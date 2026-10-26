@@ -11,6 +11,7 @@
 #include <mma.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include "mx_sw.cuh"   /* software e4m3 / e2m1 conversions (sm_86: no fp8 / fp4 cvt instructions) */
 using namespace nvcuda;
 
 extern int g_tf32;
@@ -1887,7 +1888,13 @@ __device__ __forceinline__ float sr_quant(float a, int bits, float qmax, unsigne
     float u = (float)(rnd & 0xffffff) * (1.f / 16777216.f);
     return (u < (a - lo) / sp) ? hi : lo;
 }
-__device__ __forceinline__ unsigned char enc_e4m3(float q) { unsigned short r; asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(r) : "f"(0.f), "f"(q)); return (unsigned char)r; }
+__device__ __forceinline__ unsigned char enc_e4m3(float q) {   /* the cvt needs sm_89; below it the bit-exact software RNE (mx_sw.cuh) */
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 890
+    return (unsigned char)mxsw_enc_e4m3(q);
+#else
+    unsigned short r; asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(r) : "f"(0.f), "f"(q)); return (unsigned char)r;
+#endif
+}
 __device__ __forceinline__ float dec_e4m3(unsigned char b) {   /* e4m3: bias 7, 3 mantissa bits, no inf, 0x7f = nan (never produced) */
     int sg = b >> 7, e = (b >> 3) & 15, m = b & 7;
     float v = e ? ldexpf(1.f + m / 8.f, e - 7) : ldexpf(m / 8.f, -6);

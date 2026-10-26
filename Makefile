@@ -2,11 +2,32 @@
 # Default build: the fp16 / MX kernels used by training and inference. VERIFY=1 builds the bf16 and fp32 tensor-core
 # instantiations as well (verification, legacy --f16 0) into build-verify/, so the two builds never invalidate each other.
 VERIFY ?= 0
+# GPU target. ARCH=120 (default): GeForce Blackwell, nn_* for sm_120 and the MX-fp4 / fp8 kernels (lp_*) for sm_120a with the
+# block-scaled mma. ARCH=86: Ampere (RTX 3090): everything for sm_86, the lp_* kernels with their software MX paths
+# (lp_common.cuh: e2m1 / e4m3 / ue8m0 conversions in integer ops, the block-scaled mma as int8 / f16 mma + per-block scaling).
+# PTX=1 embeds compute_$(ARCH) PTX only (no SASS): a newer GPU JIT-compiles it, so the sm_86 code paths run (and are tested) on
+# the 5080. Build dirs: build / build-verify for ARCH=120; build86 / build86p (PTX) + -verify otherwise; BDIR= overrides the stem
+# (a suite clone of the sm_86 build uses BDIR=build: the python tests run build/ufsm).
+ARCH ?= 120
+PTX  ?= 0
+ifeq ($(ARCH),120)
+BDIR    ?= build
+NVARCH  := -arch=sm_120
+LPARCH  := -gencode arch=compute_120a,code=sm_120a
+else ifeq ($(PTX),1)
+BDIR    ?= build$(ARCH)p
+NVARCH  := -gencode arch=compute_$(ARCH),code=compute_$(ARCH)
+LPARCH  := $(NVARCH)
+else
+BDIR    ?= build$(ARCH)
+NVARCH  := -gencode arch=compute_$(ARCH),code=sm_$(ARCH)
+LPARCH  := $(NVARCH)
+endif
 ifeq ($(VERIFY),1)
-B := build-verify
+B := $(BDIR)-verify
 TYPEFLAGS := -DUFSM_ALL_TYPES
 else
-B := build
+B := $(BDIR)
 TYPEFLAGS :=
 endif
 
@@ -19,7 +40,7 @@ CFLAGS  ?= -std=c23 -O3 -march=native -g -Wall -Wextra -Wno-unused-parameter -Wn
 CPPFLAGS = -D_GNU_SOURCE -Isrc -Ithird_party -Ithird_party/surfcomp $(shell pkg-config --cflags libcurl libzstd blosc zlib libcrypto)
 LDLIBS   = $(shell pkg-config --libs libcurl libzstd blosc zlib libcrypto) -ljpeg -lm -lpthread
 CUDA    ?= /usr/local/cuda
-NVFLAGS ?= -O3 -arch=sm_120 -use_fast_math -Xcompiler -fno-threadsafe-statics -Isrc   # fast math: +4% step time, FD tests still pass
+NVFLAGS ?= -O3 $(NVARCH) -use_fast_math -Xcompiler -fno-threadsafe-statics -Isrc   # fast math: +4% step time, FD tests still pass
 CUDALIBS = -L$(CUDA)/lib64 -lcudart -lcublasLt
 
 SRC  = src/json.c src/checkpoint.c src/sheet.c src/store.c src/zarr3.c src/sources.c src/sample.c src/band.c src/ct_augment.c src/scan_augment.c src/spatial_augment.c src/crush.c src/scrollaug.c src/cover.c src/zarr2.c src/tiff.c src/z3w.c src/hf.c src/ingest.c src/zipr.c src/train.c src/restore.c src/restore_cli.c src/unet.c src/split.c src/predict.c src/sweep.c src/eval.c src/fit.c src/tiffw.c src/edt.c src/votes.c src/wind.c src/fuse.c src/phase_check.c
@@ -68,7 +89,7 @@ $(B)/nn.o: $(NNOBJ)
 LPSRC = $(wildcard src/lp_*.cu)
 LPOBJ = $(patsubst src/%.cu,$(B)/%.o,$(LPSRC))
 $(B)/lp_%.o: src/lp_%.cu | $(B)
-	$(NVCC) -O3 -gencode arch=compute_120a,code=sm_120a -use_fast_math -Xcompiler -fno-threadsafe-statics $(TYPEFLAGS) -Xfatbin=-compress-all -MMD -MP -Isrc -c $< -o $@
+	$(NVCC) -O3 $(LPARCH) -use_fast_math -Xcompiler -fno-threadsafe-statics $(TYPEFLAGS) -Xfatbin=-compress-all -MMD -MP -Isrc -c $< -o $@
 $(B)/nn_fp8.o: $(LPOBJ)
 	ld -r -o $@ $^
 
@@ -128,6 +149,9 @@ $(B)/bench_mem: tests/bench_mem.c $(B)/unet.o $(B)/nn.o $(B)/nn_fp8.o
 
 $(B)/test_mx: tests/test_mx.c $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
+$(B)/test_mx_sw: tests/test_mx_sw.c $(B)/nn.o $(B)/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
+test-all: $(B)/test_mx_sw
 $(B)/test_mx4: tests/test_mx4.c $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 $(B)/test_grad_mx4: tests/test_grad_mx4.c $(B)/unet.o $(B)/nn.o $(B)/nn_fp8.o
@@ -493,6 +517,7 @@ test-all: $(B)/test_gpu_aug $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover 
 	python3 tests/test_ink_ext_tiling.py
 	python3 tests/test_dinovol.py
 	python3 tests/test_dinovol_embed.py
+	./$(B)/test_mx_sw
 	./$(B)/test_mx
 	./$(B)/test_mx4
 	./$(B)/test_grad_mx4
@@ -533,7 +558,7 @@ test-all: $(B)/test_gpu_aug $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover 
 	./tests/test_zarr.sh
 
 clean:
-	rm -rf build build-verify
+	rm -rf build build-verify build86 build86-verify build86p build86p-verify
 
 .PHONY: all test test-all clean
 

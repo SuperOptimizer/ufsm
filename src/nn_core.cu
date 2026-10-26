@@ -73,7 +73,20 @@ extern "C" void nn_set_conv_prec(int id, int sub, int p_fwd, int p_bwd_data, int
 extern "C" int nn_get_conv_prec(int id, int sub, int pass) { return id >= 0 && id < NN_MAXLAYER && sub >= 0 && sub < 2 && pass >= 0 && pass < 3 ? g_lprec3[id][sub][pass] : 0; }
 int g_prec_w = -1;
 extern "C" void nn_set_prec_wgrad(int p) { g_prec_w = p; }
-int eff_prec_pass(int pass) {
+/* the MX gate (nn.h nn_mx_ok): decided once per process from device 0's compute capability and UFSM_MX_EMU */
+static int g_mx_ok = -1;
+extern "C" int nn_mx_ok(void) {
+    if (g_mx_ok < 0) {
+        int maj = 0;
+        if (cudaDeviceGetAttribute(&maj, cudaDevAttrComputeCapabilityMajor, 0) != cudaSuccess) maj = 0;
+        const char *e = getenv("UFSM_MX_EMU");
+        g_mx_ok = e && *e ? atoi(e) != 0 : maj >= 12;
+        if (!g_mx_ok) fprintf(stderr, "ufsm: %s: fp8 / fp4 precisions run as bf16, MX activation storage off (UFSM_MX_EMU=1: the software MX kernels)\n",
+                              e && *e ? "UFSM_MX_EMU=0" : maj ? "no block-scaled fp4 / fp8 tensor cores (compute capability < 12)" : "no GPU");
+    }
+    return g_mx_ok;
+}
+static int eff_prec_raw(int pass) {
     lprec_init();
     if (!g_tf32) return 0;
     if (pass == 2 && g_prec_w >= 1) return g_prec_w;
@@ -84,6 +97,7 @@ int eff_prec_pass(int pass) {
     }
     return g_prec;
 }
+int eff_prec_pass(int pass) { const int p = eff_prec_raw(pass); return (p == 2 || p == 3) && !nn_mx_ok() ? 1 : p; }   /* fp8 / fp4 -> bf16 without MX */
 int eff_prec(void) { return eff_prec_pass(g_pass); }
 int eff_prec_w(void) { return eff_prec_pass(2); }
 extern "C" int nn_cur_prec(void) { return eff_prec(); }

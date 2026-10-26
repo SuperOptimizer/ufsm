@@ -129,14 +129,55 @@ template <> struct mx_type_s<4> { typedef mx4_t t; };
 __host__ __device__ __forceinline__ int mx_bw(int C) { return C <= 8 ? 8 : C <= 16 ? 16 : 32; }   /* 8: the network input (4 channels; rows of 4 / 8 B stay word-aligned) */
 __host__ __device__ __forceinline__ int mx_nb(int C) { int bw = mx_bw(C); return (C + bw - 1) / bw; }
 __host__ __device__ __forceinline__ int mx_rb(int bw, int bits) { return bw * bits / 8; }   /* row bytes */
+/* ---- software MX paths (GPUs before sm_120a, i.e. the Ampere sm_86 build, LP_SW): the fp8 / fp4 conversion instructions and
+   the block-scaled MMA do not exist there. The storage formats are unchanged (e4m3 bytes / e2m1 nibbles + ue8m0 scales); the
+   conversions become bit-exact integer code (mx_sw.cuh, the 2^32 / 256 / 16 input checks of tests/test_mx_sw.c) and the MMAs
+   are emulated from the same register fragments (mma_f8 / mma_f4 / mma_f4x4 below), so every lp kernel runs unchanged. */
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1200
+#define LP_SW 1
+#endif
+#include "mx_sw.cuh"
+/* two e4m3 bytes -> f16x2 bits (= cvt.rn.f16x2.e4m3x2, low byte -> low half). Software: the e4m3 field at f16 bit 7 is the
+   value times 2^-8 (exponent biases 7 / 15, subnormals aligned), so one exact f16 multiply by 256 finishes both halves; the
+   NaN codes (x111 1111) give the f16 NaN 0x7fff with the sign, as the instruction does. (The _sw forms exist in every build:
+   test_mx_sw compares them with the instructions on sm_120a.) */
+__device__ __forceinline__ unsigned h2_e4m3x2_sw(unsigned v) {
+    const unsigned t = __byte_perm(v, 0u, 0x1404u);                          /* b1 << 24 | b0 << 8 */
+    const unsigned h = (t & 0x80008000u) | ((t & 0x7f007f00u) >> 1);
+    const __half2 r = __hmul2(*(const __half2 *)&h, __half2(__ushort_as_half(0x5c00), __ushort_as_half(0x5c00)));   /* x 256 */
+    const unsigned nm = __vcmpeq2(h & 0x7fff7fffu, 0x3f803f80u);           /* 0xffff per NaN half */
+    return (*(const unsigned *)&r & ~nm) | (nm & ((h & 0x80008000u) | 0x7fff7fffu));
+}
+/* two e2m1 nibbles -> f16x2 bits (= cvt.rn.f16x2.e2m1x2, low nibble -> low half): the f16 grid {0, .5, 1, 1.5, 2, 3, 4, 6} has
+   zero low bytes, so one byte permute looks up both high bytes and a second places them; the sign bits move to bits 15 / 31 */
+__device__ __forceinline__ unsigned h2_e2m1x2_sw(unsigned b) {
+    const unsigned hb = __byte_perm(0x3e3c3800u, 0x46444240u, b & 0x77u);   /* bytes 0, 1: high bytes of nibbles 0, 1 */
+    return __byte_perm(hb, 0u, 0x1404u) | ((b & 0x08u) << 12) | ((b & 0x80u) << 24);
+}
+__device__ __forceinline__ unsigned h2_e4m3x2(unsigned v) {
+#ifdef LP_SW
+    return h2_e4m3x2_sw(v);
+#else
+    unsigned r; asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(r) : "h"((unsigned short)v));
+    return r;
+#endif
+}
+__device__ __forceinline__ unsigned h2_e2m1x2(unsigned b) {
+#ifdef LP_SW
+    return h2_e2m1x2_sw(b);
+#else
+    unsigned r; asm("{ .reg .b8 t; cvt.u8.u32 t, %1; cvt.rn.f16x2.e2m1x2 %0, t; }" : "=r"(r) : "r"(b & 0xff));
+    return r;
+#endif
+}
 __device__ __forceinline__ float2 dec_e4m3x2(unsigned short v) {   /* low byte -> .x */
-    unsigned r; asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(r) : "h"(v));
-    return __half22float2(*(__half2 *)&r);
+    const unsigned r = h2_e4m3x2(v);
+    return __half22float2(*(const __half2 *)&r);
 }
 __device__ __forceinline__ float dec_e4m3(unsigned b) { return dec_e4m3x2((unsigned short)(b & 0xff)).x; }
 __device__ __forceinline__ float2 dec_e2m1x2(unsigned b) {   /* low nibble -> .x */
-    unsigned r; asm("{ .reg .b8 t; cvt.u8.u32 t, %1; cvt.rn.f16x2.e2m1x2 %0, t; }" : "=r"(r) : "r"(b & 0xff));
-    return __half22float2(*(__half2 *)&r);
+    const unsigned r = h2_e2m1x2(b & 0xff);
+    return __half22float2(*(const __half2 *)&r);
 }
 __device__ __forceinline__ float dec_e2m1n(unsigned n) { return dec_e2m1x2(n & 15).x; }   /* one nibble */
 __device__ __forceinline__ float mx_scale(unsigned sbyte) { return __uint_as_float(sbyte << 23); }   /* 0xFF -> inf */
@@ -433,10 +474,14 @@ template <int NB> __device__ __forceinline__ void cp_async(void *sdst, const voi
 }
 __device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.commit_group;\ncp.async.wait_group 0;\n" ::: "memory"); }
 __device__ __forceinline__ unsigned cvt_e4m3x4(float a, float b, float c, float d) {   /* bytes a,b,c,d (a lowest) */
+#ifdef LP_SW
+    return mxsw_enc_e4m3(a) | (mxsw_enc_e4m3(b) << 8) | (mxsw_enc_e4m3(c) << 16) | (mxsw_enc_e4m3(d) << 24);
+#else
     unsigned short lo, hi;
     asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(lo) : "f"(b), "f"(a));
     asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(hi) : "f"(d), "f"(c));
     return (unsigned)lo | ((unsigned)hi << 16);
+#endif
 }
 /* stochastic rounding to e4m3 by dithering: v (already scaled into the e4m3 range) plus a uniform offset in
    [-1/2, 1/2) ulp, then round to nearest. The ulp is that of v's binade (3 mantissa bits; subnormal below 2^-6). h: a
@@ -453,14 +498,22 @@ __device__ __forceinline__ float sr_e4m3(float v, uint32_t h) {
     return fmaf((float)(h >> 8) * (1.f / 16777216.f) - 0.5f, ulp, v);
 }
 __device__ __forceinline__ unsigned char cvt_e4m3(float a) {
+#ifdef LP_SW
+    return (unsigned char)mxsw_enc_e4m3(a);
+#else
     unsigned short r;
     asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(r) : "f"(0.f), "f"(a));
     return (unsigned char)(r & 0xff);
+#endif
 }
 __device__ __forceinline__ unsigned char cvt_e2m1x2(float lo, float hi) {   /* low nibble = lo */
+#ifdef LP_SW
+    return (unsigned char)(mxsw_enc_e2m1(lo) | (mxsw_enc_e2m1(hi) << 4));
+#else
     unsigned short r;
     asm("{ .reg .b8 t; cvt.rn.satfinite.e2m1x2.f32 t, %1, %2; cvt.u16.u8 %0, t; }" : "=h"(r) : "f"(hi), "f"(lo));
     return (unsigned char)r;
+#endif
 }
 __device__ __forceinline__ unsigned cvt_e2m1x8(const float *v, float m) {   /* 8 values -> 8 nibbles, v[0] lowest */
     return (unsigned)cvt_e2m1x2(v[0] * m, v[1] * m) | ((unsigned)cvt_e2m1x2(v[2] * m, v[3] * m) << 8) |
@@ -599,8 +652,8 @@ __device__ __forceinline__ void stage_up_smem_h2(const uint8_t *cu, const uint8_
 #pragma unroll
                 for (int j = 0; j < 8; j++) {
                     unsigned lo, hi;
-                    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(lo) : "h"((unsigned short)(w[j] & 0xffff)));
-                    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(hi) : "h"((unsigned short)(w[j] >> 16)));
+                    lo = h2_e4m3x2(w[j] & 0xffff);
+                    hi = h2_e4m3x2(w[j] >> 16);
                     acc[2 * j] = __hfma2(w3, *(const __half2 *)&lo, acc[2 * j]); acc[2 * j + 1] = __hfma2(w3, *(const __half2 *)&hi, acc[2 * j + 1]);
                 }
             }
@@ -611,26 +664,123 @@ __device__ __forceinline__ unsigned smem_u32_(const void *p) { return (unsigned)
 __device__ __forceinline__ void ldsm_x4(unsigned *r, const void *row_ptr) {
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n" : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(smem_u32_(row_ptr)));
 }
+/* ---- block-scaled MMA emulation (sm_86). Same operands as the sm_120a instructions: A / B fragments of the m16n8k32 (e4m3) /
+   m16n8k64 (e2m1) layouts (thread (g = lane / 4, t = lane % 4): a0 / a1 = rows g / g + 8 at K t*8+i (e2m1; t*4+i for e4m3), a2 / a3
+   the same + 32 (+16), b0 / b1 = column g at the same K), and the scale registers of the layout above (A row g: lane 4g, row g+8:
+   lane 4g+1; B col n: lane 4n; byte j = K block j), fetched with shuffles. The K order inside one MMA is free as long as A and B
+   agree, so a thread's 8 e2m1 of one register feed both K halves of an int8 m16n8k32 (its nibbles 0..3 -> K t*4.., 4..7 -> K
+   16+t*4..) and its 4 e4m3 the two K halves of an f16 m16n8k16: every 32-K MX block is then exactly one int8 MMA (e2m1 x 2 is an
+   integer in [-12, 12], |block sum| <= 32 * 144, exact in int32) or two f16 MMAs (e4m3 is exact in f16, the products in fp32),
+   and its fp32 partial gets the block's 2^(sa + sb) before the sum. A NaN scale (0xFF) gives NaN, as the instruction. */
+__device__ __forceinline__ float lpsw_sc(unsigned byte) { byte &= 0xffu; return __uint_as_float(byte == 0xffu ? 0x7fc00000u : byte << 23); }
+/* nibbles 0..3 of w -> 4 int8 = 2 x e2m1 (bytes 0..3): magnitude and negated tables looked up by the 3 low bits, the sign
+   bits expanded to a byte mask selecting between them */
+__device__ __forceinline__ unsigned lpsw_e2m1x4_s8(unsigned w) {
+    const unsigned s = w & 0x7777u;
+    const unsigned pos = __byte_perm(0x03020100u, 0x0c080604u, s), neg = __byte_perm(0xfdfeff00u, 0xf4f8fafcu, s);
+    const unsigned m = __byte_perm(0x0000ff00u, 0u, (w >> 3) & 0x1111u);
+    return (pos & ~m) | (neg & m);
+}
+__device__ __forceinline__ void lpsw_mma_s8(int *d, unsigned a0, unsigned a1, unsigned a2, unsigned a3, unsigned b0, unsigned b1) {
+    asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%10,%10,%10};\n"
+        : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3]) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "r"(0));
+}
+__device__ __forceinline__ void lpsw_mma_h(float *d, unsigned a0, unsigned a1, unsigned a2, unsigned a3, unsigned b0, unsigned b1) {
+    asm("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+/* the scale registers of this thread's C elements: ra[0] / ra[1] = rows g / g+8, rb[0] / rb[1] = columns 2t / 2t+1 */
+__device__ __forceinline__ void lpsw_scales(unsigned sa, unsigned sb, unsigned *ra, unsigned *rb) {
+    const int l = threadIdx.x & 31, g = l >> 2, t = l & 3;
+    ra[0] = __shfl_sync(0xffffffffu, sa, 4 * g); ra[1] = __shfl_sync(0xffffffffu, sa, 4 * g + 1);
+    rb[0] = __shfl_sync(0xffffffffu, sb, 8 * t); rb[1] = __shfl_sync(0xffffffffu, sb, 8 * t + 4);
+}
+/* c += int32 block partial d x 2^(sa_j + sb_j) / 4 (the e2m1 x 2 integers); |d| < 2^22: exact int -> float by the 1.5 2^23 bias */
+__device__ __forceinline__ void lpsw_acc_s8(float *c, const int *d, const unsigned *ra, const unsigned *rb, int j) {
+#pragma unroll
+    for (int e = 0; e < 4; e++) {
+        const float f = __int_as_float(d[e] + 0x4b400000) - 12582912.f;
+        c[e] = fmaf(f * lpsw_sc(ra[e >> 1] >> (8 * j)), lpsw_sc(rb[e & 1] >> (8 * j)) * 0.25f, c[e]);
+    }
+}
+/* e4m3 word (4 bytes, K ascending) -> f16x2 of bytes 0, 1 (lo) and 2, 3 (hi) */
+__device__ __forceinline__ void lpsw_e4m3x4_h(unsigned w, unsigned &lo, unsigned &hi) { lo = h2_e4m3x2(w & 0xffffu); hi = h2_e4m3x2(w >> 16); }
+/* emulated block-scaled MMAs, same operands and results as mma_f8 / mma_f4 / mma_f4x4 (defined in every build; the sm_86 build's
+   mma_* call them, test_mx_sw checks them against the instructions on sm_120a) */
+__device__ __forceinline__ void lpsw_mma_f8(float *c, const unsigned *a, const unsigned *b, unsigned sa, unsigned sb) {
+    unsigned ra[2], rb[2], A[4][2], B[2][2];
+    lpsw_scales(sa, sb, ra, rb);
+#pragma unroll
+    for (int i = 0; i < 4; i++) lpsw_e4m3x4_h(a[i], A[i][0], A[i][1]);
+    lpsw_e4m3x4_h(b[0], B[0][0], B[0][1]); lpsw_e4m3x4_h(b[1], B[1][0], B[1][1]);
+    float d[4] = {0.f, 0.f, 0.f, 0.f};
+    lpsw_mma_h(d, A[0][0], A[1][0], A[0][1], A[1][1], B[0][0], B[0][1]);   /* K t*4 + 0..3 */
+    lpsw_mma_h(d, A[2][0], A[3][0], A[2][1], A[3][1], B[1][0], B[1][1]);   /* K 16 + t*4 + 0..3 */
+#pragma unroll
+    for (int e = 0; e < 4; e++) c[e] = fmaf(d[e] * lpsw_sc(ra[e >> 1]), lpsw_sc(rb[e & 1]), c[e]);
+}
+__device__ __forceinline__ void lpsw_mma_f4(float *c, const unsigned *a, const unsigned *b, unsigned sa, unsigned sb) {
+    unsigned ra[2], rb[2];
+    lpsw_scales(sa, sb, ra, rb);
+#pragma unroll
+    for (int j = 0; j < 2; j++) {   /* K block j: a[2j] (row g), a[2j+1] (row g+8), b[j] */
+        int d[4];
+        lpsw_mma_s8(d, lpsw_e2m1x4_s8(a[2 * j]), lpsw_e2m1x4_s8(a[2 * j + 1]), lpsw_e2m1x4_s8(a[2 * j] >> 16), lpsw_e2m1x4_s8(a[2 * j + 1] >> 16),
+                    lpsw_e2m1x4_s8(b[j]), lpsw_e2m1x4_s8(b[j] >> 16));
+        lpsw_acc_s8(c, d, ra, rb, j);
+    }
+}
+/* 4X: a 16-K block lives in two threads of each quad (t = 0, 1: K 0..15 of a register, t = 2, 3: K 16..31), so per register pair
+   the full int8 MMA S and the one with the t >= 2 half of A zeroed (S0 = the first block) give both blocks: S0, S - S0 */
+__device__ __forceinline__ void lpsw_mma_f4x4(float *c, const unsigned *a, const unsigned *b, unsigned sa, unsigned sb) {
+    unsigned ra[2], rb[2];
+    lpsw_scales(sa, sb, ra, rb);
+    const unsigned keep = (threadIdx.x & 2) ? 0u : ~0u;
+#pragma unroll
+    for (int j = 0; j < 2; j++) {   /* blocks 2j, 2j+1 */
+        const unsigned A0 = lpsw_e2m1x4_s8(a[2 * j]), A1 = lpsw_e2m1x4_s8(a[2 * j + 1]), A2 = lpsw_e2m1x4_s8(a[2 * j] >> 16), A3 = lpsw_e2m1x4_s8(a[2 * j + 1] >> 16);
+        const unsigned B0 = lpsw_e2m1x4_s8(b[j]), B1 = lpsw_e2m1x4_s8(b[j] >> 16);
+        int s[4], s0[4];
+        lpsw_mma_s8(s, A0, A1, A2, A3, B0, B1);
+        lpsw_mma_s8(s0, A0 & keep, A1 & keep, A2 & keep, A3 & keep, B0, B1);
+        lpsw_acc_s8(c, s0, ra, rb, 2 * j);
+#pragma unroll
+        for (int e = 0; e < 4; e++) s[e] -= s0[e];
+        lpsw_acc_s8(c, s, ra, rb, 2 * j + 1);
+    }
+}
 __device__ __forceinline__ void mma_f8(float *c, const unsigned *a, const unsigned *b, unsigned sa, unsigned sb) {
 #ifdef F8_NOMMA
     c[0] += __uint_as_float(a[0] ^ b[0] ^ sa ^ sb) ; return;
 #endif
+#ifdef LP_SW
+    lpsw_mma_f8(c, a, b, sa, sb);
+#else
     asm volatile("mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.scale_vec::1X.f32.e4m3.e4m3.f32.ue8m0 "
                  "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, %10, {0, 0}, %11, {0, 0};\n"
                  : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]), "r"(sa), "r"(sb));
+#endif
 }
 /* m16n8k64 e2m1 x e2m1, scales per 32 K (bytes 0, 1 = K blocks 0..31, 32..63) */
 __device__ __forceinline__ void mma_f4(float *c, const unsigned *a, const unsigned *b, unsigned sa, unsigned sb) {
+#ifdef LP_SW
+    lpsw_mma_f4(c, a, b, sa, sb);
+#else
     asm volatile("mma.sync.aligned.m16n8k64.row.col.kind::mxf4.block_scale.scale_vec::2X.f32.e2m1.e2m1.f32.ue8m0 "
                  "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, %10, {0, 0}, %11, {0, 0};\n"
                  : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]), "r"(sa), "r"(sb));
+#endif
 }
 /* m16n8k64 e2m1 x e2m1 with one ue8m0 scale per 16 K (kind::mxf4nvf4 scale_vec::4X; bytes 0..3 = K 0..15, 16..31, 32..47, 48..63):
    the MX layout of a <= 16-channel tensor (one scale per position), so 16-channel rows need no padding or shared scales */
 __device__ __forceinline__ void mma_f4x4(float *c, const unsigned *a, const unsigned *b, unsigned sa, unsigned sb) {
+#ifdef LP_SW
+    lpsw_mma_f4x4(c, a, b, sa, sb);
+#else
     asm volatile("mma.sync.aligned.m16n8k64.row.col.kind::mxf4nvf4.block_scale.scale_vec::4X.f32.e2m1.e2m1.f32.ue8m0 "
                  "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, %10, {0, 0}, %11, {0, 0};\n"
                  : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]), "r"(sa), "r"(sb));
+#endif
 }
 
 /* ======================= weights: wq[tap][Cop][Cip] e4m3, ws[tap][Cop][Cip/32] ue8m0 ======================= */

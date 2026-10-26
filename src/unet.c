@@ -513,8 +513,8 @@ static float *dalloc_act(unet *u, size_t n) { size_t b = ABF ? n * 2 : n * 4; u-
 /* activation tensor of shape s: MX-fp8 (registered, channel-blocked bytes + scales) in act-MX8 mode, else as dalloc_act */
 static int g_act_mx8 = -1, g_act_mx4 = -1;
 /* MX activation storage: fp8 (registry 8) or packed fp4 (registry 4); mx4 wins when both are requested */
-static int act_mx4(void) { if (g_act_mx4 < 0) g_act_mx4 = ufsm_env_on("UFSM_ACT_MX4"); return g_act_mx4 && nn_get_tf32(); }
-static int act_mx8(void) { if (g_act_mx8 < 0) g_act_mx8 = ufsm_env_on("UFSM_ACT_MX8"); return (g_act_mx8 || act_mx4()) && nn_get_tf32(); }   /* any MX format */
+static int act_mx4(void) { if (g_act_mx4 < 0) g_act_mx4 = ufsm_env_on("UFSM_ACT_MX4"); return g_act_mx4 && nn_get_tf32() && nn_mx_ok(); }   /* (nn_mx_ok: 16-bit storage without MX) */
+static int act_mx8(void) { if (g_act_mx8 < 0) g_act_mx8 = ufsm_env_on("UFSM_ACT_MX8"); return (g_act_mx8 || act_mx4()) && nn_get_tf32() && nn_mx_ok(); }   /* any MX format */
 static int act_dt(void) { return act_mx4() ? 4 : 8; }   /* registry dt of the MX activations */
 void unet_set_act_mx8(int on) { g_act_mx8 = on; }
 void unet_set_act_mx4(int on) { g_act_mx4 = on; }

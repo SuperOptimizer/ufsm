@@ -97,8 +97,8 @@ __device__ __forceinline__ void stage_up_smem16_h2(const uint8_t *cu, const uint
 #pragma unroll
                 for (int j = 0; j < 4; j++) {
                     unsigned lo, hi;
-                    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(lo) : "h"((unsigned short)(w[j] & 0xffff)));
-                    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(hi) : "h"((unsigned short)(w[j] >> 16)));
+                    lo = h2_e4m3x2(w[j] & 0xffff);
+                    hi = h2_e4m3x2(w[j] >> 16);
                     acc[2 * j] = __hfma2(w3, *(const __half2 *)&lo, acc[2 * j]); acc[2 * j + 1] = __hfma2(w3, *(const __half2 *)&hi, acc[2 * j + 1]);
                 }
             }
