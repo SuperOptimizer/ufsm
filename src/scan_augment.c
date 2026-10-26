@@ -70,6 +70,16 @@ static void exp_smooth(float *F, int P, int axis, float a, float *line, float *p
         for (int i = P - 2; i >= 0; i--) { float *ri = base + i * st; const float *rn = ri + st; for (int v = 0; v < inner; v++) ri[v] = b * ri[v] + a * rn[v]; }
     }
 }
+/* exp_smooth axis 1 then axis 2 with each z plane in cache between them (the same operations per plane, bit for bit) */
+static void exp_smooth_yx(float *F, int P, float a, float *line, float *plane) {
+    if (!plane || P % 8) { exp_smooth(F, P, 1, a, line, plane); exp_smooth(F, P, 2, a, line, plane); return; }
+    const size_t P2 = (size_t)P * P;
+    for (int u = 0; u < P; u++) {
+        float *pl = F + (size_t)u * P2;
+        exp_smooth_rows(pl, P, a);   /* (= exp_smooth axis 1 on this plane) */
+        transpose(pl, plane, P); exp_smooth_rows(plane, P, a); transpose(plane, pl, P);
+    }
+}
 
 /* Local SplitMix64, as ct_augment: decisions and per-voxel noise use their own streams. */
 static uint64_t next_u64(uint64_t *s) {
@@ -223,6 +233,17 @@ static void bop_apply(float *F, int P, int axis, const bop *b, float *tmp) {
         else { for (int z = 0; z < P; z++) memcpy(tmp + (size_t)z * P, F + z * P2 + (size_t)a * P, P * sizeof *tmp); bop_rows(b, tmp, F + (size_t)a * P, P2, P); }
     }
 }
+/* bop_apply axis 1 (by) then axis 2 (bx) with the plane in cache between them: per z plane the same operations as the two full
+   passes, bit for bit (either may be null: identity) */
+static void bop_apply_yx(float *F, int P, const bop *by, const bop *bx, float *tmp) {
+    const size_t P2 = (size_t)P * P; float *t2 = tmp + P2;
+    if (!by && !bx) return;
+    for (int a = 0; a < P; a++) {
+        float *pl = F + a * P2;
+        if (by) { memcpy(tmp, pl, P2 * sizeof *tmp); bop_rows(by, tmp, pl, P, P); }
+        if (bx) { transpose(pl, tmp, P); bop_rows(bx, tmp, t2, P, P); transpose(t2, pl, P); }
+    }
+}
 static int bop_is_identity(const bop *b) { for (int i = 0; i < b->P; i++) if (b->n[i] != 1 || b->s[i] != i || b->w[i][0] != 1) return 0; return 1; }
 
 /* shift plane z >= zc content by (dy, dx); vacated voxels take fill */
@@ -367,7 +388,8 @@ unsigned scan_aug_apply(const scan_aug_cfg *c, uint64_t seed, uint8_t *ctu, uint
     }
     /* resolution: PSF blur or phase-contrast sharpening, then a coarser sampling grid, per axis */
     if (on & (1u << SA_LOWRES | 1u << SA_BLUR | 1u << SA_SHARPEN | 1u << SA_MOTION)) {
-        bop *op = malloc(3 * sizeof *op); if (!op) abort();
+        bop *op = malloc(5 * sizeof *op); if (!op) abort();   /* op[0..2] composing; op[3], op[4]: axes 1 and 2, applied together after */
+        int on_yx[3] = {0, 0, 0};
         int iso = uniform(&rs) < .5;
         const double SL = SO(SA_LOWRES), SB = SO(SA_BLUR), SS = SO(SA_SHARPEN);
         double f0 = 1 + uniform(&rs) * 1.5 * SL, sb0 = .3 + uniform(&rs) * .7 * SB, sa0 = .15 + uniform(&rs) * .3 * SS;
@@ -390,8 +412,11 @@ unsigned scan_aug_apply(const scan_aug_cfg *c, uint64_t seed, uint8_t *ctu, uint
             if (on & 1u << SA_SHARPEN) { bop_gauss(&op[1], P, ss, sa, dense); bop_compose(&op[2], &op[1], &op[0], dense); op[0] = op[2]; }
             if (d == maxis && (mmode || mne)) { bop_motion(&op[1], P, mmode, mne, mt, mw, mL, dense); bop_compose(&op[2], &op[1], &op[0], dense); op[0] = op[2]; }
             if (on & 1u << SA_LOWRES && f > 1.01) { bop_lowres(&op[1], P, f, phase, dense); bop_compose(&op[2], &op[1], &op[0], dense); op[0] = op[2]; }
-            if (!bop_is_identity(&op[0])) bop_apply(F, P, d, &op[0], tmp);
+            if (bop_is_identity(&op[0])) continue;
+            if (d == 0) bop_apply(F, P, 0, &op[0], tmp);
+            else { op[2 + d] = op[0]; on_yx[d] = 1; }
         }
+        bop_apply_yx(F, P, on_yx[1] ? &op[3] : nullptr, on_yx[2] ? &op[4] : nullptr, tmp);   /* (the draws are all above: same stream) */
         free(op);
     }
     if (on & 1u << SA_BIAS) {   /* smooth multiplicative field: exp(N(0, b)) on a 3..5 grid, linearly interpolated */
@@ -488,7 +513,7 @@ unsigned scan_aug_apply(const scan_aug_cfg *c, uint64_t seed, uint8_t *ctu, uint
     }
     if (on & 1u << SA_PAGANIN) {   /* phase-retrieval-like low-pass after the noise: per axis exp(-|t| / lambda) */
         const double lam = (.4 + 1.2 * uniform(&rs)) * SO(SA_PAGANIN); const float a = (float)exp(-1 / fmax(lam, .05));
-        for (int d = 0; d < 3; d++) exp_smooth(F, P, d, a, row, tmp);
+        exp_smooth(F, P, 0, a, row, tmp); exp_smooth_yx(F, P, a, row, tmp);
     }
     if (on & 1u << SA_GIN) {   /* random shallow conv net (GIN-style), positive-biased centre taps keep the structure */
         const int C = 2 + (int)(uniform(&rs) * 3), k = uniform(&rs) < .5 ? 1 : 3, r = k / 2, kk = k * k * k;
