@@ -29,10 +29,10 @@ v() { awk -F'\t' -v m=$1 -v s=$2 -v c=$3 '$1 == m && $2 == s {print $c}' $T/s.ts
 echo
 printf '%-10s %8s %8s %8s %8s %8s %10s\n' site "$REF" "$TAG" oracle join_ref join_tag gap_closed
 [ -s $SLABS ] && awk -F'\t' 'FNR == 1 { f++; next } f == 1 { r[$2] = $10; rj[$2] = $9 } f == 2 { o[$2] = $10 } f == 3 && ($2 in r) {
-    g = ($10 != "na" && o[$2] != "" && o[$2] - r[$2] > 0) ? sprintf("%+.3f", ($10 - r[$2]) / (o[$2] - r[$2])) : "na"
+    g = ($10 ~ /^[0-9.]+$/ && o[$2] != "" && o[$2] - r[$2] > 0) ? sprintf("%+.3f", ($10 - r[$2]) / (o[$2] - r[$2])) : "na"
     printf "%-10s %8.4f %8s %8s %8.4f %8s %10s\n", $2, r[$2], $10, o[$2], rj[$2], $9, g }' $RS $ORC $SLABS
 [ -s $SLABS ] || SLABS=/dev/null
-read -r sn sa sb sk <<< "$(awk -F'\t' 'FNR == 1 { f++; next } f == 1 { r[$2] = $10 } f == 2 && ($2 in r) && $10 != "na" { n++; a += r[$2]; b += $10; if ($10 - r[$2] > 0.02) k++ }
+read -r sn sa sb sk <<< "$(awk -F'\t' 'FNR == 1 { f++; next } f == 1 { r[$2] = $10 } f == 2 && ($2 in r) && $10 ~ /^[0-9.]+$/ { n++; a += r[$2]; b += $10; if ($10 - r[$2] > 0.02) k++ }
   END { if (n) printf "%d %.4f %.4f %d\n", n, a / n, b / n, k; else print "0 na na 0" }' $RS $SLABS)"
 echo "slab joined mean over $sn sites: $REF $sa  $TAG $sb"
 # ---- radius profile: share of slab voxels with the right winding (zero integer error), voxel weighted, by radius band ----

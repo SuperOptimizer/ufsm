@@ -68,6 +68,8 @@ at peak LR that is only a ~1k-step average.
 - 1 slab lane fits each site as its fields land. When the boxes are done the GPU block ends, and the remaining slab fits queue
   one fit at a time at eval priority with the run's own ticket number: quick `now` checks and older tickets get the GPU between
   slab fits, later wgates wait. A slab fit that dies (OOM in the shared slice) runs once more; a failed site writes no row.
+  Each slab fit has a wall-clock cap (SLABTIME, 1200 s; fitter slip-repair blow-ups on some fields ran > 1 h): the site row then
+  says TIMEOUT (no score, R2 incomplete) and a rerun redoes it. On forlindesk one slab fit runs per GPU (slabfit$GPU.lock).
 - There are no ceiling fits: the clean set uses wind96's ceilings.
 - Fields are kept in `$WB/fields/TAG`, and a rerun skips everything that already has rows.
 

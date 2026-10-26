@@ -121,16 +121,22 @@ sfit() {   # sfit LOG fit-args...: a slab fit, run again once if it died (10-26:
   # one slab fit at a time across all wgate runs (each takes 12-20 GB host; two at once got OOM-killed in ufsm.slice), taken
   # before the GPU (the run holding the block never waits on this lock for anything but its own slab lane: no deadlock), and
   # MemAvailable >= SLABMEM GB (default 22; up to 10 min, then go)
+  # a wall-clock cap per slab fit, SLABTIME s (1200): a timed-out site is written as TIMEOUT (no score; rerun it later), the lane moves on
   local lg=$1 try; shift
   for try in 1 2; do
     ( flock 6; local n=0; while [ $(awk '/^MemAvailable:/ {print int($2 / 1048576)}' /proc/meminfo) -lt ${SLABMEM:-22} ] && [ $n -lt 60 ]; do sleep 10; n=$((n + 1)); done
-      UFSM_FIT_THREADS=$THREADS gstep RUNBIG $U fit "$@" > $lg 2>&1 ) 6> $SLOCK
+      UFSM_FIT_THREADS=$THREADS gstep RUNBIG timeout -k 30 ${SLABTIME:-1200} $U fit "$@" > $lg 2>&1 ) 6> $SLOCK
+    local rc=$?; [ $rc = 124 ] && { log "$(basename $(dirname $lg)) $(basename $lg) TIMEOUT after ${SLABTIME:-1200} s (slip repair blow-up?)"; return 3; }
     grep -q 'winding ids right' $lg && return 0; log "$(basename $(dirname $lg)) $(basename $lg) died (try $try)"; done; return 1; }
 slabsite() {   # slabsite s: wbench.sh's slab site (2 slabs, fit-join, joined score) on this run's site fields
   local s=$1 S=site$1 d f t0 t1 k a b m p1 p4 js; d=$O/$S; f=$FD/$S; mkdir -p $d; t0=$(date +%s); scroll paris4
   bash $H/mkcrop.sh $f $d/fA 0 96 96 96 3328 3520 > /dev/null; bash $H/mkcrop.sh $f $d/fB 64 96 96 96 3328 3520 > /dev/null; bash $H/mkcrop.sh $f $d/fC 0 96 96 160 3328 3520 > /dev/null
-  for k in A B; do sfit $d/fit$k.log $d/f$k $GF --out $d/fit$k --codes $QR $QK --score-detail 1 --score-pairs 1 --dir 1 --uw-repair 8
+  local to=0
+  for k in A B; do sfit $d/fit$k.log $d/f$k $GF --out $d/fit$k --codes $QR $QK --score-detail 1 --score-pairs 1 --dir 1 --uw-repair 8 || { [ $? = 3 ] && { to=1; break; }; }
     grep -E '^    radius' $d/fit$k.log | awk -v t=$TAG -v s=$S -v k=$k '{gsub(/-/, " "); $0 = $0; print t"\t"s"\t"k"\t"$2"\t"$3"\t"$5"\t"$7"\t"$8"\t"$9"\t"$10"\t"$11}' >> $RR; done
+  if [ $to = 1 ]; then   # a timed-out slab: the site row says TIMEOUT (no score); a rerun redoes it
+    echo "$TAG	$S	p4slab	TIMEOUT	na	na	na	na	na	TIMEOUT	na	$(( $(date +%s) - t0 ))	$BIN	$FCFG" >> $RS; log "$S TIMEOUT (a slab fit over ${SLABTIME:-1200} s; no score)"
+    rm -rf $d/fA $d/fB $d/fC $d/fitA $d/fitB; return; fi
   RUN $U fit-join $d/joined $d/fC --blend 16 $d/fitA 32 160 $d/fitB 160 288 > $d/join.log 2>&1
   js=$(num $(grep -oE '^ +0\|1 .*' $d/join.log | awk '{print $NF}'))
   sfit $d/joined.log $d/fC --model $d/joined $GF --codes $QR $QK --score-pairs 1
@@ -143,7 +149,7 @@ slabsite() {   # slabsite s: wbench.sh's slab site (2 slabs, fit-join, joined sc
   log "$S slabs $a / $b join share $js joined $(g_ids $d/joined.log) ($((t1 - t0)) s)"
   rm -rf $d/fA $d/fB $d/fC $d/fitA $d/fitB $d/joined
 }
-slablane() { local s; for s in $SITES; do grep -qP "^$TAG\tsite$s\t" $RS && continue
+slablane() { local s; for s in $SITES; do grep -P "^$TAG\tsite$s\t" $RS | grep -qv TIMEOUT && continue   # (TIMEOUT rows are redone)
     while [ ! -e $O/ready/site$s ] && [ ! -e $O/ready/.end ]; do sleep 2; done
     [ -e $O/ready/site$s ] && slabsite $s; done; }
 
