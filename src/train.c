@@ -128,7 +128,7 @@ static int g_ds; static float g_ds_w = 0.5f, g_ds_frac = 1.f; static int g_ds_an
 static int g_distill, g_distill_lev = 3, g_distill_div; static float g_distill_w = 1.f; static float g_distill_pap;   /* --distill-papyrus F: targets only on head cells >= F papyrus */ static size_t g_distill_n;   /* --distill C: a C-channel 1^3 head on decoder level --distill-level
                                                                                                     (cells of g_distill_div^3 window voxels; g_distill_n int8 targets per batch), cosine loss x --distill-weight */
 static float g_count_lambda; static int g_count_K = 1024, g_count_L = 64;   /* --count-lambda / -segments / -length: the count loss (nn_count_loss) */
-static float g_pg_lambda, g_pg_dist[4] = {2.f}; static int g_pg_nd = 1;   /* --pgrad-lambda / --pgrad-dist (D[,D...], up to 4): the phase wavenumber loss (nn_pgrad_slab; head slabs only) */
+static float g_pg_lambda, g_pg_dist[4] = {2.f}; static int g_pg_nd = 1, g_pg_angle;   /* --pgrad-lambda / --pgrad-dist (D[,D...], up to 4): the phase wavenumber loss (nn_pgrad_slab; head slabs only) */
 /* --task papyrus: papyrus vs void inside the scroll, labels made by the sampler from the clean CT at a random cutoff per patch
    (src/papyrus.h) in target channel 0; --pap-cond 1 conditions the stem bias on that cutoff in input units (batch.um, unet_set_cond) */
 static int g_papyrus; static papyrus_cfg g_pap;
@@ -722,7 +722,7 @@ static void head_slab_pass(gpu_state *d, int pass) {
             } else nn_wind4_stats(LGC(g_w4_ch), LGC(g_w4_ch + 1), d->w4 + vb, d->wc + vb, d->sidem, ns, d->w4ds);
             nn_loss_stats_acc(LGC(g_side_ch), d->sidet, d->sidem, d->sidew, two, d->hs_ds + 10);
             nn_loss_stats_acc(LGC(g_norm_ch), d->nt, d->nm, d->nw, seven, d->hs_ds + 20);
-            if (g_pg_lambda > 0) nn_pgrad_slab(LGC(g_side_ch), LGC(g_side_ch + 1), d->sdb, d->sidem, D, H, W, z0, z1, g_norm_s, g_pg_dist, g_pg_nd, d->hs_ds + 56, nullptr);
+            if (g_pg_lambda > 0) nn_pgrad_slab(LGC(g_side_ch), LGC(g_side_ch + 1), d->sdb, d->sidem, D, H, W, z0, z1, g_norm_s, g_pg_dist, g_pg_nd, g_pg_angle, d->hs_ds + 56, nullptr);
             continue;
         }
         if (!g_unwrap2) {
@@ -730,7 +730,7 @@ static void head_slab_pass(gpu_state *d, int pass) {
             nn_loss_grad_only(LGC(1), d->t + l3 + vb, d->pm + vb, d->w + 1, one, g_ink_dice, LGC(1), d->iscratch);
             if (g_ink_lambda != 1.f) nn_loss_grad_scale(LGC(1), ns, g_ink_lambda);
         } else nn_wind4_grad(LGC(g_w4_ch), LGC(g_w4_ch + 1), d->w4 + vb, d->wc + vb, d->sidem, ns, d->w4fin, g_w4_lambda, LGC(g_w4_ch), LGC(g_w4_ch + 1));
-        if (g_pg_lambda > 0) nn_pgrad_slab(LGC(g_side_ch), LGC(g_side_ch + 1), d->sdb, d->sidem, D, H, W, z0, z1, g_norm_s, g_pg_dist, g_pg_nd, d->hs_ds + 58, d->pg_acc);   /* (before the BCE gradient overwrites the logits; its sums go to + 58, unused) */
+        if (g_pg_lambda > 0) nn_pgrad_slab(LGC(g_side_ch), LGC(g_side_ch + 1), d->sdb, d->sidem, D, H, W, z0, z1, g_norm_s, g_pg_dist, g_pg_nd, g_pg_angle, d->hs_ds + 58, d->pg_acc);   /* (before the BCE gradient overwrites the logits; its sums go to + 58, unused) */
         nn_loss_grad_only(LGC(g_side_ch), d->sidet, d->sidem, d->sidew, two, 0.f, LGC(g_side_ch), d->sscratch);
         if (g_side_lambda != 1.f) nn_loss_grad_scale(LGC(g_side_ch), 2 * ns, g_side_lambda);
         if (g_pg_lambda > 0) nn_pgrad_apply(LGC(g_side_ch), LGC(g_side_ch + 1), d->pg_acc, ns, d->hs_ds + 56, g_pg_lambda);
@@ -1245,7 +1245,8 @@ int cmd_train(int argc, char **argv) {
         /* --pgrad-lambda L (> 0): the phase wavenumber loss (nn_pgrad_slab): the predicted phase's rotation over --pgrad-dist D voxels (2)
            along the true sheet normal against the label's, angular, weighted by the phase mask (packed sheets x --packed-weight);
            punishes a phase that skips sheets, which the per-voxel BCE lets blur. Head-slab path only (task unwrap2, B 1) */
-        g_pg_lambda = (float)atof(opt(argc,argv,"--pgrad-lambda","0")); { const char *pd = opt(argc,argv,"--pgrad-dist","2"); g_pg_nd = 0; int bad = 0;   /* several distances: each voxel pairs with a partner at each */
+        g_pg_lambda = (float)atof(opt(argc,argv,"--pgrad-lambda","0")); g_pg_angle = atoi(opt(argc,argv,"--pgrad-angle","0")) > 0;   /* --pgrad-angle 1: the angular gradient only (pgrad otherwise raises every phasor magnitude where the rotation is right: 10-25 pg1 / s1p median confidence 0.2 -> 0.55, gross errors at conf > 0.6 2-7% -> 21-41%) */
+        { const char *pd = opt(argc,argv,"--pgrad-dist","2"); g_pg_nd = 0; int bad = 0;   /* several distances: each voxel pairs with a partner at each */
           while (*pd && g_pg_nd < 4) { char *e; g_pg_dist[g_pg_nd] = strtof(pd, &e); if (e == pd) { bad = 1; break; } bad |= !(g_pg_dist[g_pg_nd] >= 1 && g_pg_dist[g_pg_nd] <= 16); g_pg_nd++; pd = *e == ',' ? e + 1 : e; if (*e && *e != ',') { bad = 1; break; } }
           if (*pd || !g_pg_nd) bad = 1;
           if (!(g_pg_lambda >= 0) || bad) { fprintf(stderr,"--pgrad-lambda >= 0, --pgrad-dist D[,D...] (1..16, up to 4)\n"); return 2; } }
