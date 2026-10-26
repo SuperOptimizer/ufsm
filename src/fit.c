@@ -645,7 +645,7 @@ static size_t uw_two_level(uw_ctx *x, double split, int T, size_t nr, int verbos
    the summed weighted L1 disagreement (src/l1pot.h, exact). A dislocation is then cut along its cheapest (least confident, least
    evidenced) surface. The shifted integers seed the phase stage's delta like the flood's. */
 typedef struct {
-    uw_ctx *x; const fit_cfg *c; int T, ntz, nty, ntx; _Atomic int next;
+    uw_ctx *x; const fit_cfg *c; int T, o, ntz, nty, ntx; _Atomic int next;   /* o: the tile grid offset (field voxels, all axes) */
     uint32_t *comp;                         /* per record: its piece within its tile (1..), 0 not flooded */
     uint32_t *npc, *tbase;                  /* per tile: pieces, the first global id */
     l1_vote *v[64]; size_t nv[64], cv[64];  /* per thread: merged votes */
@@ -659,7 +659,7 @@ typedef struct {
     float *lst; int sr;                     /* per record (sst > 0): log2 of the phase stretch; its box radius */
 } uwr_ctx;
 static inline uint32_t uwr_gid(const uwr_ctx *u, int z, int y, int xx, uint32_t id) {
-    const int t = ((z / u->T) * u->nty + y / u->T) * u->ntx + xx / u->T; return u->tbase[t] + u->comp[id] - 1;
+    const int t = (((z + u->o) / u->T) * u->nty + (y + u->o) / u->T) * u->ntx + (xx + u->o) / u->T; return u->tbase[t] + u->comp[id] - 1;
 }
 static inline double uw_U(const uw_ctx *x, uint32_t id) { return (double)x->V[id].uw + x->V[id].k; }   /* (the base kb cancels in differences) */
 static void uwr_vote(uwr_ctx *u, int th, uint32_t a, uint32_t b, int32_t d, int64_t w) {
@@ -750,8 +750,9 @@ static void uwr_tiles(void *a, int z0_, int z1_, int th) {
     const int nt = u->ntz * u->nty * u->ntx; uint32_t *q = nullptr; size_t qcap = 0;
     for (int t; (t = atomic_fetch_add(&u->next, 1)) < nt;) {
         const int tx = t % u->ntx, ty = (t / u->ntx) % u->nty, tz = t / (u->ntx * u->nty);
-        const int z0 = tz * u->T, y0 = ty * u->T, x0 = tx * u->T;
-        const int z1 = z0 + u->T < g->D ? z0 + u->T : g->D, y1 = y0 + u->T < g->H ? y0 + u->T : g->H, x1 = x0 + u->T < g->W ? x0 + u->T : g->W;
+        const int za = tz * u->T - u->o, ya = ty * u->T - u->o, xa = tx * u->T - u->o;
+        const int z0 = za > 0 ? za : 0, y0 = ya > 0 ? ya : 0, x0 = xa > 0 ? xa : 0;
+        const int z1 = za + u->T < g->D ? za + u->T : g->D, y1 = ya + u->T < g->H ? ya + u->T : g->H, x1 = xa + u->T < g->W ? xa + u->T : g->W;
         if (u->pass == 0) {   /* pieces: flooded voxels connected through neighbours whose integers agree */
             const size_t nv = (size_t)(z1 - z0) * (y1 - y0) * (x1 - x0);
             if (nv > qcap) { qcap = nv; free(q); q = malloc(qcap * sizeof *q); if (!q) abort(); }
@@ -860,10 +861,11 @@ static void uwr_apply(void *a, int z0, int z1, int th) {   /* the shifts, and th
     }
     u->nseam[th] = ns;
 }
-static void uw_repair(uw_ctx *x, size_t nr, const fit_cfg *c) {
+static void uw_repair1(uw_ctx *x, size_t nr, const fit_cfg *c, int o_) {
     const uw_geo *g = &x->g; const double t0 = nn_wall_seconds(); const fit_fields *f = x->f;
     const int T = c->uw_repair;
-    uwr_ctx u = {.x = x, .c = c, .T = T, .ntz = (g->D + T - 1) / T, .nty = (g->H + T - 1) / T, .ntx = (g->W + T - 1) / T};
+    const int o = o_ > 0 ? o_ % T : 0;
+    uwr_ctx u = {.x = x, .c = c, .T = T, .o = o, .ntz = (g->D + o + T - 1) / T, .nty = (g->H + o + T - 1) / T, .ntx = (g->W + o + T - 1) / T};
     const int nt = u.ntz * u.nty * u.ntx;
     u.comp = calloc(nr, sizeof *u.comp); u.npc = calloc(nt, sizeof *u.npc); u.tbase = calloc(nt + 1, sizeof *u.tbase);
     if (!u.comp || !u.npc || !u.tbase) { fprintf(stderr, "fit: out of memory for the slip repair (skipped)\n"); free(u.comp); free(u.npc); free(u.tbase); return; }
@@ -934,6 +936,38 @@ static void uw_repair(uw_ctx *x, size_t nr, const fit_cfg *c) {
                             "%zu pieces / %zu voxels shifted; seam pairs %zu -> %zu; pieces + votes %.1fs\n",
                             T, (unsigned long long)np, st.nedge, nv, (long long)st.e0, (long long)st.e1, st.moves, st.iters, t2 - t1, pm, vm, seam0 / 2, seam1 / 2, t1 - t0);
     free(v); free(s); free(u.comp); free(u.npc); free(u.tbase); free(u.seam); free(u.bad); free(u.lst);
+}
+/* the consensus repair (fit_cfg uw_rep_cons K > 1): K repairs of the same flood on tile grids offset by i T / K (+ uw_rep_off), each
+   voxel's integer the most frequent of the K after aligning every run's gauge to the first (the mode of their per-voxel difference);
+   ties keep the first run's. One L1 solve's choice of where to cut a dislocation moves with the tiling; a cut that the tilings agree on
+   survives the vote. */
+static void uw_repair(uw_ctx *x, size_t nr, const fit_cfg *c) {
+    const int K = c->uw_rep_cons, T = c->uw_repair;
+    if (K <= 1) { uw_repair1(x, nr, c, c->uw_rep_off); return; }
+    uw_vox *V = x->V; int16_t *k0 = malloc(nr * sizeof *k0), *ks = malloc(nr * (size_t)K * sizeof *ks);
+    if (!k0 || !ks) { free(k0); free(ks); fprintf(stderr, "fit: no memory for the consensus repair (one repair)\n"); uw_repair1(x, nr, c, c->uw_rep_off); return; }
+    for (size_t i = 0; i < nr; i++) k0[i] = V[i].k;
+    for (int r = 0; r < K; r++) {
+        if (r) for (size_t i = 0; i < nr; i++) V[i].k = k0[i];
+        uw_repair1(x, nr, c, c->uw_rep_off + (int)((long)r * T / K));
+        int16_t *o = ks + (size_t)r * nr; for (size_t i = 0; i < nr; i++) o[i] = V[i].k;
+    }
+    size_t moved = 0, split = 0;
+    for (int r = 1; r < K; r++) {   /* the gauge of run r against run 0 */
+        size_t h[65] = {0}; int16_t *o = ks + (size_t)r * nr;
+        for (size_t i = 0; i < nr; i++) { if (k0[i] == UK_UNSET) continue; const int d = o[i] - ks[i]; if (d >= -32 && d <= 32) h[d + 32]++; }
+        int m = 32; for (int d = 0; d < 65; d++) if (h[d] > h[m]) m = d;
+        if (m != 32) for (size_t i = 0; i < nr; i++) if (k0[i] != UK_UNSET) o[i] = (int16_t)(o[i] - (m - 32));
+    }
+    for (size_t i = 0; i < nr; i++) {
+        if (k0[i] == UK_UNSET) continue;
+        int best = ks[i], bn = 0;
+        for (int a = 0; a < K; a++) { const int v = ks[(size_t)a * nr + i]; int n = 0; for (int b = 0; b < K; b++) n += ks[(size_t)b * nr + i] == v; if (n > bn) { bn = n; best = v; } }
+        if (2 * bn <= K) split++;
+        moved += best != ks[i]; V[i].k = (int16_t)best;
+    }
+    if (c->verbose) fprintf(stderr, "fit: consensus repair over %d tilings: %zu voxels moved off the first tiling's integers, %zu without a majority\n", K, moved, split);
+    free(k0); free(ks);
 }
 
 static size_t fit_unwrap_voxels(fit_model *m, const fit_fields *f, double min_conf, const fit_cfg *c) {

@@ -67,6 +67,8 @@ typedef struct {
                                        sheet): a phase that lost a sheet is stretched (s ~0.5-0.7 where it disagrees with the published wraps
                                        on Paris 4, 1.05 where it agrees), so the cut prefers it (0 off) */
     int uw_rep_sr;                  /* the stretch's box radius (field voxels: (2r+1)^3; 0 the voxel's own central differences) */
+    int uw_rep_off;                 /* the repair tiles' grid offset (field voxels on every axis, mod uw_repair; 0: tiles from the origin) */
+    int uw_rep_cons;                /* > 1: the consensus repair: the voxel-wise majority integers of this many repairs on offset tile grids */
     int uw_rep_geo_init;            /* 1: the uw_rep_geo votes from the init model's W (fit --init-model, e.g. a global coarse fit) */
     float uw_rep_seed;              /* with a seed model: each piece holding seeded voxels is tied to its seeded integers by an anchor vote of
                                        weight uw_rep_seed x its seeded voxels' confidence sum (so the repair cannot move the carried count; 0 free) */
