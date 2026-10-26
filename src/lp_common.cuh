@@ -712,12 +712,27 @@ __device__ __forceinline__ void lpsw_scales(unsigned sa, unsigned sb, unsigned *
     ra[0] = lpsw_shfl(sa, 4 * g); ra[1] = lpsw_shfl(sa, 4 * g + 1);
     rb[0] = lpsw_shfl(sb, 8 * t); rb[1] = lpsw_shfl(sb, 8 * t + 4);
 }
+/* one accumulator: c += S fa fb from x = 1.5 2^23 + S. Fast form fma(fma(x, fa, -1.5 2^23 fa), fb, c) (S fa exact: fa is a power of
+   two); when -1.5 2^23 fa overflows (A scale byte >= 234, |values| ~ 1e31) the bias goes on the B side instead, same result */
+__device__ __forceinline__ float lpsw_acc1_big(float x, float fa, float fb, float c) { return fmaf(fmaf(x, fb, -12582912.f * fb), fa, c); }
 /* c += S 2^(sa_j + sb_j) / 4 from x = 1.5 2^23 + S (the e2m1 x 2 integers: the / 4 goes into the A scale) */
 __device__ __forceinline__ void lpsw_acc_s8(float *c, const float *x, const unsigned *ra, const unsigned *rb, int j) {
     const float fa0 = 0.25f * lpsw_sc(ra[0], j), fa1 = 0.25f * lpsw_sc(ra[1], j), fb0 = lpsw_sc(rb[0], j), fb1 = lpsw_sc(rb[1], j);
     const float na0 = -12582912.f * fa0, na1 = -12582912.f * fa1;
+    if (__builtin_expect(isinf(na0) || isinf(na1), 0)) {
+        c[0] = lpsw_acc1_big(x[0], fa0, fb0, c[0]); c[1] = lpsw_acc1_big(x[1], fa0, fb1, c[1]);
+        c[2] = lpsw_acc1_big(x[2], fa1, fb0, c[2]); c[3] = lpsw_acc1_big(x[3], fa1, fb1, c[3]);
+        return;
+    }
     c[0] = fmaf(fmaf(x[0], fa0, na0), fb0, c[0]); c[1] = fmaf(fmaf(x[1], fa0, na0), fb1, c[1]);
     c[2] = fmaf(fmaf(x[2], fa1, na1), fb0, c[2]); c[3] = fmaf(fmaf(x[3], fa1, na1), fb1, c[3]);
+}
+/* warp-uniform: does any lane of a hoisted A fragment have an overflowed bias (n[r][k], r < 2, k < K)? */
+template <int K> __device__ __forceinline__ int lpsw_bigA(const float (*n)[K]) {
+    int b = 0;
+#pragma unroll
+    for (int r = 0; r < 2; r++) for (int k = 0; k < K; k++) b |= isinf(n[r][k]);
+    return __any_sync(0xffffffffu, b);
 }
 /* e4m3 word (4 bytes, K ascending) -> f16x2 of bytes 0, 1 (lo) and 2, 3 (hi) */
 __device__ __forceinline__ void lpsw_e4m3x4_h(unsigned w, unsigned &lo, unsigned &hi) { lo = h2_e4m3x2(w & 0xffffu); hi = h2_e4m3x2(w >> 16); }
@@ -732,9 +747,11 @@ __device__ __forceinline__ void lpsw_mma_f8(float *c, const unsigned *a, const u
     float d[4] = {0.f, 0.f, 0.f, 0.f};
     lpsw_mma_h(d, A[0][0], A[1][0], A[0][1], A[1][1], B[0][0], B[0][1]);   /* K t*4 + 0..3 */
     lpsw_mma_h(d, A[2][0], A[3][0], A[2][1], A[3][1], B[1][0], B[1][1]);   /* K 16 + t*4 + 0..3 */
+    /* the scale product first (one power of two, exact while it is a normal float), so a huge scale on one side and a tiny one on
+       the other does not overflow d fa on the way */
     const float fa0 = lpsw_sc(ra[0], 0), fa1 = lpsw_sc(ra[1], 0), fb0 = lpsw_sc(rb[0], 0), fb1 = lpsw_sc(rb[1], 0);
-    c[0] = fmaf(d[0] * fa0, fb0, c[0]); c[1] = fmaf(d[1] * fa0, fb1, c[1]);
-    c[2] = fmaf(d[2] * fa1, fb0, c[2]); c[3] = fmaf(d[3] * fa1, fb1, c[3]);
+    c[0] = fmaf(d[0], fa0 * fb0, c[0]); c[1] = fmaf(d[1], fa0 * fb1, c[1]);
+    c[2] = fmaf(d[2], fa1 * fb0, c[2]); c[3] = fmaf(d[3], fa1 * fb1, c[3]);
 }
 __device__ __forceinline__ void lpsw_mma_f4(float *c, const unsigned *a, const unsigned *b, unsigned sa, unsigned sb) {
     unsigned ra[2], rb[2];
@@ -809,7 +826,8 @@ __device__ __forceinline__ void mma_f4x4(float *c, const unsigned *a, const unsi
    dead. mma4p then costs two int8 MMAs and 16 FFMAs. */
 #ifdef LP_SW
 #define LP_SWV 1
-struct mx4a { unsigned q[8]; float f[2][2], n[2][2]; };   /* q[4j..4j+3]: block j's int8 A operand; f / n [row][block]: scale, -1.5 2^23 scale */
+struct mx4a { unsigned q[8]; float f[2][2], n[2][2]; int big; };   /* q[4j..4j+3]: block j's int8 A operand; f / n [row][block]: scale, -1.5 2^23 scale;
+                                                                    big: some lane's n overflowed (lpsw_bigA: the bias goes on the B side) */
 struct mx4b { unsigned q[4]; float f[2][2]; };            /* q[2j..2j+1]: block j's int8 B operand; f [column][block] */
 #else
 #define LP_SWV 0
@@ -831,6 +849,7 @@ __device__ __forceinline__ mx4a mx4a_make(const unsigned *a, unsigned s0, unsign
         A.f[0][j] = 0.25f * lpsw_sc(s0, j); A.f[1][j] = 0.25f * lpsw_sc(s1, j);   /* (the / 4 of the e2m1 x 2 integers) */
         A.n[0][j] = -12582912.f * A.f[0][j]; A.n[1][j] = -12582912.f * A.f[1][j];
     }
+    A.big = lpsw_bigA<2>(A.n);
 #else
     A.a[0] = a[0]; A.a[1] = a[1]; A.a[2] = a[2]; A.a[3] = a[3]; A.s = s0; (void)s1;
 #endif
@@ -856,6 +875,11 @@ __device__ __forceinline__ void mma4p(float *c, const mx4a &A, const mx4b &B) {
     for (int j = 0; j < 2; j++) {
         float x[4];
         lpsw_mma_s8(x, A.q[4 * j], A.q[4 * j + 1], A.q[4 * j + 2], A.q[4 * j + 3], B.q[2 * j], B.q[2 * j + 1]);
+        if (__builtin_expect(A.big, 0)) {   /* (warp-uniform; A scales near the top of e8m0) */
+#pragma unroll
+            for (int e = 0; e < 4; e++) c[e] = lpsw_acc1_big(x[e], A.f[e >> 1][j], B.f[e & 1][j], c[e]);
+            continue;
+        }
         c[0] = fmaf(fmaf(x[0], A.f[0][j], A.n[0][j]), B.f[0][j], c[0]); c[1] = fmaf(fmaf(x[1], A.f[0][j], A.n[0][j]), B.f[1][j], c[1]);
         c[2] = fmaf(fmaf(x[2], A.f[1][j], A.n[1][j]), B.f[0][j], c[2]); c[3] = fmaf(fmaf(x[3], A.f[1][j], A.n[1][j]), B.f[1][j], c[3]);
     }
@@ -866,7 +890,7 @@ __device__ __forceinline__ void mma4p(float *c, const mx4a &A, const mx4b &B) {
 /* the same for the 4X MMA (mma_f4x4, one scale per 16 K, bytes 0..3): LP_SW keeps B twice, as is and with the t >= 2 lanes'
    K zeroed (qm: S0 = the even 16-K block of each int8 MMA, S - S0 the odd one; see lpsw_mma_f4x4) */
 #ifdef LP_SW
-struct mx4a4 { unsigned q[8]; float f[2][4], n[2][4]; };
+struct mx4a4 { unsigned q[8]; float f[2][4], n[2][4]; int big; };
 struct mx4b4 { unsigned q[4], qm[4]; float f[2][4]; };
 #else
 struct mx4a4 { unsigned a[4]; unsigned s; };
@@ -885,6 +909,7 @@ __device__ __forceinline__ mx4a4 mx4a4_make(const unsigned *a, unsigned s0, unsi
         A.f[0][k] = 0.25f * lpsw_sc(s0, k); A.f[1][k] = 0.25f * lpsw_sc(s1, k);
         A.n[0][k] = -12582912.f * A.f[0][k]; A.n[1][k] = -12582912.f * A.f[1][k];
     }
+    A.big = lpsw_bigA<4>(A.n);
 #else
     A.a[0] = a[0]; A.a[1] = a[1]; A.a[2] = a[2]; A.a[3] = a[3]; A.s = s0; (void)s1;
 #endif
@@ -916,6 +941,14 @@ __device__ __forceinline__ void mma4p4(float *c, const mx4a4 &A, const mx4b4 &B)
 #pragma unroll
         for (int e = 0; e < 4; e++) s[e] = s[e] - s0[e] + 12582912.f;
         const int k0 = 2 * j, k1 = 2 * j + 1;
+        if (__builtin_expect(A.big, 0)) {   /* (warp-uniform, see mma4p) */
+#pragma unroll
+            for (int e = 0; e < 4; e++) {
+                c[e] = lpsw_acc1_big(s0[e], A.f[e >> 1][k0], B.f[e & 1][k0], c[e]);
+                c[e] = lpsw_acc1_big(s[e], A.f[e >> 1][k1], B.f[e & 1][k1], c[e]);
+            }
+            continue;
+        }
 #pragma unroll
         for (int e = 0; e < 4; e++) {
             const int r = e >> 1, cl = e & 1;
@@ -967,6 +1000,7 @@ __device__ __forceinline__ mx4a mx4a_make_s8(const unsigned *qa, const unsigned 
         A.f[0][j] = 0.25f * lpsw_sc(s0, j); A.f[1][j] = 0.25f * lpsw_sc(s1, j);
         A.n[0][j] = -12582912.f * A.f[0][j]; A.n[1][j] = -12582912.f * A.f[1][j];
     }
+    A.big = lpsw_bigA<2>(A.n);
     return A;
 }
 __device__ __forceinline__ mx4b mx4b_make_s8(unsigned b0, unsigned b1, unsigned b2, unsigned b3, unsigned s0, unsigned s1) {   /* block 0: b0, b1; block 1: b2, b3 */

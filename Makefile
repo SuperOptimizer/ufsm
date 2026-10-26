@@ -40,7 +40,7 @@ CFLAGS  ?= -std=c23 -O3 -march=native -g -Wall -Wextra -Wno-unused-parameter -Wn
 CPPFLAGS = -D_GNU_SOURCE -Isrc -Ithird_party -Ithird_party/surfcomp $(shell pkg-config --cflags libcurl libzstd blosc zlib libcrypto)
 LDLIBS   = $(shell pkg-config --libs libcurl libzstd blosc zlib libcrypto) -ljpeg -lm -lpthread
 CUDA    ?= /usr/local/cuda
-NVFLAGS ?= -O3 $(NVARCH) -use_fast_math -Xcompiler -fno-threadsafe-statics -Isrc   # fast math: +4% step time, FD tests still pass
+NVFLAGS ?= -O3 $(NVARCH) -DUFSM_ARCH=$(ARCH) -use_fast_math -Xcompiler -fno-threadsafe-statics -Isrc   # fast math: +4% step time, FD tests still pass
 CUDALIBS = -L$(CUDA)/lib64 -lcudart -lcublasLt
 
 SRC  = src/json.c src/checkpoint.c src/sheet.c src/store.c src/zarr3.c src/sources.c src/sample.c src/band.c src/ct_augment.c src/scan_augment.c src/spatial_augment.c src/crush.c src/scrollaug.c src/cover.c src/zarr2.c src/tiff.c src/z3w.c src/hf.c src/ingest.c src/zipr.c src/train.c src/restore.c src/restore_cli.c src/unet.c src/split.c src/predict.c src/sweep.c src/eval.c src/fit.c src/tiffw.c src/edt.c src/votes.c src/wind.c src/fuse.c src/phase_check.c
@@ -89,7 +89,7 @@ $(B)/nn.o: $(NNOBJ)
 LPSRC = $(wildcard src/lp_*.cu)
 LPOBJ = $(patsubst src/%.cu,$(B)/%.o,$(LPSRC))
 $(B)/lp_%.o: src/lp_%.cu | $(B)
-	$(NVCC) -O3 $(LPARCH) -use_fast_math -Xcompiler -fno-threadsafe-statics $(TYPEFLAGS) -Xfatbin=-compress-all -MMD -MP -Isrc -c $< -o $@
+	$(NVCC) -O3 $(LPARCH) -DUFSM_ARCH=$(ARCH) -use_fast_math -Xcompiler -fno-threadsafe-statics $(TYPEFLAGS) -Xfatbin=-compress-all -MMD -MP -Isrc -c $< -o $@
 $(B)/nn_fp8.o: $(LPOBJ)
 	ld -r -o $@ $^
 

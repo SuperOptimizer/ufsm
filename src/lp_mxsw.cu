@@ -89,7 +89,12 @@ __global__ void mxsw_mma_k(mxsw_res *r, int kind, unsigned seed) {
     for (int i = 0; i < 4; i++) { a[i] = mxsw_rng(s); if (kind == 0) a[i] = (a[i] & 0xf7f7f7f7u) | 0x0u; }   /* e4m3: no NaN (x111 1111) */
     for (int i = 0; i < 2; i++) { b[i] = mxsw_rng(s); if (kind == 0) b[i] &= 0xf7f7f7f7u; }
     unsigned sa = 0, sb = 0;
-    for (int j = 0; j < 4; j++) { sa |= (112u + mxsw_rng(s) % 32u) << (8 * j); sb |= (112u + mxsw_rng(s) % 32u) << (8 * j); }
+    const int ext = blockIdx.x % 4;   /* 1 / 2: one side's scales near the top of e8m0 (2^101 .. 2^118), the other's low enough for a
+                                         finite product (the sm_86 bias -1.5 2^23 fa overflows there: lpsw_acc1_big) */
+    for (int j = 0; j < 4; j++) {
+        const unsigned hi = 228u + mxsw_rng(s) % 18u, lo = 40u + mxsw_rng(s) % 32u, mid = 112u + mxsw_rng(s) % 32u, mid2 = 112u + mxsw_rng(s) % 32u;
+        sa |= (ext == 1 ? hi : ext == 2 ? lo : mid) << (8 * j); sb |= (ext == 1 ? lo : ext == 2 ? hi : mid2) << (8 * j);
+    }
     float c[4], c0[4];
     for (int e = 0; e < 4; e++) c[e] = c0[e] = (float)((int)(mxsw_rng(s) % 2001u) - 1000) * 0.01f;
     for (int i = 0; i < 4; i++) fa[l][i] = a[i];
@@ -97,6 +102,15 @@ __global__ void mxsw_mma_k(mxsw_res *r, int kind, unsigned seed) {
     __syncwarp();
     float cs[4] = {c[0], c[1], c[2], c[3]};
     if (kind == 0) lpsw_mma_f8(cs, a, b, sa, sb); else if (kind == 1) lpsw_mma_f4(cs, a, b, sa, sb); else lpsw_mma_f4x4(cs, a, b, sa, sb);
+    /* the hoisted fragments (mx4a / mx4b + mma4p, 4X forms), scale registers per row / column as the kernels read them: row r's
+       is fsa[4 (r & 7) + (r >= 8)], column n's fsb[4 n] (LPA0 / LPA1 / LPB0 / LPB1 pick the rows / columns this build needs) */
+    float ch[4] = {c[0], c[1], c[2], c[3]};
+    if (kind) {
+        auto rs = [&](int row) { return fsa[4 * (row & 7) + (row >= 8)]; };
+        auto cl = [&](int col) { return fsb[4 * col]; };
+        if (kind == 1) mma4p(ch, mx4a_make(a, rs(LPA0), rs(LPA1)), mx4b_make(b, cl(LPB0), cl(LPB1)));
+        else mma4p4(ch, mx4a4_make(a, rs(LPA0), rs(LPA1)), mx4b4_make(b, cl(LPB0), cl(LPB1)));
+    }
     /* scalar reference over the layout */
     const int K = kind ? 64 : 32, KB = kind == 2 ? 16 : 32;
     double sums[4], mags[4]; (void)sums;
@@ -117,8 +131,9 @@ __global__ void mxsw_mma_k(mxsw_res *r, int kind, unsigned seed) {
             sum += (double)av * bv * sc; mag += fabs((double)av * bv * sc);
         }
         sums[e] = sum; mags[e] = mag > 0 ? mag : 1.0;
-        const double err = fabs((double)cs[e] - sum) / mags[e];
-        if (err > 1e-6) mxsw_note(r, 6, (unsigned)(blockIdx.x * 32 + l));
+        double err = fabs((double)cs[e] - sum) / mags[e];
+        if (kind) err = fmax(err, fabs((double)ch[e] - sum) / mags[e]);   /* (and the hoisted form) */
+        if (!(err <= 1e-6)) mxsw_note(r, 6, (unsigned)(blockIdx.x * 32 + l));
         atomicMax((unsigned *)&r->worst[0], __float_as_uint((float)err));
     }
 #ifdef MXSW_HW
@@ -178,10 +193,10 @@ extern "C" int lp_mxsw_hw(void) {
     cudaMalloc(&d, 4); mxsw_hw_k<<<1, 1>>>(d); cudaMemcpy(&h, d, 4, cudaMemcpyDeviceToHost); cudaFree(d);
     return h;
 }
-/* 1 when this build's lp kernels are the software MX paths (compiled for < sm_120: the ptx version of a kernel of this unit; an
-   ARCH=86 PTX build JIT-run on a newer GPU still reports 86). Host-side defaults that suit only the hardware MMAs check it. */
-extern "C" int lp_sw_build(void) {
-    static int v = -1;
-    if (v < 0) { cudaFuncAttributes a; v = cudaFuncGetAttributes(&a, (const void *)mxsw_hw_k) == cudaSuccess ? a.ptxVersion < 120 : 0; }
-    return v;
-}
+/* 1 when this build's lp kernels are the software MX paths (the Makefile's ARCH < 120, -DUFSM_ARCH; an ARCH=86 PTX build JIT-run
+   on a newer GPU too). Host-side defaults that suit only the hardware MMAs check it. A compile-time answer: no CUDA call, so it
+   is safe before predict's fork (a CUDA context in the parent breaks the forked GPU workers). */
+#ifndef UFSM_ARCH
+#define UFSM_ARCH 120
+#endif
+extern "C" int lp_sw_build(void) { return UFSM_ARCH < 120; }

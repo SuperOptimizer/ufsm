@@ -73,18 +73,17 @@ extern "C" void nn_set_conv_prec(int id, int sub, int p_fwd, int p_bwd_data, int
 extern "C" int nn_get_conv_prec(int id, int sub, int pass) { return id >= 0 && id < NN_MAXLAYER && sub >= 0 && sub < 2 && pass >= 0 && pass < 3 ? g_lprec3[id][sub][pass] : 0; }
 int g_prec_w = -1;
 extern "C" void nn_set_prec_wgrad(int p) { g_prec_w = p; }
-/* the MX gate (nn.h nn_mx_ok): decided once per process from device 0's compute capability and UFSM_MX_EMU */
+/* the MX gate (nn.h nn_mx_ok): on unless UFSM_MX_EMU=0. Every build has MX kernels: the default ARCH=120 build's need block-scaled
+   tensor cores but its sm_120 code runs on nothing else, an ARCH=86 build's are the exact software ones. No CUDA call here (it
+   runs before predict forks its GPU workers, which a parent CUDA context would break) */
 static int g_mx_ok = -1;
-extern "C" int lp_sw_build(void);   /* lp_mxsw.cu */
+extern "C" int lp_sw_build(void);   /* lp_mxsw.cu (compile time) */
 extern "C" int nn_mx_ok(void) {
     if (g_mx_ok < 0) {
-        int maj = 0;
-        if (cudaDeviceGetAttribute(&maj, cudaDevAttrComputeCapabilityMajor, 0) != cudaSuccess) maj = 0;
         const char *e = getenv("UFSM_MX_EMU");
-        g_mx_ok = e && *e ? atoi(e) != 0 : maj >= 12 || lp_sw_build();   /* (an ARCH=86 build: the exact software MX kernels, the only way to fit P512 in 24 GB) */
+        g_mx_ok = e && *e ? atoi(e) != 0 : 1;   /* (ARCH=86: the software MX kernels, the only way to fit P512 in 24 GB) */
         if (g_mx_ok && lp_sw_build()) fprintf(stderr, "ufsm: MX-fp4 / fp8 through the software kernels of this build (no block-scaled tensor cores; UFSM_MX_EMU=0: bf16)\n");
-        if (!g_mx_ok) fprintf(stderr, "ufsm: %s: fp8 / fp4 precisions run as bf16, MX activation storage off (UFSM_MX_EMU=1: the software MX kernels)\n",
-                              e && *e ? "UFSM_MX_EMU=0" : maj ? "no block-scaled fp4 / fp8 tensor cores (compute capability < 12)" : "no GPU");
+        if (!g_mx_ok) fprintf(stderr, "ufsm: UFSM_MX_EMU=0: fp8 / fp4 precisions run as bf16, MX activation storage off\n");
     }
     return g_mx_ok;
 }
