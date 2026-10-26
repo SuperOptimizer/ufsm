@@ -2,6 +2,7 @@
 # scripts/gpuq.sh on a private lock: a bg job yields to a later "now" job at its next box boundary, eval jobs are served before bg
 # jobs that queued earlier, FIFO inside a priority, plain flock users stay mutually exclusive, dead tickets are dropped.
 set -u; H=$(cd "$(dirname "$0")/.." && pwd); T=$(mktemp -d); trap 'rm -rf $T' EXIT; f=0
+unset GPUQ_HELD GPUQ_FD GPUQ_OWNER GPUQ_PR GPUQ_SEQ GPUQ_TAG GPUQ_WAIT LOCK   # (run inside a held gpuq block, e.g. the suite's GPU block: no inherited grant)
 export GPUQ_LOCK=$T/gpu.lock GPUQ_DIR=$T/q GPUQ_POLL=0.1
 Q=$H/scripts/gpuq.sh; L=$T/order
 bgjob() {   # 4 boxes of 0.5 s, yielding at each boundary

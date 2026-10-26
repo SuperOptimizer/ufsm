@@ -53,6 +53,32 @@ __device__ __forceinline__ void fit_reduce_parts(const double *lp, double (*red)
     for (int o = blockDim.x / 2; o > 0; o >>= 1) { if (threadIdx.x < o) for (int k = 0; k < FIT_NPARTS; k++) red[k][threadIdx.x] += red[k][threadIdx.x + o]; __syncthreads(); }
     if (threadIdx.x == 0) for (int k = 0; k < FIT_NPARTS; k++) if (k != FIT_P_SMOOTH && red[k][0] != 0.0) atomicAdd(&parts[k], red[k][0]);
 }
+/* Deterministic sums (2026-10-26): the gradient and the loss parts accumulate as 64-bit fixed-point integers (integer adds commute,
+   so the result does not depend on the block / list order; the float / double atomics before made every GPU fit differ in the last
+   bits from run to run, which the chaotic slab fits amplified to ~0.05 of joined ids). Gradient: FIT_GQ = 2^50 per unit (|node sum|
+   < 8192, resolution 9e-16; per-voxel contributions are ~1e-7..1e-4), parts: FIT_PQ = 2^40 (|part| < 8e6). Converted once per call. */
+#define FIT_GQ 1125899906842624.0
+#define FIT_PQ 1099511627776.0
+__device__ __forceinline__ void fit_gadd(long long *gi, size_t k, float v) { atomicAdd((unsigned long long *)&gi[k], (unsigned long long)__double2ll_rn((double)v * FIT_GQ)); }
+__device__ __forceinline__ long long fit_pfix(double v) { return __double2ll_rn(v * FIT_PQ); }
+/* a block's per-thread fixed-point parts summed (integers: any order) into pi */
+__device__ __forceinline__ void fit_reduce_parts_fix(const long long *lp, long long (*red)[FIT_TPB], long long *pi) {
+    for (int k = 0; k < FIT_NPARTS; k++) red[k][threadIdx.x] = lp[k];
+    __syncthreads();
+    for (int o = blockDim.x / 2; o > 0; o >>= 1) { if (threadIdx.x < o) for (int k = 0; k < FIT_NPARTS; k++) red[k][threadIdx.x] += red[k][threadIdx.x + o]; __syncthreads(); }
+    if (threadIdx.x == 0) for (int k = 0; k < FIT_NPARTS; k++) if (k != FIT_P_SMOOTH && red[k][0] != 0) atomicAdd((unsigned long long *)&pi[k], (unsigned long long)red[k][0]);
+}
+__global__ void fit_gconv_k(const long long *gi, size_t n, float *g) {   /* g += gi / FIT_GQ */
+    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) if (gi[i]) g[i] += (float)((double)gi[i] * (1.0 / FIT_GQ));
+}
+__global__ void fit_pconv_k(const long long *pi, double *parts) { if (threadIdx.x < FIT_NPARTS && pi[threadIdx.x]) parts[threadIdx.x] += (double)pi[threadIdx.x] * (1.0 / FIT_PQ); }
+static long long *g_fix_g, *g_fix_p; static size_t g_fix_gn;
+static long long *fit_fix_scratch(size_t n) {   /* the gradient scratch (n nodes) and the parts' (zeroed) */
+    if (!g_fix_p) CK(cudaMalloc(&g_fix_p, 16 * sizeof(long long)));
+    if (n > g_fix_gn) { if (g_fix_g) CK(cudaFree(g_fix_g)); CK(cudaMalloc(&g_fix_g, n * sizeof(long long))); g_fix_gn = n; }
+    CK(cudaMemsetAsync(g_fix_g, 0, n * sizeof(long long))); CK(cudaMemsetAsync(g_fix_p, 0, 16 * sizeof(long long)));
+    return g_fix_g;
+}
 __global__ void fit_loss_k(fit_dev f, double *parts, float *g_delta, float *g_pitch, float *g_offset) {
     __shared__ float sp_pitch[FIT_MAXK], sp_off[FIT_MAXK];
     __shared__ double red[FIT_NPARTS][FIT_TPB];
@@ -128,7 +154,7 @@ __global__ void fit_lap_k(const float *v, int lz, int ly, int lx, float *lap) {
 }
 /* g += 2 ws (sum_{m in nbr(n)} wl_m - deg_n wl_n) + 2 wd v_n with wl = wn lap (the per-node weighted laplacian; wn null: 1); the loss
    ws wn lap^2 + wd v^2 */
-__global__ void fit_smooth_k(const float *v, const float *lap, const float *wn, int lz, int ly, int lx, float ws, float wd, double *parts, float *g) {
+__global__ void fit_smooth_k(const float *v, const float *lap, const float *wn, int lz, int ly, int lx, float ws, float wd, long long *pi, float *g) {
     __shared__ double red[FIT_TPB];
     const size_t n = (size_t)lz * ly * lx, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     double l = 0;
@@ -150,12 +176,15 @@ __global__ void fit_smooth_k(const float *v, const float *lap, const float *wn, 
     red[threadIdx.x] = l;
     __syncthreads();
     for (int o = blockDim.x / 2; o > 0; o >>= 1) { if (threadIdx.x < o) red[threadIdx.x] += red[threadIdx.x + o]; __syncthreads(); }
-    if (threadIdx.x == 0) atomicAdd(&parts[6], red[0]);
+    if (threadIdx.x == 0 && red[0] != 0.0) atomicAdd((unsigned long long *)&pi[6], (unsigned long long)fit_pfix(red[0]));   /* (fixed point: deterministic) */
 }
 extern "C" void nn_fit_smooth(const float *delta, int lz, int ly, int lx, float w_smooth, float w_decay, const float *wn, float *lap, double *parts, float *g_delta) {
     const size_t n = (size_t)lz * ly * lx;
     fit_lap_k<<<nblk(n, FIT_TPB), FIT_TPB>>>(delta, lz, ly, lx, lap);
-    fit_smooth_k<<<nblk(n, FIT_TPB), FIT_TPB>>>(delta, lap, wn, lz, ly, lx, w_smooth, w_decay, parts, g_delta);
+    static long long *ps; if (!ps) CK(cudaMalloc(&ps, 16 * sizeof(long long)));
+    CK(cudaMemsetAsync(ps, 0, 16 * sizeof(long long)));
+    fit_smooth_k<<<nblk(n, FIT_TPB), FIT_TPB>>>(delta, lap, wn, lz, ly, lx, w_smooth, w_decay, ps, g_delta);
+    fit_pconv_k<<<1, 32>>>(ps, parts);
     KCHECK();
 }
 
@@ -441,17 +470,18 @@ __global__ void fit_finalize_w4_k(const float *acc, size_t nf, uint8_t *a) {
 extern "C" void nn_fit_finalize_w4(const float *acc, size_t nf, uint8_t *a) { fit_finalize_w4_k<<<nblk(nf, 256), 256>>>(acc, nf, a); KCHECK(); }
 
 /* analytic data terms (nn_fit_loss2): one evaluation per voxel (src/fit_terms.h fit_vox2) */
-__global__ void fit_loss2_k(fit_dev f, double *parts, float *g_delta) {
-    __shared__ double red[FIT_NPARTS][FIT_TPB];
-    double lp[FIT_NPARTS] = {0};
+__global__ void fit_loss2_k(fit_dev f, long long *pi, long long *gi) {   /* (fixed-point sums: deterministic) */
+    __shared__ long long red[FIT_NPARTS][FIT_TPB];
+    double lp[FIT_NPARTS] = {0}; long long lq[FIT_NPARTS] = {0};
     const size_t n = (size_t)f.D * f.H * f.W, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     const float wv = i < n && (f.stride <= 1 || fit_hash((unsigned)i ^ f.salt) % (unsigned)f.stride == 0) ? f.w[i] * (1.f / 255.f) : 0.f;
     if (wv > 0.f) {
         size_t ic[FIT_VOX2_MAXC]; float gv[FIT_VOX2_MAXC];
         const int nc = fit_vox2(&f, i, wv, (float)(f.stride > 1 ? f.stride : 1), lp, ic, gv);
-        for (int c = 0; c < nc; c++) if (gv[c] != 0.f) atomicAdd(&g_delta[ic[c]], gv[c]);
+        for (int c = 0; c < nc; c++) if (gv[c] != 0.f) fit_gadd(gi, ic[c], gv[c]);
+        for (int q = 0; q < FIT_NPARTS; q++) lq[q] = fit_pfix(lp[q]);
     }
-    fit_reduce_parts(lp, red, parts);
+    fit_reduce_parts_fix(lq, red, pi);
 }
 /* Minibatch steps (stride > 1): the step's voxels (hash(i ^ salt) % stride == 0, material) are first listed (one thread per voxel:
    a hash and, for the 1 / stride selected, the weight byte; warp-aggregated appends), then evaluated by a grid-stride kernel over
@@ -470,9 +500,9 @@ __global__ void fit_select_k(fit_dev f, unsigned *list, unsigned *count, unsigne
     base = __shfl_sync(0xffffffffu, base, leader);
     if (sel) { const unsigned k = base + __popc(m & ((1u << lane) - 1u)); if (k < cap) list[k] = (unsigned)i; }
 }
-__global__ void fit_loss2_list_k(fit_dev f, const unsigned *list, const unsigned *count, unsigned cap, double *parts, float *g_delta) {
-    __shared__ double red[FIT_NPARTS][FIT_TPB];
-    double lp[FIT_NPARTS] = {0};
+__global__ void fit_loss2_list_k(fit_dev f, const unsigned *list, const unsigned *count, unsigned cap, long long *pi, long long *gi) {
+    __shared__ long long red[FIT_NPARTS][FIT_TPB];
+    long long lp[FIT_NPARTS] = {0};   /* (per voxel in fixed point: the list order does not matter) */
     const unsigned nc = min(*count, cap);
     const float sc = (float)f.stride;
     for (unsigned k = blockIdx.x * blockDim.x + threadIdx.x; k < nc; k += gridDim.x * blockDim.x) {
@@ -481,15 +511,19 @@ __global__ void fit_loss2_list_k(fit_dev f, const unsigned *list, const unsigned
         double vp[FIT_NPARTS] = {0};
         size_t ic[FIT_VOX2_MAXC]; float gv[FIT_VOX2_MAXC];
         const int ncr = fit_vox2(&f, i, wv, sc, vp, ic, gv);
-        for (int c = 0; c < ncr; c++) if (gv[c] != 0.f) atomicAdd(&g_delta[ic[c]], gv[c]);
-        for (int q = 0; q < FIT_NPARTS; q++) lp[q] += vp[q];
+        for (int c = 0; c < ncr; c++) if (gv[c] != 0.f) fit_gadd(gi, ic[c], gv[c]);
+        for (int q = 0; q < FIT_NPARTS; q++) lp[q] += fit_pfix(vp[q]);
     }
-    fit_reduce_parts(lp, red, parts);
+    fit_reduce_parts_fix(lp, red, pi);
 }
 static unsigned *g_sel_list, *g_sel_count; static unsigned g_sel_cap;
 extern "C" void nn_fit_loss2(const fit_dev *f, double *parts, float *g_delta) {
-    const size_t n = (size_t)f->D * f->H * f->W;
-    if (f->stride <= 1 || n >= 0xffffffffull) { fit_loss2_k<<<nblk(n, FIT_TPB), FIT_TPB>>>(*f, parts, g_delta); KCHECK(); return; }
+    const size_t n = (size_t)f->D * f->H * f->W, nl = (size_t)f->lz * f->ly * f->lx;
+    long long *gi = fit_fix_scratch(nl), *pi = g_fix_p;
+    if (f->stride <= 1 || n >= 0xffffffffull) {
+        fit_loss2_k<<<nblk(n, FIT_TPB), FIT_TPB>>>(*f, pi, gi);
+        fit_gconv_k<<<nblk(nl, 256) < 4096 ? nblk(nl, 256) : 4096, 256>>>(gi, nl, g_delta); fit_pconv_k<<<1, 32>>>(pi, parts); KCHECK(); return;
+    }
     /* capacity: the expected n / stride plus a quarter (the count is binomial: sd ~ sqrt(n / stride), ~0.07% of it at 2 M) */
     const size_t want = n / (size_t)f->stride + n / (size_t)f->stride / 4 + 65536;
     if (want > g_sel_cap) {
@@ -500,7 +534,8 @@ extern "C" void nn_fit_loss2(const fit_dev *f, double *parts, float *g_delta) {
     CK(cudaMemsetAsync(g_sel_count, 0, sizeof(unsigned)));
     fit_select_k<<<nblk(n, 256), 256>>>(*f, g_sel_list, g_sel_count, g_sel_cap);
     const unsigned nb = nblk(want, FIT_TPB) < 1024 ? nblk(want, FIT_TPB) : 1024;
-    fit_loss2_list_k<<<nb, FIT_TPB>>>(*f, g_sel_list, g_sel_count, g_sel_cap, parts, g_delta);
+    fit_loss2_list_k<<<nb, FIT_TPB>>>(*f, g_sel_list, g_sel_count, g_sel_cap, pi, gi);
+    fit_gconv_k<<<nblk(nl, 256) < 4096 ? nblk(nl, 256) : 4096, 256>>>(gi, nl, g_delta); fit_pconv_k<<<1, 32>>>(pi, parts);
     KCHECK();
 }
 
