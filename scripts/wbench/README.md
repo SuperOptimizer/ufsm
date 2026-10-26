@@ -58,7 +58,9 @@ at peak LR that is only a ~1k-step average.
 **Speed.** One GPU block (gpuq eval). The GPU lane only predicts: the 4 sites first (~2 min each), then the boxes (~11 s each).
 - 3 box lanes fit each box as soon as its fields land. The box fit and its 2 shifted fits run concurrently, followed by the
   CPU-only fields-oracle and fit-compare (diagnostic columns; `DIAG=0` skips them).
-- 1 slab lane fits each site as its fields land. It is the critical path.
+- 1 slab lane fits each site as its fields land. When the boxes are done the GPU block ends, and the remaining slab fits queue
+  one fit at a time at eval priority with the run's own ticket number: quick `now` checks and older tickets get the GPU between
+  slab fits, later wgates wait. A slab fit that dies (OOM in the shared slice) runs once more; a failed site writes no row.
 - There are no ceiling fits: the clean set uses wind96's ceilings.
 - Fields are kept in `$WB/fields/TAG`, and a rerun skips everything that already has rows.
 
