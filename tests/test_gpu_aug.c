@@ -98,7 +98,7 @@ int main(int argc, char **argv) {
         c.augment = 3; c.symmetry_p = .5f; c.rotate_p = .5f; c.zoom_p = .3f; c.elastic_p = .3f; c.zoom_out_p = 0;
         memset(c.scan.p, 0, sizeof c.scan.p); c.scan.strength = 1;
         const int sops[] = {SA_BLUR, SA_LOWRES, SA_NOISE, SA_CNOISE, SA_TONE, SA_PAGANIN, SA_GIN, SA_BIAS, SA_RING, SA_SLICE, SA_QUANT, SA_CHUNK, SA_CUTOUT, SA_DROPSLICE};
-        for (size_t k = 0; k < sizeof sops / sizeof *sops; k++) c.scan.p[sops[k]] = .35f;
+        for (size_t k = 0; k < sizeof sops / sizeof *sops; k++) c.scan.p[sops[k]] = .1f;   /* 0.9^14: ~1 in 4 windows without scanner ops */
         sample_cfg cg = c; cg.gpu_aug = 1;
         CHECK(sample_gpu_aug_ok(&cg), "sample_gpu_aug_ok on the unwrap2 recipe");
         uint16_t *xa[NB]; uint8_t *lab[2][NB], *c8[NB]; void *rr[2][NB]; scan_ct_rec *ra[NB];
