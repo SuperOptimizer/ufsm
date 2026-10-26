@@ -643,7 +643,10 @@ extern "C" void nn_pred_input_d(const uint8_t *ct, int D, int W, float mean, flo
     else pred_in_k<bf16><<<nblk(n, 256), 256>>>(ct, D, W, mean, isd, dyo, dxo, axis, (bf16 *)x);
     KCHECK();
 }
-extern "C" void nn_pred_input(const uint8_t *ct, int W, float mean, float isd, const float *dyo, const float *dxo, int axis, void *x, int h16) { nn_pred_input_d(ct, W, W, mean, isd, dyo, dxo, axis, x, h16); }
+extern "C" void nn_pred_input(const uint8_t *ct, int W, float mean, float isd, const float *dyo, const float *dxo, int axis, void *x, int h16) {
+    if (!ct || !x) { fprintf(stderr, "nn_pred_input: null %s buffer\n", ct ? "input" : "CT"); abort(); }   /* (a missing scratch, e.g. an MX-only caller with MX off: a clear stop, not a GPU write to 0) */
+    nn_pred_input_d(ct, W, W, mean, isd, dyo, dxo, axis, x, h16);
+}
 /* half-resolution networks (unet_cfg.half_res, nn.h nn_half_*) */
 template <typename T> __global__ void half_in_k(const T *x, int n, int C, int d, int h, int w, int mode, T *y) {   /* one thread per half voxel */
     const size_t hv = (size_t)d * h * w, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;

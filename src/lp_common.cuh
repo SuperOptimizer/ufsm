@@ -927,6 +927,56 @@ __device__ __forceinline__ void mma4p4(float *c, const mx4a4 &A, const mx4b4 &B)
     mma_f4x4(c, A.a, B.b, A.s, B.s);
 #endif
 }
+/* ---- int8-predecoded fp4 tiles in shared memory (LP_SW): a staged 32-channel e2m1 row (16 B of nibbles) is written as 32 int8
+   (e2m1 x 2) bytes in two 16-byte chunks, chunk index ^ bit 2 of the row (8 consecutive rows of 32 B then hit distinct banks for
+   ldmatrix), so an ldmatrix of a row group returns int8 MMA operands directly (lo chunk = K t*4.., hi chunk = K 16+t*4..: the same K
+   order on both operands) and the unpack is paid once per staged element, not once per MMA tap. sm_120a: the nibble rows as before.
+   LP_XB: staged bytes per 32-channel row; lp_xb(): the same on the host (smem sizes). */
+#define LP_XB (LP_SWV ? 32 : 16)
+static inline int lp_xb(void) { return lp_sw_build() ? 32 : 16; }
+__device__ __forceinline__ int lp_xchunk(int row, int h) { return h ^ ((row >> 2) & 1); }
+/* store one staged row (16 B of nibbles) at row index pos of a [rows][LP_XB] tile */
+__device__ __forceinline__ void lp_st_row4(uint8_t *s, int pos, uint4 w) {
+#ifdef LP_SW
+    const uint4 lo = make_uint4(lpsw_e2m1x4_s8(w.x), lpsw_e2m1x4_s8(w.x >> 16), lpsw_e2m1x4_s8(w.y), lpsw_e2m1x4_s8(w.y >> 16));
+    const uint4 hi = make_uint4(lpsw_e2m1x4_s8(w.z), lpsw_e2m1x4_s8(w.z >> 16), lpsw_e2m1x4_s8(w.w), lpsw_e2m1x4_s8(w.w >> 16));
+    *(uint4 *)(s + pos * 32 + lp_xchunk(pos, 0) * 16) = lo; *(uint4 *)(s + pos * 32 + lp_xchunk(pos, 1) * 16) = hi;
+#else
+    *(uint4 *)(s + pos * 16) = w;
+#endif
+}
+/* store the 16 B nibble row of weight tap pair pp, row c, tap h of a weight stage [pairs][BM][32 B] (sm_120a: sw16 swizzled halves;
+   LP_SW: [pairs][tap][BM][32 B int8]; pair stride BM * 2 * LP_XB in both) */
+__device__ __forceinline__ int sw16(int row, int half);
+__device__ __forceinline__ void lp_st_w4(uint8_t *wa, int pp, int BM, int c, int h, uint4 w) {
+#ifdef LP_SW
+    lp_st_row4(wa + (pp * 2 + h) * BM * 32, c, w);
+#else
+    *(uint4 *)(wa + pp * BM * 32 + sw16(c, h)) = w;
+#endif
+}
+#ifdef LP_SW
+/* ldmatrix x4 of an int8 tile: matrix mt of the lane's group = rows row0(mt) .. + 7, chunk hc(mt) (row index of this lane: rowl) */
+__device__ __forceinline__ void lp_ldsm_s8(unsigned *r, const uint8_t *s, int rowl, int h) { ldsm_x4(r, s + rowl * 32 + lp_xchunk(rowl, h) * 16); }
+__device__ __forceinline__ mx4a mx4a_make_s8(const unsigned *qa, const unsigned *qb, unsigned s0, unsigned s1) {   /* qa / qb: int8 a0..a3 of blocks 0 / 1 */
+    mx4a A;
+#pragma unroll
+    for (int i = 0; i < 4; i++) { A.q[i] = qa[i]; A.q[4 + i] = qb[i]; }
+#pragma unroll
+    for (int j = 0; j < 2; j++) {
+        A.f[0][j] = 0.25f * lpsw_sc(s0, j); A.f[1][j] = 0.25f * lpsw_sc(s1, j);
+        A.n[0][j] = -12582912.f * A.f[0][j]; A.n[1][j] = -12582912.f * A.f[1][j];
+    }
+    return A;
+}
+__device__ __forceinline__ mx4b mx4b_make_s8(unsigned b0, unsigned b1, unsigned b2, unsigned b3, unsigned s0, unsigned s1) {   /* block 0: b0, b1; block 1: b2, b3 */
+    mx4b B;
+    B.q[0] = b0; B.q[1] = b1; B.q[2] = b2; B.q[3] = b3;
+#pragma unroll
+    for (int j = 0; j < 2; j++) { B.f[0][j] = lpsw_sc(s0, j); B.f[1][j] = lpsw_sc(s1, j); }
+    return B;
+}
+#endif
 /* min blocks per SM for __launch_bounds__ of the hoisted kernels: the decoded fragments need registers (sm_86: 1 block of 256) */
 #define LP_MINB(n) (LP_SWV ? 1 : (n))
 

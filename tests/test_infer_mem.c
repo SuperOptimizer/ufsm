@@ -134,6 +134,7 @@ static size_t split_run_ct(split_ctx *ctx, const unet_cfg *cfg, int sc, int P, i
 
 int main(void) {
     nn_init(0); nn_set_tf32(1); nn_set_f16(1); nn_set_prec(3); nn_set_gn_stored(1);
+    if (!nn_mx_ok()) { printf("test_infer_mem: skipped (the MX paths are off: no fp4 / fp8 tensor cores and UFSM_MX_EMU not 1)\n"); return 0; }   /* (MX-fp4 placement only) */
     unet_set_act_mx4(1); unet_set_act_mx8(0); unet_set_grad_mx8(0); unet_set_input_mx(1);
     if (unet_set_input_prec(8)) return 2;
     for (int sc = 0; sc < 2; sc++) {

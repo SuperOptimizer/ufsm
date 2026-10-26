@@ -24,11 +24,11 @@ __global__ void __launch_bounds__(256, LP_MINB(2)) conv_fwd_f4_k(const T *__rest
                                                      int N, int Ci, int D, int H, int W, int Co, int Cop, int Cip, gnp_t gp, double *__restrict__ osum, int Go, split_t sp) {
     constexpr int BM = MT * 16, PG = 7, RZ = TZ / 2, NR = 2 * RZ, TT = (TZ + 2) * 180, NRX = NR;   /* PG: tap pairs per weight stage */
     extern __shared__ __align__(128) unsigned char smem_raw[];
-    uint8_t *sx = smem_raw;                         /* [TT pos][16 B] */
-    uint8_t *sxs = sx + TT * 16;                    /* [TT] */
-    uint8_t *wa = sxs + ((TT + 127) & ~127);        /* [PG pair][BM co][32 B] (tapA 16 B | tapB 16 B), swizzled */
-    unsigned short *was = (unsigned short *)(wa + PG * BM * 32);   /* [PG][BM] (byte 0 tapA, byte 1 tapB) */
-    chan_t *ctab = (chan_t *)(wa + PG * BM * 32 + ((PG * BM * 2 + 15) & ~15));
+    uint8_t *sx = smem_raw;                         /* [TT pos][16 B] (LP_SW: [TT][32 B] int8, lp_st_row4) */
+    uint8_t *sxs = sx + TT * LP_XB;                 /* [TT] */
+    uint8_t *wa = sxs + ((TT + 127) & ~127);        /* [PG pair][BM co][32 B] (tapA 16 B | tapB 16 B), swizzled (LP_SW: [PG][tap][BM][32 B] int8) */
+    unsigned short *was = (unsigned short *)(wa + PG * BM * 2 * LP_XB);   /* [PG][BM] (byte 0 tapA, byte 1 tapB) */
+    chan_t *ctab = (chan_t *)(wa + PG * BM * 2 * LP_XB + ((PG * BM * 2 + 15) & ~15));
     float2 *cab = (float2 *)(ctab + 32); unsigned *sgm = (unsigned *)(cab + 32);   /* [32] (a, b), GN mask */
     uint8_t *cu = (uint8_t *)(sgm + 4), *cus = cu + (TZ / 2 + 4) * 96 * 32;   /* sp.up: coarse rows of the up segment (stage_up_coarse) */
     float2 *cab2 = (float2 *)(((uintptr_t)(sp.up ? cus + (TZ / 2 + 4) * 96 : cu) + 15) & ~(uintptr_t)15);   /* [32] slab GN: bank 1 (launch_f4) */
@@ -81,7 +81,7 @@ __global__ void __launch_bounds__(256, LP_MINB(2)) conv_fwd_f4_k(const T *__rest
                     if (c0.bw == 32) h0 = __ldg((const uint4 *)src); else if (c0.bw == 16) { uint2 u = __ldg((const uint2 *)src); h0.x = u.x; h0.y = u.y; } else h0.x = __ldg((const unsigned *)src);   /* 32 / 16 / 8 channels: 16 / 8 / 4 bytes */
                     sc = c0.sp[off];
                 }
-                *(uint4 *)(sx + pos * 16) = h0;
+                lp_st_row4(sx, pos, h0);
                 sxs[pos] = (uint8_t)sc;
             }
         }
@@ -106,16 +106,21 @@ __global__ void __launch_bounds__(256, LP_MINB(2)) conv_fwd_f4_k(const T *__rest
                 unsigned wd[4];
 #pragma unroll
                 for (int q = 0; q < 4; q++) { uint32_t hh[4]; sr_hash4(sp.sr, vid * 4 + q, hh); wd[q] = sr_e2m1_word(v + 8 * q, m, hh); }
-                *(uint4 *)(sx + pos * 16) = make_uint4(wd[0], wd[1], wd[2], wd[3]);
+                lp_st_row4(sx, pos, make_uint4(wd[0], wd[1], wd[2], wd[3]));
             } else
-            *(uint4 *)(sx + pos * 16) = make_uint4(cvt_e2m1x8(v, m), cvt_e2m1x8(v + 8, m), cvt_e2m1x8(v + 16, m), cvt_e2m1x8(v + 24, m));
+            lp_st_row4(sx, pos, make_uint4(cvt_e2m1x8(v, m), cvt_e2m1x8(v + 8, m), cvt_e2m1x8(v + 16, m), cvt_e2m1x8(v + 24, m)));
             sxs[pos] = (uint8_t)(e + 127);
         }
         for (int p0 = 0; p0 < 14; p0 += PG) {
             __syncthreads();
             for (int i = threadIdx.x; i < PG * BM * 2; i += 256) {
                 int pp = i / (BM * 2), r = i % (BM * 2), c = r >> 1, h = r & 1, tap = 2 * (p0 + pp) + h;
-                *(uint4 *)(wa + pp * BM * 32 + sw16(c, h)) = __ldg((const uint4 *)(wq + ((size_t)tap * Cop + co0 + c) * (Cip / 2) + ci0 / 2));
+                const uint4 wv = __ldg((const uint4 *)(wq + ((size_t)tap * Cop + co0 + c) * (Cip / 2) + ci0 / 2));
+#ifdef LP_SW
+                lp_st_row4(wa + (pp * 2 + h) * BM * 32, c, wv);
+#else
+                *(uint4 *)(wa + pp * BM * 32 + sw16(c, h)) = wv;
+#endif
             }
             for (int i = threadIdx.x; i < PG * BM; i += 256) {
                 int pp = i / BM, c = i % BM, tap = 2 * (p0 + pp);
@@ -131,6 +136,16 @@ __global__ void __launch_bounds__(256, LP_MINB(2)) conv_fwd_f4_k(const T *__rest
                 for (int r = 0; r < NR; r++) {
                     const int rowo = (r >> 1) * 180 + (r & 1) * 18;   /* z plane r/2, row r%2 of the warp's tile */
                     int mat = lane >> 3, q = mat >> 1, isB = mat & 1;
+#ifdef LP_SW
+                    /* the int8 rows of taps A / B: matrices (cols 0..7 lo, hi, cols 8..15 lo, hi) */
+                    unsigned qa[4], qb[4];
+                    lp_ldsm_s8(qa, sx, rA + rowo + q * 8 + (lane & 7), isB); lp_ldsm_s8(qb, sx, rB + rowo + q * 8 + (lane & 7), isB);
+#pragma unroll
+                    for (int q2 = 0; q2 < 2; q2++)
+                        bf[r][q2] = mx4b_make_s8(qa[2 * q2], qa[2 * q2 + 1], qb[2 * q2], qb[2 * q2 + 1],
+                                                 (unsigned)sxs[rA + rowo + q2 * 8 + LPB0] | ((unsigned)sxs[rB + rowo + q2 * 8 + LPB0] << 8),
+                                                 (unsigned)sxs[rA + rowo + q2 * 8 + LPB1] | ((unsigned)sxs[rB + rowo + q2 * 8 + LPB1] << 8));
+#else
                     int pos = (isB ? rB : rA) + rowo + q * 8 + (lane & 7);
                     unsigned bfr[4];
                     ldsm_x4(bfr, sx + pos * 16);
@@ -138,13 +153,20 @@ __global__ void __launch_bounds__(256, LP_MINB(2)) conv_fwd_f4_k(const T *__rest
                     for (int q2 = 0; q2 < 2; q2++)
                         bf[r][q2] = mx4b_make(bfr + 2 * q2, (unsigned)sxs[rA + rowo + q2 * 8 + LPB0] | ((unsigned)sxs[rB + rowo + q2 * 8 + LPB0] << 8),
                                               (unsigned)sxs[rA + rowo + q2 * 8 + LPB1] | ((unsigned)sxs[rB + rowo + q2 * 8 + LPB1] << 8));
+#endif
                 }
 #pragma unroll
                 for (int m = 0; m < MT; m++) {
-                    unsigned af[4];
                     int mat = lane >> 3, row = m * 16 + (mat & 1) * 8 + (lane & 7);
+#ifdef LP_SW
+                    unsigned qa[4], qb[4];   /* a0..a3 (rows lo, hi 8; chunks lo, hi) of taps A / B */
+                    lp_ldsm_s8(qa, wa + (pp * 2) * BM * 32, row, mat >> 1); lp_ldsm_s8(qb, wa + (pp * 2 + 1) * BM * 32, row, mat >> 1);
+                    const mx4a A = mx4a_make_s8(qa, qb, was[pp * BM + m * 16 + LPA0], was[pp * BM + m * 16 + LPA1]);
+#else
+                    unsigned af[4];
                     ldsm_x4(af, wa + pp * BM * 32 + sw16(row, mat >> 1));
                     const mx4a A = mx4a_make(af, was[pp * BM + m * 16 + LPA0], was[pp * BM + m * 16 + LPA1]);
+#endif
 #pragma unroll
                     for (int r = 0; r < NR; r++) { mma4p(acc[m][r][0], A, bf[r][0]); mma4p(acc[m][r][1], A, bf[r][1]); }
                 }
@@ -155,7 +177,8 @@ __global__ void __launch_bounds__(256, LP_MINB(2)) conv_fwd_f4_k(const T *__rest
 }
 template <int MT, int TZ, typename T, typename TO> void launch_f4(dim3 grid, const void *x, shape5 xs, const uint8_t *wq, const uint8_t *ws, const float *b, int cout, void *y, int Cop, int Cip, gnp_t gp, double *osum, int Go, split_t sp) {
     constexpr int TT = (TZ + 2) * 180;
-    size_t smem = (size_t)TT * 16 + ((TT + 127) & ~127) + 7 * MT * 16 * 32 + ((7 * MT * 16 * 2 + 15) & ~15) + 32 * sizeof(chan_t) + 32 * 8 + 16 + (sp.up ? (TZ / 2 + 4) * 96 * 33 + 16 : 0)
+    const int xb = lp_xb();   /* staged row bytes: 16 (nibbles), 32 (sm_86 int8 tiles) */
+    size_t smem = (size_t)TT * xb + ((TT + 127) & ~127) + 7 * MT * 16 * 2 * xb + ((7 * MT * 16 * 2 + 15) & ~15) + 32 * sizeof(chan_t) + 32 * 8 + 16 + (sp.up ? (TZ / 2 + 4) * 96 * 33 + 16 : 0)
                   + (gp.ns || sp.gp2.ns ? 32 * 8 + 16 : 0);   /* (slab GroupNorm: the second coefficient bank) */
     if (smem < 8 * 256 * sizeof(float)) smem = 8 * 256 * sizeof(float);
     static int attr[8];
@@ -176,24 +199,24 @@ __device__ unsigned long long g_f4r_prof[8];
 #else
 #define F4RP(i) do { } while (0)
 #endif
-template <int MT, int TZ, int NCH> __host__ __device__ constexpr unsigned f4r_wa_off() {   /* the rings, then the channel tables */
+template <int MT, int TZ, int NCH> __host__ __device__ constexpr unsigned f4r_wa_off(int xb) {   /* the rings, then the channel tables (xb: staged row bytes, LP_XB / lp_xb()) */
     constexpr int TT = (TZ + 2) * 180;
-    return (unsigned)((NCH * (TT * 16 + ((TT + 127) & ~127)) + NCH * 32 * 32 + NCH * 32 * 8 + 16 + 127) & ~127);
+    return (unsigned)((NCH * (TT * xb + ((TT + 127) & ~127)) + NCH * 32 * 32 + NCH * 32 * 8 + 16 + 127) & ~127);
 }
 template <int MT, int TZ, int NCH, typename T, typename TO>
 __global__ void __launch_bounds__(256, LP_MINB(2)) conv_fwd_f4r_k(const T *__restrict__ x, const uint8_t *__restrict__ wq, const uint8_t *__restrict__ wsc,
                                                       const float *__restrict__ b, TO *__restrict__ y,
                                                       int N, int Ci, int D, int H, int W, int Co, int Cop, gnp_t gp, double *__restrict__ osum, int Go, split_t sp, int ZC,
                                                       int wres) {   /* wres: all 14 tap pairs resident (one output tile, one chunk), staged once */
-    constexpr int BM = MT * 16, PG = 7, RZ = TZ / 2, NR = 2 * RZ, NP = TZ + 2, TT = NP * 180, Cip = 32 * NCH, RB = TT * 16 + ((TT + 127) & ~127);
+    constexpr int BM = MT * 16, PG = 7, RZ = TZ / 2, NR = 2 * RZ, NP = TZ + 2, TT = NP * 180, Cip = 32 * NCH, RB = TT * LP_XB + ((TT + 127) & ~127);
     extern __shared__ __align__(128) unsigned char smem_raw[];
-    /* chunk c: sx = smem_raw + c RB [NP slots x 180 pos][16 B], sxs = sx + TT * 16 [TT] */
+    /* chunk c: sx = smem_raw + c RB [NP slots x 180 pos][LP_XB B], sxs = sx + TT * LP_XB [TT] */
     chan_t *ctab = (chan_t *)(smem_raw + NCH * RB);                          /* [NCH][32] */
     float2 *cab = (float2 *)(ctab + NCH * 32); unsigned *sgm = (unsigned *)(cab + NCH * 32);   /* [NCH][32], [NCH] */
-    uint8_t *wa = smem_raw + f4r_wa_off<MT, TZ, NCH>();                     /* [PG pair][BM co][32 B] (tapA 16 B | tapB 16 B), swizzled */
-    unsigned short *was = (unsigned short *)(wa + (wres ? 14 : PG) * BM * 32);   /* [PG][BM] (wres: [14][BM]) */
+    uint8_t *wa = smem_raw + f4r_wa_off<MT, TZ, NCH>(LP_XB);                     /* [PG pair][BM co][32 B] (tapA 16 B | tapB 16 B), swizzled */
+    unsigned short *was = (unsigned short *)(wa + (wres ? 14 : PG) * BM * 2 * LP_XB);   /* [PG][BM] (wres: [14][BM]) */
     /* epilogue scratch (after the MMA): over the weight stage, or after the resident weights */
-    const unsigned scr_off = f4r_wa_off<MT, TZ, NCH>() + (wres ? (unsigned)((14 * BM * 32 + 14 * BM * 2 + 127) & ~127) : 0u);
+    const unsigned scr_off = f4r_wa_off<MT, TZ, NCH>(LP_XB) + (wres ? (unsigned)((14 * BM * 2 * LP_XB + 14 * BM * 2 + 127) & ~127) : 0u);
     unsigned char *scr = smem_raw + scr_off;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
     const int wz = warp >> 2, wr = (warp & 3) * 2;
@@ -222,7 +245,7 @@ __global__ void __launch_bounds__(256, LP_MINB(2)) conv_fwd_f4r_k(const T *__res
     if (wres) {   /* the whole weight set once (nmt == 1, NCH == 1): no weight stage or its barriers per tile */
         for (int i = threadIdx.x; i < 14 * BM * 2; i += 256) {
             const int pp = i / (BM * 2), r = i % (BM * 2), c = r >> 1, h = r & 1, tap = 2 * pp + h;
-            *(uint4 *)(wa + pp * BM * 32 + sw16(c, h)) = __ldg((const uint4 *)(wq + ((size_t)tap * Cop + c) * (Cip / 2)));
+            lp_st_w4(wa, pp, BM, c, h, __ldg((const uint4 *)(wq + ((size_t)tap * Cop + c) * (Cip / 2))));
         }
         for (int i = threadIdx.x; i < 14 * BM; i += 256) {
             const int pp = i / BM, c = i % BM, tap = 2 * pp;
@@ -256,7 +279,7 @@ __global__ void __launch_bounds__(256, LP_MINB(2)) conv_fwd_f4r_k(const T *__res
         F4RP(0);
 #pragma unroll
         for (int ch = 0; ch < NCH; ch++) {
-            uint8_t *sx = smem_raw + ch * RB, *sxs = sx + TT * 16;
+            uint8_t *sx = smem_raw + ch * RB, *sxs = sx + TT * LP_XB;
             const chan_t *ct = ctab + 32 * ch;
             if constexpr (IS_MX4(T)) if (!G && !sp.sr) {   /* mx4 input without transform: the chunk is one stored block -> copy the row and its scale */
                 const chan_t c0 = ct[0];
@@ -272,7 +295,7 @@ __global__ void __launch_bounds__(256, LP_MINB(2)) conv_fwd_f4r_k(const T *__res
                         if (c0.bw == 32) h0 = __ldg((const uint4 *)src); else if (c0.bw == 16) { uint2 u = __ldg((const uint2 *)src); h0.x = u.x; h0.y = u.y; } else h0.x = __ldg((const unsigned *)src);   /* 32 / 16 / 8 channels: 16 / 8 / 4 bytes */
                         sc = c0.sp[off];
                     }
-                    *(uint4 *)(sx + pos * 16) = h0;
+                    lp_st_row4(sx, pos, h0);
                     sxs[pos] = (uint8_t)sc;
                 }
             }
@@ -293,9 +316,9 @@ __global__ void __launch_bounds__(256, LP_MINB(2)) conv_fwd_f4r_k(const T *__res
                     unsigned wd[4];
 #pragma unroll
                     for (int q = 0; q < 4; q++) { uint32_t hh[4]; sr_hash4(sp.sr, vid * 4 + q, hh); wd[q] = sr_e2m1_word(v + 8 * q, m, hh); }
-                    *(uint4 *)(sx + pos * 16) = make_uint4(wd[0], wd[1], wd[2], wd[3]);
+                    lp_st_row4(sx, pos, make_uint4(wd[0], wd[1], wd[2], wd[3]));
                 } else
-                *(uint4 *)(sx + pos * 16) = make_uint4(cvt_e2m1x8(v, m), cvt_e2m1x8(v + 8, m), cvt_e2m1x8(v + 16, m), cvt_e2m1x8(v + 24, m));
+                lp_st_row4(sx, pos, make_uint4(cvt_e2m1x8(v, m), cvt_e2m1x8(v + 8, m), cvt_e2m1x8(v + 16, m), cvt_e2m1x8(v + 24, m)));
                 sxs[pos] = (uint8_t)(e + 127);
             }
         }
@@ -305,16 +328,16 @@ __global__ void __launch_bounds__(256, LP_MINB(2)) conv_fwd_f4r_k(const T *__res
 #pragma unroll
             for (int m = 0; m < MT; m++) for (int r = 0; r < NR; r++) for (int q = 0; q < 2; q++) for (int k = 0; k < 4; k++) acc[m][r][q][k] = 0.f;
             for (int ch = 0; ch < NCH; ch++) {
-                const uint8_t *sx = smem_raw + ch * RB, *sxs = sx + TT * 16;
+                const uint8_t *sx = smem_raw + ch * RB, *sxs = sx + TT * LP_XB;
                 for (int p0 = 0; p0 < 14; p0 += PG) {
                     if (!wres || !p0) __syncthreads();   /* (wres: only the staging barrier) */
                     F4RP(p0 ? 3 : 1);   /* 1: staging (its barrier), 3: the first pair group's mma */
-                    const uint8_t *wag = wres ? wa + p0 * BM * 32 : wa;
+                    const uint8_t *wag = wres ? wa + p0 * BM * 2 * LP_XB : wa;
                     const unsigned short *wasg = wres ? was + p0 * BM : was;
                     if (!wres) {
                     for (int i = threadIdx.x; i < PG * BM * 2; i += 256) {
                         int pp = i / (BM * 2), r = i % (BM * 2), c = r >> 1, h = r & 1, tap = 2 * (p0 + pp) + h;
-                        *(uint4 *)(wa + pp * BM * 32 + sw16(c, h)) = __ldg((const uint4 *)(wq + ((size_t)tap * Cop + co0 + c) * (Cip / 2) + 16 * ch));
+                        lp_st_w4(wa, pp, BM, c, h, __ldg((const uint4 *)(wq + ((size_t)tap * Cop + co0 + c) * (Cip / 2) + 16 * ch)));
                     }
                     for (int i = threadIdx.x; i < PG * BM; i += 256) {
                         int pp = i / BM, c = i % BM, tap = 2 * (p0 + pp);
@@ -333,19 +356,35 @@ __global__ void __launch_bounds__(256, LP_MINB(2)) conv_fwd_f4r_k(const T *__res
                             const int sA = (oz0 + wz * RZ + (r >> 1) + tA / 9) % NP, sB = (oz0 + wz * RZ + (r >> 1) + tB / 9) % NP;
                             const int rA = sA * 180 + (wr + (r & 1) + (tA / 3) % 3) * 18 + tA % 3, rB = sB * 180 + (wr + (r & 1) + (tB / 3) % 3) * 18 + tB % 3;
                             int mat = lane >> 3, q = mat >> 1, isB = mat & 1;
+#ifdef LP_SW
+                            unsigned qa[4], qb[4];   /* int8 rows of taps A / B (see conv_fwd_f4_k) */
+                            lp_ldsm_s8(qa, sx, rA + q * 8 + (lane & 7), isB); lp_ldsm_s8(qb, sx, rB + q * 8 + (lane & 7), isB);
+#pragma unroll
+                            for (int q2 = 0; q2 < 2; q2++)
+                                bf[r][q2] = mx4b_make_s8(qa[2 * q2], qa[2 * q2 + 1], qb[2 * q2], qb[2 * q2 + 1],
+                                                         (unsigned)sxs[rA + q2 * 8 + LPB0] | ((unsigned)sxs[rB + q2 * 8 + LPB0] << 8),
+                                                         (unsigned)sxs[rA + q2 * 8 + LPB1] | ((unsigned)sxs[rB + q2 * 8 + LPB1] << 8));
+#else
                             unsigned bfr[4];
                             ldsm_x4(bfr, sx + ((isB ? rB : rA) + q * 8 + (lane & 7)) * 16);
 #pragma unroll
                             for (int q2 = 0; q2 < 2; q2++)
                                 bf[r][q2] = mx4b_make(bfr + 2 * q2, (unsigned)sxs[rA + q2 * 8 + LPB0] | ((unsigned)sxs[rB + q2 * 8 + LPB0] << 8),
                                                       (unsigned)sxs[rA + q2 * 8 + LPB1] | ((unsigned)sxs[rB + q2 * 8 + LPB1] << 8));
+#endif
                         }
 #pragma unroll
                         for (int m = 0; m < MT; m++) {
-                            unsigned af[4];
                             int mat = lane >> 3, row = m * 16 + (mat & 1) * 8 + (lane & 7);
+#ifdef LP_SW
+                            unsigned qa[4], qb[4];
+                            lp_ldsm_s8(qa, wag + (pp * 2) * BM * 32, row, mat >> 1); lp_ldsm_s8(qb, wag + (pp * 2 + 1) * BM * 32, row, mat >> 1);
+                            const mx4a A = mx4a_make_s8(qa, qb, wasg[pp * BM + m * 16 + LPA0], wasg[pp * BM + m * 16 + LPA1]);
+#else
+                            unsigned af[4];
                             ldsm_x4(af, wag + pp * BM * 32 + sw16(row, mat >> 1));
                             const mx4a A = mx4a_make(af, wasg[pp * BM + m * 16 + LPA0], wasg[pp * BM + m * 16 + LPA1]);
+#endif
 #pragma unroll
                             for (int r = 0; r < NR; r++) { mma4p(acc[m][r][0], A, bf[r][0]); mma4p(acc[m][r][1], A, bf[r][1]); }
                         }
@@ -368,7 +407,8 @@ template <int MT, int TZ, int NCH, typename T, typename TO> static void launch_f
     constexpr int NR = TZ, RBM = IS_MX(TO) ? 32 * MX_BITS(TO) / 8 : 0, BM = MT * 16;
     size_t scr = (size_t)8 * 256 * sizeof(float);
     if (IS_MX(TO) && scr < (size_t)512 + 8 * NR * 16 * (RBM + 1)) scr = (size_t)512 + 8 * NR * 16 * (RBM + 1);
-    const size_t wst = (size_t)7 * BM * 32 + ((7 * BM * 2 + 15) & ~15);
+    const int xb = lp_xb();   /* staged row bytes (sm_86: int8 tiles) */
+    const size_t wst = (size_t)7 * BM * 2 * xb + ((7 * BM * 2 + 15) & ~15);
     if (IS_MX(TO) && MT % 2 == 0) {   /* the transposed MX epilogue (fwd_epi_mxt): whole rows when that adds <= 2 KB, else half rows */
         const size_t s0 = scr > wst ? scr : wst;
         if (s0 < FEPI_SCR(8)) scr = FEPI_SCR(8);
@@ -377,7 +417,7 @@ template <int MT, int TZ, int NCH, typename T, typename TO> static void launch_f
     static int wres_env = -1;
     if (wres_env < 0) wres_env = getenv("UFSM_F4R_WRES") ? atoi(getenv("UFSM_F4R_WRES")) : 1;
     const int wres = wres_env && NCH == 1 && Cop == BM && MT <= 2;   /* one output tile, one chunk: the 14 tap pairs (<= 15 KB) resident */
-    const size_t wfix = f4r_wa_off<MT, TZ, NCH>() + (wres ? ((size_t)(14 * BM * 32 + 14 * BM * 2 + 127) & ~(size_t)127) : 0);
+    const size_t wfix = f4r_wa_off<MT, TZ, NCH>(xb) + (wres ? ((size_t)(14 * BM * 2 * xb + 14 * BM * 2 + 127) & ~(size_t)127) : 0);
     if (!wres && scr < wst) scr = wst;   /* (the scratch overlays the weight stage) */
     if (IS_MX(TO) && MT == 1) scr = fepi16_scr(wfix, scr, cout, sp);   /* the 16-channel-block MX epilogue (fwd_epi_mx16) */
     const size_t smem = wfix + scr + (gp.ns || sp.gp2.ns ? (size_t)NCH * 32 * 8 + 16 : 0);   /* (slab GroupNorm: the second coefficient bank) */

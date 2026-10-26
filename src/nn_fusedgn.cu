@@ -115,8 +115,85 @@ extern "C" int nn_head_bwd_x(const float *x, const nn_gn_t *gx_gn, shape5 xs, co
 /* the head on voxels [vb, vb + nv) of x (the trainer's head slabs, train.c): forward into fp16 planes of nv voxels; backward from
    fp16 gy planes of nv voxels, weight / bias gradients accumulated, gx rows [vb, vb + nv) written with the SR seed drawn by the
    first slab (first != 0) and kept for the rest, so the stored bits match one whole-volume call. -1: not MX / not covered */
+/* 16-bit (bf16 / fp16 storage, no MX: e.g. sm_86 without UFSM_MX_EMU) head slabs, one sample (the head-slab path is B 1): the
+   forward per voxel; the weight / bias gradients as per-(channel, block) partials summed in a fixed order (deterministic, as the
+   MX kernels); the input gradient W^T gy per voxel into the 16-bit gx */
+template <typename TI> __global__ void head_fwd_z16_k(const TI *__restrict__ x, const float *__restrict__ w, const float *__restrict__ b, __half *__restrict__ y,
+                                                      int Ci, int Co, size_t S, size_t vb, size_t nv, gnp_t gp) {
+    const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= nv) return;
+    const TI *xp = x + vb + i;
+    float a[16];
+#pragma unroll
+    for (int co = 0; co < 16; co++) a[co] = co < Co ? b[co] : 0.f;
+    for (int ci = 0; ci < Ci; ci++) {
+        const float v = gn_silu_at(ldv(xp, (size_t)ci * S), gp, 0, ci, Ci);
+#pragma unroll
+        for (int co = 0; co < 16; co++) if (co < Co) a[co] = fmaf(w[co * Ci + ci], v, a[co]);
+    }
+#pragma unroll
+    for (int co = 0; co < 16; co++) if (co < Co) y[(size_t)co * nv + i] = __float2half_rn(a[co]);
+}
+#define HZ_NB 128   /* voxel blocks of the weight-gradient partials */
+template <typename TI> __global__ void __launch_bounds__(256) head_bwd_w_z16_k(const TI *__restrict__ x, const __half *__restrict__ gy, float *__restrict__ part,
+                                                                              int Ci, int Co, size_t S, size_t vb, size_t nv, gnp_t gp) {
+    const int ci = blockIdx.y;   /* ci == Ci: the bias row (activation 1) */
+    float acc[16];
+#pragma unroll
+    for (int co = 0; co < 16; co++) acc[co] = 0.f;
+    const size_t per = (nv + HZ_NB - 1) / HZ_NB, v0 = blockIdx.x * per, v1 = min(nv, v0 + per);
+    for (size_t i = v0 + threadIdx.x; i < v1; i += blockDim.x) {
+        const float a = ci < Ci ? gn_silu_at(ldv(x + vb + i, (size_t)ci * S), gp, 0, ci, Ci) : 1.f;
+#pragma unroll
+        for (int co = 0; co < 16; co++) if (co < Co) acc[co] = fmaf(__half2float(gy[(size_t)co * nv + i]), a, acc[co]);
+    }
+    __shared__ float red[8][16];
+#pragma unroll
+    for (int co = 0; co < 16; co++) {
+        float s = acc[co];
+        for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
+        if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5][co] = s;
+    }
+    __syncthreads();
+    if (threadIdx.x < Co) {
+        float s = 0.f;
+        for (int k = 0; k < 8; k++) s += red[k][threadIdx.x];
+        part[((size_t)ci * HZ_NB + blockIdx.x) * 16 + threadIdx.x] = s;
+    }
+}
+__global__ void head_bwd_w_z16_sum_k(const float *__restrict__ part, float *__restrict__ gw, float *__restrict__ gb, int Ci, int Co) {
+    const int k = blockIdx.x * blockDim.x + threadIdx.x;   /* (ci, co), ci == Ci: the bias */
+    if (k >= (Ci + 1) * Co) return;
+    const int ci = k / Co, co = k % Co;
+    float s = 0.f;
+    for (int bx = 0; bx < HZ_NB; bx++) s += part[((size_t)ci * HZ_NB + bx) * 16 + co];
+    if (ci < Ci) gw[co * Ci + ci] += s; else if (gb) gb[co] += s;
+}
+template <typename TG> __global__ void head_bwd_x_z16_k(const __half *__restrict__ gy, const float *__restrict__ w, TG *__restrict__ gx, int Ci, int Co, size_t S, size_t vb, size_t nv) {
+    const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= nv) return;
+    float g[16];
+#pragma unroll
+    for (int co = 0; co < 16; co++) g[co] = co < Co ? __half2float(gy[(size_t)co * nv + i]) : 0.f;
+    for (int ci = 0; ci < Ci; ci++) {
+        float s = 0.f;
+#pragma unroll
+        for (int co = 0; co < 16; co++) if (co < Co) s = fmaf(w[co * Ci + ci], g[co], s);
+        stv(gx, (size_t)ci * S + vb + i, s);
+    }
+}
+static int head_z16_ok(const float *x, const float *gx, shape5 xs, int cout) { return !ISMX(x) && (!gx || !ISMX(gx)) && ABF && xs.n == 1 && cout <= 16; }
 extern "C" int nn_head_fwd_z(const float *x, const nn_gn_t *gx_gn, shape5 xs, const float *w, const float *b, int cout, void *y16, size_t vb, size_t nv) {
-    if (!g_tf32 || !ISMX(x)) return -1;
+    if (!g_tf32) return -1;
+    if (head_z16_ok(x, nullptr, xs, cout)) {
+        exec_prec(0, 0);
+        const size_t S = shape_spatial(xs);
+        if (g_h16) head_fwd_z16_k<f16><<<nblk(nv, 256), 256>>>((const f16 *)x, w, b, (__half *)y16, xs.c, cout, S, vb, nv, to_gnp(gx_gn));
+        else head_fwd_z16_k<bf16><<<nblk(nv, 256), 256>>>((const bf16 *)x, w, b, (__half *)y16, xs.c, cout, S, vb, nv, to_gnp(gx_gn));
+        KCHECK();
+        return 0;
+    }
+    if (!ISMX(x)) return -1;
     exec_prec(0, 0);
     lp_conv1_fwd_mx_h16_r(x, MXDT(x), xs, w, b, cout, y16, to_gnp(gx_gn), vb, nv);
     KCHECK();
@@ -125,6 +202,23 @@ extern "C" int nn_head_fwd_z(const float *x, const nn_gn_t *gx_gn, shape5 xs, co
 extern "C" int nn_head_bwd_z(const float *x, const nn_gn_t *gx_gn, shape5 xs, const void *gy16, int cout, const float *w, float *gw, float *gb, float *gx,
                              size_t vb, size_t nv, int first) {
     static thread_local unsigned seed;
+    if (g_tf32 && head_z16_ok(x, gx, xs, cout) && GBF) {   /* 16-bit storage */
+        static thread_local float *part; static thread_local int pn;
+        const int np = (xs.c + 1) * HZ_NB * 16;
+        if (pn < np) { if (part) cudaFree(part); CK(cudaMalloc(&part, (size_t)np * 4)); pn = np; }
+        const size_t S = shape_spatial(xs);
+        const gnp_t gp = to_gnp(gx_gn);
+        exec_prec(2, 0);
+        if (g_h16) head_bwd_w_z16_k<f16><<<dim3(HZ_NB, xs.c + 1), 256>>>((const f16 *)x, (const __half *)gy16, part, xs.c, cout, S, vb, nv, gp);
+        else head_bwd_w_z16_k<bf16><<<dim3(HZ_NB, xs.c + 1), 256>>>((const bf16 *)x, (const __half *)gy16, part, xs.c, cout, S, vb, nv, gp);
+        head_bwd_w_z16_sum_k<<<nblk((size_t)(xs.c + 1) * cout, 128), 128>>>(part, gw, gb, xs.c, cout);
+        exec_prec(1, 0);
+        if (g_h16) head_bwd_x_z16_k<f16><<<nblk(nv, 256), 256>>>((const __half *)gy16, w, (f16 *)gx, xs.c, cout, S, vb, nv);
+        else head_bwd_x_z16_k<bf16><<<nblk(nv, 256), 256>>>((const __half *)gy16, w, (bf16 *)gx, xs.c, cout, S, vb, nv);
+        KCHECK();
+        (void)first;
+        return 0;
+    }
     if (!g_tf32 || !ISMX(x) || !ISMX(gx) || !GBF || !g_h16) return -1;
     shape5 ys = xs; ys.c = cout;
     if (xs.c != 32) {   /* no fused kernel (16-channel input): the whole path's steps per range -- nn_head_bwd_x's declined draw, the weight /

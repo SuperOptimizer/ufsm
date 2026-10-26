@@ -1915,7 +1915,7 @@ int cmd_train(int argc, char **argv) {
            whole windows, MX activations; -22 B (logits) - 11 B (derived targets) per voxel. UFSM_HEAD_SLAB=0: whole-window head and losses;
            UFSM_HEAD_SLAB_Z: planes per slab (32) */
         g_head_slab = g_gl_inplace && g_unwrap && B == 1 && !split && !g_verso && !g_pap_head && g_side == 2 && g_side_nc == 2
-                      && (g_unwrap2 ? g_side_ch == 0 && g_norm_ch == 2 && g_w4_ch == 9 : g_side_ch == 2 && g_norm_ch == 4) && g_cout == 11 && unet_act_mx() && cfg.widths[0] == 32 && !(getenv("UFSM_HEAD_SLAB") && !atoi(getenv("UFSM_HEAD_SLAB")));   /* (the fused
+                      && (g_unwrap2 ? g_side_ch == 0 && g_norm_ch == 2 && g_w4_ch == 9 : g_side_ch == 2 && g_norm_ch == 4) && g_cout == 11 && (unet_act_mx() || nn_get_act_bf16()) && cfg.widths[0] == 32 && !(getenv("UFSM_HEAD_SLAB") && !atoi(getenv("UFSM_HEAD_SLAB")));   /* (the fused
                                                                                                      slab head backward takes exactly 32 inputs) */
         g_hs_z = getenv("UFSM_HEAD_SLAB_Z") ? atoi(getenv("UFSM_HEAD_SLAB_Z")) : 32;
         if (g_hs_z < 1) g_hs_z = 1;
