@@ -116,7 +116,7 @@ void nn_conv3d_fwd_fp4(const float *x, shape5 xs, const float *w, const float *b
 void nn_conv3d_bwd_weight_fp8(const float *x, shape5 xs, const float *gy, shape5 ys, float *gw, float *gb);
 int nn_get_tf32(void);
 /* 1 when the MX-fp4 / fp8 paths (packed activations, fp8 / fp4 compute) are on: GPUs with the block-scaled tensor cores
-   (compute capability >= 12), or env UFSM_MX_EMU=1 (the software MX kernels of an ARCH=86 build, e.g. on an RTX 3090);
+   (compute capability >= 12) or an ARCH=86 build (its exact software MX kernels, e.g. on an RTX 3090), or env UFSM_MX_EMU=1;
    UFSM_MX_EMU=0 forces them off anywhere. Off: every fp8 / fp4 precision runs as bf16 and MX storage is 16-bit (one log line). */
 int nn_mx_ok(void);
 /* 1: convolution-output GN statistics describe the rounded stored tensor.

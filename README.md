@@ -7,6 +7,9 @@ Design, data inventory and milestones: [DESIGN.md](DESIGN.md).
 
 ```sh
 make && make test        # gcc -std=c23 + nvcc; needs libcurl, libzstd, libblosc, zlib, OpenSSL libcrypto, CUDA 13 (sm_120)
+make ARCH=86             # Ampere (RTX 3090) into build86/: software MX-fp4 / fp8 (bit-exact conversions, emulated block-scaled MMAs)
+                         # (on by default there; UFSM_MX_EMU=0: fp8 / fp4 as bf16, 16-bit storage); PTX=1: compute_86 PTX
+                         # only (build86p/), so a newer GPU runs the sm_86 code (tests); BDIR=build puts it in build/
 ```
 
 ## Commands
