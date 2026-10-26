@@ -747,7 +747,10 @@ static thread_local gnpend_t g_gnpend;
 static int g_gn_defer_req;   /* nn_gn_silu_bwd's caller: the next op is the weight gradient of this gradient (lp_gnpend_request) */
 extern "C" void lp_gnpend_request(int on) { g_gn_defer_req = on; }
 extern "C" int lp_gnpend_env(void) { static int on = -1; if (on < 0) on = getenv("UFSM_GN_DEFER") ? atoi(getenv("UFSM_GN_DEFER")) : 1; return on; }
-extern "C" int lp_gnpend_want(void) { return lp_gnpend_env() && g_gn_defer_req; }
+extern "C" int lp_gnpend_want(void) {   /* (gy records off -- lp_set_gyrec_off(1), UFSM_GYREC=0: the deferral, a records route, too) */
+    static int rec = -1; if (rec < 0) rec = getenv("UFSM_GYREC") ? atoi(getenv("UFSM_GYREC")) != 0 : 1;
+    return lp_gnpend_env() && g_gn_defer_req && rec && g_gyrec_off != 1;
+}
 extern "C" int lp_gn_silu_bwd_apply_defer(const void *x, int xdt, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd,
                                           const void *gy, void *gx, const float *AB, unsigned gsr, unsigned rsr) {
     lp_gnpend_flush();   /* (one pending apply at a time) */
