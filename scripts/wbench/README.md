@@ -14,9 +14,10 @@ of `boxes.tsv` not tagged `label-noise`) plus 4 full-cross-section Paris 4 slab 
 
 ## wgate: the decision for a winding checkpoint (use this to promote / drop arms)
 
-    # laptop: one GPU block (gpuq priority eval), ~30 min; deployed copy in $WB/bin/wb8
-    ~/ufsm-data/capped.sh bash $WB/bin/wb8/wgate.sh CKPT TAG        # -> $WB/gate/TAG/table.txt
-    bash $WB/bin/wb8/wgate-table.sh TAG                            # the table again (or ROWS=$WB/res/old.tsv for old wbench rows)
+    # laptop: boxes in one GPU block (gpuq eval; PRIO=now for top-priority reads), slab sites on forlindesk (wgate-slabs.sh);
+    # deployed copies: laptop $WB/bin/wb19, forlindesk /vesuvius/ufsm/wgate/bin/wb-current (never edit a deployed dir: deploy a new wbN)
+    ~/ufsm-data/capped.sh bash $WB/bin/wb19/wgate.sh CKPT TAG        # -> $WB/gate/TAG/table.txt
+    bash $WB/bin/wb19/wgate-table.sh TAG                            # the table again (or ROWS=$WB/res/old.tsv for old wbench rows)
 
 **What it measures.** The 44 core boxes and the 4 Paris 4 slab sites, against wind96. The wind96 rows and ceilings are cached
 and never re-run: fits are deterministic and identical across binaries, and wind96 predicted with a new build reproduces its old ids.
