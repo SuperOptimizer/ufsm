@@ -1447,8 +1447,8 @@ static int aux_window(source *s, const int64_t o[3], int P, uint8_t *dst) {
 static double rnorm(rng *r) { double u1 = runif(r); const double u2 = runif(r); if (u1 < 1e-300) u1 = 1e-300; return sqrt(-2 * log(u1)) * cos(2 * M_PI * u2); }
 /* train --prev-input: inputs ch0..ch0+3 of one window from its window-unwrapped winding mod 4 (batch.w4: 63 codes per turn, 255 unknown;
    output coordinates): cos / sin of 2 pi W and of 2 pi W / 4, W = w4 / 63, corrupted the way a previous estimate (a fit or a refiner pass)
-   goes wrong: a cold start (all zero, p 0.15), 0-2 half-space slips (W +- 1 beyond a random plane), an octant slip (p 0.3), the packed
-   undercount (p 0.5: W - a ramp of 1-2 turns over 0.5 mm along a random direction, weighted by each 16^3 block's packed fraction, sheets
+   goes wrong (a fit: drift and slips): a cold start (all zero, p 0.15), 0-2 half-space slips (W +- 1 beyond a random plane), an octant slip (p 0.3), the packed
+   undercount (p 0.7: W - a ramp of 1-2 turns over 0.5 mm along a random direction, weighted by each 16^3 block's packed fraction, sheets
    closer than packed_um), slab dropout (p 0.3: zero over 32-96 planes of an axis); unknown voxels zero. Own rng stream (seed): the
    window's other draws are unchanged */
 static void prev_channels(uint64_t seed, const uint8_t *w4, int Pz, int P, double vox_um, double packed_um, float *X, uint16_t *H, int xfmt, int ch0) {
@@ -1462,7 +1462,7 @@ static void prev_channels(uint64_t seed, const uint8_t *w4, int Pz, int P, doubl
         pn[k][0] = a / nn; pn[k][1] = b / nn; pn[k][2] = cc / nn; pc[k][0] = runif(r) * Pz; pc[k][1] = runif(r) * P; pc[k][2] = runif(r) * P; ps[k] = runif(r) < .5 ? -1 : 1; }
     const int oct = runif(r) < 0.3; const int oz = (int)(Pz * (.25 + .5 * runif(r))), oy = (int)(P * (.25 + .5 * runif(r))), ox = (int)(P * (.25 + .5 * runif(r)));
     const int osel = (int)rint_below(r, 8), osh = runif(r) < .5 ? -1 : 1;
-    const int und = runif(r) < 0.5; double ud[3]; { double a = rnorm(r), b = rnorm(r), cc = rnorm(r), nn = sqrt(a * a + b * b + cc * cc) + 1e-9; ud[0] = a / nn; ud[1] = b / nn; ud[2] = cc / nn; }
+    const int und = runif(r) < 0.7; double ud[3]; { double a = rnorm(r), b = rnorm(r), cc = rnorm(r), nn = sqrt(a * a + b * b + cc * cc) + 1e-9; ud[0] = a / nn; ud[1] = b / nn; ud[2] = cc / nn; }
     const double ua = runif(r) < .5 ? 1 : 2, uL = 500.0 / vox_um, ut0 = (runif(r) - .5) * P;
     const int sd = runif(r) < 0.3, sax = (int)rint_below(r, 3), sth = 32 + (int)rint_below(r, 65), s0 = (int)rint_below(r, (sax ? P : Pz));
     /* the packed fraction of each 16^3 block (|grad W| from the w4 codes over +-1 voxel) */
