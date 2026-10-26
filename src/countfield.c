@@ -371,7 +371,7 @@ static float *cf_gauge_solve(const cf_lvl *L0, float *gr, float *gi, int Rg, int
    the model's phase-gauge sums per solve cell (gr / gi) */
 typedef struct {
     const fit_fields *f; int zoff, c0;   /* the chunk (row 0 = box row zoff); the output buffers' row 0 = box row c0 */
-    const cf_lvl *L; const float *ring, *Wz, *Sfine, *cl; int zo, D, H, W, Rz, P, cmode, demod, fine; double keep, wsc, t0, t1;
+    const cf_lvl *L; const float *ring, *Wz, *Sfine, *cl; int zo, D, H, W, Rz, P, cmode, demod, fine, trf; double keep, wsc, t0, t1;
     uint8_t *opc, *ops, *ocl, *osp; const float *gW; float *wc, *gr, *gi; double ag[CF_MAXT][2];   /* osp / gW: --sp-w (sp from |grad W|) */
 } cf_out;
 static void cf_out_run(void *a, long Y0, long Y1, int t) {
@@ -387,7 +387,7 @@ static void cf_out_run(void *a, long Y0, long Y1, int t) {
             if (hypot(pcv0, psv0) > 0.05) { double e = atan2(psv0, pcv0) / (2 * M_PI) - Wo; e -= round(e); Wo += pow(A, O->keep) * e; } }
         if (O->t1 > 0) {   /* --trust: a confident network phase keeps its own position (and count) */
             const double pc1 = (f->pc[i] - 128) / 127.0, ps1 = (f->ps[i] - 128) / 127.0, s = cf_smooth(hypot(pc1, ps1), O->t0, O->t1);
-            if (s > 0) { double e = atan2(ps1, pc1) / (2 * M_PI) - Wo; e -= round(e); Wo += s * e; } }
+            if (s > 0) { double e = atan2(ps1, pc1) / (2 * M_PI) - Wo; e -= round(e); Wo += O->trf ? s * 2 * (sin(2 * M_PI * e) - sin(4 * M_PI * e) / 2 + sin(6 * M_PI * e) / 3) / (2 * M_PI) : s * e; } }   /* --trust-f 1: a periodic continuous pull (no new dislocations) */
         const double cn = (double)P * P * P, cwt = fmin(1, O->Sfine[si] / cn * 2) * exp(-O->cl[si] * O->cl[si] / (2 * 0.25 * 0.25));
         const double pcv = (f->pc[i] - 128) / 127.0, psv = (f->ps[i] - 128) / 127.0, cph = hypot(pcv, psv);
         if (O->gr && f->w[i] && cph >= 1e-3) { const double e = atan2(psv, pcv) - 2 * M_PI * O->Wz[j]; O->gr[si] += (float)(cph * cos(e)); O->gi[si] += (float)(cph * sin(e)); }
@@ -614,7 +614,7 @@ int cmd_count_field(int argc, char **argv) {
     const int nring = 2 * Rz + 1; float *ring = malloc((size_t)nring * 3 * HW * sizeof(float)), *Wring = malloc((size_t)nring * HW * sizeof(float));
     float *gr = *mdir ? calloc(L->n, sizeof(float)) : nullptr, *gi = *mdir ? calloc(L->n, sizeof(float)) : nullptr;
     if (!opc || !ops || !ocl || (doc && !wc) || !ring || !Wring || (*mdir && (!gr || !gi))) { fprintf(stderr, "count-field: out of memory\n"); return 1; }
-    cf_out O = {nullptr, 0, 0, L, ring, nullptr, Sfine, cl, 0, D, H, W, Rz, P, !strcmp(cmode, "w") ? 0 : !strcmp(cmode, "phase") ? 1 : !strcmp(cmode, "pmax") ? 3 : 2, R > 0 ? (gls ? 2 : 1) : 0, atoi(cf_opt(argc, argv, "--fine", "0")), atof(cf_opt(argc, argv, "--keep", "0")), atof(cf_opt(argc, argv, "--conf-w", "1")), tr0, tr1, opc, ops, ocl, osp, gW, wc, gr, gi, {{0}}};
+    cf_out O = {nullptr, 0, 0, L, ring, nullptr, Sfine, cl, 0, D, H, W, Rz, P, !strcmp(cmode, "w") ? 0 : !strcmp(cmode, "phase") ? 1 : !strcmp(cmode, "pmax") ? 3 : 2, R > 0 ? (gls ? 2 : 1) : 0, atoi(cf_opt(argc, argv, "--fine", "0")), atoi(cf_opt(argc, argv, "--trust-f", "0")), atof(cf_opt(argc, argv, "--keep", "0")), atof(cf_opt(argc, argv, "--conf-w", "1")), tr0, tr1, opc, ops, ocl, osp, gW, wc, gr, gi, {{0}}};
     double resid[2][2] = {{0, 0}, {0, 0}};   /* UFSM_CF_RESID: plaquettes, residues (input, output) */
     const int olo = into ? (int)(irow[0] - ioff[0]) : 0, ohi = into ? (int)(irow[1] - ioff[0]) : D;   /* the box rows written */
     for (int b0 = olo; b0 < ohi; b0 += BZ) {
