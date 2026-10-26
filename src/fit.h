@@ -47,6 +47,8 @@ typedef struct {
     double uw_split;                /* > 0: two-level voxel unwrapping: tiles flood their voxels of confidence >= uw_split in parallel,
                                        the pieces are stitched by border votes, then the serial flood does the rest (0: serial only) */
     int uw_tile;                    /* its tile edge (field voxels) */
+    int uw_msf;                     /* 1: the voxel unwrapping as a parallel maximum spanning forest (src/fit.c uw_msf: the flood's tree up to
+                                       the order among equal confidence levels; deterministic, threads) instead of the serial flood (0) */
     double uw_min_conf;             /* the unwrapping's lowest phase confidence (0: 0.3) */
     double uw_pdv;                  /* > 0: the unwrapping quality (flood order, node weights) times exp(-pdv / uw_pdv^2), pdv the
                                        phase derivative variance (turns^2): dislocated / noisy phase is flooded last */

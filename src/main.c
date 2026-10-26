@@ -999,7 +999,43 @@ static void fit_gpu_join(void) {   /* the init thread done; the device selected 
     const double tj = now(); pthread_join(g_fit_gth, nullptr); g_fit_gthr = 0; nn_init(g_fit_gdev);
     if (getenv("UFSM_FIT_TIMES")) fprintf(stderr, "fit times: gpu init wait %.2fs\n", now() - tj);
 }
+/* fit --sweep: the streamed fields of the last run, kept for the next (same directory, optional planes and pooling factors) */
+static int g_fit_sweep;
+static struct { int valid, kskip, kct, nfp, fps[8]; char dir[1400]; fit_fields_buf fb; fit_stream fst; } g_fcache;
+static int cmd_fit(int argc, char **argv);
+/* ufsm fit FIELDS [common options] --sweep FILE: one process, the fields loaded once (GPU fits: device fields and pooled stages
+   shared), then one fit per line of FILE: the line's options (whitespace-separated, '#' comments and blank lines skipped) come first, so
+   they override the common ones; each line needs its own --out (if any). Each run prints "fit sweep: run i/n: <line>" and its usual log;
+   a run's result equals the same options as a single fit (deterministic GPU sums). Options that change the loaded fields (--w-recto,
+   --wind4-weight, --uw-rep-w4, --w-ct, --w-cspacing, --lattice) reload them when they differ from the previous run. */
+static int cmd_fit_sweep(int argc, char **argv, const char *file) {
+    FILE *f = fopen(file, "r"); if (!f) { fprintf(stderr, "fit: cannot read --sweep %s\n", file); return 1; }
+    char *line = nullptr; size_t cap = 0; char **lines = nullptr; int nl = 0;
+    while (getline(&line, &cap, f) > 0) {
+        char *p = line; while (*p == ' ' || *p == '\t') p++;
+        if (!*p || *p == '\n' || *p == '#') continue;
+        p[strcspn(p, "\r\n")] = 0; lines = realloc(lines, (nl + 1) * sizeof *lines); lines[nl++] = strdup(p);
+    }
+    free(line); fclose(f);
+    g_fit_sweep = 1; int bad = 0; const double t0 = now();
+    for (int r = 0; r < nl; r++) {
+        char *buf = strdup(lines[r]); char **av = malloc((argc + 256) * sizeof *av); int ac = 0;
+        av[ac++] = argv[0]; av[ac++] = argv[1]; av[ac++] = argv[2];
+        for (char *q = strtok(buf, " \t"); q && ac < argc + 250; q = strtok(nullptr, " \t")) av[ac++] = q;
+        for (int i = 3; i < argc; i++) { if (!strcmp(argv[i], "--sweep") && i + 1 < argc) { i++; continue; } av[ac++] = argv[i]; }
+        av[ac] = nullptr;
+        printf("fit sweep: run %d/%d: %s\n", r + 1, nl, lines[r]); fflush(stdout); fprintf(stderr, "fit sweep: run %d/%d: %s\n", r + 1, nl, lines[r]);
+        const double tr = now(); const int rc = cmd_fit(ac, av); fflush(stdout);
+        fprintf(stderr, "fit sweep: run %d/%d %s in %.1fs\n", r + 1, nl, rc ? "FAILED" : "done", now() - tr);
+        bad += rc != 0; free(av); free(buf); free(lines[r]);
+    }
+    free(lines);
+    if (g_fcache.valid) { fit_stream_free(&g_fcache.fst); fit_fields_free(&g_fcache.fb); g_fcache.valid = 0; }
+    fprintf(stderr, "fit sweep: %d runs (%d failed) in %.1fs\n", nl, bad, now() - t0);
+    return bad ? 1 : 0;
+}
 static int cmd_fit(int argc, char **argv) {
+    if (!g_fit_sweep && *opt(argc, argv, "--sweep", "")) return cmd_fit_sweep(argc, argv, opt(argc, argv, "--sweep", ""));
     const char *dir = argv[2];
     fit_cfg c = fit_cfg_default();
     c.verbose = arg_index(argc, argv, "--quiet") < 0;
@@ -1023,6 +1059,7 @@ static int cmd_fit(int argc, char **argv) {
         fprintf(stderr, "fit: --phase-robust, --bend and the weights must be >= 0, --conf-pow and --pgrad-delta > 0, --unwrap-voxels -1, 0 or 1\n"); return 2;
     }
     c.uw_split = atof(opt(argc, argv, "--uw-split", "0")); c.uw_tile = atoi(opt(argc, argv, "--uw-tile", "256")); c.uw_pdv = atof(opt(argc, argv, "--uw-pdv", "0")); c.uw_min_conf = atof(opt(argc, argv, "--uw-min-conf", "0.3"));
+    { const char *uf = opt(argc, argv, "--uw-flood", "serial"); c.uw_msf = !strcmp(uf, "msf"); if (!c.uw_msf && strcmp(uf, "serial")) { fprintf(stderr, "fit: --uw-flood serial|msf\n"); return 2; } }   /* the voxel unwrapping: the serial flood or the parallel spanning forest (src/fit.c uw_msf) */
     /* local slip repair (fit_cfg uw_repair): pieces of uw_repair^3 tiles, least-cost integer shifts from their votes and the evidence */
     c.uw_repair = atoi(opt(argc, argv, "--uw-repair", "0")); c.uw_rep_w4 = (float)atof(opt(argc, argv, "--uw-rep-w4", "0"));
     c.uw_rep_geo = (float)atof(opt(argc, argv, "--uw-rep-geo", "0")); c.uw_rep_gd = atoi(opt(argc, argv, "--uw-rep-gd", "8"));
@@ -1073,10 +1110,22 @@ static int cmd_fit(int argc, char **argv) {
     const int use_stream = !c.cpu && !min && slab <= 0 && !ufsm_env_on("UFSM_FIT_NOSTREAM") && !(c.w_pgrad > 0) && !(c.w_cspacing > 0) && !(c.bend > 0) &&
                            !(c.phase_stretch > 0) && !(c.w_ct > 0 && c.ct_flood) && !*opt(argc, argv, "--axis-normal", "");
     struct timespec tl0, tl1; clock_gettime(CLOCK_MONOTONIC, &tl0);
+    int cached = 0;   /* fit --sweep: the streamed fields of an earlier run of this process (same directory, planes and pooling factors) */
     if (use_stream) {
         int fps[8]; const int nfp = fit_stream_fps(&c, fb.h, fps);
-        if (fit_fields_load_stream(dir, &fb, &fst, fps, nfp, fit_gpu_join)) { fprintf(stderr, "fit: cannot load the fields in %s\n", dir); return 1; }
-        fst.drop_pooled = c.dir != 0;   /* (one direction: the pooled planes are not needed after the gradient stages) */
+        const int kskip = (c.w_recto > 0 ? 0 : 1) | (c.w_wind4 > 0 || c.uw_rep_w4 > 0 ? 0 : 2), kct = (c.w_ct > 0 ? 1 : 0) | (c.w_cspacing > 0 ? 2 : 0);
+        if (g_fit_sweep && g_fcache.valid && !strcmp(g_fcache.dir, dir) && g_fcache.kskip == kskip && g_fcache.kct == kct && g_fcache.nfp == nfp && !memcmp(g_fcache.fps, fps, nfp * sizeof *fps)) {
+            fb = g_fcache.fb; fst = g_fcache.fst; cached = 1; fit_gpu_join();
+            if (c.verbose) fprintf(stderr, "fit: the fields of the previous sweep run reused\n");
+        } else {
+            if (g_fcache.valid) { fit_stream_free(&g_fcache.fst); fit_fields_free(&g_fcache.fb); g_fcache.valid = 0; }
+            if (fit_fields_load_stream(dir, &fb, &fst, fps, nfp, fit_gpu_join)) { fprintf(stderr, "fit: cannot load the fields in %s\n", dir); return 1; }
+            if (g_fit_sweep) {
+                snprintf(g_fcache.dir, sizeof g_fcache.dir, "%s", dir); g_fcache.kskip = kskip; g_fcache.kct = kct; g_fcache.nfp = nfp; memcpy(g_fcache.fps, fps, sizeof fps);
+                g_fcache.fb = fb; g_fcache.fst = fst; g_fcache.valid = 1; cached = 1;
+            }
+        }
+        fst.drop_pooled = c.dir != 0 && !cached;   /* (one direction: the pooled planes are not needed after the gradient stages; a sweep keeps them) */
         if (ufsm_env_on("UFSM_FIT_STREAM_VERIFY")) {   /* (tests: the streamed device / pooled planes against the whole host load) */
             fit_fields_buf full; if (fit_fields_load(dir, 0, 0, 1, &full)) return 1;
             const int bad = fit_stream_verify(&fst, &full.f); fit_fields_free(&full);
@@ -1151,8 +1200,9 @@ static int cmd_fit(int argc, char **argv) {
     if (!min) { fs->global->um = fb.um; for (int k = 0; k < fs->n; k++) fs->slab[k]->um = fb.um; }
     const long long org[3] = {m->origin[0], m->origin[1], m->origin[2]};
     const int shp[3] = {fb.shape[0], fb.shape[1], fb.shape[2]}; const double h = fb.h;
-    fit_stream_free(&fst); c.stream = nullptr;   /* the fields are done with: the exports and the score read the model and the axis (--winding-gate reloads them) */
-    for (int k = 0; k < 17; k++) { free(fb.a[k]); fb.a[k] = nullptr; }
+    c.stream = nullptr;   /* the fields are done with: the exports and the score read the model and the axis (--winding-gate reloads them) */
+    if (!cached) { fit_stream_free(&fst); for (int k = 0; k < 17; k++) { free(fb.a[k]); fb.a[k] = nullptr; } }
+    else for (int k = 0; k < 17; k++) fb.a[k] = nullptr;   /* (the sweep cache owns them and the axis) */
     fprintf(stderr, "fit: dir %+d, %d slab model(s), global lattice %d (%dx%dx%d), loss %.5f in %.1fs\n", m->dir, fs->n, m->L, m->lz, m->ly, m->lx, m->loss[0], now() - t0);
     const char *mout = opt(argc, argv, "--out", nullptr);
     if (mout && (fs->n ? fit_set_save(fs, mout) : fit_save(fs->global, mout))) { fprintf(stderr, "fit: cannot save %s\n", mout); return 1; }
@@ -1166,7 +1216,7 @@ static int cmd_fit(int argc, char **argv) {
                 c.w_ct, c.ct_pow, c.ct_phi, c.ct_floor, c.ct_radius_um, c.ct_flood, c.w_cspacing, c.cs_tol, c.phase_robust, c.conf_pow, c.bend, c.unwrap_voxels, c.uw_min_conf,
                 c.uw_repair, c.uw_rep_w4, c.uw_rep_geo, c.uw_rep_gd, c.uw_rep_cs, c.uw_rep_qpow, c.uw_rep_stretch, c.uw_rep_sr, (double)c.uw_rep_emb, (double)c.phase_stretch, c.phase_stretch_r, c.phase_stage, slab, c.cpu, c.um);
         for (int k = 0; k < c.nstage; k++) fprintf(cf, "%s%d", k ? "," : "", c.lattice[k]);
-        fprintf(cf, "]}\n"); if (fclose(cf)) { fprintf(stderr, "fit: cannot save %s\n", cp); return 1; }
+        fprintf(cf, "]%s}\n", c.uw_msf ? ",\"uw_flood\":\"msf\"" : ""); if (fclose(cf)) { fprintf(stderr, "fit: cannot save %s\n", cp); return 1; }
     }
     const char *wout = opt(argc, argv, "--winding", nullptr);
     if (wout) {   /* the per-voxel winding number W * 256 (uint16, exact volcomp typed chunks) on a grid of --winding-step native voxels;
@@ -1294,7 +1344,7 @@ static int cmd_fit(int argc, char **argv) {
         fit_set_dev_free(gd); z3_close(z); if (dump) fclose(dump);
         if (rc) return 1;
     }
-    fit_set_free(fs); fit_fields_free(&fb);
+    fit_set_free(fs); if (!cached) fit_fields_free(&fb);
     return 0;
 }
 

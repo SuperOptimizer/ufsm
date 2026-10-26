@@ -309,7 +309,7 @@ typedef struct {
     float qb[64]; size_t sb[64];            /* per thread: the best confidence and its voxel */
     double *acc, *wsum;
 } uw_ctx;
-/* the records: fresh anonymous zero pages (= UK_UNSET, bk 0), written only where a voxel can be unwrapped. Up to UFSM_UW_HUGE_GB (1)
+/* the records: fresh anonymous zero pages (= UK_UNSET, bk 0), written only where a voxel can be unwrapped. Up to UFSM_UW_HUGE_GB (default 0: never; huge pages stall in direct compaction when memory is fragmented, 15 s seen on a 10 M-voxel box)
    on transparent huge pages (the flood is memory-latency bound: fewer TLB misses), above that on 4 KB pages (one 8^3 brick per page),
    so a full cross-section (~6% of its voxels reached) takes the bricks with material, not 8 B per voxel; *base / *len: the mapping
    (munmap) */
@@ -317,7 +317,7 @@ static void *uw_alloc_records(size_t bytes, void **base, size_t *len) {
     const size_t A = (size_t)2 << 20; bytes = (bytes + A - 1) / A * A;
     void *p = mmap(nullptr, bytes + A, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     if (p == MAP_FAILED) return nullptr;
-    const char *e = getenv("UFSM_UW_HUGE_GB"); const double hg = e ? atof(e) : 1.0;
+    const char *e = getenv("UFSM_UW_HUGE_GB"); const double hg = e ? atof(e) : 0.0;
     uint8_t *a = (uint8_t *)(((uintptr_t)p + A - 1) / A * A);   /* (2 MB aligned inside the mapping) */
     madvise(a, bytes, (double)bytes <= hg * 1e9 ? MADV_HUGEPAGE : MADV_NOHUGEPAGE);
     *base = p; *len = bytes + A;
@@ -990,6 +990,169 @@ static void uw_repair(uw_ctx *x, size_t nr, const fit_cfg *c) {
     free(k0); free(ks);
 }
 
+/* Parallel voxel unwrapping (fit_cfg uw_msf): the serial flood grows a quality-ordered spanning tree from the seed (each voxel takes
+   its integer from its first popped neighbour); here the same kind of tree is built in parallel as the maximum spanning forest of the
+   unwrappable voxels' 6-neighbour graph under a total edge order (weight = the lower confidence level of the two voxels, then the
+   higher, then the lower edge id): Boruvka rounds (each component picks its best outgoing edge, components hook along them, pointer
+   jumping), integers carried as union-find potentials (k_b = k_a + round(uw_a - uw_b) along every tree edge, the flood's step). The
+   forest is unique for a total order, so the result does not depend on threads or timing. It equals the flood's tree up to the
+   order among equal confidence levels (the flood: first popped, FIFO; here: the higher partner level, then the edge id), which only
+   matters where such ties close a loop around a dislocation. The seed's component gets the integers, the rest stays unreached, as
+   the flood. Memory: ~20 B per unwrappable voxel (compact ids). */
+typedef struct {
+    uw_ctx *x; size_t nb;                 /* bricks of 512 records */
+    uint64_t *mask; uint16_t *pre; uint32_t *base;   /* per brick: valid-record bits, cumulative counts per 64-bit word, first compact id */
+    uint32_t *rec;                        /* compact id -> record id */
+    uint32_t *par; int32_t *pot;          /* union-find over compact ids (par: the root after each round; pot: k_v - k_root) */
+    uint32_t *par2; int32_t *pot2;        /* (pointer jumping: double buffers) */
+    _Atomic uint64_t *best;               /* per root: the best outgoing edge key (0 none) */
+    uint32_t *roots; size_t nroots;       /* the current roots (compact ids) */
+    _Atomic size_t hooks; size_t nv;
+} msf_ctx;
+static inline uint32_t msf_cid(const msf_ctx *M, uint32_t id) {
+    const size_t b = id >> 9; const unsigned r = id & 511, w = r >> 6, bit = r & 63;
+    return M->base[b] + M->pre[b * 8 + w] + (uint32_t)__builtin_popcountll(M->mask[b * 8 + w] & ((1ull << bit) - 1));
+}
+static void msf_mask(void *a, int b0, int b1, int t) {   /* bricks [b0, b1): valid bits and counts */
+    msf_ctx *M = a; const uw_vox *V = M->x->V;
+    for (size_t b = (size_t)b0; b < (size_t)b1; b++) {
+        unsigned c = 0;
+        for (int w = 0; w < 8; w++) {
+            uint64_t m = 0; for (int k = 0; k < 64; k++) m |= (uint64_t)(V[(b << 9) + w * 64 + k].bk != 0) << k;
+            M->mask[b * 8 + w] = m; M->pre[b * 8 + w] = (uint16_t)c; c += (unsigned)__builtin_popcountll(m);
+        }
+        M->base[b] = c;   /* (the count; prefix-summed after) */
+    }
+}
+static void msf_init(void *a, int b0, int b1, int t) {   /* compact ids: records, every node its own root */
+    msf_ctx *M = a;
+    for (size_t b = (size_t)b0; b < (size_t)b1; b++) for (int w = 0; w < 8; w++) {
+        uint64_t m = M->mask[b * 8 + w];
+        while (m) { const int k = __builtin_ctzll(m); m &= m - 1; const uint32_t id = (uint32_t)((b << 9) + w * 64 + k), c = msf_cid(M, id); M->rec[c] = id; M->par[c] = c; M->pot[c] = 0; }
+    }
+}
+static inline uint64_t msf_key(unsigned lo, unsigned hi, uint64_t eid) { return (uint64_t)lo << 46 | (uint64_t)hi << 34 | ((((uint64_t)1 << 34) - 1) - eid); }
+static inline void msf_amax(_Atomic uint64_t *p, uint64_t v) { uint64_t o = atomic_load_explicit(p, memory_order_relaxed); while (o < v && !atomic_compare_exchange_weak_explicit(p, &o, v, memory_order_relaxed, memory_order_relaxed)) {} }
+/* the neighbour of record id along axis ax (0 z, 1 y, 2 x; +1), or UINT32_MAX outside the box or not unwrappable */
+static inline uint32_t msf_nbr(const msf_ctx *M, uint32_t id, int ax) {
+    const uw_geo *g = &M->x->g; int z, y, xx; ub_zyx(g, id, &z, &y, &xx);
+    if (ax == 0) { if (++z >= g->D) return UINT32_MAX; } else if (ax == 1) { if (++y >= g->H) return UINT32_MAX; } else { if (++xx >= g->W) return UINT32_MAX; }
+    const uint32_t j = ub_id(g, z, y, xx); return M->x->V[j].bk ? j : UINT32_MAX;
+}
+static void msf_edges(void *a, int b0, int b1, int t) {   /* every edge between two components: both roots' best */
+    msf_ctx *M = a; const uw_vox *V = M->x->V;
+    for (size_t b = (size_t)b0; b < (size_t)b1; b++) for (int w = 0; w < 8; w++) {
+        uint64_t m = M->mask[b * 8 + w];
+        while (m) {
+            const int k = __builtin_ctzll(m); m &= m - 1; const uint32_t id = (uint32_t)((b << 9) + w * 64 + k), cu = msf_cid(M, id), ru = M->par[cu];
+            for (int ax = 0; ax < 3; ax++) {
+                const uint32_t j = msf_nbr(M, id, ax); if (j == UINT32_MAX) continue;
+                const uint32_t cv = msf_cid(M, j), rv = M->par[cv]; if (ru == rv) continue;
+                const unsigned bu = V[id].bk, bv = V[j].bk;
+                const uint64_t key = msf_key(bu < bv ? bu : bv, bu < bv ? bv : bu, (uint64_t)cu * 3 + ax);
+                msf_amax(&M->best[ru], key); msf_amax(&M->best[rv], key);
+            }
+        }
+    }
+}
+static inline double msf_d(const uw_vox *V, uint32_t a, uint32_t b) { return round((double)V[a].uw - (double)V[b].uw); }   /* k_b - k_a */
+static void msf_hook(void *a, int i0, int i1, int t) {   /* each root with an edge: its parent root and potential (mutual best: the lower root stays) */
+    msf_ctx *M = a; const uw_vox *V = M->x->V; size_t nh = 0;
+    for (size_t i = (size_t)i0; i < (size_t)i1; i++) {
+        const uint32_t r = M->roots[i]; const uint64_t key = atomic_load_explicit(&M->best[r], memory_order_relaxed);
+        M->par2[r] = r; M->pot2[r] = 0;
+        if (!key) continue;
+        const uint64_t eid = (((uint64_t)1 << 34) - 1) - (key & (((uint64_t)1 << 34) - 1)); const uint32_t cu = (uint32_t)(eid / 3); const int ax = (int)(eid % 3);
+        const uint32_t iu = M->rec[cu], iv = msf_nbr(M, iu, ax), cv = msf_cid(M, iv);
+        const uint32_t ru = M->par[cu], rv = M->par[cv], s = ru == r ? rv : ru;   /* the other side's root */
+        if (atomic_load_explicit(&M->best[s], memory_order_relaxed) == key && r < s) continue;   /* mutual: r stays a root */
+        /* k_r - k_s from the edge: k_iv = k_iu + d(iu, iv); k_x = k_root(x) + pot(x) */
+        const int32_t d = (int32_t)msf_d(V, iu, iv);
+        M->par2[r] = s; M->pot2[r] = ru == r ? M->pot[cv] - M->pot[cu] - d : M->pot[cu] - M->pot[cv] + d;
+        nh++;
+    }
+    atomic_fetch_add(&M->hooks, nh);
+}
+static void msf_jump(void *a, int i0, int i1, int t) {   /* one pointer-jumping step over the roots: par2 / pot2 -> par / pot (as scratch) */
+    msf_ctx *M = a;
+    for (size_t i = (size_t)i0; i < (size_t)i1; i++) {
+        const uint32_t r = M->roots[i], p = M->par2[r];
+        M->par[r] = M->par2[p]; M->pot[r] = M->pot2[r] + (p != r ? M->pot2[p] : 0);
+    }
+}
+static void msf_copyback(void *a, int i0, int i1, int t) {   /* par / pot -> par2 / pot2 (the next jumping step reads them) */
+    msf_ctx *M = a; for (size_t i = (size_t)i0; i < (size_t)i1; i++) { const uint32_t r = M->roots[i]; M->par2[r] = M->par[r]; M->pot2[r] = M->pot[r]; }
+}
+/* every node c: r = par[c] its round-start root (or, for a hooked root, already its final root, whose par2 / pot2 are itself / 0)
+   -> the final root par2[r], potential + pot2[r] (reads only the roots' par2 / pot2, writes only c's own entries) */
+static void msf_relabel(void *a, int c0, int c1, int t) {
+    msf_ctx *M = a;
+    for (size_t c = (size_t)c0; c < (size_t)c1; c++) { const uint32_t r = M->par[c]; M->pot[c] += M->pot2[r]; M->par[c] = M->par2[r]; }
+}
+static size_t uw_msf(uw_ctx *x, size_t nr, uint32_t sid, int32_t kseed, int verbose) {
+    msf_ctx M = {.x = x, .nb = nr >> 9}; const double t0 = nn_wall_seconds();
+    M.mask = malloc(M.nb * 8 * sizeof *M.mask); M.pre = malloc(M.nb * 8 * sizeof *M.pre); M.base = malloc((M.nb + 1) * sizeof *M.base);
+    if (!M.mask || !M.pre || !M.base) { free(M.mask); free(M.pre); free(M.base); return (size_t)-1; }
+    fit_zpar((int)M.nb, fit_nthreads((int)M.nb), msf_mask, &M);
+    size_t nv = 0; for (size_t b = 0; b < M.nb; b++) { const uint32_t c = M.base[b]; M.base[b] = (uint32_t)nv; nv += c; }
+    M.base[M.nb] = (uint32_t)nv; M.nv = nv;
+    if (nv >= ((uint64_t)1 << 32) / 3) { free(M.mask); free(M.pre); free(M.base); return (size_t)-1; }
+    M.rec = malloc(nv * 4); M.par = malloc(nv * 4); M.pot = malloc(nv * 4); M.par2 = malloc(nv * 4); M.pot2 = malloc(nv * 4); M.best = malloc(nv * 8); M.roots = malloc(nv * 4);
+    if (!M.rec || !M.par || !M.pot || !M.par2 || !M.pot2 || !M.best || !M.roots) { free(M.rec); free(M.par); free(M.pot); free(M.par2); free(M.pot2); free(M.best); free(M.roots); free(M.mask); free(M.pre); free(M.base); return (size_t)-1; }
+    fit_zpar((int)M.nb, fit_nthreads((int)M.nb), msf_init, &M);
+    for (size_t c = 0; c < nv; c++) M.roots[c] = (uint32_t)c;
+    M.nroots = nv; int rounds = 0;
+    while (M.nroots > 1) {
+        for (size_t i = 0; i < M.nroots; i++) atomic_store_explicit(&M.best[M.roots[i]], 0, memory_order_relaxed);
+        fit_zpar((int)M.nb, fit_nthreads((int)M.nb), msf_edges, &M);
+        atomic_store(&M.hooks, 0);
+        const int nri = (int)M.nroots, ntr = fit_nthreads(nri);
+        fit_zpar(nri, ntr, msf_hook, &M);
+        rounds++;
+        if (!atomic_load(&M.hooks)) break;
+        /* pointer jumping over the roots until every root points at a final root (par2 / pot2 hold the current pointers) */
+        for (int it = 0; it < 64; it++) {
+            fit_zpar(nri, ntr, msf_jump, &M);
+            int moved = 0; for (size_t i = 0; i < M.nroots; i++) { const uint32_t r = M.roots[i]; if (M.par[r] != M.par2[r]) { moved = 1; break; } }
+            fit_zpar(nri, ntr, msf_copyback, &M);
+            if (!moved) break;
+        }
+        /* the non-roots follow their roots (roots already hold their final root and potential in par / pot = par2 / pot2) */
+        fit_zpar((int)nv, fit_nthreads((int)nv), msf_relabel, &M);
+        size_t k = 0; for (size_t i = 0; i < M.nroots; i++) { const uint32_t r = M.roots[i]; if (M.par[r] == r) M.roots[k++] = r; }
+        M.nroots = k;
+    }
+    /* the integers: the seed's component, k_seed fixed */
+    const uint32_t cs = msf_cid(&M, sid), R = M.par[cs]; const int32_t kR = kseed - M.pot[cs];
+    size_t reached = 0, over = 0; uw_vox *V = x->V;
+    for (size_t c = 0; c < nv; c++) {
+        if (M.par[c] != R) continue;
+        const int64_t k = (int64_t)kR + M.pot[c];
+        if (k <= UK_UNSET || k > INT16_MAX) { over++; continue; }
+        V[M.rec[c]].k = (int16_t)k; reached++;
+    }
+    if (over) atomic_fetch_add(&x->over, over);
+    if (verbose) fprintf(stderr, "fit: voxel unwrapping (spanning forest): %zu voxels, %d rounds, %.1fs\n", nv, rounds, nn_wall_seconds() - t0);
+    free(M.rec); free(M.par); free(M.pot); free(M.par2); free(M.pot2); free(M.best); free(M.roots); free(M.mask); free(M.pre); free(M.base);
+    return reached;
+}
+typedef struct { const fit_model *m; uint8_t *have; double *corr; int changed[64]; } nf_job;
+static void uw_nodefill(void *a, int a0, int a1, int t) {   /* lattice z planes [a0, a1): one pass of the node fill */
+    nf_job *J = a; const fit_model *m = J->m; int changed = 0;
+    for (size_t k = (size_t)a0 * m->ly * m->lx; k < (size_t)a1 * m->ly * m->lx; k++) {
+        if (J->have[k]) continue;
+        const int aa = (int)(k / ((size_t)m->ly * m->lx)), b = (int)((k / m->lx) % m->ly), cc = (int)(k % m->lx);
+        double sm = 0; int cnt = 0;
+        const int nb[6][3] = {{aa - 1, b, cc}, {aa + 1, b, cc}, {aa, b - 1, cc}, {aa, b + 1, cc}, {aa, b, cc - 1}, {aa, b, cc + 1}};
+        for (int q = 0; q < 6; q++) {
+            if (nb[q][0] < 0 || nb[q][1] < 0 || nb[q][2] < 0 || nb[q][0] >= m->lz || nb[q][1] >= m->ly || nb[q][2] >= m->lx) continue;
+            const size_t j = ((size_t)nb[q][0] * m->ly + nb[q][1]) * m->lx + nb[q][2];
+            if (J->have[j] == 1) { sm += J->corr[j]; cnt++; }
+        }
+        if (cnt) { J->corr[k] = sm / cnt; J->have[k] = 2; changed = 1; }
+    }
+    J->changed[t] = changed;
+}
 static size_t fit_unwrap_voxels(fit_model *m, const fit_fields *f, double min_conf, const fit_cfg *c) {
     const size_t n = (size_t)f->D * f->H * f->W; const int na = (int)(f->D * f->h) + 1;
     const uw_geo g = {f->D, f->H, f->W, (f->H + UB_M) / UB_S, (f->W + UB_M) / UB_S};
@@ -1021,15 +1184,18 @@ static size_t fit_unwrap_voxels(fit_model *m, const fit_fields *f, double min_co
                     const uint32_t id = ub_id(&g, z, y, xx); if (V[id].bk && V[id].k != UK_UNSET) { reached++; uq_push(&q, id, V[id].bk); }
                 }
             }
+            size_t rm = (size_t)-1;
             if (!reached) {
                 const int z = (int)(seed / ((size_t)f->H * f->W)), y = (int)((seed / f->W) % f->H), xx = (int)(seed % f->W);
                 const double pz = (z + 0.5) * f->h, py = (y + 0.5) * f->h, px = (xx + 0.5) * f->h;
                 const double th = atan2(py - axis_lerp(f->cy, na, pz), px - axis_lerp(f->cx, na, pz));
                 const double Um = fit_W(m, pz, py, px) + m->dir * th / (2 * M_PI);
-                const uint32_t sid = ub_id(&g, z, y, xx);
-                V[sid].k = (int16_t)((int32_t)round(Um - V[sid].uw) - x.kb); reached = 1; uq_push(&q, sid, V[sid].bk);
+                const uint32_t sid = ub_id(&g, z, y, xx); const int32_t ks = (int32_t)round(Um - V[sid].uw) - x.kb;
+                if (c->uw_msf && !c->seed) rm = uw_msf(&x, nr, sid, ks, c->verbose);   /* the parallel spanning forest (seeded fits: the flood) */
+                if (rm == (size_t)-1) { V[sid].k = (int16_t)ks; reached = 1; uq_push(&q, sid, V[sid].bk); }
             }
-            reached += uw_flood(&x, &q, &(uw_box){0, f->D, 0, f->H, 0, f->W, 1, nullptr, 0});
+            if (rm != (size_t)-1) reached = rm;
+            else reached += uw_flood(&x, &q, &(uw_box){0, f->D, 0, f->H, 0, f->W, 1, nullptr, 0});
         }
     }
     uq_free(&q);
@@ -1041,20 +1207,11 @@ static size_t fit_unwrap_voxels(fit_model *m, const fit_fields *f, double min_co
     fit_zpar(f->D, x.nt, uw_accum, &x);
     uint8_t *have = calloc(nl, 1); double *corr = calloc(nl, sizeof(double));
     for (size_t k = 0; k < nl; k++) if (x.wsum[k] > 0) { corr[k] = x.acc[k] / x.wsum[k]; have[k] = 1; }
-    for (int pass = 0; pass < 64; pass++) {   /* nodes without voxels: the mean of their neighbours */
-        int changed = 0;
-        for (size_t k = 0; k < nl; k++) {
-            if (have[k]) continue;
-            const int a = (int)(k / ((size_t)m->ly * m->lx)), b = (int)((k / m->lx) % m->ly), cc = (int)(k % m->lx);
-            double sm = 0; int cnt = 0;
-            const int nb[6][3] = {{a - 1, b, cc}, {a + 1, b, cc}, {a, b - 1, cc}, {a, b + 1, cc}, {a, b, cc - 1}, {a, b, cc + 1}};
-            for (int t = 0; t < 6; t++) {
-                if (nb[t][0] < 0 || nb[t][1] < 0 || nb[t][2] < 0 || nb[t][0] >= m->lz || nb[t][1] >= m->ly || nb[t][2] >= m->lx) continue;
-                const size_t j = ((size_t)nb[t][0] * m->ly + nb[t][1]) * m->lx + nb[t][2];
-                if (have[j] == 1) { sm += corr[j]; cnt++; }
-            }
-            if (cnt) { corr[k] = sm / cnt; have[k] = 2; changed = 1; }
-        }
+    for (int pass = 0; pass < 64; pass++) {   /* nodes without voxels: the mean of their neighbours (a pass reads only earlier passes'
+                                                 nodes, have 1, and writes only have-0 nodes: lattice z planes on threads, the serial result) */
+        nf_job J = {m, have, corr, {0}};
+        fit_zpar(m->lz, fit_nthreads(m->lz), uw_nodefill, &J);
+        int changed = 0; for (int t = 0; t < 64; t++) changed |= J.changed[t];
         for (size_t k = 0; k < nl; k++) if (have[k] == 2) have[k] = 1;
         if (!changed) break;
     }
