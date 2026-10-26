@@ -25,7 +25,7 @@ REF=${REF:-wind96}; BOXES=${BOXES:-core}; SITES=${SITES-4624 5392 5904 6672}; RE
 BT=${BT:-$H/boxes.tsv}; FIT=""; FIELDS=""
 GF="--gpu $GPU"; BIN=$(sha1sum $U | cut -c1-8); FCFG=$(echo "$BIN --dir 1 --uw-repair 8 " | sha1sum | cut -c1-8)
 O=$WB/gate/$TAG; FD=$WB/fields/$TAG; mkdir -p $O/ready $O/claim $FD $CACHE
-RES=$O/rows.tsv; RS=$O/slabs.tsv; RR=$O/radius.tsv; RREF=$WB/res/$REF.tsv
+RES=$O/rows.tsv; RS=$O/slabs.tsv; RR=$O/radius.tsv; RREF=$WB/res/$REF.tsv; [ -s $RREF ] || RREF=$WB/gate/$REF/rows.tsv   # REF: res rows (wind96) or a wgate run (e.g. wind96fd)
 [ -s $RREF ] || { echo "no baseline rows $RREF"; exit 2; }
 eval "$(sed -n '/^scroll() {/,/^# ---- boxes ----/p' $H/wbench.sh)"   # scroll, predict, fitsc, g_* (wbench.sh is the reference)
 GQ=$H/gpuq.sh; [ -e $GQ ] || GQ=$H/../gpuq.sh; GPUQ_LOCK=${LOCK:-}; . $GQ

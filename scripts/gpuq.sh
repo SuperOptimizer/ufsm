@@ -20,7 +20,8 @@
 # Env: GPUQ_LOCK (default $LOCK, else ~/ufsm-data/gpu.lock), GPUQ_DIR (tickets; default <lock dir>/gpuq), GPUQ_POLL.
 
 GPUQ_LOCK=${GPUQ_LOCK:-${LOCK:-$HOME/ufsm-data/gpu.lock}}
-GPUQ_DIR=${GPUQ_DIR:-$(dirname "$GPUQ_LOCK")/gpuq}
+# tickets: <lock dir>/gpuq for the laptop gpu.lock (the queue every laptop job shares), <lock>.q for any other lock (one queue per GPU)
+GPUQ_DIR=${GPUQ_DIR:-$( [ "$(basename "$GPUQ_LOCK")" = gpu.lock ] && echo "$(dirname "$GPUQ_LOCK")/gpuq" || echo "${GPUQ_LOCK%.lock}.q" )}
 GPUQ_POLL=${GPUQ_POLL:-0.5}
 
 gpuq_prio() { case $1 in 0|now) echo 0;; 1|eval) echo 1;; 2|bg) echo 2;; *) echo "gpuq: priority $1 (0|now 1|eval 2|bg)" >&2; return 1;; esac; }

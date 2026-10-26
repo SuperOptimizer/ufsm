@@ -9,6 +9,7 @@ SITE=${SITE:-$([ -d $HOME/ufsm-data ] && echo laptop || echo desk)}; GPU=0; . $H
 TAG=$1; REF=${2:-wind96}; O=$WB/gate/$TAG; ST=${STATS:-$WB/bin/ufsm-gate}
 ROWS=${ROWS:-$O/rows.tsv}; SLABS=${SLABS:-$O/slabs.tsv}; RADIUS=${RADIUS:-$O/radius.tsv}
 RR=$WB/res/$REF.tsv; RS=$WB/res/$REF-slabs.tsv; RRAD=$WB/res/$REF-radius.tsv; ORC=$WB/res/slaborc-net-slabs.tsv
+[ -s $RR ] || { RR=$WB/gate/$REF/rows.tsv; RS=$WB/gate/$REF/slabs.tsv; RRAD=$WB/gate/$REF/radius.tsv; }   # REF a wgate run (wind96fd)
 [ -s $ROWS ] || { echo "no rows $ROWS"; exit 2; }
 # the baseline's ceilings decide the clean set for both sides (rows without a ceil get REF's)
 T=$(mktemp -d); trap 'rm -rf $T' EXIT
