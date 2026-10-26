@@ -905,9 +905,17 @@ static void uw_repair1(uw_ctx *x, size_t nr, const fit_cfg *c, int o_) {
         }
     }
     nv = l1_votes_merge(v, nv);
+    {   /* UFSM_L1_DUMP=PATH: the solve's input (n, nv, then the merged votes) for ufsm l1-bench */
+        const char *dp = getenv("UFSM_L1_DUMP");
+        if (dp && *dp) { FILE *fo = fopen(dp, "wb"); const uint64_t n64 = nn, nv64 = nv; int bad = !fo;
+            if (fo) { bad |= fwrite(&n64, 8, 1, fo) != 1 || fwrite(&nv64, 8, 1, fo) != 1 || (nv && fwrite(v, sizeof *v, nv, fo) != nv); bad |= fclose(fo) != 0; }
+            if (bad) fprintf(stderr, "fit: cannot write the repair dump %s\n", dp); else fprintf(stderr, "fit: repair votes dumped to %s\n", dp);
+            if (getenv("UFSM_L1_DUMP_EXIT")) exit(bad); }
+    }
     const double t1 = nn_wall_seconds();
     int32_t *s = calloc(nn ? nn : 1, sizeof *s); l1_stats st = {0};
     if (l1_solve(nn, v, nv, s, 256, &st)) fprintf(stderr, "fit: out of memory for the slip repair's solve (skipped)\n");
+    if (st.capped) fprintf(stderr, "fit: slip repair: the max-flow work budget stopped the moves after %d max flows (%d moves, L1 %lld -> %lld, %.1fs); the last move's integers kept\n", st.iters, st.moves, (long long)st.e0, (long long)st.e1, st.secs);
     if (nn > np) { const int32_t s0 = s[np]; for (uint64_t k = 0; k < np; k++) s[k] -= s0; }   /* the anchor's gauge */
     if (c->verbose && na) fprintf(stderr, "fit: slip repair: %zu pieces anchored to the seed model's integers (weight %g)\n", na, (double)c->uw_rep_seed);
     const double t2 = nn_wall_seconds();

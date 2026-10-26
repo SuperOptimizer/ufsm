@@ -11,6 +11,7 @@
 #include "store.h"
 #include "zarr3.h"
 #include "fit.h"
+#include "l1pot.h"
 #include "fit_emb.h"
 #include "unet.h"
 #include "checkpoint.h"
@@ -2618,6 +2619,30 @@ static double hist_q(const size_t *h, int nb, double lo, double w, double q) {  
     size_t c = 0; for (int k = 0; k < nb; k++) { c += h[k]; if (n && (double)c >= q * n) return lo + (k + 0.5) * w; }
     return lo + nb * w;
 }
+/* ufsm l1-bench FILE [--iters 256]: the slip repair's L1 solve on a dumped vote set (fit with UFSM_L1_DUMP=FILE): time, moves, energy
+   and a hash of the shifts (bit-identity checks between solver versions) */
+static int cmd_l1_bench(int argc, char **argv) {
+    if (argc < 3) { fprintf(stderr, "usage: ufsm l1-bench FILE [--iters 256]\n"); return 2; }
+    FILE *f = fopen(argv[2], "rb"); uint64_t n = 0, nv = 0;
+    if (!f || fread(&n, 8, 1, f) != 1 || fread(&nv, 8, 1, f) != 1) { fprintf(stderr, "l1-bench: cannot read %s\n", argv[2]); return 1; }
+    l1_vote *v = malloc((nv ? nv : 1) * sizeof *v); int32_t *s = calloc(n ? n : 1, sizeof *s);
+    if (!v || !s || fread(v, sizeof *v, nv, f) != nv) { fprintf(stderr, "l1-bench: short read\n"); return 1; }
+    fclose(f);
+    {   /* the votes' offsets (a huge offset makes the +-1 moves crawl) */
+        size_t h[5] = {0}; int64_t dmax = 0; size_t imax = 0;
+        for (uint64_t k = 0; k < nv; k++) { const int64_t a = v[k].d < 0 ? -(int64_t)v[k].d : v[k].d; h[a == 0 ? 0 : a == 1 ? 1 : a <= 4 ? 2 : a <= 64 ? 3 : 4]++; if (a > dmax) { dmax = a; imax = k; } }
+        printf("l1-bench: vote offsets 0: %zu, 1: %zu, 2-4: %zu, 5-64: %zu, > 64: %zu; max %lld (nodes %u %u, weight %lld)\n", h[0], h[1], h[2], h[3], h[4],
+               (long long)dmax, nv ? v[imax].a : 0, nv ? v[imax].b : 0, nv ? (long long)v[imax].w : 0);
+    }
+    l1_stats st = {0};
+    if (l1_solve((uint32_t)n, v, nv, s, atoi(opt(argc, argv, "--iters", "256")), &st)) { fprintf(stderr, "l1-bench: solve failed\n"); return 1; }
+    uint64_t hsh = 1469598103934665603ull; size_t nz = 0;
+    for (uint64_t k = 0; k < n; k++) { hsh = (hsh ^ (uint32_t)s[k]) * 1099511628211ull; nz += s[k] != 0; }
+    printf("l1-bench: %llu nodes, %llu votes, %zu edges: E %lld -> %lld in %d moves (%d max flows), %zu nodes shifted, %.2f s, work %llu%s, hash %016llx\n",
+           (unsigned long long)n, (unsigned long long)nv, st.nedge, (long long)st.e0, (long long)st.e1, st.moves, st.iters, nz, st.secs, (unsigned long long)st.work, st.capped ? " (budget reached)" : "", (unsigned long long)hsh);
+    free(v); free(s);
+    return 0;
+}
 static int cmd_fit_compare(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: ufsm fit-compare <reference-fields> <fields>\n"); return 2; }
     fit_fields_buf A, B;
@@ -3503,6 +3528,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "self-gate")) return cmd_self_gate(argc, argv);
     if (!strcmp(cmd, "ct-fields")) return cmd_ct_fields(argc, argv);
     if (!strcmp(cmd, "fit-compare")) return cmd_fit_compare(argc, argv);
+    if (!strcmp(cmd, "l1-bench")) return cmd_l1_bench(argc, argv);
     if (!strcmp(cmd, "field-blend")) return cmd_field_blend(argc, argv);
     if (!strcmp(cmd, "gap-compare")) return cmd_gap_compare(argc, argv);
     if (!strcmp(cmd, "gap-density")) return cmd_gap_density(argc, argv);

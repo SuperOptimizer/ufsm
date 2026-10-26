@@ -57,6 +57,16 @@ static void test_l1(void) {
     setenv("UFSM_L1_DINIC", "1", 1); l1_solve(n, v, nv, s2, 256, &b); unsetenv("UFSM_L1_DINIC");
     printf("l1: grid %d nodes %zu edges: E %lld -> %lld (BK, %d moves), %lld (Dinic)\n", n, a.nedge, (long long)a.e0, (long long)a.e1, a.moves, (long long)b.e1);
     CHECK(a.e1 == b.e1 && a.e1 < a.e0, "l1 grid: BK %lld, Dinic %lld, start %lld", (long long)a.e1, (long long)b.e1, (long long)a.e0);
+    {   /* the cut is the minimal source side of any maximum flow: BK (cache-friendly), the previous BK storage and Dinic give the same
+           shifts bit for bit; a work budget stops after whole moves */
+        int32_t *s3 = calloc(n, 4), *s4 = calloc(n, 4); l1_stats c, d;
+        setenv("UFSM_L1_BK0", "1", 1); l1_solve(n, v, nv, s3, 256, &c); unsetenv("UFSM_L1_BK0");
+        CHECK(!memcmp(s1, s2, (size_t)n * 4) && !memcmp(s1, s3, (size_t)n * 4) && c.moves == a.moves, "l1 grid: BK / previous BK / Dinic shifts differ");
+        setenv("UFSM_L1_WORK", "1", 1); l1_solve(n, v, nv, s4, 256, &d); unsetenv("UFSM_L1_WORK");
+        printf("l1: grid with a work budget of 1: %d move(s), capped %d, E %lld -> %lld\n", d.moves, d.capped, (long long)d.e0, (long long)d.e1);
+        CHECK(d.capped && d.moves <= 1 && d.e1 <= d.e0 && !a.capped, "l1 grid: work budget: capped %d, %d moves", d.capped, d.moves);
+        free(s3); free(s4);
+    }
     free(v); free(s1); free(s2);
 }
 
