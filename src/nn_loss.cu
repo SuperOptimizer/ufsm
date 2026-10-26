@@ -728,7 +728,7 @@ extern "C" void nn_distill_loss(const float *y, const int8_t *t, int n, int C, s
    Weighted by the phase mask (the packed-sheet weight: train --packed-weight), mean over the pairs. Head slabs [z0, z1) of the window:
    both ends inside the slab; the gradient direction from the codes over +-s voxels of the whole window. sums (device doubles): sum
    w loss, sum w (pass 0 accumulates them over the slabs; pass 1 reads sum w). ---- */
-typedef struct { float d[4]; int n; } pg_dists;
+typedef struct { float d[4]; int n, angle; } pg_dists;   /* angle: the gradient on the phasors' angles only (radial parts removed: the loss cannot raise the confidence) */
 template <typename LT> __global__ void pgrad_k(const LT *lc, const LT *ls, const uint8_t *ph, const uint8_t *wm, int D, int H, int W, int z0, int z1,
                                                int s, pg_dists ds, double *sums, float *acc) {
     const size_t HW = (size_t)H * W, ns = (size_t)(z1 - z0) * HW;
@@ -761,8 +761,12 @@ template <typename LT> __global__ void pgrad_k(const LT *lc, const LT *ls, const
         if (acc) {
             const float mr = br * ur + bi * ui, mi = bi * ur - br * ui;   /* m = b conj(u): R = Re(conj(a) m) */
             const float c0 = -w / den, c1 = w * R / (den * den);           /* dloss = c0 dR + c1 dM */
-            const float gar = c0 * mr + c1 * ar * nb / na, gai = c0 * mi + c1 * ai * nb / na;
-            const float gbr = c0 * kr + c1 * br * na / nb, gbi = -c0 * ki + c1 * bi * na / nb;
+            float gar = c0 * mr + c1 * ar * nb / na, gai = c0 * mi + c1 * ai * nb / na;
+            float gbr = c0 * kr + c1 * br * na / nb, gbi = -c0 * ki + c1 * bi * na / nb;
+            if (ds.angle) {   /* tangential parts: g - (g . p) p / |p|^2 */
+                const float pa = (gar * ar + gai * ai) / (na * na), pb = (gbr * br + gbi * bi) / (nb * nb);
+                gar -= pa * ar; gai -= pa * ai; gbr -= pb * br; gbi -= pb * bi;
+            }
             atomicAdd(&acc[li], gar * 2.f * sa * (1.f - sa)); atomicAdd(&acc[ns + li], gai * 2.f * sb * (1.f - sb));
             atomicAdd(&acc[lj], gbr * 2.f * sc * (1.f - sc)); atomicAdd(&acc[ns + lj], gbi * 2.f * sd * (1.f - sd));
         }
@@ -786,8 +790,8 @@ template <typename GT> __global__ void pgrad_apply_k(GT *gc, GT *gs, float *acc,
     gc[i] = f2h<GT>((float)gc[i] + f * a); gs[i] = f2h<GT>((float)gs[i] + f * b);
 }
 extern "C" void nn_pgrad_slab(const void *lc, const void *ls, const uint8_t *phase, const uint8_t *wm, int d, int h, int w, int z0, int z1, int s, const float *dist,
-                              int nd, double *sums, float *acc) {
-    const size_t ns = (size_t)(z1 - z0) * h * w; pg_dists ds = {{0}, nd < 1 ? 1 : nd > 4 ? 4 : nd}; for (int k = 0; k < ds.n; k++) ds.d[k] = dist[k];
+                              int nd, int angle, double *sums, float *acc) {
+    const size_t ns = (size_t)(z1 - z0) * h * w; pg_dists ds = {{0}, nd < 1 ? 1 : nd > 4 ? 4 : nd, angle}; for (int k = 0; k < ds.n; k++) ds.d[k] = dist[k];
     if (g_logits_h16) pgrad_k<f16><<<nblk(ns, 256), 256>>>((const f16 *)lc, (const f16 *)ls, phase, wm, d, h, w, z0, z1, s, ds, sums, acc);
     else pgrad_k<float><<<nblk(ns, 256), 256>>>((const float *)lc, (const float *)ls, phase, wm, d, h, w, z0, z1, s, ds, sums, acc);
     KCHECK();
