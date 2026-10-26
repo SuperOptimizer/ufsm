@@ -18,14 +18,17 @@ eval "$(sed -n '/^scroll() {/,/^# ---- boxes ----/p' $H/wbench.sh)"   # scroll, 
 O=$WB/pcheck/$TAG; RES=$WB/res/pcheck-$TAG.tsv; mkdir -p $O $WB/res $CACHE
 [ -s $RES ] || printf 'tag\tbox\tscroll\tcnt_bias\tcnt_off\tcnt_offp\tdcnt_bias\tdcnt_off\tdcnt_offp\tgross\tgross100\tpmed\tconf\tpred_s\n' > $RES
 log() { echo "$(date '+%m-%d %H:%M:%S') $*" | tee -a $O/run.log; }
-if [ -z "${NOLOCK:-}" ] && [ -n "${LOCK:-}" ]; then exec 9> $LOCK; log "waiting for $LOCK"; flock 9; fi
+# GPU lock per box around predict only (as wbench.sh; released in between so other jobs interleave); NOLOCK=1: the caller holds it
+LK=; [ -z "${NOLOCK:-}" ] && [ -n "${LOCK:-}" ] && LK=$LOCK; HL=0
+lk() { [ -n "$LK" ] && [ $HL = 0 ] || return 0; exec 9> $LK; flock -n 9 || { log "waiting for $LK"; flock 9; }; HL=1; }
+ulk() { [ $HL = 1 ] || return 0; flock -u 9; exec 9>&-; HL=0; sleep 3; }
 log "pcheck $TAG ckpt $CK boxes $BOXES site $SITE gpu $GPU"
 for B in $BOXES; do
   IFS=$'\t' read -r nm sc z y x nz ny nx lv note <<< "$(awk -F'\t' -v b=$B '$1 == b' $BT)"; [ -n "${nx:-}" ] || { log "no box $B"; continue; }
   grep -qP "^$TAG\t$B\t" $RES && { log "$B done"; continue; }
   scroll $sc || { log "$B: unknown scroll $sc"; continue; }
   d=$O/$B; f=$d/fields; [ -n "${FIELDS:-}" ] && f=$WB/fields/$FIELDS/$B; mkdir -p $d; t0=$(date +%s)
-  [ -e $f/fields.json ] || predict $f $z $y $x $nz $ny $nx $d/pred.log || { log "$B predict failed (see $d/pred.log)"; continue; }
+  [ -e $f/fields.json ] || { lk; predict $f $z $y $x $nz $ny $nx $d/pred.log || { log "$B predict failed (see $d/pred.log)"; ulk; continue; }; ulk; }
   t1=$(date +%s)
   RUN $U fields-oracle $f $PR $PK $d/orc --fill none --phase-scale $PF > $d/orc.log 2>&1 && RUN $U fit-compare $d/orc $f > $d/cmp.log 2>&1 || { log "$B compare failed"; continue; }
   rm -rf $d/orc
