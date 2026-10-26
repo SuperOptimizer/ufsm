@@ -5,7 +5,7 @@
 # ($WB/res/$REF.tsv, -slabs, -radius; fits are deterministic and identical across binaries) and its label ceilings are reused.
 # Pipeline (one GPU block, gpuq priority eval): the GPU lane only predicts (the 4 sites first, then the boxes); FL box lanes fit each
 # predicted box (the box fit + 2 shifted sub-domain fits, concurrently) while the GPU predicts the next ones; one slab lane fits the
-# sites (2 slabs, fit-join, joined score) as their fields land. The phase / turn-count columns (fields-oracle + fit-compare, CPU only, ~25 s a box) run in the box lanes off the GPU (DIAG=0 skips them); no ceiling fits.
+# sites (2 slabs, fit-join, joined score) as their fields land. The phase / turn-count columns (fields-oracle + fit-compare, CPU only, ~25 s a box) run after the GPU block, beside the slab lane (DIAG=0 skips them); no ceiling fits.
 # Output: $WB/gate/TAG/{rows.tsv (wbench.sh columns), slabs.tsv, radius.tsv, table.txt, run.log}; fields in $WB/fields/TAG (reused
 # by a rerun; KEEP=0 deletes them at the end). A rerun skips boxes / sites that already have rows.
 # Env: SITE (laptop), GPU (0), U (fitter binary; default the pin $WB/bin/ufsm), UP (predict binary; default $WB/bin/ufsm-gate),
@@ -68,17 +68,28 @@ boxrow() {   # boxrow B: fits + row of one predicted box (a box lane)
   read -r ids sd <<< "$(echo "$ids0 $ia $ib" | awk '{n=0; s=0; q=0; for (i=1;i<=3;i++) if ($i != "na") { n++; s+=$i; q+=$i*$i } if (!n) { print "na na"; exit } m=s/n; v=n>1 ? (q-n*m*m)/(n-1) : 0; printf "%.4f %.4f\n", m, sqrt(v > 0 ? v : 0)}')"
   e08=$(num $(g_e08 $d/fit.log))
   pp=""; for m in 0.5 1 2 4; do pp="$pp	$(num $(g_pair $d/fit.log $m 0))"; done; for m in 0.5 1 2 4; do pp="$pp	$(num $(g_pair $d/fit.log $m 1))"; done
-  if [ "$DIAG" = 1 ]; then   # network phase vs label phase (CPU only)
-    RUN $U fields-oracle $f $PR $PK $d/orc --fill none --phase-scale $PF > $d/orc.log 2>&1; RUN $U fit-compare $d/orc $f > $d/cmp.log 2>&1; rm -rf $d/orc
-    pe=$(num $(grep -oE 'phase \|error\| \(turns\): median [0-9.]+' $d/cmp.log | awk '{print $NF}')); gr=$(num $(grep -oE '> 0.25 [0-9.]+' $d/cmp.log | head -1 | awk '{print $3}'))
-    g1=$(num $(grep 'gross phase errors by reference spacing' $d/cmp.log | grep -oE '< 100 um [0-9.]+' | awk '{print $4}'))
-    cf=$(num $(grep -oE 'phase confidence: median [0-9.]+' $d/cmp.log | awk '{print $NF}'))
-    read -r cnb cno cnp <<< "$(g_cnt $d/cmp.log phase)"; read -r dnb dno dnp <<< "$(g_cnt $d/cmp.log density)"
-  fi
   read -r cl clp <<< "$(awk -F'\t' -v b=$B 'NR > 1 && $2 == b {print $22, $23; exit}' $RREF)"; cl=${cl:-na}; clp=${clp:-na}   # the baseline's label ceiling
   fr=$(echo "$ids $cl" | awk '$1 != "na" && $2 != "na" && $2 > 0 {printf "%.4f", $1 / $2; exit} {print "na"}')
   echo "$TAG	$B	$sc	$ids	$ids0	$ia	$ib	$sd	$e08$pp	$pe	$gr	$g1	$cf	$cl	$clp	$fr	$(cat $O/ready/$B 2> /dev/null || echo na)	$((t2 - t1))	$BIN	$FCFG	$cnb	$cno	$cnp	$dnb	$dno	$dnp" >> $RES
   log "$B ids $ids (box $ids0 shifted $ia $ib) p05x $(echo "$pp" | cut -f6) fits $((t2 - t1)) s"
+}
+diagbox() {   # diagbox B: network phase vs label phase (fields-oracle + fit-compare, CPU only) -> $O/B/diag (the row's pmed gross
+  # gross100 conf and cnt_* / dcnt_* columns); runs after the GPU block, beside the slab lane
+  local B=$1 sc d=$O/$1 f=$FD/$1 pe gr g1 cf cnb cno cnp dnb dno dnp
+  sc=$(awk -F'\t' -v b=$B '$1 == b {print $2}' $BT); scroll $sc || return
+  RUN $U fields-oracle $f $PR $PK $d/orc --fill none --phase-scale $PF > $d/orc.log 2>&1; RUN $U fit-compare $d/orc $f > $d/cmp.log 2>&1; rm -rf $d/orc
+  pe=$(num $(grep -oE 'phase \|error\| \(turns\): median [0-9.]+' $d/cmp.log | awk '{print $NF}')); gr=$(num $(grep -oE '> 0.25 [0-9.]+' $d/cmp.log | head -1 | awk '{print $3}'))
+  g1=$(num $(grep 'gross phase errors by reference spacing' $d/cmp.log | grep -oE '< 100 um [0-9.]+' | awk '{print $4}'))
+  cf=$(num $(grep -oE 'phase confidence: median [0-9.]+' $d/cmp.log | awk '{print $NF}'))
+  read -r cnb cno cnp <<< "$(g_cnt $d/cmp.log phase)"; read -r dnb dno dnp <<< "$(g_cnt $d/cmp.log density)"
+  echo "$pe $gr $g1 $cf $cnb $cno $cnp $dnb $dno $dnp" > $d/diag
+}
+diaglane() { local B; for B in $BL; do [ -s $O/$B/diag ] || [ ! -e $FD/$B/fields.json ] && continue; claim diag-$B && diagbox $B; done; }
+diagmerge() {   # the diag values into rows.tsv (columns 18-21, 29-34)
+  local B t=$O/rows.tmp
+  for B in $BL; do [ -s $O/$B/diag ] && echo "$B $(cat $O/$B/diag)"; done > $O/diag.all
+  awk -F'\t' -v OFS='\t' 'NR == FNR { split($0, a, " "); for (i = 2; i <= 11; i++) v[a[1], i - 1] = a[i]; has[a[1]] = 1; next }
+    FNR > 1 && has[$2] { for (i = 1; i <= 4; i++) $(17 + i) = v[$2, i]; for (i = 5; i <= 10; i++) $(24 + i) = v[$2, i] } { print }' $O/diag.all $RES > $t && mv $t $RES
 }
 # claim B: one lane per box (a flock-guarded marker; plain mkdir claims raced in the 10-26 sandbox: two lanes both fitted PH1)
 claim() { ( flock 7; [ -e $O/claim/$1 ] && exit 1; : > $O/claim/$1 ) 7> $O/claim.lock; }
@@ -148,6 +159,7 @@ wait $BLANES
 # the block ends with the boxes: the remaining slab fits queue per fit (the slab lane is mostly CPU scoring at low GPU use)
 if [ -z "${NOLOCK:-}" ]; then touch $O/ready/.released; gpuq_release; fi
 log "boxes done: GPU block $(( $(date +%s) - TG )) s ($((TG - T0)) s queued); slab lane continues per fit"
+if [ "$DIAG" = 1 ]; then DL=; for i in $(seq $FL); do diaglane & DL="$DL $!"; done; wait $DL; diagmerge; log "diag columns done"; fi
 wait $SL
 log "wgate $TAG: $(( $(date +%s) - T0 )) s in all"
 [ "$KEEP" = 0 ] && rm -rf $FD
