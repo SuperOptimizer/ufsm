@@ -796,6 +796,8 @@ static void *score_rows(void *arg) {
     score_job *J = ((void **)arg)[0]; const int t = (int)(intptr_t)((void **)arg)[1];
     const int64_t z0 = J->n3[0] * t / J->nt, z1 = J->n3[0] * (t + 1) / J->nt; const double cf = J->cf, h = J->h; const long long *org = J->org; const int *shp = J->shp;
     size_t *hist = J->hist[t], *fine = J->fine[t], nd = 0, nan = 0;
+    /* the thread's detail records and pair buffer as locals (written back at the end): the per-thread slots of J share cache lines */
+    score_rec *ddt = J->dd[t]; size_t ndt = J->ndet[t], dct = J->dcap[t]; pa_buf pat = {0}; if (J->pa) pat = J->pa[t];
     for (int64_t zz = z0; zz < z1; zz++) for (int64_t yy = 0; yy < J->n3[1]; yy++) for (int64_t xx = 0; xx < J->n3[2]; xx++) {
         const size_t i = ((size_t)zz * J->n3[1] + yy) * J->n3[2] + xx; const uint8_t cd = J->codes[i];
         if (cd < 1 || cd > 252) continue;
@@ -804,15 +806,16 @@ static void *score_rows(void *arg) {
         if (!(J->U[i] == J->U[i])) { nan++; continue; }
         double d = fmod(J->U[i] - (cd - 1) / 18.0, 14.0); if (d < 0) d += 14; if (d >= 14) d = 0;
         hist[(int)(d / 14 * SC_NB) % SC_NB]++; fine[(int)(d / 14 * SC_NF) % SC_NF]++; nd++;
-        if (J->pa) pa_add(&J->pa[t], (float)pz, (float)py, (float)px, (float)d, cd, ((uint64_t)(zz + J->o3[0]) << 42) ^ ((uint64_t)(yy + J->o3[1]) << 21) ^ (uint64_t)(xx + J->o3[2]));
+        if (J->pa) pa_add(&pat, (float)pz, (float)py, (float)px, (float)d, cd, ((uint64_t)(zz + J->o3[0]) << 42) ^ ((uint64_t)(yy + J->o3[1]) << 21) ^ (uint64_t)(xx + J->o3[2]));
         if (J->detail) {
-            if (J->ndet[t] == J->dcap[t]) { J->dcap[t] = J->dcap[t] ? 2 * J->dcap[t] : 1 << 16; J->dd[t] = realloc(J->dd[t], J->dcap[t] * sizeof(score_rec)); }
+            if (ndt == dct) { dct = dct ? 2 * dct : 1 << 16; ddt = realloc(ddt, dct * sizeof(score_rec)); if (!ddt) abort(); }
             const int zi = (int)fmin(7, fmax(0, pz / (shp[0] * h) * 8));
             const int ai = (int)fmin(J->na_ax - 1, fmax(0, pz)); const double rr = hypot(py - J->cy[ai], px - J->cx[ai]) * J->um;
-            J->dd[t][J->ndet[t]++] = (score_rec){(float)d, (uint8_t)zi, (uint8_t)fmin(255, rr / 250)};
+            ddt[ndt++] = (score_rec){(float)d, (uint8_t)zi, (uint8_t)fmin(255, rr / 250)};
         }
     }
     J->nd[t] += nd; J->nan[t] += nan;   /* (summed over the blocks) */
+    J->dd[t] = ddt; J->ndet[t] = ndt; J->dcap[t] = dct; if (J->pa) J->pa[t] = pat;
     return nullptr;
 }
 static int score_codes(z3 *z, double cf, const long long org[3], const int shp[3], double h, double um, const float *cy, const float *cx, int detail, FILE *dump,
