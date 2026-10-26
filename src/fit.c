@@ -1471,6 +1471,7 @@ static fit_model *fit_run_dir(const fit_fields *f, const fit_cfg *c) {
         fd.ctm = fp == 1 ? dctm : nullptr; fd.ct_pow = c->ct_pow; fd.ct_phi = c->ct_phi; fd.ct_floor = c->ct_floor;
         fd.cs = fp == 1 ? dcs : nullptr; fd.w_cs = (float)(c->w_cspacing * norm); fd.cs_tol = c->cs_tol;
         fd.skip = fp == 1 ? dskip : nullptr; fd.w_dskip = c->w_dskip;
+        fd.w_rc = (float)(c->w_rcount * norm);
         uint8_t *pcs = nullptr;   /* the pooled CT spacing (device or host) */
         float *pgd = nullptr;   /* pooled phase gradients (device or host) */
         uint8_t *pdev = nullptr, *phost[10] = {0};

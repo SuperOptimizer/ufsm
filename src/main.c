@@ -1015,7 +1015,7 @@ static int cmd_fit(int argc, char **argv) {
     /* the phase-skip gate (fit_cfg skip_*): --skip-gate E0,E1 (on; e = 1 - phase turns / density turns over --skip-d 32 field voxels of the radial
        ray, g = clamp((e - E0) / E1, 0, 1)) gates --uw-rep-cnt and drives --w-dskip K (the density term x (1 + K g)) */
     if (*opt(argc, argv, "--skip-gate", "") && sscanf(opt(argc, argv, "--skip-gate", ""), "%f,%f", &c.skip_e0, &c.skip_e1) != 2) { fprintf(stderr, "fit: --skip-gate E0,E1\n"); return 2; }
-    c.skip_d = atoi(opt(argc, argv, "--skip-d", "32")); c.skip_conf = (float)atof(opt(argc, argv, "--skip-conf", "0.05")); c.w_dskip = (float)atof(opt(argc, argv, "--w-dskip", "0")); c.w_density_pre = (float)atof(opt(argc, argv, "--w-density-pre", "0"));
+    c.skip_d = atoi(opt(argc, argv, "--skip-d", "32")); c.skip_conf = (float)atof(opt(argc, argv, "--skip-conf", "0.05")); c.w_dskip = (float)atof(opt(argc, argv, "--w-dskip", "0")); c.w_density_pre = (float)atof(opt(argc, argv, "--w-density-pre", "0")); c.w_rcount = (float)atof(opt(argc, argv, "--w-rcount", "0"));
     if (c.skip_e1 < 0 || c.skip_d < 2 || !(c.w_dskip >= 0)) { fprintf(stderr, "fit: --skip-gate E0,E1 with E1 >= 0, --skip-d >= 2, --w-dskip >= 0\n"); return 2; }
     if (c.w_dskip > 0 && !(c.skip_e1 > 0)) { fprintf(stderr, "fit: --w-dskip needs --skip-gate E0,E1\n"); return 2; }
     if (*opt(argc, argv, "--uw-rep-cnt-d", "")) { c.uw_rep_cnt_nd = 0; char *t = strdup(opt(argc, argv, "--uw-rep-cnt-d", "")); for (char *q = strtok(t, ","); q && c.uw_rep_cnt_nd < 4; q = strtok(nullptr, ",")) c.uw_rep_cnt_d[c.uw_rep_cnt_nd++] = atoi(q); free(t); }

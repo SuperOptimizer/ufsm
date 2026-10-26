@@ -212,6 +212,18 @@ FIT_HD int fit_vox2(const fit_dev *f, size_t i, float wv, float sc, double lp[FI
     fit_grad_terms(f, i, g, wv * sc, lp, dg);
     fit_pgrad_term(f, i, g, wv * sc, lp, dg);
     fit_cspace_term(f, i, g, wv * sc, lp, dg);
+    if (f->w_rc > 0.f && f->sp[i]) {   /* radial count: W's radial derivative = the density's radial count rho |n . r| (the density term matches |grad W| = rho
+                                        whatever its direction, so a W smoother / more radial than the oblique sheets over-counts along the radius) */
+        const float ry = dy / r, rx = dx / r, tyy = f->t[1][i] * (1.f / 255.f), txx = f->t[2][i] * (1.f / 255.f), tyx = f->t[5][i] * (1.f / 255.f) - 0.5f;
+        const float tr = f->t[0][i] * (1.f / 255.f) + tyy + txx;
+        if (tr > 0.1f) {
+            const float nr = sqrtf(fminf(1.f, fmaxf(0.f, (ry * ry * tyy + rx * rx * txx + 2.f * ry * rx * tyx) / tr))), rho = 8.f / (f->h * (float)f->sp[i]) * nr;
+            if (nr > 0.3f) {
+                const float gr = g[1] * ry + g[2] * rx, e = (gr - rho) / rho, c = f->w_rc * wv * sc;
+                lp[FIT_P_DENSITY] += c * e * e; dg[1] += c * 2.f * e / rho * ry; dg[2] += c * 2.f * e / rho * rx;
+            }
+        }
+    }
     int nc = 8;
     const size_t n = (size_t)f->D * f->H * f->W;
     if (f->wd && f->w_w4 > 0.f && f->wd[3 * n + i]) {   /* winding mod 4: per axis 1 - cos(pi / 2 (W(x + d e_a) - W(x) - delta_a)) */

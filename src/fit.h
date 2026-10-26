@@ -37,6 +37,7 @@ typedef struct {
     int nstage, lattice[8], steps[8];   /* delta lattice spacing (native voxels) and Adam steps per stage */
     float lr, lr_knot;              /* Adam learning rates for delta and the knots */
     float w_phase, w_normal, w_density, w_nondeg, w_smooth, w_decay;
+    float w_rcount;                 /* the radial count term (fit_terms.h fit_vox2: W's radial derivative against the density's radial count; 0 off) */
     float w_density_pre;            /* > 0: the density weight of the gradient-only stages (before phase_stage; 0: w_density): they set the turn count
                                        where the phase never floods (confidence < uw_min_conf: where wind96 skips packed sheets) */
     float w_wind4;                  /* the winding mod 4 term (fields with dz dy dx dq planes; analytic loss, phase stages, ramped like the phase) */
@@ -197,6 +198,7 @@ typedef struct {
     const uint8_t *ctm; float w_ct, ct_pow, ct_phi, ct_floor;   /* CT parity 128 + 127 m (m > 0 papyrus, < 0 void; fit_ct_parity), weight,
                                                (1 - conf)^ct_pow (>= ct_floor), papyrus phase; nullptr none; loss in parts[FIT_P_CT] */
     const uint8_t *cs; float w_cs, cs_tol;  /* CT sheet spacing (sp units), weight, log tolerance to sp; loss in parts[FIT_P_CSPACE] */
+    float w_rc;                             /* radial count (fit_cfg w_rcount): ((g . r) - rho |n . r|)^2 / rho^2, r the radial unit vector; into the density slot */
     const uint8_t *skip; float w_dskip;   /* phase-skip evidence x255 (fit_cfg skip; nullptr none): the density term x (1 + w_dskip g), g the gated evidence
                                                ((skip / 255 - skip_e0) / skip_e1 clamped to 0..1, precomputed into the plane) */
 } fit_dev;

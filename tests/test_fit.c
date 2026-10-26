@@ -317,6 +317,7 @@ static double run_skip_case(int cpu, float w_cnt, double *all) {
     if (getenv("FIT_SKPSU")) c.phase_stretch_uw = atoi(getenv("FIT_SKPSU"));
     if (getenv("FIT_SKG")) sscanf(getenv("FIT_SKG"), "%f,%f", &c.skip_e0, &c.skip_e1);
     if (getenv("FIT_SKDW")) c.w_dskip = (float)atof(getenv("FIT_SKDW"));
+    if (getenv("FIT_SKRC")) c.w_rcount = (float)atof(getenv("FIT_SKRC"));
     if (getenv("FIT_SKST")) for (int k = c.phase_stage; k < c.nstage; k++) c.steps[k] = atoi(getenv("FIT_SKST"));
     if (getenv("FIT_SKD")) { c.uw_rep_cnt_nd = 0; char *s = strdup(getenv("FIT_SKD")); for (char *q = strtok(s, ","); q && c.uw_rep_cnt_nd < 4; q = strtok(nullptr, ",")) c.uw_rep_cnt_d[c.uw_rep_cnt_nd++] = atoi(q); free(s); }
     fit_model *m = fit_run(&f, &c);
