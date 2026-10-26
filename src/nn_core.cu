@@ -1,5 +1,6 @@
 /* CUDA ops: core section of the former nn.cu */
 #include "nn_common.cuh"
+#include <dlfcn.h>
 
 int g_tf32 = 1;
 int g_gn_stored = 0;
@@ -188,7 +189,7 @@ int g_gradbf = 1;
 extern "C" void nn_set_grad_bf16(int on) { g_gradbf = on; }
 extern "C" int nn_get_grad_bf16(void) { return g_gradbf; }
 cudaError_t g_err = cudaSuccess;
-extern "C" int nn_init(int device) { if (ufsm_env_on("UFSM_ACTF32")) g_actbf = 0; if (ufsm_env_on("UFSM_GRADF32")) g_gradbf = 0; if (ufsm_env_on("UFSM_F16")) { g_h16 = 1; g_gscale = getenv("UFSM_GSCALE") ? (float)atof(getenv("UFSM_GSCALE")) : 1024.f; } return cudaSetDevice(device) == cudaSuccess ? 0 : -1; }
+extern "C" int nn_init(int device) { if (ufsm_env_on("UFSM_ACTF32")) g_actbf = 0; if (ufsm_env_on("UFSM_GRADF32")) g_gradbf = 0; if (ufsm_env_on("UFSM_F16")) { g_h16 = 1; g_gscale = getenv("UFSM_GSCALE") ? (float)atof(getenv("UFSM_GSCALE")) : 1024.f; } if (cudaSetDevice(device) != cudaSuccess) return -1; if (getenv("UFSM_MEM_REPORT") && atoi(getenv("UFSM_MEM_REPORT")) >= 3) { size_t fr = 0, tot = 0; cudaFree(0); cudaMemGetInfo(&fr, &tot); fprintf(stderr, "nn_init: device used %.1f MB after the context\n", (tot - fr) / 1e6); } return 0; }
 extern "C" const char *nn_check(void) {
     cudaError_t e = g_err;
     g_err = cudaSuccess;
@@ -196,7 +197,16 @@ extern "C" const char *nn_check(void) {
     const char *lp_error = lp_check();   /* low-precision kernels clear CUDA's last error into their own buffer */
     return e == cudaSuccess ? lp_error : cudaGetErrorString(e);
 }
-extern "C" void *nn_malloc(size_t n) { void *p = nullptr; CK(cudaMalloc(&p, n)); return p; }
+/* UFSM_MEM_REPORT >= 3: every device allocation of >= 16 MB with the device's used bytes after it and the caller's offset in its object
+   (addr2line -f -e <binary> OFFSET names the allocating function) */
+static void alloc_log(size_t n, void *ra) {
+    static int rep = -1; if (rep < 0) rep = getenv("UFSM_MEM_REPORT") ? atoi(getenv("UFSM_MEM_REPORT")) : 0;
+    if (rep < 3 || n < (rep >= 4 ? ((size_t)1 << 20) : ((size_t)16 << 20))) return;
+    size_t fr = 0, tot = 0; cudaMemGetInfo(&fr, &tot);
+    Dl_info di; const size_t off = dladdr(ra, &di) && di.dli_fbase ? (size_t)((char *)ra - (char *)di.dli_fbase) : (size_t)ra;
+    fprintf(stderr, "alloc %9.1f MB, device used %8.1f MB, caller 0x%zx\n", n / 1e6, (tot - fr) / 1e6, off);
+}
+extern "C" void *nn_malloc(size_t n) { void *p = nullptr; CK(cudaMalloc(&p, n)); alloc_log(n, __builtin_return_address(0)); return p; }
 g_reg_t g_reg[NN_MAXREG];
 int g_nreg;
 extern "C" void nn_storage_forget(const void *p) { for (int i = 0; i < g_nreg; i++) if (g_reg[i].p == (const char *)p) { g_reg[i] = g_reg[--g_nreg]; return; } }
@@ -331,7 +341,7 @@ extern "C" void nn_d2d_kernel(void *d, const void *s, size_t n) {   /* a kernel 
 extern "C" void nn_sync(void) { CK(cudaDeviceSynchronize()); }
 extern "C" void *nn_host_alloc(size_t n) { void *p = nullptr; CK(cudaMallocHost(&p, n)); return p; }
 extern "C" void *nn_managed_alloc(size_t n) { void *p = nullptr; if (cudaMallocManaged(&p, n ? n : 4) != cudaSuccess) { cudaGetLastError(); return nullptr; } return p; }
-extern "C" void *nn_malloc_try(size_t n) { void *p = nullptr; if (cudaMalloc(&p, n ? n : 4) != cudaSuccess) { cudaGetLastError(); return nullptr; } return p; }
+extern "C" void *nn_malloc_try(size_t n) { void *p = nullptr; if (cudaMalloc(&p, n ? n : 4) != cudaSuccess) { cudaGetLastError(); return nullptr; } alloc_log(n, __builtin_return_address(0)); return p; }
 extern "C" void *nn_host_alloc_try(size_t n) { void *p = nullptr; if (cudaMallocHost(&p, n) != cudaSuccess) { cudaGetLastError(); return nullptr; } return p; }
 extern "C" void nn_host_free(void *p) { if (p) CK(cudaFreeHost(p)); }
 cudaStream_t copy_stream(void) {
