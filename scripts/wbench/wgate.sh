@@ -10,7 +10,8 @@
 # by a rerun; KEEP=0 deletes them at the end). A rerun skips boxes / sites that already have rows.
 # Env: SITE (laptop), GPU (0), U (fitter binary; default the pin $WB/bin/ufsm), UP (predict binary; default $WB/bin/ufsm-gate),
 #   REF (wind96), BOXES (core | names), SITES ("4624 5392 5904 6672"; "" = no slabs), REP (2), FL (box lanes, 3), DIAG (1),
-#   KEEP (1), NOLOCK=1 (the caller holds the GPU), PRIO (eval).
+#   KEEP (1), NOLOCK=1 (the caller holds the GPU), PRIO (eval), TTA (predict --tta K, 1 = off), SEAM (1: average 2 window-grid
+#   offsets 0 / 8 vx: volcomp seam TTA, 2x predict), SPRIO (slab fits after the block, bg).
 set -u
 H=$(cd "$(dirname "$0")" && pwd)
 SITE=${SITE:-$([ -d $HOME/ufsm-data ] && echo laptop || echo desk)}; GPU=${GPU:-0}
@@ -18,6 +19,7 @@ SITE=${SITE:-$([ -d $HOME/ufsm-data ] && echo laptop || echo desk)}; GPU=${GPU:-
 [ $# -ge 2 ] || { sed -n '2,15p' $0; exit 2; }
 CK=$(readlink -f "$1"); TAG=$2
 U=${U:-$WB/bin/ufsm}; UP=${UP:-$WB/bin/ufsm-gate}; [ -x $UP ] || UP=$U; [ -x $U ] || { echo "no binary $U"; exit 2; }
+TTA=${TTA:-1}; SEAM=${SEAM:-0}; [ "$TTA" -gt 1 ] && export PX="--tta $TTA"   # (wbench.sh's predict appends PX)
 REF=${REF:-wind96}; BOXES=${BOXES:-core}; SITES=${SITES-4624 5392 5904 6672}; REP=${REP:-2}; FL=${FL:-3}; DIAG=${DIAG:-1}; KEEP=${KEEP:-1}
 BT=${BT:-$H/boxes.tsv}; FIT=""; FIELDS=""
 GF="--gpu $GPU"; BIN=$(sha1sum $U | cut -c1-8); FCFG=$(echo "$BIN --dir 1 --uw-repair 8 " | sha1sum | cut -c1-8)
@@ -39,6 +41,13 @@ log "wgate $TAG ckpt $CK (step ${step:-?}) vs $REF: $(echo $BL | wc -w) boxes, s
 echo "$CK" > $O/ckpt
 rm -f $O/ready/.end; rm -rf $O/claim/*
 
+gpredict() {   # gpredict like predict; SEAM=1: two passes, window grid at 0 and shifted 8 voxels on every axis (another phase of the
+  # network's pooling against the 16^3 volcomp codec blocks), averaged by field-blend (phase as the complex mean)
+  [ "$SEAM" = 1 ] || { predict "$@"; return; }
+  local f=$1; shift
+  GO=0,0,0 predict $f.g0 "$@" && GO=8,8,8 predict $f.g8 "${@:1:6}" ${7}.g8 ${8:-} || return 1
+  RUNBIG $U field-blend $f $f.g0 $f.g8 > ${7}.blend 2>&1; local rc=$?; rm -rf $f.g0 $f.g8; return $rc
+}
 boxrow() {   # boxrow B: fits + row of one predicted box (a box lane)
   local B=$1 nm sc z y x nz ny nx lv note
   IFS=$'\t' read -r nm sc z y x nz ny nx lv note <<< "$(awk -F'\t' -v b=$B '$1 == b' $BT)"; scroll $sc || return
@@ -122,7 +131,7 @@ trap 'touch $O/ready/.end' EXIT; trap 'touch $O/ready/.end; kill $LANES 2> /dev/
 scroll paris4
 for s in $SITES; do
   grep -qP "^$TAG\tsite$s\t" $RS && continue; f=$FD/site$s; mkdir -p $O/site$s
-  if [ ! -e $f/fields.json ]; then t0=$(date +%s); predict $f $((2 * s)) 1024 512 320 7168 7680 $O/site$s/pred.log big || { log "site$s predict failed"; continue; }; log "site$s predicted in $(( $(date +%s) - t0 )) s"; fi
+  if [ ! -e $f/fields.json ]; then t0=$(date +%s); gpredict $f $((2 * s)) 1024 512 320 7168 7680 $O/site$s/pred.log big || { log "site$s predict failed"; continue; }; log "site$s predicted in $(( $(date +%s) - t0 )) s"; fi
   echo 0 > $O/ready/site$s
 done
 for B in $BL; do
@@ -130,7 +139,7 @@ for B in $BL; do
   IFS=$'\t' read -r nm sc z y x nz ny nx lv note <<< "$(awk -F'\t' -v b=$B '$1 == b' $BT)"; [ -n "${nx:-}" ] || { log "no box $B"; continue; }
   scroll $sc || { log "$B: unknown scroll $sc"; continue; }
   f=$FD/$B; mkdir -p $O/$B; t0=$(date +%s)
-  if [ ! -e $f/fields.json ]; then predict $f $z $y $x $nz $ny $nx $O/$B/pred.log || { log "$B predict failed"; continue; }; fi
+  if [ ! -e $f/fields.json ]; then gpredict $f $z $y $x $nz $ny $nx $O/$B/pred.log || { log "$B predict failed"; continue; }; fi
   echo $(( $(date +%s) - t0 )) > $O/ready/$B
 done
 touch $O/ready/.end; TP=$(date +%s); log "GPU lane done: predicts $((TP - TG)) s"
