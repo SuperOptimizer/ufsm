@@ -479,7 +479,8 @@ traced further).
 ## Sheet-aware crush augmentation: train --aug-crush P (2026-10-24)
 Goal: teach the winding nets compressed / crushed scroll regions (PHerc1299-like) from Paris 4's clean labels. src/crush.[ch], used by
 sample.c `crush_draw` on stored-phase windows (task unwrap / unwrap2, side 2, no target channels, no band/cond/sheet/papyrus/aux, cube
-windows); default p 0 = bit-identical (test). A crushed window replaces the plain read and the geometry warp (it carries its own rotation).
+windows); default p 0 = bit-identical (test). A crushed window replaces the plain read and the geometry warp (it carries its own rotation);
+`--aug-crush-warp 1` (2026-10-26) applies the ordinary geometry warp after the crush map as well (labels through both, tested).
 - Map u -> x (window voxel -> source voxel), C1 and invertible, det = k F' > 0:
   A. squash 1.5-3x (p .5) along a random direction IN the sheet plane (squashing along the normal thinned the sheets), + rotation 10 deg;
   B. bends (p .5, amp .06) and a logcosh kink (p .25) along the sheet normal n (normal from the stored phase gradient over the window);

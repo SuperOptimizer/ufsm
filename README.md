@@ -35,6 +35,44 @@ Papyrus / void network (DESIGN.md "Papyrus / void network"): per patch a random 
 by a Gaussian above t, scanner augmentation on the input only, the cutoff fed as the input's zero, so one checkpoint serves
 every cutoff.
 
+## Training: crush augmentation
+
+Sheet-aware crush (`src/crush.h`, DESIGN.md "Sheet-aware crush augmentation"): a window is pulled through an invertible
+map (positive Jacobian) that squashes it in the sheet plane, bends / kinks it along the sheet normal and collapses the
+voids between wraps while papyrus keeps its thickness; the stored phase is pulled through the same map, so phase, winding
+mod 4, normals and density stay exact. Applies to stored-phase windows (task unwrap / unwrap2, side 2, cube windows) and
+needs `--geometry-aug 1`. **Every flag defaults off**: without `--aug-crush` the batches are bit-identical (tested), so
+existing recipes are unchanged.
+
+| flag | default | meaning |
+|---|---|---|
+| `--aug-crush P` | 0 | probability a window is crushed |
+| `--aug-crush-void LO,HI` | 0.15,0.5 | void ratio a gap keeps (per window, varying over it) |
+| `--aug-crush-squash P` / `--aug-crush-k LO,HI` | 0.5 / 1.5,3 | in-plane squash probability / factor |
+| `--aug-crush-bend P` / `--aug-crush-bend-amp A` | 0.5 / 0.06 | low-frequency bends along the normal (amplitude x P) |
+| `--aug-crush-kink P` | 0.25 | a fold line |
+| `--aug-crush-rot DEG` | 10 | the crush map's own rotation |
+| `--aug-crush-fine N` | 0 | CT box mean from N levels finer (too slow for the loader) |
+| `--aug-crush-warp 0/1` | 0 | 1: crushed windows also take the ordinary geometry warp (rotation / elastic / affine / zoom, `--rotate-p`, `--elastic-p`, `--aug-affine-p`, `--zoom-p`) after the crush map; labels pulled through both |
+
+Realistic setting (the desk crush arm `ctrain.sh`; at the defaults above gaps collapse into touching sheets with the phase
+kept smooth, which is the crushed-scroll look):
+
+```sh
+--geometry-aug 1 --aug-crush 0.3 --aug-crush-warp 1 --aug-crush-bend 0.7 --aug-crush-kink 0.35 \
+  --rotate-p 0.3 --elastic-p 0.5 --aug-affine-p 0.4 --aug-aniso 0.1 --aug-shear 0.06 --zoom-p 0.3 --zoom-min 0.85
+```
+
+CPU cost: a crushed P512 window takes 18-31 CPU-s on the sampler (tile decodes through the map's footprint; P256 6-17 s),
+against well under 1 s for a plain window. Budget workers for it: at P512 `--aug-crush 1` needs ~16-24 sampler workers to
+feed one GPU and stays loader-bound on the laptop; 0.3 is the comfortable rate for normal training. `--aug-crush-warp 1`
+adds only the ordinary warp's cost.
+
+Debugging: `build/crush_render <sources.json> <out-prefix> [P] [windows] [seed] [level] [fine] [box] [--aug-crush-* flags]`
+renders CT | phase | crushed CT | crushed phase panels. `UFSM_DUMP_WIN=PREFIX` (with `UFSM_SYNC_UPLOAD=1`, `--gpu-input 0`,
+cube windows) makes `train` write the first `UFSM_DUMP_N` (8) host windows as PREFIX-NN.pgm (rows z-mid / y-mid; columns
+CT | phase | winding mod 4, unknown black).
+
 Ground-truth export scripts: `tools/pget.sh` (parallel ranged download), `tools/ingest_all.sh` (all label zarrs),
 `tools/ingest_segments.sh`, `tools/raster_all.sh`, `tools/surfcomp_all.sh`.
 

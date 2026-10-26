@@ -4,6 +4,8 @@
    - normals: J^T n_src (the pull's transpose) = the gradient of the pulled winding
    - the window pull: pulled phase codes = frac(W(pull(u))) (analytic, the label grid), pulled CT papyrus / void = the analytic sheets,
      the gradient of the pulled phase along J^T n_src; a 2-levels-finer box pull of the identity map = the stored mean pyramid
+   - --aug-crush-warp: the crushed phase through rotation / elastic / zoom / affine / a symmetry = frac(W) at the composite pull,
+     whose Jacobian determinant is > 0 (times the symmetry sign); in the sampler warped crushed windows keep w4 steps = phase steps
    - the sampler (task unwrap2 settings): crushed windows drawn and deterministic; --aug-crush 0 with every other crush parameter
      changed gives bit-identical batches (the default-off path draws nothing)
    test_crush [DIR] */
@@ -127,7 +129,7 @@ static void window_tests(const char *dir) {
     const int P = 64; const size_t p3 = (size_t)P * P * P;
     uint8_t *arena = malloc((size_t)40 << 21), *oct = malloc(p3), *oph = malloc(p3), *ofn = malloc(p3), *ref = malloc(p3);
     crush_cache cc; assert(arena && !crush_cache_init(&cc, arena, (size_t)40 << 21));
-    int lab = 1, ctok = 1, grad = 1, fineok = 1, ncr = 0, lneg = 0; double ctd = 0, latd = 0, lxdev = 0;
+    int lab = 1, ctok = 1, grad = 1, fineok = 1, ncr = 0, lneg = 0, wlab = 1, wjac = 1; double ctd = 0, latd = 0, lxdev = 0;
     for (int t = 0; t < 4; t++) {
         const int64_t o[3] = {20 + 5 * t, 18 + 4 * t, 30 - 3 * t};   /* level-1 window (the fixture's level 1 is 128^3) */
         an_ctx a = {{o[0], o[1], o[2]}, 1};
@@ -195,6 +197,42 @@ static void window_tests(const char *dir) {
                t, ng, cols ? "off" : "on", m.sq_k, p50, p95, ne, ag[0], ag[1], ag0[0], ag0[1], a50);
         lab &= ne > (int)(p3 / 8) && p50 < 2 && p95 < 6; ctok &= ag[0] > ag0[0] - .05 && ag[1] > ag0[1] - .02 && ag0[1] > .9; grad &= na > 100 && a50 < 8; ncr += !cols;
         free(ep); free(ea);
+        {   /* --aug-crush-warp 1: the crushed phase through the ordinary geometry warp (rotation + elastic, zoom or affine, a cube symmetry);
+               the warped codes = frac(W(crush pull(sym(spatial pull(v))))), and the composite pull has a positive Jacobian (times the
+               symmetry's sign: the symmetries are exact relabellings) */
+            spatial_aug sa; spatial_aug_make(&sa, 50 + t, P, 15, 1, 1, 1);
+            if (t & 1) spatial_aug_affine(&sa, 60 + t, .15, .08); else spatial_aug_zoom(&sa, .85);
+            const sym sy = sym_of(7 * t + 3);
+            double S[3][3] = {{0}}; for (int d = 0; d < 3; d++) S[sy.perm[d]][d] = sy.flip[d] ? -1 : 1;
+            const double ssg = det3(S);
+            uint8_t *wph = malloc(p3), *eph = malloc(p3); float *tab = malloc(6 * (size_t)P * sizeof *tab); assert(wph && eph && tab);
+            m.lat = 1; crush_layer E = Lph; E.out = eph; assert(!crush_window(&m, &cc, o, &E, 1)); m.lat = 2;   /* (the exact map: the reference below pulls exactly) */
+            warp_phase(eph, wph, P, sy, &sa); spatial_aug_tables(&sa, tab); free(eph);
+            double *ew = malloc(p3 * sizeof *ew); int nw = 0, nj = 0, jneg = 0;
+            for (int z = 1; z < P - 1; z += 2) for (int y = 1; y < P - 1; y += 2) for (int x = 1; x < P - 1; x += 2) {
+                const size_t k = ((size_t)z * P + y) * P + x;
+                double X[4][3]; int in = 1;
+                for (int q = 0; q < 4; q++) {   /* v, v + e_z, v + e_y, v + e_x through spatial pull, symmetry, crush pull */
+                    const int v[3] = {z + (q == 1), y + (q == 2), x + (q == 3)}; float pl[3], jac[3]; double wd[3];
+                    spatial_aug_pull(&sa, tab, v[0], v[1], v[2], pl, jac);
+                    for (int d = 0; d < 3; d++) wd[sy.perm[d]] = sy.flip[d] ? P - 1 - pl[d] : pl[d];
+                    for (int d = 0; d < 3; d++) in &= wd[d] >= 0 && wd[d] <= P - 1;
+                    crush_pull(&m, wd, X[q], nullptr);
+                }
+                if (!in) continue;
+                double J[3][3]; for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) J[i][j] = X[j + 1][i] - X[0][i];
+                nj++; jneg += !(det3(J) * ssg > 0);
+                if (wph[k] < PHASE_PERIOD) {
+                    const double w = an_w(&a, X[0]), f = w - floor(w);
+                    double d = wph[k] - f * PHASE_PERIOD; d -= PHASE_PERIOD * floor(d / PHASE_PERIOD + .5); ew[nw++] = fabs(d);
+                }
+            }
+            const double w50 = pct(ew, nw, .5), w95 = pct(ew, nw, .95);
+            printf("crush: window %d + geometry warp (sym %d): phase error p50 %.2f p95 %.2f codes (%d known), composite Jacobian det <= 0 at %d of %d voxels\n",
+                   t, 7 * t + 3, w50, w95, nw, jneg, nj);
+            wlab &= nw > (int)(p3 / 64) && w50 < 1.5 && w95 < 6; wjac &= nj > (int)(p3 / 16) && jneg == 0;
+            free(ew); free(wph); free(tab);
+        }
         crush_map_free(&m);
         /* a 1-level-finer box pull of the identity map = the stored mean pyramid (lossy codec: small differences) */
         if (t == 0) {
@@ -220,18 +258,20 @@ static void window_tests(const char *dir) {
     check("blocked window CT = the point pull at the same coordinates (rounding)", ctd < .51);
     check("pulled phase gradient along J^T grad W (p50 < 8 deg)", grad);
     check("collapse columns built in every window", ncr == 4);
+    check("--aug-crush-warp: crushed + warped phase codes = frac(W(crush pull(sym(spatial pull(v))))) (p50 < 1.5, p95 < 6 codes)", wlab);
+    check("--aug-crush-warp: the composite pull (crush after rotation / elastic / zoom / affine) has det > 0 everywhere", wjac);
     check("finer-level 2^3 box mean of the identity map = the stored pyramid level", fineok);
     crush_cache_free(&cc); free(arena); free(oct); free(oph); free(ofn); free(ref);
     sources_free(S);
 }
 
 enum { NB = 6 };
-typedef struct { uint16_t *x; uint8_t *side, *w4; } snap;
+typedef struct { uint16_t *x; uint8_t *side, *w4, *wc; } snap;
 static uint64_t take(sampler *sp, snap *o, size_t p3) {
     for (int i = 0; i < NB; i++) {
         batch *b = sampler_next(sp); assert(b);
         o[i].x = malloc(p3 * 2); memcpy(o[i].x, b->x16, p3 * 2);
-        o[i].side = malloc(p3); memcpy(o[i].side, b->side, p3); o[i].w4 = malloc(p3); memcpy(o[i].w4, b->w4, p3);
+        o[i].side = malloc(p3); memcpy(o[i].side, b->side, p3); o[i].w4 = malloc(p3); memcpy(o[i].w4, b->w4, p3); o[i].wc = malloc(p3); memcpy(o[i].wc, b->wcomp, p3);
         sampler_release(sp, b);
     }
     return sampler_crushed(sp);
@@ -240,7 +280,7 @@ static int same(const snap *a, const snap *b, size_t p3) {
     int ok = 1; for (int i = 0; i < NB; i++) ok &= !memcmp(a[i].x, b[i].x, p3 * 2) && !memcmp(a[i].side, b[i].side, p3) && !memcmp(a[i].w4, b[i].w4, p3);
     return ok;
 }
-static void drop(snap *o) { for (int i = 0; i < NB; i++) { free(o[i].x); free(o[i].side); free(o[i].w4); } }
+static void drop(snap *o) { for (int i = 0; i < NB; i++) { free(o[i].x); free(o[i].side); free(o[i].w4); free(o[i].wc); } }
 static void sampler_tests(const char *dir) {
     char path[1400]; snprintf(path, sizeof path, "%s/sources.json", dir);
     sources *S = sources_load(path); assert(S);
@@ -264,6 +304,28 @@ static void sampler_tests(const char *dir) {
     c3.crush.fine = 1;
     sp = sampler_start(S, &c3); assert(sp); const uint64_t n4 = take(sp, e, p3); sampler_stop(sp);
     check("--aug-crush-fine 1 (CT from level 0): crushed windows drawn", n4 >= NB);
+    /* --aug-crush-warp 1: crushed windows also warped (rotation / elastic forced on), deterministic, not the unwarped crushed batches;
+       the winding mod 4 warps with the phase (neighbours in one component: the w4 step agrees with the phase step mod 1 turn) */
+    snap f[NB], g[NB];
+    sample_cfg c5 = c; c5.crush.p = 1; c5.crush.warp = 1; c5.rotate_p = 1; c5.rotate_degrees = 15; c5.elastic_p = 1;
+    sample_cfg c6 = c5; c6.crush.warp = 0;
+    sp = sampler_start(S, &c6); assert(sp); take(sp, g, p3); sampler_stop(sp);
+    sp = sampler_start(S, &c5); assert(sp); const uint64_t n5 = take(sp, f, p3); sampler_stop(sp);
+    const int diff = !same(f, g, p3); drop(g);
+    sp = sampler_start(S, &c5); assert(sp); take(sp, g, p3); sampler_stop(sp);
+    size_t pairs = 0, agree = 0, kw5 = 0;
+    for (int i = 0; i < NB; i++) for (size_t k = 0; k + 1 < p3; k++) {
+        kw5 += f[i].w4[k] < PHASE_PERIOD;
+        if (k % PW == PW - 1 || f[i].w4[k] == 255 || f[i].w4[k + 1] == 255 || f[i].side[k] >= PHASE_PERIOD || f[i].side[k + 1] >= PHASE_PERIOD || f[i].wc[k] != f[i].wc[k + 1]) continue;
+        int dw = f[i].w4[k + 1] - f[i].w4[k]; if (dw >= 126) dw -= 252; if (dw < -126) dw += 252;   /* (63 codes per turn, mod 4 turns) */
+        int mm = (dw * 4 - (f[i].side[k + 1] - f[i].side[k])) % 252; if (mm < 0) mm += 252; if (mm > 126) mm = 252 - mm;
+        pairs++; agree += mm <= 12;
+    }
+    printf("crush: sampler --aug-crush-warp 1: %llu crushed; winding mod 4 known %.3f; %zu neighbour pairs, w4 / phase steps agree at %.4f\n",
+           (unsigned long long)n5, kw5 / (double)(NB * p3), pairs, pairs ? agree / (double)pairs : 0);
+    check("--aug-crush-warp 1: crushed windows warped (differ from warp 0), deterministic", n5 >= NB && diff && same(f, g, p3));
+    check("--aug-crush-warp 1: the winding mod 4 follows the warped phase (steps agree mod 1 turn)", pairs > p3 && agree >= .99 * (double)pairs);
+    drop(f); drop(g);
     drop(a); drop(b); drop(d); drop(e);
     sources_free(S);
 }
