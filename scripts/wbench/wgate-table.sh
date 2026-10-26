@@ -32,8 +32,8 @@ printf '%-10s %8s %8s %8s %8s %8s %10s\n' site "$REF" "$TAG" oracle join_ref joi
     g = ($10 != "na" && o[$2] != "" && o[$2] - r[$2] > 0) ? sprintf("%+.3f", ($10 - r[$2]) / (o[$2] - r[$2])) : "na"
     printf "%-10s %8.4f %8s %8s %8.4f %8s %10s\n", $2, r[$2], $10, o[$2], rj[$2], $9, g }' $RS $ORC $SLABS
 [ -s $SLABS ] || SLABS=/dev/null
-read -r sn sa sb <<< "$(awk -F'\t' 'FNR == 1 { f++; next } f == 1 { r[$2] = $10 } f == 2 && ($2 in r) && $10 != "na" { n++; a += r[$2]; b += $10 }
-  END { if (n) printf "%d %.4f %.4f\n", n, a / n, b / n; else print "0 na na" }' $RS $SLABS)"
+read -r sn sa sb sk <<< "$(awk -F'\t' 'FNR == 1 { f++; next } f == 1 { r[$2] = $10 } f == 2 && ($2 in r) && $10 != "na" { n++; a += r[$2]; b += $10; if ($10 - r[$2] > 0.02) k++ }
+  END { if (n) printf "%d %.4f %.4f %d\n", n, a / n, b / n, k; else print "0 na na 0" }' $RS $SLABS)"
 echo "slab joined mean over $sn sites: $REF $sa  $TAG $sb"
 # ---- radius profile: share of slab voxels with the right winding (zero integer error), voxel weighted, by radius band ----
 if [ -s $RADIUS ] && [ -s $RRAD ]; then
@@ -46,13 +46,13 @@ echo
 pd=$(v p05x paris4,paris4j 8); plo=$(v p05x paris4,paris4j 9); phi=$(v p05x paris4,paris4j 10); id=$(v ids paris4,paris4j 8); md=$(v p05x paris4,paris4j 12)
 ghi=$(v p05x 1667 10); gihi=$(v ids 1667 10); np=$(v p05x paris4,paris4j 3); ng=$(v p05x 1667 3)
 r1=$(awk -v lo=$plo -v d=$id 'BEGIN { print (lo + 0 > 0 && d + 0 >= 0) ? "PASS" : "fail" }')
-r2=$(awk -v a=$sa -v b=$sb -v n=$sn 'BEGIN { print (n >= 4 && b + 0 > a + 0) ? "PASS" : (n < 4 ? "incomplete" : "fail") }')
+r2=$(awk -v a=$sa -v b=$sb -v n=$sn -v k=$sk 'BEGIN { print (n >= 4 && b - a >= 0.03 && k >= 3) ? "PASS" : (n < 4 ? "incomplete" : "fail") }')
 r3=$(awk -v a=$ghi -v b=$gihi 'BEGIN { print (a + 0 >= 0 && b + 0 >= 0) ? "PASS" : "fail" }')
 echo "R1 primary ($np boxes): p05x diff CI low $plo > 0 and ids diff $id >= 0 -> $r1"
-echo "R2 slabs: joined mean $sb > $REF $sa (all 4 sites) -> $r2"
+echo "R2 slabs: joined mean $sb - $REF $sa >= +0.03 and >= 3 of 4 sites > +0.02 (null: wind96 on other hardware +0.014, 1 site > 0.02; $sk here) -> $r2"
 echo "R3 guard 1667 ($ng boxes): not worse beyond the CI (p05x CI high $ghi >= 0, ids CI high $gihi >= 0) -> $r3"
 if [ $r1 = PASS ] && [ $r2 = PASS ] && [ $r3 = PASS ]; then vd="PASS: promote (next: p4unwrap milestone)"
 elif [ $r3 = fail ] || awk -v h=$phi 'BEGIN { exit !(h + 0 < 0) }'; then vd="FAIL: worse than $REF"
-elif awk -v d=$pd 'BEGIN { exit !(d + 0 > 0) }'; then vd="INCONCLUSIVE: p05x +$pd is inside the noise (MDE $md); no promotion"
+elif awk -v d=$pd 'BEGIN { exit !(d + 0 > 0) }'; then vd="INCONCLUSIVE: p05x $pd is inside the noise (MDE $md); no promotion"
 else vd="FAIL: no gain over $REF"; fi
 echo "VERDICT $TAG: $vd"

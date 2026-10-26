@@ -40,7 +40,13 @@ The paris4j boxes are held out of every current arm. PH1-3 are in-sample for win
 
 **PASS rule (pre-registered 2026-10-26; do not change it after seeing a result):**
 - **R1 primary:** the p05x paired-difference 95 % CI is entirely > 0, AND the ids difference is >= 0.
-- **R2 slabs:** the mean joined ids over all 4 sites is > wind96's.
+- **R2 slabs:** the mean joined ids over all 4 sites is >= wind96's + 0.03, AND at least 3 of the 4 sites improve by > 0.02.
+  This was revised 10-26, before any candidate had slab rows. The first version ("mean > wind96") passed a null model: wind96
+  itself, predicted on forlindesk, differs from the 5080 only in the last bits of the MX arithmetic, yet its joined sites came
+  out .2387 / .3321 / .2616 / .2214 vs .2403 / .3268 / .2093 / .2207. That is a mean of +0.014, one site +0.052. The slab fit
+  is chaotic in its inputs, so only effects above that floor count.
+- The same null measures the box-level numerical floor: primary p05x +0.0066 [-0.0015, +0.0167], ids +0.004.
+- Slab sites are only ever compared on one host (slabref).
 - **R3 guard 1667:** not worse beyond its CI: the upper CI bound of the p05x and of the ids difference are both >= 0.
 
 PASS = R1 and R2 and R3, which promotes the checkpoint to the p4unwrap milestone. The other verdicts:
