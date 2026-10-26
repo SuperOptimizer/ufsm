@@ -27,7 +27,10 @@ HDR="tag	box	scroll	ids	ids0	ids_a	ids_b	ids_sd	e08	p05	p1	p2	p4	p05x	p1x	p2x	p4
 [ -s $RES ] || echo "$HDR" > $RES
 [ -s $CEIL ] || printf 'box\tceil\tceil_p1x\tfrom\n' > $CEIL
 log() { echo "$(date '+%m-%d %H:%M:%S') $*" | tee -a $O/run.log; }
-if [ -z "${NOLOCK:-}" ] && [ -n "${LOCK:-}" ]; then exec 9> $LOCK; log "waiting for $LOCK"; flock 9; fi
+# GPU lock per box / per slab GPU step (released in between so short jobs interleave); NOLOCK=1: the caller holds it
+LK=; [ -z "${NOLOCK:-}" ] && [ -n "${LOCK:-}" ] && [ "${CPU:-0}" != 1 ] && LK=$LOCK; HL=0
+lk() { [ -n "$LK" ] && [ $HL = 0 ] || return 0; exec 9> $LK; flock -n 9 || { log "waiting for $LK"; flock 9; }; HL=1; }
+ulk() { [ $HL = 1 ] || return 0; flock -u 9; exec 9>&-; HL=0; sleep 3; }   # the pause lets a waiting job take the lock
 log "wbench $TAG ckpt $CK fields $FT fitter $FCFG ($BIN $FIT) site $SITE gpu $GPU"
 echo "$CK" > $O/ckpt; echo "$BIN $FIT" > $O/fitter
 
@@ -73,10 +76,12 @@ elif [ "$BOXES" = clean ]; then BL=$(grep -v '^#' $BT | awk -F'\t' '$10 !~ /labe
 elif [ "$BOXES" = core ]; then BL=$(grep -v '^#' $BT | awk -F'\t' '$10 !~ /label-noise/ && ($2 == "paris4" || $2 == "paris4j" || $10 ~ /core/)' | cut -f1)   # routine snapshot evals
 else BL=$BOXES; fi
 for B in $BL; do
+  ulk
   IFS=$'\t' read -r nm sc z y x nz ny nx lv note <<< "$(awk -F'\t' -v b=$B '$1 == b' $BT)"; [ -n "${nx:-}" ] || { log "no box $B"; continue; }
   grep -qP "^$TAG\t$B\t" $RES && { log "$B done"; continue; }
   scroll $sc || { log "$B: unknown scroll $sc"; continue; }
   d=$O/$B; mkdir -p $d; f=$FD/$B; t0=$(date +%s)
+  lk
   if [ -n "$FIELDS" ]; then [ -e $f/fields.json ] || { log "$B: no fields $f"; continue; }
   elif [ ! -e $f/fields.json ]; then predict $f $z $y $x $nz $ny $nx $d/pred.log || { log "$B predict failed"; continue; }; fi
   t1=$(date +%s)
@@ -112,6 +117,7 @@ for B in $BL; do
   # (the fit dir is kept: others read runs/TAG/BOX/fit)
   [ -z "$FIELDS" ] && [ "$KEEP" = 0 ] && rm -rf $f
 done
+ulk
 
 # ---- Paris 4 full-cross-section slab sites (in-sample for every Paris 4-trained model) ----
 # site s (19.2 um field cells, s = 256 k: the box on the predict window / shard grid): fields cells [s, s+160) x y 512..4096 x 256..4096,
@@ -122,20 +128,21 @@ if [ "$SLABS" = 1 ]; then
   [ -s $RS ] || printf 'tag\tbox\tscroll\tids\tids_a\tids_b\tp1x\tp4x\tjoin\tjoined\tjoined_p4x\tfit_s\tbin\tfcfg\n' > $RS
   [ -s $RR ] || printf 'tag\tsite\tslab\tr0_mm\tr1_mm\tvoxels\tm2\tm1\tzero\tp1\tp2\n' > $RR
   for s in $SITES; do
+    ulk
     S=site$s; grep -qP "^$TAG\t$S\t" $RS && { log "$S done"; continue; }
     d=$O/$S; mkdir -p $d; f=$FD/$S; t0=$(date +%s)
     if [ -n "$FIELDS" ]; then [ -e $f/fields.json ] || { log "$S: no fields $f"; continue; }
-    elif [ ! -e $f/fields.json ]; then predict $f $((2 * s)) 1024 512 320 7168 7680 $d/pred.log big || { log "$S predict failed"; continue; }; fi
+    elif [ ! -e $f/fields.json ]; then lk; predict $f $((2 * s)) 1024 512 320 7168 7680 $d/pred.log big || { log "$S predict failed"; continue; }; ulk; fi
     bash $H/mkcrop.sh $f $d/fA 0 96 96 96 3328 3520 > /dev/null; bash $H/mkcrop.sh $f $d/fB 64 96 96 96 3328 3520 > /dev/null; bash $H/mkcrop.sh $f $d/fC 0 96 96 160 3328 3520 > /dev/null
     if [ -n "$SLABORC" ]; then   # slab ceiling: label phase in the slab crops (--fill net: network planes where unlabelled)
       for k in A B C; do RUNBIG $U fields-oracle $d/f$k $PR $PK $d/o$k --fill $SLABORC --phase-scale $PF > $d/orc$k.log 2>&1 || { log "$S: fields-oracle $k failed"; continue 2; }
         rm -rf $d/f$k; mv $d/o$k $d/f$k; done
     fi
-    for k in A B; do UFSM_FIT_THREADS=$THREADS RUNBIG $U fit $d/f$k $GF --out $d/fit$k --codes $QR $QK --score-detail 1 --score-pairs 1 --dir 1 --uw-repair 8 ${FIT//\{box\}/$S} > $d/fit$k.log 2>&1
+    for k in A B; do lk; UFSM_FIT_THREADS=$THREADS RUNBIG $U fit $d/f$k $GF --out $d/fit$k --codes $QR $QK --score-detail 1 --score-pairs 1 --dir 1 --uw-repair 8 ${FIT//\{box\}/$S} > $d/fit$k.log 2>&1; ulk
       grep -E '^    radius' $d/fit$k.log | awk -v t=$TAG -v s=$S -v k=$k '{gsub(/-/, " "); $0 = $0; print t"\t"s"\t"k"\t"$2"\t"$3"\t"$5"\t"$7"\t"$8"\t"$9"\t"$10"\t"$11}' >> $RR; done
     RUN $U fit-join $d/joined $d/fC --blend 16 $d/fitA 32 160 $d/fitB 160 288 > $d/join.log 2>&1
     js=$(num $(grep -oE '^ +0\|1 .*' $d/join.log | awk '{print $NF}'))
-    UFSM_FIT_THREADS=$THREADS RUNBIG $U fit $d/fC --model $d/joined $GF --codes $QR $QK --score-pairs 1 > $d/joined.log 2>&1
+    lk; UFSM_FIT_THREADS=$THREADS RUNBIG $U fit $d/fC --model $d/joined $GF --codes $QR $QK --score-pairs 1 > $d/joined.log 2>&1; ulk
     t1=$(date +%s); a=$(num $(g_ids $d/fitA.log)); b=$(num $(g_ids $d/fitB.log))
     m=$(echo "$a $b" | awk '$1 != "na" && $2 != "na" {printf "%.4f", ($1 + $2) / 2; exit} {print "na"}')
     p1=$(echo "$(num $(g_pair $d/fitA.log 1 1)) $(num $(g_pair $d/fitB.log 1 1))" | awk '$1 != "na" && $2 != "na" {printf "%.4f", ($1 + $2) / 2; exit} {print "na"}')
