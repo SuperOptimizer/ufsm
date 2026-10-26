@@ -9,11 +9,12 @@
 # 2 | bg (long background loops: core benches, slab ceilings, p4unwrap lanes: call gpuq_yield at every box boundary).
 # The grant is still an exclusive flock on the lock file, so scripts that call plain `flock ~/ufsm-data/gpu.lock cmd` keep working
 # and stay mutually exclusive with queue jobs; they just have no priority (a blocked plain flock may win the lock at a release).
-# Order: lowest PRIO first, FIFO (ticket number) inside a priority. Only the head ticket waits on the lock (a blocking flock of
-# GPUQ_WAIT s, 2, then the head is re-checked: it races plain-flock waiters fairly at each release); the others poll every GPUQ_POLL s.
-# gpuq_yield (at a box boundary): releases the GPU only when someone better waits: a ticket of higher priority, or (bg only) any
-# other waiting ticket or a blocked plain flock (round robin; the bg job re-queues at the back). eval / now jobs re-queue with
-# their old ticket number, so they get the GPU back first among their priority. Tickets of dead processes are dropped.
+# Order: lowest PRIO first, FIFO (ticket number) inside a priority. Only the head ticket waits on the lock: a blocking flock (the kernel
+# serves the longest-blocked waiter first, so a head that re-blocked every few s would lose every release to plain-flock waiters;
+# a better newcomer kills the head's flock child, the head re-checks and steps back). Others poll every GPUQ_POLL s.
+# gpuq_yield (at a box boundary): eval / now holders release only for a waiting ticket of higher priority and re-queue with their
+# old ticket number (first again among their priority); bg holders always let go for 1 s (plain-flock waiters are invisible) and
+# re-queue behind waiting bg tickets (round robin). Tickets of dead processes are dropped.
 # A command started by `gpuq.sh run` (or by a holder) inherits the lock: nested gpuq_acquire calls return at once
 # (GPUQ_HELD=1 in the environment) and nested yields / releases do nothing; wbench.sh's NOLOCK=1 stays valid.
 # Env: GPUQ_LOCK (default $LOCK, else ~/ufsm-data/gpu.lock), GPUQ_DIR (tickets; default <lock dir>/gpuq), GPUQ_POLL.
@@ -48,14 +49,14 @@ gpuq_acquire() {   # gpuq_acquire PRIO TAG
   echo "$tag" > "$t"
   local hp hpr wp ok
   # a better ticket than the head that is blocked on the lock interrupts its wait (the head then re-checks and steps back)
-  if read -r hp hpr < "$GPUQ_DIR/headwait" 2> /dev/null && [ "$pr" -lt "${hpr:-0}" ]; then kill "$hp" 2> /dev/null; fi
+  if [ -s "$GPUQ_DIR/headwait" ] && read -r hp hpr < "$GPUQ_DIR/headwait" && [ "$pr" -lt "${hpr:-0}" ]; then kill "$hp" 2> /dev/null; fi
   while :; do
     head=$(gpuq_tickets | head -1)
     if [ "${head%% *}" = "$pr" ] && [ "$(echo "$head" | cut -d' ' -f2)" = "$seq" ]; then
       exec {GPUQ_FD}> "$GPUQ_LOCK"
       # the head blocks like a plain flock (a polling head would lose every release to blocked plain flocks), in a child whose pid
       # is published so that a better newcomer can cut the wait short (the lock, once taken, belongs to the shared open file)
-      flock -w "${GPUQ_WAIT:-2}" $GPUQ_FD & wp=$!; echo "$wp $pr" > "$GPUQ_DIR/headwait"; wait $wp && ok=1 || ok=0
+      flock -w "${GPUQ_WAIT:-3600}" $GPUQ_FD & wp=$!; echo "$wp $pr" > "$GPUQ_DIR/headwait"; wait $wp && ok=1 || ok=0
       [ "$(cat "$GPUQ_DIR/headwait" 2> /dev/null)" = "$wp $pr" ] && rm -f "$GPUQ_DIR/headwait"
       if [ $ok = 1 ]; then
         rm -f "$t"; GPUQ_HELD=1; GPUQ_OWNER=$me; GPUQ_PR=$pr; GPUQ_TAG=$tag; GPUQ_SEQ=$seq; export GPUQ_HELD
