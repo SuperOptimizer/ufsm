@@ -49,7 +49,7 @@ typedef struct {
     int unfold, kw0, pw0;                                /* ci == 1 source unfolded along W: kw0 taps, pad pw0 -> 8 channels, kw = 1 */
     int K, Kp, Cop;                                      /* K = kd kh kw ci, padded to the K / N tiles */
     void *w; float *scale, *bias;                        /* device: fp16 [Cop][Kp]; fp32 [co] */
-    int tconv;                                           /* ConvTranspose k2 s2: GEMM to 4 co channels, shuffled */
+    int tconv;                                           /* ConvTranspose k2 s2: GEMM to 4 (2D; tconv 1) or 8 (3D; tconv 2) co channels, shuffled */
     float *tbias;                                        /* the transposed conv's bias [co] */
 } xconv;
 
@@ -58,6 +58,8 @@ int xconv_init(xconv *c, const float *w, int co, int ci, int kd, int kh, int kw,
                const float *scale, const float *bias);
 /* ConvTranspose2d(ci, co, 2, stride 2) of a 2D map, w [ci][co][2][2], bias [co] or nullptr */
 int xtconv_init(xconv *c, const float *w, int ci, int co, const float *bias);
+/* ConvTranspose3d(ci, co, 2, stride 2), w [ci][co][2][2][2], bias [co] or nullptr */
+int xtconv3_init(xconv *c, const float *w, int ci, int co, const float *bias);
 void xconv_free(xconv *c);
 /* y = act(conv(x) * scale + bias (+ res)); allocates y. res (optional) has y's shape. */
 xt xconv_fwd(const xconv *c, xt x, const xt *res, int act);

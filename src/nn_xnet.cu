@@ -310,6 +310,19 @@ extern "C" int xtconv_init(xconv *c, const float *w, int ci, int co, const float
     c->tbias = xdev_floats(tb, co); free(tb);
     return c->tbias ? 0 : -1;
 }
+extern "C" int xtconv3_init(xconv *c, const float *w, int ci, int co, const float *bias) {
+    memset(c, 0, sizeof *c);
+    if (ci % 8 || co % 8) { fprintf(stderr, "xnet: 3D transposed conv %d -> %d channels\n", ci, co); return -1; }
+    c->tconv = 2; c->co = 8 * co; c->ci = ci; c->kd = c->kh = c->kw = 1; c->sd = c->sh = c->sw = 1; c->K = ci;
+    float *wk = (float *)malloc((size_t)8 * co * ci * sizeof(float)); if (!wk) return -1;
+    for (int abc = 0; abc < 8; abc++) for (int o = 0; o < co; o++) for (int i = 0; i < ci; i++)
+        wk[((size_t)abc * co + o) * ci + i] = w[((size_t)i * co + o) * 8 + abc];   /* torch [ci][co][2][2][2]: abc = (a * 2 + b) * 2 + e */
+    int rc = conv_upload(c, wk, 8 * co, nullptr, nullptr); free(wk);
+    if (rc) return rc;
+    float *tb = (float *)calloc(co, sizeof(float)); if (bias) memcpy(tb, bias, co * sizeof(float));
+    c->tbias = xdev_floats(tb, co); free(tb);
+    return c->tbias ? 0 : -1;
+}
 extern "C" void xconv_free(xconv *c) { xfree_dev(c->w); xfree_dev(c->scale); xfree_dev(c->bias); xfree_dev(c->tbias); memset(c, 0, sizeof *c); }
 
 __global__ void k_tshuffle(const __half *g, const float *bias, __half *y, int n, int h, int w, int co) {
@@ -319,6 +332,16 @@ __global__ void k_tshuffle(const __half *g, const float *bias, __half *y, int n,
         const int o = (int)(i % co); size_t t = i / co; const int ab = (int)(t % 4); t /= 4; const int x = (int)(t % w); t /= w; const int yy = (int)(t % h); const size_t nn = t / h;
         const int a = ab >> 1, b = ab & 1;
         y[(((nn * 2 * h) + 2 * yy + a) * (size_t)(2 * w) + 2 * x + b) * co + o] = __float2half_rn(__half2float(g[i]) + bias[o]);
+    }
+}
+
+__global__ void k_tshuffle3(const __half *g, const float *bias, __half *y, size_t nd, int h, int w, int co) {
+    /* g [nd][h][w][8][co] -> y [2 nd][2h][2w][co] (nd = n d: plane 2 (n D + z) + a = n 2D + 2z + a) */
+    const size_t total = nd * h * w * 8 * co;
+    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < total; i += (size_t)gridDim.x * blockDim.x) {
+        const int o = (int)(i % co); size_t t = i / co; const int abc = (int)(t % 8); t /= 8; const int x = (int)(t % w); t /= w; const int yy = (int)(t % h); const size_t zz = t / h;
+        const int a = abc >> 2, b = (abc >> 1) & 1, e = abc & 1;
+        y[(((2 * zz + a) * (size_t)(2 * h) + 2 * yy + b) * (size_t)(2 * w) + 2 * x + e) * co + o] = __float2half_rn(__half2float(g[i]) + bias[o]);
     }
 }
 
@@ -373,6 +396,14 @@ extern "C" xt xconv_fwd_ln(const xconv *c, xt x, const xt *res, int act, const f
 }
 extern "C" xt xconv_fwd(const xconv *c, xt x, const xt *res, int act) {
     if (!c->tconv) return conv_run(c, x, res, act);
+    if (c->tconv == 2) {
+        xt g = conv_run(c, x, nullptr, XA_NONE);   /* [n][d][h][w][8 co] */
+        const int co = c->co / 8; xt y = xt_new(x.n, 2 * x.d, 2 * x.h, 2 * x.w, co);
+        const size_t total = (size_t)x.n * x.d * x.h * x.w * 8 * co;
+        k_tshuffle3<<<nblk(total, 256) > 65535 * 8 ? 65535 * 8 : nblk(total, 256), 256, 0, g_st>>>((const __half *)g.p, c->tbias, (__half *)y.p, (size_t)x.n * x.d, x.h, x.w, co);
+        xt_free(&g);
+        return y;
+    }
     xt g = conv_run(c, x, nullptr, XA_NONE);   /* [n][1][h][w][4 co] */
     const int co = c->co / 4; xt y = xt_new(x.n, x.d, 2 * x.h, 2 * x.w, co);
     const size_t total = (size_t)x.n * x.d * x.h * x.w * 4 * co;

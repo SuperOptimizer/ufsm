@@ -59,9 +59,15 @@ static int cln_of(const wl_dict *d, cln *c, const char *pfx, int stride, int k, 
 dv_net *dv_load(const char *ckpt) {
     wl_dict *d = wl_load(ckpt, "teacher");
     if (!d) { fprintf(stderr, "dinovol: %s: %s\n", ckpt, wl_error()); return nullptr; }
+    dv_net *n = dv_load_dict(d, ckpt);
+    wl_free(d);
+    return n;
+}
+dv_net *dv_load_dict(const wl_dict *d, const char *ckpt) {
     dv_net *n = calloc(1, sizeof *n); int rc = 0;
+    const int head = wl_get(d, "dense_head.fpn_in.weight") != nullptr;   /* the PointDenseHead is optional (HercuViT carries none) */
     {   const wl_tensor *c = wl_get(d, "backbone.cls_token"), *m = wl_get(d, "backbone.blocks.0.rope_embed.mix_frequencies");
-        if (!c || !m || c->numel % 48 || m->shape[0] * 48 != c->numel || c->numel > 1024) { fprintf(stderr, "dinovol: %s: unsupported width (cls %lld, heads %lld; need heads of 48)\n", ckpt, c ? (long long)c->numel : -1LL, m ? (long long)m->shape[0] : -1LL); wl_free(d); free(n); return nullptr; }
+        if (!c || !m || c->numel % 48 || m->shape[0] * 48 != c->numel || c->numel > 1024) { fprintf(stderr, "dinovol: %s: unsupported width (cls %lld, heads %lld; need heads of 48)\n", ckpt, c ? (long long)c->numel : -1LL, m ? (long long)m->shape[0] : -1LL); free(n); return nullptr; }
         n->E = (int)c->numel; n->H = (int)m->shape[0]; }
     rc |= cln_of(d, &n->stem, "backbone.down_projection.stem.convs.0", 1, 3, 1);
     for (int s = 0; s < DV_MAXST; s++) {
@@ -138,42 +144,43 @@ dv_net *dv_load(const char *ckpt) {
 #undef BN
     }
     n->nw = devf(d, "backbone.norm.weight"); n->nb = devf(d, "backbone.norm.bias");
-    /* dense head */
-    rc |= conv_of(d, &n->fpn_in, "dense_head.fpn_in.weight", "dense_head.fpn_in.bias", 1, 0, nullptr, nullptr);
-    rc |= conv_of(d, &n->lat, "dense_head.fpn_laterals.0.weight", "dense_head.fpn_laterals.0.bias", 1, 0, nullptr, nullptr);
-    rc |= conv_of(d, &n->ref2, "dense_head.fpn_refines.0.2.weight", "dense_head.fpn_refines.0.2.bias", 1, 0, nullptr, nullptr);
-    n->refw = devf(d, "dense_head.fpn_refines.0.0.weight"); n->refb = devf(d, "dense_head.fpn_refines.0.0.bias");
-    {
-        const wl_tensor *gw = need(d, "dense_head.fpn_refines.0.0.weight"), *gb = need(d, "dense_head.fpn_refines.0.0.bias");
-        if (!gw || !gb) rc = -1;
-        else {
-            const int C = (int)gw->shape[0], gi = (int)gw->shape[1]; float *w = calloc((size_t)C * C * 27, 4);
-            for (int o = 0; o < C; o++) for (int i = 0; i < gi; i++) memcpy(w + ((size_t)o * C + o / gi * gi + i) * 27, gw->data + ((size_t)o * gi + i) * 27, 27 * 4);
-            rc |= xconv_init(&n->ref1, w, C, C, 3, 3, 3, 1, 1, 1, 1, 1, 1, nullptr, gb->data); free(w);
+    if (head) {   /* dense head */
+        rc |= conv_of(d, &n->fpn_in, "dense_head.fpn_in.weight", "dense_head.fpn_in.bias", 1, 0, nullptr, nullptr);
+        rc |= conv_of(d, &n->lat, "dense_head.fpn_laterals.0.weight", "dense_head.fpn_laterals.0.bias", 1, 0, nullptr, nullptr);
+        rc |= conv_of(d, &n->ref2, "dense_head.fpn_refines.0.2.weight", "dense_head.fpn_refines.0.2.bias", 1, 0, nullptr, nullptr);
+        n->refw = devf(d, "dense_head.fpn_refines.0.0.weight"); n->refb = devf(d, "dense_head.fpn_refines.0.0.bias");
+        {
+            const wl_tensor *gw = need(d, "dense_head.fpn_refines.0.0.weight"), *gb = need(d, "dense_head.fpn_refines.0.0.bias");
+            if (!gw || !gb) rc = -1;
+            else {
+                const int C = (int)gw->shape[0], gi = (int)gw->shape[1]; float *w = calloc((size_t)C * C * 27, 4);
+                for (int o = 0; o < C; o++) for (int i = 0; i < gi; i++) memcpy(w + ((size_t)o * C + o / gi * gi + i) * 27, gw->data + ((size_t)o * gi + i) * 27, 27 * 4);
+                rc |= xconv_init(&n->ref1, w, C, C, 3, 3, 3, 1, 1, 1, 1, 1, 1, nullptr, gb->data); free(w);
+            }
         }
-    }
-    n->fnw = devf(d, "dense_head.fpn_norm.weight"); n->fnb = devf(d, "dense_head.fpn_norm.bias");
-    for (int k = 0; k < 3; k++) { char p[128]; snprintf(p, sizeof p, "dense_head.skip_norms.%d.weight", k); n->skw[k] = devf(d, p); snprintf(p, sizeof p, "dense_head.skip_norms.%d.bias", k); n->skb[k] = devf(d, p); }
-    rc |= conv_of(d, &n->mlp0, "dense_head.mlp.0.weight", "dense_head.mlp.0.bias", 1, 0, nullptr, nullptr);
-    rc |= conv_of(d, &n->mlp2, "dense_head.mlp.2.weight", "dense_head.mlp.2.bias", 1, 0, nullptr, nullptr);
-    rc |= conv_of(d, &n->shortcut, "dense_head.token_shortcut.weight", "dense_head.token_shortcut.bias", 1, 0, nullptr, nullptr);
-    n->tw = devf(d, "dense_head.trunk_norm.weight"); n->tb = devf(d, "dense_head.trunk_norm.bias");
-    {   /* obj_proj and ink_proj as one GEMM (64 + 32 outputs) */
-        const wl_tensor *ow = need(d, "dense_head.obj_proj.weight"), *ob = need(d, "dense_head.obj_proj.bias"), *iw = need(d, "dense_head.ink_proj.weight"), *ib = need(d, "dense_head.ink_proj.bias");
-        if (!ow || !ob || !iw || !ib) rc = -1;
-        else {
-            n->nd = (int)ow->shape[0]; n->ni = (int)iw->shape[0]; n->hid = (int)ow->shape[1];
-            const int co = n->nd + n->ni; float *w = malloc((size_t)co * n->hid * 4), *bb = malloc((size_t)co * 4);
-            memcpy(w, ow->data, (size_t)n->nd * n->hid * 4); memcpy(w + (size_t)n->nd * n->hid, iw->data, (size_t)n->ni * n->hid * 4);
-            memcpy(bb, ob->data, n->nd * 4); memcpy(bb + n->nd, ib->data, n->ni * 4);
-            rc |= xconv_init(&n->proj, w, co, n->hid, 1, 1, 1, 1, 1, 1, 0, 0, 0, nullptr, bb);
-            free(w); free(bb);
+        n->fnw = devf(d, "dense_head.fpn_norm.weight"); n->fnb = devf(d, "dense_head.fpn_norm.bias");
+        for (int k = 0; k < 3; k++) { char p[128]; snprintf(p, sizeof p, "dense_head.skip_norms.%d.weight", k); n->skw[k] = devf(d, p); snprintf(p, sizeof p, "dense_head.skip_norms.%d.bias", k); n->skb[k] = devf(d, p); }
+        rc |= conv_of(d, &n->mlp0, "dense_head.mlp.0.weight", "dense_head.mlp.0.bias", 1, 0, nullptr, nullptr);
+        rc |= conv_of(d, &n->mlp2, "dense_head.mlp.2.weight", "dense_head.mlp.2.bias", 1, 0, nullptr, nullptr);
+        rc |= conv_of(d, &n->shortcut, "dense_head.token_shortcut.weight", "dense_head.token_shortcut.bias", 1, 0, nullptr, nullptr);
+        n->tw = devf(d, "dense_head.trunk_norm.weight"); n->tb = devf(d, "dense_head.trunk_norm.bias");
+        {   /* obj_proj and ink_proj as one GEMM (64 + 32 outputs) */
+            const wl_tensor *ow = need(d, "dense_head.obj_proj.weight"), *ob = need(d, "dense_head.obj_proj.bias"), *iw = need(d, "dense_head.ink_proj.weight"), *ib = need(d, "dense_head.ink_proj.bias");
+            if (!ow || !ob || !iw || !ib) rc = -1;
+            else {
+                n->nd = (int)ow->shape[0]; n->ni = (int)iw->shape[0]; n->hid = (int)ow->shape[1];
+                const int co = n->nd + n->ni; float *w = malloc((size_t)co * n->hid * 4), *bb = malloc((size_t)co * 4);
+                memcpy(w, ow->data, (size_t)n->nd * n->hid * 4); memcpy(w + (size_t)n->nd * n->hid, iw->data, (size_t)n->ni * n->hid * 4);
+                memcpy(bb, ob->data, n->nd * 4); memcpy(bb + n->nd, ib->data, n->ni * 4);
+                rc |= xconv_init(&n->proj, w, co, n->hid, 1, 1, 1, 1, 1, 1, 0, 0, 0, nullptr, bb);
+                free(w); free(bb);
+            }
         }
     }
     { const wl_tensor *f = wl_get(d, "dense_head.fpn_in.weight"); n->fpn = f ? (int)f->shape[0] : 0; }
-    rc |= !n->nw || !n->nb || !n->refw || !n->refb || !n->fnw || !n->fnb || !n->tw || !n->tb || !n->skw[0] || !n->skw[1] || !n->skw[2];
+    rc |= !n->nw || !n->nb;
+    if (head) rc |= !n->refw || !n->refb || !n->fnw || !n->fnb || !n->tw || !n->tb || !n->skw[0] || !n->skw[1] || !n->skw[2];
     if (n->nstage != 4 || n->stage_ch[n->nstage - 1] <= 0 || n->depth < 1 || n->fpn % 8) { fprintf(stderr, "dinovol: unexpected architecture (%d stages, %d blocks)\n", n->nstage, n->depth); rc = -1; }
-    wl_free(d);
     if (rc || xnet_check("dinovol load")) { fprintf(stderr, "dinovol: cannot load %s\n", ckpt); dv_free(n); return nullptr; }
     return n;
 }
@@ -225,11 +232,12 @@ static xt bblock_fwd(const bblock *B, xt x) {
     return y;
 }
 
-int dv_forward(dv_net *n, const uint8_t *u8_dev, int T, float center, float scale, float hi) {
+int dv_forward(dv_net *n, const uint8_t *u8_dev, int T, float center, float scale, float hi) { return dv_forward_norm(n, u8_dev, T, -1e30f, hi, center, scale); }
+int dv_forward_norm(dv_net *n, const uint8_t *u8_dev, int T, float lo, float hi, float center, float scale) {
     if (T % (DV_PATCH * 2) || T < 32) { fprintf(stderr, "dinovol: tile %d must be a multiple of 16\n", T); return -1; }
     xt_free(&n->tok); for (int k = 0; k < 3; k++) xt_free(&n->sk[k]); xt_free(&n->fpng);
     n->T = T;
-    const float lo = -1e30f, a = 1.f / scale, b = -center / scale;
+    const float a = 1.f / scale, b = -center / scale;
     dv_prof(DVP_OTHER);
     xt in = xinput_u8(u8_dev, 1, T, T, T, &lo, &hi, &a, &b);
     xt x = cln_fwd(&n->stem, in, nullptr, 1); xt_free(&in);
@@ -285,6 +293,7 @@ int dv_forward(dv_net *n, const uint8_t *u8_dev, int T, float center, float scal
     }
     xt_free(&h); xt_free(&o); xfree_dev(X);
     dv_prof(DVP_FINAL);
+    if (!n->fpn) return xnet_check("dinovol forward");   /* no dense head */
     /* FPN grid at the 128-channel skip's resolution */
     xt f = xconv_fwd(&n->fpn_in, n->tok, nullptr, XA_NONE);
     const xt s2 = n->sk[2];
@@ -297,6 +306,7 @@ int dv_forward(dv_net *n, const uint8_t *u8_dev, int T, float center, float scal
 }
 
 int dv_net_points(dv_net *n, const float *coords_dev, const float *wgt_dev, const int *rows_dev, int P, float *acc_dev) {
+    if (!n->fpn) { fprintf(stderr, "dinovol: this checkpoint has no dense head\n"); return -1; }
     const int C = n->nd + n->ni, Ft = n->E + n->sk[0].c + n->sk[1].c + n->sk[2].c + n->fpn;
     for (int p0 = 0; p0 < P; p0 += DV_HCHUNK) {
         const int np = P - p0 < DV_HCHUNK ? P - p0 : DV_HCHUNK;

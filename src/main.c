@@ -62,6 +62,7 @@ int cmd_ink_ext(int argc, char **argv);   /* src/inkext.c */
 int cmd_ink_ensemble(int argc, char **argv);
 int cmd_wl_dump(int argc, char **argv);
 int cmd_dinovol_embed(int argc, char **argv);   /* src/dinovol.c */
+int cmd_hercuvit(int argc, char **argv);   /* src/hercuvit.c */
 int cmd_dinovol_eval(int argc, char **argv);
 int cmd_dinovol_read(int argc, char **argv);
 int cmd_emb_pca(int argc, char **argv);
@@ -132,6 +133,7 @@ static int usage(void) {
         "  ufsm ink-splat <out-group> --surface TIFXYZ --labels L [--mask M] --ct ROOT KEY --ct-um U --iso I [--band -4,4] ..   published 2D ink labels -> sparse 3D label zarr\n"
         "  ufsm wl-dump <weights> [key]   the tensors of a safetensors / torch zip weight file\n"
         "  ufsm dinovol-embed ROOT KEY OUT --ckpt PT --box z,y,x,nz,ny,nx   scrollprize dinovol tokens / dense / ink embeddings (zarr v3)\n"
+        "  ufsm hercuvit ROOT KEY OUT --ckpt PTH --box z,y,x,nz,ny,nx   HercuViT v0 sheet surface probability + per-window instance ids\n"
         "  ufsm dinovol-read GROUP NAME z,y,x,nz,ny,nx OUT.f32   a region of a dinovol embedding as float32\n"
         "  ufsm dinovol-eval EMB SURF.tifxyz ...   sheet-identity check of the dense embedding along surfaces\n"
         "  ufsm surf-eval --cases LIST --ckpt PT --out DIR   the upstream kaggle_surfaces frozen-encoder surface decoder evaluation\n"
@@ -2618,8 +2620,10 @@ static double hist_q(const size_t *h, int nb, double lo, double w, double q) {  
     size_t c = 0; for (int k = 0; k < nb; k++) { c += h[k]; if (n && (double)c >= q * n) return lo + (k + 0.5) * w; }
     return lo + nb * w;
 }
+static int fc_surf_counts(int argc, char **argv, const fit_fields_buf *A);
 static int cmd_fit_compare(int argc, char **argv) {
-    if (argc < 4) { fprintf(stderr, "usage: ufsm fit-compare <reference-fields> <fields>\n"); return 2; }
+    if (argc < 4) { fprintf(stderr, "usage: ufsm fit-compare <reference-fields> <fields> [--surf ROOT KEY [--surf-hi 0.5] [--surf-lo 0.3]]\n"
+                                    "  --surf: also count sheet crossings as peaks of a uint8 surface probability array (e.g. ufsm hercuvit) on the turn-count segments\n"); return 2; }
     fit_fields_buf A, B;
     if (fit_fields_load(argv[2], 0, 0, 1, &A) || fit_fields_load(argv[3], 0, 0, 1, &B)) { fprintf(stderr, "fit-compare: cannot load the fields\n"); return 1; }
     /* the candidate's cells may be k times the reference's (a coarser net, e.g. 38.4 um cells against the 19.2 um oracle): each
@@ -2719,7 +2723,89 @@ static int cmd_fit_compare(int argc, char **argv) {
                    hist_q(hed, NE, -4, 8.0 / NE, 0.5), bd / nseg, (double)sld / nseg, pk_n ? (double)pk_sd / pk_n : 0);
         }
     }
+    if (arg_index(argc, argv, "--surf") > 0 && fc_surf_counts(argc, argv, &A)) { fit_fields_free(&A); fit_fields_free(&B); return 1; }
     fit_fields_free(&A); fit_fields_free(&B);
+    return 0;
+}
+
+/* fit-compare --surf ROOT KEY [--surf-hi 0.5] [--surf-lo 0.3]: sheet crossings counted as peaks of a surface probability array
+   (uint8, e.g. ufsm hercuvit surface; on the reference fields' native voxel grid, placed by its ufsm.origin_zyx) along the same radial
+   0.5 mm segments as the turn counts, stepping one native voxel: hysteresis runs (on at p >= hi, off below lo), one peak (the run's
+   maximum) per run inside the segment. Reference: the crossings of the unwrapped reference phase through phi0, the reference phase
+   where the peaks sit (circular mean over all peaks, a first pass), so the count compares integer sheet crossings with integer peaks.
+   Placement: per peak the reference phase offset from phi0 (turns) times the reference spacing there (um), |.| median / p90. */
+static int fc_surf_counts(int argc, char **argv, const fit_fields_buf *A) {
+    const int si = arg_index(argc, argv, "--surf");
+    if (si + 2 >= argc) { fprintf(stderr, "fit-compare: --surf ROOT KEY\n"); return -1; }
+    const double hi = atof(opt(argc, argv, "--surf-hi", "0.5")) * 255, lo = atof(opt(argc, argv, "--surf-lo", "0.3")) * 255;
+    z3 *sz = z3_open(store_open(argv[si + 1]), argv[si + 2], nullptr); if (!sz) { fprintf(stderr, "fit-compare: --surf: %s\n", z3_error()); return -1; }
+    long long so[3] = {0, 0, 0};
+    {   char jp[1400]; snprintf(jp, sizeof jp, "%s/%s/zarr.json", argv[si + 1], argv[si + 2]); FILE *jf = fopen(jp, "rb"); char jb[8192] = {0};
+        if (jf) { size_t nr = fread(jb, 1, sizeof jb - 1, jf); (void)nr; fclose(jf); }
+        const char *q = strstr(jb, "\"origin_zyx\":"); if (q) sscanf(q + 13, " [%lld,%lld,%lld]", so, so + 1, so + 2); }
+    const int64_t *ssh = z3_meta_of(sz)->shape;
+    const int64_t nb[3] = {(int64_t)A->shape[0] * A->h, (int64_t)A->shape[1] * A->h, (int64_t)A->shape[2] * A->h};   /* the fields' native box */
+    int64_t ro[3], rn[3];
+    for (int d = 0; d < 3; d++) { ro[d] = A->origin[d] - so[d]; rn[d] = nb[d]; if (ro[d] < 0 || ro[d] + rn[d] > ssh[d]) { fprintf(stderr, "fit-compare: --surf does not cover the fields' box (axis %d)\n", d); z3_close(sz); return -1; } }
+    uint8_t *S = malloc((size_t)rn[0] * rn[1] * rn[2]); if (!S || z3_read(sz, ro, rn, S, 8)) { fprintf(stderr, "fit-compare: --surf read: %s\n", z3_error()); z3_close(sz); free(S); return -1; }
+    z3_close(sz);
+    const double L = 500.0, cu = A->h * A->um; const int ns = (int)(L / A->um);   /* one native voxel per step */
+    double *ph = malloc(sizeof(double) * (ns + 1)), *spv = malloc(sizeof(double) * (ns + 1)); int *pv = malloc(sizeof(int) * (ns + 1));
+    enum { NE = 400, ND = 1000 };
+    double phi0 = 0;
+    for (int pass = 0; pass < 2; pass++) {
+        double sc = 0, ss = 0; size_t n0 = 0, nseg = 0, off = 0, pkn = 0, pko = 0, npk = 0, hep[NE] = {0}, hd[ND] = {0}; double eb = 0, rt = 0;
+        for (int z = 0; z < A->shape[0]; z += 4) for (int y = 0; y < A->shape[1]; y += 4) for (int x = 0; x < A->shape[2]; x += 4) {
+            const double nz = A->h * (z + 0.5); const int az = (int)fmin(fmax(nz, 0), A->shape[0] * A->h); const double cyv = A->f.cy[az], cxv = A->f.cx[az];
+            const double py = A->h * (y + 0.5), px = A->h * (x + 0.5);
+            double ry = py - cyv, rx = px - cxv; const double rl = hypot(ry, rx); if (rl < 1) continue; ry /= rl; rx /= rl;
+            int ok = 1; double u = 0, la = 0, spsum = 0;
+            for (int k = 0; k <= ns && ok; k++) {
+                const double qy = py + ry * k, qx = px + rx * k;   /* native voxels, box-local */
+                const double cy = qy / A->h - 0.5, cx = qx / A->h - 0.5; const int iy = (int)floor(cy), ix = (int)floor(cx);
+                if (iy < 0 || ix < 0 || iy + 1 >= A->shape[1] || ix + 1 >= A->shape[2] || (int)qy >= nb[1] || (int)qx >= nb[2]) { ok = 0; break; }
+                const double ty = cy - iy, tx = cx - ix; double pc = 0, ps = 0, sp = 0;   /* bilinear reference phasor */
+                for (int b = 0; b < 4 && ok; b++) {
+                    const size_t i = ((size_t)z * A->shape[1] + iy + (b >> 1)) * A->shape[2] + ix + (b & 1); const double wgt = (b >> 1 ? ty : 1 - ty) * (b & 1 ? tx : 1 - tx);
+                    const double ac = (A->f.pc[i] - 128) / 127.0, as = (A->f.ps[i] - 128) / 127.0;
+                    if (!A->f.w[i] || hypot(ac, as) <= 0.3) { ok = 0; break; }
+                    pc += wgt * ac; ps += wgt * as; sp += wgt * A->f.sp[i] * cu / 8.0;
+                }
+                if (!ok) break;
+                const double a = atan2(ps, pc) / (2 * M_PI);
+                if (k) { double d = a - la; d -= round(d); u += d; } else u = a;
+                la = a; ph[k] = u; spv[k] = sp; spsum += sp;
+                pv[k] = S[((size_t)(int)nz * rn[1] + (size_t)qy) * rn[2] + (size_t)qx];
+            }
+            if (!ok) continue;
+            if (fabs(ph[ns] - ph[0]) < 0.5) continue;   /* as the turn counts: under half a turn says nothing */
+            int npeaks = 0, on = 0, best = -1;
+            for (int k = 0; k <= ns + 1; k++) {
+                const int v = k <= ns ? pv[k] : -1;
+                if (!on && v >= hi) { on = 1; best = k; }
+                else if (on && v >= 0 && v > pv[best]) best = k;
+                if (on && (v < lo || k > ns)) {   /* run ends: its peak */
+                    on = 0; if (best <= 0 || best >= ns) continue;   /* a run cut by the segment end: no interior peak */
+                    npeaks++;
+                    double d = ph[best] - phi0; d -= round(d);   /* the sheet sits at one reference phase value (mod 1) */
+                    if (pass == 0) { sc += cos(2 * M_PI * ph[best]); ss += sin(2 * M_PI * ph[best]); n0++; }
+                    else { hd[(int)fmin(ND - 1, fabs(d) * spv[best] / 0.5)]++; npk++; }
+                }
+            }
+            if (pass == 0) continue;
+            const double ref = fabs(floor(ph[ns] - phi0) - floor(ph[0] - phi0));   /* integer crossings of phi0 */
+            const double e = npeaks - ref;
+            hep[(int)fmin(NE - 1, fmax(0, (e + 4) / 8 * NE))]++; nseg++; off += fabs(e) >= 0.5; eb += e; rt += ref;
+            if (spsum / (ns + 1) < 100) { pkn++; pko += fabs(e) >= 0.5; }
+        }
+        if (pass == 0) { phi0 = atan2(ss, sc) / (2 * M_PI); printf("  surface peaks (--surf, hysteresis %.2f / %.2f): reference phase at the peaks phi0 %+.3f turn (concentration %.2f over %zu peaks)\n", hi / 255, lo / 255, phi0, n0 ? hypot(sc, ss) / n0 : 0.0, n0); continue; }
+        if (!nseg) { printf("  surface peaks: no segments\n"); break; }
+        printf("  surface peak counts on %zu segments (reference %.2f phi0 crossings each): error median %+.2f, mean %+.2f, off by >= 0.5 %.3f (packed < 100 um: %.3f of %zu)\n",
+               nseg, rt / nseg, hist_q(hep, NE, -4, 8.0 / NE, 0.5), eb / nseg, (double)off / nseg, pkn ? (double)pko / pkn : 0, pkn);
+        printf("  surface peak placement (%zu peaks, |phase offset from phi0| x reference spacing): median %.1f um, p75 %.1f, p90 %.1f\n",
+               npk, hist_q(hd, ND, 0, 0.5, 0.5), hist_q(hd, ND, 0, 0.5, 0.75), hist_q(hd, ND, 0, 0.5, 0.9));
+    }
+    free(S); free(ph); free(spv); free(pv);
     return 0;
 }
 
@@ -3033,9 +3119,11 @@ static int png_write_rgb(const char *path, int w, int h, const uint8_t *rgb) {
    its ufsm.origin_zyx): void (0 inside the scroll) tinted blue, ignored (128) yellow, papyrus left grey. Panels left to right in
    --labels order after the plain CT, 4 white pixels apart; --zoom N repeats pixels. */
 static int cmd_overlay(int argc, char **argv) {
-    if (argc < 5) { fprintf(stderr, "usage: ufsm overlay <out.png> <ct-root> <ct-key> --plane z,y,x,h,w [--labels G1,G2,..] [--prob G1,G2,..] [--um 2.4] [--zoom 1] [--cache DIR]\n"
+    if (argc < 5) { fprintf(stderr, "usage: ufsm overlay <out.png> <ct-root> <ct-key> --plane z,y,x,h,w [--axis z|y|x] [--labels G1,G2,..] [--prob G1,G2,..] [--ids G1,..] [--um 2.4] [--zoom 1] [--cache DIR]\n"
                                   "  --labels: papyrus label groups (void blue, ignored yellow); --prob: uint8 probability groups (predict output, binary\n"
-                                  "  labels), red with alpha p / 255; each group's level is named by --um, its origin_zyx attribute places it\n"); return 2; }
+                                  "  labels), red with alpha p / 255; --ids: integer instance groups (any width; e.g. ufsm hercuvit ids), one hashed colour per id\n"
+                                  "  over the CT (0 = none); each group's level is named by --um, its origin_zyx attribute places it. --axis y / x: the plane is\n"
+                                  "  normal to y / x (h runs along z, w along x / y)\n"); return 2; }
     long long pz[5]; if (sscanf(opt(argc, argv, "--plane", ""), "%lld,%lld,%lld,%lld,%lld", pz, pz + 1, pz + 2, pz + 3, pz + 4) != 5 || pz[3] < 1 || pz[4] < 1) { fprintf(stderr, "overlay: --plane z,y,x,h,w\n"); return 2; }
     const int H = (int)pz[3], W = (int)pz[4], Z = atoi(opt(argc, argv, "--zoom", "1")) < 1 ? 1 : atoi(opt(argc, argv, "--zoom", "1"));
     char lv[32]; z3w_level_name(atof(opt(argc, argv, "--um", "2.4")), lv, sizeof lv);
@@ -3043,24 +3131,36 @@ static int cmd_overlay(int argc, char **argv) {
     for (char *s = lab, *tok; nl < 16 && (tok = strtok(s, ",")); s = nullptr) names[nl++] = tok;
     char prb[4096]; snprintf(prb, sizeof prb, "%s", opt(argc, argv, "--prob", "")); const int nlab = nl;   /* panels [0, nlab) labels, then probabilities */
     for (char *s = prb, *tok; nl < 16 && (tok = strtok(s, ",")); s = nullptr) names[nl++] = tok;
-    const size_t n2 = (size_t)H * W; uint8_t *ct = malloc(n2), *lb = malloc(n2 * (nl ? nl : 1));
-    z3 *cz = z3_open(store_open(argv[3]), argv[4], opt(argc, argv, "--cache", nullptr)); if (!cz || !ct || !lb) { fprintf(stderr, "overlay: %s\n", z3_error()); return 1; }
-    const int64_t o[3] = {pz[0], pz[1], pz[2]}, n[3] = {1, H, W};
+    char idg[4096]; snprintf(idg, sizeof idg, "%s", opt(argc, argv, "--ids", "")); const int nprob = nl;   /* then instance-id panels [nprob, nl) */
+    for (char *s = idg, *tok; nl < 16 && (tok = strtok(s, ",")); s = nullptr) names[nl++] = tok;
+    const size_t n2 = (size_t)H * W; uint8_t *ct = malloc(n2), *lb = malloc(n2 * (nl ? nl : 1)); uint32_t *idv = malloc(n2 * 4 * (nl - nprob ? nl - nprob : 1)); uint8_t *tb = malloc(n2 * 8);
+    z3 *cz = z3_open(store_open(argv[3]), argv[4], opt(argc, argv, "--cache", nullptr)); if (!cz || !ct || !lb || !idv || !tb) { fprintf(stderr, "overlay: %s\n", z3_error()); return 1; }
+    const char ax = opt(argc, argv, "--axis", "z")[0];
+    const int64_t o[3] = {pz[0], pz[1], pz[2]}, n[3] = {ax == 'z' ? 1 : H, ax == 'z' ? H : ax == 'y' ? 1 : W, ax == 'x' ? 1 : W};
     if (z3_read(cz, o, n, ct, 8)) { fprintf(stderr, "overlay: %s\n", z3_error()); return 1; }
     for (int i = 0; i < nl; i++) {
         long long po[3] = {0, 0, 0}; char jp[1400]; snprintf(jp, sizeof jp, "%s/%s/zarr.json", names[i], lv); FILE *jf = fopen(jp, "rb"); char jb[8192] = {0};
         if (jf) { size_t nr = fread(jb, 1, sizeof jb - 1, jf); (void)nr; fclose(jf); }
         const char *q = strstr(jb, "\"origin_zyx\":"); if (q) sscanf(q + 13, " [%lld,%lld,%lld]", po, po + 1, po + 2);
-        z3 *lz = z3_open(store_open(names[i]), lv, nullptr); if (!lz) { fprintf(stderr, "overlay: %s: %s\n", names[i], z3_error()); return 1; }
+        z3 *lz = i < nprob ? z3_open(store_open(names[i]), lv, nullptr) : z3_open_typed(store_open(names[i]), lv, nullptr); if (!lz) { fprintf(stderr, "overlay: %s: %s\n", names[i], z3_error()); return 1; }
         const int64_t lo[3] = {pz[0] - po[0], pz[1] - po[1], pz[2] - po[2]};
-        if (z3_read(lz, lo, n, lb + n2 * i, 8)) { fprintf(stderr, "overlay: %s: %s\n", names[i], z3_error()); return 1; }
+        if (i < nprob) { if (z3_read(lz, lo, n, lb + n2 * i, 8)) { fprintf(stderr, "overlay: %s: %s\n", names[i], z3_error()); return 1; } }
+        else {   /* instance ids: any integer width, as uint32 */
+            const int es = z3_meta_of(lz)->esize; if (es > 8 || z3_read(lz, lo, n, tb, 8)) { fprintf(stderr, "overlay: %s: %s\n", names[i], z3_error()); return 1; }
+            uint32_t *dst = idv + n2 * (i - nprob);
+            for (size_t k = 0; k < n2; k++) { uint64_t v = 0; memcpy(&v, tb + k * es, es); dst[k] = (uint32_t)v; }
+        }
         z3_close(lz);
     }
     const int gap = 4, OW = (W * Z + gap) * (nl + 1) - gap, OH = H * Z; uint8_t *img = malloc((size_t)OW * OH * 3); if (!img) return 1;
     memset(img, 255, (size_t)OW * OH * 3);
     for (int p = 0; p <= nl; p++) for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
         const uint8_t g = ct[(size_t)y * W + x]; int r = g, gg = g, b = g;
-        if (p && p - 1 >= nlab) { const int a = lb[n2 * (p - 1) + (size_t)y * W + x];   /* probability: red over the CT */
+        if (p && p - 1 >= nprob) { const uint32_t v = idv[n2 * (p - 1 - nprob) + (size_t)y * W + x];   /* instance: hashed colour, alpha 0.6 */
+                 if (v) { uint32_t hsh = v * 2654435761u; hsh ^= hsh >> 15; hsh *= 2246822519u; hsh ^= hsh >> 13;
+                          const int cr = 60 + (int)(hsh & 0xff) * 195 / 255, cg = 60 + (int)((hsh >> 8) & 0xff) * 195 / 255, cb = 60 + (int)((hsh >> 16) & 0xff) * 195 / 255;
+                          r = (2 * g + 3 * cr) / 5; gg = (2 * g + 3 * cg) / 5; b = (2 * g + 3 * cb) / 5; } }
+        else if (p && p - 1 >= nlab) { const int a = lb[n2 * (p - 1) + (size_t)y * W + x];   /* probability: red over the CT */
                  r = (g * (255 - a) + 255 * a) / 255; gg = (g * (255 - a) + 30 * a) / 255; b = (g * (255 - a) + 20 * a) / 255; }
         else if (p) { const uint8_t v = lb[n2 * (p - 1) + (size_t)y * W + x];
                  if (g && v == 0) { r = g / 2; gg = g / 2 + 30; b = g / 2 + 120; } else if (v == 128) { r = g / 2 + 120; gg = g / 2 + 100; b = g / 2; } }
@@ -3071,7 +3171,7 @@ static int cmd_overlay(int argc, char **argv) {
     }
     const int rc = png_write_rgb(argv[2], OW, OH, img);
     if (rc) fprintf(stderr, "overlay: cannot write %s\n", argv[2]); else fprintf(stderr, "overlay: %s (%d x %d, %d panels)\n", argv[2], OW, OH, nl + 1);
-    z3_close(cz); free(ct); free(lb); free(img);
+    z3_close(cz); free(ct); free(lb); free(idv); free(tb); free(img);
     return rc;
 }
 
@@ -3466,6 +3566,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "ink-ensemble")) return cmd_ink_ensemble(argc, argv);
     if (!strcmp(cmd, "wl-dump")) return cmd_wl_dump(argc, argv);
     if (!strcmp(cmd, "dinovol-embed")) return cmd_dinovol_embed(argc, argv);
+    if (!strcmp(cmd, "hercuvit")) return cmd_hercuvit(argc, argv);
     if (!strcmp(cmd, "dinovol-eval")) return cmd_dinovol_eval(argc, argv);
     if (!strcmp(cmd, "dinovol-read")) return cmd_dinovol_read(argc, argv);
     if (!strcmp(cmd, "emb-pca")) return cmd_emb_pca(argc, argv);

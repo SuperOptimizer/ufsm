@@ -58,6 +58,8 @@ int cmd_dinovol_eval(int argc, char **argv);
 /* the network (src/dinovol_net.c) */
 typedef struct dv_net dv_net;
 dv_net *dv_load(const char *ckpt);          /* nullptr on failure (message printed); needs xnet_init first */
+typedef struct wl_dict wl_dict;
+dv_net *dv_load_dict(const wl_dict *d, const char *what);   /* from a loaded state dict (backbone.* [+ dense_head.*]; the head is optional) */
 void dv_free(dv_net *n);
 int dv_embed_dim(const dv_net *n);          /* 480 */
 int dv_dense_dims(const dv_net *n, int *nd, int *ni);   /* 64, 32 */
@@ -66,6 +68,8 @@ int dv_train_tile(const dv_net *n);         /* the training global crop (192) */
 /* one tile: u8 [T][T][T] on the device, normalised y = (min(x, hi) - center) / scale. Keeps the patch tokens ((T/8)^3 x 480, fp16,
    z y x order), the CNN skips and the FPN grid for dv_net_points. 0 on success. */
 int dv_forward(dv_net *n, const uint8_t *u8_dev, int T, float center, float scale, float hi);
+/* the same with the input  y = (clamp(x, lo, hi) - center) / scale  (HercuViT's per-window robust normalisation clips both ends) */
+int dv_forward_norm(dv_net *n, const uint8_t *u8_dev, int T, float lo, float hi, float center, float scale);
 const void *dv_tokens(const dv_net *n);     /* device fp16 [(T/8)^3][480] */
 const void *dv_cls(const dv_net *n);        /* device fp16 [480]: the last forward's normed cls token */
 /* the dense head at P points (tile voxel-index coordinates [P][3] on the device), in chunks: unit dense / ink vectors accumulated
