@@ -59,6 +59,7 @@ SRC += src/storebench.c src/phasepack.c
 SRC += src/afv.c src/fibercheck.c
 SRC += src/countfield.c
 SRC += src/flatten.c
+SRC += src/sheetcut.c
 OBJ  = $(patsubst src/%.c,$(B)/%.o,$(SRC)) $(B)/surfcomp.o
 
 all: $(B)/ufsm
@@ -265,6 +266,9 @@ $(B)/test_dinor: tests/test_dinor.c $(B)/nn.o $(B)/nn_fp8.o
 test-all: $(B)/test_dinor
 $(B)/test_tfx: tests/test_tfx.c $(B)/tfx.o $(B)/imgops.o $(B)/tiffw.o $(B)/tiff.o $(B)/surfcomp.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_tfx.c $(B)/tfx.o $(B)/imgops.o $(B)/tiffw.o $(B)/tiff.o $(B)/surfcomp.o -o $@ $(LDLIBS)
+$(B)/test_sheetcut: tests/test_sheetcut.c $(B)/sheetcut.o $(B)/tfx.o $(B)/imgops.o $(B)/tiffw.o $(B)/tiff.o $(B)/surfcomp.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_sheetcut.c $(B)/sheetcut.o $(B)/tfx.o $(B)/imgops.o $(B)/tiffw.o $(B)/tiff.o $(B)/surfcomp.o -o $@ $(LDLIBS)
+test-all: $(B)/test_sheetcut
 test-all: $(B)/test_tfx
 $(B)/test_fit_join: tests/test_fit_join.c $(B)/fitjoin.o $(B)/fit.o $(B)/fit_emb.o $(B)/embz.o $(B)/z3w.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/coreline.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)

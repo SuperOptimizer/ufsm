@@ -84,6 +84,7 @@ int cmd_tifxyz_orient(int argc, char **argv);
 int cmd_tifxyz_bbox(int argc, char **argv);
 int cmd_png2jpg(int argc, char **argv);
 int cmd_tifxyz_sfc(int argc, char **argv);
+int cmd_sheet_cut(int argc, char **argv);   /* src/sheetcut.c */
 int cmd_phase_score(int argc, char **argv);
 int cmd_ink_splat(int argc, char **argv);   /* src/inksplat.c */
 
@@ -132,6 +133,7 @@ static int usage(void) {
         "  ufsm tifxyz-scale <src> <dst> <div> [--offset z,y,x]   tifxyz coordinates / div (e.g. 2.4 -> 9.6 um: 4)\n"
         "  ufsm ink-compare <out.jpg> --ct CT.tif --ink LABEL=INK.tif ..   CT | ink panels (half-res JPEG) + ink statistics per render\n"
         "  ufsm tifxyz-sfc <src-dir> <dst-dir> [--error 0.25] [--every K]   tifxyz wraps -> surface-compressor .sfc (readers take .sfc wraps directly)\n"
+        "  ufsm sheet-cut <wraps-dir> <out-dir> [--tol 0.3] [--min-cm2 0.25] [--max 8]   square flat sheets: largest isometric rectangles of each wrap\n"
         "  ufsm ink-ext --model v8in|hecate24|hecate96|reader3 --weights W --surface TIFXYZ --ct ROOT KEY --out DIR   external ink networks on a surface\n"
         "  ufsm ink-ensemble <out.tif> --ink [W:]INK.tif ..   per-model percentile-stretched weighted mean of ink renders\n"
         "  ufsm ink-splat <out-group> --surface TIFXYZ --labels L [--mask M] --ct ROOT KEY --ct-um U --iso I [--band -4,4] ..   published 2D ink labels -> sparse 3D label zarr\n"
@@ -3825,6 +3827,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "tifxyz-bbox")) return cmd_tifxyz_bbox(argc, argv);
     if (!strcmp(cmd, "png2jpg")) return cmd_png2jpg(argc, argv);
     if (!strcmp(cmd, "tifxyz-sfc")) return cmd_tifxyz_sfc(argc, argv);
+    if (!strcmp(cmd, "sheet-cut")) return cmd_sheet_cut(argc, argv);
     if (!strcmp(cmd, "phase-score")) return cmd_phase_score(argc, argv);
     if (!strcmp(cmd, "render")) return cmd_render(argc, argv);
     if (!strcmp(cmd, "blend")) return cmd_blend(argc, argv);

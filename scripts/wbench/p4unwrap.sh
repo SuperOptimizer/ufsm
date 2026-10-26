@@ -11,6 +11,8 @@
 #   U (binary, default $WB/bin/ufsm), O ($WB/p4unwrap/TAG), FIELDS (existing fit-field dir: skip the predict),
 #   Z0 ZE Y0 NY X0 NX (crop in field cells; default the whole scroll), I OV (64 / 16), ONLY ("k1 k2": just these slabs),
 #   FITARGS (extra fit flags), WRAPS (0), NOLOCK=1 (ignore the site GPU lock; the laptop lock is taken per GPU step).
+#   SPACEGB (120: free disk GB needed before the predict and each fit), JOIN=0 (fits only: a second host runs ONLY=... lanes; rsync its s??? dirs back), MEMGB (30: MemAvailable GB before each fit);
+#   lanes claim slabs dynamically (flock $O/claim.k), so GPUS="0 1" lanes balance and a second invocation can add lanes.
 set -u
 H=$(cd "$(dirname "$0")" && pwd)
 CK=$(readlink -f "$1"); TAG=$2
@@ -23,7 +25,7 @@ Z0=${Z0:-128}; ZE=${ZE:-9473}; Y0=${Y0:-608}; NY=${NY:-3328}; X0=${X0:-352}; NX=
 F=${FIELDS:-$O/fields}; BASE=0.1117
 log() { echo "$(date '+%m-%d %H:%M:%S') $*" | tee -a $O/run.log; }
 stopped() { [ -e $O/STOP ]; }
-space() { local f=$(df -BG --output=avail $O | tail -n 1 | tr -dc 0-9); [ $f -ge 120 ] || { log "only $f GB free"; return 1; }; }
+space() { local f=$(df -BG --output=avail $O | tail -n 1 | tr -dc 0-9); [ $f -ge ${SPACEGB:-120} ] || { log "only $f GB free (SPACEGB ${SPACEGB:-120})"; return 1; }; }
 LK=; [ -z "${NOLOCK:-}" ] && [ "$SITE" = laptop ] && LK=${LOCK:-}
 GQ=$H/gpuq.sh; [ -e $GQ ] || GQ=$H/../gpuq.sh; GPUQ_LOCK=${LK:-$HOME/ufsm-data/gpu.lock}; . $GQ
 G() { if [ -n "$LK" ]; then ( gpuq_acquire ${PRIO:-bg} p4unwrap-$TAG; "$@"; rc=$?; gpuq_release; exit $rc ); else "$@"; fi; }   # a GPU step through the laptop gpuq (per step, not per run)
@@ -46,10 +48,12 @@ order() {   # the codes region (cells 3456..8576) first, middle outward, then th
   local k c; for k in $(seq 0 $((NS - 1))); do c=$((Z0 + k * I)); [ $c -ge 3456 ] && [ $c -lt 8576 ] && echo "$(( (c - 6016) * (c - 6016) )) $k"; done | sort -n | awk '{print $2}'
   for k in $(seq 0 $((NS - 1))); do c=$((Z0 + k * I)); { [ $c -lt 3456 ] || [ $c -ge 8576 ]; } && echo $k; done; }
 LIST=${ONLY:-$(order)}
-lane() {   # lane L GPU: the slabs k of LIST with k mod NL == L
+lane() {   # lane L GPU: the unclaimed slabs of LIST, in order
   local L=$1 g=$2 k s d c0 c1 a b t0 rc ids e08
   for k in $LIST; do
-    [ $((k % NL)) = $L ] || continue; stopped && { log "STOP"; return 0; }; space || return 3
+    stopped && { log "STOP"; return 0; }; space || return 3
+    exec 9> $O/claim.$k; flock -n 9 || continue   # dynamic claims: lanes (and several runs of this script on one host) share the list
+    while [ $(awk '/MemAvailable/ {print int($2 / 1048576)}' /proc/meminfo) -lt ${MEMGB:-30} ]; do sleep 30; done
     s=$(printf 's%03d' $k); d=$O/$s; [ -e $d/done ] && continue
     c0=$((Z0 + k * I)); c1=$((c0 + I)); [ $c1 -gt $ZE ] && c1=$ZE
     a=$((c0 - OV)); [ $a -lt 0 ] && a=0; b=$((c1 + OV)); [ $b -gt $ZE ] && b=$ZE
@@ -64,6 +68,7 @@ lane() {   # lane L GPU: the slabs k of LIST with k mod NL == L
   done; }
 NL=$(echo $GPUS | wc -w); L=0; for g in $GPUS; do lane $L $g & L=$((L + 1)); done; wait
 stopped && exit 0
+[ "${JOIN:-1}" = 0 ] && { log "JOIN=0: slab fits only (another host joins)"; exit 0; }
 nd=$(ls -d $O/s???/done 2>/dev/null | wc -l); log "slab fits: $nd of $NS done ($(awk '{s += $NF + 0} END {printf "%.2f", s / 3600}' $O/slabs.txt) GPU-h)"
 
 # ---- 3. join + whole-scroll score ----
