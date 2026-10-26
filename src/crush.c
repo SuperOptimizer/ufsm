@@ -22,17 +22,18 @@ int crush_cfg_parse(crush_cfg *c, int argc, char **argv) {
     CR_F("--aug-crush", c->p); CR_R("--aug-crush-void", c->jlo, c->jhi); CR_F("--aug-crush-squash", c->squash_p); CR_R("--aug-crush-k", c->klo, c->khi);
     CR_F("--aug-crush-bend", c->bend_p); CR_F("--aug-crush-bend-amp", c->bend_amp); CR_F("--aug-crush-kink", c->kink_p); CR_F("--aug-crush-rot", c->rotate_deg);
     if ((v = cr_opt(argc, argv, "--aug-crush-fine"))) c->fine = atoi(v);
+    if ((v = cr_opt(argc, argv, "--aug-crush-warp"))) c->warp = atoi(v);
 #undef CR_F
 #undef CR_R
     const int bad = !(c->p >= 0 && c->p <= 1) || !(c->jlo > .04f && c->jlo <= c->jhi && c->jhi <= 1) || !(c->squash_p >= 0 && c->squash_p <= 1) ||
                     !(c->klo >= 1 && c->klo <= c->khi && c->khi <= 4) || !(c->bend_p >= 0 && c->bend_p <= 1) || !(c->bend_amp >= 0 && c->bend_amp <= .2f) ||
-                    !(c->kink_p >= 0 && c->kink_p <= 1) || !(c->rotate_deg >= 0 && c->rotate_deg <= 45) || c->fine < 0 || c->fine > 3;
-    if (bad) { fprintf(stderr, "--aug-crush: p 0..1, void 0.05..1 (lo <= hi), squash p 0..1, k 1..4 (lo <= hi), bend p 0..1 amp 0..0.2, kink p 0..1, rot 0..45, fine 0..3\n"); return 1; }
+                    !(c->kink_p >= 0 && c->kink_p <= 1) || !(c->rotate_deg >= 0 && c->rotate_deg <= 45) || c->fine < 0 || c->fine > 3 || c->warp < 0 || c->warp > 1;
+    if (bad) { fprintf(stderr, "--aug-crush: p 0..1, void 0.05..1 (lo <= hi), squash p 0..1, k 1..4 (lo <= hi), bend p 0..1 amp 0..0.2, kink p 0..1, rot 0..45, fine 0..3, warp 0|1\n"); return 1; }
     return 0;
 }
 void crush_cfg_print(const crush_cfg *c) {
-    fprintf(stderr, "crush augmentation: p %.3g, void ratio %.3g..%.3g, squash p %.3g x%.3g..%.3g, bend p %.3g (%.3g P), kink p %.3g, rotation %.3g deg, CT %d levels finer\n",
-            c->p, c->jlo, c->jhi, c->squash_p, c->klo, c->khi, c->bend_p, c->bend_amp, c->kink_p, c->rotate_deg, c->fine);
+    fprintf(stderr, "crush augmentation: p %.3g, void ratio %.3g..%.3g, squash p %.3g x%.3g..%.3g, bend p %.3g (%.3g P), kink p %.3g, rotation %.3g deg, CT %d levels finer, geometry warp after %d\n",
+            c->p, c->jlo, c->jhi, c->squash_p, c->klo, c->khi, c->bend_p, c->bend_amp, c->kink_p, c->rotate_deg, c->fine, c->warp);
 }
 static double dot3(const double a[3], const double b[3]) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
 static void unit3(double v[3]) { const double l = sqrt(dot3(v, v)); for (int d = 0; d < 3; d++) v[d] /= l; }

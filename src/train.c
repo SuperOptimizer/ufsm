@@ -1176,7 +1176,7 @@ int cmd_train(int argc, char **argv) {
                         "       [--geometry-aug 0|1] [--rotate-deg 5] [--rotate-p 0.2] [--elastic 1] [--elastic-p 0.15] [--label-morph 0] [--label-morph-p 0.2]\n"
                         "       [--aug-strength 1 (0..2)] [--aug-p 0 (default p of every scanner op)] [--aug-OP-p P] [--aug-drop-ignore 1] [--aug-affine-p 0] [--aug-aniso 0.1] [--aug-shear 0.06]\n"
                         "       [--aug-crush 0 (p: crushed windows of stored-phase sources, src/crush.h)] [--aug-crush-void 0.15,0.5] [--aug-crush-squash 0.5] [--aug-crush-k 1.5,3]\n"
-                        "       [--aug-crush-bend 0.5] [--aug-crush-bend-amp 0.06] [--aug-crush-kink 0.25] [--aug-crush-rot 10] [--aug-crush-fine 0 (CT N levels finer, sources \"crush_fine\")]\n"
+                        "       [--aug-crush-bend 0.5] [--aug-crush-bend-amp 0.06] [--aug-crush-kink 0.25] [--aug-crush-rot 10] [--aug-crush-fine 0 (CT N levels finer, sources \"crush_fine\")] [--aug-crush-warp 0 (1: crushed windows also take the rotation / elastic / affine / zoom warp)]\n"
                         "       [--aug-xscan 0 (p: the CT from a registered partner scan, sources \"xscan\": [{\"map\": REG.json}])]\n"
                         "       [--aug-tear 0 (p: crush-type windows cut across the sheets, one side shifted up to ~1+ turns, src/scrollaug.h)] [--aug-tear-um 480 (largest shift)]\n"
                         "       [--aug-delam 0 (p: crush-type windows with 1-3 peels (thin voids inside sheets) / burned-out holes, labels keep the winding)] [--aug-delam-hole 0.5 (per site)]\n"
