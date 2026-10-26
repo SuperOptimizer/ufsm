@@ -2018,7 +2018,7 @@ int fit_fields_load_ex(const char *dir, int fz0, int fz1, int pool, fit_fields_b
         if (direct) for (int q = 0; q < nact; q++) blk[act[q]] = b->a[act[q]] + (size_t)(z0 - fz0) * plane;
         for (int q = 0; q < nact; q++) {
             const int k = act[q];
-            if (za[k]) { const int64_t o[3] = {z0 + zoff[0], zoff[1], zoff[2]}, n[3] = {nz, H, W}; if (z3_read(za[k], o, n, blk[k], 8)) { fprintf(stderr, "fit: %s\n", z3_error()); return -1; } }
+            if (za[k]) { const int64_t o[3] = {z0 + zoff[0], zoff[1], zoff[2]}, n[3] = {nz, H, W}; if (z3_read(za[k], o, n, blk[k], fit_nthreads(16))) { fprintf(stderr, "fit: %s\n", z3_error()); return -1; } }
             else if (boxraw[k]) { const long long bs[3] = {shp[0], shp[1], shp[2]}, o[3] = {z0, 0, 0}; const int64_t n[3] = {nz, H, W};
                    if (raw_read_box(fr[k], bs, o, n, blk[k])) { fprintf(stderr, "fit: short read of %s\n", nm[k]); return -1; } }
             else { const long long o[3] = {z0 + zoff[0], zoff[1], zoff[2]}; const int64_t n[3] = {nz, H, W};
@@ -2118,7 +2118,7 @@ int fit_fields_load_stream(const char *dir, fit_fields_buf *b, fit_stream *s, co
             const long long e = zarr ? ((z0 + zoff[0]) / cz + 1) * cz - zoff[0] : (long long)z0 + cz; nz = (int)((e < D ? e : D) - z0);
             if ((size_t)nz * plane > bcap) { free(buf); bcap = (size_t)nz * plane; buf = malloc(bcap); if (!buf) { rc = -1; break; } }
             const long long o[3] = {z0 + zoff[0], zoff[1], zoff[2]}; const int64_t nn3[3] = {nz, H, W};
-            if (za) { const int64_t oi[3] = {o[0], o[1], o[2]}; if (z3_read(za, oi, nn3, buf, 8)) { fprintf(stderr, "fit: %s\n", z3_error()); rc = -1; } }
+            if (za) { const int64_t oi[3] = {o[0], o[1], o[2]}; if (z3_read(za, oi, nn3, buf, fit_nthreads(16))) { fprintf(stderr, "fit: %s\n", z3_error()); rc = -1; } }
             else if (raw_read_box(fr, rsh, o, nn3, buf)) { fprintf(stderr, "fit: short read of %s\n", fit_plane_names[k]); rc = -1; }
             if (!rc) nn_h2d(s->dfield + (size_t)k * n + (size_t)z0 * plane, buf, (size_t)nz * plane);
         }

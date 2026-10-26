@@ -96,6 +96,44 @@ static int run_case(int dir) {
         CHECK(acc >= 0.995, "dir %+d: winding ids right %.4f < 0.995", dir, acc);
         CHECK(prec >= 0.99, "dir %+d: |error| < 0.08 at %.4f < 0.99", dir, prec);
     }
+    const int plain = g_split == 0 && g_robust == 0 && g_bend == 0 && g_pgrad == 0 && g_bias == 0 && dir > 0;
+    if (plain && !g_cpu) {   /* streamed fields (fit_fields_load_stream): the device planes and pooled sets equal the host path's, and fit */
+        char td[] = "/tmp/test_fit_stream_XXXXXX"; CHECK(mkdtemp(td) != nullptr, "mkdtemp");
+        const long long org[3] = {0, 0, 0}; const int shp[3] = {D, H, W}; uint8_t *a10[10] = {pc, ps, t[0], t[1], t[2], t[3], t[4], t[5], sp, w};
+        CHECK(fit_fields_save(td, org, shp, (int)H8, 2.4, a10, cy, cx, na) == 0, "fit_fields_save");
+        int fps[8]; const int nfp = fit_stream_fps(&c, (int)H8, fps);
+        fit_fields_buf sb, hb; fit_stream st;
+        CHECK(fit_fields_load_stream(td, &sb, &st, fps, nfp, nullptr) == 0 && fit_fields_load(td, 0, 0, 1, &hb) == 0, "stream / host loads");
+        CHECK(sb.a[2] == nullptr && sb.a[0] && sb.a[9], "streamed host buffer: no normal planes, phase and material kept");
+        const int bad = fit_stream_verify(&st, &hb.f);
+        printf("stream: %d pooling factors, device / pooled planes vs the host load: %s\n", st.nfp, bad ? "MISMATCH" : "identical");
+        CHECK(nfp >= 2 && bad == 0, "streamed fields differ from the host path (%d)", bad);
+        fit_cfg cs = c; cs.stream = &st; cs.verbose = 0; st.drop_pooled = 1; cs.dir = dir;
+        fit_model *ms = fit_run(&sb.f, &cs); CHECK(ms != nullptr, "streamed fit_run");
+        if (ms) {
+            size_t rs = 0, ns = 0;
+            for (size_t i = 0; i < n; i++) {
+                if (!w[i]) continue;
+                const int z = (int)(i / ((size_t)H * W)), y = (int)((i / W) % H), x = (int)(i % W);
+                const double pz = (z + 0.5) * H8, py = (y + 0.5) * H8, px = (x + 0.5) * H8;
+                const double d = fit_W(ms, pz, py, px) - W_true(pz, py, px) - (k0 - 200); rs += fabs(d) < 0.5; ns++;
+            }
+            printf("stream: winding ids right %.4f\n", (double)rs / ns);
+            CHECK((double)rs / ns >= 0.995, "streamed fit: winding ids right %.4f < 0.995", (double)rs / ns);
+            fit_free(ms);
+        }
+        fit_stream_free(&st); fit_fields_free(&sb); fit_fields_free(&hb);
+        char cmd[200]; snprintf(cmd, sizeof cmd, "rm -rf %s", td); CHECK(system(cmd) == 0, "rm");
+    }
+    if (plain && g_cpu) {   /* the voxel unwrapping's records on 4 KB pages (UFSM_UW_HUGE_GB=0) and on huge pages: the same model bit for bit */
+        fit_cfg c2 = c; c2.verbose = 0; c2.dir = dir;
+        setenv("UFSM_UW_HUGE_GB", "0", 1); fit_model *m4 = fit_run(&f, &c2);
+        unsetenv("UFSM_UW_HUGE_GB"); fit_model *mh = fit_run(&f, &c2);
+        CHECK(m4 && mh && m4->lz == mh->lz && m4->ly == mh->ly && m4->lx == mh->lx &&
+              !memcmp(m4->delta, mh->delta, (size_t)m4->lz * m4->ly * m4->lx * sizeof(float)), "unwrap records: 4 KB vs huge pages give different models");
+        printf("unwrap records on 4 KB / huge pages: %s\n", m4 && mh && !memcmp(m4->delta, mh->delta, (size_t)m4->lz * m4->ly * m4->lx * sizeof(float)) ? "same model" : "DIFFERENT");
+        fit_free(m4); fit_free(mh);
+    }
     if (g_cpu && dir > 0 && g_robust == 0 && g_pgrad == 0 && g_bias == 0) {   /* a seed model (this fit one turn up: fit_model offsets + 1) on z [0, 96):
                                                  the seeded refit with the slip repair carries its count (gauge k0 + 1) */
         const double ps = (10 + 0.5) * H8, py = 600, px = 200, w0 = fit_W(m, ps, py, px);
