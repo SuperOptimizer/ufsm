@@ -65,6 +65,8 @@ int cmd_ink_ensemble(int argc, char **argv);
 int cmd_wl_dump(int argc, char **argv);
 int cmd_dinovol_embed(int argc, char **argv);   /* src/dinovol.c */
 int cmd_hercuvit(int argc, char **argv);   /* src/hercuvit.c */
+int cmd_ink3d_ext(int argc, char **argv);   /* src/ink3dext.c */
+int cmd_vol_cmp(int argc, char **argv);
 int cmd_dinovol_eval(int argc, char **argv);
 int cmd_dinovol_read(int argc, char **argv);
 int cmd_emb_pca(int argc, char **argv);
@@ -136,6 +138,8 @@ static int usage(void) {
         "  ufsm wl-dump <weights> [key]   the tensors of a safetensors / torch zip weight file\n"
         "  ufsm dinovol-embed ROOT KEY OUT --ckpt PT --box z,y,x,nz,ny,nx   scrollprize dinovol tokens / dense / ink embeddings (zarr v3)\n"
         "  ufsm hercuvit ROOT KEY OUT --ckpt PTH --box z,y,x,nz,ny,nx   HercuViT v0 sheet surface probability + per-window instance ids\n"
+        "  ufsm ink3d-ext --weights W --ct ROOT KEY --box z,y,x,nz,ny,nx --out GROUP [--out-um 9.6,4.8]   published 3D ink net (gambiarra) on a 2.4 um CT box -> prob254 zarr\n"
+        "  ufsm vol-cmp A_ROOT A_KEY B_ROOT B_KEY --box z,y,x,nz,ny,nx   two uint8 volumes (zarr v3 / v2): Pearson / Spearman + value mapping\n"
         "  ufsm dinovol-read GROUP NAME z,y,x,nz,ny,nx OUT.f32   a region of a dinovol embedding as float32\n"
         "  ufsm dinovol-eval EMB SURF.tifxyz ...   sheet-identity check of the dense embedding along surfaces\n"
         "  ufsm surf-eval --cases LIST --ckpt PT --out DIR   the upstream kaggle_surfaces frozen-encoder surface decoder evaluation\n"
@@ -3776,6 +3780,8 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "wl-dump")) return cmd_wl_dump(argc, argv);
     if (!strcmp(cmd, "dinovol-embed")) return cmd_dinovol_embed(argc, argv);
     if (!strcmp(cmd, "hercuvit")) return cmd_hercuvit(argc, argv);
+    if (!strcmp(cmd, "ink3d-ext")) return cmd_ink3d_ext(argc, argv);
+    if (!strcmp(cmd, "vol-cmp")) return cmd_vol_cmp(argc, argv);
     if (!strcmp(cmd, "dinovol-eval")) return cmd_dinovol_eval(argc, argv);
     if (!strcmp(cmd, "dinovol-read")) return cmd_dinovol_read(argc, argv);
     if (!strcmp(cmd, "emb-pca")) return cmd_emb_pca(argc, argv);

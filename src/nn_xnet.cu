@@ -526,6 +526,22 @@ extern "C" xt xavgpool2d_k2(xt x) {
     k_avgpool2<<<nb, 256, 0, g_st>>>((const __half *)x.p, (__half *)y.p, (long long)x.n * x.d, x.h, x.w, x.h / 2, x.w / 2, x.c);
     return y;
 }
+__global__ void k_avgpool3(const __half *x, __half *y, long long total, int D, int H, int W, int C) {
+    const int Do = D / 2, Ho = H / 2, Wo = W / 2;
+    for (long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; i < total; i += (long long)gridDim.x * blockDim.x) {
+        const int c = (int)(i % C); long long t = i / C; const int xo = (int)(t % Wo); t /= Wo; const int yo = (int)(t % Ho); t /= Ho; const int zo = (int)(t % Do); const long long nn = t / Do;
+        float a = 0.f;
+        for (int dz = 0; dz < 2; dz++) for (int dy = 0; dy < 2; dy++) for (int dx = 0; dx < 2; dx++)
+            a += __half2float(x[(((nn * D + 2 * zo + dz) * H + 2 * yo + dy) * (long long)W + 2 * xo + dx) * C + c]);
+        y[i] = __float2half(a * 0.125f);
+    }
+}
+extern "C" xt xavgpool3d_k2(xt x) {
+    xt y = xt_new(x.n, x.d / 2, x.h / 2, x.w / 2, x.c);
+    const size_t total = xt_numel(y); unsigned nb = nblk(total, 256); if (nb > 65535 * 8) nb = 65535 * 8;
+    k_avgpool3<<<nb, 256, 0, g_st>>>((const __half *)x.p, (__half *)y.p, (long long)total, x.d, x.h, x.w, x.c);
+    return y;
+}
 __global__ void k_depthmax(const __half *x, __half *y, int n, int D, long long HWC) {
     const long long total = (long long)n * HWC;
     for (long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; i < total; i += (long long)gridDim.x * blockDim.x) {

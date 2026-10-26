@@ -49,7 +49,7 @@ SRC += src/fblend.c
 SRC += src/render.c src/imgops.c
 SRC += src/repack.c
 SRC += src/wload.c src/inkext.c src/inkext_net.c src/dinovol.c src/dinovol_net.c src/dino.c src/surfeval.c
-SRC += src/inksplat.c src/hercuvit.c src/hercuvit_net.c
+SRC += src/inksplat.c src/hercuvit.c src/hercuvit_net.c src/ink3dext.c src/ink3dext_net.c
 SRC += src/tfx.c
 SRC += src/embz.c src/fit_emb.c src/embpca.c src/embcalib.c src/sample_emb.c
 SRC += src/fitjoin.c src/fieldsoracle.c src/packmap.c src/scanprep.c src/pairacc.c src/wbench.c
@@ -530,6 +530,7 @@ test-all: $(B)/test_gpu_aug $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover 
 	python3 tests/test_dinovol.py
 	python3 tests/test_dinovol_embed.py
 	python3 tests/test_hercuvit.py
+	python3 tests/test_ink3d_gambiarra.py
 	./$(B)/test_mx_sw
 	./$(B)/test_mx
 	./$(B)/test_mx4

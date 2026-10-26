@@ -75,6 +75,7 @@ float *xdev_floats(const float *host, size_t n);       /* a cached device copy o
 xt xunfold(xt x, int kw, int pw);                      /* c = 1 -> c = 8: out[.., w, j] = x[.., w - pw + j] (j < kw), width W + 2pw - kw + 1 */
 xt xmaxpool2d_k3s2(xt x);                              /* per depth plane, kernel 3, stride 2, pad 1 (-inf) */
 xt xavgpool2d_k2(xt x);                                /* per depth plane, kernel 2, stride 2 */
+xt xavgpool3d_k2(xt x);                                /* 3D, kernel 2, stride 2 (even D H W) */
 xt xdepthmax(xt x);                                    /* max over D -> D = 1 */
 xt xresize(xt x, int d, int h, int w);                 /* trilinear / bilinear, align_corners False */
 xt xconcat(xt a, xt b);                                /* channels: a then b */
