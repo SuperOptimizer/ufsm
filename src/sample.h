@@ -82,6 +82,10 @@ typedef struct {
                                 um with soft_um): a wide distance ridge trained beside the sharp recto (task surface, no channel-1 teacher) */
     int side, side_air;      /* side: 1 fills batch.side (band.h SIDE_*: recto / verso side of the nearest labelled recto) from the same band
                                 field, 2 fills it with the winding phase (band.h PHASE_*); voxels with CT <= side_air (and CT 0) are unknown */
+    float prev_packed_um;    /* --prev-input: the packed undercount acts where sheets are closer than this (train --packed-um) */
+    int prev;                /* train --prev-input (task unwrap2): inputs 4-7 hold a corrupted previous estimate from the labels: cos / sin
+                                of 2 pi W and of 2 pi W / 4 (W the window-unwrapped winding, batch.w4), corrupted by half-space and octant
+                                slips, a packed undercount warp, slab dropout and cold starts (src/sample.c prev_channels) */
     int aux;                 /* 1: a fifth input channel from the source's aux volume (src/sources.h), symmetry applied like the CT;
                                 batch.x / x16 then hold 5 channels per sample */
     int pmask;               /* 1: fill batch.pm, the papyrus mask (CT > 0, symmetry applied) for heads whose loss covers all papyrus

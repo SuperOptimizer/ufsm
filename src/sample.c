@@ -198,7 +198,7 @@ static void hfree(void *p) { if (nopin()) free(p); else nn_host_free(p); }
 static batch alloc_batch(const sample_cfg *c) {
     size_t p3 = (size_t)PZ(c) * c->P * c->P;
     batch b;
-    const size_t xc = c->gpu_input ? 1 : 4 + (c->aux != 0) + (c->cond ? 3 : 0);   /* input channels per sample (--gpu-input: the CT alone) */
+    const size_t xc = c->gpu_input ? 1 : 4 + (c->aux != 0) + (c->cond ? 3 : 0) + (c->prev ? 4 : 0);   /* input channels per sample (--gpu-input: the CT alone) */
     b.xch = (int)xc;
     b.rad = c->gpu_input ? halloc((size_t)c->B * NN_RAD_REC(PZ(c))) : nullptr;
     b.axr = c->axis_rec > 0 ? halloc((size_t)c->B * SAMPLE_AXR(PZ(c) > c->P ? PZ(c) : c->P) * sizeof(float)) : nullptr;
@@ -690,7 +690,7 @@ void sample_axis_record_spatial_test(float *r, const int64_t o[3], int P, int ha
 }
 int sample_gpu_input_ok(const sample_cfg *c) {
     const int Pz = c->Pz > 0 ? c->Pz : c->P;
-    return c->xfmt != 0 && !c->aux && !c->cond && !c->sheet && !(c->augment && c->ct_augment && Pz != c->P);   /* warps: the CT channel of
+    return c->xfmt != 0 && !c->aux && !c->prev && !c->cond && !c->sheet && !(c->augment && c->ct_augment && Pz != c->P);   /* warps: the CT channel of
                                                                                    write_spatial, the transported radial vector on the device */
 }
 int sample_gpu_aug_ok(const sample_cfg *c) {   /* the device's CT channel (nn_aug_ct): cubes, no CT appearance plan, labels that read the CT's zero set
@@ -698,7 +698,7 @@ int sample_gpu_aug_ok(const sample_cfg *c) {   /* the device's CT channel (nn_au
     return c->gpu_input && sample_gpu_input_ok(c) && (c->Pz <= 0 || c->Pz == c->P) && !c->ct_augment && c->side_air == 0 && !c->restore && !c->papyrus && c->P <= SA_MAXP;
 }
 int sample_gpu_lwarp_ok(const sample_cfg *c) {   /* --gpu-aug 2: the warped windows' labels on the device: the packed targets (and pmask: their mask bit), phase and winding only */
-    return sample_gpu_aug_ok(c) && c->pack_tm && !c->sheet && !c->pap_head && !c->emb_ch && !c->cond && !c->band && !c->aux;
+    return sample_gpu_aug_ok(c) && c->pack_tm && !c->sheet && !c->pap_head && !c->emb_ch && !c->cond && !c->band && !c->aux && !c->prev;
 }
 void sample_write_x_test(const uint8_t *ctu, int D, int P, const int64_t o[3], float mean, float isd, int hasax, const float *cyz,
                          const float *cxz, const int perm[3], const int flip[3], int xfmt, uint64_t seed, uint16_t *H4, uint16_t *H1, void *rec) {
@@ -1445,6 +1445,52 @@ static int aux_window(source *s, const int64_t o[3], int P, uint8_t *dst) {
 }
 
 static double rnorm(rng *r) { double u1 = runif(r); const double u2 = runif(r); if (u1 < 1e-300) u1 = 1e-300; return sqrt(-2 * log(u1)) * cos(2 * M_PI * u2); }
+/* train --prev-input: inputs ch0..ch0+3 of one window from its window-unwrapped winding mod 4 (batch.w4: 63 codes per turn, 255 unknown;
+   output coordinates): cos / sin of 2 pi W and of 2 pi W / 4, W = w4 / 63, corrupted the way a previous estimate (a fit or a refiner pass)
+   goes wrong: a cold start (all zero, p 0.15), 0-2 half-space slips (W +- 1 beyond a random plane), an octant slip (p 0.3), the packed
+   undercount (p 0.5: W - a ramp of 1-2 turns over 0.5 mm along a random direction, weighted by each 16^3 block's packed fraction, sheets
+   closer than packed_um), slab dropout (p 0.3: zero over 32-96 planes of an axis); unknown voxels zero. Own rng stream (seed): the
+   window's other draws are unchanged */
+static void prev_channels(uint64_t seed, const uint8_t *w4, int Pz, int P, double vox_um, double packed_um, float *X, uint16_t *H, int xfmt, int ch0) {
+    rng q = {{seed ^ 0x9e3779b97f4a7c15ull, seed * 0xbf58476d1ce4e5b9ull + 1, seed ^ 0x94d049bb133111ebull, seed + 0x2545f4914f6cdd1dull}}; rng *r = &q;
+    for (int k = 0; k < 8; k++) rnext(r);
+    const size_t p2 = (size_t)P * P, p3 = (size_t)Pz * p2;
+    const int cold = runif(r) < 0.15;
+    /* slips: planes n . (x - c) > 0 get +s turns */
+    double pn[3][3], pc[3][3]; int ps[3], npl = (int)rint_below(r, 3);
+    for (int k = 0; k < npl; k++) { double a = rnorm(r), b = rnorm(r), cc = rnorm(r), nn = sqrt(a * a + b * b + cc * cc) + 1e-9;
+        pn[k][0] = a / nn; pn[k][1] = b / nn; pn[k][2] = cc / nn; pc[k][0] = runif(r) * Pz; pc[k][1] = runif(r) * P; pc[k][2] = runif(r) * P; ps[k] = runif(r) < .5 ? -1 : 1; }
+    const int oct = runif(r) < 0.3; const int oz = (int)(Pz * (.25 + .5 * runif(r))), oy = (int)(P * (.25 + .5 * runif(r))), ox = (int)(P * (.25 + .5 * runif(r)));
+    const int osel = (int)rint_below(r, 8), osh = runif(r) < .5 ? -1 : 1;
+    const int und = runif(r) < 0.5; double ud[3]; { double a = rnorm(r), b = rnorm(r), cc = rnorm(r), nn = sqrt(a * a + b * b + cc * cc) + 1e-9; ud[0] = a / nn; ud[1] = b / nn; ud[2] = cc / nn; }
+    const double ua = runif(r) < .5 ? 1 : 2, uL = 500.0 / vox_um, ut0 = (runif(r) - .5) * P;
+    const int sd = runif(r) < 0.3, sax = (int)rint_below(r, 3), sth = 32 + (int)rint_below(r, 65), s0 = (int)rint_below(r, (sax ? P : Pz));
+    /* the packed fraction of each 16^3 block (|grad W| from the w4 codes over +-1 voxel) */
+    const int Bz = (Pz + 15) / 16, By = (P + 15) / 16; float *pk = und ? calloc((size_t)Bz * By * By, sizeof *pk) : nullptr;
+    if (pk) { int *cnt = calloc((size_t)Bz * By * By, sizeof *cnt); const double lim = vox_um / packed_um;   /* turns per voxel above which packed */
+        for (int z = 1; z < Pz - 1; z++) for (int y = 1; y < P - 1; y++) for (int x = 1; x < P - 1; x++) {
+            const size_t i = (size_t)z * p2 + (size_t)y * P + x; if (w4[i] == 255) continue;
+            const size_t nb[6] = {i + p2, i - p2, i + P, i - P, i + 1, i - 1}; double g2 = 0; int ok = 1;
+            for (int a = 0; a < 3 && ok; a++) { const int u = w4[nb[2 * a]], v = w4[nb[2 * a + 1]]; if (u == 255 || v == 255) { ok = 0; break; }
+                int d = u - v; d -= 252 * (d > 126); d += 252 * (d <= -126); const double t = d / 63.0 / 2; g2 += t * t; }
+            if (!ok) continue; const size_t bi = ((size_t)(z / 16) * By + y / 16) * By + x / 16; cnt[bi]++; if (sqrt(g2) > lim) pk[bi] += 1; }
+        for (size_t b = 0; b < (size_t)Bz * By * By; b++) pk[b] = cnt[b] ? pk[b] / cnt[b] : 0; free(cnt); }
+    for (int z = 0; z < Pz; z++) for (int y = 0; y < P; y++) for (int x = 0; x < P; x++) {
+        const size_t i = (size_t)z * p2 + (size_t)y * P + x; float v[4] = {0, 0, 0, 0};
+        const int sc = sax == 0 ? z : sax == 1 ? y : x;
+        if (!cold && w4[i] != 255 && !(sd && sc >= s0 && sc < s0 + sth)) {
+            double W = w4[i] / 63.0;
+            for (int k = 0; k < npl; k++) if (pn[k][0] * (z - pc[k][0]) + pn[k][1] * (y - pc[k][1]) + pn[k][2] * (x - pc[k][2]) > 0) W += ps[k];
+            if (oct && ((z >= oz) | (y >= oy) << 1 | (x >= ox) << 2) == osel) W += osh;
+            if (pk) { const double t = (ud[0] * (z - Pz / 2) + ud[1] * (y - P / 2) + ud[2] * (x - P / 2) - ut0) / uL, f = t < 0 ? 0 : t > 1 ? 1 : t;
+                W -= ua * f * pk[((size_t)(z / 16) * By + y / 16) * By + x / 16]; }
+            v[0] = (float)cos(2 * M_PI * W); v[1] = (float)sin(2 * M_PI * W); v[2] = (float)cos(M_PI_2 * W); v[3] = (float)sin(M_PI_2 * W);
+        }
+        for (int c = 0; c < 4; c++) { const size_t o = (size_t)(ch0 + c) * p3 + i;
+            if (X) X[o] = v[c]; else if (xfmt == 1) { _Float16 hv = (_Float16)v[c]; memcpy(&H[o], &hv, 2); } else H[o] = bf16_rn(v[c]); }
+    }
+    free(pk);
+}
 static inline void put_x(float *X, uint16_t *H, int xfmt, size_t idx, float v) {
     if (X) X[idx] = v; else if (xfmt == 1) { _Float16 hv = (_Float16)v; memcpy(&H[idx], &hv, 2); } else H[idx] = bf16_rn(v);
 }
@@ -2817,7 +2863,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
     }
     if (embp2) tp_put(embp2, p3 / 8);
     PROF_MARK(PS_AUGMENT);
-    const size_t xc = c->gpu_input ? 1 : 4 + (c->aux != 0);
+    const size_t xc = c->gpu_input ? 1 : 4 + (c->aux != 0) + (c->prev ? 4 : 0);
     if (c->gpu_input && (c->sheet || (app && Pz != P))) { fprintf(stderr, "sampler: --gpu-input needs write_x / write_spatial samples (sample_gpu_input_ok)\n"); abort(); }
     float *X = c->xfmt ? nullptr : b->x + (size_t)i * xc * p3;
     uint16_t *H = c->xfmt && !grec ? b->x16 + (size_t)i * xc * p3 : nullptr;   /* (--gpu-aug: neither: the device writes the CT channel) */
@@ -2852,6 +2898,8 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
         }
         tp_put(aw, p3); tp_put(as, p3);
     }
+    if (c->prev) prev_channels(r->s[0] ^ ((uint64_t)i << 40) ^ 0x5bd1e995u, b->w4 + (size_t)i * p3, Pz, P, b->um[i], c->prev_packed_um > 0 ? c->prev_packed_um : 120.0,
+                               X, H, c->xfmt, 4 + (c->aux != 0));   /* (after the labels: batch.w4 is this window's, output coordinates) */
     tp_put(near, p3);
     if (c->side == 2 && c->min_phase > 0 && !s->ct_only) {   /* --min-phase: windows with (almost) no known phase supervise nothing (sources with band / phase
                                                  targets only draw anywhere in the scroll): rejected */

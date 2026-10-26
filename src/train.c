@@ -1580,8 +1580,12 @@ int cmd_train(int argc, char **argv) {
     }
     {   /* --aux-input 1: a fifth input channel from each source's aux volume (src/sources.h; e.g. the papyrus void fraction pooled
            from 2.4 um, which keeps the packed gaps a 9.6 um CT averages away); the checkpoint's cin decides on resume */
-        g_xc = atoi(opt(argc, argv, "--aux-input", "0")) ? 5 : g_cond ? 7 : 4;
-        if (resume) { unet_cfg pc; int st; if (!unet_peek(resume, &pc, &st) && !pc.half_res) g_xc = pc.cin == 5 || pc.cin == 7 ? pc.cin : 4; }
+        g_xc = atoi(opt(argc, argv, "--aux-input", "0")) ? 5 : g_cond ? 7 : atoi(opt(argc, argv, "--prev-input", "0")) ? 8 : 4;   /* --prev-input 1: 4 previous-estimate channels (sample.c prev_channels) */
+        if (resume) { unet_cfg pc; int st; if (!unet_peek(resume, &pc, &st) && !pc.half_res) g_xc = pc.cin == 5 || pc.cin == 7 || pc.cin == 8 ? pc.cin : 4; }
+        if (g_xc == 8) {
+            if (!g_unwrap2 || g_half || split || g_sheet || g_cond) { fprintf(stderr, "--prev-input: task unwrap2 only, not with --half-res, --split, --cond or winding geometry\n"); return 2; }
+            cfg.cin = 8; fprintf(stderr, "inputs: CT, radial (3), previous estimate (cos, sin of 2 pi W and of 2 pi W / 4; label-derived, corrupted)\n");
+        }
         if (g_xc == 5) {
             if (g_half || split || g_sheet || g_cond) { fprintf(stderr, "--aux-input: not with --half-res, --split, --cond or winding geometry\n"); return 2; }
             cfg.cin = 5; fprintf(stderr, "inputs: CT, radial (3), aux (sources' \"aux\" volumes)\n");
@@ -1659,7 +1663,7 @@ int cmd_train(int argc, char **argv) {
     if (atoi(opt(argc, argv, "--rotonly", "0"))) sc.augment = 2;   /* proper rotations only (no reflections) */
     if (atoi(opt(argc, argv, "--zfix", "0"))) sc.augment = 3;      /* diagnostic: symmetries that keep the z axis */
     if (atoi(opt(argc, argv, "--intonly", "0"))) sc.augment = 4;   /* diagnostic: intensity jitter, no symmetry */
-    sc.aux = g_xc == 5; sc.cond = g_cond; sc.cond_outside = g_cond_outside; sc.pap_head = g_pap_head ? &g_paph : nullptr;
+    sc.aux = g_xc == 5; sc.prev = g_xc == 8; sc.prev_packed_um = g_packed_um; sc.cond = g_cond; sc.cond_outside = g_cond_outside; sc.pap_head = g_pap_head ? &g_paph : nullptr;
     sc.band = g_aff; sc.side = g_side; sc.pmask = g_unwrap;   /* unwrap: the phase only (band codes per window, or the stored phase) */ sc.side_air = atoi(opt(argc, argv, "--side-air", "0"));
     sc.wind4 = g_unwrap2; sc.wind4_step = atoi(opt(argc, argv, "--wind4-step", "80")); sc.wind4_min = atoi(opt(argc, argv, "--wind4-min", "512"));   /* unwrap2: band_wind4's join limit (phase codes) and smallest component */
     sc.emb_ch = g_distill; sc.emb_div = g_distill_div; sc.emb_pap = g_distill_pap;   /* --distill: the feature targets per head cell */
@@ -2597,11 +2601,11 @@ int cmd_train(int argc, char **argv) {
                 double tw = now(); batch *b = sampler_next(sp); wait += now() - tw;
                 if (!b) { fprintf(stderr, "sampler stopped\n"); g_stop = 1; break; }
                 upload(d, b, B, P); sampler_release(sp, b);
-                if (getenv("UFSM_DUMP_BATCH") && step == step0 + 5) {   /* diagnostic: what the GPU sees (mid slice of patch 0: CT | target | mask) */
-                    size_t p3 = (size_t)g_Pz * P * P; const size_t zm = (size_t)(g_Pz / 2); float *hx = malloc(4 * p3 * 4); uint8_t *ht = malloc(g_tc * p3), *hm = malloc(p3);
-                    if (!g_xfmt) nn_d2h(hx, d->x, 4 * p3 * 4);
-                    else { uint16_t *h16 = malloc(4 * p3 * 2); nn_d2h(h16, d->x, 4 * p3 * 2);
-                        for (size_t k = 0; k < 4 * p3; k++) { if (g_xfmt == 1) { _Float16 h; memcpy(&h, &h16[k], 2); hx[k] = (float)h; } else { uint32_t u = (uint32_t)h16[k] << 16; memcpy(&hx[k], &u, 4); } }
+                if (getenv("UFSM_DUMP_BATCH") && step == step0 + atoi(getenv("UFSM_DUMP_STEP") ? getenv("UFSM_DUMP_STEP") : "5")) {   /* diagnostic: what the GPU sees (mid slice of patch 0: CT | target | mask) */
+                    size_t p3 = (size_t)g_Pz * P * P; const size_t zm = (size_t)(g_Pz / 2); const size_t xcn = g_gpu_in ? 4 : (size_t)g_xc; float *hx = malloc(xcn * p3 * 4); uint8_t *ht = malloc(g_tc * p3), *hm = malloc(p3);
+                    if (!g_xfmt) nn_d2h(hx, d->x, xcn * p3 * 4);
+                    else { uint16_t *h16 = malloc(xcn * p3 * 2); nn_d2h(h16, d->x, xcn * p3 * 2);
+                        for (size_t k = 0; k < xcn * p3; k++) { if (g_xfmt == 1) { _Float16 h; memcpy(&h, &h16[k], 2); hx[k] = (float)h; } else { uint32_t u = (uint32_t)h16[k] << 16; memcpy(&hx[k], &u, 4); } }
                         free(h16); }
                     nn_d2h(ht, d->t, g_tc * p3); nn_d2h(hm, d->m, p3);
                     FILE *f = fopen(getenv("UFSM_DUMP_BATCH"), "wb"); fprintf(f, "P5\n%d %d\n255\n", 3 * P, P);
@@ -2610,6 +2614,12 @@ int cmd_train(int argc, char **argv) {
                         for (int x = 0; x < P; x++) fputc(ht[(zm * P + y) * P + x], f);
                         for (int x = 0; x < P; x++) fputc(hm[(zm * P + y) * P + x] ? 255 : 0, f);
                     }
+                    if (xcn == 8) { size_t nz_ = 0; for (size_t k = 0; k < p3; k++) nz_ += hx[4 * p3 + k] != 0.f; fprintf(stderr, "dump: prev channel 4 nonzero in %.1f%% of the window\n", 100.0 * nz_ / p3); }
+                    if (xcn == 8) {   /* --prev-input: the mid slice of the 4 previous-estimate channels (x 127.5 + 127.5), PATH.prev.pgm */
+                        char pp[1100]; snprintf(pp, sizeof pp, "%s.prev.pgm", getenv("UFSM_DUMP_BATCH")); FILE *g = fopen(pp, "wb");
+                        if (g) { fprintf(g, "P5\n%d %d\n255\n", 4 * P, P);
+                            for (int y = 0; y < P; y++) for (int c = 4; c < 8; c++) for (int x = 0; x < P; x++) { int v = (int)(127.5f + 127.5f * hx[(size_t)c * p3 + (zm * P + y) * P + x]); fputc(v < 0 ? 0 : v > 255 ? 255 : v, g); }
+                            fclose(g); } }
                     fclose(f); free(hx); free(ht); free(hm); fprintf(stderr, "dumped batch to %s\n", getenv("UFSM_DUMP_BATCH"));
                 }
                 unet_zero_grad(d->u); restore_train_recipe(d, step, g), run_batch(d, B, P, dice_w, 1); unet_backward_x(d->u, g_half && !g_pkf ? d->glh : d->gl, g_g16);

@@ -707,6 +707,14 @@ int cmd_predict(int argc, char **argv) {
     const int nwork = split ? 1 : ngpu;   /* worker processes */
     if (ffd && (split || ngpu > 1 || out_ch)) { fprintf(stderr, "predict: --fit-fields runs on one GPU and writes channel 0\n"); return 2; }
     z3 *auxz = nullptr; uint8_t *auxd = nullptr, *auxh = nullptr;   /* --aux ROOT KEY: the fifth input of 5-input checkpoints (train --aux-input) */
+    fit_set *pvs = nullptr; long long pvo[3] = {0, 0, 0}; double pvu = 0, pve[3] = {0, 0, 0}; uint8_t *pvd = nullptr, *pvh = nullptr; float *pvw = nullptr;   /* --prev FITDIR: inputs 4-7 of 8-input checkpoints (train --prev-input) from a fit's W */
+    {   const char *pd = opt(argc, argv, "--prev", nullptr);
+        if (pd && (cfg.cin != 8 || half)) { fprintf(stderr, "predict: --prev needs a checkpoint trained with --prev-input (8 inputs)\n"); return 2; }
+        if (pd) { if (!(pvs = fit_set_load(pd))) { fprintf(stderr, "predict: --prev: cannot load the fit %s\n", pd); return 1; }
+                  double zo; const fit_model *m0 = fit_set_model(pvs, 0, &zo); for (int d = 0; d < 3; d++) pvo[d] = m0->origin[d]; pvu = m0->um > 0 ? m0->um : 2.4;   /* (the fit's native voxel: its fields' um) */ pve[0] = m0->D * m0->h; pve[1] = m0->H * m0->h; pve[2] = m0->W * m0->h;   /* (outside the fit box: zero inputs) */
+                  if (split || ngpu > 1) { fprintf(stderr, "predict: --prev runs on one GPU without --split\n"); return 2; } }
+        else if (cfg.cin == 8) fprintf(stderr, "predict: 8-input checkpoint without --prev: the previous-estimate inputs are zero (a cold start)\n");
+    }
     {   int ai = -1; for (int k = 1; k + 2 < argc; k++) if (!strcmp(argv[k], "--aux")) ai = k;
         if (cfg.cin == 5 && !half) {
             if (ai < 0) { fprintf(stderr, "predict: %s has a fifth (aux) input: --aux ROOT KEY (the volume on this level's grid)\n", ckpt); return 2; }
@@ -903,7 +911,7 @@ int cmd_predict(int argc, char **argv) {
     uint8_t *pu = gpath ? nullptr : malloc(w3), *pud = gpath ? nullptr : nn_malloc(w3);
     float *dyo = malloc(2 * (size_t)W * sizeof(float)), *dxo = dyo + W, *dyd = nn_malloc(2 * (size_t)W * sizeof(float)), *dxd = dyd + W;
     const int Dl = split ? W / 2 + H0 : Wz;   /* planes per GPU */
-    shape5 xs = {1, !half && (cfg.cin == 5 || cfg.cin == 7) ? cfg.cin : 4, Dl, W, W};   /* (7: a train --cond net, its condition inputs zero here) */
+    shape5 xs = {1, !half && (cfg.cin == 5 || cfg.cin == 7 || cfg.cin == 8) ? cfg.cin : 4, Dl, W, W};   /* (7: a train --cond net, its condition inputs zero here) */
     const shape5 xn = half ? (shape5){1, cfg.cin, W / hdiv, W / hdiv, W / hdiv} : xs;   /* the network's input */
     void *x2 = nullptr, *lrt = nullptr; float *lgf = nullptr;   /* half: the network's input, the intermediate grid (div 4), the full-resolution logits */
     /* the 16-bit input in the network's shared a1 scratch when it has one (free until the stem conv, after the input conversion) */
@@ -937,10 +945,11 @@ int cmd_predict(int argc, char **argv) {
         if (ffct && ct_shared && !(ctcp = nn_malloc(w3))) { fprintf(stderr, "predict: no device memory for the --fit-ct CT copy\n"); return 1; }
         ctm = ct_shared ? nn_malloc((w3 + 31) / 32 * 4) : nullptr;
         ctmi = ct_shared && iso > 1 ? nn_malloc((w3 + 31) / 32 * 4) : ctm;   /* --iso: the outputs' own mask (the fit keeps ctm) */
-        xd = ct_stem || half || auxz || cfg.cin == 7 ? nullptr : h16 && !sheet_task ? unet_input_scratch(u, 4 * w3 * 2) : nullptr;
+        xd = ct_stem || half || auxz || cfg.cin == 7 || cfg.cin == 8 ? nullptr : h16 && !sheet_task ? unet_input_scratch(u, 4 * w3 * 2) : nullptr;
         xd_shared = xd != nullptr;
         if (!xd && !ct_stem) xd = nn_malloc((size_t)xs.c * w3 * (h16 ? 2 : 4));
         if (auxz) { auxd = nn_malloc(w3); auxh = malloc(w3); }
+        if (pvs) { pvd = nn_malloc(w3); pvh = malloc(w3); pvw = malloc(((size_t)Dl / 4 + 2) * (W / 4 + 2) * (W / 4 + 2) * sizeof(float)); }
         if (half) { x2 = nn_malloc(shape_numel(xn) * (h16 ? 2 : 4)); lgf = nn_malloc(w3 * 4); if (hdiv > 2) lrt = nn_malloc(w3 / 8 * 16); }
         if (ct_stem) fprintf(stderr, "predict: in-place slab inference from the CT window (%.1f B per window voxel)\n", (double)unet_activation_bytes(u) / w3);
         if (tta > 1 && (!ct_stem || !ct_shared || degrade || auxz || cfg.cin != 4)) { fprintf(stderr, "predict: --tta needs the CT-stem device path (no --aug-*, --aux, extra inputs)\n"); return 2; }
@@ -1225,6 +1234,30 @@ int cmd_predict(int argc, char **argv) {
             if ((xd_shared && unet_input_scratch(u, 4 * w3 * 2) != xd) || (ct_shared && unet_input_scratch2(u, w3) != ctd)) { fprintf(stderr, "predict: the network was rebuilt under its input scratch\n"); return 1; }
             if (!ct_stem) nn_pred_input_d(ctd, Wz, W, (float)mean, (float)(1.0 / sd), dyd, dxd, ax.n > 0 ? (int)radial_sign : 0, xd, h16);
             if (cfg.cin == 7 && !half) nn_zero((char *)xd + 4 * w3 * (h16 ? 2 : 4), 3 * w3 * (h16 ? 2 : 4));   /* no condition: inputs 4-6 zero */
+            if (cfg.cin == 8 && !half) {   /* inputs 4-7: the previous estimate from --prev's fit (cos / sin of 2 pi W and of 2 pi W / 4), else zero */
+                if (!pvs) nn_zero((char *)xd + 4 * w3 * (h16 ? 2 : 4), 4 * w3 * (h16 ? 2 : 4));
+                else {
+                    const double pvs_f = scale * um / pvu;   /* window (level) voxels -> the fit's native voxels */
+                    const int gz = Wz / 4 + 2, gy = W / 4 + 2;   /* W on a 4-voxel grid (fit_set_W at native coordinates relative to the fit's box), trilinear between */
+                    for (int a = 0; a < gz; a++) for (int b2 = 0; b2 < gy; b2++) for (int c2 = 0; c2 < gy; c2++)
+                    {   const double pz = (double)(o[0] + 4 * a) * pvs_f - pvo[0], py = (double)(o[1] + 4 * b2) * pvs_f - pvo[1], px = (double)(o[2] + 4 * c2) * pvs_f - pvo[2];
+                        pvw[((size_t)a * gy + b2) * gy + c2] = pz < 0 || py < 0 || px < 0 || pz > pve[0] || py > pve[1] || px > pve[2] ? NAN : (float)fit_set_W(pvs, pz, py, px); }
+                    for (int ch = 0; ch < 4; ch++) {
+                        for (int z = 0; z < Wz; z++) for (int y = 0; y < W; y++) for (int x = 0; x < W; x++) {
+                            const int a = z / 4, b2 = y / 4, c2 = x / 4; const float fz = (z % 4) * .25f, fy = (y % 4) * .25f, fx = (x % 4) * .25f;
+#define PV(i, j, k) pvw[((size_t)(a + i) * gy + (b2 + j)) * gy + (c2 + k)]
+                            const float Wv = (1 - fz) * ((1 - fy) * ((1 - fx) * PV(0, 0, 0) + fx * PV(0, 0, 1)) + fy * ((1 - fx) * PV(0, 1, 0) + fx * PV(0, 1, 1)))
+                                           + fz * ((1 - fy) * ((1 - fx) * PV(1, 0, 0) + fx * PV(1, 0, 1)) + fy * ((1 - fx) * PV(1, 1, 0) + fx * PV(1, 1, 1)));
+#undef PV
+                            const double ang = ch < 2 ? 2 * M_PI * Wv : M_PI_2 * Wv; const double v = isnan(Wv) ? 0 : (ch & 1) ? sin(ang) : cos(ang);
+                            pvh[((size_t)z * W + y) * W + x] = (uint8_t)lrint(127.5 + 127.5 * v);
+                        }
+                        nn_h2d(pvd, pvh, w3); nn_aux_input(pvd, w3, (char *)xd + (4 + ch) * w3 * (h16 ? 2 : 4), h16);   /* (u8 v -> v / 127.5 - 1, as the aux channel) */
+                        if (ch == 0 && getenv("UFSM_PREV_DUMP")) { static int dumped; if (!dumped++) { FILE *g = fopen(getenv("UFSM_PREV_DUMP"), "wb");   /* diagnostic: cos 2 pi W, mid slice of the first window */
+                            if (g) { fprintf(g, "P5\n%d %d\n255\n", W, W); fwrite(pvh + (size_t)(Wz / 2) * W * W, 1, (size_t)W * W, g); fclose(g); fprintf(stderr, "predict: prev slice z %lld y %lld x %lld (level, the window origin of y / x), %d x %d -> %s\n", (long long)(o[0] + Wz / 2), (long long)o[1], (long long)o[2], W, W, getenv("UFSM_PREV_DUMP")); } } }
+                    }
+                }
+            }
             if (auxz) {   /* the fifth channel: the aux volume over this window (level coordinates as the CT; outside 0) */
                 const z3_meta *am = z3_meta_of(auxz); int64_t ao[3], an[3]; int inb = 1;
                 memset(auxh, 0, w3);
