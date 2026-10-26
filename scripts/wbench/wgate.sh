@@ -27,6 +27,7 @@ REF=${REF:-wind96}; BOXES=${BOXES:-core}; SITES=${SITES-4624 5392 5904 6672}; RE
 # slab sites on the laptop are OOM-killed in ufsm.slice (12-20 GB per slab fit beside other jobs): there they run on forlindesk
 # (wgate-slabs.sh, after the boxes) unless SLABS_AT=local
 SLABS_AT=${SLABS_AT:-$([ "$SITE" = laptop ] && echo forlindesk || echo local)}; RSITES=; [ "$SLABS_AT" != local ] && { RSITES=$SITES; SITES=; }
+[ "$SITE" = laptop ] && [ "$SLABS_AT" = local ] && [ -n "$SITES" ] && { echo "wgate: no slab fits on the laptop (12-20 GB each, OOM-killed in ufsm.slice): SLABS_AT=forlindesk or SITES=\"\""; exit 2; }
 BT=${BT:-$H/boxes.tsv}; FIT=""; FIELDS=""
 GF="--gpu $GPU"; BIN=$(sha1sum $U | cut -c1-8); FCFG=$(echo "$BIN --dir 1 --uw-repair 8 " | sha1sum | cut -c1-8)
 O=$WB/gate/$TAG; FD=$WB/fields/$TAG; mkdir -p $O/ready $O/claim $FD $CACHE

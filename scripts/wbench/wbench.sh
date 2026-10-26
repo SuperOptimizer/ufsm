@@ -17,7 +17,8 @@ SITE=${SITE:-$([ -d $HOME/ufsm-data ] && echo laptop || echo desk)}; GPU=${GPU:-
 . $H/site-$SITE.env
 CK=$(readlink -f "$1"); TAG=$2
 U=${U:-$WB/bin/ufsm}; [ -x $U ] || { echo "no binary $U"; exit 2; }
-BOXES=${BOXES:-clean}; SLABORC=${SLABORC:-}; REP=${REP:-2}; SLABS=${SLABS:-1}; SITES=${SITES:-4624 5392 5904 6672}; FIT=${FIT:-}; FIELDS=${FIELDS:-}; KEEP=${KEEP:-1}
+BOXES=${BOXES:-clean}; SLABORC=${SLABORC:-}; REP=${REP:-2}; SLABS=${SLABS:-$([ "$SITE" = laptop ] && echo 0 || echo 1)}; SITES=${SITES:-4624 5392 5904 6672}; FIT=${FIT:-}; FIELDS=${FIELDS:-}; KEEP=${KEEP:-1}
+[ "$SITE" = laptop ] && [ "$SLABS" = 1 ] && { echo "wbench: no slab fits on the laptop (OOM in ufsm.slice): run the sites on forlindesk (wgate-slabs.sh) or SLABS=0"; exit 2; }
 BT=${BT:-$H/boxes.tsv}; BIN=$(sha1sum $U | cut -c1-8)
 GF="--gpu $GPU"; [ "${CPU:-0}" = 1 ] && GF="--cpu --threads $THREADS"   # CPU=1: fits on the CPU backend (no GPU; a separate fitter config)
 FCFG=$(echo "$BIN --dir 1 --uw-repair 8 $FIT${CPU:+ cpu$CPU}" | sha1sum | cut -c1-8)   # the fitter config: binary + flags
