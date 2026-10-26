@@ -9,7 +9,7 @@
 # Output: $WB/gate/TAG/{rows.tsv (wbench.sh columns), slabs.tsv, radius.tsv, table.txt, run.log}; fields in $WB/fields/TAG (reused
 # by a rerun; KEEP=0 deletes them at the end). A rerun skips boxes / sites that already have rows.
 # Env: SITE (laptop), GPU (0), U (fitter binary; default the pin $WB/bin/ufsm), UP (predict binary; default $WB/bin/ufsm-gate),
-#   REF (wind96), BOXES (core | names), SITES ("4624 5392 5904 6672"; "" = no slabs), REP (2), FL (box lanes, 2), DIAG (1),
+#   REF (wind96), BOXES (core | names), SITES ("4624 5392 5904 6672"; "" = no slabs), REP (2), FL (box lanes, 3), DIAG (1),
 #   KEEP (1), NOLOCK=1 (the caller holds the GPU), PRIO (eval).
 set -u
 H=$(cd "$(dirname "$0")" && pwd)
@@ -18,7 +18,7 @@ SITE=${SITE:-$([ -d $HOME/ufsm-data ] && echo laptop || echo desk)}; GPU=${GPU:-
 [ $# -ge 2 ] || { sed -n '2,15p' $0; exit 2; }
 CK=$(readlink -f "$1"); TAG=$2
 U=${U:-$WB/bin/ufsm}; UP=${UP:-$WB/bin/ufsm-gate}; [ -x $UP ] || UP=$U; [ -x $U ] || { echo "no binary $U"; exit 2; }
-REF=${REF:-wind96}; BOXES=${BOXES:-core}; SITES=${SITES-4624 5392 5904 6672}; REP=${REP:-2}; FL=${FL:-2}; DIAG=${DIAG:-1}; KEEP=${KEEP:-1}
+REF=${REF:-wind96}; BOXES=${BOXES:-core}; SITES=${SITES-4624 5392 5904 6672}; REP=${REP:-2}; FL=${FL:-3}; DIAG=${DIAG:-1}; KEEP=${KEEP:-1}
 BT=${BT:-$H/boxes.tsv}; FIT=""; FIELDS=""
 GF="--gpu $GPU"; BIN=$(sha1sum $U | cut -c1-8); FCFG=$(echo "$BIN --dir 1 --uw-repair 8 " | sha1sum | cut -c1-8)
 O=$WB/gate/$TAG; FD=$WB/fields/$TAG; mkdir -p $O/ready $O/claim $FD $CACHE
@@ -47,7 +47,12 @@ boxrow() {   # boxrow B: fits + row of one predicted box (a box lane)
   fitsc $f $d/fit $d/fit.log &
   if [ $REP -ge 1 ]; then bash $H/mkcrop.sh $f $d/fa 16 16 16 $((cz - 16)) $((cy - 16)) $((cx - 16)) > /dev/null && fitsc $d/fa $d/fita $d/fita.log & fi
   if [ $REP -ge 2 ]; then bash $H/mkcrop.sh $f $d/fb 0 0 0 $((cz - 16)) $((cy - 16)) $((cx - 16)) > /dev/null && fitsc $d/fb $d/fitb $d/fitb.log & fi
-  wait; t2=$(date +%s)
+  wait
+  # a fit that died (e.g. GPU memory beside the predicts and the slab lane) runs again alone, once
+  grep -q 'winding ids right' $d/fit.log 2> /dev/null || { log "$B: fit retried"; fitsc $f $d/fit $d/fit.log; }
+  [ $REP -ge 1 ] && ! grep -q 'winding ids right' $d/fita.log 2> /dev/null && { log "$B: fit a retried"; fitsc $d/fa $d/fita $d/fita.log; }
+  [ $REP -ge 2 ] && ! grep -q 'winding ids right' $d/fitb.log 2> /dev/null && { log "$B: fit b retried"; fitsc $d/fb $d/fitb $d/fitb.log; }
+  t2=$(date +%s)
   local ids0 ia=na ib=na ids sd e08 pp m pe=na gr=na g1=na cf=na cnb=na cno=na cnp=na dnb=na dno=na dnp=na cl clp fr
   ids0=$(num $(g_ids $d/fit.log)); [ $REP -ge 1 ] && ia=$(num $(g_ids $d/fita.log)); [ $REP -ge 2 ] && ib=$(num $(g_ids $d/fitb.log))
   rm -rf $d/fa $d/fb $d/fita $d/fitb
@@ -66,28 +71,37 @@ boxrow() {   # boxrow B: fits + row of one predicted box (a box lane)
   echo "$TAG	$B	$sc	$ids	$ids0	$ia	$ib	$sd	$e08$pp	$pe	$gr	$g1	$cf	$cl	$clp	$fr	$(cat $O/ready/$B 2> /dev/null || echo na)	$((t2 - t1))	$BIN	$FCFG	$cnb	$cno	$cnp	$dnb	$dno	$dnp" >> $RES
   log "$B ids $ids (box $ids0 shifted $ia $ib) p05x $(echo "$pp" | cut -f6) fits $((t2 - t1)) s"
 }
-boxlane() {   # boxes in list order as their fields land; mkdir claims a box
+# claim B: one lane per box (a flock-guarded marker; plain mkdir claims raced in the 10-26 sandbox: two lanes both fitted PH1)
+claim() { ( flock 7; [ -e $O/claim/$1 ] && exit 1; : > $O/claim/$1 ) 7> $O/claim.lock; }
+boxlane() {   # boxes in list order as their fields land
   local B
   for B in $BL; do
     grep -qP "^$TAG\t$B\t" $RES && continue
     while [ ! -e $O/ready/$B ] && [ ! -e $O/ready/.end ]; do sleep 1; done
     [ -e $O/ready/$B ] || continue
-    mkdir $O/claim/$B 2> /dev/null || continue
+    claim $B || continue
     boxrow $B
   done
 }
+# a slab-lane GPU step: under the run's GPU block while it lasts; once the block is released (boxes done) each step queues on its
+# own (gpuq ${SPRIO:-bg}: other jobs get the GPU between slab fits)
+gstep() { if [ -e $O/ready/.released ]; then ( GPUQ_HELD=0; gpuq_acquire ${SPRIO:-bg} wgate-$TAG-slab; "$@"; rc=$?; gpuq_release; exit $rc ); else "$@"; fi; }
+sfit() {   # sfit LOG fit-args...: a slab fit, run again once if it died (10-26: one was OOM-killed in the shared ufsm.slice)
+  local lg=$1 try; shift
+  for try in 1 2; do UFSM_FIT_THREADS=$THREADS gstep RUNBIG $U fit "$@" > $lg 2>&1; grep -q 'winding ids right' $lg && return 0; log "$(basename $(dirname $lg)) $(basename $lg) died (try $try)"; done; return 1; }
 slabsite() {   # slabsite s: wbench.sh's slab site (2 slabs, fit-join, joined score) on this run's site fields
   local s=$1 S=site$1 d f t0 t1 k a b m p1 p4 js; d=$O/$S; f=$FD/$S; mkdir -p $d; t0=$(date +%s); scroll paris4
   bash $H/mkcrop.sh $f $d/fA 0 96 96 96 3328 3520 > /dev/null; bash $H/mkcrop.sh $f $d/fB 64 96 96 96 3328 3520 > /dev/null; bash $H/mkcrop.sh $f $d/fC 0 96 96 160 3328 3520 > /dev/null
-  for k in A B; do UFSM_FIT_THREADS=$THREADS RUNBIG $U fit $d/f$k $GF --out $d/fit$k --codes $QR $QK --score-detail 1 --score-pairs 1 --dir 1 --uw-repair 8 > $d/fit$k.log 2>&1
+  for k in A B; do sfit $d/fit$k.log $d/f$k $GF --out $d/fit$k --codes $QR $QK --score-detail 1 --score-pairs 1 --dir 1 --uw-repair 8
     grep -E '^    radius' $d/fit$k.log | awk -v t=$TAG -v s=$S -v k=$k '{gsub(/-/, " "); $0 = $0; print t"\t"s"\t"k"\t"$2"\t"$3"\t"$5"\t"$7"\t"$8"\t"$9"\t"$10"\t"$11}' >> $RR; done
   RUN $U fit-join $d/joined $d/fC --blend 16 $d/fitA 32 160 $d/fitB 160 288 > $d/join.log 2>&1
   js=$(num $(grep -oE '^ +0\|1 .*' $d/join.log | awk '{print $NF}'))
-  UFSM_FIT_THREADS=$THREADS RUNBIG $U fit $d/fC --model $d/joined $GF --codes $QR $QK --score-pairs 1 > $d/joined.log 2>&1
+  sfit $d/joined.log $d/fC --model $d/joined $GF --codes $QR $QK --score-pairs 1
   t1=$(date +%s); a=$(num $(g_ids $d/fitA.log)); b=$(num $(g_ids $d/fitB.log))
   m=$(echo "$a $b" | awk '$1 != "na" && $2 != "na" {printf "%.4f", ($1 + $2) / 2; exit} {print "na"}')
   p1=$(echo "$(num $(g_pair $d/fitA.log 1 1)) $(num $(g_pair $d/fitB.log 1 1))" | awk '$1 != "na" && $2 != "na" {printf "%.4f", ($1 + $2) / 2; exit} {print "na"}')
   p4=$(echo "$(num $(g_pair $d/fitA.log 4 1)) $(num $(g_pair $d/fitB.log 4 1))" | awk '$1 != "na" && $2 != "na" {printf "%.4f", ($1 + $2) / 2; exit} {print "na"}')
+  grep -q 'winding ids right' $d/joined.log || { log "$S FAILED (no joined score; no row: a rerun redoes the site)"; return; }
   echo "$TAG	$S	p4slab	$m	$a	$b	$p1	$p4	$js	$(num $(g_ids $d/joined.log))	$(num $(g_pair $d/joined.log 4 1))	$((t1 - t0))	$BIN	$FCFG" >> $RS
   log "$S slabs $a / $b join share $js joined $(g_ids $d/joined.log) ($((t1 - t0)) s)"
   rm -rf $d/fA $d/fB $d/fC $d/fitA $d/fitB $d/joined
@@ -99,8 +113,9 @@ slablane() { local s; for s in $SITES; do grep -qP "^$TAG\tsite$s\t" $RS && cont
 T0=$(date +%s)
 [ -n "${NOLOCK:-}" ] || gpuq_acquire ${PRIO:-eval} wgate-$TAG
 TG=$(date +%s); [ $((TG - T0)) -gt 5 ] && log "GPU after $((TG - T0)) s in the queue"
-slablane & LANES=$!
-for i in $(seq $FL); do boxlane & LANES="$LANES $!"; done
+rm -f $O/ready/.released
+slablane & SL=$!; LANES=$SL; BLANES=
+for i in $(seq $FL); do boxlane & BLANES="$BLANES $!"; done; LANES="$LANES $BLANES"
 # the lanes hold the GPU lock too (inherited fd): on any exit of this script stop them (they finish the box at hand)
 trap 'touch $O/ready/.end' EXIT; trap 'touch $O/ready/.end; kill $LANES 2> /dev/null; exit 143' INT TERM
 # ---- the GPU lane: predicts only (sites first: the slab lane is the longest) ----
@@ -119,8 +134,11 @@ for B in $BL; do
   echo $(( $(date +%s) - t0 )) > $O/ready/$B
 done
 touch $O/ready/.end; TP=$(date +%s); log "GPU lane done: predicts $((TP - TG)) s"
-wait
-[ -n "${NOLOCK:-}" ] || gpuq_release
-log "wgate $TAG: $(( $(date +%s) - TG )) s on the GPU ($((TG - T0)) s queued)"
+wait $BLANES
+# the block ends with the boxes: the remaining slab fits queue per fit (the slab lane is mostly CPU scoring at low GPU use)
+if [ -z "${NOLOCK:-}" ]; then touch $O/ready/.released; gpuq_release; fi
+log "boxes done: GPU block $(( $(date +%s) - TG )) s ($((TG - T0)) s queued); slab lane continues per fit"
+wait $SL
+log "wgate $TAG: $(( $(date +%s) - T0 )) s in all"
 [ "$KEEP" = 0 ] && rm -rf $FD
 bash $H/wgate-table.sh $TAG | tee $O/table.txt
