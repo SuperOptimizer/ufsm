@@ -2754,7 +2754,7 @@ static int fc_surf_counts(int argc, char **argv, const fit_fields_buf *A) {
     enum { NE = 400, ND = 1000 };
     double phi0 = 0;
     for (int pass = 0; pass < 2; pass++) {
-        double sc = 0, ss = 0; size_t n0 = 0, nseg = 0, off = 0, pkn = 0, pko = 0, npk = 0, hep[NE] = {0}, hd[ND] = {0}; double eb = 0, rt = 0;
+        double sc = 0, ss = 0; size_t h10[10] = {0}, n0 = 0, nseg = 0, off = 0, pkn = 0, pko = 0, npk = 0, hep[NE] = {0}, hd[ND] = {0}; double eb = 0, rt = 0;
         for (int z = 0; z < A->shape[0]; z += 4) for (int y = 0; y < A->shape[1]; y += 4) for (int x = 0; x < A->shape[2]; x += 4) {
             const double nz = A->h * (z + 0.5); const int az = (int)fmin(fmax(nz, 0), A->shape[0] * A->h); const double cyv = A->f.cy[az], cxv = A->f.cx[az];
             const double py = A->h * (y + 0.5), px = A->h * (x + 0.5);
@@ -2788,7 +2788,7 @@ static int fc_surf_counts(int argc, char **argv, const fit_fields_buf *A) {
                     on = 0; if (best <= 0 || best >= ns) continue;   /* a run cut by the segment end: no interior peak */
                     npeaks++;
                     double d = ph[best] - phi0; d -= round(d);   /* the sheet sits at one reference phase value (mod 1) */
-                    if (pass == 0) { sc += cos(2 * M_PI * ph[best]); ss += sin(2 * M_PI * ph[best]); n0++; }
+                    if (pass == 0) { sc += cos(2 * M_PI * ph[best]); ss += sin(2 * M_PI * ph[best]); n0++; double f = ph[best] - floor(ph[best]); h10[(int)fmin(9, f * 10)]++; }
                     else { hd[(int)fmin(ND - 1, fabs(d) * spv[best] / 0.5)]++; npk++; }
                 }
             }
@@ -2798,7 +2798,8 @@ static int fc_surf_counts(int argc, char **argv, const fit_fields_buf *A) {
             hep[(int)fmin(NE - 1, fmax(0, (e + 4) / 8 * NE))]++; nseg++; off += fabs(e) >= 0.5; eb += e; rt += ref;
             if (spsum / (ns + 1) < 100) { pkn++; pko += fabs(e) >= 0.5; }
         }
-        if (pass == 0) { phi0 = atan2(ss, sc) / (2 * M_PI); printf("  surface peaks (--surf, hysteresis %.2f / %.2f): reference phase at the peaks phi0 %+.3f turn (concentration %.2f over %zu peaks)\n", hi / 255, lo / 255, phi0, n0 ? hypot(sc, ss) / n0 : 0.0, n0); continue; }
+        if (pass == 0) { phi0 = atan2(ss, sc) / (2 * M_PI); printf("  surface peaks (--surf, hysteresis %.2f / %.2f): reference phase at the peaks phi0 %+.3f turn (concentration %.2f over %zu peaks)\n", hi / 255, lo / 255, phi0, n0 ? hypot(sc, ss) / n0 : 0.0, n0);
+                         printf("    reference phase histogram at the peaks (10 bins of 0.1 turn):"); for (int b = 0; b < 10; b++) printf(" %.3f", n0 ? (double)h10[b] / n0 : 0.0); printf("\n"); continue; }
         if (!nseg) { printf("  surface peaks: no segments\n"); break; }
         printf("  surface peak counts on %zu segments (reference %.2f phi0 crossings each): error median %+.2f, mean %+.2f, off by >= 0.5 %.3f (packed < 100 um: %.3f of %zu)\n",
                nseg, rt / nseg, hist_q(hep, NE, -4, 8.0 / NE, 0.5), eb / nseg, (double)off / nseg, pkn ? (double)pko / pkn : 0, pkn);
