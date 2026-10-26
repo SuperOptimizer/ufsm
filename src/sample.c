@@ -1363,6 +1363,23 @@ static int phase_window_interp(z3 *a, const int64_t o[3], int D, int P, int shif
 }
 /* a stored phase / winding read against the convention (sources "phase_sign": -1): codes 0..251 negated mod 252, unknown kept */
 static void phase_negate(uint8_t *p, size_t n) { for (size_t k = 0; k < n; k++) if (p[k] < PHASE_PERIOD && p[k]) p[k] = (uint8_t)(PHASE_PERIOD - p[k]); }
+/* the stored phase's air test in one pass: sw unknown where CT <= air or CT 0; pw (optional, --task unwrap2's winding input,
+   taken before the test): the phase where CT > 0, else unknown */
+static void phase_air(const uint8_t *ctu, uint8_t *sw, uint8_t *pw, size_t n, int air) {
+    size_t k = 0;
+#ifdef __AVX2__
+    {
+        const __m256i z = _mm256_setzero_si256(), U = _mm256_set1_epi8((char)SIDE_UNKNOWN), A = _mm256_set1_epi8((char)(air > 255 ? 255 : air < 0 ? 0 : air));
+        for (; k + 32 <= n; k += 32) {
+            const __m256i v = _mm256_loadu_si256((const __m256i *)(ctu + k)), s = _mm256_loadu_si256((const __m256i *)(sw + k));
+            const __m256i v0 = _mm256_cmpeq_epi8(v, z), cond = air < 0 ? v0 : _mm256_cmpeq_epi8(_mm256_min_epu8(v, A), v);   /* (v <= air: min == v) */
+            if (pw) _mm256_storeu_si256((__m256i *)(pw + k), _mm256_blendv_epi8(s, U, v0));
+            _mm256_storeu_si256((__m256i *)(sw + k), _mm256_blendv_epi8(s, U, cond));
+        }
+    }
+#endif
+    for (; k < n; k++) { const uint8_t v = ctu[k], s = sw[k]; if (pw) pw[k] = v ? s : SIDE_UNKNOWN; if (v <= air || !v) sw[k] = SIDE_UNKNOWN; }
+}
 static int phase_window(z3 *a, const int64_t o[3], int D, int P, int shift, uint8_t *side) {   /* a: s->phase, or s->wind (same grid); D x P x P */
     if (shift >= 2) return phase_window_interp(a, o, D, P, shift, side);
     int64_t lo[3], ln[3], ro[3], rn[3]; const int wn[3] = {D, P, P};
@@ -1370,6 +1387,19 @@ static int phase_window(z3 *a, const int64_t o[3], int D, int P, int shift, uint
     for (int d = 0; d < 3; d++) {
         lo[d] = (o[d] + shift) >> shift; ln[d] = ((o[d] + wn[d] - 1 + shift) >> shift) - lo[d] + 1;
         ro[d] = lo[d] < 0 ? 0 : lo[d]; const int64_t e = lo[d] + ln[d] < m->shape[d] ? lo[d] + ln[d] : m->shape[d]; rn[d] = e - ro[d];
+    }
+    if (!shift) {   /* the window's own grid: read straight into it (outside the volume unknown), no staging copies */
+        const size_t n = (size_t)D * P * P;
+        if (rn[0] <= 0 || rn[1] <= 0 || rn[2] <= 0) { memset(side, PHASE_UNKNOWN, n); return 0; }
+        if (rn[0] == D && rn[1] == P && rn[2] == P) return z3_read(a, ro, rn, side, 1) ? -1 : 0;
+        const size_t rnn = (size_t)rn[0] * rn[1] * rn[2];
+        uint8_t *tmp = tp_get(rnn, 0);
+        if (!tmp || z3_read(a, ro, rn, tmp, 1)) { tp_put(tmp, rnn); return -1; }
+        memset(side, PHASE_UNKNOWN, n);
+        for (int64_t z = 0; z < rn[0]; z++) for (int64_t y = 0; y < rn[1]; y++)
+            memcpy(side + ((size_t)(z + ro[0] - lo[0]) * P + (y + ro[1] - lo[1])) * P + (ro[2] - lo[2]), tmp + ((size_t)z * rn[1] + y) * rn[2], (size_t)rn[2]);
+        tp_put(tmp, rnn);
+        return 0;
     }
     const size_t N = (size_t)ln[0] * ln[1] * ln[2];
     uint8_t *ph = tp_get(N, 0);
@@ -2696,6 +2726,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
             if (c->side) memset(b->side + (size_t)i * p3, SIDE_UNKNOWN, p3);
         } else if (stored_phase) {   /* the stored phase (ufsm phase-raster, ufsm downsample --mode phase) */
             uint8_t *sw = tp_get(p3 + 64, 0);   /* (+ 64: warp_phase_w4 reads byte pairs as 32-bit words) */
+            int air_done = 0;   /* (phase_air ran with the winding input) */
             uint16_t *wq = nullptr;   /* warped --task unwrap2: the winding and its component for warp_phase_w4 (one pass with the phase) */
             if (!sw || (g_crush.ph ? (memcpy(sw, g_crush.ph, p3), 0) : phase_window(s->phase, o, Pz, P, pshift, sw))) { tp_put(sw, p3 + 64); return -1; }
             if (s->phase_sign < 0) phase_negate(sw, p3);   /* (before the winding mod 4: it unwraps this phase) */
@@ -2708,7 +2739,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
             if (c->wind4) {   /* the winding mod 4: the phase unwrapped before the air test (gaps join the windings), outside the scroll (CT 0) not */
                 uint8_t *pw = tp_get(p3, 0), *ww = tp_get(p3, 0), *wc = tp_get(p3, 0);
                 if (!pw || !ww || !wc) { tp_put(pw, p3); tp_put(ww, p3); tp_put(wc, p3); tp_put(sw, p3 + 64); return -1; }
-                for (size_t k = 0; k < p3; k++) pw[k] = ctu[k] ? sw[k] : SIDE_UNKNOWN;
+                phase_air(ctu, sw, pw, p3, c->side_air); air_done = 1;   /* (the winding input and the air test in one pass) */
                 const int wt = c->wind4_tile < 0 ? 0 : c->wind4_tile > (P + 5) / 6 ? c->wind4_tile : (P + 5) / 6;   /* (<= 6^3 tiles: one gauge each fits the loss's 255) */
                 if (g_crush.w4) { memcpy(ww, g_crush.w4, p3); memcpy(wc, g_crush.wc, p3); }   /* (--aug-tear: unwrapped before the cut) */
                 else if (band_wind4_tiled(pw, Pz, P, P, wt, c->wind4_step > 0 ? c->wind4_step : 80, c->wind4_min > 0 ? (size_t)c->wind4_min : 512, wt ? 1 : 15, ww, wc, nullptr) < 0) {
@@ -2722,7 +2753,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
                 w4_set = 1;   /* (warped: warp_phase_w4 below writes every voxel) */
                 tp_put(pw, p3); tp_put(ww, p3); tp_put(wc, p3);
             }
-            for (size_t k = 0; k < p3; k++) if (ctu[k] <= c->side_air || !ctu[k]) sw[k] = SIDE_UNKNOWN;
+            if (!air_done) phase_air(ctu, sw, nullptr, p3, c->side_air);
             if (c->phase_near_um > 0) for (size_t k = 0; k < p3; k++) if (!near || !near[k]) sw[k] = SIDE_UNKNOWN;   /* no labelled wrap: none */
             if (spatial.active) {   /* (slabs never warp: sampler_start) */
                 memset(sw + p3, PHASE_UNKNOWN, 64);
@@ -2828,7 +2859,18 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
            the step's gradient goes non-finite (skipped, the gradient scale halved) on every replay of the window */
         size_t bad = 0, k0 = 0; const size_t nx = xc * p3;
         if (X) { for (size_t k = 0; k < nx; k++) if (!isfinite(X[k])) { if (!bad) k0 = k; bad++; } }
-        else { const uint16_t e = c->xfmt == 1 ? 0x7c00 : 0x7f80; for (size_t k = 0; k < nx; k++) if ((H[k] & e) == e) { if (!bad) k0 = k; bad++; } }
+        else {   /* (an AVX2 any-test first; the count and the first index only when there is one) */
+            const uint16_t e = c->xfmt == 1 ? 0x7c00 : 0x7f80; size_t k = 0;
+#ifdef __AVX2__
+            {
+                const __m256i ve = _mm256_set1_epi16((short)e); __m256i acc = _mm256_setzero_si256();
+                for (; k + 16 <= nx; k += 16) acc = _mm256_or_si256(acc, _mm256_cmpeq_epi16(_mm256_and_si256(_mm256_loadu_si256((const __m256i *)(H + k)), ve), ve));
+                if (!_mm256_testz_si256(acc, acc)) k = 0;   /* (any: count them all below) */
+            }
+#endif
+            for (; k < nx; k++) bad += (H[k] & e) == e;
+            if (bad) while ((H[k0] & e) != e) k0++;
+        }
         if (bad) {
             static _Atomic int nwarn;
             if (atomic_fetch_add(&nwarn, 1) < 20)
