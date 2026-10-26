@@ -435,6 +435,9 @@ static void restore_upload(gpu_state *d, const batch *b, int i, int B, int P, in
     cp(d->tb[i], b->t, (size_t)B * g_tc * g_Pz * P * P); cp(d->wb[i], b->w, (size_t)B * g_tc);
 }
 /* synchronous upload (pageable host memory: validation batches) */
+/* --gpu-aug 2 with --task unwrap(2): the papyrus mask of a warped window is its warped packed mask bit, written by the targets' warp (lab_upload
+   kind 0's db); the batch's pm planes then go with the packed targets */
+static int lw_pm(const batch *b) { return g_unwrap && g_pack && g_gpu_aug == 2 && b->ct8; }
 /* one label kind of a batch (nn_label_warp's: 0 packed targets / mask, 1 phase, 2 winding mod 4 + component) into da (db): --gpu-aug 2
    batches (batch.ct8) carry source-grid labels for windows with a warped radial record, warped on the device (rad: the records' device
    copy, uploaded first by ct_upload); the rest are copies */
@@ -473,7 +476,7 @@ static void upload(gpu_state *d, const batch *b, int B, int P) {
     if (d->side >= 0) { upload_slab(d, b, d->cur, B, P, 0); return; }
     size_t p3 = (size_t)g_Pz * P * P;
     ct_upload(b, d->x, d->rad, B, P, 0);
-    if (g_pack) { lab_upload(0, b, d->m, nullptr, b->tm, nullptr, d->rad, B, P, 0); if (!g_pkf) nn_unpack_tm(d->t, d->m, B, p3, 0); }   /* (--pack-targets excludes --heads; the
+    if (g_pack) { lab_upload(0, b, d->m, lw_pm(b) ? d->pm : nullptr, b->tm, b->pm, d->rad, B, P, 0); if (!g_pkf) nn_unpack_tm(d->t, d->m, B, p3, 0); }   /* (--pack-targets excludes --heads; the
                                                                                                        direct pack loss reads the codes) */
     else {
         if (!g_heads) nn_h2d(d->t, b->t, (size_t)B * NCH * p3);
@@ -483,7 +486,7 @@ static void upload(gpu_state *d, const batch *b, int B, int P) {
     nn_h2d(d->w, trow_w(b, B, d->hwh[d->cur]), (size_t)B * g_tc);
     if (g_aff) nn_h2d(d->band, b->band, (size_t)B * p3);
     if (g_side) lab_upload(1, b, d->sdb, nullptr, b->side, nullptr, d->rad, B, P, 0);
-    if (g_unwrap) nn_h2d(d->pm, b->pm, (size_t)B * p3);
+    if (g_unwrap && !lw_pm(b)) nn_h2d(d->pm, b->pm, (size_t)B * p3);   /* (lw_pm: with the packed targets) */
     if (g_cond) nn_h2d(d->wd, b->wind, (size_t)B * p3);
     if (g_unwrap2) lab_upload(2, b, d->w4, d->wc, b->w4, b->wcomp, d->rad, B, P, 0);
     if (g_distill) nn_h2d(d->embt, b->emb, g_distill_n);
@@ -510,7 +513,7 @@ static void upload_async(gpu_state *d, const batch *b, int i, int B, int P) {
     else if (d->side >= 0) upload_slab(d, b, i, B, P, 1);
     else {
         ct_upload(b, d->xb[i], d->radb[i], B, P, 1);
-        if (g_pack) { lab_upload(0, b, d->mb[i], nullptr, b->tm, nullptr, d->radb[i], B, P, 1); if (!g_pkf) nn_unpack_tm(d->tb[i], d->mb[i], B, p3, 1); }   /* (copy stream) */
+        if (g_pack) { lab_upload(0, b, d->mb[i], lw_pm(b) ? d->pmb[i] : nullptr, b->tm, b->pm, d->radb[i], B, P, 1); if (!g_pkf) nn_unpack_tm(d->tb[i], d->mb[i], B, p3, 1); }   /* (copy stream) */
         else {
             if (!g_heads) nn_h2d_copy_stream(d->tb[i], b->t, (size_t)B * NCH * p3);
             else for (int r = 0; r < B * NCH; r++) nn_h2d_copy_stream(d->tb[i] + (size_t)trow(b, r) * p3, b->t + (size_t)r * p3, p3);
@@ -519,7 +522,7 @@ static void upload_async(gpu_state *d, const batch *b, int i, int B, int P) {
         nn_h2d_copy_stream(d->wb[i], trow_w(b, B, d->hwh[i]), (size_t)B * g_tc);
         if (g_aff) nn_h2d_copy_stream(d->bandb[i], b->band, (size_t)B * p3);
         if (g_side) lab_upload(1, b, d->sideb[i], nullptr, b->side, nullptr, d->radb[i], B, P, 1);
-        if (g_unwrap) nn_h2d_copy_stream(d->pmb[i], b->pm, (size_t)B * p3);
+        if (g_unwrap && !lw_pm(b)) nn_h2d_copy_stream(d->pmb[i], b->pm, (size_t)B * p3);   /* (lw_pm: with the packed targets) */
         if (g_cond) nn_h2d_copy_stream(d->wdb[i], b->wind, (size_t)B * p3);
         if (g_unwrap2) lab_upload(2, b, d->w4b[i], d->wcb[i], b->w4, b->wcomp, d->radb[i], B, P, 1);
         if (g_distill) nn_h2d_copy_stream(d->embb[i], b->emb, g_distill_n);
@@ -536,7 +539,7 @@ static void upload_tail(gpu_state *d, int B, int P) {
     const int i = d->cur;   /* (lean: both buffer indices alias) */
     const size_t p3 = (size_t)g_Pz * P * P;
     nn_stream_wait(1, d->ev_done[i]); nn_stream_wait(1, d->ev_done[i ^ 1]);
-    if (g_pack) { lab_upload(0, b, d->mb[i], nullptr, b->tm, nullptr, d->radb[i], B, P, 1); nn_unpack_tm(d->tb[i], d->mb[i], B, p3, 1); }
+    if (g_pack) { lab_upload(0, b, d->mb[i], lw_pm(b) ? d->pmb[i] : nullptr, b->tm, b->pm, d->radb[i], B, P, 1); nn_unpack_tm(d->tb[i], d->mb[i], B, p3, 1); }
     else {
         if (!g_heads) nn_h2d_copy_stream(d->tb[i], b->t, (size_t)B * NCH * p3);
         else for (int r = 0; r < B * NCH; r++) nn_h2d_copy_stream(d->tb[i] + (size_t)trow(b, r) * p3, b->t + (size_t)r * p3, p3);

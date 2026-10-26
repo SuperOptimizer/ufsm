@@ -697,8 +697,8 @@ int sample_gpu_aug_ok(const sample_cfg *c) {   /* the device's CT channel (nn_au
                                                   only (side_air 0), the plain inputs */
     return c->gpu_input && sample_gpu_input_ok(c) && (c->Pz <= 0 || c->Pz == c->P) && !c->ct_augment && c->side_air == 0 && !c->restore && !c->papyrus && c->P <= SA_MAXP;
 }
-int sample_gpu_lwarp_ok(const sample_cfg *c) {   /* --gpu-aug 2: the warped windows' labels on the device: the packed targets, phase and winding only */
-    return sample_gpu_aug_ok(c) && c->pack_tm && !c->sheet && !c->pmask && !c->pap_head && !c->emb_ch && !c->cond && !c->band && !c->aux;
+int sample_gpu_lwarp_ok(const sample_cfg *c) {   /* --gpu-aug 2: the warped windows' labels on the device: the packed targets (and pmask: their mask bit), phase and winding only */
+    return sample_gpu_aug_ok(c) && c->pack_tm && !c->sheet && !c->pap_head && !c->emb_ch && !c->cond && !c->band && !c->aux;
 }
 void sample_write_x_test(const uint8_t *ctu, int D, int P, const int64_t o[3], float mean, float isd, int hasax, const float *cyz,
                          const float *cxz, const int perm[3], const int flip[3], int xfmt, uint64_t seed, uint16_t *H4, uint16_t *H1, void *rec) {
@@ -2883,7 +2883,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
         if (spatial.active) warp_sheet_batch(b->sheet[i],&spatial,M);
         w[1]=0; /* winding is supervised by the sparse regression objective */
     }
-    if (spatial.active && c->pmask) memcpy(b->pm + (size_t)i * p3, M, p3);   /* warped samples: the warped loss mask */
+    if (spatial.active && c->pmask && !lw) memcpy(b->pm + (size_t)i * p3, M, p3);   /* warped samples: the warped loss mask (--gpu-aug 2: the device's, from the packed mask bit) */
     if (Tw) {
         size_t bad = 0;
         if (sample_pack_tm(Tw, Tw + p3, Tw + NCH * p3, p3, b->tm + (size_t)i * p3, &bad)) {

@@ -140,7 +140,7 @@ typedef struct {
    radial channels then follow from the window's corner, symmetry and axis centres alone */
 int sample_gpu_input_ok(const sample_cfg *c);
 int sample_gpu_aug_ok(const sample_cfg *c);   /* train --gpu-aug possible with this configuration (needs gpu_input) */
-int sample_gpu_lwarp_ok(const sample_cfg *c);   /* train --gpu-aug 2 possible (sample_gpu_aug_ok, packed targets, no sheet / pmask / gap / distill / cond labels) */
+int sample_gpu_lwarp_ok(const sample_cfg *c);   /* train --gpu-aug 2 possible (sample_gpu_aug_ok, packed targets, no sheet / gap / distill / cond / band / aux labels; pmask: from the packed mask bit) */
 void sample_phase_cssn(const float **cs, const float **sn);   /* the phase codes' cos / sin (PHASE_PERIOD floats; the warps' tables) */
 
 typedef struct {

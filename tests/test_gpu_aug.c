@@ -83,7 +83,7 @@ int main(int argc, char **argv) {
         }
         free(tg);
     }
-    int e2e_n = 0, e2e_scan = 0, e2e_warp = 0; double e2e_worst = 0; size_t e2e_lbad[4] = {0};
+    int e2e_n = 0, e2e_scan = 0, e2e_warp = 0; double e2e_worst = 0; size_t e2e_lbad[5] = {0};
     {   /* end to end: the --task unwrap2 sampler with --gpu-aug 0 and 1 (same seed, deterministic): phase / winding / packed targets / radial
            records byte for byte; the device's CT channel from ct8 + aug against the CPU's x16 within the two jitter noises */
         enum { PW = 64, NB = 16 }; const size_t q3 = (size_t)PW * PW * PW;
@@ -92,7 +92,7 @@ int main(int argc, char **argv) {
         char path[1400]; snprintf(path, sizeof path, "%s/sources.json", dir);
         sources *S = sources_load(path); CHECK(S != nullptr, "sources");
         sample_cfg c = sample_cfg_default();
-        c.P = PW; c.B = 1; c.nworkers = 2; c.nbuf = 3; c.deterministic = 1; c.seed = 11; c.xfmt = 1; c.gpu_input = 1; c.side = 2; c.wind4 = 1; c.pack_tm = 1;
+        c.P = PW; c.B = 1; c.nworkers = 2; c.nbuf = 3; c.deterministic = 1; c.seed = 11; c.xfmt = 1; c.gpu_input = 1; c.side = 2; c.wind4 = 1; c.pack_tm = 1; c.pmask = 1;   /* (pmask: as train sets it for --task unwrap2) */
         memset(c.level_p, 0, sizeof c.level_p); c.level_p[0] = 1; c.min_fg = 0;
         CHECK(!sample_aug_preset(&c, "all"), "preset");
         c.augment = 3; c.symmetry_p = .5f; c.rotate_p = .5f; c.zoom_p = .3f; c.elastic_p = .3f; c.zoom_out_p = 0;
@@ -107,7 +107,7 @@ int main(int argc, char **argv) {
             sampler *sp = sampler_start(S, run == 2 ? &cg2 : run ? &cg : &c); CHECK(sp != nullptr, "sampler %d", run);
             for (int i = 0; sp && i < NB; i++) {
                 batch *b = sampler_next(sp);
-                lab[run][i] = malloc(4 * q3); memcpy(lab[run][i], b->side, q3); memcpy(lab[run][i] + q3, b->w4, q3); memcpy(lab[run][i] + 2 * q3, b->wcomp, q3); memcpy(lab[run][i] + 3 * q3, b->tm, q3);
+                lab[run][i] = malloc(5 * q3); memcpy(lab[run][i] + 4 * q3, b->pm, q3); memcpy(lab[run][i], b->side, q3); memcpy(lab[run][i] + q3, b->w4, q3); memcpy(lab[run][i] + 2 * q3, b->wcomp, q3); memcpy(lab[run][i] + 3 * q3, b->tm, q3);
                 rr[run][i] = malloc(NN_RAD_REC(PW)); memcpy(rr[run][i], b->rad, NN_RAD_REC(PW));
                 if (!run) { CHECK(b->x16 && !b->ct8, "CPU batch layout"); xa[i] = malloc(2 * q3); memcpy(xa[i], b->x16, 2 * q3); }
                 else if (run == 1) { CHECK(!b->x16 && b->ct8 && b->aug, "--gpu-aug batch layout"); c8[i] = nn_host_alloc(q3); memcpy(c8[i], b->ct8, q3); ra[i] = nn_host_alloc(sizeof *ra[i]); memcpy(ra[i], b->aug, sizeof *ra[i]); }
@@ -116,7 +116,7 @@ int main(int argc, char **argv) {
                     { const scan_ct_rec *g = b->aug; CHECK(!memcmp(g, ra[i], offsetof(scan_ct_rec, plan)), "window %d: --gpu-aug 2 record head differs (scan %d/%d nseed %llx/%llx)", i, g->scan, ra[i]->scan, (unsigned long long)g->nseed, (unsigned long long)ra[i]->nseed);
                       if (g->scan && memcmp(&g->plan, &ra[i]->plan, sizeof g->plan)) { size_t o = 0, nd = 0, last = 0; const uint8_t *x0 = (const uint8_t *)&g->plan, *x1 = (const uint8_t *)&ra[i]->plan; for (size_t q = 0; q < sizeof g->plan; q++) if (x0[q] != x1[q]) { if (!nd) o = q; nd++; last = q; }
                           CHECK(0, "window %d: --gpu-aug 2 scan plan differs (%zu bytes, offsets %zu..%zu)", i, nd, o, last); } }
-                    c82[i] = nn_host_alloc(4 * q3); memcpy(c82[i], lab[2][i], 4 * q3);   /* (pinned: nn_label_warp's sources) */
+                    c82[i] = nn_host_alloc(5 * q3); memcpy(c82[i], lab[2][i], 5 * q3);   /* (pinned: nn_label_warp's sources) */
                 }
                 sampler_release(sp, b);
             }
@@ -124,24 +124,24 @@ int main(int argc, char **argv) {
         }
         void *rd = nn_malloc(NN_RAD_REC(PW)), *hd = nn_malloc(2 * q3); uint16_t *hg = malloc(2 * q3);
         for (int i = 0; i < NB; i++) {
-            CHECK(!memcmp(lab[0][i], lab[1][i], 4 * q3), "window %d: phase / winding / packed targets differ between --gpu-aug 0 and 1", i);
+            CHECK(!memcmp(lab[0][i], lab[1][i], 5 * q3), "window %d: phase / winding / packed targets differ between --gpu-aug 0 and 1", i);
             CHECK(!memcmp(rr[0][i], rr[1][i], NN_RAD_REC(PW)), "window %d: radial records differ", i);
             CHECK(!memcmp(rr[0][i], rr[2][i], NN_RAD_REC(PW)), "window %d: --gpu-aug 2 radial records differ", i);
             int32_t hh[8]; memcpy(hh, rr[1][i], sizeof hh); const int warped = hh[6] & 1;
             nn_h2d(rd, rr[1][i], NN_RAD_REC(PW));
-            if (!warped) CHECK(!memcmp(lab[0][i], lab[2][i], 4 * q3), "window %d (unwarped): --gpu-aug 2 labels differ from the CPU's", i);
+            if (!warped) CHECK(!memcmp(lab[0][i], lab[2][i], 5 * q3), "window %d (unwarped): --gpu-aug 2 labels differ from the CPU's", i);
             else {   /* --gpu-aug 2: the device's warp of the source-grid labels against the CPU's warped labels */
                 const float *cs, *sn; sample_phase_cssn(&cs, &sn);
-                uint8_t *dl = nn_malloc(4 * q3), *gl = malloc(4 * q3);
+                uint8_t *dl = nn_malloc(5 * q3), *gl = malloc(5 * q3);
                 nn_label_warp(1, c82[i], nullptr, rd, PW, dl, nullptr, cs, sn, 0);
                 nn_label_warp(2, c82[i] + q3, c82[i] + 2 * q3, rd, PW, dl + q3, dl + 2 * q3, cs, sn, 0);
-                nn_label_warp(0, c82[i] + 3 * q3, nullptr, rd, PW, dl + 3 * q3, nullptr, cs, sn, 0);
-                nn_d2h(gl, dl, 4 * q3);
-                size_t bad[4] = {0};
-                for (int pl = 0; pl < 4; pl++) for (size_t k = 0; k < q3; k++) bad[pl] += gl[pl * q3 + k] != lab[0][i][pl * q3 + k];
-                for (int pl = 0; pl < 4; pl++) if (bad[pl] > e2e_lbad[pl]) e2e_lbad[pl] = bad[pl];
-                CHECK(bad[0] <= q3 / 10000 && bad[1] <= q3 / 10000 && bad[2] <= q3 / 10000 && bad[3] <= q3 / 10000,
-                      "window %d: device-warped labels differ from the CPU's at %zu phase / %zu w4 / %zu component / %zu packed voxels of %zu", i, bad[0], bad[1], bad[2], bad[3], q3);
+                nn_label_warp(0, c82[i] + 3 * q3, nullptr, rd, PW, dl + 3 * q3, dl + 4 * q3, cs, sn, 0);   /* (with the pmask plane) */
+                nn_d2h(gl, dl, 5 * q3);
+                size_t bad[5] = {0};
+                for (int pl = 0; pl < 5; pl++) for (size_t k = 0; k < q3; k++) bad[pl] += gl[pl * q3 + k] != lab[0][i][pl * q3 + k];
+                for (int pl = 0; pl < 5; pl++) if (bad[pl] > e2e_lbad[pl]) e2e_lbad[pl] = bad[pl];
+                CHECK(bad[0] <= q3 / 10000 && bad[1] <= q3 / 10000 && bad[2] <= q3 / 10000 && bad[3] <= q3 / 10000 && bad[4] <= q3 / 10000,
+                      "window %d: device-warped labels differ from the CPU's at %zu phase / %zu w4 / %zu component / %zu packed / %zu pmask voxels of %zu", i, bad[0], bad[1], bad[2], bad[3], bad[4], q3);
                 nn_free(dl); free(gl);
             }
             nn_host_free(c82[i]); free(lab[2][i]); free(rr[2][i]);
@@ -163,7 +163,7 @@ int main(int argc, char **argv) {
         char rm[1500]; snprintf(rm, sizeof rm, "rm -rf %s", dir); if (system(rm)) {}
     }
     printf("test_gpu_aug: end to end %d unwrap2 windows (%d with scanner ops, %d warped), CT channel sd beyond the jitter noises <= %.3f\n", e2e_n, e2e_scan, e2e_warp, e2e_worst);
-    printf("test_gpu_aug: --gpu-aug 2 device-warped labels, worst window: %zu phase / %zu w4 / %zu component / %zu packed voxels off the CPU's\n", e2e_lbad[0], e2e_lbad[1], e2e_lbad[2], e2e_lbad[3]);
+    printf("test_gpu_aug: --gpu-aug 2 device-warped labels, worst window: %zu phase / %zu w4 / %zu component / %zu packed / %zu pmask voxels off the CPU's\n", e2e_lbad[0], e2e_lbad[1], e2e_lbad[2], e2e_lbad[3], e2e_lbad[4]);
     printf("test_gpu_aug: %d cases (%d warped) at P %d: worst bytes mean |d| %.3f, max %d: %s\n", ncase, nwarp, P, worst_mean, worst_max, fails ? "FAIL" : "ok");
     return fails ? 1 : 0;
 }

@@ -166,7 +166,7 @@ void nn_aug_ct(const uint8_t *ct8_h, const void *rec_h, const void *rad_d, int P
 size_t nn_aug_device_bytes(int P);
 void nn_aug_last_bytes(uint8_t *out, int P);   /* tests: the last window's output bytes */
 /* train --gpu-aug 2: one warped window's labels warped on the device from the source-grid labels the sampler shipped (sample_cfg.gpu_aug
-   2): kind 0 the packed targets / mask a_h -> da, 1 the phase a_h -> da, 2 the winding mod 4 / component a_h, b_h -> da, db; rad_d its
+   2): kind 0 the packed targets / mask a_h -> da (db: the pmask plane, optional), 1 the phase a_h -> da, 2 the winding mod 4 / component a_h, b_h -> da, db; rad_d its
    radial record on the device; cs_h / sn_h sample_phase_cssn's tables. Same stream order as nn_aug_ct (its staging buffer, 2 P^3). */
 void nn_label_warp(int kind, const uint8_t *a_h, const uint8_t *b_h, const void *rad_d, int P, uint8_t *da, uint8_t *db, const float *cs_h, const float *sn_h, int on_copy_stream);
 size_t nn_label_warp_device_bytes(int P);
