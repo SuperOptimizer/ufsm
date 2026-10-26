@@ -9,7 +9,8 @@
 # 2 | bg (long background loops: core benches, slab ceilings, p4unwrap lanes: call gpuq_yield at every box boundary).
 # The grant is still an exclusive flock on the lock file, so scripts that call plain `flock ~/ufsm-data/gpu.lock cmd` keep working
 # and stay mutually exclusive with queue jobs; they just have no priority (a blocked plain flock may win the lock at a release).
-# Order: lowest PRIO first, FIFO (ticket number) inside a priority. Only the head ticket tries the lock (poll GPUQ_POLL s, 0.5).
+# Order: lowest PRIO first, FIFO (ticket number) inside a priority. Only the head ticket waits on the lock (a blocking flock of
+# GPUQ_WAIT s, 2, then the head is re-checked: it races plain-flock waiters fairly at each release); the others poll every GPUQ_POLL s.
 # gpuq_yield (at a box boundary): releases the GPU only when someone better waits: a ticket of higher priority, or (bg only) any
 # other waiting ticket or a blocked plain flock (round robin; the bg job re-queues at the back). eval / now jobs re-queue with
 # their old ticket number, so they get the GPU back first among their priority. Tickets of dead processes are dropped.
@@ -45,17 +46,26 @@ gpuq_acquire() {   # gpuq_acquire PRIO TAG
   fi
   local me=$BASHPID t="$GPUQ_DIR/t.$pr.$seq.$BASHPID" said=0 head
   echo "$tag" > "$t"
+  local hp hpr wp ok
+  # a better ticket than the head that is blocked on the lock interrupts its wait (the head then re-checks and steps back)
+  if read -r hp hpr < "$GPUQ_DIR/headwait" 2> /dev/null && [ "$pr" -lt "${hpr:-0}" ]; then kill "$hp" 2> /dev/null; fi
   while :; do
     head=$(gpuq_tickets | head -1)
     if [ "${head%% *}" = "$pr" ] && [ "$(echo "$head" | cut -d' ' -f2)" = "$seq" ]; then
       exec {GPUQ_FD}> "$GPUQ_LOCK"
-      if flock -n $GPUQ_FD; then
+      # the head blocks like a plain flock (a polling head would lose every release to blocked plain flocks), in a child whose pid
+      # is published so that a better newcomer can cut the wait short (the lock, once taken, belongs to the shared open file)
+      flock -w "${GPUQ_WAIT:-2}" $GPUQ_FD & wp=$!; echo "$wp $pr" > "$GPUQ_DIR/headwait"; wait $wp && ok=1 || ok=0
+      [ "$(cat "$GPUQ_DIR/headwait" 2> /dev/null)" = "$wp $pr" ] && rm -f "$GPUQ_DIR/headwait"
+      if [ $ok = 1 ]; then
         rm -f "$t"; GPUQ_HELD=1; GPUQ_OWNER=$me; GPUQ_PR=$pr; GPUQ_TAG=$tag; GPUQ_SEQ=$seq; export GPUQ_HELD
         echo "$me $pr $tag $(date +%s)" > "$GPUQ_DIR/holder"
         [ $said = 1 ] && gpuq_log "$tag got the GPU"
         return 0
       fi
       exec {GPUQ_FD}>&-
+      [ $said = 0 ] && { gpuq_log "$tag (prio $pr) waiting for the GPU"; said=1; }
+      continue   # (re-check the head: a better ticket may have come)
     fi
     [ $said = 0 ] && { gpuq_log "$tag (prio $pr) waiting for the GPU"; said=1; }
     sleep "$GPUQ_POLL"

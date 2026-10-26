@@ -34,7 +34,7 @@ log() { echo "$(date '+%m-%d %H:%M:%S') $*" | tee -a $O/run.log; }
 
 if [ "$BOXES" = core ]; then BL=$(grep -v '^#' $BT | awk -F'\t' '$10 !~ /label-noise/ && ($2 == "paris4" || $2 == "paris4j" || $10 ~ /core/)' | cut -f1)
 else BL=$BOXES; fi
-step=$(head -c 16384 $CK | tr ',' '\n' | grep -m1 '"step":' | grep -oE '[0-9]+')
+step=$(head -c 16384 $CK | tr ',' '\n' | grep -a -m1 '"step":' | grep -aoE '[0-9]+')
 log "wgate $TAG ckpt $CK (step ${step:-?}) vs $REF: $(echo $BL | wc -w) boxes, sites ${SITES:-none}, predict $(basename $UP), fitter $(basename $U) ($FCFG), lanes $FL"
 echo "$CK" > $O/ckpt
 rm -f $O/ready/.end; rm -rf $O/claim/*

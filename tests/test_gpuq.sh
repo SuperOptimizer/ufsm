@@ -5,9 +5,9 @@ set -u; H=$(cd "$(dirname "$0")/.." && pwd); T=$(mktemp -d); trap 'rm -rf $T' EX
 export GPUQ_LOCK=$T/gpu.lock GPUQ_DIR=$T/q GPUQ_POLL=0.1
 Q=$H/scripts/gpuq.sh; L=$T/order
 bgjob() {   # 4 boxes of 0.5 s, yielding at each boundary
-  . $Q; gpuq_acquire bg bgA; for b in 1 2 3 4; do gpuq_yield; echo "bgA$b" >> $L; sleep 0.5; done; gpuq_release; }
+  . $Q; gpuq_acquire bg bgA; for b in 1 2 3 4; do echo "bgA$b" >> $L; sleep 0.5; gpuq_yield; done; gpuq_release; }
 bgjob & p1=$!
-sleep 0.7
+sleep 1.7   # box 1 0-0.5 s, its yield gap 0.5-1.5 s, box 2 1.5-2 s
 bash $Q run now quick bash -c "echo now >> $L" &   # arrives during box 2: must run right after it
 p2=$!
 wait $p1 $p2
