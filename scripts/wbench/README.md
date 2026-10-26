@@ -124,3 +124,11 @@ On the desk, in /vesuvius/ufsm/paris4 (scripts there). These are the steps that 
    - wraps and wrapswitch per wrap.
 
 Compare the joined ids, the slip map and the wrapswitch "right" share with `slabs-base`.
+
+## Whole-Paris-4 unwrap milestone (p4unwrap.sh)
+`SITE=desk GPUS="0" bash scripts/wbench/p4unwrap.sh CKPT TAG` = the 10-21 run_pred + run_fit + post_slabs for any checkpoint:
+whole-scroll fit fields, 147 full-section slab fits (64-cell interiors + 16 overlap, `--uw-repair 8`), fit-join, whole-scroll
+`--codes` score -> `$WB/p4unwrap/TAG/summary.txt` (joined ids vs wind96's 0.1117, join share, pair accuracy, radius rows).
+Cost on one 5060 Ti (wind96): predict 1.4 h + fits 4.7 GPU-h + join/score ~1.6 h; ~21 GB host per slab fit, 50 GB fields.
+`GPUS="0 1"` splits the slabs over two lanes; `FIELDS=dir` skips the predict; `WRAPS=1` adds wraps + wrapswitch; restart-safe, `touch $O/STOP`.
+Only for milestone candidates that won BOXES=core on paris4 + paris4j.
