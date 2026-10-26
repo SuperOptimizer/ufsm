@@ -156,6 +156,7 @@ static int usage(void) {
         "  ufsm self-gate <wraps-dir> <out-dir> --fields DIR --model FIT [--ct ..] [--nb FIT].. [--exclude ..]   strict stretches of a box fit -> label tifxyz + q.tif\n"
         "  ufsm ct-fields <ct-root> <key> <fields-dir> --ct-um U   CT planes ct / cs of a fit-field directory (fit --w-ct / --w-cspacing)\n"
         "  ufsm fit-join <out-set> <fields-dir> <slab-model> <z0> <z1> ...   independent z-slab fits -> one fit set, gauges matched on the overlaps\n"
+        "  ufsm fit-consensus <out-model> <fields-dir> <model0> <model1> ...   per-point median W of several fits of one box (gauges matched)\n"
         "  ufsm fields-oracle <fields-dir> <phase-root> <phase-key> <out-dir>   fit fields with the phase planes from a label phase raster (oracle / swap)\n"
         "  ufsm phase-packing <phase-root> <phase-key> [--box ..] [--map OUT.raw]   how packed the labelled sheets are (box stats, per-chunk map for the sampler focus)\n"
         "  ufsm wbench-stats A.tsv [B.tsv] [--metric ids,p1x] [--set clean|all]   winding bench means, stratified bootstrap CIs, paired A-B, MDE (--scroll a,b; --tsv 1)\n"
@@ -3549,6 +3550,7 @@ static int cmd_sample(int argc, char **argv) {
 
 int cmd_repack(int argc, char **argv);   /* src/repack.c */
 int cmd_fit_join(int argc, char **argv);   /* src/fitjoin.c */
+int cmd_fit_consensus(int argc, char **argv);   /* src/fitcons.c */
 int cmd_fields_oracle(int argc, char **argv);   /* src/fieldsoracle.c */
 int cmd_fiber_check(int argc, char **argv);    /* src/fibercheck.c */
 int cmd_fiber_export(int argc, char **argv);   /* src/fibercheck.c */
@@ -3583,6 +3585,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "band")) return cmd_band(argc, argv);
     if (!strcmp(cmd, "fit")) return cmd_fit(argc, argv);
     if (!strcmp(cmd, "fit-join")) return cmd_fit_join(argc, argv);
+    if (!strcmp(cmd, "fit-consensus")) return cmd_fit_consensus(argc, argv);
     if (!strcmp(cmd, "fields-oracle")) return cmd_fields_oracle(argc, argv);
     if (!strcmp(cmd, "fiber-check")) return cmd_fiber_check(argc, argv);
     if (!strcmp(cmd, "fiber-export")) return cmd_fiber_export(argc, argv);

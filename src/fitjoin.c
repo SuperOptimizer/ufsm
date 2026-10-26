@@ -32,12 +32,13 @@ int cmd_fit_join(int argc, char **argv) {
         return 2;
     }
     const char *out = argv[2], *fdir = argv[3];
-    double blend = 16, minc = 0.3; long long nsamp = 4000000;
+    double blend = 16, minc = 0.3; long long nsamp = 4000000; int tile = 0;
     int ai = 4;
     for (; ai + 1 < argc && !strncmp(argv[ai], "--", 2); ai += 2) {
         if (!strcmp(argv[ai], "--blend")) blend = atof(argv[ai + 1]);
         else if (!strcmp(argv[ai], "--min-conf")) minc = atof(argv[ai + 1]);
         else if (!strcmp(argv[ai], "--samples")) nsamp = atoll(argv[ai + 1]);
+        else if (!strcmp(argv[ai], "--tile-shift")) tile = atoi(argv[ai + 1]);
         else { fprintf(stderr, "fit-join: unknown option %s\n", argv[ai]); return 2; }
     }
     const int ns = (argc - ai) / 3;
@@ -78,6 +79,8 @@ int cmd_fit_join(int argc, char **argv) {
         const size_t stride = cand > (size_t)nsamp ? cand / (size_t)nsamp : 1;
         long long used = 0, near = 0; size_t seen = 0;   /* (slab gauges are arbitrary: the rounded differences can be any integer) */
         double *dv = malloc(sizeof(double) * (cand / stride + 2)); long *rv = malloc(sizeof(long) * (cand / stride + 2)); size_t nd = 0;
+        uint32_t *tv = malloc(sizeof(uint32_t) * (cand / stride + 2));
+        const int nty = tile > 0 ? (f.shape[1] + tile - 1) / tile : 0, ntx = tile > 0 ? (f.shape[2] + tile - 1) / tile : 0;
         for (size_t i = 0; i < n; i++) {
             if (!f.f.w[i]) continue;
             if (seen++ % stride) continue;
@@ -87,14 +90,31 @@ int cmd_fit_join(int argc, char **argv) {
             const double z = (fz0 + zz + 0.5) * h, y = (yy + 0.5) * h, x = (xx + 0.5) * h;
             const double d = fit_W(b, z - zb, y, x) - fit_W(a, z - za, y, x);
             if (!isfinite(d)) continue;
+            if (tile > 0) tv[nd] = (uint32_t)((yy / tile) * ntx + xx / tile);
             rv[nd] = lround(d); dv[nd++] = d; used++;
         }
         qsort(rv, nd, sizeof(long), cmp_long);   /* the mode of the rounded differences */
         long shift = 0; size_t bestn = 0;
         for (size_t i = 0; i < nd;) { size_t j = i; while (j < nd && rv[j] == rv[i]) j++; if (j - i > bestn) { bestn = j - i; shift = rv[i]; } i = j; }
         for (size_t i = 0; i < nd; i++) near += fabs(dv[i] - shift) < 0.25;
-        free(dv); free(rv); fit_fields_free(&f);
         if (shift) for (int q = 0; q < b->nk; q++) b->offset[q] -= (float)shift;
+        if (tile > 0) {   /* per xy tile: the mode of the rounded difference left after the shift; a tile whose mode is not 0 (>= 100 cells,
+                             >= 1.5x the cells at 0) steps slab k's lattice by it over all z (the slabs slipped differently there) */
+            const int nt = nty * ntx; int (*hc)[9] = calloc((size_t)nt, sizeof *hc); int *ts = calloc((size_t)nt, sizeof *ts), nsh = 0, nok = 0;
+            for (size_t i = 0; i < nd; i++) { const long r = lround(dv[i]) - shift; if (r >= -4 && r <= 4) hc[tv[i]][r + 4]++; }
+            for (int t = 0; t < nt; t++) {
+                int bm = 4, tot = 0; for (int j = 0; j < 9; j++) { tot += hc[t][j]; if (hc[t][j] > hc[t][bm]) bm = j; }
+                if (tot >= 100) nok++;
+                if (tot >= 100 && bm != 4 && hc[t][bm] >= 1.5 * hc[t][4]) { ts[t] = bm - 4; nsh++; }
+            }
+            for (int a = 0; a < b->lz; a++) for (int yb = 0; yb < b->ly; yb++) for (int c = 0; c < b->lx; c++) {
+                int ty = (int)((double)yb * b->L / h / tile), tx = (int)((double)c * b->L / h / tile); if (ty >= nty) ty = nty - 1; if (tx >= ntx) tx = ntx - 1;
+                b->delta[((size_t)a * b->ly + yb) * b->lx + c] -= (float)ts[ty * ntx + tx];
+            }
+            printf("  %3d|%-3d tile shifts (%d cells): %d of %d tiles (>= 100 cells) shifted\n", k - 1, k, tile, nsh, nok);
+            free(hc); free(ts);
+        }
+        free(dv); free(rv); free(tv); fit_fields_free(&f);
         const double share = used ? (double)bestn / used : 0;
         printf("  %3d|%-3d %10.0f %14lld %+6ld  %10.4f  %10.4f\n", k - 1, k, s->z0[k], used, shift, share, used ? (double)near / used : 0);
         tot_n += used; tot_share += share * used;
