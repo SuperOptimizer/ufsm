@@ -10,6 +10,7 @@ TAG=$1; REF=${2:-wind96}; O=$WB/gate/$TAG; ST=${STATS:-$WB/bin/ufsm-gate}
 ROWS=${ROWS:-$O/rows.tsv}; SLABS=${SLABS:-$O/slabs.tsv}; RADIUS=${RADIUS:-$O/radius.tsv}
 RR=$WB/res/$REF.tsv; RS=$WB/res/$REF-slabs.tsv; RRAD=$WB/res/$REF-radius.tsv; ORC=$WB/res/slaborc-net-slabs.tsv
 [ -s $RR ] || { RR=$WB/gate/$REF/rows.tsv; RS=$WB/gate/$REF/slabs.tsv; RRAD=$WB/gate/$REF/radius.tsv; }   # REF a wgate run (wind96fd)
+[ -s $O/slabref ] && { R2=$(cat $O/slabref); RS=$WB/res/$R2-slabs.tsv; RRAD=$WB/res/$R2-radius.tsv; [ -s $RS ] || { RS=$WB/gate/$R2/slabs.tsv; RRAD=$WB/gate/$R2/radius.tsv; }; }   # slab sites run elsewhere (wgate-slabs.sh): their own site's wind96
 [ -s $ROWS ] || { echo "no rows $ROWS"; exit 2; }
 # the baseline's ceilings decide the clean set for both sides (rows without a ceil get REF's)
 T=$(mktemp -d); trap 'rm -rf $T' EXIT

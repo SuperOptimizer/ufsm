@@ -23,6 +23,9 @@ U=${U:-$WB/bin/ufsm}; UP=${UP:-$WB/bin/ufsm-gate}; [ -x $UP ] || UP=$U; [ -x $U 
 FIXED=${FIXED:-0}; TTA=${TTA:-1}; SEAM=${SEAM:-0}; [ "$TTA" -gt 1 ] && export PX="--tta $TTA"   # (wbench.sh's predict appends PX)
 SLOCK=${SLOCK:-$(dirname ${LOCK:-$WB/x})/slabfit.lock}   # the cross-run slab-fit lock (laptop ~/ufsm-data/slabfit.lock)
 REF=${REF:-wind96}; BOXES=${BOXES:-core}; SITES=${SITES-4624 5392 5904 6672}; REP=${REP:-2}; FL=${FL:-3}; DIAG=${DIAG:-1}; KEEP=${KEEP:-1}
+# slab sites on the laptop are OOM-killed in ufsm.slice (12-20 GB per slab fit beside other jobs): there they run on forlindesk
+# (wgate-slabs.sh, after the boxes) unless SLABS_AT=local
+SLABS_AT=${SLABS_AT:-$([ "$SITE" = laptop ] && echo forlindesk || echo local)}; RSITES=; [ "$SLABS_AT" != local ] && { RSITES=$SITES; SITES=; }
 BT=${BT:-$H/boxes.tsv}; FIT=""; FIELDS=""
 GF="--gpu $GPU"; BIN=$(sha1sum $U | cut -c1-8); FCFG=$(echo "$BIN --dir 1 --uw-repair 8 " | sha1sum | cut -c1-8)
 O=$WB/gate/$TAG; FD=$WB/fields/$TAG; mkdir -p $O/ready $O/claim $FD $CACHE
@@ -170,6 +173,7 @@ if [ -z "${NOLOCK:-}" ]; then touch $O/ready/.released; gpuq_release; fi
 log "boxes done: GPU block $(( $(date +%s) - TG )) s ($((TG - T0)) s queued); slab lane continues per fit"
 if [ "$DIAG" = 1 ]; then DL=; for i in $(seq $FL); do diaglane & DL="$DL $!"; done; wait $DL; diagmerge; log "diag columns done"; fi
 wait $SL
+if [ -n "$RSITES" ]; then log "slab sites on $SLABS_AT (wgate-slabs.sh)"; SITES="$RSITES" TTA=$TTA SEAM=$SEAM bash $H/wgate-slabs.sh $TAG $CK; fi
 log "wgate $TAG: $(( $(date +%s) - T0 )) s in all"
 [ "$KEEP" = 0 ] && rm -rf $FD
 bash $H/wgate-table.sh $TAG | tee $O/table.txt
