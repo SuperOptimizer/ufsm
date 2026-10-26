@@ -818,6 +818,13 @@ static void *score_rows(void *arg) {
     J->dd[t] = ddt; J->ndet[t] = ndt; J->dcap[t] = dct; if (J->pa) J->pa[t] = pat;
     return nullptr;
 }
+typedef struct { z3 *z; int64_t o3[3], n3[3]; uint8_t *buf; int rc; size_t any; } sc_read;   /* one block's codes (a reader thread) */
+static void *sc_read_run(void *a) {
+    sc_read *r = a; r->any = 0; r->rc = z3_read(r->z, r->o3, r->n3, r->buf, 16);
+    const size_t nb3 = (size_t)r->n3[0] * r->n3[1] * r->n3[2];
+    if (!r->rc) for (size_t i = 0; i < nb3 && !r->any; i++) r->any = r->buf[i] >= 1 && r->buf[i] <= 252;
+    return nullptr;
+}
 static int score_codes(z3 *z, double cf, const long long org[3], const int shp[3], double h, double um, const float *cy, const float *cx, int detail, FILE *dump,
                        score_fill_fn fill, void *ctx) {
     int64_t lo[3], ln[3]; for (int d = 0; d < 3; d++) { lo[d] = (int64_t)floor(org[d] / cf); ln[d] = (int64_t)(shp[d] * h / cf); }
@@ -828,23 +835,33 @@ static int score_codes(z3 *z, double cf, const long long org[3], const int shp[3
     /* blocks of up to 128 x 1024 x 1024 label voxels aligned to the codes' 128^3 chunks (z planes one at a time decoded every chunk
        128 times: minutes on a 3.9 cm slab) */
     enum { SBZ = 128, SBY = 1024, SBX = 1024 };
-    uint8_t *codes = malloc((size_t)SBZ * SBY * SBX); float *U = malloc((size_t)SBZ * SBY * SBX * 4);
-    const int tms = getenv("UFSM_FIT_TIMES") != nullptr; double tr = 0, tf = 0, tw = 0, tq = 0;   /* UFSM_FIT_TIMES: code reads, U fill, tally */
+    uint8_t *cbuf[2] = {malloc((size_t)SBZ * SBY * SBX), malloc((size_t)SBZ * SBY * SBX)}; float *U = malloc((size_t)SBZ * SBY * SBX * 4);
+    const int tms = getenv("UFSM_FIT_TIMES") != nullptr; double tr = 0, tf = 0, tw = 0, tq = 0;   /* UFSM_FIT_TIMES: code reads (waits), U fill, tally */
     score_job J = {.cf = cf, .h = h, .um = um, .org = org, .shp = shp, .cy = cy, .cx = cx, .na_ax = na_ax, .detail = detail, .pa = pab};   /* (the threaded tally) */
+    /* the blocks in order; block b + 1's codes decode on a thread while block b is filled and tallied */
+    size_t nblk = 0, cblk = 0; int64_t (*blk)[6] = nullptr;
     for (int64_t za = lo[0]; za < lo[0] + ln[0]; za = (za / SBZ + 1) * SBZ)
     for (int64_t ya = lo[1]; ya < lo[1] + ln[1]; ya = (ya / SBY + 1) * SBY)
     for (int64_t xa = lo[2]; xa < lo[2] + ln[2]; xa = (xa / SBX + 1) * SBX) {
         const int64_t ze = (za / SBZ + 1) * SBZ < lo[0] + ln[0] ? (za / SBZ + 1) * SBZ : lo[0] + ln[0];
         const int64_t ye = (ya / SBY + 1) * SBY < lo[1] + ln[1] ? (ya / SBY + 1) * SBY : lo[1] + ln[1];
         const int64_t xe = (xa / SBX + 1) * SBX < lo[2] + ln[2] ? (xa / SBX + 1) * SBX : lo[2] + ln[2];
-        const int64_t o3[3] = {za, ya, xa}, n3[3] = {ze - za, ye - ya, xe - xa}; const size_t nb3 = (size_t)n3[0] * n3[1] * n3[2];
+        if (nblk == cblk) { cblk = cblk ? 2 * cblk : 64; blk = realloc(blk, cblk * sizeof *blk); }
+        blk[nblk][0] = za; blk[nblk][1] = ya; blk[nblk][2] = xa; blk[nblk][3] = ze - za; blk[nblk][4] = ye - ya; blk[nblk][5] = xe - xa; nblk++;
+    }
+    sc_read rd[2] = {{.z = z, .buf = cbuf[0]}, {.z = z, .buf = cbuf[1]}}; pthread_t rth[2]; int rup[2] = {0, 0};
+    if (nblk) { memcpy(rd[0].o3, blk[0], 3 * sizeof(int64_t)); memcpy(rd[0].n3, blk[0] + 3, 3 * sizeof(int64_t)); rup[0] = pthread_create(&rth[0], nullptr, sc_read_run, &rd[0]) == 0; if (!rup[0]) sc_read_run(&rd[0]); }
+    for (size_t bi = 0; bi < nblk; bi++) {
+        const int s = (int)(bi & 1); sc_read *R = &rd[s];
+        tq = now(); if (rup[s]) { pthread_join(rth[s], nullptr); rup[s] = 0; } tr += now() - tq;
+        if (bi + 1 < nblk) { sc_read *N = &rd[s ^ 1]; memcpy(N->o3, blk[bi + 1], 3 * sizeof(int64_t)); memcpy(N->n3, blk[bi + 1] + 3, 3 * sizeof(int64_t));
+                             rup[s ^ 1] = pthread_create(&rth[s ^ 1], nullptr, sc_read_run, N) == 0; if (!rup[s ^ 1]) sc_read_run(N); }
+        uint8_t *codes = R->buf; const int64_t *o3 = R->o3, *n3 = R->n3;
+        if (R->rc) { fprintf(stderr, "score: code read failed: %s\n", z3_error()); for (int q = 0; q < 2; q++) if (rup[q]) pthread_join(rth[q], nullptr); free(cbuf[0]); free(cbuf[1]); free(U); free(hist); free(fine); free(dd); free(blk); return 1; }
         tq = now();
-        if (z3_read(z, o3, n3, codes, 16)) { fprintf(stderr, "score: code read failed: %s\n", z3_error()); free(codes); free(U); free(hist); free(fine); free(dd); return 1; }
-        size_t any = 0; for (size_t i = 0; i < nb3 && !any; i++) any = codes[i] >= 1 && codes[i] <= 252;
-        tr += now() - tq; tq = now();
-        if (!any) continue;
+        if (!R->any) continue;
         const double og[3] = {cf * o3[0] - 0.25 * cf - org[0], cf * o3[1] - 0.25 * cf - org[1], cf * o3[2] - 0.25 * cf - org[2]};   /* label voxel i at cf (i + lo + 1 / 4) - org */
-        if (fill(ctx, og, n3, cf, codes, U)) { fprintf(stderr, "score: cannot evaluate U on the score grid\n"); free(codes); free(U); free(hist); free(fine); free(dd); return 1; }
+        if (fill(ctx, og, n3, cf, codes, U)) { fprintf(stderr, "score: cannot evaluate U on the score grid\n"); for (int q = 0; q < 2; q++) if (rup[q]) pthread_join(rth[q], nullptr); free(cbuf[0]); free(cbuf[1]); free(U); free(hist); free(fine); free(dd); free(blk); return 1; }
         tf += now() - tq; tq = now();
         if (!dump) {   /* threads (the dump keeps the serial voxel order); per-thread tallies and detail records kept over all blocks */
             J.codes = codes; J.U = U; for (int d = 0; d < 3; d++) { J.n3[d] = n3[d]; J.o3[d] = o3[d]; }
@@ -876,7 +893,7 @@ static int score_codes(z3 *z, double cf, const long long org[3], const int shp[3
             }
         }
     }
-    free(codes); free(U);
+    free(cbuf[0]); free(cbuf[1]); free(U); free(blk);
     const size_t ndet_serial = ndet;   /* (dd: the dump path's records; the threads keep theirs in J.dd) */
     for (int t = 0; t < 64; t++) {   /* the threads' tallies (integer counts: any order) */
         if (J.hist[t]) { for (int k = 0; k < NB; k++) hist[k] += J.hist[t][k]; for (int k = 0; k < NF; k++) fine[k] += J.fine[t][k]; }
