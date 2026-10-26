@@ -77,6 +77,13 @@ at peak LR that is only a ~1k-step average.
 Env: `REF` (wind96), `BOXES`, `SITES` ("" = boxes only, ~10 min), `FL` (box lanes), `UP` (predict binary, default
 `$WB/bin/ufsm-gate`), `U` (fitter pin).
 
+**Windows and overlap (inference-only arms of one checkpoint).** `WIN HALO WINZ HALOZ` set the predict window (production 640 64
+384 64; tile interior = window - 2 halo). `OV=8` predicts every box 8 times, the window grid at 0 or half the interior on each
+axis (each cell inside 8 windows), and blends the passes with `ufsm field-blend --tile SZ,SY,SX --grids ...`: each pass weighs
+sin^2 of the cell's place in that pass's interior (two grids half an interior apart sum to 1). `OVW=flat` blends with a plain mean,
+`OVCONF=mean` keeps the mean confidence where passes disagree (default: the resultant, disagreement lowers it). Passes stay in
+`$WB/fields/TAG/BOX.ov/gZ_Y_X`; `OVFROM=TAG0` blends TAG0's passes (blend variants without GPU); `UB` is the field-blend binary.
+
 ## gpuq: the laptop GPU queue (`scripts/gpuq.sh`; deployed copy `~/ufsm-data/gpuq.sh`)
 
 The GPU is still one exclusive flock on `~/ufsm-data/gpu.lock`, and gpuq decides who takes it next. Priorities:

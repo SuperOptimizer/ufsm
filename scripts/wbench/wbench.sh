@@ -57,7 +57,7 @@ scroll() {   # scroll SCROLL: R V UM LV AX QR QK PR PK PF (PF: CT voxels per lab
 }
 predict() {   # predict OUTFIELDS z y x nz ny nx LOG [big]: fit fields of the box (production window, 19.2 / 18.7 um cells, lossless phase)
   local f=$1 lg=$8 run=RUN; [ "${9:-}" = big ] && run=RUNBIG; rm -rf $f $f.tmp
-  $run ${UP:-$U} predict $CK $R $V $f.tmp --um $UM --level $LV --box $2,$3,$4,$5,$6,$7 --window-z 384 --halo-z 64 --window 640 --halo 64 --shard 512 \
+  $run ${UP:-$U} predict $CK $R $V $f.tmp --um $UM --level $LV --box $2,$3,$4,$5,$6,$7 --window-z ${WINZ:-384} --halo-z ${HALOZ:-64} --window ${WIN:-640} --halo ${HALO:-64} --shard 512 \
     --grid-origin ${GO:-0,0,0} --ema 1 --q 8 --threads $THREADS --gpu $GPU --axis $AX --levels 1 --fit-zarr $f --fit-h 2 --fit-q 8 --fit-q-phase 0 ${PX:-} \
     --no-out 1 --cache $CACHE > $lg 2>&1; local rc=$?; rm -rf $f.tmp; return $rc
 }

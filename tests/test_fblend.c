@@ -61,6 +61,38 @@ static void test_cells(void) {
     CHECK(out4[3][1] < 3, "wind4 opposite: dq %d", out4[3][1]);
 }
 
+/* overlapping predicts: tile weights (two grids half an interior apart sum to 1, peak mid-interior) and the per-cell weighted rules */
+static void test_tiles(void) {
+    double mx = 0, mn = 1, worst = 0;
+    for (int c = 0; c < 600; c++) {
+        const double a = fb_tile_w(100, 2, c, 256, 0), b = fb_tile_w(100, 2, c, 256, 128);
+        worst = fmax(worst, fabs(a + b - 1)); mx = fmax(mx, a); mn = fmin(mn, a);
+    }
+    CHECK(worst < 1e-5 && mx > 0.999 && mn < 1e-3, "tile weights: |sum - 1| %g, max %g, min %g", worst, mx, mn);
+    /* interior [0, 256) on grid 0: the cell centred at voxel 128 is mid-interior, the one at voxel 1 next to the face */
+    CHECK(fb_tile_w(0, 2, 63, 256, 0) > 0.999 && fb_tile_w(0, 2, 0, 256, 0) < 2e-4 && fb_tile_w(-8, 2, 4, 256, 0) < 2e-4, "tile weight placement");
+    const float w1[2] = {1, 1}; uint8_t c[2], s[2], oc, os; double cf, ph;
+    /* per-cell weights: input 0 weighs ~0 -> input 1 */
+    enc(0.9, 0.1, &c[0], &s[0]); enc(0.6, 0.4, &c[1], &s[1]);
+    { const float q0 = 1e-6f, q1 = 1.f; const float *cw[2] = {&q0, &q1}; const uint8_t *pc[2] = {&c[0], &c[1]}, *ps[2] = {&s[0], &s[1]};
+      fb_phase_cw(2, pc, ps, w1, cw, FB_CONF_RESULTANT, 1, &oc, &os); }
+    CHECK(abs(oc - c[1]) <= 1 && abs(os - s[1]) <= 1, "cell weights: %d %d vs input 1 %d %d", oc, os, c[1], s[1]);
+    /* --conf mean: a quarter turn apart keeps the mean confidence (resultant: cos 45 deg) along the mean direction */
+    enc(1.0, 0.0, &c[0], &s[0]); enc(0.6, 0.25, &c[1], &s[1]);
+    { const uint8_t *pc[2] = {&c[0], &c[1]}, *ps[2] = {&s[0], &s[1]}; fb_phase_cw(2, pc, ps, w1, nullptr, FB_CONF_MEAN, 1, &oc, &os); }
+    dec(oc, os, &cf, &ph); CHECK(fabs(cf - 0.8) < 0.01 && fabs(ph - atan2(0.6, 1.0) / (2 * M_PI)) < 0.005, "conf mean: conf %g phase %g", cf, ph);
+    /* opposite: no direction, the length stays the mean (0.9) only when a direction exists; exact cancel -> 0 */
+    enc(0.9, 0.1, &c[0], &s[0]); enc(0.9, 0.6, &c[1], &s[1]);
+    { const uint8_t *pc[2] = {&c[0], &c[1]}, *ps[2] = {&s[0], &s[1]}; fb_phase_cw(2, pc, ps, w1, nullptr, FB_CONF_MEAN, 1, &oc, &os); }
+    dec(oc, os, &cf, &ph); CHECK(cf < 0.02 || fabs(cf - 0.9) < 0.02, "conf mean opposite: %g", cf);
+    /* the _cw rules equal the plain ones without cell weights */
+    const uint8_t a0[4] = {0, 40, 10, 200}, a1[4] = {50, 0, 20, 100}; const uint8_t *a[2] = {a0, a1}; uint8_t o1[4], o2[4];
+    fb_mean(2, a, w1, 4, o1); fb_mean_cw(2, a, w1, nullptr, 4, o2); CHECK(!memcmp(o1, o2, 4), "mean_cw");
+    fb_median_known(2, a, w1, 4, o1); fb_median_known_cw(2, a, w1, nullptr, 4, o2); CHECK(!memcmp(o1, o2, 4), "median_cw");
+    { const float q0[4] = {1, 1, 3, 1}, q1[4] = {1, 1, 1, 3}; const float *cw[2] = {q0, q1}; fb_mean_cw(2, a, w1, cw, 4, o2);
+      CHECK(o2[2] == 12 && o2[3] == 125, "mean_cw weighted %d %d", o2[2], o2[3]); }
+}
+
 /* field sets: A raw (with an extra plane ct and the winding mod 4 planes), B zarr arrays two cells larger per axis read through
    zarr_offset [1, 2, 1] */
 enum { D = 6, H = 5, W = 7 };
@@ -119,6 +151,31 @@ static void test_sets(void) {
     CHECK(g1.f.wd != nullptr && g1.f.w4_d == 16, "winding mod 4 planes in the blend (w4_d %g)", (double)g1.f.w4_d);
     CHECK(fabs(g1.cy[3] - (3.5f + 0.03f)) < 1e-3 && fabs(g2.cx[0] + 2.25f) < 1e-3, "axis kept");
     fit_fields_free(&g1); fit_fields_free(&g2);
+    /* tile weights through the whole-set path (fblend_run2): the expected planes from the _cw rules with fb_tile_w weights */
+    {
+        static fb_opts op; memset(&op, 0, sizeof op); op.tile = 1; op.conf = FB_CONF_MEAN;
+        op.stride[0] = 8; op.stride[1] = 6; op.stride[2] = 10; op.grid[1][0] = 4; op.grid[1][1] = 3; op.grid[1][2] = 5;
+        char o4[256]; snprintf(o4, sizeof o4, "%s/tile", tmp);
+        CHECK(fblend_run2(o4, 2, in1, nullptr, &op, 2) == 0, "blend --tile");
+        static float q[2][D * H * W]; const long long org[3] = {100, 200, 300}; const int sh[3] = {D, H, W};
+        for (int i = 0; i < 2; i++) for (int z = 0; z < D; z++) for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
+            const int c3[3] = {z, y, x}; double v = 1; for (int d = 0; d < 3; d++) v *= fb_tile_w(org[d], 2, c3[d], op.stride[d], op.grid[i][d]);
+            q[i][(z * H + y) * W + x] = (float)v; (void)sh;
+        }
+        const float *cw[2] = {q[0], q[1]};
+        { const uint8_t *pc[2] = {A[0], B[0]}, *ps[2] = {A[1], B[1]}; fb_phase_cw(2, pc, ps, w1, cw, FB_CONF_MEAN, n, ex[0], ex[1]); }
+        for (int k = 2; k < 8; k++) { const uint8_t *s[2] = {A[k], B[k]}; fb_mean_cw(2, s, w1, cw, n, ex[k]); }
+        { const uint8_t *s[2] = {A[8], B[8]}; fb_median_known_cw(2, s, w1, cw, n, ex[8]); }
+        { const uint8_t *s[2] = {A[9], B[9]}; fb_max(2, s, n, ex[9]); }
+        { const uint8_t *const d[2][4] = {{A[10], A[11], A[12], A[13]}, {B[10], B[11], B[12], B[13]}}; uint8_t *const o[4] = {ex[10], ex[11], ex[12], ex[13]}; fb_wind4_cw(2, d, w1, cw, n, o); }
+        { const uint8_t *s[2] = {A[14], B[14]}; fb_mean_cw(2, s, w1, cw, n, ex[14]); }
+        fit_fields_buf g4; CHECK(fit_fields_load(o4, 0, 0, 1, &g4) == 0, "load tile blend");
+        for (int k = 0; k < 15; k++) { int bad = 0; for (size_t i = 0; i < n; i++) if (!g4.a[k] || g4.a[k][i] != ex[k][i]) bad++; CHECK(!bad, "tile plane %d: %d cells differ", k, bad); }
+        /* and the tile weights matter: the plain blend differs somewhere in pc */
+        fit_fields_buf g5; CHECK(fit_fields_load(o1, 0, 0, 1, &g5) == 0, "reload plain");
+        int dif = 0; for (size_t i = 0; i < n; i++) dif += g4.a[0][i] != g5.a[0][i]; CHECK(dif > 0, "tile weights changed nothing");
+        fit_fields_free(&g4); fit_fields_free(&g5);
+    }
     /* ct: A's own plane passed through (first input A); with B first it is not B's, so it is left out */
     snprintf(p, sizeof p, "%s/ct.raw", o1); FILE *f = fopen(p, "rb"); uint8_t got[D * H * W] = {0};
     CHECK(f && fread(got, 1, n, f) == n && !memcmp(got, ct, n), "ct passed through"); if (f) fclose(f);
@@ -134,6 +191,7 @@ static void test_sets(void) {
 
 int main(void) {
     test_cells();
+    test_tiles();
     test_sets();
     if (fails) { fprintf(stderr, "test_fblend: %d FAILED\n", fails); return 1; }
     printf("test_fblend: ok\n");

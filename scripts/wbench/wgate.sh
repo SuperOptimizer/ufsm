@@ -14,11 +14,15 @@
 #   offsets 0 / 8 vx: volcomp seam TTA, 2x predict), FIXED=1 (fixed fields: only $WB/fields/TAG/* as they are, never predict;
 #   e.g. field rewrites of the wind96 fields $WB/fields/w96g), PREV=TAG0 (refiner checkpoints: predict --prev with TAG0's box fit,
 #   $WB/runs/TAG0/BOX/fit or $WB/gate/TAG0/BOX/fit; sites without a kept fit get zero prev; UP must be a --prev build), SPRIO (slab fits after the block, eval with the run's ticket number).
+#   Windows (wbench.sh predict): WIN HALO WINZ HALOZ (production 640 64 384 64). OV=8: 8 overlapping passes per box (grid origin 0 or
+#   half the tile interior per axis), blended by field-blend --tile (centre-weighted; OVW=flat plain mean; OVCONF=mean keeps the
+#   confidence where passes disagree); passes kept in $WB/fields/TAG/BOX.ov (OVKEEP=1), OVFROM=TAG0 blends TAG0's passes (no GPU
+#   for a blend variant); UB: the field-blend binary (default U).
 set -u
 H=$(cd "$(dirname "$0")" && pwd)
 SITE=${SITE:-$([ -d $HOME/ufsm-data ] && echo laptop || echo desk)}; GPU=${GPU:-0}
 . $H/site-$SITE.env
-[ $# -ge 2 ] || { sed -n '2,15p' $0; exit 2; }
+[ $# -ge 2 ] || { sed -n '2,19p' $0; exit 2; }
 CK=$(readlink -f "$1"); TAG=$2
 U=${U:-$WB/bin/ufsm}; UP=${UP:-$WB/bin/ufsm-gate}; [ -x $UP ] || UP=$U; [ -x $U ] || { echo "no binary $U"; exit 2; }
 FIXED=${FIXED:-0}; TTA=${TTA:-1}; SEAM=${SEAM:-0}; [ "$TTA" -gt 1 ] && export PX="--tta $TTA"   # (wbench.sh's predict appends PX)
@@ -53,6 +57,22 @@ gpredict() {   # gpredict like predict; SEAM=1: two passes, window grid at 0 and
   [ "$FIXED" = 1 ] && { log "FIXED=1: no fields $1 (not predicted; skipped)"; return 1; }
   local PX=${PX:-} pv   # PREV=TAG0 (refiner checkpoints, predict --prev): TAG0's fit of this box as the prev input; none (zero prev) if absent
   if [ -n "${PREV:-}" ]; then for pv in $WB/runs/$PREV/$(basename $1)/fit $WB/gate/$PREV/$(basename $1)/fit; do [ -e $pv ] && { PX="$PX --prev $pv"; break; }; done; fi
+  if [ "${OV:-1}" = 8 ]; then   # OV=8: 8 overlapping passes, window grid at 0 or half the tile interior on every axis (each cell
+    # inside 8 windows), blended per cell by its place in each pass's interior (field-blend --tile; OVW flat: plain mean; OVCONF mean:
+    # keep the confidence where passes disagree). Passes in OVFROM's (default this run's) fields dir BOX.ov/gZ_Y_X, kept (OVKEEP=1):
+    # a pass already there is not predicted again, so blend variants of one pass set cost no GPU
+    local f=$1; shift
+    local SZ=$(( (${WINZ:-384} - 2 * ${HALOZ:-64}) / 2 )) SY=$(( (${WIN:-640} - 2 * ${HALO:-64}) / 2 )) pd ins="" grs="" gz gy gx g
+    pd=$f.ov; [ -n "${OVFROM:-}" ] && pd=$WB/fields/$OVFROM/$(basename $f).ov; mkdir -p $pd
+    for gz in 0 $SZ; do for gy in 0 $SY; do for gx in 0 $SY; do
+      g=$pd/g${gz}_${gy}_${gx}
+      [ -e $g/fields.json ] || GO=$gz,$gy,$gx predict $g "${@:1:6}" ${7}.g${gz}_${gy}_${gx} ${8:-} || return 1
+      ins="$ins $g"; grs="$grs${grs:+:}$gz,$gy,$gx"
+    done; done; done
+    local tf="--tile $((2 * SZ)),$((2 * SY)),$((2 * SY)) --grids $grs"; [ "${OVW:-hann}" = flat ] && tf=""
+    RUNBIG ${UB:-$U} field-blend $f $ins $tf --conf ${OVCONF:-resultant} --threads $THREADS > ${7}.blend 2>&1; local rc=$?
+    [ "${OVKEEP:-1}" = 1 ] || [ -n "${OVFROM:-}" ] || rm -rf $pd; return $rc
+  fi
   [ "$SEAM" = 1 ] || { predict "$@"; return; }
   local f=$1; shift
   GO=0,0,0 predict $f.g0 "$@" && GO=8,8,8 predict $f.g8 "${@:1:6}" ${7}.g8 ${8:-} || return 1

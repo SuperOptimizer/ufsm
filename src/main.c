@@ -168,7 +168,7 @@ static int usage(void) {
         "  ufsm fit-compare <reference-fields> <fields>                      fit fields vs a reference (phase, spacing, normals)\n"
         "  ufsm fiber-check <afv> --tr T.json --boxes B.tsv --names A,B --codes R K --phase R K   do published fibre polylines link points of one GT sheet?\n"
         "  ufsm fiber-export <afv> <fields-dir> <out.fib> --tr T.json    fibre polylines in a fit box's coordinates for fit --fibers\n"
-        "  ufsm field-blend <out> <fields1> <fields2> ... [--weights a,b,..]  several models' fit fields averaged (phase: confidence-weighted complex mean)\n"
+        "  ufsm field-blend <out> <fields1> <fields2> ... [--weights a,b,..] [--tile SZ,SY,SX --grids z,y,x:..] [--conf mean]  fit fields averaged (phase: confidence-weighted complex mean; --tile: overlapping predicts, centre-weighted)\n"
         "  ufsm wind-score <sweep-dir> <codes-root> <codes-key>             the fit --codes score of a predict --cond-sweep winding raster\n"
         "  ufsm store-bench <root> <array-key> [--box 128,256,512] [--n 8] [--par 1] [--threads 16]   HTTP zarr fetch benchmark\n"
         "  ufsm phase-pack ROOT KEY OUT --row R [--level 19] [--threads 8] / phase-unpack IN DIR / phase-cmp RA KA RB KB --row R   6-bit phase-label transfer\n"
@@ -2714,24 +2714,41 @@ static int cmd_surfsnap(int argc, char **argv) {
     return nw ? 0 : 1;
 }
 
-/* ufsm field-blend OUT IN1 IN2 ... [--weights a,b,...] [--threads N]: fit-field sets of several models on one grid blended into
-   OUT (src/fblend.h: the phase as the confidence-weighted complex mean, its length the new confidence) */
+/* ufsm field-blend OUT IN1 IN2 ... [--weights a,b,...] [--tile SZ,SY,SX --grids z,y,x:z,y,x:...] [--conf resultant|mean] [--threads N]:
+   fit-field sets of several models on one grid blended into OUT (src/fblend.h: the phase as the confidence-weighted complex mean,
+   its length the new confidence). --tile: the inputs are overlapping predicts of one model on tile interiors of SZ x SY x SX level
+   voxels (predict --window - 2 --halo; z: --window-z - 2 --halo-z) anchored at each input's --grid-origin (--grids, in input order):
+   per-cell weights sin^2 of the cell's place in its interior (fb_tile_w). --conf mean: the mean input confidence as the length. */
 static int cmd_field_blend(int argc, char **argv) {
-    const char *in[32]; float w[32]; int n = 0; const char *ws = nullptr, *out = nullptr; int nt = 8;
+    const char *in[32]; float w[32]; int n = 0; const char *ws = nullptr, *out = nullptr, *tile = nullptr, *grids = nullptr, *conf = "resultant"; int nt = 8;
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--weights") && i + 1 < argc) { ws = argv[++i]; continue; }
         if (!strcmp(argv[i], "--threads") && i + 1 < argc) { nt = atoi(argv[++i]); continue; }
+        if (!strcmp(argv[i], "--tile") && i + 1 < argc) { tile = argv[++i]; continue; }
+        if (!strcmp(argv[i], "--grids") && i + 1 < argc) { grids = argv[++i]; continue; }
+        if (!strcmp(argv[i], "--conf") && i + 1 < argc) { conf = argv[++i]; continue; }
         if (!strncmp(argv[i], "--", 2)) { fprintf(stderr, "field-blend: unknown option %s\n", argv[i]); return 2; }
         if (!out) out = argv[i]; else if (n < 32) in[n++] = argv[i]; else { fprintf(stderr, "field-blend: at most 32 inputs\n"); return 2; }
     }
-    if (!out || n < 1) { fprintf(stderr, "usage: ufsm field-blend <out> <fields1> [<fields2> ...] [--weights a,b,...] [--threads N]\n"); return 2; }
+    if (!out || n < 1) { fprintf(stderr, "usage: ufsm field-blend <out> <fields1> [<fields2> ...] [--weights a,b,...] [--tile SZ,SY,SX --grids z,y,x:...] [--conf resultant|mean] [--threads N]\n"); return 2; }
     if (ws) {
         int k = 0; char *t = strdup(ws);
         for (char *q = strtok(t, ","); q; q = strtok(nullptr, ",")) { if (k < 32) w[k] = (float)atof(q); k++; }
         free(t);
         if (k != n) { fprintf(stderr, "field-blend: %d weights for %d inputs\n", k, n); return 2; }
     }
-    return fblend_run(out, n, in, ws ? w : nullptr, nt < 1 ? 1 : nt);
+    static fb_opts o; memset(&o, 0, sizeof o);
+    if (!strcmp(conf, "mean")) o.conf = FB_CONF_MEAN; else if (strcmp(conf, "resultant")) { fprintf(stderr, "field-blend: --conf resultant|mean\n"); return 2; }
+    if (!tile != !grids) { fprintf(stderr, "field-blend: --tile and --grids go together\n"); return 2; }
+    if (tile) {
+        if (sscanf(tile, "%lf,%lf,%lf", &o.stride[0], &o.stride[1], &o.stride[2]) != 3 || !(o.stride[0] > 0 && o.stride[1] > 0 && o.stride[2] > 0)) { fprintf(stderr, "field-blend: --tile SZ,SY,SX (> 0)\n"); return 2; }
+        int k = 0; char *t = strdup(grids);
+        for (char *q = strtok(t, ":"); q; q = strtok(nullptr, ":")) { if (k < 32 && sscanf(q, "%lf,%lf,%lf", &o.grid[k][0], &o.grid[k][1], &o.grid[k][2]) != 3) { free(t); fprintf(stderr, "field-blend: --grids z,y,x:z,y,x:...\n"); return 2; } k++; }
+        free(t);
+        if (k != n) { fprintf(stderr, "field-blend: %d grids for %d inputs\n", k, n); return 2; }
+        o.tile = 1;
+    }
+    return fblend_run2(out, n, in, ws ? w : nullptr, &o, nt < 1 ? 1 : nt);
 }
 /* ufsm fit-compare <reference-fields> <fields>: how a field set (e.g. a network's, predict --fit-zarr) agrees with a reference
    (e.g. the oracle, band --fit-fields) cell by cell; both must cover the same physical cells (origin x um, h x um equal), at any
