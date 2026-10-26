@@ -25,6 +25,7 @@
 #include "z3w.h"
 #include <limits.h>
 #include <stdatomic.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 static const char *cf_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], k)) return argv[i + 1]; return d; }
@@ -249,10 +250,11 @@ typedef struct {
     float *re, *im, *cw;   /* this plane: c e^{2 pi i (phi - W)} and c, blurred in y / x */
     float *Wp;             /* W (gauge included) of the plane */
     int z;                 /* box row of the plane */
+    const float *gls;      /* --gauge ls: the smooth (vortex-free) gauge field on the solve grid, added to W (nullptr: none) */
 } cf_dm;
 static double cf_Wcell(const cf_dm *M, int z, int y, int x) {   /* W = U - dir theta / 2 pi at a field cell (box row z) + the gauge */
     const cf_lvl *L = M->L; const double P = L->P, pz = (z + 0.5) * M->h, py = (y + 0.5) * M->h, px = (x + 0.5) * M->h;
-    const double U = cf_tri(L->U, L->d, L->hh, L->w, (z + 0.5) / P - 0.5, (y + 0.5) / P - 0.5, (x + 0.5) / P - 0.5);
+    const double U = cf_tri(L->U, L->d, L->hh, L->w, (z + 0.5) / P - 0.5, (y + 0.5) / P - 0.5, (x + 0.5) / P - 0.5) + (M->gls ? cf_tri(M->gls, L->d, L->hh, L->w, (z + 0.5) / P - 0.5, (y + 0.5) / P - 0.5, (x + 0.5) / P - 0.5) : 0);
     const double cy = cf_axis_at(M->cy, M->na, pz), cx = cf_axis_at(M->cx, M->na, pz);
     return U - M->dir * atan2(py - cy, px - cx) / (2 * M_PI) + M->gauge;
 }
@@ -282,6 +284,77 @@ static void cf_blur_cols(void *a, long r0, long r1, int t_) {   /* x-blur rows [
     cf_dm *M = ((cf_blr *)a)->M; float *tmp = malloc((size_t)M->W * sizeof(float));
     for (long y = r0; y < r1; y++) { const size_t o = (size_t)y * M->W; cf_box1(M->re + o, M->W, 1, M->R, tmp); cf_box1(M->im + o, M->W, 1, M->R, tmp); cf_box1(M->cw + o, M->W, 1, M->R, tmp); }
     free(tmp);
+}
+
+/* ---- --gauge ls: the phase's sub-turn offset to W as a smooth field. Per solve cell the phasor sum z = sum c e^{2 pi i (phi - W)},
+   box-smoothed over +-Rg cells; the gauge g minimises sum_edges min(|z_i|, |z_j|) (g_j - g_i - wrap(arg z_j - arg z_i))^2 (least-squares
+   phase unwrapping, coarse to fine CG): unlike arg z itself, g has no vortices, so W + g adds no phase dislocations to the output ---- */
+typedef struct { const cf_dm *M; float *gr, *gi; } cf_gsum;
+static void cf_gsum_run(void *a, long Y0, long Y1, int t_) {   /* solve rows of one plane M->z (bands of P field rows) */
+    const cf_gsum *G = a; const cf_dm *M = G->M; const fit_fields *f = M->f; const cf_lvl *L = M->L; const int P = L->P; const size_t HW = (size_t)M->H * M->W;
+    for (long y = Y0 * P; y < Y1 * P && y < M->H; y++) for (int x = 0; x < M->W; x++) {
+        const size_t i = (size_t)(M->z - M->zoff) * HW + (size_t)y * M->W + x; if (!f->w[i]) continue;
+        const double pc = (f->pc[i] - 128) / 127.0, ps = (f->ps[i] - 128) / 127.0, c = hypot(pc, ps); if (c < 1e-3) continue;
+        const double e = atan2(ps, pc) - 2 * M_PI * cf_Wcell(M, M->z, (int)y, x); const size_t si = ((size_t)(M->z / P) * L->hh + y / P) * L->w + x / P;
+        G->gr[si] += (float)(c * cos(e)); G->gi[si] += (float)(c * sin(e));
+    }
+}
+static void cf_boxsmooth(float *v, int d, int hh, int w, int R) {
+    if (R < 1) return;
+    const size_t st[3] = {(size_t)hh * w, (size_t)w, 1}; const int dm[3] = {d, hh, w}; const int mx = d > hh ? (d > w ? d : w) : (hh > w ? hh : w);
+    float *tmp = malloc((size_t)mx * sizeof(float));
+    for (int ax = 0; ax < 3; ax++) { const int a1 = ax == 0 ? 1 : 0, a2 = ax == 2 ? 1 : 2;
+        for (int u = 0; u < dm[a1]; u++) for (int v2 = 0; v2 < dm[a2]; v2++) cf_box1(v + u * st[a1] + v2 * st[a2], dm[ax], st[ax], R, tmp); }
+    free(tmp);
+}
+/* gr / gi (level-0 solve grid of L0, smoothed in place) -> the gauge g (turns, malloc'ed, L0's grid) */
+static float *cf_gauge_solve(const cf_lvl *L0, float *gr, float *gi, int Rg, int iters) {
+    cf_boxsmooth(gr, L0->d, L0->hh, L0->w, Rg); cf_boxsmooth(gi, L0->d, L0->hh, L0->w, Rg);
+    int nl = 1; while (nl < 6 && (L0->d >> nl) >= 4 && (L0->hh >> nl) >= 4 && (L0->w >> nl) >= 4) nl++;
+    cf_lvl *G = calloc(nl, sizeof *G); float **zr = calloc(nl, sizeof *zr), **zi = calloc(nl, sizeof *zi);
+    for (int l = 0; l < nl; l++) {
+        cf_lvl *L = &G[l]; L->d = l ? (G[l - 1].d + 1) / 2 : L0->d; L->hh = l ? (G[l - 1].hh + 1) / 2 : L0->hh; L->w = l ? (G[l - 1].w + 1) / 2 : L0->w; L->n = (size_t)L->d * L->hh * L->w;
+        if (!l) { zr[0] = gr; zi[0] = gi; continue; }
+        zr[l] = calloc(L->n, sizeof(float)); zi[l] = calloc(L->n, sizeof(float)); const cf_lvl *F = &G[l - 1];
+        for (int z = 0; z < F->d; z++) for (int y = 0; y < F->hh; y++) for (int x = 0; x < F->w; x++) {
+            const size_t i = ((size_t)z * F->hh + y) * F->w + x, j = ((size_t)(z / 2) * L->hh + y / 2) * L->w + x / 2; zr[l][j] += zr[l - 1][i]; zi[l][j] += zi[l - 1][i]; }
+    }
+    float *g = nullptr;
+    for (int l = nl - 1; l >= 0; l--) {
+        cf_lvl *L = &G[l]; const size_t st[3] = {(size_t)L->hh * L->w, (size_t)L->w, 1}; const int dm[3] = {L->d, L->hh, L->w};
+        double zmax = 0; for (size_t i = 0; i < L->n; i++) zmax = fmax(zmax, hypot(zr[l][i], zi[l][i])); if (zmax <= 0) zmax = 1;
+        for (int k = 0; k < 3; k++) { L->wt[k] = malloc(L->n * sizeof(float)); L->tg[k] = malloc(L->n * sizeof(float)); }
+        L->b = calloc(L->n, sizeof(float)); L->diag = calloc(L->n, sizeof(float)); L->U = malloc(L->n * sizeof(float));
+        L->r = malloc(L->n * sizeof(float)); L->p = malloc(L->n * sizeof(float)); L->Ap = malloc(L->n * sizeof(float)); L->lam = 1e-7;
+        for (int z = 0; z < L->d; z++) for (int y = 0; y < L->hh; y++) for (int x = 0; x < L->w; x++) {
+            const size_t i = ((size_t)z * L->hh + y) * L->w + x; const int c[3] = {z, y, x};
+            for (int ax = 0; ax < 3; ax++) {
+                if (c[ax] + 1 >= dm[ax]) { L->wt[ax][i] = L->tg[ax][i] = 0; continue; }
+                const size_t j = i + st[ax]; const double ai = hypot(zr[l][i], zi[l][i]), aj = hypot(zr[l][j], zi[l][j]);
+                double t = (atan2(zi[l][j], zr[l][j]) - atan2(zi[l][i], zr[l][i])) / (2 * M_PI); t -= round(t);
+                L->wt[ax][i] = (float)(fmin(ai, aj) / zmax + 1e-4); L->tg[ax][i] = (float)t;
+            }
+        }
+        for (size_t i = 0; i < L->n; i++) {   /* b, diag (cf_rhs_run without the prior) */
+            const int z = (int)(i / st[0]), y = (int)(i / L->w % L->hh), x = (int)(i % L->w); const int c[3] = {z, y, x}; double b = 0, dg = L->lam;
+            for (int ax = 0; ax < 3; ax++) { b -= L->wt[ax][i] * L->tg[ax][i]; dg += L->wt[ax][i]; if (c[ax] > 0) { b += L->wt[ax][i - st[ax]] * L->tg[ax][i - st[ax]]; dg += L->wt[ax][i - st[ax]]; } }
+            L->b[i] = (float)b; L->diag[i] = (float)dg;
+        }
+        if (l == nl - 1) for (size_t i = 0; i < L->n; i++) L->U[i] = 0;
+        else { const cf_lvl *C = &G[l + 1];
+            for (int z = 0; z < L->d; z++) for (int y = 0; y < L->hh; y++) for (int x = 0; x < L->w; x++)
+                L->U[((size_t)z * L->hh + y) * L->w + x] = (float)cf_tri(C->U, C->d, C->hh, C->w, (z + 0.5) / 2 - 0.5, (y + 0.5) / 2 - 0.5, (x + 0.5) / 2 - 0.5); }
+        double rr; const int it = cf_cg_solve(L, l == nl - 1 ? 4 * iters : iters, 1e-5, &rr);
+        if (!l) fprintf(stderr, "count-field: gauge (ls, +-%d solve cells): %d CG iterations at level 0, relative residual %.2e\n", Rg, it, rr);
+        free(L->b); free(L->diag); free(L->r); free(L->p); free(L->Ap); for (int k = 0; k < 3; k++) { free(L->wt[k]); free(L->tg[k]); }
+        if (l + 1 < nl) free(G[l + 1].U);
+        if (l) { free(zr[l]); free(zi[l]); }
+    }
+    g = G[0].U;
+    double complex acc = 0; for (size_t i = 0; i < G[0].n; i++) acc += (gr[i] + I * gi[i]) * cexp(-2 * M_PI * I * g[i]);   /* the constant */
+    const double c0 = carg(acc) / (2 * M_PI); for (size_t i = 0; i < G[0].n; i++) g[i] += (float)c0;
+    free(G); free(zr); free(zi);
+    return g;
 }
 
 /* one output plane zo (bands of P rows = one solve row each, in parallel): the ring's blurred phasors -> W_out, confidence, planes;
@@ -320,7 +393,7 @@ static void cf_out_run(void *a, long Y0, long Y1, int t) {
 }
 
 /* zarr output: one block of rows (z shard index sz, nz rows) of the planes pc / ps / cl into 128^3 shards, a job per (plane, sy, sx) */
-typedef struct { z3w *const *zw; const uint8_t *pl[4]; int sz, nz, H, W, ny, nx; _Atomic int fail; } cf_shards;
+typedef struct { z3w *const *zw; const uint8_t *pl[4]; int sz, nz, H, W, ny, nx, oy, ox; _Atomic int fail; } cf_shards;   /* oy / ox: the shard grid offset (--into) */
 static void cf_shard_run(void *a, long j0, long j1, int t_) {
     cf_shards *S = a; uint8_t *sb = malloc(128 * 128 * 128); static const uint8_t fill[4] = {128, 128, 0, 0};
     for (long j = j0; j < j1 && sb; j++) {
@@ -329,7 +402,7 @@ static void cf_shard_run(void *a, long j0, long j1, int t_) {
         const int x0 = sx * 128, nx = S->W - x0 < 128 ? S->W - x0 : 128;
         for (int z = 0; z < S->nz; z++) for (int y = 0; y < 128 && sy * 128 + y < S->H; y++)
             memcpy(sb + ((size_t)z * 128 + y) * 128, S->pl[k] + ((size_t)z * S->H + sy * 128 + y) * S->W + x0, (size_t)nx);
-        if (z3w_write_shard(S->zw[k], S->sz, sy, sx, sb, 1)) atomic_store(&S->fail, 1);
+        if (z3w_write_shard(S->zw[k], S->sz, S->oy + sy, S->ox + sx, sb, 1)) atomic_store(&S->fail, 1);
     }
     if (!sb) atomic_store(&S->fail, 1);
     free(sb);
@@ -357,7 +430,7 @@ static float *cf_gradW(const cf_lvl *L, const float *cy, const float *cx, int na
 int cmd_count_field(int argc, char **argv) {
     if (argc < 4) {
         fprintf(stderr, "usage: ufsm count-field <in-fields> <out-fields> [--method ls|ray] [--pool P (solve cell in field cells, 0 auto)] [--R 10 (phase demod radius, field cells; 0: W only)] [--Rz R]\n"
-                        "       [--conf w|phase|mix|pmax] [--trust C0,C1 (phase confidence ramp: the network phase kept)] [--conf-w 1 (scale of the count confidence)] [--keep 0 (p: + A^p wrap(phi - W_out), A the local agreement)] [--sp-w 0 (1: sp from |grad W|)] [--dir 0] [--iters 400] [--lambda 1e-7] [--eps 1e-3] [--loop 8 (closing loop edge, field cells)] [--model DIR] [--model-R 8] [--rmin-um 500] [--emin 0.1] [--sheet0 0.4]\n"
+                        "       [--gauge demod|ls (ls: a smooth LS-unwrapped gauge instead of the +-R demodulation; with --R 0)] [--gauge-R 5 (solve cells)] [--conf w|phase|mix|pmax] [--trust C0,C1 (phase confidence ramp: the network phase kept)] [--conf-w 1 (scale of the count confidence)] [--keep 0 (p: + A^p wrap(phi - W_out), A the local agreement)] [--sp-w 0 (1: sp from |grad W|)] [--dir 0] [--iters 400] [--lambda 1e-7] [--eps 1e-3] [--loop 8 (closing loop edge, field cells)] [--model DIR] [--model-R 8] [--rmin-um 500] [--emin 0.1] [--sheet0 0.4]\n"
                         "       [--wc 1 (0: no wc.f32)] [--mem-gb 6 (field chunk budget)] [--threads 8]\n");
         return 2;
     }
@@ -456,7 +529,7 @@ int cmd_count_field(int argc, char **argv) {
                 cn[k]++; cb[k] += cl[i] > 0.25; cs[k] += Sfine[i]; cr[k] += (Gfine[1][i] * ry + Gfine[2][i] * rx) / (r > 1 ? r : 1) / Sfine[i]; cg[k] += sqrt(Gfine[0][i] * Gfine[0][i] + Gfine[1][i] * Gfine[1][i] + Gfine[2][i] * Gfine[2][i]) / Sfine[i]; } }
         for (int k = 0; k < NRB; k++) if (cn[k] > 0) fprintf(stderr, "count-field debug: r %2d mm: %8.0f cells, closing > 0.25 %.3f, mean weight %.3f, radial density %.3f, |g| %.3f turns per field cell\n", k, cn[k], cb[k] / cn[k], cs[k] / cn[k] / ((double)P * P * P), cr[k] / cn[k], cg[k] / cn[k]);
     }
-    cf_dm M = {nullptr, 0, L, D, H, W, R, na, dir, h, 0, g.cy, g.cx, nullptr, nullptr, nullptr, nullptr, 0};
+    cf_dm M = {nullptr, 0, L, D, H, W, R, na, dir, h, 0, g.cy, g.cx, nullptr, nullptr, nullptr, nullptr, 0, nullptr};
     if (!R) {   /* R 0: the global gauge arg sum c e^{2 pi i (phi - W)} (with R > 0 the demodulation absorbs any constant) */
         double complex acc = 0;
         for (int z0 = 0; z0 < D; z0 += CZ) {
@@ -470,17 +543,38 @@ int cmd_count_field(int argc, char **argv) {
         }
         M.gauge = carg(acc) / (2 * M_PI);
     }
+    float *gls = nullptr;
+    if (!strcmp(cf_opt(argc, argv, "--gauge", "demod"), "ls")) {   /* the smooth gauge (cf_gauge_solve) instead of the demodulation */
+        if (R) { fprintf(stderr, "count-field: --gauge ls replaces the demodulation: use it with --R 0\n"); return 2; }
+        float *gr2 = calloc(L->n, sizeof(float)), *gi2 = calloc(L->n, sizeof(float)); if (!gr2 || !gi2) { fprintf(stderr, "count-field: out of memory (gauge)\n"); return 1; }
+        for (int z0 = 0; z0 < D; z0 += CZ) {
+            const int z1 = z0 + CZ < D ? z0 + CZ : D; fit_fields_buf b; if (fit_fields_load(in, z0, z1, 1, &b)) { fprintf(stderr, "count-field: cannot load rows %d..%d of %s\n", z0, z1, in); return 1; }
+            M.f = &b.f; M.zoff = z0; cf_gsum GS = {&M, gr2, gi2};
+            for (int z = z0; z < z1; z++) { M.z = z; cf_par(L->hh, cf_gsum_run, &GS); }
+            fit_fields_free(&b);
+        }
+        gls = cf_gauge_solve(L, gr2, gi2, atoi(cf_opt(argc, argv, "--gauge-R", "5")), iters); free(gr2); free(gi2);
+        if (!gls) { fprintf(stderr, "count-field: the gauge solve failed\n"); return 1; }
+        M.gls = gls;
+    }
     /* pass 2: the output, chunk by chunk. raw: rows appended to raw planes (every plane written); zarr (input zarr arrays of the same
        box, no zarr_offset): pc / ps / cl as new zarr arrays (128^3 shards, lossless), the other planes symlinked to the input's */
     char p[1400]; snprintf(p, sizeof p, "mkdir -p '%s'", out); if (system(p)) { fprintf(stderr, "count-field: cannot create %s\n", out); return 1; }
     static const char *names[15] = {"pc", "ps", "t0", "t1", "t2", "t3", "t4", "t5", "sp", "w", "dz", "dy", "dx", "dq", "r"};
-    int zarr = 0;
+    int zarr = 0; long long ish[3] = {0, 0, 0}, ioff[3] = {0, 0, 0}, irow[2] = {0, 0}; const int into = *cf_opt(argc, argv, "--into-shape", "") != 0;
+    if (into) {   /* --into-shape D,H,W --into-off Z,Y,X [--into-rows A,B]: write rows [A, B) of whole-volume pc / ps / cl arrays (global 128^3 shards) */
+        if (sscanf(cf_opt(argc, argv, "--into-shape", ""), "%lld,%lld,%lld", &ish[0], &ish[1], &ish[2]) != 3 || sscanf(cf_opt(argc, argv, "--into-off", ""), "%lld,%lld,%lld", &ioff[0], &ioff[1], &ioff[2]) != 3) { fprintf(stderr, "count-field: --into-shape D,H,W and --into-off Z,Y,X\n"); return 2; }
+        irow[0] = ioff[0]; irow[1] = ioff[0] + D;
+        if (*cf_opt(argc, argv, "--into-rows", "") && sscanf(cf_opt(argc, argv, "--into-rows", ""), "%lld,%lld", &irow[0], &irow[1]) != 2) { fprintf(stderr, "count-field: --into-rows A,B\n"); return 2; }
+        if (ioff[1] % 128 || ioff[2] % 128 || irow[0] % 128 || (irow[1] % 128 && irow[1] != ish[0]) || irow[0] < ioff[0] || irow[1] > ioff[0] + D || irow[0] >= irow[1] ||
+            ioff[1] + H > ish[1] || ioff[2] + W > ish[2] || *mdir) { fprintf(stderr, "count-field: --into: y / x offsets and the rows must be 128-aligned (B may be the volume end), inside the box and the volume; no --model\n"); return 2; }
+    }
     {   const char *fmt = cf_opt(argc, argv, "--format", "auto");
         snprintf(p, sizeof p, "%s/pc/zarr.json", in); FILE *t = fopen(p, "rb"); const int inz = t != nullptr; if (t) fclose(t);
         snprintf(p, sizeof p, "%s/fields.json", in); t = fopen(p, "rb"); int off = 0;
         if (t) { char buf[4096]; const size_t r = fread(buf, 1, sizeof buf - 1, t); buf[r] = 0; off = strstr(buf, "zarr_offset") != nullptr; fclose(t); }
-        zarr = !strcmp(fmt, "zarr") || (!strcmp(fmt, "auto") && inz && !off);
-        if (zarr && (!inz || off)) { fprintf(stderr, "count-field: --format zarr needs zarr input arrays of the same box (no zarr_offset)\n"); return 2; }
+        zarr = into || !strcmp(fmt, "zarr") || (!strcmp(fmt, "auto") && inz && !off);
+        if (zarr && (!inz || (off && !into))) { fprintf(stderr, "count-field: --format zarr needs zarr input arrays of the same box (no zarr_offset)\n"); return 2; }
         if (zarr && wwc && !strcmp(cf_opt(argc, argv, "--wc", ""), "1")) fprintf(stderr, "count-field: zarr output: no wc.f32 (raw only)\n");
     }
     const int doc = zarr ? 0 : wwc;   /* wc.f32 with raw output only */
@@ -488,13 +582,13 @@ int cmd_count_field(int argc, char **argv) {
     FILE *fp[15] = {0}, *fwc = nullptr, *fcl = nullptr; z3w *zw[4] = {0};
     const int spw = atoi(cf_opt(argc, argv, "--sp-w", "0")), nzp = spw ? 4 : 3;   /* --sp-w 1: sp from |grad W| (the density term agrees with the phase) */
     if (zarr) {
-        char rp[PATH_MAX]; if (!realpath(in, rp)) { fprintf(stderr, "count-field: %s\n", in); return 1; }
         for (int k = 2; k < 15; k++) {
             if ((k >= 10 && k < 14 && !w4d) || (k == 14 && !recto) || (k == 8 && spw)) continue;
-            char src[PATH_MAX + 64], dst[1400]; snprintf(src, sizeof src, "%s/%s", rp, names[k]); snprintf(dst, sizeof dst, "%s/%s", out, names[k]);
+            char src[PATH_MAX], dst[1400]; snprintf(dst, sizeof dst, "%s/%s", in, names[k]); if (!realpath(dst, src)) { fprintf(stderr, "count-field: %s\n", dst); return 1; }   /* the base array (through crop links) */
+            snprintf(dst, sizeof dst, "%s/%s", out, names[k]); struct stat sst; if (into && !lstat(dst, &sst)) continue;
             unlink(dst); if (symlink(src, dst)) { fprintf(stderr, "count-field: cannot link %s\n", dst); return 1; }
         }
-        const int64_t zsh[3] = {D, H, W}; static const char *zn[4] = {"pc", "ps", "cl", "sp"}; const int zf[4] = {128, 128, 0, 0};
+        const int64_t zsh[3] = {into ? ish[0] : D, into ? ish[1] : H, into ? ish[2] : W}; static const char *zn[4] = {"pc", "ps", "cl", "sp"}; const int zf[4] = {128, 128, 0, 0};
         for (int k = 0; k < nzp; k++) { snprintf(p, sizeof p, "%s/%s", out, zn[k]); zw[k] = z3w_create(p, zsh, 128, 0, zf[k], "{\"ufsm\": {\"content\": \"ufsm count-field\"}}");
             if (!zw[k]) { fprintf(stderr, "count-field: %s\n", z3w_error()); return 1; } }
     } else {
@@ -512,8 +606,10 @@ int cmd_count_field(int argc, char **argv) {
     float *gr = *mdir ? calloc(L->n, sizeof(float)) : nullptr, *gi = *mdir ? calloc(L->n, sizeof(float)) : nullptr;
     if (!opc || !ops || !ocl || (doc && !wc) || !ring || !Wring || (*mdir && (!gr || !gi))) { fprintf(stderr, "count-field: out of memory\n"); return 1; }
     cf_out O = {nullptr, 0, 0, L, ring, nullptr, Sfine, cl, 0, D, H, W, Rz, P, !strcmp(cmode, "w") ? 0 : !strcmp(cmode, "phase") ? 1 : !strcmp(cmode, "pmax") ? 3 : 2, R > 0, atof(cf_opt(argc, argv, "--keep", "0")), atof(cf_opt(argc, argv, "--conf-w", "1")), tr0, tr1, opc, ops, ocl, osp, gW, wc, gr, gi, {{0}}};
-    for (int b0 = 0; b0 < D; b0 += BZ) {
-        const int b1 = b0 + BZ < D ? b0 + BZ : D; O.c0 = b0;
+    double resid[2][2] = {{0, 0}, {0, 0}};   /* UFSM_CF_RESID: plaquettes, residues (input, output) */
+    const int olo = into ? (int)(irow[0] - ioff[0]) : 0, ohi = into ? (int)(irow[1] - ioff[0]) : D;   /* the box rows written */
+    for (int b0 = olo; b0 < ohi; b0 += BZ) {
+        const int b1 = b0 + BZ < ohi ? b0 + BZ : ohi; O.c0 = b0;
         if (zarr) { memset(opc, 128, (size_t)BZ * HW); memset(ops, 128, (size_t)BZ * HW); memset(ocl, 0, (size_t)BZ * HW); }
         for (int c0 = b0; c0 < b1; c0 += CZ) {
             const int c1 = c0 + CZ < b1 ? c0 + CZ : b1, a = c0 - Rz > 0 ? c0 - Rz : 0, e = c1 + Rz < D ? c1 + Rz : D;
@@ -529,6 +625,19 @@ int cmd_count_field(int argc, char **argv) {
                 if (zo < c0) continue;
                 O.zo = zo; O.Wz = Wring + (size_t)(zo % nring) * HW; cf_par(L->hh, cf_out_run, &O);
             }
+            if (getenv("UFSM_CF_RESID")) {   /* phase residues on y-x plaquettes (all 4 corners conf >= 0.3): the input vs the output phase */
+                for (int zo = c0; zo < c1; zo++) for (int y = 0; y + 1 < H; y++) for (int x = 0; x + 1 < W; x++) {
+                    const size_t q[4] = {(size_t)y * W + x, (size_t)y * W + x + 1, (size_t)(y + 1) * W + x + 1, (size_t)(y + 1) * W + x};
+                    for (int io = 0; io < 2; io++) {
+                        const uint8_t *pc = io ? opc + (size_t)(zo - b0) * HW : b.f.pc + (size_t)(zo - a) * HW, *ps = io ? ops + (size_t)(zo - b0) * HW : b.f.ps + (size_t)(zo - a) * HW;
+                        double ph[4]; int ok = 1;
+                        for (int k = 0; k < 4 && ok; k++) { const double cc = (pc[q[k]] - 128) / 127.0, ss = (ps[q[k]] - 128) / 127.0; if (hypot(cc, ss) < 0.3) ok = 0; ph[k] = atan2(ss, cc) / (2 * M_PI); }
+                        if (!ok) continue;
+                        double s = 0; for (int k = 0; k < 4; k++) { double d = ph[(k + 1) % 4] - ph[k]; d -= round(d); s += d; }
+                        resid[io][0]++; resid[io][1] += fabs(s) > 0.5;
+                    }
+                }
+            }
             if (!zarr) {   /* raw: one chunk = one block */
                 const size_t nr = (size_t)(c1 - c0) * HW, off = (size_t)(c0 - a) * HW, bo = (size_t)(c0 - b0) * HW;
                 int bad = cf_wr(fp[0], opc + bo, 1, nr) || cf_wr(fp[1], ops + bo, 1, nr) || cf_wr(fcl, ocl + bo, 1, nr) || (doc && cf_wr(fwc, wc + bo, sizeof(float), nr));
@@ -542,7 +651,7 @@ int cmd_count_field(int argc, char **argv) {
             fit_fields_free(&b);
         }
         if (zarr) {   /* the block's shards: (plane, shard y, shard x) jobs on threads */
-            cf_shards SJ = {zw, {opc, ops, ocl, osp}, b0 / 128, b1 - b0, H, W, (H + 127) / 128, (W + 127) / 128, 0};
+            cf_shards SJ = {zw, {opc, ops, ocl, osp}, (int)((b0 + ioff[0]) / 128), b1 - b0, H, W, (H + 127) / 128, (W + 127) / 128, (int)(ioff[1] / 128), (int)(ioff[2] / 128), 0};
             cf_par((long)nzp * SJ.ny * SJ.nx, cf_shard_run, &SJ);
             if (SJ.fail) { fprintf(stderr, "count-field: %s\n", z3w_error()); return 1; }
         }
@@ -552,9 +661,18 @@ int cmd_count_field(int argc, char **argv) {
         for (int k = 0; k < 15; k++) if (fp[k] && fclose(fp[k])) { fprintf(stderr, "count-field: write error %s\n", out); return 1; }
         if (fclose(fcl) || (fwc && fclose(fwc))) { fprintf(stderr, "count-field: write error %s\n", out); return 1; }
     }
+    if (getenv("UFSM_CF_RESID")) fprintf(stderr, "count-field: phase residues per confident y-x plaquette: input %.5f (%.0f), output %.5f (%.0f)\n", resid[0][0] > 0 ? resid[0][1] / resid[0][0] : 0, resid[0][0], resid[1][0] > 0 ? resid[1][1] / resid[1][0] : 0, resid[1][0]);
     double agree_s = 0, agree_n = 0; for (int t = 0; t < CF_MAXT; t++) { agree_s += O.ag[t][0]; agree_n += O.ag[t][1]; }
     fprintf(stderr, "count-field: gauge %.3f turn; phase / W agreement (phasor mean over +-%d cells, confidence-weighted) %.3f\n", M.gauge, R, agree_n > 0 ? agree_s / agree_n : 0);
-    {   /* fields.json (fit_fields_save_ex's keys) + "wcount" */
+    if (into) {   /* the whole volume's fields.json: the base field set's (the directory of the input's pc array), written once */
+        struct stat sst; snprintf(p, sizeof p, "%s/fields.json", out);
+        if (stat(p, &sst)) {
+            char src[PATH_MAX], q[1400]; snprintf(q, sizeof q, "%s/pc", in); if (!realpath(q, src)) { fprintf(stderr, "count-field: %s\n", q); return 1; }
+            char *sl = strrchr(src, '/'); if (sl) *sl = 0;
+            snprintf(q, sizeof q, "cp '%s/fields.json' '%s.tmp%d' && mv '%s.tmp%d' '%s'", src, p, (int)getpid(), p, (int)getpid(), p);
+            if (system(q)) { fprintf(stderr, "count-field: cannot copy %s/fields.json\n", src); return 1; }
+        }
+    } else {   /* fields.json (fit_fields_save_ex's keys) + "wcount" */
         snprintf(p, sizeof p, "%s/fields.json", out); FILE *fj = fopen(p, "w"); if (!fj) return 1;
         fprintf(fj, "{%s\"origin\": [%lld, %lld, %lld], \"shape\": [%d, %d, %d], \"h\": %d, \"um\": %.9g, ", zarr ? "\"format\": \"zarr\", " : "", (long long)g.origin[0], (long long)g.origin[1], (long long)g.origin[2], D, H, W, g.h, g.um);
         if (w4d > 0) fprintf(fj, "\"w4_d\": %d, ", w4d);
@@ -585,7 +703,7 @@ int cmd_count_field(int argc, char **argv) {
         free(m.delta);
     }
     printf("count-field: %s -> %s (method %s, pool %d, R %d / %d, conf %s)\n", in, out, meth, P, R, Rz, cmode);
-    free(opc); free(ops); free(ocl); free(osp); free(gW); free(wc); free(cl); free(ring); free(Wring); free(gr); free(gi); free(Sfine); for (int k = 0; k < 3; k++) free(Gfine[k]);
+    free(opc); free(ops); free(ocl); free(osp); free(gW); free(gls); free(wc); free(cl); free(ring); free(Wring); free(gr); free(gi); free(Sfine); for (int k = 0; k < 3; k++) free(Gfine[k]);
     for (int l = 0; l < nl; l++) { cf_lvl *C = &lv[l]; free(C->b); free(C->diag); free(C->U); free(C->r); free(C->p); free(C->Ap); for (int k = 0; k < 3; k++) { free(C->wt[k]); free(C->tg[k]); } }
     free(lv); free(Sl); free(Gl); fit_fields_free(&g);
     return 0;
