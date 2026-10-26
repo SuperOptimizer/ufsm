@@ -19,7 +19,7 @@ __device__ void mxsw_note(mxsw_res *r, int k, unsigned v) {
 /* table-search references (no arithmetic on x: comparisons against the exact grid values and midpoints) */
 __device__ unsigned ref_e4m3(float x) {
     const unsigned u = __float_as_uint(x), s = (u >> 24) & 0x80u;
-    if ((u & 0x7fffffffu) > 0x7f800000u) return s | 0x7fu;
+    if ((u & 0x7fffffffu) > 0x7f800000u) return 0x7fu;
     const float a = fabsf(x);
     if (a >= 448.f) return s | 0x7eu;
     int lo = 0, hi = 126;                 /* largest code c with val(c) <= a */
@@ -99,6 +99,7 @@ __global__ void mxsw_mma_k(mxsw_res *r, int kind, unsigned seed) {
     if (kind == 0) lpsw_mma_f8(cs, a, b, sa, sb); else if (kind == 1) lpsw_mma_f4(cs, a, b, sa, sb); else lpsw_mma_f4x4(cs, a, b, sa, sb);
     /* scalar reference over the layout */
     const int K = kind ? 64 : 32, KB = kind == 2 ? 16 : 32;
+    double sums[4], mags[4]; (void)sums;
     for (int e = 0; e < 4; e++) {
         const int row = g + 8 * (e >> 1), col = 2 * t + (e & 1);
         double sum = c0[e], mag = fabs(c0[e]);
@@ -115,14 +116,15 @@ __global__ void mxsw_mma_k(mxsw_res *r, int kind, unsigned seed) {
             const double sc = ldexp(1.0, (int)((fsa[4 * (row & 7) + (row >= 8)] >> (8 * blk)) & 255u) - 127) * ldexp(1.0, (int)((fsb[4 * col] >> (8 * blk)) & 255u) - 127);
             sum += (double)av * bv * sc; mag += fabs((double)av * bv * sc);
         }
-        const double err = fabs((double)cs[e] - sum) / (mag > 0 ? mag : 1.0);
+        sums[e] = sum; mags[e] = mag > 0 ? mag : 1.0;
+        const double err = fabs((double)cs[e] - sum) / mags[e];
         if (err > 1e-6) mxsw_note(r, 6, (unsigned)(blockIdx.x * 32 + l));
         atomicMax((unsigned *)&r->worst[0], __float_as_uint((float)err));
     }
 #ifdef MXSW_HW
     if (kind == 0) mma_f8(c, a, b, sa, sb); else if (kind == 1) mma_f4(c, a, b, sa, sb); else mma_f4x4(c, a, b, sa, sb);
     for (int e = 0; e < 4; e++) {
-        const float err = fabsf(c[e] - cs[e]) / fmaxf(fabsf(c[e]), 1e-3f);
+        const float err = (float)(fabs((double)c[e] - sums[e]) / mags[e]);   /* the instruction vs the exact sum, relative to the sum of magnitudes (its accumulation order is its own) */
         if (err > 1e-5f) mxsw_note(r, 7, (unsigned)(blockIdx.x * 32 + l));
         atomicMax((unsigned *)&r->worst[1], __float_as_uint(err));
     }

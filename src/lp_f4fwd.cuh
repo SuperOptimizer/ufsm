@@ -19,7 +19,7 @@ __global__ void prep_w4_k(const float *__restrict__ w, uint8_t *__restrict__ wq,
 extern int g_w2d;
 __global__ void prep_w4_2d_k(const float *__restrict__ w, uint8_t *__restrict__ wq, uint8_t *__restrict__ ws, int Co, int Ci, int Cop, int Cip, int Cx = -1, int CxP = 0, int Ox = -1, int OxP = 0);   /* defined in lp_f4fwd.cu */
 template <int MT, int TZ, typename T, typename TO>
-__global__ void __launch_bounds__(256, 2) conv_fwd_f4_k(const T *__restrict__ x, const uint8_t *__restrict__ wq, const uint8_t *__restrict__ wsc,
+__global__ void __launch_bounds__(256, LP_MINB(2)) conv_fwd_f4_k(const T *__restrict__ x, const uint8_t *__restrict__ wq, const uint8_t *__restrict__ wsc,
                                                      const float *__restrict__ b, TO *__restrict__ y,
                                                      int N, int Ci, int D, int H, int W, int Co, int Cop, int Cip, gnp_t gp, double *__restrict__ osum, int Go, split_t sp) {
     constexpr int BM = MT * 16, PG = 7, RZ = TZ / 2, NR = 2 * RZ, TT = (TZ + 2) * 180, NRX = NR;   /* PG: tap pairs per weight stage */
@@ -126,24 +126,27 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f4_k(const T *__restrict__ x,
             for (int pp = 0; pp < PG; pp++) {
                 const int tA = 2 * (p0 + pp), tB = min(tA + 1, 26);
                 const int rA = ((wz * RZ + tA / 9) * 10 + wr + (tA / 3) % 3) * 18 + tA % 3, rB = ((wz * RZ + tB / 9) * 10 + wr + (tB / 3) % 3) * 18 + tB % 3;
-                unsigned bfr[NR][4], sb[NR][2];
+                mx4b bf[NR][2];
 #pragma unroll
                 for (int r = 0; r < NR; r++) {
                     const int rowo = (r >> 1) * 180 + (r & 1) * 18;   /* z plane r/2, row r%2 of the warp's tile */
                     int mat = lane >> 3, q = mat >> 1, isB = mat & 1;
                     int pos = (isB ? rB : rA) + rowo + q * 8 + (lane & 7);
-                    ldsm_x4(bfr[r], sx + pos * 16);
+                    unsigned bfr[4];
+                    ldsm_x4(bfr, sx + pos * 16);
 #pragma unroll
-                    for (int q2 = 0; q2 < 2; q2++) sb[r][q2] = (unsigned)sxs[rA + rowo + q2 * 8 + g] | ((unsigned)sxs[rB + rowo + q2 * 8 + g] << 8);
+                    for (int q2 = 0; q2 < 2; q2++)
+                        bf[r][q2] = mx4b_make(bfr + 2 * q2, (unsigned)sxs[rA + rowo + q2 * 8 + LPB0] | ((unsigned)sxs[rB + rowo + q2 * 8 + LPB0] << 8),
+                                              (unsigned)sxs[rA + rowo + q2 * 8 + LPB1] | ((unsigned)sxs[rB + rowo + q2 * 8 + LPB1] << 8));
                 }
 #pragma unroll
                 for (int m = 0; m < MT; m++) {
                     unsigned af[4];
                     int mat = lane >> 3, row = m * 16 + (mat & 1) * 8 + (lane & 7);
                     ldsm_x4(af, wa + pp * BM * 32 + sw16(row, mat >> 1));
-                    unsigned sa = was[pp * BM + m * 16 + g + 8 * (t & 1)];
+                    const mx4a A = mx4a_make(af, was[pp * BM + m * 16 + LPA0], was[pp * BM + m * 16 + LPA1]);
 #pragma unroll
-                    for (int r = 0; r < NR; r++) { mma_f4(acc[m][r][0], af, bfr[r], sa, sb[r][0]); mma_f4(acc[m][r][1], af, bfr[r] + 2, sa, sb[r][1]); }
+                    for (int r = 0; r < NR; r++) { mma4p(acc[m][r][0], A, bf[r][0]); mma4p(acc[m][r][1], A, bf[r][1]); }
                 }
             }
         }
@@ -178,7 +181,7 @@ template <int MT, int TZ, int NCH> __host__ __device__ constexpr unsigned f4r_wa
     return (unsigned)((NCH * (TT * 16 + ((TT + 127) & ~127)) + NCH * 32 * 32 + NCH * 32 * 8 + 16 + 127) & ~127);
 }
 template <int MT, int TZ, int NCH, typename T, typename TO>
-__global__ void __launch_bounds__(256, 2) conv_fwd_f4r_k(const T *__restrict__ x, const uint8_t *__restrict__ wq, const uint8_t *__restrict__ wsc,
+__global__ void __launch_bounds__(256, LP_MINB(2)) conv_fwd_f4r_k(const T *__restrict__ x, const uint8_t *__restrict__ wq, const uint8_t *__restrict__ wsc,
                                                       const float *__restrict__ b, TO *__restrict__ y,
                                                       int N, int Ci, int D, int H, int W, int Co, int Cop, gnp_t gp, double *__restrict__ osum, int Go, split_t sp, int ZC,
                                                       int wres) {   /* wres: all 14 tap pairs resident (one output tile, one chunk), staged once */
@@ -323,25 +326,28 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f4r_k(const T *__restrict__ x
 #pragma unroll
                     for (int pp = 0; pp < PG; pp++) {
                         const int tA = 2 * (p0 + pp), tB = min(tA + 1, 26);
-                        unsigned bfr[NR][4], sb[NR][2];
+                        mx4b bf[NR][2];
 #pragma unroll
                         for (int r = 0; r < NR; r++) {
                             /* rows of the warp's output row r for taps A / B: tile plane wz RZ + r / 2 + tap / 9 -> its ring slot */
                             const int sA = (oz0 + wz * RZ + (r >> 1) + tA / 9) % NP, sB = (oz0 + wz * RZ + (r >> 1) + tB / 9) % NP;
                             const int rA = sA * 180 + (wr + (r & 1) + (tA / 3) % 3) * 18 + tA % 3, rB = sB * 180 + (wr + (r & 1) + (tB / 3) % 3) * 18 + tB % 3;
                             int mat = lane >> 3, q = mat >> 1, isB = mat & 1;
-                            ldsm_x4(bfr[r], sx + ((isB ? rB : rA) + q * 8 + (lane & 7)) * 16);
+                            unsigned bfr[4];
+                            ldsm_x4(bfr, sx + ((isB ? rB : rA) + q * 8 + (lane & 7)) * 16);
 #pragma unroll
-                            for (int q2 = 0; q2 < 2; q2++) sb[r][q2] = (unsigned)sxs[rA + q2 * 8 + g] | ((unsigned)sxs[rB + q2 * 8 + g] << 8);
+                            for (int q2 = 0; q2 < 2; q2++)
+                                bf[r][q2] = mx4b_make(bfr + 2 * q2, (unsigned)sxs[rA + q2 * 8 + LPB0] | ((unsigned)sxs[rB + q2 * 8 + LPB0] << 8),
+                                                      (unsigned)sxs[rA + q2 * 8 + LPB1] | ((unsigned)sxs[rB + q2 * 8 + LPB1] << 8));
                         }
 #pragma unroll
                         for (int m = 0; m < MT; m++) {
                             unsigned af[4];
                             int mat = lane >> 3, row = m * 16 + (mat & 1) * 8 + (lane & 7);
                             ldsm_x4(af, wag + pp * BM * 32 + sw16(row, mat >> 1));
-                            unsigned sa = wasg[pp * BM + m * 16 + g + 8 * (t & 1)];
+                            const mx4a A = mx4a_make(af, wasg[pp * BM + m * 16 + LPA0], wasg[pp * BM + m * 16 + LPA1]);
 #pragma unroll
-                            for (int r = 0; r < NR; r++) { mma_f4(acc[m][r][0], af, bfr[r], sa, sb[r][0]); mma_f4(acc[m][r][1], af, bfr[r] + 2, sa, sb[r][1]); }
+                            for (int r = 0; r < NR; r++) { mma4p(acc[m][r][0], A, bf[r][0]); mma4p(acc[m][r][1], A, bf[r][1]); }
                         }
                     }
                 }

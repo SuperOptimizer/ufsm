@@ -3,7 +3,7 @@
    cvt.*.e4m3x2 below sm_89, no cvt.*.e2m1x2 below sm_100a). Each is bit-exact against the instruction it replaces on
    every fp32 input (tests/test_mx_sw.c runs all 2^32 against the sm_120a instructions and an independent table search):
      mxsw_enc_e4m3  = cvt.rn.satfinite.e4m3x2.f32 (one lane): round to nearest even, |x| >= 448 (incl. inf) -> +-448,
-                      NaN -> 0x7f (sign kept); fp32 subnormals are below half the e4m3 step 2^-9 and give +-0.
+                      NaN -> 0x7f (either sign, as the cvt); fp32 subnormals are below half the e4m3 step 2^-9 and give +-0.
      mxsw_enc_e2m1  = cvt.rn.satfinite.e2m1x2.f32 (one lane, the nibble): grid {0, .5, 1, 1.5, 2, 3, 4, 6}, ties to the even
                       code, |x| > 6 (incl. inf) -> +-6, NaN -> +6 (0x7: the instruction's NaN result).
      mxsw_dec_e4m3x2 / mxsw_dec_e2m1x2 = cvt.rn.f16x2.e4m3x2 / cvt.rn.f16x2.e2m1x2 (both exact in f16).
@@ -19,7 +19,7 @@ __host__ __device__ __forceinline__ unsigned mxsw_enc_e4m3(float x) {
     __builtin_memcpy(&u, &x, 4);
 #endif
     const unsigned s = (u >> 24) & 0x80u, a = u & 0x7fffffffu;
-    if (a > 0x7f800000u) return s | 0x7fu;                      /* NaN */
+    if (a > 0x7f800000u) return 0x7fu;                          /* NaN (either sign) -> 0x7f */
     if (a >= 0x43e00000u) return s | 0x7eu;                     /* >= 448 (ties at 464 round to 448, larger saturate) */
     if (a >= 0x3c800000u) {                                     /* normal e4m3 (>= 2^-6): RNE on the 20 dropped mantissa bits */
         const unsigned r = (a + 0x7ffffu + ((a >> 20) & 1u)) >> 20;
@@ -54,10 +54,10 @@ __host__ __device__ __forceinline__ unsigned mxsw_enc_e2m1(float x) {
     return s | 2u;
 }
 /* e4m3 byte -> f16 bits: the e4m3 field placed at f16 bit 7 is the value times 2^-8 in f16 (exponent biases 7 vs 15, and the
-   subnormals line up), so one exact multiply by 256 finishes it; 0x7f / 0xff (NaN) -> f16 NaN */
+   subnormals line up), so one exact multiply by 256 finishes it; 0x7f / 0xff (NaN) -> f16 NaN 0x7fff (no sign, as the cvt) */
 __host__ __device__ __forceinline__ unsigned short mxsw_e4m3_h16(unsigned b) {
     b &= 0xffu;
-    if ((b & 0x7fu) == 0x7fu) return (unsigned short)(((b & 0x80u) << 8) | 0x7fffu);
+    if ((b & 0x7fu) == 0x7fu) return (unsigned short)0x7fffu;
     const unsigned em = b & 0x7fu, e = em >> 3, m = em & 7u;
     unsigned short h;
     if (e) h = (unsigned short)(((e + 8u) << 10) | (m << 7));    /* normal: f16 exponent e - 7 + 15 */
