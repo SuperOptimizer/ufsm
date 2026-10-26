@@ -1100,22 +1100,28 @@ int cmd_predict(int argc, char **argv) {
     /* enumerate the tiles in shard order, then let the reader run ahead */
     reader_t rd = {0}; rd.ct = ct; rd.bo = bo; rd.W = W; rd.Wz = Wz; rd.nthreads = nthreads;
     long cap = 0;
-    long nwq = 0;   /* the computed (super-)shards dealt round-robin to the GPU workers (skipped ones dealt to none) */
+    long nwq = 0;   /* the non-air (super-)shards dealt round-robin to the GPU workers. Air (--occupancy, 2) is the same in every worker,
+                       but each worker reads the --resume list when it starts, so a shard another worker wrote meanwhile is "written" (1)
+                       in a late one only: the deal counts those, then the owner skips them (dealing by the late view left shards to
+                       no worker) */
     if (kss > 1) for (int64_t sz = 0; sz < nss[0]; sz++) for (int64_t sy = 0; sy < nss[1]; sy++) for (int64_t sx = 0; sx < nss[2]; sx++) {   /* super-shards */
-        if (sskip) {   /* skipped when every shard of it is */
-            int all = 1;
-            for (int64_t a = sz * kss; a < (sz + 1) * kss && a < ns[0] && all; a++) for (int64_t b = sy * kss; b < (sy + 1) * kss && b < ns[1] && all; b++)
-                for (int64_t c = sx * kss; c < (sx + 1) * kss && c < ns[2]; c++) if (!sskip[(a * ns[1] + b) * ns[2] + c]) { all = 0; break; }
-            if (all) continue;
-        }
+        int all = 1, air = 1;   /* skipped when every shard of it is; dealt unless every shard is air */
+        if (sskip) {
+            for (int64_t a = sz * kss; a < (sz + 1) * kss && a < ns[0]; a++) for (int64_t b = sy * kss; b < (sy + 1) * kss && b < ns[1]; b++)
+                for (int64_t c = sx * kss; c < (sx + 1) * kss && c < ns[2]; c++) { const uint8_t e = sskip[(a * ns[1] + b) * ns[2] + c]; all &= e != 0; air &= e == 2; }
+        } else all = air = 0;
+        if (air) continue;
         if (nwork > 1 && (nwq++ % ngpu) != part) continue;
+        if (all) continue;
         if (rd.ntiles == cap) { cap = cap ? 2 * cap : 1024; rd.tiles = realloc(rd.tiles, (size_t)cap * sizeof *rd.tiles); }
         rd.tiles[rd.ntiles++] = (tile_t){sz * stride - halo, sy * stride - halo, sx * stride - halo, (sz * nss[1] + sy) * nss[2] + sx};
     }
     if (kss == 1) for (int64_t sz = 0; sz < ns[0]; sz++) for (int64_t sy = 0; sy < ns[1]; sy++) for (int64_t sx = 0; sx < ns[2]; sx++) {
         int64_t so[3] = {sz * shard, sy * shard, sx * shard}, se[3], first[3];
-        if (sskip && sskip[(sz * ns[1] + sy) * ns[2] + sx]) continue;   /* --resume: written; --occupancy: air */
+        const uint8_t sk = sskip ? sskip[(sz * ns[1] + sy) * ns[2] + sx] : 0;
+        if (sk == 2) continue;   /* --occupancy: air */
         if (nwork > 1 && (nwq++ % ngpu) != part) continue;   /* another worker's shard */
+        if (sk) continue;   /* --resume: written (see nwq) */
         for (int d = 0; d < 3; d++) se[d] = so[d] + shard < bn[d] ? so[d] + shard : bn[d];
         for (int d = 0; d < 3; d++) {
             int64_t phase = grid ? (bo[d] + so[d] - grid_origin[d]) % strd[d] : 0;
