@@ -430,7 +430,7 @@ void nn_count_loss(const void *dens_logits, const uint8_t *phase, int d, int h, 
    (2 x slab floats, zero; nullptr: statistics only) the logit gradient, which nn_pgrad_apply adds times lambda / sum w into gc / gs
    (16-bit gradients) and zeroes */
 void nn_pgrad_slab(const void *lc, const void *ls, const uint8_t *phase, const uint8_t *wm, int d, int h, int w, int z0, int z1, int s, const float *dist,
-                   int nd, double *sums, float *acc);   /* dist: nd (1..4) partner distances, each its own pairs */
+                   int nd, int angle, double *sums, float *acc);   /* dist: nd (1..4) partner distances, each its own pairs; angle: angular gradient only */
 void nn_pgrad_apply(void *gc, void *gs, float *acc, size_t ns, const double *sums, float lambda);
 void nn_cond_targets(const uint8_t *wind, size_t n, uint8_t *t, uint8_t *m);   /* --cond: winding mod 14 (band.h band_winding) -> 4 targets: cos / sin of 2 pi q / 14 and 2 pi q / 2 (x255, 4 planes), mask (known) */
 void nn_cond_acc(const void *lg, int lg_h16, const uint8_t *wind, size_t n, unsigned long long *cnt);   /* --cond: known / right-turn counts of the 14-turn head (cnt: 2 device u64, accumulated) */
