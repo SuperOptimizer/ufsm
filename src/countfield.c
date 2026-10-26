@@ -68,14 +68,24 @@ typedef struct {
     float *S, *G[3];
     double emin;   /* weight floor of the orientation |n . r| ramp */
     double sheet0; /* eigenvalue ratio at which the sheetness weight starts */
+    double kph, c0;   /* --phase-w kph: confident network phase gradients join the targets (weight kph x ramp(conf, c0, c0 + 0.3)) */
 } cf_pool;
+static double cf_ph(const fit_fields *f, size_t i, double *c) { const double a = (f->pc[i] - 128) / 127.0, b = (f->ps[i] - 128) / 127.0; *c = f->w[i] ? hypot(a, b) : 0; return atan2(b, a) / (2 * M_PI); }
+static double cf_wrap(double d) { return d - round(d); }
 static void cf_pool_run(void *a, long z0, long z1, int t_) {   /* solve rows zoff / P + [z0, z1) */
     cf_pool *p = a; const fit_fields *f = p->f; const size_t HW = (size_t)p->H * p->W;
     for (long Zr = z0; Zr < z1; Zr++) for (int dz = 0; dz < p->P; dz++) {
         const long Z = p->zoff / p->P + Zr; const int z = (int)Z * p->P + dz, zl = z - p->zoff; if (zl < 0) continue; if (zl >= p->nzl) break;
         const double pz = (z + 0.5) * p->h, cy = cf_axis_at(p->cy, p->na, pz), cx = cf_axis_at(p->cx, p->na, pz);
         for (int y = 0; y < p->H; y++) for (int x = 0; x < p->W; x++) {
-            const size_t i = zl * HW + (size_t)y * p->W + x; if (!f->w[i] || !f->sp[i]) continue;
+            const size_t i = zl * HW + (size_t)y * p->W + x; if (!f->w[i]) continue;
+            if (p->kph > 0 && zl > 0 && zl + 1 < p->nzl && y > 0 && y + 1 < p->H && x > 0 && x + 1 < p->W) {   /* the phase gradient (central wrapped differences) */
+                double c0v, cm, cp; const double p0 = cf_ph(f, i, &c0v); const size_t st[3] = {HW, (size_t)p->W, 1}; double gph[3], cmin = c0v;
+                for (int k = 0; k < 3; k++) { const double pm = cf_ph(f, i - st[k], &cm), pp = cf_ph(f, i + st[k], &cp); cmin = fmin(cmin, fmin(cm, cp)); gph[k] = 0.5 * (cf_wrap(pp - p0) + cf_wrap(p0 - pm)); }
+                const double cw = p->kph * cf_smooth(cmin, p->c0, p->c0 + 0.3);
+                if (cw > 0) { const size_t j = ((size_t)Z * p->hh + y / p->P) * p->w + x / p->P; p->S[j] += (float)cw; for (int k = 0; k < 3; k++) p->G[k][j] += (float)(cw * gph[k]); }
+            }
+            if (!f->sp[i]) continue;
             double v[3]; const double lr = cf_axis(f, i, v); if (lr <= 0) continue;
             double ry = (y + 0.5) * p->h - cy, rx = (x + 0.5) * p->h - cx; const double rl = hypot(ry, rx); if (rl < 1) continue; ry /= rl; rx /= rl;
             double dot = v[1] * ry + v[2] * rx; if (dot < 0) { v[0] = -v[0]; v[1] = -v[1]; v[2] = -v[2]; dot = -dot; }
@@ -361,7 +371,7 @@ static float *cf_gauge_solve(const cf_lvl *L0, float *gr, float *gi, int Rg, int
    the model's phase-gauge sums per solve cell (gr / gi) */
 typedef struct {
     const fit_fields *f; int zoff, c0;   /* the chunk (row 0 = box row zoff); the output buffers' row 0 = box row c0 */
-    const cf_lvl *L; const float *ring, *Wz, *Sfine, *cl; int zo, D, H, W, Rz, P, cmode, demod; double keep, wsc, t0, t1;
+    const cf_lvl *L; const float *ring, *Wz, *Sfine, *cl; int zo, D, H, W, Rz, P, cmode, demod, fine; double keep, wsc, t0, t1;
     uint8_t *opc, *ops, *ocl, *osp; const float *gW; float *wc, *gr, *gi; double ag[CF_MAXT][2];   /* osp / gW: --sp-w (sp from |grad W|) */
 } cf_out;
 static void cf_out_run(void *a, long Y0, long Y1, int t) {
@@ -371,7 +381,7 @@ static void cf_out_run(void *a, long Y0, long Y1, int t) {
         if (O->demod) for (int dz = -Rz; dz <= Rz; dz++) { const int zz = O->zo + dz; if (zz < 0 || zz >= O->D) continue; const float *s = O->ring + (size_t)(zz % nring) * 3 * HW; re += s[j]; im += s[HW + j]; cs += s[2 * HW + j]; }
         const size_t i = (size_t)(O->zo - O->zoff) * HW + j, io = (size_t)(O->zo - O->c0) * HW + j, si = ((size_t)(O->zo / P) * L->hh + y / P) * L->w + x / P;
         double Wo = O->Wz[j], A = 0;
-        if (O->demod && cs > 0) { A = hypot(re, im) / cs; if (hypot(re, im) > 1e-9) Wo += atan2(im, re) / (2 * M_PI); }
+        if (O->demod && cs > 0) { A = hypot(re, im) / cs; if (O->demod == 2) { const double th = atan2(im, re); Wo += (O->fine ? A * 2 * (sin(th) - sin(2 * th) / 2 + sin(3 * th) / 3) : im / cs) / (2 * M_PI); } else if (hypot(re, im) > 1e-9) Wo += atan2(im, re) / (2 * M_PI); }   /* 2 (--gauge ls): the bounded continuous A sin(arg) / 2 pi: no new dislocations */
         if (O->keep > 0 && A > 0) {   /* where the phase rotates with W (local agreement A high) it keeps its own sub-turn detail: + A^keep wrap(phi - W_out) */
             const double pcv0 = (f->pc[i] - 128) / 127.0, psv0 = (f->ps[i] - 128) / 127.0;
             if (hypot(pcv0, psv0) > 0.05) { double e = atan2(psv0, pcv0) / (2 * M_PI) - Wo; e -= round(e); Wo += pow(A, O->keep) * e; } }
@@ -430,7 +440,7 @@ static float *cf_gradW(const cf_lvl *L, const float *cy, const float *cx, int na
 int cmd_count_field(int argc, char **argv) {
     if (argc < 4) {
         fprintf(stderr, "usage: ufsm count-field <in-fields> <out-fields> [--method ls|ray] [--pool P (solve cell in field cells, 0 auto)] [--R 10 (phase demod radius, field cells; 0: W only)] [--Rz R]\n"
-                        "       [--gauge demod|ls (ls: a smooth LS-unwrapped gauge instead of the +-R demodulation; with --R 0)] [--gauge-R 5 (solve cells)] [--conf w|phase|mix|pmax] [--trust C0,C1 (phase confidence ramp: the network phase kept)] [--conf-w 1 (scale of the count confidence)] [--keep 0 (p: + A^p wrap(phi - W_out), A the local agreement)] [--sp-w 0 (1: sp from |grad W|)] [--dir 0] [--iters 400] [--lambda 1e-7] [--eps 1e-3] [--loop 8 (closing loop edge, field cells)] [--model DIR] [--model-R 8] [--rmin-um 500] [--emin 0.1] [--sheet0 0.4]\n"
+                        "       [--phase-w 0 (confident network phase gradients in the targets, weight)] [--phase-c0 0.4] [--gauge demod|ls (ls: a smooth LS-unwrapped gauge instead of the +-R demodulation; with --R 0)] [--gauge-R 5 (solve cells)] [--conf w|phase|mix|pmax] [--trust C0,C1 (phase confidence ramp: the network phase kept)] [--conf-w 1 (scale of the count confidence)] [--keep 0 (p: + A^p wrap(phi - W_out), A the local agreement)] [--sp-w 0 (1: sp from |grad W|)] [--dir 0] [--iters 400] [--lambda 1e-7] [--eps 1e-3] [--loop 8 (closing loop edge, field cells)] [--model DIR] [--model-R 8] [--rmin-um 500] [--emin 0.1] [--sheet0 0.4]\n"
                         "       [--wc 1 (0: no wc.f32)] [--mem-gb 6 (field chunk budget)] [--threads 8]\n");
         return 2;
     }
@@ -466,7 +476,7 @@ int cmd_count_field(int argc, char **argv) {
         const int z1 = z0 + CZ < D ? z0 + CZ : D; fit_fields_buf b;
         if (fit_fields_load(in, z0, z1, 1, &b)) { fprintf(stderr, "count-field: cannot load rows %d..%d of %s\n", z0, z1, in); return 1; }
         if (!z0) { recto = b.f.recto != nullptr; w4d = b.f.wd[0] ? b.f.w4_d : 0; }
-        cf_pool pp = {&b.f, z0, z1 - z0, H, W, P, lv[0].hh, lv[0].w, h, g.cy, g.cx, na, Sl[0], {Gl[0][0], Gl[0][1], Gl[0][2]}, atof(cf_opt(argc, argv, "--emin", "0.1")), atof(cf_opt(argc, argv, "--sheet0", "0.4"))};
+        cf_pool pp = {&b.f, z0, z1 - z0, H, W, P, lv[0].hh, lv[0].w, h, g.cy, g.cx, na, Sl[0], {Gl[0][0], Gl[0][1], Gl[0][2]}, atof(cf_opt(argc, argv, "--emin", "0.1")), atof(cf_opt(argc, argv, "--sheet0", "0.4")), atof(cf_opt(argc, argv, "--phase-w", "0")), atof(cf_opt(argc, argv, "--phase-c0", "0.4"))};
         cf_par((z1 - z0 + P - 1) / P, cf_pool_run, &pp);   /* (threads own whole solve rows: no shared cells) */
         if (z0 <= D / 2 && D / 2 < z1) {
             fit_cfg pc = fit_cfg_default(); pc.dir = dir; fit_model pm; memset(&pm, 0, sizeof pm);
@@ -545,7 +555,6 @@ int cmd_count_field(int argc, char **argv) {
     }
     float *gls = nullptr;
     if (!strcmp(cf_opt(argc, argv, "--gauge", "demod"), "ls")) {   /* the smooth gauge (cf_gauge_solve) instead of the demodulation */
-        if (R) { fprintf(stderr, "count-field: --gauge ls replaces the demodulation: use it with --R 0\n"); return 2; }
         float *gr2 = calloc(L->n, sizeof(float)), *gi2 = calloc(L->n, sizeof(float)); if (!gr2 || !gi2) { fprintf(stderr, "count-field: out of memory (gauge)\n"); return 1; }
         for (int z0 = 0; z0 < D; z0 += CZ) {
             const int z1 = z0 + CZ < D ? z0 + CZ : D; fit_fields_buf b; if (fit_fields_load(in, z0, z1, 1, &b)) { fprintf(stderr, "count-field: cannot load rows %d..%d of %s\n", z0, z1, in); return 1; }
@@ -605,7 +614,7 @@ int cmd_count_field(int argc, char **argv) {
     const int nring = 2 * Rz + 1; float *ring = malloc((size_t)nring * 3 * HW * sizeof(float)), *Wring = malloc((size_t)nring * HW * sizeof(float));
     float *gr = *mdir ? calloc(L->n, sizeof(float)) : nullptr, *gi = *mdir ? calloc(L->n, sizeof(float)) : nullptr;
     if (!opc || !ops || !ocl || (doc && !wc) || !ring || !Wring || (*mdir && (!gr || !gi))) { fprintf(stderr, "count-field: out of memory\n"); return 1; }
-    cf_out O = {nullptr, 0, 0, L, ring, nullptr, Sfine, cl, 0, D, H, W, Rz, P, !strcmp(cmode, "w") ? 0 : !strcmp(cmode, "phase") ? 1 : !strcmp(cmode, "pmax") ? 3 : 2, R > 0, atof(cf_opt(argc, argv, "--keep", "0")), atof(cf_opt(argc, argv, "--conf-w", "1")), tr0, tr1, opc, ops, ocl, osp, gW, wc, gr, gi, {{0}}};
+    cf_out O = {nullptr, 0, 0, L, ring, nullptr, Sfine, cl, 0, D, H, W, Rz, P, !strcmp(cmode, "w") ? 0 : !strcmp(cmode, "phase") ? 1 : !strcmp(cmode, "pmax") ? 3 : 2, R > 0 ? (gls ? 2 : 1) : 0, atoi(cf_opt(argc, argv, "--fine", "0")), atof(cf_opt(argc, argv, "--keep", "0")), atof(cf_opt(argc, argv, "--conf-w", "1")), tr0, tr1, opc, ops, ocl, osp, gW, wc, gr, gi, {{0}}};
     double resid[2][2] = {{0, 0}, {0, 0}};   /* UFSM_CF_RESID: plaquettes, residues (input, output) */
     const int olo = into ? (int)(irow[0] - ioff[0]) : 0, ohi = into ? (int)(irow[1] - ioff[0]) : D;   /* the box rows written */
     for (int b0 = olo; b0 < ohi; b0 += BZ) {
