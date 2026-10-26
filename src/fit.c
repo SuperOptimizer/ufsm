@@ -1008,6 +1008,9 @@ typedef struct {
     _Atomic uint64_t *best;               /* per root: the best outgoing edge key (0 none) */
     uint32_t *roots; size_t nroots;       /* the current roots (compact ids) */
     _Atomic size_t hooks; size_t nv;
+    int moved[64];                        /* msf_jump: per thread, a pointer changed */
+    int collect;                          /* msf_edges: also keep the edges between components (per thread), later rounds scan only those */
+    struct msf_e { uint64_t key; uint32_t cu, cv; } *el[64], *E; size_t eln[64], elc[64], ne;
 } msf_ctx;
 static inline uint32_t msf_cid(const msf_ctx *M, uint32_t id) {
     const size_t b = id >> 9; const unsigned r = id & 511, w = r >> 6, bit = r & 63;
@@ -1051,8 +1054,19 @@ static void msf_edges(void *a, int b0, int b1, int t) {   /* every edge between 
                 const unsigned bu = V[id].bk, bv = V[j].bk;
                 const uint64_t key = msf_key(bu < bv ? bu : bv, bu < bv ? bv : bu, (uint64_t)cu * 3 + ax);
                 msf_amax(&M->best[ru], key); msf_amax(&M->best[rv], key);
+                if (M->collect) {
+                    if (M->eln[t] == M->elc[t]) { M->elc[t] = M->elc[t] ? 2 * M->elc[t] : 4096; struct msf_e *n = realloc(M->el[t], M->elc[t] * sizeof *n); if (!n) { M->collect = -1; continue; } M->el[t] = n; }
+                    M->el[t][M->eln[t]++] = (struct msf_e){key, cu, cv};
+                }
             }
         }
+    }
+}
+static void msf_edges_list(void *a, int e0, int e1, int t) {   /* the collected edges: those still between two components */
+    msf_ctx *M = a;
+    for (size_t e = (size_t)e0; e < (size_t)e1; e++) {
+        const struct msf_e *E = &M->E[e]; const uint32_t ru = M->par[E->cu], rv = M->par[E->cv]; if (ru == rv) continue;
+        msf_amax(&M->best[ru], E->key); msf_amax(&M->best[rv], E->key);
     }
 }
 static inline double msf_d(const uw_vox *V, uint32_t a, uint32_t b) { return round((double)V[a].uw - (double)V[b].uw); }   /* k_b - k_a */
@@ -1074,11 +1088,12 @@ static void msf_hook(void *a, int i0, int i1, int t) {   /* each root with an ed
     atomic_fetch_add(&M->hooks, nh);
 }
 static void msf_jump(void *a, int i0, int i1, int t) {   /* one pointer-jumping step over the roots: par2 / pot2 -> par / pot (as scratch) */
-    msf_ctx *M = a;
+    msf_ctx *M = a; int mv = 0;
     for (size_t i = (size_t)i0; i < (size_t)i1; i++) {
         const uint32_t r = M->roots[i], p = M->par2[r];
-        M->par[r] = M->par2[p]; M->pot[r] = M->pot2[r] + (p != r ? M->pot2[p] : 0);
+        M->par[r] = M->par2[p]; M->pot[r] = M->pot2[r] + (p != r ? M->pot2[p] : 0); mv |= M->par2[p] != p;
     }
+    M->moved[t] = mv;
 }
 static void msf_copyback(void *a, int i0, int i1, int t) {   /* par / pot -> par2 / pot2 (the next jumping step reads them) */
     msf_ctx *M = a; for (size_t i = (size_t)i0; i < (size_t)i1; i++) { const uint32_t r = M->roots[i]; M->par2[r] = M->par[r]; M->pot2[r] = M->pot[r]; }
@@ -1104,7 +1119,22 @@ static size_t uw_msf(uw_ctx *x, size_t nr, uint32_t sid, int32_t kseed, int verb
     M.nroots = nv; int rounds = 0;
     while (M.nroots > 1) {
         for (size_t i = 0; i < M.nroots; i++) atomic_store_explicit(&M.best[M.roots[i]], 0, memory_order_relaxed);
-        fit_zpar((int)M.nb, fit_nthreads((int)M.nb), msf_edges, &M);
+        /* once under 1 / 256 of the nodes are roots: only the edges still between components (collected by that scan, filtered each round;
+           the same keys, so the same forest) */
+        const double te0 = nn_wall_seconds();
+        if (M.E) fit_zpar((int)M.ne, fit_nthreads((int)M.ne), msf_edges_list, &M);
+        else {
+            M.collect = M.nroots * 256 < M.nv;   /* (late: after round 1 the boundary edges of 7 M components were 4.6 s and 6 GB on a slab) */
+            fit_zpar((int)M.nb, fit_nthreads((int)M.nb), msf_edges, &M);
+            if (M.collect == 1) {
+                size_t ne = 0; for (int t = 0; t < 64; t++) ne += M.eln[t];
+                M.E = malloc((ne ? ne : 1) * sizeof *M.E);
+                if (M.E) { for (int t = 0; t < 64; t++) if (M.eln[t]) { memcpy(M.E + M.ne, M.el[t], M.eln[t] * sizeof *M.E); M.ne += M.eln[t]; } }
+            }
+            for (int t = 0; t < 64; t++) { free(M.el[t]); M.el[t] = nullptr; M.eln[t] = M.elc[t] = 0; }
+            M.collect = 0;
+        }
+        const double te1 = nn_wall_seconds();
         atomic_store(&M.hooks, 0);
         const int nri = (int)M.nroots, ntr = fit_nthreads(nri);
         fit_zpar(nri, ntr, msf_hook, &M);
@@ -1113,15 +1143,18 @@ static size_t uw_msf(uw_ctx *x, size_t nr, uint32_t sid, int32_t kseed, int verb
         /* pointer jumping over the roots until every root points at a final root (par2 / pot2 hold the current pointers) */
         for (int it = 0; it < 64; it++) {
             fit_zpar(nri, ntr, msf_jump, &M);
-            int moved = 0; for (size_t i = 0; i < M.nroots; i++) { const uint32_t r = M.roots[i]; if (M.par[r] != M.par2[r]) { moved = 1; break; } }
+            int moved = 0; for (int t = 0; t < ntr; t++) moved |= M.moved[t];
             fit_zpar(nri, ntr, msf_copyback, &M);
             if (!moved) break;
         }
         /* the non-roots follow their roots (roots already hold their final root and potential in par / pot = par2 / pot2) */
         fit_zpar((int)nv, fit_nthreads((int)nv), msf_relabel, &M);
         size_t k = 0; for (size_t i = 0; i < M.nroots; i++) { const uint32_t r = M.roots[i]; if (M.par[r] == r) M.roots[k++] = r; }
+        if (getenv("UFSM_FIT_TIMES")) fprintf(stderr, "fit times: msf round %d: %zu -> %zu roots, edges %.2fs, rest %.2fs\n", rounds, M.nroots, k, te1 - te0, nn_wall_seconds() - te1);
         M.nroots = k;
+        if (M.E) { size_t j = 0; for (size_t e = 0; e < M.ne; e++) if (M.par[M.E[e].cu] != M.par[M.E[e].cv]) M.E[j++] = M.E[e]; M.ne = j; }   /* (the order kept) */
     }
+    free(M.E);
     /* the integers: the seed's component, k_seed fixed */
     const uint32_t cs = msf_cid(&M, sid), R = M.par[cs]; const int32_t kR = kseed - M.pot[cs];
     size_t reached = 0, over = 0; uw_vox *V = x->V;
