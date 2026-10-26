@@ -101,8 +101,8 @@ static void gauss_row(uint64_t *s, float *row, int n) {
 }
 
 /* ---- separable 1D operators: out[i] = sum_t w[i][t] in[s[i] + t], replicate boundary ---- */
-#define MAXTAP 48
-typedef struct { int P, s[1024], n[1024]; float w[1024][MAXTAP]; } bop;
+#define MAXTAP SA_MAXTAP
+typedef scan_bop bop;
 static void bop_add(float *dense, int *lo, int *hi, int P, int j, float w) {
     j = j < 0 ? 0 : j >= P ? P - 1 : j;
     dense[j] += w; if (j < *lo) *lo = j; if (j > *hi) *hi = j;
@@ -343,53 +343,44 @@ static float *gin_buf(size_t n) {
     }
     return t->g;
 }
-unsigned scan_aug_apply(const scan_aug_cfg *c, uint64_t seed, uint8_t *ctu, uint8_t *tgt, int nch, uint8_t *ign, int P,
-                        const int64_t o[3], float *cy, float *cx, int hasax, const int chunk[3], int allow_seam, void *scratch) {
-    if (!scan_aug_enabled(c) || P < 4 || P > 1024) return 0;
+unsigned scan_aug_plan(const scan_aug_cfg *c, uint64_t seed, uint8_t *ctu, uint8_t *tgt, int nch, uint8_t *ign, int P,
+                       const int64_t o[3], float *cy, float *cx, int hasax, const int chunk[3], int allow_seam, scan_plan *p) {
+    p->on = 0; p->P = P;
+    if (!scan_aug_enabled(c) || P < 4 || P > SA_MAXP) return 0;
     const double S = c->strength;
 #define SO(i) (c->s[i] > 0 ? (double)c->s[i] : S)   /* this op's magnitude scale */
     const size_t P2 = (size_t)P * P, p3 = P2 * P;
-    uint64_t rs = seed, ns = seed ^ UINT64_C(0x5ca1ab1e0ddba11);
+    uint64_t rs = seed;
     unsigned on = 0;
     for (int i = 0; i < SA_N; i++) if (c->p[i] > 0 && uniform(&rs) < c->p[i]) on |= 1u << i;
     if (!allow_seam) on &= ~(1u << SA_SEAM);
+    p->on = on;
     if (!on) return 0;
-    float *F = scratch; uint8_t *Z = (uint8_t *)scratch + 4 * p3;   /* float CT; 1 = the output is air (0) */
-    float *tmp = malloc(2 * P2 * sizeof *tmp), *dense = calloc(P, sizeof *dense), *row = malloc(P * sizeof *row);
-    if (!tmp || !dense || !row) abort();
+    p->ns = seed ^ UINT64_C(0x5ca1ab1e0ddba11);
     double sum = 0, sq = 0; size_t nz = 0; size_t hist[256] = {0};
-    size_t k0 = 0;
-#ifdef __AVX2__
-    for (; k0 + 16 <= p3; k0 += 16) {   /* the bytes as floats, and the air flags */
-        const __m128i b = _mm_loadu_si128((const __m128i *)(ctu + k0));
-        _mm256_storeu_ps(F + k0, _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(b)));
-        _mm256_storeu_ps(F + k0 + 8, _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(b, 8))));
-        _mm_storeu_si128((__m128i *)(Z + k0), _mm_and_si128(_mm_cmpeq_epi8(b, _mm_setzero_si128()), _mm_set1_epi8(1)));
-    }
-#endif
-    for (size_t k = k0; k < p3; k++) { F[k] = ctu[k]; Z[k] = !ctu[k]; }
     for (size_t k = 0; k < p3; k += 7) hist[ctu[k]]++;   /* magnitudes only need the statistics of a subsample */
     for (int v = 1; v < 256; v++) { nz += hist[v]; sum += (double)v * hist[v]; sq += (double)v * v * hist[v]; }
     const double mean = nz ? sum / nz : 128, sd = nz ? sqrt(fmax(sq / nz - mean * mean, 1)) : 32;   /* of the material (nonzero) voxels */
-    if (on & 1u << SA_SEAM) {   /* stitched scan segments: a z slab moved in y/x, labels and axis with it */
+    p->mean = mean; p->sd = sd;
+    if (on & 1u << SA_SEAM) {   /* stitched scan segments: a z slab moved in y/x, labels and axis with it (the input bytes: vacated voxels 0 = air) */
         int zc = P / 8 + (int)(uniform(&rs) * (P - P / 4)), m = 1 + (int)lround(2 * SO(SA_SEAM)), dy, dx;
         do { dy = (int)lround(sym1(&rs) * m); dx = (int)lround(sym1(&rs) * m); } while (!dy && !dx);
-        const float f0 = 0; const uint8_t one = 1, zero = 0;
-        shift_planes(F, sizeof *F, P, zc, dy, dx, &f0, tmp);
-        shift_planes(Z, 1, P, zc, dy, dx, &one, tmp);
+        const uint8_t one = 1, zero = 0; uint8_t *tmp = malloc(P2); if (!tmp) abort();
+        shift_planes(ctu, 1, P, zc, dy, dx, &zero, tmp);
         shift_planes(ign, 1, P, zc, dy, dx, &one, tmp);
         for (int ch = 0; ch < nch; ch++) shift_planes(tgt + ch * p3, 1, P, zc, dy, dx, &zero, tmp);
         for (int z = zc; z < P; z++) { cy[z] += dy; cx[z] += dx; }
+        free(tmp);
     }
     if (on & 1u << SA_AIR) {   /* unmasked scan: air (masked to 0) becomes dim noisy material, still unsupervised */
         size_t lo = 0, k1 = nz / 100; int v1 = 1; while (v1 < 255 && lo + hist[v1] <= k1) lo += hist[v1++];
-        float level = (float)(v1 * (.4 + .6 * uniform(&rs)));
-        for (size_t k = 0; k < p3; k++) if (Z[k]) { F[k] = level; Z[k] = 0; ign[k] = 1; }
+        p->air_level = (float)(v1 * (.4 + .6 * uniform(&rs)));
+        for (size_t k = 0; k < p3; k++) if (!ctu[k]) ign[k] = 1;
     }
     /* resolution: PSF blur or phase-contrast sharpening, then a coarser sampling grid, per axis */
+    p->bop_on[0] = p->bop_on[1] = p->bop_on[2] = 0;
     if (on & (1u << SA_LOWRES | 1u << SA_BLUR | 1u << SA_SHARPEN | 1u << SA_MOTION)) {
-        bop *op = malloc(5 * sizeof *op); if (!op) abort();   /* op[0..2] composing; op[3], op[4]: axes 1 and 2, applied together after */
-        int on_yx[3] = {0, 0, 0};
+        bop *op = malloc(3 * sizeof *op); float *dense = calloc(P, sizeof *dense); if (!op || !dense) abort();
         int iso = uniform(&rs) < .5;
         const double SL = SO(SA_LOWRES), SB = SO(SA_BLUR), SS = SO(SA_SHARPEN);
         double f0 = 1 + uniform(&rs) * 1.5 * SL, sb0 = .3 + uniform(&rs) * .7 * SB, sa0 = .15 + uniform(&rs) * .3 * SS;
@@ -413,15 +404,160 @@ unsigned scan_aug_apply(const scan_aug_cfg *c, uint64_t seed, uint8_t *ctu, uint
             if (d == maxis && (mmode || mne)) { bop_motion(&op[1], P, mmode, mne, mt, mw, mL, dense); bop_compose(&op[2], &op[1], &op[0], dense); op[0] = op[2]; }
             if (on & 1u << SA_LOWRES && f > 1.01) { bop_lowres(&op[1], P, f, phase, dense); bop_compose(&op[2], &op[1], &op[0], dense); op[0] = op[2]; }
             if (bop_is_identity(&op[0])) continue;
-            if (d == 0) bop_apply(F, P, 0, &op[0], tmp);
-            else { op[2 + d] = op[0]; on_yx[d] = 1; }
+            p->bop[d] = op[0]; p->bop_on[d] = 1;
         }
-        bop_apply_yx(F, P, on_yx[1] ? &op[3] : nullptr, on_yx[2] ? &op[4] : nullptr, tmp);   /* (the draws are all above: same stream) */
-        free(op);
+        free(op); free(dense);
     }
     if (on & 1u << SA_BIAS) {   /* smooth multiplicative field: exp(N(0, b)) on a 3..5 grid, linearly interpolated */
         int g = 3 + (int)(uniform(&rs) * 3); double b = (.08 + .12 * uniform(&rs)) * SO(SA_BIAS);
-        float G[125]; for (int k = 0; k < g * g * g; k++) G[k] = (float)exp(b * sym1(&rs) * 1.7320508);
+        p->bias_g = g; for (int k = 0; k < g * g * g; k++) p->bias_G[k] = (float)exp(b * sym1(&rs) * 1.7320508);
+    }
+    if (on & (1u << SA_RING | 1u << SA_CUPPING)) {   /* radial profile about the scan axis: rings + cupping */
+        float *ccy = p->ccy, *ccx = p->ccx;
+        if (hasax) for (int z = 0; z < P; z++) { ccy[z] = cy[z] - (float)o[1]; ccx[z] = cx[z] - (float)o[2]; }
+        else { double t = 2 * M_PI * uniform(&rs), D = P * (1 + 3 * uniform(&rs)); for (int z = 0; z < P; z++) { ccy[z] = (float)(.5 * P + D * sin(t)); ccx[z] = (float)(.5 * P + D * cos(t)); } }
+        float rmin = INFINITY, rmax = 0;
+        for (int z = 0; z < P; z++) {
+            float dy = fmaxf(0, fmaxf(-ccy[z], ccy[z] - (P - 1))), dx = fmaxf(0, fmaxf(-ccx[z], ccx[z] - (P - 1)));
+            float fy = fmaxf(fabsf(ccy[z]), fabsf(ccy[z] - (P - 1))), fx = fmaxf(fabsf(ccx[z]), fabsf(ccx[z] - (P - 1)));
+            rmin = fminf(rmin, sqrtf(dy * dy + dx * dx)); rmax = fmaxf(rmax, sqrtf(fy * fy + fx * fx));
+        }
+        const float res = 4; int nt = (int)((rmax - rmin) * res) + 3;
+        if (nt > SA_MAXTAB) { fprintf(stderr, "scan_aug: radial table of %d entries (> %d)\n", nt, SA_MAXTAB); abort(); }
+        float *tab = p->tab; memset(tab, 0, (size_t)nt * sizeof *tab);
+        p->rmin = rmin; p->res = res; p->nt = nt;
+        if (on & 1u << SA_RING) {
+            int nr = 3 + (int)fmin(512, (rmax - rmin) * (.02 + .1 * uniform(&rs)) * SO(SA_RING));   /* dense: one per miscalibrated detector column */ double amp = (.05 + .15 * uniform(&rs)) * SO(SA_RING) * sd;
+            for (int i = 0; i < nr; i++) {
+                double r0 = rmin + uniform(&rs) * (rmax - rmin), w = .4 + 1.1 * uniform(&rs), a = amp * sym1(&rs) * 1.7320508;
+                for (int t = (int)fmax(0, (r0 - 4 * w - rmin) * res); t < nt && rmin + t / res < r0 + 4 * w; t++) { double d = (rmin + t / res - r0) / w; tab[t] += (float)(a * exp(-.5 * d * d)); }
+            }
+        }
+        if (on & 1u << SA_CUPPING) {   /* beam hardening: a smooth radial bowl, here its local quadratic over the patch */
+            double a = (.1 + .3 * uniform(&rs)) * SO(SA_CUPPING) * sd * (uniform(&rs) < .5 ? -1 : 1), lin = sym1(&rs);
+            for (int t = 0; t < nt; t++) { double u = 2 * (t / res) / fmax(rmax - rmin, 1) - 1; tab[t] += (float)(a * (u * u + lin * u)); }
+        }
+    }
+    if (on & 1u << SA_SLICE) {   /* per-slice gain/offset along the scan axis (beam current / detector drift), AR(1) in z */
+        double rho = .9 * uniform(&rs), q = sqrt(1 - rho * rho), ga = .03 * SO(SA_SLICE), oa = .08 * SO(SA_SLICE) * sd, gz = 0, oz = 0;
+        for (int z = 0; z < P; z++) {
+            gz = z ? rho * gz + q * sym1(&rs) * 1.7320508 : sym1(&rs) * 1.7320508; oz = z ? rho * oz + q * sym1(&rs) * 1.7320508 : sym1(&rs) * 1.7320508;
+            p->slice_gain[z] = (float)exp(ga * gz); p->slice_off[z] = (float)(oa * oz);
+        }
+    }
+    if (on & 1u << SA_NOISE) {   /* white noise, partly signal-dependent (sigma ~ sqrt(value)) */
+        p->noise_s0 = (float)((.05 + .2 * uniform(&rs)) * SO(SA_NOISE) * sd); p->noise_mix = (float)uniform(&rs); p->noise_im = (float)(1 / mean);
+    }
+    if (on & 1u << SA_CNOISE) {   /* correlated noise: unit-variance AR(1) along x, y, z (ct_augment's generator) */
+        p->cnoise_rho = (float)(.5 + .35 * uniform(&rs));
+        p->cnoise_s0 = (float)((.05 + .15 * uniform(&rs)) * SO(SA_CNOISE) * sd);
+    }
+    if (on & 1u << SA_PAGANIN) {   /* phase-retrieval-like low-pass after the noise: per axis exp(-|t| / lambda) */
+        const double lam = (.4 + 1.2 * uniform(&rs)) * SO(SA_PAGANIN); p->pag_a = (float)exp(-1 / fmax(lam, .05));
+    }
+    if (on & 1u << SA_GIN) {   /* random shallow conv net (GIN-style), positive-biased centre taps keep the structure */
+        const int C = 2 + (int)(uniform(&rs) * 3), k = uniform(&rs) < .5 ? 1 : 3, kk = k * k * k;
+        p->gin_C = C; p->gin_k = k;
+        for (int ch = 0; ch < C; ch++) {
+            for (int t = 0; t < kk; t++) p->gin_w1[ch][t] = (float)(sym1(&rs) * 1.7320508 / sqrt(kk));
+            p->gin_w1[ch][kk / 2] += 1.f; p->gin_b1[ch] = (float)(.5 * sym1(&rs)); p->gin_w2[ch] = (float)(.2 + fabs(sym1(&rs)));
+        }
+        p->gin_alpha = fmin(1, (.3 + .7 * uniform(&rs)) * SO(SA_GIN));
+    }
+    float *lut = p->lut; p->tone = 0;
+    for (int i = 0; i < 257; i++) lut[i] = (float)(i < 256 ? i : 255);
+    if (on & 1u << SA_TONE) {   /* reconstruction / conversion to 8 bits: gamma, random monotone remap, narrower window */
+        const double ST = SO(SA_TONE); double g = exp(sym1(&rs) * .35 * ST), kn[6] = {0}, inc[5], tot = 0;
+        for (int i = 0; i < 5; i++) tot += inc[i] = exp(sym1(&rs) * .5 * ST);
+        for (int i = 0; i < 5; i++) kn[i + 1] = kn[i] + 255 * inc[i] / tot;
+        double lo = 0, hi = 255;
+        if (uniform(&rs) < .5) { lo = fmax(0, mean - sd * (4 - 1.25 * ST * uniform(&rs))); hi = fmin(255, mean + sd * (4 - 1.25 * ST * uniform(&rs))); }
+        for (int i = 0; i < 256; i++) {
+            double v = 255 * pow(i / 255., g), u = v / 51; int j = (int)u; if (j > 4) j = 4;
+            v = kn[j] + (u - j) * (kn[j + 1] - kn[j]);
+            lut[i] = (float)(255 * fmin(1, fmax(0, (v - lo) / fmax(hi - lo, 1))));
+        }
+        lut[256] = lut[255]; p->tone = 1;
+    }
+    p->step = 0;
+    if (on & 1u << SA_QUANT) { int drop = 1 + (int)(uniform(&rs) * 2 * SO(SA_QUANT)); if (drop > 4) drop = 4; p->step = (float)(1 << drop); }
+    p->ndrop = 0;
+    if (on & 1u << SA_DROPSLICE) {   /* missing / corrupt reconstructed slices: repeated neighbour, constant or pure noise */
+        int n = 1 + (int)(uniform(&rs) * 2 * SO(SA_DROPSLICE));
+        if (n > SA_MAXBOX) abort();   /* (n <= 5 for strength <= 2) */
+        for (int i = 0; i < n; i++) {
+            int z = (int)(uniform(&rs) * P), mode = (int)(uniform(&rs) * 3);
+            p->drop_z[i] = z; p->drop_mode[i] = mode;
+            if (c->drop_ignore) memset(ign + z * P2, 1, P2);
+        }
+        p->ndrop = n;
+    }
+    p->ncut = 0;
+    if (on & 1u << SA_CUTOUT) {   /* occlusion: boxes of constant or noise */
+        int n = 1 + (int)(uniform(&rs) * 2 * SO(SA_CUTOUT));
+        if (n > SA_MAXBOX) abort();
+        for (int i = 0; i < n; i++) {
+            int *b0 = p->cut_b0[i], *b1 = p->cut_b1[i], noisy = uniform(&rs) < .5;
+            for (int d = 0; d < 3; d++) { int e = P / 16 + (int)(uniform(&rs) * P / 8 * SO(SA_CUTOUT)); if (e > P / 2) e = P / 2; b0[d] = (int)(uniform(&rs) * (P - e)); b1[d] = b0[d] + e; }
+            p->cut_noisy[i] = noisy;
+            if (c->drop_ignore) for (int z = b0[0]; z < b1[0]; z++) for (int y = b0[1]; y < b1[1]; y++) memset(ign + z * P2 + (size_t)y * P + b0[2], 1, b1[2] - b0[2]);
+        }
+        p->ncut = n;
+    }
+    p->nchunk = 0;
+    if (on & 1u << SA_CHUNK) {   /* missing zarr chunks read as the fill value 0: unsupervised through the CT > 0 mask */
+        int n = 1 + (int)(uniform(&rs) * 2 * SO(SA_CHUNK)), e[3];
+        if (n > SA_MAXBOX) abort();
+        for (int d = 0; d < 3; d++) { e[d] = chunk[d] > 0 && chunk[d] <= P / 2 ? chunk[d] : P / 4; if (e[d] < 1) e[d] = 1; }
+        for (int i = 0; i < n; i++) {
+            int *b0 = p->chunk_b0[i], *b1 = p->chunk_b1[i];
+            for (int d = 0; d < 3; d++) {   /* a chunk-grid cell (global grid) that meets the patch */
+                int64_t g0 = (o[d] / e[d]) * e[d], cells = (o[d] + P - 1) / e[d] - o[d] / e[d] + 1, a = g0 + (int64_t)(uniform(&rs) * cells) * e[d] - o[d];
+                b0[d] = a < 0 ? 0 : (int)a; b1[d] = a + e[d] > P ? P : (int)(a + e[d]);
+            }
+        }
+        p->nchunk = n;
+    }
+    p->hist_on = (on & 1u << SA_HIST) && c->nhist > 0;
+    if (p->hist_on) {   /* the window's material histogram onto a target scan's (quantile mapping), blended */
+        const float *ct = c->hist + (size_t)(uniform(&rs) * c->nhist) * 256; p->hist_alpha = fmin(1, (.5 + .5 * uniform(&rs)) * SO(SA_HIST));
+        memcpy(p->hist_ct, ct, sizeof p->hist_ct);
+    }
+#undef SO
+    return on;
+}
+void scan_plan_air(const scan_plan *p, const uint8_t *ctu, uint8_t *air) {
+    const int P = p->P; const size_t P2 = (size_t)P * P, p3 = P2 * P;
+    if (p->on & 1u << SA_AIR) memset(air, 0, p3); else for (size_t k = 0; k < p3; k++) air[k] = !ctu[k];
+    for (int i = 0; i < p->nchunk; i++) {
+        const int *b0 = p->chunk_b0[i], *b1 = p->chunk_b1[i];
+        for (int z = b0[0]; z < b1[0]; z++) for (int y = b0[1]; y < b1[1]; y++) memset(air + z * P2 + (size_t)y * P + b0[2], 1, b1[2] - b0[2]);
+    }
+}
+void scan_aug_exec(const scan_plan *p, uint8_t *ctu, void *scratch) {
+    const unsigned on = p->on;
+    if (!on) return;
+    const int P = p->P; const size_t P2 = (size_t)P * P, p3 = P2 * P;
+    const double mean = p->mean, sd = p->sd;
+    uint64_t ns = p->ns;
+    float *F = scratch; uint8_t *Z = (uint8_t *)scratch + 4 * p3;   /* float CT; 1 = the output is air (0) */
+    float *tmp = malloc(2 * P2 * sizeof *tmp), *row = malloc(P * sizeof *row);
+    if (!tmp || !row) abort();
+    size_t k0 = 0;
+#ifdef __AVX2__
+    for (; k0 + 16 <= p3; k0 += 16) {   /* the bytes as floats, and the air flags */
+        const __m128i b = _mm_loadu_si128((const __m128i *)(ctu + k0));
+        _mm256_storeu_ps(F + k0, _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(b)));
+        _mm256_storeu_ps(F + k0 + 8, _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(b, 8))));
+        _mm_storeu_si128((__m128i *)(Z + k0), _mm_and_si128(_mm_cmpeq_epi8(b, _mm_setzero_si128()), _mm_set1_epi8(1)));
+    }
+#endif
+    for (size_t k = k0; k < p3; k++) { F[k] = ctu[k]; Z[k] = !ctu[k]; }
+    if (on & 1u << SA_AIR) { const float level = p->air_level; for (size_t k = 0; k < p3; k++) if (Z[k]) { F[k] = level; Z[k] = 0; } }
+    if (p->bop_on[0]) bop_apply(F, P, 0, &p->bop[0], tmp);
+    bop_apply_yx(F, P, p->bop_on[1] ? &p->bop[1] : nullptr, p->bop_on[2] ? &p->bop[2] : nullptr, tmp);
+    if (on & 1u << SA_BIAS) {   /* smooth multiplicative field: exp(N(0, b)) on a 3..5 grid, linearly interpolated */
+        const int g = p->bias_g; const float *G = p->bias_G;
         int *ix = malloc(P * sizeof *ix); float *wx = malloc(P * sizeof *wx), crow[5]; if (!ix || !wx) abort();
         const float sc = (float)(g - 1) / (float)(P - 1);
         for (int x = 0; x < P; x++) { float u = x * sc; int i = (int)u; if (i > g - 2) i = g - 2; ix[x] = i; wx[x] = u - i; }
@@ -437,28 +573,7 @@ unsigned scan_aug_apply(const scan_aug_cfg *c, uint64_t seed, uint8_t *ctu, uint
         free(ix); free(wx);
     }
     if (on & (1u << SA_RING | 1u << SA_CUPPING)) {   /* radial profile about the scan axis: rings + cupping */
-        float ccy[1024], ccx[1024];
-        if (hasax) for (int z = 0; z < P; z++) { ccy[z] = cy[z] - (float)o[1]; ccx[z] = cx[z] - (float)o[2]; }
-        else { double t = 2 * M_PI * uniform(&rs), D = P * (1 + 3 * uniform(&rs)); for (int z = 0; z < P; z++) { ccy[z] = (float)(.5 * P + D * sin(t)); ccx[z] = (float)(.5 * P + D * cos(t)); } }
-        float rmin = INFINITY, rmax = 0;
-        for (int z = 0; z < P; z++) {
-            float dy = fmaxf(0, fmaxf(-ccy[z], ccy[z] - (P - 1))), dx = fmaxf(0, fmaxf(-ccx[z], ccx[z] - (P - 1)));
-            float fy = fmaxf(fabsf(ccy[z]), fabsf(ccy[z] - (P - 1))), fx = fmaxf(fabsf(ccx[z]), fabsf(ccx[z] - (P - 1)));
-            rmin = fminf(rmin, sqrtf(dy * dy + dx * dx)); rmax = fmaxf(rmax, sqrtf(fy * fy + fx * fx));
-        }
-        const float res = 4; int nt = (int)((rmax - rmin) * res) + 3;
-        float *tab = calloc(nt, sizeof *tab); if (!tab) abort();
-        if (on & 1u << SA_RING) {
-            int nr = 3 + (int)fmin(512, (rmax - rmin) * (.02 + .1 * uniform(&rs)) * SO(SA_RING));   /* dense: one per miscalibrated detector column */ double amp = (.05 + .15 * uniform(&rs)) * SO(SA_RING) * sd;
-            for (int i = 0; i < nr; i++) {
-                double r0 = rmin + uniform(&rs) * (rmax - rmin), w = .4 + 1.1 * uniform(&rs), a = amp * sym1(&rs) * 1.7320508;
-                for (int t = (int)fmax(0, (r0 - 4 * w - rmin) * res); t < nt && rmin + t / res < r0 + 4 * w; t++) { double d = (rmin + t / res - r0) / w; tab[t] += (float)(a * exp(-.5 * d * d)); }
-            }
-        }
-        if (on & 1u << SA_CUPPING) {   /* beam hardening: a smooth radial bowl, here its local quadratic over the patch */
-            double a = (.1 + .3 * uniform(&rs)) * SO(SA_CUPPING) * sd * (uniform(&rs) < .5 ? -1 : 1), lin = sym1(&rs);
-            for (int t = 0; t < nt; t++) { double u = 2 * (t / res) / fmax(rmax - rmin, 1) - 1; tab[t] += (float)(a * (u * u + lin * u)); }
-        }
+        const float *ccy = p->ccy, *ccx = p->ccx, *tab = p->tab, rmin = p->rmin, res = p->res; const int nt = p->nt;
         for (int z = 0; z < P; z++) for (int y = 0; y < P; y++) {
             float *r = F + z * P2 + (size_t)y * P, dy = y - ccy[z];
             int x = 0;
@@ -484,26 +599,21 @@ unsigned scan_aug_apply(const scan_aug_cfg *c, uint64_t seed, uint8_t *ctu, uint
                 int i = (int)u; r[x] += tab[i] + (u - i) * (tab[i + 1] - tab[i]);
             }
         }
-        free(tab);
     }
-    if (on & 1u << SA_SLICE) {   /* per-slice gain/offset along the scan axis (beam current / detector drift), AR(1) in z */
-        double rho = .9 * uniform(&rs), q = sqrt(1 - rho * rho), ga = .03 * SO(SA_SLICE), oa = .08 * SO(SA_SLICE) * sd, gz = 0, oz = 0;
-        for (int z = 0; z < P; z++) {
-            gz = z ? rho * gz + q * sym1(&rs) * 1.7320508 : sym1(&rs) * 1.7320508; oz = z ? rho * oz + q * sym1(&rs) * 1.7320508 : sym1(&rs) * 1.7320508;
-            const float gain = (float)exp(ga * gz), off = (float)(oa * oz); float *pl = F + z * P2;
-            for (size_t k = 0; k < P2; k++) pl[k] = pl[k] * gain + off;
-        }
+    if (on & 1u << SA_SLICE) for (int z = 0; z < P; z++) {   /* per-slice gain/offset along the scan axis */
+        const float gain = p->slice_gain[z], off = p->slice_off[z]; float *pl = F + z * P2;
+        for (size_t k = 0; k < P2; k++) pl[k] = pl[k] * gain + off;
     }
     if (on & 1u << SA_NOISE) {   /* white noise, partly signal-dependent (sigma ~ sqrt(value)) */
-        const float s0 = (float)((.05 + .2 * uniform(&rs)) * SO(SA_NOISE) * sd), mix = (float)uniform(&rs), im = (float)(1 / mean);
+        const float s0 = p->noise_s0, mix = p->noise_mix, im = p->noise_im;
         for (size_t r = 0; r < P2; r++) {
             float *v = F + r * P; gauss_row(&ns, row, P);
             for (int x = 0; x < P; x++) v[x] += s0 * row[x] * ((1 - mix) + mix * sqrtf(fmax_c(v[x], 0) * im));
         }
     }
     if (on & 1u << SA_CNOISE) {   /* correlated noise: unit-variance AR(1) along x, y, z (ct_augment's generator) */
-        ct_aug_plan q; memset(&q, 0, sizeof q); q.noise_rho = (float)(.5 + .35 * uniform(&rs));
-        const float s0 = (float)((.05 + .15 * uniform(&rs)) * SO(SA_CNOISE) * sd);
+        ct_aug_plan q; memset(&q, 0, sizeof q); q.noise_rho = p->cnoise_rho;
+        const float s0 = p->cnoise_s0;
         float *prow = malloc(P * sizeof *prow), *pplane = malloc(P2 * sizeof *pplane); if (!prow || !pplane) abort();
         for (int z = 0; z < P; z++) for (int y = 0; y < P; y++) {
             gauss_row(&ns, row, P); ct_aug_noise_row(&q, row, prow, pplane, P, z, y);
@@ -511,80 +621,38 @@ unsigned scan_aug_apply(const scan_aug_cfg *c, uint64_t seed, uint8_t *ctu, uint
         }
         free(prow); free(pplane);
     }
-    if (on & 1u << SA_PAGANIN) {   /* phase-retrieval-like low-pass after the noise: per axis exp(-|t| / lambda) */
-        const double lam = (.4 + 1.2 * uniform(&rs)) * SO(SA_PAGANIN); const float a = (float)exp(-1 / fmax(lam, .05));
-        exp_smooth(F, P, 0, a, row, tmp); exp_smooth_yx(F, P, a, row, tmp);
-    }
-    if (on & 1u << SA_GIN) {   /* random shallow conv net (GIN-style), positive-biased centre taps keep the structure */
-        const int C = 2 + (int)(uniform(&rs) * 3), k = uniform(&rs) < .5 ? 1 : 3, r = k / 2, kk = k * k * k;
-        float w1[4][27], b1[4], w2[4];
-        for (int ch = 0; ch < C; ch++) {
-            for (int t = 0; t < kk; t++) w1[ch][t] = (float)(sym1(&rs) * 1.7320508 / sqrt(kk));
-            w1[ch][kk / 2] += 1.f; b1[ch] = (float)(.5 * sym1(&rs)); w2[ch] = (float)(.2 + fabs(sym1(&rs)));
-        }
-        const double alpha = fmin(1, (.3 + .7 * uniform(&rs)) * SO(SA_GIN));
+    if (on & 1u << SA_PAGANIN) { const float a = p->pag_a; exp_smooth(F, P, 0, a, row, tmp); exp_smooth_yx(F, P, a, row, tmp); }
+    if (on & 1u << SA_GIN) {   /* random shallow conv net (GIN-style) */
+        const double alpha = p->gin_alpha;
         float *G = gin_buf(p3);   /* (P^3 floats kept per thread: a fresh 512 MB at P512 was faulted in and unmapped per use) */
         const float im = (float)mean, is = (float)(1 / sd);
         double g1 = 0, g2 = 0; size_t gn = 0;
-        gin_eval(F, Z, P, C, k, w1, b1, w2, im, is, G, &g1, &g2, &gn);
+        gin_eval(F, Z, P, p->gin_C, p->gin_k, p->gin_w1, p->gin_b1, p->gin_w2, im, is, G, &g1, &g2, &gn);
         const double gm = gn ? g1 / gn : 0, gs = gn ? sqrt(fmax(g2 / gn - gm * gm, 1e-12)) : 1;
         for (size_t i = 0; i < p3; i++) F[i] = (float)(alpha * (mean + sd * (G[i] - gm) / gs) + (1 - alpha) * F[i]);
     }
-    float lut[257]; int tone = 0;
-    for (int i = 0; i < 257; i++) lut[i] = (float)(i < 256 ? i : 255);
-    if (on & 1u << SA_TONE) {   /* reconstruction / conversion to 8 bits: gamma, random monotone remap, narrower window */
-        const double ST = SO(SA_TONE); double g = exp(sym1(&rs) * .35 * ST), kn[6] = {0}, inc[5], tot = 0;
-        for (int i = 0; i < 5; i++) tot += inc[i] = exp(sym1(&rs) * .5 * ST);
-        for (int i = 0; i < 5; i++) kn[i + 1] = kn[i] + 255 * inc[i] / tot;
-        double lo = 0, hi = 255;
-        if (uniform(&rs) < .5) { lo = fmax(0, mean - sd * (4 - 1.25 * ST * uniform(&rs))); hi = fmin(255, mean + sd * (4 - 1.25 * ST * uniform(&rs))); }
-        for (int i = 0; i < 256; i++) {
-            double v = 255 * pow(i / 255., g), u = v / 51; int j = (int)u; if (j > 4) j = 4;
-            v = kn[j] + (u - j) * (kn[j + 1] - kn[j]);
-            lut[i] = (float)(255 * fmin(1, fmax(0, (v - lo) / fmax(hi - lo, 1))));
-        }
-        lut[256] = lut[255]; tone = 1;
+    const float *lut = p->lut; const int tone = p->tone; const float step = p->step;
+    for (int i = 0; i < p->ndrop; i++) {   /* missing / corrupt reconstructed slices: repeated neighbour, constant or pure noise */
+        const int z = p->drop_z[i], mode = p->drop_mode[i]; float *pl = F + z * P2;
+        if (mode == 0) memcpy(pl, F + (size_t)(z ? z - 1 : 1) * P2, P2 * sizeof *pl);
+        else for (int r = 0; r < P; r++) { gauss_row(&ns, row, P); for (int x = 0; x < P; x++) pl[(size_t)r * P + x] = (float)(mean + (mode == 2 ? 1.5 * sd * row[x] : 0)); }
     }
-    float step = 0;
-    if (on & 1u << SA_QUANT) { int drop = 1 + (int)(uniform(&rs) * 2 * SO(SA_QUANT)); if (drop > 4) drop = 4; step = (float)(1 << drop); }
-    if (on & 1u << SA_DROPSLICE) {   /* missing / corrupt reconstructed slices: repeated neighbour, constant or pure noise */
-        int n = 1 + (int)(uniform(&rs) * 2 * SO(SA_DROPSLICE));
-        for (int i = 0; i < n; i++) {
-            int z = (int)(uniform(&rs) * P), mode = (int)(uniform(&rs) * 3); float *pl = F + z * P2;
-            if (mode == 0) memcpy(pl, F + (size_t)(z ? z - 1 : 1) * P2, P2 * sizeof *pl);
-            else for (int r = 0; r < P; r++) { gauss_row(&ns, row, P); for (int x = 0; x < P; x++) pl[(size_t)r * P + x] = (float)(mean + (mode == 2 ? 1.5 * sd * row[x] : 0)); }
-            if (c->drop_ignore) memset(ign + z * P2, 1, P2);
+    for (int i = 0; i < p->ncut; i++) {   /* occlusion: boxes of constant or noise */
+        const int *b0 = p->cut_b0[i], *b1 = p->cut_b1[i], noisy = p->cut_noisy[i];
+        for (int z = b0[0]; z < b1[0]; z++) for (int y = b0[1]; y < b1[1]; y++) {
+            float *v = F + z * P2 + (size_t)y * P;
+            if (noisy) gauss_row(&ns, row, P);
+            for (int x = b0[2]; x < b1[2]; x++) v[x] = (float)(mean + (noisy ? sd * row[x] : 0));
         }
     }
-    if (on & 1u << SA_CUTOUT) {   /* occlusion: boxes of constant or noise */
-        int n = 1 + (int)(uniform(&rs) * 2 * SO(SA_CUTOUT));
-        for (int i = 0; i < n; i++) {
-            int b0[3], b1[3], noisy = uniform(&rs) < .5;
-            for (int d = 0; d < 3; d++) { int e = P / 16 + (int)(uniform(&rs) * P / 8 * SO(SA_CUTOUT)); if (e > P / 2) e = P / 2; b0[d] = (int)(uniform(&rs) * (P - e)); b1[d] = b0[d] + e; }
-            for (int z = b0[0]; z < b1[0]; z++) for (int y = b0[1]; y < b1[1]; y++) {
-                float *v = F + z * P2 + (size_t)y * P;
-                if (noisy) gauss_row(&ns, row, P);
-                for (int x = b0[2]; x < b1[2]; x++) v[x] = (float)(mean + (noisy ? sd * row[x] : 0));
-                if (c->drop_ignore) memset(ign + z * P2 + (size_t)y * P + b0[2], 1, b1[2] - b0[2]);
-            }
-        }
+    for (int i = 0; i < p->nchunk; i++) {   /* missing zarr chunks read as the fill value 0 */
+        const int *b0 = p->chunk_b0[i], *b1 = p->chunk_b1[i];
+        for (int z = b0[0]; z < b1[0]; z++) for (int y = b0[1]; y < b1[1]; y++) memset(Z + z * P2 + (size_t)y * P + b0[2], 1, b1[2] - b0[2]);
     }
-    if (on & 1u << SA_CHUNK) {   /* missing zarr chunks read as the fill value 0: unsupervised through the CT > 0 mask */
-        int n = 1 + (int)(uniform(&rs) * 2 * SO(SA_CHUNK)), e[3];
-        for (int d = 0; d < 3; d++) { e[d] = chunk[d] > 0 && chunk[d] <= P / 2 ? chunk[d] : P / 4; if (e[d] < 1) e[d] = 1; }
-        for (int i = 0; i < n; i++) {
-            int b0[3], b1[3];
-            for (int d = 0; d < 3; d++) {   /* a chunk-grid cell (global grid) that meets the patch */
-                int64_t g0 = (o[d] / e[d]) * e[d], cells = (o[d] + P - 1) / e[d] - o[d] / e[d] + 1, a = g0 + (int64_t)(uniform(&rs) * cells) * e[d] - o[d];
-                b0[d] = a < 0 ? 0 : (int)a; b1[d] = a + e[d] > P ? P : (int)(a + e[d]);
-            }
-            for (int z = b0[0]; z < b1[0]; z++) for (int y = b0[1]; y < b1[1]; y++) memset(Z + z * P2 + (size_t)y * P + b0[2], 1, b1[2] - b0[2]);
-        }
-    }
-    const int hist_on = (on & 1u << SA_HIST) && c->nhist > 0;
+    const int hist_on = p->hist_on;
     if (tone && hist_on) for (size_t k = 0; k < p3; k++) { float v = fmin_c(fmax_c(F[k], 0), 255); int i = (int)v; F[k] = lut[i] + (v - i) * (lut[i + 1] - lut[i]); }
     if (hist_on) {   /* the window's material histogram onto a target scan's (quantile mapping), blended */
-        const float *ct = c->hist + (size_t)(uniform(&rs) * c->nhist) * 256; const double alpha = fmin(1, (.5 + .5 * uniform(&rs)) * SO(SA_HIST));
+        const float *ct = p->hist_ct; const double alpha = p->hist_alpha;
         double hw[257] = {0}, nw = 0;
         for (size_t k = 0; k < p3; k += 7) if (!Z[k]) { float v = fmin_c(fmax_c(F[k], 1), 255); hw[(int)v] += 1; nw++; }
         if (nw > 0) {
@@ -636,6 +704,14 @@ unsigned scan_aug_apply(const scan_aug_cfg *c, uint64_t seed, uint8_t *ctu, uint
         if (step > 0) f = (floorf(f * is) + .5f) * step;
         const float v = fmin_c(fmax_c(f + .5f, 1), 255.5f); const uint8_t q = (uint8_t)(int)v; ctu[k] = Z[k] ? 0 : q;
     }
-    free(tmp); free(dense); free(row);
+    free(tmp); free(row);
+}
+unsigned scan_aug_apply(const scan_aug_cfg *c, uint64_t seed, uint8_t *ctu, uint8_t *tgt, int nch, uint8_t *ign, int P,
+                        const int64_t o[3], float *cy, float *cx, int hasax, const int chunk[3], int allow_seam, void *scratch) {
+    if (!scan_aug_enabled(c) || P < 4 || P > SA_MAXP) return 0;
+    scan_plan *p = malloc(sizeof *p); if (!p) abort();
+    const unsigned on = scan_aug_plan(c, seed, ctu, tgt, nch, ign, P, o, cy, cx, hasax, chunk, allow_seam, p);
+    if (on) scan_aug_exec(p, ctu, scratch);
+    free(p);
     return on;
 }

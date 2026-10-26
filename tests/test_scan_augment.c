@@ -236,6 +236,26 @@ int main(void) {
         }
         CHECK(!bad, "vectorised paganin / GIN equal the per-line / per-voxel loops");
     }
+    {   /* scan_aug_plan + scan_aug_exec = scan_aug_apply (bytes, labels, ignore, axis), and scan_plan_air is the output's zero set
+           (what the --gpu-aug sampler builds its masks from before the GPU runs the float ops) */
+        scan_plan *pl = malloc(sizeof *pl); uint8_t *air = malloc(N); int bad_same = 0, bad_air = 0, nair = 0;
+        for (int op = -1; op < SA_N; op++) for (uint64_t seed = 0; seed < 6; seed++) {
+            scan_aug_cfg c = one(op, seed % 3 == 2 ? 2.f : 1.f);
+            if (op < 0) for (int i = 0; i < SA_N; i++) c.p[i] = .5f;   /* (mixtures) */
+            c.drop_ignore = (int)(seed & 1);
+            fill(&v0, 1, 0); v1 = v0; v2 = v0;
+            run(&c, 900 + seed * 41 + (uint64_t)op, &v1, (int)(seed & 1), 1);
+            const unsigned on = scan_aug_plan(&c, 900 + seed * 41 + (uint64_t)op, v2.ct, v2.tgt, NCHT, v2.ign, P, O, v2.cy, v2.cx, (int)(seed & 1), CHUNK, 1, pl);
+            if (on) scan_plan_air(pl, v2.ct, air);
+            if (on) scan_aug_exec(pl, v2.ct, scratch);
+            bad_same += !same(&v1, &v2);
+            if (on) for (size_t k = 0; k < N; k++) { bad_air += (v2.ct[k] == 0) != (air[k] != 0); nair += air[k] != 0; }
+        }
+        CHECK(!bad_same, "scan_aug_plan + scan_aug_exec = scan_aug_apply");
+        CHECK(!bad_air && nair > 0, "scan_plan_air is the output's zero set");
+        free(pl); free(air);
+    }
+    if (failures) { fprintf(stderr, "scan augment: %d failure(s)\n", failures); return 1; }
     printf("scan augment: identity, determinism, label/ignore consistency of %d ops, seam registration, operators, paganin / gin / hist / per-op strength: ok\n", SA_N);
     return 0;
 }
