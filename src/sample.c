@@ -2747,7 +2747,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
     const int stored_phase = !c->band && c->side == 2 && s->phase && !c->phase_dense && (pshift == 1 || ((pshift == 0 || pshift == 2) && s->phase_direct));   /* (2: a 9.6 um phase interpolated into 2.4 um windows) */
     const int band_sample = (c->band || c->side) && s->band && (l == 0 || stored_phase);   /* (c->side without c->band: task unwrap, the phase only) */
     const int warp_ok = !band_sample || (stored_phase && !c->band && !c->cond);   /* a stored phase warps (warp_phase); band fields do not */
-    if (c->augment && c->geometry_augment && s->geometry && warp_ok && !chained && !c->view_P && !crushed) {   /* (crushed: already warped) */
+    if (c->augment && c->geometry_augment && s->geometry && warp_ok && !chained && !c->view_P && (!crushed || c->crush.warp)) {   /* (crushed: already warped, unless --aug-crush-warp 1) */
         spatial_aug_make(&spatial,rnext(r),P,c->rotate_degrees,c->rotate_p,c->elastic,c->elastic_p);
         if (zoom_out > 0) spatial_aug_zoom(&spatial, .5 * zoom_out);   /* (the coarser level read above) */
         else if (c->zoom_p > 0 && c->zoom_min > 0 && c->zoom_min < 1 && runif(r) < c->zoom_p) spatial_aug_zoom(&spatial, exp(runif(r) * log(c->zoom_min)));

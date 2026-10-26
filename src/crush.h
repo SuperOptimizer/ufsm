@@ -23,8 +23,9 @@ typedef struct {
     float squash_p, klo, khi; /* window-scale squash: probability, factor range (log-uniform); along a random direction in the sheet plane (d . n = 0) */
     float bend_p, bend_amp;   /* low-frequency bends: probability, amplitude (fraction of P) */
     float kink_p;             /* a fold line (kink) */
-    float rotate_deg;         /* random rotation up to this many degrees per axis (crushed windows skip the ordinary spatial warp) */
+    float rotate_deg;         /* random rotation up to this many degrees per axis (crushed windows skip the ordinary spatial warp unless warp) */
     int fine;                 /* CT from N levels finer (2^N box mean per output voxel); sources' "crush_fine" overrides */
+    int warp;                 /* 1: crushed windows also take the ordinary geometry warp (rotation / elastic / affine / zoom) after the crush map; 0 (default) none */
 } crush_cfg;
 crush_cfg crush_cfg_default(void);
 /* the --aug-crush flags (train and dino-train): --aug-crush P, --aug-crush-void LO,HI, --aug-crush-squash P, --aug-crush-k LO,HI,

@@ -20,7 +20,7 @@ static void panel(uint8_t *img, int W, int px, int P, const uint8_t *ct, const u
     }
 }
 int main(int argc, char **argv) {
-    if (argc < 3) { fprintf(stderr, "usage: crush_render <sources.json> <out-prefix> [P] [windows] [seed] [level] [fine] [z0,y0,x0,z1,y1,x1]\n"); return 2; }
+    if (argc < 3) { fprintf(stderr, "usage: crush_render <sources.json> <out-prefix> [P] [windows] [seed] [level] [fine] [z0,y0,x0,z1,y1,x1] [--aug-crush-* flags]\n"); return 2; }
     const int P = argc > 3 ? atoi(argv[3]) : 256, NW = argc > 4 ? atoi(argv[4]) : 4, l = argc > 6 ? atoi(argv[6]) : 2, fine = argc > 7 ? atoi(argv[7]) : 0;
     const uint64_t seed = argc > 5 ? strtoull(argv[5], nullptr, 10) : 1;
     sources *S = sources_load(argv[1]); if (!S) return 1;
@@ -29,7 +29,8 @@ int main(int argc, char **argv) {
     const z3_meta *zm = z3_meta_of(ct); int64_t box[6] = {0, 0, 0, zm->shape[0] - P, zm->shape[1] - P, zm->shape[2] - P};
     if (argc > 8 && sscanf(argv[8], "%ld,%ld,%ld,%ld,%ld,%ld", &box[0], &box[1], &box[2], &box[3], &box[4], &box[5]) != 6) { fprintf(stderr, "box z0,y0,x0,z1,y1,x1\n"); return 2; }
     sampler *sp = calloc(1, sizeof *sp); sp->S = S; sp->cfg = sample_cfg_default(); sp->cfg.P = P;
-    sp->cfg.crush = crush_cfg_default(); sp->cfg.crush.p = 1; sp->cfg.crush.fine = fine;
+    sp->cfg.crush = crush_cfg_default(); if (crush_cfg_parse(&sp->cfg.crush, argc, argv)) return 2;   /* (--aug-crush-* flags after the positional arguments) */
+    sp->cfg.crush.p = 1; sp->cfg.crush.fine = fine;
     const size_t p3 = (size_t)P * P * P;
     const size_t AR = getenv("UFSM_CRUSH_ARENA") ? (size_t)atoi(getenv("UFSM_CRUSH_ARENA")) : 8;   /* the tile arena in P^3 (the sampler's: 8) */
     uint8_t *big = malloc((1 + AR) * p3), *ct0 = malloc(p3), *ph0 = malloc(p3), *img = malloc((size_t)4 * P * P * 3);
