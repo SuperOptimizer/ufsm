@@ -135,7 +135,7 @@ static int g_distill, g_distill_lev = 3, g_distill_div; static float g_distill_w
                                                                                                     (cells of g_distill_div^3 window voxels; g_distill_n int8 targets per batch), cosine loss x --distill-weight */
 static float g_count_lambda; static int g_count_K = 1024, g_count_L = 64;   /* --count-lambda / -segments / -length: the count loss (nn_count_loss) */
 static float g_pg_lambda, g_pg_dist[4] = {2.f}; static int g_pg_nd = 1, g_pg_angle, g_pg_mask;   /* --pgrad-lambda / --pgrad-dist (D[,D...], up to 4): the phase wavenumber loss (nn_pgrad_slab; head slabs only) */
-static float g_pc_lambda, g_pc_cmin = .3f, g_pc_dist[4] = {2.f, 4.f}; static int g_pc_nd = 2;   /* --pcons-lambda / --pcons-dist / --pcons-cmin: phase / density consistency (nn_pcons_slab; self-supervised) */
+static float g_pc_lambda, g_pc_cmin = .3f, g_pc_dist[4] = {2.f, 4.f}; static int g_pc_nd = 2, g_pc_dirn;   /* --pcons-dir normal: the direction from the normals head (g_pc_dirn); --pcons-lambda / --pcons-dist / --pcons-cmin: phase / density consistency (nn_pcons_slab; self-supervised) */
 /* --task papyrus: papyrus vs void inside the scroll, labels made by the sampler from the clean CT at a random cutoff per patch
    (src/papyrus.h) in target channel 0; --pap-cond 1 conditions the stem bias on that cutoff in input units (batch.um, unet_set_cond) */
 static int g_papyrus; static papyrus_cfg g_pap;
@@ -754,7 +754,7 @@ static void head_slab_pass(gpu_state *d, int pass) {
             nn_loss_stats_acc(LGC(g_side_ch), d->sidet, d->sidem, d->sidew, two, d->hs_ds + 10);
             nn_loss_stats_acc(LGC(g_norm_ch), d->nt, d->nm, d->nw, seven, d->hs_ds + 20);
             if (g_pg_lambda > 0) nn_pgrad_slab(d->hs_train ? nullptr : LGC(g_side_ch), d->hs_train ? nullptr : LGC(g_side_ch + 1), d->sdb, d->sidem, D, H, W, z0, z1, g_norm_s, g_pg_dist, g_pg_nd, g_pg_angle, g_pg_mask, d->hs_ds + 56, nullptr);   /* (training: the pair weights only; the loss sum comes from the gradient pass, + 58) */
-            if (g_pc_lambda > 0) nn_pcons_slab(LGC(g_side_ch), LGC(g_side_ch + 1), LGC(g_norm_ch + 6), H, W, nz, g_dens_scale, g_pc_cmin, g_pc_dist, g_pc_nd, d->hs_ds + 60, nullptr);
+            if (g_pc_lambda > 0) nn_pcons_slab(LGC(g_side_ch), LGC(g_side_ch + 1), LGC(g_norm_ch + 6), g_pc_dirn ? LGC(g_norm_ch) : nullptr, H, W, nz, g_dens_scale, g_pc_cmin, g_pc_dist, g_pc_nd, d->hs_ds + 60, nullptr);
             continue;
         }
         if (!g_unwrap2) {
@@ -763,7 +763,7 @@ static void head_slab_pass(gpu_state *d, int pass) {
             if (g_ink_lambda != 1.f) nn_loss_grad_scale(LGC(1), ns, g_ink_lambda);
         } else nn_wind4_grad(LGC(g_w4_ch), LGC(g_w4_ch + 1), d->w4 + vb, d->wc + vb, d->sidem, ns, d->w4fin, g_w4_lambda, LGC(g_w4_ch), LGC(g_w4_ch + 1));
         if (g_pg_lambda > 0) nn_pgrad_slab(LGC(g_side_ch), LGC(g_side_ch + 1), d->sdb, d->sidem, D, H, W, z0, z1, g_norm_s, g_pg_dist, g_pg_nd, g_pg_angle, g_pg_mask, d->hs_ds + 58, d->pg_acc);   /* (before the BCE gradient overwrites the logits; its sums go to + 58: the logged loss of a training step) */
-        if (g_pc_lambda > 0) nn_pcons_slab(LGC(g_side_ch), LGC(g_side_ch + 1), LGC(g_norm_ch + 6), H, W, nz, g_dens_scale, g_pc_cmin, g_pc_dist, g_pc_nd, d->hs_ds + 62, d->pc_acc);   /* (before the phase / normal BCE gradients overwrite the logits) */
+        if (g_pc_lambda > 0) nn_pcons_slab(LGC(g_side_ch), LGC(g_side_ch + 1), LGC(g_norm_ch + 6), g_pc_dirn ? LGC(g_norm_ch) : nullptr, H, W, nz, g_dens_scale, g_pc_cmin, g_pc_dist, g_pc_nd, d->hs_ds + 62, d->pc_acc);   /* (before the phase / normal BCE gradients overwrite the logits) */
         nn_loss_grad_only(LGC(g_side_ch), d->sidet, d->sidem, d->sidew, two, 0.f, LGC(g_side_ch), d->sscratch);
         if (g_side_lambda != 1.f) nn_loss_grad_scale(LGC(g_side_ch), 2 * ns, g_side_lambda);
         if (g_pg_lambda > 0) nn_pgrad_apply(LGC(g_side_ch), LGC(g_side_ch + 1), d->pg_acc, ns, d->hs_ds + 56, g_pg_lambda);
@@ -1291,7 +1291,7 @@ int cmd_train(int argc, char **argv) {
           while (*pd && g_pg_nd < 4) { char *e; g_pg_dist[g_pg_nd] = strtof(pd, &e); if (e == pd) { bad = 1; break; } bad |= !(g_pg_dist[g_pg_nd] >= 1 && g_pg_dist[g_pg_nd] <= 16); g_pg_nd++; pd = *e == ',' ? e + 1 : e; if (*e && *e != ',') { bad = 1; break; } }
           if (*pd || !g_pg_nd) bad = 1;
           if (!(g_pg_lambda >= 0) || bad) { fprintf(stderr,"--pgrad-lambda >= 0, --pgrad-dist D[,D...] (1..16, up to 4)\n"); return 2; } }
-        g_pc_lambda = (float)atof(opt(argc,argv,"--pcons-lambda","0")); g_pc_cmin = (float)atof(opt(argc,argv,"--pcons-cmin","0.3"));
+        g_pc_lambda = (float)atof(opt(argc,argv,"--pcons-lambda","0")); { const char *pdr = opt(argc,argv,"--pcons-dir","phase"); g_pc_dirn = !strcmp(pdr, "normal"); if (!g_pc_dirn && strcmp(pdr, "phase")) { fprintf(stderr, "--pcons-dir phase|normal\n"); return 2; } } g_pc_cmin = (float)atof(opt(argc,argv,"--pcons-cmin","0.3"));
         { const char *pd = opt(argc,argv,"--pcons-dist","2,4"); g_pc_nd = 0; int bad = 0;
           while (*pd && g_pc_nd < 4) { char *e; g_pc_dist[g_pc_nd] = strtof(pd, &e); if (e == pd) { bad = 1; break; } bad |= !(g_pc_dist[g_pc_nd] >= 1 && g_pc_dist[g_pc_nd] <= 16); g_pc_nd++; pd = *e == ',' ? e + 1 : e; if (*e && *e != ',') { bad = 1; break; } }
           if (!(g_pc_lambda >= 0) || !(g_pc_cmin >= 0 && g_pc_cmin < 1) || bad || g_pc_nd < 1) { fprintf(stderr,"--pcons-lambda >= 0, --pcons-cmin 0..1, --pcons-dist D[,D...] (1..16, up to 4)\n"); return 2; } }

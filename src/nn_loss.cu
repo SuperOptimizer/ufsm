@@ -848,8 +848,8 @@ extern "C" void nn_pgrad_apply(void *gc, void *gs, float *acc, size_t ns, const 
    confident), the partner j at dist along it (inside the slab, confident), the target rotation u = exp(2 pi i rho_i dist) (skipped when
    rho_i dist > 0.4 turn: no wrap), loss 1 - Re(b conj(a) conj(u)) / (|a| |b| + eps) with the angular gradient only (as --pgrad-angle:
    the loss cannot raise the confidence). Unweighted mean over the pairs; sums as nn_pgrad_slab. ---- */
-template <typename LT> __global__ void pcons_k(const LT *lc, const LT *ls, const LT *ld, int H, int W, int nz, float dscale, float cmin,
-                                               pg_dists ds, double *sums, float *acc) {
+template <typename LT> __global__ void pcons_k(const LT *lc, const LT *ls, const LT *ld, const LT *ln, int H, int W, int nz, float dscale, float cmin,
+                                               pg_dists ds, double *sums, float *acc) {   /* ln: the 6 n n^T planes (ds.mask = 1: the direction from them) */
     const size_t HW = (size_t)H * W, ns = (size_t)nz * HW;
     const size_t li = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     float wl = 0.f, ww = 0.f;
@@ -859,6 +859,11 @@ template <typename LT> __global__ void pcons_k(const LT *lc, const LT *ls, const
 #define PH(k, re, im) const float re = 2.f / (1.f + __expf(-lgv(lc, k))) - 1.f, im = 2.f / (1.f + __expf(-lgv(ls, k))) - 1.f
         PH(li, ar, ai); const float na = sqrtf(ar * ar + ai * ai) + 1e-6f; if (na < cmin) break;
         const size_t st[3] = {HW, (size_t)W, 1}; float g[3]; int ok = 1;
+        if (ds.mask) {   /* the direction from the normals head: the principal axis of n n^T (the largest diagonal's column), unsigned */
+            const float a0 = 1.f / (1.f + __expf(-lgv(ln, li))), a1 = 1.f / (1.f + __expf(-lgv(ln, ns + li))), a2 = 1.f / (1.f + __expf(-lgv(ln, 2 * ns + li)));
+            const float o01 = 1.f / (1.f + __expf(-lgv(ln, 3 * ns + li))) - .5f, o02 = 1.f / (1.f + __expf(-lgv(ln, 4 * ns + li))) - .5f, o12 = 1.f / (1.f + __expf(-lgv(ln, 5 * ns + li))) - .5f;
+            if (a0 >= a1 && a0 >= a2) { g[0] = a0; g[1] = o01; g[2] = o02; } else if (a1 >= a2) { g[0] = o01; g[1] = a1; g[2] = o12; } else { g[0] = o02; g[1] = o12; g[2] = a2; }
+        } else
         for (int ax = 0; ax < 3; ax++) {
             PH(li + st[ax], pr, pi); PH(li - st[ax], mr, mi);
             if (sqrtf(pr * pr + pi * pi) < cmin || sqrtf(mr * mr + mi * mi) < cmin) { ok = 0; break; }
@@ -873,7 +878,8 @@ template <typename LT> __global__ void pcons_k(const LT *lc, const LT *ls, const
         const size_t lj = (size_t)zz * HW + (size_t)yy * W + xx; if (lj == li) continue;
         PH(lj, br, bi); const float nb = sqrtf(br * br + bi * bi) + 1e-6f; if (nb < cmin) continue;
 #undef PH
-        const float ur = cospif(2.f * ex), ui = sinpif(2.f * ex);
+        float ex2 = ex; if (ds.mask && ar * bi - ai * br < 0.f) ex2 = -ex;   /* unsigned normal: the rotation's sign as predicted */
+        const float ur = cospif(2.f * ex2), ui = sinpif(2.f * ex2);
         const float kr = ar * ur - ai * ui, ki = -(ar * ui + ai * ur);   /* k = conj(a u) */
         const float R = br * kr - bi * ki, M = na * nb, den = M + .05f;
         wl += 1.f - R / den; ww += 1.f;
@@ -899,10 +905,10 @@ template <typename LT> __global__ void pcons_k(const LT *lc, const LT *ls, const
         if (b > 0) { atomicAdd(&sums[0], a); atomicAdd(&sums[1], b); }
     }
 }
-extern "C" void nn_pcons_slab(const void *lc, const void *ls, const void *ld, int h, int w, int nz, float dscale, float cmin, const float *dist, int nd,
+extern "C" void nn_pcons_slab(const void *lc, const void *ls, const void *ld, const void *ln, int h, int w, int nz, float dscale, float cmin, const float *dist, int nd,
                               double *sums, float *acc) {
-    const size_t ns = (size_t)nz * h * w; pg_dists ds = {{0}, nd < 1 ? 1 : nd > 4 ? 4 : nd, 1, 0}; for (int k = 0; k < ds.n; k++) ds.d[k] = dist[k];
-    if (g_logits_h16) pcons_k<f16><<<nblk(ns, 256), 256>>>((const f16 *)lc, (const f16 *)ls, (const f16 *)ld, h, w, nz, dscale, cmin, ds, sums, acc);
-    else pcons_k<float><<<nblk(ns, 256), 256>>>((const float *)lc, (const float *)ls, (const float *)ld, h, w, nz, dscale, cmin, ds, sums, acc);
+    const size_t ns = (size_t)nz * h * w; pg_dists ds = {{0}, nd < 1 ? 1 : nd > 4 ? 4 : nd, 1, ln != nullptr}; for (int k = 0; k < ds.n; k++) ds.d[k] = dist[k];
+    if (g_logits_h16) pcons_k<f16><<<nblk(ns, 256), 256>>>((const f16 *)lc, (const f16 *)ls, (const f16 *)ld, (const f16 *)ln, h, w, nz, dscale, cmin, ds, sums, acc);
+    else pcons_k<float><<<nblk(ns, 256), 256>>>((const float *)lc, (const float *)ls, (const float *)ld, (const float *)ln, h, w, nz, dscale, cmin, ds, sums, acc);
     KCHECK();
 }
