@@ -8,6 +8,27 @@
 template <int B> __device__ __forceinline__ void mx_load_row_b(const uint8_t *q, const uint8_t *sc, size_t ri, int bw, float *v) {
     mxf<B>::dec_row(q + ri * mx_rb(bw, B), bw, mx_scale(sc[ri]), v);
 }
+/* mxf<B>::dec_row of a whole 32-channel row already in registers (B / 4 16-byte words; dec_row loads through __ldg, which must not be
+   given a local array): the same decode operations in the same order (prefetching kernels: the row loaded a step ahead) */
+template <int B> __device__ __forceinline__ void dec_row32_regs(const uint4 *raw, float s, float *v) {
+    if constexpr (B == 4) {
+        const unsigned w[4] = {raw[0].x, raw[0].y, raw[0].z, raw[0].w};
+#pragma unroll
+        for (int j = 0; j < 4; j++)
+#pragma unroll
+            for (int q = 0; q < 4; q++) { float2 a = dec_e2m1x2(w[j] >> (8 * q)); v[8 * j + 2 * q] = a.x * s; v[8 * j + 2 * q + 1] = a.y * s; }
+    } else {
+#pragma unroll
+        for (int h = 0; h < 2; h++) {
+            const unsigned w[4] = {raw[h].x, raw[h].y, raw[h].z, raw[h].w};
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                float2 a = dec_e4m3x2((unsigned short)(w[j] & 0xffff)), b = dec_e4m3x2((unsigned short)(w[j] >> 16));
+                v[16 * h + 4 * j] = a.x * s; v[16 * h + 4 * j + 1] = a.y * s; v[16 * h + 4 * j + 2] = b.x * s; v[16 * h + 4 * j + 3] = b.y * s;
+            }
+        }
+    }
+}
 /* the MX-fp4 row of bw <= BW values with exact SR (sr != 0) as mx_store_row_b<4> below stores it (the same operations, kept apart so
    that function's code stays as it was): words w[0 .. BW / 8) (0 past bw) and the block exponent (scale byte e + 127) */
 template <int BW> __device__ __forceinline__ int mx4_sr_row(const float *v, int bw, size_t ri, uint32_t sr, unsigned *w) {

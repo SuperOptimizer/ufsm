@@ -31,6 +31,15 @@ int main(int argc, char **argv) {
     float *hf = malloc(C * 4 > B * G * 4 ? C * 4 : B * G * 4);
     for (int i = 0; i < C; i++) hf[i] = 1.f; nn_h2d(gamma, hf, C * 4); for (int i = 0; i < C; i++) hf[i] = 0.f; nn_h2d(beta, hf, C * 4);
     for (int i = 0; i < B * G; i++) hf[i] = 0.f; nn_h2d(mean, hf, B * G * 4); for (int i = 0; i < B * G; i++) hf[i] = 1.f; nn_h2d(rstd, hf, B * G * 4);
+    if (getenv("UFSM_SR")) nn_set_sr(1);   /* the trainer's SR rounding of the MX gradients (and the fp4 records) */
+    {   /* a checksum of gx after one call at a fixed SR seed: kernel variants compared bit for bit */
+        nn_set_sr_step(7); nn_sr_set_ctr(0); nn_zero(gg, C * 4); nn_zero(gb, C * 4);
+        nn_gn_silu_bwd(x, s, G, gamma, beta, mean, rstd, gy, gx, gg, gb, scr); nn_sync();
+        uint8_t *h8 = malloc(gby); nn_d2h(h8, gx, gby);
+        uint64_t f = 1469598103934665603ull; for (size_t i = 0; i < gby; i++) { f ^= h8[i]; f *= 1099511628211ull; }
+        float hg[64]; nn_d2h(hg, gg, (C < 64 ? C : 64) * 4); double sg = 0; for (int i = 0; i < (C < 64 ? C : 64); i++) sg += hg[i];
+        printf("checksum: gx fnv %016llx, sum dgamma %.9g\n", (unsigned long long)f, sg); free(h8);
+    }
     for (int i = 0; i < 3; i++) nn_gn_silu_bwd(x, s, G, gamma, beta, mean, rstd, gy, gx, gg, gb, scr);
     double tg = 1e9;   /* min over iterations (robust on a shared GPU) */
     for (int i = 0; i < it; i++) { nn_sync(); double t0 = now(); nn_gn_silu_bwd(x, s, G, gamma, beta, mean, rstd, gy, gx, gg, gb, scr); nn_sync(); double t = now() - t0; if (t < tg) tg = t; }
