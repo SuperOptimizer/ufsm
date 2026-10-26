@@ -180,7 +180,7 @@ static int on_nested(const char *name, int is_dir, int64_t size, void *ud) {
     return 0;
 }
 
-typedef struct { z2 *z; const int64_t (*chunks)[3]; int nchunks; uint8_t *shard; int S; int64_t so[3]; int labels; atomic_int failed; } fill_job;
+typedef struct { z2 *z; const int64_t (*chunks)[3]; int nchunks; uint8_t *shard; int S; int64_t so[3]; int labels; atomic_int failed; const uint8_t *lut; } fill_job;
 static void fill_chunk(int i, int tid, void *ud) {
     fill_job *j = ud;
     const z2_meta *m = z2_meta_of(j->z);
@@ -194,7 +194,7 @@ static void fill_chunk(int i, int tid, void *ud) {
         const uint8_t *src = buf + ((size_t)z * n[1] + y) * n[2];
         for (int64_t x = 0; x < n[2] && gx + x < j->S; x++) {
             uint8_t v = src[x];
-            dst[x] = j->labels ? (v == 2 ? 255 : v ? 254 : 0) : v;
+            dst[x] = j->lut ? j->lut[v] : j->labels ? (v == 2 ? 255 : v ? 254 : 0) : v;
         }
     }
     free(buf);
@@ -203,7 +203,8 @@ static void fill_chunk(int i, int tid, void *ud) {
 static int cmp3(const void *a, const void *b) { const int64_t *p = a, *q = b; for (int d = 0; d < 3; d++) if (p[d] != q[d]) return p[d] < q[d] ? -1 : 1; return 0; }
 
 int cmd_ingest_labels(int argc, char **argv) {
-    if (argc < 5) { fprintf(stderr, "usage: ufsm ingest-labels <root> <zarr-key> <out-dir> --um U [--levels L] [--token FILE] [--cache DIR] [--threads N] [--raw] [--shard 1024] [--zmax Z]\n"); return 2; }
+    if (argc < 5) { fprintf(stderr, "usage: ufsm ingest-labels <root> <zarr-key> <out-dir> --um U [--levels L] [--token FILE] [--cache DIR] [--threads N] [--raw] [--shard 1024] [--zmax Z]\n"
+                    "       [--src-level K (read <zarr-key>/K, default 0)] [--lut FILE (256 output bytes, one per source value: a soft teacher map -> prob254, 255 = unknown; pyramid by known-max)]\n"); return 2; }
     const char *root = argv[2], *key = argv[3], *out = argv[4];
     double um = atof(opt(argc, argv, "--um", "0"));
     int nlev = atoi(opt(argc, argv, "--levels", "6"));
@@ -213,11 +214,18 @@ int cmd_ingest_labels(int argc, char **argv) {
     int shard = atoi(opt(argc, argv, "--shard", "1024"));
     int64_t zmax = atoll(opt(argc, argv, "--zmax", "0"));
     if (um <= 0) { fprintf(stderr, "--um required\n"); return 2; }
+    int src_level = atoi(opt(argc, argv, "--src-level", "0"));
+    uint8_t lut[256], *lutp = nullptr;   /* --lut: whitespace-separated 0..255 values, entry v = the output byte for source value v */
+    { const char *lf = opt(argc, argv, "--lut", nullptr);
+      if (lf) { FILE *f = fopen(lf, "r"); if (!f) { perror(lf); return 2; }
+          for (int v = 0; v < 256; v++) { int x; if (fscanf(f, "%d", &x) != 1 || x < 0 || x > 255) { fprintf(stderr, "--lut %s: need 256 values 0..255\n", lf); fclose(f); return 2; } lut[v] = (uint8_t)x; }
+          fclose(f); lutp = lut; labels = 3; } }
+    if (src_level < 0 || src_level > 20) { fprintf(stderr, "--src-level 0..20\n"); return 2; }
     store *s = store_open(root);
     char *tok = hf_token(opt(argc, argv, "--token", nullptr));
     if (tok && strstr(root, "huggingface")) store_set_bearer(s, tok);
     char akey[1200];
-    snprintf(akey, sizeof akey, "%s/0", key);
+    snprintf(akey, sizeof akey, "%s/%d", key, src_level);
     z2 *z = z2_open(s, akey, opt(argc, argv, "--cache", nullptr));
     if (!z) { fprintf(stderr, "%s\n", z2_error()); return 1; }
     z2_assume_present(z, 1);
@@ -237,8 +245,8 @@ int cmd_ingest_labels(int argc, char **argv) {
     z3w_level_name(um, lv, sizeof lv);
     snprintf(ldir, sizeof ldir, "%s/%s", out, lv);
     char attrs[512];
-    snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"content\":\"%s\",\"source\":\"%s/%s\",\"encoding\":\"%s\"}}", labels ? "labels" : "raw", root, key, labels ? "0=bg,254=surface,255=ignore" : "uint8");
-    z3w *w = z3w_create(ldir, shape, shard, 0.f, labels ? 255 : 0, attrs);
+    snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"content\":\"%s\",\"source\":\"%s/%s\",\"encoding\":\"%s\"}}", lutp ? "teacher" : labels ? "labels" : "raw", root, key, lutp ? "prob254: p*254, 254 = ink, 0 = no ink, 255 = unknown" : labels ? "0=bg,254=surface,255=ignore" : "uint8");
+    z3w *w = z3w_create(ldir, shape, shard, 0.f, labels ? 255 : 0, attrs);   /* absent shards: unknown (labels, lut) */
     if (!w) { fprintf(stderr, "%s\n", z3w_error()); return 1; }
     size_t sv = (size_t)shard * shard * shard;
     uint8_t *buf = malloc(sv);
@@ -255,8 +263,8 @@ int cmd_ingest_labels(int argc, char **argv) {
         for (int j = i; j < cl.n && cl.c[j][0] / cpp == sz; j++)
             if (!used[j] && cl.c[j][1] / cpp == sy && cl.c[j][2] / cpp == sx) { memcpy(sel[cnt++], cl.c[j], sizeof *sel); used[j] = 1; }
         if (!cnt) { free(sel); i++; continue; }
-        memset(buf, labels ? 255 : 0, sv);
-        fill_job fj = {z, sel, cnt, buf, shard, {sz * shard, sy * shard, sx * shard}, labels, 0};
+        memset(buf, lutp ? lutp[0] : labels ? 255 : 0, sv);   /* lut: absent chunks of a present shard = the source fill (0) mapped */
+        fill_job fj = {z, sel, cnt, buf, shard, {sz * shard, sy * shard, sx * shard}, labels, 0, lutp};
         parallel_for(cnt, nthreads, fill_chunk, &fj);
         if (atomic_load(&fj.failed)) return 1;
         if (z3w_write_shard(w, sz, sy, sx, buf, nthreads)) { fprintf(stderr, "%s\n", z3w_error()); return 1; }
