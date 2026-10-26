@@ -99,9 +99,12 @@ slablane() { local s; for s in $SITES; do grep -qP "^$TAG\tsite$s\t" $RS && cont
 T0=$(date +%s)
 [ -n "${NOLOCK:-}" ] || gpuq_acquire ${PRIO:-eval} wgate-$TAG
 TG=$(date +%s); [ $((TG - T0)) -gt 5 ] && log "GPU after $((TG - T0)) s in the queue"
-slablane & SL=$!
-for i in $(seq $FL); do boxlane & done
+slablane & LANES=$!
+for i in $(seq $FL); do boxlane & LANES="$LANES $!"; done
+# the lanes hold the GPU lock too (inherited fd): on any exit of this script stop them (they finish the box at hand)
+trap 'touch $O/ready/.end' EXIT; trap 'touch $O/ready/.end; kill $LANES 2> /dev/null; exit 143' INT TERM
 # ---- the GPU lane: predicts only (sites first: the slab lane is the longest) ----
+scroll paris4
 for s in $SITES; do
   grep -qP "^$TAG\tsite$s\t" $RS && continue; f=$FD/site$s; mkdir -p $O/site$s
   if [ ! -e $f/fields.json ]; then t0=$(date +%s); predict $f $((2 * s)) 1024 512 320 7168 7680 $O/site$s/pred.log big || { log "site$s predict failed"; continue; }; log "site$s predicted in $(( $(date +%s) - t0 )) s"; fi
