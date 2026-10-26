@@ -772,6 +772,28 @@ extern "C" int lp_gnpend_flush(void) {   /* the pending apply, whole layer, no r
     return 1;
 }
 extern "C" int lp_gnpend_of(const void *gx) { return g_gnpend.valid && g_gnpend.gx == gx && g_gnpend.dev == cur_dev_(); }
+/* the folded per-channel coefficients of gn_silu_bwd_apply_rec_k (sample 0) for a consumer that applies on the fly */
+__global__ void gnpend_cf_k(const float *gamma, const float *beta, const float *mean, const float *rstd, const float *AB, int C, int G, size_t S, float4 *cf) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= C) return;
+    const int cpg = C / G, ng = c / cpg;
+    const float len = (float)cpg * (float)S;
+    const float rs = rstd[ng], mu = mean[ng], ga = gamma[c], be = beta[c];
+    const float ca = AB[2 * ng] / len, cc = AB[2 * ng + 1] / len, A = rs * ga;
+    cf[c] = make_float4(0.5f * A, 0.5f * (be - mu * A), -rs * rs * cc, rs * (mu * rs * cc - ca));
+}
+extern "C" const void *lp_gnpend_take(const void *gx, const void **gy, const float **cf) {
+    gnpend_t &p = g_gnpend;
+    if (!lp_gnpend_of(gx) || p.gy != gx || p.s.n != 1 || p.xdt != 4 || p.s.c > 1024) return nullptr;   /* (in place: gx holds gy) */
+    static thread_local float4 *cfb[16];
+    const int d = cur_dev_();
+    if (!cfb[d] && cudaMalloc((void **)&cfb[d], 1024 * sizeof(float4)) != cudaSuccess) { cfb[d] = nullptr; cudaGetLastError(); return nullptr; }
+    gnpend_cf_k<<<(p.s.c + 127) / 128, 128>>>(p.gamma, p.beta, p.mean, p.rstd, p.AB, p.s.c, p.G, shape_spatial(p.s), cfb[d]);
+    LPCK();
+    p.valid = 0;
+    *gy = p.gy; *cf = (const float *)cfb[d];
+    return p.x;
+}
 extern "C" int lp_gnpend_flush_of(const void *gx) { return lp_gnpend_of(gx) ? lp_gnpend_flush() : 0; }   /* (a consumer that does not take it over) */
 /* the pending apply over z-steps [zt0, zt1) with that slab's records into out (the pre-pass layout of a slab) and the gy sums into gb
    (N 1: per channel; nullptr: none); the last slab clears the pending state */

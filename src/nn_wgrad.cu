@@ -9,7 +9,8 @@ int f4_had_w(void) {   /* bit 0: Hadamard (UFSM_F4_HAD_W), bit 1: stochastic rou
     return v;
 }
 void launch_bwd_w_tc(const void *x, int xbf, shape5 xs, const void *gy, int gybf, shape5 ys, float *gw, float *gb, gnp_t gp, split_t sp) {
-    if (!(eff_prec_w() == 3 && f4_wgrad() && (!sp.up || ISMX(x)))) lp_gnpend_flush_of(gy);   /* (a deferred GN apply into gy: only the fp4 kernel takes it over) */
+    if (!(eff_prec_w() == 3 && f4_wgrad() && (!sp.up || ISMX(x))) && !ISMX(x)) lp_gnpend_flush_of(gy);   /* (a deferred GN apply into gy: the fp4 kernel takes it over; lp_bwd_w_f8 (MX x) fuses it
+                                                                                                    into the network input conv or flushes it) */
     exec_prec(2, eff_prec_w() == 3 && f4_wgrad() && (!sp.up || ISMX(x)) ? 3 : ISMX(x) || ((eff_prec_w() == 2 || eff_prec_w() == 3) && !sp.up) ? 2 : 1);
     if (eff_prec_w() == 3 && f4_wgrad() && (!sp.up || ISMX(x))) {   /* sp.up: MX only (fused upsample in the tile decode) */
         if (sr_on()) sp.sr = sr_seed();

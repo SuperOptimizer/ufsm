@@ -557,6 +557,16 @@ __device__ __forceinline__ unsigned sr_e2m1_nibf(float x, unsigned r22) {
     const unsigned c = ((__float_as_uint(lo ? a + 1.f : a) + r22) >> 22) - (lo ? 254u : 252u);
     return c | (__float_as_uint(x) >> 28 & 8u);
 }
+/* exact stochastic rounding onto the e4m3 grid with a 16-bit uniform (|q| <= 448 after the block scale; returns a grid value, so the
+   round-to-nearest conversion that follows is exact): e4m3 keeps 3 mantissa bits, so on the fp32 bits adding u16 at bits 4..19 of the
+   20 dropped bits and clearing them rounds up exactly when frac + u >= 1 (P(up) = frac to 2^-16), carries into the exponent included;
+   below 2^-6 (e4m3 subnormals, spacing 2^-9) the value is shifted into [2^-6, 2^-5), which has that spacing, and back (exact) */
+__device__ __forceinline__ float sr_e4m3_u16(float q, unsigned u16) {
+    const float a = fminf(fabsf(q), 448.f);
+    const bool lo = a < 0.015625f;
+    const float r = __uint_as_float((__float_as_uint(lo ? a + 0.015625f : a) + (u16 << 4)) & 0xfff00000u);
+    return copysignf(fminf(lo ? r - 0.015625f : r, 448.f), q);
+}
 /* four 32-bit words (eight 16-bit uniforms) from one hash of key and three remixes: the per-8-value SR of the fp4 staging */
 __device__ __forceinline__ void sr_hash4(uint32_t seed, uint64_t key, uint32_t *hh) {
     hh[0] = sr_hash(seed, key);

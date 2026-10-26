@@ -17,7 +17,9 @@
          (ci stride 1040 B = 260 words == 4 mod 32 -> conflict-free fragment loads), GY tile fp8 [co][16 rows][16 B] (co stride 272 B, ldmatrix conflict-free) + scales. */
 template <int MT, int NT, typename T, typename TG, int FAST = 0>   /* FAST: the network input conv's path, 4 or 8 = the real x channels */
 __global__ void __launch_bounds__(288, FAST ? BW8F_MINB : BW8_MINB) conv_bwd_w_f8_k(const T *__restrict__ x, const TG *__restrict__ gy, float *__restrict__ gw, float *__restrict__ gb,
-                                                       int N, int Ci, int D, int H, int W, int Co, gnp_t gp, split_t sp, int ZC, int coop) {
+                                                       int N, int Ci, int D, int H, int W, int Co, gnp_t gp, split_t sp, int ZC, int coop,
+                                                       const uint8_t *__restrict__ gnx = nullptr, const float4 *__restrict__ gncf = nullptr) {   /* gnx: FAST with MX-fp4 gy: a pending GN+SiLU
+                                                       backward apply fused into the gy staging (gy then holds its input gradient; lp_gnpend_take) */
     constexpr int CH = 8 * NT, BMo = 16 * MT;
     extern __shared__ __align__(128) unsigned char smem_raw[];
     uint8_t *sxq = smem_raw;                        /* [CH][X8_CS] */
@@ -111,6 +113,11 @@ __global__ void __launch_bounds__(288, FAST ? BW8F_MINB : BW8_MINB) conv_bwd_w_f
            readers and reused two z-steps later, past the next z-step's first barrier) */
         uint8_t *graw = smem_raw + (((unsigned char *)(amx + 4 * CH) - smem_raw + 15) & ~15);   /* [256 voxels][BMo] raw gy (e4m3) */
         uint8_t *gscl = graw + 256 * BMo;                                                           /* [256] gy scale bytes */
+        /* gnx (MX-fp4 gy of one 32-channel block): the GN layer's activation rows and scales beside gy's, and the channels' folded
+           coefficients (the fused GN+SiLU backward apply) */
+        uint8_t *araw = gscl + 256, *ascl = araw + 256 * 16;
+        float4 *scf = (float4 *)(ascl + 256);
+        if constexpr (IS_MX4(TG) && BMo == 32) { if (gnx && threadIdx.x < 32) scf[threadIdx.x] = gncf[co0 + threadIdx.x]; }
         constexpr int XW = IS_MX4(T) ? 1 : 2;   /* 32-bit words of the 8-channel x row */
         const chan_t c0 = ctab8[0];
         const int tid = threadIdx.x, xrow = tid / 18, xp = tid % 18, xgy = oy0 - 1 + xrow, xgx = ox0 - 1 + xp;
@@ -230,11 +237,13 @@ __global__ void __launch_bounds__(288, FAST ? BW8F_MINB : BW8_MINB) conv_bwd_w_f
                 const int i = k / (GRB / GCB), h = k % (GRB / GCB), row = i >> 4, oz = oz0 + (row >> 3), oy = oy0 + (row & 7), ox = ox0 + (i & 15);
                 const bool ok = oz < D && oy < H && ox < W;
                 cp_async<GCB>(graw + i * GRB + GCB * h, ok ? gq + (gri + ((size_t)oz * H + oy) * W + ox) * mx_rb(gbw, GB) + (co0 % gbw) * GB / 8 + GCB * h : gq, ok);
+                if constexpr (GB == 4 && BMo == 32) if (gnx) cp_async<16>(araw + i * 16, ok ? gnx + (gri + ((size_t)oz * H + oy) * W + ox) * 16 : gnx, ok);   /* (GRB = GCB = 16) */
             }
             if (tid < 64) {   /* scale bytes, 4 voxels per copy (host: W % 4 == 0) */
                 const int row = tid >> 2, oz = oz0 + (row >> 3), oy = oy0 + (row & 7), ox = ox0 + 4 * (tid & 3);
                 const bool ok = oz < D && oy < H && ox < W;
                 cp_async<4>(gscl + 4 * tid, ok ? gqs + gri + ((size_t)oz * H + oy) * W + ox : gqs, ok);
+                if constexpr (GB == 4 && BMo == 32) if (gnx) { const uint8_t *axs = gnx + (size_t)N * mx_nb(Co) * Sg * 16; cp_async<4>(ascl + 4 * tid, ok ? axs + gri + ((size_t)oz * H + oy) * W + ox : axs, ok); }
             }
             asm volatile("cp.async.commit_group;\n" ::: "memory");
         };
@@ -243,6 +252,53 @@ __global__ void __launch_bounds__(288, FAST ? BW8F_MINB : BW8_MINB) conv_bwd_w_f
             const int c = lane % BMo, part = lane / BMo, ks = warp, i0 = part * NV;
             if (ks >= 8) return;
             const bool cok = co0 + c < Co;
+            if constexpr (GB == 4 && BMo == 32) if (gnx) {   /* fused GN+SiLU backward apply: gy = the apply's input, araw the activation: the
+                                                             apply's unrounded value (gn_silu_bwd_apply_rec_k's arithmetic, operation for
+                                                             operation), then one exact SR straight onto the e4m3 grid (no MX-fp4 gx between) */
+                const float4 c4 = scf[c];
+                const uint8_t *rb = graw + (ks * 32) * GRB + (c >> 1), *ab = araw + (ks * 32) * 16 + (c >> 1);
+                float v[32];
+                unsigned am = 0u;
+#pragma unroll
+                for (int i = 0; i < 32; i += 4) {
+                    const unsigned gs4 = *(const unsigned *)(gscl + ks * 32 + i), as4 = *(const unsigned *)(ascl + ks * 32 + i);
+#pragma unroll
+                    for (int j = 0; j < 4; j++) {
+                        const float2 gd = dec_e2m1x2(rb[(i + j) * GRB]), xd = dec_e2m1x2(ab[(i + j) * 16]);
+                        const float g = (c & 1) ? gd.y : gd.x, r = ((c & 1) ? xd.y : xd.x) * mx_scale((as4 >> (8 * j)) & 0xffu);
+                        const float fg = mx_scale((gs4 >> (8 * j)) & 0xffu);
+                        const float p = fmaf(r, c4.x, c4.y);
+                        float th; asm("tanh.approx.f32 %0, %1;" : "=f"(th) : "f"(p));
+                        const float d2 = (1.f + th) * (fmaf(-p, th, p) + 1.f);
+                        const float o = fmaf(g * d2 * c4.x, fg, fmaf(r, c4.z, c4.w));
+                        v[i + j] = cok ? o : 0.f;
+                        am = max(am, __float_as_uint(v[i + j]) & 0x7fffffffu);
+                    }
+                }
+                const unsigned u = __float_as_uint(__uint_as_float(am) * (1.f / 448.f));   /* mx_exp without its early return */
+                const int e = (u & 0x7fffffffu) > 0x7f800000u ? 128 : max(-126, min(126, (int)((u >> 23) & 0xff) - 127 + ((u & 0x7fffff) != 0)));
+                const float m = exp2i(-e);
+                sgs[c * 8 + ks] = (uint8_t)(e + 127);
+                unsigned *dst = (unsigned *)(sg + c * G8_CS + ks * 32);
+#pragma unroll
+                for (int w8 = 0; w8 < 4; w8++) {   /* eight voxels (one row's half) per hash: 8 16-bit uniforms */
+                    const int ii = 8 * w8, row = 2 * ks + (ii >> 4);
+                    const uint64_t key = ((((uint64_t)n * Co + co0 + c) * D + oz0 + (row >> 3)) * H + oy0 + (row & 7)) * (uint64_t)W + ox0 + (ii & 15);
+                    uint32_t hh[4];
+                    if (sp.sr) sr_hash4(sp.sr ^ 0x9e3779b9u, key, hh); else hh[0] = hh[1] = hh[2] = hh[3] = 0x80008000u;   /* (no SR: u = 1/2, round to nearest) */
+                    float q[8];
+#pragma unroll
+                    for (int k = 0; k < 8; k++) q[k] = sr_e4m3_u16(v[ii + k] * m, (hh[k >> 1] >> (16 * (k & 1))) & 0xffffu);
+                    dst[2 * w8] = cvt_e4m3x4(q[0], q[1], q[2], q[3]); dst[2 * w8 + 1] = cvt_e4m3x4(q[4], q[5], q[6], q[7]);   /* (on the grid: exact) */
+                }
+                if (do_bias) {
+                    float bs = 0.f;
+#pragma unroll
+                    for (int i = 0; i < 32; i++) bs += v[i];
+                    bacc += bs;
+                }
+                return;
+            }
             const uint8_t *rb = graw + (ks * 32 + i0) * GRB + (GB == 8 ? c : c >> 1), *sb = gscl + ks * 32 + i0;
             unsigned sw[NV / 4];   /* the NV scale bytes (16-byte aligned): NV / 16 vector loads, not NV byte loads (the kernel is LSU-bound) */
 #pragma unroll
@@ -526,22 +582,28 @@ __global__ void __launch_bounds__(288, FAST ? BW8F_MINB : BW8_MINB) conv_bwd_w_f
 
 /* cooperative MX staging of the fp8 weight gradient (bit 0: x, bit 1: gy); 0 = the per-element paths (test hook) */
 extern int g_f8w_coop;
+/* the network input conv's FAST path with MX-fp4 gy may fuse a pending GN+SiLU backward apply (lp_bwd_w_f8 sets this before its
+   launch: the activation and the folded coefficients; cleared after) */
+typedef struct { const uint8_t *x; const float4 *cf; } f8w_gnf_t;
+extern thread_local f8w_gnf_t g_f8w_gnf;
 template <int MT, int NT, typename T, typename TG> static void launch_bw8(dim3 grid, size_t smem, const void *x, shape5 xs, const TG *gy, shape5 ys, float *gw, float *gb, gnp_t gp, split_t sp, int ZC) {
     static int attr[8][2];
+    const f8w_gnf_t gf = IS_MX4(TG) && MT == 2 ? g_f8w_gnf : f8w_gnf_t{nullptr, nullptr};
     const int coop = g_f8w_coop | ((g_f8w_coop & 4) && xs.c <= 8 && (ys.c <= 32 || ys.c % 32 == 0) ? 2 : 0);   /* bit 2: the cooperative gy path for the
                                                                     network input conv (> 32 outputs: half-resolution nets, 32-output tiles) */
     if constexpr (NT == 1 && IS_MX(T) && IS_MX(TG)) {   /* the network input conv: conv_bwd_w_f8_k's FAST path (MX-fp8 or MX-fp4 gy) */
         if (xs.c <= 8 && !sp.up && !sp.x2 && x && (coop & 3) == 3 && (16 * MT <= mx_bw(ys.c) || (ys.c <= mx_bw(ys.c) && mx_bw(ys.c) < 16 * MT)) && ys.w % 4 == 0) {
             smem += 2 * 8 * NT * 4 + 16 + 256 * 16 * MT + 256;   /* plane multipliers, raw gy rows and scales */
+            if (gf.x) smem += 256 * 16 + 256 + 32 * 16;   /* the fused GN apply: activation rows, scales, coefficients */
             static int x4env = -1;
             if (x4env < 0) x4env = getenv("UFSM_F8W_X4") ? atoi(getenv("UFSM_F8W_X4")) : 1;   /* 0: stage all 8 tile channels (A/B) */
             if (xs.c <= 4 && x4env) {   /* the 4-channel network input: half the x staging */
                 if (!(attr[cur_dev_()][1] & 1)) { attr[cur_dev_()][1] |= 1; cudaFuncSetAttribute((const void *)conv_bwd_w_f8_k<MT, NT, T, TG, 4>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
-                conv_bwd_w_f8_k<MT, NT, T, TG, 4><<<grid, 288, smem>>>((const T *)x, gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, gp, sp, ZC, coop);
+                conv_bwd_w_f8_k<MT, NT, T, TG, 4><<<grid, 288, smem>>>((const T *)x, gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, gp, sp, ZC, coop, gf.x, gf.cf);
                 return;
             }
             if (!(attr[cur_dev_()][1] & 2)) { attr[cur_dev_()][1] |= 2; cudaFuncSetAttribute((const void *)conv_bwd_w_f8_k<MT, NT, T, TG, 8>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
-            conv_bwd_w_f8_k<MT, NT, T, TG, 8><<<grid, 288, smem>>>((const T *)x, gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, gp, sp, ZC, coop);
+            conv_bwd_w_f8_k<MT, NT, T, TG, 8><<<grid, 288, smem>>>((const T *)x, gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, gp, sp, ZC, coop, gf.x, gf.cf);
             return;
         }
     }

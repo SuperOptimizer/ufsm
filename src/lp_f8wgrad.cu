@@ -49,14 +49,38 @@ extern template void bwd_w_f8_t<float, float>(const void *x, shape5 xs, const fl
 
 template void bwd_w_f8_t<mx8_t, mx4_t>(const void *x, shape5 xs, const mx4_t *gy, shape5 ys, float *gw, float *gb, gnp_t gp, split_t sp);
 template void bwd_w_f8_t<mx4_t, mx4_t>(const void *x, shape5 xs, const mx4_t *gy, shape5 ys, float *gw, float *gb, gnp_t gp, split_t sp);
+thread_local f8w_gnf_t g_f8w_gnf;
+extern "C" int lp_gnpend_of(const void *gx);
+extern "C" int lp_gnpend_flush_of(const void *gx);
+extern "C" const void *lp_gnpend_take(const void *gx, const void **gy, const float **cf);
+static int g_stem_gnfuse = -1;
+extern "C" void lp_set_stem_gnfuse(int on) { g_stem_gnfuse = on; }
+/* the network input conv's weight gradient takes over a pending GN+SiLU backward apply of its gy (unet: enc[0]'s GN1, whose gx only
+   this weight gradient reads): the apply runs inside the FAST path's gy staging and gx is never written (saves the apply's pass: P512
+   ~23 ms, and a fp4 rounding of the operand). Only for the FAST path's shape (<= 8 MX inputs, 32 MX-fp4 outputs, N 1, no z-window) */
+static int stem_gnfuse(const void *x, int xbf, shape5 xs, const void *gy, shape5 ys, split_t sp) {
+    if (g_stem_gnfuse < 0) g_stem_gnfuse = getenv("UFSM_STEM_GNFUSE") ? atoi(getenv("UFSM_STEM_GNFUSE")) : 1;
+    int a, c;
+    if (!g_stem_gnfuse || !lp_gnpend_of(gy) || (xbf != 3 && xbf != 4) || !x || xs.c > 8 || ys.c != 32 || ys.n != 1 || ys.w % 4 || sp.up || sp.x2 || zw_win(ys.d, &a, &c)) return 0;
+    if ((g_f8w_coop & 3) != 3 && !((g_f8w_coop & 1) && (g_f8w_coop & 4))) return 0;   /* (launch_bw8's coop: the FAST path) */
+    const void *g2 = nullptr; const float *cf = nullptr;
+    const void *ax = lp_gnpend_take(gy, &g2, &cf);
+    if (!ax || g2 != gy) return 0;
+    g_f8w_gnf = f8w_gnf_t{(const uint8_t *)ax, (const float4 *)cf};
+    return 1;
+}
 extern "C" int lp_bwd_w_f8(const void *x, int xbf, shape5 xs, const void *gy, int gybf, shape5 ys, float *gw, float *gb, gnp_t gp, split_t sp) {
     if (gybf == 4) {   /* MX-fp4 gradients: the network input conv (FAST path) only */
+        const int fuse = stem_gnfuse(x, xbf, xs, gy, ys, sp);
+        if (!fuse) lp_gnpend_flush_of(gy);
         if (xbf == 3) bwd_w_f8_t<mx8_t, mx4_t>(x, xs, (const mx4_t *)gy, ys, gw, gb, gp, sp);
         else if (xbf == 4) bwd_w_f8_t<mx4_t, mx4_t>(x, xs, (const mx4_t *)gy, ys, gw, gb, gp, sp);
         else { fprintf(stderr, "lp_bwd_w_f8: MX-fp4 gradients need an MX x\n"); abort(); }
+        g_f8w_gnf = f8w_gnf_t{nullptr, nullptr};
         LPCK();
         return 0;
     }
+    lp_gnpend_flush_of(gy);
     if (xbf == 4 && gybf == 3) bwd_w_f8_t<mx4_t, mx8_t>(x, xs, (const mx8_t *)gy, ys, gw, gb, gp, sp);
     else if (xbf == 4 && gybf == 2) bwd_w_f8_t<mx4_t, __half>(x, xs, (const __half *)gy, ys, gw, gb, gp, sp);
     else if (xbf == 4 && gybf == 1) VERIFY_ONLY(bwd_w_f8_t<mx4_t, bf16>(x, xs, (const bf16 *)gy, ys, gw, gb, gp, sp));

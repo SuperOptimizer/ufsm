@@ -211,6 +211,49 @@ int main(void) {
         free(ha); free(hb); free(hc);
         nn_set_sr(0);
     }
+    {   /* enc[0]'s GN1 apply fused into the network input conv's weight gradient (lp_bwd_w_f8 takes the pending apply over: gx never
+           written): K draws of the fused gw against the fp32 reference (the fp32 GN backward on the dequantised activation / gy, the
+           weight gradient on the dequantised input) -- one draw no worse than the unfused path's (MX-fp4 gx, then e4m3), the mean of K
+           unbiased, the bias (the sums of the unrounded gx) exact up to fp32 summation */
+        const int C = 32;
+        shape5 s = {1, C, 16, 16, 32}, xs4 = {1, 4, 16, 16, 32};
+        const size_t n = shape_numel(s), n4 = shape_numel(xs4), nw = (size_t)C * 4 * 27;
+        float *x = dev_rand(n, 2.f), *gam = dev_rand(C, 1.f), *bet = dev_rand(C, 0.5f), *mean = dev_rand(G, 0.2f), *rstd = dev_rand(G, 0.3f);
+        { float h[64]; nn_d2h(h, rstd, G * 4); for (int i = 0; i < G; i++) h[i] = 0.8f + fabsf(h[i]); nn_h2d(rstd, h, G * 4); }
+        void *xm = mx4_from(x, s); float *xd = deq4(xm, s);
+        float *gy = dev_rand_wide(n, 1e-3f); void *gym = mx4_from(gy, s); float *gyd = deq4(gym, s);
+        float *xi = dev_rand_wide(n4, 2.f); const size_t b8 = nn_mx8_bytes(xs4); void *xi8 = nn_malloc(b8); nn_set_storage(xi8, b8, 8);
+        lp_f32_to_mx8(xi, 1, 4, shape_spatial(xs4), xi8); float *xid = dev_zero(n4); lp_mx8_to_f32(xi8, 1, 4, shape_spatial(xs4), xid);
+        float *gg = dev_zero(C), *gbn = dev_zero(C), *scr = nn_malloc(nn_gn_scratch(s) + 4096), *gxr = dev_zero(n);
+        float *gwr = dev_zero(nw), *gbr = dev_zero(C);
+        mode_ref(); nn_gn_silu_bwd(xd, s, G, gam, bet, mean, rstd, gyd, gxr, gg, gbn, scr); nn_conv3d_bwd_weight(xid, xs4, gxr, s, 3, 1, gwr, gbr);
+        void *gb4 = mx4_new(s);
+        const size_t bytes = nn_mx4_bytes(s);
+        double one[2], avg[2], ebias[2]; int pend = 1, left = 0;
+        for (int f = 0; f < 2; f++) {   /* f 0: fused, 1: flushed (the plain apply, then the e4m3 requantisation of the MX-fp4 gx) */
+            float *acc = dev_zero(nw), *gw = dev_zero(nw), *gbv = dev_zero(C);
+            lp_set_stem_gnfuse(f == 0);
+            for (int k = 0; k < K; k++) {
+                nn_d2d(gb4, gym, bytes);
+                mode_mx(); nn_set_sr(1);
+                lp_gnpend_request(1); nn_set_sr_step(1800 + k); nn_gn_silu_bwd(xm, s, G, gam, bet, mean, rstd, gb4, (float *)gb4, gg, gbn, scr); lp_gnpend_request(0);
+                pend &= lp_gnpend_of(gb4);
+                nn_zero(gw, nw * 4); nn_zero(gbv, C * 4);
+                split_t sr = {0}; sr.sr = 0x2545f491u * (unsigned)(k + 1);
+                lp_bwd_w_f8(xi8, 3, xs4, gb4, 4, s, gw, gbv, (gnp_t){0}, sr);
+                left |= lp_gnpend_of(gb4);
+                if (!k) { one[f] = relerr(gw, gwr, nw); ebias[f] = relerr(gbv, gbr, C); }
+                nn_axpy(acc, 1.f / K, gw, nw);
+            }
+            avg[f] = relerr(acc, gwr, nw);
+            nn_free(acc); nn_free(gw); nn_free(gbv);
+        }
+        lp_set_stem_gnfuse(-1); nn_set_sr(0);
+        const int ok = pend && !left && one[0] < one[1] * 1.1 + 1e-3 && avg[0] < one[0] * 2.0 / sqrt((double)K) + 0.01 && ebias[0] < 1e-4 && !nn_check();
+        printf("  stem wgrad, GN1 apply fused: pending %d, left %d, one %.3g (unfused %.3g), mean of %d %.3g (unfused %.3g), bias %.3g (unfused %.3g)%s\n",
+               pend, left, one[0], one[1], K, avg[0], avg[1], ebias[0], ebias[1], ok ? "" : "  FAIL");
+        if (!ok) bad++;
+    }
     for (int C = 8; C <= 64; C *= 2) {   /* the persistent grid-stride apply (several trips per thread, a partial last sweep) writes the bytes
                                             of a row per thread (lp_set_gn_persist(0)): same arithmetic, same SR keys */
         const uint64_t rs0 = rs;
