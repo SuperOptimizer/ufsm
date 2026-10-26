@@ -20,6 +20,7 @@ SITE=${SITE:-$([ -d $HOME/ufsm-data ] && echo laptop || echo desk)}; GPU=${GPU:-
 CK=$(readlink -f "$1"); TAG=$2
 U=${U:-$WB/bin/ufsm}; UP=${UP:-$WB/bin/ufsm-gate}; [ -x $UP ] || UP=$U; [ -x $U ] || { echo "no binary $U"; exit 2; }
 TTA=${TTA:-1}; SEAM=${SEAM:-0}; [ "$TTA" -gt 1 ] && export PX="--tta $TTA"   # (wbench.sh's predict appends PX)
+SLOCK=${SLOCK:-$(dirname ${LOCK:-$WB/x})/slabfit.lock}   # the cross-run slab-fit lock (laptop ~/ufsm-data/slabfit.lock)
 REF=${REF:-wind96}; BOXES=${BOXES:-core}; SITES=${SITES-4624 5392 5904 6672}; REP=${REP:-2}; FL=${FL:-3}; DIAG=${DIAG:-1}; KEEP=${KEEP:-1}
 BT=${BT:-$H/boxes.tsv}; FIT=""; FIELDS=""
 GF="--gpu $GPU"; BIN=$(sha1sum $U | cut -c1-8); FCFG=$(echo "$BIN --dir 1 --uw-repair 8 " | sha1sum | cut -c1-8)
@@ -108,8 +109,14 @@ boxlane() {   # boxes in list order as their fields land
 # slab fits; at bg the slab stage starved behind every later wgate block)
 gstep() { if [ -e $O/ready/.released ]; then ( GPUQ_HELD=0; GPUQ_SEQ=$RUNSEQ gpuq_acquire ${SPRIO:-eval} wgate-$TAG-slab; "$@"; rc=$?; gpuq_release; exit $rc ); else "$@"; fi; }
 sfit() {   # sfit LOG fit-args...: a slab fit, run again once if it died (10-26: one was OOM-killed in the shared ufsm.slice)
+  # one slab fit at a time across all wgate runs (each takes 12-20 GB host; two at once got OOM-killed in ufsm.slice), taken
+  # before the GPU (the run holding the block never waits on this lock for anything but its own slab lane: no deadlock), and
+  # MemAvailable >= SLABMEM GB (default 22; up to 10 min, then go)
   local lg=$1 try; shift
-  for try in 1 2; do UFSM_FIT_THREADS=$THREADS gstep RUNBIG $U fit "$@" > $lg 2>&1; grep -q 'winding ids right' $lg && return 0; log "$(basename $(dirname $lg)) $(basename $lg) died (try $try)"; done; return 1; }
+  for try in 1 2; do
+    ( flock 6; local n=0; while [ $(awk '/^MemAvailable:/ {print int($2 / 1048576)}' /proc/meminfo) -lt ${SLABMEM:-22} ] && [ $n -lt 60 ]; do sleep 10; n=$((n + 1)); done
+      UFSM_FIT_THREADS=$THREADS gstep RUNBIG $U fit "$@" > $lg 2>&1 ) 6> $SLOCK
+    grep -q 'winding ids right' $lg && return 0; log "$(basename $(dirname $lg)) $(basename $lg) died (try $try)"; done; return 1; }
 slabsite() {   # slabsite s: wbench.sh's slab site (2 slabs, fit-join, joined score) on this run's site fields
   local s=$1 S=site$1 d f t0 t1 k a b m p1 p4 js; d=$O/$S; f=$FD/$S; mkdir -p $d; t0=$(date +%s); scroll paris4
   bash $H/mkcrop.sh $f $d/fA 0 96 96 96 3328 3520 > /dev/null; bash $H/mkcrop.sh $f $d/fB 64 96 96 96 3328 3520 > /dev/null; bash $H/mkcrop.sh $f $d/fC 0 96 96 160 3328 3520 > /dev/null
