@@ -840,3 +840,69 @@ extern "C" void nn_pgrad_apply(void *gc, void *gs, float *acc, size_t ns, const 
     else pgrad_apply_k<bf16><<<nblk(ns, 256), 256>>>((bf16 *)gc, (bf16 *)gs, acc, ns, sums, lambda * g_gscale);
     KCHECK();
 }
+
+/* ---- phase / density consistency (train --pcons-lambda, self-supervised: no labels): along the predicted phase gradient, the phase's
+   rotation over dist voxels should equal the density head's own turn count there, rho dist (rho = exp(density logit) / dscale turns per
+   voxel, --density-code 1; stop-gradient: only the phase moves). Per voxel i of the slab with phase confidence |a_i| >= cmin: the gradient
+   direction from the predicted phasors at +-1 voxel per axis (arg(a(+1) conj(a(-1))) / 4 pi, turns per voxel; all inside the slab, all
+   confident), the partner j at dist along it (inside the slab, confident), the target rotation u = exp(2 pi i rho_i dist) (skipped when
+   rho_i dist > 0.4 turn: no wrap), loss 1 - Re(b conj(a) conj(u)) / (|a| |b| + eps) with the angular gradient only (as --pgrad-angle:
+   the loss cannot raise the confidence). Unweighted mean over the pairs; sums as nn_pgrad_slab. ---- */
+template <typename LT> __global__ void pcons_k(const LT *lc, const LT *ls, const LT *ld, int H, int W, int nz, float dscale, float cmin,
+                                               pg_dists ds, double *sums, float *acc) {
+    const size_t HW = (size_t)H * W, ns = (size_t)nz * HW;
+    const size_t li = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    float wl = 0.f, ww = 0.f;
+    if (li < ns) do {
+        const int z = (int)(li / HW), y = (int)(li / W % H), x = (int)(li % W);
+        if (z < 1 || z >= nz - 1 || y < 1 || y >= H - 1 || x < 1 || x >= W - 1) break;
+#define PH(k, re, im) const float re = 2.f / (1.f + __expf(-lgv(lc, k))) - 1.f, im = 2.f / (1.f + __expf(-lgv(ls, k))) - 1.f
+        PH(li, ar, ai); const float na = sqrtf(ar * ar + ai * ai) + 1e-6f; if (na < cmin) break;
+        const size_t st[3] = {HW, (size_t)W, 1}; float g[3]; int ok = 1;
+        for (int ax = 0; ax < 3; ax++) {
+            PH(li + st[ax], pr, pi); PH(li - st[ax], mr, mi);
+            if (sqrtf(pr * pr + pi * pi) < cmin || sqrtf(mr * mr + mi * mi) < cmin) { ok = 0; break; }
+            g[ax] = atan2f(pi * mr - pr * mi, pr * mr + pi * mi) * (1.f / (4.f * 3.14159265f));   /* arg(p conj(m)) / (2 pi * 2 voxels) */
+        }
+        if (!ok) break;
+        const float gn = sqrtf(g[0] * g[0] + g[1] * g[1] + g[2] * g[2]); if (gn < 1e-4f) break;
+        const float rho = __expf(fminf(lgv(ld, li), 20.f)) / dscale;
+        for (int di = 0; di < ds.n; di++) { const float dist = ds.d[di], ex = rho * dist; if (!(ex > 0.f) || ex > 0.4f) continue;
+        const int zz = (int)lrintf(z + dist * g[0] / gn), yy = (int)lrintf(y + dist * g[1] / gn), xx = (int)lrintf(x + dist * g[2] / gn);
+        if (zz < 0 || zz >= nz || yy < 0 || yy >= H || xx < 0 || xx >= W) continue;
+        const size_t lj = (size_t)zz * HW + (size_t)yy * W + xx; if (lj == li) continue;
+        PH(lj, br, bi); const float nb = sqrtf(br * br + bi * bi) + 1e-6f; if (nb < cmin) continue;
+#undef PH
+        const float ur = cospif(2.f * ex), ui = sinpif(2.f * ex);
+        const float kr = ar * ur - ai * ui, ki = -(ar * ui + ai * ur);   /* k = conj(a u) */
+        const float R = br * kr - bi * ki, M = na * nb, den = M + .05f;
+        wl += 1.f - R / den; ww += 1.f;
+        if (acc) {
+            const float mr = br * ur + bi * ui, mi = bi * ur - br * ui;
+            const float c0 = -1.f / den, c1 = R / (den * den);
+            float gar = c0 * mr + c1 * ar * nb / na, gai = c0 * mi + c1 * ai * nb / na;
+            float gbr = c0 * kr + c1 * br * na / nb, gbi = -c0 * ki + c1 * bi * na / nb;
+            const float pa = (gar * ar + gai * ai) / (na * na), pb = (gbr * br + gbi * bi) / (nb * nb);   /* angular parts only */
+            gar -= pa * ar; gai -= pa * ai; gbr -= pb * br; gbi -= pb * bi;
+            const float sa = .5f * (ar + 1.f), sb = .5f * (ai + 1.f), sc = .5f * (br + 1.f), sd = .5f * (bi + 1.f);   /* the sigmoids back */
+            atomicAdd(&acc[li], gar * 2.f * sa * (1.f - sa)); atomicAdd(&acc[ns + li], gai * 2.f * sb * (1.f - sb));
+            atomicAdd(&acc[lj], gbr * 2.f * sc * (1.f - sc)); atomicAdd(&acc[ns + lj], gbi * 2.f * sd * (1.f - sd));
+        }
+        }
+    } while (0);
+    for (int o = 16; o; o >>= 1) { wl += __shfl_down_sync(0xffffffffu, wl, o); ww += __shfl_down_sync(0xffffffffu, ww, o); }
+    __shared__ float sh[2][32];
+    if ((threadIdx.x & 31) == 0) { sh[0][threadIdx.x >> 5] = wl; sh[1][threadIdx.x >> 5] = ww; }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        double a = 0, b = 0; for (int k = 0; k < (int)(blockDim.x >> 5); k++) { a += sh[0][k]; b += sh[1][k]; }
+        if (b > 0) { atomicAdd(&sums[0], a); atomicAdd(&sums[1], b); }
+    }
+}
+extern "C" void nn_pcons_slab(const void *lc, const void *ls, const void *ld, int h, int w, int nz, float dscale, float cmin, const float *dist, int nd,
+                              double *sums, float *acc) {
+    const size_t ns = (size_t)nz * h * w; pg_dists ds = {{0}, nd < 1 ? 1 : nd > 4 ? 4 : nd, 1, 0}; for (int k = 0; k < ds.n; k++) ds.d[k] = dist[k];
+    if (g_logits_h16) pcons_k<f16><<<nblk(ns, 256), 256>>>((const f16 *)lc, (const f16 *)ls, (const f16 *)ld, h, w, nz, dscale, cmin, ds, sums, acc);
+    else pcons_k<float><<<nblk(ns, 256), 256>>>((const float *)lc, (const float *)ls, (const float *)ld, h, w, nz, dscale, cmin, ds, sums, acc);
+    KCHECK();
+}
