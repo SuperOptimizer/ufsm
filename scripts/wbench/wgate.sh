@@ -11,7 +11,7 @@
 # Env: SITE (laptop), GPU (0), U (fitter binary; default the pin $WB/bin/ufsm), UP (predict binary; default $WB/bin/ufsm-gate),
 #   REF (wind96), BOXES (core | names), SITES ("4624 5392 5904 6672"; "" = no slabs), REP (2), FL (box lanes, 3), DIAG (1),
 #   KEEP (1), NOLOCK=1 (the caller holds the GPU), PRIO (eval), TTA (predict --tta K, 1 = off), SEAM (1: average 2 window-grid
-#   offsets 0 / 8 vx: volcomp seam TTA, 2x predict), SPRIO (slab fits after the block, bg).
+#   offsets 0 / 8 vx: volcomp seam TTA, 2x predict), SPRIO (slab fits after the block, eval with the run's ticket number).
 set -u
 H=$(cd "$(dirname "$0")" && pwd)
 SITE=${SITE:-$([ -d $HOME/ufsm-data ] && echo laptop || echo desk)}; GPU=${GPU:-0}
@@ -93,8 +93,9 @@ boxlane() {   # boxes in list order as their fields land
   done
 }
 # a slab-lane GPU step: under the run's GPU block while it lasts; once the block is released (boxes done) each step queues on its
-# own (gpuq ${SPRIO:-bg}: other jobs get the GPU between slab fits)
-gstep() { if [ -e $O/ready/.released ]; then ( GPUQ_HELD=0; gpuq_acquire ${SPRIO:-bg} wgate-$TAG-slab; "$@"; rc=$?; gpuq_release; exit $rc ); else "$@"; fi; }
+# own at eval priority WITH THE RUN'S TICKET NUMBER (ahead of wgates queued later; "now" checks and older tickets get the GPU between
+# slab fits; at bg the slab stage starved behind every later wgate block)
+gstep() { if [ -e $O/ready/.released ]; then ( GPUQ_HELD=0; GPUQ_SEQ=$RUNSEQ gpuq_acquire ${SPRIO:-eval} wgate-$TAG-slab; "$@"; rc=$?; gpuq_release; exit $rc ); else "$@"; fi; }
 sfit() {   # sfit LOG fit-args...: a slab fit, run again once if it died (10-26: one was OOM-killed in the shared ufsm.slice)
   local lg=$1 try; shift
   for try in 1 2; do UFSM_FIT_THREADS=$THREADS gstep RUNBIG $U fit "$@" > $lg 2>&1; grep -q 'winding ids right' $lg && return 0; log "$(basename $(dirname $lg)) $(basename $lg) died (try $try)"; done; return 1; }
@@ -120,7 +121,7 @@ slablane() { local s; for s in $SITES; do grep -qP "^$TAG\tsite$s\t" $RS && cont
     [ -e $O/ready/site$s ] && slabsite $s; done; }
 
 T0=$(date +%s)
-[ -n "${NOLOCK:-}" ] || gpuq_acquire ${PRIO:-eval} wgate-$TAG
+[ -n "${NOLOCK:-}" ] || gpuq_acquire ${PRIO:-eval} wgate-$TAG; RUNSEQ=${GPUQ_SEQ:-}
 TG=$(date +%s); [ $((TG - T0)) -gt 5 ] && log "GPU after $((TG - T0)) s in the queue"
 rm -f $O/ready/.released
 slablane & SL=$!; LANES=$SL; BLANES=

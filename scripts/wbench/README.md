@@ -56,7 +56,7 @@ at peak LR that is only a ~1k-step average.
     ufsm ckpt-avg run-avg.ckpt snap-6000.ckpt snap-8000.ckpt   # uniform average of the EMA + live weights; optimiser state of the last
 
 **Speed.** One GPU block (gpuq eval). The GPU lane only predicts: the 4 sites first (~2 min each), then the boxes (~11 s each).
-- 2 box lanes fit each box as soon as its fields land. The box fit and its 2 shifted fits run concurrently, followed by the
+- 3 box lanes fit each box as soon as its fields land. The box fit and its 2 shifted fits run concurrently, followed by the
   CPU-only fields-oracle and fit-compare (diagnostic columns; `DIAG=0` skips them).
 - 1 slab lane fits each site as its fields land. It is the critical path.
 - There are no ceiling fits: the clean set uses wind96's ceilings.
