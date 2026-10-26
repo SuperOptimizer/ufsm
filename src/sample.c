@@ -206,7 +206,8 @@ static batch alloc_batch(const sample_cfg *c) {
     b.choff = c->chain_p > 0 ? malloc((size_t)c->B * 3 * sizeof *b.choff) : nullptr;
     b.xv = c->view_P > 0 ? halloc((size_t)c->B * c->view_P * c->view_P * c->view_P) : nullptr; b.vok = c->view_P > 0 ? calloc((size_t)c->B, 1) : nullptr;
     b.x = c->xfmt || c->restore ? nullptr : halloc((size_t)c->B * xc * p3 * sizeof(float));   /* pinned: the trainer uploads asynchronously */
-    b.x16 = c->xfmt && !c->restore ? halloc((size_t)c->B * xc * p3 * 2) : nullptr;
+    b.x16 = c->xfmt && !c->restore && !c->gpu_aug ? halloc((size_t)c->B * xc * p3 * 2) : nullptr;   /* (--gpu-aug: the device builds the CT channel) */
+    b.ct8 = c->gpu_aug ? halloc((size_t)c->B * p3) : nullptr; b.aug = c->gpu_aug ? halloc((size_t)c->B * sizeof(scan_ct_rec)) : nullptr;
     b.t = c->pack_tm ? nullptr : halloc((size_t)c->B * (c->restore == 1 ? 1 : NCH) * p3);   /* (task restore: the clean CT alone; real pairs: target + input crop) */
     b.m = c->pack_tm || c->restore ? nullptr : halloc((size_t)c->B * p3);
     b.tm = c->pack_tm ? halloc((size_t)c->B * p3) : nullptr;   /* one code byte per voxel instead of NCH + 1 */
@@ -227,7 +228,7 @@ static batch alloc_batch(const sample_cfg *c) {
     return b;
 }
 
-static void free_batch(batch *b) { if (b->emb) hfree(b->emb); if (b->xv) hfree(b->xv); free(b->vok); free(b->chid); free(b->chidx); free(b->choff); if (b->w4) hfree(b->w4); if (b->wcomp) hfree(b->wcomp); if (b->tm) hfree(b->tm); if (b->rad) hfree(b->rad); if (b->axr) hfree(b->axr); if (b->pap) hfree(b->pap); if (b->wind) hfree(b->wind); if (b->band) hfree(b->band); if (b->side) hfree(b->side); if (b->pm) hfree(b->pm); if (b->x) hfree(b->x); if (b->x16) hfree(b->x16); if (b->t) hfree(b->t); if (b->m) hfree(b->m); hfree(b->w); free(b->src); free(b->level); free(b->um); free(b->corner); if (b->sheet) { sheet_batch_free(b->sheet[0]); free(b->sheet); } }
+static void free_batch(batch *b) { if (b->ct8) hfree(b->ct8); if (b->aug) hfree(b->aug); if (b->emb) hfree(b->emb); if (b->xv) hfree(b->xv); free(b->vok); free(b->chid); free(b->chidx); free(b->choff); if (b->w4) hfree(b->w4); if (b->wcomp) hfree(b->wcomp); if (b->tm) hfree(b->tm); if (b->rad) hfree(b->rad); if (b->axr) hfree(b->axr); if (b->pap) hfree(b->pap); if (b->wind) hfree(b->wind); if (b->band) hfree(b->band); if (b->side) hfree(b->side); if (b->pm) hfree(b->pm); if (b->x) hfree(b->x); if (b->x16) hfree(b->x16); if (b->t) hfree(b->t); if (b->m) hfree(b->m); hfree(b->w); free(b->src); free(b->level); free(b->um); free(b->corner); if (b->sheet) { sheet_batch_free(b->sheet[0]); free(b->sheet); } }
 
 /* Level choice for a source: restrict cfg.level_p to levels the CT has and every target of the source
    can provide (pyramid: same level; regions: levels 0..1). Returns -1 if nothing is usable. */
@@ -692,6 +693,10 @@ int sample_gpu_input_ok(const sample_cfg *c) {
     return c->xfmt != 0 && !c->aux && !c->cond && !c->sheet && !(c->augment && c->ct_augment && Pz != c->P);   /* warps: the CT channel of
                                                                                    write_spatial, the transported radial vector on the device */
 }
+int sample_gpu_aug_ok(const sample_cfg *c) {   /* the device's CT channel (nn_aug_ct): cubes, no CT appearance plan, labels that read the CT's zero set
+                                                  only (side_air 0), the plain inputs */
+    return c->gpu_input && sample_gpu_input_ok(c) && (c->Pz <= 0 || c->Pz == c->P) && !c->ct_augment && c->side_air == 0 && !c->restore && !c->papyrus && c->P <= SA_MAXP;
+}
 void sample_write_x_test(const uint8_t *ctu, int D, int P, const int64_t o[3], float mean, float isd, int hasax, const float *cyz,
                          const float *cxz, const int perm[3], const int flip[3], int xfmt, uint64_t seed, uint16_t *H4, uint16_t *H1, void *rec) {
     sym y; for (int d = 0; d < 3; d++) { y.perm[d] = perm[d]; y.flip[d] = flip[d]; }
@@ -1032,6 +1037,7 @@ static void write_spatial_tm(const uint8_t *ctu,const uint8_t *target,const uint
         for (int z=z0;z<z0+nz;z++) for (int y=0;y<P;y++) {   /* channel 0: the noise rows in the per-voxel loop's order */
             for (int x=0;x+4<=P;x+=4) { uint64_t v=rnext(r); for (int j=0;j<4;j++) nrow[x+j]=g_ntab[(v>>(16*j))&65535]; }
             for (int x=P&~3;x<P;x++) nrow[x]=g_ntab[rnext(r)&65535];
+            if (!X && !H) continue;   /* (--gpu-aug: the masks and targets only; the draws as ever) */
             if (ap && ap->noise_rho>0) ct_aug_noise_row(ap,nrow,noise_row,noise_plane,P,z,y);
             const size_t k0=((size_t)z*P+y)*P, kb0=((size_t)(z-z0)*P+y)*P;
             int x=0;   /* (the row in place, then one store pass) */
@@ -2621,15 +2627,27 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
         if (!(embp2 = tp_get(p3 / 8, 0))) return -1;
         sample_emb_pap2(ctu, Pz, P, s->pap_level, embp2);
     }
+    scan_ct_rec *grec = c->gpu_aug ? (scan_ct_rec *)b->aug + i : nullptr;   /* --gpu-aug: the device's record of this window */
+    if (grec) grec->scan = 0;
     if (c->augment && scan_aug_enabled(&c->scan)) {   /* scanner domains on the source grid; the per-patch z-score follows them, as at inference */
         PROF_MARK(PS_ZSCORE);
-        if (scan_aug_apply(&c->scan, rnext(r), ctu, ttmp, NCH, ign, P, o, cyz, cxz, s->ax.n > 0, m->chunk, !c->sheet && !c->band && !c->side, big + p3)) {
+        if (grec) {   /* --gpu-aug: the decisions and the label side here, the float ops on the device; ctu then holds only the output's zero
+                         set (0 / 1: every later CPU reader of ctu needs no more with side_air 0, sample_gpu_aug_ok) */
+            const unsigned on = scan_aug_plan(&c->scan, rnext(r), ctu, ttmp, NCH, ign, P, o, cyz, cxz, s->ax.n > 0, m->chunk, !c->sheet && !c->band && !c->side, &grec->plan);
+            grec->scan = on != 0;
+            if (on) {
+                memcpy(b->ct8 + (size_t)i * p3, ctu, p3);
+                uint8_t *air = big + p3; scan_plan_air(&grec->plan, ctu, air);
+                for (size_t k = 0; k < p3; k++) ctu[k] = !air[k];
+            }
+        } else if (scan_aug_apply(&c->scan, rnext(r), ctu, ttmp, NCH, ign, P, o, cyz, cxz, s->ax.n > 0, m->chunk, !c->sheet && !c->band && !c->side, big + p3)) {
             size_t nz2;   /* (integer sums: the same doubles as accumulating the bytes in double, exact below 2^53) */
             u8_stats(ctu, p3, &nz2, &sum, &sq);
             mean = sum / (double)p3; var = sq / (double)p3 - mean * mean; sd = sqrt(var > 0 ? var : 0) + 1e-3;
         }
         PROF_MARK(PS_SCAN);
     }
+    if (grec && !grec->scan) memcpy(b->ct8 + (size_t)i * p3, ctu, p3);   /* (the bytes as read) */
     if (s->norm_s > 0) { mean = s->norm_c; sd = s->norm_s; }   /* "norm": the scan's fixed normalisation (ufsm scanprep median / scale) instead of the window z-score */
     uint8_t *mask = big + 9 * p3;   /* ign lives here: fold CT > 0 into it */
     for (size_t k = 0; k < p3; k++) mask[k] = (ctu[k] != 0) & (mask[k] == 0);
@@ -2788,7 +2806,12 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
     const size_t xc = c->gpu_input ? 1 : 4 + (c->aux != 0);
     if (c->gpu_input && (c->sheet || (app && Pz != P))) { fprintf(stderr, "sampler: --gpu-input needs write_x / write_spatial samples (sample_gpu_input_ok)\n"); abort(); }
     float *X = c->xfmt ? nullptr : b->x + (size_t)i * xc * p3;
-    uint16_t *H = c->xfmt ? b->x16 + (size_t)i * xc * p3 : nullptr;
+    uint16_t *H = c->xfmt && !grec ? b->x16 + (size_t)i * xc * p3 : nullptr;   /* (--gpu-aug: neither: the device writes the CT channel) */
+    if (grec) {   /* the device's z-score and jitter (its noise from its own stream, seeded without a draw: the CPU path's draws follow unchanged) */
+        grec->jitter = c->augment != 0; grec->ia = ia; grec->ib = ib; grec->isg = isg;
+        grec->nseed = r->s[0] ^ rotl(r->s[2], 23) ^ ((uint64_t)i << 48);
+        grec->fixed = s->norm_s > 0; grec->fmean = (float)mean; grec->fisd = (float)(1.0 / sd); grec->xfmt = c->xfmt;
+    }
     double (*params)[4]=nullptr;
     if (c->sheet) {
         params=malloc((size_t)P*sizeof *params);
@@ -2798,6 +2821,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
             ia,ib,isg,r,nrow,c->xfmt,X,H,app,noise_state,noise_state?noise_state+P:nullptr,c->sheet,params,(float *)(big+p3),c->pack_tm,c->gpu_input,TMd);
     else if (c->sheet || (app && Pz != P)) write_x_aug(ctu, P, o, (float)mean, (float)(1.0 / sd), s->ax.n > 0, cyz, cxz, y, c->augment != 0, ia, ib, isg, r, nrow, c->xfmt,
             X, H, app, noise_state, noise_state ? noise_state + P : nullptr,c->sheet,params);
+    else if (grec) { if (c->augment) for (size_t q = (size_t)Pz * P * (size_t)(P / 4 + P % 4); q; q--) rnext(r); }   /* (write_x's jitter draws) */
     else write_x(ctu, Pz, P, o, (float)mean, (float)(1.0 / sd), s->ax.n > 0, cyz, cxz, y, c->augment != 0, ia, ib, isg, r, nrow, c->xfmt, X, H,
                  app, noise_state, noise_state ? noise_state + P : nullptr, c->gpu_input);   /* the CT appearance plan in the row-vectorised writer (cubes) */
     if (c->gpu_input) rad_record((char *)b->rad + (size_t)i * NN_RAD_REC(Pz), o, Pz, P, s->ax.n > 0, y, cyz, cxz, &spatial);   /* the radial channels: on the device */
@@ -2859,7 +2883,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
            the step's gradient goes non-finite (skipped, the gradient scale halved) on every replay of the window */
         size_t bad = 0, k0 = 0; const size_t nx = xc * p3;
         if (X) { for (size_t k = 0; k < nx; k++) if (!isfinite(X[k])) { if (!bad) k0 = k; bad++; } }
-        else {   /* (an AVX2 any-test first; the count and the first index only when there is one) */
+        else if (H) {   /* (an AVX2 any-test first; the count and the first index only when there is one) */
             const uint16_t e = c->xfmt == 1 ? 0x7c00 : 0x7f80; size_t k = 0;
 #ifdef __AVX2__
             {
