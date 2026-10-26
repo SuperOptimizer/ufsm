@@ -812,7 +812,7 @@ static void *score_rows(void *arg) {
             J->dd[t][J->ndet[t]++] = (score_rec){(float)d, (uint8_t)zi, (uint8_t)fmin(255, rr / 250)};
         }
     }
-    J->nd[t] = nd; J->nan[t] = nan;
+    J->nd[t] += nd; J->nan[t] += nan;   /* (summed over the blocks) */
     return nullptr;
 }
 static int score_codes(z3 *z, double cf, const long long org[3], const int shp[3], double h, double um, const float *cy, const float *cx, int detail, FILE *dump,
@@ -826,6 +826,8 @@ static int score_codes(z3 *z, double cf, const long long org[3], const int shp[3
        128 times: minutes on a 3.9 cm slab) */
     enum { SBZ = 128, SBY = 1024, SBX = 1024 };
     uint8_t *codes = malloc((size_t)SBZ * SBY * SBX); float *U = malloc((size_t)SBZ * SBY * SBX * 4);
+    const int tms = getenv("UFSM_FIT_TIMES") != nullptr; double tr = 0, tf = 0, tw = 0, tq = 0;   /* UFSM_FIT_TIMES: code reads, U fill, tally */
+    score_job J = {.cf = cf, .h = h, .um = um, .org = org, .shp = shp, .cy = cy, .cx = cx, .na_ax = na_ax, .detail = detail, .pa = pab};   /* (the threaded tally) */
     for (int64_t za = lo[0]; za < lo[0] + ln[0]; za = (za / SBZ + 1) * SBZ)
     for (int64_t ya = lo[1]; ya < lo[1] + ln[1]; ya = (ya / SBY + 1) * SBY)
     for (int64_t xa = lo[2]; xa < lo[2] + ln[2]; xa = (xa / SBX + 1) * SBX) {
@@ -833,26 +835,25 @@ static int score_codes(z3 *z, double cf, const long long org[3], const int shp[3
         const int64_t ye = (ya / SBY + 1) * SBY < lo[1] + ln[1] ? (ya / SBY + 1) * SBY : lo[1] + ln[1];
         const int64_t xe = (xa / SBX + 1) * SBX < lo[2] + ln[2] ? (xa / SBX + 1) * SBX : lo[2] + ln[2];
         const int64_t o3[3] = {za, ya, xa}, n3[3] = {ze - za, ye - ya, xe - xa}; const size_t nb3 = (size_t)n3[0] * n3[1] * n3[2];
+        tq = now();
         if (z3_read(z, o3, n3, codes, 16)) { fprintf(stderr, "score: code read failed: %s\n", z3_error()); free(codes); free(U); free(hist); free(fine); free(dd); return 1; }
         size_t any = 0; for (size_t i = 0; i < nb3 && !any; i++) any = codes[i] >= 1 && codes[i] <= 252;
+        tr += now() - tq; tq = now();
         if (!any) continue;
         const double og[3] = {cf * o3[0] - 0.25 * cf - org[0], cf * o3[1] - 0.25 * cf - org[1], cf * o3[2] - 0.25 * cf - org[2]};   /* label voxel i at cf (i + lo + 1 / 4) - org */
         if (fill(ctx, og, n3, cf, codes, U)) { fprintf(stderr, "score: cannot evaluate U on the score grid\n"); free(codes); free(U); free(hist); free(fine); free(dd); return 1; }
-        if (!dump) {   /* threads (the dump keeps the serial voxel order) */
-            score_job J = {codes, U, {n3[0], n3[1], n3[2]}, {o3[0], o3[1], o3[2]}, cf, h, um, org, shp, cy, cx, na_ax, detail, {0}, {0}, {0}, {0}, {0}, {0}, {0}, 0, pab};
+        tf += now() - tq; tq = now();
+        if (!dump) {   /* threads (the dump keeps the serial voxel order); per-thread tallies and detail records kept over all blocks */
+            J.codes = codes; J.U = U; for (int d = 0; d < 3; d++) { J.n3[d] = n3[d]; J.o3[d] = o3[d]; }
             long ncpu = sysconf(_SC_NPROCESSORS_ONLN); const char *te = getenv("UFSM_FIT_THREADS"); if (te && atoi(te) > 0) ncpu = atoi(te);   /* (the fit's threads) */
             J.nt = (int)(ncpu < 1 ? 1 : ncpu > 16 ? 16 : ncpu); if (J.nt > n3[0]) J.nt = (int)n3[0];
             pthread_t th[64]; void *args[64][2];
-            for (int t = 0; t < J.nt; t++) { J.hist[t] = calloc(NB, sizeof(size_t)); J.fine[t] = calloc(NF, sizeof(size_t)); args[t][0] = &J; args[t][1] = (void *)(intptr_t)t; pthread_create(&th[t], nullptr, score_rows, args[t]); }
-            for (int t = 0; t < J.nt; t++) pthread_join(th[t], nullptr);
             for (int t = 0; t < J.nt; t++) {
-                for (int k = 0; k < NB; k++) hist[k] += J.hist[t][k];
-                for (int k = 0; k < NF; k++) fine[k] += J.fine[t][k];
-                nd += J.nd[t]; nan += J.nan[t];
-                if (J.ndet[t]) { if (ndet + J.ndet[t] > dcap) { dcap = ndet + J.ndet[t] > 2 * dcap ? ndet + J.ndet[t] : 2 * dcap; dd = realloc(dd, dcap * sizeof *dd); }
-                                 memcpy(dd + ndet, J.dd[t], J.ndet[t] * sizeof *dd); ndet += J.ndet[t]; }
-                free(J.hist[t]); free(J.fine[t]); free(J.dd[t]);
+                if (!J.hist[t]) { J.hist[t] = calloc(NB, sizeof(size_t)); J.fine[t] = calloc(NF, sizeof(size_t)); }
+                args[t][0] = &J; args[t][1] = (void *)(intptr_t)t; pthread_create(&th[t], nullptr, score_rows, args[t]);
             }
+            for (int t = 0; t < J.nt; t++) pthread_join(th[t], nullptr);
+            tw += now() - tq;
             continue;
         }
         for (int64_t zz = 0; zz < n3[0]; zz++) for (int64_t yy = 0; yy < n3[1]; yy++) for (int64_t xx = 0; xx < n3[2]; xx++) {
@@ -873,6 +874,12 @@ static int score_codes(z3 *z, double cf, const long long org[3], const int shp[3
         }
     }
     free(codes); free(U);
+    const size_t ndet_serial = ndet;   /* (dd: the dump path's records; the threads keep theirs in J.dd) */
+    for (int t = 0; t < 64; t++) {   /* the threads' tallies (integer counts: any order) */
+        if (J.hist[t]) { for (int k = 0; k < NB; k++) hist[k] += J.hist[t][k]; for (int k = 0; k < NF; k++) fine[k] += J.fine[t][k]; }
+        nd += J.nd[t]; nan += J.nan[t]; ndet += J.ndet[t]; free(J.hist[t]); free(J.fine[t]);
+    }
+    if (tms) fprintf(stderr, "fit times: score code reads %.2fs, U fill %.2fs, tally %.2fs\n", tr, tf, tw);
     size_t best = 0; int bi = 0;
     for (int k = 0; k < NB; k++) { size_t sacc = 0; for (int e = -18; e <= 18; e++) sacc += hist[(k + e + NB) % NB]; if (sacc > best) { best = sacc; bi = k; } }   /* +-0.25 turn window */
     const double mode = (bi + 0.5) * 14.0 / NB;
@@ -888,10 +895,13 @@ static int score_codes(z3 *z, double cf, const long long org[3], const int shp[3
     if (nan) printf("  %zu labelled voxels without U (%.4f of those in the box), not scored\n", nan, (double)nan / (nan + nd));
     if (detail && ndet) {
         size_t ie[8][9] = {{0}}, re[256][9] = {{0}};   /* integer error -4..4 by z octile / by 250 um radius bin (up to 64 mm) */
-        for (size_t i = 0; i < ndet; i++) {
-            double e = dd[i].d - mode - mean; e -= 14 * round(e / 14); const int k = (int)lround(e);
-            if (k < -4 || k > 4) continue;
-            ie[dd[i].z][k + 4]++; re[dd[i].r][k + 4]++;
+        for (int s = -1; s < 64; s++) {   /* the serial (dump) records, then each thread's */
+            const score_rec *r = s < 0 ? dd : J.dd[s]; const size_t cnt = s < 0 ? ndet_serial : J.ndet[s];
+            for (size_t i = 0; i < cnt; i++) {
+                double e = r[i].d - mode - mean; e -= 14 * round(e / 14); const int k = (int)lround(e);
+                if (k < -4 || k > 4) continue;
+                ie[r[i].z][k + 4]++; re[r[i].r][k + 4]++;
+            }
         }
         printf("  integer error -2 -1 0 +1 +2 (fractions):\n");
         for (int zb = 0; zb < 8; zb++) { size_t t = 0; for (int k = 0; k < 9; k++) t += ie[zb][k]; if (!t) continue;
@@ -902,12 +912,14 @@ static int score_codes(z3 *z, double cf, const long long org[3], const int shp[3
     if (pab) {   /* pair winding accuracy (gauge-free): 0.5 / 1 / 2 / 4 mm */
         pa_buf all; pa_init(&all, 1 << 20); for (int t = 0; t < 16; t++) { pa_merge(&all, &pab[t]); pa_free(&pab[t]); } free(pab); pab = nullptr;
         const double mm[4] = {0.5, 1, 2, 4}; double dv[4], a[4], ac[4]; size_t na[4], nc[4]; for (int k = 0; k < 4; k++) dv[k] = mm[k] * 1000 / um;
-        pa_score(&all, dv, 4, 200000, 0x5eed, a, ac, na, nc);
+        tq = now(); pa_score(&all, dv, 4, 200000, 0x5eed, a, ac, na, nc);
+        if (tms) fprintf(stderr, "fit times: pair score %.2fs\n", now() - tq);
         printf("pair winding right (%zu records):", all.n);
         for (int k = 0; k < 4; k++) printf(" %g mm %.4f cross %.4f (%zu / %zu)%s", mm[k], a[k], ac[k], na[k], nc[k], k < 3 ? " |" : "\n");
         pa_free(&all);
     }
-    free(dd); free(ah); free(hist); free(fine);
+    free(dd); for (int t = 0; t < 64; t++) free(J.dd[t]);
+    free(ah); free(hist); free(fine);
     return 0;
 }
 typedef struct { fit_set_dev *gd; const fit_set *fs; } fit_fill_ctx;   /* gd null: the CPU */
@@ -977,6 +989,13 @@ static int cmd_convert_unwrap2(int argc, char **argv) {
     return 0;
 }
 
+static pthread_t g_fit_gth; static int g_fit_gthr, g_fit_gdev;   /* fit: the GPU context comes up on a thread while the fields load */
+static void *fit_gpu_init_thread(void *a) { (void)a; nn_init(g_fit_gdev); return nullptr; }
+static void fit_gpu_join(void) {   /* the init thread done; the device selected on this thread too */
+    if (!g_fit_gthr) return;
+    const double tj = now(); pthread_join(g_fit_gth, nullptr); g_fit_gthr = 0; nn_init(g_fit_gdev);
+    if (getenv("UFSM_FIT_TIMES")) fprintf(stderr, "fit times: gpu init wait %.2fs\n", now() - tj);
+}
 static int cmd_fit(int argc, char **argv) {
     const char *dir = argv[2];
     fit_cfg c = fit_cfg_default();
@@ -1030,14 +1049,41 @@ static int cmd_fit(int argc, char **argv) {
     c.analytic = atoi(opt(argc, argv, "--analytic", "1")); c.packed_um = atof(opt(argc, argv, "--packed-um", "0")); c.batch = atoi(opt(argc, argv, "--batch", "2000000")); c.knot_dz = atoi(opt(argc, argv, "--knot-dz", "1024")); c.phase_stage = atoi(opt(argc, argv, "--phase-stage", "4"));
     if (*opt(argc, argv, "--lattice", "")) { c.nstage = 0; char *t = strdup(opt(argc, argv, "--lattice", "")); for (char *q = strtok(t, ","); q && c.nstage < 8; q = strtok(nullptr, ",")) c.lattice[c.nstage++] = atoi(q); free(t); }
     if (*opt(argc, argv, "--steps", "")) { int k = 0; char *t = strdup(opt(argc, argv, "--steps", "")); for (char *q = strtok(t, ","); q && k < 8; q = strtok(nullptr, ",")) c.steps[k++] = atoi(q); for (; k < c.nstage; k++) c.steps[k] = c.steps[k - 1]; free(t); }
-    if (!c.cpu) nn_init(atoi(opt(argc, argv, "--gpu", "0")));
+    fit_fields_skip_planes((c.w_recto > 0 ? 0 : 1) | (c.w_wind4 > 0 || c.uw_rep_w4 > 0 ? 0 : 2));   /* load only the optional planes the terms read */
+    /* the GPU context (~2 s) comes up on a thread while the fields load; the main thread selects the device again after the join */
+    g_fit_gdev = atoi(opt(argc, argv, "--gpu", "0"));
+    if (!c.cpu) { g_fit_gthr = pthread_create(&g_fit_gth, nullptr, fit_gpu_init_thread, nullptr) == 0; if (!g_fit_gthr) nn_init(g_fit_gdev); }
     const double t0 = now();
     const char *min = opt(argc, argv, "--model", nullptr);   /* score / export a saved model or set instead of fitting */
     const int slab = atoi(opt(argc, argv, "--slab", "0")), overlap = atoi(opt(argc, argv, "--overlap", "256"));
     fit_fields_buf fb; memset(&fb, 0, sizeof fb);
+    {   /* the native voxel size first: default lattices and knots are physical, given in 2.4 um voxels, scaled to the fields' native voxels */
+        fit_fields_buf g0; if (fit_fields_load(dir, 0, 0, 0, &g0)) { fprintf(stderr, "fit: cannot load the fields in %s\n", dir); return 1; }
+        c.um = g0.um; fb.h = g0.h; fit_fields_free(&g0);
+        if (!*opt(argc, argv, "--knot-dz", "")) c.knot_dz = fit_scale_L(1024, 2.4 / c.um);
+        if (!*opt(argc, argv, "--lattice", "")) for (int k = 0; k < c.nstage; k++) c.lattice[k] = fit_scale_L(c.lattice[k], 2.4 / c.um);
+    }
+    /* GPU fits stream the fields: the normals straight to the device, the gradient stages' pooled fields made while loading, ~4 B per cell
+       on the host instead of 10 (UFSM_FIT_NOSTREAM=1: off; the options whose host code reads the normals or alters the phase planes
+       before the upload fall back to the whole host fields) */
+    fit_stream fst; memset(&fst, 0, sizeof fst);
+    const int use_stream = !c.cpu && !min && slab <= 0 && !ufsm_env_on("UFSM_FIT_NOSTREAM") && !(c.w_pgrad > 0) && !(c.w_cspacing > 0) && !(c.bend > 0) &&
+                           !(c.phase_stretch > 0) && !(c.w_ct > 0 && c.ct_flood) && !*opt(argc, argv, "--axis-normal", "");
     struct timespec tl0, tl1; clock_gettime(CLOCK_MONOTONIC, &tl0);
-    if (fit_fields_load(dir, 0, 0, min || slab > 0 ? 0 : 1, &fb)) { fprintf(stderr, "fit: cannot load the fields in %s\n", dir); return 1; }
+    if (use_stream) {
+        int fps[8]; const int nfp = fit_stream_fps(&c, fb.h, fps);
+        if (fit_fields_load_stream(dir, &fb, &fst, fps, nfp, fit_gpu_join)) { fprintf(stderr, "fit: cannot load the fields in %s\n", dir); return 1; }
+        fst.drop_pooled = c.dir != 0;   /* (one direction: the pooled planes are not needed after the gradient stages) */
+        if (ufsm_env_on("UFSM_FIT_STREAM_VERIFY")) {   /* (tests: the streamed device / pooled planes against the whole host load) */
+            fit_fields_buf full; if (fit_fields_load(dir, 0, 0, 1, &full)) return 1;
+            const int bad = fit_stream_verify(&fst, &full.f); fit_fields_free(&full);
+            fprintf(stderr, "fit: stream verify: %s (%d pooling factors)\n", bad ? "MISMATCH" : "identical", fst.nfp);
+            if (bad) return 1;
+        }
+        c.stream = &fst;
+    } else if (fit_fields_load(dir, 0, 0, min || slab > 0 ? 0 : 1, &fb)) { fprintf(stderr, "fit: cannot load the fields in %s\n", dir); return 1; }
     clock_gettime(CLOCK_MONOTONIC, &tl1);
+    fit_gpu_join();
     if (c.verbose) fprintf(stderr, "fit: fields %dx%dx%d loaded in %.1fs\n", fb.shape[0], fb.shape[1], fb.shape[2], (double)(tl1.tv_sec - tl0.tv_sec) + (tl1.tv_nsec - tl0.tv_nsec) * 1e-9);   /* (slab runs load per slab; a given model needs the geometry only) */
     emb_vol *embv = nullptr;
     if (opt(argc, argv, "--emb", nullptr) && c.uw_rep_emb > 0) {   /* the embedding over the fields' box (+ the farthest partner distance) */
@@ -1077,9 +1123,6 @@ static int cmd_fit(int argc, char **argv) {
         fprintf(stderr, "fit: --axis-normal: mean normal z %.3f y %.3f x %.3f; axis at box-local (y %.1f, x %.1f), %.0f native voxels away\n",
                 v[0], v[1], v[2], cy - D * ny, cx - D * nx, D);
     }
-    c.um = fb.um;   /* default lattices and knots are physical: given in 2.4 um voxels, scaled to the fields' native voxels */
-    if (!*opt(argc, argv, "--knot-dz", "")) c.knot_dz = fit_scale_L(1024, 2.4 / fb.um);
-    if (!*opt(argc, argv, "--lattice", "")) for (int k = 0; k < c.nstage; k++) c.lattice[k] = fit_scale_L(c.lattice[k], 2.4 / fb.um);
     fit_model *seedm = nullptr, *initm = nullptr;   /* --seed-model / --init-model: a neighbouring (separately fitted) box's model */
     if (*opt(argc, argv, "--seed-model", "")) {
         if (!(seedm = fit_load(opt(argc, argv, "--seed-model", "")))) { fprintf(stderr, "fit: cannot load --seed-model %s\n", opt(argc, argv, "--seed-model", "")); return 1; }
@@ -1105,6 +1148,8 @@ static int cmd_fit(int argc, char **argv) {
     if (!min) { fs->global->um = fb.um; for (int k = 0; k < fs->n; k++) fs->slab[k]->um = fb.um; }
     const long long org[3] = {m->origin[0], m->origin[1], m->origin[2]};
     const int shp[3] = {fb.shape[0], fb.shape[1], fb.shape[2]}; const double h = fb.h;
+    fit_stream_free(&fst); c.stream = nullptr;   /* the fields are done with: the exports and the score read the model and the axis (--winding-gate reloads them) */
+    for (int k = 0; k < 17; k++) { free(fb.a[k]); fb.a[k] = nullptr; }
     fprintf(stderr, "fit: dir %+d, %d slab model(s), global lattice %d (%dx%dx%d), loss %.5f in %.1fs\n", m->dir, fs->n, m->L, m->lz, m->ly, m->lx, m->loss[0], now() - t0);
     const char *mout = opt(argc, argv, "--out", nullptr);
     if (mout && (fs->n ? fit_set_save(fs, mout) : fit_save(fs->global, mout))) { fprintf(stderr, "fit: cannot save %s\n", mout); return 1; }
@@ -2658,10 +2703,88 @@ static int cmd_l1_bench(int argc, char **argv) {
     free(v); free(s);
     return 0;
 }
+/* fit-compare on threads (contiguous z ranges): integer histograms / counts summed; the floating sums (densities by spacing, the
+   segments' turn errors) added afterwards in the serial loop's order, so the output is the serial one's bit for bit */
+enum { FC_NP = 500, FC_NC = 100, FC_NR = 200, FC_NA = 900, FC_NS = 5, FC_NK = 4, FC_NE = 400 };
+typedef struct {
+    size_t hp[FC_NP], hca[FC_NC], hcb[FC_NC], hr[FC_NR], ha[FC_NA], sn[FC_NS], sg[FC_NS], kn[FC_NK], kg[FC_NK], m, lt01, gt25, hrs[FC_NS][FC_NR];
+    size_t hep[FC_NE], hed[FC_NE], nseg, slp, sld, pk_n, pk_sp, pk_sd; double *seg; size_t nsg, csg;   /* seg: ep, ed, ref per segment */
+} fc_part;
+typedef struct { const fit_fields_buf *A, *B; int k; uint8_t *cls; fc_part *P; } fc_job;
+static const double fc_sb[FC_NS + 1] = {0, 100, 140, 180, 240, 1e30}, fc_cb[FC_NK + 1] = {0, 0.2, 0.4, 0.6, 1.01};
+static void fc_cells(void *a, int z0, int z1, int t) {
+    const fc_job *J = a; const fit_fields_buf *A = J->A, *B = J->B; const int k = J->k; fc_part *P = &J->P[t];
+    const size_t HW = (size_t)A->shape[1] * A->shape[2];
+    for (size_t i = (size_t)z0 * HW; i < (size_t)z1 * HW; i++) {
+        const size_t az = i / HW, ay = i / A->shape[2] % A->shape[1], ax = i % A->shape[2];
+        const size_t j = ((az / k) * B->shape[1] + ay / k) * B->shape[2] + ax / k;   /* the candidate cell */
+        if (!A->f.w[i] || !B->f.w[j]) continue;
+        const double ac = (A->f.pc[i] - 128) / 127.0, as = (A->f.ps[i] - 128) / 127.0, bc = (B->f.pc[j] - 128) / 127.0, bs = (B->f.ps[j] - 128) / 127.0;
+        const double ca = hypot(ac, as), cbv = hypot(bc, bs); if (ca <= 0.3) continue;
+        P->m++;
+        double e = (atan2(bs, bc) - atan2(as, ac)) / (2 * M_PI); e -= round(e); e = fabs(e);
+        P->hp[(int)fmin(FC_NP - 1, e / 0.5 * FC_NP)]++; P->lt01 += e < 0.1; P->gt25 += e > 0.25;
+        P->hca[(int)fmin(FC_NC - 1, ca * FC_NC)]++; P->hcb[(int)fmin(FC_NC - 1, cbv * FC_NC)]++;
+        const double spa = A->f.sp[i] * A->h / 8.0 * A->um, spb = B->f.sp[j] * B->h / 8.0 * B->um;   /* spacing in um (sp = 8 / (h rho)) */
+        if (spa > 0 && spb > 0) P->hr[(int)fmin(FC_NR - 1, fmax(0, (log2(spb / spa) + 2) / 4 * FC_NR))]++;   /* log2 ratio in [-2, 2) */
+        if (spa > 0 && spb > 0) for (int q = 0; q < FC_NS; q++) if (spa >= fc_sb[q] && spa < fc_sb[q + 1]) { P->hrs[q][(int)fmin(FC_NR - 1, fmax(0, (log2(spb / spa) + 2) / 4 * FC_NR))]++; J->cls[i] = (uint8_t)(q + 1); }
+        for (int q = 0; q < FC_NS; q++) if (spa >= fc_sb[q] && spa < fc_sb[q + 1]) { P->sn[q]++; P->sg[q] += e > 0.25; }
+        for (int q = 0; q < FC_NK; q++) if (cbv >= fc_cb[q] && cbv < fc_cb[q + 1]) { P->kn[q]++; P->kg[q] += e > 0.25; }
+        double va[3], vb[3]; fc_axis(&A->f, i, va); fc_axis(&B->f, j, vb);
+        const double ang = acos(fmin(1, fabs(va[0] * vb[0] + va[1] * vb[1] + va[2] * vb[2]))) * 180 / M_PI;
+        P->ha[(int)fmin(FC_NA - 1, ang / 90 * FC_NA)]++;
+    }
+}
+/* the turn count without the fitter: 0.5 mm segments along the radial direction (away from the axis, in z planes) from every 4th
+   reference cell; the reference crosses n turns (its phase unwrapped along the segment, every step known with confidence > 0.3); the
+   candidate's count from its phase unwrapped the same way, and from its density integrated along the segment (|n . r| / spacing, n
+   the principal axis of its n n^T): a field too coarse for its phase to resolve the sheets can still count them by density. Error =
+   candidate - reference turns (negative: sheets missed). Threads over the segment z planes (z = 4 a). */
+static void fc_segs(void *a, int a0, int a1, int t) {
+    const fc_job *J = a; const fit_fields_buf *A = J->A, *B = J->B; fc_part *P = &J->P[t];
+    const double L = 500.0, ds = 0.5 * A->h * A->um;   /* segment length and step (um) */
+    const int ns = (int)(L / ds);
+    const double cu = A->h * A->um, ccu = B->h * B->um;   /* reference / candidate cell edge (um) */
+    for (int zi = a0; zi < a1; zi++) for (int y = 0; y < A->shape[1]; y += 4) for (int x = 0; x < A->shape[2]; x += 4) {
+        const int z = 4 * zi;
+        const double nz = A->h * (z + 0.5);   /* native z of the cell centre (reference's native voxels, box-local) */
+        const int az = (int)fmin(fmax(nz, 0), A->shape[0] * A->h); const double cyv = A->f.cy[az], cxv = A->f.cx[az];
+        double py = A->h * (y + 0.5), px = A->h * (x + 0.5);
+        double ry = py - cyv, rx = px - cxv; const double rl = hypot(ry, rx); if (rl < 1) continue; ry /= rl; rx /= rl;
+        double pa = 0, pb = 0, ta = 0, tb = 0, td = 0, la = 0, lb = 0, spsum = 0; int ok = 1, hb = 0;
+        for (int k = 0; k <= ns && ok; k++) {
+            const double qy = py + ry * k * ds / A->um, qx = px + rx * k * ds / A->um;   /* native voxels */
+            const int iy = (int)(qy / A->h), ix = (int)(qx / A->h);
+            if (iy < 0 || ix < 0 || iy >= A->shape[1] || ix >= A->shape[2]) { ok = 0; break; }
+            const size_t i = ((size_t)z * A->shape[1] + iy) * A->shape[2] + ix;
+            const double ac = (A->f.pc[i] - 128) / 127.0, as = (A->f.ps[i] - 128) / 127.0;
+            if (!A->f.w[i] || hypot(ac, as) <= 0.3) { ok = 0; break; }
+            const size_t j = (((size_t)(nz * A->um / ccu)) * B->shape[1] + (size_t)(qy * A->um / ccu)) * B->shape[2] + (size_t)(qx * A->um / ccu);
+            const double bc = (B->f.pc[j] - 128) / 127.0, bs = (B->f.ps[j] - 128) / 127.0;
+            pa = atan2(as, ac) / (2 * M_PI); spsum += A->f.sp[i] * cu / 8.0;
+            if (k) { double d = pa - la; d -= round(d); ta += d; }
+            la = pa;
+            if (hypot(bc, bs) > 1e-3) { pb = atan2(bs, bc) / (2 * M_PI); if (hb) { double d = pb - lb; d -= round(d); tb += d; } lb = pb; hb = 1; }
+            if (k < ns && B->f.sp[j] && B->f.w[j]) {   /* density: |n . r| / spacing over the step */
+                double v[3]; fc_axis(&B->f, j, v);
+                td += fabs(v[1] * ry + v[2] * rx) * ds / (B->f.sp[j] * ccu / 8.0);
+            }
+        }
+        if (!ok) continue;
+        const double ref = fabs(ta); if (ref < 0.5) continue;   /* a segment with under half a turn says nothing about counting */
+        const double ep = fabs(tb) - ref, ed = td - ref;
+        P->hep[(int)fmin(FC_NE - 1, fmax(0, (ep + 4) / 8 * FC_NE))]++; P->hed[(int)fmin(FC_NE - 1, fmax(0, (ed + 4) / 8 * FC_NE))]++;
+        P->nseg++; P->slp += fabs(ep) >= 0.5; P->sld += fabs(ed) >= 0.5;
+        if (P->nsg == P->csg) { P->csg = P->csg ? 2 * P->csg : 4096; P->seg = realloc(P->seg, P->csg * 3 * sizeof *P->seg); if (!P->seg) abort(); }
+        P->seg[3 * P->nsg] = ep; P->seg[3 * P->nsg + 1] = ed; P->seg[3 * P->nsg + 2] = ref; P->nsg++;
+        if (spsum / (ns + 1) < 100) { P->pk_n++; P->pk_sp += fabs(ep) >= 0.5; P->pk_sd += fabs(ed) >= 0.5; }
+    }
+}
 static int cmd_fit_compare(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: ufsm fit-compare <reference-fields> <fields> [--surf ROOT KEY [--surf-hi 0.5] [--surf-lo 0.3]]\n"
                                     "  --surf: also count sheet crossings as peaks of a uint8 surface probability array (e.g. ufsm hercuvit) on the turn-count segments\n"); return 2; }
     fit_fields_buf A, B;
+    fit_fields_skip_planes(3);   /* (neither the recto nor the winding mod 4 planes are compared) */
     if (fit_fields_load(argv[2], 0, 0, 1, &A) || fit_fields_load(argv[3], 0, 0, 1, &B)) { fprintf(stderr, "fit-compare: cannot load the fields\n"); return 1; }
     /* the candidate's cells may be k times the reference's (a coarser net, e.g. 38.4 um cells against the 19.2 um oracle): each
        reference cell reads the candidate cell that contains it */
@@ -2673,93 +2796,67 @@ static int cmd_fit_compare(int argc, char **argv) {
         }
     }
     const size_t n = (size_t)A.shape[0] * A.shape[1] * A.shape[2];
-    enum { NP = 500, NC = 100, NR = 200, NA = 900, NS = 5, NK = 4 };
-    size_t hp[NP] = {0}, hca[NC] = {0}, hcb[NC] = {0}, hr[NR] = {0}, ha[NA] = {0}, sn[NS] = {0}, sg[NS] = {0}, kn[NK] = {0}, kg[NK] = {0}, m = 0, lt01 = 0, gt25 = 0;
-    const double sb[NS + 1] = {0, 100, 140, 180, 240, 1e30}, cb[NK + 1] = {0, 0.2, 0.4, 0.6, 1.01};
+    enum { NP = FC_NP, NC = FC_NC, NR = FC_NR, NA = FC_NA, NS = FC_NS, NK = FC_NK, NE = FC_NE };
+    const double *sb = fc_sb, *cb = fc_cb;
     if (k > 1) printf("fit-compare: candidate cells %dx the reference's\n", k);
-    static size_t hrs[NS][NR]; memset(hrs, 0, sizeof hrs); double dra[NS] = {0}, drb[NS] = {0};   /* by reference spacing: spacing ratio histogram, summed densities (1 / um) */
-    for (size_t i = 0; i < n; i++) {
-        const size_t az = i / ((size_t)A.shape[1] * A.shape[2]), ay = i / A.shape[2] % A.shape[1], ax = i % A.shape[2];
-        const size_t j = ((az / k) * B.shape[1] + ay / k) * B.shape[2] + ax / k;   /* the candidate cell */
-        if (!A.f.w[i] || !B.f.w[j]) continue;
-        const double ac = (A.f.pc[i] - 128) / 127.0, as = (A.f.ps[i] - 128) / 127.0, bc = (B.f.pc[j] - 128) / 127.0, bs = (B.f.ps[j] - 128) / 127.0;
-        const double ca = hypot(ac, as), cbv = hypot(bc, bs); if (ca <= 0.3) continue;
-        m++;
-        double e = (atan2(bs, bc) - atan2(as, ac)) / (2 * M_PI); e -= round(e); e = fabs(e);
-        hp[(int)fmin(NP - 1, e / 0.5 * NP)]++; lt01 += e < 0.1; gt25 += e > 0.25;
-        hca[(int)fmin(NC - 1, ca * NC)]++; hcb[(int)fmin(NC - 1, cbv * NC)]++;
-        const double spa = A.f.sp[i] * A.h / 8.0 * A.um, spb = B.f.sp[j] * B.h / 8.0 * B.um;   /* spacing in um (sp = 8 / (h rho)) */
-        if (spa > 0 && spb > 0) hr[(int)fmin(NR - 1, fmax(0, (log2(spb / spa) + 2) / 4 * NR))]++;   /* log2 ratio in [-2, 2) */
-        if (spa > 0 && spb > 0) for (int k = 0; k < NS; k++) if (spa >= sb[k] && spa < sb[k + 1]) { hrs[k][(int)fmin(NR - 1, fmax(0, (log2(spb / spa) + 2) / 4 * NR))]++; dra[k] += 1 / spa; drb[k] += 1 / spb; }
-        for (int k = 0; k < NS; k++) if (spa >= sb[k] && spa < sb[k + 1]) { sn[k]++; sg[k] += e > 0.25; }
-        for (int k = 0; k < NK; k++) if (cbv >= cb[k] && cbv < cb[k + 1]) { kn[k]++; kg[k] += e > 0.25; }
-        double va[3], vb[3]; fc_axis(&A.f, i, va); fc_axis(&B.f, j, vb);
-        const double ang = acos(fmin(1, fabs(va[0] * vb[0] + va[1] * vb[1] + va[2] * vb[2]))) * 180 / M_PI;
-        ha[(int)fmin(NA - 1, ang / 90 * NA)]++;
+    const int ntm = fit_par_threads(1 << 30);
+    fc_part *P = calloc(ntm, sizeof *P); uint8_t *cls = calloc(n ? n : 1, 1);   /* cls: the spacing class + 1 of the cells in the density sums */
+    if (!P || !cls) { fprintf(stderr, "fit-compare: out of memory\n"); return 1; }
+    fc_job J = {&A, &B, k, cls, P};
+    int nt = fit_par(A.shape[0], fc_cells, &J);
+    fc_part S = {0};
+    for (int t = 0; t < nt; t++) {
+        for (int q = 0; q < NP; q++) S.hp[q] += P[t].hp[q];
+        for (int q = 0; q < NC; q++) { S.hca[q] += P[t].hca[q]; S.hcb[q] += P[t].hcb[q]; }
+        for (int q = 0; q < NR; q++) S.hr[q] += P[t].hr[q];
+        for (int q = 0; q < NA; q++) S.ha[q] += P[t].ha[q];
+        for (int q = 0; q < NS; q++) { S.sn[q] += P[t].sn[q]; S.sg[q] += P[t].sg[q]; for (int r = 0; r < NR; r++) S.hrs[q][r] += P[t].hrs[q][r]; }
+        for (int q = 0; q < NK; q++) { S.kn[q] += P[t].kn[q]; S.kg[q] += P[t].kg[q]; }
+        S.m += P[t].m; S.lt01 += P[t].lt01; S.gt25 += P[t].gt25;
     }
-    if (!m) { fprintf(stderr, "fit-compare: no cells with reference phase\n"); return 1; }
+    double dra[NS] = {0}, drb[NS] = {0};   /* by reference spacing: summed densities (1 / um), in cell order */
+    for (size_t i = 0; i < n; i++) {
+        if (!cls[i]) continue;
+        const size_t az = i / ((size_t)A.shape[1] * A.shape[2]), ay = i / A.shape[2] % A.shape[1], ax = i % A.shape[2];
+        const size_t j = ((az / k) * B.shape[1] + ay / k) * B.shape[2] + ax / k;
+        const double spa = A.f.sp[i] * A.h / 8.0 * A.um, spb = B.f.sp[j] * B.h / 8.0 * B.um;
+        dra[cls[i] - 1] += 1 / spa; drb[cls[i] - 1] += 1 / spb;
+    }
+    free(cls);
+    const size_t m = S.m;
+    if (!m) { fprintf(stderr, "fit-compare: no cells with reference phase\n"); free(P); return 1; }
     printf("fit-compare: %zu cells with reference phase (confidence > 0.3) and material in both\n", m);
-    printf("  phase |error| (turns): median %.3f p75 %.3f p90 %.3f; < 0.1 %.3f, > 0.25 %.3f\n", hist_q(hp, NP, 0, 0.5 / NP, 0.5), hist_q(hp, NP, 0, 0.5 / NP, 0.75), hist_q(hp, NP, 0, 0.5 / NP, 0.9), (double)lt01 / m, (double)gt25 / m);
-    printf("  phase confidence: median %.2f (reference %.2f)\n", hist_q(hcb, NC, 0, 1.0 / NC, 0.5), hist_q(hca, NC, 0, 1.0 / NC, 0.5));
-    printf("  spacing ratio: median %.3f p10 %.3f p90 %.3f\n", exp2(hist_q(hr, NR, -2, 4.0 / NR, 0.5)), exp2(hist_q(hr, NR, -2, 4.0 / NR, 0.1)), exp2(hist_q(hr, NR, -2, 4.0 / NR, 0.9)));
+    printf("  phase |error| (turns): median %.3f p75 %.3f p90 %.3f; < 0.1 %.3f, > 0.25 %.3f\n", hist_q(S.hp, NP, 0, 0.5 / NP, 0.5), hist_q(S.hp, NP, 0, 0.5 / NP, 0.75), hist_q(S.hp, NP, 0, 0.5 / NP, 0.9), (double)S.lt01 / m, (double)S.gt25 / m);
+    printf("  phase confidence: median %.2f (reference %.2f)\n", hist_q(S.hcb, NC, 0, 1.0 / NC, 0.5), hist_q(S.hca, NC, 0, 1.0 / NC, 0.5));
+    printf("  spacing ratio: median %.3f p10 %.3f p90 %.3f\n", exp2(hist_q(S.hr, NR, -2, 4.0 / NR, 0.5)), exp2(hist_q(S.hr, NR, -2, 4.0 / NR, 0.1)), exp2(hist_q(S.hr, NR, -2, 4.0 / NR, 0.9)));
     printf("  density ratio (candidate / reference, the sum over cells: the count ratio; median of the per-cell ratio) by reference spacing:");
-    for (int k = 0; k < NS; k++) if (sn[k]) printf("  %s%.0f um %.3f (%.3f)", k == NS - 1 ? ">= " : "< ", k == NS - 1 ? sb[k] : sb[k + 1], dra[k] > 0 ? drb[k] / dra[k] : 0, 1 / exp2(hist_q(hrs[k], NR, -2, 4.0 / NR, 0.5)));
+    for (int q = 0; q < NS; q++) if (S.sn[q]) printf("  %s%.0f um %.3f (%.3f)", q == NS - 1 ? ">= " : "< ", q == NS - 1 ? sb[q] : sb[q + 1], dra[q] > 0 ? drb[q] / dra[q] : 0, 1 / exp2(hist_q(S.hrs[q], NR, -2, 4.0 / NR, 0.5)));
     printf("\n");
-    printf("  normal angle (degrees): median %.1f p90 %.1f\n", hist_q(ha, NA, 0, 90.0 / NA, 0.5), hist_q(ha, NA, 0, 90.0 / NA, 0.9));
+    printf("  normal angle (degrees): median %.1f p90 %.1f\n", hist_q(S.ha, NA, 0, 90.0 / NA, 0.5), hist_q(S.ha, NA, 0, 90.0 / NA, 0.9));
     printf("  gross phase errors by reference spacing:");
-    for (int k = 0; k < NS; k++) printf("  %s%.0f um %.3f (%zu)", k == NS - 1 ? ">= " : "< ", k == NS - 1 ? sb[k] : sb[k + 1], sn[k] ? (double)sg[k] / sn[k] : 0, sn[k]);
+    for (int q = 0; q < NS; q++) printf("  %s%.0f um %.3f (%zu)", q == NS - 1 ? ">= " : "< ", q == NS - 1 ? sb[q] : sb[q + 1], S.sn[q] ? (double)S.sg[q] / S.sn[q] : 0, S.sn[q]);
     printf("\n  gross phase errors by confidence:");
-    for (int k = 0; k < NK; k++) printf("  %.1f-%.1f %.3f (%zu)", cb[k], fmin(1, cb[k + 1]), kn[k] ? (double)kg[k] / kn[k] : 0, kn[k]);
+    for (int q = 0; q < NK; q++) printf("  %.1f-%.1f %.3f (%zu)", cb[q], fmin(1, cb[q + 1]), S.kn[q] ? (double)S.kg[q] / S.kn[q] : 0, S.kn[q]);
     printf("\n");
-    {   /* the turn count without the fitter: 0.5 mm segments along the radial direction (away from the axis, in z planes) from
-           every 4th reference cell; the reference crosses n turns (its phase unwrapped along the segment, every step known with
-           confidence > 0.3); the candidate's count from its phase unwrapped the same way, and from its density integrated along
-           the segment (|n . r| / spacing, n the principal axis of its n n^T): a field too coarse for its phase to resolve the
-           sheets can still count them by density. Error = candidate - reference turns (negative: sheets missed) */
-        const double L = 500.0, ds = 0.5 * A.h * A.um;   /* segment length and step (um) */
-        const int ns = (int)(L / ds);
-        enum { NE = 400 }; size_t hep[NE] = {0}, hed[NE] = {0}, nseg = 0, slp = 0, sld = 0; double bp = 0, bd = 0, rt = 0;
-        size_t pk_n = 0, pk_sp = 0, pk_sd = 0;   /* segments whose reference spacing is under 100 um: slips */
-        const double cu = A.h * A.um, ccu = B.h * B.um;   /* reference / candidate cell edge (um) */
-        for (int z = 0; z < A.shape[0]; z += 4) for (int y = 0; y < A.shape[1]; y += 4) for (int x = 0; x < A.shape[2]; x += 4) {
-            const double nz = A.h * (z + 0.5);   /* native z of the cell centre (reference's native voxels, box-local) */
-            const int az = (int)fmin(fmax(nz, 0), A.shape[0] * A.h); const double cyv = A.f.cy[az], cxv = A.f.cx[az];
-            double py = A.h * (y + 0.5), px = A.h * (x + 0.5);
-            double ry = py - cyv, rx = px - cxv; const double rl = hypot(ry, rx); if (rl < 1) continue; ry /= rl; rx /= rl;
-            double pa = 0, pb = 0, ta = 0, tb = 0, td = 0, la = 0, lb = 0, spsum = 0; int ok = 1, hb = 0;
-            for (int k = 0; k <= ns && ok; k++) {
-                const double qy = py + ry * k * ds / A.um, qx = px + rx * k * ds / A.um;   /* native voxels */
-                const int iy = (int)(qy / A.h), ix = (int)(qx / A.h);
-                if (iy < 0 || ix < 0 || iy >= A.shape[1] || ix >= A.shape[2]) { ok = 0; break; }
-                const size_t i = ((size_t)z * A.shape[1] + iy) * A.shape[2] + ix;
-                const double ac = (A.f.pc[i] - 128) / 127.0, as = (A.f.ps[i] - 128) / 127.0;
-                if (!A.f.w[i] || hypot(ac, as) <= 0.3) { ok = 0; break; }
-                const size_t j = (((size_t)(nz * A.um / ccu)) * B.shape[1] + (size_t)(qy * A.um / ccu)) * B.shape[2] + (size_t)(qx * A.um / ccu);
-                const double bc = (B.f.pc[j] - 128) / 127.0, bs = (B.f.ps[j] - 128) / 127.0;
-                pa = atan2(as, ac) / (2 * M_PI); spsum += A.f.sp[i] * cu / 8.0;
-                if (k) { double d = pa - la; d -= round(d); ta += d; }
-                la = pa;
-                if (hypot(bc, bs) > 1e-3) { pb = atan2(bs, bc) / (2 * M_PI); if (hb) { double d = pb - lb; d -= round(d); tb += d; } lb = pb; hb = 1; }
-                if (k < ns && B.f.sp[j] && B.f.w[j]) {   /* density: |n . r| / spacing over the step */
-                    double v[3]; fc_axis(&B.f, j, v);
-                    td += fabs(v[1] * ry + v[2] * rx) * ds / (B.f.sp[j] * ccu / 8.0);
-                }
-            }
-            if (!ok) continue;
-            const double ref = fabs(ta); if (ref < 0.5) continue;   /* a segment with under half a turn says nothing about counting */
-            const double ep = fabs(tb) - ref, ed = td - ref;
-            hep[(int)fmin(NE - 1, fmax(0, (ep + 4) / 8 * NE))]++; hed[(int)fmin(NE - 1, fmax(0, (ed + 4) / 8 * NE))]++;
-            nseg++; slp += fabs(ep) >= 0.5; sld += fabs(ed) >= 0.5; bp += ep; bd += ed; rt += ref;
-            if (spsum / (ns + 1) < 100) { pk_n++; pk_sp += fabs(ep) >= 0.5; pk_sd += fabs(ed) >= 0.5; }
+    {
+        nt = fit_par((A.shape[0] + 3) / 4, fc_segs, &J);
+        double bp = 0, bd = 0, rt = 0;
+        for (int t = 0; t < nt; t++) {
+            for (int q = 0; q < NE; q++) { S.hep[q] += P[t].hep[q]; S.hed[q] += P[t].hed[q]; }
+            S.nseg += P[t].nseg; S.slp += P[t].slp; S.sld += P[t].sld; S.pk_n += P[t].pk_n; S.pk_sp += P[t].pk_sp; S.pk_sd += P[t].pk_sd;
+            for (size_t s = 0; s < P[t].nsg; s++) { bp += P[t].seg[3 * s]; bd += P[t].seg[3 * s + 1]; rt += P[t].seg[3 * s + 2]; }   /* (segment order) */
+            free(P[t].seg);
         }
+        const size_t nseg = S.nseg;
         if (nseg) {
             printf("  turn counts on %zu radial 0.5 mm segments (reference %.2f turns each on average):\n", nseg, rt / nseg);
             printf("    by phase:   error median %+.2f, mean %+.2f turns, off by >= 0.5 turn %.3f (packed < 100 um: %.3f of %zu)\n",
-                   hist_q(hep, NE, -4, 8.0 / NE, 0.5), bp / nseg, (double)slp / nseg, pk_n ? (double)pk_sp / pk_n : 0, pk_n);
+                   hist_q(S.hep, NE, -4, 8.0 / NE, 0.5), bp / nseg, (double)S.slp / nseg, S.pk_n ? (double)S.pk_sp / S.pk_n : 0, S.pk_n);
             printf("    by density: error median %+.2f, mean %+.2f turns, off by >= 0.5 turn %.3f (packed < 100 um: %.3f)\n",
-                   hist_q(hed, NE, -4, 8.0 / NE, 0.5), bd / nseg, (double)sld / nseg, pk_n ? (double)pk_sd / pk_n : 0);
+                   hist_q(S.hed, NE, -4, 8.0 / NE, 0.5), bd / nseg, (double)S.sld / nseg, S.pk_n ? (double)S.pk_sd / S.pk_n : 0);
         }
     }
+    free(P);
     if (arg_index(argc, argv, "--surf") > 0 && fc_surf_counts(argc, argv, &A)) { fit_fields_free(&A); fit_fields_free(&B); return 1; }
     fit_fields_free(&A); fit_fields_free(&B);
     return 0;

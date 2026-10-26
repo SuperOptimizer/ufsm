@@ -25,6 +25,17 @@ static double fj_knot(const float *v, int nk, int dz, double z) {   /* (fit.c kn
 
 static int cmp_long(const void *a, const void *b) { const long x = *(const long *)a, y = *(const long *)b; return (x > y) - (x < y); }
 
+/* the slabs' W difference at sampled overlap cells, chunks of 4096 samples [c0, c1) */
+typedef struct { const fit_model *a, *b; double za, zb, h; int fz0; size_t HW; int H, W; const size_t *iv; double *dv; size_t n; } fj_job;
+static void fj_rows(void *ctx, int c0, int c1, int t) {
+    const fj_job *J = ctx; (void)t;
+    for (size_t q = (size_t)c0 * 4096; q < (size_t)c1 * 4096 && q < J->n; q++) {
+        const size_t i = J->iv[q]; const int zz = (int)(i / J->HW), yy = (int)((i / J->W) % J->H), xx = (int)(i % J->W);
+        const double z = (J->fz0 + zz + 0.5) * J->h, y = (yy + 0.5) * J->h, x = (xx + 0.5) * J->h;
+        J->dv[q] = fit_W(J->b, z - J->zb, y, x) - fit_W(J->a, z - J->za, y, x);
+    }
+}
+
 int cmd_fit_join(int argc, char **argv) {
     if (argc < 7) {
         fprintf(stderr, "usage: ufsm fit-join <out-set> <fields-dir> [--blend 16] [--min-conf 0.3] [--samples 4000000] <slab-model> <z0> <z1> ...\n"
@@ -42,6 +53,7 @@ int cmd_fit_join(int argc, char **argv) {
     }
     const int ns = (argc - ai) / 3;
     if (ns < 1 || (argc - ai) % 3 || !(blend >= 0) || nsamp < 1) { fprintf(stderr, "fit-join: give <slab-model> <z0> <z1> triples (and --blend >= 0)\n"); return 2; }
+    fit_fields_skip_planes(1 | 2 | 4); fit_fields_ct_planes(0);   /* (the overlaps read pc ps w only) */
     fit_fields_buf g; if (fit_fields_load(fdir, 0, 0, 0, &g)) { fprintf(stderr, "fit-join: cannot read the fields in %s\n", fdir); return 1; }
     const double h = g.h, Z = g.shape[0] * h;
     fit_set *s = calloc(1, sizeof *s); s->n = ns; s->blend = blend;
@@ -78,17 +90,18 @@ int cmd_fit_join(int argc, char **argv) {
         const size_t stride = cand > (size_t)nsamp ? cand / (size_t)nsamp : 1;
         long long used = 0, near = 0; size_t seen = 0;   /* (slab gauges are arbitrary: the rounded differences can be any integer) */
         double *dv = malloc(sizeof(double) * (cand / stride + 2)); long *rv = malloc(sizeof(long) * (cand / stride + 2)); size_t nd = 0;
+        size_t *iv = malloc(sizeof(size_t) * (cand / stride + 2)); size_t ni = 0;   /* the sampled cells, in cell order */
         for (size_t i = 0; i < n; i++) {
             if (!f.f.w[i]) continue;
             if (seen++ % stride) continue;
             const double c = (f.f.pc[i] - 128) / 127.0, sn = (f.f.ps[i] - 128) / 127.0;
             if (c * c + sn * sn < minc * minc) continue;
-            const int zz = (int)(i / HW), yy = (int)((i / f.shape[2]) % f.shape[1]), xx = (int)(i % f.shape[2]);
-            const double z = (fz0 + zz + 0.5) * h, y = (yy + 0.5) * h, x = (xx + 0.5) * h;
-            const double d = fit_W(b, z - zb, y, x) - fit_W(a, z - za, y, x);
-            if (!isfinite(d)) continue;
-            rv[nd] = lround(d); dv[nd++] = d; used++;
+            iv[ni++] = i;
         }
+        fj_job J = {a, b, za, zb, h, fz0, HW, f.shape[1], f.shape[2], iv, dv, ni};
+        fit_par((int)((ni + 4095) / 4096), fj_rows, &J);   /* (W differences on threads, written by position) */
+        for (size_t q = 0; q < ni; q++) { const double d = dv[q]; if (!isfinite(d)) continue; rv[nd] = lround(d); dv[nd++] = d; used++; }   /* (nd <= q: in place) */
+        free(iv);
         qsort(rv, nd, sizeof(long), cmp_long);   /* the mode of the rounded differences */
         long shift = 0; size_t bestn = 0;
         for (size_t i = 0; i < nd;) { size_t j = i; while (j < nd && rv[j] == rv[i]) j++; if (j - i > bestn) { bestn = j - i; shift = rv[i]; } i = j; }

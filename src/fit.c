@@ -262,6 +262,8 @@ static void fit_zpar(int D, int nt, fit_zfn fn, void *ctx) {
     fit_zrun(&jb[0]);
     for (int t = 1; t < nt; t++) { if (up[t]) pthread_join(th[t], nullptr); else fit_zrun(&jb[t]); }
 }
+int fit_par_threads(int n) { return fit_nthreads(n); }
+int fit_par(int n, void (*fn)(void *ctx, int a0, int a1, int t), void *ctx) { if (n <= 0) return 0; const int nt = fit_nthreads(n); fit_zpar(n, nt, fn, ctx); return nt; }
 
 /* Voxel-level quality-guided phase unwrapping: per field voxel the wrapped unwrapped-radius u = frac(phi + dir theta / 2 pi) (U mod 1,
    single-valued away from the axis), flooded from the most confident voxel in order of confidence (phasor length x material),
@@ -280,8 +282,11 @@ static void fit_zpar(int D, int nt, fit_zfn fn, void *ctx) {
    consensus over seeds gains nothing; only the quality order (uw_q) shapes where the flood crosses dislocations. */
 enum { UQ_LEVELS = 4096 };
 #define UQ_NONE UINT32_MAX
-#define UK_UNSET INT16_MIN
-typedef struct { float uw; int16_t k; uint16_t bk; } uw_vox;   /* wrapped U; integer turns minus the seed's (UK_UNSET: not reached);
+#define UK_UNSET 0         /* an all-zero record: not reached, bk 0 (the records start as fresh zero pages: only the bricks holding
+                              unwrappable voxels take memory) */
+#define UK_BIAS 16384      /* the integer base kb sits this far below the seed's integer, so reached voxels hold k > 0 (k in 1..32767:
+                              -16383..+16383 turns from the seed) */
+typedef struct { float uw; int16_t k; uint16_t bk; } uw_vox;   /* wrapped U; integer turns minus the base kb (UK_UNSET: not reached);
                                                                 confidence bucket (0: not unwrapped). 8 B: the flood is memory bound */
 static_assert(sizeof(uw_vox) == 8);
 /* records in UB_S^3 bricks (UB = log2 UB_S; a voxel's six neighbours mostly within the brick; linear rows put z neighbours 32 MB away) */
@@ -300,13 +305,23 @@ static inline void ub_zyx(const uw_geo *g, uint32_t id, int *z, int *y, int *x) 
 typedef struct {
     fit_model *m; const fit_fields *f; const fit_cfg *c; double min_conf; int na, nt; uw_geo g;
     uw_vox *V; int32_t kb;                 /* the records; their integer base (the seed's integer) */
-    _Atomic size_t over;                   /* integers more than 32767 turns from the base (left unreached) */
+    _Atomic size_t over;                   /* integers more than 16383 turns from the seed (left unreached) */
     float qb[64]; size_t sb[64];            /* per thread: the best confidence and its voxel */
     double *acc, *wsum;
 } uw_ctx;
-static void *uw_alloc_huge(size_t bytes) {   /* 2 MB aligned and advised onto transparent huge pages */
+/* the records: fresh anonymous zero pages (= UK_UNSET, bk 0), written only where a voxel can be unwrapped. Up to UFSM_UW_HUGE_GB (1)
+   on transparent huge pages (the flood is memory-latency bound: fewer TLB misses), above that on 4 KB pages (one 8^3 brick per page),
+   so a full cross-section (~6% of its voxels reached) takes the bricks with material, not 8 B per voxel; *base / *len: the mapping
+   (munmap) */
+static void *uw_alloc_records(size_t bytes, void **base, size_t *len) {
     const size_t A = (size_t)2 << 20; bytes = (bytes + A - 1) / A * A;
-    void *p = aligned_alloc(A, bytes); if (p) madvise(p, bytes, MADV_HUGEPAGE); return p;
+    void *p = mmap(nullptr, bytes + A, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (p == MAP_FAILED) return nullptr;
+    const char *e = getenv("UFSM_UW_HUGE_GB"); const double hg = e ? atof(e) : 1.0;
+    uint8_t *a = (uint8_t *)(((uintptr_t)p + A - 1) / A * A);   /* (2 MB aligned inside the mapping) */
+    madvise(a, bytes, (double)bytes <= hg * 1e9 ? MADV_HUGEPAGE : MADV_NOHUGEPAGE);
+    *base = p; *len = bytes + A;
+    return a;
 }
 /* phase derivative variance of voxel i (turns^2): the mean square of the wrapped second differences of the phase along z, y and x
    (over the axes whose two neighbours carry a phase); ~0 where the phase is locally linear, large at dislocations and noise */
@@ -334,19 +349,16 @@ static float uw_q(const fit_fields *f, size_t i, double min_conf, const fit_cfg 
     if (c->uw_pdv > 0) q *= exp(-uw_pdv(f, i, *ang) / (c->uw_pdv * c->uw_pdv));
     return (float)q;
 }
-static void uw_zero(void *a, int b0, int b1, int t) {   /* brick layers [b0, b1) (first touch of the huge pages, on threads) */
-    uw_ctx *x = a; const size_t L = (size_t)x->g.bH * x->g.bW << (3 * UB); memset(x->V + (size_t)b0 * L, 0, (size_t)(b1 - b0) * L * sizeof *x->V);
-}
 static void uw_setup(void *a, int z0, int z1, int t) {
     uw_ctx *x = a; const fit_fields *f = x->f; const size_t HW = (size_t)f->H * f->W;
     float qb = 0; size_t sb = (size_t)-1;
     for (int z = z0; z < z1; z++) {
         const double pz = (z + 0.5) * f->h, cy = axis_lerp(f->cy, x->na, pz), cx = axis_lerp(f->cx, x->na, pz);
         for (int y = 0; y < f->H; y++) for (int xx = 0; xx < f->W; xx++) {
-            const size_t i = z * HW + (size_t)y * f->W + xx; double ang = 0; uw_vox *v = &x->V[ub_id(&x->g, z, y, xx)];
-            v->k = UK_UNSET;
+            const size_t i = z * HW + (size_t)y * f->W + xx; double ang = 0;
             const float q = uw_q(f, i, x->min_conf, x->c, &ang);
-            if (q <= 0) { v->bk = 0; v->uw = 0; continue; }
+            if (q <= 0) continue;   /* (the record stays zero: uw 0, UK_UNSET, bk 0; its page untouched) */
+            uw_vox *v = &x->V[ub_id(&x->g, z, y, xx)]; v->k = UK_UNSET;
             const double th = atan2((y + 0.5) * f->h - cy, (xx + 0.5) * f->h - cx);
             double u = ang / (2 * M_PI) + x->m->dir * th / (2 * M_PI); u -= floor(u);
             v->uw = (float)u; v->bk = (uint16_t)(1 + (int)(fminf(q, 1.f) * (UQ_LEVELS - 2)));
@@ -365,7 +377,7 @@ static void uw_seedmodel(void *a, int z0, int z1, int t) {   /* the seed model's
             const double py = (y + 0.5) * f->h, px = (xx + 0.5) * f->h, th = atan2(py - cy, px - cx);
             const double Us = fit_W(c->seed, pz + c->seed_off, py, px) + x->m->dir * th / (2 * M_PI);
             const int32_t kr = (int32_t)round(Us - v->uw) - x->kb;
-            if (kr > INT16_MIN && kr <= INT16_MAX) v->k = (int16_t)kr; else atomic_fetch_add(&x->over, 1);
+            if (kr > UK_UNSET && kr <= INT16_MAX) v->k = (int16_t)kr; else atomic_fetch_add(&x->over, 1);
         }
     }
 }
@@ -437,7 +449,7 @@ static size_t uw_flood(uw_ctx *x, uw_queue *q, const uw_box *bx) {
             const uint32_t j = ub_id(g, nb3[q6][0], nb3[q6][1], nb3[q6][2]); uw_vox *vj = &V[j];
             if (!vj->bk || vj->bk < bx->minb || vj->k != UK_UNSET) continue;
             const int32_t kr = (int32_t)round(ui - vj->uw) - x->kb;
-            if (kr <= INT16_MIN || kr > INT16_MAX) { over++; continue; }
+            if (kr <= UK_UNSET || kr > INT16_MAX) { over++; continue; }
             vj->k = (int16_t)kr; reached++;
             if (bx->comp) bx->comp[j] = bx->cid;
             uq_push(q, j, vj->bk);
@@ -451,7 +463,7 @@ static int32_t uw_model_k(const uw_ctx *x, int z, int y, int xx, float uw) {
     const fit_fields *f = x->f; const double pz = (z + 0.5) * f->h, py = (y + 0.5) * f->h, px = (xx + 0.5) * f->h;
     const double th = atan2(py - axis_lerp(f->cy, x->na, pz), px - axis_lerp(f->cx, x->na, pz));
     const int32_t kr = (int32_t)round(fit_W(x->m, pz, py, px) + x->m->dir * th / (2 * M_PI) - uw) - x->kb;
-    return kr > INT16_MIN && kr <= INT16_MAX ? kr : INT32_MIN;
+    return kr > UK_UNSET && kr <= INT16_MAX ? kr : INT32_MIN;
 }
 
 /* Two-level unwrapping (--uw-split S): the serial flood is bound by memory latency and needs every record in one address space (the
@@ -538,7 +550,7 @@ static void uw2_apply(void *a, int t0, int t1, int th) {   /* (B'): the joined p
         for (int z = b.z0; z < b.z1; z++) for (int y = b.y0; y < b.y1; y++) for (int xx = b.x0; xx < b.x1; xx++) {
             const uint32_t i = ub_id(g, z, y, xx); if (!u->comp[i]) continue;
             const int32_t s = u->shift[u->tbase[t] + u->comp[i] - 1], k = s == INT32_MIN ? INT32_MIN : V[i].k + s;
-            if (k == INT32_MIN || k <= INT16_MIN || k > INT16_MAX) V[i].k = UK_UNSET; else V[i].k = (int16_t)k;
+            if (k == INT32_MIN || k <= UK_UNSET || k > INT16_MAX) V[i].k = UK_UNSET; else V[i].k = (int16_t)k;
         }
     }
 }
@@ -846,7 +858,7 @@ static void uwr_apply(void *a, int z0, int z1, int th) {   /* the shifts, and th
         const uint32_t i = ub_id(g, z, y, xx); if (V[i].k == UK_UNSET) continue;
         if (u->shift) {
             const int32_t k = V[i].k + u->shift[uwr_gid(u, z, y, xx, i)];
-            V[i].k = (int16_t)(k <= INT16_MIN ? INT16_MIN + 1 : k > INT16_MAX ? INT16_MAX : k);
+            V[i].k = (int16_t)(k <= UK_UNSET ? UK_UNSET + 1 : k > INT16_MAX ? INT16_MAX : k);
         }
     }
     /* the seams (shift null: a separate pass, as the neighbours of other z ranges must be shifted first) */
@@ -985,22 +997,21 @@ static size_t fit_unwrap_voxels(fit_model *m, const fit_fields *f, double min_co
     if (nr >= UQ_NONE) { fprintf(stderr, "fit: %zu field voxels exceed the unwrapping's 32-bit queue: use --slab\n", n); return 0; }
     const double t0 = nn_wall_seconds();
     uw_ctx x = {.m = m, .f = f, .c = c, .min_conf = min_conf, .na = na, .nt = fit_nthreads(f->D), .g = g};
-    uw_vox *V = x.V = uw_alloc_huge(nr * sizeof *V);
+    void *vbase = nullptr; size_t vlen = 0; uw_vox *V = x.V = uw_alloc_records(nr * sizeof *V, &vbase, &vlen);   /* (zero: every record UK_UNSET, bk 0) */
     if (!V) { fprintf(stderr, "fit: out of memory for the voxel unwrapping\n"); return 0; }
-    fit_zpar((f->D + UB_M) / UB_S, x.nt, uw_zero, &x);   /* padding records: bk 0 (never flooded) */
     fit_zpar(f->D, x.nt, uw_setup, &x);
     size_t seed = (size_t)-1; float qbest = 0;
     for (int t = 0; t < x.nt; t++) if (x.qb[t] > qbest) { qbest = x.qb[t]; seed = x.sb[t]; }   /* ties: the lowest voxel, as serially */
     const double t1 = nn_wall_seconds();
     size_t reached = 0;
-    uw_queue q; if (uq_init(&q)) { free(V); return 0; }
+    uw_queue q; if (uq_init(&q)) { munmap(vbase, vlen); return 0; }
     if (seed != (size_t)-1) {
         {   /* the integer base: the seed (or seed model's) integer at the most confident voxel */
             const int z = (int)(seed / ((size_t)f->H * f->W)), y = (int)((seed / f->W) % f->H), xx = (int)(seed % f->W);
             const double pz = (z + 0.5) * f->h, py = (y + 0.5) * f->h, px = (xx + 0.5) * f->h;
             const double th = atan2(py - axis_lerp(f->cy, na, pz), px - axis_lerp(f->cx, na, pz));
             const double Ub = (c->seed ? fit_W(c->seed, pz + c->seed_off, py, px) : fit_W(m, pz, py, px)) + m->dir * th / (2 * M_PI);
-            x.kb = (int32_t)round(Ub - V[ub_id(&g, z, y, xx)].uw);
+            x.kb = (int32_t)round(Ub - V[ub_id(&g, z, y, xx)].uw) - UK_BIAS;
         }
         if (c->uw_split > 0 && !c->seed) reached = uw_two_level(&x, c->uw_split, c->uw_tile > 0 ? c->uw_tile : 256, nr, c->verbose);
         else {
@@ -1049,8 +1060,8 @@ static size_t fit_unwrap_voxels(fit_model *m, const fit_fields *f, double min_co
     }
     for (size_t k = 0; k < nl; k++) m->delta[k] += (float)corr[k];
     if (c->verbose) fprintf(stderr, "fit: voxel unwrapping %d threads: setup %.1fs, flood %.1fs, nodes %.1fs\n", x.nt, t1 - t0, t2 - t1, nn_wall_seconds() - t2);
-    if (x.over) fprintf(stderr, "fit: %zu voxels over 32767 turns from the seed left unreached\n", (size_t)x.over);
-    free(V); free(x.acc); free(x.wsum); free(have); free(corr);
+    if (x.over) fprintf(stderr, "fit: %zu voxels over 16383 turns from the seed left unreached\n", (size_t)x.over);
+    munmap(vbase, vlen); free(x.acc); free(x.wsum); free(have); free(corr);
     return reached;
 }
 
@@ -1407,12 +1418,17 @@ static fit_model *fit_run_dir(const fit_fields *f, const fit_cfg *c) {
             m->pitch[k] = (float)knot_lerp(c->init->pitch, c->init->nk, c->init->knot_dz, zg);
             m->offset[k] = (float)knot_lerp(c->init->offset, c->init->nk, c->init->knot_dz, zg);
         }
-    } else if (fit_init_prior(f, c, m)) { fit_free(m); return nullptr; }
+    } else { const double tp = nn_wall_seconds(); if (fit_init_prior(f, c, m)) { fit_free(m); return nullptr; } if (getenv("UFSM_FIT_TIMES")) fprintf(stderr, "fit times: prior %.2fs\n", nn_wall_seconds() - tp); }
     const size_t n = (size_t)f->D * f->H * f->W;
     size_t ndata = 0; for (size_t i = 0; i < n; i++) ndata += f->w[i] != 0;
     const uint8_t *dpc = f->pc, *dps = f->ps, *dt[6], *dsp = f->sp, *dw = f->w; uint8_t *dfield = nullptr;   /* CPU: the host fields as they are */
     for (int k = 0; k < 6; k++) dt[k] = f->t[k];
-    if (!cpu) {
+    fit_stream *fst = cpu ? nullptr : c->stream;   /* streamed fields: already on the device, the pooled stages made while loading */
+    if (fst && fst->n != n) { fprintf(stderr, "fit: the streamed fields do not match the box\n"); fit_free(m); return nullptr; }
+    if (fst) {
+        dfield = fst->dfield;
+        dpc = dfield; dps = dfield + n; dsp = dfield + 8 * n; dw = dfield + 9 * n; for (int k = 0; k < 6; k++) dt[k] = dfield + (2 + k) * n;
+    } else if (!cpu) {
         /* the fields on the device; when they do not fit (or UFSM_FIT_MANAGED=1), in CUDA managed memory: pages migrate on demand, so boxes
            larger than the GPU (e.g. 9.6 um cells over a full cross-section) still fit, slower */
         const int force_managed = ufsm_env_on("UFSM_FIT_MANAGED");
@@ -1472,6 +1488,8 @@ static fit_model *fit_run_dir(const fit_fields *f, const fit_cfg *c) {
                 double dth = (tb - ta) / (2 * M_PI); dth -= floor(dth + 0.5); fpairs[i].base = (float)((Wb + m->dir * tb / (2 * M_PI)) - (Wa + m->dir * ta / (2 * M_PI)) - m->dir * dth); }
             if (!cpu) { free(fph); free(fpg); fph = malloc(nl * 4); fpg = malloc(nl * 4); }
         }
+        if (fst && fst->drop_pooled && st == c->phase_stage)   /* the pooled stages are done (one direction: no second run) */
+            for (int q = 0; q < fst->nfp; q++) for (int k = 0; k < 10; k++) { free(fst->pool[q][k]); fst->pool[q][k] = nullptr; }
         if (st == c->phase_stage && c->w_phase > 0) {   /* the current knots too: W reads them */
             fb_get(cpu, m->pitch, dpi, nk * 4); fb_get(cpu, m->offset, dof, nk * 4);
             const double umc = c->uw_min_conf > 0 ? c->uw_min_conf : 0.3;
@@ -1512,13 +1530,17 @@ static fit_model *fit_run_dir(const fit_fields *f, const fit_cfg *c) {
         float *pgd = nullptr;   /* pooled phase gradients (device or host) */
         uint8_t *pdev = nullptr, *phost[10] = {0};
         if (fp > 1) {
-            fit_pooled pp = fit_pool(f, fp, c->w_pgrad > 0); const size_t np = (size_t)pp.D * pp.H * pp.W;
+            int sq = -1; if (fst) for (int q = 0; q < fst->nfp; q++) if (fst->fp[q] == fp && fst->pool[q][0]) sq = q;
+            if (fst && sq < 0) { fprintf(stderr, "fit: no streamed fields pooled by %d\n", fp); fit_free(m); return nullptr; }   /* (fit_stream_fps: never) */
+            fit_pooled pp = sq < 0 ? fit_pool(f, fp, c->w_pgrad > 0) : (fit_pooled){fst->pD[sq], fst->pH[sq], fst->pW[sq], {0}, nullptr, nullptr};
+            if (sq >= 0) for (int k = 0; k < 10; k++) pp.a[k] = fst->pool[sq][k];   /* (not freed here: fit_stream_free) */
+            const size_t np = (size_t)pp.D * pp.H * pp.W;
             size_t pdata = 0; for (size_t i = 0; i < np; i++) pdata += pp.a[9][i] != 0;
             const uint8_t *pa[10];
             if (cpu) { for (int k = 0; k < 10; k++) pa[k] = phost[k] = pp.a[k]; }
             else {
                 pdev = nn_malloc(10 * np);
-                for (int k = 0; k < 10; k++) { nn_h2d(pdev + k * np, pp.a[k], np); pa[k] = pdev + k * np; free(pp.a[k]); }
+                for (int k = 0; k < 10; k++) { nn_h2d(pdev + k * np, pp.a[k], np); pa[k] = pdev + k * np; if (sq < 0) free(pp.a[k]); }
             }
             fd.D = pp.D; fd.H = pp.H; fd.W = pp.W; fd.h = (float)(f->h * fp);
             fd.pc = pa[0]; fd.ps = pa[1]; for (int k = 0; k < 6; k++) fd.t[k] = pa[2 + k]; fd.sp = pa[8]; fd.w = pa[9];
@@ -1577,7 +1599,7 @@ static fit_model *fit_run_dir(const fit_fields *f, const fit_cfg *c) {
         for (int k = 0; k < 10; k++) free(phost[k]);
     }
     fb_get(cpu, m->pitch, dpi, nk * 4); fb_get(cpu, m->offset, dof, nk * 4);
-    if (dfield) nn_free(dfield);
+    if (dfield && !fst) nn_free(dfield);   /* (streamed fields: the caller frees them) */
     fb_free(cpu, dcy); fb_free(cpu, dcx);
     fb_free(cpu, dpi); fb_free(cpu, dof); fb_free(cpu, gpi); fb_free(cpu, gof); fb_free(cpu, mpi); fb_free(cpu, vpi); fb_free(cpu, mof); fb_free(cpu, vof); fb_free(cpu, dparts);
     if (dwd) fb_free(cpu, dwd);
@@ -1832,6 +1854,8 @@ static int fields_core(const json *j, coreline *C) {
 }
 static int g_ct_planes = 3;   /* the CT planes fit_fields_load reads: bit 0 ct, bit 1 cs */
 void fit_fields_ct_planes(int mask) { g_ct_planes = mask; }
+static int g_skip_planes;   /* optional planes fit_fields_load leaves out: bit 0 the recto plane, bit 1 the winding mod 4 planes */
+void fit_fields_skip_planes(int mask) { g_skip_planes = mask; }
 /* The half-box masks (cl_mask_block) on threads, row by row, with a per-process cache of the cells each row blanks: a fit loads
    every field row three to four times (the prior, the pooled global fit, the slabs with their overlaps), surf-stats the pc / ps / w
    planes of the whole box, and the masks were most of a 2 cm half-box fit's wall time (~11 of 19 min, one core, cl_sdist per cell
@@ -1918,9 +1942,9 @@ int fit_fields_load_ex(const char *dir, int fz0, int fz1, int pool, fit_fields_b
        false ignores a stale one, absent: used when present) */
     const int w4_d = (int)json_num(json_get(j, "w4_d"), 0);
     const json *jr = json_get(j, "recto"); const int want_recto = !jr ? -1 : (jr->type == J_BOOL || jr->type == J_NUM) ? (jr->num != 0) : -1;
-    int act[17], nact = 0, boxraw[17] = {0}; for (int k = 0; k < 10; k++) act[nact++] = k;
-    if (pool == 1 && w4_d > 0) for (int k = 10; k < 14; k++) act[nact++] = k;
-    if (pool == 1 && want_recto != 0) {
+    int act[17], nact = 0, boxraw[17] = {0}; for (int k = 0; k < 10; k++) if (!(g_skip_planes & 4 && pool == 1 && k >= 2 && k < 8)) act[nact++] = k;   /* (bit 2: the normals stay off the host: fit_fields_load_stream) */
+    if (pool == 1 && w4_d > 0 && !(g_skip_planes & 2)) for (int k = 10; k < 14; k++) act[nact++] = k;
+    if (pool == 1 && want_recto != 0 && !(g_skip_planes & 1)) {
         snprintf(path, sizeof path, zarr ? "%s/r/zarr.json" : "%s/r.raw", dir);
         const int exists = access(path, F_OK) == 0;
         if (want_recto > 0 && !exists) { fprintf(stderr, "fit: missing declared recto field %s\n", path); json_free(j); return -1; }
@@ -1974,9 +1998,11 @@ int fit_fields_load_ex(const char *dir, int fz0, int fz1, int pool, fit_fields_b
     if (prev) fit_fields_free(prev);
     if (zr0 == fz0) for (int q = 0; q < nact; q++) b->a[act[q]] = calloc(np, 1);
     if (noread) fz1 = fz0;   /* (the loop below reads nothing) */
-    /* read in z-blocks of `pool` rows (or 64 when not pooling), pool each block into the output rows */
-    const int zb = pool > 1 ? pool : 64;
-    uint8_t *blk[17] = {0}; for (int q = 0; q < nact; q++) blk[act[q]] = malloc((size_t)zb * plane);
+    /* read in z-blocks of `pool` rows, pooled into one output row each; unpooled (direct), decoded straight into the output rows (no
+       block buffers: they were 64 rows x every plane, 8 GB on a full cross-section), in blocks that end on the zarr's chunk rows (each
+       chunk decoded once), or of 64 rows when a pooled box is filled alongside */
+    const int direct = pool == 1, zb = pool > 1 ? pool : 64;
+    uint8_t *blk[17] = {0}; if (!direct) for (int q = 0; q < nact; q++) blk[act[q]] = malloc((size_t)zb * plane);
     z3 *za[17] = {0}; FILE *fr[17] = {0};
     for (int q = 0; q < nact; q++) {
         const int k = act[q];
@@ -1985,8 +2011,11 @@ int fit_fields_load_ex(const char *dir, int fz0, int fz1, int pool, fit_fields_b
         if (!za[k] && !fr[k]) { fprintf(stderr, "fit: cannot open %s\n", path); return -1; }
     }
     fit_fields src = {0}; src.h = h;
-    for (int z0 = zr0; z0 < fz1; z0 += zb) {
-        const int nz = z0 + zb <= fz1 ? zb : fz1 - z0;
+    int cz = 128; for (int q = 0; q < nact; q++) if (za[act[q]]) { const int c0 = z3_meta_of(za[act[q]])->chunk[0]; if (c0 > 0) cz = c0; break; }
+    for (int z0 = zr0, nz = 0; z0 < fz1; z0 += nz) {
+        nz = z0 + zb <= fz1 ? zb : fz1 - z0;
+        if (direct && !also) { const long long e = zarr ? ((z0 + zoff[0]) / cz + 1) * cz - zoff[0] : (long long)z0 + cz; nz = (int)((e < fz1 ? e : fz1) - z0); }
+        if (direct) for (int q = 0; q < nact; q++) blk[act[q]] = b->a[act[q]] + (size_t)(z0 - fz0) * plane;
         for (int q = 0; q < nact; q++) {
             const int k = act[q];
             if (za[k]) { const int64_t o[3] = {z0 + zoff[0], zoff[1], zoff[2]}, n[3] = {nz, H, W}; if (z3_read(za[k], o, n, blk[k], 8)) { fprintf(stderr, "fit: %s\n", z3_error()); return -1; } }
@@ -1997,7 +2026,6 @@ int fit_fields_load_ex(const char *dir, int fz0, int fz1, int pool, fit_fields_b
         }
         if (cside) core_mask(dir, &core, cside, org, h, b->um, shp[0], z0, nz, H, W, blk[0], blk[1], blk[9]);   /* the other side of the core: no data */
         if (pool == 1) {
-            for (int q = 0; q < nact; q++) memcpy(b->a[act[q]] + (size_t)(z0 - fz0) * plane, blk[act[q]], (size_t)nz * plane);
             for (int g = 0; also && g < nz; g += also_pool) {   /* the pooled box's rows of this block */
                 const int gz = g + also_pool <= nz ? also_pool : nz - g;
                 src.D = gz; src.H = H; src.W = W; src.pc = blk[0] + g * plane; src.ps = blk[1] + g * plane; for (int t = 0; t < 6; t++) src.t[t] = blk[2 + t] + g * plane;
@@ -2014,13 +2042,115 @@ int fit_fields_load_ex(const char *dir, int fz0, int fz1, int pool, fit_fields_b
         for (int k = 0; k < 10; k++) { memcpy(b->a[k] + (size_t)zo * Hp * Wp, pp.a[k], (size_t)pp.H * pp.W); free(pp.a[k]); }
         free(pp.cs); free(pp.pg);
     }
-    for (int k = 0; k < 17; k++) { free(blk[k]); if (za[k]) z3_close(za[k]); if (fr[k]) fclose(fr[k]); }
+    for (int k = 0; k < 17; k++) { if (!direct) free(blk[k]); if (za[k]) z3_close(za[k]); if (fr[k]) fclose(fr[k]); }
     if (cside) cl_free(&core);
     b->h = h * pool; b->shape[0] = Dp; b->shape[1] = Hp; b->shape[2] = Wp;
     b->origin[0] = org[0] + (long long)fz0 * h; b->origin[1] = org[1]; b->origin[2] = org[2];
     b->f = (fit_fields){Dp, Hp, Wp, (double)b->h, b->a[0], b->a[1], {b->a[2], b->a[3], b->a[4], b->a[5], b->a[6], b->a[7]}, b->a[8], b->a[9], b->cy, b->cx, {0}, 0, nullptr, nullptr, nullptr};
     if (b->a[10]) { for (int k = 0; k < 4; k++) b->f.wd[k] = b->a[10 + k]; b->f.w4_d = w4_d; }
     b->f.recto = b->a[14]; b->f.ct = b->a[15]; b->f.cs = b->a[16];
+    return 0;
+}
+
+/* ---- streamed fields for GPU fits (src/fit.h fit_fields_load_stream) ---- */
+int fit_stream_fps(const fit_cfg *c, int h, int fps[8]) {
+    int n = 0;
+    for (int st = 0; st < c->nstage && st < c->phase_stage; st++) {
+        const int L = c->lattice[st]; int fp = 1; while (2 * fp * (double)h <= L / 4.0) fp *= 2;   /* (fit_run_dir's rule) */
+        if (fp <= 1) continue;
+        int have = 0; for (int q = 0; q < n; q++) have |= fps[q] == fp;
+        if (!have && n < 8) fps[n++] = fp;
+    }
+    return n;
+}
+void fit_stream_free(fit_stream *s) {
+    if (!s) return;
+    if (s->dfield) nn_free(s->dfield);
+    for (int q = 0; q < 8; q++) for (int k = 0; k < 10; k++) free(s->pool[q][k]);
+    memset(s, 0, sizeof *s);
+}
+int fit_stream_verify(const fit_stream *s, const fit_fields *f) {   /* (src/fit.h) */
+    const size_t n = (size_t)f->D * f->H * f->W; if (n != s->n) return 1;
+    int bad = 0; uint8_t *h = malloc(n); if (!h) return 1;
+    const uint8_t *pl[10] = {f->pc, f->ps, f->t[0], f->t[1], f->t[2], f->t[3], f->t[4], f->t[5], f->sp, f->w};
+    for (int k = 0; k < 10; k++) { nn_d2h(h, s->dfield + (size_t)k * n, n); if (memcmp(h, pl[k], n)) { fprintf(stderr, "fit stream verify: device plane %d differs\n", k); bad++; } }
+    free(h);
+    for (int q = 0; q < s->nfp; q++) {
+        fit_pooled pp = fit_pool(f, s->fp[q], 0); const size_t np = (size_t)pp.D * pp.H * pp.W;
+        if (pp.D != s->pD[q] || pp.H != s->pH[q] || pp.W != s->pW[q]) bad++;
+        else for (int k = 0; k < 10; k++) if (!s->pool[q][k] || memcmp(pp.a[k], s->pool[q][k], np)) { fprintf(stderr, "fit stream verify: pooled by %d plane %d differs\n", s->fp[q], k); bad++; }
+        for (int k = 0; k < 10; k++) free(pp.a[k]);
+        free(pp.cs); free(pp.pg);
+    }
+    return bad;
+}
+int fit_fields_load_stream(const char *dir, fit_fields_buf *b, fit_stream *s, const int *fps, int nfp, void (*gpu_ready)(void)) {
+    memset(s, 0, sizeof *s);
+    if (nfp > 8) return -1;
+    const int sk = g_skip_planes; g_skip_planes |= 4;   /* the host buffer without the normal planes */
+    const int lr = fit_fields_load(dir, 0, 0, 1, b);
+    g_skip_planes = sk;
+    if (lr) return -1;
+    char path[1400]; snprintf(path, sizeof path, "%s/fields.json", dir);
+    json *j = read_json_file(path); if (!j) { fit_fields_free(b); return -1; }
+    if (gpu_ready) gpu_ready();
+    int shp[3]; for (int d = 0; d < 3; d++) shp[d] = (int)json_num(json_at(json_get(j, "shape"), d), 0);
+    const int zarr = !strcmp(json_str(json_get(j, "format"), "raw"), "zarr"); long long zoff[3], rsh[3]; fields_crop(j, zarr, shp, zoff, rsh);
+    json_free(j);
+    const int D = b->shape[0], H = b->shape[1], W = b->shape[2]; const size_t plane = (size_t)H * W, n = (size_t)D * plane;
+    s->n = n;
+    const int force_managed = ufsm_env_on("UFSM_FIT_MANAGED");
+    s->dfield = force_managed ? nullptr : nn_malloc_try(10 * n);
+    if (!s->dfield) {
+        s->dfield = nn_managed_alloc(10 * n);
+        if (s->dfield) fprintf(stderr, "fit: fields in managed memory (%.1f GB, %s)\n", 10.0 * n / 1e9, force_managed ? "UFSM_FIT_MANAGED" : "over the free device memory");
+    }
+    if (!s->dfield) { fprintf(stderr, "fit: no device memory for the fields (%.1f GB: 10 B per cell of %dx%dx%d)\n", 10.0 * n / 1e9, D, H, W); fit_fields_free(b); return -1; }
+    const int hk[4] = {0, 1, 8, 9}; for (int q = 0; q < 4; q++) nn_h2d(s->dfield + (size_t)hk[q] * n, b->a[hk[q]], n);
+    /* the normals: per plane, blocks ending on the zarr's chunk rows, to the device */
+    int cz = 128; uint8_t *buf = nullptr; size_t bcap = 0; int rc = 0;
+    for (int k = 2; k < 8 && !rc; k++) {
+        z3 *za = nullptr; FILE *fr = nullptr;
+        if (zarr) { za = z3_open(store_open(dir), fit_plane_names[k], nullptr); if (za && z3_meta_of(za)->chunk[0] > 0) cz = z3_meta_of(za)->chunk[0]; }
+        else { snprintf(path, sizeof path, "%s/%s.raw", dir, fit_plane_names[k]); fr = fopen(path, "rb"); }
+        if (!za && !fr) { fprintf(stderr, "fit: cannot open the %s plane of %s\n", fit_plane_names[k], dir); rc = -1; break; }
+        for (int z0 = 0, nz = 0; z0 < D && !rc; z0 += nz) {
+            const long long e = zarr ? ((z0 + zoff[0]) / cz + 1) * cz - zoff[0] : (long long)z0 + cz; nz = (int)((e < D ? e : D) - z0);
+            if ((size_t)nz * plane > bcap) { free(buf); bcap = (size_t)nz * plane; buf = malloc(bcap); if (!buf) { rc = -1; break; } }
+            const long long o[3] = {z0 + zoff[0], zoff[1], zoff[2]}; const int64_t nn3[3] = {nz, H, W};
+            if (za) { const int64_t oi[3] = {o[0], o[1], o[2]}; if (z3_read(za, oi, nn3, buf, 8)) { fprintf(stderr, "fit: %s\n", z3_error()); rc = -1; } }
+            else if (raw_read_box(fr, rsh, o, nn3, buf)) { fprintf(stderr, "fit: short read of %s\n", fit_plane_names[k]); rc = -1; }
+            if (!rc) nn_h2d(s->dfield + (size_t)k * n + (size_t)z0 * plane, buf, (size_t)nz * plane);
+        }
+        if (za) z3_close(za);
+        if (fr) fclose(fr);
+    }
+    /* the gradient stages' pooled fields from row blocks of the device normals (blocks of whole pooled rows of every factor) */
+    int fmax = 1; for (int q = 0; q < nfp; q++) if (fps[q] > fmax) fmax = fps[q];
+    int rb = fmax; while (rb < D && (size_t)(2 * rb) * plane * 6 <= ((size_t)512 << 20)) rb *= 2;
+    uint8_t *tb = nfp && !rc ? malloc((size_t)rb * plane * 6) : nullptr;
+    if (nfp && !rc && !tb) rc = -1;
+    for (int q = 0; q < nfp && !rc; q++) {
+        const int fp = fps[q]; s->fp[q] = fp; s->pD[q] = (D + fp - 1) / fp; s->pH[q] = (H + fp - 1) / fp; s->pW[q] = (W + fp - 1) / fp;
+        const size_t np = (size_t)s->pD[q] * s->pH[q] * s->pW[q];
+        for (int k = 0; k < 10; k++) if (!(s->pool[q][k] = calloc(np, 1))) rc = -1;
+    }
+    s->nfp = rc ? 0 : nfp;
+    for (int z0 = 0; z0 < D && !rc && nfp; z0 += rb) {
+        const int nz = z0 + rb <= D ? rb : D - z0;
+        for (int t = 0; t < 6; t++) nn_d2h(tb + (size_t)t * rb * plane, s->dfield + (size_t)(2 + t) * n + (size_t)z0 * plane, (size_t)nz * plane);
+        fit_fields src = {0}; src.D = nz; src.H = H; src.W = W; src.h = b->h;
+        src.pc = b->a[0] + (size_t)z0 * plane; src.ps = b->a[1] + (size_t)z0 * plane; for (int t = 0; t < 6; t++) src.t[t] = tb + (size_t)t * rb * plane;
+        src.sp = b->a[8] + (size_t)z0 * plane; src.w = b->a[9] + (size_t)z0 * plane;
+        for (int q = 0; q < nfp; q++) {
+            fit_pooled pp = fit_pool(&src, s->fp[q], 0);
+            const size_t ap = (size_t)s->pH[q] * s->pW[q], zo = (size_t)(z0 / s->fp[q]);
+            for (int k = 0; k < 10; k++) { memcpy(s->pool[q][k] + zo * ap, pp.a[k], (size_t)pp.D * ap); free(pp.a[k]); }
+            free(pp.cs); free(pp.pg);
+        }
+    }
+    free(tb); free(buf);
+    if (rc) { fit_stream_free(s); fit_fields_free(b); return -1; }
     return 0;
 }
 

@@ -41,6 +41,41 @@ static void fo_blur(float *v, int D, int H, int W, int r) {   /* separable box b
     free(line); free(acc);
 }
 static int fo_cmpf(const void *a, const void *b) { const float x = *(const float *)a, y = *(const float *)b; return (x < y) - (x > y); }
+/* one field row's cells, field y rows [y0, y1) on thread t: per cell the complex mean of the known voxels' label phasors (+ the label
+   spacing for --fill none) */
+typedef struct {
+    fit_fields_buf *b; const uint8_t *base; uint8_t *lab; const double *ctab, *stab; int h, F, fillnet; double mk; int z; int64_t n[3];
+    size_t nmat[64], nknown[64], nsp[64];
+} fo_job;
+static void fo_rows(void *a, int y0, int y1, int t) {
+    fo_job *J = a; fit_fields_buf *bb = J->b; const int h = J->h, W = bb->shape[2]; const size_t HW = (size_t)bb->shape[1] * W; const int64_t *n = J->n;
+    const uint8_t *row = J->base; size_t nmat = 0, nknown = 0, nsp = 0;
+    for (int y = y0; y < y1; y++) for (int x = 0; x < W; x++) {
+        const size_t i = (size_t)J->z * HW + (size_t)y * W + x; double complex a = 0; int kn = 0; double gs = 0; int gn = 0;
+        for (int dz = 0; dz < h; dz++) for (int dy = 0; dy < h; dy++) for (int dx = 0; dx < h; dx++) {
+            const size_t k = ((size_t)dz * n[1] + (size_t)y * h + dy) * n[2] + (size_t)x * h + dx; const uint8_t p = row[k];
+            if (p >= 252) continue;
+            a += J->ctab[p] + I * J->stab[p]; kn++;
+            if (dz + 1 < n[0] && (size_t)y * h + dy + 1 < (size_t)n[1] && (size_t)x * h + dx + 1 < (size_t)n[2]) {   /* the label's local sheet frequency */
+                const uint8_t pzn = row[k + (size_t)n[1] * n[2]], pyn = row[k + n[2]], pxn = row[k + 1];
+                if (pzn < 252 && pyn < 252 && pxn < 252) {
+                    double e[3] = {(pzn - p) / 252.0, (pyn - p) / 252.0, (pxn - p) / 252.0};
+                    for (int q = 0; q < 3; q++) e[q] -= round(e[q]);
+                    gs += sqrt(e[0] * e[0] + e[1] * e[1] + e[2] * e[2]); gn++;
+                }
+            }
+        }
+        if (bb->f.w[i]) nmat++;
+        if (kn >= J->mk * h * h * h) {
+            a /= kn; if (bb->f.w[i]) nknown++; J->lab[i] = 1;
+            bb->a[0][i] = (uint8_t)lround(128 + 127 * creal(a)); bb->a[1][i] = (uint8_t)lround(128 + 127 * cimag(a));
+            if (!J->fillnet && gn && gs > 0) {   /* --fill none: the label spacing as sp (sp h / 8 = native voxels per turn) */
+                const double spn = gn / gs * J->F, v = spn * 8.0 / bb->h; bb->a[8][i] = (uint8_t)(v < 1 ? 1 : v > 255 ? 255 : lround(v)); nsp++;
+            }
+        } else if (!J->fillnet) { bb->a[0][i] = bb->a[1][i] = 128; }
+    }
+    J->nmat[t] += nmat; J->nknown[t] += nknown; J->nsp[t] += nsp;
+}
 int cmd_fields_oracle(int argc, char **argv) {
     if (argc < 6) { fprintf(stderr, "usage: ufsm fields-oracle <fields-dir> <phase-root> <phase-key> <out-dir> [--sign 1] [--fill net|none] [--min-known 0.5] [--phase-scale F (native voxels per raster voxel, e.g. 4: 2.4 um fields, 9.6 um raster)] [--noise-gross P --noise-blob L --noise-sigma S --noise-seed N --noise-conf K]\n"); return 2; }
     const char *fd = argv[2], *out = argv[5];
@@ -53,39 +88,30 @@ int cmd_fields_oracle(int argc, char **argv) {
     const int F = atoi(fo_opt(argc, argv, "--phase-scale", "1")), h = b.h / (F > 0 ? F : 1);   /* (raster voxels per field cell) */
     if (F < 1 || b.h % F || b.origin[0] % F || b.origin[1] % F || b.origin[2] % F) { fprintf(stderr, "fields-oracle: --phase-scale must divide the cell (h %d) and the origin\n", b.h); return 2; }
     double ctab[252], stab[252]; for (int k = 0; k < 252; k++) { ctab[k] = cos(2 * M_PI * k / 252.0); stab[k] = sin(sign * 2 * M_PI * k / 252.0); }
-    uint8_t *row = malloc((size_t)(h + 1) * (H * h + 1) * (W * h + 1)); size_t nmat = 0, nknown = 0, nsp = 0;
+    /* blocks of field rows read at once, ending on the raster's chunk rows (a chunk decoded once or a few times, not once per field
+       row: the raster's 128^3 chunks span 128 / h rows), at most ~2 GB of raster per block; the cells of a row on threads */
+    size_t nmat = 0, nknown = 0, nsp = 0;
     uint8_t *lab = calloc((size_t)D * HW, 1);   /* (cells holding the label phase) */
     const z3_meta *pm = z3_meta_of(pz);
-    for (int z = 0; z < D; z++) {   /* one field row: h native planes of the box (+1 plane / row / column for the label gradient) */
-        const int64_t o[3] = {b.origin[0] / F + (int64_t)z * h, b.origin[1] / F, b.origin[2] / F};
-        int64_t n[3] = {h + 1, (int64_t)H * h + 1, (int64_t)W * h + 1};
+    const size_t pl = (size_t)(H * h + 1) * (W * h + 1); const int cz = pm->chunk[0] > 0 ? pm->chunk[0] : 128;
+    int rbmax = (int)(((size_t)2 << 30) / pl / h); if (rbmax < 1) rbmax = 1; if (rbmax > cz / h + 1) rbmax = cz / h + 1;
+    uint8_t *row = malloc(((size_t)rbmax * h + 1) * pl);
+    fo_job J = {.b = &b, .base = row, .lab = lab, .ctab = ctab, .stab = stab, .h = h, .F = F, .fillnet = fillnet, .mk = mk};
+    for (int z = 0; z < D;) {   /* rows [z, z + nr): native planes [o0, o0 + nr h + 1) of the raster (the +1 plane for the label gradient) */
+        const int64_t o0 = b.origin[0] / F + (int64_t)z * h;
+        int nr = (int)(((o0 / cz + 1) * cz - o0) / h); if (nr < 1) nr = 1; if (nr > rbmax) nr = rbmax; if (nr > D - z) nr = D - z;
+        const int64_t o[3] = {o0, b.origin[1] / F, b.origin[2] / F};
+        int64_t n[3] = {(int64_t)nr * h + 1, (int64_t)H * h + 1, (int64_t)W * h + 1};
         for (int d = 0; d < 3; d++) if (o[d] + n[d] > pm->shape[d]) n[d] = pm->shape[d] - o[d];
-        if (n[0] < h || n[1] < (int64_t)H * h || n[2] < (int64_t)W * h) { fprintf(stderr, "fields-oracle: the box leaves the phase raster\n"); return 1; }
+        if (n[0] < (int64_t)(nr - 1) * h + h || n[1] < (int64_t)H * h || n[2] < (int64_t)W * h) { fprintf(stderr, "fields-oracle: the box leaves the phase raster\n"); return 1; }
         if (z3_read(pz, o, n, row, 16)) { fprintf(stderr, "fields-oracle: phase read failed: %s\n", z3_error()); return 1; }
-        for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
-            const size_t i = (size_t)z * HW + (size_t)y * W + x; double complex a = 0; int kn = 0; double gs = 0; int gn = 0;
-            for (int dz = 0; dz < h; dz++) for (int dy = 0; dy < h; dy++) for (int dx = 0; dx < h; dx++) {
-                const size_t k = ((size_t)dz * n[1] + (size_t)y * h + dy) * n[2] + (size_t)x * h + dx; const uint8_t p = row[k];
-                if (p >= 252) continue;
-                a += ctab[p] + I * stab[p]; kn++;
-                if (dz + 1 < n[0] && (size_t)y * h + dy + 1 < (size_t)n[1] && (size_t)x * h + dx + 1 < (size_t)n[2]) {   /* the label's local sheet frequency */
-                    const uint8_t pzn = row[k + (size_t)n[1] * n[2]], pyn = row[k + n[2]], pxn = row[k + 1];
-                    if (pzn < 252 && pyn < 252 && pxn < 252) {
-                        double e[3] = {(pzn - p) / 252.0, (pyn - p) / 252.0, (pxn - p) / 252.0};
-                        for (int q = 0; q < 3; q++) e[q] -= round(e[q]);
-                        gs += sqrt(e[0] * e[0] + e[1] * e[1] + e[2] * e[2]); gn++;
-                    }
-                }
-            }
-            if (b.f.w[i]) nmat++;
-            if (kn >= mk * h * h * h) {
-                a /= kn; if (b.f.w[i]) nknown++; lab[i] = 1;
-                b.a[0][i] = (uint8_t)lround(128 + 127 * creal(a)); b.a[1][i] = (uint8_t)lround(128 + 127 * cimag(a));
-                if (!fillnet && gn && gs > 0) {   /* --fill none: the label spacing as sp (sp h / 8 = native voxels per turn) */
-                    const double spn = gn / gs * F, v = spn * 8.0 / b.h; b.a[8][i] = (uint8_t)(v < 1 ? 1 : v > 255 ? 255 : lround(v)); nsp++;
-                }
-            } else if (!fillnet) { b.a[0][i] = b.a[1][i] = 128; }
+        for (int r = 0; r < nr; r++) {   /* field row z + r: the planes from r h on (h + 1 of them, or what the raster has) */
+            J.z = z + r; J.base = row + (size_t)r * h * n[1] * n[2];
+            J.n[0] = n[0] - (int64_t)r * h < h + 1 ? n[0] - (int64_t)r * h : h + 1; J.n[1] = n[1]; J.n[2] = n[2];
+            const int nt = fit_par(H, fo_rows, &J);
+            for (int t = 0; t < nt; t++) { nmat += J.nmat[t]; nknown += J.nknown[t]; nsp += J.nsp[t]; J.nmat[t] = J.nknown[t] = J.nsp[t] = 0; }
         }
+        z += nr;
     }
     free(row); z3_close(pz);
     const double ngp = atof(fo_opt(argc, argv, "--noise-gross", "0")), nsg = atof(fo_opt(argc, argv, "--noise-sigma", "0"));

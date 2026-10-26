@@ -121,6 +121,9 @@ typedef struct {
        16..128 native voxels apart along one fibre whose network phase stays within half a turn along it should have W(b) - W(a) = that
        phase change (a loss term in every fit stage, src/fit.c fib_pairs); fib_zoff: the fields' first native z in the fibres' frame */
     const float *fib; const int *fib_off; int fib_n; float w_fib; double fib_zoff;
+    struct fit_stream *stream;      /* GPU fits (fit_fields_load_stream): the fields already on the device and the gradient stages' pooled
+                                       fields made while loading (the host fields then carry no normal planes); nullptr: fit_run_dir uploads
+                                       and pools the host fields itself */
     int verbose;
 } fit_cfg;
 
@@ -233,6 +236,22 @@ typedef struct { fit_fields f; uint8_t *a[17]; float *cy, *cx; long long origin[
 int fit_fields_load(const char *dir, int fz0, int fz1, int pool, fit_fields_buf *b);
 void fit_fields_free(fit_fields_buf *b);
 void fit_fields_ct_planes(int mask);   /* which CT planes later fit_fields_load calls read (bit 0 ct, bit 1 cs; default both) */
+void fit_fields_skip_planes(int mask);   /* optional planes later fit_fields_load calls leave out (bit 0 the recto plane r, bit 1 the winding mod 4 planes dz dy dx dq; default none): RAM and reads for fits whose terms do not read them */
+/* Streamed fields for a GPU fit (fit_cfg stream): the whole box (unpooled) with the six normal planes read plane by plane (chunk rows)
+   straight to the device field array (the fit's 10 B per cell: pc ps t0..t5 sp w), the host buffer b holding the planes the CPU reads
+   (pc ps sp w and the optional planes; b->a[2..7] null), and the pooled fields of the gradient stages (pooling factors fps[0..nfp)) made
+   from device row blocks, bit for bit fit_run_dir's own pooling. Host memory ~4 B per cell instead of 10 (+ the pooled ~1.4 B).
+   Returns 0, or -1 (then nothing is held). */
+typedef struct fit_stream {
+    uint8_t *dfield; size_t n;           /* device (or managed) planes, n cells each */
+    int nfp, fp[8]; uint8_t *pool[8][10]; int pD[8], pH[8], pW[8];   /* host pooled planes per pooling factor */
+    int drop_pooled;                     /* 1: fit_run_dir frees the pooled planes at the phase stage (a single fitted direction) */
+} fit_stream;
+int fit_fields_load_stream(const char *dir, fit_fields_buf *b, fit_stream *s, const int *fps, int nfp, void (*gpu_ready)(void));   /* gpu_ready (or null): called after the host planes load, before the first device call */
+void fit_stream_free(fit_stream *s);
+int fit_stream_verify(const fit_stream *s, const fit_fields *f);   /* the device planes and pooled sets against whole host fields f (fit_fields_load, all planes): mismatches (0: identical) */
+/* the gradient stages' pooling factors of a fit config at field cell h (fit_run_dir's rule); returns their count (at most 8) */
+int fit_stream_fps(const fit_cfg *c, int h, int fps[8]);
 
 /* a fit set: the global model plus z-slab models whose interiors [z0, z1) (box-local native z of the global box) partition it */
 typedef struct { fit_model *global; int n; fit_model **slab; double *z0, *z1, blend; } fit_set;   /* blend: W blended linearly over +-blend around slab boundaries */
@@ -259,6 +278,10 @@ int fit_set_grid(fit_set_dev *g, const fit_set *s, const double o[3], const int6
 /* the same on the CPU (no device); mask (optional, laid out as out): only points with a band code 1..252 there are evaluated (others 0) */
 int fit_set_grid_cpu(const fit_set *s, const double o[3], const int64_t n[3], double step, int with_theta, const uint8_t *mask, float *out);
 void fit_set_threads(int n);   /* the CPU backend's / grid's thread count (0: all cores) */
+/* fn(ctx, a0, a1, t) on contiguous ranges of [0, n) over the fit threads (fit_set_threads / UFSM_FIT_THREADS / the cores, at most 64 and n);
+   returns the thread count used (fit_par_threads(n): the count without running) */
+int fit_par(int n, void (*fn)(void *ctx, int a0, int a1, int t), void *ctx);
+int fit_par_threads(int n);
 /* fit_fields_load plus: noread (the arrays allocated, nothing read: a pooled box to fill through `also`); also (pool 1 loads, rows
    [fz0, fz1) starting on a multiple of also_pool and ending on one or at the box end): each block of also_pool rows, masked, pooled into
    `also` (a noread pooled box of the whole box) exactly as its own pooled load would (fit --slab: the prior's loads fill the global fit's
