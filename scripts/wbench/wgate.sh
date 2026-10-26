@@ -11,7 +11,8 @@
 # Env: SITE (laptop), GPU (0), U (fitter binary; default the pin $WB/bin/ufsm), UP (predict binary; default $WB/bin/ufsm-gate),
 #   REF (wind96), BOXES (core | names), SITES ("4624 5392 5904 6672"; "" = no slabs), REP (2), FL (box lanes, 3), DIAG (1),
 #   KEEP (1), NOLOCK=1 (the caller holds the GPU), PRIO (eval), TTA (predict --tta K, 1 = off), SEAM (1: average 2 window-grid
-#   offsets 0 / 8 vx: volcomp seam TTA, 2x predict), SPRIO (slab fits after the block, eval with the run's ticket number).
+#   offsets 0 / 8 vx: volcomp seam TTA, 2x predict), FIXED=1 (fixed fields: only $WB/fields/TAG/* as they are, never predict;
+#   e.g. field rewrites of the wind96 fields $WB/fields/w96g), SPRIO (slab fits after the block, eval with the run's ticket number).
 set -u
 H=$(cd "$(dirname "$0")" && pwd)
 SITE=${SITE:-$([ -d $HOME/ufsm-data ] && echo laptop || echo desk)}; GPU=${GPU:-0}
@@ -19,7 +20,7 @@ SITE=${SITE:-$([ -d $HOME/ufsm-data ] && echo laptop || echo desk)}; GPU=${GPU:-
 [ $# -ge 2 ] || { sed -n '2,15p' $0; exit 2; }
 CK=$(readlink -f "$1"); TAG=$2
 U=${U:-$WB/bin/ufsm}; UP=${UP:-$WB/bin/ufsm-gate}; [ -x $UP ] || UP=$U; [ -x $U ] || { echo "no binary $U"; exit 2; }
-TTA=${TTA:-1}; SEAM=${SEAM:-0}; [ "$TTA" -gt 1 ] && export PX="--tta $TTA"   # (wbench.sh's predict appends PX)
+FIXED=${FIXED:-0}; TTA=${TTA:-1}; SEAM=${SEAM:-0}; [ "$TTA" -gt 1 ] && export PX="--tta $TTA"   # (wbench.sh's predict appends PX)
 SLOCK=${SLOCK:-$(dirname ${LOCK:-$WB/x})/slabfit.lock}   # the cross-run slab-fit lock (laptop ~/ufsm-data/slabfit.lock)
 REF=${REF:-wind96}; BOXES=${BOXES:-core}; SITES=${SITES-4624 5392 5904 6672}; REP=${REP:-2}; FL=${FL:-3}; DIAG=${DIAG:-1}; KEEP=${KEEP:-1}
 BT=${BT:-$H/boxes.tsv}; FIT=""; FIELDS=""
@@ -44,6 +45,7 @@ rm -f $O/ready/.end; rm -rf $O/claim/*
 
 gpredict() {   # gpredict like predict; SEAM=1: two passes, window grid at 0 and shifted 8 voxels on every axis (another phase of the
   # network's pooling against the 16^3 volcomp codec blocks), averaged by field-blend (phase as the complex mean)
+  [ "$FIXED" = 1 ] && { log "FIXED=1: no fields $1 (not predicted; skipped)"; return 1; }
   [ "$SEAM" = 1 ] || { predict "$@"; return; }
   local f=$1; shift
   GO=0,0,0 predict $f.g0 "$@" && GO=8,8,8 predict $f.g8 "${@:1:6}" ${7}.g8 ${8:-} || return 1
