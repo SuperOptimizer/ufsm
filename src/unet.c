@@ -2721,10 +2721,14 @@ static float *tb_bwd(unet *u, const float *gy) {
     return u->tb_gx;
 }
 static float *block_bwd_(unet *u, block *b, int level, const float *gy, float *gx2, int pre, const float *gid, float *save);
+/* the block backward's GroupNorm applies deferred into the weight gradient that follows (lp_gn_silu_bwd_apply_defer): bit 0 GN2 -> conv2's,
+   bit 1 GN1 -> conv1's (env UFSM_GN_DEFER_SITES, default 3; UFSM_GN_DEFER=0 turns the deferral off altogether) */
+static int gn_defer_sites(void) { static int v = -1; if (v < 0) v = getenv("UFSM_GN_DEFER_SITES") ? atoi(getenv("UFSM_GN_DEFER_SITES")) : 3; return v; }
 static float *block_bwd(unet *u, block *b, int level, const float *gy, float *gx2, int pre, const float *gid, float *save) {
     nn_set_gn_const(l0_fixed(u, b) && u->cfg.l0_norm != 4);   /* constant level-0 statistics: no mean / variance terms in the block's GroupNorm
                                                               backwards (slab: the slabs' terms, gn_silu_bwd_b) */
     float *r = block_bwd_(u, b, level, gy, gx2, pre, gid, save);
+    lp_gnpend_request(0); lp_gnpend_flush();   /* (a deferred GroupNorm apply never outlives its block) */
     nn_set_gn_const(0);
     return r;
 }
@@ -2765,10 +2769,16 @@ static float *block_bwd_(unet *u, block *b, int level, const float *gy, float *g
         PROF(3, gn_bwd_b(u, b, 2, b->a2, b->ys, G, P(u, b->n2.gamma), b->m2, b->r2, B, A, g + b->n2.gamma, g + b->n2.beta, u->gn_scratch));   /* A = d/d a2 */
     } else if (nn_get_tf32()) {   /* fused: no materialised gn / silu activations */
         sp_zero(u, gy, b->ys, 1);   /* split: only owned voxels enter the reductions below */
+        /* the GroupNorm apply deferred into the weight gradient right below (its gy records slab by slab: lp_gn_silu_bwd_apply_defer)
+           when nothing else reads B before it */
+        lp_gnpend_request((gn_defer_sites() & 1) && !pre && !gid && !save && !l3ro && !u->l3b && !sp_on(u) && !fakeq_grad());
         if (!pre) PROF(3, gn_silu_bwd_b(u, b, 2, b->a2, b->ys, G, P(u, b->n2.gamma), P(u, b->n2.beta), b->m2, b->r2, gy, B, g + b->n2.gamma, g + b->n2.beta, u->gn_scratch));   /* B = d/d a2 */
+        lp_gnpend_request(0);
         if (gid) nn_add_into(B, gid, b->ys, GBF);
         if (save) nn_d2d(save, B, gbytes);
-        if (b == &u->enc[0] && u->a0_share && u->xin_shared && !u->l3b) {   /* a2 read for the last time: the input into its buffer for conv1's weight gradient */
+        const int a0late = b == &u->enc[0] && u->a0_share && u->xin_shared && !u->l3b && lp_gnpend_of(B);   /* (the deferred apply reads a2:
+                                                                                                     the input goes into it after the weight gradient) */
+        if (b == &u->enc[0] && u->a0_share && u->xin_shared && !u->l3b && !a0late) {   /* a2 read for the last time: the input into its buffer for conv1's weight gradient */
             nn_set_storage(b->a2, u->xin_bytes, unet_input_prec());
             nn_offload_copy(b->a2, u->h_xin, u->xin_bytes, 0, u->ev_xin[2], u->ev_xin[3]);
             b->in = b->a2;
@@ -2788,6 +2798,12 @@ static float *block_bwd_(unet *u, block *b, int level, const float *gy, float *g
         sp_begin(u, B, b->ys, 1);   /* split: the halo crosses during the weight gradient (which reads it as zero) */
         PROF(2, nn_conv3d_bwd_weight_gn(b->a1, b->ys, G, P(u, b->n1.gamma), P(u, b->n1.beta), b->m1, b->r1, B, b->ys, g + b->c2.w, g + b->c2.b));
         sp_end(u, B, b->ys, 1);
+        if (a0late) {   /* (as above, after the deferred apply's last read of a2) */
+            lp_gnpend_flush_of(B);
+            nn_set_storage(b->a2, u->xin_bytes, unet_input_prec());
+            nn_offload_copy(b->a2, u->h_xin, u->xin_bytes, 0, u->ev_xin[2], u->ev_xin[3]);
+            b->in = b->a2;
+        }
         if (l3ro) {
             if (nn_sr_ctr() != c0 + kw) rc_fail("three level-0 buffers: enc[0]'s conv2 weight gradient drew other seeds than predicted (UFSM_L0_3BUF_REORDER=0)");
             nn_sr_set_ctr(c1);
@@ -2807,7 +2823,16 @@ static float *block_bwd_(unet *u, block *b, int level, const float *gy, float *g
         }
         FQG(A, b->ys);
         sp_zero(u, A, b->ys, 1);
+        /* encoders: deferred into conv1's weight gradient below (nothing reads A or a1 before it). Decoders: the plain apply now, no gy records
+           (dec_conv1 builds its up transient over a1 -- the coarse gradients share the level-0 buffers -- before its weight gradient, which
+           then rounds its gy records in its own pre-pass); in every layout, so that layouts keep the same bits */
+        const int gdef = lp_gnpend_env();
+        lp_gnpend_request(gdef && !b->xb && (gn_defer_sites() & 2) && !u->l3b && !sp_on(u) && !fakeq_grad());
+        const int gro = lp_get_gyrec_off();
+        if (gdef && b->xb) lp_set_gyrec_off(1);
         PROF(3, gn_silu_bwd_b(u, b, 1, b->a1, b->ys, G, P(u, b->n1.gamma), P(u, b->n1.beta), b->m1, b->r1, A, A, g + b->n1.gamma, g + b->n1.beta, u->gn_scratch));    /* A = d/d a1 (in place) */
+        if (gdef && b->xb) lp_set_gyrec_off(gro);
+        lp_gnpend_request(0);
         FQG(A, b->ys);
         sp_zero(u, A, b->ys, 1);
         if (b != &u->enc[0]) sp_begin(u, A, b->ys, 1);   /* for conv1's backward-data (enc0 has none) */

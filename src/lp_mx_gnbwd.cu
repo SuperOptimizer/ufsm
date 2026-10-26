@@ -535,7 +535,8 @@ template <int B, int BW = 32>   /* BW: the MX block width of gy / gx (32, or a w
                                    8 channels -2% step for 570 MB, 16 channels ~0 for 1.14 GB: this kernel then costs what the pre-pass did) */
 __global__ void __launch_bounds__(256, 3) gn_silu_bwd_apply_rec_k(const uint8_t *__restrict__ x, const uint8_t *__restrict__ gy, const float *gamma, const float *beta,
                                                             const float *mean, const float *rstd, const float *AB, uint8_t *__restrict__ gx, uint8_t *__restrict__ out,
-                                                            float *__restrict__ gbsum, int N, int C, int G, int D, int H, int W, unsigned gsr, unsigned rsr) {
+                                                            float *__restrict__ gbsum, int N, int C, int G, int D, int H, int W, unsigned gsr, unsigned rsr,
+                                                            int zt0, int ZTs) {   /* z-steps [zt0, zt0 + ZTs) of the layer, their records from out (a slab of the wgrad) */
     constexpr int NTASK = BW / 8, GRB = BW / 2;   /* record tasks per lane; MX-fp4 gy / gx row bytes */
     __shared__ __align__(16) __nv_bfloat16 v[8][BW][40];   /* bf16 (its 2^-9 rounding far below the fp4 SR that follows): 3 blocks / SM */
     __shared__ float4 cf[BW];
@@ -543,8 +544,8 @@ __global__ void __launch_bounds__(256, 3) gn_silu_bwd_apply_rec_k(const uint8_t 
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int nb = C / BW, cb = blockIdx.y % nb, n = blockIdx.y / nb, cpg = C / G;
     const size_t S = (size_t)D * H * W;
-    const int Wb = (W + 15) / 16, ZT = (D + 1) / 2, TY = (H + 7) / 8;
-    const unsigned ngrp = (unsigned)ZT * TY * Wb;
+    const int Wb = (W + 15) / 16, TY = (H + 7) / 8;
+    const unsigned ngrp = (unsigned)ZTs * TY * Wb;
     if (threadIdx.x < BW) {
         const int k = threadIdx.x, c = cb * BW + k, ng = n * G + c / cpg;
         const float len = (float)cpg * (float)S;
@@ -560,18 +561,46 @@ __global__ void __launch_bounds__(256, 3) gn_silu_bwd_apply_rec_k(const uint8_t 
     float bacc[NTASK];
 #pragma unroll
     for (int k = 0; k < NTASK; k++) bacc[k] = 0.f;
+    /* BW 32: the next group's x and gy rows and scales are loaded during this group's arithmetic (one group's loads in flight per warp
+       left the kernel latency-bound; the arithmetic is unchanged) */
+    constexpr int RW = B / 4;
+    uint4 px[RW], pg = make_uint4(0u, 0u, 0u, 0u); unsigned psx = 0u, psg = 0u;
+    auto pf = [&](unsigned grp_) {
+        if constexpr (BW == 32) {
+            const int xb_ = (int)(grp_ % Wb), ty_ = (int)((grp_ / Wb) % TY), zt_ = zt0 + (int)(grp_ / ((unsigned)Wb * TY));
+            const int z_ = 2 * zt_ + (warp >> 2), y_ = 2 * (4 * ty_ + (warp & 3)) + (lane >> 4), x_ = 16 * xb_ + (lane & 15);
+#pragma unroll
+            for (int w_ = 0; w_ < RW; w_++) px[w_] = make_uint4(0u, 0u, 0u, 0u);
+            if (z_ < D && y_ < H && x_ < W) {
+                const size_t ri_ = ((size_t)n * nb + cb) * S + ((size_t)z_ * H + y_) * W + x_;
+#pragma unroll
+                for (int w_ = 0; w_ < RW; w_++) px[w_] = __ldg((const uint4 *)(x + ri_ * rbx) + w_);
+                pg = __ldg((const uint4 *)(gy + ri_ * GRB)); psx = sx[ri_]; psg = sg[ri_];
+            }
+        }
+    };
+    if (blockIdx.x < ngrp) pf(blockIdx.x);
     for (unsigned grp = blockIdx.x; grp < ngrp; grp += gridDim.x) {
-        const int xb = (int)(grp % Wb), ty = (int)((grp / Wb) % TY), zt = (int)(grp / ((unsigned)Wb * TY));
+        const int xb = (int)(grp % Wb), ty = (int)((grp / Wb) % TY), zt = zt0 + (int)(grp / ((unsigned)Wb * TY));
         const int z = 2 * zt + (warp >> 2), yp = 4 * ty + (warp & 3), y = 2 * yp + (lane >> 4), xx = 16 * xb + (lane & 15);
         float q[BW];
 #pragma unroll
         for (int k = 0; k < BW; k++) q[k] = 0.f;
+        uint4 cx[RW], cgy = pg; const unsigned csx = psx, csg = psg;
+#pragma unroll
+        for (int w_ = 0; w_ < RW; w_++) cx[w_] = px[w_];
+        if (grp + gridDim.x < ngrp) pf(grp + gridDim.x);
         if (z < D && y < H && xx < W) {
             const size_t ri = ((size_t)n * nb + cb) * S + ((size_t)z * H + y) * W + xx;
             float r[32], g[32];
-            mxf<B>::dec_row(x + ri * rbx, BW, mx_scale(sx[ri]), r);
-            mxf<4>::dec_row(gy + ri * GRB, BW, 1.f, g);   /* raw; the scale below */
-            const float fg = mx_scale(sg[ri]);
+            if constexpr (BW == 32) {
+                dec_row32_regs<B>(cx, mx_scale(csx), r);
+                dec_row32_regs<4>(&cgy, 1.f, g);   /* raw; the scale below */
+            } else {
+                mxf<B>::dec_row(x + ri * rbx, BW, mx_scale(sx[ri]), r);
+                mxf<4>::dec_row(gy + ri * GRB, BW, 1.f, g);   /* raw; the scale below */
+            }
+            const float fg = mx_scale(BW == 32 ? csg : (unsigned)sg[ri]);
             float o[BW]; unsigned am = 0u;
 #pragma unroll
             for (int k = 0; k < BW; k++) {
@@ -628,7 +657,7 @@ __global__ void __launch_bounds__(256, 3) gn_silu_bwd_apply_rec_k(const uint8_t 
             sr_hash4(rsr, vid, hh);
             /* straight to the record (the warp's 16 bytes of channel c, its scale byte): no block gather, no barriers per group
                (L2 merges the partial sectors of the 8 warps' slices) */
-            uint8_t *rec = out + ((((size_t)n * C + co) * ZT + zt) * TY + ty) * Wb * GREC + (size_t)xb * GREC;
+            uint8_t *rec = out + ((((size_t)n * C + co) * ZTs + (zt - zt0)) * TY + ty) * Wb * GREC + (size_t)xb * GREC;
             *(unsigned *)(rec + warp * 16 + 4 * f) = sr_e2m1_word(qq, m, hh);
             if (f == 0) rec[128 + warp] = (uint8_t)(e + 127);
         }
@@ -641,6 +670,23 @@ __global__ void __launch_bounds__(256, 3) gn_silu_bwd_apply_rec_k(const uint8_t 
     }
     __syncthreads();
     if (threadIdx.x < BW) atomicAdd(&gbsum[(size_t)n * C + cb * BW + threadIdx.x], bred[threadIdx.x]);
+}
+/* gn_silu_bwd_apply_rec_k over z-steps [zt0, zt0 + ZTs) (records relative to zt0 in out; gbsum += the per-channel gy sums, nullptr:
+   a scratch) */
+static void apply_rec_launch(const void *x, int xdt, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd,
+                             const void *gy, void *gx, const float *AB, unsigned gsr, unsigned rsr, int zt0, int ZTs, uint8_t *out, float *gbsum) {
+    static thread_local float *gscr[16]; static thread_local int gscn[16];
+    const int bw = mx_bw(s.c), Wb = (s.w + 15) / 16, TY = (s.h + 7) / 8, nb = s.c / bw, d = cur_dev_();
+    if (!gbsum) {
+        if (gscn[d] < s.n * s.c) { if (gscr[d]) cudaFree(gscr[d]); if (cudaMalloc((void **)&gscr[d], (size_t)s.n * s.c * 4) != cudaSuccess) { fprintf(stderr, "gn apply: no memory for the bias scratch\n"); abort(); } gscn[d] = s.n * s.c; }
+        gbsum = gscr[d];
+    }
+    const unsigned ngrp = (unsigned)ZTs * TY * Wb;
+    const dim3 grid(ngrp < 4096 ? ngrp : 4096, (unsigned)(nb * s.n));
+#define GREC_K(BWT) do { if (xdt == 4) gn_silu_bwd_apply_rec_k<4, BWT><<<grid, 256>>>((const uint8_t *)x, (const uint8_t *)gy, gamma, beta, mean, rstd, AB, (uint8_t *)gx, out, gbsum, s.n, s.c, G, s.d, s.h, s.w, gsr, rsr, zt0, ZTs); \
+                          else gn_silu_bwd_apply_rec_k<8, BWT><<<grid, 256>>>((const uint8_t *)x, (const uint8_t *)gy, gamma, beta, mean, rstd, AB, (uint8_t *)gx, out, gbsum, s.n, s.c, G, s.d, s.h, s.w, gsr, rsr, zt0, ZTs); } while (0)
+    if (bw == 32) GREC_K(32); else if (bw == 16) GREC_K(16); else GREC_K(8);
+#undef GREC_K
 }
 thread_local lp_gyrec_t g_gyrec;
 /* the record / bias-sum buffers of every GPU this thread drives: data-parallel training runs all GPUs' steps on one host thread, and
@@ -659,6 +705,7 @@ static int g_gyrec_narrow = -1;   /* records also for whole 8- / 16-channel leve
 extern "C" void lp_set_gyrec_narrow(int on) { g_gyrec_narrow = on; }
 static int g_gyrec_off = -1;   /* test hook: 1 no records at all (the plain apply), -1 env UFSM_GYREC */
 extern "C" void lp_set_gyrec_off(int off) { g_gyrec_off = off; }
+extern "C" int lp_get_gyrec_off(void) { return g_gyrec_off; }
 extern "C" int lp_gyrec_narrow(void) { return g_gyrec_narrow >= 0 ? g_gyrec_narrow : getenv("UFSM_GYREC") && atoi(getenv("UFSM_GYREC")) >= 2; }
 extern "C" int lp_gn_silu_bwd_apply_rec(const void *x, int xdt, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd,
                                         const void *gy, void *gx, const float *AB, unsigned gsr, unsigned rsr) {
@@ -684,15 +731,52 @@ extern "C" int lp_gn_silu_bwd_apply_rec(const void *x, int xdt, shape5 s, int G,
         R->gbc = s.n * s.c;
     }
     cudaMemsetAsync(R->gb, 0, (size_t)s.n * s.c * 4);
-    const unsigned ngrp = (unsigned)ZT * TY * Wb;
-    const dim3 grid(ngrp < 4096 ? ngrp : 4096, (unsigned)(nb * s.n));
-#define GREC_K(BWT) do { if (xdt == 4) gn_silu_bwd_apply_rec_k<4, BWT><<<grid, 256>>>((const uint8_t *)x, (const uint8_t *)gy, gamma, beta, mean, rstd, AB, (uint8_t *)gx, R->rec, R->gb, s.n, s.c, G, s.d, s.h, s.w, gsr, rsr); \
-                          else gn_silu_bwd_apply_rec_k<8, BWT><<<grid, 256>>>((const uint8_t *)x, (const uint8_t *)gy, gamma, beta, mean, rstd, AB, (uint8_t *)gx, R->rec, R->gb, s.n, s.c, G, s.d, s.h, s.w, gsr, rsr); } while (0)
-    if (bw == 32) GREC_K(32); else if (bw == 16) GREC_K(16); else GREC_K(8);
-#undef GREC_K
+    apply_rec_launch(x, xdt, s, G, gamma, beta, mean, rstd, gy, gx, AB, gsr, rsr, 0, ZT, R->rec, R->gb);
     LPCK();
     R->gy = gx; R->n = s.n; R->c = s.c; R->d = s.d; R->h = s.h; R->w = s.w; R->bw = bw; R->valid = 1;
     return 1;
+}
+/* ---- deferred apply (UFSM_GN_DEFER, default on): the whole layer's records (17 B per level-0 voxel at 32 channels, 2.28 GB at
+   P512) existed only between this apply and the fp4 weight gradient right after it. nn_gn_silu_bwd now leaves the apply pending
+   (gx still holds gy) when its caller says the next op is that weight gradient; the weight gradient then runs the apply over each
+   of its gy pre-pass slabs (z-steps [zt0, zt0 + ZTs): gx rows and that slab's records, the same bits as the whole-layer apply, SR keyed
+   globally) followed by its kernel over the slab, so the records take one ~96 MB slab buffer. Any other consumer of the pending
+   gradient runs the plain apply first (lp_gnpend_flush: the same gx bits, no records). */
+typedef struct { const void *x; int xdt; shape5 s; int G; const float *gamma, *beta, *mean, *rstd, *AB; const void *gy; void *gx; unsigned gsr, rsr; int valid, dev; } gnpend_t;
+static thread_local gnpend_t g_gnpend;
+static int g_gn_defer_req;   /* nn_gn_silu_bwd's caller: the next op is the weight gradient of this gradient (lp_gnpend_request) */
+extern "C" void lp_gnpend_request(int on) { g_gn_defer_req = on; }
+extern "C" int lp_gnpend_env(void) { static int on = -1; if (on < 0) on = getenv("UFSM_GN_DEFER") ? atoi(getenv("UFSM_GN_DEFER")) : 1; return on; }
+extern "C" int lp_gnpend_want(void) { return lp_gnpend_env() && g_gn_defer_req; }
+extern "C" int lp_gn_silu_bwd_apply_defer(const void *x, int xdt, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd,
+                                          const void *gy, void *gx, const float *AB, unsigned gsr, unsigned rsr) {
+    lp_gnpend_flush();   /* (one pending apply at a time) */
+    if (s.c % 32 || s.n > 1 || (xdt != 4 && xdt != 8)) return 0;   /* (32-channel blocks: the records' slabs; the rest applies at once) */
+    static thread_local float *abk[16];   /* the group coefficients kept (AB sits in the caller's GN scratch, which the next GN op rewrites) */
+    const int d = cur_dev_();
+    if (2 * s.n * G > 1024) return 0;
+    if (!abk[d] && cudaMalloc((void **)&abk[d], 1024 * sizeof(float)) != cudaSuccess) { abk[d] = nullptr; cudaGetLastError(); return 0; }
+    cudaMemcpyAsync(abk[d], AB, (size_t)2 * s.n * G * sizeof(float), cudaMemcpyDeviceToDevice);
+    g_gnpend = (gnpend_t){x, xdt, s, G, gamma, beta, mean, rstd, abk[d], gy, gx, gsr, rsr, 1, d};
+    g_gyrec.valid = 0;
+    return 1;
+}
+extern "C" int lp_gnpend_flush(void) {   /* the pending apply, whole layer, no records; 1 when there was one */
+    gnpend_t &p = g_gnpend;
+    if (!p.valid) return 0;
+    p.valid = 0;
+    lp_gn_silu_bwd_apply_mx(p.x, p.xdt, p.s, p.G, p.gamma, p.beta, p.mean, p.rstd, p.gy, p.gx, 4, p.AB, p.gsr);
+    return 1;
+}
+extern "C" int lp_gnpend_of(const void *gx) { return g_gnpend.valid && g_gnpend.gx == gx && g_gnpend.dev == cur_dev_(); }
+extern "C" int lp_gnpend_flush_of(const void *gx) { return lp_gnpend_of(gx) ? lp_gnpend_flush() : 0; }   /* (a consumer that does not take it over) */
+/* the pending apply over z-steps [zt0, zt1) with that slab's records into out (the pre-pass layout of a slab) and the gy sums into gb
+   (N 1: per channel; nullptr: none); the last slab clears the pending state */
+extern "C" void lp_gnpend_slab(int zt0, int zt1, uint8_t *out, float *gb, int last) {
+    gnpend_t &p = g_gnpend;
+    apply_rec_launch(p.x, p.xdt, p.s, p.G, p.gamma, p.beta, p.mean, p.rstd, p.gy, p.gx, p.AB, p.gsr, p.rsr, zt0, zt1 - zt0, out, gb);
+    LPCK();
+    if (last) p.valid = 0;
 }
 /* 8-channel tensors (bw 8) take the FULL lane-per-row kernels with NK 8: the general ones guarded every channel and computed the
    second, unstored SR word (P512 desk, 8-wide net level 0: apply 9.4 -> 6.0 ms, stats 4.5 -> 3.5 ms per call). Test hook: 0 the general ones */

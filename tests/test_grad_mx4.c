@@ -177,6 +177,40 @@ int main(void) {
         if (!same) bad++;
         free(ha); free(hb);
     }
+    {   /* the deferred apply (lp_gn_silu_bwd_apply_defer): the fp4 weight gradient of gx runs it over its gy pre-pass slabs (here 5 slabs
+           of 2 z-steps), records from the apply. gx must be bit-identical to the whole-layer apply's, the weight gradient equal to the one
+           from the whole layer's records up to the fp32 grouping of its sums; a flush (any other consumer) gives the same gx bits */
+        const int C = 32;
+        shape5 s = {1, C, 20, 24, 32};
+        size_t n = shape_numel(s), nw = (size_t)C * C * 27;
+        float *x = dev_rand(n, 2.f), *gam = dev_rand(C, 1.f), *bet = dev_rand(C, 0.5f), *mean = dev_rand(G, 0.2f), *rstd = dev_rand(G, 0.3f);
+        { float h[64]; nn_d2h(h, rstd, G * 4); for (int i = 0; i < G; i++) h[i] = 0.8f + fabsf(h[i]); nn_h2d(rstd, h, G * 4); }
+        void *xm = mx4_from(x, s); float *gy = dev_rand_wide(n, 1e-3f); void *gym = mx4_from(gy, s);
+        void *xin = mx4_from(dev_rand_wide(n, 2.f), s);   /* the weight gradient's input */
+        float *gg = dev_zero(C), *gb = dev_zero(C), *scr = nn_malloc(nn_gn_scratch(s) + 4096);
+        void *gxa = mx4_new(s), *gxb = mx4_new(s), *gxc = mx4_new(s);
+        float *gwa = dev_zero(nw), *gba = dev_zero(C), *gwb = dev_zero(nw), *gbb = dev_zero(C);
+        const size_t bytes = nn_mx4_bytes(s);
+        mode_mx(); nn_set_sr(1); setenv("UFSM_F4_WGRAD", "1", 1);
+        split_t sr = {0}; sr.sr = 0x51ed2701u;
+        nn_set_sr_step(1700); nn_gn_silu_bwd(xm, s, G, gam, bet, mean, rstd, gym, (float *)gxa, gg, gb, scr);   /* whole-layer records */
+        lp_bwd_w_f4(xin, 4, s, gxa, 4, s, gwa, gba, (gnp_t){0}, sr, 0);
+        lp_gnpend_request(1); nn_set_sr_step(1700); nn_gn_silu_bwd(xm, s, G, gam, bet, mean, rstd, gym, (float *)gxb, gg, gb, scr); lp_gnpend_request(0);
+        const int pend = lp_gnpend_of(gxb);
+        lp_set_f4w_gypre_kb(64); lp_bwd_w_f4(xin, 4, s, gxb, 4, s, gwb, gbb, (gnp_t){0}, sr, 0); lp_set_f4w_gypre_kb(-1);
+        const int left = lp_gnpend_of(gxb);
+        lp_gnpend_request(1); nn_set_sr_step(1700); nn_gn_silu_bwd(xm, s, G, gam, bet, mean, rstd, gym, (float *)gxc, gg, gb, scr); lp_gnpend_request(0);
+        const int flushed = lp_gnpend_flush_of(gxc);
+        uint8_t *ha = malloc(bytes), *hb = malloc(bytes), *hc = malloc(bytes); nn_d2h(ha, gxa, bytes); nn_d2h(hb, gxb, bytes); nn_d2h(hc, gxc, bytes);
+        const int sb = !memcmp(ha, hb, bytes), sc = !memcmp(ha, hc, bytes);
+        const double dw = relerr(gwb, gwa, nw), db = relerr(gbb, gba, C);
+        const int ok = pend && !left && flushed && sb && sc && dw < 1e-6 && db < 1e-6 && !nn_check();
+        printf("  deferred gn+silu bwd apply (5 slabs): pending %d, left %d, gx %s, flushed gx %s, wgrad rel diff %.3g, bias %.3g%s\n", pend, left,
+               sb ? "equal" : "DIFFERS", sc ? "equal" : "DIFFERS", dw, db, ok ? "" : "  FAIL");
+        if (!ok) bad++;
+        free(ha); free(hb); free(hc);
+        nn_set_sr(0);
+    }
     for (int C = 8; C <= 64; C *= 2) {   /* the persistent grid-stride apply (several trips per thread, a partial last sweep) writes the bytes
                                             of a row per thread (lp_set_gn_persist(0)): same arithmetic, same SR keys */
         const uint64_t rs0 = rs;

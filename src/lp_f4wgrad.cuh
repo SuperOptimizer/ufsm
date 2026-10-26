@@ -1123,6 +1123,10 @@ template <typename T, typename TG> void bwd_w_f4_t(const void *x, shape5 xs, con
     if (pre_env < 0) pre_env = getenv("UFSM_F4W_GYPRE") ? atoi(getenv("UFSM_F4W_GYPRE")) : 96;
     const size_t cap_kb = g_f4w_gypre_kb >= 0 ? (size_t)g_f4w_gypre_kb : (size_t)pre_env * 1024;
     if (g_f4w_gy4 && !(IS_MX8(TG) && cap_kb && sp.sr && !had && (lay == 1 || lay == 2) && zc_env <= 0)) { fprintf(stderr, "lp_bwd_w_f4: MX-fp4 gradients need the gy pre-pass (SR on, plain layout)\n"); abort(); }
+    /* a GN+SiLU backward apply left pending into gy (lp_gn_silu_bwd_apply_defer): run over the pre-pass slabs below (whole windows of
+       32-channel MX-fp4 gy, N 1), otherwise now, before anything reads gy */
+    const int pend = g_f4w_gy4 && lp_gnpend_of(gy) && !zw_trange(ys.d, 2).y && mx_bw(ys.c) == 32 && ys.n == 1;
+    if (!pend) lp_gnpend_flush_of(gy);
     if constexpr (IS_MX8(TG)) if (cap_kb && sp.sr && !had && (lay == 1 || lay == 2) && zc_env <= 0) {
         const int Wb = (ys.w + 15) / 16, gbw = mx_bw(ys.c);
         if ((size_t)ys.d * ys.h * ys.w >= ((size_t)1 << 32)) { fprintf(stderr, "lp_bwd_w_f4: gy pre-pass needs < 2^32 voxels per channel\n"); abort(); }   /* (gy_pre4_k's 32-bit spatial indices) */
@@ -1131,7 +1135,7 @@ template <typename T, typename TG> void bwd_w_f4_t(const void *x, shape5 xs, con
         const lp_gyrec_t &rc = g_gyrec;   /* this thread's (lp_gn_silu_bwd_apply_rec) */
         const int2 zw = zw_trange(ys.d, 2);   /* z-window: gy's z-steps [zt0, zt1) */
         const int zt0 = zw.y ? zw.x : 0, zt1 = zw.y ? zw.y : nzt;
-        const int cached = !zw.y && g_f4w_gy4 && rc.valid && rc.dev == cur_dev_() && rc.gy == (const void *)gy && rc.n == ys.n && rc.c == ys.c && rc.d == ys.d && rc.h == ys.h && rc.w == ys.w && gbw == rc.bw;
+        const int cached = !pend && !zw.y && g_f4w_gy4 && rc.valid && rc.dev == cur_dev_() && rc.gy == (const void *)gy && rc.n == ys.n && rc.c == ys.c && rc.d == ys.d && rc.h == ys.h && rc.w == ys.w && gbw == rc.bw;
         const size_t cap_zt = (cap_kb << 10) / per_zt;
         const int szt = cached ? nzt : cap_zt < 1 ? 1 : cap_zt < (size_t)nzt ? (int)cap_zt : nzt;
         uint8_t *buf = cached ? (uint8_t *)rc.rec : lp_buf<uint8_t>(4, per_zt * szt);
@@ -1144,7 +1148,8 @@ template <typename T, typename TG> void bwd_w_f4_t(const void *x, shape5 xs, con
 #define GP4(GB) do { if (gbw == 8) gy_pre4_k<8, GB><<<pg, 256>>>((const uint8_t *)gy, buf, gb, ys.n, ys.c, ys.d, ys.h, ys.w, 2 * zs0, Zs, sp.sr); \
                         else if (gbw == 16) gy_pre4_k<16, GB><<<pg, 256>>>((const uint8_t *)gy, buf, gb, ys.n, ys.c, ys.d, ys.h, ys.w, 2 * zs0, Zs, sp.sr); \
                         else gy_pre4_k<32, GB><<<pg, 256>>>((const uint8_t *)gy, buf, gb, ys.n, ys.c, ys.d, ys.h, ys.w, 2 * zs0, Zs, sp.sr); } while (0)
-            if (!cached) { if (g_f4w_gy4) GP4(4); else GP4(8); }
+            if (pend) lp_gnpend_slab(zs0, zs1, buf, gb, zs1 >= zt1);   /* the slab's gy (gx of the apply) and its records, the apply's bits */
+            else if (!cached) { if (g_f4w_gy4) GP4(4); else GP4(8); }
 #undef GP4
             int zc_s = zs1 - zs0 < max_zc ? zs1 - zs0 : max_zc;
             while (zc_s > 1 && (size_t)base * nblk_(zs1 - zs0, zc_s) < 72) zc_s--;

@@ -61,12 +61,24 @@ extern _Thread_local lp_gyrec_t g_gyrec;
 int lp_mx_affine(void *x, int bits, shape5 s, int G, const float *mean, const float *rstd, unsigned sr);   /* src/lp_l0slab.cu */
 int lp_gn_silu_bwd_apply_rec(const void *x, int xdt, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd,
                              const void *gy, void *gx, const float *AB, unsigned gsr, unsigned rsr);   /* 1: done (gx and the records) */
+/* the deferred GN+SiLU backward apply (src/lp_mx_gnbwd.cu): the apply left pending (gx holds gy) until the fp4 weight gradient of gx runs
+   it slab by slab with its gy records (no whole-layer records); any other consumer flushes it (the plain apply, the same gx bits) */
+void lp_gnpend_request(int on);   /* the caller of nn_gn_silu_bwd: the next op is the weight gradient of its gx */
+int lp_gnpend_env(void);          /* UFSM_GN_DEFER (default 1): the deferral and its decoder rule (unet.c block_bwd_) are on */
+int lp_gnpend_want(void);         /* requested and UFSM_GN_DEFER (default 1) */
+int lp_gn_silu_bwd_apply_defer(const void *x, int xdt, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd,
+                               const void *gy, void *gx, const float *AB, unsigned gsr, unsigned rsr);   /* 1: left pending */
+int lp_gnpend_flush(void);        /* run a pending apply now (whole layer, no records); 1 when there was one */
+int lp_gnpend_of(const void *gx); /* an apply is pending into gx (this GPU) */
+int lp_gnpend_flush_of(const void *gx);   /* flush when the pending apply writes gx (a reader of gx that does not run it) */
+void lp_gnpend_slab(int zt0, int zt1, uint8_t *out, float *gb, int last);   /* the pending apply over z-steps [zt0, zt1), that slab's records into out */
 void lp_set_s2b_f4(int on);  /* the fp4 stride-2 backward-data (MX-fp4 gy): 3 for 32 and 64 channels, 1 for 32 only, 0 bf16 tensor cores, -1 env UFSM_S2B_F4 (default 3) */
 void lp_set_s2_f4(int on);   /* the fp4 stride-2 forward (MX-fp4 32-channel input, widths % 16): 1 on, 0 fp8, -1 env UFSM_S2_F4 (default on) */
 void lp_set_f4w_gypre_kb(int kb);   /* gy pre-pass of the fp4 weight gradient: slab cap in KiB (0 off, -1 env UFSM_F4W_GYPRE MiB, default 96) */
 void lp_set_f4w_ws(int m);          /* warp-specialised fp4 weight gradient: 0 off, 1 on (default), 3 only >= 32 outputs; -1 env UFSM_F4W_WS */
 void lp_set_gyrec_narrow(int on);   /* the GN+SiLU backward's gy records also for whole 8 / 16-channel levels (-1: env UFSM_GYREC=2) */
 void lp_set_gyrec_off(int off);     /* test hook: 1 no gy records at all (the plain apply), -1 env */
+int lp_get_gyrec_off(void);
 int lp_gyrec_narrow(void);
 int lp_conv_fwd_s2_f8(const void *x, int xbf, shape5 xs, const float *w, const float *b, int cout, void *y, int ybf, shape5 ys, gnp_t gp);   /* stride 2; gp: input gn+silu; 0, or 3 when the fp4 kernel ran */
 void lp_set_s2_f4g(int on);   /* the coarse down convs' fp4 forward (conv_fwd_s2_f4_k GEN): 1 on, 0 off, -1 env UFSM_S2_F4G (default off) */

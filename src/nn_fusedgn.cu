@@ -69,6 +69,7 @@ extern "C" int nn_conv3d_fwd_x(const float *x, const nn_gn_t *gx, const float *x
 }
 extern "C" int nn_conv3d_bwd_weight_x(const float *x, const nn_gn_t *gx, const float *x2, const nn_gn_t *gx2, int c_split, int up, shape5 xs,
                                       const float *gy, shape5 ys, int k, int stride, float *gw, float *gb) {
+    if (!(k == 3 && stride == 1)) lp_gnpend_flush_of(gy);   /* (a deferred GN apply into gy: only the fp4 kernel takes it over) */
     if (!g_tf32) return -1;
     gnp_t gp = to_gnp(gx);
     if (k == 3 && stride == 1) {
@@ -288,7 +289,9 @@ extern "C" void nn_gn_silu_bwd(const float *x, shape5 s, int G, const float *gam
            from gsr, so the global seed sequence is unchanged */
         int za, zb; const int zwin = zw_win(s.n * s.d, &za, &zb);   /* (z-window: the plain apply, same gx bits; no whole-layer records) */
         if (zwin) g_gyrec.valid = 0;
-        if (gdt != 4 || zwin || !lp_gn_silu_bwd_apply_rec(x, xdt, s, G, gamma, beta, mean, rstd, gy, gx, AB, gsr, gsr * 0x9e3779b9u + 0x7f4a7c15u))
+        if (gdt == 4 && !zwin && lp_gnpend_want() && lp_gn_silu_bwd_apply_defer(x, xdt, s, G, gamma, beta, mean, rstd, gy, gx, AB, gsr, gsr * 0x9e3779b9u + 0x7f4a7c15u)) {}   /* (the
+                                                                                                     weight gradient that follows applies it with its records, slab by slab) */
+        else if (gdt != 4 || zwin || !lp_gn_silu_bwd_apply_rec(x, xdt, s, G, gamma, beta, mean, rstd, gy, gx, AB, gsr, gsr * 0x9e3779b9u + 0x7f4a7c15u))
             lp_gn_silu_bwd_apply_mx(x, xdt, s, G, gamma, beta, mean, rstd, gy, gx, gdt, AB, gsr);
         if (!zsp) gn_param_grad_k2<<<nblk(s.c, 128), 128>>>(scratch, ggamma, gbeta, s.n, s.c);
         KCHECK();

@@ -9,6 +9,7 @@ int f4_had_w(void) {   /* bit 0: Hadamard (UFSM_F4_HAD_W), bit 1: stochastic rou
     return v;
 }
 void launch_bwd_w_tc(const void *x, int xbf, shape5 xs, const void *gy, int gybf, shape5 ys, float *gw, float *gb, gnp_t gp, split_t sp) {
+    if (!(eff_prec_w() == 3 && f4_wgrad() && (!sp.up || ISMX(x)))) lp_gnpend_flush_of(gy);   /* (a deferred GN apply into gy: only the fp4 kernel takes it over) */
     exec_prec(2, eff_prec_w() == 3 && f4_wgrad() && (!sp.up || ISMX(x)) ? 3 : ISMX(x) || ((eff_prec_w() == 2 || eff_prec_w() == 3) && !sp.up) ? 2 : 1);
     if (eff_prec_w() == 3 && f4_wgrad() && (!sp.up || ISMX(x))) {   /* sp.up: MX only (fused upsample in the tile decode) */
         if (sr_on()) sp.sr = sr_seed();
@@ -25,6 +26,7 @@ void launch_bwd_w_tc(const void *x, int xbf, shape5 xs, const void *gy, int gybf
     else launch_bwd_w_tc_h<bf16>(x, xbf, xs, gy, gybf, ys, gw, gb, gp, sp);
 }
 extern "C" void nn_conv3d_bwd_weight(const float *x, shape5 xs, const float *gy, shape5 ys, int k, int stride, float *gw, float *gb) {
+    if (!(k == 3 && stride == 1 && g_tf32)) lp_gnpend_flush_of(gy);
     if (k == 1 || !g_tf32) exec_prec(2, 0);
     else if (stride == 2) exec_prec(2, ISMX(x) || eff_prec_w() == 2 || eff_prec_w() == 3 ? 2 : 1);
     size_t So = shape_spatial(ys);
