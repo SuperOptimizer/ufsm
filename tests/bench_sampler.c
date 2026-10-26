@@ -47,6 +47,7 @@ int main(int argc, char **argv) {
     if (getenv("UFSM_BENCH_PZ")) c.Pz = atoi(getenv("UFSM_BENCH_PZ"));
     if (getenv("UFSM_BENCH_MINFG")) c.min_fg = atof(getenv("UFSM_BENCH_MINFG"));   /* train --min-fg */
     if (getenv("UFSM_BENCH_GPUIN")) c.gpu_input = 1;   /* train --gpu-input: the CT channel and radial records only (hashed as such) */
+    if (getenv("UFSM_BENCH_GPUAUG")) { c.gpu_input = 1; c.gpu_aug = 1; if (!sample_gpu_aug_ok(&c)) { fprintf(stderr, "UFSM_BENCH_GPUAUG: not with this configuration\n"); return 2; } }   /* train --gpu-aug: the sampler's share (the CT channel left to the device) */
     if (getenv("UFSM_BENCH_PRESET") && sample_aug_preset(&c, getenv("UFSM_BENCH_PRESET"))) { fprintf(stderr, "UFSM_BENCH_PRESET: all | none\n"); return 2; }
     if (getenv("UFSM_BENCH_PACK")) c.pack_tm = 1;
     if (getenv("UFSM_BENCH_WIND4")) c.wind4 = 1;   /* train --task unwrap2 (with UFSM_BENCH_SIDE=2): the winding mod 4 and its component, hashed too */
@@ -108,7 +109,7 @@ int main(int argc, char **argv) {
                     const uint8_t code = b->tm ? b->tm[z0 + j] : 0;
                     const int t0 = b->tm ? (code & SAMPLE_TM_T0) != 0 : b->t[z0 + j] > 127, t1 = b->tm ? (code & SAMPLE_TM_T1) != 0 : b->t[p3 + z0 + j] > 127;
                     const int mk = b->tm ? (code & SAMPLE_TM_M) != 0 : b->m[z0 + j] != 0;
-                    if (k == 0) { _Float16 h; memcpy(&h, b->x16 + z0 + j, 2); const float v = 128.f + 40.f * (float)h; img[j] = (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v); }
+                    if (k == 0 && b->x16) { _Float16 h; memcpy(&h, b->x16 + z0 + j, 2); const float v = 128.f + 40.f * (float)h; img[j] = (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v); }
                     else if (k == 3) img[j] = b->side[z0 + j] < 252 ? (uint8_t)(1 + b->side[z0 + j]) : 0;   /* phase codes 0..251 (0: unknown) */
                     else if (k == 1) img[j] = !mk ? 0 : t0 ? 255 : t1 ? 128 : 40;   /* recto 255, verso 128, void 40, unsupervised 0 */
                     else img[j] = (uint8_t)(mk ? 255 : 0);
@@ -122,13 +123,13 @@ int main(int argc, char **argv) {
             free(img); sampler_release(sp, b);
         }
     }
-    for (int i = 0; i < 4; i++) { batch *b = sampler_next(sp); if (!b) return 1; if (hashing) { h = hash(h, b->x16, (size_t)c.B * b->xch * p3 * 2); if (b->rad) h = hash(h, b->rad, (size_t)c.B * NN_RAD_REC(Pz)); if (b->tm) h = hash(h, b->tm, (size_t)c.B * p3); else { h = hash(h, b->t, (size_t)c.B * NCH * p3); h = hash(h, b->m, (size_t)c.B * p3); } h = hash(h, b->w, (size_t)c.B * NCH); if (b->side) h = hash(h, b->side, (size_t)c.B * p3); if (b->w4) { h = hash(h, b->w4, (size_t)c.B * p3); h = hash(h, b->wcomp, (size_t)c.B * p3); } } sampler_release(sp, b); }   /* warm-up */
+    for (int i = 0; i < 4; i++) { batch *b = sampler_next(sp); if (!b) return 1; if (hashing) { h = b->x16 ? hash(h, b->x16, (size_t)c.B * b->xch * p3 * 2) : hash(hash(h, b->ct8, (size_t)c.B * p3), b->aug, (size_t)c.B * sizeof(scan_ct_rec)); if (b->rad) h = hash(h, b->rad, (size_t)c.B * NN_RAD_REC(Pz)); if (b->tm) h = hash(h, b->tm, (size_t)c.B * p3); else { h = hash(h, b->t, (size_t)c.B * NCH * p3); h = hash(h, b->m, (size_t)c.B * p3); } h = hash(h, b->w, (size_t)c.B * NCH); if (b->side) h = hash(h, b->side, (size_t)c.B * p3); if (b->w4) { h = hash(h, b->w4, (size_t)c.B * p3); h = hash(h, b->wcomp, (size_t)c.B * p3); } } sampler_release(sp, b); }   /* warm-up */
     size_t side_known = 0, side_all = 0;   /* phase voxels known (UFSM_BENCH_SIDE=2) */
     double t0 = now();
     for (int i = 0; i < NB; i++) {
         batch *b = sampler_next(sp); if (!b) return 1;
         if (b->side) for (size_t k = 0; k < (size_t)c.B * p3; k++) { side_known += b->side[k] < 252; side_all++; }
-        if (hashing) { h = hash(h, b->x16, (size_t)c.B * b->xch * p3 * 2); if (b->rad) h = hash(h, b->rad, (size_t)c.B * NN_RAD_REC(Pz)); if (b->tm) h = hash(h, b->tm, (size_t)c.B * p3); else { h = hash(h, b->t, (size_t)c.B * NCH * p3); h = hash(h, b->m, (size_t)c.B * p3); } h = hash(h, b->w, (size_t)c.B * NCH); if (b->side) h = hash(h, b->side, (size_t)c.B * p3); if (b->w4) { h = hash(h, b->w4, (size_t)c.B * p3); h = hash(h, b->wcomp, (size_t)c.B * p3); } }
+        if (hashing) { h = b->x16 ? hash(h, b->x16, (size_t)c.B * b->xch * p3 * 2) : hash(hash(h, b->ct8, (size_t)c.B * p3), b->aug, (size_t)c.B * sizeof(scan_ct_rec)); if (b->rad) h = hash(h, b->rad, (size_t)c.B * NN_RAD_REC(Pz)); if (b->tm) h = hash(h, b->tm, (size_t)c.B * p3); else { h = hash(h, b->t, (size_t)c.B * NCH * p3); h = hash(h, b->m, (size_t)c.B * p3); } h = hash(h, b->w, (size_t)c.B * NCH); if (b->side) h = hash(h, b->side, (size_t)c.B * p3); if (b->w4) { h = hash(h, b->w4, (size_t)c.B * p3); h = hash(h, b->wcomp, (size_t)c.B * p3); } }
         sampler_release(sp, b);
     }
     double dt = now() - t0;

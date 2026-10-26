@@ -99,6 +99,10 @@ typedef struct {
                                 input units ((t - mean) / sd, times the intensity jitter: the conditioning code) instead of a voxel size */
     int gpu_input;           /* train --gpu-input (needs xfmt and sample_gpu_input_ok): batch.x16 holds the CT channel only and batch.rad
                                 each sample's radial record (nn.h nn_input_rad builds the 4 input channels on the device, bit for bit) */
+    int gpu_aug;             /* train --gpu-aug (with gpu_input, cubes, no --ct-aug, side_air 0; sample_gpu_aug_ok): batch.ct8 holds each window's
+                                source-grid bytes (after the seam shift) and batch.aug its scan_ct_rec (scanner plan, jitter, normalisation); the
+                                device builds the CT channel (nn.h nn_aug_ct); batch.x16 is absent. The labels and masks are the CPU path's, byte
+                                for byte (the output's zero set comes from the plan); the sampler still makes write_x's draws */
     int axis_rec;            /* > 0: batch.axr holds each sample's scroll-axis record (SAMPLE_AXR floats, the layout of unet.h UNET_AXR:
                                 the axis centre per window plane along the window dim nearest the axis, through the symmetry and the
                                 warp) with div = axis_rec (the half-res factor); for train --attn-axis radial / --attn-pe scroll */
@@ -132,6 +136,7 @@ typedef struct {
 /* the configurations whose every sample takes write_x (no warp, sheet prior, slab appearance plan, aux or condition channels): the
    radial channels then follow from the window's corner, symmetry and axis centres alone */
 int sample_gpu_input_ok(const sample_cfg *c);
+int sample_gpu_aug_ok(const sample_cfg *c);   /* train --gpu-aug possible with this configuration (needs gpu_input) */
 
 typedef struct {
     float *x;                /* B x 4 x P^3: z-scored CT, radial z (0), radial y, radial x; nullptr when cfg.xfmt */
@@ -151,6 +156,8 @@ typedef struct {
     uint8_t *pap;            /* B x P^3 papyrus labels when cfg.pap_head: 0 void, 1 papyrus, 255 ignored */
     uint8_t *w4, *wcomp;     /* B x P^3 each when cfg.wind4: winding mod 4 (63 codes per turn, 255 unknown) and its component (0..14, 255 none) */
     void *rad;               /* cfg.gpu_input: B radial records of NN_RAD_REC(Pz) bytes (nn.h), x / x16 then one channel per sample */
+    uint8_t *ct8;            /* cfg.gpu_aug: B x P^3 source-grid CT bytes (sample.h gpu_aug), else nullptr */
+    void *aug;               /* cfg.gpu_aug: B scan_ct_rec (scan_augment.h) */
     float *axr;              /* cfg.axis_rec: B records of SAMPLE_AXR(P) floats */
     int64_t *chid;           /* cfg.chain_p: B chain ids (-1: not in a chain) */
     int *chidx;              /* B: the window's index in its chain (0: the start) */
