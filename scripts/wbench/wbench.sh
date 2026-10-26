@@ -9,7 +9,7 @@
 # Env: SITE laptop|desk (default: laptop if ~/ufsm-data exists), GPU (0), BOXES ("clean" default: boxes not tagged label-noise in boxes.tsv | "core": the clean paris4 + paris4j boxes + 12 1667 boxes tagged core (routine snapshot evals) | "all" | "none" | names), REP (2: shifted fits per box, 0 off),
 #   SLABS (1), SLABORC (none|net: slab ceiling, label phase in the slab crops; BOXES=none skips the boxes), SITES (z cells of the slab sites), FIT (extra fit flags; changes the fitter config tag; "{box}" becomes the box name,
 #   e.g. FIT="--emb /vesuvius/ufsm/repr/emb/bench/{box} --uw-rep-emb 2"), FIELDS (TAG0: reuse fields),
-#   KEEP (1: keep this TAG's fields for later fixed-fields runs; default 1), U (binary; default $WB/bin/ufsm = the pinned build),
+#   KEEP (1: keep this TAG's fields for later fixed-fields runs; default 1), U (binary; default $WB/bin/ufsm = the pinned build), UP (predict binary, default U: a newer build for checkpoints the fitter pin cannot load),
 #   NOLOCK=1 (the caller holds the GPU lock).
 set -u
 H=$(cd "$(dirname "$0")" && pwd)
@@ -53,7 +53,7 @@ scroll() {   # scroll SCROLL: R V UM LV AX QR QK PR PK PF (PF: CT voxels per lab
 }
 predict() {   # predict OUTFIELDS z y x nz ny nx LOG [big]: fit fields of the box (production window, 19.2 / 18.7 um cells, lossless phase)
   local f=$1 lg=$8 run=RUN; [ "${9:-}" = big ] && run=RUNBIG; rm -rf $f $f.tmp
-  $run $U predict $CK $R $V $f.tmp --um $UM --level $LV --box $2,$3,$4,$5,$6,$7 --window-z 384 --halo-z 64 --window 640 --halo 64 --shard 512 \
+  $run ${UP:-$U} predict $CK $R $V $f.tmp --um $UM --level $LV --box $2,$3,$4,$5,$6,$7 --window-z 384 --halo-z 64 --window 640 --halo 64 --shard 512 \
     --grid-origin 0,0,0 --ema 1 --q 8 --threads $THREADS --gpu $GPU --axis $AX --levels 1 --fit-zarr $f --fit-h 2 --fit-q 8 --fit-q-phase 0 \
     --no-out 1 --cache $CACHE > $lg 2>&1; local rc=$?; rm -rf $f.tmp; return $rc
 }
