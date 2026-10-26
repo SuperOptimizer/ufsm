@@ -487,7 +487,7 @@ __device__ __forceinline__ void dec_row16_gnh(uint2 raw, unsigned rsc, bool in, 
 }
 template <int MT, int TZ, typename T, typename TO, bool SL = false>   /* SL: slab-local GroupNorm statistics (MT 1; its reload kept out of the usual
                                                                           instance, where its registers spilled 108 B) */
-__global__ void __launch_bounds__(256, 2) conv_fwd_f4p_k(const T *__restrict__ x, const uint8_t *__restrict__ wq, const uint8_t *__restrict__ wsc,
+__global__ void __launch_bounds__(256, LP_MINB(2)) conv_fwd_f4p_k(const T *__restrict__ x, const uint8_t *__restrict__ wq, const uint8_t *__restrict__ wsc,
                                                       const float *__restrict__ b, TO *__restrict__ y,
                                                       int N, int Ci, int D, int H, int W, int Co, int Cop, gnp_t gp, double *__restrict__ osum, int Go, split_t sp, int ZC) {
     constexpr int BM = MT * 16, RZ = TZ / 2, NR = 2 * RZ, NP = TZ + 2, TT = NP * 180;
@@ -643,18 +643,19 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f4p_k(const T *__restrict__ x
 #pragma unroll (UNR)
     for (int tr = 0; tr < 9; tr++) {
         const int kz = tr / 3, ky = tr % 3;
-        unsigned bfr[NR][4], sb[NR][2];
+        mx4b4 bf[NR][2];
 #pragma unroll
         for (int r = 0; r < NR; r++) {
             const int s0 = sl[r >> 1] + kz, slot = s0 >= NP ? s0 - NP : s0;
             const int rowi = slot * 10 + wr + (r & 1) + ky;   /* the tile plane's ring slot */
-            ldsm_x4(bfr[r], sx + (rowi * 18 + vx + 2 * kb) * 16);   /* K 0..31: [x | x+1], K 32..63: [x+2 | x+3] */
-            if constexpr (IL) {   /* columns g, 8 + g: their three positions' scales, kx3 = 1 */
-                const uint2 s2 = *(const uint2 *)(sxw + rowi * 18 + 2 * g);
-                sb[r][0] = s2.x; sb[r][1] = s2.y;
+            unsigned bfr[4];
+            ldsm_x4(bfr, sx + (rowi * 18 + vx + 2 * kb) * 16);   /* K 0..31: [x | x+1], K 32..63: [x+2 | x+3] */
+            if constexpr (IL) {   /* columns c, 8 + c: their three positions' scales, kx3 = 1 (interleaved: [2c] = column c, [2c + 1] = 8 + c) */
+                const uint2 s0 = *(const uint2 *)(sxw + rowi * 18 + 2 * LPB0), s1 = *(const uint2 *)(sxw + rowi * 18 + 2 * LPB1);
+                bf[r][0] = mx4b4_make(bfr, s0.x, s1.x); bf[r][1] = mx4b4_make(bfr + 2, s0.y, s1.y);
             } else {
 #pragma unroll
-                for (int q2 = 0; q2 < 2; q2++) sb[r][q2] = sxw[rowi * 18 + q2 * 8 + g];
+                for (int q2 = 0; q2 < 2; q2++) bf[r][q2] = mx4b4_make(bfr + 2 * q2, sxw[rowi * 18 + q2 * 8 + LPB0], sxw[rowi * 18 + q2 * 8 + LPB1]);
             }
         }
 #pragma unroll
@@ -662,9 +663,9 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f4p_k(const T *__restrict__ x
             unsigned af[4];
             const int arow = m * 16 + (mat & 1) * 8 + (lane & 7);
             ldsm_x4(af, wa + tr * BM * 32 + sw16(arow, mat >> 1));
-            const unsigned sa = was[tr * BM + m * 16 + g + 8 * (t & 1)];
+            const mx4a4 A = mx4a4_make(af, was[tr * BM + m * 16 + LPA0], was[tr * BM + m * 16 + LPA1]);
 #pragma unroll
-            for (int r = 0; r < NR; r++) { mma_f4x4(acc[m][r][0], af, bfr[r], sa, sb[r][0]); mma_f4x4(acc[m][r][1], af, bfr[r] + 2, sa, sb[r][1]); }
+            for (int r = 0; r < NR; r++) { mma4p4(acc[m][r][0], A, bf[r][0]); mma4p4(acc[m][r][1], A, bf[r][1]); }
         }
     }
 #if F4R_PROF

@@ -32,6 +32,7 @@
 #include <stdlib.h>
 
 extern cudaError_t g_lp_err;
+extern "C" int lp_sw_build(void);   /* lp_mxsw.cu: 1 = the software MX paths (an ARCH=86 build) */
 #define LPCK() do { cudaError_t e_ = cudaGetLastError(); if (e_ != cudaSuccess && g_lp_err == cudaSuccess) g_lp_err = e_; } while (0)
 static inline unsigned nblk_(size_t n, unsigned b) { return (unsigned)((n + b - 1) / b); }
 /* the z tiles of TZ planes a launch covers: all of depth D, or those of the z-window sp.zw0 / zw1 (nn_set_zwin; its bounds on tile
@@ -860,6 +861,70 @@ __device__ __forceinline__ void mma4p(float *c, const mx4a &A, const mx4b &B) {
     }
 #else
     mma_f4(c, A.a, B.b, A.s, B.s);
+#endif
+}
+/* the same for the 4X MMA (mma_f4x4, one scale per 16 K, bytes 0..3): LP_SW keeps B twice, as is and with the t >= 2 lanes'
+   K zeroed (qm: S0 = the even 16-K block of each int8 MMA, S - S0 the odd one; see lpsw_mma_f4x4) */
+#ifdef LP_SW
+struct mx4a4 { unsigned q[8]; float f[2][4], n[2][4]; };
+struct mx4b4 { unsigned q[4], qm[4]; float f[2][4]; };
+#else
+struct mx4a4 { unsigned a[4]; unsigned s; };
+struct mx4b4 { unsigned b[2]; unsigned s; };
+#endif
+__device__ __forceinline__ mx4a4 mx4a4_make(const unsigned *a, unsigned s0, unsigned s1) {
+    mx4a4 A;
+#ifdef LP_SW
+#pragma unroll
+    for (int j = 0; j < 2; j++) {
+        A.q[4 * j] = lpsw_e2m1x4_s8(a[2 * j]); A.q[4 * j + 1] = lpsw_e2m1x4_s8(a[2 * j + 1]);
+        A.q[4 * j + 2] = lpsw_e2m1x4_s8(a[2 * j] >> 16); A.q[4 * j + 3] = lpsw_e2m1x4_s8(a[2 * j + 1] >> 16);
+    }
+#pragma unroll
+    for (int k = 0; k < 4; k++) {
+        A.f[0][k] = 0.25f * lpsw_sc(s0, k); A.f[1][k] = 0.25f * lpsw_sc(s1, k);
+        A.n[0][k] = -12582912.f * A.f[0][k]; A.n[1][k] = -12582912.f * A.f[1][k];
+    }
+#else
+    A.a[0] = a[0]; A.a[1] = a[1]; A.a[2] = a[2]; A.a[3] = a[3]; A.s = s0; (void)s1;
+#endif
+    return A;
+}
+__device__ __forceinline__ mx4b4 mx4b4_make(const unsigned *b, unsigned s0, unsigned s1) {
+    mx4b4 B;
+#ifdef LP_SW
+    const unsigned keep = (lpsw_lane() & 2) ? 0u : ~0u;
+#pragma unroll
+    for (int j = 0; j < 2; j++) {
+        B.q[2 * j] = lpsw_e2m1x4_s8(b[j]); B.q[2 * j + 1] = lpsw_e2m1x4_s8(b[j] >> 16);
+        B.qm[2 * j] = B.q[2 * j] & keep; B.qm[2 * j + 1] = B.q[2 * j + 1] & keep;
+    }
+#pragma unroll
+    for (int k = 0; k < 4; k++) { B.f[0][k] = lpsw_sc(s0, k); B.f[1][k] = lpsw_sc(s1, k); }
+#else
+    B.b[0] = b[0]; B.b[1] = b[1]; B.s = s0; (void)s1;
+#endif
+    return B;
+}
+__device__ __forceinline__ void mma4p4(float *c, const mx4a4 &A, const mx4b4 &B) {
+#ifdef LP_SW
+#pragma unroll
+    for (int j = 0; j < 2; j++) {
+        float s[4], s0[4];
+        lpsw_mma_s8(s, A.q[4 * j], A.q[4 * j + 1], A.q[4 * j + 2], A.q[4 * j + 3], B.q[2 * j], B.q[2 * j + 1]);
+        lpsw_mma_s8(s0, A.q[4 * j], A.q[4 * j + 1], A.q[4 * j + 2], A.q[4 * j + 3], B.qm[2 * j], B.qm[2 * j + 1]);
+#pragma unroll
+        for (int e = 0; e < 4; e++) s[e] = s[e] - s0[e] + 12582912.f;
+        const int k0 = 2 * j, k1 = 2 * j + 1;
+#pragma unroll
+        for (int e = 0; e < 4; e++) {
+            const int r = e >> 1, cl = e & 1;
+            c[e] = fmaf(fmaf(s0[e], A.f[r][k0], A.n[r][k0]), B.f[cl][k0], c[e]);
+            c[e] = fmaf(fmaf(s[e], A.f[r][k1], A.n[r][k1]), B.f[cl][k1], c[e]);
+        }
+    }
+#else
+    mma_f4x4(c, A.a, B.b, A.s, B.s);
 #endif
 }
 /* min blocks per SM for __launch_bounds__ of the hoisted kernels: the decoded fragments need registers (sm_86: 1 block of 256) */

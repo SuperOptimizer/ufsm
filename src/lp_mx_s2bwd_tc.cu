@@ -242,23 +242,28 @@ __global__ void __launch_bounds__(256, 2) bwd_data_s2_f4_k(const uint8_t *__rest
             const int mat = lane >> 3, isB = mat & 1, qn = mat >> 1, v8 = lane & 7;
             for (int q = PT.first[p]; q < PT.first[p + 1]; q++) {
                 auto gpos = [&](int b_, int o) { const signed char *d = b_ ? PT.db[q] : PT.da[q]; return ((mzw + d[0]) * GY + myw + d[1]) * GX + d[2] + o; };
-                unsigned bfr[4], sb[2];
+                unsigned bfr[4], sb[2][2];   /* [half][column LPB0 / LPB1] */
                 if (NCH == 1) {   /* halves: taps A / B */
                     ldsm_x4(bfr, gyt + gpos(isB, 8 * qn + v8) * 16);
 #pragma unroll
-                    for (int q2 = 0; q2 < 2; q2++) sb[q2] = (unsigned)gys[gpos(0, 8 * q2 + g)] | ((unsigned)gys[gpos(1, 8 * q2 + g)] << 8);
+                    for (int q2 = 0; q2 < 2; q2++)
+#pragma unroll
+                        for (int h = 0; h < 2; h++) { const int c = 8 * q2 + (h ? LPB1 : LPB0); sb[q2][h] = (unsigned)gys[gpos(0, c)] | ((unsigned)gys[gpos(1, c)] << 8); }
                 } else {          /* halves: the tap's channel blocks 0 / 1 */
                     ldsm_x4(bfr, gyt + (gpos(0, 8 * qn + v8) * NCH + isB) * 16);
 #pragma unroll
-                    for (int q2 = 0; q2 < 2; q2++) { const int pp = gpos(0, 8 * q2 + g) * NCH; sb[q2] = (unsigned)gys[pp] | ((unsigned)gys[pp + 1] << 8); }
+                    for (int q2 = 0; q2 < 2; q2++)
+#pragma unroll
+                        for (int h = 0; h < 2; h++) { const int pp = gpos(0, 8 * q2 + (h ? LPB1 : LPB0)) * NCH; sb[q2][h] = (unsigned)gys[pp] | ((unsigned)gys[pp + 1] << 8); }
                 }
+                const mx4b bf0 = mx4b_make(bfr, sb[0][0], sb[0][1]), bf1 = mx4b_make(bfr + 2, sb[1][0], sb[1][1]);
 #pragma unroll
                 for (int m = 0; m < 2; m++) {
                     unsigned af[4];
                     const int row = m * 16 + (mat & 1) * 8 + (lane & 7);
                     ldsm_x4(af, wp + q * BM * 32 + sw16(row, mat >> 1));
-                    const unsigned sa = wps[q * BM + m * 16 + g + 8 * (t & 1)];
-                    mma_f4(acc[m][0], af, bfr, sa, sb[0]); mma_f4(acc[m][1], af, bfr + 2, sa, sb[1]);
+                    const mx4a A = mx4a_make(af, wps[q * BM + m * 16 + LPA0], wps[q * BM + m * 16 + LPA1]);
+                    mma4p(acc[m][0], A, bf0); mma4p(acc[m][1], A, bf1);
                 }
             }
 #pragma unroll

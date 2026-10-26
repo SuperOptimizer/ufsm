@@ -178,3 +178,10 @@ extern "C" int lp_mxsw_hw(void) {
     cudaMalloc(&d, 4); mxsw_hw_k<<<1, 1>>>(d); cudaMemcpy(&h, d, 4, cudaMemcpyDeviceToHost); cudaFree(d);
     return h;
 }
+/* 1 when this build's lp kernels are the software MX paths (compiled for < sm_120: the ptx version of a kernel of this unit; an
+   ARCH=86 PTX build JIT-run on a newer GPU still reports 86). Host-side defaults that suit only the hardware MMAs check it. */
+extern "C" int lp_sw_build(void) {
+    static int v = -1;
+    if (v < 0) { cudaFuncAttributes a; v = cudaFuncGetAttributes(&a, (const void *)mxsw_hw_k) == cudaSuccess ? a.ptxVersion < 120 : 0; }
+    return v;
+}

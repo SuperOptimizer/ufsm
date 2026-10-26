@@ -394,17 +394,20 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_s2_f4_k(const uint8_t *__rest
                 const int kz = tap / 9, ky = (tap / 3) % 3, kx = tap % 3, o = 8 * qn + v8;
                 return ((2 * wz + kz) * 9 + 2 * wr + ky) * S2F4_E + (kx == 1 ? 17 + o : kx == 0 ? o : o + 1);
             };
-            unsigned bfr[4], sb[2];
+            unsigned bfr[4];
             ldsm_x4(bfr, sx + pos(isB ? tB : tA, q, vv) * 16);
+            mx4b bf[2];
 #pragma unroll
-            for (int q2 = 0; q2 < 2; q2++) sb[q2] = (unsigned)sxs[pos(tA, q2, g)] | ((unsigned)sxs[pos(tB, q2, g)] << 8);
+            for (int q2 = 0; q2 < 2; q2++)
+                bf[q2] = mx4b_make(bfr + 2 * q2, (unsigned)sxs[pos(tA, q2, LPB0)] | ((unsigned)sxs[pos(tB, q2, LPB0)] << 8),
+                                   (unsigned)sxs[pos(tA, q2, LPB1)] | ((unsigned)sxs[pos(tB, q2, LPB1)] << 8));
 #pragma unroll
             for (int m = 0; m < MT; m++) {
                 unsigned af[4];
                 const int row = m * 16 + (mat & 1) * 8 + (lane & 7);
                 ldsm_x4(af, wa + pp * BM * 32 + sw16(row, mat >> 1));
-                const unsigned sa = was[pp * BM + m * 16 + g + 8 * (t & 1)];
-                mma_f4(acc[m][0], af, bfr, sa, sb[0]); mma_f4(acc[m][1], af, bfr + 2, sa, sb[1]);
+                const mx4a A = mx4a_make(af, was[pp * BM + m * 16 + LPA0], was[pp * BM + m * 16 + LPA1]);
+                mma4p(acc[m][0], A, bf[0]); mma4p(acc[m][1], A, bf[1]);
             }
         }
         }   /* chunks */
@@ -573,22 +576,23 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_s2_f4p_k(const mx4_t *__restr
 #pragma unroll 3
         for (int tr = 0; tr < 9; tr++) {
             const int kz = tr / 3, ky = tr % 3;
-            unsigned bfr[2][4], sbw[2][2];
+            mx4b4 bf[2][2];
 #pragma unroll
             for (int r = 0; r < 2; r++) {
                 const int rowi = ((2 * oz0 + 2 * wz + kz) % NP) * 17 + 2 * (wr + r) + ky;   /* input plane 2 oz - 1 + kz's slot, row 2 oy - 1 + ky */
-                ldsm_x4(bfr[r], sx + (rowi * 17 + vx + kb) * 16);   /* K 0..31: P(o), K 32..63: P(o + 1) */
+                unsigned bfr[4];
+                ldsm_x4(bfr, sx + (rowi * 17 + vx + kb) * 16);   /* K 0..31: P(o), K 32..63: P(o + 1) */
 #pragma unroll
-                for (int q2 = 0; q2 < 2; q2++) sbw[r][q2] = sxw[rowi * 17 + q2 * 8 + g];
+                for (int q2 = 0; q2 < 2; q2++) bf[r][q2] = mx4b4_make(bfr + 2 * q2, sxw[rowi * 17 + q2 * 8 + LPB0], sxw[rowi * 17 + q2 * 8 + LPB1]);
             }
 #pragma unroll
             for (int m = 0; m < MT; m++) {
                 unsigned af[4];
                 const int arow = m * 16 + (mat & 1) * 8 + (lane & 7);
                 ldsm_x4(af, wa + tr * BM * 32 + sw16(arow, mat >> 1));
-                const unsigned sa = was[tr * BM + m * 16 + g + 8 * (t & 1)];
+                const mx4a4 A = mx4a4_make(af, was[tr * BM + m * 16 + LPA0], was[tr * BM + m * 16 + LPA1]);
 #pragma unroll
-                for (int r = 0; r < 2; r++) { mma_f4x4(acc[m][r][0], af, bfr[r], sa, sbw[r][0]); mma_f4x4(acc[m][r][1], af, bfr[r] + 2, sa, sbw[r][1]); }
+                for (int r = 0; r < 2; r++) { mma4p4(acc[m][r][0], A, bf[r][0]); mma4p4(acc[m][r][1], A, bf[r][1]); }
             }
         }
         fwd_epilogue<MT, 2, TO, true, MT <= 2, true>(acc, scr, y, b, n, 0, Co, Do, Ho, Wo, oz0, oy0, ox0, wz, wr, nullptr, 0, nsp, N, s2p4_scr_off<MT>());

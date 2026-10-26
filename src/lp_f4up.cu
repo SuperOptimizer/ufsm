@@ -131,7 +131,7 @@ __host__ __device__ constexpr unsigned f4u_off(int part) {   /* smem: 0 ring, 1 
 template <int TZ>
 __host__ __device__ constexpr unsigned f4u_coarse_bytes() { return (unsigned)(TZ / 2 + 4) * 96 * 17; }   /* rows + scales */
 template <int TZ, typename T, typename TO>
-__global__ void __launch_bounds__(256, 2) conv_fwd_f4u_k(const T *__restrict__ x, const uint8_t *__restrict__ wq, const uint8_t *__restrict__ wsc,
+__global__ void __launch_bounds__(256, LP_MINB(2)) conv_fwd_f4u_k(const T *__restrict__ x, const uint8_t *__restrict__ wq, const uint8_t *__restrict__ wsc,
                                                       const float *__restrict__ b, TO *__restrict__ y, int N, int Ci, int Cx, int D, int H, int W, int Co,
                                                       gnp_t gp, double *__restrict__ osum, int Go, split_t sp, int ZC) {
     constexpr int RZ = TZ / 2, NR = 2 * RZ, NP = TZ + 2, CZ = TZ / 2 + 4;
@@ -245,7 +245,7 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f4u_k(const T *__restrict__ x
 #pragma unroll
         for (int pp = 0; pp < 14; pp++) {
             const int tA = 2 * pp, tB = min(tA + 1, 26);
-            unsigned bfr[NR][4], sb[NR][2];
+            unsigned bfr[NR][4]; mx4b4 bf[NR][2];
 #pragma unroll
             for (int r = 0; r < NR; r++) {
                 const int rA = slot[(r >> 1) + tA / 9] + ((r & 1) + (tA / 3) % 3) * 18 + tA % 3, rB = slot[(r >> 1) + tB / 9] + ((r & 1) + (tB / 3) % 3) * 18 + tB % 3;
@@ -253,16 +253,21 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f4u_k(const T *__restrict__ x
                 ldsm_x4(bfr[r], sx + ((isB ? rB : rA) + q * 8 + (lane & 7)) * 16);
 #pragma unroll
                 for (int q2 = 0; q2 < 2; q2++) {   /* (up, skip) of tap A | of tap B << 16: one word when B is A's x neighbour */
-                    if (tB == tA + 1 && tA % 3 != 2) sb[r][q2] = sxw[rA + q2 * 8 + g];
-                    else sb[r][q2] = (sxw[rA + q2 * 8 + g] & 0xffffu) | (sxw[rB + q2 * 8 + g] << 16);
+                    unsigned s[2];
+#pragma unroll
+                    for (int h = 0; h < 2; h++) {   /* (columns LPB0 / LPB1: mx4b4_make) */
+                        const int c = q2 * 8 + (h ? LPB1 : LPB0);
+                        s[h] = tB == tA + 1 && tA % 3 != 2 ? sxw[rA + c] : (sxw[rA + c] & 0xffffu) | (sxw[rB + c] << 16);
+                    }
+                    bf[r][q2] = mx4b4_make(bfr[r] + 2 * q2, s[0], s[1]);
                 }
             }
             unsigned af[4];
             const int mat = lane >> 3, row = (mat & 1) * 8 + (lane & 7);
             ldsm_x4(af, wa + pp * 16 * 32 + sw16(row, mat >> 1));
-            const unsigned sa = was[pp * 16 + g + 8 * (t & 1)];
+            const mx4a4 A = mx4a4_make(af, was[pp * 16 + LPA0], was[pp * 16 + LPA1]);
 #pragma unroll
-            for (int r = 0; r < NR; r++) { mma_f4x4(acc[0][r][0], af, bfr[r], sa, sb[r][0]); mma_f4x4(acc[0][r][1], af, bfr[r] + 2, sa, sb[r][1]); }
+            for (int r = 0; r < NR; r++) { mma4p4(acc[0][r][0], A, bf[r][0]); mma4p4(acc[0][r][1], A, bf[r][1]); }
         }
 #if F4R_PROF
         __syncthreads();
