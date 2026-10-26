@@ -103,6 +103,9 @@ typedef struct {
                                 source-grid bytes (after the seam shift) and batch.aug its scan_ct_rec (scanner plan, jitter, normalisation); the
                                 device builds the CT channel (nn.h nn_aug_ct); batch.x16 is absent. The labels and masks are the CPU path's, byte
                                 for byte (the output's zero set comes from the plan); the sampler still makes write_x's draws */
+                             /* 2: also the labels of warped windows on the device (sample_gpu_lwarp_ok): batch.tm, side, w4, wcomp of a window whose
+                                radial record is warped hold its SOURCE-grid labels (tm packed, unsymmetrised), nn_label_warp warps them;
+                                write_spatial_tm's draws are made as ever; --min-phase counts the source-grid phase there */
     int axis_rec;            /* > 0: batch.axr holds each sample's scroll-axis record (SAMPLE_AXR floats, the layout of unet.h UNET_AXR:
                                 the axis centre per window plane along the window dim nearest the axis, through the symmetry and the
                                 warp) with div = axis_rec (the half-res factor); for train --attn-axis radial / --attn-pe scroll */
@@ -137,6 +140,8 @@ typedef struct {
    radial channels then follow from the window's corner, symmetry and axis centres alone */
 int sample_gpu_input_ok(const sample_cfg *c);
 int sample_gpu_aug_ok(const sample_cfg *c);   /* train --gpu-aug possible with this configuration (needs gpu_input) */
+int sample_gpu_lwarp_ok(const sample_cfg *c);   /* train --gpu-aug 2 possible (sample_gpu_aug_ok, packed targets, no sheet / pmask / gap / distill / cond labels) */
+void sample_phase_cssn(const float **cs, const float **sn);   /* the phase codes' cos / sin (PHASE_PERIOD floats; the warps' tables) */
 
 typedef struct {
     float *x;                /* B x 4 x P^3: z-scored CT, radial z (0), radial y, radial x; nullptr when cfg.xfmt */

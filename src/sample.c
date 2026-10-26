@@ -697,6 +697,9 @@ int sample_gpu_aug_ok(const sample_cfg *c) {   /* the device's CT channel (nn_au
                                                   only (side_air 0), the plain inputs */
     return c->gpu_input && sample_gpu_input_ok(c) && (c->Pz <= 0 || c->Pz == c->P) && !c->ct_augment && c->side_air == 0 && !c->restore && !c->papyrus && c->P <= SA_MAXP;
 }
+int sample_gpu_lwarp_ok(const sample_cfg *c) {   /* --gpu-aug 2: the warped windows' labels on the device: the packed targets, phase and winding only */
+    return sample_gpu_aug_ok(c) && c->pack_tm && !c->sheet && !c->pmask && !c->pap_head && !c->emb_ch && !c->cond && !c->band && !c->aux;
+}
 void sample_write_x_test(const uint8_t *ctu, int D, int P, const int64_t o[3], float mean, float isd, int hasax, const float *cyz,
                          const float *cxz, const int perm[3], const int flip[3], int xfmt, uint64_t seed, uint16_t *H4, uint16_t *H1, void *rec) {
     sym y; for (int d = 0; d < 3; d++) { y.perm[d] = perm[d]; y.flip[d] = flip[d]; }
@@ -1619,6 +1622,7 @@ static float g_wcssn[512] __attribute__((aligned(64)));   /* (cos, sin) pairs of
 static void wtab_init(void) {
     for (int k = 0; k < PHASE_PERIOD; k++) { g_wcs[k] = (float)cos(2 * M_PI * k / PHASE_PERIOD); g_wsn[k] = (float)sin(2 * M_PI * k / PHASE_PERIOD); g_wcssn[2 * k] = g_wcs[k]; g_wcssn[2 * k + 1] = g_wsn[k]; }
 }
+void sample_phase_cssn(const float **cs, const float **sn) { pthread_once(&g_wtab_once, wtab_init); *cs = g_wcs; *sn = g_wsn; }
 #ifdef __AVX2__
 /* cos and sin of 8 codes (0..255) from the pair table: two 4 x 64-bit gathers (half the loads of two 8 x 32-bit ones); lanes
    0, 1, 4, 5 go to the first, 2, 3, 6, 7 to the second, so the even / odd shuffles come out in lane order */
@@ -2709,7 +2713,15 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
     if (c->papyrus && c->papyrus->cond == 2) { mean = pap_t; ib = 0.f; }   /* the CT channel (ct - t) / sd: the cutoff at zero */
     uint8_t *Tw = nullptr;   /* (packed and warped: the warped targets and mask before packing) */
     uint8_t *TMd = nullptr;   /* packed, warped, CT-only, nothing else reading T / M: the warp writes the codes into the batch */
-    if (c->pack_tm && spatial.active && c->gpu_input && !c->sheet && !c->pmask) TMd = b->tm + (size_t)i * p3;
+    const int lw = c->gpu_aug == 2 && spatial.active;   /* --gpu-aug 2: this window's labels warp on the device (source-grid labels in the batch) */
+    if (lw) {
+        size_t bad = 0;
+        if (sample_pack_tm(ttmp, ttmp + p3, mask, p3, b->tm + (size_t)i * p3, &bad)) {
+            fprintf(stderr, "sampler: packed targets need hard 0 / 255 targets and a 0 / 1 mask (voxel %zu); train --pack-targets 0\n", bad);
+            abort();
+        }
+    }
+    else if (c->pack_tm && spatial.active && c->gpu_input && !c->sheet && !c->pmask) TMd = b->tm + (size_t)i * p3;
     else if (c->pack_tm && spatial.active) {
         if (!(Tw = tp_get((NCH + 1) * p3, 0))) return -1;
         T = Tw; M = Tw + NCH * p3;
@@ -2763,7 +2775,8 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
                 else if (band_wind4_tiled(pw, Pz, P, P, wt, c->wind4_step > 0 ? c->wind4_step : 80, c->wind4_min > 0 ? (size_t)c->wind4_min : 512, wt ? 1 : 15, ww, wc, nullptr) < 0) {
                     tp_put(pw, p3); tp_put(ww, p3); tp_put(wc, p3); tp_put(sw, p3 + 64); return -1;
                 }
-                if (spatial.active) {
+                if (lw) { memcpy(b->w4 + (size_t)i * p3, ww, p3); memcpy(b->wcomp + (size_t)i * p3, wc, p3); }   /* (source grid: the device warps) */
+                else if (spatial.active) {
                     if (!(wq = tp_get(2 * p3, 0))) { tp_put(pw, p3); tp_put(ww, p3); tp_put(wc, p3); tp_put(sw, p3 + 64); return -1; }
                     warp_w4_pack(ww, wc, wq, p3);
                 }
@@ -2773,7 +2786,8 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
             }
             if (!air_done) phase_air(ctu, sw, nullptr, p3, c->side_air);
             if (c->phase_near_um > 0) for (size_t k = 0; k < p3; k++) if (!near || !near[k]) sw[k] = SIDE_UNKNOWN;   /* no labelled wrap: none */
-            if (spatial.active) {   /* (slabs never warp: sampler_start) */
+            if (lw) memcpy(b->side + (size_t)i * p3, sw, p3);   /* (source grid: the device warps) */
+            else if (spatial.active) {   /* (slabs never warp: sampler_start) */
                 memset(sw + p3, PHASE_UNKNOWN, 64);
                 warp_phase_w4(sw, wq, b->side + (size_t)i * p3, wq ? b->w4 + (size_t)i * p3 : nullptr, wq ? b->wcomp + (size_t)i * p3 : nullptr, P, y, &spatial);
                 tp_put(wq, 2 * p3);
@@ -2817,7 +2831,8 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
         params=malloc((size_t)P*sizeof *params);
         for (int sz=0;sz<P;sz++) sheet_parameters(c->sheet,o[0]+sz,params[sz]);
     }
-    if (spatial.active) write_spatial_tm(ctu,ttmp,mask,T,M,P,o,(float)mean,(float)(1.0/sd),s->ax.n>0,cyz,cxz,y,&spatial,
+    if (lw) for (size_t q = (size_t)Pz * P * (size_t)(P / 4 + P % 4); q; q--) rnext(r);   /* (write_spatial_tm's noise draws) */
+    else if (spatial.active) write_spatial_tm(ctu,ttmp,mask,T,M,P,o,(float)mean,(float)(1.0/sd),s->ax.n>0,cyz,cxz,y,&spatial,
             ia,ib,isg,r,nrow,c->xfmt,X,H,app,noise_state,noise_state?noise_state+P:nullptr,c->sheet,params,(float *)(big+p3),c->pack_tm,c->gpu_input,TMd);
     else if (c->sheet || (app && Pz != P)) write_x_aug(ctu, P, o, (float)mean, (float)(1.0 / sd), s->ax.n > 0, cyz, cxz, y, c->augment != 0, ia, ib, isg, r, nrow, c->xfmt,
             X, H, app, noise_state, noise_state ? noise_state + P : nullptr,c->sheet,params);

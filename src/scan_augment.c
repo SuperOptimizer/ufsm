@@ -345,7 +345,7 @@ static float *gin_buf(size_t n) {
 }
 unsigned scan_aug_plan(const scan_aug_cfg *c, uint64_t seed, uint8_t *ctu, uint8_t *tgt, int nch, uint8_t *ign, int P,
                        const int64_t o[3], float *cy, float *cx, int hasax, const int chunk[3], int allow_seam, scan_plan *p) {
-    p->on = 0; p->P = P;
+    memset(p, 0, sizeof *p); p->P = P;   /* (all of it: a reused record holds no stale fields; ~0.7 MB, microseconds) */
     if (!scan_aug_enabled(c) || P < 4 || P > SA_MAXP) return 0;
     const double S = c->strength;
 #define SO(i) (c->s[i] > 0 ? (double)c->s[i] : S)   /* this op's magnitude scale */
@@ -380,7 +380,7 @@ unsigned scan_aug_plan(const scan_aug_cfg *c, uint64_t seed, uint8_t *ctu, uint8
     /* resolution: PSF blur or phase-contrast sharpening, then a coarser sampling grid, per axis */
     p->bop_on[0] = p->bop_on[1] = p->bop_on[2] = 0;
     if (on & (1u << SA_LOWRES | 1u << SA_BLUR | 1u << SA_SHARPEN | 1u << SA_MOTION)) {
-        bop *op = malloc(3 * sizeof *op); float *dense = calloc(P, sizeof *dense); if (!op || !dense) abort();
+        bop *op = calloc(3, sizeof *op);   /* (zeroed: the unused taps are copied into the plan; records stay deterministic) */ float *dense = calloc(P, sizeof *dense); if (!op || !dense) abort();
         int iso = uniform(&rs) < .5;
         const double SL = SO(SA_LOWRES), SB = SO(SA_BLUR), SS = SO(SA_SHARPEN);
         double f0 = 1 + uniform(&rs) * 1.5 * SL, sb0 = .3 + uniform(&rs) * .7 * SB, sa0 = .15 + uniform(&rs) * .3 * SS;

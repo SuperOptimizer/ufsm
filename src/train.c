@@ -313,9 +313,12 @@ static void axr_set(gpu_state *d, int i) { if (g_axr) unet_set_attn_axis(d->u, d
 static void gpu_input_settle(sample_cfg *sc) {
     g_gpu_in = g_gpu_want && unet_input_converted();
     g_xs = g_gpu_in ? 1 : g_xc; sc->gpu_input = g_gpu_in;
-    g_gpu_aug = g_gpu_aug_want && g_gpu_in && sample_gpu_aug_ok(sc); sc->gpu_aug = g_gpu_aug;
+    g_gpu_aug = g_gpu_aug_want && g_gpu_in && sample_gpu_aug_ok(sc) ? 1 : 0;
+    if (g_gpu_aug && g_gpu_aug_want == 2) { if (sample_gpu_lwarp_ok(sc)) g_gpu_aug = 2; else fprintf(stderr, "--gpu-aug 2: the labels' warp needs packed targets and no sheet / pmask / gap / distill / cond / band / aux labels; --gpu-aug 1\n"); }
+    sc->gpu_aug = g_gpu_aug;
     if (g_gpu_aug) fprintf(stderr, "input: the scanner augmentation, z-score, symmetry / warp and jitter of the CT channel on the GPU (--gpu-aug 0: on the CPU)\n");
-    else if (g_gpu_aug_want) fprintf(stderr, "--gpu-aug: not available here (needs --gpu-input, cubes, no --ct-aug, --side-air 0, no --overfit / --split); CPU augmentation\n");
+    if (g_gpu_aug == 2) fprintf(stderr, "input: the warped windows' packed targets, phase and winding mod 4 warped on the GPU (--gpu-aug 1: on the CPU)\n");
+    if (g_gpu_aug_want && !g_gpu_aug) fprintf(stderr, "--gpu-aug: not available here (needs --gpu-input, cubes, no --ct-aug, --side-air 0, no --overfit / --split); CPU augmentation\n");
     if (g_gpu_in) fprintf(stderr, "input: the CT channel uploaded, the radial channels built on the GPU (--gpu-input 0: host-built)\n");
     else if (g_gpu_asked) fprintf(stderr, "--gpu-input: not available here (needs the 16-bit -> MX input conversion, whole windows, the 4 plain inputs, no warps / sheet prior); host-built input\n");
 }
@@ -432,6 +435,21 @@ static void restore_upload(gpu_state *d, const batch *b, int i, int B, int P, in
     cp(d->tb[i], b->t, (size_t)B * g_tc * g_Pz * P * P); cp(d->wb[i], b->w, (size_t)B * g_tc);
 }
 /* synchronous upload (pageable host memory: validation batches) */
+/* one label kind of a batch (nn_label_warp's: 0 packed targets / mask, 1 phase, 2 winding mod 4 + component) into da (db): --gpu-aug 2
+   batches (batch.ct8) carry source-grid labels for windows with a warped radial record, warped on the device (rad: the records' device
+   copy, uploaded first by ct_upload); the rest are copies */
+static void lab_upload(int kind, const batch *b, uint8_t *da, uint8_t *db, const uint8_t *ha, const uint8_t *hb, const void *rad, int B, int P, int async) {
+    void (*cp)(void *, const void *, size_t) = async ? nn_h2d_copy_stream : nn_h2d;
+    const size_t p3 = (size_t)g_Pz * P * P;
+    if (g_gpu_aug != 2 || !b->ct8) { cp(da, ha, (size_t)B * p3); if (db) cp(db, hb, (size_t)B * p3); return; }
+    const float *cs, *sn; sample_phase_cssn(&cs, &sn);
+    for (int s = 0; s < B; s++) {
+        int32_t h[8]; memcpy(h, (const char *)b->rad + (size_t)s * NN_RAD_REC(g_Pz), sizeof h);
+        if (h[6] & 1) nn_label_warp(kind, ha + (size_t)s * p3, hb ? hb + (size_t)s * p3 : nullptr, (const char *)rad + (size_t)s * NN_RAD_REC(g_Pz), P,
+                                    da + (size_t)s * p3, db ? db + (size_t)s * p3 : nullptr, cs, sn, async);
+        else { cp(da + (size_t)s * p3, ha + (size_t)s * p3, p3); if (db) cp(db + (size_t)s * p3, hb + (size_t)s * p3, p3); }
+    }
+}
 /* the input channel(s) and radial records of a batch into the device buffers x / rad (async: on the copy stream). --gpu-aug batches
    (batch.ct8): the records first, then each window's CT channel built on the device from its bytes (nn_aug_ct) */
 static void ct_upload(const batch *b, void *x, void *rad, int B, int P, int async) {
@@ -455,7 +473,7 @@ static void upload(gpu_state *d, const batch *b, int B, int P) {
     if (d->side >= 0) { upload_slab(d, b, d->cur, B, P, 0); return; }
     size_t p3 = (size_t)g_Pz * P * P;
     ct_upload(b, d->x, d->rad, B, P, 0);
-    if (g_pack) { nn_h2d(d->m, b->tm, (size_t)B * p3); if (!g_pkf) nn_unpack_tm(d->t, d->m, B, p3, 0); }   /* (--pack-targets excludes --heads; the
+    if (g_pack) { lab_upload(0, b, d->m, nullptr, b->tm, nullptr, d->rad, B, P, 0); if (!g_pkf) nn_unpack_tm(d->t, d->m, B, p3, 0); }   /* (--pack-targets excludes --heads; the
                                                                                                        direct pack loss reads the codes) */
     else {
         if (!g_heads) nn_h2d(d->t, b->t, (size_t)B * NCH * p3);
@@ -464,12 +482,13 @@ static void upload(gpu_state *d, const batch *b, int B, int P) {
     }
     nn_h2d(d->w, trow_w(b, B, d->hwh[d->cur]), (size_t)B * g_tc);
     if (g_aff) nn_h2d(d->band, b->band, (size_t)B * p3);
-    if (g_side) nn_h2d(d->sdb, b->side, (size_t)B * p3);
+    if (g_side) lab_upload(1, b, d->sdb, nullptr, b->side, nullptr, d->rad, B, P, 0);
     if (g_unwrap) nn_h2d(d->pm, b->pm, (size_t)B * p3);
     if (g_cond) nn_h2d(d->wd, b->wind, (size_t)B * p3);
-    if (g_unwrap2) { nn_h2d(d->w4, b->w4, (size_t)B * p3); nn_h2d(d->wc, b->wcomp, (size_t)B * p3); }
+    if (g_unwrap2) lab_upload(2, b, d->w4, d->wc, b->w4, b->wcomp, d->rad, B, P, 0);
     if (g_distill) nn_h2d(d->embt, b->emb, g_distill_n);
     if (g_pap_head) nn_h2d(d->pap, b->pap, (size_t)B * p3);
+    if (b->ct8) nn_sync();   /* (--gpu-aug: nn_aug_ct / nn_label_warp copy from the pinned batch asynchronously; the caller may release it now) */
 }
 /* asynchronous upload of a pinned sampler batch into buffer i on the copy stream, after the compute that last used it */
 static void upload_async(gpu_state *d, const batch *b, int i, int B, int P) {
@@ -491,7 +510,7 @@ static void upload_async(gpu_state *d, const batch *b, int i, int B, int P) {
     else if (d->side >= 0) upload_slab(d, b, i, B, P, 1);
     else {
         ct_upload(b, d->xb[i], d->radb[i], B, P, 1);
-        if (g_pack) { nn_h2d_copy_stream(d->mb[i], b->tm, (size_t)B * p3); if (!g_pkf) nn_unpack_tm(d->tb[i], d->mb[i], B, p3, 1); }   /* (copy stream) */
+        if (g_pack) { lab_upload(0, b, d->mb[i], nullptr, b->tm, nullptr, d->radb[i], B, P, 1); if (!g_pkf) nn_unpack_tm(d->tb[i], d->mb[i], B, p3, 1); }   /* (copy stream) */
         else {
             if (!g_heads) nn_h2d_copy_stream(d->tb[i], b->t, (size_t)B * NCH * p3);
             else for (int r = 0; r < B * NCH; r++) nn_h2d_copy_stream(d->tb[i] + (size_t)trow(b, r) * p3, b->t + (size_t)r * p3, p3);
@@ -499,10 +518,10 @@ static void upload_async(gpu_state *d, const batch *b, int i, int B, int P) {
         }
         nn_h2d_copy_stream(d->wb[i], trow_w(b, B, d->hwh[i]), (size_t)B * g_tc);
         if (g_aff) nn_h2d_copy_stream(d->bandb[i], b->band, (size_t)B * p3);
-        if (g_side) nn_h2d_copy_stream(d->sideb[i], b->side, (size_t)B * p3);
+        if (g_side) lab_upload(1, b, d->sideb[i], nullptr, b->side, nullptr, d->radb[i], B, P, 1);
         if (g_unwrap) nn_h2d_copy_stream(d->pmb[i], b->pm, (size_t)B * p3);
         if (g_cond) nn_h2d_copy_stream(d->wdb[i], b->wind, (size_t)B * p3);
-        if (g_unwrap2) { nn_h2d_copy_stream(d->w4b[i], b->w4, (size_t)B * p3); nn_h2d_copy_stream(d->wcb[i], b->wcomp, (size_t)B * p3); }
+        if (g_unwrap2) lab_upload(2, b, d->w4b[i], d->wcb[i], b->w4, b->wcomp, d->radb[i], B, P, 1);
         if (g_distill) nn_h2d_copy_stream(d->embb[i], b->emb, g_distill_n);
         if (g_pap_head) nn_h2d_copy_stream(d->papb[i], b->pap, (size_t)B * p3);
     }
@@ -517,7 +536,7 @@ static void upload_tail(gpu_state *d, int B, int P) {
     const int i = d->cur;   /* (lean: both buffer indices alias) */
     const size_t p3 = (size_t)g_Pz * P * P;
     nn_stream_wait(1, d->ev_done[i]); nn_stream_wait(1, d->ev_done[i ^ 1]);
-    if (g_pack) { nn_h2d_copy_stream(d->mb[i], b->tm, (size_t)B * p3); nn_unpack_tm(d->tb[i], d->mb[i], B, p3, 1); }
+    if (g_pack) { lab_upload(0, b, d->mb[i], nullptr, b->tm, nullptr, d->radb[i], B, P, 1); nn_unpack_tm(d->tb[i], d->mb[i], B, p3, 1); }
     else {
         if (!g_heads) nn_h2d_copy_stream(d->tb[i], b->t, (size_t)B * NCH * p3);
         else for (int r = 0; r < B * NCH; r++) nn_h2d_copy_stream(d->tb[i] + (size_t)trow(b, r) * p3, b->t + (size_t)r * p3, p3);
@@ -1718,7 +1737,9 @@ int cmd_train(int argc, char **argv) {
         const int want = atoi(opt(argc, argv, "--gpu-input", "1"));
         g_gpu_want = want && g_xfmt && unet_act_mx() && !split && (!g_half || g_pkf) && g_xc == 4 && sample_gpu_input_ok(&sc) && !getenv("UFSM_DUMP_BATCH");
         g_gpu_asked = atoi(opt(argc, argv, "--gpu-input", "0"));   /* (an explicit request: say when it cannot apply) */
-        g_gpu_aug_want = atoi(opt(argc, argv, "--gpu-aug", "0")) && !atoi(opt(argc, argv, "--overfit", "0")) && !split;   /* --gpu-aug 1: the CT channel built on the device (nn_aug_ct) */
+        g_gpu_aug_want = atoi(opt(argc, argv, "--gpu-aug", "0"));   /* --gpu-aug 1: the CT channel built on the device (nn_aug_ct); 2: also the warped windows' labels (nn_label_warp) */
+        if (g_gpu_aug_want < 0 || g_gpu_aug_want > 2) { fprintf(stderr, "--gpu-aug: 0, 1 or 2\n"); return 2; }
+        if (atoi(opt(argc, argv, "--overfit", "0")) || split) g_gpu_aug_want = 0;
         /* the MX input conversion it needs depends on the memory mode (MX gradients): settled after the planner (gpu_input_settle) */
     }
     {   /* --pack-targets 1 (default where it applies): hard two-class targets (every source's recto target side-encoded: 0 / 255 in both
@@ -2023,7 +2044,7 @@ int cmd_train(int argc, char **argv) {
                    channel x 256 voxels (~0.5 B per voxel and channel), outside the dry build. 8 / 16-channel levels only with UFSM_GYREC=2
                    (8.5 B per level-0 voxel at 16 channels for ~0 step time there; 8 channels: -2%) */
                 const size_t grec = unet_grad_mx4() && (cfg.widths[0] % 32 == 0 || lp_gyrec_narrow()) && (getenv("UFSM_GYREC") ? atoi(getenv("UFSM_GYREC")) : 1) ? (size_t)B * cfg.widths[0] * p3 * 136 / 256 : 0;
-                need = grec + tb + tb / 14 + trainer + (nn_get_loss_tol() ? (size_t)B * p3 : 0) + (g_aff ? (size_t)2 * B * p3 : 0) + (g_unwrap ? (g_head_slab ? (size_t)4 * B * p3 + (size_t)g_hs_z * P * P * (2 * g_cout + 11) + 4096 : (size_t)15 * B * p3) + (g_unwrap2 ? (size_t)4 * B * p3 : 0) : 0) + (g_cond ? (size_t)7 * B * p3 : 0) + (g_pap_head ? (size_t)4 * B * p3 : 0) + (g_restore ? (size_t)B * p3 * (cand[c].lean ? 5 : 1) + restore_scratch_bytes(g_Pz, P, P, fminf(g_rr.sc_step[0], 4.f)) + 256 : 0) + ((size_t)550 << 20) + (split ? (size_t)4 * B * 32 * P * P * 2 : 0) + (g_gpu_aug_want && gin ? nn_aug_device_bytes(P) : 0);   /* split: two slots of halo send / receive planes */   /* kernel workspaces: measured device growth / tracked ~1.07 + 0.3 GB, + 0.2 GB margin for other processes */
+                need = grec + tb + tb / 14 + trainer + (nn_get_loss_tol() ? (size_t)B * p3 : 0) + (g_aff ? (size_t)2 * B * p3 : 0) + (g_unwrap ? (g_head_slab ? (size_t)4 * B * p3 + (size_t)g_hs_z * P * P * (2 * g_cout + 11) + 4096 : (size_t)15 * B * p3) + (g_unwrap2 ? (size_t)4 * B * p3 : 0) : 0) + (g_cond ? (size_t)7 * B * p3 : 0) + (g_pap_head ? (size_t)4 * B * p3 : 0) + (g_restore ? (size_t)B * p3 * (cand[c].lean ? 5 : 1) + restore_scratch_bytes(g_Pz, P, P, fminf(g_rr.sc_step[0], 4.f)) + 256 : 0) + ((size_t)550 << 20) + (split ? (size_t)4 * B * 32 * P * P * 2 : 0) + (g_gpu_aug_want && gin ? nn_aug_device_bytes(P) + (g_gpu_aug_want == 2 ? nn_label_warp_device_bytes(P) : 0) : 0);   /* split: two slots of halo send / receive planes */   /* kernel workspaces: measured device growth / tracked ~1.07 + 0.3 GB, + 0.2 GB margin for other processes */
                 if (need < min_need) { min_need = need; minc = c; min_hoff = pass; }   /* (no fit: the smallest mode evaluated) */
                 if (need <= fmin) { pick = c; pick_hoff = pass; pick_off = unet_last_offload_bytes(); pick_need = need; }
             }

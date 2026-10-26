@@ -47,7 +47,8 @@ int main(int argc, char **argv) {
     if (getenv("UFSM_BENCH_PZ")) c.Pz = atoi(getenv("UFSM_BENCH_PZ"));
     if (getenv("UFSM_BENCH_MINFG")) c.min_fg = atof(getenv("UFSM_BENCH_MINFG"));   /* train --min-fg */
     if (getenv("UFSM_BENCH_GPUIN")) c.gpu_input = 1;   /* train --gpu-input: the CT channel and radial records only (hashed as such) */
-    if (getenv("UFSM_BENCH_GPUAUG")) { c.gpu_input = 1; c.gpu_aug = 1; if (!sample_gpu_aug_ok(&c)) { fprintf(stderr, "UFSM_BENCH_GPUAUG: not with this configuration\n"); return 2; } }   /* train --gpu-aug: the sampler's share (the CT channel left to the device) */
+    const int gaug = getenv("UFSM_BENCH_GPUAUG") ? atoi(getenv("UFSM_BENCH_GPUAUG")) : 0;   /* train --gpu-aug 1 / 2: the sampler's share (the CT channel, 2: and the warped labels, left to the device); checked below */
+    if (gaug) { c.gpu_input = 1; c.gpu_aug = gaug; }
     if (getenv("UFSM_BENCH_PRESET") && sample_aug_preset(&c, getenv("UFSM_BENCH_PRESET"))) { fprintf(stderr, "UFSM_BENCH_PRESET: all | none\n"); return 2; }
     if (getenv("UFSM_BENCH_PACK")) c.pack_tm = 1;
     if (getenv("UFSM_BENCH_WIND4")) c.wind4 = 1;   /* train --task unwrap2 (with UFSM_BENCH_SIDE=2): the winding mod 4 and its component, hashed too */
@@ -95,6 +96,7 @@ int main(int argc, char **argv) {
     const int hashing = getenv("UFSM_BENCH_HASH") != nullptr;
     const size_t p3 = (size_t)Pz * P * P;
     uint64_t h = 0xcbf29ce484222325ull;
+    if (gaug && (gaug > 2 || !sample_gpu_aug_ok(&c) || (gaug == 2 && !sample_gpu_lwarp_ok(&c)))) { fprintf(stderr, "UFSM_BENCH_GPUAUG %d: not with this configuration\n", gaug); return 2; }
     sampler *sp = sampler_start(S, &c); if (!sp) return 1;
     if (getenv("UFSM_BENCH_DUMP")) {   /* mid-z planes of the first batch(es): input (z-scored CT x 40 + 128), target, mask */
         const int nd = getenv("UFSM_BENCH_DUMPN") ? atoi(getenv("UFSM_BENCH_DUMPN")) : 1;
