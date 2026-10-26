@@ -37,6 +37,8 @@ typedef struct {
     int nstage, lattice[8], steps[8];   /* delta lattice spacing (native voxels) and Adam steps per stage */
     float lr, lr_knot;              /* Adam learning rates for delta and the knots */
     float w_phase, w_normal, w_density, w_nondeg, w_smooth, w_decay;
+    float w_density_pre;            /* > 0: the density weight of the gradient-only stages (before phase_stage; 0: w_density): they set the turn count
+                                       where the phase never floods (confidence < uw_min_conf: where wind96 skips packed sheets) */
     float w_wind4;                  /* the winding mod 4 term (fields with dz dy dx dq planes; analytic loss, phase stages, ramped like the phase) */
     float w_recto;                  /* recto anchors r^2 (1 - cos 2 pi W) (fields with an r plane; phase stages, ramped like the phase; 0: off) */
     int phase_stage;                /* stages before it fit the gradient terms only (normal, density: no integer ambiguity, they
@@ -62,6 +64,22 @@ typedef struct {
     int uw_rep_gd;                  /* their distance (field voxels) */
     float uw_rep_cs;                /* the CT sheet spacing cs (fields with a cs plane) as offset votes like uw_rep_geo: the turns between
                                        the voxels counted from cs along the model normal (0 off) */
+    float uw_rep_cnt;               /* radial turn-count votes (0 off): from every uw_rep_cnt_sub-th flooded voxel per axis, partners
+                                       uw_rep_cnt_d field voxels outward along the radial ray from the axis (same z); the turns between them
+                                       counted from a count source (cnt, else these fields: the density |n . r| / spacing, or the phase
+                                       wavenumber with uw_rep_cnt_src 1) integrated along the ray; the real offset want - flooded W difference
+                                       votes as two integer L1 votes (floor, ceil) weighted by 1 - frac, frac: exactly the L1 of the real
+                                       offset. Counts reach inside flooded pieces at tile granularity, where the phase skipped sheets */
+    int uw_rep_cnt_d[4], uw_rep_cnt_nd, uw_rep_cnt_sub, uw_rep_cnt_src;
+    float uw_rep_cnt_known;         /* the least share of ray steps with a count (else no vote; unknown steps take the known mean) */
+    const fit_fields *cnt;          /* the count source fields (same grid as the fit's; nullptr: the fit's own) */
+    float skip_e0, skip_e1;         /* the phase-skip gate: along a radial window of skip_d field voxels, e = 1 - phase turns / count-source turns; g =
+                                       clamp((e - skip_e0) / skip_e1, 0, 1) gates the count votes (uw_rep_cnt x mean g along the ray, when skip_e1 > 0)
+                                       and raises the density term where the phase skips sheets (w_density x (1 + w_dskip g)) */
+    int skip_d;
+    float skip_conf;                /* the phase confidence a ray step needs in the gate (fit-compare's counts: any) */
+    float w_dskip;
+    const uint8_t *skip;            /* (internal) g x255 per field voxel, from fit_run */
     float uw_rep_qpow;              /* the repair's vote weight: (lower confidence)^uw_rep_qpow (1: linear) */
     float uw_rep_stretch;           /* > 0: votes x exp(-(log2 s)^2 / (2 uw_rep_stretch^2)) at both voxels, s = |grad phase| x sp (turns per
                                        sheet): a phase that lost a sheet is stretched (s ~0.5-0.7 where it disagrees with the published wraps
@@ -75,6 +93,9 @@ typedef struct {
     float phase_stretch;            /* gate the phase confidence by the phase stretch s (uwr_stretch: |grad phase| x spacing): x exp(-log2(s)^2 / 2 S^2)
                                        before the fit (0 off), so where the phase skips or doubles sheets the density sets the turn count */
     int phase_stretch_r;            /* its box radius (field voxels) */
+    int phase_stretch_uw;           /* 1: the voxel unwrapping floods the gated phase too (default); 0: the gate weakens the phase only in the loss (the
+                                       flood and the repair keep the network phase, so the count votes see it), i.e. the density sets the count there */
+    const fit_fields *uw_src;       /* (internal) the fields the voxel unwrapping reads (nullptr: the fit's) */
     const char *uw_rep_dump;        /* write PREFIX.shift.raw (the repair's integer shift + 128 per field voxel, 0 not flooded) and
                                        PREFIX.seam.raw (per field voxel the neighbours whose integers disagree, before | after << 4, | 8 where
                                        the phase is stretched: uw_rep_stretch's weight < 1/2) */
@@ -176,6 +197,8 @@ typedef struct {
     const uint8_t *ctm; float w_ct, ct_pow, ct_phi, ct_floor;   /* CT parity 128 + 127 m (m > 0 papyrus, < 0 void; fit_ct_parity), weight,
                                                (1 - conf)^ct_pow (>= ct_floor), papyrus phase; nullptr none; loss in parts[FIT_P_CT] */
     const uint8_t *cs; float w_cs, cs_tol;  /* CT sheet spacing (sp units), weight, log tolerance to sp; loss in parts[FIT_P_CSPACE] */
+    const uint8_t *skip; float w_dskip;   /* phase-skip evidence x255 (fit_cfg skip; nullptr none): the density term x (1 + w_dskip g), g the gated evidence
+                                               ((skip / 255 - skip_e0) / skip_e1 clamped to 0..1, precomputed into the plane) */
 } fit_dev;
 /* the data terms over every field voxel: loss parts (double[FIT_NPARTS], FIT_P_*, accumulated; the smoothness slot untouched)
    and the gradients of delta and of the knots (accumulated: zero them first) */

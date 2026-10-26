@@ -145,6 +145,7 @@ static int run_case(int dir) {
             const double cv = sp[i] * (1 + 0.8 * z / D); csp[i] = (uint8_t)(cv > 255 ? 255 : lround(cv));
         }
         fd.ctm = ctm; fd.cs = csp;
+        fd.skip = rc; fd.w_dskip = 2.f;   /* the phase-skip density gain on both backends (the recto bytes as a gate plane) */
         const size_t nl = (size_t)m->lz * m->ly * m->lx; double ph[FIT_NPARTS] = {0}, pd[FIT_NPARTS] = {0}; float *gh = calloc(nl, 4), *gg = malloc(nl * 4);
         fit_loss2_host(&fd, ph, gh);
         uint8_t *dv = nn_malloc(17 * n); const uint8_t *hv[17] = {pc, ps, t[0], t[1], t[2], t[3], t[4], t[5], sp, w, wd, wd + n, wd + 2 * n, wd + 3 * n, rc, ctm, csp};
@@ -154,6 +155,7 @@ static int run_case(int dir) {
         nn_h2d(dcy, cy, na * 4); nn_h2d(dcx, cx, na * 4); nn_h2d(dpi, m->pitch, m->nk * 4); nn_h2d(dof, m->offset, m->nk * 4); nn_h2d(ddl, m->delta, nl * 4);
         nn_zero(dg, nl * 4); nn_zero(dp, FIT_NPARTS * sizeof(double));
         fit_dev fg = fd; fg.pc = dv; fg.ps = dv + n; for (int k = 0; k < 6; k++) fg.t[k] = dv + (2 + k) * n; fg.sp = dv + 8 * n; fg.w = dv + 9 * n; fg.wd = dv + 10 * n; fg.recto = dv + 14 * n; fg.ctm = dv + 15 * n; fg.cs = dv + 16 * n;
+        fg.skip = dv + 14 * n;   /* (the phase-skip gate: the recto bytes, on the device) */
         fg.cy = dcy; fg.cx = dcx; fg.pitch = dpi; fg.offset = dof; fg.delta = ddl;
         nn_fit_loss2(&fg, dp, dg); nn_sync(); nn_d2h(pd, dp, sizeof pd); nn_d2h(gg, dg, nl * 4);
         double gmax = 0, dmax = 0; for (size_t k = 0; k < nl; k++) { gmax = fmax(gmax, fabs(gh[k])); dmax = fmax(dmax, fabs(gh[k] - gg[k])); }
@@ -269,6 +271,81 @@ static double run_ct_case(int cpu, float w_ct, float w_cs, double *all, double *
     return r;
 }
 
+/* Radial turn-count votes (fit_cfg uw_rep_cnt): in the packed sector the network phase SKIPS sheets inside consistent pieces, as wind96
+   on packed Paris 4 (one sheet in every g_skp turns: the phase stretched to half its rate over two turns, then right again; the skips
+   fade out at the sector's edge, where the phase dislocates), confidence g_skc; the density (n n^T, sp) is right. The production repair
+   (--uw-repair 8, qpow 3, stretch 0.5) alone keeps the phase's count; the count votes must add the skipped turns. Returns the sector's
+   ids right (gauge from outside the sector); *all the whole box's. */
+static double g_skp = 3, g_skc = 0.6; static float g_ske0 = 0, g_ske1 = 0, g_skdw = 0;   /* the phase-skip gate of the case (fit --skip-gate / --w-dskip) */
+static double W_skip(double z, double y, double x) {
+    const double sw = ct_sector(z, y, x), bw = sw > 0.3 ? fmin(1, (sw - 0.3) / 0.4) : 0;
+    const double u = fmax(0.0, U_true(z, y, x) - 3.5), m = floor(u / g_skp), f = u - g_skp * m;   /* (turns out from the material's inner edge) */
+    return W_true(z, y, x) - bw * (m + fmin(1.0, f / 2));
+}
+static double run_skip_case(int cpu, float w_cnt, double *all) {
+    g_dir = 1;
+    const int D = 48, H = 96, W = 96; const size_t n = (size_t)D * H * W;
+    uint8_t *pc = malloc(n), *ps = malloc(n), *t[6], *sp = malloc(n), *w = malloc(n), *sec = malloc(n);
+    for (int k = 0; k < 6; k++) t[k] = malloc(n);
+    const int na = (int)(D * H8) + 1;
+    float *cy = malloc(na * sizeof(float)), *cx = malloc(na * sizeof(float));
+    for (int z = 0; z < na; z++) { cy[z] = (float)ax_y(z); cx[z] = (float)ax_x(z); }
+    for (int z = 0; z < D; z++) for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
+        const size_t i = ((size_t)z * H + y) * W + x;
+        const double pz = (z + 0.5) * H8, py = (y + 0.5) * H8, px = (x + 0.5) * H8, r = hypot(py - ax_y(pz), px - ax_x(pz));
+        w[i] = r >= 3 * 70 && r <= 370 ? 255 : 0;
+        const double sw = ct_sector(pz, py, px); sec[i] = sw > 0.3;
+        const double Wn = W_skip(pz, py, px), ph = 2 * M_PI * (Wn - floor(Wn)), amp = sw > 0.3 ? g_skc : 1;
+        pc[i] = (uint8_t)lround(128 + 127 * amp * cos(ph)); ps[i] = (uint8_t)lround(128 + 127 * amp * sin(ph));
+        double gt[3]; const double e = 0.5;
+        for (int d = 0; d < 3; d++) {
+            double a[3] = {pz, py, px}, b[3] = {pz, py, px}; a[d] += e; b[d] -= e;
+            const double dt = W_true(a[0], a[1], a[2]) - W_true(b[0], b[1], b[2]); gt[d] = (dt - round(dt)) / (2 * e);
+        }
+        const double rt = sqrt(gt[0] * gt[0] + gt[1] * gt[1] + gt[2] * gt[2]), nz = gt[0] / rt, ny = gt[1] / rt, nx = gt[2] / rt;
+        const double tv[6] = {nz * nz, ny * ny, nx * nx, 0.5 + nz * ny, 0.5 + nz * nx, 0.5 + ny * nx};
+        for (int k = 0; k < 6; k++) t[k][i] = (uint8_t)lround(255 * tv[k]);
+        const double s2 = 8 / (H8 * rt); sp[i] = (uint8_t)(s2 < 1 ? 1 : s2 > 255 ? 255 : lround(s2));
+    }
+    fit_fields f = {D, H, W, H8, pc, ps, {t[0], t[1], t[2], t[3], t[4], t[5]}, sp, w, cy, cx, {0}, 0, nullptr, nullptr, nullptr};
+    fit_cfg c = fit_cfg_default(); c.verbose = getenv("FIT_SKV") != nullptr; c.cpu = cpu; c.dir = 1;
+    c.uw_repair = 8; c.uw_rep_qpow = 3; c.uw_rep_stretch = 0.5f; c.uw_rep_sr = 1; c.uw_rep_cnt = w_cnt;
+    c.skip_e0 = g_ske0; c.skip_e1 = g_ske1; c.w_dskip = g_skdw;
+    if (getenv("FIT_SKWD")) c.w_density = (float)atof(getenv("FIT_SKWD"));
+    if (getenv("FIT_SKROB")) c.phase_robust = (float)atof(getenv("FIT_SKROB"));
+    if (getenv("FIT_SKPS")) c.phase_stretch = (float)atof(getenv("FIT_SKPS"));
+    if (getenv("FIT_SKPSU")) c.phase_stretch_uw = atoi(getenv("FIT_SKPSU"));
+    if (getenv("FIT_SKG")) sscanf(getenv("FIT_SKG"), "%f,%f", &c.skip_e0, &c.skip_e1);
+    if (getenv("FIT_SKDW")) c.w_dskip = (float)atof(getenv("FIT_SKDW"));
+    if (getenv("FIT_SKST")) for (int k = c.phase_stage; k < c.nstage; k++) c.steps[k] = atoi(getenv("FIT_SKST"));
+    if (getenv("FIT_SKD")) { c.uw_rep_cnt_nd = 0; char *s = strdup(getenv("FIT_SKD")); for (char *q = strtok(s, ","); q && c.uw_rep_cnt_nd < 4; q = strtok(nullptr, ",")) c.uw_rep_cnt_d[c.uw_rep_cnt_nd++] = atoi(q); free(s); }
+    fit_model *m = fit_run(&f, &c);
+    if (!m) { fprintf(stderr, "FAIL: fit_run (skip)\n"); fails++; return 0; }
+    int hist[401] = {0};
+    for (size_t i = 0; i < n; i++) {
+        if (!w[i] || sec[i]) continue;
+        const int z = (int)(i / ((size_t)H * W)), y = (int)((i / W) % H), x = (int)(i % W);
+        const double pz = (z + 0.5) * H8, py = (y + 0.5) * H8, px = (x + 0.5) * H8; const long k = lround(fit_W(m, pz, py, px) - W_true(pz, py, px));
+        if (k >= -200 && k <= 200) hist[k + 200]++;
+    }
+    int k0 = 0; for (int k = 1; k < 401; k++) if (hist[k] > hist[k0]) k0 = k;
+    size_t nd = 0, right = 0, ns = 0, sright = 0, sph = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (!w[i]) continue;
+        const int z = (int)(i / ((size_t)H * W)), y = (int)((i / W) % H), x = (int)(i % W);
+        const double pz = (z + 0.5) * H8, py = (y + 0.5) * H8, px = (x + 0.5) * H8;
+        const double d = fit_W(m, pz, py, px) - W_true(pz, py, px) - (k0 - 200);
+        nd++; right += fabs(d) < 0.5;
+        if (sec[i]) { ns++; sright += fabs(d) < 0.5; const double e = W_skip(pz, py, px) - W_true(pz, py, px); sph += fabs(e - round(e)) < 0.25 && fabs(e) < 0.5; }
+    }
+    *all = (double)right / nd;
+    printf("skip case%s, uw_rep_cnt %g: ids right %.4f (sector %.4f; the phase's own count right on %.4f of the sector)\n", cpu ? " cpu" : "", w_cnt, *all, ns ? (double)sright / ns : 0, ns ? (double)sph / ns : 0);
+    const double r = ns ? (double)sright / ns : 0;
+    fit_free(m);
+    free(pc); free(ps); free(sp); free(w); free(sec); free(cy); free(cx); for (int k = 0; k < 6; k++) free(t[k]);
+    return r;
+}
+
 /* (from the main checkout, 2026-10-20) a local stack with smooth sheet curvature, a confident 0.35-turn phase error, a missing recto
    patch and a small false recto patch: recto anchors (fit --w-recto, --phase-robust, --unwrap-voxels -1) must bring the geometry back,
    compared against the analytic surfaces rather than the corrupted prediction */
@@ -349,6 +426,13 @@ int main(void) {
     nn_init(0);
     if (getenv("FIT_BIAS")) g_bias = atof(getenv("FIT_BIAS"));
     if (getenv("FIT_SIMPLE")) { g_wob = atof(getenv("FIT_SIMPLE")); g_pack = 0; g_dpitch = 0; g_hole = 0; }
+    if (getenv("FIT_SKIPONLY")) {   /* sweep: FIT_SKW weights */
+        const char *ws = getenv("FIT_SKW"); char *s = strdup(ws ? ws : "0,4,16"); double a;
+        if (getenv("FIT_SKP")) g_skp = atof(getenv("FIT_SKP"));
+        if (getenv("FIT_SKC")) g_skc = atof(getenv("FIT_SKC"));
+        for (char *q = strtok(s, ","); q; q = strtok(nullptr, ",")) run_skip_case(1, (float)atof(q), &a);
+        free(s); return fails != 0;
+    }
     if (!getenv("FIT_CTONLY")) {   /* (FIT_CTONLY: the CT cases alone) */
     run_case(+1);
     run_case(-1);
@@ -387,6 +471,14 @@ int main(void) {
         CHECK(s2 >= 0.98 && a2 >= 0.99 && p2 >= 0.9, "gpu: CT terms: sector ids %.4f, ids %.4f, |e| < 0.08 %.4f", s2, a2, p2);
         g_ctflood = 1; const double s3 = run_ct_case(1, 2.f, 0.f, &a1, &p1); g_ctflood = 0;   /* with the CT phase in the voxel unwrapping */
         CHECK(s3 >= 0.98 && a1 >= 0.99 && p1 >= 0.9, "cpu, CT flood: sector ids %.4f, ids %.4f, |e| < 0.08 %.4f", s3, a1, p1);
+    }
+    {   /* a packed sector whose phase skips one sheet in two turns inside consistent pieces: the phase-skip gate raises the density there
+           and the fit keeps the density's count (sector ids 0.86 -> 1.0, 2026-10-26) */
+        double a0, a1; g_skp = 2;
+        const double s0 = run_skip_case(1, 0.f, &a0);
+        g_ske0 = 0.3f; g_ske1 = 0.15f; g_skdw = 10; const double s1 = run_skip_case(1, 0.f, &a1); g_ske0 = g_ske1 = g_skdw = 0; g_skp = 3;
+        CHECK(s0 < 0.95, "the skipping sector should break the plain fit (sector ids %.4f)", s0);
+        CHECK(s1 >= 0.98 && a1 >= 0.99, "phase-skip gate: sector ids %.4f, ids %.4f", s1, a1);
     }
     if (fails) { fprintf(stderr, "test_fit: %d failure(s)\n", fails); return 1; }
     printf("test_fit: OK\n");

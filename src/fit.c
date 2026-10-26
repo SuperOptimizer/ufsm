@@ -39,6 +39,7 @@ fit_cfg fit_cfg_default(void) {
     c.seed_z0 = -1e30;
     c.uw_repair = 0; c.uw_rep_qpow = 1.f; c.uw_rep_sr = 1; c.uw_rep_seed = 0.f; c.uw_rep_gd = 8; c.phase_stretch_r = 1;   /* local slip repair off by default */
     c.emb = nullptr; c.uw_rep_emb = 0.f; c.uw_rep_emb_m0 = 0.3f; c.emb_phi = 0.f; c.uw_rep_emb_rmax = 2; c.uw_rep_emb_sub = 2;   /* embedding evidence off */
+    c.phase_stretch_uw = 1; c.skip_e0 = 0.3f; c.skip_e1 = 0.f; c.skip_d = 32; c.skip_conf = 0.05f; c.w_dskip = 0.f; c.skip = nullptr; c.uw_rep_cnt = 0.f; c.uw_rep_cnt_nd = 3; c.uw_rep_cnt_d[0] = 16; c.uw_rep_cnt_d[1] = 32; c.uw_rep_cnt_d[2] = 64; c.uw_rep_cnt_sub = 4; c.uw_rep_cnt_src = 0; c.uw_rep_cnt_known = 0.5f; c.cnt = nullptr;   /* radial count votes off */
     c.uw_rep_emb_nd = 2; c.uw_rep_emb_d[0] = 16; c.uw_rep_emb_d[1] = 48; c.uw_rep_emb_d[2] = 128;   /* emb-calib (HOLD): P(r right) 0.99 at conf >= 0.2 for D <= 48, 0.88 at 128 */
     return c;
 }
@@ -745,6 +746,58 @@ static void uwr_emb(uwr_ctx *u, int th, int z, int y, int xx, uint32_t i, uint32
         if (wv >= 1) uwr_vote(u, th, ga, gb, (int32_t)-r, (int64_t)lround(wv));
     }
 }
+/* radial turn-count evidence (fit_cfg uw_rep_cnt): from voxel i the ray outward from the axis in its z plane, one field voxel per step;
+   each step's turns from the count source (density: |n . r| / spacing over the step, n n^T and sp of the source; phase wavenumber: the
+   source phase's wrapped change between consecutive steps), unknown steps (material without a count) at the known steps' mean, air
+   (no material) 0. At the partner distances the turns counted so far are the wanted W(j) - W(i); its real offset to the flooded
+   difference votes as the two nearest integers weighted 1 - frac / frac (the L1 of the real offset). */
+static void uwr_cnt(uwr_ctx *u, int th, int z, int y, int xx, uint32_t i, uint32_t ga, double ui) {
+    uw_ctx *x = u->x; const uw_geo *g = &x->g; const fit_cfg *c = u->c; const fit_fields *f = x->f, *s = c->cnt ? c->cnt : f; const uw_vox *V = x->V;
+    const double h = f->h, pz = (z + 0.5) * h, py = (y + 0.5) * h, px = (xx + 0.5) * h;
+    const double cy = axis_lerp(f->cy, x->na, pz), cx = axis_lerp(f->cx, x->na, pz);
+    double ry = py - cy, rx = px - cx; const double rl = hypot(ry, rx); if (rl < 4 * h) return;
+    ry /= rl; rx /= rl;
+    const double th0 = atan2(ry, rx); int dmax = 0; for (int k = 0; k < c->uw_rep_cnt_nd; k++) if (c->uw_rep_cnt_d[k] > dmax) dmax = c->uw_rep_cnt_d[k];
+    const size_t HW = (size_t)f->H * f->W, zo = (size_t)z * HW;
+    double tk = 0; int nk = 0, nu = 0, nair = 0;   /* turns over the known steps, known / unknown / air steps */
+    double gsk = 0;   /* the phase-skip gate summed over the steps (c->skip: the votes x its mean) */
+    int lyy = y, lxx = xx; double lph = 0; int lhp = 0;   /* the previous step's cell; its source phase */
+    if (c->uw_rep_cnt_src == 1) { const size_t i0 = zo + (size_t)y * f->W + xx; const double sc = (s->pc[i0] - 128) / 127.0, ss = (s->ps[i0] - 128) / 127.0;
+                                  if (hypot(sc, ss) > 0.05) { lph = atan2(ss, sc) / (2 * M_PI); lhp = 1; } }
+    for (int k = 1; k <= dmax; k++) {
+        const int yn = (int)floor((py + ry * k * h) / h), xn = (int)floor((px + rx * k * h) / h);
+        if (yn < 0 || xn < 0 || yn >= f->H || xn >= f->W) return;
+        const size_t fj = zo + (size_t)yn * f->W + xn;
+        if (c->skip) gsk += c->skip[fj] / 255.0;
+        if (c->uw_rep_cnt_src == 1) {   /* phase wavenumber: the wrapped change from the previous step */
+            const double sc = (s->pc[fj] - 128) / 127.0, ss = (s->ps[fj] - 128) / 127.0;
+            if (!s->w[fj]) { nair++; lhp = 0; }
+            else if (hypot(sc, ss) > 0.05) { const double ph = atan2(ss, sc) / (2 * M_PI); if (lhp) { double d = ph - lph; d -= round(d); tk += fabs(d); nk++; } else nu++; lph = ph; lhp = 1; }
+            else { nu++; lhp = 0; }
+        } else {   /* density: |n . r| / spacing over the step (one field voxel: h native voxels) */
+            if (!s->w[fj]) nair++;
+            else {
+                const double tyy = s->t[1][fj] / 255.0, txx = s->t[2][fj] / 255.0, tyx = s->t[5][fj] / 255.0 - 0.5, tr = s->t[0][fj] / 255.0 + tyy + txx;
+                if (!s->sp[fj] || tr < 0.1) nu++;
+                else { const double nr2 = fmin(1.0, fmax(0.0, (ry * ry * tyy + rx * rx * txx + 2 * ry * rx * tyx) / tr)); tk += sqrt(nr2) * 8.0 / s->sp[fj]; nk++; }
+            }
+        }
+        lyy = yn; lxx = xn;
+        int at = 0; for (int q = 0; q < c->uw_rep_cnt_nd; q++) at |= c->uw_rep_cnt_d[q] == k;
+        if (!at || nk < c->uw_rep_cnt_known * (nk + nu) || !nk) continue;
+        const uint32_t j = ub_id(g, z, yn, xn); if (V[j].k == UK_UNSET) continue;
+        const uint32_t gb = uwr_gid(u, z, yn, xn, j); if (ga == gb) continue;
+        const double want = tk + (double)nu * tk / nk;   /* (unknown steps at the known mean; air 0) */
+        const double th1 = atan2((yn + 0.5) * h - cy, (xn + 0.5) * h - cx);
+        const double dWc = (uw_U(x, j) - ui) - x->m->dir * wrap_pi(th1 - th0) / (2 * M_PI);
+        const double r = want - dWc, fl = floor(r), fr = r - fl;
+        const int bq = V[i].bk < V[j].bk ? V[i].bk : V[j].bk;
+        const double wv = c->uw_rep_cnt * (double)uwr_w(u, bq, z, y, xx, z, yn, xn) * (c->skip ? gsk / k : 1.0);
+        if (wv * (1 - fr) >= 1) uwr_vote(u, th, ga, gb, (int32_t)fl, (int64_t)lround(wv * (1 - fr)));
+        if (wv * fr >= 1) uwr_vote(u, th, ga, gb, (int32_t)fl + 1, (int64_t)lround(wv * fr));
+    }
+    (void)lyy; (void)lxx; (void)nair;
+}
 static void uwr_tiles(void *a, int z0_, int z1_, int th) {
     uwr_ctx *u = a; uw_ctx *x = u->x; const uw_geo *g = &x->g; const uw_vox *V = x->V; (void)z0_; (void)z1_;
     const int nt = u->ntz * u->nty * u->ntx; uint32_t *q = nullptr; size_t qcap = 0;
@@ -786,6 +839,7 @@ static void uwr_tiles(void *a, int z0_, int z1_, int th) {
                     uwr_vote(u, th, ga, gb, (int32_t)lround(ui - uw_U(x, j)), uwr_w(u, V[i].bk < V[j].bk ? V[i].bk : V[j].bk, z, y, xx, zn, yn, xn));
                 }
                 if (u->c->emb && u->c->uw_rep_emb > 0 && z % u->c->uw_rep_emb_sub == 0 && y % u->c->uw_rep_emb_sub == 0 && xx % u->c->uw_rep_emb_sub == 0) uwr_emb(u, th, z, y, xx, i, ga, ui);
+                if (u->c->uw_rep_cnt > 0 && z % u->c->uw_rep_cnt_sub == 0 && y % u->c->uw_rep_cnt_sub == 0 && xx % u->c->uw_rep_cnt_sub == 0) uwr_cnt(u, th, z, y, xx, i, ga, ui);
                 /* evidence: votes between voxels farther apart (every other voxel per axis) */
                 if ((z | y | xx) & 1) continue;
                 const fit_fields *f = x->f; const size_t fi = ((size_t)z * f->H + y) * f->W + xx;
@@ -1353,6 +1407,8 @@ static fit_model *fit_run_dir(const fit_fields *f, const fit_cfg *c) {
         dwd = fb_alloc(cpu, 4 * n); for (int k = 0; k < 4; k++) fb_put(cpu, dwd + k * n, f->wd[k], n);
         if (c->verbose) fprintf(stderr, "fit: winding mod 4 term (offset %d native voxels, weight %g)\n", f->w4_d, c->w_wind4);
     }
+    uint8_t *dskip = nullptr;   /* the phase-skip gate for the density term (phase stages, full resolution) */
+    if (c->skip && c->w_dskip > 0) { dskip = fb_alloc(cpu, n); fb_put(cpu, dskip, c->skip, n); if (c->verbose) fprintf(stderr, "fit: density term x (1 + %g g) on phase-skip cells\n", (double)c->w_dskip); }
     if (f->recto && c->w_recto > 0) {
         drec = fb_alloc(cpu, n); fb_put(cpu, drec, f->recto, n);
         if (c->verbose) fprintf(stderr, "fit: recto anchors (weight %g)\n", c->w_recto);
@@ -1382,7 +1438,7 @@ static fit_model *fit_run_dir(const fit_fields *f, const fit_cfg *c) {
             fb_get(cpu, m->pitch, dpi, nk * 4); fb_get(cpu, m->offset, dof, nk * 4);
             const double umc = c->uw_min_conf > 0 ? c->uw_min_conf : 0.3;
             if (c->unwrap_voxels > 0) {
-                const fit_fields *fu = f; fit_fields fm; uint8_t *mpc = nullptr, *mps = nullptr; double um2 = umc;
+                const fit_fields *fu = c->uw_src ? c->uw_src : f; fit_fields fm; uint8_t *mpc = nullptr, *mps = nullptr; double um2 = umc;
                 if (hctm && c->ct_flood) {   /* voxels below the network's floor flood with the CT's phase, after every network voxel */
                     const double tq = nn_wall_seconds(), qmin = 0.3; size_t nadd = 0;
                     mpc = malloc(n); mps = malloc(n); fit_ct_phasor(m, f, hctm, c->ct_phi, mpc, mps);
@@ -1408,12 +1464,13 @@ static fit_model *fit_run_dir(const fit_fields *f, const fit_cfg *c) {
         if (c->bend > 0) { float *hw = fit_bend_weights(f, L, lz, ly, lx, c->bend, c->verbose); dwn = fb_alloc(cpu, nl * 4); fb_put(cpu, dwn, hw, nl * 4); free(hw); }
         int fp = 1; while (st < c->phase_stage && 2 * fp * f->h <= L / 4.0) fp *= 2;   /* gradient-only stages: pooled fields (~4 field voxels per lattice cell) */
         fit_dev fd = {f->D, f->H, f->W, (float)f->h, dpc, dps, {dt[0], dt[1], dt[2], dt[3], dt[4], dt[5]}, dsp, dw, dcy, dcx, na, m->dir, nk, m->knot_dz, dpi, dof, L, lz, ly, lx, dd,
-                      0, (float)(c->w_normal * norm), (float)(c->w_density * norm), (float)(c->w_nondeg * norm), c->core, 0, 0u, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, nullptr, nullptr, 0.f, 0.f, nullptr, 0.f, nullptr, 0.f, 1.f, 0.f, 0.f, nullptr, 0.f, 0.25f};
+                      0, (float)(c->w_normal * norm), (float)((st < c->phase_stage && c->w_density_pre > 0 ? c->w_density_pre : c->w_density) * norm), (float)(c->w_nondeg * norm), c->core, 0, 0u, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, nullptr, nullptr, 0.f, 0.f, nullptr, 0.f, nullptr, 0.f, 1.f, 0.f, 0.f, nullptr, 0.f, 0.25f};
         fd.phase_robust = c->phase_robust; fd.conf_pow = c->conf_pow > 0 ? c->conf_pow : 1.f;
         fd.w_pgrad = (float)(c->w_pgrad * norm); fd.pgrad_delta = c->pgrad_delta; fd.pg = nullptr;
         fd.wd = fp == 1 ? dwd : nullptr; fd.w4_d = (float)f->w4_d; fd.recto = fp == 1 ? drec : nullptr;   /* (pooled stages: neither; their ramp is 0 there anyway) */
         fd.ctm = fp == 1 ? dctm : nullptr; fd.ct_pow = c->ct_pow; fd.ct_phi = c->ct_phi; fd.ct_floor = c->ct_floor;
         fd.cs = fp == 1 ? dcs : nullptr; fd.w_cs = (float)(c->w_cspacing * norm); fd.cs_tol = c->cs_tol;
+        fd.skip = fp == 1 ? dskip : nullptr; fd.w_dskip = c->w_dskip;
         uint8_t *pcs = nullptr;   /* the pooled CT spacing (device or host) */
         float *pgd = nullptr;   /* pooled phase gradients (device or host) */
         uint8_t *pdev = nullptr, *phost[10] = {0};
@@ -1484,6 +1541,7 @@ static fit_model *fit_run_dir(const fit_fields *f, const fit_cfg *c) {
     fb_free(cpu, dpi); fb_free(cpu, dof); fb_free(cpu, gpi); fb_free(cpu, gof); fb_free(cpu, mpi); fb_free(cpu, vpi); fb_free(cpu, mof); fb_free(cpu, vof); fb_free(cpu, dparts);
     if (dwd) fb_free(cpu, dwd);
     if (drec) fb_free(cpu, drec);
+    if (dskip) fb_free(cpu, dskip);
     if (dctm && !cpu) nn_free(dctm);
     free(hctm); if (dcs) fb_free(cpu, dcs);
     return m;
@@ -1506,7 +1564,59 @@ static void pst_rows(void *a, int z0, int z1, int t) {
         J->pc[i] = (uint8_t)lround(128 + (f->pc[i] - 128) * g); J->ps[i] = (uint8_t)lround(128 + (f->ps[i] - 128) * g);
     }
 }
+/* the phase-skip gate (fit_cfg skip_e0 / skip_e1 / skip_d): on a grid of every 4th field voxel, the radial window of skip_d field voxels
+   centred on the point (its z plane): the phase's turns (wrapped steps between consecutive confident cells, conf > 0.3) against the
+   count source's turns over the same steps (density |n . r| / spacing, as uwr_cnt); e = 1 - phase / count where the count exceeds one
+   turn, g = clamp((e - e0) / e1, 0, 1) x255, each field voxel taking its nearest grid point's. The density over-counts across gaps
+   on some scrolls (PHerc1667 +0.2..0.4 turn per 0.5 mm) while the phase there is right: the gate keeps count evidence to the cells
+   where the phase is short by more than that. */
+typedef struct { const fit_fields *f; const fit_cfg *c; uint8_t *g; } skip_job;
+static void skip_rows(void *a, int z0, int z1, int t_) {
+    skip_job *J = a; const fit_fields *f = J->f, *s = J->c->cnt ? J->c->cnt : f; const int S = 4, na = (int)(f->D * f->h) + 1, R = J->c->skip_d / 2;
+    const size_t HW = (size_t)f->H * f->W; const double h = f->h;
+    for (int z = z0; z < z1; z++) {
+        if (z % S) continue;
+        const double pz = (z + 0.5) * h, cy = axis_lerp(f->cy, na, pz), cx = axis_lerp(f->cx, na, pz);
+        for (int y = 0; y < f->H; y += S) for (int x = 0; x < f->W; x += S) {
+            const int yc = y + S / 2 < f->H ? y + S / 2 : y, xc = x + S / 2 < f->W ? x + S / 2 : x;
+            const double py = (yc + 0.5) * h, px = (xc + 0.5) * h; double ry = py - cy, rx = px - cx; const double rl = hypot(ry, rx);
+            double tp = 0, td = 0; int lp = 0; double lph = 0;
+            if (rl >= 4 * h && f->w[z * HW + (size_t)yc * f->W + xc]) {
+                ry /= rl; rx /= rl;
+                for (int k = -R; k <= R; k++) {
+                    const int yn = (int)floor((py + ry * k * h) / h), xn = (int)floor((px + rx * k * h) / h);
+                    if (yn < 0 || xn < 0 || yn >= f->H || xn >= f->W) { lp = 0; continue; }
+                    const size_t j = z * HW + (size_t)yn * f->W + xn;
+                    const double pc = (f->pc[j] - 128) / 127.0, ps = (f->ps[j] - 128) / 127.0;
+                    if (!f->w[j] || hypot(pc, ps) <= J->c->skip_conf) { lp = 0; continue; }
+                    const double ph = atan2(ps, pc) / (2 * M_PI);
+                    if (lp) {
+                        const double tyy = s->t[1][j] / 255.0, txx = s->t[2][j] / 255.0, tyx = s->t[5][j] / 255.0 - 0.5, tr = s->t[0][j] / 255.0 + tyy + txx;
+                        if (s->sp[j] && s->w[j] && tr >= 0.1) {
+                            double d = ph - lph; d -= round(d); tp += d;   /* (signed: the phase unwrapped along the ray; noise cancels) */
+                            td += sqrt(fmin(1.0, fmax(0.0, (ry * ry * tyy + rx * rx * txx + 2 * ry * rx * tyx) / tr))) * 8.0 / s->sp[j];
+                        }
+                    }
+                    lph = ph; lp = 1;
+                }
+            }
+            double g = 0;
+            if (td > 1) { const double e = 1 - fabs(tp) / td; g = fmin(1.0, fmax(0.0, (e - J->c->skip_e0) / J->c->skip_e1)); }
+            const uint8_t gv = (uint8_t)lround(255 * g);
+            for (int a = z; a < z + S && a < f->D; a++) for (int b = y; b < y + S && b < f->H; b++) memset(J->g + a * HW + (size_t)b * f->W + x, gv, (size_t)(x + S <= f->W ? S : f->W - x));
+        }
+    }
+}
 fit_model *fit_run(const fit_fields *f, const fit_cfg *c) {
+    if (c->skip_e1 > 0 && !c->skip && (c->uw_rep_cnt > 0 || c->w_dskip > 0)) {
+        const size_t n = (size_t)f->D * f->H * f->W; uint8_t *g = calloc(n, 1);
+        if (!g) { fprintf(stderr, "fit: out of memory for the phase-skip gate\n"); return nullptr; }
+        skip_job J = {f, c, g}; fit_zpar(f->D, fit_nthreads(f->D), skip_rows, &J);   /* (a row z % 4 == 0 writes its block's 4 rows; the other rows do nothing) */
+        if (c->verbose) { size_t nm = 0, ng = 0; double gs = 0; for (size_t i = 0; i < n; i++) if (f->w[i]) { nm++; if (g[i]) { ng++; gs += g[i] / 255.0; } }
+            fprintf(stderr, "fit: phase-skip gate (window %d field voxels, e0 %.2f, e1 %.2f): %.3f of the material gated, mean g there %.3f\n", c->skip_d, (double)c->skip_e0, (double)c->skip_e1, nm ? (double)ng / nm : 0, ng ? gs / ng : 0); }
+        fit_cfg c2 = *c; c2.skip = g;
+        fit_model *m = fit_run(f, &c2); free(g); return m;
+    }
     if (c->phase_stretch > 0 && c->phase_stage < c->nstage) {
         const size_t n = (size_t)f->D * f->H * f->W; uint8_t *pc = malloc(n), *ps = malloc(n);
         if (!pc || !ps) { free(pc); free(ps); fprintf(stderr, "fit: out of memory for --phase-stretch\n"); return nullptr; }
@@ -1517,7 +1627,7 @@ fit_model *fit_run(const fit_fields *f, const fit_cfg *c) {
             for (size_t i = 0; i < n; i++) { s0 += hypot(f->pc[i] - 128, f->ps[i] - 128); s1 += hypot(pc[i] - 128, ps[i] - 128); }
             fprintf(stderr, "fit: --phase-stretch %.3g: phase confidence kept %.3f\n", c->phase_stretch, s0 > 0 ? s1 / s0 : 0);
         }
-        fit_fields g = *f; g.pc = pc; g.ps = ps; fit_cfg c2 = *c; c2.phase_stretch = 0;
+        fit_fields g = *f; g.pc = pc; g.ps = ps; fit_cfg c2 = *c; c2.phase_stretch = 0; if (!c->phase_stretch_uw) c2.uw_src = f;
         fit_model *m = fit_run(&g, &c2); free(pc); free(ps); return m;
     }
     if (c->w_recto > 0 && c->phase_stage < c->nstage && !f->recto) { fprintf(stderr, "fit: --w-recto needs an r plane (r.raw or an r zarr array) on the fit-field grid\n"); return nullptr; }

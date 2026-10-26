@@ -157,6 +157,7 @@ static int usage(void) {
         "  ufsm wbench-stats A.tsv [B.tsv] [--metric ids,p1x] [--set clean|all]   winding bench means, stratified bootstrap CIs, paired A-B, MDE\n"
         "  ufsm phase-conflict <a-root> <a-key> <b-root> <b-key> <out>   where two label phase sets disagree (> --tol turn): the sampler's phase ignore mask\n"
         "  ufsm fit-compare <reference-fields> <fields>                      fit fields vs a reference (phase, spacing, normals)\n"
+        "  ufsm model-fields <fields-dir> <model> <out-dir>                  a fitted model as fit fields (fit-compare: the fit's own turn counts)\n"
         "  ufsm field-blend <out> <fields1> <fields2> ... [--weights a,b,..]  several models' fit fields averaged (phase: confidence-weighted complex mean)\n"
         "  ufsm wind-score <sweep-dir> <codes-root> <codes-key>             the fit --codes score of a predict --cond-sweep winding raster\n"
         "  ufsm store-bench <root> <array-key> [--box 128,256,512] [--n 8] [--par 1] [--threads 16]   HTTP zarr fetch benchmark\n"
@@ -997,7 +998,7 @@ static int cmd_fit(int argc, char **argv) {
     c.uw_rep_geo = (float)atof(opt(argc, argv, "--uw-rep-geo", "0")); c.uw_rep_gd = atoi(opt(argc, argv, "--uw-rep-gd", "8"));
     c.uw_rep_cs = (float)atof(opt(argc, argv, "--uw-rep-cs", "0")); c.uw_rep_dump = opt(argc, argv, "--uw-rep-dump", nullptr);
     c.uw_rep_qpow = (float)atof(opt(argc, argv, "--uw-rep-qpow", "3")); c.uw_rep_stretch = (float)atof(opt(argc, argv, "--uw-rep-stretch", "0.5"));
-    c.uw_rep_sr = atoi(opt(argc, argv, "--uw-rep-sr", "1")); c.uw_rep_seed = (float)atof(opt(argc, argv, "--uw-rep-seed", *opt(argc, argv, "--seed-model", "") ? "16" : "0"));   /* (fit --slab chaining: off unless given) */ c.uw_rep_geo_init = atoi(opt(argc, argv, "--uw-rep-geo-init", "0")); c.uw_rep_off = atoi(opt(argc, argv, "--uw-rep-off", "0")); c.uw_rep_cons = atoi(opt(argc, argv, "--uw-rep-cons", "1")); c.phase_stretch = (float)atof(opt(argc, argv, "--phase-stretch", "0")); c.phase_stretch_r = atoi(opt(argc, argv, "--phase-stretch-r", "1"));
+    c.uw_rep_sr = atoi(opt(argc, argv, "--uw-rep-sr", "1")); c.uw_rep_seed = (float)atof(opt(argc, argv, "--uw-rep-seed", *opt(argc, argv, "--seed-model", "") ? "16" : "0"));   /* (fit --slab chaining: off unless given) */ c.uw_rep_geo_init = atoi(opt(argc, argv, "--uw-rep-geo-init", "0")); c.uw_rep_off = atoi(opt(argc, argv, "--uw-rep-off", "0")); c.uw_rep_cons = atoi(opt(argc, argv, "--uw-rep-cons", "1")); c.phase_stretch = (float)atof(opt(argc, argv, "--phase-stretch", "0")); c.phase_stretch_r = atoi(opt(argc, argv, "--phase-stretch-r", "1")); c.phase_stretch_uw = atoi(opt(argc, argv, "--phase-stretch-uw", "1"));
     if (!(c.phase_stretch >= 0) || c.phase_stretch_r < 0 || c.phase_stretch_r > 4) { fprintf(stderr, "fit: --phase-stretch >= 0, --phase-stretch-r 0..4\n"); return 2; }
     /* embedding evidence for the slip repair (src/fit_emb.h): --emb GROUP (a dinovol-embed output group at the fields' scan level, or
        --emb-scale S embedding voxels per native voxel) [--emb-output tokens_unit] --uw-rep-emb W [--uw-rep-emb-d 16,48 native voxels]
@@ -1007,6 +1008,19 @@ static int cmd_fit(int argc, char **argv) {
     c.uw_rep_emb = (float)atof(opt(argc, argv, "--uw-rep-emb", "0")); c.uw_rep_emb_m0 = (float)atof(opt(argc, argv, "--uw-rep-emb-m0", "0.3"));
     c.uw_rep_emb_rmax = atoi(opt(argc, argv, "--uw-rep-emb-rmax", "2")); c.uw_rep_emb_sub = atoi(opt(argc, argv, "--uw-rep-emb-sub", "2")); c.emb_phi = (float)atof(opt(argc, argv, "--emb-phi", "0"));
     if (*opt(argc, argv, "--uw-rep-emb-d", "")) { c.uw_rep_emb_nd = 0; char *t = strdup(opt(argc, argv, "--uw-rep-emb-d", "")); for (char *q = strtok(t, ","); q && c.uw_rep_emb_nd < 4; q = strtok(nullptr, ",")) c.uw_rep_emb_d[c.uw_rep_emb_nd++] = atoi(q); free(t); }
+    /* radial turn-count votes (fit_cfg uw_rep_cnt): --uw-rep-cnt W [--uw-rep-cnt-d 16,32,64 field voxels] [--uw-rep-cnt-sub 4] [--uw-rep-cnt-src 0 density | 1 phase wavenumber]
+       [--uw-rep-cnt-known 0.5] [--cnt-fields DIR: the count source, a fit-field directory on the same grid (e.g. another model's fields)] */
+    c.uw_rep_cnt = (float)atof(opt(argc, argv, "--uw-rep-cnt", "0")); c.uw_rep_cnt_sub = atoi(opt(argc, argv, "--uw-rep-cnt-sub", "4")); c.uw_rep_cnt_src = atoi(opt(argc, argv, "--uw-rep-cnt-src", "0"));
+    c.uw_rep_cnt_known = (float)atof(opt(argc, argv, "--uw-rep-cnt-known", "0.5"));
+    /* the phase-skip gate (fit_cfg skip_*): --skip-gate E0,E1 (on; e = 1 - phase turns / density turns over --skip-d 32 field voxels of the radial
+       ray, g = clamp((e - E0) / E1, 0, 1)) gates --uw-rep-cnt and drives --w-dskip K (the density term x (1 + K g)) */
+    if (*opt(argc, argv, "--skip-gate", "") && sscanf(opt(argc, argv, "--skip-gate", ""), "%f,%f", &c.skip_e0, &c.skip_e1) != 2) { fprintf(stderr, "fit: --skip-gate E0,E1\n"); return 2; }
+    c.skip_d = atoi(opt(argc, argv, "--skip-d", "32")); c.skip_conf = (float)atof(opt(argc, argv, "--skip-conf", "0.05")); c.w_dskip = (float)atof(opt(argc, argv, "--w-dskip", "0")); c.w_density_pre = (float)atof(opt(argc, argv, "--w-density-pre", "0"));
+    if (c.skip_e1 < 0 || c.skip_d < 2 || !(c.w_dskip >= 0)) { fprintf(stderr, "fit: --skip-gate E0,E1 with E1 >= 0, --skip-d >= 2, --w-dskip >= 0\n"); return 2; }
+    if (c.w_dskip > 0 && !(c.skip_e1 > 0)) { fprintf(stderr, "fit: --w-dskip needs --skip-gate E0,E1\n"); return 2; }
+    if (*opt(argc, argv, "--uw-rep-cnt-d", "")) { c.uw_rep_cnt_nd = 0; char *t = strdup(opt(argc, argv, "--uw-rep-cnt-d", "")); for (char *q = strtok(t, ","); q && c.uw_rep_cnt_nd < 4; q = strtok(nullptr, ",")) c.uw_rep_cnt_d[c.uw_rep_cnt_nd++] = atoi(q); free(t); }
+    if (!(c.uw_rep_cnt >= 0) || c.uw_rep_cnt_sub < 1 || c.uw_rep_cnt_src < 0 || c.uw_rep_cnt_src > 1 || c.uw_rep_cnt_nd < 1) { fprintf(stderr, "fit: --uw-rep-cnt >= 0, --uw-rep-cnt-sub >= 1, --uw-rep-cnt-src 0 | 1, --uw-rep-cnt-d D[,D...]\n"); return 2; }
+    for (int k = 0; k < c.uw_rep_cnt_nd; k++) if (c.uw_rep_cnt_d[k] < 1 || c.uw_rep_cnt_d[k] > 4096) { fprintf(stderr, "fit: --uw-rep-cnt-d 1..4096\n"); return 2; }
     if (!(c.uw_rep_emb >= 0) || !(c.uw_rep_emb_m0 > 0) || c.uw_rep_emb_rmax < 1 || c.uw_rep_emb_rmax > 8 || c.uw_rep_emb_sub < 1) { fprintf(stderr, "fit: --uw-rep-emb >= 0, --uw-rep-emb-m0 > 0, --uw-rep-emb-rmax 1..8, --uw-rep-emb-sub >= 1\n"); return 2; }
     if (c.uw_repair < 0 || !(c.uw_rep_w4 >= 0) || !(c.uw_rep_geo >= 0) || !(c.uw_rep_cs >= 0) || c.uw_rep_gd < 1 || !(c.uw_rep_qpow > 0) || !(c.uw_rep_stretch >= 0) || c.uw_rep_sr < 0 || c.uw_rep_sr > 4 || !(c.uw_rep_seed >= 0)) { fprintf(stderr, "fit: --uw-repair >= 0, --uw-rep-* weights >= 0, --uw-rep-gd >= 1\n"); return 2; }
     c.core = (float)atof(opt(argc, argv, "--core", "3"));   /* no data terms within core x pitch of the axis */
@@ -1079,6 +1093,13 @@ static int cmd_fit(int argc, char **argv) {
         c.init = initm; for (int d = 0; d < 3; d++) c.init_off[d] = (double)(fb.origin[d] - initm->origin[d]);
         if (c.dir == 0) c.dir = initm->dir;
     }
+    fit_fields_buf cfb; memset(&cfb, 0, sizeof cfb);   /* --cnt-fields: the radial count votes' source (same grid; unpooled box fits only) */
+    if (*opt(argc, argv, "--cnt-fields", "") && !min) {
+        if (slab > 0) { fprintf(stderr, "fit: --cnt-fields needs a single box fit (no --slab)\n"); return 2; }
+        if (fit_fields_load(opt(argc, argv, "--cnt-fields", ""), 0, 0, 1, &cfb)) { fprintf(stderr, "fit: cannot load --cnt-fields %s\n", opt(argc, argv, "--cnt-fields", "")); return 1; }
+        if (memcmp(cfb.shape, fb.shape, sizeof cfb.shape) || cfb.h != fb.h || memcmp(cfb.origin, fb.origin, sizeof cfb.origin)) { fprintf(stderr, "fit: --cnt-fields must share the fields' box and grid\n"); return 2; }
+        c.cnt = &cfb.f;
+    }
     fit_set *fs = nullptr;
     if (min) fs = fit_set_load(min);
     else if (slab > 0) fs = fit_run_slabs(dir, &c, slab, overlap);
@@ -1097,10 +1118,10 @@ static int cmd_fit(int argc, char **argv) {
         if (!cf) { fprintf(stderr, "fit: cannot save %s\n", cp); return 1; }
         fprintf(cf, "{\"version\":1,\"w_phase\":%.9g,\"w_normal\":%.9g,\"w_density\":%.9g,\"w_smooth\":%.9g,\"w_pgrad\":%.9g,\"pgrad_delta\":%.9g,\"w_wind4\":%.9g,\"w_recto\":%.9g,"
                     "\"w_ct\":%.9g,\"ct_pow\":%.9g,\"ct_phi\":%.9g,\"ct_floor\":%.9g,\"ct_radius_um\":%.9g,\"ct_flood\":%d,\"w_cspacing\":%.9g,\"cs_tol\":%.9g,"
-                    "\"phase_robust_turns\":%.9g,\"conf_pow\":%.9g,\"bend\":%.9g,\"unwrap_voxels\":%d,\"uw_min_conf\":%.9g,\"uw_repair\":%d,\"uw_rep_w4\":%.9g,\"uw_rep_geo\":%.9g,\"uw_rep_gd\":%d,\"uw_rep_cs\":%.9g,\"uw_rep_qpow\":%.9g,\"uw_rep_stretch\":%.9g,\"uw_rep_sr\":%d,\"uw_rep_emb\":%.9g,\"phase_stretch\":%.9g,\"phase_stretch_r\":%d,\"phase_stage\":%d,\"slab\":%d,\"cpu\":%d,\"native_um\":%.9g,\"lattice\":[",
+                    "\"phase_robust_turns\":%.9g,\"conf_pow\":%.9g,\"bend\":%.9g,\"unwrap_voxels\":%d,\"uw_min_conf\":%.9g,\"uw_repair\":%d,\"uw_rep_w4\":%.9g,\"uw_rep_geo\":%.9g,\"uw_rep_gd\":%d,\"uw_rep_cs\":%.9g,\"uw_rep_cnt\":%.9g,\"uw_rep_cnt_src\":%d,\"uw_rep_qpow\":%.9g,\"uw_rep_stretch\":%.9g,\"uw_rep_sr\":%d,\"uw_rep_emb\":%.9g,\"phase_stretch\":%.9g,\"phase_stretch_r\":%d,\"phase_stage\":%d,\"slab\":%d,\"cpu\":%d,\"native_um\":%.9g,\"lattice\":[",
                 c.w_phase, c.w_normal, c.w_density, c.w_smooth, c.w_pgrad, c.pgrad_delta, c.w_wind4, c.w_recto,
                 c.w_ct, c.ct_pow, c.ct_phi, c.ct_floor, c.ct_radius_um, c.ct_flood, c.w_cspacing, c.cs_tol, c.phase_robust, c.conf_pow, c.bend, c.unwrap_voxels, c.uw_min_conf,
-                c.uw_repair, c.uw_rep_w4, c.uw_rep_geo, c.uw_rep_gd, c.uw_rep_cs, c.uw_rep_qpow, c.uw_rep_stretch, c.uw_rep_sr, (double)c.uw_rep_emb, (double)c.phase_stretch, c.phase_stretch_r, c.phase_stage, slab, c.cpu, c.um);
+                c.uw_repair, c.uw_rep_w4, c.uw_rep_geo, c.uw_rep_gd, c.uw_rep_cs, (double)c.uw_rep_cnt, c.uw_rep_cnt_src, c.uw_rep_qpow, c.uw_rep_stretch, c.uw_rep_sr, (double)c.uw_rep_emb, (double)c.phase_stretch, c.phase_stretch_r, c.phase_stage, slab, c.cpu, c.um);
         for (int k = 0; k < c.nstage; k++) fprintf(cf, "%s%d", k ? "," : "", c.lattice[k]);
         fprintf(cf, "]}\n"); if (fclose(cf)) { fprintf(stderr, "fit: cannot save %s\n", cp); return 1; }
     }
@@ -1230,7 +1251,7 @@ static int cmd_fit(int argc, char **argv) {
         fit_set_dev_free(gd); z3_close(z); if (dump) fclose(dump);
         if (rc) return 1;
     }
-    fit_set_free(fs); fit_fields_free(&fb);
+    fit_set_free(fs); fit_fields_free(&fb); if (cfb.a[0]) fit_fields_free(&cfb);
     return 0;
 }
 
@@ -2617,6 +2638,40 @@ static double hist_q(const size_t *h, int nb, double lo, double w, double q) {  
     size_t c = 0; for (int k = 0; k < nb; k++) { c += h[k]; if (n && (double)c >= q * n) return lo + (k + 0.5) * w; }
     return lo + nb * w;
 }
+/* ufsm model-fields <fields-dir> <model-or-set> <out-dir> [--threads N]: a fit model as fit fields on the fields' grid (diagnostics: ufsm
+   fit-compare ORACLE OUT counts the FITTED turns along radial segments, i.e. what the fitter kept of the counts): pc / ps the phasor of
+   W at full confidence, sp the spacing 1 / |grad W| (central differences over the cells), the other planes copied from the fields. */
+static int cmd_model_fields(int argc, char **argv) {
+    if (argc < 5) { fprintf(stderr, "usage: ufsm model-fields <fields-dir> <model-or-set> <out-dir> [--threads N]\n"); return 2; }
+    fit_set_threads(atoi(opt(argc, argv, "--threads", "0")));
+    fit_fields_buf b; if (fit_fields_load(argv[2], 0, 0, 1, &b)) { fprintf(stderr, "model-fields: cannot load %s\n", argv[2]); return 1; }
+    fit_set *fs = fit_set_load(argv[3]); if (!fs) { fprintf(stderr, "model-fields: cannot load %s\n", argv[3]); return 1; }
+    const int D = b.shape[0], H = b.shape[1], W = b.shape[2]; const size_t HW = (size_t)H * W, n = (size_t)D * HW; const double h = b.h;
+    const double o3[3] = {(double)(b.origin[0] - fs->global->origin[0]), (double)(b.origin[1] - fs->global->origin[1]), (double)(b.origin[2] - fs->global->origin[2])};
+    const int64_t n3[3] = {D, H, W};
+    float *wv = malloc(n * sizeof *wv); if (!wv) { fprintf(stderr, "model-fields: out of memory\n"); return 1; }
+    if (fit_set_grid_cpu(fs, o3, n3, h, 1, nullptr, wv)) { fprintf(stderr, "model-fields: grid failed\n"); return 1; }   /* U: continuous (no theta cut) */
+    const int na = (int)(D * b.h) + 1, dir = fs->global->dir;
+    for (int z = 0; z < D; z++) for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
+        const size_t i = z * HW + (size_t)y * W + x;
+        const int az = (int)fmin((z + 0.5) * h, na - 1); const double th = atan2((y + 0.5) * h - b.cy[az], (x + 0.5) * h - b.cx[az]), w0 = wv[i] - dir * th / (2 * M_PI);
+        b.a[0][i] = (uint8_t)lround(128 + 127 * cos(2 * M_PI * w0)); b.a[1][i] = (uint8_t)lround(128 + 127 * sin(2 * M_PI * w0));
+        double g[3]; const int p[3] = {z, y, x}, dm[3] = {D, H, W}; const size_t st[3] = {HW, (size_t)W, 1};
+        for (int a = 0; a < 3; a++) {   /* grad U (|grad W| differs by the tangential 1 / (2 pi r): negligible off the axis) */
+            const size_t lo = p[a] > 0 ? i - st[a] : i, hi = p[a] + 1 < dm[a] ? i + st[a] : i; const int span = (p[a] > 0) + (p[a] + 1 < dm[a]);
+            g[a] = span ? (wv[hi] - wv[lo]) / (span * h) : 0;
+        }
+        const double gl = sqrt(g[0] * g[0] + g[1] * g[1] + g[2] * g[2]), v = gl > 1e-9 ? 8.0 / (h * gl) : 0;
+        b.a[8][i] = (uint8_t)(v <= 0 ? 0 : v < 1 ? 1 : v > 255 ? 255 : lround(v));
+    }
+    free(wv);
+    uint8_t *a10[10]; for (int k = 0; k < 10; k++) a10[k] = b.a[k];
+    const long long org[3] = {b.origin[0], b.origin[1], b.origin[2]}; const int shp[3] = {D, H, W};
+    if (fit_fields_save(argv[4], org, shp, b.h, b.um, a10, b.cy, b.cx, (int)(D * b.h) + 1)) { fprintf(stderr, "model-fields: cannot write %s\n", argv[4]); return 1; }
+    fit_set_free(fs); fit_fields_free(&b);
+    printf("model-fields: %dx%dx%d -> %s\n", D, H, W, argv[4]);
+    return 0;
+}
 static int cmd_fit_compare(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: ufsm fit-compare <reference-fields> <fields>\n"); return 2; }
     fit_fields_buf A, B;
@@ -3500,6 +3555,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "self-gate")) return cmd_self_gate(argc, argv);
     if (!strcmp(cmd, "ct-fields")) return cmd_ct_fields(argc, argv);
     if (!strcmp(cmd, "fit-compare")) return cmd_fit_compare(argc, argv);
+    if (!strcmp(cmd, "model-fields")) return cmd_model_fields(argc, argv);
     if (!strcmp(cmd, "field-blend")) return cmd_field_blend(argc, argv);
     if (!strcmp(cmd, "gap-compare")) return cmd_gap_compare(argc, argv);
     if (!strcmp(cmd, "gap-density")) return cmd_gap_density(argc, argv);
