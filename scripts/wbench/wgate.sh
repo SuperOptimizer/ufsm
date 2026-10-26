@@ -12,7 +12,8 @@
 #   REF (wind96), BOXES (core | names), SITES ("4624 5392 5904 6672"; "" = no slabs), REP (2), FL (box lanes, 3), DIAG (1),
 #   KEEP (1), NOLOCK=1 (the caller holds the GPU), PRIO (eval), TTA (predict --tta K, 1 = off), SEAM (1: average 2 window-grid
 #   offsets 0 / 8 vx: volcomp seam TTA, 2x predict), FIXED=1 (fixed fields: only $WB/fields/TAG/* as they are, never predict;
-#   e.g. field rewrites of the wind96 fields $WB/fields/w96g), SPRIO (slab fits after the block, eval with the run's ticket number).
+#   e.g. field rewrites of the wind96 fields $WB/fields/w96g), PREV=TAG0 (refiner checkpoints: predict --prev with TAG0's box fit,
+#   $WB/runs/TAG0/BOX/fit or $WB/gate/TAG0/BOX/fit; sites without a kept fit get zero prev; UP must be a --prev build), SPRIO (slab fits after the block, eval with the run's ticket number).
 set -u
 H=$(cd "$(dirname "$0")" && pwd)
 SITE=${SITE:-$([ -d $HOME/ufsm-data ] && echo laptop || echo desk)}; GPU=${GPU:-0}
@@ -49,6 +50,8 @@ rm -f $O/ready/.end; rm -rf $O/claim/*
 gpredict() {   # gpredict like predict; SEAM=1: two passes, window grid at 0 and shifted 8 voxels on every axis (another phase of the
   # network's pooling against the 16^3 volcomp codec blocks), averaged by field-blend (phase as the complex mean)
   [ "$FIXED" = 1 ] && { log "FIXED=1: no fields $1 (not predicted; skipped)"; return 1; }
+  local PX=${PX:-} pv   # PREV=TAG0 (refiner checkpoints, predict --prev): TAG0's fit of this box as the prev input; none (zero prev) if absent
+  if [ -n "${PREV:-}" ]; then for pv in $WB/runs/$PREV/$(basename $1)/fit $WB/gate/$PREV/$(basename $1)/fit; do [ -e $pv ] && { PX="$PX --prev $pv"; break; }; done; fi
   [ "$SEAM" = 1 ] || { predict "$@"; return; }
   local f=$1; shift
   GO=0,0,0 predict $f.g0 "$@" && GO=8,8,8 predict $f.g8 "${@:1:6}" ${7}.g8 ${8:-} || return 1

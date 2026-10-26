@@ -17,7 +17,7 @@ log() { echo "$(date '+%m-%d %H:%M:%S') $*" | tee -a $O/run.log; }
 S="ssh -o BatchMode=yes $RHOST"
 log "slab sites of $TAG on $RHOST GPU $RGPU (vs $RREF)"
 $S "mkdir -p $RWB/ckpt" && rsync -a "$CK" $RHOST:$RWB/ckpt/$TAG.ckpt || { log "wgate-slabs: copy to $RHOST failed"; exit 1; }
-$S "cd $RWB && SITE=forlindesk GPU=$RGPU UP=$RUP REF=$RREF BOXES=none SITES='${SITES:-4624 5392 5904 6672}' TTA=${TTA:-1} SEAM=${SEAM:-0} bash $RBIN/wgate.sh $RWB/ckpt/$TAG.ckpt $TAG > $RWB/gate-$TAG-slabs.out 2>&1"
+$S "cd $RWB && SITE=forlindesk GPU=$RGPU UP=$RUP REF=$RREF BOXES=none SITES='${SITES:-4624 5392 5904 6672}' TTA=${TTA:-1} SEAM=${SEAM:-0} PREV=${PREV:-} bash $RBIN/wgate.sh $RWB/ckpt/$TAG.ckpt $TAG > $RWB/gate-$TAG-slabs.out 2>&1"
 for f in slabs.tsv radius.tsv; do rsync -a $RHOST:$RWB/gate/$TAG/$f $O/$f.remote || { log "wgate-slabs: no $f from $RHOST"; exit 1; }; done
 # keep the laptop's own slab rows (if any) aside; the remote rows become the run's slab rows
 for f in slabs radius; do [ -s $O/$f.tsv ] && [ ! -e $O/$f.local.tsv ] && mv $O/$f.tsv $O/$f.local.tsv; mv $O/$f.tsv.remote $O/$f.tsv; done
