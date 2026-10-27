@@ -51,4 +51,24 @@ with tempfile.TemporaryDirectory(prefix="ufsm-iblend-") as tmp:
     c = (t / "c.raw").read_bytes()[0]
     m = sum(at(z, y, x) for z in (0, 1) for y in (0, 1) for x in (0, 1)) / 8
     assert abs(c - m) <= 1, (c, m)
+    # --origins: a 96^3 input (value 200) placed at 32,32,32 (a predict of a --box without --full-grid) on grid 32 beside input a on grid 0
+    M = 96
+    lv = t / "c.zarr" / "0"
+    lv.mkdir(parents=True)
+    (lv / ".zarray").write_text(json.dumps({"shape": [M] * 3, "chunks": [32] * 3, "dtype": "|u1", "fill_value": 0, "order": "C",
+                                            "filters": None, "compressor": None, "zarr_format": 2, "dimension_separator": "/"}))
+    for cz in range(3):
+        for cy in range(3):
+            (lv / str(cz) / str(cy)).mkdir(parents=True)
+            for cx in range(3):
+                (lv / str(cz) / str(cy) / str(cx)).write_bytes(bytes([200]) * 32 ** 3)
+    run(BIN, "ingest-labels", t, "c.zarr", t / "c", "--um", "9.6", "--lut", t / "lut.txt", "--levels", "1", "--shard", "128", "--threads", "2")
+    run(BIN, "ink-blend", t / "out2", "--um", "9.6", "--tile", f"{T},{T},{T}", "--grids", "0,0,0:32,32,32", "--origins", "0,0,0:32,32,32", ins[0], t / "c",
+        "--q", "0", "--levels", "1", "--shard", "128", "--threads", "2")
+    run(BIN, "read", t / "out2", "9.6", 0, 0, 0, N, N, N, t / "o2.raw")
+    o2 = (t / "o2.raw").read_bytes()
+    for z, y, x in [(32, 32, 32), (64, 64, 64), (100, 40, 90), (50, 40, 70)]:
+        assert abs(o2[(z * N + y) * N + x] - o[(z * N + y) * N + x]) <= 1, (z, y, x, o2[(z * N + y) * N + x], o[(z * N + y) * N + x])
+    for z, y, x in [(0, 0, 0), (5, 31, 100), (31, 31, 31)]:   # outside the placed input: input a alone
+        assert o2[(z * N + y) * N + x] == 100, (z, y, x, o2[(z * N + y) * N + x])
 print("test_ink_blend: ok")
