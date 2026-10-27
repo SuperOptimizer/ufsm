@@ -478,6 +478,7 @@ static int write_gray_jpeg_half_stretch(const char *path, const uint8_t *g, int 
 }
 static int write_gray_jpeg_half(const char *path, const uint8_t *g, int w, int h) {
     const int ow = w / 2 > 0 ? w / 2 : 1, oh = h / 2 > 0 ? h / 2 : 1;
+    if (ow > 65500 || oh > 65500) { fprintf(stderr, "ink-ext: %s skipped (%d x %d is beyond the JPEG limit of 65500)\n", path, ow, oh); return 0; }
     uint8_t *half = malloc((size_t)ow * oh), *rgb = malloc((size_t)ow * oh * 3);
     if (!half || !rgb || pil_resize(g, w, h, 1, half, ow, oh, PIL_BOX, 8)) { free(half); free(rgb); return -1; }
     for (size_t i = 0; i < (size_t)ow * oh; i++) rgb[3 * i] = rgb[3 * i + 1] = rgb[3 * i + 2] = half[i];
