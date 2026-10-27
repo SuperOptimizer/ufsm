@@ -524,6 +524,7 @@ test-all: $(B)/test_gpu_aug $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover 
 	./$(B)/test_share_enc_a1
 	python3 tests/test_pipeline_cli.py
 	python3 tests/test_ingest_lut.py
+	python3 tests/test_ink_blend.py
 	python3 tests/test_cover_training.py
 	./$(B)/test_checkpoint
 	./$(B)/test_optimizer_owners
