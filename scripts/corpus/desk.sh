@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # desk.sh: the desk side of the corpus unroll (see common.sh). Lanes (one process; restart-safe: done markers + flock claims):
-#   prep     every scroll up front, PREPPAR (3) at once: box of the scanprep mask (object cells padded one cell, 64-aligned level voxels),
+#   prep     every scroll up front, PREPPAR (3) at once: box of the scanprep mask (object cells padded one cell, origin on the 512-voxel grid: predict --fit-zarr slab rows are 256 cells = 512 voxels),
 #            axis (list.tsv umbilicus or ufsm axis = per-z centroid of the masked CT)
 #   gpu 0/1  wind96 fit fields of one scroll per GPU (run3-cf predict settings) + lossless repack to 512^3 shards; waits for SPACEGB
 #   ref      count-field ref on the CPU (REFPAR (2) lanes, TH (12) threads each, nice 10 under the predicts; MemAvailable >= MEMGB 40 first)
@@ -19,7 +19,7 @@ prep() {
         if (!n++) { z0 = z1 = z; y0 = y1 = y; x0 = x1 = x }
         if (z < z0) z0 = z; if (z > z1) z1 = z; if (y < y0) y0 = y; if (y > y1) y1 = y; if (x < x0) x0 = x; if (x > x1) x1 = x } }
     END { split(sh, s, " "); a[1] = z0; a[2] = y0; a[3] = x0; b[1] = z1; b[2] = y1; b[3] = x1
-      for (d = 1; d <= 3; d++) { lo = (a[d] - 1) * c; if (lo < 0) lo = 0; lo = int(lo / 64) * 64; hi = (b[d] + 2) * c; if (hi > s[d]) hi = s[d]; o[d] = lo; e[d] = hi - lo }
+      for (d = 1; d <= 3; d++) { lo = (a[d] - 1) * c; if (lo < 0) lo = 0; lo = int(lo / 512) * 512; hi = (b[d] + 2) * c; if (hi > s[d]) hi = s[d]; o[d] = lo; e[d] = hi - lo }
       printf "%d,%d,%d,%d,%d,%d\n", o[1], o[2], o[3], e[1], e[2], e[3] }' > $O/box.txt
   [ -s $O/box.txt ] || return 1
   if [ "$AXS" = auto ]; then MEMGB=60 memok; N $U axis $R $K $O/axis.json > $O/logs/axis.log 2>&1 || return 1; else cp $AXS $O/axis.json; fi
