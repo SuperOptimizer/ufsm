@@ -1133,7 +1133,15 @@ static int cmd_fit(int argc, char **argv) {
        on the host instead of 10 (UFSM_FIT_NOSTREAM=1: off; the options whose host code reads the normals or alters the phase planes
        before the upload fall back to the whole host fields) */
     fit_stream fst; memset(&fst, 0, sizeof fst);
-    const int use_stream = !c.cpu && !min && slab <= 0 && !ufsm_env_on("UFSM_FIT_NOSTREAM") && !(c.w_pgrad > 0) && !(c.w_cspacing > 0) && !(c.bend > 0) &&
+    /* --coarse-pool P (> 1): the coarse stage of a coarse-to-fine unwrap: the fields max / mean pooled by P per axis (pooled phase carries no
+       information) and only the gradient terms (normal, density: the integrated turn count; no phase stage), e.g. a whole scroll in one fit
+       whose model is the --ref-model of the blocks' fine fits */
+    const int cpool = atoi(opt(argc, argv, "--coarse-pool", "0"));
+    if (cpool > 1) {
+        if (min || slab > 0) { fprintf(stderr, "fit: --coarse-pool goes without --model / --slab\n"); return 2; }
+        c.phase_stage = c.nstage; c.unwrap_voxels = -1;
+    }
+    const int use_stream = cpool <= 1 && !c.cpu && !min && slab <= 0 && !ufsm_env_on("UFSM_FIT_NOSTREAM") && !(c.w_pgrad > 0) && !(c.w_cspacing > 0) && !(c.bend > 0) &&
                            !(c.phase_stretch > 0) && !(c.w_ct > 0 && c.ct_flood) && !*opt(argc, argv, "--axis-normal", "");
     struct timespec tl0, tl1; clock_gettime(CLOCK_MONOTONIC, &tl0);
     int cached = 0;   /* fit --sweep: the streamed fields of an earlier run of this process (same directory, planes and pooling factors) */
@@ -1159,7 +1167,7 @@ static int cmd_fit(int argc, char **argv) {
             if (bad) return 1;
         }
         c.stream = &fst;
-    } else if (fit_fields_load(dir, 0, 0, min || slab > 0 ? 0 : 1, &fb)) { fprintf(stderr, "fit: cannot load the fields in %s\n", dir); return 1; }
+    } else if (fit_fields_load(dir, 0, 0, min || slab > 0 ? 0 : cpool > 1 ? cpool : 1, &fb)) { fprintf(stderr, "fit: cannot load the fields in %s\n", dir); return 1; }
     clock_gettime(CLOCK_MONOTONIC, &tl1);
     fit_gpu_join();
     if (c.verbose) fprintf(stderr, "fit: fields %dx%dx%d loaded in %.1fs\n", fb.shape[0], fb.shape[1], fb.shape[2], (double)(tl1.tv_sec - tl0.tv_sec) + (tl1.tv_nsec - tl0.tv_nsec) * 1e-9);   /* (slab runs load per slab; a given model needs the geometry only) */
@@ -1215,6 +1223,18 @@ static int cmd_fit(int argc, char **argv) {
         if (!(initm = fit_load(opt(argc, argv, "--init-model", "")))) { fprintf(stderr, "fit: cannot load --init-model %s\n", opt(argc, argv, "--init-model", "")); return 1; }
         c.init = initm; for (int d = 0; d < 3; d++) c.init_off[d] = (double)(fb.origin[d] - initm->origin[d]);
         if (c.dir == 0) c.dir = initm->dir;
+    }
+    fit_set *refm = nullptr;   /* --ref-model: a global coarse model / set (coarse-to-fine: the integers tied to it) */
+    if (*opt(argc, argv, "--ref-model", "")) {
+        if (!(refm = fit_set_load(opt(argc, argv, "--ref-model", "")))) { fprintf(stderr, "fit: cannot load --ref-model %s\n", opt(argc, argv, "--ref-model", "")); return 1; }
+        if (seedm || slab > 0) { fprintf(stderr, "fit: --ref-model goes without --seed-model / --slab\n"); return 2; }
+        c.ref = refm; for (int d = 0; d < 3; d++) c.ref_off[d] = (double)(fb.origin[d] - refm->global->origin[d]);
+        c.ref_snap = atoi(opt(argc, argv, "--ref-snap", "0")); c.uw_rep_ref = (float)atof(opt(argc, argv, "--uw-rep-ref", "0"));
+        if (!(c.uw_rep_ref >= 0)) { fprintf(stderr, "fit: --uw-rep-ref >= 0\n"); return 2; }
+        if (c.dir == 0) c.dir = refm->global->dir;
+        else if (c.dir != refm->global->dir) { fprintf(stderr, "fit: --dir %+d differs from the --ref-model's %+d\n", c.dir, refm->global->dir); return 2; }
+        fprintf(stderr, "fit: ref model %s (box offset %.0f %.0f %.0f native): %s%s\n", opt(argc, argv, "--ref-model", ""), c.ref_off[0], c.ref_off[1], c.ref_off[2],
+                c.ref_snap ? "integers snapped to it" : "flood seed from it", c.uw_rep_ref > 0 ? ", repair pieces anchored to it" : "");
     }
     fit_set *fs = nullptr;
     if (min) fs = fit_set_load(min);

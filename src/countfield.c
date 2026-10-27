@@ -450,6 +450,10 @@ int cmd_count_field(int argc, char **argv) {
     const int iters = atoi(cf_opt(argc, argv, "--iters", "400")), Qf = atoi(cf_opt(argc, argv, "--loop", "8")), Rm = atoi(cf_opt(argc, argv, "--model-R", "8")), wwc = atoi(cf_opt(argc, argv, "--wc", "1"));
     const double lamr = atof(cf_opt(argc, argv, "--lambda", "1e-7")), eps = atof(cf_opt(argc, argv, "--eps", "1e-3")), rmin_um = atof(cf_opt(argc, argv, "--rmin-um", "500"));
     const double memgb = atof(cf_opt(argc, argv, "--mem-gb", "6"));
+    /* --model-only 1 (with --model): no output fields (the out directory is not written), only the model; --model-stride K: its phase
+       gauge (and the R 0 global gauge) from every K-th field chunk (a whole scroll: the gauge is smoothed over +-model-R solve cells) */
+    const int mo = atoi(cf_opt(argc, argv, "--model-only", "0")), mstride = atoi(cf_opt(argc, argv, "--model-stride", "1"));
+    if (mo && (!*mdir || mstride < 1 || *cf_opt(argc, argv, "--into-shape", ""))) { fprintf(stderr, "count-field: --model-only needs --model DIR, --model-stride >= 1, no --into-*\n"); return 2; }
     if (strcmp(meth, "ls") && strcmp(meth, "ray")) { fprintf(stderr, "count-field: --method ls or ray\n"); return 2; }
     if (strcmp(cmode, "w") && strcmp(cmode, "phase") && strcmp(cmode, "mix") && strcmp(cmode, "pmax")) { fprintf(stderr, "count-field: --conf w, phase, mix or pmax\n"); return 2; }
     double tr0 = 0, tr1 = 0; if (*cf_opt(argc, argv, "--trust", "") && sscanf(cf_opt(argc, argv, "--trust", ""), "%lf,%lf", &tr0, &tr1) != 2) { fprintf(stderr, "count-field: --trust C0,C1\n"); return 2; }
@@ -543,6 +547,7 @@ int cmd_count_field(int argc, char **argv) {
     if (!R) {   /* R 0: the global gauge arg sum c e^{2 pi i (phi - W)} (with R > 0 the demodulation absorbs any constant) */
         double complex acc = 0;
         for (int z0 = 0; z0 < D; z0 += CZ) {
+            if (mo && (z0 / CZ) % mstride) continue;   /* (--model-only: every mstride-th chunk) */
             const int z1 = z0 + CZ < D ? z0 + CZ : D; fit_fields_buf b; if (fit_fields_load(in, z0, z1, 1, &b)) return 1;
             for (size_t i = 0; i < (size_t)(z1 - z0) * HW; i += 7) {
                 if (!b.f.w[i]) continue;
@@ -568,7 +573,7 @@ int cmd_count_field(int argc, char **argv) {
     }
     /* pass 2: the output, chunk by chunk. raw: rows appended to raw planes (every plane written); zarr (input zarr arrays of the same
        box, no zarr_offset): pc / ps / cl as new zarr arrays (128^3 shards, lossless), the other planes symlinked to the input's */
-    char p[1400]; snprintf(p, sizeof p, "mkdir -p '%s'", out); if (system(p)) { fprintf(stderr, "count-field: cannot create %s\n", out); return 1; }
+    char p[1400]; snprintf(p, sizeof p, "mkdir -p '%s'", out); if (!mo && system(p)) { fprintf(stderr, "count-field: cannot create %s\n", out); return 1; }
     static const char *names[15] = {"pc", "ps", "t0", "t1", "t2", "t3", "t4", "t5", "sp", "w", "dz", "dy", "dx", "dq", "r"};
     int zarr = 0; long long ish[3] = {0, 0, 0}, ioff[3] = {0, 0, 0}, irow[2] = {0, 0}; const int into = *cf_opt(argc, argv, "--into-shape", "") != 0;
     if (into) {   /* --into-shape D,H,W --into-off Z,Y,X [--into-rows A,B]: write rows [A, B) of whole-volume pc / ps / cl arrays (global 128^3 shards) */
@@ -585,8 +590,9 @@ int cmd_count_field(int argc, char **argv) {
         zarr = into || !strcmp(fmt, "zarr") || (!strcmp(fmt, "auto") && inz && !off);
         if (zarr && (!inz || (off && !into))) { fprintf(stderr, "count-field: --format zarr needs zarr input arrays of the same box (no zarr_offset)\n"); return 2; }
         if (zarr && wwc && !strcmp(cf_opt(argc, argv, "--wc", ""), "1")) fprintf(stderr, "count-field: zarr output: no wc.f32 (raw only)\n");
+        if (mo) zarr = 0;
     }
-    const int doc = zarr ? 0 : wwc;   /* wc.f32 with raw output only */
+    const int doc = zarr || mo ? 0 : wwc;   /* wc.f32 with raw output only */
     const int BZ = zarr ? 128 : CZ; if (zarr && CZ > BZ) CZ = BZ;
     FILE *fp[15] = {0}, *fwc = nullptr, *fcl = nullptr; z3w *zw[4] = {0};
     const int spw = atoi(cf_opt(argc, argv, "--sp-w", "0")), nzp = spw ? 4 : 3;   /* --sp-w 1: sp from |grad W| (the density term agrees with the phase) */
@@ -600,7 +606,7 @@ int cmd_count_field(int argc, char **argv) {
         const int64_t zsh[3] = {into ? ish[0] : D, into ? ish[1] : H, into ? ish[2] : W}; static const char *zn[4] = {"pc", "ps", "cl", "sp"}; const int zf[4] = {128, 128, 0, 0};
         for (int k = 0; k < nzp; k++) { snprintf(p, sizeof p, "%s/%s", out, zn[k]); zw[k] = z3w_create(p, zsh, 128, 0, zf[k], "{\"ufsm\": {\"content\": \"ufsm count-field\"}}");
             if (!zw[k]) { fprintf(stderr, "count-field: %s\n", z3w_error()); return 1; } }
-    } else {
+    } else if (!mo) {
         for (int k = 0; k < 15; k++) {
             if ((k >= 10 && k < 14 && !w4d) || (k == 14 && !recto)) continue;
             snprintf(p, sizeof p, "%s/%s.raw", out, names[k]); if (!(fp[k] = fopen(p, "wb"))) { fprintf(stderr, "count-field: cannot write %s\n", p); return 1; }
@@ -618,6 +624,7 @@ int cmd_count_field(int argc, char **argv) {
     double resid[2][2] = {{0, 0}, {0, 0}};   /* UFSM_CF_RESID: plaquettes, residues (input, output) */
     const int olo = into ? (int)(irow[0] - ioff[0]) : 0, ohi = into ? (int)(irow[1] - ioff[0]) : D;   /* the box rows written */
     for (int b0 = olo; b0 < ohi; b0 += BZ) {
+        if (mo && ((b0 - olo) / BZ) % mstride) continue;   /* (--model-only: the model gauge from every mstride-th block) */
         const int b1 = b0 + BZ < ohi ? b0 + BZ : ohi; O.c0 = b0;
         if (zarr) { memset(opc, 128, (size_t)BZ * HW); memset(ops, 128, (size_t)BZ * HW); memset(ocl, 0, (size_t)BZ * HW); }
         for (int c0 = b0; c0 < b1; c0 += CZ) {
@@ -647,7 +654,7 @@ int cmd_count_field(int argc, char **argv) {
                     }
                 }
             }
-            if (!zarr) {   /* raw: one chunk = one block */
+            if (!zarr && !mo) {   /* raw: one chunk = one block */
                 const size_t nr = (size_t)(c1 - c0) * HW, off = (size_t)(c0 - a) * HW, bo = (size_t)(c0 - b0) * HW;
                 int bad = cf_wr(fp[0], opc + bo, 1, nr) || cf_wr(fp[1], ops + bo, 1, nr) || cf_wr(fcl, ocl + bo, 1, nr) || (doc && cf_wr(fwc, wc + bo, sizeof(float), nr));
                 for (int k = 2; k < 15 && !bad; k++) {
@@ -666,7 +673,7 @@ int cmd_count_field(int argc, char **argv) {
         }
     }
     if (zarr) { for (int k = 0; k < nzp; k++) if (z3w_close(zw[k])) { fprintf(stderr, "count-field: %s\n", z3w_error()); return 1; } }
-    else {
+    else if (!mo) {
         for (int k = 0; k < 15; k++) if (fp[k] && fclose(fp[k])) { fprintf(stderr, "count-field: write error %s\n", out); return 1; }
         if (fclose(fcl) || (fwc && fclose(fwc))) { fprintf(stderr, "count-field: write error %s\n", out); return 1; }
     }
@@ -681,7 +688,7 @@ int cmd_count_field(int argc, char **argv) {
             snprintf(q, sizeof q, "cp '%s/fields.json' '%s.tmp%d' && mv '%s.tmp%d' '%s'", src, p, (int)getpid(), p, (int)getpid(), p);
             if (system(q)) { fprintf(stderr, "count-field: cannot copy %s/fields.json\n", src); return 1; }
         }
-    } else {   /* fields.json (fit_fields_save_ex's keys) + "wcount" */
+    } else if (!mo) {   /* fields.json (fit_fields_save_ex's keys) + "wcount" */
         snprintf(p, sizeof p, "%s/fields.json", out); FILE *fj = fopen(p, "w"); if (!fj) return 1;
         fprintf(fj, "{%s\"origin\": [%lld, %lld, %lld], \"shape\": [%d, %d, %d], \"h\": %d, \"um\": %.9g, ", zarr ? "\"format\": \"zarr\", " : "", (long long)g.origin[0], (long long)g.origin[1], (long long)g.origin[2], D, H, W, g.h, g.um);
         if (w4d > 0) fprintf(fj, "\"w4_d\": %d, ", w4d);

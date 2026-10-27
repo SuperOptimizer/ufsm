@@ -126,6 +126,17 @@ typedef struct {
     struct fit_stream *stream;      /* GPU fits (fit_fields_load_stream): the fields already on the device and the gradient stages' pooled
                                        fields made while loading (the host fields then carry no normal planes); nullptr: fit_run_dir uploads
                                        and pools the host fields itself */
+    /* coarse-to-fine (fit --ref-model DIR: a global coarse model or set, e.g. a whole-scroll coarse fit or count-field --model; one
+       integer gauge for every block): the voxel unwrapping's integers are tied to it. ref_bias = the circular mean of U_ref - u over the
+       unwrappable voxels (the sub-turn offset between the ref and the phase). ref_snap 1: every voxel takes round(U_ref - bias - u) as its
+       integer (no flood: the integers are the ref's, the phase only the sub-turn position). uw_rep_ref W > 0 (with uw_repair): each repair
+       piece is also tied to the ref by votes round(U_ref - bias - U) from every other voxel per axis, weight W x confidence (an L1 median
+       over the piece: the ref decides the integer offsets the phase votes leave open; the base integer at the flood's seed from the ref;
+       the pieces start at their votes' weighted median; slow: one max flow ~10 min on a slab). ref_snap 2 with uw_rep_ref > 0: the flood,
+       then each repair piece (uw_repair^3 tiles) shifted to that weighted median and no L1 moves (a per-piece snap: the phase keeps the
+       integers inside a piece, the ref sets each piece's offset) */
+    const struct fit_set *ref; double ref_off[3];   /* point p of this box is p + ref_off in the ref's box */
+    int ref_snap; float uw_rep_ref;
     int verbose;
 } fit_cfg;
 
@@ -256,7 +267,7 @@ int fit_stream_verify(const fit_stream *s, const fit_fields *f);   /* the device
 int fit_stream_fps(const fit_cfg *c, int h, int fps[8]);
 
 /* a fit set: the global model plus z-slab models whose interiors [z0, z1) (box-local native z of the global box) partition it */
-typedef struct { fit_model *global; int n; fit_model **slab; double *z0, *z1, blend; } fit_set;   /* blend: W blended linearly over +-blend around slab boundaries */
+typedef struct fit_set { fit_model *global; int n; fit_model **slab; double *z0, *z1, blend; } fit_set;   /* blend: W blended linearly over +-blend around slab boundaries */
 const fit_model *fit_set_model(const fit_set *s, double z, double *zoff);   /* the model for box-local z, and its z offset */
 double fit_set_W(const fit_set *s, double z, double y, double x);
 int fit_set_ray_root(const fit_set *s, double z, double theta, double k, double r_hint, double *r);   /* fit_ray_root of the set (global box, axis, pitch) */

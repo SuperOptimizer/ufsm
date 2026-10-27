@@ -165,9 +165,11 @@ int fit_init_prior(const fit_fields *f, const fit_cfg *c, fit_model *m) {
             const double cy = axis_lerp(f->cy, na, pz), cx = axis_lerp(f->cx, na, pz), py = (y + 0.5) * h, px = (x + 0.5) * h;
             v[ns++] = (fit_sample){hypot(py - cy, px - cx), atan2(py - cy, px - cx), f->w[i] / 255.0, mc + I * ms};
         }
-        if (!nsp || !ns) { pk[k] = -1; continue; }
+        const int gonly = c->phase_stage >= c->nstage;   /* a gradient-only fit (fit --coarse-pool: pooled phase carries nothing): */
+        if (!nsp || (!ns && !gonly)) { pk[k] = -1; continue; }
         qsort(sps, nsp, sizeof(float), cmp_f);
         const double p0 = sps[nsp / 2];
+        if (!ns) { pk[k] = p0; continue; }   /* the pitch from the spacing alone (offset 0: the gradient terms set no gauge) */
         double bestc = -1, bestp = p0, cc[71];
         { coh_job J = {v, ns, p0, cc}; fit_zpar(71, fit_nthreads(71), coh_run, &J); }   /* the 71 trial pitches on threads */
         for (int s = 0; s <= 70; s++) { const double p = p0 * (0.7 + 0.01 * s); if (cc[s] > bestc) { bestc = cc[s]; bestp = p; } }
@@ -308,7 +310,15 @@ typedef struct {
     _Atomic size_t over;                   /* integers more than 16383 turns from the seed (left unreached) */
     float qb[64]; size_t sb[64];            /* per thread: the best confidence and its voxel */
     double *acc, *wsum;
+    double rbias;                          /* fit_cfg ref: the sub-turn offset U_ref - u (turns) */
+    double complex rph[64]; double rpw[64]; /* per thread: its phasor sums */
 } uw_ctx;
+/* the ref model's (fit_cfg ref) U at a field voxel: W_ref at the same point of its box plus dir theta / 2 pi about this box's axis */
+static double uw_Uref(const uw_ctx *x, int z, int y, int xx) {
+    const fit_fields *f = x->f; const fit_cfg *c = x->c; const double pz = (z + 0.5) * f->h, py = (y + 0.5) * f->h, px = (xx + 0.5) * f->h;
+    const double th = atan2(py - axis_lerp(f->cy, x->na, pz), px - axis_lerp(f->cx, x->na, pz));
+    return fit_set_W(c->ref, pz + c->ref_off[0], py + c->ref_off[1], px + c->ref_off[2]) + x->m->dir * th / (2 * M_PI);
+}
 /* the records: fresh anonymous zero pages (= UK_UNSET, bk 0), written only where a voxel can be unwrapped. Up to UFSM_UW_HUGE_GB (default 0: never; huge pages stall in direct compaction when memory is fragmented, 15 s seen on a 10 M-voxel box)
    on transparent huge pages (the flood is memory-latency bound: fewer TLB misses), above that on 4 KB pages (one 8^3 brick per page),
    so a full cross-section (~6% of its voxels reached) takes the bricks with material, not 8 B per voxel; *base / *len: the mapping
@@ -379,6 +389,25 @@ static void uw_seedmodel(void *a, int z0, int z1, int t) {   /* the seed model's
             const int32_t kr = (int32_t)round(Us - v->uw) - x->kb;
             if (kr > UK_UNSET && kr <= INT16_MAX) v->k = (int16_t)kr; else atomic_fetch_add(&x->over, 1);
         }
+    }
+}
+static void uw_refbias(void *a, int z0, int z1, int t) {   /* fit_cfg ref: phasor sums of U_ref - u over every other z row, every 4th y / x */
+    uw_ctx *x = a; const fit_fields *f = x->f; double complex s = 0; double w = 0;
+    for (int z = z0; z < z1; z++) {
+        if (z & 1) continue;
+        for (int y = 0; y < f->H; y += 4) for (int xx = 0; xx < f->W; xx += 4) {
+            const uw_vox *v = &x->V[ub_id(&x->g, z, y, xx)]; if (!v->bk) continue;
+            s += v->bk * cexp(2 * M_PI * I * (uw_Uref(x, z, y, xx) - v->uw)); w += v->bk;
+        }
+    }
+    x->rph[t] = s; x->rpw[t] = w;
+}
+static void uw_refsnap(void *a, int z0, int z1, int t) {   /* fit_cfg ref_snap: every unwrappable voxel's integer from the ref */
+    uw_ctx *x = a; (void)t;
+    for (int z = z0; z < z1; z++) for (int y = 0; y < x->f->H; y++) for (int xx = 0; xx < x->f->W; xx++) {
+        uw_vox *v = &x->V[ub_id(&x->g, z, y, xx)]; if (!v->bk) continue;
+        const int32_t kr = (int32_t)round(uw_Uref(x, z, y, xx) - x->rbias - v->uw) - x->kb;
+        if (kr > UK_UNSET && kr <= INT16_MAX) v->k = (int16_t)kr; else atomic_fetch_add(&x->over, 1);
     }
 }
 static void uw_accum(void *a, int z0_, int z1_, int t) {   /* thread t owns lattice z planes [lz t / nt, lz (t + 1) / nt): no shared nodes */
@@ -669,6 +698,7 @@ typedef struct {
     double qpow, sst;                       /* vote weight: confidence power, stretch scale (0 off) */
     uint8_t *bad;                           /* per record (sst > 0): the stretch weight < 1/2 (pieces do not join such voxels to others) */
     float *lst; int sr;                     /* per record (sst > 0): log2 of the phase stretch; its box radius */
+    uint32_t anchor; double wref;           /* fit_cfg uw_rep_ref: the ref anchor node (the piece count) and the vote weight (0 off) */
 } uwr_ctx;
 static inline uint32_t uwr_gid(const uwr_ctx *u, int z, int y, int xx, uint32_t id) {
     const int t = (((z + u->o) / u->T) * u->nty + (y + u->o) / u->T) * u->ntx + (xx + u->o) / u->T; return u->tbase[t] + u->comp[id] - 1;
@@ -800,6 +830,10 @@ static void uwr_tiles(void *a, int z0_, int z1_, int th) {
                 if (u->c->emb && u->c->uw_rep_emb > 0 && z % u->c->uw_rep_emb_sub == 0 && y % u->c->uw_rep_emb_sub == 0 && xx % u->c->uw_rep_emb_sub == 0) uwr_emb(u, th, z, y, xx, i, ga, ui);
                 /* evidence: votes between voxels farther apart (every other voxel per axis) */
                 if ((z | y | xx) & 1) continue;
+                if (u->wref > 0) {   /* the ref anchor: this voxel's integer offset to the ref (s_anchor - s_piece = -offset) */
+                    const double r = uw_Uref(x, z, y, xx) - x->rbias - (ui + x->kb); const int64_t wv = llround(u->wref * V[i].bk);
+                    if (wv >= 1) uwr_vote(u, th, ga, u->anchor, -(int32_t)lround(r), wv);
+                }
                 const fit_fields *f = x->f; const size_t fi = ((size_t)z * f->H + y) * f->W + xx;
                 for (int ev = 0; ev < 3; ev++) {
                     const double wt = ev == 0 ? u->ww4 : ev == 1 ? u->wgeo : u->wcs; if (wt <= 0) continue;
@@ -897,11 +931,12 @@ static void uw_repair1(uw_ctx *x, size_t nr, const fit_cfg *c, int o_) {
     if (np >= UINT32_MAX) { fprintf(stderr, "fit: too many repair pieces (skipped)\n"); free(u.comp); free(u.npc); free(u.tbase); free(u.seam); free(u.bad); free(u.lst); return; }
     u.gd = c->uw_rep_gd > 0 ? c->uw_rep_gd : 8; u.wgeo = c->uw_rep_geo; u.wcs = f->cs ? c->uw_rep_cs : 0;
     u.ww4 = f->wd[0] && f->wd[1] && f->wd[2] && f->wd[3] && f->w4_d > 0 ? c->uw_rep_w4 : 0; u.w4c = (int)lround(f->w4_d / f->h);
+    if (c->ref && c->uw_rep_ref > 0) { u.anchor = (uint32_t)np; u.wref = c->uw_rep_ref; }
     u.pass = 1; atomic_store(&u.next, 0); fit_zpar(x->nt, x->nt, uwr_tiles, &u);
     size_t nv = 0; for (int t = 0; t < x->nt; t++) nv += u.nv[t];
     l1_vote *v = malloc((nv ? nv : 1) * sizeof *v); nv = 0;
     for (int t = 0; t < x->nt; t++) { if (u.nv[t]) memcpy(v + nv, u.v[t], u.nv[t] * sizeof *v); nv += u.nv[t]; free(u.v[t]); }
-    uint32_t nn = (uint32_t)np; size_t na = 0;   /* the seed anchor: node np, tied to each piece holding seeded voxels (shift 0 wanted) */
+    uint32_t nn = (uint32_t)np + (u.wref > 0); size_t na = 0;   /* the seed anchor: node np, tied to each piece holding seeded voxels (shift 0 wanted) */
     if (c->seed && c->uw_rep_seed > 0 && np) {
         int64_t *aw = calloc(np, sizeof *aw);
         if (aw) {
@@ -926,7 +961,22 @@ static void uw_repair1(uw_ctx *x, size_t nr, const fit_cfg *c, int o_) {
     }
     const double t1 = nn_wall_seconds();
     int32_t *s = calloc(nn ? nn : 1, sizeof *s); l1_stats st = {0};
-    if (l1_solve(nn, v, nv, s, 256, &st)) fprintf(stderr, "fit: out of memory for the slip repair's solve (skipped)\n");
+    if (u.wref > 0 && s) {   /* start each piece at its anchor votes' weighted median (the ref's integers): the flood's count can sit many
+                                turns off the ref, and +-1 moves from 0 would take as many max flows (the merged votes: sorted by a, b, d) */
+        size_t i = 0, ns0 = 0;
+        while (i < nv) {
+            const uint32_t a = v[i].a; size_t j = i; int64_t tw = 0;
+            while (j < nv && v[j].a == a) { if (v[j].b == u.anchor) tw += v[j].w; j++; }
+            if (tw > 0 && a < np) {
+                int64_t cw = 0;
+                for (size_t q = i; q < j; q++) if (v[q].b == u.anchor) { cw += v[q].w; if (2 * cw >= tw) { s[a] = -v[q].d; ns0 += s[a] != 0; break; } }
+            }
+            i = j;
+        }
+        if (c->verbose) fprintf(stderr, "fit: slip repair: %zu of %llu pieces start at the ref's integers\n", ns0, (unsigned long long)np);
+    }
+    if (c->ref_snap == 2 && u.wref > 0) { if (c->verbose) fprintf(stderr, "fit: slip repair: --ref-snap 2: each piece at its ref median, no L1 moves\n"); }
+    else if (l1_solve(nn, v, nv, s, 256, &st)) fprintf(stderr, "fit: out of memory for the slip repair's solve (skipped)\n");
     if (st.capped) fprintf(stderr, "fit: slip repair: the max-flow work budget stopped the moves after %d max flows (%d moves, L1 %lld -> %lld, %.1fs); the last move's integers kept\n", st.iters, st.moves, (long long)st.e0, (long long)st.e1, st.secs);
     if (nn > np) { const int32_t s0 = s[np]; for (uint64_t k = 0; k < np; k++) s[k] -= s0; }   /* the anchor's gauge */
     if (c->verbose && na) fprintf(stderr, "fit: slip repair: %zu pieces anchored to the seed model's integers (weight %g)\n", na, (double)c->uw_rep_seed);
@@ -1206,10 +1256,21 @@ static size_t fit_unwrap_voxels(fit_model *m, const fit_fields *f, double min_co
             const int z = (int)(seed / ((size_t)f->H * f->W)), y = (int)((seed / f->W) % f->H), xx = (int)(seed % f->W);
             const double pz = (z + 0.5) * f->h, py = (y + 0.5) * f->h, px = (xx + 0.5) * f->h;
             const double th = atan2(py - axis_lerp(f->cy, na, pz), px - axis_lerp(f->cx, na, pz));
-            const double Ub = (c->seed ? fit_W(c->seed, pz + c->seed_off, py, px) : fit_W(m, pz, py, px)) + m->dir * th / (2 * M_PI);
+            if (c->ref) {   /* the sub-turn offset between the ref and the phase */
+                fit_zpar(f->D, x.nt, uw_refbias, &x);
+                double complex s = 0; double w = 0; for (int t = 0; t < x.nt; t++) { s += x.rph[t]; w += x.rpw[t]; }
+                x.rbias = cabs(s) > 0 ? carg(s) / (2 * M_PI) : 0;
+                if (c->verbose) fprintf(stderr, "fit: ref model: sub-turn offset U_ref - phase %+.3f turn (coherence %.3f)%s\n", x.rbias, w > 0 ? cabs(s) / w : 0,
+                                        c->ref_snap ? ", integers snapped to the ref" : "");
+            }
+            const double Ub = (c->ref ? uw_Uref(&x, z, y, xx) - x.rbias : (c->seed ? fit_W(c->seed, pz + c->seed_off, py, px) : fit_W(m, pz, py, px)) + m->dir * th / (2 * M_PI));
             x.kb = (int32_t)round(Ub - V[ub_id(&g, z, y, xx)].uw) - UK_BIAS;
         }
-        if (c->uw_split > 0 && !c->seed) reached = uw_two_level(&x, c->uw_split, c->uw_tile > 0 ? c->uw_tile : 256, nr, c->verbose);
+        if (c->ref && c->ref_snap == 1) {   /* the ref's integers everywhere, no flood */
+            fit_zpar(f->D, x.nt, uw_refsnap, &x);
+            for (size_t i = 0; i < nr; i++) reached += V[i].bk && V[i].k != UK_UNSET;
+        }
+        else if (c->uw_split > 0 && !c->seed && !c->ref) reached = uw_two_level(&x, c->uw_split, c->uw_tile > 0 ? c->uw_tile : 256, nr, c->verbose);
         else {
             if (c->seed) {
                 fit_zpar(f->D, x.nt, uw_seedmodel, &x);
@@ -1222,7 +1283,7 @@ static size_t fit_unwrap_voxels(fit_model *m, const fit_fields *f, double min_co
                 const int z = (int)(seed / ((size_t)f->H * f->W)), y = (int)((seed / f->W) % f->H), xx = (int)(seed % f->W);
                 const double pz = (z + 0.5) * f->h, py = (y + 0.5) * f->h, px = (xx + 0.5) * f->h;
                 const double th = atan2(py - axis_lerp(f->cy, na, pz), px - axis_lerp(f->cx, na, pz));
-                const double Um = fit_W(m, pz, py, px) + m->dir * th / (2 * M_PI);
+                const double Um = c->ref ? uw_Uref(&x, z, y, xx) - x.rbias : fit_W(m, pz, py, px) + m->dir * th / (2 * M_PI);
                 const uint32_t sid = ub_id(&g, z, y, xx); const int32_t ks = (int32_t)round(Um - V[sid].uw) - x.kb;
                 if (c->uw_msf && !c->seed) rm = uw_msf(&x, nr, sid, ks, c->verbose);   /* the parallel spanning forest (seeded fits: the flood) */
                 if (rm == (size_t)-1) { V[sid].k = (int16_t)ks; reached = 1; uq_push(&q, sid, V[sid].bk); }

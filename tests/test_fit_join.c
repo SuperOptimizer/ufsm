@@ -1,7 +1,8 @@
 /* ufsm fit-join (src/fitjoin.c): two independent z-slab fits of one synthetic spiral field box (overlapping in z, the second with an
    extra integer gauge of +3 turns) joined into one fit set: the shift is found from the overlap alone and the joined set's W is one
    integer gauge from the true W over the whole box (winding ids >= 99%). Also fit_set_upload with more than 63 slabs: the GPU grid
-   evaluation of a 70-slab set equals the CPU one. */
+   evaluation of a 70-slab set equals the CPU one. Coarse-to-fine: a whole-box fit as the global ref: fit-join --ref --chain-w 0 (the
+   gauges from the ref alone) is one gauge too, and a slab fitted with --ref-model / --ref-snap 1 takes the ref's integers (>= 99%). */
 #include "fit.h"
 #include "nn.h"
 #include <math.h>
@@ -92,6 +93,49 @@ int main(void) {
         for (int k = 0; k < 70; k++) fit_free(T.slab[k]);
         free(T.slab); free(T.z0); free(T.z1);
         fit_set_free(S);
+    }
+    {   /* coarse-to-fine: the whole box fitted as the ref */
+        char ref[300], out2[300]; snprintf(ref, sizeof ref, "%s/ref", dir); snprintf(out2, sizeof out2, "%s/set2", dir);
+        fit_fields_skip_planes(0); fit_fields_ct_planes(3);   /* (fit-join left its pc ps w-only plane selection set in this process) */
+        fit_fields_buf b; CHECK(!fit_fields_load(dir, 0, 0, 1, &b), "load the box");
+        fit_cfg c = fit_cfg_default(); c.verbose = 0; c.dir = 1; c.um = b.um;
+        fit_model *m = fit_run(&b.f, &c); CHECK(m != nullptr, "fit the ref"); if (!m) return 1;
+        for (int d = 0; d < 3; d++) m->origin[d] = b.origin[d];
+        m->um = b.um; for (int q = 0; q < m->nk; q++) m->offset[q] -= 5;   /* (any gauge) */
+        CHECK(!fit_save(m, ref), "save the ref"); fit_free(m); fit_fields_free(&b);
+        char *av2[] = {"ufsm", "fit-join", out2, dir, "--ref", ref, "--chain-w", "0", m0, "0", "256", m1, "256", "512"};
+        CHECK(cmd_fit_join(14, av2) == 0, "fit-join --ref");
+        fit_set *S2 = fit_set_load(out2), *R = fit_set_load(ref); CHECK(S2 && R, "load the ref join / the ref");
+        if (S2 && R) {   /* the joined set vs the ref: one integer everywhere */
+            long hist[81] = {0}; size_t nd = 0;
+            for (size_t i = 0; i < n; i += 3) {
+                if (!a[9][i]) continue;
+                const int z = (int)(i / ((size_t)H * W)), y = (int)((i / W) % H), x = (int)(i % W); const double pz = (z + 0.5) * H8, py = (y + 0.5) * H8, px = (x + 0.5) * H8;
+                const long k = lround(fit_set_W(S2, pz, py, px) - fit_set_W(R, pz, py, px)); if (k >= -40 && k <= 40) hist[k + 40]++; nd++;
+            }
+            long best = 0; for (int k = 0; k < 81; k++) if (hist[k] > best) best = hist[k];
+            printf("fit-join --ref --chain-w 0: share of one integer vs the ref %.4f\n", nd ? (double)best / nd : 0);
+            CHECK(nd && (double)best / nd >= 0.99, "fit-join --ref: one integer on %.4f < 0.99", nd ? (double)best / nd : 0);
+            /* a slab fitted with its integers snapped to the ref */
+            fit_fields_skip_planes(0); fit_fields_ct_planes(3);
+            fit_fields_buf sb; CHECK(!fit_fields_load(dir, rows[1][0], rows[1][1], 1, &sb), "load slab 1");
+            fit_cfg cs = fit_cfg_default(); cs.verbose = 0; cs.dir = 1; cs.um = sb.um; cs.ref = R; cs.ref_snap = 1;
+            for (int d = 0; d < 3; d++) cs.ref_off[d] = (double)(sb.origin[d] - R->global->origin[d]);
+            fit_model *ms = fit_run(&sb.f, &cs); CHECK(ms != nullptr, "fit --ref-snap");
+            if (ms) {
+                size_t ns = 0, ok = 0;
+                for (size_t i = 0; i < (size_t)(rows[1][1] - rows[1][0]) * H * W; i += 3) {
+                    if (!sb.f.w[i]) continue;
+                    const int z = (int)(i / ((size_t)H * W)), y = (int)((i / W) % H), x = (int)(i % W); const double pz = (z + 0.5) * H8, py = (y + 0.5) * H8, px = (x + 0.5) * H8;
+                    ok += lround(fit_W(ms, pz, py, px) - fit_set_W(R, pz + cs.ref_off[0], py, px)) == 0; ns++;
+                }
+                printf("fit --ref-snap 1: the ref's integer on %.4f of the slab's voxels\n", ns ? (double)ok / ns : 0);
+                CHECK(ns && (double)ok / ns >= 0.99, "fit --ref-snap: the ref's integer on %.4f < 0.99", ns ? (double)ok / ns : 0);
+                fit_free(ms);
+            }
+            fit_fields_free(&sb);
+        }
+        fit_set_free(S2); fit_set_free(R);
     }
     snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir); if (system(cmd)) fprintf(stderr, "(could not remove %s)\n", dir);
     if (fails) { fprintf(stderr, "test_fit_join: %d failure(s)\n", fails); return 1; }
