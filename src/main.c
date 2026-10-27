@@ -243,17 +243,17 @@ static int cmd_regions(store *s, const char *key) {
     return 0;
 }
 
-/* ---- axis: per-z centroid of the masked CT at a coarse level, written as umbilicus control points ---- */
+/* ---- axis: per-z centroid of the masked CT at a coarse level, written as umbilicus control points ----
+   The coarsest EXISTING level whose slices are still >= 128 wide (levels may be missing: the u0 copies hold L and L+2..), read one
+   inner-chunk row (128 z rows) at a time: memory ~ 128 x Y x X of that level (a full-resolution shard row was ~70 GB). */
 static int cmd_axis(store *s, const char *key, const char *out, const char *cache) {
-    z3_level lv[16];
-    int nl = z3_group_levels(s, key, lv, 16);
     z3 *z = nullptr;
     int level = -1;
-    for (int l = 0; l < (nl > 0 ? nl : MAXLEV); l++) {   /* coarsest level whose slices are still >= 128 wide */
+    for (int l = 0; l < MAXLEV; l++) {   /* numeric level paths, factor 2 each; absent ones skipped */
         char ak[1200];
         snprintf(ak, sizeof ak, "%s/%d", key, l);
         z3 *t = z3_open(s, ak, cache);
-        if (!t) break;
+        if (!t) continue;
         if (z && z3_meta_of(t)->shape[1] < 128) { z3_close(t); break; }
         z3_close(z);
         z = t;
@@ -262,15 +262,17 @@ static int cmd_axis(store *s, const char *key, const char *out, const char *cach
     if (!z) { fprintf(stderr, "axis: no readable level under %s\n", key); return 1; }
     const z3_meta *m = z3_meta_of(z);
     int64_t Z = m->shape[0], Y = m->shape[1], X = m->shape[2];
-    fprintf(stderr, "axis: level %d, %lld x %lld x %lld\n", level, (long long)Z, (long long)Y, (long long)X);
-    uint8_t *slab = malloc((size_t)m->shard[0] * Y * X);
+    const int64_t R = m->chunk[0] > 0 ? m->chunk[0] : 128;
+    fprintf(stderr, "axis: level %d, %lld x %lld x %lld, %lld rows per read\n", level, (long long)Z, (long long)Y, (long long)X, (long long)R);
+    uint8_t *slab = malloc((size_t)R * Y * X);
+    if (!slab) { fprintf(stderr, "axis: no memory for %lld rows\n", (long long)R); return 1; }
     FILE *f = fopen(out, "w");
     if (!f) { fprintf(stderr, "cannot write %s\n", out); return 1; }
     fprintf(f, "{\"control_points\":[");
     int n = 0;
     double scale = (double)(1 << level);
-    for (int64_t z0 = 0; z0 < Z; z0 += m->shard[0]) {
-        int64_t nz = z0 + m->shard[0] > Z ? Z - z0 : m->shard[0];
+    for (int64_t z0 = 0; z0 < Z; z0 += R) {
+        int64_t nz = z0 + R > Z ? Z - z0 : R;
         int64_t o[3] = {z0, 0, 0}, cnt[3] = {nz, Y, X};
         if (z3_read(z, o, cnt, slab, 0)) { fprintf(stderr, "axis: %s\n", z3_error()); return 1; }
         for (int64_t zi = 0; zi < nz; zi += 4) {

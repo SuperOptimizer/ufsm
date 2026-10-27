@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # desk.sh: the desk side of the corpus unroll (see common.sh). Lanes (one process; restart-safe: done markers + flock claims):
-#   prep     every scroll up front, PREPPAR (6) at once: box of the scanprep mask (object cells padded one cell, 64-aligned level voxels),
+#   prep     every scroll up front, PREPPAR (3) at once: box of the scanprep mask (object cells padded one cell, 64-aligned level voxels),
 #            axis (list.tsv umbilicus or ufsm axis = per-z centroid of the masked CT)
 #   gpu 0/1  wind96 fit fields of one scroll per GPU (run3-cf predict settings) + lossless repack to 512^3 shards; waits for SPACEGB
 #   ref      count-field ref on the CPU (REFPAR (2) lanes, TH (12) threads each, nice 10 under the predicts; MemAvailable >= MEMGB 40 first)
@@ -22,7 +22,7 @@ prep() {
       for (d = 1; d <= 3; d++) { lo = (a[d] - 1) * c; if (lo < 0) lo = 0; lo = int(lo / 64) * 64; hi = (b[d] + 2) * c; if (hi > s[d]) hi = s[d]; o[d] = lo; e[d] = hi - lo }
       printf "%d,%d,%d,%d,%d,%d\n", o[1], o[2], o[3], e[1], e[2], e[3] }' > $O/box.txt
   [ -s $O/box.txt ] || return 1
-  if [ "$AXS" = auto ]; then N $U axis $R $K $O/axis.json > $O/logs/axis.log 2>&1 || return 1; else cp $AXS $O/axis.json; fi
+  if [ "$AXS" = auto ]; then MEMGB=60 memok; N $U axis $R $K $O/axis.json > $O/logs/axis.log 2>&1 || return 1; else cp $AXS $O/axis.json; fi
   log "box $(cat $O/box.txt) (level $LV, $LUM um), axis $AXS"
 }
 fields() {   # (GPU $G)
@@ -71,7 +71,7 @@ lane() {
 }
 
 for S in $LIST; do scan $S; (failed || done_ prep) && continue; ( run prep prep ) &
-  while [ $(jobs -r | wc -l) -ge ${PREPPAR:-6} ]; do sleep 5; done; done; wait
+  while [ $(jobs -r | wc -l) -ge ${PREPPAR:-3} ]; do sleep 5; done; done; wait
 for g in ${GPUS:-0 1}; do lane fields prep fields $g & done
 for k in $(seq 1 ${REFPAR:-2}); do lane ref fields ref & sleep 5; done
 lane push ref push & wait
