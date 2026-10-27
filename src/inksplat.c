@@ -247,7 +247,7 @@ typedef struct {
     z3 *ct; z3w *w; z3 *old; vol *pred;
     double hpx; int nsub, nt; double tstep;
     pthread_mutex_t mu;
-    uint64_t n_ink, n_no, n_rej, n_hit, n_excl, cm[2][2];   /* cm[splat ink][pred ink] over the written known voxels (--pred at this level) */
+    uint64_t n_ink, n_no, n_rej, n_hit, n_excl, cm[2][2], vh[255];   /* cm[splat ink][pred ink] over the written known voxels (--pred at this level) */
     uint8_t *chunks_used; int64_t cg[3];            /* 128-chunk occupancy of the written voxels (block origins) */
     int64_t bb_lo[3], bb_hi[3];
     _Atomic int failed;
@@ -295,7 +295,7 @@ static void *splat_worker(void *arg) {
             have_old = 1;
         }
         if (!have_old) memset(buf, 255, sv);
-        uint64_t ni = 0, nn = 0, nr = 0, nh = 0, nx = 0, cm[2][2] = {{0, 0}, {0, 0}}; int any = 0;
+        uint64_t ni = 0, nn = 0, nr = 0, nh = 0, nx = 0, cm[2][2] = {{0, 0}, {0, 0}}, vh[255] = {0}; int any = 0;
         for (int ci = 0; ci < NCS * NCS * NCS; ci++) {
             acc *ac = A[ci]; if (!ac) continue;
             const int64_t co[3] = {so[0] + (ci / (NCS * NCS)) * CH, so[1] + (ci / NCS % NCS) * CH, so[2] + (ci % NCS) * CH}, cn[3] = {CH, CH, CH};
@@ -319,7 +319,7 @@ static void *splat_worker(void *arg) {
                 const int isink = ac->ni[k] && ac->ni[k] >= c->thr * h;
                 const uint8_t v = (uint8_t)(((isink ? ac->pi[k] : ac->pn[k]) * 254 + 127) / 255);
                 const size_t bi = ((size_t)(z - so[0]) * SH + (size_t)(y - so[1])) * SH + (size_t)(x - so[2]);
-                buf[bi] = buf[bi] == 255 ? v : (buf[bi] > v ? buf[bi] : v);
+                buf[bi] = buf[bi] == 255 ? v : (buf[bi] > v ? buf[bi] : v); vh[v]++;
                 if (isink) ni++; else nn++;
                 if (pb && pb[k] != c->pred_skip) cm[v >= 127][pb[k] >= c->pred_thr]++;
                 cany = 1;
@@ -333,7 +333,7 @@ static void *splat_worker(void *arg) {
         if (atomic_load(&J->failed)) break;
         if ((any || have_old) && z3w_write_shard(J->w, sz, sy, sx, buf, 2)) { fprintf(stderr, "ink-splat: %s\n", z3w_error()); atomic_store(&J->failed, 1); break; }
         pthread_mutex_lock(&J->mu);
-        J->n_ink += ni; J->n_no += nn; J->n_rej += nr; J->n_hit += nh; J->n_excl += nx;
+        J->n_ink += ni; J->n_no += nn; J->n_rej += nr; J->n_hit += nh; J->n_excl += nx; for (int q = 0; q < 255; q++) J->vh[q] += vh[q];
         for (int a = 0; a < 2; a++) for (int b = 0; b < 2; b++) J->cm[a][b] += cm[a][b];
         for (int d = 0; d < 3; d++) { if (blo[d] < J->bb_lo[d]) J->bb_lo[d] = blo[d]; if (bhi[d] > J->bb_hi[d]) J->bb_hi[d] = bhi[d]; }
         pthread_mutex_unlock(&J->mu);
@@ -640,7 +640,7 @@ int inksplat_run(const inksplat_cfg *c) {
         const double known = (double)(J.n_ink + J.n_no);
         fprintf(stderr, "ink-splat: %s: %llu hit voxels, %llu ink + %llu no-ink written, %llu below iso / masked, %llu excluded (%.1f%% on papyrus) in %.1fs\n", name,
                 (unsigned long long)J.n_hit, (unsigned long long)J.n_ink, (unsigned long long)J.n_no, (unsigned long long)J.n_rej, (unsigned long long)J.n_excl, J.n_hit ? 100.0 * known / J.n_hit : 0, snow() - t0);
-        char cmp_json[512] = "";
+        char cmp_json[8192] = "";
         if (have_pred) {
             const double tp = J.cm[1][1], fp = J.cm[1][0], fn = J.cm[0][1], tn = J.cm[0][0], tot = tp + fp + fn + tn;
             printf("# voxelwise vs prediction >= %d over the %.0f written voxels: agreement %.4f, ink IoU %.4f, precision %.4f, recall %.4f (splat ink %.0f, prediction ink %.0f)\n",
@@ -648,6 +648,11 @@ int inksplat_run(const inksplat_cfg *c) {
             snprintf(cmp_json, sizeof cmp_json, "\"voxelwise\": {\"pred_thr\": %d, \"tp\": %.0f, \"fp\": %.0f, \"fn\": %.0f, \"tn\": %.0f, \"agreement\": %.5f, \"iou\": %.5f},",
                      c->pred_thr, tp, fp, fn, tn, tot ? (tp + tn) / tot : 0, tp + fp + fn ? tp / (tp + fp + fn) : 0);
             fflush(stdout);
+        }
+        {   /* the written values of this segment (0 .. 254, before the merge): soft-label percentiles across segments */
+            size_t o = strlen(cmp_json); o += (size_t)snprintf(cmp_json + o, sizeof cmp_json - o, "\"value_hist\": [");
+            for (int q = 0; q < 255 && o < sizeof cmp_json - 32; q++) o += (size_t)snprintf(cmp_json + o, sizeof cmp_json - o, q ? ", %llu" : "%llu", (unsigned long long)J.vh[q]);
+            snprintf(cmp_json + o, sizeof cmp_json - o, "],");
         }
         /* coarse levels (known-max pooling) and the group */
         if (splat_pyramid(c, shape0)) goto out2;
