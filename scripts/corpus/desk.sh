@@ -183,5 +183,6 @@ lane flat surf flat &
 lane render ink_ready render &
 lane clean render clean &
 wait
-ssh -n $FD "touch $FDC/desk.done"
+n=0; for S in $(scrolls); do scan $S; done_ clean || failed || n=$((n + 1)); done   # (desk.done only when every scroll of list.tsv is finished or failed:
+[ $n = 0 ] && ssh -n $FD "touch $FDC/desk.done"            #  an ONLY= instance must not end forlindesk's loop)
 echo "$(date '+%m-%d %H:%M:%S') desk.sh done" >> $C/corpus.log
