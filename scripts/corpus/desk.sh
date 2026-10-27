@@ -75,6 +75,10 @@ push() {
   ssh -n $FD "mkdir -p $d/state $d/logs" && rsync -a $O/box.txt $O/axis.json $FD:$d/ && rsync -a $F/ $FD:$d/fields/ || return 1
   a=$(bytes $F); b=$(ssh -n $FD "du -sb --apparent-size $d/fields" | awk '{print $1}')
   [ "$a" = "$b" ] || { log "push: fields $a bytes here, ${b:-?} on forlindesk"; return 1; }
+  if [ -e $REF/model.json ]; then   # (a ref already computed here, e.g. by an older instance: it goes along)
+    ssh -n $FD "mkdir -p $d/state/ref.lock && echo desk > $d/state/ref.lock/owner" && rsync -a $REF/ $FD:$d/ref/ &&
+      [ "$(bytes $REF)" = "$(ssh -n $FD "du -sb --apparent-size $d/ref" | awk '{print $1}')" ] && ssh -n $FD "echo '$(date '+%F %T') desk' > $d/state/ref.ready" || return 1
+  fi
   ssh -n $FD "echo '$(date '+%F %T') $a field bytes' > $d/state/fields.ready" || return 1
   log "push: fields on forlindesk ($(awk -v b=$a 'BEGIN { printf "%.1f", b / 1e9 }') GB)"
 }
