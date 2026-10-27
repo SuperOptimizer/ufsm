@@ -46,6 +46,7 @@ CUDALIBS = -L$(CUDA)/lib64 -lcudart -lcublasLt
 SRC  = src/json.c src/checkpoint.c src/sheet.c src/store.c src/zarr3.c src/sources.c src/sample.c src/band.c src/ct_augment.c src/scan_augment.c src/spatial_augment.c src/crush.c src/scrollaug.c src/cover.c src/zarr2.c src/tiff.c src/z3w.c src/hf.c src/ingest.c src/zipr.c src/train.c src/restore.c src/restore_cli.c src/unet.c src/split.c src/predict.c src/sweep.c src/eval.c src/fit.c src/tiffw.c src/edt.c src/votes.c src/wind.c src/fuse.c src/phase_check.c
 SRC += src/surf.c src/stitch.c src/coreline.c src/coreline_check.c src/fit_ct.c src/l1pot.c
 SRC += src/fblend.c
+SRC += src/inkblend.c
 SRC += src/render.c src/imgops.c
 SRC += src/repack.c
 SRC += src/wload.c src/inkext.c src/inkext_net.c src/dinovol.c src/dinovol_net.c src/dino.c src/surfeval.c
