@@ -37,6 +37,10 @@ bytes() { du -sb --apparent-size "$@" | awk '{s += $1} END {print s + 0}'; }
 push() {   # fields, ink, the CT level, box + axis -> forlindesk C/<S>; byte-checked; then forlindesk:<S>/state/ready and the desk fields deleted
   local f=$(ssh -n $FD "df -BG --output=avail $C | tail -n 1" | tr -dc 0-9) d=$C/$S cn=$(basename $K) a b
   [ "${f:-0}" -ge ${FDGB:-250} ] || { log "push: forlindesk has ${f:-?} GB free (FDGB ${FDGB:-250})"; return 1; }
+  for a in $F/*/zarr.json; do   # predict --fit-zarr writes 128^3 shards: lossless repack to 512^3 (64x fewer files), plane by plane
+    jq -e '.chunk_grid.configuration.chunk_shape[0] == 512' $a > /dev/null && continue; b=$(dirname $a)
+    rm -rf $b.512 && N $U repack $b $b.512 512 --threads 16 > /dev/null && rm -rf $b && mv $b.512 $b || return 1
+  done
   ssh -n $FD "mkdir -p $d/state $d/logs $d/ct/$cn" || return 1
   rsync -a $O/box.txt $O/axis.json $FD:$d/ && rsync -a $F/ $FD:$d/fields/ && { [ "${INK:-1}" != 1 ] || rsync -a $O/ink.zarr/ $FD:$d/ink.zarr/; } &&
     rsync -a $R/$K/zarr.json $FD:$d/ct/$cn/ && rsync -a $R/$K/$LV/ $FD:$d/ct/$cn/$LV/ || return 1
