@@ -15,6 +15,7 @@ const ie_spec ie_specs[IE_NMODELS] = {
     {"hecate24", 64, 256, 2.399, 128, 32},
     {"hecate96", 16, 64, 9.596, 32, 8},
     {"reader3", 17, 384, 9.596, 192, 8},
+    {"ink9um", 17, 128, 9.596, 64, 8},   /* scrollprize/ink_9um: 17 of 21 (9.6 um pooled) / 28 (native 9.362) layers, 128 px, overlap 0.5 */
 };
 int ie_model_kind(const char *name) {
     for (int k = 0; k < IE_NMODELS; k++) if (!strcmp(name, ie_specs[k].name)) return k;
@@ -220,13 +221,15 @@ static int load_reader(ie_net *n, const wl_dict *W) {
 
 ie_net *ie_load(int kind, const char *weights) {
     if (kind < 0 || kind >= IE_NMODELS) return nullptr;
-    const char *sub = kind == IE_HEC24 || kind == IE_HEC96 ? "ema_model" : kind == IE_READER3 ? "model" : nullptr;
-    wl_dict *W = wl_load(weights, sub);
+    const char *sub = kind == IE_HEC24 || kind == IE_HEC96 ? "ema_model" : ie_is_koine(kind) ? "model" : nullptr;
+    wl_dict *W = nullptr;
+    if (ie_is_koine(kind)) W = wl_load(weights, "ema_model");   /* koine infer.py prefers the EMA weights when a checkpoint has them */
+    if (!W) W = wl_load(weights, sub);
     if (!W) { fprintf(stderr, "ink-ext: %s\n", wl_error()); return nullptr; }
     ie_net *n = calloc(1, sizeof *n); n->kind = kind; n->sp = ie_specs[kind];
     int rc;
     if (kind == IE_V8IN) rc = load_v8in(n, W);
-    else if (kind == IE_READER3) rc = load_reader(n, W);
+    else if (ie_is_koine(kind)) rc = load_reader(n, W);
     else {
         const double um = wl_num(W, "sampling_um", 0);
         if (um > 0 && fabs(um - (kind == IE_HEC24 ? 2.4 : 9.6)) > 0.05) { fprintf(stderr, "ink-ext: %s is a %.1f um Hecate checkpoint\n", weights, um); rc = -1; }
@@ -244,6 +247,7 @@ size_t ie_tile_bytes_gpu(int kind) {
     case IE_V8IN: return (size_t)700 << 20;
     case IE_HEC24: return (size_t)700 << 20;
     case IE_HEC96: return (size_t)40 << 20;
+    case IE_INK9UM: return (size_t)56 << 20;
     default: return (size_t)450 << 20;
     }
 }
@@ -394,7 +398,7 @@ static xt bbd_fwd(const bbd *B, xt x) {
     return h2;
 }
 static void reader_fwd(const ie_net *n, const uint8_t *tiles, int B, float *out) {
-    const int D = 17, T = 384; const size_t per = (size_t)D * T * T;
+    const int D = n->sp.D, T = n->sp.T; const size_t per = (size_t)D * T * T;
     float lo[B], hi[B], a[B], b[B];
     for (int i = 0; i < B; i++) ie_robust_params(tiles + i * per, per, &lo[i], &hi[i], &a[i], &b[i]);
     uint8_t *dev; upload_tiles(tiles, B, D, T, T, &dev);
@@ -424,9 +428,9 @@ static void reader_fwd(const ie_net *n, const uint8_t *tiles, int B, float *out)
 int ie_forward(ie_net *n, const uint8_t *tiles, int B, float *out, int logits) {
     const size_t TT = (size_t)n->sp.T * n->sp.T;
     if (n->kind == IE_V8IN) v8in_fwd(n, tiles, B, out);
-    else if (n->kind == IE_READER3) reader_fwd(n, tiles, B, out);
+    else if (ie_is_koine(n->kind)) reader_fwd(n, tiles, B, out);
     else hecate_fwd(n, tiles, B, out, logits);
     if (xnet_check("forward")) return -1;
-    if (!logits && (n->kind == IE_V8IN || n->kind == IE_READER3)) for (size_t i = 0; i < (size_t)B * TT; i++) out[i] = 1.f / (1.f + expf(-out[i]));
+    if (!logits && (n->kind == IE_V8IN || ie_is_koine(n->kind))) for (size_t i = 0; i < (size_t)B * TT; i++) out[i] = 1.f / (1.f + expf(-out[i]));
     return 0;
 }

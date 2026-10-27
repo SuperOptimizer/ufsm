@@ -541,6 +541,7 @@ test-all: $(B)/test_gpu_aug $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover 
 	python3 tests/test_ink_ext_v8in.py
 	python3 tests/test_ink_ext_hecate.py
 	python3 tests/test_ink_ext_reader3.py
+	python3 tests/test_ink_ext_ink9um.py
 	python3 tests/test_ink_ext_tiling.py
 	python3 tests/test_dinovol.py
 	python3 tests/test_dinovol_embed.py

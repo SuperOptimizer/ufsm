@@ -1,4 +1,4 @@
-/* ufsm ink-ext: external ink-detection networks (v8in, Hecate 2.4 / 9.6 um, Reader V3) ported to xnet (xnet.h), the
+/* ufsm ink-ext: external ink-detection networks (v8in, Hecate 2.4 / 9.6 um, Reader V3, scrollprize ink_9um) ported to xnet (xnet.h), the
    surface-volume render they read (from a tifxyz and the 2.4 um CT pyramid), their tiling / blending, and the ensemble.
 
    ie_net: one loaded network. ie_forward runs B tiles of uint8 surface volume (B x D x T x T, layer 0 = the first layer the
@@ -8,10 +8,13 @@
 #include <stddef.h>
 #include <stdint.h>
 
-enum { IE_V8IN = 0, IE_HEC24 = 1, IE_HEC96 = 2, IE_READER3 = 3, IE_NMODELS = 4 };
+enum { IE_V8IN = 0, IE_HEC24 = 1, IE_HEC96 = 2, IE_READER3 = 3, IE_INK9UM = 4, IE_NMODELS = 5 };
+/* the koine_machines hybrid 3D-stem / 2D U-Net family (Reader V3 384 px, scrollprize/ink_9um 128 px): one network, koine infer.py
+   tiling (overlap 0.5, hann), normalize_robust per tile */
+static inline int ie_is_koine(int kind) { return kind == IE_READER3 || kind == IE_INK9UM; }
 
 typedef struct {
-    const char *name;     /* v8in | hecate24 | hecate96 | reader3 */
+    const char *name;     /* v8in | hecate24 | hecate96 | reader3 | ink9um */
     int D, T;             /* input layers, tile edge (pixels) */
     double px_um;         /* render spacing (pixel and layer step) */
     int stride;           /* default tile stride */

@@ -176,7 +176,7 @@ static inline float ct_tri(const ctlev *L, double z, double y, double x, const u
 /* ---- the surface-volume renderer ---- */
 typedef struct {
     const isurf *S; ctlev *L; double lscale;   /* level coordinate = level-0 voxel / lscale */
-    int D, reverse, ss; double center, du;  /* center = (D - 1) / 2: layer i at offset i - center (half-integer for even D, as the published renders) */     /* grid units per model pixel */
+    int D, reverse, ss; double center, du, shift;  /* center = (D - 1) / 2: layer i at offset i - center (half-integer for even D, as the published renders); shift: + shift layers along +N (--shift) */     /* grid units per model pixel */
     double step_vox;                           /* layer / pixel step in level-0 voxels */
     int Wm, Hm;
 } irender;
@@ -193,7 +193,7 @@ static void *render_worker(void *a) {
             double tu[3], tv[3];   /* one model pixel along u / v (level-0 voxels) */
             for (int d = 0; d < 3; d++) { tu[d] = dU[d] * R->du; tv[d] = dV[d] * R->du; }
             for (int i = 0; i < R->D; i++) {
-                const double off = (R->reverse ? R->center - i : i - R->center) * R->step_vox;
+                const double off = ((R->reverse ? R->center - i : i - R->center) + R->shift) * R->step_vox;
                 double acc = 0;
                 for (int a = 0; a < ss; a++) for (int b = 0; b < ss; b++) for (int c = 0; c < ss; c++) {
                     const double ou = ss > 1 ? (a + 0.5) / ss - 0.5 : 0, ov = ss > 1 ? (b + 0.5) / ss - 0.5 : 0, on = ss > 1 ? ((c + 0.5) / ss - 0.5) * R->step_vox : 0;
@@ -212,7 +212,7 @@ static int i64cmp(const void *a, const void *b) { const int64_t p = *(const int6
 static int render_rows(const irender *R, int r0, int r1, uint8_t **rows, int nth) {
     if (r1 <= r0) return 0;
     /* the chunks: per 16 x 16 pixel block the box of its corner points +- the layer reach */
-    const double reach = (R->center + 1.5) * R->step_vox + 2 * R->du * 4 + 2;
+    const double reach = (R->center + fabs(R->shift) + 1.5) * R->step_vox + 2 * R->du * 4 + 2;
     size_t nk = 0, ck = 4096; int64_t *keys = malloc(ck * sizeof *keys);
     for (int by = r0; by < r1; by += 16) for (int bx = 0; bx < R->Wm; bx += 16) {
         double lo[3] = {1e300, 1e300, 1e300}, hi[3] = {-1e300, -1e300, -1e300}; int any = 0;
@@ -275,7 +275,7 @@ static void hann2(float *k, int T, float floor_) {   /* torch.hann_window(T, per
 static const char ell7[7][8] = {"0001000", "0111110", "1111111", "1111111", "1111111", "0111110", "0001000"};
 
 typedef struct {
-    int kind; ie_net *net; const ie_spec *sp; int stride, batch, nth, reverse, blend_norm, no_overlap; size_t ct_mem; double px_um;
+    int kind; ie_net *net; const ie_spec *sp; int stride, batch, nth, reverse, blend_norm, no_overlap; size_t ct_mem; double px_um, shift;
     ctlev lev[6]; int nlev; double lev_um[6];
     uint8_t **stk; int stk_n, stk_w, stk_h;   /* --layers: a pre-rendered stack (ascending normal offsets) instead of the renderer */
     uint8_t *dump; int dump_req, render_only;  /* --dump-layers: the rendered model-grid stack [D][Hm][Wm] (run_surface allocates) */
@@ -305,7 +305,7 @@ static void *gpu_worker(void *a) {
             for (int y = 0; y < ph; y++) for (int x = 0; x < pw; x++) {
                 const size_t g = (size_t)(G->ty[k] + y) * Wm + G->tx[k] + x; const float w = G->win[y * T + x];
                 if (X->kind == IE_V8IN) { G->num[g] += o[y * T + x] * w; G->den[g] += X->blend_norm ? w : 1.f; }
-                else if (X->kind == IE_READER3) { G->num[g] += o[y * T + x] * w; G->den[g] += w; }
+                else if (ie_is_koine(X->kind)) { G->num[g] += o[y * T + x] * w; G->den[g] += w; }
                 else {   /* Hecate: probability x support (column has data) x window; den is the renderer's */
                     int sup = 0; for (int i = 0; i < D && !sup; i++) sup = tl[((size_t)i * T + y) * T + x] != 0;
                     G->num[g] += sup ? o[y * T + x] * w : 0.f;
@@ -331,12 +331,12 @@ static float *run_surface(irun *X, const isurf *S, int *pWm, int *pHm, double *p
     const ie_spec *sp = X->sp; const int D = sp->D, T = sp->T;
     /* CT level: the coarsest not coarser than the spacing (5% slack) */
     int L = 0; for (int l = 0; l < X->nlev; l++) if (X->lev_um[l] <= X->px_um * 1.05) L = l;
-    irender R = {0}; R.S = S; R.L = &X->lev[L]; R.lscale = X->lev_um[L] / X->lev_um[0]; R.D = D; R.center = (D - 1) * 0.5; R.reverse = X->reverse;
+    irender R = {0}; R.S = S; R.L = &X->lev[L]; R.lscale = X->lev_um[L] / X->lev_um[0]; R.D = D; R.center = (D - 1) * 0.5; R.reverse = X->reverse; R.shift = X->shift;
     R.ss = (int)lround(X->px_um / X->lev_um[L]); if (R.ss < 1) R.ss = 1;
     R.du = X->px_um / (S->vox_um / S->scale); R.step_vox = X->px_um / X->lev_um[0];
     R.Wm = (int)((S->w - 1) / R.du) + 1; R.Hm = (int)((S->h - 1) / R.du) + 1;
     if (X->stk) { R.Wm = X->stk_w; R.Hm = X->stk_h; }   /* --layers: the stack's own pixel grid */
-    const int stk0 = X->stk ? X->stk_n / 2 - D / 2 : 0;   /* the D central layers (koine / hecate rule) */
+    const int stk0 = X->stk ? X->stk_n / 2 - D / 2 + (int)lround(X->shift) : 0;   /* the D central layers (koine / hecate rule), moved by --shift */
     if (X->stk && (stk0 < 0 || stk0 + D > X->stk_n)) { fprintf(stderr, "ink-ext: --layers has %d layers, %s needs %d\n", X->stk_n, sp->name, D); return nullptr; }
     const int Wm = R.Wm, Hm = R.Hm; *pWm = Wm; *pHm = Hm; *pdu = R.du;
     fprintf(stderr, "ink-ext: %s %s: %d x %d px at %.3f um, %d layers, CT level %d (%.3f um, %d^3 sub-samples)%s\n", S->name, sp->name, Wm, Hm, X->px_um, D, L, X->lev_um[L], R.ss, X->reverse ? ", reversed" : "");
@@ -351,7 +351,7 @@ static float *run_surface(irun *X, const isurf *S, int *pWm, int *pHm, double *p
     const int stride = X->no_overlap ? T : X->stride > 0 ? X->stride : sp->stride;
     if (X->no_overlap) { xs = axis_starts_koine(Wm, T, stride, &nx); ys = axis_starts_koine(Hm, T, stride, &ny); }   /* tiles at 0, T, 2T .. and the last at L - T */
     else if (X->kind == IE_V8IN) { xs = axis_starts_v8(Wm, T, stride, &nx); ys = axis_starts_v8(Hm, T, stride, &ny); }
-    else if (X->kind == IE_READER3) { xs = axis_starts_koine(Wm, T, stride, &nx); ys = axis_starts_koine(Hm, T, stride, &ny); }
+    else if (ie_is_koine(X->kind)) { xs = axis_starts_koine(Wm, T, stride, &nx); ys = axis_starts_koine(Hm, T, stride, &ny); }
     else { xs = axis_starts_hecate(Wm, T, stride, &nx); ys = axis_starts_hecate(Hm, T, stride, &ny); }
     /* rolling row buffer: rows [rb0, rb1) */
     const int RB = T + 16; uint8_t **ring = malloc(RB * sizeof *ring); for (int i = 0; i < RB; i++) ring[i] = malloc((size_t)D * Wm);
@@ -440,7 +440,7 @@ static float *run_surface(irun *X, const isurf *S, int *pWm, int *pHm, double *p
     free(G.tiles); free(G.tx); free(G.ty); pthread_mutex_destroy(&G.mu); pthread_cond_destroy(&G.cv);
     fprintf(stderr, "\rink-ext: %s %s: %lld tiles (%lld empty skipped), render %.1fs, net %.1fs (%.1f tiles/s), CT chunks decoded %llu\n", S->name, sp->name, ntiles, nskip, tr, tg, tg > 0 ? ntiles / tg : 0, (unsigned long long)X->lev[L].ndec);
     for (size_t i = 0; i < (size_t)Wm * Hm; i++) {
-        const float d = den[i]; float p = X->kind == IE_READER3 ? (d > 1e-6f ? num[i] / d : 0.f) : (d != 0 ? num[i] / d : 0.f);
+        const float d = den[i]; float p = ie_is_koine(X->kind) ? (d > 1e-6f ? num[i] / d : 0.f) : (d != 0 ? num[i] / d : 0.f);
         num[i] = !(p > 0) ? 0.f : p > 1 ? 1.f : p;
     }
     for (int i = 0; i < RB; i++) free(ring[i]);
@@ -508,17 +508,37 @@ static int raw_mode(int argc, char **argv, ie_net *net, int kind) {
 int cmd_ink_ext(int argc, char **argv) {
     const char *mname = iopt(argc, argv, "--model", nullptr), *weights = iopt(argc, argv, "--weights", nullptr);
     if (!mname || !weights) {
-        fprintf(stderr, "usage: ufsm ink-ext --model v8in|hecate24|hecate96|reader3 --weights W --surface TIFXYZ [--surface ..] --ct ROOT KEY --out DIR\n"
+        fprintf(stderr, "usage: ufsm ink-ext --model v8in|hecate24|hecate96|reader3|ink9um --weights W[,W2..] --surface TIFXYZ [--surface ..] --ct ROOT KEY --out DIR\n"
                         "         [--reverse] [--stride S] [--px-um U] [--batch B] [--gpu 0] [--threads 16] [--ct-mem 3] [--cache DIR] [--native] [--suffix S] [--prefix P]\n"
                         "         [--ct-local ROOT --local-levels 1,2] [--ct-um 2.399] [--surf-um U] [--no-overlap] [--blend official|norm] [--grid-crop c,r,w,h]\n"
                         "         [--ct-tif] [--jpeg PATH] [--jpeg-stretch] [--layers DIR [--px-crop x,y,w,h]] [--dump-layers DIR] [--render-only]\n"
-                        "       ufsm ink-ext --model M --weights W --raw-in TILES.u8 --raw-out LOGITS.f32 [--batch 2]   (parity: native tiles -> logits)\n"); return 2;
+                        "         [--shift S] [--zwin a,b,..] [--calib]\n"
+                        "       ufsm ink-ext --model M --weights W --raw-in TILES.u8 --raw-out LOGITS.f32 [--batch 2]   (parity: native tiles -> logits)\n"
+                        "  --weights W1,W2,..: an ensemble (mean probability) of checkpoints of the model (e.g. ink9um seed42 + seed43)\n"
+                        "  --shift S: every layer S layers further along +N (fractional ok; --layers: rounded, the window moves in the stack)\n"
+                        "  --zwin a,b,..: also average over these extra layer shifts (the ink_9um card's z-window ensemble, e.g. -1,0,1)\n"
+                        "  --calib: write (p - 0.25) / 0.5 clipped to [0, 1] (koine BCE label smoothing 0.5: reader3 / ink9um no-ink sits near 0.25)\n"); return 2;
     }
     const int kind = ie_model_kind(mname); if (kind < 0) { fprintf(stderr, "ink-ext: unknown model %s\n", mname); return 2; }
     if (xnet_init(atoi(iopt(argc, argv, "--gpu", "0")))) return 1;
-    const double tl = inow(); ie_net *net = ie_load(kind, weights); if (!net) return 1;
-    fprintf(stderr, "ink-ext: %s loaded from %s in %.1fs\n", mname, weights, inow() - tl);
+    enum { MAXE = 16 }; ie_net *nets[MAXE]; int nnet = 0;
+    {   /* --weights W1,W2,..: each checkpoint loaded once */
+        char wl[4096]; snprintf(wl, sizeof wl, "%s", weights);
+        for (char *sv = nullptr, *t = strtok_r(wl, ",", &sv); t && nnet < MAXE; t = strtok_r(nullptr, ",", &sv)) {
+            const double tl = inow(); nets[nnet] = ie_load(kind, t); if (!nets[nnet]) return 1;
+            fprintf(stderr, "ink-ext: %s loaded from %s in %.1fs\n", mname, t, inow() - tl); nnet++;
+        }
+        if (!nnet) { fprintf(stderr, "ink-ext: no --weights\n"); return 2; }
+    }
+    ie_net *net = nets[0];
     if (iopt(argc, argv, "--raw-in", nullptr)) return raw_mode(argc, argv, net, kind);
+    double zw[MAXE]; int nzw = 0;
+    {   /* --zwin: extra layer shifts averaged (default: 0 only) */
+        const char *z = iopt(argc, argv, "--zwin", nullptr);
+        if (z) { char zb[512]; snprintf(zb, sizeof zb, "%s", z); for (char *sv = nullptr, *t = strtok_r(zb, ",", &sv); t && nzw < MAXE; t = strtok_r(nullptr, ",", &sv)) zw[nzw++] = atof(t); }
+        if (!nzw) zw[nzw++] = 0;
+    }
+    const int calib = iflag(argc, argv, "--calib");
     int ci = -1; for (int i = 2; i + 2 < argc; i++) if (!strcmp(argv[i], "--ct")) ci = i;
     const char *outdir = iopt(argc, argv, "--out", nullptr), *cache = iopt(argc, argv, "--cache", nullptr), *suffix = iopt(argc, argv, "--suffix", "");
     const char *ldir = iopt(argc, argv, "--layers", nullptr);   /* a published surface volume (NN.tif, ascending normal offsets) instead of our render */
@@ -604,8 +624,25 @@ surfaces:;
         }
         const double t0 = inow(); int Wm, Hm; double du;
         float *ctl = nullptr; const int want_ct = iflag(argc, argv, "--ct-tif");
-        float *pm = run_surface(&X, &S, &Wm, &Hm, &du, want_ct ? &ctl : nullptr);
-        if (!pm) { rc = 1; free(ctl); isurf_free(&S); continue; }
+        /* the mean probability over the checkpoints (--weights a,b) x layer windows (--zwin); the first pass gives --ct-tif / --dump-layers */
+        const double shift0 = atof(iopt(argc, argv, "--shift", "0")); const int dreq = X.dump_req;
+        float *pm = nullptr; uint8_t *dump0 = nullptr; int npass = 0, bad = 0;
+        for (int k = 0; k < nnet && !bad; k++) for (int z = 0; z < nzw && !bad; z++) {
+            X.net = nets[k]; X.shift = shift0 + zw[z]; X.dump_req = dreq && !npass;
+            if (nnet * nzw > 1) fprintf(stderr, "ink-ext: pass %d/%d: weights %d, shift %+.2f layers\n", npass + 1, nnet * nzw, k, X.shift);
+            float *q = run_surface(&X, &S, &Wm, &Hm, &du, want_ct && !npass ? &ctl : nullptr);
+            if (!q) { bad = 1; break; }
+            if (!npass) { pm = q; dump0 = X.dump; X.dump = nullptr; }
+            else { for (size_t i = 0; i < (size_t)Wm * Hm; i++) pm[i] += q[i]; free(q); }
+            npass++;
+        }
+        X.dump = dump0; X.dump_req = dreq;
+        if (bad || !pm) { rc = 1; free(pm); free(ctl); free(X.dump); X.dump = nullptr; isurf_free(&S); continue; }
+        for (size_t i = 0; i < (size_t)Wm * Hm; i++) {
+            float v = pm[i] / npass;
+            if (calib) { v = (v - 0.25f) / 0.5f; v = v < 0 ? 0.f : v > 1 ? 1.f : v; }
+            pm[i] = v;
+        }
         if (ctl) {   /* --ct-tif: the model's surface layer on the render grid, <surf>_<model>_ct.tif */
             int cw, chh; uint8_t *cg = to_ref_grid(&S, ctl, Wm, Hm, du, &cw, &chh);
             snprintf(p, sizeof p, "%s/%s_%s%s_ct.tif", outdir, nm, mname, suffix);
@@ -781,6 +818,39 @@ int cmd_tifxyz_orient(int argc, char **argv) {
         isurf_free(&S);
     }
     return 0;
+}
+
+/* ufsm tifxyz-shards <tifxyz> --shard S [--div F] [--margin M]: the shards (S^3 on the grid of level-0 voxels / F, global indices,
+   "z y x" per line on stdout) within M level-0 voxels of any valid vertex of the surface; stderr: the shard box "z0,y0,x0,nz,ny,nx" in
+   level voxels (ufsm predict --box, with --full-grid 1 --resume 1 and the complement as predict-done-<level>.txt: only the shards a
+   surface passes through) */
+int cmd_tifxyz_shards(int argc, char **argv) {
+    if (argc < 3) { fprintf(stderr, "usage: ufsm tifxyz-shards <tifxyz> --shard S [--div F] [--margin M]\n"); return 2; }
+    isurf S; if (isurf_load(&S, argv[2])) { fprintf(stderr, "tifxyz-shards: cannot read %s\n", argv[2]); return 1; }
+    const double sh = atof(iopt(argc, argv, "--shard", "512")) * atof(iopt(argc, argv, "--div", "1")), mg = atof(iopt(argc, argv, "--margin", "32"));
+    if (!(sh > 0)) { fprintf(stderr, "tifxyz-shards: bad --shard / --div\n"); return 2; }
+    int64_t *k = nullptr; size_t n = 0, cap = 0; int64_t lo[3] = {INT64_MAX, INT64_MAX, INT64_MAX}, hi[3] = {-1, -1, -1};
+    const float *A[3] = {S.Z, S.Y, S.X};
+    for (size_t i = 0; i < (size_t)S.w * S.h; i++) {
+        if (S.Z[i] < 0) continue;
+        int64_t a[3], b[3];
+        for (int d = 0; d < 3; d++) { a[d] = (int64_t)floor((A[d][i] - mg) / sh); b[d] = (int64_t)floor((A[d][i] + mg) / sh); if (a[d] < 0) a[d] = 0; }
+        for (int64_t z = a[0]; z <= b[0]; z++) for (int64_t y = a[1]; y <= b[1]; y++) for (int64_t x = a[2]; x <= b[2]; x++) {
+            if (n == cap) { cap = cap ? cap * 2 : 4096; k = realloc(k, cap * sizeof *k); }
+            k[n++] = (z << 42) | (y << 21) | x;
+        }
+    }
+    qsort(k, n, sizeof *k, i64cmp); size_t u = 0;
+    for (size_t i = 0; i < n; i++) if (!u || k[i] != k[u - 1]) k[u++] = k[i];
+    for (size_t i = 0; i < u; i++) {
+        const int64_t c[3] = {k[i] >> 42, (k[i] >> 21) & 0x1fffff, k[i] & 0x1fffff};
+        for (int d = 0; d < 3; d++) { if (c[d] < lo[d]) lo[d] = c[d]; if (c[d] > hi[d]) hi[d] = c[d]; }
+        printf("%lld %lld %lld\n", (long long)c[0], (long long)c[1], (long long)c[2]);
+    }
+    const double s1 = atof(iopt(argc, argv, "--shard", "512"));
+    if (u) fprintf(stderr, "tifxyz-shards: %zu shards, box %.0f,%.0f,%.0f,%.0f,%.0f,%.0f\n", u, lo[0] * s1, lo[1] * s1, lo[2] * s1, (hi[0] - lo[0] + 1) * s1, (hi[1] - lo[1] + 1) * s1, (hi[2] - lo[2] + 1) * s1);
+    free(k); isurf_free(&S);
+    return u ? 0 : 1;
 }
 
 /* ufsm tifxyz-bbox <tifxyz> <image.tif> [--thresh 0] [--margin 0]: the 3D bounding box (native voxels, "z0 z1 y0 y1 x0 x1") of the

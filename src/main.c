@@ -82,11 +82,13 @@ int cmd_dino_boxes(int argc, char **argv);
 int cmd_tifxyz_map(int argc, char **argv);
 int cmd_tifxyz_orient(int argc, char **argv);
 int cmd_tifxyz_bbox(int argc, char **argv);
+int cmd_tifxyz_shards(int argc, char **argv);
 int cmd_png2jpg(int argc, char **argv);
 int cmd_tifxyz_sfc(int argc, char **argv);
 int cmd_sheet_cut(int argc, char **argv);   /* src/sheetcut.c */
 int cmd_phase_score(int argc, char **argv);
 int cmd_ink_splat(int argc, char **argv);   /* src/inksplat.c */
+int cmd_ink_score(int argc, char **argv);   /* src/inksplat.c */
 
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 static int arg_index(int argc, char **argv, const char *k) { for (int i = 2; i < argc; i++) if (!strcmp(argv[i], k)) return i; return -1; }
@@ -134,9 +136,10 @@ static int usage(void) {
         "  ufsm ink-compare <out.jpg> --ct CT.tif --ink LABEL=INK.tif ..   CT | ink panels (half-res JPEG) + ink statistics per render\n"
         "  ufsm tifxyz-sfc <src-dir> <dst-dir> [--error 0.25] [--every K]   tifxyz wraps -> surface-compressor .sfc (readers take .sfc wraps directly)\n"
         "  ufsm sheet-cut <wraps-dir> <out-dir> [--tol 0.3] [--min-cm2 0.25] [--max 8]   square flat sheets: largest isometric rectangles of each wrap\n"
-        "  ufsm ink-ext --model v8in|hecate24|hecate96|reader3 --weights W --surface TIFXYZ --ct ROOT KEY --out DIR   external ink networks on a surface\n"
+        "  ufsm ink-ext --model v8in|hecate24|hecate96|reader3|ink9um --weights W --surface TIFXYZ --ct ROOT KEY --out DIR   external ink networks on a surface\n"
         "  ufsm ink-ensemble <out.tif> --ink [W:]INK.tif ..   per-model percentile-stretched weighted mean of ink renders\n"
         "  ufsm ink-splat <out-group> --surface TIFXYZ --labels L [--mask M] --ct ROOT KEY --ct-um U --iso I [--band -4,4] ..   published 2D ink labels -> sparse 3D label zarr\n"
+        "  ufsm ink-score --surface TIFXYZ --labels L [--mask M] --map NAME=MAP.tif ..   F1 / AUC of 2D ink maps vs a segment's published labels\n"
         "  ufsm wl-dump <weights> [key]   the tensors of a safetensors / torch zip weight file\n"
         "  ufsm dinovol-embed ROOT KEY OUT --ckpt PT --box z,y,x,nz,ny,nx   scrollprize dinovol tokens / dense / ink embeddings (zarr v3)\n"
         "  ufsm hercuvit ROOT KEY OUT --ckpt PTH --box z,y,x,nz,ny,nx   HercuViT v0 sheet surface probability + per-window instance ids\n"
@@ -3824,6 +3827,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "ink-compare")) return cmd_ink_compare(argc, argv);
     if (!strcmp(cmd, "ink-ext")) return cmd_ink_ext(argc, argv);
     if (!strcmp(cmd, "ink-splat")) return cmd_ink_splat(argc, argv);
+    if (!strcmp(cmd, "ink-score")) return cmd_ink_score(argc, argv);
     if (!strcmp(cmd, "ink-ensemble")) return cmd_ink_ensemble(argc, argv);
     if (!strcmp(cmd, "wl-dump")) return cmd_wl_dump(argc, argv);
     if (!strcmp(cmd, "dinovol-embed")) return cmd_dinovol_embed(argc, argv);
@@ -3845,6 +3849,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "tifxyz-map")) return cmd_tifxyz_map(argc, argv);
     if (!strcmp(cmd, "tifxyz-orient")) return cmd_tifxyz_orient(argc, argv);
     if (!strcmp(cmd, "tifxyz-bbox")) return cmd_tifxyz_bbox(argc, argv);
+    if (!strcmp(cmd, "tifxyz-shards")) return cmd_tifxyz_shards(argc, argv);
     if (!strcmp(cmd, "png2jpg")) return cmd_png2jpg(argc, argv);
     if (!strcmp(cmd, "tifxyz-sfc")) return cmd_tifxyz_sfc(argc, argv);
     if (!strcmp(cmd, "sheet-cut")) return cmd_sheet_cut(argc, argv);

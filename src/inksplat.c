@@ -798,3 +798,85 @@ int cmd_ink_splat(int argc, char **argv) {
     if (!c.surface || !c.labels) { fprintf(stderr, "ink-splat: need --surface and --labels (or --points / --pyramid-only)\n"); return 2; }
     return inksplat_run(&c);
 }
+
+/* ufsm ink-score --surface TIFXYZ --labels L [--mask M] --map NAME=MAP.tif [--map ..] [--label-z K] [--label-scale F] [--surf-um U] [--cache DIR]
+   [--threads 8] [--row TAG]
+   2D ink maps on the surface's render grid (ufsm render / ink-ext output: pixel = canvas px = tifxyz grid / scale, uint8 p x 255)
+   scored against the segment's published 2D ink labels within its supervision mask (labels / mask >= 128, 0/1 rasters read as
+   0/255), on the label pixel grid (label px (r, c) = canvas ((c + 0.5) F - 0.5, (r + 0.5) F - 0.5), F canvas px per label px as
+   ink-splat: the label OME pixel size / mesh voxel size, else the canvas size ratio). Each label pixel takes the mean of the map
+   over its F x F canvas footprint (bilinear when F < 1.5); pixels whose surface cell is invalid are skipped. Per map: supervised
+   px, ink fraction, F1 / precision / recall at the F1-optimal threshold and at p >= 0.5 (byte >= 128), ROC AUC.
+   --row TAG: one TSV line per map "TAG name n inkfrac f1best thr f1_05 prec05 rec05 auc" on stdout. */
+int cmd_ink_score(int argc, char **argv) {
+    const char *surf = sopt(argc, argv, "--surface", nullptr), *lab = sopt(argc, argv, "--labels", nullptr), *msk = sopt(argc, argv, "--mask", nullptr);
+    const char *cache = sopt(argc, argv, "--cache", nullptr), *row = sopt(argc, argv, "--row", nullptr);
+    if (!surf || !lab || sidx(argc, argv, "--map") < 0) {
+        fprintf(stderr, "usage: ufsm ink-score --surface TIFXYZ --labels L [--mask M] --map NAME=MAP.tif [--map ..] [--label-z K] [--label-scale F] [--surf-um U] [--cache DIR] [--row TAG]\n"); return 2;
+    }
+    ssurf S; if (ssurf_load(&S, surf)) return 1;
+    { const double su = atof(sopt(argc, argv, "--surf-um", "0")); if (su > 0) S.vox_um = su; }   /* the mesh voxel size when its meta has none */
+    lsrc LL, LM; const int lz = atoi(sopt(argc, argv, "--label-z", "-1"));
+    if (lsrc_open(&LL, lab, lz, cache)) { ssurf_free(&S); return 1; }
+    if (msk && lsrc_open(&LM, msk, lz, cache)) { lsrc_close(&LL); ssurf_free(&S); return 1; }
+    if (msk && (LM.H != LL.H || LM.W != LL.W)) { fprintf(stderr, "ink-score: mask %lld x %lld != labels %lld x %lld\n", (long long)LM.W, (long long)LM.H, (long long)LL.W, (long long)LL.H); return 1; }
+    double F = atof(sopt(argc, argv, "--label-scale", "0"));
+    const double ew = S.w / S.scale, eh = S.h / S.scale;
+    if (!(F > 0)) {
+        F = 0.5 * (ew / (double)LL.W + eh / (double)LL.H);
+        const double p2 = pow(2, round(log2(F))); if (fabs(F - p2) < 0.002 * p2) F = p2;
+        if (LL.um > 0 && S.vox_um > 0) F = LL.um / S.vox_um;
+    }
+    const int nth = atoi(sopt(argc, argv, "--threads", "8"));
+    const size_t np = (size_t)LL.W * LL.H;
+    uint8_t *L = malloc(np), *M = msk ? malloc(np) : nullptr;
+    if (!L || (msk && !M) || lsrc_read(&LL, 0, 0, LL.H, LL.W, L, nth) || (msk && lsrc_read(&LM, 0, 0, LL.H, LL.W, M, nth))) { fprintf(stderr, "ink-score: label read failed\n"); return 1; }
+    uint8_t *R[2] = {L, M};
+    for (int k = 0; k < 2; k++) { if (!R[k]) continue; uint8_t mx = 0; for (size_t i = 0; i < np; i++) if (R[k][i] > mx) mx = R[k][i]; if (mx == 1) for (size_t i = 0; i < np; i++) R[k][i] *= 255; }
+    fprintf(stderr, "ink-score: %s: labels %lld x %lld, %.4g canvas px per label px (canvas %.0f x %.0f)\n", S.name, (long long)LL.W, (long long)LL.H, F, ew, eh);
+    int rc = 0;
+    for (int a = 2; a + 1 < argc; a++) {
+        if (strcmp(argv[a], "--map")) continue;
+        char nm[256]; const char *path = argv[a + 1], *eq = strchr(path, '=');
+        if (eq && eq - path < (long)sizeof nm) { snprintf(nm, sizeof nm, "%.*s", (int)(eq - path), path); path = eq + 1; } else snprintf(nm, sizeof nm, "%s", path);
+        int mw, mh; uint8_t *mp = img_read_u8(path, &mw, &mh);
+        if (!mp) { fprintf(stderr, "ink-score: cannot read %s\n", path); rc = 1; continue; }
+        uint64_t hi[256] = {0}, hn[256] = {0};
+        const int foot = F >= 1.5 ? (int)lround(F) : 0;
+        for (int64_t r = 0; r < LL.H; r++) for (int64_t c = 0; c < LL.W; c++) {
+            const size_t i = (size_t)r * LL.W + c; if (M && M[i] < 128) continue;
+            const double cx = (c + 0.5) * F - 0.5, cy = (r + 0.5) * F - 0.5;
+            double P[3], N[3]; if (ssurf_pn(&S, cx * S.scale, cy * S.scale, P, N)) continue;
+            double v;
+            if (foot) {   /* the label pixel's canvas footprint */
+                const int x0 = (int)floor(c * F), y0 = (int)floor(r * F); double s = 0; int n = 0;
+                for (int y = y0; y < y0 + foot; y++) for (int x = x0; x < x0 + foot; x++) if (x >= 0 && y >= 0 && x < mw && y < mh) { s += mp[(size_t)y * mw + x]; n++; }
+                if (!n) continue;
+                v = s / n;
+            } else {
+                if (cx < 0 || cy < 0 || cx > mw - 1 || cy > mh - 1) continue;
+                const int x0 = (int)cx, y0 = (int)cy, x1 = x0 + 1 < mw ? x0 + 1 : x0, y1 = y0 + 1 < mh ? y0 + 1 : y0; const double fx = cx - x0, fy = cy - y0;
+                v = (1 - fy) * ((1 - fx) * mp[(size_t)y0 * mw + x0] + fx * mp[(size_t)y0 * mw + x1]) + fy * ((1 - fx) * mp[(size_t)y1 * mw + x0] + fx * mp[(size_t)y1 * mw + x1]);
+            }
+            const int b = (int)lround(v); if (L[i] >= 128) hi[b]++; else hn[b]++;
+        }
+        uint64_t ti = 0, tn = 0; for (int b = 0; b < 256; b++) { ti += hi[b]; tn += hn[b]; }
+        double best = 0, bthr = 0, f05 = 0, p05 = 0, r05 = 0, wrong = 0; uint64_t tp = 0, fp = 0;
+        for (int t = 255; t >= 0; t--) {   /* predict ink where byte >= t */
+            wrong += (double)hi[t] * (fp + 0.5 * hn[t]);   /* ink pixels with no-ink ranked above them (ties half) */
+            tp += hi[t]; fp += hn[t];
+            const double pr = tp + fp ? (double)tp / (tp + fp) : 0, re = ti ? (double)tp / ti : 0, f = pr + re > 0 ? 2 * pr * re / (pr + re) : 0;
+            if (f > best) { best = f; bthr = t / 255.0; }
+            if (t == 128) { f05 = f; p05 = pr; r05 = re; }
+        }
+        const double auc = ti && tn ? 1 - wrong / ((double)ti * tn) : 0;
+        const uint64_t n = ti + tn;
+        fprintf(stderr, "ink-score: %s: %llu px, ink %.3f, F1 best %.4f (p >= %.3f), F1@0.5 %.4f (prec %.3f rec %.3f), AUC %.4f\n", nm,
+                (unsigned long long)n, n ? (double)ti / n : 0, best, bthr, f05, p05, r05, auc);
+        if (row) printf("%s\t%s\t%llu\t%.4f\t%.4f\t%.3f\t%.4f\t%.4f\t%.4f\t%.4f\n", row, nm, (unsigned long long)n, n ? (double)ti / n : 0, best, bthr, f05, p05, r05, auc);
+        fflush(stdout);
+        free(mp);
+    }
+    free(L); free(M); lsrc_close(&LL); if (msk) lsrc_close(&LM); ssurf_free(&S);
+    return rc;
+}
