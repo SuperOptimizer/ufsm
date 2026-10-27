@@ -1,13 +1,15 @@
 # scripts/corpus/common.sh: shared settings of the corpus unroll (sourced by desk.sh, laptop.sh, fd.sh). Three hosts, pipelined (user 10-27):
 #   desk (forlindesk2: 2 x 5060 Ti, 32 threads, 182 GB): prep of every scroll (mask box, axis) -> wind96 fit fields, one scroll per GPU
-#        (two at once) -> lossless repack to 512^3 shards -> count-field ref on the CPU (REFPAR at once) -> push fields + ref + box/axis to
-#        forlindesk (rsync, byte-checked) -> forlindesk:<S>/state/fields.ready (the desk keeps its fields: surf-stats needs them)
+#        (two at once) -> lossless repack to 512^3 shards -> push fields + box/axis to forlindesk (rsync, byte-checked) ->
+#        forlindesk:<S>/state/fields.ready (the desk keeps its fields: surf-stats needs their geometry); the count-field ref only as a
+#        fallback when forlindesk has a queue (lock forlindesk:<S>/state/ref.lock, then ref/ + state/ref.ready pushed)
 #        ... later: pull joined + wraps back once forlindesk:<S>/state/wraps.ready -> surf-stats --per-wrap --ct (local CT, papyrus level =
 #        the scan's Otsu) -> SLIM flatten of the NFLAT wraps with the largest area x on-papyrus share (theta sw/cm <= SWMAX, on-papyrus
 #        >= ONPAP) -> once the ink is here: upright CT | ink renders + sheets.tsv -> clean (fields). CPU stages at nice 10, MemAvailable >= 40 GB.
 #   laptop (RTX 5080): ift3-24000 ink of every scroll's box (per-scroll frozen GroupNorm, window 640 halo 64), CT read over HTTP from the
 #        public mirror (no CT copy, no chunk cache), the ink zarr pushed to the desk (byte-checked) -> desk <S>/state/ink.ready, deleted locally.
-#   forlindesk (2 x 3090, 60 GB; cannot ssh to the desk): scrolls with fields.ready in list order: snapped slab fits (one per GPU) ->
+#   forlindesk (2 x 3090, 60 GB; cannot ssh to the desk): scrolls with fields.ready in list order: the count-field ref (unless the
+#        desk holds ref.lock; then its ref.ready is waited for while other scrolls go ahead) -> snapped slab fits (one per GPU) ->
 #        fit-join --ref -> wraps (.sfc) -> state/wraps.ready; its fields and slab fits deleted.
 # Root C on each host: desk + forlindesk /vesuvius/ufsm/corpus, laptop ~/ufsm-data/corpus (scripts from the repo checkout).
 # Per scroll C/<S>: state/<stage>.done, state/failed (RETRY+1 failures: skipped; rm it to retry), logs/, run.log; corpus.log per host.

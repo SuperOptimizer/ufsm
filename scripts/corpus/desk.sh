@@ -3,9 +3,12 @@
 #   prep     every scroll up front, PREPPAR (3) at once: box of the scanprep mask (object cells padded one cell, origin on the 512-voxel
 #            grid: predict --fit-zarr slab rows are 256 cells = 512 voxels), axis (list.tsv umbilicus or ufsm axis = per-z CT centroid)
 #   gpu 0/1  wind96 fit fields of one scroll per GPU (run3-cf predict settings) + lossless repack to 512^3 shards; waits for SPACEGB
-#   ref      count-field ref on the CPU (REFPAR (2) lanes, TH (12) threads each, nice 10; MemAvailable >= MEMGB 40 first); --model-stride
-#            MSTRIDE (4): Paris 4 at 4 vs 2 (forlindesk, 10 threads each): 1:36 vs 1:54 h, ref-alone ids .1598 vs .1605, pairs .691/.295 vs .683/.296
-#   push     fields + ref + box + axis -> forlindesk (FDGB 250 free there), byte-checked -> forlindesk:<S>/state/fields.ready (fields kept here)
+#   push     fields + box + axis -> forlindesk as soon as the fields are done (FDGB 250 free there), byte-checked ->
+#            forlindesk:<S>/state/fields.ready (fields kept here); forlindesk computes the count-field ref itself before its slabs
+#   ref      fallback only (one lane): when forlindesk holds more than one pushed scroll without wraps, the desk takes a queued scroll's
+#            ref (atomic lock forlindesk:<S>/state/ref.lock, owner desk), computes it here (TH 12 threads, nice 10), pushes ref/ and writes
+#            forlindesk:<S>/state/ref.ready; --model-stride MSTRIDE (4): Paris 4 at 4 vs 2 (forlindesk, 10 threads each): 1:36 vs 1:54 h,
+#            ref-alone ids .1598 vs .1605, pairs .691/.295 vs .683/.296
 #   pull     once forlindesk:<S>/state/wraps.ready: its joined model + wraps -> here (byte-checked)
 #   surf     surf-stats --per-wrap --ct --ct-only 1 (the fields' geometry only: whole-scroll phase planes OOMed the desk at 137 GB): the on-papyrus share (max CT within +-15 um along the normal
 #            >= the scan's Otsu level, scanprep stats)
@@ -14,7 +17,8 @@
 #   render   once the laptop's ink is here (state/ink.ready): rectangles >= MINCM2 (5) upright (tifxyz-scale --flip-rows 1), CT (local) +
 #            ift3 ink at 2 px / voxel, CT | ink side-by-side JPEGs sheets/img/<w>_side.jpg, sheets/sheets.tsv sorted by cm2
 #   clean    the fields, the flatten inputs, the render tifs (keeps ref, joined, wraps, flat, sheets, ink)
-#   CPU stages (ref, surf, flat, render) run at nice 10 and wait for MemAvailable >= MEMGB (40) before they start.
+#   CPU stages (ref, surf, flat, render) run at nice 10, wait for MemAvailable >= MEMGB (40) and hold one of CPUSLOTS (2) desk-wide
+#   slots (flock C/cpu.slotN), so at most 2 of them run beside the two predicts.
 # Start (from a copy, so repo edits never touch a running instance):
 #   cd /vesuvius/ufsm/corpus && mkdir -p run && cp src/scripts/corpus/{common,desk}.sh run/ && setsid nohup bash run/desk.sh > desk.out 2>&1 < /dev/null &
 # Env: ONLY ("S1 S2"), SPACEGB (150: free desk GB before a predict), GPUS ("0 1"), WAITGPU (1: a lane waits until its GPU holds no other
@@ -50,19 +54,29 @@ fields() {   # (GPU $G)
   done
   log "fields $(du -sh $F | cut -f1)"
 }
+refq_ready() {   # the fallback: pushed here, forlindesk has > 1 pushed scroll without wraps, and nobody owns this scroll's ref yet
+  done_ push || return 1
+  local q=$(ssh -n $FD "cd $FDC; n=0; for f in */state/fields.ready; do s=\${f%%/*}; [ -e \$s/state/wraps.ready ] || [ -e \$s/state/failed ] || n=\$((n + 1)); done; echo \$n; test -e $S/state/ref.lock && echo owned" 2>/dev/null)
+  case "$q" in *owned*) done_ ref || mark ref "owned on forlindesk"; return 1;; esac; [ "${q:-0}" -gt 1 ]
+}
 ref() {
+  local d=$FDC/$S a b
+  ssh -n $FD "mkdir $d/state/ref.lock 2>/dev/null && echo desk > $d/state/ref.lock/owner" || { log "ref: forlindesk took it"; return 0; }
   rm -rf $REF
-  /usr/bin/time -v nice -n 10 $U count-field $F $O/cf.unused --R 0 --pool 8 --phase-w 4 --iters 1200 --model $REF --model-only 1 --model-stride ${MSTRIDE:-4} \
-    --threads $TH --mem-gb ${CFMEM:-24} > $O/logs/ref.log 2>&1 && [ -e $REF/model.json ]
+  if ! /usr/bin/time -v nice -n 10 $U count-field $F $O/cf.unused --R 0 --pool 8 --phase-w 4 --iters 1200 --model $REF --model-only 1 --model-stride ${MSTRIDE:-4} \
+       --threads $TH --mem-gb ${CFMEM:-24} > $O/logs/ref.log 2>&1 || [ ! -e $REF/model.json ]; then ssh -n $FD "rm -rf $d/state/ref.lock"; return 1; fi   # (forlindesk may take it then)
+  rsync -a $REF/ $FD:$d/ref/ || return 1; a=$(bytes $REF); b=$(ssh -n $FD "du -sb --apparent-size $d/ref" | awk '{print $1}')
+  [ "$a" = "$b" ] || { log "ref push: $a bytes here, ${b:-?} on forlindesk"; return 1; }
+  ssh -n $FD "echo '$(date '+%F %T') desk' > $d/state/ref.ready" && log "ref: computed here, on forlindesk"
 }
 push() {
-  local f=$(ssh -n $FD "df -BG --output=avail $FDC | tail -n 1" | tr -dc 0-9) d=$FDC/$S a b p
+  local f=$(ssh -n $FD "df -BG --output=avail $FDC | tail -n 1" | tr -dc 0-9) d=$FDC/$S a b
   [ "${f:-0}" -ge ${FDGB:-250} ] || { log "push: forlindesk has ${f:-?} GB free (FDGB ${FDGB:-250})"; return 1; }
-  ssh -n $FD "mkdir -p $d/state $d/logs" && rsync -a $O/box.txt $O/axis.json $FD:$d/ && rsync -a $F/ $FD:$d/fields/ && rsync -a $REF/ $FD:$d/ref/ || return 1
-  for p in fields ref; do a=$(bytes $O/$p); b=$(ssh -n $FD "du -sb --apparent-size $d/$p" | awk '{print $1}')
-    [ "$a" = "$b" ] || { log "push: $p $a bytes here, ${b:-?} on forlindesk"; return 1; }; done
-  ssh -n $FD "echo '$(date '+%F %T') $(bytes $F) field bytes' > $d/state/fields.ready" || return 1
-  log "push: fields + ref on forlindesk"
+  ssh -n $FD "mkdir -p $d/state $d/logs" && rsync -a $O/box.txt $O/axis.json $FD:$d/ && rsync -a $F/ $FD:$d/fields/ || return 1
+  a=$(bytes $F); b=$(ssh -n $FD "du -sb --apparent-size $d/fields" | awk '{print $1}')
+  [ "$a" = "$b" ] || { log "push: fields $a bytes here, ${b:-?} on forlindesk"; return 1; }
+  ssh -n $FD "echo '$(date '+%F %T') $a field bytes' > $d/state/fields.ready" || return 1
+  log "push: fields on forlindesk ($(awk -v b=$a 'BEGIN { printf "%.1f", b / 1e9 }') GB)"
 }
 wraps_ready() { ssh -n $FD "test -e $FDC/$S/state/wraps.ready"; }
 pull() {
@@ -115,6 +129,8 @@ clean() { rm -rf $F $O/flat/orig $O/sheets/r/*/*.tif; ssh -n $FD "rm -rf $FDC/$S
 
 # a lane: LANE STAGE NEED FN [G]: every scroll of LIST whose NEED holds (a stage name: its done marker; a function name ending in _ready;
 # -: always) and STAGE is not done, claimed; until no scroll is left
+cpu_slot() {   # one of CPUSLOTS (2) desk-wide CPU slots for the heavy CPU stages (flock on fd 7)
+  local i; while :; do for i in $(seq 1 ${CPUSLOTS:-2}); do exec 7> $C/cpu.slot$i; flock -n 7 && return 0; done; exec 7>&-; sleep 30; done; }
 lane() {
   local st=$1 need=$2 fn=$3 left; G=${4:-}
   while ! stopped; do
@@ -126,9 +142,9 @@ lane() {
       case $st in
         fields) while [ "${WAITGPU:-1}" = 1 ] && nvidia-smi -i $G --query-compute-apps=pid --format=csv,noheader | grep -q .; do sleep 60; done
                 while [ $(freegb) -lt ${SPACEGB:-150} ]; do log "fields waits: $(freegb) GB free (SPACEGB ${SPACEGB:-150})"; sleep 600; done;;
-        ref|surf|flat|render) memok;;
+        ref|surf|flat|render) memok; cpu_slot;;
       esac
-      run $st $fn; unclaim
+      run $st $fn; unclaim; exec 7>&-   # (fd 7: the CPU slot, if held)
     done
     [ $left = 0 ] && break; sleep 60
   done
@@ -137,8 +153,8 @@ lane() {
 for S in $LIST; do scan $S; (failed || done_ prep) && continue; ( run prep prep ) &
   while [ $(jobs -r | wc -l) -ge ${PREPPAR:-3} ]; do sleep 5; done; done; wait
 for g in ${GPUS:-0 1}; do lane fields prep fields $g & done
-for k in $(seq 1 ${REFPAR:-2}); do lane ref fields ref & sleep 5; done
-lane push ref push &
+lane push fields push &
+lane ref refq_ready ref &
 lane pull wraps_ready pull &
 lane surf pull surf &
 lane flat surf flat &

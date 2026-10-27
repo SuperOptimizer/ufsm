@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # fd.sh: the forlindesk side of the corpus unroll (see common.sh). Loop, in list.tsv order: the next scroll with state/fields.ready (the
-# desk pushed fields + ref) and no wraps yet -> slabs -> join -> wraps -> state/wraps.ready (the desk pulls joined + wraps and does
-# surf-stats, flatten and renders); its fields and slab fits are deleted here.
+# desk pushed the fields) and no wraps yet, whose ref this host owns (atomic mkdir state/ref.lock; a desk-owned one is skipped until its
+# state/ref.ready arrives) -> ref -> slabs -> join -> wraps -> state/wraps.ready (the desk pulls joined + wraps and does surf-stats,
+# flatten and renders); its fields and slab fits are deleted here.
+#   ref     count-field --R 0 --pool 8 --phase-w 4 --model-only --model-stride MSTRIDE (4), TH (20) threads, --mem-gb CFMEM (24)
 #   slabs   fit --ref-model REF --ref-snap 1 --uw-repair 0 --dir (the ref's: count-field finds the handedness, 1447 is -1) per 64-cell slab (+16 overlap), full cross-section, one lane per GPU; air
 #           slabs at the box ends (fit: no data for the prior) count as done and are left out of the join
 #   join    fit-join --ref REF (prints the overlap integer agreement)
@@ -45,13 +47,26 @@ wraps() {
   [ "${CLEAN:-1}" = 1 ] && rm -rf $F $O/slabs/s???/f $O/slabs/s???/fit; return 0   # (the joined model is standalone)
 }
 
+ref() {   # the count-field ref here (this host holds ref.lock), unless the desk's arrived (ref.ready)
+  [ -e $O/state/ref.ready ] && return 0
+  rm -rf $REF
+  /usr/bin/time -v nice -n 5 $U count-field $F $O/cf.unused --R 0 --pool 8 --phase-w 4 --iters 1200 --model $REF --model-only 1 --model-stride ${MSTRIDE:-4} \
+    --threads $TH --mem-gb ${CFMEM:-24} > $O/logs/ref.log 2>&1 && [ -e $REF/model.json ] &&
+    log "ref: $(grep -oE 'closing error[^:]*: mean [0-9.]+ turns, > 0.25 turn on [0-9.]+' $O/logs/ref.log)"
+}
+mine() {   # this scroll's ref is (or may become) this host's: ready, or the lock taken (or ours from an earlier run)
+  [ -e $O/state/ref.ready ] && return 0
+  if mkdir $O/state/ref.lock 2> /dev/null; then echo fd > $O/state/ref.lock/owner; return 0; fi
+  [ "$(cat $O/state/ref.lock/owner 2> /dev/null)" = fd ]
+}
+
 while ! stopped; do
   fs=
-  for S in $(scrolls); do
+  for S in $(scrolls); do   # the first pushed scroll without wraps whose ref is not being computed by the desk
     scan $S || continue; failed && continue; done_ wraps && continue
-    [ -e $O/state/fields.ready ] && { fs=$S; break; }
+    [ -e $O/state/fields.ready ] && mine && { fs=$S; break; }
   done
-  if [ -n "$fs" ]; then S=$fs; scan $S; run slabs slabs && run join joinst && run wraps wraps; continue; fi
+  if [ -n "$fs" ]; then S=$fs; scan $S; run ref ref && run slabs slabs && run join joinst && run wraps wraps; continue; fi
   [ -e $C/desk.done ] && break
   sleep 300
 done
