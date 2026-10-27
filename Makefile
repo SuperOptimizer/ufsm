@@ -501,6 +501,7 @@ test-all: $(B)/test_gpu_aug $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover 
 	./$(B)/test_tiffw
 	./$(B)/test_imgops
 	./$(B)/test_tfx
+	./$(B)/test_sheetcut
 	./$(B)/test_dino_loss
 	UFSM_TEST_D=16 ./$(B)/test_dino_loss
 	./$(B)/test_head32
