@@ -55,4 +55,13 @@ with tempfile.TemporaryDirectory(prefix="ufsm-lut-") as tmp:
     b = (t / "b.raw").read_bytes()
     exp = max(lut[val(z, y, x)] for z in (0, 1) for y in (0, 1) for x in (0, 1))
     assert b[0] == exp, (b[0], exp)
+    # z3-recode: the prob254 output through a second LUT (v -> v // 2), 255 kept
+    (t / "lut2.txt").write_text(" ".join(str(v // 2) for v in range(255)))
+    r = subprocess.run([str(v) for v in (BIN, "z3-recode", out, t / "rec", "--um", "9.6", "--lut", t / "lut2.txt", "--levels", "2", "--hist", "1")], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60)
+    assert r.returncode == 0, r.stdout
+    r = subprocess.run([str(v) for v in (BIN, "read", t / "rec", "9.6", 0, 0, 0, N, N, N, t / "c.raw")], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60)
+    assert r.returncode == 0, r.stdout
+    c = (t / "c.raw").read_bytes()
+    for i in (0, (3 * N + 5) * N + 30, (40 * N + 33) * N + 2, 40, 200):
+        assert c[i] == (255 if a[i] == 255 else a[i] // 2), (i, a[i], c[i])
 print("test_ingest_lut: ok")
