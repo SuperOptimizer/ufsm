@@ -3,7 +3,8 @@
 #   prep     every scroll up front, PREPPAR (3) at once: box of the scanprep mask (object cells padded one cell, origin on the 512-voxel
 #            grid: predict --fit-zarr slab rows are 256 cells = 512 voxels), axis (list.tsv umbilicus or ufsm axis = per-z CT centroid)
 #   gpu 0/1  wind96 fit fields of one scroll per GPU (run3-cf predict settings) + lossless repack to 512^3 shards; waits for SPACEGB
-#   ref      count-field ref on the CPU (REFPAR (2) lanes, TH (12) threads each, nice 10; MemAvailable >= MEMGB 40 first)
+#   ref      count-field ref on the CPU (REFPAR (2) lanes, TH (12) threads each, nice 10; MemAvailable >= MEMGB 40 first); --model-stride
+#            MSTRIDE (4): Paris 4 at 4 vs 2 (forlindesk, 10 threads each): 1:36 vs 1:54 h, ref-alone ids .1598 vs .1605, pairs .691/.295 vs .683/.296
 #   push     fields + ref + box + axis -> forlindesk (FDGB 250 free there), byte-checked -> forlindesk:<S>/state/fields.ready (fields kept here)
 #   pull     once forlindesk:<S>/state/wraps.ready: its joined model + wraps -> here (byte-checked)
 #   surf     surf-stats --per-wrap --ct --ct-only 1 (the fields' geometry only: whole-scroll phase planes OOMed the desk at 137 GB): the on-papyrus share (max CT within +-15 um along the normal
@@ -51,7 +52,7 @@ fields() {   # (GPU $G)
 }
 ref() {
   rm -rf $REF
-  /usr/bin/time -v nice -n 10 $U count-field $F $O/cf.unused --R 0 --pool 8 --phase-w 4 --iters 1200 --model $REF --model-only 1 --model-stride 2 \
+  /usr/bin/time -v nice -n 10 $U count-field $F $O/cf.unused --R 0 --pool 8 --phase-w 4 --iters 1200 --model $REF --model-only 1 --model-stride ${MSTRIDE:-4} \
     --threads $TH --mem-gb ${CFMEM:-24} > $O/logs/ref.log 2>&1 && [ -e $REF/model.json ]
 }
 push() {
