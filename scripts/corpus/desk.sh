@@ -12,7 +12,8 @@
 #   pull     once forlindesk:<S>/state/wraps.ready: its joined model + wraps -> here (byte-checked)
 #   surf     surf-stats --per-wrap --ct --ct-only 1 (the fields' geometry only: whole-scroll phase planes OOMed the desk at 137 GB): the on-papyrus share (max CT within +-15 um along the normal
 #            >= the scan's Otsu level, scanprep stats)
-#   flat     SLIM flatten of the NFLAT (40) wraps with the largest vertices x on-papyrus among those with on-papyrus
+#   flat     SLIM flatten of NFLAT (40) wraps alternately from queue a (vertices x on-papyrus) and b (on-papyrus among wraps >= HALF
+#            x the largest wrap's vertices), all with on-papyrus
 #            >= ONPAP (0.5); 4 processes x FTH (6) threads; the largest valid rectangle per wrap
 #   render   once the laptop's ink is here (state/ink.ready): rectangles >= MINCM2 (5) upright (tifxyz-scale --flip-rows 1), CT (local) +
 #            ift3 ink at 2 px / voxel, CT | ink side-by-side JPEGs sheets/img/<w>_side.jpg, sheets/sheets.tsv sorted by cm2
@@ -96,24 +97,40 @@ surf() {
   log "surf: $(grep -E '^surf-stats: sheet switches' $O/logs/surfstats.log | cut -c1-110) | $(grep -E '^surf-stats: CT: on papyrus' $O/logs/surfstats.log | cut -c1-120)"
 }
 flat() {   # per-wrap rows of surf-stats --ct: wNNN vertices conf |e|med |e|>.25 theta-sw/cm z-sw/cm on-papyrus
-  local list g=0 grp
-  list=$(awk -v m=${SWMAX:-2.5} -v p=${ONPAP:-0.5} '$1 ~ /^w[0-9]+$/ && NF >= 8 && $6 <= m && $8 >= p {print $2 * $8, $1}' $O/logs/surfstats.log |
-         sort -rg | head -n ${NFLAT:-40} | awk '{print $2}')
-  [ -n "$list" ] || { log "flat: no wrap with theta sw/cm <= ${SWMAX:-2.5} and on-papyrus >= ${ONPAP:-0.5}"; mkdir -p $O/flat; : > $O/flat/flatten.log; return 0; }
-  echo "$list" > $O/flat-list.txt; rm -rf $O/flat; mkdir -p $O/flat
-  N nice -n 5 $U tifxyz-scale $O/wraps $O/flat/orig 1 --wraps $(echo $list | tr ' ' ',') > $O/logs/flat-scale.log 2>&1 || return 1
-  for grp in $(echo $list | tr ' ' '\n' | awk '{a[NR % 4] = a[NR % 4] (a[NR % 4] ? "," : "") $1} END {for (k in a) print a[k]}'); do
-    N nice -n 5 $U flatten $O/flat/orig $O/flat/flat --wraps $grp --threads ${FTH:-6} > $O/logs/flatten.$g.log 2> $O/logs/flatten.$g.err & g=$((g + 1))
-  done; wait
-  cat $O/logs/flatten.?.log > $O/flat/flatten.log
-  log "flat: $(grep -cE '^w[0-9]+: input' $O/flat/flatten.log) of $(echo $list | wc -w) wraps; rectangles >= ${MINCM2:-5} cm2: $(grep -oE '= [0-9.]+ cm2' $O/flat/flatten.log | awk -v m=${MINCM2:-5} '$2 >= m' | wc -l)"
+  # NFLAT (40) wraps with on-papyrus >= ONPAP (0.5), taken alternately from two queues (duplicates skipped): (a) vertices x on-papyrus,
+  # (b) on-papyrus among the wraps with >= HALF (0.5) x the largest wrap's vertices. flat-list.txt: "wrap queue". Incremental: wraps
+  # already flattened (flat/flat/<w>) are kept, e.g. an earlier list's.
+  local list new g=0 grp R=$(date +%s)
+  awk -v p=${ONPAP:-0.5} -v hf=${HALF:-0.5} -v n=${NFLAT:-40} '
+    $1 ~ /^w[0-9]+$/ && NF >= 8 && $8 >= p { k++; w[k] = $1; v[k] = $2; o[k] = $8; if ($2 > mx) mx = $2 }
+    END { for (i = 1; i <= k; i++) { A[i] = i; B[i] = i }
+      for (i = 1; i <= k; i++) for (j = i + 1; j <= k; j++) {
+        if (v[A[j]] * o[A[j]] > v[A[i]] * o[A[i]]) { t = A[i]; A[i] = A[j]; A[j] = t }
+        if (o[B[j]] > o[B[i]]) { t = B[i]; B[i] = B[j]; B[j] = t } }
+      ia = 1; ib = 1; m = 0
+      while (m < n && (ia <= k || ib <= k)) {
+        while (ia <= k && seen[A[ia]]) ia++
+        if (ia <= k && m < n) { seen[A[ia]] = 1; print w[A[ia]], "a"; m++ }
+        while (ib <= k && (seen[B[ib]] || v[B[ib]] < hf * mx)) ib++
+        if (ib <= k && m < n) { seen[B[ib]] = 1; print w[B[ib]], "b"; m++ } } }' $O/logs/surfstats.log > $O/flat-list.txt
+  list=$(awk '{print $1}' $O/flat-list.txt); mkdir -p $O/flat
+  [ -n "$list" ] || { log "flat: no wrap with on-papyrus >= ${ONPAP:-0.5}"; : > $O/flat/flatten.log; return 0; }
+  new=$(for w in $list; do [ -e $O/flat/flat/$w ] || echo $w; done)
+  if [ -n "$new" ]; then
+    N nice -n 5 $U tifxyz-scale $O/wraps $O/flat/orig 1 --wraps $(echo $new | tr ' ' ',') > $O/logs/flat-scale.$R.log 2>&1 || return 1
+    for grp in $(echo $new | tr ' ' '\n' | awk '{a[NR % 4] = a[NR % 4] (a[NR % 4] ? "," : "") $1} END {for (k in a) print a[k]}'); do
+      N nice -n 5 $U flatten $O/flat/orig $O/flat/flat --wraps $grp --threads ${FTH:-6} > $O/logs/flatten.$R.$g.log 2> $O/logs/flatten.$R.$g.err & g=$((g + 1))
+    done; wait
+  fi
+  cat $O/logs/flatten.*.log > $O/flat/flatten.log
+  log "flat: $(echo $new | wc -w) new of $(echo $list | wc -w) listed ($(grep -c ' a$' $O/flat-list.txt) a, $(grep -c ' b$' $O/flat-list.txt) b); $(grep -cE '^w[0-9]+: input' $O/flat/flatten.log) flattened, rectangles >= ${MINCM2:-5} cm2: $(grep -oE '= [0-9.]+ cm2' $O/flat/flatten.log | awk -v m=${MINCM2:-5} '$2 >= m' | wc -l)"
 }
 ink_ready() { done_ flat && [ -e $O/state/ink.ready ]; }
 render() {
-  local P=$O/sheets w cm a50 d st op line il px=$(awk -v u=$LUM 'BEGIN { print u / 2 }')
+  local P=$O/sheets w cm a50 d st op qu line il px=$(awk -v u=$LUM 'BEGIN { print u / 2 }')
   il=$(ls $O/ink.zarr | grep -E '^[0-9.]+$' | sort -g | head -n 1); [ -n "$il" ] || return 1
   rm -rf $P; mkdir -p $P/up $P/r $P/img
-  printf 'scroll\twrap\trect_cm2\ton_papyrus\taniso_p50\tink_mean\tink_frac50\tside_jpg\n' > $P/sheets.tmp
+  printf 'scroll\twrap\tqueue\trect_cm2\ton_papyrus\taniso_p50\tink_mean\tink_frac50\tside_jpg\n' > $P/sheets.tmp
   grep -E '^w[0-9]+: input' $O/flat/flatten.log | while read -r line; do
     w=${line%%:*}; cm=$(echo "$line" | grep -oE '= [0-9.]+ cm2' | awk '{print $2}'); awk -v c=$cm -v m=${MINCM2:-5} 'BEGIN { exit !(c >= m) }' || continue
     a50=$(grep -E "^$w output grid" $O/flat/flatten.log | grep -oE 'aniso p50/p95/p99 [0-9.]+' | awk '{print $3}')
@@ -124,10 +141,11 @@ render() {
     N $U ink-compare $P/img/${w}_side.jpg --ct $d/${w}_ct.tif --ink "ift3=$d/$w.tif" --px-um $px --stretch --stretch-ct > $d/stats.txt 2>&1
     N $U ink-compare - --ct $d/${w}_ct.tif --ink "ift3=$d/$w.tif" --px-um $px --stretch --stretch-ct --each $P/img/${w}_ --each-ct > /dev/null 2>&1
     st=$(grep -E '^ink ift3:' $d/stats.txt | awk '{print $6"\t"$8}')
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' $S $w $cm ${op:-na} ${a50:-na} "${st:-na	na}" ${w}_side.jpg >> $P/sheets.tmp
+    qu=$(awk -v w=$w '$1 == w {print $2}' $O/flat-list.txt)   # (a wrap of an earlier, a-only list: a)
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' $S $w ${qu:-a} $cm ${op:-na} ${a50:-na} "${st:-na	na}" ${w}_side.jpg >> $P/sheets.tmp
   done
-  { head -n 1 $P/sheets.tmp; tail -n +2 $P/sheets.tmp | sort -t$'\t' -k3,3gr; } > $P/sheets.tsv; rm -f $P/sheets.tmp
-  log "render: $(($(wc -l < $P/sheets.tsv) - 1)) sheets >= ${MINCM2:-5} cm2, $(tail -n +2 $P/sheets.tsv | awk '{s += $3} END {printf "%.1f", s}') cm2, largest $(sed -n 2p $P/sheets.tsv | cut -f2-4)"
+  { head -n 1 $P/sheets.tmp; tail -n +2 $P/sheets.tmp | sort -t$'\t' -k4,4gr; } > $P/sheets.tsv; rm -f $P/sheets.tmp
+  log "render: $(($(wc -l < $P/sheets.tsv) - 1)) sheets >= ${MINCM2:-5} cm2, $(tail -n +2 $P/sheets.tsv | awk '{s += $4} END {printf "%.1f", s}') cm2, largest $(sed -n 2p $P/sheets.tsv | cut -f2-5)"
 }
 clean() { rm -rf $F $O/flat/orig $O/sheets/r/*/*.tif; ssh -n $FD "rm -rf $FDC/$S/fields"; return 0; }
 
