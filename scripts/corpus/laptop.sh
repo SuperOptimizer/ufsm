@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # laptop.sh: the laptop side of the corpus unroll (see common.sh): the ift3-24000 ink of every scroll of list.tsv, in order, as soon as the
 # desk has its box (desk <S>/box.txt). CT over HTTP from the public mirror (byte-identical to the desk copies; no --cache, so nothing of
-# the CT lands on disk), one predict pass (window 1152, halo 64: N measured the P4 border jump 30 (halo 0) -> 23 (frozen GN) -> 9.4 (halo 64 + frozen); --occupancy 5 skips air) with GroupNorm statistics frozen per scroll
+# the CT lands on disk), one predict pass (window 640, halo 64, 512^3 shards; 1152 pages on the 16 GB 5080: 5x slower; N measured the P4 border jump 30 (halo 0) -> 23 (frozen GN) -> 9.4 (halo 64 + frozen); --occupancy 5 skips air) with GroupNorm statistics frozen per scroll
 # (a --gn-save calibration band first: per-window GN made tile-to-tile brightness seams on 1667). The ink zarr
 # (~1-2 GB) rsynced to forlindesk, byte-checked -> forlindesk:<S>/state/ink.ready, then deleted here (laptop growth: one ink zarr).
 # Each predict holds the laptop GPU through gpuq (prio bg) and runs in the memory slice (capped.sh, MEM 12G).
@@ -21,10 +21,10 @@ ink() {
   # then the ink pass with those frozen statistics (--gn-frozen): no per-window normalisation, so no tile-to-tile brightness jumps
   local cal=$(echo $box | awk -F, '{ zc = $1 + int($4 / 2); z0 = zc - 1024; if (z0 < $1) z0 = $1; nz = 2048; if (nz > $4) nz = $4; printf "%d,%d,%d,%d,%d,%d", z0, $2, $3, nz, $5, $6 }')
   ( gpuq_acquire bg corpus-ink-$S
-    MEM=${MEM:-12G} $HOME/ufsm-data/capped.sh nice -n 5 $U predict $INKCK $MIRROR $MK $O/gncal.zarr --um $UM --level $LV --box $cal --shard 1024 \
-      --window 1152 --halo 64 --ema 1 --q 32 --threads 12 --gpu 0 --full-grid 1 --occupancy 5 --levels 1 --no-out 1 --gn-save $O/gn.bin > $O/logs/ink-gn.log 2>&1 &&
-    MEM=${MEM:-12G} $HOME/ufsm-data/capped.sh nice -n 5 $U predict $INKCK $MIRROR $MK $O/ink.zarr --um $UM --level $LV --box $box --shard 1024 \
-      --window 1152 --halo 64 --ema 1 --q 32 --threads 12 --gpu 0 --full-grid 1 --resume 1 --occupancy 5 --levels 4 --gn-frozen $O/gn.bin > $O/logs/ink.log 2>&1
+    MEM=${MEM:-12G} $HOME/ufsm-data/capped.sh nice -n 5 $U predict $INKCK $MIRROR $MK $O/gncal.zarr --um $UM --level $LV --box $cal --shard 512 \
+      --window 640 --halo 64 --ema 1 --q 32 --threads 12 --gpu 0 --full-grid 1 --occupancy 5 --levels 1 --no-out 1 --gn-save $O/gn.bin > $O/logs/ink-gn.log 2>&1 &&
+    MEM=${MEM:-12G} $HOME/ufsm-data/capped.sh nice -n 5 $U predict $INKCK $MIRROR $MK $O/ink.zarr --um $UM --level $LV --box $box --shard 512 \
+      --window 640 --halo 64 --ema 1 --q 32 --threads 12 --gpu 0 --full-grid 1 --resume 1 --occupancy 5 --levels 4 --gn-frozen $O/gn.bin > $O/logs/ink.log 2>&1
     rc=$?; gpuq_release; exit $rc ) || return 1
   rm -rf $O/gncal.zarr
   ssh -n $FD "mkdir -p $d/state" && rsync -a $O/ink.zarr/ $FD:$d/ink.zarr/ || return 1
