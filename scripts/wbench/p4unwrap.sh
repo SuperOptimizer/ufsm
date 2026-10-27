@@ -11,7 +11,7 @@
 #   U (binary, default $WB/bin/ufsm), O ($WB/p4unwrap/TAG), FIELDS (existing fit-field dir: skip the predict),
 #   Z0 ZE Y0 NY X0 NX (crop in field cells; default the whole scroll), I OV (64 / 16), ONLY ("k1 k2": just these slabs),
 #   FITARGS (extra fit flags), WRAPS (0), NOLOCK=1 (ignore the site GPU lock; the laptop lock is taken per GPU step).
-#   SPACEGB (120: free disk GB needed before the predict and each fit), JOIN=0 (fits only: a second host runs ONLY=... lanes; rsync its s??? dirs back), MEMGB (30: MemAvailable GB before each fit);
+#   JDETAIL (1: the joined score per radius bin; 0 for whole-scroll crops: --score-detail needs ~90 GB host RAM there), SPACEGB (120: free disk GB needed before the predict and each fit), JOIN=0 (fits only: a second host runs ONLY=... lanes; rsync its s??? dirs back), MEMGB (30: MemAvailable GB before each fit);
 #   lanes claim slabs dynamically (flock $O/claim.k), so GPUS="0 1" lanes balance and a second invocation can add lanes.
 set -u
 H=$(cd "$(dirname "$0")" && pwd)
@@ -78,7 +78,7 @@ for d in $O/s???; do [ -e $d/done ] || continue; read -r c0 c1 a b < $d/cells   
 done > $O/slipmap.tsv
 args=(); for d in $(ls -d $O/s??? | sort); do [ -e $d/done ] || continue; read -r c0 c1 a b < $d/cells; args+=($d/fit $((2 * (c0 - Z0))) $((2 * (c1 - Z0)))); done
 RUN $U fit-join $O/joined $FC --blend 16 "${args[@]}" > $O/join.log 2>&1 || { log "fit-join failed"; tail -n 3 $O/join.log; exit 1; }
-G RUNBIG env UFSM_FIT_THREADS=$THREADS $U fit $FC --model $O/joined --gpu $GPU --codes $Q 9.6 --score-detail 1 --score-pairs 1 > $O/joined-score.log 2>&1
+G RUNBIG env UFSM_FIT_THREADS=$THREADS $U fit $FC --model $O/joined --gpu $GPU --codes $Q 9.6 --score-detail ${JDETAIL:-1} --score-pairs 1 > $O/joined-score.log 2>&1
 ids=$(grep -oE 'winding ids right [0-9.]+' $O/joined-score.log | tail -1 | awk '{print $4}')
 js=$(grep -oE "mean share\(mode\).*: [0-9.]+" $O/join.log | awk "{print \$NF}"); js=${js:-na}
 { echo "tag $TAG ckpt $CK"; echo "whole-scroll joined ids ${ids:-na} (wind96 10-21: $BASE), mean join share $js, slabs $nd of $NS"
