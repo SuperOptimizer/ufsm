@@ -247,7 +247,7 @@ typedef struct {
     z3 *ct; z3w *w; z3 *old; vol *pred;
     double hpx; int nsub, nt; double tstep;
     pthread_mutex_t mu;
-    uint64_t n_ink, n_no, n_rej, n_hit, cm[2][2];   /* cm[splat ink][pred ink] over the written known voxels (--pred at this level) */
+    uint64_t n_ink, n_no, n_rej, n_hit, n_excl, cm[2][2];   /* cm[splat ink][pred ink] over the written known voxels (--pred at this level) */
     uint8_t *chunks_used; int64_t cg[3];            /* 128-chunk occupancy of the written voxels (block origins) */
     int64_t bb_lo[3], bb_hi[3];
     _Atomic int failed;
@@ -295,7 +295,7 @@ static void *splat_worker(void *arg) {
             have_old = 1;
         }
         if (!have_old) memset(buf, 255, sv);
-        uint64_t ni = 0, nn = 0, nr = 0, nh = 0, cm[2][2] = {{0, 0}, {0, 0}}; int any = 0;
+        uint64_t ni = 0, nn = 0, nr = 0, nh = 0, nx = 0, cm[2][2] = {{0, 0}, {0, 0}}; int any = 0;
         for (int ci = 0; ci < NCS * NCS * NCS; ci++) {
             acc *ac = A[ci]; if (!ac) continue;
             const int64_t co[3] = {so[0] + (ci / (NCS * NCS)) * CH, so[1] + (ci / NCS % NCS) * CH, so[2] + (ci % NCS) * CH}, cn[3] = {CH, CH, CH};
@@ -307,6 +307,14 @@ static void *splat_worker(void *arg) {
                 nh++;
                 const int64_t z = co[0] + (int64_t)(k >> 14), y = co[1] + (int64_t)(k >> 7 & 127), x = co[2] + (int64_t)(k & 127);
                 if (z >= J->oshape[0] || y >= J->oshape[1] || x >= J->oshape[2]) continue;
+                if (c->nexcl) {   /* --exclude: the voxel's level-0 extent [j V, (j + 1) V) touches a held-out box */
+                    const int64_t Vi = (int64_t)J->V; int ex = 0;
+                    for (int e = 0; e < c->nexcl && !ex; e++) {
+                        const int64_t *b = c->excl[e];
+                        ex = (z + 1) * Vi > b[0] && z * Vi < b[0] + b[3] && (y + 1) * Vi > b[1] && y * Vi < b[1] + b[4] && (x + 1) * Vi > b[2] && x * Vi < b[2] + b[5];
+                    }
+                    if (ex) { nx++; continue; }
+                }
                 if (!ctb[k] || ctb[k] < c->iso) { nr++; continue; }
                 const int isink = ac->ni[k] && ac->ni[k] >= c->thr * h;
                 const uint8_t v = (uint8_t)(((isink ? ac->pi[k] : ac->pn[k]) * 254 + 127) / 255);
@@ -325,7 +333,7 @@ static void *splat_worker(void *arg) {
         if (atomic_load(&J->failed)) break;
         if ((any || have_old) && z3w_write_shard(J->w, sz, sy, sx, buf, 2)) { fprintf(stderr, "ink-splat: %s\n", z3w_error()); atomic_store(&J->failed, 1); break; }
         pthread_mutex_lock(&J->mu);
-        J->n_ink += ni; J->n_no += nn; J->n_rej += nr; J->n_hit += nh;
+        J->n_ink += ni; J->n_no += nn; J->n_rej += nr; J->n_hit += nh; J->n_excl += nx;
         for (int a = 0; a < 2; a++) for (int b = 0; b < 2; b++) J->cm[a][b] += cm[a][b];
         for (int d = 0; d < 3; d++) { if (blo[d] < J->bb_lo[d]) J->bb_lo[d] = blo[d]; if (bhi[d] > J->bb_hi[d]) J->bb_hi[d] = bhi[d]; }
         pthread_mutex_unlock(&J->mu);
@@ -630,8 +638,8 @@ int inksplat_run(const inksplat_cfg *c) {
         if (old) z3_close(old);
         if (atomic_load(&J.failed)) { fprintf(stderr, "ink-splat: failed\n"); goto out2; }
         const double known = (double)(J.n_ink + J.n_no);
-        fprintf(stderr, "ink-splat: %s: %llu hit voxels, %llu ink + %llu no-ink written, %llu below iso / masked (%.1f%% on papyrus) in %.1fs\n", name,
-                (unsigned long long)J.n_hit, (unsigned long long)J.n_ink, (unsigned long long)J.n_no, (unsigned long long)J.n_rej, J.n_hit ? 100.0 * known / J.n_hit : 0, snow() - t0);
+        fprintf(stderr, "ink-splat: %s: %llu hit voxels, %llu ink + %llu no-ink written, %llu below iso / masked, %llu excluded (%.1f%% on papyrus) in %.1fs\n", name,
+                (unsigned long long)J.n_hit, (unsigned long long)J.n_ink, (unsigned long long)J.n_no, (unsigned long long)J.n_rej, (unsigned long long)J.n_excl, J.n_hit ? 100.0 * known / J.n_hit : 0, snow() - t0);
         char cmp_json[512] = "";
         if (have_pred) {
             const double tp = J.cm[1][1], fp = J.cm[1][0], fn = J.cm[0][1], tn = J.cm[0][0], tot = tp + fp + fn + tn;
@@ -650,11 +658,11 @@ int inksplat_run(const inksplat_cfg *c) {
         int64_t blo[3], bhi[3]; for (int d = 0; d < 3; d++) { blo[d] = J.bb_lo[d] == INT64_MAX ? 0 : J.bb_lo[d] << L; bhi[d] = J.bb_hi[d] < 0 ? 0 : ((J.bb_hi[d] + 1) << L); }
         fprintf(f, "{\"name\": \"%s\", \"surface\": \"%s\", \"labels\": \"%s\", \"mask\": \"%s\", \"ct\": \"%s/%s\", \"ct_um\": %g, \"level\": %d, \"um\": %g, \"iso\": %d,\n"
                    " \"band\": [%g, %g], \"layer_vox\": %g, \"sign\": %d, \"thr\": %g, \"label_px_per_canvas\": %g, \"crop\": [%d, %d, %d, %d],\n"
-                   " \"label_px\": %llu, \"ink_px\": %llu, \"label_cm2\": %.4f, \"ink_cm2\": %.4f, \"hit_voxels\": %llu, \"ink_voxels\": %llu, \"noink_voxels\": %llu, \"rejected_voxels\": %llu,\n"
+                   " \"label_px\": %llu, \"ink_px\": %llu, \"label_cm2\": %.4f, \"ink_cm2\": %.4f, \"hit_voxels\": %llu, \"ink_voxels\": %llu, \"noink_voxels\": %llu, \"rejected_voxels\": %llu, \"excluded_voxels\": %llu,\n"
                    " %s%s%s\"bbox\": [%lld, %lld, %lld, %lld, %lld, %lld],\n \"origins\": [",
                 name, c->surface, c->labels, c->mask ? c->mask : "", c->ct_root, c->ct_key, c->ct_um, L, um, c->iso, c->band_a, c->band_b, c->layer_vox, (int)G.sign, c->thr, F,
                 c->crop[0], c->crop[1], c->crop[2], c->crop[3], (unsigned long long)nsup, (unsigned long long)nink, nsup * cm2, nink * cm2,
-                (unsigned long long)J.n_hit, (unsigned long long)J.n_ink, (unsigned long long)J.n_no, (unsigned long long)J.n_rej,
+                (unsigned long long)J.n_hit, (unsigned long long)J.n_ink, (unsigned long long)J.n_no, (unsigned long long)J.n_rej, (unsigned long long)J.n_excl,
                 cmp_json, prof_json[0] ? prof_json : "", prof_json[0] ? ",\n " : "",
                 (long long)blo[0], (long long)blo[1], (long long)blo[2], (long long)(bhi[0] - blo[0]), (long long)(bhi[1] - blo[1]), (long long)(bhi[2] - blo[2]));
         /* 1024-blocks (level-0 voxels) holding written voxels */
@@ -771,7 +779,7 @@ int cmd_ink_splat(int argc, char **argv) {
     if (argc < 3 || ci < 0 || ci + 2 >= argc) {
         fprintf(stderr, "usage: ufsm ink-splat <out-group|-> --surface TIFXYZ --labels L [--mask M] --ct ROOT KEY --ct-um U [--level 0] --iso I\n"
                         "         [--band A,B (layers, -4,4)] [--layer-vox 1] [--flip] [--thr 0.5] [--label-z Z] [--label-scale F] [--label-offset r,c] [--crop c0,r0,w,h]\n"
-                        "         [--merge] [--coarse N] [--name NAME] [--summary JSON] [--preview JPG] [--pyramid-only]\n         ufsm ink-splat <out-group> --points VC3D.json --radius-um 5 --ct ROOT KEY --ct-um U [--level 0] --iso I [--merge]   (3D point labels) [--threads 6] [--cache DIR]\n"
+                        "         [--merge] [--coarse N] [--name NAME] [--summary JSON] [--preview JPG] [--pyramid-only] [--exclude z,y,x,nz,ny,nx (level-0, repeatable)]\n         ufsm ink-splat <out-group> --points VC3D.json --radius-um 5 --ct ROOT KEY --ct-um U [--level 0] --iso I [--merge]   (3D point labels) [--threads 6] [--cache DIR]\n"
                         "         [--pred ROOT KEY [--pred-level L] [--pred-thr 128] [--pred-skip V] [--profile T] [--stride 4]]\n"
                         "  L / M: a .tif / .png, or a zarr array dir (v3 2-D, v2 3-D at --label-z), local or https; '-' as out: profile only\n");
         return 2;
@@ -788,6 +796,13 @@ int cmd_ink_splat(int argc, char **argv) {
     if (cr && sscanf(cr, "%d,%d,%d,%d", c.crop, c.crop + 1, c.crop + 2, c.crop + 3) != 4) { fprintf(stderr, "ink-splat: --crop c0,r0,w,h\n"); return 2; }
     c.merge = sflag(argc, argv, "--merge"); c.coarse = atoi(sopt(argc, argv, "--coarse", "-1")); c.name = sopt(argc, argv, "--name", nullptr); c.summary = sopt(argc, argv, "--summary", nullptr); c.preview = sopt(argc, argv, "--preview", nullptr);
     c.threads = atoi(sopt(argc, argv, "--threads", "6")); c.cache = sopt(argc, argv, "--cache", nullptr);
+    for (int i = 2; i + 1 < argc; i++) {
+        if (strcmp(argv[i], "--exclude")) continue;
+        long long b[6];
+        if (c.nexcl >= 16 || sscanf(argv[i + 1], "%lld,%lld,%lld,%lld,%lld,%lld", b, b + 1, b + 2, b + 3, b + 4, b + 5) != 6) { fprintf(stderr, "ink-splat: --exclude z,y,x,nz,ny,nx (at most 16)\n"); return 2; }
+        for (int d = 0; d < 6; d++) c.excl[c.nexcl][d] = b[d];
+        c.nexcl++;
+    }
     if (pi >= 0) { if (pi + 2 >= argc) { fprintf(stderr, "ink-splat: --pred ROOT KEY\n"); return 2; } c.pred_root = argv[pi + 1]; c.pred_key = argv[pi + 2]; }
     c.pred_level = atoi(sopt(argc, argv, "--pred-level", "-1")); c.pred_thr = atoi(sopt(argc, argv, "--pred-thr", "128")); c.pred_skip = atoi(sopt(argc, argv, "--pred-skip", "-1"));
     c.profile = atoi(sopt(argc, argv, "--profile", "0")); c.stride = atoi(sopt(argc, argv, "--stride", "4"));

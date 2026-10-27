@@ -43,6 +43,7 @@ typedef struct {
     int profile, stride;        /* profile half range (layers), pixel stride */
     const char *summary;        /* summary JSON path (default <out>/segments/<name>.json) */
     const char *preview;        /* JPEG of the label window (supervised no ink gray-blue, ink white) */
+    int nexcl; int64_t excl[16][6];   /* --exclude z,y,x,nz,ny,nx (level-0 voxels, repeatable): output voxels touching a box are never written (held-out regions) */
 } inksplat_cfg;
 
 void inksplat_defaults(inksplat_cfg *c);
