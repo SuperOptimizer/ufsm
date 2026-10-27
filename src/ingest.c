@@ -843,3 +843,51 @@ int cmd_raster(int argc, char **argv) {
     for (int mi = 0; mi < nm; mi++) { free(meshes[mi]->xyz); free(meshes[mi]->valid); free(meshes[mi]->val); free(meshes[mi]); }
     return result;
 }
+
+/* ================= z3-recode ================= */
+/* ufsm z3-recode <group-dir> <out-group> --um U --lut FILE [--levels N] [--threads T] [--hist 1]: a local prob254 pyramid's base
+   level (named by U) through a 255-entry LUT (values 0..254; 255 = unknown stays 255), same shards, coarse levels by known-max.
+   --hist 1 prints the value histogram of the input (known voxels) and writes nothing when --lut is omitted. */
+int cmd_z3_recode(int argc, char **argv) {
+    if (argc < 4) { fprintf(stderr, "usage: ufsm z3-recode <group-dir> <out-group> --um U [--lut FILE] [--levels 1] [--threads 16] [--hist 1]\n"); return 2; }
+    const char *in = argv[2], *out = argv[3];
+    double um = atof(opt(argc, argv, "--um", "0"));
+    int nlev = atoi(opt(argc, argv, "--levels", "1")), nthreads = atoi(opt(argc, argv, "--threads", "16")), hist = atoi(opt(argc, argv, "--hist", "0"));
+    const char *lf = opt(argc, argv, "--lut", nullptr);
+    if (um <= 0 || (!lf && !hist)) { fprintf(stderr, "z3-recode: --um and --lut (or --hist 1) required\n"); return 2; }
+    uint8_t lut[256];
+    for (int v = 0; v < 256; v++) lut[v] = (uint8_t)v;
+    if (lf) { FILE *f = fopen(lf, "r"); if (!f) { perror(lf); return 2; }
+        for (int v = 0; v < 255; v++) { int x; if (fscanf(f, "%d", &x) != 1 || x < 0 || x > 254) { fprintf(stderr, "--lut %s: need 255 values 0..254 (255 = unknown is kept)\n", lf); fclose(f); return 2; } lut[v] = (uint8_t)x; }
+        fclose(f); }
+    char lv[32]; z3w_level_name(um, lv, sizeof lv);
+    store *s = store_open(in); z3 *z = s ? z3_open(s, lv, nullptr) : nullptr;
+    if (!z) { fprintf(stderr, "z3-recode: cannot open %s/%s: %s\n", in, lv, z3_error()); return 1; }
+    const z3_meta *m = z3_meta_of(z);
+    const int S = m->shard[0];
+    int64_t ns[3]; for (int d = 0; d < 3; d++) ns[d] = (m->shape[d] + S - 1) / S;
+    char attrs[256]; snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"content\":\"teacher\",\"encoding\":\"prob254: p*254, 254 = ink, 0 = no ink, 255 = unknown\"}}");
+    char odir[1400]; snprintf(odir, sizeof odir, "%s/%s", out, lv);
+    z3w *w = lf ? z3w_create(odir, m->shape, S, 0.f, 255, attrs) : nullptr;
+    if (lf && !w) { fprintf(stderr, "%s\n", z3w_error()); return 1; }
+    size_t sv = (size_t)S * S * S; uint8_t *buf = malloc(sv);
+    uint64_t h[256] = {0}; int nw = 0; double t0 = now();
+    for (int64_t a = 0; a < ns[0]; a++) for (int64_t b = 0; b < ns[1]; b++) for (int64_t c = 0; c < ns[2]; c++) {
+        if (z3_shard_present(z, a, b, c) != 1) continue;
+        int64_t o[3] = {a * S, b * S, c * S}, n[3] = {S, S, S};
+        if (z3_read(z, o, n, buf, nthreads)) { fprintf(stderr, "z3-recode: read: %s\n", z3_error()); return 1; }
+        for (size_t i = 0; i < sv; i++) { h[buf[i]]++; buf[i] = lut[buf[i]]; }
+        if (w && z3w_write_shard(w, a, b, c, buf, nthreads)) { fprintf(stderr, "%s\n", z3w_error()); return 1; }
+        nw++;
+    }
+    free(buf);
+    fprintf(stderr, "z3-recode: %d shards in %.0fs\n", nw, now() - t0);
+    if (hist) { uint64_t tot = 0; for (int v = 0; v < 255; v++) tot += h[v];
+        printf("# value count cumfrac (known voxels %llu, unknown %llu)\n", (unsigned long long)tot, (unsigned long long)h[255]);
+        uint64_t cum = 0; for (int v = 0; v < 255; v++) { cum += h[v]; if (h[v]) printf("%d %llu %.5f\n", v, (unsigned long long)h[v], tot ? (double)cum / tot : 0); } }
+    if (w) { z3w_close(w);
+        for (int l = 1; l < nlev; l++) if (pyramid_build_level(out, um, l, m->shape, S, 0.f, 3, nthreads, attrs)) return 1;
+        pyramid_write_group(out, um, nlev, "z3-recode", attrs); }
+    z3_close(z); store_close(s);
+    return 0;
+}
