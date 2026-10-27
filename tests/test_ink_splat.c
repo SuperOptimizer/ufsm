@@ -123,6 +123,21 @@ int main(void) {
         z3_close(z); store_close(s3);
     }
 
+    /* --exclude: a held-out box over the low-x half: nothing written there, the rest as before */
+    {
+        char o5[512]; snprintf(o5, sizeof o5, "%s/excl.zarr", dir);
+        inksplat_cfg c5 = c; c5.out = o5; c5.coarse = 0; c5.nexcl = 1;
+        const int64_t bx[6] = {0, 0, 0, NV, NV, NV / 2}; memcpy(c5.excl[0], bx, sizeof bx);
+        CHECK(inksplat_run(&c5) == 0, "exclude splat");
+        store *s5 = store_open(o5); z3 *z = z3_open(s5, "1", nullptr);
+        CHECK(z && !z3_read(z, z0, nn, ob, 4), "read exclude");
+        long win = 0, wout = 0;
+        for (int64_t k = 0; k < (int64_t)NV * NV * NV; k++) if (ob[k] != 255) { if (k % NV < NV / 2) win++; else wout++; }
+        fprintf(stderr, "exclude: written %ld inside the box, %ld outside\n", win, wout);
+        CHECK(win == 0 && wout > 10000, "exclude box: %ld inside, %ld outside", win, wout);
+        if (z) z3_close(z);
+        store_close(s5);
+    }
     /* merge: a second splat with all-ink labels into the first output: ink wins (max) where both are known */
     {
         for (size_t k = 0; k < (size_t)CW * CHh; k++) lab[k] = 255;
