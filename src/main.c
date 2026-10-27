@@ -3433,6 +3433,7 @@ typedef struct {   /* ufsm render: one output tile's pixel rows over threads */
     const float *X, *Y, *Z; int w, h; double gs;   /* the vertex grid; output pixels per grid step */
     const uint8_t *vol, *ct; int64_t o[3], n[3]; int depth;
     uint8_t *img, *cimg; int ow, px0, px1, py0, py1; _Atomic int next;
+    int known;   /* --known: nearest voxel, 255 (prob254 unknown) skipped: the max over the known values (0 when none) */
 } render_job;
 static void *render_rows(void *arg) {
     render_job *J = arg; const int w = J->w, h = J->h;
@@ -3452,7 +3453,15 @@ static void *render_rows(void *arg) {
         const double nl = sqrt(N[0] * N[0] + N[1] * N[1] + N[2] * N[2]); if (nl < 1e-12) continue;
         for (int d = 0; d < 3; d++) N[d] /= nl;
         float m = 0;
-        for (int t = -J->depth; t <= J->depth; t++) { const float v = trilin(J->vol, J->n, P[0] + t * N[0] - J->o[0], P[1] + t * N[1] - J->o[1], P[2] + t * N[2] - J->o[2]); if (v > m) m = v; }
+        for (int t = -J->depth; t <= J->depth; t++) {
+            if (J->known) {   /* nearest voxel; unknown (255) skipped */
+                const int64_t q0 = (int64_t)floor(P[0] + t * N[0] - J->o[0] + 0.5), q1 = (int64_t)floor(P[1] + t * N[1] - J->o[1] + 0.5), q2 = (int64_t)floor(P[2] + t * N[2] - J->o[2] + 0.5);
+                if (q0 < 0 || q1 < 0 || q2 < 0 || q0 >= J->n[0] || q1 >= J->n[1] || q2 >= J->n[2]) continue;
+                const uint8_t b = J->vol[((size_t)q0 * J->n[1] + q1) * J->n[2] + q2]; if (b != 255 && b > m) m = b;
+                continue;
+            }
+            const float v = trilin(J->vol, J->n, P[0] + t * N[0] - J->o[0], P[1] + t * N[1] - J->o[1], P[2] + t * N[2] - J->o[2]); if (v > m) m = v;
+        }
         J->img[(size_t)py * J->ow + px] = (uint8_t)lroundf(m);
         if (J->cimg) J->cimg[(size_t)py * J->ow + px] = (uint8_t)lroundf(trilin(J->ct, J->n, P[0] - J->o[0], P[1] - J->o[1], P[2] - J->o[2]));
     }
@@ -3541,13 +3550,14 @@ static int cmd_blend(int argc, char **argv) {
     return 0;
 }
 static int cmd_render(int argc, char **argv) {
-    if (argc < 4) { fprintf(stderr, "usage: ufsm render <wraps-dir> <out-dir> --volume ROOT KEY [--ct ROOT KEY] [--cache DIR] [--scale 1] [--depth 8] [--tile 512] [--threads 16] [--crop x,y,w,h]\n"
+    if (argc < 4) { fprintf(stderr, "usage: ufsm render <wraps-dir> <out-dir> --volume ROOT KEY [--ct ROOT KEY] [--cache DIR] [--scale 1] [--depth 8] [--tile 512] [--threads 16] [--crop x,y,w,h] [--known]\n"
+                                     "  --known: nearest voxel, 255 (prob254 unknown) skipped (label zarrs: ink-splat output)\n"
                                      "  --crop: only that rectangle of each wrap's output pixels is rendered and written (e.g. a labelled region)\n"); return 2; }
     const int vi = arg_index(argc, argv, "--volume"), ci = arg_index(argc, argv, "--ct");
     int crop[4] = {0, 0, 0, 0}; const char *crs = opt(argc, argv, "--crop", nullptr);
     if (crs && (sscanf(crs, "%d,%d,%d,%d", &crop[0], &crop[1], &crop[2], &crop[3]) != 4 || crop[0] < 0 || crop[1] < 0 || crop[2] < 1 || crop[3] < 1)) { fprintf(stderr, "render: --crop x,y,w,h\n"); return 2; }
     if (vi < 0 || vi + 2 >= argc) { fprintf(stderr, "render: --volume ROOT KEY\n"); return 2; }
-    const double scale = atof(opt(argc, argv, "--scale", "1")); const int depth = atoi(opt(argc, argv, "--depth", "8"));
+    const double scale = atof(opt(argc, argv, "--scale", "1")); const int depth = atoi(opt(argc, argv, "--depth", "8")), known = flag(argc, argv, "--known");
     const int tile = atoi(opt(argc, argv, "--tile", "512")), nthreads = atoi(opt(argc, argv, "--threads", "16"));
     const char *cache = opt(argc, argv, "--cache", nullptr);
     z3 *vz = z3_open(store_open(argv[vi + 1]), argv[vi + 2], cache), *cz = ci > 0 && ci + 2 < argc ? z3_open(store_open(argv[ci + 1]), argv[ci + 2], cache) : nullptr;
@@ -3605,7 +3615,7 @@ static int cmd_render(int argc, char **argv) {
                 const double v[3] = {Z[i], Y[i], X[i]}; for (int d = 0; d < 3; d++) { if (v[d] < lo[d]) lo[d] = v[d]; if (v[d] > hi[d]) hi[d] = v[d]; }
             }
             if (lo[0] > hi[0]) continue;
-            render_job J = {X, Y, Z, w, h, gs, nullptr, nullptr, {0, 0, 0}, {0, 0, 0}, depth, img, cimg, ow, tx, px1, ty, py1, 0};
+            render_job J = {X, Y, Z, w, h, gs, nullptr, nullptr, {0, 0, 0}, {0, 0, 0}, depth, img, cimg, ow, tx, px1, ty, py1, 0, known};
             if (rvol) {   /* the region read once */
                 J.vol = rvol; J.ct = rct; for (int d = 0; d < 3; d++) { J.o[d] = ro[d]; J.n[d] = rn[d]; }
                 pthread_t th[64]; const int nt = nthreads < 64 ? nthreads : 64;
