@@ -10,7 +10,8 @@
 #           voxel, CT | ink side-by-side JPEGs sheets/img/<w>_side.jpg, sheets/sheets.tsv sorted by cm2
 #   clean   the slab fits, the flatten inputs, the render tifs, the CT cache (keeps ref, joined, wraps, flat, sheets, ink)
 # Ends when the desk has pushed everything (C/desk.done) and nothing is left. Start:
-#   cd /vesuvius/ufsm/corpus && setsid nohup bash src/scripts/corpus/fd.sh > fd.out 2>&1 < /dev/null &
+#   cd /vesuvius/ufsm/corpus && mkdir -p run && cp src/scripts/corpus/{common,fd}.sh run/ && setsid nohup bash run/fd.sh > fd.out 2>&1 < /dev/null &
+#   (a copy: editing the repo never touches the running loop; fd.sh finds mkcrop.sh in src/scripts/wbench)
 # Env: TH (20), MEMGB (12: MemAvailable GB before a fit), NFLAT (40), SWMAX (2.5), MINCM2 (5), CLEAN (1).
 H=$(cd "$(dirname "$0")" && pwd); . $H/common.sh
 TH=${TH:-20}; MEMGB=${MEMGB:-12}
@@ -22,11 +23,11 @@ lane() {   # lane GPU: unclaimed slabs in z order
     s=$(printf 's%03d' $k); d=$O/slabs/$s; mkdir -p $d
     exec 9> $d/claim; flock -n 9 || continue; [ -e $d/done ] && continue
     c0=$((k * I)); c1=$((c0 + I)); [ $c1 -gt $ze ] && c1=$ze; a=$((c0 - OV)); [ $a -lt 0 ] && a=0; b=$((c1 + OV)); [ $b -gt $ze ] && b=$ze
-    rm -rf $d/f $d/fit; bash $H/../wbench/mkcrop.sh $F $d/f $a 0 0 $((b - a)) $ny $nx > /dev/null || continue
+    rm -rf $d/f $d/fit; bash $C/src/scripts/wbench/mkcrop.sh $F $d/f $a 0 0 $((b - a)) $ny $nx > /dev/null || continue
     echo "$c0 $c1 $a $b" > $d/cells; memok; t0=$(date +%s)
     env UFSM_FIT_THREADS=10 nice -n 5 $U fit $d/f --gpu $g --out $d/fit --dir 1 --ref-model $REF --ref-snap 1 --uw-repair 0 > $d/fit.log 2>&1; rc=$?
     echo "$s $c0..$c1 rc $rc gpu $g $(( $(date +%s) - t0 ))s" >> $O/slabs.txt
-    [ $rc = 0 ] && touch $d/done
+    if [ $rc = 0 ]; then touch $d/done; elif grep -q "no data for the prior" $d/fit.log; then touch $d/empty $d/done; fi   # (air slabs: the box ends)
   done
 }
 slabs() {
@@ -36,7 +37,7 @@ slabs() {
 }
 joinst() {
   local args=() d c0 c1 a b
-  for d in $(ls -d $O/slabs/s??? | sort); do [ -e $d/done ] || return 1; read -r c0 c1 a b < $d/cells; args+=($d/fit $((2 * c0)) $((2 * c1))); done
+  for d in $(ls -d $O/slabs/s??? | sort); do [ -e $d/done ] || return 1; [ -e $d/empty ] && continue; read -r c0 c1 a b < $d/cells; args+=($d/fit $((2 * c0)) $((2 * c1))); done
   rm -rf $O/joined; N $U fit-join $O/joined $F --blend 16 --ref $REF "${args[@]}" > $O/logs/join.log 2>&1 || return 1
   log "join: $(grep -oE 'integer agreement[^:]*: [0-9.]+|mean share\(mode\)[^:]*: [0-9.]+' $O/logs/join.log | tr '\n' ' ')"
 }
