@@ -81,11 +81,15 @@ static int sf_normal(const sf_wrap *s, size_t i, double N[3]) {
 /* ---- the fit fields sampled at native points ---- */
 typedef struct { int D, H, W, na; double h, um, sp_med; long long org[3]; uint8_t *pc, *ps, *sp; float *cy, *cx; } sf_fields;
 static void sff_free(sf_fields *F) { free(F->pc); free(F->ps); free(F->sp); free(F->cy); free(F->cx); memset(F, 0, sizeof *F); }
-static int sff_load(const char *dir, sf_fields *F) {
+static int sff_load_geom(const char *dir, sf_fields *F) {   /* the box, the cell size and the axis only (no field planes) */
     memset(F, 0, sizeof *F);
     fit_fields_buf g; if (fit_fields_load(dir, 0, 0, 0, &g)) return -1;
     F->D = g.shape[0]; F->H = g.shape[1]; F->W = g.shape[2]; F->h = g.h; F->um = g.um; for (int d = 0; d < 3; d++) F->org[d] = g.origin[d];
     F->na = (int)(F->D * F->h) + 1; F->cy = g.cy; F->cx = g.cx; g.cy = g.cx = nullptr; fit_fields_free(&g);
+    return 0;
+}
+static int sff_load(const char *dir, sf_fields *F) {
+    if (sff_load_geom(dir, F)) return -1;
     int shp[3];
     if (!(F->pc = fit_field_array(dir, "pc", 1, shp)) || !(F->ps = fit_field_array(dir, "ps", 1, shp)) || !(F->sp = fit_field_array(dir, "sp", 1, shp))) { sff_free(F); return -1; }
     size_t hist[256] = {0}, nsp = 0; const size_t n = (size_t)F->D * F->H * F->W;
@@ -98,6 +102,7 @@ static int sff_load(const char *dir, sf_fields *F) {
 static void sff_phase(const sf_fields *F, const double q[3], double *vc, double *vs) {
     double u[3]; int i0[3]; double t[3]; const int n[3] = {F->D, F->H, F->W};
     *vc = *vs = 0;
+    if (!F->pc) return;   /* (geometry-only fields: surf-stats --ct-only) */
     for (int d = 0; d < 3; d++) {
         u[d] = q[d] / F->h - 0.5; if (u[d] < 0 || u[d] > n[d] - 1) { if (u[d] < -0.5 || u[d] > n[d] - 0.5) return; u[d] = u[d] < 0 ? 0 : n[d] - 1; }
         i0[d] = (int)u[d]; if (i0[d] > n[d] - 2) i0[d] = n[d] - 2 < 0 ? 0 : n[d] - 2; t[d] = n[d] > 1 ? u[d] - i0[d] : 0;
@@ -112,6 +117,7 @@ static void sff_phase(const sf_fields *F, const double q[3], double *vc, double 
 }
 static double sff_spacing(const sf_fields *F, const double q[3]) {   /* sheet spacing (native) at q: the cell's sp, else the median */
     int c[3]; const int n[3] = {F->D, F->H, F->W};
+    if (!F->sp) return F->sp_med;
     for (int d = 0; d < 3; d++) { c[d] = (int)floor(q[d] / F->h); if (c[d] < 0 || c[d] >= n[d]) return F->sp_med; }
     const uint8_t v = F->sp[((size_t)c[0] * n[1] + c[1]) * n[2] + c[2]];
     return v ? v * F->h / 8 : F->sp_med;
@@ -508,10 +514,12 @@ int cmd_surf_stats(int argc, char **argv) {
     if (argc < 3 || !sopt(argc, argv, "--fields", nullptr)) {
         fprintf(stderr, "usage: ufsm surf-stats <wraps-dir> --fields DIR [--model FIT [--fault-ratio 3] [--fault-stride 2]] [--min-conf 0.3] [--gap 1] [--min-run 100] [--ct ROOT KEY --ct-um U [--ct-level 80] [--ct-range 15] [--cache DIR]] [--threads 16] [--per-wrap]\n"
                         "  with --model: faults (field cells with |grad W| > fault-ratio x the fields' sheet density) and the largest clean sheet: per wrap the largest\n"
-                        "  connected patch of vertices that are clean (outside faults, wrap spacing 0.5..1.5 x the fields', phase residual < 0.25 where confident, on papyrus with --ct)\n"); return 2;
+                        "  connected patch of vertices that are clean (outside faults, wrap spacing 0.5..1.5 x the fields', phase residual < 0.25 where confident, on papyrus with --ct)\n"
+                        "  --ct-only 1 (with --ct): only the fields' geometry is read (no phase / spacing planes: a whole scroll's are 100s of GB), so only the CT\n"
+                        "  statistics (on-papyrus share per wrap, CT profile) and the normal angles are measured; the phase columns print 0\n"); return 2;
     }
     const double cmin = atof(sopt(argc, argv, "--min-conf", "0.3")), gap_um = atof(sopt(argc, argv, "--gap", "1")) * 1000, min_um = atof(sopt(argc, argv, "--min-run", "100"));
-    const int nt = atoi(sopt(argc, argv, "--threads", "16")), per = sflag(argc, argv, "--per-wrap");
+    const int nt = atoi(sopt(argc, argv, "--threads", "16")), per = sflag(argc, argv, "--per-wrap"), ctonly = atoi(sopt(argc, argv, "--ct-only", "0"));
     fit_set_threads(nt);   /* the field loads' core masks */
     int ci = -1; for (int i = 2; i + 2 < argc; i++) if (!strcmp(argv[i], "--ct")) ci = i;
     const double ctum = atof(sopt(argc, argv, "--ct-um", "0")), ctlev = atof(sopt(argc, argv, "--ct-level", "80")), ctR = atof(sopt(argc, argv, "--ct-range", "15"));
@@ -519,13 +527,14 @@ int cmd_surf_stats(int argc, char **argv) {
     z3 *cz = ci > 0 ? z3_open(store_open(argv[ci + 1]), argv[ci + 2], sopt(argc, argv, "--cache", nullptr)) : nullptr;
     if (ci > 0 && !cz) { fprintf(stderr, "surf-stats: %s\n", z3_error()); return 1; }
     ct_cache ctc; memset(&ctc, 0, sizeof ctc); if (cz && ctc_init(&ctc, cz, nt)) { fprintf(stderr, "surf-stats: out of memory for the CT chunk table\n"); return 1; }
-    sf_fields F; if (sff_load(sopt(argc, argv, "--fields", ""), &F)) { fprintf(stderr, "surf-stats: cannot read the fields\n"); return 1; }
+    if (ctonly && !cz) { fprintf(stderr, "surf-stats: --ct-only needs --ct\n"); return 2; }
+    sf_fields F; if ((ctonly ? sff_load_geom : sff_load)(sopt(argc, argv, "--fields", ""), &F)) { fprintf(stderr, "surf-stats: cannot read the fields\n"); return 1; }
     fit_set *ms = sopt(argc, argv, "--model", nullptr) ? fit_set_load(sopt(argc, argv, "--model", "")) : nullptr;   /* orients the normals */
     if (sopt(argc, argv, "--model", nullptr) && !ms) { fprintf(stderr, "surf-stats: cannot load the model %s\n", sopt(argc, argv, "--model", "")); return 1; }
     char (*names)[256] = nullptr; const int nn = sf_names(argv[2], &names); if (nn <= 0) { fprintf(stderr, "surf-stats: no wraps in %s\n", argv[2]); return 1; }
-    /* faults on the field grid (with the model) */
+    /* faults on the field grid (with the model; not with --ct-only: no density plane) */
     sf_fault_job FJ; memset(&FJ, 0, sizeof FJ); uint8_t *wfield = nullptr;
-    if (ms) {
+    if (ms && !ctonly) {
         int shp[3]; wfield = fit_field_array(sopt(argc, argv, "--fields", ""), "w", 1, shp);
         if (!wfield) { fprintf(stderr, "surf-stats: cannot read the material plane\n"); return 1; }
         FJ.F = &F; FJ.w = wfield; FJ.ms = ms; FJ.st = atoi(sopt(argc, argv, "--fault-stride", "2")); FJ.ratio = atof(sopt(argc, argv, "--fault-ratio", "3"));
@@ -557,12 +566,12 @@ int cmd_surf_stats(int argc, char **argv) {
         const size_t n = (size_t)s.w * s.h; float *e = calloc(n, 4), *cf = calloc(n, 4), *ct = nprof ? malloc(n * nprof * 4) : nullptr;
         for (size_t i = 0; i < (size_t)n * nprof; i++) ct[i] = NAN;
         const int sign = sf_orient(&s, &F, ms ? ms->global : nullptr);
-        float *sr = ms ? malloc(n * 4) : nullptr; if (sr) for (size_t i = 0; i < n; i++) sr[i] = NAN;
-        { ss_job J = {&s, &F, e, cf, nullptr, 0, 0, 0, 0, nullptr, {0}, {0}, 0, s.h, 0, s.w, 0, 0, sign, ms, sr, nullptr, 0};
+        float *sr = ms && !ctonly ? malloc(n * 4) : nullptr; if (sr) for (size_t i = 0; i < n; i++) sr[i] = NAN;
+        if (!ctonly) { ss_job J = {&s, &F, e, cf, nullptr, 0, 0, 0, 0, nullptr, {0}, {0}, 0, s.h, 0, s.w, 0, 0, sign, ms, sr, nullptr, 0};
           pthread_t th[64]; const int m = nt < 64 ? nt : 64; for (int q = 0; q < m; q++) pthread_create(&th[q], nullptr, ss_rows, &J); for (int q = 0; q < m; q++) pthread_join(th[q], nullptr); }
         if (cz && ct_wrap(&ctc, cz, &s, &F, e, cf, ct, nprof, ctum, ctR, ctstep, sign, nt, k, 0)) { fprintf(stderr, "surf-stats: %s\n", z3_error()); }
         size_t wv = 0, wc = 0, wb = 0, won = 0, wct = 0; float *we = malloc(n * 4); size_t wne = 0;
-        uint8_t *clean = ms ? calloc(n, 1) : nullptr;   /* clean vertices (the largest clean sheet) */
+        uint8_t *clean = ms && !ctonly ? calloc(n, 1) : nullptr;   /* clean vertices (the largest clean sheet) */
         for (size_t i = 0; i < n; i++) {
             if (s.Z[i] < 0) continue;
             wv++;
@@ -602,8 +611,8 @@ int cmd_surf_stats(int argc, char **argv) {
         }
         ss_stat S[2] = {{0}}; const int mx = s.w > s.h ? s.w : s.h; int *sb = malloc((mx + 1) * sizeof(int)); double *lb = malloc((mx + 1) * sizeof(double)); float *ub = malloc((mx + 1) * 4);
         for (int d = 0; d < 2; d++) { ss_walk(&s, e, cf, cmin, d, gap_um, min_um, &S[d], sb, lb, ub); A[d].path += S[d].path; A[d].sw += S[d].sw; A[d].runs += S[d].runs; }
-        if (per && wne) { qsort(we, wne, 4, cmp_f32);
-            printf("  w%03d %9zu  %9.3f  %6.3f  %8.3f  %11.2f  %7.2f", s.id, wv, wv ? (double)wc / wv : 0, we[wne / 2], (double)wb / wne,
+        if (per && (wne || (ctonly && wv))) { if (wne) qsort(we, wne, 4, cmp_f32);
+            printf("  w%03d %9zu  %9.3f  %6.3f  %8.3f  %11.2f  %7.2f", s.id, wv, wv ? (double)wc / wv : 0, wne ? we[wne / 2] : 0, wne ? (double)wb / wne : 0,
                    S[0].path > 0 ? S[0].sw / (S[0].path * 1e-4) : 0, S[1].path > 0 ? S[1].sw / (S[1].path * 1e-4) : 0);
             if (cz) printf("  %10.3f", wct ? (double)won / wct : 0);
             printf("\n"); }
@@ -623,7 +632,7 @@ int cmd_surf_stats(int argc, char **argv) {
         printf("surf-stats: spacing to the next wrap outward / the fields' sheet spacing: median %.2f p10 %.2f p90 %.2f; < 0.5 (wraps bunched: a lost turn) %.4f, > 1.5 (a gained turn) %.4f\n",
                srall[nsa / 2], srall[nsa / 10], srall[nsa * 9 / 10], (double)srlo / nsr, (double)srhi / nsr); }
     printf("surf-stats: adjacent normals: angle median %.2f p90 %.2f deg, > 30 deg %.5f\n", na ? aall[na / 2] : 0, na ? aall[na * 9 / 10] : 0, nang ? (double)nang30 / nang : 0);
-    if (ms) printf("surf-stats: clean sheet (outside faults, spacing 0.5..1.5, |e| < 0.25 where confident%s): largest %.3f cm2 (%s), all clean patches %.2f cm2\n",
+    if (ms && !ctonly) printf("surf-stats: clean sheet (outside faults, spacing 0.5..1.5, |e| < 0.25 where confident%s): largest %.3f cm2 (%s), all clean patches %.2f cm2\n",
                    nprof ? ", on papyrus" : "", clean_best, clean_name, clean_tot);
     if (nprof) {
         printf("surf-stats: CT: on papyrus (max CT within +-%.0f um along the normal >= %.0f) %.3f; at the vertex mean %.1f, below %.0f %.3f\n",

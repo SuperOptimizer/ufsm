@@ -6,9 +6,9 @@
 #   ref      count-field ref on the CPU (REFPAR (2) lanes, TH (12) threads each, nice 10; MemAvailable >= MEMGB 40 first)
 #   push     fields + ref + box + axis -> forlindesk (FDGB 250 free there), byte-checked -> forlindesk:<S>/state/fields.ready (fields kept here)
 #   pull     once forlindesk:<S>/state/wraps.ready: its joined model + wraps -> here (byte-checked)
-#   surf     surf-stats --per-wrap --ct: per wrap phase residual / switches and the on-papyrus share (max CT within +-15 um along the normal
+#   surf     surf-stats --per-wrap --ct --ct-only 1 (the fields' geometry only: whole-scroll phase planes OOMed the desk at 137 GB): the on-papyrus share (max CT within +-15 um along the normal
 #            >= the scan's Otsu level, scanprep stats)
-#   flat     SLIM flatten of the NFLAT (40) wraps with the largest vertices x on-papyrus among theta sw/cm <= SWMAX (2.5) and on-papyrus
+#   flat     SLIM flatten of the NFLAT (40) wraps with the largest vertices x on-papyrus among those with on-papyrus
 #            >= ONPAP (0.5); 4 processes x FTH (6) threads; the largest valid rectangle per wrap
 #   render   once the laptop's ink is here (state/ink.ready): rectangles >= MINCM2 (5) upright (tifxyz-scale --flip-rows 1), CT (local) +
 #            ift3 ink at 2 px / voxel, CT | ink side-by-side JPEGs sheets/img/<w>_side.jpg, sheets/sheets.tsv sorted by cm2
@@ -73,7 +73,7 @@ pull() {
 }
 surf() {
   [ -s $O/otsu.txt ] || jq -r .stats.otsu /vesuvius/ufsm/u0/prep/$S-$(basename $K | cut -c1-14).json > $O/otsu.txt
-  N nice -n 5 $U surf-stats $O/wraps --fields $F --threads 16 --per-wrap --ct $R $K/$LV --ct-um $LUM --ct-level $(cat $O/otsu.txt) > $O/logs/surfstats.log 2>&1 || return 1
+  N nice -n 5 $U surf-stats $O/wraps --fields $F --model $O/joined --ct-only 1 --threads 16 --per-wrap --ct $R $K/$LV --ct-um $LUM --ct-level $(cat $O/otsu.txt) > $O/logs/surfstats.log 2>&1 || return 1
   log "surf: $(grep -E '^surf-stats: sheet switches' $O/logs/surfstats.log | cut -c1-110) | $(grep -E '^surf-stats: CT: on papyrus' $O/logs/surfstats.log | cut -c1-120)"
 }
 flat() {   # per-wrap rows of surf-stats --ct: wNNN vertices conf |e|med |e|>.25 theta-sw/cm z-sw/cm on-papyrus

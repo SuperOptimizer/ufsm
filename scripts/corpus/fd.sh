@@ -2,7 +2,7 @@
 # fd.sh: the forlindesk side of the corpus unroll (see common.sh). Loop, in list.tsv order: the next scroll with state/fields.ready (the
 # desk pushed fields + ref) and no wraps yet -> slabs -> join -> wraps -> state/wraps.ready (the desk pulls joined + wraps and does
 # surf-stats, flatten and renders); its fields and slab fits are deleted here.
-#   slabs   fit --ref-model REF --ref-snap 1 --uw-repair 0 per 64-cell slab (+16 overlap), full cross-section, one lane per GPU; air
+#   slabs   fit --ref-model REF --ref-snap 1 --uw-repair 0 --dir (the ref's: count-field finds the handedness, 1447 is -1) per 64-cell slab (+16 overlap), full cross-section, one lane per GPU; air
 #           slabs at the box ends (fit: no data for the prior) count as done and are left out of the join
 #   join    fit-join --ref REF (prints the overlap integer agreement)
 #   wraps   ufsm wraps (.sfc, step 4)
@@ -22,7 +22,7 @@ lane() {   # lane GPU: unclaimed slabs in z order
     c0=$((k * I)); c1=$((c0 + I)); [ $c1 -gt $ze ] && c1=$ze; a=$((c0 - OV)); [ $a -lt 0 ] && a=0; b=$((c1 + OV)); [ $b -gt $ze ] && b=$ze
     rm -rf $d/f $d/fit; bash $C/src/scripts/wbench/mkcrop.sh $F $d/f $a 0 0 $((b - a)) $ny $nx > /dev/null || continue
     echo "$c0 $c1 $a $b" > $d/cells; memok; t0=$(date +%s)
-    env UFSM_FIT_THREADS=10 nice -n 5 $U fit $d/f --gpu $g --out $d/fit --dir 1 --ref-model $REF --ref-snap 1 --uw-repair 0 > $d/fit.log 2>&1; rc=$?
+    env UFSM_FIT_THREADS=10 nice -n 5 $U fit $d/f --gpu $g --out $d/fit --dir $(jq -r .dir $REF/model.json) --ref-model $REF --ref-snap 1 --uw-repair 0 > $d/fit.log 2>&1; rc=$?
     echo "$s $c0..$c1 rc $rc gpu $g $(( $(date +%s) - t0 ))s" >> $O/slabs.txt
     if [ $rc = 0 ]; then touch $d/done; elif grep -q "no data for the prior" $d/fit.log; then touch $d/empty $d/done; fi   # (air slabs: the box ends)
   done
