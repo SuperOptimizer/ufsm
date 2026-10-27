@@ -151,6 +151,8 @@ static int usage(void) {
         "  ufsm phase-score <pc-dir> <ps-dir> [<sheets-dir>]   on-recto score of pc / ps renders on surfaces (per seam class with sheets)\n"
         "  ufsm stitch align|solve|field|sheets|info ...   overlapping box fits -> one gauge, a global winding field, stitched sheets\n"
         "  ufsm render <wraps-dir> <out-dir> --volume ROOT KEY [--ct ROOT KEY]  ink / CT along each wrap (tiled TIFF)\n"
+        "  ufsm flatten <wraps-dir> <out-dir> [--wraps a,b] [--decim 1] [--out-step S]   SLIM-flattened wraps (isometric uv, largest valid rectangle)\n"
+        "  ufsm flatten-warp <in.jpg|tif> <flat-wrap-dir> <out.jpg|tif> --src-px P [--scale S]   a render of the original wrap onto the flat one\n"
         "  ufsm blend <out-group> <out-um> --shape Z,Y,X --interior S <root> <key> <oz,oy,ox>...   shifted predict runs -> one seamless sin^2-weighted logit average\n"
         "  ufsm wrapdist <wraps-dir> <labels-root> <labels-key>              wrap vertices vs the nearest labelled sheet\n"
         "  ufsm wrapswitch <wraps-dir> <codes-root> <codes-key>            how often the wraps switch sheets (per cm)\n"
@@ -3739,6 +3741,8 @@ static int cmd_sample(int argc, char **argv) {
 int cmd_repack(int argc, char **argv);   /* src/repack.c */
 int cmd_fit_join(int argc, char **argv);   /* src/fitjoin.c */
 int cmd_fields_oracle(int argc, char **argv);   /* src/fieldsoracle.c */
+int cmd_flatten(int argc, char **argv);         /* src/flatten.c */
+int cmd_flatten_warp(int argc, char **argv);
 int cmd_fiber_check(int argc, char **argv);    /* src/fibercheck.c */
 int cmd_fiber_export(int argc, char **argv);   /* src/fibercheck.c */
 int cmd_count_field(int argc, char **argv);   /* src/countfield.c */
@@ -3774,6 +3778,8 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "fit")) return cmd_fit(argc, argv);
     if (!strcmp(cmd, "fit-join")) return cmd_fit_join(argc, argv);
     if (!strcmp(cmd, "fields-oracle")) return cmd_fields_oracle(argc, argv);
+    if (!strcmp(cmd, "flatten")) return cmd_flatten(argc, argv);
+    if (!strcmp(cmd, "flatten-warp")) return cmd_flatten_warp(argc, argv);
     if (!strcmp(cmd, "fiber-check")) return cmd_fiber_check(argc, argv);
     if (!strcmp(cmd, "fiber-export")) return cmd_fiber_export(argc, argv);
     if (!strcmp(cmd, "count-field")) return cmd_count_field(argc, argv);

@@ -161,6 +161,23 @@ against each method's uncorrupted fit after integer gauge alignment. Approximate
 stability needs further work.
 Whole-scroll topology and accuracy are not established by these local checks.
 
+## Flattening wraps
+
+Wraps are parameterized by column = angle and row = z, so their renders are sheared and stretched
+(Paris 4 w072: σmax/σmin median 1.6). `ufsm flatten` SLIM-flattens each wrap
+(symmetric Dirichlet, multilevel, flip-free line search; `src/flatten.h`). It then resamples
+the wrap onto an isometric uv grid and crops it to the largest fully valid rectangle; enclosed
+tears of up to `--fill-holes` vertices are Laplace-filled first and shown orange in
+`<out>/<wrap>_mask.jpg`. `ufsm render` of the output is the flattened render.
+`flatten-warp` moves an existing render of the original wrap onto the flat grid, through the
+`gu.tif` and `gv.tif` source-grid maps:
+
+```sh
+build/ufsm flatten wraps flat --wraps w072 --threads 16      # distortion before / after on stdout
+build/ufsm render flat r --volume ink.zarr 9.6 --ct CT 2 --depth 1 --scale 2
+build/ufsm flatten-warp old/w072_published.jpg flat/w072 r/w072_published.tif --src-px 8 --scale 2
+```
+
 ## Prediction input transform
 
 `predict --input-gain G --input-bias B` exposes the standardized CT transform
