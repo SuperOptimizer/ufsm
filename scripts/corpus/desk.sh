@@ -118,8 +118,11 @@ flat() {   # per-wrap rows of surf-stats --ct: wNNN vertices conf |e|med |e|>.25
   new=$(for w in $list; do [ -e $O/flat/flat/$w ] || echo $w; done)
   if [ -n "$new" ]; then
     N nice -n 5 $U tifxyz-scale $O/wraps $O/flat/orig 1 --wraps $(echo $new | tr ' ' ',') > $O/logs/flat-scale.$R.log 2>&1 || return 1
-    for grp in $(echo $new | tr ' ' '\n' | awk '{a[NR % 4] = a[NR % 4] (a[NR % 4] ? "," : "") $1} END {for (k in a) print a[k]}'); do
-      N nice -n 5 $U flatten $O/flat/orig $O/flat/flat --wraps $grp --threads ${FTH:-6} > $O/logs/flatten.$R.$g.log 2> $O/logs/flatten.$R.$g.err & g=$((g + 1))
+    for w in $new; do   # one flatten per wrap, FPAR (4) at once; --decim from the wrap's vertices: the finest SLIM mesh <= FMAXV (1.5M)
+      local nv=$(awk -v w=$w '$1 == w {print $2}' $O/logs/surfstats.log) dc
+      dc=$(awk -v n=${nv:-0} -v m=${FMAXV:-1500000} 'BEGIN { d = 1; while (n / (d * d) > m) d++; print d }')
+      N nice -n 5 $U flatten $O/flat/orig $O/flat/flat --wraps $w --decim $dc --threads ${FTH:-6} > $O/logs/flatten.$R.$w.log 2> $O/logs/flatten.$R.$w.err &
+      while [ $(jobs -r | wc -l) -ge ${FPAR:-4} ]; do sleep 5; done
     done; wait
   fi
   cat $O/logs/flatten.*.log > $O/flat/flatten.log
