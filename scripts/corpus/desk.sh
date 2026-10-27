@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
-# desk.sh: the desk side of the corpus unroll (see common.sh): for every scroll of list.tsv in order: prep -> wind96 fields (GPU 0) ||
-# ift3-24000 ink (GPU 1) -> push to forlindesk in the background (one push at a time) while the next scroll predicts.
+# desk.sh: the desk side of the corpus unroll (see common.sh). Lanes (one process; restart-safe: done markers + flock claims):
+#   prep     every scroll up front, PREPPAR (6) at once: box of the scanprep mask (object cells padded one cell, 64-aligned level voxels),
+#            axis (list.tsv umbilicus or ufsm axis = per-z centroid of the masked CT)
+#   gpu 0/1  wind96 fit fields of one scroll per GPU (run3-cf predict settings) + lossless repack to 512^3 shards; waits for SPACEGB
+#   ref      count-field ref on the CPU (REFPAR (2) lanes, TH (12) threads each, nice 10 under the predicts; MemAvailable >= MEMGB 40 first)
+#   push     fields + ref + box + axis -> forlindesk (FDGB 250 free there), byte-checked -> forlindesk:<S>/state/fields.ready; desk fields deleted
 # Start: cd /vesuvius/ufsm/corpus && setsid nohup bash src/scripts/corpus/desk.sh > desk.out 2>&1 < /dev/null &
-# Env: ONLY ("S1 S2": these scrolls), SPACEGB (120 free desk GB before a predict), FDGB (250: free forlindesk GB before a push),
-#   INK (1), WAITGPU (1: wait until no other process holds a desk GPU before each scroll's predicts).
+# Env: ONLY ("S1 S2"), SPACEGB (150: free desk GB before a predict), GPUS ("0 1"), WAITGPU (1: a lane waits until its GPU holds no other process).
 H=$(cd "$(dirname "$0")" && pwd); . $H/common.sh
+LIST=${ONLY:-$(scrolls)}
 
-prep() {   # box of the scanprep mask (object cells, padded one cell, 64-aligned, level voxels) and the axis
+prep() {
   local id=$(basename $K | cut -c1-14) m sh GZ GY GX cell
   m=/vesuvius/ufsm/u0/prep/$S-$id.mask.raw; sh=$(jq -r '.shape | join(" ")' $R/$K/$LV/zarr.json)
   read -r GZ GY GX < <(jq -r '.grid | join(" ")' $m.json); cell=$(jq -r .cell $m.json)
@@ -18,53 +22,58 @@ prep() {   # box of the scanprep mask (object cells, padded one cell, 64-aligned
       for (d = 1; d <= 3; d++) { lo = (a[d] - 1) * c; if (lo < 0) lo = 0; lo = int(lo / 64) * 64; hi = (b[d] + 2) * c; if (hi > s[d]) hi = s[d]; o[d] = lo; e[d] = hi - lo }
       printf "%d,%d,%d,%d,%d,%d\n", o[1], o[2], o[3], e[1], e[2], e[3] }' > $O/box.txt
   [ -s $O/box.txt ] || return 1
-  # axis: an umbilicus in the scan's own frame (list.tsv) or ufsm axis (per-z centroid of the masked CT)
   if [ "$AXS" = auto ]; then N $U axis $R $K $O/axis.json > $O/logs/axis.log 2>&1 || return 1; else cp $AXS $O/axis.json; fi
   log "box $(cat $O/box.txt) (level $LV, $LUM um), axis $AXS"
 }
-fields() {
-  space || return 1; rm -rf $F $F.tmp
+fields() {   # (GPU $G)
+  rm -rf $F $F.tmp
   N $U predict $CK $R $K $F.tmp --um $UM --level $LV --box $(cat $O/box.txt) --window-z 384 --halo-z 64 --window 640 --halo 64 --shard 512 \
-    --grid-origin 0,0,0 --ema 1 --q 8 --threads 16 --gpu 0 --axis $O/axis.json --levels 1 --fit-zarr $F --fit-h 2 --fit-q 8 --fit-q-phase 0 \
-    --no-out 1 > $O/logs/fields.log 2>&1; local rc=$?; rm -rf $F.tmp; [ $rc = 0 ] && [ -e $F/fields.json ]
-}
-ink() {   # plain (one pass, halo 0) ift3 predict of the box: has window-border seams (N: ink-blend of 8 offset passes fixes them, 8x cost)
-  [ "${INK:-1}" = 1 ] || return 0
-  N $U predict $INKCK $R $K $O/ink.zarr --um $UM --level $LV --box $(cat $O/box.txt) --shard 1024 --window 1024 --halo 0 --ema 1 --q 32 --threads 16 \
-    --gpu 1 --full-grid 1 --resume 1 --occupancy 5 --levels 4 >> $O/logs/ink.log 2>&1
-}
-bytes() { du -sb --apparent-size "$@" | awk '{s += $1} END {print s + 0}'; }
-push() {   # fields, ink, the CT level, box + axis -> forlindesk C/<S>; byte-checked; then forlindesk:<S>/state/ready and the desk fields deleted
-  local f=$(ssh -n $FD "df -BG --output=avail $C | tail -n 1" | tr -dc 0-9) d=$C/$S cn=$(basename $K) a b
-  [ "${f:-0}" -ge ${FDGB:-250} ] || { log "push: forlindesk has ${f:-?} GB free (FDGB ${FDGB:-250})"; return 1; }
-  for a in $F/*/zarr.json; do   # predict --fit-zarr writes 128^3 shards: lossless repack to 512^3 (64x fewer files), plane by plane
+    --grid-origin 0,0,0 --ema 1 --q 8 --threads 12 --gpu $G --axis $O/axis.json --levels 1 --fit-zarr $F --fit-h 2 --fit-q 8 --fit-q-phase 0 \
+    --no-out 1 > $O/logs/fields.log 2>&1 || return 1
+  rm -rf $F.tmp; [ -e $F/fields.json ] || return 1
+  local a b; for a in $F/*/zarr.json; do   # predict --fit-zarr writes 128^3 shards: lossless repack to 512^3 (64x fewer files)
     jq -e '.chunk_grid.configuration.chunk_shape[0] == 512' $a > /dev/null && continue; b=$(dirname $a)
-    rm -rf $b.512 && N $U repack $b $b.512 512 --threads 16 > /dev/null && rm -rf $b && mv $b.512 $b || return 1
+    rm -rf $b.512 && N $U repack $b $b.512 512 --threads 12 > /dev/null && rm -rf $b && mv $b.512 $b || return 1
   done
-  ssh -n $FD "mkdir -p $d/state $d/logs $d/ct/$cn" || return 1
-  rsync -a $O/box.txt $O/axis.json $FD:$d/ && rsync -a $F/ $FD:$d/fields/ && { [ "${INK:-1}" != 1 ] || rsync -a $O/ink.zarr/ $FD:$d/ink.zarr/; } &&
-    rsync -a $R/$K/zarr.json $FD:$d/ct/$cn/ && rsync -a $R/$K/$LV/ $FD:$d/ct/$cn/$LV/ || return 1
-  for p in "$F fields" "$O/ink.zarr ink.zarr" "$R/$K/$LV ct/$cn/$LV"; do set -- $p; [ -e $1 ] || continue
-    a=$(bytes $1); b=$(ssh -n $FD "du -sb --apparent-size $d/$2" | awk '{print $1}')
-    [ "$a" = "$b" ] || { log "push: $2 $a bytes here, ${b:-?} on forlindesk"; return 1; }; done
-  ssh -n $FD "echo '$(date '+%F %T') $(bytes $F) field bytes' > $d/state/ready" || return 1
-  rm -rf $F; log "push: $(awk -v b=$(ssh -n $FD "du -sb $d" | awk '{print $1}') 'BEGIN { printf "%.1f", b / 1e9 }') GB on forlindesk, desk fields deleted"
+  log "fields $(du -sh $F | cut -f1)"
+}
+ref() {
+  rm -rf $REF; memok
+  /usr/bin/time -v nice -n 10 $U count-field $F $O/cf.unused --R 0 --pool 8 --phase-w 4 --iters 1200 --model $REF --model-only 1 --model-stride 2 \
+    --threads ${TH:-12} --mem-gb ${CFMEM:-24} > $O/logs/ref.log 2>&1 && [ -e $REF/model.json ]
+}
+push() {
+  local f=$(ssh -n $FD "df -BG --output=avail $FDC | tail -n 1" | tr -dc 0-9) d=$FDC/$S a b p
+  [ "${f:-0}" -ge ${FDGB:-250} ] || { log "push: forlindesk has ${f:-?} GB free (FDGB ${FDGB:-250})"; return 1; }
+  ssh -n $FD "mkdir -p $d/state $d/logs" && rsync -a $O/box.txt $O/axis.json $FD:$d/ && rsync -a $F/ $FD:$d/fields/ && rsync -a $REF/ $FD:$d/ref/ || return 1
+  for p in fields ref; do a=$(bytes $O/$p); b=$(ssh -n $FD "du -sb --apparent-size $d/$p" | awk '{print $1}')
+    [ "$a" = "$b" ] || { log "push: $p $a bytes here, ${b:-?} on forlindesk"; return 1; }; done
+  ssh -n $FD "echo '$(date '+%F %T') $(bytes $F) field bytes' > $d/state/fields.ready" || return 1
+  rm -rf $F; log "push: fields + ref on forlindesk ($(awk -v b=$a 'BEGIN { printf "%.1f", b / 1e9 }') GB ref), desk fields deleted"
+}
+# a lane: LANE STAGE NEED FN [G]: every scroll of LIST whose NEED stage is done (or NEED = -) and STAGE is not, claimed; until none is left
+lane() {
+  local st=$1 need=$2 fn=$3 left; G=${4:-}
+  while ! stopped; do
+    left=0
+    for S in $LIST; do
+      scan $S || continue; failed && continue; done_ $st && continue; left=$((left + 1))
+      [ "$need" = - ] || done_ $need || continue
+      claim $st || continue
+      if [ $st = fields ]; then
+        while [ "${WAITGPU:-1}" = 1 ] && nvidia-smi -i $G --query-compute-apps=pid --format=csv,noheader | grep -q .; do sleep 60; done
+        while [ $(freegb) -lt ${SPACEGB:-150} ]; do log "fields waits: $(freegb) GB free (SPACEGB ${SPACEGB:-150})"; sleep 600; done
+      fi
+      run $st $fn; unclaim
+    done
+    [ $left = 0 ] && break; sleep 60
+  done
 }
 
-LIST=${ONLY:-$(tail -n +2 $C/list.tsv | cut -f1)}; PP=
-for S in $LIST; do
-  stopped && break; scan $S || continue; [ -e $O/state/failed ] && { log "failed before, skipped"; continue; }
-  done_ push && continue
-  run prep prep || continue
-  if ! done_ fields || ! done_ ink; then
-    while [ "${WAITGPU:-1}" = 1 ] && [ -n "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ]; do sleep 60; done   # (our own predicts have ended here)
-    ( run ink ink ) & IP=$!
-    run fields fields; rf=$?; wait $IP; ri=$?
-    [ $rf = 0 ] && [ $ri = 0 ] || continue
-  fi
-  [ -n "$PP" ] && wait $PP   # one push at a time
-  ( run push push ) & PP=$!
-done
-[ -n "$PP" ] && wait $PP
-ssh -n $FD "touch $C/desk.done"
+for S in $LIST; do scan $S; (failed || done_ prep) && continue; ( run prep prep ) &
+  while [ $(jobs -r | wc -l) -ge ${PREPPAR:-6} ]; do sleep 5; done; done; wait
+for g in ${GPUS:-0 1}; do lane fields prep fields $g & done
+for k in $(seq 1 ${REFPAR:-2}); do lane ref fields ref & sleep 5; done
+lane push ref push & wait
+ssh -n $FD "touch $FDC/desk.done"
 echo "$(date '+%m-%d %H:%M:%S') desk.sh done" >> $C/corpus.log
