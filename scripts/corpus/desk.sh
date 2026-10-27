@@ -157,7 +157,14 @@ clean() { rm -rf $F $O/flat/orig $O/sheets/r/*/*.tif; ssh -n $FD "rm -rf $FDC/$S
 # a lane: LANE STAGE NEED FN [G]: every scroll of LIST whose NEED holds (a stage name: its done marker; a function name ending in _ready;
 # -: always) and STAGE is not done, claimed; until no scroll is left
 cpu_slot() {   # one of CPUSLOTS (2) desk-wide CPU slots for the heavy CPU stages (flock on fd 7)
-  local i; while :; do for i in $(seq 1 ${CPUSLOTS:-2}); do exec 7> $C/cpu.slot$i; flock -n 7 && return 0; done; exec 7>&-; sleep 30; done; }
+  # downstream first (render > flat > surf > ref): a waiting stage leaves cpu.want.<rank>.<pid> (refreshed each round) and a stage takes a
+  # free slot only when no fresher-than-2-min want of a higher rank exists (otherwise surf won the 30 s race and renders waited for hours)
+  local i r w me; case $st in render) r=3;; flat) r=2;; surf) r=1;; *) r=0;; esac; me=$C/cpu.want.$r.$BASHPID
+  while :; do
+    touch $me; w=$(find $C -maxdepth 1 -name "cpu.want.*" -mmin -2 | awk -F. -v r=$r '$(NF-1) > r' | head -n 1)
+    if [ -z "$w" ]; then for i in $(seq 1 ${CPUSLOTS:-2}); do exec 7> $C/cpu.slot$i; flock -n 7 && { rm -f $me; return 0; }; done; exec 7>&-; fi
+    sleep 30
+  done; }
 lane() {
   local st=$1 need=$2 fn=$3 left; G=${4:-}
   while ! stopped; do
