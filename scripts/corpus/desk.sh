@@ -56,7 +56,7 @@ fields() {   # (GPU $G)
   log "fields $(du -sh $F | cut -f1)"
 }
 refq_ready() {   # the fallback: pushed here, forlindesk has > 1 pushed scroll without wraps, and nobody owns this scroll's ref yet
-  done_ push || return 1
+  done_ push && [ -e $F/pc ] || return 1   # (the fields are stripped after the push unless KEEPF=1)
   local q=$(ssh -n $FD "cd $FDC; n=0; for f in */state/fields.ready; do s=\${f%%/*}; [ -e \$s/state/wraps.ready ] || [ -e \$s/state/failed ] || n=\$((n + 1)); done; echo \$n; test -e $S/state/ref.lock && echo owned" 2>/dev/null)
   case "$q" in *owned*) done_ ref || mark ref "owned on forlindesk"; return 1;; esac; [ "${q:-0}" -gt 1 ]
 }
@@ -68,7 +68,8 @@ ref() {
        --threads $TH --mem-gb ${CFMEM:-24} > $O/logs/ref.log 2>&1 || [ ! -e $REF/model.json ]; then ssh -n $FD "rm -rf $d/state/ref.lock"; return 1; fi   # (forlindesk may take it then)
   rsync -a $REF/ $FD:$d/ref/ || return 1; a=$(bytes $REF); b=$(ssh -n $FD "du -sb --apparent-size $d/ref" | awk '{print $1}')
   [ "$a" = "$b" ] || { log "ref push: $a bytes here, ${b:-?} on forlindesk"; return 1; }
-  ssh -n $FD "echo '$(date '+%F %T') desk' > $d/state/ref.ready" && log "ref: computed here, on forlindesk"
+  ssh -n $FD "echo '$(date '+%F %T') desk' > $d/state/ref.ready" && log "ref: computed here, on forlindesk" || return 1
+  [ "${KEEPF:-0}" = 1 ] || find $F -mindepth 1 -maxdepth 1 ! -name fields.json -exec rm -rf {} +
 }
 push() {
   local f=$(ssh -n $FD "df -BG --output=avail $FDC | tail -n 1" | tr -dc 0-9) d=$FDC/$S a b
@@ -82,6 +83,7 @@ push() {
   fi
   ssh -n $FD "echo '$(date '+%F %T') $a field bytes' > $d/state/fields.ready" || return 1
   log "push: fields on forlindesk ($(awk -v b=$a 'BEGIN { printf "%.1f", b / 1e9 }') GB)"
+  [ "${KEEPF:-0}" = 1 ] || find $F -mindepth 1 -maxdepth 1 ! -name fields.json -exec rm -rf {} +   # (surf --ct-only reads fields.json only; forlindesk computes the refs)
 }
 wraps_ready() { ssh -n $FD "test -e $FDC/$S/state/wraps.ready"; }
 pull() {
