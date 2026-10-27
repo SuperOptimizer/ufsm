@@ -42,6 +42,7 @@ uint8_t *png_read_rgb(const char *path, int *w, int *h);
 /* xform_wraps.py: x / y / z of the tifxyz src divided by div (float32), minus off (z, y, x) where z >= 0, -1 elsewhere;
    meta.json copied with scale x div and voxel_size_um x div. Grids written deflate float32 TIFFs. 0 on success. */
 int tifxyz_scale(const char *src, const char *dst, double div, const double off[3]);
+extern int tifxyz_flip_rows;   /* tifxyz_scale: 1 = write the rows in reverse order (renders of Paris 4 wraps read upright; ufsm tifxyz-scale --flip-rows 1) */
 /* the tifxyz src copied to dst with every vertex moved d (its own units) along the vertex normal +n = (d/d column) x (d/d row)
    (central differences over valid neighbours; vertices without a normal stay); meta.json copied. toward = {y, x} (a vertical line, the
    scroll axis): +n is first flipped when most vertex normals face away from it, so D > 0 moves the sheet INWARD. 0 on success */

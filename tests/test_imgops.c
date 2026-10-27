@@ -92,6 +92,16 @@ static void test_tifxyz_scale(void) {
         bad += memcmp(&X[i], &ex, 4) != 0 || memcmp(&Z[i], &ez, 4) != 0;
     }
     CHECK(X && Z && !bad, "tifxyz scale: %d vertices differ", bad);
+    {   /* --flip-rows: row r of the output = row H-1-r of the input */
+        tifxyz_flip_rows = 1; const char *df = "/tmp/ufsm_test_imgops_flip"; int fbad = 1;
+        if (!tifxyz_scale(s, df, 4, off)) {
+            snprintf(p, sizeof p, "%s/z.tif", df); float *F = img_read_f32(p, &w, &h); fbad = !F;
+            for (int i = 0; F && i < W * H; i++) { const int j = (H - 1 - i / W) * W + i % W; const float ez = z[j] < 0 ? -1.f : z[j] / 4.f - 10.f; fbad += memcmp(&F[i], &ez, 4) != 0; }
+            free(F);
+        }
+        tifxyz_flip_rows = 0; CHECK(!fbad, "tifxyz scale --flip-rows: rows reversed");
+        snprintf(p, sizeof p, "rm -rf %s", df); CHECK(!system(p), "cleanup flip");
+    }
     snprintf(p, sizeof p, "%s/meta.json", d); FILE *f = fopen(p, "rb"); char m[2048] = {0};
     if (f) { CHECK(fread(m, 1, sizeof m - 1, f) > 0, "meta read"); fclose(f); }
     CHECK(strstr(m, "\"scale\": [1, 1]") && strstr(m, "\"voxel_size_um\": 9.596") && strstr(m, "\"winding\": 150"), "tifxyz scale meta: %s", m);

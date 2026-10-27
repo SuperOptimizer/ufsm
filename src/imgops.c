@@ -343,6 +343,7 @@ out:
     for (int k = 0; k < 3; k++) { free(A[k]); free(O[k]); free(Nv[k]); }
     return rc;
 }
+int tifxyz_flip_rows = 0;
 int tifxyz_scale(const char *src, const char *dst, double div, const double off[3]) {
     char p[1400]; static const char *nm[3] = {"x", "y", "z"}; float *A[3] = {0}; int w = 0, h = 0, rc = -1;
     for (int k = 0; k < 3; k++) {
@@ -354,7 +355,7 @@ int tifxyz_scale(const char *src, const char *dst, double div, const double off[
     const float df = (float)div, of[3] = {(float)off[2], (float)off[1], (float)off[0]};   /* x, y, z */
     const size_t n = (size_t)w * h; float *o = malloc(n * 4); if (!o) goto out;
     for (int k = 0; k < 3; k++) {
-        for (size_t i = 0; i < n; i++) o[i] = tifxyz_scaled(A[k][i], A[2][i], df, of[k]);
+        for (size_t i = 0; i < n; i++) { const size_t j = tifxyz_flip_rows ? (size_t)(h - 1 - (int)(i / w)) * w + i % w : i; o[i] = tifxyz_scaled(A[k][j], A[2][j], df, of[k]); }
         snprintf(p, sizeof p, "%s/%s.tif", dst, nm[k]); if (tiffw_write(p, w, h, 3, o, 1)) { free(o); goto out; }
     }
     free(o);
