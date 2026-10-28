@@ -317,6 +317,7 @@ test-all: $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover $(B)/test_ct_augme
 	./$(B)/test_recompute_live
 	./$(B)/test_share_enc_a1
 	python3 tests/test_pipeline_cli.py
+	python3 tests/test_val_window.py
 	python3 tests/test_cover_training.py
 	python3 tests/test_production.py
 	./$(B)/test_checkpoint

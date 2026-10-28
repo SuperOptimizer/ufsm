@@ -6,6 +6,81 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## perf baselines 2026-10: integration (2026-10-20)
+
+The isolated `perf-int` worktree starts at production `phase-sign-20261019`
+(`ce8bfa2`), preserving unwrap2, loader2, phase-sign sources and the multi-GPU GN
+buffer fix. Master and production training are untouched.
+
+- D's normalization implementation and tests already match production. Its old
+  branch was cherry-picked earlier; a trial merge conflicted with the newer S1
+  slab kernels, unwrap2, Hyperball and weight-layout changes. The redundant merge
+  was aborted; the production implementations are retained.
+- X (`069223f`) adds `--val-P`. The train.c conflict retains the new independent
+  validation network and production's unwrap2 validation metrics. The DESIGN.md
+  conflict retains both sections. The option currently supports plain cubic
+  recto losses only; it does not yet implement a winding-context experiment.
+- R is already present, including loader2's newer sampler and `086d16a`'s
+  additional preservation of soft side votes. Re-merging the older sampler
+  would discard those updates. All K1 changes have patch-equivalent commits in
+  production; no kernel code is replaced during this integration.
+
+`bench/fulltest.sh` runs the same full test-all recipes from its own worktree,
+builds both ordinary and VERIFY binaries with eight jobs, and records each test
+independently. The previous external runner hardcodes `~/ufsm` and tmpfs logs,
+so it cannot verify this worktree. The adapted runner uses disk-backed logs and
+TMPDIR under `~/ufsm-data/perf-int`, and takes the cooperative GPU lock per test.
+It compares the result with the five known failures and rejects any difference.
+`tests/test_val_window.py` checks fixed validation voxels across P16/P32, matching
+zero-LR validation scores through the separate network, and invalid geometries.
+
+### Laptop benchmark protocol
+
+The user has reserved no desk GPUs; all execution uses the laptop RTX 5080M.
+`bench/perf_baseline.sh` records exact native CLI commands, the source patch,
+planner bytes, `/usr/bin/time -v` host peak, 100 ms board-memory samples, and
+training/prediction logs. `bench/perf_summary.py` rejects throughput from runs
+with skipped non-finite updates. Training rates exclude the first five-step
+warm-up interval. The reported rate excluding sampler wait still includes
+upload, optimizer, and host overhead; it is not a kernel-only rate.
+
+Both layouts use the current unwrap2 task (11 outputs), MX4, scale conditioning,
+down norm, packed targets and GPU input. The seven-level layout is
+16,16,32,64,128,192,256; wind96 is 32,64,96,128,160,192 with decoder widths 0,32.
+They must not be compared directly with the older two-output P512 4.63 GB
+measurement. In particular, level-0 three-buffer storage accepts at most four
+outputs, and head slabs currently require 32 level-0 channels.
+
+The fixture is real Paris4 CT and existing band/phase labels from the local box.
+The old seven-level checkpoint has a known label convention problem and is used
+only to start from finite numerical weights, never as an accuracy reference.
+No claim of labeled ground truth or model quality follows from these timings.
+The default sampler repeats a fixed physical box, so these are local hot-cache
+performance measurements, not random full-corpus throughput. At 9.6 um the input
+uses CT level 2 and at 2.4 um level 0, with matching physical locations.
+`bench/prepare_local_data.sh` creates a private symlink mirror and fetches its
+missing compressed level-5 occupancy shard; shared CT metadata is unchanged.
+
+The main training matrix uses one worker/two slots to keep each job below the
+8 GiB cap while other laptop work runs. The six-worker/13-slot host comparison
+uses P256; six simultaneous P512 samplers need a separate memory budget. All
+cases acquire `~/ufsm-data/gpu.lock`. Windows which the dry planner rejects are
+recorded as not fitting, rather than launched to OOM the laptop.
+
+Commands (prefix each with `MEM=8G ~/ufsm-data/capped.sh bash -c`):
+
+```sh
+bench/prepare_local_data.sh
+bench/perf_baseline.sh dry ~/ufsm-data/perf-int/baseline-dry-a2
+NETS=wind2-7level WINDOWS="512x512 256x768" SCALES="9.6 2.4" POLICIES="auto fast" WORKERS=1 SLOTS=2 STEPS=15 CASE_TIMEOUT=600 bench/perf_baseline.sh train ~/ufsm-data/perf-int/baseline-train-a1
+NETS=wind2-7level WINDOWS=256x256 SCALES="9.6 2.4" POLICIES=auto WORKERS=6 SLOTS=13 STEPS=15 CASE_TIMEOUT=600 bench/perf_baseline.sh train ~/ufsm-data/perf-int/baseline-host6-a1
+bench/perf_baseline.sh infer ~/ufsm-data/perf-int/baseline-infer-a2
+```
+
+Inference uses 512-cubed output shards and valid interior strides (256 at window
+512, 256 at window 384, and 512 at window 640). Report processed window voxels
+and unique output voxels separately: overlap changes the amount of work.
+
 ## Spiral-fit heads only: train --task unwrap2, a gauge-free winding mod 4 head (2026-10-18)
 
 User (10-18): drop the recto and ink heads from the winding model; add only heads whose training data follows from our ground truth.
@@ -173,6 +248,30 @@ id), the scroll's umbilicus, provenance (author / run) to form sets; a reference
 they exist, else the largest consistent set or our fit's dense winding raster (unassigned surfaces wait for it); per-vertex q from
 authors that publish it can replace wind-assign's (then wind-assign is the consistency check). Open: surfaces of another scan of
 the same scroll must be registered onto the reference scan first (surfcomp re-registrations exist for Paris4's 81 segments).
+
+## Training window P768 vs P512 on the same validation voxels: train --val-P N (2026-10-16)
+`train --val-P N` (N <= P, a multiple of 2^(nlev-1)) validates on N^3 windows whatever the training window: an inference-only
+copy of the network on GPU 0 (its own N^3 build; the planner keeps its bytes free) reads the training net's current weights
+(`unet_fwd_params`) and scores the windows through GPU 0's batch buffers. The startup line prints a hash of the validation
+windows' bytes: P128, P256 `--val-P 128` and P128 through the copy (`UFSM_VALP_FORCE=1`) print the same hash; the copy's loss
+equals the plain pass to 2e-4 (the inference build's arithmetic). The copy takes ~19 B per N^3 voxel (1.08 GB at 384^3), so a
+P768 trainer (13.8 GB) fits a 16 GB card with `--val-P 384`, not 512. Plain cube windows and losses only.
+
+A/B on the desk (GPU 0 alone, production recipe: sources-rv24 2.4 um, 7 levels 16..256, Muon, --det 1, seed 1, --aug none,
+all three scored on the same 8 windows of 384^3, `--val-P 384 --val-seed 1`; EMA-weight validation loss):
+
+| arm | P | steps | wall s | Mvox/s | GPU 0 peak | val 500 | 1000 | 1500 | 2000 | end |
+|---|---|---|---|---|---|---|---|---|---|---|
+| A | 512 | 2000 | 1251 | 219 | 5.99 GB | .69053 | .67182 | .65939 | .65242 | .65242 |
+| B | 768 | 2000 | 4172 | 222 | 15.52 GB | .69247 | .66986 | .65530 | .64717 | .64717 |
+| C | 512 | 6670 (B's wall clock) | 4099 | 220 | 5.99 GB | .69521 | .67113 | .65919 | .65255 | .63354 |
+
+- Matched steps (B vs A at 2000): P768 better by 0.005 with 3.4x the voxels per step (about the run-to-run noise, ~0.003).
+- Matched compute (B vs C, ~4100 s, ~900 G voxels each): P512 for 3.3x the steps better by **0.014**. At this length the
+  window is not what limits the side task: more optimizer steps beat more voxels per step (windows of one scroll region are
+  highly correlated, so a larger window acts like a larger batch). The receptive field (~1000 voxels) exceeds both windows.
+- Caveats: one seed; evaluation on 384^3 windows (a P768-trained net's use of longer context at inference windows is not
+  measured); 2000-step runs. Same throughput (~220 Mvox/s) either way.
 
 ## Level-0 kernels outside the 16-channel convs; why test_l3_sched broke under a fused GN-backward sum (2026-10-16)
 Desk 5060 Ti, P512 production net (`tests/bench_l0misc`: per-call times and output hashes; every change below is bit for bit):
