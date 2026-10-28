@@ -127,6 +127,21 @@ flat() {   # per-wrap rows of surf-stats --ct: wNNN vertices conf |e|med |e|>.25
   log "flat: $(echo $new | wc -w) new of $(echo $list | wc -w) listed; $(grep -cE '^w[0-9]+: input' $O/flat/flatten.log) flattened ($(grep -E '^w[0-9]+: input' $O/flat/flatten.log | grep -oE '= [0-9.]+ cm2' | awk '{s += $2} END {printf "%.0f", s}') cm2 whole), rectangles >= ${MINCM2:-5} cm2: $(grep -E '^w[0-9]+_r[0-9]+: rect' $O/flat/flatten.log | grep -oE '= [0-9.]+ cm2' | awk -v m=${MINCM2:-5} '$2 >= m {n++; s += $2} END {printf "%d (%.0f cm2)", n, s}')"
 }
 ink_ready() { done_ flat && [ -e $O/state/ink.ready ]; }
+fdink_ready() {   # a forlindesk ink lane (fdink.sh) finished S: inkbl.zarr + state/ink.fdready there (a laptop ink, ink.2pass here, ends the lane's wait)
+  if ssh -n $FD "test -e $FDC/$S/state/ink.fdready"; then return 0; fi
+  [ -e $O/state/ink.2pass ] && mark inkpull "the laptop's"; return 1
+}
+inkpull() {   # forlindesk's blended ink -> <S>/ink.zarr (byte-checked) -> ink.ready + ink.2pass (a re-ink's render / clean redone), deleted there
+  local d=$FDC/$S a b
+  rm -f $O/state/ink.ready $O/state/ink.2pass
+  rsync -a --delete $FD:$d/inkbl.zarr/ $O/ink.zarr/ || return 1
+  a=$(bytes $O/ink.zarr); b=$(ssh -n $FD "du -sb --apparent-size $d/inkbl.zarr" | awk '{print $1}')
+  [ "$a" = "$b" ] || { log "inkpull: $a bytes here, ${b:-?} on forlindesk"; return 1; }
+  echo "$(date '+%F %T') $a ink bytes ($(ssh -n $FD "cat $d/state/ink.fdready" | grep -oE 'fd-g[0-9]+'))" > $O/state/ink.ready; cp $O/state/ink.ready $O/state/ink.2pass
+  rm -f $O/state/render.done $O/state/clean.done
+  ssh -n $FD "rm -rf $d/inkbl.zarr $d/gn.bin $d/blend.done $d/state/ink.fdready"
+  log "inkpull: $(awk -v b=$a 'BEGIN { printf "%.2f", b / 1e9 }') GB from forlindesk"
+}
 render() {   # each flattened wrap rendered WHOLE once (CT + ink, upright: flip-rows), <w>_full_side.jpg (<= 8k px), then every rects.tsv
   # rectangle cut from that render (ink-compare --crop) -> <w>_r<k>_side.jpg + panels; sheets.tsv: a <w>_full row + one row per rectangle
   local P=$O/sheets w cm a50 d st op qu line il gs H px=$(awk -v u=$LUM 'BEGIN { print u / 2 }') k x y rw rh rc ra
@@ -198,6 +213,7 @@ lane ref refq_ready ref &
 lane pull wraps_ready pull &
 lane surf pull surf &
 lane flat surf flat &
+lane inkpull fdink_ready inkpull &
 lane render ink_ready render &
 lane clean render clean &
 wait
