@@ -32,3 +32,5 @@ size_t ie_tile_bytes_gpu(int kind);   /* rough peak device memory of one tile in
 
 /* per-tile input normalisation parameters (host): y = clamp(x, lo, hi) * a + b */
 void ie_robust_params(const uint8_t *x, size_t n, float *lo, float *hi, float *a, float *b);   /* Reader: normalize_robust (p1, p99, median / MAD) */
+/* Reader / ink9um: use these parameters for every tile instead of the per-tile normalize_robust (on = 0: back to per tile) */
+void ie_set_norm(ie_net *n, int on, float lo, float hi, float a, float b);

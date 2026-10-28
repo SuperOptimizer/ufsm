@@ -9,7 +9,7 @@
 #include <string.h>
 
 static cudaStream_t g_st = nullptr;
-static int g_dev_ok = 0, g_verbose = 0;
+static int g_dev_ok = 0, g_verbose = 0, g_dev = 0;
 static size_t g_budget = (size_t)1 << 62;   /* device bytes in use + cached before the cache is dropped */
 static double g_macs = 0;
 extern "C" double xnet_macs(void) { return g_macs; }
@@ -17,12 +17,14 @@ extern "C" double xnet_macs(void) { return g_macs; }
 extern "C" int xnet_init(int gpu) {
     if (g_dev_ok) return 0;
     if (cudaSetDevice(gpu) != cudaSuccess) { fprintf(stderr, "xnet: no GPU %d\n", gpu); return -1; }
+    g_dev = gpu;
     if (cudaStreamCreateWithFlags(&g_st, cudaStreamNonBlocking) != cudaSuccess) return -1;
     size_t fr = 0, tot = 0; cudaMemGetInfo(&fr, &tot);
     g_budget = fr > ((size_t)1 << 30) ? fr - ((size_t)1 << 30) : fr / 2;   /* free memory at start minus 1 GB headroom */
     g_dev_ok = 1; g_verbose = getenv("UFSM_XNET_VERBOSE") ? atoi(getenv("UFSM_XNET_VERBOSE")) : 0;
     return 0;
 }
+extern "C" void xnet_bind(void) { if (g_dev_ok) cudaSetDevice(g_dev); }
 extern "C" void *xnet_stream(void) { return (void *)g_st; }
 extern "C" void xnet_sync(void) { cudaStreamSynchronize(g_st); }
 extern "C" int xnet_check(const char *where) {

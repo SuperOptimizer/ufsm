@@ -279,6 +279,7 @@ typedef struct {
     ctlev lev[6]; int nlev; double lev_um[6];
     uint8_t **stk; int stk_n, stk_w, stk_h;   /* --layers: a pre-rendered stack (ascending normal offsets) instead of the renderer */
     uint8_t *dump; int dump_req, render_only;  /* --dump-layers: the rendered model-grid stack [D][Hm][Wm] (run_surface allocates) */
+    int norm_sheet;   /* --norm sheet (Reader / ink9um): one normalize_robust over a row sample of the whole surface for every tile */
 } irun;
 
 /* the network side of run_surface in its own thread: batches handed over by the renderer (double buffered), forward,
@@ -291,6 +292,7 @@ typedef struct {
 } gworker;
 static void *gpu_worker(void *a) {
     gworker *G = a; irun *X = G->X; const int D = G->D, T = G->T, Wm = G->Wm, Hm = G->Hm;
+    xnet_bind();   /* --gpu N: this thread's CUDA calls on the same device as xnet_init (else device 0) */
     for (;;) {
         pthread_mutex_lock(&G->mu);
         while (!G->has && !G->quit) pthread_cond_wait(&G->cv, &G->mu);
@@ -340,6 +342,19 @@ static float *run_surface(irun *X, const isurf *S, int *pWm, int *pHm, double *p
     if (X->stk && (stk0 < 0 || stk0 + D > X->stk_n)) { fprintf(stderr, "ink-ext: --layers has %d layers, %s needs %d\n", X->stk_n, sp->name, D); return nullptr; }
     const int Wm = R.Wm, Hm = R.Hm; *pWm = Wm; *pHm = Hm; *pdu = R.du;
     fprintf(stderr, "ink-ext: %s %s: %d x %d px at %.3f um, %d layers, CT level %d (%.3f um, %d^3 sub-samples)%s\n", S->name, sp->name, Wm, Hm, X->px_um, D, L, X->lev_um[L], R.ss, X->reverse ? ", reversed" : "");
+    if (X->norm_sheet && ie_is_koine(X->kind) && !X->stk) {   /* --norm sheet: normalize_robust of the surface's non-zero voxels over <= 512 rows */
+        const int nr = Hm < 512 ? Hm : 512; size_t nv = 0, cv = (size_t)1 << 20; uint8_t *v = malloc(cv), *row = malloc((size_t)D * Wm);
+        for (int k = 0; k < nr; k++) {
+            const int r = (int)((k + 0.5) * Hm / nr); uint8_t *rp1[1] = {row};
+            if (render_rows(&R, r, r + 1, rp1, X->nth)) break;
+            for (size_t i = 0; i < (size_t)D * Wm; i++) if (row[i]) { if (nv == cv) { cv *= 2; v = realloc(v, cv); } v[nv++] = row[i]; }
+        }
+        if (nv > 1000) {
+            float lo, hi, a, b; ie_robust_params(v, nv, &lo, &hi, &a, &b); ie_set_norm(X->net, 1, lo, hi, a, b);
+            fprintf(stderr, "ink-ext: %s: sheet normalisation over %zu voxels of %d rows: p1 %.0f p99 %.0f median %.1f scale %.2f\n", S->name, nv, nr, lo, hi, -b / a, 1 / a);
+        } else { ie_set_norm(X->net, 0, 0, 0, 0, 0); fprintf(stderr, "ink-ext: %s: too few voxels for --norm sheet, per-tile normalisation\n", S->name); }
+        free(v); free(row);
+    }
     float *num = calloc((size_t)Wm * Hm, sizeof *num), *den = calloc((size_t)Wm * Hm, sizeof *den);
     free(X->dump); X->dump = X->dump_req ? calloc((size_t)D * Wm * Hm, 1) : nullptr;
     float *ctl = pctl ? calloc((size_t)Wm * Hm, sizeof *ctl) : nullptr; if (pctl) *pctl = ctl;   /* the surface layer (CT / 255) */
@@ -510,7 +525,7 @@ int cmd_ink_ext(int argc, char **argv) {
     if (!mname || !weights) {
         fprintf(stderr, "usage: ufsm ink-ext --model v8in|hecate24|hecate96|reader3|ink9um --weights W[,W2..] --surface TIFXYZ [--surface ..] --ct ROOT KEY --out DIR\n"
                         "         [--reverse] [--stride S] [--px-um U] [--batch B] [--gpu 0] [--threads 16] [--ct-mem 3] [--cache DIR] [--native] [--suffix S] [--prefix P]\n"
-                        "         [--ct-local ROOT --local-levels 1,2] [--ct-um 2.399] [--surf-um U] [--no-overlap] [--blend official|norm] [--grid-crop c,r,w,h]\n"
+                        "         [--ct-local ROOT --local-levels 1,2] [--ct-um 2.399] [--surf-um U] [--no-overlap] [--norm tile|sheet] [--blend official|norm] [--grid-crop c,r,w,h]\n"
                         "         [--ct-tif] [--jpeg PATH] [--jpeg-stretch] [--layers DIR [--px-crop x,y,w,h]] [--dump-layers DIR] [--render-only]\n"
                         "         [--shift S] [--zwin a,b,..] [--calib]\n"
                         "       ufsm ink-ext --model M --weights W --raw-in TILES.u8 --raw-out LOGITS.f32 [--batch 2]   (parity: native tiles -> logits)\n"
@@ -567,6 +582,7 @@ int cmd_ink_ext(int argc, char **argv) {
     X.dump_req = iopt(argc, argv, "--dump-layers", nullptr) != nullptr; X.render_only = iflag(argc, argv, "--render-only"); X.kind = kind; X.net = net; X.sp = &ie_specs[kind]; X.stride = atoi(iopt(argc, argv, "--stride", "0")); X.reverse = iflag(argc, argv, "--reverse");
     X.blend_norm = !strcmp(iopt(argc, argv, "--blend", "official"), "norm");   /* v8in: sum(p g) / sum(g) instead of inference.py sum(p g) / count (its stride grid) */
     X.no_overlap = iflag(argc, argv, "--no-overlap");   /* stride = the tile, uniform weights (no blending), empty tiles skipped, v8in without its coverage-mask rule */
+    X.norm_sheet = !strcmp(iopt(argc, argv, "--norm", "tile"), "sheet");   /* Reader / ink9um input normalisation: tile (official, per tile) or sheet */
     X.nth = atoi(iopt(argc, argv, "--threads", "16")); X.px_um = atof(iopt(argc, argv, "--px-um", "0")); if (!(X.px_um > 0)) X.px_um = X.sp->px_um;
     X.ct_mem = (size_t)(atof(iopt(argc, argv, "--ct-mem", "3")) * (1 << 30));
     X.batch = atoi(iopt(argc, argv, "--batch", "0"));
