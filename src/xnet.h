@@ -22,6 +22,7 @@ typedef struct { void *p; int n, d, h, w, c; } xt;            /* fp16 NDHWC; p =
 static inline size_t xt_numel(xt t) { return (size_t)t.n * t.d * t.h * t.w * t.c; }
 
 int xnet_init(int gpu);                 /* select the device, create the stream; 0 on success */
+void xnet_bind(void);                   /* make the xnet_init device current on the calling thread (worker threads) */
 void *xnet_stream(void);                /* the cudaStream_t of every xnet call */
 void xnet_sync(void);
 int xnet_check(const char *where);      /* 0, or prints the pending CUDA error and returns -1 */

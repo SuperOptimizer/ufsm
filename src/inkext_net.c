@@ -30,6 +30,7 @@ struct ie_net {
     int kind; ie_spec sp;
     /* input normalisation */
     float in_w, in_b, in_rm, in_rv;   /* v8in InstanceNorm affine (w, b) / Hecate BatchNorm3d(1) */
+    int gnorm; float g_lo, g_hi, g_a, g_b;   /* Reader: one robust normalisation for every tile (ie_set_norm, ink-ext --norm sheet) */
     /* ResNet3D encoder (v8in, Hecate) */
     xconv stem; int nlayer[4]; bneck *layer[4];
     /* v8in decoder */
@@ -400,7 +401,10 @@ static xt bbd_fwd(const bbd *B, xt x) {
 static void reader_fwd(const ie_net *n, const uint8_t *tiles, int B, float *out) {
     const int D = n->sp.D, T = n->sp.T; const size_t per = (size_t)D * T * T;
     float lo[B], hi[B], a[B], b[B];
-    for (int i = 0; i < B; i++) ie_robust_params(tiles + i * per, per, &lo[i], &hi[i], &a[i], &b[i]);
+    for (int i = 0; i < B; i++) {
+        if (n->gnorm) { lo[i] = n->g_lo; hi[i] = n->g_hi; a[i] = n->g_a; b[i] = n->g_b; }
+        else ie_robust_params(tiles + i * per, per, &lo[i], &hi[i], &a[i], &b[i]);
+    }
     uint8_t *dev; upload_tiles(tiles, B, D, T, T, &dev);
     xt x0 = xinput_u8(dev, B, D, T, T, lo, hi, a, b); xfree_dev(dev);
     xt f1 = xconv_fwd(&n->f1, x0, nullptr, XA_NONE); xt_free(&x0); xgn(f1, f1.c, n->f1g, n->f1b, 1e-5f, nullptr, XA_LRELU, f1);
@@ -434,3 +438,5 @@ int ie_forward(ie_net *n, const uint8_t *tiles, int B, float *out, int logits) {
     if (!logits && (n->kind == IE_V8IN || ie_is_koine(n->kind))) for (size_t i = 0; i < (size_t)B * TT; i++) out[i] = 1.f / (1.f + expf(-out[i]));
     return 0;
 }
+
+void ie_set_norm(ie_net *n, int on, float lo, float hi, float a, float b) { n->gnorm = on; n->g_lo = lo; n->g_hi = hi; n->g_a = a; n->g_b = b; }
