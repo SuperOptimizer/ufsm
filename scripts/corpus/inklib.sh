@@ -32,7 +32,7 @@ ink_compute() {   # ink_compute BOX -> $O/inkbl.zarr (+ blend.done); resumable a
   gpu_run $U predict $INKCK $ctr $ctk $O/inkb.zarr --um $UM --level $LV --box $bb --shard 512 --window 640 --halo 64 --ema 1 --q 32 --threads 12 \
     --gpu $GPU --resume 1 --occupancy 5 --levels 1 --gn-frozen $O/gn.bin >> $O/logs/inkb.log 2>&1 || return 1
   rm -rf $O/gncal.zarr $O/inkbl.zarr
-  cpu_run $U ink-blend $O/inkbl.zarr --um $UM --tile 512,512,512 --grids 0,0,0:256,256,256 --origins 0,0,0:$bo --levels 4 --shard 512 --q 32 --threads 12 \
+  cpu_run $U ink-blend $O/inkbl.zarr --um $LUM --tile 512,512,512 --grids 0,0,0:256,256,256 --origins 0,0,0:$bo --levels 4 --shard 512 --q 32 --threads 12 \
     $O/${INKA:-ink.zarr} $O/inkb.zarr > $O/logs/blend.log 2>&1 || return 1
   touch $O/blend.done; rm -rf $O/${INKA:-ink.zarr} $O/inkb.zarr
 }
