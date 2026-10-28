@@ -41,7 +41,13 @@ int tifxyz_scale(const char *src, const char *dst, double div, const double off[
 /* the tifxyz src copied to dst with every vertex moved d (its own units) along the vertex normal +n = (d/d column) x (d/d row)
    (central differences over valid neighbours; vertices without a normal stay); meta.json copied. toward = {y, x} (a vertical line, the
    scroll axis): +n is first flipped when most vertex normals face away from it, so D > 0 moves the sheet INWARD. 0 on success */
-int tifxyz_shift(const char *src, const char *dst, double d, const double *toward);   /* toward (y, x) or nullptr: see above */
+int tifxyz_shift(const char *src, const char *dst, double d, const double *toward);
+/* the distortion check of a tifxyz grid (w x h vertices, step native voxels between them; Z < 0 invalid): a quad is good when its 4
+   corners are valid, its 4 edges have unit stretch |dP| / step within tol (0.1 = +-10%), its u and v edges are orthogonal within
+   ang_deg, and qok (per quad, (w-1) x (h-1), optional) is set. *share_ok: good quads / valid quads. The largest axis-aligned rectangle of
+   good quads: rows r0 .. r0 + rh - 1, columns c0 .. c0 + cw - 1 (quads; rh x cw = 0 when none). 0 on success */
+int tifxyz_rect(const float *X, const float *Y, const float *Z, int w, int h, double step, double tol, double ang_deg, const uint8_t *qok,
+                int *r0, int *c0, int *rh, int *cw, double *share_ok);   /* toward (y, x) or nullptr: see above */
 /* the scaled coordinate of one vertex value v (z the vertex's z): numpy float32 v / div - off, or -1 for an invalid vertex */
 static inline float tifxyz_scaled(float v, float z, float divf, float offf) { return z < 0 ? -1.f : v / divf - offf; }
 

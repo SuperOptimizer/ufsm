@@ -280,6 +280,48 @@ static char *meta_scaled(const char *m, double div) {
     }
     o[k] = 0; return o;
 }
+int tifxyz_rect(const float *X, const float *Y, const float *Z, int w, int h, double step, double tol, double ang_deg, const uint8_t *qok,
+                int *r0, int *c0, int *rh, int *cw, double *share_ok) {
+    *r0 = *c0 = *rh = *cw = 0; *share_ok = 0;
+    if (w < 2 || h < 2 || !(step > 0)) return -1;
+    const int qw = w - 1, qh = h - 1; uint8_t *ok = calloc((size_t)qw * qh, 1); int *hist = calloc((size_t)qw + 1, sizeof(int)), *stk = malloc(((size_t)qw + 1) * sizeof(int));
+    if (!ok || !hist || !stk) { free(ok); free(hist); free(stk); return -1; }
+    const double cmax = sin(ang_deg * M_PI / 180); size_t nq = 0, nok = 0;
+    for (int r = 0; r < qh; r++) for (int c = 0; c < qw; c++) {
+        const size_t a = (size_t)r * w + c, b = a + 1, d = a + w, e = d + 1;
+        if (!(Z[a] >= 0 && Z[b] >= 0 && Z[d] >= 0 && Z[e] >= 0)) continue;
+        nq++;
+        if (qok && !qok[(size_t)r * qw + c]) continue;
+        /* the edges of the quad: top / bottom along u, left / right along v; unit stretch within tol, u and v orthogonal within ang */
+        const size_t eu[2][2] = {{a, b}, {d, e}}, ev[2][2] = {{a, d}, {b, e}}; double su[2], sv[2], u0[3], v0[3]; int good = 1;
+        for (int k = 0; k < 2; k++) {
+            const double ux = X[eu[k][1]] - X[eu[k][0]], uy = Y[eu[k][1]] - Y[eu[k][0]], uz = Z[eu[k][1]] - Z[eu[k][0]];
+            const double vx = X[ev[k][1]] - X[ev[k][0]], vy = Y[ev[k][1]] - Y[ev[k][0]], vz = Z[ev[k][1]] - Z[ev[k][0]];
+            su[k] = sqrt(ux * ux + uy * uy + uz * uz) / step; sv[k] = sqrt(vx * vx + vy * vy + vz * vz) / step;
+            if (!k) { u0[0] = ux; u0[1] = uy; u0[2] = uz; v0[0] = vx; v0[1] = vy; v0[2] = vz; }
+            good &= fabs(su[k] - 1) <= tol && fabs(sv[k] - 1) <= tol;
+        }
+        const double lu = sqrt(u0[0] * u0[0] + u0[1] * u0[1] + u0[2] * u0[2]), lv = sqrt(v0[0] * v0[0] + v0[1] * v0[1] + v0[2] * v0[2]);
+        good &= lu > 0 && lv > 0 && fabs((u0[0] * v0[0] + u0[1] * v0[1] + u0[2] * v0[2]) / (lu * lv)) <= cmax;
+        ok[(size_t)r * qw + c] = (uint8_t)good; nok += good;
+    }
+    *share_ok = nq ? (double)nok / nq : 0;
+    /* the largest all-ok axis-aligned rectangle of quads (histogram / stack per row) */
+    long best = 0;
+    for (int r = 0; r < qh; r++) {
+        for (int c = 0; c < qw; c++) hist[c] = ok[(size_t)r * qw + c] ? hist[c] + 1 : 0;
+        hist[qw] = 0; int top = 0;
+        for (int c = 0; c <= qw; c++) {
+            while (top > 0 && hist[stk[top - 1]] >= hist[c]) {
+                const int hh = hist[stk[--top]], left = top > 0 ? stk[top - 1] + 1 : 0; const long ar = (long)hh * (c - left);
+                if (ar > best) { best = ar; *rh = hh; *cw = c - left; *r0 = r - hh + 1; *c0 = left; }
+            }
+            stk[top++] = c;
+        }
+    }
+    free(ok); free(hist); free(stk);
+    return 0;
+}
 int tifxyz_shift(const char *src, const char *dst, double d, const double *toward) {
     char p[1400]; static const char *nm[3] = {"x", "y", "z"}; float *A[3] = {0}, *O[3] = {0}, *Nv[3] = {0}; int w = 0, h = 0, rc = -1;
     for (int k = 0; k < 3; k++) {

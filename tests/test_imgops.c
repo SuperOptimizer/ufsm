@@ -97,6 +97,22 @@ static void test_tifxyz_shift(void) {   /* a plane z = 10 (x = column, y = row):
         free(Y); snprintf(p, sizeof p, "rm -rf %s %s", s, d); CHECK(!system(p), "cleanup");
     }
 }
+static void test_tifxyz_rect(void) {   /* a flat unit-stretch grid (step 4) with a stretched band, a sheared block and an invalid hole */
+    enum { W = 40, H = 30 }; static float X[W * H], Y[W * H], Z[W * H];
+    for (int r = 0; r < H; r++) for (int c = 0; c < W; c++) { const int i = r * W + c; X[i] = 4.f * c; Y[i] = 100; Z[i] = 1000 + 4.f * r; }
+    for (int r = 0; r < H; r++) for (int c = 31; c < W; c++) X[r * W + c] = 4.f * 31 + 6.f * (c - 31);   /* columns 31..: stretch 1.5 */
+    for (int r = 0; r < 4; r++) for (int c = 0; c < W; c++) X[r * W + c] += 3.f * r;                      /* rows 0..3: sheared (u-v angle) */
+    Z[20 * W + 10] = -1;                                                                                   /* a hole */
+    int r0, c0, rh, cw; double share;
+    CHECK(!tifxyz_rect(X, Y, Z, W, H, 4, 0.1, 10, nullptr, &r0, &c0, &rh, &cw, &share), "tifxyz_rect");
+    /* good quads: rows 4..28 (quad rows 0..3 have a sheared edge), columns 0..30 (from 31 stretched), minus the hole's 4;
+       the largest rectangle beside the hole: rows 4..28 x columns 11..30 (25 x 20 = 500) beats rows 4..18 x 31 (465) */
+    printf("tifxyz_rect: share %.3f, rectangle %d x %d at (%d, %d)\n", share, rh, cw, r0, c0);
+    CHECK(rh * cw == 500 && r0 == 4 && c0 == 11, "tifxyz_rect rectangle %d x %d at (%d, %d)", rh, cw, r0, c0);
+    CHECK(share > 0.6 && share < 0.75, "tifxyz_rect share %.3f", share);
+    static uint8_t qok[(W - 1) * (H - 1)]; for (int i = 0; i < (W - 1) * (H - 1); i++) qok[i] = i % (W - 1) < 20;   /* a mask: columns < 20 only */
+    CHECK(!tifxyz_rect(X, Y, Z, W, H, 4, 0.1, 10, qok, &r0, &c0, &rh, &cw, &share) && cw <= 20 && rh * cw == 15 * 20, "masked rectangle %d x %d", rh, cw);
+}
 static void test_ink_compare(void) {   /* ink_stats / ink_corr / ink_panels_half (ufsm ink-compare) */
     enum { W = 64, H = 48 }; static uint8_t a[W * H], b[W * H], m[W * H], ct[W * H], flat[W * H];
     for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) { const int i = y * W + x; a[i] = x < W / 2 ? 255 : 0; b[i] = 255 - a[i]; m[i] = 1; ct[i] = 100; flat[i] = 77; }
@@ -148,7 +164,7 @@ static void test_ink_compare(void) {   /* ink_stats / ink_corr / ink_panels_half
     CHECK(img_crop_u8(dim, W, H, 0, 0, 0, 4) == nullptr, "crop of width 0");
 }
 int main(void) {
-    test_resample(); test_overlay(); test_dilate(); test_jpeg(); test_tifxyz_scale(); test_tifxyz_shift(); test_ink_compare();
+    test_resample(); test_overlay(); test_dilate(); test_jpeg(); test_tifxyz_scale(); test_tifxyz_shift(); test_tifxyz_rect(); test_ink_compare();
     if (fails) { fprintf(stderr, "test_imgops: %d failures\n", fails); return 1; }
     printf("test_imgops: ok\n");
     return 0;

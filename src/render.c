@@ -418,6 +418,45 @@ int cmd_tifxyz_scale(int argc, char **argv) {
 /* ufsm tifxyz-sfc <src-dir> <dst-dir> [--error 0.25] [--every K] [--wraps a,b,..]: every tifxyz wrap of <src-dir> (directories or
    .sfc) as <dst-dir>/<w>.sfc (surface-compressor, joint XYZ within --error voxels, meta.json inside), keeping every K-th vertex in both
    grid directions (K 4 turns a scale-1 wrap into scale 0.25; meta rewritten: scale, area, bbox). Prints the bytes before / after. */
+/* ufsm tifxyz-rect <src-wrap> <dst-wrap> [--tol 0.1] [--angle 10] [--ct CT.tif [--ct-min 1]] [--min-cm2 0]: the distortion check of one
+   wrap (a tifxyz dir or .sfc) and its crop to the largest axis-aligned rectangle of good quads (tifxyz_rect: unit stretch within --tol,
+   u / v orthogonal within --angle degrees; with --ct a render of the wrap (ufsm render <w>_ct.tif, scale 1: pixel = vertex x step) the
+   quad's centre pixel must also be >= --ct-min: on material). Writes the cropped tifxyz (meta area = the rectangle's) and prints one line
+   "tifxyz-rect: <src> grid WxH step S: good QUADS share X; rectangle RH x CW quads at (R0, C0) = A cm2". Exit 3: no rectangle >= --min-cm2. */
+int cmd_tifxyz_rect(int argc, char **argv) {
+    if (argc < 4) { fprintf(stderr, "usage: ufsm tifxyz-rect <src-wrap> <dst-wrap> [--tol 0.1] [--angle 10] [--ct CT.tif [--ct-min 1]] [--min-cm2 0]\n"); return 2; }
+    const double tol = atof(ropt(argc, argv, "--tol", "0.1")), ang = atof(ropt(argc, argv, "--angle", "10")), mincm2 = atof(ropt(argc, argv, "--min-cm2", "0"));
+    const char *src = argv[2], *dst = argv[3]; char p[1500];
+    snprintf(p, sizeof p, "%s/meta.json", src); FILE *f = tfx_meta_fopen(p); char mb[16384] = {0}; if (f) { const size_t mr = fread(mb, 1, sizeof mb - 1, f); (void)mr; fclose(f); }
+    const char *q = strstr(mb, "\"scale\": ["); const double sc = q ? atof(q + 10) : 1; q = strstr(mb, "\"voxel_size_um\":"); const double vum = q ? atof(q + 16) : 1;
+    q = strstr(mb, "\"winding\":"); const int wid = q ? atoi(q + 10) : -1; const double step = sc > 0 ? 1 / sc : 1;
+    static const char *ax[3] = {"x", "y", "z"}; float *A[3] = {0}; int w = 0, h = 0;
+    for (int k = 0; k < 3; k++) { int w2, h2; snprintf(p, sizeof p, "%s/%s.tif", src, ax[k]); A[k] = img_read_f32(p, &w2, &h2); if (!A[k] || (k && (w2 != w || h2 != h))) { fprintf(stderr, "tifxyz-rect: cannot read %s\n", src); return 1; } w = w2; h = h2; }
+    uint8_t *qok = nullptr; const char *ctp = ropt(argc, argv, "--ct", nullptr);
+    if (ctp) {
+        int cw2, ch2; uint8_t *ct = img_read_u8(ctp, &cw2, &ch2); if (!ct) { fprintf(stderr, "tifxyz-rect: cannot read %s\n", ctp); return 1; }
+        const int cmin = atoi(ropt(argc, argv, "--ct-min", "1")); qok = calloc((size_t)(w - 1) * (h - 1), 1);
+        for (int r = 0; r < h - 1; r++) for (int c = 0; c < w - 1; c++) {
+            const int py = (int)((r + 0.5) * step), px = (int)((c + 0.5) * step);
+            qok[(size_t)r * (w - 1) + c] = py < ch2 && px < cw2 && ct[(size_t)py * cw2 + px] >= cmin;
+        }
+        free(ct);
+    }
+    int r0, c0, rh, cw; double share;
+    if (tifxyz_rect(A[0], A[1], A[2], w, h, step, tol, ang, qok, &r0, &c0, &rh, &cw, &share)) { fprintf(stderr, "tifxyz-rect: failed\n"); return 1; }
+    const double cm2 = (double)rh * cw * step * step * vum * vum * 1e-8;
+    printf("tifxyz-rect: %s grid %dx%d step %g: good quads share %.3f; rectangle %d x %d quads at (%d, %d) = %.3f cm2\n", src, w, h, step, share, rh, cw, r0, c0, cm2);
+    int rc = 0;
+    if (rh < 1 || cw < 1 || cm2 < mincm2) rc = 3;
+    else {
+        const int ow = cw + 1, oh = rh + 1; float *O[3];
+        for (int k = 0; k < 3; k++) { O[k] = malloc((size_t)ow * oh * 4); for (int r = 0; r < oh; r++) memcpy(O[k] + (size_t)r * ow, A[k] + (size_t)(r0 + r) * w + c0, (size_t)ow * 4); }
+        if (tifxyz_write(dst, ow, oh, O[0], O[1], O[2], step, vum, wid, "ufsm tifxyz-rect (the largest undistorted rectangle)")) { fprintf(stderr, "tifxyz-rect: cannot write %s\n", dst); rc = 1; }
+        for (int k = 0; k < 3; k++) free(O[k]);
+    }
+    for (int k = 0; k < 3; k++) free(A[k]);
+    free(qok); return rc;
+}
 int cmd_tifxyz_sfc(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: ufsm tifxyz-sfc <src-dir> <dst-dir> [--error 0.25] [--every K] [--wraps a,b,..]\n"); return 2; }
     const double err = atof(ropt(argc, argv, "--error", "0.25")); const int K = atoi(ropt(argc, argv, "--every", "1"));
