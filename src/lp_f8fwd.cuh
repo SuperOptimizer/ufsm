@@ -415,7 +415,7 @@ template <int MT, int CP, typename T, typename TO> void launch_f8s(dim3 grid, co
     while (ZC > 1 && (size_t)rest * ((nzt + ZC - 1) / ZC) < 480) ZC--;
     grid.z = (grid.z / nzt) * ((nzt + ZC - 1) / ZC);
     static int attr[8];
-    if (!attr[cur_dev_()]) { attr[cur_dev_()] = 1; cudaFuncSetAttribute((const void *)conv_fwd_f8s_k<MT, CP, T, TO>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
+    if (!attr[cur_dev_()]) { attr[cur_dev_()] = 1; nn_set_dynamic_smem((const void *)conv_fwd_f8s_k<MT, CP, T, TO>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
     conv_fwd_f8s_k<MT, CP, T, TO><<<grid, 256, smem>>>((const T *)x, wq, ws, b, (TO *)y, xs.n, xs.c, xs.d, xs.h, xs.w, cout, Cop, gp, osum, Go, sp, ZC, (unsigned)base);
 }
 template <int CP, typename T, typename TO = T> static void small_f8(const void *x, shape5 xs, const float *w, const float *b, int cout, void *y, gnp_t gp, double *osum, int Go, split_t sp) {
@@ -566,7 +566,7 @@ template <int MT, int TZ, typename T, typename TO> void launch_f8p(dim3 grid, co
     size_t smem = (size_t)TT * 16 + 16 + 64 + P16_KS * BM * 32 + ((P16_KS * BM + 15) & ~15) + 32 * sizeof(chan_t) + 64 * 4;
     if (smem < 8 * 256 * sizeof(float)) smem = 8 * 256 * sizeof(float);
     static int attr[8];
-    if (!attr[cur_dev_()]) { attr[cur_dev_()] = 1; cudaFuncSetAttribute((const void *)conv_fwd_f8p_k<MT, TZ, T, TO>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
+    if (!attr[cur_dev_()]) { attr[cur_dev_()] = 1; nn_set_dynamic_smem((const void *)conv_fwd_f8p_k<MT, TZ, T, TO>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
     conv_fwd_f8p_k<MT, TZ, T, TO><<<grid, 256, smem>>>((const T *)x, wq, ws, b, (TO *)y, xs.n, xs.c, xs.d, xs.h, xs.w, cout, Cop, gp, osum, Go, sp);
 }
 template <typename T, typename TO> static void p16_f8(const void *x, shape5 xs, const float *w, const float *b, int cout, void *y, int Cop, int Ox, int OxP, gnp_t gp, double *osum, int Go, split_t sp) {
@@ -595,7 +595,7 @@ template <int MT, int TZ, typename T, typename TO> void launch_f8g(dim3 grid, co
                   + (gp.ns || sp.gp2.ns ? 32 * 8 + 16 : 0);   /* (slab GroupNorm: the second coefficient bank, gn_bank2) */
     if (smem < 8 * 256 * sizeof(float)) smem = 8 * 256 * sizeof(float);
     static int attr[8];
-    if (!attr[cur_dev_()]) { attr[cur_dev_()] = 1; cudaFuncSetAttribute((const void *)conv_fwd_f8_k<MT, TZ, T, TO>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
+    if (!attr[cur_dev_()]) { attr[cur_dev_()] = 1; nn_set_dynamic_smem((const void *)conv_fwd_f8_k<MT, TZ, T, TO>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
     conv_fwd_f8_k<MT, TZ, T, TO><<<grid, 256, smem>>>((const T *)x, wq, ws, b, (TO *)y, xs.n, xs.c, xs.d, xs.h, xs.w, cout, Cop, Cip, gp, osum, Go, sp);
 }
 template <typename T, typename TO = T> void fwd_f8_t(const void *x, shape5 xs, const float *w, const float *b, int cout, void *y, gnp_t gp, double *osum, int Go, split_t sp) {

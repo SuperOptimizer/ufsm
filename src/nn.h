@@ -50,6 +50,11 @@ void nn_prof_collect(double *out, int nk);
 
 /* Tensor-core TF32 path for the 3^3 stride-1 convolutions (default on; fp32 CUDA-core kernels otherwise). */
 void nn_set_tf32(int on);
+/* Ordered reduction paths (train --det 1); fast atomics remain available with 0. */
+void nn_set_deterministic(int on);
+int nn_get_deterministic(void);
+size_t nn_det_scratch_limit(void);
+float *nn_det_workspace(size_t bytes);   /* reusable per-device reduction workspace */
 /* precision of the tensor-core path: 1 bf16 (default), 2 fp8 (e4m3 with MX block scales, fp32 accumulate), 3 fp4 forward +
    backward-data with fp8 weight gradient. nn_set_tf32(0) selects exact fp32; nn_set_tf32(1) restores the last precision. */
 void nn_set_prec(int p);

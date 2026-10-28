@@ -716,7 +716,7 @@ __device__ __forceinline__ void fwd_epi_mxt(float (&acc)[MT][NR][2][4], float *t
     }
     if (stats)
 #pragma unroll
-        for (int jb = 0; jb < MT / 2; jb++) { atomicAdd(&cs[32 * jb + lane], ps[jb]); atomicAdd(&cs[BM + 32 * jb + lane], pss[jb]); }
+        for (int jb = 0; jb < MT / 2; jb++) { cs[32 * jb + lane] = ps[jb]; cs[BM + 32 * jb + lane] = pss[jb]; }
 }
 /* MX output of fwd_epilogue when every 16-row tile is one whole stored 16-channel block (the <= 16-channel tensors of a 16-wide
    level 0): per warp row (HV 16) or half row (HV 8) of 16 output voxels and tile, the [HV voxel][16 ch] accumulators pass through
@@ -827,7 +827,7 @@ __device__ __forceinline__ void fwd_epi_mx16(float (&acc)[MT][NR][2][4], float *
 #pragma unroll
         for (int j = 0; j < MT; j++) {
             ps[j] += __shfl_xor_sync(0xffffffffu, ps[j], 16); pss[j] += __shfl_xor_sync(0xffffffffu, pss[j], 16);
-            if (!sh) { atomicAdd(&cs[16 * j + sv], ps[j]); atomicAdd(&cs[BM + 16 * j + sv], pss[j]); }
+            if (!sh) { cs[16 * j + sv] = ps[j]; cs[BM + 16 * j + sv] = pss[j]; }
         }
 }
 /* a launcher's epilogue scratch with fwd_epi_mx16 room when an output tensor of cout (split at sp.o_split) is stored in 16-channel
@@ -868,7 +868,10 @@ __device__ __forceinline__ void fwd_epilogue(float (&acc)[MT][NR][2][4], unsigne
     const int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
     const int zs0 = sp.zlo, zs1 = D - sp.zhi;   /* statistics over the z planes this GPU owns (spatial split) */
     float *cs = (float *)smem_raw;
-    if (osum && !OWN) { __syncthreads(); for (int i = threadIdx.x; i < 2 * BM; i += blockDim.x) cs[i] = 0.f; __syncthreads(); }
+    /* One writer per warp/channel, then a fixed warp-order sum. Float atomics
+       here changed GN coefficients by an ulp when launch timing changed. */
+    __shared__ float warp_stats[8][2 * BM];   /* all lp forward launchers use 256 threads */
+    float *wcs = warp_stats[threadIdx.x >> 5];
     bool mx_done = false, st_done = false;
     if constexpr (IS_MX(T) && FST && MT % 2 == 0) {
         unsigned dsm; asm("mov.u32 %0, %%dynamic_smem_size;" : "=r"(dsm));
@@ -882,8 +885,8 @@ __device__ __forceinline__ void fwd_epilogue(float (&acc)[MT][NR][2][4], unsigne
         if (fit) {
             __syncthreads();   /* every warp is past its MMA loop: the scratch (weight stage) is free */
             float *tb = (float *)(smem_raw + 512);
-            if (dsm >= scr_off + FEPI_SCR(16)) fwd_epi_mxt<16>(acc, tb, cs, y, b, n, co0, Co, D, H, W, oz0, oy0, ox0, wz, wr, osum != nullptr, sp, N, zs0, zs1);
-            else fwd_epi_mxt<8>(acc, tb, cs, y, b, n, co0, Co, D, H, W, oz0, oy0, ox0, wz, wr, osum != nullptr, sp, N, zs0, zs1);
+            if (dsm >= scr_off + FEPI_SCR(16)) fwd_epi_mxt<16>(acc, tb, wcs, y, b, n, co0, Co, D, H, W, oz0, oy0, ox0, wz, wr, osum != nullptr, sp, N, zs0, zs1);
+            else fwd_epi_mxt<8>(acc, tb, wcs, y, b, n, co0, Co, D, H, W, oz0, oy0, ox0, wz, wr, osum != nullptr, sp, N, zs0, zs1);
             mx_done = st_done = true;
         }
     }
@@ -899,8 +902,8 @@ __device__ __forceinline__ void fwd_epilogue(float (&acc)[MT][NR][2][4], unsigne
         if (fit) {
             if constexpr (!OWN) __syncthreads();   /* every warp is past its MMA loop: the scratch is free */
             float *tb = (float *)(smem_raw + 512);
-            if (dsm >= scr_off + FEPI16_SCR(16)) fwd_epi_mx16<16>(acc, tb, cs, y, b, n, co0, Co, D, H, W, oz0, oy0, ox0, wz, wr, osum != nullptr, sp, N, zs0, zs1);
-            else fwd_epi_mx16<8>(acc, tb, cs, y, b, n, co0, Co, D, H, W, oz0, oy0, ox0, wz, wr, osum != nullptr, sp, N, zs0, zs1);
+            if (dsm >= scr_off + FEPI16_SCR(16)) fwd_epi_mx16<16>(acc, tb, wcs, y, b, n, co0, Co, D, H, W, oz0, oy0, ox0, wz, wr, osum != nullptr, sp, N, zs0, zs1);
+            else fwd_epi_mx16<8>(acc, tb, wcs, y, b, n, co0, Co, D, H, W, oz0, oy0, ox0, wz, wr, osum != nullptr, sp, N, zs0, zs1);
             mx_done = st_done = true;
         }
     }
@@ -1109,16 +1112,22 @@ __device__ __forceinline__ void fwd_epilogue(float (&acc)[MT][NR][2][4], unsigne
             if (osum) {
                 ps += __shfl_xor_sync(0xffffffff, ps, 1); ps += __shfl_xor_sync(0xffffffff, ps, 2);
                 pss += __shfl_xor_sync(0xffffffff, pss, 1); pss += __shfl_xor_sync(0xffffffff, pss, 2);
-                if (t == 0) { atomicAdd(&cs[m * 16 + g + 8 * h], ps); atomicAdd(&cs[BM + m * 16 + g + 8 * h], pss); }
+                if (t == 0) { wcs[m * 16 + g + 8 * h] = ps; wcs[BM + m * 16 + g + 8 * h] = pss; }
             }
         }
-    if (osum && !OWN) {
+    if (osum) {
         __syncthreads();
-        if (threadIdx.x < BM && co0 + (int)threadIdx.x < Co) {
-            int cpg = Co / Go, ng = n * Go + (co0 + threadIdx.x) / cpg;
-            atomicAdd(&osum[2 * ng], (double)cs[threadIdx.x]);
-            atomicAdd(&osum[2 * ng + 1], (double)cs[BM + threadIdx.x]);
+        if (threadIdx.x < BM) {
+            float a = 0.f, b2 = 0.f;
+#pragma unroll
+            for (int w = 0; w < 8; w++) { a += warp_stats[w][threadIdx.x]; b2 += warp_stats[w][BM + threadIdx.x]; }
+            if constexpr (OWN) { cs[threadIdx.x] += a; cs[BM + threadIdx.x] += b2; }
+            else if (co0 + (int)threadIdx.x < Co) {
+                const int ng = n * Go + (co0 + threadIdx.x) / (Co / Go);
+                atomicAdd(&osum[2 * ng], (double)a); atomicAdd(&osum[2 * ng + 1], (double)b2);
+            }
         }
+        if constexpr (OWN) __syncthreads();   /* every reader done before the next tile reuses warp_stats */
     }
 }
 
@@ -1141,6 +1150,7 @@ template <typename T> T *lp_buf(int slot, size_t n) {
     }
     return (T *)buf[d][slot];
 }
+#include "nn_det.cuh"
 #define P16_KS 18
 __global__ void prep_w8p_k(const float *__restrict__ w, uint8_t *__restrict__ wq, uint8_t *__restrict__ ws, int Co, int Ci, int Cop, int Ox, int OxP);   /* defined in lp_f8fwd.cu */
 template <typename T>

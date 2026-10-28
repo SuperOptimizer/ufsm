@@ -29,7 +29,9 @@ int lp_gn_slab_any(void);   /* any statistics array registered */
 /* zlo / zhi (spatial split, nn_split_cfg): the GroupNorm statistics of the output (osum) skip the first zlo and the last zhi
    z planes (halo planes owned by the other GPU); 0 / 0 = every plane */
 /* stored_stats: output statistics use decoded rounded MX values, including bias exactly once. */
-typedef struct { const void *x2; int c_split; void *y2; int o_split; int accum; gnp_t gp2; int up; unsigned sr; unsigned wkey; int zlo, zhi; int stored_stats; unsigned osr; int zi0, Di; int o_pad; } split_t;   /* o_pad: the split output's
+typedef struct { const void *x2; int c_split; void *y2; int o_split; int accum; gnp_t gp2; int up; unsigned sr; unsigned wkey; int zlo, zhi; int stored_stats; unsigned osr; int zi0, Di; int o_pad;
+                 float *wpart; int wpart_x0, wpart_nx; } split_t;   /* wpart: deterministic weight-gradient CTA partials; x0/nx retain original spatial indices.
+                                      o_pad: the split output's
                                                                      second tensor starts at padded row o_pad (0: o_split rounded up to 32; 16 for two <= 16-channel MX tensors) */   /* osr: exact SR seed of an MX-fp4 output (fp4 gradients); zi0 / Di: z-range (MX forward kernels: output plane z reads input plane
    z + zi0 of a depth-Di input; Di 0 = off) */
 /* k=3 stride 1 forward / weight gradient with the same semantics as the BF16 tensor-core paths in nn.cu

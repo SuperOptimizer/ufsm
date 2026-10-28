@@ -1,6 +1,36 @@
 /* CUDA ops: elem section of the former nn.cu */
 #include "nn_common.cuh"
 
+/* Same per-slab arithmetic as gn_sums_k, with ordered commit. */
+template <typename T = float>
+__global__ void gn_sums_det_k(const T *x, int C, int G, size_t S, double *part, size_t v0 = 0, size_t v1 = ~(size_t)0) {   /* voxels [v0, v1) only */
+    int ng = blockIdx.x, slab = blockIdx.y;
+    int n = ng / G, g = ng % G, cpg = C / G;
+    const T *p = x + ((size_t)n * C + (size_t)g * cpg) * S;
+    size_t len = (size_t)cpg * S, per = (len + KSLAB - 1) / KSLAB, lo = (size_t)slab * per, hi = lo + per < len ? lo + per : len;
+    double s1 = 0, s2 = 0;
+    const bool all = v0 == 0 && v1 >= S;
+    for (size_t i = lo + threadIdx.x; i < hi; i += blockDim.x) { if (!all) { size_t v = i % S; if (v < v0 || v >= v1) continue; } double v = ldv(p, i); s1 += v; s2 += v * v; }
+    __shared__ double r1[256], r2[256];
+    r1[threadIdx.x] = s1; r2[threadIdx.x] = s2;
+    __syncthreads();
+    for (int o = 128; o > 0; o >>= 1) { if (threadIdx.x < o) { r1[threadIdx.x] += r1[threadIdx.x + o]; r2[threadIdx.x] += r2[threadIdx.x + o]; } __syncthreads(); }
+    if (threadIdx.x == 0) { const size_t i = 2 * ((size_t)ng * KSLAB + slab); part[i] = r1[0]; part[i + 1] = r2[0]; }
+}
+__global__ void gn_sums_commit_k(const double *part, double *sums, int NG) {
+    const int ng = blockIdx.x * blockDim.x + threadIdx.x; if (ng >= NG) return;
+    double a = 0., b = 0.;
+    for (int slab = 0; slab < KSLAB; slab++) { const size_t i = 2 * ((size_t)ng * KSLAB + slab); a += part[i]; b += part[i + 1]; }
+    sums[2 * ng] += a; sums[2 * ng + 1] += b;
+}
+template <typename T> static void launch_gn_sums(const T *x, int NG, int C, int G, size_t S, double *sums, size_t v0 = 0, size_t v1 = ~(size_t)0) {
+    if (!nn_get_deterministic()) { gn_sums_k<T><<<dim3(NG, KSLAB), 256>>>(x, C, G, S, sums, v0, v1); return; }
+    double *part = (double *)nn_det_workspace((size_t)2 * NG * KSLAB * sizeof(double));
+    gn_sums_det_k<T><<<dim3(NG, KSLAB), 256>>>(x, C, G, S, part, v0, v1);
+    gn_sums_commit_k<<<nblk(NG, 128), 128>>>(part, sums, NG);
+}
+
+
 __global__ void gn_finalize_k(const double *sums, int NG, size_t len, float eps, float *mean, float *rstd) {
     int ng = blockIdx.x * blockDim.x + threadIdx.x;
     if (ng >= NG) return;
@@ -20,7 +50,7 @@ extern "C" void nn_gn_fwd(const float *x, shape5 s, int G, float eps, const floa
     int NG = s.n * G;
     double *sums = gn_dsums((size_t)2 * NG);
     cudaMemsetAsync(sums, 0, (size_t)2 * NG * sizeof(double));
-    gn_sums_k<<<dim3(NG, KSLAB), 256>>>(x, s.c, G, S, sums);
+    launch_gn_sums(x, NG, s.c, G, S, sums);
     gn_finalize_k<<<nblk(NG, 128), 128>>>(sums, NG, (size_t)(s.c / G) * S, eps, mean, rstd);
     size_t n = shape_numel(s);
     if (y) gn_apply_k<0, float, float><<<dim3(s.n * s.c, KSLAB), 256>>>(x, gamma, beta, mean, rstd, y, s.c, G, S);   /* y == nullptr: statistics only */
@@ -41,9 +71,9 @@ extern "C" int nn_gn_stats(const float *x, shape5 s, int G, float eps, float *me
         KCHECK();
         return 0;
     }
-    if (ABF && g_h16) gn_sums_k<f16><<<dim3(NG, KSLAB), 256>>>((const f16 *)x, s.c, G, S, sums, v0, v1);
-    else if (ABF) gn_sums_k<bf16><<<dim3(NG, KSLAB), 256>>>((const bf16 *)x, s.c, G, S, sums, v0, v1);
-    else gn_sums_k<float><<<dim3(NG, KSLAB), 256>>>(x, s.c, G, S, sums, v0, v1);
+    if (ABF && g_h16) launch_gn_sums<f16>((const f16 *)x, NG, s.c, G, S, sums, v0, v1);
+    else if (ABF) launch_gn_sums<bf16>((const bf16 *)x, NG, s.c, G, S, sums, v0, v1);
+    else launch_gn_sums<float>(x, NG, s.c, G, S, sums, v0, v1);
     zs_reduce(sums, 2 * NG);
     gn_finalize_k<<<nblk(NG, 128), 128>>>(sums, NG, zs_len((size_t)(s.c / G) * S, s.d), eps, mean, rstd);
     KCHECK();
@@ -55,7 +85,7 @@ extern "C" void nn_gn_fwd_silu(const float *x, shape5 s, int G, float eps, const
     int NG = s.n * G;
     double *sums = gn_dsums((size_t)2 * NG);
     cudaMemsetAsync(sums, 0, (size_t)2 * NG * sizeof(double));
-    gn_sums_k<<<dim3(NG, KSLAB), 256>>>(x, s.c, G, S, sums);
+    launch_gn_sums(x, NG, s.c, G, S, sums);
     gn_finalize_k<<<nblk(NG, 128), 128>>>(sums, NG, (size_t)(s.c / G) * S, eps, mean, rstd);
     size_t n = shape_numel(s);
     gn_apply_k<1, float, float><<<dim3(s.n * s.c, KSLAB), 256>>>(x, gamma, beta, mean, rstd, y, s.c, G, S);

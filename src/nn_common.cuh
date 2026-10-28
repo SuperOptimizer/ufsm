@@ -270,6 +270,7 @@ template <> __device__ __forceinline__ void stv<float>(float *p, size_t i, float
 template <> __device__ __forceinline__ void stv<bf16>(bf16 *p, size_t i, float v) { p[i] = __float2bfloat16(v); }
 template <> __device__ __forceinline__ void stv<f16>(f16 *p, size_t i, float v) { p[i] = __float2half(v); }
 #include "nn_lp.h"   /* gnp_t, split_t and the fp8/fp4 entry points */
+#include "nn_det.cuh"
 /* channel split: input channels >= c_split come from x2 (channel ci - c_split); output channels >= o_split go to y2 */
 /* tap set for the parity-decomposed stride-2 backward-data (S2B mode of the forward kernel): entries are
    (offset dz,dy,dx in {0,1} on the gy grid, weight tap index); outputs land at 2*o + parity in a gx of Dx x Hx x Wx */
@@ -695,9 +696,9 @@ __global__ void __launch_bounds__(fw_nth_z(MT, FZ), fw_blocks_z(MT, FZ)) conv_fw
     }
     /* epilogue straight from registers; optional GroupNorm statistics of the output (sum, sum of squares per
        (n, group)) reduced within the block in smem, one pair of double atomics per channel per block */
-    float *cs = (float *)smem_raw;                     /* [2][BM] block partials */
+    __shared__ float warp_stats[NTH / 32][2 * BM];
+    float *cs = warp_stats[warp];                     /* one writer per warp / channel */
     const int zs0 = sp.zlo, zs1 = D - sp.zhi;          /* statistics over the z planes this GPU owns (spatial split) */
-    if (osum) { __syncthreads(); for (int i = threadIdx.x; i < 2 * BM; i += NTH) cs[i] = 0.f; __syncthreads(); }
 #pragma unroll
     for (int m = 0; m < MT; m++)
 #pragma unroll
@@ -728,15 +729,18 @@ __global__ void __launch_bounds__(fw_nth_z(MT, FZ), fw_blocks_z(MT, FZ)) conv_fw
             if (osum) {
                 ps += __shfl_xor_sync(0xffffffff, ps, 1); ps += __shfl_xor_sync(0xffffffff, ps, 2);
                 pss += __shfl_xor_sync(0xffffffff, pss, 1); pss += __shfl_xor_sync(0xffffffff, pss, 2);
-                if (t == 0) { atomicAdd(&cs[m * 16 + g + 8 * h], ps); atomicAdd(&cs[BM + m * 16 + g + 8 * h], pss); }
+                if (t == 0) { cs[m * 16 + g + 8 * h] = ps; cs[BM + m * 16 + g + 8 * h] = pss; }
             }
         }
     if (osum) {
         __syncthreads();
         if (threadIdx.x < BM && co0 + (int)threadIdx.x < Co) {
             int cpg = Co / Go, ng = n * Go + (co0 + threadIdx.x) / cpg;
-            atomicAdd(&osum[2 * ng], (double)cs[threadIdx.x]);
-            atomicAdd(&osum[2 * ng + 1], (double)cs[BM + threadIdx.x]);
+            float a = 0.f, b2 = 0.f;
+#pragma unroll
+            for (int w = 0; w < NTH / 32; w++) { a += warp_stats[w][threadIdx.x]; b2 += warp_stats[w][BM + threadIdx.x]; }
+            atomicAdd(&osum[2 * ng], (double)a);
+            atomicAdd(&osum[2 * ng + 1], (double)b2);
         }
     }
 }
@@ -1037,7 +1041,7 @@ static void conv_fwd_tc_launch(int MT, dim3 grid, size_t smem, const TI *x, cons
     const int tz = fw_tz(MT);
     const int ai = MT == 1 ? (tz == 4 ? 5 : tz == 6 ? 6 : 1) : MT;
     if (!attr_set[cur_dev()][ai]) {
-        cudaFuncSetAttribute(MT == 1 ? (tz == 4 ? (const void *)conv_fwd_tc_k<1, TI, TO, S2B, HT, OP, 4> : tz == 6 ? (const void *)conv_fwd_tc_k<1, TI, TO, S2B, HT, OP, 6> : (const void *)conv_fwd_tc_k<1, TI, TO, S2B, HT, OP>)
+        nn_set_dynamic_smem(MT == 1 ? (tz == 4 ? (const void *)conv_fwd_tc_k<1, TI, TO, S2B, HT, OP, 4> : tz == 6 ? (const void *)conv_fwd_tc_k<1, TI, TO, S2B, HT, OP, 6> : (const void *)conv_fwd_tc_k<1, TI, TO, S2B, HT, OP>)
                              : MT == 2 ? (const void *)conv_fwd_tc_k<2, TI, TO, S2B, HT, OP> : (const void *)conv_fwd_tc_k<4, TI, TO, S2B, HT, OP>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024);
         attr_set[cur_dev()][ai] = 1;
     }
@@ -1088,7 +1092,7 @@ int conv_fwd_tc_h(const void *x, int xbf, shape5 xs, const float *w, const float
         const int tz = 4;
         dim3 grid(nblk(xs.w, 16), nblk(xs.h, TC_TY), (unsigned)(nblk(xs.d, tz) * xs.n));
         size_t smem = fw_smem(1, tz);
-        static int at[8]; if (!at[cur_dev()]) { cudaFuncSetAttribute((const void *)conv_fwd_tc_k<1, HT, HT, 0, HT, 0, 4, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); cudaFuncSetAttribute((const void *)conv_fwd_tc_k<1, float, HT, 0, HT, 0, 4, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); at[cur_dev()] = 1; }
+        static int at[8]; if (!at[cur_dev()]) { nn_set_dynamic_smem((const void *)conv_fwd_tc_k<1, HT, HT, 0, HT, 0, 4, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); nn_set_dynamic_smem((const void *)conv_fwd_tc_k<1, float, HT, 0, HT, 0, 4, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); at[cur_dev()] = 1; }
         tapset_t nt = {};
         if (xbf && ybf) conv_fwd_tc_k<1, HT, HT, 0, HT, 0, 4, 1><<<grid, fw_nth_z(1, 4), smem>>>((const HT *)x, wp, b, (HT *)y, xs.n, xs.c, xs.d, xs.h, xs.w, cout, 16, 16, gp, osum, Go, sp, nt);
         else if (!xbf && ybf) conv_fwd_tc_k<1, float, HT, 0, HT, 0, 4, 1><<<grid, fw_nth_z(1, 4), smem>>>((const float *)x, wp, b, (HT *)y, xs.n, xs.c, xs.d, xs.h, xs.w, cout, 16, 16, gp, osum, Go, sp, nt);
@@ -1119,7 +1123,7 @@ int conv_fwd_tc(const void *x, int xbf, shape5 xs, const float *w, const float *
 template <typename TI, typename TO, typename HT>
 static void conv_fwd_tc_s2_launch(int MT, dim3 grid, size_t smem, const TI *x, const HT *wp, const float *b, TO *y, shape5 xs, int cout, int Cop, int Cip, shape5 ys, gnp_t gp) {
     static int attr_set[8][5];
-    if (!attr_set[cur_dev()][MT]) { cudaFuncSetAttribute(MT == 1 ? (const void *)conv_fwd_tc_s2_k<1, TI, TO, HT> : MT == 2 ? (const void *)conv_fwd_tc_s2_k<2, TI, TO, HT> : (const void *)conv_fwd_tc_s2_k<4, TI, TO, HT>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); attr_set[cur_dev()][MT] = 1; }
+    if (!attr_set[cur_dev()][MT]) { nn_set_dynamic_smem(MT == 1 ? (const void *)conv_fwd_tc_s2_k<1, TI, TO, HT> : MT == 2 ? (const void *)conv_fwd_tc_s2_k<2, TI, TO, HT> : (const void *)conv_fwd_tc_s2_k<4, TI, TO, HT>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); attr_set[cur_dev()][MT] = 1; }
     switch (MT) {
     case 1: conv_fwd_tc_s2_k<1, TI, TO, HT><<<grid, 256, smem>>>(x, wp, b, y, xs.n, xs.c, xs.d, xs.h, xs.w, cout, Cop, Cip, ys.d, ys.h, ys.w, gp); break;
     case 2: conv_fwd_tc_s2_k<2, TI, TO, HT><<<grid, 256, smem>>>(x, wp, b, y, xs.n, xs.c, xs.d, xs.h, xs.w, cout, Cop, Cip, ys.d, ys.h, ys.w, gp); break;
@@ -1318,7 +1322,8 @@ __global__ void __launch_bounds__(W2_NTHR, 3) conv_bwd_w_tc2_k(const TI *__restr
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
     const int kz = warp / 3, ky = warp - 3 * kz;
     const int ci0 = blockIdx.z * 8 * NT, co0 = blockIdx.y * 16;
-    int bz = blockIdx.x;
+    int bz = blockIdx.x + sp.wpart_x0;
+    if (sp.wpart) { const size_t nw = (size_t)Co * Ci * 27; gw = sp.wpart + (size_t)blockIdx.x * (nw + Co); if (gb) gb = gw + nw; }
     const int nxt = (W + 15) / 16, nyt = (H + TC_TY - 1) / TC_TY, nzt = (D + TC_TZ - 1) / TC_TZ;
     const int ox0 = (bz % nxt) * 16; bz /= nxt;
     const int oy0 = (bz % nyt) * TC_TY; bz /= nyt;
@@ -1436,10 +1441,12 @@ static void launch_bwd_w_tc_t(const TI *x, shape5 xs, const TG *gy, shape5 ys, f
        Put them on grid.x; the channel-block dimensions are small. */
     dim3 grid((unsigned)(nblk(ys.w, 16) * nblk(ys.h, TC_TY) * nzc * ys.n), (ys.c + 15) / 16, (xs.c + 8 * NT - 1) / (8 * NT));
     static int attr2[8];
-    if (!attr2[cur_dev()]) { attr2[cur_dev()] = 1; cudaFuncSetAttribute((const void *)conv_bwd_w_tc2_k<1, TI, TG, HT>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); cudaFuncSetAttribute((const void *)conv_bwd_w_tc2_k<2, TI, TG, HT>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
+    if (!attr2[cur_dev()]) { attr2[cur_dev()] = 1; nn_set_dynamic_smem((const void *)conv_bwd_w_tc2_k<1, TI, TG, HT>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); nn_set_dynamic_smem((const void *)conv_bwd_w_tc2_k<2, TI, TG, HT>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
     size_t smem2 = (size_t)(8 * W2_T + 16 * NVT) * 2;
-    if (NT == 1) conv_bwd_w_tc2_k<1, TI, TG, HT><<<grid, W2_NTHR, smem2>>>(x, gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, gp, sp);
-    else conv_bwd_w_tc2_k<2, TI, TG, HT><<<grid, W2_NTHR, smem2>>>(x, gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, gp, sp);
+    det_wgrad_launch(grid, gw, gb, xs.c, ys.c, 27, sp, [&](dim3 piece, split_t ss) {
+        if (NT == 1) conv_bwd_w_tc2_k<1, TI, TG, HT><<<piece, W2_NTHR, smem2>>>(x, gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, gp, ss);
+        else conv_bwd_w_tc2_k<2, TI, TG, HT><<<piece, W2_NTHR, smem2>>>(x, gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, gp, ss);
+    });
 }
 template <typename HT>
 static void launch_bwd_w_tc_h(const void *x, int xbf, shape5 xs, const void *gy, int gybf, shape5 ys, float *gw, float *gb, gnp_t gp, split_t sp) {
@@ -1590,7 +1597,7 @@ __global__ void __launch_bounds__(256) conv_bwd_w1_k(const TI *__restrict__ x, c
     if (threadIdx.x < Ci * Co) { int ci = threadIdx.x / Co, co = threadIdx.x % Co; float a = 0.f; for (int w = 0; w < 8; w++) a += red[threadIdx.x][w]; atomicAdd(&gw[(size_t)co * Ci + ci], a); }   /* gw[co][ci] */
 }
 template <typename TG>
-__global__ void bias_grad_k(const TG *gy, float *gb, int N, int Co, size_t So) {
+__global__ void bias_grad_k(const TG *gy, float *gb, int N, int Co, size_t So, float *parts = nullptr) {
     int co = blockIdx.x, slab = blockIdx.y;
     size_t per = (So + KSLAB - 1) / KSLAB, lo = slab * per, hi = lo + per < So ? lo + per : So;
     float s = 0.f;
@@ -1602,13 +1609,25 @@ __global__ void bias_grad_k(const TG *gy, float *gb, int N, int Co, size_t So) {
     red[threadIdx.x] = s;
     __syncthreads();
     for (int o = 128; o > 0; o >>= 1) { if (threadIdx.x < o) red[threadIdx.x] += red[threadIdx.x + o]; __syncthreads(); }
-    if (threadIdx.x == 0) atomicAdd(&gb[co], red[0]);
+    if (threadIdx.x == 0) { if (parts) parts[(size_t)co * KSLAB + slab] = red[0]; else atomicAdd(&gb[co], red[0]); }
+}
+
+template <int TAG = 0> __global__ void bias_grad_sum_k(const float *part, float *gb, int Co) {
+    const int co = blockIdx.x * blockDim.x + threadIdx.x;
+    if (co >= Co) return;
+    float sum = 0.f; for (int s = 0; s < KSLAB; s++) sum += part[(size_t)co * KSLAB + s];
+    gb[co] += sum;
+}
+template <typename TG> static void launch_bias_grad(const TG *gy, float *gb, int N, int Co, size_t So) {
+    float *part = nn_get_deterministic() ? nn_det_workspace((size_t)Co * KSLAB * sizeof(float)) : nullptr;
+    bias_grad_k<TG><<<dim3(Co, KSLAB), 256>>>(gy, gb, N, Co, So, part);
+    if (part) bias_grad_sum_k<<<nblk(Co, 128), 128>>>(part, gb, Co);
 }
 
 template <typename HT>
 static void bwd_w_s2_h(const float *x, shape5 xs, const float *gy, shape5 ys, float *gw, float *gb, gnp_t gp = {}) {
     static int attr[8];
-    if (!attr[cur_dev()]) { cudaFuncSetAttribute((const void *)conv_bwd_w_tc_s2_k<float, float, HT>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); cudaFuncSetAttribute((const void *)conv_bwd_w_tc_s2_k<HT, float, HT>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); cudaFuncSetAttribute((const void *)conv_bwd_w_tc_s2_k<HT, HT, HT>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); attr[cur_dev()] = 1; }
+    if (!attr[cur_dev()]) { nn_set_dynamic_smem((const void *)conv_bwd_w_tc_s2_k<float, float, HT>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); nn_set_dynamic_smem((const void *)conv_bwd_w_tc_s2_k<HT, float, HT>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); nn_set_dynamic_smem((const void *)conv_bwd_w_tc_s2_k<HT, HT, HT>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); attr[cur_dev()] = 1; }
     size_t smem = (size_t)(2 * S2W_CI * 600 + 16 * 64) * 2;
     int nzc = (nblk(ys.d, 2) + WG_ZC - 1) / WG_ZC;
     dim3 grid((unsigned)(nblk(ys.w, 8) * nblk(ys.h, 4) * nzc * ys.n), (ys.c + 15) / 16, (xs.c + S2W_CI - 1) / S2W_CI);

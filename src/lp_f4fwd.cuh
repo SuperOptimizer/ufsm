@@ -156,7 +156,7 @@ template <int MT, int TZ, typename T, typename TO> void launch_f4(dim3 grid, con
                   + (gp.ns || sp.gp2.ns ? 32 * 8 + 16 : 0);   /* (slab GroupNorm: the second coefficient bank) */
     if (smem < 8 * 256 * sizeof(float)) smem = 8 * 256 * sizeof(float);
     static int attr[8];
-    if (!attr[cur_dev_()]) { attr[cur_dev_()] = 1; cudaFuncSetAttribute((const void *)conv_fwd_f4_k<MT, TZ, T, TO>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
+    if (!attr[cur_dev_()]) { attr[cur_dev_()] = 1; nn_set_dynamic_smem((const void *)conv_fwd_f4_k<MT, TZ, T, TO>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
     conv_fwd_f4_k<MT, TZ, T, TO><<<grid, 256, smem>>>((const T *)x, wq, ws, b, (TO *)y, xs.n, xs.c, xs.d, xs.h, xs.w, cout, Cop, Cip, gp, osum, Go, sp);
 }
 /* ---- one or two 32-channel input chunks (Cip == 32 NCH, no fused upsample): conv_fwd_f4_k with the input staged once per z
@@ -382,7 +382,7 @@ template <int MT, int TZ, int NCH, typename T, typename TO> static void launch_f
     while (ZC > 1 && base * nblk_(nzt, ZC) < 480) ZC--;
     const dim3 grid(nblk_(xs.w, 16), nblk_(xs.h, 8), (unsigned)(nblk_(nzt, ZC) * xs.n));
     static int attr[8];
-    if (!attr[cur_dev_()]) { attr[cur_dev_()] = 1; cudaFuncSetAttribute((const void *)conv_fwd_f4r_k<MT, TZ, NCH, T, TO>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
+    if (!attr[cur_dev_()]) { attr[cur_dev_()] = 1; nn_set_dynamic_smem((const void *)conv_fwd_f4r_k<MT, TZ, NCH, T, TO>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
     conv_fwd_f4r_k<MT, TZ, NCH, T, TO><<<grid, 256, smem>>>((const T *)x, wq, ws, b, (TO *)y, xs.n, xs.c, xs.d, xs.h, xs.w, cout, Cop, gp, osum, Go, sp, ZC, wres);
 #if F4R_PROF
     if (getenv("F4R_PROF")) {
@@ -697,10 +697,10 @@ template <int MT, int TZ, typename T, typename TO> void launch_f4p(dim3, const v
     static int attr[8];
     if (MT == 1 && gp.ns && gp.G) {   /* slab-local GroupNorm statistics: the instance with the per-slab reload */
         static int attr1[8];
-        if (!attr1[cur_dev_()]) { attr1[cur_dev_()] = 1; cudaFuncSetAttribute((const void *)conv_fwd_f4p_k<MT, TZ, T, TO, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
+        if (!attr1[cur_dev_()]) { attr1[cur_dev_()] = 1; nn_set_dynamic_smem((const void *)conv_fwd_f4p_k<MT, TZ, T, TO, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
         conv_fwd_f4p_k<MT, TZ, T, TO, true><<<grid, 256, smem>>>((const T *)x, wq, ws, b, (TO *)y, xs.n, xs.c, xs.d, xs.h, xs.w, cout, Cop, gp, osum, Go, sp, ZC);
     } else {
-        if (!attr[cur_dev_()]) { attr[cur_dev_()] = 1; cudaFuncSetAttribute((const void *)conv_fwd_f4p_k<MT, TZ, T, TO>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
+        if (!attr[cur_dev_()]) { attr[cur_dev_()] = 1; nn_set_dynamic_smem((const void *)conv_fwd_f4p_k<MT, TZ, T, TO>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
         conv_fwd_f4p_k<MT, TZ, T, TO><<<grid, 256, smem>>>((const T *)x, wq, ws, b, (TO *)y, xs.n, xs.c, xs.d, xs.h, xs.w, cout, Cop, gp, osum, Go, sp, ZC);
     }
 #if F4R_PROF

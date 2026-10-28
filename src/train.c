@@ -162,6 +162,10 @@ static int g_sheet_variant=2;
    the halo planes (from a pinned zero buffer) so each voxel counts once */
 static int g_Dl, g_h0; static uint8_t *g_zeros;
 static int g_Pz;   /* window depth: --Pz (a Pz x P x P slab), else P */
+static int g_valP;   /* --val-P N (!= P): validation windows of N^3 (the same voxels for every run with this N and --val-seed), scored by an
+                        inference-only copy of the network on GPU 0 that reads the training weights; 0: windows of the training size */
+static size_t g_val_reserve;   /* --val-P: device bytes the planner keeps free for that copy's inference build */
+static unet *g_val_u;          /* --val-P: that copy */
 
 static int g_xfmt = 0, g_g16 = 0;   /* input batches uploaded as 16-bit (1 fp16, 2 bf16); loss gradient written as 16-bit */
 static size_t xbytes(void) { return g_xfmt ? 2 : 4; }
@@ -236,6 +240,12 @@ typedef struct { int fd; size_t bytes; batch buf; } valdisk;   /* --val-store di
 static int pwrite_all(int fd, const void *p, size_t n, size_t off) {
     for (size_t k = 0; k < n;) { const ssize_t w = pwrite(fd, (const char *)p + k, n - k, (off_t)(off + k)); if (w <= 0) return -1; k += (size_t)w; }
     return 0;
+}
+static uint64_t hash_bytes(uint64_t h, const void *p, size_t n) {   /* 64-bit words, multiply-xorshift; the tail bytewise */
+    const uint8_t *c = p; size_t k = 0;
+    for (; k + 8 <= n; k += 8) { uint64_t w; memcpy(&w, c + k, 8); h = (h ^ w) * 0x100000001B3ull; h ^= h >> 29; }
+    for (; k < n; k++) { h = (h ^ c[k]) * 0x100000001B3ull; }
+    return h ^ (h >> 31);
 }
 static int val_read(valdisk *v, int i, int B, size_t p3) {   /* window i into v->buf (its pages then leave the page cache) */
     void **f[VAL_NF]; size_t sz[VAL_NF];
@@ -857,7 +867,7 @@ int cmd_train(int argc, char **argv) {
     if (argc < 3) {
         fprintf(stderr, "usage: ufsm train <sources.json> --out DIR [--P 512] [--B 1] [--steps 20000] [--lr 1e-3] [--warmup 500] [--wd 0.01]\n"
                         "       [--dice 0.5] [--ema 0.999] [--widths 16,32,64,80] [--down-norm 1] [--gpus 0,1] [--workers 12] [--sampler-slots N] [--seed 0] [--det 1] [--resume CKPT] [--finetune 1] [--fp4 0|1|2 (default 2)] [--mem auto|auto16|default|wide] [--opt adamw|muon|anvil] [--muon-lr 0.02] [--muon-beta 0.95] [--anvil-lr 0.023] [--anvil-wd 2.25] [--sched cos|wsd] [--cooldown 0.2]\n"
-                        "       [--val-batches 8] [--log-every 20] [--val-every 500] [--ckpt-every 1000] [--clip 5] [--levels 0.5,0.25,0.15,0.1] [--fp32] [--f16 1] [--gscale 1024] [--prec 1|2|3|4] [--input-prec 0|4|8] [--policy enc0=1,dec0.c1=fp16:fp16:fp8,...] [--qat 2|3] [--wq 8|4] [--sparse24 STEP] [--srste 2e-4] [--pos-weight 1] [--tol 0..2] [--sr 1]\n"
+                        "       [--val-batches 8] [--val-P N (validation windows of N^3 whatever P: the same voxels across window sizes)] [--log-every 20] [--val-every 500] [--ckpt-every 1000] [--clip 5] [--levels 0.5,0.25,0.15,0.1] [--fp32] [--f16 1] [--gscale 1024] [--prec 1|2|3|4] [--input-prec 0|4|8] [--policy enc0=1,dec0.c1=fp16:fp16:fp8,...] [--qat 2|3] [--wq 8|4] [--sparse24 STEP] [--srste 2e-4] [--pos-weight 1] [--tol 0..2] [--sr 1]\n"
                         "       [--seconds S] [--warmup-seconds S (default 5%% of time budget)] (time-based schedule and final checkpoint)\n"
                         "       [--schedule-seconds S --schedule-elapsed S]   wall-time LR horizon across finite-cover evaluation pauses\n"
                         "       [--cover PLAN.json] [--cover-extend-from OLD_PLAN.json] [--cover-next-pass 1] [--stop-at STEP] [--ct-aug 0|1] [--symmetry-p 1] [--axis-jitter 0] [--limit-seconds 0]\n"
@@ -915,6 +925,7 @@ int cmd_train(int argc, char **argv) {
     int nval = atoi(opt(argc, argv, "--val-batches", "8")), log_every = atoi(opt(argc, argv, "--log-every", "20"));
     int val_every = atoi(opt(argc, argv, "--val-every", "500")), ckpt_every = atoi(opt(argc, argv, "--ckpt-every", "1000"));
     const int val_live = atoi(opt(argc, argv, "--val-live", "0"));   /* validate the live weights instead of the EMA (e.g. resume a last.ckpt for one lr-0 step) */
+    g_valP = atoi(opt(argc, argv, "--val-P", "0"));   /* (checked once the window and the task are known) */
     const int l0_recal = atoi(opt(argc, argv, "--l0-recal", "4"));   /* --l0-norm ema: windows recalibrating the EMA weights' level-0 statistics before each validation */
     uint64_t seed = (uint64_t)atoll(opt(argc, argv, "--seed", "0"));
     const char *resume = opt(argc, argv, "--resume", nullptr);
@@ -1098,6 +1109,7 @@ int cmd_train(int argc, char **argv) {
     for (int i = 1; i < argc; i++) if (!strcmp(argv[i], "--fp32")) nn_set_tf32(0);
     int devs[8], ng = 0;
     { char *t = strdup(opt(argc, argv, "--gpus", opt(argc, argv, "--gpu", "0"))); for (char *q = strtok(t, ","); q && ng < 8; q = strtok(nullptr, ",")) devs[ng++] = atoi(q); free(t); }
+    nn_set_deterministic(atoi(opt(argc, argv, "--det", "0")));
     nn_init(devs[0]);   /* env precision knobs are read here; the storage modes decide the batch formats */
     g_xfmt = nn_get_tf32() && nn_get_act_bf16() && !ufsm_env_on("UFSM_ACT_MX8") ? (nn_get_f16() ? 1 : 2) : 0;
     g_g16 = nn_get_tf32() && nn_get_act_bf16() && nn_get_grad_bf16();
@@ -1490,6 +1502,19 @@ int cmd_train(int argc, char **argv) {
         if (g_hs_z < 1) g_hs_z = 1;
         if (g_hs_z > g_Pz) g_hs_z = g_Pz;
         for (int g = 0; g < ng; g++) unet_set_head_ext(G[g].u, g_head_slab);
+        if (g_valP == P && !getenv("UFSM_VALP_FORCE")) g_valP = 0;   /* (UFSM_VALP_FORCE=1: the separate validation network at the training size, a test) */
+        if (g_valP) {   /* --val-P: the plain recto-style losses on whole cube windows; validation on GPU 0 */
+            if (g_valP < 0 || g_valP > P || g_valP % (1 << (cfg.nlev - 1))) { fprintf(stderr, "--val-P: a positive multiple of %d, at most P (the windows go up through "
+                                                                                       "the training batch buffers)\n", 1 << (cfg.nlev - 1)); return 2; }
+            if (split || g_Pz != P || g_half || g_aff || g_side || g_unwrap || g_heads || g_ds || g_cond || g_pap_head || g_verso || g_head_slab || g_sheet
+                || cfg.l0_norm == 2 || nn_get_loss_tol()) {
+                fprintf(stderr, "--val-P: whole cube windows and the plain losses only (no --split, --Pz, --half-res, heads, deep supervision, verso, "
+                                "side / unwrap / cond / papyrus / band tasks, --tol, --l0-norm ema)\n"); return 2;
+            }
+            nn_init(G[0].dev);
+            g_val_u = unet_create(&cfg);   /* its own buffers (an inference build at N^3); the weights are the training net's (unet_use_params) */
+            unet_set_fp16_logits(g_val_u, !ufsm_env_on("UFSM_LOGITS32"));   /* (as the training nets) */
+        }
         const char *mm = opt(argc, argv, "--mem", "auto");   /* MX-fp8 gradients passed their stair (3 seeds, mean 0.293 vs 0.294) */
         const int auto16 = g_sheet || !strcmp(mm, "auto16") || !unet_act_mx();   /* sheet reference keeps FP16 stem, hence 16-bit gradients */
         /* MX gradient modes store MX-fp4 activation gradients by default (paired 500-step runs: same step time, -2.9 GB per desk GPU,
@@ -1551,6 +1576,14 @@ int cmd_train(int argc, char **argv) {
             size_t fmin = (size_t)-1;
             for (int g = 0; g < ng; g++) { nn_init(G[g].dev); size_t f = nn_mem_free(); if (f < fmin) fmin = f; }
             nn_init(G[0].dev);
+            if (g_val_u) {   /* --val-P: the validation copy's inference build at N^3 stays out of the training budget */
+                g_val_reserve = unet_infer_bytes(g_val_u, (shape5){B, g_xc, g_valP, g_valP, g_valP});
+                g_val_reserve += g_val_reserve * 2 / 5 + ((size_t)256 << 20);   /* (the dry build counts ~3/4 of what it takes: 1.08 GB at 384^3) */
+                fmin = fmin > g_val_reserve ? fmin - g_val_reserve : 0;
+                fprintf(stderr, "memory: --val-P %d keeps %.2f GB free for the validation network\n", g_valP, g_val_reserve / 1e9);
+            }
+            const size_t det_scratch = nn_get_deterministic() ? nn_det_scratch_limit() : 0;
+            if (det_scratch) fprintf(stderr, "memory: deterministic reduction workspace budget %.2f MB per GPU\n", det_scratch / 1e6);
             const shape5 xs = g_half ? (shape5){B, cfg.cin, P / g_hdiv, P / g_hdiv, P / g_hdiv} : (shape5){B, cfg.cin, split ? g_Dl : g_Pz, P, P};   /* split: this GPU's slab of the window */
             const size_t p3 = p3l;
             int pick = -1, pick_hoff = 1, minc = -1, min_hoff = 1; size_t need = 0, pick_off = 0, pick_need = 0, min_need = (size_t)-1;
@@ -1593,7 +1626,7 @@ int cmd_train(int argc, char **argv) {
                    channel x 256 voxels (~0.5 B per voxel and channel), outside the dry build. 8 / 16-channel levels only with UFSM_GYREC=2
                    (8.5 B per level-0 voxel at 16 channels for ~0 step time there; 8 channels: -2%) */
                 const size_t grec = unet_grad_mx4() && (cfg.widths[0] % 32 == 0 || lp_gyrec_narrow()) && (getenv("UFSM_GYREC") ? atoi(getenv("UFSM_GYREC")) : 1) ? (size_t)B * cfg.widths[0] * p3 * 136 / 256 : 0;
-                need = grec + tb + tb / 14 + trainer + (nn_get_loss_tol() ? (size_t)B * p3 : 0) + (g_aff ? (size_t)2 * B * p3 : 0) + (g_unwrap ? (g_head_slab ? (size_t)4 * B * p3 + (size_t)g_hs_z * P * P * (2 * g_cout + 11) + 4096 : (size_t)15 * B * p3) + (g_unwrap2 ? (size_t)4 * B * p3 : 0) : 0) + (g_cond ? (size_t)7 * B * p3 : 0) + (g_pap_head ? (size_t)4 * B * p3 : 0) + ((size_t)550 << 20) + (split ? (size_t)4 * B * 32 * P * P * 2 : 0);   /* split: two slots of halo send / receive planes */   /* kernel workspaces: measured device growth / tracked ~1.07 + 0.3 GB, + 0.2 GB margin for other processes */
+                need = det_scratch + grec + tb + tb / 14 + trainer + (nn_get_loss_tol() ? (size_t)B * p3 : 0) + (g_aff ? (size_t)2 * B * p3 : 0) + (g_unwrap ? (g_head_slab ? (size_t)4 * B * p3 + (size_t)g_hs_z * P * P * (2 * g_cout + 11) + 4096 : (size_t)15 * B * p3) + (g_unwrap2 ? (size_t)4 * B * p3 : 0) : 0) + (g_cond ? (size_t)7 * B * p3 : 0) + (g_pap_head ? (size_t)4 * B * p3 : 0) + ((size_t)550 << 20) + (split ? (size_t)4 * B * 32 * P * P * 2 : 0);   /* split: two slots of halo send / receive planes */   /* kernel workspaces: measured device growth / tracked ~1.07 + 0.3 GB, + 0.2 GB margin for other processes */
                 if (need < min_need) { min_need = need; minc = c; min_hoff = pass; }   /* (no fit: the smallest mode evaluated) */
                 if (need <= fmin) { pick = c; pick_hoff = pass; pick_off = unet_last_offload_bytes(); pick_need = need; }
             }
@@ -1891,6 +1924,11 @@ int cmd_train(int argc, char **argv) {
        through one host batch; ram: copies in host RAM (the former layout); regen: drawn again at every pass (no copies; the pass waits
        for 3 sampler workers). The sheet prior's per-window records keep ram. */
     vc.deterministic = 1; vc.nworkers = 3; vc.nbuf = 3;
+    /* --val-P N: N^3 windows (vc.P), whatever the training window; the batch layout helpers see the validation size while they run */
+    const int vP = g_valP ? g_valP : P, Pz_tr = g_Pz;
+    const size_t p3v = g_valP ? (size_t)vP * vP * vP : p3;
+    if (g_valP) { vc.P = vP; vc.Pz = 0; g_Pz = vP; }
+    uint64_t vhash = 0x9E3779B97F4A7C15ull;   /* the validation windows' bytes (the same windows across runs: the same hash) */
     const char *vmode_s = opt(argc, argv, "--val-store", "disk");
     int vmode = !strcmp(vmode_s, "ram") ? VAL_RAM : !strcmp(vmode_s, "regen") ? VAL_REGEN : !strcmp(vmode_s, "disk") ? VAL_DISK : -1;
     if (vmode < 0) { fprintf(stderr, "--val-store: disk, ram or regen\n"); return 2; }
@@ -1909,7 +1947,8 @@ int cmd_train(int argc, char **argv) {
             batch *b = sampler_next(vs);
             if (!b) { nval = i; break; }
             void **fb[VAL_NF], **fv[VAL_NF]; size_t sz[VAL_NF];
-            const int nf = val_fields(b, B, p3, fb, sz); val_fields(&val[i], B, p3, fv, sz);
+            const int nf = val_fields(b, B, p3v, fb, sz); val_fields(&val[i], B, p3v, fv, sz);
+            for (int k = 0; k < nf; k++) vhash = hash_bytes(vhash, *fb[k], sz[k]);
             for (int k = 0; k < nf; k++)
                 if (vmode == VAL_RAM) { *fv[k] = malloc(sz[k]); memcpy(*fv[k], *fb[k], sz[k]); }
                 else if (pwrite_all(vdk.fd, *fb[k], sz[k], vdk.bytes)) { fprintf(stderr, "cannot write the validation windows\n"); return 1; }
@@ -1922,13 +1961,14 @@ int cmd_train(int argc, char **argv) {
         if (validation_failed) { fprintf(stderr, "validation sampler failed\n"); return 1; }
         if (vmode == VAL_DISK) {   /* one host batch to read them back into; the written pages leave the page cache */
             void **fv[VAL_NF]; size_t sz[VAL_NF];
-            const int nf = val_fields(&vdk.buf, B, p3, fv, sz);
+            const int nf = val_fields(&vdk.buf, B, p3v, fv, sz);
             for (int k = 0; k < nf; k++) if (!(*fv[k] = malloc(sz[k]))) { fprintf(stderr, "out of host memory (validation batch)\n"); return 1; }
             fdatasync(vdk.fd); posix_fadvise(vdk.fd, 0, 0, POSIX_FADV_DONTNEED);
         }
-        fprintf(stderr, "%d validation batches, %s (--val-store %s)\n", nval, vmode == VAL_RAM ? "held in host RAM" : "in an unlinked file in the run directory, read back at each pass", vmode_s);
+        fprintf(stderr, "%d validation batches of %d^3, %s (--val-store %s), windows hash %016llx\n", nval, vP, vmode == VAL_RAM ? "held in host RAM" : "in an unlinked file in the run directory, read back at each pass", vmode_s, (unsigned long long)vhash);
     } else if (nval > 0) fprintf(stderr, "%d validation batches, drawn again at every validation pass (--val-store regen)\n", nval);
     else fprintf(stderr, "0 validation batches\n");
+    g_Pz = Pz_tr;
 
     if (!sc.cover && step0 > 0) {   /* resumed: a fresh sample stream (the per-sample seeds count from batch 0 at every sampler start, so a
                                        resume under --det replayed the windows and augmentations of steps 1, 2, ...); validation keeps its seed */
@@ -2167,8 +2207,9 @@ int cmd_train(int argc, char **argv) {
             if (g_head_only) unet_grad_head_only(d->u, g_head_only - 1);   /* --train-head-only N: head + last N-1 decoder blocks (frozen rest: --wd 0) */
             if (clip > 0 && gn > clip) unet_clip_grad(d->u, clip);
             unet_srste24(d->u, srste);                       /* no-op unless sparse */
-            if (use_anvil) unet_anvil(d->u, anvil_lr * (lr / lr0), anvil_wd, step, steps, lr, 0.9f, 0.999f, 1e-8f, wd);
-            else if (use_muon) unet_muon(d->u, muon_lr * (lr / lr0), muon_beta, lr, 0.9f, 0.999f, 1e-8f, wd, step);   /* Muon lr follows the same schedule shape */
+            const float lr_fraction = lr0 ? lr / lr0 : 0.f;   /* --lr 0 freezes all optimizers (0/0 poisoned Muon / ANVIL weights). */
+            if (use_anvil) unet_anvil(d->u, anvil_lr * lr_fraction, anvil_wd, step, steps, lr, 0.9f, 0.999f, 1e-8f, wd);
+            else if (use_muon) unet_muon(d->u, muon_lr * lr_fraction, muon_beta, lr, 0.9f, 0.999f, 1e-8f, wd, step);   /* Muon lr follows the same schedule shape */
             else unet_adamw(d->u, lr, 0.9f, 0.999f, 1e-8f, wd, step);
             unet_ema(d->u, step < 100 ? 0.9f : ema);
             unet_wquant(d->u, (unsigned)step);              /* no-op unless --wq */
@@ -2223,20 +2264,43 @@ int cmd_train(int argc, char **argv) {
                     }
                     sampler *vq = nval > 0 && vmode == VAL_REGEN ? sampler_start(S, &vc) : nullptr;   /* --val-store regen: the same windows drawn again */
                     if (nval > 0 && vmode == VAL_REGEN && !vq) { fprintf(stderr, "cannot construct validation sampler\n"); return 1; }
+                    /* --val-P: the validation copy of the network (its own N^3 inference build, the training net's current weights) on GPU 0's
+                       batch buffers (larger than N^3 needs; the lean layouts' prefetched batch goes up again below, as for the plain pass) */
+                    gpu_state Gv;
+                    if (g_val_u) {
+                        nn_init(G[0].dev);
+                        nn_event_sync(G[0].ev_up[0]); nn_event_sync(G[0].ev_up[1]); nn_sync();   /* (no upload into the shared buffers in flight) */
+                        Gv = G[0]; Gv.u = g_val_u; Gv.lean = 0; Gv.upsplit = 0; Gv.gl_inplace = 0; Gv.gl_inside = 0; Gv.side = -1; Gv.pending = nullptr; Gv.tail_due = nullptr;
+                        unet_use_params(g_val_u, unet_fwd_params(G[0].u));
+                        select_buf(&Gv, Gv.cur);   /* (the radial records of its forward) */
+                        g_Pz = vP;
+                    }
                     int got = 0;
                     for (int i = 0; i < nval; i++) {
                         float vp[2 * TCMAX + 1];
-                        batch *vbt = vq ? sampler_next(vq) : vmode == VAL_DISK ? (val_read(&vdk, i, B, p3) ? nullptr : &vdk.buf) : &val[i];
+                        batch *vbt = vq ? sampler_next(vq) : vmode == VAL_DISK ? (val_read(&vdk, i, B, p3v) ? nullptr : &vdk.buf) : &val[i];
                         if (!vbt) { if (vmode == VAL_DISK) { fprintf(stderr, "cannot read the validation windows\n"); return 1; } break; }
-                        for (int g = 0; g < nv; g++) { nn_init(G[g].dev); upload(&G[g], vbt, B, P); }
-                        if (split) { split_arg sa = {G, B, P, 0, dice_w}; split_run(sctx, split_job, &sa); nn_init(G[0].dev); }
-                        else run_batch(&G[0], B, P, dice_w, 0);
-                        double l = fetch_loss(&G[0], B, P, dice_w, vp); vl = (vl < 0 ? 0 : vl) + l; vb += vp[0];
+                        double l;
+                        if (g_val_u) {
+                            static int reported;
+                            const size_t f0 = reported ? 0 : nn_mem_free();
+                            upload(&Gv, vbt, B, vP); run_batch(&Gv, B, vP, dice_w, 0); l = fetch_loss(&Gv, B, vP, dice_w, vp);
+                            if (!reported++) fprintf(stderr, "memory: the --val-P validation network's build took %.2f GB (%.2f reserved)\n",
+                                                     f0 > nn_mem_free() ? (f0 - nn_mem_free()) / 1e9 : 0.0, g_val_reserve / 1e9);
+                        }
+                        else {
+                            for (int g = 0; g < nv; g++) { nn_init(G[g].dev); upload(&G[g], vbt, B, P); }
+                            if (split) { split_arg sa = {G, B, P, 0, dice_w}; split_run(sctx, split_job, &sa); nn_init(G[0].dev); }
+                            else run_batch(&G[0], B, P, dice_w, 0);
+                            l = fetch_loss(&G[0], B, P, dice_w, vp);
+                        }
+                        vl = (vl < 0 ? 0 : vl) + l; vb += vp[0];
                         if (g_unwrap2) { vw4[0] += G[0].w4h[0]; vw4[1] += G[0].w4h[5]; vw4[2] += G[0].w4h[1] * G[0].w4h[2]; vw4[3] += G[0].w4h[2]; vw4[4] += G[0].side_loss / (g_side_lambda ? g_side_lambda : 1.f); vw4[5] += G[0].norm_loss / (g_norm_lambda ? g_norm_lambda : 1.f); } vd += vp[g_aff || g_unwrap || g_heads ? NCH : g_half ? g_cout : cfg.cout];
                         if (g_heads) for (int h = 0; h < g_heads; h++) if (G[0].hon[h]) { vh[h] += G[0].hl[h]; vhn[h]++; }
                         if (vq) sampler_release(vq, vbt);
                         got++;
                     }
+                    if (g_val_u) { g_Pz = Pz_tr; unet_use_params(g_val_u, nullptr); }
                     if (vq) {
                         const int vfail = sampler_failed(vq);
                         sampler_stop(vq);

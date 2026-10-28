@@ -95,7 +95,7 @@ extern "C" int nn_conv3d_bwd_weight_x(const float *x, const nn_gn_t *gx, const f
         if (ISMX(x)) bdone = lp_bwd_w1_mx_b(x, MXDT(x), xs, gy, LPDT(GBF), ys, gw, gb, gp);
         else if (xs.c * ys.c <= 128 && ys.c <= 8) { if (g_h16) bwd_w1_h<f16>(x, xs, gy, ys, gw, So, gp); else bwd_w1_h<bf16>(x, xs, gy, ys, gw, So, gp); }
         else return -1;
-        if (gb && !bdone) { if (GBF && g_h16) bias_grad_k<f16><<<dim3(ys.c, KSLAB), 256>>>((const f16 *)gy, gb, ys.n, ys.c, So); else if (GBF) bias_grad_k<bf16><<<dim3(ys.c, KSLAB), 256>>>((const bf16 *)gy, gb, ys.n, ys.c, So); else bias_grad_k<float><<<dim3(ys.c, KSLAB), 256>>>(gy, gb, ys.n, ys.c, So); }
+        if (gb && !bdone) { if (GBF && g_h16) launch_bias_grad<f16>((const f16 *)gy, gb, ys.n, ys.c, So); else if (GBF) launch_bias_grad<bf16>((const bf16 *)gy, gb, ys.n, ys.c, So); else launch_bias_grad<float>(gy, gb, ys.n, ys.c, So); }
         KCHECK();
         return 0;
     }

@@ -39,7 +39,7 @@ extern "C" void nn_conv3d_bwd_weight(const float *x, shape5 xs, const float *gy,
     if (k == 1 && stride == 1 && g_tf32 && ISMX(x)) {
         const int bdone = lp_bwd_w1_mx_b(x, MXDT(x), xs, gy, LPDT(GBF), ys, gw, gb, gnp_t{});
         size_t So1 = shape_spatial(ys);
-        if (gb && !bdone) { if (GBF && g_h16) bias_grad_k<f16><<<dim3(ys.c, KSLAB), 256>>>((const f16 *)gy, gb, ys.n, ys.c, So1); else if (GBF) bias_grad_k<bf16><<<dim3(ys.c, KSLAB), 256>>>((const bf16 *)gy, gb, ys.n, ys.c, So1); else bias_grad_k<float><<<dim3(ys.c, KSLAB), 256>>>(gy, gb, ys.n, ys.c, So1); }
+        if (gb && !bdone) { if (GBF && g_h16) launch_bias_grad<f16>((const f16 *)gy, gb, ys.n, ys.c, So1); else if (GBF) launch_bias_grad<bf16>((const bf16 *)gy, gb, ys.n, ys.c, So1); else launch_bias_grad<float>(gy, gb, ys.n, ys.c, So1); }
         KCHECK(); return;
     }
     if (k == 3 && stride == 2 && g_tf32 && (eff_prec_w() == 2 || eff_prec_w() == 3)) { lp_bwd_w_s2_f8(x, LPDT(ABF), xs, gy, LPDT(GBF), ys, gw, gb, gnp_t{}); KCHECK(); return; }
@@ -57,7 +57,7 @@ extern "C" void nn_conv3d_bwd_weight(const float *x, shape5 xs, const float *gy,
     } else if (k == 1 && stride == 1 && xs.c * ys.c <= 128 && ys.c <= 8) {
         if (g_h16) bwd_w1_h<f16>(x, xs, gy, ys, gw, So); else bwd_w1_h<bf16>(x, xs, gy, ys, gw, So);
     } else { fprintf(stderr, "nn_conv3d_bwd_weight: unsupported k=%d stride=%d\n", k, stride); abort(); }
-    if (gb) { if (GBF && g_h16) bias_grad_k<f16><<<dim3(ys.c, KSLAB), 256>>>((const f16 *)gy, gb, ys.n, ys.c, So); else if (GBF) bias_grad_k<bf16><<<dim3(ys.c, KSLAB), 256>>>((const bf16 *)gy, gb, ys.n, ys.c, So); else bias_grad_k<float><<<dim3(ys.c, KSLAB), 256>>>(gy, gb, ys.n, ys.c, So); }
+    if (gb) { if (GBF && g_h16) launch_bias_grad<f16>((const f16 *)gy, gb, ys.n, ys.c, So); else if (GBF) launch_bias_grad<bf16>((const bf16 *)gy, gb, ys.n, ys.c, So); else launch_bias_grad<float>(gy, gb, ys.n, ys.c, So); }
     KCHECK();
 }
 extern "C" int nn_conv3d_fwd_gn(const float *x, shape5 xs, int G, const float *gamma, const float *beta, const float *mean, const float *rstd,

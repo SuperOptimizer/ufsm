@@ -526,11 +526,11 @@ template <int B, int BW = 32>   /* BW: the MX block width of gy / gx (32, or a w
                                    8 channels -2% step for 570 MB, 16 channels ~0 for 1.14 GB: this kernel then costs what the pre-pass did) */
 __global__ void __launch_bounds__(256, 3) gn_silu_bwd_apply_rec_k(const uint8_t *__restrict__ x, const uint8_t *__restrict__ gy, const float *gamma, const float *beta,
                                                             const float *mean, const float *rstd, const float *AB, uint8_t *__restrict__ gx, uint8_t *__restrict__ out,
-                                                            float *__restrict__ gbsum, int N, int C, int G, int D, int H, int W, unsigned gsr, unsigned rsr) {
+                                                            float *__restrict__ gbsum, int N, int C, int G, int D, int H, int W, unsigned gsr, unsigned rsr, float *bias_part = nullptr) {
     constexpr int NTASK = BW / 8, GRB = BW / 2;   /* record tasks per lane; MX-fp4 gy / gx row bytes */
     __shared__ __align__(16) __nv_bfloat16 v[8][BW][40];   /* bf16 (its 2^-9 rounding far below the fp4 SR that follows): 3 blocks / SM */
     __shared__ float4 cf[BW];
-    __shared__ float bred[BW];
+    __shared__ float bred[8][BW];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int nb = C / BW, cb = blockIdx.y % nb, n = blockIdx.y / nb, cpg = C / G;
     const size_t S = (size_t)D * H * W;
@@ -542,7 +542,7 @@ __global__ void __launch_bounds__(256, 3) gn_silu_bwd_apply_rec_k(const uint8_t 
         const float rs = rstd[ng], mu = mean[ng], ga = gamma[c], be = beta[c];
         const float ca = AB[2 * ng] / len, cc = AB[2 * ng + 1] / len, A = rs * ga;
         cf[k] = make_float4(0.5f * A, 0.5f * (be - mu * A), -rs * rs * cc, rs * (mu * rs * cc - ca));
-        bred[k] = 0.f;
+        for (int w = 0; w < 8; w++) bred[w][k] = 0.f;
     }
     __syncthreads();
     const uint8_t *sx = mx_sc<B>(x, N, C, S), *sg = mx_sc<4>(gy, N, C, S);
@@ -628,10 +628,15 @@ __global__ void __launch_bounds__(256, 3) gn_silu_bwd_apply_rec_k(const uint8_t 
 #pragma unroll
     for (int k = 0; k < NTASK; k++) {
         float a = bacc[k]; a += __shfl_xor_sync(0xffffffffu, a, 1); a += __shfl_xor_sync(0xffffffffu, a, 2);
-        if ((lane & 3) == 0) atomicAdd(&bred[(k * 32 + lane) >> 2], a);
+        if ((lane & 3) == 0) bred[warp][(k * 32 + lane) >> 2] = a;
     }
     __syncthreads();
-    if (threadIdx.x < BW) atomicAdd(&gbsum[(size_t)n * C + cb * BW + threadIdx.x], bred[threadIdx.x]);
+    if (threadIdx.x < BW) {
+        float sum = 0.f; for (int w = 0; w < 8; w++) sum += bred[w][threadIdx.x];
+        const size_t c = (size_t)n * C + cb * BW + threadIdx.x;
+        if (bias_part) bias_part[(size_t)blockIdx.x * N * C + c] = sum;
+        else atomicAdd(&gbsum[c], sum);
+    }
 }
 thread_local lp_gyrec_t g_gyrec;
 /* the record / bias-sum buffers of every GPU this thread drives: data-parallel training runs all GPUs' steps on one host thread, and
@@ -677,10 +682,12 @@ extern "C" int lp_gn_silu_bwd_apply_rec(const void *x, int xdt, shape5 s, int G,
     cudaMemsetAsync(R->gb, 0, (size_t)s.n * s.c * 4);
     const unsigned ngrp = (unsigned)ZT * TY * Wb;
     const dim3 grid(ngrp < 4096 ? ngrp : 4096, (unsigned)(nb * s.n));
-#define GREC_K(BWT) do { if (xdt == 4) gn_silu_bwd_apply_rec_k<4, BWT><<<grid, 256>>>((const uint8_t *)x, (const uint8_t *)gy, gamma, beta, mean, rstd, AB, (uint8_t *)gx, R->rec, R->gb, s.n, s.c, G, s.d, s.h, s.w, gsr, rsr); \
-                          else gn_silu_bwd_apply_rec_k<8, BWT><<<grid, 256>>>((const uint8_t *)x, (const uint8_t *)gy, gamma, beta, mean, rstd, AB, (uint8_t *)gx, R->rec, R->gb, s.n, s.c, G, s.d, s.h, s.w, gsr, rsr); } while (0)
+    float *bias_part = nn_get_deterministic() ? nn_det_workspace((size_t)grid.x * s.n * s.c * sizeof(float)) : nullptr;
+#define GREC_K(BWT) do { if (xdt == 4) gn_silu_bwd_apply_rec_k<4, BWT><<<grid, 256>>>((const uint8_t *)x, (const uint8_t *)gy, gamma, beta, mean, rstd, AB, (uint8_t *)gx, R->rec, R->gb, s.n, s.c, G, s.d, s.h, s.w, gsr, rsr, bias_part); \
+                          else gn_silu_bwd_apply_rec_k<8, BWT><<<grid, 256>>>((const uint8_t *)x, (const uint8_t *)gy, gamma, beta, mean, rstd, AB, (uint8_t *)gx, R->rec, R->gb, s.n, s.c, G, s.d, s.h, s.w, gsr, rsr, bias_part); } while (0)
     if (bw == 32) GREC_K(32); else if (bw == 16) GREC_K(16); else GREC_K(8);
 #undef GREC_K
+    if (bias_part) det_bias_sum_k<<<nblk_((size_t)s.n * s.c, 128), 128>>>(bias_part, R->gb, s.n * s.c, 1, grid.x);
     LPCK();
     R->gy = gx; R->n = s.n; R->c = s.c; R->d = s.d; R->h = s.h; R->w = s.w; R->bw = bw; R->valid = 1;
     return 1;

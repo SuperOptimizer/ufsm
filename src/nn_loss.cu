@@ -624,6 +624,52 @@ template <typename LT> __global__ void w4_stats_k(const LT *la, const LT *lb, co
     __syncthreads();
     for (int k = threadIdx.x; k < W4_NC * W4_NS; k += blockDim.x) if (sh[k] != 0.f) atomicAdd(&ds[k], (double)sh[k]);
 }
+/* Deterministic winding statistics: group equal component keys within a warp,
+   visit contributing lanes and warps in order, then commit CTA slots in order.
+   The ordinary path retains its fast float atomics. */
+template <typename LT> __global__ void w4_stats_ordered_k(const LT *la, const LT *lb, const uint8_t *w4, const uint8_t *cp, const uint8_t *m, size_t n, float *part) {
+    __shared__ float sh[W4_NC * W4_NS];
+    for (int k = threadIdx.x; k < W4_NC * W4_NS; k += blockDim.x) sh[k] = 0.f;
+    __syncthreads();
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    for (size_t base = blockIdx.x * (size_t)blockDim.x; base < n; base += (size_t)gridDim.x * blockDim.x) {
+        const size_t i = base + threadIdx.x;
+        unsigned c = 255u; float value[W4_NS] = {};
+        if (i < n && cp[i] < W4_NC && w4[i] < 252u && m[i]) {
+            c = cp[i]; const float a = lgv(la, i), b = lgv(lb, i), w = (float)m[i];
+            float st, ct; sincosf(6.283185307179586f * (float)w4[i] * (1.f / 252.f), &st, &ct);
+            const float spa = fmaxf(a, 0.f) + log1pf(__expf(-fabsf(a))), spb = fmaxf(b, 0.f) + log1pf(__expf(-fabsf(b)));
+            value[0] = w; value[1] = w * (spa + spb); value[2] = w * 0.5f * (a + b);
+            value[3] = w * 0.5f * (a * ct + b * st); value[4] = w * 0.5f * (b * ct - a * st);
+            const float pa = 2.f / (1.f + __expf(-a)) - 1.f, pb = 2.f / (1.f + __expf(-b)) - 1.f;
+            const float e = atan2f(pb * ct - pa * st, pa * ct + pb * st);
+            const int k = ((int)lrintf(e * (2.f / 3.14159265358979f)) % 4 + 4) % 4;
+            value[5 + k] = w;
+        }
+        const unsigned peers = __match_any_sync(0xffffffffu, c);
+        const int leader = __ffs(peers) - 1;
+        float sum[W4_NS] = {};
+        for (unsigned remaining = peers; remaining; remaining &= remaining - 1) {
+            const int source = __ffs(remaining) - 1;
+#pragma unroll
+            for (int k = 0; k < W4_NS; k++) sum[k] += __shfl_sync(peers, value[k], source);
+        }
+        for (int w = 0; w < 8; w++) {
+            if (warp == w && lane == leader && c < W4_NC) {
+#pragma unroll
+                for (int k = 0; k < W4_NS; k++) sh[c * W4_NS + k] += sum[k];
+            }
+            __syncthreads();
+        }
+    }
+    for (int k = threadIdx.x; k < W4_NC * W4_NS; k += blockDim.x) part[(size_t)blockIdx.x * W4_NC * W4_NS + k] = sh[k];
+}
+__global__ void w4_stats_commit_k(const float *part, double *ds, int blocks) {
+    const int k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k >= W4_NC * W4_NS) return;
+    double sum = 0.; for (int b = 0; b < blocks; b++) sum += (double)part[(size_t)b * W4_NC * W4_NS + k];
+    ds[k] += sum;
+}
 /* per component the best gauge g* (largest of X, Y, -X, -Y); out: [0] loss (mean per channel of the best-gauge BCE over the
    supervised voxels), [1] accuracy (fraction with the predicted turn right at g*), [2] N, [3] 1 / N (0 when none), [4] components,
    [5] the same BCE at the worst gauge (a gauge-blind net has [0] == [5]), [8 + c] g* of component c */
@@ -661,8 +707,15 @@ extern "C" size_t nn_wind4_scratch(void) { return (8 + W4_NC) * sizeof(float); }
 extern "C" size_t nn_wind4_sums(void) { return (size_t)W4_NC * W4_NS * sizeof(double); }
 extern "C" void nn_wind4_stats(const void *la, const void *lb, const uint8_t *w4, const uint8_t *comp, const uint8_t *m, size_t n, double *ds) {
     const unsigned nb = (unsigned)(n / 2048 + 1 < 1024 ? n / 2048 + 1 : 1024);
+    if (nn_get_deterministic()) {
+        float *part = nn_det_workspace((size_t)nb * W4_NC * W4_NS * sizeof(float));
+        if (g_logits_h16) w4_stats_ordered_k<f16><<<nb, 256>>>((const f16 *)la, (const f16 *)lb, w4, comp, m, n, part);
+        else w4_stats_ordered_k<float><<<nb, 256>>>((const float *)la, (const float *)lb, w4, comp, m, n, part);
+        w4_stats_commit_k<<<nblk(W4_NC * W4_NS, 128), 128>>>(part, ds, nb);
+    } else {
     if (g_logits_h16) w4_stats_k<f16><<<nb, 256>>>((const f16 *)la, (const f16 *)lb, w4, comp, m, n, ds);
     else w4_stats_k<float><<<nb, 256>>>((const float *)la, (const float *)lb, w4, comp, m, n, ds);
+    }
     KCHECK();
 }
 extern "C" void nn_wind4_fin(double *ds, float *out) {

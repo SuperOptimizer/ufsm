@@ -294,7 +294,7 @@ int lp_f4u_fwd(const void *x, shape5 xs, const float *w, const float *b, int cou
     while (ZC > 1 && base * nblk_(nzt, ZC) < 480) ZC--;
     const dim3 grid(nblk_(xs.w, 16), nblk_(xs.h, 8), (unsigned)(nblk_(nzt, ZC) * xs.n));
     static int attr[8];
-    if (!attr[cur_dev_()]) { attr[cur_dev_()] = 1; cudaFuncSetAttribute((const void *)conv_fwd_f4u_k<TZ, mx4_t, mx4_t>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
+    if (!attr[cur_dev_()]) { attr[cur_dev_()] = 1; nn_set_dynamic_smem((const void *)conv_fwd_f4u_k<TZ, mx4_t, mx4_t>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
     conv_fwd_f4u_k<TZ, mx4_t, mx4_t><<<grid, 256, smem>>>((const mx4_t *)x, wq, ws, b, (mx4_t *)y, xs.n, xs.c, Cx, xs.d, xs.h, xs.w, cout, gp, osum, Go, sp, ZC);
 #if F4R_PROF
     if (getenv("F4R_PROF")) {

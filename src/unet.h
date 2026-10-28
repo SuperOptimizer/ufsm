@@ -94,6 +94,7 @@ void unet_adamw(unet *u, float lr, float b1, float b2, float eps, float wd, int 
 void unet_ema(unet *u, float decay);
 /* Use the EMA weights (1) or the live weights (0) for forward. */
 void unet_use_ema(unet *u, int on);
+const float *unet_fwd_params(const unet *u);   /* the device weights the forward uses now (EMA or live; train --val-P's copy reads them) */
 /* Frozen GroupNorm statistics for inference: unet_gn_nstats floats per sample (means and reciprocal standard deviations of every
    GroupNorm in a fixed order); unet_gn_stats_get copies sample 0 of the last forward (tensor-core path); unet_gn_freeze(h) makes
    every later inference forward use h instead of the window's statistics (nullptr: back to the window's). */

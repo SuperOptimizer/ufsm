@@ -6,7 +6,7 @@
    channel into its group's sums. (The kernel this replaced, a block per 256 voxels and double atomics per block and group on the same
    2 N G addresses, took ~14 ms per 8-channel level-0 call at P512 on the desk: 55 ms of an 8-wide net's step.) */
 template <int B, int HPB>
-__global__ void __launch_bounds__(256) gn_sums_mx2_k(const uint8_t *x, int N, int C, int G, size_t S, double *sums, size_t v0, size_t v1) {
+__global__ void __launch_bounds__(256) gn_sums_mx2_k(const uint8_t *x, int N, int C, int G, size_t S, double *sums, size_t v0, size_t v1, float *part = nullptr) {
     const int bw = mx_bw(C), nb = mx_nb(C), cpg = C / G, blk = blockIdx.y, n = blockIdx.z, nsl = gridDim.x;
     const int h = HPB == 2 ? (int)(threadIdx.x & 1) : 0, h0 = 16 * h, tv = (int)threadIdx.x / HPB, nt = 256 / HPB;
     size_t q0 = S * blockIdx.x / nsl, q1 = S * (blockIdx.x + 1) / nsl;
@@ -66,8 +66,22 @@ __global__ void __launch_bounds__(256) gn_sums_mx2_k(const uint8_t *x, int N, in
 #pragma unroll
         for (int w = 0; w < 8; w++) { a += w1[w][threadIdx.x]; b2 += w2[w][threadIdx.x]; }
         const size_t o = 2 * ((size_t)n * G + (blk * bw + (int)threadIdx.x) / cpg);
-        atomicAdd(&sums[o], (double)a); atomicAdd(&sums[o + 1], (double)b2);
+        if (part) {
+            const size_t i = 2 * (((size_t)blockIdx.x * N + n) * C + blk * bw + threadIdx.x);
+            part[i] = a; part[i + 1] = b2;
+        } else { atomicAdd(&sums[o], (double)a); atomicAdd(&sums[o + 1], (double)b2); }
     }
+}
+template <int TAG = 0> __global__ void gn_sums_mx_ordered_k(const float *part, double *sums, int N, int C, int G, int blocks) {
+    const int ng = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ng >= N * G) return;
+    const int n = ng / G, g = ng % G, cpg = C / G;
+    double a = 0., b = 0.;
+    for (int block = 0; block < blocks; block++) for (int c = g * cpg; c < (g + 1) * cpg; c++) {
+        const size_t i = 2 * (((size_t)block * N + n) * C + c);
+        a += (double)part[i]; b += (double)part[i + 1];
+    }
+    sums[2 * ng] += a; sums[2 * ng + 1] += b;
 }
 extern "C" int lp_gn_sums_mx(const void *x, int xdt, int N, int C, int G, size_t S, double *sums, size_t v0, size_t v1) {
     const int cpg = C / G;
@@ -81,8 +95,10 @@ extern "C" int lp_gn_sums_mx(const void *x, int xdt, int N, int C, int G, size_t
     if (slabs > 1024) slabs = 1024;
     const dim3 grid((unsigned)slabs, (unsigned)nb, (unsigned)N);
     const uint8_t *xq = (const uint8_t *)x;
-    if (xdt == 4) { if (hpb == 2) gn_sums_mx2_k<4, 2><<<grid, 256>>>(xq, N, C, G, S, sums, v0, v1); else gn_sums_mx2_k<4, 1><<<grid, 256>>>(xq, N, C, G, S, sums, v0, v1); }
-    else { if (hpb == 2) gn_sums_mx2_k<8, 2><<<grid, 256>>>(xq, N, C, G, S, sums, v0, v1); else gn_sums_mx2_k<8, 1><<<grid, 256>>>(xq, N, C, G, S, sums, v0, v1); }
+    float *part = nn_get_deterministic() ? nn_det_workspace((size_t)slabs * 2 * N * C * sizeof(float)) : nullptr;
+    if (xdt == 4) { if (hpb == 2) gn_sums_mx2_k<4, 2><<<grid, 256>>>(xq, N, C, G, S, sums, v0, v1, part); else gn_sums_mx2_k<4, 1><<<grid, 256>>>(xq, N, C, G, S, sums, v0, v1, part); }
+    else { if (hpb == 2) gn_sums_mx2_k<8, 2><<<grid, 256>>>(xq, N, C, G, S, sums, v0, v1, part); else gn_sums_mx2_k<8, 1><<<grid, 256>>>(xq, N, C, G, S, sums, v0, v1, part); }
+    if (part) gn_sums_mx_ordered_k<<<nblk_((size_t)N * G, 128), 128>>>(part, sums, N, C, G, slabs);
     LPCK();
     return 0;
 }

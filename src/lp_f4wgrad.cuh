@@ -84,7 +84,12 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_f4_k(const T *__restrict__ 
     float *scr = (float *)(wsc + 9 * 32);                             /* [9 warps][180], LY 0 only */
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
     const int ci0 = blockIdx.y * CH, co0 = blockIdx.z * BMo;
-    int bz = blockIdx.x;   /* spatial tiles use grid.x: grid.z is limited to 65535 */
+    int bz = blockIdx.x + sp.wpart_x0;   /* spatial tiles use grid.x: grid.z is limited to 65535 */
+    if (sp.wpart) {
+        const size_t nw = (size_t)Co * Ci * 27;
+        gw = sp.wpart + (size_t)blockIdx.x * (nw + Co);
+        if (gb) gb = gw + nw;
+    }
     /* z-steps [zs0, nzt) of the volume (zs1 > 0: a slab [zs0, zs1), with gpre holding its pre-rounded gy blocks) */
     const int nxt = (W + 15) / 16, nyt = (H + 7) / 8, nzt = zs1 > 0 ? zs1 : (D + 1) / 2;
     const int ox0 = (bz % nxt) * 16; bz /= nxt;
@@ -101,6 +106,9 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_f4_k(const T *__restrict__ 
 #pragma unroll
     for (int a = 0; a < 3; a++) for (int m = 0; m < MT; m++) for (int q = 0; q < NT; q++) for (int k = 0; k < 4; k++) acc[a][m][q][k] = 0.f;
     if (threadIdx.x < BMo) sbias[threadIdx.x] = 0.f;
+    __shared__ float ordered_bias[9][BMo * 8];
+    if (sp.wpart) for (int i = threadIdx.x; i < 9 * BMo * 8; i += blockDim.x) ((float *)ordered_bias)[i] = 0.f;
+    __syncthreads();
     const bool vec = (W & 3) == 0;
     const int zt_begin = zs0 + zc * ZC;
     bool mxu = false;
@@ -533,7 +541,7 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_f4_k(const T *__restrict__ 
                 for (int j = 0; j < 8; j++) word |= sr_e2m1_nib(q[j] * m, (hh[j >> 1] >> (16 * (j & 1))) & 0xffffu) << (4 * j);
             } else word = cvt_e2m1x8(q, m);
             *(unsigned *)(sg + c * G4_CS + pb * 16 + 4 * f) = word;
-            if (f == 0) { sgs[c * 8 + pb] = (uint8_t)(e + 127); if (do_bias) atomicAdd(&sbias[c], sm); }
+            if (f == 0) { sgs[c * 8 + pb] = (uint8_t)(e + 127); if (do_bias) { if (sp.wpart) ordered_bias[warp][c * 8 + pb] += sm; else atomicAdd(&sbias[c], sm); } }
         }
         __syncthreads();
         FP_T(t2)
@@ -603,7 +611,11 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_f4_k(const T *__restrict__ 
     if (threadIdx.x == 0) { atomicAdd(&g_f4wprof[0], pa); atomicAdd(&g_f4wprof[1], pb_); atomicAdd(&g_f4wprof[2], pc); atomicAdd(&g_f4wprof[3], 1ull);
                             atomicAdd(&g_f4wprof[4], sA); atomicAdd(&g_f4wprof[5], sB); }
 #endif
-    if (do_bias) { __syncthreads(); if (threadIdx.x < BMo && co0 + (int)threadIdx.x < Co) atomicAdd(&gb[co0 + threadIdx.x], sbias[threadIdx.x]); }
+    if (do_bias) { __syncthreads(); if (threadIdx.x < BMo && co0 + (int)threadIdx.x < Co) {
+            float sum = sbias[threadIdx.x];
+            if (sp.wpart) { sum = 0.f; for (int w = 0; w < 9; w++) for (int k = 0; k < 8; k++) sum += ordered_bias[w][threadIdx.x * 8 + k]; }
+            atomicAdd(&gb[co0 + threadIdx.x], sum);
+        } }
     const float osc = (had & 4) ? 1.f / 16.f : (had & 1) ? 1.f / 32.f : 1.f;
 #pragma unroll
     for (int kx = 0; kx < 3; kx++) {
@@ -705,8 +717,10 @@ __global__ void __launch_bounds__(WS_NT, 1) conv_bwd_w_f4ws_k(const T *__restric
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
     const int ci0 = blockIdx.y * CH, co0 = blockIdx.z * BMo;
     const int nxt = (W + 15) / 16, nyt = (H + 7) / 8, nzt = zs1;
-    const int nzc = (nzt - zs0 + ZC - 1) / ZC, nitem = nxt * nyt * nzc, nper = gridDim.x / N;
-    const int n = blockIdx.x / nper, w0 = blockIdx.x % nper;   /* items w0, w0 + nper, ... of batch entry n */
+    const int nzc = (nzt - zs0 + ZC - 1) / ZC, nitem = nxt * nyt * nzc, nper = (sp.wpart_nx ? sp.wpart_nx : (int)gridDim.x) / N;
+    const int bid = blockIdx.x + sp.wpart_x0;
+    const int n = bid / nper, w0 = bid % nper;   /* items w0, w0 + nper, ... of batch entry n */
+    if (sp.wpart) gw = sp.wpart + (size_t)blockIdx.x * ((size_t)Co * Ci * 27 + Co);
     const size_t plane = (size_t)D * H * W;
     const int Cx = sp.x2 ? sp.c_split : Ci;
     int ntot = 0, npas = 0;   /* z-steps and producer passes of this block (an item: its z-steps + 1) */
@@ -975,11 +989,11 @@ __global__ void __launch_bounds__(WS_NT, 1) conv_bwd_w_f4ws_k(const T *__restric
    channel and CTA). */
 extern int g_f4w_gy4;   /* lp_bwd_w_f4: the (mx8_t-typed) gy holds MX-fp4 rows; only the gy pre-pass reads it */
 template <int BW, int GB = 8> __global__ void __launch_bounds__(256) gy_pre4_k(const uint8_t *__restrict__ gy, uint8_t *__restrict__ out, float *__restrict__ gb,
-                                                                  int N, int Co, int D, int H, int W, int z0, int Zs, unsigned sr) {   /* GB: gy MX bits */
+                                                                  int N, int Co, int D, int H, int W, int z0, int Zs, unsigned sr, float *bias_part = nullptr) {   /* GB: gy MX bits */
     constexpr int NTASK = BW / 8;   /* (channel, word) tasks per lane */
     __shared__ __align__(16) __nv_bfloat16 v[8][BW][40];   /* per warp: [channel][block element k = 16 row + x]; bf16 holds the decoded
                                                               MX values exactly (e2m1 / e4m3 mantissas, fp32 exponents): 20 KB (fp32: 34) */
-    __shared__ float bred[BW];
+    __shared__ float bred[8][BW];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int nb = mx_nb(Co), cb = blockIdx.y % nb, n = blockIdx.y / nb;
     const int Wb = (W + 15) / 16, ZT = (Zs + 1) / 2, TY = (H + 7) / 8, Yb = 4 * TY;   /* padded block grid: 2 ZT planes x 4 TY row pairs */
@@ -987,7 +1001,7 @@ template <int BW, int GB = 8> __global__ void __launch_bounds__(256) gy_pre4_k(c
     const unsigned ngrp = (unsigned)ZT * TY * Wb;   /* record groups (z-step, 8-row tile, 16-x tile): a CTA each, warp = block pb */
     (void)Yb;
     const uint8_t *gsc = gy + (size_t)N * nb * Sg * mx_rb(BW, GB);
-    if (threadIdx.x < BW) bred[threadIdx.x] = 0.f;
+    if (threadIdx.x < BW) for (int w = 0; w < 8; w++) bred[w][threadIdx.x] = 0.f;
     float bacc[NTASK];
 #pragma unroll
     for (int k = 0; k < NTASK; k++) bacc[k] = 0.f;
@@ -1060,10 +1074,15 @@ template <int BW, int GB = 8> __global__ void __launch_bounds__(256) gy_pre4_k(c
 #pragma unroll
         for (int k = 0; k < NTASK; k++) {
             float a = bacc[k]; a += __shfl_xor_sync(0xffffffffu, a, 1); a += __shfl_xor_sync(0xffffffffu, a, 2);
-            if ((lane & 3) == 0) atomicAdd(&bred[(k * 32 + lane) >> 2], a);
+            if ((lane & 3) == 0) bred[warp][(k * 32 + lane) >> 2] = a;
         }
         __syncthreads();
-        if (threadIdx.x < BW && cb * BW + (int)threadIdx.x < Co) atomicAdd(&gb[cb * BW + threadIdx.x], bred[threadIdx.x]);
+        if (threadIdx.x < BW && cb * BW + (int)threadIdx.x < Co) {
+            float sum = 0.f; for (int w = 0; w < 8; w++) sum += bred[w][threadIdx.x];
+            const int co = cb * BW + threadIdx.x;
+            if (bias_part) bias_part[((size_t)blockIdx.x * N + n) * Co + co] = sum;
+            else atomicAdd(&gb[co], sum);
+        }
     }
 }
 #if F4W_PROF
@@ -1078,6 +1097,12 @@ static void f4w_prof_dump(shape5 xs, shape5 ys, int MT, int NT, int lay) {
 #endif
 template <int MT, int NT, typename T, typename TG> static void launch_bw4(dim3 grid, size_t smem, const void *x, shape5 xs, const TG *gy, shape5 ys, float *gw, float *gb, gnp_t gp, split_t sp, int ZC, int had, int lay,
                                                                           const uint8_t *gpre = nullptr, int zs0 = 0, int zs1 = 0) {
+    if (nn_get_deterministic() && !sp.wpart) {
+        det_wgrad_launch(grid, gw, gb, xs.c, ys.c, 27, sp, [&](dim3 piece, split_t ss) {
+            launch_bw4<MT, NT, T, TG>(piece, smem, x, xs, gy, ys, gw, gb, gp, ss, ZC, had, lay, gpre, zs0, zs1);
+        });
+        return;
+    }
     static int attr[8];
     if (!attr[cur_dev_()]) { attr[cur_dev_()] = 1; cudaFuncSetAttribute((const void *)conv_bwd_w_f4_k<MT, NT, 0, T, TG>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); cudaFuncSetAttribute((const void *)conv_bwd_w_f4_k<MT, NT, 1, T, TG>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); cudaFuncSetAttribute((const void *)conv_bwd_w_f4_k<MT, NT, 2, T, TG>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); cudaFuncSetAttribute((const void *)conv_bwd_w_f4_k<MT, NT, 3, T, TG>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
     const int coop = f4w_coop() && ys.c <= 16 && IS_MX(T) && IS_MX8(TG) && (lay == 1 || lay == 2);
@@ -1132,11 +1157,13 @@ template <typename T, typename TG> void bwd_w_f4_t(const void *x, shape5 xs, con
             const size_t ntile = (size_t)2 * ((Zs + 1) / 2) * 4 * ((ys.h + 7) / 8) * Wb;   /* the padded block grid of the records */
             const size_t nwb = (ntile + 7) / 8;   /* CTAs of 8 warps, a few tiles per warp */
             const dim3 pg((unsigned)(nwb < 4096 ? nwb : 4096), (unsigned)(ys.n * mx_nb(ys.c)));
-#define GP4(GB) do { if (gbw == 8) gy_pre4_k<8, GB><<<pg, 256>>>((const uint8_t *)gy, buf, gb, ys.n, ys.c, ys.d, ys.h, ys.w, 2 * zs0, Zs, sp.sr); \
-                        else if (gbw == 16) gy_pre4_k<16, GB><<<pg, 256>>>((const uint8_t *)gy, buf, gb, ys.n, ys.c, ys.d, ys.h, ys.w, 2 * zs0, Zs, sp.sr); \
-                        else gy_pre4_k<32, GB><<<pg, 256>>>((const uint8_t *)gy, buf, gb, ys.n, ys.c, ys.d, ys.h, ys.w, 2 * zs0, Zs, sp.sr); } while (0)
+            float *bias_part = !cached && gb && nn_get_deterministic() ? nn_det_workspace((size_t)pg.x * ys.n * ys.c * sizeof(float)) : nullptr;
+#define GP4(GB) do { if (gbw == 8) gy_pre4_k<8, GB><<<pg, 256>>>((const uint8_t *)gy, buf, gb, ys.n, ys.c, ys.d, ys.h, ys.w, 2 * zs0, Zs, sp.sr, bias_part); \
+                        else if (gbw == 16) gy_pre4_k<16, GB><<<pg, 256>>>((const uint8_t *)gy, buf, gb, ys.n, ys.c, ys.d, ys.h, ys.w, 2 * zs0, Zs, sp.sr, bias_part); \
+                        else gy_pre4_k<32, GB><<<pg, 256>>>((const uint8_t *)gy, buf, gb, ys.n, ys.c, ys.d, ys.h, ys.w, 2 * zs0, Zs, sp.sr, bias_part); } while (0)
             if (!cached) { if (g_f4w_gy4) GP4(4); else GP4(8); }
 #undef GP4
+            if (bias_part) det_bias_sum_k<<<nblk_((size_t)ys.c, 128), 128>>>(bias_part, gb, ys.c, ys.n, pg.x);
             int zc_s = zs1 - zs0 < max_zc ? zs1 - zs0 : max_zc;
             while (zc_s > 1 && (size_t)base * nblk_(zs1 - zs0, zc_s) < 72) zc_s--;
             const dim3 g((unsigned)(nblk_(ys.w, 16) * nblk_(ys.h, 8) * nblk_(zs1 - zs0, zc_s) * ys.n), (xs.c + 8 * NT - 1) / (8 * NT), (ys.c + 16 * MT - 1) / (16 * MT));
@@ -1170,7 +1197,8 @@ template <typename T, typename TG> void bwd_w_f4_t(const void *x, shape5 xs, con
                 const bool wsl = gp.ns || sp.gp2.ns;   /* slab-local GroupNorm: the SL instance */
                 const int mi = (MT - 1) + 2 * (NTw - 1) + 4 * wsl;
 #define WSL1(M, NN, S) do { if (!wattr[cur_dev_()][mi]) { wattr[cur_dev_()][mi] = 1; cudaFuncSetAttribute((const void *)conv_bwd_w_f4ws_k<M, NN, T, S>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)ws_smem<M, NN>()); } \
-                        conv_bwd_w_f4ws_k<M, NN, T, S><<<gw3, WS_NT, ws_smem<M, NN>()>>>((const T *)x, gw, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, gp, sp, zc_w, buf, zs0, zs1); } while (0)
+                        det_wgrad_launch(gw3, gw, nullptr, xs.c, ys.c, 27, sp, [&](dim3 piece, split_t ss) { \
+                            conv_bwd_w_f4ws_k<M, NN, T, S><<<piece, WS_NT, ws_smem<M, NN>()>>>((const T *)x, gw, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, gp, ss, zc_w, buf, zs0, zs1); }); } while (0)
 #define WSL(M, NN) do { if (wsl) WSL1(M, NN, true); else WSL1(M, NN, false); } while (0)
                 if (MT == 1 && NTw == 1) WSL(1, 1);
                 else if (MT == 1) WSL(1, 2);

@@ -47,8 +47,9 @@ int zr_zero(void) { return !g_zr_Di || g_zr_first; }
 int zr_final(void) { return !g_zr_Di || g_zr_last; }
 int gn_fused_stored(const void *y, int cout) {
     /* MX epilogues can reduce their rounded outputs directly. Ordinary outputs retain
-       the independent FP64 pass; the environment switch preserves the reference path. */
-    return g_gn_stored && ISMX(y) && cout >= 16 &&
+       the independent FP64 pass; the environment switch preserves the reference path. Deterministic mode uses
+       the independent stored-output pass and its ordered spatial partials. */
+    return !nn_get_deterministic() && g_gn_stored && ISMX(y) && cout >= 16 &&
         (!getenv("UFSM_FUSED_STORED_GN") || ufsm_env_on("UFSM_FUSED_STORED_GN"));
 }
 void *tc_wbuf(size_t n) { static void *buf[8]; static size_t cap[8]; int d = cur_dev(); if (n > cap[d]) { if (buf[d]) cudaFree(buf[d]); if (cudaMalloc(&buf[d], n * 2) != cudaSuccess) { fprintf(stderr, "tc_wbuf: no device memory for %.1f MB (GPU %d)\n", n * 2 / 1e6, d); abort(); } cap[d] = n; } return buf[d]; }

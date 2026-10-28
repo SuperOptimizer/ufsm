@@ -280,7 +280,7 @@ template <int MT, typename T, bool P16 = false> static void launch_s2f8(dim3 gri
     static int attr[8];
     if (P16) { const size_t sp16 = (size_t)S2F8_T * 16 + 16 + 64 + 256 + 18 * MT * 16 * 33 + 16 + 16 * sizeof(chan_t); if (sp16 > smem) smem = sp16; }
     if (gp.ns) smem += 32 * 8 + 16;   /* (slab GroupNorm: the second coefficient bank, gn_bank2) */
-    if (!attr[cur_dev_()]) { attr[cur_dev_()] = 1; cudaFuncSetAttribute((const void *)conv_fwd_s2_f8_k<MT, T, P16>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
+    if (!attr[cur_dev_()]) { attr[cur_dev_()] = 1; nn_set_dynamic_smem((const void *)conv_fwd_s2_f8_k<MT, T, P16>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
     conv_fwd_s2_f8_k<MT, T, P16><<<grid, 256, smem>>>((const T *)x, wq, ws, b, (T *)y, xs.n, xs.c, xs.d, xs.h, xs.w, cout, Cop, Cip, ys.d, ys.h, ys.w, gp);
 }
 /* ======================= FP4 stride-2 forward (k=3, pad 1): MX-fp4 input of one 32-channel chunk (down0) =======================
@@ -616,7 +616,7 @@ extern "C" int lp_conv_fwd_s2_f8(const void *x, int xbf, shape5 xs, const float 
         const dim3 grid((unsigned)((ys.w + 15) / 16), (unsigned)((ys.h + 3) / 4), (unsigned)(((nzt + ZC - 1) / ZC) * xs.n));
         static int attr[8][2];
         const int ob = ybf == 4 ? 4 : 8;
-#define S2F4(OB_) do { if (!attr[cur_dev_()][OB_ == 4]) { attr[cur_dev_()][OB_ == 4] = 1; cudaFuncSetAttribute((const void *)conv_fwd_s2_f4_k<2, OB_>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); } \
+#define S2F4(OB_) do { if (!attr[cur_dev_()][OB_ == 4]) { attr[cur_dev_()][OB_ == 4] = 1; nn_set_dynamic_smem((const void *)conv_fwd_s2_f4_k<2, OB_>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); } \
                        conv_fwd_s2_f4_k<2, OB_><<<grid, 256, smem>>>((const uint8_t *)x, wq, ws, b, (uint8_t *)y, xs.n, xs.c, xs.d, xs.h, xs.w, cout, Cop, ys.d, ys.h, ys.w, gp, ZC); } while (0)
         if (ob == 4) S2F4(4); else S2F4(8);
 #undef S2F4
@@ -637,7 +637,7 @@ extern "C" int lp_conv_fwd_s2_f8(const void *x, int xbf, shape5 xs, const float 
         const dim3 grid((unsigned)((ys.w + 15) / 16), (unsigned)((ys.h + 3) / 4), (unsigned)(((nzt + ZC - 1) / ZC) * xs.n * ncot));
         static int attr[8][2];
         const int ob = ybf == 4 ? 4 : 8;
-#define S2F4G(OB_) do { if (!attr[cur_dev_()][OB_ == 4]) { attr[cur_dev_()][OB_ == 4] = 1; cudaFuncSetAttribute((const void *)conv_fwd_s2_f4_k<2, OB_, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); } \
+#define S2F4G(OB_) do { if (!attr[cur_dev_()][OB_ == 4]) { attr[cur_dev_()][OB_ == 4] = 1; nn_set_dynamic_smem((const void *)conv_fwd_s2_f4_k<2, OB_, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); } \
                         conv_fwd_s2_f4_k<2, OB_, true><<<grid, 256, smem>>>((const uint8_t *)x, wq, ws, b, (uint8_t *)y, xs.n, xs.c, xs.d, xs.h, xs.w, cout, Cop, ys.d, ys.h, ys.w, gp, ZC, Cip); } while (0)
         if (ob == 4) S2F4G(4); else S2F4G(8);
 #undef S2F4G
@@ -659,7 +659,7 @@ extern "C" int lp_conv_fwd_s2_f8(const void *x, int xbf, shape5 xs, const float 
         const size_t smem = (MT == 1 ? s2p4_scr_off<1>() : s2p4_scr_off<2>()) + FEPI16_SCR(16);   /* >= FEPI_SCR(8): two blocks per SM */
         static unsigned attr[8];
         const int ki = (MT - 1) * 2 + (ybf == 4);
-#define S2F4P(MT_, TO_) do { if (!(attr[cur_dev_()] >> ki & 1u)) { attr[cur_dev_()] |= 1u << ki; cudaFuncSetAttribute((const void *)conv_fwd_s2_f4p_k<MT_, TO_>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); } \
+#define S2F4P(MT_, TO_) do { if (!(attr[cur_dev_()] >> ki & 1u)) { attr[cur_dev_()] |= 1u << ki; nn_set_dynamic_smem((const void *)conv_fwd_s2_f4p_k<MT_, TO_>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); } \
                              conv_fwd_s2_f4p_k<MT_, TO_><<<grid, 256, smem>>>((const mx4_t *)x, wq, ws, b, (TO_ *)y, xs.n, xs.c, xs.d, xs.h, xs.w, cout, Cq, ys.d, ys.h, ys.w, gp, ZC); } while (0)
         if (MT == 1) { if (ybf == 4) S2F4P(1, mx4_t); else S2F4P(1, mx8_t); }
         else { if (ybf == 4) S2F4P(2, mx4_t); else S2F4P(2, mx8_t); }
@@ -717,7 +717,7 @@ __device__ unsigned long long g_s2wprof[4];
 #define XS2_PS 612
 template <int MT, int NT, typename T, typename TG, bool FAST = false>
 __global__ void __launch_bounds__(288, FAST ? S2WF_MINB : 2) conv_bwd_w_s2_f8_k(const T *__restrict__ x, const TG *__restrict__ gy, float *__restrict__ gw, float *__restrict__ gb,
-                                                          int N, int Ci, int D, int H, int W, int Co, int Do, int Ho, int Wo, int ZC, gnp_t gp) {
+                                                            int N, int Ci, int D, int H, int W, int Co, int Do, int Ho, int Wo, int ZC, gnp_t gp, split_t sp = {}) {
     constexpr int CH = 8 * NT, BMo = 16 * MT;
     extern __shared__ __align__(128) unsigned char smem_raw[];
     uint8_t *sxq = smem_raw;                        /* [CH][XS2_CS] */
@@ -728,8 +728,9 @@ __global__ void __launch_bounds__(288, FAST ? S2WF_MINB : 2) conv_bwd_w_s2_f8_k(
     chan_t *ctab = (chan_t *)(smem_raw + (((unsigned char *)(sbias + BMo) - smem_raw + 31) & ~31));   /* [CH] MX x */
     unsigned *amx = (unsigned *)(ctab + CH);        /* [3][CH] MX x: per-channel plane amax (bits), three buffers */
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
-    const int ci0 = blockIdx.x * CH, co0 = blockIdx.y * BMo;
-    int bz = blockIdx.z;
+    const int ci0 = (sp.wpart ? blockIdx.y : blockIdx.x) * CH, co0 = (sp.wpart ? blockIdx.z : blockIdx.y) * BMo;
+    int bz = sp.wpart ? blockIdx.x + sp.wpart_x0 : blockIdx.z;
+    if (sp.wpart) { const size_t nw = (size_t)Co * Ci * 27; gw = sp.wpart + (size_t)blockIdx.x * (nw + Co); if (gb) gb = gw + nw; }
     const int nxt = (Wo + 15) / 16, nyt = (Ho + 7) / 8, nzt = (Do + 1) / 2;
     const int ox0 = (bz % nxt) * 16; bz /= nxt;
     const int oy0 = (bz % nyt) * 8; bz /= nyt;
@@ -737,12 +738,15 @@ __global__ void __launch_bounds__(288, FAST ? S2WF_MINB : 2) conv_bwd_w_s2_f8_k(
     const int zc = bz % nzc; const int n = bz / nzc;
     const size_t plane = (size_t)D * H * W;
     const int kz = warp / 3, ky = warp % 3;
-    const bool do_bias = gb && blockIdx.x == 0;
+    const bool do_bias = gb && (sp.wpart ? blockIdx.y : blockIdx.x) == 0;
     const bool vec = (Wo & 3) == 0, vec8 = (W & 7) == 0;
     float acc[3][MT][NT][4];
 #pragma unroll
     for (int a = 0; a < 3; a++) for (int m = 0; m < MT; m++) for (int q = 0; q < NT; q++) for (int k = 0; k < 4; k++) acc[a][m][q][k] = 0.f;
     if (threadIdx.x < BMo) sbias[threadIdx.x] = 0.f;
+    __shared__ float ordered_bias[9][BMo * 8];
+    if (sp.wpart) for (int i = threadIdx.x; i < 9 * BMo * 8; i += blockDim.x) ((float *)ordered_bias)[i] = 0.f;
+    __syncthreads();
     /* MX x whose CH channels are consecutive entries of one stored block row: thread per voxel, the row decoded once for all
        CH channels (as conv_bwd_w_f8_k), instead of one strided byte per (channel, voxel) */
     bool uni = false;
@@ -1187,7 +1191,7 @@ __global__ void __launch_bounds__(288, FAST ? S2WF_MINB : 2) conv_bwd_w_s2_f8_k(
             int e = mx_exp(amax, 1.f / 448.f);
             float m = exp2i(-e);
             *(unsigned *)(sg + c * G8_CS + row * 16 + vx) = cvt_e4m3x4(vv.x * m, vv.y * m, vv.z * m, vv.w * m);
-            if (f == 0) { sgs[c * 8 + ks] = (uint8_t)(e + 127); if (do_bias) atomicAdd(&sbias[c], sm); }
+            if (f == 0) { sgs[c * 8 + ks] = (uint8_t)(e + 127); if (do_bias) { if (sp.wpart) ordered_bias[warp][c * 8 + ks] += sm; else atomicAdd(&sbias[c], sm); } }
         }
         __syncthreads();
 #if S2W_PROF
@@ -1202,8 +1206,12 @@ __global__ void __launch_bounds__(288, FAST ? S2WF_MINB : 2) conv_bwd_w_s2_f8_k(
 #if S2W_PROF
     if (threadIdx.x == 0) { atomicAdd(&g_s2wprof[0], pa); atomicAdd(&g_s2wprof[1], pb_); atomicAdd(&g_s2wprof[2], pc); atomicAdd(&g_s2wprof[3], 1ull); }
 #endif
-    if constexpr (FAST) if (do_bias && warp * (32 / BMo) + lane / BMo < 8 && bacc != 0.f) atomicAdd(&sbias[lane % BMo], bacc);
-    if (do_bias) { __syncthreads(); if (threadIdx.x < BMo && co0 + (int)threadIdx.x < Co) atomicAdd(&gb[co0 + threadIdx.x], sbias[threadIdx.x]); }
+    if constexpr (FAST) if (do_bias && warp * (32 / BMo) + lane / BMo < 8 && bacc != 0.f) { if (sp.wpart) ordered_bias[warp][(lane % BMo) * 8 + lane / BMo] += bacc; else atomicAdd(&sbias[lane % BMo], bacc); }
+    if (do_bias) { __syncthreads(); if (threadIdx.x < BMo && co0 + (int)threadIdx.x < Co) {
+            float sum = sbias[threadIdx.x];
+            if (sp.wpart) { sum = 0.f; for (int w = 0; w < 9; w++) for (int k = 0; k < 8; k++) sum += ordered_bias[w][threadIdx.x * 8 + k]; }
+            atomicAdd(&gb[co0 + threadIdx.x], sum);
+        } }
 #pragma unroll
     for (int kx = 0; kx < 3; kx++) {
         int tap = (kz * 3 + ky) * 3 + kx;
@@ -1222,23 +1230,29 @@ __global__ void __launch_bounds__(288, FAST ? S2WF_MINB : 2) conv_bwd_w_s2_f8_k(
             }
     }
 }
-template <int MT, int NT, typename T, typename TG> static void launch_bws2(dim3 grid, size_t smem, const void *x, shape5 xs, const TG *gy, shape5 ys, float *gw, float *gb, int ZC, gnp_t gp) {
+template <int MT, int NT, typename T, typename TG> static void launch_bws2(dim3 grid, size_t smem, const void *x, shape5 xs, const TG *gy, shape5 ys, float *gw, float *gb, int ZC, gnp_t gp, split_t sp = {}) {
+    if (nn_get_deterministic() && !sp.wpart) {
+        det_wgrad_launch(dim3(grid.z, grid.x, grid.y), gw, gb, xs.c, ys.c, 27, sp, [&](dim3 piece, split_t ss) {
+            launch_bws2<MT, NT, T, TG>(piece, smem, x, xs, gy, ys, gw, gb, ZC, gp, ss);
+        });
+        return;
+    }
     static int attr[8][2];
     static int fast_env = -1;
     if (fast_env < 0) fast_env = getenv("UFSM_S2W_FAST") ? atoi(getenv("UFSM_S2W_FAST")) : 1;
     if constexpr (NT == 1 && IS_MX(T) && IS_MX(TG)) {   /* conv_bwd_w_s2_f8_k's FAST path (x: one 8-channel block row per voxel; MX-fp8 or MX-fp4 gy) */
         if (fast_env && x && (16 * MT <= mx_bw(ys.c) || (ys.c <= mx_bw(ys.c) && mx_bw(ys.c) < 16 * MT)) && (ys.w % 4 == 0 || IS_MX4(TG))) {   /* MX-fp4 gy: any Wo */
-            if (!attr[cur_dev_()][1]) { attr[cur_dev_()][1] = 1; cudaFuncSetAttribute((const void *)conv_bwd_w_s2_f8_k<MT, NT, T, TG, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
+            if (!attr[cur_dev_()][1]) { attr[cur_dev_()][1] = 1; nn_set_dynamic_smem((const void *)conv_bwd_w_s2_f8_k<MT, NT, T, TG, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
             smem += 16 + 256 * 16 * MT + 256;   /* raw gy rows and scales */
-            conv_bwd_w_s2_f8_k<MT, NT, T, TG, true><<<grid, 288, smem>>>((const T *)x, gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, ys.d, ys.h, ys.w, ZC, gp);
+            conv_bwd_w_s2_f8_k<MT, NT, T, TG, true><<<grid, 288, smem>>>((const T *)x, gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, ys.d, ys.h, ys.w, ZC, gp, sp);
             return;
         }
     }
     if constexpr (IS_MX4(TG)) { fprintf(stderr, "lp_bwd_w_s2_f8: MX-fp4 gradients only on the FAST path (MX x): x %s, %d -> %d channels, out %dx%dx%d, MT %d\n",
                                         x ? "set" : "null", xs.c, ys.c, ys.d, ys.h, ys.w, MT); abort(); }
     else {
-    if (!attr[cur_dev_()][0]) { attr[cur_dev_()][0] = 1; cudaFuncSetAttribute((const void *)conv_bwd_w_s2_f8_k<MT, NT, T, TG>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
-    conv_bwd_w_s2_f8_k<MT, NT, T, TG><<<grid, 288, smem>>>((const T *)x, gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, ys.d, ys.h, ys.w, ZC, gp);
+    if (!attr[cur_dev_()][0]) { attr[cur_dev_()][0] = 1; nn_set_dynamic_smem((const void *)conv_bwd_w_s2_f8_k<MT, NT, T, TG>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
+    conv_bwd_w_s2_f8_k<MT, NT, T, TG><<<grid, 288, smem>>>((const T *)x, gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, ys.d, ys.h, ys.w, ZC, gp, sp);
     }
 }
 template <typename T, typename TG> static void bwd_w_s2_f8_t(const void *x, shape5 xs, const TG *gy, shape5 ys, float *gw, float *gb, gnp_t gp) {

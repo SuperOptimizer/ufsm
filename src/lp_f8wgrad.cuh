@@ -29,7 +29,12 @@ __global__ void __launch_bounds__(288, FAST ? BW8F_MINB : BW8_MINB) conv_bwd_w_f
     unsigned *amx = (unsigned *)(ctab8 + CH);      /* [2][CH] MX x: per-channel plane amax (bits), double-buffered by plane */
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
     const int ci0 = blockIdx.y * CH, co0 = blockIdx.z * BMo;
-    int bz = blockIdx.x;   /* spatial tiles use grid.x: grid.z is limited to 65535 */
+    int bz = blockIdx.x + sp.wpart_x0;   /* spatial tiles use grid.x: grid.z is limited to 65535 */
+    if (sp.wpart) {
+        const size_t nw = (size_t)Co * Ci * 27;
+        gw = sp.wpart + (size_t)blockIdx.x * (nw + Co);
+        if (gb) gb = gw + nw;
+    }
     const int nxt = (W + 15) / 16, nyt = (H + 7) / 8, nzt = (D + 1) / 2;
     const int ox0 = (bz % nxt) * 16; bz /= nxt;
     const int oy0 = (bz % nyt) * 8; bz /= nyt;
@@ -43,6 +48,9 @@ __global__ void __launch_bounds__(288, FAST ? BW8F_MINB : BW8_MINB) conv_bwd_w_f
 #pragma unroll
     for (int a = 0; a < 3; a++) for (int m = 0; m < MT; m++) for (int q = 0; q < NT; q++) for (int k = 0; k < 4; k++) acc[a][m][q][k] = 0.f;
     if (threadIdx.x < BMo) sbias[threadIdx.x] = 0.f;
+    __shared__ float ordered_bias[9][BMo * 8];
+    if (sp.wpart) for (int i = threadIdx.x; i < 9 * BMo * 8; i += blockDim.x) ((float *)ordered_bias)[i] = 0.f;
+    __syncthreads();
     const bool vec = (W & 3) == 0;
     const int zt_begin = zc * ZC;
     float bpart[BMo];   /* coop gy path: this thread's gy sums per output channel over the block's z-steps (reduced once at the end) */
@@ -487,23 +495,27 @@ __global__ void __launch_bounds__(288, FAST ? BW8F_MINB : BW8_MINB) conv_bwd_w_f
                 q.z = sr_e4m3x(q.z, sp.sr, vid + 2); q.w = sr_e4m3x(q.w, sp.sr, vid + 3);
             }
             *(unsigned *)(sg + c * G8_CS + row * 16 + vx) = cvt_e4m3x4(q.x, q.y, q.z, q.w);
-            if (f == 0) { sgs[c * 8 + ks] = (uint8_t)(e + 127); if (do_bias) atomicAdd(&sbias[c], sm); }
+            if (f == 0) { sgs[c * 8 + ks] = (uint8_t)(e + 127); if (do_bias) { if (sp.wpart) ordered_bias[warp][c * 8 + ks] += sm; else atomicAdd(&sbias[c], sm); } }
         }
         __syncthreads();
         mma_zstep(oz0);
     }
     if (do_bias) {   /* the coop path's register partials (zero otherwise): one warp reduction per channel for the whole block */
-        if constexpr (FAST) { if (warp < 8 && bacc != 0.f) atomicAdd(&sbias[lane % BMo], bacc); }
+        if constexpr (FAST) { if (warp < 8 && bacc != 0.f) { if (sp.wpart) ordered_bias[warp][(lane % BMo) * 8 + lane / BMo] += bacc; else atomicAdd(&sbias[lane % BMo], bacc); } }
         else
 #pragma unroll
         for (int c = 0; c < BMo; c++) {
             float sm = bpart[c];
 #pragma unroll
             for (int o = 16; o; o >>= 1) sm += __shfl_xor_sync(0xffffffffu, sm, o);
-            if (lane == 0 && sm != 0.f) atomicAdd(&sbias[c], sm);
+            if (lane == 0 && sm != 0.f) { if (sp.wpart) ordered_bias[warp][c * 8] += sm; else atomicAdd(&sbias[c], sm); }
         }
         __syncthreads();
-        if (threadIdx.x < BMo && co0 + (int)threadIdx.x < Co) atomicAdd(&gb[co0 + threadIdx.x], sbias[threadIdx.x]);
+        if (threadIdx.x < BMo && co0 + (int)threadIdx.x < Co) {
+            float sum = sbias[threadIdx.x];
+            if (sp.wpart) { sum = 0.f; for (int w = 0; w < 9; w++) for (int k = 0; k < 8; k++) sum += ordered_bias[w][threadIdx.x * 8 + k]; }
+            atomicAdd(&gb[co0 + threadIdx.x], sum);
+        }
     }
 #pragma unroll
     for (int kx = 0; kx < 3; kx++) {
@@ -527,6 +539,12 @@ __global__ void __launch_bounds__(288, FAST ? BW8F_MINB : BW8_MINB) conv_bwd_w_f
 /* cooperative MX staging of the fp8 weight gradient (bit 0: x, bit 1: gy); 0 = the per-element paths (test hook) */
 extern int g_f8w_coop;
 template <int MT, int NT, typename T, typename TG> static void launch_bw8(dim3 grid, size_t smem, const void *x, shape5 xs, const TG *gy, shape5 ys, float *gw, float *gb, gnp_t gp, split_t sp, int ZC) {
+    if (nn_get_deterministic() && !sp.wpart) {
+        det_wgrad_launch(grid, gw, gb, xs.c, ys.c, 27, sp, [&](dim3 piece, split_t ss) {
+            launch_bw8<MT, NT, T, TG>(piece, smem, x, xs, gy, ys, gw, gb, gp, ss, ZC);
+        });
+        return;
+    }
     static int attr[8][2];
     const int coop = g_f8w_coop | ((g_f8w_coop & 4) && xs.c <= 8 && (ys.c <= 32 || ys.c % 32 == 0) ? 2 : 0);   /* bit 2: the cooperative gy path for the
                                                                     network input conv (> 32 outputs: half-resolution nets, 32-output tiles) */
