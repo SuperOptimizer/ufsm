@@ -7,7 +7,7 @@
 # Ink: GroupNorm statistics frozen per scroll (predict --gn-save over a 2048-voxel z band through the middle of the box), then pass A
 # (window 640 halo 64, 512^3 shards, --full-grid) and pass B (the box + 256 voxels in z / y / x, box-local), blended by ufsm ink-blend
 # (sin^2 tile weights): window-border jumps 26.7 -> 5.8 on 0125 (= the 5.5 of planes away from any border; ufsm ink-seam). Every
-# predict --resumes, so a killed pass continues where it stopped.
+# predict --resumes, so a killed pass continues where it stopped. INKA: pass A's zarr (ink.zarr; the desk: inka.zarr, its ink.zarr is the delivered ink).
 ink_lock() {   # this host owns S's ink (taken now, or earlier by this host)
   local o; o=$(fdsh "d=$FDC/$S/state; mkdir -p \$d; mkdir \$d/ink.lock 2> /dev/null && echo $ME > \$d/ink.lock/owner; cat \$d/ink.lock/owner 2> /dev/null") || return 1
   [ "$o" = "$ME" ]
@@ -27,21 +27,22 @@ ink_compute() {   # ink_compute BOX -> $O/inkbl.zarr (+ blend.done); resumable a
     gpu_run $U predict $INKCK $ctr $ctk $O/gncal.zarr --um $UM --level $LV --box $cal --shard 512 --window 640 --halo 64 --ema 1 --q 32 --threads 12 \
       --gpu $GPU --full-grid 1 --occupancy 5 --levels 1 --no-out 1 --gn-save $O/gn.tmp > $O/logs/ink-gn.log 2>&1 && mv $O/gn.tmp $O/gn.bin || return 1
   fi
-  gpu_run $U predict $INKCK $ctr $ctk $O/ink.zarr --um $UM --level $LV --box $box --shard 512 --window 640 --halo 64 --ema 1 --q 32 --threads 12 \
+  gpu_run $U predict $INKCK $ctr $ctk $O/${INKA:-ink.zarr} --um $UM --level $LV --box $box --shard 512 --window 640 --halo 64 --ema 1 --q 32 --threads 12 \
     --gpu $GPU --full-grid 1 --resume 1 --occupancy 5 --levels 4 --gn-frozen $O/gn.bin >> $O/logs/ink.log 2>&1 || return 1
   gpu_run $U predict $INKCK $ctr $ctk $O/inkb.zarr --um $UM --level $LV --box $bb --shard 512 --window 640 --halo 64 --ema 1 --q 32 --threads 12 \
     --gpu $GPU --resume 1 --occupancy 5 --levels 1 --gn-frozen $O/gn.bin >> $O/logs/inkb.log 2>&1 || return 1
   rm -rf $O/gncal.zarr $O/inkbl.zarr
   cpu_run $U ink-blend $O/inkbl.zarr --um $UM --tile 512,512,512 --grids 0,0,0:256,256,256 --origins 0,0,0:$bo --levels 4 --shard 512 --q 32 --threads 12 \
-    $O/ink.zarr $O/inkb.zarr > $O/logs/blend.log 2>&1 || return 1
-  touch $O/blend.done; rm -rf $O/ink.zarr $O/inkb.zarr
+    $O/${INKA:-ink.zarr} $O/inkb.zarr > $O/logs/blend.log 2>&1 || return 1
+  touch $O/blend.done; rm -rf $O/${INKA:-ink.zarr} $O/inkb.zarr
 }
 ink_loop() {   # ink_loop BOXCMD PUSHFN: claims and inks scrolls until none is left; BOXCMD prints S's box, PUSHFN delivers $O/inkbl.zarr
-  local boxcmd=$1 push=$2 S0 box k n
+  local boxcmd=$1 push=$2 S0 box k n left
   while ! stopped; do
-    n=0
+    n=0; left=0
     for S0 in $(ink_cands); do
       S=$S0; scan $S || continue; [ -e $O/state/ink.done ] || [ -e $O/state/ink.failed ] && continue
+      left=$((left + 1))
       box=$($boxcmd) && [ -n "$box" ] || continue
       ink_lock || continue
       n=$((n + 1))
@@ -53,6 +54,7 @@ ink_loop() {   # ink_loop BOXCMD PUSHFN: claims and inks scrolls until none is l
       done
       break   # (re-read the candidates: other hosts claim meanwhile)
     done
+    [ $left = 0 ] && return 0   # (every scroll this host may ink is inked or failed: the lane ends)
     [ $n = 0 ] && sleep 300
   done
 }

@@ -24,7 +24,7 @@
 #   cd /vesuvius/ufsm/corpus && mkdir -p run && cp src/scripts/corpus/{common,desk}.sh run/ && setsid nohup bash run/desk.sh > desk.out 2>&1 < /dev/null &
 # Env: ONLY ("S1 S2"), SPACEGB (150: free desk GB before a predict), GPUS ("0 1"), WAITGPU (1: a lane waits until its GPU holds no other
 #   process), STOPF (stop file, default C/STOP).
-H=$(cd "$(dirname "$0")" && pwd); . $H/common.sh
+H=$(cd "$(dirname "$0")" && pwd); . $H/common.sh; . $H/inklib.sh
 LIST=${ONLY:-$(scrolls)}; TH=${TH:-12}
 
 prep() {
@@ -131,6 +131,19 @@ fdink_ready() {   # a forlindesk ink lane (fdink.sh) finished S: inkbl.zarr + st
   if ssh -n $FD "test -e $FDC/$S/state/ink.fdready"; then return 0; fi
   [ -e $O/state/ink.2pass ] && mark inkpull "the laptop's"; return 1
 }
+inklane() {   # inklane GPU: once this GPU's fields lane has run dry, it inks too (inklib.sh: 2-pass, claims on forlindesk), CT local
+  GPU=$1; ME=desk-g$1; CTLOCAL=1; INKA=inka.zarr
+  fdsh() { ssh -n $FD "$1"; }
+  gpu_run() { nice -n 5 "$@"; }
+  cpu_run() { nice -n 10 "$@"; }
+  deskbox() { cat $O/box.txt 2> /dev/null; }
+  deskinkpush() {   # inkbl.zarr -> ink.zarr here (ink.ready + ink.2pass; a re-ink's render / clean redone)
+    rm -f $O/state/ink.ready $O/state/ink.2pass; rm -rf $O/ink.zarr; mv $O/inkbl.zarr $O/ink.zarr || return 1
+    echo "$(date '+%F %T') $(bytes $O/ink.zarr) ink bytes ($ME)" > $O/state/ink.ready; cp $O/state/ink.ready $O/state/ink.2pass
+    rm -f $O/state/render.done $O/state/clean.done $O/gn.bin $O/blend.done; log "ink: here ($ME)"
+  }
+  ink_loop deskbox deskinkpush
+}
 inkpull() {   # forlindesk's blended ink -> <S>/ink.zarr (byte-checked) -> ink.ready + ink.2pass (a re-ink's render / clean redone), deleted there
   local d=$FDC/$S a b
   rm -f $O/state/ink.ready $O/state/ink.2pass
@@ -207,7 +220,7 @@ lane() {
 
 for S in $LIST; do scan $S; (failed || done_ prep) && continue; ( run prep prep ) &
   while [ $(jobs -r | wc -l) -ge ${PREPPAR:-3} ]; do sleep 5; done; done; wait
-for g in ${GPUS:-0 1}; do lane fields prep fields $g & done
+for g in ${GPUS:-0 1}; do { lane fields prep fields $g; [ "${DESKINK:-1}" = 1 ] && ! stopped && inklane $g; } & done   # (fields first; a dry fields lane turns into an ink lane)
 lane push fields push &
 lane ref refq_ready ref &
 lane pull wraps_ready pull &
