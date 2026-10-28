@@ -1,7 +1,9 @@
 #!/bin/bash
 # upcorpus.sh S...: upload a non-prize scroll's corpus products to dl.ash2txt volcomp/<S>/representations/ufsm-c2f-20261028/
-# (fields, ref, joined, wraps, ink.zarr, axis/box): whatever exists locally. Holds the desk push lock so the fields are not
-# stripped (after their push to forlindesk) mid-upload. Re-running resumes (mirror --continue skips finished files).
+# (ref, joined, wraps, ink.zarr, axis/box; fields only with FIELDS=1): whatever exists locally. Holds the desk push lock so
+# the fields are not stripped (after their push to forlindesk) mid-upload. Re-running resumes (mirror --continue skips
+# finished files). FIELDS=0 is the default: the home uplink is ~5 MB/s, so ~300 GB of fields would take ~17 h and hold
+# those scrolls' pushes; the fields are recomputable from the CT with the uploaded wind96 checkpoint.
 C=/vesuvius/ufsm/corpus; R=ufsm-c2f-20261028; cd ~/reg-upload || exit 1
 for S in "$@"; do
   O=$C/$S; [ -d $O ] || continue
@@ -12,7 +14,7 @@ for S in "$@"; do
       echo "mkdir -p volcomp/$S/representations/$R"
       echo "cd volcomp/$S/representations/$R"
       for f in axis.json box.txt; do [ -e $O/$f ] && echo "put $O/$f"; done
-      for d in fields ref joined wraps; do [ -d $O/$d ] && echo "mirror -R --continue --parallel=4 --no-perms $O/$d/ $d"; done
+      for d in $([ "${FIELDS:-0}" = 1 ] && echo fields) ref joined wraps; do [ -d $O/$d ] && echo "mirror -R --continue --parallel=4 --no-perms $O/$d/ $d"; done
       [ -d $O/ink.zarr ] && [ -e $O/state/ink.ready ] && echo "mirror -R --continue --parallel=4 --no-perms $O/ink.zarr/ ink.zarr"
       echo "du -s ."
     } > $L
