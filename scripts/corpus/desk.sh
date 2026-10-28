@@ -74,7 +74,7 @@ ref() {
 push() {
   local f=$(ssh -n $FD "df -BG --output=avail $FDC | tail -n 1" | tr -dc 0-9) d=$FDC/$S a b
   [ "${f:-0}" -ge ${FDGB:-250} ] || { log "push: forlindesk has ${f:-?} GB free (FDGB ${FDGB:-250})"; return 1; }
-  ssh -n $FD "mkdir -p $d/state $d/logs" && rsync -a $O/box.txt $O/axis.json $FD:$d/ && rsync -a $F/ $FD:$d/fields/ || return 1
+  ssh -n $FD "mkdir -p $d/state $d/logs" && rsync -a $O/box.txt $O/axis.json $FD:$d/ && rsync -a --delete $F/ $FD:$d/fields/ || return 1   # (--delete: a broken pipe leaves rsync temp files there that fail the byte check)
   a=$(bytes $F); b=$(ssh -n $FD "du -sb --apparent-size $d/fields" | awk '{print $1}')
   [ "$a" = "$b" ] || { log "push: fields $a bytes here, ${b:-?} on forlindesk"; return 1; }
   if [ -e $REF/model.json ]; then   # (a ref already computed here, e.g. by an older instance: it goes along)
@@ -218,6 +218,7 @@ lane() {
   done
 }
 
+if [ "${INKONLY:-0}" = 1 ]; then for g in ${GPUS:-0 1}; do inklane $g & done; wait; exit 0; fi   # (INKONLY=1: just the ink lanes, e.g. after they died on a hung ssh)
 for S in $LIST; do scan $S; (failed || done_ prep) && continue; ( run prep prep ) &
   while [ $(jobs -r | wc -l) -ge ${PREPPAR:-3} ]; do sleep 5; done; done; wait
 for g in ${GPUS:-0 1}; do { lane fields prep fields $g; [ "${DESKINK:-1}" = 1 ] && ! stopped && inklane $g; } & done   # (fields first; a dry fields lane turns into an ink lane)

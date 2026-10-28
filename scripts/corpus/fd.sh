@@ -30,7 +30,7 @@ lane() {   # lane GPU: unclaimed slabs in z order
   done
 }
 slabs() {
-  lane 0 & lane 1 & wait
+  for g in ${FITGPUS:-0 1}; do lane $g & done; wait   # (FITGPUS=0: one fit at a time; two fits + ref + ink OOM-thrashed forlindesk's 60 GB)
   local ns=$(( ($(jq -r '.shape[0]' $F/fields.json) + I - 1) / I )) nd=$(ls -d $O/slabs/s???/done 2>/dev/null | wc -l)
   log "slabs $nd of $ns done, $(awk '{s += $NF + 0} END {printf "%.2f", s / 3600}' $O/slabs.txt) GPU-h"; [ $nd = $ns ]
 }
