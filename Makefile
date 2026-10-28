@@ -47,6 +47,7 @@ SRC  = src/json.c src/checkpoint.c src/sheet.c src/store.c src/zarr3.c src/sourc
 SRC += src/surf.c src/stitch.c src/coreline.c src/coreline_check.c src/fit_ct.c src/l1pot.c
 SRC += src/fblend.c
 SRC += src/inkblend.c
+SRC += src/inkseam.c
 SRC += src/render.c src/imgops.c
 SRC += src/repack.c
 SRC += src/wload.c src/inkext.c src/inkext_net.c src/dinovol.c src/dinovol_net.c src/dino.c src/surfeval.c

@@ -42,6 +42,7 @@
 int cmd_ingest_labels(int argc, char **argv);
 int cmd_z3_recode(int argc, char **argv);   /* src/ingest.c */
 int cmd_ink_blend(int argc, char **argv);   /* src/ingest.c */
+int cmd_ink_seam(int argc, char **argv);   /* src/inkseam.c */
 int cmd_ingest_kaggle(int argc, char **argv);
 int cmd_ingest_mesh(int argc, char **argv);
 int cmd_ls(int argc, char **argv);
@@ -108,6 +109,7 @@ static int usage(void) {
         "  ufsm ingest-labels <root> <zarr-key> <out-dir> --um U   HF/S3 zarr v2 labels -> volcomp pyramid\n"
         "  ufsm z3-recode <group-dir> <out-group> --um U --lut FILE [--hist 1]   a local prob254 pyramid through a LUT (255 kept), value histogram\n"
         "  ufsm ink-blend <out> --um U --tile S,S,S --grids z,y,x:... <in1> <in2> ...   overlapping uint8 predicts (predict --grid-origin) blended with sin^2 tile weights\n"
+        "  ufsm ink-seam <zarr> --um U [--period 512] [--offset 0] [--n 24]   window-seam jump of a uint8 predict (border vs interior |dv|)\n"
         "  ufsm ingest-zip <labels.zip> <zarr-name> <out-dir> --um U  label zarr from the HF archive -> volcomp pyramid\n"
         "  ufsm raster <out-dir> --shape Z,Y,X --um U [--level L] [--T 3] <mesh.sfc|tifxyz>...  meshes -> label pyramid\n"
         "  ufsm ingest-kaggle <hf-root> <out-dir> [--n N]          Kaggle cubes -> volcomp images + labels\n"
@@ -3797,6 +3799,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "ingest-labels")) return cmd_ingest_labels(argc, argv);
     if (!strcmp(cmd, "z3-recode")) return cmd_z3_recode(argc, argv);
     if (!strcmp(cmd, "ink-blend")) return cmd_ink_blend(argc, argv);
+    if (!strcmp(cmd, "ink-seam")) return cmd_ink_seam(argc, argv);
     if (!strcmp(cmd, "ingest-kaggle")) return cmd_ingest_kaggle(argc, argv);
     if (!strcmp(cmd, "ingest-mesh")) return cmd_ingest_mesh(argc, argv);
     if (!strcmp(cmd, "ls")) return cmd_ls(argc, argv);

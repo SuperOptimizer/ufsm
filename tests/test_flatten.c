@@ -103,6 +103,17 @@ int main(void) {
             int x0, y0, rw, rh; flat_largest_rect(m, w, h, &x0, &y0, &rw, &rh);
             CHECK(rw * rh == best, "largest rect rep %d: %dx%d, brute force area %d", rep, rw, rh, best);
             for (int y = y0; y < y0 + rh; y++) for (int x = x0; x < x0 + rw; x++) CHECK(m[y * w + x], "rect cell %d,%d invalid", x, y);
+            for (int ai = 0; ai < 2; ai++) {   /* aspect-capped (flatten --max-aspect) against brute force */
+                const double a = ai ? 1.5 : 2; int ba = 0;
+                for (int y0b = 0; y0b < h; y0b++) for (int y1 = y0b; y1 < h; y1++) for (int x0b = 0; x0b < w; x0b++) for (int x1 = x0b; x1 < w; x1++) {
+                    const int rw2 = x1 - x0b + 1, rh2 = y1 - y0b + 1; if (rw2 > a * rh2 || rh2 > a * rw2) continue;
+                    int ok = 1; for (int y = y0b; y <= y1 && ok; y++) for (int x = x0b; x <= x1 && ok; x++) ok = m[y * w + x];
+                    if (ok && rw2 * rh2 > ba) ba = rw2 * rh2;
+                }
+                int ax, ay, aw, ah; flat_largest_rect_aspect(m, w, h, a, &ax, &ay, &aw, &ah);
+                CHECK(aw * ah == ba && aw <= a * ah && ah <= a * aw, "aspect %.1f rect rep %d: %dx%d, brute force area %d", a, rep, aw, ah, ba);
+                for (int y = ay; y < ay + ah; y++) for (int x = ax; x < ax + aw; x++) CHECK(m[y * w + x], "aspect rect cell %d,%d invalid", x, y);
+            }
         }
     }
     printf(fails ? "test_flatten: %d FAILED\n" : "test_flatten: all passed\n", fails);

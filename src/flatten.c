@@ -497,15 +497,21 @@ int flat_resample(const flat_mesh *m, const float *X, const float *Y, const floa
     return 0;
 }
 
-void flat_largest_rect(const uint8_t *valid, int w, int h, int *x0, int *y0, int *rw, int *rh) {
+void flat_largest_rect(const uint8_t *valid, int w, int h, int *x0, int *y0, int *rw, int *rh) { flat_largest_rect_aspect(valid, w, h, 0, x0, y0, rw, rh); }
+/* the largest all-valid rectangle with max(side) / min(side) <= maxasp (<= 0: any). Every maximal valid rectangle W x H appears as a
+   stack pop of the row histogram scan; the best capped rectangle lies inside one of them, and min(W, a H) x min(H, a W) (centred) is
+   the largest capped rectangle inside W x H, so clipping each candidate gives the exact optimum. */
+void flat_largest_rect_aspect(const uint8_t *valid, int w, int h, double maxasp, int *x0, int *y0, int *rw, int *rh) {
     int *ht = calloc((size_t)w + 1, sizeof(int)), *st = malloc(((size_t)w + 2) * sizeof(int)); long best = 0; *x0 = *y0 = *rw = *rh = 0;
     for (int y = 0; y < h; y++) {
         for (int x = 0; x < w; x++) ht[x] = valid[(size_t)y * w + x] ? ht[x] + 1 : 0;
         ht[w] = 0; int sp = 0;
         for (int x = 0; x <= w; x++) {
             while (sp && ht[st[sp - 1]] >= ht[x]) {
-                const int hh = ht[st[--sp]], left = sp ? st[sp - 1] + 1 : 0; const long a = (long)hh * (x - left);
-                if (a > best) { best = a; *x0 = left; *rw = x - left; *rh = hh; *y0 = y - hh + 1; }
+                const int hh = ht[st[--sp]], left = sp ? st[sp - 1] + 1 : 0, W = x - left; int cw = W, ch = hh;
+                if (maxasp > 0) { if (cw > (int)(maxasp * hh)) cw = (int)(maxasp * hh); if (ch > (int)(maxasp * W)) ch = (int)(maxasp * W); }
+                const long a = (long)cw * ch;
+                if (a > best) { best = a; *x0 = left + (W - cw) / 2; *rw = cw; *rh = ch; *y0 = y - hh + 1 + (hh - ch) / 2; }
             }
             st[sp++] = x;
         }
@@ -559,15 +565,21 @@ static const char *fopt(int argc, char **argv, const char *name, const char *def
 static double meta_num(const char *m, const char *key, double def) { const char *q = m ? strstr(m, key) : nullptr; if (!q) return def; q += strlen(key); while (*q == ' ' || *q == ':' || *q == '[') q++; return atof(q); }
 
 /* ufsm flatten <wraps-dir> <out-dir> [--wraps a,b,..] [--decim 1] [--iters 30] [--cg 200] [--min-verts 20000] [--out-step S]
-   [--crop rect|none] [--fill-holes 5000] [--max-edge 3] [--threads 16] [--sfc ERR] [--quiet 1]
+   [--crop rect|none] [--max-aspect A] [--rects N] [--min-cm2 5] [--fill-holes 5000] [--max-edge 3] [--threads 16] [--sfc ERR] [--quiet 1]
    Every tifxyz wrap of <wraps-dir> (directories or .sfc) SLIM-flattened (src/flatten.h), resampled on a regular isometric uv grid of
    pitch --out-step native voxels (default: the input's step) and written as <out-dir>/<wrap> (tifxyz: x / y / z, meta.json, plus gu.tif /
    gv.tif = the source grid column / row of each vertex, for ufsm flatten-warp), cropped (--crop rect, default) to the largest fully valid
    rectangle after enclosed holes of at most --fill-holes vertices (tears: dropped over-stretched triangles, invalid vertices) are
    Laplace-filled (flat_fill_holes); <out-dir>/<wrap>_mask.jpg shows the flat grid (valid grey, filled orange, crop white). ufsm render of that tifxyz is the flattened CT / ink render. Prints per wrap the distortion of the input grid map, of the
-   SLIM mesh before / after, and of the written (cropped) grid, also into <out-dir>/<wrap>/flatten.txt. */
+   SLIM mesh before / after, and of the written (cropped) grid, also into <out-dir>/<wrap>/flatten.txt.
+   --max-aspect A: the rectangle's long side <= A x its short side (largest such, flat_largest_rect_aspect); --rects N: up to N
+   non-overlapping rectangles, greedily (each the largest left after the previous are cut out; after the first only >= --min-cm2),
+   written as <out-dir>/<wrap>_r0, _r1, .. (N = 1: <out-dir>/<wrap>). --crop none: the whole flat grid is written (<out-dir>/<wrap>,
+   invalid vertices z = -1, "= A cm2" = its valid area) and the rectangles go to <out-dir>/<wrap>/rects.tsv (rect x y w h cm2 aniso_p50,
+   index boxes on that grid) and as lines "<wrap>_r<i>: rect x,y wxh = A cm2" + "<wrap>_r<i> output grid ..": re-cropping never
+   needs a re-flatten. */
 int cmd_flatten(int argc, char **argv) {
-    if (argc < 4) { fprintf(stderr, "usage: ufsm flatten <wraps-dir> <out-dir> [--wraps a,b,..] [--decim 1] [--iters 30] [--cg 200] [--min-verts 20000] [--out-step S] [--crop rect|none] [--fill-holes 5000] [--max-edge 3] [--threads 16] [--sfc ERR] [--quiet 1]\n"); return 2; }
+    if (argc < 4) { fprintf(stderr, "usage: ufsm flatten <wraps-dir> <out-dir> [--wraps a,b,..] [--decim 1] [--iters 30] [--cg 200] [--min-verts 20000] [--out-step S] [--crop rect|none] [--max-aspect A] [--rects N] [--min-cm2 5] [--fill-holes 5000] [--max-edge 3] [--threads 16] [--sfc ERR] [--quiet 1]\n"); return 2; }
     flat_opts o = flat_opts_default();
     o.decim = atoi(fopt(argc, argv, "--decim", "1")); o.iters = atoi(fopt(argc, argv, "--iters", "30")); o.cg_iters = atoi(fopt(argc, argv, "--cg", "200"));
     o.min_verts = atoi(fopt(argc, argv, "--min-verts", "20000")); o.max_edge = atof(fopt(argc, argv, "--max-edge", "3")); o.nthreads = atoi(fopt(argc, argv, "--threads", "16"));
@@ -575,6 +587,8 @@ int cmd_flatten(int argc, char **argv) {
     const double ostep_opt = atof(fopt(argc, argv, "--out-step", "0")); const int crop = strcmp(fopt(argc, argv, "--crop", "rect"), "none") != 0;
     const char *wl = fopt(argc, argv, "--wraps", nullptr); char *want = nullptr; if (wl) { want = malloc(strlen(wl) + 3); sprintf(want, ",%s,", wl); }
     const double sfc = atof(fopt(argc, argv, "--sfc", "0")); const long maxhole = atol(fopt(argc, argv, "--fill-holes", "5000"));
+    const double maxasp = atof(fopt(argc, argv, "--max-aspect", "0")), mincm2 = atof(fopt(argc, argv, "--min-cm2", "5"));
+    int nrect = atoi(fopt(argc, argv, "--rects", "1")); if (nrect < 1) nrect = 1; if (nrect > 16) nrect = 16;
     DIR *dd = opendir(argv[2]); if (!dd) { fprintf(stderr, "flatten: cannot open %s\n", argv[2]); return 1; }
     char cmd[1500]; snprintf(cmd, sizeof cmd, "mkdir -p '%s'", argv[3]); if (system(cmd)) return 1;
     struct dirent *de; int nw = 0, rc = 0;
@@ -597,28 +611,44 @@ int cmd_flatten(int argc, char **argv) {
         if (flat_grid(A[0], A[1], A[2], w, h, step, &o, &m, &sb, &sa)) { fprintf(stderr, "flatten: %s: no mesh / SLIM failed\n", nm); rc = 1; for (int k = 0; k < 3; k++) free(A[k]); continue; }
         int ow, oh; float *gu, *gv, *ox, *oy, *oz;
         if (flat_resample(&m, A[0], A[1], A[2], w, h, ostep, o.nthreads, &ow, &oh, &gu, &gv, &ox, &oy, &oz)) { fprintf(stderr, "flatten: out of memory\n"); return 1; }
-        int cx = 0, cy = 0, cw = ow, ch = oh; long nvalid = 0;
+        int RX[16], RY[16], RW[16], RH[16], nr = 0; long nvalid = 0;
         float *ga[5] = {ox, oy, oz, gu, gv};
         uint8_t *fm = malloc((size_t)ow * oh); long nfill = flat_fill_holes(ga, ow, oh, maxhole, fm);
         uint8_t *vm = malloc((size_t)ow * oh); for (size_t i = 0; i < (size_t)ow * oh; i++) nvalid += vm[i] = oz[i] >= 0;
-        if (crop) flat_largest_rect(vm, ow, oh, &cx, &cy, &cw, &ch);
-        {   /* <out>/<wrap>_mask.jpg: the flat grid's valid vertices (grey), the crop rectangle (white), one pixel per vertex */
+        const double cm2px = vum * vum * 1e-8 * ostep * ostep;
+        {   /* greedy: the largest (aspect-capped) valid rectangle, taken out of the mask, again; rectangles after the first need --min-cm2 */
+            uint8_t *rm = malloc((size_t)ow * oh); memcpy(rm, vm, (size_t)ow * oh);
+            for (int k = 0; k < nrect; k++) {
+                int x0, y0, rw, rh; flat_largest_rect_aspect(rm, ow, oh, maxasp, &x0, &y0, &rw, &rh);
+                if (rw < 2 || rh < 2 || (k > 0 && (double)(rw - 1) * (rh - 1) * cm2px < mincm2)) break;
+                RX[nr] = x0; RY[nr] = y0; RW[nr] = rw; RH[nr] = rh; nr++;
+                for (int y = y0; y < y0 + rh; y++) memset(rm + (size_t)y * ow + x0, 0, (size_t)rw);
+            }
+            free(rm);
+        }
+        {   /* <out>/<wrap>_mask.jpg: the flat grid's valid vertices (grey), the crop rectangles (white), one pixel per vertex */
             uint8_t *rgb = malloc((size_t)ow * oh * 3);
             for (int y = 0; y < oh; y++) for (int x = 0; x < ow; x++) {
-                const size_t i = (size_t)y * ow + x; const int in = x >= cx && x < cx + cw && y >= cy && y < cy + ch;
+                const size_t i = (size_t)y * ow + x; int in = 0;
+                for (int k = 0; k < nr && !in; k++) in = x >= RX[k] && x < RX[k] + RW[k] && y >= RY[k] && y < RY[k] + RH[k];
                 rgb[3 * i] = rgb[3 * i + 1] = rgb[3 * i + 2] = vm[i] ? (in ? 230 : 110) : 0; if (vm[i] && !in) rgb[3 * i + 2] = 160;
                 if (fm[i]) { rgb[3 * i] = 255; rgb[3 * i + 1] = in ? 150 : 90; rgb[3 * i + 2] = 0; }   /* filled hole (orange) */
             }
+            for (int k = 0; k < nr; k++) for (int y = RY[k]; y < RY[k] + RH[k]; y++) for (int x = RX[k]; x < RX[k] + RW[k]; x++)   /* rectangle outlines (black) */
+                if (y == RY[k] || y == RY[k] + RH[k] - 1 || x == RX[k] || x == RX[k] + RW[k] - 1) { const size_t i = (size_t)y * ow + x; rgb[3 * i] = rgb[3 * i + 1] = rgb[3 * i + 2] = 0; }
             snprintf(p, sizeof p, "%s/%s_mask.jpg", argv[3], nm); if (jpeg_write_rgb(p, ow, oh, rgb, 85)) fprintf(stderr, "flatten: cannot write %s\n", p);
             free(rgb);
         }
         free(vm); free(fm);
-        if (cw < 2 || ch < 2) { fprintf(stderr, "flatten: %s: no valid rectangle\n", nm); rc = 1; }
-        else {
+        if (!nr && crop) { fprintf(stderr, "flatten: %s: no valid rectangle\n", nm); rc = 1; }
+        const int nout = crop ? nr : 1;   /* --crop none: one output, the whole flat grid (invalid vertices z = -1), + rects.tsv */
+        for (int ri = 0; ri < nout; ri++) {   /* --rects > 1: <out>/<wrap>_r<i>, else <out>/<wrap> */
+            const int cx = crop ? RX[ri] : 0, cy = crop ? RY[ri] : 0, cw = crop ? RW[ri] : ow, ch = crop ? RH[ri] : oh;
+            char rn[320]; if (crop && nrect > 1) snprintf(rn, sizeof rn, "%s_r%d", nm, ri); else snprintf(rn, sizeof rn, "%s", nm);
             float *C[5]; float *src[5] = {ox, oy, oz, gu, gv};
             for (int k = 0; k < 5; k++) { C[k] = malloc((size_t)cw * ch * 4); for (int y = 0; y < ch; y++) memcpy(C[k] + (size_t)y * cw, src[k] + (size_t)(cy + y) * ow + cx, (size_t)cw * 4); }
             grid_stats(C[0], C[1], C[2], cw, ch, ostep, o.max_edge, &gout);
-            char od[1400]; snprintf(od, sizeof od, "%s/%s", argv[3], nm);
+            char od[1400]; snprintf(od, sizeof od, "%s/%s", argv[3], rn);
             if (sfc > 0) tifxyz_set_sfc(sfc);
             if (tifxyz_write(od, cw, ch, C[0], C[1], C[2], ostep, vum, wid, "ufsm flatten (SLIM symmetric Dirichlet, isometric uv grid, largest valid rectangle)")) { fprintf(stderr, "flatten: cannot write %s\n", od); rc = 1; }
             tifxyz_set_sfc(0);
@@ -627,12 +657,26 @@ int cmd_flatten(int argc, char **argv) {
             snprintf(p, sizeof p, "%s/gv.tif", od); if (tiffw_write(p, cw, ch, 3, C[4], 1)) rc = 1;
             const double um2 = vum * vum * 1e-8;
             printf("%s: input %dx%d step %g -> flat %dx%d step %g (%ld valid, %ld in filled holes), crop %d,%d %dx%d = %.2f cm2 (%.1f%% of the flat valid area), %.1fs\n",
-                   nm, w, h, step, ow, oh, ostep, nvalid, nfill, cx, cy, cw, ch, (double)(cw - 1) * (ch - 1) * ostep * ostep * um2, 100.0 * cw * ch / (nvalid ? nvalid : 1), fnow() - t0);
+                   rn, w, h, step, ow, oh, ostep, nvalid, nfill, cx, cy, cw, ch, crop ? (double)(cw - 1) * (ch - 1) * ostep * ostep * um2 : nvalid * cm2px,
+                   crop ? 100.0 * cw * ch / (nvalid ? nvalid : 1) : 100.0, fnow() - t0);
+            if (!crop) {   /* the rectangles as index boxes on this grid: <out>/<wrap>/rects.tsv + one line each "<wrap>_r<i>: rect x,y wxh = A cm2" */
+                snprintf(p, sizeof p, "%s/rects.tsv", od); FILE *rf = fopen(p, "w");
+                if (rf) fprintf(rf, "rect\tx\ty\tw\th\tcm2\taniso_p50\n");
+                for (int k = 0; k < nr; k++) {
+                    float *R3[3]; for (int c = 0; c < 3; c++) { R3[c] = malloc((size_t)RW[k] * RH[k] * 4); for (int y = 0; y < RH[k]; y++) memcpy(R3[c] + (size_t)y * RW[k], C[c] + (size_t)(RY[k] + y) * ow + RX[k], (size_t)RW[k] * 4); }
+                    flat_stats rs; grid_stats(R3[0], R3[1], R3[2], RW[k], RH[k], ostep, o.max_edge, &rs); for (int c = 0; c < 3; c++) free(R3[c]);
+                    const double a = (double)(RW[k] - 1) * (RH[k] - 1) * cm2px;
+                    if (rf) fprintf(rf, "%s_r%d\t%d\t%d\t%d\t%d\t%.2f\t%.3f\n", nm, k, RX[k], RY[k], RW[k], RH[k], a, rs.aniso_p50);
+                    printf("%s_r%d: rect %d,%d %dx%d = %.2f cm2\n", nm, k, RX[k], RY[k], RW[k], RH[k], a);
+                    char lb2[400]; snprintf(lb2, sizeof lb2, "%s_r%d output grid", nm, k); flat_stats_print(stdout, lb2, &rs);
+                }
+                if (rf) fclose(rf);
+            }
             char lb[400];
-            snprintf(lb, sizeof lb, "%s input grid", nm); flat_stats_print(stdout, lb, &gin);
-            snprintf(lb, sizeof lb, "%s mesh before", nm); flat_stats_print(stdout, lb, &sb);
-            snprintf(lb, sizeof lb, "%s mesh after", nm); flat_stats_print(stdout, lb, &sa);
-            snprintf(lb, sizeof lb, "%s output grid", nm); flat_stats_print(stdout, lb, &gout);
+            snprintf(lb, sizeof lb, "%s input grid", rn); flat_stats_print(stdout, lb, &gin);
+            snprintf(lb, sizeof lb, "%s mesh before", rn); flat_stats_print(stdout, lb, &sb);
+            snprintf(lb, sizeof lb, "%s mesh after", rn); flat_stats_print(stdout, lb, &sa);
+            snprintf(lb, sizeof lb, "%s output grid", rn); flat_stats_print(stdout, lb, &gout);
             fflush(stdout);
             snprintf(p, sizeof p, "%s/flatten.txt", od); FILE *f = fopen(p, "w");
             if (f) {

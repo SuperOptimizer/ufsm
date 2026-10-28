@@ -69,3 +69,4 @@ int flat_resample(const flat_mesh *m, const float *X, const float *Y, const floa
 long flat_fill_holes(float *a[5], int w, int h, long maxv, uint8_t *filled);
 /* the largest axis-aligned rectangle of valid (!= 0) cells of a w x h mask: corner *x0 / *y0, size *rw x *rh (0 x 0 when none) */
 void flat_largest_rect(const uint8_t *valid, int w, int h, int *x0, int *y0, int *rw, int *rh);
+void flat_largest_rect_aspect(const uint8_t *valid, int w, int h, double maxasp, int *x0, int *y0, int *rw, int *rh);   /* max side / min side <= maxasp (<= 0: any) */
