@@ -40,15 +40,18 @@ static int write_file(const char *dir, const char *name, const void *p, size_t n
     const size_t w = fwrite(p, 1, n, f); fclose(f); return w == n ? 0 : -1;
 }
 
-/* the 256^3 parent's histogram -> lut; returns the max of the 128^3 crop (centre) */
-static void parent_lut(const uint8_t *base, size_t sy, size_t sx, float lut[256], double *lo, double *hi) {
+/* the 256^3 parent's histogram -> lut; st 2: every other voxel per axis (a 2x nearest-upsampled level 1 aligned on even voxels: exactly
+   the level-1 parent's histogram, 1 / 8 of the work) */
+static void parent_lut(const uint8_t *base, size_t sy, size_t sx, int st, float lut[256], double *lo, double *hi) {
     uint32_t h[4][256]; memset(h, 0, sizeof h);
-    for (int z = 0; z < I3_PARENT; z++) for (int y = 0; y < I3_PARENT; y++) {
+    for (int z = 0; z < I3_PARENT; z += st) for (int y = 0; y < I3_PARENT; y += st) {
         const uint8_t *r = base + ((size_t)z * sy + y) * sx;
-        for (int x = 0; x < I3_PARENT; x += 4) { h[0][r[x]]++; h[1][r[x + 1]]++; h[2][r[x + 2]]++; h[3][r[x + 3]]++; }
+        if (st == 2) for (int x = 0; x < I3_PARENT; x += 8) { h[0][r[x]]++; h[1][r[x + 2]]++; h[2][r[x + 4]]++; h[3][r[x + 6]]++; }
+        else for (int x = 0; x < I3_PARENT; x += 4) { h[0][r[x]]++; h[1][r[x + 1]]++; h[2][r[x + 2]]++; h[3][r[x + 3]]++; }
     }
     uint64_t hs[256]; for (int v = 0; v < 256; v++) hs[v] = (uint64_t)h[0][v] + h[1][v] + h[2][v] + h[3][v];
-    i3_percentiles(hs, (uint64_t)I3_PARENT * I3_PARENT * I3_PARENT, lo, hi);
+    const uint64_t np = (uint64_t)(I3_PARENT / st) * (I3_PARENT / st) * (I3_PARENT / st);
+    i3_percentiles(hs, np, lo, hi);
     i3_lut(*lo, *hi, lut);
 }
 static int crop_max(const uint8_t *base, size_t sy, size_t sx) {   /* base = the crop's first voxel */
@@ -75,7 +78,7 @@ static int raw_mode(gb_net *net, int argc, char **argv) {
     char st[64 * 1024]; size_t sl = 0;
     for (int i = 0; i < N; i++) {
         double lo, hi; const uint8_t *p = u + pv * i;
-        parent_lut(p, I3_PARENT, I3_PARENT, lut + 256 * i, &lo, &hi);
+        parent_lut(p, I3_PARENT, I3_PARENT, 1, lut + 256 * i, &lo, &hi);
         crop_copy(p + ((size_t)64 * I3_PARENT + 64) * I3_PARENT + 64, I3_PARENT, I3_PARENT, crops + cv * i);
         sl += snprintf(st + sl, sizeof st - sl, "%.9g %.9g\n", lo, hi);
     }
@@ -95,12 +98,12 @@ static int raw_mode(gb_net *net, int argc, char **argv) {
     return 0;
 }
 
-/* villa volume.grid_axes + the parent filter of crop_grid */
-static int grid_axis(int64_t V0, int **out) {
+/* villa volume.grid_axes (step S: 32 = the published half-overlap; 64 = no overlap, 8x fewer crops) + the parent filter of crop_grid */
+static int grid_axis(int64_t V0, int S, int **out) {
     const int64_t n = (V0 + 1) / 2;
-    int *a = malloc(sizeof(int) * (size_t)(n / 32 + 4)); int k = 0;
+    int *a = malloc(sizeof(int) * (size_t)(n / S + 4)); int k = 0;
     if (n >= I3_OUT) {
-        const int64_t count = (n - I3_OUT + 31) / 32 + 1;   /* ceil((n - 64) / 32) + 1 */
+        const int64_t count = (n - I3_OUT + S - 1) / S + 1;   /* ceil((n - 64) / S) + 1 */
         for (int64_t i = 0; i < count; i++) {
             const int64_t s = count > 1 ? (int64_t)nearbyint((double)(n - I3_OUT) / (double)(count - 1) * (double)i) : 0;   /* Python round: half to even */
             if (s < 0 || s + I3_OUT > n) continue;
@@ -116,7 +119,7 @@ typedef struct {
     const uint8_t *slab; size_t sy, sx;                  /* CT slab [256][sy][sx], level-0 origin (zs, ys, xs) */
     int64_t zs, ys, xs;
     int oz; const int *oy, *ox; int nj;                  /* crops of this chunk: (oz, oy[j], ox[j]) */
-    int air;
+    int air, st;   /* st: parent histogram step (2 with --ct-l1) */
     /* outputs */
     uint8_t *crops; float *lut; int *keep;
     atomic_int next;
@@ -128,7 +131,7 @@ static void *prep_worker(void *arg) {
         const int64_t pz = 2 * (int64_t)J->oz - 64 - J->zs, py = 2 * (int64_t)J->oy[j] - 64 - J->ys, px = 2 * (int64_t)J->ox[j] - 64 - J->xs;
         const uint8_t *pb = J->slab + ((size_t)pz * J->sy + py) * J->sx + px, *cb = pb + ((size_t)64 * J->sy + 64) * J->sx + 64;
         if (crop_max(cb, J->sy, J->sx) < J->air) { J->keep[j] = 0; continue; }
-        double lo, hi; parent_lut(pb, J->sy, J->sx, J->lut + 256 * j, &lo, &hi);
+        double lo, hi; parent_lut(pb, J->sy, J->sx, J->st, J->lut + 256 * j, &lo, &hi);
         crop_copy(cb, J->sy, J->sx, J->crops + (size_t)I3_CROP * I3_CROP * I3_CROP * j);
         J->keep[j] = 1;
     }
@@ -222,7 +225,7 @@ static int run_band(run_ctx *C, int tz0, int tz1, int y0, int y1, int x0, int x1
         for (int j0 = 0; j0 < nj; j0 += C->B) {
             const int n = nj - j0 < C->B ? nj - j0 : C->B;
             const double tp = now_s();
-            prep_job J = {.slab = C->slab, .sy = sy, .sx = sx, .zs = zs, .ys = ys, .xs = xs, .oz = oz, .oy = oy + j0, .ox = ox + j0, .nj = n, .air = C->air,
+            prep_job J = {.slab = C->slab, .sy = sy, .sx = sx, .zs = zs, .ys = ys, .xs = xs, .oz = oz, .oy = oy + j0, .ox = ox + j0, .nj = n, .air = C->air, .st = C->l1 ? 2 : 1,
                           .crops = C->crops, .lut = C->lut, .keep = C->keep};
             atomic_init(&J.next, 0);
             const int nt = C->nth < n ? C->nth : n; pthread_t th[64];
@@ -261,7 +264,7 @@ int cmd_ink3d_ext(int argc, char **argv) {
     const char *model = opt(argc, argv, "--model", "gambiarra"), *wts = opt(argc, argv, "--weights", nullptr);
     if (!wts || strcmp(model, "gambiarra") || (!opt(argc, argv, "--raw-in", nullptr) && (!opt(argc, argv, "--box", nullptr) || !opt(argc, argv, "--out", nullptr) || !opt(argc, argv, "--ct", nullptr)))) {
         fprintf(stderr, "usage: ufsm ink3d-ext --model gambiarra --weights model.safetensors --ct ROOT KEY --box z,y,x,nz,ny,nx --out GROUP\n"
-                        "         [--out-um 9.6[,4.8]] [--ct-um 2.4] [--ct-l1 1 (KEY = the 4.8 um level 1; box in level-0 voxels)] [--batch 16] [--air 25] [--band 1024] [--threads 8] [--cache DIR] [--gpu 0] [--gpu-mem GB]\n"
+                        "         [--out-um 9.6[,4.8]] [--ct-um 2.4] [--ct-l1 1 (KEY = the 4.8 um level 1; box in level-0 voxels)] [--stride 32 (64: no overlap)] [--batch 16] [--air 25] [--band 1024] [--threads 8] [--cache DIR] [--gpu 0] [--gpu-mem GB]\n"
                         "  published 3D ink network scrollprize/ink_paris4_3d_4.8um_gambiarra over a box of a 2.4 um CT (KEY = level 0; box in level-0\n"
                         "  voxels, widened to multiples of 4). Writes GROUP/<4 x ct-um> (and GROUP/<2 x ct-um> with 4.8): uint8 prob254 = round(254 p),\n"
                         "  255 unknown, on the scan's level-2 (level-1) grid, full level shape, 512^3 (1024^3) shards; reruns merge. Prints a logit histogram.\n"
@@ -288,7 +291,8 @@ int cmd_ink3d_ext(int argc, char **argv) {
     }
     run_ctx C = {0};
     C.nth = atoi(opt(argc, argv, "--threads", "8")); C.B = atoi(opt(argc, argv, "--batch", "16")); C.air = atoi(opt(argc, argv, "--air", "25")); C.R = 128; C.net = net;
-    const int SH = 512, band = atoi(opt(argc, argv, "--band", "1024"));
+    const int SH = 512, band = atoi(opt(argc, argv, "--band", "1024")), stride = atoi(opt(argc, argv, "--stride", "32"));
+    if (stride < 1 || stride > I3_OUT) { fprintf(stderr, "ink3d-ext: --stride in 1 .. %d\n", I3_OUT); return 2; }
     if (C.nth < 1) C.nth = 1;
     if (C.B < 1 || band < 64 || band % 2 || band > 2 * SH) { fprintf(stderr, "ink3d-ext: --batch >= 1, --band even in 64 .. %d\n", 2 * SH); return 2; }
     store *st = store_open(root); C.ct = st ? z3_open(st, key, opt(argc, argv, "--cache", nullptr)) : nullptr;
@@ -305,7 +309,7 @@ int cmd_ink3d_ext(int argc, char **argv) {
         const int64_t b0 = bv[a] / 4 * 4, b1 = (bv[a] + bv[3 + a] + 3) / 4 * 4;
         r48[0][a] = b0 / 2; r48[1][a] = (b1 / 2) < S1[a] ? b1 / 2 : S1[a];
         r96[0][a] = b0 / 4; r96[1][a] = (r48[1][a] + 1) / 2;
-        C.nA[a] = grid_axis(V[a], &C.A[a]);
+        C.nA[a] = grid_axis(V[a], stride, &C.A[a]);
     }
     fprintf(stderr, "ink3d-ext: CT %lldx%lldx%lld, box (4.8) z %lld..%lld y %lld..%lld x %lld..%lld, crop grid %dx%dx%d, batch %d, band %d, air < %d\n",
             (long long)V[0], (long long)V[1], (long long)V[2], (long long)r48[0][0], (long long)r48[1][0], (long long)r48[0][1], (long long)r48[1][1],
