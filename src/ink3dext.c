@@ -264,7 +264,7 @@ int cmd_ink3d_ext(int argc, char **argv) {
     const char *model = opt(argc, argv, "--model", "gambiarra"), *wts = opt(argc, argv, "--weights", nullptr);
     if (!wts || strcmp(model, "gambiarra") || (!opt(argc, argv, "--raw-in", nullptr) && (!opt(argc, argv, "--box", nullptr) || !opt(argc, argv, "--out", nullptr) || !opt(argc, argv, "--ct", nullptr)))) {
         fprintf(stderr, "usage: ufsm ink3d-ext --model gambiarra --weights model.safetensors --ct ROOT KEY --box z,y,x,nz,ny,nx --out GROUP\n"
-                        "         [--out-um 9.6[,4.8]] [--ct-um 2.4] [--ct-l1 1 (KEY = the 4.8 um level 1; box in level-0 voxels)] [--stride 32 (64: no overlap)] [--batch 16] [--air 25] [--band 1024] [--threads 8] [--cache DIR] [--gpu 0] [--gpu-mem GB]\n"
+                        "         [--out-um 9.6[,4.8]] [--ct-um 2.4] [--ct-l1 1 (KEY = the 4.8 um level 1; box in level-0 voxels)] [--stride 32 (64: no overlap)] [--q 0 (output volcomp q)] [--batch 16] [--air 25] [--band 1024] [--threads 8] [--cache DIR] [--gpu 0] [--gpu-mem GB]\n"
                         "  published 3D ink network scrollprize/ink_paris4_3d_4.8um_gambiarra over a box of a 2.4 um CT (KEY = level 0; box in level-0\n"
                         "  voxels, widened to multiples of 4). Writes GROUP/<4 x ct-um> (and GROUP/<2 x ct-um> with 4.8): uint8 prob254 = round(254 p),\n"
                         "  255 unknown, on the scan's level-2 (level-1) grid, full level shape, 512^3 (1024^3) shards; reruns merge. Prints a logit histogram.\n"
@@ -292,6 +292,7 @@ int cmd_ink3d_ext(int argc, char **argv) {
     run_ctx C = {0};
     C.nth = atoi(opt(argc, argv, "--threads", "8")); C.B = atoi(opt(argc, argv, "--batch", "16")); C.air = atoi(opt(argc, argv, "--air", "25")); C.R = 128; C.net = net;
     const int SH = 512, band = atoi(opt(argc, argv, "--band", "1024")), stride = atoi(opt(argc, argv, "--stride", "32"));
+    const float oq = (float)atof(opt(argc, argv, "--q", "0"));   /* output volcomp q (0 = lossless; a rerun must keep the group's q) */
     if (stride < 1 || stride > I3_OUT) { fprintf(stderr, "ink3d-ext: --stride in 1 .. %d\n", I3_OUT); return 2; }
     if (C.nth < 1) C.nth = 1;
     if (C.B < 1 || band < 64 || band % 2 || band > 2 * SH) { fprintf(stderr, "ink3d-ext: --batch >= 1, --band even in 64 .. %d\n", 2 * SH); return 2; }
@@ -327,8 +328,8 @@ int cmd_ink3d_ext(int argc, char **argv) {
     store *os = store_open(out);
     z3 *old48 = want48 && level_exists(out, lv48) ? z3_open(os, lv48, nullptr) : nullptr, *old96 = want96 && level_exists(out, lv96) ? z3_open(os, lv96, nullptr) : nullptr;
     z3w *w48 = nullptr, *w96 = nullptr;
-    if (want48) { snprintf(dir, sizeof dir, "%s/%s", out, lv48); if (!(w48 = z3w_create(dir, S1, 2 * SH, 0, 255, attrs))) { fprintf(stderr, "ink3d-ext: %s\n", z3w_error()); return 1; } }
-    if (want96) { snprintf(dir, sizeof dir, "%s/%s", out, lv96); if (!(w96 = z3w_create(dir, S2, SH, 0, 255, attrs))) { fprintf(stderr, "ink3d-ext: %s\n", z3w_error()); return 1; } }
+    if (want48) { snprintf(dir, sizeof dir, "%s/%s", out, lv48); if (!(w48 = z3w_create(dir, S1, 2 * SH, oq, 255, attrs))) { fprintf(stderr, "ink3d-ext: %s\n", z3w_error()); return 1; } }
+    if (want96) { snprintf(dir, sizeof dir, "%s/%s", out, lv96); if (!(w96 = z3w_create(dir, S2, SH, oq, 255, attrs))) { fprintf(stderr, "ink3d-ext: %s\n", z3w_error()); return 1; } }
 
     /* buffers */
     const size_t cv = (size_t)I3_CROP * I3_CROP * I3_CROP, ring = (size_t)C.R * band * band;
