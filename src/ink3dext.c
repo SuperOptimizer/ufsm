@@ -176,6 +176,10 @@ static int ct_read(run_ctx *C, const int64_t o[3], const int64_t n[3], uint8_t *
 /* emit rows [z0, z1) of a band into the shard buffers (b48: (2 SH)^3 at 4.8, origin s48; b96: SH^3, origin s96) */
 static void emit(run_ctx *C, int TY, int TX, int z0, int z1, int y0, int x0, uint8_t *b48, const int64_t s48[3], uint8_t *b96, const int64_t s96[3], int SH) {
     if (z1 <= z0) return;
+    if (z1 - z0 > C->R) {   /* at most one ring of rows at a time (the tail after the volume's last crop can be longer: crash at the top of PHercParis3) */
+        for (int z = z0; z < z1; z += C->R) emit(C, TY, TX, z, z + C->R < z1 ? z + C->R : z1, y0, x0, b48, s48, b96, s96, SH);
+        return;
+    }
     i3_emit(C->acc, C->wsum, C->R, TY, TX, z0, z1, b48 ? C->d48 : nullptr, b96 ? C->d96 : nullptr, C->dhist);
     const int nz = z1 - z0, NY = (TY + 1) / 2, NX = (TX + 1) / 2, E = 2 * SH;
     if (b48) {
