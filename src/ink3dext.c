@@ -136,7 +136,8 @@ static void *prep_worker(void *arg) {
 }
 
 typedef struct {
-    z3 *ct; int nth, B, air, R;
+    z3 *ct; int nth, B, air, R, l1;   /* l1: ct is the 4.8 um level 1, read 2x nearest-upsampled to level-0 voxels */
+    uint8_t *l1buf; size_t l1cap;
     gb_net *net;
     int *A[3], nA[3];
     /* device */
@@ -145,6 +146,29 @@ typedef struct {
     uint8_t *slab; size_t slab_cap; uint8_t *crops, *h48, *h96; float *lut; int *keep, *org;
     long long ncrop, nair; double tgpu_wait, tct, tprep;
 } run_ctx;
+
+/* the CT box o, n (level-0 voxels) -> out; with --ct-l1 read from level 1 (voxel v of level 0 = voxel v / 2 of level 1): the
+   network's avg-pool 2 of the duplicated voxels gives the level-1 values back, and the parent's p1 / p99 see each value 8 times */
+static int ct_read(run_ctx *C, const int64_t o[3], const int64_t n[3], uint8_t *out) {
+    if (!C->l1) return z3_read(C->ct, o, n, out, C->nth);
+    int64_t o1[3], n1[3];
+    for (int a = 0; a < 3; a++) { o1[a] = o[a] >> 1; n1[a] = ((o[a] + n[a] + 1) >> 1) - o1[a]; }
+    const int64_t *V1 = z3_meta_of(C->ct)->shape;
+    for (int a = 0; a < 3; a++) if (o1[a] + n1[a] > V1[a]) n1[a] = V1[a] - o1[a];   /* (level 0 = 2 x level 1 may pass the end by 1) */
+    const size_t need = (size_t)n1[0] * n1[1] * n1[2];
+    if (need > C->l1cap) { free(C->l1buf); C->l1buf = malloc(need); C->l1cap = need; if (!C->l1buf) { C->l1cap = 0; return -1; } }
+    if (z3_read(C->ct, o1, n1, C->l1buf, C->nth)) return -1;
+    for (int64_t z = 0; z < n[0]; z++) {
+        int64_t z1 = ((o[0] + z) >> 1) - o1[0]; if (z1 >= n1[0]) z1 = n1[0] - 1;
+        for (int64_t y = 0; y < n[1]; y++) {
+            int64_t y1 = ((o[1] + y) >> 1) - o1[1]; if (y1 >= n1[1]) y1 = n1[1] - 1;
+            const uint8_t *src = C->l1buf + ((size_t)z1 * n1[1] + y1) * n1[2];
+            uint8_t *dst = out + ((size_t)z * n[1] + y) * n[2];
+            for (int64_t x = 0; x < n[2]; x++) { int64_t x1 = ((o[2] + x) >> 1) - o1[2]; if (x1 >= n1[2]) x1 = n1[2] - 1; dst[x] = src[x1]; }
+        }
+    }
+    return 0;
+}
 
 /* emit rows [z0, z1) of a band into the shard buffers (b48: (2 SH)^3 at 4.8, origin s48; b96: SH^3, origin s96) */
 static void emit(run_ctx *C, int TY, int TX, int z0, int z1, int y0, int x0, uint8_t *b48, const int64_t s48[3], uint8_t *b96, const int64_t s96[3], int SH) {
@@ -193,7 +217,7 @@ static int run_band(run_ctx *C, int tz0, int tz1, int y0, int y1, int x0, int x1
             memmove(C->slab, C->slab + (size_t)(nzs - zs) * sy * sx, (size_t)keep * sy * sx);
         }
         { const int64_t o[3] = {nzs + keep, ys, xs}, n[3] = {I3_PARENT - keep, (int64_t)sy, (int64_t)sx};
-          if (z3_read(C->ct, o, n, C->slab + (size_t)keep * sy * sx, C->nth)) { fprintf(stderr, "ink3d-ext: CT read: %s\n", z3_error()); return -1; } }
+          if (ct_read(C, o, n, C->slab + (size_t)keep * sy * sx)) { fprintf(stderr, "ink3d-ext: CT read: %s\n", z3_error()); return -1; } }
         zs = nzs; C->tct += now_s() - tc;
         for (int j0 = 0; j0 < nj; j0 += C->B) {
             const int n = nj - j0 < C->B ? nj - j0 : C->B;
@@ -237,7 +261,7 @@ int cmd_ink3d_ext(int argc, char **argv) {
     const char *model = opt(argc, argv, "--model", "gambiarra"), *wts = opt(argc, argv, "--weights", nullptr);
     if (!wts || strcmp(model, "gambiarra") || (!opt(argc, argv, "--raw-in", nullptr) && (!opt(argc, argv, "--box", nullptr) || !opt(argc, argv, "--out", nullptr) || !opt(argc, argv, "--ct", nullptr)))) {
         fprintf(stderr, "usage: ufsm ink3d-ext --model gambiarra --weights model.safetensors --ct ROOT KEY --box z,y,x,nz,ny,nx --out GROUP\n"
-                        "         [--out-um 9.6[,4.8]] [--ct-um 2.4] [--batch 16] [--air 25] [--band 1024] [--threads 8] [--cache DIR] [--gpu 0] [--gpu-mem GB]\n"
+                        "         [--out-um 9.6[,4.8]] [--ct-um 2.4] [--ct-l1 1 (KEY = the 4.8 um level 1; box in level-0 voxels)] [--batch 16] [--air 25] [--band 1024] [--threads 8] [--cache DIR] [--gpu 0] [--gpu-mem GB]\n"
                         "  published 3D ink network scrollprize/ink_paris4_3d_4.8um_gambiarra over a box of a 2.4 um CT (KEY = level 0; box in level-0\n"
                         "  voxels, widened to multiples of 4). Writes GROUP/<4 x ct-um> (and GROUP/<2 x ct-um> with 4.8): uint8 prob254 = round(254 p),\n"
                         "  255 unknown, on the scan's level-2 (level-1) grid, full level shape, 512^3 (1024^3) shards; reruns merge. Prints a logit histogram.\n"
@@ -269,7 +293,9 @@ int cmd_ink3d_ext(int argc, char **argv) {
     if (C.B < 1 || band < 64 || band % 2 || band > 2 * SH) { fprintf(stderr, "ink3d-ext: --batch >= 1, --band even in 64 .. %d\n", 2 * SH); return 2; }
     store *st = store_open(root); C.ct = st ? z3_open(st, key, opt(argc, argv, "--cache", nullptr)) : nullptr;
     if (!C.ct) { fprintf(stderr, "ink3d-ext: %s %s: %s\n", root, key, z3_error()); return 1; }
-    const int64_t *V = z3_meta_of(C.ct)->shape;
+    C.l1 = atoi(opt(argc, argv, "--ct-l1", "0"));   /* KEY is level 1 (4.8 um: the network's own input scale); box still in level-0 voxels */
+    int64_t V[3];
+    for (int a = 0; a < 3; a++) V[a] = (C.l1 ? 2 : 1) * z3_meta_of(C.ct)->shape[a];
     long long bv[6]; const char *box = opt(argc, argv, "--box", nullptr);
     if (sscanf(box, "%lld,%lld,%lld,%lld,%lld,%lld", bv, bv + 1, bv + 2, bv + 3, bv + 4, bv + 5) != 6) { fprintf(stderr, "ink3d-ext: --box z,y,x,nz,ny,nx\n"); return 2; }
     int64_t S1[3], S2[3], r48[2][3], r96[2][3];
@@ -354,7 +380,7 @@ int cmd_ink3d_ext(int argc, char **argv) {
                     "%.2f Mvox/s at 4.8 um (box %.0f Mvox), %.2f known\n",
             nshard, C.ncrop, C.nair, el, C.tct, C.tprep, C.tgpu_wait, C.ncrop ? 1e3 * el / C.ncrop : 0.0, nv48 / el / 1e6, nv48 / 1e6, nv48 > 0 ? tot / nv48 : 0.0);
     xfree_dev(C.acc); xfree_dev(C.wsum); xfree_dev(C.d48); xfree_dev(C.d96); xfree_dev(C.dcrop); xfree_dev(C.dlut); xfree_dev(C.dorg); xfree_dev(C.dhist);
-    free(C.crops); free(C.lut); free(C.keep); free(C.org); free(C.h48); free(C.h96); free(C.slab); free(b48); free(b96);
+    free(C.crops); free(C.lut); free(C.keep); free(C.org); free(C.h48); free(C.h96); free(C.slab); free(C.l1buf); free(b48); free(b96);
     for (int a = 0; a < 3; a++) free(C.A[a]);
     if (old48) z3_close(old48); if (old96) z3_close(old96);
     z3_close(C.ct); gb_free(net);
