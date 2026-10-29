@@ -1,5 +1,5 @@
 /* ufsm wrap-check <model-or-set> <fields-dir> [--ct ROOT KEY --ct-um U] [--codes ROOT KEY] [--nz 16] [--nth 180] [--zr Z0,Z1]
-                   [--sigma 0.7] [--prom 0.5] [--dup 0.5] [--threads 16] [--cache DIR] [--tsv OUT]
+                   [--sigma 1.2] [--prom 1] [--w-scale 1] [--dup 0.5] [--threads 16] [--cache DIR] [--tsv OUT]
    Duplicate / over-count check of a fitted winding (a joined fit set or one model; its wraps are the level sets W = k, ufsm wraps):
    along radial rays from the umbilicus (--nth angles at --nz z levels evenly over the box, or over native box-local z [Z0, Z1)), every
    pair of consecutive wrap crossings k -> k + 1 (inside material: the fields' weight w > 0 on every sample between them) is an
@@ -15,7 +15,8 @@
    Prints: counts per radius band (CT peaks per fitted turn, and the GT turns per fitted turn with --codes), the npk x GT confusion
    (validation), and per wrap k (intervals k -> k + 1) the shares with 0 / 1 / 2+ peaks, the medians of rct, rnet, gap, the GT turn
    shares, and a verdict from the intervals on both sides of k: dup (an empty share >= --dup on either side), merged (a 2+ share
-   >= --dup), real otherwise; --tsv OUT writes that table. Coordinates: the model's box (native voxels, global origin in model.json);
+   >= --dup), real otherwise; --tsv OUT writes that table. --w-scale S (a control): the wraps of S x W (2: a fit counting every turn twice).
+   Defaults --sigma 1.2 --prom 1: on Paris 4 (9.6 um CT) 1.05 CT peaks per fitted turn where the GT codes give 1.03. Coordinates: the model's box (native voxels, global origin in model.json);
    the fields may be any box holding it at the same native grid. CPU only, rays on --threads threads. */
 #include "fit.h"
 #include "zarr3.h"
@@ -38,7 +39,7 @@ typedef struct { int k; float z, r, gapn, rct, rnet, gtq; uint8_t npk; int8_t gt
 
 typedef struct {
     const fit_set *fs; const fit_model *m;
-    double zl, step, um, h, F, cf; int dirv;
+    double zl, step, um, h, F, cf, ws; int dirv;
     /* fields row (cells), offset of the model box in the fields box (native) */
     const uint8_t *w, *sp; int FH, FW; double fo[2];
     /* CT plane (float, CT voxels), its origin (CT voxels, global) */
@@ -82,7 +83,7 @@ static void wc_rays(void *ctx, int a0, int a1, int t) {
             if (fy < 0 || fx < 0 || fy >= J->FH || fx >= J->FW) continue;
             const size_t ci = (size_t)fy * J->FW + fx;
             mat[i] = J->w[ci] != 0; spn[i] = J->sp[ci] * J->h / 8.0f;
-            W[i] = (float)fit_set_W(J->fs, J->zl, y, x);
+            W[i] = (float)(J->ws * fit_set_W(J->fs, J->zl, y, x));
             if (J->ct) C[i] = (float)wc_ct(J, y, x);
             if (J->cd) q[i] = (short)wc_code(J, y, x);
         }
@@ -164,7 +165,7 @@ static double wc_median(float *v, int n) { if (!n) return NAN; qsort(v, n, sizeo
 int cmd_wrap_check(int argc, char **argv) {
     if (argc < 4) {
         fprintf(stderr, "usage: ufsm wrap-check <model-or-set> <fields-dir> [--ct ROOT KEY --ct-um U] [--codes ROOT KEY] [--nz 16] [--nth 180] [--zr Z0,Z1]\n"
-                        "       [--sigma 0.7] [--prom 0.5] [--dup 0.5] [--threads 16] [--cache DIR] [--tsv OUT]\n"
+                        "       [--sigma 1.2] [--prom 1] [--w-scale 1] [--dup 0.5] [--threads 16] [--cache DIR] [--tsv OUT]\n"
                         "  per adjacent wrap pair along radial rays: normal gap, CT papyrus peaks between them, GT turns (--codes); per-wrap verdicts\n");
         return 2;
     }
@@ -175,7 +176,7 @@ int cmd_wrap_check(int argc, char **argv) {
     const double h = g.h, um = g.um; long long forg[3]; int fsh[3]; for (int d = 0; d < 3; d++) { forg[d] = g.origin[d]; fsh[d] = g.shape[d]; } fit_fields_free(&g);
     if (m->h != h) { fprintf(stderr, "wrap-check: the model's cell h %g differs from the fields' %g\n", m->h, h); return 1; }
     const int nz = atoi(wc_opt(argc, argv, "--nz", "16")), nth = atoi(wc_opt(argc, argv, "--nth", "180")), nt = atoi(wc_opt(argc, argv, "--threads", "16"));
-    const double sigma = atof(wc_opt(argc, argv, "--sigma", "0.7")), prom = atof(wc_opt(argc, argv, "--prom", "0.5")), dup = atof(wc_opt(argc, argv, "--dup", "0.5"));
+    const double sigma = atof(wc_opt(argc, argv, "--sigma", "1.2")), prom = atof(wc_opt(argc, argv, "--prom", "1")), wsc = atof(wc_opt(argc, argv, "--w-scale", "1")), dup = atof(wc_opt(argc, argv, "--dup", "0.5"));
     const double Z = m->D * m->h; double zr0 = 0.05 * Z, zr1 = 0.95 * Z;
     const char *zr = wc_opt(argc, argv, "--zr", nullptr); if (zr && sscanf(zr, "%lf,%lf", &zr0, &zr1) != 2) { fprintf(stderr, "wrap-check: --zr Z0,Z1\n"); return 2; }
     if (nz < 1 || nth < 4 || !(sigma > 0) || !(zr1 > zr0)) { fprintf(stderr, "wrap-check: bad --nz / --nth / --sigma / --zr\n"); return 2; }
@@ -204,7 +205,7 @@ int cmd_wrap_check(int argc, char **argv) {
         const int fz = (int)floor((zg - forg[0]) / h);
         if (fz < 0 || fz >= fsh[0]) continue;
         fit_fields_buf b; if (fit_fields_load(argv[3], fz, fz + 1, 1, &b)) { fprintf(stderr, "wrap-check: cannot load field row %d\n", fz); return 1; }
-        wc_job J = {.fs = fs, .m = m, .zl = zl, .step = step, .um = um, .h = h, .F = F, .cf = cf, .w = b.f.w, .sp = b.f.sp, .FH = fsh[1], .FW = fsh[2],
+        wc_job J = {.fs = fs, .m = m, .zl = zl, .step = step, .um = um, .h = h, .F = F, .cf = cf, .ws = wsc, .w = b.f.w, .sp = b.f.sp, .FH = fsh[1], .FW = fsh[2],
                     .fo = {morg[1] - forg[1], morg[2] - forg[2]}, .morg = {morg[0], morg[1], morg[2]}, .nth = nth, .sigma = sigma, .prom = prom};
         float *ctp = nullptr; uint8_t *cdp = nullptr;
         if (cz) {   /* the CT rows covering native z [zg - 0.5, zg + 0.5), averaged; the box's y / x range + 2 */
