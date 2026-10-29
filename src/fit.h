@@ -317,3 +317,13 @@ void fit_ct_phasor(const fit_model *m, const fit_fields *f, const uint8_t *ctm, 
 double fit_ct_profile_spacing(const float *p, int n, double step, double prom);
 /* ufsm ct-fields CTROOT KEY FIELDS-DIR [--ct-um U] [--radius-um 150] [--threads 8]: ct.raw / cs.raw beside a field directory */
 int cmd_ct_fields(int argc, char **argv);
+
+/* fit-join --global (src/fitjoin.c): integer gauges S_k of n slabs minimising sum_k U_k(S_k) + sum_e C_e(S_b - S_a) over an overlap graph.
+   A cost table: costs at the listed integers v[0..nv) (ascending), `other` for every integer not listed (the robust cap). Unary k may be
+   empty (nv 0, other 0: no ref cells). The solve: candidates S[k] +- rc around the given S (in: the start, out: the result), exact dynamic
+   programming over the edges between consecutive slabs (b = a + 1), then a local search over every edge (single slabs and every suffix
+   k.. shifted by +-1, +-2) until no move lowers the energy. Returns the final energy. */
+typedef struct { const long *v; const double *c; int nv; double other; } fj_table;
+typedef struct { int a, b; fj_table t; } fj_edge;
+double fj_table_cost(const fj_table *t, long v);
+double fit_join_solve(int n, const fj_table *unary, int ne, const fj_edge *e, int rc, long *S);
