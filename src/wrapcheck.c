@@ -267,6 +267,16 @@ int cmd_wrap_check(int argc, char **argv) {
         if (qz) printf("  %6lld  %6.3f", bs[bi][2], bs[bi][2] ? (double)bs[bi][3] / 1000 / bs[bi][2] : 0);
         printf("\n");
     }
+    if (cz) {   /* per z level (the intervals are in z order) */
+        printf("  z(native)  intervals  CTpeaks/turn  empty  2+%s\n", qz ? "  GT-n  GT/turn" : "");
+        for (size_t a = 0; a < ni;) {
+            size_t b = a; long long s = 0, e0 = 0, e2 = 0, gn = 0, gs = 0;
+            for (; b < ni && all[b].z == all[a].z; b++) { s += all[b].npk; e0 += all[b].npk == 0; e2 += all[b].npk >= 2; if (all[b].gt != -128) { gn++; gs += lround(1000 * all[b].gtq); } }
+            printf("  %9.0f  %9zu  %12.3f  %5.3f  %5.3f", all[a].z, b - a, (double)s / (b - a), (double)e0 / (b - a), (double)e2 / (b - a));
+            if (qz) printf("  %6lld  %6.3f", gn, gn ? gs / 1000.0 / gn : 0);
+            printf("\n"); a = b;
+        }
+    }
     if (qz && cz) {
         printf("  validation: CT peaks in the interval (rows) x GT turns (columns 0 / 1 / 2+ / <0), counts\n");
         for (int a = 0; a < 3; a++) printf("    npk %s  %9lld %9lld %9lld %9lld\n", a == 0 ? "0 " : a == 1 ? "1 " : "2+", conf[a][0], conf[a][1], conf[a][2], conf[a][3]);
