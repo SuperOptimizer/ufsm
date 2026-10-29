@@ -48,7 +48,7 @@ SRC += src/surf.c src/stitch.c src/coreline.c src/coreline_check.c src/fit_ct.c 
 SRC += src/fblend.c
 SRC += src/inkblend.c
 SRC += src/inkseam.c
-SRC += src/render.c src/imgops.c
+SRC += src/render.c src/imgops.c src/inkcompare.c
 SRC += src/repack.c
 SRC += src/wload.c src/inkext.c src/inkext_net.c src/dinovol.c src/dinovol_net.c src/dino.c src/surfeval.c
 SRC += src/inksplat.c src/hercuvit.c src/hercuvit_net.c src/ink3dext.c src/ink3dext_net.c
@@ -281,6 +281,9 @@ test-all: $(B)/test_pairacc
 $(B)/test_robust: tests/test_robust.c $(B)/packmap.o $(B)/z3w.o $(B)/zarr3.o $(B)/store.o $(B)/json.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 test-all: $(B)/test_robust
+$(B)/test_render_stream: tests/test_render_stream.c $(B)/render.o $(B)/inkcompare.o $(B)/imgops.o $(B)/tiff.o $(B)/tiffw.o $(B)/z3w.o $(B)/zarr3.o $(B)/store.o $(B)/json.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
+test-all: $(B)/test_render_stream
 $(B)/test_tiffw: tests/test_tiffw.c $(B)/tiffw.o $(B)/tiff.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
 $(B)/test_wind: tests/test_wind.c src/wind.h $(B)/wind.o
@@ -501,6 +504,7 @@ test-all: $(B)/test_gpu_aug $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover 
 	./$(B)/test_fit_emb
 	./$(B)/test_distill
 	./$(B)/test_tiffw
+	./$(B)/test_render_stream
 	./$(B)/test_imgops
 	./$(B)/test_tfx
 	./$(B)/test_sheetcut

@@ -248,6 +248,224 @@ static int render_pass(z3 *z, rsheet *S, int ns, int k, const int *depth, int nd
     return rc;
 }
 
+/* ---- ufsm render of one wrap, chunk-ordered and pipelined (render_wrap_chunked, imgops.h) ----
+   The output is cut into RB x RB pixel blocks; each block's chunk ranges (per volume, +- depth + 2 voxels around its vertices) are
+   known up front. Blocks are sorted by their first chunk (z, y, x) and grouped by (z, y) chunk row; a pre-pass gives every chunk the
+   first and the last group that needs it, so each chunk is decoded exactly once, in first-use order, by decoder threads that run
+   ahead of the block renderers (bounded by the budget, which only the earliest unfinished group may exceed), and is freed as soon as
+   its last group is done. Renderers take blocks in order once every chunk of the block's group is decoded. The pixel arithmetic is
+   main.c render_rows' (corners valid when Z >= 0, bilinear point and normal, max over +- depth of trilin; ct_trilin = trilin on the
+   global volume), so the renders equal the tiled / union-box ones byte for byte. */
+typedef struct { uint8_t v; int32_t ci; uint32_t first; } wdec;   /* decode list entry: volume, chunk, first group (1-based) */
+typedef struct {
+    int nv; ctab T[2]; int depth[2]; uint32_t *first[2], *last[2];
+    const float *X, *Y, *Z; int w, h; double gs; uint8_t *const *img; int ow, oh;
+    rblock *b; int32_t (*blo)[2][3], (*bhi)[2][3]; uint32_t *bgrp; size_t nb; uint32_t ng;
+    wdec *dl; size_t ndl; uint8_t *ready; size_t *need;   /* need[g]: decode-list entries with first <= g (g 1-based) */
+    size_t *frees; size_t *free0;                         /* per group g: decode entries whose last group is g, frees[free0[g] .. free0[g + 1]) */
+    uint32_t *gleft;                                      /* per group: blocks not yet rendered */
+    pthread_mutex_t mu; pthread_cond_t cv;
+    size_t ready_prefix; uint32_t gdone; size_t resident, budget, peak; uint64_t ndec, nzero;
+    _Atomic size_t dnext, bnext; _Atomic int fail;
+} wrend;
+static void *wr_decoder(void *arg) {
+    wrend *R = arg;
+    for (size_t e; (e = atomic_fetch_add(&R->dnext, 1)) < R->ndl && !atomic_load(&R->fail);) {
+        const wdec *D = &R->dl[e]; ctab *T = &R->T[D->v]; const int64_t C = (int64_t)1 << T->sh; const size_t cv = (size_t)C * C * C;
+        pthread_mutex_lock(&R->mu);   /* the budget: only chunks of the earliest unfinished group may exceed it */
+        while (R->resident + cv > R->budget && D->first > R->gdone + 1 && !atomic_load(&R->fail)) pthread_cond_wait(&R->cv, &R->mu);
+        R->resident += cv; if (R->resident > R->peak) R->peak = R->resident;
+        pthread_mutex_unlock(&R->mu);
+        const int64_t i = D->ci, a = i / (T->cn[1] * T->cn[2]), bb = i / T->cn[2] % T->cn[1], c = i % T->cn[2];
+        const int64_t o[3] = {(T->c0[0] + a) * C, (T->c0[1] + bb) * C, (T->c0[2] + c) * C}, n[3] = {C, C, C};
+        uint8_t *buf = nullptr; int zero = 1;
+        if (o[0] < T->shape[0] && o[1] < T->shape[1] && o[2] < T->shape[2]) {
+            buf = malloc(cv);
+            if (!buf || z3_read(T->z, o, n, buf, 1)) { fprintf(stderr, "render: chunk read failed: %s\n", z3_error()); free(buf); buf = nullptr; atomic_store(&R->fail, 1); }
+            else { size_t q = 0; const uint64_t *w = (const uint64_t *)buf; while (q < cv / 8 && !w[q]) q++; zero = q == cv / 8; }
+        }
+        if (zero) { free(buf); buf = nullptr; }
+        pthread_mutex_lock(&R->mu);
+        T->ptr[i] = buf ? buf : T->zero; R->ndec++;
+        if (!buf) { R->resident -= cv; R->nzero++; }
+        R->ready[e] = 1;
+        while (R->ready_prefix < R->ndl && R->ready[R->ready_prefix]) R->ready_prefix++;
+        pthread_cond_broadcast(&R->cv);
+        pthread_mutex_unlock(&R->mu);
+    }
+    pthread_mutex_lock(&R->mu); pthread_cond_broadcast(&R->cv); pthread_mutex_unlock(&R->mu);
+    return nullptr;
+}
+static void wr_block(const wrend *R, const rblock *B) {
+    const int w = R->w, h = R->h; const double gs = R->gs; const float *A[3] = {R->Z, R->Y, R->X};
+    const int py1 = B->py + RB < R->oh ? B->py + RB : R->oh, px1 = B->px + RB < R->ow ? B->px + RB : R->ow;
+    for (int py = B->py; py < py1; py++) for (int px = B->px; px < px1; px++) {
+        const double gu = px / gs, gv = py / gs;
+        int c0 = (int)gu, r0 = (int)gv; if (c0 >= w - 1) c0 = w - 2; if (r0 >= h - 1) r0 = h - 2; if (c0 < 0 || r0 < 0) continue;
+        const double fu = gu - c0, fv = gv - r0;
+        const size_t i00 = (size_t)r0 * w + c0, i01 = i00 + 1, i10 = i00 + w, i11 = i10 + 1;
+        if (!(R->Z[i00] >= 0 && R->Z[i01] >= 0 && R->Z[i10] >= 0 && R->Z[i11] >= 0)) continue;
+        double P[3], du[3], dv[3];
+        for (int d = 0; d < 3; d++) {
+            const double a = A[d][i00], b = A[d][i01], c = A[d][i10], e = A[d][i11];
+            P[d] = (1 - fv) * ((1 - fu) * a + fu * b) + fv * ((1 - fu) * c + fu * e);
+            du[d] = (1 - fv) * (b - a) + fv * (e - c); dv[d] = (1 - fu) * (c - a) + fu * (e - b);
+        }
+        double N[3] = {du[1] * dv[2] - du[2] * dv[1], du[2] * dv[0] - du[0] * dv[2], du[0] * dv[1] - du[1] * dv[0]};
+        const double nl = sqrt(N[0] * N[0] + N[1] * N[1] + N[2] * N[2]); if (nl < 1e-12) continue;
+        for (int d = 0; d < 3; d++) N[d] /= nl;
+        for (int v = 0; v < R->nv; v++) {
+            float m = 0;
+            for (int t = -R->depth[v]; t <= R->depth[v]; t++) { const float s = ct_trilin(&R->T[v], P[0] + t * N[0], P[1] + t * N[1], P[2] + t * N[2]); if (s > m) m = s; }
+            R->img[v][(size_t)py * R->ow + px] = (uint8_t)lroundf(m);
+        }
+    }
+}
+static void *wr_renderer(void *arg) {
+    wrend *R = arg;
+    for (size_t k; (k = atomic_fetch_add(&R->bnext, 1)) < R->nb;) {
+        const uint32_t g = R->bgrp[k];
+        pthread_mutex_lock(&R->mu);
+        while (R->ready_prefix < R->need[g] && !atomic_load(&R->fail)) pthread_cond_wait(&R->cv, &R->mu);
+        pthread_mutex_unlock(&R->mu);
+        if (atomic_load(&R->fail)) break;
+        wr_block(R, &R->b[k]);
+        pthread_mutex_lock(&R->mu);
+        if (!--R->gleft[g] && g == R->gdone + 1) {   /* groups done in order: free the chunks they needed last */
+            while (R->gdone < R->ng && !R->gleft[R->gdone + 1]) {
+                const uint32_t q = ++R->gdone;
+                for (size_t f = R->free0[q]; f < R->free0[q + 1]; f++) {
+                    const wdec *D = &R->dl[R->frees[f]]; ctab *T = &R->T[D->v];
+                    if (T->ptr[D->ci] && T->ptr[D->ci] != T->zero) { free(T->ptr[D->ci]); R->resident -= (size_t)1 << (3 * T->sh); }
+                    T->ptr[D->ci] = nullptr;
+                }
+            }
+            pthread_cond_broadcast(&R->cv);
+        }
+        pthread_mutex_unlock(&R->mu);
+    }
+    pthread_mutex_lock(&R->mu); pthread_cond_broadcast(&R->cv); pthread_mutex_unlock(&R->mu);
+    return nullptr;
+}
+static int wr_blk_cmp(const void *a, const void *b) {   /* by the first volume's first chunk (z, y, x), then position */
+    const rblock *p = a, *q = b;
+    for (int d = 0; d < 3; d++) if (p->lo[d] != q->lo[d]) return p->lo[d] < q->lo[d] ? -1 : 1;
+    if (p->py != q->py) return p->py < q->py ? -1 : 1;
+    return (p->px > q->px) - (p->px < q->px);
+}
+int render_wrap_chunked(z3 *const *vz, int nv, const int *depth, const float *X, const float *Y, const float *Z, int w, int h, double gs,
+                        uint8_t *const *img, int ow, int oh, const int *crop, size_t budget, int nthreads, int io_threads, int verbose) {
+    if (nv < 1 || nv > 2 || w < 2 || h < 2) return -1;
+    const double t0 = rnow();
+    wrend *R = calloc(1, sizeof *R); if (!R) return -1;
+    R->nv = nv; R->X = X; R->Y = Y; R->Z = Z; R->w = w; R->h = h; R->gs = gs; R->img = img; R->ow = ow; R->oh = oh; R->budget = budget;
+    int dm = 0, rc = -1;
+    for (int v = 0; v < nv; v++) {
+        const z3_meta *zm = z3_meta_of(vz[v]); const int C = zm->chunk[0];
+        if (C != zm->chunk[1] || C != zm->chunk[2] || (C & (C - 1))) { fprintf(stderr, "render: chunks must be cubes of a power of 2\n"); free(R); return -1; }
+        int sh = 0; while ((1 << sh) < C) sh++;
+        R->T[v].z = vz[v]; R->T[v].sh = sh; for (int d = 0; d < 3; d++) R->T[v].shape[d] = zm->shape[d];
+        R->depth[v] = depth[v]; if (depth[v] > dm) dm = depth[v];
+    }
+    /* blocks with their chunk ranges per volume */
+    size_t cap = 1 << 16, nb = 0; rblock *b = malloc(cap * sizeof *b); int32_t (*hi1)[3] = malloc(cap * sizeof *hi1), (*lo1)[3] = malloc(cap * sizeof *lo1);
+    if (!b || !hi1 || !lo1) goto out0;
+    for (int py = 0; py < oh; py += RB) for (int px = 0; px < ow; px += RB) {
+        const int py1 = (py + RB < oh ? py + RB : oh) - 1, px1 = (px + RB < ow ? px + RB : ow) - 1;
+        if (crop && (px1 < crop[0] || px >= crop[0] + crop[2] || py1 < crop[1] || py >= crop[1] + crop[3])) continue;
+        int r0 = (int)(py / gs), r1 = (int)(py1 / gs), c0 = (int)(px / gs), c1 = (int)(px1 / gs);
+        r0 = r0 > h - 2 ? h - 2 : r0; r1 = r1 > h - 2 ? h - 2 : r1; c0 = c0 > w - 2 ? w - 2 : c0; c1 = c1 > w - 2 ? w - 2 : c1;
+        r1++; c1++;
+        double lo[3] = {1e300, 1e300, 1e300}, hi[3] = {-1e300, -1e300, -1e300};
+        for (int r = r0; r <= r1; r++) for (int c = c0; c <= c1; c++) {
+            const size_t i = (size_t)r * w + c; if (!(Z[i] >= 0)) continue;
+            const double v3[3] = {Z[i], Y[i], X[i]};
+            for (int d = 0; d < 3; d++) { if (v3[d] < lo[d]) lo[d] = v3[d]; if (v3[d] > hi[d]) hi[d] = v3[d]; }
+        }
+        if (!(lo[0] <= hi[0] && lo[1] <= hi[1] && lo[2] <= hi[2])) continue;
+        if (nb == cap) { cap *= 2; rblock *g = realloc(b, cap * sizeof *b); int32_t (*g1)[3] = realloc(hi1, cap * sizeof *hi1), (*g2)[3] = g1 ? realloc(lo1, cap * sizeof *lo1) : nullptr;
+                         b = g ? g : b; hi1 = g1 ? g1 : hi1; lo1 = g2 ? g2 : lo1;
+                         if (!g || !g1 || !g2) goto out0; }
+        rblock *B = &b[nb]; B->s = (int)nb; B->px = px; B->py = py;
+        for (int d = 0; d < 3; d++) {
+            double a = floor(lo[d]) - dm - 2, e = ceil(hi[d]) + dm + 2; if (a < 0) a = 0; if (e < 0) e = 0;
+            a = a > 1e15 ? 1e15 : a; e = e > 1e15 ? 1e15 : e;
+            B->lo[d] = (int32_t)((int64_t)a >> R->T[0].sh); B->hi[d] = (int32_t)((int64_t)e >> R->T[0].sh);
+            lo1[nb][d] = nv > 1 ? (int32_t)((int64_t)a >> R->T[1].sh) : 0; hi1[nb][d] = nv > 1 ? (int32_t)((int64_t)e >> R->T[1].sh) : 0;
+        }
+        nb++;
+    }
+    /* sort (s carries the original index for the second volume's ranges) */
+    qsort(b, nb, sizeof *b, wr_blk_cmp);
+    R->b = b; R->nb = nb; R->bgrp = malloc((nb + 1) * sizeof *R->bgrp);
+    R->blo = malloc((nb + 1) * sizeof *R->blo); R->bhi = malloc((nb + 1) * sizeof *R->bhi);
+    if (!R->bgrp || !R->blo || !R->bhi) goto out0;
+    for (size_t k = 0; k < nb; k++) {
+        const int s = b[k].s;
+        for (int d = 0; d < 3; d++) { R->blo[k][0][d] = b[k].lo[d]; R->bhi[k][0][d] = b[k].hi[d]; R->blo[k][1][d] = lo1[s][d]; R->bhi[k][1][d] = hi1[s][d]; }
+    }
+    free(lo1); free(hi1); lo1 = hi1 = nullptr;
+    uint32_t ng = 0;
+    for (size_t k = 0; k < nb; k++) { if (!k || b[k].lo[0] != b[k - 1].lo[0] || b[k].lo[1] != b[k - 1].lo[1]) ng++; R->bgrp[k] = ng; }
+    R->ng = ng;
+    if (nb) {
+        /* chunk tables (the box over every block) and the first / last group of each chunk, in first-use order */
+        size_t ntot = 0;
+        for (int v = 0; v < nv; v++) {
+            ctab *T = &R->T[v]; int64_t clo[3] = {INT64_MAX, INT64_MAX, INT64_MAX}, chi[3] = {-1, -1, -1};
+            for (size_t k = 0; k < nb; k++) for (int d = 0; d < 3; d++) { if (R->blo[k][v][d] < clo[d]) clo[d] = R->blo[k][v][d]; if (R->bhi[k][v][d] > chi[d]) chi[d] = R->bhi[k][v][d]; }
+            for (int d = 0; d < 3; d++) { T->c0[d] = clo[d]; T->cn[d] = chi[d] - clo[d] + 1; }
+            const size_t nc = (size_t)(T->cn[0] * T->cn[1] * T->cn[2]); ntot += nc;
+            T->ptr = calloc(nc, sizeof *T->ptr); T->zero = calloc((size_t)1 << (3 * T->sh), 1); R->first[v] = calloc(nc, sizeof(uint32_t)); R->last[v] = calloc(nc, sizeof(uint32_t));
+            if (!T->ptr || !T->zero || !R->first[v] || !R->last[v]) goto out0;
+        }
+        size_t dcap = 1 << 16; R->dl = malloc(dcap * sizeof *R->dl); R->need = calloc(ng + 2, sizeof *R->need);
+        if (!R->dl || !R->need) goto out0;
+        for (size_t k = 0; k < nb; k++) {
+            const uint32_t g = R->bgrp[k];
+            for (int v = 0; v < nv; v++) {
+                ctab *T = &R->T[v];
+                for (int64_t a = R->blo[k][v][0]; a <= R->bhi[k][v][0]; a++) for (int64_t y = R->blo[k][v][1]; y <= R->bhi[k][v][1]; y++) for (int64_t x = R->blo[k][v][2]; x <= R->bhi[k][v][2]; x++) {
+                    const size_t ci = (size_t)(((a - T->c0[0]) * T->cn[1] + (y - T->c0[1])) * T->cn[2] + (x - T->c0[2]));
+                    if (!R->first[v][ci]) {
+                        if (R->ndl == dcap) { dcap *= 2; wdec *q = realloc(R->dl, dcap * sizeof *q); if (!q) goto out0; R->dl = q; }
+                        R->first[v][ci] = g; R->dl[R->ndl++] = (wdec){(uint8_t)v, (int32_t)ci, g};
+                    }
+                    R->last[v][ci] = g;
+                }
+            }
+            R->need[g] = R->ndl;
+        }
+        for (uint32_t g = 1; g <= ng; g++) if (R->need[g] < R->need[g - 1]) R->need[g] = R->need[g - 1];
+        /* frees per group (counting sort of the entries by their last group) */
+        R->free0 = calloc(ng + 3, sizeof *R->free0); R->frees = malloc((R->ndl + 1) * sizeof *R->frees); R->ready = calloc(R->ndl + 1, 1); R->gleft = calloc(ng + 2, sizeof *R->gleft);
+        if (!R->free0 || !R->frees || !R->ready || !R->gleft) goto out0;
+        for (size_t e = 0; e < R->ndl; e++) R->free0[R->last[R->dl[e].v][R->dl[e].ci] + 1]++;
+        for (uint32_t g = 1; g <= ng + 1; g++) R->free0[g + 1] += R->free0[g];
+        { size_t *fill = calloc(ng + 2, sizeof *fill); if (!fill) goto out0;
+          for (size_t e = 0; e < R->ndl; e++) { const uint32_t L = R->last[R->dl[e].v][R->dl[e].ci]; R->frees[R->free0[L] + fill[L]++] = e; }
+          free(fill); }
+        for (size_t k = 0; k < nb; k++) R->gleft[R->bgrp[k]]++;
+        pthread_mutex_init(&R->mu, nullptr); pthread_cond_init(&R->cv, nullptr);
+        const int nr = nthreads < 1 ? 1 : nthreads > 64 ? 64 : nthreads, nd = io_threads < 1 ? nr : io_threads > 128 ? 128 : io_threads;
+        pthread_t th[192];
+        for (int t = 0; t < nd; t++) pthread_create(&th[t], nullptr, wr_decoder, R);
+        for (int t = 0; t < nr; t++) pthread_create(&th[nd + t], nullptr, wr_renderer, R);
+        for (int t = 0; t < nd + nr; t++) pthread_join(th[t], nullptr);
+        pthread_mutex_destroy(&R->mu); pthread_cond_destroy(&R->cv);
+        rc = atomic_load(&R->fail) ? -1 : 0;
+        for (int v = 0; v < nv; v++) { ctab *T = &R->T[v]; const size_t nc = (size_t)(T->cn[0] * T->cn[1] * T->cn[2]); for (size_t i = 0; i < nc; i++) if (T->ptr[i] && T->ptr[i] != T->zero) free(T->ptr[i]); }
+        if (verbose) fprintf(stderr, "render: %zu blocks in %u chunk rows, %zu chunks decoded once (%llu empty), peak chunk memory %.2f GB, %.1fs\n",
+                             nb, ng, R->ndl, (unsigned long long)R->nzero, R->peak / 1073741824.0, rnow() - t0);
+    } else rc = 0;
+out0:
+    free(lo1); free(hi1);
+    for (int v = 0; v < 2; v++) { free(R->T[v].ptr); free(R->T[v].zero); free(R->first[v]); free(R->last[v]); }
+    free(b); free(R->bgrp); free(R->blo); free(R->bhi); free(R->dl); free(R->need); free(R->free0); free(R->frees); free(R->ready); free(R->gleft);
+    free(R);
+    return rc;
+}
+
 static int name_cmp(const void *a, const void *b) { return strcmp(*(char *const *)a, *(char *const *)b); }
 static int area_cmp(const void *a, const void *b) { const rsheet *p = a, *q = b; return p->area > q->area ? -1 : p->area < q->area; }
 static int sname_cmp(const void *a, const void *b) { return strcmp(((const rsheet *)a)->name, ((const rsheet *)b)->name); }
@@ -515,7 +733,8 @@ int cmd_phase_score(int argc, char **argv) {
    -> 0 .. 255), the same for all sheets, instead of --stretch; --each PREFIX: instead of the combined JPEG every panel alone, unlabelled,
    as PREFIX<label><--each-suffix>.jpg (the CT panel only with --each-ct; <out.jpg> unused); --max-px N: every JPEG's longest side at most N
    (antialiased, img_fit_rgb); --quality Q (90). */
-int cmd_ink_compare(int argc, char **argv) {
+int ink_compare_mem(int argc, char **argv);
+int ink_compare_mem(int argc, char **argv) {   /* the in-memory version (inkcompare.c streams; same bytes) */
     const int ci = rarg(argc, argv, "--ct");
     if (argc < 5 || ci < 0 || ci + 1 >= argc || rarg(argc, argv, "--ink") < 0) {
         fprintf(stderr, "usage: ufsm ink-compare <out.jpg> --ct CT.tif --ink LABEL=INK.tif [--ink LABEL=INK.tif ..] [--px-um 2.4] [--rs-um 25] [--rl-um 500] [--crop x,y,w,h | --crop-frac fx,fy,w,h | --best-crop N] [--stretch | --fixed LO,HI] [--stretch-ct] [--full] [--each PREFIX [--each-suffix S] [--each-ct]] [--max-px N] [--quality 90] [--threads 16]\n"); return 2;
@@ -570,8 +789,10 @@ int cmd_ink_compare(int argc, char **argv) {
         ink_stats_t st;
         if (ink_stats(img[k], mask, W, H, rs < 1 ? 1 : rs, rl < 2 ? 2 : rl, &st)) { fprintf(stderr, "ink-compare: out of memory\n"); return 1; }
         printf("ink %s: n %lld mean %.4f frac50 %.4f p50 %.3f p95 %.3f p99 %.3f band %.4f\n", lab[k], st.n, st.mean, st.frac50, st.p50, st.p95, st.p99, st.band);
+        if (getenv("UFSM_INKCMP_FULL")) printf("full %s: %.17g %.17g %.17g\n", lab[k], st.mean, st.frac50, st.band);   /* (tests: every bit) */
     }
-    for (int a = 1; a < n; a++) for (int b = a + 1; b < n; b++) printf("corr %s %s: %.4f\n", lab[a], lab[b], ink_corr(img[a], img[b], mask, np));
+    for (int a = 1; a < n; a++) for (int b = a + 1; b < n; b++) { const double r = ink_corr(img[a], img[b], mask, np); printf("corr %s %s: %.4f\n", lab[a], lab[b], r);
+                                                                    if (getenv("UFSM_INKCMP_FULL")) printf("full corr: %.17g\n", r); }
     int flo = 0, fhi = 0;
     if (*ropt(argc, argv, "--fixed", "") && (sscanf(ropt(argc, argv, "--fixed", ""), "%d,%d", &flo, &fhi) != 2 || fhi <= flo)) { fprintf(stderr, "ink-compare: --fixed LO,HI (ink bytes, LO < HI)\n"); return 2; }
     if (fhi > flo) for (int k = 1; k < n; k++)   /* display only: one fixed ink scale LO .. HI -> 0 .. 255 for every sheet (no per-sheet stretch) */

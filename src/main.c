@@ -3558,7 +3558,9 @@ static int cmd_render(int argc, char **argv) {
     const double scale = atof(opt(argc, argv, "--scale", "1")); const int depth = atoi(opt(argc, argv, "--depth", "8"));
     const int tile = atoi(opt(argc, argv, "--tile", "512")), nthreads = atoi(opt(argc, argv, "--threads", "16"));
     const char *cache = opt(argc, argv, "--cache", nullptr);
-    z3 *vz = z3_open(store_open(argv[vi + 1]), argv[vi + 2], cache), *cz = ci > 0 && ci + 2 < argc ? z3_open(store_open(argv[ci + 1]), argv[ci + 2], cache) : nullptr;
+    store *vs = store_open(argv[vi + 1]), *cs = ci > 0 && ci + 2 < argc ? store_open(argv[ci + 1]) : nullptr;
+    const int remote = (vs && !store_is_local(vs)) || (cs && !store_is_local(cs));
+    z3 *vz = vs ? z3_open(vs, argv[vi + 2], cache) : nullptr, *cz = cs ? z3_open(cs, argv[ci + 2], cache) : nullptr;
     if (!vz || (ci > 0 && !cz)) { fprintf(stderr, "render: %s\n", z3_error()); return 1; }
     char cmd[1400]; snprintf(cmd, sizeof cmd, "mkdir -p '%s'", argv[3]); if (system(cmd)) return 1;
     DIR *dd = opendir(argv[2]); if (!dd) { fprintf(stderr, "render: cannot open %s\n", argv[2]); return 1; }
@@ -3567,6 +3569,9 @@ static int cmd_render(int argc, char **argv) {
        them (wraps are rings around the axis: per-tile boxes are nearly the whole cross-section, re-decoded per wrap: 127 wraps of a 3.9 cm
        slab took 226 s) */
     uint8_t *rvol = nullptr, *rct = nullptr; int64_t ro[3] = {0, 0, 0}, rn[3] = {0, 0, 0};
+    /* otherwise the wraps render chunk-ordered (render_wrap_chunked: every chunk decoded once, ink and CT in one pass; UFSM_RENDER_MEM
+       GB of decoded chunks); UFSM_RENDER_TILED=1: the former per-tile reads; UFSM_RENDER_CHUNKED=1: chunk-ordered even when the box fits */
+    int chunked = 0; double cbudget = 0;
     {
         double lo[3] = {1e300, 1e300, 1e300}, hi[3] = {-1e300, -1e300, -1e300};
         while ((de = readdir(dd))) {
@@ -3580,10 +3585,12 @@ static int cmd_render(int argc, char **argv) {
         }
         rewinddir(dd);
         const double budget = atof(getenv("UFSM_RENDER_MEM") ? getenv("UFSM_RENDER_MEM") : "8") * (1u << 30);
+        chunked = getenv("UFSM_RENDER_TILED") ? 0 : getenv("UFSM_RENDER_CHUNKED") ? 1 : 0;
+        cbudget = budget;
         if (lo[0] <= hi[0] && lo[1] <= hi[1] && lo[2] <= hi[2]) {
             for (int d = 0; d < 3; d++) { ro[d] = (int64_t)floor(lo[d]) - depth - 2; if (ro[d] < 0) ro[d] = 0; rn[d] = (int64_t)ceil(hi[d]) + depth + 3 - ro[d]; }
             const double nv = (double)rn[0] * rn[1] * rn[2];
-            if (nv * (cz ? 2 : 1) <= budget) {
+            if (nv * (cz ? 2 : 1) <= budget && !chunked) {
                 rvol = malloc((size_t)nv); rct = cz ? malloc((size_t)nv) : nullptr;
                 if (!rvol || (cz && !rct) || z3_read(vz, ro, rn, rvol, 32) || (cz && z3_read(cz, ro, rn, rct, 32))) { fprintf(stderr, "render: read failed: %s\n", z3_error()); return 1; }
                 fprintf(stderr, "render: the wraps' box %lldx%lldx%lld read once\n", (long long)rn[0], (long long)rn[1], (long long)rn[2]);
@@ -3602,6 +3609,13 @@ static int cmd_render(int argc, char **argv) {
         const double gs = step * scale;   /* output pixels per grid step */
         const int ow = render_out_px(w, gs), oh = render_out_px(h, gs);
         uint8_t *img = calloc((size_t)ow * oh, 1), *cimg = cz ? calloc((size_t)ow * oh, 1) : nullptr;
+        if (!img || (cz && !cimg)) { fprintf(stderr, "render: out of memory\n"); return 1; }
+        if (!rvol && !getenv("UFSM_RENDER_TILED")) {
+            z3 *zs[2] = {vz, cz}; const int dp[2] = {depth, 0}; uint8_t *const im[2] = {img, cimg};
+            const size_t imgb = (size_t)ow * oh * (cz ? 2 : 1), cb = cbudget > imgb + ((size_t)1 << 30) ? (size_t)cbudget - imgb : (size_t)1 << 30;
+            const int io = remote ? (nthreads > 32 ? nthreads : 32) : nthreads;
+            if (render_wrap_chunked(zs, cz ? 2 : 1, dp, X, Y, Z, w, h, gs, im, ow, oh, crs ? crop : nullptr, cb, nthreads, io, 1)) { fprintf(stderr, "render: %s: render failed\n", de->d_name); return 1; }
+        } else
         /* output tiles: each reads only the volume around its own vertices (+- depth), so a wrap of any size renders in bounded memory */
         for (int ty = 0; ty < oh; ty += tile) for (int tx = 0; tx < ow; tx += tile) {
             const int py1 = ty + tile < oh ? ty + tile : oh, px1 = tx + tile < ow ? tx + tile : ow;

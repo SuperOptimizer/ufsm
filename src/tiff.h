@@ -11,6 +11,7 @@ typedef struct { int w, h, bits, spp, fmt; /* fmt 1 = unsigned int, 3 = IEEE flo
 
 tiff *tiff_open_mem(const uint8_t *buf, size_t n);        /* buffer must outlive the handle */
 tiff *tiff_open_file(const char *path);                    /* reads the whole file */
+tiff *tiff_open_lazy(const char *path);                    /* maps the file for its IFDs; strips are read on demand (pread) */
 void tiff_close(tiff *t);
 int tiff_npages(const tiff *t);
 int tiff_page_info(const tiff *t, int page, tiff_page *info);
@@ -20,3 +21,8 @@ int tiff_read_page(tiff *t, int page, void *out);
 /* Return the ImageDescription tag text of a page (nullptr if absent); owned by the handle. */
 const char *tiff_description(tiff *t, int page);
 const char *tiff_error(void);
+/* Strip access of a strip (not tiled) page: rows per strip and the strip count; then strip si decoded into out (rps rows, the last
+   one shorter; w*spp*(bits/8) bytes per row). scratch / cap: the caller's buffer for the compressed bytes of a lazy file (grown as
+   needed, freed by the caller), so several threads can read one handle. */
+int tiff_strip_rows(const tiff *t, int page, int *rps, int *nstrips);
+int tiff_read_strip(const tiff *t, int page, int si, void *out, uint8_t **scratch, size_t *cap);

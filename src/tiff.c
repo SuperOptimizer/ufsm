@@ -3,6 +3,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <zlib.h>
 
 static _Thread_local char errbuf[256];
@@ -25,6 +29,7 @@ struct tiff {
     int le, big;      /* big: BigTIFF (8-byte offsets, 20-byte entries) */
     int npages;
     page *pages;
+    int fd; size_t maplen;   /* tiff_open_lazy: the file mapped (IFDs parsed from it), strips read with pread */
 };
 
 static uint16_t rd16(const tiff *t, size_t o) { const uint8_t *p = t->buf + o; return t->le ? (uint16_t)(p[0] | p[1] << 8) : (uint16_t)(p[1] | p[0] << 8); }
@@ -100,7 +105,7 @@ tiff *tiff_open_mem(const uint8_t *buf, size_t n) {
     int big = n >= 16 && (!memcmp(buf, "II+\0", 4) || !memcmp(buf, "MM\0+", 4));
     if (n < 8 || (!big && memcmp(buf, "II*\0", 4) && memcmp(buf, "MM\0*", 4))) { fail("not a TIFF"); return nullptr; }
     tiff *t = calloc(1, sizeof *t);
-    t->buf = buf; t->n = n; t->le = buf[0] == 'I'; t->big = big;
+    t->fd = -1; t->buf = buf; t->n = n; t->le = buf[0] == 'I'; t->big = big;
     size_t off = big ? (size_t)rd64(t, 8) : rd32(t, 4);
     int cap = 8;
     t->pages = calloc((size_t)cap, sizeof(page));
@@ -128,8 +133,21 @@ tiff *tiff_open_file(const char *path) {
     return t;
 }
 
+tiff *tiff_open_lazy(const char *path) {
+    const int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) { fail("cannot open %s", path); return nullptr; }
+    struct stat st; if (fstat(fd, &st) || st.st_size < 8) { close(fd); fail("cannot stat %s", path); return nullptr; }
+    void *m = mmap(nullptr, (size_t)st.st_size, PROT_READ, MAP_SHARED, fd, 0);
+    if (m == MAP_FAILED) { close(fd); fail("cannot map %s", path); return nullptr; }
+    tiff *t = tiff_open_mem(m, (size_t)st.st_size);
+    if (!t) { munmap(m, (size_t)st.st_size); close(fd); return nullptr; }
+    t->fd = fd; t->maplen = (size_t)st.st_size;
+    return t;
+}
+
 void tiff_close(tiff *t) {
     if (!t) return;
+    if (t->fd >= 0) { munmap((void *)t->buf, t->maplen); close(t->fd); }
     for (int i = 0; i < t->npages; i++) { free(t->pages[i].offsets); free(t->pages[i].counts); free(t->pages[i].description); }
     free(t->pages); free(t->own); free(t);
 }
@@ -241,5 +259,43 @@ int tiff_read_page(tiff *t, int pi, void *vout) {
             memcpy(out + (size_t)(y0 + r) * rowbytes + (size_t)x0 * spp * bps, blk + (size_t)r * tw * spp * bps, (size_t)cols * spp * bps);
     }
     free(blk);
+    return 0;
+}
+
+int tiff_strip_rows(const tiff *t, int pi, int *rps, int *nstrips) {
+    if (pi < 0 || pi >= t->npages) return fail("no page %d", pi);
+    const page *pg = &t->pages[pi];
+    if (pg->tile_w > 0) return fail("tiled page: no strip rows");
+    *rps = (int)(pg->rows_per_strip < (uint32_t)pg->p.h ? pg->rows_per_strip : (uint32_t)pg->p.h); *nstrips = (int)pg->nstrips;
+    return 0;
+}
+int tiff_read_strip(const tiff *t, int pi, int si, void *vout, uint8_t **scratch, size_t *cap) {
+    if (pi < 0 || pi >= t->npages) return fail("no page %d", pi);
+    const page *pg = &t->pages[pi];
+    if (pg->tile_w > 0 || si < 0 || (uint32_t)si >= pg->nstrips) return fail("strip %d of a strip page", si);
+    const int w = pg->p.w, h = pg->p.h, spp = pg->p.spp, bps = pg->p.bits / 8;
+    const uint32_t th = pg->rows_per_strip < (uint32_t)h ? pg->rows_per_strip : (uint32_t)h, y0 = (uint32_t)si * th;
+    if (y0 >= (uint32_t)h) return 0;
+    const uint32_t rows = y0 + th > (uint32_t)h ? (uint32_t)h - y0 : th;
+    const uint64_t off = pg->offsets[si], cnt = pg->counts[si];
+    if (off + cnt > t->n) return fail("strip %d out of range", si);
+    size_t need = (size_t)w * rows * spp * bps; uint8_t *out = vout;
+    const uint8_t *src = t->buf + off;
+    if (t->fd >= 0) {   /* lazy: the strip's bytes by pread (no mapped pages touched) */
+        if (*cap < cnt) { free(*scratch); *cap = cnt; *scratch = malloc(cnt); if (!*scratch) { *cap = 0; return fail("out of memory"); } }
+        for (size_t got = 0; got < cnt;) { const ssize_t r = pread(t->fd, *scratch + got, cnt - got, (off_t)(off + got)); if (r <= 0) return fail("read strip %d", si); got += (size_t)r; }
+        src = *scratch;
+    }
+    memset(out, 0, need);
+    int rc;
+    switch (pg->compression) {
+    case 1: memcpy(out, src, cnt < need ? cnt : need); rc = 0; break;
+    case 5: rc = lzw_decode(src, cnt, out, need); break;
+    case 8: case 32946: rc = inflate_buf(src, cnt, out, need); break;
+    default: return fail("compression %d unsupported", pg->compression);
+    }
+    if (rc) return -1;
+    unpredict(out, (int)rows, w, spp, bps, pg->predictor, t->le);
+    if (!t->le && bps > 1) for (size_t k = 0; k < (size_t)w * rows * spp; k++) { uint8_t *p = out + k * bps; for (int a = 0; a < bps / 2; a++) { uint8_t q = p[a]; p[a] = p[bps - 1 - a]; p[bps - 1 - a] = q; } }
     return 0;
 }

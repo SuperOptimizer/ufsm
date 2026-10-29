@@ -178,6 +178,14 @@ build/ufsm render flat r --volume ink.zarr 9.6 --ct CT 2 --depth 1 --scale 2
 build/ufsm flatten-warp old/w072_published.jpg flat/w072 r/w072_published.tif --src-px 8 --scale 2
 ```
 
+When the wraps' union box does not fit `UFSM_RENDER_MEM` GB, `render` goes chunk-ordered: blocks
+sorted by chunk row, every chunk of the ink and CT zarrs decoded once (decoder threads run ahead of
+the renderers, 32 for HTTP stores), chunks freed after their last use. `ink-compare` streams the
+renders strip by strip (histograms, then the band statistic, then panels -> BOX half -> BILINEAR fit
+row by row). Both write the same bytes as before; a whole Paris 3 wrap (338 cm², 1.6 Gpixel
+renders) took render 5:28 -> 1:37 and ink-compare 1:37 / 51.6 GB -> 0:19 / 0.47 GB.
+`UFSM_RENDER_TILED=1` and `UFSM_INKCMP_MEM=1` select the old paths.
+
 ## Prediction input transform
 
 `predict --input-gain G --input-bias B` exposes the standardized CT transform

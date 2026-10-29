@@ -54,6 +54,13 @@ static inline float tifxyz_scaled(float v, float z, float divf, float offf) { re
 static inline int render_out_px(int n, double gs) { return (int)floor((n - 1) * gs + 1e-6) + 1; }
 
 float *img_read_f32(const char *path, int *w, int *h);     /* a float32 single-sample TIFF, nullptr on failure */
+/* ufsm render of one wrap grid (X, Y, Z: w x h vertices, gs output pixels per grid step) through nv (1-2) volumes into img[v]
+   (ow x oh, zeroed by the caller): per pixel the max over +- depth[v] voxels along the normal (depth 0: the sample itself), exactly
+   as main.c's tiled render. Every chunk is decoded once (chunk-ordered blocks, decoders ahead of renderers); budget bytes of decoded
+   chunks (exceeded only by one chunk row's needs); crop (x, y, w, h) or nullptr: only blocks meeting it. 0 ok, -1 on failure. */
+struct z3;
+int render_wrap_chunked(struct z3 *const *vz, int nv, const int *depth, const float *X, const float *Y, const float *Z, int w, int h, double gs,
+                        uint8_t *const *img, int ow, int oh, const int *crop, size_t budget, int nthreads, int io_threads, int verbose);
 uint8_t *img_read_u8(const char *path, int *w, int *h);    /* a uint8 single-sample TIFF */
 
 /* numpy.percentile(v, q) (method linear, numpy 2's _lerp) of n values; v is reordered. The float32 version is numpy's on float32
