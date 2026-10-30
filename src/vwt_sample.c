@@ -132,7 +132,20 @@ static void vws_qbox(const float *q, size_t n, double lo[3], double hi[3]) {
     for (int c = 0; c < 3; c++) { lo[c] = 1e300; hi[c] = -1e300; }
     for (size_t v = 0; v < n; v++) for (int c = 0; c < 3; c++) { lo[c] = fmin(lo[c], q[3 * v + c]); hi[c] = fmax(hi[c], q[3 * v + c]); }
 }
+/* UFSM_VWS_PROF=1: per-stage wall time of vws_fill summed over the workers, printed by vws_close */
+enum { VP_FRAME, VP_AUGMAP, VP_LATTICE, VP_QBOX, VP_CT, VP_GT, VP_SAMPLE, VP_KINC, VP_UNWRAP, VP_PW, VP_INTENS, VP_N };
+static const char *vp_name[VP_N] = {"frame", "aug map", "aug lattice", "qbox+holdout", "CT read", "GT read", "sample", "exact k", "unwrap", "weights", "intensity"};
+static _Atomic long long vp_ns[VP_N], vp_slabs, vp_tries, vp_geo; static int vp_on = -1;
+static long long vp_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1000000000ll + t.tv_nsec; }
+#define VP(k) do { if (vp_on) { const long long t_ = vp_now(); atomic_fetch_add(&vp_ns[k], t_ - vp_t); vp_t = t_; } } while (0)
+static void vp_print(void) {
+    if (vp_on <= 0 || !vp_slabs) return; double tot = 0; for (int k = 0; k < VP_N; k++) tot += vp_ns[k];
+    fprintf(stderr, "vws prof: %lld slabs (%lld draws, %lld deformed), %.2f thread-s per slab:", vp_slabs, vp_tries, vp_geo, tot / 1e9 / vp_slabs);
+    for (int k = 0; k < VP_N; k++) fprintf(stderr, " %s %.3f", vp_name[k], vp_ns[k] / 1e9 / vp_slabs); fprintf(stderr, "\n");
+}
 static int vws_fill(vws *V, uint64_t *rs, vws_work *w, vws_sample *out) {
+    if (vp_on < 0) vp_on = getenv("UFSM_VWS_PROF") && atoi(getenv("UFSM_VWS_PROF")) > 0;
+    long long vp_t = vp_on ? vp_now() : 0;
     const int T = V->T, L = V->L; const size_t n = (size_t)T * T * L;
     for (int attempt = 0; attempt < 64; attempt++) {
         /* source by weight */
@@ -154,6 +167,8 @@ static int vws_fill(vws *V, uint64_t *rs, vws_work *w, vws_sample *out) {
         double ro[3] = {px - k0 * dir[0], py - k0 * dir[1], pz - k0 * dir[2]};
         vws_frame(dir, ro, T, out->o, out->a, out->b, out->d);
         /* the source lattice q (xyz); the geometric aug hook replaces it (src/vwt_aug.h): CT and labels are both read at q */
+        if (vp_on) atomic_fetch_add(&vp_tries, 1);
+        VP(VP_FRAME);
         vwa *ga = nullptr; int geo = 0; out->T = T; out->L = L;
         if (g_vwa_ok && V->train && g_vwa.on && g_vwa.geo_p > 0) {
             if (!w->arena) w->arena = malloc(VWS_ARENA);
@@ -161,7 +176,9 @@ static int vws_fill(vws *V, uint64_t *rs, vws_work *w, vws_sample *out) {
             if (w->arena && !crush_cache_init(&cc, w->arena, VWS_ARENA)) {
                 vws_ctu u = {&cc, {S->ct, CRUSH_LINEAR, 0, 0, 1, {0, 0, 0}, nullptr}};
                 ga = vwa_begin(&g_vwa, vws_rng(rs), out, vws_ct_xyz, &u);
+                VP(VP_AUGMAP);
                 if (ga) { vwa_src_lattice(ga, T, L, w->q); geo = 1; }
+                VP(VP_LATTICE);
                 vwa_end(ga); ga = nullptr; crush_cache_free(&cc);
             }
         }
@@ -169,6 +186,7 @@ static int vws_fill(vws *V, uint64_t *rs, vws_work *w, vws_sample *out) {
             float *qq = w->q + 3 * (((size_t)i * T + j) * L + k);
             for (int c = 0; c < 3; c++) qq[c] = (float)(out->o[c] + i * out->a[c] + j * out->b[c] + k * out->d[c]);
         }
+        VP(VP_LATTICE);
         double lo[3], hi[3]; vws_qbox(w->q, n, lo, hi);
         int bad = 0;   /* holdouts: no CT and no label from there */
         for (int b = 0; b < S->nbox && !bad; b++) {
@@ -176,6 +194,7 @@ static int vws_fill(vws *V, uint64_t *rs, vws_work *w, vws_sample *out) {
             bad = hi[2] >= B[0] && lo[2] < B[0] + B[3] && hi[1] >= B[1] && lo[1] < B[1] + B[4] && hi[0] >= B[2] && lo[0] < B[2] + B[5];
         }
         if (bad) continue;
+        VP(VP_QBOX);
         /* CT box (zyx) */
         const int64_t *Vs = z3_meta_of(S->ct)->shape; int64_t bo[3], bn[3]; int empty = 0;
         for (int e = 0; e < 3; e++) { const int x = 2 - e; int64_t a = (int64_t)floor(lo[x]) - 1, b = (int64_t)ceil(hi[x]) + 2; a = a < 0 ? 0 : a; b = b > Vs[e] ? Vs[e] : b; if (b - a < 2) { empty = 1; a = 0; b = 2; } bo[e] = a; bn[e] = b - a; }
@@ -183,12 +202,14 @@ static int vws_fill(vws *V, uint64_t *rs, vws_work *w, vws_sample *out) {
         const size_t need = (size_t)bn[0] * bn[1] * bn[2];
         if (need > w->ccap) { free(w->ct); w->ct = malloc(need); w->ccap = need; if (!w->ct) return -1; }
         if (z3_read(S->ct, bo, bn, w->ct, 1)) { fprintf(stderr, "vws: CT read failed (%s): %s\n", S->name, z3_error()); continue; }
+        VP(VP_CT);
         /* GT box (zyx, GT voxels): nearest GT voxel of a CT point c: floor((c + 0.5) / f) */
         const int64_t *G = z3_meta_of(S->ph)->shape; int64_t go[3], gn[3];
         for (int e = 0; e < 3; e++) { const int x = 2 - e; int64_t a = (int64_t)floor((lo[x] + 0.5) / f) - 1, b = (int64_t)floor((hi[x] + 0.5) / f) + 2; a = a < 0 ? 0 : a; b = b > G[e] ? G[e] : b; if (b <= a) { a = 0; b = 1; } go[e] = a; gn[e] = b - a; }
         const size_t gneed = (size_t)gn[0] * gn[1] * gn[2];
         if (gneed > w->gcap) { free(w->gt); w->gt = malloc(gneed); w->gcap = gneed; if (!w->gt) return -1; }
         if (z3_read(S->ph, go, gn, w->gt, 1)) { fprintf(stderr, "vws: GT read failed (%s): %s\n", S->name, z3_error()); continue; }
+        VP(VP_GT);
         /* tubes near this slab */
         w->nsidx = 0; const double R = S->seg_r;
         for (int m = 0; m < S->nseg; m++) {
@@ -216,6 +237,7 @@ static int vws_fill(vws *V, uint64_t *rs, vws_work *w, vws_sample *out) {
             const uint8_t c = w->gt[((size_t)gz * gn[1] + gy) * gn[2] + gx]; if (c >= 252) continue;
             double ph = S->psign * c / 252.0; ph -= floor(ph); w->raw[v] = (float)ph; nlab++;
         }
+        VP(VP_SAMPLE);
         if (nlab < n / 100) continue;
         if (geo) {   /* deformed: exact k increments through the source GT along each q segment (substeps <= 0.5 voxel) */
             if (!w->kinc) { w->kinc = malloc(n * sizeof *w->kinc); if (!w->kinc) return -1; }
@@ -235,7 +257,9 @@ static int vws_fill(vws *V, uint64_t *rs, vws_work *w, vws_sample *out) {
                 if (ok) w->kinc[v] = (float)sum;
             }
         }
+        VP(VP_KINC);
         const int nc = vws_unwrap_k(w->raw, geo ? w->kinc : nullptr, T, L, 64, out->ph, out->comp); if (nc <= 0) continue;
+        VP(VP_UNWRAP);
         size_t kept = 0;
         for (size_t v = 0; v < n; v++) {
             if (!out->comp[v]) { out->pw[v] = 0; continue; }
@@ -244,7 +268,9 @@ static int vws_fill(vws *V, uint64_t *rs, vws_work *w, vws_sample *out) {
             out->pw[v] = w->nsidx && vws_seg_hit(S->seg, w->sidx, w->nsidx, R * R, p) ? 0.f : 1.f; kept += out->pw[v] > 0;
         }
         if (kept < n / 100) continue;
+        VP(VP_PW);
         if (g_vwa_ok && V->train) vwa_intensity(&g_vwa, vws_rng(rs), out->im, out->va, T, L);
+        VP(VP_INTENS); if (vp_on) { atomic_fetch_add(&vp_slabs, 1); atomic_fetch_add(&vp_geo, geo); }
         out->T = T; out->L = L; out->src = si; out->flags = inward;
         return 0;
     }
@@ -389,6 +415,7 @@ vws *vws_open(const char *sources_json, int T, int L, float tilt_deg, int nthrea
 }
 
 void vws_close(vws *V) {
+    vp_print();
     if (!V) return;
     if (V->th) {
         pthread_mutex_lock(&V->mu); V->stop = 1; pthread_cond_broadcast(&V->cv); pthread_mutex_unlock(&V->mu);
