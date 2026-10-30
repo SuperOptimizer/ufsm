@@ -36,7 +36,6 @@ typedef struct {
     double o[3], a[3], b[3], d[3];   /* frame (xyz, scan voxels of the CT level) */
     int src;            /* source index (sources json order) */
     int flags;          /* bit 0: the ray points inward (toward the umbilicus) */
-    uint8_t *shell;     /* [T][T][L] 1 = verified-patch shell voxel (position-only labels; nullptr: none) */
 } vws_sample;
 
 typedef struct vws vws;
