@@ -86,6 +86,15 @@ static int diag(int argc, char **argv) {
         for (size_t q = 0; q < n; q++) { pc[q] = s0 * (float)(q % L + 1); ic[q] = s0; }
         nn_h2d(phd, pc, n * 4); nn_h2d(incd, ic, n * 4); vt_losses(phd, incd, tgd, cd, pwd, T, L, 0.25f, 0.05f, 1, 1, 1, nullptr, nullptr, &b);
         double mm = 0, mt = 0, cm = 0, ct = 0; seg_miss(ph, tg, cp, T, L, &mm, &mt); seg_miss(pc, tg, cp, T, L, &cm, &ct);
+        {   /* the model's mean increment on labelled steps and the correlation of 16-voxel turn counts (model vs target) */
+            double sp = 0, np2 = 0, sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0, nn2 = 0;
+            for (long c0 = 0; c0 < (long)T * T; c0++) for (int k = 16; k < L; k += 8) {
+                const long q = c0 * L + k, q0 = q - 16; if (!cp[q] || cp[q] != cp[q0]) continue;
+                const double x = ph[q] - ph[q0], y = tg[q] - tg[q0]; sp += x; np2 += 16; sx += x; sy += y; sxx += x * x; syy += y * y; sxy += x * y; nn2++;
+            }
+            const double cov = sxy / nn2 - sx / nn2 * sy / nn2, vx = sxx / nn2 - sx * sx / nn2 / nn2, vy = syy / nn2 - sy * sy / nn2 / nn2;
+            printf("   model mean increment %.4f (target %.4f), corr of 16-vx counts %.3f\n", sp / np2, s0, cov / sqrt(vx * vy + 1e-30));
+        }
         printf("slab %d: model phase %.4f density %.5f miss32 %.3f | constant %.4f: phase %.4f density %.5f miss32 %.3f\n", i, a.phase, a.density, mt ? mm / mt : 0, s0, b.phase, b.density, ct ? cm / ct : 0);
         sm[0] += a.phase; sm[1] += a.density; sm[2] += mt ? mm / mt : 0; sm[3] += b.phase; sm[4] += b.density; sm[5] += ct ? cm / ct : 0;
     }
