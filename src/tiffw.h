@@ -24,6 +24,14 @@ extern float *(*tfx_axis_hook)(const char *tifpath, int *w, int *h);
 extern char *(*tfx_meta_hook)(const char *metapath);
 extern int (*tfx_write_hook)(const char *sfcpath, int w, int h, const float *x, const float *y, const float *z, const char *meta, double err);
 void tifxyz_set_sfc(double err);
+/* a joint-XYZ .sfc (w x h, Euclidean tolerance err, meta) written by nthreads encoders (<= 0: the tfx_set_threads count, shared out
+   among the tfx_sfc_write calls running at that moment): fill(ctx, bx, by, joint, valid) gives one zeroed 64 x 64 patch (columns
+   bx*64.., rows by*64..; valid samples need z > 0), called from any thread. The file is byte-identical for any thread count, and
+   to the old serial writer. Written to <sfcpath>.tmpPID and renamed. 0 ok. (src/tfx.c; the tifxyz_set_sfc writes use it.) */
+#include <stdint.h>
+typedef void (*tfx_fill_fn)(void *ctx, int bx, int by, float (*joint)[3], uint8_t *valid);
+int tfx_sfc_write(const char *sfcpath, int w, int h, double err, const char *meta, tfx_fill_fn fill, void *ctx, int nthreads);
+void tfx_set_threads(int n);
 /* an axis image <wrap>/{x,y,z}.tif: the file, else from the wrap's .sfc (null when neither) */
 float *tfx_axis_read(const char *tifpath, int *w, int *h, float *(*plain)(const char *, int *, int *));
 /* <wrap>/meta.json opened for reading: the file, else the .sfc's metadata (fmemopen) */
