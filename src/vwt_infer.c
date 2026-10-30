@@ -3,6 +3,7 @@
    neighbour pair (OUT/pairs.f32), written with pwrite at the slab's / pair's offsets.
 
    ufsm vwt-infer CKPT ROOT KEY OUT (--tiling T.bin | --umb JSON --box z,y,x,nz,ny,nx) [--gpu 0] [--part i/n] [--threads 16] [--cache DIR] [--mx8 1]
+                  [--resume 1]   (skip the slabs whose centre OUT/centre.f32 already holds)
    ufsm vwt-infer --bench N [--gpu 0]      synthetic CT band and tiling, random weights: slabs / s of the pipeline
 
    Parts take whole z bands round robin; each part writes NaN centres for its skipped slabs (> 98 % zero CT), so with every part run each
@@ -170,6 +171,15 @@ int cmd_vwt_infer(int argc, char **argv) {
     size_t nbands = 0; band_t *B = calloc((size_t)S.n + 1, sizeof *B);
     { size_t s0 = 0; int bi = 0;
       for (size_t i = 1; i <= (size_t)S.n; i++) if (i == (size_t)S.n || S.s[i].b != S.s[s0].b) { if (bi++ % pn == pi) band_box(&S, s0, i, T, L, V, &B[nbands++]); s0 = i; } }
+    /* --resume 1: slabs whose centre is already written (any non-zero bits: a value or the NaN of a skip) are done; whole done bands drop */
+    uint8_t *done = calloc((size_t)S.n + 1, 1);
+    if (!bench && atoi(opt(argc, argv, "--resume", "0"))) {
+        char p[1200]; snprintf(p, sizeof p, "%s/centre.f32", argv[5]); FILE *f = fopen(p, "rb"); size_t nd0 = 0;
+        if (f) { uint32_t *cv = calloc((size_t)S.n + 1, 4); const size_t got = fread(cv, 4, (size_t)S.n, f); fclose(f);
+                 for (size_t k = 0; k < got; k++) { done[k] = cv[k] != 0; nd0 += done[k]; } free(cv); }
+        size_t kb = 0; for (size_t b = 0; b < nbands; b++) { size_t nleft = 0; for (size_t i = B[b].first; i < B[b].last; i++) nleft += !done[i]; if (nleft) B[kb++] = B[b]; }
+        fprintf(stderr, "vwt-infer: resume: %zu slabs done, %zu of %zu bands left\n", nd0, kb, nbands); nbands = kb;
+    }
     size_t nsl = 0, hmax = 0; for (size_t b = 0; b < nbands; b++) { nsl += B[b].last - B[b].first; const size_t n = (size_t)B[b].bn[0] * B[b].bn[1] * B[b].bn[2]; if (n > hmax) hmax = n; }
     fprintf(stderr, "vwt-infer: %d slabs, %d pairs (<= %d per slab); part %d/%d: %zu bands, %zu slabs, largest band box %.0f MB\n", S.n, S.np, maxp, pi, pn, nbands, nsl, hmax / 1e6);
     /* buffers */
@@ -202,8 +212,10 @@ int cmd_vwt_infer(int argc, char **argv) {
         const size_t ns = bb->last - bb->first;
         if (ns > ccap) { nn_free(cnts); cnts = nn_malloc(ns * 8); free(hcnt); hcnt = malloc(ns * 8); ccap = ns; }
         for (int pass = 0; pass < 2; pass++)   /* 0: extract + count every slab (one sync), 1: the kept slabs through the model */
-        for (size_t i = bb->first; i < bb->last; i++) {
+        for (size_t i = bb->first; i <= bb->last; i++) {
+            if (i == bb->last) { if (!pass) nn_d2h(hcnt, cnts, ns * 8); break; }
             const vwt_slab *s = &S.s[i]; float o[3], a[3], bv[3], d[3], vlo[3], vhi[3];
+            if (done[i]) { if (pass) nskip++; continue; }
             if (pass && !bench && hcnt[i - bb->first] < nv / 50) {   /* > 98 % zero CT: centre NaN */
                 const float nanv = NAN; if (pw(W.fce, &nanv, 4, (off_t)i * 4)) { fprintf(stderr, "vwt-infer: write failed\n"); return 1; }
                 nskip++; continue;
@@ -215,7 +227,6 @@ int cmd_vwt_infer(int argc, char **argv) {
             vwi_sample(dbox, (int)bb->bn[0], (int)bb->bn[1], (int)bb->bn[2], o, a, bv, d, vlo, vhi, T, L, imd, vad, 0);
             if (!pass) {
                 vwi_count(imd, (long long)nv, cnts + (i - bb->first), 0);
-                if (i + 1 == bb->last) nn_d2h(hcnt, cnts, ns * 8);
                 continue;
             }
             if (vwt_forward(m, imd, vad, phd, nullptr, 0)) return 1;
