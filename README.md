@@ -313,7 +313,7 @@ theta = +pi edge; the wraps in order are one continuous sheet. The junction orde
 
 ```sh
 ufsm strip <wraps> <out> [--first K] [--last K] [--every E] [--err 0.25] [--threads 8]
-ufsm strip-flatten <strip-dir> [--out DIR] [--decim D] [--stride S] [--iters 30] [--cg 200] [--tol T] [--ostep S] [--stripe-px 60000] [--px-scale 1] [--flip-rows 1] [--max-edge 3] [--reuse 1] [--threads 16]
+ufsm strip-flatten <strip-dir> [--out DIR] [--decim D] [--stride S] [--iters 30] [--cg 200] [--tol T] [--ostep S] [--stripe-px 60000] [--px-scale 1] [--flip-rows 1] [--max-edge 3] [--reuse 1] [--threads 16] [--gpu 1] [--jobs J] [--stripe-jobs 3] [--chunks J0,J1]
 ufsm strip-mosaic <flat-dir> <render-dir> <out-dir> [--strip DIR] [--ct-level 80] [--overview-px 16000] [--rows 10] [--tile-cm 1] [--quality 88] [--stripes 1] [--threads 8]
 ufsm strip-crop <in.tif> <out.jpg> x,y,w,h [--stretch 1]
 ```
@@ -325,7 +325,13 @@ ufsm strip-crop <in.tif> <out.jpg> x,y,w,h [--stretch 1]
   Output `<strip>/flat`: `flat.json`, `stripes.tsv`, `stripes/wsNNN` (tifxyz + `gu.tif` / `gv.tif`, each at most
   `--stripe-px` pixels at render `--scale --px-scale`, under the JPEG limit), `chunks.tsv`, `segments.tsv`, `flatten.txt`.
   `--flip-rows` defaults to 0; Paris 4 needs 1 to read upright. Paris 4: 1757 cm x 20.6 cm, aniso p50/p95 1.053/1.166,
-  flips 0.0045% of the area, 2.6 h at `--decim 4`.
+  flips 0.0045% of the area, 2.6 h at `--decim 4` (CPU).
+- Speed: `--gpu 1` (default when a device answers) runs each chunk's SLIM iterations on the GPU (`flatten --gpu`, fp64,
+  deterministic); `--jobs J` chunks run at once (default 3 per GPU, device = job % devices, `--threads / J` CPU threads each)
+  and are blended strictly in chunk order, so the lattice does not depend on J. `--stripe-jobs` (3) writes stripes
+  concurrently (stripes.tsv rows in order). `--chunks J0,J1`: a benchmark of those chunks only (stats over their span, no
+  stripes). Desk (2x RTX 5060 Ti): Paris 4 chunk 8.5 s alone vs 88-97 s CPU, 2.5 s per chunk at `--jobs 6`; Paris 3
+  (254 chunks, decim 2 on step 8) 605 s for the chunks, 705 s in all. The GPUs (fp64) are then the limit, not the cores.
 - Render each stripe dir alone (`render` takes a directory: link one stripe into its own dir, as `strip_run.sh` does).
 - `strip-mosaic`: global contrast stretch over all stripes, then `<out>/wsNNN_ct_ink.jpg` (CT over ink; `--stripes 0`: none),
   `overview.jpg` (the length folded into `--rows` rows, with an on-papyrus bar: green on, red off, 10 cm ticks),

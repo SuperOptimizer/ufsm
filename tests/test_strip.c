@@ -71,6 +71,32 @@ int main(void) {
     snprintf(p, sizeof p, "%s/strip/flat/stripes.tsv", root); f = fopen(p, "r"); double area = 0;
     if (f) { char line[1024]; if (fgets(line, sizeof line, f)) while (fgets(line, sizeof line, f)) { char nm[64]; int a, c, d; double u0, l, v; if (sscanf(line, "%63s %d %d %d %lf %lf %lf", nm, &a, &c, &d, &u0, &l, &v) == 7) area += v; } fclose(f); }
     { const double A = Lcm * (Hcm + step * um * 1e-4); CHECK(fabs(area - A) < 0.03 * A, "stripes valid area %.4f vs %.4f cm2", area, A); }
+    /* --jobs / --stripe-jobs: chunks and stripes on concurrent workers, in order: --jobs 3 (1 thread each) writes the bytes of --jobs 1 --threads 1
+       (CPU: the SLIM sums depend on the threads per chunk; GPU: on nothing); chunks.tsv equal but for its seconds column */
+    {
+        const char *jv[2] = {"1", "3"};
+        for (int k = 0; k < 2; k++) {
+            char a1[300], a2[300]; snprintf(a1, sizeof a1, "%s/strip", root); snprintf(a2, sizeof a2, "%s/fj%s", root, jv[k]);
+            char *av[] = {"ufsm", "strip-flatten", a1, "--out", a2, "--stride", "96", "--threads", (char *)jv[k], "--jobs", (char *)jv[k], "--stripe-jobs", (char *)jv[k], "--stripe-px", "1500", "--iters", "60", "--cg", "300", "--tol", "1e-9"};
+            CHECK(!cmd_strip_flatten(22, av), "strip-flatten --jobs %s failed", jv[k]);
+        }
+        char cmd[2048];
+        snprintf(cmd, sizeof cmd, "cd %s/fj1 && test -e flat.json && for x in $(find . -type f ! -name chunks.tsv); do cmp -s $x ../fj3/$x || { echo $x differs; exit 1; }; done && "
+                 "cut -f1-10 chunks.tsv > ../c1 && cut -f1-10 ../fj3/chunks.tsv > ../c3 && cmp -s ../c1 ../c3", root);
+        CHECK(!system(cmd), "strip-flatten --jobs 3 output differs from --jobs 1");
+#ifdef STRIP_GPU
+        {   /* GPU vs CPU: the same flattening within the solvers' summation-order noise */
+            char a1[300], a2[300]; snprintf(a1, sizeof a1, "%s/strip", root); snprintf(a2, sizeof a2, "%s/fcpu", root);
+            char *av[] = {"ufsm", "strip-flatten", a1, "--out", a2, "--stride", "96", "--threads", "4", "--gpu", "0", "--stripe-px", "1500", "--iters", "60", "--cg", "300", "--tol", "1e-9"};
+            CHECK(!cmd_strip_flatten(20, av), "strip-flatten --gpu 0 failed");
+            char q[400], c[4096] = {0}; snprintf(q, sizeof q, "%s/fcpu/flat.json", root); FILE *g = fopen(q, "r");
+            if (g) { size_t nr = fread(c, 1, sizeof c - 1, g); (void)nr; fclose(g); }
+            const double l2 = num(c, "\"length_cm\": "), b50 = num(c, "\"aniso_p50\": "), b95 = num(c, "\"aniso_p95\": ");
+            printf("strip GPU vs CPU: length %.5f / %.5f cm, aniso p50 %.5f / %.5f, p95 %.5f / %.5f\n", len, l2, a50, b50, a95, b95);
+            CHECK(fabs(len - l2) < 1e-4 * l2 && fabs(a50 - b50) < 1e-3 && fabs(a95 - b95) < 1e-3, "GPU vs CPU flattening differs");
+        }
+#endif
+    }
     /* strip-mosaic on synthetic renders of the stripes: --threads 1 and --threads 4 must write the same bytes */
     {
         char rdir[400]; snprintf(rdir, sizeof rdir, "%s/render", root); snprintf(cmd, sizeof cmd, "mkdir -p %s", rdir); if (system(cmd)) {}

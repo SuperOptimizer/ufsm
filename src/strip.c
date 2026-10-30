@@ -53,6 +53,18 @@ static const char *sopt(int argc, char **argv, const char *name, const char *def
 static double meta_num(const char *m, const char *key, double def) { const char *q = m ? strstr(m, key) : nullptr; if (!q) return def; q += strlen(key); while (*q == ' ' || *q == ':' || *q == '[' || *q == '"') q++; return atof(q); }
 static int cmp_f32(const void *a, const void *b) { const float x = *(const float *)a, y = *(const float *)b; return x < y ? -1 : x > y; }
 static float median_f32(float *v, int n) { if (n <= 0) return NAN; qsort(v, (size_t)n, 4, cmp_f32); return v[n / 2]; }
+/* the same value as median_f32 (the n / 2-th order statistic) by quickselect, v reordered; values must not be NaN */
+static float select_f32(float *v, int n) {
+    if (n <= 0) return NAN;
+    int lo = 0, hi = n - 1; const int k = n / 2;
+    while (lo < hi) {
+        const float a = v[lo], b = v[(lo + hi) / 2], c = v[hi], piv = a < b ? (b < c ? b : a < c ? c : a) : (a < c ? a : b < c ? c : b);
+        int i = lo, j = hi;
+        while (i <= j) { while (v[i] < piv) i++; while (v[j] > piv) j--; if (i <= j) { const float t = v[i]; v[i] = v[j]; v[j] = t; i++; j--; } }
+        if (k <= j) hi = j; else if (k >= i) lo = i; else break;
+    }
+    return v[k];
+}
 
 /* ---- a static parallel for ---- */
 typedef void (*sp_fn)(void *ctx, long lo, long hi);
@@ -325,7 +337,7 @@ static void k_colpitch(void *ctx, long lo, long hi) {
             const size_t i = (size_t)r * J->nc + c; if (J->Z[i] < 0 || J->Z[i + 1] < 0) continue;
             const double dx = J->X[i + 1] - J->X[i], dy = J->Y[i + 1] - J->Y[i], dz = J->Z[i + 1] - J->Z[i]; buf[n++] = (float)sqrt(dx * dx + dy * dy + dz * dz);
         }
-        J->med[c] = n >= 1 ? median_f32(buf, n) : NAN;
+        J->med[c] = n >= 1 ? select_f32(buf, n) : NAN;
     }
     free(buf);
 }
@@ -444,8 +456,105 @@ static void k_rast(void *ctx, long lo, long hi) {
     }
 }
 
+/* strip-flatten's chunks on worker threads: chunk j = columns [j S - S, j S + S] (full height), SLIM-flattened and aligned onto T, then its
+   hat-weighted uv added to the lattice (in chunk order: the float sums do not depend on the worker count) */
+typedef struct {
+    sflat *F; int nchunk, S, nth, ngpu, iters, cg, verbose; double tol; FILE *cf;
+    pthread_mutex_t mu; pthread_cond_t cv; int j0, commit; _Atomic int fail; int j1; _Atomic int next;
+} sf_ctx;
+typedef struct { sf_ctx *X; int w; } sf_warg;
+static void *sf_worker(void *arg) {
+    sf_warg *A = arg; sf_ctx *X = A->X; sflat *F = X->F; const int S = X->S;
+    for (int j; (j = atomic_fetch_add(&X->next, 1)) <= X->j1;) {
+        const double tc = snow();
+        const int C = j * S, a = C - S < 0 ? 0 : C - S, b = C + S > F->w - 1 ? F->w - 1 : C + S, nc = b - a + 1;
+        flat_mesh m; memset(&m, 0, sizeof m); flat_stats sb, sa; int have = 0;
+        if (nc >= 4 && !atomic_load(&X->fail)) {
+            const size_t n = (size_t)nc * F->h; float *Xs = malloc(n * 4), *Ys = malloc(n * 4), *Zs = malloc(n * 4);
+            if (!Xs || !Ys || !Zs || st_read(&F->S, a, nc, X->nth, Xs, Ys, Zs)) atomic_store(&X->fail, 1);
+            else {
+                flat_opts o = flat_opts_default(); o.decim = F->D; o.iters = X->iters; o.cg_iters = X->cg; o.nthreads = X->nth; o.max_edge = F->max_edge;
+                o.all_components = 1; o.verbose = X->verbose; o.tol = X->tol; o.gpu = X->ngpu > 0; o.gpu_dev = X->ngpu > 0 ? A->w % X->ngpu : -1;
+                double *cu = malloc((size_t)nc * 8); for (int c = 0; c < nc; c++) cu[c] = T_u(F, a + c) - T_u(F, a); o.col_u = cu;   /* SLIM from the frame */
+                if (flat_grid(Xs, Ys, Zs, nc, F->h, F->step, &o, &m, &sb, &sa)) fprintf(stderr, "strip-flatten: chunk %d (columns %d..%d): no mesh\n", j, a, b);
+                else { align_components(F, &m, a, nc); have = 1; }
+                free(cu);
+            }
+            free(Xs); free(Ys); free(Zs);
+        }
+        const double sec = snow() - tc;
+        pthread_mutex_lock(&X->mu);
+        while (X->commit != j) pthread_cond_wait(&X->cv, &X->mu);
+        if (have) {
+            for (int v = 0; v < m.nv; v++) {
+                const int g = m.gi[v], c = g % nc, r = g / nc, gc = a + c; if (gc % F->D || r % F->D) continue;
+                const double wgt = fmax(0, 1 - fabs((double)gc - C) / S); if (!(wgt > 0)) continue;
+                const size_t li = (size_t)(r / F->D) * F->lw + gc / F->D;
+                F->du[li] += (float)(wgt * (m.uv[2 * v] - T_u(F, gc))); F->dv[li] += (float)(wgt * (m.uv[2 * v + 1] - T_v(F, r))); F->wt[li] += (float)wgt;
+            }
+            fprintf(stderr, "strip-flatten: chunk %d/%d columns %d..%d: %d vertices %d triangles, aniso p50/p95 %.3f/%.3f -> %.3f/%.3f, flips %lld, %.1fs\n",
+                    j + 1, X->nchunk, a, b, m.nv, m.nt, sb.aniso_p50, sb.aniso_p95, sa.aniso_p50, sa.aniso_p95, sa.flips, sec);
+            if (X->cf) { fprintf(X->cf, "%d\t%d\t%d\t%d\t%d\t%.4f\t%.4f\t%.4f\t%.4f\t%lld\t%.1f\n", j, a, nc, m.nv, m.nt, sb.aniso_p50, sb.aniso_p95, sa.aniso_p50, sa.aniso_p95, sa.flips, sec); fflush(X->cf); }
+        }
+        X->commit = j + 1; pthread_cond_broadcast(&X->cv);
+        pthread_mutex_unlock(&X->mu);
+        if (have) flat_mesh_free(&m);
+    }
+    return nullptr;
+}
+
+/* strip-flatten's output stripes on worker threads: stripe s = output columns [s (SW - 1), + SW) rasterised from the blended lattice, written
+   as a tifxyz + gu / gv; stripes.tsv rows appended in stripe order */
+typedef struct {
+    const sflat *F; const char *od; FILE *sf; const st_seg *segs; int nseg, SW, OW, OH, nstripe, nth, flip; double umin, vmin, ostep, um;
+    const float *cumin, *cumax; pthread_mutex_t mu; pthread_cond_t cv; int commit; long long nval; _Atomic int next, fail;
+} ss_ctx;
+static void *ss_worker(void *arg) {
+    ss_ctx *Q = arg; const sflat *F = Q->F; const int SW = Q->SW, OW = Q->OW, OH = Q->OH; const double ostep = Q->ostep, um = Q->um;
+    for (int s; (s = atomic_fetch_add(&Q->next, 1)) < Q->nstripe;) {
+        const double ts = snow(); char row[512] = ""; long long nv = 0;
+        const int oc0 = s * (SW - 1), ow = oc0 + SW <= OW ? SW : OW - oc0; const double u0 = Q->umin + oc0 * ostep, u1 = u0 + (ow - 1) * ostep;
+        int la = F->lw, lb = -1;
+        for (int j = 0; j < F->lw; j++) if (Q->cumax[j] >= u0 - 4 * ostep && Q->cumin[j] <= u1 + 4 * ostep) { if (j < la) la = j; if (j > lb) lb = j; }
+        if (lb >= la && !atomic_load(&Q->fail)) {
+            la = la > 0 ? la - 1 : 0; lb = lb + 2 < F->lw ? lb + 2 : F->lw;   /* [la, lb): the quads' left columns */
+            const int c0 = la * F->D, c1 = ((lb - 1) * F->D + F->D < F->w - 1 ? (lb - 1) * F->D + F->D : F->w - 1), nc = c1 - c0 + 1;
+            const size_t n = (size_t)nc * F->h, on = (size_t)ow * OH; float *X = malloc(n * 4), *Y = malloc(n * 4), *Z = malloc(n * 4), *A[5] = {0}; int ok = X && Y && Z;
+            for (int k = 0; k < 5 && ok; k++) { A[k] = malloc(on * 4); if (!A[k]) ok = 0; else for (size_t i = 0; i < on; i++) A[k][i] = -1.f; }
+            if (!ok || st_read((st_strip *)&F->S, c0, nc, Q->nth, X, Y, Z)) ok = 0;
+            if (ok) {
+                rsj R = {F, X, Y, Z, c0, nc, la, lb, u0, Q->vmin, ostep, ow, OH, A[0], A[1], A[2], A[3], A[4]};
+                spfor((long)(lb - la) * (F->lh - 1), Q->nth, k_rast, &R);
+            }
+            free(X); free(Y); free(Z);
+            if (ok) {
+                double gmin = INFINITY, gmax = -INFINITY;
+                for (size_t i = 0; i < on; i++) if (A[4][i] >= 0) { nv++; if (A[0][i] < gmin) gmin = A[0][i]; if (A[0][i] > gmax) gmax = A[0][i]; }
+                if (Q->flip) for (int k = 0; k < 5; k++) for (int y = 0; y < OH / 2; y++) { float *ra = A[k] + (size_t)y * ow, *rb = A[k] + (size_t)(OH - 1 - y) * ow;
+                    for (int x = 0; x < ow; x++) { const float t = ra[x]; ra[x] = rb[x]; rb[x] = t; } }
+                char sn[64], dd[1500], p[1600]; snprintf(sn, sizeof sn, "ws%03d", s); snprintf(dd, sizeof dd, "%s/stripes/%s", Q->od, sn);
+                if (tifxyz_write(dd, ow, OH, A[2], A[3], A[4], ostep, um, -1, "ufsm strip-flatten (whole-scroll strip: chunk SLIM blended, isometric uv grid)")) { fprintf(stderr, "strip-flatten: cannot write %s\n", dd); ok = 0; }
+                snprintf(p, sizeof p, "%s/gu.tif", dd); if (ok && tiffw_write(p, ow, OH, 3, A[0], 1)) ok = 0;
+                snprintf(p, sizeof p, "%s/gv.tif", dd); if (ok && tiffw_write(p, ow, OH, 3, A[1], 1)) ok = 0;
+                const double vcm2 = nv * ostep * ostep * um * um * 1e-8;
+                snprintf(row, sizeof row, "%s\t%d\t%d\t%d\t%.3f\t%.3f\t%.3f\t%.0f\t%.0f\t%d\t%d\n", sn, oc0, ow, OH, oc0 * ostep * um * 1e-4, (ow - 1) * ostep * um * 1e-4, vcm2, gmin, gmax,
+                         Q->nseg > 0 && nv ? seg_wrap(Q->segs, Q->nseg, gmin) : -1, Q->nseg > 0 && nv ? seg_wrap(Q->segs, Q->nseg, gmax) : -1);
+                if (ok) fprintf(stderr, "strip-flatten: stripe %s %d x %d (u %.1f..%.1f cm), %.2f cm2 valid, strip columns %.0f..%.0f, %.1fs\n", sn, ow, OH, oc0 * ostep * um * 1e-4, (oc0 + ow - 1) * ostep * um * 1e-4, vcm2, gmin, gmax, snow() - ts);
+            }
+            for (int k = 0; k < 5; k++) free(A[k]);
+            if (!ok) atomic_store(&Q->fail, 1);
+        }
+        pthread_mutex_lock(&Q->mu);
+        while (Q->commit != s) pthread_cond_wait(&Q->cv, &Q->mu);
+        if (*row && Q->sf) { fputs(row, Q->sf); fflush(Q->sf); }
+        Q->nval += nv; Q->commit = s + 1; pthread_cond_broadcast(&Q->cv);
+        pthread_mutex_unlock(&Q->mu);
+    }
+    return nullptr;
+}
+
 int cmd_strip_flatten(int argc, char **argv) {
-    if (argc < 3) { fprintf(stderr, "usage: ufsm strip-flatten <strip-dir> [--out DIR] [--decim D] [--stride S] [--iters 30] [--cg 200] [--threads 16] [--ostep S] [--stripe-px 60000] [--px-scale 1] [--flip-rows 1] [--max-edge 3] [--reuse 1]\n"); return 2; }
+    if (argc < 3) { fprintf(stderr, "usage: ufsm strip-flatten <strip-dir> [--out DIR] [--decim D] [--stride S] [--iters 30] [--cg 200] [--threads 16] [--ostep S] [--stripe-px 60000] [--px-scale 1] [--flip-rows 1] [--max-edge 3] [--reuse 1] [--gpu 1] [--jobs J] [--stripe-jobs 3] [--chunks J0,J1]\n"); return 2; }
     const char *sd = argv[2]; char od[1400]; snprintf(od, sizeof od, "%s", sopt(argc, argv, "--out", "")); if (!*od) snprintf(od, sizeof od, "%s/flat", sd);
     sflat F; memset(&F, 0, sizeof F);
     if (st_open(sd, &F.S)) return 1;
@@ -486,30 +595,27 @@ int cmd_strip_flatten(int argc, char **argv) {
         fprintf(stderr, "strip-flatten: %s %s\n", lp, reused ? "reused" : "not readable: recomputing");
     }
     const int nchunk = (F.w - 1 + S - 1) / S + 1;
+    int j0 = 0, j1 = nchunk - 1; sscanf(sopt(argc, argv, "--chunks", ""), "%d,%d", &j0, &j1);   /* (a benchmark: only these chunks, stats over their span) */
+    if (j0 < 0) j0 = 0;
+    if (j1 > nchunk - 1) j1 = nchunk - 1;
+    const int sub = j0 > 0 || j1 < nchunk - 1;
     snprintf(p, sizeof p, "%s/chunks.tsv", od); FILE *cf = reused ? nullptr : fopen(p, "w");
     if (cf) fprintf(cf, "chunk\tcol0\tncols\tverts\ttris\tbefore_aniso_p50\tbefore_aniso_p95\tafter_aniso_p50\tafter_aniso_p95\tflips\tseconds\n");
-    for (int j = 0; j < nchunk && !reused; j++) {
-        const double tc = snow();
-        const int C = j * S, a = C - S < 0 ? 0 : C - S, b = C + S > F.w - 1 ? F.w - 1 : C + S, nc = b - a + 1;
-        if (nc < 4) continue;
-        const size_t n = (size_t)nc * F.h; float *X = malloc(n * 4), *Y = malloc(n * 4), *Z = malloc(n * 4);
-        if (!X || !Y || !Z || st_read(&F.S, a, nc, nth, X, Y, Z)) { fprintf(stderr, "strip-flatten: read failed\n"); return 1; }
-        flat_opts o = flat_opts_default(); o.decim = F.D; o.iters = atoi(sopt(argc, argv, "--iters", "30")); o.cg_iters = atoi(sopt(argc, argv, "--cg", "200"));
-        o.nthreads = nth; o.max_edge = F.max_edge; o.all_components = 1; o.verbose = atoi(sopt(argc, argv, "--verbose", "0")); o.tol = atof(sopt(argc, argv, "--tol", "1e-5"));
-        double *cu = malloc((size_t)nc * 8); for (int c = 0; c < nc; c++) cu[c] = T_u(&F, a + c) - T_u(&F, a); o.col_u = cu;   /* SLIM from the frame */
-        flat_mesh m; memset(&m, 0, sizeof m); flat_stats sb, sa;
-        if (flat_grid(X, Y, Z, nc, F.h, F.step, &o, &m, &sb, &sa)) { fprintf(stderr, "strip-flatten: chunk %d (columns %d..%d): no mesh\n", j, a, b); free(X); free(Y); free(Z); free(cu); continue; }
-        align_components(&F, &m, a, nc);
-        for (int v = 0; v < m.nv; v++) {
-            const int g = m.gi[v], c = g % nc, r = g / nc, gc = a + c; if (gc % F.D || r % F.D) continue;
-            const double wgt = fmax(0, 1 - fabs((double)gc - C) / S); if (!(wgt > 0)) continue;
-            const size_t li = (size_t)(r / F.D) * F.lw + gc / F.D;
-            F.du[li] += (float)(wgt * (m.uv[2 * v] - T_u(&F, gc))); F.dv[li] += (float)(wgt * (m.uv[2 * v + 1] - T_v(&F, r))); F.wt[li] += (float)wgt;
-        }
-        fprintf(stderr, "strip-flatten: chunk %d/%d columns %d..%d: %d vertices %d triangles, aniso p50/p95 %.3f/%.3f -> %.3f/%.3f, flips %lld, %.1fs\n",
-                j + 1, nchunk, a, b, m.nv, m.nt, sb.aniso_p50, sb.aniso_p95, sa.aniso_p50, sa.aniso_p95, sa.flips, snow() - tc);
-        if (cf) { fprintf(cf, "%d\t%d\t%d\t%d\t%d\t%.4f\t%.4f\t%.4f\t%.4f\t%lld\t%.1f\n", j, a, nc, m.nv, m.nt, sb.aniso_p50, sb.aniso_p95, sa.aniso_p50, sa.aniso_p95, sa.flips, snow() - tc); fflush(cf); }
-        flat_mesh_free(&m); free(X); free(Y); free(Z); free(cu);
+    if (!reused) {
+        /* chunks on --jobs workers (each --threads / jobs CPU threads; with --gpu 1 the SLIM iterations on device worker % devices), blended
+           into the lattice strictly in chunk order: the sums are the same whatever the job count */
+        const int ngpu = atoi(sopt(argc, argv, "--gpu", "1")) ? flat_gpu_devices() : 0;
+        int jobs = atoi(sopt(argc, argv, "--jobs", "0")); if (jobs <= 0) jobs = ngpu > 0 ? 3 * ngpu : 1;
+        if (jobs > 64) jobs = 64;
+        if (jobs > j1 - j0 + 1) jobs = j1 - j0 + 1 > 0 ? j1 - j0 + 1 : 1;
+        sf_ctx X = {&F, nchunk, S, nth / jobs > 0 ? nth / jobs : 1, ngpu, atoi(sopt(argc, argv, "--iters", "30")), atoi(sopt(argc, argv, "--cg", "200")),
+                    atoi(sopt(argc, argv, "--verbose", "0")), atof(sopt(argc, argv, "--tol", "1e-5")), cf, PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, j0, j0, 0, j1};
+        atomic_store(&X.next, j0);
+        fprintf(stderr, "strip-flatten: chunks %d..%d on %d jobs x %d threads, SLIM on %s\n", j0, j1, jobs, X.nth, ngpu ? "the GPU" : "the CPU");
+        pthread_t th[64]; sf_warg wa[64];
+        for (int k = 0; k < jobs; k++) { wa[k] = (sf_warg){&X, k}; pthread_create(&th[k], nullptr, sf_worker, &wa[k]); }
+        for (int k = 0; k < jobs; k++) pthread_join(th[k], nullptr);
+        if (atomic_load(&X.fail)) { fprintf(stderr, "strip-flatten: read failed\n"); return 1; }
     }
     if (cf) fclose(cf);
     if (!reused) {
@@ -530,8 +636,9 @@ int cmd_strip_flatten(int argc, char **argv) {
     }
     {
         const int lband = 4096;   /* lattice columns per read */
-        for (int l0 = 0; l0 < F.lw - 1; l0 += lband) {
-            const int l1 = l0 + lband < F.lw - 1 ? l0 + lband : F.lw - 1, c0 = l0 * F.D, c1 = (l1 * F.D < F.w - 1 ? l1 * F.D : F.w - 1), nc = c1 - c0 + 1;
+        const int la0 = sub ? (j0 * S - S > 0 ? (j0 * S - S) / F.D : 0) : 0, la1 = sub ? ((j1 * S + S) / F.D < F.lw - 1 ? (j1 * S + S) / F.D : F.lw - 1) : F.lw - 1;
+        for (int l0 = la0; l0 < la1; l0 += lband) {
+            const int l1 = l0 + lband < la1 ? l0 + lband : la1, c0 = l0 * F.D, c1 = (l1 * F.D < F.w - 1 ? l1 * F.D : F.w - 1), nc = c1 - c0 + 1;
             const size_t n = (size_t)nc * F.h; float *X = malloc(n * 4), *Y = malloc(n * 4), *Z = malloc(n * 4);
             if (!X || !Y || !Z || st_read(&F.S, c0, nc, nth, X, Y, Z)) { fprintf(stderr, "strip-flatten: read failed\n"); return 1; }
             lattice_stats(&F, X, Y, Z, c0, nc, l0, l1, before, after, sg, segl);
@@ -543,6 +650,8 @@ int cmd_strip_flatten(int argc, char **argv) {
     dstat_print(stdout, "strip-flatten: frame T (arc-length columns x z) ", before);
     dstat_print(stdout, "strip-flatten: flattened (chunk SLIM + blend)", after);
     fflush(stdout);
+    if (sub) { printf("strip-flatten: chunks %d..%d only (lattice columns %d..%d): no stripes, %.1fs\n", j0, j1, j0 * S / F.D, j1 * S / F.D, snow() - t0);
+               free(before); free(after); free(sg); free(cumin); free(cumax); free(F.U); free(F.du); free(F.dv); free(F.wt); free(segs); st_close(&F.S); return 0; }
     snprintf(p, sizeof p, "%s/segments.tsv", od); FILE *gf = fopen(p, "w");
     if (gf) {
         fprintf(gf, "seg\tcol0\tcol1\tu_cm\twrap0\twrap1\tarea_cm2\taniso_p50\taniso_p95\tflips\n");
@@ -560,35 +669,17 @@ int cmd_strip_flatten(int argc, char **argv) {
     snprintf(p, sizeof p, "%s/stripes.tsv", od); FILE *sf = fopen(p, "w");
     if (sf) fprintf(sf, "stripe\tout_col0\tout_cols\tout_rows\tu0_cm\tlength_cm\tvalid_cm2\tsrc_col0\tsrc_col1\twrap0\twrap1\n");
     long long nval_all = 0;
-    for (int s = 0; s < nstripe; s++) {
-        const double ts = snow();
-        const int oc0 = s * (SW - 1), ow = oc0 + SW <= OW ? SW : OW - oc0; const double u0 = umin + oc0 * ostep, u1 = u0 + (ow - 1) * ostep;
-        int la = F.lw, lb = -1;
-        for (int j = 0; j < F.lw; j++) if (cumax[j] >= u0 - 4 * ostep && cumin[j] <= u1 + 4 * ostep) { if (j < la) la = j; if (j > lb) lb = j; }
-        if (lb < la) continue;
-        la = la > 0 ? la - 1 : 0; lb = lb + 2 < F.lw ? lb + 2 : F.lw;   /* [la, lb): the quads' left columns */
-        const int c0 = la * F.D, c1 = ((lb - 1) * F.D + F.D < F.w - 1 ? (lb - 1) * F.D + F.D : F.w - 1), nc = c1 - c0 + 1;
-        const size_t n = (size_t)nc * F.h; float *X = malloc(n * 4), *Y = malloc(n * 4), *Z = malloc(n * 4);
-        if (!X || !Y || !Z || st_read(&F.S, c0, nc, nth, X, Y, Z)) { fprintf(stderr, "strip-flatten: read failed\n"); return 1; }
-        const size_t on = (size_t)ow * OH; float *A[5];
-        for (int k = 0; k < 5; k++) { A[k] = malloc(on * 4); if (!A[k]) { fprintf(stderr, "strip-flatten: out of memory\n"); return 1; } for (size_t i = 0; i < on; i++) A[k][i] = -1.f; }
-        rsj R = {&F, X, Y, Z, c0, nc, la, lb, u0, vmin, ostep, ow, OH, A[0], A[1], A[2], A[3], A[4]};
-        spfor((long)(lb - la) * (F.lh - 1), nth, k_rast, &R);
-        free(X); free(Y); free(Z);
-        long long nv = 0; double gmin = INFINITY, gmax = -INFINITY;
-        for (size_t i = 0; i < on; i++) if (A[4][i] >= 0) { nv++; if (A[0][i] < gmin) gmin = A[0][i]; if (A[0][i] > gmax) gmax = A[0][i]; }
-        nval_all += nv;
-        if (flip) for (int k = 0; k < 5; k++) for (int y = 0; y < OH / 2; y++) { float *ra = A[k] + (size_t)y * ow, *rb = A[k] + (size_t)(OH - 1 - y) * ow;
-            for (int x = 0; x < ow; x++) { const float t = ra[x]; ra[x] = rb[x]; rb[x] = t; } }
-        char sn[64]; snprintf(sn, sizeof sn, "ws%03d", s); char dd[1500]; snprintf(dd, sizeof dd, "%s/stripes/%s", od, sn);
-        if (tifxyz_write(dd, ow, OH, A[2], A[3], A[4], ostep, um, -1, "ufsm strip-flatten (whole-scroll strip: chunk SLIM blended, isometric uv grid)")) { fprintf(stderr, "strip-flatten: cannot write %s\n", dd); return 1; }
-        snprintf(p, sizeof p, "%s/gu.tif", dd); if (tiffw_write(p, ow, OH, 3, A[0], 1)) return 1;
-        snprintf(p, sizeof p, "%s/gv.tif", dd); if (tiffw_write(p, ow, OH, 3, A[1], 1)) return 1;
-        const double vcm2 = nv * ostep * ostep * um * um * 1e-8;
-        if (sf) { fprintf(sf, "%s\t%d\t%d\t%d\t%.3f\t%.3f\t%.3f\t%.0f\t%.0f\t%d\t%d\n", sn, oc0, ow, OH, oc0 * ostep * um * 1e-4, (ow - 1) * ostep * um * 1e-4, vcm2, gmin, gmax,
-                          nseg > 0 && nv ? seg_wrap(segs, nseg, gmin) : -1, nseg > 0 && nv ? seg_wrap(segs, nseg, gmax) : -1); fflush(sf); }
-        fprintf(stderr, "strip-flatten: stripe %s %d x %d (u %.1f..%.1f cm), %.2f cm2 valid, strip columns %.0f..%.0f, %.1fs\n", sn, ow, OH, oc0 * ostep * um * 1e-4, (oc0 + ow - 1) * ostep * um * 1e-4, vcm2, gmin, gmax, snow() - ts);
-        for (int k = 0; k < 5; k++) free(A[k]);
+    {   /* stripes on --stripe-jobs workers (each --threads / jobs threads), stripes.tsv rows in stripe order: the same files */
+        int sj = atoi(sopt(argc, argv, "--stripe-jobs", "3")); if (sj < 1) sj = 1;
+        if (sj > nstripe) sj = nstripe > 0 ? nstripe : 1;
+        if (sj > 64) sj = 64;
+        ss_ctx Q = {&F, od, sf, segs, nseg, SW, OW, OH, nstripe, nth / sj > 0 ? nth / sj : 1, flip, umin, vmin, ostep, um, cumin, cumax,
+                    PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, 0, 0, 0, 0};
+        pthread_t th[64];
+        for (int k = 0; k < sj; k++) pthread_create(&th[k], nullptr, ss_worker, &Q);
+        for (int k = 0; k < sj; k++) pthread_join(th[k], nullptr);
+        if (atomic_load(&Q.fail)) { fprintf(stderr, "strip-flatten: stripe output failed\n"); return 1; }
+        nval_all = Q.nval;
     }
     if (sf) fclose(sf);
     printf("strip-flatten: %d stripes of <= %d columns (%d px at render --scale %g), output grid %d x %d step %g, valid area %.2f cm2, %.1fs\n",

@@ -31,7 +31,7 @@ static void parfor(long n, int nt, pf_fn f, void *ctx) {
     for (int t = 1; t < nt; t++) pthread_join(th[t], nullptr);
 }
 
-flat_opts flat_opts_default(void) { return (flat_opts){30, 200, 16, 20000, 1, 3.0, 1e-5, 0}; }
+flat_opts flat_opts_default(void) { flat_opts o = {30, 200, 16, 20000, 1, 3.0, 1e-5, 0}; o.gpu_dev = -1; return o; }
 
 /* ---- per-triangle geometry: gradient coefficients g (6: g0, g1, g2 in the triangle's own 2D frame) and 3D area ---- */
 static int tri_frame(const double *p0, const double *p1, const double *p2, double g[6], double *area) {
@@ -252,11 +252,13 @@ static void slim_free(slim *S) {
 
 /* src/nn_flat.cu (weak: binaries without it, e.g. test_flatten, link CPU-only) */
 int flat_slim_gpu(const double *g, const double *A, const int *tri, int nt, const int *vo, const int *vl, int nv, double *x,
-                  int iters, int cg_iters, double tol, int verbose, const char *tag, double *Eout) __attribute__((weak));
+                  int iters, int cg_iters, double tol, int verbose, const char *tag, int dev, double *Eout) __attribute__((weak));
+int flat_gpu_count(void) __attribute__((weak));
+int flat_gpu_devices(void) { return flat_gpu_count ? flat_gpu_count() : 0; }
 
 /* SLIM iterations on S (S->x = the current uv, flip-free) */
 static double slim_run(slim *S, const flat_opts *o, int iters, const char *tag) {
-    if (o->gpu && flat_slim_gpu) { double E; if (!flat_slim_gpu(S->g, S->A, S->tri, S->nt, S->vo, S->vl, S->nv, S->x, iters, o->cg_iters, o->tol, o->verbose, tag, &E)) return E; }
+    if (o->gpu && flat_slim_gpu) { double E; if (!flat_slim_gpu(S->g, S->A, S->tri, S->nt, S->vo, S->vl, S->nv, S->x, iters, o->cg_iters, o->tol, o->verbose, tag, o->gpu_dev, &E)) return E; }
     double E = energy_at(S, S->x); const size_t n2 = (size_t)S->nv * 2;
     if (o->verbose) fprintf(stderr, "flatten: %s %d vertices %d triangles, energy %.5f\n", tag, S->nv, S->nt, E);
     if (!isfinite(E)) return E;
