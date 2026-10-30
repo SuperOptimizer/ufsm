@@ -256,6 +256,7 @@ typedef struct {
     int rgb[2], ctmin;                     /* rgb[0] >= 0: one agreement panel, R = B = ink rgb[0], G = ink rgb[1]; CT < ctmin dark grey */
     int cmap;                              /* 1: ink panels (k >= 1) through viridis after their table; CT < ctmin dark grey */
     int diff; float gain;                  /* with rgb: viridis(|ink rgb[0] - ink rgb[1]| * gain) instead of magenta/green */
+    int pap; float pgain;                  /* with rgb: papyrus look, CT through a brown-tan ramp, ink rgb[0] darkens it toward carbon black */
 } p3_job;
 typedef struct { uint8_t *buf; int *tag; int cap; size_t len; } p3ring;
 static void p3_full_row(p3_job *J, icstrip *c, int y, uint8_t *row) {   /* ink_panels' row y */
@@ -267,7 +268,14 @@ static void p3_full_row(p3_job *J, icstrip *c, int y, uint8_t *row) {   /* ink_p
         const uint8_t *La = J->lut[J->rgb[0]], *Lb = J->lut[J->rgb[1]];
         for (int x = 0; x < W; x++) {
             uint8_t *o = row + 3 * x;
-            if (!m[x] || m[x] < J->ctmin) { o[0] = o[1] = o[2] = 40; continue; }
+            if (!m[x] || m[x] < J->ctmin) { if (J->pap) { o[0] = 16; o[1] = 13; o[2] = 11; } else o[0] = o[1] = o[2] = 40; continue; }
+            if (J->pap) {   /* papyrus: CT -> dark brown .. warm tan, then carbon ink over it by its density */
+                static const float P[4][3] = {{58, 36, 20}, {128, 88, 52}, {196, 156, 104}, {236, 214, 170}};
+                const float t = (float)J->lut[0][m[x]] / 255.f * 3.f; const int i = t >= 3.f ? 2 : (int)t; const float f = t - i;
+                float d = (float)La[a[x]] / 255.f * J->pgain; d = d < .12f ? 0.f : d > .9f ? 1.f : (d - .12f) / .78f; d = d * d * (3.f - 2.f * d) * .92f;
+                for (int e = 0; e < 3; e++) { const float pv = P[i][e] + f * (P[i + 1][e] - P[i][e]), iv = e == 0 ? 26.f : e == 1 ? 22.f : 19.f; o[e] = (uint8_t)lroundf(pv * (1.f - d) + iv * d); }
+                continue;
+            }
             if (J->diff) {
                 const float d = fabsf((float)La[a[x]] - (float)Lb[b[x]]) * J->gain; const uint8_t *v = VIRIDIS[d > 255.f ? 255 : (int)lroundf(d)];
                 o[0] = v[0]; o[1] = v[1]; o[2] = v[2]; continue;
@@ -338,12 +346,14 @@ out:
 }
 /* panels first .. first + np - 1 -> RGB *ow x *oh (as ink_panels + img_fit_rgb) */
 static int g_cmap = 0, g_cmap_ctmin = 1;   /* --cmap viridis (cmd_ink_compare), its off-papyrus CT floor (--rgb-ct-min) */
-static int g_diff = 0; static float g_diff_gain = 1.f;   /* --diff-agree (cmd_ink_compare), --diff-gain */
+static int g_diff = 0; static float g_diff_gain = 1.f;
+   /* --diff-agree (cmd_ink_compare), --diff-gain */
+static int g_pap = 0; static float g_pap_gain = 1.f;   /* --papyrus INK (cmd_ink_compare), --papyrus-gain */
 static uint8_t *p3_panels(icx *X, int first, int np, uint8_t lut[NIMG][256], const char *const *lab, int half, int maxpx, int *owp, int *ohp, const int *rgb, int ctmin) {
     p3_job *J = calloc(1, sizeof *J); if (!J) return nullptr;
     J->X = X; J->np = np; J->first = first; memcpy(J->lut, lut, sizeof J->lut);
     J->rgb[0] = rgb ? rgb[0] : -1; J->rgb[1] = rgb ? rgb[1] : -1; J->ctmin = ctmin; J->cmap = g_cmap;
-    J->diff = g_diff; J->gain = g_diff_gain;
+    J->diff = g_diff; J->gain = g_diff_gain; J->pap = g_pap; J->pgain = g_pap_gain;
     if (g_cmap && !rgb) J->ctmin = g_cmap_ctmin;
     for (int p = 0; p < np; p++) J->lab[p] = lab ? lab[p] : nullptr;
     J->TW = np * X->W + 8 * (np - 1); J->H0 = X->H; J->sc = X->H / 200 > 1 ? X->H / 200 : 2;
@@ -487,7 +497,7 @@ int cmd_ink_compare(int argc, char **argv) {
     if (isct[0]) for (int v = 0; v < 256; v++) { const int u = lut[0][v]; float g = ((float)u - 40.f) * 2.2f; g = g < 0.f ? 0.f : g > 255.f ? 255.f : g; lut[0][v] = (uint8_t)g; }
     free(P);
     /* the outputs: OUT [options] of the first segment, then each "--then OUT2 [options]" (output options: --max-px, --quality, --full,
-       --cmap, --rgb-ct-min, --no-ct, --each/--each-suffix/--each-ct, --rgb-agree, --diff-agree, --diff-gain; the inputs, crop, statistics
+       --cmap, --rgb-ct-min, --no-ct, --each/--each-suffix/--each-ct, --rgb-agree, --diff-agree, --diff-gain, --papyrus, --papyrus-gain; the inputs, crop, statistics
        and contrast come from the first segment and are computed once). A panel image is made once and every --max-px size of it fitted
        in memory (img_fit_rgb: the bytes of the streamed fit). */
     {
@@ -508,10 +518,18 @@ int cmd_ink_compare(int argc, char **argv) {
             const int f0 = icflag(sc, sv, "--no-ct") && n > 1 ? 1 : 0;   /* --no-ct: ink panels only */
             /* the jobs of this segment: (first panel, panels, rgb pair or none, title, output) */
             enum { MJ = NIMG }; int jfirst[MJ], jnp[MJ], jrgb[MJ][2], nj = 0, jct = 0; const char *const *jlab[MJ]; char jout[MJ][1400], title[300] = ""; const char *tl[1] = {title};
-            g_diff = 0; g_diff_gain = 1.f;
+            g_diff = 0; g_diff_gain = 1.f; g_pap = 0; g_pap_gain = 1.f;
             if (each) {
                 const char *suf = icopt(sc, sv, "--each-suffix", ""); const int ect = icflag(sc, sv, "--each-ct");
                 for (int k = ect ? 0 : 1; k < n; k++) { snprintf(jout[nj], sizeof jout[nj], "%s%s%s.jpg", each, lab[k], suf); jfirst[nj] = k; jnp[nj] = 1; jrgb[nj][0] = -1; jlab[nj] = nullptr; nj++; }
+            } else if (icopt(sc, sv, "--papyrus", nullptr)) {   /* one panel: CT as papyrus (brown .. tan), the ink as carbon black by density */
+                const char *li = icopt(sc, sv, "--papyrus", ""); int ix = -1;
+                for (int k = 1; k < n; k++) if (!strcmp(lab[k], li)) ix = k;
+                if (ix < 0) { fprintf(stderr, "ink-compare: --papyrus INK (an --ink label)\n"); rc = 2; break; }
+                g_pap = 1; g_pap_gain = (float)atof(icopt(sc, sv, "--papyrus-gain", "1"));
+                title[0] = 0;
+                snprintf(jout[0], sizeof jout[0], "%s", out); jfirst[0] = 0; jnp[0] = 1; jrgb[0][0] = ix; jrgb[0][1] = ix; jlab[0] = nullptr; nj = 1;
+                jct = atoi(icopt(sc, sv, "--rgb-ct-min", "1"));
             } else if (icopt(sc, sv, "--rgb-agree", nullptr) || icopt(sc, sv, "--diff-agree", nullptr)) {   /* one panel: recto R + B (magenta), verso G, agreement white; --diff-agree: viridis |recto - verso| */
                 const char *pair = icopt(sc, sv, "--diff-agree", nullptr); g_diff = pair != nullptr;
                 if (!pair) pair = icopt(sc, sv, "--rgb-agree", "");
@@ -526,7 +544,7 @@ int cmd_ink_compare(int argc, char **argv) {
                 jct = atoi(icopt(sc, sv, "--rgb-ct-min", "1"));
             } else { snprintf(jout[0], sizeof jout[0], "%s", out); jfirst[0] = f0; jnp[0] = n - f0; jrgb[0][0] = -1; jlab[0] = lab + f0; nj = 1; }
             for (int q = 0; q < nj && !rc; q++) {
-                char key[512]; snprintf(key, sizeof key, "%d %d %d %d %d %d %d %d %.9g %d %s", jfirst[q], jnp[q], jrgb[q][0], jrgb[q][1], jct, g_cmap, g_cmap_ctmin, g_diff, (double)g_diff_gain, half, jlab[q] == tl ? title : jlab[q] ? "lab" : "-");
+                char key[512]; snprintf(key, sizeof key, "%d %d %d %d %d %d %d %d %.9g %d %.9g %d %s", jfirst[q], jnp[q], jrgb[q][0], jrgb[q][1], jct, g_cmap, g_cmap_ctmin, g_diff, (double)g_diff_gain, g_pap, (double)g_pap_gain, half, jlab[q] == tl ? title : jlab[q] ? "lab" : "-");
                 if (!cimg || strcmp(key, ckey)) {
                     free(cimg); cimg = p3_panels(&X, jfirst[q], jnp[q], lut, jlab[q], half, 0, &cw, &chh, jrgb[q][0] >= 0 ? jrgb[q] : nullptr, jct);
                     snprintf(ckey, sizeof ckey, "%s", key);

@@ -239,6 +239,21 @@ int main(void) {
         }
         CHECK(mean[1] > mean[0] + 3, "diff-agree: disagreement not brighter (%.1f vs %.1f)", mean[1], mean[0]);
     }
+    {   /* --papyrus: papyrus is warm (R > G > B); the ink darkens it */
+        char o[760], sv[760]; snprintf(o, sizeof o, "%s/p.jpg", dir); snprintf(sv, sizeof sv, "%s/p.txt", dir);
+        char *a[] = {"ufsm", "ink-compare", o, "--ct", cp, "--ink", ia, "--papyrus", "gamb", "--stretch", "--stretch-ct", "--full", "--threads", "2", nullptr};
+        CHECK(run(cmd_ink_compare, a, sv) == 0, "papyrus rc");
+        int w = 0, h = 0; uint8_t *j = jpeg_read_rgb(o, &w, &h); long warm = 0, nn = 0; double lum[2] = {0, 0}; long cnt[2] = {0, 0};
+        CHECK(j && w == W && h == H, "papyrus size %dx%d", w, h);
+        for (int y = 0; j && y < h; y++) for (int x = 0; x < w; x++) {
+            const uint8_t *q = j + ((size_t)y * w + x) * 3; if (q[0] < 24 && q[1] < 24 && q[2] < 24) continue;
+            nn++; if (q[0] >= q[1] && q[1] >= q[2]) warm++;
+            const int k = ink[(size_t)y * W + x] > 128; lum[k] += q[0] + q[1] + q[2]; cnt[k]++;
+        }
+        CHECK(nn > 0 && warm > nn * 9 / 10, "papyrus: %ld of %ld pixels warm", warm, nn);
+        if (cnt[0] && cnt[1]) CHECK(lum[1] / cnt[1] < lum[0] / cnt[0], "papyrus: inked pixels not darker");
+        free(j);
+    }
     {   /* jpeg-fit --div 2 in place: half per side, mean colour kept */
         char o[760], sv[760]; snprintf(o, sizeof o, "%s/d.jpg", dir); snprintf(sv, sizeof sv, "%s/f.txt", dir);
         int w0, h0; uint8_t *a = jpeg_read_rgb(o, &w0, &h0); double m0 = 0, m1 = 0;
