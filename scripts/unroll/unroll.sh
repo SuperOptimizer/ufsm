@@ -22,7 +22,7 @@
 # whose done marker exists is skipped; partial stages resume (predict --resume parts, slab claims, per-wrap outputs).
 # DRY=1: print the plan (commands) without running anything. Runs from a copy of these scripts in $O/bin (edits never touch a run).
 # Env: U (ufsm), UR, TH (20), FIELDGPUS ("0 1"), FITGPUS ("0 1"), INKGPU (1), INKCMD, REFCMD, CK, INKCK, INKNAME, MINMEM, PERWRAP,
-#   TAG (output dir suffix), FACES, SPAR (4 per-wrap jobs), CLEAN (1: fields + slab fits deleted once the wraps exist), STRIPARGS / ZR / BOX (override scrolls.tsv).
+#   TAG (output dir suffix), ITH / PTH (ink / fields predict threads), FACES, SPAR (4 per-wrap jobs), CLEAN (1: fields + slab fits deleted once the wraps exist), STRIPARGS / ZR / BOX (override scrolls.tsv).
 set -u
 S=${1:?usage: unroll.sh SCROLL}
 H=$(cd "$(dirname "$0")" && pwd)
@@ -131,14 +131,14 @@ ink() {
   local box cal bb bo; box=$([ "$DRY" = 1 ] && echo ${BOX:-BOX} || cat $O/box.txt)
   cal=$(echo $box | awk -F, '{ zc = $1 + int($4 / 2); z0 = zc - 1024; if (z0 < $1) z0 = $1; nz = 2048; if (nz > $4) nz = $4; printf "%d,%d,%d,%d,%d,%d", z0, $2, $3, nz, $5, $6 }')
   bb=$(echo $box | awk -F, '{ printf "%d,%d,%d,%d,%d,%d", $1 + 256, $2 + 256, $3 + 256, $4 - 256, $5 - 256, $6 - 256 }'); bo=$(echo $bb | cut -d, -f1-3)
-  local P="--um $UM --level $LV --shard 512 --window 640 --halo 64 --ema 1 --q 32 --threads 12 --gpu $INKGPU --occupancy 5"
+  local P="--um $UM --level $LV --shard 512 --window 640 --halo 64 --ema 1 --q 32 --threads ${ITH:-12} --gpu $INKGPU --occupancy 5"
   [ -s $O/ink/gn.bin ] || { X $O/logs/ink.log $U predict $INKCK $R $K $O/ink/gncal.zarr $P --box $cal --full-grid 1 --levels 1 --no-out 1 --gn-save $O/ink/gn.tmp &&
                              { [ "$DRY" = 1 ] || { mv $O/ink/gn.tmp $O/ink/gn.bin; rm -rf $O/ink/gncal.zarr; }; } || return 1; }
   X $O/logs/ink.log $U predict $INKCK $R $K $O/ink/a.zarr $P --box $box --full-grid 1 --resume 1 --levels 4 --gn-frozen $O/ink/gn.bin || return 1
   X $O/logs/ink.log $U predict $INKCK $R $K $O/ink/b.zarr $P --box $bb --resume 1 --levels 1 --gn-frozen $O/ink/gn.bin || return 1
   [ "$DRY" = 1 ] || rm -rf $INK
   X $O/logs/ink.log $U ink-blend $INK --um $LUM --tile 512,512,512 --grids 0,0,0:256,256,256 --origins 0,0,0:$bo --levels 4 --shard 512 --q 32 \
-    --threads 12 $O/ink/a.zarr $O/ink/b.zarr || return 1
+    --threads ${ITH:-12} $O/ink/a.zarr $O/ink/b.zarr || return 1
   [ "$DRY" = 1 ] || rm -rf $O/ink/a.zarr $O/ink/b.zarr
 }
 
