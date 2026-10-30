@@ -15,6 +15,7 @@
    A slab with < 1% labelled voxels is redrawn (up to 16 times). */
 #include "vwt.h"
 #include "vwt_aug.h"
+#include "zcache.h"
 int jpeg_write_rgb(const char *path, int w, int h, const uint8_t *rgb, int quality);   /* (imgops.h) */
 #include "json.h"
 #include "sources.h"
@@ -30,6 +31,7 @@ int jpeg_write_rgb(const char *path, int w, int h, const uint8_t *rgb, int quali
 typedef struct {
     char name[128]; z3 *ct, *ph, *sh; int lv, plv, psign, shlv; double l0s, um0; axis ax; int hasax; double weight;
     int64_t *chunks; int64_t nch, cgrid[3], csz[3];      /* stored GT chunks (outside holdouts) */
+    uint8_t *ok;                                         /* [cgrid]: 1 = drawable chunk (in chunks) */
     double (*box)[6]; int nbox;                          /* holdout boxes, CT voxels zyx */
     double (*seg)[6]; int nseg; double seg_r;            /* exclusion tubes, CT voxels zyx */
 } vws_src;
@@ -38,6 +40,8 @@ typedef struct { vws_sample s; int state; } vws_slot;   /* 0 free, 1 being fille
 struct vws {
     vws_src *S; int ns; double wsum; int T, L; float tilt; int train; unsigned seed; int has_shell;
     vws_slot *slot; int nslot; pthread_t *th; int nth; _Atomic int stop; _Atomic long long next_id;
+    zcache *zc; int burst, burst_r;   /* the shared decoded-chunk cache (UFSM_VWS_CACHE_GB, 4; 0 off); training draws in bursts of `burst` slabs near one
+                                anchor chunk (UFSM_VWS_BURST, 8; 1 off) so neighbouring slabs share decoded chunks */
     pthread_mutex_t mu; pthread_cond_t cv; int last;
 };
 
@@ -115,7 +119,7 @@ static int vws_seg_hit(const double (*seg)[6], const int *idx, int nidx, double 
 }
 
 /* ---- one slab ---- */
-typedef struct { uint8_t *ct, *gt, *shb; size_t ccap, gcap, scap; float *raw, *q, *kinc; size_t n; int *sidx; int nsidx; uint8_t *arena; } vws_work;
+typedef struct { int bsrc, bleft; int64_t bck; uint8_t *ct, *gt, *shb; size_t ccap, gcap, scap; float *raw, *q, *kinc; size_t n; int *sidx; int nsidx; uint8_t *arena; } vws_work;
 #define VWS_ARENA ((size_t)64 << 21)   /* the crush map's CT tile cache per worker (64 x 2 MiB) */
 typedef struct { crush_cache *cc; crush_layer L; } vws_ctu;
 static double vws_ct_xyz(void *ud, const double x[3]) { vws_ctu *u = ud; const double p[3] = {x[2], x[1], x[0]}; return crush_linear_at(u->cc, &u->L, p); }
@@ -135,13 +139,17 @@ static void vws_qbox(const float *q, size_t n, double lo[3], double hi[3]) {
 /* UFSM_VWS_PROF=1: per-stage wall time of vws_fill summed over the workers, printed by vws_close */
 enum { VP_FRAME, VP_AUGMAP, VP_LATTICE, VP_QBOX, VP_CT, VP_GT, VP_SAMPLE, VP_KINC, VP_UNWRAP, VP_PW, VP_INTENS, VP_N };
 static const char *vp_name[VP_N] = {"frame", "aug map", "aug lattice", "qbox+holdout", "CT read", "GT read", "sample", "exact k", "unwrap", "weights", "intensity"};
-static _Atomic long long vp_ns[VP_N], vp_slabs, vp_tries, vp_geo; static int vp_on = -1;
+enum { VR_HOLD, VR_EMPTY, VR_READ, VR_SHELL, VR_NLAB, VR_NC, VR_KEPT, VR_N };
+static const char *vr_name[VR_N] = {"holdout", "empty", "read", "shell", "labels", "components", "weights"};
+static _Atomic long long vp_ns[VP_N], vr_n[VR_N], vp_slabs, vp_tries, vp_geo; static int vp_on = -1;
+#define REJ(r) { if (vp_on) atomic_fetch_add(&vr_n[r], 1); continue; }
 static long long vp_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1000000000ll + t.tv_nsec; }
 #define VP(k) do { if (vp_on) { const long long t_ = vp_now(); atomic_fetch_add(&vp_ns[k], t_ - vp_t); vp_t = t_; } } while (0)
 static void vp_print(void) {
     if (vp_on <= 0 || !vp_slabs) return; double tot = 0; for (int k = 0; k < VP_N; k++) tot += vp_ns[k];
     fprintf(stderr, "vws prof: %lld slabs (%lld draws, %lld deformed), %.2f thread-s per slab:", vp_slabs, vp_tries, vp_geo, tot / 1e9 / vp_slabs);
-    for (int k = 0; k < VP_N; k++) fprintf(stderr, " %s %.3f", vp_name[k], vp_ns[k] / 1e9 / vp_slabs); fprintf(stderr, "\n");
+    for (int k = 0; k < VP_N; k++) fprintf(stderr, " %s %.3f", vp_name[k], vp_ns[k] / 1e9 / vp_slabs);
+    fprintf(stderr, "; rejected:"); for (int k = 0; k < VR_N; k++) fprintf(stderr, " %s %lld", vr_name[k], vr_n[k]); fprintf(stderr, "\n");
 }
 static int vws_fill(vws *V, uint64_t *rs, vws_work *w, vws_sample *out) {
     if (vp_on < 0) vp_on = getenv("UFSM_VWS_PROF") && atoi(getenv("UFSM_VWS_PROF")) > 0;
@@ -149,11 +157,25 @@ static int vws_fill(vws *V, uint64_t *rs, vws_work *w, vws_sample *out) {
     const int T = V->T, L = V->L; const size_t n = (size_t)T * T * L;
     for (int attempt = 0; attempt < 64; attempt++) {
         /* source by weight */
-        double r = vws_unif(rs) * V->wsum; int si = 0; for (; si < V->ns - 1; si++) { if (V->S[si].weight <= 1e-3) continue; r -= V->S[si].weight; if (r <= 0) break; }
-        while (V->S[si].weight <= 1e-3 || !V->S[si].nch) si = (si + 1) % V->ns;
+        int si = 0; int64_t ck = -1;
+        if (V->train && V->burst > 1 && w->bleft > 0) {   /* a burst: a drawable chunk within +-burst_r chunks of the anchor (UFSM_VWS_BURST_R, 0 = the anchor chunk; 8 tries) */
+            vws_src *B = &V->S[w->bsrc]; const int64_t az = w->bck / (B->cgrid[1] * B->cgrid[2]), ay = w->bck / B->cgrid[2] % B->cgrid[1], ax = w->bck % B->cgrid[2];
+            for (int t = 0; t < 8 && ck < 0; t++) {
+                const int64_t R = V->burst_r, D = 2 * R + 1;
+                const int64_t z = az + (int64_t)(vws_rng(rs) % (uint64_t)D) - R, y = ay + (int64_t)(vws_rng(rs) % (uint64_t)D) - R, x = ax + (int64_t)(vws_rng(rs) % (uint64_t)D) - R;
+                if (z < 0 || y < 0 || x < 0 || z >= B->cgrid[0] || y >= B->cgrid[1] || x >= B->cgrid[2]) continue;
+                const int64_t k = (z * B->cgrid[1] + y) * B->cgrid[2] + x; if (B->ok[k]) { ck = k; si = w->bsrc; }
+            }
+            w->bleft--;
+        }
+        if (ck < 0) {
+            double r = vws_unif(rs) * V->wsum; for (; si < V->ns - 1; si++) { if (V->S[si].weight <= 1e-3) continue; r -= V->S[si].weight; if (r <= 0) break; }
+            while (V->S[si].weight <= 1e-3 || !V->S[si].nch) si = (si + 1) % V->ns;
+            ck = V->S[si].chunks[vws_rng(rs) % (uint64_t)V->S[si].nch];
+            if (V->train && V->burst > 1) { w->bsrc = si; w->bck = ck; w->bleft = V->burst - 1; }
+        }
         vws_src *S = &V->S[si];
-        /* a random voxel of a random stored GT chunk (GT voxels zyx) -> CT voxels xyz */
-        const int64_t ck = S->chunks[vws_rng(rs) % (uint64_t)S->nch]; const int64_t cz = ck / (S->cgrid[1] * S->cgrid[2]), cy = ck / S->cgrid[2] % S->cgrid[1], cx = ck % S->cgrid[2];
+        /* a random voxel of the chosen stored GT chunk (GT voxels zyx) -> CT voxels xyz */ const int64_t cz = ck / (S->cgrid[1] * S->cgrid[2]), cy = ck / S->cgrid[2] % S->cgrid[1], cx = ck % S->cgrid[2];
         const double f = ldexp(1, S->plv - S->lv), fd = S->ph ? f : ldexp(1, S->shlv - S->lv);   /* CT voxels per GT / drawn-raster voxel */
         const double pz = (cz * S->csz[0] + vws_unif(rs) * S->csz[0]) * fd, py = (cy * S->csz[1] + vws_unif(rs) * S->csz[1]) * fd, px = (cx * S->csz[2] + vws_unif(rs) * S->csz[2]) * fd;
         double ay = 0, ax = 0; if (S->hasax) { axis_at(&S->ax, pz * S->l0s, &ay, &ax); ay /= S->l0s; ax /= S->l0s; }
@@ -169,6 +191,17 @@ static int vws_fill(vws *V, uint64_t *rs, vws_work *w, vws_sample *out) {
         /* the source lattice q (xyz); the geometric aug hook replaces it (src/vwt_aug.h): CT and labels are both read at q */
         if (vp_on) atomic_fetch_add(&vp_tries, 1);
         VP(VP_FRAME);
+        {   /* early holdout test on the undeformed slab's bbox (no I/O, no map yet): a slab touching a holdout there is dropped at once */
+            double lo0[3] = {1e300, 1e300, 1e300}, hi0[3] = {-1e300, -1e300, -1e300};
+            for (int c = 0; c < 8; c++) for (int e = 0; e < 3; e++) {
+                const double v = out->o[e] + (c & 1 ? T - 1 : 0) * out->a[e] + (c & 2 ? T - 1 : 0) * out->b[e] + (c & 4 ? L - 1 : 0) * out->d[e];
+                lo0[e] = fmin(lo0[e], v); hi0[e] = fmax(hi0[e], v);
+            }
+            int bad0 = 0;
+            for (int b = 0; b < S->nbox && !bad0; b++) { const double *B = S->box[b];
+                bad0 = hi0[2] >= B[0] && lo0[2] < B[0] + B[3] && hi0[1] >= B[1] && lo0[1] < B[1] + B[4] && hi0[0] >= B[2] && lo0[0] < B[2] + B[5]; }
+            if (bad0) REJ(VR_HOLD)
+        }
         vwa *ga = nullptr; int geo = 0; out->T = T; out->L = L;
         if (g_vwa_ok && V->train && g_vwa.on && g_vwa.geo_p > 0) {
             if (!w->arena) w->arena = malloc(VWS_ARENA);
@@ -193,15 +226,15 @@ static int vws_fill(vws *V, uint64_t *rs, vws_work *w, vws_sample *out) {
             const double *B = S->box[b];   /* zyx */
             bad = hi[2] >= B[0] && lo[2] < B[0] + B[3] && hi[1] >= B[1] && lo[1] < B[1] + B[4] && hi[0] >= B[2] && lo[0] < B[2] + B[5];
         }
-        if (bad) continue;
+        if (bad) REJ(VR_HOLD)
         VP(VP_QBOX);
         /* CT box (zyx) */
         const int64_t *Vs = z3_meta_of(S->ct)->shape; int64_t bo[3], bn[3]; int empty = 0;
         for (int e = 0; e < 3; e++) { const int x = 2 - e; int64_t a = (int64_t)floor(lo[x]) - 1, b = (int64_t)ceil(hi[x]) + 2; a = a < 0 ? 0 : a; b = b > Vs[e] ? Vs[e] : b; if (b - a < 2) { empty = 1; a = 0; b = 2; } bo[e] = a; bn[e] = b - a; }
-        if (empty) continue;
+        if (empty) REJ(VR_EMPTY)
         const size_t need = (size_t)bn[0] * bn[1] * bn[2];
         if (need > w->ccap) { free(w->ct); w->ct = malloc(need); w->ccap = need; if (!w->ct) return -1; }
-        if (z3_read(S->ct, bo, bn, w->ct, 1)) { fprintf(stderr, "vws: CT read failed (%s): %s\n", S->name, z3_error()); continue; }
+        if (zcache_read(V->zc, S->ct, bo, bn, w->ct)) { fprintf(stderr, "vws: CT read failed (%s): %s\n", S->name, z3_error()); REJ(VR_READ) }
         VP(VP_CT);
         /* GT box (zyx, GT voxels): nearest GT voxel of a CT point c: floor((c + 0.5) / f) */
         int64_t go[3] = {0, 0, 0}, gn[3] = {0, 0, 0};
@@ -210,7 +243,7 @@ static int vws_fill(vws *V, uint64_t *rs, vws_work *w, vws_sample *out) {
             for (int e = 0; e < 3; e++) { const int x = 2 - e; int64_t a = (int64_t)floor((lo[x] + 0.5) / f) - 1, b = (int64_t)floor((hi[x] + 0.5) / f) + 2; a = a < 0 ? 0 : a; b = b > G[e] ? G[e] : b; if (b <= a) { a = 0; b = 1; } go[e] = a; gn[e] = b - a; }
             const size_t gneed = (size_t)gn[0] * gn[1] * gn[2];
             if (gneed > w->gcap) { free(w->gt); w->gt = malloc(gneed); w->gcap = gneed; if (!w->gt) return -1; }
-            if (z3_read(S->ph, go, gn, w->gt, 1)) { fprintf(stderr, "vws: GT read failed (%s): %s\n", S->name, z3_error()); continue; }
+            if (zcache_read(V->zc, S->ph, go, gn, w->gt)) { fprintf(stderr, "vws: GT read failed (%s): %s\n", S->name, z3_error()); REJ(VR_READ) }
         }
         /* shell box (zyx, shell voxels), nearest as the GT */
         const double fs = ldexp(1, S->shlv - S->lv); int64_t so[3] = {0, 0, 0}, sn[3] = {0, 0, 0};
@@ -219,7 +252,7 @@ static int vws_fill(vws *V, uint64_t *rs, vws_work *w, vws_sample *out) {
             for (int e = 0; e < 3; e++) { const int x = 2 - e; int64_t a = (int64_t)floor((lo[x] + 0.5) / fs) - 1, b = (int64_t)floor((hi[x] + 0.5) / fs) + 2; a = a < 0 ? 0 : a; b = b > H[e] ? H[e] : b; if (b <= a) { a = 0; b = 1; } so[e] = a; sn[e] = b - a; }
             const size_t sneed = (size_t)sn[0] * sn[1] * sn[2];
             if (sneed > w->scap) { free(w->shb); w->shb = malloc(sneed); w->scap = sneed; if (!w->shb) return -1; }
-            if (z3_read(S->sh, so, sn, w->shb, 1)) { fprintf(stderr, "vws: shell read failed (%s): %s\n", S->name, z3_error()); continue; }
+            if (zcache_read(V->zc, S->sh, so, sn, w->shb)) { fprintf(stderr, "vws: shell read failed (%s): %s\n", S->name, z3_error()); REJ(VR_READ) }
         }
         VP(VP_GT);
         /* tubes near this slab */
@@ -264,12 +297,12 @@ static int vws_fill(vws *V, uint64_t *rs, vws_work *w, vws_sample *out) {
         }
         if (!S->ph) {   /* shell-only source: no phase target */
             size_t ns = 0; for (size_t v = 0; v < n; v++) { out->ph[v] = NAN; out->comp[v] = 0; out->pw[v] = 0; ns += out->shell[v]; }
-            if (ns < n / 2000) continue;
+            if (ns < n / 2000) REJ(VR_SHELL)
             if (g_vwa_ok && V->train) vwa_intensity(&g_vwa, vws_rng(rs), out->im, out->va, T, L);
             out->T = T; out->L = L; out->src = si; out->flags = inward;
             return 0;
         }
-        if (nlab < n / 100) continue;
+        if (nlab < n / 100) REJ(VR_NLAB)
         if (geo) {   /* deformed: exact k increments through the source GT along each q segment (substeps <= 0.5 voxel) */
             if (!w->kinc) { w->kinc = malloc(n * sizeof *w->kinc); if (!w->kinc) return -1; }
             for (size_t v = 0; v < n; v++) {
@@ -289,7 +322,7 @@ static int vws_fill(vws *V, uint64_t *rs, vws_work *w, vws_sample *out) {
             }
         }
         VP(VP_KINC);
-        const int nc = vws_unwrap_k(w->raw, geo ? w->kinc : nullptr, T, L, 64, out->ph, out->comp); if (nc <= 0) continue;
+        const int nc = vws_unwrap_k(w->raw, geo ? w->kinc : nullptr, T, L, 64, out->ph, out->comp); if (nc <= 0) REJ(VR_NC)
         VP(VP_UNWRAP);
         size_t kept = 0;
         for (size_t v = 0; v < n; v++) {
@@ -298,7 +331,7 @@ static int vws_fill(vws *V, uint64_t *rs, vws_work *w, vws_sample *out) {
             const float *qq = w->q + 3 * v; const double p[3] = {qq[2], qq[1], qq[0]};
             out->pw[v] = w->nsidx && vws_seg_hit(S->seg, w->sidx, w->nsidx, R * R, p) ? 0.f : 1.f; kept += out->pw[v] > 0;
         }
-        if (kept < n / 100) continue;
+        if (kept < n / 100) REJ(VR_KEPT)
         VP(VP_PW);
         if (g_vwa_ok && V->train) vwa_intensity(&g_vwa, vws_rng(rs), out->im, out->va, T, L);
         VP(VP_INTENS); if (vp_on) { atomic_fetch_add(&vp_slabs, 1); atomic_fetch_add(&vp_geo, geo); }
@@ -365,7 +398,7 @@ vws *vws_open(const char *sources_json, int T, int L, float tilt_deg, int nthrea
         S->ct = pyramid_open_level(store_open(root), ct, S->lv, S->um0, cache);
         S->ph = proot && pkey ? z3_open(store_open(proot), pkey, nullptr) : nullptr;
         S->sh = sroot && skey ? z3_open(store_open(sroot), skey, nullptr) : nullptr;
-        if (!S->ct || (proot && !S->ph) || (sroot && !S->sh)) { fprintf(stderr, "vws: %s: cannot open CT level %d, GT %s/%s or shells %s/%s: %s\n", S->name, S->lv, proot ? proot : "-", pkey ? pkey : "-", sroot ? sroot : "-", skey ? skey : "-", z3_error()); continue; }
+        if (!S->ct || (proot && !S->ph) || (sroot && !S->sh)) { fprintf(stderr, "vws: %s: cannot open CT level %d, GT %s/%s or shells %s/%s: %s\n", S->name, S->lv, proot ? proot : "-", pkey ? pkey : "-", sroot ? sroot : "-", skey ? skey : "-", z3_error()); REJ(VR_READ) }
         if (S->sh) V->has_shell = 1;
         const char *axp = json_str(json_get(e, "axis"), nullptr); S->hasax = axp && !axis_load(&S->ax, axp);
         if (!S->hasax) fprintf(stderr, "vws: %s: no axis (rays radial from the box centre line x = y = 0)\n", S->name);
@@ -429,7 +462,7 @@ vws *vws_open(const char *sources_json, int T, int L, float tilt_deg, int nthrea
                 if (!bits[k]) continue;
                 const double c[3] = {((double)(k / (S->cgrid[1] * S->cgrid[2])) + 0.5) * S->csz[0] * f, ((double)(k / S->cgrid[2] % S->cgrid[1]) + 0.5) * S->csz[1] * f, ((double)(k % S->cgrid[2]) + 0.5) * S->csz[2] * f};
                 int in = 0; for (int b = 0; b < S->nbox && !in; b++) { const double *B = S->box[b]; in = c[0] >= B[0] && c[0] < B[0] + B[3] && c[1] >= B[1] && c[1] < B[1] + B[4] && c[2] >= B[2] && c[2] < B[2] + B[5]; }
-                if (!in) S->chunks[kept++] = k;
+                if (!in) { S->chunks[kept++] = k; if (!S->ok) S->ok = calloc((size_t)ng, 1); if (S->ok) S->ok[k] = 1; }
             }
         }
         free(bits); S->nch = kept;
@@ -440,6 +473,11 @@ vws *vws_open(const char *sources_json, int T, int L, float tilt_deg, int nthrea
     json_free(J);
     if (!V->ns || V->wsum <= 0) { fprintf(stderr, "vws: no drawable source\n"); vws_close(V); return nullptr; }
     for (int s = 0; s < V->ns; s++) if (V->S[s].weight <= 0) V->S[s].weight = 0;
+    for (int s = 0; s < V->ns; s++) if (V->S[s].nch && !V->S[s].ok) { fprintf(stderr, "vws: out of memory\n"); return nullptr; }
+    {   const char *e = getenv("UFSM_VWS_CACHE_GB"); const double gb = e ? atof(e) : train ? 4 : 1; V->zc = gb > 0 ? zcache_open((size_t)(gb * 1e9)) : nullptr;
+        const char *b = getenv("UFSM_VWS_BURST"); V->burst = b ? atoi(b) : 8; if (V->burst < 1) V->burst = 1;
+        const char *br = getenv("UFSM_VWS_BURST_R"); V->burst_r = br ? atoi(br) : 0; if (V->burst_r < 0) V->burst_r = 0;
+        fprintf(stderr, "vws: chunk cache %.1f GB, training bursts of %d slabs\n", gb > 0 ? gb : 0., V->burst); }
     pthread_mutex_init(&V->mu, nullptr); pthread_cond_init(&V->cv, nullptr);
     V->nth = nthreads < 1 ? 1 : nthreads; V->nslot = V->nth + 2; V->slot = calloc(V->nslot, sizeof *V->slot);
     const size_t n = (size_t)T * T * L;
@@ -462,7 +500,8 @@ void vws_close(vws *V) {
         pthread_mutex_destroy(&V->mu); pthread_cond_destroy(&V->cv);
     }
     for (int s = 0; V->slot && s < V->nslot; s++) { vws_sample *o = &V->slot[s].s; free(o->im); free(o->va); free(o->ph); free(o->comp); free(o->pw); free(o->shell); }
-    for (int s = 0; s < V->ns; s++) { vws_src *S = &V->S[s]; if (S->ct) z3_close(S->ct); if (S->ph) z3_close(S->ph); if (S->sh) z3_close(S->sh); free(S->chunks); free(S->box); free(S->seg); }
+    for (int s = 0; s < V->ns; s++) { vws_src *S = &V->S[s]; if (S->ct) z3_close(S->ct); if (S->ph) z3_close(S->ph); if (S->sh) z3_close(S->sh); free(S->chunks); free(S->ok); free(S->box); free(S->seg); }
+    if (V->zc) { uint64_t h, m; size_t by; zcache_stats(V->zc, &h, &m, &by); if (vp_on > 0) fprintf(stderr, "vws: chunk cache %llu hits, %llu misses, %.2f GB held\n", (unsigned long long)h, (unsigned long long)m, by / 1e9); zcache_close(V->zc); }
     free(V->S); free(V->slot); free(V->th); free(V);
 }
 
