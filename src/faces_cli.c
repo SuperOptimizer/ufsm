@@ -26,6 +26,7 @@ static void fc_par(void *(*fn)(void *), void *J, int nt) {
 typedef struct {
     z3 *z; int64_t shape[3]; int cs[3]; int64_t g[3]; uint8_t **ch; uint32_t *stamp; _Atomic uint8_t *need; size_t nres, cap; uint32_t clock; int nt;
     size_t ndec;
+    _Atomic uint32_t *needm; uint32_t *have;   /* sub: per chunk the volcomp substreams (16 z x 32 y slabs) marked / decoded; nullptr: whole chunks */
 } fc_cache;
 static int fcc_init(fc_cache *c, z3 *z, int nt, double mb) {
     memset(c, 0, sizeof *c); const z3_meta *m = z3_meta_of(z); c->z = z; c->nt = nt < 1 ? 1 : nt;
@@ -35,10 +36,18 @@ static int fcc_init(fc_cache *c, z3 *z, int nt, double mb) {
     c->cap = (size_t)(mb * 1048576.0 / ((double)c->cs[0] * c->cs[1] * c->cs[2])); if (c->cap < 16) c->cap = 16;
     return c->ch && c->stamp && c->need ? 0 : -1;
 }
+/* the CT cache decodes only the volcomp substreams under the marked boxes (z3_read_sub; samples are only taken inside them, so the
+   values are those of whole chunks). UFSM_FACES_FULLDECODE=1: whole chunks */
+static int fcc_sub(fc_cache *c) {
+    if (getenv("UFSM_FACES_FULLDECODE") || c->cs[0] != 128 || c->cs[1] != 128 || c->cs[2] != 128) return 0;
+    const size_t ng = (size_t)c->g[0] * c->g[1] * c->g[2];
+    c->needm = calloc(ng, sizeof *c->needm); c->have = calloc(ng, sizeof *c->have);
+    return c->needm && c->have ? 0 : -1;
+}
 static void fcc_free(fc_cache *c) {
     const size_t ng = (size_t)c->g[0] * c->g[1] * c->g[2];
     for (size_t k = 0; c->ch && k < ng; k++) free(c->ch[k]);
-    free(c->ch); free((void *)c->need); free(c->stamp); memset(c, 0, sizeof *c);
+    free(c->ch); free((void *)c->need); free(c->stamp); free((void *)c->needm); free(c->have); memset(c, 0, sizeof *c);
 }
 static inline int fcc_voxel(const fc_cache *c, int64_t z, int64_t y, int64_t x) {   /* -1: outside / not decoded */
     if (z < 0 || y < 0 || x < 0 || z >= c->shape[0] || y >= c->shape[1] || x >= c->shape[2]) return -1;
@@ -56,46 +65,67 @@ static double fcc_sample(void *ctx, double z, double y, double x) {
 }
 static void fcc_mark(void *ctx, const double lo[3], const double hi[3]) {
     fc_cache *c = ctx; int64_t a[3], b[3];
+    int64_t va[3], vb[3];
     for (int d = 0; d < 3; d++) {
         a[d] = (int64_t)floor(lo[d]); b[d] = (int64_t)floor(hi[d]) + 1;
         if (a[d] < 0) a[d] = 0;
         if (b[d] > c->shape[d] - 1) b[d] = c->shape[d] - 1;
         if (b[d] < a[d]) return;
+        va[d] = a[d]; vb[d] = b[d];
         a[d] /= c->cs[d]; b[d] /= c->cs[d];
     }
-    for (int64_t z = a[0]; z <= b[0]; z++) for (int64_t y = a[1]; y <= b[1]; y++) for (int64_t x = a[2]; x <= b[2]; x++)
-        atomic_store_explicit(&c->need[((size_t)z * c->g[1] + y) * c->g[2] + x], 1, memory_order_relaxed);
+    for (int64_t z = a[0]; z <= b[0]; z++) for (int64_t y = a[1]; y <= b[1]; y++) {
+        uint32_t m = 0;
+        if (c->needm) {   /* the box's z / y voxels inside chunk row (z, y) -> substream bits */
+            int64_t za = va[0] - z * 128, ze = vb[0] - z * 128, ya = va[1] - y * 128, ye = vb[1] - y * 128;
+            za = za < 0 ? 0 : za; ze = ze > 127 ? 127 : ze; ya = ya < 0 ? 0 : ya; ye = ye > 127 ? 127 : ye;
+            for (int64_t bz = za >> 4; bz <= ze >> 4; bz++) for (int64_t by = ya >> 5; by <= ye >> 5; by++) m |= 1u << (bz * 4 + by);
+        }
+        for (int64_t x = a[2]; x <= b[2]; x++) {
+            const size_t k = ((size_t)z * c->g[1] + y) * c->g[2] + x;
+            if (c->needm && (atomic_load_explicit(&c->needm[k], memory_order_relaxed) & m) != m) atomic_fetch_or_explicit(&c->needm[k], m, memory_order_relaxed);
+            atomic_store_explicit(&c->need[k], 1, memory_order_relaxed);
+        }
+    }
 }
 typedef struct { fc_cache *c; const int64_t *todo; size_t n; _Atomic size_t next; _Atomic int err; } fcd_job;
 static void *fcc_decode(void *arg) {
-    fcd_job *J = arg; fc_cache *c = J->c;
+    fcd_job *J = arg; fc_cache *c = J->c; const size_t cv = (size_t)c->cs[0] * c->cs[1] * c->cs[2];
     for (size_t k; (k = atomic_fetch_add(&J->next, 1)) < J->n;) {
         const int64_t id = J->todo[k], cz = id / (c->g[1] * c->g[2]), cy = id / c->g[2] % c->g[1], cx = id % c->g[2];
         int64_t o[3] = {cz * c->cs[0], cy * c->cs[1], cx * c->cs[2]}, nn[3];
         for (int d = 0; d < 3; d++) nn[d] = o[d] + c->cs[d] <= c->shape[d] ? c->cs[d] : c->shape[d] - o[d];
-        uint8_t *b = calloc((size_t)c->cs[0] * c->cs[1] * c->cs[2], 1), *t = malloc((size_t)nn[0] * nn[1] * nn[2]);
-        if (!b || !t || z3_read(c->z, o, nn, t, 1)) { free(b); free(t); atomic_store(&J->err, 1); continue; }
-        for (int64_t z = 0; z < nn[0]; z++) for (int64_t y = 0; y < nn[1]; y++)
-            memcpy(b + ((size_t)z * c->cs[1] + y) * c->cs[2], t + ((size_t)z * nn[1] + y) * nn[2], nn[2]);
-        free(t); c->ch[id] = b;
+        const int whole = nn[0] == c->cs[0] && nn[1] == c->cs[1] && nn[2] == c->cs[2];
+        const uint32_t want = c->needm ? atomic_load(&c->needm[id]) & ~c->have[id] : 0;   /* 0: the whole chunk */
+        uint8_t *b = c->ch[id];
+        if (b && c->needm && !want) continue;
+        uint8_t *t = whole && !b ? (b = malloc(cv)) : malloc((size_t)nn[0] * nn[1] * nn[2]);
+        if (!t || (!whole && !b && !(b = calloc(cv, 1))) || z3_read_sub(c->z, o, nn, t, 1, want)) { if (t != b) free(t); if (!c->ch[id]) free(b); atomic_store(&J->err, 1); continue; }
+        if (t != b) {   /* edge chunk, or substreams added to a decoded chunk: copy (only the new substreams' rows) */
+            for (int64_t z = 0; z < nn[0]; z++) for (int64_t y = 0; y < nn[1]; y++)
+                if (!want || (want >> ((z >> 4) * 4 + (y >> 5)) & 1)) memcpy(b + ((size_t)z * c->cs[1] + y) * c->cs[2], t + ((size_t)z * nn[1] + y) * nn[2], nn[2]);
+            free(t);
+        }
+        if (c->needm) c->have[id] |= want ? want : 0xffffffffu;
+        c->ch[id] = b;
     }
     return nullptr;
 }
 static int fcc_fill(void *ctx) {
     fc_cache *c = ctx; const size_t ng = (size_t)c->g[0] * c->g[1] * c->g[2]; c->clock++;
-    int64_t *todo = nullptr; size_t nt = 0, cap = 0;
+    int64_t *todo = nullptr; size_t nt = 0, cap = 0, nnew = 0;
     for (size_t k = 0; k < ng; k++) if (c->need[k]) {
-        c->need[k] = 0; c->stamp[k] = c->clock; if (c->ch[k]) continue;
+        c->need[k] = 0; c->stamp[k] = c->clock; if (c->ch[k] && (!c->needm || !(atomic_load(&c->needm[k]) & ~c->have[k]))) continue;
         if (nt == cap) { cap = cap ? 2 * cap : 256; todo = realloc(todo, cap * sizeof *todo); }
-        todo[nt++] = (int64_t)k;
+        nnew += !c->ch[k]; todo[nt++] = (int64_t)k;
     }
     fcd_job J = {c, todo, nt, 0, 0}; fc_par(fcc_decode, &J, c->nt);
-    free(todo); c->nres += nt; c->ndec += nt;
+    free(todo); c->nres += nnew; c->ndec += nt;
     if (atomic_load(&J.err)) { fprintf(stderr, "faces: %s\n", z3_error()); return -1; }
     while (c->nres > c->cap) {   /* least recently needed first, never this band's */
         uint32_t old = c->clock; for (size_t k = 0; k < ng; k++) if (c->ch[k] && c->stamp[k] < old) old = c->stamp[k];
         if (old == c->clock) break;
-        for (size_t k = 0; k < ng && c->nres > c->cap; k++) if (c->ch[k] && c->stamp[k] == old) { free(c->ch[k]); c->ch[k] = nullptr; c->nres--; }
+        for (size_t k = 0; k < ng && c->nres > c->cap; k++) if (c->ch[k] && c->stamp[k] == old) { free(c->ch[k]); c->ch[k] = nullptr; c->nres--; if (c->needm) c->needm[k] = c->have[k] = 0; }
     }
     return 0;
 }
@@ -179,7 +209,7 @@ int cmd_faces(int argc, char **argv) {
     if (!(o.range > 2) || o.smooth > 20 || o.nthreads < 1) { fprintf(stderr, "faces: --range > 2 CT voxels, --smooth <= 20\n"); return 2; }
     const char *cache = fopt(argc, argv, "--cache", nullptr);
     z3 *cz = z3_open(store_open(argv[ci + 1]), argv[ci + 2], cache); if (!cz) { fprintf(stderr, "faces: %s\n", z3_error()); return 1; }
-    fc_cache cc; if (fcc_init(&cc, cz, o.nthreads, cache_mb)) { fprintf(stderr, "faces: out of memory\n"); return 1; }
+    fc_cache cc; if (fcc_init(&cc, cz, o.nthreads, cache_mb) || fcc_sub(&cc)) { fprintf(stderr, "faces: out of memory\n"); return 1; }
     faces_vol V = {&cc, fcc_sample, fcc_mark, fcc_fill};
     const int gi = farg(argc, argv, "--gt"); z3 *gz = nullptr; fc_cache gc; const double gum = atof(fopt(argc, argv, "--gt-um", "0"));
     if (gi > 0) {
