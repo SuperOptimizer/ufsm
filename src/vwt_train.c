@@ -52,12 +52,54 @@ static int bench(int argc, char **argv) {
     return 0;
 }
 
+/* --diag CKPT DUMPDIR N: the model (EMA weights) on N dumped slabs (ufsm vwt-sample: sNNN.{im,va}.u8, .comp.u16, .ph/.pw.f32) against a
+   trivial predictor (the slab's best constant increment): phase / density losses and the share of 32-voxel in-component ray segments whose
+   predicted turn count misses the target's by >= 0.5 */
+static int rd(const char *dir, int i, const char *ext, void *p, size_t n) {
+    char f[1200]; snprintf(f, sizeof f, "%s/s%03d.%s", dir, i, ext); FILE *fp = fopen(f, "rb"); if (!fp) return -1;
+    const int ok = fread(p, 1, n, fp) == n; fclose(fp); return ok ? 0 : -1;
+}
+static void seg_miss(const float *ph, const float *tg, const uint16_t *cp, int T, int L, double *miss, double *tot) {
+    for (long c = 0; c < (long)T * T; c++) for (int k = 0; k + 32 < L; k += 16) {
+        const long a = c * L + k, b = a + 32; if (!cp[a] || cp[a] != cp[b]) continue;
+        int same = 1; for (long q = a; q <= b; q += 4) same &= cp[q] == cp[a]; if (!same) continue;
+        *tot += 1; *miss += fabs((ph[b] - ph[a]) - (tg[b] - tg[a])) >= 0.5;
+    }
+}
+static int diag(int argc, char **argv) {
+    const char *ck = opt(argc, argv, "--diag", nullptr), *dir = opt(argc, argv, "--dump", nullptr); const int N = atoi(opt(argc, argv, "--n", "8"));
+    if (!dir) { fprintf(stderr, "vwt-train --diag CKPT --dump DIR [--n 8] [--ema 1]\n"); return 2; }
+    vwt *m = vwt_load(ck, atoi(opt(argc, argv, "--ema", "1"))); if (!m) return 1;
+    const int T = 128, L = 384; const size_t n = (size_t)T * T * L;
+    uint8_t *im = malloc(n), *va = malloc(n); uint16_t *cp = malloc(n * 2); float *tg = malloc(n * 4), *pw = malloc(n * 4), *ph = malloc(n * 4), *pc = malloc(n * 4), *ic = malloc(n * 4);
+    uint8_t *imd = nn_malloc(n), *vad = nn_malloc(n); uint16_t *cd = nn_malloc(n * 2); float *tgd = nn_malloc(n * 4), *pwd = nn_malloc(n * 4), *phd = nn_malloc(n * 4), *incd = nn_malloc(n * 4);
+    double sm[6] = {0};
+    for (int i = 0; i < N; i++) {
+        if (rd(dir, i, "im.u8", im, n) || rd(dir, i, "va.u8", va, n) || rd(dir, i, "comp.u16", cp, n * 2) || rd(dir, i, "ph.f32", tg, n * 4) || rd(dir, i, "pw.f32", pw, n * 4)) { fprintf(stderr, "diag: cannot read slab %d\n", i); break; }
+        for (size_t q = 0; q < n; q++) if (!cp[q]) tg[q] = 0.f;
+        nn_h2d(imd, im, n); nn_h2d(vad, va, n); nn_h2d(cd, cp, n * 2); nn_h2d(tgd, tg, n * 4); nn_h2d(pwd, pw, n * 4);
+        if (vwt_forward(m, imd, vad, phd, incd, 0)) return 1;
+        vt_loss a, b; vt_losses(phd, incd, tgd, cd, pwd, T, L, 0.25f, 0.05f, 1, 1, 1, nullptr, nullptr, &a);
+        nn_d2h(ph, phd, n * 4);
+        double ds = 0, dn = 0; for (size_t q = 1; q < n; q++) if (q % L && cp[q] && cp[q] == cp[q - 1]) { ds += tg[q] - tg[q - 1]; dn++; }
+        const float s0 = (float)(dn ? ds / dn : 0.05);
+        for (size_t q = 0; q < n; q++) { pc[q] = s0 * (float)(q % L + 1); ic[q] = s0; }
+        nn_h2d(phd, pc, n * 4); nn_h2d(incd, ic, n * 4); vt_losses(phd, incd, tgd, cd, pwd, T, L, 0.25f, 0.05f, 1, 1, 1, nullptr, nullptr, &b);
+        double mm = 0, mt = 0, cm = 0, ct = 0; seg_miss(ph, tg, cp, T, L, &mm, &mt); seg_miss(pc, tg, cp, T, L, &cm, &ct);
+        printf("slab %d: model phase %.4f density %.5f miss32 %.3f | constant %.4f: phase %.4f density %.5f miss32 %.3f\n", i, a.phase, a.density, mt ? mm / mt : 0, s0, b.phase, b.density, ct ? cm / ct : 0);
+        sm[0] += a.phase; sm[1] += a.density; sm[2] += mt ? mm / mt : 0; sm[3] += b.phase; sm[4] += b.density; sm[5] += ct ? cm / ct : 0;
+    }
+    printf("mean: model phase %.4f density %.5f miss32 %.3f | constant phase %.4f density %.5f miss32 %.3f\n", sm[0] / N, sm[1] / N, sm[2] / N, sm[3] / N, sm[4] / N, sm[5] / N);
+    return 0;
+}
+
 int cmd_vwt_train(int argc, char **argv) {
     if (nn_init(atoi(opt(argc, argv, "--gpu", "0")))) return 1;
     if (atoi(opt(argc, argv, "--tf32", "1"))) setenv("UFSM_ATTN_TF32", "1", 0);
     at_set_core(atoi(opt(argc, argv, "--core", "1")));
     at_set_mx(atoi(opt(argc, argv, "--mx", "16")));   /* attention-block linears / activations: 16 = bf16 (src/nn_attn_h16.cu), 0 fp32, 8 / 4 MX */
     if (opt(argc, argv, "--bench", nullptr)) return bench(argc, argv);
+    if (opt(argc, argv, "--diag", nullptr)) return diag(argc, argv);
     if (argc < 4) { fprintf(stderr, "usage: ufsm vwt-train SOURCES RUNDIR [options]  |  ufsm vwt-train --bench N\n"); return 2; }
     const char *src = argv[2], *run = argv[3];
     const int T = atoi(opt(argc, argv, "--T", "128")), L = atoi(opt(argc, argv, "--L", "384")), B = atoi(opt(argc, argv, "--batch", "2"));
