@@ -36,6 +36,11 @@ typedef struct {
     double o[3], a[3], b[3], d[3];   /* frame (xyz, scan voxels of the CT level) */
     int src;            /* source index (sources json order) */
     int flags;          /* bit 0: the ray points inward (toward the umbilicus) */
+    double um;          /* the CT level's voxel size (um) */
+    double axp[3];      /* the scroll axis point (xyz, CT voxels) at the drawn point's z (the axis direction is +z) */
+    /* multiview pair (vwt-train --mv-p P > 0, undeformed training slabs only): a second, label-free slab around the same centre (shift <=
+       --mv-shift voxels per axis) with its ray direction within --mv-cone degrees of d (same sign), its own intensity aug */
+    int has_pair; uint8_t *pim, *pva; double po[3], pa[3], pb[3], pd[3];
 } vws_sample;
 
 typedef struct vws vws;
@@ -78,6 +83,7 @@ void vt_up2_bwd(vt_t gy, vt_t gx);
 /* channel concat y = [a | b] and its split */
 void vt_cat_fwd(vt_t a, vt_t b, vt_t y);
 void vt_cat_bwd(vt_t gy, vt_t ga, vt_t gb);
+void vt_cat_bf16(const float *a, int ca, const uint16_t *b, int cb, long long rows, float *y);   /* y [rows][ca + cb] = [a | float(b)] */
 void vt_add(float *y, const float *x, size_t n);   /* y += x */
 void vt_input(const uint8_t *im, const uint8_t *va, long long n, float *x);   /* device u8 [n] -> x [n][2] (standardised image, valid) */
 void vt_transpose(const float *x, float *y, long long A, long long B, int C);   /* rows [A][B][C] -> [B][A][C] */
@@ -102,6 +108,7 @@ typedef struct {
     int T, L;                  /* slab (128, 384) */
     int ch[3], trunk, stem, blocks, heads, mlp, dec;   /* 32 64 96, 192, 2, 6 (each = ray block + transverse block), 4 (head dim 48), 256, 96 */
     float phase_init;          /* initial increment (0.04) */
+    int cx;                    /* extra input channels (a frozen trunk's features, vwt_set_xfeat), 0 = CT + valid only */
 } vwt_cfg;
 typedef struct vwt vwt;
 vwt *vwt_create(const vwt_cfg *c, unsigned seed);
@@ -113,6 +120,17 @@ void vwt_zero_grad(vwt *m);
 int vwt_forward(vwt *m, const uint8_t *im, const uint8_t *va, float *ph, float *inc, int train);
 int vwt_backward(vwt *m, const float *gph, const float *ginc);   /* after vwt_forward(.., 1): gradients += */
 void vwt_free(vwt *m);
+/* extra input features (cfg.cx > 0): device bf16 [T][T][L][cx] channels-last, read by the next vwt_forward (the pointer is kept) */
+void vwt_set_xfeat(vwt *m, const uint16_t *xf);   /* bf16 [T][T][L][cx] */
+/* warm start from a checkpoint with the same architecture except cx: every parameter copied, the first conv's taps of the extra input
+   channels zero (so the start computes exactly the source model); 0 on success */
+int vwt_init_from(vwt *m, const char *path, int use_ema);
+/* multiview consistency (villa multiview_consistency_loss, one-sided: B's phase is a constant): A's voxels on a stride-`st` column lattice
+   mapped through world space into B (frames xyz), B's phase trilinear where all 8 neighbours are valid (vb), shift-invariant Huber(delta)
+   of phA - phB over >= 64 shared samples; host arrays [T][T][L]; gph (host, zeroed by the caller) += lam scale d/d phA; returns the loss
+   (0 when too few shared samples), *nshared out */
+double vt_multiview(const float *pha, const float *phb, const uint8_t *va, const uint8_t *vb, const double fa[4][3], const double fb[4][3], int T, int L,
+                    int st, float delta, float lam, float scale, float *gph, long *nshared);
 int vwt_save(const vwt *m, const char *path, const float *ema, const void *extra, size_t extra_bytes);
 vwt *vwt_load(const char *path, int use_ema);
 

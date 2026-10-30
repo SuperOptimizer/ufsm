@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stddef.h>
 
 typedef struct { size_t w, b, g, be; int ci, co, k, s; } pconv;   /* conv (+ LN affine g / be when g) */
 #define MAXB 16
@@ -28,7 +29,7 @@ struct vwt {
     float *tokin[2 * MAXB]; float *tok, *tmp; vt_t tokv;           /* block inputs (ray: R order, transverse: T order); final tokens */
     vt_t up1, cat1; cact d0, d1; vt_t up0, cat0; cact h0; vt_t lg; float *inc, *ph;
     void *scratch; void *ws_mem; at_ws ws; at_geom gr, gt;
-    int built;
+    int built; const uint16_t *xf; float *x2;   /* extra features (cfg.cx) and the CT + valid pair they are packed with */
 };
 
 /* env UFSM_VWT_PROF=1: synchronising section timers (forward / backward: enc, trunk_in + stem, blocks, decoder + head) printed per call */
@@ -57,7 +58,7 @@ static void init_conv(float *h, const pconv *c, uint64_t *seed) {   /* PyTorch C
 vwt *vwt_create(const vwt_cfg *cfg, unsigned seed) {
     vwt *m = calloc(1, sizeof *m); m->cfg = *cfg;
     const vwt_cfg *c = cfg; if (c->stem > MAXB || c->blocks > MAXB) { free(m); return nullptr; }
-    size_t off = 0; int prev = 2;
+    size_t off = 0; int prev = 2 + (c->cx > 0 ? c->cx : 0);
     for (int s = 0; s < 3; s++) { off = lay_conv(&m->enc[s][0], off, prev, c->ch[s], 3, 2, 1); off = lay_conv(&m->enc[s][1], off, c->ch[s], c->ch[s], 3, 1, 1); prev = c->ch[s]; }
     off = lay_conv(&m->tin, off, c->ch[2], c->trunk, 1, 1, 1);
     for (int k = 0; k < c->stem; k++) { off = lay_conv(&m->stem[k][0], off, c->trunk, c->trunk, 3, 1, 1); off = lay_conv(&m->stem[k][1], off, c->trunk, c->trunk, 3, 1, 1); }
@@ -98,7 +99,7 @@ static void cact_alloc(cact *a, vt_t in, int co, int s) {
 static void build(vwt *m) {
     if (m->built) return;
     const vwt_cfg *c = &m->cfg; const int T = c->T, L = c->L;
-    m->x0 = vnew(T, T, L, 2); vt_t in = m->x0;
+    m->x0 = vnew(T, T, L, 2 + c->cx); vt_t in = m->x0; if (c->cx) m->x2 = nn_malloc((size_t)T * T * L * 2 * 4);
     for (int s = 0; s < 3; s++) { cact_alloc(&m->e[s][0], in, c->ch[s], 2); cact_alloc(&m->e[s][1], m->e[s][0].a, c->ch[s], 1); in = m->e[s][1].a; }
     cact_alloc(&m->ti, in, c->trunk, 1); in = m->ti.a;
     for (int k = 0; k < c->stem; k++) { cact_alloc(&m->st[k][0], in, c->trunk, 1); cact_alloc(&m->st[k][1], m->st[k][0].a, c->trunk, 1); m->stout[k] = vnew(in.d, in.h, in.w, c->trunk); in = m->stout[k]; }
@@ -135,7 +136,10 @@ static int conv_ln_bwd(vwt *m, const pconv *p, cact *a, int gelu, vt_t gy, vt_t 
 int vwt_forward(vwt *m, const uint8_t *im, const uint8_t *va, float *ph, float *inc, int train) {
     build(m); const vwt_cfg *c = &m->cfg; const int T = c->T, L = c->L;
     double tp[6] = {0}; PT(0);
-    vt_input(im, va, (long long)T * T * L, m->x0.p);
+    if (c->cx) {   /* [CT, valid | extra features] */
+        if (!m->xf) { fprintf(stderr, "vwt_forward: cfg.cx %d but no features (vwt_set_xfeat)\n", c->cx); return -1; }
+        vt_input(im, va, (long long)T * T * L, m->x2); vt_cat_bf16(m->x2, 2, m->xf, c->cx, (long long)T * T * L, m->x0.p);
+    } else vt_input(im, va, (long long)T * T * L, m->x0.p);
     for (int s = 0; s < 3; s++) { if (conv_ln_fwd(m, &m->enc[s][0], &m->e[s][0], 1) || conv_ln_fwd(m, &m->enc[s][1], &m->e[s][1], 1)) return -1; }
     PT(1);
     if (conv_ln_fwd(m, &m->tin, &m->ti, 1)) return -1;
@@ -231,13 +235,40 @@ int vwt_backward(vwt *m, const float *gph, const float *ginc) {
     return 0;
 }
 
+void vwt_set_xfeat(vwt *m, const uint16_t *xf) { m->xf = xf; }
+
+/* checkpoint header: "VWT1" (cfg without cx) or "VWT2" (full cfg) */
+static int read_hdr(FILE *f, vwt_cfg *cfg) {
+    char mg[4]; memset(cfg, 0, sizeof *cfg);
+    if (fread(mg, 1, 4, f) != 4) return -1;
+    if (!memcmp(mg, "VWT1", 4)) return fread(cfg, offsetof(vwt_cfg, cx), 1, f) == 1 ? 0 : -1;
+    if (!memcmp(mg, "VWT2", 4)) return fread(cfg, sizeof *cfg, 1, f) == 1 ? 0 : -1;
+    return -1;
+}
+int vwt_ckpt_header(FILE *f, vwt_cfg *cfg) { return read_hdr(f, cfg); }
+
+int vwt_init_from(vwt *m, const char *path, int use_ema) {
+    vwt *s = vwt_load(path, use_ema); if (!s) return -1;
+    const vwt_cfg *a = &s->cfg, *b = &m->cfg;
+    if (a->T != b->T || a->L != b->L || a->trunk != b->trunk || a->stem != b->stem || a->blocks != b->blocks || a->heads != b->heads || a->mlp != b->mlp || a->dec != b->dec ||
+        memcmp(a->ch, b->ch, sizeof a->ch) || m->np - m->enc[0][0].b != s->np - s->enc[0][0].b) { fprintf(stderr, "vwt_init_from: %s: architecture differs\n", path); vwt_free(s); return -1; }
+    float *hs = malloc(s->np * 4), *hm = malloc(m->np * 4); nn_d2h(hs, s->P, s->np * 4); nn_d2h(hm, m->P, m->np * 4);
+    const pconv *ps = &s->enc[0][0], *pm = &m->enc[0][0]; const int taps = 27;
+    for (int co = 0; co < pm->co; co++) for (int t = 0; t < taps; t++) for (int ci = 0; ci < pm->ci; ci++)
+        hm[pm->w + ((size_t)co * taps + t) * pm->ci + ci] = ci < ps->ci ? hs[ps->w + ((size_t)co * taps + t) * ps->ci + ci] : 0.f;
+    memcpy(hm + pm->b, hs + ps->b, (s->np - ps->b) * 4);
+    nn_h2d(m->P, hm, m->np * 4); free(hs); free(hm); vwt_free(s);
+    fprintf(stderr, "vwt: warm start from %s (%s weights), %d extra input channels zero-initialised\n", path, use_ema ? "EMA" : "live", b->cx);
+    return 0;
+}
+
 void vwt_free(vwt *m) { if (!m) return; /* (process-lifetime buffers) */ nn_free(m->P); nn_free(m->G); free(m); }
 
 /* checkpoint: "VWT1", cfg, np, params (fp32), has_ema + ema, extra bytes */
 int vwt_save(const vwt *m, const char *path, const float *ema, const void *extra, size_t extra_bytes) {
     char tmp[1100]; snprintf(tmp, sizeof tmp, "%s.tmp", path); FILE *f = fopen(tmp, "wb"); if (!f) return -1;
     float *h = malloc(m->np * 4); int rc = 0; const int has = ema != nullptr; const uint64_t np = m->np, eb = extra_bytes;
-    rc |= fwrite("VWT1", 1, 4, f) != 4; rc |= fwrite(&m->cfg, sizeof m->cfg, 1, f) != 1; rc |= fwrite(&np, 8, 1, f) != 1;
+    rc |= fwrite("VWT2", 1, 4, f) != 4; rc |= fwrite(&m->cfg, sizeof m->cfg, 1, f) != 1; rc |= fwrite(&np, 8, 1, f) != 1;
     nn_d2h(h, m->P, m->np * 4); rc |= fwrite(h, 4, m->np, f) != m->np;
     rc |= fwrite(&has, 4, 1, f) != 1; if (has) { nn_d2h(h, ema, m->np * 4); rc |= fwrite(h, 4, m->np, f) != m->np; }
     rc |= fwrite(&eb, 8, 1, f) != 1; if (eb) rc |= fwrite(extra, 1, eb, f) != eb;
@@ -247,8 +278,8 @@ int vwt_save(const vwt *m, const char *path, const float *ema, const void *extra
 }
 vwt *vwt_load(const char *path, int use_ema) {
     FILE *f = fopen(path, "rb"); if (!f) { fprintf(stderr, "vwt: cannot read %s\n", path); return nullptr; }
-    char mg[4]; vwt_cfg cfg; uint64_t np; int has = 0;
-    if (fread(mg, 1, 4, f) != 4 || memcmp(mg, "VWT1", 4) || fread(&cfg, sizeof cfg, 1, f) != 1 || fread(&np, 8, 1, f) != 1) { fclose(f); fprintf(stderr, "vwt: %s: bad header\n", path); return nullptr; }
+    vwt_cfg cfg; uint64_t np; int has = 0;
+    if (read_hdr(f, &cfg) || fread(&np, 8, 1, f) != 1) { fclose(f); fprintf(stderr, "vwt: %s: bad header\n", path); return nullptr; }
     vwt *m = vwt_create(&cfg, 1); if (!m || m->np != np) { fclose(f); fprintf(stderr, "vwt: %s: parameter count mismatch\n", path); return nullptr; }
     float *h = malloc(np * 4); int rc = fread(h, 4, np, f) != np;
     if (!rc && fread(&has, 4, 1, f) == 1 && has && use_ema) rc = fread(h, 4, np, f) != np;

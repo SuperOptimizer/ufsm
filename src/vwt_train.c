@@ -12,6 +12,17 @@
 #include "vwt.h"
 #include "attn.h"
 #include "nn.h"
+#if __has_include("wtrunk.h")
+#include "wtrunk.h"
+#define HAVE_WTRUNK 1
+#else   /* the interface of src/wtrunk.h (PF) until it lands */
+typedef struct wtrunk wtrunk;
+typedef struct { double o[3], a[3], b[3], d[3], c[3], u[3]; } wt_frame;
+wtrunk *wt_open(const char *ckpt, int T, int L, int maxbatch, int feat);
+int wt_forward(wtrunk *w, const uint8_t *im, const wt_frame *fr, int n, double um, uint16_t *out);
+int wt_channels(const wtrunk *w);
+void wt_close(wtrunk *w);
+#endif
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,7 +39,8 @@ static void on_term(int sig) { (void)sig; g_term = 1; }
 static const char *opt(int argc, char **argv, const char *k, const char *d) { for (int i = argc - 2; i >= 1; i--) if (!strcmp(argv[i], k)) return argv[i + 1]; return d; }
 static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + 1e-9 * t.tv_nsec; }
 
-static vwt_cfg default_cfg(int T, int L) { return (vwt_cfg){T, L, {32, 64, 96}, 192, 2, 6, 4, 256, 96, 0.04f}; }
+static vwt_cfg default_cfg(int T, int L) { return (vwt_cfg){T, L, {32, 64, 96}, 192, 2, 6, 4, 256, 96, 0.04f, 0}; }
+int vwt_ckpt_header(FILE *f, vwt_cfg *cfg);   /* (vwt_net.c) */
 
 static int bench(int argc, char **argv) {
     const int N = atoi(opt(argc, argv, "--bench", "3")), T = atoi(opt(argc, argv, "--T", "128")), L = atoi(opt(argc, argv, "--L", "384"));
@@ -119,18 +131,28 @@ int cmd_vwt_train(int argc, char **argv) {
     const float lp = (float)atof(opt(argc, argv, "--lam-p", "1")), ld = (float)atof(opt(argc, argv, "--lam-d", "1"));
     const int use_shell = atoi(opt(argc, argv, "--shell", "0"));   /* position-only shell loss (samples carrying shell masks) */
     const float lsh = (float)atof(opt(argc, argv, "--lam-shell", "0.2")), gate = (float)atof(opt(argc, argv, "--snap-gate", "0.25"));
+    const float lmv = (float)atof(opt(argc, argv, "--lam-mv", "0.25")), mvd = (float)atof(opt(argc, argv, "--mv-delta", "0.5")); const int mvs = atoi(opt(argc, argv, "--mv-stride", "4"));
+    const int use_mv = atof(opt(argc, argv, "--mv-p", "0")) > 0 && lmv > 0;
     mkdir(run, 0755);
     char path[1200]; snprintf(path, sizeof path, "%s/latest.vwt", run);
     vwt_cfg c = default_cfg(T, L);
+    /* --trunk CKPT: a frozen feature trunk (wind96 in-slab, src/wtrunk) feeding cfg.cx extra input channels; --cx-test N: N zero channels
+       (no trunk; smoke tests of the wide input) */
+    const char *trunk = opt(argc, argv, "--trunk", nullptr); wtrunk *WT = nullptr; int cx = atoi(opt(argc, argv, "--cx-test", "0"));
+    if (trunk) { WT = wt_open(trunk, T, L, 1, atoi(opt(argc, argv, "--trunk-feat", "1"))); if (!WT) { fprintf(stderr, "vwt-train: cannot open the trunk %s\n", trunk); return 1; } cx = wt_channels(WT);
+                 fprintf(stderr, "vwt-train: frozen trunk %s, %d feature channels\n", trunk, cx); }
+    c.cx = cx;
     vwt *m = access(path, F_OK) == 0 ? vwt_load(path, 0) : vwt_create(&c, (unsigned)atoi(opt(argc, argv, "--seed", "1")));
     if (!m) return 1;
+    if (access(path, F_OK) != 0 && opt(argc, argv, "--init-from", nullptr) && vwt_init_from(m, opt(argc, argv, "--init-from", nullptr), atoi(opt(argc, argv, "--init-ema", "1")))) return 1;
+    uint16_t *xfd = cx ? nn_malloc((size_t)T * T * L * cx * 2) : nullptr; if (xfd) { nn_zero(xfd, (size_t)T * T * L * cx * 2); vwt_set_xfeat(m, xfd); }
     const size_t np = vwt_nparams(m);
     float *ema = nn_malloc(np * 4), *mo = nn_malloc(np * 4), *vo = nn_malloc(np * 4), *red = nn_malloc(1 << 20);
     nn_d2d(ema, vwt_params(m), np * 4); nn_zero(mo, np * 4); nn_zero(vo, np * 4);
     int step = 0, nbad = 0;
     if (access(path, F_OK) == 0) {   /* resume: the EMA and the optimiser state (extra = step, m, v) */
-        FILE *f = fopen(path, "rb"); char mg[4]; vwt_cfg cc; uint64_t n2; int has; uint64_t eb;
-        float *h = malloc(np * 4); int ok = f && fread(mg, 1, 4, f) == 4 && fread(&cc, sizeof cc, 1, f) == 1 && fread(&n2, 8, 1, f) == 1 && n2 == np && fread(h, 4, np, f) == np;
+        FILE *f = fopen(path, "rb"); vwt_cfg cc; uint64_t n2; int has; uint64_t eb;
+        float *h = malloc(np * 4); int ok = f && !vwt_ckpt_header(f, &cc) && fread(&n2, 8, 1, f) == 1 && n2 == np && fread(h, 4, np, f) == np;
         if (ok && fread(&has, 4, 1, f) == 1 && has && fread(h, 4, np, f) == np) nn_h2d(ema, h, np * 4);
         if (ok && fread(&eb, 8, 1, f) == 1 && eb == 4 + 8 * np && fread(&step, 4, 1, f) == 1 && fread(h, 4, np, f) == np) { nn_h2d(mo, h, np * 4); if (fread(h, 4, np, f) == np) nn_h2d(vo, h, np * 4); }
         if (f) fclose(f); free(h);
@@ -154,10 +176,12 @@ int cmd_vwt_train(int argc, char **argv) {
     const size_t n = (size_t)T * T * L;
     uint8_t *imd = nn_malloc(n), *vad = nn_malloc(n); float *tg = nn_malloc(n * 4), *pw = nn_malloc(n * 4), *gph = nn_malloc(n * 4), *ginc = nn_malloc(n * 4);
     float *phd = nn_malloc(n * 4), *incd = nn_malloc(n * 4); uint16_t *cd = nn_malloc(n * 2); float *ones = malloc(n * 4); uint8_t *shd = nn_malloc(n);
-    double acc_h = 0, acc_hc = 0;
+    double acc_h = 0, acc_hc = 0, acc_mv = 0, acc_mvn = 0;
+    float *phb = use_mv ? nn_malloc(n * 4) : nullptr, *pha_h = use_mv ? malloc(n * 4) : nullptr, *phb_h = use_mv ? malloc(n * 4) : nullptr, *gmv = use_mv ? malloc(n * 4) : nullptr;
+    float *gmvd = use_mv ? nn_malloc(n * 4) : nullptr;
     for (size_t i = 0; i < n; i++) ones[i] = 1.f;
     snprintf(path, sizeof path, "%s/log.tsv", run); FILE *lf = fopen(path, step ? "a" : "w"); if (!lf) return 1;
-    if (!step) fprintf(lf, "step\tlr\tphase\tdensity\tgnorm\tsec_step\tsample_wait\tlabelled\tmono\tshell\tshell_cols\n");
+    if (!step) fprintf(lf, "step\tlr\tphase\tdensity\tgnorm\tsec_step\tsample_wait\tlabelled\tmono\tshell\tshell_cols\tmv\tmv_pairs\n");
     double acc_p = 0, acc_d = 0, acc_w = 0, acc_mono = 0, t_step = 0, t_wait = 0, acc_g = 0; int acc_n = 0;
     while (step < steps) {
         const double t0 = now_s(); double wait = 0;
@@ -167,6 +191,16 @@ int cmd_vwt_train(int argc, char **argv) {
             nn_h2d(imd, s.im, n); nn_h2d(vad, s.va, n); nn_h2d(tg, s.ph, n * 4); nn_h2d(cd, s.comp, n * 2); nn_h2d(pw, s.pw ? s.pw : ones, n * 4);
             /* monotone convention check on the host: share of labelled ray steps where the target rises */
             { size_t up = 0, tot = 0; for (size_t i = 1; i < n; i += 7) if (i % L && s.comp[i] && s.comp[i] == s.comp[i - 1]) { tot++; up += s.ph[i] > s.ph[i - 1]; } acc_mono += tot ? (double)up / tot : 0; }
+            int pair = use_mv && s.has_pair;
+            if (pair) {   /* B first (no activations kept), then A */
+                nn_h2d(imd, s.pim, n); nn_h2d(vad, s.pva, n);
+                if (WT) { const wt_frame fr = {{s.po[0], s.po[1], s.po[2]}, {s.pa[0], s.pa[1], s.pa[2]}, {s.pb[0], s.pb[1], s.pb[2]}, {s.pd[0], s.pd[1], s.pd[2]}, {s.axp[0], s.axp[1], s.axp[2]}, {0, 0, 1}};
+                          if (wt_forward(WT, imd, &fr, 1, s.um > 0 ? s.um : 9.6, xfd)) return 1; }
+                if (vwt_forward(m, imd, vad, phb, nullptr, 0)) return 1;
+                nn_h2d(imd, s.im, n); nn_h2d(vad, s.va, n);
+            }
+            if (WT) { const wt_frame fr = {{s.o[0], s.o[1], s.o[2]}, {s.a[0], s.a[1], s.a[2]}, {s.b[0], s.b[1], s.b[2]}, {s.d[0], s.d[1], s.d[2]}, {s.axp[0], s.axp[1], s.axp[2]}, {0, 0, 1}};
+                      if (wt_forward(WT, imd, &fr, 1, s.um > 0 ? s.um : 9.6, xfd)) return 1; }
             if (vwt_forward(m, imd, vad, phd, incd, 1)) return 1;
             vt_loss lo; if (vt_losses(phd, incd, tg, cd, pw, T, L, dp, dd, lp, ld, 1.f / B, gph, ginc, &lo)) return 1;
             acc_p += lo.phase; acc_d += lo.density; acc_w += lo.wsum;
@@ -174,6 +208,13 @@ int cmd_vwt_train(int argc, char **argv) {
                 double hh, ss, nc; nn_h2d(shd, s.shell, n);
                 if (vt_shell_loss(phd, shd, cd, T, L, gate, lsh, lsh, 1.f / B, gph, &hh, &ss, &nc)) return 1;
                 acc_h += hh + ss; acc_hc += nc;
+            }
+            if (pair) {
+                nn_d2h(pha_h, phd, n * 4); nn_d2h(phb_h, phb, n * 4); memset(gmv, 0, n * 4);
+                const double fa[4][3] = {{s.o[0], s.o[1], s.o[2]}, {s.a[0], s.a[1], s.a[2]}, {s.b[0], s.b[1], s.b[2]}, {s.d[0], s.d[1], s.d[2]}};
+                const double fb[4][3] = {{s.po[0], s.po[1], s.po[2]}, {s.pa[0], s.pa[1], s.pa[2]}, {s.pb[0], s.pb[1], s.pb[2]}, {s.pd[0], s.pd[1], s.pd[2]}};
+                long ns2 = 0; const double lmvv = vt_multiview(pha_h, phb_h, s.va, s.pva, fa, fb, T, L, mvs, mvd, lmv, 1.f / B, gmv, &ns2);
+                if (ns2 >= 64) { nn_h2d(gmvd, gmv, n * 4); vt_add(gph, gmvd, n); acc_mv += lmvv; acc_mvn += 1; }
             }
             if (vwt_backward(m, gph, ginc)) return 1;
         }
@@ -189,11 +230,13 @@ int cmd_vwt_train(int argc, char **argv) {
         nn_sync(); t_step += now_s() - t0; t_wait += wait; acc_g += gn; acc_n++;
         if (step % logf == 0 || step == steps) {
             const double k = acc_n * B;
-            fprintf(lf, "%d\t%.3g\t%.5f\t%.6f\t%.3f\t%.3f\t%.3f\t%.0f\t%.3f\t%.5f\t%.0f\n", step, lr, acc_p / k, acc_d / k, acc_g / acc_n, t_step / acc_n, t_wait / acc_n, acc_w / k, acc_mono / k, acc_h / k, acc_hc / k);
+            fprintf(lf, "%d\t%.3g\t%.5f\t%.6f\t%.3f\t%.3f\t%.3f\t%.0f\t%.3f\t%.5f\t%.0f\t%.5f\t%.3f\n", step, lr, acc_p / k, acc_d / k, acc_g / acc_n, t_step / acc_n, t_wait / acc_n, acc_w / k, acc_mono / k, acc_h / k, acc_hc / k,
+                    acc_mvn ? acc_mv / acc_mvn : 0, acc_mvn / k);
             fflush(lf);
             fprintf(stderr, "vwt-train: step %d lr %.2e phase %.4f density %.5f |g| %.2f  %.2f s/step (wait %.2f)  %.1f Mvox/s  mono %.2f\n", step, lr, acc_p / k, acc_d / k, acc_g / acc_n,
                     t_step / acc_n, t_wait / acc_n, (double)n * B / (t_step / acc_n) / 1e6, acc_mono / k);
-            acc_p = acc_d = acc_w = acc_mono = t_step = t_wait = acc_g = acc_h = acc_hc = 0; acc_n = 0;
+            if (acc_mvn) fprintf(stderr, "   multiview %.4f on %.0f%% of the slabs\n", acc_mv / acc_mvn, 100 * acc_mvn / k);
+            acc_p = acc_d = acc_w = acc_mono = t_step = t_wait = acc_g = acc_h = acc_hc = acc_mv = acc_mvn = 0; acc_n = 0;
         }
         snprintf(path, sizeof path, "%s/STOP", run); const int stop = access(path, F_OK) == 0 || g_term;
         if (step % ckev == 0 || step == steps || stop) {
@@ -214,3 +257,9 @@ __attribute__((weak)) vws *vws_open(const char *s, int T, int L, float t, int n,
 __attribute__((weak)) int vws_next(vws *s, vws_sample *o) { (void)s; (void)o; return -1; }
 __attribute__((weak)) void vws_close(vws *s) { (void)s; }
 __attribute__((weak)) void vws_set_args(int argc, char **argv) { (void)argc; (void)argv; }
+#ifndef HAVE_WTRUNK   /* until src/wtrunk lands (PF) */
+__attribute__((weak)) wtrunk *wt_open(const char *c, int T, int L, int mb, int feat) { (void)c; (void)T; (void)L; (void)mb; (void)feat; fprintf(stderr, "wt_open: no trunk built in\n"); return nullptr; }
+__attribute__((weak)) int wt_forward(wtrunk *w, const uint8_t *im, const wt_frame *fr, int n, double um, uint16_t *out) { (void)w; (void)im; (void)fr; (void)n; (void)um; (void)out; return -1; }
+__attribute__((weak)) int wt_channels(const wtrunk *w) { (void)w; return 0; }
+__attribute__((weak)) void wt_close(wtrunk *w) { (void)w; }
+#endif
