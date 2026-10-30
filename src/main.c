@@ -175,6 +175,7 @@ static int usage(void) {
         "  ufsm fit-join <out-set> <fields-dir> <slab-model> <z0> <z1> ...   independent z-slab fits -> one fit set, gauges matched on the overlaps\n"
         "  ufsm fields-oracle <fields-dir> <phase-root> <phase-key> <out-dir>   fit fields with the phase planes from a label phase raster (oracle / swap)\n"
         "  ufsm count-field <in-fields> <out-fields> [--method ls|ray] [--R 3] [--model DIR]   winding from the density counts, the phase only sub-turn (src/countfield.c)\n"
+        "  ufsm hires-phase <ct-root> <key> <fields-dir> <out-dir> --ct-um U   fit fields with the sheet phase measured in a finer CT (valleys along the normal)\n"
         "  ufsm phase-packing <phase-root> <phase-key> [--box ..] [--map OUT.raw]   how packed the labelled sheets are (box stats, per-chunk map for the sampler focus)\n"
         "  ufsm wbench-stats A.tsv [B.tsv] [--metric ids,p1x] [--set clean|all]   winding bench means, stratified bootstrap CIs, paired A-B, MDE (--scroll a,b; --tsv 1)\n"
         "  ufsm ckpt-avg OUT.ckpt IN1.ckpt IN2.ckpt ... [--arrays ema|both]   uniform weight average of snapshots of one run (optimiser state of the last)\n"
@@ -3846,6 +3847,8 @@ int cmd_flatten_warp(int argc, char **argv);
 int cmd_fiber_check(int argc, char **argv);    /* src/fibercheck.c */
 int cmd_fiber_export(int argc, char **argv);   /* src/fibercheck.c */
 int cmd_count_field(int argc, char **argv);   /* src/countfield.c */
+int cmd_hires_phase(int argc, char **argv);   /* src/hiresphase.c */
+int cmd_hires_count(int argc, char **argv);
 int cmd_phase_packing(int argc, char **argv);   /* src/packmap.c */
 int cmd_wbench_stats(int argc, char **argv);   /* src/wbench.c */
 int cmd_ckpt_avg(int argc, char **argv);   /* src/wbench.c */
@@ -3886,6 +3889,8 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "fiber-check")) return cmd_fiber_check(argc, argv);
     if (!strcmp(cmd, "fiber-export")) return cmd_fiber_export(argc, argv);
     if (!strcmp(cmd, "count-field")) return cmd_count_field(argc, argv);
+    if (!strcmp(cmd, "hires-phase")) return cmd_hires_phase(argc, argv);
+    if (!strcmp(cmd, "hires-count")) return cmd_hires_count(argc, argv);
     if (!strcmp(cmd, "phase-packing")) return cmd_phase_packing(argc, argv);
     if (!strcmp(cmd, "wbench-stats")) return cmd_wbench_stats(argc, argv);
     if (!strcmp(cmd, "ckpt-avg")) return cmd_ckpt_avg(argc, argv);
