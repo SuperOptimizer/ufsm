@@ -31,6 +31,12 @@ struct vwt {
     int built;
 };
 
+/* env UFSM_VWT_PROF=1: synchronising section timers (forward / backward: enc, trunk_in + stem, blocks, decoder + head) printed per call */
+#include <time.h>
+static int prof_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("UFSM_VWT_PROF"); v = e && atoi(e); } return v; }
+static double prof_t(void) { nn_sync(); struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + 1e-9 * t.tv_nsec; }
+#define PT(i) do { if (prof_on()) tp[i] = prof_t(); } while (0)
+
 static uint64_t rng_next(uint64_t *s) { *s ^= *s << 13; *s ^= *s >> 7; *s ^= *s << 17; return *s; }
 static double unif(uint64_t *s) { return (rng_next(s) >> 11) * (1.0 / 9007199254740992.0); }
 static double gauss(uint64_t *s) { double a = unif(s) + 1e-300, b = unif(s); return sqrt(-2 * log(a)) * cos(6.283185307179586 * b); }
@@ -128,8 +134,10 @@ static int conv_ln_bwd(vwt *m, const pconv *p, cact *a, int gelu, vt_t gy, vt_t 
 
 int vwt_forward(vwt *m, const uint8_t *im, const uint8_t *va, float *ph, float *inc, int train) {
     build(m); const vwt_cfg *c = &m->cfg; const int T = c->T, L = c->L;
+    double tp[6] = {0}; PT(0);
     vt_input(im, va, (long long)T * T * L, m->x0.p);
     for (int s = 0; s < 3; s++) { if (conv_ln_fwd(m, &m->enc[s][0], &m->e[s][0], 1) || conv_ln_fwd(m, &m->enc[s][1], &m->e[s][1], 1)) return -1; }
+    PT(1);
     if (conv_ln_fwd(m, &m->tin, &m->ti, 1)) return -1;
     for (int k = 0; k < c->stem; k++) {
         if (conv_ln_fwd(m, &m->stem[k][0], &m->st[k][0], 1) || conv_ln_fwd(m, &m->stem[k][1], &m->st[k][1], 0)) return -1;
@@ -137,6 +145,7 @@ int vwt_forward(vwt *m, const uint8_t *im, const uint8_t *va, float *ph, float *
     }
     const vt_t sin_ = c->stem ? m->stout[c->stem - 1] : m->ti.a; const long NT = (long)vt_rows(sin_); const int t8 = sin_.d, C = c->trunk;
     nn_d2d(m->tok, sin_.p, (size_t)NT * C * 4);
+    PT(2);
     for (int k = 0; k < c->blocks; k++) {
         nn_d2d(m->tokin[2 * k], m->tok, (size_t)NT * C * 4);
         if (at_block_fwd(&m->ad, m->P, &m->bp[2 * k], m->tokin[2 * k], m->tmp, &m->gr, &m->ws)) return -1;
@@ -144,6 +153,7 @@ int vwt_forward(vwt *m, const uint8_t *im, const uint8_t *va, float *ph, float *
         if (at_block_fwd(&m->ad, m->P, &m->bp[2 * k + 1], m->tokin[2 * k + 1], m->tmp, &m->gt, &m->ws)) return -1;
         vt_transpose(m->tmp, m->tok, L, (long long)t8 * t8, C);
     }
+    PT(3);
     vt_up2_fwd(m->tokv, m->up1); vt_cat_fwd(m->up1, m->e[1][1].a, m->cat1);
     if (conv_ln_fwd(m, &m->dec[0], &m->d0, 1) || conv_ln_fwd(m, &m->dec[1], &m->d1, 1)) return -1;
     vt_up2_fwd(m->d1.a, m->up0); vt_cat_fwd(m->up0, m->e[0][1].a, m->cat0);
@@ -151,6 +161,7 @@ int vwt_forward(vwt *m, const uint8_t *im, const uint8_t *va, float *ph, float *
     if (vt_conv_fwd(m->h0.a, m->P + m->fh3.w, m->P + m->fh3.b, 1, 1, 1, 1, m->lg, m->scratch)) return -1;
     vt_phase_fwd(m->lg, inc ? inc : m->inc, ph ? ph : m->ph);
     (void)train;
+    PT(4); if (prof_on()) fprintf(stderr, "vwt prof fwd: enc %.0f  tin+stem %.0f  blocks %.0f  dec+head %.0f ms\n", (tp[1] - tp[0]) * 1e3, (tp[2] - tp[1]) * 1e3, (tp[3] - tp[2]) * 1e3, (tp[4] - tp[3]) * 1e3);
     const char *e = nn_check(); if (e) { fprintf(stderr, "vwt_forward: %s\n", e); return -1; }
     return 0;
 }
@@ -162,6 +173,7 @@ int vwt_backward(vwt *m, const float *gph, const float *ginc) {
     const size_t big = vt_numel(m->cat0) > vt_numel(m->e[0][0].c) * 2 ? vt_numel(m->cat0) : vt_numel(m->e[0][0].c) * 2;
     if (gcap < big) { nn_free(gA); nn_free(gB); nn_free(gC); gA = nn_malloc(big * 4); gB = nn_malloc(big * 4); gC = nn_malloc(big * 4); gcap = big; }
 #define LIKE(t, p) ((vt_t){(p), (t).n, (t).d, (t).h, (t).w, (t).c})
+    double tp[6] = {0}; PT(0);
     vt_t glg = LIKE(m->lg, gA); vt_phase_bwd(m->lg, gph, ginc, glg);
     vt_t gh = LIKE(m->h0.a, gB); if (vt_conv_bwd(m->h0.a, glg, m->P + m->fh3.w, 1, 1, 1, 1, gh, m->G + m->fh3.w, m->G + m->fh3.b, m->scratch)) return -1;
     vt_t gcat0 = LIKE(m->cat0, gA); if (conv_ln_bwd(m, &m->fh0, &m->h0, 1, gh, LIKE(m->h0.c, gC), gcat0)) return -1;
@@ -174,6 +186,7 @@ int vwt_backward(vwt *m, const float *gph, const float *ginc) {
     vt_cat_bwd(gcat1, gup1, gsk1);
     vt_t gtok = LIKE(m->tokv, gB); vt_up2_bwd(gup1, gtok);
     const int t8 = m->tokv.d; const long NT = (long)vt_rows(m->tokv);
+    PT(1);
     float *gt = gtok.p, *gt2 = gC;
     for (int k = c->blocks - 1; k >= 0; k--) {
         vt_transpose(gt, gt2, (long long)t8 * t8, L, C);   /* to transverse order */
@@ -182,6 +195,7 @@ int vwt_backward(vwt *m, const float *gph, const float *ginc) {
         if (at_block_bwd(&m->ad, m->P, m->G, &m->bp[2 * k], m->tokin[2 * k], gt, &m->gr, &m->ws)) return -1;
     }
     (void)NT;
+    PT(2);
     /* stem: gt = d/d stem output */
     vt_t g = LIKE(m->tokv, gt);
     for (int k = c->stem - 1; k >= 0; k--) {
@@ -196,6 +210,7 @@ int vwt_backward(vwt *m, const float *gph, const float *ginc) {
     }
     /* trunk_in */
     vt_t gs2 = LIKE(m->e[2][1].a, gA); if (conv_ln_bwd(m, &m->tin, &m->ti, 1, g, LIKE(m->ti.c, gC), gs2)) return -1;
+    PT(3);
     /* stages, adding the skip gradients */
     vt_t gcur = gs2;
     for (int s = 2; s >= 0; s--) {
@@ -210,6 +225,7 @@ int vwt_backward(vwt *m, const float *gph, const float *ginc) {
         gcur = gin;
     }
     nn_free(gsk0.p); nn_free(gsk1.p);
+    PT(4); if (prof_on()) fprintf(stderr, "vwt prof bwd: dec+head %.0f  blocks %.0f  stem+tin %.0f  enc %.0f ms\n", (tp[1] - tp[0]) * 1e3, (tp[2] - tp[1]) * 1e3, (tp[3] - tp[2]) * 1e3, (tp[4] - tp[3]) * 1e3);
 #undef LIKE
     const char *e = nn_check(); if (e) { fprintf(stderr, "vwt_backward: %s\n", e); return -1; }
     return 0;
