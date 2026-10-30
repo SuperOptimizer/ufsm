@@ -289,6 +289,12 @@ __global__ void k_im2col_bf8(const float *__restrict__ x, int D, int H, int W, i
 __global__ void k_f2bf(const float *__restrict__ x, __nv_bfloat16 *__restrict__ y, long long n) {
     for (long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; i < n; i += (long long)gridDim.x * blockDim.x) y[i] = __float2bfloat16_rn(x[i]);
 }
+__global__ void k_f2bf8(const float4 *__restrict__ x, uint4 *__restrict__ y, long long n8) {   /* 8 per thread */
+    for (long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; i < n8; i += (long long)gridDim.x * blockDim.x) {
+        const float4 a = x[2 * i], b = x[2 * i + 1];
+        y[i] = make_uint4(pkbf(a.x, a.y), pkbf(a.z, a.w), pkbf(b.x, b.y), pkbf(b.z, b.w));
+    }
+}
 /* gb[c] += sum over rows of g[r][c]: block = per x C threads (thread: channel tid % C, rows tid / C + per j) */
 __global__ void k_colsum_f(const float *__restrict__ g, long long rows, int C, int per, float *__restrict__ gb) {
     extern __shared__ float sh[];
@@ -664,7 +670,8 @@ extern "C" int vtf_conv_bwd(vt_t x, vt_t gy, const float *w, int k, int sd, int 
     const bool wide = co % 96 == 0 && co <= 192;   /* (the 96 x 128 tiles) */
     const int K3 = T * ci, bm3 = co % 96 == 0 ? 96 : co % 64 == 0 ? 64 : co % 32 == 0 ? 32 : 0;
     if (gw && wgk != 0 && wgk != 2 && bm3 && sw == 1 && gy.w % 32 == 0 && ci % 8 == 0 && co <= 192) {
-        /* bf16 copies of x and gy, then the pipelined kernel; partial sums after them in the chunk region */
+        /* bf16 copies of gy and x, then the pipelined kernel; partial sums after them in the chunk region (gy's copy: already there when the
+           bf16 backward-data just made it, at the same place) */
         const size_t xbb = ((size_t)vt_numel(x) * 2 + 255) & ~(size_t)255, gbb = ((size_t)rows * co * 2 + 255) & ~(size_t)255;
         const int nt = (K3 + 127) / 128 * (co / bm3);
         long long nz = (360 + nt - 1) / nt; if (nz > rows / 1024) nz = rows / 1024; if (nz < 1) nz = 1;
@@ -672,11 +679,11 @@ extern "C" int vtf_conv_bwd(vt_t x, vt_t gy, const float *w, int k, int sd, int 
         if (xbb + gbb + pb <= g_wreg) {
             if (xbb + gbb + (size_t)nz * pb > g_wreg) nz = (long long)((g_wreg - xbb - gbb) / pb);
             char *r = s + 2 * wbytes_max(256, 256);
-            WgB q; q.xb = (const __nv_bfloat16 *)r; q.gyb = (const __nv_bfloat16 *)(r + xbb); q.part = (float *)(r + xbb + gbb);
+            WgB q; q.gyb = (const __nv_bfloat16 *)r; q.xb = (const __nv_bfloat16 *)(r + gbb); q.part = (float *)(r + xbb + gbb);
             q.D = x.d; q.H = x.h; q.W = x.w; q.C = ci; q.Do = gy.d; q.Ho = gy.h; q.Wo = gy.w; q.k = k; q.sd = sd; q.sh = sh; q.p = k / 2; q.K = K3; q.co = co; q.M = rows;
             q.mper = (rows + nz - 1) / nz; q.mper = (q.mper + 31) / 32 * 32; nz = (rows + q.mper - 1) / q.mper;
-            k_f2bf<<<cap_blocks((long long)vt_numel(x)), 256>>>(x.p, (__nv_bfloat16 *)r, (long long)vt_numel(x));
-            k_f2bf<<<cap_blocks(rows * co), 256>>>(gy.p, (__nv_bfloat16 *)(r + xbb), rows * co);
+            k_f2bf8<<<cap_blocks((long long)vt_numel(x) / 8), 256>>>((const float4 *)x.p, (uint4 *)(r + gbb), (long long)vt_numel(x) / 8);   /* (ci % 8 == 0) */
+            if (b8 != 16) k_f2bf8<<<cap_blocks(rows * co / 8), 256>>>((const float4 *)gy.p, (uint4 *)r, rows * co / 8);   /* (co % 32 == 0) */
             const dim3 gr((unsigned)((K3 + 127) / 128), (unsigned)(co / bm3), (unsigned)nz);
             if (bm3 == 96) vtf_wgrad3<96, 128><<<gr, 256>>>(q); else if (bm3 == 64) vtf_wgrad3<64, 128><<<gr, 256>>>(q); else vtf_wgrad3<32, 128><<<gr, 256>>>(q);
             k_wg_reduce<<<cap_blocks((long long)co * K3), 256>>>(q.part, (int)nz, (size_t)co * K3, gw);
