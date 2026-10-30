@@ -135,13 +135,17 @@ static void vws_qbox(const float *q, size_t n, double lo[3], double hi[3]) {
 /* UFSM_VWS_PROF=1: per-stage wall time of vws_fill summed over the workers, printed by vws_close */
 enum { VP_FRAME, VP_AUGMAP, VP_LATTICE, VP_QBOX, VP_CT, VP_GT, VP_SAMPLE, VP_KINC, VP_UNWRAP, VP_PW, VP_INTENS, VP_N };
 static const char *vp_name[VP_N] = {"frame", "aug map", "aug lattice", "qbox+holdout", "CT read", "GT read", "sample", "exact k", "unwrap", "weights", "intensity"};
-static _Atomic long long vp_ns[VP_N], vp_slabs, vp_tries, vp_geo; static int vp_on = -1;
+enum { VR_HOLD, VR_EMPTY, VR_READ, VR_SHELL, VR_NLAB, VR_NC, VR_KEPT, VR_N };
+static const char *vr_name[VR_N] = {"holdout", "empty", "read", "shell", "labels", "components", "weights"};
+static _Atomic long long vp_ns[VP_N], vr_n[VR_N], vp_slabs, vp_tries, vp_geo; static int vp_on = -1;
+#define REJ(r) { if (vp_on) atomic_fetch_add(&vr_n[r], 1); continue; }
 static long long vp_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1000000000ll + t.tv_nsec; }
 #define VP(k) do { if (vp_on) { const long long t_ = vp_now(); atomic_fetch_add(&vp_ns[k], t_ - vp_t); vp_t = t_; } } while (0)
 static void vp_print(void) {
     if (vp_on <= 0 || !vp_slabs) return; double tot = 0; for (int k = 0; k < VP_N; k++) tot += vp_ns[k];
     fprintf(stderr, "vws prof: %lld slabs (%lld draws, %lld deformed), %.2f thread-s per slab:", vp_slabs, vp_tries, vp_geo, tot / 1e9 / vp_slabs);
-    for (int k = 0; k < VP_N; k++) fprintf(stderr, " %s %.3f", vp_name[k], vp_ns[k] / 1e9 / vp_slabs); fprintf(stderr, "\n");
+    for (int k = 0; k < VP_N; k++) fprintf(stderr, " %s %.3f", vp_name[k], vp_ns[k] / 1e9 / vp_slabs);
+    fprintf(stderr, "; rejected:"); for (int k = 0; k < VR_N; k++) fprintf(stderr, " %s %lld", vr_name[k], vr_n[k]); fprintf(stderr, "\n");
 }
 static int vws_fill(vws *V, uint64_t *rs, vws_work *w, vws_sample *out) {
     if (vp_on < 0) vp_on = getenv("UFSM_VWS_PROF") && atoi(getenv("UFSM_VWS_PROF")) > 0;
@@ -193,15 +197,15 @@ static int vws_fill(vws *V, uint64_t *rs, vws_work *w, vws_sample *out) {
             const double *B = S->box[b];   /* zyx */
             bad = hi[2] >= B[0] && lo[2] < B[0] + B[3] && hi[1] >= B[1] && lo[1] < B[1] + B[4] && hi[0] >= B[2] && lo[0] < B[2] + B[5];
         }
-        if (bad) continue;
+        if (bad) REJ(VR_HOLD)
         VP(VP_QBOX);
         /* CT box (zyx) */
         const int64_t *Vs = z3_meta_of(S->ct)->shape; int64_t bo[3], bn[3]; int empty = 0;
         for (int e = 0; e < 3; e++) { const int x = 2 - e; int64_t a = (int64_t)floor(lo[x]) - 1, b = (int64_t)ceil(hi[x]) + 2; a = a < 0 ? 0 : a; b = b > Vs[e] ? Vs[e] : b; if (b - a < 2) { empty = 1; a = 0; b = 2; } bo[e] = a; bn[e] = b - a; }
-        if (empty) continue;
+        if (empty) REJ(VR_EMPTY)
         const size_t need = (size_t)bn[0] * bn[1] * bn[2];
         if (need > w->ccap) { free(w->ct); w->ct = malloc(need); w->ccap = need; if (!w->ct) return -1; }
-        if (z3_read(S->ct, bo, bn, w->ct, 1)) { fprintf(stderr, "vws: CT read failed (%s): %s\n", S->name, z3_error()); continue; }
+        if (z3_read(S->ct, bo, bn, w->ct, 1)) { fprintf(stderr, "vws: CT read failed (%s): %s\n", S->name, z3_error()); REJ(VR_READ) }
         VP(VP_CT);
         /* GT box (zyx, GT voxels): nearest GT voxel of a CT point c: floor((c + 0.5) / f) */
         int64_t go[3] = {0, 0, 0}, gn[3] = {0, 0, 0};
@@ -210,7 +214,7 @@ static int vws_fill(vws *V, uint64_t *rs, vws_work *w, vws_sample *out) {
             for (int e = 0; e < 3; e++) { const int x = 2 - e; int64_t a = (int64_t)floor((lo[x] + 0.5) / f) - 1, b = (int64_t)floor((hi[x] + 0.5) / f) + 2; a = a < 0 ? 0 : a; b = b > G[e] ? G[e] : b; if (b <= a) { a = 0; b = 1; } go[e] = a; gn[e] = b - a; }
             const size_t gneed = (size_t)gn[0] * gn[1] * gn[2];
             if (gneed > w->gcap) { free(w->gt); w->gt = malloc(gneed); w->gcap = gneed; if (!w->gt) return -1; }
-            if (z3_read(S->ph, go, gn, w->gt, 1)) { fprintf(stderr, "vws: GT read failed (%s): %s\n", S->name, z3_error()); continue; }
+            if (z3_read(S->ph, go, gn, w->gt, 1)) { fprintf(stderr, "vws: GT read failed (%s): %s\n", S->name, z3_error()); REJ(VR_READ) }
         }
         /* shell box (zyx, shell voxels), nearest as the GT */
         const double fs = ldexp(1, S->shlv - S->lv); int64_t so[3] = {0, 0, 0}, sn[3] = {0, 0, 0};
@@ -219,7 +223,7 @@ static int vws_fill(vws *V, uint64_t *rs, vws_work *w, vws_sample *out) {
             for (int e = 0; e < 3; e++) { const int x = 2 - e; int64_t a = (int64_t)floor((lo[x] + 0.5) / fs) - 1, b = (int64_t)floor((hi[x] + 0.5) / fs) + 2; a = a < 0 ? 0 : a; b = b > H[e] ? H[e] : b; if (b <= a) { a = 0; b = 1; } so[e] = a; sn[e] = b - a; }
             const size_t sneed = (size_t)sn[0] * sn[1] * sn[2];
             if (sneed > w->scap) { free(w->shb); w->shb = malloc(sneed); w->scap = sneed; if (!w->shb) return -1; }
-            if (z3_read(S->sh, so, sn, w->shb, 1)) { fprintf(stderr, "vws: shell read failed (%s): %s\n", S->name, z3_error()); continue; }
+            if (z3_read(S->sh, so, sn, w->shb, 1)) { fprintf(stderr, "vws: shell read failed (%s): %s\n", S->name, z3_error()); REJ(VR_READ) }
         }
         VP(VP_GT);
         /* tubes near this slab */
@@ -264,12 +268,12 @@ static int vws_fill(vws *V, uint64_t *rs, vws_work *w, vws_sample *out) {
         }
         if (!S->ph) {   /* shell-only source: no phase target */
             size_t ns = 0; for (size_t v = 0; v < n; v++) { out->ph[v] = NAN; out->comp[v] = 0; out->pw[v] = 0; ns += out->shell[v]; }
-            if (ns < n / 2000) continue;
+            if (ns < n / 2000) REJ(VR_SHELL)
             if (g_vwa_ok && V->train) vwa_intensity(&g_vwa, vws_rng(rs), out->im, out->va, T, L);
             out->T = T; out->L = L; out->src = si; out->flags = inward;
             return 0;
         }
-        if (nlab < n / 100) continue;
+        if (nlab < n / 100) REJ(VR_NLAB)
         if (geo) {   /* deformed: exact k increments through the source GT along each q segment (substeps <= 0.5 voxel) */
             if (!w->kinc) { w->kinc = malloc(n * sizeof *w->kinc); if (!w->kinc) return -1; }
             for (size_t v = 0; v < n; v++) {
@@ -289,7 +293,7 @@ static int vws_fill(vws *V, uint64_t *rs, vws_work *w, vws_sample *out) {
             }
         }
         VP(VP_KINC);
-        const int nc = vws_unwrap_k(w->raw, geo ? w->kinc : nullptr, T, L, 64, out->ph, out->comp); if (nc <= 0) continue;
+        const int nc = vws_unwrap_k(w->raw, geo ? w->kinc : nullptr, T, L, 64, out->ph, out->comp); if (nc <= 0) REJ(VR_NC)
         VP(VP_UNWRAP);
         size_t kept = 0;
         for (size_t v = 0; v < n; v++) {
@@ -298,7 +302,7 @@ static int vws_fill(vws *V, uint64_t *rs, vws_work *w, vws_sample *out) {
             const float *qq = w->q + 3 * v; const double p[3] = {qq[2], qq[1], qq[0]};
             out->pw[v] = w->nsidx && vws_seg_hit(S->seg, w->sidx, w->nsidx, R * R, p) ? 0.f : 1.f; kept += out->pw[v] > 0;
         }
-        if (kept < n / 100) continue;
+        if (kept < n / 100) REJ(VR_KEPT)
         VP(VP_PW);
         if (g_vwa_ok && V->train) vwa_intensity(&g_vwa, vws_rng(rs), out->im, out->va, T, L);
         VP(VP_INTENS); if (vp_on) { atomic_fetch_add(&vp_slabs, 1); atomic_fetch_add(&vp_geo, geo); }
@@ -365,7 +369,7 @@ vws *vws_open(const char *sources_json, int T, int L, float tilt_deg, int nthrea
         S->ct = pyramid_open_level(store_open(root), ct, S->lv, S->um0, cache);
         S->ph = proot && pkey ? z3_open(store_open(proot), pkey, nullptr) : nullptr;
         S->sh = sroot && skey ? z3_open(store_open(sroot), skey, nullptr) : nullptr;
-        if (!S->ct || (proot && !S->ph) || (sroot && !S->sh)) { fprintf(stderr, "vws: %s: cannot open CT level %d, GT %s/%s or shells %s/%s: %s\n", S->name, S->lv, proot ? proot : "-", pkey ? pkey : "-", sroot ? sroot : "-", skey ? skey : "-", z3_error()); continue; }
+        if (!S->ct || (proot && !S->ph) || (sroot && !S->sh)) { fprintf(stderr, "vws: %s: cannot open CT level %d, GT %s/%s or shells %s/%s: %s\n", S->name, S->lv, proot ? proot : "-", pkey ? pkey : "-", sroot ? sroot : "-", skey ? skey : "-", z3_error()); REJ(VR_READ) }
         if (S->sh) V->has_shell = 1;
         const char *axp = json_str(json_get(e, "axis"), nullptr); S->hasax = axp && !axis_load(&S->ax, axp);
         if (!S->hasax) fprintf(stderr, "vws: %s: no axis (rays radial from the box centre line x = y = 0)\n", S->name);
