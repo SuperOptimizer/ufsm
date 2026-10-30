@@ -1308,10 +1308,27 @@ static int cmd_fit(int argc, char **argv) {
         double gc = 0, ge = 0, gm = 0; const int gate = m14 && *opt(argc, argv, "--winding-gate", "") && sscanf(opt(argc, argv, "--winding-gate", ""), "%lf,%lf,%lf", &gc, &ge, &gm) == 3;
         fit_fields_buf gb; memset(&gb, 0, sizeof gb); const fit_fields_buf *gf = &fb;
         if (gate && !fb.a[0]) { if (fit_fields_load(dir, 0, 0, 1, &gb)) { fprintf(stderr, "fit: --winding-gate: cannot load the fields\n"); return 1; } gf = &gb; }
-        float *wg = gate || m14 == 3 ? malloc((size_t)BK * BK * BK * 4) : nullptr; long long gn = 0, gk = 0; double gcs = 0, gcw = 0;
+        fit_fields_buf ab; memset(&ab, 0, sizeof ab); fit_fields alt;
+        if (gate && getenv("UFSM_WCHECK_PCPS") && *getenv("UFSM_WCHECK_PCPS")) {   /* (check only: the phase planes pc / ps of another fields dir on the same cells, e.g. count-field output) */
+            if (fit_fields_load(getenv("UFSM_WCHECK_PCPS"), 0, 0, 1, &ab) || ab.f.D != gf->f.D || ab.f.H != gf->f.H || ab.f.W != gf->f.W) { fprintf(stderr, "fit: UFSM_WCHECK_PCPS: cannot load or shape differs\n"); return 1; }
+            alt = gf->f; alt.pc = ab.f.pc; alt.ps = ab.f.ps; ((fit_fields_buf *)gf)->f = alt;
+        }
+        float *wg = gate || m14 == 3 ? malloc((size_t)BK * BK * BK * 4) : nullptr; long long gn = 0, gk = 0, gskip = 0; double gcs = 0, gcw = 0;
         /* --winding-check ROOT KEY UM (with the gate): the gated codes against band codes (1 + round(18 q) mod 252) of UM um voxels on the
            global grid: the code difference histogram of the gated voxels and of all voxels with a band code, best gauge, share within 0.5 turn */
         const int wci = arg_index(argc, argv, "--winding-check"); z3 *gtz = nullptr; double gtr = 0; long long hk[252] = {0}, ha[252] = {0}; uint8_t *gtb = nullptr; long long lbest[2] = {0, 0}, ltot[2] = {0, 0};
+        /* sub-turn histograms (18 codes per turn) vs the band codes, [packed sp < 10.4 native voxels (100 um at 9.6)][kind]: kind 0 the label
+           phase frac(W) on gated voxels, 1 the network phase on the same voxels, 2 the network phase on every material voxel with a band code */
+        long long hph[2][3][18]; memset(hph, 0, sizeof hph);
+        const int gtph = getenv("UFSM_WCHECK_PHASE") && atoi(getenv("UFSM_WCHECK_PHASE")) > 0;
+        /* --winding-skip ROOT KEY UM (up to 2, mod14 codes): voxels where that raster (a GT stored phase, PHASE_*) is known (!= 255) stay unknown:
+           pseudo labels only where no GT label is */
+        z3 *skz[2] = {nullptr, nullptr}; double skr[2] = {0, 0}; uint8_t *skb[2] = {nullptr, nullptr}; int64_t sk0[2][3], skn[2][3]; int nsk = 0;
+        for (int k = 1; k + 3 < argc && nsk < 2; k++) if (!strcmp(argv[k], "--winding-skip")) {
+            skz[nsk] = z3_open(store_open(argv[k + 1]), argv[k + 2], nullptr); skr[nsk] = fb.um / atof(argv[k + 3]);
+            if (!skz[nsk] || !(skr[nsk] > 0) || !m14) { fprintf(stderr, "fit: --winding-skip: cannot open %s %s (or no --winding-mod14)\n", argv[k + 1], argv[k + 2]); return 1; }
+            nsk++;
+        }
         if (gate && wci > 0 && wci + 3 < argc) {
             gtz = z3_open(store_open(argv[wci + 1]), argv[wci + 2], nullptr); gtr = fb.um / atof(argv[wci + 3]);
             if (!gtz || !(gtr > 0)) { fprintf(stderr, "fit: --winding-check: cannot open %s %s\n", argv[wci + 1], argv[wci + 2]); return 1; }
@@ -1328,6 +1345,10 @@ static int cmd_fit(int argc, char **argv) {
                 for (int d = 0; d < 3; d++) { g0[d] = (int64_t)floor((org[d] + o3[d]) * gtr); gn3[d] = (int64_t)ceil((org[d] + o3[d] + n3[d] * ws) * gtr) - g0[d] + 1; }
                 gtb = realloc(gtb, (size_t)gn3[0] * gn3[1] * gn3[2]); if (z3_read(gtz, g0, gn3, gtb, 0)) { fprintf(stderr, "fit: --winding-check: read failed\n"); return 1; }
             }
+            for (int k = 0; k < nsk; k++) {
+                for (int d = 0; d < 3; d++) { sk0[k][d] = (int64_t)floor((org[d] + o3[d]) * skr[k]); skn[k][d] = (int64_t)ceil((org[d] + o3[d] + n3[d] * ws) * skr[k]) - sk0[k][d] + 1; }
+                skb[k] = realloc(skb[k], (size_t)skn[k][0] * skn[k][1] * skn[k][2]); if (z3_read(skz[k], sk0[k], skn[k], skb[k], 0)) { fprintf(stderr, "fit: --winding-skip: read failed\n"); return 1; }
+            }
             long long lha[252] = {0}, lhk[252] = {0};   /* this block's histograms: the local (crop-sized block) gauge */
             memset(sb, m14 ? 255 : 0, (size_t)BK * BK * BK * 2);
             for (int64_t a = 0; a < n3[0]; a++) for (int64_t b = 0; b < n3[1]; b++) for (int64_t c2 = 0; c2 < n3[2]; c2++) {
@@ -1340,17 +1361,40 @@ static int cmd_fit(int argc, char **argv) {
                         const int64_t qz = (int64_t)floor((org[0] + o3[0] + (a + 0.5) * ws) * gtr) - g0[0], qy = (int64_t)floor((org[1] + o3[1] + (b + 0.5) * ws) * gtr) - g0[1],
                                       qx = (int64_t)floor((org[2] + o3[2] + (c2 + 0.5) * ws) * gtr) - g0[2];
                         gtc = gtb[((size_t)qz * gn3[1] + qy) * gn3[2] + qx]; if (gtc > 252) gtc = 0;
+                        if (gtph) {   /* UFSM_WCHECK_PHASE=1: the check array is a stored phase raster (PHASE_*), sub-turn histograms only */
+                            const int pc = gtc ? gtc : gtb[((size_t)qz * gn3[1] + qy) * gn3[2] + qx] == 0 ? 0 : -1; gtc = 0;
+                            if (pc >= 0 && fz >= 0 && fy >= 0 && fx >= 0 && fz < gf->f.D && fy < gf->f.H && fx < gf->f.W) {
+                                const fit_fields *f = &gf->f; const size_t i = ((size_t)fz * f->H + fy) * f->W + fx;
+                                const double mc = (f->pc[i] - 128) / 127.0, ms = (f->ps[i] - 128) / 127.0, cf = sqrt(mc * mc + ms * ms), Wg = wg[((size_t)a * n3[1] + b) * n3[2] + c2];
+                                const int pk = f->sp && f->sp[i] && f->sp[i] * f->h / 8.0 < 10.4;
+                                const double g = psg * pc / 252.0; double dl = Wg - g, dn = atan2(ms, mc) / (2 * M_PI) - g; dl -= floor(dl); dn -= floor(dn);
+                                const int bl = (int)(dl * 18 + 0.5) % 18, bn = (int)(dn * 18 + 0.5) % 18;
+                                double e = Wg - atan2(ms, mc) / (2 * M_PI); e -= floor(e + 0.5);
+                                if (f->w[i] >= gm * 255 && cf > 0.05) hph[pk][2][bn]++;
+                                if (cf >= gc && f->w[i] >= gm * 255 && fabs(e) <= ge) { hph[pk][0][bl]++; hph[pk][1][bn]++; }
+                            }
+                        }
                         if (gtc) { ha[(wind_dense_code(W) - (gtc - 1) + 252) % 252]++; lha[(wind_dense_code(W) - (gtc - 1) + 252) % 252]++; }
                     }
                     if (fz < 0 || fy < 0 || fx < 0 || fz >= f->D || fy >= f->H || fx >= f->W) continue;
                     const size_t i = ((size_t)fz * f->H + fy) * f->W + fx;
                     const double mc = (f->pc[i] - 128) / 127.0, ms = (f->ps[i] - 128) / 127.0, cf = sqrt(mc * mc + ms * ms), Wg = wg[((size_t)a * n3[1] + b) * n3[2] + c2];
-                    if (cf < gc || f->w[i] < gm * 255) continue;
+                    const int pk = f->sp && f->sp[i] && f->sp[i] * f->h / 8.0 < 10.4;
                     double e = Wg - atan2(ms, mc) / (2 * M_PI); e -= floor(e + 0.5);
+                    const int dW = gtc ? ((wind_dense_code(W) - (gtc - 1)) % 18 + 18) % 18 : 0, dN = gtc ? ((int)lround(dW - 18 * e) % 18 + 18) % 18 : 0;
+                    if (gtc && f->w[i] >= gm * 255 && cf > 0.05) hph[pk][2][dN]++;
+                    if (cf < gc || f->w[i] < gm * 255) continue;
                     gcs += cf * cos(2 * M_PI * e); gcw += cf;
                     if (fabs(e) > ge) continue;
+                    {   int known = 0;
+                        for (int k = 0; k < nsk && !known; k++) {
+                            const int64_t qz = (int64_t)floor((org[0] + o3[0] + (a + 0.5) * ws) * skr[k]) - sk0[k][0], qy = (int64_t)floor((org[1] + o3[1] + (b + 0.5) * ws) * skr[k]) - sk0[k][1],
+                                          qx = (int64_t)floor((org[2] + o3[2] + (c2 + 0.5) * ws) * skr[k]) - sk0[k][2];
+                            known = skb[k][((size_t)qz * skn[k][1] + qy) * skn[k][2] + qx] != 255;
+                        }
+                        if (known) { gskip++; continue; } }
                     ((uint8_t *)sb)[o] = m14 == 3 ? fit_phase_code(Wg, psg) : (uint8_t)(wind_dense_code(W) + (m14 == 2)); gk++;
-                    if (gtc) { hk[(wind_dense_code(W) - (gtc - 1) + 252) % 252]++; lhk[(wind_dense_code(W) - (gtc - 1) + 252) % 252]++; }
+                    if (gtc) { hk[(wind_dense_code(W) - (gtc - 1) + 252) % 252]++; lhk[(wind_dense_code(W) - (gtc - 1) + 252) % 252]++; hph[pk][0][dW]++; hph[pk][1][dN]++; }
                     continue;
                 }
                 if (m14 == 3) { ((uint8_t *)sb)[o] = fit_phase_code(wg[((size_t)a * n3[1] + b) * n3[2] + c2], psg); continue; }
@@ -1372,7 +1416,9 @@ static int cmd_fit(int argc, char **argv) {
         }
         fit_set_dev_free(gd); free(wv); free(wg);
         if (gate) { fprintf(stderr, "fit: --winding-gate %g,%g,%g: %lld of %lld voxels labelled (%.1f%%); conf-weighted mean cos 2 pi (W - phase) %.3f over the confident material\n",
-                            gc, ge, gm, gk, gn, gn ? 100.0 * gk / gn : 0.0, gcw > 0 ? gcs / gcw : 0.0); if (gf == &gb) fit_fields_free(&gb); }
+                            gc, ge, gm, gk, gn, gn ? 100.0 * gk / gn : 0.0, gcw > 0 ? gcs / gcw : 0.0); if (gf == &gb) fit_fields_free(&gb);
+                    if (nsk) fprintf(stderr, "fit: --winding-skip: %lld gated voxels left unknown (GT labelled)\n", gskip); }
+        for (int k = 0; k < nsk; k++) { z3_close(skz[k]); free(skb[k]); }
         if (gtz) {   /* best gauge (code offset) of each histogram, share within +-9 codes (0.5 turn) and within +-2 (0.11 turn) */
             for (int pass = 0; pass < 2; pass++) {
                 const long long *hh = pass ? hk : ha; long long tot = 0, best = -1; int bo = 0;
@@ -1383,6 +1429,13 @@ static int cmd_fit(int argc, char **argv) {
                         pass ? "gated" : "all  ", tot, bo > 126 ? bo - 252 : bo, (bo > 126 ? bo - 252 : bo) / 18.0, tot ? (double)best / tot : 0.0, tot ? (double)s2 / tot : 0.0);
             }
             fprintf(stderr, "fit: --winding-check per %d^3 grid block (own gauge): right (|dq| < 0.5) all %.4f, gated %.4f\n", BK, ltot[0] ? (double)lbest[0] / ltot[0] : 0.0, ltot[1] ? (double)lbest[1] / ltot[1] : 0.0);
+            for (int pk = 0; pk < 2; pk++) for (int k = 0; k < 3; k++) {   /* share within 1/4 turn (+-4 codes of 18) at offset 0 and at the best offset */
+                long long tot = 0, s0 = 0, sb = 0; int bo = 0;
+                for (int j = 0; j < 18; j++) tot += hph[pk][k][j];
+                for (int o = 0; o < 18; o++) { long long sw = 0; for (int j = -4; j <= 4; j++) sw += hph[pk][k][(o + j + 18) % 18]; if (!o) s0 = sw; if (sw > sb) { sb = sw; bo = o; } }
+                fprintf(stderr, "fit: --winding-check phase %s %s: %lld voxels, within 1/4 turn %.4f (offset 0), %.4f (best offset %+d/18)\n", pk ? "packed" : "sparse",
+                        k == 0 ? "label frac(W), gated" : k == 1 ? "network phase, gated" : "network phase, all  ", tot, tot ? (double)s0 / tot : 0.0, tot ? (double)sb / tot : 0.0, bo > 9 ? bo - 18 : bo);
+            }
             z3_close(gtz); free(gtb);
         }
         z3w_close(zw); free(sb);
