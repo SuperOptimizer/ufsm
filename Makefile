@@ -497,6 +497,7 @@ test-all: $(B)/test_gpu_aug $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover 
 	./$(B)/test_stitch
 	./$(B)/test_fblend
 	./$(B)/test_countfield
+	./$(B)/test_spiralfit
 	./$(B)/test_tta
 	./$(B)/test_predict_unwrap2 ./$(B)/ufsm
 	./$(B)/test_coreline
