@@ -30,6 +30,9 @@ typedef struct {
     uint16_t *comp;     /* [T][T][L] unwrap component of ph (0 = no label): the loss is shift-invariant per component, so each component
                            must be internally consistent (no integer slips inside it); split rather than guess */
     float *pw;          /* [T][T][L] per-voxel target weight in [0, 1] (nullptr: 1 where comp != 0); holdout / exclusion tubes = 0 */
+    uint8_t *shell;     /* [T][T][L] 1 = a verified surface-patch shell voxel (a sheet is here; spiral-input patches, ufsm patch-raster),
+                           nearest through the same source lattice as the GT, 0 inside the ray-check tubes; nullptr when no source has
+                           shells (then no shell loss) */
     double o[3], a[3], b[3], d[3];   /* frame (xyz, scan voxels of the CT level) */
     int src;            /* source index (sources json order) */
     int flags;          /* bit 0: the ray points inward (toward the umbilicus) */
