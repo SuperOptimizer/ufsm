@@ -167,6 +167,7 @@ static int usage(void) {
         "  ufsm blend <out-group> <out-um> --shape Z,Y,X --interior S <root> <key> <oz,oy,ox>...   shifted predict runs -> one seamless sin^2-weighted logit average\n"
         "  ufsm wrapdist <wraps-dir> <labels-root> <labels-key>              wrap vertices vs the nearest labelled sheet\n"
         "  ufsm wrapswitch <wraps-dir> <codes-root> <codes-key>            how often the wraps switch sheets (per cm)\n"
+        "  ufsm wrap-check <model> <fields-dir> [--ct ROOT KEY --ct-um U] [--codes ROOT KEY]   duplicate / merged wraps: CT peaks between adjacent wraps along radial rays\n"
         "  ufsm surf-snap <wraps-in> <wraps-out> --volume ROOT KEY --vol-um U   tifxyz vertices onto the nearest papyrus ridge\n"
         "  ufsm refine <wraps-in> <wraps-out> --fields DIR [--range 0.33] [--smooth-um 40]   vertices onto the fields' sheet phase\n"
         "  ufsm surf-stats <wraps-dir> --fields DIR [--ct ROOT KEY --ct-um U]   label-free surface quality (phase, switches, CT)\n"
@@ -3787,6 +3788,7 @@ static int cmd_sample(int argc, char **argv) {
 
 int cmd_repack(int argc, char **argv);   /* src/repack.c */
 int cmd_fit_join(int argc, char **argv);   /* src/fitjoin.c */
+int cmd_wrap_check(int argc, char **argv);   /* src/wrapcheck.c */
 int cmd_fields_oracle(int argc, char **argv);   /* src/fieldsoracle.c */
 int cmd_flatten(int argc, char **argv);         /* src/flatten.c */
 int cmd_flatten_warp(int argc, char **argv);
@@ -3828,6 +3830,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "band")) return cmd_band(argc, argv);
     if (!strcmp(cmd, "fit")) return cmd_fit(argc, argv);
     if (!strcmp(cmd, "fit-join")) return cmd_fit_join(argc, argv);
+    if (!strcmp(cmd, "wrap-check")) return cmd_wrap_check(argc, argv);
     if (!strcmp(cmd, "fields-oracle")) return cmd_fields_oracle(argc, argv);
     if (!strcmp(cmd, "flatten")) return cmd_flatten(argc, argv);
     if (!strcmp(cmd, "flatten-warp")) return cmd_flatten_warp(argc, argv);

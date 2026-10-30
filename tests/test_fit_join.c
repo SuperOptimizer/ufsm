@@ -137,6 +137,26 @@ int main(void) {
         }
         fit_set_free(S2); fit_set_free(R);
     }
+    {   /* fit_join_solve (fit-join --global): 30 slabs, true gauges T; consecutive overlaps say T_k - T_k-1 except boundary 10, which says
+           one more (a confident bad overlap: the chain shifts every slab above it); a noisy ref per slab (the truth cheapest, the
+           neighbours close) and one longer edge 3 -> 5. The capped costs let the ref outvote the bad overlap: every gauge right. */
+        enum { NS = 30 }; long T[NS], S[NS]; fj_table u[NS]; fj_edge e[NS + 1]; int ne = 0;
+        long uv[NS][3]; double uc[NS][3]; long ev[NS + 1][1]; double ec[NS + 1][1];
+        for (int k = 0; k < NS; k++) T[k] = 7 + (k * 5) % 3 - k / 4;
+        for (int k = 0; k < NS; k++) {
+            uv[k][0] = T[k] - 1; uv[k][1] = T[k]; uv[k][2] = T[k] + 1; uc[k][0] = 0.9; uc[k][1] = 0; uc[k][2] = 0.9;
+            u[k] = (fj_table){uv[k], uc[k], 3, 3.0};
+        }
+        for (int k = 1; k < NS; k++) { ev[ne][0] = T[k] - T[k - 1] + (k == 10); ec[ne][0] = 0; e[ne] = (fj_edge){k - 1, k, {ev[ne], ec[ne], 1, 3.0}}; ne++; }
+        ev[ne][0] = T[5] - T[3]; ec[ne][0] = 0; e[ne] = (fj_edge){3, 5, {ev[ne], ec[ne], 1, 3.0}}; ne++;
+        long Sc[NS]; Sc[0] = 0; for (int k = 1; k < NS; k++) Sc[k] = Sc[k - 1] + e[k - 1].t.v[0];
+        int chain_bad = 0; for (int k = 0; k < NS; k++) chain_bad += Sc[k] - Sc[0] != T[k] - T[0];
+        for (int k = 0; k < NS; k++) S[k] = T[k] + (k % 7 == 3 ? 2 : 0);   /* a start a few turns off */
+        const double E = fit_join_solve(NS, u, ne, e, 12, S);
+        int bad = 0; for (int k = 0; k < NS; k++) bad += S[k] != T[k];
+        printf("fit_join_solve: chain wrong on %d of %d slabs, the global solve on %d (energy %.2f)\n", chain_bad, NS, bad, E);
+        CHECK(chain_bad == NS - 10 && bad == 0, "fit_join_solve: %d gauges wrong (chain %d)", bad, chain_bad);
+    }
     snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir); if (system(cmd)) fprintf(stderr, "(could not remove %s)\n", dir);
     if (fails) { fprintf(stderr, "test_fit_join: %d failure(s)\n", fails); return 1; }
     printf("test_fit_join: OK\n");
