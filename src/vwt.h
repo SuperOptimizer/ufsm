@@ -83,7 +83,14 @@ void vt_up2_bwd(vt_t gy, vt_t gx);
 /* channel concat y = [a | b] and its split */
 void vt_cat_fwd(vt_t a, vt_t b, vt_t y);
 void vt_cat_bwd(vt_t gy, vt_t ga, vt_t gb);
-void vt_cat_bf16(const float *a, int ca, const uint16_t *b, int cb, long long rows, float *y);   /* y [rows][ca + cb] = [a | float(b)] */
+void vt_cat_bf16(const float *a, int ca, const uint16_t *b, int cb, long long rows, float *y);
+/* bf16 padded input of the cfg.cx nets ([rows][C], C % 32 == 0): channels 0 / 1 = vt_input's, trunk features at c0 (vt_feat_bf: from a
+   dense [rows][cx] buffer), the input conv straight from it (forward; weight + bias gradient, no input gradient) */
+void vt_input_bf(const uint8_t *im, const uint8_t *va, long long n, int C, uint16_t *x);
+void vt_feat_bf(const uint16_t *f, int cx, long long rows, int C, int c0, uint16_t *x);
+int vt_conv_fwd_bfin(const uint16_t *x, int n, int D, int H, int W, int C, int ci, const float *w, const float *b, int k, int sd, int sh, int sw, vt_t y, void *scratch);
+int vt_conv_wgrad_bfin(const uint16_t *x, int n, int D, int H, int W, int C, int ci, vt_t gy, const float *w, int k, int sd, int sh, int sw, float *gw, float *gb, void *scratch);
+int vtf_conv_bwd_feat(vt_t gy, const float *w, int ci, int k, int sd, int sh, int sw, int D, int H, int W, int c0, int c1, uint16_t *out, int ld, void *scratch);   /* bf16 d/d input channels [c0, c1) */   /* y [rows][ca + cb] = [a | float(b)] */
 void vt_add(float *y, const float *x, size_t n);   /* y += x */
 void vt_input(const uint8_t *im, const uint8_t *va, long long n, float *x);   /* device u8 [n] -> x [n][2] (standardised image, valid) */
 void vt_transpose(const float *x, float *y, long long A, long long B, int C);   /* rows [A][B][C] -> [B][A][C] */
@@ -122,6 +129,12 @@ int vwt_backward(vwt *m, const float *gph, const float *ginc);   /* after vwt_fo
 void vwt_free(vwt *m);
 /* extra input features (cfg.cx > 0): device bf16 [T][T][L][cx] channels-last, read by the next vwt_forward (the pointer is kept) */
 void vwt_set_xfeat(vwt *m, const uint16_t *xf);   /* bf16 [T][T][L][cx] */
+/* the features' place in the network's own bf16 input (row stride *ld channels; cfg.cx nets): a trunk writing there (wt_forward_ld) saves the
+   copy; it becomes the feature source (vwt_set_xfeat replaces it). nullptr without cfg.cx */
+uint16_t *vwt_xfeat_buf(vwt *m, int *ld);
+const vwt_cfg *vwt_cfg_of(const vwt *m);
+/* the next backwards also write d loss / d trunk features (bf16 rows of ld >= cx channels, the cfg.cx input channels in order; nullptr: off) */
+void vwt_set_xgrad(vwt *m, uint16_t *g, int ld);
 /* warm start from a checkpoint with the same architecture except cx: every parameter copied, the first conv's taps of the extra input
    channels zero (so the start computes exactly the source model); 0 on success */
 int vwt_init_from(vwt *m, const char *path, int use_ema);
@@ -131,6 +144,9 @@ int vwt_init_from(vwt *m, const char *path, int use_ema);
    (0 when too few shared samples), *nshared out */
 double vt_multiview(const float *pha, const float *phb, const uint8_t *va, const uint8_t *vb, const double fa[4][3], const double fb[4][3], int T, int L,
                     int st, float delta, float lam, float scale, float *gph, long *nshared);
+/* the same on the device (pha / phb / va / vb / gph device buffers; gph += the gradient): no host copies, two small syncs */
+double vt_multiview_dev(const float *pha, const float *phb, const uint8_t *va, const uint8_t *vb, const double fa[4][3], const double fb[4][3], int T, int L,
+                        int st, float delta, float lam, float scale, float *gph, long *nshared);
 int vwt_save(const vwt *m, const char *path, const float *ema, const void *extra, size_t extra_bytes);
 vwt *vwt_load(const char *path, int use_ema);
 

@@ -17,6 +17,7 @@
 
 struct V8P {
     const uint8_t *xq, *xs, *wq, *ws; const float *bias; float *y;
+    __nv_bfloat16 *yb; int yld, yc0, yc1;   /* yb: bf16 output of columns [yc0, yc1) at yb[m yld + co - yc0] instead of y (vtf8_conv_bwd_bfout) */
     int D, H, W, C, SB;      /* A source dims, its scale row stride (bytes) */
     int Do, Ho, Wo;          /* row grid */
     int k, sd, sh, sw, p;
@@ -199,6 +200,12 @@ __global__ void __launch_bounds__(256, 2) vtf8_igemm(V8P p) {
 #pragma unroll
         for (int h = 0; h < 2; h++) {
             const long long m = m_base + wm0 + mi * 16 + g + h * 8; if (m >= p.M) continue;
+            if (p.yb) {
+                __nv_bfloat16 *yr_ = p.yb + m * p.yld - p.yc0;
+                if (co >= p.yc0 && co < p.yc1) yr_[co] = __float2bfloat16_rn(acc[mi][ni][2 * h]);
+                if (co + 1 >= p.yc0 && co + 1 < p.yc1) yr_[co + 1] = __float2bfloat16_rn(acc[mi][ni][2 * h + 1]);
+                continue;
+            }
             float *yr_ = p.y + m * p.N;
             if (co < p.N) yr_[co] = acc[mi][ni][2 * h] + (p.bias ? p.bias[co] : 0.f);
             if (co + 1 < p.N) yr_[co + 1] = acc[mi][ni][2 * h + 1] + (p.bias ? p.bias[co + 1] : 0.f);
@@ -297,12 +304,52 @@ extern "C" int vtf8_conv(int mode, int bits, const float *src, int n, int D, int
         k_v16_cvt<<<v8_blocks(rows * (C / 8)), 256>>>(src, rows * (C / 8), (uint4 *)xq);
         k_v16_wprep<<<v8_blocks((long long)Np * K), 256>>>(w, co, T, ci, Np, K, mode, (__nv_bfloat16 *)wq);
     }
-    V8P p; p.xq = xq; p.xs = xs; p.wq = wq; p.ws = ws; p.bias = bias; p.y = y;
+    V8P p; p.xq = xq; p.xs = xs; p.wq = wq; p.ws = ws; p.bias = bias; p.y = y; p.yb = nullptr; p.yld = p.yc0 = p.yc1 = 0;
     p.D = D; p.H = H; p.W = W; p.C = C; p.SB = SB; p.Do = Do; p.Ho = Ho; p.Wo = Wo; p.k = k; p.sd = sd; p.sh = sh; p.sw = sw; p.p = k / 2;
     p.K = K; p.N = N; p.WSB = WSB; p.M = M;
     if (M <= 0) return 0;
     const bool ts = mode == 1 && (sd > 1 || sh > 1 || sw > 1);
     if (mode == 0) { if (f8) v8_launch<0, true>(p, bt, ts); else v8_launch<0, false>(p, bt, ts); }
     else { if (f8) v8_launch<1, true>(p, bt, ts); else v8_launch<1, false>(p, bt, ts); }
+    return cudaGetLastError() == cudaSuccess ? 0 : -1;
+}
+
+/* forward from a bf16 source already in the kernel's layout ([rows][C] channels-last, C % 32 == 0; channels ci .. C - 1 zero): no input
+   conversion; the weights w [co][T][ci] padded to C channels per tap (the vwt input conv: CT, valid and trunk features, src/vwt_net.c) */
+__global__ void k_v16_wprep_pad(const float *__restrict__ w, int co, int T, int ci, int C, int Np, int K, __nv_bfloat16 *__restrict__ q) {
+    const long long n = (long long)Np * K;
+    for (long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; i < n; i += (long long)gridDim.x * blockDim.x) {
+        const int r = (int)(i / K), kk = (int)(i % K), t = kk / C, c = kk % C;
+        q[i] = __float2bfloat16_rn(r < co && c < ci ? w[((size_t)r * T + t) * ci + c] : 0.f);
+    }
+}
+extern "C" int vtf8_conv_bfin(const void *xb, int n, int D, int H, int W, int C, int ci, const float *w, int co, int k, int sd, int sh, int sw,
+                              int Do, int Ho, int Wo, const float *bias, float *y, void *wbuf) {
+    if (!vtf8_ok(C, co) || ci > C || sd < 1 || sd > 2 || sh < 1 || sh > 2 || sw < 1 || sw > 2) return -1;
+    const long long M = (long long)n * Do * Ho * Wo; const int T = k * k * k, K = T * C, bt = v8_tile(co), Np = (co + bt - 1) / bt * bt;
+    k_v16_wprep_pad<<<v8_blocks((long long)Np * K), 256>>>(w, co, T, ci, C, Np, K, (__nv_bfloat16 *)wbuf);
+    V8P p; p.xq = (const uint8_t *)xb; p.xs = nullptr; p.wq = (const uint8_t *)wbuf; p.ws = nullptr; p.bias = bias; p.y = y; p.yb = nullptr; p.yld = p.yc0 = p.yc1 = 0;
+    p.D = D; p.H = H; p.W = W; p.C = C; p.SB = 0; p.Do = Do; p.Ho = Ho; p.Wo = Wo; p.k = k; p.sd = sd; p.sh = sh; p.sw = sw; p.p = k / 2;
+    p.K = K; p.N = co; p.WSB = 0; p.M = M;
+    if (M <= 0) return 0;
+    v8_launch<0, false>(p, bt, false);
+    return cudaGetLastError() == cudaSuccess ? 0 : -1;
+}
+
+/* backward-data of a conv into input channels [c0, c1) as bf16 rows of ld (the vwt input conv's gradient at the trunk features): gy fp32
+   [n][Do][Ho][Wo][co] (co % 32 == 0), w [co][T][ci]; columns N = c1 rounded up to 16 (>= 32) */
+extern "C" int vtf8_conv_bwd_bfout(const float *gy, int n, int Do, int Ho, int Wo, int co, const float *w, int ci, int k, int sd, int sh, int sw,
+                                   int D, int H, int W, int c0, int c1, void *out, int ld, void *qbuf, void *wbuf) {
+    int N = (c1 + 15) / 16 * 16; if (N < 32) N = 32;
+    if (!vtf8_ok(co, N) || c1 > ci || sd < 1 || sd > 2 || sh < 1 || sh > 2 || sw < 1 || sw > 2) return -1;
+    const long long rows = (long long)n * Do * Ho * Wo, M = (long long)n * D * H * W; const int T = k * k * k, K = T * co, bt = v8_tile(N), Np = (N + bt - 1) / bt * bt;
+    uint8_t *xq = (uint8_t *)qbuf, *wq = (uint8_t *)wbuf;
+    k_v16_cvt<<<v8_blocks(rows * (co / 8)), 256>>>(gy, rows * (co / 8), (uint4 *)xq);
+    k_v16_wprep<<<v8_blocks((long long)Np * K), 256>>>(w, co, T, ci, Np, K, 1, (__nv_bfloat16 *)wq);
+    V8P p; p.xq = xq; p.xs = nullptr; p.wq = wq; p.ws = nullptr; p.bias = nullptr; p.y = nullptr; p.yb = (__nv_bfloat16 *)out; p.yld = ld; p.yc0 = c0; p.yc1 = c1;
+    p.D = Do; p.H = Ho; p.W = Wo; p.C = co; p.SB = 0; p.Do = D; p.Ho = H; p.Wo = W; p.k = k; p.sd = sd; p.sh = sh; p.sw = sw; p.p = k / 2;
+    p.K = K; p.N = N; p.WSB = 0; p.M = M;
+    if (M <= 0) return 0;
+    v8_launch<1, false>(p, bt, sd > 1 || sh > 1 || sw > 1);
     return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }

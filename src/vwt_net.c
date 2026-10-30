@@ -29,7 +29,8 @@ struct vwt {
     float *tokin[2 * MAXB]; float *tok, *tmp; vt_t tokv;           /* block inputs (ray: R order, transverse: T order); final tokens */
     vt_t up1, cat1; cact d0, d1; vt_t up0, cat0; cact h0; vt_t lg; float *inc, *ph;
     void *scratch; void *ws_mem; at_ws ws; at_geom gr, gt;
-    int built; const uint16_t *xf; float *x2;   /* extra features (cfg.cx) and the CT + valid pair they are packed with */
+    int built; const uint16_t *xf; uint16_t *xb; int xC; uint16_t *xg; int xgld;   /* extra features (cfg.cx); the bf16 input [T][T][L][xC] (CT, valid, features, zero
+                                                           channels to xC % 32 == 0) the input conv reads directly */
 };
 
 /* env UFSM_VWT_PROF=1: synchronising section timers (forward / backward: enc, trunk_in + stem, blocks, decoder + head) printed per call */
@@ -99,7 +100,11 @@ static void cact_alloc(cact *a, vt_t in, int co, int s) {
 static void build(vwt *m) {
     if (m->built) return;
     const vwt_cfg *c = &m->cfg; const int T = c->T, L = c->L;
-    m->x0 = vnew(T, T, L, 2 + c->cx); vt_t in = m->x0; if (c->cx) m->x2 = nn_malloc((size_t)T * T * L * 2 * 4);
+    if (c->cx) {   /* (x0: the shape only) */
+        m->xC = (2 + c->cx + 31) / 32 * 32; m->xb = nn_malloc((size_t)T * T * L * m->xC * 2); nn_zero(m->xb, (size_t)T * T * L * m->xC * 2);
+        m->x0 = (vt_t){nullptr, 1, T, T, L, 2 + c->cx};
+    } else m->x0 = vnew(T, T, L, 2);
+    vt_t in = m->x0;
     for (int s = 0; s < 3; s++) { cact_alloc(&m->e[s][0], in, c->ch[s], 2); cact_alloc(&m->e[s][1], m->e[s][0].a, c->ch[s], 1); in = m->e[s][1].a; }
     cact_alloc(&m->ti, in, c->trunk, 1); in = m->ti.a;
     for (int k = 0; k < c->stem; k++) { cact_alloc(&m->st[k][0], in, c->trunk, 1); cact_alloc(&m->st[k][1], m->st[k][0].a, c->trunk, 1); m->stout[k] = vnew(in.d, in.h, in.w, c->trunk); in = m->stout[k]; }
@@ -138,9 +143,13 @@ int vwt_forward(vwt *m, const uint8_t *im, const uint8_t *va, float *ph, float *
     double tp[6] = {0}; PT(0);
     if (c->cx) {   /* [CT, valid | extra features] */
         if (!m->xf) { fprintf(stderr, "vwt_forward: cfg.cx %d but no features (vwt_set_xfeat)\n", c->cx); return -1; }
-        vt_input(im, va, (long long)T * T * L, m->x2); vt_cat_bf16(m->x2, 2, m->xf, c->cx, (long long)T * T * L, m->x0.p);
+        vt_input_bf(im, va, (long long)T * T * L, m->xC, m->xb);
+        if (m->xf != m->xb + 2) vt_feat_bf(m->xf, c->cx, (long long)T * T * L, m->xC, 2, m->xb);   /* (vwt_xfeat_buf: written there already) */
+        const pconv *p = &m->enc[0][0]; cact *a = &m->e[0][0];
+        if (vt_conv_fwd_bfin(m->xb, 1, T, T, L, m->xC, 2 + c->cx, m->P + p->w, m->P + p->b, p->k, p->s, p->s, 1, a->c, m->scratch)) return -1;
+        vt_ln_fwd(a->c, m->P + p->g, m->P + p->be, 1, a->a, a->mean, a->rstd);
     } else vt_input(im, va, (long long)T * T * L, m->x0.p);
-    for (int s = 0; s < 3; s++) { if (conv_ln_fwd(m, &m->enc[s][0], &m->e[s][0], 1) || conv_ln_fwd(m, &m->enc[s][1], &m->e[s][1], 1)) return -1; }
+    for (int s = 0; s < 3; s++) { if ((!(s == 0 && c->cx) && conv_ln_fwd(m, &m->enc[s][0], &m->e[s][0], 1)) || conv_ln_fwd(m, &m->enc[s][1], &m->e[s][1], 1)) return -1; }
     PT(1);
     if (conv_ln_fwd(m, &m->tin, &m->ti, 1)) return -1;
     for (int k = 0; k < c->stem; k++) {
@@ -225,7 +234,12 @@ int vwt_backward(vwt *m, const float *gph, const float *ginc) {
         if (conv_ln_bwd(m, &m->enc[s][1], &m->e[s][1], 1, gcur, LIKE(m->e[s][1].c, gC), ga)) return -1;
         float *o2 = o1 == gA ? gB : gA;
         vt_t gin = s ? LIKE(m->e[s][0].in, o2) : (vt_t){nullptr, 0, 0, 0, 0, 0};
-        if (conv_ln_bwd(m, &m->enc[s][0], &m->e[s][0], 1, ga, LIKE(m->e[s][0].c, gC), gin)) return -1;
+        if (s == 0 && c->cx) {   /* the bf16 padded input conv: weight + bias gradients only */
+            const pconv *p = &m->enc[0][0]; cact *a = &m->e[0][0]; const vt_t gc = LIKE(a->c, gC);
+            vt_ln_bwd(a->c, m->P + p->g, m->P + p->be, 1, a->mean, a->rstd, ga, gc, m->G + p->g, m->G + p->be);
+            if (vt_conv_wgrad_bfin(m->xb, 1, c->T, c->T, L, m->xC, 2 + c->cx, gc, m->P + p->w, p->k, p->s, p->s, 1, m->G + p->w, m->G + p->b, m->scratch)) return -1;
+            if (m->xg && vtf_conv_bwd_feat(gc, m->P + p->w, 2 + c->cx, p->k, p->s, p->s, 1, c->T, c->T, L, 2, 2 + c->cx, m->xg, m->xgld, m->scratch)) return -1;
+        } else if (conv_ln_bwd(m, &m->enc[s][0], &m->e[s][0], 1, ga, LIKE(m->e[s][0].c, gC), gin)) return -1;
         gcur = gin;
     }
     nn_free(gsk0.p); nn_free(gsk1.p);
@@ -236,6 +250,9 @@ int vwt_backward(vwt *m, const float *gph, const float *ginc) {
 }
 
 void vwt_set_xfeat(vwt *m, const uint16_t *xf) { m->xf = xf; }
+const vwt_cfg *vwt_cfg_of(const vwt *m) { return &m->cfg; }
+void vwt_set_xgrad(vwt *m, uint16_t *g, int ld) { m->xg = g; m->xgld = ld; }
+uint16_t *vwt_xfeat_buf(vwt *m, int *ld) { build(m); if (!m->cfg.cx) return nullptr; if (ld) *ld = m->xC; m->xf = m->xb + 2; return m->xb + 2; }
 
 /* checkpoint header: "VWT1" (cfg without cx) or "VWT2" (full cfg) */
 static int read_hdr(FILE *f, vwt_cfg *cfg) {

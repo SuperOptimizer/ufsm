@@ -4,6 +4,7 @@
 
    ufsm vwt-infer CKPT ROOT KEY OUT (--tiling T.bin | --umb JSON --box z,y,x,nz,ny,nx) [--gpu 0] [--part i/n] [--threads 16] [--cache DIR] [--mx8 1]
                   [--resume 1]   (skip the slabs whose centre OUT/centre.f32 already holds)
+                  [--trunk WIND96.ckpt | --trunk-ckpt RUN/latest.wt] --umb JSON --um UM   (cfg.cx models: the in-slab wind96 trunk first, src/wtrunk.h)
    ufsm vwt-infer --bench N [--gpu 0]      synthetic CT band and tiling, random weights: slabs / s of the pipeline
 
    Parts take whole z bands round robin; each part writes NaN centres for its skipped slabs (> 98 % zero CT), so with every part run each
@@ -20,6 +21,8 @@
 #include "store.h"
 #include "zarr3.h"
 #include "vwt_tile.h"
+#include "wtrunk.h"
+#include "sources.h"
 #include <fcntl.h>
 #include <unistd.h>
 #include <math.h>
@@ -134,8 +137,23 @@ int cmd_vwt_infer(int argc, char **argv) {
        0.002, max 0.025 turns, pair offsets max 0.012 turns; 7.5 % faster */
     if (!getenv("UFSM_VTF_MX")) vtf_set_mx(atoi(opt(argc, argv, "--mx8", "1")) ? 8 : 0);
     vwt *m; vwt_cfg c = default_cfg(T, L);
+    if (bench && (*opt(argc, argv, "--trunk", "") || *opt(argc, argv, "--trunk-ckpt", ""))) c.cx = atoi(opt(argc, argv, "--cx", "43"));   /* (bench: random weights) */
     m = bench ? vwt_create(&c, 1) : vwt_load(argv[2], 1);
     if (!m) { fprintf(stderr, "vwt-infer: no model\n"); return 1; }
+    /* --trunk CKPT (wind96; --trunk-ckpt WT: a fine-tuned trunk instead) --umb JSON --um UM: the frozen trunk in-slab before the model, as
+       vwt-train runs it (axis point at the slab centre's z from the umbilicus, axis direction +z, the CT level's voxel size) */
+    wtrunk *WT = nullptr; uint16_t *xfd = nullptr; int xld = 0; axis tax = {0};
+    const double tum = atof(opt(argc, argv, "--um", "9.6"));
+    if (*opt(argc, argv, "--trunk", "") || *opt(argc, argv, "--trunk-ckpt", "")) {
+        const char *tp = *opt(argc, argv, "--trunk-ckpt", "") ? opt(argc, argv, "--trunk-ckpt", "") : opt(argc, argv, "--trunk", "");
+        if (bench) { static double bz[2] = {0, 1e6}, by[2] = {1024, 1024}, bxx[2] = {1024, 1024}; tax.n = 2; tax.z = bz; tax.y = by; tax.x = bxx; }   /* (the bench volume's axis) */
+        else if (!*opt(argc, argv, "--umb", "") || axis_load(&tax, opt(argc, argv, "--umb", ""))) { fprintf(stderr, "vwt-infer: --trunk needs --umb JSON (the axis input)\n"); return 2; }
+        if (!*opt(argc, argv, "--um", "")) fprintf(stderr, "vwt-infer: --trunk without --um: the trunk's scale input at 9.6 um\n");
+        WT = wt_open(tp, T, L, 1, 1); if (!WT) return 1;
+        xfd = vwt_xfeat_buf(m, &xld);
+        if (!xfd || vwt_cfg_of(m)->cx != wt_channels(WT)) { fprintf(stderr, "vwt-infer: the model takes %d extra channels, the trunk gives %d\n", vwt_cfg_of(m)->cx, wt_channels(WT)); return 1; }
+        fprintf(stderr, "vwt-infer: trunk %s (%d channels) at %.3g um\n", tp, wt_channels(WT), tum);
+    } else if (vwt_cfg_of(m)->cx) { fprintf(stderr, "vwt-infer: the model takes %d trunk channels: --trunk CKPT --umb JSON --um UM\n", vwt_cfg_of(m)->cx); return 2; }
     /* the tiling and the volume */
     z3 *ct = nullptr; store *st = nullptr; int64_t V[3]; vwt_tiling S = {0};
     if (bench) {
@@ -228,6 +246,12 @@ int cmd_vwt_infer(int argc, char **argv) {
             if (!pass) {
                 vwi_count(imd, (long long)nv, cnts + (i - bb->first), 0);
                 continue;
+            }
+            if (WT) {
+                wt_frame fr; for (int e = 0; e < 3; e++) { fr.o[e] = s->o[e]; fr.a[e] = s->ax[e]; fr.b[e] = s->bx[e]; fr.d[e] = s->d[e]; fr.u[e] = e == 2; }
+                const double zc = s->o[2] + 0.5 * (T - 1) * (s->ax[2] + s->bx[2]) + 0.5 * (L - 1) * s->d[2]; double cy, cx; axis_at(&tax, zc, &cy, &cx);
+                fr.c[0] = cx; fr.c[1] = cy; fr.c[2] = zc;
+                if (wt_forward_ld(WT, imd, &fr, 1, tum, xfd, xld)) return 1;
             }
             if (vwt_forward(m, imd, vad, phd, nullptr, 0)) return 1;
             /* the record: wait for a free writer slot (its device and host buffers), then the outputs into it, asynchronously */

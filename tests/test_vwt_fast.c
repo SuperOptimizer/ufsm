@@ -93,6 +93,24 @@ int main(int argc, char **argv) {
         nn_free(x.p); nn_free(w); nn_free(b); nn_free(yr.p); nn_free(yf.p); nn_free(gy.p); nn_free(gxr.p); nn_free(gxf.p); nn_free(gwr); nn_free(gwf); nn_free(gbr); nn_free(gbf);
     }
     if (bench) printf("slab conv total fwd+bwd: reference %.1f ms, fast %.1f ms (%.1f Mvox/s of T 128 L 384 input)\n", tot_ref, tot_fast, 128.0 * 128 * 384 / (tot_fast * 1e3));
+    if (!bench) {   /* the bf16 padded input conv of the cfg.cx nets (CT, valid + 43 trunk channels, padded to 64): forward and weight / bias gradient */
+        const int ci = 45, C = 64, co = 32, dd = 16, Lw = 64; const size_t rows = (size_t)dd * dd * Lw;
+        float *hx = malloc(rows * ci * 4); uint16_t *hb = calloc(rows * C, 2);
+        for (size_t r = 0; r < rows; r++) for (int c = 0; c < ci; c++) { float v = urnd(); uint32_t u; memcpy(&u, &v, 4); u &= 0xffff0000u; memcpy(&v, &u, 4); hx[r * ci + c] = v; hb[r * C + c] = (uint16_t)(u >> 16); }
+        vt_t x = {nn_malloc(rows * ci * 4), 1, dd, dd, Lw, ci}, y = {nullptr, 1, dd / 2, dd / 2, Lw, co};
+        nn_h2d(x.p, hx, rows * ci * 4); uint16_t *xb = nn_malloc(rows * C * 2); nn_h2d(xb, hb, rows * C * 2);
+        const size_t ny = vt_numel(y), nw = (size_t)co * 27 * ci;
+        float *w = dev_rand(nw, 1.f / sqrtf(27.f * ci)), *b = dev_rand(co, 0.1f);
+        vt_t yr = y, yf = y, gy = y; yr.p = dev_zero(ny); yf.p = dev_zero(ny); gy.p = dev_rand(ny, 1.f);
+        float *gwr = dev_zero(nw), *gwf = dev_zero(nw), *gbr = dev_zero(co), *gbf = dev_zero(co);
+        printf("input bf16 padded: %d (%d) -> %d k3 s2 on %dx%dx%d\n", ci, C, co, dd, dd, Lw);
+        int rc = vtr_conv_fwd(x, w, b, 3, 2, 2, 1, yr, scr) | vt_conv_fwd_bfin(xb, 1, dd, dd, Lw, C, ci, w, b, 3, 2, 2, 1, yf, scf);
+        rc |= vtr_conv_bwd(x, gy, w, 3, 2, 2, 1, (vt_t){nullptr, 0, 0, 0, 0, 0}, gwr, gbr, scr) | vt_conv_wgrad_bfin(xb, 1, dd, dd, Lw, C, ci, gy, w, 3, 2, 2, 1, gwf, gbf, scf);
+        nn_sync();
+        if (rc || nn_check()) { printf("  FAIL: call error\n"); fail++; }
+        else { const double e[3] = {cmp("y", yf.p, yr.p, ny), cmp("gw", gwf, gwr, nw), cmp("gb", gbf, gbr, co)}; for (int j = 0; j < 3; j++) if (!(e[j] < 2e-2)) { printf("  FAIL\n"); fail++; break; } }
+        free(hx); free(hb);
+    }
     printf(fail ? "FAIL (%d)\n" : "PASS\n", fail);
     return fail ? 1 : 0;
 }

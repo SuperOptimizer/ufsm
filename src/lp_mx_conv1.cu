@@ -25,7 +25,7 @@ __global__ void conv1_mx_k(const uint8_t *x, const float *w, const float *b, flo
    (co, ci) made the kernel smem-instruction-bound. CO <= 8 (CP 8) or 16 (CP 16: 9..16 outputs, Co at run time). */
 template <int B, int CO, typename YT = float>   /* YT: fp32 or fp16 logits (lean training: the logit gradient fits beside fp16 logits) */
 __global__ void __launch_bounds__(256) conv1_mx_t_k(const uint8_t *x, const float *w, const float *b, YT *y, int N, int Ci, size_t S, gnp_t gp, int Co,
-                                                    size_t vb, size_t Sy) {   /* voxels [vb, vb + Sy) of x into y planes of Sy voxels (head slabs) */
+                                                    size_t vb, size_t Sy, int Cy) {   /* Cy: y's channels per sample (Co, or more: a pass of a wider head) */   /* voxels [vb, vb + Sy) of x into y planes of Sy voxels (head slabs) */
     constexpr int CP = CO <= 8 ? 8 : 16, C4 = CP / 4;
     extern __shared__ __align__(16) float c1s[];
     float4 *sw = (float4 *)c1s;                       /* [Ci][C4] (co 0..3, 4..7, ..) */
@@ -65,7 +65,7 @@ __global__ void __launch_bounds__(256) conv1_mx_t_k(const uint8_t *x, const floa
 #pragma unroll
     for (int co = 0; co < CO; co++) {
         if (co >= Co) break;
-        if constexpr (sizeof(YT) == 2) y[((size_t)n * Co + co) * Sy + vl] = __float2half(acc[co]); else y[((size_t)n * Co + co) * Sy + vl] = acc[co];
+        if constexpr (sizeof(YT) == 2) y[((size_t)n * Cy + co) * Sy + vl] = __float2half(acc[co]); else y[((size_t)n * Cy + co) * Sy + vl] = acc[co];
     }
 }
 /* voxels per block of the head's weight-gradient kernels: at most one slab (slab GroupNorm: a block's voxels span <= 2 slabs, its
@@ -77,9 +77,9 @@ static int slab_nper(const gnp_t &gp, int nper) {
 }
 static bool slab_small(const gnp_t &gp) { return gp.ns && gp.G && (long long)gp.zs * gp.zhw < 256; }   /* staged forward: >= 256 voxels per slab */
 static size_t conv1_smem(shape5 xs, int cout) { return (size_t)(2 * (xs.n > 2 ? xs.n : 2) * xs.c + (cout <= 8 ? 8 : 16) * xs.c) * sizeof(float); }   /* (>= 2 coefficient rows: slab banks) */
-template <int B, int CO, typename YT = float> static void conv1_mx_t(const void *x, shape5 xs, const float *w, const float *b, YT *y, gnp_t gp, int cout, size_t vb = 0, size_t nv = 0) {
+template <int B, int CO, typename YT = float> static void conv1_mx_t(const void *x, shape5 xs, const float *w, const float *b, YT *y, gnp_t gp, int cout, size_t vb = 0, size_t nv = 0, int cy = 0) {
     const size_t S = shape_spatial(xs), sm = conv1_smem(xs, cout), Sy = nv ? nv : S;
-    conv1_mx_t_k<B, CO, YT><<<dim3(nblk_(Sy, 256), xs.n), 256, sm>>>((const uint8_t *)x, w, b, y, xs.n, xs.c, S, gp, cout, vb, Sy);
+    conv1_mx_t_k<B, CO, YT><<<dim3(nblk_(Sy, 256), xs.n), 256, sm>>>((const uint8_t *)x, w, b, y, xs.n, xs.c, S, gp, cout, vb, Sy, cy ? cy : cout);
 }
 /* the same with fp16 logits (unet lean training; the staged path only) */
 extern "C" void lp_conv1_fwd_mx_h16(const void *x, int xdt, shape5 xs, const float *w, const float *b, int cout, void *y, gnp_t gp) {
@@ -87,22 +87,22 @@ extern "C" void lp_conv1_fwd_mx_h16(const void *x, int xdt, shape5 xs, const flo
 }
 /* voxels [vb, vb + nv) of x (nv 0: all) into fp16 planes of nv voxels: the trainer's head slabs (train.c head_slab) */
 extern "C" void lp_conv1_fwd_mx_h16_r(const void *x, int xdt, shape5 xs, const float *w, const float *b, int cout, void *y, gnp_t gp, size_t vb, size_t nv) {
-    if (cout > 16 && cout % 16 == 0 && xs.n == 1) {   /* more outputs: passes of 16 (channel planes of one sample are contiguous) */
-        const size_t Sy = nv ? nv : shape_spatial(xs);
-        for (int c0 = 0; c0 < cout; c0 += 16) lp_conv1_fwd_mx_h16_r(x, xdt, xs, w + (size_t)c0 * xs.c, b ? b + c0 : nullptr, 16, (__half *)y + (size_t)c0 * Sy, gp, vb, nv);
-        return;
-    }
-    if (cout > 16 || conv1_smem(xs, cout) > 32 * 1024) { fprintf(stderr, "lp_conv1_fwd_mx_h16: cout %d / %d inputs unsupported\n", cout, xs.c); abort(); }
+    if (conv1_smem(xs, cout < 16 ? cout : 16) > 32 * 1024) { fprintf(stderr, "lp_conv1_fwd_mx_h16: cout %d / %d inputs unsupported\n", cout, xs.c); abort(); }
     if (slab_small(gp)) { fprintf(stderr, "lp_conv1_fwd_mx_h16: slab GroupNorm with %d voxels per slab (< 256)\n", gp.zs * gp.zhw); abort(); }
-    __half *yh = (__half *)y;
-#define C1H(B) do { switch (cout) { case 1: conv1_mx_t<B, 1>(x, xs, w, b, yh, gp, cout, vb, nv); break; case 2: conv1_mx_t<B, 2>(x, xs, w, b, yh, gp, cout, vb, nv); break; \
-                               case 3: conv1_mx_t<B, 3>(x, xs, w, b, yh, gp, cout, vb, nv); break; case 4: conv1_mx_t<B, 4>(x, xs, w, b, yh, gp, cout, vb, nv); break; \
-                               case 5: conv1_mx_t<B, 5>(x, xs, w, b, yh, gp, cout, vb, nv); break; case 6: conv1_mx_t<B, 6>(x, xs, w, b, yh, gp, cout, vb, nv); break; \
-                               case 7: conv1_mx_t<B, 7>(x, xs, w, b, yh, gp, cout, vb, nv); break; case 8: conv1_mx_t<B, 8>(x, xs, w, b, yh, gp, cout, vb, nv); break; \
-                               case 11: conv1_mx_t<B, 11>(x, xs, w, b, yh, gp, cout, vb, nv); break; \
-                               default: conv1_mx_t<B, 16>(x, xs, w, b, yh, gp, cout, vb, nv); } } while (0)
-    if (xdt == 4) C1H(4); else C1H(8);
+    const size_t Sy = nv ? nv : shape_spatial(xs);
+    for (int c0 = 0; c0 < cout; c0 += 16) {   /* more than 16 outputs: passes of up to 16 (y keeps its cout channels per sample) */
+        const int nc = cout - c0 < 16 ? cout - c0 : 16; const int cy = cout;
+        const float *wc = w + (size_t)c0 * xs.c, *bc = b ? b + c0 : nullptr;
+        __half *yh = (__half *)y + (size_t)c0 * Sy;
+#define C1H(B) do { switch (nc) { case 1: conv1_mx_t<B, 1>(x, xs, wc, bc, yh, gp, nc, vb, nv, cy); break; case 2: conv1_mx_t<B, 2>(x, xs, wc, bc, yh, gp, nc, vb, nv, cy); break; \
+                               case 3: conv1_mx_t<B, 3>(x, xs, wc, bc, yh, gp, nc, vb, nv, cy); break; case 4: conv1_mx_t<B, 4>(x, xs, wc, bc, yh, gp, nc, vb, nv, cy); break; \
+                               case 5: conv1_mx_t<B, 5>(x, xs, wc, bc, yh, gp, nc, vb, nv, cy); break; case 6: conv1_mx_t<B, 6>(x, xs, wc, bc, yh, gp, nc, vb, nv, cy); break; \
+                               case 7: conv1_mx_t<B, 7>(x, xs, wc, bc, yh, gp, nc, vb, nv, cy); break; case 8: conv1_mx_t<B, 8>(x, xs, wc, bc, yh, gp, nc, vb, nv, cy); break; \
+                               case 11: conv1_mx_t<B, 11>(x, xs, wc, bc, yh, gp, nc, vb, nv, cy); break; \
+                               default: conv1_mx_t<B, 16>(x, xs, wc, bc, yh, gp, nc, vb, nv, cy); } } while (0)
+        if (xdt == 4) C1H(4); else C1H(8);
 #undef C1H
+    }
     LPCK();
 }
 extern "C" void lp_conv1_fwd_mx(const void *x, int xdt, shape5 xs, const float *w, const float *b, int cout, float *y, gnp_t gp) {

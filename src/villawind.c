@@ -13,6 +13,7 @@
    origin = ray_origin - (T - 1) / 2 (axis_a + axis_b); trilinear sampling (rounded to uint8), valid = inside the volume. */
 #include "villawind.h"
 #include "vwt.h"
+#include "wtrunk.h"
 #include "nn.h"
 #include "attn.h"
 #include "json.h"
@@ -200,6 +201,7 @@ static void umb_at(const umb_t *u, double z, double *x, double *y) {
 }
 
 static vwt *g_vwt = nullptr;   /* --vwt: our trained model instead of villa's */
+static wtrunk *g_wt = nullptr; static uint16_t *g_xf = nullptr; static int g_xld = 0; static double g_um = 9.6;   /* --trunk: the frozen feature trunk of a cx model */
 static int ray_check(vw_net *net, int argc, char **argv) {
     if (argc < 5) { fprintf(stderr, "usage: ufsm villawind ray-check ROOT KEY WINDINGS.json --ckpt PTH [--tsv OUT] [--zr Z0,Z1] [--cache DIR] [--threads 8] [--prefetch 1] [--geom pair|umb --umb JSON --sz 112 --sr 192 --st 112 --r0 16]\n"); return 2; }
     const int T = atoi(opt(argc, argv, "--T", "128")), L = atoi(opt(argc, argv, "--L", "384")), nth = atoi(opt(argc, argv, "--threads", "8"));
@@ -210,7 +212,7 @@ static int ray_check(vw_net *net, int argc, char **argv) {
        pair's points wherever they fall in the slab (phase trilinear at the points; pairs not inside one ring's interior are skipped) */
     const int geom_umb = !strcmp(opt(argc, argv, "--geom", "pair"), "umb");
     const double sz = atof(opt(argc, argv, "--sz", "112")), sr = atof(opt(argc, argv, "--sr", "192")), stt = atof(opt(argc, argv, "--st", "112")), r00 = atof(opt(argc, argv, "--r0", "16"));
-    umb_t umb = {0}; if (geom_umb && umb_load(opt(argc, argv, "--umb", ""), &umb)) { fprintf(stderr, "villawind: --geom umb needs --umb umbilicus.json\n"); return 2; }
+    umb_t umb = {0}; if ((geom_umb || g_wt) && umb_load(opt(argc, argv, "--umb", ""), &umb)) { fprintf(stderr, "villawind: --geom umb and --trunk need --umb umbilicus.json\n"); return 2; }
     store *st = store_open(argv[2]); z3 *ct = st ? z3_open(st, argv[3], opt(argc, argv, "--cache", nullptr)) : nullptr;
     if (!ct) { fprintf(stderr, "villawind: %s %s: %s\n", argv[2], argv[3], z3_error()); return 1; }
     size_t np = 0; rpair *P = load_pairs(argv[4], &np); if (!P) return 1;
@@ -245,6 +247,13 @@ static int ray_check(vw_net *net, int argc, char **argv) {
         double tb = now_s(); tsamp += tb - ta;
         if (prefetch) { nrun++; if (nrun % 100 == 0) fprintf(stderr, "villawind: prefetched %zu / %zu\n", nrun, np); continue; }
         xh2d(imd, im, nv); xh2d(vad, va, nv);
+        if (g_wt) {   /* the trunk features in-slab, the axis point at the slab centre's z */
+            const double cz = f.o[2] + 0.5 * (T - 1) * (f.a[2] + f.b[2]) + 0.5 * (L - 1) * f.d[2];
+            double ux, uy; umb_at(&umb, cz, &ux, &uy);
+            wt_frame wf; for (int c = 0; c < 3; c++) { wf.o[c] = f.o[c]; wf.a[c] = f.a[c]; wf.b[c] = f.b[c]; wf.d[c] = f.d[c]; wf.u[c] = c == 2; }
+            wf.c[0] = ux; wf.c[1] = uy; wf.c[2] = cz;
+            if (wt_forward_ld(g_wt, imd, &wf, 1, g_um, g_xf, g_xld)) return 1;
+        }
         if (g_vwt ? vwt_forward(g_vwt, imd, vad, phd, nullptr, 0) : vw_forward(net, imd, vad, T, L, mean, inv, phd, nullptr)) return 1;
         xd2h(ph, phd, nv * 4); tfwd += now_s() - tb;
         double turns = ray_phase(ph, T, L, mid + 0.5 * len) - ray_phase(ph, T, L, mid - 0.5 * len);
@@ -275,6 +284,13 @@ int cmd_villawind(int argc, char **argv) {
         if (nn_init(atoi(opt(argc, argv, "--gpu", "0"))) || xnet_init(atoi(opt(argc, argv, "--gpu", "0")))) return 1;
         at_set_core(1); setenv("UFSM_ATTN_TF32", "1", 0); at_set_mx(atoi(opt(argc, argv, "--mx", "16")));
         g_vwt = vwt_load(vk, atoi(opt(argc, argv, "--ema", "1"))); if (!g_vwt) return 1;
+        g_xf = vwt_xfeat_buf(g_vwt, &g_xld);
+        if (g_xf) {   /* a trunk model (cfg.cx > 0): --trunk CKPT [--trunk-feat 1] [--um 9.6] */
+            const char *tk = opt(argc, argv, "--trunk", nullptr); g_um = atof(opt(argc, argv, "--um", "9.6"));
+            if (!tk) { fprintf(stderr, "villawind: %s takes trunk features: --trunk CKPT (wind96-wk1-best.ckpt) and --umb\n", vk); return 2; }
+            g_wt = wt_open(tk, atoi(opt(argc, argv, "--T", "128")), atoi(opt(argc, argv, "--L", "384")), 1, atoi(opt(argc, argv, "--trunk-feat", "1")));
+            if (!g_wt) { fprintf(stderr, "villawind: cannot open the trunk %s\n", tk); return 1; }
+        }
         if (argc > 2 && !strcmp(argv[2], "ray-check")) return ray_check(nullptr, argc - 1, argv + 1);
         fprintf(stderr, "villawind --vwt: only ray-check\n"); return 2;
     }

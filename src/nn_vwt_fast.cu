@@ -720,3 +720,49 @@ extern "C" int vtf_conv_bwd(vt_t x, vt_t gy, const float *w, int k, int sd, int 
     }
     return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }
+
+/* ---- the vwt input conv from a bf16 channels-last input padded to C (% 32) channels, the first ci real (src/vwt_net.c with trunk features):
+   forward without an input conversion, weight gradient (+ bias gradient) with the input as the pipelined kernel's bf16 operand ---- */
+extern "C" int vtf8_conv_bfin(const void *xb, int n, int D, int H, int W, int C, int ci, const float *w, int co, int k, int sd, int sh, int sw,
+                              int Do, int Ho, int Wo, const float *bias, float *y, void *wbuf);
+extern "C" int vtf_conv_fwd_bfin(const uint16_t *x, int n, int D, int H, int W, int C, int ci, const float *w, const float *b, int k, int sd, int sh, int sw, vt_t y, void *scratch) {
+    if (y.d != odim(D, sd) || y.h != odim(H, sh) || y.w != odim(W, sw) || y.n != n) { fprintf(stderr, "vtf_conv_fwd_bfin: output shape mismatch\n"); return -1; }
+    return vtf8_conv_bfin(x, n, D, H, W, C, ci, w, y.c, k, sd, sh, sw, y.d, y.h, y.w, b, y.p, scratch);
+}
+__global__ void k_wg_reduce_pad(const float *__restrict__ part, int nz, int co, int T, int C, int ci, float *__restrict__ gw) {
+    const size_t n = (size_t)co * T * ci, K = (size_t)T * C;
+    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) {
+        const int c = (int)(i % ci); const size_t t = i / ci % T, o = i / ((size_t)ci * T), q = o * K + t * C + c;
+        float a = 0.f; for (int z = 0; z < nz; z++) a += part[(size_t)z * co * K + q];
+        gw[i] += a;
+    }
+}
+extern "C" int vtf_conv_wgrad_bfin(const uint16_t *x, int n, int D, int H, int W, int C, int ci, vt_t gy, int k, int sd, int sh, int sw, float *gw, float *gb, void *scratch) {
+    const int co = gy.c, T = k * k * k, K3 = T * C, bm3 = co % 96 == 0 ? 96 : co % 64 == 0 ? 64 : co % 32 == 0 ? 32 : 0;
+    const long long rows = (long long)gy.n * gy.d * gy.h * gy.w;
+    if (!bm3 || sw != 1 || gy.w % 32 || C % 8 || co > 192 || gy.n != n) { fprintf(stderr, "vtf_conv_wgrad_bfin: shape unsupported (co %d, C %d)\n", co, C); return -1; }
+    if (gb) { const int per = 256 / co > 0 ? 256 / co : 1; k_colsum_f<<<1024, per * co, co * sizeof(float)>>>(gy.p, rows, co, per, gb); }
+    if (!gw) return cudaGetLastError() == cudaSuccess ? 0 : -1;
+    const size_t gbb = ((size_t)rows * co * 2 + 255) & ~(size_t)255, pb = (size_t)co * K3 * 4;
+    const int nt = (K3 + 127) / 128 * (co / bm3);
+    long long nz = (360 + nt - 1) / nt; if (nz > rows / 1024) nz = rows / 1024; if (nz < 1) nz = 1;
+    if (gbb + pb > g_wreg) { fprintf(stderr, "vtf_conv_wgrad_bfin: scratch too small\n"); return -1; }
+    if (gbb + (size_t)nz * pb > g_wreg) nz = (long long)((g_wreg - gbb) / pb);
+    char *r = (char *)scratch + 2 * wbytes_max(256, 256);
+    WgB q; q.gyb = (const __nv_bfloat16 *)r; q.xb = (const __nv_bfloat16 *)x; q.part = (float *)(r + gbb);
+    q.D = D; q.H = H; q.W = W; q.C = C; q.Do = gy.d; q.Ho = gy.h; q.Wo = gy.w; q.k = k; q.sd = sd; q.sh = sh; q.p = k / 2; q.K = K3; q.co = co; q.M = rows;
+    q.mper = (rows + nz - 1) / nz; q.mper = (q.mper + 31) / 32 * 32; nz = (rows + q.mper - 1) / q.mper;
+    k_f2bf8<<<cap_blocks(rows * co / 8), 256>>>((const float4 *)gy.p, (uint4 *)r, rows * co / 8);
+    const dim3 gr((unsigned)((K3 + 127) / 128), (unsigned)(co / bm3), (unsigned)nz);
+    if (bm3 == 96) vtf_wgrad3<96, 128><<<gr, 256>>>(q); else if (bm3 == 64) vtf_wgrad3<64, 128><<<gr, 256>>>(q); else vtf_wgrad3<32, 128><<<gr, 256>>>(q);
+    k_wg_reduce_pad<<<cap_blocks((long long)co * T * ci), 256>>>(q.part, (int)nz, co, T, C, ci, gw);
+    return cudaGetLastError() == cudaSuccess ? 0 : -1;
+}
+extern "C" int vtf8_conv_bwd_bfout(const float *gy, int n, int Do, int Ho, int Wo, int co, const float *w, int ci, int k, int sd, int sh, int sw,
+                                   int D, int H, int W, int c0, int c1, void *out, int ld, void *qbuf, void *wbuf);
+/* d loss / d input channels [c0, c1) of a conv as bf16 rows of ld (the vwt input conv's gradient at the trunk features, src/vwt_net.c) */
+extern "C" int vtf_conv_bwd_feat(vt_t gy, const float *w, int ci, int k, int sd, int sh, int sw, int D, int H, int W, int c0, int c1, uint16_t *out, int ld, void *scratch) {
+    char *s = (char *)scratch;
+    if (vtf8_qbytes((long long)gy.n * gy.d * gy.h * gy.w, gy.c, 16) > g_wreg) { fprintf(stderr, "vtf_conv_bwd_feat: scratch too small\n"); return -1; }
+    return vtf8_conv_bwd_bfout(gy.p, gy.n, gy.d, gy.h, gy.w, gy.c, w, ci, k, sd, sh, sw, D, H, W, c0, c1, out, ld, s + 2 * wbytes_max(256, 256), s);
+}
