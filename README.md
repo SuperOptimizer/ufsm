@@ -163,15 +163,37 @@ Whole-scroll topology and accuracy are not established by these local checks.
 
 ## Core wraps
 
-`ufsm wraps` spaces columns at `--step` along the arc of each wrap's root on the ray through the box centre at mid z.
-A core wrap leaves the axis near that z, so its root there is tiny and its columns land far apart wherever else it reaches
-(Paris 4 w085: 29 columns). `--col-r p90` uses the 90th percentile of the wrap's roots over the rows' z range instead
-(or `--col-r R`, native voxels). `--zr Z0,Z1` keeps only rows at global native z in [Z0, Z1], for example to drop a broken end cap.
+`ufsm wraps` spaces columns at `--step` along an arc of each wrap. `--col-r centre` (the old default) takes the arc at the wrap's root on
+the ray through the box centre at mid z. A core wrap leaves the axis near that z, so its root there is tiny and its columns land far
+apart wherever else it reaches (Paris 4 w085: 29 columns). `--col-r p90` (default) uses the 90th percentile of the wrap's roots over the
+rows' z range (or `--col-r R`, native voxels). `--zr Z0,Z1` keeps only rows at global native z in [Z0, Z1], for example to drop a broken end cap.
 It also restricts the z range in which wrap ids are sampled. `--first` and `--last` are taken exactly as given, because box
 samples can miss W near the axis. Paris 4 core (W at the umbilicus 78-93):
 
 ```sh
 build/ufsm wraps joined core --step 4 --out-um 9.6 --sfc 0.25 --fields F --first 70 --last 105 --zr 384,18176 --col-r p90
+```
+
+Junk turns: `--min-cm2 C` (default 0.5) skips wraps under C cm2 (vertices x (step x um)^2). On Paris 4 these are the 62 end-cap
+fragments w016-w077 of 0.07-0.09 cm2 each. With `--fields`, only wrap ids within about one turn of a data cell are computed, largest
+first. Each empty id cost 30-60 CPU-s of failed root searches: Paris 4 sampled ids 16..580 and wrote 257. `UFSM_WRAPS_NOPRUNE=1`
+computes every id. The `.sfc` files are encoded on all threads (`tfx_sfc_write`). The bytes are the same as from the serial writer,
+and `ufsm strip` uses the same writer.
+
+## Whole-scroll unroll driver
+
+`scripts/unroll/unroll.sh SCROLL` runs the whole Paris 4 coarse-to-fine recipe on one host as a single resumable run. The stages are
+prep, wind96 fields (one predict per GPU on z parts joined by `fields_cat.sh`), ink (GPU 1, beside the CPU ref), the count-field ref,
+snapped slab fits (one lane per GPU), fit-join, wraps, strip, strip-flatten, stripe renders + mosaic, optional per-wrap renders
+(`PERWRAP=1`) and faces (`FACES=1`), and the upload (only with `UPLOAD=1`, and never for prize-eligible scrolls).
+
+- Scroll settings (box, wraps `--zr`, strip flags) come from `scripts/unroll/scrolls.tsv`, else from `scripts/corpus/list.tsv`.
+- Each stage writes `state/<stage>.done` with its wall time, CPU seconds and max RSS.
+- `DRY=1` prints the plan without running anything. `touch $O/STOP` stops the run between stages.
+
+```sh
+DRY=1 scripts/unroll/unroll.sh PHercParis4             # the plan
+U=/path/ufsm setsid nohup scripts/unroll/unroll.sh PHercParis4 > unroll.out 2>&1 &
 ```
 
 ## Flattening wraps

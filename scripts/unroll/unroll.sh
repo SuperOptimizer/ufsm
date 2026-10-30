@@ -22,11 +22,11 @@
 # whose done marker exists is skipped; partial stages resume (predict --resume parts, slab claims, per-wrap outputs).
 # DRY=1: print the plan (commands) without running anything. Runs from a copy of these scripts in $O/bin (edits never touch a run).
 # Env: U (ufsm), UR, TH (20), FIELDGPUS ("0 1"), FITGPUS ("0 1"), INKGPU (1), INKCMD, REFCMD, CK, INKCK, INKNAME, MINMEM, PERWRAP,
-#   FACES, SPAR (4 per-wrap jobs), CLEAN (1: fields + slab fits deleted once the wraps exist), STRIPARGS / ZR / BOX (override scrolls.tsv).
+#   TAG (output dir suffix), FACES, SPAR (4 per-wrap jobs), CLEAN (1: fields + slab fits deleted once the wraps exist), STRIPARGS / ZR / BOX (override scrolls.tsv).
 set -u
 S=${1:?usage: unroll.sh SCROLL}
 H=$(cd "$(dirname "$0")" && pwd)
-UR=${UR:-/vesuvius/ufsm/unroll}; O=$UR/$S
+UR=${UR:-/vesuvius/ufsm/unroll}; O=$UR/$S${TAG:-}   # (TAG: e.g. a test crop beside the full run)
 U=${U:-/vesuvius/ufsm/unroll/bin/ufsm}
 CK=${CK:-/vesuvius/ufsm/paris4/ckpt/wind96-wk1-best.ckpt}; INKCK=${INKCK:-/vesuvius/ufsm/ink-ft/runs/ift3/snap/ift3-24000.ckpt}
 INKNAME=${INKNAME:-ift3-24000}; TH=${TH:-20}; MINMEM=${MINMEM:-40}; INKGPU=${INKGPU:-1}
@@ -101,9 +101,10 @@ fpred() {   # fpred GPU BOX OUT
 fields() {
   local box; box=$([ "$DRY" = 1 ] && echo ${BOX:-BOX} || cat $O/box.txt); local g=($FIELDGPUS) n=${#g[@]}
   [ "$DRY" = 1 ] || { rm -rf $F; mkdir -p $O/fields; }
+  local z0 dz y0 x0 dy dx k a b pids=() parts=(); IFS=, read -r z0 y0 x0 dz dy dx <<< "$box"
+  [ $(( (dz / n) / 1024 )) -lt 1 ] && n=1   # (parts of >= 1024 voxels each)
   if [ $n = 1 ]; then fpred ${g[0]} $box $F; return; fi
   # z parts: equal shares rounded to 1024 voxels (= 512 field cells at h 2, a multiple of the 128-cell field shard and of the 256 z stride)
-  local z0 dz y0 x0 dy dx k a b pids=() parts=(); IFS=, read -r z0 y0 x0 dz dy dx <<< "$box"
   for k in $(seq 0 $((n - 1))); do
     a=$(( z0 + (dz * k / n) / 1024 * 1024 )); b=$(( k == n - 1 ? z0 + dz : z0 + (dz * (k + 1) / n) / 1024 * 1024 ))
     parts+=($F.p$k); [ "$DRY" = 1 ] || rm -rf $F.p$k $F.p$k.tmp
