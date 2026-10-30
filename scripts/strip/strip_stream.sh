@@ -16,7 +16,7 @@ T0=$(date +%s)
 if [ ! -e $OUT/strip/flat/flat.json ]; then
   log "strip-flatten start"
   nice -n 10 $U strip-flatten $OUT/strip --decim $DECIM --threads $NT --flip-rows 1 --cg 60 --tol 3e-4 $FLATX > $OUT/logs/flatten.log 2>&1 || { log "strip-flatten FAILED"; exit 1; }
-  log "strip-flatten done: $(grep -E '^strip-flatten: (strip|flattened|[0-9]+ stripes)' $OUT/logs/flatten.log | tr '\n' ' ')"
+  log "strip-flatten done: $(grep -E '^strip-flatten: (strip [0-9]|flattened|[0-9]+ stripes)' $OUT/logs/flatten.log | tr '\n' ' ')"
 fi
 S=($(ls $OUT/strip/flat/stripes)); N=${#S[@]}
 rend() {   # one stripe -> render/<s>.tif, <s>_ct.tif, <s>.done
