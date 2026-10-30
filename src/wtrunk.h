@@ -31,12 +31,14 @@ int wt_heads(const wtrunk *w);          /* cout: the head channels at the front 
 /* im: device uint8 [n][T][T][L] (0 outside the volume, as vws_sample); fr: host n frames; um: the CT level's voxel size (the
    network's scale input); out: device bf16 [n][T][T][L][C]. 0 on success */
 int wt_forward(wtrunk *w, const uint8_t *im, const wt_frame *fr, int n, double um, void *out);
+/* the same into rows of ld >= C channels (e.g. vwt_xfeat_buf: the features inside the ray model's padded input); channels C .. ld - 1 untouched */
+int wt_forward_ld(wtrunk *w, const uint8_t *im, const wt_frame *fr, int n, double um, void *out, int ld);
 void wt_close(wtrunk *w);
 
 /* kernels (src/nn_wtrunk.cu). prm: device floats [n][16] = (o - c)[3], a[3], b[3], d[3], u[3], pad; st: device u64 [n][2] scratch;
    x: [n][4][T][T][L] network input, fp16 (h16 1) or bf16 (h16 2); lg: [n][C][T][T][L] fp16 (lh16) or fp32, (z, y, x) = (j, i, k) */
 void wt_input(const uint8_t *im, const float *prm, int n, int T, int L, unsigned long long *st, void *x, int h16);
-void wt_output(const void *lg, int lh16, int n, int C, int cout, int T, int L, void *out);
+void wt_output(const void *lg, int lh16, int n, int C, int cout, int T, int L, int ld, void *out);   /* rows of ld >= C channels */
 #ifdef __cplusplus
 }
 #endif

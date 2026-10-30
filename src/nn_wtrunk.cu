@@ -53,24 +53,26 @@ extern "C" void wt_input(const uint8_t *im, const float *prm, int n, int T, int 
     else wt_input_k<__half><<<g, 256>>>(im, prm, T, L, st, (__half *)x);
     WTK(cudaGetLastError());
 }
-/* logits / features [n][C][j][i][k] -> bf16 [n][i][j][k][C]; channels < cout through the sigmoid. One thread per voxel */
-template <typename LT> __global__ void wt_output_k(const LT *lg, int C, int cout, int T, int L, __nv_bfloat16 *out) {
-    const size_t V = (size_t)T * T * L, v = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+/* logits / features [n][C][j][i][k] -> bf16 [n][i][j][k] rows of ld channels (the first C written); channels < cout through the sigmoid.
+   128 output voxels per block: planes read along k, rows staged in shared memory, written as contiguous channel runs */
+template <typename LT> __global__ void __launch_bounds__(128) wt_output_k(const LT *lg, int C, int cout, int T, int L, int ld, __nv_bfloat16 *out) {
+    extern __shared__ __nv_bfloat16 so[];   /* [128][C] */
+    const size_t V = (size_t)T * T * L, v0 = blockIdx.x * (size_t)128, v = v0 + threadIdx.x;
     const int s = blockIdx.y;
-    if (v >= V) return;
-    const int k = (int)(v % L), j = (int)(v / L % T), i = (int)(v / ((size_t)L * T));   /* v: output order (i, j, k) */
-    const size_t src = ((size_t)j * T + i) * L + k;
-    const LT *p = lg + (size_t)s * C * V + src;
-    __nv_bfloat16 *o = out + ((size_t)s * V + v) * C;
-    for (int c = 0; c < C; c++) {
-        const float a = (float)p[(size_t)c * V];
-        o[c] = __float2bfloat16_rn(c < cout ? 1.f / (1.f + __expf(-a)) : a);
+    if (v < V) {
+        const int k = (int)(v % L), j = (int)(v / L % T), i = (int)(v / ((size_t)L * T));   /* v: output order (i, j, k) */
+        const LT *p = lg + (size_t)s * C * V + ((size_t)j * T + i) * L + k;
+        for (int c = 0; c < C; c++) { const float a = (float)p[(size_t)c * V]; so[threadIdx.x * C + c] = __float2bfloat16_rn(c < cout ? 1.f / (1.f + __expf(-a)) : a); }
     }
+    __syncthreads();
+    const int nv = V - v0 < 128 ? (int)(V - v0) : 128;
+    __nv_bfloat16 *o = out + ((size_t)s * V + v0) * ld;
+    for (int q = threadIdx.x; q < nv * C; q += 128) o[(size_t)(q / C) * ld + q % C] = so[q];
 }
-extern "C" void wt_output(const void *lg, int lh16, int n, int C, int cout, int T, int L, void *out) {
+extern "C" void wt_output(const void *lg, int lh16, int n, int C, int cout, int T, int L, int ld, void *out) {
     const size_t V = (size_t)T * T * L;
-    const dim3 g((unsigned)((V + 127) / 128), n);
-    if (lh16) wt_output_k<__half><<<g, 128>>>((const __half *)lg, C, cout, T, L, (__nv_bfloat16 *)out);
-    else wt_output_k<float><<<g, 128>>>((const float *)lg, C, cout, T, L, (__nv_bfloat16 *)out);
+    const dim3 g((unsigned)((V + 127) / 128), n); const size_t sm = (size_t)128 * C * 2;
+    if (lh16) wt_output_k<__half><<<g, 128, sm>>>((const __half *)lg, C, cout, T, L, ld, (__nv_bfloat16 *)out);
+    else wt_output_k<float><<<g, 128, sm>>>((const float *)lg, C, cout, T, L, ld, (__nv_bfloat16 *)out);
     WTK(cudaGetLastError());
 }

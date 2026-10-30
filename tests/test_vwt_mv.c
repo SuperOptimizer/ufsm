@@ -1,6 +1,7 @@
 /* vt_multiview (src/vwt_mv.c): a smooth world phase field seen by two rotated, shifted slabs: zero loss for the exact field plus any
    constant offset; positive loss after a perturbation; the analytic gradient matches central differences. */
 #include "../src/vwt.h"
+#include "../src/nn.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -39,5 +40,17 @@ int main(void) {
         const double fd = (lp - lm) / (2 * h), e = fabs(fd - g[q]) / (fabs(fd) + fabs(g[q]) + 1e-9); if (e > maxe) maxe = e; nchk++;
     }
     printf("gradient vs central differences: %d entries, max rel error %.3e\n", nchk, maxe); if (nchk < 10 || maxe > 2e-2) fail = 1;
+    {   /* vt_multiview_dev vs the host on the perturbed field: loss, count, gradient (added to a nonzero buffer) */
+        if (nn_init(0)) return 1;
+        memset(g, 0, n * 4); const double lh = vt_multiview(pa, pb, va, vb, fa, fb, T, L, 2, 0.5f, 1, 0.5f, g, &ns); const long nh = ns;
+        float *dpa = nn_malloc(n * 4), *dpb = nn_malloc(n * 4), *dg = nn_malloc(n * 4), *hg = malloc(n * 4); uint8_t *dva = nn_malloc(n), *dvb = nn_malloc(n);
+        nn_h2d(dpa, pa, n * 4); nn_h2d(dpb, pb, n * 4); nn_h2d(dva, va, n); nn_h2d(dvb, vb, n);
+        for (size_t q = 0; q < n; q++) hg[q] = 0.01f * (float)(q % 7); nn_h2d(dg, hg, n * 4);
+        long nd = 0; const double ld = vt_multiview_dev(dpa, dpb, dva, dvb, fa, fb, T, L, 2, 0.5f, 1, 0.5f, dg, &nd);
+        nn_d2h(hg, dg, n * 4); double ge = 0, gm = 0;
+        for (size_t q = 0; q < n; q++) { const double d = fabs(hg[q] - 0.01f * (float)(q % 7) - g[q]); if (d > ge) ge = d; if (fabs(g[q]) > gm) gm = fabs(g[q]); }
+        printf("device: loss %.6f (host %.6f), shared %ld (host %ld), max |dg| %.2e of max |g| %.2e\n", ld, lh, nd, nh, ge, gm);
+        if (nd != nh || fabs(ld - lh) > 1e-5 * (1 + lh) || ge > 1e-3 * gm + 1e-9) fail = 1;
+    }
     printf(fail ? "test_vwt_mv: FAIL\n" : "test_vwt_mv: ok\n"); return fail;
 }

@@ -71,7 +71,7 @@ int main(void) {
         const int C = 5, co = 3; uint16_t *hl = malloc(n * C * V * 2), *ho = malloc(n * C * V * 2);
         for (size_t i = 0; i < n * C * V; i++) hl[i] = f2h((float)((int)(i * 2246822519u >> 20 & 4095) - 2048) / 400.f);
         uint16_t *dl = nn_malloc(n * C * V * 2), *dout = nn_malloc(n * C * V * 2); nn_h2d(dl, hl, n * C * V * 2);
-        wt_output(dl, 1, n, C, co, T, L, dout); nn_d2h(ho, dout, n * C * V * 2);
+        wt_output(dl, 1, n, C, co, T, L, C, dout); nn_d2h(ho, dout, n * C * V * 2);
         double em = 0;
         for (int s = 0; s < n; s++) for (int i = 0; i < T; i++) for (int j = 0; j < T; j++) for (int k = 0; k < L; k++) for (int c = 0; c < C; c++) {
             const float a = h2f(hl[(size_t)(s * C + c) * V + ((size_t)j * T + i) * L + k]), ref = c < co ? 1.f / (1.f + expf(-a)) : a;

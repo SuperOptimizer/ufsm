@@ -306,3 +306,25 @@ extern "C" int vtf8_conv(int mode, int bits, const float *src, int n, int D, int
     else { if (f8) v8_launch<1, true>(p, bt, ts); else v8_launch<1, false>(p, bt, ts); }
     return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }
+
+/* forward from a bf16 source already in the kernel's layout ([rows][C] channels-last, C % 32 == 0; channels ci .. C - 1 zero): no input
+   conversion; the weights w [co][T][ci] padded to C channels per tap (the vwt input conv: CT, valid and trunk features, src/vwt_net.c) */
+__global__ void k_v16_wprep_pad(const float *__restrict__ w, int co, int T, int ci, int C, int Np, int K, __nv_bfloat16 *__restrict__ q) {
+    const long long n = (long long)Np * K;
+    for (long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; i < n; i += (long long)gridDim.x * blockDim.x) {
+        const int r = (int)(i / K), kk = (int)(i % K), t = kk / C, c = kk % C;
+        q[i] = __float2bfloat16_rn(r < co && c < ci ? w[((size_t)r * T + t) * ci + c] : 0.f);
+    }
+}
+extern "C" int vtf8_conv_bfin(const void *xb, int n, int D, int H, int W, int C, int ci, const float *w, int co, int k, int sd, int sh, int sw,
+                              int Do, int Ho, int Wo, const float *bias, float *y, void *wbuf) {
+    if (!vtf8_ok(C, co) || ci > C || sd < 1 || sd > 2 || sh < 1 || sh > 2 || sw < 1 || sw > 2) return -1;
+    const long long M = (long long)n * Do * Ho * Wo; const int T = k * k * k, K = T * C, bt = v8_tile(co), Np = (co + bt - 1) / bt * bt;
+    k_v16_wprep_pad<<<v8_blocks((long long)Np * K), 256>>>(w, co, T, ci, C, Np, K, (__nv_bfloat16 *)wbuf);
+    V8P p; p.xq = (const uint8_t *)xb; p.xs = nullptr; p.wq = (const uint8_t *)wbuf; p.ws = nullptr; p.bias = bias; p.y = y;
+    p.D = D; p.H = H; p.W = W; p.C = C; p.SB = 0; p.Do = Do; p.Ho = Ho; p.Wo = Wo; p.k = k; p.sd = sd; p.sh = sh; p.sw = sw; p.p = k / 2;
+    p.K = K; p.N = co; p.WSB = 0; p.M = M;
+    if (M <= 0) return 0;
+    v8_launch<0, false>(p, bt, false);
+    return cudaGetLastError() == cudaSuccess ? 0 : -1;
+}

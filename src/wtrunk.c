@@ -54,7 +54,9 @@ wtrunk *wt_open(const char *ckpt, int T, int L, int maxbatch, int feat) {
 int wt_channels(const wtrunk *w) { return w->C; }
 int wt_heads(const wtrunk *w) { return w->cfg.cout; }
 
-int wt_forward(wtrunk *w, const uint8_t *im, const wt_frame *fr, int n, double um, void *out) {
+int wt_forward(wtrunk *w, const uint8_t *im, const wt_frame *fr, int n, double um, void *out) { return wt_forward_ld(w, im, fr, n, um, out, w->C); }
+int wt_forward_ld(wtrunk *w, const uint8_t *im, const wt_frame *fr, int n, double um, void *out, int ld) {
+    if (ld < w->C) { fprintf(stderr, "wt_forward_ld: row stride %d < %d channels\n", ld, w->C); return 1; }
     const int T = w->T, L = w->L; const size_t V = (size_t)T * T * L;
     if (w->cfg.scale_cond) unet_set_scale(w->u, um);
     for (int s0 = 0; s0 < n; s0 += w->maxb) {
@@ -72,7 +74,7 @@ int wt_forward(wtrunk *w, const uint8_t *im, const wt_frame *fr, int n, double u
         const shape5 xs = {nb, 4, T, T, L};
         const float *lg = unet_forward_x(w->u, w->x, xs, 0, 1);
         if (!lg) return 1;
-        wt_output(lg, unet_logits_h16(w->u), nb, w->C, w->cfg.cout, T, L, (char *)out + (size_t)s0 * V * w->C * 2);
+        wt_output(lg, unet_logits_h16(w->u), nb, w->C, w->cfg.cout, T, L, ld, (char *)out + (size_t)s0 * V * ld * 2);
     }
     const char *e = nn_check(); if (e) { fprintf(stderr, "wt_forward: %s\n", e); return 1; }
     return 0;

@@ -272,8 +272,8 @@ test-all: $(B)/test_wtrunk
 $(B)/test_vwt: tests/test_vwt.c $(B)/vwt_net.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_vwt.c $(B)/vwt_net.o $(B)/nn.o $(B)/nn_fp8.o -o $@ $(LDLIBS) $(CUDALIBS)
 test-all: $(B)/test_vwt
-$(B)/test_vwt_mv: tests/test_vwt_mv.c $(B)/vwt_mv.o
-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_vwt_mv.c $(B)/vwt_mv.o -o $@ -lm
+$(B)/test_vwt_mv: tests/test_vwt_mv.c $(B)/vwt_mv.o $(B)/nn.o $(B)/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_vwt_mv.c $(B)/vwt_mv.o $(B)/nn.o $(B)/nn_fp8.o -o $@ $(LDLIBS) $(CUDALIBS)
 test-all: $(B)/test_vwt_mv
 $(B)/test_attn_ray: tests/test_attn_ray.c $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_attn_ray.c $(B)/nn.o $(B)/nn_fp8.o -o $@ $(LDLIBS) $(CUDALIBS)

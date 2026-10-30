@@ -4,10 +4,12 @@
 #include "vwt.h"
 #include "attn.h"
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 extern "C" size_t vtf_conv_scratch(vt_t x, int co, int k, int sd, int sh, int sw);
 extern "C" int vtf_conv_fwd(vt_t x, const float *w, const float *b, int k, int sd, int sh, int sw, vt_t y, void *scratch);
@@ -351,34 +353,55 @@ extern "C" void vt_phase_bwd(vt_t lg, const float *gph, const float *ginc, vt_t 
 __device__ __forceinline__ float huber(float r, float d) { const float a = fabsf(r); return a <= d ? 0.5f * r * r : d * (a - 0.5f * d); }
 __device__ __forceinline__ float huber_d(float r, float d) { return r > d ? d : r < -d ? -d : r; }
 __device__ __forceinline__ float wgt(const float *pw, const uint16_t *comp, long long i) { return comp[i] ? (pw ? pw[i] : 1.f) : 0.f; }
-/* pass 1: per component sums w, w ph, w tg; density sums */
+/* warp-aggregated atomics: lanes of a warp-uniform loop; key < 0 adds nothing. When every lane has the same key (the usual case: 32 voxels
+   along one ray in one component) one shuffle reduction and one atomic per value, else an atomic per lane (the per-voxel adds of the
+   original, in a different order: double sums) */
+__device__ __forceinline__ double wsum_d(double v) { for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o); return v; }
+template <int NV> __device__ __forceinline__ void seg_add(int key, const double *v, double *base, int stride) {
+    const unsigned peers = __match_any_sync(0xffffffffu, key);
+    if (peers == 0xffffffffu) {
+        if (key < 0) return;
+        double s[NV]; for (int q = 0; q < NV; q++) s[q] = wsum_d(v[q]);
+        if ((threadIdx.x & 31) == 0) for (int q = 0; q < NV; q++) atomicAdd(&base[(size_t)key * stride + q], s[q]);
+    } else if (key >= 0) for (int q = 0; q < NV; q++) atomicAdd(&base[(size_t)key * stride + q], v[q]);
+}
+#define WLOOP(n) for (long long b_ = (blockIdx.x * (long long)blockDim.x + threadIdx.x) & ~31LL, i = b_ + (threadIdx.x & 31); b_ < (n); b_ += (long long)gridDim.x * blockDim.x, i = b_ + (threadIdx.x & 31))
+/* pass 1: per component sums w, w ph, w tg */
 static __global__ void k_loss1(const float *__restrict__ ph, const float *__restrict__ tg, const uint16_t *__restrict__ comp, const float *__restrict__ pw, long long n,
                         double *__restrict__ cs /* [65536][3] */) {
-    for (long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; i < n; i += (long long)gridDim.x * blockDim.x) {
-        const float w = wgt(pw, comp, i); if (w <= 0.f) continue; const int c = comp[i];
-        atomicAdd(&cs[c * 3], (double)w); atomicAdd(&cs[c * 3 + 1], (double)w * ph[i]); atomicAdd(&cs[c * 3 + 2], (double)w * tg[i]);
+    WLOOP(n) {
+        const float w = i < n ? wgt(pw, comp, i) : 0.f; const int key = w > 0.f ? comp[i] : -1;
+        const double v[3] = {(double)w, key >= 0 ? (double)w * ph[i] : 0., key >= 0 ? (double)w * tg[i] : 0.};
+        seg_add<3>(key, v, cs, 3);
     }
 }
 /* pass 2: residuals, Huber, sum w psi per component; density loss and gradient (ginc) */
 static __global__ void k_loss2(const float *__restrict__ ph, const float *__restrict__ inc, const float *__restrict__ tg, const uint16_t *__restrict__ comp,
                         const float *__restrict__ pw, long long n, int L, const double *__restrict__ cs, float dp, float dd, double *__restrict__ acc /* [4] */,
                         double *__restrict__ cpsi /* [65536] */, float *__restrict__ psi, float *__restrict__ ginc, float dscale) {
-    for (long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; i < n; i += (long long)gridDim.x * blockDim.x) {
-        const float w = wgt(pw, comp, i); psi[i] = 0.f; if (ginc) ginc[i] = 0.f;
+    WLOOP(n) {
+        const bool in = i < n;
+        const float w = in ? wgt(pw, comp, i) : 0.f; double a[3] = {0., 0., 0.}, pp = 0.; int key = -1;
+        if (in) { psi[i] = 0.f; if (ginc) ginc[i] = 0.f; }
         if (w > 0.f) {
             const int c = comp[i]; const double W = cs[c * 3];
             const float r = (float)((ph[i] - cs[c * 3 + 1] / W) - (tg[i] - cs[c * 3 + 2] / W));
-            atomicAdd(&acc[0], (double)w * huber(r, dp)); const float p = w * huber_d(r, dp); psi[i] = p; atomicAdd(&cpsi[c], (double)p);
+            a[0] = (double)w * huber(r, dp); const float p = w * huber_d(r, dp); psi[i] = p; pp = p; key = c;
         }
-        const int k = (int)(i % L);
-        if (k > 0 && comp[i] && comp[i] == comp[i - 1]) {
-            const float wd = fminf(w, wgt(pw, comp, i - 1)); if (wd <= 0.f) continue;
-            const float r = inc[i] - (tg[i] - tg[i - 1]);
-            atomicAdd(&acc[1], (double)wd * huber(r, dd)); atomicAdd(&acc[2], (double)wd);
-            if (ginc) ginc[i] = wd * huber_d(r, dd) * dscale;
+        if (in && (int)(i % L) > 0 && comp[i] && comp[i] == comp[i - 1]) {
+            const float wd = fminf(w, wgt(pw, comp, i - 1));
+            if (wd > 0.f) {
+                const float r = inc[i] - (tg[i] - tg[i - 1]);
+                a[1] = (double)wd * huber(r, dd); a[2] = wd;
+                if (ginc) ginc[i] = wd * huber_d(r, dd) * dscale;
+            }
         }
+        double t[3]; for (int q = 0; q < 3; q++) t[q] = wsum_d(a[q]);
+        if ((threadIdx.x & 31) == 0) for (int q = 0; q < 3; q++) if (t[q] != 0.) atomicAdd(&acc[q], t[q]);
+        seg_add<1>(key, &pp, cpsi, 1);
     }
 }
+#undef WLOOP
 /* pass 3: gph = (psi - w / W_c sum_c psi) pscale */
 static __global__ void k_loss3(const uint16_t *__restrict__ comp, const float *__restrict__ pw, long long n, const double *__restrict__ cs, const double *__restrict__ cpsi,
                         const float *__restrict__ psi, float *__restrict__ gph, float pscale) {
@@ -509,4 +532,111 @@ static __global__ void k_cat_bf16(const float *a, int ca, const uint16_t *b, int
 }
 extern "C" void vt_cat_bf16(const float *a, int ca, const uint16_t *b, int cb, long long rows, float *y) {
     k_cat_bf16<<<4096, 256>>>(a, ca, b, cb, rows, y);
+}
+
+/* ---- bf16 padded input (cfg.cx: CT, valid, trunk features, zero channels up to C % 32 == 0; src/vwt_net.c) ---- */
+static __global__ void k_in_bf(const uint8_t *__restrict__ im, const uint8_t *__restrict__ va, long long n, const double *__restrict__ s, int C, __nv_bfloat16 *__restrict__ x) {
+    const double c = s[2] > 0 ? s[2] : 1, m = s[0] / c, var = s[1] / c - m * m; const float inv = (float)(1.0 / (sqrt(var > 0 ? var : 0) + 1e-6));
+    for (long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; i < n; i += (long long)gridDim.x * blockDim.x) {
+        const float v = va[i] ? 1.f : 0.f;
+        *(__nv_bfloat162 *)(x + i * C) = __floats2bfloat162_rn((float)(im[i] - m) * v * inv, v);
+    }
+}
+extern "C" void vt_input_bf(const uint8_t *im, const uint8_t *va, long long n, int C, uint16_t *x) {
+    static double *s = nullptr; if (!s) cudaMalloc(&s, 3 * 8);
+    cudaMemsetAsync(s, 0, 3 * 8);
+    unsigned nb = nb_of(n, 256); if (nb > 4096) nb = 4096;
+    k_in_sums<<<nb, 256>>>(im, va, n, s); k_in_bf<<<GRID(n)>>>(im, va, n, s, C, (__nv_bfloat16 *)x);
+}
+static __global__ void k_feat_bf(const uint16_t *__restrict__ f, int cx, long long rows, int C, int c0, uint16_t *__restrict__ x) {
+    for (long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; i < rows * cx; i += (long long)gridDim.x * blockDim.x)
+        x[i / cx * C + c0 + i % cx] = f[i];
+}
+extern "C" void vt_feat_bf(const uint16_t *f, int cx, long long rows, int C, int c0, uint16_t *x) { k_feat_bf<<<4096, 256>>>(f, cx, rows, C, c0, x); }
+static __global__ void k_unpad_bf(const uint16_t *__restrict__ x, long long rows, int C, int ci, float *__restrict__ y) {
+    for (long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; i < rows * ci; i += (long long)gridDim.x * blockDim.x)
+        y[i] = __uint_as_float((unsigned)x[i / ci * C + i % ci] << 16);
+}
+extern "C" int vtf_conv_fwd_bfin(const uint16_t *x, int n, int D, int H, int W, int C, int ci, const float *w, const float *b, int k, int sd, int sh, int sw, vt_t y, void *scratch);
+extern "C" int vtf_conv_wgrad_bfin(const uint16_t *x, int n, int D, int H, int W, int C, int ci, vt_t gy, int k, int sd, int sh, int sw, float *gw, float *gb, void *scratch);
+/* x: bf16 [n][D][H][W][C], channels >= ci zero. The fp32 reference (UFSM_VWT_REF=1) on an unpadded fp32 copy */
+extern "C" int vt_conv_fwd_bfin(const uint16_t *x, int n, int D, int H, int W, int C, int ci, const float *w, const float *b, int k, int sd, int sh, int sw, vt_t y, void *scratch) {
+    if (!use_ref()) return vtf_conv_fwd_bfin(x, n, D, H, W, C, ci, w, b, k, sd, sh, sw, y, scratch);
+    const long long rows = (long long)n * D * H * W; float *t = nullptr; if (cudaMalloc(&t, rows * ci * 4) != cudaSuccess) return -1;
+    k_unpad_bf<<<4096, 256>>>(x, rows, C, ci, t);
+    const int r = vtr_conv_fwd((vt_t){t, n, D, H, W, ci}, w, b, k, sd, sh, sw, y, scratch); cudaFree(t); return r;
+}
+extern "C" int vt_conv_wgrad_bfin(const uint16_t *x, int n, int D, int H, int W, int C, int ci, vt_t gy, const float *w, int k, int sd, int sh, int sw, float *gw, float *gb, void *scratch) {
+    if (!use_ref()) return vtf_conv_wgrad_bfin(x, n, D, H, W, C, ci, gy, k, sd, sh, sw, gw, gb, scratch);
+    const long long rows = (long long)n * D * H * W; float *t = nullptr; if (cudaMalloc(&t, rows * ci * 4) != cudaSuccess) return -1;
+    k_unpad_bf<<<4096, 256>>>(x, rows, C, ci, t);
+    const int r = vtr_conv_bwd((vt_t){t, n, D, H, W, ci}, gy, w, k, sd, sh, sw, (vt_t){nullptr, 0, 0, 0, 0, 0}, gw, gb, scratch); cudaFree(t); return r;
+}
+
+/* ---- vt_multiview on the device (src/vwt_mv.c is the host reference): one thread per sampled A voxel (i, j on the stride grid, every k) ---- */
+struct MvF { double fa[4][3], fb[4][3]; };
+static __global__ void k_mv1(const float *__restrict__ pha, const float *__restrict__ phb, const uint8_t *__restrict__ va, const uint8_t *__restrict__ vb, MvF f,
+                             int T, int L, int st, int ni, float *__restrict__ r, double *__restrict__ acc) {
+    const long long cap = (long long)ni * ni * L;
+    for (long long b_ = (blockIdx.x * (long long)blockDim.x + threadIdx.x) & ~31LL, t = b_ + (threadIdx.x & 31); b_ < cap; b_ += (long long)gridDim.x * blockDim.x, t = b_ + (threadIdx.x & 31)) {
+        double rv = 0, ok = 0; float out = __int_as_float(0x7fc00000);
+        if (t < cap) {
+            const int k = (int)(t % L), jj = (int)(t / L % ni), ii = (int)(t / ((long long)L * ni)), i = ii * st, j = jj * st;
+            const size_t qa = ((size_t)i * T + j) * L + k;
+            if (va[qa] && isfinite(pha[qa])) {
+                double w[3], q[3]; for (int e = 0; e < 3; e++) w[e] = f.fa[0][e] + i * f.fa[1][e] + j * f.fa[2][e] + k * f.fa[3][e] - f.fb[0][e];
+                for (int e = 0; e < 3; e++) q[e] = w[0] * f.fb[1 + e][0] + w[1] * f.fb[1 + e][1] + w[2] * f.fb[1 + e][2];
+                if (q[0] >= 0 && q[1] >= 0 && q[2] >= 0 && q[0] <= T - 1 && q[1] <= T - 1 && q[2] <= L - 1) {
+                    int a0 = (int)q[0], b0 = (int)q[1], c0 = (int)q[2]; if (a0 > T - 2) a0 = T - 2; if (b0 > T - 2) b0 = T - 2; if (c0 > L - 2) c0 = L - 2;
+                    const double fa_ = q[0] - a0, fb_ = q[1] - b0, fc = q[2] - c0; double s = 0; bool good = true;
+                    for (int c = 0; c < 8 && good; c++) {
+                        const int da = c & 1, db = c >> 1 & 1, dc = c >> 2 & 1; const size_t qb = ((size_t)(a0 + da) * T + b0 + db) * L + c0 + dc;
+                        if (!vb[qb] || !isfinite(phb[qb])) { good = false; break; }
+                        s += (da ? fa_ : 1 - fa_) * (db ? fb_ : 1 - fb_) * (dc ? fc : 1 - fc) * phb[qb];
+                    }
+                    if (good) { out = (float)(pha[qa] - s); rv = out; ok = 1; }
+                }
+            }
+            r[t] = out;
+        }
+        rv = wsum_d(rv); ok = wsum_d(ok);
+        if ((threadIdx.x & 31) == 0 && ok > 0) { atomicAdd(&acc[0], rv); atomicAdd(&acc[1], ok); }
+    }
+}
+__device__ __forceinline__ double mv_hub(double r, double d) { const double a = fabs(r); return a <= d ? 0.5 * r * r : d * (a - 0.5 * d); }
+__device__ __forceinline__ double mv_hubd(double r, double d) { return fabs(r) <= d ? r : (r > 0 ? d : -d); }
+static __global__ void k_mv2(const float *__restrict__ r, long long cap, const double *__restrict__ acc, float d, double *__restrict__ acc2) {
+    const double mr = acc[0] / acc[1];
+    for (long long b_ = (blockIdx.x * (long long)blockDim.x + threadIdx.x) & ~31LL, t = b_ + (threadIdx.x & 31); b_ < cap; b_ += (long long)gridDim.x * blockDim.x, t = b_ + (threadIdx.x & 31)) {
+        double l = 0, g = 0;
+        if (t < cap && r[t] == r[t]) { const double x = r[t] - mr; l = mv_hub(x, d); g = mv_hubd(x, d); }
+        l = wsum_d(l); g = wsum_d(g);
+        if ((threadIdx.x & 31) == 0 && (l != 0 || g != 0)) { atomicAdd(&acc2[0], l); atomicAdd(&acc2[1], g); }
+    }
+}
+static __global__ void k_mv3(const float *__restrict__ r, int T, int L, int st, int ni, const double *__restrict__ acc, const double *__restrict__ acc2, float d, float ls, float *__restrict__ gph) {
+    const long long cap = (long long)ni * ni * L; const double n = acc[1], mr = acc[0] / n, mg = acc2[1] / n;
+    for (long long t = blockIdx.x * (long long)blockDim.x + threadIdx.x; t < cap; t += (long long)gridDim.x * blockDim.x) {
+        if (!(r[t] == r[t])) continue;
+        const int k = (int)(t % L), jj = (int)(t / L % ni), ii = (int)(t / ((long long)L * ni));
+        gph[((size_t)ii * st * T + (size_t)jj * st) * L + k] += (float)(ls * (mv_hubd(r[t] - mr, d) - mg) / n);
+    }
+}
+extern "C" double vt_multiview_dev(const float *pha, const float *phb, const uint8_t *va, const uint8_t *vb, const double fa[4][3], const double fb[4][3], int T, int L,
+                                   int st, float delta, float lam, float scale, float *gph, long *nshared) {
+    static double *acc = nullptr; static float *r = nullptr; static long long rcap = 0;
+    const int ni = (T + st - 1) / st; const long long cap = (long long)ni * ni * L;
+    if (!acc) cudaMalloc(&acc, 4 * 8);
+    if (rcap < cap) { cudaFree(r); cudaMalloc(&r, cap * 4); rcap = cap; }
+    MvF f; memcpy(f.fa, fa, sizeof f.fa); memcpy(f.fb, fb, sizeof f.fb);
+    cudaMemsetAsync(acc, 0, 4 * 8);
+    unsigned nb = nb_of(cap, 256); if (nb > 4096) nb = 4096;
+    k_mv1<<<nb, 256>>>(pha, phb, va, vb, f, T, L, st, ni, r, acc);
+    double h[2]; cudaMemcpy(h, acc, 2 * 8, cudaMemcpyDeviceToHost);
+    *nshared = (long)h[1];
+    if (h[1] < 64) return 0;
+    k_mv2<<<nb, 256>>>(r, cap, acc, delta, acc + 2);
+    if (gph) k_mv3<<<nb, 256>>>(r, T, L, st, ni, acc, acc + 2, delta, lam * scale, gph);
+    double l[2]; cudaMemcpy(l, acc + 2, 2 * 8, cudaMemcpyDeviceToHost);
+    return l[0] / h[1];
 }
