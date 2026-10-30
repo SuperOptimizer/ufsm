@@ -64,6 +64,7 @@ SRC += src/afv.c src/fibercheck.c
 SRC += src/countfield.c
 SRC += src/flatten.c
 SRC += src/sheetcut.c
+SRC += src/strip.c
 OBJ  = $(patsubst src/%.c,$(B)/%.o,$(SRC)) $(B)/surfcomp.o
 
 all: $(B)/ufsm

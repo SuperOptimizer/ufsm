@@ -275,7 +275,7 @@ double flat_slim(const double *P, int nv, const int *tri, int nt, double *uv, co
 typedef struct { int D, lw, lh; int *lv; flat_mesh m; } level;   /* lattice every D-th grid vertex; lv: lattice -> mesh vertex (-1) */
 static int uf_find(int *p, int a) { while (p[a] != a) { p[a] = p[p[a]]; a = p[a]; } return a; }
 static inline int gvalid(const float *X, const float *Y, const float *Z, size_t i) { return Z[i] >= 0 && isfinite(X[i]) && isfinite(Y[i]) && isfinite(Z[i]); }
-static int build_level(const float *X, const float *Y, const float *Z, int w, int h, double step, int D, double max_edge, level *L) {
+static int build_level(const float *X, const float *Y, const float *Z, int w, int h, double step, int D, double max_edge, int all, const double *col_u, level *L) {
     memset(L, 0, sizeof *L); L->D = D; L->lw = (w - 1) / D + 1; L->lh = (h - 1) / D + 1;
     const int lw = L->lw, lh = L->lh; const size_t ln = (size_t)lw * lh;
     if (lw < 2 || lh < 2) return -1;
@@ -310,9 +310,10 @@ static int build_level(const float *X, const float *Y, const float *Z, int w, in
     for (long t = 0; t < nt; t++) cnt[uf_find(par, tr[3 * t])]++;
     int best = -1; for (size_t i = 0; i < ln; i++) if (cnt[i] > 0 && (best < 0 || cnt[i] > cnt[best])) best = (int)i;
     for (size_t i = 0; i < ln; i++) L->lv[i] = -1;
+    if (all && best >= 0) cnt[best] = (int)nt;   /* (every component: the triangle buffer holds them all) */
     flat_mesh *m = &L->m; m->tri = malloc((size_t)(best >= 0 ? cnt[best] : 1) * 3 * 4); int nv = 0, mt = 0;
     for (long t = 0; t < nt && best >= 0; t++) {
-        if (uf_find(par, tr[3 * t]) != best) continue;
+        if (!all && uf_find(par, tr[3 * t]) != best) continue;
         for (int k = 0; k < 3; k++) { const int l = tr[3 * t + k]; if (L->lv[l] < 0) L->lv[l] = nv++; m->tri[3 * mt + k] = L->lv[l]; }
         mt++;
     }
@@ -321,7 +322,7 @@ static int build_level(const float *X, const float *Y, const float *Z, int w, in
     for (int i = 0; i < lh; i++) for (int j = 0; j < lw; j++) {
         const int v = L->lv[LIDX(i, j)]; if (v < 0) continue; const size_t g = GIDX(i, j);
         m->gi[v] = (int)g; m->P[3 * v] = X[g]; m->P[3 * v + 1] = Y[g]; m->P[3 * v + 2] = Z[g];
-        m->uv0[2 * v] = m->uv[2 * v] = (double)j * D * step; m->uv0[2 * v + 1] = m->uv[2 * v + 1] = (double)i * D * step;
+        m->uv0[2 * v] = m->uv[2 * v] = col_u ? col_u[(size_t)j * D] : (double)j * D * step; m->uv0[2 * v + 1] = m->uv[2 * v + 1] = (double)i * D * step;
     }
 #undef LIDX
 #undef GIDX
@@ -370,12 +371,13 @@ static void prolongate(const level *C, level *F, const flat_opts *o) {
         if (ws > 1e-9) { dl[2 * v] = s[0] / ws; dl[2 * v + 1] = s[1] / ws; known[v] = 1; } else dl[2 * v] = dl[2 * v + 1] = 0;
     }
     /* unknown vertices: neighbour means, repeated */
-    for (int pass = 0; pass < 4096; pass++) {
+    for (int pass = 0, prev = -1; pass < 4096; pass++) {
         memset(acc, 0, n2 * 8); memset(nn, 0, (size_t)m->nv * 4); int left = 0;
         for (int t = 0; t < m->nt; t++) { const int *v = m->tri + 3 * t; for (int a = 0; a < 3; a++) for (int b = 0; b < 3; b++) if (a != b && known[v[b]]) { acc[2 * v[a]] += dl[2 * v[b]]; acc[2 * v[a] + 1] += dl[2 * v[b] + 1]; nn[v[a]]++; } }
         for (int v = 0; v < m->nv; v++) if (!known[v]) { if (nn[v]) { dl[2 * v] = acc[2 * v] / nn[v]; dl[2 * v + 1] = acc[2 * v + 1] / nn[v]; known[v] = 2; } else left++; }
         for (int v = 0; v < m->nv; v++) if (known[v] == 2) known[v] = 1;
-        if (!left) break;
+        if (!left || left == prev) break;   /* (a component without a coarse vertex stays at the grid map: no progress) */
+        prev = left;
     }
     for (size_t i = 0; i < n2; i++) m->uv[i] = m->uv0[i] + dl[i];
     long nb = count_flips(m, m->uv, bad), nb0 = nb; int rounds = 0;
@@ -416,11 +418,11 @@ static void prolongate(const level *C, level *F, const flat_opts *o) {
 int flat_grid(const float *X, const float *Y, const float *Z, int w, int h, double step, const flat_opts *o, flat_mesh *out, flat_stats *before, flat_stats *after) {
     enum { MAXL = 12 }; level L[MAXL]; int nl = 0;
     int D = o->decim < 1 ? 1 : o->decim;
-    if (build_level(X, Y, Z, w, h, step, D, o->max_edge, &L[0])) { free(L[0].lv); flat_mesh_free(&L[0].m); return -1; }
+    if (build_level(X, Y, Z, w, h, step, D, o->max_edge, o->all_components, o->col_u, &L[0])) { free(L[0].lv); flat_mesh_free(&L[0].m); return -1; }
     nl = 1;
     while (nl < MAXL && L[nl - 1].m.nv > o->min_verts) {
         D *= 2; if ((w - 1) / D + 1 < 4 || (h - 1) / D + 1 < 4) break;
-        if (build_level(X, Y, Z, w, h, step, D, o->max_edge, &L[nl])) { free(L[nl].lv); flat_mesh_free(&L[nl].m); break; }
+        if (build_level(X, Y, Z, w, h, step, D, o->max_edge, o->all_components, o->col_u, &L[nl])) { free(L[nl].lv); flat_mesh_free(&L[nl].m); break; }
         nl++;
     }
     if (before) flat_stats_of(L[0].m.P, L[0].m.tri, L[0].m.nt, L[0].m.uv0, before);
@@ -521,7 +523,7 @@ void flat_largest_rect_aspect(const uint8_t *valid, int w, int h, double maxasp,
 
 /* stats of a vertex grid's own map (column step, row step): all triangles of the grid (the same edge filter as the mesh) */
 static void grid_stats(const float *X, const float *Y, const float *Z, int w, int h, double step, double max_edge, flat_stats *s) {
-    level L; if (build_level(X, Y, Z, w, h, step, 1, max_edge, &L)) { memset(s, 0, sizeof *s); free(L.lv); flat_mesh_free(&L.m); return; }
+    level L; if (build_level(X, Y, Z, w, h, step, 1, max_edge, 0, nullptr, &L)) { memset(s, 0, sizeof *s); free(L.lv); flat_mesh_free(&L.m); return; }
     flat_stats_of(L.m.P, L.m.tri, L.m.nt, L.m.uv0, s); free(L.lv); flat_mesh_free(&L.m);
 }
 
