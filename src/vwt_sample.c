@@ -14,6 +14,8 @@
    < 64 voxels dropped; negated on inward rays so ph rises along +k; comp ids from 1 (uint16, 0 none). pw = 1 on comp, 0 in the tubes.
    A slab with < 1% labelled voxels is redrawn (up to 16 times). */
 #include "vwt.h"
+#include "vwt_aug.h"
+int jpeg_write_rgb(const char *path, int w, int h, const uint8_t *rgb, int quality);   /* (imgops.h) */
 #include "json.h"
 #include "sources.h"
 #include "store.h"
@@ -39,6 +41,14 @@ struct vws {
     pthread_mutex_t mu; pthread_cond_t cv; int last;
 };
 
+/* ---- augmentation (src/vwt_aug.h; DA): vwt-train passes its argv here before vws_open; training slabs only ---- */
+static vwa_cfg g_vwa; static int g_vwa_ok;
+void vws_set_args(int argc, char **argv) {
+    g_vwa = vwa_cfg_default();
+    if (vwa_cfg_parse(&g_vwa, argc, argv)) exit(2);
+    g_vwa_ok = 1; vwa_cfg_print(&g_vwa);
+}
+
 /* ---- small helpers ---- */
 static uint64_t vws_rng(uint64_t *s) { uint64_t z = (*s += 0x9e3779b97f4a7c15ull); z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull; z = (z ^ (z >> 27)) * 0x94d049bb133111ebull; return z ^ (z >> 31); }
 static double vws_unif(uint64_t *s) { return (vws_rng(s) >> 11) * (1.0 / 9007199254740992.0); }
@@ -62,7 +72,11 @@ void vws_frame(const double dir[3], const double ray_origin[3], int T, double o[
 
 /* the flood-fill unwrap of raw phases (turns in [0, 1), NAN none) over the [T][T][L] grid: ph (NAN none), comp (0 none); components
    smaller than minsz are dropped. Returns the number of kept components. */
-int vws_unwrap(const float *raw, int T, int L, int minsz, float *ph, uint16_t *comp) {
+/* kinc (nullable): an exact phase increment from voxel v - 1 to v along k (NAN: none); such k links join regardless of size (deformed
+   slabs: a collapsed gap can step > 1/4 turn between neighbouring voxels, kinc integrates the source GT along the segment) */
+int vws_unwrap_k(const float *raw, const float *kinc, int T, int L, int minsz, float *ph, uint16_t *comp);
+int vws_unwrap(const float *raw, int T, int L, int minsz, float *ph, uint16_t *comp) { return vws_unwrap_k(raw, nullptr, T, L, minsz, ph, comp); }
+int vws_unwrap_k(const float *raw, const float *kinc, int T, int L, int minsz, float *ph, uint16_t *comp) {
     const size_t n = (size_t)T * T * L; int32_t *q = malloc(n * sizeof *q); uint32_t *lab = calloc(n, sizeof *lab);
     if (!q || !lab) { free(q); free(lab); return -1; }
     for (size_t k = 0; k < n; k++) ph[k] = NAN;
@@ -76,7 +90,9 @@ int vws_unwrap(const float *raw, int T, int L, int minsz, float *ph, uint16_t *c
                 const int ii = i + di[e], jj = j + dj[e], kk = k + dk[e];
                 if (ii < 0 || jj < 0 || kk < 0 || ii >= T || jj >= T || kk >= L) continue;
                 const size_t u = ((size_t)ii * T + jj) * L + kk; if (lab[u] || isnan(raw[u])) continue;
-                double dp = raw[u] - raw[c]; dp -= floor(dp + 0.5); if (fabs(dp) >= 0.25) continue;
+                double dp = raw[u] - raw[c]; dp -= floor(dp + 0.5);
+                const float kx = !kinc ? NAN : e == 4 ? kinc[u] : e == 5 ? -kinc[c] : NAN;
+                if (!isnan(kx)) dp = kx; else if (fabs(dp) >= 0.25) continue;
                 lab[u] = id; ph[u] = (float)(ph[c] + dp); q[t++] = (int32_t)u;
             }
         }
@@ -99,7 +115,17 @@ static int vws_seg_hit(const double (*seg)[6], const int *idx, int nidx, double 
 }
 
 /* ---- one slab ---- */
-typedef struct { uint8_t *ct, *gt; size_t ccap, gcap; float *raw, *q; size_t n; int *sidx; int nsidx; } vws_work;
+typedef struct { uint8_t *ct, *gt; size_t ccap, gcap; float *raw, *q, *kinc; size_t n; int *sidx; int nsidx; uint8_t *arena; } vws_work;
+#define VWS_ARENA ((size_t)64 << 21)   /* the crush map's CT tile cache per worker (64 x 2 MiB) */
+typedef struct { crush_cache *cc; crush_layer L; } vws_ctu;
+static double vws_ct_xyz(void *ud, const double x[3]) { vws_ctu *u = ud; const double p[3] = {x[2], x[1], x[0]}; return crush_linear_at(u->cc, &u->L, p); }
+/* the stored GT phase (turns, wrapped, sign applied) nearest to CT point x (xyz), or -1 (none / outside the read GT box) */
+static double vws_gt_at(const uint8_t *gt, const int64_t go[3], const int64_t gn[3], double f, int psign, const double x[3]) {
+    const int64_t gz = (int64_t)floor((x[2] + 0.5) / f) - go[0], gy = (int64_t)floor((x[1] + 0.5) / f) - go[1], gx = (int64_t)floor((x[0] + 0.5) / f) - go[2];
+    if (gz < 0 || gy < 0 || gx < 0 || gz >= gn[0] || gy >= gn[1] || gx >= gn[2]) return -1;
+    const uint8_t c = gt[((size_t)gz * gn[1] + gy) * gn[2] + gx]; if (c >= 252) return -1;
+    double ph = psign * c / 252.0; return ph - floor(ph);
+}
 
 /* the source bbox (xyz) of a slab whose voxel (i, j, k) samples q (xyz, [T][T][L][3]) */
 static void vws_qbox(const float *q, size_t n, double lo[3], double hi[3]) {
@@ -127,8 +153,19 @@ static int vws_fill(vws *V, uint64_t *rs, vws_work *w, vws_sample *out) {
         const int k0 = 32 + (int)(vws_rng(rs) % (uint64_t)(L - 64 > 1 ? L - 64 : 1));
         double ro[3] = {px - k0 * dir[0], py - k0 * dir[1], pz - k0 * dir[2]};
         vws_frame(dir, ro, T, out->o, out->a, out->b, out->d);
-        /* the source lattice q (xyz); the geometric aug hook replaces it (src/vwt_aug.h) */
-        for (int i = 0; i < T; i++) for (int j = 0; j < T; j++) for (int k = 0; k < L; k++) {
+        /* the source lattice q (xyz); the geometric aug hook replaces it (src/vwt_aug.h): CT and labels are both read at q */
+        vwa *ga = nullptr; int geo = 0; out->T = T; out->L = L;
+        if (g_vwa_ok && V->train && g_vwa.on && g_vwa.geo_p > 0) {
+            if (!w->arena) w->arena = malloc(VWS_ARENA);
+            crush_cache cc;
+            if (w->arena && !crush_cache_init(&cc, w->arena, VWS_ARENA)) {
+                vws_ctu u = {&cc, {S->ct, CRUSH_LINEAR, 0, 0, 1, {0, 0, 0}, nullptr}};
+                ga = vwa_begin(&g_vwa, vws_rng(rs), out, vws_ct_xyz, &u);
+                if (ga) { vwa_src_lattice(ga, T, L, w->q); geo = 1; }
+                vwa_end(ga); ga = nullptr; crush_cache_free(&cc);
+            }
+        }
+        if (!geo) for (int i = 0; i < T; i++) for (int j = 0; j < T; j++) for (int k = 0; k < L; k++) {
             float *qq = w->q + 3 * (((size_t)i * T + j) * L + k);
             for (int c = 0; c < 3; c++) qq[c] = (float)(out->o[c] + i * out->a[c] + j * out->b[c] + k * out->d[c]);
         }
@@ -180,7 +217,25 @@ static int vws_fill(vws *V, uint64_t *rs, vws_work *w, vws_sample *out) {
             double ph = S->psign * c / 252.0; ph -= floor(ph); w->raw[v] = (float)ph; nlab++;
         }
         if (nlab < n / 100) continue;
-        const int nc = vws_unwrap(w->raw, T, L, 64, out->ph, out->comp); if (nc <= 0) continue;
+        if (geo) {   /* deformed: exact k increments through the source GT along each q segment (substeps <= 0.5 voxel) */
+            if (!w->kinc) { w->kinc = malloc(n * sizeof *w->kinc); if (!w->kinc) return -1; }
+            for (size_t v = 0; v < n; v++) {
+                w->kinc[v] = NAN;
+                if (v % L == 0 || isnan(w->raw[v]) || isnan(w->raw[v - 1])) continue;
+                const float *a = w->q + 3 * (v - 1), *b = w->q + 3 * v;
+                const double len = sqrt((b[0] - a[0]) * (b[0] - a[0]) + (b[1] - a[1]) * (b[1] - a[1]) + (b[2] - a[2]) * (b[2] - a[2]));
+                const int m = (int)ceil(len / 0.5); if (m <= 1) continue;
+                double prev = w->raw[v - 1], sum = 0; int ok = 1;
+                for (int t = 1; t <= m && ok; t++) {
+                    const double x[3] = {a[0] + (b[0] - a[0]) * t / (double)m, a[1] + (b[1] - a[1]) * t / (double)m, a[2] + (b[2] - a[2]) * t / (double)m};
+                    const double g = t == m ? w->raw[v] : vws_gt_at(w->gt, go, gn, f, S->psign, x);
+                    if (g < 0) { ok = 0; break; }
+                    double dd = g - prev; dd -= floor(dd + 0.5); sum += dd; prev = g;
+                }
+                if (ok) w->kinc[v] = (float)sum;
+            }
+        }
+        const int nc = vws_unwrap_k(w->raw, geo ? w->kinc : nullptr, T, L, 64, out->ph, out->comp); if (nc <= 0) continue;
         size_t kept = 0;
         for (size_t v = 0; v < n; v++) {
             if (!out->comp[v]) { out->pw[v] = 0; continue; }
@@ -189,6 +244,7 @@ static int vws_fill(vws *V, uint64_t *rs, vws_work *w, vws_sample *out) {
             out->pw[v] = w->nsidx && vws_seg_hit(S->seg, w->sidx, w->nsidx, R * R, p) ? 0.f : 1.f; kept += out->pw[v] > 0;
         }
         if (kept < n / 100) continue;
+        if (g_vwa_ok && V->train) vwa_intensity(&g_vwa, vws_rng(rs), out->im, out->va, T, L);
         out->T = T; out->L = L; out->src = si; out->flags = inward;
         return 0;
     }
@@ -211,7 +267,7 @@ static void *vws_worker(void *arg) {
         pthread_mutex_lock(&V->mu); V->slot[k].state = rc ? 0 : 2; pthread_cond_broadcast(&V->cv); pthread_mutex_unlock(&V->mu);
         if (rc) fprintf(stderr, "vws: no slab after 64 draws\n");
     }
-    free(w.raw); free(w.q); free(w.ct); free(w.gt); free(w.sidx); free(A); return nullptr;
+    free(w.raw); free(w.q); free(w.kinc); free(w.arena); free(w.ct); free(w.gt); free(w.sidx); free(A); return nullptr;
 }
 
 int vws_next(vws *V, vws_sample *out) {
@@ -350,7 +406,10 @@ static const char *vo(int argc, char **argv, const char *k, const char *d) { for
 #include <time.h>
 #include <sys/stat.h>
 int cmd_vwt_sample(int argc, char **argv) {
-    if (argc < 5) { fprintf(stderr, "usage: ufsm vwt-sample SOURCES OUT N [--T 128] [--L 384] [--tilt 15] [--threads 8] [--seed 1] [--val 0] [--write 1]\n"); return 2; }
+    if (argc < 5) { fprintf(stderr, "usage: ufsm vwt-sample SOURCES OUT N [--T 128] [--L 384] [--tilt 15] [--threads 8] [--seed 1] [--val 0] [--write 1] [--jpg 0]\n"
+                                    "       [--vaug 1 ... (any vwt-train aug flag: the training augmentation, src/vwt_aug.h)]\n"); return 2; }
+    for (int i = 5; i < argc; i++) if (!strncmp(argv[i], "--vaug", 6) || !strncmp(argv[i], "--deform", 8) || !strncmp(argv[i], "--aug-crush", 11)) { vws_set_args(argc, argv); break; }
+    const int jpg = atoi(vo(argc, argv, "--jpg", "0"));
     const int T = atoi(vo(argc, argv, "--T", "128")), L = atoi(vo(argc, argv, "--L", "384")), N = atoi(argv[4]), wr = atoi(vo(argc, argv, "--write", "1"));
     vws *V = vws_open(argv[2], T, L, (float)atof(vo(argc, argv, "--tilt", "15")), atoi(vo(argc, argv, "--threads", "8")), (unsigned)atoi(vo(argc, argv, "--seed", "1")), !atoi(vo(argc, argv, "--val", "0")));
     if (!V) return 1;
@@ -364,6 +423,17 @@ int cmd_vwt_sample(int argc, char **argv) {
             if (v % L && s.comp[v] && s.comp[v] == s.comp[v - 1]) { const float d = s.ph[v] - s.ph[v - 1]; up += d > 0; dn += d < 0; } }
         if (m) fprintf(m, "%d\t%d\t%d\t%.1f\t%.1f\t%.1f\t%.3f\t%.3f\t%.3f\t%.4f\t%.4f\t%d\t%.3f\n", i, s.src, s.flags & 1, s.o[0], s.o[1], s.o[2], s.d[0], s.d[1], s.d[2],
                        (double)lab / n, (double)wsum / n, nc, up + dn ? (double)up / (up + dn) : 0.0);
+        if (jpg) {   /* the i = T / 2 plane ([j][k], the ray across): CT | wrapped target phase hue over the CT (unlabelled: CT) */
+            uint8_t *img = malloc((size_t)2 * T * L * 3);
+            for (int j = 0; j < T; j++) for (int k = 0; k < L; k++) {
+                const size_t v = ((size_t)(T / 2) * T + j) * L + k; const int g = s.im[v];
+                uint8_t *a = img + ((size_t)j * L + k) * 3, *b = img + ((size_t)(T + j) * L + k) * 3; a[0] = a[1] = a[2] = b[0] = b[1] = b[2] = (uint8_t)g;
+                if (s.comp[v]) { const double h = s.ph[v] - floor(s.ph[v]);
+                    const double cr[3] = {.5 + .5 * cos(2 * M_PI * h), .5 + .5 * cos(2 * M_PI * (h - 1. / 3)), .5 + .5 * cos(2 * M_PI * (h - 2. / 3))};
+                    for (int e = 0; e < 3; e++) b[e] = (uint8_t)((g + 255 * cr[e]) / 2); }
+            }
+            snprintf(p, sizeof p, "%s/s%03d.jpg", argv[3], i); jpeg_write_rgb(p, L, 2 * T, img, 88); free(img);
+        }
         if (wr) {
             const char *ext[5] = {"im.u8", "va.u8", "ph.f32", "comp.u16", "pw.f32"}; const void *buf[5] = {s.im, s.va, s.ph, s.comp, s.pw}; const size_t es[5] = {1, 1, 4, 2, 4};
             for (int k = 0; k < 5; k++) { snprintf(p, sizeof p, "%s/s%03d.%s", argv[3], i, ext[k]); FILE *f = fopen(p, "wb"); if (f) { fwrite(buf[k], es[k], n, f); fclose(f); } }
