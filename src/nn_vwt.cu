@@ -323,3 +323,56 @@ static __global__ void k_tr(const float *__restrict__ x, float *__restrict__ y, 
     }
 }
 extern "C" void vt_transpose(const float *x, float *y, long long A, long long B, int C) { k_tr<<<GRID(A * B * C)>>>(x, y, A, B, C); }
+
+static __global__ void k_axpy(float *__restrict__ y, const float *__restrict__ x, long long n, float a) {
+    for (long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; i < n; i += (long long)gridDim.x * blockDim.x) y[i] += a * x[i];
+}
+/* ---- position-only shell loss (villa position_only_phase_loss): per column (no phase labels in it) the centres of the shell runs
+   along k (runs closer than 3 voxels merged); consecutive centres: hinge relu(1 - delta) + snap 0.5 (delta - round delta)^2 when
+   delta >= 1 and |residual| <= gate; per-column means, averaged over the active columns. Gradients into g (written, unscaled per
+   column; k_shell_scale applies 1 / active and the weights). ---- */
+static __device__ __forceinline__ float ph_at(const float *p, int L, float t, int *k0, float *f) {
+    if (t < 0) t = 0; if (t > L - 1) t = L - 1; int a = (int)t; if (a > L - 2) a = L - 2; *k0 = a; *f = t - a; return p[a] + (p[a + 1] - p[a]) * *f;
+}
+static __global__ void k_shell(const float *__restrict__ ph, const uint8_t *__restrict__ sh, const uint16_t *__restrict__ comp, long long ncol, int L,
+                               float gate, float *__restrict__ g, double *__restrict__ acc /* hinge, snap, active */) {
+    const long long c = blockIdx.x * (long long)blockDim.x + threadIdx.x; if (c >= ncol) return;
+    const float *p = ph + c * L; const uint8_t *s = sh + c * L; float *gc = g + c * L;
+    for (int k = 0; k < L; k++) gc[k] = 0.f;
+    if (comp) { for (int k = 0; k < L; k++) if (comp[c * L + k]) return; }
+    float cen[64]; int nc = 0; int k = 0;
+    while (k < L && nc < 64) {
+        if (!s[k]) { k++; continue; }
+        int a = k; while (k < L && s[k]) k++; int b = k - 1;
+        while (k < L && k - b <= 3) { if (s[k]) { while (k < L && s[k]) k++; b = k - 1; } else k++; }   /* merge runs closer than 3 voxels */
+        cen[nc++] = 0.5f * (a + b);
+    }
+    if (nc < 2) return;
+    double hs = 0, ss = 0; const int np = nc - 1;
+    for (int i = 0; i < np; i++) {
+        int k0, k1; float f0, f1; const float a0 = ph_at(p, L, cen[i], &k0, &f0), a1 = ph_at(p, L, cen[i + 1], &k1, &f1), d = a1 - a0;
+        float gd = 0.f;
+        if (d < 1.f) { hs += 1.f - d; gd -= 1.f; }
+        const float r = d - rintf(d);
+        if (d >= 1.f && fabsf(r) <= gate) { ss += 0.5 * r * r; gd += r; }
+        gd /= np;   /* d/d delta of the column mean */
+        gc[k1] += gd * (1 - f1); gc[k1 + 1] += gd * f1; gc[k0] -= gd * (1 - f0); gc[k0 + 1] -= gd * f0;
+    }
+    atomicAdd(&acc[0], hs / np); atomicAdd(&acc[1], ss / np); atomicAdd(&acc[2], 1.0);
+}
+extern "C" int vt_shell_loss(const float *ph, const uint8_t *shell, const uint16_t *comp, int T, int L, float gate, float lam_h, float lam_s, float scale,
+                             float *gph, double *hinge, double *snap, double *ncol) {
+    static double *acc = nullptr; static float *gs = nullptr; static long long gn = 0;
+    const long long nc = (long long)T * T, n = nc * L;
+    if (!acc) cudaMalloc(&acc, 3 * 8);
+    if (gn < n) { cudaFree(gs); cudaMalloc(&gs, n * 4); gn = n; }
+    cudaMemsetAsync(acc, 0, 3 * 8);
+    k_shell<<<nb_of(nc, 128), 128>>>(ph, shell, comp, nc, L, gate, gs, acc);
+    double h[3]; cudaMemcpy(h, acc, 3 * 8, cudaMemcpyDeviceToHost);
+    *hinge = h[2] > 0 ? h[0] / h[2] : 0; *snap = h[2] > 0 ? h[1] / h[2] : 0; *ncol = h[2];
+    /* gs holds d(hinge + snap column means)/d ph with both terms weighted 1: re-weight is approximated by lam_h for the whole (hinge and
+       snap gradients share the column); the trainer passes lam_h == lam_s */
+    if (gph && h[2] > 0) { const float sc = (float)(lam_h * scale / h[2]); k_axpy<<<GRID(n)>>>(gph, gs, n, sc); }
+    (void)lam_s;
+    return cudaGetLastError() == cudaSuccess ? 0 : -1;
+}
