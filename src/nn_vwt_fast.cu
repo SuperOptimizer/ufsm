@@ -613,24 +613,29 @@ static VtP make_p(int mode, vt_t a, int k, int sd, int sh, int sw, int Do, int H
     p.M = (long long)a.n * Do * Ho * Wo; (void)mode; return p;
 }
 
-extern "C" int vtf8_conv(int mode, const float *src, int n, int D, int H, int W, int C, const float *w, int co, int ci, int k, int sd, int sh, int sw,
+extern "C" int vtf8_conv(int mode, int bits, const float *src, int n, int D, int H, int W, int C, const float *w, int co, int ci, int k, int sd, int sh, int sw,
                          int Do, int Ho, int Wo, int N, const float *bias, float *y, void *qbuf, void *wbuf);
-extern "C" size_t vtf8_qbytes(long long rows, int C);
-extern "C" size_t vtf8_wbytes(int N, int K);
+extern "C" size_t vtf8_qbytes(long long rows, int C, int bits);
+extern "C" size_t vtf8_wbytes(int N, int K, int bits);
 extern "C" int vtf8_ok(int C, int N);
 static int g_vmx = -1;
 extern "C" void vtf_set_mx(int bits) { g_vmx = bits; }
 static int vmx(void) { if (g_vmx < 0) { const char *e = getenv("UFSM_VTF_MX"); g_vmx = e ? atoi(e) : 0; } return g_vmx; }
-/* MX-fp8 forward / backward-data when enabled and the shapes and the scratch (A quantized into the im2col chunk region) allow */
-static bool use8(long long rows, int C, int N, int K) {
-    return vmx() == 8 && vtf8_ok(C, N) && vtf8_qbytes(rows, C) <= WCHUNK + GCHUNK && vtf8_wbytes(N, K) <= 2 * wbytes_max(256, 256);
+/* the pipelined forward / backward-data (src/lp_vwt8.cu: MX-fp8 when enabled, else bf16; the A source copied into the chunk region) when the
+   shapes and the scratch allow (0: the register-staged kernel here); env UFSM_VTF_PIPE=0 turns the bf16 one off */
+static int use8(long long rows, int C, int N, int K, int sd, int sh, int sw) {
+    static int pipe = -1; if (pipe < 0) { const char *e = getenv("UFSM_VTF_PIPE"); pipe = e ? atoi(e) : 1; }
+    const int bits = vmx() == 8 ? 8 : 16;
+    if (bits == 16 && !pipe) return 0;
+    if (sd > 2 || sh > 2 || sw > 2) return 0;
+    return vtf8_ok(C, N) && vtf8_qbytes(rows, C, bits) <= g_wreg && vtf8_wbytes(N, K, bits) <= 2 * wbytes_max(256, 256) ? bits : 0;
 }
 extern "C" int vtf_conv_fwd(vt_t x, const float *w, const float *b, int k, int sd, int sh, int sw, vt_t y, void *scratch) {
     const int Do = odim(x.d, sd), Ho = odim(x.h, sh), Wo = odim(x.w, sw), co = y.c;
     if (y.d != Do || y.h != Ho || y.w != Wo || y.n != x.n) { fprintf(stderr, "vtf_conv_fwd: output shape mismatch\n"); return -1; }
     if (co > 256 || x.c > 256) { fprintf(stderr, "vtf_conv_fwd: %d -> %d unsupported\n", x.c, co); return -1; }
-    if (use8((long long)x.n * x.d * x.h * x.w, x.c, co, k * k * k * x.c))
-        return vtf8_conv(0, x.p, x.n, x.d, x.h, x.w, x.c, w, co, x.c, k, sd, sh, sw, Do, Ho, Wo, co, b, y.p, (char *)scratch + 2 * wbytes_max(256, 256), scratch);
+    if (const int b8 = use8((long long)x.n * x.d * x.h * x.w, x.c, co, k * k * k * x.c, sd, sh, sw))
+        return vtf8_conv(0, b8, x.p, x.n, x.d, x.h, x.w, x.c, w, co, x.c, k, sd, sh, sw, Do, Ho, Wo, co, b, y.p, (char *)scratch + 2 * wbytes_max(256, 256), scratch);
     const int K = k * k * k * x.c, Kp = (K + VBK - 1) / VBK * VBK, Np = (co + ntile(co) - 1) / ntile(co) * ntile(co);
     __nv_bfloat16 *B = (__nv_bfloat16 *)scratch;
     k_wprep<<<cap_blocks((long long)Np * Kp), 256>>>(w, co, k * k * k, x.c, Kp, Np, 0, B);
@@ -644,8 +649,9 @@ extern "C" int vtf_conv_bwd(vt_t x, vt_t gy, const float *w, int k, int sd, int 
     const long long rows = (long long)gy.n * gy.d * gy.h * gy.w;
     if (gb) { const int per = 256 / co > 0 ? 256 / co : 1; k_colsum_f<<<1024, per * co, co * sizeof(float)>>>(gy.p, rows, co, per, gb); }
     char *s = (char *)scratch;
-    if (gx.p && use8(rows, co, ci, T * co)) {
-        if (vtf8_conv(1, gy.p, gy.n, gy.d, gy.h, gy.w, co, w, co, ci, k, sd, sh, sw, x.d, x.h, x.w, ci, nullptr, gx.p, s + 2 * wbytes_max(256, 256), s)) return -1;
+    const int b8 = gx.p ? use8(rows, co, ci, T * co, sd, sh, sw) : 0;
+    if (b8) {
+        if (vtf8_conv(1, b8, gy.p, gy.n, gy.d, gy.h, gy.w, co, w, co, ci, k, sd, sh, sw, x.d, x.h, x.w, ci, nullptr, gx.p, s + 2 * wbytes_max(256, 256), s)) return -1;
     } else if (gx.p) {   /* backward-data: rows = input voxels, columns = ci, K = taps x co */
         const int K = T * co, Kp = (K + VBK - 1) / VBK * VBK, Np = (ci + ntile(ci) - 1) / ntile(ci) * ntile(ci);
         __nv_bfloat16 *B = (__nv_bfloat16 *)s;
