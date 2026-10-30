@@ -138,8 +138,19 @@ int cmd_vwt_train(int argc, char **argv) {
     }
     signal(SIGTERM, on_term); signal(SIGINT, on_term);
     vws_set_args(argc, argv);
-    vws *S = vws_open(src, T, L, (float)atof(opt(argc, argv, "--tilt", "15")), atoi(opt(argc, argv, "--threads", "12")), (unsigned)(atoi(opt(argc, argv, "--seed", "1")) * 7919 + step), 1);
-    if (!S) { fprintf(stderr, "vwt-train: cannot open sources %s\n", src); return 1; }
+    /* --overfit DIR --n N: cycle over N dumped slabs instead of the sampler (correctness check: the loss must collapse) */
+    const char *ofd = opt(argc, argv, "--overfit", nullptr); const int ofn = atoi(opt(argc, argv, "--n", "4"));
+    vws_sample *OF = nullptr;
+    if (ofd) {
+        const size_t nn = (size_t)T * T * L; OF = calloc(ofn, sizeof *OF);
+        for (int i = 0; i < ofn; i++) {
+            vws_sample *q = &OF[i]; q->T = T; q->L = L; q->im = malloc(nn); q->va = malloc(nn); q->ph = malloc(nn * 4); q->comp = malloc(nn * 2); q->pw = malloc(nn * 4);
+            if (rd(ofd, i, "im.u8", q->im, nn) || rd(ofd, i, "va.u8", q->va, nn) || rd(ofd, i, "ph.f32", q->ph, nn * 4) || rd(ofd, i, "comp.u16", q->comp, nn * 2) || rd(ofd, i, "pw.f32", q->pw, nn * 4)) { fprintf(stderr, "vwt-train: cannot read overfit slab %d\n", i); return 1; }
+            for (size_t k = 0; k < nn; k++) if (!q->comp[k]) q->ph[k] = 0.f;
+        }
+    }
+    vws *S = ofd ? nullptr : vws_open(src, T, L, (float)atof(opt(argc, argv, "--tilt", "15")), atoi(opt(argc, argv, "--threads", "12")), (unsigned)(atoi(opt(argc, argv, "--seed", "1")) * 7919 + step), 1);
+    if (!S && !ofd) { fprintf(stderr, "vwt-train: cannot open sources %s\n", src); return 1; }
     const size_t n = (size_t)T * T * L;
     uint8_t *imd = nn_malloc(n), *vad = nn_malloc(n); float *tg = nn_malloc(n * 4), *pw = nn_malloc(n * 4), *gph = nn_malloc(n * 4), *ginc = nn_malloc(n * 4);
     float *phd = nn_malloc(n * 4), *incd = nn_malloc(n * 4); uint16_t *cd = nn_malloc(n * 2); float *ones = malloc(n * 4); uint8_t *shd = nn_malloc(n);
@@ -152,7 +163,7 @@ int cmd_vwt_train(int argc, char **argv) {
         const double t0 = now_s(); double wait = 0;
         vwt_zero_grad(m);
         for (int b = 0; b < B; b++) {
-            vws_sample s; const double tw = now_s(); if (vws_next(S, &s)) { fprintf(stderr, "vwt-train: sampler failed\n"); return 1; } wait += now_s() - tw;
+            vws_sample s; const double tw = now_s(); if (OF) s = OF[(step * B + b) % ofn]; else if (vws_next(S, &s)) { fprintf(stderr, "vwt-train: sampler failed\n"); return 1; } wait += now_s() - tw;
             nn_h2d(imd, s.im, n); nn_h2d(vad, s.va, n); nn_h2d(tg, s.ph, n * 4); nn_h2d(cd, s.comp, n * 2); nn_h2d(pw, s.pw ? s.pw : ones, n * 4);
             /* monotone convention check on the host: share of labelled ray steps where the target rises */
             { size_t up = 0, tot = 0; for (size_t i = 1; i < n; i += 7) if (i % L && s.comp[i] && s.comp[i] == s.comp[i - 1]) { tot++; up += s.ph[i] > s.ph[i - 1]; } acc_mono += tot ? (double)up / tot : 0; }
@@ -194,7 +205,7 @@ int cmd_vwt_train(int argc, char **argv) {
         }
         if (stop) { fprintf(stderr, "vwt-train: STOP at step %d\n", step); break; }
     }
-    fclose(lf); vws_close(S);
+    fclose(lf); if (S) vws_close(S);
     return 0;
 }
 
