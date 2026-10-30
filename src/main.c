@@ -69,6 +69,7 @@ int cmd_wl_dump(int argc, char **argv);
 int cmd_dinovol_embed(int argc, char **argv);   /* src/dinovol.c */
 int cmd_hercuvit(int argc, char **argv);   /* src/hercuvit.c */
 int cmd_villawind(int argc, char **argv);   /* src/villawind.c */
+int cmd_vwt_infer(int argc, char **argv);   /* src/vwt_infer.c */
 int cmd_vwt_train(int argc, char **argv);   /* src/vwt_train.c */
 int cmd_vwt_tile(int argc, char **argv);   /* src/vwt_tile.c */
 int cmd_ink3d_ext(int argc, char **argv);   /* src/ink3dext.c */
@@ -3941,6 +3942,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "villawind")) return cmd_villawind(argc, argv);
     if (!strcmp(cmd, "vwt-train")) return cmd_vwt_train(argc, argv);
     if (!strcmp(cmd, "vwt-tile")) return cmd_vwt_tile(argc, argv);
+    if (!strcmp(cmd, "vwt-infer")) return cmd_vwt_infer(argc, argv);
     if (!strcmp(cmd, "ink3d-ext")) return cmd_ink3d_ext(argc, argv);
     if (!strcmp(cmd, "vol-cmp")) return cmd_vol_cmp(argc, argv);
     if (!strcmp(cmd, "dinovol-eval")) return cmd_dinovol_eval(argc, argv);
