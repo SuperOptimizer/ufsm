@@ -172,6 +172,9 @@ static int usage(void) {
         "  ufsm render <wraps-dir> <out-dir> --volume ROOT KEY [--ct ROOT KEY]  ink / CT along each wrap (tiled TIFF)\n"
         "  ufsm flatten <wraps-dir> <out-dir> [--wraps a,b] [--decim 1] [--out-step S]   SLIM-flattened wraps (isometric uv, largest valid rectangle)\n"
         "  ufsm flatten-warp <in.jpg|tif> <flat-wrap-dir> <out.jpg|tif> --src-px P [--scale S]   a render of the original wrap onto the flat one\n"
+        "  ufsm strip <wraps-dir> <out-dir> [--first K] [--last K] [--every E]   the wraps joined at the theta cut: ONE continuous spiral surface (strip.sfc)\n"
+        "  ufsm strip-flatten <strip-dir> [--decim D] [--stride S] [--stripe-px 60000] [--flip-rows 1]   the whole strip flattened (chunk SLIM + blend) -> render stripes\n"
+        "  ufsm strip-mosaic <flat-dir> <render-dir> <out-dir> [--ct-level 80]   stripe JPEGs, overview, on-papyrus share along the strip\n"
         "  ufsm blend <out-group> <out-um> --shape Z,Y,X --interior S <root> <key> <oz,oy,ox>...   shifted predict runs -> one seamless sin^2-weighted logit average\n"
         "  ufsm wrapdist <wraps-dir> <labels-root> <labels-key>              wrap vertices vs the nearest labelled sheet\n"
         "  ufsm wrapswitch <wraps-dir> <codes-root> <codes-key>            how often the wraps switch sheets (per cm)\n"
@@ -3862,6 +3865,10 @@ int cmd_wrap_check(int argc, char **argv);   /* src/wrapcheck.c */
 int cmd_fields_oracle(int argc, char **argv);   /* src/fieldsoracle.c */
 int cmd_flatten(int argc, char **argv);         /* src/flatten.c */
 int cmd_flatten_warp(int argc, char **argv);
+int cmd_strip(int argc, char **argv);           /* src/strip.c */
+int cmd_strip_flatten(int argc, char **argv);
+int cmd_strip_mosaic(int argc, char **argv);
+int cmd_strip_crop(int argc, char **argv);
 int cmd_fiber_check(int argc, char **argv);    /* src/fibercheck.c */
 int cmd_fiber_export(int argc, char **argv);   /* src/fibercheck.c */
 int cmd_count_field(int argc, char **argv);   /* src/countfield.c */
@@ -3909,6 +3916,10 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "fields-oracle")) return cmd_fields_oracle(argc, argv);
     if (!strcmp(cmd, "flatten")) return cmd_flatten(argc, argv);
     if (!strcmp(cmd, "flatten-warp")) return cmd_flatten_warp(argc, argv);
+    if (!strcmp(cmd, "strip")) return cmd_strip(argc, argv);
+    if (!strcmp(cmd, "strip-flatten")) return cmd_strip_flatten(argc, argv);
+    if (!strcmp(cmd, "strip-mosaic")) return cmd_strip_mosaic(argc, argv);
+    if (!strcmp(cmd, "strip-crop")) return cmd_strip_crop(argc, argv);
     if (!strcmp(cmd, "fiber-check")) return cmd_fiber_check(argc, argv);
     if (!strcmp(cmd, "fiber-export")) return cmd_fiber_export(argc, argv);
     if (!strcmp(cmd, "count-field")) return cmd_count_field(argc, argv);

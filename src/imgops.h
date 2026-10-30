@@ -33,6 +33,7 @@ uint8_t *overlay_red_half(const uint8_t *ct, int W, int H, const uint8_t *const 
 int overlay_red_skip(const uint8_t *ct, size_t n);
 
 int jpeg_write_rgb(const char *path, int w, int h, const uint8_t *rgb, int quality);   /* 0 on success */
+int jpeg_write_gray(const char *path, int w, int h, const uint8_t *g, int quality);  /* one-channel (grayscale) JPEG, 0 on success */
 uint8_t *jpeg_read_rgb(const char *path, int *w, int *h);   /* any JPEG as RGB, nullptr on failure (no exit on corrupt input) */
 /* the longest side scaled down to max_px (antialiased bilinear, aspect kept; *rgb replaced); no-op when already within or max_px <= 0; 0 ok */
 int img_fit_rgb(uint8_t **rgb, int *w, int *h, int max_px, int nthreads);

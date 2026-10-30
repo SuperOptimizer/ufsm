@@ -37,6 +37,10 @@ typedef struct {
     double max_edge;    /* drop triangles with a 3D edge longer than max_edge x the lattice spacing (x sqrt 2 on the diagonal) (3) */
     double tol;         /* stop when an iteration lowers the energy by less than tol relative (1e-5) */
     int verbose;
+    int all_components; /* 1: every connected component of the grid mesh is kept and flattened (each keeps its own place: ufsm strip-flatten
+                           aligns them one by one); 0: the largest only (ufsm flatten) */
+    const double *col_u;   /* optional (w entries, increasing): the initial map's u of each grid column instead of column x step (an arc-length
+                              parametrisation starts SLIM nearer the optimum); nullptr: the grid map */
 } flat_opts;
 flat_opts flat_opts_default(void);
 

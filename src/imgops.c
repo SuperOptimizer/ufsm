@@ -200,6 +200,17 @@ int jpeg_write_rgb(const char *path, int w, int h, const uint8_t *rgb, int quali
 }
 
 
+int jpeg_write_gray(const char *path, int w, int h, const uint8_t *g, int quality) {
+    FILE *f = fopen(path, "wb"); if (!f) return -1;
+    struct jpeg_compress_struct ci; struct jpeg_error_mgr je;
+    ci.err = jpeg_std_error(&je); jpeg_create_compress(&ci); jpeg_stdio_dest(&ci, f);
+    ci.image_width = (JDIMENSION)w; ci.image_height = (JDIMENSION)h; ci.input_components = 1; ci.in_color_space = JCS_GRAYSCALE;
+    jpeg_set_defaults(&ci); jpeg_set_quality(&ci, quality, TRUE);
+    jpeg_start_compress(&ci, TRUE);
+    while (ci.next_scanline < ci.image_height) { JSAMPROW r = (JSAMPROW)(g + (size_t)ci.next_scanline * w); jpeg_write_scanlines(&ci, &r, 1); }
+    jpeg_finish_compress(&ci); jpeg_destroy_compress(&ci);
+    return fclose(f) ? -1 : 0;
+}
 /* ---- JPEG reading (any libjpeg input as RGB; a corrupt file returns nullptr instead of libjpeg's exit) ---- */
 typedef struct { struct jpeg_error_mgr pub; jmp_buf jb; } jr_err;
 static void jr_error_exit(j_common_ptr c) { longjmp(((jr_err *)c->err)->jb, 1); }
