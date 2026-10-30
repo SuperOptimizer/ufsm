@@ -53,8 +53,8 @@ int main(int argc, char **argv) {
         vt_t yr = y, yf = y, gy = y, gxr = x, gxf = x; yr.p = dev_zero(ny); yf.p = dev_zero(ny); gy.p = dev_rand(ny, 1.f); gxr.p = dev_zero(nx); gxf.p = dev_zero(nx);
         float *gwr = dev_zero(nw), *gwf = dev_zero(nw), *gbr = dev_zero(q->co), *gbf = dev_zero(q->co);
         printf("%s: %d -> %d k%d s%d on %dx%dx%d\n", q->nm, q->ci, q->co, q->k, s, dd, dd, L);
-        int rc = vt_conv_fwd(x, w, b, q->k, s, s, 1, yr, scr) | vtf_conv_fwd(x, w, b, q->k, s, s, 1, yf, scf);
-        rc |= vt_conv_bwd(x, gy, w, q->k, s, s, 1, gxr, gwr, gbr, scr) | vtf_conv_bwd(x, gy, w, q->k, s, s, 1, gxf, gwf, gbf, scf);
+        int rc = vtr_conv_fwd(x, w, b, q->k, s, s, 1, yr, scr) | vtf_conv_fwd(x, w, b, q->k, s, s, 1, yf, scf);
+        rc |= vtr_conv_bwd(x, gy, w, q->k, s, s, 1, gxr, gwr, gbr, scr) | vtf_conv_bwd(x, gy, w, q->k, s, s, 1, gxf, gwf, gbf, scf);
         nn_sync();
         if (rc || nn_check()) { printf("  FAIL: call error %s\n", nn_check() ? nn_check() : ""); fail++; continue; }
         if (!bench) {
@@ -66,9 +66,9 @@ int main(int argc, char **argv) {
                 double bf = 1e9, bb = 1e9;
                 for (int it = 0; it < 4; it++) {
                     nn_sync(); double t0 = now();
-                    if (f) vtf_conv_fwd(x, w, b, q->k, s, s, 1, yf, scf); else vt_conv_fwd(x, w, b, q->k, s, s, 1, yr, scr);
+                    if (f) vtf_conv_fwd(x, w, b, q->k, s, s, 1, yf, scf); else vtr_conv_fwd(x, w, b, q->k, s, s, 1, yr, scr);
                     nn_sync(); double t1 = now();
-                    if (f) vtf_conv_bwd(x, gy, w, q->k, s, s, 1, gxf, gwf, gbf, scf); else vt_conv_bwd(x, gy, w, q->k, s, s, 1, gxr, gwr, gbr, scr);
+                    if (f) vtf_conv_bwd(x, gy, w, q->k, s, s, 1, gxf, gwf, gbf, scf); else vtr_conv_bwd(x, gy, w, q->k, s, s, 1, gxr, gwr, gbr, scr);
                     nn_sync(); double t2 = now();
                     if (t1 - t0 < bf) bf = t1 - t0; if (t2 - t1 < bb) bb = t2 - t1;
                 }

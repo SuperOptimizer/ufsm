@@ -56,6 +56,12 @@ size_t vt_conv_scratch(vt_t x, int co, int k, int sd, int sh, int sw);
 int vt_conv_fwd(vt_t x, const float *w, const float *b, int k, int sd, int sh, int sw, vt_t y, void *scratch);
 /* backward: gx = d/dx (nullptr gx.p: skipped; written, not accumulated), gw += d/dw, gb += d/db (nullptr: skipped) */
 int vt_conv_bwd(vt_t x, vt_t gy, const float *w, int k, int sd, int sh, int sw, vt_t gx, float *gw, float *gb, void *scratch);
+/* the paths behind vt_conv_* (dispatch: fast unless env UFSM_VWT_REF=1): vtr_* the fp32 reference (im2col + at_gemm), vtf_* bf16 (PF) */
+int vtr_conv_fwd(vt_t x, const float *w, const float *b, int k, int sd, int sh, int sw, vt_t y, void *scratch);
+int vtr_conv_bwd(vt_t x, vt_t gy, const float *w, int k, int sd, int sh, int sw, vt_t gx, float *gw, float *gb, void *scratch);
+size_t vtf_conv_scratch(vt_t x, int co, int k, int sd, int sh, int sw);
+int vtf_conv_fwd(vt_t x, const float *w, const float *b, int k, int sd, int sh, int sw, vt_t y, void *scratch);
+int vtf_conv_bwd(vt_t x, vt_t gy, const float *w, int k, int sd, int sh, int sw, vt_t gx, float *gw, float *gb, void *scratch);
 /* channel LayerNorm over C per row (eps 1e-5) with optional exact GELU: y = act(LN(x) g + b); mean / rstd [rows] kept for the backward.
    Backward (recomputes LN and GELU from x): gx = d/dx (may alias gy), gg / gb += */
 void vt_ln_fwd(vt_t x, const float *g, const float *b, int gelu, vt_t y, float *mean, float *rstd);

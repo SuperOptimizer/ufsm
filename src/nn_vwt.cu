@@ -7,6 +7,12 @@
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
+
+extern "C" size_t vtf_conv_scratch(vt_t x, int co, int k, int sd, int sh, int sw);
+extern "C" int vtf_conv_fwd(vt_t x, const float *w, const float *b, int k, int sd, int sh, int sw, vt_t y, void *scratch);
+extern "C" int vtf_conv_bwd(vt_t x, vt_t gy, const float *w, int k, int sd, int sh, int sw, vt_t gx, float *gw, float *gb, void *scratch);
+static int use_ref(void) { static int v = -1; if (v < 0) { const char *e = getenv("UFSM_VWT_REF"); v = e && atoi(e); } return v; }
 
 static unsigned nb_of(long long n, int t) { long long b = (n + t - 1) / t; return (unsigned)(b > 2147483647LL ? 2147483647LL : b); }
 #define GRID(n) nb_of((n), 256), 256
@@ -53,9 +59,19 @@ static void colsum(const float *g, long long rows, int C, float *gb) {
 }
 static long long chunk_rows(int K) { long long r = (long long)(CONV_SCRATCH / (4ull * K)); return r < 1 ? 1 : r; }
 
-extern "C" size_t vt_conv_scratch(vt_t x, int co, int k, int sd, int sh, int sw) { (void)x; (void)co; (void)k; (void)sd; (void)sh; (void)sw; return CONV_SCRATCH; }
+extern "C" size_t vt_conv_scratch(vt_t x, int co, int k, int sd, int sh, int sw) { const size_t f = vtf_conv_scratch(x, co, k, sd, sh, sw); return f > CONV_SCRATCH ? f : CONV_SCRATCH; }
 
+extern "C" int vtr_conv_fwd(vt_t x, const float *w, const float *b, int k, int sd, int sh, int sw, vt_t y, void *scratch);
+extern "C" int vtr_conv_bwd(vt_t x, vt_t gy, const float *w, int k, int sd, int sh, int sw, vt_t gx, float *gw, float *gb, void *scratch);
+/* dispatch: the fast bf16 path (src/nn_vwt_fast.cu, PF) unless UFSM_VWT_REF=1 */
 extern "C" int vt_conv_fwd(vt_t x, const float *w, const float *b, int k, int sd, int sh, int sw, vt_t y, void *scratch) {
+    return use_ref() ? vtr_conv_fwd(x, w, b, k, sd, sh, sw, y, scratch) : vtf_conv_fwd(x, w, b, k, sd, sh, sw, y, scratch);
+}
+extern "C" int vt_conv_bwd(vt_t x, vt_t gy, const float *w, int k, int sd, int sh, int sw, vt_t gx, float *gw, float *gb, void *scratch) {
+    return use_ref() ? vtr_conv_bwd(x, gy, w, k, sd, sh, sw, gx, gw, gb, scratch) : vtf_conv_bwd(x, gy, w, k, sd, sh, sw, gx, gw, gb, scratch);
+}
+/* the fp32 reference (the parity oracle) */
+extern "C" int vtr_conv_fwd(vt_t x, const float *w, const float *b, int k, int sd, int sh, int sw, vt_t y, void *scratch) {
     const int Do = odim(x.d, sd), Ho = odim(x.h, sh), Wo = odim(x.w, sw), K = k * k * k * x.c, co = y.c;
     if (y.d != Do || y.h != Ho || y.w != Wo || y.n != x.n) { fprintf(stderr, "vt_conv_fwd: output shape mismatch\n"); return -1; }
     const long long rows = (long long)x.n * Do * Ho * Wo;
@@ -72,7 +88,7 @@ extern "C" int vt_conv_fwd(vt_t x, const float *w, const float *b, int k, int sd
     return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }
 
-extern "C" int vt_conv_bwd(vt_t x, vt_t gy, const float *w, int k, int sd, int sh, int sw, vt_t gx, float *gw, float *gb, void *scratch) {
+extern "C" int vtr_conv_bwd(vt_t x, vt_t gy, const float *w, int k, int sd, int sh, int sw, vt_t gx, float *gw, float *gb, void *scratch) {
     const int Do = gy.d, Ho = gy.h, Wo = gy.w, K = k * k * k * x.c, co = gy.c;
     const long long rows = (long long)x.n * Do * Ho * Wo;
     if (gb) colsum(gy.p, rows, co, gb);
