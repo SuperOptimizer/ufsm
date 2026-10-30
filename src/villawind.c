@@ -12,6 +12,9 @@
    axis_a = normalise(ref x d), axis_b = d x axis_a, voxel (i, j, k) at origin + i axis_a + j axis_b + k d with
    origin = ray_origin - (T - 1) / 2 (axis_a + axis_b); trilinear sampling (rounded to uint8), valid = inside the volume. */
 #include "villawind.h"
+#include "vwt.h"
+#include "nn.h"
+#include "attn.h"
 #include "json.h"
 #include "store.h"
 #include "xnet.h"
@@ -196,6 +199,7 @@ static void umb_at(const umb_t *u, double z, double *x, double *y) {
     *x = u->p[u->n - 1][0]; *y = u->p[u->n - 1][1];
 }
 
+static vwt *g_vwt = nullptr;   /* --vwt: our trained model instead of villa's */
 static int ray_check(vw_net *net, int argc, char **argv) {
     if (argc < 5) { fprintf(stderr, "usage: ufsm villawind ray-check ROOT KEY WINDINGS.json --ckpt PTH [--tsv OUT] [--zr Z0,Z1] [--cache DIR] [--threads 8] [--prefetch 1] [--geom pair|umb --umb JSON --sz 112 --sr 192 --st 112 --r0 16]\n"); return 2; }
     const int T = atoi(opt(argc, argv, "--T", "128")), L = atoi(opt(argc, argv, "--L", "384")), nth = atoi(opt(argc, argv, "--threads", "8"));
@@ -241,7 +245,7 @@ static int ray_check(vw_net *net, int argc, char **argv) {
         double tb = now_s(); tsamp += tb - ta;
         if (prefetch) { nrun++; if (nrun % 100 == 0) fprintf(stderr, "villawind: prefetched %zu / %zu\n", nrun, np); continue; }
         xh2d(imd, im, nv); xh2d(vad, va, nv);
-        if (vw_forward(net, imd, vad, T, L, mean, inv, phd, nullptr)) return 1;
+        if (g_vwt ? vwt_forward(g_vwt, imd, vad, phd, nullptr, 0) : vw_forward(net, imd, vad, T, L, mean, inv, phd, nullptr)) return 1;
         xd2h(ph, phd, nv * 4); tfwd += now_s() - tb;
         double turns = ray_phase(ph, T, L, mid + 0.5 * len) - ray_phase(ph, T, L, mid - 0.5 * len);
         if (geom_umb) { turns = fabs(point_phase(ph, T, L, &f, q->b) - point_phase(ph, T, L, &f, q->a)); if (isnan(turns)) { nlong++; continue; } }
@@ -266,10 +270,18 @@ static int ray_check(vw_net *net, int argc, char **argv) {
 }
 
 int cmd_villawind(int argc, char **argv) {
-    const char *ck = opt(argc, argv, "--ckpt", nullptr);
+    const char *ck = opt(argc, argv, "--ckpt", nullptr), *vk = opt(argc, argv, "--vwt", nullptr);
+    if (vk) {   /* ufsm villawind ray-check ... --vwt RUN/step_N.vwt [--ema 1]: the same benchmark for our model (src/vwt.h) */
+        if (nn_init(atoi(opt(argc, argv, "--gpu", "0"))) || xnet_init(atoi(opt(argc, argv, "--gpu", "0")))) return 1;
+        at_set_core(1); setenv("UFSM_ATTN_TF32", "1", 0);
+        g_vwt = vwt_load(vk, atoi(opt(argc, argv, "--ema", "1"))); if (!g_vwt) return 1;
+        if (argc > 2 && !strcmp(argv[2], "ray-check")) return ray_check(nullptr, argc - 1, argv + 1);
+        fprintf(stderr, "villawind --vwt: only ray-check\n"); return 2;
+    }
     if (!ck) {
         fprintf(stderr, "usage: ufsm villawind --ckpt ckpt_final.pth --raw-in DIR --raw-out DIR [--T 128 --L 384] [--reps 1]\n"
                         "       ufsm villawind ray-check ROOT KEY WINDINGS.json --ckpt PTH [--tsv OUT] [--zr Z0,Z1] [--cache DIR] [--gpu 0]\n"
+                        "       ufsm villawind ray-check ROOT KEY WINDINGS.json --vwt RUN/step_N.vwt [--ema 1] ...   (our ray-attention model, src/vwt.h)\n"
                         "  villa winding model (HF scrollprize/winding_model_9um) on ray-aligned slabs of a 9.6 um CT\n");
         return 2;
     }

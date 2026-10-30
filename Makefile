@@ -52,7 +52,7 @@ SRC += src/inkseam.c
 SRC += src/render.c src/imgops.c src/inkcompare.c
 SRC += src/repack.c
 SRC += src/wload.c src/inkext.c src/inkext_net.c src/dinovol.c src/dinovol_net.c src/dino.c src/surfeval.c
-SRC += src/villawind.c src/villawind_net.c
+SRC += src/villawind.c src/villawind_net.c src/vwt_net.c src/vwt_train.c
 SRC += src/inksplat.c src/hercuvit.c src/hercuvit_net.c src/ink3dext.c src/ink3dext_net.c
 SRC += src/tfx.c
 SRC += src/embz.c src/fit_emb.c src/embpca.c src/embcalib.c src/sample_emb.c
@@ -257,6 +257,9 @@ test-all: $(B)/test_dino_loss
 $(B)/test_attn: tests/test_attn.c $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_attn.c $(B)/nn.o $(B)/nn_fp8.o -o $@ $(LDLIBS) $(CUDALIBS)
 test-all: $(B)/test_attn
+$(B)/test_vwt: tests/test_vwt.c $(B)/vwt_net.o $(B)/nn.o $(B)/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_vwt.c $(B)/vwt_net.o $(B)/nn.o $(B)/nn_fp8.o -o $@ $(LDLIBS) $(CUDALIBS)
+test-all: $(B)/test_vwt
 $(B)/test_attn_ray: tests/test_attn_ray.c $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_attn_ray.c $(B)/nn.o $(B)/nn_fp8.o -o $@ $(LDLIBS) $(CUDALIBS)
 test-all: $(B)/test_attn_ray
@@ -530,6 +533,7 @@ test-all: $(B)/test_gpu_aug $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover 
 	./$(B)/test_head32
 	./$(B)/test_sslstat
 	./$(B)/test_attn
+	./$(B)/test_vwt
 	./$(B)/test_attn_ray
 	./$(B)/test_attn_dfm
 	./$(B)/test_hybrid_identity

@@ -41,6 +41,8 @@ typedef struct vws vws;
    azimuth, random sign, the point at a random k); train 0: a fixed validation list (seeded). nthreads: background workers. */
 vws *vws_open(const char *sources_json, int T, int L, float tilt_deg, int nthreads, unsigned seed, int train);
 int vws_next(vws *s, vws_sample *out);   /* blocking; 0 on success */
+/* the trainer's argv, passed through before vws_open (the sampler / aug parse their own flags from it, e.g. vwa_cfg_parse) */
+void vws_set_args(int argc, char **argv);
 void vws_close(vws *s);
 
 /* ---------------- layer kernels (src/nn_vwt.cu; reference VW, optimisation PF). Default stream, fp32 tensors. ---------------- */
@@ -65,6 +67,8 @@ void vt_up2_bwd(vt_t gy, vt_t gx);
 void vt_cat_fwd(vt_t a, vt_t b, vt_t y);
 void vt_cat_bwd(vt_t gy, vt_t ga, vt_t gb);
 void vt_add(float *y, const float *x, size_t n);   /* y += x */
+void vt_input(const uint8_t *im, const uint8_t *va, long long n, float *x);   /* device u8 [n] -> x [n][2] (standardised image, valid) */
+void vt_transpose(const float *x, float *y, long long A, long long B, int C);   /* rows [A][B][C] -> [B][A][C] */
 /* phase head: logits [N][T/2][T/2][L][4] (channel si 2 + sj) -> inc [N][T][T][L] = softplus (pixel shuffle 2), ph = cumsum_k inc.
    Backward from d/d ph and d/d inc (either nullptr) to d/d logits. */
 void vt_phase_fwd(vt_t lg, float *inc, float *ph);
