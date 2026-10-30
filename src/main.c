@@ -175,6 +175,7 @@ static int usage(void) {
         "  ufsm fit-join <out-set> <fields-dir> <slab-model> <z0> <z1> ...   independent z-slab fits -> one fit set, gauges matched on the overlaps\n"
         "  ufsm fields-oracle <fields-dir> <phase-root> <phase-key> <out-dir>   fit fields with the phase planes from a label phase raster (oracle / swap)\n"
         "  ufsm count-field <in-fields> <out-fields> [--method ls|ray] [--R 3] [--model DIR]   winding from the density counts, the phase only sub-turn (src/countfield.c)\n"
+        "  ufsm patch-raster LIST OUT --shape Z,Y,X   surface patches (tifxyz) as phase-0 shell training targets (512^3 shards)\n"
         "  ufsm hires-phase <ct-root> <key> <fields-dir> <out-dir> --ct-um U   fit fields with the sheet phase measured in a finer CT (valleys along the normal)\n"
         "  ufsm phase-packing <phase-root> <phase-key> [--box ..] [--map OUT.raw]   how packed the labelled sheets are (box stats, per-chunk map for the sampler focus)\n"
         "  ufsm wbench-stats A.tsv [B.tsv] [--metric ids,p1x] [--set clean|all]   winding bench means, stratified bootstrap CIs, paired A-B, MDE (--scroll a,b; --tsv 1)\n"
@@ -1322,6 +1323,10 @@ static int cmd_fit(int argc, char **argv) {
            phase frac(W) on gated voxels, 1 the network phase on the same voxels, 2 the network phase on every material voxel with a band code */
         long long hph[2][3][18]; memset(hph, 0, sizeof hph);
         const int gtph = getenv("UFSM_WCHECK_PHASE") && atoi(getenv("UFSM_WCHECK_PHASE")) > 0;
+        if (gate) fprintf(stderr, "fit: --winding: model origin %lld %lld %lld, gate fields origin %lld %lld %lld (%dx%dx%d cells, h %d)\n", org[0], org[1], org[2],
+                          gf->origin[0], gf->origin[1], gf->origin[2], gf->f.D, gf->f.H, gf->f.W, gf->h);
+        double dOff[3] = {0, 0, 0};   /* the gate's fields a sub-box of the model's: the grid sits on the fields (offsets in native voxels) */
+        if (gate && getenv("UFSM_WCHECK_SUBBOX")) for (int d = 0; d < 3; d++) dOff[d] = (double)(gf->origin[d] - org[d]);
         /* --winding-skip ROOT KEY UM (up to 2, mod14 codes): voxels where that raster (a GT stored phase, PHASE_*) is known (!= 255) stay unknown:
            pseudo labels only where no GT label is */
         z3 *skz[2] = {nullptr, nullptr}; double skr[2] = {0, 0}; uint8_t *skb[2] = {nullptr, nullptr}; int64_t sk0[2][3], skn[2][3]; int nsk = 0;
@@ -1338,7 +1343,7 @@ static int cmd_fit(int argc, char **argv) {
         fit_set_dev *gd = nullptr; if (!c.cpu && !(gd = fit_set_upload(fs))) return 1;
         for (int64_t sz = 0; sz * BK < gs[0]; sz++) for (int64_t sy = 0; sy * BK < gs[1]; sy++) for (int64_t sx = 0; sx * BK < gs[2]; sx++) {
             const int64_t n3[3] = {gs[0] - sz * BK < BK ? gs[0] - sz * BK : BK, gs[1] - sy * BK < BK ? gs[1] - sy * BK : BK, gs[2] - sx * BK < BK ? gs[2] - sx * BK : BK};
-            const double o3[3] = {(double)sz * BK * ws, (double)sy * BK * ws, (double)sx * BK * ws};
+            const double o3[3] = {(double)sz * BK * ws + dOff[0], (double)sy * BK * ws + dOff[1], (double)sx * BK * ws + dOff[2]};
             if (gd ? fit_set_grid(gd, fs, o3, n3, ws, m14, wv) : fit_set_grid_cpu(fs, o3, n3, ws, m14, nullptr, wv)) { fprintf(stderr, "fit: no device memory for the winding grid\n"); return 1; }
             if ((gate || m14 == 3) && (gd ? fit_set_grid(gd, fs, o3, n3, ws, 0, wg) : fit_set_grid_cpu(fs, o3, n3, ws, 0, nullptr, wg))) { fprintf(stderr, "fit: no device memory for the winding grid\n"); return 1; }
             int64_t g0[3] = {0, 0, 0}, gn3[3] = {0, 0, 0};
@@ -1356,7 +1361,8 @@ static int cmd_fit(int argc, char **argv) {
                 const double W = (double)wv[((size_t)a * n3[1] + b) * n3[2] + c2]; const size_t o = ((size_t)a * BK + b) * BK + c2;
                 if (m14 && gate) {
                     const fit_fields *f = &gf->f; gn++; if (wind_dense_code(W) == 255) continue;
-                    const int fz = (int)((o3[0] + (a + 0.5) * ws) / f->h), fy = (int)((o3[1] + (b + 0.5) * ws) / f->h), fx = (int)((o3[2] + (c2 + 0.5) * ws) / f->h);
+                    const int fz = (int)floor((org[0] - gf->origin[0] + o3[0] + (a + 0.5) * ws) / f->h), fy = (int)floor((org[1] - gf->origin[1] + o3[1] + (b + 0.5) * ws) / f->h),
+                              fx = (int)floor((org[2] - gf->origin[2] + o3[2] + (c2 + 0.5) * ws) / f->h);   /* (the fields may be a sub-box of the model's) */
                     int gtc = 0;
                     if (gtz) {
                         const int64_t qz = (int64_t)floor((org[0] + o3[0] + (a + 0.5) * ws) * gtr) - g0[0], qy = (int64_t)floor((org[1] + o3[1] + (b + 0.5) * ws) * gtr) - g0[1],
@@ -3848,6 +3854,7 @@ int cmd_fiber_check(int argc, char **argv);    /* src/fibercheck.c */
 int cmd_fiber_export(int argc, char **argv);   /* src/fibercheck.c */
 int cmd_count_field(int argc, char **argv);   /* src/countfield.c */
 int cmd_hires_phase(int argc, char **argv);   /* src/hiresphase.c */
+int cmd_patch_raster(int argc, char **argv);   /* src/patchraster.c */
 int cmd_hires_count(int argc, char **argv);
 int cmd_spiral_fit(int argc, char **argv);    /* src/countfield.c */
 int cmd_phase_packing(int argc, char **argv);   /* src/packmap.c */
@@ -3891,6 +3898,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "fiber-export")) return cmd_fiber_export(argc, argv);
     if (!strcmp(cmd, "count-field")) return cmd_count_field(argc, argv);
     if (!strcmp(cmd, "hires-phase")) return cmd_hires_phase(argc, argv);
+    if (!strcmp(cmd, "patch-raster")) return cmd_patch_raster(argc, argv);
     if (!strcmp(cmd, "hires-count")) return cmd_hires_count(argc, argv);
     if (!strcmp(cmd, "spiral-fit")) return cmd_spiral_fit(argc, argv);
     if (!strcmp(cmd, "phase-packing")) return cmd_phase_packing(argc, argv);
