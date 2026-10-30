@@ -734,3 +734,18 @@ int cmd_strip_mosaic(int argc, char **argv) {
     free(st); free(ovs); free(ovn); free(lsum); free(lcnt); free(tv); free(tp); free(tw0); free(tw1); free(wv); free(wp); free(segs);
     return 0;
 }
+
+/* ufsm strip-crop <in.tif> <out.jpg> x,y,w,h [--stretch 1]: a rectangle of a big uint8 render TIFF (stripes are 60000 px wide: past the
+   usual image tools' limits) as a grayscale JPEG, percentile-stretched over its nonzero pixels */
+int cmd_strip_crop(int argc, char **argv) {
+    int c[4];
+    if (argc < 5 || sscanf(argv[4], "%d,%d,%d,%d", c, c + 1, c + 2, c + 3) != 4) { fprintf(stderr, "usage: ufsm strip-crop <in.tif> <out.jpg> x,y,w,h [--stretch 1]\n"); return 2; }
+    int w, h; uint8_t *im = img_read_u8(argv[2], &w, &h); if (!im) { fprintf(stderr, "strip-crop: cannot read %s\n", argv[2]); return 1; }
+    if (c[0] < 0) c[0] = 0; if (c[1] < 0) c[1] = 0; if (c[0] + c[2] > w) c[2] = w - c[0]; if (c[1] + c[3] > h) c[3] = h - c[1];
+    if (c[2] < 1 || c[3] < 1) { fprintf(stderr, "strip-crop: empty rectangle\n"); free(im); return 2; }
+    uint8_t *o = malloc((size_t)c[2] * c[3]), *m = malloc((size_t)c[2] * c[3]);
+    for (int y = 0; y < c[3]; y++) for (int x = 0; x < c[2]; x++) { const uint8_t v = im[(size_t)(c[1] + y) * w + c[0] + x]; o[(size_t)y * c[2] + x] = v; m[(size_t)y * c[2] + x] = v > 0; }
+    if (atoi(sopt(argc, argv, "--stretch", "1"))) img_stretch(o, m, (size_t)c[2] * c[3], 0.01, 0.995);
+    const int rc = jpeg_write_gray(argv[3], c[2], c[3], o, 90);
+    free(im); free(o); free(m); return rc ? 1 : 0;
+}
