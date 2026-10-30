@@ -2,8 +2,8 @@
 
    Tiling (production geometry, as villawind ray-check --geom umb): radial horizontal rays from the umbilicus (umbilicus.json control points
    x y z, linear in z, clamped). Band b: zc = z0 - 64 + 56 + sz b over the box (sz 112: slab z extent 128); ring m: r0 = r00 + sr m (r00 16,
-   sr 320: 64 voxels of ray overlap); angle index a in [0, na(m)), na = ceil(2 pi r_mid / st), dth = 2 pi / na, th = a dth (st 112: tangential
-   step at the ring's mid radius r_mid = r0 + (L - 1) / 2). Slab frame = src/villawind.c frame_of(dir (cos th, sin th, 0), origin (umb(zc) +
+   sr 320: 64 voxels of ray overlap); angle index a in [0, na(m)), na = ceil(2 pi r_out / st), dth = 2 pi / na, th = a dth (st 112: tangential
+   step at the ring outer radius r_out = r0 + L - 1, so straight slabs leave no wedge gaps). Slab frame = src/villawind.c frame_of(dir (cos th, sin th, 0), origin (umb(zc) +
    r0 dir, zc)): axis_a = tangential, axis_b = +-z, d = radial. Slabs whose world bbox misses the box are dropped (the CT-empty test is the
    caller's). Coordinates: xyz in the CT level's voxels (9.6 um for P4 level 2); the box is z y x.
 

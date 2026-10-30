@@ -56,7 +56,7 @@ int vwt_tiling_build(const char *umb_json, const int64_t box[6], int T, int L, d
         double rmax = 0; for (int c = 0; c < 4; c++) { const double x = (c & 1) ? bx1 : bx0, y = (c & 2) ? by1 : by0; rmax = fmax(rmax, hypot(x - ux, y - uy)); }
         for (int m = 0;; m++) {
             const double r0 = r00 + sr * m; if (r0 > rmax + 8) break;
-            const double rmid = r0 + 0.5 * (L - 1); const int na = (int)ceil(2 * M_PI * rmid / st); const double dth = 2 * M_PI / na;
+            const double rout = r0 + (L - 1); const int na = (int)ceil(2 * M_PI * rout / st);  /* step at the outer end: no wedge gaps */ const double dth = 2 * M_PI / na;
             for (int a = 0; a < na; a++) {
                 vwt_slab s = {b, m, a, zc, r0, a * dth, {0}, {0}, {0}, {0}};
                 const double dir[3] = {cos(s.th), sin(s.th), 0}, ro[3] = {ux + r0 * dir[0], uy + r0 * dir[1], zc};
