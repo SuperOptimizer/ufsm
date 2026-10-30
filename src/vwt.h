@@ -65,6 +65,9 @@ int vtr_conv_bwd(vt_t x, vt_t gy, const float *w, int k, int sd, int sh, int sw,
 size_t vtf_conv_scratch(vt_t x, int co, int k, int sd, int sh, int sw);
 int vtf_conv_fwd(vt_t x, const float *w, const float *b, int k, int sd, int sh, int sw, vt_t y, void *scratch);
 int vtf_conv_bwd(vt_t x, vt_t gy, const float *w, int k, int sd, int sh, int sw, vt_t gx, float *gw, float *gb, void *scratch);
+/* the fast convs' forward / backward-data precision: 0 bf16 (default), 8 MX-fp8 (src/lp_vwt8.cu; layers with C % 32 == 0 and >= 32 outputs,
+   the rest bf16); env UFSM_VTF_MX. The weight gradient stays bf16 */
+void vtf_set_mx(int bits);
 /* channel LayerNorm over C per row (eps 1e-5) with optional exact GELU: y = act(LN(x) g + b); mean / rstd [rows] kept for the backward.
    Backward (recomputes LN and GELU from x): gx = d/dx (may alias gy), gg / gb += */
 void vt_ln_fwd(vt_t x, const float *g, const float *b, int gelu, vt_t y, float *mean, float *rstd);

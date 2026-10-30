@@ -37,6 +37,11 @@ __device__ __forceinline__ void mma_bf16(float *c, const unsigned *a, const unsi
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
                  : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
 }
+__device__ __forceinline__ void cp_async16(void *s, const void *g, bool ok) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" :: "r"(su32(s)), "l"(g), "r"(ok ? 16 : 0) : "memory");
+}
+__device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;\n" ::: "memory"); }
+template <int N> __device__ __forceinline__ void cp_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N) : "memory"); }
 __device__ __forceinline__ unsigned pkbf(float a, float b) { __nv_bfloat162 h = __floats2bfloat162_rn(a, b); return *(unsigned *)&h; }
 /* [rows][32 halfs]: 16-byte chunk q (0..3) of a row at q ^ ((row >> 1) & 3) (conflict-free ldmatrix) */
 __device__ __forceinline__ int swz(int row, int q) { return row * VBK + ((q ^ ((row >> 1) & 3)) << 3); }
@@ -215,10 +220,14 @@ static int ntile(int N) { return N <= 8 ? 16 : N <= 32 ? 32 : N <= 64 ? 64 : N <
 /* ---- scratch: B matrices (fwd + bwd) and the weight gradient's bf16 im2col / gy chunks ---- */
 static const size_t WCHUNK = 192ull << 20, GCHUNK = 64ull << 20;   /* bf16 im2col / gy chunk bytes */
 static size_t wbytes_max(int cimax, int comax) { const int K = 27 * cimax, Kp = (K + VBK - 1) / VBK * VBK; return ((size_t)128 * 2 * Kp * 2 + 255) & ~(size_t)255; }
+static size_t g_wreg = WCHUNK + GCHUNK;   /* the chunk region's bytes (vtf_conv_scratch) */
 extern "C" size_t vtf_conv_scratch(vt_t x, int co, int k, int sd, int sh, int sw) {
-    (void)x; (void)co; (void)k; (void)sd; (void)sh; (void)sw;
-    /* every layer of the vwt net (ci, co <= 256): two weight matrices, the im2col chunk and its gy chunk (<= 256 channels per row) */
-    return 2 * wbytes_max(256, 256) + WCHUNK + GCHUNK + 4096;
+    (void)co; (void)k; (void)sd; (void)sh; (void)sw;
+    /* every layer of the vwt net (ci, co <= 256): two weight matrices, the im2col chunk and its gy chunk (<= 256 channels per row); the
+       bf16 weight gradient's operand copies need up to (the 1/16-voxel level) 352 channels of bf16 + its partial sums */
+    const size_t v16 = (size_t)x.n * x.d * x.h * x.w / 16, need = v16 * 352 * 2 + (40ull << 20);
+    g_wreg = need > WCHUNK + GCHUNK ? need : WCHUNK + GCHUNK;
+    return 2 * wbytes_max(256, 256) + g_wreg + 4096;
 }
 
 static cublasLtHandle_t g_lt; static void *g_lws; static const size_t LWS = 32u << 20;
@@ -502,6 +511,94 @@ __global__ void __launch_bounds__(256, 2) vtf_wgrad2(WgP p) {
                 if (n + 1 < p.K) P[(size_t)co * p.K + n + 1] = acc[mi][ni][2 * h + 1];
             }
 }
+/* bf16 operands copied once (xb [vox][ci], gyb [m][co]) and streamed through a 3-stage cp.async pipeline: 32 output voxels per stage
+   (one W run: Wo % 32 == 0, sw == 1, so the stage's (n, z, y) is shared and advanced without division), BMC co x BNK K columns per
+   block, 8 warps (2 x 4), padded shared rows */
+struct WgB {
+    const __nv_bfloat16 *xb, *gyb; float *part;
+    int D, H, W, C, Do, Ho, Wo, k, sd, sh, p, K, co; long long M, mper;
+};
+#define WG3S 3
+template <int BMC, int BNK>
+__global__ void __launch_bounds__(256, 2) vtf_wgrad3(WgB p) {
+    constexpr int SA = BMC + 8, SB = BNK + 8, CA = BMC / 8, CB = BNK / 8, NA = (32 * CA + 255) / 256, NB = (32 * CB + 255) / 256;
+    constexpr int WTM = BMC / 2, WTN = BNK / 4, MI = WTM / 16, NI = WTN / 8;
+    static_assert(256 % CB == 0, "B chunk column per thread");
+    __shared__ __align__(16) __nv_bfloat16 sA[WG3S][32 * SA], sB[WG3S][32 * SB];
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, wm0 = (warp >> 2) * WTM, wn0 = (warp & 3) * WTN;
+    const int n0 = blockIdx.x * BNK, c0 = blockIdx.y * BMC;
+    const long long ma = (long long)blockIdx.z * p.mper, mb = ma + p.mper < p.M ? ma + p.mper : p.M;
+    const int bc = tid % CB, kk0 = n0 + bc * 8; const bool kin = kk0 < p.K;
+    const int t0 = kin ? kk0 / p.C : 0, cc = kin ? kk0 - t0 * p.C : 0, tz = t0 / (p.k * p.k), ty = (t0 / p.k) % p.k, tx = t0 % p.k;
+    /* the loader's run: voxel ml = (nn, od, oh, ow0) */
+    long long ml = ma; int ow0, oh, od; long long nn;
+    { long long t = ma; ow0 = (int)(t % p.Wo); t /= p.Wo; oh = (int)(t % p.Ho); t /= p.Ho; od = (int)(t % p.Do); nn = t / p.Do; }
+    auto load = [&](int st) {
+#pragma unroll
+        for (int i = 0; i < NA; i++) {
+            const int ch = tid + 256 * i;
+            if (ch < 32 * CA) {
+                const int r = ch / CA, col = ch % CA; const bool ok = ml + r < mb;
+                cp_async16(sA[st] + r * SA + col * 8, p.gyb + (ok ? (ml + r) * p.co + c0 + col * 8 : 0), ok);
+            }
+        }
+        const int z = od * p.sd - p.p + tz, y = oh * p.sh - p.p + ty; const bool zy = kin && z >= 0 && z < p.D && y >= 0 && y < p.H;
+        const long long rowb = ((nn * p.D + z) * p.H + y) * (long long)p.W;
+#pragma unroll
+        for (int i = 0; i < NB; i++) {
+            const int r = tid / CB + (256 / CB) * i, x = ow0 + r - p.p + tx;
+            const bool ok = zy && ml + r < mb && x >= 0 && x < p.W;
+            cp_async16(sB[st] + r * SB + bc * 8, p.xb + (ok ? (rowb + x) * p.C + cc : 0), ok);
+        }
+        ml += 32; ow0 += 32; if (ow0 >= p.Wo) { ow0 = 0; if (++oh == p.Ho) { oh = 0; if (++od == p.Do) { od = 0; nn++; } } }
+    };
+    float acc[MI][NI][4];
+#pragma unroll
+    for (int a = 0; a < MI; a++)
+#pragma unroll
+        for (int b = 0; b < NI; b++)
+#pragma unroll
+            for (int c = 0; c < 4; c++) acc[a][b][c] = 0.f;
+#pragma unroll
+    for (int s = 0; s < WG3S - 1; s++) { if (ml < mb) load(s); cp_commit(); }
+    int st = 0;
+    for (long long m0 = ma; m0 < mb; m0 += 32) {
+        cp_wait<WG3S - 2>(); __syncthreads();
+        { const int sl = (st + WG3S - 1) % WG3S; if (ml < mb) load(sl); cp_commit(); }
+        const __nv_bfloat16 *A = sA[st], *B = sB[st];
+#pragma unroll
+        for (int kk = 0; kk < 2; kk++) {
+            unsigned af[MI][4], bf[NI][2];
+            const int j = lane >> 3, r = lane & 7;
+#pragma unroll
+            for (int mi = 0; mi < MI; mi++) ldsm4t(af[mi], A + (kk * 16 + ((j >> 1) << 3) + r) * SA + wm0 + mi * 16 + ((j & 1) << 3));
+#pragma unroll
+            for (int nj = 0; nj < NI / 2; nj++) {
+                unsigned q[4]; ldsm4t(q, B + (kk * 16 + ((j & 1) << 3) + r) * SB + wn0 + nj * 16 + ((j >> 1) << 3));
+                bf[2 * nj][0] = q[0]; bf[2 * nj][1] = q[1]; bf[2 * nj + 1][0] = q[2]; bf[2 * nj + 1][1] = q[3];
+            }
+#pragma unroll
+            for (int mi = 0; mi < MI; mi++)
+#pragma unroll
+                for (int ni = 0; ni < NI; ni++) mma_bf16(acc[mi][ni], af[mi], bf[ni]);
+        }
+        st = (st + 1) % WG3S;
+    }
+    cp_wait<0>();
+    const int g = lane >> 2, t4 = lane & 3;
+    float *P = p.part + (size_t)blockIdx.z * p.co * p.K;
+#pragma unroll
+    for (int mi = 0; mi < MI; mi++)
+#pragma unroll
+        for (int ni = 0; ni < NI; ni++)
+#pragma unroll
+            for (int h = 0; h < 2; h++) {
+                const int co = c0 + wm0 + mi * 16 + g + 8 * h, n = n0 + wn0 + ni * 8 + 2 * t4;
+                if (co >= p.co) continue;
+                if (n < p.K) P[(size_t)co * p.K + n] = acc[mi][ni][2 * h];
+                if (n + 1 < p.K) P[(size_t)co * p.K + n + 1] = acc[mi][ni][2 * h + 1];
+            }
+}
 __global__ void k_wg_reduce(const float *__restrict__ part, int nz, size_t n, float *__restrict__ gw) {
     for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) {
         float a = 0.f; for (int z = 0; z < nz; z++) a += part[(size_t)z * n + i];
@@ -516,10 +613,24 @@ static VtP make_p(int mode, vt_t a, int k, int sd, int sh, int sw, int Do, int H
     p.M = (long long)a.n * Do * Ho * Wo; (void)mode; return p;
 }
 
+extern "C" int vtf8_conv(int mode, const float *src, int n, int D, int H, int W, int C, const float *w, int co, int ci, int k, int sd, int sh, int sw,
+                         int Do, int Ho, int Wo, int N, const float *bias, float *y, void *qbuf, void *wbuf);
+extern "C" size_t vtf8_qbytes(long long rows, int C);
+extern "C" size_t vtf8_wbytes(int N, int K);
+extern "C" int vtf8_ok(int C, int N);
+static int g_vmx = -1;
+extern "C" void vtf_set_mx(int bits) { g_vmx = bits; }
+static int vmx(void) { if (g_vmx < 0) { const char *e = getenv("UFSM_VTF_MX"); g_vmx = e ? atoi(e) : 0; } return g_vmx; }
+/* MX-fp8 forward / backward-data when enabled and the shapes and the scratch (A quantized into the im2col chunk region) allow */
+static bool use8(long long rows, int C, int N, int K) {
+    return vmx() == 8 && vtf8_ok(C, N) && vtf8_qbytes(rows, C) <= WCHUNK + GCHUNK && vtf8_wbytes(N, K) <= 2 * wbytes_max(256, 256);
+}
 extern "C" int vtf_conv_fwd(vt_t x, const float *w, const float *b, int k, int sd, int sh, int sw, vt_t y, void *scratch) {
     const int Do = odim(x.d, sd), Ho = odim(x.h, sh), Wo = odim(x.w, sw), co = y.c;
     if (y.d != Do || y.h != Ho || y.w != Wo || y.n != x.n) { fprintf(stderr, "vtf_conv_fwd: output shape mismatch\n"); return -1; }
     if (co > 256 || x.c > 256) { fprintf(stderr, "vtf_conv_fwd: %d -> %d unsupported\n", x.c, co); return -1; }
+    if (use8((long long)x.n * x.d * x.h * x.w, x.c, co, k * k * k * x.c))
+        return vtf8_conv(0, x.p, x.n, x.d, x.h, x.w, x.c, w, co, x.c, k, sd, sh, sw, Do, Ho, Wo, co, b, y.p, (char *)scratch + 2 * wbytes_max(256, 256), scratch);
     const int K = k * k * k * x.c, Kp = (K + VBK - 1) / VBK * VBK, Np = (co + ntile(co) - 1) / ntile(co) * ntile(co);
     __nv_bfloat16 *B = (__nv_bfloat16 *)scratch;
     k_wprep<<<cap_blocks((long long)Np * Kp), 256>>>(w, co, k * k * k, x.c, Kp, Np, 0, B);
@@ -533,7 +644,9 @@ extern "C" int vtf_conv_bwd(vt_t x, vt_t gy, const float *w, int k, int sd, int 
     const long long rows = (long long)gy.n * gy.d * gy.h * gy.w;
     if (gb) { const int per = 256 / co > 0 ? 256 / co : 1; k_colsum_f<<<1024, per * co, co * sizeof(float)>>>(gy.p, rows, co, per, gb); }
     char *s = (char *)scratch;
-    if (gx.p) {   /* backward-data: rows = input voxels, columns = ci, K = taps x co */
+    if (gx.p && use8(rows, co, ci, T * co)) {
+        if (vtf8_conv(1, gy.p, gy.n, gy.d, gy.h, gy.w, co, w, co, ci, k, sd, sh, sw, x.d, x.h, x.w, ci, nullptr, gx.p, s + 2 * wbytes_max(256, 256), s)) return -1;
+    } else if (gx.p) {   /* backward-data: rows = input voxels, columns = ci, K = taps x co */
         const int K = T * co, Kp = (K + VBK - 1) / VBK * VBK, Np = (ci + ntile(ci) - 1) / ntile(ci) * ntile(ci);
         __nv_bfloat16 *B = (__nv_bfloat16 *)s;
         k_wprep<<<cap_blocks((long long)Np * Kp), 256>>>(w, co, T, ci, Kp, Np, 1, B);
@@ -543,14 +656,35 @@ extern "C" int vtf_conv_bwd(vt_t x, vt_t gy, const float *w, int k, int sd, int 
     }
     static int wgk = -1; if (wgk < 0) wgk = getenv("UFSM_VTF_WGRAD") ? atoi(getenv("UFSM_VTF_WGRAD")) : 1;
     const bool wide = co % 96 == 0 && co <= 192;   /* (the 96 x 128 tiles) */
+    const int K3 = T * ci, bm3 = co % 96 == 0 ? 96 : co % 64 == 0 ? 64 : co % 32 == 0 ? 32 : 0;
+    if (gw && wgk != 0 && wgk != 2 && bm3 && sw == 1 && gy.w % 32 == 0 && ci % 8 == 0 && co <= 192) {
+        /* bf16 copies of x and gy, then the pipelined kernel; partial sums after them in the chunk region */
+        const size_t xbb = ((size_t)vt_numel(x) * 2 + 255) & ~(size_t)255, gbb = ((size_t)rows * co * 2 + 255) & ~(size_t)255;
+        const int nt = (K3 + 127) / 128 * (co / bm3);
+        long long nz = (360 + nt - 1) / nt; if (nz > rows / 1024) nz = rows / 1024; if (nz < 1) nz = 1;
+        const size_t pb = (size_t)co * K3 * 4;
+        if (xbb + gbb + pb <= g_wreg) {
+            if (xbb + gbb + (size_t)nz * pb > g_wreg) nz = (long long)((g_wreg - xbb - gbb) / pb);
+            char *r = s + 2 * wbytes_max(256, 256);
+            WgB q; q.xb = (const __nv_bfloat16 *)r; q.gyb = (const __nv_bfloat16 *)(r + xbb); q.part = (float *)(r + xbb + gbb);
+            q.D = x.d; q.H = x.h; q.W = x.w; q.C = ci; q.Do = gy.d; q.Ho = gy.h; q.Wo = gy.w; q.k = k; q.sd = sd; q.sh = sh; q.p = k / 2; q.K = K3; q.co = co; q.M = rows;
+            q.mper = (rows + nz - 1) / nz; q.mper = (q.mper + 31) / 32 * 32; nz = (rows + q.mper - 1) / q.mper;
+            k_f2bf<<<cap_blocks((long long)vt_numel(x)), 256>>>(x.p, (__nv_bfloat16 *)r, (long long)vt_numel(x));
+            k_f2bf<<<cap_blocks(rows * co), 256>>>(gy.p, (__nv_bfloat16 *)(r + xbb), rows * co);
+            const dim3 gr((unsigned)((K3 + 127) / 128), (unsigned)(co / bm3), (unsigned)nz);
+            if (bm3 == 96) vtf_wgrad3<96, 128><<<gr, 256>>>(q); else if (bm3 == 64) vtf_wgrad3<64, 128><<<gr, 256>>>(q); else vtf_wgrad3<32, 128><<<gr, 256>>>(q);
+            k_wg_reduce<<<cap_blocks((long long)co * K3), 256>>>(q.part, (int)nz, (size_t)co * K3, gw);
+            return cudaGetLastError() == cudaSuccess ? 0 : -1;
+        }
+    }
     if (gw && (wgk == 2 || (wgk == 1 && (co <= 64 || wide))) && ci % 8 == 0) {   /* implicit-GEMM weight gradient, partial sums per voxel split in the scratch's chunk region
-                                                                                   (UFSM_VTF_WGRAD 0: always im2col + cuBLASLt) */
+                                                                                   (UFSM_VTF_WGRAD 0: always im2col + cuBLASLt; 2: this one, not the pipelined one above) */
         WgP q; q.x = x.p; q.gy = gy.p; q.D = x.d; q.H = x.h; q.W = x.w; q.C = ci; q.Do = gy.d; q.Ho = gy.h; q.Wo = gy.w; q.k = k; q.sd = sd; q.sh = sh; q.sw = sw;
         q.p = k / 2; q.K = T * ci; q.co = co; q.M = rows;
         const int bmc = wide ? 96 : WG_BM, bnk = wide ? 128 : WG_BN;   /* (one 192 x 128 tile measured slower at 192 outputs) */
         const int nt = (q.K + bnk - 1) / bnk * ((co + bmc - 1) / bmc);
         long long nz = (480 + nt - 1) / nt; if (nz > rows / 1024) nz = rows / 1024; if (nz < 1) nz = 1;
-        const size_t pb = (size_t)co * q.K * 4; if ((size_t)nz * pb > WCHUNK + GCHUNK) nz = (long long)((WCHUNK + GCHUNK) / pb); if (nz < 1) nz = 1;
+        const size_t pb = (size_t)co * q.K * 4; if ((size_t)nz * pb > g_wreg) nz = (long long)(g_wreg / pb); if (nz < 1) nz = 1;
         q.mper = (rows + nz - 1) / nz; q.mper = (q.mper + WG_BK - 1) / WG_BK * WG_BK; nz = (rows + q.mper - 1) / q.mper;
         q.part = (float *)(s + 2 * wbytes_max(256, 256));
         if (wide) vtf_wgrad2<96, 128><<<dim3((unsigned)((q.K + 127) / 128), (unsigned)(co / 96), (unsigned)nz), 256>>>(q);
