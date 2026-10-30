@@ -134,8 +134,73 @@ static __global__ void k_ln_fwd(const float *__restrict__ x, const float *__rest
 #pragma unroll
     for (int q = 0; q < LNV; q++) { const int c = l + 32 * q; if (c >= C) continue; float z = (v[q] - mu) * rs * g[c] + b[c]; y[r * C + c] = gelu ? gelu_f(z) : z; }
 }
+/* even C <= 256: lanes over channel pairs 2 lane + 64 q (float2), NQ = ceil(C / 64) */
+template <int NQ>
+static __global__ void k_ln_fwd2(const float *__restrict__ x, const float *__restrict__ g, const float *__restrict__ b, int gelu, float *__restrict__ y,
+                                 float *__restrict__ mean, float *__restrict__ rstd, long long M, int C) {
+    const long long r = blockIdx.x * (long long)(blockDim.x / 32) + threadIdx.x / 32; if (r >= M) return;
+    const int l = threadIdx.x & 31; float2 v[NQ]; float s = 0;
+#pragma unroll
+    for (int q = 0; q < NQ; q++) { const int c = 2 * l + 64 * q; v[q] = c < C ? *(const float2 *)(x + r * C + c) : make_float2(0.f, 0.f); s += v[q].x + v[q].y; }
+    for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
+    const float mu = s / C; float qq = 0;
+#pragma unroll
+    for (int q = 0; q < NQ; q++) { const int c = 2 * l + 64 * q; if (c < C) { const float d0 = v[q].x - mu, d1 = v[q].y - mu; qq += d0 * d0 + d1 * d1; } }
+    for (int o = 16; o; o >>= 1) qq += __shfl_xor_sync(0xffffffffu, qq, o);
+    const float rs = rsqrtf(qq / C + 1e-5f);
+    if (l == 0) { mean[r] = mu; rstd[r] = rs; }
+#pragma unroll
+    for (int q = 0; q < NQ; q++) {
+        const int c = 2 * l + 64 * q; if (c >= C) continue;
+        const float2 gg = *(const float2 *)(g + c), bb = *(const float2 *)(b + c);
+        float z0 = (v[q].x - mu) * rs * gg.x + bb.x, z1 = (v[q].y - mu) * rs * gg.y + bb.y;
+        if (gelu) { z0 = gelu_f(z0); z1 = gelu_f(z1); }
+        *(float2 *)(y + r * C + c) = make_float2(z0, z1);
+    }
+}
+template <int NQ>
+static __global__ void k_ln_bwd2(const float *__restrict__ x, const float *__restrict__ g, const float *__restrict__ b, int gelu, const float *__restrict__ mean,
+                                 const float *__restrict__ rstd, const float *__restrict__ gy, float *__restrict__ gx, float *__restrict__ gg, float *__restrict__ gbb, long long M, int C) {
+    __shared__ float sg[256], sb[256];
+    for (int c = threadIdx.x; c < C; c += blockDim.x) { sg[c] = 0.f; sb[c] = 0.f; }
+    __syncthreads();
+    const int l = threadIdx.x & 31, wpb = blockDim.x / 32; float2 ag[NQ], ab[NQ], gq[NQ], bq[NQ];
+#pragma unroll
+    for (int q = 0; q < NQ; q++) {
+        const int c = 2 * l + 64 * q; ag[q] = ab[q] = make_float2(0.f, 0.f);
+        gq[q] = c < C ? *(const float2 *)(g + c) : make_float2(0.f, 0.f); bq[q] = c < C ? *(const float2 *)(b + c) : make_float2(0.f, 0.f);
+    }
+    for (long long r = blockIdx.x * (long long)wpb + threadIdx.x / 32; r < M; r += (long long)gridDim.x * wpb) {
+        const float mu = mean[r], rs = rstd[r]; float2 xh[NQ], dxh[NQ]; float s1 = 0, s2 = 0;
+#pragma unroll
+        for (int q = 0; q < NQ; q++) {
+            const int c = 2 * l + 64 * q; xh[q] = dxh[q] = make_float2(0.f, 0.f); if (c >= C) continue;
+            const float2 xv = *(const float2 *)(x + r * C + c); float2 dz = *(const float2 *)(gy + r * C + c);
+            xh[q] = make_float2((xv.x - mu) * rs, (xv.y - mu) * rs);
+            if (gelu) { dz.x *= gelu_d(xh[q].x * gq[q].x + bq[q].x); dz.y *= gelu_d(xh[q].y * gq[q].y + bq[q].y); }
+            ag[q].x += dz.x * xh[q].x; ag[q].y += dz.y * xh[q].y; ab[q].x += dz.x; ab[q].y += dz.y;
+            dxh[q] = make_float2(dz.x * gq[q].x, dz.y * gq[q].y); s1 += dxh[q].x + dxh[q].y; s2 += dxh[q].x * xh[q].x + dxh[q].y * xh[q].y;
+        }
+        for (int o = 16; o; o >>= 1) { s1 += __shfl_xor_sync(0xffffffffu, s1, o); s2 += __shfl_xor_sync(0xffffffffu, s2, o); }
+        s1 /= C; s2 /= C;
+#pragma unroll
+        for (int q = 0; q < NQ; q++) { const int c = 2 * l + 64 * q; if (c < C) *(float2 *)(gx + r * C + c) = make_float2(rs * (dxh[q].x - s1 - xh[q].x * s2), rs * (dxh[q].y - s1 - xh[q].y * s2)); }
+    }
+#pragma unroll
+    for (int q = 0; q < NQ; q++) { const int c = 2 * l + 64 * q; if (c < C) { atomicAdd(&sg[c], ag[q].x); atomicAdd(&sg[c + 1], ag[q].y); atomicAdd(&sb[c], ab[q].x); atomicAdd(&sb[c + 1], ab[q].y); } }
+    __syncthreads();
+    for (int c = threadIdx.x; c < C; c += blockDim.x) { if (gg) atomicAdd(&gg[c], sg[c]); if (gbb) atomicAdd(&gbb[c], sb[c]); }
+}
 extern "C" void vt_ln_fwd(vt_t x, const float *g, const float *b, int gelu, vt_t y, float *mean, float *rstd) {
     const long long M = (long long)vt_rows(x); if (x.c > 32 * LNV) { fprintf(stderr, "vt_ln_fwd: C %d > %d\n", x.c, 32 * LNV); return; }
+    if (x.c % 2 == 0) {
+        const int nq = (x.c + 63) / 64;
+        if (nq == 1) k_ln_fwd2<1><<<nb_of(M, 8), 256>>>(x.p, g, b, gelu, y.p, mean, rstd, M, x.c);
+        else if (nq == 2) k_ln_fwd2<2><<<nb_of(M, 8), 256>>>(x.p, g, b, gelu, y.p, mean, rstd, M, x.c);
+        else if (nq == 3) k_ln_fwd2<3><<<nb_of(M, 8), 256>>>(x.p, g, b, gelu, y.p, mean, rstd, M, x.c);
+        else k_ln_fwd2<4><<<nb_of(M, 8), 256>>>(x.p, g, b, gelu, y.p, mean, rstd, M, x.c);
+        return;
+    }
     k_ln_fwd<<<nb_of(M, 8), 256>>>(x.p, g, b, gelu, y.p, mean, rstd, M, x.c);
 }
 /* backward: per row dz = dy gelu'(z), dxh = dz g, dx = rstd (dxh - mean(dxh) - xh mean(dxh xh)); gg += dz xh, gb += dz via per-block
@@ -169,6 +234,14 @@ static __global__ void k_ln_bwd(const float *__restrict__ x, const float *__rest
 }
 extern "C" void vt_ln_bwd(vt_t x, const float *g, const float *b, int gelu, const float *mean, const float *rstd, vt_t gy, vt_t gx, float *gg, float *gb) {
     const long long M = (long long)vt_rows(x); unsigned nb = nb_of(M, 8); if (nb > 2048) nb = 2048;
+    if (x.c % 2 == 0 && x.c <= 256) {
+        const int nq = (x.c + 63) / 64;
+        if (nq == 1) k_ln_bwd2<1><<<nb, 256>>>(x.p, g, b, gelu, mean, rstd, gy.p, gx.p, gg, gb, M, x.c);
+        else if (nq == 2) k_ln_bwd2<2><<<nb, 256>>>(x.p, g, b, gelu, mean, rstd, gy.p, gx.p, gg, gb, M, x.c);
+        else if (nq == 3) k_ln_bwd2<3><<<nb, 256>>>(x.p, g, b, gelu, mean, rstd, gy.p, gx.p, gg, gb, M, x.c);
+        else k_ln_bwd2<4><<<nb, 256>>>(x.p, g, b, gelu, mean, rstd, gy.p, gx.p, gg, gb, M, x.c);
+        return;
+    }
     k_ln_bwd<<<nb, 256>>>(x.p, g, b, gelu, mean, rstd, gy.p, gx.p, gg, gb, M, x.c);
 }
 
@@ -424,4 +497,16 @@ extern "C" int vt_shell_loss(const float *ph, const uint8_t *shell, const uint16
     if (gph && h[2] > 0) { const float sc = (float)(lam_h * scale / h[2]); k_axpy<<<GRID(n)>>>(gph, gs, n, sc); }
     (void)lam_s;
     return cudaGetLastError() == cudaSuccess ? 0 : -1;
+}
+
+/* [a | float(b bf16)] per row */
+static __global__ void k_cat_bf16(const float *a, int ca, const uint16_t *b, int cb, long long rows, float *y) {
+    const int C = ca + cb;
+    for (long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; i < rows * C; i += (long long)gridDim.x * blockDim.x) {
+        const long long r = i / C; const int c = (int)(i % C);
+        y[i] = c < ca ? a[r * ca + c] : __uint_as_float((unsigned)b[r * cb + (c - ca)] << 16);
+    }
+}
+extern "C" void vt_cat_bf16(const float *a, int ca, const uint16_t *b, int cb, long long rows, float *y) {
+    k_cat_bf16<<<4096, 256>>>(a, ca, b, cb, rows, y);
 }

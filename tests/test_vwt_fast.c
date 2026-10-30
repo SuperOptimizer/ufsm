@@ -1,6 +1,7 @@
 /* vwt fast conv kernels (src/nn_vwt_fast.cu, bf16 tensor cores) vs the reference (src/nn_vwt.cu, fp32): forward, backward-data, weight
    and bias gradients for every conv shape of the vwt net at small sizes (T 16, L 24 grids), pass: max |fast - ref| / rms(ref) < 2e-2.
-   Usage: test_vwt_fast [bench]  (bench: ms per call of both at the full T 128 / L 384 shapes, and the slab's conv total) */
+   Usage: test_vwt_fast [bench] [mx8]  (bench: ms per call of both at the full T 128 / L 384 shapes, and the slab's conv total; mx8: the
+   MX-fp8 forward / backward-data (vtf_set_mx(8)), y and gx pass at max |d| / rms < 0.3: e4m3 of both operands, |d|_2 / |ref|_2 ~3.5e-2) */
 #include "vwt.h"
 #include "nn.h"
 #include <math.h>
@@ -20,9 +21,9 @@ static float *dev_rand(size_t n, float s) { float *h = malloc(n * 4); for (size_
 static float *dev_zero(size_t n) { float *d = nn_malloc(n * 4); nn_zero(d, n * 4); return d; }
 static double cmp(const char *what, const float *a, const float *b, size_t n) {   /* max |a - b| / rms(b) */
     float *ha = malloc(n * 4), *hb = malloc(n * 4); nn_d2h(ha, a, n * 4); nn_d2h(hb, b, n * 4);
-    double ss = 0, mx = 0; for (size_t i = 0; i < n; i++) { ss += (double)hb[i] * hb[i]; const double d = fabs((double)ha[i] - hb[i]); if (d > mx || d != d) mx = d != d ? 1e30 : d; }
+    double ss = 0, sd = 0, mx = 0; for (size_t i = 0; i < n; i++) { ss += (double)hb[i] * hb[i]; const double d = fabs((double)ha[i] - hb[i]); sd += d * d; if (d > mx || d != d) mx = d != d ? 1e30 : d; }
     const double r = mx / (sqrt(ss / n) + 1e-30); free(ha); free(hb);
-    printf("  %-6s rel %.3e\n", what, r); return r;
+    printf("  %-6s rel %.3e (l2 %.2e)\n", what, r, sqrt(sd / (ss + 1e-300))); return r;
 }
 typedef struct { int ci, co, k, s, dd, hh; const char *nm; } shp;   /* input grid D = H = dd (transverse), W = L */
 /* the vwt net's convs (T 128: stage grids 128 / 64 / 32 / 16) */
@@ -36,7 +37,9 @@ static int stems(const char *nm) { return !strcmp(nm, "stem") ? 4 : 1; }
 
 int main(int argc, char **argv) {
     if (nn_init(0)) { printf("SKIP: no GPU\n"); return 0; }
-    const int bench = argc > 1 && !strcmp(argv[1], "bench");
+    int bench = 0, mx8 = 0;
+    for (int i = 1; i < argc; i++) { if (!strcmp(argv[i], "bench")) bench = 1; if (!strcmp(argv[i], "mx8")) mx8 = 1; }
+    if (mx8) vtf_set_mx(8);
     const int L = bench ? 384 : 24;
     int fail = 0; double tot_ref = 0, tot_fast = 0;
     vt_t x0 = {nullptr, 1, 128, 128, 384, 2};
@@ -59,7 +62,7 @@ int main(int argc, char **argv) {
         if (rc || nn_check()) { printf("  FAIL: call error %s\n", nn_check() ? nn_check() : ""); fail++; continue; }
         if (!bench) {
             const double e[4] = {cmp("y", yf.p, yr.p, ny), cmp("gx", gxf.p, gxr.p, nx), cmp("gw", gwf, gwr, nw), cmp("gb", gbf, gbr, q->co)};
-            for (int j = 0; j < 4; j++) if (!(e[j] < 2e-2)) { printf("  FAIL\n"); fail++; break; }
+            for (int j = 0; j < 4; j++) if (!(e[j] < (mx8 && j < 2 ? 0.3 : 2e-2))) { printf("  FAIL\n"); fail++; break; }
         } else {
             double t[2][2];
             for (int f = 0; f < 2; f++) {
