@@ -13,6 +13,7 @@
 
 int cmd_strip(int argc, char **argv);
 int cmd_strip_flatten(int argc, char **argv);
+int cmd_strip_mosaic(int argc, char **argv);
 
 static int fails = 0;
 #define CHECK(c, ...) do { if (!(c)) { fails++; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
@@ -70,6 +71,27 @@ int main(void) {
     snprintf(p, sizeof p, "%s/strip/flat/stripes.tsv", root); f = fopen(p, "r"); double area = 0;
     if (f) { char line[1024]; if (fgets(line, sizeof line, f)) while (fgets(line, sizeof line, f)) { char nm[64]; int a, c, d; double u0, l, v; if (sscanf(line, "%63s %d %d %d %lf %lf %lf", nm, &a, &c, &d, &u0, &l, &v) == 7) area += v; } fclose(f); }
     { const double A = Lcm * (Hcm + step * um * 1e-4); CHECK(fabs(area - A) < 0.03 * A, "stripes valid area %.4f vs %.4f cm2", area, A); }
+    /* strip-mosaic on synthetic renders of the stripes: --threads 1 and --threads 4 must write the same bytes */
+    {
+        char rdir[400]; snprintf(rdir, sizeof rdir, "%s/render", root); snprintf(cmd, sizeof cmd, "mkdir -p %s", rdir); if (system(cmd)) {}
+        snprintf(p, sizeof p, "%s/strip/flat/stripes.tsv", root); f = fopen(p, "r"); int nst = 0;
+        if (f) { char line[1024]; if (fgets(line, sizeof line, f)) while (fgets(line, sizeof line, f)) { char nm[64]; int a, c, d;
+            if (sscanf(line, "%63s %d %d %d", nm, &a, &c, &d) != 4) continue;
+            const int ow = render_out_px(c, 1.0), oh = render_out_px(d, 1.0); uint8_t *ct = malloc((size_t)ow * oh), *ik = malloc((size_t)ow * oh);
+            for (int i = 0; i < ow * oh; i++) { const unsigned hsh = (unsigned)(i + a) * 2654435761u; ct[i] = (uint8_t)(60 + (hsh >> 24) % 120); ik[i] = (uint8_t)((hsh >> 16) & 255); }
+            snprintf(p, sizeof p, "%s/%s_ct.tif", rdir, nm); CHECK(!tiffw_write(p, ow, oh, 1, ct, 1), "write %s", p);
+            snprintf(p, sizeof p, "%s/%s.tif", rdir, nm); CHECK(!tiffw_write(p, ow, oh, 1, ik, 1), "write %s", p);
+            free(ct); free(ik); nst++; } fclose(f); }
+        CHECK(nst >= 2, "stripes %d", nst);
+        static const char *outs[2] = {"m1", "m4"}, *thr[2] = {"1", "4"};
+        for (int k = 0; k < 2; k++) {
+            char a1[400], a3[400]; snprintf(a1, sizeof a1, "%s/strip/flat", root); snprintf(a3, sizeof a3, "%s/%s", root, outs[k]);
+            char *av[] = {"ufsm", "strip-mosaic", a1, rdir, a3, "--threads", (char *)thr[k], "--rows", "2", "--overview-px", "600"};
+            CHECK(!cmd_strip_mosaic(11, av), "strip-mosaic --threads %s failed", thr[k]);
+        }
+        snprintf(cmd, sizeof cmd, "cd %s/m1 && for x in *; do cmp -s $x ../m4/$x || exit 1; done; test $(ls | wc -l) -ge 6", root);
+        CHECK(!system(cmd), "strip-mosaic --threads 4 output differs from --threads 1 (or files missing)");
+    }
     if (!fails) { snprintf(cmd, sizeof cmd, "rm -r %s", root); if (system(cmd)) {} }
     printf("test_strip: %s\n", fails ? "FAILED" : "ok");
     return fails ? 1 : 0;
