@@ -310,6 +310,7 @@ int cmd_hires_phase(int argc, char **argv) {
     /* --labels ROOT --labels-global Z,Y,X [--labels-conf 0.3]: phase training targets (src/band.h PHASE_* codes, 255 unknown) on the field-cell
        grid (h native voxels) of a global array of that shape, 512^3 shards; the box origin must sit on the 512 h grid. Only cells with a CT
        phase of confidence >= --labels-conf and material (w >= --labels-mat x 255). Several boxes fill one array (one shard row each). */
+    const long long org[3] = {g.origin[0], g.origin[1], g.origin[2]};
     const char *lroot = hp_opt(argc, argv, "--labels", nullptr);
     if (lroot) {
         long long gv[3]; if (sscanf(hp_opt(argc, argv, "--labels-global", ""), "%lld,%lld,%lld", &gv[0], &gv[1], &gv[2]) != 3) { fprintf(stderr, "hires-phase: --labels needs --labels-global Z,Y,X\n"); return 2; }
@@ -336,7 +337,7 @@ int cmd_hires_phase(int argc, char **argv) {
         if (!strcmp(out, "-")) { free(phi); free(conf); fit_fields_free(&g); z3_close(cz); return 0; }
     }
     uint8_t *a10[10]; for (int k = 0; k < 10; k++) a10[k] = g.a[k];
-    const long long org[3] = {g.origin[0], g.origin[1], g.origin[2]}; const int shp[3] = {D, H, W};
+    const int shp[3] = {D, H, W};
     if (fit_fields_save(out, org, shp, h, um, a10, g.cy, g.cx, (int)(D * h) + 1)) { fprintf(stderr, "hires-phase: cannot write %s\n", out); return 1; }
     printf("hires-phase: %dx%dx%d cells (h %d, %.3f um), CT %s at %.3f um%s; %lld cells probed, %lld with a CT phase; set on %zu of %zu material cells (%.3f, mean conf %.3f), sign %+d gauge %.3f, rest %s (%.0f s) -> %s\n",
            D, H, W, h, um, key, ctum, map ? " (registered)" : "", ncell, nph, nset, nmat, nmat ? (double)nset / nmat : 0, nset ? csum / nset : 0, sign, g0,
