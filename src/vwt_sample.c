@@ -40,7 +40,7 @@ typedef struct { vws_sample s; int state; } vws_slot;   /* 0 free, 1 being fille
 struct vws {
     vws_src *S; int ns; double wsum; int T, L; float tilt; int train; unsigned seed; int has_shell;
     vws_slot *slot; int nslot; pthread_t *th; int nth; _Atomic int stop; _Atomic long long next_id;
-    zcache *zc; int burst;   /* the shared decoded-chunk cache (UFSM_VWS_CACHE_GB, 4; 0 off); training draws in bursts of `burst` slabs near one
+    zcache *zc; int burst, burst_r;   /* the shared decoded-chunk cache (UFSM_VWS_CACHE_GB, 4; 0 off); training draws in bursts of `burst` slabs near one
                                 anchor chunk (UFSM_VWS_BURST, 8; 1 off) so neighbouring slabs share decoded chunks */
     pthread_mutex_t mu; pthread_cond_t cv; int last;
 };
@@ -158,10 +158,11 @@ static int vws_fill(vws *V, uint64_t *rs, vws_work *w, vws_sample *out) {
     for (int attempt = 0; attempt < 64; attempt++) {
         /* source by weight */
         int si = 0; int64_t ck = -1;
-        if (V->train && V->burst > 1 && w->bleft > 0) {   /* a burst: a drawable chunk within +-1 chunk of the anchor (8 tries) */
+        if (V->train && V->burst > 1 && w->bleft > 0) {   /* a burst: a drawable chunk within +-burst_r chunks of the anchor (UFSM_VWS_BURST_R, 1; 8 tries) */
             vws_src *B = &V->S[w->bsrc]; const int64_t az = w->bck / (B->cgrid[1] * B->cgrid[2]), ay = w->bck / B->cgrid[2] % B->cgrid[1], ax = w->bck % B->cgrid[2];
             for (int t = 0; t < 8 && ck < 0; t++) {
-                const int64_t z = az + (int64_t)(vws_rng(rs) % 3) - 1, y = ay + (int64_t)(vws_rng(rs) % 3) - 1, x = ax + (int64_t)(vws_rng(rs) % 3) - 1;
+                const int64_t R = V->burst_r, D = 2 * R + 1;
+                const int64_t z = az + (int64_t)(vws_rng(rs) % (uint64_t)D) - R, y = ay + (int64_t)(vws_rng(rs) % (uint64_t)D) - R, x = ax + (int64_t)(vws_rng(rs) % (uint64_t)D) - R;
                 if (z < 0 || y < 0 || x < 0 || z >= B->cgrid[0] || y >= B->cgrid[1] || x >= B->cgrid[2]) continue;
                 const int64_t k = (z * B->cgrid[1] + y) * B->cgrid[2] + x; if (B->ok[k]) { ck = k; si = w->bsrc; }
             }
@@ -475,6 +476,7 @@ vws *vws_open(const char *sources_json, int T, int L, float tilt_deg, int nthrea
     for (int s = 0; s < V->ns; s++) if (V->S[s].nch && !V->S[s].ok) { fprintf(stderr, "vws: out of memory\n"); return nullptr; }
     {   const char *e = getenv("UFSM_VWS_CACHE_GB"); const double gb = e ? atof(e) : 4; V->zc = gb > 0 ? zcache_open((size_t)(gb * 1e9)) : nullptr;
         const char *b = getenv("UFSM_VWS_BURST"); V->burst = b ? atoi(b) : 8; if (V->burst < 1) V->burst = 1;
+        const char *br = getenv("UFSM_VWS_BURST_R"); V->burst_r = br ? atoi(br) : 1; if (V->burst_r < 0) V->burst_r = 0;
         fprintf(stderr, "vws: chunk cache %.1f GB, training bursts of %d slabs\n", gb > 0 ? gb : 0., V->burst); }
     pthread_mutex_init(&V->mu, nullptr); pthread_cond_init(&V->cv, nullptr);
     V->nth = nthreads < 1 ? 1 : nthreads; V->nslot = V->nth + 2; V->slot = calloc(V->nslot, sizeof *V->slot);
