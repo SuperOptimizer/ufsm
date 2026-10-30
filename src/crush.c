@@ -11,7 +11,8 @@ static double cr_u(uint64_t *s) { return (double)(cr_next(s) >> 11) * 0x1.0p-53;
 static double cr_logu(uint64_t *s, double lo, double hi) { return exp(log(lo) + cr_u(s) * (log(hi) - log(lo))); }
 
 crush_cfg crush_cfg_default(void) {
-    return (crush_cfg){.p = 0, .jlo = .15f, .jhi = .5f, .squash_p = .5f, .klo = 1.5f, .khi = 3.f, .bend_p = .5f, .bend_amp = .06f, .kink_p = .25f, .rotate_deg = 10.f, .fine = 0};
+    return (crush_cfg){.p = 0, .jlo = .15f, .jhi = .5f, .squash_p = .5f, .klo = 1.5f, .khi = 3.f, .bend_p = .5f, .bend_amp = .06f, .kink_p = .25f, .rotate_deg = 10.f, .fine = 0,
+                        .loc_amp = 0, .loc_len = 48.f, .loc_jmax = 1.f};
 }
 
 static const char *cr_opt(int argc, char **argv, const char *f) { for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], f)) return argv[i + 1]; return nullptr; }
@@ -23,17 +24,19 @@ int crush_cfg_parse(crush_cfg *c, int argc, char **argv) {
     CR_F("--aug-crush-bend", c->bend_p); CR_F("--aug-crush-bend-amp", c->bend_amp); CR_F("--aug-crush-kink", c->kink_p); CR_F("--aug-crush-rot", c->rotate_deg);
     if ((v = cr_opt(argc, argv, "--aug-crush-fine"))) c->fine = atoi(v);
     if ((v = cr_opt(argc, argv, "--aug-crush-warp"))) c->warp = atoi(v);
+    CR_F("--aug-crush-local", c->loc_amp); CR_F("--aug-crush-local-len", c->loc_len); CR_F("--aug-crush-local-max", c->loc_jmax);
 #undef CR_F
 #undef CR_R
     const int bad = !(c->p >= 0 && c->p <= 1) || !(c->jlo > .04f && c->jlo <= c->jhi && c->jhi <= 1) || !(c->squash_p >= 0 && c->squash_p <= 1) ||
                     !(c->klo >= 1 && c->klo <= c->khi && c->khi <= 4) || !(c->bend_p >= 0 && c->bend_p <= 1) || !(c->bend_amp >= 0 && c->bend_amp <= .2f) ||
-                    !(c->kink_p >= 0 && c->kink_p <= 1) || !(c->rotate_deg >= 0 && c->rotate_deg <= 45) || c->fine < 0 || c->fine > 3 || c->warp < 0 || c->warp > 1;
-    if (bad) { fprintf(stderr, "--aug-crush: p 0..1, void 0.05..1 (lo <= hi), squash p 0..1, k 1..4 (lo <= hi), bend p 0..1 amp 0..0.2, kink p 0..1, rot 0..45, fine 0..3, warp 0|1\n"); return 1; }
+                    !(c->kink_p >= 0 && c->kink_p <= 1) || !(c->rotate_deg >= 0 && c->rotate_deg <= 45) || c->fine < 0 || c->fine > 3 || c->warp < 0 || c->warp > 1 ||
+                    !(c->loc_amp >= 0 && c->loc_amp <= 3) || !(c->loc_len >= 4 && c->loc_len <= 1024) || !(c->loc_jmax >= .1f && c->loc_jmax <= 3);
+    if (bad) { fprintf(stderr, "--aug-crush: p 0..1, void 0.05..1 (lo <= hi), squash p 0..1, k 1..4 (lo <= hi), bend p 0..1 amp 0..0.2, kink p 0..1, rot 0..45, fine 0..3, warp 0|1, local 0..3, local-len 4..1024, local-max 0.1..3\n"); return 1; }
     return 0;
 }
 void crush_cfg_print(const crush_cfg *c) {
-    fprintf(stderr, "crush augmentation: p %.3g, void ratio %.3g..%.3g, squash p %.3g x%.3g..%.3g, bend p %.3g (%.3g P), kink p %.3g, rotation %.3g deg, CT %d levels finer, geometry warp after %d\n",
-            c->p, c->jlo, c->jhi, c->squash_p, c->klo, c->khi, c->bend_p, c->bend_amp, c->kink_p, c->rotate_deg, c->fine, c->warp);
+    fprintf(stderr, "crush augmentation: p %.3g, void ratio %.3g..%.3g, squash p %.3g x%.3g..%.3g, bend p %.3g (%.3g P), kink p %.3g, rotation %.3g deg, CT %d levels finer, geometry warp after %d, local void field %.3g (len %.3g, max %.3g)\n",
+            c->p, c->jlo, c->jhi, c->squash_p, c->klo, c->khi, c->bend_p, c->bend_amp, c->kink_p, c->rotate_deg, c->fine, c->warp, c->loc_amp, c->loc_len, c->loc_jmax);
 }
 static double dot3(const double a[3], const double b[3]) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
 static void unit3(double v[3]) { const double l = sqrt(dot3(v, v)); for (int d = 0; d < 3; d++) v[d] /= l; }
@@ -104,6 +107,13 @@ void crush_map_init(crush_map *m, const crush_cfg *cfg, uint64_t seed, int P, co
     const double B = fabs(m->bA[0]) + fabs(m->bA[1]) + (m->kink ? fabs(m->kS) * kmx : 0);
     m->T[0] = T0 + 1; m->T[1] = T1 + 1; m->srange[0] = smn - B; m->srange[1] = smx + B;
     m->half = 4 * ceil(fmax(fabs(m->srange[0]), fabs(m->srange[1])) + 4) + 24;   /* (columns covering s' at 1 / 4 of the source: papyrus 1, voids >= 0.05) */
+    if (cfg->loc_amp > 0) {   /* (drawn last: maps without it keep their random sequence) */
+        m->nloc = 8; m->lamp = cfg->loc_amp; m->ljmax = cfg->loc_jmax;
+        for (int i = 0; i < m->nloc; i++) {
+            const double lam = cr_logu(&seed, .5 * cfg->loc_len, 2. * cfg->loc_len), cz = 2 * cr_u(&seed) - 1, ph = 2 * M_PI * cr_u(&seed), sz = sqrt(fmax(0, 1 - cz * cz));
+            const double kk = 2 * M_PI / lam; m->lk[i][0] = kk * sz * cos(ph); m->lk[i][1] = kk * sz * sin(ph); m->lk[i][2] = kk * cz; m->lph[i] = 2 * M_PI * cr_u(&seed);
+        }
+    }
 }
 void crush_footprint(const crush_map *m, double ext[3]) {
     if (m->rb) { for (int d = 0; d < 3; d++) ext[d] = m->rext[d]; return; }   /* (stage R alone) */
@@ -190,6 +200,13 @@ static double cr_jcol(const crush_map *m, double a1, double a2, double jth, doub
     const double jc = m->j0 * exp(.4 * sin(jk * (cos(jth) * a1 + sin(jth) * a2) + jph));
     return jc < .05 ? .05 : jc > 1 ? 1 : jc;
 }
+/* the local void ratio at column (a1, a2), source offset sigma along n: the column's jc x exp(A z), z = sqrt(2 / N) sum cos (unit variance) */
+static double cr_jloc(const crush_map *m, double jc, double a1, double a2, double sg) {
+    if (!m->nloc) return jc;
+    double z = 0; for (int i = 0; i < m->nloc; i++) z += cos(m->lk[i][0] * a1 + m->lk[i][1] * a2 + m->lk[i][2] * sg + m->lph[i]);
+    const double j = jc * exp(m->lamp * sqrt(2. / m->nloc) * z);
+    return j < .04 ? .04 : j > m->ljmax ? m->ljmax : j;
+}
 int crush_map_columns(crush_map *m, double jlo, double jhi, uint64_t seed, crush_ct_fn ct, void *ud) {
     free(m->tab); m->tab = nullptr;
     const int P = m->P;
@@ -227,9 +244,9 @@ int crush_map_columns(crush_map *m, double jlo, double jhi, uint64_t seed, crush
         for (;;) {
             const int H = dir ? Hp : Hm; int need = 0;
             for (int i = 0; i < m->G[0] && !need; i++) for (int j = 0; j < m->G[1] && !need; j++) {
-                const double jc = cr_jcol(m, m->alo[0] + i * m->h, m->alo[1] + j * m->h, jth, jk, jph);
+                const double a1 = m->alo[0] + i * m->h, a2 = m->alo[1] + j * m->h, jc = cr_jcol(m, a1, a2, jth, jk, jph);
                 const uint8_t *b = buf + ((size_t)i * m->G[1] + j) * KX + HX; double g = 0;
-                for (int k = 1; k <= H; k++) g += 1 - (1 - jc) * vt[b[dir ? k : -k]];
+                for (int k = 1; k <= H; k++) g += 1 - (1 - cr_jloc(m, jc, a1, a2, dir ? k : -k)) * vt[b[dir ? k : -k]];
                 need = g < S + 24;
             }
             if (!need || H >= HX) break;
@@ -243,14 +260,14 @@ int crush_map_columns(crush_map *m, double jlo, double jhi, uint64_t seed, crush
     if (!m->tab || !rho || !g || !vb) { free(buf); free(rho); free(g); free(vb); free(m->tab); m->tab = nullptr; return 1; }
     double gk[11]; { double sw = 0; for (int q = -5; q <= 5; q++) sw += gk[q + 5] = exp(-q * q / (2 * 1.5 * 1.5)); for (int q = 0; q < 11; q++) gk[q] /= sw; }
     for (int i = 0; i < m->G[0]; i++) for (int j = 0; j < m->G[1]; j++) {
-        const double jc = cr_jcol(m, m->alo[0] + i * m->h, m->alo[1] + j * m->h, jth, jk, jph);
+        const double a1 = m->alo[0] + i * m->h, a2 = m->alo[1] + j * m->h, jc = cr_jcol(m, a1, a2, jth, jk, jph);
         const uint8_t *b = buf + ((size_t)i * m->G[1] + j) * KX + HX - Hm;   /* sample k: sigma = k - Hm */
         for (int k = 0; k < K; k++) vb[k] = vt[b[k]];
         for (int k = 0; k < K; k++) {
             double s = 0; for (int q = -5; q <= 5; q++) { const int kk = k + q < 0 ? 0 : k + q >= K ? K - 1 : k + q; s += gk[q + 5] * vb[kk]; }
             const int e = k < K - 1 - k ? k : K - 1 - k; double tp = 1;
             if (e < 16) { const double z = e / 16.0; tp = z * z * (3 - 2 * z); }   /* rho -> 1 at the ends: slope 1 continues C1 */
-            rho[k] = 1 - (1 - jc) * s * tp;
+            rho[k] = 1 - (1 - cr_jloc(m, jc, a1, a2, k - Hm)) * s * tp;
         }
         g[0] = 0; for (int k = 0; k + 1 < K; k++) g[k + 1] = g[k] + .5 * (rho[k] + rho[k + 1]);
         const double g0 = g[Hm]; for (int k = 0; k < K; k++) g[k] -= g0;
