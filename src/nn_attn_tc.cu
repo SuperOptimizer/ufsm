@@ -10,6 +10,7 @@
    (cp.async double buffer, rows padded to 56 halfs: conflict-free ldmatrix). */
 #include "attn.h"
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <math.h>
 #include <stdint.h>
@@ -82,17 +83,27 @@ __device__ __forceinline__ void mm_pt(float (*acc)[4], float (*p)[4], const __ha
 }
 
 /* ---- pack: qkv [T][3C] fp32 -> QK-norm (+ gain), RoPE, fp16 head-major q / k / v; rows T..T+63 zero; amx[1] = max |v| ---- */
-__global__ void k_fa_pack(const float *__restrict__ qkv, const float *__restrict__ qg, const float *__restrict__ kg, __half *Qh, __half *Kh, __half *Vh,
+/* 8 consecutive values (16- / 32-byte aligned) of an fp32 or bf16 row -> fp32 */
+__device__ __forceinline__ void ld8f(const float *p, float *v) { const float4 a = *(const float4 *)p, b = *(const float4 *)(p + 4); v[0] = a.x; v[1] = a.y; v[2] = a.z; v[3] = a.w; v[4] = b.x; v[5] = b.y; v[6] = b.z; v[7] = b.w; }
+__device__ __forceinline__ void ld8f(const __nv_bfloat16 *p, float *v) {
+    const uint4 u = *(const uint4 *)p; const unsigned w[4] = {u.x, u.y, u.z, u.w};
+#pragma unroll
+    for (int k = 0; k < 4; k++) { v[2 * k] = __uint_as_float(w[k] << 16); v[2 * k + 1] = __uint_as_float(w[k] & 0xffff0000u); }
+}
+__device__ __forceinline__ void st2(float *p, float a, float b) { *(float2 *)p = make_float2(a, b); }
+__device__ __forceinline__ void st2(__nv_bfloat16 *p, float a, float b) { *(__nv_bfloat162 *)p = __floats2bfloat162_rn(a, b); }
+template <typename TI>
+__global__ void k_fa_pack(const TI *__restrict__ qkv, const float *__restrict__ qg, const float *__restrict__ kg, __half *Qh, __half *Kh, __half *Vh,
                           float *rq, float *rk, float *amx, long long T, int C, int S, int Hh, int W, int nreg, int rope, float lbase, const float *gpos) {
     const int H = C / HD; const long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x;
     if (i >= (T + FT) * H * 3) return;
     const int p = (int)(i % 3); const long long th = i / 3; const int h = (int)(th % H); const long long t = th / H;
     __half *dst = (p == 0 ? Qh : p == 1 ? Kh : Vh) + ((size_t)h * (T + FT) + t) * HD;
     if (t >= T) { for (int d = 0; d < HD; d += 8) *(uint4 *)(dst + d) = make_uint4(0, 0, 0, 0); return; }
-    const float *xs = qkv + t * 3 * C + p * C + h * HD;
+    const TI *xs = qkv + t * 3 * C + p * C + h * HD;
     float v[HD];
 #pragma unroll
-    for (int d = 0; d < HD; d += 4) { const float4 f = *(const float4 *)(xs + d); v[d] = f.x; v[d + 1] = f.y; v[d + 2] = f.z; v[d + 3] = f.w; }
+    for (int d = 0; d < HD; d += 8) ld8f(xs + d, v + d);
     if (p < 2) {
         float s = 0.f;
 #pragma unroll
@@ -122,7 +133,8 @@ __global__ void k_fa_pack(const float *__restrict__ qkv, const float *__restrict
 }
 
 /* ---- forward: grid (ceil(S / 64), H, nseq) ---- */
-__global__ void __launch_bounds__(128) k_fa_fwd(const __half *__restrict__ Qh, const __half *__restrict__ Kh, const __half *__restrict__ Vh, float *__restrict__ o,
+template <typename TO>
+__global__ void __launch_bounds__(128) k_fa_fwd(const __half *__restrict__ Qh, const __half *__restrict__ Kh, const __half *__restrict__ Vh, TO *__restrict__ o,
                                                 float *__restrict__ lse, int S, int H, int C, long long Tp, float sl2, const int *lens) {
     const int seq = blockIdx.z, h = blockIdx.y, q0 = blockIdx.x * FT, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
     __shared__ __align__(16) __half Ks[2][FT * FS], Vs[2][FT * FS];
@@ -170,9 +182,9 @@ __global__ void __launch_bounds__(128) k_fa_fwd(const __half *__restrict__ Qh, c
     for (int r = 0; r < 2; r++) {
         const int i = q0 + warp * 16 + g + 8 * r;
         if (i >= S) continue;
-        const float il = l[r] > 0.f ? 1.f / l[r] : 0.f; float *orow = o + ((size_t)seq * S + i) * C + h * HD;
+        const float il = l[r] > 0.f ? 1.f / l[r] : 0.f; TO *orow = o + ((size_t)seq * S + i) * C + h * HD;
 #pragma unroll
-        for (int j = 0; j < 6; j++) *(float2 *)(orow + 8 * j + 2 * t) = make_float2(acc[j][2 * r] * il, acc[j][2 * r + 1] * il);
+        for (int j = 0; j < 6; j++) st2(orow + 8 * j + 2 * t, acc[j][2 * r] * il, acc[j][2 * r + 1] * il);
         if (!t) lse[((size_t)seq * H + h) * S + i] = l[r] > 0.f ? m[r] + log2f(l[r]) : 0.f;   /* (a length-0 sequence: zero output) */
     }
 }
@@ -189,19 +201,20 @@ __device__ __forceinline__ int fa_ks(const float *amx) {   /* 48 |dO 2^e| max|v|
     const float b = 48.f * fmaxf(amx[1], 1e-30f); int k = 14 - ilogbf(b) - 1; return k < -30 ? -30 : k > 30 ? 30 : k;
 }
 /* D = dO . O per (row, head), scaled by 2^e; dO scaled -> fp16 head-major (rows T..T+63 zero) */
-__global__ void k_fa_bprep(const float *__restrict__ o, const float *__restrict__ dO, const float *amx, __half *dOh, float *Dv, long long T, int S, int C) {
+template <typename TO>
+__global__ void k_fa_bprep(const TO *__restrict__ o, const float *__restrict__ dO, const float *amx, __half *dOh, float *Dv, long long T, int S, int C) {
     const int H = C / HD; const long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x;
     if (i >= (T + FT) * H) return;
     const int h = (int)(i % H); const long long t = i / H;
     __half *dst = dOh + ((size_t)h * (T + FT) + t) * HD;
     if (t >= T) { for (int d = 0; d < HD; d += 8) *(uint4 *)(dst + d) = make_uint4(0, 0, 0, 0); return; }
-    const float sc = exp2f((float)fa_e(amx)); const float *orow = o + t * C + h * HD, *grow = dO + t * C + h * HD;
+    const float sc = exp2f((float)fa_e(amx)); const TO *orow = o + t * C + h * HD; const float *grow = dO + t * C + h * HD;
     float a = 0.f;
 #pragma unroll
     for (int d = 0; d < HD; d += 8) {
-        float v[8];
+        float v[8], ov[8]; ld8f(orow + d, ov);
 #pragma unroll
-        for (int k = 0; k < 8; k++) { v[k] = grow[d + k]; a += v[k] * orow[d + k]; v[k] *= sc; }
+        for (int k = 0; k < 8; k++) { v[k] = grow[d + k]; a += v[k] * ov[k]; v[k] *= sc; }
         *(uint4 *)(dst + d) = make_uint4(pk(v[0], v[1]), pk(v[2], v[3]), pk(v[4], v[5]), pk(v[6], v[7]));
     }
     Dv[((size_t)(t / S) * H + h) * S + t % S] = a * sc;
@@ -316,30 +329,45 @@ __global__ void __launch_bounds__(128) k_fa_dq(const __half *__restrict__ Qh, co
 
 static unsigned nbk(long long n, int t) { return (unsigned)((n + t - 1) / t); }
 /* the backward prologue: amx[0] = max |dO|, D = dO . O (x 2^e) per (row, head), dO x 2^e -> fp16 head-major doh */
-extern "C" void at_fa_bprep(const float *o, const float *dO, float *amx, void *doh, float *Dv, const at_geom *g, int C) {
+template <typename TO> static void fa_bprep(const TO *o, const float *dO, float *amx, void *doh, float *Dv, const at_geom *g, int C) {
     const long long T = (long long)g->nseq * g->S, Tp = T + FT; const int H = C / HD;
     cudaMemsetAsync(amx, 0, sizeof(float), 0);
     k_fa_amax<<<120, 256>>>(dO, T * C, amx);
-    k_fa_bprep<<<nbk(Tp * H, 128), 128>>>(o, dO, amx, (__half *)doh, Dv, T, g->S, C);
+    k_fa_bprep<TO><<<nbk(Tp * H, 128), 128>>>(o, dO, amx, (__half *)doh, Dv, T, g->S, C);
 }
-extern "C" void at_fa_pack(const float *qkv, const float *qg, const float *kg, void *qkvh, float *rq, float *rk, float *amx, const at_geom *g, int nreg, int C, int rope, float base) {
+extern "C" void at_fa_bprep(const float *o, const float *dO, float *amx, void *doh, float *Dv, const at_geom *g, int C) { fa_bprep(o, dO, amx, doh, Dv, g, C); }
+template <typename TI> static void fa_pack(const TI *qkv, const float *qg, const float *kg, void *qkvh, float *rq, float *rk, float *amx, const at_geom *g, int nreg, int C, int rope, float base) {
     const long long T = (long long)g->nseq * g->S, Tp = T + FT; const int H = C / HD;
     __half *Qh = (__half *)qkvh, *Kh = Qh + (size_t)H * Tp * HD, *Vh = Kh + (size_t)H * Tp * HD;
     cudaMemsetAsync(amx, 0, 4 * sizeof(float), 0);
-    k_fa_pack<<<nbk(Tp * H * 3, 128), 128>>>(qkv, qg, kg, Qh, Kh, Vh, rq, rk, amx, T, C, g->S, g->Hh, g->W, nreg, rope, log2f(base), g->pos);
+    k_fa_pack<TI><<<nbk(Tp * H * 3, 128), 128>>>(qkv, qg, kg, Qh, Kh, Vh, rq, rk, amx, T, C, g->S, g->Hh, g->W, nreg, rope, log2f(base), g->pos);
 }
-extern "C" void at_fa_fwd(const void *qkvh, float *o, float *lse, const at_geom *g, int H, int C) {
+extern "C" void at_fa_pack(const float *qkv, const float *qg, const float *kg, void *qkvh, float *rq, float *rk, float *amx, const at_geom *g, int nreg, int C, int rope, float base) {
+    fa_pack(qkv, qg, kg, qkvh, rq, rk, amx, g, nreg, C, rope, base);
+}
+extern "C" void at_fa_pack_bf(const void *qkv, const float *qg, const float *kg, void *qkvh, float *rq, float *rk, float *amx, const at_geom *g, int nreg, int C, int rope, float base) {
+    fa_pack((const __nv_bfloat16 *)qkv, qg, kg, qkvh, rq, rk, amx, g, nreg, C, rope, base);
+}
+template <typename TO> static void fa_fwd(const void *qkvh, TO *o, float *lse, const at_geom *g, int H, int C) {
     const long long Tp = (long long)g->nseq * g->S + FT;
     const __half *Qh = (const __half *)qkvh, *Kh = Qh + (size_t)H * Tp * HD, *Vh = Kh + (size_t)H * Tp * HD;
     dim3 gr(nbk(g->S, FT), H, g->nseq);
-    k_fa_fwd<<<gr, 128>>>(Qh, Kh, Vh, o, lse, g->S, H, C, Tp, 1.4426950408889634f / sqrtf((float)HD), g->lens);
+    k_fa_fwd<TO><<<gr, 128>>>(Qh, Kh, Vh, o, lse, g->S, H, C, Tp, 1.4426950408889634f / sqrtf((float)HD), g->lens);
 }
-extern "C" void at_fa_bwd(const void *qkvh, void *doh, const float *o, const float *lse, const float *dO, float *Dv, float *amx, float *dqkn, const at_geom *g, int H, int C) {
+extern "C" void at_fa_fwd(const void *qkvh, float *o, float *lse, const at_geom *g, int H, int C) { fa_fwd(qkvh, o, lse, g, H, C); }
+extern "C" void at_fa_fwd_bf(const void *qkvh, void *o, float *lse, const at_geom *g, int H, int C) { fa_fwd(qkvh, (__nv_bfloat16 *)o, lse, g, H, C); }
+template <typename TO> static void fa_bwd(const void *qkvh, void *doh, const TO *o, const float *lse, const float *dO, float *Dv, float *amx, float *dqkn, const at_geom *g, int H, int C) {
     const long long T = (long long)g->nseq * g->S, Tp = T + FT;
     const __half *Qh = (const __half *)qkvh, *Kh = Qh + (size_t)H * Tp * HD, *Vh = Kh + (size_t)H * Tp * HD; __half *Gh = (__half *)doh;
-    at_fa_bprep(o, dO, amx, Gh, Dv, g, C);
+    fa_bprep(o, dO, amx, Gh, Dv, g, C);
     const float scale = 1.f / sqrtf((float)HD), sl2 = scale * 1.4426950408889634f;
     dim3 gr(nbk(g->S, FT), H, g->nseq);
     k_fa_dkv<<<gr, 128>>>(Qh, Kh, Vh, Gh, lse, Dv, amx, dqkn, g->S, H, C, Tp, sl2, scale, g->lens);
     k_fa_dq<<<gr, 128>>>(Qh, Kh, Vh, Gh, lse, Dv, amx, dqkn, g->S, H, C, Tp, sl2, scale, g->lens);
+}
+extern "C" void at_fa_bwd(const void *qkvh, void *doh, const float *o, const float *lse, const float *dO, float *Dv, float *amx, float *dqkn, const at_geom *g, int H, int C) {
+    fa_bwd(qkvh, doh, o, lse, dO, Dv, amx, dqkn, g, H, C);
+}
+extern "C" void at_fa_bwd_bf(const void *qkvh, void *doh, const void *o, const float *lse, const float *dO, float *Dv, float *amx, float *dqkn, const at_geom *g, int H, int C) {
+    fa_bwd(qkvh, doh, (const __nv_bfloat16 *)o, lse, dO, Dv, amx, dqkn, g, H, C);
 }

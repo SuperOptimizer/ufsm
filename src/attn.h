@@ -205,6 +205,16 @@ int at_get_core(void);
 void at_fa_pack(const float *qkv, const float *qg, const float *kg, void *qkvh, float *rq, float *rk, float *amx, const at_geom *g, int nreg, int C, int rope, float base);
 void at_fa_fwd(const void *qkvh, float *o, float *lse, const at_geom *g, int H, int C);
 void at_fa_bwd(const void *qkvh, void *doh, const float *o, const float *lse, const float *dO, float *Dv, float *amx, float *dqkn, const at_geom *g, int H, int C);
+/* bf16 operand variants (src/nn_attn_h16.cu): qkv [T][3C] and the attention output o [T][C] in bf16 */
+void at_fa_pack_bf(const void *qkv, const float *qg, const float *kg, void *qkvh, float *rq, float *rk, float *amx, const at_geom *g, int nreg, int C, int rope, float base);
+void at_fa_fwd_bf(const void *qkvh, void *o, float *lse, const at_geom *g, int H, int C);
+void at_fa_bwd_bf(const void *qkvh, void *doh, const void *o, const float *lse, const float *dO, float *Dv, float *amx, float *dqkn, const at_geom *g, int H, int C);
+/* at_set_mx(16) / UFSM_LINEAR_MX=16: blocks without deformable attention, rays or value residual, on the fp16 tensor-core core, run with bf16
+   activations and bf16 tensor-core linear layers (fp32 accumulation, fused bias / residual / column-sum epilogues; src/nn_attn_h16.cu).
+   at_block_h16_ok: whether this block qualifies; the _h16 calls are what at_block_fwd / at_block_bwd dispatch to then */
+int at_block_h16_ok(const at_dims *d, const at_geom *g, const at_ws *w);
+int at_block_fwd_h16(const at_dims *d, const float *P, const at_bp *bp, const float *x, float *y, const at_geom *g, at_ws *w, int recompute);
+int at_block_bwd_h16(const at_dims *d, const float *P, float *G, const at_bp *bp, const float *xin, float *gy, const at_geom *g, at_ws *w);
 void at_fa_bprep(const float *o, const float *dO, float *amx, void *doh, float *Dv, const at_geom *g, int C);
 /* core 2 (src/lp_attn8.cu): the same products in MX-fp8 (e4m3, one ue8m0 scale per 32 K; P and dS quantised in registers), from the
    fp16 packs; own scratch (grown on demand); 0 or -1 */

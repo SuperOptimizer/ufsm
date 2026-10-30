@@ -73,7 +73,8 @@ static atplan *at_plan(int M, int N, int K, int ta, int tb) {
     if (!p->ok) fprintf(stderr, "at_gemm: no cuBLASLt algorithm for M %d N %d K %d ta %d tb %d\n", M, N, K, ta, tb);
     return p;
 }
-static int g_at_mx = -1;   /* the linear layers' GEMM precision: 0 fp32 (cuBLASLt), 4 / 8 MX-fp4 / MX-fp8 (lp_mx_gemm); env UFSM_LINEAR_MX */
+static int g_at_mx = -1;   /* the linear layers' GEMM precision: 0 fp32 (cuBLASLt), 4 / 8 MX-fp4 / MX-fp8 (lp_mx_gemm), 16 bf16 blocks (src/nn_attn_h16.cu;
+                             other linear layers fp32); env UFSM_LINEAR_MX */
 static int g_at_core = -1;   /* the attention core: 0 fp32 CUDA cores, 1 fp16 tensor cores (src/nn_attn_tc.cu; the default), 2 MX-fp8 (src/lp_attn8.cu);
                                 env UFSM_ATTN_CORE */
 extern "C" void at_set_core(int c) { g_at_core = c; }
@@ -544,6 +545,7 @@ static const at_geom *att_geom(const at_dims *d, const at_geom *g, at_geom *gr) 
 }
 static int att_core(const at_geom *g) { const int c = at_get_core(); return c == 2 && g->rays ? 1 : c; }   /* (MX-fp8 has no ray lengths: fp16) */
 extern "C" int at_block_fwd(const at_dims *d, const float *P, const at_bp *bp, const float *x, float *y, const at_geom *g, at_ws *w) {
+    if (at_get_mx() == 16 && at_block_h16_ok(d, g, w)) return at_block_fwd_h16(d, P, bp, x, y, g, w, 0);
     const long T = (long)g->nseq * g->S; const int C = d->C, F = d->F; const double t = (double)T;
     at_geom gr_; const at_geom *ga = att_geom(d, g, &gr_); const at_rays *R = g->rays;
     const long Ta = (long)ga->nseq * ga->S; const int nreg = R ? 0 : d->nreg, core = att_core(g);
@@ -589,6 +591,7 @@ extern "C" int at_block_fwd(const at_dims *d, const float *P, const at_bp *bp, c
     return 0;
 }
 extern "C" int at_block_bwd(const at_dims *d, const float *P, float *G, const at_bp *bp, const float *xin, float *gy, const at_geom *g, at_ws *w) {
+    if (at_get_mx() == 16 && at_block_h16_ok(d, g, w)) return at_block_bwd_h16(d, P, G, bp, xin, gy, g, w);
     const long T = (long)g->nseq * g->S; const int C = d->C, F = d->F; const double t = (double)T;
     at_geom gr_; const at_geom *ga = att_geom(d, g, &gr_); const at_rays *R = g->rays;
     const long Ta = (long)ga->nseq * ga->S; const int nreg = R ? 0 : d->nreg, core = att_core(g);
