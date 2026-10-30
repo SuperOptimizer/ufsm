@@ -171,6 +171,7 @@ static int usage(void) {
         "  ufsm stitch align|solve|field|sheets|info ...   overlapping box fits -> one gauge, a global winding field, stitched sheets\n"
         "  ufsm render <wraps-dir> <out-dir> --volume ROOT KEY [--ct ROOT KEY]  ink / CT along each wrap (tiled TIFF)\n"
         "  ufsm flatten <wraps-dir> <out-dir> [--wraps a,b] [--decim 1] [--out-step S]   SLIM-flattened wraps (isometric uv, largest valid rectangle)\n"
+        "  ufsm faces <wraps-dir> <out-dir> --ct ROOT KEY --ct-um U [--umb JSON --umb-um U]   recto (inner) / verso (outer) faces of the sheet under each wrap\n"
         "  ufsm flatten-warp <in.jpg|tif> <flat-wrap-dir> <out.jpg|tif> --src-px P [--scale S]   a render of the original wrap onto the flat one\n"
         "  ufsm strip <wraps-dir> <out-dir> [--first K] [--last K] [--every E]   the wraps joined at the theta cut: ONE continuous spiral surface (strip.sfc)\n"
         "  ufsm strip-flatten <strip-dir> [--decim D] [--stride S] [--stripe-px 60000] [--flip-rows 1]   the whole strip flattened (chunk SLIM + blend) -> render stripes\n"
@@ -3864,6 +3865,7 @@ int cmd_fit_join(int argc, char **argv);   /* src/fitjoin.c */
 int cmd_wrap_check(int argc, char **argv);   /* src/wrapcheck.c */
 int cmd_fields_oracle(int argc, char **argv);   /* src/fieldsoracle.c */
 int cmd_flatten(int argc, char **argv);         /* src/flatten.c */
+int cmd_faces(int argc, char **argv);           /* src/faces_cli.c */
 int cmd_flatten_warp(int argc, char **argv);
 int cmd_strip(int argc, char **argv);           /* src/strip.c */
 int cmd_strip_flatten(int argc, char **argv);
@@ -3915,6 +3917,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "wrap-check")) return cmd_wrap_check(argc, argv);
     if (!strcmp(cmd, "fields-oracle")) return cmd_fields_oracle(argc, argv);
     if (!strcmp(cmd, "flatten")) return cmd_flatten(argc, argv);
+    if (!strcmp(cmd, "faces")) return cmd_faces(argc, argv);
     if (!strcmp(cmd, "flatten-warp")) return cmd_flatten_warp(argc, argv);
     if (!strcmp(cmd, "strip")) return cmd_strip(argc, argv);
     if (!strcmp(cmd, "strip-flatten")) return cmd_strip_flatten(argc, argv);

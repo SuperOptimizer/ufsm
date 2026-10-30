@@ -216,11 +216,25 @@ typedef struct {
     int half, fit; int w1, h1, ow, oh;     /* stages: half -> w1 x h1; fit -> ow x oh */
     pcoef ah, av, bh, bv;
     uint8_t *out; int rows; _Atomic int next;
+    int rgb[2], ctmin;                     /* rgb[0] >= 0: one agreement panel, R = B = ink rgb[0], G = ink rgb[1]; CT < ctmin dark grey */
 } p3_job;
 typedef struct { uint8_t *buf; int *tag; int cap; size_t len; } p3ring;
 static void p3_full_row(p3_job *J, icstrip *c, int y, uint8_t *row) {   /* ink_panels' row y */
     icx *X = J->X; const int W = X->W;
     memset(row, 255, (size_t)J->TW * 3);
+    if (J->rgb[0] >= 0) {   /* recto (magenta) x verso (green): both white, neither black */
+        const uint8_t *m = ic_row(X, 0, &c[0], y), *a = ic_row(X, J->rgb[0], &c[J->rgb[0]], y), *b = ic_row(X, J->rgb[1], &c[J->rgb[1]], y);
+        if (!m || !a || !b) return;
+        const uint8_t *La = J->lut[J->rgb[0]], *Lb = J->lut[J->rgb[1]];
+        for (int x = 0; x < W; x++) {
+            uint8_t *o = row + 3 * x;
+            if (!m[x] || m[x] < J->ctmin) { o[0] = o[1] = o[2] = 40; continue; }
+            o[0] = o[2] = La[a[x]]; o[1] = Lb[b[x]];
+        }
+        const uint8_t yel[3] = {255, 220, 0}; const int sc = J->sc;
+        if (y >= 2 * sc && y < 2 * sc + 7 * sc && J->lab[0]) img_text_scaled(row, J->TW, 1, 2 * sc, 2 * sc - y, J->lab[0], sc, yel);
+        return;
+    }
     for (int p = 0; p < J->np; p++) {
         const int k = J->first + p; const uint8_t *s = ic_row(X, k, &c[k], y), *L = J->lut[k];
         uint8_t *o = row + (size_t)p * (W + 8) * 3;
@@ -274,11 +288,13 @@ out:
     return nullptr;
 }
 /* panels first .. first + np - 1 -> RGB *ow x *oh (as ink_panels + img_fit_rgb) */
-static uint8_t *p3_panels(icx *X, int first, int np, uint8_t lut[NIMG][256], const char *const *lab, int half, int maxpx, int *owp, int *ohp) {
+static uint8_t *p3_panels(icx *X, int first, int np, uint8_t lut[NIMG][256], const char *const *lab, int half, int maxpx, int *owp, int *ohp, const int *rgb, int ctmin) {
     p3_job *J = calloc(1, sizeof *J); if (!J) return nullptr;
     J->X = X; J->np = np; J->first = first; memcpy(J->lut, lut, sizeof J->lut);
+    J->rgb[0] = rgb ? rgb[0] : -1; J->rgb[1] = rgb ? rgb[1] : -1; J->ctmin = ctmin;
     for (int p = 0; p < np; p++) J->lab[p] = lab ? lab[p] : nullptr;
     J->TW = np * X->W + 8 * (np - 1); J->H0 = X->H; J->sc = X->H / 200 > 1 ? X->H / 200 : 2;
+    if (J->rgb[0] >= 0 && lab && lab[0]) { const int fit = J->TW / (8 * (int)strlen(lab[0]) + 8); if (J->sc > fit) J->sc = fit > 1 ? fit : 1; }   /* the legend fits the one panel */
     J->half = half; J->w1 = half ? J->TW / 2 : J->TW; J->h1 = half ? X->H / 2 : X->H;
     uint8_t *ret = nullptr;
     if (J->w1 < 1 || J->h1 < 1) goto done;
@@ -424,12 +440,21 @@ int cmd_ink_compare(int argc, char **argv) {
             const char *suf = icopt(argc, argv, "--each-suffix", ""); const int ect = icflag(argc, argv, "--each-ct");
             for (int k = ect ? 0 : 1; k < n; k++) {
                 char p[1400]; snprintf(p, sizeof p, "%s%s%s.jpg", each, lab[k], suf);
-                int ow, oh; uint8_t *rgb = p3_panels(&X, k, 1, lut, nullptr, half, maxpx, &ow, &oh);
+                int ow, oh; uint8_t *rgb = p3_panels(&X, k, 1, lut, nullptr, half, maxpx, &ow, &oh, nullptr, 0);
                 if (!rgb || jpeg_write_rgb(p, ow, oh, rgb, jq)) { fprintf(stderr, "ink-compare: cannot write %s\n", p); rc = 1; }
                 free(rgb);
             }
+        } else if (icopt(argc, argv, "--rgb-agree", nullptr)) {   /* one RGB panel: recto ink R + B (magenta), verso ink G; agreement white */
+            char la[128] = "", lb[128] = ""; int ix[2] = {-1, -1};
+            if (sscanf(icopt(argc, argv, "--rgb-agree", ""), "%127[^,],%127s", la, lb) == 2)
+                for (int k = 1; k < n; k++) { if (!strcmp(lab[k], la)) ix[0] = k; if (!strcmp(lab[k], lb)) ix[1] = k; }
+            if (ix[0] < 0 || ix[1] < 0) { fprintf(stderr, "ink-compare: --rgb-agree RECTO,VERSO (two --ink labels)\n"); rc = 2; goto end; }
+            char title[300]; snprintf(title, sizeof title, "%s=magenta %s=green both=white", la, lb); const char *tl[1] = {title};
+            int ow, oh; uint8_t *rgb = p3_panels(&X, 0, 1, lut, tl, half, maxpx, &ow, &oh, ix, atoi(icopt(argc, argv, "--rgb-ct-min", "1")));
+            if (!rgb || jpeg_write_rgb(argv[2], ow, oh, rgb, jq)) { fprintf(stderr, "ink-compare: cannot write %s\n", argv[2]); rc = 1; }
+            free(rgb);
         } else {
-            int ow, oh; uint8_t *rgb = p3_panels(&X, 0, n, lut, lab, half, maxpx, &ow, &oh);
+            int ow, oh; uint8_t *rgb = p3_panels(&X, 0, n, lut, lab, half, maxpx, &ow, &oh, nullptr, 0);
             if (!rgb || jpeg_write_rgb(argv[2], ow, oh, rgb, jq)) { fprintf(stderr, "ink-compare: cannot write %s\n", argv[2]); rc = 1; }
             free(rgb);
         }

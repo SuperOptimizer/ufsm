@@ -186,6 +186,30 @@ row by row). Both write the same bytes as before; a whole Paris 3 wrap (338 cm²
 renders) took render 5:28 -> 1:37 and ink-compare 1:37 / 51.6 GB -> 0:19 / 0.47 GB.
 `UFSM_RENDER_TILED=1` and `UFSM_INKCMP_MEM=1` select the old paths.
 
+## Recto and verso faces
+
+A wrap is a level set W = k of the smooth winding field. It follows the sheet but can sit anywhere
+across the sheet or in the gap next to it. `ufsm faces` (`src/faces.h`) finds the two faces of the
+papyrus sheet under each vertex. It samples the CT along the outward normal and splits the profile
+into bands (persistence-simplified extrema, so a shallow fibre-layer dip does not split a sheet).
+Each band's edges sit at the half level between its peak and the minimum on that side; a high
+valley between touching sheets is an edge. The pick is made consistent over the surface with
+median windows, then median filtered, and holes are filled by push-pull. Output per wrap, on the
+input grid: `<w>_recto` (inner face, toward the umbilicus) and `<w>_verso` (outer face), plus
+`conf.tif` / `thick.tif` in `<w>_recto` and `<w>_faces.txt`.
+
+Recto is the inner face because of the published-label side rule (`band_field_side_pair`): the
+papyrus outward of wrap k is labelled recto side. Run it on the flattened grid, so both faces share
+one uv and render pixel-aligned. `ink-compare --rgb-agree recto,verso` writes the agreement image:
+recto ink is magenta, verso ink is green, and both together are white.
+
+```sh
+build/ufsm faces flat faces --ct CT 2 --ct-um 9.6 --umb umbilicus.json --umb-um 2.4 [--gt codes.zarr 9.6 --gt-um 9.6]
+build/ufsm tifxyz-scale faces up 1 --flip-rows 1
+build/ufsm render up r --volume ink.zarr 9.6 --ct CT 2 --depth 1 --scale 2
+build/ufsm ink-compare w_rgb.jpg --ct r/w_recto_ct.tif --ink recto=r/w_recto.tif --ink verso=r/w_verso.tif --rgb-agree recto,verso --stretch --px-um 4.8
+```
+
 ## Prediction input transform
 
 `predict --input-gain G --input-bias B` exposes the standardized CT transform

@@ -737,7 +737,7 @@ int ink_compare_mem(int argc, char **argv);
 int ink_compare_mem(int argc, char **argv) {   /* the in-memory version (inkcompare.c streams; same bytes) */
     const int ci = rarg(argc, argv, "--ct");
     if (argc < 5 || ci < 0 || ci + 1 >= argc || rarg(argc, argv, "--ink") < 0) {
-        fprintf(stderr, "usage: ufsm ink-compare <out.jpg> --ct CT.tif --ink LABEL=INK.tif [--ink LABEL=INK.tif ..] [--px-um 2.4] [--rs-um 25] [--rl-um 500] [--crop x,y,w,h | --crop-frac fx,fy,w,h | --best-crop N] [--stretch | --fixed LO,HI] [--stretch-ct] [--full] [--each PREFIX [--each-suffix S] [--each-ct]] [--max-px N] [--quality 90] [--threads 16]\n"); return 2;
+        fprintf(stderr, "usage: ufsm ink-compare <out.jpg> --ct CT.tif --ink LABEL=INK.tif [--ink LABEL=INK.tif ..] [--px-um 2.4] [--rs-um 25] [--rl-um 500] [--crop x,y,w,h | --crop-frac fx,fy,w,h | --best-crop N] [--stretch | --fixed LO,HI] [--stretch-ct] [--full] [--each PREFIX [--each-suffix S] [--each-ct]] [--rgb-agree RECTO,VERSO [--rgb-ct-min 1]] [--max-px N] [--quality 90] [--threads 16]\n"); return 2;
     }
     const double px = atof(ropt(argc, argv, "--px-um", "2.4")), rsu = atof(ropt(argc, argv, "--rs-um", "25")), rlu = atof(ropt(argc, argv, "--rl-um", "500"));
     const int nthreads = atoi(ropt(argc, argv, "--threads", "16"));
