@@ -251,6 +251,15 @@ int main(void) {
             const int k = ink[(size_t)y * W + x] > 128; lum[k] += q[0] + q[1] + q[2]; cnt[k]++;
         }
         CHECK(nn > 0 && warm > nn * 9 / 10, "papyrus: %ld of %ld pixels warm", warm, nn);
+        {   /* --papyrus-floor median: no papyrus pixel darker than the floor's colour, so the mean brightens */
+            char o2[760]; snprintf(o2, sizeof o2, "%s/p2.jpg", dir);
+            char *b[] = {"ufsm", "ink-compare", o2, "--ct", cp, "--ink", ia, "--papyrus", "gamb", "--papyrus-floor", "median", "--stretch", "--stretch-ct", "--full", "--threads", "2", nullptr};
+            CHECK(run(cmd_ink_compare, b, sv) == 0, "papyrus floor rc");
+            int w2 = 0, h2 = 0; uint8_t *k = jpeg_read_rgb(o2, &w2, &h2); double s0 = 0, s1 = 0;
+            for (size_t i = 0; j && k && w2 == w && h2 == h && i < (size_t)w * h * 3; i++) { s0 += j[i]; s1 += k[i]; }
+            CHECK(k && s1 > s0, "papyrus floor: not brighter (%.0f vs %.0f)", s1, s0);
+            free(k);
+        }
         if (cnt[0] && cnt[1]) CHECK(lum[1] / cnt[1] < lum[0] / cnt[0], "papyrus: inked pixels not darker");
         free(j);
     }
