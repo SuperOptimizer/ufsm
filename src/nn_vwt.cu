@@ -498,3 +498,15 @@ extern "C" int vt_shell_loss(const float *ph, const uint8_t *shell, const uint16
     (void)lam_s;
     return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }
+
+/* [a | float(b bf16)] per row */
+static __global__ void k_cat_bf16(const float *a, int ca, const uint16_t *b, int cb, long long rows, float *y) {
+    const int C = ca + cb;
+    for (long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; i < rows * C; i += (long long)gridDim.x * blockDim.x) {
+        const long long r = i / C; const int c = (int)(i % C);
+        y[i] = c < ca ? a[r * ca + c] : __uint_as_float((unsigned)b[r * cb + (c - ca)] << 16);
+    }
+}
+extern "C" void vt_cat_bf16(const float *a, int ca, const uint16_t *b, int cb, long long rows, float *y) {
+    k_cat_bf16<<<4096, 256>>>(a, ca, b, cb, rows, y);
+}

@@ -47,7 +47,12 @@ struct vws {
 
 /* ---- augmentation (src/vwt_aug.h; DA): vwt-train passes its argv here before vws_open; training slabs only ---- */
 static vwa_cfg g_vwa; static int g_vwa_ok;
+static double g_mv_p = 0, g_mv_cone = 30, g_mv_shift = 16;   /* multiview pairs (vwt.h vws_sample.has_pair) */
 void vws_set_args(int argc, char **argv) {
+    for (int i = argc - 2; i >= 1; i--) if (!strcmp(argv[i], "--mv-p")) { g_mv_p = atof(argv[i + 1]); break; }
+    for (int i = argc - 2; i >= 1; i--) if (!strcmp(argv[i], "--mv-cone")) { g_mv_cone = atof(argv[i + 1]); break; }
+    for (int i = argc - 2; i >= 1; i--) if (!strcmp(argv[i], "--mv-shift")) { g_mv_shift = atof(argv[i + 1]); break; }
+    if (g_mv_p > 0) fprintf(stderr, "vws: multiview pairs p %.2f, cone %.0f deg, centre shift <= %.0f voxels\n", g_mv_p, g_mv_cone, g_mv_shift);
     g_vwa = vwa_cfg_default();
     if (vwa_cfg_parse(&g_vwa, argc, argv)) exit(2);
     g_vwa_ok = 1; vwa_cfg_print(&g_vwa);
@@ -151,6 +156,45 @@ static void vp_print(void) {
     for (int k = 0; k < VP_N; k++) fprintf(stderr, " %s %.3f", vp_name[k], vp_ns[k] / 1e9 / vp_slabs);
     fprintf(stderr, "; rejected:"); for (int k = 0; k < VR_N; k++) fprintf(stderr, " %s %lld", vr_name[k], vr_n[k]); fprintf(stderr, "\n");
 }
+/* the multiview pair of an undeformed slab `out` (vwt.h): direction within g_mv_cone of d, centre shifted <= g_mv_shift per axis; CT
+   only (trilinear, as the slab), outside any holdout box; 0 = filled */
+static int vws_pair(vws *V, uint64_t *rs, vws_work *w, vws_src *S, vws_sample *out) {
+    const int T = V->T, L = V->L; const size_t n = (size_t)T * T * L;
+    const double th = acos(1 - vws_unif(rs) * (1 - cos(g_mv_cone * M_PI / 180))), ph = vws_unif(rs) * 2 * M_PI;   /* uniform on the cap */
+    double dir[3]; for (int e = 0; e < 3; e++) dir[e] = cos(th) * out->d[e] + sin(th) * (cos(ph) * out->a[e] + sin(ph) * out->b[e]);
+    double c[3]; for (int e = 0; e < 3; e++) c[e] = out->o[e] + 0.5 * (T - 1) * (out->a[e] + out->b[e]) + 0.5 * (L - 1) * out->d[e] + (2 * vws_unif(rs) - 1) * g_mv_shift;
+    double ro[3]; for (int e = 0; e < 3; e++) ro[e] = c[e] - 0.5 * (L - 1) * dir[e];
+    vws_frame(dir, ro, T, out->po, out->pa, out->pb, out->pd);
+    double lo[3] = {1e300, 1e300, 1e300}, hi[3] = {-1e300, -1e300, -1e300};
+    for (int k = 0; k < 8; k++) for (int e = 0; e < 3; e++) {
+        const double v = out->po[e] + (k & 1 ? T - 1 : 0) * out->pa[e] + (k & 2 ? T - 1 : 0) * out->pb[e] + (k & 4 ? L - 1 : 0) * out->pd[e];
+        lo[e] = fmin(lo[e], v); hi[e] = fmax(hi[e], v);
+    }
+    for (int b = 0; b < S->nbox; b++) { const double *B = S->box[b]; if (hi[2] >= B[0] && lo[2] < B[0] + B[3] && hi[1] >= B[1] && lo[1] < B[1] + B[4] && hi[0] >= B[2] && lo[0] < B[2] + B[5]) return -1; }
+    const int64_t *Vs = z3_meta_of(S->ct)->shape; int64_t bo[3], bn[3];
+    for (int e = 0; e < 3; e++) { const int x = 2 - e; int64_t a = (int64_t)floor(lo[x]) - 1, b = (int64_t)ceil(hi[x]) + 2; a = a < 0 ? 0 : a; b = b > Vs[e] ? Vs[e] : b; if (b - a < 2) return -1; bo[e] = a; bn[e] = b - a; }
+    const size_t need = (size_t)bn[0] * bn[1] * bn[2];
+    if (need > w->ccap) { free(w->ct); w->ct = malloc(need); w->ccap = need; if (!w->ct) { w->ccap = 0; return -1; } }
+    if (zcache_read(V->zc, S->ct, bo, bn, w->ct)) return -1;
+    size_t nin = 0;
+    for (int i = 0; i < T; i++) for (int j = 0; j < T; j++) for (int k = 0; k < L; k++) {
+        const size_t v = ((size_t)i * T + j) * L + k;
+        const double x = out->po[0] + i * out->pa[0] + j * out->pb[0] + k * out->pd[0], y = out->po[1] + i * out->pa[1] + j * out->pb[1] + k * out->pd[1],
+                     z = out->po[2] + i * out->pa[2] + j * out->pb[2] + k * out->pd[2];
+        if (!(x >= 0 && y >= 0 && z >= 0 && x <= Vs[2] - 1 && y <= Vs[1] - 1 && z <= Vs[0] - 1)) { out->pim[v] = 0; out->pva[v] = 0; continue; }
+        const double lz = z - bo[0], ly = y - bo[1], lx = x - bo[2];
+        int iz = (int)floor(lz), iy = (int)floor(ly), ix = (int)floor(lx);
+        iz = iz < 0 ? 0 : iz > bn[0] - 2 ? (int)bn[0] - 2 : iz; iy = iy < 0 ? 0 : iy > bn[1] - 2 ? (int)bn[1] - 2 : iy; ix = ix < 0 ? 0 : ix > bn[2] - 2 ? (int)bn[2] - 2 : ix;
+        const double fz = lz - iz, fy = ly - iy, fx = lx - ix;
+        const uint8_t *B = w->ct + ((size_t)iz * bn[1] + iy) * bn[2] + ix; const size_t sy = bn[2], sz = (size_t)bn[1] * bn[2];
+        const double val = (1 - fz) * ((1 - fy) * ((1 - fx) * B[0] + fx * B[1]) + fy * ((1 - fx) * B[sy] + fx * B[sy + 1]))
+                         + fz * ((1 - fy) * ((1 - fx) * B[sz] + fx * B[sz + 1]) + fy * ((1 - fx) * B[sz + sy] + fx * B[sz + sy + 1]));
+        const int u = (int)lround(val); out->pim[v] = (uint8_t)(u < 0 ? 0 : u > 255 ? 255 : u); out->pva[v] = 1; nin++;
+    }
+    if (nin < n / 4) return -1;
+    if (g_vwa_ok) vwa_intensity(&g_vwa, vws_rng(rs), out->pim, out->pva, T, L);
+    return 0;
+}
 static int vws_fill(vws *V, uint64_t *rs, vws_work *w, vws_sample *out) {
     if (vp_on < 0) vp_on = getenv("UFSM_VWS_PROF") && atoi(getenv("UFSM_VWS_PROF")) > 0;
     long long vp_t = vp_on ? vp_now() : 0;
@@ -179,6 +223,7 @@ static int vws_fill(vws *V, uint64_t *rs, vws_work *w, vws_sample *out) {
         const double f = ldexp(1, S->plv - S->lv), fd = S->ph ? f : ldexp(1, S->shlv - S->lv);   /* CT voxels per GT / drawn-raster voxel */
         const double pz = (cz * S->csz[0] + vws_unif(rs) * S->csz[0]) * fd, py = (cy * S->csz[1] + vws_unif(rs) * S->csz[1]) * fd, px = (cx * S->csz[2] + vws_unif(rs) * S->csz[2]) * fd;
         double ay = 0, ax = 0; if (S->hasax) { axis_at(&S->ax, pz * S->l0s, &ay, &ax); ay /= S->l0s; ax /= S->l0s; }
+        out->axp[0] = ax; out->axp[1] = ay; out->axp[2] = pz; out->has_pair = 0; out->um = S->um0 * S->l0s;
         double rd[3] = {px - ax, py - ay, 0}; double rn = hypot(rd[0], rd[1]); if (rn < 1) { rd[0] = 1; rd[1] = 0; rn = 1; } rd[0] /= rn; rd[1] /= rn;
         /* tilt <= tilt_deg in a random azimuth: d = cos t r + sin t (cos phi z + sin phi (z x r)) */
         const double tt = vws_unif(rs) * V->tilt * M_PI / 180, phi = vws_unif(rs) * 2 * M_PI; const double zr[3] = {-rd[1], rd[0], 0};
@@ -336,6 +381,7 @@ static int vws_fill(vws *V, uint64_t *rs, vws_work *w, vws_sample *out) {
         if (g_vwa_ok && V->train) vwa_intensity(&g_vwa, vws_rng(rs), out->im, out->va, T, L);
         VP(VP_INTENS); if (vp_on) { atomic_fetch_add(&vp_slabs, 1); atomic_fetch_add(&vp_geo, geo); }
         out->T = T; out->L = L; out->src = si; out->flags = inward;
+        if (V->train && g_mv_p > 0 && !geo && out->pim && vws_unif(rs) < g_mv_p) out->has_pair = vws_pair(V, rs, w, S, out) == 0;
         return 0;
     }
     return -1;
@@ -484,6 +530,7 @@ vws *vws_open(const char *sources_json, int T, int L, float tilt_deg, int nthrea
     for (int s = 0; s < V->nslot; s++) {
         vws_sample *o = &V->slot[s].s; o->im = malloc(n); o->va = malloc(n); o->ph = malloc(n * 4); o->comp = malloc(n * 2); o->pw = malloc(n * 4);
         o->shell = V->has_shell ? malloc(n) : nullptr;
+        o->pim = train && g_mv_p > 0 ? malloc(n) : nullptr; o->pva = o->pim ? malloc(n) : nullptr;
         if (!o->im || !o->va || !o->ph || !o->comp || !o->pw) { fprintf(stderr, "vws: out of memory\n"); return nullptr; }
     }
     V->th = calloc(V->nth, sizeof *V->th);
@@ -499,7 +546,7 @@ void vws_close(vws *V) {
         for (int t = 0; t < V->nth; t++) pthread_join(V->th[t], nullptr);
         pthread_mutex_destroy(&V->mu); pthread_cond_destroy(&V->cv);
     }
-    for (int s = 0; V->slot && s < V->nslot; s++) { vws_sample *o = &V->slot[s].s; free(o->im); free(o->va); free(o->ph); free(o->comp); free(o->pw); free(o->shell); }
+    for (int s = 0; V->slot && s < V->nslot; s++) { vws_sample *o = &V->slot[s].s; free(o->im); free(o->va); free(o->ph); free(o->comp); free(o->pw); free(o->shell); free(o->pim); free(o->pva); }
     for (int s = 0; s < V->ns; s++) { vws_src *S = &V->S[s]; if (S->ct) z3_close(S->ct); if (S->ph) z3_close(S->ph); if (S->sh) z3_close(S->sh); free(S->chunks); free(S->ok); free(S->box); free(S->seg); }
     if (V->zc) { uint64_t h, m; size_t by; zcache_stats(V->zc, &h, &m, &by); if (vp_on > 0) fprintf(stderr, "vws: chunk cache %llu hits, %llu misses, %.2f GB held\n", (unsigned long long)h, (unsigned long long)m, by / 1e9); zcache_close(V->zc); }
     free(V->S); free(V->slot); free(V->th); free(V);
