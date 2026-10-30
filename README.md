@@ -161,6 +161,19 @@ against each method's uncorrupted fit after integer gauge alignment. Approximate
 stability needs further work.
 Whole-scroll topology and accuracy are not established by these local checks.
 
+## Core wraps
+
+`ufsm wraps` spaces columns at `--step` along the arc of each wrap's root on the ray through the box centre at mid z.
+A core wrap leaves the axis near that z, so its root there is tiny and its columns land far apart wherever else it reaches
+(Paris 4 w085: 29 columns). `--col-r p90` uses the 90th percentile of the wrap's roots over the rows' z range instead
+(or `--col-r R`, native voxels). `--zr Z0,Z1` keeps only rows at global native z in [Z0, Z1], for example to drop a broken end cap.
+It also restricts the z range in which wrap ids are sampled. `--first` and `--last` are taken exactly as given, because box
+samples can miss W near the axis. Paris 4 core (W at the umbilicus 78-93):
+
+```sh
+build/ufsm wraps joined core --step 4 --out-um 9.6 --sfc 0.25 --fields F --first 70 --last 105 --zr 384,18176 --col-r p90
+```
+
 ## Flattening wraps
 
 Wraps are parameterized by column = angle and row = z, so their renders are sheared and stretched
