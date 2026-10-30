@@ -74,6 +74,15 @@ int main(int argc, char **argv) {
                 }
                 t[f][0] = bf * 1e3; t[f][1] = bb * 1e3;
             }
+            {   /* the fast backward split: data gradient alone, weight gradient alone */
+                vt_t g0 = gxf; g0.p = nullptr; double bd = 1e9, bw = 1e9;
+                for (int it = 0; it < 4; it++) {
+                    nn_sync(); double t0 = now(); vtf_conv_bwd(x, gy, w, q->k, s, s, 1, gxf, nullptr, nullptr, scf); nn_sync(); double t1 = now();
+                    vtf_conv_bwd(x, gy, w, q->k, s, s, 1, g0, gwf, nullptr, scf); nn_sync(); double t2 = now();
+                    if (t1 - t0 < bd) bd = t1 - t0; if (t2 - t1 < bw) bw = t2 - t1;
+                }
+                printf("  fast bwd split: data %.2f ms, weights %.2f ms\n", bd * 1e3, bw * 1e3);
+            }
             const int m = stems(q->nm);
             printf("  ref fwd %.2f bwd %.2f ms | fast fwd %.2f bwd %.2f ms (x%d per slab)\n", t[0][0], t[0][1], t[1][0], t[1][1], m);
             tot_ref += m * (t[0][0] + t[0][1]); tot_fast += m * (t[1][0] + t[1][1]);
