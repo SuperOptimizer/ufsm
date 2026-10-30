@@ -190,6 +190,17 @@ static int vws_fill(vws *V, uint64_t *rs, vws_work *w, vws_sample *out) {
         /* the source lattice q (xyz); the geometric aug hook replaces it (src/vwt_aug.h): CT and labels are both read at q */
         if (vp_on) atomic_fetch_add(&vp_tries, 1);
         VP(VP_FRAME);
+        {   /* early holdout test on the undeformed slab's bbox (no I/O, no map yet): a slab touching a holdout there is dropped at once */
+            double lo0[3] = {1e300, 1e300, 1e300}, hi0[3] = {-1e300, -1e300, -1e300};
+            for (int c = 0; c < 8; c++) for (int e = 0; e < 3; e++) {
+                const double v = out->o[e] + (c & 1 ? T - 1 : 0) * out->a[e] + (c & 2 ? T - 1 : 0) * out->b[e] + (c & 4 ? L - 1 : 0) * out->d[e];
+                lo0[e] = fmin(lo0[e], v); hi0[e] = fmax(hi0[e], v);
+            }
+            int bad0 = 0;
+            for (int b = 0; b < S->nbox && !bad0; b++) { const double *B = S->box[b];
+                bad0 = hi0[2] >= B[0] && lo0[2] < B[0] + B[3] && hi0[1] >= B[1] && lo0[1] < B[1] + B[4] && hi0[0] >= B[2] && lo0[0] < B[2] + B[5]; }
+            if (bad0) REJ(VR_HOLD)
+        }
         vwa *ga = nullptr; int geo = 0; out->T = T; out->L = L;
         if (g_vwa_ok && V->train && g_vwa.on && g_vwa.geo_p > 0) {
             if (!w->arena) w->arena = malloc(VWS_ARENA);
