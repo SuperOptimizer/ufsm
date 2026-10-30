@@ -14,13 +14,13 @@ once() {
     local o=$RUNROOT/$r
     echo "-- $r$([ -e $o.stop ] && echo ' (stop file)')"
     [ -s $o.lane ] && tail -2 $o.lane | sed 's/^/  lane: /'
-    [ -s $o.log ] && grep -E '^step|error|rror' $o.log | tail -${NLOG:-2} | cut -c1-220 | sed 's/^/  log: /'
-    ls -t $o/*.ckpt 2>/dev/null | head -3 | while read -r c; do echo "  ckpt: $(basename $c) $(date -r $c '+%m-%d %H:%M')"; done
+    [ -s $o.log ] && { [ -s $o/log.tsv ] && tail -1 $o/log.tsv; grep -E 'rror' $o.log; } | tail -${NLOG:-2} | cut -c1-220 | sed 's/^/  log: /'
+    ls -t $o/*.vwt 2>/dev/null | head -3 | while read -r c; do echo "  ckpt: $(basename $c) $(date -r $c '+%m-%d %H:%M')"; done
     if [ "${KEEP:-0}" -gt 0 ]; then
       mkdir -p $o/keep
-      for c in $o/*.ckpt; do [ -e "$c" ] || continue; local t=$(date -r $c +%s); [ $(( $(date +%s) - t )) -lt 60 ] && continue   # (still being written)
+      for c in $o/step_*.vwt; do [ -e "$c" ] || continue; local t=$(date -r $c +%s); [ $(( $(date +%s) - t )) -lt 60 ] && continue   # (still being written)
         local k=$o/keep/$(basename ${c%.ckpt})-$t.ckpt; [ -e $k ] || cp $c $k; done
-      ls -t $o/keep/*.ckpt 2>/dev/null | tail -n +$((KEEP + 1)) | while read -r c; do rm -f -- "$c"; done
+      ls -t $o/keep/*.vwt 2>/dev/null | tail -n +$((KEEP + 1)) | while read -r c; do rm -f -- "$c"; done
     fi
   done
 }
