@@ -253,6 +253,9 @@ test-all: $(B)/test_dino_loss
 $(B)/test_attn: tests/test_attn.c $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_attn.c $(B)/nn.o $(B)/nn_fp8.o -o $@ $(LDLIBS) $(CUDALIBS)
 test-all: $(B)/test_attn
+$(B)/test_vwt_fast: tests/test_vwt_fast.c $(B)/nn.o $(B)/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_vwt_fast.c $(B)/nn.o $(B)/nn_fp8.o -o $@ $(LDLIBS) $(CUDALIBS)
+test-all: $(B)/test_vwt_fast
 $(B)/test_vwt: tests/test_vwt.c $(B)/vwt_net.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_vwt.c $(B)/vwt_net.o $(B)/nn.o $(B)/nn_fp8.o -o $@ $(LDLIBS) $(CUDALIBS)
 test-all: $(B)/test_vwt
@@ -526,6 +529,7 @@ test-all: $(B)/test_gpu_aug $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover 
 	./$(B)/test_sslstat
 	./$(B)/test_attn
 	./$(B)/test_vwt
+	./$(B)/test_vwt_fast
 	./$(B)/test_attn_ray
 	./$(B)/test_attn_dfm
 	./$(B)/test_hybrid_identity
