@@ -139,6 +139,25 @@ int main(void) {
           ref_render(X, Y, Z, w, h, gs, dense[1], shape, 1, r1, ow, oh);
           CHECK(!render_wrap_chunked(z1, 1, d1, X, Y, Z, w, h, gs, im, ow, oh, nullptr, 1, 2, 4, 0) && !memcmp(im[0], r1, no), "one volume");
           free(im[0]); free(r1); }
+        /* render_wraps_chunked: this grid and a second one 3 voxels outward (with its own holes) in one pass = each grid alone */
+        {
+            float *X2 = malloc(sizeof(float) * w * h), *Y2 = malloc(sizeof(float) * w * h), *Z2 = malloc(sizeof(float) * w * h);
+            for (size_t i = 0; i < (size_t)w * h; i++) {
+                const double dx = X[i] - 135, dy = Y[i] - 130, rr = hypot(dx, dy);
+                X2[i] = Z[i] < 0 ? -1 : (float)(135 + dx * (rr + 3) / rr); Y2[i] = Z[i] < 0 ? -1 : (float)(130 + dy * (rr + 3) / rr); Z2[i] = Z[i];
+                if (i % 97 == 5) X2[i] = Y2[i] = Z2[i] = -1;
+            }
+            uint8_t *r2[2]; for (int v = 0; v < 2; v++) { r2[v] = calloc(no, 1); ref_render(X2, Y2, Z2, w, h, gs, dense[v], shape, dp[v], r2[v], ow, oh); }
+            const float *const XS[2] = {X, X2}, *const YS[2] = {Y, Y2}, *const ZS[2] = {Z, Z2};
+            for (int bi = 0; bi < 3; bi += 2) {
+                uint8_t *im[4] = {calloc(no, 1), calloc(no, 1), calloc(no, 1), calloc(no, 1)};
+                CHECK(!render_wraps_chunked(zz, 2, dp, 2, XS, YS, ZS, w, h, gs, im, ow, oh, nullptr, budgets[bi], 3, 2, 0), "render_wraps_chunked");
+                CHECK(!memcmp(im[0], ref[0], no) && !memcmp(im[1], ref[1], no), "joint budget %zu: grid 0 differs", budgets[bi]);
+                CHECK(!memcmp(im[2], r2[0], no) && !memcmp(im[3], r2[1], no), "joint budget %zu: grid 1 differs", budgets[bi]);
+                for (int k = 0; k < 4; k++) free(im[k]);
+            }
+            free(r2[0]); free(r2[1]); free(X2); free(Y2); free(Z2);
+        }
         for (int v = 0; v < 2; v++) { z3_close(zz[v]); free(dense[v]); free(ref[v]); }
         free(X); free(Y); free(Z); free(buf);
     }
@@ -179,6 +198,27 @@ int main(void) {
             char x[800], y[800]; snprintf(x, sizeof x, "%s%s.jpg", e[0], k ? "gamb" : "ct"); snprintf(y, sizeof y, "%s%s.jpg", e[1], k ? "gamb" : "ct");
             CHECK(same_file(x, y), "case 1: %s differs", x);
         }
+    }
+    {   /* one call, several outputs (--then): the bytes of separate calls (rgb-agree full + fitted, panels without CT, --each fitted) */
+        char o1[760], o2[760], o3[760], e1[760], sv[760], r1[760], r2[760], r3[760], f1[760], g1[760];
+        snprintf(o1, sizeof o1, "%s/m1.jpg", dir); snprintf(o2, sizeof o2, "%s/m2.jpg", dir); snprintf(o3, sizeof o3, "%s/m3.jpg", dir); snprintf(e1, sizeof e1, "%s/me_", dir);
+        snprintf(r1, sizeof r1, "%s/s1.jpg", dir); snprintf(r2, sizeof r2, "%s/s2.jpg", dir); snprintf(r3, sizeof r3, "%s/s3.jpg", dir); snprintf(f1, sizeof f1, "%s/se_", dir);
+        snprintf(sv, sizeof sv, "%s/m.txt", dir);
+        char *m[] = {"ufsm", "ink-compare", o1, "--ct", cp, "--ink", ia, "--ink", ib, "--px-um", "4.8", "--stretch", "--stretch-ct", "--threads", "3", "--rgb-agree", "gamb,other",
+                     "--then", o2, "--rgb-agree", "gamb,other", "--max-px", "500",
+                     "--then", o3, "--cmap", "viridis", "--no-ct", "--max-px", "640",
+                     "--then", "-", "--cmap", "viridis", "--each", e1, "--each-suffix", "_v", "--max-px", "300", nullptr};
+        CHECK(run(cmd_ink_compare, m, sv) == 0, "--then rc");
+        char *s1[] = {"ufsm", "ink-compare", r1, "--ct", cp, "--ink", ia, "--ink", ib, "--px-um", "4.8", "--stretch", "--stretch-ct", "--threads", "2", "--rgb-agree", "gamb,other", nullptr};
+        char *s2[] = {"ufsm", "ink-compare", r2, "--ct", cp, "--ink", ia, "--ink", ib, "--px-um", "4.8", "--stretch", "--stretch-ct", "--threads", "2", "--rgb-agree", "gamb,other", "--max-px", "500", nullptr};
+        char *s3[] = {"ufsm", "ink-compare", r3, "--ct", cp, "--ink", ia, "--ink", ib, "--px-um", "4.8", "--stretch", "--stretch-ct", "--threads", "2", "--cmap", "viridis", "--no-ct", "--max-px", "640", nullptr};
+        char *s4[] = {"ufsm", "ink-compare", "-", "--ct", cp, "--ink", ia, "--ink", ib, "--px-um", "4.8", "--stretch", "--stretch-ct", "--threads", "2", "--cmap", "viridis", "--each", f1, "--each-suffix", "_v", "--max-px", "300", nullptr};
+        snprintf(g1, sizeof g1, "%s/s.txt", dir);
+        CHECK(run(cmd_ink_compare, s1, g1) == 0 && run(cmd_ink_compare, s2, g1) == 0 && run(cmd_ink_compare, s3, g1) == 0 && run(cmd_ink_compare, s4, g1) == 0, "separate rc");
+        CHECK(same_file(sv, g1), "--then: statistics differ");
+        CHECK(same_file(o1, r1) && same_file(o2, r2) && same_file(o3, r3), "--then: JPEG differs");
+        for (int k = 0; k < 2; k++) { char x[800], y[800]; snprintf(x, sizeof x, "%s%s_v.jpg", e1, k ? "other" : "gamb"); snprintf(y, sizeof y, "%s%s_v.jpg", f1, k ? "other" : "gamb");
+                                      CHECK(same_file(x, y), "--then: %s differs", x); }
     }
     {   /* --diff-agree: an ink against itself is viridis 0 on papyrus; against another ink, brighter */
         char o[760], ic[760], idd[760], sv[760]; snprintf(o, sizeof o, "%s/d.jpg", dir); snprintf(sv, sizeof sv, "%s/d.txt", dir);

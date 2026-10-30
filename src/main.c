@@ -3651,7 +3651,8 @@ static int cmd_blend(int argc, char **argv) {
     return 0;
 }
 static int cmd_render(int argc, char **argv) {
-    if (argc < 4) { fprintf(stderr, "usage: ufsm render <wraps-dir> <out-dir> --volume ROOT KEY [--ct ROOT KEY] [--cache DIR] [--scale 1] [--depth 8] [--tile 512] [--threads 16] [--crop x,y,w,h]\n"
+    if (argc < 4) { fprintf(stderr, "usage: ufsm render <wraps-dir> <out-dir> --volume ROOT KEY [--ct ROOT KEY] [--cache DIR] [--scale 1] [--depth 8] [--tile 512] [--threads 16] [--crop x,y,w,h] [--joint 1]\n"
+"  --joint 1: all wraps (one grid size) in one chunk-ordered pass, shared chunks decoded once\n"
                                      "  --crop: only that rectangle of each wrap's output pixels is rendered and written (e.g. a labelled region)\n"); return 2; }
     const int vi = arg_index(argc, argv, "--volume"), ci = arg_index(argc, argv, "--ct");
     int crop[4] = {0, 0, 0, 0}; const char *crs = opt(argc, argv, "--crop", nullptr);
@@ -3698,6 +3699,46 @@ static int cmd_render(int argc, char **argv) {
                 fprintf(stderr, "render: the wraps' box %lldx%lldx%lld read once\n", (long long)rn[0], (long long)rn[1], (long long)rn[2]);
             }
         }
+    }
+    /* --joint 1: every wrap of the directory (same grid size and step, e.g. one wrap's recto and verso faces on one flat uv) in one
+       chunk-ordered pass, so the chunks they share are decoded once; the outputs are those of separate renders, byte for byte */
+    if (atoi(opt(argc, argv, "--joint", "0")) && !rvol && !getenv("UFSM_RENDER_TILED")) {
+        enum { JMAX = 8 }; char *nm[JMAX]; float *JX[JMAX], *JY[JMAX], *JZ[JMAX]; int nj = 0, jw = 0, jh = 0, ok = 1; double jstep = 0;
+        while ((de = readdir(dd)) && ok) {
+            if (de->d_name[0] != 'w') continue;
+            if (nj == JMAX) { fprintf(stderr, "render: --joint takes at most %d wraps\n", JMAX); ok = 0; break; }
+            char p[1400]; int w, h, w2, h2, w3, h3;
+            snprintf(p, sizeof p, "%s/%s/x.tif", argv[2], de->d_name); float *X = read_tif_f32(p, &w, &h);
+            snprintf(p, sizeof p, "%s/%s/y.tif", argv[2], de->d_name); float *Y = read_tif_f32(p, &w2, &h2);
+            snprintf(p, sizeof p, "%s/%s/z.tif", argv[2], de->d_name); float *Z = read_tif_f32(p, &w3, &h3);
+            if (!X || !Y || !Z || w != w2 || w != w3 || h != h2 || h != h3 || w < 2 || h < 2) { free(X); free(Y); free(Z); continue; }
+            snprintf(p, sizeof p, "%s/%s/meta.json", argv[2], de->d_name);
+            double step = 1; { char *b = tfx_meta_read(p); const char *q = b ? strstr(b, "\"scale\":") : nullptr; if (q && (q = strchr(q, '['))) { const double sc = atof(q + 1); if (sc > 0) step = 1 / sc; } free(b); }
+            if (nj && (w != jw || h != jh || step != jstep)) { fprintf(stderr, "render: --joint: %s is %dx%d step %g, not %dx%d step %g\n", de->d_name, w, h, step, jw, jh, jstep); free(X); free(Y); free(Z); ok = 0; break; }
+            jw = w; jh = h; jstep = step; nm[nj] = strdup(de->d_name); JX[nj] = X; JY[nj] = Y; JZ[nj] = Z; nj++;
+        }
+        if (ok && nj) {
+            const double gs = jstep * scale; const int ow = render_out_px(jw, gs), oh = render_out_px(jh, gs), nvol = cz ? 2 : 1;
+            uint8_t *im[2 * JMAX] = {0};
+            for (int k = 0; k < nj * nvol && ok; k++) if (!(im[k] = calloc((size_t)ow * oh, 1))) { fprintf(stderr, "render: out of memory\n"); ok = 0; }
+            z3 *zs[2] = {vz, cz}; const int dp[2] = {depth, 0};
+            const size_t imgb = (size_t)ow * oh * nvol * nj, cb = cbudget > imgb + ((size_t)1 << 30) ? (size_t)cbudget - imgb : (size_t)1 << 30;
+            const int io = remote ? (nthreads > 32 ? nthreads : 32) : nthreads;
+            if (ok && render_wraps_chunked(zs, nvol, dp, nj, (const float *const *)JX, (const float *const *)JY, (const float *const *)JZ, jw, jh, gs, im, ow, oh,
+                                           crs ? crop : nullptr, cb, nthreads, io, 1)) { fprintf(stderr, "render: joint render failed\n"); ok = 0; }
+            for (int k = 0; k < nj && ok; k++) for (int v = 0; v < nvol && ok; v++) {
+                uint8_t *img = im[k * nvol + v]; int fw = ow, fh = oh;
+                if (crs) { uint8_t *c2 = img_crop_u8(img, ow, oh, crop[0], crop[1], crop[2], crop[3]); if (!c2) { ok = 0; break; } free(img); im[k * nvol + v] = img = c2; fw = crop[2]; fh = crop[3]; }
+                char p[1400]; snprintf(p, sizeof p, "%s/%s%s.tif", argv[3], nm[k], v ? "_ct" : "");
+                if (tiffw_write(p, fw, fh, 1, img, 1)) { fprintf(stderr, "render: cannot write %s\n", p); ok = 0; }
+            }
+            for (int k = 0; k < nj * nvol; k++) free(im[k]);
+        }
+        for (int k = 0; k < nj; k++) { free(nm[k]); free(JX[k]); free(JY[k]); free(JZ[k]); }
+        closedir(dd); free(rvol); free(rct);
+        if (!ok) return 1;
+        fprintf(stderr, "render: %d wraps written to %s (one pass)\n", nj, argv[3]);
+        return 0;
     }
     while ((de = readdir(dd))) {
         if (de->d_name[0] != 'w') continue;

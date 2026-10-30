@@ -62,6 +62,11 @@ float *img_read_f32(const char *path, int *w, int *h);     /* a float32 single-s
 struct z3;
 int render_wrap_chunked(struct z3 *const *vz, int nv, const int *depth, const float *X, const float *Y, const float *Z, int w, int h, double gs,
                         uint8_t *const *img, int ow, int oh, const int *crop, size_t budget, int nthreads, int io_threads, int verbose);
+/* the same for ns (1-8) wrap grids of one size and step rendered in one chunk-ordered pass (e.g. a wrap's recto and verso faces on one
+   flat uv): each block's chunks are those of the union of the grids' boxes, so shared chunks are decoded once; grid s, volume v goes to
+   img[s nv + v]. Every image equals render_wrap_chunked's of that grid alone, byte for byte. */
+int render_wraps_chunked(struct z3 *const *vz, int nv, const int *depth, int ns, const float *const *X, const float *const *Y, const float *const *Z,
+                         int w, int h, double gs, uint8_t *const *img, int ow, int oh, const int *crop, size_t budget, int nthreads, int io_threads, int verbose);
 uint8_t *img_read_u8(const char *path, int *w, int *h);    /* a uint8 single-sample TIFF */
 
 /* numpy.percentile(v, q) (method linear, numpy 2's _lerp) of n values; v is reordered. The float32 version is numpy's on float32

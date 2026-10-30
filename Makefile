@@ -235,6 +235,9 @@ test-all: $(B)/test_afv
 $(B)/test_flatten: tests/test_flatten.c $(B)/flatten.o $(B)/imgops.o $(B)/tiffw.o $(B)/tiff.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
 test-all: $(B)/test_flatten
+$(B)/test_flatten_gpu: tests/test_flatten.c $(B)/flatten.o $(B)/imgops.o $(B)/tiffw.o $(B)/tiff.o $(B)/nn_flat.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DFLAT_GPU $^ -o $@ $(LDLIBS) $(CUDALIBS)
+test-all: $(B)/test_flatten_gpu
 $(B)/test_strip: tests/test_strip.c $(B)/strip.o $(B)/flatten.o $(B)/imgops.o $(B)/tiffw.o $(B)/tiff.o $(B)/tfx.o $(B)/surfcomp.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
 test-all: $(B)/test_strip
@@ -550,6 +553,7 @@ test-all: $(B)/test_gpu_aug $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover 
 	./$(B)/test_repair
 	./$(B)/test_afv
 	./$(B)/test_flatten
+	./$(B)/test_flatten_gpu
 	./$(B)/test_strip
 	./$(B)/test_faces
 	./$(B)/test_fit_emb

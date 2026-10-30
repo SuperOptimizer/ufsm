@@ -41,6 +41,8 @@ typedef struct {
                            aligns them one by one); 0: the largest only (ufsm flatten) */
     const double *col_u;   /* optional (w entries, increasing): the initial map's u of each grid column instead of column x step (an arc-length
                               parametrisation starts SLIM nearer the optimum); nullptr: the grid map */
+    int gpu;            /* 1: SLIM iterations on the GPU when the binary has nn_flat.o and a device answers (same algorithm, fp64; else
+                           the CPU solver). 0 (default): CPU */
 } flat_opts;
 flat_opts flat_opts_default(void);
 

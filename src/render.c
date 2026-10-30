@@ -259,7 +259,7 @@ static int render_pass(z3 *z, rsheet *S, int ns, int k, const int *depth, int nd
 typedef struct { uint8_t v; int32_t ci; uint32_t first; } wdec;   /* decode list entry: volume, chunk, first group (1-based) */
 typedef struct {
     int nv; ctab T[2]; int depth[2]; uint32_t *first[2], *last[2];
-    const float *X, *Y, *Z; int w, h; double gs; uint8_t *const *img; int ow, oh;
+    int ns; const float *const *Xs, *const *Ys, *const *Zs; int w, h; double gs; uint8_t *const *img; int ow, oh;   /* grid s, volume v: img[s nv + v] */
     rblock *b; int32_t (*blo)[2][3], (*bhi)[2][3]; uint32_t *bgrp; size_t nb; uint32_t ng;
     wdec *dl; size_t ndl; uint8_t *ready; size_t *need;   /* need[g]: decode-list entries with first <= g (g 1-based) */
     size_t *frees; size_t *free0;                         /* per group g: decode entries whose last group is g, frees[free0[g] .. free0[g + 1]) */
@@ -297,14 +297,16 @@ static void *wr_decoder(void *arg) {
     return nullptr;
 }
 static void wr_block(const wrend *R, const rblock *B) {
-    const int w = R->w, h = R->h; const double gs = R->gs; const float *A[3] = {R->Z, R->Y, R->X};
+    const int w = R->w, h = R->h; const double gs = R->gs;
     const int py1 = B->py + RB < R->oh ? B->py + RB : R->oh, px1 = B->px + RB < R->ow ? B->px + RB : R->ow;
+    for (int si = 0; si < R->ns; si++) {
+    const float *A[3] = {R->Zs[si], R->Ys[si], R->Xs[si]}, *const Zg = R->Zs[si]; uint8_t *const *img = R->img + (size_t)si * R->nv;
     for (int py = B->py; py < py1; py++) for (int px = B->px; px < px1; px++) {
         const double gu = px / gs, gv = py / gs;
         int c0 = (int)gu, r0 = (int)gv; if (c0 >= w - 1) c0 = w - 2; if (r0 >= h - 1) r0 = h - 2; if (c0 < 0 || r0 < 0) continue;
         const double fu = gu - c0, fv = gv - r0;
         const size_t i00 = (size_t)r0 * w + c0, i01 = i00 + 1, i10 = i00 + w, i11 = i10 + 1;
-        if (!(R->Z[i00] >= 0 && R->Z[i01] >= 0 && R->Z[i10] >= 0 && R->Z[i11] >= 0)) continue;
+        if (!(Zg[i00] >= 0 && Zg[i01] >= 0 && Zg[i10] >= 0 && Zg[i11] >= 0)) continue;
         double P[3], du[3], dv[3];
         for (int d = 0; d < 3; d++) {
             const double a = A[d][i00], b = A[d][i01], c = A[d][i10], e = A[d][i11];
@@ -317,8 +319,9 @@ static void wr_block(const wrend *R, const rblock *B) {
         for (int v = 0; v < R->nv; v++) {
             float m = 0;
             for (int t = -R->depth[v]; t <= R->depth[v]; t++) { const float s = ct_trilin(&R->T[v], P[0] + t * N[0], P[1] + t * N[1], P[2] + t * N[2]); if (s > m) m = s; }
-            R->img[v][(size_t)py * R->ow + px] = (uint8_t)lroundf(m);
+            img[v][(size_t)py * R->ow + px] = (uint8_t)lroundf(m);
         }
+    }
     }
 }
 static void *wr_renderer(void *arg) {
@@ -355,10 +358,15 @@ static int wr_blk_cmp(const void *a, const void *b) {   /* by the first volume's
 }
 int render_wrap_chunked(z3 *const *vz, int nv, const int *depth, const float *X, const float *Y, const float *Z, int w, int h, double gs,
                         uint8_t *const *img, int ow, int oh, const int *crop, size_t budget, int nthreads, int io_threads, int verbose) {
-    if (nv < 1 || nv > 2 || w < 2 || h < 2) return -1;
+    const float *const Xs[1] = {X}, *const Ys[1] = {Y}, *const Zs[1] = {Z};
+    return render_wraps_chunked(vz, nv, depth, 1, Xs, Ys, Zs, w, h, gs, img, ow, oh, crop, budget, nthreads, io_threads, verbose);
+}
+int render_wraps_chunked(z3 *const *vz, int nv, const int *depth, int ns, const float *const *Xs, const float *const *Ys, const float *const *Zs,
+                         int w, int h, double gs, uint8_t *const *img, int ow, int oh, const int *crop, size_t budget, int nthreads, int io_threads, int verbose) {
+    if (nv < 1 || nv > 2 || ns < 1 || ns > 8 || w < 2 || h < 2) return -1;
     const double t0 = rnow();
     wrend *R = calloc(1, sizeof *R); if (!R) return -1;
-    R->nv = nv; R->X = X; R->Y = Y; R->Z = Z; R->w = w; R->h = h; R->gs = gs; R->img = img; R->ow = ow; R->oh = oh; R->budget = budget;
+    R->nv = nv; R->ns = ns; R->Xs = Xs; R->Ys = Ys; R->Zs = Zs; R->w = w; R->h = h; R->gs = gs; R->img = img; R->ow = ow; R->oh = oh; R->budget = budget;
     int dm = 0, rc = -1;
     for (int v = 0; v < nv; v++) {
         const z3_meta *zm = z3_meta_of(vz[v]); const int C = zm->chunk[0];
@@ -377,7 +385,8 @@ int render_wrap_chunked(z3 *const *vz, int nv, const int *depth, const float *X,
         r0 = r0 > h - 2 ? h - 2 : r0; r1 = r1 > h - 2 ? h - 2 : r1; c0 = c0 > w - 2 ? w - 2 : c0; c1 = c1 > w - 2 ? w - 2 : c1;
         r1++; c1++;
         double lo[3] = {1e300, 1e300, 1e300}, hi[3] = {-1e300, -1e300, -1e300};
-        for (int r = r0; r <= r1; r++) for (int c = c0; c <= c1; c++) {
+        for (int si = 0; si < ns; si++) for (int r = r0; r <= r1; r++) for (int c = c0; c <= c1; c++) {   /* the union of the grids' boxes */
+            const float *X = Xs[si], *Y = Ys[si], *Z = Zs[si];
             const size_t i = (size_t)r * w + c; if (!(Z[i] >= 0)) continue;
             const double v3[3] = {Z[i], Y[i], X[i]};
             for (int d = 0; d < 3; d++) { if (v3[d] < lo[d]) lo[d] = v3[d]; if (v3[d] > hi[d]) hi[d] = v3[d]; }

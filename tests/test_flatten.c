@@ -9,6 +9,7 @@
 #include <string.h>
 
 static int fails = 0;
+static int g_gpu = 0;   /* test_flatten_gpu (-DFLAT_GPU, linked with nn_flat.o): the SLIM iterations on the GPU */
 #define CHECK(c, ...) do { if (!(c)) { fails++; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
 
 /* a w x h grid, parameters t (columns), s (rows) in [0, 1] warped non-uniformly, point = f(t, s) */
@@ -36,7 +37,7 @@ static double uvdist(const flat_mesh *m, int w, int r0, int c0, int r1, int c1) 
 static void run(const char *name, surf_fn f, int holes, int developable) {
     const int w = 121, h = 101; const size_t n = (size_t)w * h;
     float *X = malloc(n * 4), *Y = malloc(n * 4), *Z = malloc(n * 4); make(f, w, h, X, Y, Z, holes);
-    flat_opts o = flat_opts_default(); o.min_verts = 800; o.nthreads = 4; o.iters = 60; o.cg_iters = 400; o.tol = 1e-9;
+    flat_opts o = flat_opts_default(); o.min_verts = 800; o.nthreads = 4; o.iters = 60; o.cg_iters = 400; o.tol = 1e-9; o.gpu = g_gpu;
     flat_mesh m; flat_stats b, a;
     CHECK(!flat_grid(X, Y, Z, w, h, 1.0, &o, &m, &b, &a), "%s: flat_grid failed", name);
     char lb[64]; snprintf(lb, sizeof lb, "%s before", name); flat_stats_print(stdout, lb, &b); snprintf(lb, sizeof lb, "%s after", name); flat_stats_print(stdout, lb, &a);
@@ -85,7 +86,38 @@ static void run(const char *name, surf_fn f, int holes, int developable) {
     flat_mesh_free(&m); free(X); free(Y); free(Z);
 }
 
+#ifdef FLAT_GPU
+int flat_slim_gpu(const double *g, const double *A, const int *tri, int nt, const int *vo, const int *vl, int nv, double *x,
+                  int iters, int cg_iters, double tol, int verbose, const char *tag, double *Eout);
+/* GPU vs CPU on one sheet: the same solution (the summation order differs: uv within 1e-4 of a grid step, energy 1e-7), and two GPU
+   runs bit-identical */
+static void cmp_gpu(const char *name, surf_fn f, int holes) {
+    const int w = 121, h = 101; const size_t n = (size_t)w * h;
+    float *X = malloc(n * 4), *Y = malloc(n * 4), *Z = malloc(n * 4); make(f, w, h, X, Y, Z, holes);
+    flat_mesh m[3]; flat_stats b, a[3];
+    for (int k = 0; k < 3; k++) {
+        flat_opts o = flat_opts_default(); o.min_verts = 800; o.nthreads = 4; o.iters = 60; o.cg_iters = 400; o.tol = 1e-9; o.gpu = k > 0;
+        CHECK(!flat_grid(X, Y, Z, w, h, 1.0, &o, &m[k], &b, &a[k]), "%s: flat_grid %d failed", name, k);
+    }
+    CHECK(m[0].nv == m[1].nv && m[1].nv == m[2].nv && m[0].nt == m[1].nt, "%s: meshes differ", name);
+    double dmax = 0; for (int i = 0; i < 2 * m[0].nv; i++) dmax = fmax(dmax, fabs(m[0].uv[i] - m[1].uv[i]));
+    printf("%s: GPU vs CPU max |duv| %.2e, energy %.9f vs %.9f\n", name, dmax, a[1].energy, a[0].energy);
+    CHECK(dmax < 1e-4 && fabs(a[0].energy - a[1].energy) < 1e-7, "%s: GPU solution differs (max |duv| %.3g, energy %.9f vs %.9f)", name, dmax, a[1].energy, a[0].energy);
+    CHECK(!memcmp(m[1].uv, m[2].uv, (size_t)m[1].nv * 16), "%s: two GPU runs differ", name);
+    for (int k = 0; k < 3; k++) flat_mesh_free(&m[k]);
+    free(X); free(Y); free(Z);
+}
+#endif
+
 int main(void) {
+#ifdef FLAT_GPU
+    {   /* a device? (one triangle) */
+        const double g[6] = {-1, -1, 1, 0, 0, 1}, A[1] = {0.5}; const int tri[3] = {0, 1, 2}, vo[4] = {0, 1, 2, 3}, vl[3] = {0, 1, 2}; double x[6] = {0, 0, 1, 0, 0, 1}, E;
+        if (flat_slim_gpu(g, A, tri, 1, vo, vl, 3, x, 1, 5, 1e-9, 0, "probe", &E)) { printf("test_flatten_gpu: no GPU, skipped\n"); return 0; }
+    }
+    g_gpu = 1;
+    cmp_gpu("cylinder", cyl, 0); cmp_gpu("cone-holes", cone, 1); cmp_gpu("sphere-cap", sph, 0);
+#endif
     run("cylinder", cyl, 0, 1);
     run("cone", cone, 0, 1);
     run("cylinder-holes", cyl, 1, 1);
@@ -116,6 +148,10 @@ int main(void) {
             }
         }
     }
+#ifdef FLAT_GPU
+    printf(fails ? "test_flatten_gpu: %d FAILED\n" : "test_flatten_gpu: all passed\n", fails);
+#else
     printf(fails ? "test_flatten: %d FAILED\n" : "test_flatten: all passed\n", fails);
+#endif
     return fails ? 1 : 0;
 }
