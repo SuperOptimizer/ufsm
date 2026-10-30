@@ -73,6 +73,7 @@ int cmd_vwt_infer(int argc, char **argv);   /* src/vwt_infer.c */
 int cmd_vwt_train(int argc, char **argv);   /* src/vwt_train.c */
 int cmd_vwt_tile(int argc, char **argv);   /* src/vwt_tile.c */
 int cmd_vwt_stitch(int argc, char **argv);   /* src/vwt_stitch.c */
+int cmd_phase_vis(int argc, char **argv);   /* src/phasevis.c */
 int cmd_ink3d_ext(int argc, char **argv);   /* src/ink3dext.c */
 int cmd_vol_cmp(int argc, char **argv);
 int cmd_dinovol_eval(int argc, char **argv);
@@ -3945,6 +3946,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "vwt-tile")) return cmd_vwt_tile(argc, argv);
     if (!strcmp(cmd, "vwt-infer")) return cmd_vwt_infer(argc, argv);
     if (!strcmp(cmd, "vwt-stitch")) return cmd_vwt_stitch(argc, argv);
+    if (!strcmp(cmd, "phase-vis")) return cmd_phase_vis(argc, argv);
     if (!strcmp(cmd, "ink3d-ext")) return cmd_ink3d_ext(argc, argv);
     if (!strcmp(cmd, "vol-cmp")) return cmd_vol_cmp(argc, argv);
     if (!strcmp(cmd, "dinovol-eval")) return cmd_dinovol_eval(argc, argv);
