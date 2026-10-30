@@ -1146,6 +1146,13 @@ int cmd_predict(int argc, char **argv) {
     int any = 0;
     const int pprof = ufsm_env_on("UFSM_PRED_PROF");
     double p_wait = 0, p_h2d = 0, p_gpu = 0, p_copy = 0, p_wr = 0, p_ffw = 0, pt;
+    /* the next window's CT uploaded on the copy stream during this window's forward (into ctpre, w3 bytes; at the window's start one
+       device copy into ctd): the synchronous upload left the GPU idle ~9 ms per 384 x 640^2 window. Not with --aug-* (degrade rewrites
+       the host window first); UFSM_PRED_CTPRE=0 off. long pre_i: the window whose CT ctpre holds (or is receiving) */
+    uint8_t *ctpre = nullptr; void *ev_pre = nullptr, *ev_preu = nullptr; long pre_i = -1;
+    if (gpath && !degrade && !split && (!getenv("UFSM_PRED_CTPRE") || ufsm_env_on("UFSM_PRED_CTPRE")) && (ctpre = nn_malloc_try(w3))) {
+        ev_pre = nn_event_create(); ev_preu = nn_event_create();
+    }
     if (split) {   /* both GPUs on every window */
         J.rd = &rd; J.WR = &WR; J.tiles = rd.tiles; J.ntiles = rd.ntiles;
         J.W = W; J.halo = halo; J.shard = shard; J.Dl = Dl; J.H0 = H0; J.kss = kss; J.h16 = h16; J.sign = (int)radial_sign;
@@ -1206,7 +1213,9 @@ int cmd_predict(int argc, char **argv) {
             size_t nz = rd.nz[k]; double sum = rd.sum[k], sq = rd.sq[k];
             if (gpath) {   /* upload (pinned), statistics on the device, then the slot is free for the reader */
                 pt = now();
-                nn_h2d(ctd, ctu, w3);
+                if (pre_i == i) {   /* prefetched: the copy stream's upload, then one device copy (the prefetch buffer free again after it) */
+                    nn_stream_wait(0, ev_pre); nn_d2d_async(ctd, ctpre, w3); nn_event_record(ev_preu, 0);
+                } else nn_h2d(ctd, ctu, w3);
                 nn_pred_stats(ctd, w3, stsc, &nz, &sum, &sq);
                 pthread_mutex_lock(&rd.mu); atomic_store(&rd.consumed, i + 1); pthread_cond_broadcast(&rd.cv); pthread_mutex_unlock(&rd.mu);
                 p_h2d += now() - pt;
@@ -1270,6 +1279,11 @@ int cmd_predict(int argc, char **argv) {
             } else lg = ct_stem ? unet_forward_ct(u, ctd, (float)mean, (float)(1.0 / sd), dyd, dxd, ax.n > 0 ? (int)radial_sign : 0, xs, h16)
                                 : unet_forward_x(u, xd, xs, 0, h16);
             pred_mem_out(u, o);
+            if (ctpre && i + 1 < rd.ntiles && atomic_load(&rd.filled) > i + 1) {   /* the next window's CT during this forward (its slot stays held
+                                                                                         until that window's statistics, as with the plain upload) */
+                if (pre_i >= 0) nn_stream_wait(1, ev_preu);   /* (the previous prefetch's device copy has read ctpre) */
+                nn_h2d_copy_stream(ctpre, rd.buf[(i + 1) % NSLOT], w3); nn_event_record(ev_pre, 1); pre_i = i + 1;
+            }
             nn_set_logits_h16(!half && unet_logits_h16(u));   /* the readers of lg below */
             const uint8_t *ctk = ct_shared && ctcp ? ctcp : ctd; (void)ctk;   /* --fit-ct: the CT window as it was before the forward */
             { static int memi = -1; if (memi < 0) memi = ufsm_env_on("UFSM_PRED_MEMINFO"); if (memi == 1) { nn_sync(); fprintf(stderr, "\npredict: GPU free after the first window %.2f GB\n", nn_mem_free() / 1e9); memi = 2; } }
