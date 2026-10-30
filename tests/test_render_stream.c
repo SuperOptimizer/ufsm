@@ -1,5 +1,5 @@
 /* The streamed render stage against the in-memory / tiled versions, byte for byte:
-   - render_wrap_chunked (chunk-ordered, decoders ahead of renderers): two zarr volumes (128^3 chunks, a partial edge chunk row, an
+   - render_wrap_chunked (chunk-ordered, decoders ahead of renderers, only the volcomp substreams under a block decoded): two zarr volumes (lossy, lossless) (128^3 chunks, a partial edge chunk row, an
      empty region) through a curved grid with invalid vertices and a fold, depth 2 on the first and 0 on the second volume, vs main.c's
      render_rows arithmetic on the whole volume read densely; a tiny budget (decoders wait for the renderers), a large one, --crop;
    - tiffw_write (strips compressed on threads, header patched) read back exactly, at several strip counts;
@@ -90,7 +90,7 @@ int main(void) {
         z3 *zz[2];
         for (int v = 0; v < 2; v++) {
             snprintf(p, sizeof p, "%s/v%d.zarr/0", dir, v);
-            z3w *w = z3w_create(p, shape, S, 0, 0, "{}"); CHECK(w != nullptr, "z3w_create %s", z3w_error());
+            z3w *w = z3w_create(p, shape, S, v ? 0 : 2, 0, "{}"); CHECK(w != nullptr, "z3w_create %s", z3w_error());   /* lossy (q 2) and coded (q 0) volcomp: the substream decode of both */
             for (int sz = 0; sz < 3; sz++) for (int sy = 0; sy < 3; sy++) for (int sx = 0; sx < 3; sx++) {
                 if (v == 1 && sz == 0 && sy == 0) continue;   /* absent shards of the second volume */
                 for (int z = 0; z < S; z++) for (int y = 0; y < S; y++) for (int x = 0; x < S; x++) {

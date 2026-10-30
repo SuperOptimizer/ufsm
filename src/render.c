@@ -102,7 +102,7 @@ static inline float ct_trilin(const ctab *T, double z, double y, double x) {
 
 /* ---- blocks ---- */
 enum { RB = 32 };
-typedef struct { int s, px, py; int32_t lo[3], hi[3]; } rblock;
+typedef struct { int s, px, py; int32_t lo[3], hi[3]; int32_t vlo[2], vhi[2]; } rblock;   /* vlo / vhi: the voxel box's z, y (render_wraps_chunked) */
 static int blk_cmp(const void *a, const void *b) {
     const rblock *p = a, *q = b;
     for (int d = 0; d < 3; d++) if (p->lo[d] != q->lo[d]) return p->lo[d] < q->lo[d] ? -1 : 1;
@@ -258,7 +258,7 @@ static int render_pass(z3 *z, rsheet *S, int ns, int k, const int *depth, int nd
    global volume), so the renders equal the tiled / union-box ones byte for byte. */
 typedef struct { uint8_t v; int32_t ci; uint32_t first; } wdec;   /* decode list entry: volume, chunk, first group (1-based) */
 typedef struct {
-    int nv; ctab T[2]; int depth[2]; uint32_t *first[2], *last[2];
+    int nv; ctab T[2]; int depth[2]; uint32_t *first[2], *last[2], *smask[2];   /* smask: per chunk the volcomp substreams any block reads */
     int ns; const float *const *Xs, *const *Ys, *const *Zs; int w, h; double gs; uint8_t *const *img; int ow, oh;   /* grid s, volume v: img[s nv + v] */
     rblock *b; int32_t (*blo)[2][3], (*bhi)[2][3]; uint32_t *bgrp; size_t nb; uint32_t ng;
     wdec *dl; size_t ndl; uint8_t *ready; size_t *need;   /* need[g]: decode-list entries with first <= g (g 1-based) */
@@ -281,7 +281,7 @@ static void *wr_decoder(void *arg) {
         uint8_t *buf = nullptr; int zero = 1;
         if (o[0] < T->shape[0] && o[1] < T->shape[1] && o[2] < T->shape[2]) {
             buf = malloc(cv);
-            if (!buf || z3_read(T->z, o, n, buf, 1)) { fprintf(stderr, "render: chunk read failed: %s\n", z3_error()); free(buf); buf = nullptr; atomic_store(&R->fail, 1); }
+            if (!buf || z3_read_sub(T->z, o, n, buf, 1, R->smask[D->v] ? R->smask[D->v][i] : 0)) { fprintf(stderr, "render: chunk read failed: %s\n", z3_error()); free(buf); buf = nullptr; atomic_store(&R->fail, 1); }
             else { size_t q = 0; const uint64_t *w = (const uint64_t *)buf; while (q < cv / 8 && !w[q]) q++; zero = q == cv / 8; }
         }
         if (zero) { free(buf); buf = nullptr; }
@@ -400,6 +400,7 @@ int render_wraps_chunked(z3 *const *vz, int nv, const int *depth, int ns, const 
             double a = floor(lo[d]) - dm - 2, e = ceil(hi[d]) + dm + 2; if (a < 0) a = 0; if (e < 0) e = 0;
             a = a > 1e15 ? 1e15 : a; e = e > 1e15 ? 1e15 : e;
             B->lo[d] = (int32_t)((int64_t)a >> R->T[0].sh); B->hi[d] = (int32_t)((int64_t)e >> R->T[0].sh);
+            if (d < 2) { B->vlo[d] = (int32_t)a; B->vhi[d] = (int32_t)e; }
             lo1[nb][d] = nv > 1 ? (int32_t)((int64_t)a >> R->T[1].sh) : 0; hi1[nb][d] = nv > 1 ? (int32_t)((int64_t)e >> R->T[1].sh) : 0;
         }
         nb++;
@@ -427,6 +428,8 @@ int render_wraps_chunked(z3 *const *vz, int nv, const int *depth, int ns, const 
             const size_t nc = (size_t)(T->cn[0] * T->cn[1] * T->cn[2]); ntot += nc;
             T->ptr = calloc(nc, sizeof *T->ptr); T->zero = calloc((size_t)1 << (3 * T->sh), 1); R->first[v] = calloc(nc, sizeof(uint32_t)); R->last[v] = calloc(nc, sizeof(uint32_t));
             if (!T->ptr || !T->zero || !R->first[v] || !R->last[v]) goto out0;
+            /* volcomp substreams (128^3 chunks: 16 z x 32 y slabs): only those under some block's voxel box are decoded; UFSM_RENDER_FULLDECODE=1: all */
+            if (T->sh == 7 && !getenv("UFSM_RENDER_FULLDECODE") && !(R->smask[v] = calloc(nc, sizeof(uint32_t)))) goto out0;
         }
         size_t dcap = 1 << 16; R->dl = malloc(dcap * sizeof *R->dl); R->need = calloc(ng + 2, sizeof *R->need);
         if (!R->dl || !R->need) goto out0;
@@ -441,6 +444,13 @@ int render_wraps_chunked(z3 *const *vz, int nv, const int *depth, int ns, const 
                         R->first[v][ci] = g; R->dl[R->ndl++] = (wdec){(uint8_t)v, (int32_t)ci, g};
                     }
                     R->last[v][ci] = g;
+                    if (R->smask[v]) {   /* the block's z / y voxel range inside this chunk -> substream bits */
+                        const int64_t z0 = a << 7, y0 = y << 7;
+                        int64_t za = R->b[k].vlo[0] - z0, ze = R->b[k].vhi[0] - z0, ya = R->b[k].vlo[1] - y0, ye = R->b[k].vhi[1] - y0;
+                        za = za < 0 ? 0 : za; ze = ze > 127 ? 127 : ze; ya = ya < 0 ? 0 : ya; ye = ye > 127 ? 127 : ye;
+                        uint32_t m = 0; for (int64_t bz = za >> 4; bz <= ze >> 4; bz++) for (int64_t by = ya >> 5; by <= ye >> 5; by++) m |= 1u << (bz * 4 + by);
+                        R->smask[v][ci] |= m;
+                    }
                 }
             }
             R->need[g] = R->ndl;
@@ -469,7 +479,7 @@ int render_wraps_chunked(z3 *const *vz, int nv, const int *depth, int ns, const 
     } else rc = 0;
 out0:
     free(lo1); free(hi1);
-    for (int v = 0; v < 2; v++) { free(R->T[v].ptr); free(R->T[v].zero); free(R->first[v]); free(R->last[v]); }
+    for (int v = 0; v < 2; v++) { free(R->T[v].ptr); free(R->T[v].zero); free(R->first[v]); free(R->last[v]); free(R->smask[v]); }
     free(b); free(R->bgrp); free(R->blo); free(R->bhi); free(R->dl); free(R->need); free(R->free0); free(R->frees); free(R->ready); free(R->gleft);
     free(R);
     return rc;

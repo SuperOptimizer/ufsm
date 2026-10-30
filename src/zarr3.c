@@ -383,6 +383,7 @@ typedef struct {
     uint8_t **fetched;
     int *ready, rq_head, rq_tail, rq_closed;
     pthread_mutex_t rq_mu; pthread_cond_t rq_cv;
+    uint32_t submask;   /* z3_read_sub */
 } job;
 
 static void job_failed(job *jb) {
@@ -415,7 +416,7 @@ static void copy_chunk(const job *jb, const work *w, const uint8_t *chunk) {
         }
 }
 
-static int decode_into(const z3 *z, const uint8_t *enc, size_t n, uint8_t *dec, ZSTD_DCtx *dctx, uint8_t *scratch, int *mask) {
+static int decode_into(const z3 *z, const uint8_t *enc, size_t n, uint8_t *dec, ZSTD_DCtx *dctx, uint8_t *scratch, int *mask, uint32_t submask) {
     const z3_meta *m = &z->m;
     size_t cv = (size_t)m->chunk[0] * m->chunk[1] * m->chunk[2];
     if (mask) *mask = 0;
@@ -434,7 +435,12 @@ static int decode_into(const z3 *z, const uint8_t *enc, size_t n, uint8_t *dec, 
     if (m->q >= 0) {
         uint32_t mode;
         if (mask && vll_chunk_mode(enc, n, &mode) == VOLCOMP_OK) *mask = mode == VLL_MODE_MASK || mode == VLL_MODE_MASK_LL;
-        volcomp_status st = volcomp_decode(enc, n, dec, cv);
+        volcomp_status st;
+        if (submask && submask != 0xffffffffu && cv == VOLCOMP_CHUNK_VOXELS && vll_chunk_mode(enc, n, &mode) == VOLCOMP_OK && (mode == VLL_MODE_LOSSY || mode == VLL_MODE_CODED)) {
+            memset(dec, 0, cv);   /* only the substreams asked for (z3_read_sub) */
+            if (mode == VLL_MODE_CODED) { vll_parsed lp; st = vll_parse(enc, n, &lp); for (uint32_t s = 0; s < VF_NSUB && st == VOLCOMP_OK; s++) if (submask >> s & 1) st = vll_decode_sub(&lp, s, dec, -1, NULL); }
+            else { vf_parsed p; st = vf_parse(enc, n, &p); for (uint32_t s = 0; s < VF_NSUB && st == VOLCOMP_OK; s++) if (submask >> s & 1) st = vf_decode_sub(&p, s, dec, -1, NULL); }
+        } else st = volcomp_decode(enc, n, dec, cv);
         if (st != VOLCOMP_OK) return FAIL("volcomp: %s", volcomp_status_string(st));
         return 0;
     }
@@ -676,7 +682,7 @@ static int run_task(job *jb, int task, uint8_t *fetched, uint8_t *dec, uint8_t *
             const uint8_t *enc = group + (size_t)(w->off - rg->off); size_t n = (size_t)w->len;
             cache_put(z, skey, item, enc, n); atomic_fetch_add(&g_z3_store_reads, 1);
             int msk;
-            if (decode_into(z, enc, n, dec, dctx, scratch, &msk)) { rc = -1; break; }
+            if (decode_into(z, enc, n, dec, dctx, scratch, &msk, jb->submask)) { rc = -1; break; }
             if (msk) mc_put(z, w, dec, cv);
             copy_chunk(jb, w, dec);
         }
@@ -710,7 +716,7 @@ static int run_task(job *jb, int task, uint8_t *fetched, uint8_t *dec, uint8_t *
         }
         cache_put(z, skey, item, b, n);
     }
-    int msk, rc = decode_into(z, b, n, dec, dctx, scratch, &msk);
+    int msk, rc = decode_into(z, b, n, dec, dctx, scratch, &msk, jb->submask);
     free(b);
     if (rc) return -1;
     if (msk && mc_on) mc_put(z, w, dec, cv);
@@ -831,7 +837,8 @@ static void z3_fill(const z3_meta *m, uint8_t *out, size_t nv) {
         for (size_t i = 0; i < nv; i++) memcpy(out + i * m->esize, e, (size_t)m->esize);
     }
 }
-int z3_read(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads) {
+int z3_read(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads) { return z3_read_sub(z, o, n, out, nthreads, 0); }
+int z3_read_sub(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads, uint32_t submask) {
     const z3_meta *m = &z->m;
     const size_t nv = (size_t)n[0] * n[1] * n[2];
     /* a box inside the array whose chunks are all present (sharded) is overwritten entirely by the chunk copies: no fill pass (the
@@ -937,7 +944,7 @@ int z3_read(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nth
         }
     }
     job jb = {.z = z, .o = o, .n = n, .out = out, .items = items, .nitems = nitems,
-              .ranges = ranges, .nranges = nranges};
+              .ranges = ranges, .nranges = nranges, .submask = submask};
     if (nthreads <= 0) nthreads = (int)sysconf(_SC_NPROCESSORS_ONLN);
     int ntasks = ranges ? nranges : nitems;
     store_req *reqs = nullptr; int *task_of = nullptr; char (*rkeys)[1200] = nullptr; int nreq = 0;
