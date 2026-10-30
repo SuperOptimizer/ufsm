@@ -268,7 +268,7 @@ static void p3_full_row(p3_job *J, icstrip *c, int y, uint8_t *row) {   /* ink_p
         const uint8_t *La = J->lut[J->rgb[0]], *Lb = J->lut[J->rgb[1]];
         for (int x = 0; x < W; x++) {
             uint8_t *o = row + 3 * x;
-            if (!m[x] || m[x] < J->ctmin) { if (J->pap) { o[0] = 16; o[1] = 13; o[2] = 11; } else o[0] = o[1] = o[2] = 40; continue; }
+            if (!m[x] || m[x] < J->ctmin) { if (J->pap) { o[0] = 58; o[1] = 36; o[2] = 20; } else o[0] = o[1] = o[2] = 40; continue; }   /* papyrus: off-papyrus = the ramp's dark brown */
             if (J->pap) {   /* papyrus: CT -> dark brown .. warm tan, then carbon ink over it by its density */
                 static const float P[4][3] = {{58, 36, 20}, {128, 88, 52}, {196, 156, 104}, {236, 214, 170}};
                 const float t = (float)J->lut[0][m[x]] / 255.f * 3.f; const int i = t >= 3.f ? 2 : (int)t; const float f = t - i;
@@ -522,7 +522,7 @@ int cmd_ink_compare(int argc, char **argv) {
             if (each) {
                 const char *suf = icopt(sc, sv, "--each-suffix", ""); const int ect = icflag(sc, sv, "--each-ct");
                 for (int k = ect ? 0 : 1; k < n; k++) { snprintf(jout[nj], sizeof jout[nj], "%s%s%s.jpg", each, lab[k], suf); jfirst[nj] = k; jnp[nj] = 1; jrgb[nj][0] = -1; jlab[nj] = nullptr; nj++; }
-            } else if (icopt(sc, sv, "--papyrus", nullptr)) {   /* one panel: CT as papyrus (brown .. tan), the ink as carbon black by density */
+            } else if (icopt(sc, sv, "--papyrus", nullptr)) {   /* one panel: CT as papyrus (brown .. tan), the ink as carbon black by density; off-papyrus the ramp's dark brown */
                 const char *li = icopt(sc, sv, "--papyrus", ""); int ix = -1;
                 for (int k = 1; k < n; k++) if (!strcmp(lab[k], li)) ix = k;
                 if (ix < 0) { fprintf(stderr, "ink-compare: --papyrus INK (an --ink label)\n"); rc = 2; break; }
