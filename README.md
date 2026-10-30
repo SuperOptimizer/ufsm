@@ -70,8 +70,8 @@ adds only the ordinary warp's cost.
 
 Debugging: `build/crush_render <sources.json> <out-prefix> [P] [windows] [seed] [level] [fine] [box] [--aug-crush-* flags]`
 renders CT | phase | crushed CT | crushed phase panels. `UFSM_DUMP_WIN=PREFIX` (with `UFSM_SYNC_UPLOAD=1`, `--gpu-input 0`,
-cube windows) makes `train` write the first `UFSM_DUMP_N` (8) host windows as PREFIX-NN.pgm (rows z-mid / y-mid; columns
-CT | phase | winding mod 4, unknown black).
+cube windows) makes `train` write the first `UFSM_DUMP_N` (8) host windows as PREFIX-NN.jpg (columns
+CT | phase hue over CT | winding mod 4 hue over CT; rows z-mid / y-mid / x-mid).
 
 Ground-truth export scripts: `tools/pget.sh` (parallel ranged download), `tools/ingest_all.sh` (all label zarrs),
 `tools/ingest_segments.sh`, `tools/raster_all.sh`, `tools/surfcomp_all.sh`.

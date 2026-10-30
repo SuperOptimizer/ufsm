@@ -54,7 +54,7 @@ SRC += src/wload.c src/inkext.c src/inkext_net.c src/dinovol.c src/dinovol_net.c
 SRC += src/inksplat.c src/hercuvit.c src/hercuvit_net.c src/ink3dext.c src/ink3dext_net.c
 SRC += src/tfx.c
 SRC += src/embz.c src/fit_emb.c src/embpca.c src/embcalib.c src/sample_emb.c
-SRC += src/patchraster.c src/hiresphase.c src/fitjoin.c src/fieldsoracle.c src/packmap.c src/scanprep.c src/pairacc.c src/wbench.c
+SRC += src/patchraster.c src/hiresphase.c src/fitjoin.c src/wrapcheck.c src/fieldsoracle.c src/packmap.c src/scanprep.c src/pairacc.c src/wbench.c
 SRC += src/view.c src/reg.c src/reg_cli.c src/reg_view.c src/reg_init.c src/reg_render.c src/reg_ink.c src/srpairs.c
 SRC += src/srpair.c
 SRC += src/storebench.c src/phasepack.c
@@ -278,6 +278,9 @@ test-all: $(B)/test_tfx
 $(B)/test_fit_join: tests/test_fit_join.c $(B)/fitjoin.o $(B)/fit.o $(B)/fit_emb.o $(B)/embz.o $(B)/z3w.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/coreline.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 test-all: $(B)/test_fit_join
+$(B)/test_wrap_check: tests/test_wrap_check.c $(B)/wrapcheck.o $(B)/fit.o $(B)/fit_emb.o $(B)/embz.o $(B)/z3w.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/coreline.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/nn.o $(B)/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
+test-all: $(B)/test_wrap_check
 $(B)/test_pairacc: tests/test_pairacc.c $(B)/pairacc.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ -lm
 test-all: $(B)/test_pairacc
@@ -487,6 +490,7 @@ test-all: $(B)/test_gpu_aug $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover 
 	./$(B)/test_gpu_aug
 	./$(B)/test_fit
 	./$(B)/test_fit_join
+	./$(B)/test_wrap_check
 	./$(B)/test_pairacc
 	bash tests/test_wbench_stats.sh $(B)/ufsm
 	bash tests/test_gpuq.sh

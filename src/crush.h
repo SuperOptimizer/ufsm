@@ -26,10 +26,16 @@ typedef struct {
     float rotate_deg;         /* random rotation up to this many degrees per axis (crushed windows skip the ordinary spatial warp unless warp) */
     int fine;                 /* CT from N levels finer (2^N box mean per output voxel); sources' "crush_fine" overrides */
     int warp;                 /* 1: crushed windows also take the ordinary geometry warp (rotation / elastic / affine / zoom) after the crush map; 0 (default) none */
+    float loc_amp, loc_len, loc_jmax;   /* local void ratio (--aug-crush-local A, -local-len L, -local-max J): j x exp(A z(a, sigma)), z a
+                                           unit-variance field of 8 random 3D cosines (wavelengths L / 2 .. 2 L source voxels) over the
+                                           columns AND along them, clamped to 0.04 .. J: some gaps close fully, others keep or (J > 1) widen
+                                           (delamination-like), and neighbouring columns close differently, so the sheets buckle out of
+                                           phase. A 0 (default): off, maps unchanged */
 } crush_cfg;
 crush_cfg crush_cfg_default(void);
 /* the --aug-crush flags (train and dino-train): --aug-crush P, --aug-crush-void LO,HI, --aug-crush-squash P, --aug-crush-k LO,HI,
-   --aug-crush-bend P, --aug-crush-bend-amp F, --aug-crush-kink P, --aug-crush-rot DEG, --aug-crush-fine N. 0 ok, else a message on stderr. */
+   --aug-crush-bend P, --aug-crush-bend-amp F, --aug-crush-kink P, --aug-crush-rot DEG, --aug-crush-fine N, --aug-crush-local A,
+   --aug-crush-local-len L, --aug-crush-local-max J. 0 ok, else a message on stderr. */
 int crush_cfg_parse(crush_cfg *c, int argc, char **argv);
 void crush_cfg_print(const crush_cfg *c);   /* one stderr line */
 
@@ -49,6 +55,7 @@ typedef struct {
     int lat;                                  /* crush_window evaluates the map exactly every lat voxels, trilinear between (2: the
                                                  default, 8x fewer evaluations; 1: exact). CT and labels share it, so they stay consistent. */
     int rb; double rU[3], rV[3], rA[3], r0, r1, rext[3];   /* stage R (crush_map_rebend), before A; 0 off */
+    int nloc; double lk[8][3], lph[8], lamp, ljmax;         /* the local void-ratio field (cfg loc_amp; 0 off): k in the (t1, t2, n) frame */
 } crush_map;
 
 /* stages A and B from the seed (n: the sheet normal, unit or not); stage C off until crush_map_columns */

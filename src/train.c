@@ -472,28 +472,36 @@ static void ct_upload(const batch *b, void *x, void *rad, int B, int P, int asyn
     if (g_gpu_in) { if (async) nn_h2d_copy_stream(rad, b->rad, rad_bytes(B)); else nn_h2d(rad, b->rad, rad_bytes(B)); }
 }
 /* diagnostic UFSM_DUMP_WIN=PREFIX (with UFSM_SYNC_UPLOAD=1 and --gpu-input 0, cubes): the first UFSM_DUMP_N (8) host windows as
-   PREFIX-NN.pgm, rows z-mid / y-mid, columns CT channel | phase (side codes, unknown black) | winding mod 4 (w4 codes, unknown black) */
+   PREFIX-NN.jpg, rows z-mid / y-mid / x-mid, columns CT channel | phase hue over the CT | winding mod 4 hue over the CT (unknown: CT only) */
+int jpeg_write_rgb(const char *path, int w, int h, const uint8_t *rgb, int quality);   /* (imgops.h) */
 static void dump_win(const batch *b, int B, int P) {
     static int nd = 0; const char *pre = getenv("UFSM_DUMP_WIN"); const int N = getenv("UFSM_DUMP_N") ? atoi(getenv("UFSM_DUMP_N")) : 8;
     if (!pre || nd >= N || g_Pz != P || !b->x16 || !g_xfmt) return;
     const size_t p3 = (size_t)P * P * P;
+    uint8_t *img = malloc((size_t)9 * P * P * 3); if (!img) return;
     for (int s = 0; s < B && nd < N; s++, nd++) {
-        char path[1100]; snprintf(path, sizeof path, "%s-%02d.pgm", pre, nd); FILE *f = fopen(path, "wb"); if (!f) return;
-        fprintf(f, "P5\n%d %d\n255\n", 3 * P, 2 * P);
         const uint16_t *x = b->x16 + (size_t)s * g_xs * p3;
-        for (int row = 0; row < 2 * P; row++) {
-            const int a = row % P;
+        for (int row = 0; row < 3 * P; row++) {
+            const int a = row % P, pl = row / P;
             for (int c = 0; c < 3; c++) for (int k = 0; k < P; k++) {
-                const size_t vi = row < P ? ((size_t)(P / 2) * P + a) * P + k : ((size_t)a * P + P / 2) * P + k;   /* z-mid (y = a), y-mid (z = a) */
-                int g = 0;
-                if (c == 0) { float v; if (g_xfmt == 1) { _Float16 h; memcpy(&h, x + vi, 2); v = (float)h; } else { uint32_t u = (uint32_t)x[vi] << 16; memcpy(&v, &u, 4); } g = (int)(128 + 40 * v); }
-                else if (c == 1 && b->side) { const int v = b->side[(size_t)s * p3 + vi]; g = v < 252 ? 16 + v * 239 / 251 : 0; }
-                else if (c == 2 && b->w4) { const int v = b->w4[(size_t)s * p3 + vi]; g = v < 252 ? 16 + v * 239 / 251 : 0; }
-                fputc(g < 0 ? 0 : g > 255 ? 255 : g, f);
+                const size_t vi = pl == 0 ? ((size_t)(P / 2) * P + a) * P + k : pl == 1 ? ((size_t)a * P + P / 2) * P + k : ((size_t)a * P + k) * P + P / 2;   /* z-mid (y = a), y-mid (z = a), x-mid (z = a, y = k) */
+                float v; if (g_xfmt == 1) { _Float16 h; memcpy(&h, x + vi, 2); v = (float)h; } else { uint32_t u = (uint32_t)x[vi] << 16; memcpy(&v, &u, 4); }
+                const int g = (int)(128 + 40 * v), gc = g < 0 ? 0 : g > 255 ? 255 : g;
+                uint8_t *o = img + ((size_t)row * 3 * P + (size_t)c * P + k) * 3; o[0] = o[1] = o[2] = (uint8_t)gc;
+                const uint8_t *L = c == 1 ? b->side : c == 2 ? b->w4 : nullptr;
+                if (L && L[(size_t)s * p3 + vi] < 252) {
+                    const double h = L[(size_t)s * p3 + vi] / 252.0 * (c == 2 ? 4 : 1);   /* (w4: 63 codes a turn: the hue cycles every turn) */
+                    const double cr[3] = {.5 + .5 * cos(2 * M_PI * h), .5 + .5 * cos(2 * M_PI * (h - 1. / 3)), .5 + .5 * cos(2 * M_PI * (h - 2. / 3))};
+                    for (int d = 0; d < 3; d++) o[d] = (uint8_t)((gc + 255 * cr[d]) / 2);
+                }
             }
         }
-        fclose(f); fprintf(stderr, "dumped window %s (source %d)\n", path, b->src ? b->src[s] : -1);
+        char path[1100]; snprintf(path, sizeof path, "%s-%02d.jpg", pre, nd);
+        if (jpeg_write_rgb(path, 3 * P, 3 * P, img, 88)) fprintf(stderr, "cannot write %s\n", path);
+        else fprintf(stderr, "dumped window %s (source %d, corner %lld %lld %lld)\n", path, b->src ? b->src[s] : -1,
+                     b->corner ? (long long)b->corner[s][0] : -1LL, b->corner ? (long long)b->corner[s][1] : -1LL, b->corner ? (long long)b->corner[s][2] : -1LL);
     }
+    free(img);
 }
 static void upload(gpu_state *d, const batch *b, int B, int P) {
     dump_win(b, B, P);
@@ -1198,7 +1206,7 @@ int cmd_train(int argc, char **argv) {
                         "       [--iso T (void cutoff of sources without \"iso\")] [--iso-void 0|1] [--iso-pap 2] [--iso-lift 0 (voxels)]   void (CT < cutoff, > iso-pap voxels\n"
                         "                                     from papyrus) is background beyond the trust band; labels with no papyrus within iso-lift voxels ignored\n"
                         "       [--shell R (level-0 voxels: background beside a label ignored)] [--dist-head SIGMA (channel 1 = distance ridge of channel 0)]\n"
-                        "       [--geometry-aug 0|1] [--rotate-deg 5] [--rotate-p 0.2] [--elastic 1] [--elastic-p 0.15] [--label-morph 0] [--label-morph-p 0.2]\n"
+                        "       [--geometry-aug 0|1] [--rotate-deg 5] [--rotate-p 0.2] [--elastic 1 (amplitude in voxels, 0..10; capped at 0.09 P / 2 pi: invertible)] [--elastic-p 0.15] [--label-morph 0] [--label-morph-p 0.2]\n"
                         "       [--aug-strength 1 (0..2)] [--aug-p 0 (default p of every scanner op)] [--aug-OP-p P] [--aug-drop-ignore 1] [--aug-affine-p 0] [--aug-aniso 0.1] [--aug-shear 0.06]\n"
                         "       [--aug-crush 0 (p: crushed windows of stored-phase sources, src/crush.h)] [--aug-crush-void 0.15,0.5] [--aug-crush-squash 0.5] [--aug-crush-k 1.5,3]\n"
                         "       [--aug-crush-bend 0.5] [--aug-crush-bend-amp 0.06] [--aug-crush-kink 0.25] [--aug-crush-rot 10] [--aug-crush-fine 0 (CT N levels finer, sources \"crush_fine\")] [--aug-crush-warp 0 (1: crushed windows also take the rotation / elastic / affine / zoom warp)]\n"
@@ -1786,7 +1794,7 @@ int cmd_train(int argc, char **argv) {
     if (g_sheet) { sc.augment=noaug?0:sc.geometry_augment?1:3; memset(sc.level_p,0,sizeof sc.level_p); sc.level_p[0]=1; }
     if (!isfinite(sc.symmetry_p) || sc.symmetry_p < 0 || sc.symmetry_p > 1 || !isfinite(sc.axis_jitter) || sc.axis_jitter < 0 ||
         !(sc.axis_jitter_p >= 0 && sc.axis_jitter_p <= 1) || !(sc.axis_jitter_deg >= 0 && sc.axis_jitter_deg <= 60)) { fprintf(stderr, "invalid augmentation bounds\n"); return 2; }
-    if (sc.geometry_augment<0 || sc.geometry_augment>1 || !isfinite(sc.rotate_degrees) || sc.rotate_degrees<0 || sc.rotate_degrees>15 || !isfinite(sc.elastic) || sc.elastic<0 || sc.elastic>2 ||
+    if (sc.geometry_augment<0 || sc.geometry_augment>1 || !isfinite(sc.rotate_degrees) || sc.rotate_degrees<0 || sc.rotate_degrees>15 || !isfinite(sc.elastic) || sc.elastic<0 || sc.elastic>10 ||
         !isfinite(sc.rotate_p) || sc.rotate_p<0 || sc.rotate_p>1 || !isfinite(sc.elastic_p) || sc.elastic_p<0 || sc.elastic_p>1 ||
         !isfinite(sc.zoom_min) || sc.zoom_min<0.25f || sc.zoom_min>1 || !isfinite(sc.zoom_p) || sc.zoom_p<0 || sc.zoom_p>1 ||
         !isfinite(sc.zoom_max) || sc.zoom_max<1 || sc.zoom_max>2 || !isfinite(sc.zoom_out_p) || sc.zoom_out_p<0 || sc.zoom_out_p>1 ||

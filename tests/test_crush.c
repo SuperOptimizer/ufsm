@@ -42,10 +42,11 @@ static double det3(double J[3][3]) { return J[0][0] * (J[1][1] * J[2][2] - J[1][
 static double urand(uint64_t *s) { *s = *s * 6364136223846793005ull + 1442695040888963407ull; return (double)(*s >> 11) * 0x1.0p-53; }
 
 static void map_tests(void) {
-    const int P = 96; int inv = 1, pos = 1, detok = 1, c1 = 1, comp = 1, nrm = 1, foot = 1, any_col = 0, sc_ok = 1, sc_rot = 1; double worst_inv = 0, worst_c1 = 0, worst_n = 0, worst_det = 0;
+    const int P = 96; double lvmin = 1e9, lvmax = 0; int inv = 1, pos = 1, detok = 1, c1 = 1, comp = 1, nrm = 1, foot = 1, any_col = 0, sc_ok = 1, sc_rot = 1; double worst_inv = 0, worst_c1 = 0, worst_n = 0, worst_det = 0;
     for (int t = 0; t < 12; t++) {
         crush_cfg cfg = crush_cfg_default(); cfg.p = 1;
         cfg.squash_p = t % 3 == 0 ? 0 : 1; cfg.bend_p = t % 2 ? 1 : 0; cfg.kink_p = t % 4 == 1 ? 1 : 0; cfg.jlo = .1f; cfg.jhi = .3f;
+        if (t >= 8) { cfg.loc_amp = 1.2f; cfg.loc_len = 24; cfg.loc_jmax = 1.5f; }   /* (--aug-crush-local: per-gap closing / widening) */
         an_ctx a = {{980 + 7 * t, 1620 + 3 * t, 1000 + 5 * t}, 0};   /* ~600 voxels off the axis (a real scroll's sheet curvature) */
         const double cw = .5 * (P - 1), cz = (double)a.o[0] + cw; double cy, cx; fx_axis_at(cz, &cy, &cx);
         const double n[3] = {0, (double)a.o[1] + cw - cy, (double)a.o[2] + cw - cx};
@@ -65,14 +66,14 @@ static void map_tests(void) {
             worst_c1 = fmax(worst_c1, dmax); c1 &= dmax < .05;
             /* the column compression where the source is void vs papyrus */
             const double ct = an_ct(&a, x), fp = jd / m.det;
-            if (ct == 45) { sv += fp; nv++; } else if (ct == 150) { sp_ += fp; np++; }
+            if (ct == 45) { sv += fp; nv++; if (t >= 8) { lvmin = fmin(lvmin, fp); lvmax = fmax(lvmax, fp); } } else if (ct == 150) { sp_ += fp; np++; }
             /* normals: the gradient of W(pull(u)) = J^T grad W */
             double gs[3], go[3], gf[3]; an_grad(&a, x, gs);
             for (int j = 0; j < 3; j++) go[j] = J[0][j] * gs[0] + J[1][j] * gs[1] + J[2][j] * gs[2];
             for (int d = 0; d < 3; d++) { double p[3] = {u[0], u[1], u[2]}, q[3] = {u[0], u[1], u[2]}, xp[3], xq[3]; p[d] += 1e-3; q[d] -= 1e-3; crush_pull(&m, p, xp, nullptr); crush_pull(&m, q, xq, nullptr); gf[d] = (an_w(&a, xp) - an_w(&a, xq)) / 2e-3; }
             const double an = ang(go, gf); worst_n = fmax(worst_n, an); nrm &= an < .5;
         }
-        if (m.tab && nv > 20 && np > 20) {
+        if (m.tab && nv > 20 && np > 20 && t < 8) {
             const double mv = sv / nv, mp = sp_ / np;
             comp &= mv > 1.6 * mp && mp < 1.6;
             if (t < 4) printf("crush: map %d: k %.2f, bends %d, kink %d, j0 %.2f: F' void %.2f papyrus %.2f\n", t, m.sq_k, m.nsin, m.kink, m.j0, mv, mp);
@@ -105,6 +106,8 @@ static void map_tests(void) {
     check("C1: no Jacobian jumps", c1);
     check("voids compressed (F' > 1.6 x papyrus), papyrus keeps its thickness (F' < 1.6)", comp);
     check("normals: J^T grad W = grad of the pulled winding (< 0.5 deg)", nrm);
+    printf("crush: --aug-crush-local maps: void F' %.2f .. %.2f\n", lvmin, lvmax);
+    check("--aug-crush-local: per-gap closing varies (some voids kept / widened F' < 1.3, others closed F' > 5)", lvmin < 1.3 && lvmax > 5);
 }
 
 /* the fraction of output voxels whose CT says papyrus (> 97) where the analytic sheet at pull(u) is papyrus core (f .08 .. .22), and void
