@@ -643,10 +643,16 @@ template <typename LT> __global__ void w4_stats_k(const LT *la, const LT *lb, co
             if (lane == 0) { float *s = sh + c0 * W4_NS;
 #pragma unroll
                 for (int q = 0; q < W4_NS; q++) if (v[q] != 0.f) atomicAdd(&s[q], v[q]); }
-        } else if (c < W4_NC) {
-            float *s = sh + c * W4_NS;
+        } else {   /* several components: one warp sum per component present (lanes of other components add zeros), one add per value;
+                      per-lane shared atomics serialised up to 32-fold on a component's 9 addresses */
+            unsigned rem = on;
+            while (rem) {
+                const unsigned cc = __shfl_sync(0xffffffffu, c, __ffs(rem) - 1), mine = __ballot_sync(0xffffffffu, c == cc);
+                rem &= ~mine;
+                float *s = sh + cc * W4_NS;
 #pragma unroll
-            for (int q = 0; q < W4_NS; q++) if (q < 5 || v[q] != 0.f) atomicAdd(&s[q], v[q]);
+                for (int q = 0; q < W4_NS; q++) { float x = c == cc ? v[q] : 0.f; for (int o = 16; o; o >>= 1) x += __shfl_xor_sync(0xffffffffu, x, o); if (lane == 0 && (q < 5 || x != 0.f)) atomicAdd(&s[q], x); }
+            }
         }
     }
     __syncthreads();
