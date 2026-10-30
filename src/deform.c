@@ -35,6 +35,9 @@ void deform_cfg_print(const deform_cfg *c) {
 }
 
 int deform_make(deform *D, const deform_cfg *cfg, uint64_t seed, const double c[3], const double n[3], int P, crush_ct_fn ct, void *ud) {
+    return deform_make_ext(D, cfg, seed, c, n, P, nullptr, 0, ct, ud);
+}
+int deform_make_ext(deform *D, const deform_cfg *cfg, uint64_t seed, const double c[3], const double n[3], int P, const double (*pts)[3], int np, crush_ct_fn ct, void *ud) {
     memset(D, 0, sizeof *D); D->P = P;
     for (int d = 0; d < 3; d++) D->o[d] = c[d] - .5 * (P - 1);
     if (cfg->elastic_p > 0 && df_u(&seed) < cfg->elastic_p && cfg->amp > 0) {
@@ -53,6 +56,12 @@ int deform_make(deform *D, const deform_cfg *cfg, uint64_t seed, const double c[
     if (cfg->crush_p > 0 && df_u(&seed) < cfg->crush_p) {
         crush_cfg cc = cfg->crush; cc.rotate_deg = 0;
         crush_map_init(&D->m, &cc, df_next(&seed), P, n);
+        if (pts && np > 0 && np <= 64) {   /* each point expanded by the elastic stage's bound (+2) along every axis: the hull of the cubes */
+            double ea = 2; for (int k = 0; k < D->ne; k++) for (int d = 0; d < 3; d++) ea += fabs(D->eA[k][d]);
+            double R[512][3]; int m = 0;
+            for (int i = 0; i < np; i++) for (int c8 = 0; c8 < 8; c8++, m++) for (int d = 0; d < 3; d++) R[m][d] = pts[i][d] + ((c8 >> (2 - d) & 1) ? ea : -ea);
+            crush_map_extent_pts(&D->m, (const double (*)[3])R, m);
+        }
         if (ct) crush_map_columns(&D->m, cc.jlo, cc.jhi, df_next(&seed), ct, ud);   /* (1: too little CT for a split: no collapse, A / B stay) */
         D->ncr = 1;
     }

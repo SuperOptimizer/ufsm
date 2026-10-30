@@ -60,6 +60,11 @@ typedef struct {
 
 /* stages A and B from the seed (n: the sheet normal, unit or not); stage C off until crush_map_columns */
 void crush_map_init(crush_map *m, const crush_cfg *cfg, uint64_t seed, int P, const double n[3]);
+/* restrict the map's column ranges to the output box c +- ext (window axes, zyx; before crush_map_columns): pulls are only valid
+   inside it (a slab inside the cube: far fewer columns and a shorter sweep) */
+void crush_map_extent(crush_map *m, const double ext[3]);
+/* the same for the convex hull of n points (window coordinates relative to the centre c, zyx): e.g. a rotated slab's 8 corners */
+void crush_map_extent_pts(crush_map *m, const double (*r)[3], int n);
 /* stage C from the source CT along the columns: ct(ud, x) = the CT value (0..255, 0 outside the scan) at window coordinates x.
    Returns 0, or 1 when the columns hold too little CT for a papyrus / void split (stage C stays off). */
 typedef double (*crush_ct_fn)(void *ud, const double x[3]);

@@ -32,6 +32,9 @@ typedef struct {
    caller's footprint (a T x T x L slab: P >= sqrt(L^2 + 2 T^2)). ct(ud, x): CT (0..255, 0 outside) at window coordinates x (as
    crush_map_columns). Returns 0 (crush on or off: deform_on says), -1 on alloc failure. Deterministic in seed. */
 int deform_make(deform *D, const deform_cfg *cfg, uint64_t seed, const double c[3], const double n[3], int P, crush_ct_fn ct, void *ud);
+/* the same, with the crush columns built only over the hull of the np points pts (zyx, relative to c; every point the caller pulls
+   lies in it, e.g. a slab's 8 corners); the elastic stage's displacement bound is added as a margin. nullptr pts = the cube */
+int deform_make_ext(deform *D, const deform_cfg *cfg, uint64_t seed, const double c[3], const double n[3], int P, const double (*pts)[3], int np, crush_ct_fn ct, void *ud);
 void deform_free(deform *D);
 int deform_on(const deform *D);   /* any stage active */
 /* src = pull(out) (level voxels, zyx); jdet (nullable): Jacobian determinant */

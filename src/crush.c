@@ -49,6 +49,26 @@ static double cr_bend(const crush_map *m, double a1, double a2) {
     return b;
 }
 
+/* T, srange, half from the output box c +- ext (window axes): a and s are linear in u (corners); |b| bounded by its amplitudes and the kink's slope */
+static void cr_ranges_pts(crush_map *m, const double (*R)[3], int np) {
+    double smn = 1e300, smx = -1e300, T0 = 0, T1 = 0, kmx = 0;
+    for (int pi = 0; pi < np; pi++) {
+        const double *r = R[pi]; double q[3];
+        for (int i = 0; i < 3; i++) q[i] = m->M[i][0] * r[0] + m->M[i][1] * r[1] + m->M[i][2] * r[2];
+        const double a1 = dot3(q, m->t1), a2 = dot3(q, m->t2), s = dot3(q, m->n);
+        T0 = fmax(T0, fabs(a1)); T1 = fmax(T1, fabs(a2)); smn = fmin(smn, s); smx = fmax(smx, s);
+        if (m->kink) kmx = fmax(kmx, fabs(m->kE[0] * a1 + m->kE[1] * a2 - m->kA0));
+    }
+    const double B = fabs(m->bA[0]) + fabs(m->bA[1]) + (m->kink ? fabs(m->kS) * kmx : 0);
+    m->T[0] = T0 + 1; m->T[1] = T1 + 1; m->srange[0] = smn - B; m->srange[1] = smx + B;
+    m->half = 4 * ceil(fmax(fabs(m->srange[0]), fabs(m->srange[1])) + 4) + 24;   /* (columns covering s' at 1 / 4 of the source: papyrus 1, voids >= 0.05) */
+}
+static void cr_ranges(crush_map *m, const double ext[3]) {
+    double R[8][3]; for (int c = 0; c < 8; c++) for (int d = 0; d < 3; d++) R[c][d] = (c >> (2 - d) & 1) ? ext[d] : -ext[d];
+    cr_ranges_pts(m, (const double (*)[3])R, 8);
+}
+void crush_map_extent(crush_map *m, const double ext[3]) { cr_ranges(m, ext); }
+void crush_map_extent_pts(crush_map *m, const double (*r)[3], int n) { cr_ranges_pts(m, r, n); }
 void crush_map_init(crush_map *m, const crush_cfg *cfg, uint64_t seed, int P, const double n[3]) {
     memset(m, 0, sizeof *m); m->P = P; m->c = .5 * (P - 1); m->j0 = 1; m->lat = 2;
     memcpy(m->n, n, sizeof m->n);
@@ -95,18 +115,7 @@ void crush_map_init(crush_map *m, const crush_cfg *cfg, uint64_t seed, int P, co
         m->kS = (cr_u(&seed) < .5 ? -1 : 1) * (.3 + .7 * cr_u(&seed)); m->kW = P_ * (.02 + .06 * cr_u(&seed));
         m->kE[0] = cos(th); m->kE[1] = sin(th); m->kA0 = (2 * cr_u(&seed) - 1) * .3 * P_;
     }
-    /* ranges over the output cube: a and s are linear in u (corners); |b| bounded by its amplitudes and the kink's slope */
-    double smn = 1e300, smx = -1e300, T0 = 0, T1 = 0, kmx = 0;
-    for (int cz = 0; cz < 2; cz++) for (int cy = 0; cy < 2; cy++) for (int cx = 0; cx < 2; cx++) {
-        const double r[3] = {cz ? m->c : -m->c, cy ? m->c : -m->c, cx ? m->c : -m->c}; double q[3];
-        for (int i = 0; i < 3; i++) q[i] = m->M[i][0] * r[0] + m->M[i][1] * r[1] + m->M[i][2] * r[2];
-        const double a1 = dot3(q, m->t1), a2 = dot3(q, m->t2), s = dot3(q, m->n);
-        T0 = fmax(T0, fabs(a1)); T1 = fmax(T1, fabs(a2)); smn = fmin(smn, s); smx = fmax(smx, s);
-        if (m->kink) kmx = fmax(kmx, fabs(m->kE[0] * a1 + m->kE[1] * a2 - m->kA0));
-    }
-    const double B = fabs(m->bA[0]) + fabs(m->bA[1]) + (m->kink ? fabs(m->kS) * kmx : 0);
-    m->T[0] = T0 + 1; m->T[1] = T1 + 1; m->srange[0] = smn - B; m->srange[1] = smx + B;
-    m->half = 4 * ceil(fmax(fabs(m->srange[0]), fabs(m->srange[1])) + 4) + 24;   /* (columns covering s' at 1 / 4 of the source: papyrus 1, voids >= 0.05) */
+    const double ce[3] = {m->c, m->c, m->c}; cr_ranges(m, ce);
     if (cfg->loc_amp > 0) {   /* (drawn last: maps without it keep their random sequence) */
         m->nloc = 8; m->lamp = cfg->loc_amp; m->ljmax = cfg->loc_jmax;
         for (int i = 0; i < m->nloc; i++) {

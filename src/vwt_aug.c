@@ -58,7 +58,10 @@ vwa *vwa_begin(const vwa_cfg *c, uint64_t seed, const vws_sample *s, double (*ct
     va_ctu u = {ct_xyz, ud, o};
     deform_cfg dc = c->df; if (!(dc.crush_p > 0 || dc.elastic_p > 0)) { free(w); return nullptr; }
     for (int tries = 0; tries < 4; tries++) {   /* (both stages drawn off: redraw, the slab was chosen for geometric aug) */
-        if (deform_make(&w->D, &dc, va_next(&seed), cz, nz, P, ct_xyz ? va_ct : nullptr, &u)) { free(w); return nullptr; }
+        double pc[8][3];   /* the slab's corners relative to its centre (zyx) */
+        for (int k = 0; k < 8; k++) { const double sa = (k & 1 ? .5 : -.5) * (T - 1), sb = (k & 2 ? .5 : -.5) * (T - 1), sd = (k & 4 ? .5 : -.5) * (L - 1);
+            for (int e = 0; e < 3; e++) pc[k][2 - e] = sa * s->a[e] + sb * s->b[e] + sd * s->d[e]; }
+        if (deform_make_ext(&w->D, &dc, va_next(&seed), cz, nz, P, (const double (*)[3])pc, 8, ct_xyz ? va_ct : nullptr, &u)) { free(w); return nullptr; }
         if (deform_on(&w->D)) return w;
         deform_free(&w->D);
     }
