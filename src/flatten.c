@@ -60,7 +60,25 @@ static inline void svd2(const double J[4], double *s1, double *s2, double *phi, 
 
 /* ---- stats ---- */
 typedef struct { double w, a; } wa;
-static int wa_cmp(const void *p, const void *q) { const double a = ((const wa *)p)->a, b = ((const wa *)q)->a; return a < b ? -1 : a > b; }
+/* stable sort by a (LSD radix over the double's order-preserving bits, 4 x 16-bit digits): the order glibc's merge-sort qsort gave
+   (stable, ties by index), so the quantiles' running sums are bit-identical; ~10x faster on the 10-20M triangle grids */
+static inline uint64_t wa_key(double a) { uint64_t u; memcpy(&u, &a, 8); return u >> 63 ? ~u : u | 1ULL << 63; }
+static void wa_sort(wa *v, size_t n) {
+    if (n < 2) return;
+    wa *t = malloc(n * sizeof *t); size_t *cnt = malloc(65536 * sizeof *cnt);
+    if (!t || !cnt) { free(t); free(cnt); for (size_t i = 1; i < n; i++) { const wa x = v[i]; size_t j = i; while (j && wa_key(v[j - 1].a) > wa_key(x.a)) { v[j] = v[j - 1]; j--; } v[j] = x; } return; }
+    wa *src = v, *dst = t;
+    for (int sh = 0; sh < 64; sh += 16) {
+        memset(cnt, 0, 65536 * sizeof *cnt);
+        for (size_t i = 0; i < n; i++) cnt[wa_key(src[i].a) >> sh & 0xffff]++;
+        if (cnt[wa_key(src[0].a) >> sh & 0xffff] == n) continue;   /* one digit value: the pass changes nothing */
+        size_t o = 0; for (int d = 0; d < 65536; d++) { const size_t c = cnt[d]; cnt[d] = o; o += c; }
+        for (size_t i = 0; i < n; i++) dst[cnt[wa_key(src[i].a) >> sh & 0xffff]++] = src[i];
+        wa *x = src; src = dst; dst = x;
+    }
+    if (src != v) memcpy(v, src, n * sizeof *v);
+    free(t); free(cnt);
+}
 static double wquant(wa *v, size_t n, double tot, double q) { double c = 0; for (size_t i = 0; i < n; i++) { c += v[i].w; if (c >= q * tot) return v[i].a; } return n ? v[n - 1].a : 0; }
 void flat_stats_of(const double *P, const int *tri, long long nt, const double *uv, flat_stats *s) {
     memset(s, 0, sizeof *s);
@@ -81,7 +99,7 @@ void flat_stats_of(const double *P, const int *tri, long long nt, const double *
     }
     if (A > 0) {
         s->energy = E / A; s->aniso12 = a12 / A; s->stretch12 = s12 / A; s->area_ratio = Auv / A;
-        qsort(an, n, sizeof *an, wa_cmp); qsort(mx, n, sizeof *mx, wa_cmp); qsort(mn, n, sizeof *mn, wa_cmp);
+        wa_sort(an, n); wa_sort(mx, n); wa_sort(mn, n);
         double An = 0; for (size_t i = 0; i < n; i++) An += an[i].w;
         s->aniso_p50 = wquant(an, n, An, 0.5); s->aniso_p95 = wquant(an, n, An, 0.95); s->aniso_p99 = wquant(an, n, An, 0.99);
         s->smax_p95 = wquant(mx, n, An, 0.95); s->smin_p05 = wquant(mn, n, An, 0.05);
@@ -232,8 +250,13 @@ static void slim_free(slim *S) {
     free(S->d); free(S->rhs); free(S->diag); free(S->r); free(S->z); free(S->p); free(S->q); free(S->xt);
 }
 
+/* src/nn_flat.cu (weak: binaries without it, e.g. test_flatten, link CPU-only) */
+int flat_slim_gpu(const double *g, const double *A, const int *tri, int nt, const int *vo, const int *vl, int nv, double *x,
+                  int iters, int cg_iters, double tol, int verbose, const char *tag, double *Eout) __attribute__((weak));
+
 /* SLIM iterations on S (S->x = the current uv, flip-free) */
 static double slim_run(slim *S, const flat_opts *o, int iters, const char *tag) {
+    if (o->gpu && flat_slim_gpu) { double E; if (!flat_slim_gpu(S->g, S->A, S->tri, S->nt, S->vo, S->vl, S->nv, S->x, iters, o->cg_iters, o->tol, o->verbose, tag, &E)) return E; }
     double E = energy_at(S, S->x); const size_t n2 = (size_t)S->nv * 2;
     if (o->verbose) fprintf(stderr, "flatten: %s %d vertices %d triangles, energy %.5f\n", tag, S->nv, S->nt, E);
     if (!isfinite(E)) return E;
@@ -581,11 +604,11 @@ static double meta_num(const char *m, const char *key, double def) { const char 
    index boxes on that grid) and as lines "<wrap>_r<i>: rect x,y wxh = A cm2" + "<wrap>_r<i> output grid ..": re-cropping never
    needs a re-flatten. */
 int cmd_flatten(int argc, char **argv) {
-    if (argc < 4) { fprintf(stderr, "usage: ufsm flatten <wraps-dir> <out-dir> [--wraps a,b,..] [--decim 1] [--iters 30] [--cg 200] [--min-verts 20000] [--out-step S] [--crop rect|none] [--max-aspect A] [--rects N] [--min-cm2 5] [--fill-holes 5000] [--max-edge 3] [--threads 16] [--sfc ERR] [--quiet 1]\n"); return 2; }
+    if (argc < 4) { fprintf(stderr, "usage: ufsm flatten <wraps-dir> <out-dir> [--wraps a,b,..] [--decim 1] [--iters 30] [--cg 200] [--min-verts 20000] [--out-step S] [--crop rect|none] [--max-aspect A] [--rects N] [--min-cm2 5] [--fill-holes 5000] [--max-edge 3] [--threads 16] [--gpu 1] [--sfc ERR] [--quiet 1]\n"); return 2; }
     flat_opts o = flat_opts_default();
     o.decim = atoi(fopt(argc, argv, "--decim", "1")); o.iters = atoi(fopt(argc, argv, "--iters", "30")); o.cg_iters = atoi(fopt(argc, argv, "--cg", "200"));
     o.min_verts = atoi(fopt(argc, argv, "--min-verts", "20000")); o.max_edge = atof(fopt(argc, argv, "--max-edge", "3")); o.nthreads = atoi(fopt(argc, argv, "--threads", "16"));
-    o.verbose = !atoi(fopt(argc, argv, "--quiet", "0"));
+    o.verbose = !atoi(fopt(argc, argv, "--quiet", "0")); o.gpu = atoi(fopt(argc, argv, "--gpu", "1"));
     const double ostep_opt = atof(fopt(argc, argv, "--out-step", "0")); const int crop = strcmp(fopt(argc, argv, "--crop", "rect"), "none") != 0;
     const char *wl = fopt(argc, argv, "--wraps", nullptr); char *want = nullptr; if (wl) { want = malloc(strlen(wl) + 3); sprintf(want, ",%s,", wl); }
     const double sfc = atof(fopt(argc, argv, "--sfc", "0")); const long maxhole = atol(fopt(argc, argv, "--fill-holes", "5000"));

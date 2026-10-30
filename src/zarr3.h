@@ -35,6 +35,11 @@ const char *z3_key(const z3 *z);
 /* Read the box [o, o+n) (z,y,x) into out (C order, n[0]*n[1]*n[2] bytes). Out-of-range parts use fill_value.
    nthreads <= 0 picks the CPU count. Returns 0 on success, -1 on I/O or decode failure. */
 int z3_read(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads);   /* out: n[0] n[1] n[2] * esize bytes */
+/* z3_read decoding only the volcomp substreams in submask of each chunk (bit s = substream s: blocks 16 s .. 16 s + 15, i.e. the
+   16 z x 32 y x 128 x slab z0 = 16 (s / 4), y0 = 32 (s % 4)); voxels of the other substreams read as 0. The decoded ones equal a full
+   decode byte for byte (volcomp_decode_block's guarantee). submask 0 or all ones, or a chunk that is not a lossy / coded volcomp chunk
+   (mask, surface, raw, const, typed, other codecs): the whole chunk. */
+int z3_read_sub(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads, uint32_t submask);
 
 /* Shard-level presence: 1 if the shard object exists in the store, 0 if not, -1 on error. */
 int z3_shard_present(z3 *z, int64_t sz, int64_t sy, int64_t sx);

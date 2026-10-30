@@ -199,6 +199,18 @@ row by row). Both write the same bytes as before; a whole Paris 3 wrap (338 cm²
 renders) took render 5:28 -> 1:37 and ink-compare 1:37 / 51.6 GB -> 0:19 / 0.47 GB.
 `UFSM_RENDER_TILED=1` and `UFSM_INKCMP_MEM=1` select the old paths.
 
+Speed levers (all byte-identical to the separate / full paths, see `tests/test_render_stream.c`):
+- `flatten --gpu 1` (default) runs the SLIM iterations on the GPU (`src/nn_flat.cu`, fp64, deterministic;
+  CPU fallback when no device). Paris 4 w120 (1.05M solver vertices): SLIM 59 s -> 5.5 s, whole wrap 87 -> 17 s.
+  The result matches the CPU solver to ~1e-6 of a voxel on the test sheets; `--gpu 0` is the CPU solver.
+- The chunked render decodes only the volcomp substreams (16 z x 32 y x 128 x slabs) that some block's voxel
+  box touches (`z3_read_sub`; `UFSM_RENDER_FULLDECODE=1`: whole chunks). `UFSM_RENDER_CHUNKED=1` makes small
+  wraps take this path too instead of reading their whole box.
+- `render --joint 1` renders every wrap of the directory (one grid size, e.g. recto + verso) in one chunk pass.
+- `ink-compare OUT [opts] --then OUT2 [opts] ...` writes several outputs from one read of the renders: the
+  statistics once, each panel image once, its `--max-px` sizes fitted in memory. Per-output options:
+  `--max-px --quality --full --cmap --rgb-ct-min --no-ct --each --each-suffix --each-ct --rgb-agree --diff-agree --diff-gain`.
+
 ## Recto and verso faces
 
 A wrap is a level set W = k of the smooth winding field. It follows the sheet but can sit anywhere
@@ -220,9 +232,13 @@ writes |recto - verso| through viridis instead (0 = agree, 255 = disagree; `--di
 ```sh
 build/ufsm faces flat faces --ct CT 2 --ct-um 9.6 --umb umbilicus.json --umb-um 2.4 [--gt codes.zarr 9.6 --gt-um 9.6]
 build/ufsm tifxyz-scale faces up 1 --flip-rows 1
-build/ufsm render up r --volume ink.zarr 9.6 --ct CT 2 --depth 1 --scale 2
-build/ufsm ink-compare w_rgb.jpg --ct r/w_recto_ct.tif --ink recto=r/w_recto.tif --ink verso=r/w_verso.tif --rgb-agree recto,verso --stretch --px-um 4.8
+build/ufsm render up r --volume ink.zarr 9.6 --ct CT 2 --depth 1 --scale 2 --joint 1
+build/ufsm ink-compare w_rgb.jpg --ct r/w_recto_ct.tif --ink recto=r/w_recto.tif --ink verso=r/w_verso.tif --rgb-agree recto,verso --stretch --px-um 4.8 \
+    --then w_side.jpg --then w_viridis.jpg --cmap viridis --no-ct
 ```
+
+The CT chunk cache of `faces` decodes only the volcomp substreams under each band's sample boxes
+(`UFSM_FACES_FULLDECODE=1`: whole chunks); the samples, and so the faces, are unchanged.
 
 ## Prediction input transform
 
