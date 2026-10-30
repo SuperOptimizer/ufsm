@@ -254,6 +254,7 @@ typedef struct {
     uint8_t *out; int rows; _Atomic int next;
     int rgb[2], ctmin;                     /* rgb[0] >= 0: one agreement panel, R = B = ink rgb[0], G = ink rgb[1]; CT < ctmin dark grey */
     int cmap;                              /* 1: ink panels (k >= 1) through viridis after their table; CT < ctmin dark grey */
+    int diff; float gain;                  /* with rgb: viridis(|ink rgb[0] - ink rgb[1]| * gain) instead of magenta/green */
 } p3_job;
 typedef struct { uint8_t *buf; int *tag; int cap; size_t len; } p3ring;
 static void p3_full_row(p3_job *J, icstrip *c, int y, uint8_t *row) {   /* ink_panels' row y */
@@ -266,6 +267,10 @@ static void p3_full_row(p3_job *J, icstrip *c, int y, uint8_t *row) {   /* ink_p
         for (int x = 0; x < W; x++) {
             uint8_t *o = row + 3 * x;
             if (!m[x] || m[x] < J->ctmin) { o[0] = o[1] = o[2] = 40; continue; }
+            if (J->diff) {
+                const float d = fabsf((float)La[a[x]] - (float)Lb[b[x]]) * J->gain; const uint8_t *v = VIRIDIS[d > 255.f ? 255 : (int)lroundf(d)];
+                o[0] = v[0]; o[1] = v[1]; o[2] = v[2]; continue;
+            }
             o[0] = o[2] = La[a[x]]; o[1] = Lb[b[x]];
         }
         const uint8_t yel[3] = {255, 220, 0}; const int sc = J->sc;
@@ -332,10 +337,12 @@ out:
 }
 /* panels first .. first + np - 1 -> RGB *ow x *oh (as ink_panels + img_fit_rgb) */
 static int g_cmap = 0, g_cmap_ctmin = 1;   /* --cmap viridis (cmd_ink_compare), its off-papyrus CT floor (--rgb-ct-min) */
+static int g_diff = 0; static float g_diff_gain = 1.f;   /* --diff-agree (cmd_ink_compare), --diff-gain */
 static uint8_t *p3_panels(icx *X, int first, int np, uint8_t lut[NIMG][256], const char *const *lab, int half, int maxpx, int *owp, int *ohp, const int *rgb, int ctmin) {
     p3_job *J = calloc(1, sizeof *J); if (!J) return nullptr;
     J->X = X; J->np = np; J->first = first; memcpy(J->lut, lut, sizeof J->lut);
     J->rgb[0] = rgb ? rgb[0] : -1; J->rgb[1] = rgb ? rgb[1] : -1; J->ctmin = ctmin; J->cmap = g_cmap;
+    J->diff = g_diff; J->gain = g_diff_gain;
     if (g_cmap && !rgb) J->ctmin = g_cmap_ctmin;
     for (int p = 0; p < np; p++) J->lab[p] = lab ? lab[p] : nullptr;
     J->TW = np * X->W + 8 * (np - 1); J->H0 = X->H; J->sc = X->H / 200 > 1 ? X->H / 200 : 2;
@@ -493,12 +500,18 @@ int cmd_ink_compare(int argc, char **argv) {
                 if (!rgb || jpeg_write_rgb(p, ow, oh, rgb, jq)) { fprintf(stderr, "ink-compare: cannot write %s\n", p); rc = 1; }
                 free(rgb);
             }
-        } else if (icopt(argc, argv, "--rgb-agree", nullptr)) {   /* one RGB panel: recto ink R + B (magenta), verso ink G; agreement white */
+        } else if (icopt(argc, argv, "--rgb-agree", nullptr) || icopt(argc, argv, "--diff-agree", nullptr)) {   /* one panel: recto R + B (magenta), verso G, agreement white; --diff-agree: viridis |recto - verso| */
+            const char *pair = icopt(argc, argv, "--diff-agree", nullptr); g_diff = pair != nullptr;
+            if (!pair) pair = icopt(argc, argv, "--rgb-agree", "");
+            g_diff_gain = (float)atof(icopt(argc, argv, "--diff-gain", "1"));
             char la[128] = "", lb[128] = ""; int ix[2] = {-1, -1};
-            if (sscanf(icopt(argc, argv, "--rgb-agree", ""), "%127[^,],%127s", la, lb) == 2)
+            if (sscanf(pair, "%127[^,],%127s", la, lb) == 2)
                 for (int k = 1; k < n; k++) { if (!strcmp(lab[k], la)) ix[0] = k; if (!strcmp(lab[k], lb)) ix[1] = k; }
-            if (ix[0] < 0 || ix[1] < 0) { fprintf(stderr, "ink-compare: --rgb-agree RECTO,VERSO (two --ink labels)\n"); rc = 2; goto end; }
-            char title[300]; snprintf(title, sizeof title, "%s=magenta %s=green both=white", la, lb); const char *tl[1] = {title};
+            if (ix[0] < 0 || ix[1] < 0) { fprintf(stderr, "ink-compare: --rgb-agree / --diff-agree RECTO,VERSO (two --ink labels)\n"); rc = 2; goto end; }
+            char title[300];
+            if (g_diff) snprintf(title, sizeof title, "|%s-%s| viridis 0=agree 255=disagree%s", la, lb, g_diff_gain != 1.f ? " (gain)" : "");
+            else snprintf(title, sizeof title, "%s=magenta %s=green both=white", la, lb);
+            const char *tl[1] = {title};
             int ow, oh; uint8_t *rgb = p3_panels(&X, 0, 1, lut, tl, half, maxpx, &ow, &oh, ix, atoi(icopt(argc, argv, "--rgb-ct-min", "1")));
             if (!rgb || jpeg_write_rgb(argv[2], ow, oh, rgb, jq)) { fprintf(stderr, "ink-compare: cannot write %s\n", argv[2]); rc = 1; }
             free(rgb);
