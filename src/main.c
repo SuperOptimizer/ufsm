@@ -70,6 +70,7 @@ int cmd_dinovol_embed(int argc, char **argv);   /* src/dinovol.c */
 int cmd_hercuvit(int argc, char **argv);   /* src/hercuvit.c */
 int cmd_villawind(int argc, char **argv);   /* src/villawind.c */
 int cmd_vwt_infer(int argc, char **argv);   /* src/vwt_infer.c */
+int cmd_wtrunk_bench(int argc, char **argv);   /* src/wtrunk.c */
 int cmd_vwt_train(int argc, char **argv);   /* src/vwt_train.c */
 int cmd_vwt_tile(int argc, char **argv);   /* src/vwt_tile.c */
 int cmd_vwt_stitch(int argc, char **argv);   /* src/vwt_stitch.c */
@@ -3945,6 +3946,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "vwt-train")) return cmd_vwt_train(argc, argv);
     if (!strcmp(cmd, "vwt-tile")) return cmd_vwt_tile(argc, argv);
     if (!strcmp(cmd, "vwt-infer")) return cmd_vwt_infer(argc, argv);
+    if (!strcmp(cmd, "wtrunk-bench")) return cmd_wtrunk_bench(argc, argv);
     if (!strcmp(cmd, "vwt-stitch")) return cmd_vwt_stitch(argc, argv);
     if (!strcmp(cmd, "phase-vis")) return cmd_phase_vis(argc, argv);
     if (!strcmp(cmd, "ink3d-ext")) return cmd_ink3d_ext(argc, argv);

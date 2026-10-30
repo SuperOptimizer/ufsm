@@ -254,6 +254,7 @@ size_t unet_last_offload_bytes(void);
 void *unet_logit_grad_scratch(unet *u, size_t bytes);   /* lean: home of the 16-bit logit gradient (A after the logits under lean 2, else B) */
 int unet_lean_nob(const unet *u);   /* lean 2 build: no gradient buffer B (gout[0] is the batch scratch) */
 void unet_build(unet *u, shape5 xs, int train);   /* build the buffers for xs now (the first forward would) */
+void unet_set_head_feat(unet *u, int on);   /* inference: the logits followed by dec[0]'s output channels (silu(gn) as the head reads it; cout + widths[0] channels) */
 void unet_set_head_channels(unet *u, int c0, int nc);   /* inference: only logit channels [c0, c0 + nc) (nc 0: all) */
 void *unet_input_scratch(unet *u, size_t bytes);
 void *unet_input_scratch2(unet *u, size_t bytes);   /* inference: enc[0].a2's buffer, free until the forward's input conversion (predict: the uint8 CT) */
