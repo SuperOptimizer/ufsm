@@ -30,6 +30,9 @@ typedef struct {
     uint16_t *comp;     /* [T][T][L] unwrap component of ph (0 = no label): the loss is shift-invariant per component, so each component
                            must be internally consistent (no integer slips inside it); split rather than guess */
     float *pw;          /* [T][T][L] per-voxel target weight in [0, 1] (nullptr: 1 where comp != 0); holdout / exclusion tubes = 0 */
+    uint8_t *shell;     /* [T][T][L] 1 = a verified surface-patch shell voxel (a sheet is here; spiral-input patches, ufsm patch-raster),
+                           nearest through the same source lattice as the GT, 0 inside the ray-check tubes; nullptr when no source has
+                           shells (then no shell loss) */
     double o[3], a[3], b[3], d[3];   /* frame (xyz, scan voxels of the CT level) */
     int src;            /* source index (sources json order) */
     int flags;          /* bit 0: the ray points inward (toward the umbilicus) */
@@ -85,6 +88,11 @@ void vt_phase_bwd(vt_t lg, const float *gph, const float *ginc, vt_t glg);
 typedef struct { double phase, density, wsum, dsum; } vt_loss;
 int vt_losses(const float *ph, const float *inc, const float *tg, const uint16_t *comp, const float *pw, int T, int L, float delta_p, float delta_d,
               float lam_p, float lam_d, float scale, float *gph, float *ginc, vt_loss *out);
+
+/* position-only shell loss (villa position_only_phase_loss) over the columns without phase labels: shell [T][T][L] 1 = a verified-patch
+   shell voxel; gph += lam_h scale d/d ph (hinge + snap; lam_s must equal lam_h for now); hinge / snap / active columns out */
+int vt_shell_loss(const float *ph, const uint8_t *shell, const uint16_t *comp, int T, int L, float gate, float lam_h, float lam_s, float scale,
+                  float *gph, double *hinge, double *snap, double *ncol);
 
 /* ---------------- model (src/vwt_net.c; VW) ---------------- */
 typedef struct {

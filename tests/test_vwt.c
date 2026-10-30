@@ -88,6 +88,22 @@ int main(void) {
         printf("losses: phase %.4f density %.5f; d/d ph max err %.2e (max |g| %.2e), d/d inc max err %.2e (max |g| %.2e)\n", lo.phase, lo.density, e1, s1, e2, s2);
         fails += e1 > 3e-2 * s1 + 1e-6 || e2 > 3e-2 * s2 + 1e-6;
     }
+    {   /* shell loss: monotone ph, shell runs every ~5 voxels in half the columns, FD vs the gradient */
+        float *ph = malloc(n * 4); uint8_t *sh = calloc(n, 1); uint16_t *cz = calloc(n, 2);
+        for (size_t c0 = 0; c0 < (size_t)T * T; c0++) { float a = 0; for (int k = 0; k < L; k++) { a += (float)(0.12 + 0.15 * urand()); ph[c0 * L + k] = a; if (c0 % 2 && k % 5 == 2) sh[c0 * L + k] = 1; } if (c0 % 6 == 1) cz[c0 * L + 3] = 1; }
+        float *pd = nn_malloc(n * 4), *gd = nn_malloc(n * 4); uint8_t *sd = nn_malloc(n); uint16_t *czd = nn_malloc(n * 2);
+        nn_h2d(pd, ph, n * 4); nn_h2d(sd, sh, n); nn_h2d(czd, cz, n * 2); nn_zero(gd, n * 4);
+        double h0, s0, nc; vt_shell_loss(pd, sd, czd, T, L, 0.25f, 1.f, 1.f, 1.f, gd, &h0, &s0, &nc);
+        float *g = malloc(n * 4); nn_d2h(g, gd, n * 4); double e = 0, gm = 0;
+        for (int t = 0; t < 40; t++) {
+            size_t i = (size_t)(urand() * n); i = (i / L) * L + 2 + 5 * (size_t)(urand() * 4); const float eps = 1e-3f, v0 = ph[i]; double hp, sp, hm, sm;
+            float v = v0 + eps; nn_h2d(pd + i, &v, 4); vt_shell_loss(pd, sd, czd, T, L, 0.25f, 1.f, 1.f, 1.f, nullptr, &hp, &sp, &nc);
+            v = v0 - eps; nn_h2d(pd + i, &v, 4); vt_shell_loss(pd, sd, czd, T, L, 0.25f, 1.f, 1.f, 1.f, nullptr, &hm, &sm, &nc); nn_h2d(pd + i, &v0, 4);
+            const double f = ((hp + sp) - (hm + sm)) / (2 * eps); e = fmax(e, fabs(f - g[i])); gm = fmax(gm, fabs(g[i]));
+        }
+        printf("shell loss: hinge %.4f snap %.5f over %.0f columns; d/d ph max err %.2e (max |g| %.2e)\n", h0, s0, nc, e, gm);
+        fails += e > 3e-2 * gm + 1e-6 || nc < 1;
+    }
     printf(fails ? "FAIL (%d)\n" : "PASS\n", fails);
     return fails ? 1 : 0;
 }

@@ -3,6 +3,7 @@
    ufsm vwt-train SOURCES RUNDIR [--gpu 0] [--steps 50000] [--batch 2] [--lr 5e-4] [--wd 0.01] [--warmup 500] [--ema 0.999] [--clip 1]
                   [--tilt 15] [--threads 12] [--log 50] [--ckpt-every 2000] [--seed 1] [--tf32 1] [--core 1]
                   [--dp 0.25] [--dd 0.05] [--lam-p 1] [--lam-d 1] [--T 128] [--L 384]
+                  [--shell 0|1 --lam-shell 0.2 --snap-gate 0.25]   (position-only shell loss on samples with shell masks)
    ufsm vwt-train --bench N [--T 128 --L 384]   forward + backward of N random slabs (no sampler): ms / slab, Mvox/s, device memory
 
    AdamW (all parameters, as villa's torch AdamW), cosine schedule with linear warm-up, global-norm clipping, EMA of the weights.
@@ -64,6 +65,8 @@ int cmd_vwt_train(int argc, char **argv) {
     const float lr0 = (float)atof(opt(argc, argv, "--lr", "5e-4")), wd = (float)atof(opt(argc, argv, "--wd", "0.01")), emad = (float)atof(opt(argc, argv, "--ema", "0.999"));
     const float clip = (float)atof(opt(argc, argv, "--clip", "1")), dp = (float)atof(opt(argc, argv, "--dp", "0.25")), dd = (float)atof(opt(argc, argv, "--dd", "0.05"));
     const float lp = (float)atof(opt(argc, argv, "--lam-p", "1")), ld = (float)atof(opt(argc, argv, "--lam-d", "1"));
+    const int use_shell = atoi(opt(argc, argv, "--shell", "0"));   /* position-only shell loss (samples carrying shell masks) */
+    const float lsh = (float)atof(opt(argc, argv, "--lam-shell", "0.2")), gate = (float)atof(opt(argc, argv, "--snap-gate", "0.25"));
     mkdir(run, 0755);
     char path[1200]; snprintf(path, sizeof path, "%s/latest.vwt", run);
     vwt_cfg c = default_cfg(T, L);
@@ -87,10 +90,11 @@ int cmd_vwt_train(int argc, char **argv) {
     if (!S) { fprintf(stderr, "vwt-train: cannot open sources %s\n", src); return 1; }
     const size_t n = (size_t)T * T * L;
     uint8_t *imd = nn_malloc(n), *vad = nn_malloc(n); float *tg = nn_malloc(n * 4), *pw = nn_malloc(n * 4), *gph = nn_malloc(n * 4), *ginc = nn_malloc(n * 4);
-    float *phd = nn_malloc(n * 4), *incd = nn_malloc(n * 4); uint16_t *cd = nn_malloc(n * 2); float *ones = malloc(n * 4);
+    float *phd = nn_malloc(n * 4), *incd = nn_malloc(n * 4); uint16_t *cd = nn_malloc(n * 2); float *ones = malloc(n * 4); uint8_t *shd = nn_malloc(n);
+    double acc_h = 0, acc_hc = 0;
     for (size_t i = 0; i < n; i++) ones[i] = 1.f;
     snprintf(path, sizeof path, "%s/log.tsv", run); FILE *lf = fopen(path, step ? "a" : "w"); if (!lf) return 1;
-    if (!step) fprintf(lf, "step\tlr\tphase\tdensity\tgnorm\tsec_step\tsample_wait\tlabelled\tmono\n");
+    if (!step) fprintf(lf, "step\tlr\tphase\tdensity\tgnorm\tsec_step\tsample_wait\tlabelled\tmono\tshell\tshell_cols\n");
     double acc_p = 0, acc_d = 0, acc_w = 0, acc_mono = 0, t_step = 0, t_wait = 0, acc_g = 0; int acc_n = 0;
     while (step < steps) {
         const double t0 = now_s(); double wait = 0;
@@ -103,6 +107,11 @@ int cmd_vwt_train(int argc, char **argv) {
             if (vwt_forward(m, imd, vad, phd, incd, 1)) return 1;
             vt_loss lo; if (vt_losses(phd, incd, tg, cd, pw, T, L, dp, dd, lp, ld, 1.f / B, gph, ginc, &lo)) return 1;
             acc_p += lo.phase; acc_d += lo.density; acc_w += lo.wsum;
+            if (use_shell && s.shell) {
+                double hh, ss, nc; nn_h2d(shd, s.shell, n);
+                if (vt_shell_loss(phd, shd, cd, T, L, gate, lsh, lsh, 1.f / B, gph, &hh, &ss, &nc)) return 1;
+                acc_h += hh + ss; acc_hc += nc;
+            }
             if (vwt_backward(m, gph, ginc)) return 1;
         }
         /* clip, schedule, AdamW, EMA */
@@ -117,11 +126,11 @@ int cmd_vwt_train(int argc, char **argv) {
         nn_sync(); t_step += now_s() - t0; t_wait += wait; acc_g += gn; acc_n++;
         if (step % logf == 0 || step == steps) {
             const double k = acc_n * B;
-            fprintf(lf, "%d\t%.3g\t%.5f\t%.6f\t%.3f\t%.3f\t%.3f\t%.0f\t%.3f\n", step, lr, acc_p / k, acc_d / k, acc_g / acc_n, t_step / acc_n, t_wait / acc_n, acc_w / k, acc_mono / k);
+            fprintf(lf, "%d\t%.3g\t%.5f\t%.6f\t%.3f\t%.3f\t%.3f\t%.0f\t%.3f\t%.5f\t%.0f\n", step, lr, acc_p / k, acc_d / k, acc_g / acc_n, t_step / acc_n, t_wait / acc_n, acc_w / k, acc_mono / k, acc_h / k, acc_hc / k);
             fflush(lf);
             fprintf(stderr, "vwt-train: step %d lr %.2e phase %.4f density %.5f |g| %.2f  %.2f s/step (wait %.2f)  %.1f Mvox/s  mono %.2f\n", step, lr, acc_p / k, acc_d / k, acc_g / acc_n,
                     t_step / acc_n, t_wait / acc_n, (double)n * B / (t_step / acc_n) / 1e6, acc_mono / k);
-            acc_p = acc_d = acc_w = acc_mono = t_step = t_wait = acc_g = 0; acc_n = 0;
+            acc_p = acc_d = acc_w = acc_mono = t_step = t_wait = acc_g = acc_h = acc_hc = 0; acc_n = 0;
         }
         snprintf(path, sizeof path, "%s/STOP", run); const int stop = access(path, F_OK) == 0 || g_term;
         if (step % ckev == 0 || step == steps || stop) {

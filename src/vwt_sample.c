@@ -28,7 +28,7 @@ int jpeg_write_rgb(const char *path, int w, int h, const uint8_t *rgb, int quali
 #include <string.h>
 
 typedef struct {
-    char name[128]; z3 *ct, *ph; int lv, plv, psign; double l0s, um0; axis ax; int hasax; double weight;
+    char name[128]; z3 *ct, *ph, *sh; int lv, plv, psign, shlv; double l0s, um0; axis ax; int hasax; double weight;
     int64_t *chunks; int64_t nch, cgrid[3], csz[3];      /* stored GT chunks (outside holdouts) */
     double (*box)[6]; int nbox;                          /* holdout boxes, CT voxels zyx */
     double (*seg)[6]; int nseg; double seg_r;            /* exclusion tubes, CT voxels zyx */
@@ -36,7 +36,7 @@ typedef struct {
 
 typedef struct { vws_sample s; int state; } vws_slot;   /* 0 free, 1 being filled, 2 ready, 3 handed out */
 struct vws {
-    vws_src *S; int ns; double wsum; int T, L; float tilt; int train; unsigned seed;
+    vws_src *S; int ns; double wsum; int T, L; float tilt; int train; unsigned seed; int has_shell;
     vws_slot *slot; int nslot; pthread_t *th; int nth; _Atomic int stop; _Atomic long long next_id;
     pthread_mutex_t mu; pthread_cond_t cv; int last;
 };
@@ -115,7 +115,7 @@ static int vws_seg_hit(const double (*seg)[6], const int *idx, int nidx, double 
 }
 
 /* ---- one slab ---- */
-typedef struct { uint8_t *ct, *gt; size_t ccap, gcap; float *raw, *q, *kinc; size_t n; int *sidx; int nsidx; uint8_t *arena; } vws_work;
+typedef struct { uint8_t *ct, *gt, *shb; size_t ccap, gcap, scap; float *raw, *q, *kinc; size_t n; int *sidx; int nsidx; uint8_t *arena; } vws_work;
 #define VWS_ARENA ((size_t)64 << 21)   /* the crush map's CT tile cache per worker (64 x 2 MiB) */
 typedef struct { crush_cache *cc; crush_layer L; } vws_ctu;
 static double vws_ct_xyz(void *ud, const double x[3]) { vws_ctu *u = ud; const double p[3] = {x[2], x[1], x[0]}; return crush_linear_at(u->cc, &u->L, p); }
@@ -154,8 +154,8 @@ static int vws_fill(vws *V, uint64_t *rs, vws_work *w, vws_sample *out) {
         vws_src *S = &V->S[si];
         /* a random voxel of a random stored GT chunk (GT voxels zyx) -> CT voxels xyz */
         const int64_t ck = S->chunks[vws_rng(rs) % (uint64_t)S->nch]; const int64_t cz = ck / (S->cgrid[1] * S->cgrid[2]), cy = ck / S->cgrid[2] % S->cgrid[1], cx = ck % S->cgrid[2];
-        const double f = ldexp(1, S->plv - S->lv);   /* CT voxels per GT voxel */
-        const double pz = (cz * S->csz[0] + vws_unif(rs) * S->csz[0]) * f, py = (cy * S->csz[1] + vws_unif(rs) * S->csz[1]) * f, px = (cx * S->csz[2] + vws_unif(rs) * S->csz[2]) * f;
+        const double f = ldexp(1, S->plv - S->lv), fd = S->ph ? f : ldexp(1, S->shlv - S->lv);   /* CT voxels per GT / drawn-raster voxel */
+        const double pz = (cz * S->csz[0] + vws_unif(rs) * S->csz[0]) * fd, py = (cy * S->csz[1] + vws_unif(rs) * S->csz[1]) * fd, px = (cx * S->csz[2] + vws_unif(rs) * S->csz[2]) * fd;
         double ay = 0, ax = 0; if (S->hasax) { axis_at(&S->ax, pz * S->l0s, &ay, &ax); ay /= S->l0s; ax /= S->l0s; }
         double rd[3] = {px - ax, py - ay, 0}; double rn = hypot(rd[0], rd[1]); if (rn < 1) { rd[0] = 1; rd[1] = 0; rn = 1; } rd[0] /= rn; rd[1] /= rn;
         /* tilt <= tilt_deg in a random azimuth: d = cos t r + sin t (cos phi z + sin phi (z x r)) */
@@ -204,11 +204,23 @@ static int vws_fill(vws *V, uint64_t *rs, vws_work *w, vws_sample *out) {
         if (z3_read(S->ct, bo, bn, w->ct, 1)) { fprintf(stderr, "vws: CT read failed (%s): %s\n", S->name, z3_error()); continue; }
         VP(VP_CT);
         /* GT box (zyx, GT voxels): nearest GT voxel of a CT point c: floor((c + 0.5) / f) */
-        const int64_t *G = z3_meta_of(S->ph)->shape; int64_t go[3], gn[3];
-        for (int e = 0; e < 3; e++) { const int x = 2 - e; int64_t a = (int64_t)floor((lo[x] + 0.5) / f) - 1, b = (int64_t)floor((hi[x] + 0.5) / f) + 2; a = a < 0 ? 0 : a; b = b > G[e] ? G[e] : b; if (b <= a) { a = 0; b = 1; } go[e] = a; gn[e] = b - a; }
-        const size_t gneed = (size_t)gn[0] * gn[1] * gn[2];
-        if (gneed > w->gcap) { free(w->gt); w->gt = malloc(gneed); w->gcap = gneed; if (!w->gt) return -1; }
-        if (z3_read(S->ph, go, gn, w->gt, 1)) { fprintf(stderr, "vws: GT read failed (%s): %s\n", S->name, z3_error()); continue; }
+        int64_t go[3] = {0, 0, 0}, gn[3] = {0, 0, 0};
+        if (S->ph) {
+            const int64_t *G = z3_meta_of(S->ph)->shape;
+            for (int e = 0; e < 3; e++) { const int x = 2 - e; int64_t a = (int64_t)floor((lo[x] + 0.5) / f) - 1, b = (int64_t)floor((hi[x] + 0.5) / f) + 2; a = a < 0 ? 0 : a; b = b > G[e] ? G[e] : b; if (b <= a) { a = 0; b = 1; } go[e] = a; gn[e] = b - a; }
+            const size_t gneed = (size_t)gn[0] * gn[1] * gn[2];
+            if (gneed > w->gcap) { free(w->gt); w->gt = malloc(gneed); w->gcap = gneed; if (!w->gt) return -1; }
+            if (z3_read(S->ph, go, gn, w->gt, 1)) { fprintf(stderr, "vws: GT read failed (%s): %s\n", S->name, z3_error()); continue; }
+        }
+        /* shell box (zyx, shell voxels), nearest as the GT */
+        const double fs = ldexp(1, S->shlv - S->lv); int64_t so[3] = {0, 0, 0}, sn[3] = {0, 0, 0};
+        if (S->sh) {
+            const int64_t *H = z3_meta_of(S->sh)->shape;
+            for (int e = 0; e < 3; e++) { const int x = 2 - e; int64_t a = (int64_t)floor((lo[x] + 0.5) / fs) - 1, b = (int64_t)floor((hi[x] + 0.5) / fs) + 2; a = a < 0 ? 0 : a; b = b > H[e] ? H[e] : b; if (b <= a) { a = 0; b = 1; } so[e] = a; sn[e] = b - a; }
+            const size_t sneed = (size_t)sn[0] * sn[1] * sn[2];
+            if (sneed > w->scap) { free(w->shb); w->shb = malloc(sneed); w->scap = sneed; if (!w->shb) return -1; }
+            if (z3_read(S->sh, so, sn, w->shb, 1)) { fprintf(stderr, "vws: shell read failed (%s): %s\n", S->name, z3_error()); continue; }
+        }
         VP(VP_GT);
         /* tubes near this slab */
         w->nsidx = 0; const double R = S->seg_r;
@@ -231,13 +243,32 @@ static int vws_fill(vws *V, uint64_t *rs, vws_work *w, vws_sample *out) {
                                  + fz * ((1 - fy) * ((1 - fx) * B[sz] + fx * B[sz + 1]) + fy * ((1 - fx) * B[sz + sy] + fx * B[sz + sy + 1]));
                 const int u = (int)lround(val); out->im[v] = (uint8_t)(u < 0 ? 0 : u > 255 ? 255 : u); out->va[v] = 1;
             }
+            if (out->shell) {
+                out->shell[v] = 0;
+                if (S->sh) {
+                    const int64_t hz = (int64_t)floor((z + 0.5) / fs) - so[0], hy = (int64_t)floor((y + 0.5) / fs) - so[1], hx = (int64_t)floor((x + 0.5) / fs) - so[2];
+                    if (hz >= 0 && hy >= 0 && hx >= 0 && hz < sn[0] && hy < sn[1] && hx < sn[2] && w->shb[((size_t)hz * sn[1] + hy) * sn[2] + hx] != 255) out->shell[v] = 1;
+                }
+            }
             w->raw[v] = NAN;
+            if (!S->ph) continue;
             const int64_t gz = (int64_t)floor((z + 0.5) / f) - go[0], gy = (int64_t)floor((y + 0.5) / f) - go[1], gx = (int64_t)floor((x + 0.5) / f) - go[2];
             if (gz < 0 || gy < 0 || gx < 0 || gz >= gn[0] || gy >= gn[1] || gx >= gn[2]) continue;
             const uint8_t c = w->gt[((size_t)gz * gn[1] + gy) * gn[2] + gx]; if (c >= 252) continue;
             double ph = S->psign * c / 252.0; ph -= floor(ph); w->raw[v] = (float)ph; nlab++;
         }
         VP(VP_SAMPLE);
+        if (out->shell && w->nsidx) for (size_t v = 0; v < n; v++) if (out->shell[v]) {   /* no shell inside the ray-check tubes */
+            const float *qq = w->q + 3 * v; const double p[3] = {qq[2], qq[1], qq[0]};
+            if (vws_seg_hit(S->seg, w->sidx, w->nsidx, R * R, p)) out->shell[v] = 0;
+        }
+        if (!S->ph) {   /* shell-only source: no phase target */
+            size_t ns = 0; for (size_t v = 0; v < n; v++) { out->ph[v] = NAN; out->comp[v] = 0; out->pw[v] = 0; ns += out->shell[v]; }
+            if (ns < n / 2000) continue;
+            if (g_vwa_ok && V->train) vwa_intensity(&g_vwa, vws_rng(rs), out->im, out->va, T, L);
+            out->T = T; out->L = L; out->src = si; out->flags = inward;
+            return 0;
+        }
         if (nlab < n / 100) continue;
         if (geo) {   /* deformed: exact k increments through the source GT along each q segment (substeps <= 0.5 voxel) */
             if (!w->kinc) { w->kinc = malloc(n * sizeof *w->kinc); if (!w->kinc) return -1; }
@@ -288,12 +319,13 @@ static void *vws_worker(void *arg) {
         if (V->stop) { pthread_mutex_unlock(&V->mu); break; }
         V->slot[k].state = 1; pthread_mutex_unlock(&V->mu);
         const long long id = atomic_fetch_add(&V->next_id, 1);
-        uint64_t rs = V->train ? ((uint64_t)V->seed << 32) ^ (uint64_t)id * 0x9e3779b97f4a7c15ull ^ (uint64_t)A->t << 56 : ((uint64_t)V->seed << 32) ^ (uint64_t)id;   /* val: sample id i -> seed (seed, i) */
+        uint64_t r0 = V->train ? ((uint64_t)V->seed << 32) ^ (uint64_t)id * 0x9e3779b97f4a7c15ull ^ (uint64_t)A->t << 56 : ((uint64_t)V->seed << 32) ^ (uint64_t)id;   /* val: sample id i -> seed (seed, i) */
+        uint64_t rs = vws_rng(&r0);   /* (mixed once: raw states differing by multiples of the splitmix step would share one stream: duplicate slabs) */
         int rc = vws_fill(V, &rs, &w, &V->slot[k].s);
         pthread_mutex_lock(&V->mu); V->slot[k].state = rc ? 0 : 2; pthread_cond_broadcast(&V->cv); pthread_mutex_unlock(&V->mu);
         if (rc) fprintf(stderr, "vws: no slab after 64 draws\n");
     }
-    free(w.raw); free(w.q); free(w.kinc); free(w.arena); free(w.ct); free(w.gt); free(w.sidx); free(A); return nullptr;
+    free(w.raw); free(w.q); free(w.kinc); free(w.arena); free(w.ct); free(w.gt); free(w.shb); free(w.sidx); free(A); return nullptr;
 }
 
 int vws_next(vws *V, vws_sample *out) {
@@ -326,10 +358,15 @@ vws *vws_open(const char *sources_json, int T, int L, float tilt_deg, int nthrea
         const json *pt = json_path(e, "targets.band.phase");
         const char *proot = pt ? json_str(json_get(pt, "root"), nullptr) : nullptr, *pkey = pt ? json_str(json_get(pt, "key"), nullptr) : nullptr;
         S->plv = pt ? (int)json_num(json_get(pt, "level"), S->lv) : S->lv; S->psign = pt && json_num(json_get(pt, "phase_sign"), 1) < 0 ? -1 : 1;
-        if (!root || !ct || !proot || !pkey || !(S->um0 > 0)) { fprintf(stderr, "vws: %s: needs root, ct, um, targets.band.phase {root, key, level}: skipped\n", S->name); continue; }
+        const json *shj = json_get(e, "shell");   /* {"root", "key", "level"}: surface-patch shells (patch-raster codes, 255 none); alone = a shell-only source */
+        const char *sroot = shj ? json_str(json_get(shj, "root"), nullptr) : nullptr, *skey = shj ? json_str(json_get(shj, "key"), nullptr) : nullptr;
+        S->shlv = shj ? (int)json_num(json_get(shj, "level"), S->lv) : S->lv;
+        if (!root || !ct || !(S->um0 > 0) || ((!proot || !pkey) && (!sroot || !skey))) { fprintf(stderr, "vws: %s: needs root, ct, um and targets.band.phase {root, key, level} and / or shell {root, key, level}: skipped\n", S->name); continue; }
         S->ct = pyramid_open_level(store_open(root), ct, S->lv, S->um0, cache);
-        S->ph = z3_open(store_open(proot), pkey, nullptr);
-        if (!S->ct || !S->ph) { fprintf(stderr, "vws: %s: cannot open CT level %d or GT %s/%s: %s\n", S->name, S->lv, proot, pkey, z3_error()); continue; }
+        S->ph = proot && pkey ? z3_open(store_open(proot), pkey, nullptr) : nullptr;
+        S->sh = sroot && skey ? z3_open(store_open(sroot), skey, nullptr) : nullptr;
+        if (!S->ct || (proot && !S->ph) || (sroot && !S->sh)) { fprintf(stderr, "vws: %s: cannot open CT level %d, GT %s/%s or shells %s/%s: %s\n", S->name, S->lv, proot ? proot : "-", pkey ? pkey : "-", sroot ? sroot : "-", skey ? skey : "-", z3_error()); continue; }
+        if (S->sh) V->has_shell = 1;
         const char *axp = json_str(json_get(e, "axis"), nullptr); S->hasax = axp && !axis_load(&S->ax, axp);
         if (!S->hasax) fprintf(stderr, "vws: %s: no axis (rays radial from the box centre line x = y = 0)\n", S->name);
         V->wsum += wt; V->ns++;
@@ -381,9 +418,10 @@ vws *vws_open(const char *sources_json, int T, int L, float tilt_deg, int nthrea
             json_free(R);
         }
         /* stored GT chunks whose centre is outside the holdout boxes */
-        uint8_t *bits = nullptr; const int64_t np = z3_chunk_map(S->ph, S->cgrid, &bits);
-        const z3_meta *gm = z3_meta_of(S->ph); for (int d = 0; d < 3; d++) S->csz[d] = gm->chunk[d];
-        const double f = ldexp(1, S->plv - S->lv); int64_t kept = 0;
+        z3 *dz = S->ph ? S->ph : S->sh;   /* draws: from the GT's stored chunks, else (shell-only) the shells' */
+        uint8_t *bits = nullptr; const int64_t np = z3_chunk_map(dz, S->cgrid, &bits);
+        const z3_meta *gm = z3_meta_of(dz); for (int d = 0; d < 3; d++) S->csz[d] = gm->chunk[d];
+        const double f = ldexp(1, (S->ph ? S->plv : S->shlv) - S->lv); int64_t kept = 0;
         if (np > 0) {
             S->chunks = malloc(np * sizeof *S->chunks);
             const int64_t ng = S->cgrid[0] * S->cgrid[1] * S->cgrid[2];
@@ -407,6 +445,7 @@ vws *vws_open(const char *sources_json, int T, int L, float tilt_deg, int nthrea
     const size_t n = (size_t)T * T * L;
     for (int s = 0; s < V->nslot; s++) {
         vws_sample *o = &V->slot[s].s; o->im = malloc(n); o->va = malloc(n); o->ph = malloc(n * 4); o->comp = malloc(n * 2); o->pw = malloc(n * 4);
+        o->shell = V->has_shell ? malloc(n) : nullptr;
         if (!o->im || !o->va || !o->ph || !o->comp || !o->pw) { fprintf(stderr, "vws: out of memory\n"); return nullptr; }
     }
     V->th = calloc(V->nth, sizeof *V->th);
@@ -422,8 +461,8 @@ void vws_close(vws *V) {
         for (int t = 0; t < V->nth; t++) pthread_join(V->th[t], nullptr);
         pthread_mutex_destroy(&V->mu); pthread_cond_destroy(&V->cv);
     }
-    for (int s = 0; V->slot && s < V->nslot; s++) { vws_sample *o = &V->slot[s].s; free(o->im); free(o->va); free(o->ph); free(o->comp); free(o->pw); }
-    for (int s = 0; s < V->ns; s++) { vws_src *S = &V->S[s]; if (S->ct) z3_close(S->ct); if (S->ph) z3_close(S->ph); free(S->chunks); free(S->box); free(S->seg); }
+    for (int s = 0; V->slot && s < V->nslot; s++) { vws_sample *o = &V->slot[s].s; free(o->im); free(o->va); free(o->ph); free(o->comp); free(o->pw); free(o->shell); }
+    for (int s = 0; s < V->ns; s++) { vws_src *S = &V->S[s]; if (S->ct) z3_close(S->ct); if (S->ph) z3_close(S->ph); if (S->sh) z3_close(S->sh); free(S->chunks); free(S->box); free(S->seg); }
     free(V->S); free(V->slot); free(V->th); free(V);
 }
 
@@ -441,15 +480,15 @@ int cmd_vwt_sample(int argc, char **argv) {
     vws *V = vws_open(argv[2], T, L, (float)atof(vo(argc, argv, "--tilt", "15")), atoi(vo(argc, argv, "--threads", "8")), (unsigned)atoi(vo(argc, argv, "--seed", "1")), !atoi(vo(argc, argv, "--val", "0")));
     if (!V) return 1;
     mkdir(argv[3], 0775); char p[1400]; snprintf(p, sizeof p, "%s/meta.tsv", argv[3]); FILE *m = fopen(p, "w");
-    if (m) fprintf(m, "i\tsrc\tinward\to_x\to_y\to_z\td_x\td_y\td_z\tlabelled\tweighted\tcomps\tph_rise\n");
+    if (m) fprintf(m, "i\tsrc\tinward\to_x\to_y\to_z\td_x\td_y\td_z\tlabelled\tweighted\tcomps\tph_rise\tshell\n");
     struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0); const size_t n = (size_t)T * T * L;
     for (int i = 0; i < N; i++) {
         vws_sample s; if (vws_next(V, &s)) break;
-        size_t lab = 0, wsum = 0, up = 0, dn = 0; int nc = 0;
-        for (size_t v = 0; v < n; v++) { lab += s.comp[v] != 0; wsum += s.pw[v] > 0; if (s.comp[v] > nc) nc = s.comp[v];
+        size_t lab = 0, wsum = 0, up = 0, dn = 0, nsh = 0; int nc = 0;
+        for (size_t v = 0; v < n; v++) { lab += s.comp[v] != 0; wsum += s.pw[v] > 0; nsh += s.shell && s.shell[v]; if (s.comp[v] > nc) nc = s.comp[v];
             if (v % L && s.comp[v] && s.comp[v] == s.comp[v - 1]) { const float d = s.ph[v] - s.ph[v - 1]; up += d > 0; dn += d < 0; } }
-        if (m) fprintf(m, "%d\t%d\t%d\t%.1f\t%.1f\t%.1f\t%.3f\t%.3f\t%.3f\t%.4f\t%.4f\t%d\t%.3f\n", i, s.src, s.flags & 1, s.o[0], s.o[1], s.o[2], s.d[0], s.d[1], s.d[2],
-                       (double)lab / n, (double)wsum / n, nc, up + dn ? (double)up / (up + dn) : 0.0);
+        if (m) fprintf(m, "%d\t%d\t%d\t%.1f\t%.1f\t%.1f\t%.3f\t%.3f\t%.3f\t%.4f\t%.4f\t%d\t%.3f\t%.5f\n", i, s.src, s.flags & 1, s.o[0], s.o[1], s.o[2], s.d[0], s.d[1], s.d[2],
+                       (double)lab / n, (double)wsum / n, nc, up + dn ? (double)up / (up + dn) : 0.0, (double)nsh / n);
         if (jpg) {   /* the i = T / 2 plane ([j][k], the ray across): CT | wrapped target phase hue over the CT (unlabelled: CT) */
             uint8_t *img = malloc((size_t)2 * T * L * 3);
             for (int j = 0; j < T; j++) for (int k = 0; k < L; k++) {
@@ -462,8 +501,8 @@ int cmd_vwt_sample(int argc, char **argv) {
             snprintf(p, sizeof p, "%s/s%03d.jpg", argv[3], i); jpeg_write_rgb(p, L, 2 * T, img, 88); free(img);
         }
         if (wr) {
-            const char *ext[5] = {"im.u8", "va.u8", "ph.f32", "comp.u16", "pw.f32"}; const void *buf[5] = {s.im, s.va, s.ph, s.comp, s.pw}; const size_t es[5] = {1, 1, 4, 2, 4};
-            for (int k = 0; k < 5; k++) { snprintf(p, sizeof p, "%s/s%03d.%s", argv[3], i, ext[k]); FILE *f = fopen(p, "wb"); if (f) { fwrite(buf[k], es[k], n, f); fclose(f); } }
+            const char *ext[6] = {"im.u8", "va.u8", "ph.f32", "comp.u16", "pw.f32", "shell.u8"}; const void *buf[6] = {s.im, s.va, s.ph, s.comp, s.pw, s.shell}; const size_t es[6] = {1, 1, 4, 2, 4, 1};
+            for (int k = 0; k < (s.shell ? 6 : 5); k++) { snprintf(p, sizeof p, "%s/s%03d.%s", argv[3], i, ext[k]); FILE *f = fopen(p, "wb"); if (f) { fwrite(buf[k], es[k], n, f); fclose(f); } }
         }
     }
     clock_gettime(CLOCK_MONOTONIC, &t1); const double dt = (t1.tv_sec - t0.tv_sec) + 1e-9 * (t1.tv_nsec - t0.tv_nsec);
