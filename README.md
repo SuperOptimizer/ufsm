@@ -201,7 +201,8 @@ input grid: `<w>_recto` (inner face, toward the umbilicus) and `<w>_verso` (oute
 Recto is the inner face because of the published-label side rule (`band_field_side_pair`): the
 papyrus outward of wrap k is labelled recto side. Run it on the flattened grid, so both faces share
 one uv and render pixel-aligned. `ink-compare --rgb-agree recto,verso` writes the agreement image:
-recto ink is magenta, verso ink is green, and both together are white.
+recto ink is magenta, verso ink is green, and both together are white. `--diff-agree recto,verso`
+writes |recto - verso| through viridis instead (0 = agree, 255 = disagree; `--diff-gain G` scales it).
 
 ```sh
 build/ufsm faces flat faces --ct CT 2 --ct-um 9.6 --umb umbilicus.json --umb-um 2.4 [--gt codes.zarr 9.6 --gt-um 9.6]

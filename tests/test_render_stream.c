@@ -179,6 +179,25 @@ int main(void) {
             CHECK(same_file(x, y), "case 1: %s differs", x);
         }
     }
+    {   /* --diff-agree: an ink against itself is viridis 0 on papyrus; against another ink, brighter */
+        char o[760], ic[760], idd[760], sv[760]; snprintf(o, sizeof o, "%s/d.jpg", dir); snprintf(sv, sizeof sv, "%s/d.txt", dir);
+        snprintf(ic, sizeof ic, "copy=%s", ip); snprintf(idd, sizeof idd, "%s", ib);
+        double mean[2] = {0, 0};
+        for (int c = 0; c < 2; c++) {
+            char *a[] = {"ufsm", "ink-compare", o, "--ct", cp, "--ink", ia, "--ink", c ? idd : ic, "--diff-agree", c ? "gamb,other" : "gamb,copy", "--full", "--threads", "2", nullptr};
+            CHECK(run(cmd_ink_compare, a, sv) == 0, "diff-agree %d rc", c);
+            int w = 0, h = 0; uint8_t *j = jpeg_read_rgb(o, &w, &h); long nn = 0, bad = 0;
+            CHECK(j && w == W && h == H, "diff-agree %d size %dx%d", c, w, h);
+            for (int y = h / 4; j && y < h; y++) for (int x = 0; x < w; x++) {
+                const uint8_t *q = j + ((size_t)y * w + x) * 3; if (abs(q[0] - 40) < 6 && abs(q[1] - 40) < 6 && abs(q[2] - 40) < 6) continue;   /* off papyrus */
+                nn++; mean[c] += q[1]; if (!c && (abs(q[0] - 68) > 12 || q[1] > 14 || abs(q[2] - 84) > 12)) bad++;
+            }
+            if (nn) mean[c] /= nn;
+            CHECK(nn > 0 && bad < nn / 100, "diff-agree %d: %ld of %ld papyrus pixels off viridis 0", c, bad, nn);
+            free(j);
+        }
+        CHECK(mean[1] > mean[0] + 3, "diff-agree: disagreement not brighter (%.1f vs %.1f)", mean[1], mean[0]);
+    }
     free(ct); free(ink); free(ink2);
     snprintf(p, sizeof p, "rm -rf '%s'", dir); if (system(p)) {}
     if (fails) { fprintf(stderr, "test_render_stream: %d failures\n", fails); return 1; }
