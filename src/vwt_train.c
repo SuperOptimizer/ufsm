@@ -23,7 +23,8 @@
 static volatile sig_atomic_t g_term = 0;
 static void on_term(int sig) { (void)sig; g_term = 1; }
 
-static const char *opt(int argc, char **argv, const char *k, const char *d) { for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], k)) return argv[i + 1]; return d; }
+/* the LAST occurrence wins (launch scripts put their defaults first) */
+static const char *opt(int argc, char **argv, const char *k, const char *d) { for (int i = argc - 2; i >= 1; i--) if (!strcmp(argv[i], k)) return argv[i + 1]; return d; }
 static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + 1e-9 * t.tv_nsec; }
 
 static vwt_cfg default_cfg(int T, int L) { return (vwt_cfg){T, L, {32, 64, 96}, 192, 2, 6, 4, 256, 96, 0.04f}; }
