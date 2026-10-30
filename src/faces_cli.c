@@ -26,7 +26,8 @@ static void fc_par(void *(*fn)(void *), void *J, int nt) {
 typedef struct {
     z3 *z; int64_t shape[3]; int cs[3]; int64_t g[3]; uint8_t **ch; uint32_t *stamp; _Atomic uint8_t *need; size_t nres, cap; uint32_t clock; int nt;
     size_t ndec;
-    _Atomic uint32_t *needm; uint32_t *have;   /* sub: per chunk the volcomp substreams (16 z x 32 y slabs) marked / decoded; nullptr: whole chunks */
+    _Atomic uint32_t *needm; uint32_t *have;
+    uint8_t **pool; int npool; pthread_mutex_t pmu;   /* evicted whole-chunk buffers for reuse (no page faults / zeroing per decode) */   /* sub: per chunk the volcomp substreams (16 z x 32 y slabs) marked / decoded; nullptr: whole chunks */
 } fc_cache;
 static int fcc_init(fc_cache *c, z3 *z, int nt, double mb) {
     memset(c, 0, sizeof *c); const z3_meta *m = z3_meta_of(z); c->z = z; c->nt = nt < 1 ? 1 : nt;
@@ -34,7 +35,8 @@ static int fcc_init(fc_cache *c, z3 *z, int nt, double mb) {
     const size_t ng = (size_t)c->g[0] * c->g[1] * c->g[2];
     c->ch = calloc(ng, sizeof *c->ch); c->stamp = calloc(ng, sizeof *c->stamp); c->need = calloc(ng, 1);
     c->cap = (size_t)(mb * 1048576.0 / ((double)c->cs[0] * c->cs[1] * c->cs[2])); if (c->cap < 16) c->cap = 16;
-    return c->ch && c->stamp && c->need ? 0 : -1;
+    c->pool = malloc(512 * sizeof *c->pool); pthread_mutex_init(&c->pmu, nullptr);
+    return c->ch && c->stamp && c->need && c->pool ? 0 : -1;
 }
 /* the CT cache decodes only the volcomp substreams under the marked boxes (z3_read_sub; samples are only taken inside them, so the
    values are those of whole chunks). UFSM_FACES_FULLDECODE=1: whole chunks */
@@ -47,7 +49,8 @@ static int fcc_sub(fc_cache *c) {
 static void fcc_free(fc_cache *c) {
     const size_t ng = (size_t)c->g[0] * c->g[1] * c->g[2];
     for (size_t k = 0; c->ch && k < ng; k++) free(c->ch[k]);
-    free(c->ch); free((void *)c->need); free(c->stamp); free((void *)c->needm); free(c->have); memset(c, 0, sizeof *c);
+    for (int k = 0; k < c->npool; k++) free(c->pool[k]);
+    free(c->pool); free(c->ch); free((void *)c->need); free(c->stamp); free((void *)c->needm); free(c->have); memset(c, 0, sizeof *c);
 }
 static inline int fcc_voxel(const fc_cache *c, int64_t z, int64_t y, int64_t x) {   /* -1: outside / not decoded */
     if (z < 0 || y < 0 || x < 0 || z >= c->shape[0] || y >= c->shape[1] || x >= c->shape[2]) return -1;
@@ -99,7 +102,9 @@ static void *fcc_decode(void *arg) {
         const uint32_t want = c->needm ? atomic_load(&c->needm[id]) & ~c->have[id] : 0;   /* 0: the whole chunk */
         uint8_t *b = c->ch[id];
         if (b && c->needm && !want) continue;
-        uint8_t *t = whole && !b ? (b = malloc(cv)) : malloc((size_t)nn[0] * nn[1] * nn[2]);
+        uint8_t *fresh = nullptr;
+        if (whole && !b) { pthread_mutex_lock(&c->pmu); if (c->npool) fresh = c->pool[--c->npool]; pthread_mutex_unlock(&c->pmu); if (!fresh) fresh = malloc(cv); b = fresh; }
+        uint8_t *t = fresh ? fresh : malloc((size_t)nn[0] * nn[1] * nn[2]);
         if (!t || (!whole && !b && !(b = calloc(cv, 1))) || z3_read_sub(c->z, o, nn, t, 1, want)) { if (t != b) free(t); if (!c->ch[id]) free(b); atomic_store(&J->err, 1); continue; }
         if (t != b) {   /* edge chunk, or substreams added to a decoded chunk: copy (only the new substreams' rows) */
             for (int64_t z = 0; z < nn[0]; z++) for (int64_t y = 0; y < nn[1]; y++)
@@ -125,7 +130,10 @@ static int fcc_fill(void *ctx) {
     while (c->nres > c->cap) {   /* least recently needed first, never this band's */
         uint32_t old = c->clock; for (size_t k = 0; k < ng; k++) if (c->ch[k] && c->stamp[k] < old) old = c->stamp[k];
         if (old == c->clock) break;
-        for (size_t k = 0; k < ng && c->nres > c->cap; k++) if (c->ch[k] && c->stamp[k] == old) { free(c->ch[k]); c->ch[k] = nullptr; c->nres--; if (c->needm) c->needm[k] = c->have[k] = 0; }
+        for (size_t k = 0; k < ng && c->nres > c->cap; k++) if (c->ch[k] && c->stamp[k] == old) {
+            if (c->npool < 512 && c->pool) c->pool[c->npool++] = c->ch[k]; else free(c->ch[k]);
+            c->ch[k] = nullptr; c->nres--; if (c->needm) c->needm[k] = c->have[k] = 0;
+        }
     }
     return 0;
 }
