@@ -181,9 +181,12 @@ template <int MODE> static void igemm_launch(const VtP &p) {
     if (p.N <= 8) igemm_go<MODE, 128, 16, 4, 1>(p);          /* (the 4-output head: one 16-column tile) */
     else if (p.N <= 32) igemm_go<MODE, 128, 32, 4, 1>(p);
     else if (p.N <= 64) igemm_go<MODE, 128, 64, 4, 2>(p);
+    else if (p.N <= 96) igemm_go<MODE, 128, 96, 4, 2>(p);     /* (exact tiles for 96 / 192 outputs: no idle quarter, A staged once) */
+    else if (p.N <= 128) igemm_go<MODE, 128, 128, 2, 4>(p);
+    else if (p.N <= 192) igemm_go<MODE, 128, 192, 2, 4>(p);
     else igemm_go<MODE, 128, 128, 2, 4>(p);
 }
-static int ntile(int N) { return N <= 8 ? 16 : N <= 32 ? 32 : N <= 64 ? 64 : 128; }
+static int ntile(int N) { return N <= 8 ? 16 : N <= 32 ? 32 : N <= 64 ? 64 : N <= 96 ? 96 : N <= 128 ? 128 : N <= 192 ? 192 : 128; }
 
 /* ---- scratch: B matrices (fwd + bwd) and the weight gradient's bf16 im2col / gy chunks ---- */
 static const size_t WCHUNK = 192ull << 20, GCHUNK = 64ull << 20;   /* bf16 im2col / gy chunk bytes */
