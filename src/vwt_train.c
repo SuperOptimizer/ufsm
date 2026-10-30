@@ -49,7 +49,8 @@ static int bench(int argc, char **argv) {
     const int N = atoi(opt(argc, argv, "--bench", "3")), T = atoi(opt(argc, argv, "--T", "128")), L = atoi(opt(argc, argv, "--L", "384"));
     const char *trunk = opt(argc, argv, "--trunk", nullptr); const int mv = atoi(opt(argc, argv, "--mv", "0")), mvh = atoi(opt(argc, argv, "--mv-host", "0"));
     wtrunk *WT = nullptr; int cx = 0;
-    if (trunk) { WT = wt_open(trunk, T, L, 1, atoi(opt(argc, argv, "--trunk-feat", "1"))); if (!WT) return 1; cx = wt_channels(WT); }
+    const int ttr = trunk && atoi(opt(argc, argv, "--trunk-train", "0"));
+    if (trunk) { WT = ttr ? wt_open_train(trunk, T, L, 0) : wt_open(trunk, T, L, 1, atoi(opt(argc, argv, "--trunk-feat", "1"))); if (!WT) return 1; cx = wt_channels(WT); }
     vwt_cfg c = default_cfg(T, L); c.cx = cx; vwt *m = vwt_create(&c, 1); if (!m) return 1;
     const size_t n = (size_t)T * T * L; uint8_t *im = malloc(n), *va = malloc(n); float *tgh = malloc(n * 4); uint16_t *ch = malloc(n * 2);
     for (size_t i = 0; i < n; i++) { im[i] = (uint8_t)(120 + 60 * sin((i % L) * 0.5) + (rand() & 15)); va[i] = 1; tgh[i] = 0.07f * (float)(i % L); ch[i] = 1; }
@@ -59,6 +60,7 @@ static int bench(int argc, char **argv) {
     float *ph = nn_malloc(n * 4), *inc = nn_malloc(n * 4), *g1 = nn_malloc(n * 4), *g2 = nn_malloc(n * 4), *phb = nn_malloc(n * 4);
     float *pha_h = malloc(n * 4), *phb_h = malloc(n * 4), *gmv = malloc(n * 4), *gmvd = nn_malloc(n * 4);
     int xld = cx; uint16_t *xfd = cx ? vwt_xfeat_buf(m, &xld) : nullptr;
+    uint16_t *xgd = ttr ? xfd : nullptr; if (xgd) vwt_set_xgrad(m, xgd, xld);
     /* frames: A along +x at radius 600; B its copy rotated 20 degrees about the slab centre's vertical axis (overlapping) */
     const double r0 = 600, th = 20 * M_PI / 180;
     wt_frame fa = {{r0, -(T - 1) / 2.0, 500 - (T - 1) / 2.0}, {0, 1, 0}, {0, 0, 1}, {1, 0, 0}, {0, 0, 500}, {0, 0, 1}}, fb = fa;
@@ -67,8 +69,8 @@ static int bench(int argc, char **argv) {
       fb.o[0] = cxp - L / 2.0 * cs + (T - 1) / 2.0 * sn; fb.o[1] = -L / 2.0 * sn - (T - 1) / 2.0 * cs; }
     const double FA[4][3] = {{fa.o[0], fa.o[1], fa.o[2]}, {fa.a[0], fa.a[1], fa.a[2]}, {fa.b[0], fa.b[1], fa.b[2]}, {fa.d[0], fa.d[1], fa.d[2]}};
     const double FB[4][3] = {{fb.o[0], fb.o[1], fb.o[2]}, {fb.a[0], fb.a[1], fb.a[2]}, {fb.b[0], fb.b[1], fb.b[2]}, {fb.d[0], fb.d[1], fb.d[2]}};
-    double t[8] = {0}; long ns = 0;
-    const char *nm[8] = {"B trunk", "B forward", "A trunk", "A forward", "loss", "multiview", "A backward", "total"};
+    double t[9] = {0}; long ns = 0;
+    const char *nm[9] = {"B trunk", "B forward", "A trunk", "A forward", "loss", "multiview", "A backward", "trunk bwd+step", "total"};
 #define TS(k, stmt) do { nn_sync(); const double t0_ = now_s(); stmt; nn_sync(); if (r) t[k] += now_s() - t0_; } while (0)
     for (int r = 0; r <= N; r++) {
         nn_sync(); const double t00 = now_s();
@@ -77,19 +79,20 @@ static int bench(int argc, char **argv) {
             if (WT) TS(0, if (wt_forward_ld(WT, imd, &fb, 1, 9.6, xfd, xld)) return 1);
             TS(1, if (vwt_forward(m, imd, vad, phb, nullptr, 0)) return 1);
         }
-        if (WT) TS(2, if (wt_forward_ld(WT, imd, &fa, 1, 9.6, xfd, xld)) return 1);
+        if (WT) TS(2, if (ttr ? wt_forward_train(WT, imd, &fa, 9.6, xfd, xld) : wt_forward_ld(WT, imd, &fa, 1, 9.6, xfd, xld)) return 1);
         TS(3, if (vwt_forward(m, imd, vad, ph, inc, 1)) return 1);
         vt_loss lo; TS(4, if (vt_losses(ph, inc, tg, cd, pw, T, L, 0.25f, 0.05f, 1, 1, 0.5f, g1, g2, &lo)) return 1);
         if (mv && mvh) TS(5, nn_d2h(pha_h, ph, n * 4); nn_d2h(phb_h, phb, n * 4); memset(gmv, 0, n * 4);
                       vt_multiview(pha_h, phb_h, va, va, FA, FB, T, L, 4, 0.5f, 0.25f, 0.5f, gmv, &ns); nn_h2d(gmvd, gmv, n * 4); vt_add(g1, gmvd, n));
         else if (mv) TS(5, vt_multiview_dev(ph, phb, vad, vad, FA, FB, T, L, 4, 0.5f, 0.25f, 0.5f, g1, &ns));
         TS(6, if (vwt_backward(m, g1, g2)) return 1);
-        nn_sync(); if (r) t[7] += now_s() - t00;
+        if (xgd) TS(7, wt_zero_grad(WT); if (wt_backward(WT, xgd, xld)) return 1; wt_step(WT, 1e-4f, 1e-5f, 0.f, 1.f, 0.999f));
+        nn_sync(); if (r) t[8] += now_s() - t00;
     }
 #undef TS
     printf("vwt bench: slab %dx%dx%d, cx %d, mv %d (%ld shared points): per sample", T, T, L, cx, mv, ns);
-    for (int k = 0; k < 8; k++) if (t[k] > 0) printf("  %s %.1f", nm[k], t[k] / N * 1e3);
-    printf(" ms = %.1f Mvox/s; device free %.1f GB\n", n / (t[7] / N) / 1e6, nn_mem_free() / 1e9);
+    for (int k = 0; k < 9; k++) if (t[k] > 0) printf("  %s %.1f", nm[k], t[k] / N * 1e3);
+    printf(" ms = %.1f Mvox/s; device free %.1f GB\n", n / (t[8] / N) / 1e6, nn_mem_free() / 1e9);
     return 0;
 }
 
@@ -168,7 +171,19 @@ int cmd_vwt_train(int argc, char **argv) {
     /* --trunk CKPT: a frozen feature trunk (wind96 in-slab, src/wtrunk) feeding cfg.cx extra input channels; --cx-test N: N zero channels
        (no trunk; smoke tests of the wide input) */
     const char *trunk = opt(argc, argv, "--trunk", nullptr); wtrunk *WT = nullptr; int cx = atoi(opt(argc, argv, "--cx-test", "0"));
-    if (trunk) { WT = wt_open(trunk, T, L, 1, atoi(opt(argc, argv, "--trunk-feat", "1"))); if (!WT) { fprintf(stderr, "vwt-train: cannot open the trunk %s\n", trunk); return 1; } cx = wt_channels(WT);
+    /* --trunk-train 1 (stage 2): the trunk trains too (src/wtrunk.h wt_open_train): Muon at --trunk-muon-lr (default 0.002 = 0.1 x wind96's
+       0.02) on its 3^3 convs, AdamW at --trunk-lr-mult (0.1) x the vwt lr elsewhere, both warmed up from 0 over --trunk-warmup (500) steps and
+       then the vwt schedule's shape; its own EMA (--ema); RUN/latest.wt + step_N.wt (resumed from RUN/latest.wt before --trunk);
+       --trunk-levels k: only the head + the last k decoder blocks; --trunk-wd (0) */
+    const int trunk_train = atoi(opt(argc, argv, "--trunk-train", "0")), trunk_warm = atoi(opt(argc, argv, "--trunk-warmup", "500"));
+    const float trunk_mlr = (float)atof(opt(argc, argv, "--trunk-muon-lr", "0.002")), trunk_lrm = (float)atof(opt(argc, argv, "--trunk-lr-mult", "0.1")), trunk_wd = (float)atof(opt(argc, argv, "--trunk-wd", "0"));
+    uint16_t *xgd = nullptr;
+    char wtp[1200]; snprintf(wtp, sizeof wtp, "%s/latest.wt", run);
+    if (trunk && trunk_train) {
+        const char *src_ = access(wtp, F_OK) == 0 ? wtp : trunk;
+        WT = wt_open_train(src_, T, L, atoi(opt(argc, argv, "--trunk-levels", "0"))); if (!WT) { fprintf(stderr, "vwt-train: cannot open the trunk %s for training\n", src_); return 1; } cx = wt_channels(WT);
+        xgd = (uint16_t *)1;   /* (set below: the features' gradient over their own input slots, written after the input conv's weight gradient read them) */
+    } else if (trunk) { WT = wt_open(trunk, T, L, 1, atoi(opt(argc, argv, "--trunk-feat", "1"))); if (!WT) { fprintf(stderr, "vwt-train: cannot open the trunk %s\n", trunk); return 1; } cx = wt_channels(WT);
                  fprintf(stderr, "vwt-train: frozen trunk %s, %d feature channels\n", trunk, cx); }
     c.cx = cx;
     vwt *m = access(path, F_OK) == 0 ? vwt_load(path, 0) : vwt_create(&c, (unsigned)atoi(opt(argc, argv, "--seed", "1")));
@@ -176,6 +191,7 @@ int cmd_vwt_train(int argc, char **argv) {
     if (access(path, F_OK) != 0 && opt(argc, argv, "--init-from", nullptr) && vwt_init_from(m, opt(argc, argv, "--init-from", nullptr), atoi(opt(argc, argv, "--init-ema", "1")))) return 1;
     int xld = cx; uint16_t *xfd = nullptr;   /* the trunk writes its features straight into the network's padded bf16 input */
     if (WT) xfd = vwt_xfeat_buf(m, &xld);
+    if (xgd) { xgd = xfd; vwt_set_xgrad(m, xgd, xld); }   /* (stage 2: d loss / d features for the trunk's backward) */
     else if (cx) { xfd = nn_malloc((size_t)T * T * L * cx * 2); nn_zero(xfd, (size_t)T * T * L * cx * 2); vwt_set_xfeat(m, xfd); }
     const size_t np = vwt_nparams(m);
     float *ema = nn_malloc(np * 4), *mo = nn_malloc(np * 4), *vo = nn_malloc(np * 4), *red = nn_malloc(1 << 20);
@@ -217,7 +233,7 @@ int cmd_vwt_train(int argc, char **argv) {
     double acc_p = 0, acc_d = 0, acc_w = 0, acc_mono = 0, t_step = 0, t_wait = 0, acc_g = 0; int acc_n = 0;
     while (step < steps) {
         const double t0 = now_s(); double wait = 0;
-        vwt_zero_grad(m);
+        vwt_zero_grad(m); if (xgd) wt_zero_grad(WT);
         for (int b = 0; b < B; b++) {
             vws_sample s; const double tw = now_s(); if (OF) s = OF[(step * B + b) % ofn]; else if (vws_next(S, &s)) { fprintf(stderr, "vwt-train: sampler failed\n"); return 1; } wait += now_s() - tw;
             nn_h2d(imd, s.im, n); nn_h2d(vad, s.va, n); nn_h2d(tg, s.ph, n * 4); nn_h2d(cd, s.comp, n * 2); nn_h2d(pw, s.pw ? s.pw : ones, n * 4);
@@ -233,7 +249,7 @@ int cmd_vwt_train(int argc, char **argv) {
                 nn_h2d(imd, s.im, n); nn_h2d(vad, s.va, n);
             }
             if (WT) { const wt_frame fr = {{s.o[0], s.o[1], s.o[2]}, {s.a[0], s.a[1], s.a[2]}, {s.b[0], s.b[1], s.b[2]}, {s.d[0], s.d[1], s.d[2]}, {s.axp[0], s.axp[1], s.axp[2]}, {0, 0, 1}};
-                      if (wt_forward_ld(WT, imd, &fr, 1, s.um > 0 ? s.um : 9.6, xfd, xld)) return 1; }
+                      if (xgd ? wt_forward_train(WT, imd, &fr, s.um > 0 ? s.um : 9.6, xfd, xld) : wt_forward_ld(WT, imd, &fr, 1, s.um > 0 ? s.um : 9.6, xfd, xld)) return 1; }
             if (vwt_forward(m, imd, vad, phd, incd, 1)) return 1;
             vt_loss lo; if (vt_losses(phd, incd, tg, cd, pw, T, L, dp, dd, lp, ld, 1.f / B, gph, ginc, &lo)) return 1;
             acc_p += lo.phase; acc_d += lo.density; acc_w += lo.wsum;
@@ -254,6 +270,7 @@ int cmd_vwt_train(int argc, char **argv) {
                 if (ns2 >= 64) { acc_mv += lmvv; acc_mvn += 1; }
             }
             if (vwt_backward(m, gph, ginc)) return 1;
+            if (xgd && wt_backward(WT, xgd, xld)) return 1;
         }
         /* clip, schedule, AdamW, EMA */
         double gn = sqrt(nn_sumsq(vwt_grads(m), np, red));
@@ -264,6 +281,10 @@ int cmd_vwt_train(int argc, char **argv) {
         const double lr = step < warm ? lr0 * step / warm : lr0 * 0.5 * (1 + cos(M_PI * (double)(step - warm) / fmax(1, steps - warm)));
         nn_adamw(vwt_params(m), vwt_grads(m), mo, vo, np, (float)lr, 0.9f, 0.999f, 1e-8f, wd, step);
         nn_ema(ema, vwt_params(m), np, emad);
+        if (xgd) {   /* the trunk: warmup from 0, then the vwt schedule's shape */
+            const double ts = wt_step_of(WT) + 1, sh = ts < trunk_warm ? ts / trunk_warm : (step < warm ? 1.0 : lr / lr0);
+            wt_step(WT, (float)(trunk_mlr * sh), (float)(trunk_lrm * lr0 * sh), trunk_wd, clip, emad);
+        }
         nn_sync(); t_step += now_s() - t0; t_wait += wait; acc_g += gn; acc_n++;
         if (step % logf == 0 || step == steps) {
             const double k = acc_n * B;
@@ -281,6 +302,10 @@ int cmd_vwt_train(int argc, char **argv) {
             snprintf(path, sizeof path, "%s/latest.vwt", run);
             if (vwt_save(m, path, ema, ex, eb)) fprintf(stderr, "vwt-train: cannot save %s\n", path);
             if (step % ckev == 0) { char p2[1200]; snprintf(p2, sizeof p2, "%s/step_%06d.vwt", run, step); if (vwt_save(m, p2, ema, nullptr, 0)) fprintf(stderr, "vwt-train: cannot save %s\n", p2); }
+            if (xgd) {
+                if (wt_save(WT, wtp)) fprintf(stderr, "vwt-train: cannot save %s\n", wtp);
+                if (step % ckev == 0) { char p2[1200]; snprintf(p2, sizeof p2, "%s/step_%06d.wt", run, step); if (wt_save(WT, p2)) fprintf(stderr, "vwt-train: cannot save %s\n", p2); }
+            }
             free(ex);
         }
         if (stop) { fprintf(stderr, "vwt-train: STOP at step %d\n", step); break; }

@@ -758,3 +758,11 @@ extern "C" int vtf_conv_wgrad_bfin(const uint16_t *x, int n, int D, int H, int W
     k_wg_reduce_pad<<<cap_blocks((long long)co * T * ci), 256>>>(q.part, (int)nz, co, T, C, ci, gw);
     return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }
+extern "C" int vtf8_conv_bwd_bfout(const float *gy, int n, int Do, int Ho, int Wo, int co, const float *w, int ci, int k, int sd, int sh, int sw,
+                                   int D, int H, int W, int c0, int c1, void *out, int ld, void *qbuf, void *wbuf);
+/* d loss / d input channels [c0, c1) of a conv as bf16 rows of ld (the vwt input conv's gradient at the trunk features, src/vwt_net.c) */
+extern "C" int vtf_conv_bwd_feat(vt_t gy, const float *w, int ci, int k, int sd, int sh, int sw, int D, int H, int W, int c0, int c1, uint16_t *out, int ld, void *scratch) {
+    char *s = (char *)scratch;
+    if (vtf8_qbytes((long long)gy.n * gy.d * gy.h * gy.w, gy.c, 16) > g_wreg) { fprintf(stderr, "vtf_conv_bwd_feat: scratch too small\n"); return -1; }
+    return vtf8_conv_bwd_bfout(gy.p, gy.n, gy.d, gy.h, gy.w, gy.c, w, ci, k, sd, sh, sw, D, H, W, c0, c1, out, ld, s + 2 * wbytes_max(256, 256), s);
+}

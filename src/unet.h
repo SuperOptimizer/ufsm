@@ -255,6 +255,13 @@ void *unet_logit_grad_scratch(unet *u, size_t bytes);   /* lean: home of the 16-
 int unet_lean_nob(const unet *u);   /* lean 2 build: no gradient buffer B (gout[0] is the batch scratch) */
 void unet_build(unet *u, shape5 xs, int train);   /* build the buffers for xs now (the first forward would) */
 void unet_set_head_feat(unet *u, int on);   /* inference: the logits followed by dec[0]'s output channels (silu(gn) as the head reads it; cout + widths[0] channels) */
+/* wtrunk training: after a forward, a 1^3 conv (nc rows of w [nc][widths[0]], b) over dec[0]'s output as the head reads it, fp16 planes
+   [n][nc][S]; the next backward adds g16 (16-bit storage-type planes [n][widths[0]][S] of d loss / d that output, times unet_bwd_gscale())
+   into the head input's gradient (nullptr: none; kept until replaced); unet_reset_opt zeroes the optimiser state (fine-tuning start) */
+int unet_head_ext_fwd(unet *u, const float *w, const float *b, int nc, void *y16);
+void unet_set_l0_feat_grad(unet *u, const void *g16);
+float unet_bwd_gscale(void);
+void unet_reset_opt(unet *u);
 void unet_set_head_channels(unet *u, int c0, int nc);   /* inference: only logit channels [c0, c0 + nc) (nc 0: all) */
 void *unet_input_scratch(unet *u, size_t bytes);
 void *unet_input_scratch2(unet *u, size_t bytes);   /* inference: enc[0].a2's buffer, free until the forward's input conversion (predict: the uint8 CT) */

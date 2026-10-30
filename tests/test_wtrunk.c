@@ -120,6 +120,111 @@ int main(void) {
             nn_free(o2); free(ha); free(hb); free(hh);
         }
     }
+    if (!access(ck, R_OK)) {   /* stage 2: the trunk gradient through heads and features. 16-bit mode (UFSM_WT_HI): vs central differences of a
+                                  linear loss L = sum r . out along d = g / |g| (r on the head channels only, then on the features only);
+                                  production precision (MX-fp4): the cosine of its gradient with the 16-bit one */
+        float *g16[3] = {nullptr, nullptr, nullptr};
+        for (int mode = 0; mode < 2; mode++) {
+            if (!mode) setenv("UFSM_WT_HI", "1", 1); else unsetenv("UFSM_WT_HI");
+            wtrunk *wt = wt_open_train(ck, T, L, 0);
+            CHECK(wt, "wt_open_train");
+            if (!wt) continue;
+            const int C = wt_channels(wt), co = wt_heads(wt); unet *u = wt_unet(wt); const size_t np = unet_nparams(u), nv = V * C;
+            uint16_t *o = nn_malloc(nv * 2), *ho = malloc(nv * 2), *hr = malloc(nv * 2), *gr = nn_malloc(nv * 2);
+            float *th = malloc(np * 4), *gh = malloc(np * 4), *p = (float *)unet_live_params(u);
+            nn_d2h(th, p, np * 4);
+            double tn = 0; for (size_t i = 0; i < np; i++) tn += (double)th[i] * th[i]; tn = sqrt(tn);
+            for (int part = 0; part < (mode ? 2 : 3); part++) {   /* part 2: features with r = W^T G (the head rows' span) */
+                if (part < 2) for (size_t q = 0; q < nv; q++) { const int c = (int)(q % C); float r = ((c < co) == !part) ? (float)((int)((q * 2654435761u) >> 20 & 255) - 128) / 128.f : 0.f; uint32_t b; memcpy(&b, &r, 4); hr[q] = (uint16_t)(b >> 16); }
+                else {
+                    size_t hw_, hb_; unet_head_offsets(u, &hw_, &hb_); const int w0 = C - co; float *W = malloc((size_t)co * w0 * 4); nn_d2h(W, unet_live_params(u) + hw_, (size_t)co * w0 * 4);
+                    for (size_t v = 0; v < V; v++) { float Gk[64]; for (int k = 0; k < co; k++) Gk[k] = (float)((int)(((v * 64 + k) * 2654435761u) >> 20 & 255) - 128) / 128.f;
+                        for (int c = 0; c < C; c++) { float r = 0; if (c >= co) for (int k = 0; k < co; k++) r += W[(size_t)k * w0 + c - co] * Gk[k]; uint32_t b; memcpy(&b, &r, 4); hr[v * C + c] = (uint16_t)(b >> 16); } }
+                    free(W);
+                }
+                nn_h2d(gr, hr, nv * 2);
+                wt_zero_grad(wt);
+                CHECK(!wt_forward_train(wt, im, fr, 9.6, o, C), "forward_train");
+                CHECK(!wt_backward(wt, gr, C), "backward");
+                nn_d2h(gh, unet_grad_ptr(u), np * 4);
+                double gn = 0; for (size_t i = 0; i < np; i++) gn += (double)gh[i] * gh[i]; gn = sqrt(gn);
+                if (!mode || getenv("WT_FD_ALL")) {
+                    if (!mode) { g16[part] = malloc(np * 4); memcpy(g16[part], gh, np * 4); }
+                    const double eps = (getenv("WT_EPS") ? atof(getenv("WT_EPS")) : 1e-4) * tn; double Lv[2];
+                    for (int sgn = 0; sgn < 2; sgn++) {
+                        float *t2 = malloc(np * 4); for (size_t i = 0; i < np; i++) t2[i] = th[i] + (float)((sgn ? -eps : eps) * gh[i] / gn); nn_h2d(p, t2, np * 4); free(t2);
+                        CHECK(!wt_forward_train(wt, im, fr, 9.6, o, C), "forward_train eps");
+                        nn_d2h(ho, o, nv * 2); double l = 0; for (size_t q = 0; q < nv; q++) l += (double)bf2f(ho[q]) * bf2f(hr[q]);
+                        Lv[sgn] = l;
+                    }
+                    nn_h2d(p, th, np * 4);
+                    const double fd = (Lv[0] - Lv[1]) / (2 * eps);
+                    printf("16-bit-gradient check (%s): |g| %.4g, central difference along g / |g| %.4g (ratio %.3f)\n", part == 2 ? "features in the head rows' span" : part ? "features" : "heads", gn, fd, fd / gn);
+                    CHECK(gn > 0 && fabs(fd / gn - 1) < 0.2, "trunk gradient (part %d) off: fd %g vs |g| %g", part, fd, gn);   /* (the central difference itself moves ~10% between runs) */
+                }
+                if (mode && g16[part]) {
+                    double d = 0, a = 0, b = 0; for (size_t i = 0; i < np; i++) { d += (double)gh[i] * g16[part][i]; a += (double)gh[i] * gh[i]; b += (double)g16[part][i] * g16[part][i]; }
+                    printf("MX-fp4 vs 16-bit gradient (%s): cosine %.3f, |g| %.4g vs %.4g\n", part ? "features" : "heads", d / sqrt(a * b + 1e-300), sqrt(a), sqrt(b));
+                    CHECK(d / sqrt(a * b + 1e-300) > 0.6, "MX-fp4 trunk gradient (%s) disagrees", part ? "features" : "heads");
+                }
+            }
+            {   /* the training forward's outputs vs the inference build's (the trained weights copied): the same network */
+                uint16_t *o2 = nn_malloc(nv * 2), *h1 = malloc(nv * 2), *h2 = malloc(nv * 2);
+                CHECK(!wt_forward_train(wt, im, fr, 9.6, o, C), "fwd"); nn_d2h(h1, o, nv * 2);
+                CHECK(!wt_forward_ld(wt, im, fr, 1, 9.6, o2, C), "fwd inf"); nn_d2h(h2, o2, nv * 2);
+                double dh = 0, df = 0, mf = 0; for (size_t q = 0; q < nv; q++) { const double d = fabs(bf2f(h1[q]) - bf2f(h2[q])); if ((int)(q % C) < co) dh += d; else { df += d; mf += fabs(bf2f(h2[q])); } }
+                printf("train vs inference forward (%s): heads mean |d| %.4f, features mean |d| %.4f of mean |f| %.4f\n", mode ? "MX-fp4" : "16-bit", dh / (V * co), df / (V * (C - co)), mf / (V * (C - co)));
+                nn_free(o2); free(h1); free(h2);
+            }
+            {   /* injection identity: a logit gradient G through the head == the same gradient injected at the head input as W^T G (all but the head's
+                   own weight / bias gradients equal) */
+                size_t hw, hb; unet_head_offsets(u, &hw, &hb); const int w0 = C - co; const size_t S = V;
+                float *W = malloc((size_t)co * w0 * 4); nn_d2h(W, unet_live_params(u) + hw, (size_t)co * w0 * 4);
+                float *G = malloc(S * co * 4); for (size_t q = 0; q < S * co; q++) G[q] = (float)((int)((q * 2246822519u) >> 20 & 255) - 128) / 1280.f;
+                float *dG = nn_malloc(S * co * 4); nn_h2d(dG, G, S * co * 4);
+                const float gs = unet_bwd_gscale(); uint16_t *F = malloc(S * w0 * 2);
+                for (size_t v = 0; v < S; v++) for (int c = 0; c < w0; c++) { float a = 0; for (int k = 0; k < co; k++) a += W[(size_t)k * w0 + c] * G[(size_t)k * S + v]; a *= gs;
+                    uint16_t hbits; if (nn_get_f16()) { hbits = f2h(a); } else { uint32_t b; memcpy(&b, &a, 4); hbits = (uint16_t)(b >> 16); } F[(size_t)c * S + v] = hbits; }
+                uint16_t *dF = nn_malloc(S * w0 * 2); nn_h2d(dF, F, S * w0 * 2);
+                float *zero = nn_malloc(S * co * 4); nn_zero(zero, S * co * 4);
+                float *ga = malloc(np * 4), *gb = malloc(np * 4);
+                wt_zero_grad(wt); CHECK(!wt_forward_train(wt, im, fr, 9.6, o, C), "fwd"); unet_backward(u, dG); nn_d2h(ga, unet_grad_ptr(u), np * 4);
+                wt_zero_grad(wt); CHECK(!wt_forward_train(wt, im, fr, 9.6, o, C), "fwd"); unet_set_l0_feat_grad(u, dF); unet_backward(u, zero); unet_set_l0_feat_grad(u, nullptr); nn_d2h(gb, unet_grad_ptr(u), np * 4);
+                if (!mode) {   /* central difference of sum G . logits (fp16 logits of the forward, before any sigmoid / bf16) along the head path's gradient */
+                    double gn2 = 0; for (size_t i = 0; i < np; i++) gn2 += (double)ga[i] * ga[i]; gn2 = sqrt(gn2);
+                    double tn2 = 0; for (size_t i = 0; i < np; i++) tn2 += (double)th[i] * th[i]; tn2 = sqrt(tn2);
+                    const double eps = 1e-4 * tn2; double Lv[2]; uint16_t *yy = malloc(S * co * 2);
+                    for (int sgn = 0; sgn < 2; sgn++) {
+                        float *t2 = malloc(np * 4); for (size_t i = 0; i < np; i++) t2[i] = th[i] + (float)((sgn ? -eps : eps) * ga[i] / gn2); nn_h2d(p, t2, np * 4); free(t2);
+                        CHECK(!wt_forward_train(wt, im, fr, 9.6, o, C), "fwd eps"); nn_d2h(yy, wt_y16(wt), S * co * 2);
+                        double l = 0; for (size_t q = 0; q < S * co; q++) l += (double)G[q] * h2f(yy[q]); Lv[sgn] = l;
+                    }
+                    nn_h2d(p, th, np * 4); free(yy);
+                    printf("logit path: |g| %.4g, central difference of sum G . logits %.4g (ratio %.3f)\n", gn2, (Lv[0] - Lv[1]) / (2 * eps), (Lv[0] - Lv[1]) / (2 * eps) / gn2);
+                    CHECK(fabs((Lv[0] - Lv[1]) / (2 * eps) / gn2 - 1) < 0.2, "logit path gradient off");
+                }
+                double d = 0, a2 = 0, b2 = 0; for (size_t i = 0; i < np; i++) { if (i >= hw && i < hw + (size_t)co * w0) continue; if (i >= hb && i < hb + (size_t)co) continue; d += (double)ga[i] * gb[i]; a2 += (double)ga[i] * ga[i]; b2 += (double)gb[i] * gb[i]; }
+                printf("injection identity (%s): cosine %.4f, |g head path| %.4g, |g injected| %.4g\n", mode ? "MX-fp4" : "16-bit", d / sqrt(a2 * b2 + 1e-300), sqrt(a2), sqrt(b2));
+                CHECK(d / sqrt(a2 * b2 + 1e-300) > (mode ? 0.95 : 0.999) && fabs(sqrt(b2 / a2) - 1) < 0.1, "injection identity");
+                {   /* the forward's features are the head's input: sigmoid^-1(heads) == W . features + b (from the bf16 outputs) */
+                    float *B = malloc(co * 4); nn_d2h(B, unet_live_params(u) + hb, co * 4); uint16_t *hoo = malloc(nv * 2);
+                    CHECK(!wt_forward_train(wt, im, fr, 9.6, o, C), "fwd"); nn_d2h(hoo, o, nv * 2); double em = 0, sm = 0; long cnt = 0;
+                    for (size_t v = 0; v < S; v += 7) for (int k = 0; k < co; k++) {
+                        const float sg = bf2f(hoo[v * C + k]); if (sg < 0.05f || sg > 0.95f) continue;
+                        double a = B[k]; for (int c = 0; c < w0; c++) a += (double)W[(size_t)k * w0 + c] * bf2f(hoo[v * C + co + c]);
+                        const double lg = log(sg / (1 - sg)); em += fabs(lg - a); sm += fabs(lg); cnt++;
+                    }
+                    printf("heads vs W . features + b (%s): mean |d| %.4f of mean |logit| %.3f over %ld\n", mode ? "MX-fp4" : "16-bit", em / cnt, sm / cnt, cnt);
+                    CHECK(em / cnt < 0.05 * (sm / cnt) + 0.02, "features are not the head input");
+                    free(B); free(hoo);
+                }
+                free(W); free(G); free(F); free(ga); free(gb); nn_free(dG); nn_free(dF); nn_free(zero);
+            }
+            free(ho); free(hr); free(th); free(gh); nn_free(o); nn_free(gr);
+            wt_close(wt);
+        }
+        free(g16[0]); free(g16[1]); free(g16[2]);
+    }
     nn_free(im); free(h);
     if (fails) { printf("test_wtrunk: %d FAILED\n", fails); return 1; }
     printf("test_wtrunk: ok\n");

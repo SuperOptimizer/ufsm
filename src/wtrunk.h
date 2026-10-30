@@ -35,6 +35,22 @@ int wt_forward(wtrunk *w, const uint8_t *im, const wt_frame *fr, int n, double u
 int wt_forward_ld(wtrunk *w, const uint8_t *im, const wt_frame *fr, int n, double um, void *out, int ld);
 void wt_close(wtrunk *w);
 
+/* training (stage 2): ckpt = the wind96 checkpoint (fine-tuning start: its EMA weights live, a fresh optimiser) or a wt_save file (resumed
+   with its optimiser state, EMA and step). The production training precision (fp16 + gradient scale, MX-fp4 activations / gradients, SR).
+   levels > 0: only the head and the last `levels` decoder blocks train. wt_forward_ld on this handle runs a no-grad inference build with
+   the trained live weights (copied after each step, on first use); wt_forward_train keeps the activations for wt_backward (n 1);
+   wt_backward(g: bf16 d loss / d outputs, rows of ld in output order) accumulates the trunk's gradients (through the sigmoid heads and the
+   features); wt_step: clip, Muon (3^3 convs) + AdamW, EMA (1: skipped, non-finite gradient); wt_save: a unet checkpoint wt_open reads */
+wtrunk *wt_open_train(const char *ckpt, int T, int L, int levels);
+int wt_forward_train(wtrunk *w, const uint8_t *im, const wt_frame *fr, double um, void *out, int ld);
+int wt_backward(wtrunk *w, const void *g, int ld);
+void wt_zero_grad(wtrunk *w);
+int wt_step(wtrunk *w, float lr_muon, float lr_adam, float wd, float clip, float ema);
+int wt_step_of(const wtrunk *w);
+int wt_save(wtrunk *w, const char *path);
+struct unet *wt_unet(wtrunk *w);   /* the trained network (tests) */
+const void *wt_y16(wtrunk *w);     /* the last training forward's fp16 head logits + features [C][T][T][L] (network order; tests) */
+
 /* kernels (src/nn_wtrunk.cu). prm: device floats [n][16] = (o - c)[3], a[3], b[3], d[3], u[3], pad; st: device u64 [n][2] scratch;
    x: [n][4][T][T][L] network input, fp16 (h16 1) or bf16 (h16 2); lg: [n][C][T][T][L] fp16 (lh16) or fp32, (z, y, x) = (j, i, k) */
 void wt_input(const uint8_t *im, const float *prm, int n, int T, int L, unsigned long long *st, void *x, int h16);

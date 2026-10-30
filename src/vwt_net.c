@@ -29,7 +29,7 @@ struct vwt {
     float *tokin[2 * MAXB]; float *tok, *tmp; vt_t tokv;           /* block inputs (ray: R order, transverse: T order); final tokens */
     vt_t up1, cat1; cact d0, d1; vt_t up0, cat0; cact h0; vt_t lg; float *inc, *ph;
     void *scratch; void *ws_mem; at_ws ws; at_geom gr, gt;
-    int built; const uint16_t *xf; uint16_t *xb; int xC;   /* extra features (cfg.cx); the bf16 input [T][T][L][xC] (CT, valid, features, zero
+    int built; const uint16_t *xf; uint16_t *xb; int xC; uint16_t *xg; int xgld;   /* extra features (cfg.cx); the bf16 input [T][T][L][xC] (CT, valid, features, zero
                                                            channels to xC % 32 == 0) the input conv reads directly */
 };
 
@@ -238,6 +238,7 @@ int vwt_backward(vwt *m, const float *gph, const float *ginc) {
             const pconv *p = &m->enc[0][0]; cact *a = &m->e[0][0]; const vt_t gc = LIKE(a->c, gC);
             vt_ln_bwd(a->c, m->P + p->g, m->P + p->be, 1, a->mean, a->rstd, ga, gc, m->G + p->g, m->G + p->be);
             if (vt_conv_wgrad_bfin(m->xb, 1, c->T, c->T, L, m->xC, 2 + c->cx, gc, m->P + p->w, p->k, p->s, p->s, 1, m->G + p->w, m->G + p->b, m->scratch)) return -1;
+            if (m->xg && vtf_conv_bwd_feat(gc, m->P + p->w, 2 + c->cx, p->k, p->s, p->s, 1, c->T, c->T, L, 2, 2 + c->cx, m->xg, m->xgld, m->scratch)) return -1;
         } else if (conv_ln_bwd(m, &m->enc[s][0], &m->e[s][0], 1, ga, LIKE(m->e[s][0].c, gC), gin)) return -1;
         gcur = gin;
     }
@@ -250,6 +251,7 @@ int vwt_backward(vwt *m, const float *gph, const float *ginc) {
 
 void vwt_set_xfeat(vwt *m, const uint16_t *xf) { m->xf = xf; }
 const vwt_cfg *vwt_cfg_of(const vwt *m) { return &m->cfg; }
+void vwt_set_xgrad(vwt *m, uint16_t *g, int ld) { m->xg = g; m->xgld = ld; }
 uint16_t *vwt_xfeat_buf(vwt *m, int *ld) { build(m); if (!m->cfg.cx) return nullptr; if (ld) *ld = m->xC; m->xf = m->xb + 2; return m->xb + 2; }
 
 /* checkpoint header: "VWT1" (cfg without cx) or "VWT2" (full cfg) */

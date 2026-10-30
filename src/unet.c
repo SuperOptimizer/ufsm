@@ -198,6 +198,7 @@ struct unet {
     int logits_h16;                          /* lean 2: fp16 logits, so the 16-bit logit gradient fits after them in A */
     int lh16_req;                            /* unet_set_fp16_logits: fp16 logits where the MX head writes them into their own buffer */
     int hfeat; float *hf_w, *hf_b;           /* unet_set_head_feat: inference head also writes dec[0]'s output (identity rows), its weights */
+    const void *l0fg; void *l0fg_mx; size_t l0fg_cap;   /* unet_set_l0_feat_grad: an extra d loss / d (dec[0]'s output) at the head step; its MX scratch */
     int head_ext;                            /* unet_set_head_ext: training runs the head per z-slab outside (no whole-window logits) */
     convp ds[UNET_MAXLEV];                   /* cfg.ds_levels: the deep-supervision 1^3 heads of decoder levels 1..ds_levels */
     float *ds_lg[UNET_MAXLEV];               /* their fp32 logits (training builds) */
@@ -391,7 +392,7 @@ void unet_free(unet *u) {
     if (!u) return;
     for (int i = 0; i < 4; i++) if (u->l0s_reg[i]) { lp_gn_slab_reg(u->l0s_reg[i], 0, 0, 0, 0); u->l0s_reg[i] = nullptr; }
     free_acts(u);
-    nn_free(u->p); nn_free(u->g); nn_free(u->m); nn_free(u->v); nn_free(u->ema); nn_free(u->hf_w);
+    nn_free(u->p); nn_free(u->g); nn_free(u->m); nn_free(u->v); nn_free(u->ema); nn_free(u->hf_w); nn_free(u->l0fg_mx);
     nn_free(u->gn_scratch); nn_free(u->red_scratch); nn_free(u->wg_tmp);
     nn_free(u->wm); nn_free(u->muon_mom); nn_free(u->muon_work); nn_free(u->muon_descs); nn_free(u->stem_b);
     nn_free(u->mx_mcd); nn_free(u->mx_nsd); nn_free(u->mx_pool); nn_free(u->mx_hbf); nn_free(u->mx_R); nn_free(u->mx_part); free(u->gn_frz); free(u->gn_acc); nn_free(u->l0run); nn_free(u->l0live); nn_free(u->wsp); nn_free(u->l0s_st); nn_free(u->l0s_tmp); nn_free(u->l0st_g2); nn_free(u->l0st_up); nn_free(u->l0st_poison); nn_free(u->l0h_lg); for (int i = 0; i < UNET_MAXLEV; i++) free(u->rb[i]);
@@ -2653,6 +2654,38 @@ int unet_head_bwd_z(unet *u, int z0, int z1, const void *gy16, int first) {
     return nn_head_bwd_z(x, gn ? &g : nullptr, u->dec[0].ys, gy16, u->cfg.cout, P(u, u->head.w), u->g + u->head.w, u->g + u->head.b, u->gout[0],
                          (size_t)z0 * hw, (size_t)(z1 - z0) * hw, first);
 }
+/* a 1^3 conv over dec[0]'s output as the head reads it (silu(gn(a2)) under recompute, else s2), after a forward (training or inference):
+   fp16 planes [n][nc][S] into y16 (wtrunk: the head rows followed by identity rows = heads + level-0 features of a training forward) */
+int unet_head_ext_fwd(unet *u, const float *w, const float *b, int nc, void *y16) {
+    const float *x; nn_gn_t g; const int gn = head_src(u, &x, &g);
+    nn_set_layer(3 * u->cfg.nlev - 2);
+    nn_set_head_out_h16(1);
+    int r = 0;
+    if (gn) r = nn_conv3d_fwd_x(x, &g, nullptr, nullptr, 0, 0, u->dec[0].ys, w, b, nc, 1, 1, (float *)y16, 0, 0.f, nullptr, nullptr);
+    else nn_conv3d_fwd(x, u->dec[0].ys, w, b, nc, 1, 1, (float *)y16);
+    nn_set_head_out_h16(0);
+    return r;
+}
+void unet_set_l0_feat_grad(unet *u, const void *g16) { u->l0fg = g16; }
+float unet_bwd_gscale(void) { return GBF ? nn_get_grad_scale() : 1.f; }
+void unet_reset_opt(unet *u) {
+    if (u->m) nn_zero(u->m, u->np * 4);
+    if (u->v) nn_zero(u->v, u->np * 4);
+    if (u->muon_mom) nn_zero(u->muon_mom, u->np * 4);
+}
+/* gout[0] += the injected level-0 feature gradient (16-bit planes, already in the backward's scaled domain), in gout[0]'s storage */
+static void l0_feat_grad_add(unet *u) {
+    if (!u->l0fg) return;
+    const shape5 ys = u->dec[0].ys; const int dt = nn_storage(u->gout[0]);
+    if (dt == 4 || dt == 8) {
+        const size_t nb = nn_mx_bytes(ys, dt);
+        if (nb > u->l0fg_cap) { nn_free(u->l0fg_mx); u->l0fg_mx = nn_malloc(nb); u->l0fg_cap = nb; }
+        nn_set_storage(u->l0fg_mx, nb, dt);
+        nn_h16_to_mx(u->l0fg, ys, u->l0fg_mx);
+        nn_add_into(u->gout[0], u->l0fg_mx, ys, 1);
+    } else if (GBF) nn_add_into(u->gout[0], u->l0fg, ys, 1);
+    else { fprintf(stderr, "unet: the level-0 feature gradient needs 16-bit or MX gradient storage\n"); abort(); }
+}
 
 /* ---- backward ---- */
 /* gy: grad wrt block output (s2). Returns gB of the level holding grad wrt block input. */
@@ -3482,6 +3515,8 @@ void unet_backward_x(unet *u, const void *gv, int g_h16) {
     if (ghide) dstorage(gbuf, gcap, ghide);
     if (u->a0_share && !u->l3b) nn_offload_copy(u->enc[0].a2, u->h_a2, act_bytes_of(u->enc[0].ys), 0, u->ev_a2[2], u->ev_a2[3]);   /* the skip back for dec[0]'s conv1 weight gradient
                                                                                                                                 (l3b: inside it, l3_skip_return) */
+    if (u->l0fg && (u->l3b || l0h_on(u) || u->head_ext)) { fprintf(stderr, "unet: the level-0 feature gradient needs the whole-window head backward (no l3b / head slabs)\n"); abort(); }
+    l0_feat_grad_add(u);
     if (!u->l3b) FQG(u->gout[0], d0->ys);
     if (u->gco && !u->l3b) { u->gout[1] = u->gB[1] = u->gout_x1; if (L > 2) u->gskip[1] = u->gout_x1; }   /* dec[0]'s backward: gout[1] in dec[0].a1's buffer */
     /* decoder, bottom-up in the graph = i from 0 to L-2 */

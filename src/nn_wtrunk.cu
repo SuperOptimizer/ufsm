@@ -76,3 +76,26 @@ extern "C" void wt_output(const void *lg, int lh16, int n, int C, int cout, int 
     else wt_output_k<float><<<g, 128, sm>>>((const float *)lg, C, cout, T, L, ld, (__nv_bfloat16 *)out);
     WTK(cudaGetLastError());
 }
+
+/* wt_backward: d loss / d outputs (bf16 rows of ld in output order) -> in place over the forward's fp16 outputs y16 [C][S] (network order):
+   the head rows become the logits' 16-bit gradient (the sigmoid derivative from their own logit), the feature rows the features' 16-bit
+   gradient, both times gs (the backward's scaled domain) */
+template <typename HT> __global__ void wt_grad_in_k(const __nv_bfloat16 *__restrict__ g, int ld, __half *y16, int C, int C0, int T, int L, float gs) {
+    const size_t V = (size_t)T * T * L, v = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (v >= V) return;
+    const int k = (int)(v % L), j = (int)(v / L % T), i = (int)(v / ((size_t)L * T));
+    const size_t q = ((size_t)j * T + i) * L + k;
+    const __nv_bfloat16 *gr = g + v * ld;
+    HT *yo = (HT *)y16;
+    for (int c = 0; c < C; c++) {
+        const float gv = __bfloat162float(gr[c]);
+        if (c < C0) { const float s = 1.f / (1.f + __expf(-__half2float(y16[(size_t)c * V + q]))); yo[(size_t)c * V + q] = (HT)(gv * s * (1.f - s) * gs); }
+        else yo[(size_t)c * V + q] = (HT)(gv * gs);
+    }
+}
+extern "C" void wt_grad_in(const void *g, int ld, void *y16, int C, int C0, int T, int L, float gs, int f16) {
+    const size_t V = (size_t)T * T * L;
+    if (f16) wt_grad_in_k<__half><<<(unsigned)((V + 255) / 256), 256>>>((const __nv_bfloat16 *)g, ld, (__half *)y16, C, C0, T, L, gs);
+    else wt_grad_in_k<__nv_bfloat16><<<(unsigned)((V + 255) / 256), 256>>>((const __nv_bfloat16 *)g, ld, (__half *)y16, C, C0, T, L, gs);
+    WTK(cudaGetLastError());
+}
