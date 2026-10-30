@@ -1,0 +1,76 @@
+/* src/strip.c: a synthetic Archimedean spiral sheet (r = r0 + pitch U, U = k + theta / 2 pi, straight in z: developable, its exact
+   development a rectangle of the spiral's arc length x the height) written as ufsm wraps would write it (theta from -pi, dth = step / r_k,
+   column 0 = the largest theta, past the cut). ufsm strip must walk it outermost first, drop column 0, join every seam within ~1 column
+   pitch; ufsm strip-flatten must give the analytic arc length and height, isometric (aniso ~1, no flips), and stripes whose valid area is
+   the sheet's area. */
+#include "tiffw.h"
+#include "imgops.h"
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+int cmd_strip(int argc, char **argv);
+int cmd_strip_flatten(int argc, char **argv);
+
+static int fails = 0;
+#define CHECK(c, ...) do { if (!(c)) { fails++; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
+
+static const double R0 = 150, PITCH = 7, CY = 400, CX = 420;
+static double rad(int k, double th) { return R0 + PITCH * (k + th / (2 * M_PI)); }   /* dir = +1: W = U - theta / 2 pi = k */
+static double num(const char *b, const char *key) { const char *q = strstr(b, key); return q ? atof(q + strlen(key)) : NAN; }
+
+int main(void) {
+    char root[256]; snprintf(root, sizeof root, "/tmp/test_strip_%d", (int)getpid());
+    char p[512], cmd[600]; snprintf(cmd, sizeof cmd, "mkdir -p %s/wraps", root); if (system(cmd)) return 1;
+    const int h = 48, k0 = 3, k1 = 6; const double step = 1.0, um = 10;
+    long long total = 0;
+    for (int k = k0; k <= k1; k++) {
+        const double rk = rad(k, atan2(0, 1)), dth = step / rk; const int cols = (int)ceil(2 * M_PI / dth) + 1;
+        float *X = malloc((size_t)cols * h * 4), *Y = malloc((size_t)cols * h * 4), *Z = malloc((size_t)cols * h * 4);
+        for (int r = 0; r < h; r++) for (int c = 0; c < cols; c++) {
+            const size_t i = (size_t)r * cols + (cols - 1 - c); const double th = -M_PI + c * dth, ta = atan2(sin(th), cos(th));   /* the ray's own angle */
+            const double rr = rad(k, ta); X[i] = (float)(CX + rr * cos(th)); Y[i] = (float)(CY + rr * sin(th)); Z[i] = (float)(10 + r * step);
+        }
+        snprintf(p, sizeof p, "%s/wraps/w%03d", root, k);
+        CHECK(!tifxyz_write(p, cols, h, X, Y, Z, step, um, k, "test"), "write %s", p);
+        total += cols - 1; free(X); free(Y); free(Z);
+    }
+    { char a1[300], a2[300]; snprintf(a1, sizeof a1, "%s/wraps", root); snprintf(a2, sizeof a2, "%s/strip", root);
+      char *av[] = {"ufsm", "strip", a1, a2, "--threads", "4", "--err", "0.05"}; CHECK(!cmd_strip(8, av), "ufsm strip failed"); }
+    snprintf(p, sizeof p, "%s/strip/strip.json", root); FILE *f = fopen(p, "r"); char b[4096] = {0};
+    if (f) { size_t nr = fread(b, 1, sizeof b - 1, f); (void)nr; fclose(f); }
+    CHECK(strstr(b, "\"walk\": \"descending\""), "walk not outermost first: %s", b);
+    /* columns: every wrap minus column 0 (minus one more where the seam came closer than half a pitch) */
+    snprintf(p, sizeof p, "%s/strip/strip.tsv", root); f = fopen(p, "r"); long long ncol = 0; double gmax = 0; int nseg = 0, first = -1;
+    if (f) { char line[512]; if (fgets(line, sizeof line, f)) while (fgets(line, sizeof line, f)) { int q, wr, n, wc; long long c0; char nm[64]; double g;
+                 if (sscanf(line, "%d %d %63s %lld %d %d %lf", &q, &wr, nm, &c0, &n, &wc, &g) >= 6) { if (first < 0) first = wr; ncol += n; nseg++; if (isfinite(g) && g > gmax) gmax = g; } } fclose(f); }
+    CHECK(nseg == k1 - k0 + 1 && first == k1, "segments %d, first wrap %d", nseg, first);
+    CHECK(ncol >= total - nseg && ncol <= total, "strip columns %lld vs %lld", ncol, total);
+    CHECK(gmax > 0.3 && gmax < 1.6, "largest seam gap %.3f column pitches", gmax);
+    /* flatten: the exact development */
+    { char a1[300]; snprintf(a1, sizeof a1, "%s/strip", root);
+      char *av[] = {"ufsm", "strip-flatten", a1, "--stride", "96", "--threads", "4", "--stripe-px", "1500", "--iters", "60", "--cg", "300", "--tol", "1e-9"};
+      CHECK(!cmd_strip_flatten(16, av), "ufsm strip-flatten failed"); }
+    snprintf(p, sizeof p, "%s/strip/flat/flat.json", root); f = fopen(p, "r"); memset(b, 0, sizeof b);
+    if (f) { size_t nr = fread(b, 1, sizeof b - 1, f); (void)nr; fclose(f); }
+    /* the analytic arc length from wrap k1's theta = pi to wrap k0's theta = -pi (the spiral's U from k1 + 1/2 down to k0 - 1/2) */
+    double L = 0; const int NS = 200000; const double ua = k0 - 0.5, ub = k1 + 0.5;
+    for (int i = 0; i < NS; i++) { const double u = ua + (ub - ua) * (i + 0.5) / NS, r = R0 + PITCH * u; L += sqrt(r * r + (PITCH / (2 * M_PI)) * (PITCH / (2 * M_PI))) * 2 * M_PI * (ub - ua) / NS; }
+    const double Lcm = L * um * 1e-4, Hcm = (h - 1) * step * um * 1e-4;
+    const double len = num(b, "\"length_cm\": "), hei = num(b, "\"height_cm\": "), a50 = num(b, "\"aniso_p50\": "), a95 = num(b, "\"aniso_p95\": "), fl = num(b, "\"flips\": "), ns = num(b, "\"stripes\": ");
+    printf("strip: length %.4f cm (analytic %.4f), height %.4f (%.4f), aniso p50 %.4f p95 %.4f, flips %.0f, stripes %.0f\n", len, Lcm, hei, Hcm, a50, a95, fl, ns);
+    CHECK(fabs(len - Lcm) < 0.01 * Lcm, "length %.4f vs %.4f cm", len, Lcm);
+    CHECK(fabs(hei - Hcm) < 0.02 * Hcm, "height %.4f vs %.4f cm", hei, Hcm);
+    CHECK(a50 < 1.01 && a95 < 1.03, "aniso p50 %.4f p95 %.4f", a50, a95);
+    CHECK(fl == 0, "flips %.0f", fl);
+    CHECK(ns >= 2, "stripes %.0f (expected several at --stripe-px 1500)", ns);
+    /* the stripes' valid area = the sheet's area (stripes share one boundary column) */
+    snprintf(p, sizeof p, "%s/strip/flat/stripes.tsv", root); f = fopen(p, "r"); double area = 0;
+    if (f) { char line[1024]; if (fgets(line, sizeof line, f)) while (fgets(line, sizeof line, f)) { char nm[64]; int a, c, d; double u0, l, v; if (sscanf(line, "%63s %d %d %d %lf %lf %lf", nm, &a, &c, &d, &u0, &l, &v) == 7) area += v; } fclose(f); }
+    { const double A = Lcm * (Hcm + step * um * 1e-4); CHECK(fabs(area - A) < 0.03 * A, "stripes valid area %.4f vs %.4f cm2", area, A); }
+    if (!fails) { snprintf(cmd, sizeof cmd, "rm -r %s", root); if (system(cmd)) {} }
+    printf("test_strip: %s\n", fails ? "FAILED" : "ok");
+    return fails ? 1 : 0;
+}

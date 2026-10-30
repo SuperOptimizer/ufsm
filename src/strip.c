@@ -58,7 +58,8 @@ typedef void (*sp_fn)(void *ctx, long lo, long hi);
 typedef struct { sp_fn f; void *ctx; long n; int nt, t; } sp_arg;
 static void *sp_run(void *a) { sp_arg *p = a; p->f(p->ctx, p->n * p->t / p->nt, p->n * (p->t + 1) / p->nt); return nullptr; }
 static void spfor(long n, int nt, sp_fn f, void *ctx) {
-    if (nt > 64) nt = 64; if (nt > n) nt = (int)n;
+    if (nt > 64) nt = 64;
+    if (nt > n) nt = (int)n;
     if (nt <= 1) { if (n > 0) f(ctx, 0, n); return; }
     pthread_t th[64]; sp_arg a[64];
     for (int t = 0; t < nt; t++) { a[t] = (sp_arg){f, ctx, n, nt, t}; if (t) pthread_create(&th[t], nullptr, sp_run, &a[t]); }
@@ -299,7 +300,6 @@ static double dstat_q(const dstat *s, double q) {
     double c = 0; for (int b = 0; b <= HB; b++) { c += s->h[b]; if (c >= q * tot) return exp((b + 0.5) * 2.0 / HB); }
     return exp(2.0);
 }
-static void dstat_merge(dstat *a, const dstat *b) { a->area += b->area; a->flips_area += b->flips_area; a->energy += b->energy; a->a12 += b->a12; a->nt += b->nt; a->flips += b->flips; for (int k = 0; k <= HB; k++) a->h[k] += b->h[k]; }
 static void dstat_print(FILE *f, const char *label, const dstat *s) {
     const double ok = s->area - s->flips_area;
     fprintf(f, "%s: aniso p50/p95/p99 %.3f/%.3f/%.3f aniso>1.2 %.2f%% energy %.4f flips %lld (%.4f%% area) tris %lld\n", label, dstat_q(s, 0.5), dstat_q(s, 0.95), dstat_q(s, 0.99),
@@ -427,7 +427,8 @@ static void k_rast(void *ctx, long lo, long hi) {
                 for (int k = 0; k < 3; k++) { gc += L[k] * GC[k]; gr += L[k] * GR[k]; for (int d = 0; d < 3; d++) p[d] += L[k] * P[k][d]; }
                 /* the full-res grid's bilinear surface where its 4 corners are valid (as ufsm render samples a grid) */
                 int cc = (int)floor(gc) - R->c0, rr = (int)floor(gr);
-                if (cc > nc - 2) cc = nc - 2; if (rr > F->h - 2) rr = F->h - 2;
+                if (cc > nc - 2) cc = nc - 2;
+                if (rr > F->h - 2) rr = F->h - 2;
                 if (cc >= 0 && rr >= 0) {
                     const size_t g = (size_t)rr * nc + cc; const double fu = gc - R->c0 - cc, fv = gr - rr;
                     if (R->Z[g] >= 0 && R->Z[g + 1] >= 0 && R->Z[g + nc] >= 0 && R->Z[g + nc + 1] >= 0) {
@@ -661,10 +662,11 @@ int cmd_strip_mosaic(int argc, char **argv) {
     fprintf(stderr, "strip-mosaic: stretch CT %d..%d, ink %d..%d\n", ca, cb, ia, ib);
     /* overview geometry: the whole length (pixels) folded into --rows rows of at most --overview-px */
     long long Ltot = 0; int Hpx = 0; for (int s = 0; s < ns; s++) if (st[s].ow) { Ltot = (long long)(st[s].u0cm * 1e4 / pxum + 0.5) + st[s].ow; if (st[s].oh > Hpx) Hpx = st[s].oh; }
-    const long long rowlen = (Ltot + rows - 1) / rows; const int ds = (int)((rowlen + ovpx - 1) / ovpx) < 1 ? 1 : (int)((rowlen + ovpx - 1) / ovpx);
+    const long long rowlen = (Ltot + rows - 1) / rows; int ds = (int)((rowlen + ovpx - 1) / ovpx); if (ds < 1) ds = 1;
+    while ((long long)rows * (2 * ((Hpx + ds - 1) / ds) + 16) > 65000) ds++;   /* (the JPEG limit on the folded height) */
     const int ovw = (int)((rowlen + ds - 1) / ds), bandh = (Hpx + ds - 1) / ds, barh = 6, rowh = 2 * bandh + barh + 10, ovh = rows * rowh;
     double *ovs = calloc((size_t)ovw * ovh, 8); float *ovn = calloc((size_t)ovw * ovh, 4);
-    const int lds = (int)((Ltot + 65000 - 1) / 65000) < ds ? ds : (int)((Ltot + 65000 - 1) / 65000);   /* the one-row strip */
+    const int lds = (int)((Ltot + 65000 - 1) / 65000) < 1 ? 1 : (int)((Ltot + 65000 - 1) / 65000);   /* the one-row strip */
     const int lw = (int)((Ltot + lds - 1) / lds), lh = (Hpx + lds - 1) / lds; double *lsum = calloc((size_t)lw * lh * 2, 8); float *lcnt = calloc((size_t)lw * lh, 4);
     /* papyrus along the strip: per tile-cm column of the strip (all rows) and per wrap */
     const int tpx = (int)lround(tilecm * 1e4 / pxum); const long long ntile = Ltot / tpx + 1;
