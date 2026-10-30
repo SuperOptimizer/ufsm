@@ -324,7 +324,7 @@ static void k_colpitch(void *ctx, long lo, long hi) {
             const size_t i = (size_t)r * J->nc + c; if (J->Z[i] < 0 || J->Z[i + 1] < 0) continue;
             const double dx = J->X[i + 1] - J->X[i], dy = J->Y[i + 1] - J->Y[i], dz = J->Z[i + 1] - J->Z[i]; buf[n++] = (float)sqrt(dx * dx + dy * dy + dz * dz);
         }
-        J->med[c] = n >= 4 ? median_f32(buf, n) : NAN;
+        J->med[c] = n >= 1 ? median_f32(buf, n) : NAN;
     }
     free(buf);
 }
@@ -469,8 +469,8 @@ int cmd_strip_flatten(int argc, char **argv) {
         cpj J = {X, Y, Z, nc, F.h, med + c0}; spfor(nc - 1, nth, k_colpitch, &J);
         free(X); free(Y); free(Z);
     }
-    { long long nb = 0; F.U[0] = 0; for (int c = 0; c + 1 < F.w; c++) { double d = med[c]; if (!isfinite(d) || !(d > 0)) { d = F.step; nb++; } else if (d > 3 * F.step) d = 3 * F.step; F.U[c + 1] = F.U[c] + d; }
-      fprintf(stderr, "strip-flatten: frame: length %.2f cm (%lld columns without data at the nominal step), %.1fs\n", F.U[F.w - 1] * um * 1e-4, nb, snow() - t0); }
+    { long long nb = 0; F.U[0] = 0; for (int c = 0; c + 1 < F.w; c++) { double d = med[c]; if (!isfinite(d) || !(d > 0)) { d = 0.02 * F.step; nb++; }   /* (no surface between them: a gap of 0.02 step, so empty runs of spurious outer wraps take no length) */ else if (d > 3 * F.step) d = 3 * F.step; F.U[c + 1] = F.U[c] + d; }
+      fprintf(stderr, "strip-flatten: frame: length %.2f cm (%lld column pairs without data, 0.02 step each), %.1fs\n", F.U[F.w - 1] * um * 1e-4, nb, snow() - t0); }
     free(med);
     /* 2. chunks */
     const size_t ln = (size_t)F.lw * F.lh;
