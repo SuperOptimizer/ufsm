@@ -191,8 +191,48 @@ static __global__ void k_up2(const float *__restrict__ x, float *__restrict__ y,
 #undef XI
     }
 }
-extern "C" void vt_up2_fwd(vt_t x, vt_t y) { k_up2<<<GRID((long long)vt_numel(y))>>>(x.p, y.p, x.n, x.d, x.h, x.w, x.c, 0); }
-extern "C" void vt_up2_bwd(vt_t gy, vt_t gx) { cudaMemsetAsync(gx.p, 0, vt_numel(gx) * 4); k_up2<<<GRID((long long)vt_numel(gy))>>>(gx.p, gy.p, gx.n, gx.d, gx.h, gx.w, gx.c, 1); }
+/* C % 4 == 0: 4 channels per thread; the backward as a gather over the (<= 3 x 3 contributing) outputs of each input row, no atomics */
+static __global__ void k_up2_f4(const float4 *__restrict__ x, float4 *__restrict__ y, int N, int D, int H, int W, int C4) {
+    const long long tot = (long long)N * 2 * D * 2 * H * W * C4;
+    for (long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; i < tot; i += (long long)gridDim.x * blockDim.x) {
+        long long t = i; const int c = (int)(t % C4); t /= C4; const int w = (int)(t % W); t /= W; const int oh = (int)(t % (2 * H)); t /= 2 * H; const int od = (int)(t % (2 * D)); const long long n = t / (2 * D);
+        int d0, d1, h0, h1; float fd, fh; up_src(od, D, &d0, &d1, &fd); up_src(oh, H, &h0, &h1, &fh);
+#define XI(dd, hh) ((((n * D + (dd)) * H + (hh)) * W + w) * (long long)C4 + c)
+        const float4 a = x[XI(d0, h0)], b = x[XI(d0, h1)], e = x[XI(d1, h0)], f = x[XI(d1, h1)];
+        const float w00 = (1 - fd) * (1 - fh), w01 = (1 - fd) * fh, w10 = fd * (1 - fh), w11 = fd * fh;
+        y[i] = make_float4(w00 * a.x + w01 * b.x + w10 * e.x + w11 * f.x, w00 * a.y + w01 * b.y + w10 * e.y + w11 * f.y,
+                           w00 * a.z + w01 * b.z + w10 * e.z + w11 * f.z, w00 * a.w + w01 * b.w + w10 * e.w + w11 * f.w);
+#undef XI
+    }
+}
+/* the weight of input i in output o (one axis, n inputs) */
+__device__ __forceinline__ float up_w(int o, int n, int i) { int a, b; float f; up_src(o, n, &a, &b, &f); return (a == i ? 1.f - f : 0.f) + (b == i ? f : 0.f); }
+static __global__ void k_up2_bwd_f4(float4 *__restrict__ gx, const float4 *__restrict__ gy, int N, int D, int H, int W, int C4) {
+    const long long tot = (long long)N * D * H * W * C4;
+    for (long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; i < tot; i += (long long)gridDim.x * blockDim.x) {
+        long long t = i; const int c = (int)(t % C4); t /= C4; const int w = (int)(t % W); t /= W; const int h = (int)(t % H); t /= H; const int d = (int)(t % D); const long long n = t / D;
+        float4 s = make_float4(0.f, 0.f, 0.f, 0.f);
+        const int oz0 = 2 * d - 2 > 0 ? 2 * d - 2 : 0, oz1 = 2 * d + 3 < 2 * D - 1 ? 2 * d + 3 : 2 * D - 1;
+        const int oy0 = 2 * h - 2 > 0 ? 2 * h - 2 : 0, oy1 = 2 * h + 3 < 2 * H - 1 ? 2 * h + 3 : 2 * H - 1;
+        for (int oz = oz0; oz <= oz1; oz++) {
+            const float wz = up_w(oz, D, d); if (wz == 0.f) continue;
+            for (int oy = oy0; oy <= oy1; oy++) {
+                const float wy = up_w(oy, H, h); if (wy == 0.f) continue;
+                const float ww = wz * wy; const float4 g = gy[(((n * 2 * D + oz) * 2 * H + oy) * W + w) * (long long)C4 + c];
+                s.x += ww * g.x; s.y += ww * g.y; s.z += ww * g.z; s.w += ww * g.w;
+            }
+        }
+        gx[i] = s;
+    }
+}
+extern "C" void vt_up2_fwd(vt_t x, vt_t y) {
+    if (x.c % 4 == 0) { k_up2_f4<<<GRID((long long)vt_numel(y) / 4)>>>((const float4 *)x.p, (float4 *)y.p, x.n, x.d, x.h, x.w, x.c / 4); return; }
+    k_up2<<<GRID((long long)vt_numel(y))>>>(x.p, y.p, x.n, x.d, x.h, x.w, x.c, 0);
+}
+extern "C" void vt_up2_bwd(vt_t gy, vt_t gx) {
+    if (gx.c % 4 == 0) { k_up2_bwd_f4<<<GRID((long long)vt_numel(gx) / 4)>>>((float4 *)gx.p, (const float4 *)gy.p, gx.n, gx.d, gx.h, gx.w, gx.c / 4); return; }
+    cudaMemsetAsync(gx.p, 0, vt_numel(gx) * 4); k_up2<<<GRID((long long)vt_numel(gy))>>>(gx.p, gy.p, gx.n, gx.d, gx.h, gx.w, gx.c, 1);
+}
 
 extern "C" void vt_cat_fwd(vt_t a, vt_t b, vt_t y) {
     const size_t rows = vt_rows(a);
@@ -322,4 +362,13 @@ static __global__ void k_tr(const float *__restrict__ x, float *__restrict__ y, 
         const int c = (int)(i % C); const long long t = i / C, b = t % B, a = t / B; y[(b * A + a) * C + c] = x[i];
     }
 }
-extern "C" void vt_transpose(const float *x, float *y, long long A, long long B, int C) { k_tr<<<GRID(A * B * C)>>>(x, y, A, B, C); }
+static __global__ void k_tr4(const float4 *__restrict__ x, float4 *__restrict__ y, long long A, long long B, int C4) {
+    const long long tot = A * B * C4;
+    for (long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; i < tot; i += (long long)gridDim.x * blockDim.x) {
+        const int c = (int)(i % C4); const long long t = i / C4, b = t % B, a = t / B; y[(b * A + a) * C4 + c] = x[i];
+    }
+}
+extern "C" void vt_transpose(const float *x, float *y, long long A, long long B, int C) {
+    if (C % 4 == 0) k_tr4<<<GRID(A * B * C / 4)>>>((const float4 *)x, (float4 *)y, A, B, C / 4);
+    else k_tr<<<GRID(A * B * C)>>>(x, y, A, B, C);
+}

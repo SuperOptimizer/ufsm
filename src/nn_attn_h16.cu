@@ -26,7 +26,8 @@ static unsigned nbk(long long n, int t) { return (unsigned)((n + t - 1) / t); }
 
 /* ---- GEMM: row-major D[M][N] = op(A) op(B) (+ beta Cin) (+ bias[N]); A, B bf16, D fp32 (Cin fp32) or bf16; cuBLASLt column-major as
    in nn_attn.cu (D^T = op(B)^T op(A)^T) ---- */
-typedef struct { int M, N, K, ta, tb, dbf, bias, al; cublasLtMatmulDesc_t op; cublasLtMatrixLayout_t a, b, c; cublasLtMatmulAlgo_t algo; int ok; } hplan;
+typedef struct { int M, N, K, ta, tb, dbf, bias, al; cublasLtMatmulDesc_t op; cublasLtMatrixLayout_t a, b, c; cublasLtMatmulAlgo_t algo; int ok, tuned, nh;
+                 cublasLtMatmulHeuristicResult_t h[8]; } hplan;
 static hplan g_hp[128]; static int g_nhp = 0;
 static cublasLtHandle_t g_h = nullptr; static void *g_hws = nullptr; static const size_t HWS = 32u << 20;
 static hplan *hplan_get(int M, int N, int K, int ta, int tb, int dbf, int bias, int al) {
@@ -54,8 +55,8 @@ static hplan *hplan_get(int M, int N, int K, int ta, int tb, int dbf, int bias, 
     if (al < 16) { const uint32_t a4 = (uint32_t)al;
         cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_C_BYTES, &a4, sizeof a4);
         cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_D_BYTES, &a4, sizeof a4); }
-    cublasLtMatmulHeuristicResult_t h; int n = 0;
-    if (cublasLtMatmulAlgoGetHeuristic(g_h, p->op, p->a, p->b, p->c, p->c, pref, 1, &h, &n) == CUBLAS_STATUS_SUCCESS && n > 0) { p->algo = h.algo; p->ok = 1; }
+    int n = 0;
+    if (cublasLtMatmulAlgoGetHeuristic(g_h, p->op, p->a, p->b, p->c, p->c, pref, 8, p->h, &n) == CUBLAS_STATUS_SUCCESS && n > 0) { p->algo = p->h[0].algo; p->ok = 1; p->nh = n; }
     cublasLtMatmulPreferenceDestroy(pref);
     if (!p->ok) fprintf(stderr, "at h16 gemm: no cuBLASLt algorithm for M %d N %d K %d ta %d tb %d dbf %d bias %d al %d\n", M, N, K, ta, tb, dbf, bias, al);
     return p;
@@ -67,6 +68,28 @@ static int hg(int ta, int tb, int M, int N, int K, const void *A, const void *B,
     if (!p || !p->ok) return -1;
     if (bias) cublasLtMatmulDescSetAttribute(p->op, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof bias);
     const float one = 1.f;
+    if (!p->tuned) {   /* first call: time the heuristic's candidates on these operands (an in-place accumulation writes a scratch copy) */
+        p->tuned = 1;
+        const size_t db = (size_t)M * N * (dbf ? 2 : 4); void *Dt = D; static void *tmp = nullptr; static size_t tcap = 0;
+        if (Cin == (const float *)D && beta != 0.f) {
+            if (db > ((size_t)64 << 20)) p->nh = 1;
+            else if (db > tcap) { if (tmp) cudaFree(tmp); tmp = nullptr; tcap = 0; if (cudaMalloc(&tmp, db) == cudaSuccess) tcap = db; else p->nh = 1; }
+            Dt = tmp;
+        }
+        if (p->nh > 1 && getenv("UFSM_H16_NOTUNE") == nullptr) {
+            cudaEvent_t e0, e1; cudaEventCreate(&e0); cudaEventCreate(&e1); float best = 1e30f; int bi = 0;
+            for (int i = 0; i < p->nh; i++) {
+                float tt = 0.f; int bad = 0;
+                for (int r = 0; r < 3 && !bad; r++) {
+                    cudaEventRecord(e0, 0);
+                    bad = cublasLtMatmul(g_h, p->op, &one, B, p->a, A, p->b, &beta, Cin ? (const void *)Cin : D, p->c, Dt, p->c, &p->h[i].algo, g_hws, HWS, 0) != CUBLAS_STATUS_SUCCESS;
+                    cudaEventRecord(e1, 0); cudaEventSynchronize(e1); float ms = 0.f; cudaEventElapsedTime(&ms, e0, e1); if (r) tt += ms;
+                }
+                if (!bad && tt < best) { best = tt; bi = i; }
+            }
+            p->algo = p->h[bi].algo; cudaEventDestroy(e0); cudaEventDestroy(e1);
+        }
+    }
     const cublasStatus_t s = cublasLtMatmul(g_h, p->op, &one, B, p->a, A, p->b, &beta, Cin ? (const void *)Cin : D, p->c, D, p->c, &p->algo, g_hws, HWS, 0);
     if (s != CUBLAS_STATUS_SUCCESS) { fprintf(stderr, "at h16 gemm: cublasLtMatmul failed (%d)\n", (int)s); return -1; }
     return 0;
