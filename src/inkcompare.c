@@ -12,6 +12,7 @@
 #include "imgops.h"
 #include "tiff.h"
 #include <math.h>
+#include <unistd.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -526,4 +527,24 @@ end:
     for (int k = 0; k < X.n; k++) tiff_close(X.t[k]);
     for (int k = 1; k < X.n; k++) free((void *)lab[k]);
     return rc;
+}
+
+/* ufsm jpeg-fit IN.jpg OUT.jpg [--div D | --max-px N] [--quality 90] [--threads 16]: a finished JPEG shrunk (antialiased bilinear,
+   aspect kept) by D per side or to a longest side of N; OUT may be IN (written beside it, then renamed). Already small enough: copied. */
+int cmd_jpeg_fit(int argc, char **argv) {
+    if (argc < 4) { fprintf(stderr, "usage: ufsm jpeg-fit IN.jpg OUT.jpg [--div 2 | --max-px N] [--quality 90] [--threads 16]\n"); return 2; }
+    const double div = atof(icopt(argc, argv, "--div", "0")); int maxpx = atoi(icopt(argc, argv, "--max-px", "0"));
+    const int q = atoi(icopt(argc, argv, "--quality", "90")), th = atoi(icopt(argc, argv, "--threads", "16"));
+    if ((div > 0) == (maxpx > 0)) { fprintf(stderr, "jpeg-fit: one of --div D (> 0) or --max-px N\n"); return 2; }
+    int w, h; uint8_t *rgb = jpeg_read_rgb(argv[2], &w, &h);
+    if (!rgb) { fprintf(stderr, "jpeg-fit: cannot read %s\n", argv[2]); return 1; }
+    if (div > 0) maxpx = (int)lround((w > h ? w : h) / div);
+    const int w0 = w, h0 = h;
+    if (img_fit_rgb(&rgb, &w, &h, maxpx, th)) { fprintf(stderr, "jpeg-fit: out of memory\n"); free(rgb); return 1; }
+    char tmp[4200]; snprintf(tmp, sizeof tmp, "%s.fit.tmp", argv[3]);
+    int rc = jpeg_write_rgb(tmp, w, h, rgb, q) || rename(tmp, argv[3]);
+    free(rgb);
+    if (rc) { fprintf(stderr, "jpeg-fit: cannot write %s\n", argv[3]); unlink(tmp); return 1; }
+    printf("jpeg-fit: %s %dx%d -> %s %dx%d\n", argv[2], w0, h0, argv[3], w, h);
+    return 0;
 }
