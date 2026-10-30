@@ -249,6 +249,7 @@ int vwt_backward(vwt *m, const float *gph, const float *ginc) {
 }
 
 void vwt_set_xfeat(vwt *m, const uint16_t *xf) { m->xf = xf; }
+const vwt_cfg *vwt_cfg_of(const vwt *m) { return &m->cfg; }
 uint16_t *vwt_xfeat_buf(vwt *m, int *ld) { build(m); if (!m->cfg.cx) return nullptr; if (ld) *ld = m->xC; m->xf = m->xb + 2; return m->xb + 2; }
 
 /* checkpoint header: "VWT1" (cfg without cx) or "VWT2" (full cfg) */

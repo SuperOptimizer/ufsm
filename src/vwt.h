@@ -131,6 +131,7 @@ void vwt_set_xfeat(vwt *m, const uint16_t *xf);   /* bf16 [T][T][L][cx] */
 /* the features' place in the network's own bf16 input (row stride *ld channels; cfg.cx nets): a trunk writing there (wt_forward_ld) saves the
    copy; it becomes the feature source (vwt_set_xfeat replaces it). nullptr without cfg.cx */
 uint16_t *vwt_xfeat_buf(vwt *m, int *ld);
+const vwt_cfg *vwt_cfg_of(const vwt *m);
 /* warm start from a checkpoint with the same architecture except cx: every parameter copied, the first conv's taps of the extra input
    channels zero (so the start computes exactly the source model); 0 on success */
 int vwt_init_from(vwt *m, const char *path, int use_ema);
