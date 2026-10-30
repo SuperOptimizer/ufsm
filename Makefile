@@ -62,7 +62,7 @@ SRC += src/srpair.c
 SRC += src/storebench.c src/phasepack.c
 SRC += src/afv.c src/fibercheck.c
 SRC += src/countfield.c
-SRC += src/flatten.c
+SRC += src/flatten.c src/faces.c src/faces_cli.c
 SRC += src/sheetcut.c
 SRC += src/strip.c
 OBJ  = $(patsubst src/%.c,$(B)/%.o,$(SRC)) $(B)/surfcomp.o
@@ -235,6 +235,9 @@ test-all: $(B)/test_flatten
 $(B)/test_strip: tests/test_strip.c $(B)/strip.o $(B)/flatten.o $(B)/imgops.o $(B)/tiffw.o $(B)/tiff.o $(B)/tfx.o $(B)/surfcomp.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
 test-all: $(B)/test_strip
+$(B)/test_faces: tests/test_faces.c $(B)/faces.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
+test-all: $(B)/test_faces
 $(B)/test_fit_emb: tests/test_fit_emb.c $(B)/fit_emb.o $(B)/embz.o $(B)/z3w.o $(B)/fit.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/coreline.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 test-all: $(B)/test_fit_emb
@@ -544,6 +547,7 @@ test-all: $(B)/test_gpu_aug $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover 
 	./$(B)/test_afv
 	./$(B)/test_flatten
 	./$(B)/test_strip
+	./$(B)/test_faces
 	./$(B)/test_fit_emb
 	./$(B)/test_distill
 	./$(B)/test_tiffw

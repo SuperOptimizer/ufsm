@@ -28,6 +28,42 @@ static const char *icopt(int argc, char **argv, const char *name, const char *de
 static int icflag(int argc, char **argv, const char *name) { for (int i = 2; i < argc; i++) if (!strcmp(argv[i], name)) return 1; return 0; }
 static int icarg(int argc, char **argv, const char *name) { for (int i = 2; i < argc; i++) if (!strcmp(argv[i], name)) return i; return -1; }
 
+/* matplotlib viridis (256 entries, round(255 x the float table)) */
+static const uint8_t VIRIDIS[256][3] = {
+    {68,1,84}, {68,2,86}, {69,4,87}, {69,5,89}, {70,7,90}, {70,8,92}, {70,10,93}, {70,11,94},
+    {71,13,96}, {71,14,97}, {71,16,99}, {71,17,100}, {71,19,101}, {72,20,103}, {72,22,104}, {72,23,105},
+    {72,24,106}, {72,26,108}, {72,27,109}, {72,28,110}, {72,29,111}, {72,31,112}, {72,32,113}, {72,33,115},
+    {72,35,116}, {72,36,117}, {72,37,118}, {72,38,119}, {72,40,120}, {72,41,121}, {71,42,122}, {71,44,122},
+    {71,45,123}, {71,46,124}, {71,47,125}, {70,48,126}, {70,50,126}, {70,51,127}, {70,52,128}, {69,53,129},
+    {69,55,129}, {69,56,130}, {68,57,131}, {68,58,131}, {68,59,132}, {67,61,132}, {67,62,133}, {66,63,133},
+    {66,64,134}, {66,65,134}, {65,66,135}, {65,68,135}, {64,69,136}, {64,70,136}, {63,71,136}, {63,72,137},
+    {62,73,137}, {62,74,137}, {62,76,138}, {61,77,138}, {61,78,138}, {60,79,138}, {60,80,139}, {59,81,139},
+    {59,82,139}, {58,83,139}, {58,84,140}, {57,85,140}, {57,86,140}, {56,88,140}, {56,89,140}, {55,90,140},
+    {55,91,141}, {54,92,141}, {54,93,141}, {53,94,141}, {53,95,141}, {52,96,141}, {52,97,141}, {51,98,141},
+    {51,99,141}, {50,100,142}, {50,101,142}, {49,102,142}, {49,103,142}, {49,104,142}, {48,105,142}, {48,106,142},
+    {47,107,142}, {47,108,142}, {46,109,142}, {46,110,142}, {46,111,142}, {45,112,142}, {45,113,142}, {44,113,142},
+    {44,114,142}, {44,115,142}, {43,116,142}, {43,117,142}, {42,118,142}, {42,119,142}, {42,120,142}, {41,121,142},
+    {41,122,142}, {41,123,142}, {40,124,142}, {40,125,142}, {39,126,142}, {39,127,142}, {39,128,142}, {38,129,142},
+    {38,130,142}, {38,130,142}, {37,131,142}, {37,132,142}, {37,133,142}, {36,134,142}, {36,135,142}, {35,136,142},
+    {35,137,142}, {35,138,141}, {34,139,141}, {34,140,141}, {34,141,141}, {33,142,141}, {33,143,141}, {33,144,141},
+    {33,145,140}, {32,146,140}, {32,146,140}, {32,147,140}, {31,148,140}, {31,149,139}, {31,150,139}, {31,151,139},
+    {31,152,139}, {31,153,138}, {31,154,138}, {30,155,138}, {30,156,137}, {30,157,137}, {31,158,137}, {31,159,136},
+    {31,160,136}, {31,161,136}, {31,161,135}, {31,162,135}, {32,163,134}, {32,164,134}, {33,165,133}, {33,166,133},
+    {34,167,133}, {34,168,132}, {35,169,131}, {36,170,131}, {37,171,130}, {37,172,130}, {38,173,129}, {39,173,129},
+    {40,174,128}, {41,175,127}, {42,176,127}, {44,177,126}, {45,178,125}, {46,179,124}, {47,180,124}, {49,181,123},
+    {50,182,122}, {52,182,121}, {53,183,121}, {55,184,120}, {56,185,119}, {58,186,118}, {59,187,117}, {61,188,116},
+    {63,188,115}, {64,189,114}, {66,190,113}, {68,191,112}, {70,192,111}, {72,193,110}, {74,193,109}, {76,194,108},
+    {78,195,107}, {80,196,106}, {82,197,105}, {84,197,104}, {86,198,103}, {88,199,101}, {90,200,100}, {92,200,99},
+    {94,201,98}, {96,202,96}, {99,203,95}, {101,203,94}, {103,204,92}, {105,205,91}, {108,205,90}, {110,206,88},
+    {112,207,87}, {115,208,86}, {117,208,84}, {119,209,83}, {122,209,81}, {124,210,80}, {127,211,78}, {129,211,77},
+    {132,212,75}, {134,213,73}, {137,213,72}, {139,214,70}, {142,214,69}, {144,215,67}, {147,215,65}, {149,216,64},
+    {152,216,62}, {155,217,60}, {157,217,59}, {160,218,57}, {162,218,55}, {165,219,54}, {168,219,52}, {170,220,50},
+    {173,220,48}, {176,221,47}, {178,221,45}, {181,222,43}, {184,222,41}, {186,222,40}, {189,223,38}, {192,223,37},
+    {194,223,35}, {197,224,33}, {200,224,32}, {202,225,31}, {205,225,29}, {208,225,28}, {210,226,27}, {213,226,26},
+    {216,226,25}, {218,227,25}, {221,227,24}, {223,227,24}, {226,228,24}, {229,228,25}, {231,228,25}, {234,229,26},
+    {236,229,27}, {239,229,28}, {241,229,29}, {244,230,30}, {246,230,32}, {248,230,33}, {251,231,35}, {253,231,37}
+};
+
 enum { MAXI = 8, NIMG = MAXI + 1 };
 typedef struct {
     int n; tiff *t[NIMG]; int IW, IH, rps, ns;   /* the inputs (0 = CT) and their common strip layout */
@@ -216,15 +252,36 @@ typedef struct {
     int half, fit; int w1, h1, ow, oh;     /* stages: half -> w1 x h1; fit -> ow x oh */
     pcoef ah, av, bh, bv;
     uint8_t *out; int rows; _Atomic int next;
+    int rgb[2], ctmin;                     /* rgb[0] >= 0: one agreement panel, R = B = ink rgb[0], G = ink rgb[1]; CT < ctmin dark grey */
+    int cmap;                              /* 1: ink panels (k >= 1) through viridis after their table; CT < ctmin dark grey */
 } p3_job;
 typedef struct { uint8_t *buf; int *tag; int cap; size_t len; } p3ring;
 static void p3_full_row(p3_job *J, icstrip *c, int y, uint8_t *row) {   /* ink_panels' row y */
     icx *X = J->X; const int W = X->W;
     memset(row, 255, (size_t)J->TW * 3);
+    if (J->rgb[0] >= 0) {   /* recto (magenta) x verso (green): both white, neither black */
+        const uint8_t *m = ic_row(X, 0, &c[0], y), *a = ic_row(X, J->rgb[0], &c[J->rgb[0]], y), *b = ic_row(X, J->rgb[1], &c[J->rgb[1]], y);
+        if (!m || !a || !b) return;
+        const uint8_t *La = J->lut[J->rgb[0]], *Lb = J->lut[J->rgb[1]];
+        for (int x = 0; x < W; x++) {
+            uint8_t *o = row + 3 * x;
+            if (!m[x] || m[x] < J->ctmin) { o[0] = o[1] = o[2] = 40; continue; }
+            o[0] = o[2] = La[a[x]]; o[1] = Lb[b[x]];
+        }
+        const uint8_t yel[3] = {255, 220, 0}; const int sc = J->sc;
+        if (y >= 2 * sc && y < 2 * sc + 7 * sc && J->lab[0]) img_text_scaled(row, J->TW, 1, 2 * sc, 2 * sc - y, J->lab[0], sc, yel);
+        return;
+    }
+    const uint8_t *m = J->cmap ? ic_row(X, 0, &c[0], y) : nullptr;
+    if (J->cmap && !m) return;
     for (int p = 0; p < J->np; p++) {
         const int k = J->first + p; const uint8_t *s = ic_row(X, k, &c[k], y), *L = J->lut[k];
         uint8_t *o = row + (size_t)p * (W + 8) * 3;
         if (!s) return;
+        if (J->cmap && k >= 1) {
+            for (int x = 0; x < W; x++) { uint8_t *q = o + 3 * x; if (!m[x] || m[x] < J->ctmin) { q[0] = q[1] = q[2] = 40; continue; } const uint8_t *v = VIRIDIS[L[s[x]]]; q[0] = v[0]; q[1] = v[1]; q[2] = v[2]; }
+            continue;
+        }
         for (int x = 0; x < W; x++) o[3 * x] = o[3 * x + 1] = o[3 * x + 2] = L[s[x]];
     }
     const uint8_t yel[3] = {255, 220, 0}; const int sc = J->sc;
@@ -274,11 +331,15 @@ out:
     return nullptr;
 }
 /* panels first .. first + np - 1 -> RGB *ow x *oh (as ink_panels + img_fit_rgb) */
-static uint8_t *p3_panels(icx *X, int first, int np, uint8_t lut[NIMG][256], const char *const *lab, int half, int maxpx, int *owp, int *ohp) {
+static int g_cmap = 0, g_cmap_ctmin = 1;   /* --cmap viridis (cmd_ink_compare), its off-papyrus CT floor (--rgb-ct-min) */
+static uint8_t *p3_panels(icx *X, int first, int np, uint8_t lut[NIMG][256], const char *const *lab, int half, int maxpx, int *owp, int *ohp, const int *rgb, int ctmin) {
     p3_job *J = calloc(1, sizeof *J); if (!J) return nullptr;
     J->X = X; J->np = np; J->first = first; memcpy(J->lut, lut, sizeof J->lut);
+    J->rgb[0] = rgb ? rgb[0] : -1; J->rgb[1] = rgb ? rgb[1] : -1; J->ctmin = ctmin; J->cmap = g_cmap;
+    if (g_cmap && !rgb) J->ctmin = g_cmap_ctmin;
     for (int p = 0; p < np; p++) J->lab[p] = lab ? lab[p] : nullptr;
     J->TW = np * X->W + 8 * (np - 1); J->H0 = X->H; J->sc = X->H / 200 > 1 ? X->H / 200 : 2;
+    if (J->rgb[0] >= 0 && lab && lab[0]) { const int fit = J->TW / (8 * (int)strlen(lab[0]) + 8); if (J->sc > fit) J->sc = fit > 1 ? fit : 1; }   /* the legend fits the one panel */
     J->half = half; J->w1 = half ? J->TW / 2 : J->TW; J->h1 = half ? X->H / 2 : X->H;
     uint8_t *ret = nullptr;
     if (J->w1 < 1 || J->h1 < 1) goto done;
@@ -420,16 +481,29 @@ int cmd_ink_compare(int argc, char **argv) {
     {
         const char *each = icopt(argc, argv, "--each", nullptr);
         const int maxpx = atoi(icopt(argc, argv, "--max-px", "0")), jq = atoi(icopt(argc, argv, "--quality", "90")), half = !icflag(argc, argv, "--full");
+        const char *cm = icopt(argc, argv, "--cmap", nullptr);
+        if (cm && strcmp(cm, "viridis")) { fprintf(stderr, "ink-compare: --cmap viridis (the only map)\n"); rc = 2; goto end; }
+        g_cmap = cm != nullptr; g_cmap_ctmin = atoi(icopt(argc, argv, "--rgb-ct-min", "1"));
+        const int f0 = icflag(argc, argv, "--no-ct") && n > 1 ? 1 : 0;   /* --no-ct: ink panels only */
         if (each) {
             const char *suf = icopt(argc, argv, "--each-suffix", ""); const int ect = icflag(argc, argv, "--each-ct");
             for (int k = ect ? 0 : 1; k < n; k++) {
                 char p[1400]; snprintf(p, sizeof p, "%s%s%s.jpg", each, lab[k], suf);
-                int ow, oh; uint8_t *rgb = p3_panels(&X, k, 1, lut, nullptr, half, maxpx, &ow, &oh);
+                int ow, oh; uint8_t *rgb = p3_panels(&X, k, 1, lut, nullptr, half, maxpx, &ow, &oh, nullptr, 0);
                 if (!rgb || jpeg_write_rgb(p, ow, oh, rgb, jq)) { fprintf(stderr, "ink-compare: cannot write %s\n", p); rc = 1; }
                 free(rgb);
             }
+        } else if (icopt(argc, argv, "--rgb-agree", nullptr)) {   /* one RGB panel: recto ink R + B (magenta), verso ink G; agreement white */
+            char la[128] = "", lb[128] = ""; int ix[2] = {-1, -1};
+            if (sscanf(icopt(argc, argv, "--rgb-agree", ""), "%127[^,],%127s", la, lb) == 2)
+                for (int k = 1; k < n; k++) { if (!strcmp(lab[k], la)) ix[0] = k; if (!strcmp(lab[k], lb)) ix[1] = k; }
+            if (ix[0] < 0 || ix[1] < 0) { fprintf(stderr, "ink-compare: --rgb-agree RECTO,VERSO (two --ink labels)\n"); rc = 2; goto end; }
+            char title[300]; snprintf(title, sizeof title, "%s=magenta %s=green both=white", la, lb); const char *tl[1] = {title};
+            int ow, oh; uint8_t *rgb = p3_panels(&X, 0, 1, lut, tl, half, maxpx, &ow, &oh, ix, atoi(icopt(argc, argv, "--rgb-ct-min", "1")));
+            if (!rgb || jpeg_write_rgb(argv[2], ow, oh, rgb, jq)) { fprintf(stderr, "ink-compare: cannot write %s\n", argv[2]); rc = 1; }
+            free(rgb);
         } else {
-            int ow, oh; uint8_t *rgb = p3_panels(&X, 0, n, lut, lab, half, maxpx, &ow, &oh);
+            int ow, oh; uint8_t *rgb = p3_panels(&X, f0, n - f0, lut, lab + f0, half, maxpx, &ow, &oh, nullptr, 0);
             if (!rgb || jpeg_write_rgb(argv[2], ow, oh, rgb, jq)) { fprintf(stderr, "ink-compare: cannot write %s\n", argv[2]); rc = 1; }
             free(rgb);
         }
