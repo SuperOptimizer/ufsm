@@ -201,6 +201,9 @@ test-all: $(B)/test_fblend
 $(B)/test_countfield: tests/test_countfield.c $(B)/countfield.o $(B)/fit.o $(B)/fit_emb.o $(B)/embz.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/coreline.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/z3w.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 test-all: $(B)/test_countfield
+$(B)/test_spiralfit: tests/test_spiralfit.c $(B)/countfield.o $(B)/fit.o $(B)/fit_emb.o $(B)/embz.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/coreline.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/z3w.o $(B)/nn.o $(B)/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
+test-all: $(B)/test_spiralfit
 $(B)/test_stitch: tests/test_stitch.c $(B)/stitch.o $(B)/fit.o $(B)/fit_emb.o $(B)/embz.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/coreline.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/z3w.o $(B)/tiffw.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 

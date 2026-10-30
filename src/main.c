@@ -3793,6 +3793,7 @@ int cmd_flatten_warp(int argc, char **argv);
 int cmd_fiber_check(int argc, char **argv);    /* src/fibercheck.c */
 int cmd_fiber_export(int argc, char **argv);   /* src/fibercheck.c */
 int cmd_count_field(int argc, char **argv);   /* src/countfield.c */
+int cmd_spiral_fit(int argc, char **argv);    /* src/countfield.c */
 int cmd_phase_packing(int argc, char **argv);   /* src/packmap.c */
 int cmd_wbench_stats(int argc, char **argv);   /* src/wbench.c */
 int cmd_ckpt_avg(int argc, char **argv);   /* src/wbench.c */
@@ -3833,6 +3834,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "fiber-check")) return cmd_fiber_check(argc, argv);
     if (!strcmp(cmd, "fiber-export")) return cmd_fiber_export(argc, argv);
     if (!strcmp(cmd, "count-field")) return cmd_count_field(argc, argv);
+    if (!strcmp(cmd, "spiral-fit")) return cmd_spiral_fit(argc, argv);
     if (!strcmp(cmd, "phase-packing")) return cmd_phase_packing(argc, argv);
     if (!strcmp(cmd, "wbench-stats")) return cmd_wbench_stats(argc, argv);
     if (!strcmp(cmd, "ckpt-avg")) return cmd_ckpt_avg(argc, argv);
