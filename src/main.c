@@ -63,6 +63,7 @@ int cmd_render_sheets(int argc, char **argv);   /* src/render.c */
 int cmd_overlay_red(int argc, char **argv);
 int cmd_tifxyz_scale(int argc, char **argv);
 int cmd_ink_compare(int argc, char **argv);
+int cmd_jpeg_fit(int argc, char **argv);
 int cmd_ink_ext(int argc, char **argv);   /* src/inkext.c */
 int cmd_ink_ensemble(int argc, char **argv);
 int cmd_wl_dump(int argc, char **argv);
@@ -147,6 +148,7 @@ static int usage(void) {
         "  ufsm overlay-red <ct-dir> <ink-dir> <out-dir> [ink2 [ink3]]   the 5-panel overlay of existing renders\n"
         "  ufsm tifxyz-scale <src> <dst> <div> [--offset z,y,x]   tifxyz coordinates / div (e.g. 2.4 -> 9.6 um: 4)\n"
         "  ufsm ink-compare <out.jpg> --ct CT.tif --ink LABEL=INK.tif ..   CT | ink panels (half-res JPEG) + ink statistics per render\n"
+        "  ufsm jpeg-fit IN.jpg OUT.jpg --div 2 | --max-px N                  a finished JPEG shrunk (OUT may be IN)\n"
         "  ufsm tifxyz-sfc <src-dir> <dst-dir> [--error 0.25] [--every K]   tifxyz wraps -> surface-compressor .sfc (readers take .sfc wraps directly)\n"
         "  ufsm sheet-cut <wraps-dir> <out-dir> [--tol 0.3] [--min-cm2 0.25] [--max 8]   square flat sheets: largest isometric rectangles of each wrap\n"
         "  ufsm ink-ext --model v8in|hecate24|hecate96|reader3|ink9um --weights W --surface TIFXYZ --ct ROOT KEY --out DIR   external ink networks on a surface\n"
@@ -3949,6 +3951,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "overlay-red")) return cmd_overlay_red(argc, argv);
     if (!strcmp(cmd, "tifxyz-scale")) return cmd_tifxyz_scale(argc, argv);
     if (!strcmp(cmd, "ink-compare")) return cmd_ink_compare(argc, argv);
+    if (!strcmp(cmd, "jpeg-fit")) return cmd_jpeg_fit(argc, argv);
     if (!strcmp(cmd, "ink-ext")) return cmd_ink_ext(argc, argv);
     if (!strcmp(cmd, "ink-splat")) return cmd_ink_splat(argc, argv);
     if (!strcmp(cmd, "ink-score")) return cmd_ink_score(argc, argv);

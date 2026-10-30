@@ -20,6 +20,7 @@
 
 int cmd_ink_compare(int argc, char **argv);
 int ink_compare_mem(int argc, char **argv);
+int cmd_jpeg_fit(int argc, char **argv);
 
 static int fails;
 #define CHECK(c, ...) do { if (!(c)) { fprintf(stderr, "FAIL %s:%d: ", __FILE__, __LINE__); fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); fails++; } } while (0)
@@ -197,6 +198,20 @@ int main(void) {
             free(j);
         }
         CHECK(mean[1] > mean[0] + 3, "diff-agree: disagreement not brighter (%.1f vs %.1f)", mean[1], mean[0]);
+    }
+    {   /* jpeg-fit --div 2 in place: half per side, mean colour kept */
+        char o[760], sv[760]; snprintf(o, sizeof o, "%s/d.jpg", dir); snprintf(sv, sizeof sv, "%s/f.txt", dir);
+        int w0, h0; uint8_t *a = jpeg_read_rgb(o, &w0, &h0); double m0 = 0, m1 = 0;
+        for (size_t i = 0; a && i < (size_t)w0 * h0 * 3; i++) m0 += a[i];
+        char *f[] = {"ufsm", "jpeg-fit", o, o, "--div", "2", "--threads", "2", nullptr};
+        CHECK(run(cmd_jpeg_fit, f, sv) == 0, "jpeg-fit rc");
+        int w1, h1; uint8_t *b = jpeg_read_rgb(o, &w1, &h1);
+        CHECK(b && abs(w1 - w0 / 2) <= 1 && abs(h1 - h0 / 2) <= 1, "jpeg-fit %dx%d -> %dx%d", w0, h0, w1, h1);
+        for (size_t i = 0; b && i < (size_t)w1 * h1 * 3; i++) m1 += b[i];
+        if (a && b) CHECK(fabs(m0 / ((double)w0 * h0 * 3) - m1 / ((double)w1 * h1 * 3)) < 2.0, "jpeg-fit mean moved");
+        char *g[] = {"ufsm", "jpeg-fit", o, o, nullptr};
+        CHECK(run(cmd_jpeg_fit, g, sv) == 2, "jpeg-fit without --div / --max-px");
+        free(a); free(b);
     }
     free(ct); free(ink); free(ink2);
     snprintf(p, sizeof p, "rm -rf '%s'", dir); if (system(p)) {}
