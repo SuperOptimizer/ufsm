@@ -2,7 +2,7 @@
    the model; per slab the 4x4x2-block phase relative to its centre (OUT/phase.f16), the centre (OUT/centre.f32) and its side of every
    neighbour pair (OUT/pairs.f32), written with pwrite at the slab's / pair's offsets.
 
-   ufsm vwt-infer CKPT ROOT KEY OUT (--tiling T.bin | --umb JSON --box z,y,x,nz,ny,nx) [--gpu 0] [--part i/n] [--threads 16] [--cache DIR]
+   ufsm vwt-infer CKPT ROOT KEY OUT (--tiling T.bin | --umb JSON --box z,y,x,nz,ny,nx) [--gpu 0] [--part i/n] [--threads 16] [--cache DIR] [--mx8 1]
    ufsm vwt-infer --bench N [--gpu 0]      synthetic CT band and tiling, random weights: slabs / s of the pipeline
 
    Parts take whole z bands round robin; each part writes NaN centres for its skipped slabs (> 98 % zero CT), so with every part run each
@@ -129,6 +129,9 @@ int cmd_vwt_infer(int argc, char **argv) {
     int pi = 0, pn = 1; sscanf(opt(argc, argv, "--part", "0/1"), "%d/%d", &pi, &pn); if (pn < 1 || pi < 0 || pi >= pn) { fprintf(stderr, "vwt-infer: bad --part\n"); return 2; }
     if (nn_init(atoi(opt(argc, argv, "--gpu", "0")))) { fprintf(stderr, "vwt-infer: no GPU\n"); return 1; }
     if (!getenv("UFSM_LINEAR_MX")) at_set_mx(16);   /* the bf16 blocks */
+    /* MX-fp8 conv forward (--mx8 1, the default; env UFSM_VTF_MX overrides): r0-2000 on a 96-slab P4 box vs bf16 convs: |d phase| median
+       0.002, max 0.025 turns, pair offsets max 0.012 turns; 7.5 % faster */
+    if (!getenv("UFSM_VTF_MX")) vtf_set_mx(atoi(opt(argc, argv, "--mx8", "1")) ? 8 : 0);
     vwt *m; vwt_cfg c = default_cfg(T, L);
     m = bench ? vwt_create(&c, 1) : vwt_load(argv[2], 1);
     if (!m) { fprintf(stderr, "vwt-infer: no model\n"); return 1; }
