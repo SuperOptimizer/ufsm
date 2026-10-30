@@ -49,23 +49,33 @@ __device__ __forceinline__ int sw32(int row, int q) { return row * 32 + ((q ^ ((
 __device__ __forceinline__ void ldsm4b(unsigned *r, const void *p) {
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n" : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"((unsigned)__cvta_generic_to_shared(p)));
 }
+/* bf16 rows of 64 bytes: the 16-byte chunk q (0..3) at q ^ ((row >> 1) & 3) */
+__device__ __forceinline__ int sw64b(int row, int q) { return row * 64 + ((q ^ ((row >> 1) & 3)) << 4); }
+template <bool F8> __device__ __forceinline__ int swr(int row, int q) { return F8 ? sw32(row, q) : sw64b(row, q); }
+__device__ __forceinline__ void mma_bf16v(float *c, const unsigned *a, const unsigned *b) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
 __device__ __forceinline__ void cpa_commit8() { asm volatile("cp.async.commit_group;\n" ::: "memory"); }
 template <int N> __device__ __forceinline__ void cpa_wait8() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N) : "memory"); }
 
-/* 256 threads; BM == 128 (thread pair per A row), BN <= 128 */
-template <int BN> constexpr int v8_smem() { return V8S * V8B * (128 * 32 + BN * 32 + 4 * (128 + BN)); }
-template <int MODE, int BN, int WARPS_M, int WARPS_N, bool TS>
+/* 256 threads; BM == 128 (thread pair per A row), BN <= 128. F8: MX-fp8 (rows of 32 bytes per 32-K block, scales, V8B blocks per stage);
+   else bf16 (rows of 64 bytes, one block per stage: 2 blocks per SM fit) */
+template <bool F8> __host__ __device__ constexpr int v8_vb() { return F8 ? V8B : 1; }
+template <bool F8, int BN> __host__ __device__ constexpr int v8_smem() { return V8S * v8_vb<F8>() * ((F8 ? 32 : 64) * (128 + BN) + (F8 ? 4 * (128 + BN) : 0)); }
+template <int MODE, int BN, int WARPS_M, int WARPS_N, bool TS, bool F8>
 __global__ void __launch_bounds__(256, 2) vtf8_igemm(V8P p) {
     constexpr int BM = 128, WM = BM / WARPS_M, WN = BN / WARPS_N, MI = WM / 16, NI = WN / 8;
+    constexpr int VB = v8_vb<F8>(), RB = F8 ? 32 : 64, EB = F8 ? 1 : 2, CHT = RB / 32;   /* blocks per stage, row bytes, element bytes, chunks per thread */
     static_assert(WARPS_M * WARPS_N == 8 && NI % 2 == 0, "tile");
     extern __shared__ __align__(128) uint8_t smem8[];
     /* stage s, block b: A tile at sA(s, b), B tile at sB(s, b), their scale words */
-    uint8_t *const sA0 = smem8, *const sB0 = smem8 + V8S * V8B * BM * 32;
-    uint32_t *const sAs0 = (uint32_t *)(sB0 + V8S * V8B * BN * 32), *const sBs0 = sAs0 + V8S * V8B * BM;
-#define SA(s, b) (sA0 + ((s) * V8B + (b)) * BM * 32)
-#define SB(s, b) (sB0 + ((s) * V8B + (b)) * BN * 32)
-#define SAS(s, b) (sAs0 + ((s) * V8B + (b)) * BM)
-#define SBS(s, b) (sBs0 + ((s) * V8B + (b)) * BN)
+    uint8_t *const sA0 = smem8, *const sB0 = smem8 + V8S * VB * BM * RB;
+    uint32_t *const sAs0 = (uint32_t *)(sB0 + V8S * VB * BN * RB), *const sBs0 = sAs0 + V8S * VB * BM;
+#define SA(s, b) (sA0 + ((s) * VB + (b)) * BM * RB)
+#define SB(s, b) (sB0 + ((s) * VB + (b)) * BN * RB)
+#define SAS(s, b) (sAs0 + ((s) * VB + (b)) * BM)
+#define SBS(s, b) (sBs0 + ((s) * VB + (b)) * BN)
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int wm0 = (warp / WARPS_N) * WM, wn0 = (warp % WARPS_N) * WN;
     const long long m_base = (long long)blockIdx.x * BM; const int n_base = blockIdx.y * BN;
@@ -97,12 +107,14 @@ __global__ void __launch_bounds__(256, 2) vtf8_igemm(V8P p) {
         if (lst != lt) { lst = lt; ls = zr > -(1 << 27) ? v8_src<MODE>(p, nr, zr, yr, xr, lz, ly, lx) : -1; }
         const long long s = ls;
         const bool ok = s >= 0;
-        cp_async<16>(SA(st, b) + sw32(ra, qa), p.xq + (ok ? s * p.C + cb * 32 + qa * 16 : 0), ok);
-        if (!qa) cp_async<4>(SAS(st, b) + ra, p.xs + (ok ? s * p.SB + (cb & ~3) : 0), ok);
+#pragma unroll
+        for (int j = 0; j < CHT; j++) { const int q = qa + 2 * j; cp_async<16>(SA(st, b) + swr<F8>(ra, q), p.xq + (ok ? (s * p.C + cb * 32) * EB + q * 16 : 0), ok); }
+        if (F8 && !qa) cp_async<4>(SAS(st, b) + ra, p.xs + (ok ? s * p.SB + (cb & ~3) : 0), ok);
         if (ra < BN) {
             const size_t row = (size_t)(n_base + ra);
-            cp_async<16>(SB(st, b) + sw32(ra, qa), p.wq + row * p.K + ks * 32 + qa * 16, true);
-            if (!qa) cp_async<4>(SBS(st, b) + ra, p.ws + row * p.WSB + (ks & ~3), true);
+#pragma unroll
+            for (int j = 0; j < CHT; j++) { const int q = qa + 2 * j; cp_async<16>(SB(st, b) + swr<F8>(ra, q), p.wq + (row * p.K + ks * 32) * EB + q * 16, true); }
+            if (F8 && !qa) cp_async<4>(SBS(st, b) + ra, p.ws + row * p.WSB + (ks & ~3), true);
         }
     };
     float acc[MI][NI][4];
@@ -112,10 +124,10 @@ __global__ void __launch_bounds__(256, 2) vtf8_igemm(V8P p) {
         for (int b = 0; b < NI; b++)
 #pragma unroll
             for (int c = 0; c < 4; c++) acc[a][b][c] = 0.f;
-    __shared__ int kc[V8S][V8B], kcb[V8S][V8B];   /* the K step each stage block holds (nk: none) and its channel block (block-uniform) */
+    __shared__ int kc[V8S][VB], kcb[V8S][VB];   /* the K step each stage block holds (nk: none) and its channel block (block-uniform) */
     auto fill = [&](int st) {
 #pragma unroll
-        for (int b = 0; b < V8B; b++) { kc[st][b] = kl; kcb[st][b] = lcb; if (kl < nk) { load(kl, st, b); advance(); } }
+        for (int b = 0; b < VB; b++) { kc[st][b] = kl; kcb[st][b] = lcb; if (kl < nk) { load(kl, st, b); advance(); } }
         cpa_commit8();
     };
 #pragma unroll
@@ -124,15 +136,34 @@ __global__ void __launch_bounds__(256, 2) vtf8_igemm(V8P p) {
     for (int st = 0; ; ) {
         cpa_wait8<V8S - 2>(); __syncthreads();
         if (kc[st][0] >= nk) break;
-        int kb[V8B], cbb[V8B];
+        int kb[VB], cbb[VB];
 #pragma unroll
-        for (int b = 0; b < V8B; b++) { kb[b] = kc[st][b]; cbb[b] = kcb[st][b]; }
+        for (int b = 0; b < VB; b++) { kb[b] = kc[st][b]; cbb[b] = kcb[st][b]; }
         fill((st + V8S - 1) % V8S);
 #pragma unroll
-        for (int b = 0; b < V8B; b++) {
+        for (int b = 0; b < VB; b++) {
             const int ks = kb[b];
             if (ks >= nk) break;
             const uint8_t *A = SA(st, b), *B = SB(st, b);
+            if constexpr (!F8) {
+#pragma unroll
+                for (int kk = 0; kk < 2; kk++) {
+                    unsigned af[MI][4], bfr[NI][2];
+#pragma unroll
+                    for (int mi = 0; mi < MI; mi++) { const int row = wm0 + mi * 16 + (lane & 15); ldsm4b(af[mi], A + sw64b(row, kk * 2 + (lane >> 4))); }
+#pragma unroll
+                    for (int nj = 0; nj < NI / 2; nj++) {
+                        const int row = wn0 + nj * 16 + (lane & 7) + ((lane >> 4) << 3); unsigned r[4];
+                        ldsm4b(r, B + sw64b(row, kk * 2 + ((lane >> 3) & 1)));
+                        bfr[2 * nj][0] = r[0]; bfr[2 * nj][1] = r[1]; bfr[2 * nj + 1][0] = r[2]; bfr[2 * nj + 1][1] = r[3];
+                    }
+#pragma unroll
+                    for (int mi = 0; mi < MI; mi++)
+#pragma unroll
+                        for (int ni = 0; ni < NI; ni++) mma_bf16v(acc[mi][ni], af[mi], bfr[ni]);
+                }
+                continue;
+            }
             const int bsh = (cbb[b] & 3) * 8, wsh = (ks & 3) * 8;
             unsigned af[MI][4], bfr[NI][2], sa[MI], sb[NI];
 #pragma unroll
@@ -213,13 +244,34 @@ __global__ void k_v8_wprep(const float *__restrict__ w, int co, int T, int ci, i
     }
 }
 
-template <int MODE, int BN, int WM, int WN> static void v8_go(const V8P &p, bool ts) {
+template <int MODE, int BN, int WM, int WN, bool F8> static void v8_go(const V8P &p, bool ts) {
     const dim3 g((unsigned)((p.M + 127) / 128), (unsigned)((p.N + BN - 1) / BN));
-    constexpr int SM = v8_smem<BN>();
+    constexpr int SM = v8_smem<F8, BN>();
     static bool set = false;
-    if (!set) { cudaFuncSetAttribute(vtf8_igemm<MODE, BN, WM, WN, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, SM);
-                cudaFuncSetAttribute(vtf8_igemm<MODE, BN, WM, WN, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, SM); set = true; }
-    if (ts) vtf8_igemm<MODE, BN, WM, WN, true><<<g, 256, SM>>>(p); else vtf8_igemm<MODE, BN, WM, WN, false><<<g, 256, SM>>>(p);
+    if (!set) { cudaFuncSetAttribute(vtf8_igemm<MODE, BN, WM, WN, true, F8>, cudaFuncAttributeMaxDynamicSharedMemorySize, SM);
+                cudaFuncSetAttribute(vtf8_igemm<MODE, BN, WM, WN, false, F8>, cudaFuncAttributeMaxDynamicSharedMemorySize, SM); set = true; }
+    if (ts) vtf8_igemm<MODE, BN, WM, WN, true, F8><<<g, 256, SM>>>(p); else vtf8_igemm<MODE, BN, WM, WN, false, F8><<<g, 256, SM>>>(p);
+}
+template <int MODE, bool F8> static void v8_launch(const V8P &p, int bt, bool ts) {
+    if (bt == 32) v8_go<MODE, 32, 4, 2, F8>(p, ts); else if (bt == 64) v8_go<MODE, 64, 4, 2, F8>(p, ts);
+    else if (bt == 96) v8_go<MODE, 96, 4, 2, F8>(p, ts); else v8_go<MODE, 128, 2, 4, F8>(p, ts);
+}
+/* fp32 -> bf16 rows; weights -> bf16 B [Np][K] (fwd row = co, K = t ci + c; bwd-data row = ci, K = t co + c) */
+__global__ void k_v16_cvt(const float *__restrict__ x, long long n8, uint4 *__restrict__ y) {
+    for (long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; i < n8; i += (long long)gridDim.x * blockDim.x) {
+        float v[8]; ld8x<float>(x + i * 8, v);
+        __nv_bfloat162 a = __floats2bfloat162_rn(v[0], v[1]), b = __floats2bfloat162_rn(v[2], v[3]), c = __floats2bfloat162_rn(v[4], v[5]), d = __floats2bfloat162_rn(v[6], v[7]);
+        y[i] = make_uint4(*(unsigned *)&a, *(unsigned *)&b, *(unsigned *)&c, *(unsigned *)&d);
+    }
+}
+__global__ void k_v16_wprep(const float *__restrict__ w, int co, int T, int ci, int Np, int K, int bwd, __nv_bfloat16 *__restrict__ q) {
+    const long long n = (long long)Np * K;
+    for (long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; i < n; i += (long long)gridDim.x * blockDim.x) {
+        const int r = (int)(i / K), kk = (int)(i % K); float x = 0.f;
+        if (!bwd) { if (r < co) { const int t = kk / ci, c = kk % ci; x = w[((size_t)r * T + t) * ci + c]; } }
+        else { if (r < ci) { const int t = kk / co, c = kk % co; x = w[((size_t)c * T + t) * ci + r]; } }
+        q[i] = __float2bfloat16_rn(x);
+    }
 }
 static int v8_tile(int N) { return N <= 32 ? 32 : N <= 64 ? 64 : N <= 96 ? 96 : N <= 128 ? 128 : N <= 192 ? 96 : 128; }
 static unsigned v8_blocks(long long n) { long long b = (n + 255) / 256; return (unsigned)(b > 4096 ? 4096 : b < 1 ? 1 : b); }
@@ -228,26 +280,29 @@ static size_t r256(size_t b) { return (b + 255) & ~(size_t)255; }
 /* the A source src [n][D][H][W][C] (fwd: x; bwd-data: gy), rows = the M voxels of the (Do, Ho, Wo) grid, N columns; w [co][T][ci]
    (fwd: N = co, C = ci; bwd-data: N = ci, C = co). qbuf: >= vtf8_qbytes(), wbuf: >= vtf8_wbytes(). Returns -1 when the shapes do not
    qualify (C % 32, N < 32) */
-extern "C" size_t vtf8_qbytes(long long rows, int C) { const int SB = (C / 32 + 3) & ~3; return r256((size_t)rows * C) + r256((size_t)rows * SB); }
-extern "C" size_t vtf8_wbytes(int N, int K) { const int Np = (N + 127) / 128 * 128 + 128, WSB = (K / 32 + 3) & ~3; return r256((size_t)Np * K) + r256((size_t)Np * WSB); }
+extern "C" size_t vtf8_qbytes(long long rows, int C, int bits) { const int SB = (C / 32 + 3) & ~3; return bits == 8 ? r256((size_t)rows * C) + r256((size_t)rows * SB) : r256((size_t)rows * C * 2); }
+extern "C" size_t vtf8_wbytes(int N, int K, int bits) { const int Np = (N + 127) / 128 * 128 + 128, WSB = (K / 32 + 3) & ~3; return bits == 8 ? r256((size_t)Np * K) + r256((size_t)Np * WSB) : r256((size_t)Np * K * 2); }
 extern "C" int vtf8_ok(int C, int N) { return C % 32 == 0 && N >= 32 && N <= 256; }   /* (and strides 1 / 2: vtf8_conv) */
-extern "C" int vtf8_conv(int mode, const float *src, int n, int D, int H, int W, int C, const float *w, int co, int ci, int k, int sd, int sh, int sw,
+extern "C" int vtf8_conv(int mode, int bits, const float *src, int n, int D, int H, int W, int C, const float *w, int co, int ci, int k, int sd, int sh, int sw,
                          int Do, int Ho, int Wo, int N, const float *bias, float *y, void *qbuf, void *wbuf) {
     if (!vtf8_ok(C, N) || sd < 1 || sd > 2 || sh < 1 || sh > 2 || sw < 1 || sw > 2) return -1;
     const long long rows = (long long)n * D * H * W, M = (long long)n * Do * Ho * Wo; const int T = k * k * k, K = T * C;
     const int SB = (C / 32 + 3) & ~3, WSB = (K / 32 + 3) & ~3, bt = v8_tile(N), Np = (N + bt - 1) / bt * bt;
+    const bool f8 = bits == 8;
     uint8_t *xq = (uint8_t *)qbuf, *xs = xq + r256((size_t)rows * C), *wq = (uint8_t *)wbuf, *ws = wq + r256((size_t)Np * K);
-    k_v8_quant<<<v8_blocks(rows * (C / 8)), 256>>>(src, rows, C, SB, xq, xs);
-    k_v8_wprep<<<v8_blocks((long long)Np * (K / 32)), 256>>>(w, co, T, ci, Np, K, WSB, mode, wq, ws);
+    if (f8) {
+        k_v8_quant<<<v8_blocks(rows * (C / 8)), 256>>>(src, rows, C, SB, xq, xs);
+        k_v8_wprep<<<v8_blocks((long long)Np * (K / 32)), 256>>>(w, co, T, ci, Np, K, WSB, mode, wq, ws);
+    } else {
+        k_v16_cvt<<<v8_blocks(rows * (C / 8)), 256>>>(src, rows * (C / 8), (uint4 *)xq);
+        k_v16_wprep<<<v8_blocks((long long)Np * K), 256>>>(w, co, T, ci, Np, K, mode, (__nv_bfloat16 *)wq);
+    }
     V8P p; p.xq = xq; p.xs = xs; p.wq = wq; p.ws = ws; p.bias = bias; p.y = y;
     p.D = D; p.H = H; p.W = W; p.C = C; p.SB = SB; p.Do = Do; p.Ho = Ho; p.Wo = Wo; p.k = k; p.sd = sd; p.sh = sh; p.sw = sw; p.p = k / 2;
     p.K = K; p.N = N; p.WSB = WSB; p.M = M;
     if (M <= 0) return 0;
     const bool ts = mode == 1 && (sd > 1 || sh > 1 || sw > 1);
-    if (mode == 0) {
-        if (bt == 32) v8_go<0, 32, 4, 2>(p, ts); else if (bt == 64) v8_go<0, 64, 4, 2>(p, ts); else if (bt == 96) v8_go<0, 96, 4, 2>(p, ts); else v8_go<0, 128, 2, 4>(p, ts);
-    } else {
-        if (bt == 32) v8_go<1, 32, 4, 2>(p, ts); else if (bt == 64) v8_go<1, 64, 4, 2>(p, ts); else if (bt == 96) v8_go<1, 96, 4, 2>(p, ts); else v8_go<1, 128, 2, 4>(p, ts);
-    }
+    if (mode == 0) { if (f8) v8_launch<0, true>(p, bt, ts); else v8_launch<0, false>(p, bt, ts); }
+    else { if (f8) v8_launch<1, true>(p, bt, ts); else v8_launch<1, false>(p, bt, ts); }
     return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }

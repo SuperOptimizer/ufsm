@@ -289,6 +289,12 @@ __global__ void k_im2col_bf8(const float *__restrict__ x, int D, int H, int W, i
 __global__ void k_f2bf(const float *__restrict__ x, __nv_bfloat16 *__restrict__ y, long long n) {
     for (long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; i < n; i += (long long)gridDim.x * blockDim.x) y[i] = __float2bfloat16_rn(x[i]);
 }
+__global__ void k_f2bf8(const float4 *__restrict__ x, uint4 *__restrict__ y, long long n8) {   /* 8 per thread */
+    for (long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; i < n8; i += (long long)gridDim.x * blockDim.x) {
+        const float4 a = x[2 * i], b = x[2 * i + 1];
+        y[i] = make_uint4(pkbf(a.x, a.y), pkbf(a.z, a.w), pkbf(b.x, b.y), pkbf(b.z, b.w));
+    }
+}
 /* gb[c] += sum over rows of g[r][c]: block = per x C threads (thread: channel tid % C, rows tid / C + per j) */
 __global__ void k_colsum_f(const float *__restrict__ g, long long rows, int C, int per, float *__restrict__ gb) {
     extern __shared__ float sh[];
@@ -613,24 +619,29 @@ static VtP make_p(int mode, vt_t a, int k, int sd, int sh, int sw, int Do, int H
     p.M = (long long)a.n * Do * Ho * Wo; (void)mode; return p;
 }
 
-extern "C" int vtf8_conv(int mode, const float *src, int n, int D, int H, int W, int C, const float *w, int co, int ci, int k, int sd, int sh, int sw,
+extern "C" int vtf8_conv(int mode, int bits, const float *src, int n, int D, int H, int W, int C, const float *w, int co, int ci, int k, int sd, int sh, int sw,
                          int Do, int Ho, int Wo, int N, const float *bias, float *y, void *qbuf, void *wbuf);
-extern "C" size_t vtf8_qbytes(long long rows, int C);
-extern "C" size_t vtf8_wbytes(int N, int K);
+extern "C" size_t vtf8_qbytes(long long rows, int C, int bits);
+extern "C" size_t vtf8_wbytes(int N, int K, int bits);
 extern "C" int vtf8_ok(int C, int N);
 static int g_vmx = -1;
 extern "C" void vtf_set_mx(int bits) { g_vmx = bits; }
 static int vmx(void) { if (g_vmx < 0) { const char *e = getenv("UFSM_VTF_MX"); g_vmx = e ? atoi(e) : 0; } return g_vmx; }
-/* MX-fp8 forward / backward-data when enabled and the shapes and the scratch (A quantized into the im2col chunk region) allow */
-static bool use8(long long rows, int C, int N, int K) {
-    return vmx() == 8 && vtf8_ok(C, N) && vtf8_qbytes(rows, C) <= WCHUNK + GCHUNK && vtf8_wbytes(N, K) <= 2 * wbytes_max(256, 256);
+/* the pipelined forward / backward-data (src/lp_vwt8.cu: MX-fp8 when enabled, else bf16; the A source copied into the chunk region) when the
+   shapes and the scratch allow (0: the register-staged kernel here); env UFSM_VTF_PIPE=0 turns the bf16 one off */
+static int use8(long long rows, int C, int N, int K, int sd, int sh, int sw) {
+    static int pipe = -1; if (pipe < 0) { const char *e = getenv("UFSM_VTF_PIPE"); pipe = e ? atoi(e) : 1; }
+    const int bits = vmx() == 8 ? 8 : 16;
+    if (bits == 16 && !pipe) return 0;
+    if (sd > 2 || sh > 2 || sw > 2) return 0;
+    return vtf8_ok(C, N) && vtf8_qbytes(rows, C, bits) <= g_wreg && vtf8_wbytes(N, K, bits) <= 2 * wbytes_max(256, 256) ? bits : 0;
 }
 extern "C" int vtf_conv_fwd(vt_t x, const float *w, const float *b, int k, int sd, int sh, int sw, vt_t y, void *scratch) {
     const int Do = odim(x.d, sd), Ho = odim(x.h, sh), Wo = odim(x.w, sw), co = y.c;
     if (y.d != Do || y.h != Ho || y.w != Wo || y.n != x.n) { fprintf(stderr, "vtf_conv_fwd: output shape mismatch\n"); return -1; }
     if (co > 256 || x.c > 256) { fprintf(stderr, "vtf_conv_fwd: %d -> %d unsupported\n", x.c, co); return -1; }
-    if (use8((long long)x.n * x.d * x.h * x.w, x.c, co, k * k * k * x.c))
-        return vtf8_conv(0, x.p, x.n, x.d, x.h, x.w, x.c, w, co, x.c, k, sd, sh, sw, Do, Ho, Wo, co, b, y.p, (char *)scratch + 2 * wbytes_max(256, 256), scratch);
+    if (const int b8 = use8((long long)x.n * x.d * x.h * x.w, x.c, co, k * k * k * x.c, sd, sh, sw))
+        return vtf8_conv(0, b8, x.p, x.n, x.d, x.h, x.w, x.c, w, co, x.c, k, sd, sh, sw, Do, Ho, Wo, co, b, y.p, (char *)scratch + 2 * wbytes_max(256, 256), scratch);
     const int K = k * k * k * x.c, Kp = (K + VBK - 1) / VBK * VBK, Np = (co + ntile(co) - 1) / ntile(co) * ntile(co);
     __nv_bfloat16 *B = (__nv_bfloat16 *)scratch;
     k_wprep<<<cap_blocks((long long)Np * Kp), 256>>>(w, co, k * k * k, x.c, Kp, Np, 0, B);
@@ -644,8 +655,9 @@ extern "C" int vtf_conv_bwd(vt_t x, vt_t gy, const float *w, int k, int sd, int 
     const long long rows = (long long)gy.n * gy.d * gy.h * gy.w;
     if (gb) { const int per = 256 / co > 0 ? 256 / co : 1; k_colsum_f<<<1024, per * co, co * sizeof(float)>>>(gy.p, rows, co, per, gb); }
     char *s = (char *)scratch;
-    if (gx.p && use8(rows, co, ci, T * co)) {
-        if (vtf8_conv(1, gy.p, gy.n, gy.d, gy.h, gy.w, co, w, co, ci, k, sd, sh, sw, x.d, x.h, x.w, ci, nullptr, gx.p, s + 2 * wbytes_max(256, 256), s)) return -1;
+    const int b8 = gx.p ? use8(rows, co, ci, T * co, sd, sh, sw) : 0;
+    if (b8) {
+        if (vtf8_conv(1, b8, gy.p, gy.n, gy.d, gy.h, gy.w, co, w, co, ci, k, sd, sh, sw, x.d, x.h, x.w, ci, nullptr, gx.p, s + 2 * wbytes_max(256, 256), s)) return -1;
     } else if (gx.p) {   /* backward-data: rows = input voxels, columns = ci, K = taps x co */
         const int K = T * co, Kp = (K + VBK - 1) / VBK * VBK, Np = (ci + ntile(ci) - 1) / ntile(ci) * ntile(ci);
         __nv_bfloat16 *B = (__nv_bfloat16 *)s;
@@ -658,7 +670,8 @@ extern "C" int vtf_conv_bwd(vt_t x, vt_t gy, const float *w, int k, int sd, int 
     const bool wide = co % 96 == 0 && co <= 192;   /* (the 96 x 128 tiles) */
     const int K3 = T * ci, bm3 = co % 96 == 0 ? 96 : co % 64 == 0 ? 64 : co % 32 == 0 ? 32 : 0;
     if (gw && wgk != 0 && wgk != 2 && bm3 && sw == 1 && gy.w % 32 == 0 && ci % 8 == 0 && co <= 192) {
-        /* bf16 copies of x and gy, then the pipelined kernel; partial sums after them in the chunk region */
+        /* bf16 copies of gy and x, then the pipelined kernel; partial sums after them in the chunk region (gy's copy: already there when the
+           bf16 backward-data just made it, at the same place) */
         const size_t xbb = ((size_t)vt_numel(x) * 2 + 255) & ~(size_t)255, gbb = ((size_t)rows * co * 2 + 255) & ~(size_t)255;
         const int nt = (K3 + 127) / 128 * (co / bm3);
         long long nz = (360 + nt - 1) / nt; if (nz > rows / 1024) nz = rows / 1024; if (nz < 1) nz = 1;
@@ -666,11 +679,11 @@ extern "C" int vtf_conv_bwd(vt_t x, vt_t gy, const float *w, int k, int sd, int 
         if (xbb + gbb + pb <= g_wreg) {
             if (xbb + gbb + (size_t)nz * pb > g_wreg) nz = (long long)((g_wreg - xbb - gbb) / pb);
             char *r = s + 2 * wbytes_max(256, 256);
-            WgB q; q.xb = (const __nv_bfloat16 *)r; q.gyb = (const __nv_bfloat16 *)(r + xbb); q.part = (float *)(r + xbb + gbb);
+            WgB q; q.gyb = (const __nv_bfloat16 *)r; q.xb = (const __nv_bfloat16 *)(r + gbb); q.part = (float *)(r + xbb + gbb);
             q.D = x.d; q.H = x.h; q.W = x.w; q.C = ci; q.Do = gy.d; q.Ho = gy.h; q.Wo = gy.w; q.k = k; q.sd = sd; q.sh = sh; q.p = k / 2; q.K = K3; q.co = co; q.M = rows;
             q.mper = (rows + nz - 1) / nz; q.mper = (q.mper + 31) / 32 * 32; nz = (rows + q.mper - 1) / q.mper;
-            k_f2bf<<<cap_blocks((long long)vt_numel(x)), 256>>>(x.p, (__nv_bfloat16 *)r, (long long)vt_numel(x));
-            k_f2bf<<<cap_blocks(rows * co), 256>>>(gy.p, (__nv_bfloat16 *)(r + xbb), rows * co);
+            k_f2bf8<<<cap_blocks((long long)vt_numel(x) / 8), 256>>>((const float4 *)x.p, (uint4 *)(r + gbb), (long long)vt_numel(x) / 8);   /* (ci % 8 == 0) */
+            if (b8 != 16) k_f2bf8<<<cap_blocks(rows * co / 8), 256>>>((const float4 *)gy.p, (uint4 *)r, rows * co / 8);   /* (co % 32 == 0) */
             const dim3 gr((unsigned)((K3 + 127) / 128), (unsigned)(co / bm3), (unsigned)nz);
             if (bm3 == 96) vtf_wgrad3<96, 128><<<gr, 256>>>(q); else if (bm3 == 64) vtf_wgrad3<64, 128><<<gr, 256>>>(q); else vtf_wgrad3<32, 128><<<gr, 256>>>(q);
             k_wg_reduce<<<cap_blocks((long long)co * K3), 256>>>(q.part, (int)nz, (size_t)co * K3, gw);
