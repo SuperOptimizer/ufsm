@@ -68,6 +68,8 @@ int cmd_ink_ensemble(int argc, char **argv);
 int cmd_wl_dump(int argc, char **argv);
 int cmd_dinovol_embed(int argc, char **argv);   /* src/dinovol.c */
 int cmd_hercuvit(int argc, char **argv);   /* src/hercuvit.c */
+int cmd_villawind(int argc, char **argv);   /* src/villawind.c */
+int cmd_vwt_train(int argc, char **argv);   /* src/vwt_train.c */
 int cmd_ink3d_ext(int argc, char **argv);   /* src/ink3dext.c */
 int cmd_vol_cmp(int argc, char **argv);
 int cmd_dinovol_eval(int argc, char **argv);
@@ -149,6 +151,7 @@ static int usage(void) {
         "  ufsm wl-dump <weights> [key]   the tensors of a safetensors / torch zip weight file\n"
         "  ufsm dinovol-embed ROOT KEY OUT --ckpt PT --box z,y,x,nz,ny,nx   scrollprize dinovol tokens / dense / ink embeddings (zarr v3)\n"
         "  ufsm hercuvit ROOT KEY OUT --ckpt PTH --box z,y,x,nz,ny,nx   HercuViT v0 sheet surface probability + per-window instance ids\n"
+        "  ufsm villawind ray-check ROOT KEY WINDINGS.json --ckpt PTH   villa winding model (scrollprize/winding_model_9um) turn counts on human rays\n"
         "  ufsm ink3d-ext --weights W --ct ROOT KEY --box z,y,x,nz,ny,nx --out GROUP [--out-um 9.6,4.8]   published 3D ink net (gambiarra) on a 2.4 um CT box -> prob254 zarr\n"
         "  ufsm vol-cmp A_ROOT A_KEY B_ROOT B_KEY --box z,y,x,nz,ny,nx   two uint8 volumes (zarr v3 / v2): Pearson / Spearman + value mapping\n"
         "  ufsm dinovol-read GROUP NAME z,y,x,nz,ny,nx OUT.f32   a region of a dinovol embedding as float32\n"
@@ -176,6 +179,7 @@ static int usage(void) {
         "  ufsm fit-join <out-set> <fields-dir> <slab-model> <z0> <z1> ...   independent z-slab fits -> one fit set, gauges matched on the overlaps\n"
         "  ufsm fields-oracle <fields-dir> <phase-root> <phase-key> <out-dir>   fit fields with the phase planes from a label phase raster (oracle / swap)\n"
         "  ufsm count-field <in-fields> <out-fields> [--method ls|ray] [--R 3] [--model DIR]   winding from the density counts, the phase only sub-turn (src/countfield.c)\n"
+        "  ufsm vwt-sample SOURCES OUT N   ray-model training slabs + targets (im / va / ph / comp / pw raw) and the sampler throughput\n"
         "  ufsm ray-check WINDINGS.json FIELDS   turn counts of a field set between human relative-winding ray points (phase / density)\n"
         "  ufsm patch-raster LIST OUT --shape Z,Y,X   surface patches (tifxyz) as phase-0 shell training targets (512^3 shards)\n"
         "  ufsm hires-phase <ct-root> <key> <fields-dir> <out-dir> --ct-um U   fit fields with the sheet phase measured in a finer CT (valleys along the normal)\n"
@@ -3859,6 +3863,7 @@ int cmd_count_field(int argc, char **argv);   /* src/countfield.c */
 int cmd_hires_phase(int argc, char **argv);   /* src/hiresphase.c */
 int cmd_patch_raster(int argc, char **argv);   /* src/patchraster.c */
 int cmd_ray_check(int argc, char **argv);   /* src/raycheck.c */
+int cmd_vwt_sample(int argc, char **argv);   /* src/vwt_sample.c */
 int cmd_hires_count(int argc, char **argv);
 int cmd_spiral_fit(int argc, char **argv);    /* src/countfield.c */
 int cmd_phase_packing(int argc, char **argv);   /* src/packmap.c */
@@ -3905,6 +3910,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "hires-phase")) return cmd_hires_phase(argc, argv);
     if (!strcmp(cmd, "patch-raster")) return cmd_patch_raster(argc, argv);
     if (!strcmp(cmd, "ray-check")) return cmd_ray_check(argc, argv);
+    if (!strcmp(cmd, "vwt-sample")) return cmd_vwt_sample(argc, argv);
     if (!strcmp(cmd, "hires-count")) return cmd_hires_count(argc, argv);
     if (!strcmp(cmd, "spiral-fit")) return cmd_spiral_fit(argc, argv);
     if (!strcmp(cmd, "phase-packing")) return cmd_phase_packing(argc, argv);
@@ -3931,6 +3937,8 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "wl-dump")) return cmd_wl_dump(argc, argv);
     if (!strcmp(cmd, "dinovol-embed")) return cmd_dinovol_embed(argc, argv);
     if (!strcmp(cmd, "hercuvit")) return cmd_hercuvit(argc, argv);
+    if (!strcmp(cmd, "villawind")) return cmd_villawind(argc, argv);
+    if (!strcmp(cmd, "vwt-train")) return cmd_vwt_train(argc, argv);
     if (!strcmp(cmd, "ink3d-ext")) return cmd_ink3d_ext(argc, argv);
     if (!strcmp(cmd, "vol-cmp")) return cmd_vol_cmp(argc, argv);
     if (!strcmp(cmd, "dinovol-eval")) return cmd_dinovol_eval(argc, argv);
