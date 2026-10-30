@@ -59,7 +59,7 @@ __device__ __forceinline__ long long a_src(const VtP &p, long long nb, int z, in
 }
 
 /* BM x BN tile, WARPS_M x WARPS_N warps; A staged from fp32 through registers (next K tile loaded during this one's MMAs), B (bf16) the same */
-template <int MODE, int BM, int BN, int WARPS_M, int WARPS_N, bool VEC>
+template <int MODE, int BM, int BN, int WARPS_M, int WARPS_N, bool VEC, bool TS = false>
 __global__ void __launch_bounds__(WARPS_M * WARPS_N * 32) vtf_igemm(VtP p) {
     constexpr int NTH = WARPS_M * WARPS_N * 32, WM = BM / WARPS_M, WN = BN / WARPS_N, MI = WM / 16, NI = WN / 8;
     constexpr int RS = NTH / 4, AP = BM / RS, BP = (BN + RS - 1) / RS;   /* 4 chunks of 8 per row; rows per pass; passes */
@@ -121,10 +121,32 @@ __global__ void __launch_bounds__(WARPS_M * WARPS_N * 32) vtf_igemm(VtP p) {
         for (int b = 0; b < NI; b++)
 #pragma unroll
             for (int c = 0; c < 4; c++) acc[a][b][c] = 0.f;
-    gload(0); sstore(0); __syncthreads();
-    for (int ks = 0; ks < nk; ks++) {
-        const int slot = ks & 1;
-        if (ks + 1 < nk) gload(ks + 1);
+    /* taps no row of this tile reads (bwd-data of a strided conv: 3 / 4 of them; padding at the grid's faces) are skipped, when a K step
+       stays inside one tap (VEC, C % VBK == 0). TS: only the strided backward-data (it slows the dense convs) */
+    const int ntap = p.k * p.k * p.k, spt = TS && VEC && p.C % VBK == 0 ? p.C / VBK : 0;
+    unsigned tmask = 0xffffffffu;
+    if (spt && ntap <= 32) {
+        tmask = 0;
+        for (int t = 0; t < ntap; t++) {
+            int any = 0;
+#pragma unroll
+            for (int i = 0; i < AP; i++) if (zr[i] > -(1 << 27) && a_src<MODE>(p, nr[i], zr[i], yr[i], xr[i], t / (p.k * p.k), (t / p.k) % p.k, t % p.k) >= 0) any = 1;
+            if (__syncthreads_or(any)) tmask |= 1u << t;
+        }
+    }
+    auto nextk = [&](int ks) {   /* the K step after ks that some row reads */
+        int n = ks + 1;
+        if (spt && n % spt == 0) { int t = n / spt; while (t < ntap && !((tmask >> t) & 1u)) t++; n = t * spt; }
+        return n < nk ? n : nk;
+    };
+    int ks = 0;
+    if (spt && !(tmask & 1u)) { int t = 0; while (t < ntap && !((tmask >> t) & 1u)) t++; ks = t * spt < nk ? t * spt : nk; }
+    if (ks < nk) { gload(ks); sstore(0); }
+    __syncthreads();
+    int slot = 0;
+    for (; ks < nk; ) {
+        const int kn = nextk(ks);
+        if (kn < nk) gload(kn);
         const __nv_bfloat16 *A = sA[slot], *B = sB[slot];
 #pragma unroll
         for (int kk = 0; kk < VBK / 16; kk++) {
@@ -142,8 +164,9 @@ __global__ void __launch_bounds__(WARPS_M * WARPS_N * 32) vtf_igemm(VtP p) {
 #pragma unroll
                 for (int ni = 0; ni < NI; ni++) mma_bf16(acc[mi][ni], af[mi], bf[ni]);
         }
-        if (ks + 1 < nk) sstore(slot ^ 1);
+        if (kn < nk) sstore(slot ^ 1);
         __syncthreads();
+        slot ^= 1; ks = kn;
     }
     const int g = lane >> 2, t4 = lane & 3;
 #pragma unroll
@@ -174,7 +197,8 @@ __global__ void k_wprep(const float *__restrict__ w, int co, int T, int ci, int 
 
 template <int MODE, int BM, int BN, int WM, int WN> static void igemm_go(const VtP &p) {
     const dim3 g((unsigned)((p.M + BM - 1) / BM), (unsigned)((p.N + BN - 1) / BN));
-    if (p.C % 8 == 0) vtf_igemm<MODE, BM, BN, WM, WN, true><<<g, WM * WN * 32>>>(p);
+    if (MODE == 1 && p.C % VBK == 0 && (p.sd > 1 || p.sh > 1 || p.sw > 1)) vtf_igemm<MODE, BM, BN, WM, WN, true, true><<<g, WM * WN * 32>>>(p);
+    else if (p.C % 8 == 0) vtf_igemm<MODE, BM, BN, WM, WN, true><<<g, WM * WN * 32>>>(p);
     else vtf_igemm<MODE, BM, BN, WM, WN, false><<<g, WM * WN * 32>>>(p);
 }
 template <int MODE> static void igemm_launch(const VtP &p) {
@@ -183,10 +207,10 @@ template <int MODE> static void igemm_launch(const VtP &p) {
     else if (p.N <= 64) igemm_go<MODE, 128, 64, 4, 2>(p);
     else if (p.N <= 96) igemm_go<MODE, 128, 96, 4, 2>(p);     /* (exact tiles for 96 / 192 outputs: no idle quarter, A staged once) */
     else if (p.N <= 128) igemm_go<MODE, 128, 128, 2, 4>(p);
-    else if (p.N <= 192) igemm_go<MODE, 128, 192, 2, 4>(p);
+    else if (p.N <= 192) igemm_go<MODE, 128, 96, 4, 2>(p);    /* (two 96 tiles beat one 192: 2 blocks per SM) */
     else igemm_go<MODE, 128, 128, 2, 4>(p);
 }
-static int ntile(int N) { return N <= 8 ? 16 : N <= 32 ? 32 : N <= 64 ? 64 : N <= 96 ? 96 : N <= 128 ? 128 : N <= 192 ? 192 : 128; }
+static int ntile(int N) { return N <= 8 ? 16 : N <= 32 ? 32 : N <= 64 ? 64 : N <= 96 ? 96 : N <= 128 ? 128 : N <= 192 ? 96 : 128; }
 
 /* ---- scratch: B matrices (fwd + bwd) and the weight gradient's bf16 im2col / gy chunks ---- */
 static const size_t WCHUNK = 192ull << 20, GCHUNK = 64ull << 20;   /* bf16 im2col / gy chunk bytes */
@@ -384,6 +408,100 @@ __global__ void __launch_bounds__(128) vtf_wgrad(WgP p) {
                 if (n + 1 < p.K) P[(size_t)co * p.K + n + 1] = acc[mi][ni][2 * h + 1];
             }
 }
+/* the same for wide outputs (co 96 / 192): block = BMC co x BNK K columns, 8 warps (2 x 4), shared rows padded by 8 halfs (conflict-free
+   ldmatrix without a swizzle at 12 / 16 chunks per row) */
+template <int BMC, int BNK>
+__global__ void __launch_bounds__(256, 2) vtf_wgrad2(WgP p) {
+    constexpr int SA = BMC + 8, SB = BNK + 8, CA = BMC / 8, CB = BNK / 8, NA = (32 * CA + 255) / 256, NB = (32 * CB + 255) / 256;
+    constexpr int WTM = BMC / 2, WTN = BNK / 4, MI = WTM / 16, NI = WTN / 8;
+    static_assert(256 % CB == 0, "B chunk column per thread");
+    __shared__ __align__(16) __nv_bfloat16 sA[2][32 * SA], sB[2][32 * SB];
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, wm0 = (warp >> 2) * WTM, wn0 = (warp & 3) * WTN;
+    const int n0 = blockIdx.x * BNK, c0 = blockIdx.y * BMC;
+    const long long ma = (long long)blockIdx.z * p.mper, mb = ma + p.mper < p.M ? ma + p.mper : p.M;
+    const int bc = tid % CB;   /* this thread's im2col chunk column: tap and channel */
+    const int kk0 = n0 + bc * 8; const bool kin = kk0 < p.K;
+    const int t0 = kin ? kk0 / p.C : 0, cc = kin ? kk0 - t0 * p.C : 0, tz = t0 / (p.k * p.k), ty = (t0 / p.k) % p.k, tx = t0 % p.k;
+    uint4 ra[NA], rb[NB];
+    auto gload = [&](long long m0) {
+#pragma unroll
+        for (int i = 0; i < NA; i++) {
+            const int ch = tid + 256 * i; float v[8];
+            const int r = ch / CA, co = c0 + (ch % CA) * 8; const long long m = m0 + r;
+            if (ch < 32 * CA && m < mb && co + 8 <= p.co) {
+                const float4 a = __ldg((const float4 *)(p.gy + m * p.co + co)), b = __ldg((const float4 *)(p.gy + m * p.co + co) + 1);
+                v[0] = a.x; v[1] = a.y; v[2] = a.z; v[3] = a.w; v[4] = b.x; v[5] = b.y; v[6] = b.z; v[7] = b.w;
+            } else for (int e = 0; e < 8; e++) v[e] = 0.f;
+            ra[i] = make_uint4(pkbf(v[0], v[1]), pkbf(v[2], v[3]), pkbf(v[4], v[5]), pkbf(v[6], v[7]));
+        }
+#pragma unroll
+        for (int i = 0; i < NB; i++) {
+            const int r = tid / CB + (256 / CB) * i; const long long m = m0 + r;
+            float4 a = make_float4(0.f, 0.f, 0.f, 0.f), b = a;
+            if (r < 32 && m < mb && kin) {
+                long long t = m; const int ow = (int)(t % p.Wo); t /= p.Wo; const int oh = (int)(t % p.Ho); t /= p.Ho; const int od = (int)(t % p.Do); const long long nb = (t / p.Do) * p.D;
+                const int z = od * p.sd - p.p + tz, y = oh * p.sh - p.p + ty, xx = ow * p.sw - p.p + tx;
+                if (z >= 0 && z < p.D && y >= 0 && y < p.H && xx >= 0 && xx < p.W) {
+                    const float4 *src = (const float4 *)(p.x + (((nb + z) * p.H + y) * p.W + xx) * (long long)p.C + cc); a = __ldg(src); b = __ldg(src + 1);
+                }
+            }
+            rb[i] = make_uint4(pkbf(a.x, a.y), pkbf(a.z, a.w), pkbf(b.x, b.y), pkbf(b.z, b.w));
+        }
+    };
+    auto sstore = [&](int s) {
+#pragma unroll
+        for (int i = 0; i < NA; i++) { const int ch = tid + 256 * i; if (ch < 32 * CA) *(uint4 *)(sA[s] + (ch / CA) * SA + (ch % CA) * 8) = ra[i]; }
+#pragma unroll
+        for (int i = 0; i < NB; i++) { const int r = tid / CB + (256 / CB) * i; if (r < 32) *(uint4 *)(sB[s] + r * SB + bc * 8) = rb[i]; }
+    };
+    float acc[MI][NI][4];
+#pragma unroll
+    for (int a = 0; a < MI; a++)
+#pragma unroll
+        for (int b = 0; b < NI; b++)
+#pragma unroll
+            for (int c = 0; c < 4; c++) acc[a][b][c] = 0.f;
+    if (ma < mb) { gload(ma); sstore(0); }
+    __syncthreads();
+    int slot = 0;
+    for (long long m0 = ma; m0 < mb; m0 += 32) {
+        const bool more = m0 + 32 < mb;
+        if (more) gload(m0 + 32);
+        const __nv_bfloat16 *A = sA[slot], *B = sB[slot];
+#pragma unroll
+        for (int kk = 0; kk < 2; kk++) {
+            unsigned af[MI][4], bf[NI][2];
+            const int j = lane >> 3, r = lane & 7;
+#pragma unroll
+            for (int mi = 0; mi < MI; mi++) ldsm4t(af[mi], A + (kk * 16 + ((j >> 1) << 3) + r) * SA + wm0 + mi * 16 + ((j & 1) << 3));
+#pragma unroll
+            for (int nj = 0; nj < NI / 2; nj++) {
+                unsigned q[4]; ldsm4t(q, B + (kk * 16 + ((j & 1) << 3) + r) * SB + wn0 + nj * 16 + ((j >> 1) << 3));
+                bf[2 * nj][0] = q[0]; bf[2 * nj][1] = q[1]; bf[2 * nj + 1][0] = q[2]; bf[2 * nj + 1][1] = q[3];
+            }
+#pragma unroll
+            for (int mi = 0; mi < MI; mi++)
+#pragma unroll
+                for (int ni = 0; ni < NI; ni++) mma_bf16(acc[mi][ni], af[mi], bf[ni]);
+        }
+        if (more) sstore(slot ^ 1);
+        __syncthreads();
+        slot ^= 1;
+    }
+    const int g = lane >> 2, t4 = lane & 3;
+    float *P = p.part + (size_t)blockIdx.z * p.co * p.K;
+#pragma unroll
+    for (int mi = 0; mi < MI; mi++)
+#pragma unroll
+        for (int ni = 0; ni < NI; ni++)
+#pragma unroll
+            for (int h = 0; h < 2; h++) {
+                const int co = c0 + wm0 + mi * 16 + g + 8 * h, n = n0 + wn0 + ni * 8 + 2 * t4;
+                if (co >= p.co) continue;
+                if (n < p.K) P[(size_t)co * p.K + n] = acc[mi][ni][2 * h];
+                if (n + 1 < p.K) P[(size_t)co * p.K + n + 1] = acc[mi][ni][2 * h + 1];
+            }
+}
 __global__ void k_wg_reduce(const float *__restrict__ part, int nz, size_t n, float *__restrict__ gw) {
     for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) {
         float a = 0.f; for (int z = 0; z < nz; z++) a += part[(size_t)z * n + i];
@@ -424,15 +542,19 @@ extern "C" int vtf_conv_bwd(vt_t x, vt_t gy, const float *w, int k, int sd, int 
         if (p.M > 0) igemm_launch<1>(p);
     }
     static int wgk = -1; if (wgk < 0) wgk = getenv("UFSM_VTF_WGRAD") ? atoi(getenv("UFSM_VTF_WGRAD")) : 1;
-    if (gw && (wgk == 2 || (wgk == 1 && co <= 64)) && ci % 8 == 0) {   /* (measured: implicit wins at <= 64 outputs, cuBLASLt on im2col beyond) */   /* implicit-GEMM weight gradient, partial sums per voxel split in the scratch's chunk region */
+    const bool wide = co % 96 == 0 && co <= 192;   /* (the 96 x 128 tiles) */
+    if (gw && (wgk == 2 || (wgk == 1 && (co <= 64 || wide))) && ci % 8 == 0) {   /* implicit-GEMM weight gradient, partial sums per voxel split in the scratch's chunk region
+                                                                                   (UFSM_VTF_WGRAD 0: always im2col + cuBLASLt) */
         WgP q; q.x = x.p; q.gy = gy.p; q.D = x.d; q.H = x.h; q.W = x.w; q.C = ci; q.Do = gy.d; q.Ho = gy.h; q.Wo = gy.w; q.k = k; q.sd = sd; q.sh = sh; q.sw = sw;
         q.p = k / 2; q.K = T * ci; q.co = co; q.M = rows;
-        const int nt = (q.K + WG_BN - 1) / WG_BN * ((co + WG_BM - 1) / WG_BM);
+        const int bmc = wide ? 96 : WG_BM, bnk = wide ? 128 : WG_BN;   /* (one 192 x 128 tile measured slower at 192 outputs) */
+        const int nt = (q.K + bnk - 1) / bnk * ((co + bmc - 1) / bmc);
         long long nz = (480 + nt - 1) / nt; if (nz > rows / 1024) nz = rows / 1024; if (nz < 1) nz = 1;
         const size_t pb = (size_t)co * q.K * 4; if ((size_t)nz * pb > WCHUNK + GCHUNK) nz = (long long)((WCHUNK + GCHUNK) / pb); if (nz < 1) nz = 1;
         q.mper = (rows + nz - 1) / nz; q.mper = (q.mper + WG_BK - 1) / WG_BK * WG_BK; nz = (rows + q.mper - 1) / q.mper;
         q.part = (float *)(s + 2 * wbytes_max(256, 256));
-        vtf_wgrad<<<dim3((unsigned)((q.K + WG_BN - 1) / WG_BN), (unsigned)((co + WG_BM - 1) / WG_BM), (unsigned)nz), 128>>>(q);
+        if (wide) vtf_wgrad2<96, 128><<<dim3((unsigned)((q.K + 127) / 128), (unsigned)(co / 96), (unsigned)nz), 256>>>(q);
+        else vtf_wgrad<<<dim3((unsigned)((q.K + WG_BN - 1) / WG_BN), (unsigned)((co + WG_BM - 1) / WG_BM), (unsigned)nz), 128>>>(q);
         k_wg_reduce<<<cap_blocks((long long)co * q.K), 256>>>(q.part, (int)nz, (size_t)co * q.K, gw);
     } else if (gw) {   /* weight gradient: chunks of output rows, bf16 im2col (ld = K rounded to 8) and gy, cuBLASLt into gw */
         const int K = T * ci, ldc = (K + 7) / 8 * 8;
