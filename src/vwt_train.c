@@ -1,7 +1,7 @@
 /* ufsm vwt-train: training loop of the ray-attention winding model (src/vwt.h).
 
    ufsm vwt-train SOURCES RUNDIR [--gpu 0] [--steps 50000] [--batch 2] [--lr 5e-4] [--wd 0.01] [--warmup 500] [--ema 0.999] [--clip 1]
-                  [--tilt 15] [--threads 12] [--log 50] [--ckpt-every 2000] [--seed 1] [--tf32 1] [--core 1]
+                  [--tilt 15] [--threads 12] [--log 50] [--ckpt-every 2000] [--seed 1] [--tf32 1] [--core 1] [--mx 16]
                   [--dp 0.25] [--dd 0.05] [--lam-p 1] [--lam-d 1] [--T 128] [--L 384]
                   [--shell 0|1 --lam-shell 0.2 --snap-gate 0.25]   (position-only shell loss on samples with shell masks)
    ufsm vwt-train --bench N [--T 128 --L 384]   forward + backward of N random slabs (no sampler): ms / slab, Mvox/s, device memory
@@ -56,6 +56,7 @@ int cmd_vwt_train(int argc, char **argv) {
     if (nn_init(atoi(opt(argc, argv, "--gpu", "0")))) return 1;
     if (atoi(opt(argc, argv, "--tf32", "1"))) setenv("UFSM_ATTN_TF32", "1", 0);
     at_set_core(atoi(opt(argc, argv, "--core", "1")));
+    at_set_mx(atoi(opt(argc, argv, "--mx", "16")));   /* attention-block linears / activations: 16 = bf16 (src/nn_attn_h16.cu), 0 fp32, 8 / 4 MX */
     if (opt(argc, argv, "--bench", nullptr)) return bench(argc, argv);
     if (argc < 4) { fprintf(stderr, "usage: ufsm vwt-train SOURCES RUNDIR [options]  |  ufsm vwt-train --bench N\n"); return 2; }
     const char *src = argv[2], *run = argv[3];

@@ -273,7 +273,7 @@ int cmd_villawind(int argc, char **argv) {
     const char *ck = opt(argc, argv, "--ckpt", nullptr), *vk = opt(argc, argv, "--vwt", nullptr);
     if (vk) {   /* ufsm villawind ray-check ... --vwt RUN/step_N.vwt [--ema 1]: the same benchmark for our model (src/vwt.h) */
         if (nn_init(atoi(opt(argc, argv, "--gpu", "0"))) || xnet_init(atoi(opt(argc, argv, "--gpu", "0")))) return 1;
-        at_set_core(1); setenv("UFSM_ATTN_TF32", "1", 0);
+        at_set_core(1); setenv("UFSM_ATTN_TF32", "1", 0); at_set_mx(atoi(opt(argc, argv, "--mx", "16")));
         g_vwt = vwt_load(vk, atoi(opt(argc, argv, "--ema", "1"))); if (!g_vwt) return 1;
         if (argc > 2 && !strcmp(argv[2], "ray-check")) return ray_check(nullptr, argc - 1, argv + 1);
         fprintf(stderr, "villawind --vwt: only ray-check\n"); return 2;
