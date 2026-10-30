@@ -41,6 +41,8 @@ typedef struct vws vws;
    azimuth, random sign, the point at a random k); train 0: a fixed validation list (seeded). nthreads: background workers. */
 vws *vws_open(const char *sources_json, int T, int L, float tilt_deg, int nthreads, unsigned seed, int train);
 int vws_next(vws *s, vws_sample *out);   /* blocking; 0 on success */
+/* the trainer's argv, passed through before vws_open (the sampler / aug parse their own flags from it, e.g. vwa_cfg_parse) */
+void vws_set_args(int argc, char **argv);
 void vws_close(vws *s);
 
 /* ---------------- layer kernels (src/nn_vwt.cu; reference VW, optimisation PF). Default stream, fp32 tensors. ---------------- */
