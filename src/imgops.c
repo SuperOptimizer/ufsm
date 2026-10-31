@@ -716,8 +716,32 @@ size_t img_pushpull_fill(uint8_t *const *imgs, int nimg, uint8_t *flag, int w, i
 enum { PM_T = 256, PM_H = 40, PM_R = 3, PM_LV = 3, PM_IT = 4 };
 typedef struct { uint8_t *const *imgs; uint8_t **snap; int nimg; const uint8_t *flag; int w, h, ntx, nty; _Atomic int next; } pm_job;
 static inline uint32_t pm_rand(uint32_t *s) { uint32_t x = *s; x ^= x << 13; x ^= x >> 17; x ^= x << 5; return *s = x; }
-typedef struct { int S; float *I; uint8_t *m; uint8_t *vc; int32_t *nnf; float *dist; int32_t *cent; int nc; } pm_lvl;   /* m: 0 source, 1 hole, 2 outside */
+typedef struct { int S; float *I; uint8_t *m; uint8_t *vc; int32_t *nnf; float *dist; int32_t *cent; int nc; int32_t *hl; int nh; } pm_lvl;   /* m: 0 source, 1 hole,
+    2 outside; hl: the hole pixels (m == 1) in increasing order, nh of them (the passes visit them in the order of a full scan) */
+static void pm_holes(pm_lvl *L) { L->nh = 0; for (int p = 0; p < L->S * L->S; p++) if (L->m[p] == 1) L->hl[L->nh++] = p; }
+/* pm_dist for two channels: the same additions in the same order (pixel by pixel, channel 0 then 1; C23 ISO mode: no contraction), the
+   bounds tests hoisted out of the rows / columns that cannot leave the level (q is a valid centre: its window is inside) */
+static float pm_dist2(const pm_lvl *L, int p, int q, float cap) {
+    const int S = L->S, py = p / S, px = p % S, qy = q / S, qx = q % S; float s = 0; int n = 0;
+    const int xin = px >= PM_R && px < S - PM_R; const float *I = L->I; const uint8_t *m = L->m;
+    for (int dy = -PM_R; dy <= PM_R; dy++) {
+        const int ay = py + dy; if (ay < 0 || ay >= S) continue;
+        const uint8_t *mr = m + (size_t)ay * S; const float *ar = I + (size_t)2 * ((size_t)ay * S), *br = I + (size_t)2 * ((size_t)(qy + dy) * S + qx);
+        if (xin) {
+            for (int dx = -PM_R; dx <= PM_R; dx++) {
+                const int ax = px + dx; if (mr[ax] == 2) continue;
+                const float e0 = ar[2 * ax] - br[2 * dx], e1 = ar[2 * ax + 1] - br[2 * dx + 1]; s += e0 * e0; s += e1 * e1; n++;
+            }
+        } else for (int dx = -PM_R; dx <= PM_R; dx++) {
+            const int ax = px + dx; if (ax < 0 || ax >= S) continue; if (mr[ax] == 2) continue;
+            const float e0 = ar[2 * ax] - br[2 * dx], e1 = ar[2 * ax + 1] - br[2 * dx + 1]; s += e0 * e0; s += e1 * e1; n++;
+        }
+        if (n && s > cap * n * 2) return 1e30f;
+    }
+    return n ? s / n : 1e30f;
+}
 static float pm_dist(const pm_lvl *L, int nimg, int p, int q, float cap) {
+    if (nimg == 2) return pm_dist2(L, p, q, cap);
     const int S = L->S, py = p / S, px = p % S, qy = q / S, qx = q % S; float s = 0; int n = 0;
     for (int dy = -PM_R; dy <= PM_R; dy++) {
         const int ay = py + dy; if (ay < 0 || ay >= S) continue;
@@ -743,10 +767,30 @@ static void pm_valid_centres(pm_lvl *L) {   /* centres whose whole 7 x 7 window 
     }
     free(ii);
 }
+/* pm_vote for two channels: the same sums in the same order (dy, dx; in place, holes in scan order), the bounds tests hoisted */
+static void pm_vote2(pm_lvl *L) {
+    const int S = L->S; float *I = L->I; const uint8_t *m = L->m; const int32_t *nnf = L->nnf;
+    for (int h = 0; h < L->nh; h++) {
+        const int p = L->hl[h]; if (nnf[p] < 0) continue;
+        const int py = p / S, px = p % S, xin = px >= PM_R && px < S - PM_R; int n = 0; float a0 = 0, a1 = 0;
+        for (int dy = -PM_R; dy <= PM_R; dy++) {
+            const int ay = py + dy; if (ay < 0 || ay >= S) continue;
+            const size_t row = (size_t)ay * S;
+            for (int dx = -PM_R; dx <= PM_R; dx++) {
+                const int ax = px + dx; if (!xin && (ax < 0 || ax >= S)) continue;
+                const size_t a = row + ax; if (m[a] != 1 || nnf[a] < 0) continue;
+                const int q = nnf[a] - dy * S - dx;   /* the source pixel patch a puts at p */
+                a0 += I[(size_t)q * 2]; a1 += I[(size_t)q * 2 + 1]; n++;
+            }
+        }
+        if (n) { I[(size_t)p * 2] = a0 / n; I[(size_t)p * 2 + 1] = a1 / n; }
+    }
+}
 static void pm_vote(pm_lvl *L, int nimg) {
+    if (nimg == 2) { pm_vote2(L); return; }
     const int S = L->S; float acc[16];
-    for (int p = 0; p < S * S; p++) {
-        if (L->m[p] != 1 || L->nnf[p] < 0) continue;
+    for (int h = 0; h < L->nh; h++) {
+        const int p = L->hl[h]; if (L->nnf[p] < 0) continue;
         const int py = p / S, px = p % S; int n = 0; for (int c = 0; c < nimg; c++) acc[c] = 0;
         for (int dy = -PM_R; dy <= PM_R; dy++) for (int dx = -PM_R; dx <= PM_R; dx++) {
             const int ay = py + dy, ax = px + dx; if (ay < 0 || ax < 0 || ay >= S || ax >= S) continue;
@@ -760,8 +804,8 @@ static void pm_vote(pm_lvl *L, int nimg) {
 }
 static void pm_sweep(pm_lvl *L, int nimg, int rev, uint32_t *rs) {
     const int S = L->S, st = rev ? -1 : 1;
-    for (int k = 0; k < S * S; k++) {
-        const int p = rev ? S * S - 1 - k : k; if (L->m[p] != 1) continue;
+    for (int k = 0; k < L->nh; k++) {
+        const int p = L->hl[rev ? L->nh - 1 - k : k];
         const int py = p / S, px = p % S;
         int best = L->nnf[p]; float bd = best >= 0 ? L->dist[p] : 1e30f;
         for (int t = 0; t < 2; t++) {   /* propagation from the left / upper (right / lower) neighbour */
@@ -785,7 +829,7 @@ static void *pm_worker(void *arg) {
     pm_lvl Lv[PM_LV];
     for (int l = 0, S = S0; l < PM_LV; l++, S = (S + 1) / 2) {
         const size_t n = (size_t)S * S; Lv[l].S = S;
-        Lv[l].I = malloc(n * nimg * sizeof(float)); Lv[l].m = malloc(n); Lv[l].vc = malloc(n); Lv[l].nnf = malloc(n * 4); Lv[l].dist = malloc(n * 4); Lv[l].cent = malloc(n * 4);
+        Lv[l].I = malloc(n * nimg * sizeof(float)); Lv[l].m = malloc(n); Lv[l].vc = malloc(n); Lv[l].nnf = malloc(n * 4); Lv[l].dist = malloc(n * 4); Lv[l].cent = malloc(n * 4); Lv[l].hl = malloc(n * 4);
     }
     for (int t; (t = atomic_fetch_add(&J->next, 1)) < J->ntx * J->nty;) {
         const int x0 = (t % J->ntx) * PM_T, y0 = (t / J->ntx) * PM_T, ox = x0 - PM_H, oy = y0 - PM_H;
@@ -811,7 +855,7 @@ static void *pm_worker(void *arg) {
             }
         }
         for (int l = PM_LV - 1; l >= 0; l--) {
-            pm_lvl *L = &Lv[l]; const int S = L->S; pm_valid_centres(L);
+            pm_lvl *L = &Lv[l]; const int S = L->S; pm_valid_centres(L); pm_holes(L);
             if (!L->nc) { if (l == 0) goto next_tile; for (int i = 0; i < S * S; i++) L->nnf[i] = -1; continue; }
             for (int p = 0; p < S * S; p++) {
                 L->nnf[p] = -1; if (L->m[p] != 1) continue;
@@ -827,10 +871,10 @@ static void *pm_worker(void *arg) {
                 L->nnf[p] = q;
             }
             if (l < PM_LV - 1) pm_vote(L, nimg);   /* the finer level starts from the coarser NNF's vote (the coarsest from push-pull) */
-            for (int p = 0; p < S * S; p++) if (L->m[p] == 1) L->dist[p] = pm_dist(L, nimg, p, L->nnf[p], 1e30f);
+            for (int h = 0; h < L->nh; h++) { const int p = L->hl[h]; L->dist[p] = pm_dist(L, nimg, p, L->nnf[p], 1e30f); }
             for (int it = 0; it < PM_IT; it++) {
                 pm_sweep(L, nimg, it & 1, &rs); pm_vote(L, nimg);
-                for (int p = 0; p < S * S; p++) if (L->m[p] == 1 && L->nnf[p] >= 0) L->dist[p] = pm_dist(L, nimg, p, L->nnf[p], 1e30f);
+                for (int h = 0; h < L->nh; h++) { const int p = L->hl[h]; if (L->nnf[p] >= 0) L->dist[p] = pm_dist(L, nimg, p, L->nnf[p], 1e30f); }
             }
         }
         for (int y = y0; y < cy1; y++) for (int x = x0; x < cx1; x++) {
@@ -840,7 +884,7 @@ static void *pm_worker(void *arg) {
         }
     next_tile:;
     }
-    for (int l = 0; l < PM_LV; l++) { free(Lv[l].I); free(Lv[l].m); free(Lv[l].vc); free(Lv[l].nnf); free(Lv[l].dist); free(Lv[l].cent); }
+    for (int l = 0; l < PM_LV; l++) { free(Lv[l].I); free(Lv[l].m); free(Lv[l].vc); free(Lv[l].nnf); free(Lv[l].dist); free(Lv[l].cent); free(Lv[l].hl); }
     return nullptr;
 }
 int img_patchmatch_fill(uint8_t *const *imgs, int nimg, const uint8_t *flag, int w, int h, int nthreads) {
