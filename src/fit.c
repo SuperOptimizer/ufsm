@@ -111,8 +111,8 @@ static inline double ev_part_U(const ev_part *p, double y, double x, double r) {
     double s = 0;
     for (int c = 0; c < 8; c++) {   /* corner order and weight products as lattice_at: (wz wy) wx */
         const int bz = c >> 2 & 1, by = c >> 1 & 1, bx = c & 1;
-        const double w = wz[bz] * wy[by] * wx[bx];
-        if (w != 0) s += w * m->delta[(p->za[bz] + yo[by]) * lx + xo[bx]];
+        const double w = wz[bz] * wy[by] * wx[bx], t = w * m->delta[(p->za[bz] + yo[by]) * lx + xo[bx]];
+        s += w != 0 ? t : 0.0;   /* (a select, not a branch: s starts at +0 and is never -0, so adding +0 for a skipped corner is exact) */
     }
     return r / p->pit + p->off + s;
 }
@@ -2073,9 +2073,9 @@ static int rr_cross(ray_ev evr, const void *ctx, double z, double cy, double cx,
    dropped by the caller, so the search returns -1 as soon as every root it can still find is outside: the ring's crossing intervals
    all outside (no refinement), or each side's front past its bound (or stopped). The same roots where they are kept. */
 typedef void (*ray_prep)(const void *ctx, double thw);   /* (optional: per-ray constants of the evaluator, given the ray angle) */
-static int ray_root_b(ray_ev evr, ray_prep prep, const void *ctx, const fit_model *m, double z, double theta, double k, double r_hint, double ua, double ub, double *r);
+static inline int ray_root_b(ray_ev evr, ray_prep prep, const void *ctx, const fit_model *m, double z, double theta, double k, double r_hint, double ua, double ub, double *r);
 static int ray_root(ray_ev evr, ray_prep prep, const void *ctx, const fit_model *m, double z, double theta, double k, double r_hint, double *r) { return ray_root_b(evr, prep, ctx, m, z, theta, k, r_hint, -1e300, 1e300, r); }
-static int ray_root_b(ray_ev evr, ray_prep prep, const void *ctx, const fit_model *m, double z, double theta, double k, double r_hint, double ua, double ub, double *r) {
+static inline __attribute__((always_inline)) int ray_root_b(ray_ev evr, ray_prep prep, const void *ctx, const fit_model *m, double z, double theta, double k, double r_hint, double ua, double ub, double *r) {   /* (inlined: a constant evaluator inlines too) */
     const int na = (int)(m->D * m->h) + 1;
     const double cy = axis_lerp(m->cy, na, z), cx = axis_lerp(m->cx, na, z), sy = sin(theta), sx = cos(theta), thw = atan2(sy, sx);
     if (prep) prep(ctx, thw);
