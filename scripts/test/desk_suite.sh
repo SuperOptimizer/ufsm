@@ -30,8 +30,11 @@ echo "desk_suite: $REF = ${SHA:0:12} ($(git log -1 --format=%s "$SHA" | cut -c1-
 ssh -o ConnectTimeout=10 "$DESK" "mkdir -p $ROOT && { [ -d $ROOT/repo.git ] || git init -q --bare $ROOT/repo.git; }" || exit 2
 git push -q "$DESK:$ROOT/repo.git" "$SHA:refs/suite/${SHA:0:12}" 2>&1 | grep -v '^$' || true
 
-# (ssh joins the words into one string: quote each so empty ones survive)
-ssh -o ConnectTimeout=10 "$DESK" "bash -s -- $(printf '%q ' "$SHA" "$TIER" "$J" "$T" "$MEMGB" "$BJ" "$KEEP" "$FILT" "${SUITE_ARGS:-}" "$LOADMAX" "$WAITMIN")" <<'REMOTE'
+# the desk side as a script file, run on a pty (ssh -tt: a dropped caller HUPs it); its arguments quoted (ssh joins the words into one
+# string: quote each so empty ones survive)
+RS=$ROOT/.remote-${SHA:0:12}.sh
+ssh -o ConnectTimeout=10 "$DESK" "cat > $RS" <<'REMOTE' || exit 2
+
 set -u
 SHA=$1 TIER=$2 J=$3 T=$4 MEMGB=$5 BJ=$6 KEEP=$7 FILT=$8 XARGS=$9 LOADMAX=${10} WAITMIN=${11}
 ROOT=/vesuvius/ufsm/suite; S=${SHA:0:12}; W=$ROOT/$S
@@ -44,12 +47,14 @@ deskok() {   # wait (<= WAITMIN) until MemAvailable >= MEMGB and the 1-min load 
     [ $i = 0 ] && echo "desk_suite: desk busy (MemAvailable ${a} GB, need ${MEMGB}; load ${l}, max ${LOADMAX}): waiting <= ${WAITMIN} min"
     [ $i -lt $n ] && sleep 30; done
   echo "desk_suite: desk still busy (MemAvailable ${a} GB, load ${l}): giving up, try later"; return 1; }
-# the caller gone (ssh dropped, ^C on the laptop): no orphan build or suite on the desk. The build and the runner lead their own
-# process groups (setsid); the watchdog TERMs the current one (the runner's trap stops its tests) once sshd's child has exited.
-SSHPID=$PPID; GRP=$ROOT/.$S.pgid; : > $GRP
-( while kill -0 $SSHPID 2> /dev/null; do sleep 5; done; g=$(cat $GRP 2> /dev/null); [ -n "$g" ] && kill -TERM -- -"$g" 2> /dev/null; kill -TERM $$ 2> /dev/null ) &
-WD=$!; trap 'kill $WD 2> /dev/null; rm -f $GRP' EXIT
-inbg() { setsid "$@" & local p=$!; echo $p > $GRP; wait $p; local r=$?; : > $GRP; return $r; }
+# the caller gone (ssh dropped, ^C on the laptop): no orphan build or suite on the desk. The script runs on a pty (ssh -tt), so the
+# desk side gets SIGHUP; the build and the runner lead their own process groups (setsid) and get a TERM (the runner's trap stops its
+# tests). (Without a pty sshd keeps the session open while the child lives: nothing tells a sleeping script that the caller left.)
+stty -onlcr 2> /dev/null   # (no CR LF on the pty)
+GRP=$ROOT/.$S.pgid; : > $GRP
+gone() { g=$(cat $GRP 2> /dev/null); [ -n "$g" ] && kill -TERM -- -"$g" 2> /dev/null; rm -f $GRP; exit 129; }
+trap gone HUP INT TERM; trap 'rm -f $GRP "$0"' EXIT
+inbg() { setsid "$@" < /dev/null & local p=$!; echo $p > $GRP; wait $p; local r=$?; : > $GRP; return $r; }
 exec 9> $ROOT/suite.lock
 flock -n 9 || { echo "desk_suite: another desk suite holds $ROOT/suite.lock: waiting"; flock 9; }
 deskok || exit 3
@@ -73,3 +78,4 @@ cd $W && eval inbg nice -n 10 tests/run_suite.sh -t "$TIER" -j "$J" -T "$T" -g "
 ls -dt $ROOT/[0-9a-f]*/ 2> /dev/null | tail -n +9 | while read -r d; do d=${d%/}; [[ ${d##*/} =~ ^[0-9a-f]{12}$ ]] && rm -rf -- "$ROOT/${d##*/}"; done
 exit $rc
 REMOTE
+ssh -tt -o ConnectTimeout=10 "$DESK" "bash $RS $(printf '%q ' "$SHA" "$TIER" "$J" "$T" "$MEMGB" "$BJ" "$KEEP" "$FILT" "${SUITE_ARGS:-}" "$LOADMAX" "$WAITMIN")"
