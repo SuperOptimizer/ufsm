@@ -628,7 +628,7 @@ static uint8_t *stripe_mask(const char *dir, int ow, int oh, double gs, int *gw,
 }
 /* strip-mosaic's per-stripe work on threads (stripes taken in turn; output and every sum identical to one thread) */
 typedef struct {
-    ms_stripe *st; int ns; const char *rd, *fd, *od; double gs; double *hc, *hi;
+    ms_stripe *st; int ns; const char *rd, *fd, *od, *fmd; double gs; double *hc, *hi;   /* fmd: --fill-maps DIR or nullptr */
     int ca, cb, ia, ib, ctl, q, wstripes; double pxum; const st_seg *segs; int nseg;
     int rows; long long rowlen; int ds, ovw, bandh, rowh; double *ovs; float *ovn;
     int lds, lw, lh; double *lsum; float *lcnt; int tpx; long long ntile; double *tv, *tp; long long *tw0, *tw1;
@@ -637,6 +637,15 @@ typedef struct {
     int wait, rm;   /* --wait-renders: a stripe is taken when <render-dir>/<stripe>.done exists; --rm-renders: its two TIFFs deleted after use */
     pthread_mutex_t mu; _Atomic int next, fail;
 } ms_ctx;
+static void ms_fill_mask(const ms_ctx *C, const char *name, uint8_t *m, int w, int h) {
+    /* --fill-maps: pixels render --fill rendered (flag < RFILL_NONE and not RFILL_EMPTY: on the surface, filled along the normal,
+       in a bridged grid hole, inpainted) join the stripe's mask, so the bridged grid holes show in the mosaic */
+    if (!C->fmd || !m) return;
+    char p[1600]; snprintf(p, sizeof p, "%s/%s_fill.tif", C->fmd, name); int fw, fh; uint8_t *f = img_read_u8(p, &fw, &fh);
+    if (!f) return;
+    if (fw == w && fh == h) for (size_t i = 0; i < (size_t)w * h; i++) if (f[i] < RFILL_NONE) m[i] = 1;
+    free(f);
+}
 static void *ms_pass1(void *arg) {
     ms_ctx *C = arg; char p[1600];
     for (int s; (s = atomic_fetch_add(&C->next, 1)) < C->ns;) {
@@ -644,7 +653,7 @@ static void *ms_pass1(void *arg) {
         int w1, h1, w2, h2, gw, gh; snprintf(p, sizeof p, "%s/%s_ct.tif", C->rd, S->name); uint8_t *ct = img_read_u8(p, &w1, &h1);
         snprintf(p, sizeof p, "%s/%s.tif", C->rd, S->name); uint8_t *ink = img_read_u8(p, &w2, &h2);
         if (!ct || !ink || w1 != w2 || h1 != h2) { fprintf(stderr, "strip-mosaic: missing renders for %s\n", S->name); free(ct); free(ink); S->ow = 0; continue; }
-        snprintf(p, sizeof p, "%s/stripes/%s", C->fd, S->name); uint8_t *m = stripe_mask(p, w1, h1, C->gs, &gw, &gh);
+        snprintf(p, sizeof p, "%s/stripes/%s", C->fd, S->name); uint8_t *m = stripe_mask(p, w1, h1, C->gs, &gw, &gh); ms_fill_mask(C, S->name, m, w1, h1);
         double hc[256] = {0}, hi[256] = {0};
         if (m) { hist_u8(ct, m, (size_t)w1 * h1, hc); hist_u8(ink, m, (size_t)w1 * h1, hi); }
         pthread_mutex_lock(&C->mu); for (int k = 0; k < 256; k++) { C->hc[k] += hc[k]; C->hi[k] += hi[k]; } pthread_mutex_unlock(&C->mu);
@@ -663,23 +672,17 @@ static int ms_jpeg_stripe(const char *path, int w, int h, const uint8_t *ct, con
     ms_rows R = {.w = w, .h = h, .ca = ca, .cb = cb, .ia = ia, .ib = ib, .ct = ct, .ink = ink, .m = m};
     return jpar_write(path, w, 2 * h, 1, q, nullptr, ms_stripe_row, &R, 0);
 }
+typedef struct { int w, ca, cb, ia, ib, bg; float gain; const uint8_t *ct, *ink, *m; } ms_prows;
+static void ms_pap_row(void *u, int y, int x0, int n, uint8_t *dst) {   /* --papyrus row (encoder threads) */
+    const ms_prows *R = u; const size_t o = (size_t)y * R->w + x0;
+    for (int x = 0; x < n; x++) { uint8_t *c = dst + 3 * x;
+        if (!R->m[o + x] || !R->ct[o + x]) { c[0] = c[1] = c[2] = (uint8_t)R->bg; continue; }
+        img_pap_rgb(stretch(R->ct[o + x], R->ca, R->cb), img_pap_ink(stretch(R->ink[o + x], R->ia, R->ib), R->gain), c); }
+}
 static int ms_jpeg_stripe_pap(const char *path, int w, int h, const uint8_t *ct, const uint8_t *ink, const uint8_t *m, int ca, int cb, int ia, int ib, float gain, int bg, int q) {
     /* --papyrus: one RGB band, the CT ramp under the ink (img_pap_rgb), grey bg off the surface and where the CT is 0 */
-    FILE *f = fopen(path, "wb"); if (!f) return -1;
-    struct jpeg_compress_struct ci; struct jpeg_error_mgr je;
-    ci.err = jpeg_std_error(&je); jpeg_create_compress(&ci); jpeg_stdio_dest(&ci, f);
-    ci.image_width = (JDIMENSION)w; ci.image_height = (JDIMENSION)h; ci.input_components = 3; ci.in_color_space = JCS_RGB;
-    jpeg_set_defaults(&ci); jpeg_set_quality(&ci, q, TRUE); jpeg_start_compress(&ci, TRUE);
-    uint8_t *row = malloc((size_t)w * 3);
-    while (ci.next_scanline < ci.image_height) {
-        const size_t o = (size_t)ci.next_scanline * w;
-        for (int x = 0; x < w; x++) { uint8_t *c = row + 3 * x;
-            if (!m[o + x] || !ct[o + x]) { c[0] = c[1] = c[2] = (uint8_t)bg; continue; }
-            img_pap_rgb(stretch(ct[o + x], ca, cb), img_pap_ink(stretch(ink[o + x], ia, ib), gain), c); }
-        JSAMPROW r = row; jpeg_write_scanlines(&ci, &r, 1);
-    }
-    jpeg_finish_compress(&ci); jpeg_destroy_compress(&ci); free(row);
-    return fclose(f) ? -1 : 0;
+    ms_prows R = {.w = w, .ca = ca, .cb = cb, .ia = ia, .ib = ib, .bg = bg, .gain = gain, .ct = ct, .ink = ink, .m = m};
+    return jpar_write(path, w, h, 3, q, nullptr, ms_pap_row, &R, 0);
 }
 static void *ms_pass2(void *arg) {
     ms_ctx *C = arg; char p[1600];
@@ -689,7 +692,7 @@ static void *ms_pass2(void *arg) {
         const double ts = snow(); const int w = S->ow, h = S->oh;
         int w1, h1, gw, gh; snprintf(p, sizeof p, "%s/%s_ct.tif", C->rd, S->name); uint8_t *ct = img_read_u8(p, &w1, &h1);
         snprintf(p, sizeof p, "%s/%s.tif", C->rd, S->name); uint8_t *ink = img_read_u8(p, &w1, &h1);
-        snprintf(p, sizeof p, "%s/stripes/%s", C->fd, S->name); uint8_t *m = stripe_mask(p, w, h, C->gs, &gw, &gh);
+        snprintf(p, sizeof p, "%s/stripes/%s", C->fd, S->name); uint8_t *m = stripe_mask(p, w, h, C->gs, &gw, &gh); ms_fill_mask(C, S->name, m, w, h);
         snprintf(p, sizeof p, "%s/stripes/%s/gu.tif", C->fd, S->name); int uw, uh; float *gu = img_read_f32(p, &uw, &uh);
         if (!ct || !ink || !m || !gu) { fprintf(stderr, "strip-mosaic: %s unreadable\n", S->name); atomic_store(&C->fail, 1); free(ct); free(ink); free(m); free(gu); continue; }
         const long long x0 = (long long)(S->u0cm * 1e4 / C->pxum + 0.5); const int xs = s ? 1 : 0;   /* (stripes share their first column with the previous one's last) */
@@ -741,7 +744,8 @@ static void *ms_pass2(void *arg) {
     return nullptr;
 }
 int cmd_strip_mosaic(int argc, char **argv) {
-    if (argc < 5) { fprintf(stderr, "usage: ufsm strip-mosaic <flat-dir> <render-dir> <out-dir> [--strip DIR] [--ct-level 80] [--overview-px 16000] [--rows 10] [--tile-cm 1] [--quality 88] [--stripes 1] [--threads 8] [--stretch CA,CB,IA,IB] [--stretch-only 1] [--wait-renders 1] [--rm-renders 1] [--papyrus GAIN [--papyrus-bg 128]]\n"
+    if (argc < 5) { fprintf(stderr, "usage: ufsm strip-mosaic <flat-dir> <render-dir> <out-dir> [--strip DIR] [--ct-level 80] [--overview-px 16000] [--rows 10] [--tile-cm 1] [--quality 88] [--stripes 1] [--threads 8] [--stretch CA,CB,IA,IB] [--stretch-only 1] [--wait-renders 1] [--rm-renders 1] [--papyrus GAIN [--papyrus-bg 128]] [--fill-maps DIR]\n"
+                          "  --fill-maps DIR: <stripe>_fill.tif of render --fill: its rendered pixels (bridged grid holes, fills) join the stripe mask\n"
                           "  --papyrus GAIN: papyrus-look RGB stripe JPEGs (<stripe>_papyrus.jpg), overview and long strip (ink-compare --papyrus colours,\n"
                           "  the mosaic's stretch, ink x GAIN; CT 0 / no surface in grey --papyrus-bg)\n"); return 2; }
     const char *fd = argv[2], *rd = argv[3], *od = argv[4];
@@ -770,6 +774,7 @@ int cmd_strip_mosaic(int argc, char **argv) {
        is the same in any order) */
     double hc[256] = {0}, hi[256] = {0};
     ms_ctx C = {.st = st, .ns = ns, .rd = rd, .fd = fd, .od = od, .gs = gs, .hc = hc, .hi = hi};
+    C.fmd = sopt(argc, argv, "--fill-maps", nullptr);
     pthread_mutex_init(&C.mu, nullptr);
     int ca, cb, ia, ib; const char *fs = sopt(argc, argv, "--stretch", nullptr);
     if (fs) {   /* --stretch CA,CB,IA,IB: given (no pass 1: the renders need not exist yet; their sizes from the stripe grids) */

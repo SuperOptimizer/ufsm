@@ -38,12 +38,12 @@ rend() {   # one stripe -> render_fill/<s>.tif, <s>_ct.tif, <s>.done; fillmap/<s
 }
 for d in $R/*.done; do [ -e "$d" ] || continue; s=$(basename $d .done); [ -e $R/${s}_ct.tif ] || rm -f $d; done   # the mosaic needs every stripe: re-render those it already consumed
 if [ -z "$PAPMOS" ]; then
-  nice -n 10 $U strip-mosaic $OUT/strip/flat $R $I --ct-level $CTL --threads $MOS_NT --stretch $ST --wait-renders 1 --rm-renders 1 > $OUT/logs/mosaic_fill.log 2>&1 &
+  nice -n 10 $U strip-mosaic $OUT/strip/flat $R $I --ct-level $CTL --threads $MOS_NT --stretch $ST --wait-renders 1 --rm-renders 1 --fill-maps $M > $OUT/logs/mosaic_fill.log 2>&1 &
   MPS=($!)
 else   # two mosaics on the same renders: the script deletes a render once both have logged it
-  nice -n 10 $U strip-mosaic $OUT/strip/flat $R $I --ct-level $CTL --threads $MOS_NT --stretch $ST --wait-renders 1 > $OUT/logs/mosaic_fill.log 2>&1 &
+  nice -n 10 $U strip-mosaic $OUT/strip/flat $R $I --ct-level $CTL --threads $MOS_NT --stretch $ST --wait-renders 1 --fill-maps $M > $OUT/logs/mosaic_fill.log 2>&1 &
   MPS=($!)
-  nice -n 10 $U strip-mosaic $OUT/strip/flat $R $PAPMOS --ct-level $CTL --threads $MOS_NT --stretch $ST --wait-renders 1 --papyrus $PGAIN --papyrus-bg 128 --overview-px $PAPPX > $OUT/logs/mosaic_fill_pap.log 2>&1 &
+  nice -n 10 $U strip-mosaic $OUT/strip/flat $R $PAPMOS --ct-level $CTL --threads $MOS_NT --stretch $ST --wait-renders 1 --papyrus $PGAIN --papyrus-bg 128 --overview-px $PAPPX --fill-maps $M > $OUT/logs/mosaic_fill_pap.log 2>&1 &
   MPS+=($!)
 fi
 clean() {   # PAPMOS: renders both mosaics have taken
