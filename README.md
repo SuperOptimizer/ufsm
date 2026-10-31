@@ -41,7 +41,7 @@ CK=wind96-wk1-best.ckpt; INKCK=ift3-24000.ckpt
 
 # 1. fit fields (wind96): 10 planes on a 2-voxel cell grid, written straight into a fit-field set; repack to 512^3 shards
 $U predict $CK $R $K fields.tmp --um 2.4 --level 2 --box Z,Y,X,NZ,NY,NX --window-z 384 --halo-z 64 --window 640 --halo 64 --shard 512 \
-   --grid-origin 0,0,0 --ema 1 --q 8 --axis axis.json --levels 1 --fit-zarr fields --fit-h 2 --fit-q 8 --fit-q-phase 0 --no-out 1
+   --grid-origin 0,0,0 --ema 1 --q 8 --axis axis.json --levels 1 --fit-zarr fields --fit-h 2 --fit-q 8 --fit-q-phase 0 --no-out 1 --occupancy 5
 for a in fields/*/; do $U repack $a ${a%/}.512 512 --threads 12 && rm -r $a && mv ${a%/}.512 $a; done
 
 # 2. ink (ift3-24000): frozen GroupNorm from a calibration band, two passes offset by half a shard, blended
@@ -96,7 +96,7 @@ Drivers (resumable per stage; `STOP` files; MemAvailable gates):
   `state/<stage>.done` holds the wall time, CPU seconds and max RSS. `DRY=1` prints the plan; `touch $O/STOP` stops between stages.
   The render, faces and ink-compare stages use the shared decoded-CT cache (`UFSM_ZCACHE_GB`, admit 0.6). Its size is `ZCACHE_GB`:
   by default 1/4 of the available RAM, at most 30 GB (the desk 30; a 62 GB pod ~15), and off on the laptop. The run removes
-  `/dev/shm/ufsm-zcache-<uid>` when it ends, also on STOP. strip-mosaic gets `UFSM_JPEG_THREADS` = cores / 8.
+  `/dev/shm/ufsm-zcache-<uid>` when it ends, also on STOP. strip-mosaic gets `UFSM_JPEG_THREADS` = cores / 2.
   Env: `U CK INKCK FIELDGPUS FITGPUS INKGPU BOX TH PTH ITH MINMEM CTROOT CTKEY TAG INKCMD REFCMD ZCACHE_GB ZCACHE_ADMIT`.
 - `scripts/corpus/`: the three-host pipelined corpus unroll (`common.sh` describes the split): `desk.sh` prep (mask box from
   scanprep, `ufsm axis` when there is no umbilicus), wind96 fields, repack, push; `laptop.sh` / `inklib.sh` ift3 ink over HTTP
@@ -157,7 +157,7 @@ x 512+7424, so slab fits and predicts see the whole-scroll cross-section. The cr
 | strip | `strip` | 1.9 GB | 33.6 GB (e2e validation) | valid vertices (~28 B each) | `--every 2` (4x less), `--first/--last` |
 | strip flatten | `strip-flatten` | 0.7 GB | ~13 GB (est.) | vertices | `--decim` |
 | stripe render | `render` (union box) | 15.2 GB | 29.3 GB (Paris 3, 60000 x 22361 px stripes) | `UFSM_RENDER_MEM` + stripe px (~19 B/px) | `UFSM_RENDER_MEM` (now <= 50% available), strip-flatten `--stripe-px` |
-| mosaic | `strip-mosaic` | 1.0 GB (1 thread), 4.5 GB (14) | ~5 GB per thread (est., 3.3 B/stripe px) | threads x stripe px | threads now capped by memory (70% available) |
+| mosaic | `strip-mosaic` | 9.5 GB (2 P4 stripes, 2 jobs) | ~5 GB per stripe in flight (3.3 B/stripe px) + overview sums | stripe jobs x stripe px | `--stripe-jobs` (2) capped by memory (70% available); `--threads` work inside a stripe |
 | per wrap | `render` / `ink-compare` / `flatten` | 0.8 / 0.25 / 0.43 GB | render <= `UFSM_RENDER_MEM` + output; ink-compare streamed 0.5 GB | wrap area | `UFSM_RENDER_MEM`, `--decim` |
 
 On a pod only ink (GPU) and ref (CPU) overlap, about 26 GB together. Every other stage runs alone. The largest are strip
@@ -259,7 +259,7 @@ CT | phase hue over CT | winding mod 4 hue over CT; rows z-mid / y-mid / x-mid).
 |---|---|
 | `--window W --halo H` / `--window-z --halo-z` | tile size and discarded border (thin-z windows for the fields) |
 | `--grid-origin z,y,x` | tile interiors anchored to CT coordinates: a voxel's windows do not depend on the box / shard layout |
-| `--full-grid 1` | every tile of the grid (ink); `--occupancy N`: skip windows with little CT; `--resume 1`: skip written shards |
+| `--full-grid 1` | every tile of the grid (ink); `--occupancy L`: skip shards, and windows whose interior, that are zero on the coarser CT level L (one coarse voxel of margin; outputs and fit fields identical except at isolated low CT specks whose coarse voxels round to 0, e.g. 6 of 4.2M P3 coarse voxels; also with `--fit-zarr`; reads of air windows saved: P4 61% / P3 31% of the shards at L 5; `UFSM_OCC_TILES=0`: shards only); `--resume 1`: skip written shards |
 | `--fit-zarr DIR --fit-h 2 --fit-q 8 --fit-q-phase 0 --no-out 1 --axis JSON` | the unwrap heads straight into a fit-field set (no prediction pyramid) |
 | `--gn-save FILE` / `--gn-frozen FILE` | GroupNorm statistics from a calibration box, then frozen for the whole volume (no per-tile brightness seams) |
 | `--ema 1`, `--q Q`, `--levels N` | EMA weights, volcomp quality (0 lossless), pyramid levels written |
@@ -434,7 +434,7 @@ theta = +pi edge; the wraps in order are one continuous sheet. The junction orde
 ```sh
 ufsm strip <wraps> <out> [--first K] [--last K] [--every E] [--err 0.25] [--threads 8]
 ufsm strip-flatten <strip-dir> [--out DIR] [--decim D] [--stride S] [--iters 30] [--cg 200] [--tol T] [--ostep S] [--stripe-px 60000] [--px-scale 1] [--flip-rows 1] [--max-edge 3] [--reuse 1] [--threads 16] [--gpu 1] [--jobs J] [--stripe-jobs 3] [--chunks J0,J1]
-ufsm strip-mosaic <flat-dir> <render-dir> <out-dir> [--strip DIR] [--ct-level 80] [--overview-px 16000] [--rows 10] [--tile-cm 1] [--quality 88] [--stripes 1] [--threads 8]
+ufsm strip-mosaic <flat-dir> <render-dir> <out-dir> [--strip DIR] [--ct-level 80] [--overview-px 16000] [--rows 10] [--tile-cm 1] [--quality 88] [--stripes 1] [--threads 8] [--stripe-jobs 2] [--papyrus GAIN] [--papyrus-dir DIR [--papyrus-gain 1] [--papyrus-overview-px PX]] [--fill-maps DIR]
 ufsm strip-crop <in.tif> <out.jpg> x,y,w,h [--stretch 1]
 ```
 
@@ -456,8 +456,13 @@ ufsm strip-crop <in.tif> <out.jpg> x,y,w,h [--stretch 1]
 - `strip-mosaic`: global contrast stretch over all stripes, then `<out>/wsNNN_ct_ink.jpg` (CT over ink; `--stripes 0`: none),
   `overview.jpg` (the length folded into `--rows` rows, with an on-papyrus bar: green on, red off, 10 cm ticks),
   `strip_long.jpg`, `strip_papyrus.tsv` (per `--tile-cm`: valid cm², share with CT >= `--ct-level` within 3 x 3 px, wrap range)
-  and `papyrus_wraps.tsv`. Stripes run on `--threads` with private sums merged under a lock (same bytes as one thread);
-  stripe JPEGs are streamed row by row. Off-papyrus surface is reported, never cut.
+  and `papyrus_wraps.tsv`. `--papyrus GAIN`: the papyrus look instead (`<s>_papyrus.jpg`, one-band overview / long strip);
+  `--papyrus-dir DIR` writes that papyrus mosaic as well, from the same reads, into DIR (the bytes of a separate `--papyrus` run;
+  `--papyrus-gain`, `--papyrus-overview-px`). `--stripe-jobs` (2, memory capped) stripes in flight, each worked on by `--threads`
+  threads (strip-parallel TIFF decode, mask rows, pixel row bands with private integer sums merged under a lock: the same bytes
+  for any thread / job count); stripe JPEGs are streamed row by row through lookup tables. Desk (loaded), real P4 stripe
+  60000 x 21452 px at 4 threads: per stripe TIFF decode 14.8 -> 3.9 s, mask/fill/gu 13 -> 2.5, pixels 45 -> 3.3; a 2-stripe run
+  grey 81 -> 14 s, papyrus 71 -> 11 s, both from one read 17 s; 6 stripes grey 189 -> 73 s. Off-papyrus surface is reported, never cut.
 - `strip-crop`: a rectangle of a stripe-size render TIFF (60000 px, past most image tools) as a stretched JPEG.
 
 ### Rendering and panels
