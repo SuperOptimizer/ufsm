@@ -49,7 +49,7 @@ SRC += src/fblend.c
 SRC += src/deform.c src/vwt_aug.c src/zcache.c
 SRC += src/inkblend.c
 SRC += src/inkseam.c
-SRC += src/render.c src/imgops.c src/inkcompare.c
+SRC += src/render.c src/imgops.c src/jpegpar.c src/inkcompare.c
 SRC += src/repack.c
 SRC += src/wload.c src/inkext.c src/inkext_net.c src/dinovol.c src/dinovol_net.c src/dino.c src/surfeval.c
 SRC += src/villawind.c src/villawind_net.c src/vwt_net.c src/vwt_train.c src/vwt_tile.c src/vwt_infer.c src/wtrunk.c src/vwt_stitch.c src/phasevis.c src/vwt_mv.c
@@ -207,7 +207,7 @@ test-all: $(B)/test_fblend
 $(B)/test_countfield: tests/test_countfield.c $(B)/countfield.o $(B)/fit.o $(B)/fit_emb.o $(B)/embz.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/coreline.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/z3w.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 test-all: $(B)/test_countfield
-$(B)/test_vwt_sample: tests/test_vwt_sample.c $(B)/vwt_sample.o $(B)/imgops.o $(B)/tiffw.o $(B)/tfx.o $(B)/surfcomp.o $(B)/vwt_aug.o $(B)/zcache.o $(B)/deform.o $(B)/edt.o $(B)/band.o $(B)/sheet.o $(B)/ct_augment.o $(B)/scan_augment.o $(B)/spatial_augment.o $(B)/crush.o $(B)/scrollaug.o $(B)/cover.o $(B)/json.o $(B)/store.o $(B)/zarr3.o $(B)/sources.o $(B)/srpair.o $(B)/zarr2.o $(B)/tiff.o $(B)/z3w.o $(B)/hf.o $(B)/zipr.o $(B)/view.o $(B)/reg.o $(B)/sample_emb.o $(B)/embz.o $(B)/nn.o $(B)/nn_fp8.o
+$(B)/test_vwt_sample: tests/test_vwt_sample.c $(B)/vwt_sample.o $(B)/imgops.o $(B)/jpegpar.o $(B)/tiffw.o $(B)/tfx.o $(B)/surfcomp.o $(B)/vwt_aug.o $(B)/zcache.o $(B)/deform.o $(B)/edt.o $(B)/band.o $(B)/sheet.o $(B)/ct_augment.o $(B)/scan_augment.o $(B)/spatial_augment.o $(B)/crush.o $(B)/scrollaug.o $(B)/cover.o $(B)/json.o $(B)/store.o $(B)/zarr3.o $(B)/sources.o $(B)/srpair.o $(B)/zarr2.o $(B)/tiff.o $(B)/z3w.o $(B)/hf.o $(B)/zipr.o $(B)/view.o $(B)/reg.o $(B)/sample_emb.o $(B)/embz.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 test-all: $(B)/test_vwt_sample
 $(B)/test_spiralfit: tests/test_spiralfit.c $(B)/countfield.o $(B)/fit.o $(B)/fit_emb.o $(B)/embz.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/coreline.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/z3w.o $(B)/nn.o $(B)/nn_fp8.o
@@ -220,7 +220,7 @@ test-all: $(B)/test_stitch
 $(B)/test_coreline: tests/test_coreline.c $(B)/coreline.o $(B)/z3w.o $(B)/fit.o $(B)/fit_emb.o $(B)/embz.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 test-all: $(B)/test_coreline
-$(B)/test_pyports: tests/test_pyports.c tests/test_pyports_expected.h $(B)/coreline_check.o $(B)/coreline.o $(B)/imgops.o $(B)/tiff.o $(B)/tiffw.o $(B)/fit.o $(B)/fit_emb.o $(B)/embz.o $(B)/z3w.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/nn.o $(B)/nn_fp8.o
+$(B)/test_pyports: tests/test_pyports.c tests/test_pyports_expected.h $(B)/coreline_check.o $(B)/coreline.o $(B)/imgops.o $(B)/jpegpar.o $(B)/tiff.o $(B)/tiffw.o $(B)/fit.o $(B)/fit_emb.o $(B)/embz.o $(B)/z3w.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_pyports.c $(filter %.o,$^) -o $@ $(LDLIBS) $(CUDALIBS)
 test-all: $(B)/test_pyports
 $(B)/test_fit_w4: tests/test_fit_w4.c $(B)/fit.o $(B)/fit_emb.o $(B)/embz.o $(B)/z3w.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/coreline.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/nn.o $(B)/nn_fp8.o
@@ -232,13 +232,13 @@ test-all: $(B)/test_repair
 $(B)/test_afv: tests/test_afv.c $(B)/afv.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
 test-all: $(B)/test_afv
-$(B)/test_flatten: tests/test_flatten.c $(B)/flatten.o $(B)/imgops.o $(B)/tiffw.o $(B)/tiff.o
+$(B)/test_flatten: tests/test_flatten.c $(B)/flatten.o $(B)/imgops.o $(B)/jpegpar.o $(B)/tiffw.o $(B)/tiff.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
 test-all: $(B)/test_flatten
-$(B)/test_flatten_gpu: tests/test_flatten.c $(B)/flatten.o $(B)/imgops.o $(B)/tiffw.o $(B)/tiff.o $(B)/nn_flat.o
+$(B)/test_flatten_gpu: tests/test_flatten.c $(B)/flatten.o $(B)/imgops.o $(B)/jpegpar.o $(B)/tiffw.o $(B)/tiff.o $(B)/nn_flat.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DFLAT_GPU $^ -o $@ $(LDLIBS) $(CUDALIBS)
 test-all: $(B)/test_flatten_gpu
-$(B)/test_strip: tests/test_strip.c $(B)/strip.o $(B)/flatten.o $(B)/imgops.o $(B)/tiffw.o $(B)/tiff.o $(B)/tfx.o $(B)/surfcomp.o
+$(B)/test_strip: tests/test_strip.c $(B)/strip.o $(B)/flatten.o $(B)/imgops.o $(B)/jpegpar.o $(B)/tiffw.o $(B)/tiff.o $(B)/tfx.o $(B)/surfcomp.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
 test-all: $(B)/test_strip
 $(B)/test_faces: tests/test_faces.c $(B)/faces.o
@@ -255,9 +255,12 @@ $(B)/test_ink_splat: tests/test_ink_splat.c $(OBJ) $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 test-all: $(B)/test_ink_splat
 
-$(B)/test_imgops: tests/test_imgops.c tests/test_imgops_expected.h $(B)/imgops.o $(B)/tiffw.o $(B)/tiff.o
-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_imgops.c $(B)/imgops.o $(B)/tiffw.o $(B)/tiff.o -o $@ $(LDLIBS)
+$(B)/test_imgops: tests/test_imgops.c tests/test_imgops_expected.h $(B)/imgops.o $(B)/jpegpar.o $(B)/tiffw.o $(B)/tiff.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_imgops.c $(B)/imgops.o $(B)/jpegpar.o $(B)/tiffw.o $(B)/tiff.o -o $@ $(LDLIBS)
 test-all: $(B)/test_imgops
+$(B)/test_jpegpar: tests/test_jpegpar.c $(B)/jpegpar.o $(B)/imgops.o $(B)/tiffw.o $(B)/tiff.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
+test-all: $(B)/test_jpegpar
 $(B)/test_head32: tests/test_head32.c $(B)/unet.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 $(B)/test_sslstat: tests/test_sslstat.c src/sslstat.h | $(B)
@@ -305,10 +308,10 @@ test-all: $(B)/test_dino_pts
 $(B)/test_dinor: tests/test_dinor.c $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_dinor.c $(B)/nn.o $(B)/nn_fp8.o -o $@ $(LDLIBS) $(CUDALIBS)
 test-all: $(B)/test_dinor
-$(B)/test_tfx: tests/test_tfx.c $(B)/tfx.o $(B)/imgops.o $(B)/tiffw.o $(B)/tiff.o $(B)/surfcomp.o
-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_tfx.c $(B)/tfx.o $(B)/imgops.o $(B)/tiffw.o $(B)/tiff.o $(B)/surfcomp.o -o $@ $(LDLIBS)
-$(B)/test_sheetcut: tests/test_sheetcut.c $(B)/sheetcut.o $(B)/tfx.o $(B)/imgops.o $(B)/tiffw.o $(B)/tiff.o $(B)/surfcomp.o
-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_sheetcut.c $(B)/sheetcut.o $(B)/tfx.o $(B)/imgops.o $(B)/tiffw.o $(B)/tiff.o $(B)/surfcomp.o -o $@ $(LDLIBS)
+$(B)/test_tfx: tests/test_tfx.c $(B)/tfx.o $(B)/imgops.o $(B)/jpegpar.o $(B)/tiffw.o $(B)/tiff.o $(B)/surfcomp.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_tfx.c $(B)/tfx.o $(B)/imgops.o $(B)/jpegpar.o $(B)/tiffw.o $(B)/tiff.o $(B)/surfcomp.o -o $@ $(LDLIBS)
+$(B)/test_sheetcut: tests/test_sheetcut.c $(B)/sheetcut.o $(B)/tfx.o $(B)/imgops.o $(B)/jpegpar.o $(B)/tiffw.o $(B)/tiff.o $(B)/surfcomp.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_sheetcut.c $(B)/sheetcut.o $(B)/tfx.o $(B)/imgops.o $(B)/jpegpar.o $(B)/tiffw.o $(B)/tiff.o $(B)/surfcomp.o -o $@ $(LDLIBS)
 test-all: $(B)/test_sheetcut
 test-all: $(B)/test_tfx
 $(B)/test_fit_join: tests/test_fit_join.c $(B)/fitjoin.o $(B)/fit.o $(B)/fit_emb.o $(B)/embz.o $(B)/z3w.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/coreline.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/nn.o $(B)/nn_fp8.o
@@ -323,7 +326,7 @@ test-all: $(B)/test_pairacc
 $(B)/test_robust: tests/test_robust.c $(B)/packmap.o $(B)/z3w.o $(B)/zarr3.o $(B)/store.o $(B)/json.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 test-all: $(B)/test_robust
-$(B)/test_render_stream: tests/test_render_stream.c $(B)/render.o $(B)/inkcompare.o $(B)/imgops.o $(B)/tiff.o $(B)/tiffw.o $(B)/z3w.o $(B)/zarr3.o $(B)/store.o $(B)/json.o
+$(B)/test_render_stream: tests/test_render_stream.c $(B)/render.o $(B)/inkcompare.o $(B)/imgops.o $(B)/jpegpar.o $(B)/tiff.o $(B)/tiffw.o $(B)/z3w.o $(B)/zarr3.o $(B)/store.o $(B)/json.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
 test-all: $(B)/test_render_stream
 $(B)/test_tiffw: tests/test_tiffw.c $(B)/tiffw.o $(B)/tiff.o
@@ -363,17 +366,17 @@ $(B)/make_wind_fixture: tests/make_wind_fixture.c $(B)/z3w.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/make_wind_fixture.c $(B)/z3w.o -o $@ $(LDLIBS)
 $(B)/test_wind_sampler: tests/test_wind_sampler.c tests/make_wind_fixture.c src/sample.c src/*.h $(SAMPLE_TEST_OBJ)
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_wind_sampler.c $(SAMPLE_TEST_OBJ) -o $@ $(LDLIBS)
-$(B)/crush_render: tests/crush_render.c src/sample.c src/*.h $(SAMPLE_TEST_OBJ) $(B)/imgops.o $(B)/tiffw.o $(B)/tfx.o $(B)/surfcomp.o
-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/crush_render.c $(SAMPLE_TEST_OBJ) $(B)/imgops.o $(B)/tiffw.o $(B)/tfx.o $(B)/surfcomp.o -o $@ $(LDLIBS)
-$(B)/xscan_render: tests/xscan_render.c src/sample.c src/*.h $(SAMPLE_TEST_OBJ) $(B)/imgops.o $(B)/tiffw.o $(B)/tfx.o $(B)/surfcomp.o
-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/xscan_render.c $(SAMPLE_TEST_OBJ) $(B)/imgops.o $(B)/tiffw.o $(B)/tfx.o $(B)/surfcomp.o -o $@ $(LDLIBS)
+$(B)/crush_render: tests/crush_render.c src/sample.c src/*.h $(SAMPLE_TEST_OBJ) $(B)/imgops.o $(B)/jpegpar.o $(B)/tiffw.o $(B)/tfx.o $(B)/surfcomp.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/crush_render.c $(SAMPLE_TEST_OBJ) $(B)/imgops.o $(B)/jpegpar.o $(B)/tiffw.o $(B)/tfx.o $(B)/surfcomp.o -o $@ $(LDLIBS)
+$(B)/xscan_render: tests/xscan_render.c src/sample.c src/*.h $(SAMPLE_TEST_OBJ) $(B)/imgops.o $(B)/jpegpar.o $(B)/tiffw.o $(B)/tfx.o $(B)/surfcomp.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/xscan_render.c $(SAMPLE_TEST_OBJ) $(B)/imgops.o $(B)/jpegpar.o $(B)/tiffw.o $(B)/tfx.o $(B)/surfcomp.o -o $@ $(LDLIBS)
 
-$(B)/scrollaug_anim: tests/scrollaug_anim.c tests/gif_anim.h src/sample.c src/*.h $(SAMPLE_TEST_OBJ) $(B)/imgops.o $(B)/tiffw.o $(B)/tfx.o $(B)/surfcomp.o
-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/scrollaug_anim.c $(SAMPLE_TEST_OBJ) $(B)/imgops.o $(B)/tiffw.o $(B)/tfx.o $(B)/surfcomp.o -o $@ $(LDLIBS)
-$(B)/aug_render: tests/aug_render.c src/sample.c src/*.h $(SAMPLE_TEST_OBJ) $(B)/imgops.o $(B)/tiffw.o $(B)/tfx.o $(B)/surfcomp.o
-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/aug_render.c $(SAMPLE_TEST_OBJ) $(B)/imgops.o $(B)/tiffw.o $(B)/tfx.o $(B)/surfcomp.o -o $@ $(LDLIBS)
-$(B)/crush_anim: tests/crush_anim.c src/sample.c src/*.h $(SAMPLE_TEST_OBJ) $(B)/imgops.o $(B)/tiffw.o $(B)/tfx.o $(B)/surfcomp.o
-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/crush_anim.c $(SAMPLE_TEST_OBJ) $(B)/imgops.o $(B)/tiffw.o $(B)/tfx.o $(B)/surfcomp.o -o $@ $(LDLIBS)
+$(B)/scrollaug_anim: tests/scrollaug_anim.c tests/gif_anim.h src/sample.c src/*.h $(SAMPLE_TEST_OBJ) $(B)/imgops.o $(B)/jpegpar.o $(B)/tiffw.o $(B)/tfx.o $(B)/surfcomp.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/scrollaug_anim.c $(SAMPLE_TEST_OBJ) $(B)/imgops.o $(B)/jpegpar.o $(B)/tiffw.o $(B)/tfx.o $(B)/surfcomp.o -o $@ $(LDLIBS)
+$(B)/aug_render: tests/aug_render.c src/sample.c src/*.h $(SAMPLE_TEST_OBJ) $(B)/imgops.o $(B)/jpegpar.o $(B)/tiffw.o $(B)/tfx.o $(B)/surfcomp.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/aug_render.c $(SAMPLE_TEST_OBJ) $(B)/imgops.o $(B)/jpegpar.o $(B)/tiffw.o $(B)/tfx.o $(B)/surfcomp.o -o $@ $(LDLIBS)
+$(B)/crush_anim: tests/crush_anim.c src/sample.c src/*.h $(SAMPLE_TEST_OBJ) $(B)/imgops.o $(B)/jpegpar.o $(B)/tiffw.o $(B)/tfx.o $(B)/surfcomp.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/crush_anim.c $(SAMPLE_TEST_OBJ) $(B)/imgops.o $(B)/jpegpar.o $(B)/tiffw.o $(B)/tfx.o $(B)/surfcomp.o -o $@ $(LDLIBS)
 $(B)/test_scrollaug: tests/test_scrollaug.c tests/make_wind_fixture.c src/sample.c src/*.h $(SAMPLE_TEST_OBJ)
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_scrollaug.c $(SAMPLE_TEST_OBJ) -o $@ $(LDLIBS)
 $(B)/test_zcache: tests/test_zcache.c $(B)/zcache.o $(B)/zarr3.o $(B)/store.o $(B)/json.o $(B)/z3w.o $(B)/hf.o $(B)/zipr.o
@@ -561,6 +564,7 @@ test-all: $(B)/test_gpu_aug $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover 
 	./$(B)/test_tiffw
 	./$(B)/test_render_stream
 	./$(B)/test_imgops
+	./$(B)/test_jpegpar
 	./$(B)/test_tfx
 	./$(B)/test_sheetcut
 	./$(B)/test_dino_loss
