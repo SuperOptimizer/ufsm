@@ -458,7 +458,11 @@ int cmd_count_field(int argc, char **argv) {
     const int R = atoi(cf_opt(argc, argv, "--R", "10")), Rz = R > 0 ? atoi(cf_opt(argc, argv, "--Rz", cf_opt(argc, argv, "--R", "10"))) : 0;
     const int iters = atoi(cf_opt(argc, argv, "--iters", "400")), Qf = atoi(cf_opt(argc, argv, "--loop", "8")), Rm = atoi(cf_opt(argc, argv, "--model-R", "8")), wwc = atoi(cf_opt(argc, argv, "--wc", "1"));
     const double lamr = atof(cf_opt(argc, argv, "--lambda", "1e-7")), eps = atof(cf_opt(argc, argv, "--eps", "1e-3")), rmin_um = atof(cf_opt(argc, argv, "--rmin-um", "500"));
-    const double memgb = atof(cf_opt(argc, argv, "--mem-gb", "6"));
+    double memgb = atof(cf_opt(argc, argv, "--mem-gb", "6"));
+    {   /* the chunk budget never above 60% of what this process may still allocate (cgroup aware: pods, capped scopes) */
+        const double av = (double)ufsm_mem_available() / (1u << 30);
+        if (av > 0 && memgb > 0.6 * av) { fprintf(stderr, "count-field: --mem-gb %.1f lowered to %.1f (60%% of the %.1f GB available)\n", memgb, 0.6 * av, av); memgb = 0.6 * av; }
+    }
     /* --model-only 1 (with --model): no output fields (the out directory is not written), only the model; --model-stride K: its phase
        gauge (and the R 0 global gauge) from every K-th field chunk (a whole scroll: the gauge is smoothed over +-model-R solve cells) */
     const int mo = atoi(cf_opt(argc, argv, "--model-only", "0")), mstride = atoi(cf_opt(argc, argv, "--model-stride", "1"));

@@ -43,7 +43,7 @@ cg_min() {   # cg_min FILE: the smallest numeric first field of FILE over this c
 ncpu_cg() {   # floor(cpu.max quota / period), capped by the affinity count
   local n=$(nproc) p=$(cg_path) best= q per
   while :; do
-    read -r q per < /sys/fs/cgroup$p/cpu.max 2>/dev/null && [ "$q" != max ] && [ -n "$q" ] && {
+    [ -r /sys/fs/cgroup$p/cpu.max ] && read -r q per < /sys/fs/cgroup$p/cpu.max && [ "$q" != max ] && [ -n "$q" ] && {
       local c=$(( q / per )); [ $c -lt 1 ] && c=1; { [ -z "$best" ] || [ $c -lt $best ]; } && best=$c; }
     [ -z "$p" ] && break; p=${p%/*}
   done
@@ -52,7 +52,7 @@ NCPU=$(ncpu_cg); MEMMAX=$(cg_min memory.max)
 MEMGB=$(( ${MEMMAX:-$(awk '/MemTotal/ {print $2 * 1024}' /proc/meminfo)} >> 30 ))
 {
   echo "date $(date -u '+%F %T')Z host $(hostname)"
-  echo "nproc $(nproc) (host), cgroup $(cg_path) cpu.max: $(cat /sys/fs/cgroup$(cg_path)/cpu.max /sys/fs/cgroup/cpu.max 2>/dev/null | tr '\n' ' ') -> NCPU $NCPU"
+  echo "nproc $(nproc), cgroup $(cg_path) cpu.max: $(cat /sys/fs/cgroup$(cg_path)/cpu.max /sys/fs/cgroup/cpu.max 2>/dev/null | tr '\n' ' ') -> NCPU $NCPU"
   echo "memory.max ${MEMMAX:-none} -> MEMGB $MEMGB (free says $(awk '/MemTotal/ {print int($2 / 1048576)}' /proc/meminfo) GB)"
   nvidia-smi -L 2>&1 | sed 's/^/gpu /'
   nvidia-smi --query-gpu=driver_version,compute_cap --format=csv,noheader 2>&1 | sed 's/^/gpu driver, cc: /'

@@ -3667,7 +3667,9 @@ static int cmd_render(int argc, char **argv) {
             }
         }
         rewinddir(dd);
-        const double budget = atof(getenv("UFSM_RENDER_MEM") ? getenv("UFSM_RENDER_MEM") : "8") * (1u << 30);
+        double budget = atof(getenv("UFSM_RENDER_MEM") ? getenv("UFSM_RENDER_MEM") : "8") * (1u << 30);
+        { const double av = (double)ufsm_mem_available();   /* never above half of what this process may still allocate (cgroup aware) */
+          if (av > 0 && budget > 0.5 * av) { fprintf(stderr, "render: UFSM_RENDER_MEM lowered to %.1f GB (half of the %.1f GB available)\n", 0.5 * av / (1u << 30), av / (1u << 30)); budget = 0.5 * av; } }
         chunked = getenv("UFSM_RENDER_TILED") ? 0 : getenv("UFSM_RENDER_CHUNKED") ? 1 : 0;
         cbudget = budget;
         if (lo[0] <= hi[0] && lo[1] <= hi[1] && lo[2] <= hi[2]) {

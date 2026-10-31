@@ -38,6 +38,10 @@ int main(void) {
     put("cg/user.slice/run-1.scope/memory.current", "1073741824\n");
     assert(near(ufsm_cpu_quota(), 6.0)); assert(ufsm_ncpu() == (host < 6 ? host : 6));
     assert(ufsm_mem_limit() == 10737418240ull && ufsm_mem_available() == 9663676416ull);
+    /* page cache in memory.current is reclaimable: inactive_file fully, active_file half (current 9 GB = 1 GB anon + 8 GB file) */
+    put("cg/user.slice/run-1.scope/memory.current", "9663676416\n");
+    put("cg/user.slice/run-1.scope/memory.stat", "anon 1073741824\nfile 8589934592\nactive_file 4294967296\ninactive_file 4294967296\n");
+    assert(ufsm_mem_available() == 10737418240ull - (9663676416ull - 4294967296ull - 2147483648ull));
     /* 3. no limits: the host (meminfo) */
     setup("ufsm_test_sysinfo_none");
     put("proc/self/cgroup", "0::/\n"); put("cg/cpu.max", "max 100000\n"); put("cg/memory.max", "max\n");

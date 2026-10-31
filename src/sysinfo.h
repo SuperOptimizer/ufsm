@@ -3,7 +3,8 @@
    (256 on a pod whose cgroup cpu.max allows 13.6) and /proc/meminfo the host's RAM (1 TB vs a 62 GB memory.max).
    ufsm_ncpu: CPUs this process may use = min(sched affinity, floor(cgroup quota / period) over this cgroup, its ancestors and
    the container's root cgroup; v2 cpu.max or v1 cpu.cfs_quota_us); UFSM_NCPU overrides. ufsm_mem_limit: min(MemTotal,
-   memory.max along the same path). ufsm_mem_available: MemAvailable capped by every memory.max - memory.current.
+   memory.max along the same path). ufsm_mem_available: MemAvailable capped by every memory.max - memory.current
+   (+ reclaimable page cache: inactive file pages, half the active ones).
    UFSM_CGROUP_ROOT (default /sys/fs/cgroup) and UFSM_PROC_ROOT (default /proc) point the readers at a fake tree (tests).
    Header-only (static inline) so every object that picks a thread count links without an extra object. */
 #include <sched.h>
@@ -91,6 +92,13 @@ static inline void ufsm_cg_mem_fn(const char *d, void *ctx) {
     if (!m->lim || (size_t)mx < m->lim) m->lim = (size_t)mx;
     snprintf(p, sizeof p, "%s/memory.current", d);
     if (!ufsm_read_ll2(p, &cur, nullptr)) cur = 0;
+    /* memory.current includes the page cache, which the kernel reclaims before it OOM-kills: count inactive file pages as free and
+       half of the active ones (a cgroup full of cached CT shards would otherwise look full) */
+    snprintf(p, sizeof p, "%s/memory.stat", d);
+    FILE *f = fopen(p, "r");
+    if (f) { char k[64]; long long v, ia = 0, ac = 0;
+             while (fscanf(f, "%63s %lld", k, &v) == 2) { if (!strcmp(k, "inactive_file")) ia = v; else if (!strcmp(k, "active_file")) ac = v; }
+             fclose(f); const long long rec = ia + ac / 2; cur = cur > rec ? cur - rec : 0; }
     const size_t left = mx > cur ? (size_t)(mx - cur) : 0;
     if (left < m->avail) m->avail = left;
 }

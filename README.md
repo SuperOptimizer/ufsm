@@ -15,7 +15,14 @@ make ARCH=86             # Ampere (RTX 3090) into build86/: software MX-fp4 / fp
                          # (on by default there; UFSM_MX_EMU=0: fp8 / fp4 as bf16, 16-bit storage); PTX=1: compute_86 PTX
                          # only (build86p/), so a newer GPU runs the sm_86 code (tests); BDIR=build puts it in build/
 make VERIFY=1 test-all   # the suite alone (build-verify/: adds the bf16 / fp32 reference kernels)
+make doctor              # the toolchain the Makefile picked + `ufsm sysinfo` (real cgroup CPUs / RAM, GPUs / MIG, CUDA, disk)
 ```
+
+The Makefile finds its toolchain itself: the first of gcc / gcc-15 / gcc-14 that accepts `-std=c23` (HOSTCC=, CC= override),
+CUDA in /usr/local/cuda, else the newest /usr/local/cuda-*, else nvcc's prefix on PATH (CUDA= overrides), nvcc `-ccbin g++-N`
+for gcc-N, and `-lstdc++` in CUDALIBS (gcc-14 + CUDA 13.2 failed to link without it). Default thread counts follow the cgroup
+(`cpu.max` quota, affinity; `UFSM_NCPU` overrides), not nproc, and memory budgets (count-field `--mem-gb`, `UFSM_RENDER_MEM`)
+are lowered to what the cgroup still allows (src/sysinfo.h).
 
 `make test` builds the default `build/ufsm` plus the fixtures the Python CLI tests use, then runs `test-all` on the VERIFY=1
 build. Single tests: `make VERIFY=1 build-verify/test_strip && build-verify/test_strip`. The pipeline stages below have their
