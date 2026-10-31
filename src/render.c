@@ -439,7 +439,7 @@ static void *wr_decoder_gpu(void *arg) {
         /* the substreams outside want are never read (want covers every block's voxel box, depth + fill reach + 2 included) and keep whatever the
            slot held; UFSM_RENDER_GPU_POISON=1 (tests) fills them with 0xa5 first, so a sample outside want would show */
         if (want && R->poison && rgpu_zero(R->G, 2 * tid + cur, d)) { WR_GFAIL(); rgpu_release(R->G, d); break; }
-        const int rc = dev ? z3_read_sub_dev(T->z, o, n, stg, 1, want, d, &dm) : z3_read_sub(T->z, o, n, stg, 1, want);
+        const int rc = dev ? z3_read_sub_dev_lean(T->z, o, n, stg, 1, want, d, &dm) : z3_read_sub(T->z, o, n, stg, 1, want);
         { const double t1 = rnow(); atomic_fetch_add(&R->pt[1], (uint64_t)((t1 - tp) * 1e6)); tp = t1; }
         if (rc) { fprintf(stderr, "render: chunk read failed: %s\n", z3_error()); atomic_store(&R->fail, 1); rgpu_release(R->G, d); break; }
         int zero = 0;
