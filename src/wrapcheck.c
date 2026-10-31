@@ -28,6 +28,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <stdatomic.h>
 
 static const char *wc_opt(int argc, char **argv, const char *name, const char *dflt) {
     for (int i = 3; i + 1 < argc; i++) if (!strcmp(argv[i], name)) return argv[i + 1];
@@ -36,13 +37,15 @@ static const char *wc_opt(int argc, char **argv, const char *name, const char *d
 static int wc_idx(int argc, char **argv, const char *name) { for (int i = 3; i < argc; i++) if (!strcmp(argv[i], name)) return i; return -1; }
 static double wc_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + 1e-9 * t.tv_nsec; }
 
-typedef struct { int k; float z, r, gapn, rct, rnet, gtq; uint8_t npk; int8_t gt; } wc_int;   /* the interval from wrap k to k + 1 on a ray; gtq the GT turns, gt their class (< 0.5: 0, < 1.5: 1, 2; < -0.25: -1; -128 none) */
+typedef struct { int k; float z, r, gapn, rct, rnet, gtq, tph, tdn, tref; uint8_t npk; int8_t gt; } wc_int;   /* tph / tdn / tref: the network phase turns, density turns (integral of |n.r| / sp) and --ref model turns between the two crossings (NAN: none) */   /* the interval from wrap k to k + 1 on a ray; gtq the GT turns, gt their class (< 0.5: 0, < 1.5: 1, 2; < -0.25: -1; -128 none) */
 
 typedef struct {
     const fit_set *fs; const fit_model *m;
     double zl, step, um, h, F, cf, ws; int dirv;
     /* fields row (cells), offset of the model box in the fields box (native) */
-    const uint8_t *w, *sp; int FH, FW; double fo[2];
+    const uint8_t *w, *sp, *pc, *ps, *tyy, *txx, *tyx; int FH, FW; double fo[2];
+    const fit_set *ref; double roff[3];   /* --ref: its box-local = ours + roff */
+    _Atomic long long nmat, nconf;   /* material samples, those with a phase (confidence >= 1/8) */
     /* CT plane (float, CT voxels), its origin (CT voxels, global) */
     const float *ct; int64_t co[2], cn[2];
     /* codes plane, its origin (label voxels, global) */
@@ -76,14 +79,20 @@ static void wc_rays(void *ctx, int a0, int a1, int t) {
         const int n = (int)(rmax / st) + 1;
         float *W = malloc(sizeof(float) * n), *C = malloc(sizeof(float) * n), *Cs = malloc(sizeof(float) * n), *spn = malloc(sizeof(float) * n);
         uint8_t *mat = calloc(n, 1); short *q = calloc(n, sizeof(short));
+        float *ph = malloc(sizeof(float) * n), *dn = malloc(sizeof(float) * n), *Wr = malloc(sizeof(float) * n);
+        long long lm = 0, lc = 0;
         for (int i = 0; i < n; i++) {
             const double r = i * st, y = cy + r * sn, x = cx + r * cs;
-            W[i] = NAN; C[i] = NAN; spn[i] = 0;
+            W[i] = NAN; C[i] = NAN; spn[i] = 0; ph[i] = NAN; dn[i] = NAN; Wr[i] = NAN;
+            if (J->ref && y >= 0 && x >= 0 && y < Y && x < X) Wr[i] = (float)fit_set_W(J->ref, J->zl + J->roff[0], y + J->roff[1], x + J->roff[2]);
             if (y < 0 || x < 0 || y >= Y || x >= X) continue;
             const int fy = (int)floor((y + J->fo[0]) / J->h), fx = (int)floor((x + J->fo[1]) / J->h);
             if (fy < 0 || fx < 0 || fy >= J->FH || fx >= J->FW) continue;
             const size_t ci = (size_t)fy * J->FW + fx;
             mat[i] = J->w[ci] != 0; spn[i] = J->sp[ci] * J->h / 8.0f;
+            { const int a = J->pc[ci] - 128, b = J->ps[ci] - 128; lm += mat[i]; if (a * a + b * b >= 16 * 16) { ph[i] = (float)(atan2(b, a) / (2 * M_PI)); lc += mat[i]; } }
+            if (spn[i] > 0) { const double nyy = J->tyy[ci] / 255.0, nxx = J->txx[ci] / 255.0, nyx = J->tyx[ci] / 255.0 - 0.5;
+                              const double nr2 = sn * sn * nyy + cs * cs * nxx + 2 * sn * cs * nyx; dn[i] = (float)(sqrt(fmax(0, nr2)) / spn[i]); }
             W[i] = (float)(J->ws * fit_set_W(J->fs, J->zl, y, x));
             if (J->ct) C[i] = (float)wc_ct(J, y, x);
             if (J->cd) q[i] = (short)wc_code(J, y, x);
@@ -137,7 +146,20 @@ static void wc_rays(void *ctx, int a0, int a1, int t) {
             const double ym = cy + rm * sn, xm = cx + rm * cs; double g[3];
             const double gl = fit_set_gradW(J->fs, J->zl, ym, xm, 0.5, g);
             const double cosr = gl > 0 ? fabs(g[1] * sn + g[2] * cs) / gl : 1;
-            wc_int v = {ck[c], (float)J->zl, (float)rm, (float)((rb - ra) * cosr * J->um), NAN, NAN, NAN, 0, -128};
+            wc_int v = {ck[c], (float)J->zl, (float)rm, (float)((rb - ra) * cosr * J->um), NAN, NAN, NAN, NAN, NAN, NAN, 0, -128};
+            {   /* network phase turns (wrapped steps summed, outward sign), density turns, ref turns between the crossings */
+                const int i0 = (int)ceil(ra / st), i1 = (int)floor(rb / st);
+                double sph = 0, sdn = 0; int nph = 0, ndn = 0, last = -1;
+                for (int i = i0; i <= i1 && i < n; i++) {
+                    if (dn[i] == dn[i]) { sdn += dn[i] * st; ndn++; }
+                    if (ph[i] == ph[i]) { if (last >= 0 && i - last <= 3) { double d = ph[i] - ph[last]; d -= floor(d + 0.5); sph += d; nph += i - last; } last = i; }
+                }
+                const int span = i1 - i0 + 1;
+                if (span > 0 && ndn >= 0.8 * span) v.tdn = (float)(sdn * (rb - ra) / (ndn * st));
+                if (span > 1 && nph >= 0.8 * (span - 1)) v.tph = (float)(sph * (rb - ra) / (nph * st));
+                if (J->ref) { const int ja = (int)floor(ra / st), jb = (int)ceil(rb / st);
+                              if (jb < n && Wr[ja] == Wr[ja] && Wr[jb] == Wr[jb]) { double d = Wr[jb] - Wr[ja]; v.tref = (float)(d * (rb - ra) / ((jb - ja) * st)); } }
+            }
             const int im = (int)lround(rm / st); const double spm = im < n ? spn[im] : 0;
             if (spm > 0) v.rnet = (float)((rb - ra) * cosr / spm);
             if (J->ct) {
@@ -156,7 +178,8 @@ static void wc_rays(void *ctx, int a0, int a1, int t) {
             o[no++] = v;
         }
         J->out[j] = o; J->nout[j] = no;
-        free(W); free(C); free(Cs); free(spn); free(mat); free(q); free(pk); free(cr); free(ck); free(ci); free(cu);
+        atomic_fetch_add(&J->nmat, lm); atomic_fetch_add(&J->nconf, lc);
+        free(W); free(C); free(Cs); free(spn); free(mat); free(q); free(pk); free(ph); free(dn); free(Wr); free(cr); free(ck); free(ci); free(cu);
     }
 }
 
@@ -166,13 +189,13 @@ static double wc_median(float *v, int n) { if (!n) return NAN; qsort(v, n, sizeo
 int cmd_wrap_check(int argc, char **argv) {
     if (argc < 4) {
         fprintf(stderr, "usage: ufsm wrap-check <model-or-set> <fields-dir> [--ct ROOT KEY --ct-um U] [--codes ROOT KEY] [--nz 16] [--nth 180] [--zr Z0,Z1]\n"
-                        "       [--sigma 1.2] [--prom 1] [--w-scale 1] [--dup 0.5] [--threads 16] [--cache DIR] [--tsv OUT]\n"
+                        "       [--sigma 1.2] [--prom 1] [--w-scale 1] [--dup 0.5] [--threads 16] [--cache DIR] [--tsv OUT] [--ref MODEL]\n"
                         "  per adjacent wrap pair along radial rays: normal gap, CT papyrus peaks between them, GT turns (--codes); per-wrap verdicts\n");
         return 2;
     }
     fit_set *fs = fit_set_load(argv[2]); if (!fs) { fprintf(stderr, "wrap-check: cannot load %s\n", argv[2]); return 1; }
     const fit_model *m = fs->global;
-    fit_fields_skip_planes(1 | 2 | 4); fit_fields_ct_planes(0);
+    fit_fields_skip_planes(1 | 2); fit_fields_ct_planes(0);   /* (the normals are read: density turns) */
     fit_fields_buf g; if (fit_fields_load(argv[3], 0, 0, 0, &g)) { fprintf(stderr, "wrap-check: cannot read the fields in %s\n", argv[3]); return 1; }
     const double h = g.h, um = g.um; long long forg[3]; int fsh[3]; for (int d = 0; d < 3; d++) { forg[d] = g.origin[d]; fsh[d] = g.shape[d]; } fit_fields_free(&g);
     if (m->h != h) { fprintf(stderr, "wrap-check: the model's cell h %g differs from the fields' %g\n", m->h, h); return 1; }
@@ -196,17 +219,21 @@ int cmd_wrap_check(int argc, char **argv) {
     }
     const double F = cz ? um / ctum : 1, step = fmin(1.0, fmax(0.25, 1 / F));
     const double morg[3] = {(double)m->origin[0], (double)m->origin[1], (double)m->origin[2]};
+    fit_set *rs = nullptr; double ro[3] = {0, 0, 0};
+    { const char *rp = wc_opt(argc, argv, "--ref", nullptr);
+      if (rp) { if (!(rs = fit_set_load(rp))) { fprintf(stderr, "wrap-check: cannot load --ref %s\n", rp); return 1; } for (int d = 0; d < 3; d++) ro[d] = (double)rs->global->origin[d]; } }
     printf("wrap-check: %s: box %dx%dx%d cells h %g (%.3f um), %d z levels in [%.0f, %.0f) x %d rays, step %.2f native%s%s\n", argv[2], m->D, m->H, m->W, h, um,
            nz, zr0, zr1, nth, step, cz ? ", CT" : "", qz ? ", GT codes" : "");
     const double t0 = wc_now();
     size_t ni = 0, capi = 1 << 16; wc_int *all = malloc(sizeof(wc_int) * capi);
+    long long tmat = 0, tconf = 0;
     const double Y = m->H * h, X = m->W * h;
     for (int zi = 0; zi < nz; zi++) {
         const double zl = floor(zr0 + (zi + 0.5) * (zr1 - zr0) / nz) + 0.5, zg = zl + morg[0];
         const int fz = (int)floor((zg - forg[0]) / h);
         if (fz < 0 || fz >= fsh[0]) continue;
         fit_fields_buf b; if (fit_fields_load(argv[3], fz, fz + 1, 1, &b)) { fprintf(stderr, "wrap-check: cannot load field row %d\n", fz); return 1; }
-        wc_job J = {.fs = fs, .m = m, .zl = zl, .step = step, .um = um, .h = h, .F = F, .cf = cf, .ws = wsc, .w = b.f.w, .sp = b.f.sp, .FH = fsh[1], .FW = fsh[2],
+        wc_job J = {.fs = fs, .m = m, .zl = zl, .step = step, .um = um, .h = h, .F = F, .cf = cf, .ws = wsc, .w = b.f.w, .sp = b.f.sp, .pc = b.f.pc, .ps = b.f.ps, .tyy = b.f.t[1], .txx = b.f.t[2], .tyx = b.f.t[5], .ref = rs, .roff = {morg[0] - ro[0], morg[1] - ro[1], morg[2] - ro[2]}, .FH = fsh[1], .FW = fsh[2],
                     .fo = {morg[1] - forg[1], morg[2] - forg[2]}, .morg = {morg[0], morg[1], morg[2]}, .nth = nth, .sigma = sigma, .prom = prom};
         float *ctp = nullptr; uint8_t *cdp = nullptr;
         if (cz) {   /* the CT rows covering native z [zg - 0.5, zg + 0.5), averaged; the box's y / x range + 2 */
@@ -238,6 +265,7 @@ int cmd_wrap_check(int argc, char **argv) {
         }
         J.out = calloc(nth, sizeof(wc_int *)); J.nout = calloc(nth, sizeof(int));
         fit_par(nth, wc_rays, &J);
+        tmat += J.nmat; tconf += J.nconf;
         for (int j = 0; j < nth; j++) {
             if (ni + J.nout[j] > capi) { while (ni + J.nout[j] > capi) capi *= 2; all = realloc(all, sizeof(wc_int) * capi); }
             memcpy(all + ni, J.out[j], sizeof(wc_int) * J.nout[j]); ni += J.nout[j]; free(J.out[j]);
@@ -267,6 +295,26 @@ int cmd_wrap_check(int argc, char **argv) {
                (double)bs[bi][4] / bs[bi][0], (double)bs[bi][5] / bs[bi][0]);
         if (qz) printf("  %6lld  %6.3f", bs[bi][2], bs[bi][2] ? (double)bs[bi][3] / 1000 / bs[bi][2] : 0);
         printf("\n");
+    }
+    {   /* sources of the count: per fitted turn, the network phase turns, density turns, --ref turns and CT peaks, per radius band (means over intervals with a value) */
+        double (*ss)[10] = calloc(nb + 1, sizeof *ss);   /* sum/n phase, density, ref, CT */
+        for (size_t i = 0; i < ni; i++) {
+            const wc_int *v = &all[i]; const int bi = (int)(v->r / band);
+            double *a = ss[bi], *t = ss[nb];
+            if (v->tph == v->tph) { a[0] += v->tph; a[1]++; t[0] += v->tph; t[1]++; }
+            if (v->tdn == v->tdn) { a[2] += v->tdn; a[3]++; t[2] += v->tdn; t[3]++; }
+            if (v->tref == v->tref) { a[4] += v->tref; a[5]++; t[4] += v->tref; t[5]++; }
+            if (cz) { a[6] += v->npk; a[7]++; t[6] += v->npk; t[7]++; }
+            if (v->tph == v->tph) { a[8] += fabs(v->tph); t[8] += fabs(v->tph); }
+        }
+        printf("  network phase present (confidence >= 1/8) on %.3f of the material samples\n", tmat ? (double)tconf / tmat : 0);
+        printf("  count sources per fitted turn (phase: network phase turns, signed; density: integral |n.r| / sp; ref: --ref model turns; CT: peaks)\n  radius(mm)  phase  |phase|  density  ref     CT\n");
+        for (int bi = 0; bi <= nb; bi++) {
+            const double *a = ss[bi]; if (a[1] + a[3] < 20) continue;
+            if (bi < nb) printf("  %4.0f-%-4.0f", bi * band * um / 1000, (bi + 1) * band * um / 1000); else printf("  all      ");
+            printf("  %5.3f  %7.3f  %7.3f  %5.3f  %5.3f\n", a[1] ? a[0] / a[1] : NAN, a[1] ? a[8] / a[1] : NAN, a[3] ? a[2] / a[3] : NAN, a[5] ? a[4] / a[5] : NAN, a[7] ? a[6] / a[7] : NAN);
+        }
+        free(ss);
     }
     if (cz) {   /* per z level (the intervals are in z order) */
         printf("  z(native)  intervals  CTpeaks/turn  empty  2+%s\n", qz ? "  GT-n  GT/turn" : "");
@@ -323,6 +371,6 @@ int cmd_wrap_check(int argc, char **argv) {
     }
     if (cz) printf("wrap-check: verdicts: %d real, %d dup, %d merged (--dup %g)\n", nreal, ndup, nmrg, dup);
     if (tf) fclose(tf);
-    free(W); free(tmp); free(all); free(bs); fit_set_free(fs); if (cz) z3_close(cz); if (qz) z3_close(qz);
+    free(W); free(tmp); free(all); free(bs); fit_set_free(fs); if (rs) fit_set_free(rs); if (cz) z3_close(cz); if (qz) z3_close(qz);
     return 0;
 }
