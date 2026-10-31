@@ -34,7 +34,7 @@ static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t
 /* ---- the CT (or a label raster) through a cache of decoded chunks ---- */
 typedef struct {
     z3 *z; int64_t shape[3]; int cs[3]; int64_t g[3]; uint8_t **ch; uint32_t *stamp; _Atomic uint8_t *need; size_t nres, cap; uint32_t clock; int nt;
-    size_t ndec; double tdec, tup, tev;   /* fill: decode / device upload / eviction seconds */
+    size_t ndec; double tdec, tev;   /* UFSM_FACES_PROF: fill decode (+ device upload) / eviction seconds */
     fgpu *dev;   /* non-null: every decoded chunk mirrored on the GPU (faces_vol.gpu) */
     _Atomic uint32_t *needm; uint32_t *have;
     uint32_t *ever; _Atomic size_t nsub, nresub;   /* UFSM_FACES_PROF: substreams ever decoded per chunk; decoded, decoded again after eviction */
@@ -145,7 +145,7 @@ static int fcc_fill(void *ctx) {
     double tq = now_s(); fcd_job J = {c, todo, nt, 0, 0}; fc_par(fcc_decode, &J, c->nt); c->tdec += now_s() - tq; tq = now_s();
     c->nres += nnew; c->ndec += nt;
     if (atomic_load(&J.err)) { free(todo); fprintf(stderr, "faces: %s\n", z3_error()); return -1; }
-    free(todo); c->tup += now_s() - tq; tq = now_s();
+    free(todo); tq = now_s();
     while (c->nres > c->cap) {   /* least recently needed first, never this band's */
         uint32_t old = c->clock; for (size_t k = 0; k < ng; k++) if (c->ch[k] && c->stamp[k] < old) old = c->stamp[k];
         if (old == c->clock) break;
@@ -245,7 +245,6 @@ int cmd_faces(int argc, char **argv) {
     if (gi > 0) {
         if (gi + 2 >= argc || !(gum > 0)) { fprintf(stderr, "faces: --gt ROOT KEY --gt-um U\n"); return 2; }
         gz = z3_open(store_open(argv[gi + 1]), argv[gi + 2], cache); if (!gz || fcc_init(&gc, gz, o.nthreads, cache_mb)) { fprintf(stderr, "faces: --gt %s\n", z3_error()); return 1; }
-        if (getenv("UFSM_FACES_GTSUB") && fcc_sub(&gc)) { fprintf(stderr, "faces: out of memory\n"); return 1; }
     }
     axis ax; const char *umb = fopt(argc, argv, "--umb", nullptr); const double umbum = atof(fopt(argc, argv, "--umb-um", "0"));
     if (umb && (axis_load(&ax, umb) || !(umbum > 0))) { fprintf(stderr, "faces: --umb JSON (control_points) --umb-um U\n"); return 2; }
@@ -326,7 +325,7 @@ int cmd_faces(int argc, char **argv) {
         }
         if (getenv("UFSM_FACES_PROF")) {
             size_t np = 0, nb = 0; int ns = 0; if (cc.dev && fgpu_stats) fgpu_stats(cc.dev, &np, &nb, &ns);
-            fprintf(stderr, "faces prof: CT fill: decode %.2f (+%.2f) evict %.2f s, %zu substreams (%zu again); GT fill: decode %.2f s, %zu substreams (%zu again); gt %.2f s; gpu %s, %zu chunk uploads %.2f GB, %d device slots\n", cc.tdec, cc.tup, cc.tev, (size_t)cc.nsub, (size_t)cc.nresub, gz ? gc.tdec : 0.0, gz ? (size_t)gc.nsub : 0, gz ? (size_t)gc.nresub : 0, now_s() - tgt, cc.dev ? (fgpu_broken(cc.dev) ? "broken" : "on") : "off", np, nb / 1e9, ns);
+            fprintf(stderr, "faces prof: CT fill: decode+upload %.2f evict %.2f s, %zu substreams (%zu again); GT fill: decode %.2f s, %zu substreams (%zu again); gt %.2f s; gpu %s, %zu chunk uploads %.2f GB, %d device slots\n", cc.tdec, cc.tev, (size_t)cc.nsub, (size_t)cc.nresub, gz ? gc.tdec : 0.0, gz ? (size_t)gc.nsub : 0, gz ? (size_t)gc.nresub : 0, now_s() - tgt, cc.dev ? (fgpu_broken(cc.dev) ? "broken" : "on") : "off", np, nb / 1e9, ns);
         }
         const size_t nm1 = st.nv ? st.nv : 1, cn = st.ct_n ? st.ct_n : 1, np = st.nv - st.nfill ? st.nv - st.nfill : 1;
         char line[1200];
