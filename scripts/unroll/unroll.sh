@@ -22,14 +22,18 @@
 # whose done marker exists is skipped; partial stages resume (predict --resume parts, slab claims, per-wrap outputs).
 # DRY=1: print the plan (commands) without running anything. Runs from a copy of these scripts in $O/bin (edits never touch a run).
 # Env: U (ufsm), UR, TH (20), FIELDGPUS ("0 1"), FITGPUS ("0 1"), INKGPU (1), INKCMD, REFCMD, CK, INKCK, INKNAME, MINMEM, PERWRAP,
-#   TAG (output dir suffix), ITH / PTH (ink / fields predict threads), FACES, SPAR (4 per-wrap jobs), CLEAN (1: fields + slab fits deleted once the wraps exist), STRIPARGS / ZR / BOX (override scrolls.tsv).
+#   CTROOT / CTKEY (replace the table's CT root / key), TAG (output dir suffix), ITH / PTH (ink / fields predict threads), FACES, SPAR (4 per-wrap jobs), CLEAN (1: fields + slab fits deleted once the wraps exist), STRIPARGS / ZR / BOX (override scrolls.tsv).
 set -u
 S=${1:?usage: unroll.sh SCROLL}
 H=$(cd "$(dirname "$0")" && pwd)
 UR=${UR:-/vesuvius/ufsm/unroll}; O=$UR/$S${TAG:-}   # (TAG: e.g. a test crop beside the full run)
 U=${U:-/vesuvius/ufsm/unroll/bin/ufsm}
 CK=${CK:-/vesuvius/ufsm/paris4/ckpt/wind96-wk1-best.ckpt}; INKCK=${INKCK:-/vesuvius/ufsm/ink-ft/runs/ift3/snap/ift3-24000.ckpt}
-INKNAME=${INKNAME:-ift3-24000}; TH=${TH:-20}; MINMEM=${MINMEM:-40}; INKGPU=${INKGPU:-1}
+# host limits (cgroup-aware on pods): ufsm sysinfo --ncpu / --avail-gb when the binary has it, else nproc / /proc/meminfo
+ncpu() { local n; n=$($U sysinfo --ncpu 2> /dev/null) && [ "$n" -gt 0 ] 2> /dev/null && { echo $n; return; }; nproc; }
+availgb() { local g; g=$($U sysinfo --avail-gb 2> /dev/null) && [ "$g" -ge 0 ] 2> /dev/null && { echo $g; return; }
+            awk '/MemAvailable/ {print int($2 / 1048576)}' /proc/meminfo; }
+INKNAME=${INKNAME:-ift3-24000}; TH=${TH:-$(ncpu)}; [ "$TH" -gt 20 ] 2> /dev/null && [ -z "${TH_ALL:-}" ] && TH=20; MINMEM=${MINMEM:-40}; INKGPU=${INKGPU:-1}
 FIELDGPUS=${FIELDGPUS:-0 1}; FITGPUS=${FITGPUS:-0 1}; DRY=${DRY:-0}; I=64; OV=16
 PRIZE="PHerc0125 PHerc0175A PHerc0175B PHerc0191 PHerc0211 PHerc0257 PHerc0268 PHerc0306B PHerc0358 PHerc0483A PHerc0483B PHerc0490A PHerc0490B PHerc0800 PHerc0813 PHerc0826 PHerc0846A PHerc0846B PHerc1203 PHerc1218 PHerc1545"
 
@@ -39,6 +43,7 @@ REPO=${UNROLL_REPO:-$(cd $H/../.. && pwd)}
 [ -n "$row" ] || row=$(awk -F'\t' -v s=$S '$1 == s { print $0 "\t-\t-\t-" }' $REPO/scripts/corpus/list.tsv)
 [ -n "$row" ] || { echo "unroll: $S is in neither scrolls.tsv nor corpus/list.tsv"; exit 2; }
 IFS=$'\t' read -r _ R K UM LV AXS TBOX TZR TSTRIP <<< "$row"
+R=${CTROOT:-$R}; K=${CTKEY:-$K}   # (pods: the CT mirrored to local disk)
 LUM=$(awk -v u=$UM -v l=$LV 'BEGIN { printf "%.4g", u * 2 ^ l }')
 BOX=${BOX:-$TBOX}; ZR=${ZR:-$TZR}; STRIPARGS=${STRIPARGS:-$TSTRIP}; [ "$STRIPARGS" = - ] && STRIPARGS=
 F=$O/fields/wind96; REF=$O/ref-cf; INK=$O/ink/$INKNAME.zarr
@@ -55,7 +60,7 @@ STRIPRUN=$H/strip_run.sh; [ -e $STRIPRUN ] || STRIPRUN=$REPO/scripts/strip/strip
 log() { if [ "$DRY" = 1 ]; then echo "    log: $*"; else echo "$(date '+%F %T') $*" | tee -a $O/progress.log; fi; }
 stopped() { [ -e $O/STOP ]; }
 done_() { [ -e $O/state/$1.done ]; }
-memok() { [ "$DRY" = 1 ] && return 0; while [ $(awk '/MemAvailable/ {print int($2 / 1048576)}' /proc/meminfo) -lt $MINMEM ]; do sleep 30; done; }
+memok() { [ "$DRY" = 1 ] && return 0; while [ $(availgb) -lt $MINMEM ]; do sleep 30; done; }
 # X LOG CMD..: a command, nice 10, timed (/usr/bin/time -v appended to LOG); DRY: printed
 X() { local l=$1; shift; if [ "$DRY" = 1 ]; then echo "    $*  > $l"; return 0; fi
       /usr/bin/time -v nice -n 10 "$@" >> $l 2>&1; }
