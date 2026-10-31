@@ -13,7 +13,7 @@
 #   ref     -> fields: count-field --model-only (REFCMD overrides; CPU, TH threads)
 #   slabs   -> ref: snapped slab fits, one lane per GPU in FITGPUS ("0 1"); the INKGPU lane starts once the ink is done
 #   join    -> slabs: fit-join --ref ;  wraps -> join: ufsm wraps (.sfc, step 4, --zr from scrolls.tsv, --min-cm2, --col-r p90)
-#   strip   -> wraps: ufsm strip ($STRIPARGS) ; stripflat -> strip: strip-flatten (FLATX) ; stripimg -> stripflat + ink:
+#   strip   -> wraps: ufsm strip ($STRIPARGS) ; stripflat -> strip: strip-flatten (FLATX, default "--gpu 1"; FLATX= for the CPU) ; stripimg -> stripflat + ink:
 #           stripe renders + strip-mosaic (strip_run.sh)
 #   perwrap -> wraps + ink (PERWRAP=1): flatten (GPU) + render + ink-compare per wrap, largest first (p4full3.sh recipe)
 #   faces   -> perwrap (FACES=1): ufsm faces per flattened wrap
@@ -60,12 +60,12 @@ STRIPRUN=$H/strip_run.sh; [ -e $STRIPRUN ] || STRIPRUN=$REPO/scripts/strip/strip
 [ "$DRY" = 1 ] || mkdir -p $O/state $O/logs
 # the shared decoded-CT cache (src/zshm.c) for the render / faces / ink-compare stages: ZCACHE_GB (auto: 1/4 of the available RAM, at
 # most 30 GB; off on the laptop = WSL), admit 0.6 (P4 w137 / w138 re-renders: 47-54% hits, a render 32.8 -> 20.0 s). The cache file
-# is removed at the end of the run (also on STOP / failure). strip-mosaic: UFSM_JPEG_THREADS = cores / 8 (it encodes 8 stripes at once).
+# is removed at the end of the run (also on STOP / failure). strip-mosaic: UFSM_JPEG_THREADS = cores / 2 (it encodes up to 2 stripes at once, --stripe-jobs 2).
 if [ "${ZCACHE_GB:-auto}" = auto ]; then
   if grep -qi microsoft /proc/version 2> /dev/null; then ZCACHE_GB=0; else ZCACHE_GB=$(( $(availgb) / 4 )); [ $ZCACHE_GB -gt 30 ] && ZCACHE_GB=30; fi
 fi
 ZCPATH=${UFSM_ZCACHE_PATH:-/dev/shm/ufsm-zcache-$(id -u)}
-JPEGT=$(( $(ncpu) / 8 )); [ $JPEGT -lt 1 ] && JPEGT=1
+JPEGT=$(( $(ncpu) / 2 )); [ $JPEGT -lt 1 ] && JPEGT=1
 zcon() { export UFSM_ZCACHE_GB=$ZCACHE_GB UFSM_ZCACHE_ADMIT=${ZCACHE_ADMIT:-0.6}; }   # (called inside the stages' subshells)
 zcclean() { [ "$DRY" = 1 ] || [ "$ZCACHE_GB" = 0 ] || rm -f "$ZCPATH"; }
 [ "$DRY" = 1 ] || trap zcclean EXIT
@@ -110,9 +110,15 @@ prep() {
 }
 
 # --- fields: one predict per GPU on z parts (whole 1024-voxel multiples; the last part takes the rest) ---
+occlv() {   # --occupancy L for the fields: the first of levels LV+3, LV+2, LV+4 the CT has (local root or mirror URL); none: no flag
+  local l; for l in $((LV + 3)) $((LV + 2)) $((LV + 4)); do
+    case $R in http://*|https://*) curl -sfI $R/$K/$l/zarr.json > /dev/null && { echo "--occupancy $l"; return; };;
+                     *) [ -e $R/$K/$l/zarr.json ] && { echo "--occupancy $l"; return; };; esac
+  done
+}
 fpred() {   # fpred GPU BOX OUT
   X $O/logs/fields.log $U predict $CK $R $K $3.tmp --um $UM --level $LV --box $2 --window-z 384 --halo-z 64 --window 640 --halo 64 --shard 512 \
-    --grid-origin 0,0,0 --ema 1 --q 8 --threads ${PTH:-14} --gpu $1 --axis $O/axis.json --levels 1 --fit-zarr $3 --fit-h 2 --fit-q 8 --fit-q-phase 0 --no-out 1 &&
+    --grid-origin 0,0,0 --ema 1 --q 8 --threads ${PTH:-14} --gpu $1 --axis $O/axis.json --levels 1 --fit-zarr $3 --fit-h 2 --fit-q 8 --fit-q-phase 0 --no-out 1 $(occlv) &&
     { [ "$DRY" = 1 ] || { rm -rf $3.tmp; [ -e $3/fields.json ]; }; }
 }
 fields() {
@@ -204,7 +210,7 @@ wraps() {
   return 0
 }
 strip() { [ "$DRY" = 1 ] || rm -rf $O/strip/strip; X $O/logs/strip.log $U strip $O/wraps $O/strip/strip --threads $TH $STRIPARGS; }
-stripflat() { X $O/logs/stripflat.log $U strip-flatten $O/strip/strip --decim ${DECIM:-4} --threads $TH --flip-rows 1 --cg 60 --tol 3e-4 ${FLATX:-}; }
+stripflat() { X $O/logs/stripflat.log $U strip-flatten $O/strip/strip --decim ${DECIM:-4} --threads $TH --flip-rows 1 --cg 60 --tol 3e-4 ${FLATX---gpu 1}; }
 stripimg() {   # stripe renders + mosaic: strip_run.sh skips its strip / flatten stages (done here)
   [ "$DRY" = 1 ] && { echo "    UFSM_ZCACHE_GB=$ZCACHE_GB UFSM_JPEG_THREADS=$JPEGT U=$U CTR=$R CTK=$K/$LV INK=$INK INKK=$LUM bash $STRIPRUN $O/strip $O/wraps"; return 0; }
   UFSM_ZCACHE_GB=$ZCACHE_GB UFSM_ZCACHE_ADMIT=${ZCACHE_ADMIT:-0.6} UFSM_JPEG_THREADS=$JPEGT \
