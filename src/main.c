@@ -1263,7 +1263,7 @@ static int cmd_fit(int argc, char **argv) {
         const fit_pgate_cfg pg = {.mode = pgm == 2, .R = atoi(opt(argc, argv, "--pg-R", "6")), .lo = atof(opt(argc, argv, "--pg-lo", "0.3")), .hi = atof(opt(argc, argv, "--pg-hi", "0.6")),
                                   .rc = atof(opt(argc, argv, "--pg-conf", "0.5"))};
         const int D = fb.shape[0], H = fb.shape[1], W = fb.shape[2], na = (int)(D * fb.h) + 1; const size_t plane = (size_t)H * W, n = (size_t)D * plane;
-        const int BZ = 16, dev = use_stream && !fb.f.t[1];
+        const int BZ = 32, dev = use_stream && !fb.f.t[1];
         uint8_t *tb = dev ? malloc((size_t)3 * BZ * plane) : nullptr; double st[4] = {0}; int bad = dev && !tb;
         fit_set_dev *gd = c.cpu ? nullptr : fit_set_upload(refm);   /* (W_ref on the GPU; null: the CPU grid) */
         for (int z0 = 0; z0 < D && !bad; z0 += BZ) {
