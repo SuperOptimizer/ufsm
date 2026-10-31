@@ -139,13 +139,13 @@ int main(void) {
                 uint8_t *opc = malloc(sn), *ops = malloc(sn), *gt = malloc(sn), *dpc = malloc(sn), *dps = malloc(sn);
                 const fit_pgate_cfg pg = {.mode = 0, .R = 6, .lo = 0.3, .hi = 0.6, .rc = 0.5};
                 double st[4] = {0};
-                CHECK(!fit_phase_gate(&sb.f, 0, sb.f.cy, sb.f.cx, sna, R, cs.ref_off, &pg, opc, ops, gt, st), "phase gate (rotating)");
+                CHECK(!fit_phase_gate(&sb.f, 0, sb.f.cy, sb.f.cx, sna, R, nullptr, cs.ref_off, &pg, opc, ops, gt, st), "phase gate (rotating)");
                 size_t nm = 0, kept = 0; for (size_t i = 0; i < sn; i++) if (sb.f.w[i]) { nm++; kept += gt[i] == 255 && opc[i] == sb.f.pc[i] && ops[i] == sb.f.ps[i]; }
                 printf("phase gate: rotating phase: mean q %.3f, kept on %.4f of the material\n", st[3] ? st[2] / st[3] : 0, nm ? (double)kept / nm : 0);
                 CHECK(nm && (double)kept / nm >= 0.95, "phase gate: a rotating phase kept on only %.4f", nm ? (double)kept / nm : 0);
                 for (size_t i = 0; i < sn; i++) { dpc[i] = 230; dps[i] = 128; }   /* (confident, never rotating) */
                 fit_fields df = sb.f; df.pc = dpc; df.ps = dps; double st2[4] = {0};
-                CHECK(!fit_phase_gate(&df, 0, sb.f.cy, sb.f.cx, sna, R, cs.ref_off, &pg, dpc, dps, gt, st2), "phase gate (dead)");
+                CHECK(!fit_phase_gate(&df, 0, sb.f.cy, sb.f.cx, sna, R, nullptr, cs.ref_off, &pg, dpc, dps, gt, st2), "phase gate (dead)");
                 size_t ng = 0, near = 0;
                 for (size_t i = 0; i < sn; i++) {
                     if (!sb.f.w[i]) continue;

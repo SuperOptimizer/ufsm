@@ -1265,15 +1265,16 @@ static int cmd_fit(int argc, char **argv) {
         const int D = fb.shape[0], H = fb.shape[1], W = fb.shape[2], na = (int)(D * fb.h) + 1; const size_t plane = (size_t)H * W, n = (size_t)D * plane;
         const int BZ = 16, dev = use_stream && !fb.f.t[1];
         uint8_t *tb = dev ? malloc((size_t)3 * BZ * plane) : nullptr; double st[4] = {0}; int bad = dev && !tb;
+        fit_set_dev *gd = c.cpu ? nullptr : fit_set_upload(refm);   /* (W_ref on the GPU; null: the CPU grid) */
         for (int z0 = 0; z0 < D && !bad; z0 += BZ) {
             const int nz = z0 + BZ <= D ? BZ : D - z0; const size_t off = (size_t)z0 * plane;
             fit_fields blk = fb.f; blk.D = nz; blk.pc = fb.a[0] + off; blk.ps = fb.a[1] + off; blk.sp = fb.a[8] + off; blk.w = fb.a[9] + off;
             for (int k = 0; k < 6; k++) blk.t[k] = fb.f.t[k] ? fb.f.t[k] + off : nullptr;
             if (dev) { const int tk[3] = {1, 2, 5}; for (int q = 0; q < 3; q++) { nn_d2h(tb + (size_t)q * BZ * plane, fst.dfield + (size_t)(2 + tk[q]) * n + off, (size_t)nz * plane); blk.t[tk[q]] = tb + (size_t)q * BZ * plane; } }
-            if (fit_phase_gate(&blk, z0, fb.f.cy, fb.f.cx, na, refm, c.ref_off, &pg, fb.a[0] + off, fb.a[1] + off, nullptr, st)) bad = 1;
+            if (fit_phase_gate(&blk, z0, fb.f.cy, fb.f.cx, na, refm, gd, c.ref_off, &pg, fb.a[0] + off, fb.a[1] + off, nullptr, st)) bad = 1;
             if (!bad && dev) { nn_h2d(fst.dfield + off, fb.a[0] + off, (size_t)nz * plane); nn_h2d(fst.dfield + n + off, fb.a[1] + off, (size_t)nz * plane); }
         }
-        free(tb);
+        free(tb); if (gd) fit_set_dev_free(gd);
         if (bad) { fprintf(stderr, "fit: --phase-gate failed (memory / ref grid)\n"); return 1; }
         clock_gettime(CLOCK_MONOTONIC, &tg1);
         fprintf(stderr, "fit: phase gate (%s): mean rotation q %.3f, the ref's phase on %.3f of %.0f material cells (%.1f s)\n", pg.mode ? "ref everywhere" : "gated",

@@ -307,9 +307,9 @@ int fit_set_grid_cpu(const fit_set *s, const double o[3], const int64_t n[3], do
    not rotate with the density's sheets (crushed scrolls). mode 1: everywhere; R the box radius (cells) of the rotation ratio q, gate
    smoothstep(q, lo, hi), rc the ref phase's confidence. f a block of field rows (pc ps sp w t[1] t[2] t[5] read), zo its first row in the
    box, cy / cx / na the box's axis, ro the box's native origin minus the ref's; pc_out / ps_out may be f's own planes; gate optional;
-   st += {material cells, cells gated (< 0.5), sum q, n q}. Returns 0, -1 (memory / ref grid). */
+   st += {material cells, cells gated (< 0.5), sum q, n q}; gd (optional): the ref uploaded (fit_set_upload), W_ref on the GPU. Returns 0, -1 (memory / ref grid). */
 typedef struct { int mode, R; double lo, hi, rc; } fit_pgate_cfg;
-int fit_phase_gate(const fit_fields *f, int zo, const float *cy, const float *cx, int na, const fit_set *ref, const double ro[3], const fit_pgate_cfg *g,
+int fit_phase_gate(const fit_fields *f, int zo, const float *cy, const float *cx, int na, const fit_set *ref, fit_set_dev *gd, const double ro[3], const fit_pgate_cfg *g,
                    uint8_t *pc_out, uint8_t *ps_out, uint8_t *gate, double st[4]);
 void fit_set_threads(int n);   /* the CPU backend's / grid's thread count (0: all cores) */
 /* fn(ctx, a0, a1, t) on contiguous ranges of [0, n) over the fit threads (fit_set_threads / UFSM_FIT_THREADS / the cores, at most 64 and n);

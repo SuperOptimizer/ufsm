@@ -89,13 +89,13 @@ static void pg_rows(void *ctx, int z0, int z1, int t) {
     free(A); free(B); free(pa); free(pb);
 }
 
-int fit_phase_gate(const fit_fields *f, int zo, const float *cy, const float *cx, int na, const fit_set *ref, const double ro[3], const fit_pgate_cfg *g,
+int fit_phase_gate(const fit_fields *f, int zo, const float *cy, const float *cx, int na, const fit_set *ref, fit_set_dev *gd, const double ro[3], const fit_pgate_cfg *g,
                    uint8_t *pc_out, uint8_t *ps_out, uint8_t *gate, double st[4]) {
     const size_t n = (size_t)f->D * f->H * f->W;
     float *wref = malloc(n * sizeof(float)); if (!wref) return -1;
     const double o[3] = {zo * f->h + ro[0], ro[1], ro[2]};   /* (grid points o + (i + 0.5) h = the cell centres in the ref box) */
     const int64_t n3[3] = {f->D, f->H, f->W};
-    if (fit_set_grid_cpu(ref, o, n3, f->h, 0, nullptr, wref)) { free(wref); return -1; }
+    if (gd ? fit_set_grid(gd, ref, o, n3, f->h, 0, wref) : fit_set_grid_cpu(ref, o, n3, f->h, 0, nullptr, wref)) { free(wref); return -1; }
     pg_job J = {.f = f, .zo = zo, .cy = cy, .cx = cx, .na = na, .wref = wref, .g = g, .pc = pc_out, .ps = ps_out, .gate = gate};
     fit_par(f->D, pg_rows, &J);
     for (int t = 0; t < 64; t++) { st[0] += J.nmat[t]; st[1] += J.ngated[t]; st[2] += J.qsum[t]; st[3] += J.qn[t]; }
@@ -119,7 +119,7 @@ int cmd_phase_gate(int argc, char **argv) {
                               .hi = atof(pg_opt(argc, argv, "--hi", "0.6")), .rc = atof(pg_opt(argc, argv, "--ref-conf", "0.5"))};
     const double ro[3] = {(double)(g.origin[0] - ref->global->origin[0]), (double)(g.origin[1] - ref->global->origin[1]), (double)(g.origin[2] - ref->global->origin[2])};
     uint8_t *gate = calloc(n, 1); double st[4] = {0};
-    if (!gate || fit_phase_gate(&g.f, 0, g.cy, g.cx, (int)(g.shape[0] * g.h) + 1, ref, ro, &pc, g.a[0], g.a[1], gate, st)) { fprintf(stderr, "phase-gate: out of memory / ref grid failed\n"); return 1; }
+    if (!gate || fit_phase_gate(&g.f, 0, g.cy, g.cx, (int)(g.shape[0] * g.h) + 1, ref, nullptr, ro, &pc, g.a[0], g.a[1], gate, st)) { fprintf(stderr, "phase-gate: out of memory / ref grid failed\n"); return 1; }
     uint8_t *a10[10]; for (int k = 0; k < 10; k++) a10[k] = g.a[k];
     if (fit_fields_save(argv[3], (const long long[3]){g.origin[0], g.origin[1], g.origin[2]}, g.shape, g.h, g.um, a10, g.cy, g.cx, (int)(g.shape[0] * g.h) + 1)) { fprintf(stderr, "phase-gate: cannot write %s\n", argv[3]); return 1; }
     { char p[1400]; snprintf(p, sizeof p, "%s/gate.u8", argv[3]); FILE *fo = fopen(p, "wb"); if (fo) { fwrite(gate, 1, n, fo); fclose(fo); } }
