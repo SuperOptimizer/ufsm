@@ -559,6 +559,8 @@ typedef struct {   /* stripe rasterisation */
     int la, lb;     /* lattice columns */
     double u0, v0, os; int ow, oh;
     float *gu, *gv, *ox, *oy, *oz;
+    uint32_t *own; int pass;   /* pass 0: own[pixel] = the highest ticket (quad q, triangle t: 2 q + t + 1) covering it; pass 1: only that one writes
+                                  (the serial order's last writer: the same pixels on any thread count; before, threads raced on shared edges) */
 } rsj;
 static void k_rast(void *ctx, long lo, long hi) {
     rsj *R = ctx; const sflat *F = R->F; const int D = F->D, lw = F->lw, nc = R->nc;
@@ -574,6 +576,7 @@ static void k_rast(void *ctx, long lo, long hi) {
         if (nok == 4) { cand[0][0] = 0; cand[0][1] = 1; cand[0][2] = 3; cand[1][0] = 0; cand[1][1] = 3; cand[1][2] = 2; ncnd = 2; }
         else if (nok == 3) { static const int one[4][3] = {{1, 3, 2}, {0, 3, 2}, {0, 1, 3}, {0, 1, 2}}; for (int k = 0; k < 4; k++) if (!ok[k]) { memcpy(cand[0], one[k], sizeof cand[0]); ncnd = 1; } }
         for (int t = 0; t < ncnd; t++) {
+            const uint32_t tk = (uint32_t)(2 * q + t + 1);
             double U[3], V[3], P[3][3], GC[3], GR[3]; int bad = 0;
             for (int k = 0; k < 3; k++) {
                 const int v = cand[t][k]; const int c = LC[v][1] * D, r = LC[v][0] * D;
@@ -588,6 +591,11 @@ static void k_rast(void *ctx, long lo, long hi) {
             for (int y = y0 < 0 ? 0 : y0; y <= y1 && y < R->oh; y++) for (int x = x0 < 0 ? 0 : x0; x <= x1 && x < R->ow; x++) {
                 const double l1 = ((x - U[0]) * (V[2] - V[0]) - (y - V[0]) * (U[2] - U[0])) / det, l2 = ((U[1] - U[0]) * (y - V[0]) - (V[1] - V[0]) * (x - U[0])) / det, l0 = 1 - l1 - l2;
                 if (l0 < -1e-7 || l1 < -1e-7 || l2 < -1e-7) continue;
+                if (R->pass == 0) {   /* atomic max of the ticket */
+                    uint32_t *w = &R->own[(size_t)y * R->ow + x], cur = __atomic_load_n(w, __ATOMIC_RELAXED);
+                    while (cur < tk && !__atomic_compare_exchange_n(w, &cur, tk, true, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+                    continue;
+                }
                 const double L[3] = {l0, l1, l2}; double gc = 0, gr = 0, p[3] = {0, 0, 0};
                 for (int k = 0; k < 3; k++) { gc += L[k] * GC[k]; gr += L[k] * GR[k]; for (int d = 0; d < 3; d++) p[d] += L[k] * P[k][d]; }
                 /* the full-res grid's bilinear surface where its 4 corners are valid (as ufsm render samples a grid) */
@@ -602,6 +610,7 @@ static void k_rast(void *ctx, long lo, long hi) {
                     }
                 }
                 const size_t o = (size_t)y * R->ow + x;
+                if (R->pass == 1 && R->own[o] != tk) continue;
                 R->gu[o] = (float)gc; R->gv[o] = (float)gr; R->ox[o] = (float)p[0]; R->oy[o] = (float)p[1]; R->oz[o] = (float)p[2];
             }
         }
@@ -675,8 +684,11 @@ static void *ss_worker(void *arg) {
             for (int k = 0; k < 5 && ok; k++) { A[k] = malloc(on * 4); if (!A[k]) ok = 0; else for (size_t i = 0; i < on; i++) A[k][i] = -1.f; }
             if (!ok || st_read((st_strip *)&F->S, c0, nc, Q->nth, X, Y, Z)) ok = 0;
             if (ok) {
-                rsj R = {F, X, Y, Z, c0, nc, la, lb, u0, Q->vmin, ostep, ow, OH, A[0], A[1], A[2], A[3], A[4]};
-                spfor((long)(lb - la) * (F->lh - 1), Q->nth, k_rast, &R);
+                const long nq = (long)(lb - la) * (F->lh - 1);
+                rsj R = {F, X, Y, Z, c0, nc, la, lb, u0, Q->vmin, ostep, ow, OH, A[0], A[1], A[2], A[3], A[4], calloc(on, sizeof(uint32_t)), 0};
+                if (!R.own || 2 * nq + 2 > 0xffffffffL) ok = 0;
+                else { spfor(nq, Q->nth, k_rast, &R); R.pass = 1; spfor(nq, Q->nth, k_rast, &R); }
+                free(R.own);
             }
             free(X); free(Y); free(Z);
             if (ok) {
