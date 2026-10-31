@@ -87,7 +87,10 @@ Drivers (resumable per stage; `STOP` files; MemAvailable gates):
   optional per-wrap renders (`PERWRAP=1`) and faces (`FACES=1`), and the upload (`UPLOAD=1` only, never for prize-eligible
   scrolls). Settings per scroll (box, wraps `--zr`, strip flags) come from `scripts/unroll/scrolls.tsv`, else `scripts/corpus/list.tsv`.
   `state/<stage>.done` holds the wall time, CPU seconds and max RSS. `DRY=1` prints the plan; `touch $O/STOP` stops between stages.
-  Env: `U CK INKCK FIELDGPUS FITGPUS INKGPU BOX TH PTH ITH MINMEM CTROOT CTKEY TAG INKCMD REFCMD`.
+  The render, faces and ink-compare stages use the shared decoded-CT cache (`UFSM_ZCACHE_GB`, admit 0.6). Its size is `ZCACHE_GB`:
+  by default 1/4 of the available RAM, at most 30 GB (the desk 30; a 62 GB pod ~15), and off on the laptop. The run removes
+  `/dev/shm/ufsm-zcache-<uid>` when it ends, also on STOP. strip-mosaic gets `UFSM_JPEG_THREADS` = cores / 8.
+  Env: `U CK INKCK FIELDGPUS FITGPUS INKGPU BOX TH PTH ITH MINMEM CTROOT CTKEY TAG INKCMD REFCMD ZCACHE_GB ZCACHE_ADMIT`.
 - `scripts/corpus/`: the three-host pipelined corpus unroll (`common.sh` describes the split): `desk.sh` prep (mask box from
   scanprep, `ufsm axis` when there is no umbilicus), wind96 fields, repack, push; `laptop.sh` / `inklib.sh` ift3 ink over HTTP
   from the mirror (steps 2); `fd.sh` ref, snapped slab fits, join, wraps (steps 3-6); `desk.sh` then surf-stats, flatten and

@@ -22,7 +22,8 @@
 # whose done marker exists is skipped; partial stages resume (predict --resume parts, slab claims, per-wrap outputs).
 # DRY=1: print the plan (commands) without running anything. Runs from a copy of these scripts in $O/bin (edits never touch a run).
 # Env: U (ufsm), UR, TH (20), FIELDGPUS ("0 1"), FITGPUS ("0 1"), INKGPU (1), INKCMD, REFCMD, CK, INKCK, INKNAME, MINMEM, PERWRAP,
-#   CTROOT / CTKEY (replace the table's CT root / key), TAG (output dir suffix), ITH / PTH (ink / fields predict threads), FACES, SPAR (4 per-wrap jobs), CLEAN (1: fields + slab fits deleted once the wraps exist), STRIPARGS / ZR / BOX (override scrolls.tsv).
+#   CTROOT / CTKEY (replace the table's CT root / key), ZCACHE_GB (auto) / ZCACHE_ADMIT (0.6): the decoded-CT cache of the render stages,
+#   TAG (output dir suffix), ITH / PTH (ink / fields predict threads), FACES, SPAR (4 per-wrap jobs), CLEAN (1: fields + slab fits deleted once the wraps exist), STRIPARGS / ZR / BOX (override scrolls.tsv).
 set -u
 S=${1:?usage: unroll.sh SCROLL}
 H=$(cd "$(dirname "$0")" && pwd)
@@ -57,6 +58,17 @@ MKCROP=$H/mkcrop.sh; [ -e $MKCROP ] || MKCROP=$REPO/scripts/wbench/mkcrop.sh
 STRIPRUN=$H/strip_run.sh; [ -e $STRIPRUN ] || STRIPRUN=$REPO/scripts/strip/strip_run.sh
 
 [ "$DRY" = 1 ] || mkdir -p $O/state $O/logs
+# the shared decoded-CT cache (src/zshm.c) for the render / faces / ink-compare stages: ZCACHE_GB (auto: 1/4 of the available RAM, at
+# most 30 GB; off on the laptop = WSL), admit 0.6 (P4 w137 / w138 re-renders: 47-54% hits, a render 32.8 -> 20.0 s). The cache file
+# is removed at the end of the run (also on STOP / failure). strip-mosaic: UFSM_JPEG_THREADS = cores / 8 (it encodes 8 stripes at once).
+if [ "${ZCACHE_GB:-auto}" = auto ]; then
+  if grep -qi microsoft /proc/version 2> /dev/null; then ZCACHE_GB=0; else ZCACHE_GB=$(( $(availgb) / 4 )); [ $ZCACHE_GB -gt 30 ] && ZCACHE_GB=30; fi
+fi
+ZCPATH=${UFSM_ZCACHE_PATH:-/dev/shm/ufsm-zcache-$(id -u)}
+JPEGT=$(( $(ncpu) / 8 )); [ $JPEGT -lt 1 ] && JPEGT=1
+zcon() { export UFSM_ZCACHE_GB=$ZCACHE_GB UFSM_ZCACHE_ADMIT=${ZCACHE_ADMIT:-0.6}; }   # (called inside the stages' subshells)
+zcclean() { [ "$DRY" = 1 ] || [ "$ZCACHE_GB" = 0 ] || rm -f "$ZCPATH"; }
+[ "$DRY" = 1 ] || trap zcclean EXIT
 log() { if [ "$DRY" = 1 ]; then echo "    log: $*"; else echo "$(date '+%F %T') $*" | tee -a $O/progress.log; fi; }
 stopped() { [ -e $O/STOP ]; }
 done_() { [ -e $O/state/$1.done ]; }
@@ -194,13 +206,14 @@ wraps() {
 strip() { [ "$DRY" = 1 ] || rm -rf $O/strip/strip; X $O/logs/strip.log $U strip $O/wraps $O/strip/strip --threads $TH $STRIPARGS; }
 stripflat() { X $O/logs/stripflat.log $U strip-flatten $O/strip/strip --decim ${DECIM:-4} --threads $TH --flip-rows 1 --cg 60 --tol 3e-4 ${FLATX:-}; }
 stripimg() {   # stripe renders + mosaic: strip_run.sh skips its strip / flatten stages (done here)
-  [ "$DRY" = 1 ] && { echo "    U=$U CTR=$R CTK=$K/$LV INK=$INK INKK=$LUM bash $STRIPRUN $O/strip $O/wraps"; return 0; }
-  U=$U CTR=$R CTK=$K/$LV INK=$INK INKK=$LUM NT=$TH RENDER_NT=${RENDER_NT:-8} /usr/bin/time -v bash $STRIPRUN $O/strip $O/wraps >> $O/logs/stripimg.log 2>&1
+  [ "$DRY" = 1 ] && { echo "    UFSM_ZCACHE_GB=$ZCACHE_GB UFSM_JPEG_THREADS=$JPEGT U=$U CTR=$R CTK=$K/$LV INK=$INK INKK=$LUM bash $STRIPRUN $O/strip $O/wraps"; return 0; }
+  UFSM_ZCACHE_GB=$ZCACHE_GB UFSM_ZCACHE_ADMIT=${ZCACHE_ADMIT:-0.6} UFSM_JPEG_THREADS=$JPEGT \
+    U=$U CTR=$R CTK=$K/$LV INK=$INK INKK=$LUM NT=$TH RENDER_NT=${RENDER_NT:-8} /usr/bin/time -v bash $STRIPRUN $O/strip $O/wraps >> $O/logs/stripimg.log 2>&1
 }
 
 # --- per-wrap renders (p4full3.sh) and faces ---
-pw_one() {   # pw_one WRAP GPU
-  local w=$1 gpu=$2 L=$O/logs/pw/$1 nv dc d=$O/r/$1
+pw_one() {   # pw_one WRAP GPU (a background subshell: the cache env stays in it)
+  zcon; local w=$1 gpu=$2 L=$O/logs/pw/$1 nv dc d=$O/r/$1
   nv=$(stat -c %s $O/wraps/$w.sfc); dc=$(awk -v n=$nv -v m=1500000 'BEGIN { d = 1; while (n / (d * d) > m) d++; print d }')
   if [ ! -e $O/flat/$w/x.tif ]; then
     nice -n 10 $U tifxyz-scale $O/wraps $O/orig 1 --wraps $w > $L.scale.log 2>&1 || return 1
@@ -228,7 +241,7 @@ perwrap() {
 }
 faces() {
   [ "$DRY" = 1 ] && { echo "    ufsm faces per flattened wrap ($O/flat) -> $O/faces (faces_p4e.sh recipe)"; return 0; }
-  mkdir -p $O/faces; local w
+  mkdir -p $O/faces; local w; zcon
   for w in $(ls $O/flat); do [ -e $O/flat/$w/x.tif ] || continue; [ -e $O/faces/out/${w}_recto ] && continue; stopped && break; memok
     X $O/logs/faces.log $U faces $O/flat $O/faces/out --wraps $w --ct $R $K/$LV --ct-um $LUM --threads ${RTH:-8} || echo "faces $w failed" >> $O/logs/faces.log
   done
