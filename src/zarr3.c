@@ -16,6 +16,7 @@
 #include "volcomp.h"
 #include "volcomp_fast.h"
 #include "zshm.h"
+#include "gpudec.h"
 #define XXH_INLINE_ALL
 #include <xxhash.h>
 
@@ -209,6 +210,22 @@ static void cache_path(const z3 *z, const char *skey, const char *item, char *bu
 /* io statistics: chunk reads served from the cache vs fetched from the store (atomic, process-wide) */
 static atomic_uint_fast64_t g_z3_cache_hits, g_z3_store_reads;
 void z3_shared_cache_stats(uint64_t *hits, uint64_t *misses, uint64_t *stored) { zshm_stats(hits, misses, stored); }
+
+/* src/nn_gpudec.cu (UFSM_GPU_DECODE=1); weak stubs keep CPU-only binaries linking */
+__attribute__((weak)) int gpudec_enabled(void) { return 0; }
+__attribute__((weak)) int gpudec_threads(int nthreads) { return nthreads; }
+__attribute__((weak)) int gpudec_decode(const gd_chunk *c, uint32_t mask, uint8_t *dst) { (void)c; (void)mask; (void)dst; return -1; }
+__attribute__((weak)) void gpudec_stats(uint64_t *subs, uint64_t *batches, uint64_t *redo, double *gpu_s) { if (subs) *subs = 0; if (batches) *batches = 0; if (redo) *redo = 0; if (gpu_s) *gpu_s = 0; }
+/* decode the substreams in need of a parsed lossy chunk: on the GPU when it is on (a substream the GPU cannot decode, or a device
+   error: the request on the CPU, the reference status and bytes), else volcomp_fast.h */
+static volcomp_status z3_decode_subs(const vf_parsed *p, uint32_t need, uint8_t *dec) {
+    if (gpudec_enabled()) {
+        gd_chunk g = {p->payload, p->tok_n, p->byp_n, p->off, p->step, {0}, VF_SCAN16};
+        for (int m = 0; m < 10; m++) g.dt[m] = (const uint32_t *)p->models[m].dt;
+        if (!p->strict && gpudec_decode(&g, need, dec) == 0) return VOLCOMP_OK;
+    }
+    return vfx_decode_subs(p, need, dec);
+}
 void z3_io_stats(uint64_t *cache_hits, uint64_t *store_reads) { *cache_hits = atomic_load(&g_z3_cache_hits); *store_reads = atomic_load(&g_z3_store_reads); }
 static uint8_t *cache_get(const z3 *z, const char *skey, const char *item, size_t *len) {
     if (!z->cache) return nullptr;
@@ -456,7 +473,7 @@ static int decode_into(const z3 *z, const uint8_t *enc, size_t n, uint8_t *dec, 
             st = VOLCOMP_OK;
             if (need) {
                 vf_parsed p; st = vf_parse(enc, n, &p);
-                if (st == VOLCOMP_OK) st = vfx_decode_subs(&p, need, dec);
+                if (st == VOLCOMP_OK) st = z3_decode_subs(&p, need, dec);
                 if (st == VOLCOMP_OK && zshm_on()) for (uint32_t s = 0; s < VF_NSUB; s++) if (need >> s & 1) zshm_put(hk.low64, hk.high64, s, dec);
             }
         } else if (sub && cv == VOLCOMP_CHUNK_VOXELS && vll_chunk_mode(enc, n, &mode) == VOLCOMP_OK && mode == VLL_MODE_CODED) {
@@ -501,6 +518,35 @@ int z3_prefetch_chunk(z3 *z, int64_t cz, int64_t cy, int64_t cx) {
     if (!b) return FAIL("prefetch allocation");
     if (store_read(z->s, skey, (int64_t)e.off, (int64_t)e.len, b) != (int64_t)e.len) { free(b); return FAIL("prefetch chunk %d of %s", ci, skey); }
     cache_put(z, skey, item, b, e.len); free(b);
+    return 1;
+}
+
+/* the encoded bytes of inner chunk (cz, cy, cx) (after zstd when the chain has it): 1 with *buf (malloc) / *n, 0 absent, -1 error */
+int z3_chunk_raw(z3 *z, int64_t cz, int64_t cy, int64_t cx, uint8_t **buf, size_t *n) {
+    *buf = nullptr; *n = 0;
+    int64_t sz = cz / z->cgrid[0], sy = cy / z->cgrid[1], sx = cx / z->cgrid[2];
+    int ci = (int)(((cz % z->cgrid[0]) * z->cgrid[1] + (cy % z->cgrid[1])) * z->cgrid[2] + (cx % z->cgrid[2]));
+    char skey[1200]; shard_key(z, sz, sy, sx, skey, sizeof skey);
+    uint8_t *b = nullptr; size_t len = 0;
+    if (!z->m.sharded) {
+        if (!(b = store_read_all(z->s, skey, &len))) return object_missing(z->s, skey) ? 0 : FAIL("read object %s", skey);
+    } else {
+        ientry *idx = malloc((size_t)z->nc * sizeof *idx);
+        if (!idx) return FAIL("index allocation");
+        int li = load_index(z, skey, idx);
+        if (li <= 0) { free(idx); return li; }
+        ientry e = idx[ci]; free(idx);
+        if ((e.off == UINT64_MAX && e.len == UINT64_MAX) || !e.len) return 0;
+        len = (size_t)e.len;
+        if (!(b = malloc(len)) || store_read(z->s, skey, (int64_t)e.off, (int64_t)len, b) != (int64_t)len) { free(b); return FAIL("read chunk %d of %s", ci, skey); }
+    }
+    if (z->m.zstd) {
+        const size_t cap = VOLCOMP_TYPED_ENCODE_BOUND; uint8_t *d = malloc(cap);
+        size_t r = d ? ZSTD_decompress(d, cap, b, len) : 0; free(b);
+        if (!d || ZSTD_isError(r)) { free(d); return FAIL("zstd chunk of %s", skey); }
+        b = d; len = r;
+    }
+    *buf = b; *n = len;
     return 1;
 }
 

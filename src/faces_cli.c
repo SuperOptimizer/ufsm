@@ -5,6 +5,7 @@
 #include "store.h"
 #include "tiffw.h"
 #include "zarr3.h"
+#include "gpudec.h"
 #include <dirent.h>
 #include <malloc.h>
 #include <math.h>
@@ -124,7 +125,7 @@ static int fcc_fill(void *ctx) {
         if (nt == cap) { cap = cap ? 2 * cap : 256; todo = realloc(todo, cap * sizeof *todo); }
         nnew += !c->ch[k]; todo[nt++] = (int64_t)k;
     }
-    fcd_job J = {c, todo, nt, 0, 0}; fc_par(fcc_decode, &J, c->nt);
+    fcd_job J = {c, todo, nt, 0, 0}; fc_par(fcc_decode, &J, gpudec_threads(c->nt));   /* GPU decoding: more requests in flight */
     free(todo); c->nres += nnew; c->ndec += nt;
     if (atomic_load(&J.err)) { fprintf(stderr, "faces: %s\n", z3_error()); return -1; }
     while (c->nres > c->cap) {   /* least recently needed first, never this band's */

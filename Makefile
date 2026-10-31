@@ -91,6 +91,8 @@ $(B)/nn_%.o: src/nn_%.cu | $(B)
 	$(NVCC) $(NVFLAGS) $(TYPEFLAGS) -Xfatbin=-compress-all -MMD -MP -c $< -o $@
 $(B)/nn.o: $(NNOBJ)
 	ld -r -o $@ $^
+# volcomp decoding on the GPU (src/nn_gpudec.cu) is byte-identical to the CPU decoder: no FMA contraction, no fast math
+$(B)/nn_gpudec.o: NVFLAGS = -O3 $(NVARCH) -DUFSM_ARCH=$(ARCH) -fmad=false -Xcompiler -fno-threadsafe-statics -Isrc
 # count-field on the GPU mirrors the CPU's rounding (src/nn_cf.cu): IEEE division / sqrt, no FMA contraction, no fast math
 $(B)/nn_cf.o: NVFLAGS = -O3 $(NVARCH) -DUFSM_ARCH=$(ARCH) -fmad=false -Xcompiler -fno-threadsafe-statics -Isrc
 # FP8 / FP4 block-scaled mma (kind::mxf8f6f4 / kind::mxf4) needs the arch-specific sm_120a target
@@ -345,6 +347,8 @@ $(B)/test_volcomp: tests/test_volcomp.c third_party/volcomp.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< -o $@ -lm
 $(B)/test_volcomp_fast: tests/test_volcomp_fast.c src/volcomp_fast.h src/zshm.h $(B)/zarr3.o $(B)/store.o $(B)/json.o $(B)/z3w.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(B)/zarr3.o $(B)/store.o $(B)/json.o $(B)/z3w.o -o $@ $(LDLIBS)
+$(B)/test_gpudec: tests/test_gpudec.c src/gpudec.h src/volcomp_fast.h $(B)/zarr3.o $(B)/store.o $(B)/json.o $(B)/z3w.o $(B)/nn_gpudec.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(B)/zarr3.o $(B)/store.o $(B)/json.o $(B)/z3w.o $(B)/nn_gpudec.o -o $@ $(LDLIBS) $(CUDALIBS)
 $(B)/test_edt: tests/test_edt.c $(B)/edt.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ -lpthread -lm
 $(B)/test_infer_mem: tests/test_infer_mem.c $(B)/unet.o $(B)/split.o $(B)/nn.o $(B)/nn_fp8.o
@@ -497,7 +501,7 @@ test-all: $(B)/test_wgrad_grid
 $(B):
 	mkdir -p $(B)
 
-test-all: $(B)/test_gpu_aug $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover $(B)/test_ct_augment $(B)/test_scan_augment $(B)/test_side $(B)/test_votes $(B)/test_wind $(B)/test_phase_check $(B)/test_fuse $(B)/test_raster $(B)/test_http_reader $(B)/test_wide_up_grad $(B)/test_wgrad_staging $(B)/test_stem_precision $(B)/test_gn_contract $(B)/test_sampler_safety $(B)/test_optimizer_owners $(B)/test_infer_buffers $(B)/test_recompute_live $(B)/test_share_enc_a1 $(B)/test_checkpoint_runtime $(B)/make_pipeline_fixture $(B)/test_checkpoint $(B)/test_eval $(B)/test_sample_ops $(B)/test_json $(B)/test_nn $(B)/test_unet $(B)/test_fused $(B)/test_formats $(B)/ufsm $(B)/test_mx $(B)/test_mx4 $(B)/test_grad_mx4 $(B)/test_rc $(B)/test_split $(B)/test_muon $(B)/test_muonc $(B)/test_gn_frozen $(B)/test_infer_mem $(B)/test_half $(B)/test_unwrap_targets $(B)/test_fit $(B)/test_surf $(B)/test_tiffw $(B)/test_edt $(B)/test_volcomp $(B)/test_volcomp_fast $(B)/test_typed_zarr $(B)/test_aug_preset $(B)/test_l0_norm $(B)/test_l0_slab $(B)/test_wind_sampler $(B)/test_crush $(B)/test_vwt_aug $(B)/test_zcache $(B)/test_scrollaug $(B)/test_zwin $(B)/test_l0_stream $(B)/test_phasepack
+test-all: $(B)/test_gpu_aug $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover $(B)/test_ct_augment $(B)/test_scan_augment $(B)/test_side $(B)/test_votes $(B)/test_wind $(B)/test_phase_check $(B)/test_fuse $(B)/test_raster $(B)/test_http_reader $(B)/test_wide_up_grad $(B)/test_wgrad_staging $(B)/test_stem_precision $(B)/test_gn_contract $(B)/test_sampler_safety $(B)/test_optimizer_owners $(B)/test_infer_buffers $(B)/test_recompute_live $(B)/test_share_enc_a1 $(B)/test_checkpoint_runtime $(B)/make_pipeline_fixture $(B)/test_checkpoint $(B)/test_eval $(B)/test_sample_ops $(B)/test_json $(B)/test_nn $(B)/test_unet $(B)/test_fused $(B)/test_formats $(B)/ufsm $(B)/test_mx $(B)/test_mx4 $(B)/test_grad_mx4 $(B)/test_rc $(B)/test_split $(B)/test_muon $(B)/test_muonc $(B)/test_gn_frozen $(B)/test_infer_mem $(B)/test_half $(B)/test_unwrap_targets $(B)/test_fit $(B)/test_surf $(B)/test_tiffw $(B)/test_edt $(B)/test_volcomp $(B)/test_volcomp_fast $(B)/test_gpudec $(B)/test_typed_zarr $(B)/test_aug_preset $(B)/test_l0_norm $(B)/test_l0_slab $(B)/test_wind_sampler $(B)/test_crush $(B)/test_vwt_aug $(B)/test_zcache $(B)/test_scrollaug $(B)/test_zwin $(B)/test_l0_stream $(B)/test_phasepack
 	./$(B)/test_target_erode
 	./$(B)/test_wind_sampler
 	./$(B)/test_crush
@@ -592,6 +596,7 @@ test-all: $(B)/test_gpu_aug $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover 
 	./$(B)/test_edt
 	./$(B)/test_volcomp
 	./$(B)/test_volcomp_fast
+	./$(B)/test_gpudec
 	./$(B)/test_typed_zarr
 	python3 tests/test_http_reader.py
 	./$(B)/test_checkpoint_runtime
