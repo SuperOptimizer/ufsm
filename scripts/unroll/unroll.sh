@@ -16,7 +16,7 @@
 #           bad-slab check (fit.log: "illegal memory", "loss 0.00000", no final loss line): refit on 1 lane, up to 3 tries, else fail
 #   join    -> slabs: fit-join --ref (refuses bad slabs) ; check -> join: wrap-check (wrapcheck.tsv verdicts; 0 CT peaks = fail)
 #   wraps   -> check: ufsm wraps (.sfc, step 4, --zr from scrolls.tsv, --min-cm2, --col-r p90)
-#   trim    -> wraps: the outer-end dup run (wrap-check) + near-empty outer wraps (on-papyrus <= PAPMIN 0.1) dropped: strip --last
+#   trim    -> wraps: the outer-end dup run (wrap-check) + near-empty outer wraps (on-papyrus <= PAPMIN 0.1; surf-stats) dropped: strip --last
 #           = the first kept id (state/strip.args, the dropped ids in progress.log); TRIM=0 or a --last in STRIPARGS: off
 #   strip   -> trim: ufsm strip ($STRIPARGS + --last) ; stripflat -> strip: strip-flatten (FLATX, default "--gpu 1"; FLATX= for the CPU) ;
 #   stripimg -> stripflat + ink: stretch from the 3 middle stripes, filled stripe renders (FILLX) + strip-mosaic img_fill (rgb) and
@@ -68,8 +68,10 @@ REFILL=$H/strip_refill.sh; [ -e $REFILL ] || REFILL=$REPO/scripts/strip/strip_re
 # the shared decoded-CT cache (src/zshm.c) for the render / faces / ink-compare stages: ZCACHE_GB (auto: 1/4 of the available RAM, at
 # most 30 GB; off on the laptop = WSL), admit 0.6 (P4 w137 / w138 re-renders: 47-54% hits, a render 32.8 -> 20.0 s). The cache file
 # is removed at the end of the run (also on STOP / failure). strip-mosaic: UFSM_JPEG_THREADS = cores / 2 (it encodes up to 2 stripes at once, --stripe-jobs 2).
+# auto = OFF when the host has a CUDA device: the renders run on the GPU (GPU volcomp decode), and with the cache on they decode on the
+# CPU instead (0490B stripe ws021: 12.0 s / 4.2 GB RSS without, 25.0 s / 29 GB with; same bytes; stripes are decoded about once anyway)
 if [ "${ZCACHE_GB:-auto}" = auto ]; then
-  if grep -qi microsoft /proc/version 2> /dev/null; then ZCACHE_GB=0; else ZCACHE_GB=$(( $(availgb) / 4 )); [ $ZCACHE_GB -gt 30 ] && ZCACHE_GB=30; fi
+  if grep -qi microsoft /proc/version 2> /dev/null || $U sysinfo 2> /dev/null | grep -q '^gpu [0-9]'; then ZCACHE_GB=0; else ZCACHE_GB=$(( $(availgb) / 4 )); [ $ZCACHE_GB -gt 30 ] && ZCACHE_GB=30; fi
 fi
 ZCPATH=${UFSM_ZCACHE_PATH:-/dev/shm/ufsm-zcache-$(id -u)}
 JPEGT=$(( $(ncpu) / 2 )); [ $JPEGT -lt 1 ] && JPEGT=1
@@ -204,14 +206,17 @@ lane() {   # lane GPU
     # FIT_MANAGED=1 (the last refit try of a failed slab) puts the fields in managed memory (fit picks it itself when they leave too little
     # device headroom since 6126e23; this is the fallback)
     local man=${FIT_MANAGED:-0}
-    env UFSM_FIT_THREADS=${FTHREADS:-10} $([ "$man" = 1 ] && echo UFSM_FIT_MANAGED=1) /usr/bin/time -v nice -n 5 $U fit $d/f --gpu $g --out $d/fit --dir $dir --ref-model $REF --ref-snap 1 --uw-repair 0 ${FITX:-} > $d/fit.log 2>&1; rc=$?
+    env UFSM_FIT_THREADS=$FTH_LANE $([ "$man" = 1 ] && echo UFSM_FIT_MANAGED=1) /usr/bin/time -v nice -n 5 $U fit $d/f --gpu $g --out $d/fit --dir $dir --ref-model $REF --ref-snap 1 --uw-repair 0 ${FITX:-} > $d/fit.log 2>&1; rc=$?
     echo "$s $c0..$c1 rc $rc gpu $g $(( $(date +%s) - t0 ))s$([ "$man" = 1 ] && echo " managed")" >> $O/slabs.txt
     if [ $rc = 0 ]; then touch $d/done; elif grep -q "no data for the prior" $d/fit.log; then touch $d/empty $d/done; fi
     rm -rf $d/f; exec 9>&-
   done
 }
 slabs() {
-  local g pids=()
+  local g pids=() ng
+  # fit threads per lane: the host's CPUs over the lanes (fits are thread-count independent: 0490B s020/s021 models equal at 10 / 20;
+  # 1 lane 10 -> 20 threads: 8 slabs 163 -> 150 s; 2 lanes per GPU with the GPU lock: 156 s, not used)
+  ng=$(echo $FITGPUS | wc -w); FTH_LANE=${FTHREADS:-$(( $(ncpu) / (ng > 0 ? ng : 1) ))}; [ $FTH_LANE -lt 2 ] && FTH_LANE=2
   for g in $FITGPUS; do
     if [ "$g" = "$INKGPU" ] && ! done_ ink; then { [ "$DRY" = 1 ] && echo "    (GPU $g lane starts once the ink is done or failed)" || while ! done_ ink && ! stopped && [ ! -e $O/state/ink.failed ]; do sleep 30; done; lane $g; } &
     else lane $g & fi; pids+=($!)
@@ -288,11 +293,12 @@ trim() {
       while [ $k -lt ${#ids[@]} ] && { [ ${ids[$k]} -gt $top ] || [ "${V[${ids[$k]}]:-}" = dup ]; }; do dropped+=" ${ids[$k]}"; k=$((k + 1)); done
       log "trim: outer-end dup run (wrap-check verdicts) + every wrap above it: $(echo $dropped | wc -w) wraps"
     fi
-    # (3) the near-empty outer tail: on-papyrus <= PAPMIN, computed 16 wraps at a time from the top
-    declare -A P; : > $pap
+    # (3) the near-empty outer tail: on-papyrus <= PAPMIN, computed from the top in batches of 1, 4, then 16 wraps (usually the first
+    # wrap below the dup run decides: one surf-stats of one wrap, ~5 s instead of ~65 s for 16 outer wraps on 0490B)
+    declare -A P; : > $pap; local nb=1
     while [ $k -lt ${#ids[@]} ]; do
       i=${ids[$k]}
-      if [ -z "${P[$i]:-}" ]; then batch=("${ids[@]:$k:16}"); while read -r a b; do P[$a]=$b; echo "$a $b" >> $pap; done < <(onpap "${batch[@]}"); [ -n "${P[$i]:-}" ] || P[$i]=0; fi
+      if [ -z "${P[$i]:-}" ]; then batch=("${ids[@]:$k:$nb}"); nb=$(( nb < 16 ? nb * 4 : 16 )); while read -r a b; do P[$a]=$b; echo "$a $b" >> $pap; done < <(onpap "${batch[@]}"); [ -n "${P[$i]:-}" ] || P[$i]=0; fi
       awk -v p=${P[$i]} -v m=${PAPMIN:-0.1} 'BEGIN { exit !(p <= m) }' || break
       dropped+=" $i"; k=$((k + 1))
     done
@@ -328,7 +334,9 @@ stripimg() {
     nice -n 10 $U strip-mosaic $ST/strip/flat $RF $ST/img_fill --stretch-only 1 --threads 3 2> $ST/logs/stretch.log | awk '/^stretch/ {print $2}' > $ST/stretch.txt
     [ -s $ST/stretch.txt ] || { log "stripimg: no stretch (logs in $ST/logs)"; return 1; }; log "stripimg: stretch $(cat $ST/stretch.txt)"
   fi
-  env $E U=$U CTR=$R CTK=$K/$LV INK=$INK INKK=$LUM RENDER_NT=${RENDER_NT:-$TH} MOS_NT=${MOS_NT:-4} MAXR=${MAXR:-6} MEMGB=${RMEMGB:-0} \
+  # RJOBS: 2 stripe renders at once when >= 64 GB is available (0490B: 394 -> 355 s, 6.7 -> 18.4 GB RSS, same images), else 1
+  local rj=${RJOBS:-$([ $(availgb) -ge 64 ] && echo 2 || echo 1)}
+  env $E U=$U CTR=$R CTK=$K/$LV INK=$INK INKK=$LUM RJOBS=$rj RENDER_NT=${RENDER_NT:-$TH} MOS_NT=${MOS_NT:-4} MAXR=${MAXR:-6} MEMGB=${RMEMGB:-0} \
     PAPMOS=$ST/img_pap PGAIN=${PGAIN:-1} PAPPX=${PAPPX:-8000} FILLX="$FILLX" /usr/bin/time -v bash $REFILL $ST >> $O/logs/stripimg.log 2>&1 &&
     [ -e $ST/img_fill/overview.jpg ] && log "stripimg: $(grep '^strip-mosaic: .* overview' $ST/logs/mosaic_fill.log | head -1)"
 }

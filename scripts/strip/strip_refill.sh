@@ -10,7 +10,7 @@
 # made by the same strip-mosaic process from the same reads (--papyrus-dir; PGAIN default 1, PAPPX 8000).
 # PAP=DIR: also a papyrus-look preview per stripe (ink-compare --papyrus, --max-px 8000) DIR/<s>.jpg, made before the mosaic takes the
 # render. MEMGB: each render waits until MemAvailable exceeds it (default 80: a stripe render is ~40 GB RSS, keep 40 GB for the rest).
-#   env: U, CTR CTK (CT root / key at 9.6 um), INK INKK, RENDER_NT, MOS_NT, MAXR, CTL, FILLX (render fill flags), STRETCH, PAP, MEMGB;
+#   env: U, CTR CTK (CT root / key at 9.6 um), INK INKK, RENDER_NT, RJOBS (concurrent renders, 1), MOS_NT, MAXR, CTL, FILLX (render fill flags), STRETCH, PAP, MEMGB;
 #   STOP: OUT/STOP_FILL
 set -u
 OUT=$1
@@ -43,13 +43,20 @@ nice -n 10 $U strip-mosaic $OUT/strip/flat $R $I --ct-level $CTL --threads $MOS_
 MPS=($!)
 clean() { :; }   # (the mosaic removes each render after use)
 alive() { local p; for p in "${MPS[@]}"; do kill -0 $p 2> /dev/null || return 1; done; return 0; }
+# RJOBS renders at once (default 1; each RENDER_NT threads): a stripe render uses ~13 of 20 threads and ~15% of the GPU (0490B), so two
+# overlap; the mosaic takes stripes in order by their .done markers, whichever render finishes first
+RP=(); RFAIL=0
+reap() { local q=() p; for p in "${RP[@]}"; do if kill -0 $p 2> /dev/null; then q+=($p); else wait $p || RFAIL=1; fi; done; RP=("${q[@]}"); }
 for s in "${S[@]}"; do
-  [ -e $OUT/STOP_FILL ] && { kill "${MPS[@]}"; exit 0; }
-  clean
-  while [ $(ls $R | grep -c '_ct\.tif$') -ge $MAXR ] && alive; do sleep 10; clean; done
+  [ -e $OUT/STOP_FILL ] && { kill "${MPS[@]}"; wait; exit 0; }
+  clean; reap
+  while { [ $(( $(ls $R | grep -c '_ct\.tif$') + ${#RP[@]} )) -ge $MAXR ] || [ ${#RP[@]} -ge ${RJOBS:-1} ]; } && alive && [ $RFAIL = 0 ]; do sleep 2; clean; reap; done
+  [ $RFAIL = 0 ] || { kill "${MPS[@]}"; wait; exit 1; }
   alive || break
-  rend $s || { kill "${MPS[@]}"; exit 1; }
+  if [ ${RJOBS:-1} -gt 1 ]; then rend $s & RP+=($!); else rend $s || { kill "${MPS[@]}"; exit 1; }; fi
 done
+for p in "${RP[@]}"; do wait $p || RFAIL=1; done
+[ $RFAIL = 0 ] || { kill "${MPS[@]}"; exit 1; }
 for p in "${MPS[@]}"; do while kill -0 $p 2> /dev/null; do sleep 10; clean; done; wait $p || { log "mosaic FAILED"; exit 1; }; done
 clean
 log "mosaic done: $(grep "^strip-mosaic: .* overview $I/" $OUT/logs/mosaic_fill.log | tail -1)"
