@@ -133,6 +133,43 @@ int main(void) {
                 CHECK(ns && (double)ok / ns >= 0.99, "fit --ref-snap: the ref's integer on %.4f < 0.99", ns ? (double)ok / ns : 0);
                 fit_free(ms);
             }
+            {   /* the phase gate (fit --phase-gate, src/phasegate.c): a phase that rotates with the sheets is kept; a dead (constant,
+                   confident) phase takes the ref's phase W_ref mod 1, and the snapped fit of the gated fields keeps the ref's integers */
+                const size_t sn = (size_t)sb.f.D * H * W; const int sna = (int)(sb.f.D * H8) + 1;
+                uint8_t *opc = malloc(sn), *ops = malloc(sn), *gt = malloc(sn), *dpc = malloc(sn), *dps = malloc(sn);
+                const fit_pgate_cfg pg = {.mode = 0, .R = 6, .lo = 0.3, .hi = 0.6, .rc = 0.5};
+                double st[4] = {0};
+                CHECK(!fit_phase_gate(&sb.f, 0, sb.f.cy, sb.f.cx, sna, R, cs.ref_off, &pg, opc, ops, gt, st), "phase gate (rotating)");
+                size_t nm = 0, kept = 0; for (size_t i = 0; i < sn; i++) if (sb.f.w[i]) { nm++; kept += gt[i] == 255 && opc[i] == sb.f.pc[i] && ops[i] == sb.f.ps[i]; }
+                printf("phase gate: rotating phase: mean q %.3f, kept on %.4f of the material\n", st[3] ? st[2] / st[3] : 0, nm ? (double)kept / nm : 0);
+                CHECK(nm && (double)kept / nm >= 0.95, "phase gate: a rotating phase kept on only %.4f", nm ? (double)kept / nm : 0);
+                for (size_t i = 0; i < sn; i++) { dpc[i] = 230; dps[i] = 128; }   /* (confident, never rotating) */
+                fit_fields df = sb.f; df.pc = dpc; df.ps = dps; double st2[4] = {0};
+                CHECK(!fit_phase_gate(&df, 0, sb.f.cy, sb.f.cx, sna, R, cs.ref_off, &pg, dpc, dps, gt, st2), "phase gate (dead)");
+                size_t ng = 0, near = 0;
+                for (size_t i = 0; i < sn; i++) {
+                    if (!sb.f.w[i]) continue;
+                    if (gt[i] == 0) ng++;
+                    const int z = (int)(i / ((size_t)H * W)), y = (int)((i / W) % H), x = (int)(i % W);
+                    double d = atan2(dps[i] - 128.0, dpc[i] - 128.0) / (2 * M_PI) - fit_set_W(R, (z + 0.5) * H8 + cs.ref_off[0], (y + 0.5) * H8, (x + 0.5) * H8); d -= floor(d + 0.5);
+                    near += fabs(d) < 0.02;
+                }
+                printf("phase gate: dead phase: the ref's phase on %.4f (gate 0 on %.4f) of the material\n", nm ? (double)near / nm : 0, nm ? (double)ng / nm : 0);
+                CHECK(nm && (double)near / nm >= 0.95 && (double)ng / nm >= 0.95, "phase gate: a dead phase replaced on only %.4f", nm ? (double)near / nm : 0);
+                fit_model *mg = fit_run(&df, &cs); CHECK(mg != nullptr, "fit --ref-snap on the gated fields");
+                if (mg) {
+                    size_t ns2 = 0, ok2 = 0;
+                    for (size_t i = 0; i < sn; i += 3) {
+                        if (!sb.f.w[i]) continue;
+                        const int z = (int)(i / ((size_t)H * W)), y = (int)((i / W) % H), x = (int)(i % W); const double pz = (z + 0.5) * H8, py = (y + 0.5) * H8, px = (x + 0.5) * H8;
+                        ok2 += lround(fit_W(mg, pz, py, px) - fit_set_W(R, pz + cs.ref_off[0], py, px)) == 0; ns2++;
+                    }
+                    printf("fit --ref-snap 1 on the gated dead phase: the ref's integer on %.4f\n", ns2 ? (double)ok2 / ns2 : 0);
+                    CHECK(ns2 && (double)ok2 / ns2 >= 0.99, "gated snap: the ref's integer on %.4f < 0.99", ns2 ? (double)ok2 / ns2 : 0);
+                    fit_free(mg);
+                }
+                free(opc); free(ops); free(gt); free(dpc); free(dps);
+            }
             fit_fields_free(&sb);
         }
         fit_set_free(S2); fit_set_free(R);
