@@ -18,7 +18,10 @@
 #   wraps   -> check: ufsm wraps (.sfc, step 4, --zr from scrolls.tsv, --min-cm2, --col-r p90)
 #   trim    -> wraps: the outer-end dup run (wrap-check) + near-empty outer wraps (on-papyrus <= PAPMIN 0.1; surf-stats) dropped: strip --last
 #           = the first kept id (state/strip.args, the dropped ids in progress.log); TRIM=0 or a --last in STRIPARGS: off
-#   strip   -> trim: ufsm strip ($STRIPARGS + --last) ; stripflat -> strip: strip-flatten (FLATX, default "--gpu 1"; FLATX= for the CPU) ;
+#   snap    -> trim (SNAP=1 default; SNAP=0 off): ufsm wrap-snap wraps -> wraps_snap: each wrap moved along its rays onto the sheets
+#           (smooth per-wrap offsets, order kept: never past half the gap to its neighbours, never into masked CT; SNAPT target, SNAPX
+#           extra flags); the strip and its renders then use wraps_snap. CLEAN runs after it (the phase / mix targets read the fields)
+#   strip   -> snap: ufsm strip ($STRIPARGS + --last) ; stripflat -> strip: strip-flatten (FLATX, default "--gpu 1"; FLATX= for the CPU) ;
 #   stripimg -> stripflat + ink: stretch from the 3 middle stripes, filled stripe renders (FILLX) + strip-mosaic img_fill (rgb) and
 #           img_pap (papyrus look) via scripts/strip/strip_refill.sh; renders UFSM_RENDER_GPU_MEM=4 (a fit may share the GPU), RGPU
 #   perwrap -> wraps + ink (PERWRAP=1): flatten (GPU) + render + ink-compare per wrap, largest first (p4full3.sh recipe)
@@ -273,7 +276,7 @@ wraps() {
 # end is the highest ids. (1) From the highest wrap-check verdict id walk down while the verdict is dup (the ref's outer over-count:
 # duplicate turns). (2) With no dup run, start from the highest wrap written instead. (3) Keep walking down while the wrap is near-empty:
 # on-papyrus (surf-stats --ct-only, CT >= 80 within +-15 um) <= PAPMIN (0.1). The first kept id becomes strip --last (state/strip.args);
-# the dropped ids are logged. STRIPARGS with its own --last, or TRIM=0, skips this. CLEAN=1 deletes the field planes + slab fits after it.
+# the dropped ids are logged. STRIPARGS with its own --last, or TRIM=0, skips this. CLEAN=1 deletes the field planes + slab fits after the snap stage.
 onpap() {   # onpap ID..: "id share" per wrap (surf-stats --per-wrap --ct-only on a link dir of those wraps)
   local d=$O/trim.tmp i; rm -rf $d; mkdir -p $d; for i in "$@"; do ln -s $O/wraps/$(printf 'w%03d' $i).sfc $d/; done
   nice -n 10 $U surf-stats $d --fields $F --ct $R $K/$LV --ct-um $LUM --ct-only 1 --per-wrap --threads $TH 2>> $O/logs/trim.log |
@@ -309,11 +312,28 @@ trim() {
     else log "trim: nothing dropped (top w$(printf %03d ${ids[0]}): verdict ${V[${ids[0]}]:-none}, on-papyrus ${P[${ids[0]}]:-?})"; fi
   fi
   echo "$args" > $O/state/strip.args
-  [ "${CLEAN:-1}" = 1 ] && { find $F -mindepth 1 -maxdepth 1 ! -name fields.json -exec rm -rf {} +; rm -rf $O/slabs/s???/fit; }   # (the joined model is standalone)
+  return 0
+}
+# snap: the wraps onto the sheets (src/wrapsnap.c): along their rays (z and the ray angle kept: the strip's columns / rows unchanged), each
+# within (1/2 - margin) of the radial gap to its neighbouring wraps (order kept, two wraps never on one sheet), a smooth offset field per
+# wrap fitted to the target's ridges (SNAPT: ct = CT ridges, phase / recto = the fields' sheet centres / recto, mix = CT ridges weighted
+# by the network phase), never into masked CT. Then CLEAN=1 deletes the field planes + slab fits (the joined model is standalone).
+wrapsdir() { if [ "${SNAP:-1}" = 1 ] && [ -e $O/state/snap.done ]; then echo $O/wraps_snap; else echo $O/wraps; fi; }
+snap() {
+  if [ "${SNAP:-1}" = 1 ]; then
+    local t=${SNAPT:-mix}
+    [ "$DRY" = 1 ] || rm -rf $O/wraps_snap
+    # (a run whose fields were already cleaned: the CT target)
+    [ "$DRY" != 1 ] && [ "$t" != ct ] && [ ! -e $F/pc/zarr.json ] && { log "snap: no field planes in $F (cleaned): --target ct"; t=ct; }
+    X $O/logs/snap.log $U wrap-snap $O/wraps $O/wraps_snap --target $t --axis $O/axis.json --axis-um $UM --ct $R $K/$LV --ct-um $LUM \
+      --fields $F --threads $TH ${SNAPX:-} || return 1
+    [ "$DRY" = 1 ] || log "snap: $(grep '^wrap-snap: solve' $O/logs/snap.log | tail -1)"
+  else log "snap: off (SNAP=0)"; fi
+  [ "$DRY" = 1 ] || { [ "${CLEAN:-1}" = 1 ] && { find $F -mindepth 1 -maxdepth 1 ! -name fields.json -exec rm -rf {} +; rm -rf $O/slabs/s???/fit; }; }
   return 0
 }
 strip() { local a=$STRIPARGS; [ -e $O/state/strip.args ] && a=$(cat $O/state/strip.args)
-          [ "$DRY" = 1 ] || rm -rf $O/strip/strip; X $O/logs/strip.log $U strip $O/wraps $O/strip/strip --threads $TH $a; }
+          [ "$DRY" = 1 ] || rm -rf $O/strip/strip; X $O/logs/strip.log $U strip $(wrapsdir) $O/strip/strip --threads $TH $a; }
 stripflat() { X $O/logs/stripflat.log $U strip-flatten $O/strip/strip --decim ${DECIM:-4} --threads $TH --flip-rows 1 --cg 60 --tol 3e-4 ${FLATX---gpu 1}; }
 # stripimg: the filled stripe renders + two mosaics (the pods' strip.sh recipe): a contrast stretch from the 3 middle stripes (rendered
 # with fill into strip/render_fill, reused), then scripts/strip/strip_refill.sh: every stripe rendered with FILLX, strip-mosaic img_fill
@@ -390,7 +410,7 @@ stage fields fields || exit 1
 ( stage ink ink || touch $O/state/ink.failed ) &
 INKP=$!
 [ "$DRY" = 1 ] && wait $INKP
-{ [ "${CTCAL:-0}" != 1 ] || stage ctcal ctcal; } && stage ref ref && stage slabs slabs && stage join join && stage check check && stage wraps wraps && stage trim trim ||
+{ [ "${CTCAL:-0}" != 1 ] || stage ctcal ctcal; } && stage ref ref && stage slabs slabs && stage join join && stage check check && stage wraps wraps && stage trim trim && stage snap snap ||
   { log "unroll: stopped before the strip"; wait; exit 1; }
 if [ "${PERWRAP:-0}" = 1 ]; then ( waitfor ink && stage perwrap perwrap && { [ "${FACES:-0}" = 1 ] && stage faces faces; true; } ) & PWP=$!; [ "$DRY" = 1 ] && wait $PWP; fi
 stage strip strip && stage stripflat stripflat && waitfor ink && stage stripimg stripimg || log "unroll: the strip stopped"
