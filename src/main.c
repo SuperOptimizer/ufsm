@@ -1170,6 +1170,8 @@ static int cmd_fit(int argc, char **argv) {
             if (c.verbose) fprintf(stderr, "fit: the fields of the previous sweep run reused\n");
         } else {
             if (g_fcache.valid) { fit_stream_free(&g_fcache.fst); fit_fields_free(&g_fcache.fb); g_fcache.valid = 0; }
+            /* (device room beside the fields: the ref models and, when the phase gate runs, its block of <= 16M cells (~22 B per cell) + the W_ref grid rows) */
+            g_fit_dev_reserve = *opt(argc, argv, "--ref-model", "") ? fit_set_disk_bytes(opt(argc, argv, "--ref-model", "")) + ((size_t)640 << 20) : 0;
             if (fit_fields_load_stream(dir, &fb, &fst, fps, nfp, fit_gpu_join)) { fprintf(stderr, "fit: cannot load the fields in %s\n", dir); return 1; }
             if (g_fit_sweep) {
                 snprintf(g_fcache.dir, sizeof g_fcache.dir, "%s", dir); g_fcache.kskip = kskip; g_fcache.kct = kct; g_fcache.nfp = nfp; memcpy(g_fcache.fps, fps, sizeof fps);
