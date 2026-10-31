@@ -43,6 +43,9 @@ int z3_read_sub(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int
 /* z3_read_sub of one whole aligned 128^3 chunk with UFSM_GPU_DECODE on: the GPU decodes lossy substreams straight into the device chunk
    dchunk (128^3, chunk layout, on the decoder's device; out keeps zeros there); *dev_mask = those substreams (0: everything went to out) */
 int z3_read_sub_dev(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads, uint32_t submask, uint8_t *dchunk, uint32_t *dev_mask);
+/* the same, but out holds only the substreams decoded on the host (want & ~*dev_mask; the rest of out is left as it was: no zeroing,
+   no copy of the device ones): for callers that upload just those (render --gpu) */
+int z3_read_sub_dev_lean(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads, uint32_t submask, uint8_t *dchunk, uint32_t *dev_mask);
 
 /* Shard-level presence: 1 if the shard object exists in the store, 0 if not, -1 on error. */
 int z3_shard_present(z3 *z, int64_t sz, int64_t sy, int64_t sx);

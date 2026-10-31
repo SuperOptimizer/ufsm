@@ -398,6 +398,15 @@ suite-bins: $(B)/test_render_stream
 $(B)/test_render_fill: tests/test_render_fill.c $(B)/render.o $(B)/inkcompare.o $(B)/imgops.o $(B)/jpegpar.o $(B)/tiff.o $(B)/tiffw.o $(B)/z3w.o $(B)/zarr3.o $(B)/store.o $(B)/json.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
 suite-bins: $(B)/test_render_fill
+# the renders on the GPU (nn_render.cu, gpudec device decode): the same tests, every chunked render through the GPU path; byte-identical, so no
+# fast math and no fused multiply-adds in this object
+$(B)/nn_render.o: NVFLAGS := -O3 $(NVARCH) -DUFSM_ARCH=$(ARCH) -fmad=false -Xcompiler -fno-threadsafe-statics -Isrc
+RGPU_OBJ = $(B)/render.o $(B)/inkcompare.o $(B)/imgops.o $(B)/jpegpar.o $(B)/tiff.o $(B)/tiffw.o $(B)/z3w.o $(B)/zarr3.o $(B)/store.o $(B)/json.o $(B)/nn_render.o $(B)/nn_gpudec.o
+$(B)/test_render_stream_gpu: tests/test_render_stream.c $(RGPU_OBJ)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DRENDER_GPU $^ -o $@ $(LDLIBS) $(CUDALIBS)
+$(B)/test_render_fill_gpu: tests/test_render_fill.c $(RGPU_OBJ)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DRENDER_GPU $^ -o $@ $(LDLIBS) $(CUDALIBS)
+suite-bins: $(B)/test_render_stream_gpu $(B)/test_render_fill_gpu
 $(B)/test_tiffw: tests/test_tiffw.c $(B)/tiffw.o $(B)/tiff.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
 $(B)/test_wind: tests/test_wind.c src/wind.h $(B)/wind.o

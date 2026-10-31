@@ -181,6 +181,8 @@ test_predict_det                               | gpu          |    11 | ./$B/tes
 test_strip_gpu                                 | gpu          |    10 | ./$B/test_strip_gpu
 test_faces_gpu                                 | gpu          |    10 | ./$B/test_faces_gpu
 test_render_fill                               |              |    10 | ./$B/test_render_fill
+test_render_stream_gpu                         | gpu          |    10 | ./$B/test_render_stream_gpu
+test_render_fill_gpu                           | gpu          |    12 | ./$B/test_render_fill_gpu
 test_jpegpar                                   |              |    10 | ./$B/test_jpegpar
 test_sysinfo                                   |              |     5 | ./$B/test_sysinfo
 test_volcomp_fast                              |              |    25 | ./$B/test_volcomp_fast

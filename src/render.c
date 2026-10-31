@@ -15,6 +15,7 @@
 #include "tiffw.h"
 #include "zarr3.h"
 #include "gpudec.h"
+#include "render_core.h"
 #include <dirent.h>
 #include <math.h>
 #include <pthread.h>
@@ -270,7 +271,33 @@ typedef struct {
     pthread_mutex_t mu; pthread_cond_t cv;
     size_t ready_prefix; uint32_t gdone; size_t resident, budget, peak; uint64_t ndec, nzero;
     _Atomic size_t dnext, bnext; _Atomic int fail;
+    struct rgpu *G; uint8_t **dp[2]; _Atomic int tid, gfail;   /* the GPU path: device chunk pointers per volume, decoder ids, a device failure */
+    _Atomic uint64_t pt[8]; _Atomic uint64_t nhost; int poison;   /* UFSM_RENDER_PROF (us): decoder budget wait, read, zero + upload; driver ready wait, kernel + copies, scatter */
 } wrend;
+
+/* ---- the GPU path (src/nn_render.cu, weak: CPU-only binaries link without it) ---- */
+typedef struct rgpu rgpu;
+size_t rgpu_free_mem(int dev, size_t *total) __attribute__((weak));
+rgpu *rgpu_open(int dev, size_t cv, size_t cap, size_t hcap, int nstg) __attribute__((weak));
+void rgpu_close(rgpu *G) __attribute__((weak));
+uint8_t *rgpu_stage(rgpu *G, int k) __attribute__((weak));
+uint8_t *rgpu_slot(rgpu *G, int *host) __attribute__((weak));
+void rgpu_release(rgpu *G, uint8_t *d) __attribute__((weak));
+int rgpu_zero(rgpu *G, int k, uint8_t *d) __attribute__((weak));
+int rgpu_upload(rgpu *G, int k, uint8_t *d, uint32_t mask, int box, int wait) __attribute__((weak));
+int rgpu_stage_sync(rgpu *G, int k) __attribute__((weak));
+int rgpu_setup(rgpu *G, int nv, const size_t nc[2], int ns, const float *const *X, const float *const *Y, const float *const *Z, int w, int h,
+               const uint8_t *const *vgrid, const int32_t *pxy, size_t nb, size_t bmax, int nimg) __attribute__((weak));
+int rgpu_ptrs(rgpu *G, int b, const uint64_t *keys, uint8_t *const *ptrs, size_t n) __attribute__((weak));
+int rgpu_launch(rgpu *G, int b, size_t kb, size_t ke, const rc_vol *V, const int *depth, const rc_fill *F, double gs, int ow, int oh) __attribute__((weak));
+int rgpu_wait(rgpu *G, int b, const uint8_t **hout) __attribute__((weak));
+void rgpu_stats(const rgpu *G, size_t *pool, size_t *hpool, double *kms, uint64_t *nlaunch, uint64_t *nput, uint64_t *bytes) __attribute__((weak));
+static int g_render_gpu = 0; static _Atomic int g_render_gpu_done, g_render_gpu_cpu;
+int render_gpu_count(void) { return atomic_load(&g_render_gpu_done); }       /* renders the GPU path completed (tests) */
+int render_gpu_fallbacks(void) { return atomic_load(&g_render_gpu_cpu); }   /* GPU renders redone on the CPU */
+void render_set_gpu(int on) { g_render_gpu = on; }
+int render_gpu_available(void) { return rgpu_open != nullptr; }
+static int rg_device(void) { const char *e = getenv("UFSM_GPU_DECODE_DEV"); return e ? atoi(e) : 0; }   /* gpudec's device: it writes into the slots */
 static void *wr_decoder(void *arg) {
     wrend *R = arg;
     for (size_t e; (e = atomic_fetch_add(&R->dnext, 1)) < R->ndl && !atomic_load(&R->fail);) {
@@ -299,48 +326,26 @@ static void *wr_decoder(void *arg) {
     pthread_mutex_lock(&R->mu); pthread_cond_broadcast(&R->cv); pthread_mutex_unlock(&R->mu);
     return nullptr;
 }
-static void wr_block(const wrend *R, const rblock *B) {
-    const int w = R->w, h = R->h; const double gs = R->gs;
-    const int py1 = B->py + RB < R->oh ? B->py + RB : R->oh, px1 = B->px + RB < R->ow ? B->px + RB : R->ow;
-    for (int si = 0; si < R->ns; si++) {
-    const float *A[3] = {R->Zs[si], R->Ys[si], R->Xs[si]}, *const Zg = R->Zs[si]; uint8_t *const *img = R->img + (size_t)si * R->nv;
-    for (int py = B->py; py < py1; py++) for (int px = B->px; px < px1; px++) {
-        const double gu = px / gs, gv = py / gs;
-        int c0 = (int)gu, r0 = (int)gv; if (c0 >= w - 1) c0 = w - 2; if (r0 >= h - 1) r0 = h - 2; if (c0 < 0 || r0 < 0) continue;
-        const double fu = gu - c0, fv = gv - r0;
-        const size_t i00 = (size_t)r0 * w + c0, i01 = i00 + 1, i10 = i00 + w, i11 = i10 + 1;
-        if (!(Zg[i00] >= 0 && Zg[i01] >= 0 && Zg[i10] >= 0 && Zg[i11] >= 0)) continue;
-        double P[3], du[3], dv[3];
-        for (int d = 0; d < 3; d++) {
-            const double a = A[d][i00], b = A[d][i01], c = A[d][i10], e = A[d][i11];
-            P[d] = (1 - fv) * ((1 - fu) * a + fu * b) + fv * ((1 - fu) * c + fu * e);
-            du[d] = (1 - fv) * (b - a) + fv * (e - c); dv[d] = (1 - fu) * (c - a) + fu * (e - b);
-        }
-        double N[3] = {du[1] * dv[2] - du[2] * dv[1], du[2] * dv[0] - du[0] * dv[2], du[0] * dv[1] - du[1] * dv[0]};
-        const double nl = sqrt(N[0] * N[0] + N[1] * N[1] + N[2] * N[2]); if (nl < 1e-12) continue;
-        for (int d = 0; d < 3; d++) N[d] /= nl;
-        if (R->F) {   /* --fill: void CT on the surface -> the nearest papyrus along the normal, every volume centred there */
-            const render_fill *F = R->F; const ctab *C = &R->T[1]; int k = 0; uint8_t fl = RFILL_ON;
-            if (lroundf(ct_trilin(C, P[0], P[1], P[2])) < F->thr) {
-                fl = RFILL_EMPTY;
-                for (int j = 1; j <= F->n; j++) {
-                    const float cp = ct_trilin(C, P[0] + j * N[0], P[1] + j * N[1], P[2] + j * N[2]), cm = ct_trilin(C, P[0] - j * N[0], P[1] - j * N[1], P[2] - j * N[2]);
-                    const int okp = lroundf(cp) >= F->thr, okm = lroundf(cm) >= F->thr;
-                    if (!okp && !okm) continue;
-                    k = okp && okm ? (F->prefer > 0 ? j : F->prefer < 0 ? -j : cm > cp ? -j : j) : okp ? j : -j;
-                    fl = (uint8_t)(k > 0 ? k : RFILL_NEG - k); break;
-                }
-                if (k) for (int d = 0; d < 3; d++) P[d] += k * N[d];
-            }
-            if (F->vgrid && fl != RFILL_EMPTY && (F->vgrid[si][i00] || F->vgrid[si][i01] || F->vgrid[si][i10] || F->vgrid[si][i11])) fl += RFILL_GRID;
-            F->flag[si][(size_t)py * R->ow + px] = fl;
-        }
-        for (int v = 0; v < R->nv; v++) {
-            float m = 0;
-            for (int t = -R->depth[v]; t <= R->depth[v]; t++) { const float s = ct_trilin(&R->T[v], P[0] + t * N[0], P[1] + t * N[1], P[2] + t * N[2]); if (s > m) m = s; }
-            img[v][(size_t)py * R->ow + px] = (uint8_t)lroundf(m);
-        }
+static void wr_vols(const wrend *R, rc_vol *V) {   /* the chunk tables as render_core.h volumes */
+    for (int v = 0; v < R->nv; v++) {
+        const ctab *T = &R->T[v]; V[v].sh = T->sh;
+        for (int d = 0; d < 3; d++) { V[v].c0[d] = T->c0[d]; V[v].cn[d] = T->cn[d]; }
+        V[v].ptr = (const uint8_t *const *)T->ptr;
     }
+}
+static void wr_block(const wrend *R, const rblock *B) {   /* render_core.h rc_pixel over the block's pixels, every grid */
+    const int py1 = B->py + RB < R->oh ? B->py + RB : R->oh, px1 = B->px + RB < R->ow ? B->px + RB : R->ow;
+    rc_vol V[2]; wr_vols(R, V);
+    const rc_fill RF = {R->F ? R->F->n : 0, R->F ? R->F->thr : 0, R->F ? R->F->prefer : 0};
+    for (int si = 0; si < R->ns; si++) {
+        uint8_t *const *img = R->img + (size_t)si * R->nv; const uint8_t *vg = R->F && R->F->vgrid ? R->F->vgrid[si] : nullptr;
+        for (int py = B->py; py < py1; py++) for (int px = B->px; px < px1; px++) {
+            uint8_t val[2], fl = RFILL_NONE;
+            if (!rc_pixel(R->Zs[si], R->Ys[si], R->Xs[si], R->w, R->h, R->gs, px, py, V, R->nv, R->depth, R->F ? &RF : nullptr, vg, val, &fl)) continue;
+            const size_t o = (size_t)py * R->ow + px;
+            if (R->F) R->F->flag[si][o] = fl;
+            for (int v = 0; v < R->nv; v++) img[v][o] = val[v];
+        }
     }
 }
 static void *wr_renderer(void *arg) {
@@ -369,6 +374,158 @@ static void *wr_renderer(void *arg) {
     pthread_mutex_lock(&R->mu); pthread_cond_broadcast(&R->cv); pthread_mutex_unlock(&R->mu);
     return nullptr;
 }
+/* GPU decoders: wr_decoder's order and budget (in device bytes), the chunk into a device slot: lossy substreams decoded there by gpudec
+   (z3_read_sub_dev), the rest decoded on the host into this thread's pinned staging buffer and uploaded. An all-zero host-decoded chunk
+   takes no slot (null pointer = zeros, as T->zero on the CPU). T->ptr marks decoded chunks (T->zero / any non-null). */
+static void wr_publish(wrend *R, size_t e, uint8_t *d) {   /* decode-list entry e is on the device at d (nullptr: zero) */
+    const wdec *D = &R->dl[e]; ctab *T = &R->T[D->v]; const size_t cv = (size_t)1 << (3 * T->sh);
+    pthread_mutex_lock(&R->mu);
+    R->dp[D->v][D->ci] = d; T->ptr[D->ci] = d ? d : T->zero; R->ndec++;
+    if (!d) { R->resident -= cv; R->nzero++; }
+    R->ready[e] = 1;
+    while (R->ready_prefix < R->ndl && R->ready[R->ready_prefix]) R->ready_prefix++;
+    pthread_cond_broadcast(&R->cv);
+    pthread_mutex_unlock(&R->mu);
+}
+static void *wr_decoder_gpu(void *arg) {
+    wrend *R = arg; const int tid = atomic_fetch_add(&R->tid, 1);
+    /* two staging buffers: chunk n uploads (asynchronously) while chunk n + 1 decodes; an entry is published once its upload is done */
+    uint8_t *stgs[2] = {rgpu_stage(R->G, 2 * tid), rgpu_stage(R->G, 2 * tid + 1)}; int cur = 0;
+    size_t pend_e = SIZE_MAX; uint8_t *pend_d = nullptr;
+#define WR_GFAIL() do { atomic_store(&R->gfail, 1); atomic_store(&R->fail, 1); } while (0)
+    if (!stgs[0] || !stgs[1]) { fprintf(stderr, "render gpu: no staging buffer for decoder %d: CPU render\n", tid); WR_GFAIL(); }
+    for (size_t e; !atomic_load(&R->fail) && (e = atomic_fetch_add(&R->dnext, 1)) < R->ndl;) {
+        const wdec *D = &R->dl[e]; ctab *T = &R->T[D->v]; const int64_t C = (int64_t)1 << T->sh; const size_t cv = (size_t)C * C * C;
+        const int64_t i = D->ci, a = i / (T->cn[1] * T->cn[2]), bb = i / T->cn[2] % T->cn[1], c = i % T->cn[2];
+        const int64_t o[3] = {(T->c0[0] + a) * C, (T->c0[1] + bb) * C, (T->c0[2] + c) * C}, n[3] = {C, C, C};
+        const int inside = o[0] < T->shape[0] && o[1] < T->shape[1] && o[2] < T->shape[2];
+        uint8_t *d = nullptr; int host = 0; double tp = rnow();
+        for (;;) {
+            pthread_mutex_lock(&R->mu);
+            if (pend_e != SIZE_MAX && R->resident + cv > R->budget && D->first > R->gdone + 1) {   /* about to wait: publish the pending chunk first (the renderer may need it) */
+                pthread_mutex_unlock(&R->mu);
+                if (rgpu_stage_sync(R->G, 2 * tid + (cur ^ 1))) { WR_GFAIL(); break; }
+                wr_publish(R, pend_e, pend_d); pend_e = SIZE_MAX;
+                pthread_mutex_lock(&R->mu);
+            }
+            while (R->resident + cv > R->budget && D->first > R->gdone + 1 && !atomic_load(&R->fail)) pthread_cond_wait(&R->cv, &R->mu);
+            R->resident += cv; if (R->resident > R->peak) R->peak = R->resident;
+            pthread_mutex_unlock(&R->mu);
+            if (!inside || atomic_load(&R->fail) || (d = rgpu_slot(R->G, &host))) break;
+            /* the device pool is full (a shared GPU): wait for frees unless this chunk's group is the earliest unfinished one */
+            pthread_mutex_lock(&R->mu);
+            R->resident -= cv;
+            const int early = D->first <= R->gdone + 1;
+            if (!early && R->resident > cv) R->budget = R->resident;   /* never more than now fits */
+            pthread_mutex_unlock(&R->mu);
+            if (early) { fprintf(stderr, "render gpu: device chunk pool full: CPU render\n"); WR_GFAIL(); break; }
+        }
+        if (atomic_load(&R->fail)) { if (d) rgpu_release(R->G, d); break; }
+        { const double t1 = rnow(); atomic_fetch_add(&R->pt[0], (uint64_t)((t1 - tp) * 1e6)); tp = t1; }
+        if (!inside) { wr_publish(R, e, nullptr); continue; }
+        if (host) {   /* a mapped pinned host slot: decoded into it on the host, the kernel reads it over the bus */
+            const uint32_t want = R->smask[D->v] ? R->smask[D->v][i] : 0;
+            if (z3_read_sub(T->z, o, n, d, 1, want)) { fprintf(stderr, "render: chunk read failed: %s\n", z3_error()); atomic_store(&R->fail, 1); rgpu_release(R->G, d); break; }
+            atomic_fetch_add(&R->pt[1], (uint64_t)((rnow() - tp) * 1e6)); atomic_fetch_add(&R->nhost, 1);
+            size_t q = 0; const uint64_t *w = (const uint64_t *)d; while (q < cv / 8 && !w[q]) q++;
+            if (q == cv / 8) { rgpu_release(R->G, d); d = nullptr; }
+            wr_publish(R, e, d); continue;
+        }
+        uint8_t *stg = stgs[cur];
+        if (rgpu_stage_sync(R->G, 2 * tid + cur)) { WR_GFAIL(); rgpu_release(R->G, d); break; }   /* this buffer's previous upload */
+        const uint32_t want = R->smask[D->v] ? R->smask[D->v][i] : 0; uint32_t dm = 0;
+        const int edge = o[0] + C > T->shape[0] || o[1] + C > T->shape[1] || o[2] + C > T->shape[2];   /* padded voxels: the host's fill */
+        const int dev = !edge && T->sh == 7 && gpudec_enabled();
+        /* the substreams outside want are never read (want covers every block's voxel box, depth + fill reach + 2 included) and keep whatever the
+           slot held; UFSM_RENDER_GPU_POISON=1 (tests) fills them with 0xa5 first, so a sample outside want would show */
+        if (want && R->poison && rgpu_zero(R->G, 2 * tid + cur, d)) { WR_GFAIL(); rgpu_release(R->G, d); break; }
+        const int rc = dev ? z3_read_sub_dev_lean(T->z, o, n, stg, 1, want, d, &dm) : z3_read_sub(T->z, o, n, stg, 1, want);
+        { const double t1 = rnow(); atomic_fetch_add(&R->pt[1], (uint64_t)((t1 - tp) * 1e6)); tp = t1; }
+        if (rc) { fprintf(stderr, "render: chunk read failed: %s\n", z3_error()); atomic_store(&R->fail, 1); rgpu_release(R->G, d); break; }
+        int zero = 0;
+        if (!dm) { size_t q = 0; const uint64_t *w = (const uint64_t *)stg; while (q < cv / 8 && !w[q]) q++; zero = q == cv / 8; }
+        if (zero) { rgpu_release(R->G, d); d = nullptr; }
+        else {   /* host-decoded: the whole buffer (zeros where nothing was asked, one copy); device-decoded: the substreams the host did */
+            const uint32_t rem = dm ? (want ? want : 0xffffffffu) & ~dm : want;
+            if ((!dm || rem) && rgpu_upload(R->G, 2 * tid + cur, d, rem, !dm && T->sh == 7, 0)) { WR_GFAIL(); rgpu_release(R->G, d); break; }
+        }
+        atomic_fetch_add(&R->pt[2], (uint64_t)((rnow() - tp) * 1e6));
+        /* publish the previous chunk (its upload had a whole decode to finish), keep this one pending */
+        if (pend_e != SIZE_MAX) { if (rgpu_stage_sync(R->G, 2 * tid + (cur ^ 1))) { WR_GFAIL(); break; } wr_publish(R, pend_e, pend_d); }
+        pend_e = e; pend_d = d; cur ^= 1;
+    }
+    if (pend_e != SIZE_MAX && !atomic_load(&R->fail)) { if (rgpu_stage_sync(R->G, 2 * tid + (cur ^ 1))) WR_GFAIL(); else wr_publish(R, pend_e, pend_d); }
+#undef WR_GFAIL
+    pthread_mutex_lock(&R->mu); pthread_cond_broadcast(&R->cv); pthread_mutex_unlock(&R->mu);
+    return nullptr;
+}
+/* the GPU renderer (this thread): runs of blocks whose chunks are decoded, at most bmax per launch, two launches in flight: while the
+   kernel renders one run the previous run's outputs are scattered into the images and the groups it finished free their last chunks */
+enum { WR_MINRUN = 512 };
+static void wr_gpu_drive(wrend *R, size_t bmax) {
+    const int nimg = R->nv + (R->F ? 1 : 0); size_t up = 0, ucap = 0; uint64_t *keys = nullptr; uint8_t **ptrs = nullptr;
+    rc_vol V[2]; const rc_fill RF = {R->F ? R->F->n : 0, R->F ? R->F->thr : 0, R->F ? R->F->prefer : 0};
+    size_t k = 0, pk = 0, pke = 0; int have = 0, cur = 0;
+#define WR_DFAIL() do { atomic_store(&R->gfail, 1); atomic_store(&R->fail, 1); } while (0)
+    wr_vols(R, V);
+    for (;;) {
+        int launched = 0; size_t ke = k; double tp = rnow();
+        if (k < R->nb && !atomic_load(&R->fail)) {
+            const uint32_t g = R->bgrp[k];
+            pthread_mutex_lock(&R->mu);
+            if (!have) while (R->ready_prefix < R->need[g] && !atomic_load(&R->fail)) pthread_cond_wait(&R->cv, &R->mu);   /* nothing in flight: wait */
+            { const double t1 = rnow(); R->pt[3] += (uint64_t)((t1 - tp) * 1e6); tp = t1; }
+            const size_t rp = R->ready_prefix;
+            while (ke < R->nb && ke - k < bmax && R->need[R->bgrp[ke]] <= rp) ke++;
+            /* with a launch in flight, a small run waits for more (fewer, larger launches: CUDA calls serialise with the decoders') */
+            if (ke > k && !(have && ke - k < WR_MINRUN && ke < R->nb) && !atomic_load(&R->fail)) {
+                const size_t nu = rp - up;
+                if (nu > ucap) { ucap = nu + ucap; uint64_t *k2 = realloc(keys, ucap * sizeof *keys); uint8_t **p2 = k2 ? realloc(ptrs, ucap * sizeof *ptrs) : nullptr;
+                                 if (k2) keys = k2;
+                                 if (p2) ptrs = p2;
+                                 if (!k2 || !p2) { pthread_mutex_unlock(&R->mu); atomic_store(&R->fail, 1); break; } }
+                for (size_t e = up; e < rp; e++) { const wdec *D = &R->dl[e]; keys[e - up] = (uint64_t)D->ci | (uint64_t)D->v << 63; ptrs[e - up] = R->dp[D->v][D->ci]; }
+                pthread_mutex_unlock(&R->mu);
+                if (rgpu_ptrs(R->G, cur, keys, ptrs, nu) || rgpu_launch(R->G, cur, k, ke, V, R->depth, R->F ? &RF : nullptr, R->gs, R->ow, R->oh)) { WR_DFAIL(); break; }
+                up = rp; launched = 1;
+                { const double t1 = rnow(); R->pt[6] += (uint64_t)((t1 - tp) * 1e6); tp = t1; }
+            } else { pthread_mutex_unlock(&R->mu); ke = k; }
+        }
+        if (have) {   /* the previous launch: wait, scatter, free */
+            const uint8_t *ho = nullptr;
+            if (rgpu_wait(R->G, cur ^ 1, &ho)) { WR_DFAIL(); break; }
+            { const double t1 = rnow(); R->pt[4] += (uint64_t)((t1 - tp) * 1e6); tp = t1; }
+            for (size_t q = pk; q < pke; q++) {   /* the block's rows into each image */
+                const rblock *B = &R->b[q]; const int nr = (B->py + RB < R->oh ? B->py + RB : R->oh) - B->py, nc = (B->px + RB < R->ow ? B->px + RB : R->ow) - B->px;
+                for (int si = 0; si < R->ns; si++) for (int m = 0; m < nimg; m++) {
+                    const uint8_t *src = ho + (((q - pk) * R->ns + si) * nimg + m) * (RB * RB);
+                    uint8_t *dst = m < R->nv ? R->img[(size_t)si * R->nv + m] : R->F->flag[si];
+                    for (int r = 0; r < nr; r++) memcpy(dst + (size_t)(B->py + r) * R->ow + B->px, src + r * RB, (size_t)nc);
+                }
+            }
+            R->pt[5] += (uint64_t)((rnow() - tp) * 1e6);
+            const uint32_t gd = pke < R->nb ? R->bgrp[pke] - 1 : R->ng;   /* every group before the next block's is done */
+            pthread_mutex_lock(&R->mu);
+            while (R->gdone < gd) {
+                const uint32_t q = ++R->gdone;
+                for (size_t f = R->free0[q]; f < R->free0[q + 1]; f++) {
+                    const wdec *D = &R->dl[R->frees[f]]; ctab *T = &R->T[D->v];
+                    if (R->dp[D->v][D->ci]) { rgpu_release(R->G, R->dp[D->v][D->ci]); R->dp[D->v][D->ci] = nullptr; R->resident -= (size_t)1 << (3 * T->sh); }
+                    T->ptr[D->ci] = nullptr;
+                }
+            }
+            pthread_cond_broadcast(&R->cv);
+            pthread_mutex_unlock(&R->mu);
+            have = 0;
+        }
+        if (launched) { have = 1; pk = k; pke = ke; k = ke; cur ^= 1; }
+        else if (k >= R->nb || atomic_load(&R->fail)) break;
+    }
+    if (have) { const uint8_t *ho; rgpu_wait(R->G, cur ^ 1, &ho); }   /* (a failure: nothing to scatter, the CPU re-renders) */
+#undef WR_DFAIL
+    free(keys); free(ptrs);
+    pthread_mutex_lock(&R->mu); pthread_cond_broadcast(&R->cv); pthread_mutex_unlock(&R->mu);
+}
 static int wr_blk_cmp(const void *a, const void *b) {   /* by the first volume's first chunk (z, y, x), then position */
     const rblock *p = a, *q = b;
     for (int d = 0; d < 3; d++) if (p->lo[d] != q->lo[d]) return p->lo[d] < q->lo[d] ? -1 : 1;
@@ -384,9 +541,9 @@ int render_wraps_chunked(z3 *const *vz, int nv, const int *depth, int ns, const 
                          int w, int h, double gs, uint8_t *const *img, int ow, int oh, const int *crop, size_t budget, int nthreads, int io_threads, int verbose) {
     return render_wraps_chunked_fill(vz, nv, depth, ns, Xs, Ys, Zs, w, h, gs, img, ow, oh, crop, budget, nthreads, io_threads, verbose, nullptr);
 }
-int render_wraps_chunked_fill(z3 *const *vz, int nv, const int *depth, int ns, const float *const *Xs, const float *const *Ys, const float *const *Zs,
-                              int w, int h, double gs, uint8_t *const *img, int ow, int oh, const int *crop, size_t budget, int nthreads, int io_threads,
-                              int verbose, const render_fill *F) {
+static int wr_run(z3 *const *vz, int nv, const int *depth, int ns, const float *const *Xs, const float *const *Ys, const float *const *Zs,
+                  int w, int h, double gs, uint8_t *const *img, int ow, int oh, const int *crop, size_t budget, int nthreads, int io_threads,
+                  int verbose, const render_fill *F, int gpu) {
     if (nv < 1 || nv > 2 || ns < 1 || ns > 8 || w < 2 || h < 2) return -1;
     if (F && (nv != 2 || F->n < 0 || F->n > 49 || !F->flag)) return -1;
     const double t0 = rnow();
@@ -494,6 +651,53 @@ int render_wraps_chunked_fill(z3 *const *vz, int nv, const int *depth, int ns, c
         pthread_mutex_init(&R->mu, nullptr); pthread_cond_init(&R->cv, nullptr);
         const int nr = nthreads < 1 ? 1 : nthreads > 64 ? 64 : nthreads, nd0 = io_threads < 1 ? nr : io_threads > 128 ? 128 : io_threads, nd = gpudec_threads(nd0) > 128 ? 128 : gpudec_threads(nd0);   /* GPU decoding: more decoders in flight (they wait on the batches) */
         pthread_t th[192];
+        R->poison = getenv("UFSM_RENDER_GPU_POISON") && atoi(getenv("UFSM_RENDER_GPU_POISON"));
+        if (gpu) {   /* device chunk pool sized to the free device memory (GPUs shared with other jobs), one pinned staging buffer per decoder */
+            /* decoders: with the GPU decoder many requests in flight make its batches (one substream is a serial chain of a few ms): 128
+               (UFSM_RENDER_GPU_DECODERS); without it the CPU decoders of the CPU path */
+            const int dev = rg_device(); size_t tot = 0; const size_t fr = rgpu_free_mem(dev, &tot);
+            const size_t cvmax = (size_t)1 << (3 * (nv > 1 && R->T[1].sh > R->T[0].sh ? R->T[1].sh : R->T[0].sh));
+            const int nimg = nv + (F ? 1 : 0); const size_t bmax = (size_t)(8192 / ns), outb = bmax * ns * nimg * RB * RB;
+            const size_t grids = (size_t)ns * w * h * 13 + nb * 8 + (R->T[0].cn[0] * R->T[0].cn[1] * R->T[0].cn[2] + (nv > 1 ? R->T[1].cn[0] * R->T[1].cn[1] * R->T[1].cn[2] : 0)) * 8;
+            size_t reserve = (size_t)3 << 29; if (reserve < tot / 12) reserve = tot / 12;   /* >= 1.5 GB for gpudec and the driver */
+            const double lim = getenv("UFSM_RENDER_GPU_MEM") ? atof(getenv("UFSM_RENDER_GPU_MEM")) * 1073741824.0 : 0;
+            size_t cap = fr > reserve + grids + outb + 64 * cvmax ? fr - reserve - grids - outb : 0;
+            if (lim > 0 && cap > (size_t)lim) cap = (size_t)lim;
+            if (cap < 128 * cvmax) { fprintf(stderr, "render gpu: %.2f GB free on device %d: CPU render\n", fr / 1073741824.0, dev); rc = 2; goto gout; }
+            const char *nde = getenv("UFSM_RENDER_GPU_DECODERS");
+            const int ndg = nde && atoi(nde) > 0 ? (atoi(nde) > 128 ? 128 : atoi(nde)) : gpudec_enabled() ? 128 : nd;
+            { const char *dl = getenv("UFSM_RENDER_GPU_DEVMB");   /* tests: a small device tier (the rest in pinned host slots) */
+              if (dl && (size_t)atol(dl) << 20 < cap) cap = (size_t)atol(dl) << 20; }
+            /* the budget (decoders ahead of the renderer): the device tier less headroom for the earliest group, plus the caller's host budget for
+               mapped pinned host slots (a live chunk set larger than the GPU: P3 stripes peak ~29 GB); host slots may grow past it for the earliest group */
+            R->budget = (cap > 64 * cvmax ? cap - 64 * cvmax : 0) + budget;
+            const double hav = (double)ufsm_mem_available(); const size_t hcap = hav > 0 ? (size_t)(0.5 * hav) : budget * 2;
+            const size_t nc2[2] = {(size_t)(R->T[0].cn[0] * R->T[0].cn[1] * R->T[0].cn[2]), nv > 1 ? (size_t)(R->T[1].cn[0] * R->T[1].cn[1] * R->T[1].cn[2]) : 0};
+            int32_t *pxy = malloc((nb + 1) * 2 * sizeof *pxy);
+            for (int v = 0; v < nv; v++) if (!(R->dp[v] = calloc(nc2[v] ? nc2[v] : 1, sizeof *R->dp[v]))) { rc = 2; }
+            if (pxy) for (size_t k = 0; k < nb; k++) { pxy[2 * k] = b[k].px; pxy[2 * k + 1] = b[k].py; }
+            if (rc != 2 && pxy && (R->G = rgpu_open(dev, cvmax, cap, hcap, 2 * ndg)) &&
+                !rgpu_setup(R->G, nv, nc2, ns, Xs, Ys, Zs, w, h, F ? F->vgrid : nullptr, pxy, nb, bmax, nimg)) {
+                for (int t = 0; t < ndg; t++) pthread_create(&th[t], nullptr, wr_decoder_gpu, R);
+                wr_gpu_drive(R, bmax);
+                for (int t = 0; t < ndg; t++) pthread_join(th[t], nullptr);
+                rc = atomic_load(&R->gfail) ? 2 : atomic_load(&R->fail) ? -1 : 0;
+            } else { fprintf(stderr, "render gpu: device setup failed: CPU render\n"); rc = 2; }
+            free(pxy);
+            if (verbose && R->G && rc == 0) {
+                size_t pool, hpool; double kms; uint64_t nl, np, nby; rgpu_stats(R->G, &pool, &hpool, &kms, &nl, &np, &nby);
+                fprintf(stderr, "render: %zu blocks in %u chunk rows, %zu chunks decoded once (%llu empty), GPU: pool %.2f GB (cap %.2f) + host %.2f GB (%llu chunks), peak %.2f GB, %llu launches %.2f s kernel, %llu uploads %.2f GB, %.1fs\n",
+                        nb, ng, R->ndl, (unsigned long long)R->nzero, pool / 1073741824.0, cap / 1073741824.0, hpool / 1073741824.0, (unsigned long long)R->nhost, R->peak / 1073741824.0, (unsigned long long)nl, kms / 1000,
+                        (unsigned long long)np, nby / 1073741824.0, rnow() - t0);
+                if (getenv("UFSM_RENDER_PROF")) fprintf(stderr, "render prof (s): decoders %d: budget wait %.1f, read %.1f, upload %.1f; driver: ready wait %.1f, pointer table %.1f, kernel %.1f, scatter %.1f\n", ndg,
+                                                        R->pt[0] * 1e-6, R->pt[1] * 1e-6, R->pt[2] * 1e-6, R->pt[3] * 1e-6, R->pt[6] * 1e-6, R->pt[4] * 1e-6, R->pt[5] * 1e-6);
+            }
+            rgpu_close(R->G); R->G = nullptr;
+        gout:
+            pthread_mutex_destroy(&R->mu); pthread_cond_destroy(&R->cv);
+            for (int v = 0; v < 2; v++) { free(R->dp[v]); R->dp[v] = nullptr; }
+            goto out0;
+        }
         for (int t = 0; t < nd; t++) pthread_create(&th[t], nullptr, wr_decoder, R);
         for (int t = 0; t < nr; t++) pthread_create(&th[nd + t], nullptr, wr_renderer, R);
         for (int t = 0; t < nd + nr; t++) pthread_join(th[t], nullptr);
@@ -509,6 +713,27 @@ out0:
     free(b); free(R->bgrp); free(R->blo); free(R->bhi); free(R->dl); free(R->need); free(R->free0); free(R->frees); free(R->ready); free(R->gleft);
     free(R);
     return rc;
+}
+/* render_set_gpu(1): the GPU path (nn_render.cu), same bytes; on any device error / a full device it re-renders on the CPU, which needs
+   the images at 0 and the flags at RFILL_NONE, as every caller starts them (UFSM_RENDER_GPU=0/1 overrides) */
+int render_wraps_chunked_fill(z3 *const *vz, int nv, const int *depth, int ns, const float *const *Xs, const float *const *Ys, const float *const *Zs,
+                              int w, int h, double gs, uint8_t *const *img, int ow, int oh, const int *crop, size_t budget, int nthreads, int io_threads,
+                              int verbose, const render_fill *F) {
+    const char *ev = getenv("UFSM_RENDER_GPU");
+    const int gpu = (ev ? atoi(ev) : g_render_gpu) && rgpu_open && nv >= 1 && nv <= 2 && ns >= 1 && ns <= 8;
+    if (gpu) {
+        /* GPU decoding on (UFSM_GPU_DECODE=0 keeps it off) only when the device has room for the GPU path: a render that will fall back to
+           the CPU (a full device, e.g. next to a slab fit) must not send its decodes to that GPU either (busy round trips: P4 stripe 33 -> 50 s) */
+        size_t tot = 0; const size_t fr = rgpu_free_mem(rg_device(), &tot);
+        if (fr > ((size_t)5 << 29) + (size_t)256 * ((size_t)1 << 21)) setenv("UFSM_GPU_DECODE", "1", 0);
+        const int rc = wr_run(vz, nv, depth, ns, Xs, Ys, Zs, w, h, gs, img, ow, oh, crop, budget, nthreads, io_threads, verbose, F, 1);
+        if (rc == 0) atomic_fetch_add(&g_render_gpu_done, 1);
+        if (rc != 2) return rc;
+        atomic_fetch_add(&g_render_gpu_cpu, 1);
+        for (int k = 0; k < ns * nv; k++) memset(img[k], 0, (size_t)ow * oh);
+        if (F) for (int k = 0; k < ns; k++) memset(F->flag[k], RFILL_NONE, (size_t)ow * oh);
+    }
+    return wr_run(vz, nv, depth, ns, Xs, Ys, Zs, w, h, gs, img, ow, oh, crop, budget, nthreads, io_threads, verbose, F, 0);
 }
 
 static int name_cmp(const void *a, const void *b) { return strcmp(*(char *const *)a, *(char *const *)b); }
@@ -881,14 +1106,27 @@ int ink_compare_mem(int argc, char **argv) {   /* the in-memory version (inkcomp
 }
 
 /* ---- tifxyz_fill_holes (render --fill-grid) ---- */
+/* Gauss-Seidel on the hole vertices, one hole per task: a hole's vertices see only their own hole and fixed rims (holes are whole 4-connected
+   components), so each hole iterated alone in its own index order equals the sweep over all of them in index order, byte for byte */
+typedef struct { float *A[3]; const float *Z; const uint8_t *hole; const uint32_t *q; const size_t *c0; size_t nc; int w; _Atomic size_t next; } gs_job;
+static void *gs_worker(void *arg) {
+    gs_job *J = arg; const int w = J->w;
+    for (size_t h; (h = atomic_fetch_add(&J->next, 1)) < J->nc;)
+        for (int it = 0; it < 400; it++) for (size_t k = J->c0[h]; k < J->c0[h + 1]; k++) {
+            const size_t i = J->q[k]; const size_t nb4[4] = {i - 1, i + 1, i - w, i + w}; double s[3] = {0, 0, 0}; int m = 0;   /* holes touch no border */
+            for (int j = 0; j < 4; j++) { const size_t u = nb4[j]; if (!J->hole[u] && !(J->Z[u] >= 0)) continue; for (int d = 0; d < 3; d++) s[d] += J->A[d][u]; m++; }
+            if (m) for (int d = 0; d < 3; d++) J->A[d][i] = (float)(s[d] / m);
+        }
+    return nullptr;
+}
 size_t tifxyz_fill_holes(float *X, float *Y, float *Z, int w, int h, size_t maxv, uint8_t *filled, size_t *nholes, size_t *nbig) {
     const size_t n = (size_t)w * h; size_t nf = 0, nh = 0, nb = 0;
     if (nholes) *nholes = 0;
     if (nbig) *nbig = 0;
     if (filled) memset(filled, 0, n);
     if (w < 3 || h < 3) return 0;
-    uint8_t *hole = calloc(n, 1), *seen = calloc(n, 1); uint32_t *q = malloc(n * sizeof *q);
-    if (!hole || !seen || !q) { free(hole); free(seen); free(q); return 0; }
+    uint8_t *hole = calloc(n, 1), *seen = calloc(n, 1); uint32_t *q = malloc(n * sizeof *q), *hid = malloc(n * sizeof *hid);   /* hid: a hole vertex's hole */
+    if (!hole || !seen || !q || !hid) { free(hole); free(seen); free(q); free(hid); return 0; }
     for (size_t s = 0; s < n; s++) {   /* components of invalid vertices: the enclosed, small enough ones are holes */
         if (seen[s] || Z[s] >= 0) continue;
         size_t a = 0, e = 0; int border = 0; q[e++] = (uint32_t)s; seen[s] = 1;
@@ -900,7 +1138,8 @@ size_t tifxyz_fill_holes(float *X, float *Y, float *Z, int w, int h, size_t maxv
         }
         if (border) continue;
         if (e > maxv) { nb++; continue; }
-        nh++; for (size_t k = 0; k < e; k++) hole[q[k]] = 1;
+        for (size_t k = 0; k < e; k++) { hole[q[k]] = 1; hid[q[k]] = (uint32_t)nh; }
+        nh++;
     }
     free(seen);
     /* start: push-pull of the valid vertices over the whole grid (the hole vertices take the pulled values) */
@@ -938,20 +1177,27 @@ size_t tifxyz_fill_holes(float *X, float *Y, float *Z, int w, int h, size_t maxv
         }
     }
     if (ok) {
-        size_t nl = 0; for (size_t i = 0; i < n; i++) if (hole[i]) { for (int d = 0; d < 3; d++) A[d][i] = pv[0][d][i]; q[nl++] = (uint32_t)i; }
-        /* Gauss-Seidel on the Laplace equation over the hole vertices (rims fixed): the membrane through the rim */
-        for (int it = 0; it < 400; it++) for (size_t k = 0; k < nl; k++) {
-            const size_t i = q[k]; const int r = (int)(i / w), c = (int)(i % w);
-            const size_t nb4[4] = {i - 1, i + 1, i - w, i + w}; double s[3] = {0, 0, 0}; int m = 0;
-            (void)r; (void)c;   /* holes touch no border: all four neighbours exist */
-            for (int j = 0; j < 4; j++) { const size_t u = nb4[j]; if (!hole[u] && !(Z[u] >= 0)) continue; for (int d = 0; d < 3; d++) s[d] += A[d][u]; m++; }
-            if (m) for (int d = 0; d < 3; d++) A[d][i] = (float)(s[d] / m);
-        }
+        /* the hole vertices grouped by hole (counting sort), index order inside each */
+        size_t nl = 0, *c0 = calloc(nh + 2, sizeof *c0);
+        if (c0) {
+            for (size_t i = 0; i < n; i++) if (hole[i]) { for (int d = 0; d < 3; d++) A[d][i] = pv[0][d][i]; c0[hid[i] + 1]++; nl++; }
+            for (size_t k = 0; k < nh; k++) c0[k + 1] += c0[k];
+            size_t *fill = calloc(nh + 1, sizeof *fill);
+            if (fill) for (size_t i = 0; i < n; i++) if (hole[i]) q[c0[hid[i]] + fill[hid[i]]++] = (uint32_t)i;
+            if (!fill) nh = 0, nl = 0;   /* (out of memory: no Laplace pass, nothing reported filled) */
+            free(fill);
+            /* Gauss-Seidel on the Laplace equation over the hole vertices (rims fixed): the membrane through the rim; holes on threads */
+            gs_job J = {{Z, Y, X}, Z, hole, q, c0, nh, w, 0};
+            long nc = ufsm_ncpu(); const int nt = nc < 1 ? 1 : nc > 32 ? 32 : (int)(nc < (long)nh ? nc : (long)(nh ? nh : 1));
+            pthread_t th[32]; for (int t = 0; t < nt; t++) pthread_create(&th[t], nullptr, gs_worker, &J);
+            for (int t = 0; t < nt; t++) pthread_join(th[t], nullptr);
+            free(c0);
+        } else nl = 0;
         nf = nl;
         if (filled) for (size_t k = 0; k < nl; k++) filled[q[k]] = 1;
     }
     for (int l = 0; l <= L; l++) { free(pw[l]); for (int d = 0; d < 3; d++) free(pv[l][d]); }
-    free(hole); free(q);
+    free(hole); free(q); free(hid);
     if (nholes) *nholes = nh;
     if (nbig) *nbig = nb;
     return nf;

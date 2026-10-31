@@ -3729,8 +3729,12 @@ static void render_fill_report(const char *name, uint8_t *img, uint8_t *cimg, ui
                     "grid holes filled: %zu pixels (%.2f%% of the surface); no surface: %zu pixels\n",
             name, ns, (ns - non) * d, nfill * d, nin * d, nemp * d, ngrid, ngrid * d, nnone);
 }
+typedef struct { char path[1400]; const uint8_t *data; int w, h, rc; } rw_job;   /* ufsm render: one output TIFF */
+static void *rw_write(void *arg) { rw_job *J = arg; J->rc = tiffw_write(J->path, J->w, J->h, 1, J->data, 1); return nullptr; }
 static int cmd_render(int argc, char **argv) {
-    if (argc < 4) { fprintf(stderr, "usage: ufsm render <wraps-dir> <out-dir> --volume ROOT KEY [--ct ROOT KEY] [--cache DIR] [--scale 1] [--depth 8] [--tile 512] [--threads 16] [--crop x,y,w,h] [--joint 1]\n"
+    if (argc < 4) { fprintf(stderr, "usage: ufsm render <wraps-dir> <out-dir> --volume ROOT KEY [--ct ROOT KEY] [--cache DIR] [--scale 1] [--depth 8] [--tile 512] [--threads 16] [--crop x,y,w,h] [--joint 1] [--gpu 1]\n"
+"  --gpu 1 (default): sample on the GPU (decoded chunks kept on the device, decoded there by gpudec); same bytes as --gpu 0 (CPU),\n"
+"    the CPU path on any device error or a full device (UFSM_RENDER_GPU_MEM GB caps the device chunk pool)\n"
 "         [--fill N] [--fill-ct 1] [--fill-prefer 0] [--fill-inpaint L] [--fill-pm 1] [--fill-grid V]\n"
 "  --joint 1: all wraps (one grid size) in one chunk-ordered pass, shared chunks decoded once\n"
 "  --fill N (needs --ct): a pixel whose CT on the surface is < --fill-ct (masked CT: 0 off the papyrus) takes the nearest papyrus\n"
@@ -3752,6 +3756,8 @@ static int cmd_render(int argc, char **argv) {
     const int fill_n = atoi(opt(argc, argv, "--fill", "-1")), fill_inp = atoi(opt(argc, argv, "--fill-inpaint", "0"));
     const int fill_thr = atoi(opt(argc, argv, "--fill-ct", "1")), fill_pref = atoi(opt(argc, argv, "--fill-prefer", "0")), fill_pm = atoi(opt(argc, argv, "--fill-pm", "1"));
     const long fill_grid = atol(opt(argc, argv, "--fill-grid", "0"));
+    const int rgpu_on = atoi(opt(argc, argv, "--gpu", "1")) && render_gpu_available() && !getenv("UFSM_RENDER_TILED");   /* default on: same bytes, CPU on any device trouble */
+    render_set_gpu(rgpu_on);
     if (fill_n > 49 || (fill_grid && fill_n < 0) || fill_inp < 0 || fill_inp > 8 || ((fill_n >= 0 || fill_inp) && (ci < 0 || ci + 2 >= argc)) || (fill_inp && fill_n < 0) || (fill_n >= 0 && getenv("UFSM_RENDER_TILED"))) {
         fprintf(stderr, "render: --fill N (0..49) needs --ct (and not UFSM_RENDER_TILED); --fill-inpaint L (1..8) needs --fill\n"); return 2; }
     store *vs = store_open(argv[vi + 1]), *cs = ci > 0 && ci + 2 < argc ? store_open(argv[ci + 1]) : nullptr;
@@ -3770,7 +3776,8 @@ static int cmd_render(int argc, char **argv) {
     int chunked = 0; double cbudget = 0;
     {
         double lo[3] = {1e300, 1e300, 1e300}, hi[3] = {-1e300, -1e300, -1e300};
-        while ((de = readdir(dd))) {
+        const int forced = !getenv("UFSM_RENDER_TILED") && (getenv("UFSM_RENDER_CHUNKED") || fill_n >= 0 || rgpu_on);   /* chunk-ordered anyway: no box scan (a grid read) */
+        while (!forced && (de = readdir(dd))) {
             if (de->d_name[0] != 'w') continue;
             char p[1400]; int w, h; const char *ax[3] = {"z", "y", "x"};
             for (int d = 0; d < 3; d++) {
@@ -3783,7 +3790,7 @@ static int cmd_render(int argc, char **argv) {
         double budget = atof(getenv("UFSM_RENDER_MEM") ? getenv("UFSM_RENDER_MEM") : "8") * (1u << 30);
         { const double av = (double)ufsm_mem_available();   /* never above half of what this process may still allocate (cgroup aware) */
           if (av > 0 && budget > 0.5 * av) { fprintf(stderr, "render: UFSM_RENDER_MEM lowered to %.1f GB (half of the %.1f GB available)\n", 0.5 * av / (1u << 30), av / (1u << 30)); budget = 0.5 * av; } }
-        chunked = getenv("UFSM_RENDER_TILED") ? 0 : getenv("UFSM_RENDER_CHUNKED") || fill_n >= 0 ? 1 : 0;   /* --fill: the chunk-ordered renderer only */
+        chunked = forced;   /* --fill: the chunk-ordered renderer only; --gpu 1: the chunk-ordered renderer is the GPU one */
         cbudget = budget;
         if (lo[0] <= hi[0] && lo[1] <= hi[1] && lo[2] <= hi[2]) {
             for (int d = 0; d < 3; d++) { ro[d] = (int64_t)floor(lo[d]) - depth - 2; if (ro[d] < 0) ro[d] = 0; rn[d] = (int64_t)ceil(hi[d]) + depth + 3 - ro[d]; }
@@ -3851,6 +3858,8 @@ static int cmd_render(int argc, char **argv) {
     while ((de = readdir(dd))) {
         if (de->d_name[0] != 'w') continue;
         char p[1400]; int w, h, w2, h2, w3, h3;
+        struct timespec ts0; clock_gettime(CLOCK_MONOTONIC, &ts0); double tw[4] = {0, 0, 0, 0};   /* stage times: grids, render, fill, writes */
+#define RNOW() ({ struct timespec t_; clock_gettime(CLOCK_MONOTONIC, &t_); (t_.tv_sec - ts0.tv_sec) + (t_.tv_nsec - ts0.tv_nsec) * 1e-9; })
         snprintf(p, sizeof p, "%s/%s/x.tif", argv[2], de->d_name); float *X = read_tif_f32(p, &w, &h);
         snprintf(p, sizeof p, "%s/%s/y.tif", argv[2], de->d_name); float *Y = read_tif_f32(p, &w2, &h2);
         snprintf(p, sizeof p, "%s/%s/z.tif", argv[2], de->d_name); float *Z = read_tif_f32(p, &w3, &h3);
@@ -3871,8 +3880,11 @@ static int cmd_render(int argc, char **argv) {
             const int io = remote ? (nthreads > 32 ? nthreads : 32) : nthreads;
             const float *const Xs[1] = {X}, *const Ys[1] = {Y}, *const Zs[1] = {Z}; uint8_t *const fls[1] = {flag}; const uint8_t *const vgs[1] = {vgrid};
             const render_fill RF = {fill_n, fill_thr, fill_pref, fls, vgrid ? vgs : nullptr};
+            tw[0] = RNOW();
             if (render_wraps_chunked_fill(zs, cz ? 2 : 1, dp, 1, Xs, Ys, Zs, w, h, gs, im, ow, oh, crs ? crop : nullptr, cb, nthreads, io, 1, flag ? &RF : nullptr)) { fprintf(stderr, "render: %s: render failed\n", de->d_name); return 1; }
+            tw[1] = RNOW();
             if (flag) render_fill_report(de->d_name, img, cimg, flag, ow, oh, fill_inp, fill_pm, nthreads);
+            tw[2] = RNOW();
         } else
         /* output tiles: each reads only the volume around its own vertices (+- depth), so a wrap of any size renders in bounded memory */
         for (int ty = 0; ty < oh; ty += tile) for (int tx = 0; tx < ow; tx += tile) {
@@ -3911,10 +3923,18 @@ static int cmd_render(int argc, char **argv) {
             free(img); free(cimg); img = ci2; cimg = cc2; fw = crop[2]; fh = crop[3];
             if (flag) { uint8_t *cf = img_crop_u8(flag, ow, oh, crop[0], crop[1], crop[2], crop[3]); if (!cf) return 1; free(flag); flag = cf; }
         }
-        if (flag) { snprintf(p, sizeof p, "%s/%s_fill.tif", argv[3], de->d_name); if (tiffw_write(p, fw, fh, 1, flag, 1)) { fprintf(stderr, "render: cannot write %s\n", p); return 1; } free(flag); }
-        snprintf(p, sizeof p, "%s/%s.tif", argv[3], de->d_name);
-        if (tiffw_write(p, fw, fh, 1, img, 1)) { fprintf(stderr, "render: cannot write %s\n", p); return 1; }
-        if (cimg) { snprintf(p, sizeof p, "%s/%s_ct.tif", argv[3], de->d_name); if (tiffw_write(p, fw, fh, 1, cimg, 1)) return 1; }
+        { /* the renders (and the fill flags) written concurrently, each compressed on its own threads */
+          rw_job wj[3] = {0}; int nj = 0; pthread_t wt[3];
+          if (flag) { snprintf(wj[nj].path, sizeof wj[nj].path, "%s/%s_fill.tif", argv[3], de->d_name); wj[nj].data = flag; nj++; }
+          snprintf(wj[nj].path, sizeof wj[nj].path, "%s/%s.tif", argv[3], de->d_name); wj[nj].data = img; nj++;
+          if (cimg) { snprintf(wj[nj].path, sizeof wj[nj].path, "%s/%s_ct.tif", argv[3], de->d_name); wj[nj].data = cimg; nj++; }
+          for (int k = 0; k < nj; k++) { wj[k].w = fw; wj[k].h = fh; pthread_create(&wt[k], nullptr, rw_write, &wj[k]); }
+          int bad = 0; for (int k = 0; k < nj; k++) { pthread_join(wt[k], nullptr); if (wj[k].rc) { fprintf(stderr, "render: cannot write %s\n", wj[k].path); bad = 1; } }
+          free(flag); flag = nullptr;
+          if (bad) return 1; }
+        tw[3] = RNOW();
+        if (tw[1] > 0) fprintf(stderr, "render: %s: grids %.1f s, render %.1f s, fill %.1f s, writes %.1f s\n", de->d_name, tw[0], tw[1] - tw[0], tw[2] - tw[1], tw[3] - tw[2]);
+#undef RNOW
         free(X); free(Y); free(Z); free(img); free(cimg); free(vgrid); nw++;
     }
     closedir(dd); free(rvol); free(rct);

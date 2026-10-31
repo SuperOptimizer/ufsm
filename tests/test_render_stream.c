@@ -81,6 +81,9 @@ static int run(int (*f)(int, char **), char **argv, const char *out) {   /* argv
 }
 
 int main(void) {
+#ifdef RENDER_GPU   /* every chunk-ordered render through the GPU path (nn_render.cu), lossy chunks decoded on the device (gpudec) */
+    setenv("UFSM_RENDER_GPU", "1", 1); setenv("UFSM_GPU_DECODE", "1", 1); setenv("UFSM_RENDER_GPU_POISON", "1", 1);
+#endif
     char dir[] = "/tmp/test_render_stream_XXXXXX"; CHECK(mkdtemp(dir) != nullptr, "mkdtemp");
     char p[800], q[800];
     /* ---- render_wrap_chunked ---- */
@@ -139,6 +142,17 @@ int main(void) {
           ref_render(X, Y, Z, w, h, gs, dense[1], shape, 1, r1, ow, oh);
           CHECK(!render_wrap_chunked(z1, 1, d1, X, Y, Z, w, h, gs, im, ow, oh, nullptr, 1, 2, 4, 0) && !memcmp(im[0], r1, no), "one volume");
           free(im[0]); free(r1); }
+#ifdef RENDER_GPU
+        /* a device failure at the first launch: the CPU re-renders, same bytes */
+        { setenv("UFSM_RENDER_GPU_FAIL", "1", 1); uint8_t *im[2] = {calloc(no, 1), calloc(no, 1)};
+          CHECK(!render_wrap_chunked(zz, 2, dp, X, Y, Z, w, h, gs, im, ow, oh, nullptr, (size_t)1 << 32, 3, 2, 0) && !memcmp(im[0], ref[0], no) && !memcmp(im[1], ref[1], no) && render_gpu_fallbacks() == 1, "GPU failure -> CPU render");
+          unsetenv("UFSM_RENDER_GPU_FAIL"); free(im[0]); free(im[1]); }
+        /* a device tier of 8 chunks (the rest in mapped pinned host slots), and none at all, at a tiny and a large budget */
+        for (int t = 0; t < 4; t++) { setenv("UFSM_RENDER_GPU_DEVMB", t & 1 ? "0" : "16", 1); uint8_t *im[2] = {calloc(no, 1), calloc(no, 1)};
+          CHECK(!render_wrap_chunked(zz, 2, dp, X, Y, Z, w, h, gs, im, ow, oh, nullptr, t < 2 ? 1 : (size_t)1 << 32, 3, 2, 1) && !memcmp(im[0], ref[0], no) && !memcmp(im[1], ref[1], no), "GPU host-tier slots %d", t);
+          free(im[0]); free(im[1]); }
+        unsetenv("UFSM_RENDER_GPU_DEVMB");
+#endif
         /* render_wraps_chunked: this grid and a second one 3 voxels outward (with its own holes) in one pass = each grid alone */
         {
             float *X2 = malloc(sizeof(float) * w * h), *Y2 = malloc(sizeof(float) * w * h), *Z2 = malloc(sizeof(float) * w * h);
@@ -289,6 +303,9 @@ int main(void) {
     }
     free(ct); free(ink); free(ink2);
     snprintf(p, sizeof p, "rm -rf '%s'", dir); if (system(p)) {}
+#ifdef RENDER_GPU
+    CHECK(render_gpu_count() >= 9 && render_gpu_fallbacks() == 1, "GPU renders: %d, %d on the CPU", render_gpu_count(), render_gpu_fallbacks()); fprintf(stderr, "test_render_stream: %d renders on the GPU\n", render_gpu_count());
+#endif
     if (fails) { fprintf(stderr, "test_render_stream: %d failures\n", fails); return 1; }
     printf("test_render_stream: OK\n");
     return 0;

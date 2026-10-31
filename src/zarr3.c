@@ -427,7 +427,7 @@ typedef struct {
     int *ready, rq_head, rq_tail, rq_closed;
     pthread_mutex_t rq_mu; pthread_cond_t rq_cv;
     uint32_t submask;   /* z3_read_sub */
-    uint8_t *dsink; _Atomic uint32_t dmask;   /* z3_read_sub_dev: the device chunk the GPU decodes into, the substreams it did */
+    uint8_t *dsink; _Atomic uint32_t dmask; int lean;   /* z3_read_sub_dev: the device chunk the GPU decodes into, the substreams it did; lean: z3_read_sub_dev_lean */
 } job;
 
 static void job_failed(job *jb) {
@@ -457,6 +457,13 @@ static uint32_t auto_submask(const job *jb, const work *w) {
     for (int64_t bz = a[0] >> 4; bz <= e[0] >> 4; bz++) for (int64_t by = a[1] >> 5; by <= e[1] >> 5; by++) mk |= 1u << (bz * 4 + by);
     return mk == 0xffffffffu ? 0 : mk;
 }
+static void copy_chunk(const job *jb, const work *w, const uint8_t *chunk);
+/* the decoded chunk into out: whole, or (a lean device-sink read: one aligned 128^3 chunk) only the substreams the host decoded */
+static void copy_out(const job *jb, const work *w, const uint8_t *chunk, uint32_t hsub) {
+    if (hsub == 0xffffffffu || !jb->lean) { copy_chunk(jb, w, chunk); return; }
+    for (int s = 0; s < 32; s++) if (hsub >> s & 1)
+        for (int z = 16 * (s / 4); z < 16 * (s / 4) + 16; z++) { const size_t o = ((size_t)z * 128 + 32 * (s % 4)) * 128; memcpy(jb->out + o, chunk + o, 32 * 128); }
+}
 static void copy_chunk(const job *jb, const work *w, const uint8_t *chunk) {
     const z3_meta *m = &jb->z->m;
     int64_t c0[3] = {w->sz * m->shard[0] + (int64_t)w->cz * m->chunk[0],
@@ -479,7 +486,8 @@ static void copy_chunk(const job *jb, const work *w, const uint8_t *chunk) {
         }
 }
 
-static int decode_into(const z3 *z, const uint8_t *enc, size_t n, uint8_t *dec, ZSTD_DCtx *dctx, uint8_t *scratch, int *mask, uint32_t submask, uint8_t *dsink, _Atomic uint32_t *dmask) {
+static int decode_into(const z3 *z, const uint8_t *enc, size_t n, uint8_t *dec, ZSTD_DCtx *dctx, uint8_t *scratch, int *mask, uint32_t submask, uint8_t *dsink, _Atomic uint32_t *dmask, int lean, uint32_t *hsub) {
+    *hsub = 0xffffffffu;   /* the substreams dec holds (all but for a lean device-sink read) */
     const z3_meta *m = &z->m;
     size_t cv = (size_t)m->chunk[0] * m->chunk[1] * m->chunk[2];
     if (mask) *mask = 0;
@@ -506,7 +514,8 @@ static int decode_into(const z3 *z, const uint8_t *enc, size_t n, uint8_t *dec, 
             const uint32_t want = sub ? submask : 0xffffffffu;
             uint32_t need = want;
             XXH128_hash_t hk = {0, 0};
-            if (sub) memset(dec, 0, cv);
+            const int lean1 = lean && dsink;   /* z3_read_sub_dev_lean: only the host-decoded substreams are copied out, no zeroing */
+            if (sub && !lean1) memset(dec, 0, cv);
             if (zshm_on()) {
                 hk = XXH3_128bits(enc, n);
                 for (uint32_t s = 0; s < VF_NSUB; s++) if (want >> s & 1 && zshm_get(hk.low64, hk.high64, s, dec)) need &= ~(1u << s);
@@ -517,6 +526,7 @@ static int decode_into(const z3 *z, const uint8_t *enc, size_t n, uint8_t *dec, 
                 uint32_t dev = 0;
                 if (st == VOLCOMP_OK) st = z3_decode_subs(&p, need, dec, dsink, &dev);
                 if (dev) { atomic_fetch_or(dmask, dev); need &= ~dev; }   /* on the device only: not in dec, not for the shared cache */
+                if (lean1) *hsub = want & ~dev;
                 if (st == VOLCOMP_OK && zshm_on()) for (uint32_t s = 0; s < VF_NSUB; s++) if (need >> s & 1) zshm_put(hk.low64, hk.high64, s, dec);
             }
         } else if (sub && cv == VOLCOMP_CHUNK_VOXELS && vll_chunk_mode(enc, n, &mode) == VOLCOMP_OK && mode == VLL_MODE_CODED) {
@@ -792,10 +802,10 @@ static int run_task(job *jb, int task, uint8_t *fetched, uint8_t *dec, uint8_t *
             work *w = &jb->items[i + j]; char item[16]; snprintf(item, sizeof item, "%d", w->ci);
             const uint8_t *enc = group + (size_t)(w->off - rg->off); size_t n = (size_t)w->len;
             cache_put(z, skey, item, enc, n); atomic_fetch_add(&g_z3_store_reads, 1);
-            int msk;
-            if (decode_into(z, enc, n, dec, dctx, scratch, &msk, jb->submask ? jb->submask : auto_submask(jb, w), jb->dsink, &jb->dmask)) { rc = -1; break; }
+            int msk; uint32_t hs;
+            if (decode_into(z, enc, n, dec, dctx, scratch, &msk, jb->submask ? jb->submask : auto_submask(jb, w), jb->dsink, &jb->dmask, jb->lean, &hs)) { rc = -1; break; }
             if (msk) mc_put(z, w, dec, cv);
-            copy_chunk(jb, w, dec);
+            copy_out(jb, w, dec, hs);
         }
         free(group);
         return rc;
@@ -827,11 +837,11 @@ static int run_task(job *jb, int task, uint8_t *fetched, uint8_t *dec, uint8_t *
         }
         cache_put(z, skey, item, b, n);
     }
-    int msk, rc = decode_into(z, b, n, dec, dctx, scratch, &msk, jb->submask ? jb->submask : auto_submask(jb, w), jb->dsink, &jb->dmask);
+    int msk; uint32_t hs; int rc = decode_into(z, b, n, dec, dctx, scratch, &msk, jb->submask ? jb->submask : auto_submask(jb, w), jb->dsink, &jb->dmask, jb->lean, &hs);
     free(b);
     if (rc) return -1;
     if (msk && mc_on) mc_put(z, w, dec, cv);
-    copy_chunk(jb, w, dec);
+    copy_out(jb, w, dec, hs);
     return 0;
 }
 /* batch mode: the next ready task (blocks), -1 when the queue is closed and drained */
@@ -960,17 +970,23 @@ static void z3_fill(const z3_meta *m, uint8_t *out, size_t nv, int nthreads) {
         for (size_t i = 0; i < nv; i++) memcpy(out + i * m->esize, e, (size_t)m->esize);
     }
 }
-static int z3_read_impl(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads, uint32_t submask, uint8_t *dsink, uint32_t *dmask);
-int z3_read(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads) { return z3_read_impl(z, o, n, out, nthreads, 0, nullptr, nullptr); }
-int z3_read_sub(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads, uint32_t submask) { return z3_read_impl(z, o, n, out, nthreads, submask, nullptr, nullptr); }
-int z3_read_sub_dev(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads, uint32_t submask, uint8_t *dchunk, uint32_t *dev_mask) {
+static int z3_read_impl(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads, uint32_t submask, uint8_t *dsink, uint32_t *dmask, int lean);
+int z3_read(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads) { return z3_read_impl(z, o, n, out, nthreads, 0, nullptr, nullptr, 0); }
+int z3_read_sub(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads, uint32_t submask) { return z3_read_impl(z, o, n, out, nthreads, submask, nullptr, nullptr, 0); }
+static int z3_read_sub_dev_impl(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads, uint32_t submask, uint8_t *dchunk, uint32_t *dev_mask, int lean) {
     *dev_mask = 0;
     const z3_meta *m = &z->m;   /* one whole, aligned 128^3 uint8 chunk; the shared cache off (it stores host bytes) */
     const int one = dchunk && m->chunk[0] == 128 && m->chunk[1] == 128 && m->chunk[2] == 128 && m->esize == 1 && n[0] == 128 && n[1] == 128 && n[2] == 128 &&
                     !(o[0] % 128) && !(o[1] % 128) && !(o[2] % 128) && !zshm_on() && gpudec_enabled();
-    return z3_read_impl(z, o, n, out, nthreads, submask, one ? dchunk : nullptr, dev_mask);
+    return z3_read_impl(z, o, n, out, nthreads, submask, one ? dchunk : nullptr, dev_mask, lean);
 }
-static int z3_read_impl(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads, uint32_t submask, uint8_t *dsink, uint32_t *dmask) {
+int z3_read_sub_dev(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads, uint32_t submask, uint8_t *dchunk, uint32_t *dev_mask) {
+    return z3_read_sub_dev_impl(z, o, n, out, nthreads, submask, dchunk, dev_mask, 0);
+}
+int z3_read_sub_dev_lean(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads, uint32_t submask, uint8_t *dchunk, uint32_t *dev_mask) {
+    return z3_read_sub_dev_impl(z, o, n, out, nthreads, submask, dchunk, dev_mask, 1);
+}
+static int z3_read_impl(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads, uint32_t submask, uint8_t *dsink, uint32_t *dmask, int lean) {
     const z3_meta *m = &z->m;
     const size_t nv = (size_t)n[0] * n[1] * n[2];
     /* a box inside the array whose chunks are all present (sharded) is overwritten entirely by the chunk copies: no fill pass (the
@@ -1076,7 +1092,7 @@ static int z3_read_impl(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *
         }
     }
     job jb = {.z = z, .o = o, .n = n, .out = out, .items = items, .nitems = nitems,
-              .ranges = ranges, .nranges = nranges, .submask = submask, .dsink = dsink};
+              .ranges = ranges, .nranges = nranges, .submask = submask, .dsink = dsink, .lean = lean && dsink};
     if (nthreads <= 0) nthreads = (int)ufsm_ncpu();
     int ntasks = ranges ? nranges : nitems;
     store_req *reqs = nullptr; int *task_of = nullptr; char (*rkeys)[1200] = nullptr; int nreq = 0;

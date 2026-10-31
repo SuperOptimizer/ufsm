@@ -22,6 +22,10 @@ static int fails;
 #define CHECK(c, ...) do { if (!(c)) { fprintf(stderr, "FAIL %s:%d: ", __FILE__, __LINE__); fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); fails++; } } while (0)
 
 int main(void) {
+#ifdef RENDER_GPU   /* every chunk-ordered render through the GPU path (nn_render.cu), lossy chunks decoded on the device (gpudec) */
+    setenv("UFSM_RENDER_GPU", "1", 1); setenv("UFSM_GPU_DECODE", "1", 1); setenv("UFSM_RENDER_GPU_POISON", "1", 1);
+    setenv("UFSM_GPU_DECODE_THREADS", "128", 1);   /* the most decoders (two staging buffers each) */
+#endif
     char dir[] = "/tmp/test_render_fill_XXXXXX"; CHECK(mkdtemp(dir) != nullptr, "mkdtemp");
     char p[800], q[800];
     const int S = 128; const int64_t shape[3] = {48, 64, 64};
@@ -150,6 +154,9 @@ int main(void) {
     for (int v = 0; v < 2; v++) { z3_close(zz[v]); free(ref[v]); free(im[v]); }
     free(fl); free(buf);
     snprintf(p, sizeof p, "rm -r '%s'", dir); if (system(p)) {}
+#ifdef RENDER_GPU
+    CHECK(render_gpu_count() >= 6 && !render_gpu_fallbacks(), "GPU renders: %d, %d on the CPU", render_gpu_count(), render_gpu_fallbacks()); fprintf(stderr, "test_render_fill: %d renders on the GPU\n", render_gpu_count());
+#endif
     if (fails) { fprintf(stderr, "test_render_fill: %d failures\n", fails); return 1; }
     printf("test_render_fill: ok\n");
     return 0;

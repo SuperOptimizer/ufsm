@@ -510,6 +510,20 @@ freed after its last use, and only the volcomp substreams (16 z x 32 y x 128 x s
 size, e.g. recto + verso) in one chunk pass. Same bytes on every path (`UFSM_RENDER_TILED=1`, `UFSM_RENDER_FULLDECODE=1`:
 the old paths). A whole Paris 3 wrap (338 cm², 1.6 Gpixel): 5:28 -> 1:37.
 
+`render --gpu 1` (the default; `--gpu 0`: the CPU path; `src/nn_render.cu`; same bytes, every `--fill*` / `--depth` / `--joint` / `--crop` mode) runs
+the chunk-ordered renderer on the GPU. Decoded chunks stay on the device. The decoder threads have gpudec decode the lossy
+substreams straight into a device chunk pool (device-sink requests ignore `UFSM_GPU_DECODE_MIN_BYTES`). `--gpu 1` sets `UFSM_GPU_DECODE=1` (unless set) when the device has room for the GPU path,
+and runs 128 decoders (`UFSM_RENDER_GPU_DECODERS`). Anything decoded on the host is uploaded from pinned staging
+buffers. The kernel evaluates `src/render_core.h` `rc_pixel`, the per-pixel arithmetic shared with the CPU renderer (built
+with `-fmad=false`, no fast math). Its outputs go to mapped pinned memory, two launches in flight. The pool is sized from the
+device's free memory (`UFSM_RENDER_GPU_MEM` GB caps it; the GPU may be shared). When a live chunk set exceeds the device (P3
+stripes peak ~29 GB), mapped pinned host slots hold the rest. Any device error, or a pool too full for the earliest chunk row,
+re-renders on the CPU. `UFSM_RENDER_PROF=1` prints decoder and driver times. Back to back, --gpu 0 -> 1: w178 per-wrap render on
+the idle laptop (5080, 8 threads): render 37.1 -> 9.6 s, wall 40.6 -> 13.7 s; Paris 4 stripe ws010 on the desk (5060 Ti, load ~90): wall
+43 -> 22 s, CPU 700 -> 195 s; next to a compute-saturating GPU job: 43 -> 24 s; on a full device the render falls back to the CPU (GPU
+decoding stays off then), same speed as --gpu 0. The hole fills around the samples (`--fill-grid` grid bridging: its Laplace pass one hole per thread, same bytes; `--fill-inpaint` /
+`--fill-pm`) stay on the CPU (a few seconds per stripe).
+
 **ink-compare** prints per-ink statistics (mean, frac50, p50 / p95 / p99, band contrast at `--rs-um` / `--rl-um`, pairwise
 correlation) and writes CT | ink panels, Pillow-BOX-halved (`--full`: full size) and fitted to `--max-px`. It streams the
 renders strip by strip (Paris 3 wrap: 51.6 GB -> 0.47 GB; `UFSM_INKCMP_MEM=1`: the in-memory version, same bytes). Under 5% of
