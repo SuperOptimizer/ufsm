@@ -216,13 +216,13 @@ pw_one() {   # pw_one WRAP GPU
   echo "$(date '+%F %T') $w $(grep -E '^[^ ]+: input' $L.flat.log | head -1 | grep -oE '= [0-9.]+ cm2')" >> $O/logs/perwrap.list
 }
 perwrap() {
-  [ "$DRY" = 1 ] && { echo "    per wrap (largest first, SPAR ${SPAR:-4}, GPUs alternating): tifxyz-scale -> flatten --gpu 1 -> tifxyz-scale --flip-rows 1 -> render (ink + CT) -> ink-compare --then"; return 0; }
+  [ "$DRY" = 1 ] && { echo "    per wrap (largest first, SPAR ${SPAR:-4}, GPUs of FITGPUS in turn): tifxyz-scale -> flatten --gpu 1 -> tifxyz-scale --flip-rows 1 -> render (ink + CT) -> ink-compare --then"; return 0; }
   mkdir -p $O/orig $O/flat $O/up $O/r $O/img $O/prev $O/logs/pw
-  local w k=0 rc=0
+  local w k=0 rc=0 pg=($FITGPUS)
   for w in $(for f in $O/wraps/w*.sfc; do w=$(basename $f .sfc); [ -e $O/img/${w}_full_side.jpg ] || echo "$(stat -c %s $f) $w"; done | sort -rn | awk '{print $2}'); do
     stopped && break
     while [ $(jobs -r | wc -l) -ge ${SPAR:-4} ]; do sleep 5; done; memok
-    pw_one $w $((k % 2)) & k=$((k + 1))
+    pw_one $w ${pg[$((k % ${#pg[@]}))]} & k=$((k + 1))
   done; wait
   echo "perwrap: $(ls $O/img/*_full_side.jpg 2>/dev/null | wc -l) wraps rendered" >> $O/logs/perwrap.log
 }
