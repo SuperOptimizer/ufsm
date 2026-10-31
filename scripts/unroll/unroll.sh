@@ -201,14 +201,20 @@ lane() {   # lane GPU
     c0=$((k * I)); c1=$((c0 + I)); [ $c1 -gt $ze ] && c1=$ze; a=$((c0 - OV)); [ $a -lt 0 ] && a=0; b=$((c1 + OV)); [ $b -gt $ze ] && b=$ze
     rm -rf $d/f $d/fit; bash $MKCROP $F $d/f $a 0 0 $((b - a)) $ny $nx > /dev/null || continue
     echo "$c0 $c1 $a $b" > $d/cells; memok; t0=$(date +%s)
-    env UFSM_FIT_THREADS=10 /usr/bin/time -v nice -n 5 $U fit $d/f --gpu $g --out $d/fit --dir $dir --ref-model $REF --ref-snap 1 --uw-repair 0 ${FITX:-} > $d/fit.log 2>&1; rc=$?
-    echo "$s $c0..$c1 rc $rc gpu $g $(( $(date +%s) - t0 ))s" >> $O/slabs.txt
+    # fields over FITMAN (0.75) of the card: in managed memory (a full 0490B cross-section, 15.4 GB on a 16.6 GB card, fits on the device
+    # but leaves no room for the models / gate blocks: OOM then an illegal access, rc 1); FIT_MANAGED=1 (the last refit try) forces it
+    local man=${FIT_MANAGED:-0} fgb; fgb=$(awk -v n=$(( (b - a) * ny * nx )) 'BEGIN { printf "%.2f", n * 10 / 1073741824 }')
+    [ "$man" = 1 ] || awk -v f=$fgb -v g=${GPUGB[$g]:-0} -v m=${FITMAN:-0.75} 'BEGIN { exit !(g > 0 && f > m * g) }' && man=1
+    env UFSM_FIT_THREADS=${FTHREADS:-10} $([ "$man" = 1 ] && echo UFSM_FIT_MANAGED=1) /usr/bin/time -v nice -n 5 $U fit $d/f --gpu $g --out $d/fit --dir $dir --ref-model $REF --ref-snap 1 --uw-repair 0 ${FITX:-} > $d/fit.log 2>&1; rc=$?
+    echo "$s $c0..$c1 rc $rc gpu $g $(( $(date +%s) - t0 ))s$([ "$man" = 1 ] && echo " managed")" >> $O/slabs.txt
     if [ $rc = 0 ]; then touch $d/done; elif grep -q "no data for the prior" $d/fit.log; then touch $d/empty $d/done; fi
     rm -rf $d/f; exec 9>&-
   done
 }
 slabs() {
-  local g pids=()
+  local g pids=() l
+  # the cards' memory (GB) by --gpu index, for the managed-memory rule (ufsm sysinfo: "gpu N: name, sm_X, S SMs, T GB (F GB free)")
+  declare -gA GPUGB; while read -r l; do [[ $l =~ ^gpu\ ([0-9]+):.*\ ([0-9.]+)\ GB\ \( ]] && GPUGB[${BASH_REMATCH[1]}]=${BASH_REMATCH[2]}; done < <($U sysinfo 2> /dev/null)
   for g in $FITGPUS; do
     if [ "$g" = "$INKGPU" ] && ! done_ ink; then { [ "$DRY" = 1 ] && echo "    (GPU $g lane starts once the ink is done or failed)" || while ! done_ ink && ! stopped && [ ! -e $O/state/ink.failed ]; do sleep 30; done; lane $g; } &
     else lane $g & fi; pids+=($!)
@@ -217,22 +223,24 @@ slabs() {
   [ "$DRY" = 1 ] && return 0
   local ns=$(( ($(jq -r '.shape[0]' $F/fields.json) + I - 1) / I )) nd=$(ls -d $O/slabs/s???/done 2>/dev/null | wc -l)
   cat $O/slabs/s???/fit.log | grep -E 'User time|System time|Maximum resident' >> $O/logs/slabs.log   # (the stage marker's CPU s)
-  log "slabs $nd of $ns done"; [ $nd = $ns ] || return 1
-  # bad slabs (a fit that "succeeded" with an illegal memory access, a zero loss or no final loss line: pods 10-31, GPU memory pressure):
-  # refit them on ONE lane (the first GPU of FITGPUS), up to 3 tries; the stage fails if any stays bad (the join refuses them too)
+  log "slabs $nd of $ns done"
+  # failed (rc != 0) and bad slabs (a fit that "succeeded" with an illegal memory access, a zero loss or no final loss line: pods 10-31, GPU
+  # memory pressure): refit on ONE lane (the first GPU of FITGPUS), up to 3 tries, the last with the fields in managed memory; the stage
+  # fails if any stays failed / bad (the join refuses bad ones too)
   local try bad; for try in 1 2 3; do
-    bad=$(badslabs); [ -z "$bad" ] && break
-    log "slabs: bad fits (try $try): $(for d in $bad; do basename $d; done | tr '\n' ' ')-> refit on 1 lane"
-    for d in $bad; do mv -f $d/fit.log $d/fit.bad$try.log; rm -rf $d/done $d/fit $d/empty; done
-    lane ${FITGPUS%% *}
+    bad=$(badslabs all); [ -z "$bad" ] && break
+    log "slabs: failed / bad fits (try $try): $(for d in $bad; do basename $d; done | tr '\n' ' ')-> refit on 1 lane$([ $try = 3 ] && echo ', managed memory')"
+    for d in $bad; do [ -e $d/fit.log ] && mv -f $d/fit.log $d/fit.bad$try.log; rm -rf $d/done $d/fit $d/empty; done
+    FIT_MANAGED=$([ $try = 3 ] && echo 1 || echo 0) lane ${FITGPUS%% *}
   done
-  bad=$(badslabs); [ -z "$bad" ] || { log "slabs: bad fits remain after 3 refits: $(for d in $bad; do basename $d; done | tr '\n' ' ')"; return 1; }
-  nd=$(ls -d $O/slabs/s???/done 2>/dev/null | wc -l); [ $nd = $ns ]
+  bad=$(badslabs all); [ -z "$bad" ] || { log "slabs: failed / bad fits remain after 3 refits: $(for d in $bad; do basename $d; done | tr '\n' ' ')"; return 1; }
+  nd=$(ls -d $O/slabs/s???/done 2>/dev/null | wc -l); log "slabs $nd of $ns done after the checks"; [ $nd = $ns ]
 }
-# badslabs: the slab dirs whose (non-empty) fit is bad: fit.log has "illegal memory" or "loss 0.00000", or lacks the final "fit: ... loss X" line
+# badslabs [all]: the slab dirs whose (non-empty) fit is bad: fit.log has "illegal memory" or "loss 0.00000", or lacks the final "fit: ...
+# loss X" line; all: also the slabs that are not done (a failed fit)
 badslabs() {
-  local d; for d in $O/slabs/s???; do
-    [ -e $d/done ] || continue; [ -e $d/empty ] && continue
+  local d ns=$(( ($(jq -r '.shape[0]' $F/fields.json) + I - 1) / I )) k; for k in $(seq 0 $((ns - 1))); do d=$O/slabs/$(printf 's%03d' $k)
+    if [ ! -e $d/done ]; then [ "${1:-}" = all ] && echo $d; continue; fi; [ -e $d/empty ] && continue
     if [ ! -e $d/fit.log ] || grep -qE 'illegal memory|loss 0\.00000' $d/fit.log || ! grep -qE '^fit: .*loss [0-9]' $d/fit.log; then echo $d; fi
   done
 }
@@ -338,7 +346,7 @@ pw_one() {   # pw_one WRAP GPU (a background subshell: the cache env stays in it
   fi
   nice -n 10 $U tifxyz-scale $O/flat $O/up 1 --wraps $w --flip-rows 1 > /dev/null 2>&1 || return 1
   mkdir -p $d/in; ln -sfn $O/up/$w $d/in/$w
-  UFSM_RENDER_MEM=16 UFSM_RENDER_CHUNKED=1 nice -n 10 $U render $d/in $d --volume $INK $LUM --ct $R $K/$LV --depth 1 --scale 1 --threads ${RTH:-8} > $d/render.log 2>&1 || return 1
+  UFSM_RENDER_MEM=16 UFSM_RENDER_CHUNKED=1 UFSM_RENDER_GPU_MEM=${UFSM_RENDER_GPU_MEM:-4} CUDA_VISIBLE_DEVICES=$gpu nice -n 10 $U render $d/in $d --volume $INK $LUM --ct $R $K/$LV --depth 1 --scale 1 --threads ${RTH:-8} > $d/render.log 2>&1 || return 1
   nice -n 10 $U ink-compare $O/img/${w}_full_side.jpg --ct $d/${w}_ct.tif --ink "ift3=$d/$w.tif" --px-um $LUM --stretch --stretch-ct --max-px 65000 --threads ${RTH:-8} \
     --then $O/prev/${w}_side.jpg --max-px 8000 > $d/stats.txt 2>&1
   [ -e $O/img/${w}_full_side.jpg ] && rm -f $d/$w.tif $d/${w}_ct.tif
