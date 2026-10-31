@@ -56,6 +56,7 @@ int cmd_predict(int argc, char **argv);
 int cmd_eval(int argc, char **argv);
 int cmd_refine(int argc, char **argv);       /* src/surf.c */
 int cmd_surf_stats(int argc, char **argv);
+int cmd_wrap_snap(int argc, char **argv);   /* src/wrapsnap.c */
 int cmd_self_gate(int argc, char **argv);
 int cmd_stitch(int argc, char **argv);   /* src/stitch.c */
 int cmd_coreline(int argc, char **argv);   /* src/coreline.c */
@@ -186,6 +187,7 @@ static int usage(void) {
         "  ufsm wrapswitch <wraps-dir> <codes-root> <codes-key>            how often the wraps switch sheets (per cm)\n"
         "  ufsm wrap-check <model> <fields-dir> [--ct ROOT KEY --ct-um U] [--codes ROOT KEY]   duplicate / merged wraps: CT peaks between adjacent wraps along radial rays\n"
         "  ufsm surf-snap <wraps-in> <wraps-out> --volume ROOT KEY --vol-um U   tifxyz vertices onto the nearest papyrus ridge\n"
+        "  ufsm wrap-snap <wraps-in> <wraps-out> --axis F --axis-um U0 --ct ROOT KEY --ct-um U   .sfc wraps moved along their rays onto the sheets (smooth, order-kept)\n"
         "  ufsm refine <wraps-in> <wraps-out> --fields DIR [--range 0.33] [--smooth-um 40]   vertices onto the fields' sheet phase\n"
         "  ufsm surf-stats <wraps-dir> --fields DIR [--ct ROOT KEY --ct-um U]   label-free surface quality (phase, switches, CT)\n"
         "  ufsm self-gate <wraps-dir> <out-dir> --fields DIR --model FIT [--ct ..] [--nb FIT].. [--exclude ..]   strict stretches of a box fit -> label tifxyz + q.tif\n"
@@ -4239,6 +4241,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "surf-snap")) return cmd_surfsnap(argc, argv);
     if (!strcmp(cmd, "refine")) return cmd_refine(argc, argv);
     if (!strcmp(cmd, "surf-stats")) return cmd_surf_stats(argc, argv);
+    if (!strcmp(cmd, "wrap-snap")) return cmd_wrap_snap(argc, argv);
     if (!strcmp(cmd, "self-gate")) return cmd_self_gate(argc, argv);
     if (!strcmp(cmd, "ct-fields")) return cmd_ct_fields(argc, argv);
     if (!strcmp(cmd, "fit-compare")) return cmd_fit_compare(argc, argv);

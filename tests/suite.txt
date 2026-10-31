@@ -75,6 +75,7 @@ test_afv                                       |              |     1 | ./$B/tes
 test_flatten                                   |              |    11 | ./$B/test_flatten
 test_flatten_gpu                               | gpu          |    80 | ./$B/test_flatten_gpu
 test_strip                                     |              |     4 | ./$B/test_strip
+test_wrapsnap                                  |              |     3 | ./$B/test_wrapsnap
 test_faces                                     |              |     1 | ./$B/test_faces
 test_fit_emb                                   |              |    60 | ./$B/test_fit_emb
 test_distill                                   | gpu          |     1 | ./$B/test_distill

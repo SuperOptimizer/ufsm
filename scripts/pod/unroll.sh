@@ -10,7 +10,7 @@
 # Pod defaults (per-stage RAM table in README "Pod runs"), all overridable by env:
 #   TH = cgroup CPUs; PTH / ITH (predict threads) = TH; FIELDGPUS = FITGPUS = INKGPU = 0 (one GPU or MIG slice);
 #   MINMEM 8 (cgroup-aware with `ufsm sysinfo --avail-gb`); CFMEM (count-field --mem-gb) = min(24, 40% of the cgroup RAM);
-#   PERWRAP 0. The strip is the deliverable. Per-wrap renders beside the strip would add 16-24 GB each.
+#   SNAP 1 (wrap-snap the wraps onto the sheets before the strip; SNAPT mix), PERWRAP 0. The strip is the deliverable. Per-wrap renders beside the strip would add 16-24 GB each.
 #   CLEAN 1: fields and slab fits are deleted once the wraps exist.
 set -u
 S=${1:?usage: unroll.sh SCROLL}; shift || true
