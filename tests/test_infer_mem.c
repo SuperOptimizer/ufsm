@@ -13,6 +13,7 @@
 #include <string.h>
 
 static int fails;
+static int g_quick;   /* UFSM_TEST_QUICK (make test): fewer CT-stem cases (P 128, every path once) */
 static int g_lh16;   /* the CT helpers below: fp16 logits (predict's unet_set_fp16_logits), 2 B per output voxel */
 static float h2f(uint16_t h) {   /* IEEE half -> float (the test's comparisons) */
     const uint32_t s = (uint32_t)(h >> 15) << 31, e = (h >> 10) & 31, m = h & 1023;
@@ -133,6 +134,7 @@ static size_t split_run_ct(split_ctx *ctx, const unet_cfg *cfg, int sc, int P, i
 }
 
 int main(void) {
+    g_quick = getenv("UFSM_TEST_QUICK") && atoi(getenv("UFSM_TEST_QUICK"));
     nn_init(0); nn_set_tf32(1); nn_set_f16(1); nn_set_prec(3); nn_set_gn_stored(1);
     if (!nn_mx_ok()) { printf("test_infer_mem: skipped (the MX paths are off: no fp4 / fp8 tensor cores and UFSM_MX_EMU not 1)\n"); return 0; }   /* (MX-fp4 placement only) */
     unet_set_act_mx4(1); unet_set_act_mx8(0); unet_set_grad_mx8(0); unet_set_input_mx(1);
@@ -218,6 +220,7 @@ int main(void) {
         int dev1 = 1; if (nn_init(1)) { dev1 = 0; nn_check(); } nn_init(0);
         split_ctx *ctx = split_create(0, dev1);
         for (int sc = 0; sc < 2; sc++) for (int P = 128; P <= 192; P += 64) {
+            if (g_quick && (P > 128 || sc)) continue;   /* (make test: P 128, scale_cond 0 (1 above); the rest in make test-slow) */
             unet_cfg cfg = {6, {32, 64, 96, 128, 160, 192}, 4, 7, 8, 1, sc};
             const size_t p3 = (size_t)P * P * P;
             uint8_t *hct = malloc(p3); float *hrow = malloc(2 * (size_t)P * 4);
@@ -249,6 +252,7 @@ int main(void) {
         split_ctx *ctx = split_create(0, dev1);
         const unet_cfg cfg = {7, {16, 16, 32, 64, 128, 192, 256}, 4, 2, 8, 0, 0};
         for (int lh = 0; lh < 2; lh++) for (int ip = 8; ip >= 4; ip -= 4) for (int P = 128; P <= 256; P += 128) {
+            if (g_quick && (P > 128 || (!lh && ip == 4))) continue;   /* (make test: P 128; fp4 input with fp16 logits only) */
             if (lh && ip == 8) continue;   /* (fp16 logits over X: the production input precision) */
             g_lh16 = lh;
             if (unet_set_input_prec(ip)) return 2;
