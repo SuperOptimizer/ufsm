@@ -1792,6 +1792,7 @@ static fit_model *fit_run_dir(const fit_fields *f, const fit_cfg *c) {
             if (cpu) { for (int k = 0; k < 10; k++) pa[k] = phost[k] = pp.a[k]; }
             else {
                 pdev = nn_malloc(10 * np);
+                if (!pdev) { fprintf(stderr, "fit: out of GPU memory for the fields pooled by %d (%.1f GB): crop the fields in y / x (the papyrus box) or use a larger GPU\n", fp, 10.0 * np / 1e9); fit_free(m); return nullptr; }
                 for (int k = 0; k < 10; k++) { nn_h2d(pdev + k * np, pp.a[k], np); pa[k] = pdev + k * np; if (sq < 0) free(pp.a[k]); }
             }
             fd.D = pp.D; fd.H = pp.H; fd.W = pp.W; fd.h = (float)(f->h * fp);
