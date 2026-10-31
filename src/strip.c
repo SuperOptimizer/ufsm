@@ -34,6 +34,7 @@
      wrap (strip_papyrus.tsv, papyrus_wraps.tsv): where the surface leaves the papyrus is reported, never cut. */
 #include "flatten.h"
 #include "imgops.h"
+#include "jpegpar.h"
 #include "tiffw.h"
 #include "surfcomp.h"
 #include <dirent.h>
@@ -651,22 +652,16 @@ static void *ms_pass1(void *arg) {
     }
     return nullptr;
 }
-#include <jpeglib.h>
+typedef struct { int w, h, ca, cb, ia, ib; const uint8_t *ct, *ink, *m; } ms_rows;
+static void ms_stripe_row(void *u, int y, int x0, int n, uint8_t *dst) {   /* (called from the encoder's threads) */
+    const ms_rows *R = u; const int k = y >= R->h; const size_t o = (size_t)(k ? y - R->h : y) * R->w + x0; const uint8_t *src = k ? R->ink : R->ct;
+    for (int x = 0; x < n; x++) dst[x] = R->m[o + x] ? (k ? stretch(src[o + x], R->ia, R->ib) : stretch(src[o + x], R->ca, R->cb)) : 0;
+}
 static int ms_jpeg_stripe(const char *path, int w, int h, const uint8_t *ct, const uint8_t *ink, const uint8_t *m, int ca, int cb, int ia, int ib, int q) {
-    /* CT over ink, stretched, 0 off the surface: streamed row by row (the same bytes as jpeg_write_gray of the stacked image) */
-    FILE *f = fopen(path, "wb"); if (!f) return -1;
-    struct jpeg_compress_struct ci; struct jpeg_error_mgr je;
-    ci.err = jpeg_std_error(&je); jpeg_create_compress(&ci); jpeg_stdio_dest(&ci, f);
-    ci.image_width = (JDIMENSION)w; ci.image_height = (JDIMENSION)(2 * h); ci.input_components = 1; ci.in_color_space = JCS_GRAYSCALE;
-    jpeg_set_defaults(&ci); jpeg_set_quality(&ci, q, TRUE); jpeg_start_compress(&ci, TRUE);
-    uint8_t *row = malloc((size_t)w);
-    while (ci.next_scanline < ci.image_height) {
-        const int y = (int)ci.next_scanline, k = y >= h; const size_t o = (size_t)(k ? y - h : y) * w; const uint8_t *src = k ? ink : ct;
-        for (int x = 0; x < w; x++) row[x] = m[o + x] ? (k ? stretch(src[o + x], ia, ib) : stretch(src[o + x], ca, cb)) : 0;
-        JSAMPROW r = row; jpeg_write_scanlines(&ci, &r, 1);
-    }
-    jpeg_finish_compress(&ci); jpeg_destroy_compress(&ci); free(row);
-    return fclose(f) ? -1 : 0;
+    /* CT over ink, stretched, 0 off the surface: rows generated on the fly by the banded multithreaded encoder (the same bytes as
+       jpeg_write_gray of the stacked image, = libjpeg's) */
+    ms_rows R = {.w = w, .h = h, .ca = ca, .cb = cb, .ia = ia, .ib = ib, .ct = ct, .ink = ink, .m = m};
+    return jpar_write(path, w, 2 * h, 1, q, nullptr, ms_stripe_row, &R, 0);
 }
 static int ms_jpeg_stripe_pap(const char *path, int w, int h, const uint8_t *ct, const uint8_t *ink, const uint8_t *m, int ca, int cb, int ia, int ib, float gain, int bg, int q) {
     /* --papyrus: one RGB band, the CT ramp under the ink (img_pap_rgb), grey bg off the surface and where the CT is 0 */
