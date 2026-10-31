@@ -40,8 +40,11 @@ void nn_host_free(void *p);
 /* pipelined uploads: an async copy on a per-device copy stream (pinned source), events to order it against the compute stream */
 void nn_h2d_copy_stream(void *dst, const void *src, size_t bytes);
 void *nn_event_create(void);
-void nn_event_record(void *ev, int on_copy_stream);      /* 0: compute stream, 1: copy stream */
-void nn_stream_wait(int copy_stream_waits, void *ev);    /* make the copy stream (1) or the compute stream (0) wait for ev */
+void nn_event_record(void *ev, int on_copy_stream);      /* 0: compute stream, 1: copy stream, 2: the aux stream (nn_d2d_aux) */
+void nn_stream_wait(int copy_stream_waits, void *ev);    /* make the copy stream (1), the aux stream (2) or the compute stream (0) wait for ev */
+void nn_set_conv1_const(int on);   /* fp16 1^3 heads with constant-bank weights (UFSM_CONV1_CONST, default 1; bit-identical): 0 the staged kernel */
+void nn_d2d_aux(void *dst, const void *src, size_t bytes);   /* device copy on the per-device aux stream (ordered by events only:
+                                                                in-place slab plane copies overlapped with the next slab's conv) */
 void nn_event_sync(void *ev);
 /* activation offload: copy (pinned host <-> device) on an offload stream once the compute stream reaches this point (ev_start);
    ev_done completes with the copy (nn_stream_wait(0, ev_done) before the compute stream touches dst / src again) */
