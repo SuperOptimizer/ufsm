@@ -7,7 +7,9 @@
  * a hit is the same bytes a decode would give, whatever volume, store or path the chunk came from. Readers never block (a
  * per-slot sequence lock: a slot rewritten during the copy is a miss); writers claim a slot with a CAS, so a crashed process can at
  * worst leave a slot unusable for 10 minutes. The file keeps its first size: delete it to resize (or to drop the cache). Unset /
- * 0: off. UFSM_ZCACHE_STATS=1 prints hits / misses / puts at exit. */
+ * 0: off. UFSM_ZCACHE_STATS=1 prints hits / misses / puts at exit. UFSM_ZCACHE_ADMIT=f (0..1, default 1) stores only a fixed hash
+ * subset f of the substreams: when one job's working set exceeds the cache (a Paris 4 wrap decodes ~36 GB of substreams), LRU on a
+ * scan keeps nothing for the next job, a stable subset of about the cache's size does. */
 #pragma once
 /* header-only (static functions): included by zarr3.c, the only user */
 #include <stdint.h>
@@ -50,6 +52,7 @@ static zshm_slot *g_zs_slots;
 static uint8_t *g_zs_data;
 static pthread_once_t g_zs_once = PTHREAD_ONCE_INIT;
 static _Atomic uint64_t g_zs_hits, g_zs_misses, g_zs_puts;
+static uint64_t g_zs_admit = UINT64_MAX;   /* UFSM_ZCACHE_ADMIT f: only keys whose hash falls in the first f of the range are stored */
 
 static uint64_t zshm_now_s(void) { struct timespec t; clock_gettime(CLOCK_REALTIME, &t); return (uint64_t)t.tv_sec; }
 static void zshm_stats_atexit(void) {
@@ -106,6 +109,7 @@ static void zshm_init(void) {
     g_zs_slots = (zshm_slot *)((uint8_t *)m + slots_off);
     g_zs_data = (uint8_t *)m + h->data_off;
     g_zs_h = h;
+    if ((e = getenv("UFSM_ZCACHE_ADMIT")) && *e) { double f = atof(e); if (f >= 0 && f < 1) g_zs_admit = (uint64_t)(f * 18446744073709551615.0); }
     if ((e = getenv("UFSM_ZCACHE_STATS")) && *e && strcmp(e, "0")) atexit(zshm_stats_atexit);
 }
 
@@ -143,6 +147,7 @@ static inline size_t zshm_sub_off(uint32_t s, uint32_t z) { return ((size_t)(16u
 [[maybe_unused]] static void zshm_put(uint64_t k0, uint64_t k1, uint32_t s, const uint8_t *src) {
     if (!zshm_on()) return;
     uint64_t a, b; zshm_skey(k0, k1, s, &a, &b);
+    if (g_zs_admit != UINT64_MAX && zshm_mix(a + 0x5bd1e995u) > g_zs_admit) return;   /* not admitted: a stable subset stays cached */
     const uint64_t set = zshm_mix(a ^ b) % g_zs_h->nsets, t = zshm_now_s();
     zshm_slot *victim = nullptr; uint64_t vseq = 0, vstamp = UINT64_MAX;
     for (uint32_t w = 0; w < ZSHM_WAYS; w++) {
