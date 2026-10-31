@@ -516,7 +516,7 @@ substreams straight into a device chunk pool (device-sink requests ignore `UFSM_
 and runs 128 decoders (`UFSM_RENDER_GPU_DECODERS`). Anything decoded on the host is uploaded from pinned staging
 buffers. The kernel evaluates `src/render_core.h` `rc_pixel`, the per-pixel arithmetic shared with the CPU renderer (built
 with `-fmad=false`, no fast math). Its outputs go to mapped pinned memory, two launches in flight. The pool is sized from the
-device's free memory (`UFSM_RENDER_GPU_MEM` GB caps it; the GPU may be shared). When a live chunk set exceeds the device (P3
+device's free memory: at most min(50% of it, 8 GB) by default so a later slab fit on a shared GPU keeps room (`UFSM_RENDER_GPU_MEM` GB overrides, higher or lower). When a live chunk set exceeds the device (P3
 stripes peak ~29 GB), mapped pinned host slots hold the rest. Any device error, or a pool too full for the earliest chunk row,
 re-renders on the CPU. `UFSM_RENDER_PROF=1` prints decoder and driver times. Back to back, --gpu 0 -> 1: w178 per-wrap render on
 the idle laptop (5080, 8 threads): render 37.1 -> 9.6 s, wall 40.6 -> 13.7 s; Paris 4 stripe ws010 on the desk (5060 Ti, load ~90): wall

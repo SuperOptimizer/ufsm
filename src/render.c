@@ -662,7 +662,12 @@ static int wr_run(z3 *const *vz, int nv, const int *depth, int ns, const float *
             size_t reserve = (size_t)3 << 29; if (reserve < tot / 12) reserve = tot / 12;   /* >= 1.5 GB for gpudec and the driver */
             const double lim = getenv("UFSM_RENDER_GPU_MEM") ? atof(getenv("UFSM_RENDER_GPU_MEM")) * 1073741824.0 : 0;
             size_t cap = fr > reserve + grids + outb + 64 * cvmax ? fr - reserve - grids - outb : 0;
-            if (lim > 0 && cap > (size_t)lim) cap = (size_t)lim;
+            if (lim > 0) { if (cap > (size_t)lim) cap = (size_t)lim; }
+            else {   /* default: min(50% of the free memory, 8 GB): a slab fit starting later on a shared GPU (pods) keeps its room; the rest spills to
+                        mapped pinned host slots (same bytes). UFSM_RENDER_GPU_MEM=GB overrides (higher or lower) */
+                const size_t half = fr / 2, cap8 = (size_t)8 << 30, dflt = half < cap8 ? half : cap8;
+                if (cap > dflt) cap = dflt;
+            }
             if (cap < 128 * cvmax) { fprintf(stderr, "render gpu: %.2f GB free on device %d: CPU render\n", fr / 1073741824.0, dev); rc = 2; goto gout; }
             const char *nde = getenv("UFSM_RENDER_GPU_DECODERS");
             const int ndg = nde && atoi(nde) > 0 ? (atoi(nde) > 128 ? 128 : atoi(nde)) : gpudec_enabled() ? 128 : nd;
