@@ -1036,6 +1036,40 @@ template <typename T, typename TO> static void p16_f4(const void *x, shape5 xs, 
 }
 /* the 16-wide decoder conv1 with the fused upsample, MX-fp4 in / out (lp_f4up.cu): 0 = not this shape (the caller's path) */
 int lp_f4u_fwd(const void *x, shape5 xs, const float *w, const float *b, int cout, void *y, gnp_t gp, double *osum, int Go, const split_t &sp);
+/* GroupNorm + SiLU of an MX-fp4 input requantised once (conv_fwd_f4_k's staging transform, per stored 32-channel block and voxel: the
+   same values, amax, exponent and e2m1 codes as it stages them) into y, an MX-fp4 tensor of the input's layout: the convs whose Cop / BM
+   output tiles would each re-stage the input through the transform (levels >= 2: 2 .. 5 tiles, the input halo planes too) copy-stage
+   it instead (f4_prenorm, UFSM_F4_PRENORM); identical bytes */
+template <typename T>
+__global__ void __launch_bounds__(256) gn_prenorm_f4_k(const T *__restrict__ x, int N, int Ci, size_t S, gnp_t gp, uint8_t *__restrict__ y) {
+    __shared__ chan_t ctab[32]; __shared__ float2 cab[32]; __shared__ unsigned sgm;
+    const int blk = blockIdx.y, n = blockIdx.z, nb = Ci / 32;
+    if (threadIdx.x < 32) {
+        const split_t sp0 = {};
+        const chan_t c = make_chan(blk * 32 + (int)threadIdx.x, Ci, Ci, n, S, x, sp0, gp, N);
+        ctab[threadIdx.x] = c; cab[threadIdx.x] = make_float2(c.a, c.b);
+        const unsigned gm = __ballot_sync(0xffffffffu, c.g != 0);
+        if (threadIdx.x == 0) sgm = gm;
+    }
+    __syncthreads();
+    const size_t v = (size_t)blockIdx.x * 256 + threadIdx.x;
+    if (v >= S) return;
+    float val[32];
+    stage_row32<T>(ctab, v, true, true, val, cab, sgm);
+    unsigned amu = 0u;
+#pragma unroll
+    for (int k = 0; k < 32; k++) amu = amax_u(amu, val[k]);
+    const int e = mx_exp(__uint_as_float(amu), 1.f / 6.f);
+    const float m = exp2i(-e);
+    const size_t ri = ((size_t)n * nb + blk) * S + v;
+    *(uint4 *)(y + ri * 16) = make_uint4(cvt_e2m1x8(val, m), cvt_e2m1x8(val + 8, m), cvt_e2m1x8(val + 16, m), cvt_e2m1x8(val + 24, m));
+    y[(size_t)N * nb * S * 16 + ri] = (uint8_t)(e + 127);
+}
+static inline uint8_t *f4_prenorm_buf(size_t n) {   /* per device, grown on demand */
+    static uint8_t *buf[8]; static size_t cap[8]; const int d = cur_dev_();
+    if (n > cap[d]) { if (buf[d]) cudaFree(buf[d]); buf[d] = nullptr; cap[d] = 0; if (cudaMalloc(&buf[d], n) != cudaSuccess) { cudaGetLastError(); return nullptr; } cap[d] = n; }
+    return buf[d];
+}
 template <typename T, typename TO> void fwd_f4_t(const void *x, shape5 xs, const float *w, const float *b, int cout, void *y, gnp_t gp, double *osum, int Go, split_t sp) {
     static int uph2 = -1; if (uph2 < 0) uph2 = getenv("UFSM_UP_H2") ? atoi(getenv("UFSM_UP_H2")) : 1;
     if (sp.up && uph2) sp.up = 2;   /* the fused upsample blends in half2 (stage_up_smem_h2); UFSM_UP_H2=0: fp32 */
@@ -1096,6 +1130,17 @@ template <typename T, typename TO> void fwd_f4_t(const void *x, shape5 xs, const
         if (ru_env && ring_env && sp.up == 2 && sp.x2 && !sp.sr && Cip == 64 && CxP == 32 && MT == 2 && TZ == 4 && !tz_env && !(gp.ns || sp.gp2.ns) && xs.c > Cx) {
             launch_f4r<2, 4, 2, T, TO, 1>(x, xs, wq, ws, b, cout, y, Cop, gp, osum, Go, sp);
             return;
+        }
+    }
+    if constexpr (IS_MX4(T)) {   /* several output tiles over a GroupNorm input: requantise it once (gn_prenorm_f4_k), copy staging */
+        static int pn = -1; if (pn < 0) pn = getenv("UFSM_F4_PRENORM") ? atoi(getenv("UFSM_F4_PRENORM")) : 1;
+        if (pn && nmt >= 2 && gp.G && !gp.ns && !sp.x2 && !sp.up && !sp.sr && !sp.Di && !sp.zw1 && xs.c % 32 == 0 && Cip == xs.c) {
+            const size_t S = (size_t)xs.d * xs.h * xs.w, nbytes = (size_t)xs.n * (xs.c / 32) * S * 17;
+            uint8_t *q = f4_prenorm_buf(nbytes);
+            if (q) {
+                gn_prenorm_f4_k<T><<<dim3(nblk_(S, 256), (unsigned)(xs.c / 32), (unsigned)xs.n), 256>>>((const T *)x, xs.n, xs.c, S, gp, q);
+                x = q; gp = gnp_t{};
+            }
         }
     }
     dim3 grid(nblk_(xs.w, 16), nblk_(xs.h, 8), (unsigned)(zw_tiles(xs.d, TZ, sp) * nmt * xs.n));
