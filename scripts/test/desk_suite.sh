@@ -45,7 +45,7 @@ deskok() {   # wait (<= WAITMIN) until MemAvailable >= MEMGB and the 1-min load 
     a=$(awk '/^MemAvailable/ {print int($2 / 1048576)}' /proc/meminfo); l=$(cut -d' ' -f1 /proc/loadavg)
     [ "$a" -ge "$MEMGB" ] && awk -v l="$l" -v m="$LOADMAX" 'BEGIN {exit !(l <= m)}' && return 0
     [ $i = 0 ] && echo "desk_suite: desk busy (MemAvailable ${a} GB, need ${MEMGB}; load ${l}, max ${LOADMAX}): waiting <= ${WAITMIN} min"
-    [ $i -lt $n ] && sleep 30; done
+    [ $i -lt $n ] && { sleep 30 & wait $!; }; done   # (wait: a HUP runs the trap at once)
   echo "desk_suite: desk still busy (MemAvailable ${a} GB, load ${l}): giving up, try later"; return 1; }
 # the caller gone (ssh dropped, ^C on the laptop): no orphan build or suite on the desk. The script runs on a pty (ssh -tt), so the
 # desk side gets SIGHUP; the build and the runner lead their own process groups (setsid) and get a TERM (the runner's trap stops its
