@@ -5,6 +5,7 @@
 #include "fit.h"
 #include "fit_terms.h"
 #include "nn.h"
+#include "z3w.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -384,8 +385,49 @@ static void check_recto_fields(void) {
     for (int k = 0; k < 11; k++) { snprintf(p, sizeof p, "%s/%s", dir, names[k]); unlink(p); } rmdir(dir);
 }
 
+/* zarr fields (volcomp 128^3 chunks: the phase planes lossless, the rest lossy): fit_fields_load of rows crossing a chunk row decodes
+   only the 16-row substreams it needs (fit_submask); the rows equal a whole-chunk decode (UFSM_FIT_FULLDECODE=1) byte for byte */
+static void zarr_substream_case(void) {
+    char td[] = "/tmp/test_fit_zarr_XXXXXX"; if (!mkdtemp(td)) { fprintf(stderr, "FAIL: mkdtemp\n"); fails++; return; }
+    const int64_t shp[3] = {256, 128, 128}; const size_t cv = (size_t)128 * 128 * 128;
+    static const char *nm[10] = {"pc", "ps", "t0", "t1", "t2", "t3", "t4", "t5", "sp", "w"};
+    uint8_t *d = malloc(cv);
+    for (int k = 0; k < 10; k++) {
+        char p[1400]; snprintf(p, sizeof p, "%s/%s", td, nm[k]);
+        z3w *zw = z3w_create(p, shp, 128, k < 2 ? 0.f : 8.f, 128, nullptr);
+        if (!zw) { fprintf(stderr, "FAIL: z3w_create %s\n", p); fails++; free(d); return; }
+        for (int s = 0; s < 2; s++) {
+            for (int z = 0; z < 128; z++) for (int y = 0; y < 128; y++) for (int x = 0; x < 128; x++) {
+                const double v = 128 + 90 * sin(0.11 * (z + 128 * s) + 0.07 * k * y) * cos(0.05 * x + k) + ((z * 7 + y * 13 + x * 3 + k) % 9);
+                d[((size_t)z * 128 + y) * 128 + x] = (uint8_t)(k == 9 ? (x > 20 ? 200 : 0) : v < 0 ? 0 : v > 255 ? 255 : v);
+            }
+            CHECK(z3w_write_shard(zw, s, 0, 0, d, 2) == 0, "z3w_write_shard %s", nm[k]);
+        }
+        CHECK(z3w_close(zw) == 0, "z3w_close %s", nm[k]);
+    }
+    free(d);
+    char p[1400]; snprintf(p, sizeof p, "%s/fields.json", td); FILE *f = fopen(p, "w");
+    fprintf(f, "{\"format\": \"zarr\", \"origin\": [0, 0, 0], \"shape\": [256, 128, 128], \"h\": 2, \"um\": 9.6, \"axis\": [");
+    for (int z = 0; z <= 512; z++) fprintf(f, "%s[64.0, 64.0]", z ? ", " : "");
+    fprintf(f, "]}\n"); fclose(f);
+    const int rows[3][2] = {{100, 196}, {112, 208}, {48, 144}};
+    for (int r = 0; r < 3; r++) {
+        fit_fields_buf a, b;
+        unsetenv("UFSM_FIT_FULLDECODE"); const int ra = fit_fields_load(td, rows[r][0], rows[r][1], 1, &a);
+        setenv("UFSM_FIT_FULLDECODE", "1", 1); const int rb = fit_fields_load(td, rows[r][0], rows[r][1], 1, &b); unsetenv("UFSM_FIT_FULLDECODE");
+        CHECK(ra == 0 && rb == 0, "zarr loads of rows %d..%d", rows[r][0], rows[r][1]);
+        if (ra || rb) continue;
+        const size_t n = (size_t)(rows[r][1] - rows[r][0]) * 128 * 128; int same = 1, nonc = 0;
+        for (int k = 0; k < 10; k++) { same &= !memcmp(a.a[k], b.a[k], n); for (size_t i = 0; i < n; i += 4099) nonc |= a.a[k][i] != 128; }
+        printf("zarr rows %d..%d: substream decode vs whole chunks: %s\n", rows[r][0], rows[r][1], same ? "identical" : "DIFFER");
+        CHECK(same && nonc, "zarr rows %d..%d: the substream decode differs from the whole-chunk decode (or reads nothing)", rows[r][0], rows[r][1]);
+        fit_fields_free(&a); fit_fields_free(&b);
+    }
+    char cmd[1500]; snprintf(cmd, sizeof cmd, "rm -rf -- '%s'", td); if (system(cmd)) {}
+}
 int main(void) {
     nn_init(0);
+    zarr_substream_case();
     {   /* fit_unhash inverts fit_hash on every 32-bit word (the GPU minibatch selection enumerates the hashes) */
         unsigned long long nbad = 0; for (unsigned long long x = 0; x < (1ull << 32); x++) nbad += fit_unhash(fit_hash((unsigned)x)) != (unsigned)x;
         CHECK(nbad == 0, "fit_unhash(fit_hash(x)) != x for %llu words", nbad);

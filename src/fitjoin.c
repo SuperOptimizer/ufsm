@@ -263,6 +263,8 @@ static void fj_global(int ns, const fj_hist *hb, const fj_hist *hr, int nx, cons
     free(u); free(e); free(S0);
 }
 
+typedef struct { char **md; fit_model **out; } fj_load_job;   /* the slab models read on threads (~70 MB of lattice each) */
+static void fj_load_rows(void *a, int k0, int k1, int t) { const fj_load_job *J = a; (void)t; for (int k = k0; k < k1; k++) J->out[k] = fit_load(J->md[k]); }
 int cmd_fit_join(int argc, char **argv) {
     if (argc < 7) {
         fprintf(stderr, "usage: ufsm fit-join <out-set> <fields-dir> [--blend 16] [--min-conf 0.3] [--samples 4000000] [--ref MODEL [--ref-w 1] [--chain-w 1] [--ref-samples 200000] [--ref-rows 16]]\n"
@@ -295,9 +297,10 @@ int cmd_fit_join(int argc, char **argv) {
     const double h = g.h, Z = g.shape[0] * h;
     fit_set *s = calloc(1, sizeof *s); s->n = ns; s->blend = blend;
     s->slab = calloc(ns, sizeof *s->slab); s->z0 = calloc(ns, sizeof(double)); s->z1 = calloc(ns, sizeof(double));
+    { char **md = malloc(sizeof(char *) * ns); for (int k = 0; k < ns; k++) md[k] = argv[ai + 3 * k]; fj_load_job J = {md, s->slab}; fit_par(ns, fj_load_rows, &J); free(md); }
     for (int k = 0; k < ns; k++) {
         const char *md = argv[ai + 3 * k];
-        s->slab[k] = fit_load(md); s->z0[k] = atof(argv[ai + 3 * k + 1]); s->z1[k] = atof(argv[ai + 3 * k + 2]);
+        s->z0[k] = atof(argv[ai + 3 * k + 1]); s->z1[k] = atof(argv[ai + 3 * k + 2]);
         const fit_model *m = s->slab[k];
         if (!m) { fprintf(stderr, "fit-join: cannot load the model %s\n", md); return 1; }
         if (m->origin[1] != g.origin[1] || m->origin[2] != g.origin[2] || m->H != g.shape[1] || m->W != g.shape[2] || m->h != h) {

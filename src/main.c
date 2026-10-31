@@ -1090,6 +1090,9 @@ static int cmd_fit_sweep(int argc, char **argv, const char *file) {
     fprintf(stderr, "fit sweep: %d runs (%d failed) in %.1fs\n", nl, bad, now() - t0);
     return bad ? 1 : 0;
 }
+/* fit --ref-model: the ref (a whole-scroll model: ~0.9 GB of lattice) loads on a thread while the fields load */
+static struct { pthread_t th; int on; const char *dir; fit_set *s; } g_fit_ref;
+static void *fit_ref_thread(void *a) { (void)a; g_fit_ref.s = fit_set_load(g_fit_ref.dir); return nullptr; }
 static int cmd_fit(int argc, char **argv) {
     if (!g_fit_sweep && *opt(argc, argv, "--sweep", "")) return cmd_fit_sweep(argc, argv, opt(argc, argv, "--sweep", ""));
     const char *dir = argv[2];
@@ -1149,6 +1152,7 @@ static int cmd_fit(int argc, char **argv) {
     /* the GPU context (~2 s) comes up on a thread while the fields load; the main thread selects the device again after the join */
     g_fit_gdev = atoi(opt(argc, argv, "--gpu", "0"));
     if (!c.cpu) { g_fit_gthr = pthread_create(&g_fit_gth, nullptr, fit_gpu_init_thread, nullptr) == 0; if (!g_fit_gthr) nn_init(g_fit_gdev); }
+    if (*opt(argc, argv, "--ref-model", "")) { if (g_fit_ref.on) { pthread_join(g_fit_ref.th, nullptr); g_fit_ref.on = 0; } g_fit_ref.dir = opt(argc, argv, "--ref-model", ""); g_fit_ref.s = nullptr; g_fit_ref.on = pthread_create(&g_fit_ref.th, nullptr, fit_ref_thread, nullptr) == 0; }
     const double t0 = now();
     const char *min = opt(argc, argv, "--model", nullptr);   /* score / export a saved model or set instead of fitting */
     const int slab = atoi(opt(argc, argv, "--slab", "0")), overlap = atoi(opt(argc, argv, "--overlap", "256"));
@@ -1256,7 +1260,8 @@ static int cmd_fit(int argc, char **argv) {
     }
     fit_set *refm = nullptr;   /* --ref-model: a global coarse model / set (coarse-to-fine: the integers tied to it) */
     if (*opt(argc, argv, "--ref-model", "")) {
-        if (!(refm = fit_set_load(opt(argc, argv, "--ref-model", "")))) { fprintf(stderr, "fit: cannot load --ref-model %s\n", opt(argc, argv, "--ref-model", "")); return 1; }
+        if (g_fit_ref.on) { pthread_join(g_fit_ref.th, nullptr); g_fit_ref.on = 0; refm = g_fit_ref.s; } else refm = fit_set_load(opt(argc, argv, "--ref-model", ""));
+        if (!refm) { fprintf(stderr, "fit: cannot load --ref-model %s\n", opt(argc, argv, "--ref-model", "")); return 1; }
         if (seedm || slab > 0) { fprintf(stderr, "fit: --ref-model goes without --seed-model / --slab\n"); return 2; }
         c.ref = refm; for (int d = 0; d < 3; d++) c.ref_off[d] = (double)(fb.origin[d] - refm->global->origin[d]);
         c.ref_snap = atoi(opt(argc, argv, "--ref-snap", "0")); c.uw_rep_ref = (float)atof(opt(argc, argv, "--uw-rep-ref", "0"));
