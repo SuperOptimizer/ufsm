@@ -653,6 +653,10 @@ static int wr_run(z3 *const *vz, int nv, const int *depth, int ns, const float *
         pthread_t th[192];
         R->poison = getenv("UFSM_RENDER_GPU_POISON") && atoi(getenv("UFSM_RENDER_GPU_POISON"));
         if (gpu) {   /* device chunk pool sized to the free device memory (GPUs shared with other jobs), one pinned staging buffer per decoder */
+            /* decoders: with the GPU decoder many requests in flight make its batches (one substream is a serial chain of a few ms): 128
+               (UFSM_RENDER_GPU_DECODERS); without it the CPU decoders of the CPU path */
+            const char *nde = getenv("UFSM_RENDER_GPU_DECODERS");
+            const int ndg = nde && atoi(nde) > 0 ? (atoi(nde) > 128 ? 128 : atoi(nde)) : gpudec_enabled() ? 128 : nd;
             const int dev = rg_device(); size_t tot = 0; const size_t fr = rgpu_free_mem(dev, &tot);
             const size_t cvmax = (size_t)1 << (3 * (nv > 1 && R->T[1].sh > R->T[0].sh ? R->T[1].sh : R->T[0].sh));
             const int nimg = nv + (F ? 1 : 0); const size_t bmax = (size_t)(8192 / ns), outb = bmax * ns * nimg * RB * RB;
@@ -672,11 +676,11 @@ static int wr_run(z3 *const *vz, int nv, const int *depth, int ns, const float *
             int32_t *pxy = malloc((nb + 1) * 2 * sizeof *pxy);
             for (int v = 0; v < nv; v++) if (!(R->dp[v] = calloc(nc2[v] ? nc2[v] : 1, sizeof *R->dp[v]))) { rc = 2; }
             if (pxy) for (size_t k = 0; k < nb; k++) { pxy[2 * k] = b[k].px; pxy[2 * k + 1] = b[k].py; }
-            if (rc != 2 && pxy && (R->G = rgpu_open(dev, cvmax, cap, hcap, 2 * nd)) &&
+            if (rc != 2 && pxy && (R->G = rgpu_open(dev, cvmax, cap, hcap, 2 * ndg)) &&
                 !rgpu_setup(R->G, nv, nc2, ns, Xs, Ys, Zs, w, h, F ? F->vgrid : nullptr, pxy, nb, bmax, nimg)) {
-                for (int t = 0; t < nd; t++) pthread_create(&th[t], nullptr, wr_decoder_gpu, R);
+                for (int t = 0; t < ndg; t++) pthread_create(&th[t], nullptr, wr_decoder_gpu, R);
                 wr_gpu_drive(R, bmax);
-                for (int t = 0; t < nd; t++) pthread_join(th[t], nullptr);
+                for (int t = 0; t < ndg; t++) pthread_join(th[t], nullptr);
                 rc = atomic_load(&R->gfail) ? 2 : atomic_load(&R->fail) ? -1 : 0;
             } else { fprintf(stderr, "render gpu: device setup failed: CPU render\n"); rc = 2; }
             free(pxy);
@@ -685,7 +689,7 @@ static int wr_run(z3 *const *vz, int nv, const int *depth, int ns, const float *
                 fprintf(stderr, "render: %zu blocks in %u chunk rows, %zu chunks decoded once (%llu empty), GPU: pool %.2f GB (cap %.2f) + host %.2f GB (%llu chunks), peak %.2f GB, %llu launches %.2f s kernel, %llu uploads %.2f GB, %.1fs\n",
                         nb, ng, R->ndl, (unsigned long long)R->nzero, pool / 1073741824.0, cap / 1073741824.0, hpool / 1073741824.0, (unsigned long long)R->nhost, R->peak / 1073741824.0, (unsigned long long)nl, kms / 1000,
                         (unsigned long long)np, nby / 1073741824.0, rnow() - t0);
-                if (getenv("UFSM_RENDER_PROF")) fprintf(stderr, "render prof (s): decoders %d: budget wait %.1f, read %.1f, upload %.1f; driver: ready wait %.1f, pointer table %.1f, kernel %.1f, scatter %.1f\n", nd,
+                if (getenv("UFSM_RENDER_PROF")) fprintf(stderr, "render prof (s): decoders %d: budget wait %.1f, read %.1f, upload %.1f; driver: ready wait %.1f, pointer table %.1f, kernel %.1f, scatter %.1f\n", ndg,
                                                         R->pt[0] * 1e-6, R->pt[1] * 1e-6, R->pt[2] * 1e-6, R->pt[3] * 1e-6, R->pt[6] * 1e-6, R->pt[4] * 1e-6, R->pt[5] * 1e-6);
             }
             rgpu_close(R->G); R->G = nullptr;

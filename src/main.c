@@ -3699,6 +3699,8 @@ static void render_fill_report(const char *name, uint8_t *img, uint8_t *cimg, ui
                     "grid holes filled: %zu pixels (%.2f%% of the surface); no surface: %zu pixels\n",
             name, ns, (ns - non) * d, nfill * d, nin * d, nemp * d, ngrid, ngrid * d, nnone);
 }
+typedef struct { char path[1400]; const uint8_t *data; int w, h, rc; } rw_job;   /* ufsm render: one output TIFF */
+static void *rw_write(void *arg) { rw_job *J = arg; J->rc = tiffw_write(J->path, J->w, J->h, 1, J->data, 1); return nullptr; }
 static int cmd_render(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: ufsm render <wraps-dir> <out-dir> --volume ROOT KEY [--ct ROOT KEY] [--cache DIR] [--scale 1] [--depth 8] [--tile 512] [--threads 16] [--crop x,y,w,h] [--joint 1] [--gpu 0]\n"
 "  --gpu 1: sample on the GPU (decoded chunks kept on the device; with UFSM_GPU_DECODE=1 lossy chunks decoded there too); same bytes,\n"
@@ -3726,6 +3728,10 @@ static int cmd_render(int argc, char **argv) {
     const long fill_grid = atol(opt(argc, argv, "--fill-grid", "0"));
     const int rgpu_on = atoi(opt(argc, argv, "--gpu", "0")) && render_gpu_available() && !getenv("UFSM_RENDER_TILED");
     render_set_gpu(rgpu_on);
+    if (rgpu_on) {   /* --gpu 1: chunks decoded on the GPU into the device pool, near-empty substreams too (on the host they would cost a chunk upload);
+                       UFSM_GPU_DECODE=0 / UFSM_GPU_DECODE_MIN_BYTES override */
+        setenv("UFSM_GPU_DECODE", "1", 0); setenv("UFSM_GPU_DECODE_MIN_BYTES", "0", 0);
+    }
     if (fill_n > 49 || (fill_grid && fill_n < 0) || fill_inp < 0 || fill_inp > 8 || ((fill_n >= 0 || fill_inp) && (ci < 0 || ci + 2 >= argc)) || (fill_inp && fill_n < 0) || (fill_n >= 0 && getenv("UFSM_RENDER_TILED"))) {
         fprintf(stderr, "render: --fill N (0..49) needs --ct (and not UFSM_RENDER_TILED); --fill-inpaint L (1..8) needs --fill\n"); return 2; }
     store *vs = store_open(argv[vi + 1]), *cs = ci > 0 && ci + 2 < argc ? store_open(argv[ci + 1]) : nullptr;
@@ -3891,10 +3897,15 @@ static int cmd_render(int argc, char **argv) {
             free(img); free(cimg); img = ci2; cimg = cc2; fw = crop[2]; fh = crop[3];
             if (flag) { uint8_t *cf = img_crop_u8(flag, ow, oh, crop[0], crop[1], crop[2], crop[3]); if (!cf) return 1; free(flag); flag = cf; }
         }
-        if (flag) { snprintf(p, sizeof p, "%s/%s_fill.tif", argv[3], de->d_name); if (tiffw_write(p, fw, fh, 1, flag, 1)) { fprintf(stderr, "render: cannot write %s\n", p); return 1; } free(flag); }
-        snprintf(p, sizeof p, "%s/%s.tif", argv[3], de->d_name);
-        if (tiffw_write(p, fw, fh, 1, img, 1)) { fprintf(stderr, "render: cannot write %s\n", p); return 1; }
-        if (cimg) { snprintf(p, sizeof p, "%s/%s_ct.tif", argv[3], de->d_name); if (tiffw_write(p, fw, fh, 1, cimg, 1)) return 1; }
+        { /* the renders (and the fill flags) written concurrently, each compressed on its own threads */
+          rw_job wj[3] = {0}; int nj = 0; pthread_t wt[3];
+          if (flag) { snprintf(wj[nj].path, sizeof wj[nj].path, "%s/%s_fill.tif", argv[3], de->d_name); wj[nj].data = flag; nj++; }
+          snprintf(wj[nj].path, sizeof wj[nj].path, "%s/%s.tif", argv[3], de->d_name); wj[nj].data = img; nj++;
+          if (cimg) { snprintf(wj[nj].path, sizeof wj[nj].path, "%s/%s_ct.tif", argv[3], de->d_name); wj[nj].data = cimg; nj++; }
+          for (int k = 0; k < nj; k++) { wj[k].w = fw; wj[k].h = fh; pthread_create(&wt[k], nullptr, rw_write, &wj[k]); }
+          int bad = 0; for (int k = 0; k < nj; k++) { pthread_join(wt[k], nullptr); if (wj[k].rc) { fprintf(stderr, "render: cannot write %s\n", wj[k].path); bad = 1; } }
+          free(flag); flag = nullptr;
+          if (bad) return 1; }
         tw[3] = RNOW();
         if (tw[1] > 0) fprintf(stderr, "render: %s: grids %.1f s, render %.1f s, fill %.1f s, writes %.1f s\n", de->d_name, tw[0], tw[1] - tw[0], tw[2] - tw[1], tw[3] - tw[2]);
 #undef RNOW
