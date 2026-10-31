@@ -45,6 +45,10 @@ int band_field_phase(const uint8_t *codes, const int n[3], const int64_t o[3], c
    Unknown beyond rmax label voxels from either sheet, where the two windings are not consecutive (a missing wrap) or the sheets are
    on one side. spacing (optional) as band_field_phase. */
 int band_field_phase_pair(const uint8_t *codes, const int n[3], float rmax, uint8_t *phase, uint8_t *spacing);
+/* the same, plus per voxel the index (into the n[0] x n[1] x n[2] block) of the nearest labelled voxel of the lower winding (lo) and
+   of the higher (hi) that set its phase (both the voxel itself on a labelled sheet; -1 where the phase is unknown); lo / hi may be
+   nullptr. Used by ufsm surf-labels (which sheets, i.e. wraps, a voxel's phase comes from). Block size < 2^31 voxels. */
+int band_field_phase_pair_ex(const uint8_t *codes, const int n[3], float rmax, uint8_t *phase, uint8_t *spacing, int32_t *lo, int32_t *hi);
 
 /* Recto / verso side of every voxel from the labelled recto faces alone (no axis): between consecutive windings k and k + 1 the
    half nearer k is the recto side, the half nearer k + 1 the verso side (each wrap's label leaves it on its outer side only:
