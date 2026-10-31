@@ -10,8 +10,10 @@
  *     line (the reference skips lines it knows are zero: the transform of a zero line is +0, the same), round as vf_scatter_block,
  *     DC-only blocks as vf_flat_value.
  * A service thread batches the requests of all calling threads: callers reserve space in the open batch's pinned staging, copy
- * their tables and substream bytes in parallel, and wait; the service runs one batch at a time (H2D, kernels, D2H) while the next
- * one fills; callers copy their decoded substreams out of the pinned output in parallel. */
+ * their tables and substream bytes in parallel, and wait; a launcher thread queues a batch (H2D, kernels, D2H, each batch with its
+ * own buffers and stream) as soon as its writers are done and fewer than UFSM_GPU_DECODE_FLIGHT (2) run, a completer thread wakes
+ * the requests in launch order; callers copy their decoded substreams out of the pinned output in parallel (or the kernels wrote
+ * them straight into a device chunk: gpudec_decode_dev). */
 #include <cuda_runtime.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -210,22 +212,24 @@ __global__ void __launch_bounds__(256) k_idct(const gd_item *__restrict__ items,
 }
 
 /* ---------------- host: device state, batching service ---------------- */
-enum { NSLOT = 3, MAXREQ = 4096 };
+enum { NSLOT = 4, MAXREQ = 4096 };
 enum { S_FREE, S_OPEN, S_GPU, S_DRAIN };
-struct gd_req { int slot; uint32_t item0, nitems, mask, tab_off, out0; uint8_t *dst, *ddst; int state; };   /* ddst: device chunk (no copy out) */   /* state: 0 pending, 1 ok, 2 GPU decode failed, 3 GPU unavailable */
-struct gd_slot {
-    int state, writers, readers, nreq;
+struct gd_req { int slot; uint32_t item0, nitems, mask, tab_off, out0; uint8_t *dst, *ddst; int state; };   /* ddst: device chunk (no copy out);
+                                                                                                              state: 0 pending, 1 ok, 2 GPU decode failed, 3 GPU unavailable */
+struct gd_slot {   /* a batch: pinned staging + its own device buffers / stream, so up to G.flight batches run at once */
+    int state, writers, readers, nreq, rc;
     uint8_t *h_in, *h_out; gd_item *h_items; gd_group *h_groups; uint32_t *h_status;
+    uint8_t *d_in, *d_out; gd_item *d_items; gd_group *d_groups; uint32_t *d_rec, *d_meta, *d_status;
+    cudaStream_t st; cudaEvent_t ev; double t0;
     size_t in_used, rec_used; uint32_t nitems, nout;
     gd_req *req[MAXREQ];
 };
 static struct {
-    pthread_once_t once; pthread_mutex_t mu; pthread_cond_t cv; pthread_t th;
-    int ok, broken, dev;
+    pthread_once_t once; pthread_mutex_t mu; pthread_cond_t cv; pthread_t th, th2;
+    int ok, broken, dev, flight, inflight, fifo[NSLOT], fhead, fn;
     size_t in_cap, rec_cap; uint32_t max_items, min_bytes;
     gd_slot slot[NSLOT]; int open;
-    uint8_t *d_in, *d_out; gd_item *d_items; gd_group *d_groups; uint32_t *d_rec, *d_meta, *d_status, *d_pos;
-    cudaStream_t st; cudaEvent_t ev;
+    uint32_t *d_pos;
     uint16_t scan[BLKV]; int have_scan;
     uint64_t n_subs, n_batches, n_redo, n_busy, n_cpu_busy; double gpu_s;
     double max_s, cool_s; int64_t busy_us;   /* a GPU shared with saturating kernels: round trips over max_s -> the CPU for cool_s */
@@ -239,43 +243,75 @@ static int take_free(void) {
     return -1;
 }
 
-/* one batch, synchronously on the service thread; returns 0, or -1 on a device error */
-static int run_batch(gd_slot *S) {
-    const double t0 = now_s(); const uint32_t n = S->nitems;
-    GD_CK(cudaMemcpyAsync(G.d_in, S->h_in, S->in_used, cudaMemcpyHostToDevice, G.st));
+/* queue one batch on its stream (H2D, kernels, D2H, event); returns 0, or -1 on a device error */
+static int launch_batch(gd_slot *S) {
+    S->t0 = now_s(); const uint32_t n = S->nitems;
     for (int r = 0; r < S->nreq; r++) S->h_groups[r] = (gd_group){S->req[r]->item0, S->req[r]->nitems, S->req[r]->tab_off, 0};
-    GD_CK(cudaMemcpyAsync(G.d_items, S->h_items, n * sizeof(gd_item), cudaMemcpyHostToDevice, G.st));
-    GD_CK(cudaMemcpyAsync(G.d_groups, S->h_groups, S->nreq * sizeof(gd_group), cudaMemcpyHostToDevice, G.st));
-    k_entropy<<<S->nreq, 32, 0, G.st>>>(G.d_groups, G.d_items, G.d_in, G.d_pos, G.d_rec, G.d_meta, G.d_status);
+    GD_CK(cudaMemcpyAsync(S->d_in, S->h_in, S->in_used, cudaMemcpyHostToDevice, S->st));
+    GD_CK(cudaMemcpyAsync(S->d_items, S->h_items, n * sizeof(gd_item), cudaMemcpyHostToDevice, S->st));
+    GD_CK(cudaMemcpyAsync(S->d_groups, S->h_groups, S->nreq * sizeof(gd_group), cudaMemcpyHostToDevice, S->st));
+    k_entropy<<<S->nreq, 32, 0, S->st>>>(S->d_groups, S->d_items, S->d_in, G.d_pos, S->d_rec, S->d_meta, S->d_status);
     GD_CK(cudaGetLastError());
-    k_idct<<<n * 16, 256, 0, G.st>>>(G.d_items, G.d_in, G.d_pos, G.d_rec, G.d_meta, G.d_status);
+    k_idct<<<n * 16, 256, 0, S->st>>>(S->d_items, S->d_in, G.d_pos, S->d_rec, S->d_meta, S->d_status);
     GD_CK(cudaGetLastError());
-    GD_CK(cudaMemcpyAsync(S->h_status, G.d_status, n * sizeof(uint32_t), cudaMemcpyDeviceToHost, G.st));
-    if (S->nout) GD_CK(cudaMemcpyAsync(S->h_out, G.d_out, (size_t)S->nout * SUB_BYTES, cudaMemcpyDeviceToHost, G.st));
-    GD_CK(cudaEventRecord(G.ev, G.st));
-    GD_CK(cudaEventSynchronize(G.ev));
-    { const double dt = now_s() - t0; G.gpu_s += dt;
-      if (dt > G.max_s) { __atomic_store_n(&G.busy_us, (int64_t)((now_s() + G.cool_s) * 1e6), __ATOMIC_RELAXED); G.n_busy++; } }   /* starved (time sliced next to another job's kernels): the CPU decodes for a while */
+    GD_CK(cudaMemcpyAsync(S->h_status, S->d_status, n * sizeof(uint32_t), cudaMemcpyDeviceToHost, S->st));
+    if (S->nout) GD_CK(cudaMemcpyAsync(S->h_out, S->d_out, (size_t)S->nout * SUB_BYTES, cudaMemcpyDeviceToHost, S->st));
+    GD_CK(cudaEventRecord(S->ev, S->st));
     return 0;
 fail:
     return -1;
 }
 
+/* fail every request not done yet (under G.mu, after a device error) */
+static void fail_all(void) {
+    for (int k = 0; k < NSLOT; k++) {
+        gd_slot *S = &G.slot[k];
+        if (S->state == S_OPEN || S->state == S_GPU) for (int r = 0; r < S->nreq; r++) if (!S->req[r]->state) S->req[r]->state = 3;
+    }
+    pthread_cond_broadcast(&G.cv);
+}
+
+/* launcher: the open batch goes to the GPU as soon as its writers are done and fewer than G.flight batches are running */
 static void *service(void *arg) {
     (void)arg;
-    if (cudaSetDevice(G.dev) != cudaSuccess) { pthread_mutex_lock(&G.mu); G.broken = 1; pthread_cond_broadcast(&G.cv); pthread_mutex_unlock(&G.mu); return nullptr; }
+    if (cudaSetDevice(G.dev) != cudaSuccess) { pthread_mutex_lock(&G.mu); G.broken = 1; fail_all(); pthread_mutex_unlock(&G.mu); return nullptr; }
     pthread_mutex_lock(&G.mu);
     for (;;) {
-        while (!G.broken && !(G.open >= 0 && G.slot[G.open].nitems > 0 && G.slot[G.open].writers == 0)) pthread_cond_wait(&G.cv, &G.mu);
+        while (!G.broken && !(G.open >= 0 && G.slot[G.open].nitems > 0 && G.slot[G.open].writers == 0 && G.inflight < G.flight)) pthread_cond_wait(&G.cv, &G.mu);
         if (G.broken) break;
         const int k = G.open; gd_slot *S = &G.slot[k];
-        S->state = S_GPU; G.open = take_free();
+        S->state = S_GPU; G.open = take_free(); G.inflight++;
         pthread_cond_broadcast(&G.cv);
         pthread_mutex_unlock(&G.mu);
-        const int rc = run_batch(S);
+        S->rc = launch_batch(S);
         pthread_mutex_lock(&G.mu);
+        G.fifo[(G.fhead + G.fn++) % NSLOT] = k;
+        pthread_cond_broadcast(&G.cv);
+    }
+    fail_all();
+    pthread_mutex_unlock(&G.mu);
+    return nullptr;
+}
+/* completer: batches in launch order; wakes their requests (callers copy their outputs out in parallel) */
+static void *completer(void *arg) {
+    (void)arg;
+    if (cudaSetDevice(G.dev) != cudaSuccess) { pthread_mutex_lock(&G.mu); G.broken = 1; fail_all(); pthread_mutex_unlock(&G.mu); return nullptr; }
+    pthread_mutex_lock(&G.mu);
+    for (;;) {
+        while (!G.broken && !G.fn) pthread_cond_wait(&G.cv, &G.mu);
+        if (G.broken && !G.fn) break;
+        const int k = G.fifo[G.fhead]; G.fhead = (G.fhead + 1) % NSLOT; G.fn--;
+        gd_slot *S = &G.slot[k];
+        pthread_mutex_unlock(&G.mu);
+        int rc = S->rc;
+        if (!rc && cudaEventSynchronize(S->ev) != cudaSuccess) { cudaGetLastError(); fprintf(stderr, "gpudec: batch failed, decoding on the CPU from now on\n"); rc = -1; }
+        const double dt = now_s() - S->t0;
+        pthread_mutex_lock(&G.mu);
+        G.gpu_s += dt;
+        if (dt > G.max_s) { __atomic_store_n(&G.busy_us, (int64_t)((now_s() + G.cool_s) * 1e6), __ATOMIC_RELAXED); G.n_busy++; }   /* starved (time sliced next to another
+                                                                                                                                     job's kernels): the CPU for a while */
         if (rc) G.broken = 1;
-        G.n_batches++;
+        G.n_batches++; G.inflight--;
         int readers = 0;
         for (int r = 0; r < S->nreq; r++) {
             gd_req *q = S->req[r]; int bad = 0;
@@ -286,15 +322,9 @@ static void *service(void *arg) {
         }
         S->readers = readers; S->state = readers ? S_DRAIN : S_FREE;
         if (G.open < 0) G.open = take_free();
+        if (G.broken) fail_all();
         pthread_cond_broadcast(&G.cv);
-        if (G.broken) break;
     }
-    /* broken: fail every queued request, close the open slot */
-    for (int k = 0; k < NSLOT; k++) {
-        gd_slot *S = &G.slot[k];
-        if (S->state == S_OPEN) for (int r = 0; r < S->nreq; r++) S->req[r]->state = 3;
-    }
-    pthread_cond_broadcast(&G.cv);
     pthread_mutex_unlock(&G.mu);
     return nullptr;
 }
@@ -315,21 +345,14 @@ static void gd_init(void) {
     const char *ms = getenv("UFSM_GPU_DECODE_MAX_MS"), *cs = getenv("UFSM_GPU_DECODE_COOL_S");
     G.max_s = (ms && atof(ms) > 0 ? atof(ms) : 60.0) * 1e-3;   /* an idle GPU: 5-12 ms for a full batch */
     G.cool_s = cs && atof(cs) >= 0 ? atof(cs) : 2.0;
+    const char *fl = getenv("UFSM_GPU_DECODE_FLIGHT");   /* batches running at once (each slot: ~0.3 GB of device buffers at 1024 items) */
+    G.flight = fl && atoi(fl) > 0 ? (atoi(fl) < NSLOT - 1 ? atoi(fl) : NSLOT - 1) : 2;
     G.in_cap = (size_t)G.max_items * 40000 + ((size_t)16 << 20);   /* q 2 substreams are ~10-20 KB */
     G.rec_cap = (size_t)G.max_items * 49152 + ((size_t)16 << 20);   /* records (u32); a substream reserves its bound, 8 x its bypass bytes (q 2: ~5 KB) */
     int nd = 0;
     if (cudaGetDeviceCount(&nd) != cudaSuccess || G.dev < 0 || G.dev >= nd) { cudaGetLastError(); fprintf(stderr, "gpudec: no CUDA device %d, decoding on the CPU\n", G.dev); return; }
     int prev = 0; cudaGetDevice(&prev);
     GD_CK(cudaSetDevice(G.dev));
-    GD_CK(cudaStreamCreateWithFlags(&G.st, cudaStreamNonBlocking));
-    GD_CK(cudaEventCreateWithFlags(&G.ev, cudaEventBlockingSync | cudaEventDisableTiming));   /* the service thread sleeps, it does not spin */
-    GD_CK(cudaMalloc(&G.d_in, G.in_cap));
-    GD_CK(cudaMalloc(&G.d_out, (size_t)G.max_items * SUB_BYTES));
-    GD_CK(cudaMalloc(&G.d_items, G.max_items * sizeof(gd_item)));
-    GD_CK(cudaMalloc(&G.d_groups, MAXREQ * sizeof(gd_group)));
-    GD_CK(cudaMalloc(&G.d_rec, G.rec_cap * 4));
-    GD_CK(cudaMalloc(&G.d_meta, (size_t)G.max_items * META * 4));
-    GD_CK(cudaMalloc(&G.d_status, G.max_items * 4));
     GD_CK(cudaMalloc(&G.d_pos, BLKV * 4));
     for (int k = 0; k < NSLOT; k++) {
         gd_slot *S = &G.slot[k];
@@ -338,6 +361,15 @@ static void gd_init(void) {
         GD_CK(cudaHostAlloc(&S->h_items, G.max_items * sizeof(gd_item), cudaHostAllocPortable));
         GD_CK(cudaHostAlloc(&S->h_groups, MAXREQ * sizeof(gd_group), cudaHostAllocPortable));
         GD_CK(cudaHostAlloc(&S->h_status, G.max_items * 4, cudaHostAllocPortable));
+        GD_CK(cudaStreamCreateWithFlags(&S->st, cudaStreamNonBlocking));
+        GD_CK(cudaEventCreateWithFlags(&S->ev, cudaEventBlockingSync | cudaEventDisableTiming));   /* the completer sleeps, it does not spin */
+        GD_CK(cudaMalloc(&S->d_in, G.in_cap));
+        GD_CK(cudaMalloc(&S->d_out, (size_t)G.max_items * SUB_BYTES));
+        GD_CK(cudaMalloc(&S->d_items, G.max_items * sizeof(gd_item)));
+        GD_CK(cudaMalloc(&S->d_groups, MAXREQ * sizeof(gd_group)));
+        GD_CK(cudaMalloc(&S->d_rec, G.rec_cap * 4));
+        GD_CK(cudaMalloc(&S->d_meta, (size_t)G.max_items * META * 4));
+        GD_CK(cudaMalloc(&S->d_status, G.max_items * 4));
         S->state = S_FREE;
     }
     cudaSetDevice(prev);
@@ -397,8 +429,8 @@ static int gd_decode(const gd_chunk *c, uint32_t mask, uint8_t *dst, uint8_t *dd
     if (!G.have_scan) {
         if (pos_upload(c->scan)) { G.broken = 1; pthread_cond_broadcast(&G.cv); pthread_mutex_unlock(&G.mu); return -1; }
         G.have_scan = 1;
-        if (pthread_create(&G.th, nullptr, service, nullptr)) { G.broken = 1; pthread_mutex_unlock(&G.mu); return -1; }
-        pthread_detach(G.th);
+        if (pthread_create(&G.th, nullptr, service, nullptr) || pthread_create(&G.th2, nullptr, completer, nullptr)) { G.broken = 1; pthread_mutex_unlock(&G.mu); return -1; }
+        pthread_detach(G.th); pthread_detach(G.th2);
     }
     gd_slot *S = nullptr;
     for (;;) {
@@ -428,7 +460,7 @@ static int gd_decode(const gd_chunk *c, uint32_t mask, uint8_t *dst, uint8_t *dd
         it->byp_off = (uint32_t)off; it->byp_n = c->byp_n[s]; memcpy(S->h_in + off, p + c->tok_n[s], c->byp_n[s]); off += ((c->byp_n[s] + 15u) & ~15u) + 16;
         it->rec_off = (uint32_t)roff; roff += (size_t)c->byp_n[s] * 8u + 1u;
         if (ddst) { it->dst = (uint64_t)(uintptr_t)(ddst + ((size_t)16u * (s >> 2) * 128u + 32u * (s & 3u)) * 128u); it->zs = 128u * 128u; }
-        else { it->dst = (uint64_t)(uintptr_t)(G.d_out + (size_t)(q.out0 + u - 1) * SUB_BYTES); it->zs = 32u * 128u; }
+        else { it->dst = (uint64_t)(uintptr_t)(S->d_out + (size_t)(q.out0 + u - 1) * SUB_BYTES); it->zs = 32u * 128u; }
     }
 
     pthread_mutex_lock(&G.mu);
