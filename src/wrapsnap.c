@@ -425,6 +425,7 @@ int cmd_wrap_snap(int argc, char **argv) {
         size_t nr = fread(jb, 1, sizeof jb - 1, jf); (void)nr; fclose(jf);
         double org[3] = {0, 0, 0}, fum = 0; const char *q = strstr(jb, "\"origin\":"); if (q) sscanf(strchr(q, '[') + 1, "%lf,%lf,%lf", org, org + 1, org + 2);
         q = strstr(jb, "\"um\":"); if (q) fum = atof(q + 5);
+        { const char *hq = strstr(jb, "\"h\":"); const double hh = hq ? atof(hq + 4) : 1; if (hh > 0) { fum *= hh; for (int d = 0; d < 3; d++) org[d] /= hh; } }   /* cells of h native voxels (um = the native um), origin in native voxels */
         if (!(fum > 0)) { fprintf(stderr, "wrap-snap: no um in %s\n", jp); return 1; }
         if ((target == T_PHASE || target == T_MIX) && wsn_vol_open(&vpc, fd, "pc", cache, wum / fum, org, 128)) { fprintf(stderr, "wrap-snap: fields pc: %s\n", z3_error()); return 1; }
         if (target == T_RECTO && wsn_vol_open(&vr, fd, "r", cache, wum / fum, org, 0)) { fprintf(stderr, "wrap-snap: fields r: %s (no recto plane?)\n", z3_error()); return 1; }
