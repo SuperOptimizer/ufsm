@@ -1,7 +1,7 @@
 /* ufsm count-field on the GPU (src/cfgpu.h): pass 1's pooling, the CG solves, the --model-only R 0 model pass. Mirrors
    src/countfield.c element by element: built without fast math and with -fmad=false (Makefile), so every fp32 / fp64 operation
    rounds as the CPU's (gcc -std=c23 does not contract either); the libm calls (atan2, hypot, cos, sin) may differ from glibc in the
-   last bit. Each solve cell's sums run in one thread in the CPU's voxel order (z, y, x); the CG's dot products over a fixed grid of
+   last bit; the sheet normal (d_axis) is fp32 (see there). Each solve cell's sums run in one thread in the CPU's voxel order (z, y, x); the CG's dot products over a fixed grid of
    blocks (deterministic; the CPU threads sum in another order, so CG iterates differ in the last bits). */
 #include <cuda_runtime.h>
 #include <math.h>
@@ -35,16 +35,20 @@ __device__ __forceinline__ double d_ph(const ph_tab &T, const uint8_t *pc, const
     const int k = pc[i] * 256 + ps[i]; *c = w[i] ? T.c[k] : 0; return T.a[k] / (2 * M_PI);
 }
 __device__ __forceinline__ double d_wrap(double d) { return d - round(d); }
-__device__ double d_axis(const uint8_t *const *t8, size_t i, double v[3]) {
-    double T[3][3]; const double t[6] = {t8[0][i] / 255.0, t8[1][i] / 255.0, t8[2][i] / 255.0, t8[3][i] / 255.0 - 0.5, t8[4][i] / 255.0 - 0.5, t8[5][i] / 255.0 - 0.5};
+/* the sheet normal (dominant eigenvector of n n^T, 16 power iterations) and its linearity l / tr in fp32: the CPU's fp64 iteration
+   was ~85% of the pooling kernel on consumer cards (fp64 at 1/64 rate; 0490B crop 10.5 -> 1.8 s); the pooled sums differ from the
+   CPU's in the last bits (gate: join / wrap-check / P4 GT within the pipeline's noise floor) */
+__device__ double d_axis(const uint8_t *const *t8, size_t i, double vo[3]) {
+    float T[3][3]; const float t[6] = {t8[0][i] / 255.0f, t8[1][i] / 255.0f, t8[2][i] / 255.0f, t8[3][i] / 255.0f - 0.5f, t8[4][i] / 255.0f - 0.5f, t8[5][i] / 255.0f - 0.5f};
     T[0][0] = t[0]; T[1][1] = t[1]; T[2][2] = t[2]; T[0][1] = T[1][0] = t[3]; T[0][2] = T[2][0] = t[4]; T[1][2] = T[2][1] = t[5];
-    int k = T[0][0] >= T[1][1] && T[0][0] >= T[2][2] ? 0 : T[1][1] >= T[2][2] ? 1 : 2; v[0] = v[1] = v[2] = 0; v[k] = 1;
-    double l = 0;
+    float v[3] = {0, 0, 0}; v[T[0][0] >= T[1][1] && T[0][0] >= T[2][2] ? 0 : T[1][1] >= T[2][2] ? 1 : 2] = 1;
+    float l = 0;
     for (int it = 0; it < 16; it++) {
-        double w[3] = {0, 0, 0}; for (int a = 0; a < 3; a++) for (int b = 0; b < 3; b++) w[a] += T[a][b] * v[b];
-        l = sqrt(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]); if (l < 1e-12) return 0; for (int a = 0; a < 3; a++) v[a] = w[a] / l;
+        float w[3] = {0, 0, 0}; for (int a = 0; a < 3; a++) for (int b = 0; b < 3; b++) w[a] += T[a][b] * v[b];
+        l = sqrtf(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]); if (l < 1e-12f) { vo[0] = vo[1] = vo[2] = 0; return 0; } for (int a = 0; a < 3; a++) v[a] = w[a] / l;
     }
-    const double tr = t[0] + t[1] + t[2]; return tr > 1e-6 ? l / tr : 0;
+    vo[0] = v[0]; vo[1] = v[1]; vo[2] = v[2];
+    const float tr = t[0] + t[1] + t[2]; return tr > 1e-6f ? l / tr : 0;
 }
 __device__ double d_tri(const float *U, int d, int hh, int w, double qz, double qy, double qx) {
     const double q[3] = {qz, qy, qx}; const int dm[3] = {d, hh, w}; int c[3]; double t[3];
