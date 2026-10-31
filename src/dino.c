@@ -1,6 +1,7 @@
 /* ufsm dino: our own DINO-style embedding training from scratch (ufsm dino-train), its inference (ufsm dino-embed) and the
    view-pair data tool (ufsm halves). See DESIGN.md "Own dense embedding net (dino-train)". */
 #include "dino.h"
+#include "sysinfo.h"
 #include "dinor.h"
 #include "sslstat.h"
 #include "band.h"
@@ -39,7 +40,7 @@ int cmd_dino_halves(int argc, char **argv) {
         return 2;
     }
     const char *root = argv[2], *key = argv[3], *out = argv[4];
-    const int nthreads = atoi(opt(argc, argv, "--threads", "8")), slab = atoi(opt(argc, argv, "--slab", "16"));
+    const int nthreads = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 8), slab = atoi(opt(argc, argv, "--slab", "16"));
     store *st = store_open(root); const int v2 = atoi(opt(argc, argv, "--zarr2", "0"));   /* the raw upstream zarr v2 (uncompressed: the lossy volcomp levels are denoised) */
     z3 *ct = st && !v2 ? z3_open(st, key, opt(argc, argv, "--cache", nullptr)) : nullptr; z2 *ct2 = st && v2 ? z2_open(st, key, nullptr) : nullptr;
     if (!ct && !ct2) { fprintf(stderr, "halves: cannot open %s %s: %s\n", root, key, v2 ? z2_error() : z3_error()); return 1; }
@@ -2535,7 +2536,7 @@ int cmd_dino_train(int argc, char **argv) {
     const float wvar = (float)atof(opt(argc, argv, "--var", "30")), vgam = (float)atof(opt(argc, argv, "--var-gamma", "0")) > 0 ? (float)atof(opt(argc, argv, "--var-gamma", "0")) : 0.8f / sqrtf((float)ED);
     const float mfrac = (float)atof(opt(argc, argv, "--mask-frac", "0")); const int mcube = atoi(opt(argc, argv, "--mask-cube", "16"));
     const int K = atoi(opt(argc, argv, "--protos", "1024")), log_every = atoi(opt(argc, argv, "--log-every", "20")), save_every = atoi(opt(argc, argv, "--save-every", "2000"));
-    const int eval_every = atoi(opt(argc, argv, "--eval-every", "2000")), nthreads = atoi(opt(argc, argv, "--threads", "4")), nwork = atoi(opt(argc, argv, "--workers", "4"));
+    const int eval_every = atoi(opt(argc, argv, "--eval-every", "2000")), nthreads = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 4), nwork = atoi(opt(argc, argv, "--workers", "4"));
     const uint64_t seed = strtoull(opt(argc, argv, "--seed", "1"), nullptr, 10);
     dn_data *Dd = calloc(1, sizeof *Dd); Dd->P = P; Dd->ngt = atoi(opt(argc, argv, "--gt-points", "2048")); Dd->nssl = atoi(opt(argc, argv, "--ssl-points", "2048")); Dd->margin = 8; Dd->nair = atoi(opt(argc, argv, "--air-points", "0")); Dd->gtpap = atoi(opt(argc, argv, "--gt-papyrus", "0"));   /* the sources' default "gt_papyrus" */
     { char *t = strdup(opt(argc, argv, "--exclude-src", "")); for (char *q = strtok(t, ","); q && Dd->nexcl < 8; q = strtok(nullptr, ",")) snprintf(Dd->excl[Dd->nexcl++], 64, "%s", q); free(t); }

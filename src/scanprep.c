@@ -1,5 +1,6 @@
 /* ufsm mirror / ufsm scanprep: see src/scanprep.h. */
 #include "scanprep.h"
+#include "sysinfo.h"
 #include "edt.h"
 #include "sources.h"
 #include "store.h"
@@ -103,7 +104,7 @@ int cmd_mirror(int argc, char **argv) {
     if (argc < 5) { fprintf(stderr, "usage: ufsm mirror <root> <array-key> <out-dir> [--threads 4] [--mbps 0] [--mbps-file F] [--link-from DIR] [--verify N] [--seed 1]\n"); return 2; }
     mir_t M = {0};
     M.key = argv[3]; M.out = argv[4]; M.link = sopt(argc, argv, "--link-from", nullptr);
-    const int nt = atoi(sopt(argc, argv, "--threads", "4")), nver = atoi(sopt(argc, argv, "--verify", "0"));
+    const int nt = ufsm_threads(atoi(sopt(argc, argv, "--threads", "0")), 4), nver = atoi(sopt(argc, argv, "--verify", "0"));
     M.rate = atof(sopt(argc, argv, "--mbps", "0")) * 1e6; M.rate_file = sopt(argc, argv, "--mbps-file", nullptr); M.t_file = -1e9; uint64_t seed = (uint64_t)atoll(sopt(argc, argv, "--seed", "1"));
     store_global_init();
     M.s = store_open(argv[2]);
@@ -338,12 +339,12 @@ static double um_from_name(const char *key) {   /* "...-8.640um-..." */
 int cmd_scanprep(int argc, char **argv) {
     if (argc < 4 || !sopt(argc, argv, "--out", nullptr) || !sopt(argc, argv, "--level", nullptr)) {
         fprintf(stderr, "usage: ufsm scanprep <root> <group-key> --level L --out PREFIX [--um U] [--cell 16] [--close-mm 2] [--window 128] [--min-inside 0.25]\n"
-                        "                     [--fill2d 1] [--stats-chunks 256] [--threads 16] [--seed 1]\n");
+                        "                     [--fill2d 1] [--stats-chunks 256] [--threads 16] [--seed 1] [--box-out FILE (unroll box z,y,x,nz,ny,nx)]\n");
         return 2;
     }
     const char *root = argv[2], *group = argv[3], *out = sopt(argc, argv, "--out", nullptr);
     const int L = atoi(sopt(argc, argv, "--level", "0")), cell = atoi(sopt(argc, argv, "--cell", "16")), win = atoi(sopt(argc, argv, "--window", "128"));
-    const int fill2d = atoi(sopt(argc, argv, "--fill2d", "1")), nstat = atoi(sopt(argc, argv, "--stats-chunks", "256")), nt = atoi(sopt(argc, argv, "--threads", "16"));
+    const int fill2d = atoi(sopt(argc, argv, "--fill2d", "1")), nstat = atoi(sopt(argc, argv, "--stats-chunks", "256")), nt = ufsm_threads(atoi(sopt(argc, argv, "--threads", "0")), 16);
     const double close_mm = atof(sopt(argc, argv, "--close-mm", "2")), min_inside = atof(sopt(argc, argv, "--min-inside", "0.25"));
     const double keep_frac = atof(sopt(argc, argv, "--keep-frac", "0.1"));
     double zr[2] = {-1e18, 1e18};
@@ -439,6 +440,18 @@ int cmd_scanprep(int argc, char **argv) {
     char p[1400];
     snprintf(p, sizeof p, "%s.mask.raw", out);
     if (write_file(p, val, NG)) { fprintf(stderr, "scanprep: cannot write %s\n", p); return 1; }
+    if (sopt(argc, argv, "--box-out", nullptr)) {   /* the unroll box (level-L voxels): object cells +-1 cell, origin floored to 512 */
+        int64_t lo[3] = {INT64_MAX, INT64_MAX, INT64_MAX}, hi[3] = {-1, -1, -1};
+        for (int64_t z = 0; z < G[0]; z++) for (int64_t y = 0; y < G[1]; y++) for (int64_t x = 0; x < G[2]; x++) {
+            if (!val[(size_t)z * plane + (size_t)y * G[2] + x]) continue;
+            const int64_t c[3] = {z, y, x}; for (int d = 0; d < 3; d++) { if (c[d] < lo[d]) lo[d] = c[d]; if (c[d] > hi[d]) hi[d] = c[d]; } }
+        if (hi[0] < 0) { fprintf(stderr, "scanprep: --box-out: empty mask\n"); return 1; }
+        int64_t o[3], e[3];
+        for (int d = 0; d < 3; d++) { int64_t a = (lo[d] - 1) * cell, b = (hi[d] + 2) * cell; if (a < 0) a = 0; a = a / 512 * 512; if (b > ml->shape[d]) b = ml->shape[d]; o[d] = a; e[d] = b - a; }
+        snprintf(p, sizeof p, "%lld,%lld,%lld,%lld,%lld,%lld\n", (long long)o[0], (long long)o[1], (long long)o[2], (long long)e[0], (long long)e[1], (long long)e[2]);
+        if (write_file(sopt(argc, argv, "--box-out", ""), p, strlen(p))) { fprintf(stderr, "scanprep: cannot write the box\n"); return 1; }
+        fprintf(stderr, "scanprep: box %s", p);
+    }
     int lev = L; for (int c = cell; c > 1; c >>= 1) lev++;
     snprintf(p, sizeof p, "%s.mask.raw.json", out);
     FILE *fj = fopen(p, "w"); if (!fj) { fprintf(stderr, "scanprep: cannot write %s\n", p); return 1; }

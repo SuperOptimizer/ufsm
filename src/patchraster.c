@@ -17,6 +17,7 @@
 #include <string.h>
 #include <unistd.h>
 #include "store.h"
+#include "sysinfo.h"
 #include "tiff.h"
 #include "tiffw.h"
 #include "zarr3.h"
@@ -95,7 +96,7 @@ int cmd_patch_raster(int argc, char **argv) {
     J.zr[0] = 0; J.zr[1] = J.shp[0];   /* --zrow Z0,Z1: only voxels with z in [Z0, Z1) (rows of shards per run: bounded memory) */
     if (*pr_opt(argc, argv, "--zrow", "") && sscanf(pr_opt(argc, argv, "--zrow", ""), "%lld,%lld", (long long *)&J.zr[0], (long long *)&J.zr[1]) != 2) { fprintf(stderr, "patch-raster: --zrow Z0,Z1\n"); return 2; }
     for (int i = 1; i + 1 < argc && J.nsk < 16; i++) if (!strcmp(argv[i], "--skip-z") && sscanf(argv[i + 1], "%lld,%lld", (long long *)&J.sk[J.nsk][0], (long long *)&J.sk[J.nsk][1]) == 2) J.nsk++;
-    const double um = atof(pr_opt(argc, argv, "--um", "9.6")); const int code = atoi(pr_opt(argc, argv, "--code", "0")), nt0 = atoi(pr_opt(argc, argv, "--threads", "16"));
+    const double um = atof(pr_opt(argc, argv, "--um", "9.6")); const int code = atoi(pr_opt(argc, argv, "--code", "0")), nt0 = ufsm_threads(atoi(pr_opt(argc, argv, "--threads", "0")), 16);
     const int conly = atoi(pr_opt(argc, argv, "--check-only", "0"));
     FILE *f = fopen(list, "r"); if (!f) { fprintf(stderr, "patch-raster: cannot read %s\n", list); return 1; }
     int cap = 1024; J.dirs = malloc(cap * sizeof *J.dirs); char line[1100];

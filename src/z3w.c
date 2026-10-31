@@ -1,4 +1,5 @@
 #include "z3w.h"
+#include "sysinfo.h"
 #include <errno.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -156,7 +157,7 @@ static void *worker(void *arg) {
 int z3w_write_shard(z3w *w, int64_t sz, int64_t sy, int64_t sx, const uint8_t *data, int nthreads) {
     int nc = w->cg * w->cg * w->cg;
     job jb = {w, data, calloc((size_t)nc, sizeof(uint8_t *)), calloc((size_t)nc, sizeof(size_t)), nc, 0, 0};
-    if (nthreads <= 0) nthreads = (int)sysconf(_SC_NPROCESSORS_ONLN);
+    if (nthreads <= 0) nthreads = (int)ufsm_ncpu();
     if (nthreads > nc) nthreads = nc;
     if (nthreads > 256) nthreads = 256;
     pthread_t th[256];

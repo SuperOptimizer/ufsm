@@ -4,6 +4,7 @@
    decoded or re-encoded. zarr.json is copied with only the outer chunk_shape changed. Shards whose chunks are all absent (fill) are
    omitted, as z3w does. E.g. predict --fit-zarr writes 128^3 shards (one chunk per file); 512^3 shards hold up to 64 chunks per file,
    ~64x fewer files to upload. */
+#include "sysinfo.h"
 #include <errno.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -108,7 +109,7 @@ static const char *json_ints(const char *from, const char *key, int64_t v[3]) {
 int cmd_repack(int argc, char **argv) {
     if (argc < 5) { fprintf(stderr, "usage: ufsm repack <in-array-dir> <out-array-dir> <shard> [--threads N]\n"); return 2; }
     rp_t R = {.in = argv[2], .out = argv[3], .sout = atoi(argv[4])};
-    int nth = 32; for (int a = 5; a + 1 < argc; a++) if (!strcmp(argv[a], "--threads")) nth = atoi(argv[a + 1]);
+    int nth = ufsm_threads(0, 32); for (int a = 5; a + 1 < argc; a++) if (!strcmp(argv[a], "--threads")) nth = atoi(argv[a + 1]);
     char p[1400]; snprintf(p, sizeof p, "%s/zarr.json", R.in);
     size_t jn; char *js = slurp(p, &jn); if (!js) { fprintf(stderr, "repack: cannot read %s\n", p); return 1; }
     int64_t cs[3], inner[3];

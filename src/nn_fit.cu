@@ -469,6 +469,39 @@ __global__ void fit_finalize_w4_k(const float *acc, size_t nf, uint8_t *a) {
 }
 extern "C" void nn_fit_finalize_w4(const float *acc, size_t nf, uint8_t *a) { fit_finalize_w4_k<<<nblk(nf, 256), 256>>>(acc, nf, a); KCHECK(); }
 
+/* fit.c fit_pool (no phase gradient, no CT spacing) of the device fields: one thread per pooled cell, the same sums in the same order
+   in double with the roundings of the host (_rn: no fused multiply-adds), so the planes are byte-identical to the host's. dfield: the
+   10 planes of n = D H W cells back to back (pc ps t0..t5 sp w), h the field cell size; out: 10 device planes of the pooled box; *cnt +=
+   its cells with material. */
+__global__ void fit_pool_k(const uint8_t *__restrict__ dfield, int D, int H, int W, double h, int fp, int pD, int pH, int pW, uint8_t *__restrict__ out, unsigned long long *cnt_) {
+    const size_t np = (size_t)pD * pH * pW, o = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    uint8_t v[10] = {128, 128, 0, 0, 0, 0, 0, 0, 0, 0};
+    if (o < np) {
+        const size_t n = (size_t)D * H * W; const int x = (int)(o % pW), y = (int)((o / pW) % pH), z = (int)(o / ((size_t)pW * pH));
+        const uint8_t *w = dfield + 9 * n, *sp = dfield + 8 * n;
+        double sw = 0, st[6] = {0, 0, 0, 0, 0, 0}, srho = 0, swr = 0; int cnt = 0;
+        for (int a = 0; a < fp && z * fp + a < D; a++) for (int b = 0; b < fp && y * fp + b < H; b++) for (int e = 0; e < fp && x * fp + e < W; e++) {
+            const size_t i = ((size_t)(z * fp + a) * H + y * fp + b) * W + x * fp + e; cnt++;
+            if (!w[i]) continue;
+            const double wi = __ddiv_rn((double)w[i], 255.0); sw = __dadd_rn(sw, wi);
+            for (int k = 0; k < 6; k++) st[k] = __dadd_rn(st[k], __dmul_rn(wi, (double)dfield[(size_t)(2 + k) * n + i]));
+            if (sp[i]) { srho = __dadd_rn(srho, __ddiv_rn(__dmul_rn(wi, 8.0), __dmul_rn(h, (double)sp[i]))); swr = __dadd_rn(swr, wi); }
+        }
+        if (sw > 0) {
+            v[9] = (uint8_t)llround(__ddiv_rn(__dmul_rn(255.0, sw), (double)cnt));
+            for (int k = 0; k < 6; k++) v[2 + k] = (uint8_t)llround(__ddiv_rn(st[k], sw));
+            if (swr > 0) { const double r = __ddiv_rn(8.0, __dmul_rn(__dmul_rn(h, (double)fp), __ddiv_rn(srho, swr))); v[8] = (uint8_t)(r < 1 ? 1 : r > 255 ? 255 : llround(r)); }
+        }
+        for (int k = 0; k < 10; k++) out[(size_t)k * np + o] = v[k];
+    }
+    const unsigned m = __ballot_sync(0xffffffffu, v[9] != 0);
+    if ((threadIdx.x & 31) == 0 && m) atomicAdd(cnt_, (unsigned long long)__popc(m));
+}
+extern "C" void nn_fit_pool(const uint8_t *dfield, int D, int H, int W, double h, int fp, uint8_t *out, unsigned long long *cnt) {
+    const int pD = (D + fp - 1) / fp, pH = (H + fp - 1) / fp, pW = (W + fp - 1) / fp; const size_t np = (size_t)pD * pH * pW;
+    fit_pool_k<<<nblk(np, 256), 256>>>(dfield, D, H, W, h, fp, pD, pH, pW, out, cnt); KCHECK();
+}
+
 /* analytic data terms (nn_fit_loss2): one evaluation per voxel (src/fit_terms.h fit_vox2) */
 __global__ void fit_loss2_k(fit_dev f, long long *pi, long long *gi) {   /* (fixed-point sums: deterministic) */
     __shared__ long long red[FIT_NPARTS][FIT_TPB];
@@ -482,23 +515,6 @@ __global__ void fit_loss2_k(fit_dev f, long long *pi, long long *gi) {   /* (fix
         for (int q = 0; q < FIT_NPARTS; q++) lq[q] = fit_pfix(lp[q]);
     }
     fit_reduce_parts_fix(lq, red, pi);
-}
-/* Minibatch steps (stride > 1): the step's voxels (hash(i ^ salt) % stride == 0, material) are first listed (one thread per voxel:
-   a hash and, for the 1 / stride selected, the weight byte; warp-aggregated appends), then evaluated by a grid-stride kernel over
-   the list. fit_loss2_k ran a thread, a block-wide reduction of FIT_NPARTS doubles and a launch slot per voxel of the slab for the
-   ~1 / stride of them that do work: 60-100 ms per step on a 1024^2 x 256 slab (2 M voxels a step), ~2 ms so. The same voxels
-   and per-voxel terms (fit_vox2); the float gradient sums are atomic in either form, so their order (the last bits) varies run to
-   run as before. */
-__global__ void fit_select_k(fit_dev f, unsigned *list, unsigned *count, unsigned cap) {
-    const size_t n = (size_t)f.D * f.H * f.W, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
-    const bool sel = i < n && fit_hash((unsigned)i ^ f.salt) % (unsigned)f.stride == 0 && f.w[i] != 0;
-    const unsigned m = __ballot_sync(0xffffffffu, sel);
-    if (!m) return;
-    const int lane = threadIdx.x & 31, leader = __ffs(m) - 1;
-    unsigned base = 0;
-    if (lane == leader) base = atomicAdd(count, (unsigned)__popc(m));
-    base = __shfl_sync(0xffffffffu, base, leader);
-    if (sel) { const unsigned k = base + __popc(m & ((1u << lane) - 1u)); if (k < cap) list[k] = (unsigned)i; }
 }
 __global__ void fit_loss2_list_k(fit_dev f, const unsigned *list, const unsigned *count, unsigned cap, long long *pi, long long *gi) {
     __shared__ long long red[FIT_NPARTS][FIT_TPB];
@@ -516,6 +532,37 @@ __global__ void fit_loss2_list_k(fit_dev f, const unsigned *list, const unsigned
     }
     fit_reduce_parts_fix(lp, red, pi);
 }
+/* Minibatch steps (stride > 1): the step's voxels (hash(i ^ salt) % stride == 0, material) are first listed (warp-aggregated appends),
+   then evaluated by a grid-stride kernel over the list (fit_loss2_list_k; fit_loss2_k's thread per voxel of the slab was 60-100 ms a
+   step on a 1024^2 x 256 slab). The list from the other side: fit_hash is a bijection of 32-bit words, so {i < n : hash(i ^ salt) %
+   stride == 0} is {unhash(k stride) ^ salt : k stride < 2^32} restricted to i < n: one thread per multiple of the stride (2^32 / stride,
+   ~7.6 M at stride 562) reading the weight byte of its candidate. Hashing every voxel of the box instead took 3.7 ms a step on a
+   96 x 3328 x 3520 slab (half of a fit's GPU time); fit_select_k still does where the box has fewer voxels than candidates. The list
+   order varies run to run; the sums are fixed point (order-free).
+   n < 2^32 (nn_fit_loss2's guard). */
+__global__ void fit_select_k(fit_dev f, unsigned *list, unsigned *count, unsigned cap) {   /* the same list, one thread per voxel */
+    const size_t n = (size_t)f.D * f.H * f.W, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    const bool sel = i < n && fit_hash((unsigned)i ^ f.salt) % (unsigned)f.stride == 0 && f.w[i] != 0;
+    const unsigned m = __ballot_sync(0xffffffffu, sel);
+    if (!m) return;
+    const int lane = threadIdx.x & 31, leader = __ffs(m) - 1;
+    unsigned base = 0;
+    if (lane == leader) base = atomicAdd(count, (unsigned)__popc(m));
+    base = __shfl_sync(0xffffffffu, base, leader);
+    if (sel) { const unsigned k = base + __popc(m & ((1u << lane) - 1u)); if (k < cap) list[k] = (unsigned)i; }
+}
+__global__ void fit_select_inv_k(fit_dev f, unsigned long long nk, unsigned *list, unsigned *count, unsigned cap) {
+    const size_t n = (size_t)f.D * f.H * f.W; const unsigned long long k = blockIdx.x * (unsigned long long)blockDim.x + threadIdx.x;
+    unsigned i = 0; bool sel = false;
+    if (k < nk) { i = fit_unhash((unsigned)(k * (unsigned long long)(unsigned)f.stride)) ^ f.salt; sel = (size_t)i < n && f.w[i] != 0; }
+    const unsigned m = __ballot_sync(0xffffffffu, sel);
+    if (!m) return;
+    const int lane = threadIdx.x & 31, leader = __ffs(m) - 1;
+    unsigned base = 0;
+    if (lane == leader) base = atomicAdd(count, (unsigned)__popc(m));
+    base = __shfl_sync(0xffffffffu, base, leader);
+    if (sel) { const unsigned q = base + __popc(m & ((1u << lane) - 1u)); if (q < cap) list[q] = i; }
+}
 static unsigned *g_sel_list, *g_sel_count; static unsigned g_sel_cap;
 extern "C" void nn_fit_loss2(const fit_dev *f, double *parts, float *g_delta) {
     const size_t n = (size_t)f->D * f->H * f->W, nl = (size_t)f->lz * f->ly * f->lx;
@@ -532,7 +579,9 @@ extern "C" void nn_fit_loss2(const fit_dev *f, double *parts, float *g_delta) {
         CK(cudaMalloc(&g_sel_list, want * sizeof(unsigned))); g_sel_cap = (unsigned)want;
     }
     CK(cudaMemsetAsync(g_sel_count, 0, sizeof(unsigned)));
-    fit_select_k<<<nblk(n, 256), 256>>>(*f, g_sel_list, g_sel_count, g_sel_cap);
+    const unsigned long long nk = ((1ull << 32) + (unsigned)f->stride - 1) / (unsigned)f->stride;   /* the multiples of the stride below 2^32 */
+    if (nk < n) fit_select_inv_k<<<(unsigned)((nk + 255) / 256), 256>>>(*f, nk, g_sel_list, g_sel_count, g_sel_cap);
+    else fit_select_k<<<nblk(n, 256), 256>>>(*f, g_sel_list, g_sel_count, g_sel_cap);   /* (small boxes: fewer voxels than candidates) */
     const unsigned nb = nblk(want, FIT_TPB) < 1024 ? nblk(want, FIT_TPB) : 1024;
     fit_loss2_list_k<<<nb, FIT_TPB>>>(*f, g_sel_list, g_sel_count, g_sel_cap, pi, gi);
     fit_gconv_k<<<nblk(nl, 256) < 4096 ? nblk(nl, 256) : 4096, 256>>>(gi, nl, g_delta); fit_pconv_k<<<1, 32>>>(pi, parts);
@@ -559,4 +608,57 @@ void nn_fit_grid(const fit_dev *ms, const fit_grid_row *rows, int nz, int ny, in
         fit_grid_k<<<dim3((unsigned)((per + 255) / 256), (unsigned)n), 256>>>(ms, rows + z0, ny, nx, y0, x0, step, with_theta, out + (size_t)z0 * per);
     }
     CK(cudaGetLastError());
+}
+
+/* fit_fields_load_stream's uploads (src/fit.h nn_fit_up_*): a thread copies pageable host ranges to the device through two pinned
+   staging buffers (memcpy into one while the other's DMA runs, on its own stream), so the uploads run beside the main thread's
+   decoding instead of after it (pageable cudaMemcpy: ~3 GB/s, synchronous). */
+#include <pthread.h>
+struct nn_fit_up {
+    pthread_t th; pthread_mutex_t mu; pthread_cond_t cv; int dev, quit;
+    struct job { uint8_t *dst; const uint8_t *src; size_t n; } *q; long nq, cap, done;   /* jobs [0, nq); [0, done) consumed */
+    uint8_t *pin[2]; size_t S; cudaEvent_t ev[2]; cudaStream_t st;
+};
+static void *nn_fit_up_main(void *a) {
+    nn_fit_up *u = (nn_fit_up *)a; CK(cudaSetDevice(u->dev)); long j = 0;
+    for (;;) {
+        pthread_mutex_lock(&u->mu);
+        while (u->done == u->nq && !u->quit) pthread_cond_wait(&u->cv, &u->mu);
+        if (u->done == u->nq) { pthread_mutex_unlock(&u->mu); break; }
+        const nn_fit_up::job jb = u->q[u->done]; pthread_mutex_unlock(&u->mu);
+        for (size_t o = 0; o < jb.n; o += u->S, j++) {
+            const size_t len = jb.n - o < u->S ? jb.n - o : u->S; const int s = (int)(j & 1);
+            CK(cudaEventSynchronize(u->ev[s]));
+            memcpy(u->pin[s], jb.src + o, len);
+            CK(cudaMemcpyAsync(jb.dst + o, u->pin[s], len, cudaMemcpyHostToDevice, u->st)); CK(cudaEventRecord(u->ev[s], u->st));
+        }
+        pthread_mutex_lock(&u->mu); u->done++; pthread_cond_broadcast(&u->cv); pthread_mutex_unlock(&u->mu);
+    }
+    return nullptr;
+}
+extern "C" nn_fit_up *nn_fit_up_open(void) {
+    nn_fit_up *u = (nn_fit_up *)calloc(1, sizeof *u); u->S = (size_t)32 << 20;
+    CK(cudaGetDevice(&u->dev)); pthread_mutex_init(&u->mu, nullptr); pthread_cond_init(&u->cv, nullptr);
+    for (int s = 0; s < 2; s++) { CK(cudaMallocHost(&u->pin[s], u->S)); CK(cudaEventCreateWithFlags(&u->ev[s], cudaEventDisableTiming)); CK(cudaEventRecord(u->ev[s], 0)); }
+    CK(cudaStreamCreateWithFlags(&u->st, cudaStreamNonBlocking));
+    pthread_create(&u->th, nullptr, nn_fit_up_main, u);
+    return u;
+}
+extern "C" long nn_fit_up_put(nn_fit_up *u, void *dst, const void *src, size_t n) {
+    pthread_mutex_lock(&u->mu);
+    if (u->nq == u->cap) { u->cap = u->cap ? 2 * u->cap : 64; u->q = (nn_fit_up::job *)realloc(u->q, u->cap * sizeof *u->q); }
+    u->q[u->nq] = {(uint8_t *)dst, (const uint8_t *)src, n}; const long id = u->nq++;
+    pthread_cond_broadcast(&u->cv); pthread_mutex_unlock(&u->mu);
+    return id;
+}
+extern "C" void nn_fit_up_wait(nn_fit_up *u, long id) {   /* job id's source read (reusable) */
+    pthread_mutex_lock(&u->mu); while (u->done <= id) pthread_cond_wait(&u->cv, &u->mu); pthread_mutex_unlock(&u->mu);
+}
+extern "C" void nn_fit_up_close(nn_fit_up *u) {   /* every job on the device; frees u */
+    if (!u) return;
+    pthread_mutex_lock(&u->mu); u->quit = 1; pthread_cond_broadcast(&u->cv); pthread_mutex_unlock(&u->mu);
+    pthread_join(u->th, nullptr);
+    CK(cudaStreamSynchronize(u->st)); CK(cudaStreamDestroy(u->st));
+    for (int s = 0; s < 2; s++) { CK(cudaEventDestroy(u->ev[s])); CK(cudaFreeHost(u->pin[s])); }
+    pthread_mutex_destroy(&u->mu); pthread_cond_destroy(&u->cv); free(u->q); free(u);
 }

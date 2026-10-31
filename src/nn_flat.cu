@@ -2,13 +2,15 @@
    SVD, symmetric Dirichlet proxy weights, closest rotation), the matrix-free Jacobi-preconditioned CG of the global step (warm start at the
    current map, the same proximal term), the flip-capped halving line search. Reductions run over a fixed grid in a fixed order, so a run is
    deterministic; it differs from the CPU threads' summation order in the last bits only (energies agree to ~1e-12 relative per step).
-   Called through flatten.c's weak flat_slim_gpu: a binary without this object (test_flatten, test_strip) stays CPU-only. */
+   Built with --default-stream per-thread: concurrent callers (ufsm strip-flatten --jobs) on one device do not serialise on the legacy
+   stream. Called through flatten.c's weak flat_slim_gpu: a binary without this object (test_flatten, test_strip) stays CPU-only. */
 #include <cuda_runtime.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <pthread.h>
 
 enum { FB = 256, FG = 1024 };   /* block size, blocks of every reduction (fixed: deterministic sums) */
 
@@ -129,6 +131,7 @@ __global__ void k_maxstep(int nt, const int *tri, const double *x, const double 
     if (!threadIdx.x) part[blockIdx.x] = s[0];
 }
 
+extern "C" int flat_gpu_count(void) { int n = 0; if (cudaGetDeviceCount(&n) != cudaSuccess) { cudaGetLastError(); return 0; } return n; }
 static double fl_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 static int fl_grid(long long n) { const long long b = (n + FB - 1) / FB; return (int)(b < 1 ? 1 : b > FG ? FG : b); }
 
@@ -159,10 +162,15 @@ static double fl_matvec(flg *G, double lam, const double *x, double *y) {
    updated in place. Returns 0 and the final energy in *Eout, -1 when the device is missing or out of memory (x untouched: the caller
    runs the CPU solver). */
 extern "C" int flat_slim_gpu(const double *g, const double *A, const int *tri, int nt, const int *vo, const int *vl, int nv, double *xh,
-                             int iters, int cg_iters, double tol, int verbose, const char *tag, double *Eout) {
+                             int iters, int cg_iters, double tol, int verbose, const char *tag, int dev, double *Eout) {
     int ndev = 0; if (cudaGetDeviceCount(&ndev) != cudaSuccess || ndev < 1) { cudaGetLastError(); return -1; }
-    static int flags_set = 0;   /* host waits block instead of spinning: the desk's cores are busy with other jobs */
-    if (!flags_set) { flags_set = 1; if (cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync) != cudaSuccess) cudaGetLastError(); }
+    if (dev >= 0) { if (dev >= ndev || cudaSetDevice(dev) != cudaSuccess) { cudaGetLastError(); return -1; } }
+    else if (cudaGetDevice(&dev) != cudaSuccess) { cudaGetLastError(); return -1; }
+    static pthread_mutex_t fmu = PTHREAD_MUTEX_INITIALIZER; static unsigned flags_set = 0;   /* per device: host waits block instead of spinning
+                                                                                               (the desk's cores are busy with other jobs) */
+    pthread_mutex_lock(&fmu);
+    if (dev < 32 && !(flags_set >> dev & 1)) { flags_set |= 1u << dev; if (cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync) != cudaSuccess) cudaGetLastError(); }
+    pthread_mutex_unlock(&fmu);
     flg G; memset(&G, 0, sizeof G); G.nv = nv; G.nt = nt; G.n2 = 2LL * nv;
     const size_t T = (size_t)nt, V2 = (size_t)G.n2 * 8;
     int ok = cudaMalloc(&G.g, T * 48) == cudaSuccess && cudaMalloc(&G.A, T * 8) == cudaSuccess && cudaMalloc(&G.M, T * 24) == cudaSuccess &&

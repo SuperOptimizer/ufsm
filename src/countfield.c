@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "fit.h"
+#include "sysinfo.h"
 #include "z3w.h"
 #include "spiralfit.h"
 #include "zarr3.h"
@@ -497,11 +498,15 @@ int cmd_count_field(int argc, char **argv) {
         return 2;
     }
     const char *in = argv[2], *out = argv[3], *meth = cf_opt(argc, argv, "--method", "ls"), *cmode = cf_opt(argc, argv, "--conf", "mix"), *mdir = cf_opt(argc, argv, "--model", "");
-    cf_nt = atoi(cf_opt(argc, argv, "--threads", "8"));
+    cf_nt = ufsm_threads(atoi(cf_opt(argc, argv, "--threads", "0")), 8);
     const int R = atoi(cf_opt(argc, argv, "--R", "10")), Rz = R > 0 ? atoi(cf_opt(argc, argv, "--Rz", cf_opt(argc, argv, "--R", "10"))) : 0;
     const int iters = atoi(cf_opt(argc, argv, "--iters", "400")), Qf = atoi(cf_opt(argc, argv, "--loop", "8")), Rm = atoi(cf_opt(argc, argv, "--model-R", "8")), wwc = atoi(cf_opt(argc, argv, "--wc", "1"));
     const double lamr = atof(cf_opt(argc, argv, "--lambda", "1e-7")), eps = atof(cf_opt(argc, argv, "--eps", "1e-3")), rmin_um = atof(cf_opt(argc, argv, "--rmin-um", "500"));
-    const double memgb = atof(cf_opt(argc, argv, "--mem-gb", "6"));
+    double memgb = atof(cf_opt(argc, argv, "--mem-gb", "6"));
+    {   /* the chunk budget never above 60% of what this process may still allocate (cgroup aware: pods, capped scopes) */
+        const double av = (double)ufsm_mem_available() / (1u << 30);
+        if (av > 0 && memgb > 0.6 * av) { fprintf(stderr, "count-field: --mem-gb %.1f lowered to %.1f (60%% of the %.1f GB available)\n", memgb, 0.6 * av, av); memgb = 0.6 * av; }
+    }
     /* --model-only 1 (with --model): no output fields (the out directory is not written), only the model; --model-stride K: its phase
        gauge (and the R 0 global gauge) from every K-th field chunk (a whole scroll: the gauge is smoothed over +-model-R solve cells) */
     const int mo = atoi(cf_opt(argc, argv, "--model-only", "0")), mstride = atoi(cf_opt(argc, argv, "--model-stride", "1"));
@@ -1017,7 +1022,7 @@ int cmd_cf_compare(int argc, char **argv) {
     printf("cf-compare: lattice %dx%dx%d (%zu nodes): |delta A - B| max %.3g, p99 %.3g, p99.9 %.3g, p99.99 %.3g turn; > 0.01 turn at %zu nodes, > 0.5 turn at %zu (%.2e)\n",
            a->lz, a->ly, a->lx, nl, mx, cf_hq(hl, nl, 0.99), cf_hq(hl, nl, 0.999), cf_hq(hl, nl, 0.9999), n01, ni, (double)ni / nl);
     if (argc > 4 && argv[4][0] != '-') {
-        cf_nt = atoi(cf_opt(argc, argv, "--threads", "8")); const int step = atoi(cf_opt(argc, argv, "--step", "4"));
+        cf_nt = ufsm_threads(atoi(cf_opt(argc, argv, "--threads", "0")), 8); const int step = atoi(cf_opt(argc, argv, "--step", "4"));
         fit_fields_buf g; if (fit_fields_load(argv[4], 0, 0, 0, &g)) { fprintf(stderr, "cf-compare: cannot load %s\n", argv[4]); return 1; }
         const int D = g.shape[0]; fit_fields_skip_planes(1 | 2 | 4);
         cf_cmp C = {a, b, nullptr, 0, 0, 0, step, g.h, {0}, {0}, {0}}; for (int t = 0; t < CF_MAXT; t++) C.hist[t] = calloc(CF_NH, sizeof(uint64_t));
