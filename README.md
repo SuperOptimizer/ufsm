@@ -20,7 +20,7 @@ make VERIFY=1 test-all   # the suite alone (build-verify/: adds the bf16 / fp32 
 `make test` builds the default `build/ufsm` plus the fixtures the Python CLI tests use, then runs `test-all` on the VERIFY=1
 build. Single tests: `make VERIFY=1 build-verify/test_strip && build-verify/test_strip`. The pipeline stages below have their
 own tests: `test_countfield`, `test_fit_join`, `test_wraps_core`, `test_flatten`, `test_flatten_gpu`,
-`test_faces`, `test_strip`, `test_render_stream` (render / ink-compare / jpeg-fit, byte-identical streamed vs in-memory),
+`test_faces`, `test_faces_gpu`, `test_strip`, `test_render_stream` (render / ink-compare / jpeg-fit, byte-identical streamed vs in-memory),
 `test_sheetcut`, `test_ink_blend.py`. On the laptop run builds and tests through `~/ufsm-data/capped.sh`.
 
 ## Unroll a scroll
@@ -277,7 +277,7 @@ ufsm tifxyz-scale <src> <dst> <div> [--wraps a,b] [--offset z,y,x] [--flip-rows 
 ufsm tifxyz-sfc <src> <dst> [--error 0.25] [--every K] [--wraps a,b]                 # tifxyz -> .sfc
 ufsm flatten <wraps> <out> [--wraps a,b] [--decim 1] [--crop rect|none] [--max-aspect A] [--rects N] [--min-cm2 5] [--fill-holes 5000] [--gpu 1] [--sfc ERR]
 ufsm flatten-warp <in.jpg|tif> <flat-wrap-dir> <out.jpg|tif> --src-px P [--scale S]
-ufsm faces <wraps> <out> --ct ROOT KEY --ct-um U [--wraps a,b] [--umb JSON --umb-um U] [--thick 15,200] [--gt ROOT KEY --gt-um U]
+ufsm faces <wraps> <out> --ct ROOT KEY --ct-um U [--wraps a,b] [--umb JSON --umb-um U] [--thick 15,200] [--gt ROOT KEY --gt-um U] [--gpu 1]
 ufsm sheet-cut <wraps> <out> [--tol 0.3] [--min-cm2 0.25] [--max 8]                  # square flat sheets from the raw grids
 ufsm wrapswitch <wraps> <codes-root> <codes-key> [--per-wrap]                          # sheet switches per cm vs GT codes
 ```
@@ -307,7 +307,10 @@ extrema; half-level edges; a high valley between touching sheets is an edge), ma
 line per wrap on stdout. Recto is the inner face by the published-label side rule (papyrus outward of wrap k is recto side).
 Run it on the flat grid so both faces share one uv and render pixel-aligned; render faces with `--depth 0` (the sheet is
 ~4 voxels at 9.6 um). The CT cache decodes only the volcomp substreams under the samples (`UFSM_FACES_FULLDECODE=1`: whole
-chunks; same output).
+chunks; same output). `--gpu 1` (default) samples the profiles, cuts the bands and runs the median windows on the GPU from a
+device mirror of the decoded chunks (decode list = the exact substreams the samples read; `src/nn_faces.cu`, no fast math,
+no FMA): byte-identical outputs, CPU fallback without a device or when the device pool fills. Paris 4 w178: sampling 35 -> 3 s,
+medians 15 -> 2.5 s; the CPU volcomp decode is then ~75% of the wall. `UFSM_FACES_PROF=1` prints per-stage times.
 
 ### Whole-scroll strip
 
