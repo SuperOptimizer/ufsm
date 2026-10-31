@@ -85,6 +85,10 @@ int render_wraps_chunked(struct z3 *const *vz, int nv, const int *depth, int ns,
    vgrid[s] (w x h, or vgrid nullptr): nonzero at vertices tifxyz_fill_holes interpolated; pixels with such a corner get + RFILL_GRID. */
 enum { RFILL_ON = 0, RFILL_NEG = 50, RFILL_GRID = 100, RFILL_INPAINT = 250, RFILL_NONE = 254, RFILL_EMPTY = 255 };   /* +k: k (1..49); -k: 50 + k */
 typedef struct { int n, thr, prefer; uint8_t *const *flag; const uint8_t *const *vgrid; } render_fill;
+void render_set_gpu(int on);        /* the chunk-ordered renderer on the GPU (src/nn_render.cu; same bytes, CPU on any device error) */
+int render_gpu_available(void);    /* nn_render.cu linked in */
+int render_gpu_count(void);         /* renders completed on the GPU */
+int render_gpu_fallbacks(void);     /* GPU renders redone on the CPU (device error / full) */
 int render_wraps_chunked_fill(struct z3 *const *vz, int nv, const int *depth, int ns, const float *const *X, const float *const *Y, const float *const *Z,
                               int w, int h, double gs, uint8_t *const *img, int ow, int oh, const int *crop, size_t budget, int nthreads, int io_threads,
                               int verbose, const render_fill *F);
