@@ -485,7 +485,7 @@ the old paths). A whole Paris 3 wrap (338 cm², 1.6 Gpixel): 5:28 -> 1:37.
 
 `render --gpu 1` (the default; `--gpu 0`: the CPU path; `src/nn_render.cu`; same bytes, every `--fill*` / `--depth` / `--joint` / `--crop` mode) runs
 the chunk-ordered renderer on the GPU. Decoded chunks stay on the device. The decoder threads have gpudec decode the lossy
-substreams straight into a device chunk pool. `--gpu 1` sets `UFSM_GPU_DECODE=1` and `UFSM_GPU_DECODE_MIN_BYTES=0` unless they are
+substreams straight into a device chunk pool (device-sink requests ignore `UFSM_GPU_DECODE_MIN_BYTES`). `--gpu 1` sets `UFSM_GPU_DECODE=1` unless it is
 already set, and runs 128 decoders (`UFSM_RENDER_GPU_DECODERS`). Anything decoded on the host is uploaded from pinned staging
 buffers. The kernel evaluates `src/render_core.h` `rc_pixel`, the per-pixel arithmetic shared with the CPU renderer (built
 with `-fmad=false`, no fast math). Its outputs go to mapped pinned memory, two launches in flight. The pool is sized from the
