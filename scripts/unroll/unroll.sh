@@ -334,7 +334,9 @@ stripimg() {
     nice -n 10 $U strip-mosaic $ST/strip/flat $RF $ST/img_fill --stretch-only 1 --threads 3 2> $ST/logs/stretch.log | awk '/^stretch/ {print $2}' > $ST/stretch.txt
     [ -s $ST/stretch.txt ] || { log "stripimg: no stretch (logs in $ST/logs)"; return 1; }; log "stripimg: stretch $(cat $ST/stretch.txt)"
   fi
-  env $E U=$U CTR=$R CTK=$K/$LV INK=$INK INKK=$LUM RENDER_NT=${RENDER_NT:-$TH} MOS_NT=${MOS_NT:-4} MAXR=${MAXR:-6} MEMGB=${RMEMGB:-0} \
+  # RJOBS: 2 stripe renders at once when >= 64 GB is available (0490B: 394 -> 355 s, 6.7 -> 18.4 GB RSS, same images), else 1
+  local rj=${RJOBS:-$([ $(availgb) -ge 64 ] && echo 2 || echo 1)}
+  env $E U=$U CTR=$R CTK=$K/$LV INK=$INK INKK=$LUM RJOBS=$rj RENDER_NT=${RENDER_NT:-$TH} MOS_NT=${MOS_NT:-4} MAXR=${MAXR:-6} MEMGB=${RMEMGB:-0} \
     PAPMOS=$ST/img_pap PGAIN=${PGAIN:-1} PAPPX=${PAPPX:-8000} FILLX="$FILLX" /usr/bin/time -v bash $REFILL $ST >> $O/logs/stripimg.log 2>&1 &&
     [ -e $ST/img_fill/overview.jpg ] && log "stripimg: $(grep '^strip-mosaic: .* overview' $ST/logs/mosaic_fill.log | head -1)"
 }
