@@ -29,10 +29,12 @@ int fgpu_put(fgpu *G, size_t id, const uint8_t *buf, uint32_t mask) __attribute_
 void fgpu_drop(fgpu *G, size_t id) __attribute__((weak));
 void fgpu_stats(const fgpu *G, size_t *nput, size_t *bytes, int *slots) __attribute__((weak));
 
+static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + 1e-9 * t.tv_nsec; }
+
 /* ---- the CT (or a label raster) through a cache of decoded chunks ---- */
 typedef struct {
     z3 *z; int64_t shape[3]; int cs[3]; int64_t g[3]; uint8_t **ch; uint32_t *stamp; _Atomic uint8_t *need; size_t nres, cap; uint32_t clock; int nt;
-    size_t ndec;
+    size_t ndec; double tdec, tup, tev;   /* fill: decode / device upload / eviction seconds */
     fgpu *dev;   /* non-null: every decoded chunk mirrored on the GPU (faces_vol.gpu) */
     _Atomic uint32_t *needm; uint32_t *have;
     uint8_t **pool; int npool; pthread_mutex_t pmu;   /* evicted whole-chunk buffers for reuse (no page faults / zeroing per decode) */   /* sub: per chunk the volcomp substreams (16 z x 32 y slabs) marked / decoded; nullptr: whole chunks */
@@ -132,12 +134,12 @@ static int fcc_fill(void *ctx) {
         if (nt == cap) { cap = cap ? 2 * cap : 256; todo = realloc(todo, cap * sizeof *todo); }
         nnew += !c->ch[k]; todo[nt++] = (int64_t)k;
     }
-    fcd_job J = {c, todo, nt, 0, 0}; fc_par(fcc_decode, &J, c->nt);
+    double tq = now_s(); fcd_job J = {c, todo, nt, 0, 0}; fc_par(fcc_decode, &J, c->nt); c->tdec += now_s() - tq; tq = now_s();
     c->nres += nnew; c->ndec += nt;
     if (atomic_load(&J.err)) { free(todo); fprintf(stderr, "faces: %s\n", z3_error()); return -1; }
     if (c->dev && !fgpu_broken(c->dev))   /* the new chunks / substreams to the device mirror */
         for (size_t k = 0; k < nt && !fgpu_broken(c->dev); k++) { const size_t id = (size_t)todo[k]; if (c->ch[id]) fgpu_put(c->dev, id, c->ch[id], c->needm ? c->have[id] : 0xffffffffu); }
-    free(todo);
+    free(todo); c->tup += now_s() - tq; tq = now_s();
     while (c->nres > c->cap) {   /* least recently needed first, never this band's */
         uint32_t old = c->clock; for (size_t k = 0; k < ng; k++) if (c->ch[k] && c->stamp[k] < old) old = c->stamp[k];
         if (old == c->clock) break;
@@ -147,6 +149,7 @@ static int fcc_fill(void *ctx) {
             if (c->dev) fgpu_drop(c->dev, k);
         }
     }
+    c->tev += now_s() - tq;
     return 0;
 }
 
@@ -190,7 +193,6 @@ static const char *fopt(int argc, char **argv, const char *name, const char *dfl
 }
 static int farg(int argc, char **argv, const char *name) { for (int i = 2; i < argc; i++) if (!strcmp(argv[i], name)) return i; return -1; }
 static int cmp_flt(const void *a, const void *b) { const float x = *(const float *)a, y = *(const float *)b; return (x > y) - (x < y); }
-static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + 1e-9 * t.tv_nsec; }
 
 static void meta_get(const char *dir, const char *name, double *um, double *scale, int *winding) {
     char p[1400]; snprintf(p, sizeof p, "%s/%s/meta.json", dir, name);
@@ -317,7 +319,7 @@ int cmd_faces(int argc, char **argv) {
         }
         if (getenv("UFSM_FACES_PROF")) {
             size_t np = 0, nb = 0; int ns = 0; if (cc.dev && fgpu_stats) fgpu_stats(cc.dev, &np, &nb, &ns);
-            fprintf(stderr, "faces prof: gt %.2f s; gpu %s, %zu chunk uploads %.2f GB, %d device slots\n", now_s() - tgt, cc.dev ? (fgpu_broken(cc.dev) ? "broken" : "on") : "off", np, nb / 1e9, ns);
+            fprintf(stderr, "faces prof: CT fill: decode %.2f upload %.2f evict %.2f s; GT fill: decode %.2f s; gt %.2f s; gpu %s, %zu chunk uploads %.2f GB, %d device slots\n", cc.tdec, cc.tup, cc.tev, gz ? gc.tdec : 0.0, now_s() - tgt, cc.dev ? (fgpu_broken(cc.dev) ? "broken" : "on") : "off", np, nb / 1e9, ns);
         }
         const size_t nm1 = st.nv ? st.nv : 1, cn = st.ct_n ? st.ct_n : 1, np = st.nv - st.nfill ? st.nv - st.nfill : 1;
         char line[1200];
