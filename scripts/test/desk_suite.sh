@@ -29,7 +29,8 @@ echo "desk_suite: $REF = ${SHA:0:12} ($(git log -1 --format=%s "$SHA" | cut -c1-
 ssh -o ConnectTimeout=10 "$DESK" "mkdir -p $ROOT && { [ -d $ROOT/repo.git ] || git init -q --bare $ROOT/repo.git; }" || exit 2
 git push -q "$DESK:$ROOT/repo.git" "$SHA:refs/suite/${SHA:0:12}" 2>&1 | grep -v '^$' || true
 
-ssh -o ConnectTimeout=10 "$DESK" bash -s -- "$SHA" "$TIER" "$J" "$T" "$MEMGB" "$BJ" "$KEEP" "$FILT" "${SUITE_ARGS:-}" <<'REMOTE'
+# (ssh joins the words into one string: quote each so empty ones survive)
+ssh -o ConnectTimeout=10 "$DESK" "bash -s -- $(printf '%q ' "$SHA" "$TIER" "$J" "$T" "$MEMGB" "$BJ" "$KEEP" "$FILT" "${SUITE_ARGS:-}")" <<'REMOTE'
 set -u
 SHA=$1 TIER=$2 J=$3 T=$4 MEMGB=$5 BJ=$6 KEEP=$7 FILT=$8 XARGS=$9
 ROOT=/vesuvius/ufsm/suite; S=${SHA:0:12}; W=$ROOT/$S
