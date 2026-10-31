@@ -1,11 +1,12 @@
 /* ufsm ink-gate OUT --ink ROOT KEY --ink-um U --phase ROOT KEY --phase-um U [--ignore ROOT KEY] [--lo 0] [--hi 125] [--ink-max 255]
-                  [--shard 512] [--threads N]
+                  [--seam PERIOD,OFFSET,WIDTH] [--shard 512] [--threads N]
    Pseudo ink targets: an ink prediction (uint8 probability, 0..ink-max) restricted to a band of a stored label phase raster
    (PHASE_* codes: 0..251 = phase x 252, 252..255 unknown), e.g. the recto half k..k+0.5 of every turn = codes lo 0 .. hi 125.
    Output on the phase raster's grid (OUT/<phase-um>, OME group OUT/zarr.json, 512^3 shards, lossless), "prob254" encoding:
    p x 254 where the phase code lies in [lo, hi] (lo > hi wraps through 251 / 0) and the ignore mask (same grid as the phase) is 0,
    else 255 (unknown). The ink is read nearest-neighbour at the phase voxel centres (both on the scan's global grid, origin 0;
-   voxel sizes --ink-um / --phase-um). Only shards holding stored phase chunks are visited. Prints the gated / ink voxel counts. */
+   voxel sizes --ink-um / --phase-um). --seam: also unknown within WIDTH ink voxels of the planes OFFSET + k PERIOD of every axis
+   (the window borders of a single-pass predict, whose seams ink-seam measures), so window seams are not taught. Only shards holding stored phase chunks are visited. Prints the gated / ink voxel counts. */
 #include <math.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -26,7 +27,7 @@ static int ig_opt2(int argc, char **argv, const char *k, const char **a, const c
 
 typedef struct {
     const char *ir, *ik, *pr, *pk, *gr, *gk;   /* ink, phase, ignore (root, key) */
-    double ium, pum; int lo, hi, imax, S;
+    double ium, pum; int lo, hi, imax, S, sp, so, sw;   /* sp, so, sw: --seam period, offset, width (ink voxels) */
     int64_t shape[3], ishape[3], ns[3]; uint8_t *present; z3w *zw; uint8_t lut[256];
     _Atomic long next; _Atomic int fail; _Atomic long long ngate, nink, nknown;
 } ig_job;
@@ -39,6 +40,7 @@ static void *ig_worker(void *arg) {
     z3 *zp = sp ? z3_open(sp, J->pk, nullptr) : nullptr, *zi = si ? z3_open(si, J->ik, nullptr) : nullptr, *zg = sg ? z3_open(sg, J->gk, nullptr) : nullptr;
     uint8_t *p = malloc(n), *g = zg ? malloc(n) : nullptr, *o = malloc(n), *ib = nullptr; size_t icap = 0;
     int64_t *map[3] = {malloc(S * sizeof(int64_t)), malloc(S * sizeof(int64_t)), malloc(S * sizeof(int64_t))};
+    uint8_t *seam[3] = {calloc(S, 1), calloc(S, 1), calloc(S, 1)};
     if (!zp || !zi || (J->gr && !zg) || !p || !o || (zg && !g)) { fprintf(stderr, "ink-gate: cannot open the inputs: %s\n", z3_error()); atomic_store(&J->fail, 1); goto done; }
     const double r = J->pum / J->ium;
     for (;;) {
@@ -50,6 +52,7 @@ static void *ig_worker(void *arg) {
             int64_t a = INT64_MAX, b = -1;
             for (int64_t i = 0; i < sn[d]; i++) { int64_t v = (int64_t)floor((so[d] + i + 0.5) * r); if (v < 0) v = 0; if (v >= J->ishape[d]) v = J->ishape[d] - 1; map[d][i] = v; if (v < a) a = v; if (v > b) b = v; }
             io[d] = a; in[d] = b - a + 1;
+            for (int64_t i = 0; i < sn[d]; i++) { int64_t m = J->sp > 0 ? ((map[d][i] - J->so) % J->sp + J->sp) % J->sp : J->sw; seam[d][i] = m < J->sw || m >= J->sp - J->sw; }
             for (int64_t i = 0; i < sn[d]; i++) map[d][i] -= a;
         }
         const int64_t pn[3] = {sn[0], sn[1], sn[2]};
@@ -61,7 +64,7 @@ static void *ig_worker(void *arg) {
             const size_t src = ((size_t)z * sn[1] + y) * sn[2], dst = ((size_t)z * S + y) * S, irow = ((size_t)map[0][z] * in[1] + map[1][y]) * in[2];
             for (int64_t x = 0; x < sn[2]; x++) {
                 const int c = p[src + x]; if (c > 251) continue; nk++;
-                if (!ig_in(J, c) || (g && g[src + x])) continue;
+                if (!ig_in(J, c) || (g && g[src + x]) || (J->sp > 0 && (seam[0][z] || seam[1][y] || seam[2][x]))) continue;
                 const uint8_t v = J->lut[ib[irow + map[2][x]]]; o[dst + x] = v; ng++; if (v >= 127) ni++;
             }
         }
@@ -69,7 +72,7 @@ static void *ig_worker(void *arg) {
         if (ng && z3w_write_shard(J->zw, so[0] / S, so[1] / S, so[2] / S, o, 1)) { fprintf(stderr, "ink-gate: %s\n", z3w_error()); atomic_store(&J->fail, 1); break; }
     }
 done:
-    free(p); free(g); free(o); free(ib); for (int d = 0; d < 3; d++) free(map[d]);
+    free(p); free(g); free(o); free(ib); for (int d = 0; d < 3; d++) { free(map[d]); free(seam[d]); }
     if (zp) { z3_close(zp); }
     if (zi) { z3_close(zi); }
     if (zg) { z3_close(zg); }
@@ -82,13 +85,14 @@ done:
 int cmd_ink_gate(int argc, char **argv) {
     ig_job J = {0};
     if (argc < 3 || !ig_opt2(argc, argv, "--ink", &J.ir, &J.ik) || !ig_opt2(argc, argv, "--phase", &J.pr, &J.pk)) {
-        fprintf(stderr, "usage: ufsm ink-gate OUT --ink ROOT KEY --ink-um U --phase ROOT KEY --phase-um U [--ignore ROOT KEY] [--lo 0] [--hi 125] [--ink-max 255] [--shard 512] [--threads N]\n");
+        fprintf(stderr, "usage: ufsm ink-gate OUT --ink ROOT KEY --ink-um U --phase ROOT KEY --phase-um U [--ignore ROOT KEY] [--lo 0] [--hi 125] [--ink-max 255] [--seam P,O,W] [--shard 512] [--threads N]\n");
         return 2;
     }
     ig_opt2(argc, argv, "--ignore", &J.gr, &J.gk);
     const char *out = argv[2];
     J.ium = atof(ig_opt(argc, argv, "--ink-um", "0")); J.pum = atof(ig_opt(argc, argv, "--phase-um", "0"));
     J.lo = atoi(ig_opt(argc, argv, "--lo", "0")); J.hi = atoi(ig_opt(argc, argv, "--hi", "125")); J.imax = atoi(ig_opt(argc, argv, "--ink-max", "255"));
+    { const char *sm = ig_opt(argc, argv, "--seam", nullptr); if (sm && (sscanf(sm, "%d,%d,%d", &J.sp, &J.so, &J.sw) != 3 || J.sp <= 0 || J.sw < 0 || 2 * J.sw >= J.sp)) { fprintf(stderr, "ink-gate: --seam PERIOD,OFFSET,WIDTH\n"); return 2; } }
     J.S = atoi(ig_opt(argc, argv, "--shard", "512")); int nth = atoi(ig_opt(argc, argv, "--threads", "0")); if (nth <= 0) nth = ufsm_ncpu();
     if (!(J.ium > 0 && J.pum > 0) || J.lo < 0 || J.lo > 251 || J.hi < 0 || J.hi > 251 || J.imax < 1 || J.imax > 255 || J.S <= 0 || J.S % 128) { fprintf(stderr, "ink-gate: bad option value\n"); return 2; }
     for (int v = 0; v < 256; v++) { int q = (int)lround(254.0 * (v > J.imax ? J.imax : v) / J.imax); J.lut[v] = (uint8_t)q; }

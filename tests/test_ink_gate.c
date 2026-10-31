@@ -1,7 +1,8 @@
 /* ufsm ink-gate (src/inkgate.c): pseudo ink restricted to a phase band.
    - phase codes in [lo, hi] and ignore 0: out = round(254 x ink / 255); elsewhere (other codes, unknown phase, ignored) 255;
    - the ink on a 2x finer grid (--ink-um half the phase's) is read at the phase voxel centres;
-   - a wrapping band (lo > hi) keeps codes lo..251 and 0..hi. */
+   - a wrapping band (lo > hi) keeps codes lo..251 and 0..hi;
+   - --seam P,O,W: also unknown within W ink voxels of the window-border planes O + k P. */
 #include "store.h"
 #include "z3w.h"
 #include "zarr3.h"
@@ -73,6 +74,19 @@ int main(void) {
         if ((r[i] != 255) != keep) bad++;
     }
     CHECK(r && bad == 0, "wrapping band: %ld wrong", bad); free(r);
+    /* --seam 16,4,2 (ink voxels): unknown where any axis's ink index i has (i - 4) mod 16 in {0, 1, 14, 15} */
+    char o3[600]; snprintf(o3, sizeof o3, "%s/out3", tmp);
+    char *a3[] = {"ufsm", "ink-gate", o3, "--ink", q, "4.8", "--ink-um", "4.8", "--phase", p, "9.6", "--phase-um", "9.6", "--seam", "16,4,2", nullptr};
+    CHECK(cmd_ink_gate(15, a3) == 0, "ink-gate seam");
+    r = rd(o3, "9.6"); bad = 0; long ns = 0;
+    for (int z = 0; r && z < D; z++) for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
+        const size_t i = ((size_t)z * H + y) * W + x; const int iz = 2 * z + 1, iy = 2 * y + 1, ix = 2 * x + 1;
+        const int sm = ((iz - 4) % 16 + 16) % 16, sy_ = ((iy - 4) % 16 + 16) % 16, sx_ = ((ix - 4) % 16 + 16) % 16;
+        const int seam = sm < 2 || sm >= 14 || sy_ < 2 || sy_ >= 14 || sx_ < 2 || sx_ >= 14;
+        const int keep = P[i] <= 125 && !seam; ns += seam;
+        if ((r[i] != 255) != keep) bad++;
+    }
+    CHECK(r && bad == 0 && ns > 0, "seam mask: %ld wrong (%ld seam voxels)", bad, ns); free(r);
     char cmd[700]; snprintf(cmd, sizeof cmd, "rm -rf %s", tmp); if (system(cmd)) {}
     if (fails) { fprintf(stderr, "test_ink_gate: %d failures\n", fails); return 1; }
     printf("test_ink_gate: ok\n"); return 0;

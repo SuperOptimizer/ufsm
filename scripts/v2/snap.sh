@@ -12,7 +12,7 @@ log() { echo "$(date '+%m-%d %H:%M:%S') $*" | tee -a $V2/logs/snap.log; }
 memok() { [ $(awk '/MemAvailable/ { print int($2 / 1048576) }' /proc/meminfo) -gt ${MINMEM:-40} ]; }
 lane() {
   local S SPLIT NW WR WC SJ SL AX CR K UM LV FL PK T
-  tail -n +2 $V2/scrolls.tsv | while IFS=$'\t' read -r S SPLIT NW WR WC SJ SL AX CR K UM LV FL PK; do
+  tail -n +2 $V2/scrolls.tsv | while IFS=$'\t' read -r S SPLIT NW WR WC SJ SL AX CR K UM LV FL PK _; do
     [ "$SPLIT" = train ] && [ "$CR" != - ] && [ "$AX" != - ] || continue
     [ -n "${ONLY:-}" ] && { case " $ONLY " in *" $S "*) ;; *) continue;; esac; }
     [ -e $O/$S/done ] && continue

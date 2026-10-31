@@ -1,0 +1,12 @@
+# human 3D ink-splat sources (= ift3 sources-inkft-c.json, tight labels, labels copied to V2/ink/human/tight); 0139 / 1667 left out (whole-scroll holdouts)
+# name	scroll	volume	um	level	weight	labels	holdout	axis
+PHerc0009B-human-inksplat	PHerc0009B	20250521125136-8.640um-1.2m-116keV-masked.zarr	8.64	0	2.73	PHerc0009B-human.zarr	-	/vesuvius/ufsm/gt/axis/PHerc0009B-20250521125136.json
+PHerc0009B-human24-inksplat	PHerc0009B	20250820154339-2.401um-0.3m-77keV-masked.zarr	2.401	2	2.73	PHerc0009B-human24.zarr	-	-
+PHerc0500P2-human-inksplat	PHerc0500P2	20250820143440-9.362um-1.2m-113keV-masked.zarr	9.362	0	2.55	PHerc0500P2-human.zarr	-	/vesuvius/ufsm/gt/axis/PHerc0500P2-20250820143440.json
+PHerc0500P2-human24-inksplat	PHerc0500P2	20250526151718-2.215um-0.4m-111keV-masked.zarr	2.215	2	2.55	PHerc0500P2-human24.zarr	-	-
+PHerc0814-human-inksplat	PHerc0814	20250804134230-9.362um-1.2m-113keV-masked.zarr	9.362	0	1.26	PHerc0814-human.zarr	-	/vesuvius/ufsm/gt/axis/PHerc0814-20250804134230.json
+PHerc0814-human24-inksplat	PHerc0814	20260309142202-2.399um-0.2m-78keV-masked.zarr	2.399	2	1.26	PHerc0814-human24.zarr	-	-
+PHercMAN5-human-inksplat	PHercMAN5	20260311104824-2.399um-0.2m-78keV-masked.zarr	2.399	2	1.71	PHercMAN5-human.zarr	-	-
+PHercParis4-human-inksplat	PHercParis4	20260411134726-2.400um-0.2m-78keV-masked.zarr	2.4	2	15	PHercParis4-human.zarr	29696,12288,16384,3072,3072,3072	/vesuvius/ufsm/umbilicus/PHercParis4/umbilicus-full-resolution.json
+PHerc0841-human-inksplat	PHerc0841	20250821151531-9.366um-1.2m-113keV-masked.zarr	9.366	0	3.15	PHerc0841-human.zarr	-	-
+PHerc0841-human24-inksplat	PHerc0841	20260319124803-2.403um-0.2m-77keV-masked.zarr	2.403	2	3.15	PHerc0841-human24.zarr	-	-

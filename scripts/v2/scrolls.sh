@@ -6,6 +6,7 @@
 #   axis.json, fields  first run dir (then extra dir) holding them; fields must have fields.json + a readable pc plane
 # and writes V2/scrolls.tsv (one row per scroll):
 #   scroll split nwraps wraps wrapcheck strip_json strip_log axis ct_root ct_key ct_um ct_level fields fields_packed
+#   ink_src ink_key ink_model ink_mode ink_seam (scripts/v2/inksrc.sh: the pseudo-ink source, its model and window-seam handling)
 # strip_json = the strip's strip.json ("wraps": [first, last] = the trim), strip_log = its logs/strip.log; ct_root = V2/ct when the
 # fetched scan is complete there (fetch state done or a symlinked local scan), else "-" (pending). Rerun after the fetch to fill ct_root.
 # Env: V2 (/vesuvius/ufsm/v2), U (V2/src/build/ufsm). Never touches the source runs.
@@ -13,7 +14,7 @@ set -u
 H=$(cd "$(dirname "$0")" && pwd); REPO=$(cd $H/../.. && pwd)
 CFG=${1:-$H/runs.cfg}; V2=${V2:-/vesuvius/ufsm/v2}; U=${U:-$V2/src/build/ufsm}
 OUT=$V2/scrolls.tsv; TMP=$OUT.tmp; PACKLOG=${PACKLOG:-/vesuvius/ufsm/clean/pack-result.tsv}
-printf 'scroll\tsplit\tnwraps\twraps\twrapcheck\tstrip_json\tstrip_log\taxis\tct_root\tct_key\tct_um\tct_level\tfields\tfields_packed\n' > $TMP
+printf 'scroll\tsplit\tnwraps\twraps\twrapcheck\tstrip_json\tstrip_log\taxis\tct_root\tct_key\tct_um\tct_level\tfields\tfields_packed\tink_src\tink_key\tink_model\tink_mode\tink_seam\n' > $TMP
 newest() { local cut=$1; shift; find "$@" -maxdepth 0 -newermt "$cut" -size +0 -printf '%T@\t%p\n' 2>/dev/null | sort -gr | head -1 | cut -f2; }
 grep -v '^#' $CFG | while IFS='|' read -r S SPLIT CUT RUNS STRIPS EXTRA FCFG; do
   [ -n "$S" ] || continue
@@ -44,7 +45,8 @@ grep -v '^#' $CFG | while IFS='|' read -r S SPLIT CUT RUNS STRIPS EXTRA FCFG; do
   IFS=$'\t' read -r _ R0 K UM LV _ <<< "$row"
   cr=-; vol=$(basename $K); tag=$S-${vol%%-*}
   if [ -L $V2/ct/$K ] || [ -e $V2/fetch/state/$tag.copy.done ]; then cr=$V2/ct; fi
-  printf '%s\t%s\t%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' $S $SPLIT $nw $W/wraps ${wc:--} ${sj:--} ${sl:--} ${ax:--} $cr $K $UM $LV ${fl:--} $pk >> $TMP
+  ink=$(bash $H/inksrc.sh $S)
+  printf '%s\t%s\t%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' $S $SPLIT $nw $W/wraps ${wc:--} ${sj:--} ${sl:--} ${ax:--} $cr $K $UM $LV ${fl:--} $pk "$ink" >> $TMP
 done
 mv $TMP $OUT
 column -t $OUT | cut -c1-200
