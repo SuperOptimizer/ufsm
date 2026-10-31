@@ -731,6 +731,11 @@ int cmd_predict(int argc, char **argv) {
         } else if (ai >= 0) { fprintf(stderr, "predict: --aux needs a checkpoint trained with --aux-input\n"); return 2; }
     }
     if (nwork > 1 && !box) { fprintf(stderr, "--gpus needs --box\n"); return 2; }
+    if (nwork > 1 && ffd) {   /* every worker would write (and fill) the whole field arrays: a corrupt set */
+        fprintf(stderr, "predict: --gpus with --fit-zarr / --fit-fields is not supported (each worker writes the whole field set): run one predict per GPU on z-halves of the box "
+                        "(--grid-origin anchored) and join them with scripts/unroll/fields_cat.sh\n");
+        return 2;
+    }
     if (sheet_task && ngpu>1) { fprintf(stderr,"winding export currently uses one GPU per output store\n"); return 2; }
     pid_t kids[8] = {0}; int is_child = 0;
     if (nwork > 1) {
