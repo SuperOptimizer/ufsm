@@ -230,6 +230,11 @@ static void wsn_row(const wsn_job *J, int wi, int r) {
             const double t = t0 + 0.5 * s, q[3] = {P[0], P[1] + t * u[1], P[2] + t * u[2]};
             prof[s] = wsn_tri(ev, q); if (J->target == T_MIX) pcp[s] = (wsn_tri(J->pc, q) - 128) / 127.0;
         }
+        if (getenv("UFSM_WSN_DEBUG") && c % 997 == 0 && r % 61 == 0) {
+            fprintf(stderr, "dbg w%03d r%d c%d P %.1f %.1f %.1f [%.2f %.2f]:", w->id, r, c, P[0], P[1], P[2], tlo, thi);
+            for (int s = 0; s < n; s++) fprintf(stderr, " %.0f", prof[s]);
+            fputc('\n', stderr);
+        }
         float cand[64][2]; int nc = 0;
         for (int s = 1; s + 1 < n && nc < 64; s++) {
             const double t = t0 + 0.5 * s; if (t < tlo - 1e-9 || t > thi + 1e-9) continue;
