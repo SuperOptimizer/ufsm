@@ -27,7 +27,7 @@ are lowered to what the cgroup still allows (src/sysinfo.h).
 `make test` builds the default `build/ufsm` plus the fixtures the Python CLI tests use, then runs `test-all` on the VERIFY=1
 build. Single tests: `make VERIFY=1 build-verify/test_strip && build-verify/test_strip`. The pipeline stages below have their
 own tests: `test_countfield`, `test_fit_join`, `test_wraps_core`, `test_flatten`, `test_flatten_gpu`,
-`test_faces`, `test_strip`, `test_render_stream` (render / ink-compare / jpeg-fit, byte-identical streamed vs in-memory),
+`test_faces`, `test_faces_gpu`, `test_strip`, `test_render_stream` (render / ink-compare / jpeg-fit, byte-identical streamed vs in-memory),
 `test_sheetcut`, `test_ink_blend.py`. On the laptop run builds and tests through `~/ufsm-data/capped.sh`.
 
 ## Unroll a scroll
@@ -88,6 +88,16 @@ $U strip-mosaic s/strip/flat s/render s/img --ct-level 80 --threads 12
 ```
 
 Drivers (resumable per stage; `STOP` files; MemAvailable gates):
+- `scripts/unroll/unroll.sh SCROLL`: steps 1-9 on one host as one resumable run. Stages: fields (one predict per GPU on z parts
+  of the box, joined by `fields_cat.sh`: shard files moved, byte-identical to one predict), ink on GPU `INKGPU` (1) beside the ref,
+  ref, slabs (one lane per GPU; the ink GPU joins once the ink is done), join, wraps, strip, strip-flatten, stripe renders + mosaic,
+  optional per-wrap renders (`PERWRAP=1`) and faces (`FACES=1`), and the upload (`UPLOAD=1` only, never for prize-eligible
+  scrolls). Settings per scroll (box, wraps `--zr`, strip flags) come from `scripts/unroll/scrolls.tsv`, else `scripts/corpus/list.tsv`.
+  `state/<stage>.done` holds the wall time, CPU seconds and max RSS. `DRY=1` prints the plan; `touch $O/STOP` stops between stages.
+  The render, faces and ink-compare stages use the shared decoded-CT cache (`UFSM_ZCACHE_GB`, admit 0.6). Its size is `ZCACHE_GB`:
+  by default 1/4 of the available RAM, at most 30 GB (the desk 30; a 62 GB pod ~15), and off on the laptop. The run removes
+  `/dev/shm/ufsm-zcache-<uid>` when it ends, also on STOP. strip-mosaic gets `UFSM_JPEG_THREADS` = cores / 8.
+  Env: `U CK INKCK FIELDGPUS FITGPUS INKGPU BOX TH PTH ITH MINMEM CTROOT CTKEY TAG INKCMD REFCMD ZCACHE_GB ZCACHE_ADMIT`.
 - `scripts/corpus/`: the three-host pipelined corpus unroll (`common.sh` describes the split): `desk.sh` prep (mask box from
   scanprep, `ufsm axis` when there is no umbilicus), wind96 fields, repack, push; `laptop.sh` / `inklib.sh` ift3 ink over HTTP
   from the mirror (steps 2); `fd.sh` ref, snapped slab fits, join, wraps (steps 3-6); `desk.sh` then surf-stats, flatten and
@@ -265,12 +275,20 @@ Runtime notes:
   handles are pooled (32). `UFSM_Z3_COALESCE=0`, `UFSM_Z3_INDEX_PARALLEL=0`, `UFSM_HTTP_REUSE=0` disable them for comparisons.
   HTTP permission failures are errors; genuinely missing shards read as the fill value.
 - The input transform is rejected by split inference, surface winding, conditioned sweeps and cutoff-conditioned papyrus models.
+- `--feather B` (B <= halo; window - 2 halo = k shards on the shard grid): seam-free single pass. The lower B voxels of every
+  window are a sin^2 blend of its own and the earlier neighbours' halo predictions (normalized over the windows present), only
+  the earlier windows' upper slabs are held (a window layer + a row on the host), the blend runs on its own thread. `--resume`
+  recomputes done windows a remaining neighbour needs; `--gpus a,b` deals contiguous window layers. Byte-identical away from the
+  blend bands and across resume / worker splits (test_predict_feather). Paris 4 ift3 ink: border step (`ink-seam --block 16`)
+  20.2 (halo 0) / 6.3 (halo 64) -> 0.0 at window 576 halo 32 `--feather 32`, as the old 2-pass + ink-blend, in one pass.
+- `z3_read` decodes only the volcomp substreams (16 z x 32 y slabs of a 128^3 chunk) under the request box: same bytes, -33%
+  read time on 576^3 windows with 32-voxel halos (`UFSM_Z3_AUTOSUB=0` off; test_z3_autosub).
 
 ### Ink
 
 ```sh
 ufsm ink-blend <out> --um U --tile SZ,SY,SX --grids z,y,x:z,y,x:... <in1> <in2> ... [--origins z,y,x:...] [--levels 4] [--shard 512] [--q 32]
-ufsm ink-seam <zarr> --um U [--period 512] [--offset 0] [--n 24]     # window-seam jump (border vs interior |dv|)
+ufsm ink-seam <zarr> --um U [--period 512] [--offset 0] [--n 24] [--block 16]   # window-seam jump (border vs interior |dv|; --block 16: vs the codec-block faces)
 ufsm ink-ext --model v8in|hecate24|hecate96|reader3|ink9um --weights W --surface TIFXYZ --ct ROOT KEY --out DIR   # external 2.5D ink nets
 ufsm ink3d-ext --weights W --ct ROOT KEY --box ... --out GROUP       # the published 3D ink net (gambiarra) on a 2.4 um CT box
 ufsm ink-splat <out-group> --surface TIFXYZ --labels L --ct ROOT KEY --ct-um U --iso I [--band -4,4]   # 2D ink labels -> 3D label zarr
@@ -314,10 +332,13 @@ ufsm cf-compare <model-a> <model-b> [fields] [--step 4]   # two count-field refs
   reproduces the 88-row chunks of the 10-26 Paris 4 ref.
 - `fit --ref-model REF --ref-snap 1`: every voxel's integer = round(U_ref - bias - u); no flood, use with `--uw-repair 0`.
   A full-cross-section slab needs ~11 GB of GPU memory (one fit per 16 GB GPU). An air slab at the box ends fails with "no data
-  for the prior"; leave it out of the join.
+  for the prior"; leave it out of the join. `UFSM_FIT_GPU_LOCK=FILE` (default in `scripts/cfit/slabs.sh`: /tmp/ufsm-fit-gpuN.lock)
+  holds a lock from the device allocation to exit, so two lanes per GPU overlap one fit's field decoding with the other's device
+  stages. Zarr fields decode only the 16-row volcomp substreams the slab touches (`UFSM_FIT_FULLDECODE=1`: whole chunks).
 - `fit-join --ref`: per-slab integer gauges by DP over the ref and the overlaps; prints the ref share per slab and the integer
   agreement on the overlaps. `--global 1`: joint robust solve over the whole overlap graph (ties the DP on Paris 4 and Paris 3).
-  Slab interiors are box-local native z (`2 x` field cells at `--fit-h 2`).
+  Slab interiors are box-local native z (`2 x` field cells at `--fit-h 2`). All sample requests run in one z sweep through a
+  two-chunk-row cache (each chunk row decoded once; ~9 GB RSS on a full cross-section).
 - `wrap-check`: along radial rays, CT papyrus peaks between consecutive wraps (defaults `--sigma 1.2 --prom 1`, calibrated on
   Paris 4 GT): per-wrap dup / merged / real verdicts, radius and z tables. ~1.0 peak per turn is right; `--w-scale 2` is the
   doubled-count control.
@@ -344,12 +365,12 @@ do not fix winding integers across disconnected regions; whole-scroll accuracy i
 ### Surfaces
 
 ```sh
-ufsm wraps <model> <out> [--step 8] [--out-um U] [--sfc ERR] [--fields DIR] [--first K] [--last K] [--zr Z0,Z1] [--col-r centre|p90|R]
+ufsm wraps <model> <out> [--step 8] [--out-um U] [--sfc ERR] [--fields DIR] [--first K] [--last K] [--zr Z0,Z1] [--col-r centre|p90|R] [--min-cm2 0.5]
 ufsm tifxyz-scale <src> <dst> <div> [--wraps a,b] [--offset z,y,x] [--flip-rows 1]   # coordinates / div; div 1 = .sfc -> tifxyz copy
 ufsm tifxyz-sfc <src> <dst> [--error 0.25] [--every K] [--wraps a,b]                 # tifxyz -> .sfc
 ufsm flatten <wraps> <out> [--wraps a,b] [--decim 1] [--crop rect|none] [--max-aspect A] [--rects N] [--min-cm2 5] [--fill-holes 5000] [--gpu 1] [--sfc ERR]
 ufsm flatten-warp <in.jpg|tif> <flat-wrap-dir> <out.jpg|tif> --src-px P [--scale S]
-ufsm faces <wraps> <out> --ct ROOT KEY --ct-um U [--wraps a,b] [--umb JSON --umb-um U] [--thick 15,200] [--gt ROOT KEY --gt-um U]
+ufsm faces <wraps> <out> --ct ROOT KEY --ct-um U [--wraps a,b] [--umb JSON --umb-um U] [--thick 15,200] [--gt ROOT KEY --gt-um U] [--gpu 1]
 ufsm sheet-cut <wraps> <out> [--tol 0.3] [--min-cm2 0.25] [--max 8]                  # square flat sheets from the raw grids
 ufsm wrapswitch <wraps> <codes-root> <codes-key> [--per-wrap]                          # sheet switches per cm vs GT codes
 ```
@@ -358,9 +379,14 @@ ufsm wrapswitch <wraps> <codes-root> <codes-key> [--per-wrap]                   
 voxels), row = z. `--out-um 9.6` writes coordinates on that grid (a 9.6 um fit's wraps on the 2.4 um grid with 2.4), `--sfc
 0.25` one `wNNN.sfc` per wrap instead of tifxyz dirs. The column spacing is the arc of the wrap's root on the ray through the
 box centre at mid z; a core wrap leaves the axis near that z, so its root is tiny and its columns land far apart (Paris 4 w085:
-29 columns). `--col-r p90` uses the 90th percentile of the wrap's roots over the rows' z range instead (w085: 267 columns).
-`--zr Z0,Z1` keeps rows at global native z in [Z0, Z1] and samples the wrap ids there (drop a broken end cap). `--first` /
-`--last` are exact. Wraps with <= 16 vertices are not written.
+29 columns). `--col-r p90` (default) uses the 90th percentile of the wrap's roots over the rows' z range instead (w085: 267
+columns); `--col-r centre` is the old spacing. `--zr Z0,Z1` keeps rows at global native z in [Z0, Z1] and samples the wrap ids there
+(drop a broken end cap). `--first` / `--last` are exact. Wraps with <= 16 vertices, or under `--min-cm2` (default 0.5; vertices x
+(step x um)^2), are not written: on Paris 4 these are the 62 end-cap fragments w016-w077 of 0.07-0.09 cm2. With `--fields`, only
+wrap ids within about one turn of a data cell are computed, largest first. Each empty id cost 30-60 CPU-s of failed root searches:
+Paris 4 sampled 16..580, wrote 257, and the empty ids above the data took 10.7 of 20.7 min. `UFSM_WRAPS_NOPRUNE=1` computes every id.
+The `.sfc` files (here and in `ufsm strip`) are encoded on all threads, byte-identical to the serial writer (P4 strip.sfc 876 -> 170 s
+at 4 threads).
 
 **flatten.** SLIM (symmetric Dirichlet, multilevel, flip-free line search; `src/flatten.h`) on the wrap's own vertex grid,
 then an isometric uv resample, Laplace fill of enclosed tears up to `--fill-holes` vertices (orange in `<w>_mask.jpg`; they
@@ -379,7 +405,10 @@ extrema; half-level edges; a high valley between touching sheets is an edge), ma
 line per wrap on stdout. Recto is the inner face by the published-label side rule (papyrus outward of wrap k is recto side).
 Run it on the flat grid so both faces share one uv and render pixel-aligned; render faces with `--depth 0` (the sheet is
 ~4 voxels at 9.6 um). The CT cache decodes only the volcomp substreams under the samples (`UFSM_FACES_FULLDECODE=1`: whole
-chunks; same output).
+chunks; same output). `--gpu 1` (default) samples the profiles, cuts the bands and runs the median windows on the GPU from a
+device mirror of the decoded chunks (decode list = the exact substreams the samples read; `src/nn_faces.cu`, no fast math,
+no FMA): byte-identical outputs, CPU fallback without a device or when the device pool fills. Paris 4 w178: sampling 35 -> 3 s,
+medians 15 -> 2.5 s; the CPU volcomp decode is then ~75% of the wall. `UFSM_FACES_PROF=1` prints per-stage times.
 
 ### Whole-scroll strip
 

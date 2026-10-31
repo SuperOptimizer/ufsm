@@ -111,6 +111,16 @@ static double col_pitch(const st_wrap *a, int c0, int c1, float *buf) {
     return median_f32(v, n);
 }
 
+typedef struct { const st_wrap *W; const int *mw, *mc; int w, h; } st_fill_ctx;
+static void st_fill(void *ctx, int bx, int by, float (*joint)[3], uint8_t *valid) {   /* one strip.sfc patch (tfx_sfc_write) */
+    const st_fill_ctx *F = ctx;
+    for (int q = 0; q < 4096; q++) {
+        const int c = bx * 64 + q % 64, r = by * 64 + q / 64; if (c >= F->w || r >= F->h) continue;
+        const st_wrap *s = &F->W[F->mw[c]]; const size_t i = (size_t)r * s->w + F->mc[c];
+        if (!vok(s, i) || !(s->Z[i] > 0)) continue;
+        joint[q][0] = s->X[i]; joint[q][1] = s->Y[i]; joint[q][2] = s->Z[i]; valid[q] = 1;
+    }
+}
 int cmd_strip(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: ufsm strip <wraps-dir> <out-dir> [--first K] [--last K] [--every E] [--err 0.25] [--threads 8]\n"); return 2; }
     const char *wd = argv[2], *od = argv[3];
@@ -190,25 +200,9 @@ int cmd_strip(int argc, char **argv) {
              "\"voxel_size_um\": %.6g, \"winding\": -1, \"wraps\": [%d, %d], \"walk\": \"%s\", \"valid_vertices\": %zu, \"source\": \"ufsm strip (consecutive wraps joined at the theta cut)\"}\n",
              1 / step, 1 / step, lo[0], lo[1], lo[2], hi[0], hi[1], hi[2], um, W[ord[0]].id, W[ord[n - 1]].id, desc ? "descending" : "ascending", nvalid);
     snprintf(p, sizeof p, "%s/strip.json", od); { FILE *f = fopen(p, "w"); if (f) { fputs(meta, f); fclose(f); } }
-    sfc_channel dc[3]; memset(dc, 0, sizeof dc); static const char *cn[3] = {"x", "y", "z"};
-    for (int a = 0; a < 3; a++) { snprintf(dc[a].name, sizeof dc[a].name, "%s", cn[a]); dc[a].width = (uint64_t)w; dc[a].height = (uint64_t)h; dc[a].dtype = SFC_F32;
-                                  dc[a].flags = SFC_COORDINATE | SFC_XYZ; dc[a].components = 3; dc[a].component = (uint32_t)a; dc[a].tolerance = err; }
-    char sp[1500], tmp[1600]; snprintf(sp, sizeof sp, "%s/strip.sfc", od); snprintf(tmp, sizeof tmp, "%s.tmp%d", sp, (int)getpid()); unlink(tmp);
-    sfc_writer *wr = nullptr; if (sfc_create(tmp, dc, 3, meta, strlen(meta), &wr)) { fprintf(stderr, "strip: cannot create %s\n", tmp); return 1; }
-    float (*joint)[3] = malloc(4096 * 12); uint8_t *valid = malloc(4096); int rc = 0; const double tw = snow();
-    for (int by = 0; by < (h + 63) / 64 && !rc; by++) for (int bx = 0; bx < (w + 63) / 64 && !rc; bx++) {
-        memset(joint, 0, 4096 * 12); memset(valid, 0, 4096);
-        for (int q = 0; q < 4096; q++) {
-            const int c = bx * 64 + q % 64, r = by * 64 + q / 64; if (c >= w || r >= h) continue;
-            const st_wrap *s = &W[mw[c]]; const size_t i = (size_t)r * s->w + mc[c];
-            if (!vok(s, i) || !(s->Z[i] > 0)) continue;
-            joint[q][0] = s->X[i]; joint[q][1] = s->Y[i]; joint[q][2] = s->Z[i]; valid[q] = 1;
-        }
-        rc = sfc_write_xyz_block(wr, joint, 12, 768, valid);
-    }
-    free(joint); free(valid);
-    if (rc) { sfc_cancel(wr); fprintf(stderr, "strip: sfc write failed\n"); return 1; }
-    if (sfc_finish(wr) || rename(tmp, sp)) { unlink(tmp); fprintf(stderr, "strip: sfc finish failed\n"); return 1; }
+    char sp[1500]; snprintf(sp, sizeof sp, "%s/strip.sfc", od);
+    const double tw = snow(); st_fill_ctx FC = {W, mw, mc, w, h};
+    if (tfx_sfc_write(sp, w, h, err, meta, st_fill, &FC, nth)) { fprintf(stderr, "strip: sfc write %s failed\n", sp); return 1; }
     struct stat st; stat(sp, &st);
     double pmed = 0; { float *pv = malloc((size_t)n * 4); int np = 0; for (int k = 0; k < n; k++) { const double pk = col_pitch(&W[k], W[k].w / 2, W[k].w / 2 + 16, buf); if (pk > 0) pv[np++] = (float)pk; } pmed = np ? median_f32(pv, np) : step; free(pv); }
     printf("strip: %d wraps -> %s: %d x %d (columns x rows), %zu valid vertices, column pitch median %.2f voxels (step %g), length ~%.1f cm, %.1f MB, write %.1fs, total %.1fs\n",

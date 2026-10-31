@@ -1071,6 +1071,9 @@ static int cmd_fit_sweep(int argc, char **argv, const char *file) {
     fprintf(stderr, "fit sweep: %d runs (%d failed) in %.1fs\n", nl, bad, now() - t0);
     return bad ? 1 : 0;
 }
+/* fit --ref-model: the ref (a whole-scroll model: ~0.9 GB of lattice) loads on a thread while the fields load */
+static struct { pthread_t th; int on; const char *dir; fit_set *s; } g_fit_ref;
+static void *fit_ref_thread(void *a) { (void)a; g_fit_ref.s = fit_set_load(g_fit_ref.dir); return nullptr; }
 static int cmd_fit(int argc, char **argv) {
     if (!g_fit_sweep && *opt(argc, argv, "--sweep", "")) return cmd_fit_sweep(argc, argv, opt(argc, argv, "--sweep", ""));
     const char *dir = argv[2];
@@ -1130,6 +1133,7 @@ static int cmd_fit(int argc, char **argv) {
     /* the GPU context (~2 s) comes up on a thread while the fields load; the main thread selects the device again after the join */
     g_fit_gdev = atoi(opt(argc, argv, "--gpu", "0"));
     if (!c.cpu) { g_fit_gthr = pthread_create(&g_fit_gth, nullptr, fit_gpu_init_thread, nullptr) == 0; if (!g_fit_gthr) nn_init(g_fit_gdev); }
+    if (*opt(argc, argv, "--ref-model", "")) { if (g_fit_ref.on) { pthread_join(g_fit_ref.th, nullptr); g_fit_ref.on = 0; } g_fit_ref.dir = opt(argc, argv, "--ref-model", ""); g_fit_ref.s = nullptr; g_fit_ref.on = pthread_create(&g_fit_ref.th, nullptr, fit_ref_thread, nullptr) == 0; }
     const double t0 = now();
     const char *min = opt(argc, argv, "--model", nullptr);   /* score / export a saved model or set instead of fitting */
     const int slab = atoi(opt(argc, argv, "--slab", "0")), overlap = atoi(opt(argc, argv, "--overlap", "256"));
@@ -1237,7 +1241,8 @@ static int cmd_fit(int argc, char **argv) {
     }
     fit_set *refm = nullptr;   /* --ref-model: a global coarse model / set (coarse-to-fine: the integers tied to it) */
     if (*opt(argc, argv, "--ref-model", "")) {
-        if (!(refm = fit_set_load(opt(argc, argv, "--ref-model", "")))) { fprintf(stderr, "fit: cannot load --ref-model %s\n", opt(argc, argv, "--ref-model", "")); return 1; }
+        if (g_fit_ref.on) { pthread_join(g_fit_ref.th, nullptr); g_fit_ref.on = 0; refm = g_fit_ref.s; } else refm = fit_set_load(opt(argc, argv, "--ref-model", ""));
+        if (!refm) { fprintf(stderr, "fit: cannot load --ref-model %s\n", opt(argc, argv, "--ref-model", "")); return 1; }
         if (seedm || slab > 0) { fprintf(stderr, "fit: --ref-model goes without --seed-model / --slab\n"); return 2; }
         c.ref = refm; for (int d = 0; d < 3; d++) c.ref_off[d] = (double)(fb.origin[d] - refm->global->origin[d]);
         c.ref_snap = atoi(opt(argc, argv, "--ref-snap", "0")); c.uw_rep_ref = (float)atof(opt(argc, argv, "--uw-rep-ref", "0"));
@@ -1697,6 +1702,7 @@ typedef struct {
     const char *out; z3 *snapz; const int64_t *snapo; double snap_range, snap_min; const uint8_t *sfa; int sfn[3]; long long sfo[3]; double sfh; int verbose_snap; double Y, X;
     const wr_polar *P; _Atomic int next; _Atomic int nwr; _Atomic size_t nvalid; _Atomic int fail;
     double zlo, zhi, colr;   /* --zr: box-local native z of the first / last row; --col-r: < 0 centre, 0 p90, > 0 that radius */
+    const int *ks; int nk; double min_cm2; _Atomic int nsmall;   /* the wrap ids to compute (largest first); --min-cm2; wraps dropped by it */
 } wraps_all;
 static int wr_cmp_d(const void *a, const void *b) { const double x = *(const double *)a, y = *(const double *)b; return (x > y) - (x < y); }
 static int wrap_one(wraps_all *A, int k, int nthreads) {   /* wrap k: its rows on nthreads threads, snapped, written */
@@ -1729,7 +1735,9 @@ static int wrap_one(wraps_all *A, int k, int nthreads) {   /* wrap k: its rows o
     const size_t valid = atomic_load(&J.valid);
     if ((A->snapz || A->sfa) && valid) { const size_t mv = wraps_snap(A->snapz, A->snapo, m, rows, cols, px, py, pz, A->snap_range, A->snap_min, nthreads, A->sfa, A->sfn, A->sfo, A->sfh); if (A->verbose_snap) fprintf(stderr, "wraps: w%03d: %zu of %zu vertices snapped\n", k, mv, valid); }
     int rc = 0;
-    if (valid > 16) {
+    const double vcm2 = A->step * A->um * 1e-4 * A->step * A->um * 1e-4;   /* (cm2 per vertex at the column spacing --step) */
+    if (valid > 16 && valid * vcm2 < A->min_cm2) atomic_fetch_add(&A->nsmall, 1);
+    else if (valid > 16) {
         char wd[1400]; snprintf(wd, sizeof wd, "%s/w%03d", A->out, k);
         double wstep = step, wum = A->um;
         if (A->out_um > 0 && fabs(A->out_um - A->um) > 1e-9) {   /* --out-um: coordinates on another grid of the same scan (voxel centres to voxel centres) */
@@ -1745,8 +1753,34 @@ static int wrap_one(wraps_all *A, int k, int nthreads) {   /* wrap k: its rows o
 }
 static void *wraps_worker(void *arg) {
     wraps_all *A = arg;
-    for (int k; (k = A->k0 + atomic_fetch_add(&A->next, 1)) <= A->k1;) if (wrap_one(A, k, 1)) atomic_store(&A->fail, 1);
+    for (int i; (i = atomic_fetch_add(&A->next, 1)) < A->nk;) if (wrap_one(A, A->ks[i], 1)) atomic_store(&A->fail, 1);
     return nullptr;
+}
+/* the wrap ids near data: W at the centre of every data-weight cell (wf != 0) in the rows' z range; id k is kept when some cell has
+   |W - k| <= margin (1 turn + the cell's half diagonal at a 4-voxel pitch, so a vertex in a data cell, which needs |W - k| = 0 inside it, is
+   never missed); counts per id (cells within the margin) order the wraps largest first. Empty ids cost ~30-60 CPU-s each (a root search
+   on every ray): Paris 4 sampled 16..580 and wrote 257, the 308 ids above the outermost data took 10.7 of the 20.7 min. */
+typedef struct { const fit_set *fs; const uint8_t *wf; int wsh[3]; double wh, zlo, zhi, margin; int k0, nk; _Atomic long long *cnt; _Atomic int next; } wr_prune_job;
+static void *wr_prune_rows(void *arg) {
+    wr_prune_job *J = arg; const int H = J->wsh[1], W = J->wsh[2]; long long *loc = calloc((size_t)J->nk, sizeof *loc);
+    for (int fz; (fz = atomic_fetch_add(&J->next, 1)) < J->wsh[0];) {
+        const double z = (fz + 0.5) * J->wh; if (z < J->zlo - J->wh || z > J->zhi + J->wh) continue;
+        const double zc = fmin(fmax(z, J->zlo), J->zhi); const uint8_t *pl = J->wf + (size_t)fz * H * W;
+        for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
+            if (!pl[(size_t)y * W + x]) continue;
+            const double w = fit_set_W(J->fs, zc, (y + 0.5) * J->wh, (x + 0.5) * J->wh); if (!isfinite(w)) continue;
+            int a = (int)ceil(w - J->margin) - J->k0, b = (int)floor(w + J->margin) - J->k0; if (a < 0) a = 0; if (b > J->nk - 1) b = J->nk - 1;
+            for (int k = a; k <= b; k++) loc[k]++;
+        }
+    }
+    for (int k = 0; k < J->nk; k++) if (loc[k]) atomic_fetch_add(&J->cnt[k], loc[k]);
+    free(loc);
+    return nullptr;
+}
+static const long long *g_wr_cnt; static int g_wr_k0;
+static int wr_cmp_cnt(const void *a, const void *b) {   /* larger count first, then the lower id */
+    const int x = *(const int *)a, y = *(const int *)b; const long long cx = g_wr_cnt[x - g_wr_k0], cy = g_wr_cnt[y - g_wr_k0];
+    return cx != cy ? (cx < cy) - (cx > cy) : (x > y) - (x < y);
 }
 static int cmd_wraps(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: ufsm wraps <model-dir> <out-dir> [--step 8] [--first K] [--last K] [--fields DIR] [--um 2.4] [--threads 16] [--sfc ERR] [--zr Z0,Z1] [--col-r centre|p90|R]\n"
@@ -1754,7 +1788,9 @@ static int cmd_wraps(int argc, char **argv) {
                                     "  --zr Z0,Z1: only the rows at global native z in [Z0, Z1] (the model's grid; also the z range the wrap ids are sampled in)\n"
                                     "  --first / --last K: the wrap ids exactly (default: those the box samples meet); wraps with <= 16 vertices are not written\n"
                                     "  --col-r: the radius (native voxels) whose arc the column spacing --step is: centre = the wrap's root on the box centre's ray (default),\n"
-                                    "     p90 = the 90th percentile of its roots over the rows' z range (wraps that leave the axis, the core), or a number\n"); return 2; }
+                                    "     p90 = the 90th percentile of its roots over the rows' z range (default; wraps that leave the axis, the core), or a number\n"
+                                    "  --min-cm2 C: wraps under C cm2 (vertices x (step x um)^2) are not written (default 0.5: end-cap / air fragments; 0 keeps all)\n"
+                                    "  with --fields: only wrap ids within ~1 turn of a data cell are computed, largest first (UFSM_WRAPS_NOPRUNE=1: every id)\n"); return 2; }
     if (atof(opt(argc, argv, "--sfc", "0")) > 0) tifxyz_set_sfc(atof(opt(argc, argv, "--sfc", "0")));
     fit_set *fs = fit_set_load(argv[2]); if (!fs) { fprintf(stderr, "wraps: cannot load %s\n", argv[2]); return 1; }
     const fit_model *m = fs->global;   /* the box, the axis; rows dispatch to the slab model of their z */
@@ -1812,7 +1848,7 @@ static int cmd_wraps(int argc, char **argv) {
     int k0 = (int)ceil(wmin), k1 = (int)floor(wmax);   /* (the samples can miss W near the axis: --first / --last are taken as given) */
     if (*opt(argc, argv, "--first", "")) k0 = atoi(opt(argc, argv, "--first", ""));
     if (*opt(argc, argv, "--last", "")) k1 = atoi(opt(argc, argv, "--last", ""));
-    const char *cr = opt(argc, argv, "--col-r", "centre"); const double colr = !strcmp(cr, "centre") ? -1 : !strcmp(cr, "p90") ? 0 : atof(cr);
+    const char *cr = opt(argc, argv, "--col-r", "p90"); const double colr = !strcmp(cr, "centre") ? -1 : !strcmp(cr, "p90") ? 0 : atof(cr);
     if (strcmp(cr, "centre") && strcmp(cr, "p90") && !(colr > 0)) { fprintf(stderr, "wraps: --col-r centre|p90|R (R > 0 native voxels)\n"); return 2; }
     const int na = (int)Z + 1;
     double th0 = 1e300, th1 = -1e300; int full = 0;   /* the box's angular range around the axis */
@@ -1844,16 +1880,31 @@ static int cmd_wraps(int argc, char **argv) {
         for (int t = 0; t < nt; t++) pthread_join(th[t], nullptr);
         A.P = &P;
     }
+    const int nall = k1 >= k0 ? k1 - k0 + 1 : 0; int *ks = malloc(sizeof(int) * (nall > 0 ? nall : 1)), nk = 0;
+    _Atomic long long *cnt = calloc(nall > 0 ? nall : 1, sizeof *cnt);
+    if (wf && nall > 0 && !ufsm_env_on("UFSM_WRAPS_NOPRUNE")) {
+        wr_prune_job PJ = {fs, wf, {wsh[0], wsh[1], wsh[2]}, wh, zlo, zhi, 1 + 0.5 * sqrt(3.0) * wh / 4, k0, nall, cnt, 0};
+        pthread_t th[64]; const int nt = nthreads < 64 ? (nthreads > 0 ? nthreads : 1) : 64;
+        for (int t = 0; t < nt; t++) pthread_create(&th[t], nullptr, wr_prune_rows, &PJ);
+        for (int t = 0; t < nt; t++) pthread_join(th[t], nullptr);
+        for (int k = k0; k <= k1; k++) if (cnt[k - k0]) ks[nk++] = k;
+        g_wr_cnt = (const long long *)cnt; g_wr_k0 = k0; qsort(ks, nk, sizeof(int), wr_cmp_cnt);
+        fprintf(stderr, "wraps: %d of %d wrap ids (%d..%d) meet the data, largest first\n", nk, nall, k0, k1);
+    } else for (int k = k0; k <= k1; k++) ks[nk++] = k;
+    A.ks = ks; A.nk = nk; A.min_cm2 = atof(opt(argc, argv, "--min-cm2", "0.5"));
+    tfx_set_threads(nthreads);   /* (the .sfc encoders: shared out among the wraps being written at that moment) */
     const int par = !(snapz || sfa) && nthreads > 1;
     if (par) {
         pthread_t th[64]; const int nt = nthreads < 64 ? nthreads : 64;
         for (int t = 0; t < nt; t++) pthread_create(&th[t], nullptr, wraps_worker, &A);
         for (int t = 0; t < nt; t++) pthread_join(th[t], nullptr);
-    } else for (int k = k0; k <= k1; k++) if (wrap_one(&A, k, nthreads)) A.fail = 1;
-    free(P.rmin); free(P.rmax);
+    } else for (int i = 0; i < nk; i++) if (wrap_one(&A, ks[i], nthreads)) A.fail = 1;
+    free(P.rmin); free(P.rmax); free(ks); free(cnt);
     if (A.fail) return 1;
     const int nwr = A.nwr; const size_t nvalid_all = A.nvalid;
-    fprintf(stderr, "wraps: %d wraps (%d..%d) with %zu vertices written to %s\n", nwr, k0, k1, nvalid_all, argv[3]);
+    fprintf(stderr, "wraps: %d wraps (%d..%d) with %zu vertices written to %s", nwr, k0, k1, nvalid_all, argv[3]);
+    if (A.nsmall) fprintf(stderr, " (%d under --min-cm2 %g not written)", (int)A.nsmall, A.min_cm2);
+    fputc('\n', stderr);
     fit_set_free(fs); free(wf); free(sfa); if (snapz) z3_close(snapz);
     return 0;
 }

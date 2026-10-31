@@ -224,6 +224,9 @@ test-all: $(B)/test_wraps_core
 $(B)/test_predict_unwrap2: tests/test_predict_unwrap2.c $(B)/unet.o $(B)/fit.o $(B)/fit_emb.o $(B)/embz.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/coreline.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/z3w.o $(B)/nn.o $(B)/nn_fp8.o | $(B)/ufsm
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 test-all: $(B)/test_predict_unwrap2
+$(B)/test_predict_feather: tests/test_predict_feather.c $(B)/unet.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/z3w.o $(B)/nn.o $(B)/nn_fp8.o | $(B)/ufsm
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
+test-all: $(B)/test_predict_feather
 $(B)/test_tta: tests/test_tta.c $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 test-all: $(B)/test_tta
@@ -270,6 +273,11 @@ test-all: $(B)/test_strip
 $(B)/test_faces: tests/test_faces.c $(B)/faces.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
 test-all: $(B)/test_faces
+# faces on the GPU: bit-identical to the CPU path, so no fast math and no fused multiply-adds in this object
+$(B)/nn_faces.o: NVFLAGS := -O3 $(NVARCH) -DUFSM_ARCH=$(ARCH) -fmad=false -Xcompiler -fno-threadsafe-statics -Isrc
+$(B)/test_faces_gpu: tests/test_faces.c $(B)/faces.o $(B)/nn_faces.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DFACES_GPU $^ -o $@ $(LDLIBS) $(CUDALIBS)
+test-all: $(B)/test_faces_gpu
 $(B)/test_fit_emb: tests/test_fit_emb.c $(B)/fit_emb.o $(B)/embz.o $(B)/z3w.o $(B)/fit.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/coreline.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 test-all: $(B)/test_fit_emb
@@ -448,6 +456,9 @@ $(B)/test_formats: tests/test_formats.c $(OBJ) $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 $(B)/test_typed_zarr: tests/test_typed_zarr.c $(B)/z3w.o $(B)/zarr3.o $(B)/store.o $(B)/json.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
+$(B)/test_z3_autosub: tests/test_z3_autosub.c $(B)/z3w.o $(B)/zarr3.o $(B)/store.o $(B)/json.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
+test-all: $(B)/test_z3_autosub
 
 $(B)/test_ct_augment: tests/test_ct_augment.c $(B)/ct_augment.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ -lm
@@ -579,6 +590,7 @@ test-all: $(B)/test_gpu_aug $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover 
 	./$(B)/test_spiralfit
 	./$(B)/test_tta
 	./$(B)/test_predict_unwrap2 ./$(B)/ufsm
+	./$(B)/test_predict_feather ./$(B)/ufsm
 	./$(B)/test_coreline
 	./$(B)/test_fit_w4
 	./$(B)/test_repair
@@ -587,6 +599,7 @@ test-all: $(B)/test_gpu_aug $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover 
 	./$(B)/test_flatten_gpu
 	./$(B)/test_strip
 	./$(B)/test_faces
+	./$(B)/test_faces_gpu
 	./$(B)/test_fit_emb
 	./$(B)/test_distill
 	./$(B)/test_tiffw
@@ -618,6 +631,7 @@ test-all: $(B)/test_gpu_aug $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover 
 	./$(B)/test_volcomp
 	./$(B)/test_volcomp_fast
 	./$(B)/test_typed_zarr
+	./$(B)/test_z3_autosub
 	python3 tests/test_http_reader.py
 	./$(B)/test_checkpoint_runtime
 	./$(B)/test_infer_buffers
