@@ -40,6 +40,9 @@ int z3_read(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nth
    decode byte for byte (volcomp_decode_block's guarantee). submask 0 or all ones, or a chunk that is not a lossy / coded volcomp chunk
    (mask, surface, raw, const, typed, other codecs): the whole chunk. */
 int z3_read_sub(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads, uint32_t submask);
+/* z3_read_sub of one whole aligned 128^3 chunk with UFSM_GPU_DECODE on: the GPU decodes lossy substreams straight into the device chunk
+   dchunk (128^3, chunk layout, on the decoder's device; out keeps zeros there); *dev_mask = those substreams (0: everything went to out) */
+int z3_read_sub_dev(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads, uint32_t submask, uint8_t *dchunk, uint32_t *dev_mask);
 
 /* Shard-level presence: 1 if the shard object exists in the store, 0 if not, -1 on error. */
 int z3_shard_present(z3 *z, int64_t sz, int64_t sy, int64_t sx);
@@ -57,3 +60,4 @@ void z3_io_stats(uint64_t *cache_hits, uint64_t *store_reads);
 /* the shared decoded-substream cache (UFSM_ZCACHE_GB, src/zshm.h) in this process: substream hits, misses, stored */
 void z3_shared_cache_stats(uint64_t *hits, uint64_t *misses, uint64_t *stored);   /* chunk reads served from the cache vs fetched from the store */
 int z3_prefetch_chunk(z3 *z, int64_t cz, int64_t cy, int64_t cx);   /* fetch one inner chunk into the cache (no decode): 1 fetched, 0 cached/absent, -1 error */
+int z3_chunk_raw(z3 *z, int64_t cz, int64_t cy, int64_t cx, uint8_t **buf, size_t *n);   /* encoded inner chunk bytes (after zstd): 1 with *buf (malloc), 0 absent, -1 error */

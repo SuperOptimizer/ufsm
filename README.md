@@ -14,7 +14,8 @@ make -j && make test     # gcc -std=c23 + nvcc; needs libcurl, libzstd, libblosc
 make ARCH=86             # Ampere (RTX 3090) into build86/: software MX-fp4 / fp8 (bit-exact conversions, emulated block-scaled MMAs)
                          # (on by default there; UFSM_MX_EMU=0: fp8 / fp4 as bf16, 16-bit storage); PTX=1: compute_86 PTX
                          # only (build86p/), so a newer GPU runs the sm_86 code (tests); BDIR=build puts it in build/
-make VERIFY=1 test-all   # the suite alone (build-verify/: adds the bf16 / fp32 reference kernels)
+make -j test             # fast tier (the merge gate); make test-slow: the slow tier; make test-all: both
+scripts/test/desk_suite.sh BRANCH   # the same on the desk (push over ssh, build, run, failing logs), one suite at a time
 make doctor              # the toolchain the Makefile picked + `ufsm sysinfo` (real cgroup CPUs / RAM, GPUs / MIG, CUDA, disk)
 ```
 
@@ -22,13 +23,27 @@ The Makefile finds its toolchain itself: the first of gcc / gcc-15 / gcc-14 that
 CUDA in /usr/local/cuda, else the newest /usr/local/cuda-*, else nvcc's prefix on PATH (CUDA= overrides), nvcc `-ccbin g++-N`
 for gcc-N, and `-lstdc++` in CUDALIBS (gcc-14 + CUDA 13.2 failed to link without it). Default thread counts follow the cgroup
 (`cpu.max` quota, affinity; `UFSM_NCPU` overrides), not nproc, and memory budgets (count-field `--mem-gb`, `UFSM_RENDER_MEM`)
-are lowered to what the cgroup still allows (src/sysinfo.h).
+are lowered to what the cgroup still allows (src/sysinfo.h). ccache is shared across worktrees (`CCACHE_BASEDIR` = the tree,
+`CCACHE_NOHASHDIR`), so a fresh worktree or desk suite dir rebuilds from the cache.
 
-`make test` builds the default `build/ufsm` plus the fixtures the Python CLI tests use, then runs `test-all` on the VERIFY=1
-build. Single tests: `make VERIFY=1 build-verify/test_strip && build-verify/test_strip`. The pipeline stages below have their
-own tests: `test_countfield`, `test_fit_join`, `test_wraps_core`, `test_flatten`, `test_flatten_gpu`,
+The tests are listed in `tests/suite.txt` (`NAME | TAGS | EST_SECONDS | COMMAND`) and run by `tests/run_suite.sh`. `make test`
+builds `build/ufsm`, the fixtures the Python CLI tests use and every suite binary on the VERIFY=1 build (`build-verify/`), then runs
+the fast tier in parallel: the runner sets the job count from the CPUs this process may use (cgroup-aware, `-j`, `SUITE_J`), caps the
+threads of each test (`UFSM_NCPU` / `UFSM_FIT_THREADS` / `UFSM_TIFF_THREADS` / `OMP_NUM_THREADS`, `-T`), gives each `gpu` test
+one of 2 slots per GPU (`-G`; machine-wide locks in `/tmp/ufsm-suite-locks`, shared by concurrent suites), the GPU with the most free memory first, runs the
+longest first, retries `flaky` tests once and prints each failing test's log tail plus a summary (`results.tsv` holds wall / CPU /
+max RSS per test). Runner options go through `SUITE_FLAGS`, e.g. `make test SUITE_FLAGS="-j 4 test_fit"` (names matching a regex),
+`-l` lists the tests, `-P` profiles (marks the tests that open the GPU, samples their GPU memory). One test by hand:
+`make VERIFY=1 build-verify/test_strip && build-verify/test_strip`. A new test: its binary as a prerequisite of `suite-bins` in the
+Makefile and a line in `tests/suite.txt` (tag `gpu` if it touches the GPU, `slow` if it takes more than ~30 s). The pipeline
+stages below have their own tests: `test_countfield`, `test_fit_join`, `test_wraps_core`, `test_flatten`, `test_flatten_gpu`,
 `test_faces`, `test_faces_gpu`, `test_strip`, `test_render_stream` (render / ink-compare / jpeg-fit, byte-identical streamed vs in-memory),
-`test_sheetcut`, `test_ink_blend.py`. On the laptop run builds and tests through `~/ufsm-data/capped.sh`.
+`test_sheetcut`, `test_ink_blend.py`. On the laptop run builds and tests through `~/ufsm-data/capped.sh` (with nice).
+
+`scripts/test/desk_suite.sh [-t fast|slow|all] REF [REGEX...]` pushes the commit into `/vesuvius/ufsm/suite/repo.git` on the desk,
+exports it to `/vesuvius/ufsm/suite/<sha>`, builds it (ccache shared across the sha dirs) and runs the suite at nice 10 under a lock
+(one desk suite at a time). It waits for the desk to have MemAvailable >= 40 GB and a 1-min load <= 32 (`-m` / `-l`, at most `-w` 60 min)
+before building and before testing, and uses the GPUs with >= 3 GB free. Logs stay in `/vesuvius/ufsm/suite/<sha>/out`.
 
 ## Unroll a scroll
 
@@ -408,7 +423,24 @@ Run it on the flat grid so both faces share one uv and render pixel-aligned; ren
 chunks; same output). `--gpu 1` (default) samples the profiles, cuts the bands and runs the median windows on the GPU from a
 device mirror of the decoded chunks (decode list = the exact substreams the samples read; `src/nn_faces.cu`, no fast math,
 no FMA): byte-identical outputs, CPU fallback without a device or when the device pool fills. Paris 4 w178: sampling 35 -> 3 s,
-medians 15 -> 2.5 s; the CPU volcomp decode is then ~75% of the wall. `UFSM_FACES_PROF=1` prints per-stage times.
+medians 15 -> 2.5 s; the CPU volcomp decode is then ~75% of the wall. `UFSM_FACES_PROF=1` prints per-stage times. With
+`UFSM_GPU_DECODE=1` (below) the CT substreams are decoded on the GPU straight into that device mirror (no host round trip;
+if the GPU path fails mid-run the substreams only the device had are decoded again on the host; with it faces marks + decodes
+128 rows per fill instead of 32 (`UFSM_FACES_FILL_ROWS`): bigger decode batches, w178 CT fill 79-82 -> 55-58 s on a loaded laptop).
+
+**GPU volcomp decoding** (`UFSM_GPU_DECODE=1`, opt-in; `src/nn_gpudec.cu`): every lossy (mode 0) volcomp substream that
+z3_read / z3_read_sub decodes goes to the GPU instead of volcomp_fast.h, byte-identical (one thread per substream for the tANS
+/ bypass decode, one CUDA block per 16^3 block for the dequantisation and the reference's inverse DCT network; no fast math,
+`-fmad=false`; corrupt or truncated streams are decoded again on the CPU, which gives the reference's status). A service
+thread batches the requests of all decode threads (render and faces run `UFSM_GPU_DECODE_THREADS`, default 32, decoders
+when it is on); a substream is a ~3-5 ms serial chain on the GPU, so throughput comes from many substreams in flight.
+Requests under `UFSM_GPU_DECODE_MIN_BYTES` (2048) compressed bytes per substream (ink, air: flat blocks) stay on the CPU;
+(not when decoding straight into device memory) `UFSM_GPU_DECODE_DEV` picks the device, `UFSM_GPU_DECODE_STATS=1` prints substreams / batches at exit; any device error
+turns it off for the rest of the process. A GPU that another job saturates starves it (time slicing: next to a fit at 99% SM
+it crawled), so a round trip over `UFSM_GPU_DECODE_MAX_MS` (60) sends the requests to the CPU for `UFSM_GPU_DECODE_COOL_S` (2 s),
+then the GPU is tried again; requests on the CPU path run at most `UFSM_GPU_DECODE_CPU_THREADS` (default: the CPUs this process
+may use) at once, so the extra decode threads do not oversubscribe the machine. `tests/test_gpudec.c` (`--real ARRAY cz cy cx nz ny nx [threads] [density]`:
+identity + MB/s on real chunks).
 
 ### Whole-scroll strip
 
