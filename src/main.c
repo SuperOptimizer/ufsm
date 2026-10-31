@@ -3650,9 +3650,35 @@ static int cmd_blend(int argc, char **argv) {
     fprintf(stderr, "blend: %lld of %lld shards written to %s in %.1fs\n", (long long)atomic_load(&J.written), (long long)(J.nsh[0] * J.nsh[1] * J.nsh[2]), dir, now() - t0);
     return 0;
 }
+/* render --fill: the share of surface pixels per class (stderr) and the cosmetic inpaint of the rest (--fill-inpaint L) */
+static void render_fill_report(const char *name, uint8_t *img, uint8_t *cimg, uint8_t *flag, int ow, int oh, int inpaint, int pm, int nthreads) {
+    size_t nin = 0;
+    if (inpaint > 0) {
+        uint8_t *const im[2] = {img, cimg}; const double t0 = now(); nin = img_pushpull_fill(im, 2, flag, ow, oh, inpaint, nthreads); const double t1 = now();
+        if (pm && img_patchmatch_fill(im, 2, flag, ow, oh, nthreads)) fprintf(stderr, "render: %s: PatchMatch out of memory (push-pull kept)\n", name);
+        fprintf(stderr, "render: %s inpaint: push-pull %.1fs, PatchMatch %.1fs\n", name, t1 - t0, pm ? now() - t1 : 0.0);
+    }
+    size_t ns = 0, non = 0, nfill = 0, nemp = 0, ngrid = 0, nnone = 0;   /* pixels of the original surface; grid-filled ones apart */
+    for (size_t i = 0; i < (size_t)ow * oh; i++) { const uint8_t f = flag[i]; if (f == RFILL_NONE) { nnone++; continue; }
+        if (f >= RFILL_GRID && f < RFILL_INPAINT) { ngrid++; continue; }
+        ns++; if (f == RFILL_ON) non++; else if (f == RFILL_EMPTY) nemp++; else if (f != RFILL_INPAINT) nfill++; }
+    const double d = ns ? 100.0 / ns : 0;
+    fprintf(stderr, "render: %s fill: %zu surface pixels: void on the surface %.2f%%, filled along the normal %.2f%%, inpainted %.2f%% (incl. grid-hole pixels), still empty %.2f%%; "
+                    "grid holes filled: %zu pixels (%.2f%% of the surface); no surface: %zu pixels\n",
+            name, ns, (ns - non) * d, nfill * d, nin * d, nemp * d, ngrid, ngrid * d, nnone);
+}
 static int cmd_render(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: ufsm render <wraps-dir> <out-dir> --volume ROOT KEY [--ct ROOT KEY] [--cache DIR] [--scale 1] [--depth 8] [--tile 512] [--threads 16] [--crop x,y,w,h] [--joint 1]\n"
+"         [--fill N] [--fill-ct 1] [--fill-prefer 0] [--fill-inpaint L] [--fill-pm 1] [--fill-grid V]\n"
 "  --joint 1: all wraps (one grid size) in one chunk-ordered pass, shared chunks decoded once\n"
+"  --fill N (needs --ct): a pixel whose CT on the surface is < --fill-ct (masked CT: 0 off the papyrus) takes the nearest papyrus\n"
+"    sample along the surface normal within +-N voxels for the volume AND the CT (same offset); ties: --fill-prefer 1 / -1 the\n"
+"    +- normal side, 0 the larger CT. Writes <wrap>_fill.tif: 0 on the surface, k filled from +k, 50 + k from -k, 250 inpainted,\n"
+"    254 no surface, 255 still empty; prints the shares. --fill 0: flags only. --fill-inpaint L: push-pull over L levels (holes up\n"
+"    to ~2^L pixels) of the still-empty pixels in both renders, then PatchMatch texture (--fill-pm 1, default; 0: push-pull only);\n"
+"    cosmetic, off by default; flag 250\n"
+"  --fill-grid V (with --fill): enclosed holes of the grid (invalid vertices, at most V per hole) bridged by interpolated vertices\n"
+"    (push-pull + Laplace), rendered like the rest; their pixels' flags + 100\n"
                                      "  --crop: only that rectangle of each wrap's output pixels is rendered and written (e.g. a labelled region)\n"); return 2; }
     const int vi = arg_index(argc, argv, "--volume"), ci = arg_index(argc, argv, "--ct");
     int crop[4] = {0, 0, 0, 0}; const char *crs = opt(argc, argv, "--crop", nullptr);
@@ -3661,6 +3687,11 @@ static int cmd_render(int argc, char **argv) {
     const double scale = atof(opt(argc, argv, "--scale", "1")); const int depth = atoi(opt(argc, argv, "--depth", "8"));
     const int tile = atoi(opt(argc, argv, "--tile", "512")), nthreads = atoi(opt(argc, argv, "--threads", "16"));
     const char *cache = opt(argc, argv, "--cache", nullptr);
+    const int fill_n = atoi(opt(argc, argv, "--fill", "-1")), fill_inp = atoi(opt(argc, argv, "--fill-inpaint", "0"));
+    const int fill_thr = atoi(opt(argc, argv, "--fill-ct", "1")), fill_pref = atoi(opt(argc, argv, "--fill-prefer", "0")), fill_pm = atoi(opt(argc, argv, "--fill-pm", "1"));
+    const long fill_grid = atol(opt(argc, argv, "--fill-grid", "0"));
+    if (fill_n > 49 || (fill_grid && fill_n < 0) || fill_inp < 0 || fill_inp > 8 || ((fill_n >= 0 || fill_inp) && (ci < 0 || ci + 2 >= argc)) || (fill_inp && fill_n < 0) || (fill_n >= 0 && getenv("UFSM_RENDER_TILED"))) {
+        fprintf(stderr, "render: --fill N (0..49) needs --ct (and not UFSM_RENDER_TILED); --fill-inpaint L (1..8) needs --fill\n"); return 2; }
     store *vs = store_open(argv[vi + 1]), *cs = ci > 0 && ci + 2 < argc ? store_open(argv[ci + 1]) : nullptr;
     const int remote = (vs && !store_is_local(vs)) || (cs && !store_is_local(cs));
     z3 *vz = vs ? z3_open(vs, argv[vi + 2], cache) : nullptr, *cz = cs ? z3_open(cs, argv[ci + 2], cache) : nullptr;
@@ -3688,7 +3719,7 @@ static int cmd_render(int argc, char **argv) {
         }
         rewinddir(dd);
         const double budget = atof(getenv("UFSM_RENDER_MEM") ? getenv("UFSM_RENDER_MEM") : "8") * (1u << 30);
-        chunked = getenv("UFSM_RENDER_TILED") ? 0 : getenv("UFSM_RENDER_CHUNKED") ? 1 : 0;
+        chunked = getenv("UFSM_RENDER_TILED") ? 0 : getenv("UFSM_RENDER_CHUNKED") || fill_n >= 0 ? 1 : 0;   /* --fill: the chunk-ordered renderer only */
         cbudget = budget;
         if (lo[0] <= hi[0] && lo[1] <= hi[1] && lo[2] <= hi[2]) {
             for (int d = 0; d < 3; d++) { ro[d] = (int64_t)floor(lo[d]) - depth - 2; if (ro[d] < 0) ro[d] = 0; rn[d] = (int64_t)ceil(hi[d]) + depth + 3 - ro[d]; }
@@ -3703,7 +3734,7 @@ static int cmd_render(int argc, char **argv) {
     /* --joint 1: every wrap of the directory (same grid size and step, e.g. one wrap's recto and verso faces on one flat uv) in one
        chunk-ordered pass, so the chunks they share are decoded once; the outputs are those of separate renders, byte for byte */
     if (atoi(opt(argc, argv, "--joint", "0")) && !rvol && !getenv("UFSM_RENDER_TILED")) {
-        enum { JMAX = 8 }; char *nm[JMAX]; float *JX[JMAX], *JY[JMAX], *JZ[JMAX]; int nj = 0, jw = 0, jh = 0, ok = 1; double jstep = 0;
+        enum { JMAX = 8 }; char *nm[JMAX]; float *JX[JMAX], *JY[JMAX], *JZ[JMAX]; uint8_t *VG[JMAX] = {0}; int nj = 0, jw = 0, jh = 0, ok = 1; double jstep = 0;
         while ((de = readdir(dd)) && ok) {
             if (de->d_name[0] != 'w') continue;
             if (nj == JMAX) { fprintf(stderr, "render: --joint takes at most %d wraps\n", JMAX); ok = 0; break; }
@@ -3715,17 +3746,30 @@ static int cmd_render(int argc, char **argv) {
             snprintf(p, sizeof p, "%s/%s/meta.json", argv[2], de->d_name);
             double step = 1; { char *b = tfx_meta_read(p); const char *q = b ? strstr(b, "\"scale\":") : nullptr; if (q && (q = strchr(q, '['))) { const double sc = atof(q + 1); if (sc > 0) step = 1 / sc; } free(b); }
             if (nj && (w != jw || h != jh || step != jstep)) { fprintf(stderr, "render: --joint: %s is %dx%d step %g, not %dx%d step %g\n", de->d_name, w, h, step, jw, jh, jstep); free(X); free(Y); free(Z); ok = 0; break; }
-            jw = w; jh = h; jstep = step; nm[nj] = strdup(de->d_name); JX[nj] = X; JY[nj] = Y; JZ[nj] = Z; nj++;
+            jw = w; jh = h; jstep = step; nm[nj] = strdup(de->d_name); JX[nj] = X; JY[nj] = Y; JZ[nj] = Z;
+            if (fill_grid > 0) { size_t nh, nbg; VG[nj] = malloc((size_t)w * h); const size_t nf = tifxyz_fill_holes(X, Y, Z, w, h, (size_t)fill_grid, VG[nj], &nh, &nbg);
+                                 fprintf(stderr, "render: %s grid: %zu holes, %zu vertices interpolated, %zu holes over %ld vertices left\n", de->d_name, nh, nf, nbg, fill_grid); }
+            nj++;
         }
         if (ok && nj) {
             const double gs = jstep * scale; const int ow = render_out_px(jw, gs), oh = render_out_px(jh, gs), nvol = cz ? 2 : 1;
-            uint8_t *im[2 * JMAX] = {0};
+            uint8_t *im[2 * JMAX] = {0}, *fl[JMAX] = {0};
             for (int k = 0; k < nj * nvol && ok; k++) if (!(im[k] = calloc((size_t)ow * oh, 1))) { fprintf(stderr, "render: out of memory\n"); ok = 0; }
+            for (int k = 0; k < nj && ok && fill_n >= 0; k++) { if (!(fl[k] = malloc((size_t)ow * oh))) { fprintf(stderr, "render: out of memory\n"); ok = 0; } else memset(fl[k], RFILL_NONE, (size_t)ow * oh); }
+            const render_fill RF = {fill_n, fill_thr, fill_pref, fl, fill_grid > 0 ? (const uint8_t *const *)VG : nullptr};
             z3 *zs[2] = {vz, cz}; const int dp[2] = {depth, 0};
             const size_t imgb = (size_t)ow * oh * nvol * nj, cb = cbudget > imgb + ((size_t)1 << 30) ? (size_t)cbudget - imgb : (size_t)1 << 30;
             const int io = remote ? (nthreads > 32 ? nthreads : 32) : nthreads;
-            if (ok && render_wraps_chunked(zs, nvol, dp, nj, (const float *const *)JX, (const float *const *)JY, (const float *const *)JZ, jw, jh, gs, im, ow, oh,
-                                           crs ? crop : nullptr, cb, nthreads, io, 1)) { fprintf(stderr, "render: joint render failed\n"); ok = 0; }
+            if (ok && render_wraps_chunked_fill(zs, nvol, dp, nj, (const float *const *)JX, (const float *const *)JY, (const float *const *)JZ, jw, jh, gs, im, ow, oh,
+                                                crs ? crop : nullptr, cb, nthreads, io, 1, fill_n >= 0 ? &RF : nullptr)) { fprintf(stderr, "render: joint render failed\n"); ok = 0; }
+            for (int k = 0; k < nj && ok && fill_n >= 0; k++) {
+                render_fill_report(nm[k], im[k * nvol], im[k * nvol + 1], fl[k], ow, oh, fill_inp, fill_pm, nthreads);
+                uint8_t *f = fl[k]; int fw = ow, fh = oh;
+                if (crs) { uint8_t *c2 = img_crop_u8(f, ow, oh, crop[0], crop[1], crop[2], crop[3]); if (!c2) { ok = 0; break; } free(f); fl[k] = f = c2; fw = crop[2]; fh = crop[3]; }
+                char p[1400]; snprintf(p, sizeof p, "%s/%s_fill.tif", argv[3], nm[k]);
+                if (tiffw_write(p, fw, fh, 1, f, 1)) { fprintf(stderr, "render: cannot write %s\n", p); ok = 0; }
+            }
+            for (int k = 0; k < nj; k++) free(fl[k]);
             for (int k = 0; k < nj && ok; k++) for (int v = 0; v < nvol && ok; v++) {
                 uint8_t *img = im[k * nvol + v]; int fw = ow, fh = oh;
                 if (crs) { uint8_t *c2 = img_crop_u8(img, ow, oh, crop[0], crop[1], crop[2], crop[3]); if (!c2) { ok = 0; break; } free(img); im[k * nvol + v] = img = c2; fw = crop[2]; fh = crop[3]; }
@@ -3734,7 +3778,7 @@ static int cmd_render(int argc, char **argv) {
             }
             for (int k = 0; k < nj * nvol; k++) free(im[k]);
         }
-        for (int k = 0; k < nj; k++) { free(nm[k]); free(JX[k]); free(JY[k]); free(JZ[k]); }
+        for (int k = 0; k < nj; k++) { free(nm[k]); free(JX[k]); free(JY[k]); free(JZ[k]); free(VG[k]); }
         closedir(dd); free(rvol); free(rct);
         if (!ok) return 1;
         fprintf(stderr, "render: %d wraps written to %s (one pass)\n", nj, argv[3]);
@@ -3751,13 +3795,20 @@ static int cmd_render(int argc, char **argv) {
         double step = 1; { char *b = tfx_meta_read(p); const char *q = b ? strstr(b, "\"scale\":") : nullptr; if (q && (q = strchr(q, '['))) { const double sc = atof(q + 1); if (sc > 0) step = 1 / sc; } free(b); }
         const double gs = step * scale;   /* output pixels per grid step */
         const int ow = render_out_px(w, gs), oh = render_out_px(h, gs);
-        uint8_t *img = calloc((size_t)ow * oh, 1), *cimg = cz ? calloc((size_t)ow * oh, 1) : nullptr;
-        if (!img || (cz && !cimg)) { fprintf(stderr, "render: out of memory\n"); return 1; }
+        uint8_t *vgrid = nullptr;
+        if (fill_grid > 0) { size_t nh, nbg; vgrid = malloc((size_t)w * h); const size_t nf = tifxyz_fill_holes(X, Y, Z, w, h, (size_t)fill_grid, vgrid, &nh, &nbg);
+                             fprintf(stderr, "render: %s grid: %zu holes, %zu vertices interpolated, %zu holes over %ld vertices left\n", de->d_name, nh, nf, nbg, fill_grid); }
+        uint8_t *img = calloc((size_t)ow * oh, 1), *cimg = cz ? calloc((size_t)ow * oh, 1) : nullptr, *flag = fill_n >= 0 ? malloc((size_t)ow * oh) : nullptr;
+        if (!img || (cz && !cimg) || (fill_n >= 0 && !flag)) { fprintf(stderr, "render: out of memory\n"); return 1; }
+        if (flag) memset(flag, RFILL_NONE, (size_t)ow * oh);
         if (!rvol && !getenv("UFSM_RENDER_TILED")) {
             z3 *zs[2] = {vz, cz}; const int dp[2] = {depth, 0}; uint8_t *const im[2] = {img, cimg};
             const size_t imgb = (size_t)ow * oh * (cz ? 2 : 1), cb = cbudget > imgb + ((size_t)1 << 30) ? (size_t)cbudget - imgb : (size_t)1 << 30;
             const int io = remote ? (nthreads > 32 ? nthreads : 32) : nthreads;
-            if (render_wrap_chunked(zs, cz ? 2 : 1, dp, X, Y, Z, w, h, gs, im, ow, oh, crs ? crop : nullptr, cb, nthreads, io, 1)) { fprintf(stderr, "render: %s: render failed\n", de->d_name); return 1; }
+            const float *const Xs[1] = {X}, *const Ys[1] = {Y}, *const Zs[1] = {Z}; uint8_t *const fls[1] = {flag}; const uint8_t *const vgs[1] = {vgrid};
+            const render_fill RF = {fill_n, fill_thr, fill_pref, fls, vgrid ? vgs : nullptr};
+            if (render_wraps_chunked_fill(zs, cz ? 2 : 1, dp, 1, Xs, Ys, Zs, w, h, gs, im, ow, oh, crs ? crop : nullptr, cb, nthreads, io, 1, flag ? &RF : nullptr)) { fprintf(stderr, "render: %s: render failed\n", de->d_name); return 1; }
+            if (flag) render_fill_report(de->d_name, img, cimg, flag, ow, oh, fill_inp, fill_pm, nthreads);
         } else
         /* output tiles: each reads only the volume around its own vertices (+- depth), so a wrap of any size renders in bounded memory */
         for (int ty = 0; ty < oh; ty += tile) for (int tx = 0; tx < ow; tx += tile) {
@@ -3794,11 +3845,13 @@ static int cmd_render(int argc, char **argv) {
             uint8_t *ci2 = img_crop_u8(img, ow, oh, crop[0], crop[1], crop[2], crop[3]), *cc2 = cimg ? img_crop_u8(cimg, ow, oh, crop[0], crop[1], crop[2], crop[3]) : nullptr;
             if (!ci2 || (cimg && !cc2)) { fprintf(stderr, "render: out of memory\n"); return 1; }
             free(img); free(cimg); img = ci2; cimg = cc2; fw = crop[2]; fh = crop[3];
+            if (flag) { uint8_t *cf = img_crop_u8(flag, ow, oh, crop[0], crop[1], crop[2], crop[3]); if (!cf) return 1; free(flag); flag = cf; }
         }
+        if (flag) { snprintf(p, sizeof p, "%s/%s_fill.tif", argv[3], de->d_name); if (tiffw_write(p, fw, fh, 1, flag, 1)) { fprintf(stderr, "render: cannot write %s\n", p); return 1; } free(flag); }
         snprintf(p, sizeof p, "%s/%s.tif", argv[3], de->d_name);
         if (tiffw_write(p, fw, fh, 1, img, 1)) { fprintf(stderr, "render: cannot write %s\n", p); return 1; }
         if (cimg) { snprintf(p, sizeof p, "%s/%s_ct.tif", argv[3], de->d_name); if (tiffw_write(p, fw, fh, 1, cimg, 1)) return 1; }
-        free(X); free(Y); free(Z); free(img); free(cimg); nw++;
+        free(X); free(Y); free(Z); free(img); free(cimg); free(vgrid); nw++;
     }
     closedir(dd); free(rvol); free(rct);
     fprintf(stderr, "render: %d wraps written to %s\n", nw, argv[3]);

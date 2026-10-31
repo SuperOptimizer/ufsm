@@ -651,3 +651,228 @@ uint8_t *img_crop_u8(const uint8_t *im, int w, int h, int x, int y, int cw, int 
     if (x1 > x0) for (int r = 0; r < ch; r++) { const int sy = y + r; if (sy < 0 || sy >= h) continue; memcpy(o + (size_t)r * cw + (x0 - x), im + (size_t)sy * w + x0, (size_t)(x1 - x0)); }
     return o;
 }
+
+/* ---- img_pushpull_fill (render --fill-inpaint) ----
+   Per tile (core T x T, origin a multiple of T, halo 2^(L+1)): level 0 = the tile's pixels, weight 1 at surface pixels (flag <=
+   RFILL_INPAINT), 0 elsewhere; push: each coarser pixel = the weighted mean of its 2 x 2 children, weight min(1, sum); pull: from the
+   coarsest level down, a pixel of weight < 1 is blended with the bilinear (premultiplied) value of the level above. Pixels flagged
+   RFILL_EMPTY whose final weight is > 0 take the pulled values. No-surface pixels (RFILL_NONE) are neither sources nor targets. */
+typedef struct { uint8_t *const *imgs; int nimg; uint8_t *flag; int w, h, L, T, ntx, nty; _Atomic int next; _Atomic size_t filled; } ppf_job;
+static inline int ppf_src(uint8_t f) { return f < RFILL_INPAINT; }
+static void *ppf_worker(void *arg) {
+    ppf_job *J = arg; const int L = J->L, T = J->T, H = 2 << L, S = T + 2 * H, nimg = J->nimg;
+    float *cw[16], *wt[16]; int dim[16];   /* per level: premultiplied channels (nimg planes) and weights */
+    for (int l = 0, d = S; l <= L; l++, d = (d + 1) / 2) { dim[l] = d; cw[l] = malloc((size_t)d * d * nimg * sizeof(float)); wt[l] = malloc((size_t)d * d * sizeof(float)); }
+    for (int t; (t = atomic_fetch_add(&J->next, 1)) < J->ntx * J->nty;) {
+        const int x0 = (t % J->ntx) * T, y0 = (t / J->ntx) * T, ox = x0 - H, oy = y0 - H;
+        const int cx1 = x0 + T < J->w ? x0 + T : J->w, cy1 = y0 + T < J->h ? y0 + T : J->h;
+        int any = 0;
+        for (int y = y0; y < cy1 && !any; y++) for (int x = x0; x < cx1; x++) if (J->flag[(size_t)y * J->w + x] == RFILL_EMPTY) { any = 1; break; }
+        if (!any) continue;
+        const int d0 = dim[0];
+        for (int y = 0; y < d0; y++) for (int x = 0; x < d0; x++) {
+            const int gx = ox + x, gy = oy + y; const size_t i = (size_t)y * d0 + x;
+            const int in = gx >= 0 && gy >= 0 && gx < J->w && gy < J->h, src = in && ppf_src(J->flag[(size_t)gy * J->w + gx]);
+            wt[0][i] = src ? 1.f : 0.f;
+            for (int c = 0; c < nimg; c++) cw[0][i * nimg + c] = src ? J->imgs[c][(size_t)gy * J->w + gx] : 0.f;
+        }
+        for (int l = 0; l < L; l++) {   /* push */
+            const int d = dim[l], e = dim[l + 1];
+            for (int y = 0; y < e; y++) for (int x = 0; x < e; x++) {
+                float W = 0, A[16] = {0};
+                for (int q = 0; q < 4; q++) { const int a = 2 * y + (q >> 1), b = 2 * x + (q & 1); if (a >= d || b >= d) continue;
+                    const size_t i = (size_t)a * d + b; W += wt[l][i]; for (int c = 0; c < nimg; c++) A[c] += cw[l][i * nimg + c]; }
+                const size_t o = (size_t)y * e + x; const float s = W > 0 ? 1.f / W : 0.f, wn = W < 1 ? W : 1;
+                wt[l + 1][o] = wn; for (int c = 0; c < nimg; c++) cw[l + 1][o * nimg + c] = A[c] * s * wn;   /* mean, premultiplied by min(1, W) */
+            }
+        }
+        for (int l = L - 1; l >= 0; l--) {   /* pull */
+            const int d = dim[l], e = dim[l + 1];
+            for (int y = 0; y < d; y++) for (int x = 0; x < d; x++) {
+                const size_t i = (size_t)y * d + x; const float w0 = wt[l][i]; if (w0 >= 1) continue;
+                double fy = (y - 0.5) / 2, fx = (x - 0.5) / 2; if (fy < 0) fy = 0; if (fx < 0) fx = 0; if (fy > e - 1) fy = e - 1; if (fx > e - 1) fx = e - 1;
+                const int a = (int)fy, b = (int)fx, a1 = a + 1 < e ? a + 1 : a, b1 = b + 1 < e ? b + 1 : b; const float ty = (float)(fy - a), tx = (float)(fx - b);
+                const size_t q00 = (size_t)a * e + b, q01 = (size_t)a * e + b1, q10 = (size_t)a1 * e + b, q11 = (size_t)a1 * e + b1;
+                const float k00 = (1 - ty) * (1 - tx), k01 = (1 - ty) * tx, k10 = ty * (1 - tx), k11 = ty * tx;
+                const float wu = k00 * wt[l + 1][q00] + k01 * wt[l + 1][q01] + k10 * wt[l + 1][q10] + k11 * wt[l + 1][q11];
+                if (!(wu > 0)) continue;
+                const float r = 1 - w0;
+                for (int c = 0; c < nimg; c++) {
+                    const float cu = (k00 * cw[l + 1][q00 * nimg + c] + k01 * cw[l + 1][q01 * nimg + c] + k10 * cw[l + 1][q10 * nimg + c] + k11 * cw[l + 1][q11 * nimg + c]) / wu;
+                    cw[l][i * nimg + c] += r * cu * (wu < 1 ? wu : 1);
+                }
+                wt[l][i] = w0 + r * (wu < 1 ? wu : 1);
+            }
+        }
+        size_t nf = 0;
+        for (int y = y0; y < cy1; y++) for (int x = x0; x < cx1; x++) {
+            uint8_t *f = &J->flag[(size_t)y * J->w + x]; if (*f != RFILL_EMPTY) continue;
+            const size_t i = (size_t)(y - oy) * d0 + (x - ox); const float W = wt[0][i]; if (!(W > 1e-3f)) continue;
+            for (int c = 0; c < nimg; c++) { const float v = cw[0][i * nimg + c] / W; J->imgs[c][(size_t)y * J->w + x] = (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : lroundf(v)); }
+            *f = RFILL_INPAINT; nf++;
+        }
+        atomic_fetch_add(&J->filled, nf);
+    }
+    for (int l = 0; l <= L; l++) { free(cw[l]); free(wt[l]); }
+    return nullptr;
+}
+size_t img_pushpull_fill(uint8_t *const *imgs, int nimg, uint8_t *flag, int w, int h, int levels, int nthreads) {
+    if (nimg < 1 || nimg > 16 || levels < 1 || levels > 8 || w < 1 || h < 1) return 0;
+    ppf_job J = {imgs, nimg, flag, w, h, levels, 512, (w + 511) / 512, (h + 511) / 512, 0, 0};
+    const int nt = nthreads < 1 ? 1 : nthreads > 64 ? 64 : nthreads; pthread_t th[64];
+    for (int t = 0; t < nt; t++) pthread_create(&th[t], nullptr, ppf_worker, &J);
+    for (int t = 0; t < nt; t++) pthread_join(th[t], nullptr);
+    return atomic_load(&J.filled);
+}
+
+/* ---- img_patchmatch_fill (render --fill-pm) ----
+   PatchMatch (Barnes et al. 2009) inpainting of the pixels flagged RFILL_INPAINT (the push-pull fill gives the initial values): per
+   tile (core 256, halo 40, its own region as the source), a 3-level pyramid coarse to fine; per level an NNF from every hole pixel to
+   a source patch centre (7 x 7 patches wholly on surface, non-hole pixels), EM iterations of one PatchMatch sweep (propagation from the
+   scan-order neighbours, random search with halving radius; alternating scan direction) and a vote (each hole pixel = the mean of
+   the source pixels the overlapping patches put there). Patch distance: the SSD over every channel (CT and ink jointly, so both come
+   from the same source patch) over the window pixels on the surface. Holes are written in the tile cores only (from a snapshot of
+   the input, so tiles do not depend on each other); deterministic (seeded per tile). */
+enum { PM_T = 256, PM_H = 40, PM_R = 3, PM_LV = 3, PM_IT = 4 };
+typedef struct { uint8_t *const *imgs; uint8_t **snap; int nimg; const uint8_t *flag; int w, h, ntx, nty; _Atomic int next; } pm_job;
+static inline uint32_t pm_rand(uint32_t *s) { uint32_t x = *s; x ^= x << 13; x ^= x >> 17; x ^= x << 5; return *s = x; }
+typedef struct { int S; float *I; uint8_t *m; uint8_t *vc; int32_t *nnf; float *dist; int32_t *cent; int nc; } pm_lvl;   /* m: 0 source, 1 hole, 2 outside */
+static float pm_dist(const pm_lvl *L, int nimg, int p, int q, float cap) {
+    const int S = L->S, py = p / S, px = p % S, qy = q / S, qx = q % S; float s = 0; int n = 0;
+    for (int dy = -PM_R; dy <= PM_R; dy++) {
+        const int ay = py + dy; if (ay < 0 || ay >= S) continue;
+        for (int dx = -PM_R; dx <= PM_R; dx++) {
+            const int ax = px + dx; if (ax < 0 || ax >= S) continue;
+            const int a = ay * S + ax; if (L->m[a] == 2) continue;
+            const int b = (qy + dy) * S + qx + dx;
+            for (int c = 0; c < nimg; c++) { const float e = L->I[(size_t)a * nimg + c] - L->I[(size_t)b * nimg + c]; s += e * e; }
+            n++;
+        }
+        if (n && s > cap * n * 2) return 1e30f;   /* cannot win: stop early (loose: the mean over the rest could only fall so far) */
+    }
+    return n ? s / n : 1e30f;
+}
+static void pm_valid_centres(pm_lvl *L) {   /* centres whose whole 7 x 7 window is source */
+    const int S = L->S; L->nc = 0;
+    int32_t *ii = calloc((size_t)(S + 1) * (S + 1), sizeof *ii);
+    for (int y = 0; y < S; y++) for (int x = 0; x < S; x++) ii[(y + 1) * (S + 1) + x + 1] = ii[y * (S + 1) + x + 1] + ii[(y + 1) * (S + 1) + x] - ii[y * (S + 1) + x] + (L->m[y * S + x] != 0);
+    for (int y = 0; y < S; y++) for (int x = 0; x < S; x++) {
+        int ok = y >= PM_R && x >= PM_R && y < S - PM_R && x < S - PM_R;
+        if (ok) { const int y0 = y - PM_R, y1 = y + PM_R + 1, x0 = x - PM_R, x1 = x + PM_R + 1; ok = ii[y1 * (S + 1) + x1] - ii[y0 * (S + 1) + x1] - ii[y1 * (S + 1) + x0] + ii[y0 * (S + 1) + x0] == 0; }
+        L->vc[y * S + x] = (uint8_t)ok; if (ok) L->cent[L->nc++] = y * S + x;
+    }
+    free(ii);
+}
+static void pm_vote(pm_lvl *L, int nimg) {
+    const int S = L->S; float acc[16];
+    for (int p = 0; p < S * S; p++) {
+        if (L->m[p] != 1 || L->nnf[p] < 0) continue;
+        const int py = p / S, px = p % S; int n = 0; for (int c = 0; c < nimg; c++) acc[c] = 0;
+        for (int dy = -PM_R; dy <= PM_R; dy++) for (int dx = -PM_R; dx <= PM_R; dx++) {
+            const int ay = py + dy, ax = px + dx; if (ay < 0 || ax < 0 || ay >= S || ax >= S) continue;
+            const int a = ay * S + ax; if (L->m[a] != 1 || L->nnf[a] < 0) continue;
+            const int q = L->nnf[a] - dy * S - dx;   /* the source pixel patch a puts at p */
+            for (int c = 0; c < nimg; c++) acc[c] += L->I[(size_t)q * nimg + c];
+            n++;
+        }
+        if (n) for (int c = 0; c < nimg; c++) L->I[(size_t)p * nimg + c] = acc[c] / n;
+    }
+}
+static void pm_sweep(pm_lvl *L, int nimg, int rev, uint32_t *rs) {
+    const int S = L->S, st = rev ? -1 : 1;
+    for (int k = 0; k < S * S; k++) {
+        const int p = rev ? S * S - 1 - k : k; if (L->m[p] != 1) continue;
+        const int py = p / S, px = p % S;
+        int best = L->nnf[p]; float bd = best >= 0 ? L->dist[p] : 1e30f;
+        for (int t = 0; t < 2; t++) {   /* propagation from the left / upper (right / lower) neighbour */
+            const int ny = py - (t ? st : 0), nx = px - (t ? 0 : st); if (ny < 0 || nx < 0 || ny >= S || nx >= S) continue;
+            const int n = ny * S + nx; if (L->m[n] != 1 || L->nnf[n] < 0) continue;
+            const int q = L->nnf[n] + (py - ny) * S + (px - nx); const int qy = q / S, qx = q % S;
+            (void)qy; if (q < 0 || q >= S * S || abs(qx - (L->nnf[n] % S)) > 1 || !L->vc[q] || q == best) continue;
+            const float d = pm_dist(L, nimg, p, q, bd); if (d < bd) { bd = d; best = q; }
+        }
+        if (best >= 0) for (int R = S; R >= 1; R /= 2) {   /* random search around the best */
+            const int by = best / S, bx = best % S, qy = by + (int)(pm_rand(rs) % (2 * R + 1)) - R, qx = bx + (int)(pm_rand(rs) % (2 * R + 1)) - R;
+            if (qy < 0 || qx < 0 || qy >= S || qx >= S) continue;
+            const int q = qy * S + qx; if (!L->vc[q] || q == best) continue;
+            const float d = pm_dist(L, nimg, p, q, bd); if (d < bd) { bd = d; best = q; }
+        }
+        L->nnf[p] = best; L->dist[p] = bd;
+    }
+}
+static void *pm_worker(void *arg) {
+    pm_job *J = arg; const int nimg = J->nimg, S0 = PM_T + 2 * PM_H;
+    pm_lvl Lv[PM_LV];
+    for (int l = 0, S = S0; l < PM_LV; l++, S = (S + 1) / 2) {
+        const size_t n = (size_t)S * S; Lv[l].S = S;
+        Lv[l].I = malloc(n * nimg * sizeof(float)); Lv[l].m = malloc(n); Lv[l].vc = malloc(n); Lv[l].nnf = malloc(n * 4); Lv[l].dist = malloc(n * 4); Lv[l].cent = malloc(n * 4);
+    }
+    for (int t; (t = atomic_fetch_add(&J->next, 1)) < J->ntx * J->nty;) {
+        const int x0 = (t % J->ntx) * PM_T, y0 = (t / J->ntx) * PM_T, ox = x0 - PM_H, oy = y0 - PM_H;
+        const int cx1 = x0 + PM_T < J->w ? x0 + PM_T : J->w, cy1 = y0 + PM_T < J->h ? y0 + PM_T : J->h;
+        int any = 0;
+        for (int y = y0; y < cy1 && !any; y++) for (int x = x0; x < cx1; x++) if (J->flag[(size_t)y * J->w + x] == RFILL_INPAINT) { any = 1; break; }
+        if (!any) continue;
+        uint32_t rs = 2654435761u * (uint32_t)(t + 1) | 1u;
+        pm_lvl *L0 = &Lv[0];
+        for (int y = 0; y < S0; y++) for (int x = 0; x < S0; x++) {
+            const int gx = ox + x, gy = oy + y; const size_t i = (size_t)y * S0 + x;
+            const int in = gx >= 0 && gy >= 0 && gx < J->w && gy < J->h; const uint8_t f = in ? J->flag[(size_t)gy * J->w + gx] : RFILL_NONE;
+            L0->m[i] = f == RFILL_INPAINT ? 1 : f < RFILL_INPAINT ? 0 : 2;
+            for (int c = 0; c < nimg; c++) L0->I[i * nimg + c] = in && L0->m[i] != 2 ? J->snap[c][(size_t)gy * J->w + gx] : 0.f;
+        }
+        for (int l = 1; l < PM_LV; l++) {   /* the pyramid: means of the children on the surface; hole if any child is a hole */
+            pm_lvl *A = &Lv[l - 1], *B = &Lv[l]; const int Sa = A->S, Sb = B->S;
+            for (int y = 0; y < Sb; y++) for (int x = 0; x < Sb; x++) {
+                float acc[16] = {0}; int n = 0, hole = 0; const size_t o = (size_t)y * Sb + x;
+                for (int q = 0; q < 4; q++) { const int a = 2 * y + (q >> 1), b = 2 * x + (q & 1); if (a >= Sa || b >= Sa) continue;
+                    const size_t i = (size_t)a * Sa + b; if (A->m[i] == 2) continue; hole |= A->m[i] == 1; n++; for (int c = 0; c < nimg; c++) acc[c] += A->I[i * nimg + c]; }
+                B->m[o] = n ? (uint8_t)hole : 2; for (int c = 0; c < nimg; c++) B->I[o * nimg + c] = n ? acc[c] / n : 0.f;
+            }
+        }
+        for (int l = PM_LV - 1; l >= 0; l--) {
+            pm_lvl *L = &Lv[l]; const int S = L->S; pm_valid_centres(L);
+            if (!L->nc) { if (l == 0) goto next_tile; for (int i = 0; i < S * S; i++) L->nnf[i] = -1; continue; }
+            for (int p = 0; p < S * S; p++) {
+                L->nnf[p] = -1; if (L->m[p] != 1) continue;
+                int q = -1;
+                if (l < PM_LV - 1) {   /* the coarser NNF, scaled */
+                    const pm_lvl *C = &Lv[l + 1]; const int py = p / S, px = p % S, cp = (py / 2) * C->S + px / 2;
+                    if (py / 2 < C->S && px / 2 < C->S && C->m[cp] == 1 && C->nnf[cp] >= 0) {
+                        const int qy = (C->nnf[cp] / C->S) * 2 + (py & 1), qx = (C->nnf[cp] % C->S) * 2 + (px & 1);
+                        if (qy < S && qx < S && L->vc[qy * S + qx]) q = qy * S + qx;
+                    }
+                }
+                if (q < 0) q = L->cent[pm_rand(&rs) % (uint32_t)L->nc];
+                L->nnf[p] = q;
+            }
+            if (l < PM_LV - 1) pm_vote(L, nimg);   /* the finer level starts from the coarser NNF's vote (the coarsest from push-pull) */
+            for (int p = 0; p < S * S; p++) if (L->m[p] == 1) L->dist[p] = pm_dist(L, nimg, p, L->nnf[p], 1e30f);
+            for (int it = 0; it < PM_IT; it++) {
+                pm_sweep(L, nimg, it & 1, &rs); pm_vote(L, nimg);
+                for (int p = 0; p < S * S; p++) if (L->m[p] == 1 && L->nnf[p] >= 0) L->dist[p] = pm_dist(L, nimg, p, L->nnf[p], 1e30f);
+            }
+        }
+        for (int y = y0; y < cy1; y++) for (int x = x0; x < cx1; x++) {
+            if (J->flag[(size_t)y * J->w + x] != RFILL_INPAINT) continue;
+            const size_t i = (size_t)(y - oy) * S0 + (x - ox); if (L0->nnf[i] < 0) continue;
+            for (int c = 0; c < nimg; c++) { const float v = L0->I[i * nimg + c]; J->imgs[c][(size_t)y * J->w + x] = (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : lroundf(v)); }
+        }
+    next_tile:;
+    }
+    for (int l = 0; l < PM_LV; l++) { free(Lv[l].I); free(Lv[l].m); free(Lv[l].vc); free(Lv[l].nnf); free(Lv[l].dist); free(Lv[l].cent); }
+    return nullptr;
+}
+int img_patchmatch_fill(uint8_t *const *imgs, int nimg, const uint8_t *flag, int w, int h, int nthreads) {
+    if (nimg < 1 || nimg > 16 || w < 1 || h < 1) return -1;
+    uint8_t *snap[16] = {0}; int rc = 0;
+    for (int c = 0; c < nimg; c++) { if (!(snap[c] = malloc((size_t)w * h))) rc = -1; else memcpy(snap[c], imgs[c], (size_t)w * h); }
+    if (!rc) {
+        pm_job J = {imgs, snap, nimg, flag, w, h, (w + PM_T - 1) / PM_T, (h + PM_T - 1) / PM_T, 0};
+        const int nt = nthreads < 1 ? 1 : nthreads > 64 ? 64 : nthreads; pthread_t th[64];
+        for (int t = 0; t < nt; t++) pthread_create(&th[t], nullptr, pm_worker, &J);
+        for (int t = 0; t < nt; t++) pthread_join(th[t], nullptr);
+    }
+    for (int c = 0; c < nimg; c++) free(snap[c]);
+    return rc;
+}
