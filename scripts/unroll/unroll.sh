@@ -201,10 +201,9 @@ lane() {   # lane GPU
     c0=$((k * I)); c1=$((c0 + I)); [ $c1 -gt $ze ] && c1=$ze; a=$((c0 - OV)); [ $a -lt 0 ] && a=0; b=$((c1 + OV)); [ $b -gt $ze ] && b=$ze
     rm -rf $d/f $d/fit; bash $MKCROP $F $d/f $a 0 0 $((b - a)) $ny $nx > /dev/null || continue
     echo "$c0 $c1 $a $b" > $d/cells; memok; t0=$(date +%s)
-    # fields over FITMAN (0.75) of the card: in managed memory (a full 0490B cross-section, 15.4 GB on a 16.6 GB card, fits on the device
-    # but leaves no room for the models / gate blocks: OOM then an illegal access, rc 1); FIT_MANAGED=1 (the last refit try) forces it
-    local man=${FIT_MANAGED:-0} fgb; fgb=$(awk -v n=$(( (b - a) * ny * nx )) 'BEGIN { printf "%.2f", n * 10 / 1073741824 }')
-    [ "$man" = 1 ] || awk -v f=$fgb -v g=${GPUGB[$g]:-0} -v m=${FITMAN:-0.75} 'BEGIN { exit !(g > 0 && f > m * g) }' && man=1
+    # FIT_MANAGED=1 (the last refit try of a failed slab) puts the fields in managed memory (fit picks it itself when they leave too little
+    # device headroom since 6126e23; this is the fallback)
+    local man=${FIT_MANAGED:-0}
     env UFSM_FIT_THREADS=${FTHREADS:-10} $([ "$man" = 1 ] && echo UFSM_FIT_MANAGED=1) /usr/bin/time -v nice -n 5 $U fit $d/f --gpu $g --out $d/fit --dir $dir --ref-model $REF --ref-snap 1 --uw-repair 0 ${FITX:-} > $d/fit.log 2>&1; rc=$?
     echo "$s $c0..$c1 rc $rc gpu $g $(( $(date +%s) - t0 ))s$([ "$man" = 1 ] && echo " managed")" >> $O/slabs.txt
     if [ $rc = 0 ]; then touch $d/done; elif grep -q "no data for the prior" $d/fit.log; then touch $d/empty $d/done; fi
@@ -212,9 +211,7 @@ lane() {   # lane GPU
   done
 }
 slabs() {
-  local g pids=() l
-  # the cards' memory (GB) by --gpu index, for the managed-memory rule (ufsm sysinfo: "gpu N: name, sm_X, S SMs, T GB (F GB free)")
-  declare -gA GPUGB; while read -r l; do [[ $l =~ ^gpu\ ([0-9]+):.*\ ([0-9.]+)\ GB\ \( ]] && GPUGB[${BASH_REMATCH[1]}]=${BASH_REMATCH[2]}; done < <($U sysinfo 2> /dev/null)
+  local g pids=()
   for g in $FITGPUS; do
     if [ "$g" = "$INKGPU" ] && ! done_ ink; then { [ "$DRY" = 1 ] && echo "    (GPU $g lane starts once the ink is done or failed)" || while ! done_ ink && ! stopped && [ ! -e $O/state/ink.failed ]; do sleep 30; done; lane $g; } &
     else lane $g & fi; pids+=($!)
