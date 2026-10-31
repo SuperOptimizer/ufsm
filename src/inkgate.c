@@ -70,7 +70,12 @@ static void *ig_worker(void *arg) {
     }
 done:
     free(p); free(g); free(o); free(ib); for (int d = 0; d < 3; d++) free(map[d]);
-    if (zp) z3_close(zp); if (zi) z3_close(zi); if (zg) z3_close(zg); if (sp) store_close(sp); if (si) store_close(si); if (sg) store_close(sg);
+    if (zp) { z3_close(zp); }
+    if (zi) { z3_close(zi); }
+    if (zg) { z3_close(zg); }
+    if (sp) { store_close(sp); }
+    if (si) { store_close(si); }
+    if (sg) { store_close(sg); }
     return nullptr;
 }
 
