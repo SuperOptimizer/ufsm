@@ -95,6 +95,74 @@ Drivers (resumable per stage; `STOP` files; MemAvailable gates):
 - `scripts/cfit/`: the Paris 4 coarse-to-fine scripts with GT scoring (`refs.sh`, `slabs.sh`, `join.sh`; `cropref.sh` the crop A/B).
 - `scripts/faces/faces_p4c.sh`, `scripts/strip/strip_run.sh`.
 
+## Pod runs
+
+The user rents the pods. These scripts make a fresh one ready and run a whole-scroll unroll within its limits; the scripts
+need nothing from the desk. Typical limits are 13-16 real CPUs, 62 GB RAM, a 48 GB MIG slice and 500 GB disk. nproc and free
+report the host (256 CPUs, 1 TB), so ufsm reads the cgroup instead: `ufsm sysinfo`.
+
+```sh
+# on the pod, as root (re-run any time: every step skips what is done)
+curl -sfO https://raw.githubusercontent.com/SuperOptimizer/ufsm/master/scripts/pod/setup.sh
+bash setup.sh PHerc1299        # limits, apt deps, clone + build master, smoke test, checkpoints, the scroll's CT from the mirror
+setsid nohup bash /root/pod/ufsm/scripts/pod/unroll.sh PHerc1299 > /root/pod/unroll-PHerc1299.out 2>&1 < /dev/null &
+tail -f /root/pod/unroll/PHerc1299/progress.log        # per-stage wall / CPU / max RSS in state/*.done; stop: touch .../STOP
+```
+
+`setup.sh` fetches everything from the public mirror, never via the desk. The mirror gives about 40 MB/s on a pod; desk -> pod
+rsync manages only about 1.6 MB/s.
+- Checkpoints: `ufsm/checkpoints/{wind96-wk1-best,ift3-24000}`.
+- The scan's CT levels LV..LV+3: `ufsm mirror`, resumable and verified.
+- Any published `ufsm-c2f-20261028` box / axis / ink of the scroll.
+- When no box is published, `ufsm scanprep --box-out` makes one: the corpus prep box (PHerc1299 reproduces the published box).
+- The scan comes from `scripts/unroll/scrolls.tsv` or `scripts/corpus/list.tsv`.
+
+Env: POD (/root/pod), BRANCH, NOAPT / NOBUILD / NOSMOKE, LEVELS, MTH (mirror threads, 12: the mirror answers 429 past 64
+requests in flight per IP). ARCH=86 is picked by itself on sm_80/86/89 GPUs (software MX).
+
+`unroll.sh` runs `scripts/unroll/unroll.sh` (the stages above, resumable) on the pod's local CT, on one GPU or MIG slice, with:
+- `TH` = the cgroup CPUs;
+- the MemAvailable gate from `ufsm sysinfo --avail-gb`;
+- count-field `--mem-gb` = min(24, 40% of the limit);
+- `UFSM_RENDER_MEM` = min(16, 25% of the limit);
+- no per-wrap renders (`PERWRAP=1` adds them).
+
+Every variable can be overridden from the environment. Disk for a Paris 4-size scroll: CT level 2 42 GB, fields 50 GB (deleted
+once the wraps exist), joined 10 GB, ink 1.5 GB.
+
+Peak RSS per stage. Measured with `scripts/pod/unroll.sh` on a Paris 4 crop: 1024 level-2 z of the papyrus box y 1024+7150,
+x 512+7424, so slab fits and predicts see the whole-scroll cross-section. The crop ran on the desk in
+`systemd-run --scope -p CPUQuota=1400% -p MemoryMax=60G`. The whole-scroll column holds Paris 4 runs where they exist
+(logs named), else estimates scaled by the strip's valid vertices (x18.5).
+
+| stage | command | crop | whole Paris 4 | grows with | cap / lever |
+|---|---|---|---|---|---|
+| fields | `predict --fit-zarr` (wind96) | 9.5 GB | ~9.5 GB | cross-section (one z slab of windows) | `--window` |
+| ink | `predict` x3 (ift3, 2 passes) | 1.8 GB | ~1.8 GB | window | |
+| ink blend | `ink-blend` | 1.2 GB | ~1.2 GB | tile | `--tile` |
+| ref | `count-field --model-only` | 23.2 GB | 24.5 GB (cfit/whole/ref-cf, 3 h) | `--mem-gb` (24) | `--mem-gb`, now <= 60% of what the cgroup allows |
+| slab fits | `fit --ref-model` (96 cells, full section) | 9.6 GB host; 12.7 GB GPU | same per slab | cross-section | GPU: full 8174^2 box ~16 GB OOMs a 16 GB card: crop to the papyrus box |
+| join | `fit-join --ref` | 2.7 GB | 11.6 GB (JDETAIL=0) | scroll | `--score-detail` costs 89 GB: off |
+| wraps | `wraps` | 2.1 GB | 11.6 GB (p4core) | scroll | `--first/--last`, `--zr` |
+| strip | `strip` | 1.9 GB | 33.6 GB (e2e validation) | valid vertices (~28 B each) | `--every 2` (4x less), `--first/--last` |
+| strip flatten | `strip-flatten` | 0.7 GB | ~13 GB (est.) | vertices | `--decim` |
+| stripe render | `render` (union box) | 15.2 GB | 29.3 GB (Paris 3, 60000 x 22361 px stripes) | `UFSM_RENDER_MEM` + stripe px (~19 B/px) | `UFSM_RENDER_MEM` (now <= 50% available), strip-flatten `--stripe-px` |
+| mosaic | `strip-mosaic` | 1.0 GB (1 thread), 4.5 GB (14) | ~5 GB per thread (est., 3.3 B/stripe px) | threads x stripe px | threads now capped by memory (70% available) |
+| per wrap | `render` / `ink-compare` / `flatten` | 0.8 / 0.25 / 0.43 GB | render <= `UFSM_RENDER_MEM` + output; ink-compare streamed 0.5 GB | wrap area | `UFSM_RENDER_MEM`, `--decim` |
+
+On a pod only ink (GPU) and ref (CPU) overlap, about 26 GB together. Every other stage runs alone. The largest are strip
+(34 GB) and a stripe render (~30 GB), both under 50 GB at Paris 4 size. For a scroll 1.3x taller (PHerc1447) strip would
+reach ~44 GB: use `strip --every 2` there.
+
+The crop is 1/18.5 of Paris 4. With 14 CPUs and one 16 GB GPU, its stage wall times were:
+- fields 4.5 min;
+- ink beside ref 7.6 min;
+- 8 slabs 4.5 min;
+- join + wraps 2.4 min;
+- strip + flatten + stripe images 5 min.
+
+Scaled up, whole Paris 4 takes about 7 h on such a pod. The global ref alone is ~3 h and does not split.
+
 ## Command reference
 
 Only the flags that matter for each stage; the usage strings list the rest.
