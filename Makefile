@@ -244,7 +244,7 @@ test-all: $(B)/test_flatten_gpu
 $(B)/test_strip: tests/test_strip.c $(B)/strip.o $(B)/flatten.o $(B)/imgops.o $(B)/jpegpar.o $(B)/tiffw.o $(B)/tiff.o $(B)/tfx.o $(B)/surfcomp.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
 test-all: $(B)/test_strip
-$(B)/test_strip_gpu: tests/test_strip.c $(B)/strip.o $(B)/flatten.o $(B)/imgops.o $(B)/tiffw.o $(B)/tiff.o $(B)/tfx.o $(B)/surfcomp.o $(B)/nn_flat.o
+$(B)/test_strip_gpu: tests/test_strip.c $(B)/strip.o $(B)/flatten.o $(B)/imgops.o $(B)/jpegpar.o $(B)/tiffw.o $(B)/tiff.o $(B)/tfx.o $(B)/surfcomp.o $(B)/nn_flat.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DSTRIP_GPU $^ -o $@ $(LDLIBS) $(CUDALIBS)
 test-all: $(B)/test_strip_gpu
 $(B)/test_faces: tests/test_faces.c $(B)/faces.o
