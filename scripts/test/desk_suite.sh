@@ -3,10 +3,11 @@
 # any clone. The commit is pushed over ssh into the desk's bare repo /vesuvius/ufsm/suite/repo.git (nothing has to be on GitHub),
 # exported to /vesuvius/ufsm/suite/<sha>, built (ccache, shared across the sha dirs) and tested at nice 10.
 #
-#   scripts/test/desk_suite.sh [-t fast|slow|all] [-j N] [-T N] [-m GB] [-b N] [-k] REF [REGEX...]
+#   scripts/test/desk_suite.sh [-t fast|slow|all] [-j N] [-T N] [-m GB] [-l LOAD] [-w MIN] [-b N] [-k] REF [REGEX...]
 #     REF     branch, tag or commit of the local repo (uncommitted changes are not sent)
 #     -t      tier (default fast = make test); -j / -T: runner jobs / threads per test (default 8 / 3)
-#     -m GB   the desk needs MemAvailable >= GB before building and testing (default 40; waits up to 30 min, then gives up)
+#     -m GB -l LOAD: before the build and before the tests the desk must have MemAvailable >= GB (default 40) and a 1-min
+#             load average <= LOAD (default 24 of 32 threads); -w MIN: wait that long for it (default 60), then give up (exit 3)
 #     -b N    build jobs (default 12); -k keeps the sha dir after a pass (failed runs are always kept)
 #     REGEX   only tests whose name matches (runner filter)
 #     env SUITE_ARGS: more runner options (e.g. "-P" profile, "-x 600")
@@ -16,10 +17,10 @@
 # /vesuvius/ufsm/suite/<sha>/out (the last 8 sha dirs are kept). Exit = the runner's (0 = all passed).
 set -u
 DESK=${DESK:-forrest@192.168.0.175}; ROOT=/vesuvius/ufsm/suite
-TIER=fast; J=8; T=3; MEMGB=40; BJ=12; KEEP=0
-while getopts "t:j:T:m:b:kh" o; do case $o in
-  t) TIER=$OPTARG;; j) J=$OPTARG;; T) T=$OPTARG;; m) MEMGB=$OPTARG;; b) BJ=$OPTARG;; k) KEEP=1;; *) sed -n '2,18p' "$0"; exit 2;; esac; done
-shift $((OPTIND - 1)); [ $# -ge 1 ] || { sed -n '2,18p' "$0"; exit 2; }
+TIER=fast; J=8; T=3; MEMGB=40; LOADMAX=24; WAITMIN=60; BJ=12; KEEP=0
+while getopts "t:j:T:m:l:w:b:kh" o; do case $o in
+  t) TIER=$OPTARG;; j) J=$OPTARG;; T) T=$OPTARG;; m) MEMGB=$OPTARG;; l) LOADMAX=$OPTARG;; w) WAITMIN=$OPTARG;; b) BJ=$OPTARG;; k) KEEP=1;; *) sed -n '2,19p' "$0"; exit 2;; esac; done
+shift $((OPTIND - 1)); [ $# -ge 1 ] || { sed -n '2,19p' "$0"; exit 2; }
 REF=$1; shift
 SHA=$(git rev-parse --verify "$REF^{commit}") || exit 2
 [[ $SHA =~ ^[0-9a-f]{40}$ ]] || exit 2
@@ -30,19 +31,22 @@ ssh -o ConnectTimeout=10 "$DESK" "mkdir -p $ROOT && { [ -d $ROOT/repo.git ] || g
 git push -q "$DESK:$ROOT/repo.git" "$SHA:refs/suite/${SHA:0:12}" 2>&1 | grep -v '^$' || true
 
 # (ssh joins the words into one string: quote each so empty ones survive)
-ssh -o ConnectTimeout=10 "$DESK" "bash -s -- $(printf '%q ' "$SHA" "$TIER" "$J" "$T" "$MEMGB" "$BJ" "$KEEP" "$FILT" "${SUITE_ARGS:-}")" <<'REMOTE'
+ssh -o ConnectTimeout=10 "$DESK" "bash -s -- $(printf '%q ' "$SHA" "$TIER" "$J" "$T" "$MEMGB" "$BJ" "$KEEP" "$FILT" "${SUITE_ARGS:-}" "$LOADMAX" "$WAITMIN")" <<'REMOTE'
 set -u
-SHA=$1 TIER=$2 J=$3 T=$4 MEMGB=$5 BJ=$6 KEEP=$7 FILT=$8 XARGS=$9
+SHA=$1 TIER=$2 J=$3 T=$4 MEMGB=$5 BJ=$6 KEEP=$7 FILT=$8 XARGS=$9 LOADMAX=${10} WAITMIN=${11}
 ROOT=/vesuvius/ufsm/suite; S=${SHA:0:12}; W=$ROOT/$S
 export PATH=/usr/local/cuda/bin:$PATH CCACHE_BASEDIR=$W CCACHE_NOHASHDIR=1
-memok() {   # wait (<= 30 min) for MemAvailable >= MEMGB
-  local i a; for ((i = 0; i < 60; i++)); do
-    a=$(awk '/^MemAvailable/ {print int($2 / 1048576)}' /proc/meminfo); [ "$a" -ge "$MEMGB" ] && return 0
-    [ $i = 0 ] && echo "desk_suite: MemAvailable ${a} GB < ${MEMGB} GB, waiting (<= 30 min)"; sleep 30; done
-  echo "desk_suite: MemAvailable still below ${MEMGB} GB: giving up (desk jobs come first)"; return 1; }
+deskok() {   # wait (<= WAITMIN) until MemAvailable >= MEMGB and the 1-min load <= LOADMAX: the desk's own jobs come first
+  local i a l n=$(( WAITMIN * 2 ))
+  for ((i = 0; i <= n; i++)); do
+    a=$(awk '/^MemAvailable/ {print int($2 / 1048576)}' /proc/meminfo); l=$(cut -d' ' -f1 /proc/loadavg)
+    [ "$a" -ge "$MEMGB" ] && awk -v l="$l" -v m="$LOADMAX" 'BEGIN {exit !(l <= m)}' && return 0
+    [ $i = 0 ] && echo "desk_suite: desk busy (MemAvailable ${a} GB, need ${MEMGB}; load ${l}, max ${LOADMAX}): waiting <= ${WAITMIN} min"
+    [ $i -lt $n ] && sleep 30; done
+  echo "desk_suite: desk still busy (MemAvailable ${a} GB, load ${l}): giving up, try later"; return 1; }
 exec 9> $ROOT/suite.lock
 flock -n 9 || { echo "desk_suite: another desk suite holds $ROOT/suite.lock: waiting"; flock 9; }
-memok || exit 3
+deskok || exit 3
 if [ ! -f $W/.built ]; then
   [ -d $W ] && rm -rf -- "$ROOT/$S"
   mkdir -p $W && git -C $ROOT/repo.git archive "$SHA" | tar -x -C $W || exit 2
@@ -52,7 +56,7 @@ if [ ! -f $W/.built ]; then
     echo "desk_suite: BUILD FAILED ($W/build.log):"; grep -E 'error|Error' $W/build.log | head -30; tail -n 15 $W/build.log; exit 2; fi
   touch $W/.built; echo "desk_suite: built in $(( $(date +%s) - t0 )) s"
 fi
-memok || exit 3
+deskok || exit 3
 G=$(nvidia-smi --query-gpu=index,memory.free --format=csv,noheader,nounits | awk -F', ' '$2 >= 3072' | sort -t, -k2,2nr | cut -d, -f1 | paste -sd, -)
 [ -z "$G" ] && { echo "desk_suite: no GPU with 3 GB free: GPU tests are skipped"; G=none; }
 rm -rf -- "$W/out"
