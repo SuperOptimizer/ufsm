@@ -746,6 +746,15 @@ int cmd_strip_mosaic(int argc, char **argv) {
     fclose(f);
     const double gs = ostep * pxs, pxum = um / pxs;   /* render pixels per grid step, um per pixel */
     fprintf(stderr, "strip-mosaic: %d stripes, %.2f um/px, CT level %d\n", ns, pxum, ctl);
+    {   /* each thread holds one stripe's CT + ink + mask (~3.3 B per render pixel; a whole-scroll stripe of 60000 x 24000 px: ~5 GB):
+           no more threads than 70% of the memory this process may still allocate allows (cgroup aware) */
+        double mpx = 0; for (int k = 0; k < ns; k++) { const double px = (double)st[k].gw * gs * st[k].gh * gs; if (px > mpx) mpx = px; }
+        const double av = (double)ufsm_mem_available(), per = 3.3 * mpx + 64e6;
+        if (av > 0 && per > 0 && nthr > 1 && nthr * per > 0.7 * av) {
+            int n = (int)(0.7 * av / per); if (n < 1) n = 1;
+            if (n < nthr) { fprintf(stderr, "strip-mosaic: %d threads (not %d): ~%.1f GB per stripe, %.1f GB available\n", n, nthr, per / 1e9, av / 1e9); nthr = n; }
+        }
+    }
     /* pass 1: global contrast (CT and ink over valid pixels); stripes on threads, each into its own histogram (integer counts: the sum
        is the same in any order) */
     double hc[256] = {0}, hi[256] = {0};
