@@ -228,6 +228,9 @@ test-all: $(B)/test_predict_unwrap2
 $(B)/test_predict_feather: tests/test_predict_feather.c $(B)/unet.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/z3w.o $(B)/nn.o $(B)/nn_fp8.o | $(B)/ufsm
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 test-all: $(B)/test_predict_feather
+$(B)/test_predict_det: tests/test_predict_det.c $(B)/unet.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/z3w.o $(B)/nn.o $(B)/nn_fp8.o | $(B)/ufsm
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
+test-all: $(B)/test_predict_det
 $(B)/test_tta: tests/test_tta.c $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 test-all: $(B)/test_tta
@@ -598,6 +601,7 @@ test-all: $(B)/test_gpu_aug $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover 
 	./$(B)/test_tta
 	./$(B)/test_predict_unwrap2 ./$(B)/ufsm
 	./$(B)/test_predict_feather ./$(B)/ufsm
+	./$(B)/test_predict_det ./$(B)/ufsm
 	./$(B)/test_coreline
 	./$(B)/test_fit_w4
 	./$(B)/test_repair
