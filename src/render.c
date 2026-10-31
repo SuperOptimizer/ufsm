@@ -10,6 +10,7 @@
    the per-wrap ufsm render's (render_rows / trilin in main.c) on the same float32 coordinates xform_wraps.py wrote, so the
    renders are bit-identical to it; the overlay is overlay_red.py's (imgops.c). */
 #include "imgops.h"
+#include "sysinfo.h"
 #include "store.h"
 #include "tiffw.h"
 #include "zarr3.h"
@@ -538,7 +539,7 @@ int cmd_render_sheets(int argc, char **argv) {
     const char *src = argv[2], *out = argv[3], *isrc = ropt(argc, argv, "--ink-tifxyz", src), *prefix = ropt(argc, argv, "--prefix", ""), *keep = ropt(argc, argv, "--keep-tif", nullptr);
     const double cdiv = atof(ropt(argc, argv, "--ct-div", "2")), idiv = atof(ropt(argc, argv, "--ink-div", "4")), mem = atof(ropt(argc, argv, "--mem", "4"));
     int cdepth = atoi(ropt(argc, argv, "--ct-depth", "3")), idepth[3]; const int nink = parse_ints(ropt(argc, argv, "--ink-depths", "5,3,1"), idepth, 3);
-    const int nthreads = atoi(ropt(argc, argv, "--threads", "12")), top = atoi(ropt(argc, argv, "--top", "0")), strip_w = rflag(argc, argv, "--strip-w"), skip = rflag(argc, argv, "--skip-existing");
+    const int nthreads = ufsm_threads(atoi(ropt(argc, argv, "--threads", "0")), 12), top = atoi(ropt(argc, argv, "--top", "0")), strip_w = rflag(argc, argv, "--strip-w"), skip = rflag(argc, argv, "--skip-existing");
     const double min_cm2 = atof(ropt(argc, argv, "--min-cm2", "0"));
     const int ci = rarg(argc, argv, "--ct"), ii = rarg(argc, argv, "--ink"); const char *cache = ropt(argc, argv, "--cache", nullptr);
     if (ci + 2 >= argc || ii + 2 >= argc || nink < 1 || cdiv <= 0 || idiv <= 0 || cdepth < 0) { fprintf(stderr, "render-sheets: bad options\n"); return 2; }
@@ -610,7 +611,7 @@ int cmd_overlay_red(int argc, char **argv) {
     if (argc < 5) { fprintf(stderr, "usage: ufsm overlay-red <ct-dir> <ink-dir> <out-dir> [<ink2-dir> [<ink3-dir>]] [--strip-w] [--skip-existing] [--threads 12]\n"); return 2; }
     const char *dirs[3] = {argv[3], nullptr, nullptr}; int nink = 1;
     for (int a = 5; a < argc && nink < 3; a++) { if (argv[a][0] == '-') { if (!strcmp(argv[a], "--threads")) a++; continue; } dirs[nink++] = argv[a]; }
-    const int strip_w = rflag(argc, argv, "--strip-w"), skip = rflag(argc, argv, "--skip-existing"), nthreads = atoi(ropt(argc, argv, "--threads", "12"));
+    const int strip_w = rflag(argc, argv, "--strip-w"), skip = rflag(argc, argv, "--skip-existing"), nthreads = ufsm_threads(atoi(ropt(argc, argv, "--threads", "0")), 12);
     char p[1400]; snprintf(p, sizeof p, "mkdir -p '%s'", argv[4]); if (system(p)) return 1;
     DIR *dd = opendir(argv[2]); if (!dd) { fprintf(stderr, "overlay-red: cannot open %s\n", argv[2]); return 1; }
     int n = 0, cap = 64; char **names = malloc(cap * sizeof *names); struct dirent *de;
@@ -783,7 +784,7 @@ int ink_compare_mem(int argc, char **argv) {   /* the in-memory version (inkcomp
         fprintf(stderr, "usage: ufsm ink-compare <out.jpg> --ct CT.tif --ink LABEL=INK.tif [--ink LABEL=INK.tif ..] [--px-um 2.4] [--rs-um 25] [--rl-um 500] [--crop x,y,w,h | --crop-frac fx,fy,w,h | --best-crop N] [--stretch | --fixed LO,HI] [--stretch-ct] [--full] [--each PREFIX [--each-suffix S] [--each-ct]] [--rgb-agree RECTO,VERSO] [--diff-agree RECTO,VERSO [--diff-gain 1]] [--papyrus INK [--papyrus-gain 1] [--papyrus-floor median|V] [--papyrus-bg G|median]] [--cmap viridis] [--no-ct] [--rgb-ct-min 1] [--max-px N] [--quality 90] [--threads 16]\n"); return 2;
     }
     const double px = atof(ropt(argc, argv, "--px-um", "2.4")), rsu = atof(ropt(argc, argv, "--rs-um", "25")), rlu = atof(ropt(argc, argv, "--rl-um", "500"));
-    const int nthreads = atoi(ropt(argc, argv, "--threads", "16"));
+    const int nthreads = ufsm_threads(atoi(ropt(argc, argv, "--threads", "0")), 16);
     if (!(px > 0) || !(rsu > 0) || !(rlu > rsu)) { fprintf(stderr, "ink-compare: need --px-um > 0 and 0 < --rs-um < --rl-um\n"); return 2; }
     enum { MAXI = 8 }; const uint8_t *img[MAXI + 1] = {0}; int isct[MAXI + 1] = {1}; const char *lab[MAXI + 1] = {"ct"}; int n = 1, W, H, rc = 0;
     uint8_t *ct = img_read_u8(argv[ci + 1], &W, &H);

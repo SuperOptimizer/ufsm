@@ -14,6 +14,7 @@
    < 64 voxels dropped; negated on inward rays so ph rises along +k; comp ids from 1 (uint16, 0 none). pw = 1 on comp, 0 in the tubes.
    A slab with < 1% labelled voxels is redrawn (up to 16 times). */
 #include "vwt.h"
+#include "sysinfo.h"
 #include "vwt_aug.h"
 #include "zcache.h"
 int jpeg_write_rgb(const char *path, int w, int h, const uint8_t *rgb, int quality);   /* (imgops.h) */
@@ -563,7 +564,7 @@ int cmd_vwt_sample(int argc, char **argv) {
     for (int i = 5; i < argc; i++) if (!strncmp(argv[i], "--vaug", 6) || !strncmp(argv[i], "--deform", 8) || !strncmp(argv[i], "--aug-crush", 11)) { vws_set_args(argc, argv); break; }
     const int jpg = atoi(vo(argc, argv, "--jpg", "0"));
     const int T = atoi(vo(argc, argv, "--T", "128")), L = atoi(vo(argc, argv, "--L", "384")), N = atoi(argv[4]), wr = atoi(vo(argc, argv, "--write", "1"));
-    vws *V = vws_open(argv[2], T, L, (float)atof(vo(argc, argv, "--tilt", "15")), atoi(vo(argc, argv, "--threads", "8")), (unsigned)atoi(vo(argc, argv, "--seed", "1")), !atoi(vo(argc, argv, "--val", "0")));
+    vws *V = vws_open(argv[2], T, L, (float)atof(vo(argc, argv, "--tilt", "15")), ufsm_threads(atoi(vo(argc, argv, "--threads", "0")), 8), (unsigned)atoi(vo(argc, argv, "--seed", "1")), !atoi(vo(argc, argv, "--val", "0")));
     if (!V) return 1;
     mkdir(argv[3], 0775); char p[1400]; snprintf(p, sizeof p, "%s/meta.tsv", argv[3]); FILE *m = fopen(p, "w");
     if (m) fprintf(m, "i\tsrc\tinward\to_x\to_y\to_z\td_x\td_y\td_z\tlabelled\tweighted\tcomps\tph_rise\tshell\n");

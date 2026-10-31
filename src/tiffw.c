@@ -1,4 +1,5 @@
 #include "tiffw.h"
+#include "sysinfo.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -42,7 +43,7 @@ int tiffw_write(const char *path, int w, int h, int fmt, const void *data, int d
     if (w <= 0 || h <= 0 || (fmt != 1 && fmt != 3)) return -1;
     const int bps = fmt == 1 ? 1 : 4, rps = 64, ns = (h + rps - 1) / rps;
     const size_t row = (size_t)w * bps;
-    long nc = sysconf(_SC_NPROCESSORS_ONLN); const char *te = getenv("UFSM_TIFF_THREADS"); if (te && atoi(te) > 0) nc = atoi(te);
+    long nc = ufsm_ncpu(); const char *te = getenv("UFSM_TIFF_THREADS"); if (te && atoi(te) > 0) nc = atoi(te);
     const int nt = nc < 1 ? 1 : nc > 16 ? 16 : (int)nc, win = nt * 4;
     uint32_t *len = calloc(ns, sizeof *len), *soff = calloc(ns, sizeof *soff); uint8_t **strip = calloc(win, sizeof *strip), *done = calloc(win, 1);
     FILE *f = len && soff && strip && done ? fopen(path, "wb") : nullptr;

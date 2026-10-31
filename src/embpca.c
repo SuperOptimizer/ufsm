@@ -6,6 +6,7 @@
    GROUP: a dinovol-embed output group (its zarr.json attributes give box_zyx); only the box's cells are read (--box: another box, e.g. one z slab of a
    whole-scroll group; OUTGROUP may be shared by several applies whose boxes cover whole 512-voxel shard layers). Streams one 16-cell z layer at a time. */
 #include "embz.h"
+#include "sysinfo.h"
 #include "fit_emb.h"
 #include "json.h"
 #include <errno.h>
@@ -75,7 +76,7 @@ static void *acc_main(void *a) {
 
 static int pca_fit(int argc, char **argv) {
     const char *outp = argv[3], *name = popt(argc, argv, "--name", "tokens_unit");
-    const int k = atoi(popt(argc, argv, "--k", "64")), nt0 = atoi(popt(argc, argv, "--threads", "8")); const size_t per = (size_t)atoll(popt(argc, argv, "--per", "50000"));
+    const int k = atoi(popt(argc, argv, "--k", "64")), nt0 = ufsm_threads(atoi(popt(argc, argv, "--threads", "0")), 8); const size_t per = (size_t)atoll(popt(argc, argv, "--per", "50000"));
     const int nt = nt0 < 1 ? 1 : nt0 > 64 ? 64 : nt0;
     int C = 0, ng = 0; double *S = nullptr, *Q = nullptr; double wsum = 0;
     for (int a = 4; a < argc; a++) {
@@ -145,7 +146,7 @@ static void *prj_main(void *p) {
 static int pca_apply(int argc, char **argv) {
     if (argc < 6) return 2;
     const char *bp = argv[3], *group = argv[4], *outg = argv[5], *name = popt(argc, argv, "--name", "tokens_unit"), *oname = popt(argc, argv, "--out-name", "pca64");
-    const int nt0 = atoi(popt(argc, argv, "--threads", "8")), nt = nt0 < 1 ? 1 : nt0 > 64 ? 64 : nt0;
+    const int nt0 = ufsm_threads(atoi(popt(argc, argv, "--threads", "0")), 8), nt = nt0 < 1 ? 1 : nt0 > 64 ? 64 : nt0;
     json *bj = jload(bp); if (!bj) { fprintf(stderr, "emb-pca: cannot read %s\n", bp); return 1; }
     const int C = (int)json_num(json_path(bj, "C"), 0), k = (int)json_num(json_path(bj, "k"), 0);
     float *B = malloc((size_t)k * C * sizeof *B), *mean = malloc(C * sizeof *mean);

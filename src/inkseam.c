@@ -11,17 +11,20 @@
    predict. Samples --n present shards that have present neighbours, reads a period^3 cube centred on a window corner (borders at
    offset + k * period) and reports, per axis, the mean |v(b) - v(b - 1)| across the border plane against the same across every other
    plane of the cube (both over voxel pairs with max >= --min, i.e. not air), plus the mean signed brightness step of the border planes.
-   "jump" = border - interior (the ~30 / 9.4 / 6 numbers of the Paris 4 ink notes), "ratio" = border / interior. */
+   "jump" = border - interior (the ~30 / 9.4 / 6 numbers of the Paris 4 ink notes), "ratio" = border / interior. --block K: the interior
+   planes only those at the border's phase mod K (16 = the volcomp codec block faces, whose own step is part of every 512 border). */
 static double ns_opt(int argc, char **argv, const char *k, double d) {
     for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], k)) return atof(argv[i + 1]);
     return d;
 }
 int cmd_ink_seam(int argc, char **argv) {
     if (argc < 3 || argv[2][0] == '-') {
-        fprintf(stderr, "usage: ufsm ink-seam ZARR --um U [--key ARRAY] [--period 512] [--offset 0] [--n 24] [--min 16] [--seed 1] [--threads 16]\n"); return 2; }
+        fprintf(stderr, "usage: ufsm ink-seam ZARR --um U [--key ARRAY] [--period 512] [--offset 0] [--n 24] [--min 16] [--block 0] [--seed 1] [--threads 16]\n"); return 2; }
     const char *in = argv[2]; const double um = ns_opt(argc, argv, "--um", 0);
     const int P = (int)ns_opt(argc, argv, "--period", 512), off = (int)ns_opt(argc, argv, "--offset", 0), N = (int)ns_opt(argc, argv, "--n", 24),
-              mn = (int)ns_opt(argc, argv, "--min", 16), nt = (int)ns_opt(argc, argv, "--threads", 16);
+              mn = (int)ns_opt(argc, argv, "--min", 16), nt = (int)ns_opt(argc, argv, "--threads", 16),
+              blk = (int)ns_opt(argc, argv, "--block", 0);   /* --block K: interior = only the planes at the border's phase mod K (16: the volcomp
+                                                                    codec block faces of the CT and of a lossy output, ~7 on Paris 4 ink, not ~3) */
     unsigned seed = (unsigned)ns_opt(argc, argv, "--seed", 1);
     if (um <= 0 || P < 8 || P % 2) { fprintf(stderr, "ink-seam: --um > 0 and an even --period >= 8\n"); return 2; }
     char lv[256]; z3w_level_name(um, lv, sizeof lv);
@@ -63,7 +66,7 @@ int cmd_ink_seam(int argc, char **argv) {
                     if ((a > bb ? a : bb) < mn) continue;
                     sa += abs(bb - a); sd += bb - a; c++;
                 }
-                if (k == P / 2) { cb[d] += sa; cbn[d] += c; cs[d] += c ? fabs(sd / c) : 0; } else { ci[d] += sa; cin[d] += c; }
+                if (k == P / 2) { cb[d] += sa; cbn[d] += c; cs[d] += c ? fabs(sd / c) : 0; } else if (blk <= 0 || (k - P / 2) % blk == 0) { ci[d] += sa; cin[d] += c; }
             }
         for (int d = 0; d < 3; d++) { bs[d] += cb[d]; bn[d] += cbn[d]; is[d] += ci[d]; in_[d] += cin[d]; sg[d] += cs[d]; }
         got++;

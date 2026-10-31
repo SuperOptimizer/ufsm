@@ -1,6 +1,7 @@
 /* Winding fitter host side (src/fit.h): label-free prior per z knot (pitch from the spacing field, refined by the phase
    coherence of r / pitch - dir theta / 2 pi; offset = its argument), then Adam on delta (coarse to fine) and the knots. */
 #include "fit.h"
+#include "sysinfo.h"
 #include "fit_terms.h"
 #include "nn.h"
 #include "json.h"
@@ -305,7 +306,7 @@ static void *fit_zrun(void *a) { fit_zjob *j = a; j->fn(j->ctx, j->z0, j->z1, j-
 static int g_fit_threads;   /* fit_cfg threads of the current fit (0: the core count) */
 void fit_set_threads(int n) { g_fit_threads = n; }
 static int fit_nthreads(int D) {
-    long n = sysconf(_SC_NPROCESSORS_ONLN); const char *e = getenv("UFSM_FIT_THREADS"); if (e && atoi(e) > 0) n = atoi(e);
+    long n = ufsm_ncpu(); const char *e = getenv("UFSM_FIT_THREADS"); if (e && atoi(e) > 0) n = atoi(e);
     if (g_fit_threads > 0) n = g_fit_threads;
     if (n > 64) n = 64;
     if (n > D) n = D;
@@ -1881,6 +1882,7 @@ static fit_model *fit_run_dir(const fit_fields *f, const fit_cfg *c) {
             else if (cpu) { for (int k = 0; k < 10; k++) pa[k] = phost[k] = pp.a[k]; }
             else {
                 pdev = nn_malloc(10 * np);
+                if (!pdev) { fprintf(stderr, "fit: out of GPU memory for the fields pooled by %d (%.1f GB): crop the fields in y / x (the papyrus box) or use a larger GPU\n", fp, 10.0 * np / 1e9); fit_free(m); return nullptr; }
                 for (int k = 0; k < 10; k++) { nn_h2d(pdev + k * np, pp.a[k], np); pa[k] = pdev + k * np; if (sq < 0) free(pp.a[k]); }
             }
             fd.D = pp.D; fd.H = pp.H; fd.W = pp.W; fd.h = (float)(f->h * fp);

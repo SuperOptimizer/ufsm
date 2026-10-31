@@ -19,6 +19,7 @@
    --boxes FILE: the candidates are another run's boxes.json centres (in its order) with its splits; --lut FILE: that run's intensity_map.json
    is copied as this run's (the own fit goes to intensity_map.own.json). */
 #include "reg.h"
+#include "sysinfo.h"
 #include "json.h"
 #include "z3w.h"
 #include <math.h>
@@ -160,7 +161,7 @@ int cmd_sr_pairs(int argc, char **argv) {
     if (rcover_load(&j->cov, pd, atof(opt(argc, argv, "--cover-mm", "1.2")) * 1000 / j->cv->um, atof(opt(argc, argv, "--tol-um", "2.4")) / j->cv->um)) return 1;
     j->B = atoi(opt(argc, argv, "--in", "64")); j->T = 4 * j->B; j->want = atoi(opt(argc, argv, "--n", "500")); j->minfrac = atof(opt(argc, argv, "--minfrac", "0.9")); j->warp = atoi(opt(argc, argv, "--warp-input", "0")) != 0;
     const double S = atof(opt(argc, argv, "--spacing", "128")), hold = atof(opt(argc, argv, "--holdout", "0.15"));
-    const int nt = atoi(opt(argc, argv, "--threads", "12")); const unsigned seed = (unsigned)atoi(opt(argc, argv, "--seed", "1"));
+    const int nt = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 12); const unsigned seed = (unsigned)atoi(opt(argc, argv, "--seed", "1"));
     /* overlap (native L0) and candidate centres */
     const int64_t *fs = j->fv->shape[0], *cs = j->cv->shape[0];
     double lo[3] = {1e300, 1e300, 1e300}, hi[3] = {-1e300, -1e300, -1e300};

@@ -1,13 +1,15 @@
-# scripts/corpus/inklib.sh: the 2-pass ift3-24000 ink of one scroll, shared by the ink lanes (laptop.sh; fdink.sh: one per forlindesk
+# scripts/corpus/inklib.sh: the seam-free single-pass ift3-24000 ink of one scroll, shared by the ink lanes (laptop.sh; fdink.sh: one per forlindesk
 # 3090; sourced after common.sh). The caller sets ME (the claim owner: laptop, fd-g0, ..), GPU, INKCK, CTLOCAL (1: the CT from the local
 # list.tsv root, else the mirror over HTTP) and defines fdsh CMD (a shell on forlindesk), gpu_run CMD.. (one GPU command: its queue /
 # preemption) and cpu_run CMD.. (the CPU blend).
 # Claims: atomic mkdir forlindesk:<S>/state/ink.lock (+ owner), reachable from every ink host (forlindesk cannot ssh to the desk; the
 # desk pulls forlindesk's inks). Order: scrolls without ink first, then those marked forlindesk:<S>/state/ink.redo (single-pass inks).
-# Ink: GroupNorm statistics frozen per scroll (predict --gn-save over a 2048-voxel z band through the middle of the box), then pass A
-# (window 640 halo 64, 512^3 shards, --full-grid) and pass B (the box + 256 voxels in z / y / x, box-local), blended by ufsm ink-blend
-# (sin^2 tile weights): window-border jumps 26.7 -> 5.8 on 0125 (= the 5.5 of planes away from any border; ufsm ink-seam). Every
-# predict --resumes, so a killed pass continues where it stopped. INKA: pass A's zarr (ink.zarr; the desk: inka.zarr, its ink.zarr is the delivered ink).
+# Ink: GroupNorm statistics frozen per scroll (predict --gn-save over a 2048-voxel z band through the middle of the box), then ONE pass
+# with feathered windows (predict --feather 32: window 576 halo 32, 512^3 shards, --full-grid; each window border blended over 32 voxels
+# from the earlier window's halo prediction) straight into inkbl.zarr. Paris 4 crops (10-30, ufsm ink-seam --block 16): border jump
+# 20.2 (halo 0) / 6.3 (halo 64) -> 0.0, the same as the old 2-pass A + B + ink-blend (0.0) at ~1/3 of its GPU time and no blend.
+# INKW / INKH / INKF override window / halo / feather (e.g. 1088 / 32 / 32 on 24 GB GPUs: interior 1024, 1.2x a halo-0 pass).
+# The predict --resumes, so a killed pass continues where it stopped (the done windows' spills are recomputed).
 ink_lock() {   # this host owns S's ink (taken now, or earlier by this host)
   local o; o=$(fdsh "d=$FDC/$S/state; mkdir -p \$d; mkdir \$d/ink.lock 2> /dev/null && echo $ME > \$d/ink.lock/owner; cat \$d/ink.lock/owner 2> /dev/null") || return 1
   [ "$o" = "$ME" ]
@@ -21,20 +23,15 @@ ink_compute() {   # ink_compute BOX -> $O/inkbl.zarr (+ blend.done); resumable a
   local box=$1 cal bb bo ctr=$MIRROR ctk=$MK; [ "${CTLOCAL:-0}" = 1 ] && { ctr=$R; ctk=$K; }   # (the CT: the mirror over HTTP, or the local copy)
   [ -e $O/blend.done ] && return 0
   cal=$(echo $box | awk -F, '{ zc = $1 + int($4 / 2); z0 = zc - 1024; if (z0 < $1) z0 = $1; nz = 2048; if (nz > $4) nz = $4; printf "%d,%d,%d,%d,%d,%d", z0, $2, $3, nz, $5, $6 }')
-  bb=$(echo $box | awk -F, '{ printf "%d,%d,%d,%d,%d,%d", $1 + 256, $2 + 256, $3 + 256, $4 - 256, $5 - 256, $6 - 256 }'); bo=$(echo $bb | cut -d, -f1-3)
   rm -rf $O/gncal.zarr
   if [ ! -s $O/gn.bin ]; then
     gpu_run $U predict $INKCK $ctr $ctk $O/gncal.zarr --um $UM --level $LV --box $cal --shard 512 --window 640 --halo 64 --ema 1 --q 32 --threads 12 \
       --gpu $GPU --full-grid 1 --occupancy 5 --levels 1 --no-out 1 --gn-save $O/gn.tmp > $O/logs/ink-gn.log 2>&1 && mv $O/gn.tmp $O/gn.bin || return 1
   fi
-  gpu_run $U predict $INKCK $ctr $ctk $O/${INKA:-ink.zarr} --um $UM --level $LV --box $box --shard 512 --window 640 --halo 64 --ema 1 --q 32 --threads 12 \
-    --gpu $GPU --full-grid 1 --resume 1 --occupancy 5 --levels 4 --gn-frozen $O/gn.bin >> $O/logs/ink.log 2>&1 || return 1
-  gpu_run $U predict $INKCK $ctr $ctk $O/inkb.zarr --um $UM --level $LV --box $bb --shard 512 --window 640 --halo 64 --ema 1 --q 32 --threads 12 \
-    --gpu $GPU --resume 1 --occupancy 5 --levels 1 --gn-frozen $O/gn.bin >> $O/logs/inkb.log 2>&1 || return 1
-  rm -rf $O/gncal.zarr $O/inkbl.zarr
-  cpu_run $U ink-blend $O/inkbl.zarr --um $LUM --tile 512,512,512 --grids 0,0,0:256,256,256 --origins 0,0,0:$bo --levels 4 --shard 512 --q 32 --threads 12 \
-    $O/${INKA:-ink.zarr} $O/inkb.zarr > $O/logs/blend.log 2>&1 || return 1
-  touch $O/blend.done; rm -rf $O/${INKA:-ink.zarr} $O/inkb.zarr
+  gpu_run $U predict $INKCK $ctr $ctk $O/inkbl.zarr --um $UM --level $LV --box $box --shard 512 --window ${INKW:-576} --halo ${INKH:-32} --feather ${INKF:-32} \
+    --ema 1 --q 32 --threads 12 --gpu $GPU --full-grid 1 --resume 1 --occupancy 5 --levels 4 --gn-frozen $O/gn.bin >> $O/logs/ink.log 2>&1 || return 1
+  rm -rf $O/gncal.zarr
+  touch $O/blend.done
 }
 ink_loop() {   # ink_loop BOXCMD PUSHFN: claims and inks scrolls until none is left; BOXCMD prints S's box, PUSHFN delivers $O/inkbl.zarr
   local boxcmd=$1 push=$2 S0 box k n left
