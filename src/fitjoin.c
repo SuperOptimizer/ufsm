@@ -65,44 +65,117 @@ static void fj_rows(void *ctx, int c0, int c1, int t) {
     }
 }
 
-/* sample the cells of field rows [fz0, fz1) with material and phase confidence >= minc (about nsamp of them) and histogram the
-   rounded differences into H (nullptr: none); ph / phw (optional): the confidence-weighted phasor sum of the differences and the weight */
-static int fj_sample(const char *fdir, int fz0, int fz1, double minc, long long nsamp, const fit_model *a, double za, const fit_model *b, double zb,
-                     const fit_set *ref, const double *ro, double bias, double h, fj_hist *H, double complex *ph, double *phw) {
-    fit_fields_buf f; if (fit_fields_load(fdir, fz0, fz1, 1, &f)) return -1;
-    const size_t HW = (size_t)f.shape[1] * f.shape[2], n = (size_t)(fz1 - fz0) * HW;
-    size_t cand = 0; for (size_t i = 0; i < n; i++) cand += f.f.w[i] != 0;
-    const size_t stride = cand > (size_t)nsamp ? cand / (size_t)nsamp : 1;
-    size_t seen = 0, ni = 0;
-    double *dv = malloc(sizeof(double) * (cand / stride + 2)); size_t *iv = malloc(sizeof(size_t) * (cand / stride + 2)); float *cw = malloc(sizeof(float) * (cand / stride + 2));
-    for (size_t i = 0; i < n; i++) {   /* the sampled cells, in cell order */
-        if (!f.f.w[i]) continue;
-        if (seen++ % stride) continue;
-        const double c = (f.f.pc[i] - 128) / 127.0, sn = (f.f.ps[i] - 128) / 127.0;
-        if (c * c + sn * sn < minc * minc) continue;
-        cw[ni] = (float)sqrt(c * c + sn * sn); iv[ni++] = i;
+/* The field rows of the box through a cache of two chunk-aligned row blocks: the requests run in z order (cmd_fit_join's sweep), so
+   each chunk row is decoded once for the whole join (the boundaries' and the ref's rows used to decode their chunk rows again per request,
+   ~7 times each). The rows equal fit_fields_load's of the same range (loads of chunk-aligned rows decode straight into the block). */
+typedef struct { const char *dir; int cz, D; long long zoff; long tick; struct { int b0, b1; long use; fit_fields_buf f; } s[2]; } fj_cache;
+static int fj_block(fj_cache *C, int j, int keep) {   /* the slot holding block j (loaded on a miss into the least recent slot other than keep) */
+    for (int q = 0; q < 2; q++) if (C->s[q].f.a[9] && C->s[q].b0 == (int)((long long)j * C->cz - C->zoff < 0 ? 0 : (long long)j * C->cz - C->zoff)) { C->s[q].use = ++C->tick; return q; }
+    int q = !C->s[0].f.a[9] ? 0 : !C->s[1].f.a[9] ? 1 : C->s[0].use <= C->s[1].use ? 0 : 1;
+    if (q == keep) q = !q;
+    fit_fields_free(&C->s[q].f);
+    long long b0 = (long long)j * C->cz - C->zoff, b1 = b0 + C->cz; if (b0 < 0) b0 = 0; if (b1 > C->D) b1 = C->D;
+    if (fit_fields_load(C->dir, (int)b0, (int)b1, 1, &C->s[q].f)) return -1;
+    C->s[q].b0 = (int)b0; C->s[q].b1 = (int)b1; C->s[q].use = ++C->tick;
+    return q;
+}
+/* rows [fz0, fz1) (at most two blocks): *v views the pc ps w planes (own[3]: buffers to free when the rows span two blocks) */
+static int fj_rows_get(fj_cache *C, int fz0, int fz1, fit_fields *v, uint8_t *own[3]) {
+    const int j0 = (int)((fz0 + C->zoff) / C->cz), j1 = (int)((fz1 - 1 + C->zoff) / C->cz); own[0] = own[1] = own[2] = nullptr;
+    if (j1 - j0 > 1) return -1;
+    const int q0 = fj_block(C, j0, -1); if (q0 < 0) return -1;
+    const fit_fields_buf *A = &C->s[q0].f; const size_t plane = (size_t)A->shape[1] * A->shape[2];
+    memset(v, 0, sizeof *v); v->D = fz1 - fz0; v->H = A->shape[1]; v->W = A->shape[2]; v->h = A->h;
+    if (j1 == j0) {
+        const size_t o = (size_t)(fz0 - C->s[q0].b0) * plane; v->pc = A->a[0] + o; v->ps = A->a[1] + o; v->w = A->a[9] + o;
+        return 0;
     }
-    fj_job J = {a, b, za, zb, h, fz0, HW, f.shape[1], f.shape[2], iv, dv, ni, ref, ro, bias};
-    fit_par((int)((ni + 4095) / 4096), fj_rows, &J);   /* (differences on threads, written by position) */
-    long *rv = malloc(sizeof(long) * (ni + 1)); size_t nd = 0;
-    for (size_t q = 0; q < ni; q++) {
-        const double d = dv[q]; if (!isfinite(d)) continue;
-        const long r = lround(d); rv[nd++] = 2 * r + (fabs(d - r) < 0.25);   /* (value, near flag) packed: sorts by the value */
-        if (ph) { *ph += cw[q] * cexp(2 * M_PI * I * d); *phw += cw[q]; }
+    const int q1 = fj_block(C, j1, q0); if (q1 < 0) return -1;
+    const fit_fields_buf *B = &C->s[q1].f; const int na = C->s[q0].b1 - fz0, nb = fz1 - C->s[q1].b0;
+    const int pk[3] = {0, 1, 9};
+    for (int k = 0; k < 3; k++) {
+        own[k] = malloc((size_t)(na + nb) * plane);
+        memcpy(own[k], A->a[pk[k]] + (size_t)(fz0 - C->s[q0].b0) * plane, (size_t)na * plane); memcpy(own[k] + (size_t)na * plane, B->a[pk[k]], (size_t)nb * plane);
     }
-    free(iv); free(dv); free(cw); fit_fields_free(&f);
-    if (H) {
-        qsort(rv, nd, sizeof(long), cmp_long);
-        memset(H, 0, sizeof *H); H->v = malloc(sizeof(long) * (nd + 1)); H->c = calloc(nd + 1, sizeof(long long)); H->cn = calloc(nd + 1, sizeof(long long));
-        for (size_t i = 0; i < nd; i++) {
-            const long v = rv[i] >> 1;   /* (arithmetic shift: floor) */
-            if (!H->n || H->v[H->n - 1] != v) { H->v[H->n] = v; H->n++; }
-            H->c[H->n - 1]++; H->cn[H->n - 1] += rv[i] & 1;
-        }
-        H->tot = (long long)nd;
-    }
-    free(rv);
+    v->pc = own[0]; v->ps = own[1]; v->w = own[2];
     return 0;
+}
+
+/* the sampled cells of rows with material and phase confidence >= minc: every stride-th material cell in cell order (stride = material
+   cells / nsamp), on threads: per chunk of cells its material count, the prefix gives each chunk's first index, so the picks and
+   their order equal the serial scan's */
+enum { FJ_CH = 1 << 20 };
+typedef struct { const fit_fields *f; size_t n, stride; double minc; size_t *cnt, *seen0, **iv, *ni; float **cw; } fj_cells_job;
+static void fj_cells_count(void *a, int c0, int c1, int t) {
+    const fj_cells_job *J = a; (void)t;
+    for (int c = c0; c < c1; c++) { size_t s = 0; const size_t e = ((size_t)c + 1) * FJ_CH < J->n ? ((size_t)c + 1) * FJ_CH : J->n; for (size_t i = (size_t)c * FJ_CH; i < e; i++) s += J->f->w[i] != 0; J->cnt[c] = s; }
+}
+static void fj_cells_pick(void *a, int c0, int c1, int t) {
+    const fj_cells_job *J = a; (void)t; const fit_fields *f = J->f;
+    for (int c = c0; c < c1; c++) {
+        const size_t e = ((size_t)c + 1) * FJ_CH < J->n ? ((size_t)c + 1) * FJ_CH : J->n, cap = J->cnt[c] / J->stride + 2; size_t seen = J->seen0[c], ni = 0;
+        size_t *iv = malloc(sizeof(size_t) * cap); float *cw = malloc(sizeof(float) * cap);
+        for (size_t i = (size_t)c * FJ_CH; i < e; i++) {
+            if (!f->w[i]) continue;
+            if (seen++ % J->stride) continue;
+            const double cc = (f->pc[i] - 128) / 127.0, sn = (f->ps[i] - 128) / 127.0;
+            if (cc * cc + sn * sn < J->minc * J->minc) continue;
+            cw[ni] = (float)sqrt(cc * cc + sn * sn); iv[ni++] = i;
+        }
+        J->iv[c] = iv; J->cw[c] = cw; J->ni[c] = ni;
+    }
+}
+static size_t fj_cells(const fit_fields *f, size_t n, double minc, long long nsamp, size_t **iv_, float **cw_) {
+    const int nch = (int)((n + FJ_CH - 1) / FJ_CH);
+    fj_cells_job J = {f, n, 1, minc, calloc(nch + 1, sizeof(size_t)), calloc(nch + 1, sizeof(size_t)), calloc(nch + 1, sizeof(size_t *)), calloc(nch + 1, sizeof(size_t)), calloc(nch + 1, sizeof(float *))};
+    fit_par(nch, fj_cells_count, &J);
+    size_t cand = 0; for (int c = 0; c < nch; c++) { J.seen0[c] = cand; cand += J.cnt[c]; }
+    J.stride = cand > (size_t)nsamp ? cand / (size_t)nsamp : 1;
+    fit_par(nch, fj_cells_pick, &J);
+    size_t ni = 0; for (int c = 0; c < nch; c++) ni += J.ni[c];
+    size_t *iv = malloc(sizeof(size_t) * (ni + 1)); float *cw = malloc(sizeof(float) * (ni + 1)); size_t o = 0;
+    for (int c = 0; c < nch; c++) { memcpy(iv + o, J.iv[c], J.ni[c] * sizeof(size_t)); memcpy(cw + o, J.cw[c], J.ni[c] * sizeof(float)); o += J.ni[c]; free(J.iv[c]); free(J.cw[c]); }
+    free(J.cnt); free(J.seen0); free(J.iv); free(J.ni); free(J.cw);
+    *iv_ = iv; *cw_ = cw; return ni;
+}
+/* the histogram of the rounded differences dv[0..nd) (non-finite ones skipped) into H: distinct values ascending with their counts and near
+   counts (|d - v| < 0.25); counting over the value range (a sort of the packed values when it is wide), the same table either way */
+static void fj_hist_of(const double *dv, size_t nd0, fj_hist *H) {
+    memset(H, 0, sizeof *H);
+    long lo = 0, hi = -1; size_t nd = 0;
+    for (size_t q = 0; q < nd0; q++) { if (!isfinite(dv[q])) continue; const long r = lround(dv[q]); if (!nd || r < lo) lo = r; if (!nd || r > hi) hi = r; nd++; }
+    if (nd && (unsigned long)(hi - lo) < (1ul << 22)) {
+        const size_t R = (size_t)(hi - lo) + 1; long long *c = calloc(R, sizeof(long long)), *cn = calloc(R, sizeof(long long)); size_t nv = 0;
+        for (size_t q = 0; q < nd0; q++) { const double d = dv[q]; if (!isfinite(d)) continue; const long r = lround(d); c[r - lo]++; cn[r - lo] += fabs(d - r) < 0.25; }
+        for (size_t v = 0; v < R; v++) nv += c[v] != 0;
+        H->v = malloc(sizeof(long) * (nv + 1)); H->c = calloc(nv + 1, sizeof(long long)); H->cn = calloc(nv + 1, sizeof(long long));
+        for (size_t v = 0; v < R; v++) if (c[v]) { H->v[H->n] = lo + (long)v; H->c[H->n] = c[v]; H->cn[H->n] = cn[v]; H->n++; }
+        H->tot = (long long)nd; free(c); free(cn);
+        return;
+    }
+    long *rv = malloc(sizeof(long) * (nd + 1)); size_t m = 0;
+    for (size_t q = 0; q < nd0; q++) { const double d = dv[q]; if (!isfinite(d)) continue; const long r = lround(d); rv[m++] = 2 * r + (fabs(d - r) < 0.25); }
+    qsort(rv, m, sizeof(long), cmp_long);
+    H->v = malloc(sizeof(long) * (m + 1)); H->c = calloc(m + 1, sizeof(long long)); H->cn = calloc(m + 1, sizeof(long long));
+    for (size_t i = 0; i < m; i++) {
+        const long v = rv[i] >> 1;   /* (arithmetic shift: floor) */
+        if (!H->n || H->v[H->n - 1] != v) { H->v[H->n] = v; H->n++; }
+        H->c[H->n - 1]++; H->cn[H->n - 1] += rv[i] & 1;
+    }
+    H->tot = (long long)m; free(rv);
+}
+/* the sampled cells (about nsamp) of field rows f (box rows from fz0, n cells) and their differences (fj_rows); H (or null): their
+   histogram; ph / phw (optional): the confidence-weighted phasor sum and weight; raw / nraw (optional): the differences themselves */
+static void fj_sample(const fit_fields *f, int fz0, size_t n, double minc, long long nsamp, const fit_model *a, double za, const fit_model *b, double zb,
+                      const fit_set *ref, const double *ro, double bias, double h, fj_hist *H, double complex *ph, double *phw, double **raw, size_t *nraw) {
+    size_t *iv; float *cw; const size_t ni = fj_cells(f, n, minc, nsamp, &iv, &cw);
+    double *dv = malloc(sizeof(double) * (ni + 1));
+    fj_job J = {a, b, za, zb, h, fz0, (size_t)f->H * f->W, f->H, f->W, iv, dv, ni, ref, ro, bias};
+    fit_par((int)((ni + 4095) / 4096), fj_rows, &J);   /* (differences on threads, written by position) */
+    if (ph) for (size_t q = 0; q < ni; q++) { const double d = dv[q]; if (!isfinite(d)) continue; *ph += cw[q] * cexp(2 * M_PI * I * d); *phw += cw[q]; }
+    if (H) fj_hist_of(dv, ni, H);
+    free(iv); free(cw);
+    if (raw) { *raw = dv; *nraw = ni; } else free(dv);
 }
 
 double fj_table_cost(const fj_table *t, long v) {
@@ -190,6 +263,8 @@ static void fj_global(int ns, const fj_hist *hb, const fj_hist *hr, int nx, cons
     free(u); free(e); free(S0);
 }
 
+typedef struct { char **md; fit_model **out; } fj_load_job;   /* the slab models read on threads (~70 MB of lattice each) */
+static void fj_load_rows(void *a, int k0, int k1, int t) { const fj_load_job *J = a; (void)t; for (int k = k0; k < k1; k++) J->out[k] = fit_load(J->md[k]); }
 int cmd_fit_join(int argc, char **argv) {
     if (argc < 7) {
         fprintf(stderr, "usage: ufsm fit-join <out-set> <fields-dir> [--blend 16] [--min-conf 0.3] [--samples 4000000] [--ref MODEL [--ref-w 1] [--chain-w 1] [--ref-samples 200000] [--ref-rows 16]]\n"
@@ -222,9 +297,10 @@ int cmd_fit_join(int argc, char **argv) {
     const double h = g.h, Z = g.shape[0] * h;
     fit_set *s = calloc(1, sizeof *s); s->n = ns; s->blend = blend;
     s->slab = calloc(ns, sizeof *s->slab); s->z0 = calloc(ns, sizeof(double)); s->z1 = calloc(ns, sizeof(double));
+    { char **md = malloc(sizeof(char *) * ns); for (int k = 0; k < ns; k++) md[k] = argv[ai + 3 * k]; fj_load_job J = {md, s->slab}; fit_par(ns, fj_load_rows, &J); free(md); }
     for (int k = 0; k < ns; k++) {
         const char *md = argv[ai + 3 * k];
-        s->slab[k] = fit_load(md); s->z0[k] = atof(argv[ai + 3 * k + 1]); s->z1[k] = atof(argv[ai + 3 * k + 2]);
+        s->z0[k] = atof(argv[ai + 3 * k + 1]); s->z1[k] = atof(argv[ai + 3 * k + 2]);
         const fit_model *m = s->slab[k];
         if (!m) { fprintf(stderr, "fit-join: cannot load the model %s\n", md); return 1; }
         if (m->origin[1] != g.origin[1] || m->origin[2] != g.origin[2] || m->H != g.shape[1] || m->W != g.shape[2] || m->h != h) {
@@ -241,54 +317,81 @@ int cmd_fit_join(int argc, char **argv) {
     const double iz0 = s->z0[0], iz1 = s->z1[ns - 1];   /* (the given interiors: the ref samples stay inside them) */
     s->z0[0] = 0; s->z1[ns - 1] = Z;   /* (the set covers the whole box: rows outside the first / last interior use those slabs) */
     printf("fit-join: %d slabs, box %dx%dx%d h %g, blend %g\n", ns, g.shape[0], g.shape[1], g.shape[2], h, blend);
-    /* per boundary the histogram of round(W_k - W_k-1) over sampled overlap cells (the slabs' own gauges, nothing shifted yet) */
+    /* The sampled differences, in one sweep over the box in z order (fj_cache: each chunk row decoded once): per boundary the
+       histogram of round(W_k - W_k-1) over sampled overlap cells (the slabs' own gauges, nothing shifted yet); with --global the overlaps
+       of slabs further apart (boxes reaching past the next slab's) as extra edges; with --ref per slab its ref cells: pass 0 the phasor
+       sum (the sub-turn bias, summed in slab order as before), pass 1 the differences kept until the bias is known, then histogrammed */
     fj_hist *hb = calloc(ns, sizeof *hb);
+    int nx = 0, *xa = nullptr, *xb = nullptr; fj_hist *hx = nullptr;
+    typedef struct { int fz0, fz1, kind, k, ord; } fj_task;   /* kind 0: boundary k | k - 1, 1: long edge k (xa, xb), 2: slab k's ref cells */
+    fj_task *tk = malloc(sizeof *tk * ((size_t)ns * (glob ? ns + 2 : 2) + 2)); int nt = 0;
     for (int k = 1; k < ns; k++) {   /* the overlap of slab k - 1 and slab k */
         const fit_model *a = s->slab[k - 1], *b = s->slab[k];
         const double za = (double)(a->origin[0] - g.origin[0]), zb = (double)(b->origin[0] - g.origin[0]);
         const double lo = fmax(za, zb), hi = fmin(za + a->D * h, zb + b->D * h);
         const int fz0 = (int)ceil(lo / h), fz1 = (int)floor(hi / h);
         if (fz1 <= fz0) { fprintf(stderr, "fit-join: slabs %d and %d do not overlap\n", k - 1, k); return 1; }
-        if (fj_sample(fdir, fz0, fz1, minc, nsamp, a, za, b, zb, nullptr, nullptr, 0, h, &hb[k], nullptr, nullptr)) { fprintf(stderr, "fit-join: cannot load field rows %d..%d\n", fz0, fz1); return 1; }
+        tk[nt] = (fj_task){fz0, fz1, 0, k, nt}; nt++;
     }
-    /* --global: the overlaps of slabs further apart (boxes reaching past the next slab's) as extra edges */
-    int nx = 0, *xa = nullptr, *xb = nullptr; fj_hist *hx = nullptr;
     if (glob) for (int i = 0; i < ns; i++) for (int j = i + 2; j < ns; j++) {
         const fit_model *a = s->slab[i], *b = s->slab[j];
         const double za = (double)(a->origin[0] - g.origin[0]), zb = (double)(b->origin[0] - g.origin[0]);
         const int fz0 = (int)ceil(fmax(za, zb) / h), fz1 = (int)floor(fmin(za + a->D * h, zb + b->D * h) / h);
         if (fz1 <= fz0) continue;
         xa = realloc(xa, sizeof(int) * (nx + 1)); xb = realloc(xb, sizeof(int) * (nx + 1)); hx = realloc(hx, sizeof *hx * (nx + 1));
-        xa[nx] = i; xb[nx] = j;
-        if (fj_sample(fdir, fz0, fz1, minc, nsamp, a, za, b, zb, nullptr, nullptr, 0, h, &hx[nx], nullptr, nullptr)) { fprintf(stderr, "fit-join: cannot load field rows %d..%d\n", fz0, fz1); return 1; }
-        nx++;
+        xa[nx] = i; xb[nx] = j; memset(&hx[nx], 0, sizeof *hx);
+        tk[nt] = (fj_task){fz0, fz1, 1, nx, nt}; nt++; nx++;
     }
+    fit_set *ref = nullptr; double ro[3] = {0, 0, 0};
+    fj_hist *hr = nullptr; double complex cs = 0; double csw = 0, cbias = 0; double **rraw = nullptr; size_t *nraw = nullptr;
+    if (refdir) {
+        ref = fit_set_load(refdir);
+        if (!ref) { fprintf(stderr, "fit-join: cannot load the --ref model %s\n", refdir); return 1; }
+        if (ref->global->dir != s->slab[0]->dir) { fprintf(stderr, "fit-join: the --ref model's direction %+d differs from the slabs' %+d\n", ref->global->dir, s->slab[0]->dir); return 1; }
+        for (int d = 0; d < 3; d++) ro[d] = (double)(g.origin[d] - ref->global->origin[d]);
+        hr = calloc(ns, sizeof *hr); rraw = calloc(ns, sizeof *rraw); nraw = calloc(ns, sizeof *nraw);
+        for (int k = 0; k < ns; k++) {
+            const double i0 = k ? s->z0[k] : iz0, i1 = k + 1 < ns ? s->z1[k] : iz1, zc = 0.5 * (i0 + i1);
+            int fz0 = refrows ? (int)floor(zc / h) - refrows / 2 : (int)ceil(i0 / h), fz1 = refrows ? fz0 + refrows : (int)floor(i1 / h);
+            if (fz0 < (int)ceil(i0 / h)) fz0 = (int)ceil(i0 / h);
+            if (fz1 > (int)floor(i1 / h)) fz1 = (int)floor(i1 / h);
+            if (fz1 <= fz0) continue;
+            tk[nt] = (fj_task){fz0, fz1, 2, k, nt}; nt++;
+        }
+    }
+    for (int i = 1; i < nt; i++) for (int j = i; j > 0 && (tk[j - 1].fz0 > tk[j].fz0 || (tk[j - 1].fz0 == tk[j].fz0 && tk[j - 1].ord > tk[j].ord)); j--) { const fj_task t = tk[j]; tk[j] = tk[j - 1]; tk[j - 1] = t; }   /* (z order, stable) */
+    long long czoff = 0; const int cz = fit_fields_zchunk(fdir, &czoff);
+    fit_fields_skip_planes(1 | 2 | 4 | 8);   /* (the rows: pc ps w) */
+    fj_cache C = {fdir, cz > 0 ? cz : 128, g.shape[0], czoff, 0, {{0}}};
+    for (int q = 0; q < nt; q++) {
+        const fj_task *t = &tk[q]; fit_fields v; uint8_t *own[3];
+        if (fj_rows_get(&C, t->fz0, t->fz1, &v, own)) { fprintf(stderr, "fit-join: cannot load field rows %d..%d\n", t->fz0, t->fz1); return 1; }
+        const size_t n = (size_t)(t->fz1 - t->fz0) * v.H * v.W;
+        if (t->kind == 0 || t->kind == 1) {
+            const fit_model *a = s->slab[t->kind ? xa[t->k] : t->k - 1], *b = s->slab[t->kind ? xb[t->k] : t->k];
+            const double za = (double)(a->origin[0] - g.origin[0]), zb = (double)(b->origin[0] - g.origin[0]);
+            fj_sample(&v, t->fz0, n, minc, nsamp, a, za, b, zb, nullptr, nullptr, 0, h, t->kind ? &hx[t->k] : &hb[t->k], nullptr, nullptr, nullptr, nullptr);
+        } else {
+            const fit_model *m = s->slab[t->k]; const double zm = (double)(m->origin[0] - g.origin[0]);
+            fj_sample(&v, t->fz0, n, minc, nref / 4 + 1, m, zm, nullptr, 0, ref, ro, 0, h, nullptr, &cs, &csw, nullptr, nullptr);
+            fj_sample(&v, t->fz0, n, minc, nref, m, zm, nullptr, 0, ref, ro, 0, h, nullptr, nullptr, nullptr, &rraw[t->k], &nraw[t->k]);
+        }
+        for (int k = 0; k < 3; k++) free(own[k]);
+    }
+    for (int q = 0; q < 2; q++) fit_fields_free(&C.s[q].f);
+    free(tk);
     if (glob) printf("fit-join: --global: %d overlap edges (%d between consecutive slabs, %d longer), cost cap %g nats, full weight from %g cells\n", ns - 1 + nx, ns - 1, nx, cap, mincells);
     /* the gauges S_k (slab k minus S_k joins). Without --ref the chain of overlap modes; with --ref the dynamic programme */
     long *S = calloc(ns, sizeof(long)), *Sc = calloc(ns, sizeof(long));
     for (int k = 1; k < ns; k++) Sc[k] = Sc[k - 1] + fj_mode(&hb[k]);   /* (the chain) */
-    fj_hist *hr = nullptr;
     if (!refdir) { memcpy(S, Sc, sizeof(long) * ns); if (glob) fj_global(ns, hb, nullptr, nx, xa, xb, hx, refw, chainw, cap, mincells, Sc, S); }
     else {
-        fit_set *ref = fit_set_load(refdir);
-        if (!ref) { fprintf(stderr, "fit-join: cannot load the --ref model %s\n", refdir); return 1; }
-        if (ref->global->dir != s->slab[0]->dir) { fprintf(stderr, "fit-join: the --ref model's direction %+d differs from the slabs' %+d\n", ref->global->dir, s->slab[0]->dir); return 1; }
-        const double ro[3] = {(double)(g.origin[0] - ref->global->origin[0]), (double)(g.origin[1] - ref->global->origin[1]), (double)(g.origin[2] - ref->global->origin[2])};
-        hr = calloc(ns, sizeof *hr); double complex cs = 0; double csw = 0, cbias = 0;
-        for (int pass = 0; pass < 2; pass++) {   /* pass 0: the sub-turn bias; pass 1: the histograms */
-            for (int k = 0; k < ns; k++) {
-                const double i0 = k ? s->z0[k] : iz0, i1 = k + 1 < ns ? s->z1[k] : iz1, zc = 0.5 * (i0 + i1);
-                int fz0 = refrows ? (int)floor(zc / h) - refrows / 2 : (int)ceil(i0 / h), fz1 = refrows ? fz0 + refrows : (int)floor(i1 / h);
-                if (fz0 < (int)ceil(i0 / h)) fz0 = (int)ceil(i0 / h);
-                if (fz1 > (int)floor(i1 / h)) fz1 = (int)floor(i1 / h);
-                if (fz1 <= fz0) continue;
-                const fit_model *m = s->slab[k]; const double zm = (double)(m->origin[0] - g.origin[0]);
-                if (fj_sample(fdir, fz0, fz1, minc, pass ? nref : nref / 4 + 1, m, zm, nullptr, 0, ref, ro, cbias, h, pass ? &hr[k] : nullptr, pass ? nullptr : &cs, &csw)) {
-                    fprintf(stderr, "fit-join: cannot load field rows %d..%d\n", fz0, fz1); return 1;
-                }
-            }
-            if (!pass) cbias = cabs(cs) > 0 ? carg(cs) / (2 * M_PI) : 0;
+        cbias = cabs(cs) > 0 ? carg(cs) / (2 * M_PI) : 0;
+        for (int k = 0; k < ns; k++) if (rraw[k]) {   /* (W_slab - W_ref) - bias, as the pass-1 differences were */
+            for (size_t q = 0; q < nraw[k]; q++) rraw[k][q] -= cbias;
+            fj_hist_of(rraw[k], nraw[k], &hr[k]); free(rraw[k]);
         }
+        free(rraw); free(nraw);
         printf("fit-join: --ref %s (box offset %.0f %.0f %.0f native), sub-turn bias of W_slab - W_ref %+.3f turn (coherence %.3f), ref weight %g, chain weight %g\n",
                refdir, ro[0], ro[1], ro[2], cbias, csw > 0 ? cabs(cs) / csw : 0, refw, chainw);
         enum { RC = 12, NC = 2 * RC + 1 };   /* candidates: the ref mode +- RC (a slab without ref cells: the previous slab's centre + its overlap mode) */
