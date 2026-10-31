@@ -3728,10 +3728,6 @@ static int cmd_render(int argc, char **argv) {
     const long fill_grid = atol(opt(argc, argv, "--fill-grid", "0"));
     const int rgpu_on = atoi(opt(argc, argv, "--gpu", "1")) && render_gpu_available() && !getenv("UFSM_RENDER_TILED");   /* default on: same bytes, CPU on any device trouble */
     render_set_gpu(rgpu_on);
-    if (rgpu_on) {   /* --gpu 1: chunks decoded on the GPU into the device pool (device-sink requests ignore UFSM_GPU_DECODE_MIN_BYTES);
-                       UFSM_GPU_DECODE=0 overrides */
-        setenv("UFSM_GPU_DECODE", "1", 0);
-    }
     if (fill_n > 49 || (fill_grid && fill_n < 0) || fill_inp < 0 || fill_inp > 8 || ((fill_n >= 0 || fill_inp) && (ci < 0 || ci + 2 >= argc)) || (fill_inp && fill_n < 0) || (fill_n >= 0 && getenv("UFSM_RENDER_TILED"))) {
         fprintf(stderr, "render: --fill N (0..49) needs --ct (and not UFSM_RENDER_TILED); --fill-inpaint L (1..8) needs --fill\n"); return 2; }
     store *vs = store_open(argv[vi + 1]), *cs = ci > 0 && ci + 2 < argc ? store_open(argv[ci + 1]) : nullptr;

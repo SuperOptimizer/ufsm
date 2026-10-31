@@ -655,8 +655,6 @@ static int wr_run(z3 *const *vz, int nv, const int *depth, int ns, const float *
         if (gpu) {   /* device chunk pool sized to the free device memory (GPUs shared with other jobs), one pinned staging buffer per decoder */
             /* decoders: with the GPU decoder many requests in flight make its batches (one substream is a serial chain of a few ms): 128
                (UFSM_RENDER_GPU_DECODERS); without it the CPU decoders of the CPU path */
-            const char *nde = getenv("UFSM_RENDER_GPU_DECODERS");
-            const int ndg = nde && atoi(nde) > 0 ? (atoi(nde) > 128 ? 128 : atoi(nde)) : gpudec_enabled() ? 128 : nd;
             const int dev = rg_device(); size_t tot = 0; const size_t fr = rgpu_free_mem(dev, &tot);
             const size_t cvmax = (size_t)1 << (3 * (nv > 1 && R->T[1].sh > R->T[0].sh ? R->T[1].sh : R->T[0].sh));
             const int nimg = nv + (F ? 1 : 0); const size_t bmax = (size_t)(8192 / ns), outb = bmax * ns * nimg * RB * RB;
@@ -666,6 +664,8 @@ static int wr_run(z3 *const *vz, int nv, const int *depth, int ns, const float *
             size_t cap = fr > reserve + grids + outb + 64 * cvmax ? fr - reserve - grids - outb : 0;
             if (lim > 0 && cap > (size_t)lim) cap = (size_t)lim;
             if (cap < 128 * cvmax) { fprintf(stderr, "render gpu: %.2f GB free on device %d: CPU render\n", fr / 1073741824.0, dev); rc = 2; goto gout; }
+            const char *nde = getenv("UFSM_RENDER_GPU_DECODERS");
+            const int ndg = nde && atoi(nde) > 0 ? (atoi(nde) > 128 ? 128 : atoi(nde)) : gpudec_enabled() ? 128 : nd;
             { const char *dl = getenv("UFSM_RENDER_GPU_DEVMB");   /* tests: a small device tier (the rest in pinned host slots) */
               if (dl && (size_t)atol(dl) << 20 < cap) cap = (size_t)atol(dl) << 20; }
             /* the budget (decoders ahead of the renderer): the device tier less headroom for the earliest group, plus the caller's host budget for
@@ -722,6 +722,10 @@ int render_wraps_chunked_fill(z3 *const *vz, int nv, const int *depth, int ns, c
     const char *ev = getenv("UFSM_RENDER_GPU");
     const int gpu = (ev ? atoi(ev) : g_render_gpu) && rgpu_open && nv >= 1 && nv <= 2 && ns >= 1 && ns <= 8;
     if (gpu) {
+        /* GPU decoding on (UFSM_GPU_DECODE=0 keeps it off) only when the device has room for the GPU path: a render that will fall back to
+           the CPU (a full device, e.g. next to a slab fit) must not send its decodes to that GPU either (busy round trips: P4 stripe 33 -> 50 s) */
+        size_t tot = 0; const size_t fr = rgpu_free_mem(rg_device(), &tot);
+        if (fr > ((size_t)5 << 29) + (size_t)256 * ((size_t)1 << 21)) setenv("UFSM_GPU_DECODE", "1", 0);
         const int rc = wr_run(vz, nv, depth, ns, Xs, Ys, Zs, w, h, gs, img, ow, oh, crop, budget, nthreads, io_threads, verbose, F, 1);
         if (rc == 0) atomic_fetch_add(&g_render_gpu_done, 1);
         if (rc != 2) return rc;
