@@ -57,6 +57,8 @@ int cmd_eval(int argc, char **argv);
 int cmd_refine(int argc, char **argv);       /* src/surf.c */
 int cmd_surf_stats(int argc, char **argv);
 int cmd_wrap_snap(int argc, char **argv);   /* src/wrapsnap.c */
+int cmd_wrap_match(int argc, char **argv);
+int cmd_ink_cover(int argc, char **argv);
 int cmd_self_gate(int argc, char **argv);
 int cmd_stitch(int argc, char **argv);   /* src/stitch.c */
 int cmd_coreline(int argc, char **argv);   /* src/coreline.c */
@@ -183,6 +185,8 @@ static int usage(void) {
         "  ufsm strip-flatten <strip-dir> [--decim D] [--stride S] [--stripe-px 60000] [--flip-rows 1]   the whole strip flattened (chunk SLIM + blend) -> render stripes\n"
         "  ufsm strip-mosaic <flat-dir> <render-dir> <out-dir> [--ct-level 80]   stripe JPEGs, overview, on-papyrus share along the strip\n"
         "  ufsm blend <out-group> <out-um> --shape Z,Y,X --interior S <root> <key> <oz,oy,ox>...   shifted predict runs -> one seamless sin^2-weighted logit average\n"
+        "  ufsm wrap-match <wraps-A> <wraps-B> --axis AXIS.json   which B wrap each A wrap coincides with (radius per z x angle bin about the axis)\n"
+        "  ufsm ink-cover <render-dir>   per rendered wrap on papyrus: ink share >= t, mean ink, stroke contrast\n"
         "  ufsm wrapdist <wraps-dir> <labels-root> <labels-key>              wrap vertices vs the nearest labelled sheet\n"
         "  ufsm wrapswitch <wraps-dir> <codes-root> <codes-key>            how often the wraps switch sheets (per cm)\n"
         "  ufsm wrap-check <model> <fields-dir> [--ct ROOT KEY --ct-um U] [--codes ROOT KEY]   duplicate / merged wraps: CT peaks between adjacent wraps along radial rays\n"
@@ -4191,7 +4195,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "jpeg-fit")) return cmd_jpeg_fit(argc, argv);
     if (!strcmp(cmd, "ink-ext")) return cmd_ink_ext(argc, argv);
     if (!strcmp(cmd, "ink-splat")) return cmd_ink_splat(argc, argv);
-    if (!strcmp(cmd, "ink-score")) return cmd_ink_score(argc, argv);
+    if (!strcmp(cmd, "ink-cover")) return cmd_ink_cover(argc, argv);
     if (!strcmp(cmd, "ink-ensemble")) return cmd_ink_ensemble(argc, argv);
     if (!strcmp(cmd, "wl-dump")) return cmd_wl_dump(argc, argv);
     if (!strcmp(cmd, "dinovol-embed")) return cmd_dinovol_embed(argc, argv);
@@ -4242,6 +4246,8 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "refine")) return cmd_refine(argc, argv);
     if (!strcmp(cmd, "surf-stats")) return cmd_surf_stats(argc, argv);
     if (!strcmp(cmd, "wrap-snap")) return cmd_wrap_snap(argc, argv);
+    if (!strcmp(cmd, "wrap-match")) return cmd_wrap_match(argc, argv);
+    if (!strcmp(cmd, "ink-cover")) return cmd_ink_cover(argc, argv);
     if (!strcmp(cmd, "self-gate")) return cmd_self_gate(argc, argv);
     if (!strcmp(cmd, "ct-fields")) return cmd_ct_fields(argc, argv);
     if (!strcmp(cmd, "fit-compare")) return cmd_fit_compare(argc, argv);
