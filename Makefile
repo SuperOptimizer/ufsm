@@ -34,6 +34,9 @@ endif
 # ccache (when installed) makes recompiling unchanged sources free: switching VERIFY, make clean, other worktrees.
 # CCACHE= disables it.
 CCACHE  ?= $(shell command -v ccache 2>/dev/null)
+# shared across worktrees / suite dirs: paths relative to the tree, the cwd not hashed (-g would key every object on the directory)
+export CCACHE_BASEDIR ?= $(CURDIR)
+export CCACHE_NOHASHDIR ?= 1
 CC      := $(CCACHE) gcc
 NVCC    ?= $(CCACHE) nvcc
 CFLAGS  ?= -std=c23 -O3 -march=native -g -Wall -Wextra -Wno-unused-parameter -Wno-format-truncation -pthread

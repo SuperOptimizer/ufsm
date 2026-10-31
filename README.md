@@ -14,14 +14,28 @@ make -j && make test     # gcc -std=c23 + nvcc; needs libcurl, libzstd, libblosc
 make ARCH=86             # Ampere (RTX 3090) into build86/: software MX-fp4 / fp8 (bit-exact conversions, emulated block-scaled MMAs)
                          # (on by default there; UFSM_MX_EMU=0: fp8 / fp4 as bf16, 16-bit storage); PTX=1: compute_86 PTX
                          # only (build86p/), so a newer GPU runs the sm_86 code (tests); BDIR=build puts it in build/
-make VERIFY=1 test-all   # the suite alone (build-verify/: adds the bf16 / fp32 reference kernels)
+make -j test             # fast tier (the merge gate); make test-slow: the slow tier; make test-all: both
+scripts/test/desk_suite.sh BRANCH   # the same on the desk (push over ssh, build, run, failing logs), one suite at a time
 ```
 
-`make test` builds the default `build/ufsm` plus the fixtures the Python CLI tests use, then runs `test-all` on the VERIFY=1
-build. Single tests: `make VERIFY=1 build-verify/test_strip && build-verify/test_strip`. The pipeline stages below have their
-own tests: `test_countfield`, `test_fit_join`, `test_wraps_core`, `test_flatten`, `test_flatten_gpu`,
+The tests are listed in `tests/suite.txt` (`NAME | TAGS | EST_SECONDS | COMMAND`) and run by `tests/run_suite.sh`. `make test`
+builds `build/ufsm`, the fixtures the Python CLI tests use and every suite binary on the VERIFY=1 build (`build-verify/`), then runs
+the fast tier in parallel: the runner sets the job count from the CPUs this process may use (cgroup-aware, `-j`, `SUITE_J`), caps the
+threads of each test (`UFSM_NCPU` / `UFSM_FIT_THREADS` / `UFSM_TIFF_THREADS` / `OMP_NUM_THREADS`, `-T`), gives each `gpu` test
+a machine-wide GPU lock (`/tmp/ufsm-suite-locks`, shared by concurrent suites), the GPU with the most free memory first, runs the
+longest first, retries `flaky` tests once and prints each failing test's log tail plus a summary (`results.tsv` holds wall / CPU /
+max RSS per test). Runner options go through `SUITE_FLAGS`, e.g. `make test SUITE_FLAGS="-j 4 test_fit"` (names matching a regex),
+`-l` lists the tests, `-P` profiles (marks the tests that open the GPU, samples their GPU memory). One test by hand:
+`make VERIFY=1 build-verify/test_strip && build-verify/test_strip`. A new test: its binary as a prerequisite of `suite-bins` in the
+Makefile and a line in `tests/suite.txt` (tag `gpu` if it touches the GPU, `slow` if it takes more than ~30 s). The pipeline
+stages below have their own tests: `test_countfield`, `test_fit_join`, `test_wraps_core`, `test_flatten`, `test_flatten_gpu`,
 `test_faces`, `test_strip`, `test_render_stream` (render / ink-compare / jpeg-fit, byte-identical streamed vs in-memory),
-`test_sheetcut`, `test_ink_blend.py`. On the laptop run builds and tests through `~/ufsm-data/capped.sh`.
+`test_sheetcut`, `test_ink_blend.py`. On the laptop run builds and tests through `~/ufsm-data/capped.sh` (with nice).
+
+`scripts/test/desk_suite.sh [-t fast|slow|all] REF [REGEX...]` pushes the commit into `/vesuvius/ufsm/suite/repo.git` on the desk,
+exports it to `/vesuvius/ufsm/suite/<sha>`, builds it (ccache shared across the sha dirs) and runs the suite at nice 10 under a lock
+(one desk suite at a time). It waits for the desk to have MemAvailable >= 40 GB and a load <= 24 (`-m` / `-l`, at most `-w` 60 min)
+before building and before testing, and uses the GPUs with >= 3 GB free. Logs stay in `/vesuvius/ufsm/suite/<sha>/out`.
 
 ## Unroll a scroll
 
