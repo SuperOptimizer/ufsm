@@ -68,8 +68,10 @@ REFILL=$H/strip_refill.sh; [ -e $REFILL ] || REFILL=$REPO/scripts/strip/strip_re
 # the shared decoded-CT cache (src/zshm.c) for the render / faces / ink-compare stages: ZCACHE_GB (auto: 1/4 of the available RAM, at
 # most 30 GB; off on the laptop = WSL), admit 0.6 (P4 w137 / w138 re-renders: 47-54% hits, a render 32.8 -> 20.0 s). The cache file
 # is removed at the end of the run (also on STOP / failure). strip-mosaic: UFSM_JPEG_THREADS = cores / 2 (it encodes up to 2 stripes at once, --stripe-jobs 2).
+# auto = OFF when the host has a CUDA device: the renders run on the GPU (GPU volcomp decode), and with the cache on they decode on the
+# CPU instead (0490B stripe ws021: 12.0 s / 4.2 GB RSS without, 25.0 s / 29 GB with; same bytes; stripes are decoded about once anyway)
 if [ "${ZCACHE_GB:-auto}" = auto ]; then
-  if grep -qi microsoft /proc/version 2> /dev/null; then ZCACHE_GB=0; else ZCACHE_GB=$(( $(availgb) / 4 )); [ $ZCACHE_GB -gt 30 ] && ZCACHE_GB=30; fi
+  if grep -qi microsoft /proc/version 2> /dev/null || $U sysinfo 2> /dev/null | grep -q '^gpu [0-9]'; then ZCACHE_GB=0; else ZCACHE_GB=$(( $(availgb) / 4 )); [ $ZCACHE_GB -gt 30 ] && ZCACHE_GB=30; fi
 fi
 ZCPATH=${UFSM_ZCACHE_PATH:-/dev/shm/ufsm-zcache-$(id -u)}
 JPEGT=$(( $(ncpu) / 2 )); [ $JPEGT -lt 1 ] && JPEGT=1
