@@ -101,6 +101,8 @@ int fgpu_broken(const fgpu *G) __attribute__((weak));
 int fgpu_grid(fgpu *G, const float *X, const float *Y, const float *Z, const float *N, int w, int h) __attribute__((weak));
 int fgpu_band(fgpu *G, int r0, int r1, double f, double hs, double R, int m, double min_prom, double rel, fc_band *cand, uint8_t *nc, float *ct0, uint8_t *prof) __attribute__((weak));
 int fgpu_median(fgpu *G, const float *in, float *out, int w, int h, int R, int minn) __attribute__((weak));
+int fgpu_mark(fgpu *G, int r0, int r1, double f, double hs, double R, int m, uint32_t *mask) __attribute__((weak));
+size_t fgpu_nchunks(const fgpu *G) __attribute__((weak));
 static int fc_gpu_ok(const faces_vol *V) { return V->gpu && fgpu_broken && !fgpu_broken(V->gpu); }
 static void fc_median(const faces_vol *V, const float *in, float *out, int w, int h, int R, int minn, int nt) {
     if (fc_gpu_ok(V) && fgpu_median && !fgpu_median(V->gpu, in, out, w, h, R, minn < 1 ? 1 : minn)) return;
@@ -157,15 +159,19 @@ int faces_wrap(const float *X, const float *Y, const float *Z, int w, int h, dou
         else N[3 * i] = N[3 * i + 1] = N[3 * i + 2] = NAN;
         if (Z[i] >= 0) st->nv++;
     }
-    /* the GPU path needs the chunk mirror (mark / fill) and 128^3 chunks; any device failure: the CPU from that band on */
+    /* the GPU path needs the chunk mirror (mark / fill) and 128^3 chunks; any device failure: the CPU from that band on. With the GPU the
+       decode list is the exact set of substreams the samples read (fgpu_mark), not the profiles' bounding boxes */
     int gpu = V->mark && V->fill && fc_gpu_ok(V) && fgpu_grid && fgpu_band && !fgpu_grid(V->gpu, X, Y, Z, N, w, h);
+    uint32_t *gmask = gpu && V->mark_mask && fgpu_mark && fgpu_nchunks ? malloc(fgpu_nchunks(V->gpu) * sizeof(uint32_t)) : nullptr;
     tp[0] += fc_now() - tq;
     for (int r0 = 0; r0 < h; r0 += 32) {   /* bands of rows: mark the chunks, decode, sample */
         fc_job J = {X, Y, Z, N, w, h, r0, r0 + 32 < h ? r0 + 32 : h, f, hs, R, m, o, V, cand, nc, prof, ct0, 0, 1};
         tq = fc_now();
         if (V->mark) {
-            fc_par(fc_rows, &J, o->nthreads); tp[1] += fc_now() - tq; tq = fc_now();
-            if (V->fill && V->fill(V->ctx)) { free(N); free(ct0); free(cand); free(nc); free(prof); return -1; }
+            if (gmask && gpu && fc_gpu_ok(V) && !fgpu_mark(V->gpu, J.r0, J.r1, f, hs, R, m, gmask)) V->mark_mask(V->ctx, gmask);
+            else fc_par(fc_rows, &J, o->nthreads);
+            tp[1] += fc_now() - tq; tq = fc_now();
+            if (V->fill && V->fill(V->ctx)) { free(N); free(ct0); free(cand); free(nc); free(prof); free(gmask); return -1; }
             tp[2] += fc_now() - tq; tq = fc_now();
         }
         if (gpu && fc_gpu_ok(V) && !fgpu_band(V->gpu, J.r0, J.r1, f, hs, R, m, o->min_prom, o->rel, cand, nc, ct0, prof)) { tp[3] += fc_now() - tq; continue; }
@@ -238,7 +244,7 @@ int faces_wrap(const float *X, const float *Y, const float *Z, int w, int h, dou
     }
     tp[6] += fc_now() - tq;
     if (prof_on) fprintf(stderr, "faces prof: normals %.2f mark %.2f fill %.2f sample %.2f pick %.2f medians %.2f final %.2f s (%s)\n", tp[0], tp[1], tp[2], tp[3], tp[4], tp[5], tp[6], gpu ? "gpu" : "cpu");
-    free(N); free(ct0); free(cand); free(nc); free(prof); free(pick); free(pn); free(pf); free(mn); free(mf);
+    free(N); free(ct0); free(cand); free(nc); free(prof); free(pick); free(pn); free(pf); free(mn); free(mf); free(gmask);
     return 0;
 }
 

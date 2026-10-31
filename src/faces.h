@@ -50,6 +50,7 @@ typedef struct {
     void (*mark)(void *ctx, const double lo[3], const double hi[3]);
     int (*fill)(void *ctx);
     struct fgpu *gpu;        /* non-null: profiles and medians on the GPU (src/nn_faces.cu), the chunks mirrored there by fill */
+    void (*mark_mask)(void *ctx, const uint32_t *mask);   /* with gpu: per 128^3 chunk the substream bits to decode (instead of mark boxes) */
 } faces_vol;
 
 typedef struct {
@@ -87,6 +88,8 @@ void fgpu_drop(fgpu *G, size_t id);
 int fgpu_grid(fgpu *G, const float *X, const float *Y, const float *Z, const float *N, int w, int h);
 int fgpu_band(fgpu *G, int r0, int r1, double f, double hs, double R, int m, double min_prom, double rel, fc_band *cand, uint8_t *nc, float *ct0, uint8_t *prof);
 int fgpu_median(fgpu *G, const float *in, float *out, int w, int h, int R, int minn);
+int fgpu_mark(fgpu *G, int r0, int r1, double f, double hs, double R, int m, uint32_t *mask);
+size_t fgpu_nchunks(const fgpu *G);
 void fgpu_stats(const fgpu *G, size_t *nput, size_t *bytes, int *slots);
 #ifdef __cplusplus
 }
