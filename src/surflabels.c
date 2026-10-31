@@ -1,4 +1,4 @@
-/* ufsm surf-labels WRAPS OUT --axis F --axis-um U0 --dir +-1 --grid-um U (--shape Z,Y,X | --like ROOT KEY)
+/* ufsm surf-labels WRAPS OUT --axis F --axis-um U0 --dir +-1|auto --grid-um U (--shape Z,Y,X | --like ROOT KEY)
                    [--wrapcheck TSV] [--first K] [--last K] [--drop w1,w2,..] [--band-peaks LO,HI]
                    [--ct ROOT KEY [--min-onpap 0.2] [--ct-level 80] [--ct-range 15]]
                    [--exclude holdouts.json --exclude-ct NAME [--exclude-mm 0.5]]
@@ -6,7 +6,8 @@
    Winding labels straight from our whole-scroll wraps (ufsm wraps / wrap-snap .sfc, rows = z, wrap k = the fit's level set W = k
    with W = U - dir theta / 2 pi, theta = atan2 around the axis in (-pi, pi]): every wrap's quads are rasterised on the scan's training
    grid (--grid-um; --like a CT level array of that grid gives the shape) with the sheet coordinate q = k + dir theta / 2 pi (continuous
-   along the spiral, +1 turn between radially neighbouring sheets, rising outward) as winding_mod14 codes (1 + round(18 q) mod 252,
+   along the spiral, +1 turn between radially neighbouring sheets, rising outward; --dir auto: the sense from the wraps themselves, wrap
+   k's theta = pi end meeting wrap k + dir's theta = -pi start, voted per row) as winding_mod14 codes (1 + round(18 q) mod 252,
    0 empty, 255 = two surfaces > 1/4 turn apart in one voxel: the ufsm raster --value rule), and the band phase of the pair rule
    (band_field_phase_pair: the nearest sheets of opposite winding parity, consecutive windings only, within --radius grid voxels;
    PHASE_* codes 0..251, 255 unknown: what phase-raster --pair 1 writes and the sampler's stored phase reads) is computed in the same pass,
@@ -61,6 +62,7 @@ typedef struct {
     int id, w, h, keep; char path[1400], why[24];
     sfc_reader *r; sfc_cache *ca; uint32_t ch; double um;
     float *rz0, *rz1;                 /* per row: grid z min / max of its valid vertices (rz0 > rz1: none) */
+    float *ra, *rb;                   /* per row (--dir auto): the radius of the valid vertex nearest theta = pi (ra) / -pi (rb) when within 0.15 rad of it, else NAN */
     long long nv;                     /* valid vertices */
     double peaks, onpap; int has_wc; char verdict[16];
     _Atomic long long pap, papn;      /* --min-onpap pass */
@@ -99,8 +101,8 @@ static int sl_open(sl_wrap *w) {
     if (!(w->um > 0)) { fprintf(stderr, "surf-labels: %s: no voxel_size_um in its meta\n", w->path); return -1; }
     const size_t budget = (size_t)((w->w + 63) / 64 + 1) * 3 * 64 * 64 * 12 * 2;
     if (sfc_cache_create(w->r, budget, &w->ca)) return -1;
-    w->rz0 = malloc((size_t)w->h * 4); w->rz1 = malloc((size_t)w->h * 4);
-    return w->rz0 && w->rz1 ? 0 : -1;
+    w->rz0 = malloc((size_t)w->h * 4); w->rz1 = malloc((size_t)w->h * 4); w->ra = malloc((size_t)w->h * 4); w->rb = malloc((size_t)w->h * 4);
+    return w->rz0 && w->rz1 && w->ra && w->rb ? 0 : -1;
 }
 /* pass 0: per row the grid z range and the valid count (rows read 64 at a time) */
 typedef struct { sl_job *J; _Atomic int next; _Atomic int fail; } sl_scan;
@@ -112,11 +114,17 @@ static void *sl_scan_run(void *arg) {
         for (int r0 = 0; r0 < w->h && xyz && v; r0 += R) {
             const int n = r0 + R <= w->h ? R : w->h - r0; memset(v, 0, (size_t)n * w->w);
             if (sfc_cache_read_xyz_region(w->ca, w->ch, 0, (uint64_t)r0, (uint32_t)w->w, (uint32_t)n, xyz, 12, (size_t)w->w * 12, v)) { atomic_store(&S->fail, 1); break; }
+            const double sw = J->s0 * w->um / J->W[0].um;
             for (int r = 0; r < n; r++) {
-                float lo = 1e30f, hi = -1e30f;
+                float lo = 1e30f, hi = -1e30f; double tmax = -10, tmin = 10, rmx = NAN, rmn = NAN;
                 for (int c = 0; c < w->w; c++) { const size_t i = (size_t)r * w->w + c; if (!v[i] || !(xyz[3 * i + 2] >= 0)) continue;
-                    const float gz = (float)((xyz[3 * i + 2] + 0.5) * f - 0.5); if (gz < lo) lo = gz; if (gz > hi) hi = gz; w->nv++; }
+                    const float gz = (float)((xyz[3 * i + 2] + 0.5) * f - 0.5); if (gz < lo) lo = gz; if (gz > hi) hi = gz; w->nv++;
+                    double cy, cx; axis_at(J->ax, xyz[3 * i + 2] * sw, &cy, &cx); cy /= sw; cx /= sw;
+                    const double dy = xyz[3 * i + 1] - cy, dx = xyz[3 * i] - cx, th = atan2(dy, dx), rr = sqrt(dy * dy + dx * dx);
+                    if (th > tmax) { tmax = th; rmx = rr; }
+                    if (th < tmin) { tmin = th; rmn = rr; } }
                 w->rz0[r0 + r] = lo; w->rz1[r0 + r] = hi;
+                w->ra[r0 + r] = tmax > M_PI - 0.15 ? (float)rmx : NAN; w->rb[r0 + r] = tmin < -M_PI + 0.15 ? (float)rmn : NAN;
             }
         }
         sfc_cache_clear(w->ca); free(xyz); free(v);
@@ -381,11 +389,12 @@ int cmd_surf_labels(int argc, char **argv) {
     }
     const char *in = argv[2], *out = argv[3];
     const char *axp = sl_opt(argc, argv, "--axis", nullptr);
-    const double axum = atof(sl_opt(argc, argv, "--axis-um", "0")), gum = atof(sl_opt(argc, argv, "--grid-um", "0")), dir = atof(sl_opt(argc, argv, "--dir", "0"));
+    const double axum = atof(sl_opt(argc, argv, "--axis-um", "0")), gum = atof(sl_opt(argc, argv, "--grid-um", "0"));
+    const int dir_auto = !strcmp(sl_opt(argc, argv, "--dir", ""), "auto"); double dir = dir_auto ? 1 : atof(sl_opt(argc, argv, "--dir", "0"));
     const int nt = ufsm_threads(atoi(sl_opt(argc, argv, "--threads", "0")), 16), S = atoi(sl_opt(argc, argv, "--shard", "512")), B = atoi(sl_opt(argc, argv, "--block", "128"));
     const double rmax = atof(sl_opt(argc, argv, "--radius", "20"));
-    if (!axp || !(axum > 0) || !(gum > 0) || (dir != 1 && dir != -1) || S < 128 || S % 128 || B < 16 || S % B || !(rmax > 0) || rmax > 120) {
-        fprintf(stderr, "surf-labels: need --axis F --axis-um U0 --grid-um U --dir 1|-1; --shard a multiple of 128, --block dividing it, --radius in (0, 120]\n"); return 2;
+    if (!axp || !(axum > 0) || !(gum > 0) || (!dir_auto && dir != 1 && dir != -1) || S < 128 || S % 128 || B < 16 || S % B || !(rmax > 0) || rmax > 120) {
+        fprintf(stderr, "surf-labels: need --axis F --axis-um U0 --grid-um U --dir 1|-1|auto; --shard a multiple of 128, --block dividing it, --radius in (0, 120]\n"); return 2;
     }
     sl_job J; memset(&J, 0, sizeof J);
     J.gum = gum; J.dir = dir; J.S = S; J.B = B; J.rmax = (float)rmax; J.Hh = (int)ceil(rmax) + 2; J.bake = atoi(sl_opt(argc, argv, "--bake", "1")); J.nt = nt;
@@ -471,6 +480,20 @@ int cmd_surf_labels(int argc, char **argv) {
       for (int q = 0; q < m; q++) pthread_join(th[q], nullptr);
       if (Sc.fail) { fprintf(stderr, "surf-labels: wrap read failed\n"); return 1; } }
     long long nvt = 0; for (int k = 0; k < nw; k++) nvt += W[k].nv;
+    if (dir_auto) {   /* the spiral sense: wrap k's theta = pi end meets wrap k + dir's theta = -pi start (W = U - dir theta / 2 pi = k) */
+        long vp = 0, vm = 0;
+        for (int k = 0; k + 1 < nw; k++) {
+            const sl_wrap *a = &W[k], *b = &W[k + 1];
+            if (b->id != a->id + 1 || a->h != b->h) continue;
+            for (int r = 0; r < a->h; r++) {
+                const double p = fabs(a->ra[r] - b->rb[r]), m = fabs(b->ra[r] - a->rb[r]);   /* (NAN: no vote) */
+                if (isfinite(p) && isfinite(m)) { if (p < m) vp++; else if (m < p) vm++; }
+            }
+        }
+        if (vp + vm < 10 || (vp > vm ? vp : vm) < 0.8 * (vp + vm)) { fprintf(stderr, "surf-labels: --dir auto undecided (votes +1 %ld, -1 %ld): give --dir\n", vp, vm); return 1; }
+        dir = vp > vm ? 1 : -1; J.dir = dir;
+        fprintf(stderr, "surf-labels: --dir auto: %+g (cut votes +1 %ld, -1 %ld)\n", dir, vp, vm);
+    }
     fprintf(stderr, "surf-labels: %d wraps, %lld vertices, %.4g um wraps -> grid %lldx%lldx%lld at %.4g um, dir %+g, radius %.1f, scan %.1fs\n",
             nw, nvt, W[0].um, (long long)J.shape[0], (long long)J.shape[1], (long long)J.shape[2], gum, dir, rmax, sl_now() - t0);
     /* pass 1 (--min-onpap): the wraps' on-papyrus shares */
@@ -602,7 +625,7 @@ int cmd_surf_labels(int argc, char **argv) {
                                              (long long)W[k].kgk, (long long)W[k].kg10, (long long)W[k].kg25);
         fclose(f);
     }
-    for (int k = 0; k < nw; k++) { free(W[k].rz0); free(W[k].rz1); sfc_cache_destroy(W[k].ca); sfc_close(W[k].r); }
+    for (int k = 0; k < nw; k++) { free(W[k].rz0); free(W[k].rz1); free(W[k].ra); free(W[k].rb); sfc_cache_destroy(W[k].ca); sfc_close(W[k].r); }
     free(W); free(J.hold);
     if (J.ct) z3_close(J.ct);
     if (J.gt) z3_close(J.gt);

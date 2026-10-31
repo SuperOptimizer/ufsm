@@ -9,7 +9,7 @@
    - a conflict: a wrap 8 lying on wrap 2 -> codes 255 there, written 0, ignore 2, never labelled;
    - --gt with the dir +1 codes as GT: phase agreement and pair accuracy 1.0 against itself;
    - a holdout box (--exclude) -> ignore 4;
-   - same bytes with 1 and 4 threads. */
+   - same bytes with 1 and 4 threads; --dir auto picks -1 on the dir -1 spiral (same bytes as --dir -1). */
 #include "band.h"
 #include "store.h"
 #include "tiffw.h"
@@ -76,6 +76,9 @@ int main(void) {
     snprintf(cmd, sizeof cmd, "cd %s && for a in codes phase ignore; do for s in $(cd p1/$a.zarr/9.6 && find c -type f); do cmp -s p1/$a.zarr/9.6/$s p4/$a.zarr/9.6/$s || exit 1; done; done", root);
     CHECK(!system(cmd), "outputs differ between 1 and 4 threads");
     CHECK(!run(root, "wm", "m", "-1", "4", nullptr, nullptr, nullptr), "surf-labels dir -1 failed");
+    CHECK(!run(root, "wm", "ma", "auto", "2", nullptr, nullptr, nullptr), "surf-labels --dir auto (-1) failed");
+    snprintf(cmd, sizeof cmd, "cd %s && for a in codes phase ignore; do for s in $(cd m/$a.zarr/9.6 && find c -type f); do cmp -s m/$a.zarr/9.6/$s ma/$a.zarr/9.6/$s || exit 1; done; done", root);
+    CHECK(!system(cmd), "--dir auto did not pick -1 on the dir -1 spiral");
     CHECK(!run(root, "wp", "d", "1", "4", "--drop", "w4", nullptr), "surf-labels --drop failed");
     CHECK(!run(root, "wd", "c", "1", "4", nullptr, nullptr, nullptr), "surf-labels dup failed");
     CHECK(!run(root, "wp", "g", "1", "4", nullptr, nullptr, "p1/codes.zarr"), "surf-labels --gt failed");
