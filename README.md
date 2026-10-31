@@ -422,7 +422,8 @@ Requests under `UFSM_GPU_DECODE_MIN_BYTES` (2048) compressed bytes per substream
 `UFSM_GPU_DECODE_DEV` picks the device, `UFSM_GPU_DECODE_STATS=1` prints substreams / batches at exit; any device error
 turns it off for the rest of the process. A GPU that another job saturates starves it (time slicing: next to a fit at 99% SM
 it crawled), so a round trip over `UFSM_GPU_DECODE_MAX_MS` (60) sends the requests to the CPU for `UFSM_GPU_DECODE_COOL_S` (2 s),
-then the GPU is tried again. `tests/test_gpudec.c` (`--real ARRAY cz cy cx nz ny nx [threads] [density]`:
+then the GPU is tried again; requests on the CPU path run at most `UFSM_GPU_DECODE_CPU_THREADS` (default: the CPUs this process
+may use) at once, so the extra decode threads do not oversubscribe the machine. `tests/test_gpudec.c` (`--real ARRAY cz cy cx nz ny nx [threads] [density]`:
 identity + MB/s on real chunks).
 
 ### Whole-scroll strip

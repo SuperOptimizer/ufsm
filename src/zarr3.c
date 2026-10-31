@@ -221,15 +221,31 @@ __attribute__((weak)) void gpudec_stats(uint64_t *subs, uint64_t *batches, uint6
 /* decode the substreams in need of a parsed lossy chunk: on the GPU when it is on (a substream the GPU cannot decode, or a device
    error: the request on the CPU, the reference status and bytes), else volcomp_fast.h. dsink (z3_read_sub_dev): a device 128^3 chunk
    the GPU writes the substreams into instead of dec; *dev = the substreams that went there (dec untouched for them) */
+/* with the GPU decoder on, consumers run gpudec_threads() (32) decode threads; the requests that end up on the CPU (busy GPU, near-empty
+   substreams, corrupt streams) are capped at UFSM_GPU_DECODE_CPU_THREADS (default ufsm_ncpu(), cgroup aware) at once, so the CPU path
+   does not oversubscribe the machine (a pod: 13 CPUs) */
+static pthread_mutex_t g_z3_cpu_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_z3_cpu_cv = PTHREAD_COND_INITIALIZER;
+static int g_z3_cpu_busy, g_z3_cpu_max;
 static volcomp_status z3_decode_subs(const vf_parsed *p, uint32_t need, uint8_t *dec, uint8_t *dsink, uint32_t *dev) {
     *dev = 0;
-    if (gpudec_enabled() && !p->strict) {
+    if (!gpudec_enabled()) return vfx_decode_subs(p, need, dec);
+    if (!p->strict) {
         gd_chunk g = {p->payload, p->tok_n, p->byp_n, p->off, p->step, {0}, VF_SCAN16};
         for (int m = 0; m < 10; m++) g.dt[m] = (const uint32_t *)p->models[m].dt;
         if (dsink && gpudec_decode_dev(&g, need, dsink) == 0) { *dev = need; return VOLCOMP_OK; }
         if (gpudec_decode(&g, need, dec) == 0) return VOLCOMP_OK;
     }
-    return vfx_decode_subs(p, need, dec);
+    pthread_mutex_lock(&g_z3_cpu_mu);
+    if (!g_z3_cpu_max) { const char *e = getenv("UFSM_GPU_DECODE_CPU_THREADS"); g_z3_cpu_max = e && atoi(e) > 0 ? atoi(e) : (int)ufsm_ncpu(); if (g_z3_cpu_max < 1) g_z3_cpu_max = 1; }
+    while (g_z3_cpu_busy >= g_z3_cpu_max) pthread_cond_wait(&g_z3_cpu_cv, &g_z3_cpu_mu);
+    g_z3_cpu_busy++;
+    pthread_mutex_unlock(&g_z3_cpu_mu);
+    volcomp_status st = vfx_decode_subs(p, need, dec);
+    pthread_mutex_lock(&g_z3_cpu_mu);
+    g_z3_cpu_busy--; pthread_cond_signal(&g_z3_cpu_cv);
+    pthread_mutex_unlock(&g_z3_cpu_mu);
+    return st;
 }
 void z3_io_stats(uint64_t *cache_hits, uint64_t *store_reads) { *cache_hits = atomic_load(&g_z3_cache_hits); *store_reads = atomic_load(&g_z3_store_reads); }
 static uint8_t *cache_get(const z3 *z, const char *skey, const char *item, size_t *len) {
