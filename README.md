@@ -228,10 +228,13 @@ ufsm spiral-fit <in-fields> --model DIR [--init-model REF]   # = count-field --m
   scroll's handedness (PHerc1447 is -1); pass it to the slab fits.
 - `fit --ref-model REF --ref-snap 1`: every voxel's integer = round(U_ref - bias - u); no flood, use with `--uw-repair 0`.
   A full-cross-section slab needs ~11 GB of GPU memory (one fit per 16 GB GPU). An air slab at the box ends fails with "no data
-  for the prior"; leave it out of the join.
+  for the prior"; leave it out of the join. `UFSM_FIT_GPU_LOCK=FILE` (default in `scripts/cfit/slabs.sh`: /tmp/ufsm-fit-gpuN.lock)
+  holds a lock from the device allocation to exit, so two lanes per GPU overlap one fit's field decoding with the other's device
+  stages. Zarr fields decode only the 16-row volcomp substreams the slab touches (`UFSM_FIT_FULLDECODE=1`: whole chunks).
 - `fit-join --ref`: per-slab integer gauges by DP over the ref and the overlaps; prints the ref share per slab and the integer
   agreement on the overlaps. `--global 1`: joint robust solve over the whole overlap graph (ties the DP on Paris 4 and Paris 3).
-  Slab interiors are box-local native z (`2 x` field cells at `--fit-h 2`).
+  Slab interiors are box-local native z (`2 x` field cells at `--fit-h 2`). All sample requests run in one z sweep through a
+  two-chunk-row cache (each chunk row decoded once; ~9 GB RSS on a full cross-section).
 - `wrap-check`: along radial rays, CT papyrus peaks between consecutive wraps (defaults `--sigma 1.2 --prom 1`, calibrated on
   Paris 4 GT): per-wrap dup / merged / real verdicts, radius and z tables. ~1.0 peak per turn is right; `--w-scale 2` is the
   doubled-count control.
