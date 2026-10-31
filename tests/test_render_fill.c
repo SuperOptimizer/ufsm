@@ -23,7 +23,7 @@ static int fails;
 
 int main(void) {
 #ifdef RENDER_GPU   /* every chunk-ordered render through the GPU path (nn_render.cu), lossy chunks decoded on the device (gpudec) */
-    setenv("UFSM_RENDER_GPU", "1", 1); setenv("UFSM_GPU_DECODE", "1", 1);
+    setenv("UFSM_RENDER_GPU", "1", 1); setenv("UFSM_GPU_DECODE", "1", 1); setenv("UFSM_RENDER_GPU_POISON", "1", 1);
 #endif
     char dir[] = "/tmp/test_render_fill_XXXXXX"; CHECK(mkdtemp(dir) != nullptr, "mkdtemp");
     char p[800], q[800];
