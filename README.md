@@ -425,7 +425,8 @@ device mirror of the decoded chunks (decode list = the exact substreams the samp
 no FMA): byte-identical outputs, CPU fallback without a device or when the device pool fills. Paris 4 w178: sampling 35 -> 3 s,
 medians 15 -> 2.5 s; the CPU volcomp decode is then ~75% of the wall. `UFSM_FACES_PROF=1` prints per-stage times. With
 `UFSM_GPU_DECODE=1` (below) the CT substreams are decoded on the GPU straight into that device mirror (no host round trip;
-if the GPU path fails mid-run the substreams only the device had are decoded again on the host).
+if the GPU path fails mid-run the substreams only the device had are decoded again on the host; with it faces marks + decodes
+128 rows per fill instead of 32 (`UFSM_FACES_FILL_ROWS`): bigger decode batches, w178 CT fill 79-82 -> 55-58 s on a loaded laptop).
 
 **GPU volcomp decoding** (`UFSM_GPU_DECODE=1`, opt-in; `src/nn_gpudec.cu`): every lossy (mode 0) volcomp substream that
 z3_read / z3_read_sub decodes goes to the GPU instead of volcomp_fast.h, byte-identical (one thread per substream for the tANS
