@@ -192,6 +192,7 @@ static int usage(void) {
         "  ufsm fit-join <out-set> <fields-dir> <slab-model> <z0> <z1> ...   independent z-slab fits -> one fit set, gauges matched on the overlaps\n"
         "  ufsm fields-oracle <fields-dir> <phase-root> <phase-key> <out-dir>   fit fields with the phase planes from a label phase raster (oracle / swap)\n"
         "  ufsm count-field <in-fields> <out-fields> [--method ls|ray] [--R 3] [--model DIR]   winding from the density counts, the phase only sub-turn (src/countfield.c)\n"
+        "  ufsm cf-compare <model-a> <model-b> [fields] [--step 4]   two count-field models: delta and snap-integer agreement (src/countfield.c)\n"
         "  ufsm vwt-sample SOURCES OUT N   ray-model training slabs + targets (im / va / ph / comp / pw raw) and the sampler throughput\n"
         "  ufsm ray-check WINDINGS.json FIELDS   turn counts of a field set between human relative-winding ray points (phase / density)\n"
         "  ufsm patch-raster LIST OUT --shape Z,Y,X   surface patches (tifxyz) as phase-0 shell training targets (512^3 shards)\n"
@@ -3930,6 +3931,7 @@ int cmd_ray_check(int argc, char **argv);   /* src/raycheck.c */
 int cmd_vwt_sample(int argc, char **argv);   /* src/vwt_sample.c */
 int cmd_hires_count(int argc, char **argv);
 int cmd_spiral_fit(int argc, char **argv);    /* src/countfield.c */
+int cmd_cf_compare(int argc, char **argv);    /* src/countfield.c */
 int cmd_phase_packing(int argc, char **argv);   /* src/packmap.c */
 int cmd_wbench_stats(int argc, char **argv);   /* src/wbench.c */
 int cmd_ckpt_avg(int argc, char **argv);   /* src/wbench.c */
@@ -3983,6 +3985,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "vwt-sample")) return cmd_vwt_sample(argc, argv);
     if (!strcmp(cmd, "hires-count")) return cmd_hires_count(argc, argv);
     if (!strcmp(cmd, "spiral-fit")) return cmd_spiral_fit(argc, argv);
+    if (!strcmp(cmd, "cf-compare")) return cmd_cf_compare(argc, argv);
     if (!strcmp(cmd, "phase-packing")) return cmd_phase_packing(argc, argv);
     if (!strcmp(cmd, "wbench-stats")) return cmd_wbench_stats(argc, argv);
     if (!strcmp(cmd, "ckpt-avg")) return cmd_ckpt_avg(argc, argv);

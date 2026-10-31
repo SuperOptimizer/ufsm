@@ -4,8 +4,8 @@
 #   1. limits: the REAL cgroup CPU / RAM limits. nproc and free show the host: 256 CPUs and 1 TB on a pod whose cgroup allows
 #      13.6 CPUs and 62 GB. Also the GPU / MIG slice, CUDA and disk.
 #      -> $POD/limits.txt; then `ufsm sysinfo` once the binary exists.
-#   2. deps: apt packages (root only), skipped when they are all present:
-#      gcc-14 (C23), libcurl / zstd / blosc / zlib / ssl / jpeg dev, jq, curl, rsync, time.
+#   2. deps: apt packages (root only), skipped when they are all present (xxhash: zarr3.c since iospeed):
+#      gcc-14 (C23), libcurl / zstd / blosc / zlib / ssl / jpeg / xxhash dev, jq, curl, rsync, time.
 #   3. clone or fast-forward ufsm ($BRANCH, default master) into $POD/ufsm, then build it.
 #      The Makefile finds gcc-14, /usr/local/cuda-*, -ccbin and -lstdc++ by itself.
 #      make -j <cgroup CPUs>. ARCH=86 is picked for sm_80/86/89 GPUs: software MX, since the fp4 / fp8 kernels need sm_120a.
@@ -63,7 +63,7 @@ cat $POD/limits.txt
 say "pod $POD: $NCPU CPUs, $MEMGB GB (cgroup)"
 
 # --- 2. deps ---
-PKGS="build-essential gcc-14 g++-14 make git pkg-config ca-certificates curl jq rsync time libcurl4-openssl-dev libzstd-dev libblosc-dev zlib1g-dev libssl-dev libjpeg-dev"
+PKGS="build-essential gcc-14 g++-14 make git pkg-config ca-certificates curl jq rsync time libcurl4-openssl-dev libzstd-dev libblosc-dev zlib1g-dev libssl-dev libjpeg-dev libxxhash-dev"
 if [ "${NOAPT:-0}" != 1 ] && command -v apt-get > /dev/null; then
   miss=$(for p in $PKGS; do dpkg -s $p > /dev/null 2>&1 || echo $p; done | tr '\n' ' ')
   if [ -n "${miss// /}" ]; then
