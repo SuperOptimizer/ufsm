@@ -110,6 +110,7 @@ NNSRC = $(wildcard src/nn_*.cu)
 NNOBJ = $(patsubst src/%.cu,$(B)/%.o,$(NNSRC))
 $(B)/nn_%.o: src/nn_%.cu | $(B)
 	$(NVCC) $(NVFLAGS) $(TYPEFLAGS) -Xfatbin=-compress-all -MMD -MP -c $< -o $@
+$(B)/nn_flat.o: NVFLAGS += --default-stream per-thread   # concurrent strip-flatten chunks on one device
 $(B)/nn.o: $(NNOBJ)
 	ld -r -o $@ $^
 # count-field on the GPU mirrors the CPU's rounding (src/nn_cf.cu): IEEE division / sqrt, no FMA contraction, no fast math
@@ -270,6 +271,9 @@ test-all: $(B)/test_flatten_gpu
 $(B)/test_strip: tests/test_strip.c $(B)/strip.o $(B)/flatten.o $(B)/imgops.o $(B)/jpegpar.o $(B)/tiffw.o $(B)/tiff.o $(B)/tfx.o $(B)/surfcomp.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
 test-all: $(B)/test_strip
+$(B)/test_strip_gpu: tests/test_strip.c $(B)/strip.o $(B)/flatten.o $(B)/imgops.o $(B)/jpegpar.o $(B)/tiffw.o $(B)/tiff.o $(B)/tfx.o $(B)/surfcomp.o $(B)/nn_flat.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DSTRIP_GPU $^ -o $@ $(LDLIBS) $(CUDALIBS)
+test-all: $(B)/test_strip_gpu
 $(B)/test_faces: tests/test_faces.c $(B)/faces.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
 test-all: $(B)/test_faces
@@ -363,6 +367,9 @@ test-all: $(B)/test_robust
 $(B)/test_render_stream: tests/test_render_stream.c $(B)/render.o $(B)/inkcompare.o $(B)/imgops.o $(B)/jpegpar.o $(B)/tiff.o $(B)/tiffw.o $(B)/z3w.o $(B)/zarr3.o $(B)/store.o $(B)/json.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
 test-all: $(B)/test_render_stream
+$(B)/test_render_fill: tests/test_render_fill.c $(B)/render.o $(B)/inkcompare.o $(B)/imgops.o $(B)/jpegpar.o $(B)/tiff.o $(B)/tiffw.o $(B)/z3w.o $(B)/zarr3.o $(B)/store.o $(B)/json.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
+test-all: $(B)/test_render_fill
 $(B)/test_tiffw: tests/test_tiffw.c $(B)/tiffw.o $(B)/tiff.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
 $(B)/test_wind: tests/test_wind.c src/wind.h $(B)/wind.o
@@ -598,12 +605,14 @@ test-all: $(B)/test_gpu_aug $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover 
 	./$(B)/test_flatten
 	./$(B)/test_flatten_gpu
 	./$(B)/test_strip
+	./$(B)/test_strip_gpu
 	./$(B)/test_faces
 	./$(B)/test_faces_gpu
 	./$(B)/test_fit_emb
 	./$(B)/test_distill
 	./$(B)/test_tiffw
 	./$(B)/test_render_stream
+	./$(B)/test_render_fill
 	./$(B)/test_imgops
 	./$(B)/test_jpegpar
 	./$(B)/test_tfx

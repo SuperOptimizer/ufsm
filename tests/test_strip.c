@@ -71,6 +71,32 @@ int main(void) {
     snprintf(p, sizeof p, "%s/strip/flat/stripes.tsv", root); f = fopen(p, "r"); double area = 0;
     if (f) { char line[1024]; if (fgets(line, sizeof line, f)) while (fgets(line, sizeof line, f)) { char nm[64]; int a, c, d; double u0, l, v; if (sscanf(line, "%63s %d %d %d %lf %lf %lf", nm, &a, &c, &d, &u0, &l, &v) == 7) area += v; } fclose(f); }
     { const double A = Lcm * (Hcm + step * um * 1e-4); CHECK(fabs(area - A) < 0.03 * A, "stripes valid area %.4f vs %.4f cm2", area, A); }
+    /* --jobs / --stripe-jobs: chunks and stripes on concurrent workers, in order: --jobs 3 (1 thread each) writes the bytes of --jobs 1 --threads 1
+       (CPU: the SLIM sums depend on the threads per chunk; GPU: on nothing); chunks.tsv equal but for its seconds column */
+    {
+        const char *jv[2] = {"1", "3"};
+        for (int k = 0; k < 2; k++) {
+            char a1[300], a2[300]; snprintf(a1, sizeof a1, "%s/strip", root); snprintf(a2, sizeof a2, "%s/fj%s", root, jv[k]);
+            char *av[] = {"ufsm", "strip-flatten", a1, "--out", a2, "--stride", "96", "--threads", (char *)jv[k], "--jobs", (char *)jv[k], "--stripe-jobs", (char *)jv[k], "--stripe-px", "1500", "--iters", "60", "--cg", "300", "--tol", "1e-9"};
+            CHECK(!cmd_strip_flatten(22, av), "strip-flatten --jobs %s failed", jv[k]);
+        }
+        char cmd[2048];
+        snprintf(cmd, sizeof cmd, "cd %s/fj1 && test -e flat.json && for x in $(find . -type f ! -name chunks.tsv); do cmp -s $x ../fj3/$x || { echo $x differs; exit 1; }; done && "
+                 "cut -f1-10 chunks.tsv > ../c1 && cut -f1-10 ../fj3/chunks.tsv > ../c3 && cmp -s ../c1 ../c3", root);
+        CHECK(!system(cmd), "strip-flatten --jobs 3 output differs from --jobs 1");
+#ifdef STRIP_GPU
+        {   /* GPU vs CPU: the same flattening within the solvers' summation-order noise */
+            char a1[300], a2[300]; snprintf(a1, sizeof a1, "%s/strip", root); snprintf(a2, sizeof a2, "%s/fcpu", root);
+            char *av[] = {"ufsm", "strip-flatten", a1, "--out", a2, "--stride", "96", "--threads", "4", "--gpu", "0", "--stripe-px", "1500", "--iters", "60", "--cg", "300", "--tol", "1e-9"};
+            CHECK(!cmd_strip_flatten(20, av), "strip-flatten --gpu 0 failed");
+            char q[400], c[4096] = {0}; snprintf(q, sizeof q, "%s/fcpu/flat.json", root); FILE *g = fopen(q, "r");
+            if (g) { size_t nr = fread(c, 1, sizeof c - 1, g); (void)nr; fclose(g); }
+            const double l2 = num(c, "\"length_cm\": "), b50 = num(c, "\"aniso_p50\": "), b95 = num(c, "\"aniso_p95\": ");
+            printf("strip GPU vs CPU: length %.5f / %.5f cm, aniso p50 %.5f / %.5f, p95 %.5f / %.5f\n", len, l2, a50, b50, a95, b95);
+            CHECK(fabs(len - l2) < 1e-4 * l2 && fabs(a50 - b50) < 1e-3 && fabs(a95 - b95) < 1e-3, "GPU vs CPU flattening differs");
+        }
+#endif
+    }
     /* strip-mosaic on synthetic renders of the stripes: --threads 1 and --threads 4 must write the same bytes */
     {
         char rdir[400]; snprintf(rdir, sizeof rdir, "%s/render", root); snprintf(cmd, sizeof cmd, "mkdir -p %s", rdir); if (system(cmd)) {}
@@ -100,6 +126,33 @@ int main(void) {
           CHECK(!cmd_strip_mosaic(15, av), "strip-mosaic --stretch --wait-renders failed"); }
         snprintf(cmd, sizeof cmd, "cd %s/m1 && for x in *; do cmp -s $x ../m5/$x || exit 1; done", root);
         CHECK(!system(cmd), "strip-mosaic --stretch --wait-renders output differs from the two-pass run");
+        /* --papyrus: papyrus-look stripe JPEGs, a one-band overview / long strip; the same tables as the grey mosaic */
+        { char a1[400], a3[400]; snprintf(a1, sizeof a1, "%s/strip/flat", root); snprintf(a3, sizeof a3, "%s/m6", root);
+          char *av[] = {"ufsm", "strip-mosaic", a1, rdir, a3, "--threads", "2", "--rows", "2", "--overview-px", "600", "--stretch", sv, "--papyrus", "1", "--papyrus-bg", "128"};
+          CHECK(!cmd_strip_mosaic(17, av), "strip-mosaic --papyrus failed"); }
+        snprintf(cmd, sizeof cmd, "cd %s && ls m6/*_papyrus.jpg > /dev/null && test -s m6/overview.jpg && test -s m6/strip_long.jpg && cmp -s m1/strip_papyrus.tsv m6/strip_papyrus.tsv && cmp -s m1/papyrus_wraps.tsv m6/papyrus_wraps.tsv", root);
+        CHECK(!system(cmd), "strip-mosaic --papyrus outputs missing or its tables differ");
+        /* --fill-maps: fill maps marking every pixel rendered (flag 100: a bridged grid hole) widen the mask: valid area grows */
+        { char fm[400]; snprintf(fm, sizeof fm, "%s/fm", root); snprintf(cmd, sizeof cmd, "mkdir -p %s", fm); CHECK(!system(cmd), "mkdir");
+          snprintf(cmd, sizeof cmd, "cd %s && ls *_ct.tif", rdir); FILE *ls = popen(cmd, "r"); char nm[256];
+          while (ls && fgets(nm, sizeof nm, ls)) { nm[strcspn(nm, "\n")] = 0; nm[strlen(nm) - 7] = 0; int w, h; snprintf(p, sizeof p, "%s/%s_ct.tif", rdir, nm); uint8_t *im = img_read_u8(p, &w, &h);
+              if (im) { memset(im, 100, (size_t)w * h); snprintf(p, sizeof p, "%s/%s_fill.tif", fm, nm); CHECK(!tiffw_write(p, w, h, 1, im, 1), "write fill map"); free(im); } }
+          if (ls) pclose(ls);
+          /* a copy of the flattened strip with a hole in every stripe grid (vertices -1): the plain mosaic loses it, --fill-maps keeps it */
+          snprintf(cmd, sizeof cmd, "cp -r %s/strip/flat %s/flat2", root, root); CHECK(!system(cmd), "cp flat");
+          snprintf(cmd, sizeof cmd, "ls %s/flat2/stripes", root); ls = popen(cmd, "r");
+          while (ls && fgets(nm, sizeof nm, ls)) { nm[strcspn(nm, "\n")] = 0; int w, h; snprintf(p, sizeof p, "%s/flat2/stripes/%s/z.tif", root, nm); float *Z = img_read_f32(p, &w, &h);
+              if (Z) { for (int r = h / 4; r < h / 2; r++) for (int c = w / 4; c < w / 2; c++) Z[(size_t)r * w + c] = -1.f; CHECK(!tiffw_write(p, w, h, 3, Z, 1), "write z"); free(Z); } }
+          if (ls) pclose(ls);
+          char a1[400], a3[400]; snprintf(a1, sizeof a1, "%s/flat2", root);
+          snprintf(a3, sizeof a3, "%s/m8", root); char *av0[] = {"ufsm", "strip-mosaic", a1, rdir, a3, "--threads", "2", "--rows", "2", "--overview-px", "600", "--stretch", sv};
+          CHECK(!cmd_strip_mosaic(13, av0), "strip-mosaic on the holed grids failed");
+          snprintf(a3, sizeof a3, "%s/m7", root);
+          char *av[] = {"ufsm", "strip-mosaic", a1, rdir, a3, "--threads", "2", "--rows", "2", "--overview-px", "600", "--stretch", sv, "--fill-maps", fm};
+          CHECK(!cmd_strip_mosaic(15, av), "strip-mosaic --fill-maps failed");
+          double v1 = 0, v7 = 0; for (int k = 0; k < 2; k++) { snprintf(p, sizeof p, "%s/%s/strip_papyrus.tsv", root, k ? "m7" : "m8"); FILE *t = fopen(p, "r"); char ln[256];
+              if (t) { if (fgets(ln, sizeof ln, t)) {} while (fgets(ln, sizeof ln, t)) { double u, v; if (sscanf(ln, "%lf %lf", &u, &v) == 2) *(k ? &v7 : &v1) += v; } fclose(t); } }
+          CHECK(v7 > v1 && v1 > 0, "--fill-maps valid area %g vs %g", v7, v1); }
     }
     if (!fails) { snprintf(cmd, sizeof cmd, "rm -r %s", root); if (system(cmd)) {} }
     printf("test_strip: %s\n", fails ? "FAILED" : "ok");
