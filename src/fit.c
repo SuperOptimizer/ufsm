@@ -2781,19 +2781,25 @@ fit_set *fit_run_slabs(const char *dir, const fit_cfg *c, int slab, int overlap)
 
 /* ---- grid evaluation of a fit set on the GPU ---- */
 struct fit_set_dev { int nm; fit_dev *hm, *dm; void **buf; int nb; float *out; size_t outn; fit_grid_row *rows; int nrows; };
-static void *dev_copy(fit_set_dev *g, const void *src, size_t n) { void *d = nn_malloc(n ? n : 4); if (n) nn_h2d(d, src, n); g->buf[g->nb++] = d; return d; }
+/* (nn_malloc_try: a device short of memory leaves no sticky error; a null pointer here once became an illegal access in nn_fit_grid) */
+static void *dev_copy(fit_set_dev *g, const void *src, size_t n, int *bad) { if (*bad) return nullptr; void *d = nn_malloc_try(n ? n : 4); if (!d) { *bad = 1; return nullptr; } if (n) nn_h2d(d, src, n); g->buf[g->nb++] = d; return d; }
 fit_set_dev *fit_set_upload(const fit_set *s) {
     if (s->n + 1 > 4096) { fprintf(stderr, "fit_set_upload: at most 4095 slabs\n"); return nullptr; }
     fit_set_dev *g = calloc(1, sizeof *g); g->nm = s->n + 1; g->hm = calloc(g->nm, sizeof(fit_dev)); g->buf = calloc((size_t)5 * g->nm + 1, sizeof *g->buf);   /* (5 arrays per model, the model table) */
+    int bad = 0; size_t need = 0;
     for (int k = 0; k < g->nm; k++) {
         const fit_model *m = k < s->n ? s->slab[k] : s->global; fit_dev *d = &g->hm[k];
         const int na = (int)(m->D * m->h) + 1;
         d->D = m->D; d->H = m->H; d->W = m->W; d->h = (float)m->h;
-        d->cy = dev_copy(g, m->cy, na * 4); d->cx = dev_copy(g, m->cx, na * 4); d->naxis = na;
-        d->dir = m->dir; d->nk = m->nk; d->knot_dz = m->knot_dz; d->pitch = dev_copy(g, m->pitch, m->nk * 4); d->offset = dev_copy(g, m->offset, m->nk * 4);
-        d->L = m->L; d->lz = m->lz; d->ly = m->ly; d->lx = m->lx; d->delta = dev_copy(g, m->delta, (size_t)m->lz * m->ly * m->lx * 4);
+        d->cy = dev_copy(g, m->cy, na * 4, &bad); d->cx = dev_copy(g, m->cx, na * 4, &bad); d->naxis = na;
+        d->dir = m->dir; d->nk = m->nk; d->knot_dz = m->knot_dz; d->pitch = dev_copy(g, m->pitch, m->nk * 4, &bad); d->offset = dev_copy(g, m->offset, m->nk * 4, &bad);
+        d->L = m->L; d->lz = m->lz; d->ly = m->ly; d->lx = m->lx; d->delta = dev_copy(g, m->delta, (size_t)m->lz * m->ly * m->lx * 4, &bad);
     }
-    g->dm = dev_copy(g, g->hm, g->nm * sizeof(fit_dev));
+    g->dm = dev_copy(g, g->hm, g->nm * sizeof(fit_dev), &bad);
+    if (bad) {   /* (callers fall back to the CPU) */
+        for (int k = 0; k < s->n + 1; k++) { const fit_model *m = k < s->n ? s->slab[k] : s->global; need += (size_t)m->lz * m->ly * m->lx * 4; }
+        fprintf(stderr, "fit_set_upload: no device memory for the %.2f GB of models\n", need / 1e9); fit_set_dev_free(g); return nullptr;
+    }
     return g;
 }
 void fit_set_dev_free(fit_set_dev *g) {
@@ -2820,7 +2826,7 @@ int fit_set_grid(fit_set_dev *g, const fit_set *s, const double o[3], const int6
     const size_t per = (size_t)n[1] * n[2]; if (!per || n[0] <= 0) return 0;
     int64_t zb = (int64_t)((64u << 20) / per); if (zb < 1) zb = 1; if (zb > n[0]) zb = n[0];   /* ~256 MB of output per batch */
     if (g->outn < (size_t)zb * per) { if (g->out) nn_free(g->out); g->outn = (size_t)zb * per; g->out = nn_malloc(g->outn * 4); if (!g->out) return -1; }
-    if (g->nrows < zb) { if (g->rows) nn_free(g->rows); g->nrows = (int)zb; g->rows = nn_malloc(zb * sizeof(fit_grid_row)); }
+    if (g->nrows < zb) { if (g->rows) nn_free(g->rows); g->nrows = 0; if (!(g->rows = nn_malloc_try(zb * sizeof(fit_grid_row)))) return -1; g->nrows = (int)zb; }
     fit_grid_row *hr = malloc(zb * sizeof *hr);
     for (int64_t z0 = 0; z0 < n[0]; z0 += zb) {
         const int64_t nz = n[0] - z0 < zb ? n[0] - z0 : zb;

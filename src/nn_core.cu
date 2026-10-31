@@ -348,6 +348,8 @@ extern "C" void nn_d2d_kernel(void *d, const void *s, size_t n) {   /* a kernel 
     if (n % 16) CK(cudaMemcpyAsync((char *)d + n16 * 16, (const char *)s + n16 * 16, n % 16, cudaMemcpyDeviceToDevice, 0));
 }
 extern "C" void nn_sync(void) { CK(cudaDeviceSynchronize()); }
+/* a fault of an earlier kernel (sticky: the context is lost, every later call fails): its message, else nullptr (callers stop instead of writing zeros) */
+extern "C" const char *nn_device_error(void) { const cudaError_t e = cudaDeviceSynchronize(); if (e == cudaSuccess) return nullptr; cudaGetLastError(); return cudaGetErrorString(e); }
 extern "C" void *nn_host_alloc(size_t n) { void *p = nullptr; CK(cudaMallocHost(&p, n)); return p; }
 extern "C" void *nn_managed_alloc(size_t n) { void *p = nullptr; if (cudaMallocManaged(&p, n ? n : 4) != cudaSuccess) { cudaGetLastError(); return nullptr; } return p; }
 extern "C" void *nn_malloc_try(size_t n) { void *p = nullptr; if (cudaMalloc(&p, n ? n : 4) != cudaSuccess) { cudaGetLastError(); return nullptr; } alloc_log(n, __builtin_return_address(0)); return p; }

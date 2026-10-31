@@ -1267,14 +1267,14 @@ static int cmd_fit(int argc, char **argv) {
         const int BZ = 32, dev = use_stream && !fb.f.t[1];
         uint8_t *tb = dev ? malloc((size_t)3 * BZ * plane) : nullptr; double st[4] = {0}; int bad = dev && !tb;
         fit_set_dev *gd = c.cpu ? nullptr : fit_set_upload(refm);   /* (W_ref on the GPU; null: the CPU grid) */
-        int gpug = dev && gd && !ufsm_env_on("UFSM_PG_CPU"), zc = 0, zcpu = 0;   /* the per-cell pass on the device planes (UFSM_PG_CPU=1: the CPU pass); zc: the CPU pass from this row (a device block short of memory) */
+        int gpug = dev && !ufsm_env_on("UFSM_PG_CPU"), zc = 0, zcpu = !gd;   /* the per-cell pass on the device planes (UFSM_PG_CPU=1: the CPU pass); zc: the CPU pass from this row (a device block short of memory) */
         if (gpug) {   /* blocks of <= 16M cells: W_ref (device grid -> host) uploaded, the gate in place on the device, pc / ps back to the host */
             int GZ = (int)((16ll << 20) / (long long)plane); if (GZ < 1) GZ = 1; if (GZ > D) GZ = D;   /* (~22 B per cell of device scratch) */
             float *wr = malloc((size_t)GZ * plane * sizeof(float)), *ay = malloc(GZ * sizeof(float)), *ax = malloc(GZ * sizeof(float)); if (!wr || !ay || !ax) bad = 1;
             for (int z0 = 0; z0 < D && !bad; z0 += GZ) {
                 const int nz = z0 + GZ <= D ? GZ : D - z0; const size_t off = (size_t)z0 * plane;
                 const double o3[3] = {z0 * fb.h + c.ref_off[0], c.ref_off[1], c.ref_off[2]}; const int64_t n3[3] = {nz, H, W};
-                if (fit_set_grid(gd, refm, o3, n3, fb.h, 0, wr)) { fprintf(stderr, "fit: phase gate: no device memory for the W_ref grid: the CPU pass from row %d\n", z0); gpug = 0; zc = z0; zcpu = 1; break; }
+                if (gd ? fit_set_grid(gd, refm, o3, n3, fb.h, 0, wr) : fit_set_grid_cpu(refm, o3, n3, fb.h, 0, nullptr, wr)) {   /* (no device room for the ref: its grid on the CPU) */ fprintf(stderr, "fit: phase gate: no device memory for the W_ref grid: the CPU pass from row %d\n", z0); gpug = 0; zc = z0; zcpu = 1; break; }
                 for (int z = 0; z < nz; z++) { const double pz = (z0 + z + 0.5) * fb.h; const int i0 = (int)fmin(fmax(floor(pz), 0), na - 1), i1 = i0 + 1 < na ? i0 + 1 : i0; const double t = fmin(fmax(pz - i0, 0), 1);
                     ay[z] = (float)(fb.f.cy[i0] + t * (fb.f.cy[i1] - fb.f.cy[i0])); ax[z] = (float)(fb.f.cx[i0] + t * (fb.f.cx[i1] - fb.f.cx[i0])); }
                 uint8_t *dp = fst.dfield;
@@ -1294,6 +1294,7 @@ static int cmd_fit(int argc, char **argv) {
         }
         free(tb); if (gd) fit_set_dev_free(gd);
         if (bad) { fprintf(stderr, "fit: --phase-gate failed (memory / ref grid)\n"); return 1; }
+        if (dev) { const char *de = nn_device_error(); if (de) { fprintf(stderr, "fit: device error after the phase gate (%s): no fit\n", de); return 1; } }
         clock_gettime(CLOCK_MONOTONIC, &tg1);
         fprintf(stderr, "fit: phase gate (%s): mean rotation q %.3f, the ref's phase on %.3f of %.0f material cells (%.1f s)\n", pg.mode ? "ref everywhere" : "gated",
                 st[3] ? st[2] / st[3] : 0, st[0] ? st[1] / st[0] : 0, st[0], (tg1.tv_sec - tg0.tv_sec) + 1e-9 * (tg1.tv_nsec - tg0.tv_nsec));
@@ -1303,6 +1304,7 @@ static int cmd_fit(int argc, char **argv) {
     else if (slab > 0) fs = fit_run_slabs(dir, &c, slab, overlap);
     else { fs = calloc(1, sizeof *fs); fs->global = fit_run(&fb.f, &c); if (!fs->global) { free(fs); fs = nullptr; } }
     if (!fs) { fprintf(stderr, "fit: no model%s%s\n", min ? " in " : "", min ? min : ""); return 1; }
+    if (!min && !c.cpu) { const char *de = nn_device_error(); if (de) { fprintf(stderr, "fit: device error during the fit (%s): no model written\n", de); return 1; } }
     const fit_model *m = fs->global;
     if (!min && !slab) for (int d = 0; d < 3; d++) fs->global->origin[d] = fb.origin[d];
     if (!min) { fs->global->um = fb.um; for (int k = 0; k < fs->n; k++) fs->slab[k]->um = fb.um; }
