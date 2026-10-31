@@ -422,7 +422,8 @@ static int gd_decode(const gd_chunk *c, uint32_t mask, uint8_t *dst, uint8_t *dd
         payload += (size_t)c->tok_n[s] + c->byp_n[s];
     }
     if (need_in > G.in_cap || need_rec > G.rec_cap || k > G.max_items) return -1;
-    if (payload < (size_t)k * G.min_bytes) return -1;   /* near-empty substreams (flat blocks: ink, air) decode faster on the CPU than a round trip */
+    if (!ddst && payload < (size_t)k * G.min_bytes) return -1;   /* near-empty substreams (flat blocks: ink, air) decode faster on the CPU than a round
+                                                                   trip; not into a device chunk (the bytes must reach the device anyway) */
     gd_req q = {}; q.mask = mask; q.dst = dst; q.ddst = ddst; q.nitems = k;
     const uint32_t kout = ddst ? 0 : k;
     pthread_mutex_lock(&G.mu);
