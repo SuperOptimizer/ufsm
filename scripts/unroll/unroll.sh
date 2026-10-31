@@ -16,7 +16,7 @@
 #           bad-slab check (fit.log: "illegal memory", "loss 0.00000", no final loss line): refit on 1 lane, up to 3 tries, else fail
 #   join    -> slabs: fit-join --ref (refuses bad slabs) ; check -> join: wrap-check (wrapcheck.tsv verdicts; 0 CT peaks = fail)
 #   wraps   -> check: ufsm wraps (.sfc, step 4, --zr from scrolls.tsv, --min-cm2, --col-r p90)
-#   trim    -> wraps: the outer-end dup run (wrap-check) + near-empty outer wraps (on-papyrus <= PAPMIN 0.1) dropped: strip --last
+#   trim    -> wraps: the outer-end dup run (wrap-check) + near-empty outer wraps (on-papyrus <= PAPMIN 0.1; surf-stats) dropped: strip --last
 #           = the first kept id (state/strip.args, the dropped ids in progress.log); TRIM=0 or a --last in STRIPARGS: off
 #   strip   -> trim: ufsm strip ($STRIPARGS + --last) ; stripflat -> strip: strip-flatten (FLATX, default "--gpu 1"; FLATX= for the CPU) ;
 #   stripimg -> stripflat + ink: stretch from the 3 middle stripes, filled stripe renders (FILLX) + strip-mosaic img_fill (rgb) and
@@ -293,11 +293,12 @@ trim() {
       while [ $k -lt ${#ids[@]} ] && { [ ${ids[$k]} -gt $top ] || [ "${V[${ids[$k]}]:-}" = dup ]; }; do dropped+=" ${ids[$k]}"; k=$((k + 1)); done
       log "trim: outer-end dup run (wrap-check verdicts) + every wrap above it: $(echo $dropped | wc -w) wraps"
     fi
-    # (3) the near-empty outer tail: on-papyrus <= PAPMIN, computed 16 wraps at a time from the top
-    declare -A P; : > $pap
+    # (3) the near-empty outer tail: on-papyrus <= PAPMIN, computed from the top in batches of 1, 4, then 16 wraps (usually the first
+    # wrap below the dup run decides: one surf-stats of one wrap, ~5 s instead of ~65 s for 16 outer wraps on 0490B)
+    declare -A P; : > $pap; local nb=1
     while [ $k -lt ${#ids[@]} ]; do
       i=${ids[$k]}
-      if [ -z "${P[$i]:-}" ]; then batch=("${ids[@]:$k:16}"); while read -r a b; do P[$a]=$b; echo "$a $b" >> $pap; done < <(onpap "${batch[@]}"); [ -n "${P[$i]:-}" ] || P[$i]=0; fi
+      if [ -z "${P[$i]:-}" ]; then batch=("${ids[@]:$k:$nb}"); nb=$(( nb < 16 ? nb * 4 : 16 )); while read -r a b; do P[$a]=$b; echo "$a $b" >> $pap; done < <(onpap "${batch[@]}"); [ -n "${P[$i]:-}" ] || P[$i]=0; fi
       awk -v p=${P[$i]} -v m=${PAPMIN:-0.1} 'BEGIN { exit !(p <= m) }' || break
       dropped+=" $i"; k=$((k + 1))
     done
