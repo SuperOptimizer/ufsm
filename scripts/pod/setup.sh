@@ -69,9 +69,13 @@ if [ "${NOAPT:-0}" != 1 ] && command -v apt-get > /dev/null; then
   if [ -n "${miss// /}" ]; then
     [ "$(id -u)" = 0 ] || die "missing packages ($miss) and not root: install them or NOAPT=1"
     say "apt: $miss"
-    DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends $miss > /dev/null || die "apt-get install"
+    export DEBIAN_FRONTEND=noninteractive; apt-get update -qq || die "apt-get update"
+    # one failing package (gcc-14 missing on an older image) must not drop the rest: retry one by one, then check the ones the build needs
+    apt-get install -y -qq --no-install-recommends $miss > /dev/null || for p in $miss; do apt-get install -y -qq --no-install-recommends $p > /dev/null || say "apt: $p failed"; done
   else say "deps present"; fi
 fi
+# xxhash (zarr3.c) is the one fresh pod images lack: fail here, not halfway through the build
+[ -e /usr/include/xxhash.h ] || [ -e /usr/local/include/xxhash.h ] || die "xxhash.h missing: apt-get install libxxhash-dev"
 for t in git make curl jq pkg-config; do command -v $t > /dev/null || die "$t missing"; done
 
 # --- 3. clone + build ---
