@@ -1,6 +1,7 @@
 /* ufsm reg overlay: a coarse-scan plane next to the fine scan resampled onto it through a map (src/reg.h), as one JPEG:
    coarse | fine resampled / checkerboard | magenta-green composite (coarse magenta, fine green: grey where they agree). */
 #include "reg.h"
+#include "sysinfo.h"
 #include "json.h"
 #include "imgops.h"
 #include <math.h>
@@ -129,7 +130,7 @@ int cmd_reg_overlay(int argc, char **argv) {
     if (j.nr <= 0 || j.ncol <= 0 || j.nr * j.ncol > 64000000) { fprintf(stderr, "reg overlay: bad plane size %lld x %lld\n", (long long)j.nr, (long long)j.ncol); return 1; }
     const size_t N = (size_t)j.nr * j.ncol;
     j.img_c = calloc(N, sizeof *j.img_c); j.img_f = calloc(N, sizeof *j.img_f);
-    const int nt = atoi(opt(argc, argv, "--threads", "8")); pthread_t th[64];
+    const int nt = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 8); pthread_t th[64];
     for (int t = 0; t < nt && t < 64; t++) pthread_create(&th[t], nullptr, ov_worker, &j);
     for (int t = 0; t < nt && t < 64; t++) pthread_join(th[t], nullptr);
     float lc, hc, lf, hf; stretch(j.img_c, N, &lc, &hc); stretch(j.img_f, N, &lf, &hf);

@@ -1,5 +1,6 @@
 /* Sheet-identity embeddings as winding evidence: see src/fit_emb.h */
 #include "fit_emb.h"
+#include "sysinfo.h"
 #include "embz.h"
 #include "json.h"
 #include "zarr3.h"
@@ -185,7 +186,7 @@ static void *vote_main(void *p) {
     free(buf); return nullptr;
 }
 void emb_shift_votes(const emb_vol *e, size_t n, const emb_side *a, const emb_side *b, int rmax, double phi, int32_t *r, float *conf, int threads) {
-    if (threads <= 0) { const long c = sysconf(_SC_NPROCESSORS_ONLN); threads = c > 0 ? (int)c : 1; }
+    if (threads <= 0) { const long c = ufsm_ncpu(); threads = c > 0 ? (int)c : 1; }
     if (threads > 64) threads = 64;
     vjob J = {.e = e, .n = n, .a = a, .b = b, .rmax = rmax, .phi = phi, .r = r, .conf = conf}; atomic_init(&J.next, 0);
     pthread_t th[64]; int nt = 0;

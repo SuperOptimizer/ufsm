@@ -1,5 +1,6 @@
 /* SLIM flattening of tifxyz wraps: see src/flatten.h. CLI: ufsm flatten, ufsm flatten-warp (end of file). */
 #include "flatten.h"
+#include "sysinfo.h"
 #include "imgops.h"
 #include "tiffw.h"
 #include <dirent.h>
@@ -31,7 +32,7 @@ static void parfor(long n, int nt, pf_fn f, void *ctx) {
     for (int t = 1; t < nt; t++) pthread_join(th[t], nullptr);
 }
 
-flat_opts flat_opts_default(void) { return (flat_opts){30, 200, 16, 20000, 1, 3.0, 1e-5, 0}; }
+flat_opts flat_opts_default(void) { return (flat_opts){30, 200, 16, 20000, 1, 3.0, 1e-5, 0, 0, nullptr, 0, -1}; }
 
 /* ---- per-triangle geometry: gradient coefficients g (6: g0, g1, g2 in the triangle's own 2D frame) and 3D area ---- */
 static int tri_frame(const double *p0, const double *p1, const double *p2, double g[6], double *area) {
@@ -252,11 +253,13 @@ static void slim_free(slim *S) {
 
 /* src/nn_flat.cu (weak: binaries without it, e.g. test_flatten, link CPU-only) */
 int flat_slim_gpu(const double *g, const double *A, const int *tri, int nt, const int *vo, const int *vl, int nv, double *x,
-                  int iters, int cg_iters, double tol, int verbose, const char *tag, double *Eout) __attribute__((weak));
+                  int iters, int cg_iters, double tol, int verbose, const char *tag, int dev, double *Eout) __attribute__((weak));
+int flat_gpu_count(void) __attribute__((weak));
+int flat_gpu_devices(void) { return flat_gpu_count ? flat_gpu_count() : 0; }
 
 /* SLIM iterations on S (S->x = the current uv, flip-free) */
 static double slim_run(slim *S, const flat_opts *o, int iters, const char *tag) {
-    if (o->gpu && flat_slim_gpu) { double E; if (!flat_slim_gpu(S->g, S->A, S->tri, S->nt, S->vo, S->vl, S->nv, S->x, iters, o->cg_iters, o->tol, o->verbose, tag, &E)) return E; }
+    if (o->gpu && flat_slim_gpu) { double E; if (!flat_slim_gpu(S->g, S->A, S->tri, S->nt, S->vo, S->vl, S->nv, S->x, iters, o->cg_iters, o->tol, o->verbose, tag, o->gpu_dev, &E)) return E; }
     double E = energy_at(S, S->x); const size_t n2 = (size_t)S->nv * 2;
     if (o->verbose) fprintf(stderr, "flatten: %s %d vertices %d triangles, energy %.5f\n", tag, S->nv, S->nt, E);
     if (!isfinite(E)) return E;
@@ -439,6 +442,35 @@ static void prolongate(const level *C, level *F, const flat_opts *o) {
     free(dl); free(known); free(bad); free(acc); free(nn);
 }
 
+/* vertices left in no triangle (all theirs dropped by prolongate) have no energy term: SLIM leaves them wherever the prolongation put them,
+   which then steers the Procrustes alignment, the next level's prolongation and ufsm strip-flatten's blend. Their displacement (uv - uv0)
+   becomes the mean of their 4 lattice neighbours' that are in a triangle (or already filled), ring by ring (Jacobi: deterministic). */
+static void fill_orphans(level *L) {
+    flat_mesh *m = &L->m; uint8_t *ok = calloc((size_t)m->nv, 1); int *li = malloc((size_t)m->nv * 4); if (!ok || !li) { free(ok); free(li); return; }
+    for (int t = 0; t < 3 * m->nt; t++) ok[m->tri[t]] = 1;
+    long left = 0; for (int v = 0; v < m->nv; v++) left += !ok[v];
+    if (!left) { free(ok); free(li); return; }
+    for (size_t q = 0; q < (size_t)L->lw * L->lh; q++) if (L->lv[q] >= 0) li[L->lv[q]] = (int)q;
+    double *nd = malloc((size_t)m->nv * 16); uint8_t *nw = calloc((size_t)m->nv, 1);
+    for (int pass = 0; left && nd && nw && pass < 100000; pass++) {
+        long got = 0;
+        for (int v = 0; v < m->nv; v++) {
+            if (ok[v]) continue;
+            const int i = li[v] / L->lw, j = li[v] % L->lw, N[4][2] = {{i - 1, j}, {i + 1, j}, {i, j - 1}, {i, j + 1}}; double a = 0, b = 0; int n = 0;
+            for (int k = 0; k < 4; k++) {
+                if (N[k][0] < 0 || N[k][0] >= L->lh || N[k][1] < 0 || N[k][1] >= L->lw) continue;
+                const int u = L->lv[(size_t)N[k][0] * L->lw + N[k][1]]; if (u < 0 || ok[u] != 1) continue;
+                a += m->uv[2 * u] - m->uv0[2 * u]; b += m->uv[2 * u + 1] - m->uv0[2 * u + 1]; n++;
+            }
+            if (n) { nd[2 * v] = a / n; nd[2 * v + 1] = b / n; nw[v] = 1; got++; }
+        }
+        for (int v = 0; v < m->nv; v++) if (nw[v]) { m->uv[2 * v] = m->uv0[2 * v] + nd[2 * v]; m->uv[2 * v + 1] = m->uv0[2 * v + 1] + nd[2 * v + 1]; ok[v] = 1; nw[v] = 0; }
+        if (!got) break;   /* (an isolated orphan island: stays) */
+        left -= got;
+    }
+    free(nd); free(nw); free(ok); free(li);
+}
+
 int flat_grid(const float *X, const float *Y, const float *Z, int w, int h, double step, const flat_opts *o, flat_mesh *out, flat_stats *before, flat_stats *after) {
     enum { MAXL = 12 }; level L[MAXL]; int nl = 0;
     int D = o->decim < 1 ? 1 : o->decim;
@@ -460,6 +492,7 @@ int flat_grid(const float *X, const float *Y, const float *Z, int w, int h, doub
         if (o->verbose) fprintf(stderr, "flatten: %s done: energy %.5f in %.1fs\n", tag, E, fnow() - t0);
         slim_free(&S);
         if (!isfinite(E)) rc = -1;
+        else fill_orphans(&L[l]);
     }
     for (int l = 1; l < nl; l++) { free(L[l].lv); flat_mesh_free(&L[l].m); }
     free(L[0].lv);
@@ -608,7 +641,7 @@ int cmd_flatten(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: ufsm flatten <wraps-dir> <out-dir> [--wraps a,b,..] [--decim 1] [--iters 30] [--cg 200] [--min-verts 20000] [--out-step S] [--crop rect|none] [--max-aspect A] [--rects N] [--min-cm2 5] [--fill-holes 5000] [--max-edge 3] [--threads 16] [--gpu 1] [--sfc ERR] [--quiet 1]\n"); return 2; }
     flat_opts o = flat_opts_default();
     o.decim = atoi(fopt(argc, argv, "--decim", "1")); o.iters = atoi(fopt(argc, argv, "--iters", "30")); o.cg_iters = atoi(fopt(argc, argv, "--cg", "200"));
-    o.min_verts = atoi(fopt(argc, argv, "--min-verts", "20000")); o.max_edge = atof(fopt(argc, argv, "--max-edge", "3")); o.nthreads = atoi(fopt(argc, argv, "--threads", "16"));
+    o.min_verts = atoi(fopt(argc, argv, "--min-verts", "20000")); o.max_edge = atof(fopt(argc, argv, "--max-edge", "3")); o.nthreads = ufsm_threads(atoi(fopt(argc, argv, "--threads", "0")), 16);
     o.verbose = !atoi(fopt(argc, argv, "--quiet", "0")); o.gpu = atoi(fopt(argc, argv, "--gpu", "1"));
     const double ostep_opt = atof(fopt(argc, argv, "--out-step", "0")); const int crop = strcmp(fopt(argc, argv, "--crop", "rect"), "none") != 0;
     const char *wl = fopt(argc, argv, "--wraps", nullptr); char *want = nullptr; if (wl) { want = malloc(strlen(wl) + 3); sprintf(want, ",%s,", wl); }

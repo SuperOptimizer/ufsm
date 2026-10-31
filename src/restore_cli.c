@@ -3,6 +3,7 @@
      ufsm restore-eval <ckpt> <clean.npy>...   PSNR of the net on clean crops degraded by a fixed recipe (comparison with older runs)
      ufsm restore-stats <root> <key> ...  calibration statistics of a CT box, as stored or after a scanner degradation */
 #include "nn.h"
+#include "sysinfo.h"
 #include "checkpoint.h"
 #include "pyramid.h"
 #include "restore.h"
@@ -87,7 +88,7 @@ int restore_predict(int argc, char **argv) {
     const double sr_scale = restore_checkpoint_scale(ckpt);   /* real-pair nets: x scale of whatever input voxel size */
     const double out_um = atof(opt(argc, argv, "--out-um", "0")) > 0 ? atof(opt(argc, argv, "--out-um", "0")) : sr_scale > 0 ? um * (1 << level) / sr_scale : fine_um;
     const float q = (float)atof(opt(argc, argv, "--q", "2"));
-    const int nlev = atoi(opt(argc, argv, "--levels", "1")), nthreads = atoi(opt(argc, argv, "--threads", "16")), use_ema = atoi(opt(argc, argv, "--ema", "1")) != 0;
+    const int nlev = atoi(opt(argc, argv, "--levels", "1")), nthreads = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 16), use_ema = atoi(opt(argc, argv, "--ema", "1")) != 0;
     if (!(um > 0) || S < 128 || S % 128 || H < 0 || nlev < 1 || nlev > 10 || !(q >= 0)) {
         fprintf(stderr, "usage: ufsm predict <restore ckpt> <root> <ct-group> <out-dir> --um U (the CT's level-0 voxel) [--level L] [--out-um %g] [--box z,y,x,nz,ny,nx (output voxels)]\n"
                         "       [--shard 512] [--halo 32] [--q 2] [--levels 1] [--ema 1] [--gpu 0] [--cache DIR] [--shards FILE (\"sz sy sx\" lines: only these)]\n"

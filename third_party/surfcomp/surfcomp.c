@@ -1519,28 +1519,12 @@ int sfc_write_block(sfc_writer *w, const void *src, size_t ps, size_t rs,
   }
   return 0;
 }
-int sfc_write_xyz_block(sfc_writer *w, const void *src, size_t ps, size_t rs,
-                        const uint8_t *mask) {
-  if (!w || w->failed || w->current >= w->count || !src ||
-      !strides(ps, rs, 12, 64, 64))
-    return SFC_INVALID;
+/* ufsm addition: append one joint XYZ patch whose packet was encoded elsewhere (sfc_xyz_encoder_run on any thread, same
+ * in-bounds mask); src / mask are the patch the packet came from (for the index entries' value ranges). Bytes identical to
+ * sfc_write_xyz_block. */
+static int append_xyz(sfc_writer *w, const uint8_t *b, size_t n, const void *src,
+                      size_t ps, size_t rs, const uint8_t *valid) {
   const sfc_channel *c = w->channels + w->current;
-  if (!(c->flags & SFC_XYZ) || c->component || w->pending_count)
-    return SFC_INVALID;
-  if (!w->xyz_work)
-    w->xyz_work = calloc(1, sizeof *w->xyz_work);
-  if (!w->xyz_work)
-    return SFC_NOMEM;
-  uint64_t bx = w->block % tiles(c->width), by = w->block / tiles(c->width);
-  uint8_t valid[4096];
-  for (unsigned i = 0; i < 4096; i++)
-    valid[i] = (!mask || mask[i]) && bx * 64 + i % 64 < c->width &&
-               by * 64 + i / 64 < c->height;
-  size_t n;
-  int rc = xyz_encode(src, ps, rs, valid, c->tolerance, w->xyz_work, &n);
-  if (rc)
-    return rc;
-  uint8_t *b = w->xyz_work->best;
   off_t off = ftello(w->f);
   if (off < 0 || (uint64_t)off > (uint64_t)INT64_MAX - n ||
       fwrite(b, 1, n, w->f) != n)
@@ -1583,6 +1567,75 @@ int sfc_write_xyz_block(sfc_writer *w, const void *src, size_t ps, size_t rs,
 io:
   w->failed = 1;
   return SFC_IO;
+}
+static int xyz_patch_mask(const sfc_writer *w, const uint8_t *mask,
+                          uint8_t *valid) {
+  const sfc_channel *c = w->channels + w->current;
+  if (!(c->flags & SFC_XYZ) || c->component || w->pending_count)
+    return SFC_INVALID;
+  uint64_t bx = w->block % tiles(c->width), by = w->block / tiles(c->width);
+  for (unsigned i = 0; i < 4096; i++)
+    valid[i] = (!mask || mask[i]) && bx * 64 + i % 64 < c->width &&
+               by * 64 + i / 64 < c->height;
+  return 0;
+}
+int sfc_write_xyz_block(sfc_writer *w, const void *src, size_t ps, size_t rs,
+                        const uint8_t *mask) {
+  if (!w || w->failed || w->current >= w->count || !src ||
+      !strides(ps, rs, 12, 64, 64))
+    return SFC_INVALID;
+  uint8_t valid[4096];
+  int rc = xyz_patch_mask(w, mask, valid);
+  if (rc)
+    return rc;
+  if (!w->xyz_work)
+    w->xyz_work = calloc(1, sizeof *w->xyz_work);
+  if (!w->xyz_work)
+    return SFC_NOMEM;
+  size_t n;
+  rc = xyz_encode(src, ps, rs, valid, w->channels[w->current].tolerance,
+                  w->xyz_work, &n);
+  if (rc)
+    return rc;
+  return append_xyz(w, w->xyz_work->best, n, src, ps, rs, valid);
+}
+int sfc_write_xyz_encoded(sfc_writer *w, const uint8_t *packet, size_t n,
+                          const void *src, size_t ps, size_t rs,
+                          const uint8_t *mask) {
+  if (!w || w->failed || w->current >= w->count || !src || !packet || !n ||
+      !strides(ps, rs, 12, 64, 64))
+    return SFC_INVALID;
+  uint8_t valid[4096];
+  int rc = xyz_patch_mask(w, mask, valid);
+  if (rc)
+    return rc;
+  return append_xyz(w, packet, n, src, ps, rs, valid);
+}
+struct sfc_xyz_encoder {
+  sfc_xyz_work *work;
+};
+sfc_xyz_encoder *sfc_xyz_encoder_create(void) {
+  sfc_xyz_encoder *e = calloc(1, sizeof *e);
+  if (e && !(e->work = calloc(1, sizeof *e->work))) {
+    free(e);
+    e = NULL;
+  }
+  return e;
+}
+void sfc_xyz_encoder_destroy(sfc_xyz_encoder *e) {
+  if (e) {
+    xyz_free(e->work);
+    free(e);
+  }
+}
+int sfc_xyz_encoder_run(sfc_xyz_encoder *e, const void *src, size_t ps,
+                        size_t rs, const uint8_t *mask, double error,
+                        const uint8_t **packet, size_t *size) {
+  if (!e || !packet || !size)
+    return SFC_INVALID;
+  int rc = xyz_encode(src, ps, rs, mask, error, e->work, size);
+  *packet = rc ? NULL : e->work->best;
+  return rc;
 }
 void sfc_cancel(sfc_writer *w) {
   if (!w)

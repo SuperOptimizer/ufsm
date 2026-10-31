@@ -12,6 +12,7 @@
    attribute ufsm.origin_zyx = box origin (ufsm overlay reads it). Work per output shard tile (windows overlapping two tiles run
    twice, as the reference's tile halo). */
 #include "hercuvit.h"
+#include "sysinfo.h"
 #include "store.h"
 #include "xnet.h"
 #include "z3w.h"
@@ -120,7 +121,7 @@ int cmd_hercuvit(int argc, char **argv) {
 
     const char *root = argv[2], *key = argv[3], *out = argv[4];
     const int P = atoi(opt(argc, argv, "--window", "128")), inst = atoi(opt(argc, argv, "--instances", "1")), air = atoi(opt(argc, argv, "--air", "25"));
-    const int SH = atoi(opt(argc, argv, "--shard", "512")), nth = atoi(opt(argc, argv, "--threads", "8"));
+    const int SH = atoi(opt(argc, argv, "--shard", "512")), nth = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 8);
     const double ov = atof(opt(argc, argv, "--overlap", "0.25")), thr = atof(opt(argc, argv, "--thresh", "0.4")), um = atof(opt(argc, argv, "--um", "9.6"));
     const float lthr = (float)log(thr / (1.0 - thr));
     int S = 2 * (int)fmax(1.0, round(P * (1.0 - ov) / 2)); if (S > P) S = P; if (S < 2) S = 2;

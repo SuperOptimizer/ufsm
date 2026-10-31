@@ -150,7 +150,8 @@ static int part3(const char *dir, const char *cpath) {
     char msg[200];
     snprintf(msg, sizeof msg, "z3_read with the shared cache = without it (cold: %llu stored, warm: %llu hits, %llu misses)",
              (unsigned long long)(p[1] - p[0]), (unsigned long long)(h[2] - h[1]), (unsigned long long)(m[2] - m[1]));
-    check(msg, ok && p[1] - p[0] == 12 * 32 && h[2] - h[1] == 12 * 32 && m[2] == m[1]);
+    /* (z3_read decodes only the substreams under the box (auto submask): <= 12 chunks x 32 stored, all of them hits when warm) */
+    check(msg, ok && p[1] - p[0] > 0 && p[1] - p[0] <= 12 * 32 && h[2] - h[1] == p[1] - p[0] && m[2] == m[1]);
     int ok2 = 1;
     for (int k = 0; k < 4 && ok2; k++) ok2 = fread(ref, 1, nv, f) == nv && !z3_read_sub(z, o, n, got, 4, masks[k]) && !memcmp(ref, got, nv);
     check("z3_read_sub with the shared cache (4 submasks) = without it", ok2);

@@ -1,6 +1,7 @@
 /* Box stitching: gauge alignment of overlapping local winding fits, the global gauge, the blended global winding field and
    level-set sheets traced across the boxes (src/stitch.h). */
 #include "stitch.h"
+#include "sysinfo.h"
 #include "coreline.h"
 #include "json.h"
 #include "store.h"
@@ -921,7 +922,7 @@ static int cm_open(const char *dir, st_fields *F, cm_ctx *c) {
 static int stitch_align(int argc, char **argv) {
     if (argc < 5) { fprintf(stderr, "usage: ufsm stitch align <out.json> --fields ZARR [--stride 2] [--min-w 0.05] [--min-agree 0.5] [--min-wsum 50] [--mask HALFBOX_DIR] [--threads 8] BOXDIR...\n"); return 2; }
     const char *out = argv[3], *fz = sopt(argc, argv, "--fields", nullptr);
-    const int stride = atoi(sopt(argc, argv, "--stride", "2")), nt = atoi(sopt(argc, argv, "--threads", "8"));
+    const int stride = atoi(sopt(argc, argv, "--stride", "2")), nt = ufsm_threads(atoi(sopt(argc, argv, "--threads", "0")), 8);
     const double min_w = atof(sopt(argc, argv, "--min-w", "0.05")), min_agree = atof(sopt(argc, argv, "--min-agree", "0.5")), min_wsum = atof(sopt(argc, argv, "--min-wsum", "50"));
     if (!fz) { fprintf(stderr, "stitch align: --fields ZARR (the fit-field zarr the boxes were cropped from)\n"); return 2; }
     st_box *b = calloc(argc, sizeof *b); int nb = 0;
@@ -982,7 +983,7 @@ static int stitch_field(int argc, char **argv) {
     if (argc < 5) { fprintf(stderr, "usage: ufsm stitch field <gauge.json> <out-group> [--comp 0] [--step 8] [--q 0.004] [--threads 8]\n"); return 2; }
     st_box *b; st_edge *e; int nb, ne; double um;
     if (st_load(argv[3], &b, &nb, &e, &ne, &um)) { fprintf(stderr, "stitch: cannot read %s\n", argv[3]); return 1; }
-    const int comp = atoi(sopt(argc, argv, "--comp", "0")), nt = atoi(sopt(argc, argv, "--threads", "8")); const double step = atof(sopt(argc, argv, "--step", "8"));
+    const int comp = atoi(sopt(argc, argv, "--comp", "0")), nt = ufsm_threads(atoi(sopt(argc, argv, "--threads", "0")), 8); const double step = atof(sopt(argc, argv, "--step", "8"));
     double lo[3] = {1e300, 1e300, 1e300}, hi[3] = {-1e300, -1e300, -1e300};
     for (int i = 0; i < nb; i++) if (b[i].comp == comp) for (int d = 0; d < 3; d++) { lo[d] = fmin(lo[d], b[i].lo[d]); hi[d] = fmax(hi[d], b[i].hi[d]); }
     if (lo[0] > hi[0]) { fprintf(stderr, "stitch field: component %d has no boxes\n", comp); return 1; }
@@ -1225,7 +1226,7 @@ static int stitch_sheets(int argc, char **argv) {
     J->cfg.bridge_max = atof(sopt(argc, argv, "--bridge", "150")); J->cfg.fault_ratio = atof(sopt(argc, argv, "--fault-ratio", "3"));
     J->cfg.min_seed_q = atof(sopt(argc, argv, "--min-seed-q", "0.3"));   /* with quality maps: seeds where the seed box follows the network phase */
     J->min_used = atoll(sopt(argc, argv, "--min-used", "2000"));   /* trace vertices of a box level that mark it as traced (no seed of its own) */
-    const int nt = atoi(sopt(argc, argv, "--threads", "4"));
+    const int nt = ufsm_threads(atoi(sopt(argc, argv, "--threads", "0")), 4);
     { char *t = strdup(sopt(argc, argv, "--seeds", "0.5,0.25,0.75")), *sv = nullptr; for (char *q = strtok_r(t, ",", &sv); q && J->nzf < 8; q = strtok_r(nullptr, ",", &sv)) J->zf[J->nzf++] = atof(q); free(t); }
     J->rdir = sopt(argc, argv, "--render-dir", nullptr); J->rrows = atoi(sopt(argc, argv, "--render-rows", "1042"));
     { char *t = strdup(sopt(argc, argv, "--render-um", "4.798,9.596")), *sv = nullptr; for (char *q = strtok_r(t, ",", &sv); q && J->nrum < 4; q = strtok_r(nullptr, ",", &sv)) J->rum[J->nrum++] = atof(q); free(t); }
@@ -1283,7 +1284,7 @@ static int stitch_quality(int argc, char **argv) {
     st_box *b; st_edge *e; int nb, ne; double um;
     if (st_load(argv[3], &b, &nb, &e, &ne, &um)) { fprintf(stderr, "stitch: cannot read %s\n", argv[3]); return 1; }
     const char *fz = sopt(argc, argv, "--fields", nullptr); if (!fz) { fprintf(stderr, "stitch quality: --fields ZARR\n"); return 2; }
-    const int nt = atoi(sopt(argc, argv, "--threads", "8")); zf_ctx zc; st_fields F; if (zf_open(fz, nt, &zc, &F)) return 1;
+    const int nt = ufsm_threads(atoi(sopt(argc, argv, "--threads", "0")), 8); zf_ctx zc; st_fields F; if (zf_open(fz, nt, &zc, &F)) return 1;
     const char *md = sopt(argc, argv, "--mask", nullptr); cm_ctx cm = {0}; if (md && cm_open(md, &F, &cm)) return 1;
     const double qb = atof(sopt(argc, argv, "--block", "64")), t0 = now_s(); const int stride = atoi(sopt(argc, argv, "--stride", "2"));
     for (int i = 0; i < nb; i++) {
@@ -1309,7 +1310,7 @@ static int stitch_coherence(int argc, char **argv) {
     st_box *b; st_edge *e; int nb, ne; double um;
     if (st_load(argv[3], &b, &nb, &e, &ne, &um)) { fprintf(stderr, "stitch: cannot read %s\n", argv[3]); return 1; }
     const char *fz = sopt(argc, argv, "--fields", nullptr); if (!fz) { fprintf(stderr, "stitch coherence: --fields ZARR\n"); return 2; }
-    const int nt = atoi(sopt(argc, argv, "--threads", "6")), comp = atoi(sopt(argc, argv, "--comp", "0")), stride = atoi(sopt(argc, argv, "--stride", "4"));
+    const int nt = ufsm_threads(atoi(sopt(argc, argv, "--threads", "0")), 6), comp = atoi(sopt(argc, argv, "--comp", "0")), stride = atoi(sopt(argc, argv, "--stride", "4"));
     const double qb = atof(sopt(argc, argv, "--block", "64"));
     zf_ctx zc; st_fields F; if (zf_open(fz, nt, &zc, &F)) return 1;
     double lo[3] = {1e300, 1e300, 1e300}, hi[3] = {-1e300, -1e300, -1e300};

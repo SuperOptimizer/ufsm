@@ -4,6 +4,7 @@
    the largest valid rectangle on a hand-made mask. */
 #include "flatten.h"
 #include <math.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -88,7 +89,12 @@ static void run(const char *name, surf_fn f, int holes, int developable) {
 
 #ifdef FLAT_GPU
 int flat_slim_gpu(const double *g, const double *A, const int *tri, int nt, const int *vo, const int *vl, int nv, double *x,
-                  int iters, int cg_iters, double tol, int verbose, const char *tag, double *Eout);
+                  int iters, int cg_iters, double tol, int verbose, const char *tag, int dev, double *Eout);
+typedef struct { const float *X, *Y, *Z; int w, h; flat_mesh m; int rc; } cg_job;
+static void *cg_run(void *a) {
+    cg_job *J = a; flat_opts o = flat_opts_default(); o.min_verts = 800; o.nthreads = 2; o.iters = 60; o.cg_iters = 400; o.tol = 1e-9; o.gpu = 1; o.gpu_dev = 0;
+    flat_stats b, s; J->rc = flat_grid(J->X, J->Y, J->Z, J->w, J->h, 1.0, &o, &J->m, &b, &s); return nullptr;
+}
 /* GPU vs CPU on one sheet: the same solution (the summation order differs: uv within 1e-4 of a grid step, energy 1e-7), and two GPU
    runs bit-identical */
 static void cmp_gpu(const char *name, surf_fn f, int holes) {
@@ -104,6 +110,13 @@ static void cmp_gpu(const char *name, surf_fn f, int holes) {
     printf("%s: GPU vs CPU max |duv| %.2e, energy %.9f vs %.9f\n", name, dmax, a[1].energy, a[0].energy);
     CHECK(dmax < 1e-4 && fabs(a[0].energy - a[1].energy) < 1e-7, "%s: GPU solution differs (max |duv| %.3g, energy %.9f vs %.9f)", name, dmax, a[1].energy, a[0].energy);
     CHECK(!memcmp(m[1].uv, m[2].uv, (size_t)m[1].nv * 16), "%s: two GPU runs differ", name);
+    {   /* two host threads on one device at once (strip-flatten --jobs; per-thread default streams): the same bits */
+        cg_job J[2]; pthread_t th[2];
+        for (int k = 0; k < 2; k++) { J[k] = (cg_job){X, Y, Z, w, h, {0}, -1}; pthread_create(&th[k], nullptr, cg_run, &J[k]); }
+        for (int k = 0; k < 2; k++) { pthread_join(th[k], nullptr);
+            CHECK(!J[k].rc && J[k].m.nv == m[1].nv && !memcmp(J[k].m.uv, m[1].uv, (size_t)m[1].nv * 16), "%s: concurrent GPU run %d differs", name, k);
+            if (!J[k].rc) flat_mesh_free(&J[k].m); }
+    }
     for (int k = 0; k < 3; k++) flat_mesh_free(&m[k]);
     free(X); free(Y); free(Z);
 }
@@ -113,7 +126,7 @@ int main(void) {
 #ifdef FLAT_GPU
     {   /* a device? (one triangle) */
         const double g[6] = {-1, -1, 1, 0, 0, 1}, A[1] = {0.5}; const int tri[3] = {0, 1, 2}, vo[4] = {0, 1, 2, 3}, vl[3] = {0, 1, 2}; double x[6] = {0, 0, 1, 0, 0, 1}, E;
-        if (flat_slim_gpu(g, A, tri, 1, vo, vl, 3, x, 1, 5, 1e-9, 0, "probe", &E)) { printf("test_flatten_gpu: no GPU, skipped\n"); return 0; }
+        if (flat_slim_gpu(g, A, tri, 1, vo, vl, 3, x, 1, 5, 1e-9, 0, "probe", -1, &E)) { printf("test_flatten_gpu: no GPU, skipped\n"); return 0; }
     }
     g_gpu = 1;
     cmp_gpu("cylinder", cyl, 0); cmp_gpu("cone-holes", cone, 1); cmp_gpu("sphere-cap", sph, 0);

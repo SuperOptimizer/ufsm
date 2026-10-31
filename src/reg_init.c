@@ -5,6 +5,7 @@
    kept or reversed). The best peak (sub-bin by parabola) gives the affine fine L0 xyz -> coarse L0 xyz written as a reg map JSON;
    refine it afterwards with reg boxes / reg fit --affine-only from coarse to fine levels. */
 #include "reg.h"
+#include "sysinfo.h"
 #include <complex.h>
 #include <math.h>
 #include <pthread.h>
@@ -233,7 +234,7 @@ int cmd_reg_init(int argc, char **argv) {
     const char *out = opt(argc, argv, "-o", nullptr), *cr = opt(argc, argv, "--coarse-root", nullptr), *ck = opt(argc, argv, "--coarse", nullptr), *fr = opt(argc, argv, "--fine-root", cr), *fk = opt(argc, argv, "--fine", nullptr);
     if (!out || !cr || !ck || !fk) { fprintf(stderr, "usage: ufsm reg init --coarse-root R --coarse KEY [--fine-root R] --fine KEY [--um 150] [--rmin 1500 (um)] [--orient all|keep] [--threads 6] [--name N] -o pair.json\n"); return 2; }
     const double W = atof(opt(argc, argv, "--um", "150")), rmin = atof(opt(argc, argv, "--rmin", "1500"));
-    const int nt = atoi(opt(argc, argv, "--threads", "6")), all = strcmp(opt(argc, argv, "--orient", "all"), "keep") != 0;
+    const int nt = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 6), all = strcmp(opt(argc, argv, "--orient", "all"), "keep") != 0;
     rvol *cv = rvol_open(cr, ck, nullptr, atof(opt(argc, argv, "--coarse-um", "0"))), *fv = rvol_open(fr, fk, nullptr, atof(opt(argc, argv, "--fine-um", "0")));
     if (!cv || !fv) return 1;
     raff A; reg_init_info in = {0};

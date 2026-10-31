@@ -10,6 +10,7 @@
      rings of horizontally resampled rows (pil_hrow, then the same fixed-point vertical sum as pil_vrow); the panels' contrast is a
      256-entry table per input (the CT's stretch maps 0 to 0, i.e. CT == 0 is the mask), the labels drawn per row with the same font. */
 #include "imgops.h"
+#include "sysinfo.h"
 #include "tiff.h"
 #include <math.h>
 #include <unistd.h>
@@ -259,11 +260,7 @@ typedef struct {
     int pap, pfloor, pbg, pbgv; float pgain; /* pfloor: the CT ramp's floor (stretched CT units); pbg >= 0: off-papyrus neutral grey pbg; else pbgv >= 0: the ramp at pbgv; else the ramp at pfloor */                  /* with rgb: papyrus look, CT through a brown-tan ramp, ink rgb[0] darkens it toward carbon black */
 } p3_job;
 typedef struct { uint8_t *buf; int *tag; int cap; size_t len; } p3ring;
-static void pap_rgb(int v, float d, uint8_t *o) {   /* --papyrus: stretched CT v through dark brown .. warm tan, carbon ink d (0..1) over it */
-    static const float P[4][3] = {{58, 36, 20}, {128, 88, 52}, {196, 156, 104}, {236, 214, 170}};
-    const float t = (float)v / 255.f * 3.f; const int i = t >= 3.f ? 2 : (int)t; const float f = t - i;
-    for (int e = 0; e < 3; e++) { const float pv = P[i][e] + f * (P[i + 1][e] - P[i][e]), iv = e == 0 ? 26.f : e == 1 ? 22.f : 19.f; o[e] = (uint8_t)lroundf(pv * (1.f - d) + iv * d); }
-}
+static void pap_rgb(int v, float d, uint8_t *o) { img_pap_rgb(v, d, o); }   /* --papyrus: imgops.h */
 static void p3_full_row(p3_job *J, icstrip *c, int y, uint8_t *row) {   /* ink_panels' row y */
     icx *X = J->X; const int W = X->W;
     memset(row, 255, (size_t)J->TW * 3);
@@ -406,7 +403,7 @@ int cmd_ink_compare(int argc, char **argv) {
         return ink_compare_mem(argc, argv);
     const double px = atof(icopt(argc, argv, "--px-um", "2.4")), rsu = atof(icopt(argc, argv, "--rs-um", "25")), rlu = atof(icopt(argc, argv, "--rl-um", "500"));
     if (!(px > 0) || !(rsu > 0) || !(rlu > rsu)) { fprintf(stderr, "ink-compare: need --px-um > 0 and 0 < --rs-um < --rl-um\n"); return 2; }
-    icx X; memset(&X, 0, sizeof X); X.nth = atoi(icopt(argc, argv, "--threads", "16"));
+    icx X; memset(&X, 0, sizeof X); X.nth = ufsm_threads(atoi(icopt(argc, argv, "--threads", "0")), 16);
     const char *lab[NIMG] = {"ct"}; int rc = 0;
     /* the inputs: strip TIFFs of one size and strip height, else the in-memory version */
     {
@@ -588,7 +585,7 @@ end:
 int cmd_jpeg_fit(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: ufsm jpeg-fit IN.jpg OUT.jpg [--div 2 | --max-px N] [--quality 90] [--threads 16]\n"); return 2; }
     const double div = atof(icopt(argc, argv, "--div", "0")); int maxpx = atoi(icopt(argc, argv, "--max-px", "0"));
-    const int q = atoi(icopt(argc, argv, "--quality", "90")), th = atoi(icopt(argc, argv, "--threads", "16"));
+    const int q = atoi(icopt(argc, argv, "--quality", "90")), th = ufsm_threads(atoi(icopt(argc, argv, "--threads", "0")), 16);
     if ((div > 0) == (maxpx > 0)) { fprintf(stderr, "jpeg-fit: one of --div D (> 0) or --max-px N\n"); return 2; }
     int w, h; uint8_t *rgb = jpeg_read_rgb(argv[2], &w, &h);
     if (!rgb) { fprintf(stderr, "jpeg-fit: cannot read %s\n", argv[2]); return 1; }

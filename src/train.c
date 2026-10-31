@@ -1,6 +1,7 @@
 /* ufsm train: sampler -> pinned batches -> one or more GPUs (data parallel, gradients averaged through the
    host) -> UNet -> BCE+Dice -> AdamW/EMA, with held-out validation batches, CSV log and checkpoints. */
 #include "nn.h"
+#include "sysinfo.h"
 #include "checkpoint.h"
 #include "sample.h"
 #include "papyrus.h"
@@ -344,26 +345,7 @@ static const uint8_t *trow_w(const batch *b, int B, uint8_t *hw) {   /* the chan
     for (int r = 0; r < B * NCH; r++) hw[trow(b, r)] = b->w[r];
     return hw;
 }
-/* host memory this process may still take: MemAvailable, or less under a cgroup v2 memory.max (capped.sh's slice / scope); 0 unknown */
-static size_t host_mem_available(void) {
-    size_t avail = 0; char line[512];
-    FILE *f = fopen("/proc/meminfo", "r");
-    if (f) { while (fgets(line, sizeof line, f)) if (!strncmp(line, "MemAvailable:", 13)) { avail = (size_t)strtoull(line + 13, nullptr, 10) << 10; break; } fclose(f); }
-    char cg[400] = "";
-    if ((f = fopen("/proc/self/cgroup", "r"))) { while (fgets(line, sizeof line, f)) if (!strncmp(line, "0::", 3)) { snprintf(cg, sizeof cg, "%s", line + 3); cg[strcspn(cg, "\n")] = 0; } fclose(f); }
-    for (char *e = cg + strlen(cg); *cg; ) {   /* this cgroup and its parents: the tightest memory.max - memory.current */
-        char p[600]; unsigned long long mx = 0, cur = 0; int ok = 1;
-        snprintf(p, sizeof p, "/sys/fs/cgroup%s/memory.max", cg);
-        if ((f = fopen(p, "r"))) { ok = fscanf(f, "%llu", &mx) == 1; fclose(f); } else ok = 0;
-        snprintf(p, sizeof p, "/sys/fs/cgroup%s/memory.current", cg);
-        if (ok && (f = fopen(p, "r"))) { ok = fscanf(f, "%llu", &cur) == 1; fclose(f); } else ok = 0;
-        if (ok && mx > cur && (!avail || mx - cur < avail)) avail = (size_t)(mx - cur);
-        while (e > cg && *e != '/') e--;
-        if (e == cg) break;
-        *e = 0;
-    }
-    return avail;
-}
+static size_t host_mem_available(void) { return ufsm_mem_available(); }   /* (src/sysinfo.h: MemAvailable under every cgroup memory.max) */
 /* the host arrays of a batch in this run's layout: the addresses of its members and their sizes (validation copies, --val-store) */
 enum { VAL_DISK, VAL_RAM, VAL_REGEN, VAL_NF = 20 };
 static int val_fields(batch *b, int B, size_t p3, void **f[VAL_NF], size_t sz[VAL_NF]) {
