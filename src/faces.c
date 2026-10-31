@@ -99,6 +99,7 @@ static void *fm_rows(void *arg) {
 fgpu *fgpu_open(const int64_t shape[3]) __attribute__((weak));
 int fgpu_broken(const fgpu *G) __attribute__((weak));
 void fgpu_set_broken(fgpu *G) __attribute__((weak));
+int gpudec_enabled(void) __attribute__((weak));   /* src/nn_gpudec.cu via zarr3.c */
 int fgpu_grid(fgpu *G, const float *X, const float *Y, const float *Z, const float *N, int w, int h) __attribute__((weak));
 int fgpu_band(fgpu *G, int r0, int r1, double f, double hs, double R, int m, double min_prom, double rel, fc_band *cand, uint8_t *nc, float *ct0, uint8_t *prof) __attribute__((weak));
 int fgpu_median(fgpu *G, const float *in, float *out, int w, int h, int R, int minn) __attribute__((weak));
@@ -165,12 +166,18 @@ int faces_wrap(const float *X, const float *Y, const float *Z, int w, int h, dou
     int gpu = V->mark && V->fill && fc_gpu_ok(V) && fgpu_grid && fgpu_band && !fgpu_grid(V->gpu, X, Y, Z, N, w, h);
     uint32_t *gmask = gpu && V->mark_mask && fgpu_mark && fgpu_nchunks ? malloc(fgpu_nchunks(V->gpu) * sizeof(uint32_t)) : nullptr;
     tp[0] += fc_now() - tq;
-    for (int r0 = 0; r0 < h; r0 += 32) {   /* bands of rows: mark the chunks, decode, sample */
+    /* rows marked + decoded per fill (a multiple of the 32-row sampling band; UFSM_FACES_FILL_ROWS): 32, or 128 with the GPU decoder,
+       whose batches need many substreams at once (a substream is a ms-long serial chain). The fill's chunks are never evicted while
+       its bands sample, so the cache may run over --cache-mb by one fill. Same samples, same outputs. */
+    int fr = gpudec_enabled && gpudec_enabled() ? 128 : 32;
+    { const char *e = getenv("UFSM_FACES_FILL_ROWS"); if (e && atoi(e) >= 32) fr = atoi(e) / 32 * 32; }
+    for (int r0 = 0; r0 < h; r0 += 32) {   /* bands of rows: mark the chunks, decode (every fr rows), sample */
         fc_job J = {X, Y, Z, N, w, h, r0, r0 + 32 < h ? r0 + 32 : h, f, hs, R, m, o, V, cand, nc, prof, ct0, 0, 1};
         tq = fc_now();
-        if (V->mark) {
-            if (gmask && gpu && fc_gpu_ok(V) && !fgpu_mark(V->gpu, J.r0, J.r1, f, hs, R, m, gmask)) V->mark_mask(V->ctx, gmask);
-            else fc_par(fc_rows, &J, o->nthreads);
+        if (V->mark && r0 % fr == 0) {
+            fc_job M = J; M.r1 = r0 + fr < h ? r0 + fr : h;
+            if (gmask && gpu && fc_gpu_ok(V) && !fgpu_mark(V->gpu, M.r0, M.r1, f, hs, R, m, gmask)) V->mark_mask(V->ctx, gmask);
+            else fc_par(fc_rows, &M, o->nthreads);
             tp[1] += fc_now() - tq; tq = fc_now();
             if (V->fill && V->fill(V->ctx)) { free(N); free(ct0); free(cand); free(nc); free(prof); free(gmask); return -1; }
             tp[2] += fc_now() - tq; tq = fc_now();
