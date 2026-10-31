@@ -156,6 +156,24 @@ int main(void) {
                 }
                 printf("phase gate: dead phase: the ref's phase on %.4f (gate 0 on %.4f) of the material\n", nm ? (double)near / nm : 0, nm ? (double)ng / nm : 0);
                 CHECK(nm && (double)near / nm >= 0.95 && (double)ng / nm >= 0.95, "phase gate: a dead phase replaced on only %.4f", nm ? (double)near / nm : 0);
+                {   /* the device pass (fit_phase_gate_gpu) against the CPU's on a half-rotating field (phase of W on even y rows, dead on odd) */
+                    uint8_t *hpc = malloc(sn), *hps = malloc(sn), *cpc = malloc(sn), *cps = malloc(sn), *gpc = malloc(sn), *gps = malloc(sn);
+                    for (size_t i = 0; i < sn; i++) { const int y = (int)((i / W) % H); hpc[i] = (y / 12) & 1 ? 230 : sb.f.pc[i]; hps[i] = (y / 12) & 1 ? 128 : sb.f.ps[i]; }
+                    fit_fields hf = sb.f; hf.pc = hpc; hf.ps = hps; double sc[4] = {0}, sg[4] = {0};
+                    CHECK(!fit_phase_gate(&hf, 0, sb.f.cy, sb.f.cx, sna, R, nullptr, cs.ref_off, &pg, cpc, cps, nullptr, sc), "phase gate (cpu, mixed)");
+                    const size_t plane = (size_t)H * W; float *wr = malloc(sn * sizeof(float)), *ay = malloc(sb.f.D * sizeof(float)), *ax = malloc(sb.f.D * sizeof(float));
+                    const int64_t n3[3] = {sb.f.D, H, W}; CHECK(!fit_set_grid_cpu(R, cs.ref_off, n3, H8, 0, nullptr, wr), "W_ref grid");
+                    for (int z = 0; z < sb.f.D; z++) { const double pz = (z + 0.5) * H8; const int i0 = (int)floor(pz); const double t = pz - i0; ay[z] = (float)(sb.f.cy[i0] + t * (sb.f.cy[i0 + 1] - sb.f.cy[i0])); ax[z] = (float)(sb.f.cx[i0] + t * (sb.f.cx[i0 + 1] - sb.f.cx[i0])); }
+                    uint8_t *d = nn_malloc(7 * sn); const uint8_t *src[7] = {hpc, hps, sb.f.t[1], sb.f.t[2], sb.f.t[5], sb.f.sp, sb.f.w};
+                    for (int k = 0; k < 7; k++) nn_h2d(d + k * sn, src[k], sn);
+                    CHECK(!fit_phase_gate_gpu(d, d + sn, d + 2 * sn, d + 3 * sn, d + 4 * sn, d + 5 * sn, d + 6 * sn, sb.f.D, H, W, H8, ay, ax, wr, 0, 6, 0.3, 0.6, 0.5, sg), "phase gate (gpu)");
+                    nn_d2h(gpc, d, sn); nn_d2h(gps, d + sn, sn); nn_free(d);
+                    size_t same = 0, near1 = 0, nmx = 0; for (size_t i = 0; i < sn; i++) { if (!sb.f.w[i]) continue; nmx++; same += gpc[i] == cpc[i] && gps[i] == cps[i]; near1 += abs(gpc[i] - cpc[i]) <= 1 && abs(gps[i] - cps[i]) <= 1; }
+                    printf("phase gate gpu vs cpu: identical on %.4f, within 1 on %.4f of %zu material cells; gated %.0f / %.0f, mean q %.4f / %.4f\n", nmx ? (double)same / nmx : 0,
+                           nmx ? (double)near1 / nmx : 0, nmx, sg[1], sc[1], sg[3] ? sg[2] / sg[3] : 0, sc[3] ? sc[2] / sc[3] : 0);
+                    CHECK(nmx && (double)near1 / nmx >= 0.999 && fabs(sg[1] - sc[1]) <= 0.001 * nmx, "phase gate gpu vs cpu: within 1 on %.4f", nmx ? (double)near1 / nmx : 0);
+                    (void)plane; free(hpc); free(hps); free(cpc); free(cps); free(gpc); free(gps); free(wr); free(ay); free(ax);
+                }
                 fit_model *mg = fit_run(&df, &cs); CHECK(mg != nullptr, "fit --ref-snap on the gated fields");
                 if (mg) {
                     size_t ns2 = 0, ok2 = 0;

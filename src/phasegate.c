@@ -22,7 +22,9 @@ static const char *pg_opt(int argc, char **argv, const char *k, const char *d) {
 static double pg_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + 1e-9 * t.tv_nsec; }
 static double pg_smooth(double x, double a, double b) { if (x <= a) return 0; if (x >= b) return 1; const double t = (x - a) / (b - a); return t * t * (3 - 2 * t); }
 static double pg_axis(const float *v, int n, double z) { if (z <= 0) return v[0]; if (z >= n - 1) return v[n - 1]; const int i = (int)z; const double t = z - i; return v[i] + t * (v[i + 1] - v[i]); }
-static double pg_mag(int a, int b) { return hypot(a - 128.0, b - 128.0); }
+static float pg_ang_t[65536], pg_mag_t[65536];   /* per (pc, ps) byte pair: the phase in turns, the phasor length x 127 (filled by fit_phase_gate) */
+static double pg_mag(int a, int b) { return pg_mag_t[a << 8 | b]; }
+static double pg_ang(int a, int b) { return pg_ang_t[a << 8 | b]; }
 
 typedef struct {
     const fit_fields *f; int zo; const float *cy, *cx; int na; const float *wref; const fit_pgate_cfg *g;   /* wref: W_ref per cell of the block */
@@ -32,7 +34,7 @@ typedef struct {
 static void pg_rows(void *ctx, int z0, int z1, int t) {
     pg_job *J = ctx; const fit_fields *f = J->f; const int H = f->H, W = f->W, R = J->g->R; const double h = f->h;
     const size_t HW = (size_t)H * W;
-    double *A = malloc((size_t)(H + 1) * (W + 1) * sizeof(double)), *B = malloc((size_t)(H + 1) * (W + 1) * sizeof(double));
+    float *A = malloc(W * sizeof(float)), *B = malloc(W * sizeof(float)); double *ca = malloc(W * sizeof(double)), *cb = malloc(W * sizeof(double));
     float *pa = malloc(HW * sizeof(float)), *pb = malloc(HW * sizeof(float));
     for (int z = z0; z < z1; z++) {
         const double pz = (J->zo + z + 0.5) * h, cy = pg_axis(J->cy, J->na, pz), cx = pg_axis(J->cx, J->na, pz);
@@ -44,12 +46,12 @@ static void pg_rows(void *ctx, int z0, int z1, int t) {
             if (J->g->mode || !f->w[i] || y == 0 || x == 0 || y + 1 >= H || x + 1 >= W || !f->sp[i]) continue;
             const double c0 = pg_mag(pc[j], ps[j]) / 127.0; if (c0 < 0.125) continue;
             double ry = (y + 0.5) * h - cy, rx = (x + 0.5) * h - cx; const double rl = hypot(ry, rx); if (rl < 1) continue; ry /= rl; rx /= rl;
-            const double p0 = atan2(ps[j] - 128.0, pc[j] - 128.0) / (2 * M_PI);
+            const double p0 = pg_ang(pc[j], ps[j]);
             const size_t ny[2] = {j - W, j + W}, nx[2] = {j - 1, j + 1}; double gy = 0, gx = 0; int ok = 1;
             for (int s = 0; s < 2 && ok; s++) {
                 const size_t a = ny[s], b = nx[s];
                 if (pg_mag(pc[a], ps[a]) < 16 || pg_mag(pc[b], ps[b]) < 16) { ok = 0; break; }
-                double dy = atan2(ps[a] - 128.0, pc[a] - 128.0) / (2 * M_PI) - p0, dx = atan2(ps[b] - 128.0, pc[b] - 128.0) / (2 * M_PI) - p0;
+                double dy = pg_ang(pc[a], ps[a]) - p0, dx = pg_ang(pc[b], ps[b]) - p0;
                 dy -= floor(dy + 0.5); dx -= floor(dx + 0.5); gy += s ? dy : -dy; gx += s ? dx : -dx;
             }
             if (!ok) continue;
@@ -58,35 +60,43 @@ static void pg_rows(void *ctx, int z0, int z1, int t) {
             const double nr = sqrt(fmax(0, ry * ry * nyy + rx * rx * nxx + 2 * ry * rx * nyx)), dn = nr / (f->sp[i] * h / 8.0);
             pa[j] = (float)(c0 * rate); pb[j] = (float)(c0 * dn);
         }
-        if (!J->g->mode) for (int y = 0; y <= H; y++) for (int x = 0; x <= W; x++) {   /* integral images */
-            const size_t k = (size_t)y * (W + 1) + x;
-            if (!y || !x) { A[k] = B[k] = 0; continue; }
-            const size_t j = (size_t)(y - 1) * W + (x - 1);
-            A[k] = pa[j] + A[k - 1] + A[k - (W + 1)] - A[k - (W + 2)]; B[k] = pb[j] + B[k - 1] + B[k - (W + 1)] - B[k - (W + 2)];
+        if (!J->g->mode) for (int y = 0; y < H; y++) {   /* box sums over +-R, separable: x running sums into pa / pb in place (via a row copy) */
+            float *ra = A, *rb = B; memcpy(ra, pa + (size_t)y * W, W * sizeof(float)); memcpy(rb, pb + (size_t)y * W, W * sizeof(float));
+            double s1 = 0, s2 = 0; for (int x = 0; x < R && x < W; x++) { s1 += ra[x]; s2 += rb[x]; }
+            for (int x = 0; x < W; x++) {
+                if (x + R < W) { s1 += ra[x + R]; s2 += rb[x + R]; }
+                if (x - R - 1 >= 0) { s1 -= ra[x - R - 1]; s2 -= rb[x - R - 1]; }
+                pa[(size_t)y * W + x] = (float)s1; pb[(size_t)y * W + x] = (float)s2;
+            }
         }
+        if (!J->g->mode) { memset(ca, 0, W * sizeof(double)); memset(cb, 0, W * sizeof(double)); for (int y = 0; y < R && y < H; y++) for (int x = 0; x < W; x++) { ca[x] += pa[(size_t)y * W + x]; cb[x] += pb[(size_t)y * W + x]; } }
         /* (the outputs may alias f's pc / ps: a cell's own phase is read before its write, the gradients above read the row first) */
-        for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
+        for (int y = 0; y < H; y++) {
+            if (!J->g->mode) {   /* the column sums of the x box sums over rows [y - R, y + R] */
+                if (y + R < H) for (int x = 0; x < W; x++) { ca[x] += pa[(size_t)(y + R) * W + x]; cb[x] += pb[(size_t)(y + R) * W + x]; }
+                if (y - R - 1 >= 0) for (int x = 0; x < W; x++) { ca[x] -= pa[(size_t)(y - R - 1) * W + x]; cb[x] -= pb[(size_t)(y - R - 1) * W + x]; }
+            }
+            for (int x = 0; x < W; x++) {
             const size_t j = (size_t)y * W + x, i = (size_t)z * HW + j;
             const uint8_t c8 = pc[j], s8 = ps[j];
             if (!f->w[i]) { if (J->gate) J->gate[i] = 0; J->pc[i] = c8; J->ps[i] = s8; continue; }
             J->nmat[t]++;
             double g = 0;
             if (!J->g->mode) {
-                const int a0 = y - R < 0 ? 0 : y - R, a1 = y + R + 1 > H ? H : y + R + 1, b0 = x - R < 0 ? 0 : x - R, b1 = x + R + 1 > W ? W : x + R + 1;
-                const size_t k00 = (size_t)a0 * (W + 1) + b0, k01 = (size_t)a0 * (W + 1) + b1, k10 = (size_t)a1 * (W + 1) + b0, k11 = (size_t)a1 * (W + 1) + b1;
-                const double sa = A[k11] - A[k01] - A[k10] + A[k00], sb = B[k11] - B[k01] - B[k10] + B[k00];
+                const double sa = ca[x], sb = cb[x];
                 if (sb > 1e-9) { const double q = sa / sb; g = pg_smooth(q, J->g->lo, J->g->hi); J->qsum[t] += q; J->qn[t]++; }
             }
             if (J->gate) J->gate[i] = (uint8_t)lround(255 * g);
             if (g < 1 && wr[j] == wr[j]) {
-                const double c = pg_mag(c8, s8) / 127.0, p = atan2(s8 - 128.0, c8 - 128.0);
-                const double re = g * c * cos(p) + (1 - g) * J->g->rc * cos(2 * M_PI * wr[j]), im = g * c * sin(p) + (1 - g) * J->g->rc * sin(2 * M_PI * wr[j]);
+                float sr, cr; sincosf((float)(2 * M_PI) * (wr[j] - floorf(wr[j])), &sr, &cr);   /* (the network phasor c (cos, sin) = its bytes) */
+                const double re = g * (c8 - 128.0) / 127.0 + (1 - g) * J->g->rc * cr, im = g * (s8 - 128.0) / 127.0 + (1 - g) * J->g->rc * sr;
                 J->pc[i] = (uint8_t)lround(fmin(255, fmax(1, 128 + 127 * re))); J->ps[i] = (uint8_t)lround(fmin(255, fmax(1, 128 + 127 * im)));
                 J->ngated[t] += g < 0.5;
             } else { J->pc[i] = c8; J->ps[i] = s8; }
+            }
         }
     }
-    free(A); free(B); free(pa); free(pb);
+    free(A); free(B); free(ca); free(cb); free(pa); free(pb);
 }
 
 int fit_phase_gate(const fit_fields *f, int zo, const float *cy, const float *cx, int na, const fit_set *ref, fit_set_dev *gd, const double ro[3], const fit_pgate_cfg *g,
@@ -95,9 +105,12 @@ int fit_phase_gate(const fit_fields *f, int zo, const float *cy, const float *cx
     float *wref = malloc(n * sizeof(float)); if (!wref) return -1;
     const double o[3] = {zo * f->h + ro[0], ro[1], ro[2]};   /* (grid points o + (i + 0.5) h = the cell centres in the ref box) */
     const int64_t n3[3] = {f->D, f->H, f->W};
+    const double tq0 = pg_now();
     if (gd ? fit_set_grid(gd, ref, o, n3, f->h, 0, wref) : fit_set_grid_cpu(ref, o, n3, f->h, 0, nullptr, wref)) { free(wref); return -1; }
+    static int tabs; if (!tabs) { for (int a = 0; a < 256; a++) for (int b = 0; b < 256; b++) { pg_ang_t[a << 8 | b] = (float)(atan2(b - 128.0, a - 128.0) / (2 * M_PI)); pg_mag_t[a << 8 | b] = (float)hypot(a - 128.0, b - 128.0); } tabs = 1; }
     pg_job J = {.f = f, .zo = zo, .cy = cy, .cx = cx, .na = na, .wref = wref, .g = g, .pc = pc_out, .ps = ps_out, .gate = gate};
-    fit_par(f->D, pg_rows, &J);
+    const double tq1 = pg_now(); fit_par(f->D, pg_rows, &J);
+    if (getenv("UFSM_PG_VERBOSE")) fprintf(stderr, "phase gate block z %d: W_ref %.2f s (%s), rows %.2f s\n", zo, tq1 - tq0, gd ? "GPU" : "CPU", pg_now() - tq1);
     for (int t = 0; t < 64; t++) { st[0] += J.nmat[t]; st[1] += J.ngated[t]; st[2] += J.qsum[t]; st[3] += J.qn[t]; }
     free(wref);
     return 0;
@@ -127,4 +140,16 @@ int cmd_phase_gate(int argc, char **argv) {
            g.shape[0], g.shape[1], g.shape[2], pc.mode ? "ref" : "gate", st[3] ? st[2] / st[3] : 0, st[3], st[0] ? st[1] / st[0] : 0, st[0], pg_now() - t0, argv[3]);
     free(gate); fit_fields_free(&g); fit_set_free(ref);
     return 0;
+}
+
+/* ufsm w-at MODEL Z,Y,X [Z,Y,X ...]: W of a fitted model / set at global native points (the wrap through a point: floor(W)) */
+int cmd_w_at(int argc, char **argv) {
+    if (argc < 4) { fprintf(stderr, "usage: ufsm w-at <model-or-set> Z,Y,X [Z,Y,X ...]   W at global native points (wrap = floor(W))\n"); return 2; }
+    fit_set *S = fit_set_load(argv[2]); if (!S) { fprintf(stderr, "w-at: cannot load %s\n", argv[2]); return 1; }
+    for (int i = 3; i < argc; i++) {
+        double p[3]; if (sscanf(argv[i], "%lf,%lf,%lf", p, p + 1, p + 2) != 3) { fprintf(stderr, "w-at: bad point %s\n", argv[i]); return 2; }
+        const double w = fit_set_W(S, p[0] - S->global->origin[0], p[1] - S->global->origin[1], p[2] - S->global->origin[2]);
+        printf("%s\t%.4f\tw%03ld\n", argv[i], w, (long)floor(w));
+    }
+    fit_set_free(S); return 0;
 }

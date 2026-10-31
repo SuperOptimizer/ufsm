@@ -4,6 +4,7 @@
    where it crosses an integer between neighbouring output pixels, red) and of the GT winding_mod14 codes (codes 1..252, 18 per turn:
    each GT turn its own colour over the CT, so the turn boundaries are colour edges). Panels: CT | each --fields | GT, 6 white
    pixels apart; JPEG q90, the longest side <= --max-px. */
+#include "fit.h"
 #include "imgops.h"
 #include "json.h"
 #include "store.h"
@@ -16,7 +17,7 @@
 static const char *pv_opt(int argc, char **argv, const char *k, const char *d) { for (int i = argc - 2; i >= 1; i--) if (!strcmp(argv[i], k)) return argv[i + 1]; return d; }
 
 int cmd_phase_vis(int argc, char **argv) {
-    if (argc < 5) { fprintf(stderr, "usage: ufsm phase-vis OUT.jpg CTROOT CTKEY --plane z,y,x,h,w [--axis z|y|x] [--fields LABEL=DIR,..] [--codes ROOT KEY] [--zoom 2] [--max-px 8000] [--cache DIR]\n"); return 2; }
+    if (argc < 5) { fprintf(stderr, "usage: ufsm phase-vis OUT.jpg CTROOT CTKEY --plane z,y,x,h,w [--axis z|y|x] [--fields LABEL=DIR,..] [--models LABEL=DIR,..] [--codes ROOT KEY] [--zoom 2] [--max-px 8000] [--cache DIR]\n"); return 2; }
     long long pz[5]; if (sscanf(pv_opt(argc, argv, "--plane", ""), "%lld,%lld,%lld,%lld,%lld", pz, pz + 1, pz + 2, pz + 3, pz + 4) != 5 || pz[3] < 1 || pz[4] < 1) { fprintf(stderr, "phase-vis: --plane z,y,x,h,w\n"); return 2; }
     const int H = (int)pz[3], W = (int)pz[4], Z = atoi(pv_opt(argc, argv, "--zoom", "2")) < 1 ? 1 : atoi(pv_opt(argc, argv, "--zoom", "2"));
     const char ax = pv_opt(argc, argv, "--axis", "z")[0];
@@ -30,7 +31,10 @@ int cmd_phase_vis(int argc, char **argv) {
     char fl[4096]; snprintf(fl, sizeof fl, "%s", pv_opt(argc, argv, "--fields", "")); char *lab[8], *dir[8]; int nf = 0;
     for (char *s = fl, *tok; nf < 8 && (tok = strtok(s, ",")); s = nullptr) { char *e = strchr(tok, '='); if (!e) { fprintf(stderr, "phase-vis: --fields LABEL=DIR\n"); return 2; } *e = 0; lab[nf] = tok; dir[nf++] = e + 1; }
     int ci = 0; for (int i = 3; i + 2 < argc; i++) if (!strcmp(argv[i], "--codes")) ci = i;
-    const int np = 1 + nf + (ci ? 1 : 0), gap = 6, PW = W * Z, OW = (PW + gap) * np - gap, OH = H * Z;
+    char ml[4096]; snprintf(ml, sizeof ml, "%s", pv_opt(argc, argv, "--models", "")); char *mlab[8], *mdir[8]; int nm = 0;   /* --models LABEL=DIR,..: fitted models / sets (CT voxels = native voxels) */
+    for (char *s = ml, *tok; nm < 8 && (tok = strtok(s, ",")); s = nullptr) { char *e = strchr(tok, '='); if (!e) { fprintf(stderr, "phase-vis: --models LABEL=DIR\n"); return 2; } *e = 0; mlab[nm] = tok; mdir[nm++] = e + 1; }
+    (void)mlab;
+    const int np = 1 + nf + nm + (ci ? 1 : 0), gap = 6, PW = W * Z, OW = (PW + gap) * np - gap, OH = H * Z;
     uint8_t *img = malloc((size_t)OW * OH * 3); memset(img, 255, (size_t)OW * OH * 3);
     for (int p = 0; p < np; p++) for (int y = 0; y < OH; y++) for (int x = 0; x < PW; x++) {   /* the CT under every panel */
         const uint8_t g = ct[(size_t)(y / Z) * W + x / Z]; uint8_t *px = img + ((size_t)y * OW + (size_t)p * (PW + gap) + x) * 3; px[0] = px[1] = px[2] = g;
@@ -73,13 +77,33 @@ int cmd_phase_vis(int argc, char **argv) {
         }
         free(pc); free(ps);
     }
+    for (int f = 0; f < nm; f++) {   /* --models: the fitted wraps (integer level sets of W), one colour per turn (6 cycling) */
+        fit_set *S = fit_set_load(mdir[f]); if (!S) { fprintf(stderr, "phase-vis: cannot load the model %s\n", mdir[f]); return 1; }
+        const double mo[3] = {(double)S->global->origin[0], (double)S->global->origin[1], (double)S->global->origin[2]};
+        for (int y = 0; y < OH; y++) for (int x = 0; x < PW; x++) {
+            const double r = (y + 0.5) / Z - 0.5, c = (x + 0.5) / Z - 0.5;
+            double v[3] = {(double)o[0], (double)o[1], (double)o[2]};
+            if (ax == 'z') { v[1] += r; v[2] += c; } else if (ax == 'y') { v[0] += r; v[2] += c; } else { v[0] += r; v[1] += c; }
+            ph[(size_t)y * OW + x] = (float)fit_set_W(S, v[0] + 0.5 - mo[0], v[1] + 0.5 - mo[1], v[2] + 0.5 - mo[2]);
+        }
+        static const uint8_t mc[6][3] = {{255, 40, 30}, {40, 220, 60}, {40, 120, 255}, {255, 220, 0}, {230, 40, 230}, {0, 230, 230}};
+        const int p = 1 + nf + f;
+        for (int y = 0; y < OH; y++) for (int x = 0; x < PW; x++) {
+            const float a0 = ph[(size_t)y * OW + x]; if (!(a0 == a0)) continue;
+            int edge = 0; long kk = 0;
+            for (int k = 0; k < 2 && !edge; k++) { const int yy = y + (k == 1), xx = x + (k == 0); if (yy >= OH || xx >= PW) continue; const float a1 = ph[(size_t)yy * OW + xx]; if (!(a1 == a1)) continue;
+                if (floorf(a0) != floorf(a1) && fabsf(a1 - a0) < 0.5f) { edge = 1; kk = (long)floorf(fmaxf(a0, a1)); } }
+            if (edge) { const uint8_t *col = mc[((kk % 6) + 6) % 6]; for (int e = 0; e < 4; e++) { const int yy = y + (e >> 1), xx = x + (e & 1); if (yy >= OH || xx >= PW) continue; uint8_t *px = img + ((size_t)yy * OW + (size_t)p * (PW + gap) + xx) * 3; px[0] = col[0]; px[1] = col[1]; px[2] = col[2]; } }
+        }
+        fit_set_free(S);
+    }
     if (ci) {   /* GT codes on the CT grid */
         uint8_t *cd = calloc(n2, 1); z3 *qz = z3_open(store_open(argv[ci + 1]), argv[ci + 2], nullptr);
         if (!qz || z3_read(qz, o, n, cd, 8)) { fprintf(stderr, "phase-vis: codes: %s\n", z3_error()); return 1; }
         z3_close(qz);
         static const uint8_t pal[14][3] = {{230, 25, 75}, {60, 180, 75}, {255, 225, 25}, {0, 130, 200}, {245, 130, 48}, {145, 30, 180}, {70, 240, 240},
                                            {240, 50, 230}, {210, 245, 60}, {250, 190, 212}, {0, 128, 128}, {220, 190, 255}, {170, 110, 40}, {255, 250, 200}};
-        const int p = 1 + nf;
+        const int p = 1 + nf + nm;
         for (int y = 0; y < OH; y++) for (int x = 0; x < PW; x++) {
             const int c = cd[(size_t)(y / Z) * W + x / Z]; if (c < 1 || c > 252) continue; const int t = (c - 1) / 18 % 14;
             uint8_t *px = img + ((size_t)y * OW + (size_t)p * (PW + gap) + x) * 3;

@@ -353,3 +353,12 @@ typedef struct { const long *v; const double *c; int nv; double other; } fj_tabl
 typedef struct { int a, b; fj_table t; } fj_edge;
 double fj_table_cost(const fj_table *t, long v);
 double fit_join_solve(int n, const fj_table *unary, int ne, const fj_edge *e, int rc, long *S);
+/* ufsm ct-cal (src/ctcal.c): the CT's papyrus peaks per density turn on a (z level, angle, radial band) table; count-field --ct-cal */
+typedef struct fit_ct_cal fit_ct_cal;
+fit_ct_cal *fit_ct_cal_load(const char *path);
+void fit_ct_cal_free(fit_ct_cal *c);
+double fit_ct_cal_k(const fit_ct_cal *c, double z, double dy, double dx);   /* k at box-local native z, offset (dy, dx) from the axis */
+/* the phase gate's per-cell pass on device planes (src/nn_pgate.cu; fit --phase-gate in a streamed GPU fit): a block of nz rows, pc / ps
+   rewritten in place, W_ref (host, nz x H x W) and the axis per row (host) uploaded; st as fit_phase_gate. 0 / -1. */
+int fit_phase_gate_gpu(uint8_t *pc, uint8_t *ps, const uint8_t *t1, const uint8_t *t2, const uint8_t *t5, const uint8_t *sp, const uint8_t *w,
+                       int nz, int H, int W, double h, const float *ay, const float *ax, const float *wref, int mode, int R, double lo, double hi, double rc, double st[4]);

@@ -607,6 +607,21 @@ int cmd_count_field(int argc, char **argv) {
                 nc++; nt += fabs(gz) / gl >= 0.5; sz += fabs(gz) / gl; }
             fprintf(stderr, "count-field ztilt: row %d (field rows %d..%d): %.0f cells, tilted >= 30 deg %.3f, mean |n_z| %.3f\n", z, z * P, z * P + P, nc, nc ? nt / nc : 0, nc ? sz / nc : 0); }
     }
+    if (*cf_opt(argc, argv, "--ct-cal", "")) {   /* --ct-cal FILE (ufsm ct-cal): the pooled count targets scaled by the CT's sheets per density turn */
+        fit_ct_cal *cc = fit_ct_cal_load(cf_opt(argc, argv, "--ct-cal", "")); if (!cc) { fprintf(stderr, "count-field: cannot read --ct-cal %s\n", cf_opt(argc, argv, "--ct-cal", "")); return 1; }
+        double ks = 0, kw = 0; const double kmax = atof(cf_opt(argc, argv, "--ct-cal-max", "1"));   /* (one-sided by default: the CT only lowers counts; Paris 4's CT counts ~5% above its GT) */
+        for (int z = 0; z < lv[0].d; z++) {
+            const double pz = (z + 0.5) * P * h, ay = cf_axis_at(g.cy, na, pz), ax = cf_axis_at(g.cx, na, pz);
+            for (int y = 0; y < lv[0].hh; y++) for (int x = 0; x < lv[0].w; x++) {
+                const size_t i = ((size_t)z * lv[0].hh + y) * lv[0].w + x; if (!(Sl[0][i] > 0)) continue;
+                const double k = fmin(kmax, fit_ct_cal_k(cc, pz, (y + 0.5) * P * h - ay, (x + 0.5) * P * h - ax));
+                for (int q = 0; q < 3; q++) Gl[0][q][i] *= (float)k;
+                ks += k * Sl[0][i]; kw += Sl[0][i];
+            }
+        }
+        fprintf(stderr, "count-field: --ct-cal: count targets scaled by the CT's sheets per density turn, weighted mean %.3f\n", kw > 0 ? ks / kw : 0);
+        fit_ct_cal_free(cc);
+    }
     float kpitch[2] = {(float)pitch, (float)pitch}, koff[2] = {0, 0}; const int kdz = (int)fmax(1, D * h);   /* the prior: r / pitch */
     fprintf(stderr, "count-field: %dx%dx%d cells (h %g, %.2f um), dir %+d, prior pitch %.1f native voxels, solve cells %d, chunks of %d rows (+-%d halo)\n", D, H, W, h, g.um, dir, pitch, P, CZ, Rz);
     for (int l = 1; l < nl; l++) {   /* coarser sums from the finer level */
