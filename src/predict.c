@@ -685,7 +685,7 @@ int cmd_predict(int argc, char **argv) {
                         "       [--fit-w4-d 32]   task unwrap2 checkpoints: the winding mod 4 relative planes dz dy dx dq over this many voxels (<= the halos)\n"
                         "       [--fit-ct 1]                     with them the CT planes ct / cs (fit --w-ct / --w-cspacing; ufsm ct-fields adds them later)\n"
                         "       [--no-out 1]                     skip writing the prediction volume's shards (e.g. only the --fit-zarr fields)\n"
-                        "       [--fit-q 0] [--fit-q-phase Q]   volcomp quantiser of the --fit-zarr arrays (0 lossless; the phase planes pc / ps: --fit-q-phase)\n"
+                        "       [--fit-q 8] [--fit-q-phase 4]   volcomp quantiser of the --fit-zarr arrays (0 lossless; the phase planes pc / ps: --fit-q-phase)\n"
                         "       [--radial-sign 1|-1]   -1 reverses the direction input (the CT is unchanged): a recto model then marks the verso face\n"
                         "       [--gn-save FILE]   pool the GroupNorm statistics of every window processed into FILE (calibration)\n"
                         "       [--gn-frozen FILE]   use FILE's pooled GroupNorm statistics instead of each window's (no dependence on the window)\n"
@@ -740,9 +740,11 @@ int cmd_predict(int argc, char **argv) {
        box, written to DIR at the end (src/fit.h fit_fields_save). One GPU, the CT window in its own buffer (no aliasing). */
     const char *ffd = opt(argc, argv, "--fit-fields", nullptr); const int ffh = atoi(opt(argc, argv, "--fit-h", "8"));
     const char *ffz = opt(argc, argv, "--fit-zarr", nullptr);   /* the same fields of a whole volume: 10-16 uint8 zarr arrays (ffz_names), flushed slab by slab */
-    /* --fit-q Q: volcomp quantiser of the --fit-zarr arrays (0 lossless, 1..255 lossy DCT); --fit-q-phase: the phase planes pc / ps
-       (default --fit-q) */
-    const float ffq = (float)atof(opt(argc, argv, "--fit-q", "0")), ffqp = (float)atof(opt(argc, argv, "--fit-q-phase", opt(argc, argv, "--fit-q", "0")));
+    /* --fit-q Q: volcomp quantiser of the --fit-zarr arrays (0 lossless, 1..255 lossy DCT; default 8); --fit-q-phase: the phase planes
+       pc / ps (default 4; was 0, lossless: ~90% of a 21-30 GB whole-scroll store; q 4 makes the phase 28-31x smaller, phase error
+       median 0.007 turn; slab fits + fit-join + wrap-check unchanged on PHerc0490B / PHerc1299 / Paris 4 crops, Paris 4 GT ids .1666 vs
+       .1668, pairs -0.1..-0.2 pt; ufsm-fieldq-2026-10-30). Old stores load unchanged. */
+    const float ffq = (float)atof(opt(argc, argv, "--fit-q", "8")), ffqp = (float)atof(opt(argc, argv, "--fit-q-phase", "4"));
     if (!(ffq >= 0 && ffq <= 255 && ffqp >= 0 && ffqp <= 255)) { fprintf(stderr, "predict: --fit-q / --fit-q-phase 0..255\n"); return 2; }
     if (ffd && ffz) { fprintf(stderr, "predict: --fit-fields or --fit-zarr\n"); return 2; }
     if ((ffd || ffz) && (ffh < 1 || ffh > 32)) { fprintf(stderr, "--fit-h 1..32\n"); return 2; }   /* (inference aliasing stays on: the fit pooling reads

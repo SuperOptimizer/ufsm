@@ -56,7 +56,7 @@ CK=wind96-wk1-best.ckpt; INKCK=ift3-24000.ckpt
 
 # 1. fit fields (wind96): 10 planes on a 2-voxel cell grid, written straight into a fit-field set; repack to 512^3 shards
 $U predict $CK $R $K fields.tmp --um 2.4 --level 2 --box Z,Y,X,NZ,NY,NX --window-z 384 --halo-z 64 --window 640 --halo 64 --shard 512 \
-   --grid-origin 0,0,0 --ema 1 --q 8 --axis axis.json --levels 1 --fit-zarr fields --fit-h 2 --fit-q 8 --fit-q-phase 0 --no-out 1 --occupancy 5
+   --grid-origin 0,0,0 --ema 1 --q 8 --axis axis.json --levels 1 --fit-zarr fields --fit-h 2 --fit-q 8 --fit-q-phase 4 --no-out 1 --occupancy 5
 for a in fields/*/; do $U repack $a ${a%/}.512 512 --threads 12 && rm -r $a && mv ${a%/}.512 $a; done
 
 # 2. ink (ift3-24000): frozen GroupNorm from a calibration band, two passes offset by half a shard, blended
@@ -152,8 +152,13 @@ requests in flight per IP). ARCH=86 is picked by itself on sm_80/86/89 GPUs (sof
 - `UFSM_RENDER_MEM` = min(16, 25% of the limit);
 - no per-wrap renders (`PERWRAP=1` adds them).
 
-Every variable can be overridden from the environment. Disk for a Paris 4-size scroll: CT level 2 42 GB, fields 50 GB (deleted
+Every variable can be overridden from the environment. Disk for a Paris 4-size scroll: CT level 2 42 GB, fields ~5 GB (50 GB with the old lossless phase; deleted
 once the wraps exist), joined 10 GB, ink 1.5 GB.
+
+Fields copied home: predict writes the phase planes lossy (`--fit-q-phase 4`; they were lossless, ~90% of the store). PHerc0490B
+21.6 -> 2.85 GB (7.6x), PHerc0483B 30.4 -> 3.47 GB (8.8x). A store written before that shrinks in place with
+`scripts/pod/packfields.sh FIELDS` (`ufsm fields-pack`, byte-identical to predicting at q 4): 21.6 GB in 160 s at 8 threads on the
+loaded desk, IO-bound on a slow disk.
 
 Peak RSS per stage. Measured with `scripts/pod/unroll.sh` on a Paris 4 crop: 1024 level-2 z of the papyrus box y 1024+7150,
 x 512+7424, so slab fits and predicts see the whole-scroll cross-section. The crop ran on the desk in
@@ -206,6 +211,7 @@ ufsm ingest-kaggle <hf-root> <out>                     # Kaggle cubes -> images.
 ufsm ingest-mesh <s3-root> <tifxyz-key> <out.sfc>      # segment mesh -> surfcomp
 ufsm raster <out> --shape Z,Y,X --um U meshes...       # meshes -> label pyramid (surface band / background / ignore)
 ufsm repack <in-array> <out-array> 512 [--threads N]   # lossless re-sharding of a z3w uint8 array (copies compressed chunks)
+ufsm fields-pack IN OUT [--q-phase 4] [--q -1] [--threads N]   # a fit-field store smaller: phase planes lossy (old stores: lossless pc / ps = 90%), other planes copied; readers unchanged
 ufsm z3-recode <group> <out-group> --um U --lut FILE [--hist 1]   # a prob254 pyramid through a LUT (255 kept), value histogram
 ```
 
@@ -275,7 +281,7 @@ CT | phase hue over CT | winding mod 4 hue over CT; rows z-mid / y-mid / x-mid).
 | `--window W --halo H` / `--window-z --halo-z` | tile size and discarded border (thin-z windows for the fields) |
 | `--grid-origin z,y,x` | tile interiors anchored to CT coordinates: a voxel's windows do not depend on the box / shard layout |
 | `--full-grid 1` | every tile of the grid (ink); `--occupancy L`: skip shards, and windows whose interior, that are zero on the coarser CT level L (one coarse voxel of margin; outputs and fit fields identical except at isolated low CT specks whose coarse voxels round to 0, e.g. 6 of 4.2M P3 coarse voxels; also with `--fit-zarr`; reads of air windows saved: P4 61% / P3 31% of the shards at L 5; `UFSM_OCC_TILES=0`: shards only); `--resume 1`: skip written shards |
-| `--fit-zarr DIR --fit-h 2 --fit-q 8 --fit-q-phase 0 --no-out 1 --axis JSON` | the unwrap heads straight into a fit-field set (no prediction pyramid) |
+| `--fit-zarr DIR --fit-h 2 --fit-q 8 --fit-q-phase 4 --no-out 1 --axis JSON` | the unwrap heads straight into a fit-field set (no prediction pyramid) |
 | `--gn-save FILE` / `--gn-frozen FILE` | GroupNorm statistics from a calibration box, then frozen for the whole volume (no per-tile brightness seams) |
 | `--ema 1`, `--q Q`, `--levels N` | EMA weights, volcomp quality (0 lossless), pyramid levels written |
 | `--tta`, `--input-gain G --input-bias B` | test-time augmentation; the standardized CT input transform `G * zscore(CT) + B` (defaults: identity) |

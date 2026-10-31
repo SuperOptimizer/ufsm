@@ -144,6 +144,7 @@ static int usage(void) {
         "  ufsm fit <fields-dir> [--slab Z] [--out MODEL] [--winding ZARR] [--codes ROOT KEY]   winding fitter (src/fit.h)\n"
         "  ufsm convert-unwrap2 <unwrap.ckpt> <out.ckpt>   a task unwrap checkpoint as task unwrap2 (heads 2-10 -> 0-8, winding mod 4 fresh; no training step)\n"
         "  ufsm repack <in-array-dir> <out-array-dir> <shard> [--threads N]   lossless re-sharding of a z3w uint8 zarr (copies the compressed chunks)\n"
+        "  ufsm fields-pack IN OUT [--q-phase Q] [--q Q] [--ang A] [--conf C] [--mask-w 1] [--shard 512]   re-encode a fit-field store smaller (readers unchanged)\n"
         "  ufsm wraps <model-dir> <out-dir> [--step 8] [--fields DIR]          one tifxyz per wrap (level sets of W)\n"
         "  ufsm coreline detect|box|sdist|check ...   a crushed scroll's flattened umbilicus per z (fit fields), half-box fit dirs behind it, check renders\n"
         "  ufsm render-sheets <tifxyz-dir> <out-dir> --ct ROOT KEY --ink ROOT KEY ...   every sheet -> CT + red ink 5-panel JPEGs, one batch\n"
@@ -4044,6 +4045,7 @@ static int cmd_sample(int argc, char **argv) {
 }
 
 int cmd_repack(int argc, char **argv);   /* src/repack.c */
+int cmd_fields_pack(int argc, char **argv);   /* src/fieldspack.c */
 int cmd_fit_join(int argc, char **argv);   /* src/fitjoin.c */
 int cmd_wrap_check(int argc, char **argv);   /* src/wrapcheck.c */
 int cmd_fields_oracle(int argc, char **argv);   /* src/fieldsoracle.c */
@@ -4128,6 +4130,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "sr-pairs")) return cmd_sr_pairs(argc, argv);
     if (!strcmp(cmd, "convert-unwrap2")) return cmd_convert_unwrap2(argc, argv);
     if (!strcmp(cmd, "repack")) return cmd_repack(argc, argv);
+    if (!strcmp(cmd, "fields-pack")) return cmd_fields_pack(argc, argv);
     if (!strcmp(cmd, "phase-raster")) return cmd_phase_raster(argc, argv);
     if (!strcmp(cmd, "wraps")) return cmd_wraps(argc, argv);
     if (!strcmp(cmd, "stitch")) return cmd_stitch(argc, argv);

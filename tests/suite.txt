@@ -61,6 +61,7 @@ test_surf                                      |              |     3 | ./$B/tes
 test_wraps_core                                |              |     1 | ./$B/test_wraps_core
 test_stitch                                    |              |     3 | ./$B/test_stitch
 test_fblend                                    |              |     1 | ./$B/test_fblend
+test_fields_pack                               |              |     2 | ./$B/test_fields_pack
 test_countfield                                |              |     6 | ./$B/test_countfield
 test_vwt_sample                                |              |     1 | ./$B/test_vwt_sample
 test_spiralfit                                 |              |    32 | ./$B/test_spiralfit
