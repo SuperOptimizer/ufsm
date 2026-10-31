@@ -22,10 +22,18 @@ static void fc_par(void *(*fn)(void *), void *J, int nt) {
     for (int t = 0; t < k; t++) pthread_join(th[t], nullptr);
 }
 
+fgpu *fgpu_open(const int64_t shape[3]) __attribute__((weak));
+void fgpu_close(fgpu *G) __attribute__((weak));
+int fgpu_broken(const fgpu *G) __attribute__((weak));
+int fgpu_put(fgpu *G, size_t id, const uint8_t *buf, uint32_t mask) __attribute__((weak));
+void fgpu_drop(fgpu *G, size_t id) __attribute__((weak));
+void fgpu_stats(const fgpu *G, size_t *nput, size_t *bytes, int *slots) __attribute__((weak));
+
 /* ---- the CT (or a label raster) through a cache of decoded chunks ---- */
 typedef struct {
     z3 *z; int64_t shape[3]; int cs[3]; int64_t g[3]; uint8_t **ch; uint32_t *stamp; _Atomic uint8_t *need; size_t nres, cap; uint32_t clock; int nt;
     size_t ndec;
+    fgpu *dev;   /* non-null: every decoded chunk mirrored on the GPU (faces_vol.gpu) */
     _Atomic uint32_t *needm; uint32_t *have;
     uint8_t **pool; int npool; pthread_mutex_t pmu;   /* evicted whole-chunk buffers for reuse (no page faults / zeroing per decode) */   /* sub: per chunk the volcomp substreams (16 z x 32 y slabs) marked / decoded; nullptr: whole chunks */
 } fc_cache;
@@ -125,14 +133,18 @@ static int fcc_fill(void *ctx) {
         nnew += !c->ch[k]; todo[nt++] = (int64_t)k;
     }
     fcd_job J = {c, todo, nt, 0, 0}; fc_par(fcc_decode, &J, c->nt);
-    free(todo); c->nres += nnew; c->ndec += nt;
-    if (atomic_load(&J.err)) { fprintf(stderr, "faces: %s\n", z3_error()); return -1; }
+    c->nres += nnew; c->ndec += nt;
+    if (atomic_load(&J.err)) { free(todo); fprintf(stderr, "faces: %s\n", z3_error()); return -1; }
+    if (c->dev && !fgpu_broken(c->dev))   /* the new chunks / substreams to the device mirror */
+        for (size_t k = 0; k < nt && !fgpu_broken(c->dev); k++) { const size_t id = (size_t)todo[k]; if (c->ch[id]) fgpu_put(c->dev, id, c->ch[id], c->needm ? c->have[id] : 0xffffffffu); }
+    free(todo);
     while (c->nres > c->cap) {   /* least recently needed first, never this band's */
         uint32_t old = c->clock; for (size_t k = 0; k < ng; k++) if (c->ch[k] && c->stamp[k] < old) old = c->stamp[k];
         if (old == c->clock) break;
         for (size_t k = 0; k < ng && c->nres > c->cap; k++) if (c->ch[k] && c->stamp[k] == old) {
             if (c->npool < 512 && c->pool) c->pool[c->npool++] = c->ch[k]; else free(c->ch[k]);
             c->ch[k] = nullptr; c->nres--; if (c->needm) c->needm[k] = c->have[k] = 0;
+            if (c->dev) fgpu_drop(c->dev, k);
         }
     }
     return 0;
@@ -193,14 +205,14 @@ static void meta_get(const char *dir, const char *name, double *um, double *scal
 
 /* ufsm faces <wraps-dir> <out-dir> --ct ROOT KEY --ct-um U [--wraps a,b,..] [--umb JSON --umb-um U] [--range 150] [--thick 15,200]
    [--min-prom 8] [--rel 0.1] [--tol 25] [--inset 0] [--smooth 4] [--ct-thr 90] [--gt ROOT KEY --gt-um U [--gt-range 100]]
-   [--threads 16] [--cache-mb 4096] [--cache DIR]
+   [--threads 16] [--cache-mb 4096] [--cache DIR] [--gpu 1]
    Every wrap <w> (tifxyz dir or .sfc) -> <out>/<w>_recto and <out>/<w>_verso (tifxyz on the wrap's grid; conf.tif (uint8: 0 filled, else
    the band's contrast) and thick.tif (float, um) in <w>_recto), and <out>/<w>_faces.txt. Lengths in um. Statistics on stdout. */
 int cmd_faces(int argc, char **argv) {
     const int ci = farg(argc, argv, "--ct");
     if (argc < 4 || ci < 0 || ci + 2 >= argc || !(atof(fopt(argc, argv, "--ct-um", "0")) > 0)) {
         fprintf(stderr, "usage: ufsm faces <wraps-dir> <out-dir> --ct ROOT KEY --ct-um U [--wraps a,b] [--umb JSON --umb-um U] [--range 150] [--thick 15,200]\n"
-                        "       [--min-prom 8] [--rel 0.1] [--tol 25] [--inset 0] [--smooth 4] [--ct-thr 90] [--gt ROOT KEY --gt-um U [--gt-range 100]] [--threads 16] [--cache-mb 4096]\n"
+                        "       [--min-prom 8] [--rel 0.1] [--tol 25] [--inset 0] [--smooth 4] [--ct-thr 90] [--gt ROOT KEY --gt-um U [--gt-range 100]] [--threads 16] [--cache-mb 4096] [--gpu 1]\n"
                         "  recto (inner face) and verso (outer face) of the papyrus sheet under each wrap: <out>/<w>_recto, <out>/<w>_verso (+ conf.tif, thick.tif)\n");
         return 2;
     }
@@ -218,7 +230,9 @@ int cmd_faces(int argc, char **argv) {
     const char *cache = fopt(argc, argv, "--cache", nullptr);
     z3 *cz = z3_open(store_open(argv[ci + 1]), argv[ci + 2], cache); if (!cz) { fprintf(stderr, "faces: %s\n", z3_error()); return 1; }
     fc_cache cc; if (fcc_init(&cc, cz, o.nthreads, cache_mb) || fcc_sub(&cc)) { fprintf(stderr, "faces: out of memory\n"); return 1; }
-    faces_vol V = {&cc, fcc_sample, fcc_mark, fcc_fill};
+    faces_vol V = {&cc, fcc_sample, fcc_mark, fcc_fill, nullptr};
+    /* --gpu 1 (default): profiles + medians on the GPU (bit-identical; 128^3 CT chunks); 0, no device, or a binary without it: the CPU */
+    if (atoi(fopt(argc, argv, "--gpu", "1")) && fgpu_open && cc.cs[0] == 128 && cc.cs[1] == 128 && cc.cs[2] == 128 && (cc.dev = fgpu_open(cc.shape))) V.gpu = cc.dev;
     const int gi = farg(argc, argv, "--gt"); z3 *gz = nullptr; fc_cache gc; const double gum = atof(fopt(argc, argv, "--gt-um", "0"));
     if (gi > 0) {
         if (gi + 2 >= argc || !(gum > 0)) { fprintf(stderr, "faces: --gt ROOT KEY --gt-um U\n"); return 2; }
@@ -276,6 +290,7 @@ int cmd_faces(int argc, char **argv) {
         for (int b = 0; b < 64 && qk < 3; b++) { acc += st.thick_hist[b]; while (qk < 3 && acc >= qs[qk] * tot) pc[qk++] = 5 * b + 2.5; }
         /* the published surfaces */
         char gts[400] = ""; size_t gth[40] = {0};
+        const double tgt = now_s();
         if (gz) {
             const int ws = (w + SUB - 1) / SUB, hs = (h + SUB - 1) / SUB; float *dist = malloc((size_t)ws * hs * 4 * sizeof(float));
             for (size_t k = 0; k < (size_t)ws * hs * 4; k++) dist[k] = NAN;
@@ -300,6 +315,10 @@ int cmd_faces(int argc, char **argv) {
             for (int k = 0; k < 3; k++) free(a[k]);
             free(dist);
         }
+        if (getenv("UFSM_FACES_PROF")) {
+            size_t np = 0, nb = 0; int ns = 0; if (cc.dev && fgpu_stats) fgpu_stats(cc.dev, &np, &nb, &ns);
+            fprintf(stderr, "faces prof: gt %.2f s; gpu %s, %zu chunk uploads %.2f GB, %d device slots\n", now_s() - tgt, cc.dev ? (fgpu_broken(cc.dev) ? "broken" : "on") : "off", np, nb / 1e9, ns);
+        }
         const size_t nm1 = st.nv ? st.nv : 1, cn = st.ct_n ? st.ct_n : 1, np = st.nv - st.nfill ? st.nv - st.nfill : 1;
         char line[1200];
         snprintf(line, sizeof line, "%s %zu %.3f %.3f %.3f %.3f %.3f  %.3f %.3f %.3f  %.0f %.0f %.0f  %.1f %.1f  %.3f %.3f%s", nm, st.nv, (double)st.nband / nm1, (double)st.npick0 / nm1, (double)st.npick / nm1, (double)st.nfill / nm1,
@@ -320,6 +339,7 @@ int cmd_faces(int argc, char **argv) {
         free(X); free(Y); free(Z); free(RX); free(RY); free(RZ); free(VX); free(VY); free(VZ); free(th); free(cf);
         done++;
     }
+    if (cc.dev) fgpu_close(cc.dev);
     fcc_free(&cc); z3_close(cz); if (gz) { fcc_free(&gc); z3_close(gz); }
     free(names); free(want);
     fprintf(stderr, "faces: %d wraps -> %s\n", done, argv[3]);

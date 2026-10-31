@@ -21,6 +21,9 @@
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 typedef struct { float near, far, peak, prom, cin, cout; } fc_band;   /* along the outward normal (profile units), peak value, contrast over void,
                                                                         the CT just inside the inner / outer face */
@@ -46,6 +49,7 @@ typedef struct {
     double (*sample)(void *ctx, double z, double y, double x);
     void (*mark)(void *ctx, const double lo[3], const double hi[3]);
     int (*fill)(void *ctx);
+    struct fgpu *gpu;        /* non-null: profiles and medians on the GPU (src/nn_faces.cu), the chunks mirrored there by fill */
 } faces_vol;
 
 typedef struct {
@@ -70,3 +74,20 @@ int faces_orient(const float *X, const float *Y, const float *Z, int w, int h, c
 
 /* the grid normal of vertex i (central differences over +-2 vertices where valid, else +-1); 0 when undefined */
 int faces_normal(const float *X, const float *Y, const float *Z, int w, int h, size_t i, double N[3]);
+
+/* ---- the GPU path (src/nn_faces.cu; weak in src/faces.c / src/faces_cli.c: binaries without it are CPU-only). Bit-identical to the
+   CPU path. A device mirror of the decoded 128^3 CT chunks (fgpu_put after each decode, fgpu_drop on eviction); on any device error
+   (pool full, ...) fgpu_broken turns true and faces_wrap continues on the CPU. */
+typedef struct fgpu fgpu;
+fgpu *fgpu_open(const int64_t shape[3]);   /* null: no device */
+void fgpu_close(fgpu *G);
+int fgpu_broken(const fgpu *G);
+int fgpu_put(fgpu *G, size_t id, const uint8_t *buf, uint32_t mask);
+void fgpu_drop(fgpu *G, size_t id);
+int fgpu_grid(fgpu *G, const float *X, const float *Y, const float *Z, const float *N, int w, int h);
+int fgpu_band(fgpu *G, int r0, int r1, double f, double hs, double R, int m, double min_prom, double rel, fc_band *cand, uint8_t *nc, float *ct0, uint8_t *prof);
+int fgpu_median(fgpu *G, const float *in, float *out, int w, int h, int R, int minn);
+void fgpu_stats(const fgpu *G, size_t *nput, size_t *bytes, int *slots);
+#ifdef __cplusplus
+}
+#endif
