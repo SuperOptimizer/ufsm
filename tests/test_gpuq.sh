@@ -16,10 +16,15 @@ o=$(tr '\n' ' ' < $L); echo "yield order: $o"
 [ "$o" = "bgA1 bgA2 now bgA3 bgA4 " ] || { echo "FAIL bg did not yield to now at a box boundary"; f=1; }
 # a holder; then bg, eval, eval, now queue in that order -> served now, eval1, eval2, bg
 : > $L
-bash $Q run eval hold bash -c "sleep 1.2; echo hold >> $L" & ph=$!; sleep 0.3
-bash $Q run bg b bash -c "echo bg >> $L" & sleep 0.2
-bash $Q run eval e1 bash -c "echo e1 >> $L" & sleep 0.2
-bash $Q run eval e2 bash -c "echo e2 >> $L" & sleep 0.2
+# (no fixed sleeps: each job is queued only once the previous one's ticket exists, and the holder lets go once all 4 wait;
+#  a loaded machine starts the bash processes late)
+nt() { ls "$GPUQ_DIR"/t.* 2> /dev/null | wc -l; }
+waitn() { until [ "$(nt)" -ge "$1" ]; do sleep 0.02; done; }
+bash $Q run eval hold bash -c "until [ \$(ls '$GPUQ_DIR'/t.* 2> /dev/null | wc -l) -ge 4 ]; do sleep 0.02; done; echo hold >> $L" & ph=$!
+until [ -s "$GPUQ_DIR/holder" ]; do sleep 0.02; done   # the holder has the GPU
+bash $Q run bg b bash -c "echo bg >> $L" & waitn 1
+bash $Q run eval e1 bash -c "echo e1 >> $L" & waitn 2
+bash $Q run eval e2 bash -c "echo e2 >> $L" & waitn 3
 bash $Q run now n bash -c "echo now >> $L" &
 wait
 o=$(tr '\n' ' ' < $L); echo "priority order: $o"
