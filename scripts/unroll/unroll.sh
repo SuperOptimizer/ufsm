@@ -12,7 +12,7 @@
 #           ift3 ink, frozen GN, window 640 / 64 + a +256 offset pass, ink-blend) -> ink/$INKNAME.zarr
 #   ctcal   -> fields (CTCAL=1 only, OFF by default): ufsm ct-cal --ct-um $LUM (the CT LEVEL's um) -> ct.cal; ref adds --ct-cal
 #   ref     -> fields: count-field --model-only (REFCMD F REF [--ct-cal FILE] overrides; cf GPU, TH threads)
-#   slabs   -> ref: snapped slab fits, one lane per GPU in FITGPUS ("0 1"); the INKGPU lane starts once the ink is done; then the
+#   slabs   -> ref: snapped slab fits, FITLANES lanes per GPU in FITGPUS ("0 1"; auto: by device memory, 1..3); the INKGPU lanes start once the ink is done; then the
 #           bad-slab check (fit.log: "illegal memory", "loss 0.00000", no final loss line): refit on 1 lane, up to 3 tries, else fail
 #   join    -> slabs: fit-join --ref (refuses bad slabs) ; check -> join: wrap-check (wrapcheck.tsv verdicts; 0 CT peaks = fail)
 #   wraps   -> check: ufsm wraps (.sfc, step 4, --zr from scrolls.tsv, --min-cm2, --col-r p90)
@@ -30,7 +30,7 @@
 # Heavy CPU stages wait for MemAvailable >= MINMEM (40) GB. STOP: touch $O/STOP (checked between stages / slabs / wraps). A stage
 # whose done marker exists is skipped; partial stages resume (predict --resume parts, slab claims, per-wrap outputs).
 # DRY=1: print the plan (commands) without running anything. Runs from a copy of these scripts in $O/bin (edits never touch a run).
-# Env: U (ufsm), UR, TH (20), FIELDGPUS ("0 1"), FITGPUS ("0 1"), INKGPU (1), INKCMD, REFCMD, CK, INKCK, INKNAME, MINMEM, PERWRAP,
+# Env: U (ufsm), UR, TH (20), FIELDGPUS ("0 1"), FITGPUS ("0 1"), FITLANES (auto), INKGPU (1), INKCMD, REFCMD, CK, INKCK, INKNAME, MINMEM, PERWRAP,
 #   CTROOT / CTKEY (replace the table's CT root / key), ZCACHE_GB (auto) / ZCACHE_ADMIT (0.6): the decoded-CT cache of the render stages,
 #   TAG (output dir suffix), ITH / PTH (ink / fields predict threads), FACES, SPAR (4 per-wrap jobs), CLEAN (1: fields + slab fits deleted once the wraps exist), STRIPARGS / ZR / BOX (override scrolls.tsv).
 set -u
@@ -215,12 +215,27 @@ lane() {   # lane GPU
     rm -rf $d/f; exec 9>&-
   done
 }
-slabs() {
-  local g pids=() ng
-  # fit threads per lane: the host's CPUs over the lanes (fits are thread-count independent: 0490B s020/s021 models equal at 10 / 20;
-  # 1 lane 10 -> 20 threads: 8 slabs 163 -> 150 s; 2 lanes per GPU with the GPU lock: 156 s, not used)
-  ng=$(echo $FITGPUS | wc -w); FTH_LANE=${FTHREADS:-$(( $(ncpu) / (ng > 0 ? ng : 1) ))}; [ $FTH_LANE -lt 2 ] && FTH_LANE=2
+# fitlanes: the slab-fit lanes, a GPU id per lane. Each GPU of FITGPUS gets FITLANES lanes; FITLANES unset means auto:
+# (device GB - 8) / 16, clamped to 1..3, so 16-24 GB cards get 1 lane, 48 GB MIG slices 2, and 96 GB cards 3.
+# Measured on a 96 GB RTX PRO 6000 with 6 Paris 3 slabs and threads = CPUs / lanes: 1 lane 82.8 s, 2 lanes 54.8 s,
+# 3 lanes 47.9 s, delta.f32 byte-identical. A fit takes ~10-16 GB of device memory. The device size comes from
+# `ufsm sysinfo` (CUDA order, MIG-aware); when it is unknown, 1 lane.
+fitlanes() {
+  local g n gb i out=
   for g in $FITGPUS; do
+    n=${FITLANES:-}
+    if [ -z "$n" ]; then gb=$($U sysinfo 2> /dev/null | awk -v g=$g '$1 == "gpu" && $2 == g ":" && match($0, /, [0-9.]+ GB \(/) { print int(substr($0, RSTART + 2, RLENGTH - 6)) }')
+      n=$(( (${gb:-0} - 8) / 16 )); [ $n -lt 1 ] && n=1; [ $n -gt 3 ] && n=3; fi
+    for i in $(seq $n); do out+="$g "; done
+  done; echo $out
+}
+slabs() {
+  local g pids=() ng lanes
+  # fit threads per lane: the host's CPUs over the lanes (fits are thread-count independent: 0490B s020/s021 models equal at 10 / 20;
+  # 1 lane 10 -> 20 threads: 8 slabs 163 -> 150 s; 2 lanes per 16 GB GPU with the GPU lock: 156 s, so 1 lane there; 96 GB: 3, fitlanes)
+  lanes=$(fitlanes); [ "$DRY" = 1 ] && echo "    slab lanes (GPU per lane): $lanes"
+  ng=$(echo $lanes | wc -w); FTH_LANE=${FTHREADS:-$(( $(ncpu) / (ng > 0 ? ng : 1) ))}; [ $FTH_LANE -lt 2 ] && FTH_LANE=2
+  for g in $lanes; do
     if [ "$g" = "$INKGPU" ] && ! done_ ink; then { [ "$DRY" = 1 ] && echo "    (GPU $g lane starts once the ink is done or failed)" || while ! done_ ink && ! stopped && [ ! -e $O/state/ink.failed ]; do sleep 30; done; lane $g; } &
     else lane $g & fi; pids+=($!)
   done

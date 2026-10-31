@@ -9,6 +9,7 @@
 #   Progress: $UR/<S>/progress.log; per-stage wall / CPU / max RSS: $UR/<S>/state/*.done.
 # Pod defaults (per-stage RAM table in README "Pod runs"), all overridable by env:
 #   TH = cgroup CPUs; PTH / ITH (predict threads) = TH; FIELDGPUS = FITGPUS = INKGPU = 0 (one GPU or MIG slice);
+#   slab-fit lanes on that GPU: FITLANES (auto in the driver: (device GB - 8) / 16, 1..3, threads = CPUs / lanes; 96 GB card: 3 lanes, 1.7x);
 #   MINMEM 8 (cgroup-aware with `ufsm sysinfo --avail-gb`); CFMEM (count-field --mem-gb) = min(24, 40% of the cgroup RAM);
 #   SNAP 1 (wrap-snap the wraps onto the sheets before the strip; SNAPT mix), PERWRAP 0. The strip is the deliverable. Per-wrap renders beside the strip would add 16-24 GB each.
 #   CLEAN 1: fields and slab fits are deleted once the wraps exist.
