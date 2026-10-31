@@ -8,8 +8,8 @@
 #   prep    box (scrolls.tsv or the scanprep mask) + axis (scrolls.tsv file or ufsm axis)
 #   fields  wind96 fit fields: the box split in z at a 1024-voxel boundary, one predict per GPU (same global tile grid), joined by
 #           fields_cat.sh (shard files moved: the result is the single-GPU run's); FIELDGPUS="0" = one predict
-#   ink     -> prep only; GPU INKGPU (1) from when the fields are done: INKCMD (the ink agent's recipe; default: the corpus 2-pass
-#           ift3 ink, frozen GN, window 640 / 64 + a +256 offset pass, ink-blend) -> ink/$INKNAME.zarr
+#   ink     -> prep only; GPU INKGPU (1) from when the fields are done: INKCMD (the ink agent's recipe; default: the feathered
+#           single pass of inklib.sh: ift3, frozen GN, --window auto --halo 32 --feather 32, resumable) -> ink/$INKNAME.zarr
 #   ctcal   -> fields (CTCAL=1 only, OFF by default): ufsm ct-cal --ct-um $LUM (the CT LEVEL's um) -> ct.cal; ref adds --ct-cal
 #   ref     -> fields: count-field --model-only (REFCMD F REF [--ct-cal FILE] overrides; cf GPU, TH threads)
 #   slabs   -> ref: snapped slab fits, FITLANES lanes per GPU in FITGPUS ("0 1"; auto: by device memory, 1..3); the INKGPU lanes start once the ink is done; then the
@@ -171,27 +171,23 @@ ref() {
     --threads $TH --mem-gb ${CFMEM:-24} $cal; fi && { [ "$DRY" = 1 ] || [ -e $REF/model.json ]; }
 }
 
-# --- ink (another agent's recipe via INKCMD SCROLLDIR GPU OUT; default the corpus 2-pass) ---
+# --- ink (another agent's recipe via INKCMD SCROLLDIR GPU OUT; default the feathered single pass of scripts/corpus/inklib.sh) ---
 ink() {
   [ "$DRY" = 1 ] || mkdir -p $O/ink
-  # INKCMD set but empty (a pod env with an unset path, "INKCMD=$X"): fail loudly instead of falling back to the 2-pass prediction;
+  # INKCMD set but empty (a pod env with an unset path, "INKCMD=$X"): fail loudly instead of falling back to the default prediction;
   # any INKCMD must leave a readable zarr at $INK (a dangling link from a missing published ink fails here, not in the renders)
-  if [ -n "${INKCMD+x}" ] && [ -z "${INKCMD// /}" ]; then log "ink: INKCMD is set but EMPTY: refusing (unset it for the default 2-pass ink)"; return 1; fi
+  if [ -n "${INKCMD+x}" ] && [ -z "${INKCMD// /}" ]; then log "ink: INKCMD is set but EMPTY: refusing (unset it for the default feathered ink)"; return 1; fi
   if [ -n "${INKCMD:-}" ]; then X $O/logs/ink.log $INKCMD $O $INKGPU $INK || { log "ink: INKCMD '$INKCMD' failed (logs/ink.log)"; return 1; }
     [ "$DRY" = 1 ] || [ -e $INK/zarr.json ] || { log "ink: INKCMD '$INKCMD' left no zarr at $INK (zarr.json missing; dangling link?)"; return 1; }
     return 0; fi
-  local box cal bb bo; box=$([ "$DRY" = 1 ] && echo ${BOX:-BOX} || cat $O/box.txt)
+  local box cal; box=$([ "$DRY" = 1 ] && echo ${BOX:-BOX} || cat $O/box.txt)
   cal=$(echo $box | awk -F, '{ zc = $1 + int($4 / 2); z0 = zc - 1024; if (z0 < $1) z0 = $1; nz = 2048; if (nz > $4) nz = $4; printf "%d,%d,%d,%d,%d,%d", z0, $2, $3, nz, $5, $6 }')
-  bb=$(echo $box | awk -F, '{ printf "%d,%d,%d,%d,%d,%d", $1 + 256, $2 + 256, $3 + 256, $4 - 256, $5 - 256, $6 - 256 }'); bo=$(echo $bb | cut -d, -f1-3)
-  local P="--um $UM --level $LV --shard 512 --window 640 --halo 64 --ema 1 --q 32 --threads ${ITH:-12} --gpu $INKGPU $(occlv)"
-  [ -s $O/ink/gn.bin ] || { X $O/logs/ink.log $U predict $INKCK $R $K $O/ink/gncal.zarr $P --box $cal --full-grid 1 --levels 1 --no-out 1 --gn-save $O/ink/gn.tmp &&
+  local P="--um $UM --level $LV --shard 512 --ema 1 --q 32 --threads ${ITH:-12} --gpu $INKGPU $(occlv)"
+  [ -s $O/ink/gn.bin ] || { X $O/logs/ink.log $U predict $INKCK $R $K $O/ink/gncal.zarr $P --window 640 --halo 64 --box $cal --full-grid 1 --levels 1 --no-out 1 --gn-save $O/ink/gn.tmp &&
                              { [ "$DRY" = 1 ] || { mv $O/ink/gn.tmp $O/ink/gn.bin; rm -rf $O/ink/gncal.zarr; }; } || return 1; }
-  X $O/logs/ink.log $U predict $INKCK $R $K $O/ink/a.zarr $P --box $box --full-grid 1 --resume 1 --levels 4 --gn-frozen $O/ink/gn.bin || return 1
-  X $O/logs/ink.log $U predict $INKCK $R $K $O/ink/b.zarr $P --box $bb --resume 1 --levels 1 --gn-frozen $O/ink/gn.bin || return 1
-  [ "$DRY" = 1 ] || rm -rf $INK
-  X $O/logs/ink.log $U ink-blend $INK --um $LUM --tile 512,512,512 --grids 0,0,0:256,256,256 --origins 0,0,0:$bo --levels 4 --shard 512 --q 32 \
-    --threads ${ITH:-12} $O/ink/a.zarr $O/ink/b.zarr || return 1
-  [ "$DRY" = 1 ] || rm -rf $O/ink/a.zarr $O/ink/b.zarr
+  # one feathered pass (inklib.sh): window auto (576/32 on 16 GB, 1088/32 from ~46 GB free), each border blended over 32 voxels; resumable
+  X $O/logs/ink.log $U predict $INKCK $R $K $INK $P --box $box --window ${INKW:-auto} --halo ${INKH:-32} --feather ${INKF:-32} --full-grid 1 --resume 1 --levels 4 \
+    --gn-frozen $O/ink/gn.bin || return 1
 }
 
 # --- slab fits: one lane per GPU, claims by flock (fd.sh lane) ---
