@@ -405,19 +405,26 @@ static void prolongate(const level *C, level *F, const flat_opts *o) {
         prev = left;
     }
     for (size_t i = 0; i < n2; i++) m->uv[i] = m->uv0[i] + dl[i];
-    long nb = count_flips(m, m->uv, bad), nb0 = nb; int rounds = 0;
+    long nb = count_flips(m, m->uv, bad), nb0 = nb, nbest = nb; int rounds = 0;
+    double *dbest = nb ? malloc(n2 * 8) : nullptr; if (dbest) memcpy(dbest, dl, n2 * 8);   /* the state with the fewest bad triangles */
     for (; nb && rounds < 200; rounds++) {   /* relax the vertices of bad triangles (and grow the set) */
         memset(acc, 0, n2 * 8); memset(nn, 0, (size_t)m->nv * 4);
         for (int t = 0; t < m->nt; t++) { const int *v = m->tri + 3 * t; for (int a = 0; a < 3; a++) if (bad[v[a]]) for (int b = 0; b < 3; b++) if (a != b) { acc[2 * v[a]] += dl[2 * v[b]]; acc[2 * v[a] + 1] += dl[2 * v[b] + 1]; nn[v[a]]++; } }
         for (int v = 0; v < m->nv; v++) if (bad[v] && nn[v]) { dl[2 * v] = acc[2 * v] / nn[v]; dl[2 * v + 1] = acc[2 * v + 1] / nn[v]; }
         for (size_t i = 0; i < n2; i++) m->uv[i] = m->uv0[i] + dl[i];
         nb = count_flips(m, m->uv, bad);   /* (the relaxed set only grows: bad marks are kept) */
+        if (dbest && nb < nbest) { nbest = nb; memcpy(dbest, dl, n2 * 8); }
         if (nb && rounds % 10 == 9) {   /* stuck: grow the relaxed region by one ring */
             uint8_t *g = calloc((size_t)m->nv, 1);
             for (int t = 0; t < m->nt; t++) { const int *v = m->tri + 3 * t; if (bad[v[0]] || bad[v[1]] || bad[v[2]]) g[v[0]] = g[v[1]] = g[v[2]] = 1; }
             memcpy(bad, g, (size_t)m->nv); free(g);
         }
     }
+    if (nb && dbest && nb > 2 * nbest) {   /* relaxing spread the folds (P4 core chunks: 293 bad -> 4134 after 200 rounds, 3% of the mesh dropped and
+                                          left as flaps): back to the state with the fewest, so only those triangles are dropped */
+        memcpy(dl, dbest, n2 * 8); for (size_t i = 0; i < n2; i++) m->uv[i] = m->uv0[i] + dl[i]; nb = nbest;
+    }
+    free(dbest);
     double alpha = 1; long dropped = 0;
     if (nb && nb * 20 < m->nt) {   /* stuck triangles (mesh borders where the coarse lattice has no cell; folds of crushed inner wraps): dropped, up to 5% of the mesh. Scaling the whole
                                      prolongation down instead (below) undid the coarse levels: P3 inner strip chunks with 0.11% stuck stayed at aniso p50 1.3 */
