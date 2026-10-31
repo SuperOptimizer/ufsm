@@ -16,7 +16,7 @@ set -u
 OUT=$1
 U=${U:-/vesuvius/ufsm/scroll1/src/build/ufsm}
 CTR=${CTR:?CT root}; CTK=${CTK:?CT key}; INK=${INK:?ink zarr}; INKK=${INKK:-9.6}
-RENDER_NT=${RENDER_NT:-8}; MOS_NT=${MOS_NT:-6}; MAXR=${MAXR:-6}; CTL=${CTL:-80}; PAP=${PAP:-}; MEMGB=${MEMGB:-80}; PAPMOS=${PAPMOS:-}; PGAIN=${PGAIN:-1}; PAPPX=${PAPPX:-8000}
+RENDER_NT=${RENDER_NT:-8}; MOS_NT=${MOS_NT:-6}; MAXR=${MAXR:-6}; [ $MAXR -ge 1 ] || MAXR=1; CTL=${CTL:-80}; PAP=${PAP:-}; MEMGB=${MEMGB:-80}; PAPMOS=${PAPMOS:-}; PGAIN=${PGAIN:-1}; PAPPX=${PAPPX:-8000}
 FILLX=${FILLX:---fill 4 --fill-grid 50000 --fill-inpaint 4 --fill-pm 1}
 R=$OUT/render_fill; I=$OUT/img_fill; M=$OUT/fillmap
 mkdir -p $OUT/logs $R $M
@@ -50,7 +50,9 @@ reap() { local q=() p; for p in "${RP[@]}"; do if kill -0 $p 2> /dev/null; then 
 for s in "${S[@]}"; do
   [ -e $OUT/STOP_FILL ] && { kill "${MPS[@]}"; wait; exit 0; }
   clean; reap
-  while { [ $(( $(ls $R | grep -c '_ct\.tif$') + ${#RP[@]} )) -ge $MAXR ] || [ ${#RP[@]} -ge ${RJOBS:-1} ]; } && alive && [ $RFAIL = 0 ]; do sleep 2; clean; reap; done
+  # only renders the mosaic takes before s count against MAXR: renders already on disk past s (the stretch's 3 middle stripes) wait for
+  # the mosaic, which waits for s, so counting them deadlocked whenever MAXR <= their number
+  while { [ $(( $(ls $R | grep '_ct\.tif$' | awk -v s=$s '$0 < s' | wc -l) + ${#RP[@]} )) -ge $MAXR ] || [ ${#RP[@]} -ge ${RJOBS:-1} ]; } && alive && [ $RFAIL = 0 ]; do sleep 2; clean; reap; done
   [ $RFAIL = 0 ] || { kill "${MPS[@]}"; wait; exit 1; }
   alive || break
   if [ ${RJOBS:-1} -gt 1 ]; then rend $s & RP+=($!); else rend $s || { kill "${MPS[@]}"; exit 1; }; fi
