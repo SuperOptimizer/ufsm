@@ -176,14 +176,15 @@ typedef struct {
     const st_wrap *W; const int *ord, *cb, *ce; const long long *col0; int n, w, h, every, K; st_band *B;
     pthread_mutex_t mu; pthread_cond_t cv; _Atomic int fail;
 } st_stream;
-static const float *st_band_get(st_stream *T, int by) {
+/* band by's slot (taken over from its old band: that one is fully encoded, since a worker fills patch q only when q < appended + R and
+   K - 2 bands span at least R patches); then up to `max` of its segments decoded by this caller (all: the band is needed now; 1: prefetch) */
+static st_band *st_band_help(st_stream *T, int by, int max) {
     st_band *b = &T->B[by % T->K];
     pthread_mutex_lock(&T->mu);
-    if (atomic_load(&b->band) != by) { atomic_store(&b->next, 0); atomic_store(&b->ndone, 0); atomic_store(&b->band, by); }   /* (the slot's old band is
-        fully encoded: a worker fills patch q only when q < appended + R, and K bands span more than R patches) */
+    if (atomic_load(&b->band) != by) { atomic_store(&b->next, 0); atomic_store(&b->ndone, 0); atomic_store(&b->band, by); }
     pthread_mutex_unlock(&T->mu);
     const int r0 = by * 64, nr = T->h - r0 < 64 ? T->h - r0 : 64;
-    for (int q; (q = atomic_fetch_add(&b->next, 1)) < T->n;) {   /* help decode the band's segments */
+    for (int k = 0, q; k < max && (q = atomic_fetch_add(&b->next, 1)) < T->n; k++) {
         const st_wrap *s = &T->W[T->ord[q]]; const int nc = T->ce[q] - T->cb[q];
         float *t = malloc((size_t)nr * nc * 12);
         if (!t || st_band_read(s, T->every, r0, nr, T->cb[q], T->ce[q], t)) atomic_store(&T->fail, 1);
@@ -191,7 +192,17 @@ static const float *st_band_get(st_stream *T, int by) {
         free(t);
         pthread_mutex_lock(&T->mu); if (atomic_fetch_add(&b->ndone, 1) + 1 == T->n) pthread_cond_broadcast(&T->cv); pthread_mutex_unlock(&T->mu);
     }
-    pthread_mutex_lock(&T->mu); while (atomic_load(&b->ndone) < T->n) pthread_cond_wait(&T->cv, &T->mu); pthread_mutex_unlock(&T->mu);
+    return b;
+}
+static const float *st_band_get(st_stream *T, int by) {
+    st_band *b = &T->B[by % T->K];
+    if (atomic_load(&b->band) != by || atomic_load(&b->ndone) < T->n) {
+        b = st_band_help(T, by, T->n);
+        pthread_mutex_lock(&T->mu); while (atomic_load(&b->ndone) < T->n) pthread_cond_wait(&T->cv, &T->mu); pthread_mutex_unlock(&T->mu);
+    }
+    /* prefetch: one segment of the next band per patch (its slot's old band by + 1 - K is encoded: K >= 3 and (K - 2) bands >= R patches) */
+    const int nby = (T->h + 63) / 64;
+    if (by + 1 < nby && T->K >= 3) { st_band *nb = &T->B[(by + 1) % T->K]; if (atomic_load(&nb->band) != by + 1 || atomic_load(&nb->next) < T->n) st_band_help(T, by + 1, 1); }
     return b->xyz;
 }
 static void st_fill_stream(void *ctx, int bx, int by, float (*joint)[3], uint8_t *valid) {
