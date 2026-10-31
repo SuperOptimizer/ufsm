@@ -81,6 +81,78 @@ template <int B, int CO, typename YT = float> static void conv1_mx_t(const void 
     const size_t S = shape_spatial(xs), sm = conv1_smem(xs, cout), Sy = nv ? nv : S;
     conv1_mx_t_k<B, CO, YT><<<dim3(nblk_(Sy, 256), xs.n), 256, sm>>>((const uint8_t *)x, w, b, y, xs.n, xs.c, S, gp, cout, vb, Sy, cy ? cy : cout);
 }
+/* the fp16-logit head with its weights in the constant bank (inference heads: one sample, one MX block of CI = 16 / 32 channels, whole-
+   window GroupNorm): each FFMA takes its weight as a constant-bank operand, no shared-memory weight loads (conv1_mx_t_k's broadcast
+   LDS.128 of the weights per input channel and voxel bound it: 18.7 ms at 384 x 640^2 x 32 -> 11, ~3x its memory floor). Two voxels per
+   thread share the GN+SiLU coefficient loads. Same values, same operations in the same order as conv1_mx_t_k: bit-identical logits.
+   The weights / bias reach c1c_w by a device-to-device copy on the launch's stream (the compute stream), so back-to-back heads with
+   other weights stay ordered. UFSM_CONV1_CONST=0: the staged kernel. */
+__constant__ float c1c_w[16 * 32 + 16];   /* [co][ci] (CO x CI) then the CO biases */
+template <int B, int CI, int CO, typename YT>
+__global__ void __launch_bounds__(256) conv1_mx_c_k(const uint8_t *x, YT *y, size_t S, gnp_t gp, int hasb, size_t vb, size_t Sy, int Cy) {
+    constexpr int V = 2;
+    __shared__ float2 sab[CI];
+    if (gp.G) for (int i = threadIdx.x; i < CI; i += blockDim.x) sab[i] = gn_ab(gp, 0, i, CI);
+    __syncthreads();
+    const uint8_t *sc = mx_sc<B>(x, 1, CI, S);
+    const size_t l0 = (size_t)blockIdx.x * (blockDim.x * V) + threadIdx.x;
+    float r[V][CI];
+#pragma unroll
+    for (int j = 0; j < V; j++) {
+        const size_t vl = l0 + (size_t)j * blockDim.x, v = vb + vl;
+        if (vl < Sy && v < S) mx_load_row_b<B>(x, sc, v, CI, r[j]);
+        else {
+#pragma unroll
+            for (int k = 0; k < CI; k++) r[j][k] = 0.f;
+        }
+    }
+    float acc[V][CO];
+#pragma unroll
+    for (int j = 0; j < V; j++)
+#pragma unroll
+        for (int co = 0; co < CO; co++) acc[j][co] = hasb ? c1c_w[CO * CI + co] : 0.f;
+#pragma unroll
+    for (int ci = 0; ci < CI; ci++) {
+        float2 ab = make_float2(0.f, 0.f);
+        if (gp.G) ab = sab[ci];
+#pragma unroll
+        for (int j = 0; j < V; j++) {
+            float xv = r[j][ci];
+            if (gp.G) xv = act_ab(xv, ab.x, ab.y, true);
+#pragma unroll
+            for (int co = 0; co < CO; co++) acc[j][co] += c1c_w[co * CI + ci] * xv;
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < V; j++) {
+        const size_t vl = l0 + (size_t)j * blockDim.x, v = vb + vl;
+        if (vl >= Sy || v >= S) continue;
+#pragma unroll
+        for (int co = 0; co < CO; co++) {
+            if constexpr (sizeof(YT) == 2) y[(size_t)co * Sy + vl] = __float2half(acc[j][co]); else y[(size_t)co * Sy + vl] = acc[j][co];
+            (void)Cy;
+        }
+    }
+}
+template <int CI, int CO> static void conv1_mx_c(const void *x, shape5 xs, const float *w, const float *b, __half *y, gnp_t gp, size_t vb, size_t Sy, int cy) {
+    const size_t S = shape_spatial(xs);
+    cudaMemcpyToSymbolAsync(c1c_w, w, sizeof(float) * CO * CI, 0, cudaMemcpyDeviceToDevice, 0);   /* (errors: LPCK after the launch) */
+    if (b) cudaMemcpyToSymbolAsync(c1c_w, b, sizeof(float) * CO, sizeof(float) * CO * CI, cudaMemcpyDeviceToDevice, 0);
+    conv1_mx_c_k<4, CI, CO, __half><<<(unsigned)((Sy + 511) / 512), 256>>>((const uint8_t *)x, y, S, gp, b != nullptr, vb, Sy, cy);
+}
+/* the constant-bank head when it applies (MX-fp4 input of one 16- or 32-channel block, one sample, no slab GroupNorm, a pass of 1, 2, 4,
+   11 or 16 outputs); 0: not taken */
+static int g_c1c = -1;
+extern "C" void nn_set_conv1_const(int on) { g_c1c = on; }
+static int conv1_const(const void *x, int xdt, shape5 xs, const float *w, const float *b, int nc, __half *y, gnp_t gp, size_t vb, size_t Sy, int cy) {
+    if (g_c1c < 0) g_c1c = !getenv("UFSM_CONV1_CONST") || atoi(getenv("UFSM_CONV1_CONST"));
+    if (!g_c1c || xdt != 4 || xs.n != 1 || gp.ns || (xs.c != 16 && xs.c != 32) || mx_nb(xs.c) != 1) return 0;
+#define C1C(CI) do { switch (nc) { case 1: conv1_mx_c<CI, 1>(x, xs, w, b, y, gp, vb, Sy, cy); return 1; case 2: conv1_mx_c<CI, 2>(x, xs, w, b, y, gp, vb, Sy, cy); return 1; \
+                                   case 4: conv1_mx_c<CI, 4>(x, xs, w, b, y, gp, vb, Sy, cy); return 1; case 11: conv1_mx_c<CI, 11>(x, xs, w, b, y, gp, vb, Sy, cy); return 1; \
+                                   case 16: conv1_mx_c<CI, 16>(x, xs, w, b, y, gp, vb, Sy, cy); return 1; default: return 0; } } while (0)
+    if (xs.c == 16) C1C(16); else C1C(32);
+#undef C1C
+}
 /* the same with fp16 logits (unet lean training; the staged path only) */
 extern "C" void lp_conv1_fwd_mx_h16(const void *x, int xdt, shape5 xs, const float *w, const float *b, int cout, void *y, gnp_t gp) {
     lp_conv1_fwd_mx_h16_r(x, xdt, xs, w, b, cout, y, gp, 0, 0);
@@ -94,6 +166,7 @@ extern "C" void lp_conv1_fwd_mx_h16_r(const void *x, int xdt, shape5 xs, const f
         const int nc = cout - c0 < 16 ? cout - c0 : 16; const int cy = cout;
         const float *wc = w + (size_t)c0 * xs.c, *bc = b ? b + c0 : nullptr;
         __half *yh = (__half *)y + (size_t)c0 * Sy;
+        if (conv1_const(x, xdt, xs, wc, bc, nc, yh, gp, vb, Sy, cy)) continue;
 #define C1H(B) do { switch (nc) { case 1: conv1_mx_t<B, 1>(x, xs, wc, bc, yh, gp, nc, vb, nv, cy); break; case 2: conv1_mx_t<B, 2>(x, xs, wc, bc, yh, gp, nc, vb, nv, cy); break; \
                                case 3: conv1_mx_t<B, 3>(x, xs, wc, bc, yh, gp, nc, vb, nv, cy); break; case 4: conv1_mx_t<B, 4>(x, xs, wc, bc, yh, gp, nc, vb, nv, cy); break; \
                                case 5: conv1_mx_t<B, 5>(x, xs, wc, bc, yh, gp, nc, vb, nv, cy); break; case 6: conv1_mx_t<B, 6>(x, xs, wc, bc, yh, gp, nc, vb, nv, cy); break; \

@@ -227,6 +227,7 @@ ufsm wrap-check <model-or-set> <fields-dir> --ct ROOT KEY --ct-um U [--codes ROO
 ufsm surf-stats <wraps-dir> --fields DIR [--model FIT] [--ct ROOT KEY --ct-um U [--ct-level 80]] [--ct-only 1] [--per-wrap]
 ufsm field-blend <out> <fields1> [<fields2> ...] [--tile SZ,SY,SX --grids z,y,x:...]
 ufsm spiral-fit <in-fields> --model DIR [--init-model REF]   # = count-field --method spiral: villa diffeomorphic spiral (opt-in, null on P4)
+ufsm cf-compare <model-a> <model-b> [fields] [--step 4]   # two count-field refs: lattice |delta|, snap-integer agreement
 ```
 
 - `count-field --model-only 1 --model DIR`: winding integrated from the network's density x normals (weighted LS, coarse to
@@ -234,6 +235,16 @@ ufsm spiral-fit <in-fields> --model DIR [--init-model REF]   # = count-field --m
   output fields). `--model-stride K` takes the gauge from every K-th field chunk (Paris 4: 15% faster, same scores at 4).
   `--mem-gb` is the field chunk budget: small budgets re-read the 128-row zarr shards many times. The model's `dir` is the
   scroll's handedness (PHerc1447 is -1); pass it to the slab fits.
+- `count-field --cf-gpu 1` (default; the CPU code without a device, and per chunk / CG level when the device is short of
+  memory, e.g. shared): pass 1's pooling, the CG solves and the `--model-only --R 0` model pass on the GPU (`src/nn_cf.cu`);
+  the global gauge pass and the model pass become one read of the strided chunks; the next chunk decodes on a thread
+  meanwhile (`--prefetch`, on when two chunks fit in half of MemAvailable; `--read-threads N` the zarr decode threads).
+  The pooled sums are bit-identical to the CPU (no FMA contraction, IEEE division, glibc atan2 / hypot of the 65536 phase
+  bytes as a table); the CG sums in another order, a difference the size of another `--threads`; runs are deterministic.
+  Paris 4 whole ref (desk, 8 threads, loaded): 3:02 h -> 32 min; snap integers round(W - phi) agree 0.999986 with the
+  10-26 CPU ref (CPU 8 vs 6 threads on a cut: the same level). `ufsm cf-compare A B [FIELDS]` measures this. The result
+  depends on `--mem-gb` (the chunk rows: chunk-edge rows skip the phase term, `--model-stride` picks chunks): `--mem-gb 13`
+  reproduces the 88-row chunks of the 10-26 Paris 4 ref.
 - `fit --ref-model REF --ref-snap 1`: every voxel's integer = round(U_ref - bias - u); no flood, use with `--uw-repair 0`.
   A full-cross-section slab needs ~11 GB of GPU memory (one fit per 16 GB GPU). An air slab at the box ends fails with "no data
   for the prior"; leave it out of the join.

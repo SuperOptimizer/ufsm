@@ -17,6 +17,66 @@ static const double p = 8.0, cy0 = 48 * h, cx0 = 48 * h;   /* pitch (native voxe
 static int bad_quadrant(double th) { return th > 0.2 && th < M_PI / 2 - 0.2; }
 static double trueW(double y, double x) { return hypot(y - cy0, x - cx0) / p - atan2(y - cy0, x - cx0) / (2 * M_PI); }
 
+/* --cf-gpu 1 (src/nn_cf.cu) vs the CPU on the cf-ref recipe (--model-only, R 0, --phase-w 4, strided chunks): a 3D spiral with
+   z-varying normals and phase noise. Pooled sums (--pool-cache) identical but for libm last bits; the model's delta (U + gauge) agrees
+   to << 1e-3 turn, like the CPU at another thread count (the CG sums in another order) */
+int cf_gpu_ok(void) __attribute__((weak));
+static float *read_f32(const char *path, size_t *n) {
+    FILE *f = fopen(path, "rb"); if (!f) return nullptr; fseek(f, 0, SEEK_END); const long sz = ftell(f); fseek(f, 0, SEEK_SET);
+    float *v = malloc(sz); *n = (size_t)sz / 4; if (fread(v, 1, sz, f) != (size_t)sz) { free(v); v = nullptr; } fclose(f); return v;
+}
+static void gpu_vs_cpu(const char *dir) {
+    if (!cf_gpu_ok || !cf_gpu_ok()) { printf("test_countfield: no GPU, CPU only\n"); return; }
+    enum { D2 = 40, H2 = 88, W2 = 104 };
+    const size_t n = (size_t)D2 * H2 * W2; uint8_t *a[10]; for (int k = 0; k < 10; k++) a[k] = calloc(n, 1);
+    unsigned rs = 7;
+    for (int z = 0; z < D2; z++) for (int y = 0; y < H2; y++) for (int x = 0; x < W2; x++) {
+        const size_t i = ((size_t)z * H2 + y) * W2 + x; const double cy = 44 * h + 6 * sin(z * 0.1), cx = 50 * h + 4 * cos(z * 0.07);
+        const double py = (y + 0.5) * h, px = (x + 0.5) * h, ry = py - cy, rx = px - cx, r = hypot(ry, rx); if (r < 2 * p) continue;
+        rs = rs * 1664525u + 1013904223u; const double nse = ((rs >> 8) / 16777216.0 - 0.5) * 0.3;
+        const double Wt = r / p - atan2(ry, rx) / (2 * M_PI) + 0.02 * z, ph = Wt + nse, cf = 0.4 + 0.55 * fabs(sin(0.3 * x + 0.2 * z));
+        a[0][i] = (uint8_t)lrint(128 + 127 * cf * cos(2 * M_PI * ph)); a[1][i] = (uint8_t)lrint(128 + 127 * cf * sin(2 * M_PI * ph));
+        const double t = 0.3 * sin(0.05 * z), nz = sin(t), ny = cos(t) * ry / r, nx = cos(t) * rx / r;
+        a[2][i] = (uint8_t)lrint(255 * nz * nz); a[3][i] = (uint8_t)lrint(255 * ny * ny); a[4][i] = (uint8_t)lrint(255 * nx * nx);
+        a[5][i] = (uint8_t)lrint(255 * (0.5 + nz * ny)); a[6][i] = (uint8_t)lrint(255 * (0.5 + nz * nx)); a[7][i] = (uint8_t)lrint(255 * (0.5 + ny * nx));
+        a[8][i] = (uint8_t)lrint(8 * p / h * (1 + 0.2 * sin(0.1 * y))); a[9][i] = (uint8_t)(150 + (rs >> 26));
+    }
+    const int na = D2 * h + 1; float *cyv = malloc(na * sizeof(float)), *cxv = malloc(na * sizeof(float));
+    for (int k = 0; k < na; k++) { cyv[k] = (float)(44 * h + 6 * sin(k / (double)h * 0.1)); cxv[k] = (float)(50 * h + 4 * cos(k / (double)h * 0.07)); }
+    char in[600]; snprintf(in, sizeof in, "%s/in3", dir);
+    const long long org[3] = {0, 0, 0}; const int shp[3] = {D2, H2, W2};
+    if (fit_fields_save(in, org, shp, h, 9.6, a, cyv, cxv, na)) { fails++; fprintf(stderr, "FAIL: cannot write the 3D input\n"); return; }
+    /* 8-row chunks (--mem-gb: 12 B per cell held), every 2nd chunk for the model gauge */
+    char mg[32]; snprintf(mg, sizeof mg, "%.9f", 8.5 * 12.0 * H2 * W2 / 1e9);
+    static const char *tag[4] = {"cpu4", "cpu1", "gpu", "gpu-lowmem"}; static const char *thr[4] = {"4", "1", "4", "2"}, *gp[4] = {"0", "0", "1", "1"};
+    float *dl[4] = {0}, *pcache[4] = {0}; size_t nd[4] = {0}, npc[4] = {0};
+    for (int r = 0; r < 4; r++) {
+        char mdir[640], pcf[640], pth[700]; snprintf(mdir, sizeof mdir, "%s/m-%s", dir, tag[r]); snprintf(pcf, sizeof pcf, "%s/pool-%s.bin", dir, tag[r]);
+        char *av[] = {"ufsm", "count-field", in, "-", "--R", "0", "--pool", "4", "--phase-w", "4", "--iters", "1200", "--model", mdir, "--model-only", "1",
+                      "--model-stride", "2", "--threads", (char *)thr[r], "--mem-gb", mg, "--cf-gpu", (char *)gp[r], "--pool-cache", pcf, "--rmin-um", "50", nullptr};
+        if (r == 3) { setenv("UFSM_CF_POOL_GZ", "1", 1); setenv("UFSM_CF_CG_NOAP", "1", 1); }   /* (one solve row per upload group: double buffers; the CG without a stored A p) */
+        CHECK(cmd_count_field(28, av) == 0, "count-field %s failed", tag[r]);
+        unsetenv("UFSM_CF_POOL_GZ"); unsetenv("UFSM_CF_CG_NOAP");
+        snprintf(pth, sizeof pth, "%s/delta.f32", mdir); dl[r] = read_f32(pth, &nd[r]); pcache[r] = read_f32(pcf, &npc[r]);
+        CHECK(dl[r] && pcache[r], "%s: no model / pool cache", tag[r]);
+    }
+    if (dl[0] && dl[1] && dl[2] && pcache[0] && pcache[2] && nd[0] == nd[2] && nd[1] == nd[0] && npc[0] == npc[2]) {
+        size_t pdiff = 0; double prel = 0;
+        for (size_t i = 8; i < npc[0]; i++) if (pcache[0][i] != pcache[2][i]) { pdiff++; prel = fmax(prel, fabs(pcache[0][i] - pcache[2][i]) / fmax(1e-6, fabs(pcache[0][i]))); }
+        double dg = 0, dt = 0; size_t ig = 0;
+        for (size_t i = 0; i < nd[0]; i++) { dg = fmax(dg, fabs(dl[2][i] - dl[0][i])); dt = fmax(dt, fabs(dl[1][i] - dl[0][i])); ig += lround(dl[2][i]) != lround(dl[0][i]); }
+        printf("test_countfield: GPU vs CPU: pooled sums %zu of %zu differ (max rel %.1e); model delta max |GPU - CPU| %.2e turn (CPU 1 vs 4 threads %.2e), integers differ at %zu of %zu lattice points\n",
+               pdiff, npc[0] - 8, prel, dg, dt, ig, nd[0]);
+        CHECK(pdiff <= (npc[0] - 8) / 1000 && prel < 1e-5, "pooled sums: %zu differ, max rel %.2e", pdiff, prel);
+        CHECK(dg < 1e-3, "model delta GPU vs CPU max %.3e turn", dg);
+        CHECK(dl[3] && nd[3] == nd[2] && !memcmp(dl[2], dl[3], nd[2] * sizeof(float)) && pcache[3] && !memcmp(pcache[2] + 8, pcache[3] + 8, (npc[2] - 8) * sizeof(float)),
+              "GPU low-memory paths (upload groups, CG without A p) not identical to the default GPU run");
+    } else CHECK(0, "model / pool cache sizes differ");
+    for (int r = 0; r < 4; r++) { free(dl[r]); free(pcache[r]); }
+    for (int k = 0; k < 10; k++) free(a[k]);
+    free(cyv); free(cxv);
+}
+
 int main(void) {
     char tmpl[] = "/tmp/test_countfield_XXXXXX"; char *dir = mkdtemp(tmpl); if (!dir) return 1;
     char in[512], out[512], mdir[512]; snprintf(in, sizeof in, "%s/in", dir); snprintf(out, sizeof out, "%s/out", dir); snprintf(mdir, sizeof mdir, "%s/model", dir);
@@ -71,6 +131,7 @@ int main(void) {
         fit_free(m);
     }
     fit_fields_free(&ob);
+    gpu_vs_cpu(dir);
     char cmd[700]; snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir); if (system(cmd)) {}
     for (int k = 0; k < 10; k++) free(a[k]);
     free(cy); free(cx); free(wc);

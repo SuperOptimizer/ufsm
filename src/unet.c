@@ -83,6 +83,7 @@ struct unet {
     int using_ema;
     block *rb[UNET_MAXLEV]; int nrb_any; float *gres[UNET_MAXLEV]; size_t gres_cap[UNET_MAXLEV];   /* cfg.enc_blocks: residual blocks, the identity gradient per level */
     float *gn_frz; size_t gn_frz_n;   /* unet_gn_freeze: per-sample GroupNorm statistics used by inference forwards instead of the window's */
+    float *gn_frz_d;                  /* their device copy (uploaded once; each forward replays it into the sites with async device copies) */
     double *gn_acc; long gn_acc_n;     /* unet_gn_accumulate: sums of the window statistics (mean, mean^2 per mean slot, variance per rstd slot) */
     float *l0run, *l0live; size_t l0live_n;   /* cfg.l0_norm ema: [mean G | var G] per level-0 site (l0_site order), three sets of 8 G: the
                                                  running statistics of the live weights, of the EMA weights (unet_ema blends the last
@@ -168,6 +169,7 @@ struct unet {
        does not fit) */
     int p3, zr, r_out, r_in; float *R, *Xp, *Yp; size_t r_bytes, x_bytes, y_bytes; void *h_r, *ev_r[4];
     float *slab_tmp1, *slab_carry1, *slab_tmpd;
+    float *slab_alt; void *ev_sc, *ev_sf[2], *ev_se;   /* slab_ovl: the second slab temp (both levels), the conv / temp-free / end events */
     struct { const uint8_t *ct; float mean, isd; const float *dyo, *dxo; int axis, h16, on; } ctin;   /* in-place z-slab convs at level 0 (UFSM_INFER_SLAB): enc[0] / dec[0] a1 and a2 all in
                                                          X = enc[0].a2's buffer; slab_s output planes per launch into slab_tmp (+ one carry plane) */     /* inference aliasing (UFSM_INFER_ALIAS, default on): the MX network input in enc[0].a2's buffer
                                                 (dead from the stem to enc[0].c2), the fp32 logits in T1 (dec[0].a1, dead after dec[0].c2) */
@@ -395,7 +397,7 @@ void unet_free(unet *u) {
     nn_free(u->p); nn_free(u->g); nn_free(u->m); nn_free(u->v); nn_free(u->ema); nn_free(u->hf_w); nn_free(u->l0fg_mx);
     nn_free(u->gn_scratch); nn_free(u->red_scratch); nn_free(u->wg_tmp);
     nn_free(u->wm); nn_free(u->muon_mom); nn_free(u->muon_work); nn_free(u->muon_descs); nn_free(u->stem_b);
-    nn_free(u->mx_mcd); nn_free(u->mx_nsd); nn_free(u->mx_pool); nn_free(u->mx_hbf); nn_free(u->mx_R); nn_free(u->mx_part); free(u->gn_frz); free(u->gn_acc); nn_free(u->l0run); nn_free(u->l0live); nn_free(u->wsp); nn_free(u->l0s_st); nn_free(u->l0s_tmp); nn_free(u->l0st_g2); nn_free(u->l0st_up); nn_free(u->l0st_poison); nn_free(u->l0h_lg); for (int i = 0; i < UNET_MAXLEV; i++) free(u->rb[i]);
+    nn_free(u->mx_mcd); nn_free(u->mx_nsd); nn_free(u->mx_pool); nn_free(u->mx_hbf); nn_free(u->mx_R); nn_free(u->mx_part); free(u->gn_frz); nn_free(u->gn_frz_d); free(u->gn_acc); nn_free(u->l0run); nn_free(u->l0live); nn_free(u->wsp); nn_free(u->l0s_st); nn_free(u->l0s_tmp); nn_free(u->l0st_g2); nn_free(u->l0st_up); nn_free(u->l0st_poison); nn_free(u->l0h_lg); for (int i = 0; i < UNET_MAXLEV; i++) free(u->rb[i]);
     nn_free(u->anvil_v1); nn_free(u->anvil_pool); nn_free(u->anvil_descs); nn_free(u->ds_g16); nn_free(u->ds_tmp);
     nn_free(u->wq_q); nn_free(u->wq_sc); nn_free(u->wq_qe); nn_free(u->wq_sce);
     nn_free(u->wq_r); nn_free(u->wq_rsc); nn_free(u->wq_re); nn_free(u->wq_rsce);
@@ -603,6 +605,18 @@ void unet_set_infer_offload(int on) { g_infer_off = on; }
 static int g_infer_slab = -1;
 static int infer_slab(void) { if (g_infer_slab < 0) g_infer_slab = getenv("UFSM_INFER_SLAB") ? atoi(getenv("UFSM_INFER_SLAB")) : 64; return g_infer_slab; }   /* planes per slab (default 64), 0 off */
 void unet_set_infer_slab(int planes) { g_infer_slab = planes; }
+/* overlapped slab copies (UFSM_SLAB_OVL, default auto): the in-place slab convs write slab k into one of two temps; slab k's planes go
+   into X on the aux stream while slab k + 1 computes into the other temp (disjoint planes: slab k + 1 reads X from slab k's last output
+   plane on, which stays in its temp until slab k + 1 is done); no carry plane. The same bytes land in X as with the serial copies */
+/* Default (auto): on for a level 0 of >= 32 channels only. Measured 10-30: wind96 (32-wide) forward 557 -> 503 ms per 384 x 640^2 window
+   on the laptop 5080, neutral on the desk 5060 Ti (448 GB/s); the 16-wide ink net's convs are as cheap as its copies: no gain on the
+   laptop, +9% on the 5060 Ti. UFSM_SLAB_OVL=0 / 1 (or unet_set_slab_ovl) forces it */
+static int g_slab_ovl = -1;
+static int slab_ovl(int w0) {
+    if (g_slab_ovl < 0 && getenv("UFSM_SLAB_OVL")) g_slab_ovl = ufsm_env_on("UFSM_SLAB_OVL");
+    return g_slab_ovl < 0 ? w0 >= 32 : g_slab_ovl;
+}
+void unet_set_slab_ovl(int on) { g_slab_ovl = on; }
 int unet_ct_stem(const unet *u) { return u->built && !u->train && u->ct_stem; }
 void unet_set_ct_input(unet *u, int on) { if (u->ct_mode != on && u->built && !u->train) free_acts(u); u->ct_mode = on; }
 static int share_enc_a1(void) { if (g_share_enc_a1 < 0) g_share_enc_a1 = ufsm_env_on("UFSM_RC_ENC_A1"); return g_share_enc_a1 && recompute() == 1 && nn_get_tf32(); }
@@ -771,9 +785,9 @@ static void free_acts(unet *u) {
     u->h_a2 = nullptr; u->a0_share = u->a2_out = 0;
     u->xin_inf = u->lg_t1 = u->lg_x = 0; u->t1_bytes = 0; u->lg_p = nullptr; u->lg_bytes = 0;
     {
-        float *q[6] = {u->slab_tmp, u->slab_carry, u->slab_xin, u->slab_tmp1, u->slab_carry1, u->slab_tmpd};
-        for (int j = 0; j < 6; j++) if (interior(u, q[j])) { if (!g_dry && j == 2) nn_storage_forget(q[j]); q[j] = nullptr; }
-        free_once(q, 6); u->slab_tmp = u->slab_carry = u->slab_xin = u->slab_tmp1 = u->slab_carry1 = u->slab_tmpd = nullptr; u->slab = u->slab1 = u->slab_s = u->ct_stem = 0;
+        float *q[7] = {u->slab_tmp, u->slab_carry, u->slab_xin, u->slab_tmp1, u->slab_carry1, u->slab_tmpd, u->slab_alt};
+        for (int j = 0; j < 7; j++) if (interior(u, q[j])) { if (!g_dry && j == 2) nn_storage_forget(q[j]); q[j] = nullptr; }
+        free_once(q, 7); u->slab_tmp = u->slab_carry = u->slab_xin = u->slab_tmp1 = u->slab_carry1 = u->slab_tmpd = u->slab_alt = nullptr; u->slab = u->slab1 = u->slab_s = u->ct_stem = 0;
     }
     if (u->h_r) { if (u->r_out || u->r_in) nn_sync(); nn_host_free(u->h_r); }
     u->h_r = nullptr; u->p3 = u->r_out = u->r_in = 0; u->R = u->Xp = u->Yp = nullptr; u->r_bytes = u->x_bytes = u->y_bytes = 0; u->zr = 0;
@@ -1046,6 +1060,14 @@ static void build_acts(unet *u, shape5 xs, int train) {
                     u->slab_xin = dalloc_oom(dmalloc(xb_), xb_); dstorage(u->slab_xin, xb_, ip);
                 }
             }
+        }
+        if (slab && slab_ovl(w[0])) {   /* the second slab temp (slab_ovl): the larger of the level-0 and level-1 temps, shared by both levels */
+            shape5 t0 = y0; t0.d = u->slab_s < y0.d ? u->slab_s : y0.d;
+            size_t b = act_bytes_of(t0);
+            if (slab1) { shape5 t1 = y1; t1.d = u->slab_s < y1.d ? u->slab_s : y1.d; if (act_bytes_of(t1) > b) b = act_bytes_of(t1); }
+            g_mlab = "second slab temp (overlapped slab copies)";
+            u->act_bytes += b; u->slab_alt = dalloc_oom(dmalloc(b), b); dstorage(u->slab_alt, b, act_dt());
+            if (!g_dry && !u->ev_sc) { u->ev_sc = nn_event_create(); u->ev_sf[0] = nn_event_create(); u->ev_sf[1] = nn_event_create(); u->ev_se = nn_event_create(); }
         }
     }
     g_mlab = "encoder a1 / a2 / GN stats + down outputs";
@@ -2040,15 +2062,29 @@ void unet_l0_recal(unet *u, int on) { if (u->cfg.l0_norm == 2) u->l0_rc = on ? 0
 long unet_l0_updates(const unet *u) { return u->l0_n; }
 /* MX tensor planes [s0, s0 + n) of src (depth Ds) -> planes [d0, d0 + n) of dst (depth Dd); one sample, s.c channels, s.h x s.w
    planes: per channel block its data rows and its scales are each plane-contiguous */
-static void mx_copy_planes(void *dst, int Dd, int d0, const void *src, int Ds, int s0, int n, shape5 s) {
+static void mx_copy_planes_on(void *dst, int Dd, int d0, const void *src, int Ds, int s0, int n, shape5 s, int aux) {
     if (n <= 0) return;
     const int bw = s.c <= 8 ? 8 : s.c <= 16 ? 16 : 32, nb = (s.c + bw - 1) / bw, rb = act_mx4() ? bw / 2 : bw;
     const size_t hw = (size_t)s.h * s.w, Sd = (size_t)Dd * hw, Ss = (size_t)Ds * hw;
+    void (*cp)(void *, const void *, size_t) = aux ? nn_d2d_aux : nn_d2d_async;
     for (int k = 0; k < nb; k++) {
-        nn_d2d_async((char *)dst + ((size_t)k * Sd + (size_t)d0 * hw) * rb, (const char *)src + ((size_t)k * Ss + (size_t)s0 * hw) * rb, (size_t)n * hw * rb);
-        nn_d2d_async((char *)dst + (size_t)nb * Sd * rb + (size_t)k * Sd + (size_t)d0 * hw, (const char *)src + (size_t)nb * Ss * rb + (size_t)k * Ss + (size_t)s0 * hw, (size_t)n * hw);
+        cp((char *)dst + ((size_t)k * Sd + (size_t)d0 * hw) * rb, (const char *)src + ((size_t)k * Ss + (size_t)s0 * hw) * rb, (size_t)n * hw * rb);
+        cp((char *)dst + (size_t)nb * Sd * rb + (size_t)k * Sd + (size_t)d0 * hw, (const char *)src + (size_t)nb * Ss * rb + (size_t)k * Ss + (size_t)s0 * hw, (size_t)n * hw);
     }
 }
+static void mx_copy_planes(void *dst, int Dd, int d0, const void *src, int Ds, int s0, int n, shape5 s) { mx_copy_planes_on(dst, Dd, d0, src, Ds, s0, n, s, 0); }
+/* slab_ovl: the copies of slab k (output depth sk in tmp, planes [z0, z0 + sk) of X) once its conv is done (the previous slab's last
+   plane, from the other temp, then this slab's planes but its last; all of them for the last slab), on the aux stream. The compute
+   stream waits for the previous slab's last-plane copy before a conv writes that temp again (ovl_reuse) and for everything at the end
+   (ovl_end) */
+static void ovl_copies(unet *u, float *X, int D, shape5 ys, float *const T[2], int k, int z0, int sk, int psk, int last) {
+    nn_event_record(u->ev_sc, 0);
+    nn_stream_wait(2, u->ev_sc);
+    if (k) { mx_copy_planes_on(X, D, z0 - 1, T[(k - 1) & 1], psk, psk - 1, 1, ys, 1); nn_event_record(u->ev_sf[(k - 1) & 1], 2); }
+    mx_copy_planes_on(X, D, z0, T[k & 1], sk, 0, last ? sk : sk - 1, ys, 1);
+}
+static void ovl_reuse(unet *u, int k) { if (k >= 2) nn_stream_wait(0, u->ev_sf[k & 1]); }
+static void ovl_end(unet *u) { nn_event_record(u->ev_se, 2); nn_stream_wait(0, u->ev_se); }
 static int dec_conv1(unet *u, block *b, int level, float *y, int G, float *m, float *r, const float *gy, float *gw, float *gbias);
 /* in-place z-slab conv (unet.slab): conv 1 (decoder: [up2(coarse) | skip X] -> X) or 2 (X -> X) of a level-0 block whose a1 and a2
    are both X. Each launch computes slab_s output planes into slab_tmp through the z-range (nn_set_zrange: input planes read from X,
@@ -2065,19 +2101,25 @@ static void stem_slab_run(unet *u, block *b, int G, float *om, float *orr) {
     const int ip = unet_input_prec();   /* the stem input's MX format (8 or 4, build_acts ct_ok) */
     const size_t xb_ = nn_mx_bytes((shape5){1, 4, s + 2 < D ? s + 2 : D, ys.h, ys.w}, ip);
     nn_gn_t gi = gn_in(u, b);
-    for (int z0 = 0, k = 0; z0 < D; z0 += s, k++) {
+    const int ovl = u->slab_alt != nullptr;
+    float *const T[2] = {u->slab_tmp, u->slab_alt};
+    for (int z0 = 0, k = 0, psk = 0; z0 < D; z0 += s, k++) {
         const int sk = D - z0 < s ? D - z0 : s, last = z0 + sk >= D;
         const int tlo = z0 > 0 ? z0 - 1 : 0, thi = z0 + sk + 1 < D ? z0 + sk + 1 : D, nt = thi - tlo;
+        float *tmp = ovl ? T[k & 1] : u->slab_tmp;
         nn_set_storage(u->slab_xin, xb_, ip);
         nn_pred_input_mx(u->ctin.ct, W, u->ctin.mean, u->ctin.isd, u->ctin.dyo, u->ctin.dxo, u->ctin.axis, tlo, nt, u->slab_xin, u->ctin.h16, ip);
         nn_set_zrange(z0 - tlo, nt, k == 0, last, D, z0);
         shape5 xs = {1, 4, sk, ys.h, ys.w};
-        PROF(0, nn_conv3d_fwd_gn_stats(u->slab_xin, xs, gi.G, gi.gamma, gi.beta, gi.mean, gi.rstd, P(u, b->c1.w), B1(u, b), b->c1.cout, u->slab_tmp, G, 1e-5f, om, orr));
+        if (ovl) ovl_reuse(u, k);
+        PROF(0, nn_conv3d_fwd_gn_stats(u->slab_xin, xs, gi.G, gi.gamma, gi.beta, gi.mean, gi.rstd, P(u, b->c1.w), B1(u, b), b->c1.cout, tmp, G, 1e-5f, om, orr));
         nn_set_zrange(0, 0, 0, 0, 0, 0);
+        if (ovl) { ovl_copies(u, X, D, ys, T, k, z0, sk, psk, last); psk = sk; continue; }
         if (k) mx_copy_planes(X, D, z0 - 1, u->slab_carry, 1, 0, 1, ys);
         mx_copy_planes(X, D, z0, u->slab_tmp, sk, 0, last ? sk : sk - 1, ys);
         if (!last) mx_copy_planes(u->slab_carry, 1, 0, u->slab_tmp, sk, sk - 1, 1, ys);
     }
+    if (ovl) ovl_end(u);
     if (u->p3) nn_storage_forget(u->slab_xin);   /* (inside Y: its fp8 registration would outlive the stem) */
 }
 /* conv 1 of an encoder block reads x (coarse offload: enc[1]'s conv1 over down0's output, which sits in Y plane for plane, see
@@ -2090,8 +2132,10 @@ static void slab_run(unet *u, block *b, int level, int conv, const float *x, int
     const int dc1 = u->p3 && conv == 1 && b == &u->dec[0];
     int B = 0, waited = 0;
     if (dc1 && u->slab_tmpd && u->r_out) { nn_offload_copy(u->R, u->h_r, u->r_bytes, 0, u->ev_r[2], u->ev_r[3]); u->r_in = 1; }   /* (own temp: R comes back at once) */
-    for (int z0 = 0, k = 0, sk; z0 < D; z0 += sk, k++) {
-        float *tmp = level ? u->slab_tmp1 : u->slab_tmp;
+    const int ovl = u->slab_alt && !dc1;   /* (dec[0]'s conv1 under the coarse offload: its temps follow the dc1_next schedule, serial copies) */
+    float *const T[2] = {level ? u->slab_tmp1 : u->slab_tmp, u->slab_alt};
+    for (int z0 = 0, k = 0, sk, psk = 0; z0 < D; z0 += sk, k++) {
+        float *tmp = ovl ? T[k & 1] : level ? u->slab_tmp1 : u->slab_tmp;
         if (dc1 && !u->slab_tmpd) {
             const int B0 = B;
             sk = dc1_next(u, z0, &B);
@@ -2105,6 +2149,7 @@ static void slab_run(unet *u, block *b, int level, int conv, const float *x, int
         if (dc1 && u->r_in && !waited && z0 + sk >= u->zr) { nn_stream_wait(0, u->ev_r[3]); waited = 1; }   /* this slab reads (and writes) R's planes */
         const int last = z0 + sk >= D;
         nn_set_zrange(z0, D, k == 0, last, D, z0);
+        if (ovl) ovl_reuse(u, k);
         if (conv == 1 && b->xb) {
             const shape5 full = b->xs; b->xs.d = sk;
             const int rv = dec_conv1(u, b, level, tmp, G, om, orr, nullptr, nullptr, nullptr);
@@ -2119,10 +2164,12 @@ static void slab_run(unet *u, block *b, int level, int conv, const float *x, int
             PROF(0, nn_conv3d_fwd_gn_stats(X, xs, G, P(u, b->n1.gamma), P(u, b->n1.beta), b->m1, b->r1, P(u, b->c2.w), P(u, b->c2.b), b->c2.cout, tmp, G, 1e-5f, om, orr));
         }
         nn_set_zrange(0, 0, 0, 0, 0, 0);
+        if (ovl) { ovl_copies(u, X, D, ys, T, k, z0, sk, psk, last); psk = sk; continue; }
         if (k) mx_copy_planes(X, D, z0 - 1, carry, 1, 0, 1, ys);
         mx_copy_planes(X, D, z0, tmp, sk, 0, last ? sk : sk - 1, ys);
         if (!last) mx_copy_planes(carry, 1, 0, tmp, sk, sk - 1, 1, ys);
     }
+    if (ovl) ovl_end(u);
     if (dc1 && u->r_in && !waited) nn_stream_wait(0, u->ev_r[3]);
     if (dc1) u->r_out = u->r_in = 0;
 }
@@ -3896,9 +3943,12 @@ int unet_gn_stats_get(unet *u, float *h) {   /* sample 0 of the last forward */
 }
 static void gn_put1(unet *u, float *d, int g, size_t off, void *arg) {
     (void)arg;
-    for (int n = 0; n < u->xs.n; n++) nn_h2d(d + (size_t)n * g, u->gn_frz + off, (size_t)g * 4);
+    for (int n = 0; n < u->xs.n; n++) nn_d2d_async(d + (size_t)n * g, u->gn_frz_d + off, (size_t)g * 4);
 }
-static void gn_frozen_load(unet *u) { gn_sites(u, gn_put1, nullptr); }
+static void gn_frozen_load(unet *u) {   /* (was one synchronous host upload per site and forward: ~50 uploads, ~4 ms of idle GPU per window) */
+    if (!u->gn_frz_d) { u->gn_frz_d = nn_malloc(u->gn_frz_n * 4); nn_h2d(u->gn_frz_d, u->gn_frz, u->gn_frz_n * 4); }
+    gn_sites(u, gn_put1, nullptr);
+}
 /* pooling over windows: sites come in (mean, rstd) pairs of equal group count; the pooled variance is the mean within-window
    variance plus the variance of the window means */
 typedef struct { const float *t; double *acc; float *out; double nw; int k; } gn_pool_t;
@@ -3931,6 +3981,7 @@ long unet_gn_pooled(unet *u, float *h) {
 }
 void unet_gn_freeze(unet *u, const float *h) {
     free(u->gn_frz); u->gn_frz = nullptr; u->gn_frz_n = 0;
+    if (u->gn_frz_d) { nn_sync(); nn_free(u->gn_frz_d); u->gn_frz_d = nullptr; }
     if (!h) return;
     u->gn_frz_n = unet_gn_nstats(u);
     u->gn_frz = malloc(u->gn_frz_n * 4);

@@ -351,8 +351,41 @@ cudaStream_t copy_stream(void) {
 }
 extern "C" void nn_h2d_copy_stream(void *d, const void *s, size_t n) { CK(cudaMemcpyAsync(d, s, n, cudaMemcpyHostToDevice, copy_stream())); }   /* s must be pinned */
 extern "C" void *nn_event_create(void) { cudaEvent_t e; CK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming)); return (void *)e; }
-extern "C" void nn_event_record(void *e, int on_copy_stream) { CK(cudaEventRecord((cudaEvent_t)e, on_copy_stream ? copy_stream() : 0)); }
-extern "C" void nn_stream_wait(int copy_stream_waits, void *e) { CK(cudaStreamWaitEvent(copy_stream_waits ? copy_stream() : 0, (cudaEvent_t)e, 0)); }
+static cudaStream_t aux_stream(void) {   /* device-to-device copies overlapped with compute (nn_d2d_aux) */
+    static cudaStream_t st[8]; int d = 0; cudaGetDevice(&d); d &= 7;
+    if (!st[d]) CK(cudaStreamCreateWithFlags(&st[d], cudaStreamNonBlocking));
+    return st[d];
+}
+static cudaStream_t stream_of(int k) { return k == 2 ? aux_stream() : k ? copy_stream() : (cudaStream_t)0; }
+/* the aux stream's device copies (UFSM_AUX_CE): 2 (default) a grid-limited copy kernel (UFSM_AUX_G blocks of 128 threads, default one per SM, 4 x 16 B
+   loads in flight per thread) that co-runs with the compute-bound convs on a few SMs; 1 the copy-engine hint (overlaps, but the copy
+   engine moves device-to-device bytes at ~1/3 of the SMs' rate); 0 a plain cudaMemcpyAsync (a full-grid SM copy kernel whose blocks
+   hold back the next conv's: no overlap) */
+__global__ void __launch_bounds__(128) d2d_aux_k(uint4 *__restrict__ d, const uint4 *__restrict__ s, size_t n) {
+    const size_t st = (size_t)gridDim.x * blockDim.x;
+    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    for (; i + 3 * st < n; i += 4 * st) { const uint4 a = s[i], b = s[i + st], c = s[i + 2 * st], e = s[i + 3 * st]; d[i] = a; d[i + st] = b; d[i + 2 * st] = c; d[i + 3 * st] = e; }
+    for (; i < n; i += st) d[i] = s[i];
+}
+extern "C" void nn_d2d_aux(void *d, const void *s, size_t n) {
+    static int mode = -1, G = 0;
+    if (mode < 0) { mode = getenv("UFSM_AUX_CE") ? atoi(getenv("UFSM_AUX_CE")) : 2; int dv = 0, sm = 0; cudaGetDevice(&dv); cudaDeviceGetAttribute(&sm, cudaDevAttrMultiProcessorCount, dv);
+                    G = getenv("UFSM_AUX_G") ? atoi(getenv("UFSM_AUX_G")) : sm > 0 ? sm : 32; if (G < 1) G = 1; }
+    if (mode == 2 && !((uintptr_t)d & 15) && !((uintptr_t)s & 15)) {
+        const size_t n16 = n / 16;
+        if (n16) d2d_aux_k<<<(unsigned)G, 128, 0, aux_stream()>>>((uint4 *)d, (const uint4 *)s, n16);
+        if (n % 16) CK(cudaMemcpyAsync((char *)d + n16 * 16, (const char *)s + n16 * 16, n % 16, cudaMemcpyDeviceToDevice, aux_stream()));
+        return;
+    }
+    if (mode == 1) {
+        cudaMemcpyAttributes a = {}; a.srcAccessOrder = cudaMemcpySrcAccessOrderStream; a.flags = cudaMemcpyFlagPreferOverlapWithCompute;
+        if (cudaMemcpyWithAttributesAsync(d, s, n, &a, aux_stream()) == cudaSuccess) return;
+        cudaGetLastError(); mode = 0;
+    }
+    CK(cudaMemcpyAsync(d, s, n, cudaMemcpyDeviceToDevice, aux_stream()));
+}
+extern "C" void nn_event_record(void *e, int on_copy_stream) { CK(cudaEventRecord((cudaEvent_t)e, stream_of(on_copy_stream))); }
+extern "C" void nn_stream_wait(int copy_stream_waits, void *e) { CK(cudaStreamWaitEvent(stream_of(copy_stream_waits), (cudaEvent_t)e, 0)); }
 extern "C" void nn_event_sync(void *e) { CK(cudaEventSynchronize((cudaEvent_t)e)); }
 static cudaStream_t offload_stream(void) {   /* activation offload: its own stream, so it never queues behind batch uploads */
     static cudaStream_t st[8]; int d = 0; cudaGetDevice(&d); d &= 7;
