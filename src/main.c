@@ -1267,29 +1267,29 @@ static int cmd_fit(int argc, char **argv) {
         const int BZ = 32, dev = use_stream && !fb.f.t[1];
         uint8_t *tb = dev ? malloc((size_t)3 * BZ * plane) : nullptr; double st[4] = {0}; int bad = dev && !tb;
         fit_set_dev *gd = c.cpu ? nullptr : fit_set_upload(refm);   /* (W_ref on the GPU; null: the CPU grid) */
-        const int gpug = dev && gd && !ufsm_env_on("UFSM_PG_CPU");   /* the per-cell pass on the device planes (UFSM_PG_CPU=1: the CPU pass) */
-        if (gpug) {   /* blocks of <= 64M cells: W_ref (device grid -> host) uploaded, the gate in place on the device, pc / ps back to the host */
-            int GZ = (int)((64ll << 20) / (long long)plane); if (GZ < 1) GZ = 1; if (GZ > D) GZ = D;
+        int gpug = dev && gd && !ufsm_env_on("UFSM_PG_CPU"), zc = 0, zcpu = 0;   /* the per-cell pass on the device planes (UFSM_PG_CPU=1: the CPU pass); zc: the CPU pass from this row (a device block short of memory) */
+        if (gpug) {   /* blocks of <= 16M cells: W_ref (device grid -> host) uploaded, the gate in place on the device, pc / ps back to the host */
+            int GZ = (int)((16ll << 20) / (long long)plane); if (GZ < 1) GZ = 1; if (GZ > D) GZ = D;   /* (~22 B per cell of device scratch) */
             float *wr = malloc((size_t)GZ * plane * sizeof(float)), *ay = malloc(GZ * sizeof(float)), *ax = malloc(GZ * sizeof(float)); if (!wr || !ay || !ax) bad = 1;
             for (int z0 = 0; z0 < D && !bad; z0 += GZ) {
                 const int nz = z0 + GZ <= D ? GZ : D - z0; const size_t off = (size_t)z0 * plane;
                 const double o3[3] = {z0 * fb.h + c.ref_off[0], c.ref_off[1], c.ref_off[2]}; const int64_t n3[3] = {nz, H, W};
-                if (fit_set_grid(gd, refm, o3, n3, fb.h, 0, wr)) { bad = 1; break; }
+                if (fit_set_grid(gd, refm, o3, n3, fb.h, 0, wr)) { fprintf(stderr, "fit: phase gate: no device memory for the W_ref grid: the CPU pass from row %d\n", z0); gpug = 0; zc = z0; zcpu = 1; break; }
                 for (int z = 0; z < nz; z++) { const double pz = (z0 + z + 0.5) * fb.h; const int i0 = (int)fmin(fmax(floor(pz), 0), na - 1), i1 = i0 + 1 < na ? i0 + 1 : i0; const double t = fmin(fmax(pz - i0, 0), 1);
                     ay[z] = (float)(fb.f.cy[i0] + t * (fb.f.cy[i1] - fb.f.cy[i0])); ax[z] = (float)(fb.f.cx[i0] + t * (fb.f.cx[i1] - fb.f.cx[i0])); }
                 uint8_t *dp = fst.dfield;
                 if (fit_phase_gate_gpu(dp + off, dp + n + off, dp + 3 * n + off, dp + 4 * n + off, dp + 7 * n + off, dp + 8 * n + off, dp + 9 * n + off, nz, H, W, fb.h, ay, ax, wr,
-                                       pg.mode, pg.R, pg.lo, pg.hi, pg.rc, st)) { bad = 1; break; }
+                                       pg.mode, pg.R, pg.lo, pg.hi, pg.rc, st)) { fprintf(stderr, "fit: phase gate: no device memory for a block: the CPU pass from row %d\n", z0); gpug = 0; zc = z0; zcpu = 1; break; }
                 nn_d2h(fb.a[0] + off, dp + off, (size_t)nz * plane); nn_d2h(fb.a[1] + off, dp + n + off, (size_t)nz * plane);
             }
             free(wr); free(ay); free(ax);
         }
-        for (int z0 = 0; z0 < D && !bad && !gpug; z0 += BZ) {
+        for (int z0 = zc; z0 < D && !bad && !gpug; z0 += BZ) {
             const int nz = z0 + BZ <= D ? BZ : D - z0; const size_t off = (size_t)z0 * plane;
             fit_fields blk = fb.f; blk.D = nz; blk.pc = fb.a[0] + off; blk.ps = fb.a[1] + off; blk.sp = fb.a[8] + off; blk.w = fb.a[9] + off;
             for (int k = 0; k < 6; k++) blk.t[k] = fb.f.t[k] ? fb.f.t[k] + off : nullptr;
             if (dev) { const int tk[3] = {1, 2, 5}; for (int q = 0; q < 3; q++) { nn_d2h(tb + (size_t)q * BZ * plane, fst.dfield + (size_t)(2 + tk[q]) * n + off, (size_t)nz * plane); blk.t[tk[q]] = tb + (size_t)q * BZ * plane; } }
-            if (fit_phase_gate(&blk, z0, fb.f.cy, fb.f.cx, na, refm, gd, c.ref_off, &pg, fb.a[0] + off, fb.a[1] + off, nullptr, st)) bad = 1;
+            if (fit_phase_gate(&blk, z0, fb.f.cy, fb.f.cx, na, refm, zcpu ? nullptr : gd, c.ref_off, &pg, fb.a[0] + off, fb.a[1] + off, nullptr, st)) bad = 1;
             if (!bad && dev) { nn_h2d(fst.dfield + off, fb.a[0] + off, (size_t)nz * plane); nn_h2d(fst.dfield + n + off, fb.a[1] + off, (size_t)nz * plane); }
         }
         free(tb); if (gd) fit_set_dev_free(gd);
