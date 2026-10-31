@@ -91,6 +91,8 @@ $(B)/nn_%.o: src/nn_%.cu | $(B)
 	$(NVCC) $(NVFLAGS) $(TYPEFLAGS) -Xfatbin=-compress-all -MMD -MP -c $< -o $@
 $(B)/nn.o: $(NNOBJ)
 	ld -r -o $@ $^
+# count-field on the GPU mirrors the CPU's rounding (src/nn_cf.cu): IEEE division / sqrt, no FMA contraction, no fast math
+$(B)/nn_cf.o: NVFLAGS = -O3 $(NVARCH) -DUFSM_ARCH=$(ARCH) -fmad=false -Xcompiler -fno-threadsafe-statics -Isrc
 # FP8 / FP4 block-scaled mma (kind::mxf8f6f4 / kind::mxf4) needs the arch-specific sm_120a target
 # The low-precision kernels are split into one translation unit per kernel family (src/lp_*.cu, shared helpers in
 # src/lp_common.cuh) so make -j compiles them in parallel; $(B)/nn_fp8.o is their relocatable link, so every target

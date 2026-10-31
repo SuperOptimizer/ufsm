@@ -91,6 +91,15 @@ int main(void) {
         }
         snprintf(cmd, sizeof cmd, "cd %s/m1 && for x in *; do cmp -s $x ../m4/$x || exit 1; done; test $(ls | wc -l) -ge 6", root);
         CHECK(!system(cmd), "strip-mosaic --threads 4 output differs from --threads 1 (or files missing)");
+        /* the streamed mode (stretch given, stripes taken as their .done markers appear) writes the same bytes */
+        char sv[64] = {0}; snprintf(p, sizeof p, "%s/m1/stretch.txt", root); f = fopen(p, "r"); if (f) { if (!fgets(sv, sizeof sv, f)) sv[0] = 0; fclose(f); }
+        sv[strcspn(sv, "\n")] = 0; CHECK(sv[0], "no stretch.txt");
+        snprintf(cmd, sizeof cmd, "cd %s && for x in *_ct.tif; do touch ${x%%_ct.tif}.done; done", rdir); CHECK(!system(cmd), "touch .done");
+        { char a1[400], a3[400]; snprintf(a1, sizeof a1, "%s/strip/flat", root); snprintf(a3, sizeof a3, "%s/m5", root);
+          char *av[] = {"ufsm", "strip-mosaic", a1, rdir, a3, "--threads", "3", "--rows", "2", "--overview-px", "600", "--stretch", sv, "--wait-renders", "1"};
+          CHECK(!cmd_strip_mosaic(15, av), "strip-mosaic --stretch --wait-renders failed"); }
+        snprintf(cmd, sizeof cmd, "cd %s/m1 && for x in *; do cmp -s $x ../m5/$x || exit 1; done", root);
+        CHECK(!system(cmd), "strip-mosaic --stretch --wait-renders output differs from the two-pass run");
     }
     if (!fails) { snprintf(cmd, sizeof cmd, "rm -r %s", root); if (system(cmd)) {} }
     printf("test_strip: %s\n", fails ? "FAILED" : "ok");
