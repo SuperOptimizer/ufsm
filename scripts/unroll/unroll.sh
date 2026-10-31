@@ -318,7 +318,7 @@ trim() {
 # within (1/2 - margin) of the radial gap to its neighbouring wraps (order kept, two wraps never on one sheet), a smooth offset field per
 # wrap fitted to the target's ridges (SNAPT: ct = CT ridges, phase / recto = the fields' sheet centres / recto, mix = CT ridges weighted
 # by the network phase), never into masked CT. Then CLEAN=1 deletes the field planes + slab fits (the joined model is standalone).
-wrapsdir() { if [ "${SNAP:-1}" = 1 ] && [ -e $O/state/snap.done ]; then echo $O/wraps_snap; else echo $O/wraps; fi; }
+wrapsdir() { if [ "${SNAP:-1}" = 1 ] && { [ "$DRY" = 1 ] || [ -e $O/state/snap.done ]; }; then echo $O/wraps_snap; else echo $O/wraps; fi; }
 snap() {
   if [ "${SNAP:-1}" = 1 ]; then
     local t=${SNAPT:-mix}
