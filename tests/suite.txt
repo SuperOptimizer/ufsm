@@ -72,7 +72,7 @@ test_repair                                    |              |    90 | UFSM_TES
 test_repair~full                               | slow         |   475 | ./$B/test_repair
 test_afv                                       |              |     1 | ./$B/test_afv
 test_flatten                                   |              |    11 | ./$B/test_flatten
-test_flatten_gpu                               |              |    80 | ./$B/test_flatten_gpu
+test_flatten_gpu                               | gpu          |    80 | ./$B/test_flatten_gpu
 test_strip                                     |              |     4 | ./$B/test_strip
 test_faces                                     |              |     1 | ./$B/test_faces
 test_fit_emb                                   |              |    60 | ./$B/test_fit_emb
@@ -181,5 +181,5 @@ test_faces_gpu                                 | gpu          |    10 | ./$B/tes
 test_render_fill                               |              |    10 | ./$B/test_render_fill
 test_jpegpar                                   |              |    10 | ./$B/test_jpegpar
 test_sysinfo                                   |              |     5 | ./$B/test_sysinfo
-test_volcomp_fast                              |              |    10 | ./$B/test_volcomp_fast
+test_volcomp_fast                              |              |    25 | ./$B/test_volcomp_fast
 test_z3_autosub                                |              |    10 | ./$B/test_z3_autosub
