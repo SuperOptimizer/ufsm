@@ -322,7 +322,7 @@ int main(void) {
             }
             free(gst); free(ref); free(b); free(b2); free(hct); free(hrow); nn_free(drow);
         }
-        unet_set_slab_ovl(1); nn_set_conv1_const(1); unet_set_infer_offload(1); unet_set_infer_slab(0);
+        unet_set_slab_ovl(-1); nn_set_conv1_const(1); unet_set_infer_offload(1); unet_set_infer_slab(0);   /* (-1: the default, by width) */
     }
     if (fails) return 1;
     printf("test_infer_mem: ok\n");

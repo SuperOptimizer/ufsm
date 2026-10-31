@@ -605,11 +605,17 @@ void unet_set_infer_offload(int on) { g_infer_off = on; }
 static int g_infer_slab = -1;
 static int infer_slab(void) { if (g_infer_slab < 0) g_infer_slab = getenv("UFSM_INFER_SLAB") ? atoi(getenv("UFSM_INFER_SLAB")) : 64; return g_infer_slab; }   /* planes per slab (default 64), 0 off */
 void unet_set_infer_slab(int planes) { g_infer_slab = planes; }
-/* overlapped slab copies (UFSM_SLAB_OVL, default on): the in-place slab convs write slab k into one of two temps; slab k's planes go
+/* overlapped slab copies (UFSM_SLAB_OVL, default auto): the in-place slab convs write slab k into one of two temps; slab k's planes go
    into X on the aux stream while slab k + 1 computes into the other temp (disjoint planes: slab k + 1 reads X from slab k's last output
    plane on, which stays in its temp until slab k + 1 is done); no carry plane. The same bytes land in X as with the serial copies */
+/* Default (auto): on for a level 0 of >= 32 channels only. Measured 10-30: wind96 (32-wide) forward 557 -> 503 ms per 384 x 640^2 window
+   on the laptop 5080, neutral on the desk 5060 Ti (448 GB/s); the 16-wide ink net's convs are as cheap as its copies: no gain on the
+   laptop, +9% on the 5060 Ti. UFSM_SLAB_OVL=0 / 1 (or unet_set_slab_ovl) forces it */
 static int g_slab_ovl = -1;
-static int slab_ovl(void) { if (g_slab_ovl < 0) g_slab_ovl = getenv("UFSM_SLAB_OVL") ? ufsm_env_on("UFSM_SLAB_OVL") : 1; return g_slab_ovl; }
+static int slab_ovl(int w0) {
+    if (g_slab_ovl < 0 && getenv("UFSM_SLAB_OVL")) g_slab_ovl = ufsm_env_on("UFSM_SLAB_OVL");
+    return g_slab_ovl < 0 ? w0 >= 32 : g_slab_ovl;
+}
 void unet_set_slab_ovl(int on) { g_slab_ovl = on; }
 int unet_ct_stem(const unet *u) { return u->built && !u->train && u->ct_stem; }
 void unet_set_ct_input(unet *u, int on) { if (u->ct_mode != on && u->built && !u->train) free_acts(u); u->ct_mode = on; }
@@ -1055,7 +1061,7 @@ static void build_acts(unet *u, shape5 xs, int train) {
                 }
             }
         }
-        if (slab && slab_ovl()) {   /* the second slab temp (slab_ovl): the larger of the level-0 and level-1 temps, shared by both levels */
+        if (slab && slab_ovl(w[0])) {   /* the second slab temp (slab_ovl): the larger of the level-0 and level-1 temps, shared by both levels */
             shape5 t0 = y0; t0.d = u->slab_s < y0.d ? u->slab_s : y0.d;
             size_t b = act_bytes_of(t0);
             if (slab1) { shape5 t1 = y1; t1.d = u->slab_s < y1.d ? u->slab_s : y1.d; if (act_bytes_of(t1) > b) b = act_bytes_of(t1); }
