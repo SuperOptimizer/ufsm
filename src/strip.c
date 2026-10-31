@@ -34,6 +34,7 @@
      wrap (strip_papyrus.tsv, papyrus_wraps.tsv): where the surface leaves the papyrus is reported, never cut. */
 #include "flatten.h"
 #include "imgops.h"
+#include "jpegpar.h"
 #include "tiffw.h"
 #include "surfcomp.h"
 #include <dirent.h>
@@ -632,6 +633,7 @@ typedef struct {
     int rows; long long rowlen; int ds, ovw, bandh, rowh; double *ovs; float *ovn;
     int lds, lw, lh; double *lsum; float *lcnt; int tpx; long long ntile; double *tv, *tp; long long *tw0, *tw1;
     int wmin, nwr; double *wv, *wp, *vtot, *ptot;
+    int wait, rm;   /* --wait-renders: a stripe is taken when <render-dir>/<stripe>.done exists; --rm-renders: its two TIFFs deleted after use */
     pthread_mutex_t mu; _Atomic int next, fail;
 } ms_ctx;
 static void *ms_pass1(void *arg) {
@@ -649,27 +651,22 @@ static void *ms_pass1(void *arg) {
     }
     return nullptr;
 }
-#include <jpeglib.h>
+typedef struct { int w, h, ca, cb, ia, ib; const uint8_t *ct, *ink, *m; } ms_rows;
+static void ms_stripe_row(void *u, int y, int x0, int n, uint8_t *dst) {   /* (called from the encoder's threads) */
+    const ms_rows *R = u; const int k = y >= R->h; const size_t o = (size_t)(k ? y - R->h : y) * R->w + x0; const uint8_t *src = k ? R->ink : R->ct;
+    for (int x = 0; x < n; x++) dst[x] = R->m[o + x] ? (k ? stretch(src[o + x], R->ia, R->ib) : stretch(src[o + x], R->ca, R->cb)) : 0;
+}
 static int ms_jpeg_stripe(const char *path, int w, int h, const uint8_t *ct, const uint8_t *ink, const uint8_t *m, int ca, int cb, int ia, int ib, int q) {
-    /* CT over ink, stretched, 0 off the surface: streamed row by row (the same bytes as jpeg_write_gray of the stacked image) */
-    FILE *f = fopen(path, "wb"); if (!f) return -1;
-    struct jpeg_compress_struct ci; struct jpeg_error_mgr je;
-    ci.err = jpeg_std_error(&je); jpeg_create_compress(&ci); jpeg_stdio_dest(&ci, f);
-    ci.image_width = (JDIMENSION)w; ci.image_height = (JDIMENSION)(2 * h); ci.input_components = 1; ci.in_color_space = JCS_GRAYSCALE;
-    jpeg_set_defaults(&ci); jpeg_set_quality(&ci, q, TRUE); jpeg_start_compress(&ci, TRUE);
-    uint8_t *row = malloc((size_t)w);
-    while (ci.next_scanline < ci.image_height) {
-        const int y = (int)ci.next_scanline, k = y >= h; const size_t o = (size_t)(k ? y - h : y) * w; const uint8_t *src = k ? ink : ct;
-        for (int x = 0; x < w; x++) row[x] = m[o + x] ? (k ? stretch(src[o + x], ia, ib) : stretch(src[o + x], ca, cb)) : 0;
-        JSAMPROW r = row; jpeg_write_scanlines(&ci, &r, 1);
-    }
-    jpeg_finish_compress(&ci); jpeg_destroy_compress(&ci); free(row);
-    return fclose(f) ? -1 : 0;
+    /* CT over ink, stretched, 0 off the surface: rows generated on the fly by the banded multithreaded encoder (the same bytes as
+       jpeg_write_gray of the stacked image, = libjpeg's) */
+    ms_rows R = {.w = w, .h = h, .ca = ca, .cb = cb, .ia = ia, .ib = ib, .ct = ct, .ink = ink, .m = m};
+    return jpar_write(path, w, 2 * h, 1, q, nullptr, ms_stripe_row, &R, 0);
 }
 static void *ms_pass2(void *arg) {
     ms_ctx *C = arg; char p[1600];
     for (int s; (s = atomic_fetch_add(&C->next, 1)) < C->ns;) {
         ms_stripe *S = &C->st[s]; if (!S->ow) continue;
+        if (C->wait) { snprintf(p, sizeof p, "%s/%s.done", C->rd, S->name); while (access(p, F_OK)) sleep(5); }
         const double ts = snow(); const int w = S->ow, h = S->oh;
         int w1, h1, gw, gh; snprintf(p, sizeof p, "%s/%s_ct.tif", C->rd, S->name); uint8_t *ct = img_read_u8(p, &w1, &h1);
         snprintf(p, sizeof p, "%s/%s.tif", C->rd, S->name); uint8_t *ink = img_read_u8(p, &w1, &h1);
@@ -718,11 +715,12 @@ static void *ms_pass2(void *arg) {
         if (C->wstripes) { snprintf(p, sizeof p, "%s/%s_ct_ink.jpg", C->od, S->name); if (ms_jpeg_stripe(p, w, h, ct, ink, m, C->ca, C->cb, C->ia, C->ib, C->q)) fprintf(stderr, "strip-mosaic: cannot write %s\n", p); }
         fprintf(stderr, "strip-mosaic: %s %dx%d done, %.1fs\n", S->name, w, h, snow() - ts);
         free(ct); free(ink); free(m); free(gu);
+        if (C->rm) { snprintf(p, sizeof p, "%s/%s_ct.tif", C->rd, S->name); unlink(p); snprintf(p, sizeof p, "%s/%s.tif", C->rd, S->name); unlink(p); }
     }
     return nullptr;
 }
 int cmd_strip_mosaic(int argc, char **argv) {
-    if (argc < 5) { fprintf(stderr, "usage: ufsm strip-mosaic <flat-dir> <render-dir> <out-dir> [--strip DIR] [--ct-level 80] [--overview-px 16000] [--rows 10] [--tile-cm 1] [--quality 88] [--stripes 1] [--threads 8]\n"); return 2; }
+    if (argc < 5) { fprintf(stderr, "usage: ufsm strip-mosaic <flat-dir> <render-dir> <out-dir> [--strip DIR] [--ct-level 80] [--overview-px 16000] [--rows 10] [--tile-cm 1] [--quality 88] [--stripes 1] [--threads 8] [--stretch CA,CB,IA,IB] [--stretch-only 1] [--wait-renders 1] [--rm-renders 1]\n"); return 2; }
     const char *fd = argv[2], *rd = argv[3], *od = argv[4];
     const int ctl = atoi(sopt(argc, argv, "--ct-level", "80")), ovpx = atoi(sopt(argc, argv, "--overview-px", "16000")), rows = atoi(sopt(argc, argv, "--rows", "10")), q = atoi(sopt(argc, argv, "--quality", "88"));
     const double tilecm = atof(sopt(argc, argv, "--tile-cm", "1")); const int wstripes = atoi(sopt(argc, argv, "--stripes", "1"));
@@ -750,9 +748,18 @@ int cmd_strip_mosaic(int argc, char **argv) {
     double hc[256] = {0}, hi[256] = {0};
     ms_ctx C = {.st = st, .ns = ns, .rd = rd, .fd = fd, .od = od, .gs = gs, .hc = hc, .hi = hi};
     pthread_mutex_init(&C.mu, nullptr);
-    { pthread_t th[64]; for (int t = 0; t < nthr; t++) pthread_create(&th[t], nullptr, ms_pass1, &C); for (int t = 0; t < nthr; t++) pthread_join(th[t], nullptr); }
-    int ca, cb, ia, ib; hist_q(hc, 0.005, 0.998, &ca, &cb); hist_q(hi, 0.01, 0.999, &ia, &ib);
+    int ca, cb, ia, ib; const char *fs = sopt(argc, argv, "--stretch", nullptr);
+    if (fs) {   /* --stretch CA,CB,IA,IB: given (no pass 1: the renders need not exist yet; their sizes from the stripe grids) */
+        if (sscanf(fs, "%d,%d,%d,%d", &ca, &cb, &ia, &ib) != 4 || cb <= ca || ib <= ia) { fprintf(stderr, "strip-mosaic: --stretch CA,CB,IA,IB\n"); return 2; }
+        for (int s = 0; s < ns; s++) { st[s].ow = render_out_px(st[s].gw, gs); st[s].oh = render_out_px(st[s].gh, gs); }
+    } else {
+        { pthread_t th[64]; for (int t = 0; t < nthr; t++) pthread_create(&th[t], nullptr, ms_pass1, &C); for (int t = 0; t < nthr; t++) pthread_join(th[t], nullptr); }
+        hist_q(hc, 0.005, 0.998, &ca, &cb); hist_q(hi, 0.01, 0.999, &ia, &ib);
+    }
     fprintf(stderr, "strip-mosaic: stretch CT %d..%d, ink %d..%d\n", ca, cb, ia, ib);
+    if (atoi(sopt(argc, argv, "--stretch-only", "0"))) { printf("stretch %d,%d,%d,%d\n", ca, cb, ia, ib); return 0; }   /* (from the renders present) */
+    { snprintf(p, sizeof p, "%s/stretch.txt", od); FILE *sf = fopen(p, "w"); if (sf) { fprintf(sf, "%d,%d,%d,%d\n", ca, cb, ia, ib); fclose(sf); } }   /* (for --stretch) */
+    C.wait = atoi(sopt(argc, argv, "--wait-renders", "0")); C.rm = atoi(sopt(argc, argv, "--rm-renders", "0"));
     /* overview geometry: the whole length (pixels) folded into --rows rows of at most --overview-px */
     long long Ltot = 0; int Hpx = 0; for (int s = 0; s < ns; s++) if (st[s].ow) { Ltot = (long long)(st[s].u0cm * 1e4 / pxum + 0.5) + st[s].ow; if (st[s].oh > Hpx) Hpx = st[s].oh; }
     const long long rowlen = (Ltot + rows - 1) / rows; int ds = (int)((rowlen + ovpx - 1) / ovpx); if (ds < 1) ds = 1;
@@ -811,7 +818,10 @@ int cmd_strip_crop(int argc, char **argv) {
     int c[4];
     if (argc < 5 || sscanf(argv[4], "%d,%d,%d,%d", c, c + 1, c + 2, c + 3) != 4) { fprintf(stderr, "usage: ufsm strip-crop <in.tif> <out.jpg> x,y,w,h [--stretch 1]\n"); return 2; }
     int w, h; uint8_t *im = img_read_u8(argv[2], &w, &h); if (!im) { fprintf(stderr, "strip-crop: cannot read %s\n", argv[2]); return 1; }
-    if (c[0] < 0) c[0] = 0; if (c[1] < 0) c[1] = 0; if (c[0] + c[2] > w) c[2] = w - c[0]; if (c[1] + c[3] > h) c[3] = h - c[1];
+    if (c[0] < 0) c[0] = 0;
+    if (c[1] < 0) c[1] = 0;
+    if (c[0] + c[2] > w) c[2] = w - c[0];
+    if (c[1] + c[3] > h) c[3] = h - c[1];
     if (c[2] < 1 || c[3] < 1) { fprintf(stderr, "strip-crop: empty rectangle\n"); free(im); return 2; }
     uint8_t *o = malloc((size_t)c[2] * c[3]), *m = malloc((size_t)c[2] * c[3]);
     for (int y = 0; y < c[3]; y++) for (int x = 0; x < c[2]; x++) { const uint8_t v = im[(size_t)(c[1] + y) * w + c[0] + x]; o[(size_t)y * c[2] + x] = v; m[(size_t)y * c[2] + x] = v > 0; }
