@@ -141,26 +141,27 @@ static uint8_t fe_val(const feather_t *F, int d, int z, int y, int x) {   /* the
     if (uy >= S) return p[((size_t)uz * B + (uy - S)) * E + ux];          /* its y slab: S x B x E */
     return p[((size_t)uz * S + uy) * B + (ux - S)];                       /* its x slab: S x S x B */
 }
+static uint8_t fe_blend(const feather_t *F, int z, int y, int x) {   /* a lower-shell voxel: the normalized blend over the windows present */
+    const int B = F->B; float s = 0, w = 0;
+    for (int d = 0; d < 8; d++) {
+        if (d && !F->nb[d]) continue;
+        const int dz = d >> 2 & 1, dy = d >> 1 & 1, dx = d & 1;
+        if ((dz && z >= B) || (dy && y >= B) || (dx && x >= B)) continue;
+        const float wi = (z < B ? F->u[dz][z] : 1.f) * (y < B ? F->u[dy][y] : 1.f) * (x < B ? F->u[dx][x] : 1.f);
+        s += wi * fe_val(F, d, z, y, x); w += wi;
+    }
+    return w > 0 ? (uint8_t)fminf(255.f, s / w + 0.5f) : 0;
+}
 static void fe_rows(void *a, int z0, int z1, int t) {
     (void)t; const feather_t *F = a; const int B = F->B, E = F->E, sh = F->osh;
     for (int lz = z0; lz < z1; lz++) for (int64_t ly = 0; ly < F->on[1]; ly++) {
-        const int z = (int)(F->oo[0] + lz), y = (int)(F->oo[1] + ly);
+        const int z = (int)(F->oo[0] + lz), y = (int)(F->oo[1] + ly), x0 = (int)F->oo[2], nx = (int)F->on[2];
         uint8_t *o = F->out + ((size_t)lz * sh + ly) * sh;
-        const uint8_t *er = F->e + ((size_t)z * E + y) * E + F->oo[2];
-        if (z >= B && y >= B && F->oo[2] >= B) { memcpy(o, er, (size_t)F->on[2]); continue; }
-        for (int64_t lx = 0; lx < F->on[2]; lx++) {
-            const int x = (int)(F->oo[2] + lx);
-            if (z >= B && y >= B && x >= B) { o[lx] = er[lx]; continue; }
-            double s = 0, w = 0;
-            for (int d = 0; d < 8; d++) {
-                if (d && !F->nb[d]) continue;
-                const int dz = d >> 2 & 1, dy = d >> 1 & 1, dx = d & 1;
-                if ((dz && z >= B) || (dy && y >= B) || (dx && x >= B)) continue;
-                const double wi = (double)(z < B ? F->u[dz][z] : 1.f) * (y < B ? F->u[dy][y] : 1.f) * (x < B ? F->u[dx][x] : 1.f);
-                s += wi * fe_val(F, d, z, y, x); w += wi;
-            }
-            o[lx] = w > 0 ? (uint8_t)fmin(255.0, s / w + 0.5) : 0;
-        }
+        const uint8_t *er = F->e + ((size_t)z * E + y) * E + x0;
+        if (z < B || y < B) { for (int lx = 0; lx < nx; lx++) o[lx] = fe_blend(F, z, y, x0 + lx); continue; }
+        int lx = 0;
+        for (; lx < nx && x0 + lx < B; lx++) o[lx] = fe_blend(F, z, y, x0 + lx);   /* (the x shell), the rest this window's own */
+        if (lx < nx) memcpy(o + lx, er + lx, (size_t)(nx - lx));
     }
 }
 static int feather_init(feather_t *F, int S, int B, const int64_t nss[3]) {

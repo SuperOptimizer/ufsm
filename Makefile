@@ -420,6 +420,9 @@ $(B)/test_formats: tests/test_formats.c $(OBJ) $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 $(B)/test_typed_zarr: tests/test_typed_zarr.c $(B)/z3w.o $(B)/zarr3.o $(B)/store.o $(B)/json.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
+$(B)/test_z3_autosub: tests/test_z3_autosub.c $(B)/z3w.o $(B)/zarr3.o $(B)/store.o $(B)/json.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
+test-all: $(B)/test_z3_autosub
 
 $(B)/test_ct_augment: tests/test_ct_augment.c $(B)/ct_augment.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ -lm
@@ -588,6 +591,7 @@ test-all: $(B)/test_gpu_aug $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover 
 	./$(B)/test_edt
 	./$(B)/test_volcomp
 	./$(B)/test_typed_zarr
+	./$(B)/test_z3_autosub
 	python3 tests/test_http_reader.py
 	./$(B)/test_checkpoint_runtime
 	./$(B)/test_infer_buffers
