@@ -4,6 +4,8 @@
 #   slow = test-slow tier, not in make test | flaky = one retry, reported FLAKY | solo = runs alone.
 # EST: seconds on the desk (quiet, one test at a time); the runner starts the longest first. A new test: add a line here and its
 # binary as a prerequisite of suite-bins in the Makefile; give it the gpu tag if it touches the GPU (tests/run_suite.sh -P tells).
+# UFSM_TEST_QUICK=1: the fast-tier variant of a long test (fewer steps / cases); the full run is NAME~full in the slow tier.
+# Helper binaries without a line of their own: test_sheet (test-sheet), test_http_reader / test_sampler_safety / test_formats (python).
 test_target_erode                              |              |     1 | ./$B/test_target_erode
 test_wind_sampler                              |              |    19 | ./$B/test_wind_sampler
 test_crush                                     |              |    17 | ./$B/test_crush
@@ -94,7 +96,8 @@ test_wtrunk                                    |              |    10 | ./$B/tes
 test_attn_ray                                  |              |    14 | ./$B/test_attn_ray
 test_attn_dfm                                  |              |    26 | ./$B/test_attn_dfm
 test_hybrid_identity                           | gpu          |     6 | ./$B/test_hybrid_identity
-test_dinor                                     | gpu          |   104 | ./$B/test_dinor
+test_dinor                                     | gpu          |    60 | UFSM_TEST_QUICK=1 ./$B/test_dinor
+test_dinor~full                                | gpu,slow     |   104 | ./$B/test_dinor
 test_dino_pts                                  |              |     1 | ./$B/test_dino_pts
 test_ink_splat                                 |              |    10 | ./$B/test_ink_splat
 test_pyports                                   |              |     1 | ./$B/test_pyports

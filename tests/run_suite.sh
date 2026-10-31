@@ -81,6 +81,8 @@ if [ $LIST = 1 ]; then for n in "${QUEUE[@]}"; do printf '%-48s %-14s %6s  %s\n'
 mkdir -p "$OUT/logs" "$OUT/res" "$OUT/tmp" || exit 2
 OUT=$(cd "$OUT" && pwd)
 TIMEBIN=; [ -x /usr/bin/time ] && TIMEBIN=/usr/bin/time
+# a test binary in the build dir that no manifest line runs (a merge that added a test to the Makefile only): say so
+for f in "$BDIR"/test_*; do [ -x "$f" ] || continue; grep -qwF "${f##*/}" "$MANIFEST" || echo "run_suite: WARNING: $f is not in $MANIFEST (add a line, or it never runs)"; done
 echo "run_suite: ${#QUEUE[@]} tests ($TIER) from $BDIR, -j $J, $T threads/test, GPUs ${GPUS} x $GSLOTS, logs $OUT/logs ($(hostname), $NC CPUs)"
 
 # profile: nvidia-smi samples every 0.5 s, each GPU process mapped to its test through /proc/<pid>/environ (UFSM_SUITE_TEST)
