@@ -65,6 +65,7 @@ SRC += src/inkblend.c
 SRC += src/inkseam.c
 SRC += src/render.c src/imgops.c src/jpegpar.c src/inkcompare.c
 SRC += src/repack.c
+SRC += src/fieldspack.c
 SRC += src/wload.c src/inkext.c src/inkext_net.c src/dinovol.c src/dinovol_net.c src/dino.c src/surfeval.c
 SRC += src/villawind.c src/villawind_net.c src/vwt_net.c src/vwt_train.c src/vwt_tile.c src/vwt_infer.c src/wtrunk.c src/vwt_stitch.c src/phasevis.c src/vwt_mv.c
 SRC += src/inksplat.c src/hercuvit.c src/hercuvit_net.c src/ink3dext.c src/ink3dext_net.c
@@ -233,6 +234,9 @@ test-all: $(B)/test_tta
 $(B)/test_fblend: tests/test_fblend.c $(B)/fblend.o $(B)/fit.o $(B)/fit_emb.o $(B)/embz.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/coreline.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/z3w.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 test-all: $(B)/test_fblend
+$(B)/test_fields_pack: tests/test_fields_pack.c $(B)/fieldspack.o $(B)/repack.o $(B)/fit.o $(B)/fit_emb.o $(B)/embz.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/coreline.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/z3w.o $(B)/nn.o $(B)/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
+test-all: $(B)/test_fields_pack
 $(B)/test_countfield: tests/test_countfield.c $(B)/countfield.o $(B)/fit.o $(B)/fit_emb.o $(B)/embz.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/coreline.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/z3w.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 test-all: $(B)/test_countfield
@@ -588,6 +592,7 @@ test-all: $(B)/test_gpu_aug $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover 
 	./$(B)/test_wraps_core
 	./$(B)/test_stitch
 	./$(B)/test_fblend
+	./$(B)/test_fields_pack
 	./$(B)/test_countfield
 	./$(B)/test_vwt_sample
 	./$(B)/test_spiralfit

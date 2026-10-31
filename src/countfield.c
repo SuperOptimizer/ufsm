@@ -997,7 +997,7 @@ int cmd_spiral_fit(int argc, char **argv) {
    max / p99.9 |delta_A - delta_B|. With FIELDS (the box's fit fields): at every step-th field cell (z, y, x) with material (w > 0) and
    a phase (|pc, ps| >= 0.05), the snap integer of the fine stage (fit --ref-snap 1: round(W - phi), phi the network phase in turns)
    under both models, their agreement, and the |W_A - W_B| quantiles */
-typedef struct { const fit_model *a, *b; const fit_fields *f; int zoff, z0, z1, step; double h; size_t n[CF_MAXT], same[CF_MAXT]; uint64_t *hist[CF_MAXT]; } cf_cmp;
+typedef struct { const fit_model *a, *b; const fit_fields *f; int zoff, z0, z1, step; double h; size_t n[CF_MAXT], same[CF_MAXT], koff[CF_MAXT][17]; uint64_t *hist[CF_MAXT]; } cf_cmp;   /* koff: snap integer differences -8..8 (the gauge-free agreement) */
 enum { CF_NH = 4096 };   /* |dW| histogram: bins of 1e-6 turn, log-spaced (bin k = 1e-6 * 10^(k / 512)) */
 static int cf_hbin(double d) { if (!(d > 1e-6)) return 0; const int k = (int)(512 * log10(d / 1e-6)) + 1; return k >= CF_NH ? CF_NH - 1 : k; }
 static void cf_cmp_run(void *a_, long r0, long r1, int t) {
@@ -1008,7 +1008,8 @@ static void cf_cmp_run(void *a_, long r0, long r1, int t) {
             const double pc = (f->pc[i] - 128) / 127.0, ps = (f->ps[i] - 128) / 127.0; if (hypot(pc, ps) < 0.05) continue;
             const double ph = atan2(ps, pc) / (2 * M_PI), pz = (z + 0.5) * C->h, py = (y + 0.5) * C->h, px = (x + 0.5) * C->h;
             const double wa = fit_W(C->a, pz, py, px), wb = fit_W(C->b, pz, py, px);
-            C->n[t]++; C->same[t] += lround(wa - ph) == lround(wb - ph); C->hist[t][cf_hbin(fabs(wa - wb))]++;
+            C->n[t]++; C->same[t] += lround(wa - ph) == lround(wb - ph);
+            { const long k = lround(wa - ph) - lround(wb - ph); if (k >= -8 && k <= 8) C->koff[t][k + 8]++; } C->hist[t][cf_hbin(fabs(wa - wb))]++;
         } }
 }
 static double cf_hq(const uint64_t *h, uint64_t n, double q) { uint64_t s = 0; for (int k = 0; k < CF_NH; k++) { s += h[k]; if (s >= q * n) return k ? 1e-6 * pow(10, k / 512.0) : 0; } return INFINITY; }
@@ -1025,7 +1026,7 @@ int cmd_cf_compare(int argc, char **argv) {
         cf_nt = ufsm_threads(atoi(cf_opt(argc, argv, "--threads", "0")), 8); const int step = atoi(cf_opt(argc, argv, "--step", "4"));
         fit_fields_buf g; if (fit_fields_load(argv[4], 0, 0, 0, &g)) { fprintf(stderr, "cf-compare: cannot load %s\n", argv[4]); return 1; }
         const int D = g.shape[0]; fit_fields_skip_planes(1 | 2 | 4);
-        cf_cmp C = {a, b, nullptr, 0, 0, 0, step, g.h, {0}, {0}, {0}}; for (int t = 0; t < CF_MAXT; t++) C.hist[t] = calloc(CF_NH, sizeof(uint64_t));
+        cf_cmp C = {.a = a, .b = b, .step = step, .h = g.h}; for (int t = 0; t < CF_MAXT; t++) C.hist[t] = calloc(CF_NH, sizeof(uint64_t));
         cf_pre pre = {0}; const int CZ = 128; cf_pre_start(&pre, argv[4], 0, CZ < D ? CZ : D, 1);
         for (int z0 = 0; z0 < D; z0 += CZ) {
             const int z1 = z0 + CZ < D ? z0 + CZ : D; fit_fields_buf fb; if (cf_pre_take(&pre, &fb)) return 1;
@@ -1037,6 +1038,9 @@ int cmd_cf_compare(int argc, char **argv) {
         for (int t = 0; t < CF_MAXT; t++) { n += C.n[t]; s += C.same[t]; for (int k = 0; k < CF_NH; k++) hv[k] += C.hist[t][k]; free(C.hist[t]); }
         printf("cf-compare: %llu field cells (every %d, material with a phase): snap integers round(W - phi) agree %.7f (%llu differ); |W A - B| median %.3g p99 %.3g p99.9 %.3g p99.99 %.3g max <= %.3g turn\n",
                (unsigned long long)n, step, n ? (double)s / n : 0, (unsigned long long)(n - s), cf_hq(hv, n, 0.5), cf_hq(hv, n, 0.99), cf_hq(hv, n, 0.999), cf_hq(hv, n, 0.9999), cf_hq(hv, n, 1.0));
+        { uint64_t kk[17] = {0}; int km = 8; for (int t = 0; t < CF_MAXT; t++) for (int k = 0; k < 17; k++) kk[k] += C.koff[t][k];
+          for (int k = 0; k < 17; k++) if (kk[k] > kk[km]) km = k;
+          printf("cf-compare: gauge-free: snap integers agree %.7f at the modal offset %+d turn(s) (B - A)\n", n ? (double)kk[km] / n : 0, 8 - km); }
         free(hv); fit_fields_free(&g);
     }
     free(hl); fit_free(a); fit_free(b); return 0;
