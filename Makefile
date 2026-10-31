@@ -248,6 +248,11 @@ test-all: $(B)/test_strip
 $(B)/test_faces: tests/test_faces.c $(B)/faces.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
 test-all: $(B)/test_faces
+# faces on the GPU: bit-identical to the CPU path, so no fast math and no fused multiply-adds in this object
+$(B)/nn_faces.o: NVFLAGS := -O3 $(NVARCH) -DUFSM_ARCH=$(ARCH) -fmad=false -Xcompiler -fno-threadsafe-statics -Isrc
+$(B)/test_faces_gpu: tests/test_faces.c $(B)/faces.o $(B)/nn_faces.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DFACES_GPU $^ -o $@ $(LDLIBS) $(CUDALIBS)
+test-all: $(B)/test_faces_gpu
 $(B)/test_fit_emb: tests/test_fit_emb.c $(B)/fit_emb.o $(B)/embz.o $(B)/z3w.o $(B)/fit.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/coreline.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 test-all: $(B)/test_fit_emb
@@ -348,7 +353,7 @@ $(B)/test_volcomp: tests/test_volcomp.c third_party/volcomp.h
 $(B)/test_volcomp_fast: tests/test_volcomp_fast.c src/volcomp_fast.h src/zshm.h $(B)/zarr3.o $(B)/store.o $(B)/json.o $(B)/z3w.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(B)/zarr3.o $(B)/store.o $(B)/json.o $(B)/z3w.o -o $@ $(LDLIBS)
 $(B)/test_gpudec: tests/test_gpudec.c src/gpudec.h src/volcomp_fast.h $(B)/zarr3.o $(B)/store.o $(B)/json.o $(B)/z3w.o $(B)/nn_gpudec.o
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(B)/zarr3.o $(B)/store.o $(B)/json.o $(B)/z3w.o $(B)/nn_gpudec.o -o $@ $(LDLIBS) $(CUDALIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(CUDA)/include $< $(B)/zarr3.o $(B)/store.o $(B)/json.o $(B)/z3w.o $(B)/nn_gpudec.o -o $@ $(LDLIBS) $(CUDALIBS)
 $(B)/test_edt: tests/test_edt.c $(B)/edt.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ -lpthread -lm
 $(B)/test_infer_mem: tests/test_infer_mem.c $(B)/unet.o $(B)/split.o $(B)/nn.o $(B)/nn_fp8.o
@@ -567,6 +572,7 @@ test-all: $(B)/test_gpu_aug $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover 
 	./$(B)/test_flatten_gpu
 	./$(B)/test_strip
 	./$(B)/test_faces
+	./$(B)/test_faces_gpu
 	./$(B)/test_fit_emb
 	./$(B)/test_distill
 	./$(B)/test_tiffw

@@ -22,7 +22,8 @@
 
 enum { NSUB = 32, BLKV = 4096, TABW = 10 * 1024, NRADII = 46, TAB_BYTES = (TABW * 4 + NRADII * 4 + 15) & ~15, SUB_BYTES = 65536 };
 
-struct gd_item { uint32_t tok_off, tok_n, byp_off, byp_n, tab_off, rec_off, pad0, pad1; };   /* byte offsets in the input; rec_off in records */
+struct gd_item { uint32_t tok_off, tok_n, byp_off, byp_n, tab_off, rec_off, zs, pad; uint64_t dst; };   /* byte offsets in the input; rec_off in records; output: the
+                                                                                            substream's (z 0, y 0, x 0) at dst, z planes zs bytes apart, rows 128 */
 
 /* per scan position: natural index | radius << 12 | zero-axis count << 18 | band << 20 (volcomp_fast.h vfx_pos_tab) */
 __constant__ float c_scale[4] = {0.0441941738f, 0.03125f, 0.0220970869f, 0.015625f};
@@ -168,7 +169,7 @@ __device__ __forceinline__ uint32_t round8(float v) {   /* vf_scatter_block / vf
 /* shared block: (z, y) rows of 17 floats (bank-conflict free in all three passes) */
 #define SI(z, y, x) (((z) * 16 + (y)) * 17 + (x))
 __global__ void __launch_bounds__(256) k_idct(const gd_item *__restrict__ items, const uint8_t *__restrict__ in, const uint32_t *__restrict__ pos_tab, const uint32_t *__restrict__ rec,
-                                              const uint32_t *__restrict__ meta, const uint32_t *__restrict__ status, uint8_t *__restrict__ out) {
+                                              const uint32_t *__restrict__ meta, const uint32_t *__restrict__ status) {
     __shared__ float S[16 * 16 * 17];
     const int i = blockIdx.x >> 4, j = blockIdx.x & 15, t = threadIdx.x;
     if (!status[i]) return;
@@ -180,7 +181,7 @@ __global__ void __launch_bounds__(256) k_idct(const gd_item *__restrict__ items,
     float b0 = 0.0f;
     if (dc != 0) { const float mag = (float)(uint32_t)(dc < 0 ? -dc : dc) * step[0] * 0.015625f; b0 = dc < 0 ? -mag : mag; }
     /* output row (z, y) of block j: compact substream layout z (16) x y (32) x x (128) */
-    uint8_t *orow = out + (size_t)i * SUB_BYTES + ((size_t)(t >> 4) * 32 + (j >> 3) * 16 + (t & 15)) * 128 + (j & 7) * 16;
+    uint8_t *orow = (uint8_t *)it.dst + (size_t)(t >> 4) * it.zs + ((j >> 3) * 16 + (t & 15)) * 128 + (j & 7) * 16;
     if (r0 == r1) {   /* DC only */
         const uint32_t v = round8(b0) * 0x01010101u;
         *(uint4 *)orow = make_uint4(v, v, v, v);
@@ -211,11 +212,11 @@ __global__ void __launch_bounds__(256) k_idct(const gd_item *__restrict__ items,
 /* ---------------- host: device state, batching service ---------------- */
 enum { NSLOT = 3, MAXREQ = 4096 };
 enum { S_FREE, S_OPEN, S_GPU, S_DRAIN };
-struct gd_req { int slot; uint32_t item0, nitems, mask, tab_off; uint8_t *dst; int state; };   /* state: 0 pending, 1 ok, 2 GPU decode failed, 3 GPU unavailable */
+struct gd_req { int slot; uint32_t item0, nitems, mask, tab_off, out0; uint8_t *dst, *ddst; int state; };   /* ddst: device chunk (no copy out) */   /* state: 0 pending, 1 ok, 2 GPU decode failed, 3 GPU unavailable */
 struct gd_slot {
     int state, writers, readers, nreq;
     uint8_t *h_in, *h_out; gd_item *h_items; gd_group *h_groups; uint32_t *h_status;
-    size_t in_used, rec_used; uint32_t nitems;
+    size_t in_used, rec_used; uint32_t nitems, nout;
     gd_req *req[MAXREQ];
 };
 static struct {
@@ -233,7 +234,7 @@ static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t
 #define GD_CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { fprintf(stderr, "gpudec: %s (%s:%d), decoding on the CPU from now on\n", cudaGetErrorString(e_), __FILE__, __LINE__); goto fail; } } while (0)
 
 static int take_free(void) {
-    for (int k = 0; k < NSLOT; k++) if (G.slot[k].state == S_FREE) { gd_slot *S = &G.slot[k]; S->state = S_OPEN; S->in_used = S->rec_used = 0; S->nitems = 0; S->nreq = 0; S->writers = S->readers = 0; return k; }
+    for (int k = 0; k < NSLOT; k++) if (G.slot[k].state == S_FREE) { gd_slot *S = &G.slot[k]; S->state = S_OPEN; S->in_used = S->rec_used = 0; S->nitems = S->nout = 0; S->nreq = 0; S->writers = S->readers = 0; return k; }
     return -1;
 }
 
@@ -246,10 +247,10 @@ static int run_batch(gd_slot *S) {
     GD_CK(cudaMemcpyAsync(G.d_groups, S->h_groups, S->nreq * sizeof(gd_group), cudaMemcpyHostToDevice, G.st));
     k_entropy<<<S->nreq, 32, 0, G.st>>>(G.d_groups, G.d_items, G.d_in, G.d_pos, G.d_rec, G.d_meta, G.d_status);
     GD_CK(cudaGetLastError());
-    k_idct<<<n * 16, 256, 0, G.st>>>(G.d_items, G.d_in, G.d_pos, G.d_rec, G.d_meta, G.d_status, G.d_out);
+    k_idct<<<n * 16, 256, 0, G.st>>>(G.d_items, G.d_in, G.d_pos, G.d_rec, G.d_meta, G.d_status);
     GD_CK(cudaGetLastError());
     GD_CK(cudaMemcpyAsync(S->h_status, G.d_status, n * sizeof(uint32_t), cudaMemcpyDeviceToHost, G.st));
-    GD_CK(cudaMemcpyAsync(S->h_out, G.d_out, (size_t)n * SUB_BYTES, cudaMemcpyDeviceToHost, G.st));
+    if (S->nout) GD_CK(cudaMemcpyAsync(S->h_out, G.d_out, (size_t)S->nout * SUB_BYTES, cudaMemcpyDeviceToHost, G.st));
     GD_CK(cudaEventRecord(G.ev, G.st));
     GD_CK(cudaEventSynchronize(G.ev));
     G.gpu_s += now_s() - t0;
@@ -278,7 +279,7 @@ static void *service(void *arg) {
             gd_req *q = S->req[r]; int bad = 0;
             if (!rc) for (uint32_t u = 0; u < q->nitems; u++) bad |= !S->h_status[q->item0 + u];
             q->state = rc ? 3 : bad ? 2 : 1;
-            readers += q->state == 1;
+            readers += q->state == 1 && !q->ddst;
             if (q->state == 1) G.n_subs += q->nitems; else if (q->state == 2) G.n_redo++;
         }
         S->readers = readers; S->state = readers ? S_DRAIN : S_FREE;
@@ -372,7 +373,7 @@ extern "C" void gpudec_stats(uint64_t *subs, uint64_t *batches, uint64_t *redo, 
     pthread_mutex_unlock(&G.mu);
 }
 
-extern "C" int gpudec_decode(const gd_chunk *c, uint32_t mask, uint8_t *dst) {
+static int gd_decode(const gd_chunk *c, uint32_t mask, uint8_t *dst, uint8_t *ddst) {
     if (!mask) return 0;
     if (!gpudec_enabled()) return -1;
     const uint32_t k = (uint32_t)__builtin_popcount(mask);
@@ -383,7 +384,8 @@ extern "C" int gpudec_decode(const gd_chunk *c, uint32_t mask, uint8_t *dst) {
     }
     if (need_in > G.in_cap || need_rec > G.rec_cap || k > G.max_items) return -1;
     if (payload < (size_t)k * G.min_bytes) return -1;   /* near-empty substreams (flat blocks: ink, air) decode faster on the CPU than a round trip */
-    gd_req q = {}; q.mask = mask; q.dst = dst; q.nitems = k;
+    gd_req q = {}; q.mask = mask; q.dst = dst; q.ddst = ddst; q.nitems = k;
+    const uint32_t kout = ddst ? 0 : k;
     pthread_mutex_lock(&G.mu);
     if (!G.have_scan) {
         if (pos_upload(c->scan)) { G.broken = 1; pthread_cond_broadcast(&G.cv); pthread_mutex_unlock(&G.mu); return -1; }
@@ -396,11 +398,11 @@ extern "C" int gpudec_decode(const gd_chunk *c, uint32_t mask, uint8_t *dst) {
         if (G.broken) { pthread_mutex_unlock(&G.mu); return -1; }
         if (G.open >= 0) {
             S = &G.slot[G.open];
-            if (S->in_used + need_in <= G.in_cap && S->rec_used + need_rec <= G.rec_cap && S->nitems + k <= G.max_items && S->nreq < MAXREQ) break;
+            if (S->in_used + need_in <= G.in_cap && S->rec_used + need_rec <= G.rec_cap && S->nitems + k <= G.max_items && S->nout + kout <= G.max_items && S->nreq < MAXREQ) break;
         }
         pthread_cond_wait(&G.cv, &G.mu);
     }
-    q.slot = G.open; q.item0 = S->nitems;
+    q.slot = G.open; q.item0 = S->nitems; q.out0 = S->nout; S->nout += kout;
     size_t off = S->in_used, roff = S->rec_used;
     S->in_used += need_in; S->rec_used += need_rec; S->nitems += k; S->req[S->nreq++] = &q; S->writers++;
     pthread_mutex_unlock(&G.mu);
@@ -418,6 +420,8 @@ extern "C" int gpudec_decode(const gd_chunk *c, uint32_t mask, uint8_t *dst) {
         it->tok_off = (uint32_t)off; it->tok_n = c->tok_n[s]; memcpy(S->h_in + off, p, c->tok_n[s]); off += ((c->tok_n[s] + 15u) & ~15u) + 16;
         it->byp_off = (uint32_t)off; it->byp_n = c->byp_n[s]; memcpy(S->h_in + off, p + c->tok_n[s], c->byp_n[s]); off += ((c->byp_n[s] + 15u) & ~15u) + 16;
         it->rec_off = (uint32_t)roff; roff += (size_t)c->byp_n[s] * 8u + 1u;
+        if (ddst) { it->dst = (uint64_t)(uintptr_t)(ddst + ((size_t)16u * (s >> 2) * 128u + 32u * (s & 3u)) * 128u); it->zs = 128u * 128u; }
+        else { it->dst = (uint64_t)(uintptr_t)(G.d_out + (size_t)(q.out0 + u - 1) * SUB_BYTES); it->zs = 32u * 128u; }
     }
 
     pthread_mutex_lock(&G.mu);
@@ -426,13 +430,22 @@ extern "C" int gpudec_decode(const gd_chunk *c, uint32_t mask, uint8_t *dst) {
     while (q.state == 0) pthread_cond_wait(&G.cv, &G.mu);
     pthread_mutex_unlock(&G.mu);
     if (q.state != 1) return q.state == 2 ? 1 : -1;
+    if (ddst) return 0;
     u = 0;
     for (uint32_t s = 0; s < NSUB; s++) if (mask >> s & 1u) {   /* compact substream -> its 16 z planes of 32 x 128 in the chunk */
-        const uint8_t *src = S->h_out + (size_t)(q.item0 + u++) * SUB_BYTES;
+        const uint8_t *src = S->h_out + (size_t)(q.out0 + u++) * SUB_BYTES;
         for (uint32_t z = 0; z < 16; z++) memcpy(dst + ((size_t)(16u * (s >> 2) + z) * 128u + 32u * (s & 3u)) * 128u, src + (size_t)z * 4096u, 4096);
     }
     pthread_mutex_lock(&G.mu);
     if (--S->readers == 0) { S->state = S_FREE; if (G.open < 0) G.open = take_free(); pthread_cond_broadcast(&G.cv); }
     pthread_mutex_unlock(&G.mu);
     return 0;
+}
+extern "C" int gpudec_decode(const gd_chunk *c, uint32_t mask, uint8_t *dst) { return gd_decode(c, mask, dst, nullptr); }
+extern "C" int gpudec_decode_dev(const gd_chunk *c, uint32_t mask, uint8_t *dchunk) {
+    if (!dchunk || !gpudec_enabled()) return -1;
+    cudaPointerAttributes a;   /* device memory of the decoder's device only */
+    if (cudaPointerGetAttributes(&a, dchunk) != cudaSuccess) { cudaGetLastError(); return -1; }
+    if (a.type != cudaMemoryTypeDevice || a.device != G.dev) return -1;
+    return gd_decode(c, mask, nullptr, dchunk);
 }

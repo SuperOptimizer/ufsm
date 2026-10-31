@@ -11,6 +11,7 @@
 #include "store.h"
 #include "z3w.h"
 #include "zarr3.h"
+#include <cuda_runtime_api.h>
 #define VOLCOMP_IMPLEMENTATION
 #include "volcomp.h"
 #include "volcomp_fast.h"
@@ -155,6 +156,48 @@ static void part3(const char *dir) {
     z3_close(z); store_close(st); free(got); free(ref);
 }
 
+/* ---- 4: straight into device memory (gpudec_decode_dev, z3_read_sub_dev) = the reference ---- */
+static void part4(const char *dir) {
+    uint8_t *dch = nullptr, *got = malloc(CV), *ref = malloc(CV), *host = malloc(CV);
+    if (cudaMalloc((void **)&dch, CV) != cudaSuccess) { check("cudaMalloc", 0); return; }
+    int ok = 1, n = 0, gpu = 0; uint64_t s = 11;
+    for (int k = 0; k < NENC; k++) {
+        if (!g_enc[k]) continue;
+        vf_parsed p; if (vf_parse(g_enc[k], g_n[k], &p) != VOLCOMP_OK) continue;
+        gd_chunk gc; to_gd(&p, &gc);
+        for (int t = 0; t < 3; t++) {
+            const uint32_t mask = t == 0 ? 0xffffffffu : (uint32_t)lcg(&s) | 1u;
+            cudaMemset(dch, 0, CV); cudaDeviceSynchronize();
+            ref_subs(&p, mask, ref);
+            const int rc = gpudec_decode_dev(&gc, mask, dch);
+            if (cudaMemcpy(got, dch, CV, cudaMemcpyDeviceToHost) != cudaSuccess || rc != 0 || memcmp(got, ref, CV)) ok = 0;
+            n++; gpu += rc == 0;
+        }
+    }
+    char msg[200]; snprintf(msg, sizeof msg, "gpudec_decode_dev: %d requests straight into device memory = vf_decode_sub", n);
+    check(msg, ok && gpu == n && n > 30);
+    check("gpudec_decode_dev refuses host memory (-1)", gpudec_decode_dev(&(gd_chunk){0}, 1u, host) == -1);
+    /* z3_read_sub_dev: device substreams + zeros in out = the reference */
+    char arr[600]; snprintf(arr, sizeof arr, "%s", dir);
+    store *st = store_open(arr); z3 *z = z3_open(st, "ct.zarr", nullptr); int ok2 = z != nullptr, nd = 0;
+    for (int cx = 0; z && cx < 3; cx++) {
+        uint8_t *raw; size_t rn; vf_parsed p;
+        if (z3_chunk_raw(z, 1, 1, cx, &raw, &rn) != 1 || vf_parse(raw, rn, &p) != VOLCOMP_OK) { ok2 = 0; continue; }
+        const uint32_t mask = 0x0f0f00f1u << cx; ref_subs(&p, mask, ref); free(raw);
+        const int64_t o[3] = {128, 128, cx * 128}, nn[3] = {128, 128, 128}; uint32_t dm = 0;
+        cudaMemset(dch, 0, CV); cudaDeviceSynchronize();
+        memset(host, 0x77, CV);
+        if (z3_read_sub_dev(z, o, nn, host, 1, mask, dch, &dm) || dm != mask) { ok2 = 0; continue; }
+        cudaMemcpy(got, dch, CV, cudaMemcpyDeviceToHost);
+        for (size_t i = 0; i < CV; i++) if (host[i] != 0) { ok2 = 0; break; }   /* out: zeros (the substreams went to the device) */
+        if (memcmp(got, ref, CV)) ok2 = 0;
+        nd++;
+    }
+    check("z3_read_sub_dev: the substreams in device memory = reference, zeros in out", ok2 && nd == 3);
+    if (z) z3_close(z);
+    store_close(st); cudaFree(dch); free(got); free(ref); free(host);
+}
+
 /* ---- --real: raw chunks of a real array, CPU vs GPU ---- */
 typedef struct { uint8_t **enc; size_t *n; uint32_t *mask; int nc; _Atomic int next, bad, gpu, cpu; int mode; } real_job;   /* mode 0 CPU (vfx), 1 GPU, 2 check */
 static void *real_worker(void *a) {
@@ -221,6 +264,7 @@ int main(int argc, char **argv) {
     char dir[] = "/tmp/test_gpudecXXXXXX"; if (!mkdtemp(dir)) return 1;
     part12();
     part3(dir);
+    part4(dir);
     char cmd[700]; snprintf(cmd, sizeof cmd, "rm -rf -- '%s'", dir); if (system(cmd)) {}
     uint64_t subs, batches, redo; double gs; gpudec_stats(&subs, &batches, &redo, &gs);
     printf("test_gpudec: %s (%llu substreams, %llu batches, %llu requests redone on the CPU, GPU %.2f s)\n", fails ? "FAIL" : "ok",

@@ -1,77 +1,19 @@
 /* ufsm faces core: recto / verso faces of the sheet under each wrap (src/faces.h; the command: src/faces_cli.c). */
-#include "faces.h"
+#include "faces_core.h"
 #include <math.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
-/* ---- one profile -> bands ---- */
+/* ---- one profile -> bands (faces_core.h: the same code runs on the GPU) ---- */
 int faces_bands(const float *f0, int m, double t0, double h, double min_prom, double rel, fc_band *out, int kmax) {
     if (m < 5 || m > 8192 || kmax < 1) return 0;
-    float f[8192], g[8192];
-    for (int k = 0; k < m; k++) if (!(f0[k] == f0[k])) return 0;   /* NaN: the profile leaves the volume */
+    float f[8192]; int ex[8192];
     memcpy(f, f0, m * sizeof(float));
-    for (int pass = 0; pass < 2; pass++) {   /* [1 2 1] / 4 twice: trilinear kinks and noise below a voxel */
-        g[0] = f[0]; g[m - 1] = f[m - 1];
-        for (int k = 1; k < m - 1; k++) g[k] = 0.25f * (f[k - 1] + 2 * f[k] + f[k + 1]);
-        memcpy(f, g, m * sizeof(float));
-    }
-    float V = f[0]; for (int k = 1; k < m; k++) if (f[k] < V) V = f[k];
-    /* alternating extrema min, max, min, ..., min (the profile ends count as minima) */
-    int ex[8192], ne = 0; ex[ne++] = 0;
-    for (int k = 1; k < m - 1; k++) {
-        const int last_max = ne & 1 ? 0 : 1;   /* ex[ne - 1] is a max when ne is even */
-        if (!last_max) {   /* looking for a max; a lower min replaces the last min */
-            if (f[k] < f[ex[ne - 1]]) ex[ne - 1] = k;
-            else if (f[k] > f[k - 1] && f[k] >= f[k + 1]) ex[ne++] = k;
-        } else {
-            if (f[k] > f[ex[ne - 1]]) ex[ne - 1] = k;
-            else if (f[k] < f[k - 1] && f[k] <= f[k + 1]) ex[ne++] = k;
-        }
-    }
-    if (!(ne & 1)) { if (f[m - 1] < f[ex[ne - 1]]) ex[ne++] = m - 1; else ne--; }   /* ends on a max: close with the end, or drop a rise */
-    else if (f[m - 1] < f[ex[ne - 1]]) ex[ne - 1] = m - 1;
-    /* persistence: drop the shallowest interior dip (and the lower of its two peaks) while it is below the floor */
-    for (;;) {
-        int bj = -1; double br = 1;
-        for (int j = 2; j + 2 < ne; j += 2) {
-            const float pa = f[ex[j - 1]], pb = f[ex[j + 1]], lo = pa < pb ? pa : pb, d = lo - f[ex[j]];
-            const double thr = fmax(min_prom, rel * (lo - V)), r = d / thr;
-            if (r < br) { br = r; bj = j; }
-        }
-        if (bj < 0) break;
-        const int drop = f[ex[bj - 1]] < f[ex[bj + 1]] ? bj - 1 : bj + 1;   /* the lower peak goes with the dip */
-        const int a = drop < bj ? drop : bj;
-        memmove(&ex[a], &ex[a + 2], (ne - a - 2) * sizeof(int)); ne -= 2;
-    }
-    int nb = 0;
-    for (int j = 1; j + 1 < ne && nb < kmax; j += 2) {
-        const int p = ex[j], vl = ex[j - 1], vr = ex[j + 1]; const float fp = f[p];
-        if (fp - V < 2 * min_prom) continue;   /* no contrast over the void */
-        const float half = V + 0.5f * (fp - V);
-        double e[2]; int ok = 1;
-        for (int sd = 0; sd < 2 && ok; sd++) {
-            const int v = sd ? vr : vl, end = v == 0 || v == m - 1;
-            if (f[v] > half) {   /* still bright at the base: a contact valley (edge there) or papyrus past the profile end */
-                if (end) { ok = 0; break; }
-                e[sd] = t0 + h * v; continue;
-            }
-            const float lev = f[v] + 0.5f * (fp - f[v]);
-            if (!sd) { int k = p; while (k > v && f[k] > lev) k--; e[0] = t0 + h * (k + (lev - f[k]) / (f[k + 1] - f[k] != 0 ? f[k + 1] - f[k] : 1)); }
-            else { int k = p; while (k < v && f[k] > lev) k++; e[1] = t0 + h * (k - (lev - f[k]) / (f[k - 1] - f[k] != 0 ? f[k - 1] - f[k] : 1)); }
-        }
-        if (!ok || !(e[1] > e[0])) continue;
-        const double di = fmin(1.0, 0.3 * (e[1] - e[0]));   /* just inside each face: its texture (fibres) */
-        float cv[2];
-        for (int sd = 0; sd < 2; sd++) {
-            const double k = ((sd ? e[1] - di : e[0] + di) - t0) / h; int k0 = (int)k; if (k0 > m - 2) k0 = m - 2; if (k0 < 0) k0 = 0;
-            cv[sd] = (float)(f[k0] + (k - k0) * (f[k0 + 1] - f[k0]));
-        }
-        out[nb++] = (fc_band){(float)e[0], (float)e[1], fp, fp - V, cv[0], cv[1]};
-    }
-    return nb;
+    return fc_bands_core(f, ex, m, t0, h, min_prom, rel, out, kmax);
 }
 
 /* ---- normals / orientation ---- */
@@ -115,7 +57,7 @@ typedef struct {
 } fc_job;
 static inline void fc_ctpos(const fc_job *J, size_t i, double c[3]) { c[0] = (J->Z[i] + 0.5) * J->f - 0.5; c[1] = (J->Y[i] + 0.5) * J->f - 0.5; c[2] = (J->X[i] + 0.5) * J->f - 0.5; }
 static void *fc_rows(void *arg) {
-    fc_job *J = arg; float f[8192];
+    fc_job *J = arg; float f[8192]; int ex[8192];
     for (int r; (r = J->r0 + atomic_fetch_add(&J->next, 1)) < J->r1;) for (int c = 0; c < J->w; c++) {
         const size_t i = (size_t)r * J->w + c; const float *N = &J->N[3 * i];
         if (!(J->Z[i] >= 0) || isnan(N[0])) continue;
@@ -131,7 +73,7 @@ static void *fc_rows(void *arg) {
             uint8_t *q = &J->prof[((size_t)(r / SUB) * ((J->w + SUB - 1) / SUB) + c / SUB) * J->m];
             for (int k = 0; k < J->m; k++) q[k] = f[k] == f[k] ? (uint8_t)lrintf(fminf(fmaxf(f[k], 0), 255)) : 0;
         }
-        J->nc[i] = (uint8_t)faces_bands(f, J->m, -J->R, J->hs, J->o->min_prom, J->o->rel, &J->cand[i * FK], FK);
+        J->nc[i] = (uint8_t)fc_bands_core(f, ex, J->m, -J->R, J->hs, J->o->min_prom, J->o->rel, &J->cand[i * FK], FK);
     }
     return nullptr;
 }
@@ -141,16 +83,7 @@ static void fc_par(void *(*fn)(void *), void *J, int nt) {
     for (int t = 0; t < k; t++) pthread_join(th[t], nullptr);
 }
 
-/* ---- robust windowed median of a float field (NaN = missing) ---- */
-static float fc_select(float *a, int n, int k) {   /* k-th smallest (quickselect) */
-    int lo = 0, hi = n - 1;
-    while (lo < hi) {
-        const float pv = a[(lo + hi) / 2]; int i = lo, j = hi;
-        while (i <= j) { while (a[i] < pv) i++; while (a[j] > pv) j--; if (i <= j) { const float t = a[i]; a[i] = a[j]; a[j] = t; i++; j--; } }
-        if (k <= j) hi = j; else if (k >= i) lo = i; else break;
-    }
-    return a[k];
-}
+/* ---- robust windowed median of a float field (NaN = missing; quickselect faces_core.h fc_select) ---- */
 typedef struct { const float *in; float *out; int w, h, R, minn; _Atomic int next; } fm_job;
 static void *fm_rows(void *arg) {
     fm_job *J = arg; const int R = J->R; float *buf = malloc(sizeof(float) * (2 * R + 1) * (2 * R + 1));
@@ -162,7 +95,22 @@ static void *fm_rows(void *arg) {
     }
     free(buf); return nullptr;
 }
-static void fc_median(const float *in, float *out, int w, int h, int R, int minn, int nt) { fm_job J = {in, out, w, h, R, minn < 1 ? 1 : minn, 0}; fc_par(fm_rows, &J, nt); }
+/* the GPU (src/nn_faces.cu); weak: absent in CPU-only binaries */
+fgpu *fgpu_open(const int64_t shape[3]) __attribute__((weak));
+int fgpu_broken(const fgpu *G) __attribute__((weak));
+void fgpu_set_broken(fgpu *G) __attribute__((weak));
+int fgpu_grid(fgpu *G, const float *X, const float *Y, const float *Z, const float *N, int w, int h) __attribute__((weak));
+int fgpu_band(fgpu *G, int r0, int r1, double f, double hs, double R, int m, double min_prom, double rel, fc_band *cand, uint8_t *nc, float *ct0, uint8_t *prof) __attribute__((weak));
+int fgpu_median(fgpu *G, const float *in, float *out, int w, int h, int R, int minn) __attribute__((weak));
+int fgpu_mark(fgpu *G, int r0, int r1, double f, double hs, double R, int m, uint32_t *mask) __attribute__((weak));
+size_t fgpu_nchunks(const fgpu *G) __attribute__((weak));
+static int fc_gpu_ok(const faces_vol *V) { return V->gpu && fgpu_broken && !fgpu_broken(V->gpu); }
+static void fc_median(const faces_vol *V, const float *in, float *out, int w, int h, int R, int minn, int nt) {
+    if (fc_gpu_ok(V) && fgpu_median && !fgpu_median(V->gpu, in, out, w, h, R, minn < 1 ? 1 : minn)) return;
+    fm_job J = {in, out, w, h, R, minn < 1 ? 1 : minn, 0}; fc_par(fm_rows, &J, nt);
+}
+/* UFSM_FACES_PROF=1: per-stage wall times on stderr */
+static double fc_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + 1e-9 * t.tv_nsec; }
 
 /* push-pull fill of the NaN entries of a (w x h) field over the valid mask (Z >= 0); levels halve until one value per field */
 static void fc_fill(float *a, const float *Z, int w, int h) {
@@ -205,17 +153,36 @@ int faces_wrap(const float *X, const float *Y, const float *Z, int w, int h, dou
     float *N = malloc(n * 3 * sizeof(float)), *ct0 = malloc(n * sizeof(float)); fc_band *cand = malloc(n * FK * sizeof(fc_band)); uint8_t *nc = calloc(n, 1);
     const int ws = (w + SUB - 1) / SUB, hsb = (h + SUB - 1) / SUB; uint8_t *prof = calloc((size_t)ws * hsb * m, 1);
     if (!N || !ct0 || !cand || !nc || !prof) { free(N); free(ct0); free(cand); free(nc); free(prof); return -1; }
+    const int prof_on = getenv("UFSM_FACES_PROF") != nullptr; double tp[8] = {0}, tq = fc_now();   /* normals mark fill sample pick medians final */
     for (size_t i = 0; i < n; i++) {
         double q[3]; ct0[i] = NAN;
         if (faces_normal(X, Y, Z, w, h, i, q)) for (int k = 0; k < 3; k++) N[3 * i + k] = (float)(sign * q[k]);
         else N[3 * i] = N[3 * i + 1] = N[3 * i + 2] = NAN;
         if (Z[i] >= 0) st->nv++;
     }
+    /* the GPU path needs the chunk mirror (mark / fill) and 128^3 chunks; any device failure: the CPU from that band on. With the GPU the
+       decode list is the exact set of substreams the samples read (fgpu_mark), not the profiles' bounding boxes */
+    int gpu = V->mark && V->fill && fc_gpu_ok(V) && fgpu_grid && fgpu_band && !fgpu_grid(V->gpu, X, Y, Z, N, w, h);
+    uint32_t *gmask = gpu && V->mark_mask && fgpu_mark && fgpu_nchunks ? malloc(fgpu_nchunks(V->gpu) * sizeof(uint32_t)) : nullptr;
+    tp[0] += fc_now() - tq;
     for (int r0 = 0; r0 < h; r0 += 32) {   /* bands of rows: mark the chunks, decode, sample */
         fc_job J = {X, Y, Z, N, w, h, r0, r0 + 32 < h ? r0 + 32 : h, f, hs, R, m, o, V, cand, nc, prof, ct0, 0, 1};
-        if (V->mark) { fc_par(fc_rows, &J, o->nthreads); if (V->fill && V->fill(V->ctx)) { free(N); free(ct0); free(cand); free(nc); free(prof); return -1; } }
-        J.mark = 0; atomic_store(&J.next, 0); fc_par(fc_rows, &J, o->nthreads);
+        tq = fc_now();
+        if (V->mark) {
+            if (gmask && gpu && fc_gpu_ok(V) && !fgpu_mark(V->gpu, J.r0, J.r1, f, hs, R, m, gmask)) V->mark_mask(V->ctx, gmask);
+            else fc_par(fc_rows, &J, o->nthreads);
+            tp[1] += fc_now() - tq; tq = fc_now();
+            if (V->fill && V->fill(V->ctx)) { free(N); free(ct0); free(cand); free(nc); free(prof); free(gmask); return -1; }
+            tp[2] += fc_now() - tq; tq = fc_now();
+        }
+        if (gpu && fc_gpu_ok(V) && !fgpu_band(V->gpu, J.r0, J.r1, f, hs, R, m, o->min_prom, o->rel, cand, nc, ct0, prof)) { tp[3] += fc_now() - tq; continue; }
+        /* the GPU failed (or is off): the CPU samples the host chunks; a fill first restores substreams only the device had (gpudec) */
+        if (gpu && fgpu_set_broken) fgpu_set_broken(V->gpu);
+        if (gpu && V->fill && V->fill(V->ctx)) { free(N); free(ct0); free(cand); free(nc); free(prof); free(gmask); return -1; }
+        gpu = 0; J.mark = 0; atomic_store(&J.next, 0); fc_par(fc_rows, &J, o->nthreads);
+        tp[3] += fc_now() - tq;
     }
+    tq = fc_now();
     /* first pick: the band nearest t = 0, ties to the nearer inner face */
     int *pick = malloc(n * sizeof(int));
     for (size_t i = 0; i < n; i++) {
@@ -234,12 +201,13 @@ int faces_wrap(const float *X, const float *Y, const float *Z, int w, int h, dou
         }
         st->npick0 += pick[i] >= 0;
     }
+    tp[4] += fc_now() - tq; tq = fc_now();
     float *pn = malloc(n * sizeof(float)), *pf = malloc(n * sizeof(float)), *mn = malloc(n * sizeof(float)), *mf = malloc(n * sizeof(float));
     const int S = o->smooth < 1 ? 1 : o->smooth, minn = (2 * S + 1) * (2 * S + 1) / 5 + 1;
     for (int it = 0; it < 3; it++) {   /* consistency: medians of the picks, re-pick the band nearest them */
         for (size_t i = 0; i < n; i++) { const int k = pick[i]; pn[i] = k >= 0 ? cand[i * FK + k].near : NAN; pf[i] = k >= 0 ? cand[i * FK + k].far : NAN; }
         if (it == 2) break;
-        fc_median(pn, mn, w, h, S, minn, o->nthreads); fc_median(pf, mf, w, h, S, minn, o->nthreads);
+        fc_median(V, pn, mn, w, h, S, minn, o->nthreads); fc_median(V, pf, mf, w, h, S, minn, o->nthreads);
         rp_job P = {cand, nc, mn, mf, pick, n, o->tol, 0}; fc_par(rp_rows, &P, o->nthreads);
     }
     for (size_t i = 0; i < n; i++) if (pick[i] >= 0) st->npick++;
@@ -249,7 +217,8 @@ int faces_wrap(const float *X, const float *Y, const float *Z, int w, int h, dou
         if (c + 1 < w && pick[i + 1] >= 0) { const fc_band *b = &cand[(i + 1) * FK + pick[i + 1]]; st->fib[0][1] += fabsf(a->cin - b->cin); st->fib[1][1] += fabsf(a->cout - b->cout); }
         if (i + w < n && pick[i + w] >= 0) { const fc_band *b = &cand[(i + w) * FK + pick[i + w]]; st->fib[0][0] += fabsf(a->cin - b->cin); st->fib[1][0] += fabsf(a->cout - b->cout); }
     }
-    fc_median(pn, mn, w, h, 2, 3, o->nthreads); fc_median(pf, mf, w, h, 2, 3, o->nthreads);   /* final 5 x 5 medians; isolated misses filled */
+    fc_median(V, pn, mn, w, h, 2, 3, o->nthreads); fc_median(V, pf, mf, w, h, 2, 3, o->nthreads);   /* final 5 x 5 medians; isolated misses filled */
+    tp[5] += fc_now() - tq; tq = fc_now();
     for (size_t i = 0; i < n; i++) if (Z[i] < 0) mn[i] = mf[i] = NAN; else if (isnan(mn[i]) || isnan(mf[i])) { mn[i] = mf[i] = NAN; st->nfill++; }
     fc_fill(mn, Z, w, h); fc_fill(mf, Z, w, h);
     for (size_t i = 0; i < n; i++) {
@@ -277,7 +246,9 @@ int faces_wrap(const float *X, const float *Y, const float *Z, int w, int h, dou
             }
         }
     }
-    free(N); free(ct0); free(cand); free(nc); free(prof); free(pick); free(pn); free(pf); free(mn); free(mf);
+    tp[6] += fc_now() - tq;
+    if (prof_on) fprintf(stderr, "faces prof: normals %.2f mark %.2f fill %.2f sample %.2f pick %.2f medians %.2f final %.2f s (%s)\n", tp[0], tp[1], tp[2], tp[3], tp[4], tp[5], tp[6], gpu ? "gpu" : "cpu");
+    free(N); free(ct0); free(cand); free(nc); free(prof); free(pick); free(pn); free(pf); free(mn); free(mf); free(gmask);
     return 0;
 }
 

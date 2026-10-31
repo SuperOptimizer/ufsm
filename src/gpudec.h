@@ -31,6 +31,9 @@ typedef struct gd_chunk {
 int gpudec_enabled(void);
 int gpudec_threads(int nthreads);      /* decode threads for a consumer that would run nthreads (more when the GPU decodes) */
 int gpudec_decode(const gd_chunk *c, uint32_t mask, uint8_t *dst);
+/* the same, written straight into a device 128^3 chunk (chunk layout) on the decoder's device: no host round trip. 0 / 1 / -1 as above
+   (-1 also when dchunk is not memory of that device) */
+int gpudec_decode_dev(const gd_chunk *c, uint32_t mask, uint8_t *dchunk);
 void gpudec_stats(uint64_t *subs, uint64_t *batches, uint64_t *cpu_redo, double *gpu_s);
 
 #ifdef __cplusplus

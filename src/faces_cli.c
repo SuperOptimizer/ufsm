@@ -23,11 +23,26 @@ static void fc_par(void *(*fn)(void *), void *J, int nt) {
     for (int t = 0; t < k; t++) pthread_join(th[t], nullptr);
 }
 
+fgpu *fgpu_open(const int64_t shape[3]) __attribute__((weak));
+void fgpu_close(fgpu *G) __attribute__((weak));
+int fgpu_broken(const fgpu *G) __attribute__((weak));
+int fgpu_put(fgpu *G, size_t id, const uint8_t *buf, uint32_t mask) __attribute__((weak));
+void fgpu_drop(fgpu *G, size_t id) __attribute__((weak));
+void fgpu_stats(const fgpu *G, size_t *nput, size_t *bytes, int *slots) __attribute__((weak));
+uint8_t *fgpu_chunk_dev(fgpu *G, size_t id) __attribute__((weak));
+void fgpu_have(fgpu *G, size_t id, uint32_t mask) __attribute__((weak));
+
+static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + 1e-9 * t.tv_nsec; }
+
 /* ---- the CT (or a label raster) through a cache of decoded chunks ---- */
 typedef struct {
     z3 *z; int64_t shape[3]; int cs[3]; int64_t g[3]; uint8_t **ch; uint32_t *stamp; _Atomic uint8_t *need; size_t nres, cap; uint32_t clock; int nt;
-    size_t ndec;
+    size_t ndec; double tdec, tev;   /* UFSM_FACES_PROF: fill decode (+ device upload) / eviction seconds */
+    fgpu *dev;   /* non-null: every decoded chunk mirrored on the GPU (faces_vol.gpu) */
     _Atomic uint32_t *needm; uint32_t *have;
+    uint32_t *hless;   /* UFSM_GPU_DECODE: substreams decoded straight into the device mirror (not in ch); re-decoded on the host if the GPU breaks */
+    _Atomic size_t ndevsub;
+    uint32_t *ever; _Atomic size_t nsub, nresub;   /* UFSM_FACES_PROF: substreams ever decoded per chunk; decoded, decoded again after eviction */
     uint8_t **pool; int npool; pthread_mutex_t pmu;   /* evicted whole-chunk buffers for reuse (no page faults / zeroing per decode) */   /* sub: per chunk the volcomp substreams (16 z x 32 y slabs) marked / decoded; nullptr: whole chunks */
 } fc_cache;
 static int fcc_init(fc_cache *c, z3 *z, int nt, double mb) {
@@ -44,14 +59,14 @@ static int fcc_init(fc_cache *c, z3 *z, int nt, double mb) {
 static int fcc_sub(fc_cache *c) {
     if (getenv("UFSM_FACES_FULLDECODE") || c->cs[0] != 128 || c->cs[1] != 128 || c->cs[2] != 128) return 0;
     const size_t ng = (size_t)c->g[0] * c->g[1] * c->g[2];
-    c->needm = calloc(ng, sizeof *c->needm); c->have = calloc(ng, sizeof *c->have);
-    return c->needm && c->have ? 0 : -1;
+    c->needm = calloc(ng, sizeof *c->needm); c->have = calloc(ng, sizeof *c->have); c->hless = calloc(ng, sizeof *c->hless); if (getenv("UFSM_FACES_PROF")) c->ever = calloc(ng, sizeof *c->ever);
+    return c->needm && c->have && c->hless ? 0 : -1;
 }
 static void fcc_free(fc_cache *c) {
     const size_t ng = (size_t)c->g[0] * c->g[1] * c->g[2];
     for (size_t k = 0; c->ch && k < ng; k++) free(c->ch[k]);
     for (int k = 0; k < c->npool; k++) free(c->pool[k]);
-    free(c->pool); free(c->ch); free((void *)c->need); free(c->stamp); free((void *)c->needm); free(c->have); memset(c, 0, sizeof *c);
+    free(c->pool); free(c->ch); free((void *)c->need); free(c->stamp); free((void *)c->needm); free(c->have); free(c->hless); free(c->ever); memset(c, 0, sizeof *c);
 }
 static inline int fcc_voxel(const fc_cache *c, int64_t z, int64_t y, int64_t x) {   /* -1: outside / not decoded */
     if (z < 0 || y < 0 || x < 0 || z >= c->shape[0] || y >= c->shape[1] || x >= c->shape[2]) return -1;
@@ -92,6 +107,11 @@ static void fcc_mark(void *ctx, const double lo[3], const double hi[3]) {
         }
     }
 }
+/* the decode list from per-chunk substream bits (faces_vol.mark_mask: the GPU computes the exact set the samples read) */
+static void fcc_mark_mask(void *ctx, const uint32_t *mask) {
+    fc_cache *c = ctx; const size_t ng = (size_t)c->g[0] * c->g[1] * c->g[2];
+    for (size_t k = 0; k < ng; k++) if (mask[k]) { if (c->needm) c->needm[k] |= mask[k]; c->need[k] = 1; }
+}
 typedef struct { fc_cache *c; const int64_t *todo; size_t n; _Atomic size_t next; _Atomic int err; } fcd_job;
 static void *fcc_decode(void *arg) {
     fcd_job *J = arg; fc_cache *c = J->c; const size_t cv = (size_t)c->cs[0] * c->cs[1] * c->cs[2];
@@ -106,36 +126,47 @@ static void *fcc_decode(void *arg) {
         uint8_t *fresh = nullptr;
         if (whole && !b) { pthread_mutex_lock(&c->pmu); if (c->npool) fresh = c->pool[--c->npool]; pthread_mutex_unlock(&c->pmu); if (!fresh) fresh = malloc(cv); b = fresh; }
         uint8_t *t = fresh ? fresh : malloc((size_t)nn[0] * nn[1] * nn[2]);
-        if (!t || (!whole && !b && !(b = calloc(cv, 1))) || z3_read_sub(c->z, o, nn, t, 1, want)) { if (t != b) free(t); if (!c->ch[id]) free(b); atomic_store(&J->err, 1); continue; }
+        /* with the GPU decoder and the device mirror, lossy substreams go straight into the mirror's chunk (no host round trip) */
+        uint8_t *dch = whole && want && c->dev && c->hless && fgpu_chunk_dev && gpudec_enabled() && !fgpu_broken(c->dev) ? fgpu_chunk_dev(c->dev, (size_t)id) : nullptr;
+        uint32_t dm = 0;
+        if (!t || (!whole && !b && !(b = calloc(cv, 1))) || (dch ? z3_read_sub_dev(c->z, o, nn, t, 1, want, dch, &dm) : z3_read_sub(c->z, o, nn, t, 1, want))) { if (t != b) free(t); if (!c->ch[id]) free(b); atomic_store(&J->err, 1); continue; }
         if (t != b) {   /* edge chunk, or substreams added to a decoded chunk: copy (only the new substreams' rows) */
             for (int64_t z = 0; z < nn[0]; z++) for (int64_t y = 0; y < nn[1]; y++)
                 if (!want || (want >> ((z >> 4) * 4 + (y >> 5)) & 1)) memcpy(b + ((size_t)z * c->cs[1] + y) * c->cs[2], t + ((size_t)z * nn[1] + y) * nn[2], nn[2]);
             free(t);
         }
-        if (c->needm) c->have[id] |= want ? want : 0xffffffffu;
+        if (c->needm) { const uint32_t wb = want ? want : 0xffffffffu; c->have[id] |= wb;
+            if (c->ever) { atomic_fetch_add(&c->nsub, __builtin_popcount(wb)); atomic_fetch_add(&c->nresub, __builtin_popcount(wb & c->ever[id])); c->ever[id] |= wb; } }
         c->ch[id] = b;
+        if (dm) { c->hless[id] |= dm; fgpu_have(c->dev, (size_t)id, dm); atomic_fetch_add(&c->ndevsub, (size_t)__builtin_popcount(dm)); }
+        if (c->dev) fgpu_put(c->dev, id, b, c->needm ? c->have[id] : 0xffffffffu);   /* the device mirror (pinned staging, async) */
     }
     return nullptr;
 }
 static int fcc_fill(void *ctx) {
     fc_cache *c = ctx; const size_t ng = (size_t)c->g[0] * c->g[1] * c->g[2]; c->clock++;
     int64_t *todo = nullptr; size_t nt = 0, cap = 0, nnew = 0;
+    if (c->hless && c->dev && fgpu_broken(c->dev))   /* the CPU samples from here: the substreams only the device had are decoded again */
+        for (size_t k = 0; k < ng; k++) if (c->hless[k]) { c->have[k] &= ~c->hless[k]; c->hless[k] = 0; c->need[k] = 1; }
     for (size_t k = 0; k < ng; k++) if (c->need[k]) {
         c->need[k] = 0; c->stamp[k] = c->clock; if (c->ch[k] && (!c->needm || !(atomic_load(&c->needm[k]) & ~c->have[k]))) continue;
         if (nt == cap) { cap = cap ? 2 * cap : 256; todo = realloc(todo, cap * sizeof *todo); }
         nnew += !c->ch[k]; todo[nt++] = (int64_t)k;
     }
-    fcd_job J = {c, todo, nt, 0, 0}; fc_par(fcc_decode, &J, gpudec_threads(c->nt));   /* GPU decoding: more requests in flight */
-    free(todo); c->nres += nnew; c->ndec += nt;
-    if (atomic_load(&J.err)) { fprintf(stderr, "faces: %s\n", z3_error()); return -1; }
+    double tq = now_s(); fcd_job J = {c, todo, nt, 0, 0}; fc_par(fcc_decode, &J, gpudec_threads(c->nt)); c->tdec += now_s() - tq; tq = now_s();
+    c->nres += nnew; c->ndec += nt;
+    if (atomic_load(&J.err)) { free(todo); fprintf(stderr, "faces: %s\n", z3_error()); return -1; }
+    free(todo); tq = now_s();
     while (c->nres > c->cap) {   /* least recently needed first, never this band's */
         uint32_t old = c->clock; for (size_t k = 0; k < ng; k++) if (c->ch[k] && c->stamp[k] < old) old = c->stamp[k];
         if (old == c->clock) break;
         for (size_t k = 0; k < ng && c->nres > c->cap; k++) if (c->ch[k] && c->stamp[k] == old) {
             if (c->npool < 512 && c->pool) c->pool[c->npool++] = c->ch[k]; else free(c->ch[k]);
-            c->ch[k] = nullptr; c->nres--; if (c->needm) c->needm[k] = c->have[k] = 0;
+            c->ch[k] = nullptr; c->nres--; if (c->needm) c->needm[k] = c->have[k] = 0; if (c->hless) c->hless[k] = 0;
+            if (c->dev) fgpu_drop(c->dev, k);
         }
     }
+    c->tev += now_s() - tq;
     return 0;
 }
 
@@ -179,7 +210,6 @@ static const char *fopt(int argc, char **argv, const char *name, const char *dfl
 }
 static int farg(int argc, char **argv, const char *name) { for (int i = 2; i < argc; i++) if (!strcmp(argv[i], name)) return i; return -1; }
 static int cmp_flt(const void *a, const void *b) { const float x = *(const float *)a, y = *(const float *)b; return (x > y) - (x < y); }
-static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + 1e-9 * t.tv_nsec; }
 
 static void meta_get(const char *dir, const char *name, double *um, double *scale, int *winding) {
     char p[1400]; snprintf(p, sizeof p, "%s/%s/meta.json", dir, name);
@@ -194,14 +224,14 @@ static void meta_get(const char *dir, const char *name, double *um, double *scal
 
 /* ufsm faces <wraps-dir> <out-dir> --ct ROOT KEY --ct-um U [--wraps a,b,..] [--umb JSON --umb-um U] [--range 150] [--thick 15,200]
    [--min-prom 8] [--rel 0.1] [--tol 25] [--inset 0] [--smooth 4] [--ct-thr 90] [--gt ROOT KEY --gt-um U [--gt-range 100]]
-   [--threads 16] [--cache-mb 4096] [--cache DIR]
+   [--threads 16] [--cache-mb 4096] [--cache DIR] [--gpu 1]
    Every wrap <w> (tifxyz dir or .sfc) -> <out>/<w>_recto and <out>/<w>_verso (tifxyz on the wrap's grid; conf.tif (uint8: 0 filled, else
    the band's contrast) and thick.tif (float, um) in <w>_recto), and <out>/<w>_faces.txt. Lengths in um. Statistics on stdout. */
 int cmd_faces(int argc, char **argv) {
     const int ci = farg(argc, argv, "--ct");
     if (argc < 4 || ci < 0 || ci + 2 >= argc || !(atof(fopt(argc, argv, "--ct-um", "0")) > 0)) {
         fprintf(stderr, "usage: ufsm faces <wraps-dir> <out-dir> --ct ROOT KEY --ct-um U [--wraps a,b] [--umb JSON --umb-um U] [--range 150] [--thick 15,200]\n"
-                        "       [--min-prom 8] [--rel 0.1] [--tol 25] [--inset 0] [--smooth 4] [--ct-thr 90] [--gt ROOT KEY --gt-um U [--gt-range 100]] [--threads 16] [--cache-mb 4096]\n"
+                        "       [--min-prom 8] [--rel 0.1] [--tol 25] [--inset 0] [--smooth 4] [--ct-thr 90] [--gt ROOT KEY --gt-um U [--gt-range 100]] [--threads 16] [--cache-mb 4096] [--gpu 1]\n"
                         "  recto (inner face) and verso (outer face) of the papyrus sheet under each wrap: <out>/<w>_recto, <out>/<w>_verso (+ conf.tif, thick.tif)\n");
         return 2;
     }
@@ -219,7 +249,9 @@ int cmd_faces(int argc, char **argv) {
     const char *cache = fopt(argc, argv, "--cache", nullptr);
     z3 *cz = z3_open(store_open(argv[ci + 1]), argv[ci + 2], cache); if (!cz) { fprintf(stderr, "faces: %s\n", z3_error()); return 1; }
     fc_cache cc; if (fcc_init(&cc, cz, o.nthreads, cache_mb) || fcc_sub(&cc)) { fprintf(stderr, "faces: out of memory\n"); return 1; }
-    faces_vol V = {&cc, fcc_sample, fcc_mark, fcc_fill};
+    faces_vol V = {&cc, fcc_sample, fcc_mark, fcc_fill, nullptr, fcc_mark_mask};
+    /* --gpu 1 (default): profiles + medians on the GPU (bit-identical; 128^3 CT chunks); 0, no device, or a binary without it: the CPU */
+    if (atoi(fopt(argc, argv, "--gpu", "1")) && fgpu_open && cc.cs[0] == 128 && cc.cs[1] == 128 && cc.cs[2] == 128 && (cc.dev = fgpu_open(cc.shape))) V.gpu = cc.dev;
     const int gi = farg(argc, argv, "--gt"); z3 *gz = nullptr; fc_cache gc; const double gum = atof(fopt(argc, argv, "--gt-um", "0"));
     if (gi > 0) {
         if (gi + 2 >= argc || !(gum > 0)) { fprintf(stderr, "faces: --gt ROOT KEY --gt-um U\n"); return 2; }
@@ -277,6 +309,7 @@ int cmd_faces(int argc, char **argv) {
         for (int b = 0; b < 64 && qk < 3; b++) { acc += st.thick_hist[b]; while (qk < 3 && acc >= qs[qk] * tot) pc[qk++] = 5 * b + 2.5; }
         /* the published surfaces */
         char gts[400] = ""; size_t gth[40] = {0};
+        const double tgt = now_s();
         if (gz) {
             const int ws = (w + SUB - 1) / SUB, hs = (h + SUB - 1) / SUB; float *dist = malloc((size_t)ws * hs * 4 * sizeof(float));
             for (size_t k = 0; k < (size_t)ws * hs * 4; k++) dist[k] = NAN;
@@ -301,6 +334,10 @@ int cmd_faces(int argc, char **argv) {
             for (int k = 0; k < 3; k++) free(a[k]);
             free(dist);
         }
+        if (getenv("UFSM_FACES_PROF")) {
+            size_t np = 0, nb = 0; int ns = 0; if (cc.dev && fgpu_stats) fgpu_stats(cc.dev, &np, &nb, &ns);
+            fprintf(stderr, "faces prof: CT fill: decode+upload %.2f evict %.2f s, %zu substreams (%zu again); GT fill: decode %.2f s, %zu substreams (%zu again); gt %.2f s; gpu %s, %zu chunk uploads %.2f GB, %d device slots, %zu substreams decoded on the GPU into the mirror\n", cc.tdec, cc.tev, (size_t)cc.nsub, (size_t)cc.nresub, gz ? gc.tdec : 0.0, gz ? (size_t)gc.nsub : 0, gz ? (size_t)gc.nresub : 0, now_s() - tgt, cc.dev ? (fgpu_broken(cc.dev) ? "broken" : "on") : "off", np, nb / 1e9, ns, (size_t)cc.ndevsub);
+        }
         const size_t nm1 = st.nv ? st.nv : 1, cn = st.ct_n ? st.ct_n : 1, np = st.nv - st.nfill ? st.nv - st.nfill : 1;
         char line[1200];
         snprintf(line, sizeof line, "%s %zu %.3f %.3f %.3f %.3f %.3f  %.3f %.3f %.3f  %.0f %.0f %.0f  %.1f %.1f  %.3f %.3f%s", nm, st.nv, (double)st.nband / nm1, (double)st.npick0 / nm1, (double)st.npick / nm1, (double)st.nfill / nm1,
@@ -321,6 +358,7 @@ int cmd_faces(int argc, char **argv) {
         free(X); free(Y); free(Z); free(RX); free(RY); free(RZ); free(VX); free(VY); free(VZ); free(th); free(cf);
         done++;
     }
+    if (cc.dev) fgpu_close(cc.dev);
     fcc_free(&cc); z3_close(cz); if (gz) { fcc_free(&gc); z3_close(gz); }
     free(names); free(want);
     fprintf(stderr, "faces: %d wraps -> %s\n", done, argv[3]);

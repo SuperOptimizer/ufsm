@@ -215,14 +215,18 @@ void z3_shared_cache_stats(uint64_t *hits, uint64_t *misses, uint64_t *stored) {
 __attribute__((weak)) int gpudec_enabled(void) { return 0; }
 __attribute__((weak)) int gpudec_threads(int nthreads) { return nthreads; }
 __attribute__((weak)) int gpudec_decode(const gd_chunk *c, uint32_t mask, uint8_t *dst) { (void)c; (void)mask; (void)dst; return -1; }
+__attribute__((weak)) int gpudec_decode_dev(const gd_chunk *c, uint32_t mask, uint8_t *dchunk) { (void)c; (void)mask; (void)dchunk; return -1; }
 __attribute__((weak)) void gpudec_stats(uint64_t *subs, uint64_t *batches, uint64_t *redo, double *gpu_s) { if (subs) *subs = 0; if (batches) *batches = 0; if (redo) *redo = 0; if (gpu_s) *gpu_s = 0; }
 /* decode the substreams in need of a parsed lossy chunk: on the GPU when it is on (a substream the GPU cannot decode, or a device
-   error: the request on the CPU, the reference status and bytes), else volcomp_fast.h */
-static volcomp_status z3_decode_subs(const vf_parsed *p, uint32_t need, uint8_t *dec) {
-    if (gpudec_enabled()) {
+   error: the request on the CPU, the reference status and bytes), else volcomp_fast.h. dsink (z3_read_sub_dev): a device 128^3 chunk
+   the GPU writes the substreams into instead of dec; *dev = the substreams that went there (dec untouched for them) */
+static volcomp_status z3_decode_subs(const vf_parsed *p, uint32_t need, uint8_t *dec, uint8_t *dsink, uint32_t *dev) {
+    *dev = 0;
+    if (gpudec_enabled() && !p->strict) {
         gd_chunk g = {p->payload, p->tok_n, p->byp_n, p->off, p->step, {0}, VF_SCAN16};
         for (int m = 0; m < 10; m++) g.dt[m] = (const uint32_t *)p->models[m].dt;
-        if (!p->strict && gpudec_decode(&g, need, dec) == 0) return VOLCOMP_OK;
+        if (dsink && gpudec_decode_dev(&g, need, dsink) == 0) { *dev = need; return VOLCOMP_OK; }
+        if (gpudec_decode(&g, need, dec) == 0) return VOLCOMP_OK;
     }
     return vfx_decode_subs(p, need, dec);
 }
@@ -406,6 +410,7 @@ typedef struct {
     int *ready, rq_head, rq_tail, rq_closed;
     pthread_mutex_t rq_mu; pthread_cond_t rq_cv;
     uint32_t submask;   /* z3_read_sub */
+    uint8_t *dsink; _Atomic uint32_t dmask;   /* z3_read_sub_dev: the device chunk the GPU decodes into, the substreams it did */
 } job;
 
 static void job_failed(job *jb) {
@@ -438,7 +443,7 @@ static void copy_chunk(const job *jb, const work *w, const uint8_t *chunk) {
         }
 }
 
-static int decode_into(const z3 *z, const uint8_t *enc, size_t n, uint8_t *dec, ZSTD_DCtx *dctx, uint8_t *scratch, int *mask, uint32_t submask) {
+static int decode_into(const z3 *z, const uint8_t *enc, size_t n, uint8_t *dec, ZSTD_DCtx *dctx, uint8_t *scratch, int *mask, uint32_t submask, uint8_t *dsink, _Atomic uint32_t *dmask) {
     const z3_meta *m = &z->m;
     size_t cv = (size_t)m->chunk[0] * m->chunk[1] * m->chunk[2];
     if (mask) *mask = 0;
@@ -473,7 +478,9 @@ static int decode_into(const z3 *z, const uint8_t *enc, size_t n, uint8_t *dec, 
             st = VOLCOMP_OK;
             if (need) {
                 vf_parsed p; st = vf_parse(enc, n, &p);
-                if (st == VOLCOMP_OK) st = z3_decode_subs(&p, need, dec);
+                uint32_t dev = 0;
+                if (st == VOLCOMP_OK) st = z3_decode_subs(&p, need, dec, dsink, &dev);
+                if (dev) { atomic_fetch_or(dmask, dev); need &= ~dev; }   /* on the device only: not in dec, not for the shared cache */
                 if (st == VOLCOMP_OK && zshm_on()) for (uint32_t s = 0; s < VF_NSUB; s++) if (need >> s & 1) zshm_put(hk.low64, hk.high64, s, dec);
             }
         } else if (sub && cv == VOLCOMP_CHUNK_VOXELS && vll_chunk_mode(enc, n, &mode) == VOLCOMP_OK && mode == VLL_MODE_CODED) {
@@ -750,7 +757,7 @@ static int run_task(job *jb, int task, uint8_t *fetched, uint8_t *dec, uint8_t *
             const uint8_t *enc = group + (size_t)(w->off - rg->off); size_t n = (size_t)w->len;
             cache_put(z, skey, item, enc, n); atomic_fetch_add(&g_z3_store_reads, 1);
             int msk;
-            if (decode_into(z, enc, n, dec, dctx, scratch, &msk, jb->submask)) { rc = -1; break; }
+            if (decode_into(z, enc, n, dec, dctx, scratch, &msk, jb->submask, jb->dsink, &jb->dmask)) { rc = -1; break; }
             if (msk) mc_put(z, w, dec, cv);
             copy_chunk(jb, w, dec);
         }
@@ -784,7 +791,7 @@ static int run_task(job *jb, int task, uint8_t *fetched, uint8_t *dec, uint8_t *
         }
         cache_put(z, skey, item, b, n);
     }
-    int msk, rc = decode_into(z, b, n, dec, dctx, scratch, &msk, jb->submask);
+    int msk, rc = decode_into(z, b, n, dec, dctx, scratch, &msk, jb->submask, jb->dsink, &jb->dmask);
     free(b);
     if (rc) return -1;
     if (msk && mc_on) mc_put(z, w, dec, cv);
@@ -905,8 +912,17 @@ static void z3_fill(const z3_meta *m, uint8_t *out, size_t nv) {
         for (size_t i = 0; i < nv; i++) memcpy(out + i * m->esize, e, (size_t)m->esize);
     }
 }
-int z3_read(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads) { return z3_read_sub(z, o, n, out, nthreads, 0); }
-int z3_read_sub(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads, uint32_t submask) {
+static int z3_read_impl(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads, uint32_t submask, uint8_t *dsink, uint32_t *dmask);
+int z3_read(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads) { return z3_read_impl(z, o, n, out, nthreads, 0, nullptr, nullptr); }
+int z3_read_sub(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads, uint32_t submask) { return z3_read_impl(z, o, n, out, nthreads, submask, nullptr, nullptr); }
+int z3_read_sub_dev(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads, uint32_t submask, uint8_t *dchunk, uint32_t *dev_mask) {
+    *dev_mask = 0;
+    const z3_meta *m = &z->m;   /* one whole, aligned 128^3 uint8 chunk; the shared cache off (it stores host bytes) */
+    const int one = dchunk && m->chunk[0] == 128 && m->chunk[1] == 128 && m->chunk[2] == 128 && m->esize == 1 && n[0] == 128 && n[1] == 128 && n[2] == 128 &&
+                    !(o[0] % 128) && !(o[1] % 128) && !(o[2] % 128) && !zshm_on() && gpudec_enabled();
+    return z3_read_impl(z, o, n, out, nthreads, submask, one ? dchunk : nullptr, dev_mask);
+}
+static int z3_read_impl(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads, uint32_t submask, uint8_t *dsink, uint32_t *dmask) {
     const z3_meta *m = &z->m;
     const size_t nv = (size_t)n[0] * n[1] * n[2];
     /* a box inside the array whose chunks are all present (sharded) is overwritten entirely by the chunk copies: no fill pass (the
@@ -1012,7 +1028,7 @@ int z3_read_sub(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int
         }
     }
     job jb = {.z = z, .o = o, .n = n, .out = out, .items = items, .nitems = nitems,
-              .ranges = ranges, .nranges = nranges, .submask = submask};
+              .ranges = ranges, .nranges = nranges, .submask = submask, .dsink = dsink};
     if (nthreads <= 0) nthreads = (int)sysconf(_SC_NPROCESSORS_ONLN);
     int ntasks = ranges ? nranges : nitems;
     store_req *reqs = nullptr; int *task_of = nullptr; char (*rkeys)[1200] = nullptr; int nreq = 0;
@@ -1077,5 +1093,6 @@ int z3_read_sub(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int
         for (int i = 0; i < started; i++) pthread_join(th[i], nullptr);
     }
     free(ranges); free(items);
+    if (dmask) *dmask = atomic_load(&jb.dmask);
     return atomic_load(&jb.failed) ? FAIL("%s", jb.error) : 0;
 }
