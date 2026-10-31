@@ -46,6 +46,11 @@ static void *mx(int bits, int C, size_t S, float sc, uint64_t seed) {
     free(h); free(hc); nn_free(d); nn_free(t);
     return q;
 }
+/* GN sums 0 and 1 of an osum buffer of fixed-point slots (src/gnacc.cuh: words lo 2^-64, hi, non-finite count) */
+static void gn2(const double *osum, double *hs) {
+    unsigned long long w[6]; nn_d2h(w, osum, sizeof w);
+    for (int i = 0; i < 2; i++) hs[i] = w[3 * i + 2] ? NAN : (double)(long long)w[3 * i + 1] + (double)w[3 * i] * 5.42101086242752217e-20;
+}
 static uint64_t fnv(const void *d, size_t n) {
     uint8_t *h = malloc(n); nn_d2h(h, d, n);
     uint64_t x = 1469598103934665603ull; for (size_t i = 0; i < n; i++) { x ^= h[i]; x *= 1099511628211ull; }
@@ -103,7 +108,7 @@ int main(int argc, char **argv) {
         }
         run(&j, 0); nn_sync();
         const uint64_t h = fnv(j.y, by1) ^ (c2 ? fnv(j.y2, by2) * 31 : 0);
-        double hs[2] = {0, 0}; if (L[l].stats) nn_d2h(hs, osum, sizeof hs);
+        double hs[2] = {0, 0}; if (L[l].stats) gn2(osum, hs);
         printf("%-32s @%d %8.3f ms  out %016llx", L[l].nm, Pl, best, (unsigned long long)h);
         if (L[l].stats) printf("  stats %.9g %.9g", hs[0], hs[1]);
         printf("\n");
@@ -124,7 +129,7 @@ int main(int argc, char **argv) {
             nn_sync(); double t0 = now(); lp_conv_fwd_f4(xc, 4, xs, w, b, co, y, 4, (gnp_t){gam + 64, bet + 64, mean, rstd, G}, osum, G, sp); nn_sync();
             if (it >= 2 && (now() - t0) * 1e3 < best) best = (now() - t0) * 1e3;
         }
-        double hs[2] = {0, 0}; nn_d2h(hs, osum, sizeof hs);
+        double hs[2] = {0, 0}; gn2(osum, hs);
         char nm[64]; snprintf(nm, sizeof nm, "fwd up %d + %d -> %d (dec0.c1)", uc, sk, co);
         printf("%-32s @%d %8.3f ms  out %016llx  stats %.9g %.9g\n", nm, P, best, (unsigned long long)fnv(y, lp_mx4_bytes(1, co, S)), hs[0], hs[1]);
         nn_free(xc); nn_free(xk); nn_free(y); nn_free(w); nn_free(b);
@@ -352,7 +357,7 @@ int main(int argc, char **argv) {
                 nn_zero(osum, 2 * 64 * sizeof(double));
                 nn_sync(); double t0 = now(); lp_conv_fwd_f8(xi, 3, x4, w, b, 32, yo, 4, (gnp_t){0}, osum, G, (split_t){0}); nn_sync(); if (it >= 2 && (now() - t0) * 1e3 < best) best = (now() - t0) * 1e3;
             }
-            double hs[16]; nn_d2h(hs, osum, sizeof hs);
+            double hs[2]; gn2(osum, hs);
             printf("%-32s @%d %8.3f ms  out %016llx  osum %.9g %.9g\n", "fwd stem 4 -> 32 (mx8 -> mx4, stats)", P, best, (unsigned long long)fnv(yo, lp_mx4_bytes(1, 32, S)), hs[0], hs[1]);
             nn_free(xi); nn_free(yo); nn_free(w); nn_free(b);
         }
@@ -365,7 +370,7 @@ int main(int argc, char **argv) {
                 nn_zero(osum, 2 * 64 * sizeof(double));
                 nn_sync(); double t0 = now(); lp_conv_fwd_f8(xi, 4, x4, w, b, 16, yo, 4, (gnp_t){0}, osum, G, (split_t){0}); nn_sync(); if (it >= 2 && (now() - t0) * 1e3 < best) best = (now() - t0) * 1e3;
             }
-            double hs[16]; nn_d2h(hs, osum, sizeof hs);
+            double hs[2]; gn2(osum, hs);
             printf("%-32s @%d %8.3f ms  out %016llx  osum %.9g %.9g\n", "fwd stem 4 -> 16 (mx4 -> mx4, stats)", P, best, (unsigned long long)fnv(yo, lp_mx4_bytes(1, 16, S)), hs[0], hs[1]);
             nn_free(xi); nn_free(yo); nn_free(w); nn_free(b);
         }
