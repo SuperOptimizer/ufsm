@@ -41,7 +41,7 @@ CK=wind96-wk1-best.ckpt; INKCK=ift3-24000.ckpt
 
 # 1. fit fields (wind96): 10 planes on a 2-voxel cell grid, written straight into a fit-field set; repack to 512^3 shards
 $U predict $CK $R $K fields.tmp --um 2.4 --level 2 --box Z,Y,X,NZ,NY,NX --window-z 384 --halo-z 64 --window 640 --halo 64 --shard 512 \
-   --grid-origin 0,0,0 --ema 1 --q 8 --axis axis.json --levels 1 --fit-zarr fields --fit-h 2 --fit-q 8 --fit-q-phase 0 --no-out 1
+   --grid-origin 0,0,0 --ema 1 --q 8 --axis axis.json --levels 1 --fit-zarr fields --fit-h 2 --fit-q 8 --fit-q-phase 0 --no-out 1 --occupancy 5
 for a in fields/*/; do $U repack $a ${a%/}.512 512 --threads 12 && rm -r $a && mv ${a%/}.512 $a; done
 
 # 2. ink (ift3-24000): frozen GroupNorm from a calibration band, two passes offset by half a shard, blended
@@ -259,7 +259,7 @@ CT | phase hue over CT | winding mod 4 hue over CT; rows z-mid / y-mid / x-mid).
 |---|---|
 | `--window W --halo H` / `--window-z --halo-z` | tile size and discarded border (thin-z windows for the fields) |
 | `--grid-origin z,y,x` | tile interiors anchored to CT coordinates: a voxel's windows do not depend on the box / shard layout |
-| `--full-grid 1` | every tile of the grid (ink); `--occupancy N`: skip windows with little CT; `--resume 1`: skip written shards |
+| `--full-grid 1` | every tile of the grid (ink); `--occupancy L`: skip shards, and windows whose interior, that are zero on the coarser CT level L (one coarse voxel of margin; outputs and fit fields identical except at isolated low CT specks whose coarse voxels round to 0, e.g. 6 of 4.2M P3 coarse voxels; also with `--fit-zarr`; reads of air windows saved: P4 61% / P3 31% of the shards at L 5; `UFSM_OCC_TILES=0`: shards only); `--resume 1`: skip written shards |
 | `--fit-zarr DIR --fit-h 2 --fit-q 8 --fit-q-phase 0 --no-out 1 --axis JSON` | the unwrap heads straight into a fit-field set (no prediction pyramid) |
 | `--gn-save FILE` / `--gn-frozen FILE` | GroupNorm statistics from a calibration box, then frozen for the whole volume (no per-tile brightness seams) |
 | `--ema 1`, `--q Q`, `--levels N` | EMA weights, volcomp quality (0 lossless), pyramid levels written |
