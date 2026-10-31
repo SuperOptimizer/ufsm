@@ -154,7 +154,7 @@ ink() {
   local box cal bb bo; box=$([ "$DRY" = 1 ] && echo ${BOX:-BOX} || cat $O/box.txt)
   cal=$(echo $box | awk -F, '{ zc = $1 + int($4 / 2); z0 = zc - 1024; if (z0 < $1) z0 = $1; nz = 2048; if (nz > $4) nz = $4; printf "%d,%d,%d,%d,%d,%d", z0, $2, $3, nz, $5, $6 }')
   bb=$(echo $box | awk -F, '{ printf "%d,%d,%d,%d,%d,%d", $1 + 256, $2 + 256, $3 + 256, $4 - 256, $5 - 256, $6 - 256 }'); bo=$(echo $bb | cut -d, -f1-3)
-  local P="--um $UM --level $LV --shard 512 --window 640 --halo 64 --ema 1 --q 32 --threads ${ITH:-12} --gpu $INKGPU --occupancy 5"
+  local P="--um $UM --level $LV --shard 512 --window 640 --halo 64 --ema 1 --q 32 --threads ${ITH:-12} --gpu $INKGPU $(occlv)"
   [ -s $O/ink/gn.bin ] || { X $O/logs/ink.log $U predict $INKCK $R $K $O/ink/gncal.zarr $P --box $cal --full-grid 1 --levels 1 --no-out 1 --gn-save $O/ink/gn.tmp &&
                              { [ "$DRY" = 1 ] || { mv $O/ink/gn.tmp $O/ink/gn.bin; rm -rf $O/ink/gncal.zarr; }; } || return 1; }
   X $O/logs/ink.log $U predict $INKCK $R $K $O/ink/a.zarr $P --box $box --full-grid 1 --resume 1 --levels 4 --gn-frozen $O/ink/gn.bin || return 1
