@@ -336,7 +336,7 @@ test-all: $(B)/test_robust
 $(B)/test_render_stream: tests/test_render_stream.c $(B)/render.o $(B)/inkcompare.o $(B)/imgops.o $(B)/jpegpar.o $(B)/tiff.o $(B)/tiffw.o $(B)/z3w.o $(B)/zarr3.o $(B)/store.o $(B)/json.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
 test-all: $(B)/test_render_stream
-$(B)/test_render_fill: tests/test_render_fill.c $(B)/render.o $(B)/inkcompare.o $(B)/imgops.o $(B)/tiff.o $(B)/tiffw.o $(B)/z3w.o $(B)/zarr3.o $(B)/store.o $(B)/json.o
+$(B)/test_render_fill: tests/test_render_fill.c $(B)/render.o $(B)/inkcompare.o $(B)/imgops.o $(B)/jpegpar.o $(B)/tiff.o $(B)/tiffw.o $(B)/z3w.o $(B)/zarr3.o $(B)/store.o $(B)/json.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
 test-all: $(B)/test_render_fill
 $(B)/test_tiffw: tests/test_tiffw.c $(B)/tiffw.o $(B)/tiff.o
