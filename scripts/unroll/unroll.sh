@@ -110,9 +110,15 @@ prep() {
 }
 
 # --- fields: one predict per GPU on z parts (whole 1024-voxel multiples; the last part takes the rest) ---
+occlv() {   # --occupancy L for the fields: the first of levels LV+3, LV+2, LV+4 the CT has (local root or mirror URL); none: no flag
+  local l; for l in $((LV + 3)) $((LV + 2)) $((LV + 4)); do
+    case $R in http://*|https://*) curl -sfI $R/$K/$l/zarr.json > /dev/null && { echo "--occupancy $l"; return; };;
+                     *) [ -e $R/$K/$l/zarr.json ] && { echo "--occupancy $l"; return; };; esac
+  done
+}
 fpred() {   # fpred GPU BOX OUT
   X $O/logs/fields.log $U predict $CK $R $K $3.tmp --um $UM --level $LV --box $2 --window-z 384 --halo-z 64 --window 640 --halo 64 --shard 512 \
-    --grid-origin 0,0,0 --ema 1 --q 8 --threads ${PTH:-14} --gpu $1 --axis $O/axis.json --levels 1 --fit-zarr $3 --fit-h 2 --fit-q 8 --fit-q-phase 0 --no-out 1 &&
+    --grid-origin 0,0,0 --ema 1 --q 8 --threads ${PTH:-14} --gpu $1 --axis $O/axis.json --levels 1 --fit-zarr $3 --fit-h 2 --fit-q 8 --fit-q-phase 0 --no-out 1 $(occlv) &&
     { [ "$DRY" = 1 ] || { rm -rf $3.tmp; [ -e $3/fields.json ]; }; }
 }
 fields() {
