@@ -632,6 +632,7 @@ typedef struct {
     int rows; long long rowlen; int ds, ovw, bandh, rowh; double *ovs; float *ovn;
     int lds, lw, lh; double *lsum; float *lcnt; int tpx; long long ntile; double *tv, *tp; long long *tw0, *tw1;
     int wmin, nwr; double *wv, *wp, *vtot, *ptot;
+    float pgain; int pbg;   /* --papyrus GAIN (> 0: papyrus-look RGB outputs; CT == 0 is off the papyrus), --papyrus-bg grey */
     int wait, rm;   /* --wait-renders: a stripe is taken when <render-dir>/<stripe>.done exists; --rm-renders: its two TIFFs deleted after use */
     pthread_mutex_t mu; _Atomic int next, fail;
 } ms_ctx;
@@ -662,6 +663,24 @@ static int ms_jpeg_stripe(const char *path, int w, int h, const uint8_t *ct, con
     while (ci.next_scanline < ci.image_height) {
         const int y = (int)ci.next_scanline, k = y >= h; const size_t o = (size_t)(k ? y - h : y) * w; const uint8_t *src = k ? ink : ct;
         for (int x = 0; x < w; x++) row[x] = m[o + x] ? (k ? stretch(src[o + x], ia, ib) : stretch(src[o + x], ca, cb)) : 0;
+        JSAMPROW r = row; jpeg_write_scanlines(&ci, &r, 1);
+    }
+    jpeg_finish_compress(&ci); jpeg_destroy_compress(&ci); free(row);
+    return fclose(f) ? -1 : 0;
+}
+static int ms_jpeg_stripe_pap(const char *path, int w, int h, const uint8_t *ct, const uint8_t *ink, const uint8_t *m, int ca, int cb, int ia, int ib, float gain, int bg, int q) {
+    /* --papyrus: one RGB band, the CT ramp under the ink (img_pap_rgb), grey bg off the surface and where the CT is 0 */
+    FILE *f = fopen(path, "wb"); if (!f) return -1;
+    struct jpeg_compress_struct ci; struct jpeg_error_mgr je;
+    ci.err = jpeg_std_error(&je); jpeg_create_compress(&ci); jpeg_stdio_dest(&ci, f);
+    ci.image_width = (JDIMENSION)w; ci.image_height = (JDIMENSION)h; ci.input_components = 3; ci.in_color_space = JCS_RGB;
+    jpeg_set_defaults(&ci); jpeg_set_quality(&ci, q, TRUE); jpeg_start_compress(&ci, TRUE);
+    uint8_t *row = malloc((size_t)w * 3);
+    while (ci.next_scanline < ci.image_height) {
+        const size_t o = (size_t)ci.next_scanline * w;
+        for (int x = 0; x < w; x++) { uint8_t *c = row + 3 * x;
+            if (!m[o + x] || !ct[o + x]) { c[0] = c[1] = c[2] = (uint8_t)bg; continue; }
+            img_pap_rgb(stretch(ct[o + x], ca, cb), img_pap_ink(stretch(ink[o + x], ia, ib), gain), c); }
         JSAMPROW r = row; jpeg_write_scanlines(&ci, &r, 1);
     }
     jpeg_finish_compress(&ci); jpeg_destroy_compress(&ci); free(row);
@@ -698,6 +717,7 @@ static void *ms_pass2(void *arg) {
             const float g = gu[(size_t)gr * uw + gc];
             if (g >= 0 && C->nseg > 0) { const int wr = seg_wrap(C->segs, C->nseg, g); if (wr < pw0[t]) pw0[t] = wr; if (wr > pw1[t]) pw1[t] = wr; pwv[wr - C->wmin] += 1; pwp[wr - C->wmin] += pap; }
             const int row = (int)(X / C->rowlen), ox = (int)((X - (long long)row * C->rowlen) / C->ds), oy = y / C->ds;
+            if (C->pgain > 0 && !ct[i]) continue;   /* --papyrus: CT 0 stays out of the overview means (shown as bg) */
             if (row < C->rows && ox < C->ovw) { const size_t a = (size_t)(OVK(X) - ka) * bh2 + oy, b2 = a + C->bandh;
                                                 pos[a] += stretch(ct[i], C->ca, C->cb); pon[a] += 1; pos[b2] += stretch(ink[i], C->ia, C->ib); pon[b2] += 1; }
             const long long lx = X / C->lds; const int ly = y / C->lds;
@@ -717,7 +737,8 @@ static void *ms_pass2(void *arg) {
         pthread_mutex_unlock(&C->mu);
         #undef OVK
         free(pos); free(pon); free(pls); free(plc); free(ptv); free(ptp); free(pw0); free(pw1); free(pwv); free(pwp);
-        if (C->wstripes) { snprintf(p, sizeof p, "%s/%s_ct_ink.jpg", C->od, S->name); if (ms_jpeg_stripe(p, w, h, ct, ink, m, C->ca, C->cb, C->ia, C->ib, C->q)) fprintf(stderr, "strip-mosaic: cannot write %s\n", p); }
+        if (C->wstripes && C->pgain > 0) { snprintf(p, sizeof p, "%s/%s_papyrus.jpg", C->od, S->name); if (ms_jpeg_stripe_pap(p, w, h, ct, ink, m, C->ca, C->cb, C->ia, C->ib, C->pgain, C->pbg, C->q)) fprintf(stderr, "strip-mosaic: cannot write %s\n", p); }
+        else if (C->wstripes) { snprintf(p, sizeof p, "%s/%s_ct_ink.jpg", C->od, S->name); if (ms_jpeg_stripe(p, w, h, ct, ink, m, C->ca, C->cb, C->ia, C->ib, C->q)) fprintf(stderr, "strip-mosaic: cannot write %s\n", p); }
         fprintf(stderr, "strip-mosaic: %s %dx%d done, %.1fs\n", S->name, w, h, snow() - ts);
         free(ct); free(ink); free(m); free(gu);
         if (C->rm) { snprintf(p, sizeof p, "%s/%s_ct.tif", C->rd, S->name); unlink(p); snprintf(p, sizeof p, "%s/%s.tif", C->rd, S->name); unlink(p); }
@@ -725,7 +746,9 @@ static void *ms_pass2(void *arg) {
     return nullptr;
 }
 int cmd_strip_mosaic(int argc, char **argv) {
-    if (argc < 5) { fprintf(stderr, "usage: ufsm strip-mosaic <flat-dir> <render-dir> <out-dir> [--strip DIR] [--ct-level 80] [--overview-px 16000] [--rows 10] [--tile-cm 1] [--quality 88] [--stripes 1] [--threads 8] [--stretch CA,CB,IA,IB] [--stretch-only 1] [--wait-renders 1] [--rm-renders 1]\n"); return 2; }
+    if (argc < 5) { fprintf(stderr, "usage: ufsm strip-mosaic <flat-dir> <render-dir> <out-dir> [--strip DIR] [--ct-level 80] [--overview-px 16000] [--rows 10] [--tile-cm 1] [--quality 88] [--stripes 1] [--threads 8] [--stretch CA,CB,IA,IB] [--stretch-only 1] [--wait-renders 1] [--rm-renders 1] [--papyrus GAIN [--papyrus-bg 128]]\n"
+                          "  --papyrus GAIN: papyrus-look RGB stripe JPEGs (<stripe>_papyrus.jpg), overview and long strip (ink-compare --papyrus colours,\n"
+                          "  the mosaic's stretch, ink x GAIN; CT 0 / no surface in grey --papyrus-bg)\n"); return 2; }
     const char *fd = argv[2], *rd = argv[3], *od = argv[4];
     const int ctl = atoi(sopt(argc, argv, "--ct-level", "80")), ovpx = atoi(sopt(argc, argv, "--overview-px", "16000")), rows = atoi(sopt(argc, argv, "--rows", "10")), q = atoi(sopt(argc, argv, "--quality", "88"));
     const double tilecm = atof(sopt(argc, argv, "--tile-cm", "1")); const int wstripes = atoi(sopt(argc, argv, "--stripes", "1"));
@@ -765,6 +788,8 @@ int cmd_strip_mosaic(int argc, char **argv) {
     if (atoi(sopt(argc, argv, "--stretch-only", "0"))) { printf("stretch %d,%d,%d,%d\n", ca, cb, ia, ib); return 0; }   /* (from the renders present) */
     { snprintf(p, sizeof p, "%s/stretch.txt", od); FILE *sf = fopen(p, "w"); if (sf) { fprintf(sf, "%d,%d,%d,%d\n", ca, cb, ia, ib); fclose(sf); } }   /* (for --stretch) */
     C.wait = atoi(sopt(argc, argv, "--wait-renders", "0")); C.rm = atoi(sopt(argc, argv, "--rm-renders", "0"));
+    C.pgain = (float)atof(sopt(argc, argv, "--papyrus", "0")); C.pbg = atoi(sopt(argc, argv, "--papyrus-bg", "128"));
+    const int pap = C.pgain > 0, pbg = C.pbg < 0 ? 0 : C.pbg > 255 ? 255 : C.pbg;
     /* overview geometry: the whole length (pixels) folded into --rows rows of at most --overview-px */
     long long Ltot = 0; int Hpx = 0; for (int s = 0; s < ns; s++) if (st[s].ow) { Ltot = (long long)(st[s].u0cm * 1e4 / pxum + 0.5) + st[s].ow; if (st[s].oh > Hpx) Hpx = st[s].oh; }
     const long long rowlen = (Ltot + rows - 1) / rows; int ds = (int)((rowlen + ovpx - 1) / ovpx); if (ds < 1) ds = 1;
@@ -788,22 +813,32 @@ int cmd_strip_mosaic(int argc, char **argv) {
     C.wmin = wmin; C.nwr = nwr; C.wv = wv; C.wp = wp; C.vtot = &vtot; C.ptot = &ptot; atomic_store(&C.next, 0);
     { pthread_t th[64]; for (int t = 0; t < nthr; t++) pthread_create(&th[t], nullptr, ms_pass2, &C); for (int t = 0; t < nthr; t++) pthread_join(th[t], nullptr); }
     if (atomic_load(&C.fail)) return 1;
-    /* the overview: per row CT band, ink band, papyrus bar (green on papyrus .. red off, grey no surface) */
-    uint8_t *ov = malloc((size_t)ovw * ovh * 3); memset(ov, 24, (size_t)ovw * ovh * 3);
-    for (size_t i = 0; i < (size_t)ovw * ovh; i++) if (ovn[i] > 0) { const uint8_t v = (uint8_t)lround(ovs[i] / ovn[i]); ov[3 * i] = ov[3 * i + 1] = ov[3 * i + 2] = v; }
+    /* the overview: per row CT band, ink band, papyrus bar (green on papyrus .. red off, grey no surface); --papyrus: per row one
+       papyrus-look band (the cell's mean stretched CT and ink through img_pap_rgb, bg where no CT) above the bar */
+    const int orowh = pap ? bandh + barh + 10 : rowh, oovh = rows * orowh, bary = pap ? bandh + 2 : 2 * bandh + 2;
+    uint8_t *ov = malloc((size_t)ovw * oovh * 3); memset(ov, pap ? pbg : 24, (size_t)ovw * oovh * 3);
+    if (!pap) for (size_t i = 0; i < (size_t)ovw * ovh; i++) if (ovn[i] > 0) { const uint8_t v = (uint8_t)lround(ovs[i] / ovn[i]); ov[3 * i] = ov[3 * i + 1] = ov[3 * i + 2] = v; }
+    if (pap) for (int r = 0; r < rows; r++) for (int b = 0; b < bandh; b++) for (int x = 0; x < ovw; x++) {
+        const size_t a = (size_t)(r * rowh + b) * ovw + x, k = (size_t)(r * rowh + bandh + b) * ovw + x; if (!(ovn[a] > 0)) continue;
+        img_pap_rgb((int)lround(ovs[a] / ovn[a]), img_pap_ink((int)lround(ovs[k] / ovn[k]), C.pgain), ov + 3 * ((size_t)(r * orowh + b) * ovw + x));
+    }
     for (int r = 0; r < rows; r++) for (int x = 0; x < ovw; x++) {
         const long long X0 = (long long)r * rowlen + (long long)x * ds, t = X0 / tpx; if (X0 >= Ltot || t >= ntile) continue;
         uint8_t col[3] = {90, 90, 90};
         if (tv[t] > 0) { const double fr = tp[t] / tv[t]; col[0] = (uint8_t)lround(255 * fmin(1, 2 * (1 - fr))); col[1] = (uint8_t)lround(255 * fmin(1, 2 * fr)); col[2] = 0; }
-        for (int y = 0; y < barh; y++) { const size_t i = (size_t)(r * rowh + 2 * bandh + 2 + y) * ovw + x; memcpy(ov + 3 * i, col, 3); }
-        if (t * tpx >= X0 && t * tpx < X0 + ds && t % 10 == 0) for (int y = 0; y < 3; y++) { const size_t i = (size_t)(r * rowh + 2 * bandh + 2 + barh + y) * ovw + x; ov[3 * i] = ov[3 * i + 1] = ov[3 * i + 2] = 230; }   /* 10 cm ticks */
+        for (int y = 0; y < barh; y++) { const size_t i = (size_t)(r * orowh + bary + y) * ovw + x; memcpy(ov + 3 * i, col, 3); }
+        if (t * tpx >= X0 && t * tpx < X0 + ds && t % 10 == 0) for (int y = 0; y < 3; y++) { const size_t i = (size_t)(r * orowh + bary + barh + y) * ovw + x; ov[3 * i] = ov[3 * i + 1] = ov[3 * i + 2] = 230; }   /* 10 cm ticks */
     }
-    snprintf(p, sizeof p, "%s/overview.jpg", od); if (jpeg_write_rgb(p, ovw, ovh, ov, q)) fprintf(stderr, "strip-mosaic: cannot write %s\n", p);
+    snprintf(p, sizeof p, "%s/overview.jpg", od); if (jpeg_write_rgb(p, ovw, oovh, ov, q)) fprintf(stderr, "strip-mosaic: cannot write %s\n", p);
     free(ov);
     uint8_t *ln = malloc((size_t)lw * lh * 2 * 3);
+    if (pap) {   /* one papyrus band */
+        for (int y = 0; y < lh; y++) for (int x = 0; x < lw; x++) { const size_t a = (size_t)y * lw + x; uint8_t *o = ln + 3 * a;
+            if (lcnt[a] > 0) img_pap_rgb((int)lround(lsum[2 * a] / lcnt[a]), img_pap_ink((int)lround(lsum[2 * a + 1] / lcnt[a]), C.pgain), o); else o[0] = o[1] = o[2] = (uint8_t)pbg; }
+    } else
     for (int y = 0; y < lh; y++) for (int x = 0; x < lw; x++) { const size_t a = (size_t)y * lw + x; const uint8_t c = lcnt[a] > 0 ? (uint8_t)lround(lsum[2 * a] / lcnt[a]) : 24, k = lcnt[a] > 0 ? (uint8_t)lround(lsum[2 * a + 1] / lcnt[a]) : 24;
         const size_t i0 = (size_t)y * lw + x, i1 = (size_t)(lh + y) * lw + x; ln[3 * i0] = ln[3 * i0 + 1] = ln[3 * i0 + 2] = c; ln[3 * i1] = ln[3 * i1 + 1] = ln[3 * i1 + 2] = k; }
-    snprintf(p, sizeof p, "%s/strip_long.jpg", od); if (jpeg_write_rgb(p, lw, 2 * lh, ln, q)) fprintf(stderr, "strip-mosaic: cannot write %s\n", p);
+    snprintf(p, sizeof p, "%s/strip_long.jpg", od); if (jpeg_write_rgb(p, lw, pap ? lh : 2 * lh, ln, q)) fprintf(stderr, "strip-mosaic: cannot write %s\n", p);
     free(ln);
     snprintf(p, sizeof p, "%s/strip_papyrus.tsv", od); FILE *pf = fopen(p, "w");
     if (pf) { fprintf(pf, "u_cm\tvalid_cm2\ton_papyrus\twrap_lo\twrap_hi\n");
@@ -812,7 +847,7 @@ int cmd_strip_mosaic(int argc, char **argv) {
     snprintf(p, sizeof p, "%s/papyrus_wraps.tsv", od); pf = fopen(p, "w");
     if (pf) { fprintf(pf, "wrap\tvalid_cm2\ton_papyrus\n"); for (int k = 0; k < nwr; k++) if (wv[k] > 0) fprintf(pf, "w%03d\t%.3f\t%.4f\n", wmin + k, wv[k] * pxum * pxum * 1e-8, wp[k] / wv[k]); fclose(pf); }
     printf("strip-mosaic: %d stripes, length %.2f cm, valid %.2f cm2, on papyrus (CT >= %d within 3x3 px) %.4f; overview %s/overview.jpg %dx%d (%d rows, 1:%d), long strip %dx%d (1:%d)\n",
-           ns, Ltot * pxum * 1e-4, vtot * pxum * pxum * 1e-8, ctl, vtot > 0 ? ptot / vtot : 0, od, ovw, ovh, rows, ds, lw, 2 * lh, lds);
+           ns, Ltot * pxum * 1e-4, vtot * pxum * pxum * 1e-8, ctl, vtot > 0 ? ptot / vtot : 0, od, ovw, oovh, rows, ds, lw, pap ? lh : 2 * lh, lds);
     free(st); free(ovs); free(ovn); free(lsum); free(lcnt); free(tv); free(tp); free(tw0); free(tw1); free(wv); free(wp); free(segs);
     return 0;
 }

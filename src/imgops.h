@@ -53,6 +53,16 @@ static inline float tifxyz_scaled(float v, float z, float divf, float offf) { re
 /* ufsm render output pixels along a grid of n vertices at gs pixels per grid step: floor((n - 1) gs) + 1 with a 1e-6 slack, so the float32
    meta scales of one mesh at two divisors (0.05 -> step 19.9999997 x 0.5, 0.2 -> 4.99999993 x 2) give the same size (ink-compare pairs) */
 static inline int render_out_px(int n, double gs) { return (int)floor((n - 1) * gs + 1e-6) + 1; }
+/* the papyrus look (ink-compare --papyrus, strip-mosaic --papyrus): stretched CT v (0..255) through dark brown .. warm tan, carbon ink of
+   density d (0..1) over it; img_pap_ink: a stretched ink value (0..255) times gain -> d (ramp .12 .. .9, smoothstep, at most .92) */
+static inline void img_pap_rgb(int v, float d, uint8_t *o) {
+    static const float P[4][3] = {{58, 36, 20}, {128, 88, 52}, {196, 156, 104}, {236, 214, 170}};
+    const float t = (float)v / 255.f * 3.f; const int i = t >= 3.f ? 2 : (int)t; const float f = t - i;
+    for (int e = 0; e < 3; e++) { const float pv = P[i][e] + f * (P[i + 1][e] - P[i][e]), iv = e == 0 ? 26.f : e == 1 ? 22.f : 19.f; o[e] = (uint8_t)lroundf(pv * (1.f - d) + iv * d); }
+}
+static inline float img_pap_ink(int ink, float gain) {
+    float d = (float)ink / 255.f * gain; d = d < .12f ? 0.f : d > .9f ? 1.f : (d - .12f) / .78f; return d * d * (3.f - 2.f * d) * .92f;
+}
 
 float *img_read_f32(const char *path, int *w, int *h);     /* a float32 single-sample TIFF, nullptr on failure */
 /* ufsm render of one wrap grid (X, Y, Z: w x h vertices, gs output pixels per grid step) through nv (1-2) volumes into img[v]

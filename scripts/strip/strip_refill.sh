@@ -6,6 +6,8 @@
 # logs' fill shares in OUT/logs/refill_<s>.log. The contrast stretch is OUT/stretch.txt (the original run's, so both mosaics compare)
 # or STRETCH. Resumable: rendered stripes still on disk are reused after a stop; stripes the stopped mosaic already consumed (and
 # deleted) are rendered again, since the restarted mosaic needs every stripe.
+# PAPMOS=DIR: a second mosaic in the papyrus look (strip-mosaic --papyrus PGAIN --papyrus-bg 128 --overview-px PAPPX) beside img_fill;
+# both mosaics read each render, which is deleted once both logged it (PGAIN default 1, PAPPX 8000).
 # PAP=DIR: also a papyrus-look preview per stripe (ink-compare --papyrus, --max-px 8000) DIR/<s>.jpg, made before the mosaic takes the
 # render. MEMGB: each render waits until MemAvailable exceeds it (default 80: a stripe render is ~40 GB RSS, keep 40 GB for the rest).
 #   env: U, CTR CTK (CT root / key at 9.6 um), INK INKK, RENDER_NT, MOS_NT, MAXR, CTL, FILLX (render fill flags), STRETCH, PAP, MEMGB;
@@ -14,7 +16,7 @@ set -u
 OUT=$1
 U=${U:-/vesuvius/ufsm/scroll1/src/build/ufsm}
 CTR=${CTR:?CT root}; CTK=${CTK:?CT key}; INK=${INK:?ink zarr}; INKK=${INKK:-9.6}
-RENDER_NT=${RENDER_NT:-8}; MOS_NT=${MOS_NT:-6}; MAXR=${MAXR:-6}; CTL=${CTL:-80}; PAP=${PAP:-}; MEMGB=${MEMGB:-80}
+RENDER_NT=${RENDER_NT:-8}; MOS_NT=${MOS_NT:-6}; MAXR=${MAXR:-6}; CTL=${CTL:-80}; PAP=${PAP:-}; MEMGB=${MEMGB:-80}; PAPMOS=${PAPMOS:-}; PGAIN=${PGAIN:-1}; PAPPX=${PAPPX:-8000}
 FILLX=${FILLX:---fill 4 --fill-grid 50000 --fill-inpaint 4 --fill-pm 1}
 R=$OUT/render_fill; I=$OUT/img_fill; M=$OUT/fillmap
 mkdir -p $OUT/logs $R $M
@@ -35,14 +37,30 @@ rend() {   # one stripe -> render_fill/<s>.tif, <s>_ct.tif, <s>.done; fillmap/<s
   rm -r $R/in_$s; touch $R/$s.done; log "render $s done: $(grep -o 'void on the surface.*' $OUT/logs/refill_$s.log | head -1)"
 }
 for d in $R/*.done; do [ -e "$d" ] || continue; s=$(basename $d .done); [ -e $R/${s}_ct.tif ] || rm -f $d; done   # the mosaic needs every stripe: re-render those it already consumed
-nice -n 10 $U strip-mosaic $OUT/strip/flat $R $I --ct-level $CTL --threads $MOS_NT --stretch $ST --wait-renders 1 --rm-renders 1 > $OUT/logs/mosaic_fill.log 2>&1 &
-MP=$!
+if [ -z "$PAPMOS" ]; then
+  nice -n 10 $U strip-mosaic $OUT/strip/flat $R $I --ct-level $CTL --threads $MOS_NT --stretch $ST --wait-renders 1 --rm-renders 1 > $OUT/logs/mosaic_fill.log 2>&1 &
+  MPS=($!)
+else   # two mosaics on the same renders: the script deletes a render once both have logged it
+  nice -n 10 $U strip-mosaic $OUT/strip/flat $R $I --ct-level $CTL --threads $MOS_NT --stretch $ST --wait-renders 1 > $OUT/logs/mosaic_fill.log 2>&1 &
+  MPS=($!)
+  nice -n 10 $U strip-mosaic $OUT/strip/flat $R $PAPMOS --ct-level $CTL --threads $MOS_NT --stretch $ST --wait-renders 1 --papyrus $PGAIN --papyrus-bg 128 --overview-px $PAPPX > $OUT/logs/mosaic_fill_pap.log 2>&1 &
+  MPS+=($!)
+fi
+clean() {   # PAPMOS: renders both mosaics have taken
+  [ -n "$PAPMOS" ] || return 0
+  local d s; for d in $R/*.done; do [ -e "$d" ] || continue; s=$(basename $d .done); [ -e $R/${s}_ct.tif ] || continue
+    grep -q "^strip-mosaic: $s .* done" $OUT/logs/mosaic_fill.log && grep -q "^strip-mosaic: $s .* done" $OUT/logs/mosaic_fill_pap.log && rm -f $R/${s}_ct.tif $R/$s.tif; done
+}
+alive() { local p; for p in "${MPS[@]}"; do kill -0 $p 2> /dev/null || return 1; done; return 0; }
 for s in "${S[@]}"; do
-  [ -e $OUT/STOP_FILL ] && { kill $MP; exit 0; }
-  while [ $(ls $R | grep -c '_ct\.tif$') -ge $MAXR ] && kill -0 $MP 2> /dev/null; do sleep 10; done
-  kill -0 $MP 2> /dev/null || break
-  rend $s || { kill $MP; exit 1; }
+  [ -e $OUT/STOP_FILL ] && { kill "${MPS[@]}"; exit 0; }
+  clean
+  while [ $(ls $R | grep -c '_ct\.tif$') -ge $MAXR ] && alive; do sleep 10; clean; done
+  alive || break
+  rend $s || { kill "${MPS[@]}"; exit 1; }
 done
-wait $MP || { log "mosaic FAILED"; exit 1; }
+for p in "${MPS[@]}"; do while kill -0 $p 2> /dev/null; do sleep 10; clean; done; wait $p || { log "mosaic FAILED"; exit 1; }; done
+clean
 log "mosaic done: $(grep '^strip-mosaic:' $OUT/logs/mosaic_fill.log | tail -1)"
+[ -n "$PAPMOS" ] && log "papyrus mosaic done: $(grep '^strip-mosaic:' $OUT/logs/mosaic_fill_pap.log | tail -1)"
 log "refill render + mosaic in $(( $(date +%s) - T0 )) s"

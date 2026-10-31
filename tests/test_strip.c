@@ -100,6 +100,12 @@ int main(void) {
           CHECK(!cmd_strip_mosaic(15, av), "strip-mosaic --stretch --wait-renders failed"); }
         snprintf(cmd, sizeof cmd, "cd %s/m1 && for x in *; do cmp -s $x ../m5/$x || exit 1; done", root);
         CHECK(!system(cmd), "strip-mosaic --stretch --wait-renders output differs from the two-pass run");
+        /* --papyrus: papyrus-look stripe JPEGs, a one-band overview / long strip; the same tables as the grey mosaic */
+        { char a1[400], a3[400]; snprintf(a1, sizeof a1, "%s/strip/flat", root); snprintf(a3, sizeof a3, "%s/m6", root);
+          char *av[] = {"ufsm", "strip-mosaic", a1, rdir, a3, "--threads", "2", "--rows", "2", "--overview-px", "600", "--stretch", sv, "--papyrus", "1", "--papyrus-bg", "128"};
+          CHECK(!cmd_strip_mosaic(17, av), "strip-mosaic --papyrus failed"); }
+        snprintf(cmd, sizeof cmd, "cd %s && ls m6/*_papyrus.jpg > /dev/null && test -s m6/overview.jpg && test -s m6/strip_long.jpg && cmp -s m1/strip_papyrus.tsv m6/strip_papyrus.tsv && cmp -s m1/papyrus_wraps.tsv m6/papyrus_wraps.tsv", root);
+        CHECK(!system(cmd), "strip-mosaic --papyrus outputs missing or its tables differ");
     }
     if (!fails) { snprintf(cmd, sizeof cmd, "rm -r %s", root); if (system(cmd)) {} }
     printf("test_strip: %s\n", fails ? "FAILED" : "ok");
