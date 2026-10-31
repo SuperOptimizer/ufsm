@@ -95,6 +95,16 @@ int main(void) {
             printf("strip GPU vs CPU: length %.5f / %.5f cm, aniso p50 %.5f / %.5f, p95 %.5f / %.5f\n", len, l2, a50, b50, a95, b95);
             CHECK(fabs(len - l2) < 1e-4 * l2 && fabs(a50 - b50) < 1e-3 && fabs(a95 - b95) < 1e-3, "GPU vs CPU flattening differs");
         }
+        {   /* GPU: the stripes do not depend on the thread count (the stripe rasteriser's pixel owners, the GPU SLIM) */
+            static const char *tv[2] = {"1", "7"};
+            for (int k = 0; k < 2; k++) {
+                char a1[300], a2[300]; snprintf(a1, sizeof a1, "%s/strip", root); snprintf(a2, sizeof a2, "%s/fgt%s", root, tv[k]);
+                char *av[] = {"ufsm", "strip-flatten", a1, "--out", a2, "--stride", "96", "--threads", (char *)tv[k], "--gpu", "1", "--stripe-px", "1500", "--iters", "60", "--cg", "300", "--tol", "1e-9"};
+                CHECK(!cmd_strip_flatten(20, av), "strip-flatten --gpu 1 --threads %s failed", tv[k]);
+            }
+            snprintf(cmd, sizeof cmd, "cd %s/fgt1/stripes && for x in */*; do cmp -s $x ../../fgt7/stripes/$x || exit 1; done", root);
+            CHECK(!system(cmd), "GPU strip-flatten stripes differ between --threads 1 and 7");
+        }
 #endif
     }
     /* strip-mosaic on synthetic renders of the stripes: --threads 1 and --threads 4 must write the same bytes */
