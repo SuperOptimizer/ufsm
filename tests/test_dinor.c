@@ -220,7 +220,8 @@ static double toy_dino(float plr, int steps, double *agree, int *distinct) {
 static int test_toy_dino(void) {
     printf("DINO loop on toy clusters (batch 1, K 4096, centring, ln K %.2f)\n", log(4096.0));
     int bad = 0; const float plrs[3] = {0.f, 4e-6f, 5e-4f};
-    for (int i = 0; i < 3; i++) {
+    const int quick = getenv("UFSM_TEST_QUICK") && atoi(getenv("UFSM_TEST_QUICK"));   /* make test: the reported-only lr 5e-4 run skipped */
+    for (int i = 0; i < (quick ? 2 : 3); i++) {
         double ag; int nd; const double H = toy_dino(plrs[i], 3000, &ag, &nd);
         const int b = i < 2 && !(H < 0.5 * log(4096.0) && ag > 0.8 && nd >= 8);   /* (no collapse: >= 8 of the 16 clusters on their own prototypes; 5e-4 reported only) */
         printf("  prototype lr %-7g: teacher H %.2f, view argmax agreement %.2f, distinct argmaxes %d (16 clusters)%s\n", plrs[i], H, ag, nd, b ? "  FAIL" : ""); bad += b;

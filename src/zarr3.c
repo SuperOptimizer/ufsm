@@ -944,7 +944,19 @@ int z3_shard_present(z3 *z, int64_t sz, int64_t sy, int64_t sx) {
 }
 
 /* the fill value over the whole output box */
-static void z3_fill(const z3_meta *m, uint8_t *out, size_t nv) {
+typedef struct { uint8_t *p; size_t n; int v; } z3_fill_part;
+static void *z3_fill_run(void *a) { const z3_fill_part *f = a; memset(f->p, f->v, f->n); return nullptr; }
+static void z3_fill(const z3_meta *m, uint8_t *out, size_t nv, int nthreads) {
+    if (nthreads <= 0) nthreads = (int)ufsm_ncpu();
+    if (nthreads > 16) nthreads = 16;
+    if (m->esize == 1 && nthreads > 1 && nv >= ((size_t)64 << 20)) {   /* a big box (fit_field_array's 1 GB blocks): the memset on threads */
+        pthread_t th[16]; z3_fill_part f[16]; int up[16] = {0};
+        for (int t = 0; t < nthreads; t++) { const size_t a = nv * t / nthreads, b = nv * (t + 1) / nthreads; f[t] = (z3_fill_part){out + a, b - a, m->fill}; }
+        for (int t = 1; t < nthreads; t++) up[t] = !pthread_create(&th[t], nullptr, z3_fill_run, &f[t]);
+        z3_fill_run(&f[0]);
+        for (int t = 1; t < nthreads; t++) { if (up[t]) pthread_join(th[t], nullptr); else z3_fill_run(&f[t]); }
+        return;
+    }
     if (m->esize == 1) memset(out, m->fill, nv);
     else {   /* typed fill: one element, then copied */
         uint8_t e[4] = {0}; const double f = m->fillv;
@@ -981,7 +993,7 @@ static int z3_read_impl(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *
        sampler's P512 CT window: a 128 MB memset per read) */
     int inside = m->sharded;
     for (int i = 0; i < 3; i++) inside &= o[i] >= 0 && o[i] + n[i] <= m->shape[i];
-    if (!inside) z3_fill(m, out, nv);
+    if (!inside) z3_fill(m, out, nv, nthreads);
     int64_t lo[3], hi[3];
     for (int i = 0; i < 3; i++) {
         lo[i] = o[i] < 0 ? 0 : o[i];
@@ -1006,7 +1018,7 @@ static int z3_read_impl(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *
                 if (m->sharded) {
                     present = load_index(z, skey, idx);
                     if (present < 0) { rc = -1; break; }
-                    if (!present) { if (inside) { z3_fill(m, out, nv); inside = 0; } continue; }   /* (a missing shard: filled) */
+                    if (!present) { if (inside) { z3_fill(m, out, nv, nthreads); inside = 0; } continue; }   /* (a missing shard: filled) */
                 }
                 /* inner chunk range within this shard that intersects the box */
                 int c0[3], c1[3];
@@ -1038,7 +1050,7 @@ static int z3_read_impl(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *
             }
     free(idx);
     if (rc) { free(items); return -1; }
-    if (inside) for (int i = 0; i < nitems; i++) if (!items[i].present) { z3_fill(m, out, nv); inside = 0; break; }   /* (an absent chunk: filled) */
+    if (inside) for (int i = 0; i < nitems; i++) if (!items[i].present) { z3_fill(m, out, nv, nthreads); inside = 0; break; }   /* (an absent chunk: filled) */
     range_work *ranges = nullptr; int nranges = 0;
     /* HTTP sharded reads go through range tasks: neighbouring cold chunks of one shard (file order, gap <= UFSM_Z3_GAP bytes,
        default 64 KiB; span <= UFSM_Z3_SPAN, default 2 MiB) become one request unless UFSM_Z3_COALESCE=0; with UFSM_HTTP_MULTI=1

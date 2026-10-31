@@ -99,7 +99,7 @@ static void ev_part_init(ev_part *p, const fit_model *m, double zl) {
     for (int b = 0; b < 2; b++) { const int a_ = p->c0z + b; p->za[b] = (size_t)(a_ < m->lz ? a_ : m->lz - 1) * m->ly; }
     p->iL = (m->L & (m->L - 1)) == 0 ? 1.0 / m->L : 0;   /* a power of two: x / L == x * (1 / L) exactly */
 }
-static double ev_part_W(const ev_part *p, double y, double x, double r, double th) {   /* fit_W_rt at (zl, y, x): lattice_at's operations */
+static inline double ev_part_U(const ev_part *p, double y, double x, double r) {   /* fit_W_rt at (zl, y, x) before its angle term: lattice_at's operations */
     const fit_model *m = p->m; const int L = m->L, ly = m->ly, lx = m->lx;
     const double qy = p->iL > 0 ? y * p->iL : y / L, qx = p->iL > 0 ? x * p->iL : x / L;
     const double ay = qy < 0 ? 0 : qy > ly - 1 ? ly - 1 : qy, ax = qx < 0 ? 0 : qx > lx - 1 ? lx - 1 : qx;
@@ -111,11 +111,13 @@ static double ev_part_W(const ev_part *p, double y, double x, double r, double t
     double s = 0;
     for (int c = 0; c < 8; c++) {   /* corner order and weight products as lattice_at: (wz wy) wx */
         const int bz = c >> 2 & 1, by = c >> 1 & 1, bx = c & 1;
-        const double w = wz[bz] * wy[by] * wx[bx];
-        if (w != 0) s += w * m->delta[(p->za[bz] + yo[by]) * lx + xo[bx]];
+        const double w = wz[bz] * wy[by] * wx[bx], t = w * m->delta[(p->za[bz] + yo[by]) * lx + xo[bx]];
+        s += w != 0 ? t : 0.0;   /* (a select, not a branch: s starts at +0 and is never -0, so adding +0 for a skipped corner is exact) */
     }
-    const double U = r / p->pit + p->off + s;
-    return U - m->dir * th / (2 * M_PI);
+    return r / p->pit + p->off + s;
+}
+static double ev_part_W(const ev_part *p, double y, double x, double r, double th) {   /* fit_W_rt at (zl, y, x) */
+    return ev_part_U(p, y, x, r) - p->m->dir * th / (2 * M_PI);
 }
 /* ev_part at one y as well (a field row: the voxel loops' x runs): the four (z, y) corners' offsets and weight products wz wy, so per
    x only its part (the same operations as ev_part_W: bit-identical) */
@@ -2056,8 +2058,8 @@ enum { RR_SEG = 16, RR_SUB = 8, RR_DEPTH = 2 };
    than the prior pitch W legitimately moves > 0.5 turn per pitch / 4 step, and those crossings were all dropped (a fit to Paris4
    network fields lost 37-52% of its wrap vertices so) */
 static int rr_cross(ray_ev evr, const void *ctx, double z, double cy, double cx, double sy, double sx, double thw, double k,
-                    double a, double fa, double b, double fb, int depth, double seg[][3], int ns) {
-    if (fabs(fa - fb) < 0.5) { if (ns < RR_SEG) { seg[ns][0] = a; seg[ns][1] = b; seg[ns][2] = fa; ns++; } return ns; }
+                    double a, double fa, double b, double fb, int depth, double seg[][4], int ns) {
+    if (fabs(fa - fb) < 0.5) { if (ns < RR_SEG) { seg[ns][0] = a; seg[ns][1] = b; seg[ns][2] = fa; seg[ns][3] = fb; ns++; } return ns; }
     if (depth >= RR_DEPTH) return ns;
     double r0 = a, f0 = fa;
     for (int q = 1; q <= RR_SUB; q++) {
@@ -2070,11 +2072,13 @@ static int rr_cross(ray_ev evr, const void *ctx, double z, double cy, double cx,
 /* ua, ub (ufsm wraps --fields): every radius whose point can be a kept vertex lies in [ua, ub] (ua > ub: none). A root outside it is
    dropped by the caller, so the search returns -1 as soon as every root it can still find is outside: the ring's crossing intervals
    all outside (no refinement), or each side's front past its bound (or stopped). The same roots where they are kept. */
-static int ray_root_b(ray_ev evr, const void *ctx, const fit_model *m, double z, double theta, double k, double r_hint, double ua, double ub, double *r);
-static int ray_root(ray_ev evr, const void *ctx, const fit_model *m, double z, double theta, double k, double r_hint, double *r) { return ray_root_b(evr, ctx, m, z, theta, k, r_hint, -1e300, 1e300, r); }
-static int ray_root_b(ray_ev evr, const void *ctx, const fit_model *m, double z, double theta, double k, double r_hint, double ua, double ub, double *r) {
+typedef void (*ray_prep)(const void *ctx, double thw);   /* (optional: per-ray constants of the evaluator, given the ray angle) */
+static inline int ray_root_b(ray_ev evr, ray_prep prep, const void *ctx, const fit_model *m, double z, double theta, double k, double r_hint, double ua, double ub, double *r);
+static int ray_root(ray_ev evr, ray_prep prep, const void *ctx, const fit_model *m, double z, double theta, double k, double r_hint, double *r) { return ray_root_b(evr, prep, ctx, m, z, theta, k, r_hint, -1e300, 1e300, r); }
+static inline __attribute__((always_inline)) int ray_root_b(ray_ev evr, ray_prep prep, const void *ctx, const fit_model *m, double z, double theta, double k, double r_hint, double ua, double ub, double *r) {   /* (inlined: a constant evaluator inlines too) */
     const int na = (int)(m->D * m->h) + 1;
     const double cy = axis_lerp(m->cy, na, z), cx = axis_lerp(m->cx, na, z), sy = sin(theta), sx = cos(theta), thw = atan2(sy, sx);
+    if (prep) prep(ctx, thw);
     const double Y = m->H * m->h, X = m->W * m->h;
     double rlo = 0, rhi = 1e9;   /* the part of the ray inside the box */
     const double c0[2] = {cy, cx}, dv[2] = {sy, sx}, ext[2] = {Y, X};
@@ -2095,7 +2099,7 @@ static int ray_root_b(ray_ev evr, const void *ctx, const fit_model *m, double z,
     double ro = h0, fo = f0, ri = h0, fi = f0, best = -1, bestd = 1e300;
     while ((ro < rhi && fo < 2) || (ri > rlo && fi > -2)) {
         if ((!(ro < rhi && fo < 2) || ro > ub) && (!(ri > rlo && fi > -2) || ri < ua)) return -1;   /* only dropped roots are left */
-        double seg[RR_SEG][3]; int ns = 0;   /* (a, b, f(a)) of this ring's crossing intervals */
+        double seg[RR_SEG][4]; int ns = 0;   /* (a, b, f(a), f(b)) of this ring's crossing intervals */
         if (ro < rhi && fo < 2) {
             const double rn = fmin(ro + dr, rhi), fn = EVR(rn) - k;
             if ((fo < 0) != (fn < 0)) ns = rr_cross(evr, ctx, z, cy, cx, sy, sx, thw, k, ro, fo, rn, fn, 0, seg, ns);
@@ -2109,7 +2113,7 @@ static int ray_root_b(ray_ev evr, const void *ctx, const fit_model *m, double z,
         if (ns) { int out = 1; for (int q = 0; q < ns; q++) out &= seg[q][1] < ua || seg[q][0] > ub; if (out) return -1; }
         for (int q = 0; q < ns; q++) {
             /* Illinois regula falsi to 1e-6 voxel (W is smooth along the ray: ~6 evaluations; the 24 halvings it replaces: dr 2^-24) */
-            double a = seg[q][0], b = seg[q][1], fa = seg[q][2], fb = EVR(b) - k, root = 0.5 * (a + b); int side = 0;
+            double a = seg[q][0], b = seg[q][1], fa = seg[q][2], fb = seg[q][3], root = 0.5 * (a + b); int side = 0;   /* (fb: EVR(b) - k, kept) */
             for (int it = 0; it < 60 && b - a > 1e-6; it++) {
                 double c = fb != fa ? b - fb * (b - a) / (fb - fa) : 0.5 * (a + b);
                 if (!(c > a && c < b)) c = 0.5 * (a + b);
@@ -2128,7 +2132,7 @@ static int ray_root_b(ray_ev evr, const void *ctx, const fit_model *m, double z,
 #undef EVR
 }
 static double ev_model(const void *m, double z, double y, double x, double r, double th) { return fit_W_rt(m, z, y, x, r, th); }
-int fit_ray_root(const fit_model *m, double z, double theta, double k, double r_hint, double *r) { return ray_root(ev_model, m, m, z, theta, k, r_hint, r); }
+int fit_ray_root(const fit_model *m, double z, double theta, double k, double r_hint, double *r) { return ray_root(ev_model, nullptr, m, m, z, theta, k, r_hint, r); }
 
 /* plane names of fit_fields_buf a[]: the 10 base planes, the winding mod 4 planes, the recto plane */
 static const char *fit_plane_names[17] = {"pc", "ps", "t0", "t1", "t2", "t3", "t4", "t5", "sp", "w", "dz", "dy", "dx", "dq", "r", "ct", "cs"};
@@ -2580,10 +2584,19 @@ double fit_set_gradW(const fit_set *s, double z, double y, double x, double e, d
     }
     return sqrt(l2);
 }
-typedef struct { int mode; double t; ev_part a, b; } ev_row;   /* mode 0: a alone; 1: (1 - t) a + t b */
+typedef struct { int mode; double t; ev_part a, b; double tta, ttb; } ev_row;   /* mode 0: a alone; 1: (1 - t) a + t b; tt*: the ray's angle terms */
 static double ev_row_W(const void *rv, double z, double y, double x, double r, double th) {
     const ev_row *R = rv;
     return R->mode ? (1 - R->t) * ev_part_W(&R->a, y, x, r, th) + R->t * ev_part_W(&R->b, y, x, r, th) : ev_part_W(&R->a, y, x, r, th);
+}
+/* ev_row_W along one ray: its angle terms dir th / 2 pi computed once (ev_row_prep; the same expression, so the same W bits) */
+static void ev_row_prep(const void *rv, double th) {
+    ev_row *R = (ev_row *)rv;   /* (the caller's own row context) */
+    R->tta = R->a.m->dir * th / (2 * M_PI); if (R->mode) R->ttb = R->b.m->dir * th / (2 * M_PI);
+}
+static double ev_row_Wt(const void *rv, double z, double y, double x, double r, double th) {
+    const ev_row *R = rv;
+    return R->mode ? (1 - R->t) * (ev_part_U(&R->a, y, x, r) - R->tta) + R->t * (ev_part_U(&R->b, y, x, r) - R->ttb) : ev_part_U(&R->a, y, x, r) - R->tta;
 }
 static void ev_row_init(ev_row *R, const fit_set *s, double z) {   /* ev_set's choice at z */
     R->mode = 0; R->t = 0;
@@ -2599,12 +2612,19 @@ static void ev_row_init(ev_row *R, const fit_set *s, double z) {   /* ev_set's c
 }
 int fit_set_ray_root(const fit_set *s, double z, double theta, double k, double r_hint, double *r) {
     ev_row R; ev_row_init(&R, s, z);
-    return ray_root(ev_row_W, &R, s->global, z, theta, k, r_hint, r);
+    return ray_root(ev_row_Wt, ev_row_prep, &R, s->global, z, theta, k, r_hint, r);
 }
 int fit_set_ray_root_b(const fit_set *s, double z, double theta, double k, double r_hint, double ua, double ub, double *r) {
     ev_row R; ev_row_init(&R, s, z);
-    return ray_root_b(ev_row_W, &R, s->global, z, theta, k, r_hint, ua, ub, r);
+    return ray_root_b(ev_row_Wt, ev_row_prep, &R, s->global, z, theta, k, r_hint, ua, ub, r);
 }
+/* the same for many rays of one z (ufsm wraps' rows): the slab choice and the z parts once per row */
+struct fit_set_row { const fit_set *s; double z; ev_row R; };
+fit_set_row *fit_set_row_new(const fit_set *s, double z) { fit_set_row *w = malloc(sizeof *w); if (w) { w->s = s; w->z = z; ev_row_init(&w->R, s, z); } return w; }
+int fit_set_row_root_b(fit_set_row *w, double theta, double k, double r_hint, double ua, double ub, double *r) {
+    return ray_root_b(ev_row_Wt, ev_row_prep, &w->R, w->s->global, w->z, theta, k, r_hint, ua, ub, r);
+}
+void fit_set_row_free(fit_set_row *w) { free(w); }
 int fit_set_save(const fit_set *s, const char *dir) {
     char p[1400]; snprintf(p, sizeof p, "%s/global", dir);
     if (fit_save(s->global, p)) return -1;
@@ -2619,6 +2639,12 @@ int fit_set_save(const fit_set *s, const char *dir) {
     fprintf(f, "], \"blend\": %.3f}\n", s->blend);
     return fclose(f) ? -1 : 0;
 }
+typedef struct { fit_set *s; const char (*paths)[1400]; _Atomic int next; } fsl_job;
+static void *fsl_worker(void *arg) {
+    fsl_job *L = arg;
+    for (int k; (k = atomic_fetch_add(&L->next, 1)) < L->s->n;) L->s->slab[k] = fit_load(L->paths[k]);
+    return nullptr;
+}
 fit_set *fit_set_load(const char *dir) {
     char p[1400]; snprintf(p, sizeof p, "%s/set.json", dir);
     fit_set *s = calloc(1, sizeof *s);
@@ -2632,13 +2658,21 @@ fit_set *fit_set_load(const char *dir) {
     s->global = fit_load(p); s->blend = json_num(json_get(j, "blend"), 0);
     const json *sl = json_get(j, "slabs"); s->n = sl ? (int)sl->n : 0;
     s->slab = calloc(s->n + 1, sizeof *s->slab); s->z0 = calloc(s->n + 1, sizeof(double)); s->z1 = calloc(s->n + 1, sizeof(double));
+    char (*paths)[1400] = malloc((size_t)(s->n + 1) * sizeof *paths);
     for (int k = 0; k < s->n; k++) {
         const json *e = json_at(sl, k);
-        snprintf(p, sizeof p, "%s/%s", dir, json_str(json_get(e, "dir"), ""));
-        s->slab[k] = fit_load(p); s->z0[k] = json_num(json_get(e, "z0"), 0); s->z1[k] = json_num(json_get(e, "z1"), 0);
-        if (!s->slab[k]) { json_free(j); fit_set_free(s); return nullptr; }
+        snprintf(paths[k], sizeof paths[k], "%s/%s", dir, json_str(json_get(e, "dir"), ""));
+        s->z0[k] = json_num(json_get(e, "z0"), 0); s->z1[k] = json_num(json_get(e, "z1"), 0);
     }
     json_free(j);
+    /* the slab models on threads (a whole-scroll join: ~80 slabs, 5 GB of deltas read one after another took ~10 s of ufsm wraps) */
+    fsl_job L = {s, (const char (*)[1400])paths, 0};
+    pthread_t th[16]; const int nt = s->n < 2 ? 0 : s->n < 16 ? s->n : 16; int up = 0;
+    for (; up < nt; up++) if (pthread_create(&th[up], nullptr, fsl_worker, &L)) break;
+    fsl_worker(&L);
+    for (int t = 0; t < up; t++) pthread_join(th[t], nullptr);
+    free(paths);
+    for (int k = 0; k < s->n; k++) if (!s->slab[k]) { fit_set_free(s); return nullptr; }
     if (!s->global) { fit_set_free(s); return nullptr; }
     return s;
 }
@@ -2824,6 +2858,90 @@ int fit_set_grid_cpu(const fit_set *s, const double o[3], const int64_t n[3], do
 }
 
 /* one field array (name: pc ps t0..t5 sp w) of a fit-field directory, max-pooled by pool per axis (raw or zarr; read in z-blocks) */
+typedef struct { const uint8_t *blk; uint8_t *out; int z0, nz, H, W, Hp, Wp, pool; } ffa_pool_job;
+static void ffa_pool_rows(void *ctx, int yp0, int yp1, int t) {   /* fit_field_array: the max over pool^3 into pooled rows [yp0, yp1) */
+    const ffa_pool_job *J = ctx; const int P = J->pool, W = J->W, Wf = W / P * P; (void)t;
+    uint8_t *acc = malloc((size_t)W);   /* the element-wise max of the block's rows of one pooled (z, y) cell row, then reduced along x */
+    for (int a0 = 0; a0 < J->nz;) {
+        const int zp = (J->z0 + a0) / P; int a1 = a0; while (a1 < J->nz && (J->z0 + a1) / P == zp) a1++;
+        uint8_t *o = J->out + (size_t)zp * J->Hp * J->Wp;
+        for (int yp = yp0; yp < yp1; yp++) {
+            const int y1 = (yp + 1) * P < J->H ? (yp + 1) * P : J->H;
+            memset(acc, 0, (size_t)W);
+            for (int a = a0; a < a1; a++) for (int y = yp * P; y < y1; y++) {
+                const uint8_t *r = J->blk + ((size_t)a * J->H + y) * W;
+                for (int x = 0; x < W; x++) acc[x] = r[x] > acc[x] ? r[x] : acc[x];
+            }
+            uint8_t *d = o + (size_t)yp * J->Wp; int x = 0;
+            for (; x < Wf; x += P) { uint8_t m = d[x / P]; for (int q = 0; q < P; q++) if (acc[x + q] > m) m = acc[x + q]; d[x / P] = m; }
+            for (; x < W; x++) if (acc[x] > d[x / P]) d[x / P] = acc[x];
+        }
+        a0 = a1;
+    }
+    free(acc);
+}
+/* fit_field_array's pooled read chunk by chunk: the stored chunks (z3_chunk_map) on threads, each read alone (z3_read of its box part)
+   and max-pooled straight into the output; absent chunks are the fill 0, the output's zeros. Every output cell lies in one chunk (chunk
+   edges on pool multiples of the box), so the cells are the block path's maxima: the same bytes without the 1 GB block buffers, their
+   fill memsets and copies. */
+typedef struct { z3 *za; const int64_t *list; int64_t nlist; const int *chunk; const long long *zoff; int D, H, W, Hp, Wp, pool; uint8_t *out; _Atomic int64_t next; _Atomic int fail; } ffa_chunk_job;
+static void *ffa_chunk_worker(void *arg) {
+    ffa_chunk_job *J = arg; const int P = J->pool; const size_t cv = (size_t)J->chunk[0] * J->chunk[1] * J->chunk[2];
+    uint8_t *buf = malloc(cv), *acc = malloc((size_t)J->chunk[2]); if (!buf || !acc) { atomic_store(&J->fail, 1); free(buf); free(acc); return nullptr; }
+    for (int64_t t; (t = atomic_fetch_add(&J->next, 1)) < J->nlist && !atomic_load(&J->fail);) {
+        const int64_t *c = J->list + 3 * t; int64_t o[3], n[3], lo[3];   /* lo: the part's box-local origin */
+        const int64_t box[3] = {J->D, J->H, J->W};
+        for (int d = 0; d < 3; d++) {
+            const int64_t a = c[d] * J->chunk[d] - J->zoff[d], b = a + J->chunk[d];
+            lo[d] = a < 0 ? 0 : a; const int64_t hi = b < box[d] ? b : box[d];
+            n[d] = hi - lo[d]; o[d] = lo[d] + J->zoff[d];
+        }
+        if (n[0] <= 0 || n[1] <= 0 || n[2] <= 0) continue;
+        if (z3_read(J->za, o, n, buf, 1)) { atomic_store(&J->fail, 1); break; }
+        const int nx = (int)n[2], nxf = nx / P * P;
+        for (int64_t z0 = 0; z0 < n[0];) {
+            const int64_t zp = (lo[0] + z0) / P; int64_t z1 = z0; while (z1 < n[0] && (lo[0] + z1) / P == zp) z1++;
+            for (int64_t y0 = 0; y0 < n[1];) {
+                const int64_t yp = (lo[1] + y0) / P; int64_t y1 = y0; while (y1 < n[1] && (lo[1] + y1) / P == yp) y1++;
+                memset(acc, 0, (size_t)nx);
+                for (int64_t z = z0; z < z1; z++) for (int64_t y = y0; y < y1; y++) {
+                    const uint8_t *r = buf + ((size_t)z * n[1] + y) * nx;
+                    for (int x = 0; x < nx; x++) acc[x] = r[x] > acc[x] ? r[x] : acc[x];
+                }
+                uint8_t *d = J->out + ((size_t)zp * J->Hp + yp) * J->Wp + lo[2] / P; int x = 0;
+                for (; x < nxf; x += P) { uint8_t m = d[x / P]; for (int q = 0; q < P; q++) if (acc[x + q] > m) m = acc[x + q]; d[x / P] = m; }
+                for (; x < nx; x++) if (acc[x] > d[x / P]) d[x / P] = acc[x];
+                y0 = y1;
+            }
+            z0 = z1;
+        }
+    }
+    free(buf); free(acc);
+    return nullptr;
+}
+/* 1 done (out filled), 0 not applicable (the block path), -1 error */
+static int ffa_chunks(z3 *za, const long long zoff[3], int D, int H, int W, int Hp, int Wp, int pool, int nth, uint8_t *out) {
+    const z3_meta *m = z3_meta_of(za);
+    if (pool < 2 || m->fill != 0 || m->esize != 1 || !m->sharded || ufsm_env_on("UFSM_FFA_BLOCKS")) return 0;
+    for (int d = 0; d < 3; d++) if (m->chunk[d] % pool || zoff[d] % pool || zoff[d] < 0) return 0;
+    int64_t g[3]; uint8_t *bits = nullptr; if (z3_chunk_map(za, g, &bits) < 0) { free(bits); return 0; }
+    const long long box[3] = {D, H, W}; int64_t c0[3], c1[3];
+    for (int d = 0; d < 3; d++) { c0[d] = zoff[d] / m->chunk[d]; c1[d] = (zoff[d] + box[d] - 1) / m->chunk[d]; if (c1[d] > g[d] - 1) c1[d] = g[d] - 1; }
+    int64_t nl = 0, cap = 1024; int64_t *list = malloc((size_t)cap * 3 * sizeof *list);
+    for (int64_t cz = c0[0]; cz <= c1[0]; cz++) for (int64_t cy = c0[1]; cy <= c1[1]; cy++) for (int64_t cx = c0[2]; cx <= c1[2]; cx++) {
+        if (!bits[(cz * g[1] + cy) * g[2] + cx]) continue;
+        if (nl == cap) { cap *= 2; list = realloc(list, (size_t)cap * 3 * sizeof *list); }
+        list[3 * nl] = cz; list[3 * nl + 1] = cy; list[3 * nl + 2] = cx; nl++;
+    }
+    free(bits);
+    ffa_chunk_job J = {za, list, nl, m->chunk, zoff, D, H, W, Hp, Wp, pool, out, 0, 0};
+    pthread_t th[64]; const int nt = nth < 1 ? 1 : nth > 64 ? 64 : nth; int k = 0;
+    for (; k < nt; k++) if (pthread_create(&th[k], nullptr, ffa_chunk_worker, &J)) break;
+    if (!k) ffa_chunk_worker(&J);
+    for (int t = 0; t < k; t++) pthread_join(th[t], nullptr);
+    free(list);
+    return atomic_load(&J.fail) ? -1 : 1;
+}
 uint8_t *fit_field_array(const char *dir, const char *name, int pool, int shape[3]) {
     fit_fields_buf g; if (fit_fields_load(dir, 0, 0, 0, &g)) return nullptr;
     const int D = g.shape[0], H = g.shape[1], W = g.shape[2], Dp = (D + pool - 1) / pool, Hp = (H + pool - 1) / pool, Wp = (W + pool - 1) / pool;
@@ -2836,21 +2954,23 @@ uint8_t *fit_field_array(const char *dir, const char *name, int pool, int shape[
     z3 *za = nullptr; FILE *fr = nullptr;
     if (zarr) za = z3_open(store_open(dir), name, nullptr); else { snprintf(p, sizeof p, "%s/%s.raw", dir, name); fr = fopen(p, "rb"); }
     if (!za && !fr) return nullptr;
-    /* blocks of >= 64 rows (whole pools): a one-row read decoded the 16-row codec blocks of its chunks for every row (~16x the decode) */
-    const int zb = pool >= 64 ? pool : 64 / pool * pool;
-    uint8_t *out = calloc((size_t)Dp * Hp * Wp, 1), *blk = malloc((size_t)zb * H * W);
-    for (int z0 = 0; z0 < D; z0 += zb) {
+    /* blocks of >= 64 rows (whole pools): a one-row read decoded the 16-row codec blocks of its chunks for every row (~16x the decode);
+       the reads (only the needed substreams), the fill and the pooling on --threads. A sharded zarr at a pool dividing its chunks goes
+       chunk by chunk instead (ffa_chunks: PHerc0490B's w at pool 8, 80 G cells: 190 s -> 6 s, the same bytes) */
+    const int zb = pool >= 64 ? pool : 64 / pool * pool, nth = fit_nthreads(1 << 20);
+    uint8_t *out = calloc((size_t)Dp * Hp * Wp, 1);
+    const int byc = out && za && !cside ? ffa_chunks(za, zoff, D, H, W, Hp, Wp, pool, nth, out) : 0;
+    if (byc < 0) { free(out); out = nullptr; }
+    uint8_t *blk = out && !byc ? malloc((size_t)zb * H * W) : nullptr;
+    if (out && !byc && !blk) { free(out); out = nullptr; }
+    for (int z0 = 0; z0 < (out && !byc ? D : 0); z0 += zb) {
         const int nz = z0 + zb <= D ? zb : D - z0;
-        if (za) { const int64_t o[3] = {z0 + zoff[0], zoff[1], zoff[2]}, n[3] = {nz, H, W}; if (z3_read(za, o, n, blk, 8)) { free(out); out = nullptr; break; } }
+        if (za) { const int64_t o[3] = {z0 + zoff[0], zoff[1], zoff[2]}, n[3] = {nz, H, W}; if (z3_read_sub(za, o, n, blk, nth, fit_submask(za, o[0], n[0]))) { free(out); out = nullptr; break; } }
         else { const long long o[3] = {z0 + zoff[0], zoff[1], zoff[2]}; const int64_t n[3] = {nz, H, W}; if (raw_read_box(fr, rsh, o, n, blk)) { free(out); out = nullptr; break; } }
         if (cside) core_mask(dir, &core, cside, gorg, gh, gum, D, z0, nz, H, W, name[0] == 'p' ? blk : nullptr, nullptr, name[0] == 'w' ? blk : nullptr);
         if (pool == 1) { memcpy(out + (size_t)z0 * H * W, blk, (size_t)nz * H * W); continue; }   /* (the max with the zeroed output) */
-        for (int a = 0; a < nz; a++) {
-            uint8_t *o = out + (size_t)((z0 + a) / pool) * Hp * Wp;
-            for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
-                const uint8_t v = blk[((size_t)a * H + y) * W + x]; uint8_t *d = &o[(size_t)(y / pool) * Wp + x / pool]; if (v > *d) *d = v;
-            }
-        }
+        ffa_pool_job PJ = {blk, out, z0, nz, H, W, Hp, Wp, pool};   /* pooled rows on threads (each output row by one thread: the same maxima) */
+        fit_zpar(Hp, nth, ffa_pool_rows, &PJ);
     }
     free(blk); if (za) z3_close(za); if (fr) fclose(fr); if (cside) cl_free(&core);
     if (out) { shape[0] = Dp; shape[1] = Hp; shape[2] = Wp; }

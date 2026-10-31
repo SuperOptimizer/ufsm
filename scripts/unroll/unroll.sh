@@ -118,7 +118,7 @@ occlv() {   # --occupancy L for the fields: the first of levels LV+3, LV+2, LV+4
 }
 fpred() {   # fpred GPU BOX OUT
   X $O/logs/fields.log $U predict $CK $R $K $3.tmp --um $UM --level $LV --box $2 --window-z 384 --halo-z 64 --window 640 --halo 64 --shard 512 \
-    --grid-origin 0,0,0 --ema 1 --q 8 --threads ${PTH:-14} --gpu $1 --axis $O/axis.json --levels 1 --fit-zarr $3 --fit-h 2 --fit-q 8 --fit-q-phase 0 --no-out 1 $(occlv) &&
+    --grid-origin 0,0,0 --ema 1 --q 8 --threads ${PTH:-14} --gpu $1 --axis $O/axis.json --levels 1 --fit-zarr $3 --fit-h 2 --fit-q 8 --fit-q-phase 4 --no-out 1 $(occlv) &&
     { [ "$DRY" = 1 ] || { rm -rf $3.tmp; [ -e $3/fields.json ]; }; }
 }
 fields() {
@@ -168,7 +168,7 @@ ink() {
 # --- slab fits: one lane per GPU, claims by flock (fd.sh lane) ---
 lane() {   # lane GPU
   local g=$1 k s d c0 c1 a b t0 rc ze ny nx dir
-  if [ "$DRY" = 1 ]; then echo "    lane GPU $g: per slab k: mkcrop.sh $F slabs/sNNN/f (64 cells + 16 overlap); $U fit slabs/sNNN/f --gpu $g --out slabs/sNNN/fit --dir REFDIR --ref-model $REF --ref-snap 1 --uw-repair 0"; return 0; fi
+  if [ "$DRY" = 1 ]; then echo "    lane GPU $g: per slab k: mkcrop.sh $F slabs/sNNN/f (64 cells + 16 overlap); $U fit slabs/sNNN/f --gpu $g --out slabs/sNNN/fit --dir REFDIR --ref-model $REF --ref-snap 1 --uw-repair 0 [phase gate on by default; FITX=\"--phase-gate 0\" off] ${FITX:-}"; return 0; fi
   ze=$(jq -r '.shape[0]' $F/fields.json); ny=$(jq -r '.shape[1]' $F/fields.json); nx=$(jq -r '.shape[2]' $F/fields.json); dir=$(jq -r .dir $REF/model.json)
   for k in $(seq 0 $(( (ze + I - 1) / I - 1 ))); do
     stopped && return 0
@@ -177,7 +177,7 @@ lane() {   # lane GPU
     c0=$((k * I)); c1=$((c0 + I)); [ $c1 -gt $ze ] && c1=$ze; a=$((c0 - OV)); [ $a -lt 0 ] && a=0; b=$((c1 + OV)); [ $b -gt $ze ] && b=$ze
     rm -rf $d/f $d/fit; bash $MKCROP $F $d/f $a 0 0 $((b - a)) $ny $nx > /dev/null || continue
     echo "$c0 $c1 $a $b" > $d/cells; memok; t0=$(date +%s)
-    env UFSM_FIT_THREADS=10 /usr/bin/time -v nice -n 5 $U fit $d/f --gpu $g --out $d/fit --dir $dir --ref-model $REF --ref-snap 1 --uw-repair 0 > $d/fit.log 2>&1; rc=$?
+    env UFSM_FIT_THREADS=10 /usr/bin/time -v nice -n 5 $U fit $d/f --gpu $g --out $d/fit --dir $dir --ref-model $REF --ref-snap 1 --uw-repair 0 ${FITX:-} > $d/fit.log 2>&1; rc=$?
     echo "$s $c0..$c1 rc $rc gpu $g $(( $(date +%s) - t0 ))s" >> $O/slabs.txt
     if [ $rc = 0 ]; then touch $d/done; elif grep -q "no data for the prior" $d/fit.log; then touch $d/empty $d/done; fi
     rm -rf $d/f; exec 9>&-

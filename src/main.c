@@ -144,6 +144,7 @@ static int usage(void) {
         "  ufsm fit <fields-dir> [--slab Z] [--out MODEL] [--winding ZARR] [--codes ROOT KEY]   winding fitter (src/fit.h)\n"
         "  ufsm convert-unwrap2 <unwrap.ckpt> <out.ckpt>   a task unwrap checkpoint as task unwrap2 (heads 2-10 -> 0-8, winding mod 4 fresh; no training step)\n"
         "  ufsm repack <in-array-dir> <out-array-dir> <shard> [--threads N]   lossless re-sharding of a z3w uint8 zarr (copies the compressed chunks)\n"
+        "  ufsm fields-pack IN OUT [--q-phase Q] [--q Q] [--ang A] [--conf C] [--mask-w 1] [--shard 512]   re-encode a fit-field store smaller (readers unchanged)\n"
         "  ufsm wraps <model-dir> <out-dir> [--step 8] [--fields DIR]          one tifxyz per wrap (level sets of W)\n"
         "  ufsm coreline detect|box|sdist|check ...   a crushed scroll's flattened umbilicus per z (fit fields), half-box fit dirs behind it, check renders\n"
         "  ufsm render-sheets <tifxyz-dir> <out-dir> --ct ROOT KEY --ink ROOT KEY ...   every sheet -> CT + red ink 5-panel JPEGs, one batch\n"
@@ -196,6 +197,7 @@ static int usage(void) {
         "  ufsm vwt-sample SOURCES OUT N   ray-model training slabs + targets (im / va / ph / comp / pw raw) and the sampler throughput\n"
         "  ufsm ray-check WINDINGS.json FIELDS   turn counts of a field set between human relative-winding ray points (phase / density)\n"
         "  ufsm patch-raster LIST OUT --shape Z,Y,X   surface patches (tifxyz) as phase-0 shell training targets (512^3 shards)\n"
+        "  ufsm phase-gate <in-fields> <out-fields> --ref MODEL [--mode gate|ref]   the network phase replaced by a ref model's where it does not rotate with the sheets\n"
         "  ufsm hires-phase <ct-root> <key> <fields-dir> <out-dir> --ct-um U   fit fields with the sheet phase measured in a finer CT (valleys along the normal)\n"
         "  ufsm phase-packing <phase-root> <phase-key> [--box ..] [--map OUT.raw]   how packed the labelled sheets are (box stats, per-chunk map for the sampler focus)\n"
         "  ufsm wbench-stats A.tsv [B.tsv] [--metric ids,p1x] [--set clean|all]   winding bench means, stratified bootstrap CIs, paired A-B, MDE (--scroll a,b; --tsv 1)\n"
@@ -1252,6 +1254,33 @@ static int cmd_fit(int argc, char **argv) {
         fprintf(stderr, "fit: ref model %s (box offset %.0f %.0f %.0f native): %s%s\n", opt(argc, argv, "--ref-model", ""), c.ref_off[0], c.ref_off[1], c.ref_off[2],
                 c.ref_snap ? "integers snapped to it" : "flood seed from it", c.uw_rep_ref > 0 ? ", repair pieces anchored to it" : "");
     }
+    /* --phase-gate 0|1|2 (with --ref-model; default 1 with --ref-snap 1; src/phasegate.c): the network phase replaced by the ref's where it does not rotate with the
+       density's sheets (1: gated, --pg-lo 0.3 --pg-hi 0.6 --pg-R 6 --pg-conf 0.5; 2: the ref's phase everywhere). Crushed scrolls. */
+    const int pgm = atoi(opt(argc, argv, "--phase-gate", refm && c.ref_snap == 1 && !min ? "1" : "0"));   /* (default on for the c2f snap: --ref-model --ref-snap 1) */
+    if (pgm > 0) {
+        if (!refm || min) { fprintf(stderr, "fit: --phase-gate needs --ref-model (and no --model)\n"); return 2; }
+        if (cached) { fprintf(stderr, "fit: --phase-gate goes without --sweep\n"); return 2; }
+        struct timespec tg0, tg1; clock_gettime(CLOCK_MONOTONIC, &tg0);
+        const fit_pgate_cfg pg = {.mode = pgm == 2, .R = atoi(opt(argc, argv, "--pg-R", "6")), .lo = atof(opt(argc, argv, "--pg-lo", "0.3")), .hi = atof(opt(argc, argv, "--pg-hi", "0.6")),
+                                  .rc = atof(opt(argc, argv, "--pg-conf", "0.5"))};
+        const int D = fb.shape[0], H = fb.shape[1], W = fb.shape[2], na = (int)(D * fb.h) + 1; const size_t plane = (size_t)H * W, n = (size_t)D * plane;
+        const int BZ = 16, dev = use_stream && !fb.f.t[1];
+        uint8_t *tb = dev ? malloc((size_t)3 * BZ * plane) : nullptr; double st[4] = {0}; int bad = dev && !tb;
+        fit_set_dev *gd = c.cpu ? nullptr : fit_set_upload(refm);   /* (W_ref on the GPU; null: the CPU grid) */
+        for (int z0 = 0; z0 < D && !bad; z0 += BZ) {
+            const int nz = z0 + BZ <= D ? BZ : D - z0; const size_t off = (size_t)z0 * plane;
+            fit_fields blk = fb.f; blk.D = nz; blk.pc = fb.a[0] + off; blk.ps = fb.a[1] + off; blk.sp = fb.a[8] + off; blk.w = fb.a[9] + off;
+            for (int k = 0; k < 6; k++) blk.t[k] = fb.f.t[k] ? fb.f.t[k] + off : nullptr;
+            if (dev) { const int tk[3] = {1, 2, 5}; for (int q = 0; q < 3; q++) { nn_d2h(tb + (size_t)q * BZ * plane, fst.dfield + (size_t)(2 + tk[q]) * n + off, (size_t)nz * plane); blk.t[tk[q]] = tb + (size_t)q * BZ * plane; } }
+            if (fit_phase_gate(&blk, z0, fb.f.cy, fb.f.cx, na, refm, gd, c.ref_off, &pg, fb.a[0] + off, fb.a[1] + off, nullptr, st)) bad = 1;
+            if (!bad && dev) { nn_h2d(fst.dfield + off, fb.a[0] + off, (size_t)nz * plane); nn_h2d(fst.dfield + n + off, fb.a[1] + off, (size_t)nz * plane); }
+        }
+        free(tb); if (gd) fit_set_dev_free(gd);
+        if (bad) { fprintf(stderr, "fit: --phase-gate failed (memory / ref grid)\n"); return 1; }
+        clock_gettime(CLOCK_MONOTONIC, &tg1);
+        fprintf(stderr, "fit: phase gate (%s): mean rotation q %.3f, the ref's phase on %.3f of %.0f material cells (%.1f s)\n", pg.mode ? "ref everywhere" : "gated",
+                st[3] ? st[2] / st[3] : 0, st[0] ? st[1] / st[0] : 0, st[0], (tg1.tv_sec - tg0.tv_sec) + 1e-9 * (tg1.tv_nsec - tg0.tv_nsec));
+    }
     fit_set *fs = nullptr;
     if (min) fs = fit_set_load(min);
     else if (slab > 0) fs = fit_run_slabs(dir, &c, slab, overlap);
@@ -1679,13 +1708,13 @@ static void *wraps_rows(void *arg) {
     wraps_job *J = arg; const fit_model *m = J->m;
     for (int r; (r = atomic_fetch_add(&J->next, 1)) < J->rows;) {
         const double z = fmin(J->zlo + r * J->step, J->Z), cy = m->cy[(int)fmin(z, J->na - 1)], cx = m->cx[(int)fmin(z, J->na - 1)];
-        double rprev = J->rk; size_t valid = 0;
+        double rprev = J->rk; size_t valid = 0; fit_set_row *row = fit_set_row_new(J->fs, z);
         for (int c = 0; c < J->cols; c++) {
             const size_t i = (size_t)r * J->cols + (J->cols - 1 - c);   /* column 0 = the largest theta side (upstream: outermost first) */
             const double th = J->th0 + c * J->dth; double rr;
             J->px[i] = J->py[i] = J->pz[i] = -1;
             double ua, ub; wr_polar_bounds(J->P, r, th, &ua, &ub);
-            if (fit_set_ray_root_b(J->fs, z, th, J->k, rprev, ua, ub, &rr)) continue;
+            if (row ? fit_set_row_root_b(row, th, J->k, rprev, ua, ub, &rr) : fit_set_ray_root_b(J->fs, z, th, J->k, rprev, ua, ub, &rr)) continue;
             const double y = cy + rr * sin(th), x = cx + rr * cos(th);
             if (J->wf) {
                 const int fz = (int)fmin(z / J->wh, J->wsh[0] - 1), fy = (int)fmin(y / J->wh, J->wsh[1] - 1), fx = (int)fmin(x / J->wh, J->wsh[2] - 1);
@@ -1693,6 +1722,7 @@ static void *wraps_rows(void *arg) {
             }
             J->px[i] = (float)(x + m->origin[2]); J->py[i] = (float)(y + m->origin[1]); J->pz[i] = (float)(z + m->origin[0]); valid++; rprev = rr;
         }
+        fit_set_row_free(row);
         atomic_fetch_add(&J->valid, valid);
     }
     return nullptr;
@@ -4036,6 +4066,7 @@ static int cmd_sample(int argc, char **argv) {
 }
 
 int cmd_repack(int argc, char **argv);   /* src/repack.c */
+int cmd_fields_pack(int argc, char **argv);   /* src/fieldspack.c */
 int cmd_fit_join(int argc, char **argv);   /* src/fitjoin.c */
 int cmd_wrap_check(int argc, char **argv);   /* src/wrapcheck.c */
 int cmd_fields_oracle(int argc, char **argv);   /* src/fieldsoracle.c */
@@ -4050,6 +4081,7 @@ int cmd_fiber_check(int argc, char **argv);    /* src/fibercheck.c */
 int cmd_fiber_export(int argc, char **argv);   /* src/fibercheck.c */
 int cmd_count_field(int argc, char **argv);   /* src/countfield.c */
 int cmd_hires_phase(int argc, char **argv);   /* src/hiresphase.c */
+int cmd_phase_gate(int argc, char **argv);   /* src/phasegate.c */
 int cmd_patch_raster(int argc, char **argv);   /* src/patchraster.c */
 int cmd_ray_check(int argc, char **argv);   /* src/raycheck.c */
 int cmd_vwt_sample(int argc, char **argv);   /* src/vwt_sample.c */
@@ -4104,6 +4136,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "fiber-export")) return cmd_fiber_export(argc, argv);
     if (!strcmp(cmd, "count-field")) return cmd_count_field(argc, argv);
     if (!strcmp(cmd, "hires-phase")) return cmd_hires_phase(argc, argv);
+    if (!strcmp(cmd, "phase-gate")) return cmd_phase_gate(argc, argv);
     if (!strcmp(cmd, "patch-raster")) return cmd_patch_raster(argc, argv);
     if (!strcmp(cmd, "ray-check")) return cmd_ray_check(argc, argv);
     if (!strcmp(cmd, "vwt-sample")) return cmd_vwt_sample(argc, argv);
@@ -4118,6 +4151,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "sr-pairs")) return cmd_sr_pairs(argc, argv);
     if (!strcmp(cmd, "convert-unwrap2")) return cmd_convert_unwrap2(argc, argv);
     if (!strcmp(cmd, "repack")) return cmd_repack(argc, argv);
+    if (!strcmp(cmd, "fields-pack")) return cmd_fields_pack(argc, argv);
     if (!strcmp(cmd, "phase-raster")) return cmd_phase_raster(argc, argv);
     if (!strcmp(cmd, "wraps")) return cmd_wraps(argc, argv);
     if (!strcmp(cmd, "stitch")) return cmd_stitch(argc, argv);

@@ -65,7 +65,10 @@ int main(void) {
         const size_t site[2] = {0, ns - 4 * (size_t)G};
         if (md == 0) {
             double d = 0; for (size_t i = 0; i < ns; i++) d = fmax(d, fabs((double)s[2][i] - s[0][i]) / (fabs((double)s[0][i]) + 1e-3));
-            CHECK(d < 1e-3 && unet_l0_updates(u) == 0, "gn: the same window's statistics again (%g), no running ones (%ld)", d, unet_l0_updates(u));
+            /* (float atomics: the summation order changes the low bits, MX rounding downstream amplifies them at the deeper sites: 40 runs
+               spread 4e-7 .. 1.02e-3 on the laptop, so 1e-3 failed ~1 in 40: the known flake) */
+            printf("  gn: the same window's statistics again: max rel diff %.3g\n", d);
+            CHECK(d < 5e-3 && unet_l0_updates(u) == 0, "gn: the same window's statistics again (%g), no running ones (%ld)", d, unet_l0_updates(u));
         } else if (md == 1 || md == 3) {
             int c = 1; for (int b = 0; b < 2; b++) for (int k = 0; k < 4 * G; k++) c &= s[0][site[b] + k] == (k / G % 2 ? 1.f : 0.f);
             int live = 0; for (int k = 0; k < G; k++) live |= s[0][4 * G + k] != 0.f;

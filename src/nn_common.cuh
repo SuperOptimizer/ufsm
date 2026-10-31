@@ -3,6 +3,7 @@
    sections compile as separate translation units in parallel). */
 /* CUDA ops behind src/nn.h. fp32, NCDHW. Direct convolutions with shared-memory tiling; no cuBLAS/cuDNN. */
 #include "nn.h"
+#include "gnacc.cuh"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -699,6 +700,7 @@ __global__ void __launch_bounds__(fw_nth_z(MT, FZ), fw_blocks_z(MT, FZ)) conv_fw
     float *cs = (float *)smem_raw;                     /* [2][BM] block partials */
     const int zs0 = sp.zlo, zs1 = D - sp.zhi;          /* statistics over the z planes this GPU owns (spatial split) */
     if (osum) { __syncthreads(); for (int i = threadIdx.x; i < 2 * BM; i += NTH) cs[i] = 0.f; __syncthreads(); }
+    float sps[MT][2] = {}, spss[MT][2] = {};   /* (the lane's channel sums, added to cs in warp order below) */
 #pragma unroll
     for (int m = 0; m < MT; m++)
 #pragma unroll
@@ -729,15 +731,24 @@ __global__ void __launch_bounds__(fw_nth_z(MT, FZ), fw_blocks_z(MT, FZ)) conv_fw
             if (osum) {
                 ps += __shfl_xor_sync(0xffffffff, ps, 1); ps += __shfl_xor_sync(0xffffffff, ps, 2);
                 pss += __shfl_xor_sync(0xffffffff, pss, 1); pss += __shfl_xor_sync(0xffffffff, pss, 2);
-                if (t == 0) { atomicAdd(&cs[m * 16 + g + 8 * h], ps); atomicAdd(&cs[BM + m * 16 + g + 8 * h], pss); }
+                sps[m][h] = ps; spss[m][h] = pss;
             }
+        }
+    if (osum)   /* the warps' sums in warp order (block barriers): fixed float rounding, run-to-run identical statistics */
+        for (int w = 0; w < NTH / 32; w++) {
+            if ((int)(threadIdx.x >> 5) == w && t == 0)
+#pragma unroll
+                for (int m = 0; m < MT; m++)
+#pragma unroll
+                    for (int h = 0; h < 2; h++) { cs[m * 16 + g + 8 * h] += sps[m][h]; cs[BM + m * 16 + g + 8 * h] += spss[m][h]; }
+            __syncthreads();
         }
     if (osum) {
         __syncthreads();
         if (threadIdx.x < BM && co0 + (int)threadIdx.x < Co) {
             int cpg = Co / Go, ng = n * Go + (co0 + threadIdx.x) / cpg;
-            atomicAdd(&osum[2 * ng], (double)cs[threadIdx.x]);
-            atomicAdd(&osum[2 * ng + 1], (double)cs[BM + threadIdx.x]);
+            gn_acc_add(osum, 2 * ng, (double)cs[threadIdx.x]);   /* exact fixed point: order-independent (src/gnacc.cuh) */
+            gn_acc_add(osum, 2 * ng + 1, (double)cs[BM + threadIdx.x]);
         }
     }
 }
@@ -1798,10 +1809,11 @@ __global__ void gn_sums_k(const T *x, int C, int G, size_t S, double *sums, size
     r1[threadIdx.x] = s1; r2[threadIdx.x] = s2;
     __syncthreads();
     for (int o = 128; o > 0; o >>= 1) { if (threadIdx.x < o) { r1[threadIdx.x] += r1[threadIdx.x + o]; r2[threadIdx.x] += r2[threadIdx.x + o]; } __syncthreads(); }
-    if (threadIdx.x == 0) { atomicAdd(&sums[2 * ng], r1[0]); atomicAdd(&sums[2 * ng + 1], r2[0]); }
+    if (threadIdx.x == 0) { gn_acc_add(sums, 2 * ng, r1[0]); gn_acc_add(sums, 2 * ng + 1, r2[0]); }   /* exact fixed point (src/gnacc.cuh) */
 }
 __global__ void gn_finalize_k(const double *sums, int NG, size_t len, float eps, float *mean, float *rstd);
 double *gn_dsums(size_t n);
+void gn_zs_reduce(double *sums, int n);   /* zs_reduce of GroupNorm sum slots (src/gnacc.cuh) */
 
 template <int SILU, typename TI, typename TO>
 __global__ void gn_apply_k(const TI *x, const float *gamma, const float *beta, const float *mean, const float *rstd, TO *y, int C, int G, size_t S) {

@@ -106,10 +106,9 @@ static const char *json_ints(const char *from, const char *key, int64_t v[3]) {
     return strchr(p, ']');
 }
 
-int cmd_repack(int argc, char **argv) {
-    if (argc < 5) { fprintf(stderr, "usage: ufsm repack <in-array-dir> <out-array-dir> <shard> [--threads N]\n"); return 2; }
-    rp_t R = {.in = argv[2], .out = argv[3], .sout = atoi(argv[4])};
-    int nth = ufsm_threads(0, 32); for (int a = 5; a + 1 < argc; a++) if (!strcmp(argv[a], "--threads")) nth = atoi(argv[a + 1]);
+/* re-shard one array (src/fieldspack.c too): 0 ok; quiet: no summary line */
+int repack_array(const char *in, const char *out, int shard, int nth, int quiet) {
+    rp_t R = {.in = in, .out = out, .sout = shard};
     char p[1400]; snprintf(p, sizeof p, "%s/zarr.json", R.in);
     size_t jn; char *js = slurp(p, &jn); if (!js) { fprintf(stderr, "repack: cannot read %s\n", p); return 1; }
     int64_t cs[3], inner[3];
@@ -135,7 +134,12 @@ int cmd_repack(int argc, char **argv) {
     for (int i = 0; i < nth; i++) pthread_create(&th[i], nullptr, rp_worker, &R);
     for (int i = 0; i < nth; i++) pthread_join(th[i], nullptr);
     if (atomic_load(&R.failed)) { fprintf(stderr, "repack: FAILED\n"); return 1; }
-    printf("repack %s -> %s: shard %d -> %d, %ld files, %ld chunks, %ld bytes\n", R.in, R.out, R.sin, R.sout,
+    if (!quiet) printf("repack %s -> %s: shard %d -> %d, %ld files, %ld chunks, %ld bytes\n", R.in, R.out, R.sin, R.sout,
            atomic_load(&R.files), atomic_load(&R.chunks), atomic_load(&R.bytes));
     return 0;
+}
+int cmd_repack(int argc, char **argv) {
+    if (argc < 5) { fprintf(stderr, "usage: ufsm repack <in-array-dir> <out-array-dir> <shard> [--threads N]\n"); return 2; }
+    int nth = ufsm_threads(0, 32); for (int a = 5; a + 1 < argc; a++) if (!strcmp(argv[a], "--threads")) nth = atoi(argv[a + 1]);
+    return repack_array(argv[2], argv[3], atoi(argv[4]), nth, 0);
 }

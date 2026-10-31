@@ -14,7 +14,8 @@ make -j && make test     # gcc -std=c23 + nvcc; needs libcurl, libzstd, libblosc
 make ARCH=86             # Ampere (RTX 3090) into build86/: software MX-fp4 / fp8 (bit-exact conversions, emulated block-scaled MMAs)
                          # (on by default there; UFSM_MX_EMU=0: fp8 / fp4 as bf16, 16-bit storage); PTX=1: compute_86 PTX
                          # only (build86p/), so a newer GPU runs the sm_86 code (tests); BDIR=build puts it in build/
-make VERIFY=1 test-all   # the suite alone (build-verify/: adds the bf16 / fp32 reference kernels)
+make -j test             # fast tier (the merge gate); make test-slow: the slow tier; make test-all: both
+scripts/test/desk_suite.sh BRANCH   # the same on the desk (push over ssh, build, run, failing logs), one suite at a time
 make doctor              # the toolchain the Makefile picked + `ufsm sysinfo` (real cgroup CPUs / RAM, GPUs / MIG, CUDA, disk)
 ```
 
@@ -22,13 +23,27 @@ The Makefile finds its toolchain itself: the first of gcc / gcc-15 / gcc-14 that
 CUDA in /usr/local/cuda, else the newest /usr/local/cuda-*, else nvcc's prefix on PATH (CUDA= overrides), nvcc `-ccbin g++-N`
 for gcc-N, and `-lstdc++` in CUDALIBS (gcc-14 + CUDA 13.2 failed to link without it). Default thread counts follow the cgroup
 (`cpu.max` quota, affinity; `UFSM_NCPU` overrides), not nproc, and memory budgets (count-field `--mem-gb`, `UFSM_RENDER_MEM`)
-are lowered to what the cgroup still allows (src/sysinfo.h).
+are lowered to what the cgroup still allows (src/sysinfo.h). ccache is shared across worktrees (`CCACHE_BASEDIR` = the tree,
+`CCACHE_NOHASHDIR`), so a fresh worktree or desk suite dir rebuilds from the cache.
 
-`make test` builds the default `build/ufsm` plus the fixtures the Python CLI tests use, then runs `test-all` on the VERIFY=1
-build. Single tests: `make VERIFY=1 build-verify/test_strip && build-verify/test_strip`. The pipeline stages below have their
-own tests: `test_countfield`, `test_fit_join`, `test_wraps_core`, `test_flatten`, `test_flatten_gpu`,
+The tests are listed in `tests/suite.txt` (`NAME | TAGS | EST_SECONDS | COMMAND`) and run by `tests/run_suite.sh`. `make test`
+builds `build/ufsm`, the fixtures the Python CLI tests use and every suite binary on the VERIFY=1 build (`build-verify/`), then runs
+the fast tier in parallel: the runner sets the job count from the CPUs this process may use (cgroup-aware, `-j`, `SUITE_J`), caps the
+threads of each test (`UFSM_NCPU` / `UFSM_FIT_THREADS` / `UFSM_TIFF_THREADS` / `OMP_NUM_THREADS`, `-T`), gives each `gpu` test
+one of 2 slots per GPU (`-G`; machine-wide locks in `/tmp/ufsm-suite-locks`, shared by concurrent suites), the GPU with the most free memory first, runs the
+longest first, retries `flaky` tests once and prints each failing test's log tail plus a summary (`results.tsv` holds wall / CPU /
+max RSS per test). Runner options go through `SUITE_FLAGS`, e.g. `make test SUITE_FLAGS="-j 4 test_fit"` (names matching a regex),
+`-l` lists the tests, `-P` profiles (marks the tests that open the GPU, samples their GPU memory). One test by hand:
+`make VERIFY=1 build-verify/test_strip && build-verify/test_strip`. A new test: its binary as a prerequisite of `suite-bins` in the
+Makefile and a line in `tests/suite.txt` (tag `gpu` if it touches the GPU, `slow` if it takes more than ~30 s). The pipeline
+stages below have their own tests: `test_countfield`, `test_fit_join`, `test_wraps_core`, `test_flatten`, `test_flatten_gpu`,
 `test_faces`, `test_faces_gpu`, `test_strip`, `test_render_stream` (render / ink-compare / jpeg-fit, byte-identical streamed vs in-memory),
-`test_sheetcut`, `test_ink_blend.py`. On the laptop run builds and tests through `~/ufsm-data/capped.sh`.
+`test_sheetcut`, `test_ink_blend.py`. On the laptop run builds and tests through `~/ufsm-data/capped.sh` (with nice).
+
+`scripts/test/desk_suite.sh [-t fast|slow|all] REF [REGEX...]` pushes the commit into `/vesuvius/ufsm/suite/repo.git` on the desk,
+exports it to `/vesuvius/ufsm/suite/<sha>`, builds it (ccache shared across the sha dirs) and runs the suite at nice 10 under a lock
+(one desk suite at a time). It waits for the desk to have MemAvailable >= 40 GB and a 1-min load <= 32 (`-m` / `-l`, at most `-w` 60 min)
+before building and before testing, and uses the GPUs with >= 3 GB free. Logs stay in `/vesuvius/ufsm/suite/<sha>/out`.
 
 ## Unroll a scroll
 
@@ -41,7 +56,7 @@ CK=wind96-wk1-best.ckpt; INKCK=ift3-24000.ckpt
 
 # 1. fit fields (wind96): 10 planes on a 2-voxel cell grid, written straight into a fit-field set; repack to 512^3 shards
 $U predict $CK $R $K fields.tmp --um 2.4 --level 2 --box Z,Y,X,NZ,NY,NX --window-z 384 --halo-z 64 --window 640 --halo 64 --shard 512 \
-   --grid-origin 0,0,0 --ema 1 --q 8 --axis axis.json --levels 1 --fit-zarr fields --fit-h 2 --fit-q 8 --fit-q-phase 0 --no-out 1 --occupancy 5
+   --grid-origin 0,0,0 --ema 1 --q 8 --axis axis.json --levels 1 --fit-zarr fields --fit-h 2 --fit-q 8 --fit-q-phase 4 --no-out 1 --occupancy 5
 for a in fields/*/; do $U repack $a ${a%/}.512 512 --threads 12 && rm -r $a && mv ${a%/}.512 $a; done
 
 # 2. ink (ift3-24000): frozen GroupNorm from a calibration band, two passes offset by half a shard, blended
@@ -137,8 +152,13 @@ requests in flight per IP). ARCH=86 is picked by itself on sm_80/86/89 GPUs (sof
 - `UFSM_RENDER_MEM` = min(16, 25% of the limit);
 - no per-wrap renders (`PERWRAP=1` adds them).
 
-Every variable can be overridden from the environment. Disk for a Paris 4-size scroll: CT level 2 42 GB, fields 50 GB (deleted
+Every variable can be overridden from the environment. Disk for a Paris 4-size scroll: CT level 2 42 GB, fields ~5 GB (50 GB with the old lossless phase; deleted
 once the wraps exist), joined 10 GB, ink 1.5 GB.
+
+Fields copied home: predict writes the phase planes lossy (`--fit-q-phase 4`; they were lossless, ~90% of the store). PHerc0490B
+21.6 -> 2.85 GB (7.6x), PHerc0483B 30.4 -> 3.47 GB (8.8x). A store written before that shrinks in place with
+`scripts/pod/packfields.sh FIELDS` (`ufsm fields-pack`, byte-identical to predicting at q 4): 21.6 GB in 160 s at 8 threads on the
+loaded desk, IO-bound on a slow disk.
 
 Peak RSS per stage. Measured with `scripts/pod/unroll.sh` on a Paris 4 crop: 1024 level-2 z of the papyrus box y 1024+7150,
 x 512+7424, so slab fits and predicts see the whole-scroll cross-section. The crop ran on the desk in
@@ -191,6 +211,7 @@ ufsm ingest-kaggle <hf-root> <out>                     # Kaggle cubes -> images.
 ufsm ingest-mesh <s3-root> <tifxyz-key> <out.sfc>      # segment mesh -> surfcomp
 ufsm raster <out> --shape Z,Y,X --um U meshes...       # meshes -> label pyramid (surface band / background / ignore)
 ufsm repack <in-array> <out-array> 512 [--threads N]   # lossless re-sharding of a z3w uint8 array (copies compressed chunks)
+ufsm fields-pack IN OUT [--q-phase 4] [--q -1] [--threads N]   # a fit-field store smaller: phase planes lossy (old stores: lossless pc / ps = 90%), other planes copied; readers unchanged
 ufsm z3-recode <group> <out-group> --um U --lut FILE [--hist 1]   # a prob254 pyramid through a LUT (255 kept), value histogram
 ```
 
@@ -260,7 +281,7 @@ CT | phase hue over CT | winding mod 4 hue over CT; rows z-mid / y-mid / x-mid).
 | `--window W --halo H` / `--window-z --halo-z` | tile size and discarded border (thin-z windows for the fields) |
 | `--grid-origin z,y,x` | tile interiors anchored to CT coordinates: a voxel's windows do not depend on the box / shard layout |
 | `--full-grid 1` | every tile of the grid (ink); `--occupancy L`: skip shards, and windows whose interior, that are zero on the coarser CT level L (one coarse voxel of margin; outputs and fit fields identical except at isolated low CT specks whose coarse voxels round to 0, e.g. 6 of 4.2M P3 coarse voxels; also with `--fit-zarr`; reads of air windows saved: P4 61% / P3 31% of the shards at L 5; `UFSM_OCC_TILES=0`: shards only); `--resume 1`: skip written shards |
-| `--fit-zarr DIR --fit-h 2 --fit-q 8 --fit-q-phase 0 --no-out 1 --axis JSON` | the unwrap heads straight into a fit-field set (no prediction pyramid) |
+| `--fit-zarr DIR --fit-h 2 --fit-q 8 --fit-q-phase 4 --no-out 1 --axis JSON` | the unwrap heads straight into a fit-field set (no prediction pyramid) |
 | `--gn-save FILE` / `--gn-frozen FILE` | GroupNorm statistics from a calibration box, then frozen for the whole volume (no per-tile brightness seams) |
 | `--ema 1`, `--q Q`, `--levels N` | EMA weights, volcomp quality (0 lossless), pyramid levels written |
 | `--tta`, `--input-gain G --input-bias B` | test-time augmentation; the standardized CT input transform `G * zscore(CT) + B` (defaults: identity) |
@@ -386,7 +407,12 @@ columns); `--col-r centre` is the old spacing. `--zr Z0,Z1` keeps rows at global
 wrap ids within about one turn of a data cell are computed, largest first. Each empty id cost 30-60 CPU-s of failed root searches:
 Paris 4 sampled 16..580, wrote 257, and the empty ids above the data took 10.7 of 20.7 min. `UFSM_WRAPS_NOPRUNE=1` computes every id.
 The `.sfc` files (here and in `ufsm strip`) are encoded on all threads, byte-identical to the serial writer (P4 strip.sfc 876 -> 170 s
-at 4 threads).
+at 4 threads). The encoder itself runs ~1.8x faster with the same bytes: the vendored surfcomp's DCTs and quantizer on 8-wide vectors
+(the same multiply-add order per lane; the build has no FP contraction), each candidate tokenized once, tANS sizes before bytes, the
+index entries buffered (`test_tfx` checks golden hashes of the original encoder). The writer's workers run a ring ahead and append
+in order themselves (no thread woken per patch). `--fields` reads the data weight chunk by chunk
+on threads (PHerc0490B's 80 G cells at pool 8: 190 -> 6 s), the slab models load on threads, and a row's slab choice is made once.
+PHerc0490B wraps + strip and a Paris 4 crop: every file byte-identical to master.
 
 **flatten.** SLIM (symmetric Dirichlet, multilevel, flip-free line search; `src/flatten.h`) on the wrap's own vertex grid,
 then an isometric uv resample, Laplace fill of enclosed tears up to `--fill-holes` vertices (orange in `<w>_mask.jpg`; they
@@ -410,7 +436,8 @@ device mirror of the decoded chunks (decode list = the exact substreams the samp
 no FMA): byte-identical outputs, CPU fallback without a device or when the device pool fills. Paris 4 w178: sampling 35 -> 3 s,
 medians 15 -> 2.5 s; the CPU volcomp decode is then ~75% of the wall. `UFSM_FACES_PROF=1` prints per-stage times. With
 `UFSM_GPU_DECODE=1` (below) the CT substreams are decoded on the GPU straight into that device mirror (no host round trip;
-if the GPU path fails mid-run the substreams only the device had are decoded again on the host).
+if the GPU path fails mid-run the substreams only the device had are decoded again on the host; with it faces marks + decodes
+128 rows per fill instead of 32 (`UFSM_FACES_FILL_ROWS`): bigger decode batches, w178 CT fill 79-82 -> 55-58 s on a loaded laptop).
 
 **GPU volcomp decoding** (`UFSM_GPU_DECODE=1`, opt-in; `src/nn_gpudec.cu`): every lossy (mode 0) volcomp substream that
 z3_read / z3_read_sub decodes goes to the GPU instead of volcomp_fast.h, byte-identical (one thread per substream for the tANS

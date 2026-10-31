@@ -69,6 +69,12 @@ int main(int argc, char **argv) {
         CHECK(abs(a.a[3][m] - (int)lrintf(255 / (1 + expf(-bias[3])))) <= 2, "unwrap2 normals from channels 2-7: t1 %d", a.a[3][m]);
         fit_fields_free(&a); fit_fields_free(&b); fit_fields_free(&t);
     }
+    /* the --fit-zarr quantisers by default: phase planes q 4, the other planes q 8 (ufsm-fieldq-2026-10-30; were both lossless) */
+    for (int k = 0; k < 2; k++) {
+        char p[600], s[8192] = {0}; snprintf(p, sizeof p, "%s/%s/zarr.json", o2, k ? "t0" : "pc"); FILE *f = fopen(p, "r");
+        if (f) { if (!fread(s, 1, sizeof s - 1, f)) s[0] = 0; fclose(f); }
+        CHECK(strstr(s, k ? "{\"q\":8}" : "{\"q\":4}") != nullptr, "default --fit-q%s: %s", k ? "" : "-phase", p);
+    }
     if (!fails) { char cmd[600]; snprintf(cmd, sizeof cmd, "rm -rf %s", dir); if (system(cmd)) {} }
     if (fails) { fprintf(stderr, "test_predict_unwrap2: %d FAILED (kept %s)\n", fails, dir); return 1; }
     printf("test_predict_unwrap2: ok\n");

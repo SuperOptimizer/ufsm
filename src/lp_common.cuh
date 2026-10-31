@@ -24,6 +24,7 @@
 #include "nn.h"
 #include "nn_lp.h"
 #include "lp_slab.cuh"
+#include "gnacc.cuh"
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -1121,9 +1122,15 @@ __device__ __forceinline__ void fwd_epi_mxt(float (&acc)[MT][NR][2][4], float *t
             }
         }
     }
-    if (stats)
+    if (stats) {   /* the warps' sums through their own buffers (free now), added over the warps in warp order: fixed float rounding,
+                      run-to-run identical statistics (float atomics from 8 warps rounded in arrival order) */
 #pragma unroll
-        for (int jb = 0; jb < MT / 2; jb++) { atomicAdd(&cs[32 * jb + lane], ps[jb]); atomicAdd(&cs[BM + 32 * jb + lane], pss[jb]); }
+        for (int jb = 0; jb < MT / 2; jb++) { tb[32 * jb + lane] = ps[jb]; tb[BM + 32 * jb + lane] = pss[jb]; }
+        __syncthreads();
+        const float *t0 = tb - (threadIdx.x >> 5) * HV * 36;
+        for (int c = threadIdx.x; c < 2 * BM; c += blockDim.x) { float s = 0.f; for (int w = 0; w < (int)(blockDim.x >> 5); w++) s += t0[w * HV * 36 + c]; cs[c] += s; }
+        __syncthreads();
+    }
 }
 /* MX output of fwd_epilogue when every 16-row tile is one whole stored 16-channel block (the <= 16-channel tensors of a 16-wide
    level 0): per warp row (HV 16) or half row (HV 8) of 16 output voxels and tile, the [HV voxel][16 ch] accumulators pass through
@@ -1230,12 +1237,17 @@ __device__ __forceinline__ void fwd_epi_mx16(float (&acc)[MT][NR][2][4], float *
             }
         }
     }
-    if (stats)
+    if (stats) {
 #pragma unroll
-        for (int j = 0; j < MT; j++) {
-            ps[j] += __shfl_xor_sync(0xffffffffu, ps[j], 16); pss[j] += __shfl_xor_sync(0xffffffffu, pss[j], 16);
-            if (!sh) { atomicAdd(&cs[16 * j + sv], ps[j]); atomicAdd(&cs[BM + 16 * j + sv], pss[j]); }
-        }
+        for (int j = 0; j < MT; j++) { ps[j] += __shfl_xor_sync(0xffffffffu, ps[j], 16); pss[j] += __shfl_xor_sync(0xffffffffu, pss[j], 16); }
+        if (!sh)   /* through the warps' own buffers, added in warp order (as fwd_epi_mxt) */
+#pragma unroll
+            for (int j = 0; j < MT; j++) { tb[16 * j + sv] = ps[j]; tb[BM + 16 * j + sv] = pss[j]; }
+        __syncthreads();
+        const float *t0 = tb - (threadIdx.x >> 5) * HV * 20;
+        for (int c = threadIdx.x; c < 2 * BM; c += blockDim.x) { float s = 0.f; for (int w = 0; w < (int)(blockDim.x >> 5); w++) s += t0[w * HV * 20 + c]; cs[c] += s; }
+        __syncthreads();
+    }
 }
 /* a launcher's epilogue scratch with fwd_epi_mx16 room when an output tensor of cout (split at sp.o_split) is stored in 16-channel
    blocks: whole rows (FEPI16_SCR(16)) while the block (fixed + scratch bytes) still fits twice per SM, else half rows */
@@ -1258,8 +1270,8 @@ template <int BM> __device__ __forceinline__ void fwd_stats_flush(const unsigned
     const float *cs = (const float *)scr;
     if (threadIdx.x < BM && co0 + (int)threadIdx.x < Co) {
         const int cpg = Co / Go, ng = n * Go + (co0 + threadIdx.x) / cpg;
-        atomicAdd(&osum[2 * ng], (double)cs[threadIdx.x]);
-        atomicAdd(&osum[2 * ng + 1], (double)cs[BM + threadIdx.x]);
+        gn_acc_add(osum, 2 * ng, (double)cs[threadIdx.x]);
+        gn_acc_add(osum, 2 * ng + 1, (double)cs[BM + threadIdx.x]);
     }
 }
 template <int MT, int NR, typename T, bool FST = false, bool E16 = (MT == 1), bool OWN = false>   /* FST: try the shared-memory MX store paths (they check
@@ -1478,6 +1490,7 @@ __device__ __forceinline__ void fwd_epilogue(float (&acc)[MT][NR][2][4], unsigne
                 }
         }
     }
+    float sps[MT][2] = {}, spss[MT][2] = {};   /* (the lane's channel sums, added to cs in warp order below) */
     if (!st_done)
 #pragma unroll
     for (int m = 0; m < MT; m++)
@@ -1516,15 +1529,24 @@ __device__ __forceinline__ void fwd_epilogue(float (&acc)[MT][NR][2][4], unsigne
             if (osum) {
                 ps += __shfl_xor_sync(0xffffffff, ps, 1); ps += __shfl_xor_sync(0xffffffff, ps, 2);
                 pss += __shfl_xor_sync(0xffffffff, pss, 1); pss += __shfl_xor_sync(0xffffffff, pss, 2);
-                if (t == 0) { atomicAdd(&cs[m * 16 + g + 8 * h], ps); atomicAdd(&cs[BM + m * 16 + g + 8 * h], pss); }
+                sps[m][h] = ps; spss[m][h] = pss;
             }
+        }
+    if (osum && !st_done)   /* the warps' sums in warp order (block barriers): fixed float rounding, run-to-run identical statistics */
+        for (int w = 0; w < (int)(blockDim.x >> 5); w++) {
+            if ((int)(threadIdx.x >> 5) == w && t == 0)
+#pragma unroll
+                for (int m = 0; m < MT; m++)
+#pragma unroll
+                    for (int h = 0; h < 2; h++) { cs[m * 16 + g + 8 * h] += sps[m][h]; cs[BM + m * 16 + g + 8 * h] += spss[m][h]; }
+            __syncthreads();
         }
     if (osum && !OWN) {
         __syncthreads();
         if (threadIdx.x < BM && co0 + (int)threadIdx.x < Co) {
             int cpg = Co / Go, ng = n * Go + (co0 + threadIdx.x) / cpg;
-            atomicAdd(&osum[2 * ng], (double)cs[threadIdx.x]);
-            atomicAdd(&osum[2 * ng + 1], (double)cs[BM + threadIdx.x]);
+            gn_acc_add(osum, 2 * ng, (double)cs[threadIdx.x]);   /* exact fixed point: order-independent (src/gnacc.cuh) */
+            gn_acc_add(osum, 2 * ng + 1, (double)cs[BM + threadIdx.x]);
         }
     }
 }
