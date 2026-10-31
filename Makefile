@@ -78,7 +78,7 @@ all: $(B)/ufsm
 # A new test: its binary as a prerequisite of suite-bins (suite-bins: $(B)/test_x) and a line in tests/suite.txt.
 SUITE_FLAGS ?=
 SUITE_BDIR = $(BDIR)-verify
-test-prep:
+test-prep: suite-check
 	$(MAKE) VERIFY=0 build/ufsm build/test_sheet build/make_pipeline_fixture build/test_http_reader build/test_sampler_safety build/test_formats
 	$(MAKE) VERIFY=1 suite-bins
 test: test-prep
@@ -87,6 +87,10 @@ test-slow: test-prep
 	tests/run_suite.sh -B $(SUITE_BDIR) -t slow $(SUITE_FLAGS)
 test-all: test-prep
 	tests/run_suite.sh -B $(SUITE_BDIR) -t all $(SUITE_FLAGS)
+# a branch from before the runner adds tests as "test-all: $(B)/test_x" (+ recipe lines, which conflict): they belong in suite-bins and
+# tests/suite.txt now (stray test-all prerequisites would not be built into build-verify)
+suite-check:
+	@! grep -nE '^test-all: *\$$\(B\)' Makefile || { echo 'Makefile: move these to "suite-bins: $$(B)/test_x" and a line in tests/suite.txt'; exit 1; }
 suite-bins: $(B)/ufsm $(B)/test_spatial_augment
 
 $(B)/%.o: src/%.c src/*.h third_party/volcomp.h | $(B)
@@ -512,7 +516,7 @@ suite-bins: $(B)/test_gpu_aug $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cove
 clean:
 	rm -rf build build-verify build86 build86-verify build86p build86p-verify
 
-.PHONY: all test test-prep test-slow test-all suite-bins clean
+.PHONY: all test test-prep test-slow test-all suite-bins suite-check clean
 
 $(B)/bench_wgrad4: tests/bench_wgrad4.c $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
