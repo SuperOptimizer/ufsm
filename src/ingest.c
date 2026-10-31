@@ -97,9 +97,10 @@ static void pool2_mask(const uint8_t *in, int n, uint8_t *out) {
 }
 
 /* ---- pyramid: build level l (>= 1) of `dir` from level l-1 (both our own zarr3 stores) ---- */
-typedef struct { z3 *zp; z3w *w; int shard, labels, nthreads; int64_t ns[3]; int64_t shape[3]; atomic_int failed, done; } bl_job;
-static void bl_shard(int si, int tid, void *ud) {
+typedef struct { z3 *zp; z3w *w; int shard, labels, nthreads; int64_t ns[3]; int64_t shape[3]; atomic_int failed, done; int64_t si0; } bl_job;
+static void bl_shard(int si_, int tid, void *ud) {
     bl_job *j = ud;
+    const int64_t si = j->si0 + si_;   /* (a z-layer range: pyramid_build_level_z) */
     int shard = j->shard;
     int64_t sx = si % j->ns[2], sy = (si / j->ns[2]) % j->ns[1], sz = si / (j->ns[2] * j->ns[1]);
     size_t sv = (size_t)shard * shard * shard;
@@ -127,7 +128,11 @@ static void bl_shard(int si, int tid, void *ud) {
     atomic_fetch_add(&j->done, 1);
 }
 
-int pyramid_build_level(const char *group_dir, double um0, int l, const int64_t shape0[3], int shard, float q, int labels, int nthreads, const char *attrs) {
+/* level l over the shard z-layers [z0, z1) of level l only (z1 < 0: to the end); quiet: no timing line. Each shard of level l is built
+   from the level l - 1 data on disk at the time of the call, as one whole-level build would (predict pipelines level 1 behind the
+   windows: layers whose level-0 shards are all written) */
+int pyramid_build_level_z(const char *group_dir, double um0, int l, const int64_t shape0[3], int shard, float q, int labels, int nthreads, const char *attrs,
+                          int64_t z0, int64_t z1, int quiet) {
     const int fill = labels == 1 || labels == 3 ? 255 : 0;
     char cur[1400], lv[32];
     z3w_level_name(um0 * (1 << l), lv, sizeof lv);
@@ -137,17 +142,23 @@ int pyramid_build_level(const char *group_dir, double um0, int l, const int64_t 
     store *s = store_open(group_dir);
     char pk[64]; z3w_level_name(um0 * (1 << (l - 1)), pk, sizeof pk);
     z3 *zp = z3_open(s, pk, nullptr);
-    if (!zp) { fprintf(stderr, "build_level: cannot open %s/%s: %s\n", group_dir, pk, z3_error()); return -1; }
+    if (!zp) { fprintf(stderr, "build_level: cannot open %s/%s: %s\n", group_dir, pk, z3_error()); store_close(s); return -1; }
     z3w *w = labels == 2 ? z3w_create_mask(cur, shape, shard, attrs) : z3w_create(cur, shape, shard, q, fill, attrs);
-    if (!w) { fprintf(stderr, "build_level: %s\n", z3w_error()); return -1; }
-    bl_job j = {zp, w, shard, labels, 4, {0, 0, 0}, {shape[0], shape[1], shape[2]}, 0, 0};
+    if (!w) { fprintf(stderr, "build_level: %s\n", z3w_error()); z3_close(zp); store_close(s); return -1; }
+    bl_job j = {zp, w, shard, labels, 4, {0, 0, 0}, {shape[0], shape[1], shape[2]}, 0, 0, 0};
     for (int d = 0; d < 3; d++) j.ns[d] = (shape[d] + shard - 1) / shard;
+    if (z1 < 0 || z1 > j.ns[0]) z1 = j.ns[0];
+    if (z0 < 0) z0 = 0;
     int par = nthreads / 4; if (par < 1) par = 1; if (par > 8) par = 8;   /* 8 shards in flight x 4 decode threads */
     double t0 = now();
-    parallel_for((int)(j.ns[0] * j.ns[1] * j.ns[2]), par, bl_shard, &j);
-    fprintf(stderr, "level %d: %lld x %lld x %lld in %.0fs\n", l, (long long)shape[0], (long long)shape[1], (long long)shape[2], now() - t0);
+    j.si0 = z0 * j.ns[1] * j.ns[2];
+    if (z1 > z0) parallel_for((int)((z1 - z0) * j.ns[1] * j.ns[2]), par, bl_shard, &j);
+    if (!quiet) fprintf(stderr, "level %d: %lld x %lld x %lld in %.0fs\n", l, (long long)shape[0], (long long)shape[1], (long long)shape[2], now() - t0);
     z3w_close(w); z3_close(zp); store_close(s);
     return atomic_load(&j.failed) ? -1 : 0;
+}
+int pyramid_build_level(const char *group_dir, double um0, int l, const int64_t shape0[3], int shard, float q, int labels, int nthreads, const char *attrs) {
+    return pyramid_build_level_z(group_dir, um0, l, shape0, shard, q, labels, nthreads, attrs, 0, -1, 0);
 }
 
 int pyramid_write_group(const char *dir, double um0, int nlev, const char *name, const char *attrs) {

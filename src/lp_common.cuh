@@ -1285,7 +1285,9 @@ __device__ __forceinline__ void fwd_epilogue(float (&acc)[MT][NR][2][4], unsigne
                                              unsigned scr_off = 0) {   /* smem_raw: the scratch, scr_off bytes into the dynamic smem */
     constexpr int BM = MT * 16, RZ = NR / 2;
     const int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
-    const int zs0 = sp.zlo, zs1 = D - sp.zhi;   /* statistics over the z planes this GPU owns (spatial split) */
+    int zs0 = sp.zlo, zs1 = D - sp.zhi;   /* statistics over the z planes this GPU owns (spatial split) */
+    if (sp.yD) { oz0 += sp.yzo; zs0 += sp.yzo; zs1 += sp.yzo; D = sp.yD; }   /* direct slab output (nn_set_zrange_out): planes yzo.. of a depth-yD
+                                                                             tensor; the launch's planes keep their statistics range */
     float *cs = (float *)smem_raw;
     if (osum && !OWN) { __syncthreads(); for (int i = threadIdx.x; i < 2 * BM; i += blockDim.x) cs[i] = 0.f; __syncthreads(); }
     bool mx_done = false, st_done = false;

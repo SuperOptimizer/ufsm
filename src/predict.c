@@ -24,6 +24,8 @@
 #include <math.h>
 #include <pthread.h>
 #include <sys/wait.h>
+#include <sys/resource.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -81,7 +83,7 @@ static void *reader_main(void *arg) {
 typedef struct { z3w *w; int nthreads; size_t bytes; uint8_t *buf[WBUF_MAX]; int64_t sz[WBUF_MAX], sy[WBUF_MAX], sx[WBUF_MAX]; int pending[WBUF_MAX]; int nb, next;
                  atomic_int failed; pthread_mutex_t mu; pthread_cond_t cv; int stop;
                  int gpu, async, skip; void *evs[WBUF_MAX], *evd[WBUF_MAX]; double t_write; long n_write;
-                 int64_t off[3]; int donefd; } writer_t;   /* off: shard index offset (--full-grid); donefd: the --resume log (-1 none) */   /* (UFSM_PRED_PROF: seconds compressing / writing, shards) */   /* async: buffer k arrives by a copy on the offload stream (evd[k]) */
+                 int64_t off[3]; int donefd; atomic_long nsub, ndone; } writer_t;   /* off: shard index offset (--full-grid); donefd: the --resume log (-1 none) */   /* (UFSM_PRED_PROF: seconds compressing / writing, shards) */   /* async: buffer k arrives by a copy on the offload stream (evd[k]) */
 static void *writer_main(void *arg) {
     writer_t *W = arg;
     if (W->async) nn_init(W->gpu);
@@ -95,7 +97,7 @@ static void *writer_main(void *arg) {
         const double tw = now();
         if (!W->skip && z3w_write_shard(W->w, W->sz[k] + W->off[0], W->sy[k] + W->off[1], W->sx[k] + W->off[2], W->buf[k], W->nthreads)) atomic_store(&W->failed, 1);   /* skip: --no-out 1 */
         else if (W->donefd >= 0) dprintf(W->donefd, "%lld %lld %lld\n", (long long)(W->sz[k] + W->off[0]), (long long)(W->sy[k] + W->off[1]), (long long)(W->sx[k] + W->off[2]));   /* (O_APPEND: whole lines across GPU workers) */
-        W->t_write += now() - tw; W->n_write++;
+        W->t_write += now() - tw; W->n_write++; atomic_fetch_add(&W->ndone, 1);
         pthread_mutex_lock(&W->mu); W->pending[k] = 0; W->next = (k + 1) % W->nb; pthread_cond_broadcast(&W->cv); pthread_mutex_unlock(&W->mu);
     }
 }
@@ -110,7 +112,7 @@ static void writer_d2h(writer_t *W, int k, const uint8_t *dsh) {
 static int writer_next(const writer_t *W, int k) { return (k + 1) % W->nb; }
 static int writer_submit(writer_t *W, int k, int64_t sz, int64_t sy, int64_t sx) {
     pthread_mutex_lock(&W->mu);
-    W->sz[k] = sz; W->sy[k] = sy; W->sx[k] = sx; W->pending[k] = 1; pthread_cond_broadcast(&W->cv);
+    W->sz[k] = sz; W->sy[k] = sy; W->sx[k] = sx; W->pending[k] = 1; atomic_fetch_add(&W->nsub, 1); pthread_cond_broadcast(&W->cv);
     while (W->pending[writer_next(W, k)]) pthread_cond_wait(&W->cv, &W->mu);
     pthread_mutex_unlock(&W->mu);
     return atomic_load(&W->failed);
@@ -215,7 +217,7 @@ typedef struct { int k; int64_t a, b, c; int noout; } fe_job;
 typedef struct {
     feather_t *F; writer_t *WR; int sb; int kss, shard; const int64_t *ns, *bn;
     uint8_t *fh[2]; int busy[2];
-    fe_job q[2]; int qh, qn, stop, failed;
+    fe_job q[2]; int qh, qn, stop, failed; atomic_long done;   /* done: windows blended and handed to the writer */
     pthread_mutex_t mu; pthread_cond_t cv; pthread_t th;
 } fe_worker;
 static void *fe_main(void *arg) {
@@ -246,7 +248,7 @@ static void *fe_main(void *arg) {
         if (!bad && feather_keep(F, j.a, j.b, j.c)) bad = 2;
         pthread_mutex_lock(&W->mu);
         if (bad) W->failed = bad;
-        W->busy[j.k] = 0; W->qh = (W->qh + 1) % 2; W->qn--;
+        W->busy[j.k] = 0; W->qh = (W->qh + 1) % 2; W->qn--; atomic_fetch_add(&W->done, 1);
         pthread_cond_broadcast(&W->cv); pthread_mutex_unlock(&W->mu);
     }
 }
@@ -255,6 +257,44 @@ static int fe_wait_idle(fe_worker *W) {   /* every queued window blended and han
     while (W->qn) pthread_cond_wait(&W->cv, &W->mu);
     const int f = W->failed; pthread_mutex_unlock(&W->mu);
     return f;
+}
+/* level 1 of the output pyramid behind the --feather windows (UFSM_PYR_PIPE, default on): once the windows have moved past level-0
+   shard layer 2 Z + 1 (global shard index) and the feather thread and the writer have written everything handed over until then, a
+   thread (nice 10) builds level-1 shard layer Z from the level-0 shards on disk (pyramid_build_level_z), as the build after the run
+   would; the layers it has not reached are built after the run. Same bytes; the ~15% of a whole-scroll ink pass that level 1 took
+   (pod P0800: 171 of 1375 s) overlaps the windows */
+typedef struct { int64_t z; long fe_t; } pp_job;
+typedef struct {
+    const char *out; double um; const int64_t *shape0; int shard, nthreads; float q; const char *attrs;
+    writer_t *WR; fe_worker *FW;
+    int64_t nz1, next; uint8_t *done; pp_job *jq; int64_t qh, qn; int stop, failed; double busy;
+    pthread_mutex_t mu; pthread_cond_t cv; pthread_t th;
+} pyr_pipe;
+static void *pyr_main(void *arg) {
+    pyr_pipe *P = arg;
+    if (setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), 10)) { }   /* (the windows' reader / blend / writer threads first; inherited by the build's threads) */
+    for (;;) {
+        pthread_mutex_lock(&P->mu);
+        while (P->qh == P->qn && !P->stop) pthread_cond_wait(&P->cv, &P->mu);
+        if (P->qh == P->qn) { pthread_mutex_unlock(&P->mu); return nullptr; }
+        const pp_job j = P->jq[P->qh];
+        pthread_mutex_unlock(&P->mu);
+        while (atomic_load(&P->FW->done) < j.fe_t && !atomic_load(&P->WR->failed)) { pthread_mutex_lock(&P->FW->mu); const int f = P->FW->failed; pthread_mutex_unlock(&P->FW->mu); if (f) break; usleep(5000); }
+        const long sub = atomic_load(&P->WR->nsub);
+        while (atomic_load(&P->WR->ndone) < sub && !atomic_load(&P->WR->failed)) usleep(5000);
+        const double t = now();
+        const int r = pyramid_build_level_z(P->out, P->um, 1, P->shape0, P->shard, P->q, 0, P->nthreads, P->attrs, j.z, j.z + 1, 1);
+        pthread_mutex_lock(&P->mu);
+        P->busy += now() - t; if (r) P->failed = 1; else P->done[j.z] = 1; P->qh++;
+        pthread_mutex_unlock(&P->mu);
+    }
+}
+/* the main loop at a window of global level-0 shard layer gz: queue the level-1 layers below it */
+static void pyr_advance(pyr_pipe *P, int64_t gz, long fe_t) {
+    if (!P) return;
+    pthread_mutex_lock(&P->mu);
+    while (P->next < P->nz1 && 2 * P->next + 1 < gz) { P->jq[P->qn++] = (pp_job){P->next, fe_t}; P->next++; }
+    pthread_cond_broadcast(&P->cv); pthread_mutex_unlock(&P->mu);
 }
 /* fit-field accumulators (12 planes, src/nn_fit.cu nn_fit_accum) of nf cells -> the 10 uint8 fit-field arrays */
 static void fit_finalize(const float *acc, size_t nf, int h, uint8_t *const a[10]) {
@@ -1377,6 +1417,15 @@ int cmd_predict(int argc, char **argv) {
         pthread_mutex_init(&FW.mu, nullptr); pthread_cond_init(&FW.cv, nullptr);
         if (pthread_create(&FW.th, nullptr, fe_main, &FW)) { fprintf(stderr, "predict: cannot start the feather thread\n"); return 1; }
     }
+    static pyr_pipe PP; pyr_pipe *pp = nullptr;
+    if (fea && gpath && sup && nlev > 1 && !WR.skip && nwork <= 1 && !split && !sheet_task && (!getenv("UFSM_PYR_PIPE") || ufsm_env_on("UFSM_PYR_PIPE"))) {
+        const int64_t n1 = ((ash[0] + 1) / 2 + shard - 1) / shard;
+        PP = (pyr_pipe){.out = out, .um = um_l, .shape0 = ash, .shard = shard, .nthreads = nthreads, .q = q, .attrs = attrs, .WR = &WR, .FW = &FW,
+                        .nz1 = n1, .done = calloc((size_t)n1, 1)};
+        PP.jq = malloc((size_t)(n1 + 1) * sizeof *PP.jq);
+        pthread_mutex_init(&PP.mu, nullptr); pthread_cond_init(&PP.cv, nullptr);
+        if (PP.done && PP.jq && !pthread_create(&PP.th, nullptr, pyr_main, &PP)) pp = &PP;
+    }
     int64_t cur_shard = -1, so[3] = {0, 0, 0}, se[3] = {0, 0, 0}, sz = 0, sy = 0, sx = 0;
     int any = 0;
     const int pprof = ufsm_env_on("UFSM_PRED_PROF");
@@ -1407,6 +1456,7 @@ int cmd_predict(int argc, char **argv) {
         p_wait += now() - pt;
         if (atomic_load(&rd.failed)) { fprintf(stderr, "%s\n", z3_error()); return 1; }
         const tile_t *t = &rd.tiles[i];
+        if (pp) pyr_advance(pp, t->shard / (nss[1] * nss[2]) * kss + soff[0], fe_n);   /* (feather windows: z-y-x, one shard each) */
         if (ffrow) {   /* a new row of (super-)shards: the previous row's field shards are final */
             const int64_t nX = sup ? nss[2] : ns[2], nY = sup ? nss[1] : ns[1], row = t->shard / nX;
             if (ffprow >= 0 && row != ffprow) {
@@ -1758,7 +1808,22 @@ int cmd_predict(int argc, char **argv) {
         nn_init(gpus[1]); unet_free(u1); nn_init(gpu); split_free(sctx);
     }
     if (nwork > 1) { fprintf(stderr, "gpu %d: %ld tiles in %.0fs\n", gpu, ntiles, now() - t0); z3_close(ct); store_close(s); unet_free(u); return 0; }   /* worker: the parent builds the pyramid */
-    for (int l = 1; l < nlev; l++) if (pyramid_build_level(out, um_l, l, ash, shard, q, 0, nthreads, attrs)) return 1;
+    if (pp) {   /* level 1: the pipelined layers, then the rest */
+        pthread_mutex_lock(&pp->mu); pp->stop = 1; pthread_cond_broadcast(&pp->cv); pthread_mutex_unlock(&pp->mu);
+        const double tw = now(); pthread_join(pp->th, nullptr); const double wait = now() - tw;
+        if (pp->failed) return 1;
+        long nd = 0; for (int64_t z = 0; z < pp->nz1; z++) nd += pp->done[z];
+        const double tr = now();
+        for (int64_t z = 0; z < pp->nz1;) {
+            if (pp->done[z]) { z++; continue; }
+            int64_t e = z; while (e < pp->nz1 && !pp->done[e]) e++;
+            if (pyramid_build_level_z(out, um_l, 1, ash, shard, q, 0, nthreads, attrs, z, e, 1)) return 1;
+            z = e;
+        }
+        fprintf(stderr, "level 1: %ld of %lld shard layers built behind the windows (%.0f s), %.0f s waited, %.0f s for the rest\n", nd, (long long)pp->nz1, pp->busy, wait, now() - tr);
+        free(pp->done); free(pp->jq);
+    }
+    for (int l = pp ? 2 : 1; l < nlev; l++) if (pyramid_build_level(out, um_l, l, ash, shard, q, 0, nthreads, attrs)) return 1;
     if (pyramid_write_group(out, um_l, nlev, "ufsm-recto", attrs)) return 1;
     fprintf(stderr, "wrote %s (%ld tiles in %.0fs)\n", out, ntiles, now() - t0);
     z3_close(ct); store_close(s); unet_free(u);

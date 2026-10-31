@@ -30,6 +30,7 @@ void nn_copy_async(void *dst, const void *src, size_t bytes);   /* device / pinn
 void nn_d2d_async(void *dst, const void *src, size_t bytes);   /* on the default stream, no host sync */
 void nn_d2d_kernel(void *dst, const void *src, size_t bytes);  /* the same as a copy kernel (16-byte aligned dst, src): no copy engine */
 void nn_set_zrange(int zi0, int Di, int first, int last, int Do, int zo);   /* z-range of the next MX forward convs (see nn_bwd.cu): output planes zo + .. of Do, reading input planes zi0 + .. of a depth-Di input; Di 0 = off */
+void nn_set_zrange_out(int on);   /* 1: the z-range's MX conv outputs go to planes zo + .. of the depth-Do output itself (no temp; nn_bwd.cu) */
 void nn_set_zwin(int zw0, int zw1, int D0, int first, int last);   /* z-window of the next level-0 ops (see nn_bwd.cu): output planes [zw0, zw1) of their whole tensors, in planes of depth D0 (scaled per tensor); D0 0 = off; first / last zero / finalise GroupNorm sums */
 void nn_sync(void);
 const char *nn_device_error(void);   /* cudaDeviceSynchronize: an earlier kernel fault (sticky) as a message, else nullptr */
