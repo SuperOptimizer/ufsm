@@ -6,6 +6,7 @@
    Vertex coordinates are in the wraps' voxels (meta.json voxel_size_um); point p there is native ((p + 0.5) wum / um - 0.5) for
    fields of native voxel um (ufsm wraps --out-um maps voxel centres to voxel centres). */
 #include "fit.h"
+#include "sysinfo.h"
 #include "stitch.h"
 #include "tiff.h"
 #include "tiffw.h"
@@ -220,7 +221,7 @@ int cmd_refine(int argc, char **argv) {
         fprintf(stderr, "usage: ufsm refine <wraps-in> <wraps-out> --fields DIR [--model FIT] [--range 0.33] [--smooth-um 40] [--target 0] [--min-conf 0.2] [--iters 400] [--threads 16]\n"); return 2;
     }
     const double range = atof(sopt(argc, argv, "--range", "0.33")), smooth_um = atof(sopt(argc, argv, "--smooth-um", "40")), target = atof(sopt(argc, argv, "--target", "0"));
-    const double minconf = atof(sopt(argc, argv, "--min-conf", "0.2")); const int iters = atoi(sopt(argc, argv, "--iters", "400")), nt = atoi(sopt(argc, argv, "--threads", "16"));
+    const double minconf = atof(sopt(argc, argv, "--min-conf", "0.2")); const int iters = atoi(sopt(argc, argv, "--iters", "400")), nt = ufsm_threads(atoi(sopt(argc, argv, "--threads", "0")), 16);
     if (!(range > 0) || range > 0.5 || !(smooth_um >= 0) || nt < 1) { fprintf(stderr, "refine: --range in (0, 0.5] sheet spacings, --smooth-um >= 0\n"); return 2; }
     sf_fields F; if (sff_load(sopt(argc, argv, "--fields", ""), &F)) { fprintf(stderr, "refine: cannot read the fields %s\n", sopt(argc, argv, "--fields", "")); return 1; }
     fit_set *ms = sopt(argc, argv, "--model", nullptr) ? fit_set_load(sopt(argc, argv, "--model", "")) : nullptr;   /* orients the normals */
@@ -519,7 +520,7 @@ int cmd_surf_stats(int argc, char **argv) {
                         "  statistics (on-papyrus share per wrap, CT profile) and the normal angles are measured; the phase columns print 0\n"); return 2;
     }
     const double cmin = atof(sopt(argc, argv, "--min-conf", "0.3")), gap_um = atof(sopt(argc, argv, "--gap", "1")) * 1000, min_um = atof(sopt(argc, argv, "--min-run", "100"));
-    const int nt = atoi(sopt(argc, argv, "--threads", "16")), per = sflag(argc, argv, "--per-wrap"), ctonly = atoi(sopt(argc, argv, "--ct-only", "0"));
+    const int nt = ufsm_threads(atoi(sopt(argc, argv, "--threads", "0")), 16), per = sflag(argc, argv, "--per-wrap"), ctonly = atoi(sopt(argc, argv, "--ct-only", "0"));
     fit_set_threads(nt);   /* the field loads' core masks */
     int ci = -1; for (int i = 2; i + 2 < argc; i++) if (!strcmp(argv[i], "--ct")) ci = i;
     const double ctum = atof(sopt(argc, argv, "--ct-um", "0")), ctlev = atof(sopt(argc, argv, "--ct-level", "80")), ctR = atof(sopt(argc, argv, "--ct-range", "15"));
@@ -727,7 +728,7 @@ int cmd_self_gate(int argc, char **argv) {
     }
     const double cmin = atof(sopt(argc, argv, "--min-conf", "0.3")), emax = atof(sopt(argc, argv, "--max-e", "0.15")), ratio = atof(sopt(argc, argv, "--fault-ratio", "3"));
     const double minq = atof(sopt(argc, argv, "--min-q", "0.5")), nbtol = atof(sopt(argc, argv, "--nb-tol", "0.15")), nbmin = atof(sopt(argc, argv, "--nb-min", "0.6"));
-    const double minarea = atof(sopt(argc, argv, "--min-area", "0.02")); const int erode = atoi(sopt(argc, argv, "--erode", "1")), nt = atoi(sopt(argc, argv, "--threads", "16")), per = sflag(argc, argv, "--per-wrap");
+    const double minarea = atof(sopt(argc, argv, "--min-area", "0.02")); const int erode = atoi(sopt(argc, argv, "--erode", "1")), nt = ufsm_threads(atoi(sopt(argc, argv, "--threads", "0")), 16), per = sflag(argc, argv, "--per-wrap");
     fit_set_threads(nt);
     int ci = -1; for (int i = 2; i + 2 < argc; i++) if (!strcmp(argv[i], "--ct")) ci = i;
     const double ctum = atof(sopt(argc, argv, "--ct-um", "0")), ctlev = atof(sopt(argc, argv, "--ct-level", "80")), ctR = atof(sopt(argc, argv, "--ct-range", "15"));

@@ -1,4 +1,5 @@
 #include "zarr3.h"
+#include "sysinfo.h"
 #include "json.h"
 #include <errno.h>
 #include <fcntl.h>
@@ -945,7 +946,7 @@ int z3_read_sub(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int
     }
     job jb = {.z = z, .o = o, .n = n, .out = out, .items = items, .nitems = nitems,
               .ranges = ranges, .nranges = nranges, .submask = submask};
-    if (nthreads <= 0) nthreads = (int)sysconf(_SC_NPROCESSORS_ONLN);
+    if (nthreads <= 0) nthreads = (int)ufsm_ncpu();
     int ntasks = ranges ? nranges : nitems;
     store_req *reqs = nullptr; int *task_of = nullptr; char (*rkeys)[1200] = nullptr; int nreq = 0;
     if (batch && ranges && ntasks) {

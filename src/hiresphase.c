@@ -22,6 +22,7 @@
 #include <string.h>
 #include <time.h>
 #include "fit.h"
+#include "sysinfo.h"
 #include "store.h"
 #include "zarr3.h"
 #include "reg.h"
@@ -228,7 +229,7 @@ int cmd_hires_phase(int argc, char **argv) {
     const char *root = argv[2], *key = argv[3], *dir = argv[4], *out = argv[5];
     const double ctum = atof(hp_opt(argc, argv, "--ct-um", "0"));
     if (!(ctum > 0)) { fprintf(stderr, "hires-phase: --ct-um U needed\n"); return 2; }
-    const int nt0 = atoi(hp_opt(argc, argv, "--threads", "16")), stride = atoi(hp_opt(argc, argv, "--stride", "1"));
+    const int nt0 = ufsm_threads(atoi(hp_opt(argc, argv, "--threads", "0")), 16), stride = atoi(hp_opt(argc, argv, "--stride", "1"));
     const int fillnet = strcmp(hp_opt(argc, argv, "--fill", "net"), "none") != 0, feature = !strcmp(hp_opt(argc, argv, "--feature", "valley"), "peak");
     const double mincf = atof(hp_opt(argc, argv, "--min-conf", "0.05")), memgb = atof(hp_opt(argc, argv, "--mem-gb", "6"));
     z3 *cz = z3_open(store_open(root), key, hp_opt(argc, argv, "--cache", nullptr)); if (!cz) { fprintf(stderr, "hires-phase: %s\n", z3_error()); return 1; }
@@ -444,7 +445,7 @@ int cmd_hires_count(int argc, char **argv) {
     if (argc < 5) { fprintf(stderr, "usage: ufsm hires-count CTROOT KEY REF-FIELDS --ct-um U [--map MAP.json] [--rt-um 15] [--sigma-um 2.4] [--prom 0.5] [--prom-abs 2] [--feature valley|peak] [--margin-um 200] [--threads 16] [--cache DIR] [--mem-gb 6]\n"); return 2; }
     const char *root = argv[2], *key = argv[3], *dir = argv[4];
     const double ctum = atof(hp_opt(argc, argv, "--ct-um", "0")); if (!(ctum > 0)) { fprintf(stderr, "hires-count: --ct-um U needed\n"); return 2; }
-    const int nt0 = atoi(hp_opt(argc, argv, "--threads", "16"));
+    const int nt0 = ufsm_threads(atoi(hp_opt(argc, argv, "--threads", "0")), 16);
     z3 *cz = z3_open(store_open(root), key, hp_opt(argc, argv, "--cache", nullptr)); if (!cz) { fprintf(stderr, "hires-count: %s\n", z3_error()); return 1; }
     const z3_meta *zm = z3_meta_of(cz);
     fit_fields_buf A; if (fit_fields_load(dir, 0, 0, 1, &A)) { fprintf(stderr, "hires-count: cannot load %s\n", dir); return 1; }

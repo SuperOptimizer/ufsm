@@ -10,6 +10,7 @@
      rings of horizontally resampled rows (pil_hrow, then the same fixed-point vertical sum as pil_vrow); the panels' contrast is a
      256-entry table per input (the CT's stretch maps 0 to 0, i.e. CT == 0 is the mask), the labels drawn per row with the same font. */
 #include "imgops.h"
+#include "sysinfo.h"
 #include "tiff.h"
 #include <math.h>
 #include <unistd.h>
@@ -406,7 +407,7 @@ int cmd_ink_compare(int argc, char **argv) {
         return ink_compare_mem(argc, argv);
     const double px = atof(icopt(argc, argv, "--px-um", "2.4")), rsu = atof(icopt(argc, argv, "--rs-um", "25")), rlu = atof(icopt(argc, argv, "--rl-um", "500"));
     if (!(px > 0) || !(rsu > 0) || !(rlu > rsu)) { fprintf(stderr, "ink-compare: need --px-um > 0 and 0 < --rs-um < --rl-um\n"); return 2; }
-    icx X; memset(&X, 0, sizeof X); X.nth = atoi(icopt(argc, argv, "--threads", "16"));
+    icx X; memset(&X, 0, sizeof X); X.nth = ufsm_threads(atoi(icopt(argc, argv, "--threads", "0")), 16);
     const char *lab[NIMG] = {"ct"}; int rc = 0;
     /* the inputs: strip TIFFs of one size and strip height, else the in-memory version */
     {
@@ -586,7 +587,7 @@ end:
 int cmd_jpeg_fit(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: ufsm jpeg-fit IN.jpg OUT.jpg [--div 2 | --max-px N] [--quality 90] [--threads 16]\n"); return 2; }
     const double div = atof(icopt(argc, argv, "--div", "0")); int maxpx = atoi(icopt(argc, argv, "--max-px", "0"));
-    const int q = atoi(icopt(argc, argv, "--quality", "90")), th = atoi(icopt(argc, argv, "--threads", "16"));
+    const int q = atoi(icopt(argc, argv, "--quality", "90")), th = ufsm_threads(atoi(icopt(argc, argv, "--threads", "0")), 16);
     if ((div > 0) == (maxpx > 0)) { fprintf(stderr, "jpeg-fit: one of --div D (> 0) or --max-px N\n"); return 2; }
     int w, h; uint8_t *rgb = jpeg_read_rgb(argv[2], &w, &h);
     if (!rgb) { fprintf(stderr, "jpeg-fit: cannot read %s\n", argv[2]); return 1; }

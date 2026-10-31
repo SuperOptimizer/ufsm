@@ -1,5 +1,6 @@
 /* ufsm faces command: the CT through a chunk cache, the published-surface check, tifxyz in / out (core: src/faces.c). */
 #include "faces.h"
+#include "sysinfo.h"
 #include "imgops.h"
 #include "sources.h"
 #include "store.h"
@@ -212,7 +213,7 @@ int cmd_faces(int argc, char **argv) {
     o.tmin = t0 / ctum; o.tmax = t1 / ctum;
     o.min_prom = atof(fopt(argc, argv, "--min-prom", "8")); o.rel = atof(fopt(argc, argv, "--rel", "0.1"));
     o.tol = atof(fopt(argc, argv, "--tol", "25")) / ctum; o.inset = atof(fopt(argc, argv, "--inset", "0")) / ctum;
-    o.smooth = atoi(fopt(argc, argv, "--smooth", "4")); o.nthreads = atoi(fopt(argc, argv, "--threads", "16"));
+    o.smooth = atoi(fopt(argc, argv, "--smooth", "4")); o.nthreads = ufsm_threads(atoi(fopt(argc, argv, "--threads", "0")), 16);
     const double ct_thr = atof(fopt(argc, argv, "--ct-thr", "90")), cache_mb = atof(fopt(argc, argv, "--cache-mb", "4096"));
     if (!(o.range > 2) || o.smooth > 20 || o.nthreads < 1) { fprintf(stderr, "faces: --range > 2 CT voxels, --smooth <= 20\n"); return 2; }
     const char *cache = fopt(argc, argv, "--cache", nullptr);

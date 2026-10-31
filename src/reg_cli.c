@@ -4,6 +4,7 @@
       "field": {"file", "n": [nz, ny, nx], "o": [x, y, z], "h"} (optional; float32 [nz][ny][nx][3] x y z displacement, coarse L0 voxels)}
    coarse c <-> fine A^-1 (c + D(c)). */
 #include "reg.h"
+#include "sysinfo.h"
 #include "json.h"
 #include "store.h"
 #include "imgops.h"
@@ -179,7 +180,7 @@ static int cmd_boxes(int argc, char **argv) {
     const double ratio = cum / (x.fv->um * (1 << q.lf));
     const char *ss = opt(argc, argv, "--ss", "auto"); q.ss = !strcmp(ss, "auto") ? (ratio > 1.3 ? 2 : 1) : atoi(ss);
     fprintf(stderr, "reg boxes: coarse level %d (%.3f um), fine level %d (%.3f um, ratio %.3f, ss %d), box %d, radius %d, metric %s hp %.2g lp %.2g\n", q.lc, cum, q.lf, x.fv->um * (1 << q.lf), ratio, q.ss, q.B, q.R, mt, q.hp, q.lp);
-    const int nt = atoi(opt(argc, argv, "--threads", "12")), mx = atoi(opt(argc, argv, "--max", "3000"));
+    const int nt = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 12), mx = atoi(opt(argc, argv, "--max", "3000"));
     const double box0 = q.B * (double)(1 << q.lc);   /* box size, coarse L0 voxels */
     const double S = atof(opt(argc, argv, "--spacing", "0")) > 0 ? atof(opt(argc, argv, "--spacing", "0")) : 2 * box0, off = atof(opt(argc, argv, "--offset", "0"));
     double *cen = nullptr; int nc = 0, cap = 0;
@@ -464,7 +465,7 @@ static int probe_ok(const double q[3], void *ud) {   /* the nearest probe box (c
 }
 static int cmd_warp(int argc, char **argv) {
     if (argc < 8) { fprintf(stderr, "usage: ufsm reg warp <reg.json> <label-root> <label-key> <label-um> <out-dir> --level L [--c2f] [--boxes eval_boxes.jsonl] [--box z,y,x,nz,ny,nx] [--fill 255] [--conf LO,HI [--iso I]] [--cache DIR] [--threads 8]\n"); return 2; }
-    const int L = atoi(opt(argc, argv, "--level", "-1")), fill = atoi(opt(argc, argv, "--fill", "255")), nt = atoi(opt(argc, argv, "--threads", "8"));
+    const int L = atoi(opt(argc, argv, "--level", "-1")), fill = atoi(opt(argc, argv, "--fill", "255")), nt = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 8);
     const int c2f = has(argc, argv, "--c2f");
     const double lum = atof(argv[6]);
     int clo = -1, chi = -1; const int iso = atoi(opt(argc, argv, "--iso", "0"));

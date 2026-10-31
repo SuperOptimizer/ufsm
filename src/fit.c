@@ -1,6 +1,7 @@
 /* Winding fitter host side (src/fit.h): label-free prior per z knot (pitch from the spacing field, refined by the phase
    coherence of r / pitch - dir theta / 2 pi; offset = its argument), then Adam on delta (coarse to fine) and the knots. */
 #include "fit.h"
+#include "sysinfo.h"
 #include "fit_terms.h"
 #include "nn.h"
 #include "json.h"
@@ -251,7 +252,7 @@ static void *fit_zrun(void *a) { fit_zjob *j = a; j->fn(j->ctx, j->z0, j->z1, j-
 static int g_fit_threads;   /* fit_cfg threads of the current fit (0: the core count) */
 void fit_set_threads(int n) { g_fit_threads = n; }
 static int fit_nthreads(int D) {
-    long n = sysconf(_SC_NPROCESSORS_ONLN); const char *e = getenv("UFSM_FIT_THREADS"); if (e && atoi(e) > 0) n = atoi(e);
+    long n = ufsm_ncpu(); const char *e = getenv("UFSM_FIT_THREADS"); if (e && atoi(e) > 0) n = atoi(e);
     if (g_fit_threads > 0) n = g_fit_threads;
     if (n > 64) n = 64;
     if (n > D) n = D;

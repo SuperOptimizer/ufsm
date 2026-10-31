@@ -1,6 +1,7 @@
 /* ufsm predict: sliding-window inference of a checkpoint over a CT box, written as a volcomp zarr v3
    probability pyramid (uint8 p*255, q=8) in the published layout. */
 #include "nn.h"
+#include "sysinfo.h"
 #include "checkpoint.h"
 #include "sheet.h"
 #include <zstd.h>
@@ -191,7 +192,7 @@ static int ffz_flush(z3w *const zw[FFZ_MAXP], uint8_t *const sl[FFZ_MAXP], int64
     }
     ffz_job J = {.zw = zw, .sl = sl, .slab = slab, .F = F, .FS = FS, .FZ = FZ, .nrow = nrow, .nx = (F[2] + FS - 1) / FS, .rq = rq, .ry = ry, .rg = rg};
     atomic_store(&J.next, 0); atomic_store(&J.fail, 0);
-    long nt = sysconf(_SC_NPROCESSORS_ONLN); if (ntmax > 0 && nt > ntmax) nt = ntmax; if (nt > 64) nt = 64; if (nt < 1) nt = 1;
+    long nt = ufsm_ncpu(); if (ntmax > 0 && nt > ntmax) nt = ntmax; if (nt > 64) nt = 64; if (nt < 1) nt = 1;
     pthread_t th[64]; int up[64] = {0};
     for (int i = 1; i < nt; i++) up[i] = pthread_create(&th[i], nullptr, ffz_worker, &J) == 0;
     ffz_worker(&J);
@@ -568,7 +569,7 @@ int cmd_predict(int argc, char **argv) {
     for (int i = 0; i < SA_N; i++) { char f[48]; snprintf(f, sizeof f, "--aug-%s-s", scan_aug_names[i]); dg.s[i] = (float)atof(opt(argc, argv, f, "0")); }
     if (*opt(argc, argv, "--aug-hist", "") && scan_aug_load_hist(opt(argc, argv, "--aug-hist", ""), &dg)) { fprintf(stderr, "predict: --aug-hist: cannot read the file\n"); return 2; }
     const int degrade = scan_aug_enabled(&dg); const uint64_t dg_seed = strtoull(opt(argc, argv, "--aug-seed", "1"), nullptr, 10);
-    int nthreads = atoi(opt(argc, argv, "--threads", "16"));
+    int nthreads = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 16);
     const int use_ema = atoi(opt(argc, argv, "--ema", "1")) != 0;
     const char *blend_s = opt(argc, argv, "--ema-blend", nullptr);   /* tail-average blend: a x final weights + (1 - a) x EMA (modded-nanogpt 0.35) */
     const float ema_blend = blend_s ? (float)atof(blend_s) : -1.f;
@@ -1077,7 +1078,7 @@ int cmd_predict(int argc, char **argv) {
             if (!ffw.done) { fprintf(stderr, "predict: out of memory\n"); return 1; }
             for (int b = 0; b < 2; b++) { ffw.h[b] = ff8h + (size_t)b * FFZ_MAXP * ffwn; ffw.evs[b] = nn_event_create(); ffw.evd[b] = nn_event_create(); }
             pthread_mutex_init(&ffw.mu, nullptr); pthread_cond_init(&ffw.cv, nullptr); atomic_store(&ffw.fail, 0);
-            { long nc = sysconf(_SC_NPROCESSORS_ONLN); ffw.rnt = nc > 2 ? (int)(nc / 2) : 1; }
+            { long nc = ufsm_ncpu(); ffw.rnt = nc > 2 ? (int)(nc / 2) : 1; }
             if (pthread_create(&ffw_th, nullptr, ffw_main, &ffw) || pthread_create(&ffw.rth, nullptr, ffw_rows, &ffw)) { fprintf(stderr, "predict: cannot start the fit writer\n"); return 1; }
             ffw_on = 1;
         }

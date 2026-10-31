@@ -1,5 +1,6 @@
 /* SLIM flattening of tifxyz wraps: see src/flatten.h. CLI: ufsm flatten, ufsm flatten-warp (end of file). */
 #include "flatten.h"
+#include "sysinfo.h"
 #include "imgops.h"
 #include "tiffw.h"
 #include <dirent.h>
@@ -607,7 +608,7 @@ int cmd_flatten(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: ufsm flatten <wraps-dir> <out-dir> [--wraps a,b,..] [--decim 1] [--iters 30] [--cg 200] [--min-verts 20000] [--out-step S] [--crop rect|none] [--max-aspect A] [--rects N] [--min-cm2 5] [--fill-holes 5000] [--max-edge 3] [--threads 16] [--gpu 1] [--sfc ERR] [--quiet 1]\n"); return 2; }
     flat_opts o = flat_opts_default();
     o.decim = atoi(fopt(argc, argv, "--decim", "1")); o.iters = atoi(fopt(argc, argv, "--iters", "30")); o.cg_iters = atoi(fopt(argc, argv, "--cg", "200"));
-    o.min_verts = atoi(fopt(argc, argv, "--min-verts", "20000")); o.max_edge = atof(fopt(argc, argv, "--max-edge", "3")); o.nthreads = atoi(fopt(argc, argv, "--threads", "16"));
+    o.min_verts = atoi(fopt(argc, argv, "--min-verts", "20000")); o.max_edge = atof(fopt(argc, argv, "--max-edge", "3")); o.nthreads = ufsm_threads(atoi(fopt(argc, argv, "--threads", "0")), 16);
     o.verbose = !atoi(fopt(argc, argv, "--quiet", "0")); o.gpu = atoi(fopt(argc, argv, "--gpu", "1"));
     const double ostep_opt = atof(fopt(argc, argv, "--out-step", "0")); const int crop = strcmp(fopt(argc, argv, "--crop", "rect"), "none") != 0;
     const char *wl = fopt(argc, argv, "--wraps", nullptr); char *want = nullptr; if (wl) { want = malloc(strlen(wl) + 3); sprintf(want, ",%s,", wl); }

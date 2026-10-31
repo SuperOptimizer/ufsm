@@ -4,6 +4,7 @@
    coarser levels hold round(254 * surface fraction) over the non-ignore children, or 255 when at least
    half of the children are ignore. */
 #include "hf.h"
+#include "sysinfo.h"
 #include "json.h"
 #include "store.h"
 #include "tiff.h"
@@ -208,7 +209,7 @@ int cmd_ingest_labels(int argc, char **argv) {
     const char *root = argv[2], *key = argv[3], *out = argv[4];
     double um = atof(opt(argc, argv, "--um", "0"));
     int nlev = atoi(opt(argc, argv, "--levels", "6"));
-    int nthreads = atoi(opt(argc, argv, "--threads", "16"));
+    int nthreads = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 16);
     int labels = !strcmp(opt(argc, argv, "--raw", "0"), "0");
     for (int i = 1; i < argc; i++) if (!strcmp(argv[i], "--raw")) labels = 0;
     int shard = atoi(opt(argc, argv, "--shard", "1024"));
@@ -323,7 +324,7 @@ static int read_cube(store *s, const char *key, uint8_t *cube, int Cmax) {
 int cmd_ingest_kaggle(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: ufsm ingest-kaggle <hf-root> <out-dir> [--key surfaces/kaggle] [--n N] [--token FILE] [--q 8] [--threads N]\n"); return 2; }
     const char *root = argv[2], *out = argv[3], *key = opt(argc, argv, "--key", "surfaces/kaggle");
-    int limit = atoi(opt(argc, argv, "--n", "0")), nthreads = atoi(opt(argc, argv, "--threads", "16"));
+    int limit = atoi(opt(argc, argv, "--n", "0")), nthreads = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 16);
     float q = (float)atof(opt(argc, argv, "--q", "8"));
     const int C = 320, SH = 640;   /* two cubes per shard along z */
     store *s = store_open(root);
@@ -508,7 +509,7 @@ int cmd_ingest_zip(int argc, char **argv) {
     if (argc < 5) { fprintf(stderr, "usage: ufsm ingest-zip <labels.zip> <zarr-name> <out-dir> --um U [--levels L] [--threads N] [--shard 1024] [--zmax Z] [--raw]\n"); return 2; }
     const char *zpath = argv[2], *name = argv[3], *out = argv[4];
     double um = atof(opt(argc, argv, "--um", "0"));
-    int nlev = atoi(opt(argc, argv, "--levels", "6")), nthreads = atoi(opt(argc, argv, "--threads", "32")), shard = atoi(opt(argc, argv, "--shard", "1024"));
+    int nlev = atoi(opt(argc, argv, "--levels", "6")), nthreads = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 32), shard = atoi(opt(argc, argv, "--shard", "1024"));
     int64_t zmax = atoll(opt(argc, argv, "--zmax", "0"));
     int labels = 1;
     for (int i = 1; i < argc; i++) if (!strcmp(argv[i], "--raw")) labels = 0;
@@ -794,7 +795,7 @@ int cmd_raster(int argc, char **argv) {
     if (sscanf(opt(argc, argv, "--shape", "0,0,0"), "%lld,%lld,%lld", &Z, &Y, &X) != 3 || Z <= 0 || Y <= 0 || X <= 0) { fprintf(stderr, "--shape Z,Y,X (positive level-0 voxels) required\n"); return 2; }
     double um = atof(opt(argc, argv, "--um", "0"));
     int level = atoi(opt(argc, argv, "--level", "0")), T = atoi(opt(argc, argv, "--T", "3")), nlev = atoi(opt(argc, argv, "--levels", "6"));
-    int nthreads = atoi(opt(argc, argv, "--threads", "8")), shard = atoi(opt(argc, argv, "--shard", "1024"));
+    int nthreads = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 8), shard = atoi(opt(argc, argv, "--shard", "1024"));
     int binary = atoi(opt(argc, argv, "--binary", "0"));
     int band = atoi(opt(argc, argv, "--band-chamfer", "4"));
     if (!isfinite(um) || um <= 0 || level < 0 || level > 20 || T < 1 || T > 84 ||
@@ -852,7 +853,7 @@ int cmd_z3_recode(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: ufsm z3-recode <group-dir> <out-group> --um U [--lut FILE] [--levels 1] [--threads 16] [--hist 1]\n"); return 2; }
     const char *in = argv[2], *out = argv[3];
     double um = atof(opt(argc, argv, "--um", "0"));
-    int nlev = atoi(opt(argc, argv, "--levels", "1")), nthreads = atoi(opt(argc, argv, "--threads", "16")), hist = atoi(opt(argc, argv, "--hist", "0"));
+    int nlev = atoi(opt(argc, argv, "--levels", "1")), nthreads = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 16), hist = atoi(opt(argc, argv, "--hist", "0"));
     const char *lf = opt(argc, argv, "--lut", nullptr);
     if (um <= 0 || (!lf && !hist)) { fprintf(stderr, "z3-recode: --um and --lut (or --hist 1) required\n"); return 2; }
     uint8_t lut[256];

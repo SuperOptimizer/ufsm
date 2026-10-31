@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "fit.h"
+#include "sysinfo.h"
 #include "z3w.h"
 #include "spiralfit.h"
 #include "zarr3.h"
@@ -453,7 +454,7 @@ int cmd_count_field(int argc, char **argv) {
         return 2;
     }
     const char *in = argv[2], *out = argv[3], *meth = cf_opt(argc, argv, "--method", "ls"), *cmode = cf_opt(argc, argv, "--conf", "mix"), *mdir = cf_opt(argc, argv, "--model", "");
-    cf_nt = atoi(cf_opt(argc, argv, "--threads", "8"));
+    cf_nt = ufsm_threads(atoi(cf_opt(argc, argv, "--threads", "0")), 8);
     const int R = atoi(cf_opt(argc, argv, "--R", "10")), Rz = R > 0 ? atoi(cf_opt(argc, argv, "--Rz", cf_opt(argc, argv, "--R", "10"))) : 0;
     const int iters = atoi(cf_opt(argc, argv, "--iters", "400")), Qf = atoi(cf_opt(argc, argv, "--loop", "8")), Rm = atoi(cf_opt(argc, argv, "--model-R", "8")), wwc = atoi(cf_opt(argc, argv, "--wc", "1"));
     const double lamr = atof(cf_opt(argc, argv, "--lambda", "1e-7")), eps = atof(cf_opt(argc, argv, "--eps", "1e-3")), rmin_um = atof(cf_opt(argc, argv, "--rmin-um", "500"));

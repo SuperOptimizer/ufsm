@@ -33,6 +33,7 @@
      JPEG, and the on-papyrus share along the strip (CT >= ct-level within 3 x 3 px around the surface point) per 1 cm column and per
      wrap (strip_papyrus.tsv, papyrus_wraps.tsv): where the surface leaves the papyrus is reported, never cut. */
 #include "flatten.h"
+#include "sysinfo.h"
 #include "imgops.h"
 #include "tiffw.h"
 #include "surfcomp.h"
@@ -113,7 +114,7 @@ int cmd_strip(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: ufsm strip <wraps-dir> <out-dir> [--first K] [--last K] [--every E] [--err 0.25] [--threads 8]\n"); return 2; }
     const char *wd = argv[2], *od = argv[3];
     const int first = atoi(sopt(argc, argv, "--first", "-1000000")), last = atoi(sopt(argc, argv, "--last", "1000000")), every = atoi(sopt(argc, argv, "--every", "1"));
-    const int nth = atoi(sopt(argc, argv, "--threads", "8")); const double err = atof(sopt(argc, argv, "--err", "0.25"));
+    const int nth = ufsm_threads(atoi(sopt(argc, argv, "--threads", "0")), 8); const double err = atof(sopt(argc, argv, "--err", "0.25"));
     if (every < 1 || !(err > 0)) { fprintf(stderr, "strip: --every >= 1, --err > 0\n"); return 2; }
     const double t0 = snow();
     DIR *d = opendir(wd); if (!d) { fprintf(stderr, "strip: cannot open %s\n", wd); return 1; }
@@ -450,7 +451,7 @@ int cmd_strip_flatten(int argc, char **argv) {
     if (st_open(sd, &F.S)) return 1;
     F.w = F.S.w; F.h = F.S.h; F.step = F.S.step; F.D = atoi(sopt(argc, argv, "--decim", "1")); if (F.D < 1) F.D = 1;
     F.max_edge = atof(sopt(argc, argv, "--max-edge", "3"));
-    const int nth = atoi(sopt(argc, argv, "--threads", "16"));
+    const int nth = ufsm_threads(atoi(sopt(argc, argv, "--threads", "0")), 16);
     int S = atoi(sopt(argc, argv, "--stride", "0")); if (S <= 0) S = F.h / 2; S = S / F.D * F.D; if (S < 4 * F.D) S = 4 * F.D; F.Sst = S;
     F.lw = (F.w - 1) / F.D + 1; F.lh = (F.h - 1) / F.D + 1;
     const double um = F.S.um, ostep = atof(sopt(argc, argv, "--ostep", "0")) > 0 ? atof(sopt(argc, argv, "--ostep", "0")) : F.step;
@@ -726,7 +727,7 @@ int cmd_strip_mosaic(int argc, char **argv) {
     const char *fd = argv[2], *rd = argv[3], *od = argv[4];
     const int ctl = atoi(sopt(argc, argv, "--ct-level", "80")), ovpx = atoi(sopt(argc, argv, "--overview-px", "16000")), rows = atoi(sopt(argc, argv, "--rows", "10")), q = atoi(sopt(argc, argv, "--quality", "88"));
     const double tilecm = atof(sopt(argc, argv, "--tile-cm", "1")); const int wstripes = atoi(sopt(argc, argv, "--stripes", "1"));
-    int nthr = atoi(sopt(argc, argv, "--threads", "8")); if (nthr < 1) nthr = 1; if (nthr > 64) nthr = 64;
+    int nthr = ufsm_threads(atoi(sopt(argc, argv, "--threads", "0")), 8); if (nthr < 1) nthr = 1; if (nthr > 64) nthr = 64;
     char p[1600], cmd[1600]; snprintf(cmd, sizeof cmd, "mkdir -p '%s'", od); if (system(cmd)) return 1;
     /* the strip's segments (wrap per source column): <flat-dir>/../strip.tsv or --strip */
     char sdir[1400]; snprintf(sdir, sizeof sdir, "%s", sopt(argc, argv, "--strip", "")); if (!*sdir) snprintf(sdir, sizeof sdir, "%s/..", fd);
