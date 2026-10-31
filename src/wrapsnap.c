@@ -1,6 +1,6 @@
 /* ufsm wrap-snap <wraps-in> <wraps-out> --axis FILE --axis-um U0 --ct ROOT KEY --ct-um U [--fields DIR] [--target ct|phase|recto|mix]
                   [--range 60] [--margin 0.1] [--sigma 480,240,120] [--tau 40,25,15] [--iters 2] [--min-prom 6] [--first K] [--last K]
-                  [--band 64] [--sfc 0.25] [--threads N] [--dry] [--cache DIR]
+                  [--band 64] [--sfc 0.25] [--threads N] [--dry] [--cache DIR] [--dmap DIR [--dmap-gs G]]
    Wraps (ufsm wraps .sfc: rows = z, columns = rays at one angle around the axis, wrap k = the level set W = k) moved ONTO the sheets.
    A fitted W is smoother than the papyrus and its level sets cross the gaps between sheets (Paris 4 strips ~.75-.79 on papyrus).
    Design (ufsm surf-snap moved vertices to the nearest CT ridge one by one: sheet switches and seams, ~10 um off the GT surfaces):
@@ -21,7 +21,9 @@
    - d is clamped to the vertex's interval and to its unmasked CT run (CT 0 = masked: a vertex never moves into or across it).
    Processing: z bands of --band wrap rows over ALL wraps (each CT / fields chunk decoded once per band; the wraps' rows read from
    their .sfc by region), then the per-wrap solves and .sfc writes on --threads. Deterministic for any thread count. --first / --last:
-   only those ids are snapped and written (their neighbours still bound them). --dry: the statistics only. */
+   only those ids are snapped and written (their neighbours still bound them). --dry: the statistics only. --dmap DIR: per wrap the
+   signed shift (um, + = outward) as DIR/wNNN.tif, uint8 128 + 4 x um, at ufsm render --scale 1 size (G = pixels per grid step,
+   default the wrap's step): it lines up with the wrap's renders. */
 #include "sources.h"
 #include "store.h"
 #include "surfcomp.h"
@@ -309,7 +311,7 @@ static void wsn_box(float *a, int w, int h, int rad, int dir, double *buf, doubl
         for (int l = 0; l < L; l++) a[dir ? (size_t)l * w + m : (size_t)m * w + l] = (float)buf[l];
     }
 }
-typedef struct { double sig[8], tau[8]; int nsig, iters; double lam, s0; axis *ax; const char *out; int dry; _Atomic int next, fail; wsn_wrap *W; int nw;
+typedef struct { double sig[8], tau[8]; int nsig, iters; double lam, s0; axis *ax; const char *out, *dmap; double dmap_gs; int dry; _Atomic int next, fail; wsn_wrap *W; int nw;
                  _Atomic long long nmov, nclamp, nval; _Atomic long long sumabs_q; } wsn_solve;
 static void wsn_solve_one(wsn_solve *S, wsn_wrap *w) {
     const int W = w->w, H = w->h; const size_t nv = (size_t)W * H;
@@ -344,12 +346,28 @@ static void wsn_solve_one(wsn_solve *S, wsn_wrap *w) {
         x[i] = X[3 * i]; y[i] = X[3 * i + 1]; z[i] = X[3 * i + 2]; val++;
         double d = D[i]; const double lo = w->lo[i] / WSN_Q, hi = w->hi[i] / WSN_Q;
         if (d < lo) { d = lo; cl++; } else if (d > hi) { d = hi; cl++; }
+        D[i] = (float)d;
         if (d == 0) continue;
         double cy, cx; axis_at(S->ax, z[i] * S->s0, &cy, &cx); cy /= S->s0; cx /= S->s0;
         const double dy = y[i] - cy, dx = x[i] - cx, rad = sqrt(dy * dy + dx * dx); if (!(rad > 1e-6)) continue;
         y[i] = (float)(y[i] + d * dy / rad); x[i] = (float)(x[i] + d * dx / rad); mov += fabs(d) >= 0.5 / WSN_Q; sq += llround(fabs(d) * 1000);
     }
     atomic_fetch_add(&S->nmov, mov); atomic_fetch_add(&S->nclamp, cl); atomic_fetch_add(&S->nval, val); atomic_fetch_add(&S->sumabs_q, sq);
+    if (S->dmap) {   /* --dmap: the signed shift (um, + outward) as uint8 128 + 4 um^-1 (1..255; 0 = no vertex) at render --scale 1 size */
+        const double gs = S->dmap_gs > 0 ? S->dmap_gs : w->step; const int ow = (int)((W - 1) * gs) + 1, oh = (int)((H - 1) * gs) + 1;
+        uint8_t *img = calloc((size_t)ow * oh, 1);
+        for (int py = 0; img && py < oh; py++) for (int px = 0; px < ow; px++) {
+            const double gu = px / gs, gv = py / gs; const int c0 = (int)gu < W - 1 ? (int)gu : W - 2, r0 = (int)gv < H - 1 ? (int)gv : H - 2;
+            if (c0 < 0 || r0 < 0) continue;
+            const double fu = gu - c0, fv = gv - r0; double s = 0, ws = 0;
+            for (int q = 0; q < 4; q++) { const size_t i = (size_t)(r0 + (q >> 1)) * W + c0 + (q & 1); if (!V[i]) continue;
+                                          const double wq = (q & 1 ? fu : 1 - fu) * (q >> 1 ? fv : 1 - fv); s += wq * D[i]; ws += wq; }
+            if (ws > 0.25) img[(size_t)py * ow + px] = (uint8_t)fmax(1, fmin(255, lround(128 + 4 * s / ws * w->um)));
+        }
+        char p[1500]; snprintf(p, sizeof p, "%s/w%03d.tif", S->dmap, w->id);
+        if (!img || tiffw_write(p, ow, oh, 1, img, 1)) fprintf(stderr, "wrap-snap: cannot write %s\n", p);
+        free(img);
+    }
     if (!S->dry) {
         char p[1500]; snprintf(p, sizeof p, "%s/w%03d", S->out, w->id);
         int winding = w->id; const char *q = w->meta ? strstr(w->meta, "\"winding\":") : nullptr; if (q) winding = atoi(q + 10);
@@ -458,7 +476,8 @@ int cmd_wrap_snap(int argc, char **argv) {
     long nval = 0, ncand = 0, nmask = 0; for (int k = 0; k < nw; k++) { for (int r = 0; W[k].rs && r < W[k].h; r++) { nval += W[k].rs[r].nv; ncand += W[k].rs[r].nc; nmask += W[k].rs[r].nm; } free(W[k].band); free(W[k].bv); free(W[k].rt); W[k].band = nullptr; W[k].bv = nullptr; W[k].rt = nullptr; }
     const double t1 = wsn_now();
     fprintf(stderr, "wrap-snap: evidence %.1f s (volume decode %.1f s): %ld vertices, %.3f with a candidate, %.4f on masked CT (not moved)\n", t1 - t0, tdec, nval, nval ? (double)ncand / nval : 0, nval ? (double)nmask / nval : 0);
-    S.s0 = wum / axum; S.ax = &ax; S.out = out; S.dry = dry; S.W = W; S.nw = nw;
+    S.s0 = wum / axum; S.ax = &ax; S.out = out; S.dry = dry; S.dmap = wsn_opt(argc, argv, "--dmap", nullptr); S.dmap_gs = atof(wsn_opt(argc, argv, "--dmap-gs", "0"));
+    if (S.dmap) { char cmd[1500]; snprintf(cmd, sizeof cmd, "mkdir -p '%s'", S.dmap); if (system(cmd)) return 1; } S.W = W; S.nw = nw;
     for (int q = 0; q < m; q++) pthread_create(&th[q], nullptr, wsn_solve_run, &S);
     for (int q = 0; q < m; q++) pthread_join(th[q], nullptr);
     const long long nv = S.nval;
