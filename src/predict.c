@@ -208,6 +208,53 @@ static int feather_keep(feather_t *F, int64_t a, int64_t b, int64_t c) {
     sx->id = id;
     return 0;
 }
+/* the blend + shard hand-off of --feather windows on a thread of its own (windows in order; two pinned E buffers), so the GPU runs the
+   next window meanwhile (the blend was 0.34 s per 576^3 window on the laptop, more than the forward) */
+typedef struct { int k; int64_t a, b, c; int noout; } fe_job;
+typedef struct {
+    feather_t *F; writer_t *WR; int sb; int kss, shard; const int64_t *ns, *bn;
+    uint8_t *fh[2]; int busy[2];
+    fe_job q[2]; int qh, qn, stop, failed;
+    pthread_mutex_t mu; pthread_cond_t cv; pthread_t th;
+} fe_worker;
+static void *fe_main(void *arg) {
+    fe_worker *W = arg; feather_t *F = W->F; const int kss = W->kss, shard = W->shard;
+    for (;;) {
+        pthread_mutex_lock(&W->mu);
+        while (!W->qn && !W->stop) pthread_cond_wait(&W->cv, &W->mu);
+        if (!W->qn) { pthread_mutex_unlock(&W->mu); return nullptr; }
+        const fe_job j = W->q[W->qh];
+        pthread_mutex_unlock(&W->mu);
+        int bad = 0;
+        F->e = W->fh[j.k]; feather_lookup(F, j.a, j.b, j.c);
+        if (!j.noout) for (int64_t qz = j.a * kss; qz < j.a * kss + kss && qz < W->ns[0] && !bad; qz++) for (int64_t qy = j.b * kss; qy < j.b * kss + kss && qy < W->ns[1] && !bad; qy++)
+        for (int64_t qx = j.c * kss; qx < j.c * kss + kss && qx < W->ns[2] && !bad; qx++) {
+            const int64_t q[3] = {qz, qy, qx}, Q[3] = {j.a, j.b, j.c}; int part_sh = 0;
+            for (int d = 0; d < 3; d++) {
+                F->oo[d] = (q[d] - Q[d] * kss) * shard;
+                F->on[d] = W->bn[d] - q[d] * shard < shard ? W->bn[d] - q[d] * shard : shard;
+                part_sh |= F->on[d] < shard;
+            }
+            uint8_t *sbuf = W->WR->buf[W->sb];
+            if (part_sh) memset(sbuf, 0, W->WR->bytes);
+            F->out = sbuf; F->osh = shard;
+            fit_par((int)(F->on[0] * F->on[1]), fe_rows, F);
+            if (writer_submit(W->WR, W->sb, qz, qy, qx)) bad = 1;
+            W->sb = writer_next(W->WR, W->sb);
+        }
+        if (!bad && feather_keep(F, j.a, j.b, j.c)) bad = 2;
+        pthread_mutex_lock(&W->mu);
+        if (bad) W->failed = bad;
+        W->busy[j.k] = 0; W->qh = (W->qh + 1) % 2; W->qn--;
+        pthread_cond_broadcast(&W->cv); pthread_mutex_unlock(&W->mu);
+    }
+}
+static int fe_wait_idle(fe_worker *W) {   /* every queued window blended and handed to the writer; the failure code */
+    pthread_mutex_lock(&W->mu);
+    while (W->qn) pthread_cond_wait(&W->cv, &W->mu);
+    const int f = W->failed; pthread_mutex_unlock(&W->mu);
+    return f;
+}
 /* fit-field accumulators (12 planes, src/nn_fit.cu nn_fit_accum) of nf cells -> the 10 uint8 fit-field arrays */
 static void fit_finalize(const float *acc, size_t nf, int h, uint8_t *const a[10]) {
     for (size_t i = 0; i < nf; i++) {
@@ -1280,11 +1327,15 @@ int cmd_predict(int argc, char **argv) {
     pthread_mutex_init(&rd.mu, nullptr); pthread_cond_init(&rd.cv, nullptr);
     pthread_t rth; pthread_create(&rth, nullptr, reader_main, &rd);
     feather_t FE = {0}; const int FEN = stride + fea; uint8_t *fext = nullptr, *fhost = nullptr;   /* --feather: E on the device and pinned on the host */
+    static fe_worker FW; long fe_n = 0;
     if (fea) {
         const size_t e3 = (size_t)FEN * FEN * FEN;
         /* E on the device: in the CT window's buffer (the level-0 skip scratch, dead from the end of the forward until the next window's
            upload) when it holds E and the logits do not overlap it (checked per window), else its own buffer (1.2 GB at interior 1024) */
-        if (feather_init(&FE, stride, fea, nss) || (!(ct_shared && w3 >= e3) && !(fext = nn_malloc_try(e3))) || !(fhost = nn_host_alloc_try(e3))) { fprintf(stderr, "predict: --feather: out of memory (%.2f GB device + pinned host)\n", e3 / 1e9); return 1; }
+        if (feather_init(&FE, stride, fea, nss) || (!(ct_shared && w3 >= e3) && !(fext = nn_malloc_try(e3))) || !(fhost = nn_host_alloc_try(2 * e3))) { fprintf(stderr, "predict: --feather: out of memory (%.2f GB device + 2x pinned host)\n", e3 / 1e9); return 1; }
+        FW = (fe_worker){.F = &FE, .WR = &WR, .sb = sb, .kss = kss, .shard = shard, .ns = ns, .bn = bn, .fh = {fhost, fhost + e3}};
+        pthread_mutex_init(&FW.mu, nullptr); pthread_cond_init(&FW.cv, nullptr);
+        if (pthread_create(&FW.th, nullptr, fe_main, &FW)) { fprintf(stderr, "predict: cannot start the feather thread\n"); return 1; }
     }
     int64_t cur_shard = -1, so[3] = {0, 0, 0}, se[3] = {0, 0, 0}, sz = 0, sy = 0, sx = 0;
     int any = 0;
@@ -1507,27 +1558,19 @@ int cmd_predict(int argc, char **argv) {
                 else if (!fdst && !(fdst = fext = nn_malloc_try(e3))) { fprintf(stderr, "predict: --feather: no device memory for E (%.2f GB)\n", e3 / 1e9); return 1; }
                 if (ct_shared) nn_pred_place_m(lg, ctmi, W, halo - fea, -halo, -halo, -halo, FEN, FEN, FEN, FEN, fdst);
                 else nn_pred_place(lg, ctd, W, halo - fea, -halo, -halo, -halo, FEN, FEN, FEN, FEN, fdst);
-                nn_d2h(fhost, fdst, e3);
+                const int fk = (int)(fe_n++ & 1);
+                pthread_mutex_lock(&FW.mu);
+                while (FW.busy[fk] && !FW.failed) pthread_cond_wait(&FW.cv, &FW.mu);   /* (its previous window blended) */
+                const int ff = FW.failed; pthread_mutex_unlock(&FW.mu);
+                if (ff) { fprintf(stderr, "predict: --feather: %s\n", ff == 2 ? "out of host memory for the spills" : z3w_error()); return 1; }
+                if (pprof) { p_copy += now() - pt; pt = now(); }
+                nn_d2h(FW.fh[fk], fdst, e3);
                 const char *e = nn_check();
                 if (e) { fprintf(stderr, "cuda: %s\n", e); return 1; }
                 if (pprof) { p_gpu += now() - pt; pt = now(); }
-                FE.e = fhost; feather_lookup(&FE, SZ, SY, SX);
-                if (!t->noout) for (int64_t qz = SZ * kss; qz < SZ * kss + kss && qz < ns[0]; qz++) for (int64_t qy = SY * kss; qy < SY * kss + kss && qy < ns[1]; qy++)
-                for (int64_t qx = SX * kss; qx < SX * kss + kss && qx < ns[2]; qx++) {
-                    const int64_t q[3] = {qz, qy, qx}, Q[3] = {SZ, SY, SX}; int part_sh = 0;
-                    for (int d = 0; d < 3; d++) {
-                        FE.oo[d] = (q[d] - Q[d] * kss) * shard;
-                        FE.on[d] = bn[d] - q[d] * shard < shard ? bn[d] - q[d] * shard : shard;
-                        part_sh |= FE.on[d] < shard;
-                    }
-                    if (part_sh) memset(sbuf, 0, WR.bytes);
-                    FE.out = sbuf; FE.osh = shard;
-                    fit_par((int)(FE.on[0] * FE.on[1]), fe_rows, &FE);
-                    if (writer_submit(&WR, sb, qz, qy, qx)) { fprintf(stderr, "%s\n", z3w_error()); return 1; }
-                    sb = writer_next(&WR, sb); sbuf = WR.buf[sb];
-                }
-                if (feather_keep(&FE, SZ, SY, SX)) { fprintf(stderr, "predict: --feather: out of host memory for the spills\n"); return 1; }
-                if (pprof) p_copy += now() - pt;
+                pthread_mutex_lock(&FW.mu);
+                FW.busy[fk] = 1; FW.q[(FW.qh + FW.qn) % 2] = (fe_job){fk, SZ, SY, SX, t->noout}; FW.qn++;
+                pthread_cond_broadcast(&FW.cv); pthread_mutex_unlock(&FW.mu);
                 ntiles++;
                 fprintf(stderr, "\rwindow %ld/%ld  %ld tiles (%ld air)  %.0fs   ", i + 1, rd.ntiles, ntiles, nskip, now() - t0);
                 continue;
@@ -1581,6 +1624,12 @@ int cmd_predict(int argc, char **argv) {
             any = 1; ntiles++;
             if (pprof) p_copy += now() - pt;
         }
+    }
+    if (fea) {   /* the feather thread's last windows */
+        const double tw = now(); const int ff = fe_wait_idle(&FW);
+        pthread_mutex_lock(&FW.mu); FW.stop = 1; pthread_cond_broadcast(&FW.cv); pthread_mutex_unlock(&FW.mu); pthread_join(FW.th, nullptr);
+        if (ff) { fprintf(stderr, "predict: --feather: %s\n", ff == 2 ? "out of host memory for the spills" : z3w_error()); return 1; }
+        if (pprof) p_copy += now() - tw;
     }
     if (pprof) fprintf(stderr, "\npredict profile (s): main: wait-reader %.2f h2d %.2f gpu(fwd+d2h) %.2f interior-copy %.2f writer-wait %.2f fit-writer-wait %.2f | reader: read %.2f stats %.2f slot-wait %.2f | wall %.2f, %ld tiles\n",
                        p_wait, p_h2d, p_gpu, p_copy, p_wr, p_ffw, rd.t_read, rd.t_stats, rd.t_wait, now() - t0, ntiles);
