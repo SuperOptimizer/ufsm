@@ -58,10 +58,12 @@ static char *tfx_meta(const char *metapath) {
     return strdup(g_c.meta ? g_c.meta : "{}");
 }
 /* the threaded joint-XYZ writer (src/tiffw.h tfx_sfc_write): persistent workers claim patches in file order and fill + encode each
-   into a ring slot (with its index entries' value ranges and CRC); the caller appends the slots strictly in patch order as they
-   complete. Workers run up to a ring ahead of the appends (no per-batch barrier: the appends overlap the encoding). */
+   into a ring slot (with its index entries' value ranges and CRC); the worker that completes the next patch in file order appends it
+   and every completed one after it (under the lock: appends are strictly in patch order). Workers run up to a ring ahead of the
+   appends: no per-batch barrier and no hand-off per patch (a caller thread woken for every patch spent most of the write waiting
+   for the scheduler on a loaded host: PHerc0490B 150-row strip 33.8k patches, 829 s for 72 CPU-s). */
 typedef struct {
-    int w, h, nbx, R; long long nball; double err; tfx_fill_fn fill; void *ctx;
+    int w, h, nbx, R; long long nball; double err; tfx_fill_fn fill; void *ctx; sfc_writer *wr;
     float (*joint)[4096][3]; uint8_t (*valid)[4096]; uint8_t **pk; size_t *pn, *pcap; uint8_t (*rg)[3][12]; uint32_t *crc;
     long long *done;   /* done[slot] = patch + 1 once encoded (under mu) */
     long long appended; _Atomic long long next; _Atomic int fail;
@@ -92,7 +94,16 @@ static void *tfx_worker(void *arg) {
         if (atomic_load(&B->fail)) break;
         const int s = (int)(q % B->R);
         if (tfx_patch(B, q, s, e)) { tfx_pipe_fail(B); break; }
-        pthread_mutex_lock(&B->mu); B->done[s] = q + 1; pthread_cond_broadcast(&B->ready); pthread_mutex_unlock(&B->mu);
+        pthread_mutex_lock(&B->mu);
+        B->done[s] = q + 1;
+        const long long a0 = B->appended;
+        while (!atomic_load(&B->fail) && B->appended < B->nball && B->done[B->appended % B->R] == B->appended + 1) {   /* the next in order is ready */
+            const int t = (int)(B->appended % B->R);
+            if (sfc_write_xyz_encoded_r(B->wr, B->pk[t], B->pn[t], B->crc[t], (const uint8_t (*)[12])B->rg[t])) { atomic_store(&B->fail, 1); pthread_cond_broadcast(&B->space); break; }
+            B->appended++;
+        }
+        if (B->appended != a0) pthread_cond_broadcast(&B->space);
+        pthread_mutex_unlock(&B->mu);
     }
     sfc_xyz_encoder_destroy(e);
     return nullptr;
@@ -113,7 +124,7 @@ int tfx_sfc_write(const char *sfcpath, int w, int h, double err, const char *met
     const int nbx = (w + 63) / 64; const long long nball = (long long)nbx * ((h + 63) / 64);
     if (nt > nball) nt = nball > 0 ? (int)nball : 1;
     const int R = nt > 1 ? 32 * nt : 1;   /* ring slots (52 KB of input + the packet each) */
-    tfx_pipe B = {.w = w, .h = h, .nbx = nbx, .R = R, .nball = nball, .err = err, .fill = fill, .ctx = ctx};
+    tfx_pipe B = {.w = w, .h = h, .nbx = nbx, .R = R, .nball = nball, .err = err, .fill = fill, .ctx = ctx, .wr = wr};
     B.joint = malloc(R * sizeof *B.joint); B.valid = malloc(R * sizeof *B.valid); B.pk = calloc(R, sizeof *B.pk); B.pn = calloc(R, sizeof *B.pn);
     B.pcap = calloc(R, sizeof *B.pcap); B.rg = malloc(R * sizeof *B.rg); B.crc = malloc(R * sizeof *B.crc); B.done = calloc(R, sizeof *B.done);
     pthread_mutex_init(&B.mu, nullptr); pthread_cond_init(&B.ready, nullptr); pthread_cond_init(&B.space, nullptr);
@@ -126,17 +137,8 @@ int tfx_sfc_write(const char *sfcpath, int w, int h, double err, const char *met
         pthread_t th[64]; int k = 0;
         for (; k < nt; k++) if (pthread_create(&th[k], nullptr, tfx_worker, &B)) break;
         if (!k) rc = 1;
-        for (long long q = 0; q < nball && !rc; q++) {
-            const int s = (int)(q % R);
-            pthread_mutex_lock(&B.mu);
-            while (B.done[s] != q + 1 && !atomic_load(&B.fail)) pthread_cond_wait(&B.ready, &B.mu);
-            pthread_mutex_unlock(&B.mu);
-            if (atomic_load(&B.fail)) { rc = 1; break; }
-            if (sfc_write_xyz_encoded_r(wr, B.pk[s], B.pn[s], B.crc[s], (const uint8_t (*)[12])B.rg[s])) { rc = 1; break; }
-            pthread_mutex_lock(&B.mu); B.appended = q + 1; pthread_cond_broadcast(&B.space); pthread_mutex_unlock(&B.mu);
-        }
-        if (rc) tfx_pipe_fail(&B);
         for (int t = 0; t < k; t++) pthread_join(th[t], nullptr);
+        if (atomic_load(&B.fail) || B.appended != nball) rc = 1;
     }
     if (B.pk) for (int s = 0; s < R; s++) free(B.pk[s]);
     free(B.joint); free(B.valid); free(B.pk); free(B.pn); free(B.pcap); free(B.rg); free(B.crc); free(B.done);
