@@ -56,7 +56,7 @@ gone() { g=$(cat $GRP 2> /dev/null); [ -n "$g" ] && kill -TERM -- -"$g" 2> /dev/
 trap gone HUP INT TERM; trap 'rm -f $GRP "$0"' EXIT
 inbg() { setsid "$@" < /dev/null & local p=$!; echo $p > $GRP; wait $p; local r=$?; : > $GRP; return $r; }
 exec 9> $ROOT/suite.lock
-flock -n 9 || { echo "desk_suite: another desk suite holds $ROOT/suite.lock: waiting"; flock 9; }
+flock -n 9 || { echo "desk_suite: another desk suite holds $ROOT/suite.lock: waiting"; flock 9 & wait $! || exit 3; }   # (the lock belongs to the shared open file)
 deskok || exit 3
 if [ ! -f $W/.built ]; then
   [ -d $W ] && rm -rf -- "$ROOT/$S"
