@@ -281,7 +281,7 @@ trim() {
   if [ "${TRIM:-1}" != 1 ] || [[ " $STRIPARGS " == *" --last "* ]]; then log "trim: skipped (TRIM=${TRIM:-1}, STRIPARGS '$STRIPARGS')"
   else
     ids=($(ls $O/wraps | sed -n 's/^w\([0-9]*\)\.sfc$/\1/p' | awk '{print $1 + 0}' | sort -rn)); [ ${#ids[@]} -gt 0 ] || { log "trim: no wraps"; return 1; }
-    declare -A V; while IFS=$'\t' read -r w _ _ _ _ _ _ _ _ _ _ _ _ v; do [[ $w == w* ]] && V[$((10#${w#w}))]=$v; done < $O/wrapcheck.tsv
+    declare -A V; while IFS=$'\t' read -r w _ _ _ _ _ _ _ _ _ _ _ _ v; do [[ $w =~ ^w[0-9]+$ ]] && V[$((10#${w#w}))]=$v; done < $O/wrapcheck.tsv
     top=$(printf '%s\n' "${!V[@]}" | sort -rn | head -1); k=0
     # (1) the dup run below the highest verdict id; (2) no dup run: from the highest wrap written
     if [ -n "$top" ] && [ "${V[$top]}" = dup ]; then
