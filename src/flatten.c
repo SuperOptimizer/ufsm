@@ -418,7 +418,8 @@ static void prolongate(const level *C, level *F, const flat_opts *o) {
         }
     }
     double alpha = 1; long dropped = 0;
-    if (nb && nb * 1000 < m->nt) {   /* a few stuck triangles (at the mesh border, where the coarse lattice has no cell): dropped */
+    if (nb && nb * 20 < m->nt) {   /* stuck triangles (mesh borders where the coarse lattice has no cell; folds of crushed inner wraps): dropped, up to 5% of the mesh. Scaling the whole
+                                     prolongation down instead (below) undid the coarse levels: P3 inner strip chunks with 0.11% stuck stayed at aniso p50 1.3 */
         int k = 0;
         for (int t = 0; t < m->nt; t++) {
             const int *v = m->tri + 3 * t; const double *a = m->uv + 2 * v[0], *b = m->uv + 2 * v[1], *c = m->uv + 2 * v[2];
