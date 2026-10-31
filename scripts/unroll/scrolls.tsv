@@ -1,3 +1,4 @@
 scroll	root	key	um	level	axis	box	zr	strip
 PHercParis4	/vesuvius/ufsm/volcomp	PHercParis4/20260411134726-2.400um-0.2m-78keV-masked.zarr	2.400	2	/vesuvius/ufsm/paris4/ckpt/axis-0.json	0,1024,512,18946,7150,7424	384,18176	--first 78
 PHercParis3	/vesuvius/ufsm/u0/vol	PHercParis3/20260427095331-2.400um-0.2m-78keV-masked.zarr	2.400	2	auto	0,1536,512,17105,7360,9536	-	--every 2 --last 432
+PHerc0490B	/vesuvius/ufsm/u0/vol	PHerc0490B/20250521151215-8.640um-1.2m-116keV-masked.zarr	8.640	0	auto	0,512,0,10016,7831,8192	1024,9600	-

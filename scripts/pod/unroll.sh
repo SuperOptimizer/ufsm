@@ -29,9 +29,11 @@ export U CK INKCK UNROLL_REPO=$REPO CTROOT=$R CTKEY=$K BOX
 export UR=${UR:-$POD/unroll} TH=${TH:-$NC} PTH=${PTH:-$NC} ITH=${ITH:-$NC} FIELDGPUS=${FIELDGPUS:-0} FITGPUS=${FITGPUS:-0} INKGPU=${INKGPU:-0}
 export MINMEM=${MINMEM:-8} CFMEM=${CFMEM:-$(( LIM * 2 / 5 < 24 ? LIM * 2 / 5 : 24 ))} PERWRAP=${PERWRAP:-0} CLEAN=${CLEAN:-1}
 export RENDER_NT=${RENDER_NT:-$(( NC < 8 ? NC : 8 ))} UFSM_RENDER_MEM=${UFSM_RENDER_MEM:-$(( LIM / 4 < 16 ? LIM / 4 : 16 ))}
+# renders keep a small device pool (4 GB): pods chain scrolls, so another scroll's slab fits can share the GPU with these renders
+export UFSM_RENDER_GPU_MEM=${UFSM_RENDER_GPU_MEM:-4}
 # a published ink (setup.sh fetched it): use it instead of predicting one
 if [ -n "${INKPUB:-}" ] && [ -z "${INKCMD:-}" ]; then export INKCMD="$B/inkpub.sh"
-  printf '#!/bin/sh\n# INKCMD O GPU OUT: the published ink (setup.sh) linked in\nmkdir -p "$(dirname "$3")" && ln -sfn %s "$3"\n' "$INKPUB" > $B/inkpub.sh; chmod +x $B/inkpub.sh; fi
+  printf '#!/bin/sh\n# INKCMD O GPU OUT: the published ink (setup.sh) linked in; a missing one fails loudly (no dangling link)\n[ -e %s/zarr.json ] || { echo "inkpub: %s has no zarr.json" >&2; exit 1; }\nmkdir -p "$(dirname "$3")" && ln -sfn %s "$3"\n' "$INKPUB" "$INKPUB" "$INKPUB" > $B/inkpub.sh; chmod +x $B/inkpub.sh; fi
 mkdir -p $UR
 echo "$(date '+%F %T') pod/unroll $S: $NC CPUs, $LIM GB, TH $TH CFMEM $CFMEM MINMEM $MINMEM, CT $R/$K level $LV, box $BOX, axis $AXS, U $U" | tee -a $UR/pod-$S.log
 $U sysinfo --disk $UR >> $UR/pod-$S.log 2>&1

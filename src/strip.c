@@ -83,8 +83,11 @@ static void spfor(long n, int nt, sp_fn f, void *ctx) {
 }
 
 /* ======================= ufsm strip ======================= */
-typedef struct { int id, w, h; float *X, *Y, *Z; double step, um; char name[256]; } st_wrap;
+/* a wrap: X / Y / Z h x m row-major (m = w when fully loaded; streamed: m stored columns, cm[c] = the stored index of column c or -1:
+   the columns the junction / seam / pitch measures read). Streamed: rd = the open .sfc, w0 / h0 its grid (before --every) */
+typedef struct { int id, w, h, m, *cm; float *X, *Y, *Z; double step, um; char name[256]; sfc_reader *rd; int cx, w0, h0; } st_wrap;
 static inline int vok(const st_wrap *s, size_t i) { return s->Z[i] >= 0 && isfinite(s->X[i]) && isfinite(s->Y[i]) && isfinite(s->Z[i]); }
+static inline size_t st_ix(const st_wrap *s, int r, int c) { return (size_t)r * s->m + (s->cm ? s->cm[c] : c); }
 typedef struct { const char *dir; char (*names)[256]; st_wrap *W; int n, every; _Atomic int next, fail; } st_load_job;
 static void *st_load_worker(void *arg) {
     st_load_job *J = arg;
@@ -102,15 +105,120 @@ static void *st_load_worker(void *arg) {
             for (int a = 0; a < 3; a++) { float *o = malloc((size_t)ow * oh * 4); for (int r = 0; r < oh; r++) for (int c = 0; c < ow; c++) o[(size_t)r * ow + c] = A[a][(size_t)r * E * w + (size_t)c * E]; free(A[a]); A[a] = o; }
             w = ow; h = oh; s->step *= E;
         }
-        s->X = A[0]; s->Y = A[1]; s->Z = A[2]; s->w = w; s->h = h;
+        s->X = A[0]; s->Y = A[1]; s->Z = A[2]; s->w = w; s->h = h; s->m = w;
     }
     return nullptr;
+}
+/* ---- streamed strip (default for .sfc wraps; UFSM_STRIP_FULL=1: every wrap decoded whole into memory, as before): the wraps stay open
+   and are decoded twice by 64-row bands, never whole: (1) per wrap, the columns the junction / seam / pitch measures read (first 10,
+   last 10, 17 from the middle) and the valid count + bbox of columns [1, w - 1) and of column w - 1; (2) while strip.sfc is encoded,
+   each 64-row band of the strip (every wrap's columns of that band) is decoded into one of K band slots by the encoder workers that
+   need it. Same values as the whole decode (the .sfc tiles decode independently), same bytes; memory ~K bands (strip columns x 64 x 13
+   bytes) instead of every wrap's whole grid (P4-size strips 23-53 GB). */
+typedef struct { size_t n; double lo[3], hi[3]; } st_bbox_part;
+static void bb_init(st_bbox_part *P) { P->n = 0; for (int a = 0; a < 3; a++) { P->lo[a] = INFINITY; P->hi[a] = -INFINITY; } }
+static void bb_add(st_bbox_part *P, const float v[3]) { P->n++; for (int a = 0; a < 3; a++) { if (v[a] < P->lo[a]) P->lo[a] = v[a]; if (v[a] > P->hi[a]) P->hi[a] = v[a]; } }
+static void bb_merge(st_bbox_part *P, const st_bbox_part *Q) { P->n += Q->n; for (int a = 0; a < 3; a++) { if (Q->lo[a] < P->lo[a]) P->lo[a] = Q->lo[a]; if (Q->hi[a] > P->hi[a]) P->hi[a] = Q->hi[a]; } }
+/* rows [r0, r0 + nr) (strip rows) x wrap columns [c0, c1) (strip-wrap columns, before x every) of s into xyz (nr x (c1 - c0) x 3, invalid
+   -1 like the whole decode's tfx_axis) */
+static int st_band_read(const st_wrap *s, int every, int r0, int nr, int c0, int c1, float *xyz) {
+    const int nc = c1 - c0, E = every, wx0 = c0 * E, wy0 = r0 * E;
+    const int wnx = (c1 - 1) * E + 1 - wx0, wny = (r0 + nr - 1) * E + 1 - wy0;
+    float *t = E > 1 ? malloc((size_t)wnx * wny * 12) : xyz; uint8_t *v = malloc((size_t)wnx * wny);
+    sfc_cache *ca = nullptr; int rc = !t || !v || sfc_cache_create(s->rd, (size_t)64 << 20, &ca);
+    if (!rc) rc = sfc_cache_read_xyz_region(ca, (uint32_t)s->cx, (uint64_t)wx0, (uint64_t)wy0, (uint32_t)wnx, (uint32_t)wny, t, 12, (size_t)wnx * 12, v) != 0;
+    if (ca) sfc_cache_destroy(ca);
+    if (!rc) for (int r = 0; r < nr; r++) for (int c = 0; c < nc; c++) {
+        const size_t q = (size_t)r * E * wnx + (size_t)c * E, o = (size_t)r * nc + c;
+        if (v[q]) { if (E > 1) { xyz[3 * o] = t[3 * q]; xyz[3 * o + 1] = t[3 * q + 1]; xyz[3 * o + 2] = t[3 * q + 2]; } }
+        else xyz[3 * o] = xyz[3 * o + 1] = xyz[3 * o + 2] = -1.f;
+    }
+    if (E > 1) free(t);
+    free(v); return rc ? -1 : 0;
+}
+static inline int vok3(const float *p) { return p[2] >= 0 && isfinite(p[0]) && isfinite(p[1]) && isfinite(p[2]); }
+typedef struct { const char *dir; char (*names)[256]; st_wrap *W; st_bbox_part *A, *B; int n, every; _Atomic int next, fail; } st_scan_job;
+static void *st_scan_worker(void *arg) {   /* phase 1: open, meta, the measured columns, the counts / bbox */
+    st_scan_job *J = arg;
+    for (int k; (k = atomic_fetch_add(&J->next, 1)) < J->n;) {
+        st_wrap *s = &J->W[k]; char p[1400]; snprintf(s->name, sizeof s->name, "%s", J->names[k]);
+        snprintf(p, sizeof p, "%s/%s.sfc", J->dir, s->name);
+        if (sfc_open_file(p, &s->rd)) { fprintf(stderr, "strip: cannot read %s\n", p); atomic_store(&J->fail, 1); continue; }
+        s->cx = sfc_find_channel(s->rd, "x"); if (s->cx < 0) s->cx = 0;
+        const sfc_channel *ch = sfc_channel_info(s->rd, (uint32_t)s->cx); s->w0 = (int)ch->width; s->h0 = (int)ch->height;
+        const uint64_t ml = sfc_metadata_size(s->rd); char *m = calloc(ml + 1, 1); if (ml && m) sfc_read_metadata(s->rd, m, ml);
+        const double sc = meta_num(m, "\"scale\"", 1); s->um = meta_num(m, "\"voxel_size_um\"", 0); s->id = (int)meta_num(m, "\"winding\"", atoi(s->name + 1)); free(m);
+        s->step = sc > 0 ? 1 / sc : 1;
+        const int E = J->every, w = (s->w0 - 1) / E + 1, h = (s->h0 - 1) / E + 1; s->w = w; s->h = h; if (E > 1) s->step *= E;
+        if (w < 4) continue;   /* (rejected by the caller) */
+        s->cm = malloc((size_t)w * sizeof *s->cm); for (int c = 0; c < w; c++) s->cm[c] = -1;
+        int nm = 0; const int win[3][2] = {{0, 10}, {w - 10, w}, {w / 2, w / 2 + 17}};
+        for (int c = 0; c < w; c++) for (int q = 0; q < 3; q++) if (c >= win[q][0] && c < win[q][1]) { s->cm[c] = nm++; break; }
+        s->m = nm; s->X = malloc((size_t)h * nm * 4); s->Y = malloc((size_t)h * nm * 4); s->Z = malloc((size_t)h * nm * 4);
+        float *xyz = malloc((size_t)64 * w * 12); bb_init(&J->A[k]); bb_init(&J->B[k]);
+        for (int r0 = 0; r0 < h && xyz; r0 += 64) {
+            const int nr = h - r0 < 64 ? h - r0 : 64;
+            if (st_band_read(s, E, r0, nr, 0, w, xyz)) { fprintf(stderr, "strip: decode of %s failed\n", p); atomic_store(&J->fail, 1); break; }
+            for (int r = 0; r < nr; r++) for (int c = 0; c < w; c++) {
+                const float *v = xyz + ((size_t)r * w + c) * 3;
+                if (s->cm[c] >= 0) { const size_t i = (size_t)(r0 + r) * nm + s->cm[c]; s->X[i] = v[0]; s->Y[i] = v[1]; s->Z[i] = v[2]; }
+                if (c >= 1 && vok3(v)) bb_add(c < w - 1 ? &J->A[k] : &J->B[k], v);
+            }
+        }
+        if (!xyz) atomic_store(&J->fail, 1);
+        free(xyz);
+    }
+    return nullptr;
+}
+/* phase 2: the band slots */
+typedef struct { _Atomic int band; _Atomic int next, ndone; float *xyz; } st_band;
+typedef struct {
+    const st_wrap *W; const int *ord, *cb, *ce; const long long *col0; int n, w, h, every, K; st_band *B;
+    pthread_mutex_t mu; pthread_cond_t cv; _Atomic int fail;
+} st_stream;
+/* band by's slot (taken over from its old band: that one is fully encoded, since a worker fills patch q only when q < appended + R and
+   K - 2 bands span at least R patches); then up to `max` of its segments decoded by this caller (all: the band is needed now; 1: prefetch) */
+static st_band *st_band_help(st_stream *T, int by, int max) {
+    st_band *b = &T->B[by % T->K];
+    pthread_mutex_lock(&T->mu);
+    if (atomic_load(&b->band) != by) { atomic_store(&b->next, 0); atomic_store(&b->ndone, 0); atomic_store(&b->band, by); }
+    pthread_mutex_unlock(&T->mu);
+    const int r0 = by * 64, nr = T->h - r0 < 64 ? T->h - r0 : 64;
+    for (int k = 0, q; k < max && (q = atomic_fetch_add(&b->next, 1)) < T->n; k++) {
+        const st_wrap *s = &T->W[T->ord[q]]; const int nc = T->ce[q] - T->cb[q];
+        float *t = malloc((size_t)nr * nc * 12);
+        if (!t || st_band_read(s, T->every, r0, nr, T->cb[q], T->ce[q], t)) atomic_store(&T->fail, 1);
+        else for (int r = 0; r < nr; r++) memcpy(b->xyz + ((size_t)r * T->w + T->col0[q]) * 3, t + (size_t)r * nc * 3, (size_t)nc * 12);
+        free(t);
+        pthread_mutex_lock(&T->mu); if (atomic_fetch_add(&b->ndone, 1) + 1 == T->n) pthread_cond_broadcast(&T->cv); pthread_mutex_unlock(&T->mu);
+    }
+    return b;
+}
+static const float *st_band_get(st_stream *T, int by) {
+    st_band *b = &T->B[by % T->K];
+    if (atomic_load(&b->band) != by || atomic_load(&b->ndone) < T->n) {
+        b = st_band_help(T, by, T->n);
+        pthread_mutex_lock(&T->mu); while (atomic_load(&b->ndone) < T->n) pthread_cond_wait(&T->cv, &T->mu); pthread_mutex_unlock(&T->mu);
+    }
+    /* prefetch: one segment of the next band per patch (its slot's old band by + 1 - K is encoded: K >= 3 and (K - 2) bands >= R patches) */
+    const int nby = (T->h + 63) / 64;
+    if (by + 1 < nby && T->K >= 3) { st_band *nb = &T->B[(by + 1) % T->K]; if (atomic_load(&nb->band) != by + 1 || atomic_load(&nb->next) < T->n) st_band_help(T, by + 1, 1); }
+    return b->xyz;
+}
+static void st_fill_stream(void *ctx, int bx, int by, float (*joint)[3], uint8_t *valid) {
+    st_stream *T = ctx; const float *xyz = st_band_get(T, by);
+    for (int q = 0; q < 4096; q++) {
+        const int c = bx * 64 + q % 64, r = by * 64 + q / 64; if (c >= T->w || r >= T->h) continue;
+        const float *v = xyz + ((size_t)(r - by * 64) * T->w + c) * 3;
+        if (!vok3(v) || !(v[2] > 0)) continue;
+        joint[q][0] = v[0]; joint[q][1] = v[1]; joint[q][2] = v[2]; valid[q] = 1;
+    }
 }
 /* the median over rows of the 3D distance between column ca of a and column cb of b (rows valid in both); nan when < 8 rows */
 static double col_dist(const st_wrap *a, int ca, const st_wrap *b, int cb, float *buf) {
     int n = 0;
     for (int r = 0; r < a->h; r++) {
-        const size_t i = (size_t)r * a->w + ca, j = (size_t)r * b->w + cb; if (!vok(a, i) || !vok(b, j)) continue;
+        const size_t i = st_ix(a, r, ca), j = st_ix(b, r, cb); if (!vok(a, i) || !vok(b, j)) continue;
         const double dx = a->X[i] - b->X[j], dy = a->Y[i] - b->Y[j], dz = a->Z[i] - b->Z[j]; buf[n++] = (float)sqrt(dx * dx + dy * dy + dz * dz);
     }
     return n >= 8 ? median_f32(buf, n) : NAN;
@@ -124,7 +232,6 @@ static double col_pitch(const st_wrap *a, int c0, int c1, float *buf) {
     return median_f32(v, n);
 }
 
-typedef struct { size_t n; double lo[3], hi[3]; } st_bbox_part;
 typedef struct { const st_wrap *W; const int *ord, *cb, *ce; int h; st_bbox_part *part; } st_bbox_ctx;
 static void k_bbox(void *ctx, long q0, long q1) {
     const st_bbox_ctx *B = ctx;
@@ -169,13 +276,29 @@ int cmd_strip(int argc, char **argv) {
     /* by winding id */
     for (int a = 1; a < n; a++) for (int b = a; b > 0 && atoi(names[b] + 1) < atoi(names[b - 1] + 1); b--) { char t[256]; memcpy(t, names[b], 256); memcpy(names[b], names[b - 1], 256); memcpy(names[b - 1], t, 256); }
     st_wrap *W = calloc((size_t)n, sizeof *W);
-    st_load_job LJ = {wd, names, W, n, every, 0, 0};
-    { pthread_t th[64]; const int m = nth < 1 ? 1 : nth > 64 ? 64 : nth; for (int t = 0; t < m; t++) pthread_create(&th[t], nullptr, st_load_worker, &LJ); for (int t = 0; t < m; t++) pthread_join(th[t], nullptr); }
-    if (LJ.fail) return 1;
+    /* streamed when every wrap is a .sfc (UFSM_STRIP_FULL=1: whole decodes) */
+    int stream = !(getenv("UFSM_STRIP_FULL") && atoi(getenv("UFSM_STRIP_FULL")));
+    for (int k = 0; k < n && stream; k++) { char p[1400]; struct stat sb; snprintf(p, sizeof p, "%s/%s.sfc", wd, names[k]); stream = !stat(p, &sb) && S_ISREG(sb.st_mode); }
+    st_bbox_part *BA = stream ? calloc((size_t)n, sizeof *BA) : nullptr, *BB = stream ? calloc((size_t)n, sizeof *BB) : nullptr;
+    if (stream) {
+        st_scan_job SJ = {wd, names, W, BA, BB, n, every, 0, 0};
+        pthread_t th[64]; const int m = nth < 1 ? 1 : nth > 64 ? 64 : nth; for (int t = 0; t < m; t++) pthread_create(&th[t], nullptr, st_scan_worker, &SJ); for (int t = 0; t < m; t++) pthread_join(th[t], nullptr);
+        if (SJ.fail) return 1;
+        int narrow = 0; for (int k = 0; k < n; k++) narrow |= W[k].w >= 4 && W[k].w < 10;
+        if (narrow) {   /* (a wrap under 10 columns: the seam measure reads columns w - 10..: the whole-decode path, as before) */
+            for (int k = 0; k < n; k++) { free(W[k].X); free(W[k].Y); free(W[k].Z); free(W[k].cm); if (W[k].rd) sfc_close(W[k].rd); }
+            memset(W, 0, (size_t)n * sizeof *W); free(BA); free(BB); BA = BB = nullptr; stream = 0;
+        }
+    }
+    if (!stream) {
+        st_load_job LJ = {wd, names, W, n, every, 0, 0};
+        pthread_t th[64]; const int m = nth < 1 ? 1 : nth > 64 ? 64 : nth; for (int t = 0; t < m; t++) pthread_create(&th[t], nullptr, st_load_worker, &LJ); for (int t = 0; t < m; t++) pthread_join(th[t], nullptr);
+        if (LJ.fail) return 1;
+    }
     const int h = W[0].h; const double step = W[0].step, um = W[0].um;
     for (int k = 0; k < n; k++) if (W[k].h != h || fabs(W[k].step - step) > 1e-6 || fabs(W[k].um - um) > 1e-9 || W[k].w < 4) {
         fprintf(stderr, "strip: %s is %dx%d step %g um %g, %s %d rows step %g um %g: one model's wraps needed\n", W[k].name, W[k].w, W[k].h, W[k].step, W[k].um, W[0].name, h, step, um); return 1; }
-    fprintf(stderr, "strip: %d wraps %s..%s, %d rows, step %g (%g um), loaded in %.1fs\n", n, W[0].name, W[n - 1].name, h, step, um, snow() - t0);
+    fprintf(stderr, "strip: %d wraps %s..%s, %d rows, step %g (%g um), %s in %.1fs\n", n, W[0].name, W[n - 1].name, h, step, um, stream ? "scanned (streamed)" : "loaded", snow() - t0);
     float *buf = malloc((size_t)h * 4);
     /* column 0 (beyond the cut): its jump from column 1 vs the pitch */
     { float *jr = malloc((size_t)n * 4); int nj = 0;
@@ -222,7 +345,9 @@ int cmd_strip(int argc, char **argv) {
        counts: exact in any order) */
     size_t nvalid = 0; double lo[3] = {INFINITY, INFINITY, INFINITY}, hi[3] = {-INFINITY, -INFINITY, -INFINITY};
     { st_bbox_ctx BC = {W, ord, cb, ce, h, calloc((size_t)n, sizeof(st_bbox_part))};
-      spfor(n, nth, k_bbox, &BC);
+      if (stream) for (int q = 0; q < n; q++) {   /* columns [1, ce): [1, w - 1) plus column w - 1 when the segment keeps it */
+          const int k = ord[q]; BC.part[q] = BA[k]; if (ce[q] == W[k].w) bb_merge(&BC.part[q], &BB[k]); }
+      else spfor(n, nth, k_bbox, &BC);
       for (int q = 0; q < n; q++) { const st_bbox_part *P = &BC.part[q]; nvalid += P->n; for (int a = 0; a < 3; a++) { if (P->lo[a] < lo[a]) lo[a] = P->lo[a]; if (P->hi[a] > hi[a]) hi[a] = P->hi[a]; } }
       free(BC.part); }
     char meta[2048];
@@ -232,13 +357,27 @@ int cmd_strip(int argc, char **argv) {
     snprintf(p, sizeof p, "%s/strip.json", od); { FILE *f = fopen(p, "w"); if (f) { fputs(meta, f); fclose(f); } }
     char sp[1500]; snprintf(sp, sizeof sp, "%s/strip.sfc", od);
     const double tw = snow(); st_fill_ctx FC = {W, mw, mc, w, h};
-    if (tfx_sfc_write(sp, w, h, err, meta, st_fill, &FC, nth)) { fprintf(stderr, "strip: sfc write %s failed\n", sp); return 1; }
+    if (stream) {   /* K band slots: more than the encoder's ring (<= 32 x 64 patches) ahead of its appends, plus the band in hand */
+        const long long nbx = (w + 63) / 64; long long K = (2048 + nbx - 1) / nbx + 2; const int nby = (h + 63) / 64; if (K > nby) K = nby;
+        st_stream T = {.W = W, .ord = ord, .cb = cb, .ce = ce, .n = n, .w = w, .h = h, .every = every, .K = (int)K};
+        long long *c0 = malloc((size_t)n * sizeof *c0); { long long c = 0; for (int q = 0; q < n; q++) { c0[q] = c; c += ce[q] - cb[q]; } } T.col0 = c0;
+        T.B = calloc((size_t)K, sizeof *T.B); int ok = !!T.B;
+        for (long long k = 0; k < K && ok; k++) { atomic_init(&T.B[k].band, -1); ok = !!(T.B[k].xyz = malloc((size_t)64 * w * 12)); }
+        pthread_mutex_init(&T.mu, nullptr); pthread_cond_init(&T.cv, nullptr);
+        if (!ok) { fprintf(stderr, "strip: out of memory for %lld band slots of %d columns\n", K, w); return 1; }
+        fprintf(stderr, "strip: streamed write: %lld band slots of 64 rows (%.2f GB)\n", K, K * 64.0 * w * 12 / 1073741824.0);
+        const int rc = tfx_sfc_write(sp, w, h, err, meta, st_fill_stream, &T, nth);
+        for (long long k = 0; k < K; k++) free(T.B[k].xyz);
+        free(T.B); free(c0);
+        pthread_mutex_destroy(&T.mu); pthread_cond_destroy(&T.cv);
+        if (rc || atomic_load(&T.fail)) { fprintf(stderr, "strip: sfc write %s failed\n", sp); if (!rc) unlink(sp); return 1; }
+    } else if (tfx_sfc_write(sp, w, h, err, meta, st_fill, &FC, nth)) { fprintf(stderr, "strip: sfc write %s failed\n", sp); return 1; }
     struct stat st; stat(sp, &st);
     double pmed = 0; { float *pv = malloc((size_t)n * 4); int np = 0; for (int k = 0; k < n; k++) { const double pk = col_pitch(&W[k], W[k].w / 2, W[k].w / 2 + 16, buf); if (pk > 0) pv[np++] = (float)pk; } pmed = np ? median_f32(pv, np) : step; free(pv); }
     printf("strip: %d wraps -> %s: %d x %d (columns x rows), %zu valid vertices, column pitch median %.2f voxels (step %g), length ~%.1f cm, %.1f MB, write %.1fs, total %.1fs\n",
            n, sp, w, h, nvalid, pmed, step, w * pmed * um * 1e-4, st.st_size / 1e6, snow() - tw, snow() - t0);
-    for (int k = 0; k < n; k++) { free(W[k].X); free(W[k].Y); free(W[k].Z); }
-    free(W); free(names); free(buf); free(ord); free(cb); free(ce); free(gap); free(mw); free(mc);
+    for (int k = 0; k < n; k++) { free(W[k].X); free(W[k].Y); free(W[k].Z); free(W[k].cm); if (W[k].rd) sfc_close(W[k].rd); }
+    free(W); free(names); free(BA); free(BB); free(buf); free(ord); free(cb); free(ce); free(gap); free(mw); free(mc);
     return 0;
 }
 
