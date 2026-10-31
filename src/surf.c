@@ -10,6 +10,7 @@
 #include "stitch.h"
 #include "tiff.h"
 #include "tiffw.h"
+#include "imgops.h"
 #include <unistd.h>
 #include "zarr3.h"
 #include "store.h"
@@ -837,5 +838,126 @@ int cmd_self_gate(int argc, char **argv) {
     for (int i = 0; i < nqb; i++) st_box_free(&qbx[i]);
     free(qbx); free(qe);
     free(names); sff_free(&F); fit_set_free(ms); if (cz) { ctc_free(&ctc); z3_close(cz); }
+    return 0;
+}
+
+/* ---- ufsm wrap-match A B --axis AXIS.json [--axis-scale 0.25] [--dz 64] [--nth 720] [--sub 2] [--threads 16] [--tsv OUT] ----
+   Two fits' wraps of one scan compared by surface position: per wrap, the mean radius about the axis of its vertices (every --sub-th row /
+   column) in bins of --dz native z x --nth angles; per wrap of A and bin, the B wrap whose radius in that bin is nearest. Per A wrap: the
+   B id it coincides with most (share of its bins), the median |dr| to the nearest B surface and the median signed dr to that B wrap,
+   and B's local spacing (the radial gap between B's two wraps around it): |dr| << spacing = the same sheet; ~ spacing / 2 = between
+   sheets. AXIS: a umbilicus control-point JSON ("x", "y", "z" per point) in the scan's level-0 voxels, times --axis-scale = the wraps'
+   coordinates. */
+typedef struct { int n; double *z, *y, *x; } wm_axis;
+static int wm_axis_load(const char *path, double sc, wm_axis *A) {
+    FILE *f = fopen(path, "rb"); if (!f) return -1; fseek(f, 0, SEEK_END); const long n = ftell(f); fseek(f, 0, SEEK_SET);
+    char *b = malloc(n + 1); if (!b || fread(b, 1, n, f) != (size_t)n) { fclose(f); free(b); return -1; } b[n] = 0; fclose(f);
+    int cap = 64; A->n = 0; A->z = malloc(cap * 8); A->y = malloc(cap * 8); A->x = malloc(cap * 8);
+    for (const char *q = b; (q = strstr(q, "\"x\":"));) {
+        const char *qy = strstr(q, "\"y\":"), *qz = strstr(q, "\"z\":"); if (!qy || !qz) break;
+        if (A->n == cap) { cap *= 2; A->z = realloc(A->z, cap * 8); A->y = realloc(A->y, cap * 8); A->x = realloc(A->x, cap * 8); }
+        A->x[A->n] = atof(q + 4) * sc; A->y[A->n] = atof(qy + 4) * sc; A->z[A->n] = atof(qz + 4) * sc; A->n++; q = qz + 4;
+    }
+    free(b);
+    for (int i = 1; i < A->n; i++) for (int j = i; j > 0 && A->z[j] < A->z[j - 1]; j--) {   /* by z */
+        double t; t = A->z[j]; A->z[j] = A->z[j - 1]; A->z[j - 1] = t; t = A->y[j]; A->y[j] = A->y[j - 1]; A->y[j - 1] = t; t = A->x[j]; A->x[j] = A->x[j - 1]; A->x[j - 1] = t; }
+    return A->n >= 1 ? 0 : -1;
+}
+static void wm_axis_at(const wm_axis *A, double z, double *cy, double *cx) {
+    if (z <= A->z[0] || A->n == 1) { *cy = A->y[0]; *cx = A->x[0]; return; }
+    if (z >= A->z[A->n - 1]) { *cy = A->y[A->n - 1]; *cx = A->x[A->n - 1]; return; }
+    int k = 0; while (k + 1 < A->n && A->z[k + 1] < z) k++;
+    const double t = (z - A->z[k]) / (A->z[k + 1] - A->z[k]); *cy = A->y[k] + t * (A->y[k + 1] - A->y[k]); *cx = A->x[k] + t * (A->x[k + 1] - A->x[k]);
+}
+typedef struct { const char *dir; char (*names)[256]; int n, nz, nth, sub; double dz; const wm_axis *ax; float **r; int *id; _Atomic int next; } wm_job;
+static void *wm_load(void *arg) {
+    wm_job *J = arg; const size_t nb = (size_t)J->nz * J->nth;
+    double *s = malloc(nb * 8); int *c = malloc(nb * 4);
+    for (int k; (k = atomic_fetch_add(&J->next, 1)) < J->n;) {
+        sf_wrap w; J->r[k] = nullptr; if (sf_load(J->dir, J->names[k], &w)) continue;
+        J->id[k] = w.id; memset(s, 0, nb * 8); memset(c, 0, nb * 4);
+        for (int y = 0; y < w.h; y += J->sub) for (int x = 0; x < w.w; x += J->sub) {
+            const size_t i = (size_t)y * w.w + x; if (!(w.Z[i] >= 0)) continue;
+            const double z = w.Z[i]; double cy, cx; wm_axis_at(J->ax, z, &cy, &cx);
+            const double dy = w.Y[i] - cy, dx = w.X[i] - cx, r = hypot(dy, dx), th = atan2(dy, dx);
+            const int zb = (int)(z / J->dz); int tb = (int)((th + M_PI) / (2 * M_PI) * J->nth); if (tb >= J->nth) tb = J->nth - 1;
+            if (zb < 0 || zb >= J->nz) continue;
+            s[(size_t)zb * J->nth + tb] += r; c[(size_t)zb * J->nth + tb]++;
+        }
+        float *r = malloc(nb * 4); for (size_t b = 0; b < nb; b++) r[b] = c[b] >= 2 ? (float)(s[b] / c[b]) : NAN;
+        J->r[k] = r; sf_free(&w);
+    }
+    free(s); free(c); return nullptr;
+}
+static int wm_cmpf(const void *a, const void *b) { const float x = *(const float *)a, y = *(const float *)b; return (x > y) - (x < y); }
+static float wm_med(float *v, int n) { if (!n) return NAN; qsort(v, n, 4, wm_cmpf); return v[n / 2]; }
+int cmd_wrap_match(int argc, char **argv) {
+    if (argc < 4) { fprintf(stderr, "usage: ufsm wrap-match <wraps-A> <wraps-B> --axis AXIS.json [--axis-scale 0.25] [--dz 64] [--nth 720] [--sub 2] [--threads 16] [--tsv OUT]\n"); return 2; }
+    wm_axis ax; if (wm_axis_load(sopt(argc, argv, "--axis", ""), atof(sopt(argc, argv, "--axis-scale", "1")), &ax)) { fprintf(stderr, "wrap-match: cannot read --axis\n"); return 1; }
+    const double dz = atof(sopt(argc, argv, "--dz", "64")); const int nth = atoi(sopt(argc, argv, "--nth", "720")), sub = atoi(sopt(argc, argv, "--sub", "2"));
+    const int nt = ufsm_threads(atoi(sopt(argc, argv, "--threads", "0")), 16);
+    const int nz = (int)(ax.z[ax.n - 1] / dz) + (int)(30000 / dz) + 2; const size_t nb = (size_t)nz * nth;
+    wm_job W[2]; char (*names[2])[256];
+    for (int s = 0; s < 2; s++) {
+        const int n = sf_names(argv[2 + s], &names[s]); if (n <= 0) { fprintf(stderr, "wrap-match: no wraps in %s\n", argv[2 + s]); return 1; }
+        W[s] = (wm_job){argv[2 + s], names[s], n, nz, nth, sub < 1 ? 1 : sub, dz, &ax, calloc(n, sizeof(float *)), calloc(n, sizeof(int)), 0};
+        pthread_t th[64]; const int m = nt < 64 ? nt : 64; for (int t = 0; t < m; t++) pthread_create(&th[t], nullptr, wm_load, &W[s]); for (int t = 0; t < m; t++) pthread_join(th[t], nullptr);
+    }
+    /* B per bin: (radius, wrap index) sorted by radius */
+    const wm_job *B = &W[1]; size_t *off = calloc(nb + 1, sizeof *off);
+    for (int k = 0; k < B->n; k++) if (B->r[k]) for (size_t b = 0; b < nb; b++) if (!isnan(B->r[k][b])) off[b + 1]++;
+    for (size_t b = 0; b < nb; b++) off[b + 1] += off[b];
+    float *br = malloc((off[nb] + 1) * 4); int *bk = malloc((off[nb] + 1) * 4); size_t *fill = calloc(nb, sizeof *fill);
+    for (int k = 0; k < B->n; k++) if (B->r[k]) for (size_t b = 0; b < nb; b++) if (!isnan(B->r[k][b])) { const size_t o = off[b] + fill[b]++; br[o] = B->r[k][b]; bk[o] = k; }
+    for (size_t b = 0; b < nb; b++) for (size_t i = off[b] + 1; i < off[b + 1]; i++) for (size_t j = i; j > off[b] && br[j] < br[j - 1]; j--) { float t = br[j]; br[j] = br[j - 1]; br[j - 1] = t; int u = bk[j]; bk[j] = bk[j - 1]; bk[j - 1] = u; }
+    FILE *tf = *sopt(argc, argv, "--tsv", "") ? fopen(sopt(argc, argv, "--tsv", ""), "w") : nullptr;
+    const char *hdr = "wrap_a\tbins\tr_med\twrap_b\tshare\tabs_dr_med\tdr_to_b_med\tb_spacing_med\n";
+    printf("%s", hdr); if (tf) fputs(hdr, tf);
+    const wm_job *A = &W[0]; int *cnt = calloc(B->n, sizeof *cnt); float *ad = malloc(nb * 4), *sd = malloc(nb * 4), *sp = malloc(nb * 4), *rr = malloc(nb * 4);
+    for (int k = 0; k < A->n; k++) {
+        if (!A->r[k]) continue;
+        memset(cnt, 0, B->n * sizeof *cnt); int na = 0, nsp = 0;
+        for (size_t b = 0; b < nb; b++) {
+            const float r = A->r[k][b]; if (isnan(r) || off[b + 1] == off[b]) continue;
+            size_t lo = off[b], hi = off[b + 1];   /* first B radius >= r */
+            while (lo < hi) { const size_t m = (lo + hi) / 2; if (br[m] < r) lo = m + 1; else hi = m; }
+            size_t best = lo; if (best == off[b + 1] || (best > off[b] && r - br[best - 1] < br[best] - r)) best = best - (best > off[b]);
+            cnt[bk[best]]++; ad[na] = fabsf(br[best] - r); rr[na] = r; na++;
+            if (best > off[b] && best + 1 < off[b + 1]) sp[nsp++] = 0.5f * (br[best + 1] - br[best - 1]);
+        }
+        if (!na) continue;
+        int kb = 0; for (int j = 1; j < B->n; j++) if (cnt[j] > cnt[kb]) kb = j;
+        int ns = 0; for (size_t b = 0; b < nb && B->r[kb]; b++) { const float r = A->r[k][b], q = B->r[kb][b]; if (!isnan(r) && !isnan(q)) sd[ns++] = q - r; }
+        char line[256]; snprintf(line, sizeof line, "%d\t%d\t%.0f\t%d\t%.3f\t%.2f\t%.2f\t%.2f\n", A->id[k], na, wm_med(rr, na), B->id[kb], (double)cnt[kb] / na, wm_med(ad, na), wm_med(sd, ns), wm_med(sp, nsp));
+        printf("%s", line); if (tf) fputs(line, tf);
+    }
+    if (tf) fclose(tf);
+    return 0;
+}
+/* ---- ufsm ink-cover <render-dir> [--t 128] [--ct-level 80] [--tsv OUT]: per rendered wrap (<name>.tif ink + <name>_ct.tif) on the papyrus
+   (CT >= ct-level): the share of pixels with ink >= t, the mean ink, and the stroke contrast (mean |4-neighbour Laplacian| of the ink on
+   papyrus pixels: sharp letter strokes high, smooth blotches / noise floor low) */
+int cmd_ink_cover(int argc, char **argv) {
+    if (argc < 3) { fprintf(stderr, "usage: ufsm ink-cover <render-dir> [--t 128] [--ct-level 80] [--tsv OUT]\n"); return 2; }
+    const int T = atoi(sopt(argc, argv, "--t", "128")), CL = atoi(sopt(argc, argv, "--ct-level", "80"));
+    DIR *d = opendir(argv[2]); if (!d) return 1; struct dirent *de; int n = 0, cap = 64; char (*nm)[256] = malloc(cap * 256);
+    while ((de = readdir(d))) { const size_t l = strlen(de->d_name); if (de->d_name[0] != 'w' || l < 5 || strcmp(de->d_name + l - 4, ".tif") || strstr(de->d_name, "_ct.tif") || strstr(de->d_name, "_fill.tif")) continue;
+        if (n == cap) { cap *= 2; nm = realloc(nm, cap * 256); } snprintf(nm[n], 256, "%.*s", (int)(l - 4), de->d_name); n++; }
+    closedir(d); qsort(nm, n, 256, (int (*)(const void *, const void *))strcmp);
+    FILE *tf = *sopt(argc, argv, "--tsv", "") ? fopen(sopt(argc, argv, "--tsv", ""), "w") : nullptr;
+    const char *hdr = "wrap\tpapyrus_px\tink_share\tink_mean\tstroke\n"; printf("%s", hdr); if (tf) fputs(hdr, tf);
+    for (int k = 0; k < n; k++) {
+        char p[1400]; int w, h, w2, h2; snprintf(p, sizeof p, "%s/%s.tif", argv[2], nm[k]); uint8_t *ink = img_read_u8(p, &w, &h);
+        snprintf(p, sizeof p, "%s/%s_ct.tif", argv[2], nm[k]); uint8_t *ct = img_read_u8(p, &w2, &h2);
+        if (!ink || !ct || w != w2 || h != h2) { free(ink); free(ct); continue; }
+        size_t np = 0, ni = 0; double sm = 0, sl = 0;
+        for (int y = 1; y + 1 < h; y++) for (int x = 1; x + 1 < w; x++) { const size_t i = (size_t)y * w + x; if (ct[i] < CL) continue;
+            np++; ni += ink[i] >= T; sm += ink[i]; sl += fabs(4.0 * ink[i] - ink[i - 1] - ink[i + 1] - ink[i - w] - ink[i + w]); }
+        char line[512]; const int id = atoi(nm[k] + 1);
+        snprintf(line, sizeof line, "%d\t%zu\t%.4f\t%.2f\t%.2f\n", id, np, np ? (double)ni / np : 0, np ? sm / np : 0, np ? sl / np : 0);
+        printf("%s", line); if (tf) fputs(line, tf); free(ink); free(ct);
+    }
+    if (tf) fclose(tf);
+    free(nm);
     return 0;
 }
