@@ -161,6 +161,29 @@ against each method's uncorrupted fit after integer gauge alignment. Approximate
 stability needs further work.
 Whole-scroll topology and accuracy are not established by these local checks.
 
+## Coarse winding reference on the GPU
+
+The coarse-to-fine unroll starts from one global winding model (the "cf ref"), which the slab fits snap their integers to
+(`fit --ref-model REF --ref-snap 1`, `fit-join --ref REF`):
+
+```sh
+build/ufsm count-field FIELDS - --R 0 --pool 8 --phase-w 4 --iters 1200 --model REF --model-only 1 --model-stride 2 --threads 8 --mem-gb 13
+```
+
+`--cf-gpu 1` (the default; the CPU code when there is no device, and per chunk or level when the device is short of memory)
+runs pass 1's per-voxel pooling, the coarse-to-fine CG solves and the `--model-only --R 0` model pass on the GPU
+(`src/nn_cf.cu`). The global gauge pass and the model pass become one read of the strided chunks. The next field chunk
+decodes on a thread meanwhile (`--prefetch`, on when two chunks fit in half of MemAvailable). `--read-threads N` sets the
+zarr decode threads. The arithmetic mirrors the CPU's (no FMA contraction, IEEE division, glibc's atan2 / hypot of the
+65536 phase bytes as a table), so the pooled sums are bit-identical. The CG's dot products are summed in another order,
+which is the same size of difference as running the CPU with another `--threads`. Runs are deterministic.
+`ufsm cf-compare A B [FIELDS]` compares two models: lattice |Δdelta| and the snap integers round(W - φ) at the field cells.
+On a 1024-row Paris 4 cut (desk, 8 threads): 686 s -> 111 s. GPU vs CPU snap integers agree 0.9999905, and CPU 8 vs 6
+threads 0.9999908.
+The `--mem-gb` budget sets the chunk rows, and the result depends on it (chunk-edge rows skip the phase term, and
+`--model-stride` picks chunks), so use the same value to reproduce a ref: `--mem-gb 13` gives the 88-row chunks of the
+10-26 Paris 4 ref.
+
 ## Core wraps
 
 `ufsm wraps` spaces columns at `--step` along the arc of each wrap's root on the ray through the box centre at mid z.
