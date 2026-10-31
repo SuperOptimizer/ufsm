@@ -206,7 +206,16 @@ static void alloc_log(size_t n, void *ra) {
     Dl_info di; const size_t off = dladdr(ra, &di) && di.dli_fbase ? (size_t)((char *)ra - (char *)di.dli_fbase) : (size_t)ra;
     fprintf(stderr, "alloc %9.1f MB, device used %8.1f MB, caller 0x%zx\n", n / 1e6, (tot - fr) / 1e6, off);
 }
-extern "C" void *nn_malloc(size_t n) { void *p = nullptr; CK(cudaMalloc(&p, n)); alloc_log(n, __builtin_return_address(0)); return p; }
+extern "C" void *nn_malloc(size_t n) {
+    void *p = nullptr; const cudaError_t e = cudaMalloc(&p, n);
+    if (e != cudaSuccess) {   /* say so (the sticky g_err alone surfaced as a segfault in the next copy to the null pointer) */
+        size_t fr = 0, tot = 0; cudaGetLastError(); cudaMemGetInfo(&fr, &tot);
+        fprintf(stderr, "nn_malloc: cudaMalloc of %.2f GB failed (%s; %.2f of %.2f GB free on the device)\n", n / 1e9, cudaGetErrorString(e), fr / 1e9, tot / 1e9);
+        if (g_err == cudaSuccess) g_err = e;
+        return nullptr;
+    }
+    alloc_log(n, __builtin_return_address(0)); return p;
+}
 g_reg_t g_reg[NN_MAXREG];
 int g_nreg;
 extern "C" void nn_storage_forget(const void *p) { for (int i = 0; i < g_nreg; i++) if (g_reg[i].p == (const char *)p) { g_reg[i] = g_reg[--g_nreg]; return; } }

@@ -1,6 +1,7 @@
 /* ufsm ink-splat (inksplat.h): published 2D ink labels -> sparse 3D label zarr on the CT grid, and the depth profile of a 3D ink
    prediction along the labelled surface. */
 #include "inksplat.h"
+#include "sysinfo.h"
 #include "imgops.h"
 #include "tiffw.h"
 #include "json.h"
@@ -787,7 +788,7 @@ int cmd_ink_splat(int argc, char **argv) {
     const char *cr = sopt(argc, argv, "--crop", nullptr);
     if (cr && sscanf(cr, "%d,%d,%d,%d", c.crop, c.crop + 1, c.crop + 2, c.crop + 3) != 4) { fprintf(stderr, "ink-splat: --crop c0,r0,w,h\n"); return 2; }
     c.merge = sflag(argc, argv, "--merge"); c.coarse = atoi(sopt(argc, argv, "--coarse", "-1")); c.name = sopt(argc, argv, "--name", nullptr); c.summary = sopt(argc, argv, "--summary", nullptr); c.preview = sopt(argc, argv, "--preview", nullptr);
-    c.threads = atoi(sopt(argc, argv, "--threads", "6")); c.cache = sopt(argc, argv, "--cache", nullptr);
+    c.threads = ufsm_threads(atoi(sopt(argc, argv, "--threads", "0")), 6); c.cache = sopt(argc, argv, "--cache", nullptr);
     if (pi >= 0) { if (pi + 2 >= argc) { fprintf(stderr, "ink-splat: --pred ROOT KEY\n"); return 2; } c.pred_root = argv[pi + 1]; c.pred_key = argv[pi + 2]; }
     c.pred_level = atoi(sopt(argc, argv, "--pred-level", "-1")); c.pred_thr = atoi(sopt(argc, argv, "--pred-thr", "128")); c.pred_skip = atoi(sopt(argc, argv, "--pred-skip", "-1"));
     c.profile = atoi(sopt(argc, argv, "--profile", "0")); c.stride = atoi(sopt(argc, argv, "--stride", "4"));
@@ -827,7 +828,7 @@ int cmd_ink_score(int argc, char **argv) {
         const double p2 = pow(2, round(log2(F))); if (fabs(F - p2) < 0.002 * p2) F = p2;
         if (LL.um > 0 && S.vox_um > 0) F = LL.um / S.vox_um;
     }
-    const int nth = atoi(sopt(argc, argv, "--threads", "8"));
+    const int nth = ufsm_threads(atoi(sopt(argc, argv, "--threads", "0")), 8);
     const size_t np = (size_t)LL.W * LL.H;
     uint8_t *L = malloc(np), *M = msk ? malloc(np) : nullptr;
     if (!L || (msk && !M) || lsrc_read(&LL, 0, 0, LL.H, LL.W, L, nth) || (msk && lsrc_read(&LM, 0, 0, LL.H, LL.W, M, nth))) { fprintf(stderr, "ink-score: label read failed\n"); return 1; }

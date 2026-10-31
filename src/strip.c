@@ -33,6 +33,7 @@
      JPEG, and the on-papyrus share along the strip (CT >= ct-level within 3 x 3 px around the surface point) per 1 cm column and per
      wrap (strip_papyrus.tsv, papyrus_wraps.tsv): where the surface leaves the papyrus is reported, never cut. */
 #include "flatten.h"
+#include "sysinfo.h"
 #include "imgops.h"
 #include "jpegpar.h"
 #include "tiffw.h"
@@ -110,11 +111,21 @@ static double col_pitch(const st_wrap *a, int c0, int c1, float *buf) {
     return median_f32(v, n);
 }
 
+typedef struct { const st_wrap *W; const int *mw, *mc; int w, h; } st_fill_ctx;
+static void st_fill(void *ctx, int bx, int by, float (*joint)[3], uint8_t *valid) {   /* one strip.sfc patch (tfx_sfc_write) */
+    const st_fill_ctx *F = ctx;
+    for (int q = 0; q < 4096; q++) {
+        const int c = bx * 64 + q % 64, r = by * 64 + q / 64; if (c >= F->w || r >= F->h) continue;
+        const st_wrap *s = &F->W[F->mw[c]]; const size_t i = (size_t)r * s->w + F->mc[c];
+        if (!vok(s, i) || !(s->Z[i] > 0)) continue;
+        joint[q][0] = s->X[i]; joint[q][1] = s->Y[i]; joint[q][2] = s->Z[i]; valid[q] = 1;
+    }
+}
 int cmd_strip(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: ufsm strip <wraps-dir> <out-dir> [--first K] [--last K] [--every E] [--err 0.25] [--threads 8]\n"); return 2; }
     const char *wd = argv[2], *od = argv[3];
     const int first = atoi(sopt(argc, argv, "--first", "-1000000")), last = atoi(sopt(argc, argv, "--last", "1000000")), every = atoi(sopt(argc, argv, "--every", "1"));
-    const int nth = atoi(sopt(argc, argv, "--threads", "8")); const double err = atof(sopt(argc, argv, "--err", "0.25"));
+    const int nth = ufsm_threads(atoi(sopt(argc, argv, "--threads", "0")), 8); const double err = atof(sopt(argc, argv, "--err", "0.25"));
     if (every < 1 || !(err > 0)) { fprintf(stderr, "strip: --every >= 1, --err > 0\n"); return 2; }
     const double t0 = snow();
     DIR *d = opendir(wd); if (!d) { fprintf(stderr, "strip: cannot open %s\n", wd); return 1; }
@@ -189,25 +200,9 @@ int cmd_strip(int argc, char **argv) {
              "\"voxel_size_um\": %.6g, \"winding\": -1, \"wraps\": [%d, %d], \"walk\": \"%s\", \"valid_vertices\": %zu, \"source\": \"ufsm strip (consecutive wraps joined at the theta cut)\"}\n",
              1 / step, 1 / step, lo[0], lo[1], lo[2], hi[0], hi[1], hi[2], um, W[ord[0]].id, W[ord[n - 1]].id, desc ? "descending" : "ascending", nvalid);
     snprintf(p, sizeof p, "%s/strip.json", od); { FILE *f = fopen(p, "w"); if (f) { fputs(meta, f); fclose(f); } }
-    sfc_channel dc[3]; memset(dc, 0, sizeof dc); static const char *cn[3] = {"x", "y", "z"};
-    for (int a = 0; a < 3; a++) { snprintf(dc[a].name, sizeof dc[a].name, "%s", cn[a]); dc[a].width = (uint64_t)w; dc[a].height = (uint64_t)h; dc[a].dtype = SFC_F32;
-                                  dc[a].flags = SFC_COORDINATE | SFC_XYZ; dc[a].components = 3; dc[a].component = (uint32_t)a; dc[a].tolerance = err; }
-    char sp[1500], tmp[1600]; snprintf(sp, sizeof sp, "%s/strip.sfc", od); snprintf(tmp, sizeof tmp, "%s.tmp%d", sp, (int)getpid()); unlink(tmp);
-    sfc_writer *wr = nullptr; if (sfc_create(tmp, dc, 3, meta, strlen(meta), &wr)) { fprintf(stderr, "strip: cannot create %s\n", tmp); return 1; }
-    float (*joint)[3] = malloc(4096 * 12); uint8_t *valid = malloc(4096); int rc = 0; const double tw = snow();
-    for (int by = 0; by < (h + 63) / 64 && !rc; by++) for (int bx = 0; bx < (w + 63) / 64 && !rc; bx++) {
-        memset(joint, 0, 4096 * 12); memset(valid, 0, 4096);
-        for (int q = 0; q < 4096; q++) {
-            const int c = bx * 64 + q % 64, r = by * 64 + q / 64; if (c >= w || r >= h) continue;
-            const st_wrap *s = &W[mw[c]]; const size_t i = (size_t)r * s->w + mc[c];
-            if (!vok(s, i) || !(s->Z[i] > 0)) continue;
-            joint[q][0] = s->X[i]; joint[q][1] = s->Y[i]; joint[q][2] = s->Z[i]; valid[q] = 1;
-        }
-        rc = sfc_write_xyz_block(wr, joint, 12, 768, valid);
-    }
-    free(joint); free(valid);
-    if (rc) { sfc_cancel(wr); fprintf(stderr, "strip: sfc write failed\n"); return 1; }
-    if (sfc_finish(wr) || rename(tmp, sp)) { unlink(tmp); fprintf(stderr, "strip: sfc finish failed\n"); return 1; }
+    char sp[1500]; snprintf(sp, sizeof sp, "%s/strip.sfc", od);
+    const double tw = snow(); st_fill_ctx FC = {W, mw, mc, w, h};
+    if (tfx_sfc_write(sp, w, h, err, meta, st_fill, &FC, nth)) { fprintf(stderr, "strip: sfc write %s failed\n", sp); return 1; }
     struct stat st; stat(sp, &st);
     double pmed = 0; { float *pv = malloc((size_t)n * 4); int np = 0; for (int k = 0; k < n; k++) { const double pk = col_pitch(&W[k], W[k].w / 2, W[k].w / 2 + 16, buf); if (pk > 0) pv[np++] = (float)pk; } pmed = np ? median_f32(pv, np) : step; free(pv); }
     printf("strip: %d wraps -> %s: %d x %d (columns x rows), %zu valid vertices, column pitch median %.2f voxels (step %g), length ~%.1f cm, %.1f MB, write %.1fs, total %.1fs\n",
@@ -451,7 +446,7 @@ int cmd_strip_flatten(int argc, char **argv) {
     if (st_open(sd, &F.S)) return 1;
     F.w = F.S.w; F.h = F.S.h; F.step = F.S.step; F.D = atoi(sopt(argc, argv, "--decim", "1")); if (F.D < 1) F.D = 1;
     F.max_edge = atof(sopt(argc, argv, "--max-edge", "3"));
-    const int nth = atoi(sopt(argc, argv, "--threads", "16"));
+    const int nth = ufsm_threads(atoi(sopt(argc, argv, "--threads", "0")), 16);
     int S = atoi(sopt(argc, argv, "--stride", "0")); if (S <= 0) S = F.h / 2; S = S / F.D * F.D; if (S < 4 * F.D) S = 4 * F.D; F.Sst = S;
     F.lw = (F.w - 1) / F.D + 1; F.lh = (F.h - 1) / F.D + 1;
     const double um = F.S.um, ostep = atof(sopt(argc, argv, "--ostep", "0")) > 0 ? atof(sopt(argc, argv, "--ostep", "0")) : F.step;
@@ -724,7 +719,7 @@ int cmd_strip_mosaic(int argc, char **argv) {
     const char *fd = argv[2], *rd = argv[3], *od = argv[4];
     const int ctl = atoi(sopt(argc, argv, "--ct-level", "80")), ovpx = atoi(sopt(argc, argv, "--overview-px", "16000")), rows = atoi(sopt(argc, argv, "--rows", "10")), q = atoi(sopt(argc, argv, "--quality", "88"));
     const double tilecm = atof(sopt(argc, argv, "--tile-cm", "1")); const int wstripes = atoi(sopt(argc, argv, "--stripes", "1"));
-    int nthr = atoi(sopt(argc, argv, "--threads", "8")); if (nthr < 1) nthr = 1; if (nthr > 64) nthr = 64;
+    int nthr = ufsm_threads(atoi(sopt(argc, argv, "--threads", "0")), 8); if (nthr < 1) nthr = 1; if (nthr > 64) nthr = 64;
     char p[1600], cmd[1600]; snprintf(cmd, sizeof cmd, "mkdir -p '%s'", od); if (system(cmd)) return 1;
     /* the strip's segments (wrap per source column): <flat-dir>/../strip.tsv or --strip */
     char sdir[1400]; snprintf(sdir, sizeof sdir, "%s", sopt(argc, argv, "--strip", "")); if (!*sdir) snprintf(sdir, sizeof sdir, "%s/..", fd);
@@ -743,6 +738,15 @@ int cmd_strip_mosaic(int argc, char **argv) {
     fclose(f);
     const double gs = ostep * pxs, pxum = um / pxs;   /* render pixels per grid step, um per pixel */
     fprintf(stderr, "strip-mosaic: %d stripes, %.2f um/px, CT level %d\n", ns, pxum, ctl);
+    {   /* each thread holds one stripe's CT + ink + mask (~3.3 B per render pixel; a whole-scroll stripe of 60000 x 24000 px: ~5 GB):
+           no more threads than 70% of the memory this process may still allocate allows (cgroup aware) */
+        double mpx = 0; for (int k = 0; k < ns; k++) { const double px = (double)st[k].gw * gs * st[k].gh * gs; if (px > mpx) mpx = px; }
+        const double av = (double)ufsm_mem_available(), per = 3.3 * mpx + 64e6;
+        if (av > 0 && per > 0 && nthr > 1 && nthr * per > 0.7 * av) {
+            int n = (int)(0.7 * av / per); if (n < 1) n = 1;
+            if (n < nthr) { fprintf(stderr, "strip-mosaic: %d threads (not %d): ~%.1f GB per stripe, %.1f GB available\n", n, nthr, per / 1e9, av / 1e9); nthr = n; }
+        }
+    }
     /* pass 1: global contrast (CT and ink over valid pixels); stripes on threads, each into its own histogram (integer counts: the sum
        is the same in any order) */
     double hc[256] = {0}, hi[256] = {0};

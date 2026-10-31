@@ -12,6 +12,7 @@
    axis_a = normalise(ref x d), axis_b = d x axis_a, voxel (i, j, k) at origin + i axis_a + j axis_b + k d with
    origin = ray_origin - (T - 1) / 2 (axis_a + axis_b); trilinear sampling (rounded to uint8), valid = inside the volume. */
 #include "villawind.h"
+#include "sysinfo.h"
 #include "vwt.h"
 #include "wtrunk.h"
 #include "nn.h"
@@ -204,7 +205,7 @@ static vwt *g_vwt = nullptr;   /* --vwt: our trained model instead of villa's */
 static wtrunk *g_wt = nullptr; static uint16_t *g_xf = nullptr; static int g_xld = 0; static double g_um = 9.6;   /* --trunk: the frozen feature trunk of a cx model */
 static int ray_check(vw_net *net, int argc, char **argv) {
     if (argc < 5) { fprintf(stderr, "usage: ufsm villawind ray-check ROOT KEY WINDINGS.json --ckpt PTH [--tsv OUT] [--zr Z0,Z1] [--cache DIR] [--threads 8] [--prefetch 1] [--geom pair|umb --umb JSON --sz 112 --sr 192 --st 112 --r0 16]\n"); return 2; }
-    const int T = atoi(opt(argc, argv, "--T", "128")), L = atoi(opt(argc, argv, "--L", "384")), nth = atoi(opt(argc, argv, "--threads", "8"));
+    const int T = atoi(opt(argc, argv, "--T", "128")), L = atoi(opt(argc, argv, "--L", "384")), nth = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 8);
     double zr0 = -1e18, zr1 = 1e18; sscanf(opt(argc, argv, "--zr", ""), "%lf,%lf", &zr0, &zr1);
     const int prefetch = atoi(opt(argc, argv, "--prefetch", "0"));   /* 1: read (and cache) the slabs' CT only, no forward */
     /* --geom pair (default): the slab centred on the pair, ray a -> b (oracle geometry). --geom umb --umb JSON: production tiling, radial

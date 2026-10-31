@@ -15,6 +15,7 @@
    band's slabs (one sync), then per kept slab extraction on the device (trilinear, src/nn_vwi.cu), the bf16 forward, the block means and
    pair points, async D2H into a pinned record slot, and a writer thread doing the pwrites. */
 #include "vwt.h"
+#include "sysinfo.h"
 #include "nn.h"
 #include "attn.h"
 #include "json.h"
@@ -129,7 +130,7 @@ int cmd_vwt_infer(int argc, char **argv) {
                         "       ufsm vwt-infer --bench N [--gpu 0]\n");
         return 2;
     }
-    const int T = atoi(opt(argc, argv, "--T", "128")), L = atoi(opt(argc, argv, "--L", "384")), nth = atoi(opt(argc, argv, "--threads", "16"));
+    const int T = atoi(opt(argc, argv, "--T", "128")), L = atoi(opt(argc, argv, "--L", "384")), nth = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 16);
     int pi = 0, pn = 1; sscanf(opt(argc, argv, "--part", "0/1"), "%d/%d", &pi, &pn); if (pn < 1 || pi < 0 || pi >= pn) { fprintf(stderr, "vwt-infer: bad --part\n"); return 2; }
     if (nn_init(atoi(opt(argc, argv, "--gpu", "0")))) { fprintf(stderr, "vwt-infer: no GPU\n"); return 1; }
     if (!getenv("UFSM_LINEAR_MX")) at_set_mx(16);   /* the bf16 blocks */

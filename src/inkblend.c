@@ -1,4 +1,5 @@
 /* ufsm ink-blend (see cmd_ink_blend) */
+#include "sysinfo.h"
 #include "fblend.h"
 #include "fit.h"
 #include "pyramid.h"
@@ -34,7 +35,7 @@ static void ib_rows(void *a, int z0, int z1, int t) {
 }
 int cmd_ink_blend(int argc, char **argv) {
     const char *in[32]; int n = 0; const char *out = nullptr, *tile = nullptr, *grids = nullptr, *origins = nullptr;
-    double um = 0, q = 32; int nlev = 4, S = 512, nt = 16;
+    double um = 0, q = 32; int nlev = 4, S = 512, nt = ufsm_threads(0, 16);
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--um") && i + 1 < argc) { um = atof(argv[++i]); continue; }
         if (!strcmp(argv[i], "--tile") && i + 1 < argc) { tile = argv[++i]; continue; }

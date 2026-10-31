@@ -1,6 +1,7 @@
 /* ufsm dinovol-embed: the scrollprize dinovol model (src/dinovol.h) over a CT box with embed_volume.py's lattice tiling, blending and
    volume-wide normalisation; ufsm dinovol-eval: the sheet-identity check of the dense embedding along published surfaces. */
 #include "dinovol.h"
+#include "sysinfo.h"
 #include "xnet.h"
 #include "store.h"
 #include "zarr3.h"
@@ -240,7 +241,7 @@ int cmd_dinovol_embed(int argc, char **argv) {
         const int rc = raw_mode(net, argc, argv); dv_free(net); return rc;
     }
     const char *root = argv[2], *key = argv[3], *out = argv[4];
-    const int nthreads = atoi(opt(argc, argv, "--threads", "8")); zw_nthreads = nthreads < 1 ? 1 : nthreads > 64 ? 64 : nthreads;
+    const int nthreads = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 8); zw_nthreads = nthreads < 1 ? 1 : nthreads > 64 ? 64 : nthreads;
     const int T = atoi(opt(argc, argv, "--tile", "192")), ds = atoi(opt(argc, argv, "--dense-stride", "1"));
     const int dtype = !strcmp(opt(argc, argv, "--dtype", "int8"), "float16") ? 1 : 0;
     const int overlap = 8 > T / 6 / 8 * 8 ? 8 : T / 6 / 8 * 8;
@@ -921,7 +922,7 @@ int cmd_dinovol_calib(int argc, char **argv) {
     if (xnet_init(atoi(opt(argc, argv, "--gpu", "0")))) return 1;
     xnet_set_budget((size_t)(atof(opt(argc, argv, "--gpu-mem", "9")) * 1e9));
     const int N = atoi(opt(argc, argv, "--crops", "128")), T = atoi(opt(argc, argv, "--tile", "128")), NT = atoi(opt(argc, argv, "--tokens", "4"));
-    const int SH = atoi(opt(argc, argv, "--shift", "32")) / 8 * 8, iters = atoi(opt(argc, argv, "--sk-iters", "3")), nth = atoi(opt(argc, argv, "--threads", "8"));
+    const int SH = atoi(opt(argc, argv, "--shift", "32")) / 8 * 8, iters = atoi(opt(argc, argv, "--sk-iters", "3")), nth = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 8);
     const int maxs = atoi(opt(argc, argv, "--max-sources", "0"));
     double temps[8]; int nt = 0;
     { char *s = strdup(opt(argc, argv, "--temps", "0.04,0.07")); for (char *t = strtok(s, ","); t && nt < 8; t = strtok(nullptr, ",")) temps[nt++] = atof(t); free(s); }
