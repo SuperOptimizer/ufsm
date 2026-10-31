@@ -34,14 +34,28 @@ endif
 # ccache (when installed) makes recompiling unchanged sources free: switching VERIFY, make clean, other worktrees.
 # CCACHE= disables it.
 CCACHE  ?= $(shell command -v ccache 2>/dev/null)
-CC      := $(CCACHE) gcc
-NVCC    ?= $(CCACHE) nvcc
+# Toolchain auto-detection (rented pods: Ubuntu gcc 13 lacks -std=c23, CUDA lives in /usr/local/cuda-13.2 without a
+# /usr/local/cuda link, nvcc is not on PATH). HOSTCC: the first of gcc, gcc-15, gcc-14 that accepts -std=c23 (CC=... overrides
+# everything). CUDA: /usr/local/cuda, else the newest /usr/local/cuda-*, else nvcc's prefix on PATH. nvcc gets -ccbin g++-N
+# when HOSTCC is gcc-N. `make doctor` prints what was picked and the machine's real limits (ufsm sysinfo).
+ifeq ($(origin HOSTCC),undefined)
+HOSTCC := $(firstword $(foreach c,gcc gcc-15 gcc-14,$(shell echo 'int main(void){return 0;}' | $(c) -std=c23 -x c - -o /dev/null 2>/dev/null && echo $(c))) gcc)
+endif
+CC      := $(CCACHE) $(HOSTCC)
+ifeq ($(origin CUDA),undefined)
+CUDA := $(or $(if $(wildcard /usr/local/cuda/bin/nvcc),/usr/local/cuda),$(patsubst %/bin/nvcc,%,$(lastword $(sort $(wildcard /usr/local/cuda-*/bin/nvcc)))),$(patsubst %/bin/nvcc,%,$(shell command -v nvcc 2>/dev/null)),/usr/local/cuda)
+endif
+CCBIN   := $(if $(filter gcc-%,$(HOSTCC)),$(if $(shell command -v $(subst gcc,g++,$(HOSTCC)) 2>/dev/null),-ccbin $(subst gcc,g++,$(HOSTCC))))
+ifeq ($(origin NVCC),undefined)
+NVCC := $(CCACHE) $(if $(shell command -v nvcc 2>/dev/null),nvcc,$(CUDA)/bin/nvcc) $(CCBIN)
+endif
 CFLAGS  ?= -std=c23 -O3 -march=native -g -Wall -Wextra -Wno-unused-parameter -Wno-format-truncation -pthread
 CPPFLAGS = -D_GNU_SOURCE -Isrc -Ithird_party -Ithird_party/surfcomp $(shell pkg-config --cflags libcurl libzstd blosc zlib libcrypto)
 LDLIBS   = $(shell pkg-config --libs libcurl libzstd blosc zlib libcrypto) -ljpeg -lm -lpthread
-CUDA    ?= /usr/local/cuda
 NVFLAGS ?= -O3 $(NVARCH) -DUFSM_ARCH=$(ARCH) -use_fast_math -Xcompiler -fno-threadsafe-statics -Isrc   # fast math: +4% step time, FD tests still pass
-CUDALIBS = -L$(CUDA)/lib64 -lcudart -lcublasLt
+# -lstdc++: nvcc objects reference the C++ runtime (operator new / delete, __cxa_*); gcc links it implicitly only on some
+# toolchains (gcc-14 + CUDA 13.2 on the pods failed without it). Harmless where it is not needed.
+CUDALIBS = -L$(CUDA)/lib64 -lcudart -lcublasLt -lstdc++
 
 SRC  = src/json.c src/checkpoint.c src/sheet.c src/store.c src/zarr3.c src/sources.c src/sample.c src/band.c src/ct_augment.c src/scan_augment.c src/spatial_augment.c src/crush.c src/scrollaug.c src/cover.c src/zarr2.c src/tiff.c src/z3w.c src/hf.c src/ingest.c src/zipr.c src/train.c src/restore.c src/restore_cli.c src/unet.c src/split.c src/predict.c src/sweep.c src/eval.c src/fit.c src/tiffw.c src/edt.c src/votes.c src/wind.c src/fuse.c src/phase_check.c
 SRC += src/surf.c src/stitch.c src/coreline.c src/coreline_check.c src/fit_ct.c src/l1pot.c
@@ -69,6 +83,13 @@ OBJ  = $(patsubst src/%.c,$(B)/%.o,$(SRC)) $(B)/surfcomp.o
 
 all: $(B)/ufsm
 
+# make doctor: the toolchain this Makefile picked, then the machine's real limits (cgroup CPUs / RAM, GPUs / MIG, CUDA, disk)
+doctor:
+	@echo "make: CC=$(CC) ($(shell $(HOSTCC) -dumpfullversion 2>/dev/null)), NVCC=$(NVCC), CUDA=$(CUDA), ARCH=$(ARCH), build dir $(B)"
+	@echo "make: nvcc $(shell $(CUDA)/bin/nvcc --version 2>/dev/null | grep -o 'release [0-9.]*'), libs: $(foreach l,libcurl libzstd blosc zlib libcrypto,$(l)=$(shell pkg-config --modversion $(l) 2>/dev/null || echo MISSING)) libjpeg=$(if $(wildcard /usr/include/jpeglib.h /usr/include/*/jpeglib.h),ok,MISSING) xxhash=$(if $(wildcard /usr/include/xxhash.h /usr/local/include/xxhash.h),ok,MISSING)"
+	@$(MAKE) --no-print-directory $(B)/ufsm > /dev/null || { echo "make doctor: the build failed (missing libs above? see make $(B)/ufsm)"; exit 1; }
+	@$(B)/ufsm sysinfo --disk . $(if $(wildcard /tmp),--disk /tmp)
+
 # make test: the default binaries (used by the python CLI / sheet tests), then the whole suite on the VERIFY=1 build
 test:
 	$(MAKE) VERIFY=0 build/ufsm build/test_sheet build/make_pipeline_fixture build/test_http_reader build/test_sampler_safety build/test_formats
@@ -80,7 +101,7 @@ $(B)/%.o: src/%.c src/*.h third_party/volcomp.h | $(B)
 $(B)/surfcomp.o: third_party/surfcomp/surfcomp.c third_party/surfcomp/*.h | $(B)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -Wno-all -Wno-extra -c $< -o $@
 
-$(B)/ufsm: $(OBJ) $(B)/main.o $(B)/nn.o $(B)/nn_fp8.o
+$(B)/ufsm: $(OBJ) $(B)/main.o $(B)/sysinfo_cli.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 
 # The CUDA ops are split by section (src/nn_*.cu, shared declarations / device helpers / templates in src/nn_common.cuh)
@@ -164,6 +185,9 @@ $(B)/bench_mem: tests/bench_mem.c $(B)/unet.o $(B)/nn.o $(B)/nn_fp8.o
 
 $(B)/test_mx: tests/test_mx.c $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
+$(B)/test_sysinfo: tests/test_sysinfo.c src/sysinfo.h | $(B)
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_sysinfo.c -o $@
+test-all: $(B)/test_sysinfo
 $(B)/test_mx_sw: tests/test_mx_sw.c $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 test-all: $(B)/test_mx_sw
@@ -202,6 +226,9 @@ test-all: $(B)/test_wraps_core
 $(B)/test_predict_unwrap2: tests/test_predict_unwrap2.c $(B)/unet.o $(B)/fit.o $(B)/fit_emb.o $(B)/embz.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/coreline.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/z3w.o $(B)/nn.o $(B)/nn_fp8.o | $(B)/ufsm
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 test-all: $(B)/test_predict_unwrap2
+$(B)/test_predict_feather: tests/test_predict_feather.c $(B)/unet.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/z3w.o $(B)/nn.o $(B)/nn_fp8.o | $(B)/ufsm
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
+test-all: $(B)/test_predict_feather
 $(B)/test_tta: tests/test_tta.c $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 test-all: $(B)/test_tta
@@ -338,6 +365,9 @@ test-all: $(B)/test_robust
 $(B)/test_render_stream: tests/test_render_stream.c $(B)/render.o $(B)/inkcompare.o $(B)/imgops.o $(B)/jpegpar.o $(B)/tiff.o $(B)/tiffw.o $(B)/z3w.o $(B)/zarr3.o $(B)/store.o $(B)/json.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
 test-all: $(B)/test_render_stream
+$(B)/test_render_fill: tests/test_render_fill.c $(B)/render.o $(B)/inkcompare.o $(B)/imgops.o $(B)/jpegpar.o $(B)/tiff.o $(B)/tiffw.o $(B)/z3w.o $(B)/zarr3.o $(B)/store.o $(B)/json.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
+test-all: $(B)/test_render_fill
 $(B)/test_tiffw: tests/test_tiffw.c $(B)/tiffw.o $(B)/tiff.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
 $(B)/test_wind: tests/test_wind.c src/wind.h $(B)/wind.o
@@ -433,6 +463,9 @@ $(B)/test_formats: tests/test_formats.c $(OBJ) $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 $(B)/test_typed_zarr: tests/test_typed_zarr.c $(B)/z3w.o $(B)/zarr3.o $(B)/store.o $(B)/json.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
+$(B)/test_z3_autosub: tests/test_z3_autosub.c $(B)/z3w.o $(B)/zarr3.o $(B)/store.o $(B)/json.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
+test-all: $(B)/test_z3_autosub
 
 $(B)/test_ct_augment: tests/test_ct_augment.c $(B)/ct_augment.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ -lm
@@ -564,6 +597,7 @@ test-all: $(B)/test_gpu_aug $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover 
 	./$(B)/test_spiralfit
 	./$(B)/test_tta
 	./$(B)/test_predict_unwrap2 ./$(B)/ufsm
+	./$(B)/test_predict_feather ./$(B)/ufsm
 	./$(B)/test_coreline
 	./$(B)/test_fit_w4
 	./$(B)/test_repair
@@ -577,6 +611,7 @@ test-all: $(B)/test_gpu_aug $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover 
 	./$(B)/test_distill
 	./$(B)/test_tiffw
 	./$(B)/test_render_stream
+	./$(B)/test_render_fill
 	./$(B)/test_imgops
 	./$(B)/test_jpegpar
 	./$(B)/test_tfx
@@ -599,11 +634,13 @@ test-all: $(B)/test_gpu_aug $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover 
 	./$(B)/test_dino_pts
 	./$(B)/test_ink_splat
 	./$(B)/test_pyports
+	./$(B)/test_sysinfo
 	./$(B)/test_edt
 	./$(B)/test_volcomp
 	./$(B)/test_volcomp_fast
 	./$(B)/test_gpudec
 	./$(B)/test_typed_zarr
+	./$(B)/test_z3_autosub
 	python3 tests/test_http_reader.py
 	./$(B)/test_checkpoint_runtime
 	./$(B)/test_infer_buffers

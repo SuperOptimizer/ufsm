@@ -2,6 +2,7 @@
    a fresh reader per size so shard indices are fetched too) and reports decoded and network throughput, requests, bytes per
    request, 429 / 503 / 5xx counts, stalls and rate-limit headers (store_stats). Built into ufsm and as build/store_bench. */
 #include "zarr3.h"
+#include "sysinfo.h"
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -45,7 +46,7 @@ int cmd_store_bench(int argc, char **argv) {
         return 2;
     }
     const char *root = argv[2], *key = argv[3];
-    const int nbox = atoi(bopt(argc, argv, "--n", "8")), par = atoi(bopt(argc, argv, "--par", "1")), threads = atoi(bopt(argc, argv, "--threads", "16"));
+    const int nbox = atoi(bopt(argc, argv, "--n", "8")), par = atoi(bopt(argc, argv, "--par", "1")), threads = ufsm_threads(atoi(bopt(argc, argv, "--threads", "0")), 16);
     uint64_t seed = strtoull(bopt(argc, argv, "--seed", "1"), nullptr, 10);
     char boxes[256]; snprintf(boxes, sizeof boxes, "%s", bopt(argc, argv, "--box", "128,256,512"));
     store *s = store_open(root);

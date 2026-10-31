@@ -13,6 +13,7 @@
    Output: the probability on the surface's 2.4 um render grid (ufsm render --scale 1: (w - 1) / scale + 1 pixels wide) as
    <out>/<surf>_<model>.tif (uint8, 255 = 1) and a half-resolution JPEG; --native also the model-grid map. */
 #include "inkext.h"
+#include "sysinfo.h"
 #include "imgops.h"
 #include "wload.h"
 #include "store.h"
@@ -583,7 +584,7 @@ int cmd_ink_ext(int argc, char **argv) {
     X.blend_norm = !strcmp(iopt(argc, argv, "--blend", "official"), "norm");   /* v8in: sum(p g) / sum(g) instead of inference.py sum(p g) / count (its stride grid) */
     X.no_overlap = iflag(argc, argv, "--no-overlap");   /* stride = the tile, uniform weights (no blending), empty tiles skipped, v8in without its coverage-mask rule */
     X.norm_sheet = !strcmp(iopt(argc, argv, "--norm", "tile"), "sheet");   /* Reader / ink9um input normalisation: tile (official, per tile) or sheet */
-    X.nth = atoi(iopt(argc, argv, "--threads", "16")); X.px_um = atof(iopt(argc, argv, "--px-um", "0")); if (!(X.px_um > 0)) X.px_um = X.sp->px_um;
+    X.nth = ufsm_threads(atoi(iopt(argc, argv, "--threads", "0")), 16); X.px_um = atof(iopt(argc, argv, "--px-um", "0")); if (!(X.px_um > 0)) X.px_um = X.sp->px_um;
     X.ct_mem = (size_t)(atof(iopt(argc, argv, "--ct-mem", "3")) * (1 << 30));
     X.batch = atoi(iopt(argc, argv, "--batch", "0"));
     const double gmem = atof(iopt(argc, argv, "--gpu-mem", "0"));   /* GB of device memory for activations + cache (default: free - 1 GB) */

@@ -1,6 +1,7 @@
 /* src/jpegpar.c: see jpegpar.h. The pipeline reproduces libjpeg-turbo 2.1.5 (jccolor.c rgb_ycc_convert, jcsample.c
    fullsize / h2v2_downsample with expand_right_edge, jcprepct.c bottom padding, jccoefct.c dummy blocks, jfdctint.c
    jpeg_fdct_islow, jcdctmgr.c reciprocal quantisation = exact rounded division, jchuff.c encode_one_block + flush_bits). */
+#include "sysinfo.h"
 #include "jpegpar.h"
 #include <jpeglib.h>
 #include <pthread.h>
@@ -19,7 +20,7 @@ void jpar_set_threads(int n) { atomic_store(&g_threads, n > 0 ? n : 0); }
 int jpar_threads(void) {
     int n = atomic_load(&g_threads); if (n > 0) return n;
     const char *e = getenv("UFSM_JPEG_THREADS"); if (e && atoi(e) > 0) return atoi(e) > 256 ? 256 : atoi(e);
-    const long c = sysconf(_SC_NPROCESSORS_ONLN); return c < 1 ? 1 : c > 32 ? 32 : (int)c;
+    const long c = ufsm_ncpu(); return c < 1 ? 1 : c > 32 ? 32 : (int)c;
 }
 
 static const uint8_t zz[64] = {0,  1,  8,  16, 9,  2,  3,  10, 17, 24, 32, 25, 18, 11, 4,  5,  12, 19, 26, 33, 40, 48,

@@ -138,6 +138,18 @@ int sfc_write_block(sfc_writer *, const void *, size_t pixel_stride,
  * fields. */
 int sfc_write_xyz_block(sfc_writer *, const void *, size_t, size_t,
                         const uint8_t *);
+/* ufsm additions (parallel joint XYZ encoding, byte-identical files): an encoder per thread encodes patches (sfc_xyz_encoder_run:
+ * mask = the patch's validity with out-of-surface samples already cleared, as sfc_write_xyz_block clears them; the packet stays owned
+ * by the encoder until its next run); the writer appends them in patch order with sfc_write_xyz_encoded (src / mask of the patch). */
+typedef struct sfc_xyz_encoder sfc_xyz_encoder;
+sfc_xyz_encoder *sfc_xyz_encoder_create(void);
+void sfc_xyz_encoder_destroy(sfc_xyz_encoder *);
+int sfc_xyz_encoder_run(sfc_xyz_encoder *, const void *src, size_t ps, size_t rs,
+                        const uint8_t *mask, double error,
+                        const uint8_t **packet, size_t *size);
+int sfc_write_xyz_encoded(sfc_writer *, const uint8_t *packet, size_t size,
+                          const void *src, size_t ps, size_t rs,
+                          const uint8_t *mask);
 /* Always consumes the writer, on success AND failure. Do not call cancel
  * or any other writer API afterward. Before finish, cancel also consumes it. */
 int sfc_finish(sfc_writer *);

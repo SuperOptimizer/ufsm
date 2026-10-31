@@ -10,12 +10,19 @@ Production models: `wind96` (task unwrap, 9.6 um: phase, normals, density, recto
 ## Build and test
 
 ```sh
-make -j && make test     # gcc -std=c23 + nvcc; needs libcurl, libzstd, libblosc, zlib, libjpeg, OpenSSL libcrypto, CUDA 13 (sm_120)
+make -j && make test     # gcc -std=c23 + nvcc; needs libcurl, libzstd, libblosc, zlib, libjpeg, xxhash (header), OpenSSL libcrypto, CUDA 13 (sm_120)
 make ARCH=86             # Ampere (RTX 3090) into build86/: software MX-fp4 / fp8 (bit-exact conversions, emulated block-scaled MMAs)
                          # (on by default there; UFSM_MX_EMU=0: fp8 / fp4 as bf16, 16-bit storage); PTX=1: compute_86 PTX
                          # only (build86p/), so a newer GPU runs the sm_86 code (tests); BDIR=build puts it in build/
 make VERIFY=1 test-all   # the suite alone (build-verify/: adds the bf16 / fp32 reference kernels)
+make doctor              # the toolchain the Makefile picked + `ufsm sysinfo` (real cgroup CPUs / RAM, GPUs / MIG, CUDA, disk)
 ```
+
+The Makefile finds its toolchain itself: the first of gcc / gcc-15 / gcc-14 that accepts `-std=c23` (HOSTCC=, CC= override),
+CUDA in /usr/local/cuda, else the newest /usr/local/cuda-*, else nvcc's prefix on PATH (CUDA= overrides), nvcc `-ccbin g++-N`
+for gcc-N, and `-lstdc++` in CUDALIBS (gcc-14 + CUDA 13.2 failed to link without it). Default thread counts follow the cgroup
+(`cpu.max` quota, affinity; `UFSM_NCPU` overrides), not nproc, and memory budgets (count-field `--mem-gb`, `UFSM_RENDER_MEM`)
+are lowered to what the cgroup still allows (src/sysinfo.h).
 
 `make test` builds the default `build/ufsm` plus the fixtures the Python CLI tests use, then runs `test-all` on the VERIFY=1
 build. Single tests: `make VERIFY=1 build-verify/test_strip && build-verify/test_strip`. The pipeline stages below have their
@@ -81,12 +88,90 @@ $U strip-mosaic s/strip/flat s/render s/img --ct-level 80 --threads 12
 ```
 
 Drivers (resumable per stage; `STOP` files; MemAvailable gates):
+- `scripts/unroll/unroll.sh SCROLL`: steps 1-9 on one host as one resumable run. Stages: fields (one predict per GPU on z parts
+  of the box, joined by `fields_cat.sh`: shard files moved, byte-identical to one predict), ink on GPU `INKGPU` (1) beside the ref,
+  ref, slabs (one lane per GPU; the ink GPU joins once the ink is done), join, wraps, strip, strip-flatten, stripe renders + mosaic,
+  optional per-wrap renders (`PERWRAP=1`) and faces (`FACES=1`), and the upload (`UPLOAD=1` only, never for prize-eligible
+  scrolls). Settings per scroll (box, wraps `--zr`, strip flags) come from `scripts/unroll/scrolls.tsv`, else `scripts/corpus/list.tsv`.
+  `state/<stage>.done` holds the wall time, CPU seconds and max RSS. `DRY=1` prints the plan; `touch $O/STOP` stops between stages.
+  The render, faces and ink-compare stages use the shared decoded-CT cache (`UFSM_ZCACHE_GB`, admit 0.6). Its size is `ZCACHE_GB`:
+  by default 1/4 of the available RAM, at most 30 GB (the desk 30; a 62 GB pod ~15), and off on the laptop. The run removes
+  `/dev/shm/ufsm-zcache-<uid>` when it ends, also on STOP. strip-mosaic gets `UFSM_JPEG_THREADS` = cores / 8.
+  Env: `U CK INKCK FIELDGPUS FITGPUS INKGPU BOX TH PTH ITH MINMEM CTROOT CTKEY TAG INKCMD REFCMD ZCACHE_GB ZCACHE_ADMIT`.
 - `scripts/corpus/`: the three-host pipelined corpus unroll (`common.sh` describes the split): `desk.sh` prep (mask box from
   scanprep, `ufsm axis` when there is no umbilicus), wind96 fields, repack, push; `laptop.sh` / `inklib.sh` ift3 ink over HTTP
   from the mirror (steps 2); `fd.sh` ref, snapped slab fits, join, wraps (steps 3-6); `desk.sh` then surf-stats, flatten and
   renders. `list.tsv`: one ~9 um scan per scroll (root, key, um, level, axis or `auto`).
 - `scripts/cfit/`: the Paris 4 coarse-to-fine scripts with GT scoring (`refs.sh`, `slabs.sh`, `join.sh`; `cropref.sh` the crop A/B).
 - `scripts/faces/faces_p4c.sh`, `scripts/strip/strip_run.sh`.
+
+## Pod runs
+
+The user rents the pods. These scripts make a fresh one ready and run a whole-scroll unroll within its limits; the scripts
+need nothing from the desk. Typical limits are 13-16 real CPUs, 62 GB RAM, a 48 GB MIG slice and 500 GB disk. nproc and free
+report the host (256 CPUs, 1 TB), so ufsm reads the cgroup instead: `ufsm sysinfo`.
+
+```sh
+# on the pod, as root (re-run any time: every step skips what is done)
+curl -sfO https://raw.githubusercontent.com/SuperOptimizer/ufsm/master/scripts/pod/setup.sh
+bash setup.sh PHerc1299        # limits, apt deps, clone + build master, smoke test, checkpoints, the scroll's CT from the mirror
+setsid nohup bash /root/pod/ufsm/scripts/pod/unroll.sh PHerc1299 > /root/pod/unroll-PHerc1299.out 2>&1 < /dev/null &
+tail -f /root/pod/unroll/PHerc1299/progress.log        # per-stage wall / CPU / max RSS in state/*.done; stop: touch .../STOP
+```
+
+`setup.sh` fetches everything from the public mirror, never via the desk. The mirror gives about 40 MB/s on a pod; desk -> pod
+rsync manages only about 1.6 MB/s.
+- Checkpoints: `ufsm/checkpoints/{wind96-wk1-best,ift3-24000}`.
+- The scan's CT levels LV..LV+3: `ufsm mirror`, resumable and verified.
+- Any published `ufsm-c2f-20261028` box / axis / ink of the scroll.
+- When no box is published, `ufsm scanprep --box-out` makes one: the corpus prep box (PHerc1299 reproduces the published box).
+- The scan comes from `scripts/unroll/scrolls.tsv` or `scripts/corpus/list.tsv`.
+
+Env: POD (/root/pod), BRANCH, NOAPT / NOBUILD / NOSMOKE, LEVELS, MTH (mirror threads, 12: the mirror answers 429 past 64
+requests in flight per IP). ARCH=86 is picked by itself on sm_80/86/89 GPUs (software MX).
+
+`unroll.sh` runs `scripts/unroll/unroll.sh` (the stages above, resumable) on the pod's local CT, on one GPU or MIG slice, with:
+- `TH` = the cgroup CPUs;
+- the MemAvailable gate from `ufsm sysinfo --avail-gb`;
+- count-field `--mem-gb` = min(24, 40% of the limit);
+- `UFSM_RENDER_MEM` = min(16, 25% of the limit);
+- no per-wrap renders (`PERWRAP=1` adds them).
+
+Every variable can be overridden from the environment. Disk for a Paris 4-size scroll: CT level 2 42 GB, fields 50 GB (deleted
+once the wraps exist), joined 10 GB, ink 1.5 GB.
+
+Peak RSS per stage. Measured with `scripts/pod/unroll.sh` on a Paris 4 crop: 1024 level-2 z of the papyrus box y 1024+7150,
+x 512+7424, so slab fits and predicts see the whole-scroll cross-section. The crop ran on the desk in
+`systemd-run --scope -p CPUQuota=1400% -p MemoryMax=60G`. The whole-scroll column holds Paris 4 runs where they exist
+(logs named), else estimates scaled by the strip's valid vertices (x18.5).
+
+| stage | command | crop | whole Paris 4 | grows with | cap / lever |
+|---|---|---|---|---|---|
+| fields | `predict --fit-zarr` (wind96) | 9.5 GB | ~9.5 GB | cross-section (one z slab of windows) | `--window` |
+| ink | `predict` x3 (ift3, 2 passes) | 1.8 GB | ~1.8 GB | window | |
+| ink blend | `ink-blend` | 1.2 GB | ~1.2 GB | tile | `--tile` |
+| ref | `count-field --model-only` | 23.2 GB | 24.5 GB (cfit/whole/ref-cf, 3 h) | `--mem-gb` (24) | `--mem-gb`, now <= 60% of what the cgroup allows |
+| slab fits | `fit --ref-model` (96 cells, full section) | 9.6 GB host; 12.7 GB GPU | same per slab | cross-section | GPU: full 8174^2 box ~16 GB OOMs a 16 GB card: crop to the papyrus box |
+| join | `fit-join --ref` | 2.7 GB | 11.6 GB (JDETAIL=0) | scroll | `--score-detail` costs 89 GB: off |
+| wraps | `wraps` | 2.1 GB | 11.6 GB (p4core) | scroll | `--first/--last`, `--zr` |
+| strip | `strip` | 1.9 GB | 33.6 GB (e2e validation) | valid vertices (~28 B each) | `--every 2` (4x less), `--first/--last` |
+| strip flatten | `strip-flatten` | 0.7 GB | ~13 GB (est.) | vertices | `--decim` |
+| stripe render | `render` (union box) | 15.2 GB | 29.3 GB (Paris 3, 60000 x 22361 px stripes) | `UFSM_RENDER_MEM` + stripe px (~19 B/px) | `UFSM_RENDER_MEM` (now <= 50% available), strip-flatten `--stripe-px` |
+| mosaic | `strip-mosaic` | 1.0 GB (1 thread), 4.5 GB (14) | ~5 GB per thread (est., 3.3 B/stripe px) | threads x stripe px | threads now capped by memory (70% available) |
+| per wrap | `render` / `ink-compare` / `flatten` | 0.8 / 0.25 / 0.43 GB | render <= `UFSM_RENDER_MEM` + output; ink-compare streamed 0.5 GB | wrap area | `UFSM_RENDER_MEM`, `--decim` |
+
+On a pod only ink (GPU) and ref (CPU) overlap, about 26 GB together. Every other stage runs alone. The largest are strip
+(34 GB) and a stripe render (~30 GB), both under 50 GB at Paris 4 size. For a scroll 1.3x taller (PHerc1447) strip would
+reach ~44 GB: use `strip --every 2` there.
+
+The crop is 1/18.5 of Paris 4. With 14 CPUs and one 16 GB GPU, its stage wall times were:
+- fields 4.5 min;
+- ink beside ref 7.6 min;
+- 8 slabs 4.5 min;
+- join + wraps 2.4 min;
+- strip + flatten + stripe images 5 min.
+
+Scaled up, whole Paris 4 takes about 7 h on such a pod. The global ref alone is ~3 h and does not split.
 
 ## Command reference
 
@@ -190,12 +275,20 @@ Runtime notes:
   handles are pooled (32). `UFSM_Z3_COALESCE=0`, `UFSM_Z3_INDEX_PARALLEL=0`, `UFSM_HTTP_REUSE=0` disable them for comparisons.
   HTTP permission failures are errors; genuinely missing shards read as the fill value.
 - The input transform is rejected by split inference, surface winding, conditioned sweeps and cutoff-conditioned papyrus models.
+- `--feather B` (B <= halo; window - 2 halo = k shards on the shard grid): seam-free single pass. The lower B voxels of every
+  window are a sin^2 blend of its own and the earlier neighbours' halo predictions (normalized over the windows present), only
+  the earlier windows' upper slabs are held (a window layer + a row on the host), the blend runs on its own thread. `--resume`
+  recomputes done windows a remaining neighbour needs; `--gpus a,b` deals contiguous window layers. Byte-identical away from the
+  blend bands and across resume / worker splits (test_predict_feather). Paris 4 ift3 ink: border step (`ink-seam --block 16`)
+  20.2 (halo 0) / 6.3 (halo 64) -> 0.0 at window 576 halo 32 `--feather 32`, as the old 2-pass + ink-blend, in one pass.
+- `z3_read` decodes only the volcomp substreams (16 z x 32 y slabs of a 128^3 chunk) under the request box: same bytes, -33%
+  read time on 576^3 windows with 32-voxel halos (`UFSM_Z3_AUTOSUB=0` off; test_z3_autosub).
 
 ### Ink
 
 ```sh
 ufsm ink-blend <out> --um U --tile SZ,SY,SX --grids z,y,x:z,y,x:... <in1> <in2> ... [--origins z,y,x:...] [--levels 4] [--shard 512] [--q 32]
-ufsm ink-seam <zarr> --um U [--period 512] [--offset 0] [--n 24]     # window-seam jump (border vs interior |dv|)
+ufsm ink-seam <zarr> --um U [--period 512] [--offset 0] [--n 24] [--block 16]   # window-seam jump (border vs interior |dv|; --block 16: vs the codec-block faces)
 ufsm ink-ext --model v8in|hecate24|hecate96|reader3|ink9um --weights W --surface TIFXYZ --ct ROOT KEY --out DIR   # external 2.5D ink nets
 ufsm ink3d-ext --weights W --ct ROOT KEY --box ... --out GROUP       # the published 3D ink net (gambiarra) on a 2.4 um CT box
 ufsm ink-splat <out-group> --surface TIFXYZ --labels L --ct ROOT KEY --ct-um U --iso I [--band -4,4]   # 2D ink labels -> 3D label zarr
@@ -272,7 +365,7 @@ do not fix winding integers across disconnected regions; whole-scroll accuracy i
 ### Surfaces
 
 ```sh
-ufsm wraps <model> <out> [--step 8] [--out-um U] [--sfc ERR] [--fields DIR] [--first K] [--last K] [--zr Z0,Z1] [--col-r centre|p90|R]
+ufsm wraps <model> <out> [--step 8] [--out-um U] [--sfc ERR] [--fields DIR] [--first K] [--last K] [--zr Z0,Z1] [--col-r centre|p90|R] [--min-cm2 0.5]
 ufsm tifxyz-scale <src> <dst> <div> [--wraps a,b] [--offset z,y,x] [--flip-rows 1]   # coordinates / div; div 1 = .sfc -> tifxyz copy
 ufsm tifxyz-sfc <src> <dst> [--error 0.25] [--every K] [--wraps a,b]                 # tifxyz -> .sfc
 ufsm flatten <wraps> <out> [--wraps a,b] [--decim 1] [--crop rect|none] [--max-aspect A] [--rects N] [--min-cm2 5] [--fill-holes 5000] [--gpu 1] [--sfc ERR]
@@ -286,9 +379,14 @@ ufsm wrapswitch <wraps> <codes-root> <codes-key> [--per-wrap]                   
 voxels), row = z. `--out-um 9.6` writes coordinates on that grid (a 9.6 um fit's wraps on the 2.4 um grid with 2.4), `--sfc
 0.25` one `wNNN.sfc` per wrap instead of tifxyz dirs. The column spacing is the arc of the wrap's root on the ray through the
 box centre at mid z; a core wrap leaves the axis near that z, so its root is tiny and its columns land far apart (Paris 4 w085:
-29 columns). `--col-r p90` uses the 90th percentile of the wrap's roots over the rows' z range instead (w085: 267 columns).
-`--zr Z0,Z1` keeps rows at global native z in [Z0, Z1] and samples the wrap ids there (drop a broken end cap). `--first` /
-`--last` are exact. Wraps with <= 16 vertices are not written.
+29 columns). `--col-r p90` (default) uses the 90th percentile of the wrap's roots over the rows' z range instead (w085: 267
+columns); `--col-r centre` is the old spacing. `--zr Z0,Z1` keeps rows at global native z in [Z0, Z1] and samples the wrap ids there
+(drop a broken end cap). `--first` / `--last` are exact. Wraps with <= 16 vertices, or under `--min-cm2` (default 0.5; vertices x
+(step x um)^2), are not written: on Paris 4 these are the 62 end-cap fragments w016-w077 of 0.07-0.09 cm2. With `--fields`, only
+wrap ids within about one turn of a data cell are computed, largest first. Each empty id cost 30-60 CPU-s of failed root searches:
+Paris 4 sampled 16..580, wrote 257, and the empty ids above the data took 10.7 of 20.7 min. `UFSM_WRAPS_NOPRUNE=1` computes every id.
+The `.sfc` files (here and in `ufsm strip`) are encoded on all threads, byte-identical to the serial writer (P4 strip.sfc 876 -> 170 s
+at 4 threads).
 
 **flatten.** SLIM (symmetric Dirichlet, multilevel, flip-free line search; `src/flatten.h`) on the wrap's own vertex grid,
 then an isometric uv resample, Laplace fill of enclosed tears up to `--fill-holes` vertices (orange in `<w>_mask.jpg`; they

@@ -1,4 +1,5 @@
 #include "zarr2.h"
+#include "sysinfo.h"
 #include "json.h"
 #include <blosc.h>
 #include <errno.h>
@@ -177,7 +178,7 @@ int z2_read(z2 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nth
     work *items = malloc((size_t)nitems * sizeof *items);
     for (int64_t cz = c0[0]; cz <= c1[0]; cz++) for (int64_t cy = c0[1]; cy <= c1[1]; cy++) for (int64_t cx = c0[2]; cx <= c1[2]; cx++) items[k++] = (work){cz, cy, cx};
     job jb = {z, o, n, out, items, nitems, 0, 0};
-    if (nthreads <= 0) nthreads = (int)sysconf(_SC_NPROCESSORS_ONLN);
+    if (nthreads <= 0) nthreads = (int)ufsm_ncpu();
     if (nthreads > nitems) nthreads = nitems;
     if (nthreads > 256) nthreads = 256;
     if (nthreads < 1) nthreads = 1;

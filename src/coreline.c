@@ -1,5 +1,6 @@
 /* Core line of a crushed scroll: detection from the fit fields, signed distance, half-box masks (see coreline.h). */
 #include "coreline.h"
+#include "sysinfo.h"
 #include "json.h"
 #include "store.h"
 #include "zarr3.h"
@@ -285,7 +286,7 @@ static int cl_cmd_detect(int argc, char **argv) {
     const char *zr = argv[3], *outp = argv[4];
     double um; int h; int64_t shp[3];
     if (fields_meta(zr, &um, &h, shp)) { fprintf(stderr, "coreline: cannot read %s/fields.json\n", zr); return 1; }
-    const int slab = atoi(copt(argc, argv, "--slab", "64")), bin = atoi(copt(argc, argv, "--bin", "4")), nt = atoi(copt(argc, argv, "--threads", "8"));
+    const int slab = atoi(copt(argc, argv, "--slab", "64")), bin = atoi(copt(argc, argv, "--bin", "4")), nt = ufsm_threads(atoi(copt(argc, argv, "--threads", "0")), 8);
     const int zlo = atoi(copt(argc, argv, "--z0", "0")), zhi = atoi(copt(argc, argv, "--z1", "0")) > 0 ? atoi(copt(argc, argv, "--z1", "0")) : (int)shp[0];
     const double oum = atof(copt(argc, argv, "--um", "2.399")), f = h * um / oum;   /* cells -> output voxels */
     cl_params P = cl_params_default();

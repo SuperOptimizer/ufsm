@@ -53,6 +53,16 @@ static inline float tifxyz_scaled(float v, float z, float divf, float offf) { re
 /* ufsm render output pixels along a grid of n vertices at gs pixels per grid step: floor((n - 1) gs) + 1 with a 1e-6 slack, so the float32
    meta scales of one mesh at two divisors (0.05 -> step 19.9999997 x 0.5, 0.2 -> 4.99999993 x 2) give the same size (ink-compare pairs) */
 static inline int render_out_px(int n, double gs) { return (int)floor((n - 1) * gs + 1e-6) + 1; }
+/* the papyrus look (ink-compare --papyrus, strip-mosaic --papyrus): stretched CT v (0..255) through dark brown .. warm tan, carbon ink of
+   density d (0..1) over it; img_pap_ink: a stretched ink value (0..255) times gain -> d (ramp .12 .. .9, smoothstep, at most .92) */
+static inline void img_pap_rgb(int v, float d, uint8_t *o) {
+    static const float P[4][3] = {{58, 36, 20}, {128, 88, 52}, {196, 156, 104}, {236, 214, 170}};
+    const float t = (float)v / 255.f * 3.f; const int i = t >= 3.f ? 2 : (int)t; const float f = t - i;
+    for (int e = 0; e < 3; e++) { const float pv = P[i][e] + f * (P[i + 1][e] - P[i][e]), iv = e == 0 ? 26.f : e == 1 ? 22.f : 19.f; o[e] = (uint8_t)lroundf(pv * (1.f - d) + iv * d); }
+}
+static inline float img_pap_ink(int ink, float gain) {
+    float d = (float)ink / 255.f * gain; d = d < .12f ? 0.f : d > .9f ? 1.f : (d - .12f) / .78f; return d * d * (3.f - 2.f * d) * .92f;
+}
 
 float *img_read_f32(const char *path, int *w, int *h);     /* a float32 single-sample TIFF, nullptr on failure */
 /* ufsm render of one wrap grid (X, Y, Z: w x h vertices, gs output pixels per grid step) through nv (1-2) volumes into img[v]
@@ -67,6 +77,30 @@ int render_wrap_chunked(struct z3 *const *vz, int nv, const int *depth, const fl
    img[s nv + v]. Every image equals render_wrap_chunked's of that grid alone, byte for byte. */
 int render_wraps_chunked(struct z3 *const *vz, int nv, const int *depth, int ns, const float *const *X, const float *const *Y, const float *const *Z,
                          int w, int h, double gs, uint8_t *const *img, int ow, int oh, const int *crop, size_t budget, int nthreads, int io_threads, int verbose);
+/* render --fill: holes = pixels whose CT sample on the surface is void (the masked CT is 0 off the papyrus: the surface sits in a gap
+   between sheets, or crosses a tear / fold). With n > 0, such a pixel searches along the surface normal t = +-1 .. +-n voxels for the
+   nearest sample with CT >= thr and renders EVERY volume centred there (ink and CT keep the same offset, so they stay aligned); at
+   equal distance both sides papyrus: prefer > 0 the +normal side, < 0 the -normal side, 0 the larger CT. n = 0: no search, only the
+   flags. The CT is volume 1 (nv must be 2). flag[s] (ow x oh, sheet s) gets the codes below; the caller sets it to RFILL_NONE.
+   vgrid[s] (w x h, or vgrid nullptr): nonzero at vertices tifxyz_fill_holes interpolated; pixels with such a corner get + RFILL_GRID. */
+enum { RFILL_ON = 0, RFILL_NEG = 50, RFILL_GRID = 100, RFILL_INPAINT = 250, RFILL_NONE = 254, RFILL_EMPTY = 255 };   /* +k: k (1..49); -k: 50 + k */
+typedef struct { int n, thr, prefer; uint8_t *const *flag; const uint8_t *const *vgrid; } render_fill;
+int render_wraps_chunked_fill(struct z3 *const *vz, int nv, const int *depth, int ns, const float *const *X, const float *const *Y, const float *const *Z,
+                              int w, int h, double gs, uint8_t *const *img, int ow, int oh, const int *crop, size_t budget, int nthreads, int io_threads,
+                              int verbose, const render_fill *F);
+/* the cosmetic fill of the pixels still empty after the search (flag RFILL_EMPTY): push-pull over `levels` pyramid levels (holes up to
+   ~2^levels pixels across; larger ones stay empty) from the surface pixels (flags 0..RFILL_NEG + 99), the same for every image in
+   imgs[0..nimg); filled pixels get RFILL_INPAINT. Tiles of 512 pixels with a 2^(levels + 1) halo on threads. Returns the pixels filled. */
+/* render --fill-grid: holes in a tifxyz grid (4-connected components of invalid vertices, Z < 0 or NaN) that touch no grid border and
+   have at most maxv vertices get X, Y, Z interpolated from their rims (push-pull start, then Gauss-Seidel on the Laplace equation),
+   so the surface bridges tears and dropped triangles and renders real data there. filled (w x h, or nullptr) = 1 at those vertices.
+   Returns the vertices filled (holes counted in *nholes, holes skipped as too large in *nbig). */
+size_t tifxyz_fill_holes(float *X, float *Y, float *Z, int w, int h, size_t maxv, uint8_t *filled, size_t *nholes, size_t *nbig);
+size_t img_pushpull_fill(uint8_t *const *imgs, int nimg, uint8_t *flag, int w, int h, int levels, int nthreads);
+/* PatchMatch (Barnes 2009) refinement of the pixels flagged RFILL_INPAINT (initialised by img_pushpull_fill): 3-level pyramid,
+   7 x 7 patches over all nimg channels jointly (CT and ink from the same source patch), sources = surface pixels within a 40-pixel
+   halo of each 256-pixel tile. 0 ok, -1 out of memory. */
+int img_patchmatch_fill(uint8_t *const *imgs, int nimg, const uint8_t *flag, int w, int h, int nthreads);
 uint8_t *img_read_u8(const char *path, int *w, int *h);    /* a uint8 single-sample TIFF */
 
 /* numpy.percentile(v, q) (method linear, numpy 2's _lerp) of n values; v is reordered. The float32 version is numpy's on float32

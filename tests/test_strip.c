@@ -100,6 +100,33 @@ int main(void) {
           CHECK(!cmd_strip_mosaic(15, av), "strip-mosaic --stretch --wait-renders failed"); }
         snprintf(cmd, sizeof cmd, "cd %s/m1 && for x in *; do cmp -s $x ../m5/$x || exit 1; done", root);
         CHECK(!system(cmd), "strip-mosaic --stretch --wait-renders output differs from the two-pass run");
+        /* --papyrus: papyrus-look stripe JPEGs, a one-band overview / long strip; the same tables as the grey mosaic */
+        { char a1[400], a3[400]; snprintf(a1, sizeof a1, "%s/strip/flat", root); snprintf(a3, sizeof a3, "%s/m6", root);
+          char *av[] = {"ufsm", "strip-mosaic", a1, rdir, a3, "--threads", "2", "--rows", "2", "--overview-px", "600", "--stretch", sv, "--papyrus", "1", "--papyrus-bg", "128"};
+          CHECK(!cmd_strip_mosaic(17, av), "strip-mosaic --papyrus failed"); }
+        snprintf(cmd, sizeof cmd, "cd %s && ls m6/*_papyrus.jpg > /dev/null && test -s m6/overview.jpg && test -s m6/strip_long.jpg && cmp -s m1/strip_papyrus.tsv m6/strip_papyrus.tsv && cmp -s m1/papyrus_wraps.tsv m6/papyrus_wraps.tsv", root);
+        CHECK(!system(cmd), "strip-mosaic --papyrus outputs missing or its tables differ");
+        /* --fill-maps: fill maps marking every pixel rendered (flag 100: a bridged grid hole) widen the mask: valid area grows */
+        { char fm[400]; snprintf(fm, sizeof fm, "%s/fm", root); snprintf(cmd, sizeof cmd, "mkdir -p %s", fm); CHECK(!system(cmd), "mkdir");
+          snprintf(cmd, sizeof cmd, "cd %s && ls *_ct.tif", rdir); FILE *ls = popen(cmd, "r"); char nm[256];
+          while (ls && fgets(nm, sizeof nm, ls)) { nm[strcspn(nm, "\n")] = 0; nm[strlen(nm) - 7] = 0; int w, h; snprintf(p, sizeof p, "%s/%s_ct.tif", rdir, nm); uint8_t *im = img_read_u8(p, &w, &h);
+              if (im) { memset(im, 100, (size_t)w * h); snprintf(p, sizeof p, "%s/%s_fill.tif", fm, nm); CHECK(!tiffw_write(p, w, h, 1, im, 1), "write fill map"); free(im); } }
+          if (ls) pclose(ls);
+          /* a copy of the flattened strip with a hole in every stripe grid (vertices -1): the plain mosaic loses it, --fill-maps keeps it */
+          snprintf(cmd, sizeof cmd, "cp -r %s/strip/flat %s/flat2", root, root); CHECK(!system(cmd), "cp flat");
+          snprintf(cmd, sizeof cmd, "ls %s/flat2/stripes", root); ls = popen(cmd, "r");
+          while (ls && fgets(nm, sizeof nm, ls)) { nm[strcspn(nm, "\n")] = 0; int w, h; snprintf(p, sizeof p, "%s/flat2/stripes/%s/z.tif", root, nm); float *Z = img_read_f32(p, &w, &h);
+              if (Z) { for (int r = h / 4; r < h / 2; r++) for (int c = w / 4; c < w / 2; c++) Z[(size_t)r * w + c] = -1.f; CHECK(!tiffw_write(p, w, h, 3, Z, 1), "write z"); free(Z); } }
+          if (ls) pclose(ls);
+          char a1[400], a3[400]; snprintf(a1, sizeof a1, "%s/flat2", root);
+          snprintf(a3, sizeof a3, "%s/m8", root); char *av0[] = {"ufsm", "strip-mosaic", a1, rdir, a3, "--threads", "2", "--rows", "2", "--overview-px", "600", "--stretch", sv};
+          CHECK(!cmd_strip_mosaic(13, av0), "strip-mosaic on the holed grids failed");
+          snprintf(a3, sizeof a3, "%s/m7", root);
+          char *av[] = {"ufsm", "strip-mosaic", a1, rdir, a3, "--threads", "2", "--rows", "2", "--overview-px", "600", "--stretch", sv, "--fill-maps", fm};
+          CHECK(!cmd_strip_mosaic(15, av), "strip-mosaic --fill-maps failed");
+          double v1 = 0, v7 = 0; for (int k = 0; k < 2; k++) { snprintf(p, sizeof p, "%s/%s/strip_papyrus.tsv", root, k ? "m7" : "m8"); FILE *t = fopen(p, "r"); char ln[256];
+              if (t) { if (fgets(ln, sizeof ln, t)) {} while (fgets(ln, sizeof ln, t)) { double u, v; if (sscanf(ln, "%lf %lf", &u, &v) == 2) *(k ? &v7 : &v1) += v; } fclose(t); } }
+          CHECK(v7 > v1 && v1 > 0, "--fill-maps valid area %g vs %g", v7, v1); }
     }
     if (!fails) { snprintf(cmd, sizeof cmd, "rm -r %s", root); if (system(cmd)) {} }
     printf("test_strip: %s\n", fails ? "FAILED" : "ok");

@@ -5,6 +5,8 @@
 #include "tiffw.h"
 #include "surfcomp.h"
 #include <math.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -55,28 +57,78 @@ static char *tfx_meta(const char *metapath) {
     if (!tfx_resolve(metapath, sfc, sizeof sfc, &leaf) || (strcmp(leaf, "meta.json") && strcmp(leaf, "x.tif")) || tfx_load(sfc)) return nullptr;
     return strdup(g_c.meta ? g_c.meta : "{}");
 }
-static int tfx_write(const char *sfcpath, int w, int h, const float *x, const float *y, const float *z, const char *meta, double err) {
+/* the threaded joint-XYZ writer (src/tiffw.h tfx_sfc_write): batches of patches in file order; workers fill + encode, the caller appends */
+typedef struct {
+    int w, h, nbx; long long b0, nb; double err; tfx_fill_fn fill; void *ctx;
+    float (*joint)[4096][3]; uint8_t (*valid)[4096]; uint8_t **pk; size_t *pn; _Atomic long long next; _Atomic int fail;
+} tfx_batch;
+static void tfx_patch(tfx_batch *B, long long q, sfc_xyz_encoder *e) {
+    const long long b = B->b0 + q; const int bx = (int)(b % B->nbx), by = (int)(b / B->nbx);
+    float (*J)[3] = B->joint[q]; uint8_t *v = B->valid[q];
+    memset(J, 0, 4096 * 12); memset(v, 0, 4096);
+    B->fill(B->ctx, bx, by, J, v);
+    for (int i = 0; i < 4096; i++) if (bx * 64 + i % 64 >= B->w || by * 64 + i / 64 >= B->h) v[i] = 0;   /* (the writer's in-surface mask) */
+    const uint8_t *pk; size_t n;
+    if (sfc_xyz_encoder_run(e, J, 12, 768, v, B->err, &pk, &n) || !(B->pk[q] = malloc(n))) { atomic_store(&B->fail, 1); return; }
+    memcpy(B->pk[q], pk, n); B->pn[q] = n;
+}
+static void *tfx_worker(void *arg) {
+    tfx_batch *B = arg; sfc_xyz_encoder *e = sfc_xyz_encoder_create(); if (!e) { atomic_store(&B->fail, 1); return nullptr; }
+    for (long long q; (q = atomic_fetch_add(&B->next, 1)) < B->nb && !atomic_load(&B->fail);) tfx_patch(B, q, e);
+    sfc_xyz_encoder_destroy(e);
+    return nullptr;
+}
+static _Atomic int g_writers;   /* tfx_sfc_write calls running now (concurrent wraps share the threads) */
+static int g_sfc_threads = 1;
+void tfx_set_threads(int n) { g_sfc_threads = n > 0 ? n : 1; }
+int tfx_sfc_write(const char *sfcpath, int w, int h, double err, const char *meta, tfx_fill_fn fill, void *ctx, int nthreads) {
+    if (nthreads <= 0) nthreads = g_sfc_threads;
+    const int active = atomic_fetch_add(&g_writers, 1) + 1; int nt = nthreads / active; if (nt < 1) nt = 1; if (nt > 64) nt = 64;
     sfc_channel d[3]; memset(d, 0, sizeof d); static const char *cn[3] = {"x", "y", "z"};
     for (int a = 0; a < 3; a++) { snprintf(d[a].name, sizeof d[a].name, "%s", cn[a]); d[a].width = (uint64_t)w; d[a].height = (uint64_t)h; d[a].dtype = SFC_F32;
                                   d[a].flags = SFC_COORDINATE | SFC_XYZ; d[a].components = 3; d[a].component = (uint32_t)a; d[a].tolerance = err; }
-    char tmp[1500];
-    { const char *sl = strrchr(sfcpath, '/'); if (sl) { snprintf(tmp, sizeof tmp, "mkdir -p '%.*s'", (int)(sl - sfcpath), sfcpath); if (system(tmp)) return -1; } }
+    char tmp[1500]; int rc = -1;
+    { const char *sl = strrchr(sfcpath, '/'); if (sl) { snprintf(tmp, sizeof tmp, "mkdir -p '%.*s'", (int)(sl - sfcpath), sfcpath); if (system(tmp)) goto out; } }
     snprintf(tmp, sizeof tmp, "%s.tmp%d", sfcpath, (int)getpid()); unlink(tmp);
-    sfc_writer *wr = nullptr; if (sfc_create(tmp, d, 3, meta, strlen(meta), &wr)) return -1;
-    float (*joint)[3] = malloc(4096 * 12); uint8_t *valid = malloc(4096); if (!joint || !valid) { sfc_cancel(wr); free(joint); free(valid); return -1; }
-    int rc = 0;
-    for (int by = 0; by < (h + 63) / 64 && !rc; by++) for (int bx = 0; bx < (w + 63) / 64 && !rc; bx++) {
-        memset(joint, 0, 4096 * 12); memset(valid, 0, 4096);
-        for (int q = 0; q < 4096; q++) {
-            const int c = bx * 64 + q % 64, r = by * 64 + q / 64; if (c >= w || r >= h) continue;
-            const size_t i = (size_t)r * w + c; joint[q][0] = x[i]; joint[q][1] = y[i]; joint[q][2] = z[i];
-            valid[q] = z[i] > 0 && isfinite(x[i]) && isfinite(y[i]) && isfinite(z[i]);   /* (sfc: valid samples need z > 0) */
+    sfc_writer *wr = nullptr; if (sfc_create(tmp, d, 3, meta, strlen(meta), &wr)) goto out;
+    const int nbx = (w + 63) / 64; const long long nball = (long long)nbx * ((h + 63) / 64);
+    const long long cap = nt > 1 ? 32LL * nt : 1;   /* patches per batch (52 KB of input each) */
+    tfx_batch B = {.w = w, .h = h, .nbx = nbx, .err = err, .fill = fill, .ctx = ctx};
+    B.joint = malloc(cap * sizeof *B.joint); B.valid = malloc(cap * sizeof *B.valid); B.pk = calloc(cap, sizeof *B.pk); B.pn = calloc(cap, sizeof *B.pn);
+    sfc_xyz_encoder *e1 = nt > 1 ? nullptr : sfc_xyz_encoder_create();
+    rc = !B.joint || !B.valid || !B.pk || !B.pn || (nt == 1 && !e1);
+    for (long long b0 = 0; b0 < nball && !rc; b0 += cap) {
+        B.b0 = b0; B.nb = nball - b0 < cap ? nball - b0 : cap; atomic_store(&B.next, 0);
+        if (nt > 1) {
+            pthread_t th[64]; const int k = B.nb < nt ? (int)B.nb : nt;
+            for (int t = 0; t < k; t++) pthread_create(&th[t], nullptr, tfx_worker, &B);
+            for (int t = 0; t < k; t++) pthread_join(th[t], nullptr);
+        } else for (long long q = 0; q < B.nb && !atomic_load(&B.fail); q++) tfx_patch(&B, q, e1);
+        rc = atomic_load(&B.fail);
+        for (long long q = 0; q < B.nb; q++) {
+            if (!rc) rc = sfc_write_xyz_encoded(wr, B.pk[q], B.pn[q], B.joint[q], 12, 768, B.valid[q]);
+            free(B.pk[q]); B.pk[q] = nullptr;
         }
-        rc = sfc_write_xyz_block(wr, joint, 12, 768, valid);
     }
-    free(joint); free(valid);
-    if (rc) { sfc_cancel(wr); return -1; }
-    if (sfc_finish(wr) || rename(tmp, sfcpath)) { unlink(tmp); return -1; }
-    return 0;
+    sfc_xyz_encoder_destroy(e1); free(B.joint); free(B.valid); free(B.pk); free(B.pn);
+    if (rc) { sfc_cancel(wr); rc = -1; goto out; }
+    if (sfc_finish(wr) || rename(tmp, sfcpath)) { unlink(tmp); rc = -1; goto out; }
+    rc = 0;
+out:
+    atomic_fetch_sub(&g_writers, 1);
+    return rc;
+}
+typedef struct { int w, h; const float *x, *y, *z; } tfx_grid;
+static void tfx_fill_grid(void *ctx, int bx, int by, float (*joint)[3], uint8_t *valid) {
+    const tfx_grid *G = ctx;
+    for (int q = 0; q < 4096; q++) {
+        const int c = bx * 64 + q % 64, r = by * 64 + q / 64; if (c >= G->w || r >= G->h) continue;
+        const size_t i = (size_t)r * G->w + c; joint[q][0] = G->x[i]; joint[q][1] = G->y[i]; joint[q][2] = G->z[i];
+        valid[q] = G->z[i] > 0 && isfinite(G->x[i]) && isfinite(G->y[i]) && isfinite(G->z[i]);   /* (sfc: valid samples need z > 0) */
+    }
+}
+static int tfx_write(const char *sfcpath, int w, int h, const float *x, const float *y, const float *z, const char *meta, double err) {
+    tfx_grid G = {w, h, x, y, z};
+    return tfx_sfc_write(sfcpath, w, h, err, meta, tfx_fill_grid, &G, 0);
 }
 __attribute__((constructor)) static void tfx_install(void) { tfx_axis_hook = tfx_axis; tfx_meta_hook = tfx_meta; tfx_write_hook = tfx_write; }
