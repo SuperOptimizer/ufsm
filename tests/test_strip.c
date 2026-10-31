@@ -173,6 +173,35 @@ int main(void) {
           snprintf(cmd, sizeof cmd, "cd %s && for x in $(ls m11); do cmp -s m11/$x m12/$x || { echo $x; exit 1; }; done && for x in $(ls m11p); do cmp -s m11p/$x m12p/$x || { echo $x; exit 1; }; done", root);
           CHECK(!system(cmd), "strip-mosaic 1:1 overview: --threads 5 --stripe-jobs 3 differs from 1 / 1"); }
     }
+    /* streamed strip (.sfc wraps, 64-row bands decoded while encoding) = the whole-decode path (UFSM_STRIP_FULL=1), byte for byte: 150
+       rows (3 bands, the last partial), holes, --every 1 / 2, threads 1 / 5 */
+    {
+        const int hs = 150; tifxyz_set_sfc(0.05);
+        snprintf(cmd, sizeof cmd, "mkdir -p %s/swraps", root); if (system(cmd)) return 1;
+        for (int k = k0; k <= k1; k++) {
+            const double rk = rad(k, atan2(0, 1)), dth = step / rk; const int cols = (int)ceil(2 * M_PI / dth) + 1;
+            float *X = malloc((size_t)cols * hs * 4), *Y = malloc((size_t)cols * hs * 4), *Z = malloc((size_t)cols * hs * 4);
+            for (int r = 0; r < hs; r++) for (int c = 0; c < cols; c++) {
+                const size_t i = (size_t)r * cols + (cols - 1 - c); const double th = -M_PI + c * dth, ta = atan2(sin(th), cos(th)), rr = rad(k, ta);
+                X[i] = (float)(CX + rr * cos(th)); Y[i] = (float)(CY + rr * sin(th)); Z[i] = (float)(10 + r * step);
+                if ((r / 9 + c / 13 + k) % 7 == 0) X[i] = Y[i] = Z[i] = -1;   /* holes */
+            }
+            snprintf(p, sizeof p, "%s/swraps/w%03d", root, k);
+            CHECK(!tifxyz_write(p, cols, hs, X, Y, Z, step, um, k, "test"), "write %s.sfc", p);
+            free(X); free(Y); free(Z);
+        }
+        tifxyz_set_sfc(0);
+        static const char *ev[2] = {"1", "2"}, *tv[2] = {"1", "5"};
+        for (int e = 0; e < 2; e++) for (int t = 0; t < 2; t++) for (int full = 0; full < 2; full++) {
+            char a1[300], a2[300]; snprintf(a1, sizeof a1, "%s/swraps", root); snprintf(a2, sizeof a2, "%s/ss_e%s_t%s_%d", root, ev[e], tv[t], full);
+            if (full) setenv("UFSM_STRIP_FULL", "1", 1); else unsetenv("UFSM_STRIP_FULL");
+            char *av[] = {"ufsm", "strip", a1, a2, "--threads", (char *)tv[t], "--err", "0.05", "--every", (char *)ev[e]};
+            CHECK(!cmd_strip(10, av), "strip --every %s --threads %s (full %d) failed", ev[e], tv[t], full);
+        }
+        unsetenv("UFSM_STRIP_FULL");
+        snprintf(cmd, sizeof cmd, "cd %s && for e in 1 2; do for t in 1 5; do for x in strip.sfc strip.tsv strip.json; do cmp ss_e${e}_t${t}_0/$x ss_e${e}_t${t}_1/$x && cmp ss_e${e}_t1_1/$x ss_e${e}_t${t}_0/$x || exit 1; done; done; done", root);
+        CHECK(!system(cmd), "streamed strip differs from the whole-decode strip");
+    }
     if (!fails && !getenv("TEST_STRIP_KEEP")) { snprintf(cmd, sizeof cmd, "rm -r %s", root); if (system(cmd)) {} }
     printf("test_strip: %s\n", fails ? "FAILED" : "ok");
     return fails ? 1 : 0;
