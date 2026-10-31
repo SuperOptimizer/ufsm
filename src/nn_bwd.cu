@@ -35,6 +35,10 @@ void zs_reduce(double *b, int n) { if (zs_on() && g_split_reduce) g_split_reduce
    halves of a split window run on two threads that hand over inside a conv's statistics reduction). */
 thread_local int g_zr_z0, g_zr_Di, g_zr_first, g_zr_last, g_zr_Do, g_zr_zo;
 extern "C" void nn_set_zrange(int zi0, int Di, int first, int last, int Do, int zo) { g_zr_z0 = zi0; g_zr_Di = Di; g_zr_first = first; g_zr_last = last; g_zr_Do = Do; g_zr_zo = zo; }
+/* direct slab outputs (unet.sdir): the z-range's MX outputs go straight to planes [zo, zo + xs.d) of the depth-Do output tensor (split_t
+   yzo / yD, the epilogue's addressing) instead of a depth-xs.d temp; per host thread, until reset */
+thread_local int g_zr_out;
+extern "C" void nn_set_zrange_out(int on) { g_zr_out = on; }
 /* the statistics planes of a split half: its owned planes; under a z-range those of the depth-Do tensor that fall into the slab */
 split_t zs_split(split_t sp, int D) {
     if (!g_zr_Di || !zs_on()) { zs_range(D, &sp.zlo, &sp.zhi); return sp; }
@@ -79,6 +83,7 @@ int conv_fwd_tc(const void *x, int xbf, shape5 xs, const float *w, const float *
     if (g_zr_Di) {   /* z-range: the MX forward kernels (and the tap-packed stem kernel) */
         if (ts || !ISMX(y) || (!ISMX(x) && xs.c > 8) || sp.y2 || sp.accum || g_pass) { fprintf(stderr, "conv: the z-range needs an MX output and input (forward)\n"); abort(); }
         sp.zi0 = g_zr_z0; sp.Di = g_zr_Di;
+        if (g_zr_out) { sp.yzo = (int16_t)g_zr_zo; sp.yD = (int16_t)g_zr_Do; }
     }
     int zwa = 0, zwb = 0; const int zwon = zw_win(xs.d, &zwa, &zwb); if (zwon) { sp.zw0 = (int16_t)zwa; sp.zw1 = (int16_t)zwb; }
     if (zwon && (ts || !ISMX(y) || sp.up && !ISMX(x) || g_zr_Di)) {   /* z-window: the MX kernels (forward and backward-data) */
