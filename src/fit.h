@@ -249,19 +249,32 @@ typedef struct { fit_fields f; uint8_t *a[17]; float *cy, *cx; long long origin[
 int fit_fields_load(const char *dir, int fz0, int fz1, int pool, fit_fields_buf *b);
 void fit_fields_free(fit_fields_buf *b);
 void fit_fields_ct_planes(int mask);   /* which CT planes later fit_fields_load calls read (bit 0 ct, bit 1 cs; default both) */
-void fit_fields_skip_planes(int mask);   /* optional planes later fit_fields_load calls leave out (bit 0 the recto plane r, bit 1 the winding mod 4 planes dz dy dx dq; default none): RAM and reads for fits whose terms do not read them */
+void fit_fields_skip_planes(int mask);   /* optional planes later fit_fields_load calls leave out (bit 0 the recto plane r, bit 1 the winding mod 4 planes dz dy dx dq, bit 2 the normals, bit 3 sp (unpooled loads); default none): RAM and reads for fits whose terms do not read them */
+int fit_fields_zchunk(const char *dir, long long *zoff);   /* the z rows per chunk of the fields' arrays (zarr; 128 for raw) and the box's z offset in them (*zoff; 0 raw): loads of chunk-aligned rows decode each chunk once */
 /* Streamed fields for a GPU fit (fit_cfg stream): the whole box (unpooled) with the six normal planes read plane by plane (chunk rows)
    straight to the device field array (the fit's 10 B per cell: pc ps t0..t5 sp w), the host buffer b holding the planes the CPU reads
    (pc ps sp w and the optional planes; b->a[2..7] null), and the pooled fields of the gradient stages (pooling factors fps[0..nfp)) made
-   from device row blocks, bit for bit fit_run_dir's own pooling. Host memory ~4 B per cell instead of 10 (+ the pooled ~1.4 B).
+   on the device (nn_fit_pool), bit for bit fit_run_dir's own pooling, kept there. Host memory ~4 B per cell instead of 10.
    Returns 0, or -1 (then nothing is held). */
 typedef struct fit_stream {
     uint8_t *dfield; size_t n;           /* device (or managed) planes, n cells each */
-    int nfp, fp[8]; uint8_t *pool[8][10]; int pD[8], pH[8], pW[8];   /* host pooled planes per pooling factor */
+    int nfp, fp[8]; uint8_t *dpool[8]; int pD[8], pH[8], pW[8];   /* device pooled planes per pooling factor (10 planes back to back) */
+    unsigned long long *dcnt;            /* device: per pooling factor its cells with material (pooled w != 0) */
     int drop_pooled;                     /* 1: fit_run_dir frees the pooled planes at the phase stage (a single fitted direction) */
 } fit_stream;
 int fit_fields_load_stream(const char *dir, fit_fields_buf *b, fit_stream *s, const int *fps, int nfp, void (*gpu_ready)(void));   /* gpu_ready (or null): called after the host planes load, before the first device call */
 void fit_stream_free(fit_stream *s);
+/* fit_pool (gradient stages: no phase gradient, no CT spacing) of the device field planes dfield (10 planes of D x H x W, cell size h) by fp into
+   the 10 device planes out (back to back, pooled box ceil(D / fp) x ceil(H / fp) x ceil(W / fp)), byte-identical to the host pooling, and
+   the count of its cells with material added to the device counter *cnt (src/nn_fit.cu; asynchronous) */
+void nn_fit_pool(const uint8_t *dfield, int D, int H, int W, double h, int fp, uint8_t *out, unsigned long long *cnt);
+/* host -> device uploads on a thread through pinned staging (src/nn_fit.cu): put queues a copy of the pageable range src (job id
+   returned), wait blocks until that job's source has been read (reusable), close until every job is on the device, and frees */
+typedef struct nn_fit_up nn_fit_up;
+nn_fit_up *nn_fit_up_open(void);
+long nn_fit_up_put(nn_fit_up *u, void *dst, const void *src, size_t n);
+void nn_fit_up_wait(nn_fit_up *u, long id);
+void nn_fit_up_close(nn_fit_up *u);
 int fit_stream_verify(const fit_stream *s, const fit_fields *f);   /* the device planes and pooled sets against whole host fields f (fit_fields_load, all planes): mismatches (0: identical) */
 /* the gradient stages' pooling factors of a fit config at field cell h (fit_run_dir's rule); returns their count (at most 8) */
 int fit_stream_fps(const fit_cfg *c, int h, int fps[8]);
