@@ -204,7 +204,8 @@ static int run_case(int dir) {
         CHECK(dmax <= 1e-3 * gmax, "gradient: max |cpu - gpu| %.3g > 1e-3 x %.3g", dmax, gmax);
         /* minibatch steps (stride > 1: the GPU lists the step's voxels, then evaluates the list): the same voxels (hash(i ^ salt) %
            stride == 0, material) and terms x stride as a host loop over fit_vox2 */
-        for (int st = 3; st <= 37; st += 34) {
+        static const int strides[3] = {3, 37, 9973};   /* (9973: fewer multiples of the stride below 2^32 than voxels: the enumerated hashes) */
+        for (int si = 0; si < 3; si++) { const int st = strides[si];
             fit_dev fs = fd, gs = fg; fs.stride = gs.stride = st; fs.salt = gs.salt = 2654435761u * (unsigned)st + 12345u;
             double ps_h[FIT_NPARTS] = {0}, ps_d[FIT_NPARTS] = {0}; float *gr = calloc(nl, 4); size_t nsel = 0;
             for (size_t i = 0; i < n; i++) {
@@ -385,6 +386,10 @@ static void check_recto_fields(void) {
 
 int main(void) {
     nn_init(0);
+    {   /* fit_unhash inverts fit_hash on every 32-bit word (the GPU minibatch selection enumerates the hashes) */
+        unsigned long long nbad = 0; for (unsigned long long x = 0; x < (1ull << 32); x++) nbad += fit_unhash(fit_hash((unsigned)x)) != (unsigned)x;
+        CHECK(nbad == 0, "fit_unhash(fit_hash(x)) != x for %llu words", nbad);
+    }
     if (getenv("FIT_BIAS")) g_bias = atof(getenv("FIT_BIAS"));
     if (getenv("FIT_SIMPLE")) { g_wob = atof(getenv("FIT_SIMPLE")); g_pack = 0; g_dpitch = 0; g_hole = 0; }
     if (!getenv("FIT_CTONLY")) {   /* (FIT_CTONLY: the CT cases alone) */

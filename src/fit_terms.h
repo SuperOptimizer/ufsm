@@ -167,6 +167,9 @@ FIT_HD float fit_U_at(const fit_dev *f, float pz, float py, float px, float *th,
     return r / pit + off + del;
 }
 FIT_HD unsigned fit_hash(unsigned x) { x ^= x >> 16; x *= 0x7feb352dU; x ^= x >> 15; x *= 0x846ca68bU; x ^= x >> 16; return x; }
+/* fit_hash's inverse (each step is a bijection of 32-bit words: the xor-shifts undone, the multipliers' inverses mod 2^32), so
+   fit_unhash(fit_hash(x)) == x for every x (tests/test_fit.c checks all 2^32) */
+FIT_HD unsigned fit_unhash(unsigned x) { x ^= x >> 16; x *= 0x43021123U; x ^= x >> 15 ^ x >> 30; x *= 0x1d69e2a5U; x ^= x >> 16; return x; }
 /* nn_fit_loss2's voxel i (weight wv, data terms x sc): W and grad W analytic at the voxel centre (trilinear delta, the knots' and
    theta's derivatives, the axis slope), the data terms into lp (FIT_P_*; lp[FIT_P_TOTAL] their sum) and dL/d delta at lattice
    corners (indices ic, values gv: the voxel's 8, then with the winding mod 4 term 8 more per axis for its second points); returns
