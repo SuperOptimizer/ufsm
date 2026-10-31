@@ -12,7 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-enum { RB = 32, SEGSLOTS = 64, MAXSTG = 192, MAXSEG = 4096 };
+enum { RB = 32, SEGSLOTS = 64, MAXSTG = 512, MAXSEG = 4096 };   /* staging: two per decoder thread (render runs up to 128 + 128) */
 
 typedef struct { uint8_t *h; cudaStream_t st; cudaEvent_t ev; } rg_stage;
 typedef struct { uint8_t *seg[MAXSEG]; int nseg; uint8_t **freel; size_t nfree, capfree, cap, used; } rg_tier;   /* a slot pool: segments, free slots, bytes */

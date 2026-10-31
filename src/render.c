@@ -393,7 +393,7 @@ static void *wr_decoder_gpu(void *arg) {
     uint8_t *stgs[2] = {rgpu_stage(R->G, 2 * tid), rgpu_stage(R->G, 2 * tid + 1)}; int cur = 0;
     size_t pend_e = SIZE_MAX; uint8_t *pend_d = nullptr;
 #define WR_GFAIL() do { atomic_store(&R->gfail, 1); atomic_store(&R->fail, 1); } while (0)
-    if (!stgs[0] || !stgs[1]) WR_GFAIL();
+    if (!stgs[0] || !stgs[1]) { fprintf(stderr, "render gpu: no staging buffer for decoder %d: CPU render\n", tid); WR_GFAIL(); }
     for (size_t e; !atomic_load(&R->fail) && (e = atomic_fetch_add(&R->dnext, 1)) < R->ndl;) {
         const wdec *D = &R->dl[e]; ctab *T = &R->T[D->v]; const int64_t C = (int64_t)1 << T->sh; const size_t cv = (size_t)C * C * C;
         const int64_t i = D->ci, a = i / (T->cn[1] * T->cn[2]), bb = i / T->cn[2] % T->cn[1], c = i % T->cn[2];
@@ -678,7 +678,7 @@ static int wr_run(z3 *const *vz, int nv, const int *depth, int ns, const float *
                 wr_gpu_drive(R, bmax);
                 for (int t = 0; t < nd; t++) pthread_join(th[t], nullptr);
                 rc = atomic_load(&R->gfail) ? 2 : atomic_load(&R->fail) ? -1 : 0;
-            } else rc = 2;
+            } else { fprintf(stderr, "render gpu: device setup failed: CPU render\n"); rc = 2; }
             free(pxy);
             if (verbose && R->G && rc == 0) {
                 size_t pool, hpool; double kms; uint64_t nl, np, nby; rgpu_stats(R->G, &pool, &hpool, &kms, &nl, &np, &nby);
