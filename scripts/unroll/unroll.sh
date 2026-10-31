@@ -6,7 +6,7 @@
 #   faces/ (FACES=1) | state/<stage>.done (wall s, CPU s, max RSS) | logs/<stage>.log | progress.log
 # Stages and their order (critical path first; -> = waits for):
 #   prep    box (scrolls.tsv or the scanprep mask) + axis (scrolls.tsv file or ufsm axis)
-#   fields  wind96 fit fields: the box split in z at a 1024-voxel boundary, one predict per GPU (same global tile grid), joined by
+#   fields  wind96 fit fields (window 384 x 640^2 / 64; FWIN=auto: predict --window auto, opt-in): the box split in z at a 1024-voxel boundary, one predict per GPU (same global tile grid), joined by
 #           fields_cat.sh (shard files moved: the result is the single-GPU run's); FIELDGPUS="0" = one predict
 #   ink     -> prep only; GPU INKGPU (1) from when the fields are done: INKCMD (the ink agent's recipe; default: the feathered
 #           single pass of inklib.sh: ift3, frozen GN, --window auto --halo 32 --feather 32, resumable) -> ink/$INKNAME.zarr
@@ -129,7 +129,7 @@ occlv() {   # --occupancy L for the fields: the first of levels LV+3, LV+2, LV+4
   done
 }
 fpred() {   # fpred GPU BOX OUT
-  X $O/logs/fields.log $U predict $CK $R $K $3.tmp --um $UM --level $LV --box $2 --window ${FWIN:-auto} --halo 64 --shard 512 \
+  X $O/logs/fields.log $U predict $CK $R $K $3.tmp --um $UM --level $LV --box $2 $([ "${FWIN:-prod}" = auto ] && echo "--window auto" || echo "--window-z 384 --halo-z 64 --window 640") --halo 64 --shard 512 \
     --grid-origin 0,0,0 --ema 1 --q 8 --threads ${PTH:-14} --gpu $1 --axis $O/axis.json --levels 1 --fit-zarr $3 --fit-h 2 --fit-q 8 --fit-q-phase 4 --no-out 1 $(occlv) &&
     { [ "$DRY" = 1 ] || { rm -rf $3.tmp; [ -e $3/fields.json ]; }; }
 }
