@@ -971,9 +971,10 @@ static void build_acts(unet *u, shape5 xs, int train) {
     const int slab1 = slab && L > 2 && slab_w_ok(w[1]) && u->cfg.enc_blocks[1] == 0 && (!getenv("UFSM_INFER_SLAB_L1") || ufsm_env_on("UFSM_INFER_SLAB_L1"));
     float *X = nullptr, *Y = nullptr, *X2 = nullptr, *Y2 = nullptr;
     int sdir = slab && slab_direct();
-    if (sdir && !g_dry) {   /* room for X, X2 (and Y, Y2) plus about one more level-0 tensor for the rest; else the in-place slabs with copies */
+    if (sdir && !g_dry) {   /* room for X, X2 (and Y, Y2) plus ~two more level-0 tensors for the rest (wind96 384 x 640^2: ~11.4 GB in all, this asks
+                               13.5 GB free: MIG slices / shared cards fall back), else the in-place slabs with copies */
         shape5 a = u->ls[0], c = u->ls[1]; a.c = w[0]; c.c = L > 1 ? w[1] : 0;
-        const size_t need = 3 * act_bytes_of(a) + (slab1 ? 2 * act_bytes_of(c) : 0) + ((size_t)1 << 30), fr = nn_mem_free();
+        const size_t need = 4 * act_bytes_of(a) + (slab1 ? 2 * act_bytes_of(c) : 0) + ((size_t)3 << 29), fr = nn_mem_free();
         if (fr < need) { sdir = 0; fprintf(stderr, "unet: %.1f GB free of the %.1f GB direct slabs want: in-place slabs with plane copies\n", fr / 1e9, need / 1e9); }
     }
     u->sdir = sdir;
