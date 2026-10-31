@@ -12,3 +12,5 @@ void zcache_close(zcache *c);
    fill value (as z3_read). Arrays with esize != 1 are read directly (no caching). 0 ok, -1 on a decode / I/O failure. */
 int zcache_read(zcache *c, z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out);
 void zcache_stats(const zcache *c, uint64_t *hits, uint64_t *misses, size_t *bytes);
+/* zcache_read with nthreads workers over the box's chunks (same bytes) */
+int zcache_read_mt(zcache *c, z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads);

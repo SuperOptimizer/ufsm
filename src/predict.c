@@ -10,6 +10,7 @@
 #include "pyramid.h"
 #include "sources.h"
 #include "split.h"
+#include "zcache.h"
 #include "store.h"
 #include "unet.h"
 #include "fit.h"
@@ -46,6 +47,7 @@ typedef struct {
     pthread_mutex_t mu; pthread_cond_t cv;
     double t_read, t_stats, t_wait;   /* UFSM_PRED_PROF: seconds in z3_read, the stats scan, waiting for a free slot */
     int nostats;                      /* the window statistics are computed on the device (default path) */
+    zcache *zc;                       /* UFSM_PRED_ZCACHE_MB > 0: decoded CT chunks kept across windows (overlapping windows decode each once) */
 } reader_t;
 static void *reader_main(void *arg) {
     reader_t *r = arg;
@@ -59,7 +61,7 @@ static void *reader_main(void *arg) {
         int k = (int)(i % NSLOT);
         tile_t *t = &r->tiles[i];
         int64_t o[3] = {r->bo[0] + t->tz, r->bo[1] + t->ty, r->bo[2] + t->tx}, n[3] = {r->Wz, r->W, r->W};
-        if (z3_read(r->ct, o, n, r->buf[k], r->nthreads)) { atomic_store(&r->failed, 1); }
+        if (r->zc ? zcache_read_mt(r->zc, r->ct, o, n, r->buf[k], r->nthreads) : z3_read(r->ct, o, n, r->buf[k], r->nthreads)) { atomic_store(&r->failed, 1); }
         else if (r->nostats) r->t_read += now() - t1;
         else {
             double t2 = now(); r->t_read += t2 - t1;
@@ -1141,6 +1143,10 @@ int cmd_predict(int argc, char **argv) {
     rd.nostats = gpath;
     atomic_store(&rd.filled, 0); atomic_store(&rd.consumed, 0); atomic_store(&rd.failed, 0);
     pthread_mutex_init(&rd.mu, nullptr); pthread_cond_init(&rd.cv, nullptr);
+    {   /* the window reader's chunk cache (same bytes as the plain read): UFSM_PRED_ZCACHE_MB budget, 0 off */
+        const char *zm = getenv("UFSM_PRED_ZCACHE_MB"); const long mb = zm ? atol(zm) : 0;
+        if (mb > 0 && !(rd.zc = zcache_open((size_t)mb << 20))) { fprintf(stderr, "predict: no memory for the chunk cache\n"); return 1; }
+    }
     pthread_t rth; pthread_create(&rth, nullptr, reader_main, &rd);
     int64_t cur_shard = -1, so[3] = {0, 0, 0}, se[3] = {0, 0, 0}, sz = 0, sy = 0, sx = 0;
     int any = 0;
@@ -1471,6 +1477,7 @@ int cmd_predict(int argc, char **argv) {
     if (gpath) { for (int k = 0; k < WR.nb; k++) nn_host_free(WR.buf[k]); nn_free(dsh); } else for (int k = 0; k < WR.nb; k++) free(WR.buf[k]);
     nn_free(stsc); nn_free(x2); nn_free(lgf); nn_free(lrt);
     pthread_join(rth, nullptr);
+    if (rd.zc) { if (pprof) { uint64_t h, m; zcache_stats(rd.zc, &h, &m, nullptr); fprintf(stderr, "predict profile: chunk cache %llu hits, %llu decodes\n", (unsigned long long)h, (unsigned long long)m); } zcache_close(rd.zc); }
     for (int k = 0; k < NSLOT; k++) { if (gpath) nn_host_free(rd.buf[k]); else free(rd.buf[k]); }
     free(rd.tiles);
     fprintf(stderr, "\rshard %lld/%lld  %ld tiles (%ld air)  %.0fs   \n", (long long)(ns[0] * ns[1] * ns[2]), (long long)(ns[0] * ns[1] * ns[2]), ntiles, nskip, now() - t0);
