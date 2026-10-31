@@ -20,6 +20,8 @@
 #include <stdint.h>
 #include <unistd.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <dirent.h>
 #include <sys/file.h>
 #include <fcntl.h>
 #include <stdatomic.h>
@@ -2491,10 +2493,15 @@ int fit_fields_load_stream(const char *dir, fit_fields_buf *b, fit_stream *s, co
         }
     }
     const int force_managed = ufsm_env_on("UFSM_FIT_MANAGED");
-    s->dfield = force_managed ? nullptr : nn_malloc_try(10 * n);
+    /* on the device only with room beside them for the pooled stages, g_fit_dev_reserve (the ref models, the phase gate's blocks) and
+       512 MB of fit buffers: fields that fit alone left the pooled planes' allocations to fail (null -> illegal access, desk 0490B 96x3916x4096) */
+    size_t pooled = 0; for (int q = 0; q < nfp; q++) { const size_t f = (size_t)fps[q]; pooled += 10 * ((D + f - 1) / f) * ((H + f - 1) / f) * ((W + f - 1) / f); }
+    const size_t need = 10 * n + pooled + g_fit_dev_reserve + ((size_t)512 << 20), fr = force_managed ? 0 : nn_mem_free();
+    s->dfield = force_managed || fr < need ? nullptr : nn_malloc_try(10 * n);
     if (!s->dfield) {
         s->dfield = nn_managed_alloc(10 * n);
         if (s->dfield) fprintf(stderr, "fit: fields in managed memory (%.1f GB, %s)\n", 10.0 * n / 1e9, force_managed ? "UFSM_FIT_MANAGED" : "over the free device memory");
+        if (s->dfield && !force_managed) fprintf(stderr, "fit: (device %.2f GB free < fields %.2f + pooled %.2f + reserve %.2f + 0.5 GB)\n", fr / 1e9, 10.0 * n / 1e9, pooled / 1e9, g_fit_dev_reserve / 1e9);
     }
     if (!s->dfield) { fprintf(stderr, "fit: no device memory for the fields (%.1f GB: 10 B per cell of %dx%dx%d)\n", 10.0 * n / 1e9, D, H, W); fit_fields_free(b); return -1; }
     /* the host planes, then the normals (per plane, blocks ending on the zarr's chunk rows, two block buffers in turn) to the device on
@@ -2528,10 +2535,11 @@ int fit_fields_load_stream(const char *dir, fit_fields_buf *b, fit_stream *s, co
     if (tms) fprintf(stderr, "fit times: normals decode %.2fs, upload waits %.2fs\n", td, tu);
     t0 = nn_wall_seconds();
     /* the gradient stages' pooled fields, pooled on the device (nn_fit_pool: fit_pool's sums and roundings; the normals stay there) */
-    if (nfp && !rc) { s->dcnt = nn_malloc(8 * sizeof *s->dcnt); nn_zero(s->dcnt, 8 * sizeof *s->dcnt); }
+    if (nfp && !rc) { if (!(s->dcnt = nn_malloc_try(8 * sizeof *s->dcnt))) rc = -1; else nn_zero(s->dcnt, 8 * sizeof *s->dcnt); }
     for (int q = 0; q < nfp && !rc; q++) {
         const int fp = fps[q]; s->fp[q] = fp; s->pD[q] = (D + fp - 1) / fp; s->pH[q] = (H + fp - 1) / fp; s->pW[q] = (W + fp - 1) / fp;
-        s->dpool[q] = nn_malloc(10 * (size_t)s->pD[q] * s->pH[q] * s->pW[q]);
+        const size_t pb = 10 * (size_t)s->pD[q] * s->pH[q] * s->pW[q];
+        if (!(s->dpool[q] = nn_malloc_try(pb))) { fprintf(stderr, "fit: no device memory for the fields pooled by %d (%.2f GB; UFSM_FIT_MANAGED=1: the fields in managed memory)\n", fp, pb / 1e9); rc = -1; break; }
         nn_fit_pool(s->dfield, D, H, W, (double)b->h, fp, s->dpool[q], s->dcnt + q);
     }
     s->nfp = rc ? 0 : nfp;
@@ -2981,4 +2989,18 @@ uint8_t *fit_field_array(const char *dir, const char *name, int pool, int shape[
     free(blk); if (za) z3_close(za); if (fr) fclose(fr); if (cside) cl_free(&core);
     if (out) { shape[0] = Dp; shape[1] = Hp; shape[2] = Wp; }
     return out;
+}
+
+/* device bytes a fit set will take (fit_set_upload: its delta lattices; the axis / knot arrays are small): the delta.f32 sizes in DIR
+   and its subdirectories (a set: global/, slabNNN/) */
+size_t g_fit_dev_reserve;
+size_t fit_set_disk_bytes(const char *dir) {
+    size_t b = 0; struct stat st; char p[1400];
+    snprintf(p, sizeof p, "%s/delta.f32", dir); if (!stat(p, &st)) b += (size_t)st.st_size;
+    DIR *d = opendir(dir); if (!d) return b;
+    for (struct dirent *e; (e = readdir(d));) {
+        if (e->d_name[0] == '.') continue;
+        snprintf(p, sizeof p, "%s/%s/delta.f32", dir, e->d_name); if (!stat(p, &st)) b += (size_t)st.st_size;
+    }
+    closedir(d); return b;
 }

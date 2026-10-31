@@ -262,6 +262,8 @@ typedef struct fit_stream {
     unsigned long long *dcnt;            /* device: per pooling factor its cells with material (pooled w != 0) */
     int drop_pooled;                     /* 1: fit_run_dir frees the pooled planes at the phase stage (a single fitted direction) */
 } fit_stream;
+extern size_t g_fit_dev_reserve;   /* fit_fields_load_stream: device bytes to leave beside the fields and pooled stages (set by fit: the ref models + the phase gate) */
+size_t fit_set_disk_bytes(const char *dir);   /* a fit set's delta.f32 bytes on disk (its device size) */
 int fit_fields_load_stream(const char *dir, fit_fields_buf *b, fit_stream *s, const int *fps, int nfp, void (*gpu_ready)(void));   /* gpu_ready (or null): called after the host planes load, before the first device call */
 void fit_stream_free(fit_stream *s);
 /* fit_pool (gradient stages: no phase gradient, no CT spacing) of the device field planes dfield (10 planes of D x H x W, cell size h) by fp into
