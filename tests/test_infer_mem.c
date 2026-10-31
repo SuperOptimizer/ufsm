@@ -284,7 +284,7 @@ int main(void) {
     {
         static const unet_cfg cfgs[2] = {{7, {16, 16, 32, 64, 128, 192, 256}, 4, 2, 8, 0, 0}, {6, {32, 64, 96, 128, 160, 192}, 4, 11, 8, 1, 0}};
         if (unet_set_input_prec(8)) return 2;
-        nn_init(0); (void)nn_check();   /* (split_run_ct's probe of a second GPU leaves an invalid-device error on a one-GPU host) */
+        nn_init(0); for (int k = 0; k < 4 && nn_check(); k++) {}   /* (split_run_ct's probe of a second GPU leaves an invalid-device error on a one-GPU host: g_err, then CUDA's last error) */
         for (int ci = 0; ci < 2; ci++) for (int P = 128; P <= 256; P += 128) for (int frz = 0; frz < 2; frz++) {
             const unet_cfg *cfg = &cfgs[ci]; const int nc = ci ? 0 : 1, co = nc ? nc : cfg->cout;
             const size_t p3 = (size_t)P * P * P, ob = (size_t)co * p3 * 2;
