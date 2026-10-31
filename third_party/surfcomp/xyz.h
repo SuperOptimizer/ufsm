@@ -169,6 +169,18 @@ static int xyz_child_guard(const uint8_t *b, size_t n, const se_model *models,
            2 * float_ulp((float)fmin(l1, FLT_MAX)) + 2 * ulp + 2e-34;
   return 0;
 }
+/* xyz_child_guard of a child decode_block_l1 has decoded (l1: its coefficients' sum; out: its samples) */
+static void xyz_child_guard_l1(const uint8_t *b, double l1, const float out[4096],
+                               double *guard) {
+  *guard = 0;
+  if (b[5] != 1 && b[5] != 3)
+    return;
+  double ulp = 0;
+  for (unsigned i = 0; i < 4096; i++)
+    ulp = fmax(ulp, float_ulp(out[i]));
+  *guard = (u32(b + 20) ? 8e-7 : 2e-13) * l1 +
+           2 * float_ulp((float)fmin(l1, FLT_MAX)) + 2 * ulp + 2e-34;
+}
 typedef struct {
   float decoded[3][4096], original[4096][3];
   uint8_t valid[4096], other[4096];
@@ -300,21 +312,27 @@ static int xyz_encode(const void *src, size_t ps, size_t rs,
   double best_square = DBL_MAX;
   for (unsigned mode = 0; mode < 2; mode++) {
     int usable = 1;
-    for (unsigned i = 0; i < 4096; i++)
+    /* ufsm: the three predictions and differences of a sample once (the same expressions, the same sum order per channel) and the
+     * clamp to +-FLT_MAX without libm calls (NaN -> FLT_MAX as fmin / fmax gave): the same planes */
+    for (unsigned i = 0; i < 4096; i++) {
+      double dd[3] = {0, 0, 0};
+      if (mode)
+        for (unsigned a = 0; a < 3; a++)
+          dd[a] = (double)w->original[i][a] - xyz_predict(predictor, a, i);
       for (unsigned k = 0; k < 3; k++) {
         double v = w->original[i][k];
         if (mode) {
           v = 0;
           for (unsigned a = 0; a < 3; a++)
-            v += (double)rotation[a * 3 + k] *
-                 ((double)w->original[i][a] - xyz_predict(predictor, a, i));
+            v += (double)rotation[a * 3 + k] * dd[a];
         }
         if (!w->valid[i])
           v = 0;
         if (!finite_number(v) || fabs(v) > 1e30)
           usable = 0;
-        w->plane[k][i] = (float)fmax(-FLT_MAX, fmin(FLT_MAX, v));
+        w->plane[k][i] = (float)(v != v ? FLT_MAX : v > FLT_MAX ? FLT_MAX : v < -FLT_MAX ? -FLT_MAX : v);
       }
+    }
     if (mode && !usable)
       continue;
     sfc_candidates *choices[3];
@@ -368,10 +386,11 @@ static int xyz_encode(const void *src, size_t ps, size_t rs,
     for (unsigned k = 0; k < 3; k++) {
       uint8_t *child = ent->best[k];
       size_t len = ent->sizes[k];
-      if (decode_block(child, len, SFC_F32, w->decoded[k], 4, 256, NULL,
-                       models) ||
-          xyz_child_guard(child, len, models, w->decoded[k], guards + k))
+      double l1 = 0;   /* ufsm: the guard from decode_block's coefficient sum (xyz_child_guard decoded them a second time) */
+      if (decode_block_l1(child, len, SFC_F32, w->decoded[k], 4, 256, NULL,
+                          models, &l1))
         return SFC_INVALID;
+      xyz_child_guard_l1(child, l1, w->decoded[k], guards + k);
       p32(b + 112 + 4 * k, (uint32_t)len);
       memcpy(b + at, child, len);
       at += len;

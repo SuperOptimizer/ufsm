@@ -6,6 +6,9 @@
    given. Runs the ufsm binary next to this test. */
 #include "fit.h"
 #include "tiff.h"
+#include "store.h"
+#include "z3w.h"
+#include "zarr3.h"
 #include <libgen.h>
 #include <math.h>
 #include <stdio.h>
@@ -48,6 +51,52 @@ static int wrap_stat(const char *dir, int k, const fit_set *fs, wstat *s) {
     return 0;
 }
 static int run(const char *cmd) { fprintf(stderr, "+ %s\n", cmd); return system(cmd); }
+/* fit_field_array (ufsm wraps --fields: the data weight max-pooled) reads a sharded zarr chunk by chunk on threads (absent chunks
+   skipped); UFSM_FFA_BLOCKS=1 forces the older path (64-row blocks of whole planes, fill + copy, then pooled). Both must give the
+   pooled maxima of the decoded array, at a pool that divides the chunks and one that does not (the block path only). */
+static int field_array_case(const char *base) {
+    enum { FD = 300, FH = 270, FW = 200 };
+    char fd[700], p[800]; snprintf(fd, sizeof fd, "%s/fields", base); snprintf(p, sizeof p, "mkdir -p '%s'", fd); if (system(p)) return 1;
+    snprintf(p, sizeof p, "%s/fields.json", fd); FILE *f = fopen(p, "w"); if (!f) return 1;
+    fprintf(f, "{\"format\": \"zarr\", \"origin\": [0, 0, 0], \"shape\": [%d, %d, %d], \"h\": 2, \"um\": 9.6, \"axis\": [[135, 100]]}\n", FD, FH, FW); fclose(f);
+    snprintf(p, sizeof p, "%s/w", fd); const int64_t shp[3] = {FD, FH, FW};
+    z3w *w = z3w_create(p, shp, 128, 8, 0, nullptr); if (!w) { fprintf(stderr, "z3w: %s\n", z3w_error()); return 1; }
+    uint8_t *sh = malloc((size_t)128 * 128 * 128); int nsh = 0;
+    for (int sz = 0; sz < 3; sz++) for (int sy = 0; sy < 3; sy++) for (int sx = 0; sx < 2; sx++) {
+        if ((sz * 7 + sy * 3 + sx) % 4 == 1) continue;   /* absent shards */
+        for (int z = 0; z < 128; z++) for (int y = 0; y < 128; y++) for (int x = 0; x < 128; x++) {
+            const int gz = sz * 128 + z, gy = sy * 128 + y, gx = sx * 128 + x; const unsigned hsh = (unsigned)(gz * 73856093u ^ gy * 19349663u ^ gx * 83492791u);
+            const double r = hypot(gy - 135.0, gx - 100.0), s = sin(r * 0.4 + gz * 0.05);   /* sheets with zero gaps, plus sparse speckle */
+            sh[((size_t)z * 128 + y) * 128 + x] = (uint8_t)(s > 0.3 ? 40 + 200 * (s - 0.3) : (hsh % 97 == 0 ? hsh % 251 : 0));
+        }
+        if (z3w_write_shard(w, sz, sy, sx, sh, 4)) { fprintf(stderr, "z3w: %s\n", z3w_error()); return 1; }
+        nsh++;
+    }
+    free(sh); if (z3w_close(w)) return 1;
+    /* the reference: the whole decoded array, pooled here */
+    z3 *za = z3_open(store_open(fd), "w", nullptr); if (!za) { fprintf(stderr, "z3_open: %s\n", z3_error()); return 1; }
+    uint8_t *all = malloc((size_t)FD * FH * FW); const int64_t o0[3] = {0, 0, 0}; if (z3_read(za, o0, shp, all, 4)) return 1; z3_close(za);
+    const int pools[3] = {4, 8, 3};
+    for (int q = 0; q < 3; q++) {
+        const int P = pools[q], Dp = (FD + P - 1) / P, Hp = (FH + P - 1) / P, Wp = (FW + P - 1) / P;
+        uint8_t *ref = calloc((size_t)Dp * Hp * Wp, 1); size_t nz = 0;
+        for (int z = 0; z < FD; z++) for (int y = 0; y < FH; y++) for (int x = 0; x < FW; x++) { uint8_t *d = &ref[((size_t)(z / P) * Hp + y / P) * Wp + x / P]; const uint8_t v = all[((size_t)z * FH + y) * FW + x]; if (v > *d) *d = v; }
+        for (size_t i = 0; i < (size_t)Dp * Hp * Wp; i++) nz += ref[i] != 0;
+        int s1[3], s2[3];
+        unsetenv("UFSM_FFA_BLOCKS"); uint8_t *a = fit_field_array(fd, "w", P, s1);
+        setenv("UFSM_FFA_BLOCKS", "1", 1); uint8_t *b = fit_field_array(fd, "w", P, s2); unsetenv("UFSM_FFA_BLOCKS");
+        CHECK(a && b, "fit_field_array pool %d", P);
+        if (a && b) {
+            CHECK(s1[0] == Dp && s1[1] == Hp && s1[2] == Wp && !memcmp(s1, s2, sizeof s1), "pool %d shapes", P);
+            CHECK(!memcmp(a, ref, (size_t)Dp * Hp * Wp), "pool %d: the chunk path differs from the pooled array", P);
+            CHECK(!memcmp(b, ref, (size_t)Dp * Hp * Wp), "pool %d: the block path differs from the pooled array", P);
+        }
+        printf("field array pool %d: %dx%dx%d, %zu non-zero cells, %d of 18 shards stored: chunk path = block path = reference\n", P, Dp, Hp, Wp, nz, nsh);
+        free(a); free(b); free(ref);
+    }
+    free(all);
+    return 0;
+}
 
 int main(int argc, char **argv) {
     (void)argc;
@@ -89,6 +138,7 @@ int main(int argc, char **argv) {
     CHECK(c.h == 17, "--zr rows %d (17)", c.h);
     CHECK(c.zmin >= ORG[0] + 16 - 1e-3 && c.zmax <= ORG[0] + 48 + 1e-3, "--zr z %.1f..%.1f outside [16, 48]", c.zmin - ORG[0], c.zmax - ORG[0]);
     CHECK(c.w == b.w || abs(c.w - b.w) < b.w / 3, "--zr columns %d vs %d", c.w, b.w);
+    CHECK(!field_array_case(base), "the field array case");
     fit_set_free(fs); free(m.delta); free(cy); free(cx);
     snprintf(cmd, sizeof cmd, "rm -rf '%s'", base); if (system(cmd)) {}
     if (fails) { fprintf(stderr, "test_wraps_core: %d failures\n", fails); return 1; }

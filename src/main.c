@@ -1708,13 +1708,13 @@ static void *wraps_rows(void *arg) {
     wraps_job *J = arg; const fit_model *m = J->m;
     for (int r; (r = atomic_fetch_add(&J->next, 1)) < J->rows;) {
         const double z = fmin(J->zlo + r * J->step, J->Z), cy = m->cy[(int)fmin(z, J->na - 1)], cx = m->cx[(int)fmin(z, J->na - 1)];
-        double rprev = J->rk; size_t valid = 0;
+        double rprev = J->rk; size_t valid = 0; fit_set_row *row = fit_set_row_new(J->fs, z);
         for (int c = 0; c < J->cols; c++) {
             const size_t i = (size_t)r * J->cols + (J->cols - 1 - c);   /* column 0 = the largest theta side (upstream: outermost first) */
             const double th = J->th0 + c * J->dth; double rr;
             J->px[i] = J->py[i] = J->pz[i] = -1;
             double ua, ub; wr_polar_bounds(J->P, r, th, &ua, &ub);
-            if (fit_set_ray_root_b(J->fs, z, th, J->k, rprev, ua, ub, &rr)) continue;
+            if (row ? fit_set_row_root_b(row, th, J->k, rprev, ua, ub, &rr) : fit_set_ray_root_b(J->fs, z, th, J->k, rprev, ua, ub, &rr)) continue;
             const double y = cy + rr * sin(th), x = cx + rr * cos(th);
             if (J->wf) {
                 const int fz = (int)fmin(z / J->wh, J->wsh[0] - 1), fy = (int)fmin(y / J->wh, J->wsh[1] - 1), fx = (int)fmin(x / J->wh, J->wsh[2] - 1);
@@ -1722,6 +1722,7 @@ static void *wraps_rows(void *arg) {
             }
             J->px[i] = (float)(x + m->origin[2]); J->py[i] = (float)(y + m->origin[1]); J->pz[i] = (float)(z + m->origin[0]); valid++; rprev = rr;
         }
+        fit_set_row_free(row);
         atomic_fetch_add(&J->valid, valid);
     }
     return nullptr;
