@@ -284,12 +284,13 @@ uint8_t *rgpu_stage(rgpu *G, int k) __attribute__((weak));
 uint8_t *rgpu_slot(rgpu *G, int *host) __attribute__((weak));
 void rgpu_release(rgpu *G, uint8_t *d) __attribute__((weak));
 int rgpu_zero(rgpu *G, int k, uint8_t *d) __attribute__((weak));
-int rgpu_upload(rgpu *G, int k, uint8_t *d, uint32_t mask, int wait) __attribute__((weak));
+int rgpu_upload(rgpu *G, int k, uint8_t *d, uint32_t mask, int box, int wait) __attribute__((weak));
 int rgpu_stage_sync(rgpu *G, int k) __attribute__((weak));
 int rgpu_setup(rgpu *G, int nv, const size_t nc[2], int ns, const float *const *X, const float *const *Y, const float *const *Z, int w, int h,
                const uint8_t *const *vgrid, const int32_t *pxy, size_t nb, size_t bmax, int nimg) __attribute__((weak));
-int rgpu_ptrs(rgpu *G, const uint64_t *keys, uint8_t *const *ptrs, size_t n) __attribute__((weak));
-int rgpu_render(rgpu *G, size_t kb, size_t ke, const rc_vol *V, const int *depth, const rc_fill *F, double gs, int ow, int oh, const uint8_t **hout) __attribute__((weak));
+int rgpu_ptrs(rgpu *G, int b, const uint64_t *keys, uint8_t *const *ptrs, size_t n) __attribute__((weak));
+int rgpu_launch(rgpu *G, int b, size_t kb, size_t ke, const rc_vol *V, const int *depth, const rc_fill *F, double gs, int ow, int oh) __attribute__((weak));
+int rgpu_wait(rgpu *G, int b, const uint8_t **hout) __attribute__((weak));
 void rgpu_stats(const rgpu *G, size_t *pool, size_t *hpool, double *kms, uint64_t *nlaunch, uint64_t *nput, uint64_t *bytes) __attribute__((weak));
 static int g_render_gpu = 0; static _Atomic int g_render_gpu_done, g_render_gpu_cpu;
 int render_gpu_count(void) { return atomic_load(&g_render_gpu_done); }       /* renders the GPU path completed (tests) */
@@ -437,7 +438,7 @@ static void *wr_decoder_gpu(void *arg) {
         const int dev = !edge && T->sh == 7 && gpudec_enabled();
         /* the substreams outside want are never read (want covers every block's voxel box, depth + fill reach + 2 included) and keep whatever the
            slot held; UFSM_RENDER_GPU_POISON=1 (tests) fills them with 0xa5 first, so a sample outside want would show */
-        if (dev && want && R->poison && rgpu_zero(R->G, 2 * tid + cur, d)) { WR_GFAIL(); rgpu_release(R->G, d); break; }
+        if (want && R->poison && rgpu_zero(R->G, 2 * tid + cur, d)) { WR_GFAIL(); rgpu_release(R->G, d); break; }
         const int rc = dev ? z3_read_sub_dev(T->z, o, n, stg, 1, want, d, &dm) : z3_read_sub(T->z, o, n, stg, 1, want);
         { const double t1 = rnow(); atomic_fetch_add(&R->pt[1], (uint64_t)((t1 - tp) * 1e6)); tp = t1; }
         if (rc) { fprintf(stderr, "render: chunk read failed: %s\n", z3_error()); atomic_store(&R->fail, 1); rgpu_release(R->G, d); break; }
@@ -445,8 +446,8 @@ static void *wr_decoder_gpu(void *arg) {
         if (!dm) { size_t q = 0; const uint64_t *w = (const uint64_t *)stg; while (q < cv / 8 && !w[q]) q++; zero = q == cv / 8; }
         if (zero) { rgpu_release(R->G, d); d = nullptr; }
         else {   /* host-decoded: the whole buffer (zeros where nothing was asked, one copy); device-decoded: the substreams the host did */
-            const uint32_t rem = dm ? (want ? want : 0xffffffffu) & ~dm : 0;
-            if ((!dm || rem) && rgpu_upload(R->G, 2 * tid + cur, d, rem, 0)) { WR_GFAIL(); rgpu_release(R->G, d); break; }
+            const uint32_t rem = dm ? (want ? want : 0xffffffffu) & ~dm : want;
+            if ((!dm || rem) && rgpu_upload(R->G, 2 * tid + cur, d, rem, !dm && T->sh == 7, 0)) { WR_GFAIL(); rgpu_release(R->G, d); break; }
         }
         atomic_fetch_add(&R->pt[2], (uint64_t)((rnow() - tp) * 1e6));
         /* publish the previous chunk (its upload had a whole decode to finish), keep this one pending */
@@ -458,55 +459,70 @@ static void *wr_decoder_gpu(void *arg) {
     pthread_mutex_lock(&R->mu); pthread_cond_broadcast(&R->cv); pthread_mutex_unlock(&R->mu);
     return nullptr;
 }
-/* the GPU renderer (this thread): runs of blocks whose chunks are decoded, at most bmax per launch, rendered by the kernel, their outputs
-   scattered into the images; groups done in order free their last chunks' slots */
+/* the GPU renderer (this thread): runs of blocks whose chunks are decoded, at most bmax per launch, two launches in flight: while the
+   kernel renders one run the previous run's outputs are scattered into the images and the groups it finished free their last chunks */
+enum { WR_MINRUN = 512 };
 static void wr_gpu_drive(wrend *R, size_t bmax) {
     const int nimg = R->nv + (R->F ? 1 : 0); size_t up = 0, ucap = 0; uint64_t *keys = nullptr; uint8_t **ptrs = nullptr;
     rc_vol V[2]; const rc_fill RF = {R->F ? R->F->n : 0, R->F ? R->F->thr : 0, R->F ? R->F->prefer : 0};
-    for (size_t k = 0; k < R->nb && !atomic_load(&R->fail);) {
-        const uint32_t g = R->bgrp[k]; double tp = rnow();
-        pthread_mutex_lock(&R->mu);
-        while (R->ready_prefix < R->need[g] && !atomic_load(&R->fail)) pthread_cond_wait(&R->cv, &R->mu);
-        { const double t1 = rnow(); R->pt[3] += (uint64_t)((t1 - tp) * 1e6); tp = t1; }
-        const size_t rp = R->ready_prefix;
-        size_t nu = rp - up;
-        if (nu > ucap) { ucap = nu + ucap; uint64_t *k2 = realloc(keys, ucap * sizeof *keys); uint8_t **p2 = k2 ? realloc(ptrs, ucap * sizeof *ptrs) : nullptr;
-                         if (k2) keys = k2;
-                         if (p2) ptrs = p2;
-                         if (!k2 || !p2) { pthread_mutex_unlock(&R->mu); atomic_store(&R->fail, 1); break; } }
-        for (size_t e = up; e < rp; e++) { const wdec *D = &R->dl[e]; keys[e - up] = (uint64_t)D->ci | (uint64_t)D->v << 63; ptrs[e - up] = R->dp[D->v][D->ci]; }
-        pthread_mutex_unlock(&R->mu);
-        if (atomic_load(&R->fail)) break;
-        size_t ke = k; while (ke < R->nb && ke - k < bmax && R->need[R->bgrp[ke]] <= rp) ke++;
-        const uint8_t *ho = nullptr;
-        wr_vols(R, V);
-        if (rgpu_ptrs(R->G, keys, ptrs, nu) || rgpu_render(R->G, k, ke, V, R->depth, R->F ? &RF : nullptr, R->gs, R->ow, R->oh, &ho)) {
-            atomic_store(&R->gfail, 1); atomic_store(&R->fail, 1); break; }
-        up = rp;
-        { const double t1 = rnow(); R->pt[4] += (uint64_t)((t1 - tp) * 1e6); tp = t1; }
-        for (size_t q = k; q < ke; q++) {   /* scatter: the block's rows into each image */
-            const rblock *B = &R->b[q]; const int nr = (B->py + RB < R->oh ? B->py + RB : R->oh) - B->py, nc = (B->px + RB < R->ow ? B->px + RB : R->ow) - B->px;
-            for (int si = 0; si < R->ns; si++) for (int m = 0; m < nimg; m++) {
-                const uint8_t *src = ho + (((q - k) * R->ns + si) * nimg + m) * (RB * RB);
-                uint8_t *dst = m < R->nv ? R->img[(size_t)si * R->nv + m] : R->F->flag[si];
-                for (int r = 0; r < nr; r++) memcpy(dst + (size_t)(B->py + r) * R->ow + B->px, src + r * RB, (size_t)nc);
-            }
+    size_t k = 0, pk = 0, pke = 0; int have = 0, cur = 0;
+#define WR_DFAIL() do { atomic_store(&R->gfail, 1); atomic_store(&R->fail, 1); } while (0)
+    wr_vols(R, V);
+    for (;;) {
+        int launched = 0; size_t ke = k; double tp = rnow();
+        if (k < R->nb && !atomic_load(&R->fail)) {
+            const uint32_t g = R->bgrp[k];
+            pthread_mutex_lock(&R->mu);
+            if (!have) while (R->ready_prefix < R->need[g] && !atomic_load(&R->fail)) pthread_cond_wait(&R->cv, &R->mu);   /* nothing in flight: wait */
+            { const double t1 = rnow(); R->pt[3] += (uint64_t)((t1 - tp) * 1e6); tp = t1; }
+            const size_t rp = R->ready_prefix;
+            while (ke < R->nb && ke - k < bmax && R->need[R->bgrp[ke]] <= rp) ke++;
+            /* with a launch in flight, a small run waits for more (fewer, larger launches: CUDA calls serialise with the decoders') */
+            if (ke > k && !(have && ke - k < WR_MINRUN && ke < R->nb) && !atomic_load(&R->fail)) {
+                const size_t nu = rp - up;
+                if (nu > ucap) { ucap = nu + ucap; uint64_t *k2 = realloc(keys, ucap * sizeof *keys); uint8_t **p2 = k2 ? realloc(ptrs, ucap * sizeof *ptrs) : nullptr;
+                                 if (k2) keys = k2;
+                                 if (p2) ptrs = p2;
+                                 if (!k2 || !p2) { pthread_mutex_unlock(&R->mu); atomic_store(&R->fail, 1); break; } }
+                for (size_t e = up; e < rp; e++) { const wdec *D = &R->dl[e]; keys[e - up] = (uint64_t)D->ci | (uint64_t)D->v << 63; ptrs[e - up] = R->dp[D->v][D->ci]; }
+                pthread_mutex_unlock(&R->mu);
+                if (rgpu_ptrs(R->G, cur, keys, ptrs, nu) || rgpu_launch(R->G, cur, k, ke, V, R->depth, R->F ? &RF : nullptr, R->gs, R->ow, R->oh)) { WR_DFAIL(); break; }
+                up = rp; launched = 1;
+                { const double t1 = rnow(); R->pt[6] += (uint64_t)((t1 - tp) * 1e6); tp = t1; }
+            } else { pthread_mutex_unlock(&R->mu); ke = k; }
         }
-        R->pt[5] += (uint64_t)((rnow() - tp) * 1e6);
-        const uint32_t gd = ke < R->nb ? R->bgrp[ke] - 1 : R->ng;   /* every group before the next block's is done */
-        pthread_mutex_lock(&R->mu);
-        while (R->gdone < gd) {
-            const uint32_t q = ++R->gdone;
-            for (size_t f = R->free0[q]; f < R->free0[q + 1]; f++) {
-                const wdec *D = &R->dl[R->frees[f]]; ctab *T = &R->T[D->v];
-                if (R->dp[D->v][D->ci]) { rgpu_release(R->G, R->dp[D->v][D->ci]); R->dp[D->v][D->ci] = nullptr; R->resident -= (size_t)1 << (3 * T->sh); }
-                T->ptr[D->ci] = nullptr;
+        if (have) {   /* the previous launch: wait, scatter, free */
+            const uint8_t *ho = nullptr;
+            if (rgpu_wait(R->G, cur ^ 1, &ho)) { WR_DFAIL(); break; }
+            { const double t1 = rnow(); R->pt[4] += (uint64_t)((t1 - tp) * 1e6); tp = t1; }
+            for (size_t q = pk; q < pke; q++) {   /* the block's rows into each image */
+                const rblock *B = &R->b[q]; const int nr = (B->py + RB < R->oh ? B->py + RB : R->oh) - B->py, nc = (B->px + RB < R->ow ? B->px + RB : R->ow) - B->px;
+                for (int si = 0; si < R->ns; si++) for (int m = 0; m < nimg; m++) {
+                    const uint8_t *src = ho + (((q - pk) * R->ns + si) * nimg + m) * (RB * RB);
+                    uint8_t *dst = m < R->nv ? R->img[(size_t)si * R->nv + m] : R->F->flag[si];
+                    for (int r = 0; r < nr; r++) memcpy(dst + (size_t)(B->py + r) * R->ow + B->px, src + r * RB, (size_t)nc);
+                }
             }
+            R->pt[5] += (uint64_t)((rnow() - tp) * 1e6);
+            const uint32_t gd = pke < R->nb ? R->bgrp[pke] - 1 : R->ng;   /* every group before the next block's is done */
+            pthread_mutex_lock(&R->mu);
+            while (R->gdone < gd) {
+                const uint32_t q = ++R->gdone;
+                for (size_t f = R->free0[q]; f < R->free0[q + 1]; f++) {
+                    const wdec *D = &R->dl[R->frees[f]]; ctab *T = &R->T[D->v];
+                    if (R->dp[D->v][D->ci]) { rgpu_release(R->G, R->dp[D->v][D->ci]); R->dp[D->v][D->ci] = nullptr; R->resident -= (size_t)1 << (3 * T->sh); }
+                    T->ptr[D->ci] = nullptr;
+                }
+            }
+            pthread_cond_broadcast(&R->cv);
+            pthread_mutex_unlock(&R->mu);
+            have = 0;
         }
-        pthread_cond_broadcast(&R->cv);
-        pthread_mutex_unlock(&R->mu);
-        k = ke;
+        if (launched) { have = 1; pk = k; pke = ke; k = ke; cur ^= 1; }
+        else if (k >= R->nb || atomic_load(&R->fail)) break;
     }
+    if (have) { const uint8_t *ho; rgpu_wait(R->G, cur ^ 1, &ho); }   /* (a failure: nothing to scatter, the CPU re-renders) */
+#undef WR_DFAIL
     free(keys); free(ptrs);
     pthread_mutex_lock(&R->mu); pthread_cond_broadcast(&R->cv); pthread_mutex_unlock(&R->mu);
 }
@@ -669,8 +685,8 @@ static int wr_run(z3 *const *vz, int nv, const int *depth, int ns, const float *
                 fprintf(stderr, "render: %zu blocks in %u chunk rows, %zu chunks decoded once (%llu empty), GPU: pool %.2f GB (cap %.2f) + host %.2f GB (%llu chunks), peak %.2f GB, %llu launches %.2f s kernel, %llu uploads %.2f GB, %.1fs\n",
                         nb, ng, R->ndl, (unsigned long long)R->nzero, pool / 1073741824.0, cap / 1073741824.0, hpool / 1073741824.0, (unsigned long long)R->nhost, R->peak / 1073741824.0, (unsigned long long)nl, kms / 1000,
                         (unsigned long long)np, nby / 1073741824.0, rnow() - t0);
-                if (getenv("UFSM_RENDER_PROF")) fprintf(stderr, "render prof (s): decoders %d: budget wait %.1f, read %.1f, upload %.1f; driver: ready wait %.1f, kernel + copies %.1f, scatter %.1f\n", nd,
-                                                        R->pt[0] * 1e-6, R->pt[1] * 1e-6, R->pt[2] * 1e-6, R->pt[3] * 1e-6, R->pt[4] * 1e-6, R->pt[5] * 1e-6);
+                if (getenv("UFSM_RENDER_PROF")) fprintf(stderr, "render prof (s): decoders %d: budget wait %.1f, read %.1f, upload %.1f; driver: ready wait %.1f, pointer table %.1f, kernel %.1f, scatter %.1f\n", nd,
+                                                        R->pt[0] * 1e-6, R->pt[1] * 1e-6, R->pt[2] * 1e-6, R->pt[3] * 1e-6, R->pt[6] * 1e-6, R->pt[4] * 1e-6, R->pt[5] * 1e-6);
             }
             rgpu_close(R->G); R->G = nullptr;
         gout:

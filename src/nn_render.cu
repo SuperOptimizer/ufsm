@@ -20,12 +20,12 @@ struct rgpu {
     int dev, broken; size_t cv;                            /* slot bytes */
     pthread_mutex_t mu; rg_tier tier[2];                   /* device slots, mapped pinned host slots */
     rg_stage stg[MAXSTG]; int nstg;
-    cudaStream_t st; cudaEvent_t e0, e1, e2;   /* blocking-sync events: waiting threads sleep instead of spinning *
+    cudaStream_t st; cudaEvent_t e0[2], e1[2];             /* per launch buffer: timing; e1 blocking-sync (the driver sleeps, it does not spin) */
     /* the render */
     int nv, ns, w, h, nimg; const uint8_t **dptr[2]; size_t nc[2];
     float *X[8], *Y[8], *Z[8]; uint8_t *vg[8]; int32_t *pxy; size_t nb, bmax;
-    uint8_t *dout, *hout; size_t outb;
-    uint64_t *upd_d, *upd_h; size_t ucap;                  /* pointer updates: (v << 63 | ci, ptr) pairs */
+    uint8_t *dout[2], *hout[2]; size_t outb;               /* two launch buffers (mapped pinned) */
+    uint64_t *upd_d[2], *upd_h[2]; size_t ucap[2];         /* pointer updates: (v << 63 | ci, ptr) pairs */
     double kms; uint64_t nlaunch, nput, bytes;
 };
 
@@ -48,7 +48,8 @@ extern "C" rgpu *rgpu_open(int dev, size_t cv, size_t cap, size_t hcap, int nstg
     pthread_mutex_init(&G->mu, nullptr);
     int lo = 0, hi = 0; cudaDeviceGetStreamPriorityRange(&lo, &hi);   /* the render stream ahead of the decoder's batches */
     int ok = cudaSetDevice(dev) == cudaSuccess && cudaStreamCreateWithPriority(&G->st, cudaStreamNonBlocking, hi) == cudaSuccess &&
-             cudaEventCreate(&G->e0) == cudaSuccess && cudaEventCreateWithFlags(&G->e1, cudaEventBlockingSync) == cudaSuccess && cudaEventCreateWithFlags(&G->e2, cudaEventDisableTiming | cudaEventBlockingSync) == cudaSuccess;
+             cudaEventCreate(&G->e0[0]) == cudaSuccess && cudaEventCreate(&G->e0[1]) == cudaSuccess &&
+             cudaEventCreateWithFlags(&G->e1[0], cudaEventBlockingSync) == cudaSuccess && cudaEventCreateWithFlags(&G->e1[1], cudaEventBlockingSync) == cudaSuccess;
     for (int k = 0; k < G->nstg && ok; k++)
         ok = cudaHostAlloc((void **)&G->stg[k].h, cv, cudaHostAllocDefault) == cudaSuccess && cudaStreamCreateWithFlags(&G->stg[k].st, cudaStreamNonBlocking) == cudaSuccess &&
              cudaEventCreateWithFlags(&G->stg[k].ev, cudaEventDisableTiming | cudaEventBlockingSync) == cudaSuccess;
@@ -64,10 +65,8 @@ extern "C" void rgpu_close(rgpu *G) {
     for (int k = 0; k < G->tier[1].nseg; k++) cudaFreeHost(G->tier[1].seg[k]);
     for (int v = 0; v < 2; v++) cudaFree(G->dptr[v]);
     for (int s = 0; s < 8; s++) { cudaFree(G->X[s]); cudaFree(G->Y[s]); cudaFree(G->Z[s]); cudaFree(G->vg[s]); }
-    cudaFree(G->pxy); cudaFree(G->dout); cudaFree(G->upd_d); if (G->hout) cudaFreeHost(G->hout); if (G->upd_h) cudaFreeHost(G->upd_h);
-    if (G->e0) cudaEventDestroy(G->e0);
-    if (G->e1) cudaEventDestroy(G->e1);
-    if (G->e2) cudaEventDestroy(G->e2);
+    cudaFree(G->pxy);
+    for (int b = 0; b < 2; b++) { if (G->e0[b]) cudaEventDestroy(G->e0[b]); if (G->e1[b]) cudaEventDestroy(G->e1[b]); if (G->hout[b]) cudaFreeHost(G->hout[b]); if (G->upd_h[b]) cudaFreeHost(G->upd_h[b]); }
     if (G->st) cudaStreamDestroy(G->st);
     cudaGetLastError();
     free(G->tier[0].freel); free(G->tier[1].freel); pthread_mutex_destroy(&G->mu); free(G);
@@ -122,11 +121,19 @@ extern "C" int rgpu_zero(rgpu *G, int k, uint8_t *d) {
     return rg_err(G, e, "slot memset");
 }
 /* staging buffer k (a host-decoded chunk, 128^3 layout when sub) -> slot d: the substreams in mask (bit s: z 16 (s / 4).., y 32 (s % 4)..)
-   or the whole chunk (mask 0 / all ones); wait 0: asynchronous, rgpu_stage_sync(G, k) before the buffer or the slot is used again */
-extern "C" int rgpu_upload(rgpu *G, int k, uint8_t *d, uint32_t mask, int wait) {
+   or the whole chunk (mask 0 / all ones); box 1: the substreams' z x y bounding box in one copy (the host buffer's other substreams are 0
+   and never read; not when the device holds some); wait 0: asynchronous, rgpu_stage_sync(G, k) before the buffer or the slot is used again */
+extern "C" int rgpu_upload(rgpu *G, int k, uint8_t *d, uint32_t mask, int box, int wait) {
     if (G->broken) return -1;
     cudaError_t e = cudaSetDevice(G->dev); const uint8_t *h = G->stg[k].h; const cudaStream_t st = G->stg[k].st; size_t bytes = 0;
     if (e == cudaSuccess && (!mask || mask == 0xffffffffu)) { e = cudaMemcpyAsync(d, h, G->cv, cudaMemcpyHostToDevice, st); bytes = G->cv; }
+    else if (e == cudaSuccess && box) {
+        int z0 = 8, z1 = -1, y0 = 4, y1 = -1;
+        for (int b = 0; b < 32; b++) if (mask >> b & 1) { const int bz = b / 4, by = b % 4; z0 = bz < z0 ? bz : z0; z1 = bz > z1 ? bz : z1; y0 = by < y0 ? by : y0; y1 = by > y1 ? by : y1; }
+        const size_t o = ((size_t)16 * z0 * 128 + 32 * y0) * 128, wb = (size_t)(y1 - y0 + 1) * 32 * 128, nz = (size_t)(z1 - z0 + 1) * 16;
+        e = wb == (size_t)128 * 128 ? cudaMemcpyAsync(d + o, h + o, wb * nz, cudaMemcpyHostToDevice, st) : cudaMemcpy2DAsync(d + o, (size_t)128 * 128, h + o, (size_t)128 * 128, wb, nz, cudaMemcpyHostToDevice, st);
+        bytes = wb * nz;
+    }
     else for (int b = 0; b < 32 && e == cudaSuccess; b++) if (mask >> b & 1) {
         const size_t o = ((size_t)16 * (b / 4) * 128 + 32 * (b % 4)) * 128;
         e = cudaMemcpy2DAsync(d + o, (size_t)128 * 128, h + o, (size_t)128 * 128, 32 * 128, 16, cudaMemcpyHostToDevice, st); bytes += 16 * 32 * 128;
@@ -156,8 +163,12 @@ extern "C" int rgpu_setup(rgpu *G, int nv, const size_t nc[2], int ns, const flo
     }
     if (e == cudaSuccess && nb) { e = cudaMalloc(&G->pxy, nb * 2 * sizeof(int32_t)); if (e == cudaSuccess) e = cudaMemcpy(G->pxy, pxy, nb * 2 * sizeof(int32_t), cudaMemcpyHostToDevice); }
     G->outb = bmax * ns * nimg * RB * RB;
-    if (e == cudaSuccess) e = cudaMalloc(&G->dout, G->outb);
-    if (e == cudaSuccess) e = cudaHostAlloc((void **)&G->hout, G->outb, cudaHostAllocDefault);
+    /* two launches in flight (the driver scatters one while the next renders); the kernel writes its outputs straight into mapped pinned
+       host memory and reads the pointer updates from there: the driver never queues behind the decoders' uploads on the copy engine */
+    for (int b = 0; b < 2 && e == cudaSuccess; b++) {
+        e = cudaHostAlloc((void **)&G->hout[b], G->outb, cudaHostAllocMapped | cudaHostAllocPortable);
+        if (e == cudaSuccess) e = cudaHostGetDevicePointer((void **)&G->dout[b], G->hout[b], 0);
+    }
     if (e == cudaSuccess) e = cudaStreamSynchronize(G->st);
     return rg_err(G, e, "setup");
 }
@@ -166,21 +177,23 @@ __global__ void k_ptrs(const uint8_t **p0, const uint8_t **p1, const uint64_t *u
     const uint64_t key = u[2 * i]; const uint8_t *p = (const uint8_t *)u[2 * i + 1];
     (key >> 63 ? p1 : p0)[key & ~(1ull << 63)] = p;
 }
-/* chunk ci of volume v is now at device address p (nullptr: zero) */
-extern "C" int rgpu_ptrs(rgpu *G, const uint64_t *keys, uint8_t *const *ptrs, size_t n) {
+/* chunk keys[i] (ci | v << 63) is now at device address ptrs[i] (nullptr: zero), before launch b (buffer b free: its last launch waited) */
+extern "C" int rgpu_ptrs(rgpu *G, int b, const uint64_t *keys, uint8_t *const *ptrs, size_t n) {
     if (G->broken) return -1;
     if (!n) return 0;
     cudaError_t e = cudaSetDevice(G->dev);
-    if (e == cudaSuccess && n > G->ucap) {
-        cudaFree(G->upd_d); if (G->upd_h) cudaFreeHost(G->upd_h); G->upd_d = nullptr; G->upd_h = nullptr; G->ucap = 0;
-        e = cudaMalloc(&G->upd_d, 2 * n * sizeof(uint64_t)); if (e == cudaSuccess) e = cudaHostAlloc((void **)&G->upd_h, 2 * n * sizeof(uint64_t), cudaHostAllocDefault);
-        if (e == cudaSuccess) G->ucap = n;
+    if (e == cudaSuccess && n > G->ucap[b]) {
+        if (G->upd_h[b]) cudaFreeHost(G->upd_h[b]);
+        G->upd_d[b] = nullptr; G->upd_h[b] = nullptr; G->ucap[b] = 0;
+        const size_t nn = n < 4096 ? 4096 : 2 * n;
+        e = cudaHostAlloc((void **)&G->upd_h[b], 2 * nn * sizeof(uint64_t), cudaHostAllocMapped | cudaHostAllocPortable);
+        if (e == cudaSuccess) e = cudaHostGetDevicePointer((void **)&G->upd_d[b], G->upd_h[b], 0);
+        if (e == cudaSuccess) G->ucap[b] = nn;
     }
     if (e != cudaSuccess) return rg_err(G, e, "pointer table");
-    for (size_t i = 0; i < n; i++) { G->upd_h[2 * i] = keys[i]; G->upd_h[2 * i + 1] = (uint64_t)(uintptr_t)ptrs[i]; }
-    e = cudaMemcpyAsync(G->upd_d, G->upd_h, 2 * n * sizeof(uint64_t), cudaMemcpyHostToDevice, G->st);
-    if (e == cudaSuccess) { k_ptrs<<<(unsigned)((n + 255) / 256), 256, 0, G->st>>>(G->dptr[0], G->dptr[1], G->upd_d, n); e = cudaGetLastError(); }
-    return rg_err(G, e, "pointer table");
+    for (size_t i = 0; i < n; i++) { G->upd_h[b][2 * i] = keys[i]; G->upd_h[b][2 * i + 1] = (uint64_t)(uintptr_t)ptrs[i]; }
+    k_ptrs<<<(unsigned)((n + 255) / 256), 256, 0, G->st>>>(G->dptr[0], G->dptr[1], G->upd_d[b], n);
+    return rg_err(G, cudaGetLastError(), "pointer table");
 }
 
 typedef struct { rc_vol V[2]; int depth[2]; rc_fill F; int fill, nv, ns, w, h, ow, oh, nimg; double gs; const float *X[8], *Y[8], *Z[8]; const uint8_t *vg[8]; } rg_par;
@@ -197,11 +210,10 @@ __global__ void __launch_bounds__(256) k_render(rg_par P, const int32_t *pxy, si
         if (P.fill) o[P.nv * RB * RB + r * RB + c] = fl;
     }
 }
-/* blocks [kb, ke) rendered; *hout: the pinned host copy of their outputs (layout of k_render, k relative to kb). Synchronous. */
-extern "C" int rgpu_render(rgpu *G, size_t kb, size_t ke, const rc_vol *V, const int *depth, const rc_fill *F, double gs, int ow, int oh, const uint8_t **hout) {
+/* blocks [kb, ke) rendered into buffer b, asynchronously (rgpu_wait(G, b) for the outputs) */
+extern "C" int rgpu_launch(rgpu *G, int b, size_t kb, size_t ke, const rc_vol *V, const int *depth, const rc_fill *F, double gs, int ow, int oh) {
     if (G->broken) return -1;
-    if (ke <= kb) { *hout = G->hout; return 0; }
-    if (ke - kb > G->bmax) return -1;
+    if (ke <= kb || ke - kb > G->bmax) return -1;
     { const char *fe = getenv("UFSM_RENDER_GPU_FAIL"); if (fe && (uint64_t)atoi(fe) == G->nlaunch + 1) return rg_err(G, cudaErrorUnknown, "injected failure (UFSM_RENDER_GPU_FAIL, tests)"); }
     rg_par P; memset(&P, 0, sizeof P);
     for (int v = 0; v < G->nv; v++) { P.V[v] = V[v]; P.V[v].ptr = G->dptr[v]; P.depth[v] = depth[v]; }
@@ -209,17 +221,18 @@ extern "C" int rgpu_render(rgpu *G, size_t kb, size_t ke, const rc_vol *V, const
     P.nv = G->nv; P.ns = G->ns; P.w = G->w; P.h = G->h; P.ow = ow; P.oh = oh; P.nimg = G->nimg; P.gs = gs;
     for (int s = 0; s < G->ns; s++) { P.X[s] = G->X[s]; P.Y[s] = G->Y[s]; P.Z[s] = G->Z[s]; P.vg[s] = G->vg[s]; }
     cudaError_t e = cudaSetDevice(G->dev);
-    const cudaEvent_t e0 = G->e0, e1 = G->e1;
-    if (e == cudaSuccess) e = cudaEventRecord(e0, G->st);
-    if (e == cudaSuccess) { k_render<<<dim3((unsigned)(ke - kb), (unsigned)G->ns), dim3(32, 8), 0, G->st>>>(P, G->pxy, kb, G->dout); e = cudaGetLastError(); }
-    if (e == cudaSuccess) e = cudaEventRecord(e1, G->st);
-    const size_t nb = (ke - kb) * G->ns * G->nimg * RB * RB;
-    if (e == cudaSuccess) e = cudaMemcpyAsync(G->hout, G->dout, nb, cudaMemcpyDeviceToHost, G->st);
-    if (e == cudaSuccess) e = cudaEventRecord(G->e2, G->st);
-    if (e == cudaSuccess) e = cudaEventSynchronize(G->e2);
-    float ms = 0; if (e == cudaSuccess && cudaEventElapsedTime(&ms, e0, e1) == cudaSuccess) G->kms += ms;
+    if (e == cudaSuccess) e = cudaEventRecord(G->e0[b], G->st);
+    if (e == cudaSuccess) { k_render<<<dim3((unsigned)(ke - kb), (unsigned)G->ns), dim3(32, 8), 0, G->st>>>(P, G->pxy, kb, G->dout[b]); e = cudaGetLastError(); }
+    if (e == cudaSuccess) e = cudaEventRecord(G->e1[b], G->st);
     G->nlaunch++;
-    *hout = G->hout;
+    return rg_err(G, e, "render kernel");
+}
+/* launch b done; *hout: its outputs (layout of k_render, k relative to its kb) */
+extern "C" int rgpu_wait(rgpu *G, int b, const uint8_t **hout) {
+    if (G->broken) return -1;
+    cudaError_t e = cudaEventSynchronize(G->e1[b]);
+    float ms = 0; if (e == cudaSuccess && cudaEventElapsedTime(&ms, G->e0[b], G->e1[b]) == cudaSuccess) G->kms += ms;
+    *hout = G->hout[b];
     return rg_err(G, e, "render kernel");
 }
 /* the last asynchronous upload from staging buffer k is done */
