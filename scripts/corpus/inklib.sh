@@ -28,7 +28,7 @@ ink_compute() {   # ink_compute BOX -> $O/inkbl.zarr (+ blend.done); resumable a
     gpu_run $U predict $INKCK $ctr $ctk $O/gncal.zarr --um $UM --level $LV --box $cal --shard 512 --window 640 --halo 64 --ema 1 --q 32 --threads 12 \
       --gpu $GPU --full-grid 1 --occupancy 5 --levels 1 --no-out 1 --gn-save $O/gn.tmp > $O/logs/ink-gn.log 2>&1 && mv $O/gn.tmp $O/gn.bin || return 1
   fi
-  gpu_run $U predict $INKCK $ctr $ctk $O/inkbl.zarr --um $UM --level $LV --box $box --shard 512 --window ${INKW:-576} --halo ${INKH:-32} --feather ${INKF:-32} \
+  gpu_run $U predict $INKCK $ctr $ctk $O/inkbl.zarr --um $UM --level $LV --box $box --shard 512 --window ${INKW:-auto} --halo ${INKH:-32} --feather ${INKF:-32} \
     --ema 1 --q 32 --threads 12 --gpu $GPU --full-grid 1 --resume 1 --occupancy 5 --levels 4 --gn-frozen $O/gn.bin >> $O/logs/ink.log 2>&1 || return 1
   rm -rf $O/gncal.zarr
   touch $O/blend.done

@@ -625,7 +625,7 @@ void unet_set_slab_ovl(int on) { g_slab_ovl = on; }
    temps; the coarse offload (unet.p3) is off with it. Desk 5060 Ti: wind96 window -14%, ift3 ink -18% (10-31). UFSM_SLAB_DIRECT=0 off */
 static int g_slab_dir = -1;
 static int slab_direct(void) { if (g_slab_dir < 0) g_slab_dir = getenv("UFSM_SLAB_DIRECT") ? ufsm_env_on("UFSM_SLAB_DIRECT") : 1; return g_slab_dir; }
-void unet_set_slab_direct(int on) { g_slab_dir = on; }
+void unet_set_slab_direct(int on) { g_slab_dir = on; }   /* 2: on without the free-memory check (predict --window auto sized the window for it) */
 int unet_ct_stem(const unet *u) { return u->built && !u->train && u->ct_stem; }
 void unet_set_ct_input(unet *u, int on) { if (u->ct_mode != on && u->built && !u->train) free_acts(u); u->ct_mode = on; }
 static int share_enc_a1(void) { if (g_share_enc_a1 < 0) g_share_enc_a1 = ufsm_env_on("UFSM_RC_ENC_A1"); return g_share_enc_a1 && recompute() == 1 && nn_get_tf32(); }
@@ -971,7 +971,7 @@ static void build_acts(unet *u, shape5 xs, int train) {
     const int slab1 = slab && L > 2 && slab_w_ok(w[1]) && u->cfg.enc_blocks[1] == 0 && (!getenv("UFSM_INFER_SLAB_L1") || ufsm_env_on("UFSM_INFER_SLAB_L1"));
     float *X = nullptr, *Y = nullptr, *X2 = nullptr, *Y2 = nullptr;
     int sdir = slab && slab_direct();
-    if (sdir && !g_dry) {   /* room for X, X2 (and Y, Y2) plus ~two more level-0 tensors for the rest (wind96 384 x 640^2: ~11.4 GB in all, this asks
+    if (sdir && !g_dry && g_slab_dir != 2) {   /* (2: chosen with the window, predict --window auto) room for X, X2 (and Y, Y2) plus ~two more level-0 tensors for the rest (wind96 384 x 640^2: ~11.4 GB in all, this asks
                                13.5 GB free: MIG slices / shared cards fall back), else the in-place slabs with copies */
         shape5 a = u->ls[0], c = u->ls[1]; a.c = w[0]; c.c = L > 1 ? w[1] : 0;
         const size_t need = 4 * act_bytes_of(a) + (slab1 ? 2 * act_bytes_of(c) : 0) + ((size_t)3 << 29), fr = nn_mem_free();

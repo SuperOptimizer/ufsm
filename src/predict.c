@@ -754,11 +754,14 @@ int cmd_predict(int argc, char **argv) {
     char input_attrs[128] = "";
     if (input_affine) snprintf(input_attrs, sizeof input_attrs, ",\"input_gain\":%.9g,\"input_bias\":%.9g", input_gain, input_bias);
     const int win_given = *opt(argc, argv, "--window", "") || *opt(argc, argv, "--halo", "");
-    /* --window auto (or UFSM_PRED_WINDOW=auto): the largest of the slab / cube windows below that this GPU holds, halo 64 (pods with
-       32-48 GB: more interior per computed voxel). OPT-IN AND UNGATED: windows other than 384 x 640^2 change the outputs (per-window
-       GroupNorm statistics, context); scripts/pod/wingate.sh is the gate, not run yet */
-    const int wauto = !strcmp(opt(argc, argv, "--window", ""), "auto") || (getenv("UFSM_PRED_WINDOW") && !strcmp(getenv("UFSM_PRED_WINDOW"), "auto"));
-    if (wauto) { W = 640; halo = 64; }
+    /* --window auto (or UFSM_PRED_WINDOW=auto; the production scripts pass it): the cheapest window per interior voxel this GPU holds (see
+       below): bigger windows on big GPUs, today's on 16 GB cards. Windows other than the production ones change the outputs (per-window
+       GroupNorm statistics, context); allowed without a gate by the user 10-31 (scripts/pod/wingate.sh is the gate, not run).
+       UFSM_PRED_WINDOW=prod: the production window (fields 384 x 640^2 halo 64, --feather ink 576 halo 32) */
+    const char *wenv = getenv("UFSM_PRED_WINDOW");
+    const int wauto = !strcmp(opt(argc, argv, "--window", ""), "auto") || (wenv && (!strcmp(wenv, "auto") || !strcmp(wenv, "prod")));
+    const int wprod = wauto && wenv && !strcmp(wenv, "prod");
+    if (wauto) { W = 640; if (!*opt(argc, argv, "--halo", "")) halo = 64; }
     /* --window-z WZ [--halo-z HZ]: slab windows WZ x W x W (train --Pz nets; HZ default WZ / 4), the plain GPU path only */
     int Wz = atoi(opt(argc, argv, "--window-z", "0")), hz = atoi(opt(argc, argv, "--halo-z", "-1"));
     int slab = Wz > 0 && Wz != W;
@@ -1033,16 +1036,31 @@ int cmd_predict(int argc, char **argv) {
     const int H0 = 1 << (cfg.nlev - 1);   /* --split: halo planes of each half */
     if (wauto) {
         if (split || half || sheet_task || sweep_out || ngpu > 1 || ufsm_env_on("UFSM_PRED_HOSTPATH")) { fprintf(stderr, "predict: --window auto: one GPU's plain CT path only\n"); return 2; }
-        static const int cand[4][2] = {{640, 1152}, {384, 1152}, {640, 640}, {384, 640}};   /* (z, xy) by interior share: 63%, 50%, 51%, 43% at halo 64 */
-        int k = 0;
-        for (; k < 4; k++) {
-            const int cz = cand[k][0], cw = cand[k][1];
-            const size_t w3 = (size_t)cz * cw * cw, need = unet_infer_bytes(u, (shape5){1, 4, cz, cw, cw}) + w3 / 8 + (size_t)shard * shard * shard + ((size_t)1 << 30);
-            if (need <= nn_mem_free()) break;
+        /* candidates (z, xy, halo), production first; cost = computed voxels per interior voxel, x 1.25 (fields) / 1.22 (ink) without the
+           direct slabs (desk measurements); the cheapest whose dry-run memory (+ CT window, field accumulators, feather E, 1.5 GB) is free wins.
+           Fields (--fit-zarr strides with 512 shards: per-shard z 256 / 512, or cubes of k shards): 384 x 640^2, 640^3, 1152^3 (halo 64);
+           --feather ink: k shards + 2 halo, k = 1..3 (576, 1088, 1600 at halo 32) */
+        int cz[4], cw[4], nc = 0; const int ha = fea ? halo : 64;
+        if (fea) { for (int k = 1; k <= 3; k++) { cz[nc] = cw[nc] = k * shard + 2 * ha; nc++; } }
+        else { static const int fz[3] = {384, 640, 1152}, fx[3] = {640, 640, 1152}; for (int k = 0; k < 3; k++) { cz[nc] = fz[k]; cw[nc] = fx[k]; nc++; } }
+        const int dir_ok = !getenv("UFSM_SLAB_DIRECT") || ufsm_env_on("UFSM_SLAB_DIRECT");
+        const size_t fr = getenv("UFSM_PRED_WINDOW_FREE") ? (size_t)(atof(getenv("UFSM_PRED_WINDOW_FREE")) * 1e9) : nn_mem_free();   /* (planning: a GB figure, with UFSM_PRED_WINDOW_DRY=1) */
+        int bk = 0, bd = dir_ok; double bc = 1e30;
+        for (int k = 0; k < (wprod ? 1 : nc); k++) for (int d = dir_ok; d >= 0; d--) {
+            const int iz = cz[k] - 2 * ha, ix = cw[k] - 2 * ha;
+            if (iz <= 0 || ix <= 0) continue;
+            const double cost = (double)cz[k] * cw[k] * cw[k] / ((double)iz * ix * ix) * (d ? 1.0 : fea ? 1.22 : 1.25);
+            unet_set_slab_direct(d);
+            const size_t w3 = (size_t)cz[k] * cw[k] * cw[k], e3 = fea ? (size_t)(ix + fea) * (ix + fea) * (ix + fea) : 0,
+                         acc = ffz ? (size_t)iz * ix * ix / ((size_t)ffh * ffh * ffh) * 64 : 0,
+                         need = unet_infer_bytes(u, (shape5){1, 4, cz[k], cw[k], cw[k]}) + w3 / 8 + e3 + acc + (size_t)shard * shard * shard + ((size_t)3 << 29);
+            if ((need <= fr || (k == 0 && d == 0)) && cost < bc - 1e-9) { bc = cost; bk = k; bd = d; }
         }
-        if (k == 4) k = 3;
-        Wz = cand[k][0]; W = cand[k][1]; halo = hz = 64; slab = Wz != W;
-        fprintf(stderr, "predict: --window auto: %d x %d^2, halo 64 (opt-in, UNGATED: other windows change the outputs; scripts/pod/wingate.sh)\n", Wz, W);
+        unet_set_slab_direct(bd ? 2 : 0);
+        Wz = cz[bk]; W = cw[bk]; halo = hz = ha; slab = Wz != W;
+        fprintf(stderr, "predict: --window auto%s: %d x %d^2, halo %d, %s slabs (%.1f GB free; %.2f computed voxels per interior voxel)\n", wprod ? " (prod)" : "",
+                Wz, W, halo, bd ? "direct" : "copy", fr / 1e9, bc);
+        if (ufsm_env_on("UFSM_PRED_WINDOW_DRY")) return 0;
     }
     if (split && !win_given && !wauto) { W = shard + 128; halo = 64; fprintf(stderr, "predict: window %d, halo %d (split default; --window / --halo set them; window - 2 halo = k * shard computes one window per k^3 shards)\n", W, halo); }
     if (split && W % (2 * H0)) { fprintf(stderr, "--split z: the window must be a multiple of %d\n", 2 * H0); return 2; }
