@@ -55,12 +55,13 @@ U=build/ufsm; R=/vesuvius/ufsm/volcomp; K=PHercParis4/20260411134726-2.400um-0.2
 CK=wind96-wk1-best.ckpt; INKCK=ift3-24000.ckpt
 
 # 1. fit fields (wind96): 10 planes on a 2-voxel cell grid, written straight into a fit-field set; repack to 512^3 shards
-$U predict $CK $R $K fields.tmp --um 2.4 --level 2 --box Z,Y,X,NZ,NY,NX --window-z 384 --halo-z 64 --window 640 --halo 64 --shard 512 \
+$U predict $CK $R $K fields.tmp --um 2.4 --level 2 --box Z,Y,X,NZ,NY,NX --window auto --halo 64 --shard 512 \
    --grid-origin 0,0,0 --ema 1 --q 8 --axis axis.json --levels 1 --fit-zarr fields --fit-h 2 --fit-q 8 --fit-q-phase 4 --no-out 1 --occupancy 5
 for a in fields/*/; do $U repack $a ${a%/}.512 512 --threads 12 && rm -r $a && mv ${a%/}.512 $a; done
-#    (predict picks direct slab outputs when the GPU has room: ~73 B per window voxel, no plane copies, same bytes; UFSM_SLAB_DIRECT=0 the old
-#     ~46 B path. `--window auto` / UFSM_PRED_WINDOW=auto picks a larger window on big GPUs (640 x 1152^2 ...): UNGATED, it changes the
-#     outputs; scripts/pod/wingate.sh is its gate and has not been run. Production stays 384 x 640^2.)
+#    (--window auto: the cheapest window per interior voxel the GPU holds: 16 GB 384 x 640^2 (the old production window), 24-46 GB 640^3,
+#     ~96 GB 1152^3; --feather ink: 576 up to ~30 GB, 1088 from ~46 GB. Direct slab outputs when there is room (~73 B per window voxel, no
+#     plane copies). Bigger windows change the outputs slightly (per-window GroupNorm, context): allowed without a gate (user 10-31);
+#     scripts/pod/wingate.sh is the gate. UFSM_PRED_WINDOW=prod: the old windows; UFSM_SLAB_DIRECT=0: the copy path.)
 
 # 2. ink (ift3-24000): frozen GroupNorm from a calibration band, two passes offset by half a shard, blended
 $U predict $INKCK $R $K gncal.zarr --um 2.4 --level 2 --box CALBOX --shard 512 --window 640 --halo 64 --ema 1 --full-grid 1 --occupancy 5 --levels 1 --no-out 1 --gn-save gn.bin
