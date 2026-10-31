@@ -286,6 +286,11 @@ double fit_set_W(const fit_set *s, double z, double y, double x);
 int fit_set_ray_root(const fit_set *s, double z, double theta, double k, double r_hint, double *r);   /* fit_ray_root of the set (global box, axis, pitch) */
 /* the same where only roots with ua <= r <= ub are wanted (others: -1, possibly without their search; a kept root is the same) */
 int fit_set_ray_root_b(const fit_set *s, double z, double theta, double k, double r_hint, double ua, double ub, double *r);
+/* fit_set_ray_root_b for many rays at one z (a row context: the slab choice and the z parts once; the same roots) */
+typedef struct fit_set_row fit_set_row;
+fit_set_row *fit_set_row_new(const fit_set *s, double z);
+int fit_set_row_root_b(fit_set_row *w, double theta, double k, double r_hint, double ua, double ub, double *r);
+void fit_set_row_free(fit_set_row *w);
 /* grad W of the set at a box-local native point by central differences over +-e (theta continued across its cut, so the gradient
    is that of the smooth U - dir theta / 2 pi); returns |grad W| (turns per native voxel) */
 double fit_set_gradW(const fit_set *s, double z, double y, double x, double e, double g[3]);

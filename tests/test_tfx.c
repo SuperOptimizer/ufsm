@@ -59,7 +59,14 @@ static unsigned char *slurpb(const char *p, long *n) {
     FILE *f = fopen(p, "rb"); if (!f) return nullptr; fseek(f, 0, SEEK_END); *n = ftell(f); fseek(f, 0, SEEK_SET);
     unsigned char *b = malloc(*n + 1); if (fread(b, 1, *n, f) != (size_t)*n) { free(b); b = nullptr; } fclose(f); return b;
 }
-static void par_identical(int W, int H) {
+#ifndef GOLD_1600
+#define GOLD_1600 0x71af1c28473ee12bull   /* (master bf9a971: tests/test_tfx.c built on its src/tfx.c + third_party/surfcomp) */
+#define GOLD_70 0xd40944b24de5a7abull
+#endif
+static uint64_t fnv64(const unsigned char *b, long n) { uint64_t h = 1469598103934665603ull; for (long i = 0; i < n; i++) h = (h ^ b[i]) * 1099511628211ull; return h; }
+/* gold: the FNV-1a hash of the file the original surfcomp / tfx code (master bf9a971) wrote: the vectorized transforms, the
+   quantizer, the entropy selection and the pipelined writer must leave every byte as it was */
+static void par_identical(int W, int H, uint64_t gold) {
     const size_t n = (size_t)W * H; float *x = malloc(n * 4), *y = malloc(n * 4), *z = malloc(n * 4);
     for (int r = 0; r < H; r++) for (int c = 0; c < W; c++) {
         const size_t i = (size_t)r * W + c; const double th = 0.1 + c * 4 / 3000.0;
@@ -82,6 +89,8 @@ static void par_identical(int W, int H) {
     CHECK(!tfx_sfc_write(p6, W, H, 0.25, meta, fill, &G, 6), "tfx_sfc_write 6 threads");
     long na = 0, nb = 0, nc = 0; unsigned char *a = slurpb(ref, &na), *b = slurpb(p1, &nb), *c = slurpb(p6, &nc);
     CHECK(a && b && c && na == nb && na == nc && !memcmp(a, b, na) && !memcmp(a, c, na), "%dx%d: threaded .sfc differs from the serial writer (%ld / %ld / %ld bytes)", W, H, na, nb, nc);
+    const uint64_t hv = a ? fnv64(a, na) : 0;
+    CHECK(hv == gold, "%dx%d: .sfc hash %016llx, the original encoder wrote %016llx", W, H, (unsigned long long)hv, (unsigned long long)gold);
     printf("tfx par %dx%d: serial = 1 thread = 6 threads (%ld bytes)\n", W, H, na);
     free(a); free(b); free(c); free(J); free(v); free(x); free(y); free(z); unlink(ref); unlink(p1); unlink(p6);
 }
@@ -89,8 +98,8 @@ int main(void) {
     roundtrip(300, 200, 1, 0.25, "full");      /* scale 1 */
     roundtrip(80, 60, 4, 0.25, "quarter");     /* scale 0.25: one vertex per 4 voxels */
     roundtrip(130, 70, 4, 0.1, "tight");       /* the library default tolerance */
-    par_identical(1600, 600);                  /* > one batch of patches at 6 threads, ragged edges */
-    par_identical(70, 65);
+    par_identical(1600, 600, GOLD_1600);                  /* > one batch of patches at 6 threads, ragged edges */
+    par_identical(70, 65, GOLD_70);
     if (fails) { fprintf(stderr, "test_tfx: %d failures\n", fails); return 1; }
     printf("test_tfx: ok\n");
     return 0;
