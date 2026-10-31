@@ -138,6 +138,14 @@ with tempfile.TemporaryDirectory(prefix="ufsm-pipeline-") as tmp:
         run(*air, t / 'air-gpus', *air_opts, '--full-grid', '1', '--resume', '1', '--gpus', '0,1', '--box', '0,0,0,256,128,128')
         assert read_bytes(t / 'air-gpus', [128, 0, 0], [128, 128, 128]) == full
         assert sorted((t / 'air-gpus/predict-done-1.txt').read_text().splitlines()) == ['0 0 0', '1 0 0']
+    # --occupancy also skips windows whose interior (in its shard) is air on the coarse level (one coarse voxel of margin): stride 4
+    # windows over z 128..143, the first (interior z 128..131, coarse 63..66) skipped; the same bytes as without the tile test
+    tile_opts = ['--um', '1', '--window', '8', '--halo', '2', '--shard', '128', '--levels', '1', '--q', '0', '--threads', '1', '--box', '128,0,0,16,8,8']
+    run(*air, t / 'occ-t0', *tile_opts, '--occupancy', '1', extra_env={'UFSM_OCC_TILES': '0'})
+    out = run(*air, t / 'occ-t1', *tile_opts, '--occupancy', '1')
+    assert '12 windows to run, 4 more skipped (interior air on CT level 1, --occupancy)' in out, out
+    assert read_bytes(t / 'occ-t1', [0, 0, 0], [16, 8, 8]) == read_bytes(t / 'occ-t0', [0, 0, 0], [16, 8, 8])
+    assert any(read_bytes(t / 'occ-t1', [0, 0, 0], [16, 8, 8]))
     run(*air, t / 'invalid', *air_opts, '--occupancy', '0', ok=2)
     run(*air, t / 'invalid', *air_opts, '--full-grid', '1', '--box', '512,0,0,8,8,8', ok=2)
     # Version-1 models without a normalization field keep the historical graph.
