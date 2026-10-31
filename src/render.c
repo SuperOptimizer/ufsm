@@ -1102,14 +1102,27 @@ int ink_compare_mem(int argc, char **argv) {   /* the in-memory version (inkcomp
 }
 
 /* ---- tifxyz_fill_holes (render --fill-grid) ---- */
+/* Gauss-Seidel on the hole vertices, one hole per task: a hole's vertices see only their own hole and fixed rims (holes are whole 4-connected
+   components), so each hole iterated alone in its own index order equals the sweep over all of them in index order, byte for byte */
+typedef struct { float *A[3]; const float *Z; const uint8_t *hole; const uint32_t *q; const size_t *c0; size_t nc; int w; _Atomic size_t next; } gs_job;
+static void *gs_worker(void *arg) {
+    gs_job *J = arg; const int w = J->w;
+    for (size_t h; (h = atomic_fetch_add(&J->next, 1)) < J->nc;)
+        for (int it = 0; it < 400; it++) for (size_t k = J->c0[h]; k < J->c0[h + 1]; k++) {
+            const size_t i = J->q[k]; const size_t nb4[4] = {i - 1, i + 1, i - w, i + w}; double s[3] = {0, 0, 0}; int m = 0;   /* holes touch no border */
+            for (int j = 0; j < 4; j++) { const size_t u = nb4[j]; if (!J->hole[u] && !(J->Z[u] >= 0)) continue; for (int d = 0; d < 3; d++) s[d] += J->A[d][u]; m++; }
+            if (m) for (int d = 0; d < 3; d++) J->A[d][i] = (float)(s[d] / m);
+        }
+    return nullptr;
+}
 size_t tifxyz_fill_holes(float *X, float *Y, float *Z, int w, int h, size_t maxv, uint8_t *filled, size_t *nholes, size_t *nbig) {
     const size_t n = (size_t)w * h; size_t nf = 0, nh = 0, nb = 0;
     if (nholes) *nholes = 0;
     if (nbig) *nbig = 0;
     if (filled) memset(filled, 0, n);
     if (w < 3 || h < 3) return 0;
-    uint8_t *hole = calloc(n, 1), *seen = calloc(n, 1); uint32_t *q = malloc(n * sizeof *q);
-    if (!hole || !seen || !q) { free(hole); free(seen); free(q); return 0; }
+    uint8_t *hole = calloc(n, 1), *seen = calloc(n, 1); uint32_t *q = malloc(n * sizeof *q), *hid = malloc(n * sizeof *hid);   /* hid: a hole vertex's hole */
+    if (!hole || !seen || !q || !hid) { free(hole); free(seen); free(q); free(hid); return 0; }
     for (size_t s = 0; s < n; s++) {   /* components of invalid vertices: the enclosed, small enough ones are holes */
         if (seen[s] || Z[s] >= 0) continue;
         size_t a = 0, e = 0; int border = 0; q[e++] = (uint32_t)s; seen[s] = 1;
@@ -1121,7 +1134,8 @@ size_t tifxyz_fill_holes(float *X, float *Y, float *Z, int w, int h, size_t maxv
         }
         if (border) continue;
         if (e > maxv) { nb++; continue; }
-        nh++; for (size_t k = 0; k < e; k++) hole[q[k]] = 1;
+        for (size_t k = 0; k < e; k++) { hole[q[k]] = 1; hid[q[k]] = (uint32_t)nh; }
+        nh++;
     }
     free(seen);
     /* start: push-pull of the valid vertices over the whole grid (the hole vertices take the pulled values) */
@@ -1159,20 +1173,27 @@ size_t tifxyz_fill_holes(float *X, float *Y, float *Z, int w, int h, size_t maxv
         }
     }
     if (ok) {
-        size_t nl = 0; for (size_t i = 0; i < n; i++) if (hole[i]) { for (int d = 0; d < 3; d++) A[d][i] = pv[0][d][i]; q[nl++] = (uint32_t)i; }
-        /* Gauss-Seidel on the Laplace equation over the hole vertices (rims fixed): the membrane through the rim */
-        for (int it = 0; it < 400; it++) for (size_t k = 0; k < nl; k++) {
-            const size_t i = q[k]; const int r = (int)(i / w), c = (int)(i % w);
-            const size_t nb4[4] = {i - 1, i + 1, i - w, i + w}; double s[3] = {0, 0, 0}; int m = 0;
-            (void)r; (void)c;   /* holes touch no border: all four neighbours exist */
-            for (int j = 0; j < 4; j++) { const size_t u = nb4[j]; if (!hole[u] && !(Z[u] >= 0)) continue; for (int d = 0; d < 3; d++) s[d] += A[d][u]; m++; }
-            if (m) for (int d = 0; d < 3; d++) A[d][i] = (float)(s[d] / m);
-        }
+        /* the hole vertices grouped by hole (counting sort), index order inside each */
+        size_t nl = 0, *c0 = calloc(nh + 2, sizeof *c0);
+        if (c0) {
+            for (size_t i = 0; i < n; i++) if (hole[i]) { for (int d = 0; d < 3; d++) A[d][i] = pv[0][d][i]; c0[hid[i] + 1]++; nl++; }
+            for (size_t k = 0; k < nh; k++) c0[k + 1] += c0[k];
+            size_t *fill = calloc(nh + 1, sizeof *fill);
+            if (fill) for (size_t i = 0; i < n; i++) if (hole[i]) q[c0[hid[i]] + fill[hid[i]]++] = (uint32_t)i;
+            if (!fill) nh = 0, nl = 0;   /* (out of memory: no Laplace pass, nothing reported filled) */
+            free(fill);
+            /* Gauss-Seidel on the Laplace equation over the hole vertices (rims fixed): the membrane through the rim; holes on threads */
+            gs_job J = {{Z, Y, X}, Z, hole, q, c0, nh, w, 0};
+            long nc = ufsm_ncpu(); const int nt = nc < 1 ? 1 : nc > 32 ? 32 : (int)(nc < (long)nh ? nc : (long)(nh ? nh : 1));
+            pthread_t th[32]; for (int t = 0; t < nt; t++) pthread_create(&th[t], nullptr, gs_worker, &J);
+            for (int t = 0; t < nt; t++) pthread_join(th[t], nullptr);
+            free(c0);
+        } else nl = 0;
         nf = nl;
         if (filled) for (size_t k = 0; k < nl; k++) filled[q[k]] = 1;
     }
     for (int l = 0; l <= L; l++) { free(pw[l]); for (int d = 0; d < 3; d++) free(pv[l][d]); }
-    free(hole); free(q);
+    free(hole); free(q); free(hid);
     if (nholes) *nholes = nh;
     if (nbig) *nbig = nb;
     return nf;

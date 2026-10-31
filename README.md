@@ -483,7 +483,7 @@ freed after its last use, and only the volcomp substreams (16 z x 32 y x 128 x s
 size, e.g. recto + verso) in one chunk pass. Same bytes on every path (`UFSM_RENDER_TILED=1`, `UFSM_RENDER_FULLDECODE=1`:
 the old paths). A whole Paris 3 wrap (338 cm², 1.6 Gpixel): 5:28 -> 1:37.
 
-`render --gpu 1` (`src/nn_render.cu`; same bytes as the CPU path, every `--fill*` / `--depth` / `--joint` / `--crop` mode) runs
+`render --gpu 1` (the default; `--gpu 0`: the CPU path; `src/nn_render.cu`; same bytes, every `--fill*` / `--depth` / `--joint` / `--crop` mode) runs
 the chunk-ordered renderer on the GPU. Decoded chunks stay on the device. The decoder threads have gpudec decode the lossy
 substreams straight into a device chunk pool. `--gpu 1` sets `UFSM_GPU_DECODE=1` and `UFSM_GPU_DECODE_MIN_BYTES=0` unless they are
 already set, and runs 128 decoders (`UFSM_RENDER_GPU_DECODERS`). Anything decoded on the host is uploaded from pinned staging
@@ -492,7 +492,7 @@ with `-fmad=false`, no fast math). Its outputs go to mapped pinned memory, two l
 device's free memory (`UFSM_RENDER_GPU_MEM` GB caps it; the GPU may be shared). When a live chunk set exceeds the device (P3
 stripes peak ~29 GB), mapped pinned host slots hold the rest. Any device error, or a pool too full for the earliest chunk row,
 re-renders on the CPU. `UFSM_RENDER_PROF=1` prints decoder and driver times. Paris 4 stripe ws010 (desk, one 5060 Ti, load ~90):
-render 127 -> 28.5 s, wall 159 -> 40 s. The hole fills after the samples (`--fill-grid` grid bridging, `--fill-inpaint` /
+render 127 -> 28.5 s, wall 159 -> 40 s. The hole fills around the samples (`--fill-grid` grid bridging: its Laplace pass one hole per thread, same bytes; `--fill-inpaint` /
 `--fill-pm`) stay on the CPU (a few seconds per stripe).
 
 **ink-compare** prints per-ink statistics (mean, frac50, p50 / p95 / p99, band contrast at `--rs-um` / `--rl-um`, pairwise
