@@ -7,6 +7,7 @@ void nn_host_free(void *p) { free(p); }
 
 int main(void) {
     const int P=32; const size_t n=(size_t)P*P*P; const int64_t origin[3]={0};
+    const int quick = getenv("UFSM_TEST_QUICK") && atoi(getenv("UFSM_TEST_QUICK"));   /* make test: the writer comparisons at P <= 128 */
     uint8_t *ct=malloc(n),*target=calloc(NCH*n,1),*mask=malloc(n),*T=malloc(NCH*n),*M=malloc(n);
     float *X=malloc(4*n*4),*scratch=malloc(n*4),cy[32],cx[32],row[32],table[192];
     uint16_t *H=malloc(4*n*2);
@@ -184,7 +185,7 @@ int main(void) {
            P 37 (odd: vector lanes and per-voxel tails), 64, 128, 256 and 512 */
         const int Ps[] = {37, 64, 128, 256, 512};
         int diffs = 0, runs = 0;
-        for (int pi = 0; pi < 5; pi++) {
+        for (int pi = 0; pi < (quick ? 3 : 5); pi++) {   /* (UFSM_TEST_QUICK: up to P 128; 256 / 512 in make test-slow) */
             const int Q = Ps[pi]; const size_t nq = (size_t)Q * Q * Q;
             uint8_t *pq = malloc(nq + 64), *pw = malloc(nq), *w4 = malloc(nq), *wc = malloc(nq), *o[6]; uint16_t *wq = malloc(nq * 2);
             for (int i = 0; i < 6; i++) o[i] = malloc(nq);
@@ -223,7 +224,7 @@ int main(void) {
            and 512 against the per-voxel reference loop + sample_pack_tm, with no appearance plan, the --ct-aug LUT (gamma, shading,
            correlated noise) and the filter plan: fp16 CT and packed codes equal */
         int diffs = 0, runs = 0;
-        for (int Q = 128; Q <= 512; Q *= 2) {
+        for (int Q = 128; Q <= (quick ? 128 : 512); Q *= 2) {
             const size_t nq = (size_t)Q * Q * Q;
             uint8_t *c2 = malloc(nq), *t2 = malloc(2 * nq), *m2 = malloc(nq), *Ta = malloc(2 * nq), *Ma = malloc(nq), *TMa = malloc(nq), *TMb = malloc(nq);
             uint16_t *Ha = malloc(nq * 2), *Hb = malloc(nq * 2); float *app = malloc(nq * 4), *nr = malloc(Q * 4), *nrs = malloc(Q * 4), *nps = malloc((size_t)Q * Q * 4), cyq[512], cxq[512];

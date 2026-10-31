@@ -12,7 +12,7 @@
 #               "none" runs no GPU test (they are reported SKIP)
 #     -G N      GPU tests at a time per GPU (default 1; env SUITE_GPU_SLOTS)
 #     -x S      per-test timeout in seconds (default 1800)
-#     -P        profile: strace marks the tests that open /dev/nvidia*, nvidia-smi samples their GPU memory (tests/suite.txt tags)
+#     -P        profile: strace marks the tests that open /dev/nvidia* (gpu column "+nv"), nvidia-smi samples their GPU memory
 #     -l        list the selected tests and exit
 # Manifest lines: NAME | TAGS | EST_SECONDS | COMMAND   (bash, run from the repo root, $B = the build dir; # comments)
 #   tags: gpu (takes a GPU lock, CUDA_VISIBLE_DEVICES = that GPU), gpu2 (both GPUs when there are two), slow (test-slow tier),
@@ -117,6 +117,7 @@ run_one() {
   for a in 1 2; do
     rm -rf -- "$tmp"; mkdir -p "$tmp"
     local pre=(); [ $PROF = 1 ] && command -v strace > /dev/null && pre=(strace -f -qq --seccomp-bpf -e trace=openat -o "$OUT/tmp/$n.strace")
+    command -v stdbuf > /dev/null && pre=(stdbuf -oL -eL "${pre[@]}")   # line-buffered stdout: logs interleave stdout and stderr in order
     local t0 t1; t0=$(date +%s.%N)
     ( export B="$BDIR" TMPDIR="$tmp" UFSM_TEST_TMP="$tmp" UFSM_SUITE_TEST="$n" UFSM_NCPU=$T UFSM_FIT_THREADS=$T UFSM_TIFF_THREADS=$T \
              OMP_NUM_THREADS=$T OPENBLAS_NUM_THREADS=$T MKL_NUM_THREADS=$T
@@ -135,7 +136,7 @@ run_one() {
     rm -f "$log.2"
     [ $rc = 0 ] || ! hastag "$n" flaky && break
   done
-  if [ $PROF = 1 ] && [ -f "$OUT/tmp/$n.strace" ]; then grep -q '/dev/nvidia' "$OUT/tmp/$n.strace" && g="${g:-?}*"; rm -f "$OUT/tmp/$n.strace"; fi
+  if [ $PROF = 1 ] && [ -f "$OUT/tmp/$n.strace" ]; then grep -q '/dev/nvidia' "$OUT/tmp/$n.strace" && g="${g:-}+nv"; rm -f "$OUT/tmp/$n.strace"; fi
   rm -f "$OUT/tmp/$n.pid"
   for fd in "${fds[@]}"; do exec {fd}>&-; done
   [ $rc = 0 ] && rm -rf -- "$tmp"

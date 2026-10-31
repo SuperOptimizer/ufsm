@@ -74,6 +74,7 @@ static void test_l1(void) {
    lost = the turns the network skipped between the axis and x (a smoothstep 0 -> 1 across each band inside the window) */
 static const double H8 = 8, PITCH = 64, CY = 400, CX = 400;
 static int g_ring;
+static int g_quick;   /* UFSM_TEST_QUICK (make test): 100 steps a stage (the coarse ones settle by then, the ids stay 1.0000), no unchecked runs */
 static double smooth01(double t) { return t <= 0 ? 0 : t >= 1 ? 1 : t * t * (3 - 2 * t); }
 static int in_window(double z, double th) { return g_ring ? z >= 96 && z < 288 : z >= 64 && z < 320 && th > -0.3 && th < 1.3; }
 static double lost(double z, double r, double th) {
@@ -108,6 +109,7 @@ static double run_spiral(int repair, int steps, double *flood_ids) {
     fit_fields f = {D, H, W, H8, pc, ps, {t[0], t[1], t[2], t[3], t[4], t[5]}, sp, w, cy, cx, {0}, 0, nullptr, nullptr, nullptr};
     fit_cfg c = fit_cfg_default(); c.verbose = 1; c.cpu = 1; c.dir = 1; c.core = 0;
     if (repair) { c.uw_repair = 4; c.uw_rep_stretch = 0.5f; }
+    if (g_quick) for (int s = 0; s < 6; s++) c.steps[s] = 100;
     if (steps) c.steps[4] = c.steps[5] = steps;   /* 1: the phase stages barely move: W is the unwrapping's (its integers) */
     fit_model *m = fit_run(&f, &c);
     if (!m) { fprintf(stderr, "FAIL: fit_run\n"); fails++; return 0; }
@@ -137,6 +139,7 @@ static double run_spiral(int repair, int steps, double *flood_ids) {
 }
 
 int main(void) {
+    g_quick = getenv("UFSM_TEST_QUICK") && atoi(getenv("UFSM_TEST_QUICK"));
     test_l1();
     fit_set_threads(4);
     for (g_ring = 0; g_ring <= 1; g_ring++) {   /* the unwrapping's integers (phase stages of 1 step), then the full fit */
@@ -145,7 +148,7 @@ int main(void) {
         rng = 88172645463325252ull; const double u1 = run_spiral(1, 1, nullptr);
         CHECK(u0 < 0.9, "%s: the flood alone already gets %.4f of the ids (the case does not slip)", nm, u0);
         CHECK(u1 >= 0.99, "%s: the repaired unwrapping gets %.4f < 0.99 of the ids", nm, u1);
-        rng = 88172645463325252ull; run_spiral(0, 0, nullptr);
+        if (!g_quick) { rng = 88172645463325252ull; run_spiral(0, 0, nullptr); }   /* (printed only: the full fit without the repair) */
         rng = 88172645463325252ull; const double a1 = run_spiral(1, 0, nullptr);
         CHECK(a1 >= 0.99, "%s: the repaired fit gets %.4f < 0.99 of the ids", nm, a1);
     }

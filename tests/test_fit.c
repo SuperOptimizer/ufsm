@@ -17,6 +17,7 @@ static int fails;
 static int g_dir; static double g_wob = 0.4, g_pack = 0.6, g_dpitch = 10; static int g_hole = 1; static double g_bias = 0;   /* FIT_BIAS: the phase under-counts the packed sector by this fraction (a weak network) */
 static const double H8 = 8, R0 = 384;
 static double g_split = 0; static int g_tile = 256;   /* the two-level unwrapping (fit_cfg uw_split / uw_tile) */
+static int g_quick;   /* UFSM_TEST_QUICK (make test): at most 100 Adam steps a stage (the full counts: make test-slow) */
 static int g_cpu = 0; static float g_robust = 0, g_bend = 0, g_pgrad = 0;   /* the CPU backend, the Cauchy phase, curvature-adaptive smoothness */
 static double ax_y(double z) { return R0 + 0.02 * z; }
 static double ax_x(double z) { return R0 - 0.01 * z; }
@@ -65,6 +66,7 @@ static int run_case(int dir) {
     }
     fit_fields f = {D, H, W, H8, pc, ps, {t[0], t[1], t[2], t[3], t[4], t[5]}, sp, w, cy, cx, {0}, 0, nullptr, nullptr, nullptr};
     fit_cfg c = fit_cfg_default(); c.verbose = 1; c.uw_split = g_split; c.uw_tile = g_tile; c.cpu = g_cpu; c.phase_robust = g_robust; c.bend = g_bend; c.w_pgrad = g_pgrad;
+    if (g_quick) for (int s = 0; s < 8; s++) c.steps[s] = c.steps[s] > 100 ? 100 : c.steps[s];
     fit_model *m = fit_run(&f, &c);
     int bad = 0;
     if (!m) { fprintf(stderr, "FAIL: fit_run\n"); return 1; }
@@ -278,6 +280,7 @@ static double run_ct_case(int cpu, float w_ct, float w_cs, double *all, double *
     }
     fit_fields f = {D, H, W, H8, pc, ps, {t[0], t[1], t[2], t[3], t[4], t[5]}, sp, w, cy, cx, {0}, 0, nullptr, ct, cs};
     fit_cfg c = fit_cfg_default(); c.verbose = getenv("FIT_CTV") != nullptr; c.cpu = cpu; c.dir = 1;
+    if (g_quick) for (int s = 0; s < 8; s++) c.steps[s] = c.steps[s] > 100 ? 100 : c.steps[s];
     c.w_ct = w_ct; c.ct_phi = 0.2f; c.w_cspacing = w_cs; c.ct_flood = g_ctflood;
     fit_model *m = fit_run(&f, &c);
     if (!m) { fprintf(stderr, "FAIL: fit_run (ct)\n"); fails++; return 0; }
@@ -385,6 +388,7 @@ static void check_recto_fields(void) {
 
 int main(void) {
     nn_init(0);
+    g_quick = getenv("UFSM_TEST_QUICK") && atoi(getenv("UFSM_TEST_QUICK"));
     if (getenv("FIT_BIAS")) g_bias = atof(getenv("FIT_BIAS"));
     if (getenv("FIT_SIMPLE")) { g_wob = atof(getenv("FIT_SIMPLE")); g_pack = 0; g_dpitch = 0; g_hole = 0; }
     if (!getenv("FIT_CTONLY")) {   /* (FIT_CTONLY: the CT cases alone) */
@@ -392,7 +396,7 @@ int main(void) {
     run_case(-1);
     g_split = 0.5; g_tile = 32; run_case(+1);   /* 18 tiles: pieces stitched across tile faces, the hole and the edge by the serial pass */
     g_split = 0; g_tile = 256;
-    g_cpu = 1; run_case(+1); run_case(-1);       /* the CPU backend (src/fit_terms.h: the same terms) */
+    g_cpu = 1; run_case(+1); if (!g_quick) run_case(-1);   /* the CPU backend (src/fit_terms.h: the same terms) */
     g_robust = 0.1f; g_bend = 1.f; run_case(+1); /* the Cauchy phase residual and curvature-adaptive smoothness keep a clean fit */
     g_cpu = 0; run_case(-1);                     /* ... on the GPU too */
     g_robust = 0; g_bend = 0; g_pgrad = 1.f; run_case(+1); g_cpu = 1; run_case(-1);   /* phase-gradient matching, both backends */
