@@ -1,5 +1,6 @@
 /* ufsm CLI. */
 #include "afv.h"
+#include "sysinfo.h"
 #include "sample.h"
 #include "sources.h"
 #include "band.h"
@@ -107,6 +108,7 @@ static int arg_index(int argc, char **argv, const char *k) { for (int i = 2; i <
 static int usage(void) {
     fprintf(stderr,
         "ufsm — ultra fast scroll model\n"
+        "  ufsm sysinfo [--ncpu | --avail-gb | --limit-gb] [--disk PATH]   real cgroup CPU / RAM limits, GPUs (MIG), CUDA, free disk\n"
         "  ufsm info    <root> <array-or-group-key> [--cache DIR]\n"
         "  ufsm read    <root> <array-key> z y x nz ny nx <out.raw> [--cache DIR] [--threads N]\n"
         "  ufsm slice   <root> <array-key> z <out.pgm> [--cache DIR] [--threads N]     (whole z slice)\n"
@@ -509,7 +511,7 @@ static int cmd_phase_raster(int argc, char **argv) {
     z3 *z = z3_open(store_open(argv[2]), argv[3], nullptr); if (!z) { fprintf(stderr, "%s\n", z3_error()); return 1; }
     const z3_meta *m = z3_meta_of(z); const int64_t fshape[3] = {m->shape[0], m->shape[1], m->shape[2]};
     const int64_t shape[3] = {(fshape[0] + pf - 1) / pf, (fshape[1] + pf - 1) / pf, (fshape[2] + pf - 1) / pf};   /* the output grid */
-    const int blk = atoi(opt(argc, argv, "--block", "256")), nth = atoi(opt(argc, argv, "--threads", "4"));
+    const int blk = atoi(opt(argc, argv, "--block", "256")), nth = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 4);
     if (512 % blk) { fprintf(stderr, "phase-raster: --block must divide 512\n"); return 2; }
     int64_t lo[3] = {0, 0, 0}, hi[3] = {shape[0], shape[1], shape[2]};
     const char *bx = opt(argc, argv, "--box", nullptr);
@@ -597,7 +599,7 @@ static void *pcheck_count(void *arg) {
 static int cmd_phase_check(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: ufsm phase-check <phase-root> <key> --axis A --scan-um U [--phase-um K] [--boxes 48] [--min 0.9] [--count 1] [--threads 8] [--sign 1] [--min-known 0.05] [--box z,y,x,nz,ny,nx]\n"); return 2; }
     const char *ap = opt(argc, argv, "--axis", nullptr); const double scan_um = atof(opt(argc, argv, "--scan-um", "0")), phase_um = atof(opt(argc, argv, "--phase-um", argv[3]));
-    const int nbox = atoi(opt(argc, argv, "--boxes", "48")), count = atoi(opt(argc, argv, "--count", "1")), nt = atoi(opt(argc, argv, "--threads", "8")), sign = atoi(opt(argc, argv, "--sign", "1"));
+    const int nbox = atoi(opt(argc, argv, "--boxes", "48")), count = atoi(opt(argc, argv, "--count", "1")), nt = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 8), sign = atoi(opt(argc, argv, "--sign", "1"));
     const double minf = atof(opt(argc, argv, "--min", "0.9")), mink = atof(opt(argc, argv, "--min-known", "0.05"));
     if (!ap || !(scan_um > 0) || !(phase_um > 0) || nbox < 1 || (sign != 1 && sign != -1)) { fprintf(stderr, "phase-check: --axis, --scan-um > 0, a numeric key or --phase-um, --boxes >= 1, --sign +-1\n"); return 2; }
     axis ax = {0}; if (axis_load(&ax, ap)) { fprintf(stderr, "phase-check: cannot load the axis %s\n", ap); return 1; }
@@ -661,29 +663,7 @@ static int cmd_phase_check(int argc, char **argv) {
    [--phase phase.raw]
    Band field (src/band.h) of a native-voxel box (even origin and size) from a winding_mod14 raster level (label grid, 2 native
    voxels per label voxel): writes the band per label voxel, (nz/2) x (ny/2) x (nx/2) uint8, 0..251 or 255 unknown. */
-/* bytes this process may still allocate: MemAvailable, capped by its cgroup's memory.max minus memory.current (e.g. inside
-   ~/ufsm-data/capped.sh's ufsm.slice); 0 when unknown */
-static size_t mem_available(void) {
-    size_t avail = 0; char line[512];
-    FILE *f = fopen("/proc/meminfo", "r");
-    if (f) { while (fgets(line, sizeof line, f)) { unsigned long long kb; if (sscanf(line, "MemAvailable: %llu kB", &kb) == 1) { avail = (size_t)kb << 10; break; } } fclose(f); }
-    f = fopen("/proc/self/cgroup", "r");
-    if (f) {
-        if (fgets(line, sizeof line, f) && !strncmp(line, "0::", 3)) {
-            line[strcspn(line, "\n")] = 0;
-            for (char *dir = line + 3; *dir; ) {   /* this cgroup and its ancestors: the tightest max - current */
-                char pm[700], pc[700]; snprintf(pm, sizeof pm, "/sys/fs/cgroup%s/memory.max", dir); snprintf(pc, sizeof pc, "/sys/fs/cgroup%s/memory.current", dir);
-                FILE *a = fopen(pm, "r"), *b = fopen(pc, "r"); unsigned long long mx = 0, cur = 0; int lim = 0;
-                if (a) { lim = fscanf(a, "%llu", &mx) == 1; fclose(a); }
-                if (b) { if (fscanf(b, "%llu", &cur) != 1) cur = 0; fclose(b); }
-                if (lim && mx > cur && (!avail || mx - cur < avail)) avail = (size_t)(mx - cur);
-                char *sl = strrchr(dir, '/'); if (!sl || sl == dir) break; *sl = 0;
-            }
-        }
-        fclose(f);
-    }
-    return avail;
-}
+static size_t mem_available(void) { return ufsm_mem_available(); }   /* (src/sysinfo.h: cgroup aware) */
 static int cmd_band(int argc, char **argv) {
     if (argc < 6) { fprintf(stderr, "usage: ufsm band <codes-root> <key> z,y,x,nz,ny,nx <out.raw> [--axis A] [--radius 80] [--span 75]\n"); return 2; }
     long long b[6];
@@ -747,7 +727,7 @@ static int cmd_band(int argc, char **argv) {
     for (int d = 0; d < 3; d++) { ro[d] = o[d] < 0 ? 0 : o[d]; int64_t e = o[d] + n[d] < m->shape[d] ? o[d] + n[d] : m->shape[d]; rn[d] = e - ro[d]; }
     if (rn[0] > 0 && rn[1] > 0 && rn[2] > 0) {
         uint8_t *tmp = malloc((size_t)rn[0] * rn[1] * rn[2]);
-        if (z3_read(z, ro, rn, tmp, atoi(opt(argc, argv, "--threads", "8")))) { fprintf(stderr, "band: read failed: %s\n", z3_error()); return 1; }
+        if (z3_read(z, ro, rn, tmp, ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 8))) { fprintf(stderr, "band: read failed: %s\n", z3_error()); return 1; }
         for (int64_t zz = 0; zz < rn[0]; zz++) for (int64_t yy = 0; yy < rn[1]; yy++)
             memcpy(codes + ((size_t)(zz + ro[0] - o[0]) * n[1] + (yy + ro[1] - o[1])) * n[2] + (ro[2] - o[2]), tmp + ((size_t)zz * rn[1] + yy) * rn[2], (size_t)rn[2]);
         free(tmp);
@@ -905,7 +885,7 @@ static int score_codes(z3 *z, double cf, const long long org[3], const int shp[3
         tf += now() - tq; tq = now();
         if (!dump) {   /* threads (the dump keeps the serial voxel order); per-thread tallies and detail records kept over all blocks */
             J.codes = codes; J.U = U; for (int d = 0; d < 3; d++) { J.n3[d] = n3[d]; J.o3[d] = o3[d]; }
-            long ncpu = sysconf(_SC_NPROCESSORS_ONLN); const char *te = getenv("UFSM_FIT_THREADS"); if (te && atoi(te) > 0) ncpu = atoi(te);   /* (the fit's threads) */
+            long ncpu = ufsm_ncpu(); const char *te = getenv("UFSM_FIT_THREADS"); if (te && atoi(te) > 0) ncpu = atoi(te);   /* (the fit's threads) */
             J.nt = (int)(ncpu < 1 ? 1 : ncpu > 16 ? 16 : ncpu); if (J.nt > n3[0]) J.nt = (int)n3[0];
             pthread_t th[64]; void *args[64][2];
             for (int t = 0; t < J.nt; t++) {
@@ -1091,6 +1071,9 @@ static int cmd_fit_sweep(int argc, char **argv, const char *file) {
     fprintf(stderr, "fit sweep: %d runs (%d failed) in %.1fs\n", nl, bad, now() - t0);
     return bad ? 1 : 0;
 }
+/* fit --ref-model: the ref (a whole-scroll model: ~0.9 GB of lattice) loads on a thread while the fields load */
+static struct { pthread_t th; int on; const char *dir; fit_set *s; } g_fit_ref;
+static void *fit_ref_thread(void *a) { (void)a; g_fit_ref.s = fit_set_load(g_fit_ref.dir); return nullptr; }
 static int cmd_fit(int argc, char **argv) {
     if (!g_fit_sweep && *opt(argc, argv, "--sweep", "")) return cmd_fit_sweep(argc, argv, opt(argc, argv, "--sweep", ""));
     const char *dir = argv[2];
@@ -1150,6 +1133,7 @@ static int cmd_fit(int argc, char **argv) {
     /* the GPU context (~2 s) comes up on a thread while the fields load; the main thread selects the device again after the join */
     g_fit_gdev = atoi(opt(argc, argv, "--gpu", "0"));
     if (!c.cpu) { g_fit_gthr = pthread_create(&g_fit_gth, nullptr, fit_gpu_init_thread, nullptr) == 0; if (!g_fit_gthr) nn_init(g_fit_gdev); }
+    if (*opt(argc, argv, "--ref-model", "")) { if (g_fit_ref.on) { pthread_join(g_fit_ref.th, nullptr); g_fit_ref.on = 0; } g_fit_ref.dir = opt(argc, argv, "--ref-model", ""); g_fit_ref.s = nullptr; g_fit_ref.on = pthread_create(&g_fit_ref.th, nullptr, fit_ref_thread, nullptr) == 0; }
     const double t0 = now();
     const char *min = opt(argc, argv, "--model", nullptr);   /* score / export a saved model or set instead of fitting */
     const int slab = atoi(opt(argc, argv, "--slab", "0")), overlap = atoi(opt(argc, argv, "--overlap", "256"));
@@ -1257,7 +1241,8 @@ static int cmd_fit(int argc, char **argv) {
     }
     fit_set *refm = nullptr;   /* --ref-model: a global coarse model / set (coarse-to-fine: the integers tied to it) */
     if (*opt(argc, argv, "--ref-model", "")) {
-        if (!(refm = fit_set_load(opt(argc, argv, "--ref-model", "")))) { fprintf(stderr, "fit: cannot load --ref-model %s\n", opt(argc, argv, "--ref-model", "")); return 1; }
+        if (g_fit_ref.on) { pthread_join(g_fit_ref.th, nullptr); g_fit_ref.on = 0; refm = g_fit_ref.s; } else refm = fit_set_load(opt(argc, argv, "--ref-model", ""));
+        if (!refm) { fprintf(stderr, "fit: cannot load --ref-model %s\n", opt(argc, argv, "--ref-model", "")); return 1; }
         if (seedm || slab > 0) { fprintf(stderr, "fit: --ref-model goes without --seed-model / --slab\n"); return 2; }
         c.ref = refm; for (int d = 0; d < 3; d++) c.ref_off[d] = (double)(fb.origin[d] - refm->global->origin[d]);
         c.ref_snap = atoi(opt(argc, argv, "--ref-snap", "0")); c.uw_rep_ref = (float)atof(opt(argc, argv, "--uw-rep-ref", "0"));
@@ -1717,6 +1702,7 @@ typedef struct {
     const char *out; z3 *snapz; const int64_t *snapo; double snap_range, snap_min; const uint8_t *sfa; int sfn[3]; long long sfo[3]; double sfh; int verbose_snap; double Y, X;
     const wr_polar *P; _Atomic int next; _Atomic int nwr; _Atomic size_t nvalid; _Atomic int fail;
     double zlo, zhi, colr;   /* --zr: box-local native z of the first / last row; --col-r: < 0 centre, 0 p90, > 0 that radius */
+    const int *ks; int nk; double min_cm2; _Atomic int nsmall;   /* the wrap ids to compute (largest first); --min-cm2; wraps dropped by it */
 } wraps_all;
 static int wr_cmp_d(const void *a, const void *b) { const double x = *(const double *)a, y = *(const double *)b; return (x > y) - (x < y); }
 static int wrap_one(wraps_all *A, int k, int nthreads) {   /* wrap k: its rows on nthreads threads, snapped, written */
@@ -1749,7 +1735,9 @@ static int wrap_one(wraps_all *A, int k, int nthreads) {   /* wrap k: its rows o
     const size_t valid = atomic_load(&J.valid);
     if ((A->snapz || A->sfa) && valid) { const size_t mv = wraps_snap(A->snapz, A->snapo, m, rows, cols, px, py, pz, A->snap_range, A->snap_min, nthreads, A->sfa, A->sfn, A->sfo, A->sfh); if (A->verbose_snap) fprintf(stderr, "wraps: w%03d: %zu of %zu vertices snapped\n", k, mv, valid); }
     int rc = 0;
-    if (valid > 16) {
+    const double vcm2 = A->step * A->um * 1e-4 * A->step * A->um * 1e-4;   /* (cm2 per vertex at the column spacing --step) */
+    if (valid > 16 && valid * vcm2 < A->min_cm2) atomic_fetch_add(&A->nsmall, 1);
+    else if (valid > 16) {
         char wd[1400]; snprintf(wd, sizeof wd, "%s/w%03d", A->out, k);
         double wstep = step, wum = A->um;
         if (A->out_um > 0 && fabs(A->out_um - A->um) > 1e-9) {   /* --out-um: coordinates on another grid of the same scan (voxel centres to voxel centres) */
@@ -1765,8 +1753,34 @@ static int wrap_one(wraps_all *A, int k, int nthreads) {   /* wrap k: its rows o
 }
 static void *wraps_worker(void *arg) {
     wraps_all *A = arg;
-    for (int k; (k = A->k0 + atomic_fetch_add(&A->next, 1)) <= A->k1;) if (wrap_one(A, k, 1)) atomic_store(&A->fail, 1);
+    for (int i; (i = atomic_fetch_add(&A->next, 1)) < A->nk;) if (wrap_one(A, A->ks[i], 1)) atomic_store(&A->fail, 1);
     return nullptr;
+}
+/* the wrap ids near data: W at the centre of every data-weight cell (wf != 0) in the rows' z range; id k is kept when some cell has
+   |W - k| <= margin (1 turn + the cell's half diagonal at a 4-voxel pitch, so a vertex in a data cell, which needs |W - k| = 0 inside it, is
+   never missed); counts per id (cells within the margin) order the wraps largest first. Empty ids cost ~30-60 CPU-s each (a root search
+   on every ray): Paris 4 sampled 16..580 and wrote 257, the 308 ids above the outermost data took 10.7 of the 20.7 min. */
+typedef struct { const fit_set *fs; const uint8_t *wf; int wsh[3]; double wh, zlo, zhi, margin; int k0, nk; _Atomic long long *cnt; _Atomic int next; } wr_prune_job;
+static void *wr_prune_rows(void *arg) {
+    wr_prune_job *J = arg; const int H = J->wsh[1], W = J->wsh[2]; long long *loc = calloc((size_t)J->nk, sizeof *loc);
+    for (int fz; (fz = atomic_fetch_add(&J->next, 1)) < J->wsh[0];) {
+        const double z = (fz + 0.5) * J->wh; if (z < J->zlo - J->wh || z > J->zhi + J->wh) continue;
+        const double zc = fmin(fmax(z, J->zlo), J->zhi); const uint8_t *pl = J->wf + (size_t)fz * H * W;
+        for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
+            if (!pl[(size_t)y * W + x]) continue;
+            const double w = fit_set_W(J->fs, zc, (y + 0.5) * J->wh, (x + 0.5) * J->wh); if (!isfinite(w)) continue;
+            int a = (int)ceil(w - J->margin) - J->k0, b = (int)floor(w + J->margin) - J->k0; if (a < 0) a = 0; if (b > J->nk - 1) b = J->nk - 1;
+            for (int k = a; k <= b; k++) loc[k]++;
+        }
+    }
+    for (int k = 0; k < J->nk; k++) if (loc[k]) atomic_fetch_add(&J->cnt[k], loc[k]);
+    free(loc);
+    return nullptr;
+}
+static const long long *g_wr_cnt; static int g_wr_k0;
+static int wr_cmp_cnt(const void *a, const void *b) {   /* larger count first, then the lower id */
+    const int x = *(const int *)a, y = *(const int *)b; const long long cx = g_wr_cnt[x - g_wr_k0], cy = g_wr_cnt[y - g_wr_k0];
+    return cx != cy ? (cx < cy) - (cx > cy) : (x > y) - (x < y);
 }
 static int cmd_wraps(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: ufsm wraps <model-dir> <out-dir> [--step 8] [--first K] [--last K] [--fields DIR] [--um 2.4] [--threads 16] [--sfc ERR] [--zr Z0,Z1] [--col-r centre|p90|R]\n"
@@ -1774,12 +1788,14 @@ static int cmd_wraps(int argc, char **argv) {
                                     "  --zr Z0,Z1: only the rows at global native z in [Z0, Z1] (the model's grid; also the z range the wrap ids are sampled in)\n"
                                     "  --first / --last K: the wrap ids exactly (default: those the box samples meet); wraps with <= 16 vertices are not written\n"
                                     "  --col-r: the radius (native voxels) whose arc the column spacing --step is: centre = the wrap's root on the box centre's ray (default),\n"
-                                    "     p90 = the 90th percentile of its roots over the rows' z range (wraps that leave the axis, the core), or a number\n"); return 2; }
+                                    "     p90 = the 90th percentile of its roots over the rows' z range (default; wraps that leave the axis, the core), or a number\n"
+                                    "  --min-cm2 C: wraps under C cm2 (vertices x (step x um)^2) are not written (default 0.5: end-cap / air fragments; 0 keeps all)\n"
+                                    "  with --fields: only wrap ids within ~1 turn of a data cell are computed, largest first (UFSM_WRAPS_NOPRUNE=1: every id)\n"); return 2; }
     if (atof(opt(argc, argv, "--sfc", "0")) > 0) tifxyz_set_sfc(atof(opt(argc, argv, "--sfc", "0")));
     fit_set *fs = fit_set_load(argv[2]); if (!fs) { fprintf(stderr, "wraps: cannot load %s\n", argv[2]); return 1; }
     const fit_model *m = fs->global;   /* the box, the axis; rows dispatch to the slab model of their z */
     const double step = atof(opt(argc, argv, "--step", "8")), um = atof(opt(argc, argv, "--um", "0")) > 0 ? atof(opt(argc, argv, "--um", "0")) : fs->global->um;
-    const int nthreads = atoi(opt(argc, argv, "--threads", "16")); fit_set_threads(nthreads);   /* (the field loads' core masks) */
+    const int nthreads = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 16); fit_set_threads(nthreads);   /* (the field loads' core masks) */
     const double out_um = atof(opt(argc, argv, "--out-um", "0"));   /* e.g. 2.4: a 9.6 um fit's wraps on the 2.4 um grid (renders with 2.4 um ink) */
     const int si = arg_index(argc, argv, "--snap");   /* --snap ROOT KEY: a recto probability array on the model's grid (predict output) */
     z3 *snapz = nullptr; int64_t snapo[3] = {0, 0, 0}; const double snap_range = atof(opt(argc, argv, "--snap-range", "0.35")), snap_min = atof(opt(argc, argv, "--snap-min", "0.5"));
@@ -1832,7 +1848,7 @@ static int cmd_wraps(int argc, char **argv) {
     int k0 = (int)ceil(wmin), k1 = (int)floor(wmax);   /* (the samples can miss W near the axis: --first / --last are taken as given) */
     if (*opt(argc, argv, "--first", "")) k0 = atoi(opt(argc, argv, "--first", ""));
     if (*opt(argc, argv, "--last", "")) k1 = atoi(opt(argc, argv, "--last", ""));
-    const char *cr = opt(argc, argv, "--col-r", "centre"); const double colr = !strcmp(cr, "centre") ? -1 : !strcmp(cr, "p90") ? 0 : atof(cr);
+    const char *cr = opt(argc, argv, "--col-r", "p90"); const double colr = !strcmp(cr, "centre") ? -1 : !strcmp(cr, "p90") ? 0 : atof(cr);
     if (strcmp(cr, "centre") && strcmp(cr, "p90") && !(colr > 0)) { fprintf(stderr, "wraps: --col-r centre|p90|R (R > 0 native voxels)\n"); return 2; }
     const int na = (int)Z + 1;
     double th0 = 1e300, th1 = -1e300; int full = 0;   /* the box's angular range around the axis */
@@ -1864,16 +1880,31 @@ static int cmd_wraps(int argc, char **argv) {
         for (int t = 0; t < nt; t++) pthread_join(th[t], nullptr);
         A.P = &P;
     }
+    const int nall = k1 >= k0 ? k1 - k0 + 1 : 0; int *ks = malloc(sizeof(int) * (nall > 0 ? nall : 1)), nk = 0;
+    _Atomic long long *cnt = calloc(nall > 0 ? nall : 1, sizeof *cnt);
+    if (wf && nall > 0 && !ufsm_env_on("UFSM_WRAPS_NOPRUNE")) {
+        wr_prune_job PJ = {fs, wf, {wsh[0], wsh[1], wsh[2]}, wh, zlo, zhi, 1 + 0.5 * sqrt(3.0) * wh / 4, k0, nall, cnt, 0};
+        pthread_t th[64]; const int nt = nthreads < 64 ? (nthreads > 0 ? nthreads : 1) : 64;
+        for (int t = 0; t < nt; t++) pthread_create(&th[t], nullptr, wr_prune_rows, &PJ);
+        for (int t = 0; t < nt; t++) pthread_join(th[t], nullptr);
+        for (int k = k0; k <= k1; k++) if (cnt[k - k0]) ks[nk++] = k;
+        g_wr_cnt = (const long long *)cnt; g_wr_k0 = k0; qsort(ks, nk, sizeof(int), wr_cmp_cnt);
+        fprintf(stderr, "wraps: %d of %d wrap ids (%d..%d) meet the data, largest first\n", nk, nall, k0, k1);
+    } else for (int k = k0; k <= k1; k++) ks[nk++] = k;
+    A.ks = ks; A.nk = nk; A.min_cm2 = atof(opt(argc, argv, "--min-cm2", "0.5"));
+    tfx_set_threads(nthreads);   /* (the .sfc encoders: shared out among the wraps being written at that moment) */
     const int par = !(snapz || sfa) && nthreads > 1;
     if (par) {
         pthread_t th[64]; const int nt = nthreads < 64 ? nthreads : 64;
         for (int t = 0; t < nt; t++) pthread_create(&th[t], nullptr, wraps_worker, &A);
         for (int t = 0; t < nt; t++) pthread_join(th[t], nullptr);
-    } else for (int k = k0; k <= k1; k++) if (wrap_one(&A, k, nthreads)) A.fail = 1;
-    free(P.rmin); free(P.rmax);
+    } else for (int i = 0; i < nk; i++) if (wrap_one(&A, ks[i], nthreads)) A.fail = 1;
+    free(P.rmin); free(P.rmax); free(ks); free(cnt);
     if (A.fail) return 1;
     const int nwr = A.nwr; const size_t nvalid_all = A.nvalid;
-    fprintf(stderr, "wraps: %d wraps (%d..%d) with %zu vertices written to %s\n", nwr, k0, k1, nvalid_all, argv[3]);
+    fprintf(stderr, "wraps: %d wraps (%d..%d) with %zu vertices written to %s", nwr, k0, k1, nvalid_all, argv[3]);
+    if (A.nsmall) fprintf(stderr, " (%d under --min-cm2 %g not written)", (int)A.nsmall, A.min_cm2);
+    fputc('\n', stderr);
     fit_set_free(fs); free(wf); free(sfa); if (snapz) z3_close(snapz);
     return 0;
 }
@@ -1984,7 +2015,7 @@ static int cmd_downsample(int argc, char **argv) {
     const char *mode = opt(argc, argv, "--mode", "max"); const int votes = !strcmp(mode, "votes"), phase = !strcmp(mode, "phase") ? 1 : votes ? 2 : 0;
     if (!phase && strcmp(mode, "max")) { fprintf(stderr, "downsample: --mode max|phase|votes\n"); return 2; }
     if (votes) ds_vote_tables();
-    const int S = atoi(opt(argc, argv, "--shard", "512")), nt = atoi(opt(argc, argv, "--threads", "16")); const double um = atof(argv[5]);
+    const int S = atoi(opt(argc, argv, "--shard", "512")), nt = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 16); const double um = atof(argv[5]);
     z3 *z = z3_open(store_open(argv[2]), argv[3], opt(argc, argv, "--cache", nullptr));
     if (!z) { fprintf(stderr, "downsample: %s\n", z3_error()); return 1; }
     const z3_meta *m = z3_meta_of(z); const int fill = phase == 1 ? PHASE_UNKNOWN : m->fill;   /* votes: 0 = no votes */
@@ -2055,7 +2086,7 @@ static int cmd_downsample(int argc, char **argv) {
 static int cmd_side_votes(int argc, char **argv) {
     const int codes = !strcmp(argv[1], "codes-merge");
     if (argc < 6) { fprintf(stderr, "usage: ufsm %s <out-group> <out-um> <root> <key> [<root> <key> ...] [--shard 512] [--threads 16] [--cache DIR]\n", argv[1]); return 2; }
-    const int S = atoi(opt(argc, argv, "--shard", "512")), nt = atoi(opt(argc, argv, "--threads", "16")); const double um = atof(argv[3]);
+    const int S = atoi(opt(argc, argv, "--shard", "512")), nt = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 16); const double um = atof(argv[3]);
     if (S < 128 || S % 128 || !(um > 0)) { fprintf(stderr, "side-votes: out-um > 0, --shard a multiple of 128\n"); return 2; }
     z3 *in[64]; const char *names[64]; char nb[64][1200]; int nin = 0;
     for (int a = 4; a + 1 < argc && nin < 64; a += 2) {
@@ -2151,7 +2182,7 @@ static int cmd_wind_assign(int argc, char **argv) {
     if (!(ref_um > 0 && vol_um > 0 && axis_um > 0) || (strcmp(kind, "codes") && strcmp(kind, "winding")) || !(p.tol >= 0 && p.tol <= 32) || p.step < 1 || (p.dir != 0 && p.dir != 1 && p.dir != -1)) {
         fprintf(stderr, "wind-assign: --ref-um / --vol-um / --axis-um > 0, --kind codes|winding, --tol 0..32, --step >= 1, --dir -1|0|1\n"); return 2;
     }
-    wa_ref R = {z3_open(store_open(argv[2]), argv[3], opt(argc, argv, "--cache", nullptr)), p.dense ? WIND_WINDING : WIND_CODES, atoi(opt(argc, argv, "--threads", "4"))};
+    wa_ref R = {z3_open(store_open(argv[2]), argv[3], opt(argc, argv, "--cache", nullptr)), p.dense ? WIND_WINDING : WIND_CODES, ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 4)};
     if (!R.z) { fprintf(stderr, "wind-assign: %s\n", z3_error()); return 1; }
     wa_axis A = {.f = axis_um / vol_um};
     if (axis_load(&A.ax, opt(argc, argv, "--axis", "/vesuvius/ufsm/umbilicus/PHercParis4/umbilicus-full-resolution.json"))) { fprintf(stderr, "wind-assign: cannot load the axis\n"); return 1; }
@@ -2379,7 +2410,7 @@ static int cmd_wind_seed(int argc, char **argv) {
 static int cmd_fuse(int argc, char **argv) {
     const int recto = !strcmp(argv[1], "recto-fuse"), first = recto ? 6 : 4;
     if (argc < first + 2) { fprintf(stderr, "usage: ufsm %s <out-group> <out-um> %s<root> <key> [<root> <key>]... %s\n", argv[1], recto ? "<ct-root> <ct-key> " : "", recto ? "[--block 32] [--dup 3]" : "[--tol 0.1]"); return 2; }
-    int S = atoi(opt(argc, argv, "--shard", "0")); const int nt = atoi(opt(argc, argv, "--threads", "8")); const double um = atof(argv[3]);
+    int S = atoi(opt(argc, argv, "--shard", "0")); const int nt = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 8); const double um = atof(argv[3]);
     const float tol = (float)atof(opt(argc, argv, "--tol", "0.1")); const int block = atoi(opt(argc, argv, "--block", "32")), dup = atoi(opt(argc, argv, "--dup", "3"));
     const char *cache = opt(argc, argv, "--cache", nullptr);
     z3 *in[FUSE_MAX]; int n = 0;
@@ -2463,7 +2494,7 @@ static int cmd_fuse(int argc, char **argv) {
 static float *wd_read(const char *path, int *w, int *h);
 static int cmd_wrapdist(int argc, char **argv) {
     if (argc < 5) { fprintf(stderr, "usage: ufsm wrapdist <wraps-dir> <labels-root> <labels-key> [--max 32] [--chunk 128] [--threads 16] [--per-wrap] [--at T1,T2..] [--cache DIR]\n"); return 2; }
-    const int M = atoi(opt(argc, argv, "--max", "32")), C = atoi(opt(argc, argv, "--chunk", "128")), nt = atoi(opt(argc, argv, "--threads", "16"));
+    const int M = atoi(opt(argc, argv, "--max", "32")), C = atoi(opt(argc, argv, "--chunk", "128")), nt = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 16);
     const int per = arg_index(argc, argv, "--per-wrap") > 0; const double lum = atof(argv[4]);
     if (!(lum > 0) || M < 1 || C < 1) { fprintf(stderr, "wrapdist: the labels key must be its voxel size in um (e.g. 4.8); --max, --chunk >= 1\n"); return 2; }
     z3 *z = z3_open(store_open(argv[3]), argv[4], opt(argc, argv, "--cache", nullptr)); if (!z) { fprintf(stderr, "wrapdist: %s\n", z3_error()); return 1; }
@@ -2628,7 +2659,7 @@ static void ws_walk(const ws_wrap *w, int along_z, double um, double gap_um, dou
 static int cmd_wrapswitch(int argc, char **argv) {
     if (argc < 5) { fprintf(stderr, "usage: ufsm wrapswitch <wraps-dir> <codes-root> <codes-key> [--range 30] [--gap 1] [--min-run 100] [--axis FILE [--dir 1]] [--chunk 64] [--threads 16] [--per-wrap] [--cache DIR]\n"); return 2; }
     const double lum = atof(argv[4]), range_um = atof(opt(argc, argv, "--range", "30")), gap_mm = atof(opt(argc, argv, "--gap", "1")), min_um = atof(opt(argc, argv, "--min-run", "100"));
-    const int C = atoi(opt(argc, argv, "--chunk", "64")), nt = atoi(opt(argc, argv, "--threads", "16")), per = arg_index(argc, argv, "--per-wrap") > 0;
+    const int C = atoi(opt(argc, argv, "--chunk", "64")), nt = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 16), per = arg_index(argc, argv, "--per-wrap") > 0;
     if (!(lum > 0) || !(range_um > 0) || !(gap_mm > 0) || C < 1 || nt < 1) { fprintf(stderr, "wrapswitch: the codes key is its voxel size in um (e.g. 4.8); --range, --gap, --chunk > 0\n"); return 2; }
     z3 *z = z3_open(store_open(argv[3]), argv[4], opt(argc, argv, "--cache", nullptr)); if (!z) { fprintf(stderr, "wrapswitch: %s\n", z3_error()); return 1; }
     const z3_meta *zm = z3_meta_of(z);
@@ -2767,7 +2798,7 @@ static int cmd_surfsnap(int argc, char **argv) {
     const int vi = arg_index(argc, argv, "--volume");
     if (argc < 4 || vi < 0 || vi + 2 >= argc) { fprintf(stderr, "usage: ufsm surf-snap <wraps-in> <wraps-out> --volume ROOT KEY --vol-um U [--range 40] [--min 100] [--median 2] [--threads 16] [--cache DIR]\n"); return 2; }
     const double vum = atof(opt(argc, argv, "--vol-um", "0")), range_um = atof(opt(argc, argv, "--range", "40")), vmin = atof(opt(argc, argv, "--min", "100"));
-    const int nt = atoi(opt(argc, argv, "--threads", "16")), MR = atoi(opt(argc, argv, "--median", "2"));
+    const int nt = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 16), MR = atoi(opt(argc, argv, "--median", "2"));
     if (!(vum > 0) || !(range_um > 0) || MR < 0 || MR > 5 || nt < 1) { fprintf(stderr, "surf-snap: --vol-um U (the volume's voxel um) > 0, --range > 0, --median 0..5\n"); return 2; }
     z3 *vz = z3_open(store_open(argv[vi + 1]), argv[vi + 2], opt(argc, argv, "--cache", nullptr)); if (!vz) { fprintf(stderr, "surf-snap: %s\n", z3_error()); return 1; }
     const z3_meta *zm = z3_meta_of(vz);
@@ -2859,7 +2890,7 @@ static int cmd_surfsnap(int argc, char **argv) {
    voxels (predict --window - 2 --halo; z: --window-z - 2 --halo-z) anchored at each input's --grid-origin (--grids, in input order):
    per-cell weights sin^2 of the cell's place in its interior (fb_tile_w). --conf mean: the mean input confidence as the length. */
 static int cmd_field_blend(int argc, char **argv) {
-    const char *in[32]; float w[32]; int n = 0; const char *ws = nullptr, *out = nullptr, *tile = nullptr, *grids = nullptr, *conf = "resultant"; int nt = 8;
+    const char *in[32]; float w[32]; int n = 0; const char *ws = nullptr, *out = nullptr, *tile = nullptr, *grids = nullptr, *conf = "resultant"; int nt = ufsm_threads(0, 8);
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--weights") && i + 1 < argc) { ws = argv[++i]; continue; }
         if (!strcmp(argv[i], "--threads") && i + 1 < argc) { nt = atoi(argv[++i]); continue; }
@@ -3221,7 +3252,7 @@ static void *gap_rows(void *arg) {
 static int cmd_gap_compare(int argc, char **argv) {
     if (argc < 5) { fprintf(stderr, "usage: ufsm gap-compare <array-root> <array-key> <reference-fields> [--net FIELDS] [--R-um 115] [--thr 128] [--min-run 2] [--origin z,y,x] [--um U] [--cache DIR] [--threads 16]\n"); return 2; }
     const double aum = atof(opt(argc, argv, "--um", "0")) > 0 ? atof(opt(argc, argv, "--um", "0")) : atof(argv[3]), Rum = atof(opt(argc, argv, "--R-um", "115"));   /* --um: when the key is not the voxel size */
-    const int thr = atoi(opt(argc, argv, "--thr", "128")), minrun = atoi(opt(argc, argv, "--min-run", "2")), nt = atoi(opt(argc, argv, "--threads", "16"));
+    const int thr = atoi(opt(argc, argv, "--thr", "128")), minrun = atoi(opt(argc, argv, "--min-run", "2")), nt = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 16);
     if (!(aum > 0)) { fprintf(stderr, "gap-compare: the array key must be its voxel size in um (e.g. 2.4)\n"); return 2; }
     fit_fields_buf A, Bn; const char *net = opt(argc, argv, "--net", nullptr);
     if (fit_fields_load(argv[4], 0, 0, 1, &A) || (net && fit_fields_load(net, 0, 0, 1, &Bn))) { fprintf(stderr, "gap-compare: cannot load the fields\n"); return 1; }
@@ -3274,7 +3305,7 @@ static int cmd_gap_compare(int argc, char **argv) {
 static int cmd_gap_density(int argc, char **argv) {
     if (argc < 6) { fprintf(stderr, "usage: ufsm gap-density <papyrus-root> <papyrus-key> <fields-in> <fields-out> [--fuse-um 150] [--R-um 115] [--thr 128] [--min-run 2]\n"); return 2; }
     const double fuse = atof(opt(argc, argv, "--fuse-um", "150")), Rum = atof(opt(argc, argv, "--R-um", "115")), ump = atof(argv[3]);
-    const int thr = atoi(opt(argc, argv, "--thr", "128")), minrun = atoi(opt(argc, argv, "--min-run", "2")), nt = atoi(opt(argc, argv, "--threads", "16"));
+    const int thr = atoi(opt(argc, argv, "--thr", "128")), minrun = atoi(opt(argc, argv, "--min-run", "2")), nt = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 16);
     if (!(ump > 0)) { fprintf(stderr, "gap-density: the papyrus key must be its voxel size in um\n"); return 2; }
     fit_fields_buf A; if (fit_fields_load(argv[4], 0, 0, 1, &A)) { fprintf(stderr, "gap-density: cannot load %s\n", argv[4]); return 1; }
     z3 *pz = z3_open(store_open(argv[2]), argv[3], nullptr); if (!pz) { fprintf(stderr, "gap-density: %s\n", z3_error()); return 1; }
@@ -3415,7 +3446,7 @@ static int cmd_papyrus_labels(int argc, char **argv) {
     c.sigma = (float)atof(opt(argc, argv, "--sigma", "1")); c.band = (float)atof(opt(argc, argv, "--band", "0"));
     if (sscanf(opt(argc, argv, "--cut", "50,128"), "%f,%f", &c.t_lo, &c.t_hi) != 2 || !(c.sigma >= 0 && c.sigma <= PAPYRUS_RMAX / 3.f) ||
         !(c.local_sigma >= 0 && c.local_sigma <= PAPYRUS_RMAX / 3.f) || (cutoff < 0 && c.local < 1)) { fprintf(stderr, "papyrus-labels: bad label options\n"); return 2; }
-    const int nt = atoi(opt(argc, argv, "--threads", "8")), S = 512, T = S / 2;
+    const int nt = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 8), S = 512, T = S / 2;
     float w[2 * PAPYRUS_RMAX + 1]; const int rs = papyrus_taps(c.sigma, w), rl = papyrus_taps(c.local_sigma, w);
     const int H = cutoff >= 0 ? rs : (rs > 2 * c.local + rl ? rs : 2 * c.local + rl), P = T + 2 * H;   /* what a core voxel's label can see */
     z3 *cz = z3_open(store_open(argv[2]), argv[3], opt(argc, argv, "--cache", nullptr)); if (!cz) { fprintf(stderr, "papyrus-labels: %s\n", z3_error()); return 1; }
@@ -3626,7 +3657,7 @@ static int cmd_blend(int argc, char **argv) {
     blend_job J; memset(&J, 0, sizeof J);
     long long s3[3]; if (sscanf(opt(argc, argv, "--shape", ""), "%lld,%lld,%lld", s3, s3 + 1, s3 + 2) != 3) { fprintf(stderr, "blend: --shape Z,Y,X\n"); return 2; }
     for (int d = 0; d < 3; d++) J.shape[d] = s3[d];
-    J.S = atoi(opt(argc, argv, "--interior", "0")); J.sh = 512; J.nthreads = atoi(opt(argc, argv, "--threads", "8"));
+    J.S = atoi(opt(argc, argv, "--interior", "0")); J.sh = 512; J.nthreads = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 8);
     const float q = (float)atof(opt(argc, argv, "--q", "8"));
     if (J.S <= 0) { fprintf(stderr, "blend: --interior S (window - 2 halo of the runs)\n"); return 2; }
     J.in = calloc(argc, sizeof *J.in); J.org = calloc(argc, sizeof *J.org); J.shp = calloc(argc, sizeof *J.shp);
@@ -3651,17 +3682,48 @@ static int cmd_blend(int argc, char **argv) {
     fprintf(stderr, "blend: %lld of %lld shards written to %s in %.1fs\n", (long long)atomic_load(&J.written), (long long)(J.nsh[0] * J.nsh[1] * J.nsh[2]), dir, now() - t0);
     return 0;
 }
+/* render --fill: the share of surface pixels per class (stderr) and the cosmetic inpaint of the rest (--fill-inpaint L) */
+static void render_fill_report(const char *name, uint8_t *img, uint8_t *cimg, uint8_t *flag, int ow, int oh, int inpaint, int pm, int nthreads) {
+    size_t nin = 0;
+    if (inpaint > 0) {
+        uint8_t *const im[2] = {img, cimg}; const double t0 = now(); nin = img_pushpull_fill(im, 2, flag, ow, oh, inpaint, nthreads); const double t1 = now();
+        if (pm && img_patchmatch_fill(im, 2, flag, ow, oh, nthreads)) fprintf(stderr, "render: %s: PatchMatch out of memory (push-pull kept)\n", name);
+        fprintf(stderr, "render: %s inpaint: push-pull %.1fs, PatchMatch %.1fs\n", name, t1 - t0, pm ? now() - t1 : 0.0);
+    }
+    size_t ns = 0, non = 0, nfill = 0, nemp = 0, ngrid = 0, nnone = 0;   /* pixels of the original surface; grid-filled ones apart */
+    for (size_t i = 0; i < (size_t)ow * oh; i++) { const uint8_t f = flag[i]; if (f == RFILL_NONE) { nnone++; continue; }
+        if (f >= RFILL_GRID && f < RFILL_INPAINT) { ngrid++; continue; }
+        ns++; if (f == RFILL_ON) non++; else if (f == RFILL_EMPTY) nemp++; else if (f != RFILL_INPAINT) nfill++; }
+    const double d = ns ? 100.0 / ns : 0;
+    fprintf(stderr, "render: %s fill: %zu surface pixels: void on the surface %.2f%%, filled along the normal %.2f%%, inpainted %.2f%% (incl. grid-hole pixels), still empty %.2f%%; "
+                    "grid holes filled: %zu pixels (%.2f%% of the surface); no surface: %zu pixels\n",
+            name, ns, (ns - non) * d, nfill * d, nin * d, nemp * d, ngrid, ngrid * d, nnone);
+}
 static int cmd_render(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: ufsm render <wraps-dir> <out-dir> --volume ROOT KEY [--ct ROOT KEY] [--cache DIR] [--scale 1] [--depth 8] [--tile 512] [--threads 16] [--crop x,y,w,h] [--joint 1]\n"
+"         [--fill N] [--fill-ct 1] [--fill-prefer 0] [--fill-inpaint L] [--fill-pm 1] [--fill-grid V]\n"
 "  --joint 1: all wraps (one grid size) in one chunk-ordered pass, shared chunks decoded once\n"
+"  --fill N (needs --ct): a pixel whose CT on the surface is < --fill-ct (masked CT: 0 off the papyrus) takes the nearest papyrus\n"
+"    sample along the surface normal within +-N voxels for the volume AND the CT (same offset); ties: --fill-prefer 1 / -1 the\n"
+"    +- normal side, 0 the larger CT. Writes <wrap>_fill.tif: 0 on the surface, k filled from +k, 50 + k from -k, 250 inpainted,\n"
+"    254 no surface, 255 still empty; prints the shares. --fill 0: flags only. --fill-inpaint L: push-pull over L levels (holes up\n"
+"    to ~2^L pixels) of the still-empty pixels in both renders, then PatchMatch texture (--fill-pm 1, default; 0: push-pull only);\n"
+"    cosmetic, off by default; flag 250\n"
+"  --fill-grid V (with --fill): enclosed holes of the grid (invalid vertices, at most V per hole) bridged by interpolated vertices\n"
+"    (push-pull + Laplace), rendered like the rest; their pixels' flags + 100\n"
                                      "  --crop: only that rectangle of each wrap's output pixels is rendered and written (e.g. a labelled region)\n"); return 2; }
     const int vi = arg_index(argc, argv, "--volume"), ci = arg_index(argc, argv, "--ct");
     int crop[4] = {0, 0, 0, 0}; const char *crs = opt(argc, argv, "--crop", nullptr);
     if (crs && (sscanf(crs, "%d,%d,%d,%d", &crop[0], &crop[1], &crop[2], &crop[3]) != 4 || crop[0] < 0 || crop[1] < 0 || crop[2] < 1 || crop[3] < 1)) { fprintf(stderr, "render: --crop x,y,w,h\n"); return 2; }
     if (vi < 0 || vi + 2 >= argc) { fprintf(stderr, "render: --volume ROOT KEY\n"); return 2; }
     const double scale = atof(opt(argc, argv, "--scale", "1")); const int depth = atoi(opt(argc, argv, "--depth", "8"));
-    const int tile = atoi(opt(argc, argv, "--tile", "512")), nthreads = atoi(opt(argc, argv, "--threads", "16"));
+    const int tile = atoi(opt(argc, argv, "--tile", "512")), nthreads = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 16);
     const char *cache = opt(argc, argv, "--cache", nullptr);
+    const int fill_n = atoi(opt(argc, argv, "--fill", "-1")), fill_inp = atoi(opt(argc, argv, "--fill-inpaint", "0"));
+    const int fill_thr = atoi(opt(argc, argv, "--fill-ct", "1")), fill_pref = atoi(opt(argc, argv, "--fill-prefer", "0")), fill_pm = atoi(opt(argc, argv, "--fill-pm", "1"));
+    const long fill_grid = atol(opt(argc, argv, "--fill-grid", "0"));
+    if (fill_n > 49 || (fill_grid && fill_n < 0) || fill_inp < 0 || fill_inp > 8 || ((fill_n >= 0 || fill_inp) && (ci < 0 || ci + 2 >= argc)) || (fill_inp && fill_n < 0) || (fill_n >= 0 && getenv("UFSM_RENDER_TILED"))) {
+        fprintf(stderr, "render: --fill N (0..49) needs --ct (and not UFSM_RENDER_TILED); --fill-inpaint L (1..8) needs --fill\n"); return 2; }
     store *vs = store_open(argv[vi + 1]), *cs = ci > 0 && ci + 2 < argc ? store_open(argv[ci + 1]) : nullptr;
     const int remote = (vs && !store_is_local(vs)) || (cs && !store_is_local(cs));
     z3 *vz = vs ? z3_open(vs, argv[vi + 2], cache) : nullptr, *cz = cs ? z3_open(cs, argv[ci + 2], cache) : nullptr;
@@ -3688,8 +3750,10 @@ static int cmd_render(int argc, char **argv) {
             }
         }
         rewinddir(dd);
-        const double budget = atof(getenv("UFSM_RENDER_MEM") ? getenv("UFSM_RENDER_MEM") : "8") * (1u << 30);
-        chunked = getenv("UFSM_RENDER_TILED") ? 0 : getenv("UFSM_RENDER_CHUNKED") ? 1 : 0;
+        double budget = atof(getenv("UFSM_RENDER_MEM") ? getenv("UFSM_RENDER_MEM") : "8") * (1u << 30);
+        { const double av = (double)ufsm_mem_available();   /* never above half of what this process may still allocate (cgroup aware) */
+          if (av > 0 && budget > 0.5 * av) { fprintf(stderr, "render: UFSM_RENDER_MEM lowered to %.1f GB (half of the %.1f GB available)\n", 0.5 * av / (1u << 30), av / (1u << 30)); budget = 0.5 * av; } }
+        chunked = getenv("UFSM_RENDER_TILED") ? 0 : getenv("UFSM_RENDER_CHUNKED") || fill_n >= 0 ? 1 : 0;   /* --fill: the chunk-ordered renderer only */
         cbudget = budget;
         if (lo[0] <= hi[0] && lo[1] <= hi[1] && lo[2] <= hi[2]) {
             for (int d = 0; d < 3; d++) { ro[d] = (int64_t)floor(lo[d]) - depth - 2; if (ro[d] < 0) ro[d] = 0; rn[d] = (int64_t)ceil(hi[d]) + depth + 3 - ro[d]; }
@@ -3704,7 +3768,7 @@ static int cmd_render(int argc, char **argv) {
     /* --joint 1: every wrap of the directory (same grid size and step, e.g. one wrap's recto and verso faces on one flat uv) in one
        chunk-ordered pass, so the chunks they share are decoded once; the outputs are those of separate renders, byte for byte */
     if (atoi(opt(argc, argv, "--joint", "0")) && !rvol && !getenv("UFSM_RENDER_TILED")) {
-        enum { JMAX = 8 }; char *nm[JMAX]; float *JX[JMAX], *JY[JMAX], *JZ[JMAX]; int nj = 0, jw = 0, jh = 0, ok = 1; double jstep = 0;
+        enum { JMAX = 8 }; char *nm[JMAX]; float *JX[JMAX], *JY[JMAX], *JZ[JMAX]; uint8_t *VG[JMAX] = {0}; int nj = 0, jw = 0, jh = 0, ok = 1; double jstep = 0;
         while ((de = readdir(dd)) && ok) {
             if (de->d_name[0] != 'w') continue;
             if (nj == JMAX) { fprintf(stderr, "render: --joint takes at most %d wraps\n", JMAX); ok = 0; break; }
@@ -3716,17 +3780,30 @@ static int cmd_render(int argc, char **argv) {
             snprintf(p, sizeof p, "%s/%s/meta.json", argv[2], de->d_name);
             double step = 1; { char *b = tfx_meta_read(p); const char *q = b ? strstr(b, "\"scale\":") : nullptr; if (q && (q = strchr(q, '['))) { const double sc = atof(q + 1); if (sc > 0) step = 1 / sc; } free(b); }
             if (nj && (w != jw || h != jh || step != jstep)) { fprintf(stderr, "render: --joint: %s is %dx%d step %g, not %dx%d step %g\n", de->d_name, w, h, step, jw, jh, jstep); free(X); free(Y); free(Z); ok = 0; break; }
-            jw = w; jh = h; jstep = step; nm[nj] = strdup(de->d_name); JX[nj] = X; JY[nj] = Y; JZ[nj] = Z; nj++;
+            jw = w; jh = h; jstep = step; nm[nj] = strdup(de->d_name); JX[nj] = X; JY[nj] = Y; JZ[nj] = Z;
+            if (fill_grid > 0) { size_t nh, nbg; VG[nj] = malloc((size_t)w * h); const size_t nf = tifxyz_fill_holes(X, Y, Z, w, h, (size_t)fill_grid, VG[nj], &nh, &nbg);
+                                 fprintf(stderr, "render: %s grid: %zu holes, %zu vertices interpolated, %zu holes over %ld vertices left\n", de->d_name, nh, nf, nbg, fill_grid); }
+            nj++;
         }
         if (ok && nj) {
             const double gs = jstep * scale; const int ow = render_out_px(jw, gs), oh = render_out_px(jh, gs), nvol = cz ? 2 : 1;
-            uint8_t *im[2 * JMAX] = {0};
+            uint8_t *im[2 * JMAX] = {0}, *fl[JMAX] = {0};
             for (int k = 0; k < nj * nvol && ok; k++) if (!(im[k] = calloc((size_t)ow * oh, 1))) { fprintf(stderr, "render: out of memory\n"); ok = 0; }
+            for (int k = 0; k < nj && ok && fill_n >= 0; k++) { if (!(fl[k] = malloc((size_t)ow * oh))) { fprintf(stderr, "render: out of memory\n"); ok = 0; } else memset(fl[k], RFILL_NONE, (size_t)ow * oh); }
+            const render_fill RF = {fill_n, fill_thr, fill_pref, fl, fill_grid > 0 ? (const uint8_t *const *)VG : nullptr};
             z3 *zs[2] = {vz, cz}; const int dp[2] = {depth, 0};
             const size_t imgb = (size_t)ow * oh * nvol * nj, cb = cbudget > imgb + ((size_t)1 << 30) ? (size_t)cbudget - imgb : (size_t)1 << 30;
             const int io = remote ? (nthreads > 32 ? nthreads : 32) : nthreads;
-            if (ok && render_wraps_chunked(zs, nvol, dp, nj, (const float *const *)JX, (const float *const *)JY, (const float *const *)JZ, jw, jh, gs, im, ow, oh,
-                                           crs ? crop : nullptr, cb, nthreads, io, 1)) { fprintf(stderr, "render: joint render failed\n"); ok = 0; }
+            if (ok && render_wraps_chunked_fill(zs, nvol, dp, nj, (const float *const *)JX, (const float *const *)JY, (const float *const *)JZ, jw, jh, gs, im, ow, oh,
+                                                crs ? crop : nullptr, cb, nthreads, io, 1, fill_n >= 0 ? &RF : nullptr)) { fprintf(stderr, "render: joint render failed\n"); ok = 0; }
+            for (int k = 0; k < nj && ok && fill_n >= 0; k++) {
+                render_fill_report(nm[k], im[k * nvol], im[k * nvol + 1], fl[k], ow, oh, fill_inp, fill_pm, nthreads);
+                uint8_t *f = fl[k]; int fw = ow, fh = oh;
+                if (crs) { uint8_t *c2 = img_crop_u8(f, ow, oh, crop[0], crop[1], crop[2], crop[3]); if (!c2) { ok = 0; break; } free(f); fl[k] = f = c2; fw = crop[2]; fh = crop[3]; }
+                char p[1400]; snprintf(p, sizeof p, "%s/%s_fill.tif", argv[3], nm[k]);
+                if (tiffw_write(p, fw, fh, 1, f, 1)) { fprintf(stderr, "render: cannot write %s\n", p); ok = 0; }
+            }
+            for (int k = 0; k < nj; k++) free(fl[k]);
             for (int k = 0; k < nj && ok; k++) for (int v = 0; v < nvol && ok; v++) {
                 uint8_t *img = im[k * nvol + v]; int fw = ow, fh = oh;
                 if (crs) { uint8_t *c2 = img_crop_u8(img, ow, oh, crop[0], crop[1], crop[2], crop[3]); if (!c2) { ok = 0; break; } free(img); im[k * nvol + v] = img = c2; fw = crop[2]; fh = crop[3]; }
@@ -3735,7 +3812,7 @@ static int cmd_render(int argc, char **argv) {
             }
             for (int k = 0; k < nj * nvol; k++) free(im[k]);
         }
-        for (int k = 0; k < nj; k++) { free(nm[k]); free(JX[k]); free(JY[k]); free(JZ[k]); }
+        for (int k = 0; k < nj; k++) { free(nm[k]); free(JX[k]); free(JY[k]); free(JZ[k]); free(VG[k]); }
         closedir(dd); free(rvol); free(rct);
         if (!ok) return 1;
         fprintf(stderr, "render: %d wraps written to %s (one pass)\n", nj, argv[3]);
@@ -3752,13 +3829,20 @@ static int cmd_render(int argc, char **argv) {
         double step = 1; { char *b = tfx_meta_read(p); const char *q = b ? strstr(b, "\"scale\":") : nullptr; if (q && (q = strchr(q, '['))) { const double sc = atof(q + 1); if (sc > 0) step = 1 / sc; } free(b); }
         const double gs = step * scale;   /* output pixels per grid step */
         const int ow = render_out_px(w, gs), oh = render_out_px(h, gs);
-        uint8_t *img = calloc((size_t)ow * oh, 1), *cimg = cz ? calloc((size_t)ow * oh, 1) : nullptr;
-        if (!img || (cz && !cimg)) { fprintf(stderr, "render: out of memory\n"); return 1; }
+        uint8_t *vgrid = nullptr;
+        if (fill_grid > 0) { size_t nh, nbg; vgrid = malloc((size_t)w * h); const size_t nf = tifxyz_fill_holes(X, Y, Z, w, h, (size_t)fill_grid, vgrid, &nh, &nbg);
+                             fprintf(stderr, "render: %s grid: %zu holes, %zu vertices interpolated, %zu holes over %ld vertices left\n", de->d_name, nh, nf, nbg, fill_grid); }
+        uint8_t *img = calloc((size_t)ow * oh, 1), *cimg = cz ? calloc((size_t)ow * oh, 1) : nullptr, *flag = fill_n >= 0 ? malloc((size_t)ow * oh) : nullptr;
+        if (!img || (cz && !cimg) || (fill_n >= 0 && !flag)) { fprintf(stderr, "render: out of memory\n"); return 1; }
+        if (flag) memset(flag, RFILL_NONE, (size_t)ow * oh);
         if (!rvol && !getenv("UFSM_RENDER_TILED")) {
             z3 *zs[2] = {vz, cz}; const int dp[2] = {depth, 0}; uint8_t *const im[2] = {img, cimg};
             const size_t imgb = (size_t)ow * oh * (cz ? 2 : 1), cb = cbudget > imgb + ((size_t)1 << 30) ? (size_t)cbudget - imgb : (size_t)1 << 30;
             const int io = remote ? (nthreads > 32 ? nthreads : 32) : nthreads;
-            if (render_wrap_chunked(zs, cz ? 2 : 1, dp, X, Y, Z, w, h, gs, im, ow, oh, crs ? crop : nullptr, cb, nthreads, io, 1)) { fprintf(stderr, "render: %s: render failed\n", de->d_name); return 1; }
+            const float *const Xs[1] = {X}, *const Ys[1] = {Y}, *const Zs[1] = {Z}; uint8_t *const fls[1] = {flag}; const uint8_t *const vgs[1] = {vgrid};
+            const render_fill RF = {fill_n, fill_thr, fill_pref, fls, vgrid ? vgs : nullptr};
+            if (render_wraps_chunked_fill(zs, cz ? 2 : 1, dp, 1, Xs, Ys, Zs, w, h, gs, im, ow, oh, crs ? crop : nullptr, cb, nthreads, io, 1, flag ? &RF : nullptr)) { fprintf(stderr, "render: %s: render failed\n", de->d_name); return 1; }
+            if (flag) render_fill_report(de->d_name, img, cimg, flag, ow, oh, fill_inp, fill_pm, nthreads);
         } else
         /* output tiles: each reads only the volume around its own vertices (+- depth), so a wrap of any size renders in bounded memory */
         for (int ty = 0; ty < oh; ty += tile) for (int tx = 0; tx < ow; tx += tile) {
@@ -3795,11 +3879,13 @@ static int cmd_render(int argc, char **argv) {
             uint8_t *ci2 = img_crop_u8(img, ow, oh, crop[0], crop[1], crop[2], crop[3]), *cc2 = cimg ? img_crop_u8(cimg, ow, oh, crop[0], crop[1], crop[2], crop[3]) : nullptr;
             if (!ci2 || (cimg && !cc2)) { fprintf(stderr, "render: out of memory\n"); return 1; }
             free(img); free(cimg); img = ci2; cimg = cc2; fw = crop[2]; fh = crop[3];
+            if (flag) { uint8_t *cf = img_crop_u8(flag, ow, oh, crop[0], crop[1], crop[2], crop[3]); if (!cf) return 1; free(flag); flag = cf; }
         }
+        if (flag) { snprintf(p, sizeof p, "%s/%s_fill.tif", argv[3], de->d_name); if (tiffw_write(p, fw, fh, 1, flag, 1)) { fprintf(stderr, "render: cannot write %s\n", p); return 1; } free(flag); }
         snprintf(p, sizeof p, "%s/%s.tif", argv[3], de->d_name);
         if (tiffw_write(p, fw, fh, 1, img, 1)) { fprintf(stderr, "render: cannot write %s\n", p); return 1; }
         if (cimg) { snprintf(p, sizeof p, "%s/%s_ct.tif", argv[3], de->d_name); if (tiffw_write(p, fw, fh, 1, cimg, 1)) return 1; }
-        free(X); free(Y); free(Z); free(img); free(cimg); nw++;
+        free(X); free(Y); free(Z); free(img); free(cimg); free(vgrid); nw++;
     }
     closedir(dd); free(rvol); free(rct);
     fprintf(stderr, "render: %d wraps written to %s\n", nw, argv[3]);
@@ -3957,6 +4043,7 @@ int cmd_phase_conflict(int argc, char **argv);   /* src/packmap.c */
 int cmd_reg(int argc, char **argv);   /* src/reg_cli.c */
 int cmd_sr_pairs(int argc, char **argv);   /* src/srpairs.c */
 int main(int argc, char **argv) {
+    if (argc >= 2 && !strcmp(argv[1], "sysinfo")) return cmd_sysinfo(argc, argv);
     if (argc == 2 && !strcmp(argv[1], "train")) return cmd_train(argc, argv);
     if (argc < 3) return usage();
     const char *cmd = argv[1];
@@ -3964,7 +4051,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "prefetch")) {   /* ufsm prefetch <sources.json> [--levels 1] [--threads 32] [--fraction 1.0] [--P 128] [--dry 0] */
         if (argc < 3) { fprintf(stderr, "usage: ufsm prefetch <sources.json> [--levels L] [--threads N] [--fraction F] [--P window] [--dry 1 (count only)]\n"); return 2; }
         sources *S = sources_load(argv[2]); if (!S) return 1;
-        return sources_prefetch(S, atoi(opt(argc, argv, "--levels", "1")), atoi(opt(argc, argv, "--threads", "32")), atof(opt(argc, argv, "--fraction", "1.0")),
+        return sources_prefetch(S, atoi(opt(argc, argv, "--levels", "1")), ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 32), atof(opt(argc, argv, "--fraction", "1.0")),
                                 atoi(opt(argc, argv, "--P", "128")), atoi(opt(argc, argv, "--dry", "0")));
     }
     if (!strcmp(cmd, "ingest-labels")) return cmd_ingest_labels(argc, argv);

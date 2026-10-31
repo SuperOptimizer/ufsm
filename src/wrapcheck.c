@@ -19,6 +19,7 @@
    Defaults --sigma 1.2 --prom 1: on Paris 4 (9.6 um CT) 1.05 CT peaks per fitted turn where the GT codes give 1.03. Coordinates: the model's box (native voxels, global origin in model.json);
    the fields may be any box holding it at the same native grid. CPU only, rays on --threads threads. */
 #include "fit.h"
+#include "sysinfo.h"
 #include "zarr3.h"
 #include "store.h"
 #include <math.h>
@@ -175,7 +176,7 @@ int cmd_wrap_check(int argc, char **argv) {
     fit_fields_buf g; if (fit_fields_load(argv[3], 0, 0, 0, &g)) { fprintf(stderr, "wrap-check: cannot read the fields in %s\n", argv[3]); return 1; }
     const double h = g.h, um = g.um; long long forg[3]; int fsh[3]; for (int d = 0; d < 3; d++) { forg[d] = g.origin[d]; fsh[d] = g.shape[d]; } fit_fields_free(&g);
     if (m->h != h) { fprintf(stderr, "wrap-check: the model's cell h %g differs from the fields' %g\n", m->h, h); return 1; }
-    const int nz = atoi(wc_opt(argc, argv, "--nz", "16")), nth = atoi(wc_opt(argc, argv, "--nth", "180")), nt = atoi(wc_opt(argc, argv, "--threads", "16"));
+    const int nz = atoi(wc_opt(argc, argv, "--nz", "16")), nth = atoi(wc_opt(argc, argv, "--nth", "180")), nt = ufsm_threads(atoi(wc_opt(argc, argv, "--threads", "0")), 16);
     const double sigma = atof(wc_opt(argc, argv, "--sigma", "1.2")), prom = atof(wc_opt(argc, argv, "--prom", "1")), wsc = atof(wc_opt(argc, argv, "--w-scale", "1")), dup = atof(wc_opt(argc, argv, "--dup", "0.5"));
     const double Z = m->D * m->h; double zr0 = 0.05 * Z, zr1 = 0.95 * Z;
     const char *zr = wc_opt(argc, argv, "--zr", nullptr); if (zr && sscanf(zr, "%lf,%lf", &zr0, &zr1) != 2) { fprintf(stderr, "wrap-check: --zr Z0,Z1\n"); return 2; }

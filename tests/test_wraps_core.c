@@ -66,9 +66,9 @@ int main(int argc, char **argv) {
 
     char cmd[2000], o1[600], o2[600], o3[600];
     snprintf(o1, sizeof o1, "%s/centre", base); snprintf(o2, sizeof o2, "%s/p90", base); snprintf(o3, sizeof o3, "%s/zr", base);
-    snprintf(cmd, sizeof cmd, "%s wraps %s %s --step 2 --first 3 --last 3 --threads 4 > /dev/null 2>&1", bin, md, o1); CHECK(run(cmd) == 0, "wraps (default)");
-    snprintf(cmd, sizeof cmd, "%s wraps %s %s --step 2 --first 3 --last 3 --col-r p90 --threads 4 > /dev/null 2>&1", bin, md, o2); CHECK(run(cmd) == 0, "wraps --col-r p90");
-    snprintf(cmd, sizeof cmd, "%s wraps %s %s --step 2 --first 3 --last 3 --col-r p90 --zr %lld,%lld --threads 4 > /dev/null 2>&1", bin, md, o3, ORG[0] + 16, ORG[0] + 48);
+    snprintf(cmd, sizeof cmd, "%s wraps %s %s --step 2 --first 3 --last 3 --col-r centre --min-cm2 0 --threads 4 > /dev/null 2>&1", bin, md, o1); CHECK(run(cmd) == 0, "wraps --col-r centre");
+    snprintf(cmd, sizeof cmd, "%s wraps %s %s --step 2 --first 3 --last 3 --min-cm2 0 --threads 4 > /dev/null 2>&1", bin, md, o2); CHECK(run(cmd) == 0, "wraps --col-r p90");
+    snprintf(cmd, sizeof cmd, "%s wraps %s %s --step 2 --first 3 --last 3 --min-cm2 0 --zr %lld,%lld --threads 4 > /dev/null 2>&1", bin, md, o3, ORG[0] + 16, ORG[0] + 48);
     CHECK(run(cmd) == 0, "wraps --zr");
     wstat a, b, c;
     CHECK(!wrap_stat(o1, 3, fs, &a), "read the default wrap 3");

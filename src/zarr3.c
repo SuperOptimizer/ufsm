@@ -1,4 +1,5 @@
 #include "zarr3.h"
+#include "sysinfo.h"
 #include "json.h"
 #include <errno.h>
 #include <fcntl.h>
@@ -14,6 +15,10 @@
 #include <zstd.h>
 #define VOLCOMP_IMPLEMENTATION
 #include "volcomp.h"
+#include "volcomp_fast.h"
+#include "zshm.h"
+#define XXH_INLINE_ALL
+#include <xxhash.h>
 
 static _Thread_local char errbuf[256];
 const char *z3_error(void) { return errbuf; }
@@ -204,6 +209,7 @@ static void cache_path(const z3 *z, const char *skey, const char *item, char *bu
 
 /* io statistics: chunk reads served from the cache vs fetched from the store (atomic, process-wide) */
 static atomic_uint_fast64_t g_z3_cache_hits, g_z3_store_reads;
+void z3_shared_cache_stats(uint64_t *hits, uint64_t *misses, uint64_t *stored) { zshm_stats(hits, misses, stored); }
 void z3_io_stats(uint64_t *cache_hits, uint64_t *store_reads) { *cache_hits = atomic_load(&g_z3_cache_hits); *store_reads = atomic_load(&g_z3_store_reads); }
 static uint8_t *cache_get(const z3 *z, const char *skey, const char *item, size_t *len) {
     if (!z->cache) return nullptr;
@@ -394,6 +400,25 @@ static int object_missing(store *s, const char *key) {
     return store_is_local(s) ? store_size(s, key) == -2 : store_last_status() == 404;
 }
 
+/* the volcomp substreams (128^3 chunks: 16 z x 32 y slabs, bit bz * 4 + by) under the request box in chunk w: z3_read decodes only
+   those (UFSM_Z3_AUTOSUB=0: whole chunks). A window whose halo reaches 32 voxels into a chunk decodes a quarter of it (predict with
+   window 576 halo 32: 3.4x -> 1.9x the decoded voxels of its interior). 0 = all (no saving, or not a 128^3 chunk). */
+static uint32_t auto_submask(const job *jb, const work *w) {
+    const int on = option_on("UFSM_Z3_AUTOSUB");
+    const z3_meta *m = &jb->z->m;
+    if (!on || m->chunk[0] != 128 || m->chunk[1] != 128 || m->chunk[2] != 128 || m->q < 0 || m->esize != 1) return 0;
+    const int64_t c0[2] = {w->sz * m->shard[0] + (int64_t)w->cz * 128, w->sy * m->shard[1] + (int64_t)w->cy * 128};
+    int64_t a[2], e[2];
+    for (int i = 0; i < 2; i++) {
+        a[i] = jb->o[i] - c0[i]; e[i] = jb->o[i] + jb->n[i] - 1 - c0[i];
+        if (a[i] < 0) a[i] = 0;
+        if (e[i] > 127) e[i] = 127;
+        if (e[i] < a[i]) return 0;
+    }
+    uint32_t mk = 0;
+    for (int64_t bz = a[0] >> 4; bz <= e[0] >> 4; bz++) for (int64_t by = a[1] >> 5; by <= e[1] >> 5; by++) mk |= 1u << (bz * 4 + by);
+    return mk == 0xffffffffu ? 0 : mk;
+}
 static void copy_chunk(const job *jb, const work *w, const uint8_t *chunk) {
     const z3_meta *m = &jb->z->m;
     int64_t c0[3] = {w->sz * m->shard[0] + (int64_t)w->cz * m->chunk[0],
@@ -436,10 +461,27 @@ static int decode_into(const z3 *z, const uint8_t *enc, size_t n, uint8_t *dec, 
         uint32_t mode;
         if (mask && vll_chunk_mode(enc, n, &mode) == VOLCOMP_OK) *mask = mode == VLL_MODE_MASK || mode == VLL_MODE_MASK_LL;
         volcomp_status st;
-        if (submask && submask != 0xffffffffu && cv == VOLCOMP_CHUNK_VOXELS && vll_chunk_mode(enc, n, &mode) == VOLCOMP_OK && (mode == VLL_MODE_LOSSY || mode == VLL_MODE_CODED)) {
+        const int sub = submask && submask != 0xffffffffu;
+        if (cv == VOLCOMP_CHUNK_VOXELS && vll_chunk_mode(enc, n, &mode) == VOLCOMP_OK && mode == VLL_MODE_LOSSY) {
+            /* lossy (CT): the substreams asked for (all for a full read), from the shared cache (zshm.h) or decoded by
+               volcomp_fast.h (the reference's bytes); a partial read leaves the rest 0 */
+            const uint32_t want = sub ? submask : 0xffffffffu;
+            uint32_t need = want;
+            XXH128_hash_t hk = {0, 0};
+            if (sub) memset(dec, 0, cv);
+            if (zshm_on()) {
+                hk = XXH3_128bits(enc, n);
+                for (uint32_t s = 0; s < VF_NSUB; s++) if (want >> s & 1 && zshm_get(hk.low64, hk.high64, s, dec)) need &= ~(1u << s);
+            }
+            st = VOLCOMP_OK;
+            if (need) {
+                vf_parsed p; st = vf_parse(enc, n, &p);
+                if (st == VOLCOMP_OK) st = vfx_decode_subs(&p, need, dec);
+                if (st == VOLCOMP_OK && zshm_on()) for (uint32_t s = 0; s < VF_NSUB; s++) if (need >> s & 1) zshm_put(hk.low64, hk.high64, s, dec);
+            }
+        } else if (sub && cv == VOLCOMP_CHUNK_VOXELS && vll_chunk_mode(enc, n, &mode) == VOLCOMP_OK && mode == VLL_MODE_CODED) {
             memset(dec, 0, cv);   /* only the substreams asked for (z3_read_sub) */
-            if (mode == VLL_MODE_CODED) { vll_parsed lp; st = vll_parse(enc, n, &lp); for (uint32_t s = 0; s < VF_NSUB && st == VOLCOMP_OK; s++) if (submask >> s & 1) st = vll_decode_sub(&lp, s, dec, -1, NULL); }
-            else { vf_parsed p; st = vf_parse(enc, n, &p); for (uint32_t s = 0; s < VF_NSUB && st == VOLCOMP_OK; s++) if (submask >> s & 1) st = vf_decode_sub(&p, s, dec, -1, NULL); }
+            vll_parsed lp; st = vll_parse(enc, n, &lp); for (uint32_t s = 0; s < VF_NSUB && st == VOLCOMP_OK; s++) if (submask >> s & 1) st = vll_decode_sub(&lp, s, dec, -1, NULL);
         } else st = volcomp_decode(enc, n, dec, cv);
         if (st != VOLCOMP_OK) return FAIL("volcomp: %s", volcomp_status_string(st));
         return 0;
@@ -682,7 +724,7 @@ static int run_task(job *jb, int task, uint8_t *fetched, uint8_t *dec, uint8_t *
             const uint8_t *enc = group + (size_t)(w->off - rg->off); size_t n = (size_t)w->len;
             cache_put(z, skey, item, enc, n); atomic_fetch_add(&g_z3_store_reads, 1);
             int msk;
-            if (decode_into(z, enc, n, dec, dctx, scratch, &msk, jb->submask)) { rc = -1; break; }
+            if (decode_into(z, enc, n, dec, dctx, scratch, &msk, jb->submask ? jb->submask : auto_submask(jb, w))) { rc = -1; break; }
             if (msk) mc_put(z, w, dec, cv);
             copy_chunk(jb, w, dec);
         }
@@ -716,7 +758,7 @@ static int run_task(job *jb, int task, uint8_t *fetched, uint8_t *dec, uint8_t *
         }
         cache_put(z, skey, item, b, n);
     }
-    int msk, rc = decode_into(z, b, n, dec, dctx, scratch, &msk, jb->submask);
+    int msk, rc = decode_into(z, b, n, dec, dctx, scratch, &msk, jb->submask ? jb->submask : auto_submask(jb, w));
     free(b);
     if (rc) return -1;
     if (msk && mc_on) mc_put(z, w, dec, cv);
@@ -945,7 +987,7 @@ int z3_read_sub(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int
     }
     job jb = {.z = z, .o = o, .n = n, .out = out, .items = items, .nitems = nitems,
               .ranges = ranges, .nranges = nranges, .submask = submask};
-    if (nthreads <= 0) nthreads = (int)sysconf(_SC_NPROCESSORS_ONLN);
+    if (nthreads <= 0) nthreads = (int)ufsm_ncpu();
     int ntasks = ranges ? nranges : nitems;
     store_req *reqs = nullptr; int *task_of = nullptr; char (*rkeys)[1200] = nullptr; int nreq = 0;
     if (batch && ranges && ntasks) {

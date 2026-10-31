@@ -7,6 +7,7 @@
          the CT sampled along the network normal (the top eigenvector of the cell's n n^T) over +-R, its papyrus peaks counted
          (fit_ct_profile_spacing), spacing = the distance between the first and last peak / (peaks - 1). It does not use the phase. */
 #include "fit.h"
+#include "sysinfo.h"
 #include "fit_terms.h"
 #include "zarr3.h"
 #include "store.h"
@@ -125,7 +126,7 @@ static void *cph_rows(void *a) {
 }
 void fit_ct_phasor(const fit_model *m, const fit_fields *f, const uint8_t *ctm, float phi_pap, uint8_t *opc, uint8_t *ops) {
     cph_job J = {.m = m, .f = f, .ctm = ctm, .phi = phi_pap, .opc = opc, .ops = ops};
-    long nt = sysconf(_SC_NPROCESSORS_ONLN); const char *e = getenv("UFSM_FIT_THREADS"); if (e && atoi(e) > 0) nt = atoi(e); if (nt > 64) nt = 64; if (nt < 1) nt = 1;
+    long nt = ufsm_ncpu(); const char *e = getenv("UFSM_FIT_THREADS"); if (e && atoi(e) > 0) nt = atoi(e); if (nt > 64) nt = 64; if (nt < 1) nt = 1;
     pthread_t th[64]; int up[64] = {0};
     for (int t = 1; t < nt; t++) up[t] = pthread_create(&th[t], nullptr, cph_rows, &J) == 0;
     cph_rows(&J);
@@ -231,7 +232,7 @@ int cmd_ct_fields(int argc, char **argv) {
     }
     const char *root = argv[2], *key = argv[3], *dir = argv[4];
     const double ctum = atof(copt(argc, argv, "--ct-um", "0")), rum = atof(copt(argc, argv, "--radius-um", "200")), prom = atof(copt(argc, argv, "--prom", "1"));
-    const int stride = atoi(copt(argc, argv, "--stride", "2")), nt0 = atoi(copt(argc, argv, "--threads", "8"));
+    const int stride = atoi(copt(argc, argv, "--stride", "2")), nt0 = ufsm_threads(atoi(copt(argc, argv, "--threads", "0")), 8);
     const double pum = atof(copt(argc, argv, "--parity-um", "150"));
     if (!(ctum > 0) || stride < 1) { fprintf(stderr, "ct-fields: --ct-um > 0 and --stride >= 1 needed\n"); return 2; }
     z3 *cz = z3_open(store_open(root), key, copt(argc, argv, "--cache", nullptr));

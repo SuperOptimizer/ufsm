@@ -15,6 +15,7 @@
    replaces the old one, unknown keeps it). Work: per 9.6 shard, y / x bands of --band 4.8 voxels, crop rows streamed in z through
    a ring of 128 output rows on the GPU; crops shared by two bands / shards are recomputed. */
 #include "ink3dext.h"
+#include "sysinfo.h"
 #include "store.h"
 #include "xnet.h"
 #include "z3w.h"
@@ -294,7 +295,7 @@ int cmd_ink3d_ext(int argc, char **argv) {
         p = *e == ',' ? e + 1 : e;
     }
     run_ctx C = {0};
-    C.nth = atoi(opt(argc, argv, "--threads", "8")); C.B = atoi(opt(argc, argv, "--batch", "16")); C.air = atoi(opt(argc, argv, "--air", "25")); C.R = 128; C.net = net;
+    C.nth = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 8); C.B = atoi(opt(argc, argv, "--batch", "16")); C.air = atoi(opt(argc, argv, "--air", "25")); C.R = 128; C.net = net;
     const int SH = 512, band = atoi(opt(argc, argv, "--band", "1024")), stride = atoi(opt(argc, argv, "--stride", "32"));
     const float oq = (float)atof(opt(argc, argv, "--q", "0"));   /* output volcomp q (0 = lossless; a rerun must keep the group's q) */
     if (stride < 1 || stride > I3_OUT) { fprintf(stderr, "ink3d-ext: --stride in 1 .. %d\n", I3_OUT); return 2; }
@@ -418,7 +419,7 @@ int cmd_vol_cmp(int argc, char **argv) {
         return 2;
     }
     const int au = atoi(opt(argc, argv, "--a-unknown", "255")), bu = atoi(opt(argc, argv, "--b-unknown", "-1")), bf = atoi(opt(argc, argv, "--b-floor", "-1"));
-    const int nb = atoi(opt(argc, argv, "--bins", "16")), nth = atoi(opt(argc, argv, "--threads", "8")); const char *cache = opt(argc, argv, "--cache", nullptr);
+    const int nb = atoi(opt(argc, argv, "--bins", "16")), nth = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 8); const char *cache = opt(argc, argv, "--cache", nullptr);
     vsrc A = {0}, Bv = {0};
     if (vsrc_open(&A, argv[2], argv[3], cache)) { fprintf(stderr, "vol-cmp: %s %s: %s %s\n", argv[2], argv[3], z3_error(), z2_error()); return 1; }
     if (vsrc_open(&Bv, argv[4], argv[5], cache)) { fprintf(stderr, "vol-cmp: %s %s: %s %s\n", argv[4], argv[5], z3_error(), z2_error()); return 1; }

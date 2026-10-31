@@ -1,4 +1,5 @@
 #include "tiffw.h"
+#include "sysinfo.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,42 +13,73 @@ static double g_sfc_err;   /* (tifxyz_set_sfc, below) */
 static void put16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
 static void put32(uint8_t *p, uint32_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24); }
 
-/* strips compressed on threads a batch at a time and written in order (the header's IFD offset patched at the end): the same
-   bytes as compressing every strip first, in bounded memory */
-typedef struct { const uint8_t *data; size_t row; int h, rps, s0, s1, deflate; uint8_t **strip; uint32_t *len; _Atomic int next, fail; } tw_job;
+/* strips compressed on worker threads up to `win` strips ahead of the writer, which writes them in order as they finish (the
+   header's IFD offset patched at the end): the same bytes as compressing every strip first, in bounded memory, with the file
+   writes overlapping the compression (was: a batch at a time, threads joined and the batch written before the next started) */
+typedef struct {
+    const uint8_t *data; size_t row; int h, rps, ns, win, deflate;
+    uint8_t **strip; uint32_t *len; uint8_t *done;
+    int next, written, fail;   /* under mu */
+    pthread_mutex_t mu; pthread_cond_t cv_done, cv_room;
+} tw_job;
 static void *tw_worker(void *arg) {
     tw_job *J = arg;
-    for (int s; (s = J->s0 + atomic_fetch_add(&J->next, 1)) < J->s1;) {
+    for (;;) {
+        pthread_mutex_lock(&J->mu);
+        while (J->next < J->ns && J->next >= J->written + J->win && !J->fail) pthread_cond_wait(&J->cv_room, &J->mu);
+        if (J->next >= J->ns || J->fail) { pthread_mutex_unlock(&J->mu); return nullptr; }
+        const int s = J->next++;
+        pthread_mutex_unlock(&J->mu);
         const int r0 = s * J->rps, nr = r0 + J->rps <= J->h ? J->rps : J->h - r0; const size_t raw = J->row * nr; const uint8_t *src = J->data + J->row * r0;
-        uint8_t **o = &J->strip[s - J->s0]; uint32_t *l = &J->len[s];
-        if (!J->deflate) { *o = malloc(raw); if (!*o) { atomic_store(&J->fail, 1); continue; } memcpy(*o, src, raw); *l = (uint32_t)raw; continue; }
-        uLongf cap = compressBound(raw); *o = malloc(cap);
-        if (!*o || compress2(*o, &cap, src, raw, 6) != Z_OK) { atomic_store(&J->fail, 1); continue; }
-        *l = (uint32_t)cap;
+        uLongf cap = compressBound(raw); uint8_t *o = malloc(cap); int bad = !o || compress2(o, &cap, src, raw, 6) != Z_OK;
+        pthread_mutex_lock(&J->mu);
+        J->strip[s % J->win] = o; J->len[s] = (uint32_t)cap; J->done[s % J->win] = 1;
+        if (bad) J->fail = 1;
+        pthread_cond_broadcast(&J->cv_done);
+        pthread_mutex_unlock(&J->mu);
     }
-    return nullptr;
 }
 int tiffw_write(const char *path, int w, int h, int fmt, const void *data, int deflate) {
     if (w <= 0 || h <= 0 || (fmt != 1 && fmt != 3)) return -1;
     const int bps = fmt == 1 ? 1 : 4, rps = 64, ns = (h + rps - 1) / rps;
     const size_t row = (size_t)w * bps;
-    long nc = sysconf(_SC_NPROCESSORS_ONLN); const char *te = getenv("UFSM_TIFF_THREADS"); if (te && atoi(te) > 0) nc = atoi(te);
-    const int nt = nc < 1 ? 1 : nc > 16 ? 16 : (int)nc, batch = nt * 4;
-    uint32_t *len = calloc(ns, sizeof *len), *soff = calloc(ns, sizeof *soff); uint8_t **strip = calloc(batch, sizeof *strip);
-    FILE *f = len && soff && strip ? fopen(path, "wb") : nullptr;
+    long nc = ufsm_ncpu(); const char *te = getenv("UFSM_TIFF_THREADS"); if (te && atoi(te) > 0) nc = atoi(te);
+    const int nt = nc < 1 ? 1 : nc > 16 ? 16 : (int)nc, win = nt * 4;
+    uint32_t *len = calloc(ns, sizeof *len), *soff = calloc(ns, sizeof *soff); uint8_t **strip = calloc(win, sizeof *strip), *done = calloc(win, 1);
+    FILE *f = len && soff && strip && done ? fopen(path, "wb") : nullptr;
     int rc = f ? 0 : -1;
     uint8_t hd[8] = {'I', 'I', 42, 0}; size_t off = 8;
     if (!rc && fwrite(hd, 1, 8, f) != 8) rc = -1;   /* the IFD offset (bytes 4..7) is patched below */
-    for (int s0 = 0; s0 < ns && !rc; s0 += batch) {
-        tw_job J = {(const uint8_t *)data, row, h, rps, s0, s0 + batch < ns ? s0 + batch : ns, deflate, strip, len, 0, 0};
-        const int k = J.s1 - J.s0, nth = nt < k ? nt : k; pthread_t th[16];
-        for (int t = 0; t < nth; t++) pthread_create(&th[t], nullptr, tw_worker, &J);
-        for (int t = 0; t < nth; t++) pthread_join(th[t], nullptr);
-        if (atomic_load(&J.fail)) rc = -1;
-        for (int s = J.s0; s < J.s1; s++) {
-            if (!rc) { soff[s] = (uint32_t)off; if (off + len[s] > 0xffffffffull || fwrite(strip[s - J.s0], 1, len[s], f) != len[s]) rc = -1; off += len[s]; }
-            free(strip[s - J.s0]); strip[s - J.s0] = nullptr;
+    if (!rc && !deflate) {   /* uncompressed: the rows as they are */
+        for (int s = 0; s < ns && !rc; s++) {
+            const int r0 = s * rps, nr = r0 + rps <= h ? rps : h - r0; const size_t raw = row * nr;
+            soff[s] = (uint32_t)off; len[s] = (uint32_t)raw;
+            if (off + raw > 0xffffffffull || fwrite((const uint8_t *)data + row * r0, 1, raw, f) != raw) rc = -1;
+            off += raw;
         }
+    } else if (!rc) {
+        tw_job J = {(const uint8_t *)data, row, h, rps, ns, win, deflate, strip, len, done, 0, 0, 0,
+                    PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, PTHREAD_COND_INITIALIZER};
+        const int nth = nt < ns ? nt : ns; pthread_t th[16];
+        for (int t = 0; t < nth; t++) pthread_create(&th[t], nullptr, tw_worker, &J);
+        for (int s = 0; s < ns; s++) {
+            pthread_mutex_lock(&J.mu);
+            while (!J.done[s % win] && !J.fail) pthread_cond_wait(&J.cv_done, &J.mu);
+            uint8_t *o = J.strip[s % win]; const int ok = J.done[s % win] && !J.fail;
+            pthread_mutex_unlock(&J.mu);
+            if (!ok) { rc = -1; break; }
+            soff[s] = (uint32_t)off; if (off + len[s] > 0xffffffffull || fwrite(o, 1, len[s], f) != len[s]) rc = -1;
+            off += len[s];
+            pthread_mutex_lock(&J.mu);
+            free(o); J.strip[s % win] = nullptr; J.done[s % win] = 0; J.written = s + 1;
+            if (rc) J.fail = 1;
+            pthread_cond_broadcast(&J.cv_room);
+            pthread_mutex_unlock(&J.mu);
+            if (rc) break;
+        }
+        pthread_mutex_lock(&J.mu); J.fail |= rc != 0; pthread_cond_broadcast(&J.cv_room); pthread_mutex_unlock(&J.mu);
+        for (int t = 0; t < nth; t++) pthread_join(th[t], nullptr);
+        for (int k = 0; k < win; k++) { free(J.strip[k]); J.strip[k] = nullptr; }
     }
     if (!rc) {
         /* strips, then the IFD (12 entries) and the offset / byte-count arrays */
@@ -76,7 +108,7 @@ int tiffw_write(const char *path, int w, int h, int fmt, const void *data, int d
         if (!rc && (fseek(f, 4, SEEK_SET) || fwrite(hd + 4, 1, 4, f) != 4)) rc = -1;
     }
     if (f && fclose(f)) rc = -1;
-    free(strip); free(len); free(soff);
+    free(strip); free(done); free(len); free(soff);
     return rc;
 }
 

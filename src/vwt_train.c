@@ -10,6 +10,7 @@
    RUNDIR: latest.vwt (+ step_NNNNNN.vwt every --ckpt-every; the EMA weights and the optimiser state ride along), log.tsv; resumes
    from latest.vwt when present; a file RUNDIR/STOP saves and exits. */
 #include "vwt.h"
+#include "sysinfo.h"
 #include "attn.h"
 #include "nn.h"
 #if __has_include("wtrunk.h")
@@ -218,7 +219,7 @@ int cmd_vwt_train(int argc, char **argv) {
             for (size_t k = 0; k < nn; k++) if (!q->comp[k]) q->ph[k] = 0.f;
         }
     }
-    vws *S = ofd ? nullptr : vws_open(src, T, L, (float)atof(opt(argc, argv, "--tilt", "15")), atoi(opt(argc, argv, "--threads", "12")), (unsigned)(atoi(opt(argc, argv, "--seed", "1")) * 7919 + step), 1);
+    vws *S = ofd ? nullptr : vws_open(src, T, L, (float)atof(opt(argc, argv, "--tilt", "15")), ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 12), (unsigned)(atoi(opt(argc, argv, "--seed", "1")) * 7919 + step), 1);
     if (!S && !ofd) { fprintf(stderr, "vwt-train: cannot open sources %s\n", src); return 1; }
     const size_t n = (size_t)T * T * L;
     uint8_t *imd = nn_malloc(n), *vad = nn_malloc(n); float *tg = nn_malloc(n * 4), *pw = nn_malloc(n * 4), *gph = nn_malloc(n * 4), *ginc = nn_malloc(n * 4);

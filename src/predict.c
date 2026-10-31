@@ -1,6 +1,7 @@
 /* ufsm predict: sliding-window inference of a checkpoint over a CT box, written as a volcomp zarr v3
    probability pyramid (uint8 p*255, q=8) in the published layout. */
 #include "nn.h"
+#include "sysinfo.h"
 #include "checkpoint.h"
 #include "sheet.h"
 #include <zstd.h>
@@ -35,7 +36,7 @@ static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
 /* tile read-ahead: a reader thread fills a ring of CT windows (with their nonzero count and intensity sums) in tile
    order while the main thread runs the network on the previous one */
 #define NSLOT 3
-typedef struct { int64_t tz, ty, tx; int64_t shard; } tile_t;
+typedef struct { int64_t tz, ty, tx; int64_t shard; int noout; } tile_t;   /* noout: --feather, computed for its spills only (written already / another worker's) */
 typedef struct {
     z3 *ct; const int64_t *bo; int W, Wz, nthreads;   /* windows Wz x W x W */
     tile_t *tiles; long ntiles;
@@ -114,6 +115,147 @@ static int writer_submit(writer_t *W, int k, int64_t sz, int64_t sy, int64_t sx)
     pthread_mutex_unlock(&W->mu);
     return atomic_load(&W->failed);
 }
+/* predict --feather B: seam-free single pass. Windows on the shard grid (interior S = k shards) in z-y-x order; each window's prediction
+   E over [I, I + S + B) per axis (its interior plus B voxels of its upper halo; B <= halo) is downloaded. The output over the interior
+   is E itself except in the lower shell (any coordinate < B), where the earlier windows' upper spills are blended in: weight of the
+   window shifted back by delta (delta_d in {0,1}) = prod_d (delta_d ? 1 - u(v_d) : u(v_d)), u(j) = sin^2(pi/2 (j + .5) / B) for j < B
+   (else 1 for delta_d = 0, 0 for delta_d = 1), normalized over the windows present (air / box edges). The transition is a smooth ramp
+   of B voxels just above every window border; only one-sided spills of earlier windows are held (an upper z slab per window of the
+   current and previous window layer, an upper y slab per window of this and the previous row, the previous window's upper x slab). */
+typedef struct { int64_t id; uint8_t *p; } fe_slot;
+typedef struct {
+    int S, B, E;                  /* interior, band, S + B */
+    int64_t nss[3];               /* windows per axis */
+    fe_slot *zs, *ys, xs;         /* zs[2][ny*nx] (layer parity), ys[2][nx] (row parity) */
+    const uint8_t *e;             /* this window's E (E^3, pinned) */
+    const uint8_t *nb[8];         /* the spill source of the window shifted back by delta (bit 0 x, 1 y, 2 z), nullptr = absent */
+    float u[2][1024];             /* [0] own weight u(j), [1] = 1 - u(j), j < B */
+    int64_t n[3];                 /* the interior clipped to the box */
+    uint8_t *out; int64_t oo[3], on[3]; int osh;   /* output: shard buffer (osh^3) at interior offset oo, extent on */
+} feather_t;
+static uint8_t fe_val(const feather_t *F, int d, int z, int y, int x) {   /* the value of window (back by d) at this window's interior voxel */
+    const int S = F->S, E = F->E, B = F->B;
+    const uint8_t *p = F->nb[d];
+    if (!d) return F->e[((size_t)z * E + y) * E + x];
+    const int uz = z + (d & 4 ? S : 0), uy = y + (d & 2 ? S : 0), ux = x + (d & 1 ? S : 0);
+    if (uz >= S) return p[((size_t)(uz - S) * E + uy) * E + ux];          /* its z slab: B x E x E */
+    if (uy >= S) return p[((size_t)uz * B + (uy - S)) * E + ux];          /* its y slab: S x B x E */
+    return p[((size_t)uz * S + uy) * B + (ux - S)];                       /* its x slab: S x S x B */
+}
+static uint8_t fe_blend(const feather_t *F, int z, int y, int x) {   /* a lower-shell voxel: the normalized blend over the windows present */
+    const int B = F->B; float s = 0, w = 0;
+    for (int d = 0; d < 8; d++) {
+        if (d && !F->nb[d]) continue;
+        const int dz = d >> 2 & 1, dy = d >> 1 & 1, dx = d & 1;
+        if ((dz && z >= B) || (dy && y >= B) || (dx && x >= B)) continue;
+        const float wi = (z < B ? F->u[dz][z] : 1.f) * (y < B ? F->u[dy][y] : 1.f) * (x < B ? F->u[dx][x] : 1.f);
+        s += wi * fe_val(F, d, z, y, x); w += wi;
+    }
+    return w > 0 ? (uint8_t)fminf(255.f, s / w + 0.5f) : 0;
+}
+static void fe_rows(void *a, int r0, int r1, int t) {   /* rows r = lz * on[1] + ly (the lower-shell rows spread over every thread) */
+    (void)t; const feather_t *F = a; const int B = F->B, E = F->E, sh = F->osh;
+    const int64_t nr = F->on[0] * F->on[1];
+    for (int q = r0; q < r1; q++) {   /* (q -> r: times the prime 2^31 - 1 > nr, a bijection, so each thread's range mixes shell and core rows) */
+        const int64_t r = (int64_t)((uint64_t)q * 2147483647u % (uint64_t)nr), lz = r / F->on[1], ly = r % F->on[1];
+        const int z = (int)(F->oo[0] + lz), y = (int)(F->oo[1] + ly), x0 = (int)F->oo[2], nx = (int)F->on[2];
+        uint8_t *o = F->out + ((size_t)lz * sh + ly) * sh;
+        const uint8_t *er = F->e + ((size_t)z * E + y) * E + x0;
+        if (z < B || y < B) { for (int lx = 0; lx < nx; lx++) o[lx] = fe_blend(F, z, y, x0 + lx); continue; }
+        int lx = 0;
+        for (; lx < nx && x0 + lx < B; lx++) o[lx] = fe_blend(F, z, y, x0 + lx);   /* (the x shell), the rest this window's own */
+        if (lx < nx) memcpy(o + lx, er + lx, (size_t)(nx - lx));
+    }
+}
+static int feather_init(feather_t *F, int S, int B, const int64_t nss[3]) {
+    memset(F, 0, sizeof *F); F->S = S; F->B = B; F->E = S + B;
+    for (int d = 0; d < 3; d++) F->nss[d] = nss[d];
+    for (int j = 0; j < B; j++) { const double s = sin(M_PI / 2 * (j + 0.5) / B); F->u[0][j] = (float)(s * s); F->u[1][j] = (float)(1 - s * s); }
+    F->zs = calloc((size_t)(2 * nss[1] * nss[2] + 2 * nss[2]), sizeof *F->zs); F->ys = F->zs + 2 * nss[1] * nss[2];
+    if (!F->zs) return 1;
+    for (int64_t k = 0; k < 2 * nss[1] * nss[2] + 2 * nss[2]; k++) F->zs[k].id = -1;
+    F->xs.id = -1; return 0;
+}
+static void feather_free(feather_t *F) {
+    if (!F->zs) return;
+    for (int64_t k = 0; k < 2 * F->nss[1] * F->nss[2] + 2 * F->nss[2]; k++) free(F->zs[k].p);
+    free(F->xs.p); free(F->zs); F->zs = nullptr;
+}
+/* the spill sources of window (a, b, c) (window grid), before it is blended */
+static void feather_lookup(feather_t *F, int64_t a, int64_t b, int64_t c) {
+    const int64_t ny = F->nss[1], nx = F->nss[2];
+    for (int d = 1; d < 8; d++) {
+        const int64_t qa = a - (d >> 2 & 1), qb = b - (d >> 1 & 1), qc = c - (d & 1);
+        F->nb[d] = nullptr;
+        if (qa < 0 || qb < 0 || qc < 0) continue;
+        const int64_t id = (qa * ny + qb) * nx + qc; const fe_slot *s;
+        if (d & 4) s = &F->zs[(qa & 1) * ny * nx + qb * nx + qc];
+        else if (d & 2) s = &F->ys[(qb & 1) * nx + qc];
+        else s = &F->xs;
+        if (s->id == id) F->nb[d] = s->p;
+    }
+}
+/* keep window (a, b, c)'s upper slabs of E for the windows after it; 1 on out of memory */
+static int feather_keep(feather_t *F, int64_t a, int64_t b, int64_t c) {
+    const int64_t ny = F->nss[1], nx = F->nss[2], id = (a * ny + b) * nx + c; const int S = F->S, B = F->B, E = F->E;
+    fe_slot *sz = &F->zs[(a & 1) * ny * nx + b * nx + c], *sy = &F->ys[(b & 1) * nx + c], *sx = &F->xs;
+    if (!sz->p && !(sz->p = malloc((size_t)B * E * E))) return 1;
+    if (!sy->p && !(sy->p = malloc((size_t)S * B * E))) return 1;
+    if (!sx->p && !(sx->p = malloc((size_t)S * S * B))) return 1;
+    memcpy(sz->p, F->e + (size_t)S * E * E, (size_t)B * E * E); sz->id = id;
+    for (int z = 0; z < S; z++) memcpy(sy->p + (size_t)z * B * E, F->e + ((size_t)z * E + S) * E, (size_t)B * E);
+    sy->id = id;
+    for (int z = 0; z < S; z++) for (int y = 0; y < S; y++) memcpy(sx->p + ((size_t)z * S + y) * B, F->e + ((size_t)z * E + y) * E + S, (size_t)B);
+    sx->id = id;
+    return 0;
+}
+/* the blend + shard hand-off of --feather windows on a thread of its own (windows in order; two pinned E buffers), so the GPU runs the
+   next window meanwhile (the blend was 0.34 s per 576^3 window on the laptop, more than the forward) */
+typedef struct { int k; int64_t a, b, c; int noout; } fe_job;
+typedef struct {
+    feather_t *F; writer_t *WR; int sb; int kss, shard; const int64_t *ns, *bn;
+    uint8_t *fh[2]; int busy[2];
+    fe_job q[2]; int qh, qn, stop, failed;
+    pthread_mutex_t mu; pthread_cond_t cv; pthread_t th;
+} fe_worker;
+static void *fe_main(void *arg) {
+    fe_worker *W = arg; feather_t *F = W->F; const int kss = W->kss, shard = W->shard;
+    for (;;) {
+        pthread_mutex_lock(&W->mu);
+        while (!W->qn && !W->stop) pthread_cond_wait(&W->cv, &W->mu);
+        if (!W->qn) { pthread_mutex_unlock(&W->mu); return nullptr; }
+        const fe_job j = W->q[W->qh];
+        pthread_mutex_unlock(&W->mu);
+        int bad = 0;
+        F->e = W->fh[j.k]; feather_lookup(F, j.a, j.b, j.c);
+        if (!j.noout) for (int64_t qz = j.a * kss; qz < j.a * kss + kss && qz < W->ns[0] && !bad; qz++) for (int64_t qy = j.b * kss; qy < j.b * kss + kss && qy < W->ns[1] && !bad; qy++)
+        for (int64_t qx = j.c * kss; qx < j.c * kss + kss && qx < W->ns[2] && !bad; qx++) {
+            const int64_t q[3] = {qz, qy, qx}, Q[3] = {j.a, j.b, j.c}; int part_sh = 0;
+            for (int d = 0; d < 3; d++) {
+                F->oo[d] = (q[d] - Q[d] * kss) * shard;
+                F->on[d] = W->bn[d] - q[d] * shard < shard ? W->bn[d] - q[d] * shard : shard;
+                part_sh |= F->on[d] < shard;
+            }
+            uint8_t *sbuf = W->WR->buf[W->sb];
+            if (part_sh) memset(sbuf, 0, W->WR->bytes);
+            F->out = sbuf; F->osh = shard;
+            fit_par((int)(F->on[0] * F->on[1]), fe_rows, F);
+            if (writer_submit(W->WR, W->sb, qz, qy, qx)) bad = 1;
+            W->sb = writer_next(W->WR, W->sb);
+        }
+        if (!bad && feather_keep(F, j.a, j.b, j.c)) bad = 2;
+        pthread_mutex_lock(&W->mu);
+        if (bad) W->failed = bad;
+        W->busy[j.k] = 0; W->qh = (W->qh + 1) % 2; W->qn--;
+        pthread_cond_broadcast(&W->cv); pthread_mutex_unlock(&W->mu);
+    }
+}
+static int fe_wait_idle(fe_worker *W) {   /* every queued window blended and handed to the writer; the failure code */
+    pthread_mutex_lock(&W->mu);
+    while (W->qn) pthread_cond_wait(&W->cv, &W->mu);
+    const int f = W->failed; pthread_mutex_unlock(&W->mu);
+    return f;
+}
 /* fit-field accumulators (12 planes, src/nn_fit.cu nn_fit_accum) of nf cells -> the 10 uint8 fit-field arrays */
 static void fit_finalize(const float *acc, size_t nf, int h, uint8_t *const a[10]) {
     for (size_t i = 0; i < nf; i++) {
@@ -191,7 +333,7 @@ static int ffz_flush(z3w *const zw[FFZ_MAXP], uint8_t *const sl[FFZ_MAXP], int64
     }
     ffz_job J = {.zw = zw, .sl = sl, .slab = slab, .F = F, .FS = FS, .FZ = FZ, .nrow = nrow, .nx = (F[2] + FS - 1) / FS, .rq = rq, .ry = ry, .rg = rg};
     atomic_store(&J.next, 0); atomic_store(&J.fail, 0);
-    long nt = sysconf(_SC_NPROCESSORS_ONLN); if (ntmax > 0 && nt > ntmax) nt = ntmax; if (nt > 64) nt = 64; if (nt < 1) nt = 1;
+    long nt = ufsm_ncpu(); if (ntmax > 0 && nt > ntmax) nt = ntmax; if (nt > 64) nt = 64; if (nt < 1) nt = 1;
     pthread_t th[64]; int up[64] = {0};
     for (int i = 1; i < nt; i++) up[i] = pthread_create(&th[i], nullptr, ffz_worker, &J) == 0;
     ffz_worker(&J);
@@ -304,6 +446,21 @@ static const char *opt(int argc, char **argv, const char *name, const char *dflt
     return dflt;
 }
 
+/* --occupancy: any nonzero voxel of the coarse level (factor f, read over [o, o + n)) under the level region [g0, g1), one coarse voxel of margin */
+static int occ_any(const uint8_t *ob, const int64_t o[3], const int64_t n[3], int f, const int64_t g0[3], const int64_t g1[3]) {
+    int64_t a[3], b[3];
+    for (int d = 0; d < 3; d++) {
+        a[d] = g0[d] / f - 1 - o[d]; b[d] = (g1[d] + f - 1) / f + 1 - o[d];
+        if (a[d] < 0) a[d] = 0;
+        if (b[d] > n[d]) b[d] = n[d];
+        if (b[d] <= a[d]) return 0;
+    }
+    for (int64_t z = a[0]; z < b[0]; z++) for (int64_t y = a[1]; y < b[1]; y++) {
+        const uint8_t *r = ob + ((size_t)z * n[1] + y) * n[2];
+        for (int64_t x = a[2]; x < b[2]; x++) if (r[x]) return 1;
+    }
+    return 0;
+}
 static int parse_grid_origin(const char *text, int64_t origin[3]) {
     for (int d = 0; d < 3; d++) {
         char *end; errno = 0;
@@ -517,6 +674,8 @@ int cmd_predict(int argc, char **argv) {
                         "       [--input-gain G] [--input-bias B]   CT = G * zscore(CT) + B; radial inputs and material mask unchanged\n"
                         "       [--gpus 0,1]   one worker per GPU over the shards of the same output (needs --box)\n"
                         "       [--split z --gpus 0,1]   both GPUs on every window, one z half each (window a multiple of 2^levels; default window shard + 128, halo 64)\n"
+                        "       [--feather B]   seam-free single pass: each window border blended over B voxels (sin^2 ramp, B <= halo) from the earlier\n"
+                        "                       windows' halo predictions; window - 2 halo = k * shard on the shard grid; --gpus deal contiguous z layers\n"
                         "       [--channel 0]   output channel written (band_affinity checkpoints: 1..6 = affinities z1 y1 x1 z8 y8 x8)\n"
                         "       [--fit-fields DIR] [--fit-h 8]   task unwrap checkpoints: also the winding fitter's input fields of the box (ufsm fit DIR)\n"
                         "       [--fit-zarr DIR]                 the same fields as zarr arrays, flushed slab by slab (whole volumes)\n"
@@ -568,7 +727,7 @@ int cmd_predict(int argc, char **argv) {
     for (int i = 0; i < SA_N; i++) { char f[48]; snprintf(f, sizeof f, "--aug-%s-s", scan_aug_names[i]); dg.s[i] = (float)atof(opt(argc, argv, f, "0")); }
     if (*opt(argc, argv, "--aug-hist", "") && scan_aug_load_hist(opt(argc, argv, "--aug-hist", ""), &dg)) { fprintf(stderr, "predict: --aug-hist: cannot read the file\n"); return 2; }
     const int degrade = scan_aug_enabled(&dg); const uint64_t dg_seed = strtoull(opt(argc, argv, "--aug-seed", "1"), nullptr, 10);
-    int nthreads = atoi(opt(argc, argv, "--threads", "16"));
+    int nthreads = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 16);
     const int use_ema = atoi(opt(argc, argv, "--ema", "1")) != 0;
     const char *blend_s = opt(argc, argv, "--ema-blend", nullptr);   /* tail-average blend: a x final weights + (1 - a) x EMA (modded-nanogpt 0.35) */
     const float ema_blend = blend_s ? (float)atof(blend_s) : -1.f;
@@ -597,6 +756,7 @@ int cmd_predict(int argc, char **argv) {
     const int ffzm = ffz != nullptr;
     /* --tta K: the fit fields averaged over K window symmetries (src/tta.h; identity first); the probability output is the last pass */
     const int tta = atoi(opt(argc, argv, "--tta", "1"));
+    const int fea = atoi(opt(argc, argv, "--feather", "0"));   /* --feather B (above) */
     if (tta < 1 || tta > TTA_MAX || (tta > 1 && !ffd)) { fprintf(stderr, "predict: --tta 1..%d, with --fit-fields / --fit-zarr\n", TTA_MAX); return 2; }
     if (tta > 1 && ffct) { fprintf(stderr, "predict: --tta with --fit-ct is not supported (the CT planes pool one pass); add them later with ufsm ct-fields\n"); return 2; }
     float q = (float)atof(opt(argc, argv, "--q", "8"));
@@ -640,6 +800,12 @@ int cmd_predict(int argc, char **argv) {
     if (out_ch < 0 || out_ch >= nout) { fprintf(stderr, "predict: --channel %d outside the checkpoint's %d outputs\n", out_ch, nout); return 2; }
     const char *sweep_out = opt(argc, argv, "--cond-sweep", nullptr);   /* train --cond checkpoints: conditioned inference (src/sweep.h) */
     if (sweep_out && (cfg.cin != 7 || cfg.cout < 15 || half || sheet_task || ffd)) { fprintf(stderr, "predict: --cond-sweep needs a train --cond checkpoint (7 inputs, 15 outputs), no --fit-fields\n"); return 2; }
+    { const char *gl = opt(argc, argv, "--gpus", nullptr);   /* --gpus a,b (workers, not --split): each would write (and fill) the whole field arrays */
+      if (ffd && gl && strchr(gl, ',') && !opt(argc, argv, "--split", nullptr)) {
+          fprintf(stderr, "predict: --gpus with --fit-zarr / --fit-fields is not supported (each worker writes the whole field set): run one predict per GPU on z-halves "
+                          "of the box (--grid-origin anchored) and join them with scripts/unroll/fields_cat.sh\n");
+          return 2;
+      } }
     if (ffd && (cfg.cout < 11 || half || sheet_task)) { fprintf(stderr, "predict: --fit-fields needs a task unwrap checkpoint (11+ outputs) at full resolution\n"); return 2; }
     /* the head layout: task unwrap (recto 0, ink 1, phase 2-3, normal 4-9, density 10) or unwrap2 (phase 0-1, normal 2-7, density 8,
        winding mod 4 9-10: no recto; the winding mod 4 pooled into the relative planes dz dy dx dq over --fit-w4-d voxels) */
@@ -950,6 +1116,7 @@ int cmd_predict(int argc, char **argv) {
     /* --resume / --occupancy: the box's shards not to compute (1 = already written, 2 = air: the outputs are masked to CT > 0, so a shard
        whose own region is zero on the coarse level, one coarse voxel of margin, predicts nothing) */
     uint8_t *sskip = nullptr; long nresumed = 0, nocc = 0;
+    uint8_t *occb = nullptr; int64_t occo[3] = {0, 0, 0}, occn[3] = {0, 0, 0}; int occf = 1;   /* --occupancy: the coarse level over the box (tile tests below) */
     if (resume || occl >= 0) {
         sskip = calloc((size_t)(ns[0] * ns[1] * ns[2]), 1);
         if (!sskip) { fprintf(stderr, "predict: out of memory\n"); return 1; }
@@ -992,7 +1159,8 @@ int cmd_predict(int argc, char **argv) {
                 }
                 if (!hit) { *e = 2; nocc++; }
             }
-            free(ob); z3_close(oc);
+            occb = ob; occf = f; for (int d = 0; d < 3; d++) { occo[d] = o0[d]; occn[d] = n0[d]; }
+            z3_close(oc);
         }
         fprintf(stderr, "predict: %lld shards in the box: %ld already written (--resume), %ld air on CT level %d (--occupancy), %lld to compute\n",
                 (long long)(ns[0] * ns[1] * ns[2]), nresumed, nocc, occl, (long long)(ns[0] * ns[1] * ns[2]) - nresumed - nocc);
@@ -1001,6 +1169,14 @@ int cmd_predict(int argc, char **argv) {
        written (INFERENCE_MEMORY_PLAN.md, memory into speed); otherwise one or more windows per shard, clipped to it */
     int kss = !slab && !sheet_task && gpath && stride % shard == 0 && stride / shard >= 2 ? stride / shard : 1;
     for (int d = 0; d < 3 && kss > 1; d++) { int64_t ph = grid ? (bo[d] - grid_origin[d]) % stride : 0; if (ph < 0) ph += stride; if (ph) kss = 1; }
+    if (fea) {   /* --feather: the window grid on the shard grid, interior k shards (k >= 1), one GPU path */
+        int bad = fea < 0 || fea > halo || fea > hz || fea > 1024 || slab || sheet_task || !gpath || split || ffd || half || stride % shard || sweep_out;
+        for (int d = 0; d < 3 && !bad; d++) { int64_t ph = grid ? (bo[d] - grid_origin[d]) % stride : 0; if (ph < 0) ph += stride; if (ph) bad = 1; }
+        if (bad) { fprintf(stderr, "predict: --feather B needs 0 < B <= halo (<= 1024), window - 2 halo = k * shard with the box on that grid, the plain device path "
+                               "(no --split, --fit-*, --window-z, half-resolution or winding outputs)\n"); return 2; }
+        kss = stride / shard;
+    }
+    const int sup = kss > 1 || fea > 0;   /* one window per k^3 shards (k = 1 with --feather), placed and written per window */
     int64_t nss[3]; for (int d = 0; d < 3; d++) nss[d] = (ns[d] + kss - 1) / kss;
     float *ffacc = nullptr, *ffacc4 = nullptr; int ffbox[3], ffF[3]; size_t ffn = 0;
     if (ffu2) {   /* the relative planes need the far voxel inside the window: offset <= the halos */
@@ -1077,7 +1253,7 @@ int cmd_predict(int argc, char **argv) {
             if (!ffw.done) { fprintf(stderr, "predict: out of memory\n"); return 1; }
             for (int b = 0; b < 2; b++) { ffw.h[b] = ff8h + (size_t)b * FFZ_MAXP * ffwn; ffw.evs[b] = nn_event_create(); ffw.evd[b] = nn_event_create(); }
             pthread_mutex_init(&ffw.mu, nullptr); pthread_cond_init(&ffw.cv, nullptr); atomic_store(&ffw.fail, 0);
-            { long nc = sysconf(_SC_NPROCESSORS_ONLN); ffw.rnt = nc > 2 ? (int)(nc / 2) : 1; }
+            { long nc = ufsm_ncpu(); ffw.rnt = nc > 2 ? (int)(nc / 2) : 1; }
             if (pthread_create(&ffw_th, nullptr, ffw_main, &ffw) || pthread_create(&ffw.rth, nullptr, ffw_rows, &ffw)) { fprintf(stderr, "predict: cannot start the fit writer\n"); return 1; }
             ffw_on = 1;
         }
@@ -1085,7 +1261,7 @@ int cmd_predict(int argc, char **argv) {
     if (kss > 1) fprintf(stderr, "predict: one window per %d^3 shards (interior %d)\n", kss, stride);
     {   /* the writer ring: one window per k^3 shards hands over k^3 shards at once (2 k^3 buffers: the next window's shards while these
            are compressed); UFSM_PRED_WBUF=N overrides (2 = the previous double buffer) */
-        int nb = kss > 1 && gpath && !split ? 2 * kss * kss * kss : 2;
+        int nb = sup && gpath && !split ? 2 * kss * kss * kss : 2;
         if (getenv("UFSM_PRED_WBUF")) nb = atoi(getenv("UFSM_PRED_WBUF"));
         if (nb < 2) nb = 2;
         if (nb > WBUF_MAX) nb = WBUF_MAX;
@@ -1104,6 +1280,38 @@ int cmd_predict(int argc, char **argv) {
                        but each worker reads the --resume list when it starts, so a shard another worker wrote meanwhile is "written" (1)
                        in a late one only: the deal counts those, then the owner skips them (dealing by the late view left shards to
                        no worker) */
+    int64_t fz0 = 0, fz1 = nss[0];   /* --feather with --gpus: this worker's contiguous window layers (and the layer before them, unwritten) */
+    if (fea && nwork > 1) { fz0 = nss[0] * part / ngpu; fz1 = nss[0] * (part + 1) / ngpu; }
+    uint8_t *fneed = nullptr;   /* --feather: window to write (1), or computed only for the spills of a later one (2) */
+    if (fea) {
+        fneed = calloc((size_t)(nss[0] * nss[1] * nss[2]), 1);
+        if (!fneed) { fprintf(stderr, "predict: out of memory\n"); return 1; }
+        for (int64_t sz = fz0; sz < fz1; sz++) for (int64_t sy = 0; sy < nss[1]; sy++) for (int64_t sx = 0; sx < nss[2]; sx++) {
+            int all = 1;
+            for (int64_t a = sz * kss; a < (sz + 1) * kss && a < ns[0]; a++) for (int64_t b = sy * kss; b < (sy + 1) * kss && b < ns[1]; b++)
+                for (int64_t c = sx * kss; c < (sx + 1) * kss && c < ns[2]; c++) all &= sskip && sskip[(a * ns[1] + b) * ns[2] + c] != 0;
+            if (!all) fneed[(sz * nss[1] + sy) * nss[2] + sx] = 1;
+        }
+        for (int64_t sz = fz0 > 0 ? fz0 - 1 : 0; sz < fz1; sz++) for (int64_t sy = 0; sy < nss[1]; sy++) for (int64_t sx = 0; sx < nss[2]; sx++) {
+            uint8_t *e = &fneed[(sz * nss[1] + sy) * nss[2] + sx]; int air = 1;
+            if (*e) continue;
+            for (int64_t a = sz * kss; a < (sz + 1) * kss && a < ns[0]; a++) for (int64_t b = sy * kss; b < (sy + 1) * kss && b < ns[1]; b++)
+                for (int64_t c = sx * kss; c < (sx + 1) * kss && c < ns[2]; c++) air &= sskip && sskip[(a * ns[1] + b) * ns[2] + c] == 2;
+            if (air) continue;   /* (air: absent, its neighbours renormalize) */
+            for (int d = 1; d < 8 && !*e; d++) {   /* a later neighbour to write needs its spill */
+                const int64_t qa = sz + (d >> 2 & 1), qb = sy + (d >> 1 & 1), qc = sx + (d & 1);
+                if (qa < nss[0] && qb < nss[1] && qc < nss[2] && fneed[(qa * nss[1] + qb) * nss[2] + qc] == 1) *e = 2;
+            }
+        }
+        long nw = 0, nsp = 0; for (int64_t k = 0; k < nss[0] * nss[1] * nss[2]; k++) { nw += fneed[k] == 1; nsp += fneed[k] == 2; }
+        fprintf(stderr, "predict: --feather %d: %ld windows (interior %d) to write, %ld more for their spills only\n", fea, nw, stride, nsp);
+        for (int64_t sz = 0; sz < nss[0]; sz++) for (int64_t sy = 0; sy < nss[1]; sy++) for (int64_t sx = 0; sx < nss[2]; sx++) {
+            const uint8_t e = fneed[(sz * nss[1] + sy) * nss[2] + sx];
+            if (!e) continue;
+            if (rd.ntiles == cap) { cap = cap ? 2 * cap : 1024; rd.tiles = realloc(rd.tiles, (size_t)cap * sizeof *rd.tiles); }
+            rd.tiles[rd.ntiles++] = (tile_t){sz * stride - halo, sy * stride - halo, sx * stride - halo, (sz * nss[1] + sy) * nss[2] + sx, e == 2};
+        }
+    } else
     if (kss > 1) for (int64_t sz = 0; sz < nss[0]; sz++) for (int64_t sy = 0; sy < nss[1]; sy++) for (int64_t sx = 0; sx < nss[2]; sx++) {   /* super-shards */
         int all = 1, air = 1;   /* skipped when every shard of it is; dealt unless every shard is air */
         if (sskip) {
@@ -1114,9 +1322,12 @@ int cmd_predict(int argc, char **argv) {
         if (nwork > 1 && (nwq++ % ngpu) != part) continue;
         if (all) continue;
         if (rd.ntiles == cap) { cap = cap ? 2 * cap : 1024; rd.tiles = realloc(rd.tiles, (size_t)cap * sizeof *rd.tiles); }
-        rd.tiles[rd.ntiles++] = (tile_t){sz * stride - halo, sy * stride - halo, sx * stride - halo, (sz * nss[1] + sy) * nss[2] + sx};
+        rd.tiles[rd.ntiles++] = (tile_t){sz * stride - halo, sy * stride - halo, sx * stride - halo, (sz * nss[1] + sy) * nss[2] + sx, 0};
     }
-    if (kss == 1) for (int64_t sz = 0; sz < ns[0]; sz++) for (int64_t sy = 0; sy < ns[1]; sy++) for (int64_t sx = 0; sx < ns[2]; sx++) {
+    /* (tile tests: not with --gn-save, whose statistics count every non-air window, nor --feather, whose neighbours need a skipped window's spill;
+       UFSM_OCC_TILES=0 off) */
+    const int occt = occb && !gn_save && !fea && !sheet_task && !split && (!getenv("UFSM_OCC_TILES") || ufsm_env_on("UFSM_OCC_TILES")); long nocct = 0;
+    if (!sup) for (int64_t sz = 0; sz < ns[0]; sz++) for (int64_t sy = 0; sy < ns[1]; sy++) for (int64_t sx = 0; sx < ns[2]; sx++) {
         int64_t so[3] = {sz * shard, sy * shard, sx * shard}, se[3], first[3];
         const uint8_t sk = sskip ? sskip[(sz * ns[1] + sy) * ns[2] + sx] : 0;
         if (sk == 2) continue;   /* --occupancy: air */
@@ -1133,15 +1344,37 @@ int cmd_predict(int argc, char **argv) {
         for (int64_t tz = first[0]; tz + hz < se[0]; tz += strd[0])
         for (int64_t ty = first[1]; ty + halo < se[1]; ty += stride)
         for (int64_t tx = first[2]; tx + halo < se[2]; tx += stride) {
+            if (occt) {   /* --occupancy: a window whose interior (in this shard) is air on the coarse level writes nothing (outputs and
+                             fit fields count CT > 0 interior voxels only): not read, not run */
+                const int64_t tw[3] = {tz, ty, tx}; int64_t g0[3], g1[3];
+                for (int d = 0; d < 3; d++) {
+                    const int64_t lo = tw[d] + hal[d], hi = tw[d] + wn[d] - hal[d];
+                    g0[d] = bo[d] + (lo > so[d] ? lo : so[d]); g1[d] = bo[d] + (hi < se[d] ? hi : se[d]);
+                }
+                if (!occ_any(occb, occo, occn, occf, g0, g1)) { nocct++; continue; }
+            }
             if (rd.ntiles == cap) { cap = cap ? 2 * cap : 1024; rd.tiles = realloc(rd.tiles, (size_t)cap * sizeof *rd.tiles); }
-            rd.tiles[rd.ntiles++] = (tile_t){tz, ty, tx, (sz * ns[1] + sy) * ns[2] + sx};
+            rd.tiles[rd.ntiles++] = (tile_t){tz, ty, tx, (sz * ns[1] + sy) * ns[2] + sx, 0};
         }
     }
+    if (occt) fprintf(stderr, "predict: %ld windows to run, %ld more skipped (interior air on CT level %d, --occupancy)\n", rd.ntiles, nocct, occl);
+    free(occb); occb = nullptr;
     for (int k = 0; k < NSLOT; k++) rd.buf[k] = gpath ? nn_host_alloc(w3) : malloc(w3);
     rd.nostats = gpath;
     atomic_store(&rd.filled, 0); atomic_store(&rd.consumed, 0); atomic_store(&rd.failed, 0);
     pthread_mutex_init(&rd.mu, nullptr); pthread_cond_init(&rd.cv, nullptr);
     pthread_t rth; pthread_create(&rth, nullptr, reader_main, &rd);
+    feather_t FE = {0}; const int FEN = stride + fea; uint8_t *fext = nullptr, *fhost = nullptr;   /* --feather: E on the device and pinned on the host */
+    static fe_worker FW; long fe_n = 0;
+    if (fea) {
+        const size_t e3 = (size_t)FEN * FEN * FEN;
+        /* E on the device: in the CT window's buffer (the level-0 skip scratch, dead from the end of the forward until the next window's
+           upload) when it holds E and the logits do not overlap it (checked per window), else its own buffer (1.2 GB at interior 1024) */
+        if (feather_init(&FE, stride, fea, nss) || (!(ct_shared && w3 >= e3) && !(fext = nn_malloc_try(e3))) || !(fhost = nn_host_alloc_try(2 * e3))) { fprintf(stderr, "predict: --feather: out of memory (%.2f GB device + 2x pinned host)\n", e3 / 1e9); return 1; }
+        FW = (fe_worker){.F = &FE, .WR = &WR, .sb = sb, .kss = kss, .shard = shard, .ns = ns, .bn = bn, .fh = {fhost, fhost + e3}};
+        pthread_mutex_init(&FW.mu, nullptr); pthread_cond_init(&FW.cv, nullptr);
+        if (pthread_create(&FW.th, nullptr, fe_main, &FW)) { fprintf(stderr, "predict: cannot start the feather thread\n"); return 1; }
+    }
     int64_t cur_shard = -1, so[3] = {0, 0, 0}, se[3] = {0, 0, 0}, sz = 0, sy = 0, sx = 0;
     int any = 0;
     const int pprof = ufsm_env_on("UFSM_PRED_PROF");
@@ -1173,7 +1406,7 @@ int cmd_predict(int argc, char **argv) {
         if (atomic_load(&rd.failed)) { fprintf(stderr, "%s\n", z3_error()); return 1; }
         const tile_t *t = &rd.tiles[i];
         if (ffrow) {   /* a new row of (super-)shards: the previous row's field shards are final */
-            const int64_t nX = kss > 1 ? nss[2] : ns[2], nY = kss > 1 ? nss[1] : ns[1], row = t->shard / nX;
+            const int64_t nX = sup ? nss[2] : ns[2], nY = sup ? nss[1] : ns[1], row = t->shard / nX;
             if (ffprow >= 0 && row != ffprow) {
                 const int64_t rz = ffprow / nY, ry = ffprow % nY, cz0 = rz * ffrk, slab = cz0 / FZ;
                 ffw_push(&ffw, (ffw_job){.kind = 2, .slab = slab, .q0 = (int)((cz0 - slab * FZ) / FFS), .q1 = (int)((cz0 - slab * FZ + ffrk) / FFS),
@@ -1181,11 +1414,11 @@ int cmd_predict(int argc, char **argv) {
             }
             ffprow = row;
         }
-        if (kss == 1 && t->shard != cur_shard) {   /* new shard: flush the previous one */
+        if (!sup && t->shard != cur_shard) {   /* new shard: flush the previous one */
             if (cur_shard >= 0) {
                 if (sheet_task && sheet_write_shard(out,sheet_shard,shard,sz,sy,sx)) return 1;
                 pt = now();
-                if (any) { if (gpath) writer_d2h(&WR, sb, dsh); if (writer_submit(&WR, sb, sz, sy, sx)) { fprintf(stderr, "%s\n", z3w_error()); return 1; } sb = writer_next(&WR, sb); sbuf = WR.buf[sb]; }
+                if (any) { if (gpath && !WR.skip) writer_d2h(&WR, sb, dsh); if (writer_submit(&WR, sb, sz, sy, sx)) { fprintf(stderr, "%s\n", z3w_error()); return 1; } sb = writer_next(&WR, sb); sbuf = WR.buf[sb]; }
                 else if (WR.donefd >= 0) dprintf(WR.donefd, "%lld %lld %lld\n", (long long)(sz + soff[0]), (long long)(sy + soff[1]), (long long)(sx + soff[2]));   /* all air: done */
                 p_wr += now() - pt;
                 fprintf(stderr, "\rshard %lld/%lld  %ld tiles (%ld air)  %.0fs   ", (long long)(cur_shard + 1), (long long)(ns[0] * ns[1] * ns[2]), ntiles, nskip, now() - t0);
@@ -1194,7 +1427,7 @@ int cmd_predict(int argc, char **argv) {
             cur_shard = t->shard; sz = cur_shard / (ns[1] * ns[2]); sy = (cur_shard / ns[2]) % ns[1]; sx = cur_shard % ns[2];
             so[0] = sz * shard; so[1] = sy * shard; so[2] = sx * shard;
             for (int d = 0; d < 3; d++) se[d] = so[d] + shard < bn[d] ? so[d] + shard : bn[d];
-            if (gpath) nn_zero(dsh, WR.bytes); else memset(sbuf, 0, (size_t)shard * shard * shard);
+            if (gpath) { if (!WR.skip) nn_zero(dsh, WR.bytes); } else memset(sbuf, 0, (size_t)shard * shard * shard);
             any = 0;
             if (sheet_task) for (size_t j=0;j<(size_t)shard*shard*shard;j++) sheet_shard[j]=NAN;
         }
@@ -1355,11 +1588,37 @@ int cmd_predict(int argc, char **argv) {
                     }
                 }
             }
-            if (gpath && kss > 1) {   /* every shard of this super-shard from the one window, written as it is placed */
+            if (gpath && sup && fea) {   /* --feather: E (interior + B upper halo voxels) to the host, blended with the earlier spills */
+                const int64_t SZ = t->shard / (nss[1] * nss[2]), SY = (t->shard / nss[2]) % nss[1], SX = t->shard % nss[2];
+                const size_t e3 = (size_t)FEN * FEN * FEN;
+                uint8_t *fdst = fext;
+                if (ct_shared && w3 >= e3 && ((const uint8_t *)lg + w3 * 4 <= ctd || (const uint8_t *)lg >= ctd + e3)) fdst = ctd;
+                else if (!fdst && !(fdst = fext = nn_malloc_try(e3))) { fprintf(stderr, "predict: --feather: no device memory for E (%.2f GB)\n", e3 / 1e9); return 1; }
+                if (ct_shared) nn_pred_place_m(lg, ctmi, W, halo - fea, -halo, -halo, -halo, FEN, FEN, FEN, FEN, fdst);
+                else nn_pred_place(lg, ctd, W, halo - fea, -halo, -halo, -halo, FEN, FEN, FEN, FEN, fdst);
+                const int fk = (int)(fe_n++ & 1);
+                pthread_mutex_lock(&FW.mu);
+                while (FW.busy[fk] && !FW.failed) pthread_cond_wait(&FW.cv, &FW.mu);   /* (its previous window blended) */
+                const int ff = FW.failed; pthread_mutex_unlock(&FW.mu);
+                if (ff) { fprintf(stderr, "predict: --feather: %s\n", ff == 2 ? "out of host memory for the spills" : z3w_error()); return 1; }
+                if (pprof) { p_copy += now() - pt; pt = now(); }
+                nn_d2h(FW.fh[fk], fdst, e3);
+                const char *e = nn_check();
+                if (e) { fprintf(stderr, "cuda: %s\n", e); return 1; }
+                if (pprof) { p_gpu += now() - pt; pt = now(); }
+                pthread_mutex_lock(&FW.mu);
+                FW.busy[fk] = 1; FW.q[(FW.qh + FW.qn) % 2] = (fe_job){fk, SZ, SY, SX, t->noout}; FW.qn++;
+                pthread_cond_broadcast(&FW.cv); pthread_mutex_unlock(&FW.mu);
+                ntiles++;
+                fprintf(stderr, "\rwindow %ld/%ld  %ld tiles (%ld air)  %.0fs   ", i + 1, rd.ntiles, ntiles, nskip, now() - t0);
+                continue;
+            }
+            if (gpath && sup) {   /* every shard of this super-shard from the one window, written as it is placed */
                 const int64_t SZ = t->shard / (nss[1] * nss[2]), SY = (t->shard / nss[2]) % nss[1], SX = t->shard % nss[2];
                 for (int64_t qz = SZ * kss; qz < SZ * kss + kss && qz < ns[0]; qz++) for (int64_t qy = SY * kss; qy < SY * kss + kss && qy < ns[1]; qy++)
                 for (int64_t qx = SX * kss; qx < SX * kss + kss && qx < ns[2]; qx++) {
                     const int64_t qo[3] = {qz * shard, qy * shard, qx * shard}, qe[3] = {qo[0] + shard < bn[0] ? qo[0] + shard : bn[0], qo[1] + shard < bn[1] ? qo[1] + shard : bn[1], qo[2] + shard < bn[2] ? qo[2] + shard : bn[2]};
+                    if (WR.skip) { if (writer_submit(&WR, sb, qz, qy, qx)) { fprintf(stderr, "%s\n", z3w_error()); return 1; } sb = writer_next(&WR, sb); sbuf = WR.buf[sb]; continue; }   /* --no-out */
                     nn_zero(dsh, WR.bytes);
                     if (ct_shared) nn_pred_place_m(lg, ctmi, W, halo, (int)(tz - qo[0]), (int)(ty - qo[1]), (int)(tx - qo[2]), (int)(qe[0] - qo[0]), (int)(qe[1] - qo[1]), (int)(qe[2] - qo[2]), shard, dsh);
                     else nn_pred_place(lg, ctd, W, halo, (int)(tz - qo[0]), (int)(ty - qo[1]), (int)(tx - qo[2]), (int)(qe[0] - qo[0]), (int)(qe[1] - qo[1]), (int)(qe[2] - qo[2]), shard, dsh);
@@ -1374,8 +1633,9 @@ int cmd_predict(int argc, char **argv) {
                 fprintf(stderr, "\rsuper-shard %ld/%ld  %ld tiles (%ld air)  %.0fs   ", i + 1, rd.ntiles, ntiles, nskip, now() - t0);
                 continue;
             }
-            if (gpath) {   /* interior straight into the device shard buffer */
-                if (ct_shared) nn_pred_place_m_d(lg, ctmi, Wz, W, hz, halo, (int)(tz - so[0]), (int)(ty - so[1]), (int)(tx - so[2]), (int)(se[0] - so[0]), (int)(se[1] - so[1]), (int)(se[2] - so[2]), shard, dsh);
+            if (gpath) {   /* interior straight into the device shard buffer (--no-out: nothing placed) */
+                if (WR.skip) ;
+                else if (ct_shared) nn_pred_place_m_d(lg, ctmi, Wz, W, hz, halo, (int)(tz - so[0]), (int)(ty - so[1]), (int)(tx - so[2]), (int)(se[0] - so[0]), (int)(se[1] - so[1]), (int)(se[2] - so[2]), shard, dsh);
                 else nn_pred_place_d(lg, ctd, Wz, W, hz, halo, (int)(tz - so[0]), (int)(ty - so[1]), (int)(tx - so[2]), (int)(se[0] - so[0]), (int)(se[1] - so[1]), (int)(se[2] - so[2]), shard, dsh);
                 const char *e = nn_check();
                 if (e) { fprintf(stderr, "cuda: %s\n", e); return 1; }
@@ -1405,10 +1665,16 @@ int cmd_predict(int argc, char **argv) {
             if (pprof) p_copy += now() - pt;
         }
     }
+    if (fea) {   /* the feather thread's last windows */
+        const double tw = now(); const int ff = fe_wait_idle(&FW);
+        pthread_mutex_lock(&FW.mu); FW.stop = 1; pthread_cond_broadcast(&FW.cv); pthread_mutex_unlock(&FW.mu); pthread_join(FW.th, nullptr);
+        if (ff) { fprintf(stderr, "predict: --feather: %s\n", ff == 2 ? "out of host memory for the spills" : z3w_error()); return 1; }
+        if (pprof) p_copy += now() - tw;
+    }
     if (pprof) fprintf(stderr, "\npredict profile (s): main: wait-reader %.2f h2d %.2f gpu(fwd+d2h) %.2f interior-copy %.2f writer-wait %.2f fit-writer-wait %.2f | reader: read %.2f stats %.2f slot-wait %.2f | wall %.2f, %ld tiles\n",
                        p_wait, p_h2d, p_gpu, p_copy, p_wr, p_ffw, rd.t_read, rd.t_stats, rd.t_wait, now() - t0, ntiles);
-    if (kss == 1 && cur_shard >= 0 && any) { if (gpath) writer_d2h(&WR, sb, dsh); if (writer_submit(&WR, sb, sz, sy, sx)) { fprintf(stderr, "%s\n", z3w_error()); return 1; } }
-    else if (kss == 1 && cur_shard >= 0 && WR.donefd >= 0) dprintf(WR.donefd, "%lld %lld %lld\n", (long long)(sz + soff[0]), (long long)(sy + soff[1]), (long long)(sx + soff[2]));
+    if (!sup && cur_shard >= 0 && any) { if (gpath && !WR.skip) writer_d2h(&WR, sb, dsh); if (writer_submit(&WR, sb, sz, sy, sx)) { fprintf(stderr, "%s\n", z3w_error()); return 1; } }
+    else if (!sup && cur_shard >= 0 && WR.donefd >= 0) dprintf(WR.donefd, "%lld %lld %lld\n", (long long)(sz + soff[0]), (long long)(sy + soff[1]), (long long)(sx + soff[2]));
     if (sheet_task && cur_shard>=0 && sheet_write_shard(out,sheet_shard,shard,sz,sy,sx)) return 1;
     if (ufsm_env_on("UFSM_PROF")) { fprintf(stderr, "\n"); unet_prof_report(); }
     { const double tf = now();
@@ -1476,7 +1742,7 @@ int cmd_predict(int argc, char **argv) {
     fprintf(stderr, "\rshard %lld/%lld  %ld tiles (%ld air)  %.0fs   \n", (long long)(ns[0] * ns[1] * ns[2]), (long long)(ns[0] * ns[1] * ns[2]), ntiles, nskip, now() - t0);
     z3w_close(w);
     if (WR.donefd >= 0) close(WR.donefd);
-    free(sskip);
+    free(sskip); free(fneed); feather_free(&FE); if (fhost) nn_host_free(fhost); if (fext) nn_free(fext);
     if (gn_save) {
         const size_t ns = unet_gn_nstats(u); float *h = malloc(ns * 4); const long nw = unet_gn_pooled(u, h);
         FILE *f = fopen(gn_save, "wb");

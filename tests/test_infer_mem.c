@@ -280,6 +280,54 @@ int main(void) {
         unet_set_infer_offload(1); unet_set_infer_slab(0); g_lh16 = 0;
         if (unet_set_input_prec(8)) return 2;
     }
+    /* the inference speed paths, each off vs on, bitwise: overlapped slab copies (unet_set_slab_ovl / UFSM_SLAB_OVL: two slab temps,
+       the plane copies on the aux stream), the constant-bank fp16 head (nn_set_conv1_const / UFSM_CONV1_CONST), the frozen GroupNorm
+       statistics replayed from their device copy (predict --gn-frozen). CT-stem windows with fp16 logits as predict runs them: the
+       16-wide ink-like net (one head channel) and a 32-wide 6-level net with 11 head channels (wind96's head), slabs 16 / 64,
+       offload 0 / 1, a second window through the same build */
+    {
+        static const unet_cfg cfgs[2] = {{7, {16, 16, 32, 64, 128, 192, 256}, 4, 2, 8, 0, 0}, {6, {32, 64, 96, 128, 160, 192}, 4, 11, 8, 1, 0}};
+        if (unet_set_input_prec(8)) return 2;
+        nn_init(0); for (int k = 0; k < 4 && nn_check(); k++) {}   /* (split_run_ct's probe of a second GPU leaves an invalid-device error on a one-GPU host: g_err, then CUDA's last error) */
+        for (int ci = 0; ci < 2; ci++) for (int P = 128; P <= 256; P += 128) for (int frz = 0; frz < 2; frz++) {
+            const unet_cfg *cfg = &cfgs[ci]; const int nc = ci ? 0 : 1, co = nc ? nc : cfg->cout;
+            const size_t p3 = (size_t)P * P * P, ob = (size_t)co * p3 * 2;
+            uint8_t *hct = malloc(p3); float *hrow = malloc(2 * (size_t)P * 4);
+            for (size_t i = 0; i < p3; i++) { const int z = (int)(i / ((size_t)P * P)), y = (int)((i / P) % P), x = (int)(i % P); hct[i] = (uint8_t)(x < 5 ? 0 : 60 + 50 * sinf(0.21f * x + 0.13f * y) + 30 * cosf(0.17f * z) + (i * 2654435761u) % 23); }
+            for (int z = 0; z < P; z++) { hrow[z] = -300.f + 0.5f * z; hrow[P + z] = 40.f - 0.25f * z; }
+            float *drow = nn_malloc(2 * (size_t)P * 4); nn_h2d(drow, hrow, 2 * (size_t)P * 4);
+            uint8_t *ref = malloc(ob), *b = malloc(ob), *b2 = malloc(ob);
+            float *gst = nullptr;
+            for (int mode = 0; mode < 5; mode++) {   /* 0: both paths off (the reference); 1-4: slab 16 / 64 x offload 0 / 1, both on */
+                const int on = mode > 0, slab = mode == 0 ? 64 : mode <= 2 ? 16 : 64, off = mode == 0 ? 1 : (mode & 1);
+                unet_set_slab_ovl(on); nn_set_conv1_const(on);
+                unet_set_infer_alias(1); unet_set_infer_slab(slab); unet_set_infer_offload(off);
+                unet *u = unet_create(cfg); unet_init(u, 7); unet_set_head_channels(u, 0, nc); unet_set_ct_input(u, 1); unet_set_fp16_logits(u, 1);
+                const shape5 xs = {1, 4, P, P, P}; unet_build(u, xs, 0);
+                CHECK(unet_ct_stem(u), "speed paths cfg %d P %d: no CT-stem build", ci, P);
+                uint8_t *ct = unet_input_scratch2(u, p3);
+                if (frz) {   /* statistics of the first window (the reference build), frozen for every build */
+                    if (!gst) { gst = malloc(unet_gn_nstats(u) * 4); nn_h2d(ct, hct, p3); (void)unet_forward_ct(u, ct, 92.f, 1.f / 31.f, drow, drow + P, 1, xs, 1); unet_gn_stats_get(u, gst); }
+                    unet_gn_freeze(u, gst);
+                }
+                uint8_t *dst = mode ? b : ref;
+                for (int rep = 0; rep < 2; rep++) {
+                    nn_h2d(ct, hct, p3);   /* (the forward consumes the CT window) */
+                    nn_d2h(rep ? b2 : dst, unet_forward_ct(u, ct, 92.f, 1.f / 31.f, drow, drow + P, 1, xs, 1), ob);
+                }
+                const char *e = nn_check(); CHECK(!e, "cuda: %s", e ? e : "");
+                CHECK(!memcmp(dst, b2, ob), "speed paths cfg %d P %d frozen %d mode %d: a second window differs", ci, P, frz, mode);
+                if (mode) {
+                    size_t nd = 0; for (size_t i = 0; i < ob / 2; i++) nd += ((uint16_t *)ref)[i] != ((uint16_t *)b)[i];
+                    CHECK(nd == 0, "speed paths cfg %d P %d frozen %d slab %d offload %d: fp16 logits differ at %zu of %zu", ci, P, frz, slab, off, nd, ob / 2);
+                    printf("speed paths: %s P %3d frozen GN %d slab %2d offload %d: %d fp16 logit channels %s\n", ci ? "32-wide" : "16-wide", P, frz, slab, off, co, nd ? "DIFFER" : "identical");
+                }
+                unet_free(u);
+            }
+            free(gst); free(ref); free(b); free(b2); free(hct); free(hrow); nn_free(drow);
+        }
+        unet_set_slab_ovl(-1); nn_set_conv1_const(1); unet_set_infer_offload(1); unet_set_infer_slab(0);   /* (-1: the default, by width) */
+    }
     if (fails) return 1;
     printf("test_infer_mem: ok\n");
     return 0;

@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "store.h"
+#include "sysinfo.h"
 #include "zarr3.h"
 #include "z3w.h"
 
@@ -47,7 +48,7 @@ int cmd_phase_packing(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: ufsm phase-packing <phase-root> <phase-key> [--um 9.6] [--packed-um 100] [--box z,y,x,nz,ny,nx] [--map OUT.raw] [--threads 16]\n"); return 2; }
     z3 *z = z3_open(store_open(argv[2]), argv[3], nullptr); if (!z) { fprintf(stderr, "phase-packing: %s\n", z3_error()); return 1; }
     const z3_meta *m = z3_meta_of(z); const double um = atof(pk_opt(argc, argv, "--um", "9.6")), pum = atof(pk_opt(argc, argv, "--packed-um", "100"));
-    const double gthr = um / pum; const int nt = atoi(pk_opt(argc, argv, "--threads", "16"));
+    const double gthr = um / pum; const int nt = ufsm_threads(atoi(pk_opt(argc, argv, "--threads", "0")), 16);
     const char *bs = pk_opt(argc, argv, "--box", nullptr), *mp = pk_opt(argc, argv, "--map", nullptr);
     if (bs) {
         long long b[6]; if (sscanf(bs, "%lld,%lld,%lld,%lld,%lld,%lld", b, b + 1, b + 2, b + 3, b + 4, b + 5) != 6) { fprintf(stderr, "phase-packing: --box z,y,x,nz,ny,nx\n"); return 2; }
@@ -92,7 +93,7 @@ int cmd_phase_conflict(int argc, char **argv) {
     if (!a || !b) { fprintf(stderr, "phase-conflict: %s\n", z3_error()); return 1; }
     const z3_meta *ma = z3_meta_of(a), *mb = z3_meta_of(b);
     if (memcmp(ma->shape, mb->shape, sizeof ma->shape)) { fprintf(stderr, "phase-conflict: the rasters differ in shape\n"); return 1; }
-    const double tol = atof(pk_opt(argc, argv, "--tol", "0.25")); const int nt = atoi(pk_opt(argc, argv, "--threads", "16")), S = 512;
+    const double tol = atof(pk_opt(argc, argv, "--tol", "0.25")); const int nt = ufsm_threads(atoi(pk_opt(argc, argv, "--threads", "0")), 16), S = 512;
     if (!(tol > 0 && tol < 0.5)) { fprintf(stderr, "phase-conflict: --tol in (0, 0.5)\n"); return 2; }
     char at[256]; snprintf(at, sizeof at, "{\"ufsm\":{\"content\":\"1 where two label phase rasters are both known and differ by more than %g turn\"}}", tol);
     z3w *w = z3w_create(argv[6], ma->shape, S, 0.f, 0, at); if (!w) { fprintf(stderr, "phase-conflict: %s\n", z3w_error()); return 1; }

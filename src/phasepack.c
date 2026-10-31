@@ -7,6 +7,7 @@
    cmp:    two arrays over one z row of shards: max cyclic error over the known voxels, unknown mismatches.
    Lossy volcomp (q > 0) is not used: the 251 -> 0 wrap of the phase would smear. Built into ufsm and as build/phase_pack (no CUDA). */
 #include "zarr3.h"
+#include "sysinfo.h"
 #include "z3w.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -71,7 +72,7 @@ static void drop_file(FILE *f) { fflush(f); fdatasync(fileno(f)); posix_fadvise(
 static int cmd_pack(int argc, char **argv) {
     if (argc < 5) { fprintf(stderr, "usage: phase-pack ROOT KEY OUT --row R [--level 19] [--threads 8]\n"); return 2; }
     const char *root = argv[2], *key = argv[3], *out = argv[4];
-    const int row = atoi(popt(argc, argv, "--row", "-1")), lev = atoi(popt(argc, argv, "--level", "19")), th = atoi(popt(argc, argv, "--threads", "8"));
+    const int row = atoi(popt(argc, argv, "--row", "-1")), lev = atoi(popt(argc, argv, "--level", "19")), th = ufsm_threads(atoi(popt(argc, argv, "--threads", "0")), 8);
     store *s; z3 *z = open_arr(root, key, &s); if (!z) return 1;
     const z3_meta *m = z3_meta_of(z);
     const int S = m->shard[0];
@@ -116,7 +117,7 @@ static int cmd_pack(int argc, char **argv) {
 
 static int cmd_unpack(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: phase-unpack IN DIR [--threads 8]   (DIR: the array directory, e.g. .../phaseA/9.6)\n"); return 2; }
-    const char *in = argv[2], *dir = argv[3]; const int th = atoi(popt(argc, argv, "--threads", "8"));
+    const char *in = argv[2], *dir = argv[3]; const int th = ufsm_threads(atoi(popt(argc, argv, "--threads", "0")), 8);
     FILE *f = fopen(in, "rb"); if (!f) { fprintf(stderr, "phase-unpack: cannot read %s\n", in); return 1; }
     pp_head h; if (fread(&h, sizeof h, 1, f) != 1 || memcmp(h.magic, MAGIC, 8)) { fprintf(stderr, "phase-unpack: %s: not a phase-pack file\n", in); fclose(f); return 1; }
     char zj[4200]; snprintf(zj, sizeof zj, "%s/zarr.json", dir);
@@ -156,7 +157,7 @@ static int cmd_unpack(int argc, char **argv) {
 
 static int cmd_cmp(int argc, char **argv) {
     if (argc < 6) { fprintf(stderr, "usage: phase-cmp ROOT_A KEY_A ROOT_B KEY_B --row R [--threads 8]\n"); return 2; }
-    const int row = atoi(popt(argc, argv, "--row", "-1")), th = atoi(popt(argc, argv, "--threads", "8"));
+    const int row = atoi(popt(argc, argv, "--row", "-1")), th = ufsm_threads(atoi(popt(argc, argv, "--threads", "0")), 8);
     store *sa, *sb; z3 *a = open_arr(argv[2], argv[3], &sa), *b = a ? open_arr(argv[4], argv[5], &sb) : nullptr; if (!a || !b) return 1;
     const z3_meta *m = z3_meta_of(a); const int S = m->shard[0];
     const int64_t gy = (m->shape[1] + S - 1) / S, gx = (m->shape[2] + S - 1) / S;

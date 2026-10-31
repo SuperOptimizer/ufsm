@@ -10,6 +10,7 @@
    the per-wrap ufsm render's (render_rows / trilin in main.c) on the same float32 coordinates xform_wraps.py wrote, so the
    renders are bit-identical to it; the overlay is overlay_red.py's (imgops.c). */
 #include "imgops.h"
+#include "sysinfo.h"
 #include "store.h"
 #include "tiffw.h"
 #include "zarr3.h"
@@ -260,6 +261,7 @@ typedef struct { uint8_t v; int32_t ci; uint32_t first; } wdec;   /* decode list
 typedef struct {
     int nv; ctab T[2]; int depth[2]; uint32_t *first[2], *last[2], *smask[2];   /* smask: per chunk the volcomp substreams any block reads */
     int ns; const float *const *Xs, *const *Ys, *const *Zs; int w, h; double gs; uint8_t *const *img; int ow, oh;   /* grid s, volume v: img[s nv + v] */
+    const render_fill *F;                                 /* --fill or nullptr */
     rblock *b; int32_t (*blo)[2][3], (*bhi)[2][3]; uint32_t *bgrp; size_t nb; uint32_t ng;
     wdec *dl; size_t ndl; uint8_t *ready; size_t *need;   /* need[g]: decode-list entries with first <= g (g 1-based) */
     size_t *frees; size_t *free0;                         /* per group g: decode entries whose last group is g, frees[free0[g] .. free0[g + 1]) */
@@ -316,6 +318,22 @@ static void wr_block(const wrend *R, const rblock *B) {
         double N[3] = {du[1] * dv[2] - du[2] * dv[1], du[2] * dv[0] - du[0] * dv[2], du[0] * dv[1] - du[1] * dv[0]};
         const double nl = sqrt(N[0] * N[0] + N[1] * N[1] + N[2] * N[2]); if (nl < 1e-12) continue;
         for (int d = 0; d < 3; d++) N[d] /= nl;
+        if (R->F) {   /* --fill: void CT on the surface -> the nearest papyrus along the normal, every volume centred there */
+            const render_fill *F = R->F; const ctab *C = &R->T[1]; int k = 0; uint8_t fl = RFILL_ON;
+            if (lroundf(ct_trilin(C, P[0], P[1], P[2])) < F->thr) {
+                fl = RFILL_EMPTY;
+                for (int j = 1; j <= F->n; j++) {
+                    const float cp = ct_trilin(C, P[0] + j * N[0], P[1] + j * N[1], P[2] + j * N[2]), cm = ct_trilin(C, P[0] - j * N[0], P[1] - j * N[1], P[2] - j * N[2]);
+                    const int okp = lroundf(cp) >= F->thr, okm = lroundf(cm) >= F->thr;
+                    if (!okp && !okm) continue;
+                    k = okp && okm ? (F->prefer > 0 ? j : F->prefer < 0 ? -j : cm > cp ? -j : j) : okp ? j : -j;
+                    fl = (uint8_t)(k > 0 ? k : RFILL_NEG - k); break;
+                }
+                if (k) for (int d = 0; d < 3; d++) P[d] += k * N[d];
+            }
+            if (F->vgrid && fl != RFILL_EMPTY && (F->vgrid[si][i00] || F->vgrid[si][i01] || F->vgrid[si][i10] || F->vgrid[si][i11])) fl += RFILL_GRID;
+            F->flag[si][(size_t)py * R->ow + px] = fl;
+        }
         for (int v = 0; v < R->nv; v++) {
             float m = 0;
             for (int t = -R->depth[v]; t <= R->depth[v]; t++) { const float s = ct_trilin(&R->T[v], P[0] + t * N[0], P[1] + t * N[1], P[2] + t * N[2]); if (s > m) m = s; }
@@ -363,7 +381,13 @@ int render_wrap_chunked(z3 *const *vz, int nv, const int *depth, const float *X,
 }
 int render_wraps_chunked(z3 *const *vz, int nv, const int *depth, int ns, const float *const *Xs, const float *const *Ys, const float *const *Zs,
                          int w, int h, double gs, uint8_t *const *img, int ow, int oh, const int *crop, size_t budget, int nthreads, int io_threads, int verbose) {
+    return render_wraps_chunked_fill(vz, nv, depth, ns, Xs, Ys, Zs, w, h, gs, img, ow, oh, crop, budget, nthreads, io_threads, verbose, nullptr);
+}
+int render_wraps_chunked_fill(z3 *const *vz, int nv, const int *depth, int ns, const float *const *Xs, const float *const *Ys, const float *const *Zs,
+                              int w, int h, double gs, uint8_t *const *img, int ow, int oh, const int *crop, size_t budget, int nthreads, int io_threads,
+                              int verbose, const render_fill *F) {
     if (nv < 1 || nv > 2 || ns < 1 || ns > 8 || w < 2 || h < 2) return -1;
+    if (F && (nv != 2 || F->n < 0 || F->n > 49 || !F->flag)) return -1;
     const double t0 = rnow();
     wrend *R = calloc(1, sizeof *R); if (!R) return -1;
     R->nv = nv; R->ns = ns; R->Xs = Xs; R->Ys = Ys; R->Zs = Zs; R->w = w; R->h = h; R->gs = gs; R->img = img; R->ow = ow; R->oh = oh; R->budget = budget;
@@ -375,6 +399,7 @@ int render_wraps_chunked(z3 *const *vz, int nv, const int *depth, int ns, const 
         R->T[v].z = vz[v]; R->T[v].sh = sh; for (int d = 0; d < 3; d++) R->T[v].shape[d] = zm->shape[d];
         R->depth[v] = depth[v]; if (depth[v] > dm) dm = depth[v];
     }
+    R->F = F; if (F) dm += F->n;   /* the search moves every volume's window up to n voxels along the normal */
     /* blocks with their chunk ranges per volume */
     size_t cap = 1 << 16, nb = 0; rblock *b = malloc(cap * sizeof *b); int32_t (*hi1)[3] = malloc(cap * sizeof *hi1), (*lo1)[3] = malloc(cap * sizeof *lo1);
     if (!b || !hi1 || !lo1) goto out0;
@@ -514,7 +539,7 @@ int cmd_render_sheets(int argc, char **argv) {
     const char *src = argv[2], *out = argv[3], *isrc = ropt(argc, argv, "--ink-tifxyz", src), *prefix = ropt(argc, argv, "--prefix", ""), *keep = ropt(argc, argv, "--keep-tif", nullptr);
     const double cdiv = atof(ropt(argc, argv, "--ct-div", "2")), idiv = atof(ropt(argc, argv, "--ink-div", "4")), mem = atof(ropt(argc, argv, "--mem", "4"));
     int cdepth = atoi(ropt(argc, argv, "--ct-depth", "3")), idepth[3]; const int nink = parse_ints(ropt(argc, argv, "--ink-depths", "5,3,1"), idepth, 3);
-    const int nthreads = atoi(ropt(argc, argv, "--threads", "12")), top = atoi(ropt(argc, argv, "--top", "0")), strip_w = rflag(argc, argv, "--strip-w"), skip = rflag(argc, argv, "--skip-existing");
+    const int nthreads = ufsm_threads(atoi(ropt(argc, argv, "--threads", "0")), 12), top = atoi(ropt(argc, argv, "--top", "0")), strip_w = rflag(argc, argv, "--strip-w"), skip = rflag(argc, argv, "--skip-existing");
     const double min_cm2 = atof(ropt(argc, argv, "--min-cm2", "0"));
     const int ci = rarg(argc, argv, "--ct"), ii = rarg(argc, argv, "--ink"); const char *cache = ropt(argc, argv, "--cache", nullptr);
     if (ci + 2 >= argc || ii + 2 >= argc || nink < 1 || cdiv <= 0 || idiv <= 0 || cdepth < 0) { fprintf(stderr, "render-sheets: bad options\n"); return 2; }
@@ -586,7 +611,7 @@ int cmd_overlay_red(int argc, char **argv) {
     if (argc < 5) { fprintf(stderr, "usage: ufsm overlay-red <ct-dir> <ink-dir> <out-dir> [<ink2-dir> [<ink3-dir>]] [--strip-w] [--skip-existing] [--threads 12]\n"); return 2; }
     const char *dirs[3] = {argv[3], nullptr, nullptr}; int nink = 1;
     for (int a = 5; a < argc && nink < 3; a++) { if (argv[a][0] == '-') { if (!strcmp(argv[a], "--threads")) a++; continue; } dirs[nink++] = argv[a]; }
-    const int strip_w = rflag(argc, argv, "--strip-w"), skip = rflag(argc, argv, "--skip-existing"), nthreads = atoi(ropt(argc, argv, "--threads", "12"));
+    const int strip_w = rflag(argc, argv, "--strip-w"), skip = rflag(argc, argv, "--skip-existing"), nthreads = ufsm_threads(atoi(ropt(argc, argv, "--threads", "0")), 12);
     char p[1400]; snprintf(p, sizeof p, "mkdir -p '%s'", argv[4]); if (system(p)) return 1;
     DIR *dd = opendir(argv[2]); if (!dd) { fprintf(stderr, "overlay-red: cannot open %s\n", argv[2]); return 1; }
     int n = 0, cap = 64; char **names = malloc(cap * sizeof *names); struct dirent *de;
@@ -759,7 +784,7 @@ int ink_compare_mem(int argc, char **argv) {   /* the in-memory version (inkcomp
         fprintf(stderr, "usage: ufsm ink-compare <out.jpg> --ct CT.tif --ink LABEL=INK.tif [--ink LABEL=INK.tif ..] [--px-um 2.4] [--rs-um 25] [--rl-um 500] [--crop x,y,w,h | --crop-frac fx,fy,w,h | --best-crop N] [--stretch | --fixed LO,HI] [--stretch-ct] [--full] [--each PREFIX [--each-suffix S] [--each-ct]] [--rgb-agree RECTO,VERSO] [--diff-agree RECTO,VERSO [--diff-gain 1]] [--papyrus INK [--papyrus-gain 1] [--papyrus-floor median|V] [--papyrus-bg G|median]] [--cmap viridis] [--no-ct] [--rgb-ct-min 1] [--max-px N] [--quality 90] [--threads 16]\n"); return 2;
     }
     const double px = atof(ropt(argc, argv, "--px-um", "2.4")), rsu = atof(ropt(argc, argv, "--rs-um", "25")), rlu = atof(ropt(argc, argv, "--rl-um", "500"));
-    const int nthreads = atoi(ropt(argc, argv, "--threads", "16"));
+    const int nthreads = ufsm_threads(atoi(ropt(argc, argv, "--threads", "0")), 16);
     if (!(px > 0) || !(rsu > 0) || !(rlu > rsu)) { fprintf(stderr, "ink-compare: need --px-um > 0 and 0 < --rs-um < --rl-um\n"); return 2; }
     enum { MAXI = 8 }; const uint8_t *img[MAXI + 1] = {0}; int isct[MAXI + 1] = {1}; const char *lab[MAXI + 1] = {"ct"}; int n = 1, W, H, rc = 0;
     uint8_t *ct = img_read_u8(argv[ci + 1], &W, &H);
@@ -852,4 +877,81 @@ int ink_compare_mem(int argc, char **argv) {   /* the in-memory version (inkcomp
     for (int k = 1; k < n; k++) free((void *)lab[k]);
     free(mask);
     return rc;
+}
+
+/* ---- tifxyz_fill_holes (render --fill-grid) ---- */
+size_t tifxyz_fill_holes(float *X, float *Y, float *Z, int w, int h, size_t maxv, uint8_t *filled, size_t *nholes, size_t *nbig) {
+    const size_t n = (size_t)w * h; size_t nf = 0, nh = 0, nb = 0;
+    if (nholes) *nholes = 0;
+    if (nbig) *nbig = 0;
+    if (filled) memset(filled, 0, n);
+    if (w < 3 || h < 3) return 0;
+    uint8_t *hole = calloc(n, 1), *seen = calloc(n, 1); uint32_t *q = malloc(n * sizeof *q);
+    if (!hole || !seen || !q) { free(hole); free(seen); free(q); return 0; }
+    for (size_t s = 0; s < n; s++) {   /* components of invalid vertices: the enclosed, small enough ones are holes */
+        if (seen[s] || Z[s] >= 0) continue;
+        size_t a = 0, e = 0; int border = 0; q[e++] = (uint32_t)s; seen[s] = 1;
+        while (a < e) {
+            const size_t i = q[a++]; const int r = (int)(i / w), c = (int)(i % w);
+            if (r == 0 || c == 0 || r == h - 1 || c == w - 1) border = 1;
+            const size_t nb4[4] = {c > 0 ? i - 1 : i, c < w - 1 ? i + 1 : i, r > 0 ? i - w : i, r < h - 1 ? i + w : i};
+            for (int k = 0; k < 4; k++) { const size_t j = nb4[k]; if (j != i && !seen[j] && !(Z[j] >= 0)) { seen[j] = 1; q[e++] = (uint32_t)j; } }
+        }
+        if (border) continue;
+        if (e > maxv) { nb++; continue; }
+        nh++; for (size_t k = 0; k < e; k++) hole[q[k]] = 1;
+    }
+    free(seen);
+    /* start: push-pull of the valid vertices over the whole grid (the hole vertices take the pulled values) */
+    float *A[3] = {Z, Y, X}; int L = 0; { int d = w > h ? w : h; while (d > 1 && L < 20) { d = (d + 1) / 2; L++; } }
+    float *pv[21][3] = {{0}}, *pw[21] = {0}; int pwd[21], phd[21]; int ok = 1;
+    pwd[0] = w; phd[0] = h; pw[0] = malloc(n * sizeof(float)); for (int d = 0; d < 3; d++) pv[0][d] = malloc(n * sizeof(float));
+    if (!pw[0] || !pv[0][0] || !pv[0][1] || !pv[0][2]) ok = 0;
+    for (size_t i = 0; ok && i < n; i++) { const int v = Z[i] >= 0; pw[0][i] = (float)v; for (int d = 0; d < 3; d++) pv[0][d][i] = v ? A[d][i] : 0.f; }
+    for (int l = 0; ok && l < L; l++) {
+        const int W0 = pwd[l], H0 = phd[l], W1 = (W0 + 1) / 2, H1 = (H0 + 1) / 2; pwd[l + 1] = W1; phd[l + 1] = H1;
+        pw[l + 1] = malloc((size_t)W1 * H1 * sizeof(float)); for (int d = 0; d < 3; d++) pv[l + 1][d] = malloc((size_t)W1 * H1 * sizeof(float));
+        if (!pw[l + 1] || !pv[l + 1][0] || !pv[l + 1][1] || !pv[l + 1][2]) { ok = 0; break; }
+        for (int y = 0; y < H1; y++) for (int x = 0; x < W1; x++) {
+            double W = 0, S[3] = {0, 0, 0};
+            for (int k = 0; k < 4; k++) { const int a = 2 * y + (k >> 1), b = 2 * x + (k & 1); if (a >= H0 || b >= W0) continue;
+                const size_t i = (size_t)a * W0 + b; W += pw[l][i]; for (int d = 0; d < 3; d++) S[d] += pv[l][d][i] * pw[l][i]; }
+            const size_t o = (size_t)y * W1 + x; pw[l + 1][o] = (float)(W < 1 ? W : 1);
+            for (int d = 0; d < 3; d++) pv[l + 1][d][o] = W > 0 ? (float)(S[d] / W) : 0.f;
+        }
+    }
+    for (int l = L - 1; ok && l >= 0; l--) {
+        const int W0 = pwd[l], H0 = phd[l], W1 = pwd[l + 1], H1 = phd[l + 1];
+        for (int y = 0; y < H0; y++) for (int x = 0; x < W0; x++) {
+            const size_t i = (size_t)y * W0 + x; const float w0 = pw[l][i]; if (w0 >= 1) continue;
+            double fy = (y - 0.5) / 2, fx = (x - 0.5) / 2; if (fy < 0) fy = 0; if (fx < 0) fx = 0; if (fy > H1 - 1) fy = H1 - 1; if (fx > W1 - 1) fx = W1 - 1;
+            const int a = (int)fy, b = (int)fx, a1 = a + 1 < H1 ? a + 1 : a, b1 = b + 1 < W1 ? b + 1 : b; const double ty = fy - a, tx = fx - b;
+            const size_t q4[4] = {(size_t)a * W1 + b, (size_t)a * W1 + b1, (size_t)a1 * W1 + b, (size_t)a1 * W1 + b1};
+            const double k4[4] = {(1 - ty) * (1 - tx), (1 - ty) * tx, ty * (1 - tx), ty * tx};
+            double wu = 0, cu[3] = {0, 0, 0};
+            for (int k = 0; k < 4; k++) { wu += k4[k] * pw[l + 1][q4[k]]; for (int d = 0; d < 3; d++) cu[d] += k4[k] * pw[l + 1][q4[k]] * pv[l + 1][d][q4[k]]; }
+            if (!(wu > 0)) continue;
+            const double r = 1 - w0, wc = wu < 1 ? wu : 1;
+            for (int d = 0; d < 3; d++) pv[l][d][i] = (float)((w0 * pv[l][d][i] + r * wc * cu[d] / wu) / (w0 + r * wc));
+            pw[l][i] = (float)(w0 + r * wc);
+        }
+    }
+    if (ok) {
+        size_t nl = 0; for (size_t i = 0; i < n; i++) if (hole[i]) { for (int d = 0; d < 3; d++) A[d][i] = pv[0][d][i]; q[nl++] = (uint32_t)i; }
+        /* Gauss-Seidel on the Laplace equation over the hole vertices (rims fixed): the membrane through the rim */
+        for (int it = 0; it < 400; it++) for (size_t k = 0; k < nl; k++) {
+            const size_t i = q[k]; const int r = (int)(i / w), c = (int)(i % w);
+            const size_t nb4[4] = {i - 1, i + 1, i - w, i + w}; double s[3] = {0, 0, 0}; int m = 0;
+            (void)r; (void)c;   /* holes touch no border: all four neighbours exist */
+            for (int j = 0; j < 4; j++) { const size_t u = nb4[j]; if (!hole[u] && !(Z[u] >= 0)) continue; for (int d = 0; d < 3; d++) s[d] += A[d][u]; m++; }
+            if (m) for (int d = 0; d < 3; d++) A[d][i] = (float)(s[d] / m);
+        }
+        nf = nl;
+        if (filled) for (size_t k = 0; k < nl; k++) filled[q[k]] = 1;
+    }
+    for (int l = 0; l <= L; l++) { free(pw[l]); for (int d = 0; d < 3; d++) free(pv[l][d]); }
+    free(hole); free(q);
+    if (nholes) *nholes = nh;
+    if (nbig) *nbig = nb;
+    return nf;
 }

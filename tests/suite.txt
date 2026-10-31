@@ -175,3 +175,11 @@ test_split~gn_stored,keep_coarse               | gpu2,slow    |    79 | UFSM_TES
 test_split~gn_stored,policy                    | gpu          |    47 | UFSM_TEST_GN_STORED=1 UFSM_TEST_INPUT_PREC=8 UFSM_TEST_POLICY=all=fp4:fp4:fp8,enc0.c1=fp16 ./$B/test_split
 test_formats                                   |              |     1 | ./tests/test_formats.sh
 test_zarr                                      |              |     1 | ./tests/test_zarr.sh
+test_predict_feather                           | gpu          |    10 | ./$B/test_predict_feather ./$B/ufsm
+test_strip_gpu                                 | gpu          |    10 | ./$B/test_strip_gpu
+test_faces_gpu                                 | gpu          |    10 | ./$B/test_faces_gpu
+test_render_fill                               |              |    10 | ./$B/test_render_fill
+test_jpegpar                                   |              |    10 | ./$B/test_jpegpar
+test_sysinfo                                   |              |     5 | ./$B/test_sysinfo
+test_volcomp_fast                              |              |    10 | ./$B/test_volcomp_fast
+test_z3_autosub                                |              |    10 | ./$B/test_z3_autosub

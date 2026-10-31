@@ -43,8 +43,11 @@ typedef struct {
                               parametrisation starts SLIM nearer the optimum); nullptr: the grid map */
     int gpu;            /* 1: SLIM iterations on the GPU when the binary has nn_flat.o and a device answers (same algorithm, fp64; else
                            the CPU solver). 0 (default): CPU */
+    int gpu_dev;        /* the CUDA device of the GPU solver (-1: the thread's current device) */
 } flat_opts;
 flat_opts flat_opts_default(void);
+/* CUDA devices the GPU solver can use (0: none, or a binary without nn_flat.o) */
+int flat_gpu_devices(void);
 
 /* SLIM on one triangle mesh, uv in place (must start flip-free). Returns the final mean energy (< 0 on failure). */
 double flat_slim(const double *P, int nv, const int *tri, int nt, double *uv, const flat_opts *o);
