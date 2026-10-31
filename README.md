@@ -403,9 +403,10 @@ Paris 4 sampled 16..580, wrote 257, and the empty ids above the data took 10.7 o
 The `.sfc` files (here and in `ufsm strip`) are encoded on all threads, byte-identical to the serial writer (P4 strip.sfc 876 -> 170 s
 at 4 threads). The encoder itself runs ~1.8x faster with the same bytes: the vendored surfcomp's DCTs and quantizer on 8-wide vectors
 (the same multiply-add order per lane; the build has no FP contraction), each candidate tokenized once, tANS sizes before bytes, the
-index entries buffered (`test_tfx` checks golden hashes of the original encoder). The writer's workers run a ring ahead of the ordered
-appends. `--fields` reads the data weight chunk by chunk on threads (PHerc0490B's 80 G cells at pool 8: 190 -> 6 s), the slab models
-load on threads, and a row's slab choice is made once. PHerc0490B wraps + strip and a Paris 4 crop: every file byte-identical to master.
+index entries buffered (`test_tfx` checks golden hashes of the original encoder). The writer's workers run a ring ahead and append
+in order themselves (no caller hand-off per patch: that stalled on a loaded host). `--fields` reads the data weight chunk by chunk
+on threads (PHerc0490B's 80 G cells at pool 8: 190 -> 6 s), the slab models load on threads, and a row's slab choice is made once.
+PHerc0490B wraps + strip and a Paris 4 crop: every file byte-identical to master.
 
 **flatten.** SLIM (symmetric Dirichlet, multilevel, flip-free line search; `src/flatten.h`) on the wrap's own vertex grid,
 then an isometric uv resample, Laplace fill of enclosed tears up to `--fill-holes` vertices (orange in `<w>_mask.jpg`; they
