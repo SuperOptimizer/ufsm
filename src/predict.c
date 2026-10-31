@@ -152,9 +152,11 @@ static uint8_t fe_blend(const feather_t *F, int z, int y, int x) {   /* a lower-
     }
     return w > 0 ? (uint8_t)fminf(255.f, s / w + 0.5f) : 0;
 }
-static void fe_rows(void *a, int z0, int z1, int t) {
+static void fe_rows(void *a, int r0, int r1, int t) {   /* rows r = lz * on[1] + ly (the lower-shell rows spread over every thread) */
     (void)t; const feather_t *F = a; const int B = F->B, E = F->E, sh = F->osh;
-    for (int lz = z0; lz < z1; lz++) for (int64_t ly = 0; ly < F->on[1]; ly++) {
+    const int64_t nr = F->on[0] * F->on[1];
+    for (int q = r0; q < r1; q++) {   /* (q -> r: times the prime 2^31 - 1 > nr, a bijection, so each thread's range mixes shell and core rows) */
+        const int64_t r = (int64_t)((uint64_t)q * 2147483647u % (uint64_t)nr), lz = r / F->on[1], ly = r % F->on[1];
         const int z = (int)(F->oo[0] + lz), y = (int)(F->oo[1] + ly), x0 = (int)F->oo[2], nx = (int)F->on[2];
         uint8_t *o = F->out + ((size_t)lz * sh + ly) * sh;
         const uint8_t *er = F->e + ((size_t)z * E + y) * E + x0;
@@ -1520,7 +1522,7 @@ int cmd_predict(int argc, char **argv) {
                     }
                     if (part_sh) memset(sbuf, 0, WR.bytes);
                     FE.out = sbuf; FE.osh = shard;
-                    fit_par((int)FE.on[0], fe_rows, &FE);
+                    fit_par((int)(FE.on[0] * FE.on[1]), fe_rows, &FE);
                     if (writer_submit(&WR, sb, qz, qy, qx)) { fprintf(stderr, "%s\n", z3w_error()); return 1; }
                     sb = writer_next(&WR, sb); sbuf = WR.buf[sb];
                 }
