@@ -227,7 +227,8 @@ static struct {
     uint8_t *d_in, *d_out; gd_item *d_items; gd_group *d_groups; uint32_t *d_rec, *d_meta, *d_status, *d_pos;
     cudaStream_t st; cudaEvent_t ev;
     uint16_t scan[BLKV]; int have_scan;
-    uint64_t n_subs, n_batches, n_redo; double gpu_s;
+    uint64_t n_subs, n_batches, n_redo, n_busy, n_cpu_busy; double gpu_s;
+    double max_s, cool_s; int64_t busy_us;   /* a GPU shared with saturating kernels: round trips over max_s -> the CPU for cool_s */
 } G = {PTHREAD_ONCE_INIT, PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER};
 
 static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
@@ -253,7 +254,8 @@ static int run_batch(gd_slot *S) {
     if (S->nout) GD_CK(cudaMemcpyAsync(S->h_out, G.d_out, (size_t)S->nout * SUB_BYTES, cudaMemcpyDeviceToHost, G.st));
     GD_CK(cudaEventRecord(G.ev, G.st));
     GD_CK(cudaEventSynchronize(G.ev));
-    G.gpu_s += now_s() - t0;
+    { const double dt = now_s() - t0; G.gpu_s += dt;
+      if (dt > G.max_s) { __atomic_store_n(&G.busy_us, (int64_t)((now_s() + G.cool_s) * 1e6), __ATOMIC_RELAXED); G.n_busy++; } }   /* starved (time sliced next to another job's kernels): the CPU decodes for a while */
     return 0;
 fail:
     return -1;
@@ -300,6 +302,7 @@ static void *service(void *arg) {
 static void gd_stats_atexit(void) {
     fprintf(stderr, "gpudec: %llu substreams on the GPU in %llu batches (%.0f / batch), %llu requests redone on the CPU, GPU round trips %.2f s\n",
             (unsigned long long)G.n_subs, (unsigned long long)G.n_batches, G.n_batches ? (double)G.n_subs / G.n_batches : 0.0, (unsigned long long)G.n_redo, G.gpu_s);
+    if (G.n_busy) fprintf(stderr, "gpudec: %llu round trips over %.0f ms (GPU busy): %llu requests decoded on the CPU meanwhile\n", (unsigned long long)G.n_busy, G.max_s * 1e3, (unsigned long long)G.n_cpu_busy);
 }
 static void gd_init(void) {
     const char *e = getenv("UFSM_GPU_DECODE");
@@ -309,6 +312,9 @@ static void gd_init(void) {
     G.max_items = mi && atoi(mi) > 0 ? (uint32_t)atoi(mi) : 1024u;
     const char *mb = getenv("UFSM_GPU_DECODE_MIN_BYTES");
     G.min_bytes = mb ? (uint32_t)atoi(mb) : 2048u;   /* per substream, compressed (Paris 4 CT q 2: ~9 KB; ink q 32: ~200 B) */
+    const char *ms = getenv("UFSM_GPU_DECODE_MAX_MS"), *cs = getenv("UFSM_GPU_DECODE_COOL_S");
+    G.max_s = (ms && atof(ms) > 0 ? atof(ms) : 60.0) * 1e-3;   /* an idle GPU: 5-12 ms for a full batch */
+    G.cool_s = cs && atof(cs) >= 0 ? atof(cs) : 2.0;
     G.in_cap = (size_t)G.max_items * 40000 + ((size_t)16 << 20);   /* q 2 substreams are ~10-20 KB */
     G.rec_cap = (size_t)G.max_items * 49152 + ((size_t)16 << 20);   /* records (u32); a substream reserves its bound, 8 x its bypass bytes (q 2: ~5 KB) */
     int nd = 0;
@@ -376,6 +382,7 @@ extern "C" void gpudec_stats(uint64_t *subs, uint64_t *batches, uint64_t *redo, 
 static int gd_decode(const gd_chunk *c, uint32_t mask, uint8_t *dst, uint8_t *ddst) {
     if (!mask) return 0;
     if (!gpudec_enabled()) return -1;
+    if ((double)__atomic_load_n(&G.busy_us, __ATOMIC_RELAXED) > now_s() * 1e6) { __atomic_fetch_add(&G.n_cpu_busy, 1, __ATOMIC_RELAXED); return -1; }   /* after a starved round trip */
     const uint32_t k = (uint32_t)__builtin_popcount(mask);
     size_t need_in = TAB_BYTES, need_rec = 0, payload = 0;
     for (uint32_t s = 0; s < NSUB; s++) if (mask >> s & 1u) {

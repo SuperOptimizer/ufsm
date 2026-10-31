@@ -258,7 +258,7 @@ static int real_main(int argc, char **argv) {
 
 int main(int argc, char **argv) {
     setenv("UFSM_GPU_DECODE", "1", 0);
-    if (!(argc > 1 && !strcmp(argv[1], "--real"))) setenv("UFSM_GPU_DECODE_MIN_BYTES", "0", 1);   /* the tests: every request on the GPU */
+    if (!(argc > 1 && !strcmp(argv[1], "--real"))) { setenv("UFSM_GPU_DECODE_MIN_BYTES", "0", 1); setenv("UFSM_GPU_DECODE_MAX_MS", "1e9", 1); }   /* the tests: every request on the GPU */
     if (!gpudec_enabled()) { printf("test_gpudec: no GPU decoder (no CUDA device): skipped\n"); return 0; }
     if (argc > 1 && !strcmp(argv[1], "--real")) return real_main(argc, argv);
     char dir[] = "/tmp/test_gpudecXXXXXX"; if (!mkdtemp(dir)) return 1;

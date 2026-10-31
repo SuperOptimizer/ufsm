@@ -310,7 +310,22 @@ Run it on the flat grid so both faces share one uv and render pixel-aligned; ren
 chunks; same output). `--gpu 1` (default) samples the profiles, cuts the bands and runs the median windows on the GPU from a
 device mirror of the decoded chunks (decode list = the exact substreams the samples read; `src/nn_faces.cu`, no fast math,
 no FMA): byte-identical outputs, CPU fallback without a device or when the device pool fills. Paris 4 w178: sampling 35 -> 3 s,
-medians 15 -> 2.5 s; the CPU volcomp decode is then ~75% of the wall. `UFSM_FACES_PROF=1` prints per-stage times.
+medians 15 -> 2.5 s; the CPU volcomp decode is then ~75% of the wall. `UFSM_FACES_PROF=1` prints per-stage times. With
+`UFSM_GPU_DECODE=1` (below) the CT substreams are decoded on the GPU straight into that device mirror (no host round trip;
+if the GPU path fails mid-run the substreams only the device had are decoded again on the host).
+
+**GPU volcomp decoding** (`UFSM_GPU_DECODE=1`, opt-in; `src/nn_gpudec.cu`): every lossy (mode 0) volcomp substream that
+z3_read / z3_read_sub decodes goes to the GPU instead of volcomp_fast.h, byte-identical (one thread per substream for the tANS
+/ bypass decode, one CUDA block per 16^3 block for the dequantisation and the reference's inverse DCT network; no fast math,
+`-fmad=false`; corrupt or truncated streams are decoded again on the CPU, which gives the reference's status). A service
+thread batches the requests of all decode threads (render and faces run `UFSM_GPU_DECODE_THREADS`, default 32, decoders
+when it is on); a substream is a ~3-5 ms serial chain on the GPU, so throughput comes from many substreams in flight.
+Requests under `UFSM_GPU_DECODE_MIN_BYTES` (2048) compressed bytes per substream (ink, air: flat blocks) stay on the CPU;
+`UFSM_GPU_DECODE_DEV` picks the device, `UFSM_GPU_DECODE_STATS=1` prints substreams / batches at exit; any device error
+turns it off for the rest of the process. A GPU that another job saturates starves it (time slicing: next to a fit at 99% SM
+it crawled), so a round trip over `UFSM_GPU_DECODE_MAX_MS` (60) sends the requests to the CPU for `UFSM_GPU_DECODE_COOL_S` (2 s),
+then the GPU is tried again. `tests/test_gpudec.c` (`--real ARRAY cz cy cx nz ny nx [threads] [density]`:
+identity + MB/s on real chunks).
 
 ### Whole-scroll strip
 
