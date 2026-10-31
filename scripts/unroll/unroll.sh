@@ -60,12 +60,12 @@ STRIPRUN=$H/strip_run.sh; [ -e $STRIPRUN ] || STRIPRUN=$REPO/scripts/strip/strip
 [ "$DRY" = 1 ] || mkdir -p $O/state $O/logs
 # the shared decoded-CT cache (src/zshm.c) for the render / faces / ink-compare stages: ZCACHE_GB (auto: 1/4 of the available RAM, at
 # most 30 GB; off on the laptop = WSL), admit 0.6 (P4 w137 / w138 re-renders: 47-54% hits, a render 32.8 -> 20.0 s). The cache file
-# is removed at the end of the run (also on STOP / failure). strip-mosaic: UFSM_JPEG_THREADS = cores / 8 (it encodes 8 stripes at once).
+# is removed at the end of the run (also on STOP / failure). strip-mosaic: UFSM_JPEG_THREADS = cores / 2 (it encodes up to 2 stripes at once, --stripe-jobs 2).
 if [ "${ZCACHE_GB:-auto}" = auto ]; then
   if grep -qi microsoft /proc/version 2> /dev/null; then ZCACHE_GB=0; else ZCACHE_GB=$(( $(availgb) / 4 )); [ $ZCACHE_GB -gt 30 ] && ZCACHE_GB=30; fi
 fi
 ZCPATH=${UFSM_ZCACHE_PATH:-/dev/shm/ufsm-zcache-$(id -u)}
-JPEGT=$(( $(ncpu) / 8 )); [ $JPEGT -lt 1 ] && JPEGT=1
+JPEGT=$(( $(ncpu) / 2 )); [ $JPEGT -lt 1 ] && JPEGT=1
 zcon() { export UFSM_ZCACHE_GB=$ZCACHE_GB UFSM_ZCACHE_ADMIT=${ZCACHE_ADMIT:-0.6}; }   # (called inside the stages' subshells)
 zcclean() { [ "$DRY" = 1 ] || [ "$ZCACHE_GB" = 0 ] || rm -f "$ZCPATH"; }
 [ "$DRY" = 1 ] || trap zcclean EXIT
