@@ -263,6 +263,11 @@ int main(void) {
             int w3 = 0, h3 = 0; uint8_t *q3 = jpeg_read_rgb(o2, &w3, &h3);
             CHECK(q3 && abs(q3[0] - 128) < 6 && abs(q3[1] - 128) < 6 && abs(q3[2] - 128) < 6, "papyrus bg: corner not neutral grey (%d %d %d)", q3 ? q3[0] : -1, q3 ? q3[1] : -1, q3 ? q3[2] : -1);
             free(q3);
+            char *g2[] = {"ufsm", "ink-compare", o2, "--ct", cp, "--ink", ia, "--papyrus", "gamb", "--papyrus-bg", "median", "--stretch", "--stretch-ct", "--full", "--threads", "2", nullptr};
+            CHECK(run(cmd_ink_compare, g2, sv) == 0, "papyrus bg median rc");
+            q3 = jpeg_read_rgb(o2, &w3, &h3);   /* corner: a warm mid tan (the ramp at the CT median), not grey or black */
+            CHECK(q3 && q3[0] > q3[2] + 20 && q3[0] > 60, "papyrus bg median: corner %d %d %d", q3 ? q3[0] : -1, q3 ? q3[1] : -1, q3 ? q3[2] : -1);
+            free(q3);
             free(k);
         }
         if (cnt[0] && cnt[1]) CHECK(lum[1] / cnt[1] < lum[0] / cnt[0], "papyrus: inked pixels not darker");
