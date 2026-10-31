@@ -18,7 +18,7 @@ row=$(awk -F'\t' -v s=$S '$1 == s' $REPO/scripts/corpus/list.tsv $H/scrolls.tsv 
 IFS=$'\t' read -r _ R K UM LV _ <<< "$row"
 LUM=$(awk -v u=$UM -v l=$LV 'BEGIN { printf "%.4g", u * 2 ^ l }')
 O=$OUT/$S; mkdir -p $O; C=
-[ -e $R/$K/$LV/zarr.json ] || { R=$MIRROR; C=$O/ctcache; mkdir -p $C; }
+[ -e $R/$K/$LV/zarr.json ] || { R=$MIRROR; K=$(dirname $K)/volumes/$(basename $K); C=$O/ctcache; mkdir -p $C; }   # (the mirror: S/volumes/<scan>.zarr)
 T=${SNAPT:-}; [ -n "$T" ] || { [ -e $RUN/fields/pc/zarr.json ] && T=mix || T=ct; }
 FL=; [ "$T" != ct ] && FL="--fields $RUN/fields"
 echo "$(date '+%F %T') snap_existing $S: run $RUN, CT $R $K/$LV ($LUM um), target $T, out $O" | tee $O/snap.log
