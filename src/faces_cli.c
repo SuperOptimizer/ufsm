@@ -6,6 +6,7 @@
 #include "store.h"
 #include "tiffw.h"
 #include "zarr3.h"
+#include "gpudec.h"
 #include <dirent.h>
 #include <malloc.h>
 #include <math.h>
@@ -29,6 +30,8 @@ int fgpu_broken(const fgpu *G) __attribute__((weak));
 int fgpu_put(fgpu *G, size_t id, const uint8_t *buf, uint32_t mask) __attribute__((weak));
 void fgpu_drop(fgpu *G, size_t id) __attribute__((weak));
 void fgpu_stats(const fgpu *G, size_t *nput, size_t *bytes, int *slots) __attribute__((weak));
+uint8_t *fgpu_chunk_dev(fgpu *G, size_t id) __attribute__((weak));
+void fgpu_have(fgpu *G, size_t id, uint32_t mask) __attribute__((weak));
 
 static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + 1e-9 * t.tv_nsec; }
 
@@ -38,6 +41,8 @@ typedef struct {
     size_t ndec; double tdec, tev;   /* UFSM_FACES_PROF: fill decode (+ device upload) / eviction seconds */
     fgpu *dev;   /* non-null: every decoded chunk mirrored on the GPU (faces_vol.gpu) */
     _Atomic uint32_t *needm; uint32_t *have;
+    uint32_t *hless;   /* UFSM_GPU_DECODE: substreams decoded straight into the device mirror (not in ch); re-decoded on the host if the GPU breaks */
+    _Atomic size_t ndevsub;
     uint32_t *ever; _Atomic size_t nsub, nresub;   /* UFSM_FACES_PROF: substreams ever decoded per chunk; decoded, decoded again after eviction */
     uint8_t **pool; int npool; pthread_mutex_t pmu;   /* evicted whole-chunk buffers for reuse (no page faults / zeroing per decode) */   /* sub: per chunk the volcomp substreams (16 z x 32 y slabs) marked / decoded; nullptr: whole chunks */
 } fc_cache;
@@ -55,14 +60,14 @@ static int fcc_init(fc_cache *c, z3 *z, int nt, double mb) {
 static int fcc_sub(fc_cache *c) {
     if (getenv("UFSM_FACES_FULLDECODE") || c->cs[0] != 128 || c->cs[1] != 128 || c->cs[2] != 128) return 0;
     const size_t ng = (size_t)c->g[0] * c->g[1] * c->g[2];
-    c->needm = calloc(ng, sizeof *c->needm); c->have = calloc(ng, sizeof *c->have); if (getenv("UFSM_FACES_PROF")) c->ever = calloc(ng, sizeof *c->ever);
-    return c->needm && c->have ? 0 : -1;
+    c->needm = calloc(ng, sizeof *c->needm); c->have = calloc(ng, sizeof *c->have); c->hless = calloc(ng, sizeof *c->hless); if (getenv("UFSM_FACES_PROF")) c->ever = calloc(ng, sizeof *c->ever);
+    return c->needm && c->have && c->hless ? 0 : -1;
 }
 static void fcc_free(fc_cache *c) {
     const size_t ng = (size_t)c->g[0] * c->g[1] * c->g[2];
     for (size_t k = 0; c->ch && k < ng; k++) free(c->ch[k]);
     for (int k = 0; k < c->npool; k++) free(c->pool[k]);
-    free(c->pool); free(c->ch); free((void *)c->need); free(c->stamp); free((void *)c->needm); free(c->have); free(c->ever); memset(c, 0, sizeof *c);
+    free(c->pool); free(c->ch); free((void *)c->need); free(c->stamp); free((void *)c->needm); free(c->have); free(c->hless); free(c->ever); memset(c, 0, sizeof *c);
 }
 static inline int fcc_voxel(const fc_cache *c, int64_t z, int64_t y, int64_t x) {   /* -1: outside / not decoded */
     if (z < 0 || y < 0 || x < 0 || z >= c->shape[0] || y >= c->shape[1] || x >= c->shape[2]) return -1;
@@ -122,7 +127,10 @@ static void *fcc_decode(void *arg) {
         uint8_t *fresh = nullptr;
         if (whole && !b) { pthread_mutex_lock(&c->pmu); if (c->npool) fresh = c->pool[--c->npool]; pthread_mutex_unlock(&c->pmu); if (!fresh) fresh = malloc(cv); b = fresh; }
         uint8_t *t = fresh ? fresh : malloc((size_t)nn[0] * nn[1] * nn[2]);
-        if (!t || (!whole && !b && !(b = calloc(cv, 1))) || z3_read_sub(c->z, o, nn, t, 1, want)) { if (t != b) free(t); if (!c->ch[id]) free(b); atomic_store(&J->err, 1); continue; }
+        /* with the GPU decoder and the device mirror, lossy substreams go straight into the mirror's chunk (no host round trip) */
+        uint8_t *dch = whole && want && c->dev && c->hless && fgpu_chunk_dev && gpudec_enabled() && !fgpu_broken(c->dev) ? fgpu_chunk_dev(c->dev, (size_t)id) : nullptr;
+        uint32_t dm = 0;
+        if (!t || (!whole && !b && !(b = calloc(cv, 1))) || (dch ? z3_read_sub_dev(c->z, o, nn, t, 1, want, dch, &dm) : z3_read_sub(c->z, o, nn, t, 1, want))) { if (t != b) free(t); if (!c->ch[id]) free(b); atomic_store(&J->err, 1); continue; }
         if (t != b) {   /* edge chunk, or substreams added to a decoded chunk: copy (only the new substreams' rows) */
             for (int64_t z = 0; z < nn[0]; z++) for (int64_t y = 0; y < nn[1]; y++)
                 if (!want || (want >> ((z >> 4) * 4 + (y >> 5)) & 1)) memcpy(b + ((size_t)z * c->cs[1] + y) * c->cs[2], t + ((size_t)z * nn[1] + y) * nn[2], nn[2]);
@@ -131,6 +139,7 @@ static void *fcc_decode(void *arg) {
         if (c->needm) { const uint32_t wb = want ? want : 0xffffffffu; c->have[id] |= wb;
             if (c->ever) { atomic_fetch_add(&c->nsub, __builtin_popcount(wb)); atomic_fetch_add(&c->nresub, __builtin_popcount(wb & c->ever[id])); c->ever[id] |= wb; } }
         c->ch[id] = b;
+        if (dm) { c->hless[id] |= dm; fgpu_have(c->dev, (size_t)id, dm); atomic_fetch_add(&c->ndevsub, (size_t)__builtin_popcount(dm)); }
         if (c->dev) fgpu_put(c->dev, id, b, c->needm ? c->have[id] : 0xffffffffu);   /* the device mirror (pinned staging, async) */
     }
     return nullptr;
@@ -138,12 +147,14 @@ static void *fcc_decode(void *arg) {
 static int fcc_fill(void *ctx) {
     fc_cache *c = ctx; const size_t ng = (size_t)c->g[0] * c->g[1] * c->g[2]; c->clock++;
     int64_t *todo = nullptr; size_t nt = 0, cap = 0, nnew = 0;
+    if (c->hless && c->dev && fgpu_broken(c->dev))   /* the CPU samples from here: the substreams only the device had are decoded again */
+        for (size_t k = 0; k < ng; k++) if (c->hless[k]) { c->have[k] &= ~c->hless[k]; c->hless[k] = 0; c->need[k] = 1; }
     for (size_t k = 0; k < ng; k++) if (c->need[k]) {
         c->need[k] = 0; c->stamp[k] = c->clock; if (c->ch[k] && (!c->needm || !(atomic_load(&c->needm[k]) & ~c->have[k]))) continue;
         if (nt == cap) { cap = cap ? 2 * cap : 256; todo = realloc(todo, cap * sizeof *todo); }
         nnew += !c->ch[k]; todo[nt++] = (int64_t)k;
     }
-    double tq = now_s(); fcd_job J = {c, todo, nt, 0, 0}; fc_par(fcc_decode, &J, c->nt); c->tdec += now_s() - tq; tq = now_s();
+    double tq = now_s(); fcd_job J = {c, todo, nt, 0, 0}; fc_par(fcc_decode, &J, gpudec_threads(c->nt)); c->tdec += now_s() - tq; tq = now_s();
     c->nres += nnew; c->ndec += nt;
     if (atomic_load(&J.err)) { free(todo); fprintf(stderr, "faces: %s\n", z3_error()); return -1; }
     free(todo); tq = now_s();
@@ -152,7 +163,7 @@ static int fcc_fill(void *ctx) {
         if (old == c->clock) break;
         for (size_t k = 0; k < ng && c->nres > c->cap; k++) if (c->ch[k] && c->stamp[k] == old) {
             if (c->npool < 512 && c->pool) c->pool[c->npool++] = c->ch[k]; else free(c->ch[k]);
-            c->ch[k] = nullptr; c->nres--; if (c->needm) c->needm[k] = c->have[k] = 0;
+            c->ch[k] = nullptr; c->nres--; if (c->needm) c->needm[k] = c->have[k] = 0; if (c->hless) c->hless[k] = 0;
             if (c->dev) fgpu_drop(c->dev, k);
         }
     }
@@ -326,7 +337,7 @@ int cmd_faces(int argc, char **argv) {
         }
         if (getenv("UFSM_FACES_PROF")) {
             size_t np = 0, nb = 0; int ns = 0; if (cc.dev && fgpu_stats) fgpu_stats(cc.dev, &np, &nb, &ns);
-            fprintf(stderr, "faces prof: CT fill: decode+upload %.2f evict %.2f s, %zu substreams (%zu again); GT fill: decode %.2f s, %zu substreams (%zu again); gt %.2f s; gpu %s, %zu chunk uploads %.2f GB, %d device slots\n", cc.tdec, cc.tev, (size_t)cc.nsub, (size_t)cc.nresub, gz ? gc.tdec : 0.0, gz ? (size_t)gc.nsub : 0, gz ? (size_t)gc.nresub : 0, now_s() - tgt, cc.dev ? (fgpu_broken(cc.dev) ? "broken" : "on") : "off", np, nb / 1e9, ns);
+            fprintf(stderr, "faces prof: CT fill: decode+upload %.2f evict %.2f s, %zu substreams (%zu again); GT fill: decode %.2f s, %zu substreams (%zu again); gt %.2f s; gpu %s, %zu chunk uploads %.2f GB, %d device slots, %zu substreams decoded on the GPU into the mirror\n", cc.tdec, cc.tev, (size_t)cc.nsub, (size_t)cc.nresub, gz ? gc.tdec : 0.0, gz ? (size_t)gc.nsub : 0, gz ? (size_t)gc.nresub : 0, now_s() - tgt, cc.dev ? (fgpu_broken(cc.dev) ? "broken" : "on") : "off", np, nb / 1e9, ns, (size_t)cc.ndevsub);
         }
         const size_t nm1 = st.nv ? st.nv : 1, cn = st.ct_n ? st.ct_n : 1, np = st.nv - st.nfill ? st.nv - st.nfill : 1;
         char line[1200];

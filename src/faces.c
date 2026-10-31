@@ -98,6 +98,7 @@ static void *fm_rows(void *arg) {
 /* the GPU (src/nn_faces.cu); weak: absent in CPU-only binaries */
 fgpu *fgpu_open(const int64_t shape[3]) __attribute__((weak));
 int fgpu_broken(const fgpu *G) __attribute__((weak));
+void fgpu_set_broken(fgpu *G) __attribute__((weak));
 int fgpu_grid(fgpu *G, const float *X, const float *Y, const float *Z, const float *N, int w, int h) __attribute__((weak));
 int fgpu_band(fgpu *G, int r0, int r1, double f, double hs, double R, int m, double min_prom, double rel, fc_band *cand, uint8_t *nc, float *ct0, uint8_t *prof) __attribute__((weak));
 int fgpu_median(fgpu *G, const float *in, float *out, int w, int h, int R, int minn) __attribute__((weak));
@@ -175,6 +176,9 @@ int faces_wrap(const float *X, const float *Y, const float *Z, int w, int h, dou
             tp[2] += fc_now() - tq; tq = fc_now();
         }
         if (gpu && fc_gpu_ok(V) && !fgpu_band(V->gpu, J.r0, J.r1, f, hs, R, m, o->min_prom, o->rel, cand, nc, ct0, prof)) { tp[3] += fc_now() - tq; continue; }
+        /* the GPU failed (or is off): the CPU samples the host chunks; a fill first restores substreams only the device had (gpudec) */
+        if (gpu && fgpu_set_broken) fgpu_set_broken(V->gpu);
+        if (gpu && V->fill && V->fill(V->ctx)) { free(N); free(ct0); free(cand); free(nc); free(prof); free(gmask); return -1; }
         gpu = 0; J.mark = 0; atomic_store(&J.next, 0); fc_par(fc_rows, &J, o->nthreads);
         tp[3] += fc_now() - tq;
     }
