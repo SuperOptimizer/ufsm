@@ -94,6 +94,18 @@ Off-grid requests can repeat windows across output shards: the tested one-axis-e
 those requests. Lossy output encoding can also depend on codec-block placement; use `--q 0` for
 arbitrary-crop byte comparisons.
 
+`predict --feather B` removes window seams in one pass. Windows lie on the shard grid (window - 2 halo =
+k shards) and run in z-y-x order; each window's prediction over its interior plus B voxels of its upper
+halo is kept, and the lower B voxels of every window are a sin^2 blend of the window and the earlier
+neighbours' halo predictions (normalized over the windows present, so air and box edges need no
+special case). Only the earlier windows' upper slabs are held (one window layer + one row on the host).
+`--resume` recomputes done windows that a remaining neighbour needs, and `--gpus a,b` deals contiguous
+window layers (each worker also computes the layer before its own). Outputs are byte-identical away from
+the blend bands and across resume / worker splits (test_predict_feather). On Paris 4 ink (ift3-24000)
+the window-border step measured by `ink-seam --block 16` (border plane against the other 16^3 codec-block
+faces) falls from 20.2 (halo 0) and 6.3 (halo 64) to 0.0 with window 576 halo 32 `--feather 32`, matching
+the old two-pass + `ink-blend` result without the second pass or the blend.
+
 Evaluation grids with three or more cutoffs now filter prediction probabilities once and collect
 byte histograms instead of dilating each threshold separately. Complete ten-cutoff scoring is
 4.9–5.5x faster on the tested native dense and partial boxes, with byte-identical reports.
