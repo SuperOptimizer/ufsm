@@ -298,9 +298,10 @@ int main(void) {
             float *drow = nn_malloc(2 * (size_t)P * 4); nn_h2d(drow, hrow, 2 * (size_t)P * 4);
             uint8_t *ref = malloc(ob), *b = malloc(ob), *b2 = malloc(ob);
             float *gst = nullptr;
-            for (int mode = 0; mode < 5; mode++) {   /* 0: both paths off (the reference); 1-4: slab 16 / 64 x offload 0 / 1, both on */
-                const int on = mode > 0, slab = mode == 0 ? 64 : mode <= 2 ? 16 : 64, off = mode == 0 ? 1 : (mode & 1);
-                unet_set_slab_ovl(on); nn_set_conv1_const(on);
+            for (int mode = 0; mode < 7; mode++) {   /* 0: all paths off (the reference); 1-4: slab 16 / 64 x offload 0 / 1, both on; 5-6: direct
+                                                        slab outputs (unet_set_slab_direct: no temps, no coarse offload), slab 16 / 64 */
+                const int on = mode > 0, dir = mode >= 5, slab = mode == 0 ? 64 : mode <= 2 || mode == 5 ? 16 : 64, off = mode == 0 || dir ? 1 : (mode & 1);
+                unet_set_slab_ovl(on); nn_set_conv1_const(on); unet_set_slab_direct(dir);
                 unet_set_infer_alias(1); unet_set_infer_slab(slab); unet_set_infer_offload(off);
                 unet *u = unet_create(cfg); unet_init(u, 7); unet_set_head_channels(u, 0, nc); unet_set_ct_input(u, 1); unet_set_fp16_logits(u, 1);
                 const shape5 xs = {1, 4, P, P, P}; unet_build(u, xs, 0);
@@ -320,13 +321,13 @@ int main(void) {
                 if (mode) {
                     size_t nd = 0; for (size_t i = 0; i < ob / 2; i++) nd += ((uint16_t *)ref)[i] != ((uint16_t *)b)[i];
                     CHECK(nd == 0, "speed paths cfg %d P %d frozen %d slab %d offload %d: fp16 logits differ at %zu of %zu", ci, P, frz, slab, off, nd, ob / 2);
-                    printf("speed paths: %s P %3d frozen GN %d slab %2d offload %d: %d fp16 logit channels %s\n", ci ? "32-wide" : "16-wide", P, frz, slab, off, co, nd ? "DIFFER" : "identical");
+                    printf("speed paths: %s P %3d frozen GN %d slab %2d offload %d direct %d: %d fp16 logit channels %s\n", ci ? "32-wide" : "16-wide", P, frz, slab, off, dir, co, nd ? "DIFFER" : "identical");
                 }
                 unet_free(u);
             }
             free(gst); free(ref); free(b); free(b2); free(hct); free(hrow); nn_free(drow);
         }
-        unet_set_slab_ovl(-1); nn_set_conv1_const(1); unet_set_infer_offload(1); unet_set_infer_slab(0);   /* (-1: the default, by width) */
+        unet_set_slab_ovl(-1); nn_set_conv1_const(1); unet_set_infer_offload(1); unet_set_infer_slab(0); unet_set_slab_direct(-1);   /* (-1: the default, by width / env) */
     }
     if (fails) return 1;
     printf("test_infer_mem: ok\n");

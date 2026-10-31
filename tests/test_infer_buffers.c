@@ -9,6 +9,7 @@ int main(void) {
     if (nn_init(0)) return 1;
     int fails = 0; nn_set_sr(0); nn_set_f16(1);
     unet_set_slab_ovl(0);   /* (the buffer-reuse comparison: no second slab temp from the overlapped slab copies) */
+    unet_set_slab_direct(0);   /* (nor the direct slabs' second level-0 / level-1 buffers) */
     for (int levels = 2; levels <= 4; levels += 2) for (int rc = 0; rc <= 2; rc++) for (int mode = 0; mode < 3; mode++) {
         unet_cfg cfg = {levels, {16, 32, 64, 80}, 4, 2, 8, 1};
         shape5 xs = {1, 4, 32, 32, 32}; size_t n = shape_numel(xs), no = n / 2;
