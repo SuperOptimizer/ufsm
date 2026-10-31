@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# scripts/v2/mksources.sh OUT.json: the v2 universal-model sources (winding + ink), modelled on scripts/selftrain/mksources.sh.
+# scripts/v2/mksources.sh [OUT.json] (default V2/sources/sources-v2.json): the v2 universal-model sources (winding + ink), modelled on scripts/selftrain/mksources.sh.
 #  1. surface sources, one per train scroll of V2/scrolls.tsv with V2LABEL labels (V2/labels/<S>/phase.zarr/<KEY>: pair-rule band phase on
 #     the scan's training grid, ignored voxels already 255): phase-only band target (radius 20, span 19, stored phase at the scan's
 #     training level: 0 for the 8.64 / 9.36 um scans, 2 for the 2.4 um scans) + targets.ink = the pseudo ink (V2/ink/pseudo/<S>.zarr,
-#     prob254, ift3-24000 in the recto band; "weight" PINKW 0.5 = its loss weight relative to human ink) when it exists
+#     prob254, ift3-24000 in the recto band; source "ink_weight" PINKW 0.3, human ink 1 = V2TRAIN's per-source ink loss weight) when it exists
 #     + "focus" (phase-packing --map of the labels, w FOCUSW 2: packed chunks drawn more often). Weights by labelled mm3
 #     (phase-packing's labelled voxels with neighbours x um^3), sharing SURF (0.60) of the total.
 #  2. Paris 4 GT (PK8: june / july phaseA/B + its PH1-3 / HOLD holdout dummies, CT root -> V2/ct): GTSHARE (0.25) of the total, so the
@@ -16,11 +16,12 @@
 # The per-source table goes to stderr. Env: V2 (/vesuvius/ufsm/v2), U (V2/src/build/ufsm), HO, PK8, SURF / GTSHARE / INKSHARE, PINKW,
 # FOCUSW, MARGIN_MM, MINMM3 (1: surface scrolls with fewer labelled mm3 are left out), TH (16).
 set -euo pipefail
-OUT=${1:?usage: mksources.sh OUT.json}; H=$(cd "$(dirname "$0")" && pwd)
+# (sources format agreed with V2TRAIN 10-31: targets.ink {root, group ".", encoding prob254} + source "ink_weight"; ink-only sources allowed)
+OUT=${1:-/vesuvius/ufsm/v2/sources/sources-v2.json}; mkdir -p $(dirname $OUT); H=$(cd "$(dirname "$0")" && pwd)
 V2=${V2:-/vesuvius/ufsm/v2}; U=${U:-$V2/src/build/ufsm}; TH=${TH:-16}
 HO=${HO:-/vesuvius/ufsm/wbench/holdouts.json}; PK8=${PK8:-/vesuvius/ufsm/paris4/wnew/sources-pk8.json}
 MIRROR=${MIRROR:-https://dl.ash2txt.org/community-uploads/forrest/volcomp}
-SURF=${SURF:-0.60}; GTS=${GTSHARE:-0.25}; INKS=${INKSHARE:-0.15}; PINKW=${PINKW:-0.5}; FOCUSW=${FOCUSW:-2}
+SURF=${SURF:-0.60}; GTS=${GTSHARE:-0.25}; INKS=${INKSHARE:-0.15}; PINKW=${PINKW:-0.3}; FOCUSW=${FOCUSW:-2}
 T=$(mktemp -d); trap 'rm -rf $T' EXIT; mkdir -p $V2/focus
 # 1. surface sources: labelled volume + focus map per scroll (cached in V2/focus/<S>.{raw,raw.json,txt})
 tail -n +2 $V2/scrolls.tsv | while IFS=$'\t' read -r S SPLIT NW WR WC SJ SL AX CR K UM LV FL PK _; do
@@ -50,8 +51,8 @@ while read -r S CR K UM LV AX key mm3 ink; do
     '{name: $n, root: $r, ct: $c, um: $um, weight: $w} + (if $ax != "-" then {axis: $ax} else {} end)
      + (if $lv == 2 then {min_level: 2, max_level: 2} else {min_level: 0, max_level: 0} end)
      + {targets: ({band: {radius: 20, span: 19, phase: {root: $pr, key: $pk, level: $lv}}}
-                  + (if $ink != "-" then {ink: {root: $ink, group: ".", encoding: "prob254", min_level: $lv, weight: $iw}} else {} end)),
-        focus: {map: $fm, w: $fw}}' >> $T/surf.jsonl
+                  + (if $ink != "-" then {ink: {root: $ink, group: ".", encoding: "prob254"}} else {} end)),
+        focus: {map: $fm, w: $fw}} + (if $ink != "-" then {ink_weight: $iw} else {} end)' >> $T/surf.jsonl
 done < $T/surf.txt
 # 2. Paris 4 GT (relative weights kept, scaled to GTSHARE; CT from the v2 tree)
 P4K=$(jq -r '.sources[0].ct' $PK8)
@@ -66,7 +67,7 @@ awk -F'\t' '!/^#/' $H/inkhuman.tsv | while IFS=$'\t' read -r n S vol um lv w lab
      --arg lab $V2/ink/human/tight/$lab --arg hold "$hold" --arg ax "$ax" \
     '{name: $n, root: $r, ct: $c, um: $um, weight: $w, min_level: $lv, max_level: $lv} + (if $ax != "-" then {axis: $ax} else {} end)
      + (if $hold != "-" then {holdout: ($hold | split(",") | map(tonumber))} else {} end)
-     + {targets: {ink: {root: $lab, group: ".", encoding: "prob254", min_level: $lv}}}' >> $T/ink.jsonl
+     + {targets: {ink: {root: $lab, group: ".", encoding: "prob254"}}, ink_weight: 1}' >> $T/ink.jsonl
 done
 # 4. bench holdouts: holdout_file everywhere + margin dummies per box of a CT some source uses
 mg=${MARGIN_MM:-0.5}
