@@ -60,8 +60,8 @@ static char *tfx_meta(const char *metapath) {
 /* the threaded joint-XYZ writer (src/tiffw.h tfx_sfc_write): persistent workers claim patches in file order and fill + encode each
    into a ring slot (with its index entries' value ranges and CRC); the worker that completes the next patch in file order appends it
    and every completed one after it (under the lock: appends are strictly in patch order). Workers run up to a ring ahead of the
-   appends: no per-batch barrier and no hand-off per patch (a caller thread woken for every patch spent most of the write waiting
-   for the scheduler on a loaded host: PHerc0490B 150-row strip 33.8k patches, 829 s for 72 CPU-s). */
+   appends: no per-batch barrier and no thread woken per patch. (A strip on the desk's /mnt/scratch waited 829 s for 72 CPU-s: the
+   kernel's dirty-page throttling while pod pulls filled that disk, not the writer: time writes on a quiet disk.) */
 typedef struct {
     int w, h, nbx, R; long long nball; double err; tfx_fill_fn fill; void *ctx; sfc_writer *wr;
     float (*joint)[4096][3]; uint8_t (*valid)[4096]; uint8_t **pk; size_t *pn, *pcap; uint8_t (*rg)[3][12]; uint32_t *crc;

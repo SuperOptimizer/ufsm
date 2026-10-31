@@ -404,7 +404,7 @@ The `.sfc` files (here and in `ufsm strip`) are encoded on all threads, byte-ide
 at 4 threads). The encoder itself runs ~1.8x faster with the same bytes: the vendored surfcomp's DCTs and quantizer on 8-wide vectors
 (the same multiply-add order per lane; the build has no FP contraction), each candidate tokenized once, tANS sizes before bytes, the
 index entries buffered (`test_tfx` checks golden hashes of the original encoder). The writer's workers run a ring ahead and append
-in order themselves (no caller hand-off per patch: that stalled on a loaded host). `--fields` reads the data weight chunk by chunk
+in order themselves (no thread woken per patch). `--fields` reads the data weight chunk by chunk
 on threads (PHerc0490B's 80 G cells at pool 8: 190 -> 6 s), the slab models load on threads, and a row's slab choice is made once.
 PHerc0490B wraps + strip and a Paris 4 crop: every file byte-identical to master.
 
