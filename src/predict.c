@@ -1279,7 +1279,9 @@ int cmd_predict(int argc, char **argv) {
     feather_t FE = {0}; const int FEN = stride + fea; uint8_t *fext = nullptr, *fhost = nullptr;   /* --feather: E on the device and pinned on the host */
     if (fea) {
         const size_t e3 = (size_t)FEN * FEN * FEN;
-        if (feather_init(&FE, stride, fea, nss) || !(fext = nn_malloc_try(e3)) || !(fhost = nn_host_alloc_try(e3))) { fprintf(stderr, "predict: --feather: out of memory (%.2f GB device + pinned host)\n", e3 / 1e9); return 1; }
+        /* E on the device: in the CT window's buffer (the level-0 skip scratch, dead from the end of the forward until the next window's
+           upload) when it holds E and the logits do not overlap it (checked per window), else its own buffer (1.2 GB at interior 1024) */
+        if (feather_init(&FE, stride, fea, nss) || (!(ct_shared && w3 >= e3) && !(fext = nn_malloc_try(e3))) || !(fhost = nn_host_alloc_try(e3))) { fprintf(stderr, "predict: --feather: out of memory (%.2f GB device + pinned host)\n", e3 / 1e9); return 1; }
     }
     int64_t cur_shard = -1, so[3] = {0, 0, 0}, se[3] = {0, 0, 0}, sz = 0, sy = 0, sx = 0;
     int any = 0;
@@ -1496,9 +1498,13 @@ int cmd_predict(int argc, char **argv) {
             }
             if (gpath && sup && fea) {   /* --feather: E (interior + B upper halo voxels) to the host, blended with the earlier spills */
                 const int64_t SZ = t->shard / (nss[1] * nss[2]), SY = (t->shard / nss[2]) % nss[1], SX = t->shard % nss[2];
-                if (ct_shared) nn_pred_place_m(lg, ctmi, W, halo - fea, -halo, -halo, -halo, FEN, FEN, FEN, FEN, fext);
-                else nn_pred_place(lg, ctd, W, halo - fea, -halo, -halo, -halo, FEN, FEN, FEN, FEN, fext);
-                nn_d2h(fhost, fext, (size_t)FEN * FEN * FEN);
+                const size_t e3 = (size_t)FEN * FEN * FEN;
+                uint8_t *fdst = fext;
+                if (ct_shared && w3 >= e3 && ((const uint8_t *)lg + w3 * 4 <= ctd || (const uint8_t *)lg >= ctd + e3)) fdst = ctd;
+                else if (!fdst && !(fdst = fext = nn_malloc_try(e3))) { fprintf(stderr, "predict: --feather: no device memory for E (%.2f GB)\n", e3 / 1e9); return 1; }
+                if (ct_shared) nn_pred_place_m(lg, ctmi, W, halo - fea, -halo, -halo, -halo, FEN, FEN, FEN, FEN, fdst);
+                else nn_pred_place(lg, ctd, W, halo - fea, -halo, -halo, -halo, FEN, FEN, FEN, FEN, fdst);
+                nn_d2h(fhost, fdst, e3);
                 const char *e = nn_check();
                 if (e) { fprintf(stderr, "cuda: %s\n", e); return 1; }
                 if (pprof) { p_gpu += now() - pt; pt = now(); }
