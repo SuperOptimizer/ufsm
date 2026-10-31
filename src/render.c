@@ -14,6 +14,7 @@
 #include "store.h"
 #include "tiffw.h"
 #include "zarr3.h"
+#include "gpudec.h"
 #include <dirent.h>
 #include <math.h>
 #include <pthread.h>
@@ -228,10 +229,10 @@ static int render_pass(z3 *z, rsheet *S, int ns, int k, const int *depth, int nd
                 for (size_t q = 0; q < np && (live + nt) * cv > budget; q++) { free(T.ptr[lp[q].i]); T.ptr[lp[q].i] = nullptr; live--; }
             }
             pass_job J = {&T, S, k, nd, dm, depth, b + g0, g1 - g0, 0, todo, nt, 0, 0};
-            const int nth = nthreads < 1 ? 1 : nthreads > 64 ? 64 : nthreads; pthread_t th[64];
+            const int nth = nthreads < 1 ? 1 : nthreads > 64 ? 64 : nthreads, ndt = gpudec_threads(nth) > 64 ? 64 : gpudec_threads(nth); pthread_t th[64];
             if (nt) {
-                for (int t = 0; t < nth; t++) pthread_create(&th[t], nullptr, decode_worker, &J);
-                for (int t = 0; t < nth; t++) pthread_join(th[t], nullptr);
+                for (int t = 0; t < ndt; t++) pthread_create(&th[t], nullptr, decode_worker, &J);
+                for (int t = 0; t < ndt; t++) pthread_join(th[t], nullptr);
                 if (atomic_load(&J.failed)) { fprintf(stderr, "render-sheets: chunk read failed: %s\n", z3_error()); rc = -1; }
                 for (size_t q = 0; q < nt; q++) if (T.ptr[todo[q]] != T.zero) live++;
                 T.ndecoded += nt;
@@ -491,7 +492,7 @@ int render_wraps_chunked_fill(z3 *const *vz, int nv, const int *depth, int ns, c
           free(fill); }
         for (size_t k = 0; k < nb; k++) R->gleft[R->bgrp[k]]++;
         pthread_mutex_init(&R->mu, nullptr); pthread_cond_init(&R->cv, nullptr);
-        const int nr = nthreads < 1 ? 1 : nthreads > 64 ? 64 : nthreads, nd = io_threads < 1 ? nr : io_threads > 128 ? 128 : io_threads;
+        const int nr = nthreads < 1 ? 1 : nthreads > 64 ? 64 : nthreads, nd0 = io_threads < 1 ? nr : io_threads > 128 ? 128 : io_threads, nd = gpudec_threads(nd0) > 128 ? 128 : gpudec_threads(nd0);   /* GPU decoding: more decoders in flight (they wait on the batches) */
         pthread_t th[192];
         for (int t = 0; t < nd; t++) pthread_create(&th[t], nullptr, wr_decoder, R);
         for (int t = 0; t < nr; t++) pthread_create(&th[nd + t], nullptr, wr_renderer, R);

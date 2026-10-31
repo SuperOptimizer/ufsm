@@ -183,3 +183,4 @@ test_jpegpar                                   |              |    10 | ./$B/tes
 test_sysinfo                                   |              |     5 | ./$B/test_sysinfo
 test_volcomp_fast                              |              |    25 | ./$B/test_volcomp_fast
 test_z3_autosub                                |              |    10 | ./$B/test_z3_autosub
+test_gpudec                                    | gpu          |    10 | ./$B/test_gpudec
