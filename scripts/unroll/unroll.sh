@@ -206,14 +206,17 @@ lane() {   # lane GPU
     # FIT_MANAGED=1 (the last refit try of a failed slab) puts the fields in managed memory (fit picks it itself when they leave too little
     # device headroom since 6126e23; this is the fallback)
     local man=${FIT_MANAGED:-0}
-    env UFSM_FIT_THREADS=${FTHREADS:-10} $([ "$man" = 1 ] && echo UFSM_FIT_MANAGED=1) /usr/bin/time -v nice -n 5 $U fit $d/f --gpu $g --out $d/fit --dir $dir --ref-model $REF --ref-snap 1 --uw-repair 0 ${FITX:-} > $d/fit.log 2>&1; rc=$?
+    env UFSM_FIT_THREADS=$FTH_LANE $([ "$man" = 1 ] && echo UFSM_FIT_MANAGED=1) /usr/bin/time -v nice -n 5 $U fit $d/f --gpu $g --out $d/fit --dir $dir --ref-model $REF --ref-snap 1 --uw-repair 0 ${FITX:-} > $d/fit.log 2>&1; rc=$?
     echo "$s $c0..$c1 rc $rc gpu $g $(( $(date +%s) - t0 ))s$([ "$man" = 1 ] && echo " managed")" >> $O/slabs.txt
     if [ $rc = 0 ]; then touch $d/done; elif grep -q "no data for the prior" $d/fit.log; then touch $d/empty $d/done; fi
     rm -rf $d/f; exec 9>&-
   done
 }
 slabs() {
-  local g pids=()
+  local g pids=() ng
+  # fit threads per lane: the host's CPUs over the lanes (fits are thread-count independent: 0490B s020/s021 models equal at 10 / 20;
+  # 1 lane 10 -> 20 threads: 8 slabs 163 -> 150 s; 2 lanes per GPU with the GPU lock: 156 s, not used)
+  ng=$(echo $FITGPUS | wc -w); FTH_LANE=${FTHREADS:-$(( $(ncpu) / (ng > 0 ? ng : 1) ))}; [ $FTH_LANE -lt 2 ] && FTH_LANE=2
   for g in $FITGPUS; do
     if [ "$g" = "$INKGPU" ] && ! done_ ink; then { [ "$DRY" = 1 ] && echo "    (GPU $g lane starts once the ink is done or failed)" || while ! done_ ink && ! stopped && [ ! -e $O/state/ink.failed ]; do sleep 30; done; lane $g; } &
     else lane $g & fi; pids+=($!)
