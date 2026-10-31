@@ -65,6 +65,7 @@ extern "C" void fgpu_close(fgpu *G) {
     free(G->ptab); free(G->dhave); free(G->seg); free(G->freel); free(G);
 }
 extern "C" int fgpu_broken(const fgpu *G) { return !G || G->broken; }
+extern "C" void fgpu_set_broken(fgpu *G) { if (G) G->broken = 1; }
 
 static int fg_slot(fgpu *G) {   /* under G->mu */
     if (!G->nfree) {
@@ -111,6 +112,25 @@ extern "C" int fgpu_put(fgpu *G, size_t id, const uint8_t *buf, uint32_t mask) {
     if (e != cudaSuccess) { cudaGetLastError(); G->broken = 1; fprintf(stderr, "faces gpu: upload: %s: CPU from here\n", cudaGetErrorString(e)); return -1; }
     __atomic_fetch_add(&G->nput, 1, __ATOMIC_RELAXED); __atomic_fetch_add(&G->bytes, bytes, __ATOMIC_RELAXED);
     return 0;
+}
+/* the device chunk of chunk id (a slot taken if it has none) for a decoder that writes it directly (gpudec_decode_dev); nullptr: pool
+   full / broken. fgpu_have: substreams written there that way (fgpu_put then sends only the others) */
+extern "C" uint8_t *fgpu_chunk_dev(fgpu *G, size_t id) {
+    if (G->broken) return nullptr;
+    pthread_mutex_lock(&G->mu);
+    int s = G->ptab[id];
+    if (s < 0) {
+        if ((s = fg_slot(G)) < 0) { G->broken = 1; pthread_mutex_unlock(&G->mu); fprintf(stderr, "faces gpu: device chunk pool full (%d MB): CPU from here\n", G->nseg * (int)(SEG * CV >> 20)); return nullptr; }
+        G->ptab[id] = s; G->dhave[id] = 0; G->dirty = 1;
+    }
+    uint8_t *d = G->seg[s / SEG] + (size_t)(s % SEG) * CV;
+    pthread_mutex_unlock(&G->mu);
+    return d;
+}
+extern "C" void fgpu_have(fgpu *G, size_t id, uint32_t mask) {
+    pthread_mutex_lock(&G->mu);
+    if (G->ptab[id] >= 0) G->dhave[id] |= mask;
+    pthread_mutex_unlock(&G->mu);
 }
 static int fg_stage_wait(fgpu *G) {   /* every staged copy done (before a kernel reads the pool) */
     for (int k = 0; k < NSTG; k++) if (cudaStreamSynchronize(G->stg[k].st) != cudaSuccess) { cudaGetLastError(); G->broken = 1; return -1; }

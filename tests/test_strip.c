@@ -71,6 +71,32 @@ int main(void) {
     snprintf(p, sizeof p, "%s/strip/flat/stripes.tsv", root); f = fopen(p, "r"); double area = 0;
     if (f) { char line[1024]; if (fgets(line, sizeof line, f)) while (fgets(line, sizeof line, f)) { char nm[64]; int a, c, d; double u0, l, v; if (sscanf(line, "%63s %d %d %d %lf %lf %lf", nm, &a, &c, &d, &u0, &l, &v) == 7) area += v; } fclose(f); }
     { const double A = Lcm * (Hcm + step * um * 1e-4); CHECK(fabs(area - A) < 0.03 * A, "stripes valid area %.4f vs %.4f cm2", area, A); }
+    /* --jobs / --stripe-jobs: chunks and stripes on concurrent workers, in order: --jobs 3 (1 thread each) writes the bytes of --jobs 1 --threads 1
+       (CPU: the SLIM sums depend on the threads per chunk; GPU: on nothing); chunks.tsv equal but for its seconds column */
+    {
+        const char *jv[2] = {"1", "3"};
+        for (int k = 0; k < 2; k++) {
+            char a1[300], a2[300]; snprintf(a1, sizeof a1, "%s/strip", root); snprintf(a2, sizeof a2, "%s/fj%s", root, jv[k]);
+            char *av[] = {"ufsm", "strip-flatten", a1, "--out", a2, "--stride", "96", "--threads", (char *)jv[k], "--jobs", (char *)jv[k], "--stripe-jobs", (char *)jv[k], "--stripe-px", "1500", "--iters", "60", "--cg", "300", "--tol", "1e-9"};
+            CHECK(!cmd_strip_flatten(22, av), "strip-flatten --jobs %s failed", jv[k]);
+        }
+        char cmd[2048];
+        snprintf(cmd, sizeof cmd, "cd %s/fj1 && test -e flat.json && for x in $(find . -type f ! -name chunks.tsv); do cmp -s $x ../fj3/$x || { echo $x differs; exit 1; }; done && "
+                 "cut -f1-10 chunks.tsv > ../c1 && cut -f1-10 ../fj3/chunks.tsv > ../c3 && cmp -s ../c1 ../c3", root);
+        CHECK(!system(cmd), "strip-flatten --jobs 3 output differs from --jobs 1");
+#ifdef STRIP_GPU
+        {   /* GPU vs CPU: the same flattening within the solvers' summation-order noise */
+            char a1[300], a2[300]; snprintf(a1, sizeof a1, "%s/strip", root); snprintf(a2, sizeof a2, "%s/fcpu", root);
+            char *av[] = {"ufsm", "strip-flatten", a1, "--out", a2, "--stride", "96", "--threads", "4", "--gpu", "0", "--stripe-px", "1500", "--iters", "60", "--cg", "300", "--tol", "1e-9"};
+            CHECK(!cmd_strip_flatten(20, av), "strip-flatten --gpu 0 failed");
+            char q[400], c[4096] = {0}; snprintf(q, sizeof q, "%s/fcpu/flat.json", root); FILE *g = fopen(q, "r");
+            if (g) { size_t nr = fread(c, 1, sizeof c - 1, g); (void)nr; fclose(g); }
+            const double l2 = num(c, "\"length_cm\": "), b50 = num(c, "\"aniso_p50\": "), b95 = num(c, "\"aniso_p95\": ");
+            printf("strip GPU vs CPU: length %.5f / %.5f cm, aniso p50 %.5f / %.5f, p95 %.5f / %.5f\n", len, l2, a50, b50, a95, b95);
+            CHECK(fabs(len - l2) < 1e-4 * l2 && fabs(a50 - b50) < 1e-3 && fabs(a95 - b95) < 1e-3, "GPU vs CPU flattening differs");
+        }
+#endif
+    }
     /* strip-mosaic on synthetic renders of the stripes: --threads 1 and --threads 4 must write the same bytes */
     {
         char rdir[400]; snprintf(rdir, sizeof rdir, "%s/render", root); snprintf(cmd, sizeof cmd, "mkdir -p %s", rdir); if (system(cmd)) {}
@@ -78,7 +104,7 @@ int main(void) {
         if (f) { char line[1024]; if (fgets(line, sizeof line, f)) while (fgets(line, sizeof line, f)) { char nm[64]; int a, c, d;
             if (sscanf(line, "%63s %d %d %d", nm, &a, &c, &d) != 4) continue;
             const int ow = render_out_px(c, 1.0), oh = render_out_px(d, 1.0); uint8_t *ct = malloc((size_t)ow * oh), *ik = malloc((size_t)ow * oh);
-            for (int i = 0; i < ow * oh; i++) { const unsigned hsh = (unsigned)(i + a) * 2654435761u; ct[i] = (uint8_t)(60 + (hsh >> 24) % 120); ik[i] = (uint8_t)((hsh >> 16) & 255); }
+            for (int i = 0; i < ow * oh; i++) { const unsigned hsh = (unsigned)(i + a) * 2654435761u; ct[i] = (uint8_t)(hsh % 23 == 0 ? 0 : 60 + (hsh >> 24) % 120);   /* (some CT 0: off the papyrus) */ ik[i] = (uint8_t)((hsh >> 16) & 255); }
             snprintf(p, sizeof p, "%s/%s_ct.tif", rdir, nm); CHECK(!tiffw_write(p, ow, oh, 1, ct, 1), "write %s", p);
             snprintf(p, sizeof p, "%s/%s.tif", rdir, nm); CHECK(!tiffw_write(p, ow, oh, 1, ik, 1), "write %s", p);
             free(ct); free(ik); nst++; } fclose(f); }
@@ -126,9 +152,28 @@ int main(void) {
           CHECK(!cmd_strip_mosaic(15, av), "strip-mosaic --fill-maps failed");
           double v1 = 0, v7 = 0; for (int k = 0; k < 2; k++) { snprintf(p, sizeof p, "%s/%s/strip_papyrus.tsv", root, k ? "m7" : "m8"); FILE *t = fopen(p, "r"); char ln[256];
               if (t) { if (fgets(ln, sizeof ln, t)) {} while (fgets(ln, sizeof ln, t)) { double u, v; if (sscanf(ln, "%lf %lf", &u, &v) == 2) *(k ? &v7 : &v1) += v; } fclose(t); } }
-          CHECK(v7 > v1 && v1 > 0, "--fill-maps valid area %g vs %g", v7, v1); }
+          CHECK(v7 > v1 && v1 > 0, "--fill-maps valid area %g vs %g", v7, v1);
+          /* --papyrus-dir: the grey and the papyrus mosaic from one read write the files of the two separate runs */
+          snprintf(a3, sizeof a3, "%s/m9", root); char a4[400]; snprintf(a4, sizeof a4, "%s/m9p", root);
+          char *av9[] = {"ufsm", "strip-mosaic", a1, rdir, a3, "--threads", "3", "--stripe-jobs", "2", "--rows", "2", "--overview-px", "600", "--stretch", sv, "--fill-maps", fm,
+                         "--papyrus-dir", a4, "--papyrus-gain", "2.5", "--papyrus-bg", "300", "--papyrus-overview-px", "350"};
+          CHECK(!cmd_strip_mosaic(25, av9), "strip-mosaic --papyrus-dir failed");
+          snprintf(a3, sizeof a3, "%s/m10", root);
+          char *av10[] = {"ufsm", "strip-mosaic", a1, rdir, a3, "--threads", "1", "--stripe-jobs", "1", "--rows", "2", "--overview-px", "350", "--stretch", sv, "--fill-maps", fm,
+                          "--papyrus", "2.5", "--papyrus-bg", "300"};
+          CHECK(!cmd_strip_mosaic(21, av10), "strip-mosaic --papyrus --fill-maps failed");
+          snprintf(cmd, sizeof cmd, "cd %s && for x in $(ls m7); do cmp -s m7/$x m9/$x || { echo $x; exit 1; }; done && for x in $(ls m10); do cmp -s m10/$x m9p/$x || { echo $x; exit 1; }; done && "
+                   "test $(ls m9 | wc -l) = $(ls m7 | wc -l) && test $(ls m9p | wc -l) = $(ls m10 | wc -l)", root);
+          CHECK(!system(cmd), "strip-mosaic --papyrus-dir output differs from the separate grey / --papyrus runs"); }
+        /* one-pixel overview cells (small row bands) and the stripe / thread counts: the same bytes */
+        { static const char *o2[2] = {"m11", "m12"}, *t2[2] = {"1", "5"}, *j2[2] = {"1", "3"};
+          for (int k = 0; k < 2; k++) { char a1[400], a3[400], a4[400]; snprintf(a1, sizeof a1, "%s/strip/flat", root); snprintf(a3, sizeof a3, "%s/%s", root, o2[k]); snprintf(a4, sizeof a4, "%s/%sp", root, o2[k]);
+              char *av[] = {"ufsm", "strip-mosaic", a1, rdir, a3, "--threads", (char *)t2[k], "--stripe-jobs", (char *)j2[k], "--rows", "1", "--overview-px", "100000", "--stretch", sv, "--papyrus-dir", a4};
+              CHECK(!cmd_strip_mosaic(19, av), "strip-mosaic 1:1 overview --threads %s failed", t2[k]); }
+          snprintf(cmd, sizeof cmd, "cd %s && for x in $(ls m11); do cmp -s m11/$x m12/$x || { echo $x; exit 1; }; done && for x in $(ls m11p); do cmp -s m11p/$x m12p/$x || { echo $x; exit 1; }; done", root);
+          CHECK(!system(cmd), "strip-mosaic 1:1 overview: --threads 5 --stripe-jobs 3 differs from 1 / 1"); }
     }
-    if (!fails) { snprintf(cmd, sizeof cmd, "rm -r %s", root); if (system(cmd)) {} }
+    if (!fails && !getenv("TEST_STRIP_KEEP")) { snprintf(cmd, sizeof cmd, "rm -r %s", root); if (system(cmd)) {} }
     printf("test_strip: %s\n", fails ? "FAILED" : "ok");
     return fails ? 1 : 0;
 }
