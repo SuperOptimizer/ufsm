@@ -216,12 +216,13 @@ static int feather_keep(feather_t *F, int64_t a, int64_t b, int64_t c) {
 typedef struct { int k; int64_t a, b, c; int noout; } fe_job;
 typedef struct {
     feather_t *F; writer_t *WR; int sb; int kss, shard; const int64_t *ns, *bn;
-    uint8_t *fh[2]; int busy[2];
+    uint8_t *fh[2]; int busy[2]; int gpu; void *evs[2], *evd[2];   /* evd[k]: E's device-to-host copy into fh[k] (queued, not waited by the main thread) */
     fe_job q[2]; int qh, qn, stop, failed; atomic_long done;   /* done: windows blended and handed to the writer */
     pthread_mutex_t mu; pthread_cond_t cv; pthread_t th;
 } fe_worker;
 static void *fe_main(void *arg) {
     fe_worker *W = arg; feather_t *F = W->F; const int kss = W->kss, shard = W->shard;
+    if (W->evd[0]) nn_init(W->gpu);
     for (;;) {
         pthread_mutex_lock(&W->mu);
         while (!W->qn && !W->stop) pthread_cond_wait(&W->cv, &W->mu);
@@ -229,6 +230,7 @@ static void *fe_main(void *arg) {
         const fe_job j = W->q[W->qh];
         pthread_mutex_unlock(&W->mu);
         int bad = 0;
+        if (W->evd[j.k]) nn_event_sync(W->evd[j.k]);   /* (E's copy on the offload stream) */
         F->e = W->fh[j.k]; feather_lookup(F, j.a, j.b, j.c);
         if (!j.noout) for (int64_t qz = j.a * kss; qz < j.a * kss + kss && qz < W->ns[0] && !bad; qz++) for (int64_t qy = j.b * kss; qy < j.b * kss + kss && qy < W->ns[1] && !bad; qy++)
         for (int64_t qx = j.c * kss; qx < j.c * kss + kss && qx < W->ns[2] && !bad; qx++) {
@@ -1413,7 +1415,8 @@ int cmd_predict(int argc, char **argv) {
         /* E on the device: in the CT window's buffer (the level-0 skip scratch, dead from the end of the forward until the next window's
            upload) when it holds E and the logits do not overlap it (checked per window), else its own buffer (1.2 GB at interior 1024) */
         if (feather_init(&FE, stride, fea, nss) || (!(ct_shared && w3 >= e3) && !(fext = nn_malloc_try(e3))) || !(fhost = nn_host_alloc_try(2 * e3))) { fprintf(stderr, "predict: --feather: out of memory (%.2f GB device + 2x pinned host)\n", e3 / 1e9); return 1; }
-        FW = (fe_worker){.F = &FE, .WR = &WR, .sb = sb, .kss = kss, .shard = shard, .ns = ns, .bn = bn, .fh = {fhost, fhost + e3}};
+        FW = (fe_worker){.F = &FE, .WR = &WR, .sb = sb, .kss = kss, .shard = shard, .ns = ns, .bn = bn, .fh = {fhost, fhost + e3}, .gpu = gpu};
+        if (gpath && (!getenv("UFSM_FE_ASYNC") || ufsm_env_on("UFSM_FE_ASYNC"))) for (int k = 0; k < 2; k++) { FW.evs[k] = nn_event_create(); FW.evd[k] = nn_event_create(); }
         pthread_mutex_init(&FW.mu, nullptr); pthread_cond_init(&FW.cv, nullptr);
         if (pthread_create(&FW.th, nullptr, fe_main, &FW)) { fprintf(stderr, "predict: cannot start the feather thread\n"); return 1; }
     }
@@ -1654,7 +1657,9 @@ int cmd_predict(int argc, char **argv) {
                 const int ff = FW.failed; pthread_mutex_unlock(&FW.mu);
                 if (ff) { fprintf(stderr, "predict: --feather: %s\n", ff == 2 ? "out of host memory for the spills" : z3w_error()); return 1; }
                 if (pprof) { p_copy += now() - pt; pt = now(); }
-                nn_d2h(FW.fh[fk], fdst, e3);
+                if (FW.evd[fk]) { nn_offload_copy(FW.fh[fk], fdst, e3, 1, FW.evs[fk], FW.evd[fk]); nn_stream_wait(0, FW.evd[fk]); }   /* (the next window's
+                                                     writes to fdst wait for the copy on the device; the blend thread waits for it on the host) */
+                else nn_d2h(FW.fh[fk], fdst, e3);
                 const char *e = nn_check();
                 if (e) { fprintf(stderr, "cuda: %s\n", e); return 1; }
                 if (pprof) { p_gpu += now() - pt; pt = now(); }
