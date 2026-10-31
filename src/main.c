@@ -144,6 +144,7 @@ static int usage(void) {
         "  ufsm fit <fields-dir> [--slab Z] [--out MODEL] [--winding ZARR] [--codes ROOT KEY]   winding fitter (src/fit.h)\n"
         "  ufsm convert-unwrap2 <unwrap.ckpt> <out.ckpt>   a task unwrap checkpoint as task unwrap2 (heads 2-10 -> 0-8, winding mod 4 fresh; no training step)\n"
         "  ufsm repack <in-array-dir> <out-array-dir> <shard> [--threads N]   lossless re-sharding of a z3w uint8 zarr (copies the compressed chunks)\n"
+        "  ufsm fields-pack IN OUT [--q-phase Q] [--q Q] [--ang A] [--conf C] [--mask-w 1] [--shard 512]   re-encode a fit-field store smaller (readers unchanged)\n"
         "  ufsm wraps <model-dir> <out-dir> [--step 8] [--fields DIR]          one tifxyz per wrap (level sets of W)\n"
         "  ufsm coreline detect|box|sdist|check ...   a crushed scroll's flattened umbilicus per z (fit fields), half-box fit dirs behind it, check renders\n"
         "  ufsm render-sheets <tifxyz-dir> <out-dir> --ct ROOT KEY --ink ROOT KEY ...   every sheet -> CT + red ink 5-panel JPEGs, one batch\n"
@@ -1724,13 +1725,13 @@ static void *wraps_rows(void *arg) {
     wraps_job *J = arg; const fit_model *m = J->m;
     for (int r; (r = atomic_fetch_add(&J->next, 1)) < J->rows;) {
         const double z = fmin(J->zlo + r * J->step, J->Z), cy = m->cy[(int)fmin(z, J->na - 1)], cx = m->cx[(int)fmin(z, J->na - 1)];
-        double rprev = J->rk; size_t valid = 0;
+        double rprev = J->rk; size_t valid = 0; fit_set_row *row = fit_set_row_new(J->fs, z);
         for (int c = 0; c < J->cols; c++) {
             const size_t i = (size_t)r * J->cols + (J->cols - 1 - c);   /* column 0 = the largest theta side (upstream: outermost first) */
             const double th = J->th0 + c * J->dth; double rr;
             J->px[i] = J->py[i] = J->pz[i] = -1;
             double ua, ub; wr_polar_bounds(J->P, r, th, &ua, &ub);
-            if (fit_set_ray_root_b(J->fs, z, th, J->k, rprev, ua, ub, &rr)) continue;
+            if (row ? fit_set_row_root_b(row, th, J->k, rprev, ua, ub, &rr) : fit_set_ray_root_b(J->fs, z, th, J->k, rprev, ua, ub, &rr)) continue;
             const double y = cy + rr * sin(th), x = cx + rr * cos(th);
             if (J->wf) {
                 const int fz = (int)fmin(z / J->wh, J->wsh[0] - 1), fy = (int)fmin(y / J->wh, J->wsh[1] - 1), fx = (int)fmin(x / J->wh, J->wsh[2] - 1);
@@ -1738,6 +1739,7 @@ static void *wraps_rows(void *arg) {
             }
             J->px[i] = (float)(x + m->origin[2]); J->py[i] = (float)(y + m->origin[1]); J->pz[i] = (float)(z + m->origin[0]); valid++; rprev = rr;
         }
+        fit_set_row_free(row);
         atomic_fetch_add(&J->valid, valid);
     }
     return nullptr;
@@ -4061,6 +4063,7 @@ static int cmd_sample(int argc, char **argv) {
 }
 
 int cmd_repack(int argc, char **argv);   /* src/repack.c */
+int cmd_fields_pack(int argc, char **argv);   /* src/fieldspack.c */
 int cmd_fit_join(int argc, char **argv);   /* src/fitjoin.c */
 int cmd_wrap_check(int argc, char **argv);   /* src/wrapcheck.c */
 int cmd_fields_oracle(int argc, char **argv);   /* src/fieldsoracle.c */
@@ -4149,6 +4152,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "sr-pairs")) return cmd_sr_pairs(argc, argv);
     if (!strcmp(cmd, "convert-unwrap2")) return cmd_convert_unwrap2(argc, argv);
     if (!strcmp(cmd, "repack")) return cmd_repack(argc, argv);
+    if (!strcmp(cmd, "fields-pack")) return cmd_fields_pack(argc, argv);
     if (!strcmp(cmd, "phase-raster")) return cmd_phase_raster(argc, argv);
     if (!strcmp(cmd, "wraps")) return cmd_wraps(argc, argv);
     if (!strcmp(cmd, "stitch")) return cmd_stitch(argc, argv);

@@ -124,6 +124,19 @@ static double col_pitch(const st_wrap *a, int c0, int c1, float *buf) {
     return median_f32(v, n);
 }
 
+typedef struct { size_t n; double lo[3], hi[3]; } st_bbox_part;
+typedef struct { const st_wrap *W; const int *ord, *cb, *ce; int h; st_bbox_part *part; } st_bbox_ctx;
+static void k_bbox(void *ctx, long q0, long q1) {
+    const st_bbox_ctx *B = ctx;
+    for (long q = q0; q < q1; q++) {
+        const st_wrap *s = &B->W[B->ord[q]]; st_bbox_part *P = &B->part[q];
+        P->n = 0; for (int a = 0; a < 3; a++) { P->lo[a] = INFINITY; P->hi[a] = -INFINITY; }
+        for (int r = 0; r < B->h; r++) for (int c = B->cb[q]; c < B->ce[q]; c++) {
+            const size_t i = (size_t)r * s->w + c; if (!vok(s, i)) continue; P->n++;
+            const float v[3] = {s->X[i], s->Y[i], s->Z[i]}; for (int a = 0; a < 3; a++) { if (v[a] < P->lo[a]) P->lo[a] = v[a]; if (v[a] > P->hi[a]) P->hi[a] = v[a]; }
+        }
+    }
+}
 typedef struct { const st_wrap *W; const int *mw, *mc; int w, h; } st_fill_ctx;
 static void st_fill(void *ctx, int bx, int by, float (*joint)[3], uint8_t *valid) {   /* one strip.sfc patch (tfx_sfc_write) */
     const st_fill_ctx *F = ctx;
@@ -205,9 +218,13 @@ int cmd_strip(int argc, char **argv) {
     { long long c = 0; for (int q = 0; q < n; q++) { fprintf(tf, "%d\t%d\t%s\t%lld\t%d\t%d\t%.3f\n", q, W[ord[q]].id, W[ord[q]].name, c, ce[q] - cb[q], cb[q], gap[q]); c += ce[q] - cb[q]; } }
     fclose(tf);
     /* strip.sfc, written block row by block row */
+    /* the valid count and bbox: per segment over its rows (row-major runs of the wrap's arrays), segments on threads (min / max and
+       counts: exact in any order) */
     size_t nvalid = 0; double lo[3] = {INFINITY, INFINITY, INFINITY}, hi[3] = {-INFINITY, -INFINITY, -INFINITY};
-    for (int c = 0; c < w; c++) { const st_wrap *s = &W[mw[c]]; for (int r = 0; r < h; r++) { const size_t i = (size_t)r * s->w + mc[c]; if (!vok(s, i)) continue; nvalid++;
-        const float v[3] = {s->X[i], s->Y[i], s->Z[i]}; for (int a = 0; a < 3; a++) { if (v[a] < lo[a]) lo[a] = v[a]; if (v[a] > hi[a]) hi[a] = v[a]; } } }
+    { st_bbox_ctx BC = {W, ord, cb, ce, h, calloc((size_t)n, sizeof(st_bbox_part))};
+      spfor(n, nth, k_bbox, &BC);
+      for (int q = 0; q < n; q++) { const st_bbox_part *P = &BC.part[q]; nvalid += P->n; for (int a = 0; a < 3; a++) { if (P->lo[a] < lo[a]) lo[a] = P->lo[a]; if (P->hi[a] > hi[a]) hi[a] = P->hi[a]; } }
+      free(BC.part); }
     char meta[2048];
     snprintf(meta, sizeof meta, "{\"format\": \"tifxyz\", \"type\": \"strip\", \"uuid\": \"strip\", \"scale\": [%.9g, %.9g], \"bbox\": [[%.3f, %.3f, %.3f], [%.3f, %.3f, %.3f]], "
              "\"voxel_size_um\": %.6g, \"winding\": -1, \"wraps\": [%d, %d], \"walk\": \"%s\", \"valid_vertices\": %zu, \"source\": \"ufsm strip (consecutive wraps joined at the theta cut)\"}\n",

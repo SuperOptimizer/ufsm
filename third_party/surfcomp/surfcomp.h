@@ -150,6 +150,13 @@ int sfc_xyz_encoder_run(sfc_xyz_encoder *, const void *src, size_t ps, size_t rs
 int sfc_write_xyz_encoded(sfc_writer *, const uint8_t *packet, size_t size,
                           const void *src, size_t ps, size_t rs,
                           const uint8_t *mask);
+/* the same append with the index entries' value ranges and the packet CRC computed beforehand (sfc_xyz_ranges, on the encoding
+ * thread; mask as for sfc_xyz_encoder_run): the writer's thread only appends the packet bytes */
+void sfc_xyz_ranges(const void *src, size_t ps, size_t rs, const uint8_t *mask,
+                    double tolerance, const uint8_t *packet, size_t size,
+                    uint8_t ranges[3][12], uint32_t *crc);
+int sfc_write_xyz_encoded_r(sfc_writer *, const uint8_t *packet, size_t size,
+                            uint32_t crc, const uint8_t ranges[3][12]);
 /* Always consumes the writer, on success AND failure. Do not call cancel
  * or any other writer API afterward. Before finish, cancel also consumes it. */
 int sfc_finish(sfc_writer *);

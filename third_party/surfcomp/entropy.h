@@ -408,6 +408,59 @@ static size_t se_tans_encode2(const se_etab et[SE_NMODELS],
     return 0;
   return used;
 }
+/* ufsm: se_tans_encode2's byte count alone (the same state walk; no fields, no bit writes): 0 where it fails */
+static size_t se_tans_size2(const se_etab et[SE_NMODELS], const uint16_t *syms,
+                            size_t n, size_t out_cap) {
+  uint32_t x[2] = {SE_PROB_SCALE, SE_PROB_SCALE};
+  uint64_t bits = 2u * SE_PROB_BITS;
+  for (size_t i = n; i-- > 0;) {
+    const se_esym *e = &et[syms[i] >> 8].sym[syms[i] & 0xffu];
+    if (e->delta_nb == 0xffffffffu)
+      return 0;
+    uint32_t l = (uint32_t)i & 1u;
+    uint32_t nb = (x[l] + e->delta_nb) >> 16;
+    bits += nb;
+    x[l] = et[syms[i] >> 8].state[(x[l] >> nb) + (uint32_t)e->delta_fs];
+  }
+  size_t used = (size_t)((bits + 7) / 8);
+  return used <= out_cap ? used : 0;
+}
+/* ufsm: se_model_build's frequencies and cumulative counts only (what se_tables_write and se_etabs_init read; the decoder table
+ * dt is left as it was: select_entropy's models never decode) */
+static bool se_model_build_enc(se_model *m, const uint32_t counts[SE_NTOK]) {
+  uint64_t total = 0;
+  for (uint32_t s = 0; s < SE_NTOK; s++)
+    total += counts[s];
+  if (total == 0)
+    return false;
+  uint32_t assigned = 0;
+  for (uint32_t s = 0; s < SE_NTOK; s++) {
+    if (counts[s] == 0) {
+      m->freq[s] = 0;
+      continue;
+    }
+    uint64_t f = (uint64_t)counts[s] * SE_PROB_SCALE / total;
+    if (f == 0)
+      f = 1;
+    m->freq[s] = (uint16_t)f;
+    assigned += (uint32_t)f;
+  }
+  if (assigned != SE_PROB_SCALE) {
+    uint32_t big = 0;
+    for (uint32_t s = 1; s < SE_NTOK; s++)
+      if (m->freq[s] > m->freq[big])
+        big = s;
+    int32_t nf =
+        (int32_t)m->freq[big] + ((int32_t)SE_PROB_SCALE - (int32_t)assigned);
+    if (nf < 1)
+      return false;
+    m->freq[big] = (uint16_t)nf;
+  }
+  m->cum[0] = 0;
+  for (uint32_t s = 0; s < SE_NTOK; s++)
+    m->cum[s + 1] = (uint16_t)(m->cum[s] + m->freq[s]);
+  return true;
+}
 typedef struct se_rdec {
   uint32_t x[2];
   uint32_t k;

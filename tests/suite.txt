@@ -61,6 +61,7 @@ test_surf                                      |              |     3 | ./$B/tes
 test_wraps_core                                |              |     1 | ./$B/test_wraps_core
 test_stitch                                    |              |     3 | ./$B/test_stitch
 test_fblend                                    |              |     1 | ./$B/test_fblend
+test_fields_pack                               |              |     2 | ./$B/test_fields_pack
 test_countfield                                |              |     6 | ./$B/test_countfield
 test_vwt_sample                                |              |     1 | ./$B/test_vwt_sample
 test_spiralfit                                 |              |    32 | ./$B/test_spiralfit
@@ -176,6 +177,7 @@ test_split~gn_stored,policy                    | gpu          |    47 | UFSM_TES
 test_formats                                   |              |     1 | ./tests/test_formats.sh
 test_zarr                                      |              |     1 | ./tests/test_zarr.sh
 test_predict_feather                           | gpu          |    10 | ./$B/test_predict_feather ./$B/ufsm
+test_predict_det                               | gpu          |    11 | ./$B/test_predict_det ./$B/ufsm
 test_strip_gpu                                 | gpu          |    10 | ./$B/test_strip_gpu
 test_faces_gpu                                 | gpu          |    10 | ./$B/test_faces_gpu
 test_render_fill                               |              |    10 | ./$B/test_render_fill

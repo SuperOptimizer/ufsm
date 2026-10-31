@@ -66,7 +66,7 @@ __global__ void __launch_bounds__(256) gn_sums_mx2_k(const uint8_t *x, int N, in
 #pragma unroll
         for (int w = 0; w < 8; w++) { a += w1[w][threadIdx.x]; b2 += w2[w][threadIdx.x]; }
         const size_t o = 2 * ((size_t)n * G + (blk * bw + (int)threadIdx.x) / cpg);
-        atomicAdd(&sums[o], (double)a); atomicAdd(&sums[o + 1], (double)b2);
+        gn_acc_add(sums, o, (double)a); gn_acc_add(sums, o + 1, (double)b2);   /* exact fixed point (src/gnacc.cuh) */
     }
 }
 extern "C" int lp_gn_sums_mx(const void *x, int xdt, int N, int C, int G, size_t S, double *sums, size_t v0, size_t v1) { return lp_gn_sums_mx_n(x, xdt, N, C, G, S, sums, v0, v1, 0, N); }
