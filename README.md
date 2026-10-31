@@ -34,7 +34,7 @@ stages below have their own tests: `test_countfield`, `test_fit_join`, `test_wra
 
 `scripts/test/desk_suite.sh [-t fast|slow|all] REF [REGEX...]` pushes the commit into `/vesuvius/ufsm/suite/repo.git` on the desk,
 exports it to `/vesuvius/ufsm/suite/<sha>`, builds it (ccache shared across the sha dirs) and runs the suite at nice 10 under a lock
-(one desk suite at a time). It waits for the desk to have MemAvailable >= 40 GB and a load <= 24 (`-m` / `-l`, at most `-w` 60 min)
+(one desk suite at a time). It waits for the desk to have MemAvailable >= 40 GB and a 1-min load <= 32 (`-m` / `-l`, at most `-w` 60 min)
 before building and before testing, and uses the GPUs with >= 3 GB free. Logs stay in `/vesuvius/ufsm/suite/<sha>/out`.
 
 ## Unroll a scroll

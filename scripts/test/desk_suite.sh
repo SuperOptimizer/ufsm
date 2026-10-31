@@ -7,7 +7,7 @@
 #     REF     branch, tag or commit of the local repo (uncommitted changes are not sent)
 #     -t      tier (default fast = make test); -j / -T: runner jobs / threads per test (default 8 / 3)
 #     -m GB -l LOAD: before the build and before the tests the desk must have MemAvailable >= GB (default 40) and a 1-min
-#             load average <= LOAD (default 24 of 32 threads); -w MIN: wait that long for it (default 60), then give up (exit 3)
+#             load average <= LOAD (default 32 = the thread count); -w MIN: wait that long for it (default 60), then give up (exit 3)
 #     -b N    build jobs (default 12); -k keeps the sha dir after a pass (failed runs are always kept)
 #     REGEX   only tests whose name matches (runner filter)
 #     env SUITE_ARGS: more runner options (e.g. "-P" profile, "-x 600")
@@ -17,7 +17,7 @@
 # /vesuvius/ufsm/suite/<sha>/out (the last 8 sha dirs are kept). Exit = the runner's (0 = all passed).
 set -u
 DESK=${DESK:-forrest@192.168.0.175}; ROOT=/vesuvius/ufsm/suite
-TIER=fast; J=8; T=3; MEMGB=40; LOADMAX=24; WAITMIN=60; BJ=12; KEEP=0
+TIER=fast; J=8; T=3; MEMGB=40; LOADMAX=32; WAITMIN=60; BJ=12; KEEP=0
 while getopts "t:j:T:m:l:w:b:kh" o; do case $o in
   t) TIER=$OPTARG;; j) J=$OPTARG;; T) T=$OPTARG;; m) MEMGB=$OPTARG;; l) LOADMAX=$OPTARG;; w) WAITMIN=$OPTARG;; b) BJ=$OPTARG;; k) KEEP=1;; *) sed -n '2,19p' "$0"; exit 2;; esac; done
 shift $((OPTIND - 1)); [ $# -ge 1 ] || { sed -n '2,19p' "$0"; exit 2; }
@@ -44,6 +44,12 @@ deskok() {   # wait (<= WAITMIN) until MemAvailable >= MEMGB and the 1-min load 
     [ $i = 0 ] && echo "desk_suite: desk busy (MemAvailable ${a} GB, need ${MEMGB}; load ${l}, max ${LOADMAX}): waiting <= ${WAITMIN} min"
     [ $i -lt $n ] && sleep 30; done
   echo "desk_suite: desk still busy (MemAvailable ${a} GB, load ${l}): giving up, try later"; return 1; }
+# the caller gone (ssh dropped, ^C on the laptop): no orphan build or suite on the desk. The build and the runner lead their own
+# process groups (setsid); the watchdog TERMs the current one (the runner's trap stops its tests) once sshd's child has exited.
+SSHPID=$PPID; GRP=$ROOT/.$S.pgid; : > $GRP
+( while kill -0 $SSHPID 2> /dev/null; do sleep 5; done; g=$(cat $GRP 2> /dev/null); [ -n "$g" ] && kill -TERM -- -"$g" 2> /dev/null; kill -TERM $$ 2> /dev/null ) &
+WD=$!; trap 'kill $WD 2> /dev/null; rm -f $GRP' EXIT
+inbg() { setsid "$@" & local p=$!; echo $p > $GRP; wait $p; local r=$?; : > $GRP; return $r; }
 exec 9> $ROOT/suite.lock
 flock -n 9 || { echo "desk_suite: another desk suite holds $ROOT/suite.lock: waiting"; flock 9; }
 deskok || exit 3
@@ -51,8 +57,9 @@ if [ ! -f $W/.built ]; then
   [ -d $W ] && rm -rf -- "$ROOT/$S"
   mkdir -p $W && git -C $ROOT/repo.git archive "$SHA" | tar -x -C $W || exit 2
   echo "desk_suite: building in $W (make -j $BJ, nice 10)"; t0=$(date +%s)
-  if ! (cd $W && nice -n 10 make -j "$BJ" VERIFY=0 build/ufsm build/test_sheet build/make_pipeline_fixture build/test_http_reader \
-          build/test_sampler_safety build/test_formats > build.log 2>&1 && nice -n 10 make -j "$BJ" VERIFY=1 suite-bins >> build.log 2>&1); then
+  cd $W || exit 2
+  if ! inbg bash -c "nice -n 10 make -j $BJ VERIFY=0 build/ufsm build/test_sheet build/make_pipeline_fixture build/test_http_reader \
+          build/test_sampler_safety build/test_formats > build.log 2>&1 && nice -n 10 make -j $BJ VERIFY=1 suite-bins >> build.log 2>&1"; then
     echo "desk_suite: BUILD FAILED ($W/build.log):"; grep -E 'error|Error' $W/build.log | head -30; tail -n 15 $W/build.log; exit 2; fi
   touch $W/.built; echo "desk_suite: built in $(( $(date +%s) - t0 )) s"
 fi
@@ -60,7 +67,7 @@ deskok || exit 3
 G=$(nvidia-smi --query-gpu=index,memory.free --format=csv,noheader,nounits | awk -F', ' '$2 >= 3072' | sort -t, -k2,2nr | cut -d, -f1 | paste -sd, -)
 [ -z "$G" ] && { echo "desk_suite: no GPU with 3 GB free: GPU tests are skipped"; G=none; }
 rm -rf -- "$W/out"
-cd $W && eval nice -n 10 tests/run_suite.sh -t "$TIER" -j "$J" -T "$T" -g "$G" -o "$W/out" -B build-verify $XARGS $FILT; rc=$?
+cd $W && eval inbg nice -n 10 tests/run_suite.sh -t "$TIER" -j "$J" -T "$T" -g "$G" -o "$W/out" -B build-verify $XARGS $FILT; rc=$?
 # keep the last 8 sha dirs (a passed one only with -k)
 [ $rc = 0 ] && [ "$KEEP" = 0 ] && rm -rf -- "$ROOT/$S/build" "$ROOT/$S/build-verify"
 ls -dt $ROOT/[0-9a-f]*/ 2> /dev/null | tail -n +9 | while read -r d; do d=${d%/}; [[ ${d##*/} =~ ^[0-9a-f]{12}$ ]] && rm -rf -- "$ROOT/${d##*/}"; done
