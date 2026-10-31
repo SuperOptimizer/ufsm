@@ -13,7 +13,7 @@
 #   ref     -> fields: count-field --model-only (REFCMD overrides; CPU, TH threads)
 #   slabs   -> ref: snapped slab fits, one lane per GPU in FITGPUS ("0 1"); the INKGPU lane starts once the ink is done
 #   join    -> slabs: fit-join --ref ;  wraps -> join: ufsm wraps (.sfc, step 4, --zr from scrolls.tsv, --min-cm2, --col-r p90)
-#   strip   -> wraps: ufsm strip ($STRIPARGS) ; stripflat -> strip: strip-flatten (FLATX) ; stripimg -> stripflat + ink:
+#   strip   -> wraps: ufsm strip ($STRIPARGS) ; stripflat -> strip: strip-flatten (FLATX, default "--gpu 1"; FLATX= for the CPU) ; stripimg -> stripflat + ink:
 #           stripe renders + strip-mosaic (strip_run.sh)
 #   perwrap -> wraps + ink (PERWRAP=1): flatten (GPU) + render + ink-compare per wrap, largest first (p4full3.sh recipe)
 #   faces   -> perwrap (FACES=1): ufsm faces per flattened wrap
@@ -210,7 +210,7 @@ wraps() {
   return 0
 }
 strip() { [ "$DRY" = 1 ] || rm -rf $O/strip/strip; X $O/logs/strip.log $U strip $O/wraps $O/strip/strip --threads $TH $STRIPARGS; }
-stripflat() { X $O/logs/stripflat.log $U strip-flatten $O/strip/strip --decim ${DECIM:-4} --threads $TH --flip-rows 1 --cg 60 --tol 3e-4 ${FLATX:-}; }
+stripflat() { X $O/logs/stripflat.log $U strip-flatten $O/strip/strip --decim ${DECIM:-4} --threads $TH --flip-rows 1 --cg 60 --tol 3e-4 ${FLATX---gpu 1}; }
 stripimg() {   # stripe renders + mosaic: strip_run.sh skips its strip / flatten stages (done here)
   [ "$DRY" = 1 ] && { echo "    UFSM_ZCACHE_GB=$ZCACHE_GB UFSM_JPEG_THREADS=$JPEGT U=$U CTR=$R CTK=$K/$LV INK=$INK INKK=$LUM bash $STRIPRUN $O/strip $O/wraps"; return 0; }
   UFSM_ZCACHE_GB=$ZCACHE_GB UFSM_ZCACHE_ADMIT=${ZCACHE_ADMIT:-0.6} UFSM_JPEG_THREADS=$JPEGT \
