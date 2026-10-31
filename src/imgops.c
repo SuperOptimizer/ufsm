@@ -2,6 +2,7 @@
 #include "imgops.h"
 #include "tiff.h"
 #include "tiffw.h"
+#include "jpegpar.h"
 #include <unistd.h>
 
 #include <dirent.h>
@@ -186,31 +187,10 @@ uint8_t *overlay_red_half(const uint8_t *ct, int W, int H, const uint8_t *const 
     return ret;
 }
 
-/* ---- JPEG (Pillow's save(quality=q) defaults: baseline, 4:2:0, standard Huffman tables, JFIF) ---- */
-int jpeg_write_rgb(const char *path, int w, int h, const uint8_t *rgb, int quality) {
-    FILE *f = fopen(path, "wb"); if (!f) return -1;
-    struct jpeg_compress_struct ci; struct jpeg_error_mgr je;
-    ci.err = jpeg_std_error(&je); jpeg_create_compress(&ci); jpeg_stdio_dest(&ci, f);
-    ci.image_width = (JDIMENSION)w; ci.image_height = (JDIMENSION)h; ci.input_components = 3; ci.in_color_space = JCS_RGB;
-    jpeg_set_defaults(&ci); jpeg_set_quality(&ci, quality, TRUE);
-    jpeg_start_compress(&ci, TRUE);
-    while (ci.next_scanline < ci.image_height) { JSAMPROW r = (JSAMPROW)(rgb + (size_t)ci.next_scanline * w * 3); jpeg_write_scanlines(&ci, &r, 1); }
-    jpeg_finish_compress(&ci); jpeg_destroy_compress(&ci);
-    return fclose(f) ? -1 : 0;
-}
-
-
-int jpeg_write_gray(const char *path, int w, int h, const uint8_t *g, int quality) {
-    FILE *f = fopen(path, "wb"); if (!f) return -1;
-    struct jpeg_compress_struct ci; struct jpeg_error_mgr je;
-    ci.err = jpeg_std_error(&je); jpeg_create_compress(&ci); jpeg_stdio_dest(&ci, f);
-    ci.image_width = (JDIMENSION)w; ci.image_height = (JDIMENSION)h; ci.input_components = 1; ci.in_color_space = JCS_GRAYSCALE;
-    jpeg_set_defaults(&ci); jpeg_set_quality(&ci, quality, TRUE);
-    jpeg_start_compress(&ci, TRUE);
-    while (ci.next_scanline < ci.image_height) { JSAMPROW r = (JSAMPROW)(g + (size_t)ci.next_scanline * w); jpeg_write_scanlines(&ci, &r, 1); }
-    jpeg_finish_compress(&ci); jpeg_destroy_compress(&ci);
-    return fclose(f) ? -1 : 0;
-}
+/* ---- JPEG (Pillow's save(quality=q) defaults: baseline, 4:2:0, standard Huffman tables, JFIF): libjpeg-turbo's exact bytes from
+   the banded multithreaded encoder of jpegpar.c (threads: jpar_threads(), UFSM_JPEG_THREADS) ---- */
+int jpeg_write_rgb(const char *path, int w, int h, const uint8_t *rgb, int quality) { return jpar_write(path, w, h, 3, quality, rgb, nullptr, nullptr, 0); }
+int jpeg_write_gray(const char *path, int w, int h, const uint8_t *g, int quality) { return jpar_write(path, w, h, 1, quality, g, nullptr, nullptr, 0); }
 /* ---- JPEG reading (any libjpeg input as RGB; a corrupt file returns nullptr instead of libjpeg's exit) ---- */
 typedef struct { struct jpeg_error_mgr pub; jmp_buf jb; } jr_err;
 static void jr_error_exit(j_common_ptr c) { longjmp(((jr_err *)c->err)->jb, 1); }
