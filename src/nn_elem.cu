@@ -4,22 +4,34 @@
 __global__ void gn_finalize_k(const double *sums, int NG, size_t len, float eps, float *mean, float *rstd) {
     int ng = blockIdx.x * blockDim.x + threadIdx.x;
     if (ng >= NG) return;
-    double m = sums[2 * ng] / (double)len, v = sums[2 * ng + 1] / (double)len - m * m;
+    double m = gn_acc_get(sums, 2 * ng) / (double)len, v = gn_acc_get(sums, 2 * ng + 1) / (double)len - m * m;   /* (fixed-point sums: src/gnacc.cuh) */
     mean[ng] = (float)m;
     rstd[ng] = (float)(1.0 / sqrt((v > 0 ? v : 0) + (double)eps));
 }
-double *gn_dsums(size_t n) {   /* small persistent device scratch for the double sums, per device */
+double *gn_dsums(size_t n) {   /* small persistent device scratch for the double sums, per device; sized in GroupNorm sum slots (GN_SLOT_BYTES >= a double) */
     static double *buf[10]; static size_t cap[10];
     int d = zs_slot();   /* (both split halves on one GPU: per half) */
-    if (n > cap[d]) { if (buf[d]) cudaFree(buf[d]); if (cudaMalloc(&buf[d], n * sizeof(double)) != cudaSuccess) { fprintf(stderr, "gn_dsums: no device memory (slot %d)\n", d); abort(); } cap[d] = n; }
+    if (n > cap[d]) { if (buf[d]) cudaFree(buf[d]); if (cudaMalloc(&buf[d], n * GN_SLOT_BYTES) != cudaSuccess) { fprintf(stderr, "gn_dsums: no device memory (slot %d)\n", d); abort(); } cap[d] = n; }
     return buf[d];
+}
+/* --split z: the GroupNorm sum slots of both GPUs added (zs_reduce adds doubles across the GPUs: the slots go through doubles and back, exactly
+   representable both ways for sums of float partials; the same on both GPUs, so both finalize the same statistics) */
+__global__ void gn_slot2d_k(const double *s, double *d, int n) { const int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) d[i] = gn_acc_get(s, i); }
+__global__ void gn_d2slot_k(const double *d, double *s, int n) { const int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) gn_acc_set(s, i, d[i]); }
+void gn_zs_reduce(double *sums, int n) {
+    if (!zs_on()) return;
+    static double *buf[10]; static int cap[10]; const int d = zs_slot();
+    if (n > cap[d]) { if (buf[d]) cudaFree(buf[d]); if (cudaMalloc(&buf[d], (size_t)n * sizeof(double)) != cudaSuccess) { fprintf(stderr, "gn_zs_reduce: no device memory\n"); abort(); } cap[d] = n; }
+    gn_slot2d_k<<<nblk(n, 128), 128>>>(sums, buf[d], n);
+    zs_reduce(buf[d], n);
+    gn_d2slot_k<<<nblk(n, 128), 128>>>(buf[d], sums, n);
 }
 extern "C" void nn_gn_fwd(const float *x, shape5 s, int G, float eps, const float *gamma, const float *beta, float *y, float *mean, float *rstd) {
     if (G > s.c) G = s.c;
     size_t S = shape_spatial(s);
     int NG = s.n * G;
     double *sums = gn_dsums((size_t)2 * NG);
-    cudaMemsetAsync(sums, 0, (size_t)2 * NG * sizeof(double));
+    cudaMemsetAsync(sums, 0, (size_t)2 * NG * GN_SLOT_BYTES);
     gn_sums_k<<<dim3(NG, KSLAB), 256>>>(x, s.c, G, S, sums);
     gn_finalize_k<<<nblk(NG, 128), 128>>>(sums, NG, (size_t)(s.c / G) * S, eps, mean, rstd);
     size_t n = shape_numel(s);
@@ -35,9 +47,9 @@ extern "C" int nn_gn_stats_n(const float *x, shape5 s, int G, float eps, float *
     const size_t S = shape_spatial(s);
     const int NG = cnt * G;
     double *sums = gn_dsums((size_t)2 * s.n * G);
-    cudaMemsetAsync(sums + (size_t)2 * n0 * G, 0, (size_t)2 * NG * sizeof(double));
+    cudaMemsetAsync(gn_slot(sums, (size_t)2 * n0 * G), 0, (size_t)2 * NG * GN_SLOT_BYTES);
     if (lp_gn_sums_mx_n(x, MXDT(x), s.n, s.c, G, S, sums, 0, S, n0, cnt)) return -1;
-    gn_finalize_k<<<nblk(NG, 128), 128>>>(sums + (size_t)2 * n0 * G, NG, (size_t)(s.c / G) * S, eps, mean + (size_t)n0 * G, rstd + (size_t)n0 * G);
+    gn_finalize_k<<<nblk(NG, 128), 128>>>(gn_slot(sums, (size_t)2 * n0 * G), NG, (size_t)(s.c / G) * S, eps, mean + (size_t)n0 * G, rstd + (size_t)n0 * G);
     KCHECK();
     return 0;
 }
@@ -46,12 +58,12 @@ extern "C" int nn_gn_stats(const float *x, shape5 s, int G, float eps, float *me
     size_t S = shape_spatial(s);
     int NG = s.n * G;
     double *sums = gn_dsums((size_t)2 * NG);
-    cudaMemsetAsync(sums, 0, (size_t)2 * NG * sizeof(double));
+    cudaMemsetAsync(sums, 0, (size_t)2 * NG * GN_SLOT_BYTES);
     int zlo, zhi; zs_range(s.d, &zlo, &zhi);
     const size_t v0 = (size_t)zlo * s.h * s.w, v1 = (size_t)(s.d - zhi) * s.h * s.w;
     if (ISMX(x)) {   /* MX storage: statistics of the dequantised values */
         if (lp_gn_sums_mx(x, MXDT(x), s.n, s.c, G, S, sums, v0, v1)) return -1;
-        zs_reduce(sums, 2 * NG);
+        gn_zs_reduce(sums, 2 * NG);
         gn_finalize_k<<<nblk(NG, 128), 128>>>(sums, NG, zs_len((size_t)(s.c / G) * S, s.d), eps, mean, rstd);
         KCHECK();
         return 0;
@@ -59,7 +71,7 @@ extern "C" int nn_gn_stats(const float *x, shape5 s, int G, float eps, float *me
     if (ABF && g_h16) gn_sums_k<f16><<<dim3(NG, KSLAB), 256>>>((const f16 *)x, s.c, G, S, sums, v0, v1);
     else if (ABF) gn_sums_k<bf16><<<dim3(NG, KSLAB), 256>>>((const bf16 *)x, s.c, G, S, sums, v0, v1);
     else gn_sums_k<float><<<dim3(NG, KSLAB), 256>>>(x, s.c, G, S, sums, v0, v1);
-    zs_reduce(sums, 2 * NG);
+    gn_zs_reduce(sums, 2 * NG);
     gn_finalize_k<<<nblk(NG, 128), 128>>>(sums, NG, zs_len((size_t)(s.c / G) * S, s.d), eps, mean, rstd);
     KCHECK();
     return 0;
@@ -69,7 +81,7 @@ extern "C" void nn_gn_fwd_silu(const float *x, shape5 s, int G, float eps, const
     size_t S = shape_spatial(s);
     int NG = s.n * G;
     double *sums = gn_dsums((size_t)2 * NG);
-    cudaMemsetAsync(sums, 0, (size_t)2 * NG * sizeof(double));
+    cudaMemsetAsync(sums, 0, (size_t)2 * NG * GN_SLOT_BYTES);
     gn_sums_k<<<dim3(NG, KSLAB), 256>>>(x, s.c, G, S, sums);
     gn_finalize_k<<<nblk(NG, 128), 128>>>(sums, NG, (size_t)(s.c / G) * S, eps, mean, rstd);
     size_t n = shape_numel(s);

@@ -177,6 +177,7 @@ test_split~gn_stored,policy                    | gpu          |    47 | UFSM_TES
 test_formats                                   |              |     1 | ./tests/test_formats.sh
 test_zarr                                      |              |     1 | ./tests/test_zarr.sh
 test_predict_feather                           | gpu          |    10 | ./$B/test_predict_feather ./$B/ufsm
+test_predict_det                               | gpu          |    11 | ./$B/test_predict_det ./$B/ufsm
 test_strip_gpu                                 | gpu          |    10 | ./$B/test_strip_gpu
 test_faces_gpu                                 | gpu          |    10 | ./$B/test_faces_gpu
 test_render_fill                               |              |    10 | ./$B/test_render_fill
