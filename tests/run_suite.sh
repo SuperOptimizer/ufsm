@@ -10,7 +10,7 @@
 #     -o DIR    output dir: logs/<name>.log, results.tsv, summary.txt (default $TMPDIR/ufsm-suite-<pid>)
 #     -g LIST   GPU indices to use, e.g. "0" or "0,1" (default: every GPU nvidia-smi lists, most free memory first);
 #               "none" runs no GPU test (they are reported SKIP)
-#     -G N      GPU tests at a time per GPU (default 1; env SUITE_GPU_SLOTS)
+#     -G N      GPU tests at a time per GPU (default 2: the GPU tests are small, two overlap well; env SUITE_GPU_SLOTS)
 #     -x S      per-test timeout in seconds (default 1800)
 #     -P        profile: strace marks the tests that open /dev/nvidia* (gpu column "+nv"), nvidia-smi samples their GPU memory
 #     -l        list the selected tests and exit
@@ -24,7 +24,7 @@
 set -u
 H=$(cd "$(dirname "$0")/.." && pwd); cd "$H" || exit 2
 MANIFEST=${SUITE_MANIFEST:-$H/tests/suite.txt}
-TIER=fast; J=${SUITE_J:-}; T=${SUITE_THREADS:-}; BDIR=build-verify; OUT=; GPUS=; GSLOTS=${SUITE_GPU_SLOTS:-1}; TO=1800; PROF=0; LIST=0
+TIER=fast; J=${SUITE_J:-}; T=${SUITE_THREADS:-}; BDIR=build-verify; OUT=; GPUS=; GSLOTS=${SUITE_GPU_SLOTS:-2}; TO=1800; PROF=0; LIST=0
 while getopts "t:j:T:B:o:g:G:x:Plh" o; do case $o in
   t) TIER=$OPTARG;; j) J=$OPTARG;; T) T=$OPTARG;; B) BDIR=$OPTARG;; o) OUT=$OPTARG;; g) GPUS=$OPTARG;; G) GSLOTS=$OPTARG;;
   x) TO=$OPTARG;; P) PROF=1;; l) LIST=1;; *) sed -n '2,22p' "$0"; exit 2;; esac; done

@@ -22,7 +22,7 @@ The tests are listed in `tests/suite.txt` (`NAME | TAGS | EST_SECONDS | COMMAND`
 builds `build/ufsm`, the fixtures the Python CLI tests use and every suite binary on the VERIFY=1 build (`build-verify/`), then runs
 the fast tier in parallel: the runner sets the job count from the CPUs this process may use (cgroup-aware, `-j`, `SUITE_J`), caps the
 threads of each test (`UFSM_NCPU` / `UFSM_FIT_THREADS` / `UFSM_TIFF_THREADS` / `OMP_NUM_THREADS`, `-T`), gives each `gpu` test
-a machine-wide GPU lock (`/tmp/ufsm-suite-locks`, shared by concurrent suites), the GPU with the most free memory first, runs the
+one of 2 slots per GPU (`-G`; machine-wide locks in `/tmp/ufsm-suite-locks`, shared by concurrent suites), the GPU with the most free memory first, runs the
 longest first, retries `flaky` tests once and prints each failing test's log tail plus a summary (`results.tsv` holds wall / CPU /
 max RSS per test). Runner options go through `SUITE_FLAGS`, e.g. `make test SUITE_FLAGS="-j 4 test_fit"` (names matching a regex),
 `-l` lists the tests, `-P` profiles (marks the tests that open the GPU, samples their GPU memory). One test by hand:

@@ -2,7 +2,7 @@
 # COMMAND: bash from the repo root; $B = the suite build dir (build-verify), $TMPDIR = a fresh per-test directory (deleted on a pass).
 # TAGS (comma list): gpu = takes a GPU lock (CUDA_VISIBLE_DEVICES = that GPU) | gpu2 = both GPUs when there are two |
 #   slow = test-slow tier, not in make test | flaky = one retry, reported FLAKY | solo = runs alone.
-# EST: seconds on the desk (quiet, one test at a time); the runner starts the longest first. A new test: add a line here and its
+# EST: seconds (laptop 10-30, -j 4 under load: relative sizes); the runner starts the longest first. A new test: add a line here and its
 # binary as a prerequisite of suite-bins in the Makefile; give it the gpu tag if it touches the GPU (tests/run_suite.sh -P tells).
 # UFSM_TEST_QUICK=1: the fast-tier variant of a long test (fewer steps / cases); the full run is NAME~full in the slow tier.
 # Helper binaries without a line of their own: test_sheet (test-sheet), test_http_reader / test_sampler_safety / test_formats (python).
