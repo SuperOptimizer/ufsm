@@ -4059,6 +4059,8 @@ int cmd_fiber_export(int argc, char **argv);   /* src/fibercheck.c */
 int cmd_count_field(int argc, char **argv);   /* src/countfield.c */
 int cmd_hires_phase(int argc, char **argv);   /* src/hiresphase.c */
 int cmd_phase_gate(int argc, char **argv);   /* src/phasegate.c */
+int cmd_ct_cal(int argc, char **argv);   /* src/ctcal.c */
+int cmd_w_at(int argc, char **argv);   /* src/phasegate.c */
 int cmd_patch_raster(int argc, char **argv);   /* src/patchraster.c */
 int cmd_ray_check(int argc, char **argv);   /* src/raycheck.c */
 int cmd_vwt_sample(int argc, char **argv);   /* src/vwt_sample.c */
@@ -4114,6 +4116,8 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "count-field")) return cmd_count_field(argc, argv);
     if (!strcmp(cmd, "hires-phase")) return cmd_hires_phase(argc, argv);
     if (!strcmp(cmd, "phase-gate")) return cmd_phase_gate(argc, argv);
+    if (!strcmp(cmd, "ct-cal")) return cmd_ct_cal(argc, argv);
+    if (!strcmp(cmd, "w-at")) return cmd_w_at(argc, argv);
     if (!strcmp(cmd, "patch-raster")) return cmd_patch_raster(argc, argv);
     if (!strcmp(cmd, "ray-check")) return cmd_ray_check(argc, argv);
     if (!strcmp(cmd, "vwt-sample")) return cmd_vwt_sample(argc, argv);

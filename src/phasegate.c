@@ -141,3 +141,15 @@ int cmd_phase_gate(int argc, char **argv) {
     free(gate); fit_fields_free(&g); fit_set_free(ref);
     return 0;
 }
+
+/* ufsm w-at MODEL Z,Y,X [Z,Y,X ...]: W of a fitted model / set at global native points (the wrap through a point: floor(W)) */
+int cmd_w_at(int argc, char **argv) {
+    if (argc < 4) { fprintf(stderr, "usage: ufsm w-at <model-or-set> Z,Y,X [Z,Y,X ...]   W at global native points (wrap = floor(W))\n"); return 2; }
+    fit_set *S = fit_set_load(argv[2]); if (!S) { fprintf(stderr, "w-at: cannot load %s\n", argv[2]); return 1; }
+    for (int i = 3; i < argc; i++) {
+        double p[3]; if (sscanf(argv[i], "%lf,%lf,%lf", p, p + 1, p + 2) != 3) { fprintf(stderr, "w-at: bad point %s\n", argv[i]); return 2; }
+        const double w = fit_set_W(S, p[0] - S->global->origin[0], p[1] - S->global->origin[1], p[2] - S->global->origin[2]);
+        printf("%s\t%.4f\tw%03ld\n", argv[i], w, (long)floor(w));
+    }
+    fit_set_free(S); return 0;
+}

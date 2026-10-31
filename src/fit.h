@@ -348,3 +348,8 @@ typedef struct { const long *v; const double *c; int nv; double other; } fj_tabl
 typedef struct { int a, b; fj_table t; } fj_edge;
 double fj_table_cost(const fj_table *t, long v);
 double fit_join_solve(int n, const fj_table *unary, int ne, const fj_edge *e, int rc, long *S);
+/* ufsm ct-cal (src/ctcal.c): the CT's papyrus peaks per density turn on a (z level, angle, radial band) table; count-field --ct-cal */
+typedef struct fit_ct_cal fit_ct_cal;
+fit_ct_cal *fit_ct_cal_load(const char *path);
+void fit_ct_cal_free(fit_ct_cal *c);
+double fit_ct_cal_k(const fit_ct_cal *c, double z, double dy, double dx);   /* k at box-local native z, offset (dy, dx) from the axis */
