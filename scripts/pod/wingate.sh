@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# scripts/pod/wingate.sh: the gate for larger wind96 fields windows (predict --window auto, opt-in, UNGATED until this passes).
+# scripts/pod/wingate.sh: the gate for larger wind96 fields windows (predict --window auto / FWIN=auto, opt-in; fields default = production window).
+# 10-31 desk run, P4 crop: c640 vs base agree .9533 vs .9502, GT ids .2174 vs .2354 = FAIL; wrap-check calls every turn dup on 512-deep crops.
 # NOT RUN YET (10-31: no pod rented for it). Needs a GPU with >= ~32 GB for the larger windows (direct slabs: ~73 B per window voxel;
 # 640 x 1152^2 = 850 M voxels -> UFSM_SLAB_DIRECT=0 (~46 B, ~39 GB) is set for it below on a 48 GB card).
 #

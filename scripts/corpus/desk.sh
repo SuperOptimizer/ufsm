@@ -46,7 +46,7 @@ prep() {
 fields() {   # (GPU $G)
   rm -rf $F $F.tmp
   local OC="" l; for l in $((LV + 3)) $((LV + 2)) $((LV + 4)); do [ -e $R/$K/$l/zarr.json ] && { OC="--occupancy $l"; break; }; done   # skip air windows unread (byte-identical)
-  N $U predict $CK $R $K $F.tmp --um $UM --level $LV --box $(cat $O/box.txt) --window ${FWIN:-auto} --halo 64 --shard 512 \
+  N $U predict $CK $R $K $F.tmp --um $UM --level $LV --box $(cat $O/box.txt) $([ "${FWIN:-prod}" = auto ] && echo "--window auto" || echo "--window-z 384 --halo-z 64 --window 640") --halo 64 --shard 512 \
     --grid-origin 0,0,0 --ema 1 --q 8 --threads 12 --gpu $G --axis $O/axis.json --levels 1 --fit-zarr $F --fit-h 2 --fit-q 8 --fit-q-phase 4 \
     --no-out 1 $OC > $O/logs/fields.log 2>&1 || return 1
   rm -rf $F.tmp; [ -e $F/fields.json ] || return 1
