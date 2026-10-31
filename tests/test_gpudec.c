@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <time.h>
 
 #define CV VOLCOMP_CHUNK_VOXELS
@@ -169,11 +170,14 @@ static void *real_worker(void *a) {
     }
     free(d); free(r); return nullptr;
 }
+static double g_cpu_s;   /* process CPU seconds of the last real_run */
+static double cpu_now(void) { struct rusage u; getrusage(RUSAGE_SELF, &u); return u.ru_utime.tv_sec + u.ru_stime.tv_sec + (u.ru_utime.tv_usec + u.ru_stime.tv_usec) * 1e-6; }
 static double real_run(real_job *J, int mode, int nt) {
     J->next = 0; J->bad = J->gpu = J->cpu = 0; J->mode = mode; pthread_t th[256];
-    const double t0 = now_s();
+    const double t0 = now_s(), c0 = cpu_now();
     for (int t = 0; t < nt; t++) pthread_create(&th[t], nullptr, real_worker, J);
     for (int t = 0; t < nt; t++) pthread_join(th[t], nullptr);
+    g_cpu_s = cpu_now() - c0;
     return now_s() - t0;
 }
 static int real_main(int argc, char **argv) {
@@ -200,17 +204,18 @@ static int real_main(int argc, char **argv) {
     printf("  check vs vf_decode_sub: %s (%d chunks on the GPU, %d on the CPU, %d mismatches) %.2f s\n", J.bad ? "FAIL" : "identical", J.gpu, J.cpu, J.bad, tc);
     int bad = J.bad;
     double t_cpu = real_run(&J, 0, nt);
-    printf("  CPU volcomp_fast, %d threads: %.2f s = %.0f MB/s (%.0f MB/s per thread)\n", nt, t_cpu, mb / t_cpu, mb / t_cpu / nt);
+    printf("  CPU volcomp_fast, %d threads: %.2f s = %.0f MB/s (%.0f MB/s per thread), %.1f CPU-s\n", nt, t_cpu, mb / t_cpu, mb / t_cpu / nt, g_cpu_s);
     uint64_t s0, b0; double g0; gpudec_stats(&s0, &b0, nullptr, &g0);
     double t_gpu = real_run(&J, 1, nt);
     uint64_t s1, b1; double g1; gpudec_stats(&s1, &b1, nullptr, &g1);
-    printf("  GPU, %d submitting threads: %.2f s = %.0f MB/s (%llu batches, %.0f substreams / batch, GPU busy %.2f s)\n", nt, t_gpu, mb / t_gpu,
-           (unsigned long long)(b1 - b0), (double)(s1 - s0) / (double)(b1 - b0 ? b1 - b0 : 1), g1 - g0);
+    printf("  GPU, %d submitting threads: %.2f s = %.0f MB/s (%llu batches, %.0f substreams / batch, GPU busy %.2f s, %.1f CPU-s, %d chunks on the CPU)\n", nt, t_gpu, mb / t_gpu,
+           (unsigned long long)(b1 - b0), (double)(s1 - s0) / (double)(b1 - b0 ? b1 - b0 : 1), g1 - g0, g_cpu_s, J.cpu);
     return bad != 0;
 }
 
 int main(int argc, char **argv) {
     setenv("UFSM_GPU_DECODE", "1", 0);
+    if (!(argc > 1 && !strcmp(argv[1], "--real"))) setenv("UFSM_GPU_DECODE_MIN_BYTES", "0", 1);   /* the tests: every request on the GPU */
     if (!gpudec_enabled()) { printf("test_gpudec: no GPU decoder (no CUDA device): skipped\n"); return 0; }
     if (argc > 1 && !strcmp(argv[1], "--real")) return real_main(argc, argv);
     char dir[] = "/tmp/test_gpudecXXXXXX"; if (!mkdtemp(dir)) return 1;

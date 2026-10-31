@@ -221,7 +221,7 @@ struct gd_slot {
 static struct {
     pthread_once_t once; pthread_mutex_t mu; pthread_cond_t cv; pthread_t th;
     int ok, broken, dev;
-    size_t in_cap, rec_cap; uint32_t max_items;
+    size_t in_cap, rec_cap; uint32_t max_items, min_bytes;
     gd_slot slot[NSLOT]; int open;
     uint8_t *d_in, *d_out; gd_item *d_items; gd_group *d_groups; uint32_t *d_rec, *d_meta, *d_status, *d_pos;
     cudaStream_t st; cudaEvent_t ev;
@@ -306,6 +306,8 @@ static void gd_init(void) {
     G.dev = getenv("UFSM_GPU_DECODE_DEV") ? atoi(getenv("UFSM_GPU_DECODE_DEV")) : 0;
     const char *mi = getenv("UFSM_GPU_DECODE_ITEMS");
     G.max_items = mi && atoi(mi) > 0 ? (uint32_t)atoi(mi) : 1024u;
+    const char *mb = getenv("UFSM_GPU_DECODE_MIN_BYTES");
+    G.min_bytes = mb ? (uint32_t)atoi(mb) : 2048u;   /* per substream, compressed (Paris 4 CT q 2: ~9 KB; ink q 32: ~200 B) */
     G.in_cap = (size_t)G.max_items * 40000 + ((size_t)16 << 20);   /* q 2 substreams are ~10-20 KB */
     G.rec_cap = (size_t)G.max_items * 49152 + ((size_t)16 << 20);   /* records (u32); a substream reserves its bound, 8 x its bypass bytes (q 2: ~5 KB) */
     int nd = 0;
@@ -374,9 +376,13 @@ extern "C" int gpudec_decode(const gd_chunk *c, uint32_t mask, uint8_t *dst) {
     if (!mask) return 0;
     if (!gpudec_enabled()) return -1;
     const uint32_t k = (uint32_t)__builtin_popcount(mask);
-    size_t need_in = TAB_BYTES, need_rec = 0;
-    for (uint32_t s = 0; s < NSUB; s++) if (mask >> s & 1u) { need_in += ((c->tok_n[s] + 15u) & ~15u) + 16 + ((c->byp_n[s] + 15u) & ~15u) + 16; need_rec += (size_t)c->byp_n[s] * 8u + 1u; }
+    size_t need_in = TAB_BYTES, need_rec = 0, payload = 0;
+    for (uint32_t s = 0; s < NSUB; s++) if (mask >> s & 1u) {
+        need_in += ((c->tok_n[s] + 15u) & ~15u) + 16 + ((c->byp_n[s] + 15u) & ~15u) + 16; need_rec += (size_t)c->byp_n[s] * 8u + 1u;
+        payload += (size_t)c->tok_n[s] + c->byp_n[s];
+    }
     if (need_in > G.in_cap || need_rec > G.rec_cap || k > G.max_items) return -1;
+    if (payload < (size_t)k * G.min_bytes) return -1;   /* near-empty substreams (flat blocks: ink, air) decode faster on the CPU than a round trip */
     gd_req q = {}; q.mask = mask; q.dst = dst; q.nitems = k;
     pthread_mutex_lock(&G.mu);
     if (!G.have_scan) {
