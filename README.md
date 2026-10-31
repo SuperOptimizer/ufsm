@@ -58,6 +58,9 @@ CK=wind96-wk1-best.ckpt; INKCK=ift3-24000.ckpt
 $U predict $CK $R $K fields.tmp --um 2.4 --level 2 --box Z,Y,X,NZ,NY,NX --window-z 384 --halo-z 64 --window 640 --halo 64 --shard 512 \
    --grid-origin 0,0,0 --ema 1 --q 8 --axis axis.json --levels 1 --fit-zarr fields --fit-h 2 --fit-q 8 --fit-q-phase 4 --no-out 1 --occupancy 5
 for a in fields/*/; do $U repack $a ${a%/}.512 512 --threads 12 && rm -r $a && mv ${a%/}.512 $a; done
+#    (predict picks direct slab outputs when the GPU has room: ~73 B per window voxel, no plane copies, same bytes; UFSM_SLAB_DIRECT=0 the old
+#     ~46 B path. `--window auto` / UFSM_PRED_WINDOW=auto picks a larger window on big GPUs (640 x 1152^2 ...): UNGATED, it changes the
+#     outputs; scripts/pod/wingate.sh is its gate and has not been run. Production stays 384 x 640^2.)
 
 # 2. ink (ift3-24000): frozen GroupNorm from a calibration band, two passes offset by half a shard, blended
 $U predict $INKCK $R $K gncal.zarr --um 2.4 --level 2 --box CALBOX --shard 512 --window 640 --halo 64 --ema 1 --full-grid 1 --occupancy 5 --levels 1 --no-out 1 --gn-save gn.bin

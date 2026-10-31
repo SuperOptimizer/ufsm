@@ -754,9 +754,14 @@ int cmd_predict(int argc, char **argv) {
     char input_attrs[128] = "";
     if (input_affine) snprintf(input_attrs, sizeof input_attrs, ",\"input_gain\":%.9g,\"input_bias\":%.9g", input_gain, input_bias);
     const int win_given = *opt(argc, argv, "--window", "") || *opt(argc, argv, "--halo", "");
+    /* --window auto (or UFSM_PRED_WINDOW=auto): the largest of the slab / cube windows below that this GPU holds, halo 64 (pods with
+       32-48 GB: more interior per computed voxel). OPT-IN AND UNGATED: windows other than 384 x 640^2 change the outputs (per-window
+       GroupNorm statistics, context); scripts/pod/wingate.sh is the gate, not run yet */
+    const int wauto = !strcmp(opt(argc, argv, "--window", ""), "auto") || (getenv("UFSM_PRED_WINDOW") && !strcmp(getenv("UFSM_PRED_WINDOW"), "auto"));
+    if (wauto) { W = 640; halo = 64; }
     /* --window-z WZ [--halo-z HZ]: slab windows WZ x W x W (train --Pz nets; HZ default WZ / 4), the plain GPU path only */
     int Wz = atoi(opt(argc, argv, "--window-z", "0")), hz = atoi(opt(argc, argv, "--halo-z", "-1"));
-    const int slab = Wz > 0 && Wz != W;
+    int slab = Wz > 0 && Wz != W;
     if (Wz <= 0) Wz = W;
     if (hz < 0) hz = slab ? Wz / 4 : halo;
     /* --aug-OP-p P [--aug-p P] [--aug-strength S] [--aug-seed N]: degrade every CT window with train's scanner augmentation
@@ -1026,9 +1031,22 @@ int cmd_predict(int argc, char **argv) {
     }
     if (occl >= 0 && (occl <= level || occl > 20)) { fprintf(stderr, "predict: --occupancy L needs a coarser CT level than --level (%d)\n", level); return 2; }
     const int H0 = 1 << (cfg.nlev - 1);   /* --split: halo planes of each half */
-    if (split && !win_given) { W = shard + 128; halo = 64; fprintf(stderr, "predict: window %d, halo %d (split default; --window / --halo set them; window - 2 halo = k * shard computes one window per k^3 shards)\n", W, halo); }
+    if (wauto) {
+        if (split || half || sheet_task || sweep_out || ngpu > 1 || ufsm_env_on("UFSM_PRED_HOSTPATH")) { fprintf(stderr, "predict: --window auto: one GPU's plain CT path only\n"); return 2; }
+        static const int cand[4][2] = {{640, 1152}, {384, 1152}, {640, 640}, {384, 640}};   /* (z, xy) by interior share: 63%, 50%, 51%, 43% at halo 64 */
+        int k = 0;
+        for (; k < 4; k++) {
+            const int cz = cand[k][0], cw = cand[k][1];
+            const size_t w3 = (size_t)cz * cw * cw, need = unet_infer_bytes(u, (shape5){1, 4, cz, cw, cw}) + w3 / 8 + (size_t)shard * shard * shard + ((size_t)1 << 30);
+            if (need <= nn_mem_free()) break;
+        }
+        if (k == 4) k = 3;
+        Wz = cand[k][0]; W = cand[k][1]; halo = hz = 64; slab = Wz != W;
+        fprintf(stderr, "predict: --window auto: %d x %d^2, halo 64 (opt-in, UNGATED: other windows change the outputs; scripts/pod/wingate.sh)\n", Wz, W);
+    }
+    if (split && !win_given && !wauto) { W = shard + 128; halo = 64; fprintf(stderr, "predict: window %d, halo %d (split default; --window / --halo set them; window - 2 halo = k * shard computes one window per k^3 shards)\n", W, halo); }
     if (split && W % (2 * H0)) { fprintf(stderr, "--split z: the window must be a multiple of %d\n", 2 * H0); return 2; }
-    if (!split && !win_given && !sheet_task && bn[0] >= shard && bn[1] >= shard && bn[2] >= shard) {   /* default window: one per k^3 shards (k shards + 2 halo,
+    if (!split && !win_given && !wauto && !sheet_task && bn[0] >= shard && bn[1] >= shard && bn[2] >= shard) {   /* default window: one per k^3 shards (k shards + 2 halo,
                                           the largest k <= 4 the box and this GPU hold: in-place slab inference makes k = 2 fit 16 GB with the 16-wide net) or one per shard,
                                           halo 16 or the least multiple of 2^(levels-1) / 2 above it; else 288 / 8. Desk widths, 512 shards, laptop: 16% less GPU time per
                                           shard than 8 windows of 288, peak 9.4 GB */
@@ -1046,13 +1064,13 @@ int cmd_predict(int argc, char **argv) {
         fprintf(stderr, "predict: window %d, halo %d (default: one window per k^3 shards, k <= 4 the box and the GPU hold, else per shard, else 288 / 8; 288 / 16 with --fit-zarr; --window / --halo set them)\n", W, halo);
         if (box) for (int d = 0; d < 3; d++) if (boxv[d + 3] > INT64_MAX - W || boxv[d] > INT64_MAX - W - boxv[d + 3]) { fprintf(stderr, "prediction box exceeds the coordinate range\n"); return 2; }
     }
-    if (ffz && !win_given && !split && W == 288 && halo == 8) halo = 16;   /* --fit-zarr fallback: a z stride (256) dividing the shard */
-    if (!win_given && W % (hdiv << (cfg.nlev - 1))) W = (W + (hdiv << (cfg.nlev - 1)) - 1) / (hdiv << (cfg.nlev - 1)) * (hdiv << (cfg.nlev - 1));   /* (288 with a deeper net) */
+    if (ffz && !win_given && !wauto && !split && W == 288 && halo == 8) halo = 16;   /* --fit-zarr fallback: a z stride (256) dividing the shard */
+    if (!win_given && !wauto && W % (hdiv << (cfg.nlev - 1))) W = (W + (hdiv << (cfg.nlev - 1)) - 1) / (hdiv << (cfg.nlev - 1)) * (hdiv << (cfg.nlev - 1));   /* (288 with a deeper net) */
     if (degrade && (slab || split || half || sheet_task || sweep_out || ufsm_env_on("UFSM_PRED_HOSTPATH") || W > 1024)) {
         fprintf(stderr, "predict: --aug-*: cube windows up to 1024 on one GPU's plain path\n"); return 2;
     }
     if (!slab) { Wz = W; hz = halo; }
-    else if (!win_given || Wz > W || Wz % (1 << (cfg.nlev - 1)) || hz >= Wz / 2 || split || half || sheet_task || auxz || sweep_out || ufsm_env_on("UFSM_PRED_HOSTPATH")) {
+    else if ((!win_given && !wauto) || Wz > W || Wz % (1 << (cfg.nlev - 1)) || hz >= Wz / 2 || split || half || sheet_task || auxz || sweep_out || ufsm_env_on("UFSM_PRED_HOSTPATH")) {
         fprintf(stderr, "predict: --window-z: at most --window (given), a multiple of %d, --halo-z under half of it; one GPU's plain path (no --split, "
                         "half-resolution, winding, --aux, --cond-sweep or UFSM_PRED_HOSTPATH)\n", 1 << (cfg.nlev - 1));
         return 2;
