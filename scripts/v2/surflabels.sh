@@ -2,10 +2,12 @@
 # surflabels.sh S [extra surf-labels flags]: v2 winding labels of scroll S from its wraps (ufsm surf-labels) + the outward-sign check.
 # Reads S's row of $TSV (scrolls.tsv: scroll split nwraps wraps wrapcheck strip_json strip_log axis ct_root ct_key ct_um ct_level ...):
 #   wraps: $SNAP/S/wraps_snap when present (snapped), else the row's wraps (noted in the log);
-#   trim: strip.json "wraps" [a, b] -> --first min --last max (no strip.json: $TRIM_S env "first,last", else none);
+#   trim: $TRIM_S env "first,last" if set, else strip.json "wraps" [a, b] -> --first min --last max, else none;
 #   grid: the CT level ct_level (local $CTL/ct_key/level) -> --like, --ct (CT 0 = ignore 3), grid um = ct_um x 2^level, axis um = ct_um;
 #   gates: wrapcheck dup/merged, ONPAP (default 0.2: --min-onpap with the local CT; 0 = off), PEAKS (e.g. 0.85,1.15; default off);
-#   holdouts: $HO boxes of this CT + 0.5 mm -> ignore 4.
+#   holdouts: $HO boxes of this CT + 0.5 mm -> ignore 4;
+#   fixed surfaces: WSRC=<dir> uses <dir>/S/wraps_snap (else <dir>/S/wraps) first (e.g. /vesuvius/ufsm/v2/count/unroll), with its
+#   wrapcheck.tsv; GEOM=<dir> adds --geom <dir>/S (geom-check output of those wraps); ROWS=a,b adds --rows a,b (end caps).
 # Output $OUT/S/{codes,phase,ignore}.zarr/<grid um>, surflabels.log, wraps.tsv, phasecheck.txt, done marker. Env: U (ufsm binary), TH.
 set -uo pipefail
 S=$1; shift
@@ -16,13 +18,16 @@ IFS=$'\t' read -r _ split nw wraps wc sj sl ax ctr ctk ctum ctlev _ <<< "$row"
 O=$OUT/$S; mkdir -p $O; rm -f $O/done
 W=$wraps; src=unsnapped
 [ -d $SNAP/$S/wraps_snap ] && [ -n "$(ls $SNAP/$S/wraps_snap | grep -m1 '\.sfc$')" ] && { W=$SNAP/$S/wraps_snap; src=snapped; }
+if [ -n "${WSRC:-}" ]; then for d in wraps_snap wraps; do
+  [ -d $WSRC/$S/$d ] && [ -n "$(ls $WSRC/$S/$d | grep -m1 '\.sfc$')" ] && { W=$WSRC/$S/$d; src="fixed $d"; [ -s $WSRC/$S/wrapcheck.tsv ] && wc=$WSRC/$S/wrapcheck.tsv; [ -s $WSRC/$S/axis.json ] && ax=$WSRC/$S/axis.json; break; }; done; fi
 trim=()
-if [ -s "$sj" ]; then read -r a b <<< "$(jq -r '.wraps | "\(min) \(max)"' $sj)"; trim=(--first $a --last $b)
-elif [ -n "${TRIM_S:-}" ]; then trim=(--first ${TRIM_S%,*} --last ${TRIM_S#*,}); fi
+if [ -n "${TRIM_S:-}" ]; then trim=(--first ${TRIM_S%,*} --last ${TRIM_S#*,})   # (env first: fixed surfaces have their own trim)
+elif [ -s "$sj" ]; then read -r a b <<< "$(jq -r '.wraps | "\(min) \(max)"' $sj)"; trim=(--first $a --last $b); fi
 ct=$CTL/$ctk/$ctlev; [ -e $ct/zarr.json ] || { echo "surflabels: no local CT $ct" >&2; exit 2; }
 gum=$(awk -v u=$ctum -v l=$ctlev 'BEGIN {printf "%.10g", u * 2 ^ l}')
 gates=(); [ -s "$wc" ] && gates+=(--wrapcheck $wc); [ -n "${PEAKS:-}" ] && gates+=(--band-peaks $PEAKS)
 op=${ONPAP:-0.2}; [ "$op" != 0 ] && gates+=(--min-onpap $op)
+[ -n "${GEOM:-}" ] && [ -s ${GEOM}/$S/cells.tsv ] && gates+=(--geom $GEOM/$S); [ -n "${ROWS:-}" ] && gates+=(--rows $ROWS)
 ho=(); [ -s "$HO" ] && ho=(--exclude $HO --exclude-ct "$(basename $ctk)" --exclude-mm 0.5)
 echo "surflabels $S: $src wraps $W, trim ${trim[*]:-none}, grid $gum um (level $ctlev), gates ${gates[*]}" > $O/surflabels.log
 rm -rf $O/codes.zarr $O/phase.zarr $O/ignore.zarr
