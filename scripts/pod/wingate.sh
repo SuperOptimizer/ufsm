@@ -42,7 +42,7 @@ run1() {   # run1 SCROLL VARIANT R K L UM AX BOX [GT]
     --grid-origin 0,0,0 --ema 1 --q 8 --threads $TH --gpu $GPU --axis $AX --levels 1 --fit-zarr $O/f --fit-h 2 --fit-q 8 --fit-q-phase 4 --no-out 1 > $O/fields.log 2>&1 \
     || { echo "$S $V FAIL fields"; return 1; }
   rm -rf $O/f.tmp; local tf=$(( $(date +%s) - t0 ))
-  $U count-field $O/f $O/cf.unused --R 0 --pool 8 --phase-w 4 --iters 1200 --model $O/ref --model-only 1 --model-stride 1 --threads $TH --mem-gb 16 > $O/ref.log 2>&1 || { echo "$S $V FAIL ref"; return 1; }
+  $U count-field $O/f $O/cf.unused --R 0 --pool 8 ${REFPH---phase-w 0.5 --wide 100,140 --wide-phase 15} --iters 1200 --model $O/ref --model-only 1 --model-stride 1 --threads $TH --mem-gb 16 > $O/ref.log 2>&1 || { echo "$S $V FAIL ref"; return 1; }
   rm -rf $O/cf.unused
   dir=$(jq -r .dir $O/ref/model.json); ze=$(jq -r '.shape[0]' $O/f/fields.json); ny=$(jq -r '.shape[1]' $O/f/fields.json); nx=$(jq -r '.shape[2]' $O/f/fields.json)
   local ns=$(( ze / I )); [ $ns -gt $NS ] && ns=$NS
