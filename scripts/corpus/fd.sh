@@ -3,7 +3,7 @@
 # desk pushed the fields) and no wraps yet, whose ref this host owns (atomic mkdir state/ref.lock; a desk-owned one is skipped until its
 # state/ref.ready arrives) -> ref -> slabs -> join -> wraps -> state/wraps.ready (the desk pulls joined + wraps and does surf-stats,
 # flatten and renders); its fields and slab fits are deleted here.
-#   ref     count-field --R 0 --pool 8 --phase-w 4 --model-only --model-stride MSTRIDE (4), TH (20) threads, --mem-gb CFMEM (24)
+#   ref     count-field --R 0 --pool 8 REFPH (default --phase-w 0.5 --wide 100,140 --wide-phase 15, as unroll.sh; old: --phase-w 4) --model-only --model-stride MSTRIDE (4), TH (20) threads, --mem-gb CFMEM (24)
 #   slabs   fit --ref-model REF --ref-snap 1 --uw-repair 0 --dir (the ref's: count-field finds the handedness, 1447 is -1) per 64-cell slab (+16 overlap), full cross-section, one lane per GPU; air
 #           slabs at the box ends (fit: no data for the prior) count as done and are left out of the join
 #   join    fit-join --ref REF (prints the overlap integer agreement)
@@ -50,7 +50,7 @@ wraps() {
 ref() {   # the count-field ref here (this host holds ref.lock), unless the desk's arrived (ref.ready)
   [ -e $O/state/ref.ready ] && return 0
   rm -rf $REF
-  /usr/bin/time -v nice -n 5 $U count-field $F $O/cf.unused --R 0 --pool 8 --phase-w 4 --iters 1200 --model $REF --model-only 1 --model-stride ${MSTRIDE:-4} \
+  /usr/bin/time -v nice -n 5 $U count-field $F $O/cf.unused --R 0 --pool 8 ${REFPH---phase-w 0.5 --wide 100,140 --wide-phase 15} --iters 1200 --model $REF --model-only 1 --model-stride ${MSTRIDE:-4} \
     --threads $TH --mem-gb ${CFMEM:-24} > $O/logs/ref.log 2>&1 && [ -e $REF/model.json ] &&
     log "ref: $(grep -oE 'closing error[^:]*: mean [0-9.]+ turns, > 0.25 turn on [0-9.]+' $O/logs/ref.log)"
 }

@@ -65,7 +65,7 @@ ref() {
   local d=$FDC/$S a b
   ssh -n $FD "mkdir $d/state/ref.lock 2>/dev/null && echo desk > $d/state/ref.lock/owner" || { log "ref: forlindesk took it"; return 0; }
   rm -rf $REF
-  if ! /usr/bin/time -v nice -n 10 $U count-field $F $O/cf.unused --R 0 --pool 8 --phase-w 4 --iters 1200 --model $REF --model-only 1 --model-stride ${MSTRIDE:-4} \
+  if ! /usr/bin/time -v nice -n 10 $U count-field $F $O/cf.unused --R 0 --pool 8 ${REFPH---phase-w 0.5 --wide 100,140 --wide-phase 15} --iters 1200 --model $REF --model-only 1 --model-stride ${MSTRIDE:-4} \
        --threads $TH --mem-gb ${CFMEM:-24} > $O/logs/ref.log 2>&1 || [ ! -e $REF/model.json ]; then ssh -n $FD "rm -rf $d/state/ref.lock"; return 1; fi   # (forlindesk may take it then)
   rsync -a $REF/ $FD:$d/ref/ || return 1; a=$(bytes $REF); b=$(ssh -n $FD "du -sb --apparent-size $d/ref" | awk '{print $1}')
   [ "$a" = "$b" ] || { log "ref push: $a bytes here, ${b:-?} on forlindesk"; return 1; }
