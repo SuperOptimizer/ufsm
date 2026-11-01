@@ -306,7 +306,8 @@ int cmd_geom_check(int argc, char **argv) {
             int64_t o1[3] = {llround((z1 + 0.5) * f - 0.5), lo[0], lo[1]}, o2[3] = {llround((z2 + 0.5) * f - 0.5), lo[0], lo[1]};
             if (!p1 || !p2 || o2[0] >= cm->shape[0] || z3_read(cz, o1, S.n, p1, nt) || z3_read(cz, o2, S.n, p2, nt)) { free(p1); free(p2); continue; }
             S.p1 = p1; S.p2 = p2;
-            for (int t = 0; t < m; t++) pthread_create(&th[t], nullptr, gc_slip_run, &S); for (int t = 0; t < m; t++) pthread_join(th[t], nullptr);
+            for (int t = 0; t < m; t++) pthread_create(&th[t], nullptr, gc_slip_run, &S);
+            for (int t = 0; t < m; t++) pthread_join(th[t], nullptr);
             free(p1); free(p2); nrows++;
         }
         z3_close(cz);

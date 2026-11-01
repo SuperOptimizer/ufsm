@@ -824,6 +824,7 @@ typedef struct {
     pa_buf *pa;   /* per thread (fit --score-pairs), or null */
 } score_job;
 static int g_score_pairs;   /* fit --score-pairs 1: pair winding accuracy (src/pairacc.h) after the box score */
+static double g_score_z0, g_score_nz;   /* fit --score-z Z0,NZ: only the box-local native z range [Z0, Z0 + NZ) is scored (per-height gauge / ids without a crop) */
 enum { SC_NB = 14 * 72, SC_NF = 14 * 1024 };
 static void *score_rows(void *arg) {
     score_job *J = ((void **)arg)[0]; const int t = (int)(intptr_t)((void **)arg)[1];
@@ -861,6 +862,7 @@ static void *sc_read_run(void *a) {
 static int score_codes(z3 *z, double cf, const long long org[3], const int shp[3], double h, double um, const float *cy, const float *cx, int detail, FILE *dump,
                        score_fill_fn fill, void *ctx) {
     int64_t lo[3], ln[3]; for (int d = 0; d < 3; d++) { lo[d] = (int64_t)floor(org[d] / cf); ln[d] = (int64_t)(shp[d] * h / cf); }
+    if (g_score_nz > 0) { lo[0] = (int64_t)floor((org[0] + g_score_z0) / cf); ln[0] = (int64_t)fmin(g_score_nz / cf, shp[0] * h / cf - (lo[0] - floor(org[0] / cf))); }
     enum { NB = SC_NB, NF = SC_NF }; size_t *hist = calloc(NB, sizeof(size_t)), *fine = calloc(NF, sizeof(size_t)), nd = 0, nan = 0;   /* d = U - q mod 14: 1/72 and 1/1024 turn bins */
     score_rec *dd = nullptr; size_t ndet = 0, dcap = 0;
     const int na_ax = (int)(shp[0] * h) + 1;
@@ -1521,6 +1523,7 @@ static int cmd_fit(int argc, char **argv) {
         fit_set_dev *gd = nullptr; if (!c.cpu && !(gd = fit_set_upload(fs))) return 1;
         fit_fill_ctx fc = {gd, fs};
         g_score_pairs = atoi(opt(argc, argv, "--score-pairs", "0")) > 0;
+        if (*opt(argc, argv, "--score-z", "") && sscanf(opt(argc, argv, "--score-z", ""), "%lf,%lf", &g_score_z0, &g_score_nz) != 2) { fprintf(stderr, "fit: --score-z Z0,NZ (box-local native z)\n"); return 2; }
         const int rc = score_codes(z, cf, org, shp, h, fb.um, fb.cy, fb.cx, arg_index(argc, argv, "--score-detail") > 0, dump, fit_fill, &fc);
         fit_set_dev_free(gd); z3_close(z); if (dump) fclose(dump);
         if (rc) return 1;
