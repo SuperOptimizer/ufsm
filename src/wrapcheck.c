@@ -337,6 +337,11 @@ int cmd_wrap_check(int argc, char **argv) {
                 printf(" %8lld", cnt[b]);
                 for (int k = 0; k < NS; k++) { const double *a = s[b][k]; if (a[2] < 20) printf("  %13s", "-"); else printf("  %6.3f/%.3f", a[0] / a[1], a[3] / a[2]); }
                 printf("\n"); }
+            if (!tab && wc_opt(argc, argv, "--tsv", nullptr)) {   /* --tsv: the overall row per source (source, turns per GT turn, share off >= 0.5, intervals) */
+                FILE *tf = fopen(wc_opt(argc, argv, "--tsv", nullptr), "w"); if (!tf) { fprintf(stderr, "wrap-check: cannot write the --tsv\n"); return 1; }
+                fprintf(tf, "source\tper_gt_turn\toff\tn\n"); for (int k = 0; k < NS; k++) { const double *a = s[nbin][k]; fprintf(tf, "%s\t%.4f\t%.4f\t%.0f\n", nm[k], a[1] > 0 ? a[0] / a[1] : NAN, a[2] > 0 ? a[3] / a[2] : NAN, a[2]); }
+                fclose(tf);
+            }
             free(s); free(cnt);
         }
         free(all); fit_set_free(fs); if (rs) fit_set_free(rs); if (cz) z3_close(cz); z3_close(qz);

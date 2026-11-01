@@ -56,7 +56,7 @@ int main(void) {
     for (int z = 0; z < D * H2; z++) for (int y = 0; y < N; y++) for (int x = 0; x < N; x++) {
         const double w = W_true(y + 0.5, x + 0.5), f = w - floor(w + 0.5), dist = fabs(f) * SP; const size_t i = ((size_t)z * N + y) * N + x;
         v[i] = (uint8_t)lround(40 + 160 * exp(-dist * dist / 4.5));
-        double wm = fmod(w, 14); if (wm < 0) wm += 14; q[i] = (uint8_t)(1 + (int)floor(wm * 18) % 252);
+        double wm = fmod(w, 14); if (wm < 0) wm += 14; q[i] = dist < 2.5 ? (uint8_t)(1 + (int)floor(wm * 18) % 252) : 0;   /* (labels near the sheets only, as published wraps rasterised) */
     }
     z3w *zw = z3w_create(ct, sh, 256, 0, 0, nullptr); CHECK(zw && !z3w_write_shard(zw, 0, 0, 0, v, 4) && !z3w_close(zw), "write CT");
     snprintf(p, sizeof p, "%s/9.6", cd);
@@ -69,6 +69,17 @@ int main(void) {
     printf("test_wrap_check: right model %d real / %d dup (mean empty %.3f); doubled model %d real / %d dup (mean empty %.3f)\n", r1, d1, e1, r2, d2, e2);
     CHECK(r1 >= 3 && d1 == 0 && e1 < 0.1, "right model: %d real, %d dup, empty %.3f", r1, d1, e1);
     CHECK(d2 >= 3 && d2 > r2 && e2 > 0.35 && e2 < 0.65, "doubled model: %d real, %d dup, empty %.3f", r2, d2, e2);
+    /* --gt-int: intervals between consecutive GT sheets; the right model counts 1 turn per GT turn, the doubled one 2 */
+    for (int mi = 0; mi < 2; mi++) {
+        char t3[600]; snprintf(t3, sizeof t3, "%s/gti%d.tsv", dir, mi);
+        char *av3[] = {"ufsm", "wrap-check", mi ? m2 : m1, fd, "--codes", dir, "codes/9.6", "--nz", "4", "--nth", "90", "--threads", "4", "--gt-int", "1", "--tsv", t3};
+        CHECK(cmd_wrap_check(17, av3) == 0, "wrap-check --gt-int");
+        FILE *f = fopen(t3, "r"); char ln[256]; double fit = NAN, n = 0;
+        while (f && fgets(ln, sizeof ln, f)) { char s[32]; double r, o, c; if (sscanf(ln, "%31s %lf %lf %lf", s, &r, &o, &c) == 4 && !strcmp(s, "fit")) { fit = r; n = c; } }
+        if (f) fclose(f);
+        printf("test_wrap_check: --gt-int model %s: %.3f fitted turns per GT turn over %.0f intervals\n", mi ? "doubled" : "right", fit, n);
+        CHECK(n > 100 && fabs(fit - (mi ? 2.0 : 1.0)) < 0.05, "--gt-int %s model: %.3f per GT turn (%.0f intervals)", mi ? "doubled" : "right", fit, n);
+    }
     for (int k = 0; k < 10; k++) free(a[k]);
     free(v); free(q); free(cy); free(cx);
     snprintf(p, sizeof p, "rm -rf '%s'", dir); if (system(p)) fprintf(stderr, "(could not remove %s)\n", dir);

@@ -131,6 +131,23 @@ int main(void) {
         fit_free(m);
     }
     fit_fields_free(&ob);
+    {   /* --rho-scale 0.75: the density count scaled (radial W differences x 0.75 in the lower half; W only, no phase targets) */
+        char out2[600]; snprintf(out2, sizeof out2, "%s/out_rs", dir);
+        char *av2[] = {"ufsm", "count-field", in, out2, "--R", "0", "--dir", "1", "--pool", "1", "--threads", "4", "--rmin-um", "0", "--rho-scale", "0.75", "--cf-gpu", "0", nullptr};
+        CHECK(cmd_count_field(18, av2) == 0, "count-field --rho-scale failed");
+        snprintf(pth, sizeof pth, "%s/wc.f32", out2); FILE *f2 = fopen(pth, "rb"); float *w2 = malloc(n * sizeof(float));
+        CHECK(f2 && fread(w2, sizeof(float), n, f2) == n, "no wc.f32 (--rho-scale)"); if (f2) fclose(f2);
+        double rs = 0; int nr = 0;
+        for (int k = 0; k < 8; k++) {
+            const double th = -2.8 + k * 2.4 / 7, r0 = 12 * h, r1 = 36 * h;
+            const int y0 = (int)((cy0 + r0 * sin(th)) / h), x0 = (int)((cx0 + r0 * cos(th)) / h), y1 = (int)((cy0 + r1 * sin(th)) / h), x1 = (int)((cx0 + r1 * cos(th)) / h);
+            const size_t i0 = ((size_t)2 * H + y0) * W + x0, i1 = ((size_t)2 * H + y1) * W + x1;
+            const double tw = trueW((y1 + 0.5) * h, (x1 + 0.5) * h) - trueW((y0 + 0.5) * h, (x0 + 0.5) * h);
+            if (w2[i0] == w2[i0] && w2[i1] == w2[i1] && tw > 1) { rs += (w2[i1] - w2[i0]) / tw; nr++; }
+        }
+        CHECK(nr >= 4 && fabs(rs / nr - 0.75) < 0.05, "--rho-scale 0.75: radial count ratio %.3f (%d segments)", nr ? rs / nr : 0, nr);
+        free(w2);
+    }
     gpu_vs_cpu(dir);
     char cmd[700]; snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir); if (system(cmd)) {}
     for (int k = 0; k < 10; k++) free(a[k]);
