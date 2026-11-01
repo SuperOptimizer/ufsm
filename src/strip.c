@@ -769,7 +769,10 @@ int cmd_strip_flatten(int argc, char **argv) {
         /* chunks on --jobs workers (each --threads / jobs CPU threads; with --gpu 1 the SLIM iterations on device worker % devices), blended
            into the lattice strictly in chunk order: the sums are the same whatever the job count */
         const int ngpu = atoi(sopt(argc, argv, "--gpu", "1")) ? flat_gpu_devices() : 0;
-        int jobs = atoi(sopt(argc, argv, "--jobs", "0")); if (jobs <= 0) jobs = ngpu > 0 ? 3 * ngpu : 1;
+        int jobs = atoi(sopt(argc, argv, "--jobs", "0"));
+        /* default with GPUs: 3 per GPU or one per 3 threads, the larger (a job's chunk prep and blend are CPU work: the GPU sat at
+           11-13% with 3 jobs; 0490B desk 120 chunks at 20 threads: 3 jobs 151-158 s, 6 jobs 96-134 s, 12 jobs 113-121 s; same files) */
+        if (jobs <= 0) jobs = ngpu > 0 ? (3 * ngpu > nth / 3 ? 3 * ngpu : nth / 3) : 1;
         if (jobs > 64) jobs = 64;
         if (jobs > j1 - j0 + 1) jobs = j1 - j0 + 1 > 0 ? j1 - j0 + 1 : 1;
         sf_ctx X = {&F, nchunk, S, nth / jobs > 0 ? nth / jobs : 1, ngpu, atoi(sopt(argc, argv, "--iters", "30")), atoi(sopt(argc, argv, "--cg", "200")),
