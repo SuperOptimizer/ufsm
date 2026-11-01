@@ -164,11 +164,17 @@ ctcal() {
     log "ctcal: CT peaks per density turn '${k:-none}' outside ${CTCAL_RANGE:-0.4,2.5}: wrong --ct-um ($LUM) or CT level ($K/$LV)?"; return 1; fi
   mv $O/ct.cal.tmp $O/ct.cal; log "ctcal: CT peaks per density turn $k (--ct-um $LUM, level $LV)"
 }
+# REFPH: the ref's phase-target flags. Default (COUNT 11-01): confident phase gradients at weight 0.5, x16 where the network spacing is wide
+# (ramp 100..140 um): the phase counts right on wide sheets and skips packed ones, where the density counts. Gate vs the old --phase-w 4
+# (whole-scroll refs, per-z-slab GT): P4 ids all 6 slabs up (z2-z7 .209/.213/.181/.151/.260/.239 -> .217/.226/.202/.184/.283/.254),
+# 0.5 mm pairs all 6 up (mean .679 -> .695), 4 mm pairs mean .286 -> .293, GT
+# intervals off .099 -> .083; 1667 all 5 slabs up (ids +.06..+.13, 4 mm pairs +.06..+.08); 0139 flat; 0846A wraps / CT peaks per turn same.
+# REFPH="--phase-w 4" = the old ref.
 ref() {
   [ "$DRY" = 1 ] || rm -rf $REF
   local cal=; [ "${CTCAL:-0}" = 1 ] && cal="--ct-cal $O/ct.cal"
   if [ -n "${REFCMD:-}" ]; then X $O/logs/ref.log $REFCMD $F $REF $cal; else
-  X $O/logs/ref.log $U count-field $F $O/cf.unused --R 0 --pool 8 --phase-w 4 --iters 1200 --model $REF --model-only 1 --model-stride ${MSTRIDE:-4} \
+  X $O/logs/ref.log $U count-field $F $O/cf.unused --R 0 --pool 8 ${REFPH---phase-w 0.5 --wide 100,140 --wide-phase 15} --iters 1200 --model $REF --model-only 1 --model-stride ${MSTRIDE:-4} \
     --threads $TH --mem-gb ${CFMEM:-24} $cal ${REFX:-}; fi && { [ "$DRY" = 1 ] || [ -e $REF/model.json ]; }
 }
 
