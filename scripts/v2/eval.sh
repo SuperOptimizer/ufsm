@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # v2 universal model evaluation (plan bright-forging-seahorse, Phase 2). Usage: eval.sh MODE CKPT TAG
 #   MODE screen (laptop GPU, under gpuq / gpu.lock as the called scripts take it):
-#     1. winding: scripts/wbench/wgate.sh CKPT v2-TAG (R1 p05x CI > 0 and ids >= 0, R2 slab sites, R3 1667 guard vs wind96; the slab
+#     1. winding: scripts/v2/wfields.sh CKPT v2-TAG (laptop predicts, desk fits: no ufsm fit on the laptop) -> wgate (R1 p05x CI > 0 and ids >= 0, R2 slab sites, R3 1667 guard vs wind96; the slab
 #        sites run on forlindesk as wgate does from the laptop). The candidate's fields come from its unwrap2 channels 0-10.
 #     2. ink: scripts/v2/inkev.sh with PX="--channel ink" (holdout F1 0139 w039 9.36 / 2.4, 1667 w028, Paris 4 segment box)
 #        -> ~/ufsm-data/v2eval/ink/eval.tsv row v2-TAG; compare with the ift3-24000 row.
@@ -20,11 +20,11 @@ MODE=${1:?usage: eval.sh screen|milestone|p4|hold CKPT TAG}; CK=$(readlink -f "$
 H=$(cd "$(dirname "$0")" && pwd); R=$(cd $H/../.. && pwd)
 log() { echo "$(date '+%F %T') eval $TAG: $*"; }
 screen() {
-  log "wgate (winding gate vs wind96)"
-  bash $R/scripts/wbench/wgate.sh $CK v2-$TAG || log "wgate failed"
+  log "winding gate vs wind96 (wfields.sh: laptop predicts the box / site fields, the desk fits them: wgate FIXED=1)"
+  bash $H/wfields.sh $CK v2-$TAG || log "wfields failed"
   log "ink holdout F1 (inkev.sh, --channel ink)"
   PX="--channel ink" bash $H/inkev.sh $CK v2-$TAG || log "ink eval failed"
-  log "done: wgate table ~/ufsm-data/wbench/gate/v2-$TAG/table.txt, ink row v2-$TAG in ~/ufsm-data/v2eval/ink/eval.tsv (baseline row ift3-24000)"
+  log "done: wgate table desk /vesuvius/ufsm/wbench/gate/v2-$TAG/table.txt, ink row v2-$TAG in ~/ufsm-data/v2eval/ink/eval.tsv (baseline row ift3-24000)"
 }
 V=/vesuvius/ufsm/v2; U=${U:-$V/bin/ufsm}; UR=${UR:-$V/unroll}; REFUR=${REFUR:-/vesuvius/ufsm/unroll}
 GT=${GT:-/vesuvius/ufsm/gt/paris4-q9p6/q-9p6.zarr}; RCW=${RCW:-$V/eval/relative_windings.json}
