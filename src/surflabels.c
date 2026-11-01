@@ -22,6 +22,7 @@
                       sheet does not; with --gt the curve over T (kept share, phase agreement, pair accuracy) is printed)
    --geom DIR (ufsm geom-check output of these wraps): quads in its defect cells (cells.tsv: 64 rows x 1/64 turn) or in z bins whose
    CT slip |slip_mean| x rows / --slip-d exceeds --slip-max turns (slip.tsv + zbins.tsv) are rasterised as dropped (ignore 1).
+   --rows A,B: only wrap rows A..B (e.g. without the end caps, where geom-check slip is garbage); the other rows likewise dropped.
    (the sampler's "phase": {"ignore": ...}: nonzero = not trained on). Dropped wraps take part in the geometry (the pair rule sees
    every sheet) but none of their voxels is labelled. Wraps are dropped by: --wrapcheck (verdict dup / merged), --first / --last
    (ids outside, e.g. strip --last trims), --drop (a list), --band-peaks LO,HI (wrap-check CT peaks per fitted turn, one + 2 x two_plus,
@@ -615,6 +616,10 @@ int cmd_surf_labels(int argc, char **argv) {
           if (fs) fclose(fs);
           fprintf(stderr, "surf-labels: --geom %s: %ld defect cells, %ld slipping wrap z bins (|slip| x rows / %.3g > %.3g turn) masked\n", gd, ncell, nzb, sd, smax);
       } }
+    { const char *rr = sl_opt(argc, argv, "--rows", nullptr); int a, b;   /* --rows A,B: only wrap rows [A, B] labelled (end caps: the rest dropped) */
+      if (rr) { if (sscanf(rr, "%d,%d", &a, &b) != 2 || b < a) { fprintf(stderr, "surf-labels: --rows A,B\n"); return 2; }
+          for (int k = 0; k < nw; k++) { sl_wrap *w = &W[k]; if (!w->badrow) w->badrow = calloc((size_t)w->h, 1);
+              for (int r = 0; r < w->h; r++) if (r < a || r > b) w->badrow[r] = 1; } } }
     int nkeep = 0; long long vkeep = 0; for (int k = 0; k < nw; k++) if (W[k].keep) { nkeep++; vkeep += W[k].nv; }
     fprintf(stderr, "surf-labels: %d of %d wraps kept (%.3f of the vertices); dropped:", nkeep, nw, nvt ? (double)vkeep / nvt : 0);
     for (int k = 0; k < nw; k++) if (!W[k].keep) fprintf(stderr, " w%03d(%s)", W[k].id, W[k].why);
