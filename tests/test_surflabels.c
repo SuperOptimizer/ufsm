@@ -9,6 +9,8 @@
    - a conflict: a wrap 8 lying on wrap 2 -> codes 255 there, written 0, ignore 2, never labelled;
    - --gt with the dir +1 codes as GT: phase agreement and pair accuracy 1.0 against itself;
    - a holdout box (--exclude) -> ignore 4;
+   - --geom: defect cells / slipping z bins of geom-check -> no codes there;
+   - --min-coh: CT ridges on the sheets keep the labels, ridges midway between them (labels half a turn off) -> ignore 5;
    - same bytes with 1 and 4 threads; --dir auto picks -1 on the dir -1 spiral (same bytes as --dir -1). */
 #include "band.h"
 #include "store.h"
@@ -66,6 +68,19 @@ int main(void) {
     fprintf(f, "{\"control_points\": [{\"x\": %g, \"y\": %g, \"z\": 0}, {\"x\": %g, \"y\": %g, \"z\": %d}]}\n", C0, C0, C0, C0, NZ - 1); fclose(f);
     snprintf(p, sizeof p, "%s/hold.json", root); f = fopen(p, "w"); if (!f) return 1;
     fprintf(f, "{\"boxes\": [{\"name\": \"h\", \"ct\": \"S/scan.zarr\", \"l0\": [10, 160, 160, 20, 30, 30]}, {\"name\": \"o\", \"ct\": \"T/other.zarr\", \"l0\": [0, 0, 0, 64, 64, 64]}]}\n"); fclose(f);
+    for (int v = 0; v < 2; v++) {   /* CT: gaussian ridges on the dir +1 sheets (ct0) or midway between them (ct1) */
+        const int64_t sh[3] = {NZ, NY, NX}; snprintf(p, sizeof p, "%s/ct%d/0", root, v); z3w *w = z3w_create(p, sh, 128, 0, 0, nullptr); if (!w) return 1;
+        uint8_t *d = malloc(128 * 128 * 128);
+        for (int sy = 0; sy < 2; sy++) for (int sx = 0; sx < 2; sx++) {
+            for (int z = 0; z < NZ; z++) for (int y = 0; y < 128; y++) for (int x = 0; x < 128; x++) {
+                const double Y = sy * 128 + y - C0, X = sx * 128 + x - C0, Wv = (hypot(X, Y) - 20) / 10 - atan2(Y, X) / (2 * M_PI) - 0.5 * v;
+                const double e = (Wv - round(Wv)) * 10; d[((size_t)z * 128 + y) * 128 + x] = (uint8_t)lround(20 + 200 * exp(-e * e / 4.5));
+            }
+            for (int z = NZ; z < 128; z++) memset(d + (size_t)z * 128 * 128, 0, 128 * 128);
+            if (z3w_write_shard(w, 0, sy, sx, d, 2)) return 1;
+        }
+        free(d); if (z3w_close(w)) return 1;
+    }
     tifxyz_set_sfc(0.01);
     snprintf(p, sizeof p, "%s/wp", root); wraps(p, 1, 0);
     snprintf(p, sizeof p, "%s/wm", root); wraps(p, -1, 0);
@@ -82,6 +97,39 @@ int main(void) {
     CHECK(!run(root, "wp", "d", "1", "4", "--drop", "w4", nullptr), "surf-labels --drop failed");
     CHECK(!run(root, "wd", "c", "1", "4", nullptr, nullptr, nullptr), "surf-labels dup failed");
     CHECK(!run(root, "wp", "g", "1", "4", nullptr, nullptr, "p1/codes.zarr"), "surf-labels --gt failed");
+    { char ct[400]; for (int v = 0; v < 2; v++) {
+        snprintf(ct, sizeof ct, "%s/ct%d", root, v); char o[32]; snprintf(o, sizeof o, "coh%d", v);
+        char ax[400], wdp[400], od[400]; snprintf(ax, sizeof ax, "%s/axis.json", root); snprintf(wdp, sizeof wdp, "%s/wp", root); snprintf(od, sizeof od, "%s/%s", root, o);
+        char *av[] = {"ufsm", "surf-labels", wdp, od, "--axis", ax, "--axis-um", "9.6", "--dir", "1", "--grid-um", "9.6", "--shape", "64,256,256", "--shard", "128", "--block", "32",
+                      "--radius", "12", "--threads", "4", "--ct", ct, "0", "--coh-cell", "16", "--min-coh", "0.3"};
+        CHECK(!cmd_surf_labels((int)(sizeof av / sizeof *av), av), "surf-labels --min-coh failed");
+        char r[600]; snprintf(r, sizeof r, "%s/ignore.zarr", od); uint8_t *ig = readall(r, "9.6"); snprintf(r, sizeof r, "%s/phase.zarr", od); uint8_t *ph = readall(r, "9.6");
+        long kept = 0, coh = 0; for (size_t i = 0; ig && ph && i < (size_t)NZ * NY * NX; i++) { kept += ph[i] != PHASE_UNKNOWN; coh += ig[i] == 5; }
+        printf("test_surflabels: CT ridges %s: %ld kept, %ld coherence-gated\n", v ? "midway (wrong labels)" : "on the sheets", kept, coh);
+        if (v == 0) CHECK(kept > 10 * coh && kept > 100000, "labels on CT-coherent sheets were gated");
+        else CHECK(coh > 10 * kept && coh > 100000, "labels half a turn off the CT ridges were kept");
+        free(ig); free(ph);
+    } }
+    {   /* --geom: geom-check defect cells covering wrap 3 (rows 0..63, every 1/64 turn), slip z bins on wrap 6 rows 16..31 */
+        snprintf(p, sizeof p, "%s/geom", root); snprintf(cmd, sizeof cmd, "mkdir -p %s", p); if (system(cmd)) return 1;
+        snprintf(p, sizeof p, "%s/geom/cells.tsv", root); FILE *g = fopen(p, "w"); fprintf(g, "wrap\trow0\tturn_frac\tn\n");
+        for (int k = 0; k < 64; k++) fprintf(g, "w003\t0\t%.4f\t100\n", (k + 0.5) / 64);
+        fclose(g);
+        snprintf(p, sizeof p, "%s/geom/zbins.tsv", root); g = fopen(p, "w"); fprintf(g, "wrap\tzbin\trow0\n"); for (int k = 0; k < 4; k++) fprintf(g, "w001\t%d\t%d\n", k, 8 * k);
+        fclose(g);
+        snprintf(p, sizeof p, "%s/geom/slip.tsv", root); g = fopen(p, "w"); fprintf(g, "wrap\tzbin\tn\tslip_mean\tslip_abs\nw006\t2\t9\t0.9\t0.9\nw006\t1\t9\t0.05\t0.1\n"); fclose(g);
+        snprintf(p, sizeof p, "%s/geom", root);
+        CHECK(!run(root, "wp", "gm", "1", "4", "--geom", p, nullptr), "surf-labels --geom failed");
+        char r[600]; snprintf(r, sizeof r, "%s/gm/codes.zarr", root); uint8_t *cd = readall(r, "9.6");
+        long on3 = 0, on6a = 0, on6b = 0;
+        for (size_t i = 0; cd && i < (size_t)NZ * NY * NX; i++) { if (!cd[i]) continue;
+            const int z = (int)(i / (NY * NX)), y = (int)(i / NX % NY), x = (int)(i % NX); const double Y = y - C0, X = x - C0, Wv = (hypot(X, Y) - 20) / 10 - atan2(Y, X) / (2 * M_PI);
+            if (fabs(Wv - 3) < 0.05) on3++;
+            if (fabs(Wv - 6) < 0.05) { if (z >= 34 && z <= 46) on6a++; else if (z < 30 || z > 50) on6b++; } }
+        printf("test_surflabels: --geom: codes on wrap 3 %ld, on wrap 6 in the slip bin (z 32..47) %ld, elsewhere %ld\n", on3, on6a, on6b);
+        CHECK(cd && on3 == 0 && on6a == 0 && on6b > 1000, "--geom masks not applied");
+        free(cd);
+    }
     snprintf(p, sizeof p, "%s/hold.json", root);
     CHECK(!run(root, "wp", "h", "1", "4", "--exclude", p, nullptr), "surf-labels --exclude failed");
     const int sense[2] = {1, -1}; const char *outs[2] = {"p1", "m"};

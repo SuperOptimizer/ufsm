@@ -1,8 +1,8 @@
 /* ufsm surf-labels WRAPS OUT --axis F --axis-um U0 --dir +-1|auto --grid-um U (--shape Z,Y,X | --like ROOT KEY)
                    [--wrapcheck TSV] [--first K] [--last K] [--drop w1,w2,..] [--band-peaks LO,HI]
-                   [--ct ROOT KEY [--min-onpap 0.2] [--ct-level 80] [--ct-range 15]]
+                   [--ct ROOT KEY [--ct-scale 1|2] [--min-onpap 0.2] [--ct-level 80] [--ct-range 15]]   (--ct-scale 2: the CT is on the 2x finer grid)
                    [--exclude holdouts.json --exclude-ct NAME [--exclude-mm 0.5]]
-                   [--radius 20] [--block 256] [--shard 512] [--bake 1] [--gt ROOT KEY] [--tsv OUT] [--threads N]
+                   [--geom DIR [--slip-max 0.5] [--slip-d 2]] [--radius 20] [--block 256] [--shard 512] [--bake 1] [--min-coh T [--coh-cell 32]] [--gt ROOT KEY] [--tsv OUT] [--threads N]
    Winding labels straight from our whole-scroll wraps (ufsm wraps / wrap-snap .sfc, rows = z, wrap k = the fit's level set W = k
    with W = U - dir theta / 2 pi, theta = atan2 around the axis in (-pi, pi]): every wrap's quads are rasterised on the scan's training
    grid (--grid-um; --like a CT level array of that grid gives the shape) with the sheet coordinate q = k + dir theta / 2 pi (continuous
@@ -16,7 +16,12 @@
      OUT/phase.zarr   the phase (with --bake 1, the default: unknown wherever ignore is set)
      OUT/ignore.zarr  0 = keep; 1 = the voxel's phase comes from a dropped wrap (on it, or between it and its neighbours: the gap
                       between two kept wraps around a dropped one is never labelled, nor are adjacent sheets invented across it),
-                      2 = conflicting codes, 3 = masked CT (CT 0, with --ct), 4 = a holdout box
+                      2 = conflicting codes, 3 = masked CT (CT 0, with --ct), 4 = a holdout box, 5 = low CT coherence (--min-coh T
+                      with --ct: per cell of --coh-cell voxels (32) the correlation of the CT with cos(2 pi phase) over the labelled
+                      voxels is under T: sheets on papyrus and gaps between them correlate; a wrap in a gap / a missed or extra
+                      sheet does not; with --gt the curve over T (kept share, phase agreement, pair accuracy) is printed)
+   --geom DIR (ufsm geom-check output of these wraps): quads in its defect cells (cells.tsv: 64 rows x 1/64 turn) or in z bins whose
+   CT slip |slip_mean| x rows / --slip-d exceeds --slip-max turns (slip.tsv + zbins.tsv) are rasterised as dropped (ignore 1).
    (the sampler's "phase": {"ignore": ...}: nonzero = not trained on). Dropped wraps take part in the geometry (the pair rule sees
    every sheet) but none of their voxels is labelled. Wraps are dropped by: --wrapcheck (verdict dup / merged), --first / --last
    (ids outside, e.g. strip --last trims), --drop (a list), --band-peaks LO,HI (wrap-check CT peaks per fitted turn, one + 2 x two_plus,
@@ -49,7 +54,8 @@
 #include <time.h>
 
 enum { SL_TR = 8, SL_TC = 32 };   /* tile = 8 rows x 32 columns of quads */
-enum { IG_DROP = 1, IG_CONFLICT = 2, IG_CT = 3, IG_HOLD = 4 };
+enum { IG_DROP = 1, IG_CONFLICT = 2, IG_CT = 3, IG_HOLD = 4, IG_COH = 5 };
+enum { COH_BINS = 40 };   /* coherence histogram bins over [-1, 1] */
 
 static const char *sl_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 2; i + 1 < argc; i++) if (!strcmp(argv[i], k)) return argv[i + 1]; return d; }
 static int sl_idx(int argc, char **argv, const char *k) { for (int i = 2; i < argc; i++) if (!strcmp(argv[i], k)) return i; return -1; }
@@ -65,13 +71,14 @@ typedef struct {
     float *ra, *rb;                   /* per row (--dir auto): the radius of the valid vertex nearest theta = pi (ra) / -pi (rb) when within 0.15 rad of it, else NAN */
     long long nv;                     /* valid vertices */
     double peaks, onpap; int has_wc; char verdict[16];
+    uint8_t *badrow, *badcell;        /* --geom: rows of slipping z bins; 64-row x 1/64-turn defect cells ((row / 64) * 64 + turn bin) */
     _Atomic long long pap, papn;      /* --min-onpap pass */
     int b0, bn; float *g; uint8_t *v; /* the band's rows: grid z, y, x, q per vertex; valid */
     _Atomic long long kn, kk, gk, g10, g25, kgk, kg10, kg25;   /* phase voxels whose lower sheet is this wrap: known, kept; vs GT: known in both (raw / kept), |d| < .1, < .25 */
 } sl_wrap;
 
 typedef struct { int wi, r0, c0; float lo[3], hi[3]; } sl_tile;   /* quads rows r0 .. r0 + SL_TR, cols c0 .. c0 + SL_TC (band-relative rows) */
-typedef struct { float p[3], d; uint32_t h; uint8_t q; } sl_rec;
+typedef struct { float p[3], d, r; uint32_t h; uint8_t q; } sl_rec;   /* r: the cell coherence (NAN: none) */
 typedef struct { sl_rec *r; size_t n, cap; } sl_recs;
 
 typedef struct {
@@ -85,8 +92,9 @@ typedef struct {
     uint8_t **bc, **bp, **bi; _Atomic int *pend; pthread_mutex_t mu;
     _Atomic long next; long nitems; _Atomic int fail;
     /* stats */
-    _Atomic long long ncode, nconf, nknown, nkept, nig[5], gtk, g10, g25, kgtk, kg10, kg25, nblk, gbins[PHASE_AGREE_BINS], kbins[PHASE_AGREE_BINS];
+    _Atomic long long ncode, nconf, nknown, nkept, nig[6], gtk, g10, g25, kgtk, kg10, kg25, nblk, gbins[PHASE_AGREE_BINS], kbins[PHASE_AGREE_BINS];
     sl_recs *recs; uint32_t pa_T; int nt;
+    int coh_cell, ct_scale; double min_coh; _Atomic long long ch_kn[COH_BINS + 1], ch_gk[COH_BINS + 1], ch_g10[COH_BINS + 1], ch_g25[COH_BINS + 1];   /* bin COH_BINS: no coherence (too few voxels) */
 } sl_job;
 
 /* ---- wraps ---- */
@@ -225,6 +233,13 @@ static void sl_raster_tile(const sl_job *J, const sl_tile *t, const int64_t o[3]
         }
         int out = 0; for (int d = 0; d < 3; d++) if (cl[d] > hi[d] || ch[d] < lo[d]) out = 1;
         if (out) continue;
+        int bad = !w->keep;   /* --geom masks: a quad with a vertex in a slipping z bin or a defect cell is rasterised as dropped */
+        if (!bad && (w->badrow || w->badcell)) for (int k = 0; k < 4 && !bad; k++) {
+            const int row = w->b0 + r + (k >> 1);
+            if (w->badrow && w->badrow[row]) bad = 1;
+            if (w->badcell) { double tf = (q[k] - w->id) / J->dir + 0.5; tf -= floor(tf); int tb = (int)(tf * 64); if (tb > 63) tb = 63;
+                              if (w->badcell[(size_t)(row / 64) * 64 + tb]) bad = 1; }
+        }
         double e1 = 0, e2 = 0;
         for (int d = 0; d < 3; d++) { e1 += (p[1][d] - p[0][d]) * (p[1][d] - p[0][d]); e2 += (p[2][d] - p[0][d]) * (p[2][d] - p[0][d]); }
         int nu = (int)ceil(sqrt(e1) / 0.5) + 1, nv = (int)ceil(sqrt(e2) / 0.5) + 1; if (nu > 256) nu = 256; if (nv > 256) nv = 256;
@@ -239,13 +254,13 @@ static void sl_raster_tile(const sl_job *J, const sl_tile *t, const int64_t o[3]
             if (!in) continue;
             const size_t vi = ((size_t)vox[0] * N + vox[1]) * N + vox[2];
             const uint8_t code = sl_code(w00 * q[0] + w01 * q[1] + w10 * q[2] + w11 * q[3]);
-            if (!w->keep) drop[vi] = 1;
+            if (bad) drop[vi] = 1;
             if (codes[vi] == 0) { codes[vi] = code; wid[vi] = (uint16_t)(t->wi + 1); }
             else if (codes[vi] != 255 && abs(sl_cdiff(codes[vi], code)) > 4) codes[vi] = 255;
         }
     }
 }
-typedef struct { uint8_t *codes, *drop, *phase, *gtc, *gph, *ct; uint16_t *wid; int32_t *lo, *hi; uint32_t *tl; size_t tcap; } sl_scratch;
+typedef struct { uint8_t *codes, *drop, *phase, *gtc, *gph, *ct; uint16_t *wid; int32_t *lo, *hi; uint32_t *tl; size_t tcap; float *coh; double *cacc; uint8_t *ct2; } sl_scratch;
 static int sl_block(sl_job *J, sl_scratch *X, int si, int bk, int tid) {
     const int S = J->S, B = J->B, Hh = J->Hh, N = B + 2 * Hh, nb = S / B;
     const int64_t sy = J->slist[si] / J->ns[2], sx = J->slist[si] % J->ns[2];
@@ -274,7 +289,18 @@ static int sl_block(sl_job *J, sl_scratch *X, int si, int bk, int tid) {
         if (!ng) memset(X->gph, PHASE_UNKNOWN, NN);   /* (no GT codes near: the pair rule's answer, without its transforms) */
         else if (band_field_phase_pair(X->gtc, n3, J->rmax, X->gph, nullptr)) return -1;
     }
-    if (J->ct) { const int64_t nn[3] = {B, B, B}; if (z3_read(J->ct, b0, nn, X->ct, 1)) return -1; }
+    if (J->ct && J->ct_scale == 1) { const int64_t nn[3] = {B, B, B}; if (z3_read(J->ct, b0, nn, X->ct, 1)) return -1; }
+    else if (J->ct) {   /* --ct-scale 2: the CT on the 2x finer grid, 2^3 means (0 when any of them is 0: masked) */
+        const int64_t o2[3] = {2 * b0[0], 2 * b0[1], 2 * b0[2]}, n2[3] = {2 * B, 2 * B, 2 * B};
+        if (!X->ct2 && !(X->ct2 = malloc((size_t)8 * B * B * B))) return -1;
+        if (z3_read(J->ct, o2, n2, X->ct2, 1)) return -1;
+        const size_t B2 = 2 * (size_t)B;
+        for (int z = 0; z < B; z++) for (int y = 0; y < B; y++) for (int x = 0; x < B; x++) {
+            int s = 0, zero = 0;
+            for (int q = 0; q < 8; q++) { const int v = X->ct2[((2 * z + (q >> 2 & 1)) * B2 + 2 * y + (q >> 1 & 1)) * B2 + 2 * x + (q & 1)]; s += v; zero |= !v; }
+            X->ct[((size_t)z * B + y) * B + x] = zero ? 0 : (uint8_t)((s + 4) / 8);
+        }
+    }
     /* the shard's buffers */
     pthread_mutex_lock(&J->mu);
     if (!J->bc[si]) {
@@ -285,8 +311,29 @@ static int sl_block(sl_job *J, sl_scratch *X, int si, int bk, int tid) {
     uint8_t *oc = J->bc[si], *op = J->bp[si], *oi = J->bi[si];
     pthread_mutex_unlock(&J->mu);
     if (!oc || !op || !oi) return -1;
-    long long ncode = 0, nconf = 0, nknown = 0, nkept = 0, nig[5] = {0}, gtk = 0, g10 = 0, g25 = 0, kgtk = 0, kg10 = 0, kg25 = 0, gb[PHASE_AGREE_BINS] = {0}, kb[PHASE_AGREE_BINS] = {0};
+    long long ncode = 0, nconf = 0, nknown = 0, nkept = 0, nig[6] = {0}, gtk = 0, g10 = 0, g25 = 0, kgtk = 0, kg10 = 0, kg25 = 0, gb[PHASE_AGREE_BINS] = {0}, kb[PHASE_AGREE_BINS] = {0};
     sl_recs *R = &J->recs[tid]; const double mm = J->gum * 1e-3;
+    /* local CT coherence of the label phase: per cell of coh_cell^3 voxels, the correlation of the CT with cos(2 pi phase) over the
+       voxels with a phase and CT > 0 (sheets on papyrus, gaps between them: high; a wrap in a gap or a missed sheet: low / negative) */
+    const int Cc = J->coh_cell, nc = Cc > 0 ? B / Cc : 0; float *coh = nullptr;
+    if (J->ct && nc) {
+        coh = X->coh; double *acc = X->cacc; memset(acc, 0, (size_t)nc * nc * nc * 6 * sizeof(double));
+        static float cs[PHASE_PERIOD]; static _Atomic int init;
+        if (!atomic_load(&init)) { for (int k = 0; k < PHASE_PERIOD; k++) cs[k] = (float)cos(2 * M_PI * k / PHASE_PERIOD); atomic_store(&init, 1); }
+        for (int z = 0; z < B; z++) for (int y = 0; y < B; y++) for (int x = 0; x < B; x++) {
+            const size_t i = ((size_t)(z + Hh) * N + (y + Hh)) * N + (x + Hh); const int ph = X->phase[i], v = X->ct[((size_t)z * B + y) * B + x];
+            if (ph == PHASE_UNKNOWN || !v) continue;
+            double *a = acc + 6 * (((size_t)(z / Cc) * nc + y / Cc) * nc + x / Cc); const double c = cs[ph];
+            a[0] += 1; a[1] += v; a[2] += (double)v * v; a[3] += c; a[4] += c * c; a[5] += v * c;
+        }
+        for (int k = 0; k < nc * nc * nc; k++) {
+            const double *a = acc + 6 * k, n = a[0];
+            if (n < 0.05 * Cc * Cc * Cc) { coh[k] = NAN; continue; }
+            const double vv = a[2] / n - (a[1] / n) * (a[1] / n), cc = a[4] / n - (a[3] / n) * (a[3] / n), cv = a[5] / n - (a[1] / n) * (a[3] / n);
+            coh[k] = vv > 1e-9 && cc > 1e-9 ? (float)(cv / sqrt(vv * cc)) : NAN;
+        }
+    }
+    long long ckn[COH_BINS + 1] = {0}, cgk[COH_BINS + 1] = {0}, cg10[COH_BINS + 1] = {0}, cg25[COH_BINS + 1] = {0};
     for (int z = 0; z < B; z++) for (int y = 0; y < B; y++) for (int x = 0; x < B; x++) {
         const int64_t gz = b0[0] + z, gy = b0[1] + y, gx = b0[2] + x;
         if (gz >= J->shape[0] || gy >= J->shape[1] || gx >= J->shape[2]) continue;
@@ -301,6 +348,10 @@ static int sl_block(sl_job *J, sl_scratch *X, int si, int bk, int tid) {
             const double *hb = J->hold[h];
             if (gz >= hb[0] && gz < hb[0] + hb[3] && gy >= hb[1] && gy < hb[1] + hb[4] && gx >= hb[2] && gx < hb[2] + hb[5]) { ig = IG_HOLD; break; }
         }
+        const float r = coh ? coh[((size_t)(z / Cc) * nc + y / Cc) * nc + x / Cc] : NAN;
+        int rb = COH_BINS; if (coh && isfinite(r)) { rb = (int)floor((r + 1) * 0.5 * COH_BINS); if (rb < 0) rb = 0; if (rb > COH_BINS - 1) rb = COH_BINS - 1; }
+        const int ig0 = ig;   /* (before the coherence gate: the calibration tables use it) */
+        if (!ig && coh && ph != PHASE_UNKNOWN && J->min_coh > -2 && !(r >= J->min_coh)) ig = IG_COH;
         const size_t oo = ((size_t)(z + bz * B) * S + (y + by * B)) * S + (x + bx * B);
         oc[oo] = c && c != 255 && !X->drop[i] ? (uint8_t)c : 0; ncode += oc[oo] != 0;
         oi[oo] = (uint8_t)ig;
@@ -309,10 +360,12 @@ static int sl_block(sl_job *J, sl_scratch *X, int si, int bk, int tid) {
         nknown++; nig[ig]++; if (!ig) nkept++;
         const int wi = X->wid[X->lo[i]] - 1; sl_wrap *w = wi >= 0 ? &J->W[wi] : nullptr;
         if (w) { atomic_fetch_add_explicit(&w->kn, 1, memory_order_relaxed); if (!ig) atomic_fetch_add_explicit(&w->kk, 1, memory_order_relaxed); }
+        if (!ig0) ckn[rb]++;
         if (!J->gt) continue;
         const int gp = X->gph[i];
         if (gp != PHASE_UNKNOWN) {
             double d = fabs((double)(ph - gp) / PHASE_PERIOD); d -= floor(d + 0.5); d = fabs(d);
+            if (!ig0) { cgk[rb]++; cg10[rb] += d < 0.1; cg25[rb] += d < 0.25; }
             const int bin = phase_agree_bin(d);
             gtk++; g10 += d < 0.1; g25 += d < 0.25; gb[bin]++;
             if (!ig) { kgtk++; kg10 += d < 0.1; kg25 += d < 0.25; kb[bin]++; }
@@ -320,17 +373,18 @@ static int sl_block(sl_job *J, sl_scratch *X, int si, int bk, int tid) {
                      if (!ig) { atomic_fetch_add_explicit(&w->kgk, 1, memory_order_relaxed); atomic_fetch_add_explicit(&w->kg10, d < 0.1, memory_order_relaxed); atomic_fetch_add_explicit(&w->kg25, d < 0.25, memory_order_relaxed); } }
         }
         const int gc = X->gtc[i];
-        if (!ig && gc >= 1 && gc <= 252) {   /* pair accuracy record: our winding at a GT-coded voxel */
+        if (!ig0 && gc >= 1 && gc <= 252) {   /* pair accuracy record: our winding at a GT-coded voxel */
             const uint64_t key = ((uint64_t)gz << 42) ^ ((uint64_t)gy << 21) ^ (uint64_t)gx; const uint32_t h = (uint32_t)(sl_mix(key) >> 32);
             if (h < J->pa_T) {
                 const double wo = (X->codes[X->lo[i]] - 1) / 18.0 + (double)ph / PHASE_PERIOD, d = wo - (gc - 1) / 18.0;
                 if (R->n == R->cap) { R->cap = R->cap ? 2 * R->cap : 4096; R->r = realloc(R->r, R->cap * sizeof *R->r); }
-                R->r[R->n++] = (sl_rec){{(float)(gz * mm), (float)(gy * mm), (float)(gx * mm)}, (float)d, h, (uint8_t)gc};
+                R->r[R->n++] = (sl_rec){{(float)(gz * mm), (float)(gy * mm), (float)(gx * mm)}, (float)d, r, h, (uint8_t)gc};
             }
         }
     }
     atomic_fetch_add(&J->ncode, ncode); atomic_fetch_add(&J->nconf, nconf); atomic_fetch_add(&J->nknown, nknown); atomic_fetch_add(&J->nkept, nkept);
-    for (int k = 0; k < 5; k++) atomic_fetch_add(&J->nig[k], nig[k]);
+    for (int k = 0; k < 6; k++) atomic_fetch_add(&J->nig[k], nig[k]);
+    for (int k = 0; k <= COH_BINS; k++) { atomic_fetch_add(&J->ch_kn[k], ckn[k]); atomic_fetch_add(&J->ch_gk[k], cgk[k]); atomic_fetch_add(&J->ch_g10[k], cg10[k]); atomic_fetch_add(&J->ch_g25[k], cg25[k]); }
     atomic_fetch_add(&J->gtk, gtk); atomic_fetch_add(&J->g10, g10); atomic_fetch_add(&J->g25, g25);
     atomic_fetch_add(&J->kgtk, kgtk); atomic_fetch_add(&J->kg10, kg10); atomic_fetch_add(&J->kg25, kg25);
     for (int k = 0; k < PHASE_AGREE_BINS; k++) { atomic_fetch_add(&J->gbins[k], gb[k]); atomic_fetch_add(&J->kbins[k], kb[k]); }
@@ -343,6 +397,7 @@ static void *sl_block_run(void *arg) {
     sl_scratch X = {0};
     X.codes = malloc(NN); X.drop = malloc(NN); X.phase = malloc(NN); X.wid = malloc(NN * 2); X.lo = malloc(NN * 4); X.hi = malloc(NN * 4);
     X.gtc = calloc(NN, 1); X.gph = malloc(NN); X.ct = malloc((size_t)J->B * J->B * J->B);
+    if (J->coh_cell > 0) { const size_t nc = (size_t)(J->B / J->coh_cell); X.coh = malloc(nc * nc * nc * sizeof(float)); X.cacc = malloc(nc * nc * nc * 6 * sizeof(double)); }
     if (!X.codes || !X.drop || !X.phase || !X.wid || !X.lo || !X.hi || !X.gtc || !X.gph || !X.ct) { atomic_store(&J->fail, 1); }
     else for (long it; (it = atomic_fetch_add(&J->next, 1)) < J->nitems && !atomic_load(&J->fail);) {
         const int si = (int)(it / J->nbs), bk = (int)(it % J->nbs);
@@ -355,7 +410,7 @@ static void *sl_block_run(void *arg) {
             free(J->bc[si]); free(J->bp[si]); free(J->bi[si]); J->bc[si] = J->bp[si] = J->bi[si] = nullptr;
         }
     }
-    free(X.codes); free(X.drop); free(X.phase); free(X.wid); free(X.lo); free(X.hi); free(X.gtc); free(X.gph); free(X.ct); free(X.tl);
+    free(X.codes); free(X.drop); free(X.phase); free(X.wid); free(X.lo); free(X.hi); free(X.gtc); free(X.gph); free(X.ct); free(X.tl); free(X.coh); free(X.cacc); free(X.ct2);
     return nullptr;
 }
 typedef struct { sl_job *J; double z0, z1; _Atomic int next, fail; } sl_loadjob;
@@ -386,7 +441,7 @@ int cmd_surf_labels(int argc, char **argv) {
     if (argc < 4) {
         fprintf(stderr, "usage: ufsm surf-labels <wraps-dir> <out-dir> --axis F --axis-um U0 --dir +-1 --grid-um U (--shape Z,Y,X | --like ROOT KEY)\n"
                         "       [--wrapcheck TSV] [--first K] [--last K] [--drop w1,w2] [--band-peaks LO,HI] [--ct ROOT KEY [--min-onpap 0.2] [--ct-level 80] [--ct-range 15]]\n"
-                        "       [--exclude holdouts.json --exclude-ct NAME [--exclude-mm 0.5]] [--radius 20] [--block 256] [--shard 512] [--bake 1] [--gt ROOT KEY] [--tsv OUT] [--threads N]\n");
+                        "       [--exclude holdouts.json --exclude-ct NAME [--exclude-mm 0.5]] [--radius 20] [--block 256] [--shard 512] [--bake 1] [--min-coh T [--coh-cell 32]] [--gt ROOT KEY] [--tsv OUT] [--threads N]\n");
         return 2;
     }
     const char *in = argv[2], *out = argv[3];
@@ -399,6 +454,8 @@ int cmd_surf_labels(int argc, char **argv) {
         fprintf(stderr, "surf-labels: need --axis F --axis-um U0 --grid-um U --dir 1|-1|auto; --shard a multiple of 128, --block dividing it, --radius in (0, 120]\n"); return 2;
     }
     sl_job J; memset(&J, 0, sizeof J);
+    J.coh_cell = atoi(sl_opt(argc, argv, "--coh-cell", "32")); J.min_coh = atof(sl_opt(argc, argv, "--min-coh", "-2"));
+    if (J.coh_cell < 0 || (J.coh_cell && B % J.coh_cell)) { fprintf(stderr, "surf-labels: --coh-cell must divide --block\n"); return 2; }
     J.gum = gum; J.dir = dir; J.S = S; J.B = B; J.rmax = (float)rmax; J.Hh = (int)ceil(rmax) + 2; J.bake = atoi(sl_opt(argc, argv, "--bake", "1")); J.nt = nt;
     pthread_mutex_init(&J.mu, nullptr);
     axis ax = {0}; if (axis_load(&ax, axp)) { fprintf(stderr, "surf-labels: cannot load the axis %s\n", axp); return 1; }
@@ -414,7 +471,10 @@ int cmd_surf_labels(int argc, char **argv) {
                J.shape[0] = a; J.shape[1] = b; J.shape[2] = c; } }
     for (int d = 0; d < 3; d++) J.ns[d] = (J.shape[d] + S - 1) / S;
     { const int ci = sl_idx(argc, argv, "--ct"); if (ci > 0) { if (ci + 2 >= argc) return 2; J.ct = z3_open(store_open(argv[ci + 1]), argv[ci + 2], sl_opt(argc, argv, "--cache", nullptr));
-        if (!J.ct || memcmp(z3_meta_of(J.ct)->shape, J.shape, sizeof J.shape)) { fprintf(stderr, "surf-labels: --ct %s %s: cannot open or not on the grid\n", argv[ci + 1], argv[ci + 2]); return 1; } } }
+        J.ct_scale = atoi(sl_opt(argc, argv, "--ct-scale", "1")); int64_t cs[3]; for (int d = 0; d < 3; d++) cs[d] = J.shape[d] * (J.ct_scale == 2 ? 2 : 1);
+        if (J.ct_scale != 1 && J.ct_scale != 2) { fprintf(stderr, "surf-labels: --ct-scale 1|2\n"); return 2; }
+        if (J.ct && J.ct_scale == 2) for (int d = 0; d < 3; d++) if (z3_meta_of(J.ct)->shape[d] == cs[d] - 1) cs[d]--;   /* (an odd finer extent) */
+        if (!J.ct || memcmp(z3_meta_of(J.ct)->shape, cs, sizeof cs)) { fprintf(stderr, "surf-labels: --ct %s %s: cannot open or not on the grid\n", argv[ci + 1], argv[ci + 2]); return 1; } } }
     { const int gi = sl_idx(argc, argv, "--gt"); if (gi > 0) { if (gi + 2 >= argc) return 2; J.gt = z3_open(store_open(argv[gi + 1]), argv[gi + 2], nullptr);
         if (!J.gt || memcmp(z3_meta_of(J.gt)->shape, J.shape, sizeof J.shape)) { fprintf(stderr, "surf-labels: --gt %s %s: cannot open or not on the grid\n", argv[gi + 1], argv[gi + 2]); return 1; } } }
     /* the wraps */
@@ -501,7 +561,7 @@ int cmd_surf_labels(int argc, char **argv) {
     /* pass 1 (--min-onpap): the wraps' on-papyrus shares */
     const double minpap = atof(sl_opt(argc, argv, "--min-onpap", "0"));
     if (minpap > 0) {
-        if (!J.ct) { fprintf(stderr, "surf-labels: --min-onpap needs --ct\n"); return 2; }
+        if (!J.ct || J.ct_scale != 1) { fprintf(stderr, "surf-labels: --min-onpap needs --ct on the grid (--ct-scale 1)\n"); return 2; }
         sl_ctc c = {.z = J.ct}; for (int d = 0; d < 3; d++) { c.sh[d] = J.shape[d]; c.g[d] = (J.shape[d] + 127) / 128; }
         const size_t ng = (size_t)c.g[0] * c.g[1] * c.g[2]; c.ch = calloc(ng, sizeof *c.ch); c.need = calloc(ng, 1);
         if (!c.ch || !c.need) return 1;
@@ -525,6 +585,36 @@ int cmd_surf_labels(int argc, char **argv) {
             if (W[k].keep && W[k].papn && W[k].onpap < minpap) { W[k].keep = 0; snprintf(W[k].why, sizeof W[k].why, "onpap %.2f", W[k].onpap); } }
         fprintf(stderr, "surf-labels: on-papyrus pass %.1fs\n", sl_now() - tp);
     }
+    { const char *gd = sl_opt(argc, argv, "--geom", nullptr);   /* ufsm geom-check output: cells.tsv defect cells, slip.tsv + zbins.tsv slipping z bins */
+      if (gd) {
+          const double smax = atof(sl_opt(argc, argv, "--slip-max", "0.5")), sd = atof(sl_opt(argc, argv, "--slip-d", "2")); char p[1600], line[1024]; long ncell = 0, nzb = 0;
+          snprintf(p, sizeof p, "%s/cells.tsv", gd); FILE *f = fopen(p, "r");
+          if (!f) { fprintf(stderr, "surf-labels: --geom: no %s\n", p); return 1; }
+          while (fgets(line, sizeof line, f)) { int id, row0; double tf; if (sscanf(line, "w%d %d %lf", &id, &row0, &tf) != 3) continue;
+              for (int k = 0; k < nw; k++) if (W[k].id == id) { sl_wrap *w = &W[k]; if (!w->badcell) w->badcell = calloc((size_t)((w->h + 63) / 64) * 64, 1);
+                  int tb = (int)floor(tf * 64); if (tb < 0) tb = 0; if (tb > 63) tb = 63; if (row0 >= 0 && row0 < w->h) { w->badcell[(size_t)(row0 / 64) * 64 + tb] = 1; ncell++; } } }
+          fclose(f);
+          /* z bins: rows [row0(zb), row0(zb + 1)) from zbins.tsv; bad when |slip_mean| x rows / slip_d > --slip-max turns */
+          snprintf(p, sizeof p, "%s/zbins.tsv", gd); FILE *fz = fopen(p, "r"); snprintf(p, sizeof p, "%s/slip.tsv", gd); FILE *fs = fopen(p, "r");
+          if (fz && fs) {
+              int *zr0 = nullptr; int nz = 0, capz = 0;   /* (zbin -> row0, from the first wrap listed: rows are shared by all wraps of one run) */
+              char first[32] = "";
+              while (fgets(line, sizeof line, fz)) { char wn[32]; int zb, r0; if (sscanf(line, "%31s %d %d", wn, &zb, &r0) != 3 || wn[0] != 'w') continue;
+                  if (!first[0]) snprintf(first, sizeof first, "%s", wn);
+                  if (strcmp(wn, first)) break;
+                  if (zb >= capz) { capz = 2 * zb + 64; zr0 = realloc(zr0, capz * sizeof *zr0); } zr0[zb] = r0; if (zb + 1 > nz) nz = zb + 1; }
+              while (fgets(line, sizeof line, fs)) { int id, zb, n; double sm, sa; if (sscanf(line, "w%d %d %d %lf %lf", &id, &zb, &n, &sm, &sa) != 5 || zb < 0 || zb >= nz) continue;
+                  for (int k = 0; k < nw; k++) if (W[k].id == id) { sl_wrap *w = &W[k]; const int a = zr0[zb], b = zb + 1 < nz ? zr0[zb + 1] : w->h;
+                      if (fabs(sm) * (b - a) / sd <= smax) continue;
+                      if (!w->badrow) w->badrow = calloc((size_t)w->h, 1);
+                      for (int r = a; r < b && r < w->h; r++) { w->badrow[r] = 1; }
+                      nzb++; } }
+              free(zr0);
+          } else fprintf(stderr, "surf-labels: --geom: no slip.tsv / zbins.tsv in %s (cells only)\n", gd);
+          if (fz) fclose(fz);
+          if (fs) fclose(fs);
+          fprintf(stderr, "surf-labels: --geom %s: %ld defect cells, %ld slipping wrap z bins (|slip| x rows / %.3g > %.3g turn) masked\n", gd, ncell, nzb, sd, smax);
+      } }
     int nkeep = 0; long long vkeep = 0; for (int k = 0; k < nw; k++) if (W[k].keep) { nkeep++; vkeep += W[k].nv; }
     fprintf(stderr, "surf-labels: %d of %d wraps kept (%.3f of the vertices); dropped:", nkeep, nw, nvt ? (double)vkeep / nvt : 0);
     for (int k = 0; k < nw; k++) if (!W[k].keep) fprintf(stderr, " w%03d(%s)", W[k].id, W[k].why);
@@ -595,9 +685,9 @@ int cmd_surf_labels(int argc, char **argv) {
     if (z3w_close(J.wc) | z3w_close(J.wp) | z3w_close(J.wi)) { fprintf(stderr, "surf-labels: %s\n", z3w_error()); return 1; }
     const double v3 = pow(gum * 1e-3, 3);
     fprintf(stderr, "\n");
-    printf("surf-labels: %d of %d wraps kept, %lld coded voxels, %lld conflict; phase known %lld (%.1f mm3), kept %lld (%.1f mm3), kept share %.4f; ignored: dropped wrap %lld, conflict %lld, CT %lld, holdout %lld; %.0fs\n",
+    printf("surf-labels: %d of %d wraps kept, %lld coded voxels, %lld conflict; phase known %lld (%.1f mm3), kept %lld (%.1f mm3), kept share %.4f; ignored: dropped wrap %lld, conflict %lld, CT %lld, holdout %lld, CT coherence %lld; %.0fs\n",
            nkeep, nw, (long long)J.ncode, (long long)J.nconf, (long long)J.nknown, J.nknown * v3, (long long)J.nkept, J.nkept * v3, J.nknown ? (double)J.nkept / J.nknown : 0,
-           (long long)J.nig[1], (long long)J.nig[2], (long long)J.nig[3], (long long)J.nig[4], sl_now() - t0);
+           (long long)J.nig[1], (long long)J.nig[2], (long long)J.nig[3], (long long)J.nig[4], (long long)J.nig[5], sl_now() - t0);
     if (J.gt) {
         printf("surf-labels: vs GT phase: raw %lld voxels known in both, |d| < 0.1 turn %.4f, < 0.25 %.4f (bins %.3f %.3f %.3f %.3f %.3f); kept %lld, < 0.1 %.4f, < 0.25 %.4f (bins %.3f %.3f %.3f %.3f %.3f)\n",
                (long long)J.gtk, J.gtk ? (double)J.g10 / J.gtk : 0, J.gtk ? (double)J.g25 / J.gtk : 0,
@@ -606,15 +696,34 @@ int cmd_surf_labels(int argc, char **argv) {
                J.kgtk ? (double)J.kbins[0] / J.kgtk : 0, J.kgtk ? (double)J.kbins[1] / J.kgtk : 0, J.kgtk ? (double)J.kbins[2] / J.kgtk : 0, J.kgtk ? (double)J.kbins[3] / J.kgtk : 0, J.kgtk ? (double)J.kbins[4] / J.kgtk : 0);
         size_t n = 0; for (int t = 0; t < nt; t++) n += J.recs[t].n;
         pa_buf all = {0}; all.r = malloc((n ? n : 1) * sizeof *all.r); all.cap = n ? n : 1; all.T = J.pa_T;
-        sl_rec *tmp = malloc((n ? n : 1) * sizeof *tmp); size_t m = 0;
+        sl_rec *tmp = malloc((n ? n : 1) * sizeof *tmp); size_t m = 0;   /* (sorted with all.r: tmp[k] is record k's source) */
         for (int t = 0; t < nt; t++) { memcpy(tmp + m, J.recs[t].r, J.recs[t].n * sizeof *tmp); m += J.recs[t].n; free(J.recs[t].r); }
         qsort(tmp, n, sizeof *tmp, sl_cmp_rec);   /* (a fixed order for any thread split) */
         for (size_t k = 0; k < n; k++) all.r[k] = (pa_rec){{tmp[k].p[0], tmp[k].p[1], tmp[k].p[2]}, tmp[k].d, tmp[k].h, tmp[k].q};
-        all.n = n; free(tmp);
+        all.n = n;
         const double mmv[4] = {0.5, 1, 2, 4}; double a[4], ac[4]; size_t na[4], nc[4];
-        pa_score(&all, mmv, 4, 200000, 0x5eed, a, ac, na, nc);
+        /* (records of every voxel not ignored before the coherence gate: the gated score keeps those with r >= --min-coh) */
+        { size_t k2 = 0; pa_buf g = all; g.r = malloc((n ? n : 1) * sizeof *g.r);
+          for (size_t k = 0; k < n; k++) if (J.min_coh <= -2 || !J.ct || tmp[k].r >= J.min_coh) g.r[k2++] = all.r[k];
+          g.n = k2; pa_score(&g, mmv, 4, 200000, 0x5eed, a, ac, na, nc); free(g.r); }
         printf("surf-labels: pair winding right vs GT (%zu records):", all.n);
         for (int k = 0; k < 4; k++) printf(" %g mm %.4f cross %.4f (%zu / %zu)%s", mmv[k], a[k], ac[k], na[k], nc[k], k < 3 ? " |" : "\n");
+        if (J.ct && J.coh_cell > 0) {   /* the coherence gate's curve: per threshold, kept share, phase agreement and pair accuracy */
+            long long tk = 0; for (int b = 0; b <= COH_BINS; b++) tk += J.ch_kn[b];
+            printf("surf-labels: CT coherence curve (cell %d voxels; voxels not ignored otherwise; r >= t kept, no-coherence cells dropped):\n  t      kept_share  gt_both      |d|<.25  |d|<.1   pairs 0.5mm 1mm   2mm   4mm\n", J.coh_cell);
+            for (int ti = -5; ti <= 16; ti++) {
+                const double t = ti == -5 ? -2 : 0.05 * ti; long long kn = 0, gk = 0, g10 = 0, g25 = 0;
+                for (int b = 0; b <= COH_BINS; b++) { const double lo = b < COH_BINS ? -1 + 2.0 * b / COH_BINS : NAN;
+                    if (t > -2 && !(lo >= t - 1e-9)) { continue; }
+                    kn += J.ch_kn[b]; gk += J.ch_gk[b]; g10 += J.ch_g10[b]; g25 += J.ch_g25[b]; }
+                size_t k2 = 0; pa_buf g = all; g.r = malloc((n ? n : 1) * sizeof *g.r);
+                for (size_t k = 0; k < n; k++) if (t <= -2 || tmp[k].r >= t - 1e-9) g.r[k2++] = all.r[k];
+                g.n = k2; double a2[4], ac2[4]; size_t na2[4], nc2[4]; pa_score(&g, mmv, 4, 100000, 0x5eed, a2, ac2, na2, nc2); free(g.r);
+                char tl[16]; if (t <= -2) snprintf(tl, sizeof tl, "off"); else snprintf(tl, sizeof tl, "%+.2f", t);
+                printf("  %-6s %.4f      %-12lld %.4f   %.4f   %.4f %.4f %.4f %.4f\n", tl, tk ? (double)kn / tk : 0, gk, gk ? (double)g25 / gk : 0, gk ? (double)g10 / gk : 0, a2[0], a2[1], a2[2], a2[3]);
+            }
+        }
+        free(tmp);
         free(all.r);
     } else { for (int t = 0; t < nt; t++) free(J.recs[t].r); }
     free(J.recs);
@@ -627,7 +736,7 @@ int cmd_surf_labels(int argc, char **argv) {
                                              (long long)W[k].kgk, (long long)W[k].kg10, (long long)W[k].kg25);
         fclose(f);
     }
-    for (int k = 0; k < nw; k++) { free(W[k].rz0); free(W[k].rz1); free(W[k].ra); free(W[k].rb); sfc_cache_destroy(W[k].ca); sfc_close(W[k].r); }
+    for (int k = 0; k < nw; k++) { free(W[k].rz0); free(W[k].rz1); free(W[k].badrow); free(W[k].badcell); free(W[k].ra); free(W[k].rb); sfc_cache_destroy(W[k].ca); sfc_close(W[k].r); }
     free(W); free(J.hold);
     if (J.ct) z3_close(J.ct);
     if (J.gt) z3_close(J.gt);
