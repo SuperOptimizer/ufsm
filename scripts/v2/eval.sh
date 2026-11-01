@@ -3,8 +3,8 @@
 #   MODE screen (laptop GPU, under gpuq / gpu.lock as the called scripts take it):
 #     1. winding: scripts/wbench/wgate.sh CKPT v2-TAG (R1 p05x CI > 0 and ids >= 0, R2 slab sites, R3 1667 guard vs wind96; the slab
 #        sites run on forlindesk as wgate does from the laptop). The candidate's fields come from its unwrap2 channels 0-10.
-#     2. ink: ~/ufsm-data/inkft/scripts/ev.sh with PX="--channel ink" (holdout F1 0139 w039 9.36 / 2.4, 1667 w028, Paris 4 segment box,
-#        + the w058 render) -> ~/ufsm-data/inksplat/train_eval.tsv row TAG; compare with the ift3-24000 row.
+#     2. ink: scripts/v2/inkev.sh with PX="--channel ink" (holdout F1 0139 w039 9.36 / 2.4, 1667 w028, Paris 4 segment box)
+#        -> ~/ufsm-data/v2eval/ink/eval.tsv row v2-TAG; compare with the ift3-24000 row.
 #   MODE milestone (desk, GPU 0 unless GPUS; only once an arm passes the screens; writes /vesuvius/ufsm/v2/unroll only):
 #     1. whole Paris 4 through the c2f pipeline (scripts/unroll/unroll.sh) with the candidate as fields AND ink checkpoint
 #        (INKPX="--channel ink"), TAG suffix -v2TAG; GT score fit --model joined --codes q-9p6 9.6 --score-pairs 1 vs .1626 / .681 / .303;
@@ -22,9 +22,9 @@ log() { echo "$(date '+%F %T') eval $TAG: $*"; }
 screen() {
   log "wgate (winding gate vs wind96)"
   bash $R/scripts/wbench/wgate.sh $CK v2-$TAG || log "wgate failed"
-  log "ink holdout F1 (ev.sh, --channel ink)"
-  PX="--channel ink" TAG=v2-$TAG bash $HOME/ufsm-data/inkft/scripts/ev.sh v2-$TAG $CK || log "ink eval failed"
-  log "done: wgate table ~/ufsm-data/wbench/gate/v2-$TAG/table.txt, ink row v2-$TAG in ~/ufsm-data/inksplat/train_eval.tsv"
+  log "ink holdout F1 (inkev.sh, --channel ink)"
+  PX="--channel ink" bash $H/inkev.sh $CK v2-$TAG || log "ink eval failed"
+  log "done: wgate table ~/ufsm-data/wbench/gate/v2-$TAG/table.txt, ink row v2-$TAG in ~/ufsm-data/v2eval/ink/eval.tsv (baseline row ift3-24000)"
 }
 V=/vesuvius/ufsm/v2; U=${U:-$V/bin/ufsm}; UR=${UR:-$V/unroll}; REFUR=${REFUR:-/vesuvius/ufsm/unroll}
 GT=${GT:-/vesuvius/ufsm/gt/paris4-q9p6/q-9p6.zarr}; RCW=${RCW:-$V/eval/relative_windings.json}

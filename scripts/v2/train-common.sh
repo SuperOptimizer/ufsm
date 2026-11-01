@@ -4,7 +4,7 @@
 # (per source: targets.band.phase + ignore, targets.ink {"root", "group", "encoding": "prob254"}, "weight", "ink_weight").
 # Desk only (2x RTX 5060 Ti 16 GB), writes under /vesuvius/ufsm/v2 only. Auto-resume from <run>/last.ckpt, STOP file <run>.stop
 # (checked between relaunches; a running trainer is stopped by its own PID: kill -TERM $(cat <run>.pid), graceful, rc 0).
-# Env: U (binary), SRCJ (sources), P (512), WORKERS (12), SLOTS (16), MEM (lean), CKPT (1000), VAL (2000), VALB (16), LOGE (50), EXTRA.
+# Env: U (binary), SRCJ (sources), P (512), WORKERS (12), SLOTS (16), MEMMODE (auto: the planner picks the cheapest storage mode that fits the 16 GB card; "lean" is not a mode name), CKPT (1000), VAL (2000), VALB (16), LOGE (50), EXTRA.
 set -u
 V=/vesuvius/ufsm/v2
 U=${U:-$V/bin/ufsm}; SRCJ=${SRCJ:-$V/sources/sources-v2.json}
@@ -23,7 +23,7 @@ AUG="--zfix 1 --symmetry-p 0.5 --geometry-aug 1 --rotate-deg 5 --rotate-p 0.2 --
 # heads: wind96's density code / packed weight / normal step; ink soft BCE
 HEADS="--task unwrap2 --ink-head 1 --ink-lambda ${INKL:-1} --density-scale 4 --density-code 1 --packed-weight 8 --normal-step 1"
 ARGS=($SRCJ --out $o --gpus $GPU --P ${P:-512} --B 1 $ARCH $HEADS --steps $STEPS --sched wsd --cooldown 0.2 --opt muon \
-  --fp4 2 --gpu-aug 2 --input-prec 8 --mem ${MEM:-lean} --val-store disk --workers ${WORKERS:-12} --sampler-slots ${SLOTS:-16} \
+  --fp4 2 --gpu-aug 2 --input-prec 8 --mem ${MEMMODE:-auto} --val-store disk --workers ${WORKERS:-12} --sampler-slots ${SLOTS:-16} \
   --log-every ${LOGE:-50} --val-every ${VAL:-2000} --val-batches ${VALB:-16} --ckpt-every ${CKPT:-1000} --seed ${SEED:-3} --val-seed 1 \
   $LRARGS $AUG ${EXTRA:-})
 echo $$ > $o.launcher.pid

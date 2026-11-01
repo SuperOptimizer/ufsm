@@ -46,7 +46,7 @@ int main(int argc, char **argv) {
     if (nn_init(0)) { fprintf(stderr, "test_unwrap2_ink: no GPU\n"); return 1; }
     CHECK(!sh("%s %s/fx 256 2 1 > %s/fx.log 2>&1", argv[2], d, d), "fixture");
     const char *common = "--task unwrap2 --P 64 --B 1 --gpus 0 --workers 2 --sampler-slots 4 --val-batches 2 --val-every 1000 --log-every 1 "
-                         "--ckpt-every 1000 --fp4 2 --input-prec 8 --warmup 0 --seed 5 --wind4-tile 0";
+                         "--ckpt-every 1000 --fp4 2 --input-prec 8 --warmup 0 --seed 5 --wind4-tile 0 --levels 1";   /* (level 0 only: the fixture's ink is a level-0 array) */
     /* (1) the donor: a plain unwrap2 net */
     CHECK(!sh("UFSM_GRAD_MX8=1 %s train %s/fx/sources.json --out %s/donor --widths 32,64,128 --steps 3 %s > %s/donor.log 2>&1", U, d, d, common, d), "donor (%s/donor.log)", d);
     /* (2) the warm start at learning rate 0 */
@@ -98,7 +98,7 @@ int main(int argc, char **argv) {
         free(lg);
     }
     /* (4) predict: fields + ink from one pass vs the ink channel alone; --feather with --fit-zarr */
-    const char *pr = "--um 9.6 --level 0 --window 96 --halo 16 --shard 64 --levels 2 --threads 2 --fit-h 4";
+    const char *pr = "--um 9.6 --level 0 --window 160 --halo 16 --shard 128 --levels 2 --threads 2 --fit-h 4";
     CHECK(!sh("%s predict %s/b/last.ckpt %s/fx ct %s/pi --channel ink --fit-zarr %s/fi %s > %s/p1.log 2>&1", U, d, d, d, d, pr, d), "predict fields + ink (%s/p1.log)", d);
     CHECK(!sh("%s predict %s/b/last.ckpt %s/fx ct %s/po --channel 11 %s > %s/p2.log 2>&1", U, d, d, d, pr, d), "predict channel 11 (%s/p2.log)", d);
     CHECK(!sh("%s predict %s/b/last.ckpt %s/fx ct %s/pz --fit-zarr %s/fz %s > %s/p3.log 2>&1", U, d, d, d, d, pr, d), "predict fields only (%s/p3.log)", d);

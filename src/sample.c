@@ -2419,6 +2419,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
             z3 *tz = s->tgt_key[ch] && s->tgt_prob[ch] && !crushed && !torn && !delam && !curved ? source_tgt_for_level(s, ch, l, nullptr) : nullptr;
             if (!tz) memset(inkw, 255, p3);
             else if (source_read_target(s, ch, l, o, n, inkw, 1)) return -1;
+            if (getenv("UFSM_INK_DEBUG")) { size_t kn = 0, ki = 0; for (size_t k = 0; k < p3; k++) { kn += inkw[k] != 255; ki += inkw[k] != 255 && inkw[k] > 127; } fprintf(stderr, "ink window: tz %p known %zu ink %zu\n", (void *)tz, kn, ki); }
             continue;
         }
         if (ch == CH_SHEET && s->tgt_side[CH_RECTO]) continue;  /* the verso side: written with the recto side below */
