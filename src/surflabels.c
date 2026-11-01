@@ -2,7 +2,7 @@
                    [--wrapcheck TSV] [--first K] [--last K] [--drop w1,w2,..] [--band-peaks LO,HI]
                    [--ct ROOT KEY [--min-onpap 0.2] [--ct-level 80] [--ct-range 15]]
                    [--exclude holdouts.json --exclude-ct NAME [--exclude-mm 0.5]]
-                   [--radius 20] [--block 128] [--shard 512] [--bake 1] [--gt ROOT KEY] [--tsv OUT] [--threads N]
+                   [--radius 20] [--block 256] [--shard 512] [--bake 1] [--gt ROOT KEY] [--tsv OUT] [--threads N]
    Winding labels straight from our whole-scroll wraps (ufsm wraps / wrap-snap .sfc, rows = z, wrap k = the fit's level set W = k
    with W = U - dir theta / 2 pi, theta = atan2 around the axis in (-pi, pi]): every wrap's quads are rasterised on the scan's training
    grid (--grid-um; --like a CT level array of that grid gives the shape) with the sheet coordinate q = k + dir theta / 2 pi (continuous
@@ -270,7 +270,9 @@ static int sl_block(sl_job *J, sl_scratch *X, int si, int bk, int tid) {
     if (J->gt) {
         const int64_t nn[3] = {N, N, N};
         if (z3_read(J->gt, o, nn, X->gtc, 1)) return -1;
-        if (band_field_phase_pair(X->gtc, n3, J->rmax, X->gph, nullptr)) return -1;
+        size_t ng = 0; for (size_t i = 0; i < NN && !ng; i++) ng = X->gtc[i] != 0;
+        if (!ng) memset(X->gph, PHASE_UNKNOWN, NN);   /* (no GT codes near: the pair rule's answer, without its transforms) */
+        else if (band_field_phase_pair(X->gtc, n3, J->rmax, X->gph, nullptr)) return -1;
     }
     if (J->ct) { const int64_t nn[3] = {B, B, B}; if (z3_read(J->ct, b0, nn, X->ct, 1)) return -1; }
     /* the shard's buffers */
@@ -384,14 +386,14 @@ int cmd_surf_labels(int argc, char **argv) {
     if (argc < 4) {
         fprintf(stderr, "usage: ufsm surf-labels <wraps-dir> <out-dir> --axis F --axis-um U0 --dir +-1 --grid-um U (--shape Z,Y,X | --like ROOT KEY)\n"
                         "       [--wrapcheck TSV] [--first K] [--last K] [--drop w1,w2] [--band-peaks LO,HI] [--ct ROOT KEY [--min-onpap 0.2] [--ct-level 80] [--ct-range 15]]\n"
-                        "       [--exclude holdouts.json --exclude-ct NAME [--exclude-mm 0.5]] [--radius 20] [--block 128] [--shard 512] [--bake 1] [--gt ROOT KEY] [--tsv OUT] [--threads N]\n");
+                        "       [--exclude holdouts.json --exclude-ct NAME [--exclude-mm 0.5]] [--radius 20] [--block 256] [--shard 512] [--bake 1] [--gt ROOT KEY] [--tsv OUT] [--threads N]\n");
         return 2;
     }
     const char *in = argv[2], *out = argv[3];
     const char *axp = sl_opt(argc, argv, "--axis", nullptr);
     const double axum = atof(sl_opt(argc, argv, "--axis-um", "0")), gum = atof(sl_opt(argc, argv, "--grid-um", "0"));
     const int dir_auto = !strcmp(sl_opt(argc, argv, "--dir", ""), "auto"); double dir = dir_auto ? 1 : atof(sl_opt(argc, argv, "--dir", "0"));
-    const int nt = ufsm_threads(atoi(sl_opt(argc, argv, "--threads", "0")), 16), S = atoi(sl_opt(argc, argv, "--shard", "512")), B = atoi(sl_opt(argc, argv, "--block", "128"));
+    const int nt = ufsm_threads(atoi(sl_opt(argc, argv, "--threads", "0")), 16), S = atoi(sl_opt(argc, argv, "--shard", "512")), B = atoi(sl_opt(argc, argv, "--block", "256"));
     const double rmax = atof(sl_opt(argc, argv, "--radius", "20"));
     if (!axp || !(axum > 0) || !(gum > 0) || (!dir_auto && dir != 1 && dir != -1) || S < 128 || S % 128 || B < 16 || S % B || !(rmax > 0) || rmax > 120) {
         fprintf(stderr, "surf-labels: need --axis F --axis-um U0 --grid-um U --dir 1|-1|auto; --shard a multiple of 128, --block dividing it, --radius in (0, 120]\n"); return 2;
@@ -490,7 +492,7 @@ int cmd_surf_labels(int argc, char **argv) {
                 if (isfinite(p) && isfinite(m)) { if (p < m) vp++; else if (m < p) vm++; }
             }
         }
-        if (vp + vm < 10 || (vp > vm ? vp : vm) < 0.8 * (vp + vm)) { fprintf(stderr, "surf-labels: --dir auto undecided (votes +1 %ld, -1 %ld): give --dir\n", vp, vm); return 1; }
+        if (vp + vm < 10 || (vp > vm ? vp : vm) < 0.65 * (vp + vm)) { fprintf(stderr, "surf-labels: --dir auto undecided (votes +1 %ld, -1 %ld): give --dir\n", vp, vm); return 1; }
         dir = vp > vm ? 1 : -1; J.dir = dir;
         fprintf(stderr, "surf-labels: --dir auto: %+g (cut votes +1 %ld, -1 %ld)\n", dir, vp, vm);
     }
