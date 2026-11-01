@@ -622,6 +622,12 @@ int cmd_count_field(int argc, char **argv) {
         fprintf(stderr, "count-field: --ct-cal: count targets scaled by the CT's sheets per density turn, weighted mean %.3f\n", kw > 0 ? ks / kw : 0);
         fit_ct_cal_free(cc);
     }
+    if (*cf_opt(argc, argv, "--gz-scale", "")) {   /* --gz-scale F: the z component of the pooled count targets times F (0: dU/dz -> 0, the
+                                                     winding of a sheet constant along z unless the radial counts force it; the network's n_z
+                                                     integrated over the height drifted Paris 3's gauge by up to ~40 turns: geom-check, src/geomcheck.c) */
+        const float s = (float)atof(cf_opt(argc, argv, "--gz-scale", "1")); for (size_t i = 0; i < lv[0].n; i++) Gl[0][0][i] *= s;
+        fprintf(stderr, "count-field: --gz-scale %g: z component of the count targets scaled\n", s);
+    }
     float kpitch[2] = {(float)pitch, (float)pitch}, koff[2] = {0, 0}; const int kdz = (int)fmax(1, D * h);   /* the prior: r / pitch */
     fprintf(stderr, "count-field: %dx%dx%d cells (h %g, %.2f um), dir %+d, prior pitch %.1f native voxels, solve cells %d, chunks of %d rows (+-%d halo)\n", D, H, W, h, g.um, dir, pitch, P, CZ, Rz);
     for (int l = 1; l < nl; l++) {   /* coarser sums from the finer level */
