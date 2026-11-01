@@ -91,6 +91,7 @@ typedef struct {
     double sheet0; /* eigenvalue ratio at which the sheetness weight starts */
     double kph, c0;   /* --phase-w kph: confident network phase gradients join the targets (weight kph x ramp(conf, c0, c0 + 0.3)) */
     int nb;           /* y bands per solve row (jobs = solve rows x bands: disjoint solve cells per job; 0 = 1) */
+    double rs, ra, rb, wa, wb, wd, wp;   /* rs: --rho-scale (the density head's turn count x rs; 0 = 1); ra, rb: --rho-pow A,S0 (x (spacing / S0)^-A, rb = S0 in sp bytes); --wide A,B (sp bytes) --wide-dens wd --wide-phase wp: where the network spacing is wide the density weight x (1 - wd s), the phase weight x (1 + wp s), s = ramp(sp, wa, wb) */
 } cf_pool;
 static double cf_ph(const fit_fields *f, size_t i, double *c) { const double a = (f->pc[i] - 128) / 127.0, b = (f->ps[i] - 128) / 127.0; *c = f->w[i] ? hypot(a, b) : 0; return atan2(b, a) / (2 * M_PI); }
 static double cf_wrap(double d) { return d - round(d); }
@@ -106,16 +107,16 @@ static void cf_pool_run(void *a, long j0, long j1, int t_) {   /* jobs [j0, j1):
             if (p->kph > 0 && zl > 0 && zl + 1 < p->nzl && y > 0 && y + 1 < p->H && x > 0 && x + 1 < p->W) {   /* the phase gradient (central wrapped differences) */
                 double c0v, cm, cp; const double p0 = cf_ph(f, i, &c0v); const size_t st[3] = {HW, (size_t)p->W, 1}; double gph[3], cmin = c0v;
                 for (int k = 0; k < 3; k++) { const double pm = cf_ph(f, i - st[k], &cm), pp = cf_ph(f, i + st[k], &cp); cmin = fmin(cmin, fmin(cm, cp)); gph[k] = 0.5 * (cf_wrap(pp - p0) + cf_wrap(p0 - pm)); }
-                const double cw = p->kph * cf_smooth(cmin, p->c0, p->c0 + 0.3);
+                const double cw = p->kph * cf_smooth(cmin, p->c0, p->c0 + 0.3) * (p->wp > 0 ? 1 + p->wp * cf_smooth(f->sp[i], p->wa, p->wb) : 1);
                 if (cw > 0) { const size_t j = ((size_t)Z * p->hh + y / p->P) * p->w + x / p->P; p->S[j] += (float)cw; for (int k = 0; k < 3; k++) p->G[k][j] += (float)(cw * gph[k]); }
             }
             if (!f->sp[i]) continue;
             double v[3]; const double lr = cf_axis(f, i, v); if (lr <= 0) continue;
             double ry = (y + 0.5) * p->h - cy, rx = (x + 0.5) * p->h - cx; const double rl = hypot(ry, rx); if (rl < 1) continue; ry /= rl; rx /= rl;
             double dot = v[1] * ry + v[2] * rx; if (dot < 0) { v[0] = -v[0]; v[1] = -v[1]; v[2] = -v[2]; dot = -dot; }
-            const double c = f->w[i] / 255.0 * cf_smooth(dot, p->emin, p->emin + 0.25) * cf_smooth(lr, p->sheet0, p->sheet0 + 0.3);
+            const double c = f->w[i] / 255.0 * cf_smooth(dot, p->emin, p->emin + 0.25) * cf_smooth(lr, p->sheet0, p->sheet0 + 0.3) * (p->wd > 0 ? 1 - p->wd * cf_smooth(f->sp[i], p->wa, p->wb) : 1);
             if (c <= 0) continue;
-            const double rho = 8.0 / f->sp[i];   /* turns per field cell */
+            const double rho = p->rs * 8.0 / f->sp[i] * (p->ra != 0 ? pow(f->sp[i] / p->rb, -p->ra) : 1);   /* turns per field cell (x --rho-scale, x (sp / S0)^-A: --rho-pow) */
             const size_t j = ((size_t)Z * p->hh + y / p->P) * p->w + x / p->P;
             p->S[j] += (float)c; for (int k = 0; k < 3; k++) p->G[k][j] += (float)(c * rho * v[k]);
         }
@@ -569,9 +570,15 @@ int cmd_count_field(int argc, char **argv) {
         if (z1 < D) cf_pre_start(&pre, in, z1, z1 + CZ < D ? z1 + CZ : D, pref);
         if (!z0) { recto = b.f.recto != nullptr; w4d = b.f.wd[0] ? b.f.w4_d : 0; }
         cf_pool pp = {&b.f, z0, z1 - z0, H, W, P, lv[0].hh, lv[0].w, h, g.cy, g.cx, na, Sl[0], {Gl[0][0], Gl[0][1], Gl[0][2]}, atof(cf_opt(argc, argv, "--emin", "0.1")), atof(cf_opt(argc, argv, "--sheet0", "0.4")), atof(cf_opt(argc, argv, "--phase-w", "0")), atof(cf_opt(argc, argv, "--phase-c0", "0.4"))};
+        pp.rs = atof(cf_opt(argc, argv, "--rho-scale", "1")); if (!(pp.rs > 0)) pp.rs = 1;
+        { double A = 0, S0 = 0; if (*cf_opt(argc, argv, "--rho-pow", "") && sscanf(cf_opt(argc, argv, "--rho-pow", ""), "%lf,%lf", &A, &S0) == 2 && S0 > 0) { pp.ra = A; pp.rb = S0 * 8 / (h * g.um); } }
+        {   /* --wide A,B (network spacing, um) --wide-dens D (0..1) --wide-phase K: the density weight x (1 - D s), the confident phase weight x (1 + K s), s = ramp(spacing, A, B) */
+            double a = 0, bw = 0; if (*cf_opt(argc, argv, "--wide", "") && sscanf(cf_opt(argc, argv, "--wide", ""), "%lf,%lf", &a, &bw) == 2 && bw > a) { pp.wa = a * 8 / (h * g.um); pp.wb = bw * 8 / (h * g.um); }
+            if (pp.wb > 0) { pp.wd = atof(cf_opt(argc, argv, "--wide-dens", "0")); pp.wp = atof(cf_opt(argc, argv, "--wide-phase", "0")); }
+        }
         const double tl1 = cf_now();
         if (gpu) {   /* the chunk's solve rows on the GPU (the same sums in the same order) */
-            const cf_gpu_poolcfg gc = {H, W, P, lv[0].hh, lv[0].w, na, h, g.cy, g.cx, pp.emin, pp.sheet0, pp.kph, pp.c0};
+            const cf_gpu_poolcfg gc = {H, W, P, lv[0].hh, lv[0].w, na, h, g.cy, g.cx, pp.emin, pp.sheet0, pp.kph, pp.c0, pp.rs, pp.ra, pp.rb, pp.wa, pp.wb, pp.wd, pp.wp};
             const uint8_t *pl[10] = {b.f.pc, b.f.ps, b.f.t[0], b.f.t[1], b.f.t[2], b.f.t[3], b.f.t[4], b.f.t[5], b.f.sp, b.f.w};
             if (cf_gpu_pool(&gc, pl, z0, z1 - z0, Sl[0], Gl[0])) {
                 fprintf(stderr, "count-field: GPU pooling failed: rows %d..%d on the CPU\n", z0, z1); gpu = 0;
@@ -609,12 +616,12 @@ int cmd_count_field(int argc, char **argv) {
     }
     if (*cf_opt(argc, argv, "--ct-cal", "")) {   /* --ct-cal FILE (ufsm ct-cal): the pooled count targets scaled by the CT's sheets per density turn */
         fit_ct_cal *cc = fit_ct_cal_load(cf_opt(argc, argv, "--ct-cal", "")); if (!cc) { fprintf(stderr, "count-field: cannot read --ct-cal %s\n", cf_opt(argc, argv, "--ct-cal", "")); return 1; }
-        double ks = 0, kw = 0; const double kmax = atof(cf_opt(argc, argv, "--ct-cal-max", "1"));   /* (one-sided by default: the CT only lowers counts; Paris 4's CT counts ~5% above its GT) */
+        double ks = 0, kw = 0; const double kmax = atof(cf_opt(argc, argv, "--ct-cal-max", "1")), kmin = atof(cf_opt(argc, argv, "--ct-cal-min", "0"));   /* (--ct-cal-min: a floor, e.g. for a phase calibration where the phase is dead) */   /* (one-sided by default: the CT only lowers counts; Paris 4's CT counts ~5% above its GT) */
         for (int z = 0; z < lv[0].d; z++) {
             const double pz = (z + 0.5) * P * h, ay = cf_axis_at(g.cy, na, pz), ax = cf_axis_at(g.cx, na, pz);
             for (int y = 0; y < lv[0].hh; y++) for (int x = 0; x < lv[0].w; x++) {
                 const size_t i = ((size_t)z * lv[0].hh + y) * lv[0].w + x; if (!(Sl[0][i] > 0)) continue;
-                const double k = fmin(kmax, fit_ct_cal_k(cc, pz, (y + 0.5) * P * h - ay, (x + 0.5) * P * h - ax));
+                const double k = fmax(kmin, fmin(kmax, fit_ct_cal_k(cc, pz, (y + 0.5) * P * h - ay, (x + 0.5) * P * h - ax)));
                 for (int q = 0; q < 3; q++) Gl[0][q][i] *= (float)k;
                 ks += k * Sl[0][i]; kw += Sl[0][i];
             }

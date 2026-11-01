@@ -65,7 +65,7 @@ __device__ double d_tri(const float *U, int d, int hh, int w, double qz, double 
 /* ---- pass 1: one thread per solve cell of the group (cf_pool_run's sums in its order) ---- */
 struct pool_k {
     const uint8_t *pl[10]; int ra;   /* device rows [ra, ..) of the planes pc ps t0..t5 sp w */
-    int zoff, nzl, Za, nZ, H, W, P, hh, w, na; double h; const float *cy, *cx; double emin, sheet0, kph, c0; float *S, *G[3]; ph_tab T;
+    int zoff, nzl, Za, nZ, H, W, P, hh, w, na; double h; const float *cy, *cx; double emin, sheet0, kph, c0, rs, rpa, rpb, wa, wb, wd, wp; float *S, *G[3]; ph_tab T;
 };
 __global__ void k_pool(pool_k a) {
     const long long nc = (long long)a.nZ * a.hh * a.w, j = blockIdx.x * (long long)blockDim.x + threadIdx.x; if (j >= nc) return;
@@ -81,7 +81,7 @@ __global__ void k_pool(pool_k a) {
             if (a.kph > 0 && zl > 0 && zl + 1 < a.nzl && y > 0 && y + 1 < a.H && x > 0 && x + 1 < a.W) {
                 double c0v, cm, cp; const double p0 = d_ph(a.T, pc, ps, wp, i, &c0v); const size_t st[3] = {HW, (size_t)a.W, 1}; double gph[3], cmin = c0v;
                 for (int k = 0; k < 3; k++) { const double pm = d_ph(a.T, pc, ps, wp, i - st[k], &cm), pp = d_ph(a.T, pc, ps, wp, i + st[k], &cp); cmin = fmin(cmin, fmin(cm, cp)); gph[k] = 0.5 * (d_wrap(pp - p0) + d_wrap(p0 - pm)); }
-                const double cw = a.kph * d_smooth(cmin, a.c0, a.c0 + 0.3);
+                const double cw = a.kph * d_smooth(cmin, a.c0, a.c0 + 0.3) * (a.wp > 0 ? 1 + a.wp * d_smooth(sp[i], a.wa, a.wb) : 1);
                 if (cw > 0) { S += (float)cw; for (int k = 0; k < 3; k++) G[k] += (float)(cw * gph[k]); }
             }
             if (!sp[i]) continue;
@@ -91,9 +91,9 @@ __global__ void k_pool(pool_k a) {
             double v[3] = {cv[0], cv[1], cv[2]}; const double lr = clr; if (lr <= 0) continue;
             double ry = (y + 0.5) * a.h - cy, rx = (x + 0.5) * a.h - cx; const double rl = hypot(ry, rx); if (rl < 1) continue; ry /= rl; rx /= rl;
             double dot = v[1] * ry + v[2] * rx; if (dot < 0) { v[0] = -v[0]; v[1] = -v[1]; v[2] = -v[2]; dot = -dot; }
-            const double c = wp[i] / 255.0 * d_smooth(dot, a.emin, a.emin + 0.25) * d_smooth(lr, a.sheet0, a.sheet0 + 0.3);
+            const double c = wp[i] / 255.0 * d_smooth(dot, a.emin, a.emin + 0.25) * d_smooth(lr, a.sheet0, a.sheet0 + 0.3) * (a.wd > 0 ? 1 - a.wd * d_smooth(sp[i], a.wa, a.wb) : 1);
             if (c <= 0) continue;
-            const double rho = 8.0 / sp[i];
+            const double rho = a.rs * 8.0 / sp[i] * (a.rpa != 0 ? pow(sp[i] / a.rpb, -a.rpa) : 1);
             S += (float)c; for (int k = 0; k < 3; k++) G[k] += (float)(c * rho * v[k]);
         }
     }
@@ -121,7 +121,7 @@ extern "C" int cf_gpu_pool(const cf_gpu_poolcfg *c, const uint8_t *const pl[10],
             int ra = Za * P - 1; if (ra < zoff) ra = zoff;
             pool_k a; for (int k = 0; k < 10; k++) a.pl[k] = dpl[q] + k * pb;
             a.ra = ra; a.zoff = zoff; a.nzl = nzl; a.Za = Za; a.nZ = nZ; a.H = c->H; a.W = c->W; a.P = P; a.hh = c->hh; a.w = c->w; a.na = c->na; a.h = c->h; a.T = T;
-            a.cy = dax; a.cx = dax + c->na; a.emin = c->emin; a.sheet0 = c->sheet0; a.kph = c->kph; a.c0 = c->c0;
+            a.cy = dax; a.cx = dax + c->na; a.emin = c->emin; a.sheet0 = c->sheet0; a.kph = c->kph; a.c0 = c->c0; a.rs = c->rs; a.rpa = c->ra; a.rpb = c->rb; a.wa = c->wa; a.wb = c->wb; a.wd = c->wd; a.wp = c->wp;
             const size_t gc = (size_t)nZ * cells; a.S = dsg[q]; for (int k = 0; k < 3; k++) a.G[k] = dsg[q] + (k + 1) * gc;
             k_pool<<<(unsigned)((gc + 127) / 128), 128, 0, sk>>>(a); CF_CK(cudaGetLastError());
         }

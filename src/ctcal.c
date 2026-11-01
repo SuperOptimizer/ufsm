@@ -10,6 +10,9 @@
    --model M: the turns are a model's W increments instead of density turns (k = CT peaks per model turn; e.g. the cf ref, whose LS
    solve counts more than its density targets); --prev CAL: the written k multiplied by that table's (ref0 -> ct-cal --model ref0 --prev
    cal0 -> count-field --ct-cal: the scale that brings ref0's count to the CT's).
+   --phase-src A,C: k = the network phase turns per density turn instead, over ray steps where the phase confidence >= C and the network
+   spacing >= A um (the phase counts right on wide sheets: a label-free density calibration; P4 GT intervals: density 1.13 per GT turn,
+   phase .95-1.02 at spacing >= 115 um).
    Prints k by radius and overall. CPU, the CT planes read like wrap-check (the rows covering each native z, averaged). */
 #include "fit.h"
 #include "zarr3.h"
@@ -23,6 +26,7 @@
 
 static const char *cc_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 3; i + 1 < argc; i++) if (!strcmp(argv[i], k)) return argv[i + 1]; return d; }
 static int cc_idx(int argc, char **argv, const char *k) { for (int i = 3; i < argc; i++) if (!strcmp(argv[i], k)) return i; return -1; }
+enum { CC_NSB = 40 }; static const double CC_SBW = 10;   /* --phase-src spacing bins: 10 um up to 400 um */
 static double cc_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + 1e-9 * t.tv_nsec; }
 
 typedef struct {
@@ -30,6 +34,8 @@ typedef struct {
     const float *ct; int64_t co[2], cn[2]; double org[2];   /* CT plane (CT voxels), origin (CT voxels, global); the box's native y / x origin */
     double *pk, *dn;   /* [nth][nb] sums */
     const fit_set *ref; double zl, roff[3];   /* --model: the turns are the model's W increments (its box-local = ours + roff) */
+    double um, *sb;   /* um: native voxel size; sb: [nth][CC_NSB][2] phase / density (model) turns per network-spacing bin (--phase-src) */
+    double pha, phc;   /* --phase-src A,C: the network phase turns instead of CT peaks, over steps with phase confidence >= C and network spacing >= A (native) */
 } cc_job;
 
 static double cc_ctv(const cc_job *J, double y, double x) {   /* box-local native -> bilinear CT */
@@ -53,7 +59,7 @@ static void cc_rays(void *ctx, int a0, int a1, int t) {
             if (y < 0 || x < 0 || y >= Y || x >= X) continue;
             const int fy = (int)floor(y / h), fx = (int)floor(x / h); if (fy < 0 || fx < 0 || fy >= J->H || fx >= J->W) continue;
             const size_t ci = (size_t)fy * J->W + fx;
-            C[i] = (float)cc_ctv(J, y, x); Wm[i] = J->ref ? (float)fit_set_W(J->ref, J->zl + J->roff[0], y + J->roff[1], x + J->roff[2]) : NAN;
+            C[i] = J->ct ? (float)cc_ctv(J, y, x) : NAN; Wm[i] = J->ref ? (float)fit_set_W(J->ref, J->zl + J->roff[0], y + J->roff[1], x + J->roff[2]) : NAN;
             if (!f->w[ci] || !f->sp[ci]) continue;
             mat[i] = 1;
             const double nyy = f->t[1][ci] / 255.0, nxx = f->t[2][ci] / 255.0, nyx = f->t[5][ci] / 255.0 - 0.5;
@@ -72,6 +78,22 @@ static void cc_rays(void *ctx, int a0, int a1, int t) {
         double *ps = calloc(n + 1, sizeof(double)), *ps2 = calloc(n + 1, sizeof(double)); int *pc = calloc(n + 1, sizeof(int));
         for (int i = 0; i < n; i++) { const int ok = Cs[i] == Cs[i]; ps[i + 1] = ps[i] + (ok ? Cs[i] : 0); ps2[i + 1] = ps2[i] + (ok ? (double)Cs[i] * Cs[i] : 0); pc[i + 1] = pc[i] + ok; }
         double *bp = J->pk + (size_t)j * J->nb, *bd = J->dn + (size_t)j * J->nb;
+        if (J->pha > 0) {   /* --phase-src: phase turns vs density turns over the same confident wide steps */
+            for (int i = 0; i + 1 < n; i++) {
+                const double r = i * st, y = J->cy + r * sn, x = J->cx + r * cs, y2 = J->cy + (r + st) * sn, x2 = J->cx + (r + st) * cs;
+                if (!mat[i] || !mat[i + 1] || y2 < 0 || x2 < 0 || y2 >= Y || x2 >= X) continue;
+                const size_t c1 = (size_t)(int)floor(y / h) * J->W + (int)floor(x / h), c2 = (size_t)(int)floor(y2 / h) * J->W + (int)floor(x2 / h);
+                const double a1 = (f->pc[c1] - 128) / 127.0, b1 = (f->ps[c1] - 128) / 127.0, a2 = (f->pc[c2] - 128) / 127.0, b2 = (f->ps[c2] - 128) / 127.0;
+                if (hypot(a1, b1) < J->phc || hypot(a2, b2) < J->phc) continue;
+                double d = (atan2(b2, a2) - atan2(b1, a1)) / (2 * M_PI); d -= floor(d + 0.5);
+                double tw; if (J->ref) { if (!(Wm[i] == Wm[i]) || !(Wm[i + 1] == Wm[i + 1]) || fabs(Wm[i + 1] - Wm[i]) >= 0.5) continue; tw = Wm[i + 1] - Wm[i]; } else tw = dn[i] * st;   /* (--model: per model turn) */
+                { const int sb = (int)(0.5 * (f->sp[c1] + f->sp[c2]) * h / 8.0 * J->um / CC_SBW); if (sb < CC_NSB) { J->sb[((size_t)j * CC_NSB + sb) * 2] += d; J->sb[((size_t)j * CC_NSB + sb) * 2 + 1] += tw; } }   /* (per network-spacing bin, every confident step) */
+                if (f->sp[c1] * h / 8.0 < J->pha || f->sp[c2] * h / 8.0 < J->pha) continue;
+                const int b = (int)(i * st / J->band); if (b >= J->nb) break;
+                bp[b] += d; bd[b] += tw;
+            }
+            free(ps); free(ps2); free(pc); free(C); free(Cs); free(dn); free(Wm); free(mat); continue;
+        }
         for (int i = 0; i < n; i++) {
             if (!mat[i]) continue;
             const int b = (int)(i * st / J->band); if (b >= J->nb) break;
@@ -92,7 +114,8 @@ static void cc_rays(void *ctx, int a0, int a1, int t) {
 
 int cmd_ct_cal(int argc, char **argv) {
     const int ci = cc_idx(argc, argv, "--ct");
-    if (argc < 4 || ci < 0 || ci + 2 >= argc) {
+    const int phmode = *cc_opt(argc, argv, "--phase-src", "") != 0;   /* (--phase-src: --ct optional) */
+    if (argc < 4 || (!phmode && (ci < 0 || ci + 2 >= argc))) {
         fprintf(stderr, "usage: ufsm ct-cal <fields-dir> <out.cal> --ct ROOT KEY --ct-um U [--model M] [--prev CAL] [--nz 32] [--nth 32] [--band-mm 1] [--sigma 1.2] [--prom 1] [--threads 16]\n"
                         "  the density head's turn count vs the CT's papyrus peaks along radial rays: k = peaks / density turns per (z, angle, band), for count-field --ct-cal\n");
         return 2;
@@ -100,35 +123,40 @@ int cmd_ct_cal(int argc, char **argv) {
     const double t0 = cc_now(), ctum = atof(cc_opt(argc, argv, "--ct-um", "0"));
     const int nz = atoi(cc_opt(argc, argv, "--nz", "32")), nth = atoi(cc_opt(argc, argv, "--nth", "32")), nt = atoi(cc_opt(argc, argv, "--threads", "16"));
     const double sigma = atof(cc_opt(argc, argv, "--sigma", "1.2")), prom = atof(cc_opt(argc, argv, "--prom", "1")), bmm = atof(cc_opt(argc, argv, "--band-mm", "1"));
-    if (!(ctum > 0) || nz < 1 || nth < 4 || !(bmm > 0)) { fprintf(stderr, "ct-cal: --ct-um, --nz, --nth, --band-mm\n"); return 2; }
+    if ((ci > 0 && !(ctum > 0)) || nz < 1 || nth < 4 || !(bmm > 0)) { fprintf(stderr, "ct-cal: --ct-um, --nz, --nth, --band-mm\n"); return 2; }
     fit_set_threads(nt); fit_fields_skip_planes(1 | 2); fit_fields_ct_planes(0);
     fit_fields_buf g; if (fit_fields_load(argv[2], 0, 0, 0, &g)) { fprintf(stderr, "ct-cal: cannot read %s\n", argv[2]); return 1; }
-    const int D = g.shape[0], H = g.shape[1], W = g.shape[2], na = (int)(D * g.h) + 1; const double h = g.h, um = g.um, F = um / ctum, band = bmm * 1000 / um;
+    const int D = g.shape[0], H = g.shape[1], W = g.shape[2], na = (int)(D * g.h) + 1; const double h = g.h, um = g.um, F = ctum > 0 ? um / ctum : 1, band = bmm * 1000 / um;
     float *ay = malloc(na * sizeof(float)), *ax = malloc(na * sizeof(float)); memcpy(ay, g.cy, na * sizeof(float)); memcpy(ax, g.cx, na * sizeof(float));
     const long long org[3] = {g.origin[0], g.origin[1], g.origin[2]}; fit_fields_free(&g);
     const int nb = (int)ceil(hypot(H * h, W * h) / band) + 1;
-    z3 *cz = z3_open(store_open(argv[ci + 1]), argv[ci + 2], cc_opt(argc, argv, "--cache", nullptr)); if (!cz) { fprintf(stderr, "ct-cal: %s\n", z3_error()); return 1; }
-    const z3_meta *zm = z3_meta_of(cz);
+    z3 *cz = nullptr; if (ci > 0 && ci + 2 < argc && !(cz = z3_open(store_open(argv[ci + 1]), argv[ci + 2], cc_opt(argc, argv, "--cache", nullptr)))) { fprintf(stderr, "ct-cal: %s\n", z3_error()); return 1; }
+    const z3_meta *zm = cz ? z3_meta_of(cz) : nullptr;
+    double pha = 0, phc = 0.5; if (*cc_opt(argc, argv, "--phase-src", "")) { if (sscanf(cc_opt(argc, argv, "--phase-src", ""), "%lf,%lf", &pha, &phc) != 2 || !(pha > 0)) { fprintf(stderr, "ct-cal: --phase-src A_UM,CONF\n"); return 2; } pha /= um; fprintf(stderr, "ct-cal: --phase-src: phase turns per density turn over steps with spacing >= %.1f native, confidence >= %.2f\n", pha, phc); }
     fit_set *mref = nullptr; double mo[3] = {0, 0, 0}; fit_ct_cal *prev = nullptr;
     if (*cc_opt(argc, argv, "--model", "")) { if (!(mref = fit_set_load(cc_opt(argc, argv, "--model", "")))) { fprintf(stderr, "ct-cal: cannot load --model\n"); return 1; } for (int d = 0; d < 3; d++) mo[d] = (double)mref->global->origin[d]; }
     if (*cc_opt(argc, argv, "--prev", "") && !(prev = fit_ct_cal_load(cc_opt(argc, argv, "--prev", "")))) { fprintf(stderr, "ct-cal: cannot read --prev\n"); return 1; }
     double *PK = calloc((size_t)nz * nth * nb, sizeof(double)), *DN = calloc((size_t)nz * nth * nb, sizeof(double));
+    double *SB = calloc((size_t)nth * CC_NSB * 2, sizeof(double));   /* (--phase-src: per ray and spacing bin, summed over z) */
     const double z0 = 0.025 * D * h, z1 = 0.975 * D * h;
     for (int zi = 0; zi < nz; zi++) {
         const double zl = floor(z0 + (zi + 0.5) * (z1 - z0) / nz) + 0.5, zg = zl + org[0]; const int fz = (int)floor(zl / h);
         if (fz < 0 || fz >= D) continue;
         fit_fields_buf b; if (fit_fields_load(argv[2], fz, fz + 1, 1, &b)) { fprintf(stderr, "ct-cal: cannot load field row %d\n", fz); return 1; }
+        int64_t o3[3] = {0, 0, 0}, n3[3] = {0, 0, 0}; float *ctp = nullptr;
+        if (cz) {
         int64_t c0 = (int64_t)floor((zg - 0.5) * F), c1 = (int64_t)ceil((zg + 0.5) * F); if (c1 <= c0) c1 = c0 + 1; if (c0 < 0) c0 = 0; if (c1 > zm->shape[0]) c1 = zm->shape[0];
-        int64_t o3[3] = {c0, (int64_t)floor(org[1] * F) - 2, (int64_t)floor(org[2] * F) - 2}, n3[3] = {c1 - c0, (int64_t)ceil(H * h * F) + 4, (int64_t)ceil(W * h * F) + 4};
+        o3[0] = c0; o3[1] = (int64_t)floor(org[1] * F) - 2; o3[2] = (int64_t)floor(org[2] * F) - 2; n3[0] = c1 - c0; n3[1] = (int64_t)ceil(H * h * F) + 4; n3[2] = (int64_t)ceil(W * h * F) + 4;
         for (int d = 1; d < 3; d++) { if (o3[d] < 0) { n3[d] += o3[d]; o3[d] = 0; } if (o3[d] + n3[d] > zm->shape[d]) n3[d] = zm->shape[d] - o3[d]; }
         if (n3[0] <= 0 || n3[1] < 2 || n3[2] < 2) { fit_fields_free(&b); continue; }
         uint8_t *raw = malloc((size_t)n3[0] * n3[1] * n3[2]); if (!raw || z3_read(cz, o3, n3, raw, nt)) { fprintf(stderr, "ct-cal: CT read failed: %s\n", z3_error()); return 1; }
-        const size_t pl = (size_t)n3[1] * n3[2]; float *ctp = calloc(pl, sizeof(float));
+        const size_t pl = (size_t)n3[1] * n3[2]; ctp = calloc(pl, sizeof(float));
         for (int64_t a = 0; a < n3[0]; a++) for (size_t i = 0; i < pl; i++) ctp[i] += raw[a * pl + i];
         for (size_t i = 0; i < pl; i++) ctp[i] /= (float)n3[0];
         free(raw);
+        }
         const int iz = (int)fmin(fmax(zl, 0), na - 1);
-        cc_job J = {.ref = mref, .zl = zl, .roff = {(double)org[0] - mo[0], (double)org[1] - mo[1], (double)org[2] - mo[2]}, .f = &b.f, .h = h, .F = F, .cy = ay[iz], .cx = ax[iz], .sigma = sigma, .prom = prom, .band = band, .nth = nth, .nb = nb, .H = H, .W = W,
+        cc_job J = {.um = um, .sb = SB, .pha = pha, .phc = phc, .ref = mref, .zl = zl, .roff = {(double)org[0] - mo[0], (double)org[1] - mo[1], (double)org[2] - mo[2]}, .f = &b.f, .h = h, .F = F, .cy = ay[iz], .cx = ax[iz], .sigma = sigma, .prom = prom, .band = band, .nth = nth, .nb = nb, .H = H, .W = W,
                     .ct = ctp, .co = {o3[1], o3[2]}, .cn = {n3[1], n3[2]}, .org = {(double)org[1], (double)org[2]},
                     .pk = PK + (size_t)zi * nth * nb, .dn = DN + (size_t)zi * nth * nb};
         fit_par(nth, cc_rays, &J);
@@ -137,6 +165,20 @@ int cmd_ct_cal(int argc, char **argv) {
     }
     fprintf(stderr, "\n");
     /* k per cell: sums over +-1 neighbours (z, angle periodic, band) with >= 3 density turns; else the ring's (z, band) value; else the box's */
+    if (pha > 0) {   /* --phase-src: phase per density (model) turn by network spacing, and the fit k(s) = rs (s / 120 um)^-A over the bins at
+                        spacing >= the --phase-src A (weighted by turns, log space): count-field --rho-scale rs --rho-pow A,120 */
+        printf("  spacing(um)  turns   phase/turn\n");
+        double sw = 0, sx = 0, sy = 0, sxx = 0, sxy = 0;
+        for (int s = 0; s < CC_NSB; s++) {
+            double p = 0, d = 0; for (int j = 0; j < nth; j++) { p += SB[((size_t)j * CC_NSB + s) * 2]; d += SB[((size_t)j * CC_NSB + s) * 2 + 1]; }
+            if (d < 20) continue;
+            const double sc = (s + 0.5) * CC_SBW; printf("  %4.0f-%-4.0f %9.0f  %7.3f\n", s * CC_SBW, (s + 1) * CC_SBW, d, p / d);
+            if (sc < pha * um || !(p > 0)) continue;
+            const double x = log(sc / 120), y = log(p / d); sw += d; sx += d * x; sy += d * y; sxx += d * x * x; sxy += d * x * y;
+        }
+        if (sw > 0) { const double den = sw * sxx - sx * sx, A = den > 0 ? -(sw * sxy - sx * sy) / den : 0, lr = (sy + A * sx) / sw;
+                      printf("ct-cal: phase fit: --rho-scale %.4f --rho-pow %.4f,120 (%.0f turns at spacing >= %.0f um)\n", exp(lr), A, sw, pha * um); }
+    }
     double tp = 0, td = 0; for (size_t i = 0; i < (size_t)nz * nth * nb; i++) { tp += PK[i]; td += DN[i]; }
     const double kall = td > 0 ? tp / td : 1;
     float *K = malloc((size_t)nz * nth * nb * sizeof(float)); long long nown = 0, nring = 0, nbox = 0;
@@ -162,7 +204,7 @@ int cmd_ct_cal(int argc, char **argv) {
     printf("  radius(mm)  density-turns  CT/density\n");
     for (int bi = 0; bi < nb; bi++) { double p = 0, d = 0; for (int i = 0; i < nz * nth; i++) { p += PK[(size_t)i * nb + bi]; d += DN[(size_t)i * nb + bi]; } if (d >= 20) printf("  %4.0f-%-4.0f  %13.0f  %10.3f\n", bi * bmm, (bi + 1) * bmm, d, p / d); }
     if (mref) { fit_set_free(mref); }
-    fit_ct_cal_free(prev); free(PK); free(DN); free(K); free(ay); free(ax); z3_close(cz);
+    fit_ct_cal_free(prev); free(SB); free(PK); free(DN); free(K); free(ay); free(ax); if (cz) z3_close(cz);
     return 0;
 }
 

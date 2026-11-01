@@ -37,7 +37,7 @@ static const char *wc_opt(int argc, char **argv, const char *name, const char *d
 static int wc_idx(int argc, char **argv, const char *name) { for (int i = 3; i < argc; i++) if (!strcmp(argv[i], name)) return i; return -1; }
 static double wc_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + 1e-9 * t.tv_nsec; }
 
-typedef struct { int k; float z, r, gapn, rct, rnet, gtq, tph, tdn, tref; uint8_t npk; int8_t gt; } wc_int;   /* tph / tdn / tref: the network phase turns, density turns (integral of |n.r| / sp) and --ref model turns between the two crossings (NAN: none) */   /* the interval from wrap k to k + 1 on a ray; gtq the GT turns, gt their class (< 0.5: 0, < 1.5: 1, 2; < -0.25: -1; -128 none) */
+typedef struct { int k; float z, r, gapn, rct, rnet, gtq, tph, tdn, tref; uint8_t npk; int8_t gt; float tfit; } wc_int;   /* tfit (--gt-int): the fit's turns over a GT interval */   /* tph / tdn / tref: the network phase turns, density turns (integral of |n.r| / sp) and --ref model turns between the two crossings (NAN: none) */   /* the interval from wrap k to k + 1 on a ray; gtq the GT turns, gt their class (< 0.5: 0, < 1.5: 1, 2; < -0.25: -1; -128 none) */
 
 typedef struct {
     const fit_set *fs; const fit_model *m;
@@ -51,7 +51,7 @@ typedef struct {
     /* codes plane, its origin (label voxels, global) */
     const uint8_t *cd; int64_t qo[2], qn[2];
     double morg[3];
-    int nth; double sigma, prom;
+    int nth; double sigma, prom; int gtint;   /* --gt-int 1: the intervals run between consecutive GT sheets (codes) instead of fitted wraps */
     wc_int **out; int *nout;   /* per ray */
 } wc_job;
 
@@ -67,6 +67,7 @@ static int wc_code(const wc_job *J, double y, double x) {
     if (qy < 0 || qx < 0 || qy >= J->qn[0] || qx >= J->qn[1]) return 0;
     const int c = J->cd[qy * J->qn[1] + qx]; return c >= 1 && c <= 252 ? c : 0;
 }
+static double J_npk_or_nan(const wc_int *v, int ct) { return ct ? (double)v->npk : NAN; }
 static int cmp_f(const void *a, const void *b) { const float x = *(const float *)a, y = *(const float *)b; return (x > y) - (x < y); }
 
 static void wc_rays(void *ctx, int a0, int a1, int t) {
@@ -146,7 +147,7 @@ static void wc_rays(void *ctx, int a0, int a1, int t) {
             const double ym = cy + rm * sn, xm = cx + rm * cs; double g[3];
             const double gl = fit_set_gradW(J->fs, J->zl, ym, xm, 0.5, g);
             const double cosr = gl > 0 ? fabs(g[1] * sn + g[2] * cs) / gl : 1;
-            wc_int v = {ck[c], (float)J->zl, (float)rm, (float)((rb - ra) * cosr * J->um), NAN, NAN, NAN, NAN, NAN, NAN, 0, -128};
+            wc_int v = {ck[c], (float)J->zl, (float)rm, (float)((rb - ra) * cosr * J->um), NAN, NAN, NAN, NAN, NAN, NAN, 0, -128, NAN};
             {   /* network phase turns (wrapped steps summed, outward sign), density turns, ref turns between the crossings */
                 const int i0 = (int)ceil(ra / st), i1 = (int)floor(rb / st);
                 double sph = 0, sdn = 0; int nph = 0, ndn = 0, last = -1;
@@ -177,6 +178,41 @@ static void wc_rays(void *ctx, int a0, int a1, int t) {
             }
             o[no++] = v;
         }
+        if (J->gtint && J->cd) {   /* --gt-int: replace the intervals by those between consecutive GT sheets (runs of labelled samples) */
+            no = 0; free(o); int cap2 = 64; o = malloc(sizeof(wc_int) * cap2);
+            double pr = -1; int pq = 0;   /* previous GT sheet: centre (samples), code */
+            for (int i = 0; i < n;) {
+                if (!q[i]) { i++; continue; }
+                int e = i, last = i;   /* a run (gaps <= 1 sample, codes within half a turn of its first) */
+                while (e < n && e - last <= 2) { if (q[e]) { int dc = (q[e] - q[i]) % 252; if (dc < 0) dc += 252; if (dc > 126) dc -= 252; if (abs(dc) > 9) break; last = e; } e++; }
+                if (e < n && e - last <= 2) e = last + 1;   /* (stopped at a code jump: the next run starts there) */
+                const double cr0 = 0.5 * (i + last); const int qc = q[(int)lround(cr0)] ? q[(int)lround(cr0)] : q[i];
+                if (pr >= 0) {
+                    double dq = fmod((qc - pq) / 18.0, 14.0); if (dq < 0) dq += 14; if (dq > 7) dq -= 14;
+                    const int ia = (int)lround(pr), ib = (int)lround(cr0);
+                    int allm = 1; for (int k = ia; k <= ib; k++) if (!mat[k]) { allm = 0; break; }
+                    if (allm && dq > 0.5 && dq < 2.5 && ib > ia && W[ia] == W[ia] && W[ib] == W[ib]) {
+                        const double ra = ia * st, rb = ib * st, rm = 0.5 * (ra + rb), ym = cy + rm * sn, xm = cx + rm * cs; double g[3];
+                        const double gl = fit_set_gradW(J->fs, J->zl, ym, xm, 0.5, g); const double cosr = gl > 0 ? fabs(g[1] * sn + g[2] * cs) / gl : 1;
+                        wc_int v = {(int)floor(W[ia]), (float)J->zl, (float)rm, (float)((rb - ra) * cosr * J->um / dq), NAN, NAN, (float)dq, NAN, NAN, NAN, 0, (int8_t)lround(dq), (float)(W[ib] - W[ia])};
+                        double sph = 0, sdn = 0; int nph = 0, ndn = 0, lp = -1;
+                        for (int k = ia; k <= ib; k++) {
+                            if (dn[k] == dn[k]) { sdn += dn[k] * st; ndn++; }
+                            if (ph[k] == ph[k]) { if (lp >= 0 && k - lp <= 3) { double d = ph[k] - ph[lp]; d -= floor(d + 0.5); sph += d; nph += k - lp; } lp = k; }
+                        }
+                        const int span = ib - ia + 1;
+                        if (ndn >= 0.8 * span) v.tdn = (float)(sdn * span / ndn);
+                        if (span > 1 && nph >= 0.8 * (span - 1)) v.tph = (float)(sph * (span - 1) / nph);
+                        if (J->ref && Wr[ia] == Wr[ia] && Wr[ib] == Wr[ib]) v.tref = Wr[ib] - Wr[ia];
+                        if (J->ct) { int c0 = 0; for (int p = 0; p < npk; p++) if (pk[p] >= ra && pk[p] < rb) c0++; v.npk = (uint8_t)(c0 > 255 ? 255 : c0); }
+                        { const int im = (ia + ib) / 2; v.rct = spn[im] > 0 ? (float)(spn[im] * J->um) : NAN; }   /* (--gt-int: rct = the network spacing at the middle, um) */
+                        if (no == cap2) { cap2 *= 2; o = realloc(o, sizeof(wc_int) * cap2); }
+                        o[no++] = v;
+                    }
+                }
+                pr = cr0; pq = qc; i = e;
+            }
+        }
         J->out[j] = o; J->nout[j] = no;
         atomic_fetch_add(&J->nmat, lm); atomic_fetch_add(&J->nconf, lc);
         free(W); free(C); free(Cs); free(spn); free(mat); free(q); free(pk); free(ph); free(dn); free(Wr); free(cr); free(ck); free(ci); free(cu);
@@ -201,6 +237,7 @@ int cmd_wrap_check(int argc, char **argv) {
     if (m->h != h) { fprintf(stderr, "wrap-check: the model's cell h %g differs from the fields' %g\n", m->h, h); return 1; }
     const int nz = atoi(wc_opt(argc, argv, "--nz", "16")), nth = atoi(wc_opt(argc, argv, "--nth", "180")), nt = ufsm_threads(atoi(wc_opt(argc, argv, "--threads", "0")), 16);
     const double sigma = atof(wc_opt(argc, argv, "--sigma", "1.2")), prom = atof(wc_opt(argc, argv, "--prom", "1")), wsc = atof(wc_opt(argc, argv, "--w-scale", "1")), dup = atof(wc_opt(argc, argv, "--dup", "0.5"));
+    const int gti = atoi(wc_opt(argc, argv, "--gt-int", "0"));
     const double Z = m->D * m->h; double zr0 = 0.05 * Z, zr1 = 0.95 * Z;
     const char *zr = wc_opt(argc, argv, "--zr", nullptr); if (zr && sscanf(zr, "%lf,%lf", &zr0, &zr1) != 2) { fprintf(stderr, "wrap-check: --zr Z0,Z1\n"); return 2; }
     if (nz < 1 || nth < 4 || !(sigma > 0) || !(zr1 > zr0)) { fprintf(stderr, "wrap-check: bad --nz / --nth / --sigma / --zr\n"); return 2; }
@@ -234,7 +271,7 @@ int cmd_wrap_check(int argc, char **argv) {
         if (fz < 0 || fz >= fsh[0]) continue;
         fit_fields_buf b; if (fit_fields_load(argv[3], fz, fz + 1, 1, &b)) { fprintf(stderr, "wrap-check: cannot load field row %d\n", fz); return 1; }
         wc_job J = {.fs = fs, .m = m, .zl = zl, .step = step, .um = um, .h = h, .F = F, .cf = cf, .ws = wsc, .w = b.f.w, .sp = b.f.sp, .pc = b.f.pc, .ps = b.f.ps, .tyy = b.f.t[1], .txx = b.f.t[2], .tyx = b.f.t[5], .ref = rs, .roff = {morg[0] - ro[0], morg[1] - ro[1], morg[2] - ro[2]}, .FH = fsh[1], .FW = fsh[2],
-                    .fo = {morg[1] - forg[1], morg[2] - forg[2]}, .morg = {morg[0], morg[1], morg[2]}, .nth = nth, .sigma = sigma, .prom = prom};
+                    .fo = {morg[1] - forg[1], morg[2] - forg[2]}, .morg = {morg[0], morg[1], morg[2]}, .nth = nth, .sigma = sigma, .prom = prom, .gtint = gti};
         float *ctp = nullptr; uint8_t *cdp = nullptr;
         if (cz) {   /* the CT rows covering native z [zg - 0.5, zg + 0.5), averaged; the box's y / x range + 2 */
             const z3_meta *zm = z3_meta_of(cz);
@@ -275,6 +312,41 @@ int cmd_wrap_check(int argc, char **argv) {
     }
     fprintf(stderr, "\n");
     if (!ni) { printf("wrap-check: no intervals (no material crossings)\n"); return 1; }
+    if (gti) {   /* --gt-int: per GT interval (consecutive GT sheets on a ray, dq GT turns), each source's turns over it: means per GT turn and
+                    the share off by >= 0.5 turn, by radius (2 mm) and by the normal gap per GT turn (packing) */
+        if (!qz) { fprintf(stderr, "wrap-check: --gt-int needs --codes\n"); return 2; }
+        enum { NS = 5 };   /* fit, ref, density, phase, CT */
+        const char *nm[NS] = {"fit", "ref", "density", "phase", "CT"};
+        const double gb[] = {0, 70, 85, 100, 115, 130, 150, 180, 230, 1e9}; const int ngb = 9;
+        for (int tab = 0; tab < 3; tab++) {
+            const int nbin = tab ? ngb : 20;
+            double (*s)[NS][4] = calloc(nbin + 1, sizeof *s); long long *cnt = calloc(nbin + 1, sizeof(long long));   /* sum turns, sum dq, n, off */
+            for (size_t i = 0; i < ni; i++) {
+                const wc_int *v = &all[i]; int b;
+                if (tab) { const double gv = tab == 1 ? v->gapn : v->rct; if (!(gv == gv)) continue; b = 0; while (b + 1 < ngb && gv >= gb[b + 1]) b++; } else { b = (int)(v->r * um / 2000); if (b >= nbin) b = nbin - 1; }
+                const double val[NS] = {v->tfit, v->tref, v->tdn, v->tph, J_npk_or_nan(v, cz != nullptr)};
+                cnt[b]++; cnt[nbin]++;
+                for (int k = 0; k < NS; k++) { if (!(val[k] == val[k])) continue;
+                    for (int bb = 0; bb < 2; bb++) { double *a = s[bb ? nbin : b][k]; a[0] += val[k]; a[1] += v->gtq; a[2]++; a[3] += fabs(val[k] - v->gtq) >= 0.5; } }
+            }
+            printf("  GT intervals by %s: per source turns per GT turn / share off >= 0.5 turn\n  %-11s %8s", tab == 1 ? "normal gap per GT turn (um)" : tab == 2 ? "network spacing sp at the middle (um)" : "radius (mm)", tab ? "gap(um)" : "radius", "n");
+            for (int k = 0; k < NS; k++) printf("  %13s", nm[k]);
+            printf("\n");
+            for (int b = 0; b <= nbin; b++) { if (cnt[b] < 50) continue;
+                if (b == nbin) printf("  %-11s", "all"); else if (tab) printf("  %4.0f-%-6.0f", gb[b], b + 1 < ngb ? gb[b + 1] : 9999.0); else printf("  %4d-%-6d", 2 * b, 2 * b + 2);
+                printf(" %8lld", cnt[b]);
+                for (int k = 0; k < NS; k++) { const double *a = s[b][k]; if (a[2] < 20) printf("  %13s", "-"); else printf("  %6.3f/%.3f", a[0] / a[1], a[3] / a[2]); }
+                printf("\n"); }
+            if (!tab && wc_opt(argc, argv, "--tsv", nullptr)) {   /* --tsv: the overall row per source (source, turns per GT turn, share off >= 0.5, intervals) */
+                FILE *tf = fopen(wc_opt(argc, argv, "--tsv", nullptr), "w"); if (!tf) { fprintf(stderr, "wrap-check: cannot write the --tsv\n"); return 1; }
+                fprintf(tf, "source\tper_gt_turn\toff\tn\n"); for (int k = 0; k < NS; k++) { const double *a = s[nbin][k]; fprintf(tf, "%s\t%.4f\t%.4f\t%.0f\n", nm[k], a[1] > 0 ? a[0] / a[1] : NAN, a[2] > 0 ? a[3] / a[2] : NAN, a[2]); }
+                fclose(tf);
+            }
+            free(s); free(cnt);
+        }
+        free(all); fit_set_free(fs); if (rs) fit_set_free(rs); if (cz) z3_close(cz); z3_close(qz);
+        return 0;
+    }
     /* radius bands of 1 mm */
     const double band = 1000 / um; int nb = 0; for (size_t i = 0; i < ni; i++) { const int bi = (int)(all[i].r / band); if (bi + 1 > nb) nb = bi + 1; }
     long long (*bs)[6] = calloc(nb, sizeof *bs);   /* n, sum npk, n with GT, sum GT, empties, 2+ */

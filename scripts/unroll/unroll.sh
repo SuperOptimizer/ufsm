@@ -11,7 +11,7 @@
 #   ink     -> prep only; GPU INKGPU (1) from when the fields are done: INKCMD (the ink agent's recipe; default: the feathered
 #           single pass of inklib.sh: ift3, frozen GN, --window auto --halo 32 --feather 32, resumable) -> ink/$INKNAME.zarr
 #   ctcal   -> fields (CTCAL=1 only, OFF by default): ufsm ct-cal --ct-um $LUM (the CT LEVEL's um) -> ct.cal; ref adds --ct-cal
-#   ref     -> fields: count-field --model-only (REFCMD F REF [--ct-cal FILE] overrides; cf GPU, TH threads)
+#   ref     -> fields: count-field --model-only (REFCMD F REF [--ct-cal FILE] overrides; cf GPU, TH threads) REFX: extra count-field flags (e.g. --rho-scale S)
 #   slabs   -> ref: snapped slab fits, FITLANES lanes per GPU in FITGPUS ("0 1"; auto: by device memory, 1..3); the INKGPU lanes start once the ink is done; then the
 #           bad-slab check (fit.log: "illegal memory", "loss 0.00000", no final loss line): refit on 1 lane, up to 3 tries, else fail
 #   join    -> slabs: fit-join --ref (refuses bad slabs) ; check -> join: wrap-check (wrapcheck.tsv verdicts; 0 CT peaks = fail)
@@ -169,7 +169,7 @@ ref() {
   local cal=; [ "${CTCAL:-0}" = 1 ] && cal="--ct-cal $O/ct.cal"
   if [ -n "${REFCMD:-}" ]; then X $O/logs/ref.log $REFCMD $F $REF $cal; else
   X $O/logs/ref.log $U count-field $F $O/cf.unused --R 0 --pool 8 --phase-w 4 --iters 1200 --model $REF --model-only 1 --model-stride ${MSTRIDE:-4} \
-    --threads $TH --mem-gb ${CFMEM:-24} $cal; fi && { [ "$DRY" = 1 ] || [ -e $REF/model.json ]; }
+    --threads $TH --mem-gb ${CFMEM:-24} $cal ${REFX:-}; fi && { [ "$DRY" = 1 ] || [ -e $REF/model.json ]; }
 }
 
 # --- ink (another agent's recipe via INKCMD SCROLLDIR GPU OUT; default the feathered single pass of scripts/corpus/inklib.sh) ---
