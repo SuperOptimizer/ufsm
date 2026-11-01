@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # scripts/v2/snap.sh [NLANES]: snap the v2 training wraps (scripts/unroll/snap_existing.sh) over V2/scrolls.tsv rows, reading local CT only.
 # A row runs when: split = train, ct_root set (the fetched scan is complete), no V2/wraps_snap/<S>/done, and either fields are set
-# (target mix) or <S> is listed in V2/snap.ct (target ct: scrolls whose fields never come back). Rows with no fields yet wait.
+# (target mix) or <S> is listed in V2/snap.ct (target ct, even with fields: fields that never come back or are damaged). Rows with no fields yet wait.
 # Lanes claim scrolls with flock; a lane only starts a scroll while MemAvailable > MINMEM GB (40). Output V2/wraps_snap/<S>/wraps_snap
 # + snap.log; MEASURE=0 (no surf-stats). Re-run scripts/v2/scrolls.sh to pick up new CT / fields, then this again (done scrolls skip).
 # Env: V2 (/vesuvius/ufsm/v2), U (V2/src/build/ufsm), TH (threads per snap, 10), MINMEM, ONLY ("S1 S2": restrict).
@@ -16,7 +16,7 @@ lane() {
     [ "$SPLIT" = train ] && [ "$CR" != - ] && [ "$AX" != - ] || continue
     [ -n "${ONLY:-}" ] && { case " $ONLY " in *" $S "*) ;; *) continue;; esac; }
     [ -e $O/$S/done ] && continue
-    T=; [ "$FL" != - ] && T=mix; [ -z "$T" ] && grep -qx $S $V2/snap.ct 2>/dev/null && T=ct; [ -n "$T" ] || continue
+    T=; [ "$FL" != - ] && T=mix; grep -qx $S $V2/snap.ct 2>/dev/null && T=ct; [ -n "$T" ] || continue   # (snap.ct wins: fields unreadable)
     [ -e $CR/$K/$LV/zarr.json ] || { log "$S: no local CT $CR/$K/$LV"; continue; }
     mkdir -p $O/$S; exec 9> $O/$S/claim; flock -n 9 || continue; [ -e $O/$S/done ] && continue
     until memok; do sleep 60; done
