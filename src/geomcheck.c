@@ -178,7 +178,7 @@ static void *gc_worker(void *arg) {
    refined) against the wrap's own radial motion r2 - r1: slip = (r2 - r1) - s. A wrap that follows its sheet has slip ~ 0; one that
    crosses sheets in z (a winding gauge drifting with z: the level set W = k slants through the turns) accumulates one pitch of slip per
    sheet crossed. The CT planes are read once per sampled row. */
-typedef struct { gc_job *J; const uint8_t *p1, *p2; int64_t o[3], n[3]; double f, z1, z2; int tr1, tr2, sb; _Atomic int next; double *slip; long long *sn; double *sabs; long long *hs; } gc_slip;
+typedef struct { gc_job *J; const uint8_t *p1, *p2; int64_t o[3], n[3]; double f, z1, z2; int tr1, tr2, sb; _Atomic int next; double *slip; long long *sn; double *sabs; long long *hs; double *rs; long long *rn; } gc_slip;   /* rs / rn: this row pair's slip sum / count per wrap */
 static inline double gc_ct(const uint8_t *pl, const int64_t n[3], const int64_t o[3], double f, double y, double x) {   /* bilinear in one plane, wrap voxels */
     const double cy = (y + 0.5) * f - 0.5 - o[1], cx = (x + 0.5) * f - 0.5 - o[2];
     const int64_t iy = (int64_t)floor(cy), ix = (int64_t)floor(cx); if (iy < 0 || ix < 0 || iy + 1 >= n[1] || ix + 1 >= n[2]) return NAN;
@@ -210,7 +210,7 @@ static void *gc_slip_run(void *arg) {
             if (cc[best] < 0.5 || best == 0 || best == 2 * Sn) continue;
             const double a = cc[best - 1], c0 = cc[best], d = cc[best + 1], den = a - 2 * c0 + d, sub = den < 0 ? 0.5 * (a - d) / den : 0;
             const double s = 0.5 * (best - Sn + sub), slip = ((r2 - r1) - s) / P;
-            S->slip[(size_t)k * J->zbins + zb] += slip; S->sabs[(size_t)k * J->zbins + zb] += fabs(slip); S->sn[(size_t)k * J->zbins + zb]++;
+            S->slip[(size_t)k * J->zbins + zb] += slip; S->sabs[(size_t)k * J->zbins + zb] += fabs(slip); S->sn[(size_t)k * J->zbins + zb]++; S->rs[k] += slip; S->rn[k]++;
             int hb = (int)floor((slip + 1) * 50); hb = hb < 0 ? 0 : hb > 99 ? 99 : hb; S->hs[k * 100 + hb]++;
         }
     }
@@ -282,6 +282,7 @@ int cmd_geom_check(int argc, char **argv) {
     if (atomic_load(&J.fail)) return 1;
     /* --ct: z slip of the wraps against the CT's sheets */
     double *slip = nullptr, *sabs = nullptr; long long *sn = nullptr, *hs = nullptr; int ci = -1;
+    int nzg = 0; int *zg_r = nullptr; double *zg_z = nullptr, *zg_m = nullptr; long long *zg_n = nullptr;   /* per sampled row pair: its row, z, mean slip x rows per sample (turns), samples */
     for (int i = 2; i + 2 < argc; i++) if (!strcmp(argv[i], "--ct")) ci = i;
     if (ci > 0) {
         const double ctum = atof(gc_opt(argc, argv, "--ct-um", "0")); const int se = atoi(gc_opt(argc, argv, "--slip-every", "128")), D = atoi(gc_opt(argc, argv, "--slip-d", "2")), sb = atoi(gc_opt(argc, argv, "--slip-sb", "8"));
@@ -289,7 +290,8 @@ int cmd_geom_check(int argc, char **argv) {
         z3 *cz = z3_open(store_open(argv[ci + 1]), argv[ci + 2], gc_opt(argc, argv, "--cache", nullptr)); if (!cz) { fprintf(stderr, "geom-check: CT: %s\n", z3_error()); return 1; }
         const z3_meta *cm = z3_meta_of(cz); const double f = um / ctum;
         slip = calloc((size_t)nw * J.zbins, 8); sabs = calloc((size_t)nw * J.zbins, 8); sn = calloc((size_t)nw * J.zbins, 8); hs = calloc((size_t)nw * 100, 8);
-        const double ts = gc_now(); int nrows = 0;
+        const double ts = gc_now(); int nrows = 0; double *rsum = malloc((size_t)nw * 8); long long *rcnt = malloc((size_t)nw * 8);
+        zg_r = malloc((size_t)(H / se + 2) * sizeof *zg_r); zg_z = malloc((size_t)(H / se + 2) * 8); zg_m = malloc((size_t)(H / se + 2) * 8); zg_n = malloc((size_t)(H / se + 2) * 8);
         for (int r = se / 2 - (se / 2) % J.every; r + D < H; r += se) {
             double z1 = NAN, z2 = NAN, rmax = 0; for (int k = 0; k < nw; k++) { if (!isfinite(z1)) z1 = W[k].rz[r]; if (!isfinite(z2)) z2 = W[k].rz[r + D]; }
             if (!isfinite(z1) || !isfinite(z2)) continue;
@@ -297,7 +299,8 @@ int cmd_geom_check(int argc, char **argv) {
             for (int k = 0; k < nw; k++) for (int b = 0; b < J.nb; b += 4) { const double v = gc_rt(&W[k], &J, tr1, b); if (isfinite(v) && v > rmax) rmax = v; }
             if (!(rmax > 0)) continue;
             double ay, ax; gc_axis(&J, z1, &ay, &ax); const double R = rmax + 64;
-            gc_slip S = {&J, nullptr, nullptr, {0, 0, 0}, {1, 0, 0}, f, z1, z2, tr1, tr2, sb, 0, slip, sn, sabs, hs};
+            gc_slip S = {&J, nullptr, nullptr, {0, 0, 0}, {1, 0, 0}, f, z1, z2, tr1, tr2, sb, 0, slip, sn, sabs, hs, rsum, rcnt};
+            memset(rsum, 0, (size_t)nw * 8); memset(rcnt, 0, (size_t)nw * 8);
             int64_t lo[2] = {(int64_t)floor(((ay - R) + 0.5) * f - 0.5), (int64_t)floor(((ax - R) + 0.5) * f - 0.5)}, hi[2] = {(int64_t)ceil(((ay + R) + 0.5) * f + 0.5), (int64_t)ceil(((ax + R) + 0.5) * f + 0.5)};
             for (int d = 0; d < 2; d++) { if (lo[d] < 0) lo[d] = 0; if (hi[d] > cm->shape[d + 1]) hi[d] = cm->shape[d + 1]; }
             if (hi[0] <= lo[0] || hi[1] <= lo[1]) continue;
@@ -308,9 +311,16 @@ int cmd_geom_check(int argc, char **argv) {
             S.p1 = p1; S.p2 = p2;
             for (int t = 0; t < m; t++) pthread_create(&th[t], nullptr, gc_slip_run, &S);
             for (int t = 0; t < m; t++) pthread_join(th[t], nullptr);
+            { /* the row pair's drift: the median over wraps (>= 3 samples each) of their mean slip, x rows per sample, clamped to +-0.5 turn
+                 (end caps and air: wraps disagree, a mean there integrated to tens of turns) */
+              double *mk = malloc((size_t)nw * 8); int nm = 0; long long c = 0;
+              for (int k = 0; k < nw; k++) { c += rcnt[k]; if (rcnt[k] >= 3) mk[nm++] = rsum[k] / rcnt[k]; }
+              if (nm >= 8) { qsort(mk, nm, 8, gc_cmpd); const double md = (nm & 1 ? mk[nm / 2] : 0.5 * (mk[nm / 2 - 1] + mk[nm / 2])) * se / D;
+                             zg_r[nzg] = r; zg_z[nzg] = 0.5 * (z1 + z2); zg_m[nzg] = fmax(-0.5, fmin(0.5, md)); zg_n[nzg] = c; nzg++; }
+              free(mk); }
             free(p1); free(p2); nrows++;
         }
-        z3_close(cz);
+        z3_close(cz); free(rsum); free(rcnt);
         long long hh[100] = {0}, nn = 0; double sa = 0; for (int k = 0; k < nw; k++) for (int b = 0; b < 100; b++) hh[b] += hs[k * 100 + b];
         for (size_t i = 0; i < (size_t)nw * J.zbins; i++) { nn += sn[i]; sa += sabs[i]; }
         long long c = 0; double q[3] = {NAN, NAN, NAN}; const double qq[3] = {.1, .5, .9};
@@ -351,6 +361,16 @@ int cmd_geom_check(int argc, char **argv) {
         if (f) { fprintf(f, "wrap\tzbin\trow0\tvalid_share\tr_mean\tdx\tdy\tcover\n");
                  for (int k = 0; k < nw; k++) for (int b = 0; b < J.zbins; b++) fprintf(f, "w%03d\t%d\t%d\t%.4f\t%.1f\t%.1f\t%.1f\t%.3f\n", W[k].id, b, (int)((long long)b * H / J.zbins), W[k].zb_valid[b], W[k].zb_r[b], W[k].zb_dx[b], W[k].zb_dy[b], __builtin_popcountll(W[k].zb_cov[b]) / 64.0);
                  fclose(f); }
+        if (nzg) {   /* zgauge.tsv: the wraps' drift across the sheets along z (turns): the per-sample mean slip integrated, centred on its
+                        median, and a +-4 sample running mean of it (cum_smooth: what ufsm wraps --zgauge subtracts from W = k) */
+            double *cum = malloc((size_t)nzg * 8), *cs = malloc((size_t)nzg * 8), *tmp = malloc((size_t)nzg * 8), a = 0;
+            for (int i = 0; i < nzg; i++) { a += zg_m[i]; cum[i] = a; tmp[i] = a; }
+            qsort(tmp, nzg, 8, gc_cmpd); const double med = tmp[nzg / 2]; for (int i = 0; i < nzg; i++) cum[i] -= med;
+            for (int i = 0; i < nzg; i++) { double s = 0; int n = 0; for (int j = i - 4; j <= i + 4; j++) if (j >= 0 && j < nzg) { s += cum[j]; n++; } cs[i] = s / n; }
+            snprintf(p, sizeof p, "%s/zgauge.tsv", out); f = fopen(p, "w");
+            if (f) { fprintf(f, "row\tz\tslip_turns\tn\tcum\tcum_smooth\n"); for (int i = 0; i < nzg; i++) fprintf(f, "%d\t%.2f\t%.4f\t%lld\t%.3f\t%.3f\n", zg_r[i], zg_z[i], zg_m[i], zg_n[i], cum[i], cs[i]); fclose(f); }
+            free(cum); free(cs); free(tmp);
+        }
         if (slip) { snprintf(p, sizeof p, "%s/slip.tsv", out); f = fopen(p, "w");
             if (f) { fprintf(f, "wrap\tzbin\tn\tslip_mean\tslip_abs\n");
                      for (int k = 0; k < nw; k++) for (int b = 0; b < J.zbins; b++) { const size_t i = (size_t)k * J.zbins + b; if (sn[i]) fprintf(f, "w%03d\t%d\t%lld\t%.4f\t%.4f\n", W[k].id, b, sn[i], slip[i] / sn[i], sabs[i] / sn[i]); }
@@ -364,7 +384,7 @@ int cmd_geom_check(int argc, char **argv) {
     }
     fprintf(stderr, "geom-check: %.1f s\n", gc_now() - t0);
     for (int k = 0; k < nw; k++) { free(W[k].rt); free(W[k].zb_valid); free(W[k].zb_r); free(W[k].zb_n); free(W[k].zb_dx); free(W[k].zb_dy); free(W[k].zb_cov); free(W[k].rz); }
-    free(slip); free(sabs); free(sn); free(hs);
+    free(slip); free(sabs); free(sn); free(hs); free(zg_r); free(zg_z); free(zg_m); free(zg_n);
     free(W); free(J.cells);
     int over = 0; for (int a = 0; a < 4; a++) over |= mx[a] > 0 && sh[a] > mx[a];
     return over ? 3 : 0;

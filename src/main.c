@@ -825,6 +825,29 @@ typedef struct {
 } score_job;
 static int g_score_pairs;   /* fit --score-pairs 1: pair winding accuracy (src/pairacc.h) after the box score */
 static double g_score_z0, g_score_nz;   /* fit --score-z Z0,NZ: only the box-local native z range [Z0, Z0 + NZ) is scored (per-height gauge / ids without a crop) */
+static int g_zg_n; static double *g_zg_z, *g_zg_v, g_zg_f = 1, g_zg_s = 1;   /* wraps --zgauge: z (wrap output coords) -> drift (turns); out = (native + .5) f - .5 */
+static double wr_zgauge(double zg) {   /* the drift at global native z, linear between the table rows, held at the ends */
+    if (!g_zg_n) return 0;
+    const double z = (zg + 0.5) * g_zg_f - 0.5;
+    if (z <= g_zg_z[0]) return g_zg_s * g_zg_v[0];
+    if (z >= g_zg_z[g_zg_n - 1]) return g_zg_s * g_zg_v[g_zg_n - 1];
+    int a = 0, b = g_zg_n - 1; while (b - a > 1) { const int c = (a + b) / 2; if (g_zg_z[c] <= z) a = c; else b = c; }
+    return g_zg_s * (g_zg_v[a] + (z - g_zg_z[a]) / (g_zg_z[b] - g_zg_z[a]) * (g_zg_v[b] - g_zg_v[a]));
+}
+static int zg_load(const char *path, double scale, double f) {   /* a geom-check zgauge.tsv (row z slip_turns n cum cum_smooth): z -> cum_smooth */
+    FILE *zf = fopen(path, "r"); if (!zf) { fprintf(stderr, "cannot read --zgauge %s\n", path); return -1; }
+    char ln[512]; int cap = 0; if (!fgets(ln, sizeof ln, zf)) { fclose(zf); return -1; }
+    while (fgets(ln, sizeof ln, zf)) { int rr; double z, sl, cu, cs; long long n;
+        if (sscanf(ln, "%d %lf %lf %lld %lf %lf", &rr, &z, &sl, &n, &cu, &cs) != 6) continue;
+        if (g_zg_n == cap) { cap = cap ? 2 * cap : 256; g_zg_z = realloc(g_zg_z, cap * 8); g_zg_v = realloc(g_zg_v, cap * 8); }
+        g_zg_z[g_zg_n] = z; g_zg_v[g_zg_n] = cs; g_zg_n++; }
+    fclose(zf);
+    if (g_zg_n < 2) { fprintf(stderr, "--zgauge %s: fewer than 2 rows\n", path); return -1; }
+    g_zg_s = scale; g_zg_f = f;
+    double lo = 1e300, hi = -1e300; for (int i = 0; i < g_zg_n; i++) { lo = fmin(lo, g_zg_v[i]); hi = fmax(hi, g_zg_v[i]); }
+    fprintf(stderr, "--zgauge: %d rows, drift %.1f .. %.1f turns (x %g)\n", g_zg_n, lo, hi, scale);
+    return 0;
+}
 enum { SC_NB = 14 * 72, SC_NF = 14 * 1024 };
 static void *score_rows(void *arg) {
     score_job *J = ((void **)arg)[0]; const int t = (int)(intptr_t)((void **)arg)[1];
@@ -897,6 +920,10 @@ static int score_codes(z3 *z, double cf, const long long org[3], const int shp[3
         if (!R->any) continue;
         const double og[3] = {cf * o3[0] - 0.25 * cf - org[0], cf * o3[1] - 0.25 * cf - org[1], cf * o3[2] - 0.25 * cf - org[2]};   /* label voxel i at cf (i + lo + 1 / 4) - org */
         if (fill(ctx, og, n3, cf, codes, U)) { fprintf(stderr, "score: cannot evaluate U on the score grid\n"); for (int q = 0; q < 2; q++) if (rup[q]) pthread_join(rth[q], nullptr); free(cbuf[0]); free(cbuf[1]); free(U); free(hist); free(fine); free(dd); free(blk); return 1; }
+        if (g_zg_n) for (int64_t a = 0; a < n3[0]; a++) {   /* fit --zgauge: U + drift(z) (the ids wraps --zgauge gives) */
+            const float g = (float)wr_zgauge(org[0] + og[0] + a * cf); float *u = U + (size_t)a * n3[1] * n3[2];
+            for (size_t i = 0; i < (size_t)n3[1] * n3[2]; i++) u[i] += g;
+        }
         tf += now() - tq; tq = now();
         if (!dump) {   /* threads (the dump keeps the serial voxel order); per-thread tallies and detail records kept over all blocks */
             J.codes = codes; J.U = U; for (int d = 0; d < 3; d++) { J.n3[d] = n3[d]; J.o3[d] = o3[d]; }
@@ -1523,6 +1550,7 @@ static int cmd_fit(int argc, char **argv) {
         fit_set_dev *gd = nullptr; if (!c.cpu && !(gd = fit_set_upload(fs))) return 1;
         fit_fill_ctx fc = {gd, fs};
         g_score_pairs = atoi(opt(argc, argv, "--score-pairs", "0")) > 0;
+        if (*opt(argc, argv, "--zgauge", "") && zg_load(opt(argc, argv, "--zgauge", ""), atof(opt(argc, argv, "--zgauge-scale", "1")), atof(opt(argc, argv, "--zgauge-f", "1")))) return 1;
         if (*opt(argc, argv, "--score-z", "") && sscanf(opt(argc, argv, "--score-z", ""), "%lf,%lf", &g_score_z0, &g_score_nz) != 2) { fprintf(stderr, "fit: --score-z Z0,NZ (box-local native z)\n"); return 2; }
         const int rc = score_codes(z, cf, org, shp, h, fb.um, fb.cy, fb.cx, arg_index(argc, argv, "--score-detail") > 0, dump, fit_fill, &fc);
         fit_set_dev_free(gd); z3_close(z); if (dump) fclose(dump);
@@ -1745,12 +1773,13 @@ static void *wraps_rows(void *arg) {
     for (int r; (r = atomic_fetch_add(&J->next, 1)) < J->rows;) {
         const double z = fmin(J->zlo + r * J->step, J->Z), cy = m->cy[(int)fmin(z, J->na - 1)], cx = m->cx[(int)fmin(z, J->na - 1)];
         double rprev = J->rk; size_t valid = 0; fit_set_row *row = fit_set_row_new(J->fs, z);
+        const double kz = J->k - wr_zgauge(z + m->origin[0]);   /* --zgauge: the level set that stays on the sheets along z */
         for (int c = 0; c < J->cols; c++) {
             const size_t i = (size_t)r * J->cols + (J->cols - 1 - c);   /* column 0 = the largest theta side (upstream: outermost first) */
             const double th = J->thc ? J->thc[c] : J->th0 + c * J->dth; double rr;
             J->px[i] = J->py[i] = J->pz[i] = -1;
             double ua, ub; wr_polar_bounds(J->P, r, th, &ua, &ub);
-            if (row ? fit_set_row_root_b(row, th, J->k, rprev, ua, ub, &rr) : fit_set_ray_root_b(J->fs, z, th, J->k, rprev, ua, ub, &rr)) continue;
+            if (row ? fit_set_row_root_b(row, th, kz, rprev, ua, ub, &rr) : fit_set_ray_root_b(J->fs, z, th, kz, rprev, ua, ub, &rr)) continue;
             const double y = cy + rr * sin(th), x = cx + rr * cos(th);
             if (J->wf) {
                 const int fz = (int)fmin(z / J->wh, J->wsh[0] - 1), fy = (int)fmin(y / J->wh, J->wsh[1] - 1), fx = (int)fmin(x / J->wh, J->wsh[2] - 1);
@@ -1939,6 +1968,10 @@ static int cmd_wraps(int argc, char **argv) {
     int k0 = (int)ceil(wmin), k1 = (int)floor(wmax);   /* (the samples can miss W near the axis: --first / --last are taken as given) */
     if (*opt(argc, argv, "--first", "")) k0 = atoi(opt(argc, argv, "--first", ""));
     if (*opt(argc, argv, "--last", "")) k1 = atoi(opt(argc, argv, "--last", ""));
+    if (*opt(argc, argv, "--zgauge", "")) {   /* --zgauge FILE (ufsm geom-check --ct zgauge.tsv of these wraps: z, cum_smooth) [--zgauge-scale S]: wrap
+                                                k = the level set W = k - S drift(z), the drift the CT measured the wraps crossing sheets along z */
+        if (zg_load(opt(argc, argv, "--zgauge", ""), atof(opt(argc, argv, "--zgauge-scale", "1")), out_um > 0 ? um / out_um : 1)) return 1;
+    }
     const char *cr = opt(argc, argv, "--col-r", "p90"); const double colr = !strcmp(cr, "centre") ? -1 : !strcmp(cr, "p90") ? 0 : !strcmp(cr, "arc") ? -2 : atof(cr);
     if (strcmp(cr, "centre") && strcmp(cr, "p90") && strcmp(cr, "arc") && !(colr > 0)) { fprintf(stderr, "wraps: --col-r centre|p90|arc|R (R > 0 native voxels)\n"); return 2; }
     const int na = (int)Z + 1;
