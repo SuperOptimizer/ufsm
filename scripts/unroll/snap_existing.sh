@@ -5,7 +5,7 @@
 # Inputs, found in order: RUN (env) or /vesuvius/ufsm/pods/S/run, /mnt/scratch/pods/S/run (wraps/wNNN.sfc, axis.json, fields/ when kept).
 # CT: scripts/corpus/list.tsv (root, key, um, level) when the root is on this host, else the mirror over HTTP (MIRROR) with a decoded-chunk
 # cache in OUT/S/ctcache (deleted at the end, KEEPCACHE=1 keeps it). Target: SNAPT (default mix when the run kept its fields' pc plane, else ct).
-# Env: U (ufsm), TH (threads, 16), SNAPX (extra wrap-snap flags), MEASURE (1: surf-stats before / after).
+# Env: U (ufsm), CTROOT (local CT root holding the list key, overrides list.tsv's), TH (threads, 16), SNAPX (extra wrap-snap flags), MEASURE (1: surf-stats before / after).
 # Prints: wall s, max RSS GB, CT cache GB, on-papyrus before / after. Never touches the source run.
 set -u
 S=${1:?usage: snap_existing.sh SCROLL [OUT]}; OUT=${2:-/mnt/scratch/snap/existing}
@@ -16,6 +16,7 @@ RUN=${RUN:-}; for r in /vesuvius/ufsm/pods/$S/run /mnt/scratch/pods/$S/run; do [
 row=$(awk -F'\t' -v s=$S '$1 == s' $REPO/scripts/corpus/list.tsv $H/scrolls.tsv | head -1)
 [ -n "$row" ] || { echo "snap_existing: $S not in scripts/corpus/list.tsv or scrolls.tsv"; exit 2; }
 IFS=$'\t' read -r _ R K UM LV _ <<< "$row"
+[ -n "${CTROOT:-}" ] && R=$CTROOT   # (a local copy of the scan elsewhere, e.g. the v2 CT tree /vesuvius/ufsm/v2/ct)
 LUM=$(awk -v u=$UM -v l=$LV 'BEGIN { printf "%.4g", u * 2 ^ l }')
 O=$OUT/$S; mkdir -p $O; C=
 [ -e $R/$K/$LV/zarr.json ] || { R=$MIRROR; K=$(dirname $K)/volumes/$(basename $K); C=$O/ctcache; mkdir -p $C; }   # (the mirror: S/volumes/<scan>.zarr)

@@ -258,7 +258,8 @@ int band_field_side_pair(const uint8_t *codes, const int n[3], float rmax, int m
     return rc ? -1 : 0;
 }
 
-int band_field_phase_pair(const uint8_t *codes, const int n[3], float rmax, uint8_t *phase, uint8_t *spacing) {
+int band_field_phase_pair(const uint8_t *codes, const int n[3], float rmax, uint8_t *phase, uint8_t *spacing) { return band_field_phase_pair_ex(codes, n, rmax, phase, spacing, nullptr, nullptr); }
+int band_field_phase_pair_ex(const uint8_t *codes, const int n[3], float rmax, uint8_t *phase, uint8_t *spacing, int32_t *lo, int32_t *hi) {
     const size_t N = (size_t)n[0] * n[1] * n[2], sy = (size_t)n[2], sz = (size_t)n[1] * n[2];
     uint8_t *se = malloc(N), *so = malloc(N); float *de = malloc(N * 4), *dd = malloc(N * 4); int32_t *ie = malloc(N * 4), *io = malloc(N * 4);
     int rc = !se || !so || !de || !dd || !ie || !io;
@@ -274,8 +275,9 @@ int band_field_phase_pair(const uint8_t *codes, const int n[3], float rmax, uint
         const float r2 = rmax * rmax;
         for (size_t i = 0; i < N; i++) {
             phase[i] = PHASE_UNKNOWN; if (spacing) spacing[i] = 0;
+            if (lo) { lo[i] = -1; hi[i] = -1; }
             const int c = codes[i];
-            if (c > 0 && c < 255) { phase[i] = 0; continue; }   /* on a labelled recto */
+            if (c > 0 && c < 255) { phase[i] = 0; if (lo) { lo[i] = (int32_t)i; hi[i] = (int32_t)i; } continue; }   /* on a labelled recto */
             if (ie[i] < 0 || io[i] < 0 || de[i] > r2 || dd[i] > r2) continue;
             const size_t a = (size_t)ie[i], b = (size_t)io[i];
             const int ka = (codes[a] - 1) / BAND_STEPS, kb = (codes[b] - 1) / BAND_STEPS;   /* windings mod 14 */
@@ -289,6 +291,7 @@ int band_field_phase_pair(const uint8_t *codes, const int n[3], float rmax, uint
             const float f = dk == 1 ? da / (da + db) : db / (da + db);   /* the way from the lower winding to the higher */
             int q = (int)lrintf(f * PHASE_PERIOD); if (q >= PHASE_PERIOD) q -= PHASE_PERIOD;
             phase[i] = (uint8_t)q;
+            if (lo) { lo[i] = (int32_t)(dk == 1 ? a : b); hi[i] = (int32_t)(dk == 1 ? b : a); }
             if (spacing) { const long sp = lrintf(da + db); spacing[i] = (uint8_t)(sp < 1 ? 1 : sp > 255 ? 255 : sp); }
         }
     }

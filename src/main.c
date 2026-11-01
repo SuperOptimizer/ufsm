@@ -57,6 +57,8 @@ int cmd_eval(int argc, char **argv);
 int cmd_refine(int argc, char **argv);       /* src/surf.c */
 int cmd_surf_stats(int argc, char **argv);
 int cmd_wrap_snap(int argc, char **argv);   /* src/wrapsnap.c */
+int cmd_surf_labels(int argc, char **argv);   /* src/surflabels.c */
+int cmd_geom_check(int argc, char **argv);   /* src/geomcheck.c */
 int cmd_wrap_match(int argc, char **argv);
 int cmd_ink_cover(int argc, char **argv);
 int cmd_self_gate(int argc, char **argv);
@@ -148,6 +150,7 @@ static int usage(void) {
         "  ufsm convert-unwrap2 <unwrap.ckpt> <out.ckpt>   a task unwrap checkpoint as task unwrap2 (heads 2-10 -> 0-8, winding mod 4 fresh; no training step)\n"
         "  ufsm repack <in-array-dir> <out-array-dir> <shard> [--threads N]   lossless re-sharding of a z3w uint8 zarr (copies the compressed chunks)\n"
         "  ufsm fields-pack IN OUT [--q-phase Q] [--q Q] [--ang A] [--conf C] [--mask-w 1] [--shard 512]   re-encode a fit-field store smaller (readers unchanged)\n"
+        "  ufsm ink-gate OUT --ink R K --ink-um U --phase R K --phase-um U [--ignore R K] [--lo 0 --hi 125]   pseudo ink (prob254) restricted to a phase band (recto)\n"
         "  ufsm wraps <model-dir> <out-dir> [--step 8] [--fields DIR]          one tifxyz per wrap (level sets of W)\n"
         "  ufsm coreline detect|box|sdist|check ...   a crushed scroll's flattened umbilicus per z (fit fields), half-box fit dirs behind it, check renders\n"
         "  ufsm render-sheets <tifxyz-dir> <out-dir> --ct ROOT KEY --ink ROOT KEY ...   every sheet -> CT + red ink 5-panel JPEGs, one batch\n"
@@ -192,6 +195,8 @@ static int usage(void) {
         "  ufsm wrap-check <model> <fields-dir> [--ct ROOT KEY --ct-um U] [--codes ROOT KEY]   duplicate / merged wraps: CT peaks between adjacent wraps along radial rays\n"
         "  ufsm surf-snap <wraps-in> <wraps-out> --volume ROOT KEY --vol-um U   tifxyz vertices onto the nearest papyrus ridge\n"
         "  ufsm wrap-snap <wraps-in> <wraps-out> --axis F --axis-um U0 --ct ROOT KEY --ct-um U   .sfc wraps moved along their rays onto the sheets (smooth, order-kept)\n"
+        "  ufsm surf-labels <wraps-dir> <out-dir> --axis F --axis-um U0 --dir +-1 --grid-um U --like ROOT KEY   winding codes + pair phase + ignore from .sfc wraps\n"
+        "  ufsm geom-check <wraps-dir> --axis F --axis-um U [--out DIR]   wraps geometry QA: spacing, steep walls, jumps, merged / skipped neighbours, holes; guard limits\n"
         "  ufsm refine <wraps-in> <wraps-out> --fields DIR [--range 0.33] [--smooth-um 40]   vertices onto the fields' sheet phase\n"
         "  ufsm surf-stats <wraps-dir> --fields DIR [--ct ROOT KEY --ct-um U]   label-free surface quality (phase, switches, CT)\n"
         "  ufsm self-gate <wraps-dir> <out-dir> --fields DIR --model FIT [--ct ..] [--nb FIT].. [--exclude ..]   strict stretches of a box fit -> label tifxyz + q.tif\n"
@@ -819,6 +824,7 @@ typedef struct {
     pa_buf *pa;   /* per thread (fit --score-pairs), or null */
 } score_job;
 static int g_score_pairs;   /* fit --score-pairs 1: pair winding accuracy (src/pairacc.h) after the box score */
+static double g_score_z0, g_score_nz;   /* fit --score-z Z0,NZ: only the box-local native z range [Z0, Z0 + NZ) is scored (per-height gauge / ids without a crop) */
 enum { SC_NB = 14 * 72, SC_NF = 14 * 1024 };
 static void *score_rows(void *arg) {
     score_job *J = ((void **)arg)[0]; const int t = (int)(intptr_t)((void **)arg)[1];
@@ -856,6 +862,7 @@ static void *sc_read_run(void *a) {
 static int score_codes(z3 *z, double cf, const long long org[3], const int shp[3], double h, double um, const float *cy, const float *cx, int detail, FILE *dump,
                        score_fill_fn fill, void *ctx) {
     int64_t lo[3], ln[3]; for (int d = 0; d < 3; d++) { lo[d] = (int64_t)floor(org[d] / cf); ln[d] = (int64_t)(shp[d] * h / cf); }
+    if (g_score_nz > 0) { lo[0] = (int64_t)floor((org[0] + g_score_z0) / cf); ln[0] = (int64_t)fmin(g_score_nz / cf, shp[0] * h / cf - (lo[0] - floor(org[0] / cf))); }
     enum { NB = SC_NB, NF = SC_NF }; size_t *hist = calloc(NB, sizeof(size_t)), *fine = calloc(NF, sizeof(size_t)), nd = 0, nan = 0;   /* d = U - q mod 14: 1/72 and 1/1024 turn bins */
     score_rec *dd = nullptr; size_t ndet = 0, dcap = 0;
     const int na_ax = (int)(shp[0] * h) + 1;
@@ -1516,6 +1523,7 @@ static int cmd_fit(int argc, char **argv) {
         fit_set_dev *gd = nullptr; if (!c.cpu && !(gd = fit_set_upload(fs))) return 1;
         fit_fill_ctx fc = {gd, fs};
         g_score_pairs = atoi(opt(argc, argv, "--score-pairs", "0")) > 0;
+        if (*opt(argc, argv, "--score-z", "") && sscanf(opt(argc, argv, "--score-z", ""), "%lf,%lf", &g_score_z0, &g_score_nz) != 2) { fprintf(stderr, "fit: --score-z Z0,NZ (box-local native z)\n"); return 2; }
         const int rc = score_codes(z, cf, org, shp, h, fb.um, fb.cy, fb.cx, arg_index(argc, argv, "--score-detail") > 0, dump, fit_fill, &fc);
         fit_set_dev_free(gd); z3_close(z); if (dump) fclose(dump);
         if (rc) return 1;
@@ -1730,6 +1738,7 @@ typedef struct {   /* ufsm wraps: one wrap's rows over threads */
     const fit_set *fs; const fit_model *m; const uint8_t *wf; int wsh[3]; double wh;
     double step, Z; int na; double th0, dth; int rows, cols, k; double rk;
     float *px, *py, *pz; _Atomic int next; _Atomic size_t valid; const wr_polar *P; double zlo;
+    const double *thc;   /* --col-r arc: per column its theta (nullptr: th0 + c dth) */
 } wraps_job;
 static void *wraps_rows(void *arg) {
     wraps_job *J = arg; const fit_model *m = J->m;
@@ -1738,7 +1747,7 @@ static void *wraps_rows(void *arg) {
         double rprev = J->rk; size_t valid = 0; fit_set_row *row = fit_set_row_new(J->fs, z);
         for (int c = 0; c < J->cols; c++) {
             const size_t i = (size_t)r * J->cols + (J->cols - 1 - c);   /* column 0 = the largest theta side (upstream: outermost first) */
-            const double th = J->th0 + c * J->dth; double rr;
+            const double th = J->thc ? J->thc[c] : J->th0 + c * J->dth; double rr;
             J->px[i] = J->py[i] = J->pz[i] = -1;
             double ua, ub; wr_polar_bounds(J->P, r, th, &ua, &ub);
             if (row ? fit_set_row_root_b(row, th, J->k, rprev, ua, ub, &rr) : fit_set_ray_root_b(J->fs, z, th, J->k, rprev, ua, ub, &rr)) continue;
@@ -1780,10 +1789,34 @@ static int wrap_one(wraps_all *A, int k, int nthreads) {   /* wrap k: its rows o
         if (nr) { qsort(rr, nr, sizeof(double), wr_cmp_d); rk = rr[(int)(0.9 * (nr - 1))]; }
     }
     const double dth = step / fmax(rk, step);
-    const int cols = (int)ceil((A->th1 - A->th0) / dth) + 1;
+    int cols = (int)ceil((A->th1 - A->th0) / dth) + 1;
+    double *thcol = nullptr;
+    if (A->colr == -2) {   /* --col-r arc: columns at equal arc length along the wrap: dtheta = step / r_med(theta), r_med = the median over
+                              33 heights of the wrap's radius in each of 256 angle bins (an eccentric or off-axis wrap, e.g. the core, is
+                              sampled at its own arc, not one radius's: p90 left inner wraps up to 15x oversampled on their near side) */
+        enum { NBA = 256, NZA = 33 }; double rm[NBA], rz[NZA]; int nok = 0; const double bw = (A->th1 - A->th0) / NBA;
+        for (int b = 0; b < NBA; b++) {
+            const double th = A->th0 + (b + 0.5) * bw; int n = 0;
+            for (int a = 0; a < NZA; a++) { double r; if (!fit_set_ray_root(A->fs, A->zlo + (A->zhi - A->zlo) * a / (NZA - 1), th, k, rk, &r)) rz[n++] = r; }
+            if (n >= 3) { qsort(rz, n, sizeof(double), wr_cmp_d); rm[b] = fmax(rz[n / 2], step); nok++; } else rm[b] = NAN;
+        }
+        if (nok >= 8) {
+            for (int b = 0; b < NBA; b++) if (!isfinite(rm[b])) {   /* gaps: linear between the nearest valid bins (circular when the range is a full turn) */
+                int lo = -1, hi = -1; for (int d = 1; d < NBA && (lo < 0 || hi < 0); d++) { const int bl = (b - d + NBA) % NBA, bh = (b + d) % NBA; if (lo < 0 && isfinite(rm[bl])) lo = d; if (hi < 0 && isfinite(rm[bh])) hi = d; }
+                rm[b] = (rm[(b - lo + NBA) % NBA] * hi + rm[(b + hi) % NBA] * lo) / (lo + hi);
+            }
+            double S = 0; for (int b = 0; b < NBA; b++) S += rm[b] * bw;
+            cols = (int)ceil(S / step) + 1; thcol = malloc((size_t)cols * sizeof *thcol);
+            double s0 = 0; int b = 0;
+            for (int c = 0; c < cols; c++) {   /* invert the piecewise-linear arc s(theta); past th1 the last bin's radius extends it */
+                const double s = c * step; while (b < NBA - 1 && s0 + rm[b] * bw < s) { s0 += rm[b] * bw; b++; }
+                thcol[c] = A->th0 + b * bw + (s - s0) / rm[b];
+            }
+        }
+    }
     const size_t nv = (size_t)rows * cols;
     float *px = malloc(nv * 4), *py = malloc(nv * 4), *pz = malloc(nv * 4);
-    wraps_job J = {A->fs, m, A->wf, {A->wsh[0], A->wsh[1], A->wsh[2]}, A->wh, step, Z, na, A->th0, dth, rows, cols, k, rk, px, py, pz, 0, 0, A->P, A->zlo};
+    wraps_job J = {A->fs, m, A->wf, {A->wsh[0], A->wsh[1], A->wsh[2]}, A->wh, step, Z, na, A->th0, dth, rows, cols, k, rk, px, py, pz, 0, 0, A->P, A->zlo, thcol};
     if (nthreads > 1) {
         pthread_t th[64]; const int nt = nthreads < 64 ? nthreads : 64;
         for (int t = 0; t < nt; t++) pthread_create(&th[t], nullptr, wraps_rows, &J);
@@ -1805,7 +1838,7 @@ static int wrap_one(wraps_all *A, int k, int nthreads) {   /* wrap k: its rows o
         if (tifxyz_write(wd, cols, rows, px, py, pz, wstep, wum, k, "ufsm wraps (fitted winding level set)")) { fprintf(stderr, "wraps: cannot write %s\n", wd); rc = -1; }
         else { atomic_fetch_add(&A->nwr, 1); atomic_fetch_add(&A->nvalid, valid); }
     }
-    free(px); free(py); free(pz);
+    free(px); free(py); free(pz); free(thcol);
     return rc;
 }
 static void *wraps_worker(void *arg) {
@@ -1845,7 +1878,8 @@ static int cmd_wraps(int argc, char **argv) {
                                     "  --zr Z0,Z1: only the rows at global native z in [Z0, Z1] (the model's grid; also the z range the wrap ids are sampled in)\n"
                                     "  --first / --last K: the wrap ids exactly (default: those the box samples meet); wraps with <= 16 vertices are not written\n"
                                     "  --col-r: the radius (native voxels) whose arc the column spacing --step is: centre = the wrap's root on the box centre's ray (default),\n"
-                                    "     p90 = the 90th percentile of its roots over the rows' z range (default; wraps that leave the axis, the core), or a number\n"
+                                    "     p90 = the 90th percentile of its roots over the rows' z range (default; wraps that leave the axis, the core), arc = equal arc length\n"
+                                    "     per column at the wrap's median radius in each 1/256 turn (eccentric / core wraps sampled at their own arc), or a number\n"
                                     "  --min-cm2 C: wraps under C cm2 (vertices x (step x um)^2) are not written (default 0.5: end-cap / air fragments; 0 keeps all)\n"
                                     "  with --fields: only wrap ids within ~1 turn of a data cell are computed, largest first (UFSM_WRAPS_NOPRUNE=1: every id)\n"); return 2; }
     if (atof(opt(argc, argv, "--sfc", "0")) > 0) tifxyz_set_sfc(atof(opt(argc, argv, "--sfc", "0")));
@@ -1905,8 +1939,8 @@ static int cmd_wraps(int argc, char **argv) {
     int k0 = (int)ceil(wmin), k1 = (int)floor(wmax);   /* (the samples can miss W near the axis: --first / --last are taken as given) */
     if (*opt(argc, argv, "--first", "")) k0 = atoi(opt(argc, argv, "--first", ""));
     if (*opt(argc, argv, "--last", "")) k1 = atoi(opt(argc, argv, "--last", ""));
-    const char *cr = opt(argc, argv, "--col-r", "p90"); const double colr = !strcmp(cr, "centre") ? -1 : !strcmp(cr, "p90") ? 0 : atof(cr);
-    if (strcmp(cr, "centre") && strcmp(cr, "p90") && !(colr > 0)) { fprintf(stderr, "wraps: --col-r centre|p90|R (R > 0 native voxels)\n"); return 2; }
+    const char *cr = opt(argc, argv, "--col-r", "p90"); const double colr = !strcmp(cr, "centre") ? -1 : !strcmp(cr, "p90") ? 0 : !strcmp(cr, "arc") ? -2 : atof(cr);
+    if (strcmp(cr, "centre") && strcmp(cr, "p90") && strcmp(cr, "arc") && !(colr > 0)) { fprintf(stderr, "wraps: --col-r centre|p90|arc|R (R > 0 native voxels)\n"); return 2; }
     const int na = (int)Z + 1;
     double th0 = 1e300, th1 = -1e300; int full = 0;   /* the box's angular range around the axis */
     for (int zi = 0; zi <= 8; zi++) {
@@ -4094,6 +4128,7 @@ static int cmd_sample(int argc, char **argv) {
 
 int cmd_repack(int argc, char **argv);   /* src/repack.c */
 int cmd_fields_pack(int argc, char **argv);   /* src/fieldspack.c */
+int cmd_ink_gate(int argc, char **argv);   /* src/inkgate.c */
 int cmd_fit_join(int argc, char **argv);   /* src/fitjoin.c */
 int cmd_wrap_check(int argc, char **argv);   /* src/wrapcheck.c */
 int cmd_fields_oracle(int argc, char **argv);   /* src/fieldsoracle.c */
@@ -4183,6 +4218,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "convert-unwrap2")) return cmd_convert_unwrap2(argc, argv);
     if (!strcmp(cmd, "repack")) return cmd_repack(argc, argv);
     if (!strcmp(cmd, "fields-pack")) return cmd_fields_pack(argc, argv);
+    if (!strcmp(cmd, "ink-gate")) return cmd_ink_gate(argc, argv);
     if (!strcmp(cmd, "phase-raster")) return cmd_phase_raster(argc, argv);
     if (!strcmp(cmd, "wraps")) return cmd_wraps(argc, argv);
     if (!strcmp(cmd, "stitch")) return cmd_stitch(argc, argv);
@@ -4246,6 +4282,8 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "refine")) return cmd_refine(argc, argv);
     if (!strcmp(cmd, "surf-stats")) return cmd_surf_stats(argc, argv);
     if (!strcmp(cmd, "wrap-snap")) return cmd_wrap_snap(argc, argv);
+    if (!strcmp(cmd, "surf-labels")) return cmd_surf_labels(argc, argv);
+    if (!strcmp(cmd, "geom-check")) return cmd_geom_check(argc, argv);
     if (!strcmp(cmd, "wrap-match")) return cmd_wrap_match(argc, argv);
     if (!strcmp(cmd, "ink-cover")) return cmd_ink_cover(argc, argv);
     if (!strcmp(cmd, "self-gate")) return cmd_self_gate(argc, argv);
