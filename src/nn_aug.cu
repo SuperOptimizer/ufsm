@@ -524,7 +524,26 @@ __global__ void lw_w4_k(const uint8_t *w4, const uint8_t *cp, uint8_t *dw, uint8
     }
     dw[k] = ow; dc[k] = oc;
 }
-/* one window's labels of one kind (0 packed targets / mask: a_h -> da, and db (optional) the pmask plane; 1 phase: a_h -> da; 2 winding mod 4 and component: a_h, b_h ->
+/* the ink plane (train --ink-head, prob254, 255 unknown): trilinear over the corners when every corner of weight > 1e-7 is known, else
+   unknown; outside unknown (sample.c sample_warp_ink) */
+__global__ void lw_ink_k(const uint8_t *src, uint8_t *dst, int P, const float *rad) {
+    const size_t n = (size_t)P * P * P, k = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (k >= n) return;
+    size_t b0; float F[3]; uint8_t out = 255;
+    if (lw_coords(rad, P, k, &b0, F)) {
+        float acc = 0.f; int ok = 1;
+        for (int cn = 0; cn < 8; cn++) {
+            const float w = lw_w(F, cn);
+            if (!(w > 1e-7f)) continue;
+            const int q = src[b0 + lw_off(P, cn)];
+            if (q == 255) { ok = 0; break; }
+            acc = fa(acc, fm(w, (float)q));
+        }
+        if (ok) { const int q = __float2int_rn(acc); out = (uint8_t)(q < 0 ? 0 : q > 254 ? 254 : q); }
+    }
+    dst[k] = out;
+}
+/* one window's labels of one kind (0 packed targets / mask: a_h -> da, and db (optional) the pmask plane; 1 phase: a_h -> da; 3 ink plane: a_h -> da; 2 winding mod 4 and component: a_h, b_h ->
    da, db) from the pinned host source labels, warped by rad_d (the window's radial record, on the device); cs_h / sn_h: the phase
    codes' cos / sin (PHASE_PERIOD floats, sample.c g_wcs / g_wsn). Shares nn_aug_ct's staging buffer (2 P^3 with labels) and its order */
 extern "C" void nn_label_warp(int kind, const uint8_t *a_h, const uint8_t *b_h, const void *rad_d, int P, uint8_t *da, uint8_t *db,
@@ -540,6 +559,7 @@ extern "C" void nn_label_warp(int kind, const uint8_t *a_h, const uint8_t *b_h, 
     const unsigned nb = nblk(p3, 256); const float *rad = (const float *)rad_d;
     if (kind == 0) lw_tm_k<<<nb, 256, 0, s>>>(a->stage, da, db, P, rad);   /* (db: the pmask plane, or nullptr) */
     else if (kind == 1) lw_phase_k<<<nb, 256, 0, s>>>(a->stage, da, P, rad, a->cssn, a->cssn + 256);
+    else if (kind == 3) lw_ink_k<<<nb, 256, 0, s>>>(a->stage, da, P, rad);   /* (the ink plane) */
     else lw_w4_k<<<nb, 256, 0, s>>>(a->stage, a->stage + p3, da, db, P, rad, a->cssn, a->cssn + 256);
     CK(cudaEventRecord(a->done, s)); a->used = 1;
     KCHECK();

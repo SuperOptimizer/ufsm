@@ -464,6 +464,14 @@ __global__ void phase_tg_k(const uint8_t *ph, size_t n, uint8_t *t, uint8_t *m) 
     t[i] = (uint8_t)__float2int_rn(127.5f + 127.5f * cs); t[n + i] = (uint8_t)__float2int_rn(127.5f + 127.5f * sn); m[i] = 1;
 }
 extern "C" void nn_phase_targets(const uint8_t *phase, size_t n, uint8_t *t, uint8_t *m) { phase_tg_k<<<nblk(n, 256), 256>>>(phase, n, t, m); KCHECK(); }
+/* train --ink-head: the ink plane (prob254, 255 unknown) -> target t = p x 255 ((v x 255 + 127) / 254, the sampler's encode) and mask m (known) */
+__global__ void ink_tg_k(const uint8_t *ink, size_t n, uint8_t *t, uint8_t *m) {
+    const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const unsigned v = ink[i];
+    t[i] = v == 255u ? 0 : (uint8_t)(v + (v >= 127u)); m[i] = v != 255u;
+}
+extern "C" void nn_ink_targets(const uint8_t *ink, size_t n, uint8_t *t, uint8_t *m) { ink_tg_k<<<nblk(n, 256), 256>>>(ink, n, t, m); KCHECK(); }
 /* --cond: the winding mod 14 turns in 1/18-turn steps (band.h band_winding, 0..251, 255 unknown) -> 4 target planes, cos / sin of
    2 pi q / 14 and of 2 pi q / 2 (q = v / 18 turns), each 127.5 + 127.5 x; mask = known */
 __global__ void cond_tg_k(const uint8_t *wv, size_t n, uint8_t *t, uint8_t *m) {

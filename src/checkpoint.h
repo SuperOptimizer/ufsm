@@ -17,3 +17,4 @@ char *checkpoint_header_line(const char *path);
 /* the task unwrap layout of a checkpoint: 2 task unwrap2 (0-1 phase, 2-7 normal, 8 density, 9-10 winding mod 4), 1 task unwrap
    (0 recto, 1 ink, 2-3 phase, 4-9 normal, 10 density), 0 neither / unreadable */
 int checkpoint_unwrap_version(const char *path);
+int checkpoint_ink_channel(const char *path);   /* task unwrap2 --ink-head checkpoints: the ink output channel (11), else -1 */

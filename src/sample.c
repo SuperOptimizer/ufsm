@@ -224,11 +224,12 @@ static batch alloc_batch(const sample_cfg *c) {
     b.pap = c->pap_head ? halloc((size_t)c->B * p3) : nullptr;
     b.w4 = c->wind4 ? halloc((size_t)c->B * p3) : nullptr;
     b.wcomp = c->wind4 ? halloc((size_t)c->B * p3) : nullptr;
+    b.ink = c->ink_plane ? halloc((size_t)c->B * p3) : nullptr;
     b.emb = c->emb_ch ? halloc((size_t)c->B * c->emb_ch * (size_t)(PZ(c) / c->emb_div) * (c->P / c->emb_div) * (c->P / c->emb_div)) : nullptr;
     return b;
 }
 
-static void free_batch(batch *b) { if (b->ct8) hfree(b->ct8); if (b->aug) hfree(b->aug); if (b->emb) hfree(b->emb); if (b->xv) hfree(b->xv); free(b->vok); free(b->chid); free(b->chidx); free(b->choff); if (b->w4) hfree(b->w4); if (b->wcomp) hfree(b->wcomp); if (b->tm) hfree(b->tm); if (b->rad) hfree(b->rad); if (b->axr) hfree(b->axr); if (b->pap) hfree(b->pap); if (b->wind) hfree(b->wind); if (b->band) hfree(b->band); if (b->side) hfree(b->side); if (b->pm) hfree(b->pm); if (b->x) hfree(b->x); if (b->x16) hfree(b->x16); if (b->t) hfree(b->t); if (b->m) hfree(b->m); hfree(b->w); free(b->src); free(b->level); free(b->um); free(b->corner); if (b->sheet) { sheet_batch_free(b->sheet[0]); free(b->sheet); } }
+static void free_batch(batch *b) { if (b->ink) hfree(b->ink); if (b->ct8) hfree(b->ct8); if (b->aug) hfree(b->aug); if (b->emb) hfree(b->emb); if (b->xv) hfree(b->xv); free(b->vok); free(b->chid); free(b->chidx); free(b->choff); if (b->w4) hfree(b->w4); if (b->wcomp) hfree(b->wcomp); if (b->tm) hfree(b->tm); if (b->rad) hfree(b->rad); if (b->axr) hfree(b->axr); if (b->pap) hfree(b->pap); if (b->wind) hfree(b->wind); if (b->band) hfree(b->band); if (b->side) hfree(b->side); if (b->pm) hfree(b->pm); if (b->x) hfree(b->x); if (b->x16) hfree(b->x16); if (b->t) hfree(b->t); if (b->m) hfree(b->m); hfree(b->w); free(b->src); free(b->level); free(b->um); free(b->corner); if (b->sheet) { sheet_batch_free(b->sheet[0]); free(b->sheet); } }
 
 /* Level choice for a source: restrict cfg.level_p to levels the CT has and every target of the source
    can provide (pyramid: same level; regions: levels 0..1). Returns -1 if nothing is usable. */
@@ -1774,6 +1775,34 @@ static void warp_phase_w4(const uint8_t *ph, const uint16_t *wq, uint8_t *dph, u
     free(pp);
 }
 static void warp_w4_pack(const uint8_t *w4, const uint8_t *cp, uint16_t *wq, size_t n) { for (size_t k = 0; k < n; k++) wq[k] = (uint16_t)(w4[k] | cp[k] << 8); }
+/* train --ink-head (cfg.ink_plane): the ink prob254 plane of a warped window, pulled through the warp as warp_pw_voxel pulls the phase:
+   trilinear over the 8 corners when every corner of weight > 1e-7 is known (< 255), else unknown (255); outside unknown. The weights
+   ((wz * wy) * wx) and the sum in corner order, rounded to nearest: nn_aug.cu lw_ink_k makes the same bytes */
+void sample_warp_ink(const uint8_t *src, uint8_t *dst, int P, const int perm[3], const int flip[3], const void *spatial) {
+    const spatial_aug *a = spatial;
+    float *table = malloc(6 * (size_t)P * sizeof *table); if (!table) abort();
+    spatial_aug_tables(a, table);
+    for (int z = 0; z < P; z++) for (int y = 0; y < P; y++) for (int x = 0; x < P; x++) {
+        const size_t k = ((size_t)z * P + y) * P + x;
+        float u[3], jac[3], v[3]; spatial_aug_pull(a, table, z, y, x, u, jac);
+        for (int d = 0; d < 3; d++) v[perm[d]] = flip[d] ? (float)(P - 1) - u[d] : u[d];
+        int inside = 1; for (int d = 0; d < 3; d++) if (!(v[d] >= 0.f && v[d] <= (float)(P - 1))) inside = 0;
+        dst[k] = 255;
+        if (!inside) continue;
+        int base[3]; float f[3];
+        for (int d = 0; d < 3; d++) { base[d] = (int)v[d]; if (base[d] > P - 2) base[d] = P - 2; f[d] = v[d] - (float)base[d]; }
+        float acc = 0.f; int ok = 1;
+        for (int c = 0; c < 8 && ok; c++) {
+            const int bz = c >> 2 & 1, by = c >> 1 & 1, bx = c & 1;
+            const float w = ((bz ? f[0] : 1.f - f[0]) * (by ? f[1] : 1.f - f[1])) * (bx ? f[2] : 1.f - f[2]);
+            if (!(w > 1e-7f)) continue;
+            const int q = src[((size_t)(base[0] + bz) * P + base[1] + by) * P + base[2] + bx];
+            if (q == 255) ok = 0; else acc += w * (float)q;
+        }
+        if (ok) { const int q = (int)lrintf(acc); dst[k] = (uint8_t)(q < 0 ? 0 : q > 254 ? 254 : q); }
+    }
+    free(table);
+}
 [[maybe_unused]] static void warp_w4(const uint8_t *w4, const uint8_t *cp, uint8_t *dw, uint8_t *dc, int P, sym sy, const spatial_aug *a) {
     const size_t p3 = (size_t)P * P * P; uint16_t *wq = malloc(p3 * 2); if (!wq) abort();
     warp_w4_pack(w4, cp, wq, p3);
@@ -2331,7 +2360,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
         !c->phase_dense && s->phase) {
         const int psh = s->phase_level - l;
         int ok = psh == 1 || (psh == 0 && s->phase_direct);
-        for (int ch = 0; ch < NCH; ch++) ok &= !s->tgt_key[ch];
+        for (int ch = 0; ch < NCH; ch++) ok &= !s->tgt_key[ch] || (c->ink_plane && ch == CH_SHEET);   /* (the ink plane: unknown on these windows) */
         if (ok && c->crush.p > 0 && runif(r) < c->crush.p && (crushed = crush_draw(sp, s, l, o, P, psh, r, big + p3, 8 * p3, ctu)) < 0) return -1;
         if (ok && !crushed && c->tear_p > 0 && runif(r) < c->tear_p && (torn = tear_draw(sp, s, l, o, P, psh, r, ctu)) < 0) return -1;
         if (ok && !crushed && !torn && c->delam_p > 0 && runif(r) < c->delam_p && (delam = delam_draw(sp, s, l, o, P, psh, r, ctu)) < 0) return -1;
@@ -2373,12 +2402,26 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
         tp_put(pm, p3);
     }
     /* targets */
+    static _Thread_local uint8_t *inkw_tl; static _Thread_local size_t inkw_n;   /* --ink-head: the window's ink plane (a worker's own buffer) */
+    uint8_t *inkw = nullptr;
+    if (c->ink_plane) {
+        if (inkw_n < p3) { free(inkw_tl); inkw_tl = malloc(p3); inkw_n = inkw_tl ? p3 : 0; }
+        inkw = inkw_tl;
+    }
     uint8_t w[NCH] = {0};
     int tmax = 0;
     for (int ch = 0; ch < NCH; ch++) {
         uint8_t *dst = ttmp + (size_t)ch * p3;
         if (c->papyrus) { memset(dst, 0, p3); continue; }   /* task papyrus: labels from the CT below */
-        if (ch == CH_SHEET && s->tgt_side[CH_RECTO]) continue;   /* the verso side: written with the recto side below */
+        if (c->ink_plane && ch == CH_SHEET) {   /* --ink-head: the source's "ink" target onto its own plane (prob254 as stored), not a channel */
+            memset(dst, 0, p3);
+            if (!inkw) { fprintf(stderr, "sampler: no ink plane buffer\n"); return -1; }
+            z3 *tz = s->tgt_key[ch] && s->tgt_prob[ch] && !crushed && !torn && !delam && !curved ? source_tgt_for_level(s, ch, l, nullptr) : nullptr;
+            if (!tz) memset(inkw, 255, p3);
+            else if (source_read_target(s, ch, l, o, n, inkw, 1)) return -1;
+            continue;
+        }
+        if (ch == CH_SHEET && s->tgt_side[CH_RECTO]) continue;  /* the verso side: written with the recto side below */
         if (ch == region_ch) {
             z3 *rz = source_region(s, ch, ri);
             if (!rz) return -1;
@@ -2655,6 +2698,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
     if (s->norm_s > 0) { mean = s->norm_c; sd = s->norm_s; }   /* "norm": the scan's fixed normalisation (ufsm scanprep median / scale) instead of the window z-score */
     uint8_t *mask = big + 9 * p3;   /* ign lives here: fold CT > 0 into it */
     for (size_t k = 0; k < p3; k++) mask[k] = (ctu[k] != 0) & (mask[k] == 0);
+    if (inkw) for (size_t k = 0; k < p3; k++) if (!mask[k]) inkw[k] = 255;   /* --ink-head: unknown on CT 0 and where the scanner augmentation ignores labels */
     PROF_MARK(PS_ZSCORE);
     /* packed targets (cfg.pack_tm): unwarped samples pack the code in the source frame over the mask (one symmetry copy into the batch);
        warped ones warp into pooled scratch and pack after */
@@ -2807,6 +2851,12 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
         }
     }
     if (c->wind4 && !w4_set) { memset(b->w4 + (size_t)i * p3, 255, p3); memset(b->wcomp + (size_t)i * p3, 255, p3); }
+    if (inkw) {   /* --ink-head: the ink plane through the symmetry / warp (--gpu-aug 2 warped windows: the source grid, warped on the device) */
+        uint8_t *bi = b->ink + (size_t)i * p3;
+        if (lw) memcpy(bi, inkw, p3);
+        else if (spatial.active) sample_warp_ink(inkw, bi, P, y.perm, y.flip, &spatial);
+        else sym_u8(inkw, bi, Pz, P, y);
+    }
     if (c->emb_ch) {   /* train --distill: the feature targets through the same symmetry and warp (none on crushed / torn / re-bent windows) */
         const size_t ge = (size_t)(Pz / c->emb_div) * (P / c->emb_div) * (P / c->emb_div);
         int8_t *eo = b->emb + (size_t)i * c->emb_ch * ge;
@@ -2857,6 +2907,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
                                                  targets only draw anywhere in the scroll): rejected */
         const uint8_t *sd = b->side + (size_t)i * p3; size_t kn = 0;
         for (size_t k = 0; k < p3; k++) kn += sd[k] < PHASE_PERIOD;
+        if (inkw) { const uint8_t *ik = b->ink + (size_t)i * p3; for (size_t k = 0; k < p3; k++) kn += ik[k] != 255; }   /* (--ink-head: known ink supervises too: ink-only sources draw) */
         if ((double)kn < c->min_phase * (double)p3) { if (Tw) tp_put(Tw, (NCH + 1) * p3); atomic_fetch_add(&sp->rejected, 1); atomic_fetch_add(&sp->rej_why[2], 1); return 1; }   /* (counted as empty targets) */
     }
     if (c->emb_ch && s->ct_only) {   /* an unlabelled ("ct_only") source supervises only the distillation: windows with < 25% of the head cells targeted are redrawn */

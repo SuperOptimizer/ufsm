@@ -17,6 +17,12 @@ int checkpoint_unwrap_version(const char *path) {
     const int v = strstr(h, "\"unwrap\":{\"version\":2") ? 2 : strstr(h, "\"unwrap\":{\"version\":1") ? 1 : 0;
     free(h); return v;
 }
+int checkpoint_ink_channel(const char *path) {   /* train --task unwrap2 --ink-head: the "ink" channel of the unwrap2 layout, else -1 */
+    char *h = checkpoint_header_line(path); if (!h) return -1;
+    const char *u = strstr(h, "\"unwrap\":{\"version\":2"), *k = u ? strstr(u, "\"ink\":") : nullptr;
+    const int c = k ? atoi(k + 6) : -1;
+    free(h); return c;
+}
 
 static int valid(const checkpoint_runtime *r) {
     return r->version == 1 && r->train_window > 0 && r->prec >= 0 && r->prec <= 4 &&

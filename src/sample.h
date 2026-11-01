@@ -127,6 +127,10 @@ typedef struct {
                                 kept as separate gauges); warped samples pull it through the warp within one component */
     int wind4_step, wind4_min;   /* band_wind4's maxstep (phase codes; 0: 80 = 0.32 turn) and minsize (voxels; 0: 512) */
     int wind4_tile;          /* band_wind4_tiled's tile edge (at least P / 6: <= 216 tiles, one gauge each); < 0 the whole window */
+    int ink_plane;           /* train --task unwrap2 --ink-head 1: batch.ink, the source's "ink" target (targets.ink, prob254: p * 254, 255 unknown)
+                                on its own plane, not in the target channels (whose packed form stays hard); unknown where CT 0, where the
+                                scanner augmentation ignores labels and on crushed / torn / delaminated / re-bent windows; warped windows
+                                pull it trilinearly over known corners (all corners of weight > 1e-7 known, else unknown) */
     int restore;             /* 2: real SR pairs (sources with "sr_pair", src/srpair.h): batch.t row = [target P^3 (through the pair's intensity map) |
                                 the native input crop (P / 4)^3], both under one symmetry and tone LUT. 1, task restore: no target reads; batch.t holds the clean CT window alone (B x P^3, tone LUT and symmetry applied),
                                 batch.x / x16 and batch.m are absent (the trainer degrades the window on the device); training windows lie inside a
@@ -141,6 +145,7 @@ typedef struct {
 int sample_gpu_input_ok(const sample_cfg *c);
 int sample_gpu_aug_ok(const sample_cfg *c);   /* train --gpu-aug possible with this configuration (needs gpu_input) */
 int sample_gpu_lwarp_ok(const sample_cfg *c);   /* train --gpu-aug 2 possible (sample_gpu_aug_ok, packed targets, no sheet / gap / distill / cond / band / aux labels; pmask: from the packed mask bit) */
+void sample_warp_ink(const uint8_t *src, uint8_t *dst, int P, const int perm[3], const int flip[3], const void *spatial);   /* cfg.ink_plane: a warped window's ink plane (src: the source grid) */
 void sample_phase_cssn(const float **cs, const float **sn);   /* the phase codes' cos / sin (PHASE_PERIOD floats; the warps' tables) */
 
 typedef struct {
@@ -160,6 +165,7 @@ typedef struct {
     uint8_t *wind;           /* B x P^3 winding mod 14 + gauge (band.h band_winding encoding, 255 unknown) when cfg.cond */
     uint8_t *pap;            /* B x P^3 papyrus labels when cfg.pap_head: 0 void, 1 papyrus, 255 ignored */
     uint8_t *w4, *wcomp;     /* B x P^3 each when cfg.wind4: winding mod 4 (63 codes per turn, 255 unknown) and its component (0..14, 255 none) */
+    uint8_t *ink;            /* B x P^3 when cfg.ink_plane: ink prob254 (0..254, 255 unknown) */
     void *rad;               /* cfg.gpu_input: B radial records of NN_RAD_REC(Pz) bytes (nn.h), x / x16 then one channel per sample */
     uint8_t *ct8;            /* cfg.gpu_aug: B x P^3 source-grid CT bytes (sample.h gpu_aug), else nullptr */
     void *aug;               /* cfg.gpu_aug: B scan_ct_rec (scan_augment.h) */

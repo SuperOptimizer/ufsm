@@ -50,6 +50,7 @@ typedef struct {
     char *ct_key;
     double um;              /* level-0 voxel size */
     double weight;
+    double ink_weight;   /* "ink_weight" (default 1): train --ink-head, this source's ink loss x the factor (e.g. pseudo labels < human) */
     int min_level;    /* training never draws levels below this (e.g. 1 for a 1.1 um scan whose level 0 is finer than the others) */
     int max_level;    /* ... nor above this (-1: no limit); e.g. a teacher target whose coarser levels are only downsampled copies */
     int geometry;     /* 0: never spatially augmented (zoom / rotation / elastic) */

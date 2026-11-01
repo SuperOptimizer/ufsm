@@ -3730,12 +3730,26 @@ void unet_clip_grad(unet *u, double max_norm) {
 static void wq_adamw(unet *u, float lr, float b1, float b2, float eps, float wd, int step);
 static void wq_ema(unet *u, float decay);
 static int trunk_lr_on(const unet *u);
+/* unet_set_trunk_lr on a net without an attention stage: everything but the 1^3 head (weights and bias) at trunk_lr x the rates, the
+   head at the full rates (train --trunk-lr-mult F [--trunk-lr-steps N]: a new head on a warm-started trunk) */
+static int head_lr_mode(const unet *u) { return !u->tbn && u->trunk_lr > 0.f && u->trunk_lr != 1.f; }
+static void head_split_adamw(unet *u, size_t off, size_t n, float lr, float b1, float b2, float eps, float wd, int step) {
+    const size_t hw0 = u->head.w, hw1 = hw0 + (size_t)u->head.cout * u->head.cin * u->head.k * u->head.k * u->head.k, hb0 = u->head.b, hb1 = hb0 + (size_t)u->head.cout;
+    const size_t cut[4] = {hw0, hw1, hb0, hb1};
+    for (size_t pos = off, end = off + n; pos < end;) {
+        size_t e = end; for (int k = 0; k < 4; k++) if (cut[k] > pos && cut[k] < e) e = cut[k];
+        const int head = (pos >= hw0 && pos < hw1) || (pos >= hb0 && pos < hb1);
+        nn_adamw(u->p + pos, u->g + pos, u->m + pos, u->v + pos, e - pos, head ? lr : lr * u->trunk_lr, b1, b2, eps, wd, step);
+        pos = e;
+    }
+}
 void unet_adamw(unet *u, float lr, float b1, float b2, float eps, float wd, int step) {
     if (u->wq) wq_adamw(u, lr, b1, b2, eps, wd, step);
     else if (trunk_lr_on(u)) {   /* the trunk [0, tb_p0) at trunk_lr x lr, the stage at lr */
         nn_adamw(u->p, u->g, u->m, u->v, u->tb_p0, lr * u->trunk_lr, b1, b2, eps, wd, step);
         nn_adamw(u->p + u->tb_p0, u->g + u->tb_p0, u->m + u->tb_p0, u->v + u->tb_p0, u->np - u->tb_p0, lr, b1, b2, eps, wd, step);
-    } else nn_adamw(u->p, u->g, u->m, u->v, u->np, lr, b1, b2, eps, wd, step);
+    } else if (head_lr_mode(u)) head_split_adamw(u, 0, u->np, lr, b1, b2, eps, wd, step);
+    else nn_adamw(u->p, u->g, u->m, u->v, u->np, lr, b1, b2, eps, wd, step);
 }
 static void for_each_conv3(unet *u, void (*fn)(unet *, const convp *, void *), void *arg);
 static void for_each_mat(unet *u, void (*fn)(unet *, const convp *, void *), void *arg);   /* the Muon matrices: the 3^3 convs + the attention linears */
@@ -3765,6 +3779,7 @@ typedef struct { float lr, b1, b2, eps, wd; int step; } adam_arg;
 static int trunk_lr_on(const unet *u) { return u->tbn && u->trunk_lr > 0.f && u->trunk_lr != 1.f; }
 static void plain_adamw(unet *u, size_t off, size_t n, void *arg) {
     adam_arg *a = arg;
+    if (head_lr_mode(u)) { head_split_adamw(u, off, n, a->lr, a->b1, a->b2, a->eps, a->wd, a->step); return; }
     if (trunk_lr_on(u) && off < u->tb_p0) {   /* the trunk part at trunk_lr x lr, the stage's part (if the range reaches it) at lr */
         const size_t nt = off + n <= u->tb_p0 ? n : u->tb_p0 - off;
         nn_adamw(u->p + off, u->g + off, u->m + off, u->v + off, nt, a->lr * u->trunk_lr, a->b1, a->b2, a->eps, a->wd, a->step);
@@ -3872,6 +3887,7 @@ static void muon_ext(unet *u, const muon_build_t *b, float lr, float beta, float
                       u->mx_hb ? u->mx_hbf : nullptr, u->mx_R, r_init, u->mx_part, lr, beta, wd, u->mx_hb_mult * lr);
 }
 void unet_muon(unet *u, float lr_muon, float beta, float lr_adam, float b1, float b2, float eps, float wd, int step) {
+    if (head_lr_mode(u)) lr_muon *= u->trunk_lr;   /* (the 3^3 convs: all trunk; the head is on AdamW) */
     if (u->wq) { unet_adamw(u, lr_adam, b1, b2, eps, wd, step); return; }   /* packed weights: AdamW only */
     if (!u->muon_mom) { u->muon_mom = nn_malloc(u->np * 4); nn_zero(u->muon_mom, u->np * 4); }
     if (u->tbn && (u->mx_c || u->mx_hb)) { fprintf(stderr, "unet: Muon-C / Hyperball do not cover the attention blocks' linear layers\n"); abort(); }
@@ -4528,6 +4544,16 @@ void unet_zero_head(unet *u) {
     nn_wmemo_clear();
     float *arr[] = {u->p, u->ema, u->m, u->v};
     for (int i = 0; i < 4; i++) { nn_zero(arr[i] + u->head.w, (size_t)u->head.cin * u->head.cout * u->head.k * u->head.k * u->head.k * sizeof(float)); nn_zero(arr[i] + u->head.b, (size_t)u->head.cout * sizeof(float)); }
+}
+void unet_head_row_reset(unet *u, int co, float bias) {   /* head output row co: zero weights, bias (live, EMA; moments 0): a fresh head on a warm trunk */
+    if (co < 0 || co >= u->head.cout) return;
+    nn_wmemo_clear();
+    const size_t row = (size_t)u->head.cin * u->head.k * u->head.k * u->head.k;
+    float *arr[] = {u->p, u->ema, u->m, u->v};
+    for (int i = 0; i < 4; i++) {
+        nn_zero(arr[i] + u->head.w + (size_t)co * row, row * sizeof(float));
+        const float b = i < 2 ? bias : 0.f; nn_h2d(arr[i] + u->head.b + co, &b, sizeof b);
+    }
 }
 void unet_head_bias_zero(unet *u) {   /* the head bias (live, EMA, moments) to 0: embedding heads (unet_init's -2 bias would align every output) */
     nn_wmemo_clear();

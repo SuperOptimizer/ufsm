@@ -132,6 +132,7 @@ sources *sources_load(const char *path) {
         s->ct_key = sdup(json_str(json_get(e, "ct"), ""));
         s->um = json_num(json_get(e, "um"), 0);
         s->weight = json_num(json_get(e, "weight"), 1.0);
+        s->ink_weight = json_num(json_get(e, "ink_weight"), 1.0);
         s->trust_band = (int)json_num(json_get(e, "trust_band"), 0);
         s->iso = (int)json_num(json_get(e, "iso"), 0);
         s->pap_level = (int)json_num(json_get(e, "papyrus"), s->iso);

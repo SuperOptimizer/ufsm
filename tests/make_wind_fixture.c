@@ -10,7 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-static int fx_N;
+static int fx_N, fx_ink;   /* fx_ink: also DIR/ink (level 0, prob254) and DIR/sources-ink.json (make_wind_fixture DIR N q 1) */
 static void fx_axis_at(double z, double *cy, double *cx) { *cy = .5 * fx_N + .03 * (z - .5 * fx_N); *cx = .5 * fx_N - .02 * (z - .5 * fx_N); }
 static double fx_wind(double z, double y, double x) {   /* winding number (turns) of a point; fx_N voxels at level 0 */
     double cy, cx; fx_axis_at(z, &cy, &cx);
@@ -104,6 +104,23 @@ static int make_wind_fixture(const char *D, int n_, float q) {
         snprintf(p, sizeof p, "%s/phase2/2", D); if (fx_write_arr(p, gs, 0.f, PHASE_UNKNOWN, fx_cut, &c2)) return 1;
         free(p2);
     }
+    if (fx_ink) {   /* train --ink-head: an ink target on the level-0 grid (prob254, the ink-splat encoding): ink (254) on the recto half of the sheets
+           (winding fraction < .15) in stripes along z and around the axis, 0 elsewhere; unknown (255) in the upper half (z >= N / 2) */
+        const size_t N0 = (size_t)fx_N; uint8_t *ik = malloc(N0 * N0 * N0);
+        if (!ik) return 1;
+        for (size_t z = 0; z < N0; z++) for (size_t y = 0; y < N0; y++) for (size_t x = 0; x < N0; x++) {
+            double cy, cx; fx_axis_at((double)z, &cy, &cx);
+            const double w = fx_wind((double)z, (double)y, (double)x), f = w - floor(w), th = atan2((double)y - cy, (double)x - cx);
+            const int stripe = (((int)(z / 12) + (int)((th + M_PI) * 6)) & 1) == 0;
+            ik[(z * N0 + y) * N0 + x] = z >= N0 / 2 ? 255 : f < .15 && stripe && fx_ct_at((int)z, (int)y, (int)x) ? 254 : 0;
+        }
+        char nm[64]; z3w_level_name(9.6, nm, sizeof nm); snprintf(p, sizeof p, "%s/ink/%s", D, nm);
+        const int64_t s0[3] = {(int64_t)N0, (int64_t)N0, (int64_t)N0}; fx_volctx ci = {ik, (int64_t)N0};
+        if (fx_write_arr(p, s0, 0.f, 255, fx_cut, &ci)) return 1;
+        free(ik);
+        const double u0 = 9.6; snprintf(p, sizeof p, "%s/ink", D);
+        if (z3w_write_group(p, &u0, 1, "ink", nullptr)) return 1;
+    }
     snprintf(p, sizeof p, "%s/axis.json", D); FILE *f = fopen(p, "w"); if (!f) return 1;
     fprintf(f, "{\"control_points\": [");
     for (int i = 0; i <= 8; i++) { const double z = (double)fx_N * i / 8; double cy, cx; fx_axis_at(z, &cy, &cx); fprintf(f, "%s{\"z\": %g, \"y\": %g, \"x\": %g}", i ? ", " : "", z, cy, cx); }
@@ -112,6 +129,12 @@ static int make_wind_fixture(const char *D, int n_, float q) {
     fprintf(f, "{\"sources\": [{\"name\": \"wind-fixture\", \"root\": \"%s\", \"ct\": \"ct\", \"um\": 9.6, \"axis\": \"%s/axis.json\", \"weight\": 1,\n"
                "  \"targets\": {\"band\": {\"root\": \"%s/band\", \"key\": \"1\", \"radius\": 80, \"span\": 75, \"phase\": {\"root\": \"%s/phase\", \"key\": \"1\", \"level\": 1}}}}]}\n", D, D, D, D);
     fclose(f);
+    if (fx_ink) {   /* train --ink-head: + the ink target */
+    snprintf(p, sizeof p, "%s/sources-ink.json", D); f = fopen(p, "w"); if (!f) return 1;
+    fprintf(f, "{\"sources\": [{\"name\": \"wind-fixture-ink\", \"root\": \"%s\", \"ct\": \"ct\", \"um\": 9.6, \"axis\": \"%s/axis.json\", \"weight\": 1, \"ink_weight\": 1,\n"
+               "  \"targets\": {\"ink\": {\"root\": \"%s/ink\", \"group\": \".\", \"encoding\": \"prob254\"},\n"
+               "               \"band\": {\"root\": \"%s/band\", \"key\": \"1\", \"radius\": 80, \"span\": 75, \"phase\": {\"root\": \"%s/phase\", \"key\": \"1\", \"level\": 1}}}}]}\n", D, D, D, D, D);
+    fclose(f); }
     snprintf(p, sizeof p, "%s/sources2.json", D); f = fopen(p, "w"); if (!f) return 1;   /* + a holdout box, the phase at level 2 */
     fprintf(f, "{\"sources\": [{\"name\": \"wind-fixture2\", \"root\": \"%s\", \"ct\": \"ct\", \"um\": 9.6, \"axis\": \"%s/axis.json\", \"weight\": 1,\n"
                "  \"holdout\": [0, 0, 0, %d, %d, %d],\n"
@@ -122,7 +145,8 @@ static int make_wind_fixture(const char *D, int n_, float q) {
 }
 #ifndef WIND_FIXTURE_NO_MAIN
 int main(int argc, char **argv) {
-    if (argc < 2) { fprintf(stderr, "usage: make_wind_fixture DIR [N 1024] [q 2]\n"); return 2; }
+    if (argc < 2) { fprintf(stderr, "usage: make_wind_fixture DIR [N 1024] [q 2] [ink 0]\n"); return 2; }
+    fx_ink = argc > 4 && atoi(argv[4]);
     return make_wind_fixture(argv[1], argc > 2 ? atoi(argv[2]) : 1024, argc > 3 ? (float)atof(argv[3]) : 2.f);
 }
 #endif
