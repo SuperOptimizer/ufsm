@@ -44,6 +44,9 @@ static pa_cell *pa_sort(pa_cell *c, pa_cell *tmp, size_t N) {
     free(cnt);
     return c;
 }
+static const float *pa_cy, *pa_cx; static int pa_na; static size_t pa_dir[64][3][2];   /* pa_set_axis: pairs split by direction */
+void pa_set_axis(const float *cy, const float *cx, int na) { pa_cy = cy; pa_cx = cx; pa_na = na; memset(pa_dir, 0, sizeof pa_dir); }
+void pa_dir_get(int k, size_t n[3], size_t right[3]) { for (int c = 0; c < 3; c++) { n[c] = k < 64 ? pa_dir[k][c][0] : 0; right[c] = k < 64 ? pa_dir[k][c][1] : 0; } }
 typedef struct { const pa_buf *b; const double *dist; size_t npairs; uint64_t seed; double *acc, *acc_cross; size_t *n, *n_cross; int k; } pa_job;
 static void *pa_one(void *a) {   /* distance k: its own cell table and random stream (the same values as the serial loop) */
     const pa_job *J = a; const pa_buf *b = J->b; const size_t N = b->n; const int k = J->k; const size_t npairs = J->npairs;
@@ -68,6 +71,11 @@ static void *pa_one(void *a) {   /* distance k: its own cell table and random st
         if (r < 0.75 * D || r > 1.25 * D) continue;
         double w = u->d - v->d; w -= 14 * round(w / 14); const int ok = fabs(w) < 0.5;
         got++; right += ok; if (u->q != v->q) { gc++; rc += ok; }
+        if (pa_cy && k < 64) {   /* direction class at u: 0 radial, 1 tangential, 2 z (the largest component) */
+            const int ai = (int)fmin(pa_na - 1, fmax(0, u->p[0])); double ry = u->p[1] - pa_cy[ai], rx = u->p[2] - pa_cx[ai]; const double rl = hypot(ry, rx);
+            if (rl > 1) { ry /= rl; rx /= rl; const double ar = fabs(dy * ry + dx * rx), at = fabs(-dy * rx + dx * ry), az = fabs(dz);
+                          const int cl = ar >= at && ar >= az ? 0 : at >= az ? 1 : 2; pa_dir[k][cl][0]++; pa_dir[k][cl][1] += ok; }
+        }
     }
     J->n[k] = got; J->n_cross[k] = gc;
     if (got) J->acc[k] = (double)right / got;

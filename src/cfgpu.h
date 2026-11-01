@@ -14,7 +14,7 @@ extern "C" {
 
 typedef struct {
     int H, W, P, hh, w, na; double h; const float *cy, *cx;   /* box geometry, the box's axis table (box-local native z) */
-    double emin, sheet0, kph, c0;                              /* cf_pool's weights */
+    double emin, sheet0, kph, c0, rs, ra, rb, wa, wb, wd, wp;  /* cf_pool's weights (wa..wp: --wide) */
 } cf_gpu_poolcfg;
 /* pass 1 for one loaded chunk of field rows [zoff, zoff + nzl) (box rows; zoff and the chunk a multiple of P except at the box end):
    pl = the chunk's planes pc ps t0..t5 sp w; S / G = the level-0 solve grid (host, whole box): the chunk's solve rows are written */

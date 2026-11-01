@@ -205,6 +205,7 @@ static int usage(void) {
         "  ufsm fields-oracle <fields-dir> <phase-root> <phase-key> <out-dir>   fit fields with the phase planes from a label phase raster (oracle / swap)\n"
         "  ufsm count-field <in-fields> <out-fields> [--method ls|ray] [--R 3] [--model DIR]   winding from the density counts, the phase only sub-turn (src/countfield.c)\n"
         "  ufsm cf-compare <model-a> <model-b> [fields] [--step 4]   two count-field models: delta and snap-integer agreement (src/countfield.c)\n"
+        "  ufsm count-anat <dump5> <out-prefix> --gauge G --cy CY --cx CX [--ct ROOT KEY --ct-um U --org Z,Y,X]   GT integer-error anatomy of one z range (fit --score-dump with UFSM_SCORE_DUMP_U=1; src/countanat.c)\n"
         "  ufsm vwt-sample SOURCES OUT N   ray-model training slabs + targets (im / va / ph / comp / pw raw) and the sampler throughput\n"
         "  ufsm ray-check WINDINGS.json FIELDS   turn counts of a field set between human relative-winding ray points (phase / density)\n"
         "  ufsm patch-raster LIST OUT --shape Z,Y,X   surface patches (tifxyz) as phase-0 shell training targets (512^3 shards)\n"
@@ -945,7 +946,7 @@ static int score_codes(z3 *z, double cf, const long long org[3], const int shp[3
             if (pz < 0 || py < 0 || px < 0 || pz > shp[0] * h || py > shp[1] * h || px > shp[2] * h) continue;
             if (!(U[i] == U[i])) { nan++; continue; }   /* no U here (a raster's unreached voxel) */
             double d = fmod(U[i] - (cd - 1) / 18.0, 14.0); if (d < 0) d += 14; if (d >= 14) d = 0;
-            if (dump) { const float rec[4] = {(float)pz, (float)py, (float)px, (float)d}; if (fwrite(rec, 4, 4, dump) != 4) dump = nullptr; }
+            if (dump) { const float rec[5] = {(float)pz, (float)py, (float)px, (float)d, U[i]}; const int nr = getenv("UFSM_SCORE_DUMP_U") ? 5 : 4; if (fwrite(rec, 4, nr, dump) != (size_t)nr) dump = nullptr; }   /* (UFSM_SCORE_DUMP_U: + U per record) */
             hist[(int)(d / 14 * NB) % NB]++; fine[(int)(d / 14 * NF) % NF]++; nd++;
             if (detail) {   /* d and the voxel's z / radius bins for the breakdown after the gauge is known */
                 if (ndet == dcap) { dcap = dcap ? 2 * dcap : 1 << 20; dd = realloc(dd, dcap * sizeof *dd); }
@@ -994,10 +995,17 @@ static int score_codes(z3 *z, double cf, const long long org[3], const int shp[3
     if (pab) {   /* pair winding accuracy (gauge-free): 0.5 / 1 / 2 / 4 mm */
         pa_buf all; pa_init(&all, 1 << 20); for (int t = 0; t < 16; t++) { pa_merge(&all, &pab[t]); pa_free(&pab[t]); } free(pab); pab = nullptr;
         const double mm[4] = {0.5, 1, 2, 4}; double dv[4], a[4], ac[4]; size_t na[4], nc[4]; for (int k = 0; k < 4; k++) dv[k] = mm[k] * 1000 / um;
+        if (g_score_pairs > 1) pa_set_axis(cy, cx, na_ax);
         tq = now(); pa_score(&all, dv, 4, 200000, 0x5eed, a, ac, na, nc);
         if (tms) fprintf(stderr, "fit times: pair score %.2fs\n", now() - tq);
         printf("pair winding right (%zu records):", all.n);
         for (int k = 0; k < 4; k++) printf(" %g mm %.4f cross %.4f (%zu / %zu)%s", mm[k], a[k], ac[k], na[k], nc[k], k < 3 ? " |" : "\n");
+        if (g_score_pairs > 1) {   /* --score-pairs 2: by direction */
+            printf("pair winding right by direction (radial / tangential / z, pairs):");
+            for (int k = 0; k < 4; k++) { size_t n3[3], r3[3]; pa_dir_get(k, n3, r3);
+                printf(" %g mm %.4f %.4f %.4f (%zu %zu %zu)%s", mm[k], n3[0] ? (double)r3[0] / n3[0] : NAN, n3[1] ? (double)r3[1] / n3[1] : NAN, n3[2] ? (double)r3[2] / n3[2] : NAN, n3[0], n3[1], n3[2], k < 3 ? " |" : "\n"); }
+            pa_set_axis(nullptr, nullptr, 0);
+        }
         pa_free(&all);
     }
     free(dd); for (int t = 0; t < 64; t++) free(J.dd[t]);
@@ -1549,7 +1557,7 @@ static int cmd_fit(int argc, char **argv) {
         FILE *dump = *opt(argc, argv, "--score-dump", "") ? fopen(opt(argc, argv, "--score-dump", ""), "wb") : nullptr;   /* box-local z y x, U - q mod 14 per voxel */
         fit_set_dev *gd = nullptr; if (!c.cpu && !(gd = fit_set_upload(fs))) return 1;
         fit_fill_ctx fc = {gd, fs};
-        g_score_pairs = atoi(opt(argc, argv, "--score-pairs", "0")) > 0;
+        g_score_pairs = atoi(opt(argc, argv, "--score-pairs", "0"));
         if (*opt(argc, argv, "--zgauge", "") && zg_load(opt(argc, argv, "--zgauge", ""), atof(opt(argc, argv, "--zgauge-scale", "1")), atof(opt(argc, argv, "--zgauge-f", "1")))) return 1;
         if (*opt(argc, argv, "--score-z", "") && sscanf(opt(argc, argv, "--score-z", ""), "%lf,%lf", &g_score_z0, &g_score_nz) != 2) { fprintf(stderr, "fit: --score-z Z0,NZ (box-local native z)\n"); return 2; }
         const int rc = score_codes(z, cf, org, shp, h, fb.um, fb.cy, fb.cx, arg_index(argc, argv, "--score-detail") > 0, dump, fit_fill, &fc);
@@ -4185,6 +4193,7 @@ int cmd_vwt_sample(int argc, char **argv);   /* src/vwt_sample.c */
 int cmd_hires_count(int argc, char **argv);
 int cmd_spiral_fit(int argc, char **argv);    /* src/countfield.c */
 int cmd_cf_compare(int argc, char **argv);    /* src/countfield.c */
+int cmd_count_anat(int argc, char **argv);    /* src/countanat.c */
 int cmd_phase_packing(int argc, char **argv);   /* src/packmap.c */
 int cmd_wbench_stats(int argc, char **argv);   /* src/wbench.c */
 int cmd_ckpt_avg(int argc, char **argv);   /* src/wbench.c */
@@ -4242,6 +4251,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "hires-count")) return cmd_hires_count(argc, argv);
     if (!strcmp(cmd, "spiral-fit")) return cmd_spiral_fit(argc, argv);
     if (!strcmp(cmd, "cf-compare")) return cmd_cf_compare(argc, argv);
+    if (!strcmp(cmd, "count-anat")) return cmd_count_anat(argc, argv);
     if (!strcmp(cmd, "phase-packing")) return cmd_phase_packing(argc, argv);
     if (!strcmp(cmd, "wbench-stats")) return cmd_wbench_stats(argc, argv);
     if (!strcmp(cmd, "ckpt-avg")) return cmd_ckpt_avg(argc, argv);

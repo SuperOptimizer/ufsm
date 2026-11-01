@@ -20,3 +20,7 @@ void pa_add(pa_buf *b, float pz, float py, float px, float d, uint8_t q, uint64_
 void pa_merge(pa_buf *dst, pa_buf *src);
 /* pairs at each distance dist[k] (same units as the positions); acc / acc_cross (NaN when no pair), counts */
 void pa_score(const pa_buf *b, const double *dist, int nd, size_t npairs, uint64_t seed, double *acc, double *acc_cross, size_t *n, size_t *n_cross);
+/* optional: split the pairs of later pa_score calls by direction at the first voxel (radial / tangential / z: the largest component;
+   cy, cx the axis per native z, positions' units); pa_dir_get(k, n, right) reads distance k's counts */
+void pa_set_axis(const float *cy, const float *cx, int na);
+void pa_dir_get(int k, size_t n[3], size_t right[3]);
