@@ -448,7 +448,7 @@ static void *pi_vert_run(void *arg) {
 
 typedef struct { uint32_t root; int J, G; uint32_t n; } pi_vote;   /* G: GT sheet in the root frame mod 14 (99 none) */
 static int pi_cmp_vote(const void *a, const void *b) { const pi_vote *x = a, *y = b; if (x->root != y->root) return x->root < y->root ? -1 : 1; if (x->J != y->J) return x->J < y->J ? -1 : 1; return (x->G > y->G) - (x->G < y->G); }
-typedef struct { uint32_t root; int Jstar, ok; uint32_t votes; double share, purity; } pi_patch;
+typedef struct { uint32_t root; int Jstar, ok; uint32_t votes; double share, purity; int Gmode; } pi_patch;
 static int pi_cmp_patch(const void *a, const void *b) { const pi_patch *x = a, *y = b; return (x->root > y->root) - (x->root < y->root); }
 
 static int pi_cmpu(const void *a, const void *b) { const uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b; return (x > y) - (x < y); }
@@ -595,28 +595,32 @@ int cmd_patch_id(int argc, char **argv) {
         size_t e = i; long long tot = 0, best = 0; int bj = 0; long long gh[14] = {0}, gtot = 0;
         while (e < nvo && VO[e].root == VO[i].root) e++;
         for (size_t j = i; j < e;) { size_t f = j; long long s = 0; while (f < e && VO[f].J == VO[j].J) { s += VO[f].n; if (VO[f].G < 14) { gh[VO[f].G] += VO[f].n; gtot += VO[f].n; } f++; } tot += s; if (s > best) { best = s; bj = VO[j].J; } j = f; }
-        long long gm = 0; for (int b = 0; b < 14; b++) if (gh[b] > gm) gm = gh[b];
+        long long gm = 0; int gmb = -1; for (int b = 0; b < 14; b++) if (gh[b] > gm) { gm = gh[b]; gmb = b; }
         if (npa == cpa) { cpa *= 2; PA = realloc(PA, cpa * sizeof *PA); }
-        PA[npa++] = (pi_patch){VO[i].root, bj, tot >= min_votes && best >= min_share * tot, (uint32_t)(tot > UINT32_MAX ? UINT32_MAX : tot), tot ? (double)best / tot : 0, gtot ? (double)gm / gtot : NAN};
+        PA[npa++] = (pi_patch){VO[i].root, bj, tot >= min_votes && best >= min_share * tot, (uint32_t)(tot > UINT32_MAX ? UINT32_MAX : tot), tot ? (double)best / tot : 0, gtot ? (double)gm / gtot : NAN, gmb};
         i = e;
     }
     free(VO);
     /* patch stats */
     long long vtot = 0, vok = 0; double pur_w = 0, pur_n = 0, sh_w = 0; size_t nok = 0;
     for (size_t p = 0; p < npa; p++) { vtot += PA[p].votes; if (PA[p].ok) { vok += PA[p].votes; nok++; sh_w += PA[p].share * PA[p].votes; if (isfinite(PA[p].purity)) { pur_w += PA[p].purity * PA[p].votes; pur_n += PA[p].votes; } } }
+    /* GT: the global modal turn */
+    long long eh[14] = {0}; for (size_t i = 0; i < ALL.n; i++) if (ALL.r[i].eb < 14) eh[ALL.r[i].eb] += ALL.r[i].n;   /* (eb: rounded e; the gauge fraction should be near 0) */
+    int gm = 0; for (int b = 1; b < 14; b++) if (eh[b] > eh[gm]) gm = b;
+    /* --oracle 1 (validation only): each kept patch takes its GT-modal sheet instead of the wraps' majority (the ceiling of patch
+       relabelling with perfect anchors) */
+    const int oracle = atoi(pi_opt(argc, argv, "--oracle", "0"));
+    #define PI_DK(P, Jv) (oracle && (P)->Gmode >= 0 ? ((((P)->Gmode - gm - (Jv)) % 14 + 21) % 14 - 7) : (P)->Jstar - (Jv))
     /* per record: the correction */
     int8_t *dk = malloc(ALL.n + 1); uint8_t *dok = calloc(ALL.n + 1, 1); uint32_t *pid = malloc((ALL.n + 1) * 4);
     for (size_t i = 0; i < ALL.n; i++) {
         dk[i] = 0; pid[i] = PI_NONE; if (Rof[i] == PI_NONE) continue;
-        pi_patch key = {Rof[i], 0, 0, 0, 0, 0}; const pi_patch *P = bsearch(&key, PA, npa, sizeof *PA, pi_cmp_patch);
+        pi_patch key = {Rof[i], 0, 0, 0, 0, 0, 0}; const pi_patch *P = bsearch(&key, PA, npa, sizeof *PA, pi_cmp_patch);
         if (!P || !P->ok) continue;
-        const int Jv = ALL.r[i].jv - (int)dir * Tof[i], d = P->Jstar - Jv;
+        const int Jv = ALL.r[i].jv - (int)dir * Tof[i], d = PI_DK(P, Jv);
         if (d < -PI_DKR || d > PI_DKR) continue;
         dk[i] = (int8_t)d; dok[i] = 1; pid[i] = Rof[i];
     }
-    /* GT: the global modal turn */
-    long long eh[14] = {0}; for (size_t i = 0; i < ALL.n; i++) if (ALL.r[i].eb < 14) eh[ALL.r[i].eb] += ALL.r[i].n;   /* (eb: rounded e; the gauge fraction should be near 0) */
-    int gm = 0; for (int b = 1; b < 14; b++) if (eh[b] > eh[gm]) gm = b;
     /* cells: records are sorted by cell */
     mkdir(out, 0775);
     char pth[1600]; snprintf(pth, sizeof pth, "%s/cells.tsv", out); FILE *fc = fopen(pth, "w"); if (!fc) { fprintf(stderr, "patch-id: cannot write %s\n", pth); return 1; }
@@ -680,9 +684,9 @@ int cmd_patch_id(int argc, char **argv) {
           pa_buf pb[3]; for (int v = 0; v < 3; v++) pa_init(&pb[v], ns + 16);
           for (int t = 0; t < J.nt; t++) for (size_t i = 0; i < J.tsmp[t].n; i++) {
               const pi_smp *q = &J.tsmp[t].s[i]; int d1 = 0;
-              if (q->comp != PI_NONE) { int T; const uint32_t root = pi_find(&U, q->comp, &T); pi_patch key = {root, 0, 0, 0, 0, 0};
+              if (q->comp != PI_NONE) { int T; const uint32_t root = pi_find(&U, q->comp, &T); pi_patch key = {root, 0, 0, 0, 0, 0, 0};
                   const pi_patch *P = bsearch(&key, PA, npa, sizeof *PA, pi_cmp_patch);
-                  if (P && P->ok) { const int d = P->Jstar - (q->jv - (int)dir * T); if (d >= -PI_DKR && d <= PI_DKR) d1 = d; } }
+                  if (P && P->ok) { const int d = PI_DK(P, q->jv - (int)dir * T); if (d >= -PI_DKR && d <= PI_DKR) d1 = d; } }
               const int e = q->eb, dd[3] = {0, d1, cell_dk[q->cell]};
               const uint64_t key = ((uint64_t)t << 40) ^ i;
               for (int v = 0; v < 3; v++) pa_add(&pb[v], q->p[0], q->p[1], q->p[2], (float)-(e - dd[v]), q->gc, key);
