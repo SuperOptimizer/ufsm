@@ -776,6 +776,15 @@ static void head_slab_pass(gpu_state *d, int pass) {
             if (g_packed_w > 1) nn_packed_mask_z(d->sdb, D, H, W, g_norm_s, d->um, g_packed_um, g_packed_w, d->inkm, z0, z1);   /* packed sheets weigh more */
         }
         uint8_t *const st = g_rv ? d->inkt : d->sidet, *const sm = g_rv ? d->inkm : d->sidem;   /* the side slot's targets / mask */
+        if (g_rv && !pass && z0 == 0 && ufsm_env_on("UFSM_RV_CHECK")) {   /* what the rv loss reads on this slab: recto / verso / void / masked counts */
+            uint8_t *h = malloc(3 * ns); nn_sync(); nn_d2h(h, d->inkt, 2 * ns); nn_d2h(h + 2 * ns, d->inkm, ns);
+            size_t nr = 0, nv = 0, nvo = 0, nm = 0; for (size_t k = 0; k < ns; k++) { if (!h[2 * ns + k]) { nm++; continue; } if (h[k]) nr++; else if (h[ns + k]) nv++; else nvo++; }
+            uint8_t *ph = malloc(ns), *pp = malloc(ns); nn_d2h(ph, d->sdb + vb, ns); nn_d2h(pp, d->ink + vb, ns);
+            size_t pk = 0, pr = 0, pap = 0, pu = 0; for (size_t k = 0; k < ns; k++) { pk += ph[k] < 252; pr += ph[k] < 126; pap += pp[k] != 255 && pp[k] >= 127; pu += pp[k] == 255; }
+            fprintf(stderr, "rv check (GPU %d): slab %zu voxels: recto %zu verso %zu void %zu masked %zu (mask weights max %d); phase known %zu (recto half %zu), papyrus %zu, papyrus unknown %zu\n",
+                    d->dev, ns, nr, nv, nvo, nm, 0, pk, pr, pap, pu);
+            free(h); free(ph); free(pp);
+        }
         if (g_ptrunc_on) nn_phase_trunc(LGC(g_side_ch), LGC(g_side_ch + 1), d->sidet, d->sidem, ns, g_ptrunc_tau, g_ptrunc_kappa);   /* robust phase loss (both passes: the same mask) */
         if (g_packed_w > 1) nn_packed_mask_z(d->sdb, D, H, W, g_norm_s, d->um, g_packed_um, g_packed_w, d->sidem, z0, z1);   /* packed sheets weigh more */
         nn_unwrap_targets2_z(d->sdb, D, H, W, g_norm_s, g_dens_scale, g_dens_code, d->um, g_packed_um, g_packed_w, d->nt, d->nm, z0, z1);
