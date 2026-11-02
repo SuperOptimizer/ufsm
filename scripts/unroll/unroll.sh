@@ -206,7 +206,7 @@ ink() {
 SLABFIT=${SLABFIT---steps 300,300,300,300,200,200 --batch 1000000}
 lane() {   # lane GPU
   local g=$1 k s d c0 c1 a b t0 rc ze ny nx dir
-  if [ "$DRY" = 1 ]; then echo "    lane GPU $g: per slab k: mkcrop.sh $F slabs/sNNN/f (64 cells + 16 overlap); $U fit slabs/sNNN/f --gpu $g --out slabs/sNNN/fit --dir REFDIR --ref-model $REF --ref-snap 1 --uw-repair 0 $SLABFIT [phase gate on by default; FITX=\"--phase-gate 0\" off] ${FITX:-}"; return 0; fi
+  if [ "$DRY" = 1 ]; then echo "    lane GPU $g: per slab k: mkcrop.sh $F slabs/sNNN/f ($I cells + $OV overlap); $U fit slabs/sNNN/f --gpu $g --out slabs/sNNN/fit --dir REFDIR --ref-model $REF --ref-snap 1 --uw-repair 0 $SLABFIT [phase gate on by default; FITX=\"--phase-gate 0\" off] ${FITX:-}"; return 0; fi
   ze=$(jq -r '.shape[0]' $F/fields.json); ny=$(jq -r '.shape[1]' $F/fields.json); nx=$(jq -r '.shape[2]' $F/fields.json); dir=$(jq -r .dir $REF/model.json)
   for k in $(seq 0 $(( (ze + I - 1) / I - 1 ))); do
     stopped && return 0
