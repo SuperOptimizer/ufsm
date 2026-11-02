@@ -571,7 +571,7 @@ int cmd_patch_id(int argc, char **argv) {
           }
           for (int b = 0; b < J.nby * J.nbx; b++) J.prev_phi[b] = J.phi[(size_t)(lz / J.B) * J.nby * J.nbx + b];
           J.have_prev = 1; }
-        fprintf(stderr, "\rpatch-id: z %lld / %lld: %zu atoms, %lld merges (%lld loop refusals), links %lld, %lld vertices on an atom of %lld  %.0fs   ",
+        fprintf(stderr, "\rpatch-id: z %lld / %lld: %zu atoms, %lld merges (%lld loop / %lld height-field refusals), links %lld, %lld vertices on an atom of %lld  %.0fs   ",
                 (long long)z1, (long long)zr1, natoms, U.merges, U.cycles, U.refused, nl, (long long)atomic_load(&J.nhit), (long long)atomic_load(&J.nvert), pi_now() - t0);
     }
     fprintf(stderr, "\npatch-id: read %.0fs, components %.0fs, links %.0fs, vertices %.0fs\n", tread, tcc, tlink, tvert);
