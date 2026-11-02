@@ -1,10 +1,10 @@
-/* ufsm recto-sp IN-FIELDS OUT-FIELDS --src ROOT KEY UM [--rows R0,R1] [--stride 4] [--half-um 400] [--prom 25] [--sigma 0.5] [--sep-um 20]
+/* ufsm recto-sp IN-FIELDS OUT-FIELDS --src ROOT KEY UM [--rows R0,R1] [--stride 4] [--half-um 400] [--half2-um 0] [--prom 25] [--sigma 0.5] [--sep-um 20]
                 [--blend 1] [--gate 0.4,2.5] [--min-net-um 0] [--blend-ramp LO,HI,A0,A1] [--min-int 3] [--rsp-in DIR] [--threads N] [--cache DIR]
    Recto predictions as a count target for count-field: the sheet spacing sp of a fit-field set replaced by the spacing of recto hits
    along the field normal. Per field cell on a --stride grid (cells with material): the source profile along the principal axis of the
    cell's n n^T over +-half-um (trilinear, step half a source voxel), peaks as recto-ruler (rr_peaks: smoothing --sigma source voxels,
    prominence --prom 0..255, merged closer than --sep-um), the median normal width of the up to 5 hit intervals around the cell centre
-   (>= --min-int intervals) = one turn each (--cls MODEL: ufsm recto-cls turns per interval, spacing = their widths / turns) -> rsp (units of h / 8 native voxels, as sp; 0 none), written to the stride block.
+   (>= --min-int intervals; --half2-um U2 > half: the profile spans +-U2 and its intervals, >= 2, are used where +-half has too few) = one turn each (--cls MODEL: ufsm recto-cls turns per interval, spacing = their widths / turns) -> rsp (units of h / 8 native voxels, as sp; 0 none), written to the stride block.
    OUT gets sp = net^(1 - a) rsp^a (a = --blend; --blend-ramp LO,HI,A0,A1: a = A0 where the network spacing <= LO um, A1 >= HI, linear between) where rsp / net lies inside --gate, net sp elsewhere; rsp (the raw recto spacing); the
    other planes linked to IN's; fields.json copied. --rsp-in DIR: reuse DIR/rsp (only the blend runs). --rows R0,R1: box rows computed (the
    others keep the net sp). The source is on the fields' scan (UM its voxel um; native = fields' um). Arrays: 512^3 shards, lossless. */
@@ -43,7 +43,7 @@ static int rs_axis(const uint8_t *const t[6], size_t i, double v[3]) {   /* prin
 typedef struct {
     const fit_fields_buf *b; int r0, nr;   /* field rows [r0, r0 + nr) of the loaded block (box-local rows of b) */
     const uint8_t *src; int64_t so[3], sn[3]; double F;   /* source block (source voxels, global), F = native / source voxel */
-    long long org[3]; int h, S; double um, half, prom, sigma, sep; int minint;
+    long long org[3]; int h, S; double um, half, half1, prom, sigma, sep; int minint;
     uint8_t *out; int64_t oz0; int H, W;   /* output rows (box rows from oz0), H x W cells */
     const rr_cls *cls;   /* --cls: turns per hit interval from the classifier (features as recto-ruler's rr_feat, along the normal) */
     _Atomic long long ncell, nest;
@@ -83,8 +83,14 @@ static void rs_rows(void *ctx, int a0, int a1, int t) {
             const int nh = rr_peaks(v, mat, n, J->sigma * 2, J->prom, (int)lround(60 / (st * J->um)), J->sep / (st * J->um), hp, tmp);
             int j = -1; for (int k = 0; k + 1 < nh; k++) if (hp[k].pos <= c && hp[k + 1].pos > c) { j = k; break; }
             if (j < 0) continue;
-            float wd[5]; int nw = 0; for (int k = j - 2; k <= j + 2; k++) if (k >= 0 && k + 1 < nh) wd[nw++] = hp[k + 1].pos - hp[k].pos;
-            if (nw < J->minint) continue;
+            /* --half2-um: the intervals inside the primary window +-half when there are >= --min-int of them, else all (the wider
+               window, >= 2) */
+            const double inner = J->half1 > 0 ? J->half1 / (st * J->um) : 1e30; int inonly = 1, mi = J->minint;
+            { int ni = 0; for (int k = j - 2; k <= j + 2; k++) if (k >= 0 && k + 1 < nh && hp[k].pos >= c - inner && hp[k + 1].pos <= c + inner) ni++;
+              if (ni < J->minint && J->half1 > 0) { inonly = 0; mi = 2; } }
+#define RS_IN(k) ((k) >= 0 && (k) + 1 < nh && (!inonly || (hp[k].pos >= c - inner && hp[(k) + 1].pos <= c + inner)))
+            float wd[5]; int nw = 0; for (int k = j - 2; k <= j + 2; k++) if (RS_IN(k)) wd[nw++] = hp[k + 1].pos - hp[k].pos;
+            if (nw < mi) continue;
             double sp;
             if (J->cls) {   /* the intervals' turns from the classifier: spacing = sum of widths / sum of turns */
                 for (int i = 0; i < n; i++) {   /* the fields along the profile (nearest cell): spacing (native), phase */
@@ -96,7 +102,7 @@ static void rs_rows(void *ctx, int a0, int a1, int t) {
                 }
                 double sw = 0, se = 0; int nint = 0;
                 for (int k = j - 2; k <= j + 2; k++) {
-                    if (k < 0 || k + 1 >= nh) continue;
+                    if (!RS_IN(k)) continue;
                     float fe[RR_NF]; for (int e = 0; e < RR_NF; e++) fe[e] = NAN;
                     const double a = hp[k].pos, b = hp[k + 1].pos; const int ia = (int)ceil(a), ib = (int)floor(b), im = (int)lround(0.5 * (a + b));
                     const double wu = (b - a) * st * J->um; fe[0] = (float)wu; if (spn[im] > 0) { fe[1] = (float)(wu / (spn[im] * J->um)); fe[20] = (float)(spn[im] * J->um); }
@@ -117,7 +123,7 @@ static void rs_rows(void *ctx, int a0, int a1, int t) {
                     float pr[RR_K]; rr_cls_predict(J->cls, fe, pr); double E = 0; for (int e = 0; e < RR_K; e++) E += e * pr[e];
                     sw += b - a; se += E; nint++;
                 }
-                if (nint < J->minint || se < 0.5) continue;
+                if (nint < mi || se < 0.5) continue;
                 sp = sw / se * st * 8 / J->h;
             } else {
                 qsort(wd, nw, sizeof(float), rs_cmpf);
@@ -165,7 +171,7 @@ int cmd_recto_sp(int argc, char **argv) {
     if (!zrin) { for (int i = 4; i + 3 < argc; i++) if (!strcmp(argv[i], "--src")) { if (!(zs = z3_open(store_open(argv[i + 1]), argv[i + 2], cache))) { fprintf(stderr, "recto-sp: --src: %s\n", z3_error()); return 1; } sum = atof(argv[i + 3]); }
                  if (!zs || !(sum > 0)) { fprintf(stderr, "recto-sp: --src ROOT KEY UM (or --rsp-in DIR)\n"); return 2; } F = um / sum; }
     rr_cls *cls = nullptr; { const char *cp = rs_opt(argc, argv, "--cls", nullptr); if (cp && !(cls = rr_cls_load(cp))) { fprintf(stderr, "recto-sp: cannot load --cls %s\n", cp); return 1; } }
-    const int S = atoi(rs_opt(argc, argv, "--stride", "4")); const double half = atof(rs_opt(argc, argv, "--half-um", "400"));
+    const int S = atoi(rs_opt(argc, argv, "--stride", "4")); const double half = atof(rs_opt(argc, argv, "--half-um", "400")), half2 = atof(rs_opt(argc, argv, "--half2-um", "0"));
     const int SH = 512;
     char attrs[256]; snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"content\":\"winding fitter fields (src/fit.h)\",\"h\":%d,\"recto_sp\":1}}", h);
     snprintf(path, sizeof path, "%s/sp", out); char sl[4096]; snprintf(sl, sizeof sl, "%s/sp", out); unlink(sl);
@@ -185,10 +191,10 @@ int cmd_recto_sp(int argc, char **argv) {
             if (q1 <= q0) continue;
             const int a0 = (q0 / S) * S, a1 = q1;   /* (stride blocks start at multiples of S) */
             fit_fields_skip_planes(1 | 2); fit_fields_ct_planes(0);
-            const int hz = cls ? (int)ceil(half / um / h) + 1 : 0, l0 = a0 - hz < 0 ? 0 : a0 - hz, l1 = a1 + hz > shp[0] ? shp[0] : a1 + hz;   /* (--cls: the fields along the profiles: a halo of rows) */
+            const int hz = cls ? (int)ceil(fmax(half, half2) / um / h) + 1 : 0, l0 = a0 - hz < 0 ? 0 : a0 - hz, l1 = a1 + hz > shp[0] ? shp[0] : a1 + hz;   /* (--cls: the fields along the profiles: a halo of rows) */
             fit_fields_buf fb; if (fit_fields_load(in, l0, l1, 1, &fb)) { fprintf(stderr, "recto-sp: cannot load field rows %d..%d\n", l0, l1); return 1; }
             /* source block: native z [org + a0 h - half, org + a1 h + half], the box's y / x +- half */
-            const double hm = half / um + 2; rs_job J = {.b = &fb, .r0 = a0 - l0, .nr = a1 - a0, .F = F, .org = {org[0] + (long long)l0 * h, org[1], org[2]}, .cls = cls, .h = h, .S = S, .um = um, .half = half,
+            const double hm = fmax(half, half2) / um + 2; rs_job J = {.b = &fb, .r0 = a0 - l0, .nr = a1 - a0, .F = F, .org = {org[0] + (long long)l0 * h, org[1], org[2]}, .cls = cls, .h = h, .S = S, .um = um, .half = fmax(half, half2), .half1 = half2 > half ? half : 0,
                 .prom = atof(rs_opt(argc, argv, "--prom", "25")), .sigma = atof(rs_opt(argc, argv, "--sigma", "0.5")), .sep = atof(rs_opt(argc, argv, "--sep-um", "20")), .minint = atoi(rs_opt(argc, argv, "--min-int", "3")), .H = H, .W = W};
             const int64_t *ssh = z3_meta_of(zs)->shape; const double za0 = org[0] + (double)a0 * h; const double lo[3] = {za0 - hm, org[1] - hm, org[2] - hm}, hi[3] = {za0 + (a1 - a0) * h + hm, org[1] + (double)H * h + hm, org[2] + (double)W * h + hm};
             for (int d = 0; d < 3; d++) { int64_t s0 = (int64_t)floor(lo[d] * F) - 1, s1 = (int64_t)ceil(hi[d] * F) + 2; if (s0 < 0) s0 = 0; if (s1 > ssh[d]) s1 = ssh[d]; J.so[d] = s0; J.sn[d] = s1 - s0; }
