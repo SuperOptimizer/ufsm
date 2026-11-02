@@ -11,6 +11,8 @@
    - a holdout box (--exclude) -> ignore 4;
    - --geom: defect cells / slipping z bins of geom-check -> no codes there;
    - --min-coh: CT ridges on the sheets keep the labels, ridges midway between them (labels half a turn off) -> ignore 5;
+   - wrap-anchor: wraps miscounted (+10 turns, a false extra turn after wrap 3) against the true codes as GT, votes in alternate z
+     blocks: every anchored code equals the GT code, the held-out blocks included;
    - same bytes with 1 and 4 threads; --dir auto picks -1 on the dir -1 spiral (same bytes as --dir -1). */
 #include "band.h"
 #include "store.h"
@@ -35,6 +37,19 @@ static uint8_t *readall(const char *root, const char *key) {
     z3 *z = z3_open(store_open(root), key, nullptr); if (!z) return nullptr;
     const int64_t o[3] = {0, 0, 0}, n[3] = {NZ, NY, NX}; uint8_t *b = malloc((size_t)NZ * NY * NX);
     if (z3_read(z, o, n, b, 1)) { free(b); b = nullptr; } z3_close(z); return b;
+}
+static void wraps_ids(const char *dir, const int *ids) {   /* dir +1 spiral wraps k = 1..7 written under other ids (ids[k]): a wrong count */
+    const int H = NZ / 2, Wc = 720;
+    for (int k = 1; k <= 7; k++) {
+        float *x = malloc(Wc * H * 4), *y = malloc(Wc * H * 4), *z = malloc(Wc * H * 4);
+        for (int r = 0; r < H; r++) for (int c = 0; c < Wc; c++) {
+            const double th = M_PI - (c + 0.5) * 2 * M_PI / Wc, rr = rk(k + th / (2 * M_PI));
+            x[r * Wc + c] = (float)(C0 + rr * cos(th)); y[r * Wc + c] = (float)(C0 + rr * sin(th)); z[r * Wc + c] = (float)(2 * r);
+        }
+        char p[600]; snprintf(p, sizeof p, "%s/w%03d", dir, ids[k]);
+        tifxyz_write(p, Wc, H, x, y, z, 2, 9.6, ids[k], "test");
+        free(x); free(y); free(z);
+    }
 }
 static void wraps(const char *dir, int sense, int dup) {
     const int H = NZ / 2, Wc = 720;
@@ -63,7 +78,7 @@ static int run(const char *root, const char *wd, const char *out, const char *di
 }
 int main(void) {
     char root[256]; snprintf(root, sizeof root, "%s/test_surflabels_%d", getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp", (int)getpid());
-    char cmd[1400], p[600]; snprintf(cmd, sizeof cmd, "rm -rf %s && mkdir -p %s/wp %s/wm %s/wd", root, root, root, root); if (system(cmd)) return 1;
+    char cmd[1400], p[600]; snprintf(cmd, sizeof cmd, "rm -rf %s && mkdir -p %s/wp %s/wm %s/wd %s/wx", root, root, root, root, root); if (system(cmd)) return 1;
     snprintf(p, sizeof p, "%s/axis.json", root); FILE *f = fopen(p, "w"); if (!f) return 1;
     fprintf(f, "{\"control_points\": [{\"x\": %g, \"y\": %g, \"z\": 0}, {\"x\": %g, \"y\": %g, \"z\": %d}]}\n", C0, C0, C0, C0, NZ - 1); fclose(f);
     snprintf(p, sizeof p, "%s/hold.json", root); f = fopen(p, "w"); if (!f) return 1;
@@ -85,6 +100,7 @@ int main(void) {
     snprintf(p, sizeof p, "%s/wp", root); wraps(p, 1, 0);
     snprintf(p, sizeof p, "%s/wm", root); wraps(p, -1, 0);
     snprintf(p, sizeof p, "%s/wd", root); wraps(p, 1, 1);
+    { const int ids[8] = {0, 11, 12, 13, 15, 16, 17, 18}; snprintf(p, sizeof p, "%s/wx", root); wraps_ids(p, ids); }   /* +10 turns, then a false extra turn between wraps 3 and 4 */
     tifxyz_set_sfc(0);
     CHECK(!run(root, "wp", "p1", "1", "1", nullptr, nullptr, nullptr), "surf-labels dir +1 (1 thread) failed");
     CHECK(!run(root, "wp", "p4", "1", "4", nullptr, nullptr, nullptr), "surf-labels dir +1 (4 threads) failed");
@@ -129,6 +145,32 @@ int main(void) {
         printf("test_surflabels: --geom: codes on wrap 3 %ld, on wrap 6 in the slip bin (z 32..47) %ld, elsewhere %ld\n", on3, on6a, on6b);
         CHECK(cd && on3 == 0 && on6a == 0 && on6b > 1000, "--geom masks not applied");
         free(cd);
+    }
+    {   /* wrap-anchor: the miscounted wraps wx against the true codes (p1) as published-segment GT; votes in the even 0.15 mm z blocks, scored in the odd */
+        char ax[400], wdp[400], an[400], gtr[400], od[400]; snprintf(ax, sizeof ax, "%s/axis.json", root); snprintf(wdp, sizeof wdp, "%s/wx", root);
+        snprintf(an, sizeof an, "%s/wx.anchor", root); snprintf(gtr, sizeof gtr, "%s/p1/codes.zarr", root); snprintf(od, sizeof od, "%s/ax", root);
+        char *av[] = {"ufsm", "wrap-anchor", wdp, an, "--axis", ax, "--axis-um", "9.6", "--dir", "1", "--grid-um", "9.6", "--shape", "64,256,256", "--shard", "128", "--block", "32",
+                      "--radius", "12", "--threads", "4", "--gt", gtr, "9.6", "--gt-split-mm", "0.1536", "--gt-half", "A", "--anchor-cell", "4,16", "--anchor-min", "5"};
+        CHECK(!cmd_surf_labels((int)(sizeof av / sizeof *av), av), "wrap-anchor failed");
+        char *bv[] = {"ufsm", "surf-labels", wdp, od, "--axis", ax, "--axis-um", "9.6", "--dir", "1", "--grid-um", "9.6", "--shape", "64,256,256", "--shard", "128", "--block", "32",
+                      "--radius", "12", "--threads", "4", "--gt", gtr, "9.6", "--gt-split-mm", "0.1536", "--gt-half", "B", "--anchor-cell", "4,16", "--anchor", an};
+        CHECK(!cmd_surf_labels((int)(sizeof bv / sizeof *bv), bv), "surf-labels --anchor failed");
+        char r[600]; snprintf(r, sizeof r, "%s/codes.zarr", od); uint8_t *ac = readall(r, "9.6"); snprintf(r, sizeof r, "%s/p1/codes.zarr", root); uint8_t *gc = readall(r, "9.6");
+        snprintf(r, sizeof r, "%s/phase.zarr", od); uint8_t *ph = readall(r, "9.6");
+        long both = 0, bad = 0, z1 = 0, kept = 0;
+        for (size_t i = 0; ac && gc && ph && i < (size_t)NZ * NY * NX; i++) { kept += ph[i] != PHASE_UNKNOWN;
+            if (!ac[i] || !gc[i] || gc[i] == 255) { continue; }
+            both++; if (abs(((ac[i] - gc[i]) % 252 + 378) % 252 - 126) > 2) { bad++; if ((i / (NY * NX)) / 16 % 2) z1++; } }
+        printf("test_surflabels: wrap-anchor: %ld anchored codes on GT codes, %ld off by > 1/9 turn (%ld of them in held-out z blocks); %ld phase voxels kept\n", both, bad, z1, kept);
+        CHECK(both > 50000 && bad == 0 && kept > 1300000, "anchored codes do not match the GT (the +10 / +11 turn miscount not undone)");
+        free(ac); free(gc); free(ph);
+    }
+    {   /* --agree smoke: the CT ridges on the sheets as both CT and recto prediction */
+        char ax[400], wdp[400], od[400], ct[400], gtr[400]; snprintf(ax, sizeof ax, "%s/axis.json", root); snprintf(wdp, sizeof wdp, "%s/wp", root); snprintf(od, sizeof od, "%s/agree", root);
+        snprintf(ct, sizeof ct, "%s/ct0", root); snprintf(gtr, sizeof gtr, "%s/p1/codes.zarr", root);
+        char *av[] = {"ufsm", "surf-labels", wdp, od, "--axis", ax, "--axis-um", "9.6", "--dir", "1", "--grid-um", "9.6", "--shape", "64,256,256", "--shard", "128", "--block", "32",
+                      "--radius", "12", "--threads", "4", "--ct", ct, "0", "--agree", ct, "0", "--gt", gtr, "9.6"};
+        CHECK(!cmd_surf_labels((int)(sizeof av / sizeof *av), av), "surf-labels --agree failed");
     }
     snprintf(p, sizeof p, "%s/hold.json", root);
     CHECK(!run(root, "wp", "h", "1", "4", "--exclude", p, nullptr), "surf-labels --exclude failed");

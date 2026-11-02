@@ -137,7 +137,7 @@ static int usage(void) {
         "  ufsm prefetch <sources.json> [--levels 1] [--threads 32] [--fraction 1] [--P 128] [--dry 1]   warm the CT chunk cache for the labelled cells\n"
         "  ufsm phase-raster <codes-root> <key> <out-dir> [--box ...]          band phase precomputed for the sampler\n"
         "  ufsm phase-check <phase-root> <key> --axis A --scan-um U [--count 1] a stored phase: share rising outward, labelled volume\n"
-        "  ufsm downsample <root> <key> <out-group> <out-um> --mode max|phase|votes  one array halved per axis (labels, phase, side votes)\n"
+        "  ufsm downsample <root> <key> <out-group> <out-um> --mode max|phase|votes|codes  one array halved per axis (labels, phase, side votes, winding codes)\n"
         "  ufsm side-votes <out-group> <out-um> <root> <key> [<root> <key> ...]   several surface sets' side labels added into one vote array\n"
         "  ufsm wind-assign <ref-root> <ref-key> <out-dir> <tifxyz>...   other authors' surfaces get winding q in a reference raster's gauge\n"
         "  ufsm wind-seed <out-dir> <tifxyz>... [--k K]   a surface set's own winding gauge (K from the wNNN name, dir from the inner end)\n"
@@ -197,6 +197,7 @@ static int usage(void) {
         "  ufsm surf-snap <wraps-in> <wraps-out> --volume ROOT KEY --vol-um U   tifxyz vertices onto the nearest papyrus ridge\n"
         "  ufsm wrap-snap <wraps-in> <wraps-out> --axis F --axis-um U0 --ct ROOT KEY --ct-um U   .sfc wraps moved along their rays onto the sheets (smooth, order-kept)\n"
         "  ufsm surf-labels <wraps-dir> <out-dir> --axis F --axis-um U0 --dir +-1 --grid-um U --like ROOT KEY   winding codes + pair phase + ignore from .sfc wraps\n"
+        "  ufsm wrap-anchor <wraps-dir> <anchor-file> --gt ROOT KEY [surf-labels flags]   per-cell winding offsets of our wraps from published-segment codes (surf-labels --anchor)\n"
         "  ufsm patch-id <wraps-dir> <out-dir> --axis F --axis-um U0 --dir +-1 --sheet ROOT KEY --grid-um U   sheet patches -> per-cell wrap id corrections (+ --gt check)\n"
         "  ufsm geom-check <wraps-dir> --axis F --axis-um U [--out DIR]   wraps geometry QA: spacing, steep walls, jumps, merged / skipped neighbours, holes; guard limits\n"
         "  ufsm refine <wraps-in> <wraps-out> --fields DIR [--range 0.33] [--smooth-um 40]   vertices onto the fields' sheet phase\n"
@@ -2109,7 +2110,7 @@ static double g_ds_cs[PHASE_PERIOD], g_ds_sn[PHASE_PERIOD];
 static void ds_tables(void) { for (int k = 0; k < PHASE_PERIOD; k++) { g_ds_cs[k] = cos(2 * M_PI * k / PHASE_PERIOD); g_ds_sn[k] = sin(2 * M_PI * k / PHASE_PERIOD); } }
 static uint8_t g_ds_vr[256], g_ds_vv[256];   /* --mode votes: vote code -> recto / verso counts (src/votes.h) */
 static void ds_vote_tables(void) { for (int k = 0; k < 256; k++) { int r, v; vote_split((uint8_t)k, &r, &v); g_ds_vr[k] = (uint8_t)r; g_ds_vv[k] = (uint8_t)v; } }
-typedef struct { const uint8_t *src; int64_t n[3]; uint8_t *dst; int S; int64_t ny, nx, na; int phase; atomic_long next; } ds_job;   /* phase: 1 phase, 2 votes */
+typedef struct { const uint8_t *src; int64_t n[3]; uint8_t *dst; int S; int64_t ny, nx, na; int phase; atomic_long next; } ds_job;   /* phase: 1 phase, 2 votes, 3 winding codes */
 static void *ds_worker(void *arg) {
     ds_job *jb = arg; const int64_t *n = jb->n; const int S = jb->S;
     for (int64_t a; (a = atomic_fetch_add(&jb->next, 1)) < jb->na;) {
@@ -2125,6 +2126,10 @@ static void *ds_worker(void *arg) {
                     if (r && yy >= 0 && xx >= 0) v[nv++] = r[(size_t)yy * n[2] + xx];
                 }
                 if (!jb->phase) { int mx = 0; for (int k = 0; k < nv; k++) mx = v[k] > mx ? v[k] : mx; out[c] = (uint8_t)mx; continue; }
+                if (jb->phase == 3) {   /* winding codes (1..252, 0 empty, 255 conflict): the first code; any other > 4 steps from it -> 255 */
+                    int f = 0, cf = 0; for (int k = 0; k < nv; k++) { const int q = v[k]; if (!q) continue; if (q == 255) { cf = 1; continue; }
+                        if (!f) { f = q; continue; } int d = (q - f) % 252; if (d < -126) d += 252; if (d >= 126) d -= 252; if (abs(d) > 4) cf = 1; }
+                    out[c] = (uint8_t)(cf ? 255 : f); continue; }
                 if (jb->phase == 2) { int r = 0, vv = 0; for (int k = 0; k < nv; k++) { r += g_ds_vr[v[k]]; vv += g_ds_vv[v[k]]; } out[c] = vote_code(r, vv); continue; }
                 double cs = 0, sn = 0; int known = 0;
                 for (int k = 0; k < nv; k++) if (v[k] < PHASE_PERIOD) { cs += g_ds_cs[v[k]]; sn += g_ds_sn[v[k]]; known++; }
@@ -2145,8 +2150,8 @@ static void ds_run(ds_job *jb, int nt) {
     for (int i = 0; i < k; i++) pthread_join(th[i], nullptr);
 }
 static int cmd_downsample(int argc, char **argv) {
-    if (argc < 6) { fprintf(stderr, "usage: ufsm downsample <root> <key> <out-group> <out-um> --mode max|phase|votes [--box z,y,x,nz,ny,nx] [--shard 512] [--cache DIR] [--threads 16]\n"); return 2; }
-    const char *mode = opt(argc, argv, "--mode", "max"); const int votes = !strcmp(mode, "votes"), phase = !strcmp(mode, "phase") ? 1 : votes ? 2 : 0;
+    if (argc < 6) { fprintf(stderr, "usage: ufsm downsample <root> <key> <out-group> <out-um> --mode max|phase|votes|codes [--box z,y,x,nz,ny,nx] [--shard 512] [--cache DIR] [--threads 16]\n"); return 2; }
+    const char *mode = opt(argc, argv, "--mode", "max"); const int votes = !strcmp(mode, "votes"), phase = !strcmp(mode, "phase") ? 1 : votes ? 2 : !strcmp(mode, "codes") ? 3 : 0;
     if (!phase && strcmp(mode, "max")) { fprintf(stderr, "downsample: --mode max|phase|votes\n"); return 2; }
     if (votes) ds_vote_tables();
     const int S = atoi(opt(argc, argv, "--shard", "512")), nt = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 16); const double um = atof(argv[5]);
@@ -4327,6 +4332,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "refine")) return cmd_refine(argc, argv);
     if (!strcmp(cmd, "surf-stats")) return cmd_surf_stats(argc, argv);
     if (!strcmp(cmd, "wrap-snap")) return cmd_wrap_snap(argc, argv);
+    if (!strcmp(cmd, "surf-labels") || !strcmp(cmd, "wrap-anchor")) return cmd_surf_labels(argc, argv);
     if (!strcmp(cmd, "surf-labels")) return cmd_surf_labels(argc, argv);
     if (!strcmp(cmd, "patch-id")) return cmd_patch_id(argc, argv);
     if (!strcmp(cmd, "geom-check")) return cmd_geom_check(argc, argv);
