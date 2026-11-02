@@ -13,6 +13,8 @@
    density (integral |n.r| / sp) and, with --ct, CT peaks (wrap-check's detector at native resolution).
    --map NAME REG.json: the source NAME is on another scan: ufsm reg map (fine = that scan, coarse = the fields' scan at its L0 um
    "coarse.um"); its samples are read through fine(c) = A^-1 (c + D(c)).
+   --src-box NAME Z0,Y0,X0,Z1,Y1,X1: the source's valid box (its voxels; partial predictions): NaN outside, its columns only on GT
+   intervals sampled inside it.
    --ens NAME OP A,B: a source from the samples of A, B (OP mean | max), after each is scaled to 0..255.
    --dump FILE --dump-src NAME: per interval between consecutive pk hits of NAME inside a GT-covered stretch, the feature vector
    (rr_feat) and the GT turns (Q(b) - Q(a), Q piecewise linear between GT sheet centres) -> FILE (float32 records, header "RRD1").
@@ -50,6 +52,7 @@ typedef struct {
     int ens; int ea[RR_MAXS], ne;      /* --ens: op (1 mean, 2 max), the member sources */
     /* the plane for this z level: uint8 averaged rows; origin (source voxels, global yx) and size; registered: a volume block */
     uint8_t *pl; int64_t po[3], pn[3];
+    int hasbox; double vb[6];   /* --src-box NAME Z0,Y0,X0,Z1,Y1,X1: the source's valid box (source voxels); NaN outside */
 } rr_src;
 
 typedef struct {
@@ -80,7 +83,9 @@ static double rr_plane8f(const float *p, const int64_t o[2], const int64_t n[2],
 static double rr_sample(const rr_job *J, const rr_src *s, double y, double x) {   /* box-local native (y, x) at J->zg */
     const double gy = y + J->morg[1], gx = x + J->morg[2];
     if (!s->map) { const double RF = J->um / s->um; const int64_t o2[2] = {s->po[1], s->po[2]}, n2[2] = {s->pn[1], s->pn[2]};
-                   return rr_plane(s->pl, o2, n2, (gy + 0.5) * RF - 0.5, (gx + 0.5) * RF - 0.5); }
+                   const double sy = (gy + 0.5) * RF - 0.5, sx = (gx + 0.5) * RF - 0.5;
+                   if (s->hasbox) { const double sz = (J->zg + 0.5) * RF - 0.5; if (sz < s->vb[0] || sy < s->vb[1] || sx < s->vb[2] || sz >= s->vb[3] || sy >= s->vb[4] || sx >= s->vb[5]) return NAN; }
+                   return rr_plane(s->pl, o2, n2, sy, sx); }
     const double K = J->um / s->cum;   /* native -> coarse L0 voxels */
     const double c[3] = {(gx + 0.5) * K - 0.5, (gy + 0.5) * K - 0.5, (J->zg + 0.5) * K - 0.5}; double f[3]; rmap_c2f(s->map, c, f);
     const double L = s->lf;
@@ -293,6 +298,7 @@ static void rr_rays(void *ctx, int a0, int a1, int t) {
                     int ok = ie < n; for (int k = ib; ok && k <= ie; k++) if (!mat[k]) ok = 0;
                     if (ok && C) { int c0 = 0; for (int p = 0; p < nct; p++) c0 += ctpk[p] >= ra + g2 && ctpk[p] < rb + g2; v.t[2] = (float)c0; }
                     for (int s = 0; s < J->ns; s++) {
+                        if (J->S[s].hasbox) { int fin = 1; const int k0 = (int)fmax(0, ra - g2), k1 = (int)fmin(n - 1, rb + g2); for (int k = k0; k <= k1 && fin; k++) if (!(V[s][k] == V[s][k])) fin = 0; if (!fin) continue; }
                         if (ok) v.t[3 + 3 * s] = (float)rr_count_hits(H[s], nH[s], ra + g2, rb + g2);
                         v.t[4 + 3 * s] = (float)rr_lin(&H[s][0].pos, 4, nH[s], ra, rb); v.t[5 + 3 * s] = (float)rr_lin(R[s], 1, nR[s], ra, rb); }
                     v.ia = ia; v.ib = ib;
@@ -441,6 +447,11 @@ int cmd_recto_ruler(int argc, char **argv) {
                 if (f < 0) { fprintf(stderr, "recto-ruler: --ens: no source %s (sources first)\n", tok); return 2; } s->ea[s->ne++] = f; if (S[f].um < s->um) s->um = S[f].um; }
             ns++; i += 3;
         }
+    }
+    for (int i = 3; i + 2 < argc; i++) if (!strcmp(argv[i], "--src-box")) {
+        int f = -1; for (int k = 0; k < ns; k++) if (!strcmp(S[k].name, argv[i + 1])) f = k;
+        if (f < 0 || sscanf(argv[i + 2], "%lf,%lf,%lf,%lf,%lf,%lf", &S[f].vb[0], &S[f].vb[1], &S[f].vb[2], &S[f].vb[3], &S[f].vb[4], &S[f].vb[5]) != 6) { fprintf(stderr, "recto-ruler: --src-box NAME Z0,Y0,X0,Z1,Y1,X1\n"); return 2; }
+        S[f].hasbox = 1; i += 2;
     }
     for (int i = 3; i + 2 < argc; i++) if (!strcmp(argv[i], "--map")) {   /* --map NAME REG.json: NAME's UM is its own voxel um (fine scan level) */
         int f = -1; for (int k = 0; k < ns; k++) if (!strcmp(S[k].name, argv[i + 1])) f = k;
