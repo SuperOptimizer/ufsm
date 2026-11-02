@@ -76,13 +76,47 @@ static void pi_reduce(pi_recs *R) {   /* sort + merge equal keys */
     R->n = o + 1;
 }
 
-/* union-find with turn offsets: theta_parent = theta_c + 2 pi off[c] */
-typedef struct { uint32_t *par; int16_t *off; uint32_t *sz; size_t n, cap; long long merges, refused, cycles; } pi_uf;
+/* union-find with turn offsets: theta_parent = theta_c + 2 pi off[c]. Every set is kept a height field: per cell (z block, angle bin
+   of 1/NA turn in the root's unwrapped frame) the radius range of its atoms' centroids; a join that would put two atoms more than
+   tol voxels apart in radius into one cell (two sheets stacked on one ray: a merge) is refused. Small-to-large over atom lists. */
+typedef struct { uint64_t *k; float *lo, *hi; size_t cap, used; } pi_hash;   /* key 0 empty, 1 tombstone */
+static inline uint64_t pi_hkey(uint32_t root, int32_t zb, int32_t ab) { return ((uint64_t)(root + 1) << 32) | ((uint64_t)(zb & 0xFFF) << 20) | (uint64_t)(ab & 0xFFFFF); }
+static size_t pi_hslot(const pi_hash *H, uint64_t key, int *found) {   /* the key's slot, or the first free / tombstone slot */
+    size_t i = (size_t)(pi_mix(key) & (H->cap - 1)), tomb = SIZE_MAX;
+    for (;;) {
+        const uint64_t k = H->k[i];
+        if (k == key) { *found = 1; return i; }
+        if (k == 0) { *found = 0; return tomb != SIZE_MAX ? tomb : i; }
+        if (k == 1 && tomb == SIZE_MAX) tomb = i;
+        i = (i + 1) & (H->cap - 1);
+    }
+}
+static void pi_hput(pi_hash *H, uint64_t key, float r);
+static void pi_hgrow(pi_hash *H) {
+    pi_hash N = {calloc(H->cap * 2, 8), malloc(H->cap * 2 * 4), malloc(H->cap * 2 * 4), H->cap * 2, 0};
+    if (!N.k || !N.lo || !N.hi) { fprintf(stderr, "patch-id: no memory for the height-field table\n"); exit(1); }
+    for (size_t i = 0; i < H->cap; i++) if (H->k[i] > 1) { int f; const size_t j = pi_hslot(&N, H->k[i], &f); N.k[j] = H->k[i]; N.lo[j] = H->lo[i]; N.hi[j] = H->hi[i]; N.used++; }
+    free(H->k); free(H->lo); free(H->hi); *H = N;
+}
+static void pi_hput(pi_hash *H, uint64_t key, float r) {
+    if (2 * (H->used + 1) > H->cap) pi_hgrow(H);
+    int f; const size_t i = pi_hslot(H, key, &f);
+    if (f) { if (r < H->lo[i]) H->lo[i] = r; if (r > H->hi[i]) H->hi[i] = r; return; }
+    if (H->k[i] == 0) H->used++;
+    H->k[i] = key; H->lo[i] = H->hi[i] = r;
+}
+static void pi_hdel(pi_hash *H, uint64_t key) { int f; const size_t i = pi_hslot(H, key, &f); if (f) H->k[i] = 1; }
+static int pi_hget(const pi_hash *H, uint64_t key, float *lo, float *hi) { int f; const size_t i = pi_hslot(H, key, &f); if (f) { *lo = H->lo[i]; *hi = H->hi[i]; } return f; }
+
+typedef struct { uint32_t *par; int16_t *off; uint32_t *sz; int32_t *zb, *ab; float *r; uint32_t *nxt, *tail; size_t n, cap; long long merges, refused, cycles; pi_hash H; int NA; float tol; } pi_uf;
 static void pi_uf_grow(pi_uf *U, size_t n) {
     if (n <= U->cap) return;
     size_t c = U->cap ? U->cap : 1 << 20; while (c < n) c *= 2;
-    U->par = realloc(U->par, c * 4); U->off = realloc(U->off, c * 2); U->sz = realloc(U->sz, c * 4); if (!U->par || !U->off || !U->sz) { fprintf(stderr, "patch-id: no memory for %zu atoms\n", c); exit(1); }
+    U->par = realloc(U->par, c * 4); U->off = realloc(U->off, c * 2); U->sz = realloc(U->sz, c * 4);
+    U->zb = realloc(U->zb, c * 4); U->ab = realloc(U->ab, c * 4); U->r = realloc(U->r, c * 4); U->nxt = realloc(U->nxt, c * 4); U->tail = realloc(U->tail, c * 4);
+    if (!U->par || !U->off || !U->sz || !U->zb || !U->ab || !U->r || !U->nxt || !U->tail) { fprintf(stderr, "patch-id: no memory for %zu atoms\n", c); exit(1); }
     U->cap = c;
+    if (!U->H.cap) { U->H.cap = 1 << 22; U->H.k = calloc(U->H.cap, 8); U->H.lo = malloc(U->H.cap * 4); U->H.hi = malloc(U->H.cap * 4); }
 }
 static uint32_t pi_find(pi_uf *U, uint32_t c, int *T) {
     uint32_t r = c; int t = 0;
@@ -92,18 +126,35 @@ static uint32_t pi_find(pi_uf *U, uint32_t c, int *T) {
     while (U->par[x] != x) { const uint32_t p = U->par[x]; const int o = U->off[x]; U->par[x] = r; U->off[x] = (int16_t)tx; tx -= o; x = p; }
     *T = t; return r;
 }
+/* a new atom (its own set; zb / ab / r set) */
+static void pi_atom(pi_uf *U, uint32_t a) { U->par[a] = a; U->off[a] = 0; U->sz[a] = 1; U->nxt[a] = PI_NONE; U->tail[a] = a; if (U->r[a] >= 0) pi_hput(&U->H, pi_hkey(a, U->zb[a], U->ab[a]), U->r[a]); }
 /* join a and b with theta_a = theta_b + 2 pi t */
 static void pi_join(pi_uf *U, uint32_t a, uint32_t b, int t) {
-    int Ta, Tb; const uint32_t ra = pi_find(U, a, &Ta), rb = pi_find(U, b, &Tb);
+    int Ta, Tb; uint32_t ra = pi_find(U, a, &Ta), rb = pi_find(U, b, &Tb);
     if (ra == rb) { if (Tb - t != Ta) U->cycles++; return; }
     /* theta_ra = theta_a + 2pi Ta = theta_b + 2pi (t + Ta); theta_rb = theta_b + 2pi Tb -> theta_ra = theta_rb + 2pi (t + Ta - Tb) */
-    const int o = t + Ta - Tb;
-    if (U->sz[ra] >= U->sz[rb]) { U->par[rb] = ra; U->off[rb] = (int16_t)o; U->sz[ra] += U->sz[rb]; }
-    else { U->par[ra] = rb; U->off[ra] = (int16_t)(-o); U->sz[rb] += U->sz[ra]; }
+    int o = t + Ta - Tb;
+    if (U->sz[ra] < U->sz[rb]) { const uint32_t x = ra; ra = rb; rb = x; o = -o; }   /* ra large: theta_ra = theta_rb + 2 pi o */
+    if (U->tol > 0) {
+        for (uint32_t x = rb; x != PI_NONE; x = U->nxt[x]) {
+            if (U->r[x] < 0) continue;
+            int Tx; pi_find(U, x, &Tx); float lo, hi;
+            if (pi_hget(&U->H, pi_hkey(ra, U->zb[x], U->ab[x] + (Tx + o) * U->NA), &lo, &hi) && (U->r[x] < lo - U->tol || U->r[x] > hi + U->tol)) { U->refused++; return; }
+        }
+        for (uint32_t x = rb; x != PI_NONE; x = U->nxt[x]) {
+            if (U->r[x] < 0) continue;
+            int Tx; pi_find(U, x, &Tx);
+            pi_hdel(&U->H, pi_hkey(rb, U->zb[x], U->ab[x] + Tx * U->NA));
+            pi_hput(&U->H, pi_hkey(ra, U->zb[x], U->ab[x] + (Tx + o) * U->NA), U->r[x]);
+        }
+    }
+    U->par[rb] = ra; U->off[rb] = (int16_t)o; U->sz[ra] += U->sz[rb];
+    U->nxt[U->tail[ra]] = rb; U->tail[ra] = U->tail[rb];
     U->merges++;
 }
 
-typedef struct { uint32_t a, b; int t; } pi_link;
+typedef struct { uint32_t a, b; int t; uint32_t n; } pi_link;
+static int pi_cmp_link(const void *x, const void *y) { const pi_link *a = x, *b = y; if (a->n != b->n) return a->n > b->n ? -1 : 1; if (a->a != b->a) return a->a < b->a ? -1 : 1; return (a->b > b->b) - (a->b < b->b); }
 typedef struct { pi_link *l; size_t n, cap; } pi_links;
 static void pi_lpush(pi_links *L, pi_link x) { if (L->n == L->cap) { L->cap = L->cap ? 2 * L->cap : 4096; L->l = realloc(L->l, L->cap * sizeof *L->l); if (!L->l) abort(); } L->l[L->n++] = x; }
 
@@ -115,7 +166,7 @@ typedef struct {
     uint32_t *prev; float *prev_phi; int have_prev;   /* the previous band's last z plane: global atom ids (PI_NONE) and its block angles */
     int CR, NS, *nrb; uint32_t *cbase;   /* cells: per wrap row blocks, cell index base */
     _Atomic long next; long nitems; _Atomic int fail, slot; int nt;   /* slot: the pass's worker index (reset per pass) */
-    pi_recs *trec; pi_links *tlink; pi_smps *tsmp; uint32_t smp_T; double mm;   /* per thread; sample threshold; grid voxel in mm */
+    pi_uf *U; pi_recs *trec; pi_links *tlink; pi_smps *tsmp; uint32_t smp_T; double mm;   /* per thread; sample threshold; grid voxel in mm */
     _Atomic long long nvert, nhit, namb, ngt; double *gre, *gim;   /* per thread circular sums of e */
 } pi_job;
 
@@ -271,7 +322,7 @@ static void pi_face(pi_job *J, uint32_t *ka, uint32_t *kb, int n, int t, pi_link
             if (y->a == x->a) { if (y->n > x->n || (y->n == x->n && y->b < x->b)) best = 0; if (y->n > s2a) s2a = y->n; }
             if (y->b == x->b) { if (y->n > x->n || (y->n == x->n && y->a < x->a)) best = 0; if (y->n > s2b) s2b = y->n; } }
         if (!best || s2a >= J->ratio * x->n || s2b >= J->ratio * x->n) continue;
-        pi_lpush(L, (pi_link){x->a, x->b, t});
+        pi_lpush(L, (pi_link){x->a, x->b, t, x->n});
     }
 }
 static inline uint32_t pi_gid(const pi_job *J, size_t bi, uint16_t l) { return l && l != PI_BAD ? J->base[bi] + l - 1 : PI_NONE; }
@@ -305,6 +356,25 @@ static void *pi_link_run(void *arg) {
             if (!isnan(J->prev_phi[pb])) {
                 for (int y = 0; y < B; y++) for (int x = 0; x < B; x++) { ka[y * B + x] = pi_gid(J, bi, PI_L(0, Y0 + y, X0 + x)); kb[y * B + x] = J->prev[(size_t)(Y0 + y) * J->NX + (X0 + x)]; }
                 pi_face(J, ka, kb, B * B, pi_turn(J->phi[bi], J->prev_phi[pb]), &loc, P);
+            }
+        }
+        { /* the block's atoms: centroid z block, angle bin (atom frame), radius */
+            const int nc = J->ncomp[bi];
+            if (nc) {
+                double *acc = calloc((size_t)nc * 4, sizeof(double));
+                for (int z = 0; z < B; z++) for (int y = 0; y < B; y++) for (int x = 0; x < B; x++) {
+                    const uint16_t l = PI_L(Z0 + z, Y0 + y, X0 + x); if (!l || l == PI_BAD) continue;
+                    double *a = acc + 4 * (l - 1); a[0]++; a[1] += z; a[2] += y; a[3] += x; }
+                for (int l = 0; l < nc; l++) {
+                    const double *a = acc + 4 * l; const uint32_t g = J->base[bi] + l;
+                    if (!(a[0] > 0)) { J->U->r[g] = -1; J->U->zb[g] = J->U->ab[g] = 0; continue; }
+                    const double gz = J->o[0] + Z0 + a[1] / a[0], gy = J->o[1] + Y0 + a[2] / a[0], gx = J->o[2] + X0 + a[3] / a[0];
+                    double cy, cx; pi_axis(J, gz, &cy, &cx);
+                    const double th = atan2(gy - cy, gx - cx), ph = J->phi[bi], tc = ph + pi_ang(th - ph);
+                    J->U->r[g] = (float)hypot(gy - cy, gx - cx); J->U->zb[g] = (int32_t)floor(gz / B);
+                    J->U->ab[g] = (int32_t)floor((tc + M_PI) / (2 * M_PI) * J->U->NA);
+                }
+                free(acc);
             }
         }
         #undef PI_L
@@ -450,7 +520,8 @@ int cmd_patch_id(int argc, char **argv) {
     J.trec = calloc(J.nt, sizeof *J.trec); J.tsmp = calloc(J.nt, sizeof *J.tsmp); J.mm = gum * 1e-3;
     J.smp_T = (uint32_t)(4294967295.0 * atof(pi_opt(argc, argv, "--pair-rate", "0.02"))); J.tlink = calloc(J.nt, sizeof *J.tlink); J.gre = calloc(J.nt, sizeof(double)); J.gim = calloc(J.nt, sizeof(double));
     if (!J.sheet || !J.lab || (zg && !J.gt) || !J.base || !J.prev) { fprintf(stderr, "patch-id: no memory for the band buffers\n"); return 1; }
-    pi_uf U = {0}; size_t natoms = 0; pi_recs ALL = {0};
+    pi_uf U = {0}; size_t natoms = 0; J.U = &U;
+    U.NA = atoi(pi_opt(argc, argv, "--hf-bins", "2048")); U.tol = (float)atof(pi_opt(argc, argv, "--hf-tol", "3")); pi_recs ALL = {0};
     double tread = 0, tcc = 0, tlink = 0, tvert = 0;
     for (int64_t z0 = zr0; z0 < zr1; z0 += J.BAND) {
         const int64_t z1 = z0 + J.BAND < zr1 ? z0 + J.BAND : zr1, nz = z1 - z0;
@@ -472,14 +543,18 @@ int cmd_patch_id(int argc, char **argv) {
         for (size_t b = 0; b < nbb; b++) { J.base[b] = (uint32_t)natoms; natoms += J.ncomp[b]; }
         if (natoms >= PI_NONE) { fprintf(stderr, "patch-id: too many atoms\n"); return 1; }
         pi_uf_grow(&U, natoms);
-        for (size_t a = U.n; a < natoms; a++) { U.par[a] = (uint32_t)a; U.off[a] = 0; U.sz[a] = 1; }
-        U.n = natoms;
+        for (size_t a = U.n; a < natoms; a++) { U.r[a] = -1; U.par[a] = (uint32_t)a; }
         double tc = pi_now(); tcc += tc - tb;
         { for (int t = 0; t < J.nt; t++) J.tlink[t].n = 0;
           pi_lkjob K = {&J, 0}; pthread_t th[64]; atomic_store(&J.slot, 0);
           for (int t = 0; t < J.nt; t++) pthread_create(&th[t], nullptr, pi_link_run, &K); for (int t = 0; t < J.nt; t++) pthread_join(th[t], nullptr); }
         long long nl = 0;
-        for (int t = 0; t < J.nt; t++) { for (size_t i = 0; i < J.tlink[t].n; i++) pi_join(&U, J.tlink[t].l[i].a, J.tlink[t].l[i].b, J.tlink[t].l[i].t); nl += (long long)J.tlink[t].n; }
+        for (size_t a = U.n; a < natoms; a++) pi_atom(&U, (uint32_t)a);
+        U.n = natoms;
+        { pi_links AL = {0}; for (int t = 0; t < J.nt; t++) for (size_t i = 0; i < J.tlink[t].n; i++) pi_lpush(&AL, J.tlink[t].l[i]);
+          qsort(AL.l, AL.n, sizeof *AL.l, pi_cmp_link);   /* strongest contacts first */
+          for (size_t i = 0; i < AL.n; i++) pi_join(&U, AL.l[i].a, AL.l[i].b, AL.l[i].t);
+          nl += (long long)AL.n; free(AL.l); }
         double td = pi_now(); tlink += td - tc;
         /* vertices */
         { long *rs = malloc((nw + 1) * sizeof *rs); rs[0] = 0; for (int k = 0; k < nw; k++) rs[k + 1] = rs[k] + W[k].bn;
@@ -497,7 +572,7 @@ int cmd_patch_id(int argc, char **argv) {
           for (int b = 0; b < J.nby * J.nbx; b++) J.prev_phi[b] = J.phi[(size_t)(lz / J.B) * J.nby * J.nbx + b];
           J.have_prev = 1; }
         fprintf(stderr, "\rpatch-id: z %lld / %lld: %zu atoms, %lld merges (%lld loop refusals), links %lld, %lld vertices on an atom of %lld  %.0fs   ",
-                (long long)z1, (long long)zr1, natoms, U.merges, U.cycles, nl, (long long)atomic_load(&J.nhit), (long long)atomic_load(&J.nvert), pi_now() - t0);
+                (long long)z1, (long long)zr1, natoms, U.merges, U.cycles, U.refused, nl, (long long)atomic_load(&J.nhit), (long long)atomic_load(&J.nvert), pi_now() - t0);
     }
     fprintf(stderr, "\npatch-id: read %.0fs, components %.0fs, links %.0fs, vertices %.0fs\n", tread, tcc, tlink, tvert);
     pi_reduce(&ALL);
@@ -589,8 +664,8 @@ int cmd_patch_id(int argc, char **argv) {
         if (W[k].id >= 89 && W[k].id <= 170) { Pk.n += s->n; Pk.np += s->np; Pk.g += s->g; Pk.rb += s->rb; Pk.rr += s->rr; Pk.rc += s->rc; }
     }
     if (fw) fclose(fw);
-    printf("patch-id: %zu atoms, %lld merges, %lld loop refusals; %zu patches with votes, %zu kept (>= %lld votes, majority >= %.2f): %.3f of the voted vertices; "
-           "majority share %.3f (vote-weighted)\n", natoms, U.merges, U.cycles, npa, nok, min_votes, min_share, vtot ? (double)vok / vtot : 0, vok ? sh_w / vok : 0);
+    printf("patch-id: %zu atoms, %lld merges, %lld loop / %lld height-field refusals; %zu patches with votes, %zu kept (>= %lld votes, majority >= %.2f): %.3f of the voted vertices; "
+           "majority share %.3f (vote-weighted)\n", natoms, U.merges, U.cycles, U.refused, npa, nok, min_votes, min_share, vtot ? (double)vok / vtot : 0, vok ? sh_w / vok : 0);
     printf("patch-id: vertices %lld, on an atom %.3f (ambiguous %.3f), in a kept patch %.3f; cells %lld, with patch votes %lld, corrected (dk != 0) %lld\n",
            (long long)J.nvert, J.nvert ? (double)J.nhit / J.nvert : 0, J.nvert ? (double)J.namb / J.nvert : 0, A.n ? (double)A.np / A.n : 0, ncell, ncellp, ncellfix);
     if (zg) {
