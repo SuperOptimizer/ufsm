@@ -29,7 +29,11 @@ trim=()
 if [ -n "${TRIM_S:-}" ]; then trim=(--first ${TRIM_S%,*} --last ${TRIM_S#*,})   # (env first: fixed surfaces have their own trim)
 elif [ -s "$sj" ]; then read -r a b <<< "$(jq -r '.wraps | "\(min) \(max)"' $sj)"; trim=(--first $a --last $b); fi
 [ -n "${GRIDUP:-}" ] && ctlev=$((ctlev + GRIDUP))   # GRIDUP=1: labels on the next coarser CT level (8x smaller / faster; the sampler interpolates a stored phase one level coarser)
-ct=$CTL/$ctk/$ctlev; [ -e $ct/zarr.json ] || { echo "surflabels: no local CT $ct" >&2; exit 2; }
+ct=$CTL/$ctk/$ctlev
+if [ ! -e $ct/zarr.json ] && [ -n "${GRIDUP:-}" ]; then   # (the coarser level is not in the local copy: the volcomp mirror's)
+  CTL=${MIRROR:-https://dl.ash2txt.org/community-uploads/forrest/volcomp}; ctk=$S/volumes/$(basename $ctk); ct=$CTL/$ctk/$ctlev
+  curl -sf --max-time 60 -o /dev/null $ct/zarr.json || { echo "surflabels: no CT $ct" >&2; exit 2; }
+else [ -e $ct/zarr.json ] || { echo "surflabels: no local CT $ct" >&2; exit 2; }; fi
 gum=$(awk -v u=$ctum -v l=$ctlev 'BEGIN {printf "%.10g", u * 2 ^ l}')
 gates=(); [ -s "$wc" ] && gates+=(--wrapcheck $wc); [ -n "${PEAKS:-}" ] && gates+=(--band-peaks $PEAKS)
 op=${ONPAP:-0.2}; [ "$op" != 0 ] && gates+=(--min-onpap $op)
