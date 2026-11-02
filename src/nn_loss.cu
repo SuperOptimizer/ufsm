@@ -247,10 +247,10 @@ extern "C" void nn_loss_grad_only(const void *logits, const uint8_t *t, const ui
    of the logit gradient. out2 (device): mean loss, valid segments, mean Tp / Tg (the count ratio). */
 __device__ __forceinline__ int cnt_pdiff(int a, int b) { int d = a - b; d -= 252 * (d > 126); d += 252 * (d <= -126); return d; }
 __device__ __forceinline__ uint64_t cnt_mix(uint64_t x) { x ^= x >> 30; x *= 0xbf58476d1ce4e5b9ull; x ^= x >> 27; x *= 0x94d049bb133111ebull; return x ^ (x >> 31); }
-struct cnt_strata { int n; float e[8]; };   /* nn_count_strata: n spacing-bin edges (voxels, ascending); n 0 = off */
+struct cnt_strata { int n; float e[8]; int gtrho; };   /* gtrho (UFSM_COUNT_GTRHO=1, diagnostic): Tp from the GT phase's own |gradient|, not the logits */   /* nn_count_strata: n spacing-bin edges (voxels, ascending); n 0 = off */
 static cnt_strata g_cnt_strata;
 extern "C" void nn_count_strata(int n, const float *edges_um, float um) {
-    g_cnt_strata.n = (n > 0 && n <= 8 && um > 0) ? n : 0;
+    g_cnt_strata.n = (n > 0 && n <= 8 && um > 0) ? n : 0; g_cnt_strata.gtrho = ufsm_env_on("UFSM_COUNT_GTRHO");
     for (int i = 0; i < g_cnt_strata.n; i++) g_cnt_strata.e[i] = edges_um[i] / um;
 }
 template <typename LT> __global__ void count_seg_k(const LT *dl, const uint8_t *ph, int D, int H, int W, int s, int K, int L, float dscale, uint64_t seed,
@@ -282,7 +282,15 @@ template <typename LT> __global__ void count_seg_k(const LT *dl, const uint8_t *
             const size_t i = (size_t)zz * HW + (size_t)yy * W + xx; const int v = ph[i];
             if (v >= 252) { valid = 0; break; }
             if (j) tg += cnt_pdiff(v, prev) * (1.f / 252.f);
-            prev = v; if (j < L - 1) tp += __expf(fminf(lgv(dl, i), 20.f)) / dscale;   /* L - 1 unit steps: rho of each step's start */
+            if (j < L - 1) {   /* L - 1 unit steps: rho of each step's start */
+                if (st.gtrho) {   /* the GT density at this voxel: |central phase difference over +-s| / (2 s 252) */
+                    const int zz2 = zz < s ? s : zz >= D - s ? D - 1 - s : zz, yy2 = yy < s ? s : yy >= H - s ? H - 1 - s : yy, xx2 = xx < s ? s : xx >= W - s ? W - 1 - s : xx;
+                    const size_t c = (size_t)zz2 * HW + (size_t)yy2 * W + xx2; const int b6[6] = {ph[c + sz], ph[c - sz], ph[c + sy], ph[c - sy], ph[c + s], ph[c - s]};
+                    int okk = 1; for (int q = 0; q < 6; q++) okk &= b6[q] < 252;
+                    if (okk) { const float a = cnt_pdiff(b6[0], b6[1]), bq = cnt_pdiff(b6[2], b6[3]), cq = cnt_pdiff(b6[4], b6[5]); tp += sqrtf(a * a + bq * bq + cq * cq) / (2.f * s * 252.f); }
+                } else tp += __expf(fminf(lgv(dl, i), 20.f)) / dscale;
+            }
+            prev = v;
         }
         if (!valid || tg < .5f) continue;
         const float e = .05f, r = logf((tp + e) / (tg + e)), coef = (r > 0 ? 1.f : -1.f) / (tp + e);

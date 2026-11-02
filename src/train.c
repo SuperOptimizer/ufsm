@@ -1025,6 +1025,26 @@ static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
         nn_loss_async_tol((const float *)((const char *)lg + g_norm_ch * l3 * le), d->nt, d->nm, d->nw, seven, 0.f,
                           train ? (float *)((char *)d->gl + g_norm_ch * l3 * eb) : nullptr, d->nscratch, nullptr);
         if (train && g_norm_lambda != 1.f) nn_loss_grad_scale((char *)d->gl + g_norm_ch * l3 * eb, 7 * l3, g_norm_lambda);
+        if (getenv("UFSM_DUMP_DENS")) {   /* diagnostic: the mid-z plane of sigmoid(density logit) x 255 of the first UFSM_DUMP_N (4) windows
+                                               as PREFIX-NN.pgm (+ source / level / corner on stderr), for an A/B against predict --channel */
+            static int ndd = 0; const int N = getenv("UFSM_DUMP_N") ? atoi(getenv("UFSM_DUMP_N")) : 4;
+            if (ndd < N && os.h == os.w) {
+                const int dch_ = getenv("UFSM_DUMP_DENS_CH") ? atoi(getenv("UFSM_DUMP_DENS_CH")) : g_norm_ch + 6;   /* (default: the density channel) */
+                const size_t pl = (size_t)os.h * os.w, off = ((size_t)dch_ * l3 + (size_t)(os.d / 2) * pl) * le;
+                void *hb = malloc(pl * le); uint8_t *img = malloc(pl);
+                if (hb && img) {
+                    nn_sync(); nn_d2h(hb, (const char *)lg + off, pl * le);
+                    for (size_t k = 0; k < pl; k++) { float v; if (le == 2) { _Float16 h; memcpy(&h, (char *)hb + 2 * k, 2); v = (float)h; } else memcpy(&v, (char *)hb + 4 * k, 4);
+                        const float sgm = 1.f / (1.f + expf(-v)); img[k] = (uint8_t)lrintf(255.f * sgm); }
+                    char path[1100]; snprintf(path, sizeof path, "%s-c%d-%02d.pgm", getenv("UFSM_DUMP_DENS"), dch_, ndd);
+                    FILE *f = fopen(path, "wb"); if (f) { fprintf(f, "P5\n%d %d\n255\n", os.w, os.h); fwrite(img, 1, pl, f); fclose(f); }
+                    fprintf(stderr, "dumped channel %d le %d %s (source %d, level %d, um %.3f, corner %lld %lld %lld, window %d^3, plane z %d)\n", dch_, (int)le, path, d->srcb[d->cur], d->lvlb[d->cur], d->um,
+                            (long long)d->cornb[d->cur][0], (long long)d->cornb[d->cur][1], (long long)d->cornb[d->cur][2], os.h, os.d / 2);
+                    ndd++;
+                }
+                free(hb); free(img);
+            }
+        }
         if (g_count_lambda > 0) {   /* turns along sheet-normal segments: the density integral against the true count */
             const size_t dch = (size_t)(g_norm_ch + 6);
             nn_count_strata(g_cnt_ns, g_cnt_edges, d->um);
@@ -1516,6 +1536,15 @@ int cmd_train(int argc, char **argv) {
     }
     unet_cfg cfg = {4, {16, 32, 64, 80}, 4, g_cout, 8, 0, 0};
     cfg.down_norm = atoi(opt(argc, argv, "--down-norm", "0"));
+    {   /* --init-from: the donor's down-sampling GroupNorm. Without it the copied trunk runs un-normalised (copy_gn skips the dn layers):
+           wind96 (down_norm 1) warm-started into a down_norm 0 net gave bias-only, spatially constant logits (CAL 11-01). Default: the
+           donor's value; an explicit different --down-norm is refused */
+        const char *ifp = opt(argc, argv, "--init-from", nullptr); unet_cfg dc; int ds;
+        if (ifp && !opt(argc, argv, "--resume", nullptr) && !unet_peek(ifp, &dc, &ds) && dc.down_norm != cfg.down_norm) {
+            if (*opt(argc, argv, "--down-norm", "")) { fprintf(stderr, "--init-from %s has down_norm %d, --down-norm %d: the trunk would run without its normalisation\n", ifp, dc.down_norm, cfg.down_norm); return 2; }
+            fprintf(stderr, "init-from: down_norm %d from the donor %s\n", dc.down_norm, ifp); cfg.down_norm = dc.down_norm;
+        }
+    }
     { const char *ln = opt(argc, argv, "--l0-norm", "gn");   /* level-0 normalisation (unet_cfg.l0_norm): gn, none (affine + SiLU), ema (running statistics), ws (none + weight standardisation), slab (GroupNorm per z-slab) */
       cfg.l0_norm = !strcmp(ln, "none") ? 1 : !strcmp(ln, "ema") ? 2 : !strcmp(ln, "ws") ? 3 : !strcmp(ln, "slab") ? 4 : 0;
       if (!cfg.l0_norm && strcmp(ln, "gn")) { fprintf(stderr, "--l0-norm gn|none|ema|ws|slab\n"); return 2; }
