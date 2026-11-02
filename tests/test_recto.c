@@ -31,7 +31,8 @@ static int save_model(const char *dir, double pitch) {
 static double tsv_val(const char *path, const char *table, const char *bin, const char *src) {
     FILE *f = fopen(path, "r"); char ln[512]; double v = NAN;
     while (f && fgets(ln, sizeof ln, f)) { char t[32], b[32], s[64]; double n, r, o; if (sscanf(ln, "%31s %31s %63s %lf %lf %lf", t, b, s, &n, &r, &o) == 6 && !strcmp(t, table) && !strcmp(b, bin) && !strcmp(s, src)) v = r; }
-    if (f) fclose(f); return v;
+    if (f) fclose(f);
+    return v;
 }
 
 int main(void) {
@@ -79,6 +80,16 @@ int main(void) {
             long long cnt = 0, mat = 0; double s = 0; for (size_t i = 0; i < nc; i++) { if (!a[9][i]) continue; mat++; if (b[i]) { cnt++; s += b[i]; } }
             printf("test_recto: recto-sp: %lld of %lld material cells, mean sp code %.2f (expected %.0f)\n", cnt, mat, cnt ? s / cnt : 0, SP * 8 / H2);
             CHECK(cnt > mat / 2 && fabs(s / cnt - SP * 8 / H2) < 3, "recto spacing %.2f on %lld / %lld", cnt ? s / cnt : 0, cnt, mat);
+            free(b); z3_close(z); } }
+    {   /* --cls: the classifier's turns (all 1 here) give the same spacing */
+        char out2[700]; snprintf(out2, sizeof out2, "%s2", out);
+        char *a2[] = {"ufsm", "recto-sp", fd, out2, "--src", dir, "rv.zarr", "9.6", "--stride", "2", "--half-um", "300", "--threads", "4", "--cls", cls};
+        CHECK(cmd_recto_sp(16, a2) == 0, "recto-sp --cls");
+        z3 *z = z3_open(store_open(out2), "rsp", nullptr); CHECK(z != nullptr, "open rsp (cls)");
+        if (z) { uint8_t *b = malloc(nc); const int64_t o[3] = {0, 0, 0}, n[3] = {D, HH, HH}; CHECK(!z3_read(z, o, n, b, 4), "read rsp (cls)");
+            long long cnt = 0; double s = 0; for (size_t i = 0; i < nc; i++) if (a[9][i] && b[i]) { cnt++; s += b[i]; }
+            printf("test_recto: recto-sp --cls: %lld cells, mean sp code %.2f\n", cnt, cnt ? s / cnt : 0);
+            CHECK(cnt > 1000 && fabs(s / cnt - SP * 8 / H2) < 4, "cls spacing %.2f", cnt ? s / cnt : 0);
             free(b); z3_close(z); } }
     for (int k = 0; k < 10; k++) free(a[k]);
     free(v); free(q);
