@@ -588,17 +588,41 @@ extern "C" void nn_fit_loss2(const fit_dev *f, double *parts, float *g_delta) {
     KCHECK();
 }
 
-__global__ void fit_grid_k(const fit_dev *ms, const fit_grid_row *rows, int ny, int nx, float y0, float x0, float step, int with_theta, float *out) {
-    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; const int a = blockIdx.y;
-    if (i >= (size_t)ny * nx) return;
-    const int b = (int)(i / nx), c = (int)(i % nx);
-    const fit_grid_row r = rows[a];
+/* one grid point (row r, voxel (b, c)): the dense and the sparse grid kernels share it (the same float operations: the same bits) */
+__device__ __forceinline__ float fit_grid_pt(const fit_dev *ms, const fit_grid_row &r, int b, int c, float y0, float x0, float step, int with_theta) {
     const float y = y0 + ((float)b + 0.5f) * step, x = x0 + ((float)c + 0.5f) * step, itp = 0.15915494309189535f;
     fit_pt p; fit_eval(ms[r.a], r.z - r.za, y, x, p);
     const float tha = p.th;
     float W = p.U - (float)ms[r.a].dir * p.th * itp;
     if (r.t > 0.f) { fit_pt q; fit_eval(ms[r.b], r.z - r.zb, y, x, q); W = (1.f - r.t) * W + r.t * (q.U - (float)ms[r.b].dir * q.th * itp); }
-    out[(size_t)a * ny * nx + i] = with_theta ? W + (float)ms[r.a].dir * tha * itp : W;
+    return with_theta ? W + (float)ms[r.a].dir * tha * itp : W;
+}
+__global__ void fit_grid_k(const fit_dev *ms, const fit_grid_row *rows, int ny, int nx, float y0, float x0, float step, int with_theta, float *out) {
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; const int a = blockIdx.y;
+    if (i >= (size_t)ny * nx) return;
+    const int b = (int)(i / nx), c = (int)(i % nx);
+    out[(size_t)a * ny * nx + i] = fit_grid_pt(ms, rows[a], b, c, y0, x0, step, with_theta);
+}
+/* the grid's points whose mask bit is set (bit i of the row-major nz x ny x nx grid: word i / 64, bit i % 64), packed in index order:
+   point i at out[woff[i / 64] + rank of bit i % 64 in its word] (woff: the exclusive prefix count of the set bits per word) */
+__global__ void fit_grid_sparse_k(const fit_dev *ms, const fit_grid_row *rows, const unsigned long long *mask, const unsigned *woff, size_t nw, int ny, int nx,
+                                  float y0, float x0, float step, int with_theta, float *out) {
+    const size_t w = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (w >= nw) return;
+    unsigned long long m = mask[w]; unsigned o = woff[w];
+    const size_t per = (size_t)ny * nx;
+    while (m) {
+        const int j = __ffsll((long long)m) - 1; m &= m - 1;
+        const size_t i = w * 64 + j; const int a = (int)(i / per); const size_t rr = i - (size_t)a * per;
+        const int b = (int)(rr / nx), c = (int)(rr % nx);
+        out[o++] = fit_grid_pt(ms, rows[a], b, c, y0, x0, step, with_theta);
+    }
+}
+void nn_fit_grid_sparse(const fit_dev *ms, const fit_grid_row *rows, const uint64_t *mask, const uint32_t *woff, size_t nw, int ny, int nx, float y0, float x0, float step,
+                        int with_theta, float *out) {
+    if (!nw) return;
+    fit_grid_sparse_k<<<(unsigned)((nw + 127) / 128), 128>>>(ms, rows, (const unsigned long long *)mask, (const unsigned *)woff, nw, ny, nx, y0, x0, step, with_theta, out);
+    CK(cudaGetLastError());
 }
 void nn_fit_grid(const fit_dev *ms, const fit_grid_row *rows, int nz, int ny, int nx, float y0, float x0, float step, int with_theta, float *out) {
     if (nz <= 0 || ny <= 0 || nx <= 0) return;

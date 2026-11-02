@@ -238,6 +238,10 @@ void nn_fit_accum_dm(const float *lg, const uint8_t *ct, const uint32_t *bits, i
    models (device pointers inside); out: device float nz x ny x nx */
 typedef struct { int a, b; float z, t, za, zb; } fit_grid_row;
 void nn_fit_grid(const fit_dev *ms, const fit_grid_row *rows, int nz, int ny, int nx, float y0, float x0, float step, int with_theta, float *out);
+/* the points of that grid whose bit is set in mask (row-major point i: word i / 64, bit i % 64; nw words), packed into out in index
+   order (woff: per word the number of set bits before it); each value bit-identical to nn_fit_grid's */
+void nn_fit_grid_sparse(const fit_dev *ms, const fit_grid_row *rows, const uint64_t *mask, const uint32_t *woff, size_t nw, int ny, int nx, float y0, float x0, float step,
+                        int with_theta, float *out);
 
 /* fit fields of a directory (ufsm band --fit-fields / predict --fit-fields: raw arrays; predict --fit-zarr: zarr arrays), field
    rows [fz0, fz1) (fz1 <= 0: to the end), pooled by pool per axis (1: none; pooled phase vectors are left uninformative, so
@@ -308,6 +312,10 @@ void fit_set_dev_free(fit_set_dev *g);
 /* W (with_theta: U) of the set on the grid of n[0] x n[1] x n[2] points at box-local native (o + (i + 0.5) step) per axis, into the
    host float array out (row-major); evaluated on the GPU in z-row batches. Matches fit_set_W up to float rounding. */
 int fit_set_grid(fit_set_dev *g, const fit_set *s, const double o[3], const int64_t n[3], double step, int with_theta, float *out);
+/* fit_set_grid at the points whose bit is set in mask only (bit i = row-major grid point i; woff[w]: the set bits before word w; nlab
+   the total), packed in index order into the host array out (nlab floats, best pinned): the same values as fit_set_grid's */
+int fit_set_grid_sparse(fit_set_dev *g, const fit_set *s, const double o[3], const int64_t n[3], double step, int with_theta, const uint64_t *mask,
+                        const uint32_t *woff, size_t nlab, float *out);
 /* the same on the CPU (no device); mask (optional, laid out as out): only points with a band code 1..252 there are evaluated (others 0) */
 int fit_set_grid_cpu(const fit_set *s, const double o[3], const int64_t n[3], double step, int with_theta, const uint8_t *mask, float *out);
 /* phase gate (src/phasegate.c, ufsm phase-gate / fit --phase-gate): the network phase replaced by a ref model's W_ref mod 1 where it does

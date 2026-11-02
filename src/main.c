@@ -33,6 +33,9 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <pthread.h>
+#ifdef __AVX2__
+#include <immintrin.h>
+#endif
 #include <stdatomic.h>
 #include <math.h>
 #include <stdio.h>
@@ -815,6 +818,9 @@ static int cmd_band(int argc, char **argv) {
    writes U at og + i step (native voxels relative to the box origin) over the n3 grid, NaN where unknown (it may skip the points
    whose code is not 1..252); returns nonzero on failure */
 typedef int (*score_fill_fn)(void *ctx, const double og[3], const int64_t n3[3], double step, const uint8_t *codes, float *U);
+/* the same at the labelled voxels only (optional; the GPU): mask bit i = code 1..252 at row-major voxel i, woff the set bits before each
+   64-bit word, U packed in voxel order into Uc (nlab floats), each the value fill would write there */
+typedef int (*score_sfill_fn)(void *ctx, const double og[3], const int64_t n3[3], double step, const uint64_t *mask, const uint32_t *woff, size_t nlab, float *Uc);
 /* Score U against the band codes (winding_mod14) of a box, streamed in label z-chunks: the gauge (the mode of U - q mod 14), the
    fraction of winding ids right (|e| < 0.5 turn), |e| < 0.08 turn, median / p90 |e|; detail: integer errors by z octile and by radius
    (cy, cx: the axis per native z, box-local, (int)(shp[0] h) + 1 entries; um: the native voxel size); dump: box-local z y x and U - q
@@ -886,8 +892,207 @@ static void *sc_read_run(void *a) {
     if (!r->rc) for (size_t i = 0; i < nb3 && !r->any; i++) r->any = r->buf[i] >= 1 && r->buf[i] <= 252;
     return nullptr;
 }
+/* ---- score_codes without a dump: a pipelined, thread-count-independent pass (2026-11-02) ----
+   Blocks as before (128 x 1024 x 1024 label voxels, chunk-aligned, in order). SC_NRD reader threads decode blocks ahead into SC_NR
+   slots and build each block's label bit mask; the main thread evaluates U on the GPU at the labelled voxels only
+   (fit_set_grid_sparse, packed: the same floats as the dense grid; without a GPU / for rasters the dense fill) while worker threads
+   tally the block before (blocks without labels are skipped unfilled, as before). Each block's tally is split into the old 16
+   z-row buckets (min(16, rows); bucket t: rows [n t / nb, n (t + 1) / nb)) whatever the thread count: bucket t's pair records go to
+   pair buffer t in block order, so the pair subsample (and every printed number) is the old scorer's at 16 threads on any machine.
+   Integer tallies are summed in any order. --score-detail keeps the per-voxel records up to UFSM_SCORE_DETAIL_GB (default 4); past
+   that it drops them and runs a second pass with the gauge known (the same integer errors, bounded memory). */
+enum { SC_NBK = 16, SC_NR = 4, SC_NRD = 2, SC_MAXW = 64 };   /* buckets, read slots, reader threads, workers */
+typedef struct { int64_t o3[3], n3[3]; uint8_t *codes; uint64_t *mask; uint32_t *woff; int rc, state; size_t any, next; } sc_slot;   /* state 0 free, 1 ready; next: the block it takes
+   next (slot s: blocks s, s + SC_NR, ...); any: the labelled voxels (with a mask) */
+typedef struct sc_par sc_par;
+typedef struct {
+    sc_par *P; const uint8_t *codes; const float *U; int sparse; int64_t o3[3], n3[3]; int nt; size_t ustart[SC_NBK]; float gz[128]; int has_gz; _Atomic int next;
+} sc_tjob;
+struct sc_par {
+    z3 *z; double cf, h, um; const long long *org; const int *shp; const float *cy, *cx; int na_ax, detail, pass, nw, rthreads, sparse;
+    int64_t (*blk)[6]; size_t nblk;
+    sc_slot slot[SC_NR]; pthread_mutex_t mu; pthread_cond_t cv; int quit;
+    size_t *hist[SC_MAXW], *fine[SC_MAXW], nd[SC_MAXW], nan[SC_MAXW];
+    score_rec *dd[SC_MAXW]; size_t ndet[SC_MAXW], dcap[SC_MAXW]; _Atomic size_t drec; size_t dmax; _Atomic int dover;
+    size_t (*ie)[8][9], (*re)[256][9]; double mode, mean;   /* pass 2: per worker integer errors at the gauge mode + mean */
+    pa_buf *pa;   /* SC_NBK buffers, or null */
+    sc_tjob *cur; int tw; double trd, tmk;   /* the reader's decode / mask seconds (UFSM_FIT_TIMES) */
+};
+/* the block's label bit mask (bit i: code 1..252 at row-major voxel i) and per-word exclusive prefix counts over words [w0, w1)
+   (counts from 0); returns the set bits */
+static size_t sc_mask_range(const uint8_t *c, size_t nv, uint64_t *m, uint32_t *wo, size_t w0, size_t w1) {
+    size_t s = 0;
+    for (size_t w = w0; w < w1; w++) {
+        const size_t i0 = w * 64, n = nv - i0 < 64 ? nv - i0 : 64; const uint8_t *p = c + i0; uint64_t b = 0;
+        wo[w] = (uint32_t)s;
+        if (n == 64) {
+#ifdef __AVX2__
+            const __m256i one = _mm256_set1_epi8(1), lim = _mm256_set1_epi8((char)251);
+            const __m256i v0 = _mm256_loadu_si256((const __m256i *)p), v1 = _mm256_loadu_si256((const __m256i *)(p + 32));
+            if (_mm256_testz_si256(_mm256_or_si256(v0, v1), _mm256_or_si256(v0, v1))) { m[w] = 0; continue; }
+            const __m256i d0 = _mm256_sub_epi8(v0, one), d1 = _mm256_sub_epi8(v1, one);   /* c - 1 <= 251 unsigned: c in 1..252 */
+            const uint32_t b0 = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_min_epu8(d0, lim), d0));
+            const uint32_t b1 = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_min_epu8(d1, lim), d1));
+            b = (uint64_t)b0 | (uint64_t)b1 << 32;
+#else
+            uint64_t z = 0; for (int q = 0; q < 8; q++) { uint64_t v; memcpy(&v, p + 8 * q, 8); z |= v; }
+            if (!z) { m[w] = 0; continue; }
+            for (int j = 0; j < 64; j++) b |= (uint64_t)((uint8_t)(p[j] - 1) < 252) << j;
+#endif
+        } else for (size_t j = 0; j < n; j++) b |= (uint64_t)((uint8_t)(p[j] - 1) < 252) << j;
+        m[w] = b; s += (size_t)__builtin_popcountll(b);
+    }
+    return s;
+}
+typedef struct { const uint8_t *c; size_t nv; uint64_t *m; uint32_t *wo; size_t w0, w1, tot, base; } sc_mjob;
+static void *sc_mask_a(void *a) { sc_mjob *J = a; J->tot = sc_mask_range(J->c, J->nv, J->m, J->wo, J->w0, J->w1); return nullptr; }
+static void *sc_mask_b(void *a) { sc_mjob *J = a; if (J->base) for (size_t w = J->w0; w < J->w1; w++) J->wo[w] += (uint32_t)J->base; return nullptr; }
+static size_t sc_mask(const uint8_t *c, size_t nv, uint64_t *m, uint32_t *wo, int nth) {   /* on nth threads (word ranges, then their bases added) */
+    const size_t nw = (nv + 63) / 64; if (nth < 1) nth = 1; if (nth > 16) nth = 16; if ((size_t)nth > nw / 4096 + 1) nth = (int)(nw / 4096 + 1);
+    sc_mjob J[16]; pthread_t th[16]; int up[16];
+    for (int t = 0; t < nth; t++) { J[t] = (sc_mjob){c, nv, m, wo, nw * t / nth, nw * (t + 1) / nth, 0, 0}; up[t] = t && !pthread_create(&th[t], nullptr, sc_mask_a, &J[t]); if (!up[t]) sc_mask_a(&J[t]); }
+    for (int t = 0; t < nth; t++) if (up[t]) pthread_join(th[t], nullptr);
+    size_t s = 0; for (int t = 0; t < nth; t++) { J[t].base = s; s += J[t].tot; }
+    for (int t = 0; t < nth; t++) { up[t] = t && !pthread_create(&th[t], nullptr, sc_mask_b, &J[t]); if (!up[t]) sc_mask_b(&J[t]); }
+    for (int t = 0; t < nth; t++) if (up[t]) pthread_join(th[t], nullptr);
+    return s;
+}
+static void sc_free_slot(sc_par *P, sc_slot *S) {   /* the slot's block is done with: the slot takes block + SC_NR next */
+    pthread_mutex_lock(&P->mu); S->state = 0; S->next += SC_NR; pthread_cond_broadcast(&P->cv); pthread_mutex_unlock(&P->mu);
+}
+typedef struct { sc_par *P; int k; } sc_rarg;
+static void *sc_reader(void *a) {   /* reader k of SC_NRD: blocks k, k + SC_NRD, ... (each into its slot once the slot's previous block is done) */
+    sc_par *P = ((sc_rarg *)a)->P; const int k = ((sc_rarg *)a)->k; const int nth = (P->rthreads + SC_NRD - 1) / SC_NRD;
+    for (size_t b = (size_t)k; b < P->nblk; b += SC_NRD) {
+        sc_slot *S = &P->slot[b % SC_NR];
+        pthread_mutex_lock(&P->mu); while ((S->state || S->next != b) && !P->quit) pthread_cond_wait(&P->cv, &P->mu); const int q = P->quit; pthread_mutex_unlock(&P->mu);
+        if (q) break;
+        memcpy(S->o3, P->blk[b], 3 * sizeof(int64_t)); memcpy(S->n3, P->blk[b] + 3, 3 * sizeof(int64_t));
+        double t0 = now(); S->rc = z3_read(P->z, S->o3, S->n3, S->codes, nth); S->any = 0; const double t1 = now();
+        const size_t nb3 = (size_t)S->n3[0] * S->n3[1] * S->n3[2];
+        if (!S->rc && P->sparse) S->any = sc_mask(S->codes, nb3, S->mask, S->woff, nth);   /* (the mask here, off the main thread) */
+        else if (!S->rc) { const uint8_t *c = S->codes; size_t i = 0;
+            for (; i + 8 <= nb3 && !S->any; i += 8) { uint64_t w; memcpy(&w, c + i, 8); if (w) for (int k = 0; k < 8; k++) S->any |= (uint8_t)(c[i + k] - 1) < 252; }
+            for (; i < nb3 && !S->any; i++) S->any = (uint8_t)(c[i] - 1) < 252; }
+        const double t2 = now();
+        pthread_mutex_lock(&P->mu); S->state = 1; P->trd += t1 - t0; P->tmk += t2 - t1; pthread_cond_broadcast(&P->cv); pthread_mutex_unlock(&P->mu);
+        if (S->rc) break;
+    }
+    return nullptr;
+}
+static void sc_bucket(sc_par *P, sc_tjob *J, int t, int w) {   /* bucket t of the block on worker w: score_rows' per-voxel steps */
+    const int64_t z0 = J->n3[0] * t / J->nt, z1 = J->n3[0] * (t + 1) / J->nt, ny = J->n3[1], nx = J->n3[2];
+    const double cf = P->cf, h = P->h; const long long *org = P->org; const int *shp = P->shp;
+    size_t *hist = P->hist[w], *fine = P->fine[w], nd = 0, nan = 0, k = J->ustart[t];
+    score_rec *ddt = P->dd[w]; size_t ndt = P->ndet[w], dct = P->dcap[w];
+    pa_buf *pat = P->pa && P->pass == 1 ? &P->pa[t] : nullptr; const int det = P->detail && P->pass == 1 && !atomic_load(&P->dover);
+    for (int64_t zz = z0; zz < z1; zz++) {
+        const double pz = cf * (zz + J->o3[0] + 0.25) - org[0]; const float gz = J->has_gz ? J->gz[zz] : 0.f;
+        for (int64_t yy = 0; yy < ny; yy++) {
+            const size_t row = ((size_t)zz * ny + yy) * nx; const uint8_t *cr = J->codes + row;
+            for (int64_t xx = 0; xx < nx; xx++) {
+                if (!(xx & 7) && xx + 8 <= nx) { uint64_t wd; memcpy(&wd, cr + xx, 8); if (!wd) { xx += 7; continue; } }
+                const uint8_t cd = cr[xx];
+                if ((uint8_t)(cd - 1) >= 252) continue;
+                float u = J->sparse ? J->U[k++] : J->U[row + xx];
+                if (J->has_gz) u += gz;
+                const double py = cf * (yy + J->o3[1] + 0.25) - org[1], px = cf * (xx + J->o3[2] + 0.25) - org[2];
+                if (pz < 0 || py < 0 || px < 0 || pz > shp[0] * h || py > shp[1] * h || px > shp[2] * h) continue;
+                if (!(u == u)) { nan++; continue; }
+                double d = fmod(u - (cd - 1) / 18.0, 14.0); if (d < 0) d += 14; if (d >= 14) d = 0;
+                if (P->pass == 2) {   /* the detail records' integer error at the known gauge */
+                    const int zi = (int)fmin(7, fmax(0, pz / (shp[0] * h) * 8));
+                    const int ai = (int)fmin(P->na_ax - 1, fmax(0, pz)); const double rr = hypot(py - P->cy[ai], px - P->cx[ai]) * P->um;
+                    const score_rec r = {(float)d, (uint8_t)zi, (uint8_t)fmin(255, rr / 250)};
+                    double e = r.d - P->mode - P->mean; e -= 14 * round(e / 14); const int ki = (int)lround(e);
+                    if (ki < -4 || ki > 4) continue;
+                    P->ie[w][r.z][ki + 4]++; P->re[w][r.r][ki + 4]++;
+                    continue;
+                }
+                hist[(int)(d / 14 * SC_NB) % SC_NB]++; fine[(int)(d / 14 * SC_NF) % SC_NF]++; nd++;
+                if (pat) pa_add(pat, (float)pz, (float)py, (float)px, (float)d, cd, ((uint64_t)(zz + J->o3[0]) << 42) ^ ((uint64_t)(yy + J->o3[1]) << 21) ^ (uint64_t)(xx + J->o3[2]));
+                if (det) {
+                    if (ndt == dct) {
+                        if (atomic_fetch_add(&P->drec, dct ? dct : (size_t)1 << 16) + (dct ? dct : (size_t)1 << 16) > P->dmax) atomic_store(&P->dover, 1);
+                        dct = dct ? 2 * dct : 1 << 16; ddt = realloc(ddt, dct * sizeof(score_rec)); if (!ddt) abort();
+                    }
+                    const int zi = (int)fmin(7, fmax(0, pz / (shp[0] * h) * 8));
+                    const int ai = (int)fmin(P->na_ax - 1, fmax(0, pz)); const double rr = hypot(py - P->cy[ai], px - P->cx[ai]) * P->um;
+                    ddt[ndt++] = (score_rec){(float)d, (uint8_t)zi, (uint8_t)fmin(255, rr / 250)};
+                }
+            }
+        }
+    }
+    P->nd[w] += nd; P->nan[w] += nan; P->dd[w] = ddt; P->ndet[w] = ndt; P->dcap[w] = dct;
+}
+static void *sc_worker(void *a) {
+    sc_par *P = ((void **)a)[0]; const int w = (int)(intptr_t)((void **)a)[1]; sc_tjob *J = P->cur;
+    for (int t; (t = atomic_fetch_add(&J->next, 1)) < J->nt;) sc_bucket(P, J, t, w);
+    return nullptr;
+}
+/* one pass over the blocks; returns 0, or 1 on a read / fill failure */
+static int sc_run(sc_par *P, score_fill_fn fill, score_sfill_fn sfill, void *ctx, int tms) {
+    const size_t BV = (size_t)128 * 1024 * 1024;
+    double tr = 0, tf = 0, tw = 0, tq;
+    pthread_mutex_init(&P->mu, nullptr); pthread_cond_init(&P->cv, nullptr); P->quit = 0; P->trd = P->tmk = 0;
+    const int sparse = P->sparse = sfill != nullptr;
+    for (int s = 0; s < SC_NR; s++) { sc_slot *S = &P->slot[s]; S->state = 0; S->next = (size_t)s;
+        if (!S->codes && !(S->codes = malloc(BV))) return 1;
+        if (sparse && !S->mask && (!(S->mask = malloc(BV / 8)) || !(S->woff = malloc(BV / 16)))) return 1; }
+    float *Ub[2] = {nullptr, nullptr}; size_t ucap[2] = {0, 0}; int upin[2] = {0, 0};
+    sc_tjob *jobs = calloc(2, sizeof *jobs); pthread_t th[SC_MAXW]; void *args[SC_MAXW][2]; int running = 0, rc = 0; size_t run_slot = 0, nproc = 0;
+    pthread_t rth[SC_NRD]; int rup[SC_NRD] = {0}; sc_rarg ra[SC_NRD];
+    for (int k = 0; k < SC_NRD; k++) { ra[k] = (sc_rarg){P, k}; rup[k] = !pthread_create(&rth[k], nullptr, sc_reader, &ra[k]); if (!rup[k]) { rc = 1; break; } }
+    for (size_t b = 0; b < P->nblk && !rc; b++) {
+        sc_slot *S = &P->slot[b % SC_NR];
+        if (running && run_slot == b % SC_NR) {   /* (skipped blocks since: this block's slot is the running tally's; the reader waits for it) */
+            tq = now(); for (int t = 0; t < P->tw; t++) pthread_join(th[t], nullptr); running = 0; tw += now() - tq;
+            sc_free_slot(P, &P->slot[run_slot]);
+        }
+        tq = now(); pthread_mutex_lock(&P->mu); while (!S->state || S->next != b) pthread_cond_wait(&P->cv, &P->mu); pthread_mutex_unlock(&P->mu); tr += now() - tq;
+        if (S->rc) { fprintf(stderr, "score: code read failed: %s\n", z3_error()); rc = 1; break; }
+        if (!S->any) { sc_free_slot(P, S); continue; }
+        const int64_t *o3 = S->o3, *n3 = S->n3; const size_t nv = (size_t)n3[0] * n3[1] * n3[2]; const int s2 = (int)(nproc++ & 1);   /* (alternates over the tallied blocks: skipped ones in between keep the running tally's buffers) */
+        sc_tjob *J = &jobs[s2];
+        J->P = P; J->codes = S->codes; J->sparse = sparse; for (int d = 0; d < 3; d++) { J->o3[d] = o3[d]; J->n3[d] = n3[d]; }
+        J->nt = (int)(n3[0] < SC_NBK ? n3[0] : SC_NBK); atomic_store(&J->next, 0);
+        const double og[3] = {P->cf * o3[0] - 0.25 * P->cf - P->org[0], P->cf * o3[1] - 0.25 * P->cf - P->org[1], P->cf * o3[2] - 0.25 * P->cf - P->org[2]};
+        J->has_gz = g_zg_n > 0; if (J->has_gz) for (int64_t a = 0; a < n3[0]; a++) J->gz[a] = (float)wr_zgauge(P->org[0] + og[0] + a * P->cf);
+        if (sparse) {
+            const size_t nlab = S->any; const uint64_t *mask = S->mask; const uint32_t *woff = S->woff;
+            for (int t = 0; t < J->nt; t++) { const size_t i0 = (size_t)(n3[0] * t / J->nt) * n3[1] * n3[2];
+                J->ustart[t] = woff[i0 / 64] + (i0 % 64 ? (size_t)__builtin_popcountll(mask[i0 / 64] & ((1ull << (i0 % 64)) - 1)) : 0); }
+            if (ucap[s2] < nlab) { if (Ub[s2]) { if (upin[s2]) nn_host_free(Ub[s2]); else free(Ub[s2]); } ucap[s2] = nlab + nlab / 4; upin[s2] = 1;
+                                if (!(Ub[s2] = nn_host_alloc_try(ucap[s2] * 4))) { upin[s2] = 0; Ub[s2] = malloc(ucap[s2] * 4); if (!Ub[s2]) { ucap[s2] = 0; rc = 1; break; } } }
+            tq = now(); if (sfill(ctx, og, n3, P->cf, mask, woff, nlab, Ub[s2])) { fprintf(stderr, "score: cannot evaluate U on the score grid\n"); rc = 1; break; } tf += now() - tq;
+        } else {
+            if (ucap[s2] < nv) { free(Ub[s2]); ucap[s2] = BV; if (!(Ub[s2] = malloc(BV * 4))) { ucap[s2] = 0; rc = 1; break; } }
+            tq = now(); if (fill(ctx, og, n3, P->cf, S->codes, Ub[s2])) { fprintf(stderr, "score: cannot evaluate U on the score grid\n"); rc = 1; break; } tf += now() - tq;
+        }
+        J->U = Ub[s2];
+        tq = now();
+        if (running) { for (int t = 0; t < P->tw; t++) pthread_join(th[t], nullptr); running = 0;
+                       sc_free_slot(P, &P->slot[run_slot]); }
+        tw += now() - tq;
+        P->cur = J; P->tw = P->nw < J->nt ? P->nw : J->nt;
+        for (int t = 0; t < P->tw; t++) { args[t][0] = P; args[t][1] = (void *)(intptr_t)t; if (pthread_create(&th[t], nullptr, sc_worker, args[t])) { sc_worker(args[t]); P->tw = t; break; } }
+        running = P->tw > 0; run_slot = b % SC_NR;
+        if (!running) sc_free_slot(P, S);
+    }
+    tq = now();
+    if (running) { for (int t = 0; t < P->tw; t++) pthread_join(th[t], nullptr); sc_free_slot(P, &P->slot[run_slot]); }
+    tw += now() - tq;
+    pthread_mutex_lock(&P->mu); P->quit = 1; for (int s = 0; s < SC_NR; s++) P->slot[s].state = 0; pthread_cond_broadcast(&P->cv); pthread_mutex_unlock(&P->mu);
+    for (int k = 0; k < SC_NRD; k++) if (rup[k]) pthread_join(rth[k], nullptr);
+    for (int s = 0; s < 2; s++) if (Ub[s]) { if (upin[s]) nn_host_free(Ub[s]); else free(Ub[s]); }
+    free(jobs);
+    pthread_mutex_destroy(&P->mu); pthread_cond_destroy(&P->cv);
+    if (tms) fprintf(stderr, "fit times: score pass %d: code read waits %.2fs (reader: decode %.2fs, masks %.2fs), U fill %.2fs (%s), tally waits %.2fs (%d workers)\n", P->pass, tr, P->trd, P->tmk, tf,
+                     sparse ? "labelled voxels on the GPU" : "dense", tw, P->nw);
+    return rc;
+}
 static int score_codes(z3 *z, double cf, const long long org[3], const int shp[3], double h, double um, const float *cy, const float *cx, int detail, FILE *dump,
-                       score_fill_fn fill, void *ctx) {
+                       score_fill_fn fill, score_sfill_fn sfill, void *ctx) {
     int64_t lo[3], ln[3]; for (int d = 0; d < 3; d++) { lo[d] = (int64_t)floor(org[d] / cf); ln[d] = (int64_t)(shp[d] * h / cf); }
     if (g_score_nz > 0) { lo[0] = (int64_t)floor((org[0] + g_score_z0) / cf); ln[0] = (int64_t)fmin(g_score_nz / cf, shp[0] * h / cf - (lo[0] - floor(org[0] / cf))); }
     enum { NB = SC_NB, NF = SC_NF }; size_t *hist = calloc(NB, sizeof(size_t)), *fine = calloc(NF, sizeof(size_t)), nd = 0, nan = 0;   /* d = U - q mod 14: 1/72 and 1/1024 turn bins */
@@ -911,6 +1116,23 @@ static int score_codes(z3 *z, double cf, const long long org[3], const int shp[3
         if (nblk == cblk) { cblk = cblk ? 2 * cblk : 64; blk = realloc(blk, cblk * sizeof *blk); }
         blk[nblk][0] = za; blk[nblk][1] = ya; blk[nblk][2] = xa; blk[nblk][3] = ze - za; blk[nblk][4] = ye - ya; blk[nblk][5] = xe - xa; nblk++;
     }
+    sc_par *P = nullptr;
+    if (!dump) {   /* the pipelined pass (sc_run) */
+        free(cbuf[0]); free(cbuf[1]); free(U); cbuf[0] = cbuf[1] = nullptr; U = nullptr;
+        long ncpu = ufsm_ncpu(); const char *te = getenv("UFSM_FIT_THREADS"); if (te && atoi(te) > 0) ncpu = atoi(te);
+        const char *dg = getenv("UFSM_SCORE_DETAIL_GB"); const double dgb = dg && *dg ? atof(dg) : 4;
+        P = calloc(1, sizeof *P);
+        P->z = z; P->cf = cf; P->h = h; P->um = um; P->org = org; P->shp = shp; P->cy = cy; P->cx = cx; P->na_ax = na_ax; P->detail = detail; P->pass = 1;
+        P->nw = (int)(ncpu < 1 ? 1 : ncpu > SC_MAXW ? SC_MAXW : ncpu); P->rthreads = (int)(ncpu < 1 ? 1 : ncpu); P->blk = blk; P->nblk = nblk; P->pa = pab;
+        P->dmax = (size_t)(dgb * 1e9 / sizeof(score_rec));
+        for (int w = 0; w < P->nw; w++) { P->hist[w] = calloc(NB, sizeof(size_t)); P->fine[w] = calloc(NF, sizeof(size_t)); }
+        const int prc = sc_run(P, fill, sfill, ctx, tms);
+        for (int w = 0; w < P->nw; w++) { for (int k = 0; k < NB; k++) hist[k] += P->hist[w][k]; for (int k = 0; k < NF; k++) fine[k] += P->fine[w][k];
+                                          nd += P->nd[w]; nan += P->nan[w]; ndet += P->ndet[w]; free(P->hist[w]); free(P->fine[w]); }
+        if (prc) { for (int w = 0; w < SC_MAXW; w++) free(P->dd[w]); for (int s = 0; s < SC_NR; s++) { free(P->slot[s].codes); free(P->slot[s].mask); free(P->slot[s].woff); } free(P);
+                   if (pab) { for (int t = 0; t < 16; t++) pa_free(&pab[t]); free(pab); } free(hist); free(fine); free(blk); return 1; }
+        if (atomic_load(&P->dover)) { for (int w = 0; w < SC_MAXW; w++) { free(P->dd[w]); P->dd[w] = nullptr; P->ndet[w] = 0; } }
+    } else {
     sc_read rd[2] = {{.z = z, .buf = cbuf[0]}, {.z = z, .buf = cbuf[1]}}; pthread_t rth[2]; int rup[2] = {0, 0};
     if (nblk) { memcpy(rd[0].o3, blk[0], 3 * sizeof(int64_t)); memcpy(rd[0].n3, blk[0] + 3, 3 * sizeof(int64_t)); rup[0] = pthread_create(&rth[0], nullptr, sc_read_run, &rd[0]) == 0; if (!rup[0]) sc_read_run(&rd[0]); }
     for (size_t bi = 0; bi < nblk; bi++) {
@@ -959,13 +1181,14 @@ static int score_codes(z3 *z, double cf, const long long org[3], const int shp[3
             }
         }
     }
-    free(cbuf[0]); free(cbuf[1]); free(U); free(blk);
-    const size_t ndet_serial = ndet;   /* (dd: the dump path's records; the threads keep theirs in J.dd) */
+    }
+    free(cbuf[0]); free(cbuf[1]); free(U);
+    const size_t ndet_serial = P ? 0 : ndet;   /* (dd: the dump path's records; the threads keep theirs in J.dd) */
     for (int t = 0; t < 64; t++) {   /* the threads' tallies (integer counts: any order) */
         if (J.hist[t]) { for (int k = 0; k < NB; k++) hist[k] += J.hist[t][k]; for (int k = 0; k < NF; k++) fine[k] += J.fine[t][k]; }
         nd += J.nd[t]; nan += J.nan[t]; ndet += J.ndet[t]; free(J.hist[t]); free(J.fine[t]);
     }
-    if (tms) fprintf(stderr, "fit times: score code reads %.2fs, U fill %.2fs, tally %.2fs\n", tr, tf, tw);
+    if (tms && !P) fprintf(stderr, "fit times: score code reads %.2fs, U fill %.2fs, tally %.2fs\n", tr, tf, tw);
     size_t best = 0; int bi = 0;
     for (int k = 0; k < NB; k++) { size_t sacc = 0; for (int e = -18; e <= 18; e++) sacc += hist[(k + e + NB) % NB]; if (sacc > best) { best = sacc; bi = k; } }   /* +-0.25 turn window */
     const double mode = (bi + 0.5) * 14.0 / NB;
@@ -979,10 +1202,18 @@ static int score_codes(z3 *z, double cf, const long long org[3], const int shp[3
     printf("fit score: %zu labelled voxels, gauge %.3f, winding ids right %.4f, |error| < 0.08 turn %.4f, |error| median %.3f p90 %.3f turn\n", nd, mode + mean,
            nd ? (double)right / nd : 0, nd ? (double)close / nd : 0, na2 ? med : 0, na2 ? p90 : 0);
     if (nan) printf("  %zu labelled voxels without U (%.4f of those in the box), not scored\n", nan, (double)nan / (nan + nd));
-    if (detail && ndet) {
+    const int dpass2 = P && atomic_load(&P->dover);
+    if (detail && (ndet || dpass2)) {
         size_t ie[8][9] = {{0}}, re[256][9] = {{0}};   /* integer error -4..4 by z octile / by 250 um radius bin (up to 64 mm) */
-        for (int s = -1; s < 64; s++) {   /* the serial (dump) records, then each thread's */
-            const score_rec *r = s < 0 ? dd : J.dd[s]; const size_t cnt = s < 0 ? ndet_serial : J.ndet[s];
+        if (dpass2) {   /* the records outgrew UFSM_SCORE_DETAIL_GB: a second pass at the known gauge */
+            P->ie = calloc(P->nw, sizeof *P->ie); P->re = calloc(P->nw, sizeof *P->re); P->mode = mode; P->mean = mean; P->pass = 2;
+            if (sc_run(P, fill, sfill, ctx, tms)) { fprintf(stderr, "score: the detail pass failed\n"); }
+            else for (int w = 0; w < P->nw; w++) { for (int a = 0; a < 8; a++) for (int k = 0; k < 9; k++) ie[a][k] += P->ie[w][a][k];
+                                                   for (int a = 0; a < 256; a++) for (int k = 0; k < 9; k++) re[a][k] += P->re[w][a][k]; }
+            free(P->ie); free(P->re);
+        }
+        for (int s = -1; s < 64 + SC_MAXW && !dpass2; s++) {   /* the serial (dump) records, then each thread's (old tally / pipelined workers) */
+            const score_rec *r = s < 0 ? dd : s < 64 ? J.dd[s] : P ? P->dd[s - 64] : nullptr; const size_t cnt = s < 0 ? ndet_serial : s < 64 ? J.ndet[s] : P ? P->ndet[s - 64] : 0;
             for (size_t i = 0; i < cnt; i++) {
                 double e = r[i].d - mode - mean; e -= 14 * round(e / 14); const int k = (int)lround(e);
                 if (k < -4 || k > 4) continue;
@@ -1012,12 +1243,16 @@ static int score_codes(z3 *z, double cf, const long long org[3], const int shp[3
         pa_free(&all);
     }
     free(dd); for (int t = 0; t < 64; t++) free(J.dd[t]);
-    free(ah); free(hist); free(fine);
+    if (P) { for (int w = 0; w < SC_MAXW; w++) free(P->dd[w]); for (int s = 0; s < SC_NR; s++) { free(P->slot[s].codes); free(P->slot[s].mask); free(P->slot[s].woff); } free(P); }
+    free(ah); free(hist); free(fine); free(blk);
     return 0;
 }
 typedef struct { fit_set_dev *gd; const fit_set *fs; } fit_fill_ctx;   /* gd null: the CPU */
 static int fit_fill(void *c, const double og[3], const int64_t n3[3], double step, const uint8_t *codes, float *U) {
     fit_fill_ctx *f = c; return f->gd ? fit_set_grid(f->gd, f->fs, og, n3, step, 1, U) : fit_set_grid_cpu(f->fs, og, n3, step, 1, codes, U);
+}
+static int fit_sfill(void *c, const double og[3], const int64_t n3[3], double step, const uint64_t *mask, const uint32_t *woff, size_t nlab, float *Uc) {
+    fit_fill_ctx *f = c; return fit_set_grid_sparse(f->gd, f->fs, og, n3, step, 1, mask, woff, nlab, Uc);
 }
 
 /* ufsm convert-unwrap2 IN OUT: a task unwrap checkpoint (recto 0, ink 1, phase 2-3, normal 4-9, density 10) as a task unwrap2 one
@@ -1563,7 +1798,7 @@ static int cmd_fit(int argc, char **argv) {
         g_score_pairs = atoi(opt(argc, argv, "--score-pairs", "0"));
         if (*opt(argc, argv, "--zgauge", "") && zg_load(opt(argc, argv, "--zgauge", ""), atof(opt(argc, argv, "--zgauge-scale", "1")), atof(opt(argc, argv, "--zgauge-f", "1")))) return 1;
         if (*opt(argc, argv, "--score-z", "") && sscanf(opt(argc, argv, "--score-z", ""), "%lf,%lf", &g_score_z0, &g_score_nz) != 2) { fprintf(stderr, "fit: --score-z Z0,NZ (box-local native z)\n"); return 2; }
-        const int rc = score_codes(z, cf, org, shp, h, fb.um, fb.cy, fb.cx, arg_index(argc, argv, "--score-detail") > 0, dump, fit_fill, &fc);
+        const int rc = score_codes(z, cf, org, shp, h, fb.um, fb.cy, fb.cx, arg_index(argc, argv, "--score-detail") > 0, dump, fit_fill, gd && !getenv("UFSM_SCORE_DENSE") ? fit_sfill : nullptr, &fc);
         fit_set_dev_free(gd); z3_close(z); if (dump) fclose(dump);
         if (rc) return 1;
     }
@@ -1608,7 +1843,7 @@ static int cmd_wind_score(int argc, char **argv) {
     FILE *dump = *opt(argc, argv, "--score-dump", "") ? fopen(opt(argc, argv, "--score-dump", ""), "wb") : nullptr;
     raster_fill_ctx rc = {Ur, {shp[0], shp[1], shp[2]}};
     g_score_pairs = atoi(opt(argc, argv, "--score-pairs", "0")) > 0;
-    const int r = score_codes(zc, cf, org, shp, 1.0, um, cy, cx, atoi(opt(argc, argv, "--score-detail", "0")) > 0, dump, raster_fill, &rc);
+    const int r = score_codes(zc, cf, org, shp, 1.0, um, cy, cx, atoi(opt(argc, argv, "--score-detail", "0")) > 0, dump, raster_fill, nullptr, &rc);
     z3_close(zc); if (dump) fclose(dump); free(Ur); free(cy); free(cx);
     return r;
 }
