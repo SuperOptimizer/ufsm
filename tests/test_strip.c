@@ -127,6 +127,9 @@ int main(void) {
         }
         snprintf(cmd, sizeof cmd, "cd %s/m1 && for x in *; do cmp -s $x ../m4/$x || exit 1; done; test $(ls | wc -l) -ge 6", root);
         CHECK(!system(cmd), "strip-mosaic --threads 4 output differs from --threads 1 (or files missing)");
+        /* grey mode: per stripe a CT JPEG and a separate ink JPEG of the stripe's own height, no stacked _ct_ink.jpg */
+        snprintf(cmd, sizeof cmd, "cd %s/m1 && n=$(ls *_ct.jpg | wc -l) && test $n -ge 2 && test $(ls *_ink.jpg | wc -l) -eq $n && ! ls *_ct_ink.jpg > /dev/null 2>&1", root);
+        CHECK(!system(cmd), "strip-mosaic grey mode: missing _ct.jpg / _ink.jpg pairs, or a stacked _ct_ink.jpg");
         /* the streamed mode (stretch given, stripes taken as their .done markers appear) writes the same bytes */
         char sv[64] = {0}; snprintf(p, sizeof p, "%s/m1/stretch.txt", root); f = fopen(p, "r"); if (f) { if (!fgets(sv, sizeof sv, f)) sv[0] = 0; fclose(f); }
         sv[strcspn(sv, "\n")] = 0; CHECK(sv[0], "no stretch.txt");

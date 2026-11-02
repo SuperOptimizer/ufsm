@@ -1035,11 +1035,13 @@ static void ms_band(void *u, int b) {
     free(tvc); free(tw); free(wvc); free(vm); free(wrow);
 }
 typedef struct { int w, h; const uint8_t *ct, *ink, *m, *sc, *si, *plut; int bg; } ms_rows;
-static void ms_stripe_row(void *u, int y, int x0, int n, uint8_t *dst) {   /* CT over ink, stretched, 0 off the surface (encoder threads) */
-    const ms_rows *R = u; const int k = y >= R->h; const size_t o = (size_t)(k ? y - R->h : y) * R->w + x0;
+static void ms_grey_row(const ms_rows *R, int k, int y, int x0, int n, uint8_t *dst) {   /* k 0: CT, 1: ink; stretched, 0 off the surface */
+    const size_t o = (size_t)y * R->w + x0;
     const uint8_t *src = (k ? R->ink : R->ct) + o, *L = k ? R->si : R->sc, *m = R->m + o;
     for (int x = 0; x < n; x++) dst[x] = m[x] ? L[src[x]] : 0;
 }
+static void ms_ct_row(void *u, int y, int x0, int n, uint8_t *dst) { ms_grey_row(u, 0, y, x0, n, dst); }    /* <stripe>_ct.jpg (encoder threads) */
+static void ms_ink_row(void *u, int y, int x0, int n, uint8_t *dst) { ms_grey_row(u, 1, y, x0, n, dst); }   /* <stripe>_ink.jpg */
 static void ms_pap_row(void *u, int y, int x0, int n, uint8_t *dst) {   /* --papyrus: the CT ramp under the ink, bg off the surface / CT 0 */
     const ms_rows *R = u; const size_t o = (size_t)y * R->w + x0; const uint8_t *c = R->ct + o, *k = R->ink + o, *m = R->m + o, bg = (uint8_t)R->bg;
     for (int x = 0; x < n; x++) { uint8_t *d = dst + 3 * x;
@@ -1083,7 +1085,10 @@ static void *ms_pass2(void *arg) {
         for (int o = 0; o < C->nout && C->wstripes; o++) { const ms_out *O = &C->out[o];
             ms_rows R = {.w = w, .h = h, .ct = ct, .ink = ink, .m = m, .sc = C->sc, .si = C->si, .plut = O->plut, .bg = O->pbg_raw};
             if (O->pgain > 0) { snprintf(p, sizeof p, "%s/%s_papyrus.jpg", O->od, S->name); if (jpar_write(p, w, h, 3, C->q, nullptr, ms_pap_row, &R, 0)) fprintf(stderr, "strip-mosaic: cannot write %s\n", p); }
-            else { snprintf(p, sizeof p, "%s/%s_ct_ink.jpg", O->od, S->name); if (jpar_write(p, w, 2 * h, 1, C->q, nullptr, ms_stripe_row, &R, 0)) fprintf(stderr, "strip-mosaic: cannot write %s\n", p); }
+            else {   /* grey mode: the CT and the 3D ink as two separate JPEGs (was one CT-over-ink _ct_ink.jpg) */
+                snprintf(p, sizeof p, "%s/%s_ct.jpg", O->od, S->name); if (jpar_write(p, w, h, 1, C->q, nullptr, ms_ct_row, &R, 0)) fprintf(stderr, "strip-mosaic: cannot write %s\n", p);
+                snprintf(p, sizeof p, "%s/%s_ink.jpg", O->od, S->name); if (jpar_write(p, w, h, 1, C->q, nullptr, ms_ink_row, &R, 0)) fprintf(stderr, "strip-mosaic: cannot write %s\n", p);
+            }
         }
         tq[4] = snow();
         if (C->prof) fprintf(stderr, "strip-mosaic prof %s: tiffs %.2f mask+gu %.2f pixels %.2f jpeg %.2f s\n", S->name, tq[1] - tq[0], tq[2] - tq[1], tq[3] - tq[2], tq[4] - tq[3]);

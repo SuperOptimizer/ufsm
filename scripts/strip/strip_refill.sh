@@ -1,6 +1,6 @@
 #!/bin/bash
 # strip_refill.sh OUT: re-render every stripe of a finished strip (OUT/strip/flat/stripes) with hole filling and mosaic them into
-# OUT/img_fill, bounded disk like strip_stream.sh (strip-mosaic --wait-renders --rm-renders, at most MAXR render pairs on disk).
+# OUT/img_fill (per stripe <s>_ct.jpg + <s>_ink.jpg, grey), bounded disk like strip_stream.sh (strip-mosaic --wait-renders --rm-renders, at most MAXR render pairs on disk).
 # Renders go to OUT/render_fill (removed by the mosaic after use), the per-pixel fill flags (<s>_fill.tif: 0 on the surface, k / 50+k
 # filled from +-k voxels along the normal (+100 in an interpolated grid hole), 250 inpainted, 254 no surface, 255 still empty) are kept in OUT/fillmap with the render
 # logs' fill shares in OUT/logs/refill_<s>.log. The contrast stretch is OUT/stretch.txt (the original run's, so both mosaics compare)
