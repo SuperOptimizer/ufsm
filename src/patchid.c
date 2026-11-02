@@ -496,7 +496,7 @@ int cmd_patch_id(int argc, char **argv) {
     const int64_t *shape = VS.shape;
     pi_vol *zg = nullptr; int gs = 1;   /* gs: the GT grid is gs x coarser than the sheet grid (1 or 2; e.g. 0139's 18.72 um codes) */
     { const int gi = pi_idx(argc, argv, "--gt"); if (gi > 0) { if (gi + 2 >= argc) return 2; if (pi_vopen(&VG, argv[gi + 1], argv[gi + 2], cache)) return 1; zg = &VG;
-        int ok = 0; for (gs = 1; gs <= 2 && !ok; gs++) { ok = 1; for (int d = 0; d < 3; d++) if (llabs(VG.shape[d] * gs - shape[d]) > gs - 1 + (gs > 1)) ok = 0; if (ok) break; }
+        int ok = 0; for (gs = 1; gs <= 2 && !ok; gs++) { ok = 1; for (int d = 0; d < 3; d++) if (d == 0 ? llabs(VG.shape[d] * gs - shape[d]) > gs - 1 + (gs > 1) : VG.shape[d] * gs + gs < shape[d]) ok = 0;   /* (z extents match; y / x: the GT may extend further, the sheet array a crop at origin 0) */ if (ok) break; }
         if (!ok) { fprintf(stderr, "patch-id: --gt %s %s: not on the sheet grid or 2x coarser\n", argv[gi + 1], argv[gi + 2]); return 1; } } }
     J.asplit = (int)lround(atof(pi_opt(argc, argv, "--anchor-split-mm", "0")) * 1000 / gum); if (J.asplit < 0) J.asplit = 0;
     /* wraps */

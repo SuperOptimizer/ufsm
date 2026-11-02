@@ -393,7 +393,7 @@ suite-bins: $(B)/test_tfx
 $(B)/test_fit_join: tests/test_fit_join.c $(B)/fitjoin.o $(B)/phasegate.o $(B)/fit.o $(B)/fit_emb.o $(B)/embz.o $(B)/z3w.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/coreline.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 suite-bins: $(B)/test_fit_join
-$(B)/test_wrap_check: tests/test_wrap_check.c $(B)/wrapcheck.o $(B)/fit.o $(B)/fit_emb.o $(B)/embz.o $(B)/z3w.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/coreline.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/nn.o $(B)/nn_fp8.o
+$(B)/test_wrap_check: tests/test_wrap_check.c $(B)/wrapcheck.o $(B)/fit.o $(B)/fit_emb.o $(B)/embz.o $(B)/z3w.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/coreline.o $(B)/json.o $(B)/zarr3.o $(B)/zarr2.o $(B)/store.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 suite-bins: $(B)/test_wrap_check
 $(B)/test_pairacc: tests/test_pairacc.c $(B)/pairacc.o
