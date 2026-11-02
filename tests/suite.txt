@@ -84,6 +84,7 @@ test_strip                                     |              |     4 | ./$B/tes
 test_wrapsnap                                  |              |     3 | ./$B/test_wrapsnap
 test_surflabels                                |              |     3 | ./$B/test_surflabels
 test_patchid                                   |              |     3 | ./$B/test_patchid   
+test_recto                                     |              |     3 | ./$B/test_recto
 test_faces                                     |              |     1 | ./$B/test_faces
 test_fit_emb                                   |              |    60 | ./$B/test_fit_emb
 test_distill                                   | gpu          |     1 | ./$B/test_distill
