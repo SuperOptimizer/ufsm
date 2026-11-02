@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 static int fails = 0;
@@ -97,6 +98,32 @@ int main(int argc, char **argv) {
     const char *pre[4] = {"fit score:", "  ", "    z octile", "    radius"};
     char *a = out[0] ? lines(out[0], pre, 4) : nullptr, *b = du ? lines(du, pre, 4) : nullptr;
     CHECK(a && b && *a && !strcmp(a, b), "serial dump path: the same score and detail lines\n--- pipelined:\n%s--- serial:\n%s", a ? a : "", b ? b : "");
+    /* empty GT: a missing level, a level without stored chunks, a level with stored chunks but no label code: nonzero exit (3 for an
+       empty level / 0 labelled), an ERROR on stderr and no "fit score:" line; UFSM_SCORE_ALLOW_EMPTY=1 prints the empty score */
+    {
+        const int64_t s3[3] = {Z, Y, X};
+        snprintf(p, sizeof p, "%s/codes/4.8", D); z3w *we = z3w_create(p, s3, S, 0.f, 0, nullptr); CHECK(we && !z3w_close(we), "empty level");
+        snprintf(p, sizeof p, "%s/codes/2.4", D); z3w *wn = z3w_create(p, s3, S, 0.f, 0, nullptr); CHECK(wn, "no-label level");
+        uint8_t *nl = calloc((size_t)S * S * S, 1); for (size_t i = 0; i < (size_t)S * S * S; i += 997) nl[i] = 254;
+        if (wn) { CHECK(!z3w_write_shard(wn, 0, 0, 0, nl, 4), "no-label shard"); CHECK(!z3w_close(wn), "no-label close"); }
+        free(nl);
+        const char *key[3] = {"7.7", "4.8", "2.4"}; const int want[3] = {1, 3, 3};
+        for (int k = 0; k < 3; k++) {   /* (the key is also the um: 4.8 / 2.4 scale the label voxel; the box is read all the same) */
+            char cmd[2048]; snprintf(cmd, sizeof cmd, "%s wind-score %s %s/codes %s --score-pairs 1 > %s/e%d.out 2> %s/e%d.err", argv[1], D, D, key[k], D, k, D, k);
+            const int st = system(cmd); const int ex = WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+            snprintf(p, sizeof p, "%s/e%d.out", D, k); char *eo = slurp(p); snprintf(p, sizeof p, "%s/e%d.err", D, k); char *ee = slurp(p);
+            CHECK(ex == want[k], "codes key %s: exit %d, want %d", key[k], ex, want[k]);
+            CHECK(eo && !strstr(eo, "fit score:"), "codes key %s: no fit score line printed", key[k]);
+            CHECK(ee && (k == 0 || strstr(ee, "ERROR")), "codes key %s: an ERROR on stderr", key[k]);
+            if (k) CHECK(ee && strstr(ee, "score: codes level"), "codes key %s: the codes level printed up front", key[k]);
+            free(eo); free(ee);
+        }
+        snprintf(p, sizeof p, "UFSM_SCORE_ALLOW_EMPTY=1 %s wind-score %s %s/codes 2.4 > %s/ea.out 2> %s/ea.err", argv[1], D, D, D, D);
+        CHECK(system(p) == 0, "UFSM_SCORE_ALLOW_EMPTY=1: exit 0");
+        snprintf(p, sizeof p, "%s/ea.out", D); char *ea = slurp(p);
+        CHECK(ea && strstr(ea, "fit score: 0 labelled voxels"), "UFSM_SCORE_ALLOW_EMPTY=1: the empty score printed");
+        free(ea);
+    }
     if (out[0]) fputs(out[0], stdout);
     free(a); free(b); free(du); free(p2); for (int k = 0; k < 3; k++) free(out[k]);
     if (!fails && !getenv("UFSM_TEST_KEEP")) sh("rm -rf %s", D); else fprintf(stderr, "test_score_par: kept %s\n", D);

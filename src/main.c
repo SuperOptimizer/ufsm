@@ -1078,7 +1078,16 @@ static int score_codes(z3 *z, double cf, const long long org[3], const int shp[3
     size_t nblk = 0, cblk = 0, nskip = 0; int64_t (*blk)[6] = nullptr;
     /* blocks without a stored chunk hold only the fill value: no labels unless the fill is a code (then every block is read) */
     int64_t cg[3] = {0, 0, 0}; uint8_t *cmap = nullptr; const z3_meta *zm = z3_meta_of(z); int ck[3] = {zm->chunk[0], zm->chunk[1], zm->chunk[2]};
-    if (zm->sharded && (zm->fill < 1 || zm->fill > 252) && !getenv("UFSM_SCORE_ALL_BLOCKS") && z3_chunk_map(z, cg, &cmap) < 0) cmap = nullptr;
+    const int64_t nstored = zm->sharded ? z3_chunk_map(z, cg, &cmap) : -1;   /* (stored chunks of the whole level; -1 unknown) */
+    if (nstored < 0) { free(cmap); cmap = nullptr; }
+    char nsb[32] = "?"; if (nstored >= 0) snprintf(nsb, sizeof nsb, "%lld", (long long)nstored);
+    fprintf(stderr, "score: codes level %lld x %lld x %lld (label voxel %.4g native voxels), %s stored chunks; scored label box z %lld..%lld\n",
+            (long long)zm->shape[0], (long long)zm->shape[1], (long long)zm->shape[2], cf, nsb, (long long)lo[0], (long long)(lo[0] + ln[0]));
+    if (nstored == 0 && (zm->fill < 1 || zm->fill > 252)) {   /* an empty GT level: a "0 labelled voxels" score would look like a result */
+        fprintf(stderr, "score: ERROR: the codes level has no stored chunks (empty GT level: wrong --codes key?)\n");
+        free(cmap); free(cbuf[0]); free(cbuf[1]); free(U); free(hist); free(fine); if (pab) { for (int t = 0; t < 16; t++) pa_free(&pab[t]); free(pab); } return 3;
+    }
+    if (!((zm->fill < 1 || zm->fill > 252) && !getenv("UFSM_SCORE_ALL_BLOCKS"))) { free(cmap); cmap = nullptr; }
     for (int64_t za = lo[0]; za < lo[0] + ln[0]; za = (za / SBZ + 1) * SBZ)
     for (int64_t ya = lo[1]; ya < lo[1] + ln[1]; ya = (ya / SBY + 1) * SBY)
     for (int64_t xa = lo[2]; xa < lo[2] + ln[2]; xa = (xa / SBX + 1) * SBX) {
@@ -1170,6 +1179,16 @@ static int score_codes(z3 *z, double cf, const long long org[3], const int shp[3
         nd += J.nd[t]; nan += J.nan[t]; ndet += J.ndet[t]; free(J.hist[t]); free(J.fine[t]);
     }
     if (tms && !P) fprintf(stderr, "fit times: score code reads %.2fs, U fill %.2fs, tally %.2fs\n", tr, tf, tw);
+    fprintf(stderr, "score: %zu labelled voxels scored (%zu without U)\n", nd, nan);
+    if (!nd && !getenv("UFSM_SCORE_ALLOW_EMPTY")) {   /* nothing scored: no "fit score:" line a runner could take for a result */
+        fprintf(stderr, "score: ERROR: 0 labelled voxels in the scored box (wrong --codes key / level, a box or --score-z outside the GT?);"
+                        " UFSM_SCORE_ALLOW_EMPTY=1 prints the empty score\n");
+        free(dd); for (int t = 0; t < 64; t++) free(J.dd[t]);
+        if (P) { for (int w = 0; w < SC_MAXW; w++) free(P->dd[w]); for (int s = 0; s < SC_NR; s++) { if (P->slot[s].pin) nn_host_free(P->slot[s].codes); else free(P->slot[s].codes); } free(P); }
+        if (pab) { for (int t = 0; t < 16; t++) pa_free(&pab[t]); free(pab); }
+        free(hist); free(fine); free(blk);
+        return 3;
+    }
     size_t best = 0; int bi = 0;
     for (int k = 0; k < NB; k++) { size_t sacc = 0; for (int e = -18; e <= 18; e++) sacc += hist[(k + e + NB) % NB]; if (sacc > best) { best = sacc; bi = k; } }   /* +-0.25 turn window */
     const double mode = (bi + 0.5) * 14.0 / NB;
@@ -1774,8 +1793,9 @@ static int cmd_fit(int argc, char **argv) {
     }
     const int ci = arg_index(argc, argv, "--codes");
     if (ci > 0 && ci + 2 < argc) {   /* score against the band codes of the box, streamed in label z-chunks (U on the GPU) */
+        fprintf(stderr, "fit: scoring against --codes %s level %s\n", argv[ci + 1], argv[ci + 2]);
         z3 *z = z3_open(store_open(argv[ci + 1]), argv[ci + 2], nullptr);
-        if (!z) { fprintf(stderr, "%s\n", z3_error()); return 1; }
+        if (!z) { fprintf(stderr, "fit: ERROR: cannot open the codes level %s/%s: %s\n", argv[ci + 1], argv[ci + 2], z3_error()); return 1; }
         const double cf = atof(argv[ci + 2]) > 0 ? atof(argv[ci + 2]) / fb.um : 2;   /* label voxel in native voxels (the codes' key is its um: 4.8) */
         FILE *dump = *opt(argc, argv, "--score-dump", "") ? fopen(opt(argc, argv, "--score-dump", ""), "wb") : nullptr;   /* box-local z y x, U - q mod 14 per voxel */
         fit_set_dev *gd = nullptr; if (!c.cpu && !(gd = fit_set_upload(fs))) return 1;
@@ -1785,7 +1805,7 @@ static int cmd_fit(int argc, char **argv) {
         if (*opt(argc, argv, "--score-z", "") && sscanf(opt(argc, argv, "--score-z", ""), "%lf,%lf", &g_score_z0, &g_score_nz) != 2) { fprintf(stderr, "fit: --score-z Z0,NZ (box-local native z)\n"); return 2; }
         const int rc = score_codes(z, cf, org, shp, h, fb.um, fb.cy, fb.cx, arg_index(argc, argv, "--score-detail") > 0, dump, fit_fill, gd && !getenv("UFSM_SCORE_DENSE") ? &fit_sparse : nullptr, &fc);
         fit_set_dev_free(gd); z3_close(z); if (dump) fclose(dump);
-        if (rc) return 1;
+        if (rc) return rc;   /* (3: an empty GT level / nothing labelled in the box) */
     }
     fit_set_free(fs); if (!cached) fit_fields_free(&fb);
     return 0;
