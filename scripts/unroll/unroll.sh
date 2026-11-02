@@ -45,7 +45,9 @@ ncpu() { local n; n=$($U sysinfo --ncpu 2> /dev/null) && [ "$n" -gt 0 ] 2> /dev/
 availgb() { local g; g=$($U sysinfo --avail-gb 2> /dev/null) && [ "$g" -ge 0 ] 2> /dev/null && { echo $g; return; }
             awk '/MemAvailable/ {print int($2 / 1048576)}' /proc/meminfo; }
 INKNAME=${INKNAME:-ift3-24000}; TH=${TH:-$(ncpu)}; [ "$TH" -gt 20 ] 2> /dev/null && [ -z "${TH_ALL:-}" ] && TH=20; MINMEM=${MINMEM:-40}; INKGPU=${INKGPU:-1}
-FIELDGPUS=${FIELDGPUS:-0 1}; FITGPUS=${FITGPUS:-0 1}; DRY=${DRY:-0}; I=64; OV=16
+FIELDGPUS=${FIELDGPUS:-0 1}; FITGPUS=${FITGPUS:-0 1}; DRY=${DRY:-0}; I=${SLABI:-64}; OV=${SLABOV:-16}
+# SLABI / SLABOV: slab cells / overlap (default 64 / 16). A full-section Paris 3 slab (96 x 3680 x 4768 fields, 16.8 GB) does not fit a 16 GB GPU and
+# runs from managed memory at 20-60 min per slab (desk 5060 Ti, 11-01); SLABI=32 (64 rows, 11.2 GB) fits the device.
 PRIZE="PHerc0125 PHerc0175A PHerc0175B PHerc0191 PHerc0211 PHerc0257 PHerc0268 PHerc0306B PHerc0358 PHerc0483A PHerc0483B PHerc0490A PHerc0490B PHerc0800 PHerc0813 PHerc0826 PHerc0846A PHerc0846B PHerc1203 PHerc1218 PHerc1545"
 
 # the scan: scrolls.tsv (box / zr / strip args), else the corpus list.tsv (box from the mask)
@@ -204,7 +206,7 @@ ink() {
 SLABFIT=${SLABFIT---steps 300,300,300,300,200,200 --batch 1000000}
 lane() {   # lane GPU
   local g=$1 k s d c0 c1 a b t0 rc ze ny nx dir
-  if [ "$DRY" = 1 ]; then echo "    lane GPU $g: per slab k: mkcrop.sh $F slabs/sNNN/f (64 cells + 16 overlap); $U fit slabs/sNNN/f --gpu $g --out slabs/sNNN/fit --dir REFDIR --ref-model $REF --ref-snap 1 --uw-repair 0 $SLABFIT [phase gate on by default; FITX=\"--phase-gate 0\" off] ${FITX:-}"; return 0; fi
+  if [ "$DRY" = 1 ]; then echo "    lane GPU $g: per slab k: mkcrop.sh $F slabs/sNNN/f ($I cells + $OV overlap); $U fit slabs/sNNN/f --gpu $g --out slabs/sNNN/fit --dir REFDIR --ref-model $REF --ref-snap 1 --uw-repair 0 $SLABFIT [phase gate on by default; FITX=\"--phase-gate 0\" off] ${FITX:-}"; return 0; fi
   ze=$(jq -r '.shape[0]' $F/fields.json); ny=$(jq -r '.shape[1]' $F/fields.json); nx=$(jq -r '.shape[2]' $F/fields.json); dir=$(jq -r .dir $REF/model.json)
   for k in $(seq 0 $(( (ze + I - 1) / I - 1 ))); do
     stopped && return 0
