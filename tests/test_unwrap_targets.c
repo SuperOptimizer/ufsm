@@ -105,7 +105,7 @@ int main(void) {
         const int K = 512, L = 32; const float ds = 8.f, lam = 1.f;
         uint8_t *qp = malloc(q3); float *lg = malloc(q3 * 4), *g = malloc(q3 * 4), out[3];
         for (int z = 0; z < Q; z++) for (int y = 0; y < Q; y++) for (int x = 0; x < Q; x++) { double q = k3[0] * z + k3[1] * y + k3[2] * x; q -= floor(q); qp[((size_t)z * Q + y) * Q + x] = (uint8_t)((int)lround(q * 252) % 252); }
-        uint8_t *dp = nn_malloc(q3); float *dl = nn_malloc(q3 * 4), *dg = nn_malloc(q3 * 4), *acc = nn_malloc(q3 * 4), *seg = nn_malloc(3 * K * 4), *o2 = nn_malloc(16); unsigned *nv = nn_malloc(4);
+        uint8_t *dp = nn_malloc(q3); float *dl = nn_malloc(q3 * 4), *dg = nn_malloc(q3 * 4), *acc = nn_malloc(q3 * 4), *seg = nn_malloc(4 * K * 4), *o2 = nn_malloc(24 * 4); unsigned *nv = nn_malloc(4);
         nn_h2d(dp, qp, q3); nn_zero(acc, q3 * 4);
         const double cs[2] = {1, .5};
         for (int ci = 0; ci < 2; ci++) {
@@ -135,21 +135,27 @@ int main(void) {
     {   /* train --count-strata (nn_count_strata): phase along z, wide sheets (50 voxels) in x < 16 (a quarter of the volume), packed ones
            (12.5 voxels) elsewhere; uniform starts give ~25% wide segments, strata edge 25 (um 1) ~50%; off again restores uniform */
         const int Q = 64, K = 2048, L = 40; const size_t q3 = (size_t)Q * Q * Q;
-        uint8_t *qp = malloc(q3); float *lg = malloc(q3 * 4), *sg = malloc((size_t)3 * K * 4), out[3];
+        uint8_t *qp = malloc(q3); float *lg = malloc(q3 * 4), *sg = malloc((size_t)4 * K * 4), out[21];
         for (int z = 0; z < Q; z++) for (int y = 0; y < Q; y++) for (int x = 0; x < Q; x++) {
             double q = (x < 16 ? .02 : .08) * z; q -= floor(q); qp[((size_t)z * Q + y) * Q + x] = (uint8_t)((int)lround(q * 252) % 252); lg[((size_t)z * Q + y) * Q + x] = 0.f; }
-        uint8_t *dp = nn_malloc(q3); float *dl = nn_malloc(q3 * 4), *acc = nn_malloc(q3 * 4), *seg = nn_malloc(3 * K * 4), *o2 = nn_malloc(16); unsigned *nv = nn_malloc(4);
+        uint8_t *dp = nn_malloc(q3); float *dl = nn_malloc(q3 * 4), *acc = nn_malloc(q3 * 4), *seg = nn_malloc(4 * K * 4), *o2 = nn_malloc(24 * 4); unsigned *nv = nn_malloc(4);
         nn_h2d(dp, qp, q3); nn_h2d(dl, lg, q3 * 4); nn_zero(acc, q3 * 4);
         double share[3]; const float e25 = 25.f;
         for (int r = 0; r < 3; r++) {
             nn_count_strata(r == 1 ? 1 : 0, &e25, 1.f);
-            nn_count_loss(dl, dp, Q, Q, Q, 1, K, L, 8.f, 11 + r, 1.f, nullptr, acc, seg, nv, o2); nn_sync(); nn_d2h(out, o2, 12); nn_d2h(sg, seg, (size_t)3 * K * 4);
-            int nw = 0, nt = 0; for (int k = 0; k < K; k++) if (sg[3 * k] >= 0) { nt++; nw += sg[3 * k + 2] < 1.2f; }
+            nn_count_loss(dl, dp, Q, Q, Q, 1, K, L, 8.f, 11 + r, 1.f, nullptr, acc, seg, nv, o2); nn_sync(); nn_d2h(out, o2, 21 * 4); nn_d2h(sg, seg, (size_t)4 * K * 4);
+            int nw = 0, nt = 0; for (int k = 0; k < K; k++) if (sg[4 * k] >= 0) { nt++; nw += sg[4 * k + 2] < 1.2f; }
             share[r] = nt ? (double)nw / nt : 0; printf("count strata %s: %d valid segments, wide share %.3f\n", r == 1 ? "on" : "off", nt, share[r]);
             CHECK(nt > K / 2, "count strata: most segments valid (%d of %d)", nt, K);
         }
         CHECK(share[0] > .15 && share[0] < .35 && share[2] > .15 && share[2] < .35, "count strata off: uniform wide share %.3f / %.3f", share[0], share[2]);
         CHECK(share[1] > .42 && share[1] < .58, "count strata on: wide share %.3f (want ~.5)", share[1]);
+        {   /* per-bin sums (out2[3..]): with strata on, bin 1 (>= 25 voxels) holds the wide segments' true turns (~0.78 each) */
+            nn_count_strata(1, &e25, 1.f); nn_count_loss(dl, dp, Q, Q, Q, 1, K, L, 8.f, 21, 1.f, nullptr, acc, seg, nv, o2); nn_sync(); nn_d2h(out, o2, 21 * 4); nn_count_strata(0, &e25, 1.f);
+            const double tw = out[6] / ((double)out[1] / 2), tn = out[4] / ((double)out[1] / 2);
+            printf("count strata bins: true turns per segment wide %.3f packed %.3f\n", tw, tn);
+            CHECK(tw > .6 && tw < 1.0 && tn > 2.5 && tn < 3.5, "count strata bins: wide %.3f (~.78) packed %.3f (~3.1)", tw, tn);
+        }
         nn_free(dp); nn_free(dl); nn_free(acc); nn_free(seg); nn_free(o2); nn_free(nv); free(qp); free(lg); free(sg);
     }
     {   /* train --density-packed 0 (nn_set_loss_unit_ch7(6)): the 7-plane loss with a weighted mask equals the weighted loss on planes

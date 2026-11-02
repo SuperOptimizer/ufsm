@@ -256,7 +256,7 @@ extern "C" void nn_count_strata(int n, const float *edges_um, float um) {
 template <typename LT> __global__ void count_seg_k(const LT *dl, const uint8_t *ph, int D, int H, int W, int s, int K, int L, float dscale, uint64_t seed,
                                                    float *acc, float *seg, unsigned *nvalid, cnt_strata st) {
     const int k = blockIdx.x * blockDim.x + threadIdx.x; if (k >= K) return;
-    seg[3 * k] = -1.f;
+    seg[4 * k] = -1.f; seg[4 * k + 3] = -1.f;
     const size_t HW = (size_t)H * W, n = (size_t)D * HW;
     uint64_t h = cnt_mix(seed * 0x9e3779b97f4a7c15ull + (uint64_t)k * 0xc2b2ae3d27d4eb4full);
     const int want = st.n ? k % (st.n + 1) : -1, ntries = st.n ? 64 : 16;   /* strata: segment k wants spacing bin k mod (n + 1); the last 16 tries take any bin */
@@ -269,9 +269,10 @@ template <typename LT> __global__ void count_seg_k(const LT *dl, const uint8_t *
         int ok = 1; for (int q = 0; q < 6; q++) ok &= a[q] < 252; if (!ok) continue;
         float g[3] = {(float)cnt_pdiff(a[0], a[1]), (float)cnt_pdiff(a[2], a[3]), (float)cnt_pdiff(a[4], a[5])};
         const float gn = sqrtf(g[0] * g[0] + g[1] * g[1] + g[2] * g[2]); if (gn < 1e-3f) continue;
-        if (want >= 0 && tries < ntries - 16) {   /* the GT sheet spacing here: 2 s 252 / |phase difference over 2 s| voxels */
-            const float sp = 2.f * s * 252.f / gn; int b = 0; while (b < st.n && sp >= st.e[b]) b++;
-            if (b != want) continue;
+        int bin = -1;
+        if (st.n) {   /* the GT sheet spacing here: 2 s 252 / |phase difference over 2 s| voxels */
+            const float sp = 2.f * s * 252.f / gn; bin = 0; while (bin < st.n && sp >= st.e[bin]) bin++;
+            if (bin != want && tries < ntries - 16) continue;
         }
         for (int q = 0; q < 3; q++) g[q] /= gn;
         float tg = 0.f, tp = 0.f; int prev = ph[i0], valid = 1;
@@ -285,7 +286,7 @@ template <typename LT> __global__ void count_seg_k(const LT *dl, const uint8_t *
         }
         if (!valid || tg < .5f) continue;
         const float e = .05f, r = logf((tp + e) / (tg + e)), coef = (r > 0 ? 1.f : -1.f) / (tp + e);
-        seg[3 * k] = fabsf(r); seg[3 * k + 1] = tp; seg[3 * k + 2] = tg;
+        seg[4 * k] = fabsf(r); seg[4 * k + 1] = tp; seg[4 * k + 2] = tg; seg[4 * k + 3] = (float)bin;
         atomicAdd(nvalid, 1u);
         for (int j = 0; j < L - 1; j++) {
             const int zz = (int)lrintf(z + j * g[0]), yy = (int)lrintf(y + j * g[1]), xx = (int)lrintf(x + j * g[2]);
@@ -295,10 +296,15 @@ template <typename LT> __global__ void count_seg_k(const LT *dl, const uint8_t *
         return;
     }
 }
-__global__ void count_sum_k(const float *seg, int K, const unsigned *nvalid, float *out2) {
+__global__ void count_sum_k(const float *seg, int K, const unsigned *nvalid, float *out2) {   /* out2[3 + 2 b], [4 + 2 b]: sum Tp, Tg of spacing bin b < 9 */
     if (threadIdx.x || blockIdx.x) return;
-    double l = 0, tp = 0, tg = 0; for (int k = 0; k < K; k++) if (seg[3 * k] >= 0) { l += seg[3 * k]; tp += seg[3 * k + 1]; tg += seg[3 * k + 2]; }
+    double l = 0, tp = 0, tg = 0, bp[9] = {0}, bg[9] = {0};
+    for (int k = 0; k < K; k++) if (seg[4 * k] >= 0) {
+        l += seg[4 * k]; tp += seg[4 * k + 1]; tg += seg[4 * k + 2];
+        const int b = (int)seg[4 * k + 3]; if (b >= 0 && b < 9) { bp[b] += seg[4 * k + 1]; bg[b] += seg[4 * k + 2]; }
+    }
     const unsigned nv = *nvalid; out2[0] = nv ? (float)(l / nv) : 0.f; out2[1] = (float)nv; out2[2] = tg > 0 ? (float)(tp / tg) : 0.f;
+    for (int b = 0; b < 9; b++) { out2[3 + 2 * b] = (float)bp[b]; out2[4 + 2 * b] = (float)bg[b]; }
 }
 template <typename GT> __global__ void count_apply_k(GT *gl, float *acc, size_t n, const unsigned *nvalid, float scale) {
     const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; if (i >= n) return;
