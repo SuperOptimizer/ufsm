@@ -70,6 +70,7 @@ test_spiralfit                                 |              |    32 | ./$B/tes
 test_tta                                       | gpu          |     1 | ./$B/test_tta
 test_predict_unwrap2                           | gpu          |     5 | ./$B/test_predict_unwrap2 ./$B/ufsm
 test_unwrap2_ink                               | gpu          |    40 | ./$B/test_unwrap2_ink ./$B/ufsm ./$B/make_wind_fixture
+test_density_lambda                            | gpu          |    40 | ./$B/test_density_lambda ./$B/ufsm ./$B/make_wind_fixture
 test_coreline                                  |              |     2 | ./$B/test_coreline
 test_fit_w4                                    |              |    16 | ./$B/test_fit_w4
 test_repair                                    |              |    90 | UFSM_TEST_QUICK=1 ./$B/test_repair

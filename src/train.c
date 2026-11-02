@@ -76,7 +76,7 @@ typedef struct {
     uint8_t *bandb[2], *band;    /* task band_affinity: band per voxel (double-buffered like t / m), current */
     uint8_t *sideb[2], *sdb, *sidet, *sidem, *sidew; float *sscratch, sout[5]; double side_loss;   /* --side: SIDE_* / PHASE_* labels, loss target / mask / weight */
     float *aff_fin, aff_out[48]; double aff_loss;
-    uint8_t *pmb[2], *pm, *nt, *nm, *nw; float *iscratch, *nscratch, iout[3], nout[15]; double ink_loss, norm_loss;
+    uint8_t *pmb[2], *pm, *nt, *nm, *nw; float *iscratch, *nscratch, iout[3], nout[15]; double ink_loss, norm_loss, norm_raw;
     float *cnt_acc, *cnt_seg, *cnt_out, cnt_h[21]; unsigned *cnt_nv; uint64_t cnt_step; double count_loss;   /* --count-lambda */   /* task unwrap: papyrus mask (ink loss), normal / density targets, mask, weights; scratch and parts of the ink and normal losses */
     uint8_t *w4b[2], *wcb[2], *w4, *wc; double *w4ds; float *w4fin, w4h[8]; double w4_loss;   /* --task unwrap2: winding mod 4 and its component per voxel (double-buffered), loss sums, scratch, host parts */
     uint8_t *inkb[2], *ink, *inkt, *inkm, *inkw;   /* --ink-head: the ink plane (double-buffered), its slab target / mask, weight byte (loss parts: iscratch / iout / ink_loss) */
@@ -126,7 +126,7 @@ static int g_unwrap2, g_w4_ch = -1; static float g_w4_lambda = 1.f;
 /* --ink-head 1 (task unwrap2): one more output channel, the last (g_ink2_ch = 11), the ink logit: soft BCE against the sources' "ink" target
    (prob254, its own sampler plane batch.ink; 255 unknown = masked), times --ink-lambda x the source's "ink_weight". Head slabs only */
 static int g_ink2, g_ink2_ch = -1;
-static int g_unwrap, g_norm_ch, g_norm_s = 4; static float g_ink_lambda = 1.f, g_ink_dice = 0.f, g_norm_lambda = 1.f, g_dens_scale = 32.f;
+static int g_unwrap, g_norm_ch, g_norm_s = 4; static float g_ink_lambda = 1.f, g_ink_dice = 0.f, g_norm_lambda = 1.f, g_dens_lambda = 1.f, g_dens_scale = 32.f;   /* --density-lambda: the density channel's BCE weight (default --normal-lambda) */
 static int g_dens_code; static float g_packed_w, g_packed_um = 120.f;   /* --density-code, --packed-weight, --packed-um (task unwrap) */
 static float g_ptrunc_tau, g_ptrunc_kappa = 0.5f; static int g_ptrunc_from = 5000, g_ptrunc_on;   /* --phase-trunc TAU [--phase-trunc-conf K] [--phase-trunc-from STEP]: the robust phase loss (nn_phase_trunc), on from STEP */
 static int g_gl_inplace;   /* the logit gradient over the fp16 logits (set before the memory planner) */
@@ -795,7 +795,11 @@ static void head_slab_pass(gpu_state *d, int pass) {
         if (g_side_lambda != 1.f) nn_loss_grad_scale(LGC(g_side_ch), 2 * ns, g_side_lambda);
         if (g_pg_lambda > 0) nn_pgrad_apply(LGC(g_side_ch), LGC(g_side_ch + 1), d->pg_acc, ns, d->hs_ds + 56, g_pg_lambda);
         nn_loss_grad_only(LGC(g_norm_ch), d->nt, d->nm, d->nw, seven, 0.f, LGC(g_norm_ch), d->nscratch);
-        if (g_norm_lambda != 1.f) nn_loss_grad_scale(LGC(g_norm_ch), 7 * ns, g_norm_lambda);
+        if (g_dens_lambda == g_norm_lambda) { if (g_norm_lambda != 1.f) nn_loss_grad_scale(LGC(g_norm_ch), 7 * ns, g_norm_lambda); }
+        else {   /* --density-lambda: the 6 normal channels at --normal-lambda, the density channel (+ 6) at its own weight */
+            if (g_norm_lambda != 1.f) nn_loss_grad_scale(LGC(g_norm_ch), 6 * ns, g_norm_lambda);
+            if (g_dens_lambda != 1.f) nn_loss_grad_scale(LGC(g_norm_ch + 6), ns, g_dens_lambda);
+        }
         if (unet_head_bwd_z(d->u, z0, z1, d->hs_lg, z0 == 0)) { fprintf(stderr, "head slabs: the fused head backward is not covered (UFSM_HEAD_SLAB=0)\n"); abort(); }
 #undef LGC
     }
@@ -1024,7 +1028,11 @@ static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
         const shape5 seven = {1, 7, os.d, os.h, os.w};
         nn_loss_async_tol((const float *)((const char *)lg + g_norm_ch * l3 * le), d->nt, d->nm, d->nw, seven, 0.f,
                           train ? (float *)((char *)d->gl + g_norm_ch * l3 * eb) : nullptr, d->nscratch, nullptr);
-        if (train && g_norm_lambda != 1.f) nn_loss_grad_scale((char *)d->gl + g_norm_ch * l3 * eb, 7 * l3, g_norm_lambda);
+        if (train && g_dens_lambda == g_norm_lambda) { if (g_norm_lambda != 1.f) nn_loss_grad_scale((char *)d->gl + g_norm_ch * l3 * eb, 7 * l3, g_norm_lambda); }
+        else if (train) {   /* --density-lambda: normals (6 channels) and density (channel + 6) weighted apart; the count loss below adds unscaled */
+            if (g_norm_lambda != 1.f) nn_loss_grad_scale((char *)d->gl + g_norm_ch * l3 * eb, 6 * l3, g_norm_lambda);
+            if (g_dens_lambda != 1.f) nn_loss_grad_scale((char *)d->gl + (g_norm_ch + 6) * l3 * eb, l3, g_dens_lambda);
+        }
         if (getenv("UFSM_DUMP_DENS")) {   /* diagnostic: the mid-z plane of sigmoid(density logit) x 255 of the first UFSM_DUMP_N (4) windows
                                                as PREFIX-NN.pgm (+ source / level / corner on stderr), for an A/B against predict --channel */
             static int ndd = 0; const int N = getenv("UFSM_DUMP_N") ? atoi(getenv("UFSM_DUMP_N")) : 4;
@@ -1121,7 +1129,7 @@ static double fetch_loss(gpu_state *d, int B, int P, float dice_w, float *out) {
     shape5 os = g_half ? (shape5){B, g_cout, P, P, P} : unet_out_shape(d->u, (shape5){B, g_xc, d->side >= 0 ? g_Dl : g_Pz, P, P});
     if (g_aff) os.c = NCH;
     if (!g_verso_on && !g_unwrap) nn_loss_fetch(d->scratch, os, out);
-    d->ink_loss = d->norm_loss = d->w4_loss = 0;
+    d->ink_loss = d->norm_loss = d->norm_raw = d->w4_loss = 0;
     if (g_unwrap) {   /* recto parts laid out as the NCH-channel fetch does; the ink and normal / density losses */
         for (int c = 0; c < 2 * NCH + 1; c++) out[c] = 0;
         if (!g_unwrap2) {
@@ -1133,8 +1141,8 @@ static double fetch_loss(gpu_state *d, int B, int P, float dice_w, float *out) {
             if (g_ink2) { nn_loss_fetch(d->iscratch, (shape5){1, 1, 1, 1, 1}, d->iout); d->ink_loss = g_ink_lambda * d->iout[0]; }   /* (--ink-head: the logged loss at lambda, not the source weight) */
         }
         nn_loss_fetch(d->nscratch, (shape5){1, 7, 1, 1, 1}, d->nout);
-        float nb = 0; for (int c = 0; c < 7; c++) nb += d->nout[c];
-        d->norm_loss = g_norm_lambda * nb / 7;
+        float nb = 0; for (int c = 0; c < 6; c++) nb += d->nout[c];
+        d->norm_raw = (nb + d->nout[6]) / 7; d->norm_loss = (g_norm_lambda * nb + g_dens_lambda * d->nout[6]) / 7;   /* (the logged unweighted mean: norm_raw) */
         if (g_unwrap2) d->w4_loss = g_w4_lambda * d->w4h[0];
     }
     d->emb_loss = d->emb_cells = 0;
@@ -1323,7 +1331,9 @@ int cmd_train(int argc, char **argv) {
             }
         }
         g_ink_lambda = (float)atof(opt(argc,argv,"--ink-lambda","1")); g_ink_dice = (float)atof(opt(argc,argv,"--ink-dice","0"));
-        g_norm_lambda = (float)atof(opt(argc,argv,"--normal-lambda","1")); g_norm_s = atoi(opt(argc,argv,"--normal-step","4"));
+        g_norm_lambda = (float)atof(opt(argc,argv,"--normal-lambda","1")); g_dens_lambda = (float)atof(opt(argc,argv,"--density-lambda",opt(argc,argv,"--normal-lambda","1")));
+        if (!(g_norm_lambda >= 0) || !(g_dens_lambda >= 0)) { fprintf(stderr,"--normal-lambda / --density-lambda >= 0\n"); return 2; }
+        g_norm_s = atoi(opt(argc,argv,"--normal-step","4"));
         if (g_norm_s < 1 || g_norm_s > 16) { fprintf(stderr,"--normal-step 1..16\n"); return 2; }
         g_dens_scale = (float)atof(opt(argc,argv,"--density-scale","32"));   /* density target min(1, scale rho): 32 at 2.4 um, 8 at 9.6 um (the same physical code) */
         if (!(g_dens_scale > 0)) { fprintf(stderr,"--density-scale > 0\n"); return 2; }
@@ -1391,9 +1401,9 @@ int cmd_train(int argc, char **argv) {
         if (g_unwrap2) { g_w4_ch = g_cout; g_cout += 2; }
         if (g_ink2) { g_ink2_ch = g_cout; g_cout += 1; fprintf(stderr, "unwrap2 --ink-head: channel %d ink (soft BCE over the sources' \"ink\" prob254 targets, 255 unknown; lambda %g x the source's ink_weight)\n", g_ink2_ch, g_ink_lambda); }
         if (g_unwrap2) fprintf(stderr, "unwrap2: channels %d-%d phase, %d-%d normal n n^T, %d density (lambda %g, step %d), %d-%d winding mod 4 (gauge-free, lambda %g)\n",
-                               g_side_ch, g_side_ch + 1, g_norm_ch, g_norm_ch + 5, g_norm_ch + 6, g_norm_lambda, g_norm_s, g_w4_ch, g_w4_ch + 1, g_w4_lambda);
+                               g_side_ch, g_side_ch + 1, g_norm_ch, g_norm_ch + 5, g_norm_ch + 6, g_dens_lambda, g_norm_s, g_w4_ch, g_w4_ch + 1, g_w4_lambda);
         else fprintf(stderr, "unwrap: channels 0 recto, 1 ink (lambda %g, dice %g), %d-%d phase, %d-%d normal n n^T, %d density (lambda %g, step %d)\n",
-                     g_ink_lambda, g_ink_dice, g_side_ch, g_side_ch + 1, g_norm_ch, g_norm_ch + 5, g_norm_ch + 6, g_norm_lambda, g_norm_s);
+                     g_ink_lambda, g_ink_dice, g_side_ch, g_side_ch + 1, g_norm_ch, g_norm_ch + 5, g_norm_ch + 6, g_dens_lambda, g_norm_s);
     }
     g_cond = atoi(opt(argc, argv, "--cond", "0")); g_cond_lambda = (float)atof(opt(argc, argv, "--cond-lambda", "1"));
     const char *closs = opt(argc, argv, "--cond-loss", "all");   /* all: the winding heads supervised everywhere known; outside: only where the condition does not reach */
@@ -2422,18 +2432,18 @@ int cmd_train(int argc, char **argv) {
     }
     if (g_unwrap2) {   /* channel layout of the unwrap2 heads (predict --fit-fields reads "version":2) */
         size_t n=strlen(runtime_extra); runtime_extra[n-1]=0;
-        snprintf(runtime_extra+n-1,sizeof runtime_extra-n+1,",\"unwrap\":{\"version\":2,\"channels\":{\"phase\":[%d,%d],\"normal\":[%d,%d,%d,%d,%d,%d],\"density\":%d,\"wind4\":[%d,%d]},\"normal\":\"n_z^2, n_y^2, n_x^2, 0.5+n_z n_y, 0.5+n_z n_x, 0.5+n_y n_x\",\"density\":\"%s, rho = |grad phase| turns per voxel\",\"wind4\":\"0.5+0.5cos / sin(2pi W/4), W the stored phase unwrapped over the window, gauge-free\",\"density_scale\":%.9g,\"density_code\":%d,\"packed_weight\":%.9g,\"packed_um\":%.9g,\"normal_lambda\":%.9g,\"normal_step\":%d,\"wind4_lambda\":%.9g,\"wind4_step\":%d,\"wind4_min\":%d,\"wind4_tile\":%d}}",
+        snprintf(runtime_extra+n-1,sizeof runtime_extra-n+1,",\"unwrap\":{\"version\":2,\"channels\":{\"phase\":[%d,%d],\"normal\":[%d,%d,%d,%d,%d,%d],\"density\":%d,\"wind4\":[%d,%d]},\"normal\":\"n_z^2, n_y^2, n_x^2, 0.5+n_z n_y, 0.5+n_z n_x, 0.5+n_y n_x\",\"density\":\"%s, rho = |grad phase| turns per voxel\",\"wind4\":\"0.5+0.5cos / sin(2pi W/4), W the stored phase unwrapped over the window, gauge-free\",\"density_scale\":%.9g,\"density_code\":%d,\"packed_weight\":%.9g,\"packed_um\":%.9g,\"normal_lambda\":%.9g,\"density_lambda\":%.9g,\"normal_step\":%d,\"wind4_lambda\":%.9g,\"wind4_step\":%d,\"wind4_min\":%d,\"wind4_tile\":%d}}",
                  g_side_ch,g_side_ch+1,g_norm_ch,g_norm_ch+1,g_norm_ch+2,g_norm_ch+3,g_norm_ch+4,g_norm_ch+5,g_norm_ch+6,g_w4_ch,g_w4_ch+1,
-                 g_dens_code ? "x / (1 + x), x = density_scale rho" : "min(1, density_scale rho)",g_dens_scale,g_dens_code,g_packed_w,g_packed_um,g_norm_lambda,g_norm_s,g_w4_lambda,sc.wind4_step,sc.wind4_min,sc.wind4_tile);
+                 g_dens_code ? "x / (1 + x), x = density_scale rho" : "min(1, density_scale rho)",g_dens_scale,g_dens_code,g_packed_w,g_packed_um,g_norm_lambda,g_dens_lambda,g_norm_s,g_w4_lambda,sc.wind4_step,sc.wind4_min,sc.wind4_tile);
         if (g_ink2) {   /* --ink-head: the ink channel (predict --fit-zarr --channel ink writes it beside the fields) */
             size_t n2=strlen(runtime_extra); runtime_extra[n2-2]=0;
             snprintf(runtime_extra+n2-2,sizeof runtime_extra-n2+2,",\"ink\":%d,\"ink_lambda\":%.9g}}",g_ink2_ch,g_ink_lambda);
         }
     } else if (g_unwrap) {   /* channel layout of the unwrap heads */
         size_t n=strlen(runtime_extra); runtime_extra[n-1]=0;
-        snprintf(runtime_extra+n-1,sizeof runtime_extra-n+1,",\"unwrap\":{\"version\":1,\"channels\":{\"recto\":0,\"ink\":1,\"phase\":[%d,%d],\"normal\":[%d,%d,%d,%d,%d,%d],\"density\":%d},\"normal\":\"n_z^2, n_y^2, n_x^2, 0.5+n_z n_y, 0.5+n_z n_x, 0.5+n_y n_x\",\"density\":\"%s, rho = |grad phase| turns per voxel\",\"density_scale\":%.9g,\"density_code\":%d,\"packed_weight\":%.9g,\"packed_um\":%.9g,\"ink_lambda\":%.9g,\"ink_dice\":%.9g,\"normal_lambda\":%.9g,\"normal_step\":%d}}",
+        snprintf(runtime_extra+n-1,sizeof runtime_extra-n+1,",\"unwrap\":{\"version\":1,\"channels\":{\"recto\":0,\"ink\":1,\"phase\":[%d,%d],\"normal\":[%d,%d,%d,%d,%d,%d],\"density\":%d},\"normal\":\"n_z^2, n_y^2, n_x^2, 0.5+n_z n_y, 0.5+n_z n_x, 0.5+n_y n_x\",\"density\":\"%s, rho = |grad phase| turns per voxel\",\"density_scale\":%.9g,\"density_code\":%d,\"packed_weight\":%.9g,\"packed_um\":%.9g,\"ink_lambda\":%.9g,\"ink_dice\":%.9g,\"normal_lambda\":%.9g,\"density_lambda\":%.9g,\"normal_step\":%d}}",
                  g_side_ch,g_side_ch+1,g_norm_ch,g_norm_ch+1,g_norm_ch+2,g_norm_ch+3,g_norm_ch+4,g_norm_ch+5,g_norm_ch+6,
-                 g_dens_code ? "x / (1 + x), x = density_scale rho" : "min(1, density_scale rho)",g_dens_scale,g_dens_code,g_packed_w,g_packed_um,g_ink_lambda,g_ink_dice,g_norm_lambda,g_norm_s);
+                 g_dens_code ? "x / (1 + x), x = density_scale rho" : "min(1, density_scale rho)",g_dens_scale,g_dens_code,g_packed_w,g_packed_um,g_ink_lambda,g_ink_dice,g_norm_lambda,g_dens_lambda,g_norm_s);
         if (g_cond) {   /* conditioned inference (predict --cond-sweep): inside the unwrap object */
             n=strlen(runtime_extra); runtime_extra[n-2]=0;
             snprintf(runtime_extra+n-2,sizeof runtime_extra-n+2,",\"cond\":{\"version\":1,\"inputs\":[4,5,6],\"input\":\"cos, sin of 2 pi q / 14, mask\",\"channels\":[%d,%d,%d,%d],\"periods\":[14,2],\"lambda\":%.9g,\"loss\":\"%s\"}}}",
@@ -2824,7 +2834,7 @@ int cmd_train(int argc, char **argv) {
         acc_loss += loss / nl; acc_bce += parts[0][0]; acc_dice += parts[0][g_aff || g_unwrap || g_heads ? NCH : g_half ? g_cout : cfg.cout]; acc_g += gn; nacc++;
         if (g_verso_on) { acc_vbce += G[0].vout[0]; acc_vdice += G[0].vout[1]; }
         if (g_side) acc_side += G[0].sout[0];
-        if (g_unwrap) { acc_ink += G[0].iout[0]; acc_norm += G[0].norm_loss / (g_norm_lambda ? g_norm_lambda : 1.f); }
+        if (g_unwrap) { acc_ink += G[0].iout[0]; acc_norm += G[0].norm_raw; }
         if (g_ink2 && G[0].iout[2] > 0) acc_inkn += 1;
         if (g_unwrap2) { acc_w4 += G[0].w4h[0]; acc_w4w += G[0].w4h[5]; acc_w4a += G[0].w4h[1]; } acc_pg += G[0].pg_loss;
         if (g_ds) acc_ds += G[0].ds_loss;
@@ -2910,7 +2920,7 @@ int cmd_train(int argc, char **argv) {
                         }
                         vl = (vl < 0 ? 0 : vl) + l; vb += vp[0];
                         if (g_ink2 && G[0].iout[2] > 0) { vik[0] += G[0].iout[0]; vik[1] += 1; }
-                        if (g_unwrap2) { vw4[0] += G[0].w4h[0]; vw4[1] += G[0].w4h[5]; vw4[2] += G[0].w4h[1] * G[0].w4h[2]; vw4[3] += G[0].w4h[2]; vw4[4] += G[0].side_loss / (g_side_lambda ? g_side_lambda : 1.f); vw4[5] += G[0].norm_loss / (g_norm_lambda ? g_norm_lambda : 1.f); } vd += vp[g_aff || g_unwrap || g_heads ? NCH : g_half ? g_cout : cfg.cout];
+                        if (g_unwrap2) { vw4[0] += G[0].w4h[0]; vw4[1] += G[0].w4h[5]; vw4[2] += G[0].w4h[1] * G[0].w4h[2]; vw4[3] += G[0].w4h[2]; vw4[4] += G[0].side_loss / (g_side_lambda ? g_side_lambda : 1.f); vw4[5] += G[0].norm_raw; } vd += vp[g_aff || g_unwrap || g_heads ? NCH : g_half ? g_cout : cfg.cout];
                         if (g_heads) for (int h = 0; h < g_heads; h++) if (G[0].hon[h]) { vh[h] += G[0].hl[h]; vhn[h]++; }
                         if (vq) sampler_release(vq, vbt);
                         got++;
