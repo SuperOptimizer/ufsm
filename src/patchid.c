@@ -52,7 +52,7 @@ typedef struct {
     int b0, bn; float *g; uint8_t *v;   /* band rows: grid z, y, x, theta per vertex */
 } pi_wrap;
 
-typedef struct { uint32_t cell, comp; int16_t jv; uint8_t eb, pad; uint32_t n; } pi_rec;   /* eb: GT turn offset 0..13, 255 none */
+typedef struct { uint32_t cell, comp; int16_t jv; uint8_t eb, side; uint32_t n; } pi_rec;   /* eb: GT turn offset 0..13, 255 none; side (--anchor-split): 1 anchor z slab, 0 eval */
 typedef struct { pi_rec *r; size_t n, cap; } pi_recs;
 typedef struct { float p[3]; uint32_t cell, comp; int16_t jv; uint8_t eb, gc; } pi_smp;   /* a pair-metric sample (GT-coded vertex), p in mm */
 typedef struct { pi_smp *s; size_t n, cap; } pi_smps;
@@ -63,7 +63,8 @@ static int pi_cmp_rec(const void *a, const void *b) {
     if (x->cell != y->cell) return x->cell < y->cell ? -1 : 1;
     if (x->comp != y->comp) return x->comp < y->comp ? -1 : 1;
     if (x->jv != y->jv) return x->jv < y->jv ? -1 : 1;
-    return (x->eb > y->eb) - (x->eb < y->eb);
+    if (x->eb != y->eb) return x->eb < y->eb ? -1 : 1;
+    return (x->side > y->side) - (x->side < y->side);
 }
 static void pi_reduce(pi_recs *R) {   /* sort + merge equal keys */
     if (!R->n) return;
@@ -71,7 +72,7 @@ static void pi_reduce(pi_recs *R) {   /* sort + merge equal keys */
     size_t o = 0;
     for (size_t i = 1; i < R->n; i++) {
         pi_rec *a = &R->r[o], *b = &R->r[i];
-        if (a->cell == b->cell && a->comp == b->comp && a->jv == b->jv && a->eb == b->eb) a->n += b->n; else R->r[++o] = *b;
+        if (a->cell == b->cell && a->comp == b->comp && a->jv == b->jv && a->eb == b->eb && a->side == b->side) a->n += b->n; else R->r[++o] = *b;
     }
     R->n = o + 1;
 }
@@ -161,6 +162,7 @@ static void pi_lpush(pi_links *L, pi_link x) { if (L->n == L->cap) { L->cap = L-
 typedef struct {
     pi_wrap *W; int nw; axis *ax; double s0, f, dir;
     int B, BAND, nby, nbx, nbz; int64_t o[3];   /* band origin (z, y, x) in grid voxels; band extent BAND x nby B x nbx B */
+    int asplit;   /* --anchor-split S: GT votes for the patch ids only from z slabs floor(z / S) even, scores only on the odd ones */
     int64_t NY, NX; uint8_t thr; int min_comp, range, gt_range, min_link, bad_gap; double ratio; _Atomic long long nbad;
     uint8_t *sheet, *gt; uint16_t *lab; uint32_t *base; uint16_t *ncomp; float *phi;   /* per band block: atom count, centre angle (NAN: skipped) */
     uint32_t *prev; float *prev_phi; int have_prev;   /* the previous band's last z plane: global atom ids (PI_NONE) and its block angles */
@@ -432,7 +434,7 @@ static void *pi_vert_run(void *arg) {
                 gre += cos(2 * M_PI * e); gim += sin(2 * M_PI * e); ng++;
                 eb = (uint8_t)(((long)lround(e)) % 14); gcode = gc;
             }
-            pi_push(R, (pi_rec){cb + (uint32_t)sec, comp, jv, eb, 0, 1});
+            pi_push(R, (pi_rec){cb + (uint32_t)sec, comp, jv, eb, (uint8_t)(J->asplit > 0 && (zi / J->asplit) % 2 == 0), 1});
             if (eb != 255 && (uint32_t)(pi_mix(((uint64_t)w->id << 42) ^ ((uint64_t)row << 21) ^ (uint64_t)c) >> 32) < J->smp_T) {
                 pi_smps *Sm = &J->tsmp[tid];
                 if (Sm->n == Sm->cap) { Sm->cap = Sm->cap ? 2 * Sm->cap : 1 << 14; Sm->s = realloc(Sm->s, Sm->cap * sizeof *Sm->s); if (!Sm->s) abort(); }
@@ -467,7 +469,7 @@ int cmd_patch_id(int argc, char **argv) {
     J.B = atoi(pi_opt(argc, argv, "--block", "32")); J.BAND = atoi(pi_opt(argc, argv, "--band", "64"));
     J.thr = (uint8_t)atoi(pi_opt(argc, argv, "--thr", "1")); J.min_comp = atoi(pi_opt(argc, argv, "--min-comp", "8"));
     J.range = atoi(pi_opt(argc, argv, "--range", "3")); J.gt_range = atoi(pi_opt(argc, argv, "--gt-range", "4"));
-    J.min_link = atoi(pi_opt(argc, argv, "--min-link", "16")); J.bad_gap = atoi(pi_opt(argc, argv, "--bad-gap", "2")); J.ratio = atof(pi_opt(argc, argv, "--ratio", "0.3"));
+    J.min_link = atoi(pi_opt(argc, argv, "--min-link", "16")); J.bad_gap = atoi(pi_opt(argc, argv, "--bad-gap", "2")); J.asplit = atoi(pi_opt(argc, argv, "--anchor-split", "0")); J.ratio = atof(pi_opt(argc, argv, "--ratio", "0.3"));
     const long long min_votes = atoll(pi_opt(argc, argv, "--min-votes", "500")); const double min_share = atof(pi_opt(argc, argv, "--min-share", "0.5"));
     if (sscanf(pi_opt(argc, argv, "--cells", "32,32"), "%d,%d", &J.CR, &J.NS) != 2 || J.CR < 1 || J.NS < 1) { fprintf(stderr, "patch-id: --cells R,S\n"); return 2; }
     J.dir = dir;
@@ -587,7 +589,7 @@ int cmd_patch_id(int argc, char **argv) {
         const pi_rec *r = &ALL.r[i]; Rof[i] = PI_NONE; Tof[i] = 0; if (r->comp == PI_NONE) continue;
         int T; const uint32_t root = pi_find(&U, r->comp, &T); Rof[i] = root; Tof[i] = T;
         const int Jv = r->jv - (int)dir * T;
-        VO[nvo++] = (pi_vote){root, Jv, r->eb == 255 ? 99 : ((r->eb + Jv) % 14 + 14) % 14, r->n};
+        VO[nvo++] = (pi_vote){root, Jv, r->eb == 255 || (J.asplit > 0 && !r->side) ? 99 : ((r->eb + Jv) % 14 + 14) % 14, r->n};
     }
     qsort(VO, nvo, sizeof *VO, pi_cmp_vote);
     size_t npa = 0, cpa = 1024; pi_patch *PA = malloc(cpa * sizeof *PA);
@@ -684,6 +686,7 @@ int cmd_patch_id(int argc, char **argv) {
           pa_buf pb[5]; for (int v = 0; v < 5; v++) pa_init(&pb[v], ns + 16);   /* 3, 4: the samples in kept patches only, before / vote fix */
           for (int t = 0; t < J.nt; t++) for (size_t i = 0; i < J.tsmp[t].n; i++) {
               const pi_smp *q = &J.tsmp[t].s[i]; int d1 = 0, inp = 0;
+              if (J.asplit > 0 && ((int64_t)floor(q->p[0] / J.mm + 0.5) / J.asplit) % 2 == 0) continue;   /* (anchor slab: not scored) */
               if (q->comp != PI_NONE) { int T; const uint32_t root = pi_find(&U, q->comp, &T); pi_patch key = {root, 0, 0, 0, 0, 0, 0};
                   const pi_patch *P = bsearch(&key, PA, npa, sizeof *PA, pi_cmp_patch);
                   if (P && P->ok) { const int d = PI_DK(P, q->jv - (int)dir * T); if (d >= -PI_DKR && d <= PI_DKR) { d1 = d; inp = 1; } } }
