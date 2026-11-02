@@ -17,7 +17,7 @@
 #   join    -> slabs: fit-join --ref (refuses bad slabs) ; check -> join: wrap-check (wrapcheck.tsv verdicts; 0 CT peaks = fail)
 #   wraps   -> check: ufsm wraps (.sfc, step 4, --zr from scrolls.tsv, --min-cm2, --col-r p90)
 #   trim    -> wraps: the outer-end dup run (wrap-check) + near-empty outer wraps (on-papyrus <= PAPMIN 0.1; surf-stats) dropped: strip --last
-#           = the first kept id (state/strip.args, the dropped ids in progress.log); TRIM=0 or a --last in STRIPARGS: off
+#           = the first kept id (state/strip.args, the dropped ids in progress.log); TRIM=0 or a --last in STRIPARGS (env only; a tsv --last is ignored): off
 #   snap    -> trim (SNAP=1 default; SNAP=0 off): ufsm wrap-snap wraps -> wraps_snap: each wrap moved along its rays onto the sheets
 #           (smooth per-wrap offsets, order kept: never past half the gap to its neighbours, never into masked CT; SNAPT target, SNAPX
 #           extra flags); the strip and its renders then use wraps_snap. CLEAN runs after it (the phase / mix targets read the fields)
@@ -58,7 +58,10 @@ REPO=${UNROLL_REPO:-$(cd $H/../.. && pwd)}
 IFS=$'\t' read -r _ R K UM LV AXS TBOX TZR TSTRIP <<< "$row"
 R=${CTROOT:-$R}; K=${CTKEY:-$K}   # (pods: the CT mirrored to local disk)
 LUM=$(awk -v u=$UM -v l=$LV 'BEGIN { printf "%.4g", u * 2 ^ l }')
-BOX=${BOX:-$TBOX}; ZR=${ZR:-$TZR}; STRIPARGS=${STRIPARGS:-$TSTRIP}; [ "$STRIPARGS" = - ] && STRIPARGS=
+BOX=${BOX:-$TBOX}; ZR=${ZR:-$TZR}; [ "$TSTRIP" = - ] && TSTRIP=
+# a wrap id (--last N) is in ONE run's gauge only (P3 11-02: the prod run's --last 432 skipped the trim of a re-unroll numbered w025-w266):
+# a --last in scrolls.tsv / list.tsv is dropped here (the trim stage finds it per run); only a STRIPARGS env override keeps one (checked in trim)
+if [ -z "${STRIPARGS:-}" ]; then STRIPARGS=$(echo " $TSTRIP " | sed -E 's/ --last [0-9]+ / /; s/^ +//; s/ +$//'); else [ "$STRIPARGS" = - ] && STRIPARGS=; fi
 F=$O/fields/wind96; REF=$O/ref-cf; INK=$O/ink/$INKNAME.zarr
 
 # the run's own copy of the scripts (bash reads scripts incrementally: editing the repo must not change a running driver)
@@ -300,7 +303,7 @@ wraps() {
 # end is the highest ids. (1) From the highest wrap-check verdict id walk down while the verdict is dup (the ref's outer over-count:
 # duplicate turns). (2) With no dup run, start from the highest wrap written instead. (3) Keep walking down while the wrap is near-empty:
 # on-papyrus (surf-stats --ct-only, CT >= 80 within +-15 um) <= PAPMIN (0.1). The first kept id becomes strip --last (state/strip.args);
-# the dropped ids are logged. STRIPARGS with its own --last, or TRIM=0, skips this. CLEAN=1 deletes the field planes + slab fits after the snap stage.
+# the dropped ids are logged. STRIPARGS (env) with its own --last (must name a wrap of this run), or TRIM=0, skips this. CLEAN=1 deletes the field planes + slab fits after the snap stage.
 onpap() {   # onpap ID..: "id share" per wrap (surf-stats --per-wrap --ct-only on a link dir of those wraps)
   local d=$O/trim.tmp i; rm -rf $d; mkdir -p $d; for i in "$@"; do ln -s $O/wraps/$(printf 'w%03d' $i).sfc $d/; done
   nice -n 10 $U surf-stats $d --fields $F --ct $R $K/$LV --ct-um $LUM --ct-only 1 --per-wrap --threads $TH 2>> $O/logs/trim.log |
@@ -310,6 +313,10 @@ onpap() {   # onpap ID..: "id share" per wrap (surf-stats --per-wrap --ct-only o
 trim() {
   [ "$DRY" = 1 ] && { echo "    strip --last = first kept id walking down from the top: wrapcheck.tsv dup run, then wraps with on-papyrus <= ${PAPMIN:-0.1} (surf-stats --ct-only)"; return 0; }
   local args=$STRIPARGS ids top last k i v p dropped= batch=() pap=$O/trim.pap; : > $O/state/strip.args
+  if [[ " $STRIPARGS " == *" --last "* ]]; then   # an explicit STRIPARGS --last (env): must name a wrap of THIS run
+    last=$(echo " $STRIPARGS " | sed -nE 's/.* --last ([0-9]+) .*/\1/p')
+    [ -e $O/wraps/$(printf 'w%03d' $((10#$last))).sfc ] || { log "trim: STRIPARGS --last $last names no wrap of this run ($(ls $O/wraps | head -1)..$(ls $O/wraps | tail -1)): a --last from another run's gauge? refusing"; return 1; }
+  fi
   if [ "${TRIM:-1}" != 1 ] || [[ " $STRIPARGS " == *" --last "* ]]; then log "trim: skipped (TRIM=${TRIM:-1}, STRIPARGS '$STRIPARGS')"
   else
     ids=($(ls $O/wraps | sed -n 's/^w\([0-9]*\)\.sfc$/\1/p' | awk '{print $1 + 0}' | sort -rn)); [ ${#ids[@]} -gt 0 ] || { log "trim: no wraps"; return 1; }
