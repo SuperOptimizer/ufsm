@@ -431,8 +431,11 @@ void nn_unwrap_targets2_z(const uint8_t *phase, int d, int h, int w, int s, floa
                           int z0, int z1);   /* planes [z0, z1) of the window into planes of (z1 - z0) h w */
 /* train --count-lambda: K segments of L voxels along the ground-truth phase gradient; loss |log((sum rho_pred + .05) / (true turns + .05))|
    (rho_pred = exp(logit) / dscale, the x / (1 + x) density code); its gradient times lambda added into dens_grad (the density
-   channel of the logit gradient; nullptr: none). acc: d h w floats (zero, left zero); seg: 3 K floats; out2 (device): mean loss,
-   valid segments, mean predicted / true turns */
+   channel of the logit gradient; nullptr: none). acc: d h w floats (zero, left zero); seg: 4 K floats; out2 (device, 21 floats): mean loss,
+   valid segments, mean predicted / true turns, then per --count-strata spacing bin b < 9 the sums of predicted and true turns (3 + 2 b, 4 + 2 b) */
+/* train --count-strata E1,..,En (um): stratify the count segments by GT sheet spacing: segment k is drawn from bin k mod (n + 1) of the
+   edges (converted to voxels with um, the window's voxel size; call before each nn_count_loss); n 0 = off (uniform starts) */
+void nn_count_strata(int n, const float *edges_um, float um);
 void nn_count_loss(const void *dens_logits, const uint8_t *phase, int d, int h, int w, int s, int K, int L, float dscale, uint64_t seed,
                    float lambda, void *dens_grad, float *acc, float *seg, unsigned *nvalid, float *out2);
 /* train --pgrad-lambda: the phase wavenumber loss over a head slab [z0, z1) (src/nn_loss.cu pgrad_k): lc / ls the slab's phase cos / sin
