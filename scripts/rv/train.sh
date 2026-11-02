@@ -28,6 +28,9 @@ ARGS=($SRCJ --out $o --gpus 0 --P $P --B 1 $ARCH $HEADS --steps $STEPS --sched w
   --log-every ${LOGE:-50} --val-every ${VAL:-2000} --val-batches ${VALB:-16} --ckpt-every ${CKPT:-1000} --seed ${SEED:-3} --val-seed 1 \
   --warmup 2000 --muon-lr ${MLR:-0.02} --lr ${ALR:-0.001} $AUG ${EXTRA:-})
 echo $$ > $o.launcher.pid
+printf 'cd %q && R=%q U=%q SRCJ=%q GPU=%q LOCK=%q P=%q ARCH=%q WORKERS=%q SLOTS=%q MEMMODE=%q ALR=%q MLR=%q WIND4L=%q ISO=%q EXTRA=%q SNAP=%q nohup bash %q %q %q >> %q 2>&1 &\n' \
+  "$PWD" "$R" "$U" "$SRCJ" "$GPU" "$LOCK" "$P" "$ARCH" "${WORKERS:-12}" "${SLOTS:-16}" "${MEMMODE:-auto}" "${ALR:-0.001}" "${MLR:-0.02}" "${WIND4L:-0.25}" "${ISO:-64}" "${EXTRA:-}" "${SNAP:-5000}" \
+  "$(readlink -f $0)" "$NAME" "$STEPS" "$o.nohup" > $o.relaunch   # (scripts/rv/evwatch.sh: pause for an eval, then bash <run>.relaunch)
 # snapshots: every SNAP steps last.ckpt is copied to <run>/snap/<step>.ckpt (the eval checkpoints); the copy's own header names its step
 mkdir -p $o/snap
 ( while kill -0 $$ 2>/dev/null; do
