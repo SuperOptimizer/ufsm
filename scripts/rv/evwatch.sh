@@ -2,7 +2,7 @@
 # scripts/rv/evwatch.sh RUN [EVERY 5000]: evaluate each new snapshot <run>/snap/<step>.ckpt (step % EVERY == 0) with scripts/rv/eval.sh.
 # The eval needs the training GPU (one 16 GB card holds the trainer): PAUSE=1 (default) stops the trainer gracefully (STOP file + SIGTERM:
 # it saves last.ckpt), runs the eval on that GPU, then relaunches it from <run>.relaunch (auto-resume). EVGPU / PAUSE=0: evaluate on another
-# GPU (e.g. 0 when free) without pausing. Log <run>.evwatch.log; results /vesuvius/ufsm/v2/rv/eval/<name>-<step>.txt.
+# GPU (e.g. 0 when free) without pausing. Log <run>.evwatch.log; results /mnt/scratch/rv/eval/<name>-<step>.txt.
 set -u
 o=${1:?RUN}; EV=${2:-5000}; H=$(cd "$(dirname "$0")" && pwd); n=$(basename $o)
 while :; do

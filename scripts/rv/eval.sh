@@ -4,15 +4,15 @@
 #   p1667 (eval scroll, never trained on): pn2 ref + fields /vesuvius/ufsm/v2/count/p1667, GT codes 4.798, --zr 500,8800 --nz 24 (m7 .973/.099)
 #   p139  (trained outside its 8 wbench boxes): count/p139, GT codes 18.72, --zr 1000,12000 --nz 24 (m7 .847/.220)
 #   p4    (trained outside PH1-3/HOLD: CONTAMINATED for this model): count/p4w + cfit/whole/refcrop, q-9p6, t1.sh zs + --zblock 1500,1 (m7 .920/.210)
-# Predictions: predict --channel rv (255 (1 + p_recto - p_verso) / 2) only on the shard rows (z) the ruler samples (--full-grid 1, --box per row,
-# --shard SH 64, --occupancy 5), on the scan level the fields use; then recto-ruler with --src rv (peaks of the fused signal = recto-side
+# Predictions: predict --channel rv (1 + 254 (1 + p_recto - p_verso) / 2, 0 = CT 0) only on the shard rows (z) the ruler samples (--full-grid 1, --box per row,
+# --shard SH 128, --occupancy 5), on the scan level the fields use; then recto-ruler with --src rv (peaks of the fused signal = recto-side
 # runs: one per sheet even where sheets touch) and --src rvr (the same volume, hit = run, --thr 160).
 # Out: $E/<TAG>/<scroll>/{pred,ruler.log}; summary $E/<TAG>.txt. Prediction zarrs are deleted after the ruler unless KEEP=1.
 # Env: U (rv binary), RU (ruler binary: RECTO's src2), GPU (1), LOCK, E (/vesuvius/ufsm/v2/rv/eval), TH (16), WIN (640/64, z 192/64).
 set -u
 CK=$1; T=$2; SC=${3:-p1667 p139 p4}
-U=${U:-/vesuvius/ufsm/v2/rv/bin/ufsm}; RU=${RU:-/vesuvius/ufsm/v2/recto/src2/build/ufsm}; GPU=${GPU:-1}; LOCK=${LOCK-/vesuvius/ufsm/opt/gpu$GPU.lock}
-E=${E:-/vesuvius/ufsm/v2/rv/eval}; TH=${TH:-16}; SH=${SH:-64}; CTR=/vesuvius/ufsm/v2/ct; C=/vesuvius/ufsm/v2/count
+U=${U:-/vesuvius/ufsm/v2/rv/bin/ufsm.ev}; RU=${RU:-/vesuvius/ufsm/v2/recto/src2/build/ufsm}; GPU=${GPU:-1}; LOCK=${LOCK-/vesuvius/ufsm/opt/gpu$GPU.lock}
+E=${E:-/mnt/scratch/rv/eval}; TH=${TH:-16}; SH=${SH:-128}; CTR=/vesuvius/ufsm/v2/ct; C=/vesuvius/ufsm/v2/count
 mkdir -p $E/$T; echo "== $T $CK $(date)" >> $E/$T.txt
 zlist() {   # zlist ZR0 ZR1 NZ: the ruler's --nz z levels (model-local native z)
   awk -v a=$1 -v b=$2 -v n=$3 'BEGIN { for (i = 0; i < n; i++) printf "%s%d", i ? "," : "", int(a + (i + 0.5) * (b - a) / n) }'; }
@@ -36,7 +36,7 @@ for S in $SC; do
     for r in $rows; do
       L=(); [ -n "$LOCK" ] && L=(flock $LOCK)
       CUDA_VISIBLE_DEVICES=$GPU "${L[@]}" nice -n 5 $U predict $CK $CTR $CK_ $D/pred --um $U0 --level $LV --box $((r * SH)),$oy,$ox,$SH,$((my * h)),$((mx * h)) \
-        --full-grid 1 --resume 1 --shard $SH --window 640 --halo 64 --window-z $((SH + 128)) --halo-z 64 --levels 1 --occupancy 3 --channel rv \
+        --full-grid 1 --resume 1 --shard $SH --window 640 --halo 64 --window-z $((SH + 128)) --halo-z 64 --levels 1 --channel rv \
         --threads $TH --gpu 0 --q 0 >> $D/pred.log 2>&1 || { echo "$S: predict row $r failed (see $D/pred.log)" | tee -a $E/$T.txt; continue 2; }
     done
     echo "$S: predicted $(echo $rows | wc -w) shard rows of $SH in $(( $(date +%s) - t0 )) s" | tee -a $E/$T.txt; touch $D/pred.done

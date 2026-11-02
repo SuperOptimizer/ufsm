@@ -3916,7 +3916,7 @@ static int cmd_overlay(int argc, char **argv) {
     for (char *s = lab, *tok; nl < 16 && (tok = strtok(s, ",")); s = nullptr) names[nl++] = tok;
     char prb[4096]; snprintf(prb, sizeof prb, "%s", opt(argc, argv, "--prob", "")); const int nlab = nl;   /* panels [0, nlab) labels, then probabilities */
     for (char *s = prb, *tok; nl < 16 && (tok = strtok(s, ",")); s = nullptr) names[nl++] = tok;
-    /* --rv G: predict --channel rv volumes (255 (1 + p_recto - p_verso) / 2): recto side red, verso side blue; --sides G: stored phase
+    /* --rv G: predict --channel rv volumes (1 + 254 (1 + p_recto - p_verso) / 2, 0 untinted): recto side red, verso side blue; --sides G: stored phase
        rasters (band.h PHASE_*): the recto half turn red, the verso half blue on papyrus (CT >= --iso 64), unknown untinted. A group
        "DIR@KEY" reads array KEY instead of the --um level name. Panels: labels, prob, rv, sides, then ids */
     char rvg[4096]; snprintf(rvg, sizeof rvg, "%s", opt(argc, argv, "--rv", "")); const int nprob0 = nl;
@@ -3956,7 +3956,7 @@ static int cmd_overlay(int argc, char **argv) {
                           r = (2 * g + 3 * cr) / 5; gg = (2 * g + 3 * cg) / 5; b = (2 * g + 3 * cb) / 5; } }
         else if (p && p - 1 >= nrv) { const int v = lb[n2 * (p - 1) + (size_t)y * W + x];   /* sides of a stored phase on papyrus */
                  if (v < 252 && g >= iso) { if (v < 126) { r = (g + 2 * 255) / 3; gg = g / 3; b = g / 3; } else { r = g / 3; gg = (g + 120) / 3; b = (g + 2 * 255) / 3; } } }
-        else if (p && p - 1 >= nprob0) { const int v = lb[n2 * (p - 1) + (size_t)y * W + x], a = v > 128 ? 2 * (v - 128) : 2 * (128 - v);   /* rv: red recto, blue verso */
+        else if (p && p - 1 >= nprob0) { const int v0 = lb[n2 * (p - 1) + (size_t)y * W + x], v = v0 ? v0 : 128, a = v > 128 ? 2 * (v - 128) : 2 * (128 - v);   /* rv: red recto, blue verso (0: none) */
                  const int a2 = a > 255 ? 255 : a;
                  if (v >= 128) { r = (g * (255 - a2) + 255 * a2) / 255; gg = (g * (255 - a2) + 30 * a2) / 255; b = (g * (255 - a2) + 20 * a2) / 255; }
                  else { r = (g * (255 - a2) + 20 * a2) / 255; gg = (g * (255 - a2) + 90 * a2) / 255; b = (g * (255 - a2) + 255 * a2) / 255; } }
