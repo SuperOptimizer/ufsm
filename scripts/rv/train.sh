@@ -45,8 +45,9 @@ for i in $(seq 0 ${RELAUNCH:-20}); do
   if [ "$avail" -lt ${MINMEM:-40} ]; then echo "$(date) MemAvailable ${avail} GB < ${MINMEM:-40}: waiting" >> $o.resume.log; sleep 300; continue; fi
   RS=(); [ -f $o/last.ckpt ] && RS=(--resume $o/last.ckpt)
   echo "$(date) start $i (GPU $GPU, lock ${LOCK:-none}): $U train ${ARGS[*]} ${RS[*]}" >> $o.resume.log
-  L=(); [ -n "$LOCK" ] && L=(flock $LOCK)
-  CUDA_VISIBLE_DEVICES=$GPU "${L[@]}" nice -n 5 $U train "${ARGS[@]}" "${RS[@]}" >> $o.log 2>&1 & echo $! > $o.pid; wait $!; rc=$?
+  # the GPU lock is held by this launcher (fd 9) for its lifetime, so <run>.pid is the trainer itself (SIGTERM = graceful save)
+  if [ -n "$LOCK" ] && [ -z "${LOCKED:-}" ]; then exec 9> $LOCK; flock 9; LOCKED=1; echo "$(date) holding $LOCK" >> $o.resume.log; fi
+  CUDA_VISIBLE_DEVICES=$GPU nice -n 5 $U train "${ARGS[@]}" "${RS[@]}" >> $o.log 2>&1 & echo $! > $o.pid; wait $!; rc=$?
   echo "$(date) exit rc=$rc" >> $o.resume.log
   last=$(awk '/^step +[0-9]+ / {s=$2} END {print s + 0}' $o.log)
   [ "$last" -ge "$STEPS" ] && break

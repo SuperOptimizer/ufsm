@@ -39,13 +39,14 @@ done < $T/gt.txt
 : > $T/surf.txt
 for S in ${LABS:-$(ls $V2/labels 2>/dev/null)}; do
   L=$V2/labels/$S; [ -e $L/done ] && [ -d $L/phase.zarr ] || continue
-  case $S in PHerc1667|PHerc0814|PHerc0139|PHerc1299|PHerc0846A) echo "mksources: $S is a holdout / invalid: left out" >&2; continue;; esac
+  case $S in PHerc1667|PHerc0139|PHerc1299|PHerc0846A|PHercParis4) echo "mksources: $S: holdout or own GT: our surfaces left out" >&2; continue;; esac
   row=$(awk -F'\t' -v s=$S '$1 == s' $V2/scrolls.tsv); [ -n "$row" ] || continue
   IFS=$'\t' read -r _ split _ _ _ _ _ ax ctr ctk ctum ctlev _ <<< "$row"; [ "$split" = train ] || continue
   key=$(ls $L/phase.zarr | grep -v '\.json$' | head -1)
   mm3=$(sed -nE 's/.*kept [0-9]+ \(([0-9.]+) mm3\).*/\1/p' $L/surflabels.log | tail -1)
   lw=$(echo " ${LABW:-} " | sed -nE "s/.* $S=([0-9.]+) .*/\1/p"); lw=${lw:-1}
-  echo "$S $CTR $ctk $ctum $ctlev $ax $L/phase.zarr $key $ctlev $(awk -v m=${mm3:-0} -v w=$lw 'BEGIN {print m * w}')" >> $T/surf.txt
+  pl=$(awk -v k=$key -v u=$ctum -v l=$ctlev 'BEGIN { printf "%d", l + int(log(k / (u * 2 ^ l)) / log(2) + 0.5) }')   # (GRIDUP labels: one level coarser)
+  echo "$S $CTR $ctk $ctum $ctlev $ax $L/phase.zarr $key $pl $(awk -v m=${mm3:-0} -v w=$lw 'BEGIN {print m * w}')" >> $T/surf.txt
 done
 SV=$(awk '{s += $10} END {print s + 0}' $T/surf.txt)
 while read -r n r c um lv ax pr pk pl w; do
