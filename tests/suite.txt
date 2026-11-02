@@ -144,6 +144,7 @@ test_ink_ext_tiling                            | gpu          |    24 | python3 
 test_dinovol                                   | gpu,slow     |    86 | python3 tests/test_dinovol.py
 test_dinovol_embed                             | gpu,slow     |   591 | python3 tests/test_dinovol_embed.py
 test_hercuvit                                  | gpu,slow     |    77 | python3 tests/test_hercuvit.py
+test_surfrecto                                 | gpu,slow     |    40 | python3 tests/test_surfrecto.py
 test_villawind                                 | gpu,slow     |   129 | python3 tests/test_villawind.py
 test_ink3d_gambiarra                           | gpu,slow     |   102 | python3 tests/test_ink3d_gambiarra.py
 test_mx_sw                                     | gpu          |     2 | ./$B/test_mx_sw
