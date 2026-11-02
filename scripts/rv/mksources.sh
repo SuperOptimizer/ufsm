@@ -3,7 +3,7 @@
 # Every source is phase-only (targets.band.phase: the pair-rule winding phase; the sampler's papyrus plane = CT >= "iso" gives
 # recto side = papyrus with phase < 1/2 turn, verso the outer half). Training grid ~8-9.6 um (each scan's 8.64 / 9.36 um level 0,
 # or level 2 of the 2.4 um scans).
-#  1. published GT (GTSHARE of the weight, 0.6): Paris 4 June / July phaseA / phaseB (gt/paris4-wind-20261019, 9.6 = level 2),
+#  1. published GT (GTSHARE of the weight, 0.6): Paris 4 June / July phaseA / phaseB (gt/paris4-wind-20261019 at 19.2 = level 3: P4PH),
 #     PHerc0139 (gt/PHerc0139-wind-20261016/phase 18.72 = level 1 of the 9.362 um scan), and whatever GTX lists
 #     (lines "name ct_root ct_key um level axis phase_root phase_key phase_level weight", e.g. 0172 / 0500P2 once checked).
 #     NEVER 0814 (skips sheets) or 1667 (the eval scroll).
@@ -15,12 +15,13 @@
 set -euo pipefail
 OUT=${1:-/vesuvius/ufsm/v2/rv/sources-rv.json}
 V2=${V2:-/vesuvius/ufsm/v2}; ISO=${ISO:-64}; HO=${HO:-/vesuvius/ufsm/wbench/holdouts.json}; MM=${MARGIN_MM:-0.5}
-GTS=${GTSHARE:-0.6}; SFS=${SURFSHARE:-0.4}; CTR=${CTR:-/vesuvius/ufsm/v2/ct}; GT=/vesuvius/ufsm/gt
+GTS=${GTSHARE:-0.6}; P4PH=${P4PH:-/vesuvius/ufsm/v2/rv/gt};   # P4 June / July phase: 19.2 um copies (downsample --mode phase of gt/paris4-wind-20261019 phaseA/B 9.6, which sit on the USB HDD)
+ SFS=${SURFSHARE:-0.4}; CTR=${CTR:-/vesuvius/ufsm/v2/ct}; GT=/vesuvius/ufsm/gt
 T=$(mktemp -d); trap 'rm -rf $T' EXIT
 # name ct_root ct_key um level axis phase_root phase_key phase_level weight
 cat > $T/gt.txt <<G
-PHercParis4-june $CTR PHercParis4/20260411134726-2.400um-0.2m-78keV-masked.zarr 2.4 2 /vesuvius/ufsm/teacher/axis-0.json $GT/paris4-wind-20261019/phaseA 9.6 2 1
-PHercParis4-july $CTR PHercParis4/20260411134726-2.400um-0.2m-78keV-masked.zarr 2.4 2 /vesuvius/ufsm/teacher/axis-0.json $GT/paris4-wind-20261019/phaseB 9.6 2 0.559
+PHercParis4-june $CTR PHercParis4/20260411134726-2.400um-0.2m-78keV-masked.zarr 2.4 2 /vesuvius/ufsm/teacher/axis-0.json $P4PH/p4phaseA 19.2 3 1
+PHercParis4-july $CTR PHercParis4/20260411134726-2.400um-0.2m-78keV-masked.zarr 2.4 2 /vesuvius/ufsm/teacher/axis-0.json $P4PH/p4phaseB 19.2 3 0.559
 PHerc0139-gt $CTR PHerc0139/20250728140407-9.362um-1.2m-113keV-masked.zarr 9.362 0 /mnt/scratch/pods/PHerc0139/unroll/axis.json $GT/PHerc0139-wind-20261016/phase 18.72 1 0.6
 G
 [ -n "${GTX:-}" ] && grep -v '^#' $GTX >> $T/gt.txt

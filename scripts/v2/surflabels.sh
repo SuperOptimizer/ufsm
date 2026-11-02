@@ -28,6 +28,7 @@ if [ -n "${WSRC:-}" ]; then for d in wraps_snap wraps; do
 trim=()
 if [ -n "${TRIM_S:-}" ]; then trim=(--first ${TRIM_S%,*} --last ${TRIM_S#*,})   # (env first: fixed surfaces have their own trim)
 elif [ -s "$sj" ]; then read -r a b <<< "$(jq -r '.wraps | "\(min) \(max)"' $sj)"; trim=(--first $a --last $b); fi
+[ -n "${GRIDUP:-}" ] && ctlev=$((ctlev + GRIDUP))   # GRIDUP=1: labels on the next coarser CT level (8x smaller / faster; the sampler interpolates a stored phase one level coarser)
 ct=$CTL/$ctk/$ctlev; [ -e $ct/zarr.json ] || { echo "surflabels: no local CT $ct" >&2; exit 2; }
 gum=$(awk -v u=$ctum -v l=$ctlev 'BEGIN {printf "%.10g", u * 2 ^ l}')
 gates=(); [ -s "$wc" ] && gates+=(--wrapcheck $wc); [ -n "${PEAKS:-}" ] && gates+=(--band-peaks $PEAKS)
