@@ -14,7 +14,7 @@ while :; do
     if [ "$pause" = auto ]; then   # another GPU free (its lock not held: e.g. gpu0 after RECTO): evaluate there, the trainer keeps going
       pause=1; for g in ${FREEGPUS:-0}; do if flock -n /vesuvius/ufsm/opt/gpu$g.lock true; then pause=0; eg=$g; break; fi; done
     fi
-    echo "$(date) eval $st: pause $pause gpu ${eg:-trainer's}" >> $o.evwatch.log
+    echo "$(date) eval $st: pause $pause gpu ${eg:-trainer}" >> $o.evwatch.log
     if [ "$pause" = 1 ]; then
       touch $o.stop; [ -f $o.pid ] && kill -TERM $(cat $o.pid) 2>/dev/null
       while [ -f $o.launcher.pid ] && kill -0 $(cat $o.launcher.pid) 2>/dev/null; do sleep 10; done
