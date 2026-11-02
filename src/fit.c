@@ -2788,7 +2788,7 @@ fit_set *fit_run_slabs(const char *dir, const fit_cfg *c, int slab, int overlap)
 }
 
 /* ---- grid evaluation of a fit set on the GPU ---- */
-struct fit_set_dev { int nm; fit_dev *hm, *dm; void **buf; int nb; float *out; size_t outn; fit_grid_row *rows; int nrows; };
+struct fit_set_dev { int nm; fit_dev *hm, *dm; void **buf; int nb; float *out; size_t outn; fit_grid_row *rows; int nrows; uint64_t *smask; uint32_t *swoff; size_t snw; uint8_t *scodes; void *stmp; size_t snv; };
 /* (nn_malloc_try: a device short of memory leaves no sticky error; a null pointer here once became an illegal access in nn_fit_grid) */
 static void *dev_copy(fit_set_dev *g, const void *src, size_t n, int *bad) { if (*bad) return nullptr; void *d = nn_malloc_try(n ? n : 4); if (!d) { *bad = 1; return nullptr; } if (n) nn_h2d(d, src, n); g->buf[g->nb++] = d; return d; }
 fit_set_dev *fit_set_upload(const fit_set *s) {
@@ -2815,6 +2815,10 @@ void fit_set_dev_free(fit_set_dev *g) {
     for (int k = 0; k < g->nb; k++) nn_free(g->buf[k]);
     if (g->out) nn_free(g->out);
     if (g->rows) nn_free(g->rows);
+    if (g->smask) nn_free(g->smask);
+    if (g->swoff) nn_free(g->swoff);
+    if (g->scodes) nn_free(g->scodes);
+    if (g->stmp) nn_free(g->stmp);
     free(g->hm); free(g->buf); free(g);
 }
 static fit_grid_row set_row(const fit_set *s, double z) {   /* the models of box-local z, as fit_set_W */
@@ -2847,6 +2851,48 @@ int fit_set_grid(fit_set_dev *g, const fit_set *s, const double o[3], const int6
     return 0;
 }
 
+static int sparse_bufs(fit_set_dev *g, size_t nw) {
+    if (g->snw >= nw) return 0;
+    if (g->smask) nn_free(g->smask);
+    if (g->swoff) nn_free(g->swoff);
+    g->smask = nullptr; g->swoff = nullptr; g->snw = 0;
+    g->smask = nn_malloc_try(nw * 8); g->swoff = nn_malloc_try(nw * 4); if (!g->smask || !g->swoff) return -1; g->snw = nw;
+    return 0;
+}
+size_t fit_set_label_mask(fit_set_dev *g, const uint8_t *codes, const int64_t n[3], int nst, const uint64_t *starts, uint64_t *ustart) {
+    const size_t nv = (size_t)n[0] * n[1] * n[2], nw = (nv + 63) / 64;
+    if (!nv) return 0;
+    if (nst > 64 || nv > (size_t)UINT32_MAX || sparse_bufs(g, nw)) return (size_t)-1;
+    if (g->snv < nv) { if (g->scodes) nn_free(g->scodes); if (g->stmp) nn_free(g->stmp); g->scodes = nullptr; g->stmp = nullptr; g->snv = 0;
+                       g->scodes = nn_malloc_try(nv); g->stmp = nn_malloc_try((nw + 1023) / 1024 * 4 + 1040); if (!g->scodes || !g->stmp) return (size_t)-1; g->snv = nv; }
+    nn_h2d(g->scodes, codes, nv);
+    return nn_fit_label_mask(g->scodes, nv, g->smask, g->swoff, g->stmp, nst, starts, ustart);
+}
+static int grid_masked(fit_set_dev *g, const fit_set *s, const double o[3], const int64_t n[3], double step, int with_theta, size_t nlab, float *out) {
+    const size_t nw = ((size_t)n[0] * n[1] * n[2] + 63) / 64;
+    if (g->outn < nlab) { if (g->out) nn_free(g->out); g->outn = 0; if (!(g->out = nn_malloc_try(nlab * 4))) return -1; g->outn = nlab; }
+    if (g->nrows < n[0]) { if (g->rows) nn_free(g->rows); g->nrows = 0; if (!(g->rows = nn_malloc_try(n[0] * sizeof(fit_grid_row)))) return -1; g->nrows = (int)n[0]; }
+    fit_grid_row *hr = malloc(n[0] * sizeof *hr);
+    for (int64_t a = 0; a < n[0]; a++) hr[a] = set_row(s, o[0] + ((double)a + 0.5) * step);   /* (fit_set_grid's rows: z0 + a there) */
+    nn_h2d(g->rows, hr, n[0] * sizeof *hr); free(hr);
+    nn_fit_grid_sparse(g->dm, g->rows, g->smask, g->swoff, nw, (int)n[1], (int)n[2], (float)(o[1]), (float)(o[2]), (float)step, with_theta, g->out);
+    nn_d2h(out, g->out, nlab * 4);
+    return 0;
+}
+int fit_set_grid_masked(fit_set_dev *g, const fit_set *s, const double o[3], const int64_t n[3], double step, int with_theta, size_t nlab, float *out) {
+    if (!nlab) return 0;
+    if (n[0] > INT32_MAX || g->snw < ((size_t)n[0] * n[1] * n[2] + 63) / 64) return -1;
+    return grid_masked(g, s, o, n, step, with_theta, nlab, out);
+}
+int fit_set_grid_sparse(fit_set_dev *g, const fit_set *s, const double o[3], const int64_t n[3], double step, int with_theta, const uint64_t *mask,
+                        const uint32_t *woff, size_t nlab, float *out) {
+    const size_t per = (size_t)n[1] * n[2], nv = per * (size_t)(n[0] > 0 ? n[0] : 0), nw = (nv + 63) / 64;
+    if (!nlab || !nw) return 0;
+    if (n[0] > INT32_MAX || nv > (size_t)UINT32_MAX * 64) return -1;
+    if (sparse_bufs(g, nw)) return -1;
+    nn_h2d(g->smask, mask, nw * 8); nn_h2d(g->swoff, woff, nw * 4);
+    return grid_masked(g, s, o, n, step, with_theta, nlab, out);
+}
 /* fit_set_grid on the CPU: threads over the z rows; mask (optional, laid out as out): only points whose mask value is 1..252 (a band
    code) are evaluated, the others are left 0 */
 typedef struct { const fit_set *s; const double *o; const int64_t *n; double step; int with_theta; const uint8_t *mask; float *out; } grid_cpu_job;

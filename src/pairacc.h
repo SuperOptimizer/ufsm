@@ -3,7 +3,8 @@
    piece. Pair accuracy instead asks, for pairs of labelled voxels about D apart, whether the fitted winding DIFFERENCE is right:
    |wrap14(d_u - d_v)| < 0.5 turn with d = U - q (mod 14) per voxel. A slip costs only the pairs that straddle it.
    Records are a hash subsample of the labelled voxels (pa_add keeps a record when its hash < the buffer's threshold, halving the
-   threshold whenever the buffer is full): deterministic for a fixed thread split. pa_score samples pairs at distance D +-25 %
+   threshold whenever the buffer is full): deterministic for a fixed split (fit --codes: 16 z-row buckets per block whatever the
+   thread count, src/main.c sc_run). pa_score samples pairs at distance D +-25 %
    (random record, random direction, a random record of the grid cell there). "cross" = pairs whose codes differ (different sheets). */
 #pragma once
 #include <stddef.h>
