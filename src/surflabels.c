@@ -81,7 +81,7 @@ typedef struct {
 } sl_wrap;
 
 typedef struct { int wi, r0, c0; float lo[3], hi[3]; } sl_tile;   /* quads rows r0 .. r0 + SL_TR, cols c0 .. c0 + SL_TC (band-relative rows) */
-typedef struct { float p[3], d, r, dm; uint32_t h; uint8_t q; } sl_rec;   /* dm: mm to the nearest voted anchor cell (NAN: none) */   /* r: the cell coherence (NAN: none) */
+typedef struct { float p[3], d, r, dm; uint32_t h; uint8_t q, ag; } sl_rec;   /* dm: mm to the nearest voted anchor cell (NAN: none) */   /* r: the cell coherence (NAN: none) */
 typedef struct { sl_rec *r; size_t n, cap; } sl_recs;
 
 typedef struct {
@@ -99,7 +99,8 @@ typedef struct {
     sl_recs *recs; uint32_t pa_T; int nt;
     const char *an_patches; int an_mode, an_cr, an_ns; uint32_t ncell; _Atomic uint32_t *an_hist, *an_pres; _Atomic int64_t *an_cs; float *an_d, *an_dist; double an_tol;
     _Atomic long long dk_gk[5], dk_g25[5];   /* apply + GT: phase agreement per distance bin (mm along the surface to the nearest voted cell: 0, 0-2.5, 2.5-10, 10-30, 30+) */   /* anchors: mode 1 vote, 2 apply */
-    double gsplit; int ghalf;          /* --gt-half A|B with --gt-split-mm: GT used only in z blocks of that parity (A even, B odd) */
+    double gsplit; int ghalf;
+    z3 *ag_r; int ag_s, ag_R, ag_rmin; _Atomic long long ag_kn[34], ag_gk[34], ag_g25[34];   /* --agree: recto field (on a grid ag_s x coarser), search +-ag_R voxels; bins 0..ag_R, ag_R + 1 = no agreement */          /* --gt-half A|B with --gt-split-mm: GT used only in z blocks of that parity (A even, B odd) */
     int coh_cell, ct_scale; double min_coh; _Atomic long long ch_kn[COH_BINS + 1], ch_gk[COH_BINS + 1], ch_g10[COH_BINS + 1], ch_g25[COH_BINS + 1];   /* bin COH_BINS: no coherence (too few voxels) */
 } sl_job;
 
@@ -279,7 +280,7 @@ static void sl_raster_tile(const sl_job *J, const sl_tile *t, const int64_t o[3]
         }
     }
 }
-typedef struct { uint8_t *codes, *drop, *phase, *gtc, *gph, *ct; uint16_t *wid; int32_t *lo, *hi; uint32_t *tl; size_t tcap; float *coh; double *cacc; uint8_t *ct2; uint32_t *cell; } sl_scratch;
+typedef struct { uint8_t *codes, *drop, *phase, *gtc, *gph, *ct; uint16_t *wid; int32_t *lo, *hi; uint32_t *tl; size_t tcap; float *coh; double *cacc; uint8_t *ct2; uint32_t *cell; uint8_t *cth, *rh, *ag, *tmp2; } sl_scratch;
 static int sl_block(sl_job *J, sl_scratch *X, int si, int bk, int tid) {
     const int S = J->S, B = J->B, Hh = J->Hh, N = B + 2 * Hh, nb = S / B;
     const int64_t sy = J->slist[si] / J->ns[2], sx = J->slist[si] % J->ns[2];
@@ -320,6 +321,42 @@ static int sl_block(sl_job *J, sl_scratch *X, int si, int bk, int tid) {
             X->ct[((size_t)z * B + y) * B + x] = zero ? 0 : (uint8_t)((s + 4) / 8);
         }
     }
+    if (J->ag_r) {   /* --agree: per sheet voxel, the distance (voxels) to the CT maximum and to the recto-prediction maximum along the ray */
+        const int64_t nn[3] = {N, N, N};
+        if (J->ct_scale == 1) { if (z3_read(J->ct, o, nn, X->cth, 1)) return -1; }
+        else {
+            const int64_t o2[3] = {2 * o[0], 2 * o[1], 2 * o[2]}, n2[3] = {2 * (int64_t)N, 2 * (int64_t)N, 2 * (int64_t)N};
+            if (!X->tmp2 && !(X->tmp2 = malloc((size_t)8 * N * N * N))) return -1;
+            if (z3_read(J->ct, o2, n2, X->tmp2, 1)) return -1;
+            const size_t N2 = 2 * (size_t)N;
+            for (int z = 0; z < N; z++) for (int y = 0; y < N; y++) for (int x = 0; x < N; x++) { int sm = 0;
+                for (int q = 0; q < 8; q++) sm += X->tmp2[((2 * z + (q >> 2 & 1)) * N2 + 2 * y + (q >> 1 & 1)) * N2 + 2 * x + (q & 1)];
+                X->cth[((size_t)z * N + y) * N + x] = (uint8_t)((sm + 4) / 8); }
+        }
+        const int S2 = J->ag_s; int64_t ro[3], rn[3];
+        for (int d = 0; d < 3; d++) { ro[d] = (int64_t)floor((double)o[d] / S2); rn[d] = (int64_t)floor((double)(o[d] + N - 1) / S2) - ro[d] + 1; }
+        if (!X->tmp2 && !(X->tmp2 = malloc((size_t)8 * N * N * N))) return -1;
+        if (z3_read(J->ag_r, ro, rn, X->tmp2, 1)) return -1;
+        for (int z = 0; z < N; z++) for (int y = 0; y < N; y++) for (int x = 0; x < N; x++) {
+            const int64_t rz = (int64_t)floor((double)(o[0] + z) / S2) - ro[0], ry = (int64_t)floor((double)(o[1] + y) / S2) - ro[1], rx = (int64_t)floor((double)(o[2] + x) / S2) - ro[2];
+            X->rh[((size_t)z * N + y) * N + x] = X->tmp2[((size_t)rz * rn[1] + ry) * rn[2] + rx]; }
+        const double sw = J->s0 / J->f; const int R = J->ag_R;
+        for (int z = 0; z < N; z++) {
+            double cy, cx; axis_at(J->ax, (o[0] + z + 0.5) * sw - 0.5, &cy, &cx); cy = (cy + 0.5) / sw - 0.5 - o[1]; cx = (cx + 0.5) / sw - 0.5 - o[2];
+            for (int y = 0; y < N; y++) for (int x = 0; x < N; x++) {
+                const size_t i = ((size_t)z * N + y) * N + x; const int c = X->codes[i]; X->ag[i] = (uint8_t)(R + 1);
+                if (c < 1 || c > 252) continue;
+                double uy = y - cy, ux = x - cx; const double rr = sqrt(uy * uy + ux * ux); if (rr < 1e-6) continue; uy /= rr; ux /= rr;
+                int bc = -1, br = -1, tc = 0, tr = 0;
+                for (int t = -R; t <= R; t++) { const long yy = lround(y + t * uy), xx = lround(x + t * ux); if (yy < 0 || xx < 0 || yy >= N || xx >= N) continue;
+                    const size_t j = ((size_t)z * N + yy) * N + xx; const int vc = X->cth[j], vr = X->rh[j];
+                    if (vc > bc || (vc == bc && abs(t) < abs(tc))) { bc = vc; tc = t; }
+                    if (vr > br || (vr == br && abs(t) < abs(tr))) { br = vr; tr = t; } }
+                if (bc <= 0 || br < J->ag_rmin) continue;
+                const int a = abs(tc) > abs(tr) ? abs(tc) : abs(tr); X->ag[i] = (uint8_t)a;
+            }
+        }
+    }
     /* the shard's buffers */
     pthread_mutex_lock(&J->mu);
     if (!J->bc[si]) {
@@ -352,7 +389,7 @@ static int sl_block(sl_job *J, sl_scratch *X, int si, int bk, int tid) {
             coh[k] = vv > 1e-9 && cc > 1e-9 ? (float)(cv / sqrt(vv * cc)) : NAN;
         }
     }
-    long long ckn[COH_BINS + 1] = {0}, cgk[COH_BINS + 1] = {0}, cg10[COH_BINS + 1] = {0}, cg25[COH_BINS + 1] = {0};
+    long long ckn[COH_BINS + 1] = {0}, cgk[COH_BINS + 1] = {0}, cg10[COH_BINS + 1] = {0}, cg25[COH_BINS + 1] = {0}, akn[34] = {0}, agk[34] = {0}, ag25[34] = {0};
     for (int z = 0; z < B; z++) for (int y = 0; y < B; y++) for (int x = 0; x < B; x++) {
         const int64_t gz = b0[0] + z, gy = b0[1] + y, gx = b0[2] + x;
         if (gz >= J->shape[0] || gy >= J->shape[1] || gx >= J->shape[2]) continue;
@@ -399,11 +436,13 @@ static int sl_block(sl_job *J, sl_scratch *X, int si, int bk, int tid) {
         const int wi = X->wid[X->lo[i]] - 1; sl_wrap *w = wi >= 0 ? &J->W[wi] : nullptr;
         if (w) { atomic_fetch_add_explicit(&w->kn, 1, memory_order_relaxed); if (!ig) atomic_fetch_add_explicit(&w->kk, 1, memory_order_relaxed); }
         if (!ig0) ckn[rb]++;
+        int agv = 0;
+        if (J->ag_r) { const int a1 = X->ag[X->lo[i]], a2 = X->ag[X->hi[i]]; agv = a1 > a2 ? a1 : a2; if (!ig0) akn[agv]++; }
         if (!gt_ok) continue;
         const int gp = X->gph[i];
         if (gp != PHASE_UNKNOWN) {
             double d = fabs((double)(ph - gp) / PHASE_PERIOD); d -= floor(d + 0.5); d = fabs(d);
-            if (!ig0) { cgk[rb]++; cg10[rb] += d < 0.1; cg25[rb] += d < 0.25; }
+            if (!ig0) { cgk[rb]++; cg10[rb] += d < 0.1; cg25[rb] += d < 0.25; if (J->ag_r) { agk[agv]++; ag25[agv] += d < 0.25; } }
             const int bin = phase_agree_bin(d);
             gtk++; g10 += d < 0.1; g25 += d < 0.25; gb[bin]++;
             if (!ig) { kgtk++; kg10 += d < 0.1; kg25 += d < 0.25; kb[bin]++;
@@ -417,12 +456,13 @@ static int sl_block(sl_job *J, sl_scratch *X, int si, int bk, int tid) {
             if (h < J->pa_T) {
                 const double wo = (X->codes[X->lo[i]] - 1) / 18.0 + (double)ph / PHASE_PERIOD, d = wo - (gc - 1) / 18.0;
                 if (R->n == R->cap) { R->cap = R->cap ? 2 * R->cap : 4096; R->r = realloc(R->r, R->cap * sizeof *R->r); }
-                R->r[R->n++] = (sl_rec){{(float)(gz * mm), (float)(gy * mm), (float)(gx * mm)}, (float)d, r, J->an_dist ? J->an_dist[X->cell[X->lo[i]]] : NAN, h, (uint8_t)gc};
+                R->r[R->n++] = (sl_rec){{(float)(gz * mm), (float)(gy * mm), (float)(gx * mm)}, (float)d, r, J->an_dist ? J->an_dist[X->cell[X->lo[i]]] : NAN, h, (uint8_t)gc, (uint8_t)agv};
             }
         }
     }
     atomic_fetch_add(&J->ncode, ncode); atomic_fetch_add(&J->nconf, nconf); atomic_fetch_add(&J->nknown, nknown); atomic_fetch_add(&J->nkept, nkept);
     for (int k = 0; k < IG_N; k++) atomic_fetch_add(&J->nig[k], nig[k]);
+    for (int k = 0; k < 34; k++) { atomic_fetch_add(&J->ag_kn[k], akn[k]); atomic_fetch_add(&J->ag_gk[k], agk[k]); atomic_fetch_add(&J->ag_g25[k], ag25[k]); }
     for (int k = 0; k <= COH_BINS; k++) { atomic_fetch_add(&J->ch_kn[k], ckn[k]); atomic_fetch_add(&J->ch_gk[k], cgk[k]); atomic_fetch_add(&J->ch_g10[k], cg10[k]); atomic_fetch_add(&J->ch_g25[k], cg25[k]); }
     atomic_fetch_add(&J->gtk, gtk); atomic_fetch_add(&J->g10, g10); atomic_fetch_add(&J->g25, g25);
     atomic_fetch_add(&J->kgtk, kgtk); atomic_fetch_add(&J->kg10, kg10); atomic_fetch_add(&J->kg25, kg25);
@@ -436,6 +476,7 @@ static void *sl_block_run(void *arg) {
     sl_scratch X = {0};
     X.codes = malloc(NN); X.drop = malloc(NN); X.phase = malloc(NN); X.wid = malloc(NN * 2); X.lo = malloc(NN * 4); X.hi = malloc(NN * 4);
     X.gtc = calloc(NN, 1); X.gph = malloc(NN); X.ct = malloc((size_t)J->B * J->B * J->B); if (J->an_mode) X.cell = malloc(NN * 4);
+    if (J->ag_r) { X.cth = malloc(NN); X.rh = malloc(NN); X.ag = malloc(NN); if (!X.cth || !X.rh || !X.ag) atomic_store(&J->fail, 1); }
     if (J->coh_cell > 0) { const size_t nc = (size_t)(J->B / J->coh_cell); X.coh = malloc(nc * nc * nc * sizeof(float)); X.cacc = malloc(nc * nc * nc * 6 * sizeof(double)); }
     if (!X.codes || !X.drop || !X.phase || !X.wid || !X.lo || !X.hi || !X.gtc || !X.gph || !X.ct || (J->an_mode && !X.cell)) { atomic_store(&J->fail, 1); }
     else for (long it; (it = atomic_fetch_add(&J->next, 1)) < J->nitems && !atomic_load(&J->fail);) {
@@ -449,7 +490,7 @@ static void *sl_block_run(void *arg) {
             free(J->bc[si]); free(J->bp[si]); free(J->bi[si]); J->bc[si] = J->bp[si] = J->bi[si] = nullptr;
         }
     }
-    free(X.codes); free(X.drop); free(X.phase); free(X.wid); free(X.lo); free(X.hi); free(X.gtc); free(X.gph); free(X.ct); free(X.tl); free(X.coh); free(X.cacc); free(X.ct2); free(X.cell);
+    free(X.codes); free(X.drop); free(X.phase); free(X.wid); free(X.lo); free(X.hi); free(X.gtc); free(X.gph); free(X.ct); free(X.tl); free(X.coh); free(X.cacc); free(X.ct2); free(X.cell); free(X.cth); free(X.rh); free(X.ag); free(X.tmp2);
     return nullptr;
 }
 typedef struct { sl_job *J; double z0, z1; _Atomic int next, fail; } sl_loadjob;
@@ -606,6 +647,8 @@ int cmd_surf_labels(int argc, char **argv) {
     J.an_mode = !strcmp(argv[1], "wrap-anchor") ? 1 : sl_opt(argc, argv, "--anchor", nullptr) ? 2 : 0;
     if (sscanf(sl_opt(argc, argv, "--anchor-cell", "32,32"), "%d,%d", &J.an_cr, &J.an_ns) != 2 || J.an_cr < 1 || J.an_ns < 4) { fprintf(stderr, "surf-labels: --anchor-cell ROWS,SECTORS\n"); return 2; }
     J.an_patches = sl_opt(argc, argv, "--patches", nullptr);
+    J.ag_s = atoi(sl_opt(argc, argv, "--agree-scale", "1")); J.ag_R = atoi(sl_opt(argc, argv, "--agree-range", "4")); J.ag_rmin = atoi(sl_opt(argc, argv, "--agree-rmin", "64"));
+    if (J.ag_s < 1 || J.ag_R < 1 || J.ag_R > 32) { fprintf(stderr, "surf-labels: --agree-scale >= 1, --agree-range 1..32\n"); return 2; }
     J.an_tol = atof(sl_opt(argc, argv, "--anchor-tol-um", "30")) / gum; if (J.an_tol < 1.5) J.an_tol = 1.5;
     J.gsplit = atof(sl_opt(argc, argv, "--gt-split-mm", "0")) * 1000 / gum; J.ghalf = !strcmp(sl_opt(argc, argv, "--gt-half", "A"), "B");
     J.coh_cell = atoi(sl_opt(argc, argv, "--coh-cell", "32")); J.min_coh = atof(sl_opt(argc, argv, "--min-coh", "-2"));
@@ -629,6 +672,8 @@ int cmd_surf_labels(int argc, char **argv) {
         if (J.ct_scale != 1 && J.ct_scale != 2) { fprintf(stderr, "surf-labels: --ct-scale 1|2\n"); return 2; }
         if (J.ct && J.ct_scale == 2) for (int d = 0; d < 3; d++) if (z3_meta_of(J.ct)->shape[d] == cs[d] - 1) cs[d]--;   /* (an odd finer extent) */
         if (!J.ct || memcmp(z3_meta_of(J.ct)->shape, cs, sizeof cs)) { fprintf(stderr, "surf-labels: --ct %s %s: cannot open or not on the grid\n", argv[ci + 1], argv[ci + 2]); return 1; } } }
+    { const int ai = sl_idx(argc, argv, "--agree"); if (ai > 0) { if (ai + 2 >= argc || !J.ct) { fprintf(stderr, "surf-labels: --agree ROOT KEY (the recto prediction) needs --ct\n"); return 2; }
+        J.ag_r = z3_open(store_open(argv[ai + 1]), argv[ai + 2], nullptr); if (!J.ag_r) { fprintf(stderr, "surf-labels: --agree: %s\n", z3_error()); return 1; } } }
     { const int gi = sl_idx(argc, argv, "--gt"); if (J.an_mode == 1 && gi < 0) { fprintf(stderr, "wrap-anchor: --gt ROOT KEY (the published-segment winding codes on the grid) is the anchor source\n"); return 2; }
       if (gi > 0) { if (gi + 2 >= argc) return 2; J.gt = z3_open(store_open(argv[gi + 1]), argv[gi + 2], nullptr);
         if (!J.gt || memcmp(z3_meta_of(J.gt)->shape, J.shape, sizeof J.shape)) { fprintf(stderr, "surf-labels: --gt %s %s: cannot open or not on the grid\n", argv[gi + 1], argv[gi + 2]); return 1; } } }
@@ -886,6 +931,18 @@ int cmd_surf_labels(int argc, char **argv) {
                 printf("  %-9s %-12lld %.4f   %.4f %.4f %.4f %.4f  (%zu records)\n", dl[b], (long long)J.dk_gk[b], J.dk_gk[b] ? (double)J.dk_g25[b] / J.dk_gk[b] : 0, a2[0], a2[1], a2[2], a2[3], k2);
             }
         }
+        if (J.ag_r) {   /* the agreement gate's curve: keep where both bounding sheets have the CT and recto maxima within t voxels */
+            long long tk = 0; for (int b = 0; b < 34; b++) tk += J.ag_kn[b];
+            printf("surf-labels: agreement curve (our sheet vs CT max and recto max along the ray, +-%d voxels, recto >= %d; voxels not ignored otherwise):\n  t_vox  kept_share  gt_both      |d|<.25  pairs 0.5mm 1mm   2mm   4mm\n", J.ag_R, J.ag_rmin);
+            for (int t = 0; t <= J.ag_R + 1; t++) {
+                long long kn = 0, gk = 0, g25 = 0; for (int b = 0; b <= t; b++) { kn += J.ag_kn[b]; gk += J.ag_gk[b]; g25 += J.ag_g25[b]; }
+                size_t k2 = 0; pa_buf g = all; g.r = malloc((n ? n : 1) * sizeof *g.r);
+                for (size_t k = 0; k < n; k++) if (tmp[k].ag <= t) g.r[k2++] = all.r[k];
+                g.n = k2; double a2[4] = {NAN, NAN, NAN, NAN}, ac2[4]; size_t na2[4], nc2[4]; if (k2 > 100) pa_score(&g, mmv, 4, 100000, 0x5eed, a2, ac2, na2, nc2); free(g.r);
+                char tl[8]; if (t > J.ag_R) snprintf(tl, sizeof tl, "off"); else snprintf(tl, sizeof tl, "%d", t);
+                printf("  %-6s %.4f      %-12lld %.4f   %.4f %.4f %.4f %.4f\n", tl, tk ? (double)kn / tk : 0, gk, gk ? (double)g25 / gk : 0, a2[0], a2[1], a2[2], a2[3]);
+            }
+        }
         if (J.ct && J.coh_cell > 0) {   /* the coherence gate's curve: per threshold, kept share, phase agreement and pair accuracy */
             long long tk = 0; for (int b = 0; b <= COH_BINS; b++) tk += J.ch_kn[b];
             printf("surf-labels: CT coherence curve (cell %d voxels; voxels not ignored otherwise; r >= t kept, no-coherence cells dropped):\n  t      kept_share  gt_both      |d|<.25  |d|<.1   pairs 0.5mm 1mm   2mm   4mm\n", J.coh_cell);
@@ -919,5 +976,6 @@ int cmd_surf_labels(int argc, char **argv) {
     free(W); free(J.hold); free((void *)J.an_hist); free((void *)J.an_pres); free((void *)J.an_cs); free(J.an_d); free(J.an_dist);
     if (J.ct) z3_close(J.ct);
     if (J.gt) z3_close(J.gt);
+    if (J.ag_r) z3_close(J.ag_r);
     return 0;
 }

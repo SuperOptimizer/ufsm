@@ -165,6 +165,13 @@ int main(void) {
         CHECK(both > 50000 && bad == 0 && kept > 1300000, "anchored codes do not match the GT (the +10 / +11 turn miscount not undone)");
         free(ac); free(gc); free(ph);
     }
+    {   /* --agree smoke: the CT ridges on the sheets as both CT and recto prediction */
+        char ax[400], wdp[400], od[400], ct[400], gtr[400]; snprintf(ax, sizeof ax, "%s/axis.json", root); snprintf(wdp, sizeof wdp, "%s/wp", root); snprintf(od, sizeof od, "%s/agree", root);
+        snprintf(ct, sizeof ct, "%s/ct0", root); snprintf(gtr, sizeof gtr, "%s/p1/codes.zarr", root);
+        char *av[] = {"ufsm", "surf-labels", wdp, od, "--axis", ax, "--axis-um", "9.6", "--dir", "1", "--grid-um", "9.6", "--shape", "64,256,256", "--shard", "128", "--block", "32",
+                      "--radius", "12", "--threads", "4", "--ct", ct, "0", "--agree", ct, "0", "--gt", gtr, "9.6"};
+        CHECK(!cmd_surf_labels((int)(sizeof av / sizeof *av), av), "surf-labels --agree failed");
+    }
     snprintf(p, sizeof p, "%s/hold.json", root);
     CHECK(!run(root, "wp", "h", "1", "4", "--exclude", p, nullptr), "surf-labels --exclude failed");
     const int sense[2] = {1, -1}; const char *outs[2] = {"p1", "m"};
