@@ -11,6 +11,10 @@
 #   ink     -> prep only; GPU INKGPU (1) from when the fields are done: INKCMD (the ink agent's recipe; default: the feathered
 #           single pass of inklib.sh: ift3, frozen GN, --window auto --halo 32 --feather 32, resumable) -> ink/$INKNAME.zarr
 #   ctcal   -> fields (CTCAL=1 only, OFF by default): ufsm ct-cal --ct-um $LUM (the CT LEVEL's um) -> ct.cal; ref adds --ct-cal
+#   rectosp -> fields (default ON when the scroll has m7 surface predictions on the mirror; RECTOSP=0 off): ufsm recto-sp $F
+#           fields/rsp --src <m7 prob> --half-um 400 --half2-um 800 --blend 0.3 (RECTOSPX overrides the flags; RECTOSRC="ROOT KEY UM"
+#           names the source): the sheet spacing blended with the m7 recto hit spacing (RECTO 11-02: whole P4 ids .1764 -> .2054, 1667 slabs
+#           +.006..+.045, 0139 -.01..-.02); the ref, slabs and later stages then read fields/rsp. No m7 for this scan + level: skipped.
 #   ref     -> fields: count-field --model-only (REFCMD F REF [--ct-cal FILE] overrides; cf GPU, TH threads) REFX: extra count-field flags (e.g. --rho-scale S)
 #   slabs   -> ref: snapped slab fits, FITLANES lanes per GPU in FITGPUS ("0 1"; auto: by device memory, 1..3); the INKGPU lanes start once the ink is done; then the
 #           bad-slab check (fit.log: "illegal memory", "loss 0.00000", no final loss line): refit on 1 lane, up to 3 tries, else fail
@@ -30,7 +34,7 @@
 # Heavy CPU stages wait for MemAvailable >= MINMEM (40) GB. STOP: touch $O/STOP (checked between stages / slabs / wraps). A stage
 # whose done marker exists is skipped; partial stages resume (predict --resume parts, slab claims, per-wrap outputs).
 # DRY=1: print the plan (commands) without running anything. Runs from a copy of these scripts in $O/bin (edits never touch a run).
-# Env: U (ufsm), UR, TH (20), FIELDGPUS ("0 1"), FITGPUS ("0 1"), FITLANES (auto), INKGPU (1), INKCMD, REFCMD, CK, INKCK, INKNAME, MINMEM, PERWRAP,
+# Env: RECTOSP (1; 0 = no m7 recto spacing), RECTOSRC, RECTOSPX, U (ufsm), UR, TH (20), FIELDGPUS ("0 1"), FITGPUS ("0 1"), FITLANES (auto), INKGPU (1), INKCMD, REFCMD, CK, INKCK, INKNAME, MINMEM, PERWRAP,
 #   INKPX (extra ink predict args, e.g. "--channel ink" for a v2 universal checkpoint as INKCK),
 #   CTROOT / CTKEY (replace the table's CT root / key), ZCACHE_GB (auto) / ZCACHE_ADMIT (0.6): the decoded-CT cache of the render stages,
 #   TAG (output dir suffix), ITH / PTH (ink / fields predict threads), FACES, SPAR (4 per-wrap jobs), CLEAN (1: fields + slab fits deleted once the wraps exist), STRIPARGS / ZR / BOX (override scrolls.tsv).
@@ -181,6 +185,25 @@ ref() {
   if [ -n "${REFCMD:-}" ]; then X $O/logs/ref.log $REFCMD $F $REF $cal; else
   X $O/logs/ref.log $U count-field $F $O/cf.unused --R 0 --pool 8 ${REFPH---phase-w 0.5 --wide 100,140 --wide-phase 15} --iters 1200 --model $REF --model-only 1 --model-stride ${MSTRIDE:-4} \
     --threads $TH --mem-gb ${CFMEM:-24} $cal ${REFX:-}; fi && { [ "$DRY" = 1 ] || [ -e $REF/model.json ]; }
+}
+
+# --- rectosp: m7 recto spacing into the count target (see the header); the source: RECTOSRC, else the mirror's
+#     <SCROLL>/representations/predictions/surfaces/<scan id>-surface-*-surface-m7-L<LV>-prob.zarr at its finest level ---
+m7src() {
+  [ -n "${RECTOSRC:-}" ] && { echo "$RECTOSRC"; return; }
+  local base=https://dl.ash2txt.org/community-uploads/forrest/volcomp/$S/representations/predictions/surfaces id z key
+  id=$(basename $K | cut -c1-14)
+  z=$(curl -sf --max-time 60 $base/ | grep -o "href=\"$id-surface-[^\"]*-surface-m7-L$LV-prob.zarr/\"" | head -1 | sed 's/href="//; s/\/"$//')
+  [ -n "$z" ] || return 1
+  key=$(curl -sf --max-time 60 $base/$z/ | grep -o 'href="[0-9.]*/"' | sed 's/href="//; s/\/"$//' | sort -g | head -1)
+  [ -n "$key" ] && echo "$base/$z $key $key"
+}
+rectosp() {
+  local src; src=$(m7src) || { log "rectosp: no m7 prob for $S $(basename $K | cut -c1-14) level $LV on the mirror: skipped (fields unchanged)"; [ "$DRY" = 1 ] || echo none > $O/rectosp.src; return 0; }
+  log "rectosp: source $src"; [ "$DRY" = 1 ] || echo "$src" > $O/rectosp.src
+  [ "$DRY" = 1 ] || rm -rf $O/fields/rsp
+  X $O/logs/rectosp.log $U recto-sp $F $O/fields/rsp --src $src --cache $O/fields/rsp.cache --threads $TH ${RECTOSPX:---half-um 400 --half2-um 800 --blend 0.3} &&
+    { [ "$DRY" = 1 ] || { rm -rf $O/fields/rsp.cache; [ -e $O/fields/rsp/sp/zarr.json ]; }; }
 }
 
 # --- ink (another agent's recipe via INKCMD SCROLLDIR GPU OUT; default the feathered single pass of scripts/corpus/inklib.sh) ---
@@ -360,7 +383,7 @@ snap() {
       --fields $F --threads $TH ${SNAPX:-} || return 1
     [ "$DRY" = 1 ] || log "snap: $(grep '^wrap-snap: solve' $O/logs/snap.log | tail -1)"
   else log "snap: off (SNAP=0)"; fi
-  [ "$DRY" = 1 ] || { [ "${CLEAN:-1}" = 1 ] && { find $F -mindepth 1 -maxdepth 1 ! -name fields.json -exec rm -rf {} +; rm -rf $O/slabs/s???/fit; }; }
+  [ "$DRY" = 1 ] || { [ "${CLEAN:-1}" = 1 ] && { find $F -mindepth 1 -maxdepth 1 ! -name fields.json -exec rm -rf {} +; [ $F = $O/fields/wind96 ] || find $O/fields/wind96 -mindepth 1 -maxdepth 1 ! -name fields.json -exec rm -rf {} +; rm -rf $O/slabs/s???/fit; }; }
   return 0
 }
 strip() { local a=$STRIPARGS; [ -e $O/state/strip.args ] && a=$(cat $O/state/strip.args)
@@ -441,6 +464,8 @@ stage fields fields || exit 1
 ( stage ink ink || touch $O/state/ink.failed ) &
 INKP=$!
 [ "$DRY" = 1 ] && wait $INKP
+{ [ "${RECTOSP:-1}" = 0 ] || stage rectosp rectosp; } || { log "unroll: rectosp failed"; wait; exit 1; }
+[ "${RECTOSP:-1}" != 0 ] && { [ -e $O/fields/rsp/fields.json ] || { [ "$DRY" = 1 ] && [ -n "$(m7src)" ]; }; } && F=$O/fields/rsp   # (the ref and every later stage read the blended fields)
 { [ "${CTCAL:-0}" != 1 ] || stage ctcal ctcal; } && stage ref ref && stage slabs slabs && stage join join && stage check check && stage wraps wraps && stage trim trim && stage snap snap ||
   { log "unroll: stopped before the strip"; wait; exit 1; }
 if [ "${PERWRAP:-0}" = 1 ]; then ( waitfor ink && stage perwrap perwrap && { [ "${FACES:-0}" = 1 ] && stage faces faces; true; } ) & PWP=$!; [ "$DRY" = 1 ] && wait $PWP; fi
