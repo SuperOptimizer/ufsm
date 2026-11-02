@@ -238,6 +238,10 @@ void nn_fit_accum_dm(const float *lg, const uint8_t *ct, const uint32_t *bits, i
    models (device pointers inside); out: device float nz x ny x nx */
 typedef struct { int a, b; float z, t, za, zb; } fit_grid_row;
 void nn_fit_grid(const fit_dev *ms, const fit_grid_row *rows, int nz, int ny, int nx, float y0, float x0, float step, int with_theta, float *out);
+/* the label mask of a device block of nv codes (bit i: code 1..252 at voxel i; woff: the set bits before each word, as the CPU's), and
+   the set bits before each of the voxel indices starts[0..nst) (nst <= 64) into ustart; returns the total; dtmp: device scratch of
+   ((nv + 63) / 64 + 1023) / 1024 * 4 + 1040 bytes */
+size_t nn_fit_label_mask(const uint8_t *dcodes, size_t nv, uint64_t *dmask, uint32_t *dwoff, void *dtmp, int nst, const uint64_t *starts, uint64_t *ustart);
 /* the points of that grid whose bit is set in mask (row-major point i: word i / 64, bit i % 64; nw words), packed into out in index
    order (woff: per word the number of set bits before it); each value bit-identical to nn_fit_grid's */
 void nn_fit_grid_sparse(const fit_dev *ms, const fit_grid_row *rows, const uint64_t *mask, const uint32_t *woff, size_t nw, int ny, int nx, float y0, float x0, float step,
@@ -312,6 +316,12 @@ void fit_set_dev_free(fit_set_dev *g);
 /* W (with_theta: U) of the set on the grid of n[0] x n[1] x n[2] points at box-local native (o + (i + 0.5) step) per axis, into the
    host float array out (row-major); evaluated on the GPU in z-row batches. Matches fit_set_W up to float rounding. */
 int fit_set_grid(fit_set_dev *g, const fit_set *s, const double o[3], const int64_t n[3], double step, int with_theta, float *out);
+/* the same with the mask built on the GPU from the codes: fit_set_label_mask uploads n[0] x n[1] x n[2] codes (best pinned), builds the
+   mask (nn_fit_label_mask) and returns the labelled count (ustart: the counts before the voxel indices starts[0..nst), nst <= 64),
+   or (size_t)-1 without device memory; fit_set_grid_masked then evaluates the set at those nlab points into out (host, packed in
+   voxel order: fit_set_grid_sparse's values) */
+size_t fit_set_label_mask(fit_set_dev *g, const uint8_t *codes, const int64_t n[3], int nst, const uint64_t *starts, uint64_t *ustart);
+int fit_set_grid_masked(fit_set_dev *g, const fit_set *s, const double o[3], const int64_t n[3], double step, int with_theta, size_t nlab, float *out);
 /* fit_set_grid at the points whose bit is set in mask only (bit i = row-major grid point i; woff[w]: the set bits before word w; nlab
    the total), packed in index order into the host array out (nlab floats, best pinned): the same values as fit_set_grid's */
 int fit_set_grid_sparse(fit_set_dev *g, const fit_set *s, const double o[3], const int64_t n[3], double step, int with_theta, const uint64_t *mask,

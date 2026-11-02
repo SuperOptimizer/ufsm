@@ -1,6 +1,7 @@
 /* fit_set_grid_sparse (the GT scorer's U at labelled voxels only, src/fit.c + nn_fit.cu fit_grid_sparse_k): on a fit set of a
    global model and 3 blended slabs, over a grid with partial last words and a random mask (empty words, full words, single bits),
-   every packed value is bit-identical to the dense fit_set_grid's at its voxel, with_theta 0 and 1. */
+   every packed value is bit-identical to the dense fit_set_grid's at its voxel, with_theta 0 and 1; the mask built on the GPU from
+   codes (fit_set_label_mask: count, counts before given voxels) and fit_set_grid_masked give the same. */
 #include "fit.h"
 #include "nn.h"
 #include <math.h>
@@ -53,6 +54,18 @@ int main(void) {
         for (size_t i = 0; i < nv; i++) if (m[i / 64] >> (i % 64) & 1) { if (memcmp(&pk[k], &dense[i], 4)) bad++; k++; }
         CHECK(k == nl && !bad, "with_theta %d: %zu of %zu packed values differ from the dense grid's", wt, bad, nl);
         printf("grid_sparse with_theta %d: %zu labelled of %zu points, %zu differ\n", wt, nl, nv, bad);
+        /* the GPU-built mask from codes (1..252 labelled; 0 and 253..255 not) laid out as the mask above */
+        uint8_t *codes = malloc(nv);
+        for (size_t i = 0; i < nv; i++) { const uint32_t h = hsh((uint32_t)i * 7 + 3); codes[i] = m[i / 64] >> (i % 64) & 1 ? (uint8_t)(1 + h % 252) : (uint8_t)(h & 1 ? 0 : 253 + h % 3); }
+        uint64_t st[5] = {0, 1, 63, 64 * 101 + 17, nv - 1}, us[5] = {0}, ref[5];
+        for (int q = 0; q < 5; q++) { ref[q] = 0; for (size_t i = 0; i < st[q]; i++) ref[q] += m[i / 64] >> (i % 64) & 1; }
+        const size_t ng = fit_set_label_mask(g, codes, n, 5, st, us);
+        CHECK(ng == nl, "GPU label mask: %zu labelled, want %zu", ng, nl);
+        for (int q = 0; q < 5; q++) CHECK(us[q] == ref[q], "GPU label mask: %llu before voxel %llu, want %llu", (unsigned long long)us[q], (unsigned long long)st[q], (unsigned long long)ref[q]);
+        float *pg = malloc(nv * 4); memset(pg, 0xff, nv * 4);
+        CHECK(!fit_set_grid_masked(g, &s, o, n, step, wt, ng, pg), "masked grid");
+        CHECK(!memcmp(pg, pk, nl * 4), "with_theta %d: the GPU-masked values differ from the host-masked ones", wt);
+        free(codes); free(pg);
     }
     fit_set_dev_free(g); free(dense); free(pk); free(m); free(wo);
     printf("test_grid_sparse: %s\n", fails ? "FAILED" : "ok");

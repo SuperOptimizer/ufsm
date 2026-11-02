@@ -618,6 +618,55 @@ __global__ void fit_grid_sparse_k(const fit_dev *ms, const fit_grid_row *rows, c
         out[o++] = fit_grid_pt(ms, rows[a], b, c, y0, x0, step, with_theta);
     }
 }
+/* the label mask of a device code block on the GPU (fit --codes scoring): bit i = code 1..252 at voxel i, woff the exclusive prefix
+   count of the set bits per word (integers: exactly the CPU's), the total and the counts before the voxels starts[0..nst) */
+__global__ void fit_lmask_k(const uint8_t *c, size_t nv, size_t nw, unsigned long long *mask, unsigned *cnt) {
+    const size_t w = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (w >= nw) return;
+    const size_t i0 = w * 64; unsigned long long b = 0;
+    if (i0 + 64 <= nv) {
+        const uint4 *q = (const uint4 *)(c + i0);
+        for (int k = 0; k < 4; k++) {
+            const uint4 v = q[k]; const unsigned u[4] = {v.x, v.y, v.z, v.w};
+            for (int e = 0; e < 4; e++) for (int j = 0; j < 4; j++) { const unsigned char x = (unsigned char)(u[e] >> (8 * j)); b |= (unsigned long long)((unsigned char)(x - 1) < 252) << (16 * k + 4 * e + j); }
+        }
+    } else for (size_t j = 0; i0 + j < nv; j++) b |= (unsigned long long)((unsigned char)(c[i0 + j] - 1) < 252) << j;
+    mask[w] = b; cnt[w] = (unsigned)__popcll(b);
+}
+__global__ void fit_scan1_k(unsigned *a, size_t n, unsigned *bsum) {   /* exclusive scan of each 1024-run in place; the run totals */
+    __shared__ unsigned s[1024];
+    const size_t i = (size_t)blockIdx.x * 1024 + threadIdx.x; const unsigned v = i < n ? a[i] : 0u;
+    s[threadIdx.x] = v; __syncthreads();
+    for (int o = 1; o < 1024; o <<= 1) { const unsigned t = threadIdx.x >= (unsigned)o ? s[threadIdx.x - o] : 0u; __syncthreads(); s[threadIdx.x] += t; __syncthreads(); }
+    if (i < n) a[i] = s[threadIdx.x] - v;
+    if (threadIdx.x == 1023) bsum[blockIdx.x] = s[1023];
+}
+__global__ void fit_scan2_k(unsigned *bsum, size_t nb, unsigned long long *tot) {   /* (one thread: the run totals' exclusive scan) */
+    unsigned long long r = 0; for (size_t k = 0; k < nb; k++) { const unsigned t = bsum[k]; bsum[k] = (unsigned)r; r += t; } *tot = r;
+}
+__global__ void fit_scan3_k(unsigned *a, size_t n, const unsigned *bsum) {
+    const size_t i = (size_t)blockIdx.x * 1024 + threadIdx.x; if (i < n) a[i] += bsum[blockIdx.x];
+}
+__global__ void fit_starts_k(const unsigned long long *mask, const unsigned *woff, const unsigned long long *st, int nst, unsigned long long *us) {
+    const int k = threadIdx.x; if (k >= nst) return;
+    const unsigned long long i0 = st[k]; const size_t w = i0 / 64; const int r = (int)(i0 % 64);
+    us[k] = woff[w] + (r ? (unsigned long long)__popcll(mask[w] & ((1ull << r) - 1)) : 0ull);
+}
+/* tmp: >= (nw + 1023) / 1024 + 2 * 64 + 2 words of 8 bytes; nst <= 64 */
+size_t nn_fit_label_mask(const uint8_t *dcodes, size_t nv, uint64_t *dmask, uint32_t *dwoff, void *dtmp, int nst, const uint64_t *starts, uint64_t *ustart) {
+    const size_t nw = (nv + 63) / 64, nb = (nw + 1023) / 1024; if (!nw) return 0;
+    unsigned long long *tot = (unsigned long long *)dtmp, *dst = tot + 1, *dus = dst + 64; unsigned *bsum = (unsigned *)(dus + 64);
+    fit_lmask_k<<<(unsigned)((nw + 255) / 256), 256>>>(dcodes, nv, nw, (unsigned long long *)dmask, (unsigned *)dwoff);
+    fit_scan1_k<<<(unsigned)nb, 1024>>>((unsigned *)dwoff, nw, bsum);
+    fit_scan2_k<<<1, 1>>>(bsum, nb, tot);
+    fit_scan3_k<<<(unsigned)nb, 1024>>>((unsigned *)dwoff, nw, bsum);
+    if (nst > 0) { CK(cudaMemcpy(dst, starts, (size_t)nst * 8, cudaMemcpyHostToDevice));
+                   fit_starts_k<<<1, 64>>>((const unsigned long long *)dmask, (const unsigned *)dwoff, dst, nst, dus); }
+    CK(cudaGetLastError());
+    unsigned long long t = 0; CK(cudaMemcpy(&t, tot, 8, cudaMemcpyDeviceToHost));
+    if (nst > 0) CK(cudaMemcpy(ustart, dus, (size_t)nst * 8, cudaMemcpyDeviceToHost));
+    return (size_t)t;
+}
 void nn_fit_grid_sparse(const fit_dev *ms, const fit_grid_row *rows, const uint64_t *mask, const uint32_t *woff, size_t nw, int ny, int nx, float y0, float x0, float step,
                         int with_theta, float *out) {
     if (!nw) return;
