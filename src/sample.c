@@ -2416,6 +2416,11 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
         if (c->ink_plane && ch == CH_SHEET) {   /* --ink-head: the source's "ink" target onto its own plane (prob254 as stored), not a channel */
             memset(dst, 0, p3);
             if (!inkw) { fprintf(stderr, "sampler: no ink plane buffer\n"); return -1; }
+            if (c->rv_iso > 0) {   /* --rv: papyrus (clean CT >= the cutoff) 254, void 0; unknown on CT 0 below (mask) */
+                const int it = s->iso > 0 ? s->iso : c->rv_iso;
+                for (size_t k = 0; k < p3; k++) inkw[k] = ctu[k] >= it ? 254 : 0;
+                continue;
+            }
             z3 *tz = s->tgt_key[ch] && s->tgt_prob[ch] && !crushed && !torn && !delam && !curved ? source_tgt_for_level(s, ch, l, nullptr) : nullptr;
             if (!tz) memset(inkw, 255, p3);
             else if (source_read_target(s, ch, l, o, n, inkw, 1)) return -1;
@@ -2908,7 +2913,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
                                                  targets only draw anywhere in the scroll): rejected */
         const uint8_t *sd = b->side + (size_t)i * p3; size_t kn = 0;
         for (size_t k = 0; k < p3; k++) kn += sd[k] < PHASE_PERIOD;
-        if (inkw) { const uint8_t *ik = b->ink + (size_t)i * p3; for (size_t k = 0; k < p3; k++) kn += ik[k] != 255; }   /* (--ink-head: known ink supervises too: ink-only sources draw) */
+        if (inkw && !c->rv_iso) { const uint8_t *ik = b->ink + (size_t)i * p3; for (size_t k = 0; k < p3; k++) kn += ik[k] != 255; }   /* (--ink-head: known ink supervises too: ink-only sources draw) */
         if ((double)kn < c->min_phase * (double)p3) { if (Tw) tp_put(Tw, (NCH + 1) * p3); atomic_fetch_add(&sp->rejected, 1); atomic_fetch_add(&sp->rej_why[2], 1); return 1; }   /* (counted as empty targets) */
     }
     if (c->emb_ch && s->ct_only) {   /* an unlabelled ("ct_only") source supervises only the distillation: windows with < 25% of the head cells targeted are redrawn */

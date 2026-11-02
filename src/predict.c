@@ -784,7 +784,12 @@ int cmd_predict(int argc, char **argv) {
     const double radial_sign = atof(opt(argc, argv, "--radial-sign", "1"));   /* -1: reversed direction input (a recto model then marks the verso face) */
     if (radial_sign != 1 && radial_sign != -1) { fprintf(stderr, "predict: --radial-sign must be 1 or -1\n"); return 2; }
     const char *chs = opt(argc, argv, "--channel", "0");   /* output channel to write (band_affinity: 1..6 = affinities; "ink": a task unwrap2 --ink-head checkpoint's ink channel) */
-    const int out_ch = !strcmp(chs, "ink") ? checkpoint_ink_channel(ckpt) : atoi(chs);
+    /* --channel rv (train --task unwrap2 --rv checkpoints): both side channels in one pass, written as 255 (1 + p_recto - p_verso) / 2 */
+    const int rvfuse = !strcmp(chs, "rv");
+    { char *h = checkpoint_header_line(ckpt); const int isrv = h && strstr(h, "\"rv\":{\"version\":1"); free(h);
+      if (rvfuse && !isrv) { fprintf(stderr, "predict: --channel rv: %s is not a train --rv checkpoint\n", ckpt); return 2; }
+      if (isrv && (opt(argc, argv, "--fit-fields", nullptr) || opt(argc, argv, "--fit-zarr", nullptr))) { fprintf(stderr, "predict: %s is a recto / verso (train --rv) checkpoint: channels 0-1 are not the phase (no --fit-*)\n", ckpt); return 2; } }
+    const int out_ch = !strcmp(chs, "ink") ? checkpoint_ink_channel(ckpt) : rvfuse ? 0 : atoi(chs);
     if (!strcmp(chs, "ink") && out_ch < 0) { fprintf(stderr, "predict: --channel ink: %s has no ink channel (train --task unwrap2 --ink-head 1)\n", ckpt); return 2; }
     /* --fit-fields DIR (task unwrap checkpoints: recto 0, ink 1, phase 2-3, normal 4-9, density 10): every head computed, each
        window's interior pooled on the device into the winding fitter's fields (h native voxels per field voxel, --fit-h 8) of the
@@ -875,6 +880,8 @@ int cmd_predict(int argc, char **argv) {
     if (*opt(argc, argv, "--papyrus-cut", "") && !(pap && pap_cond)) { fprintf(stderr, "predict: --papyrus-cut needs a cutoff-conditioned papyrus checkpoint\n"); return 2; }
     char content[96]; if (pap && pcut >= 0) snprintf(content, sizeof content, "papyrus probability at cutoff %g", pcut); else snprintf(content, sizeof content, "%s probability", pap ? "papyrus" : "recto");
     if (!strcmp(chs, "ink")) snprintf(content, sizeof content, "ink probability (unwrap2 channel %d)", out_ch);
+    if (rvfuse) { if (half || hmode == 2) { fprintf(stderr, "predict: --channel rv: full-resolution checkpoints only\n"); return 2; }
+                  snprintf(content, sizeof content, "recto / verso side: 255 (1 + p_recto - p_verso) / 2"); }
     const char *gn_stats = opt(argc, argv, "--gn-stats", embedded && runtime.gn_stored ? "stored" : "legacy");
     if (strcmp(gn_stats, "stored") && strcmp(gn_stats, "legacy")) { fprintf(stderr, "--gn-stats must be stored or legacy\n"); return 2; }
     nn_set_gn_stored(!strcmp(gn_stats, "stored"));
@@ -995,6 +1002,7 @@ int cmd_predict(int argc, char **argv) {
         if (k) nn_init(gpus[1]);
         if (gnh) unet_gn_freeze(uk, gnh);
         if (ffd || sweep_out) unet_set_head_channels(uk, 0, cfg.cout);   /* every head: the recto channel 0 is written, the others pooled (or swept) */
+        else if (rvfuse) unet_set_head_channels(uk, 0, 2);   /* --channel rv: both side logits, fused into channel 0 after the forward */
         else if (!sheet_task) unet_set_head_channels(uk, hmode == 2 ? 8 * out_ch : out_ch, hmode == 2 ? 8 : 1);   /* only the written logit channel (desk widths: -24 B per window voxel) */
         /* fp16 logits (MX activations): the readers below take them as they are (nn_set_logits_h16 after each forward); the 11 heads
            of --fit-zarr were 44 B per window voxel in fp32, which pushed 640^3 windows past the 16 GB card (paged: 40x slower).
@@ -1604,6 +1612,7 @@ int cmd_predict(int argc, char **argv) {
                 lg = lgf;
             } else lg = ct_stem ? unet_forward_ct(u, ctd, (float)mean, (float)(1.0 / sd), dyd, dxd, ax.n > 0 ? (int)radial_sign : 0, xs, h16)
                                 : unet_forward_x(u, xd, xs, 0, h16);
+            if (rvfuse) nn_rv_fuse((void *)lg, w3, unet_logits_h16(u));
             pred_mem_out(u, o);
             if (ctpre && i + 1 < rd.ntiles && atomic_load(&rd.filled) > i + 1) {   /* the next window's CT during this forward (its slot stays held
                                                                                          until that window's statistics, as with the plain upload) */

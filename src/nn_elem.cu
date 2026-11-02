@@ -464,6 +464,36 @@ __global__ void phase_tg_k(const uint8_t *ph, size_t n, uint8_t *t, uint8_t *m) 
     t[i] = (uint8_t)__float2int_rn(127.5f + 127.5f * cs); t[n + i] = (uint8_t)__float2int_rn(127.5f + 127.5f * sn); m[i] = 1;
 }
 extern "C" void nn_phase_targets(const uint8_t *phase, size_t n, uint8_t *t, uint8_t *m) { phase_tg_k<<<nblk(n, 256), 256>>>(phase, n, t, m); KCHECK(); }
+/* train --rv 1: recto / verso side papyrus from the phase (band.h PHASE_*: the recto side is phase < PHASE_PERIOD / 2, between a recto
+   face k and midway to k + 1) and the papyrus plane (sampler cfg.rv_iso: 254 papyrus, 0 void, 255 unknown; warped trilinearly, so >= 127
+   is papyrus): t[0..n) recto side, t[n..2n) verso side (x255); void 0 / 0 wherever the papyrus is known; papyrus of unknown phase and
+   unknown papyrus masked */
+__global__ void rv_tg_k(const uint8_t *ph, const uint8_t *pap, size_t n, uint8_t *t, uint8_t *m) {
+    const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const uint8_t p = pap[i], v = ph[i];
+    t[i] = t[n + i] = 0;
+    if (p == 255) { m[i] = 0; return; }
+    if (p < 127) { m[i] = 1; return; }
+    if (v >= 252) { m[i] = 0; return; }
+    if (v < 126) t[i] = 255; else t[n + i] = 255;
+    m[i] = 1;
+}
+extern "C" void nn_rv_targets(const uint8_t *phase, const uint8_t *pap, size_t n, uint8_t *t, uint8_t *m) { rv_tg_k<<<nblk(n, 256), 256>>>(phase, pap, n, t, m); KCHECK(); }
+/* predict --channel rv (train --rv checkpoints): the two side logits [recto | verso] of a window -> channel 0 := logit of
+   (1 + p_recto - p_verso) / 2, so the written uint8 is 255 (1 + p_r - p_v) / 2: recto side high, verso side low, void ~128 */
+template <typename T> __global__ void rv_fuse_k(T *lg, size_t n) {
+    const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float a = (float)lg[i], b = (float)lg[n + i];
+    const float pr = 1.f / (1.f + __expf(-a)), pv = 1.f / (1.f + __expf(-b));
+    float q = 0.5f + 0.5f * (pr - pv); q = fminf(fmaxf(q, 1e-4f), 1.f - 1e-4f);
+    lg[i] = (T)__logf(q / (1.f - q));
+}
+extern "C" void nn_rv_fuse(void *lg, size_t n, int h16) {
+    if (h16) rv_fuse_k<__half><<<nblk(n, 256), 256>>>((__half *)lg, n); else rv_fuse_k<float><<<nblk(n, 256), 256>>>((float *)lg, n);
+    KCHECK();
+}
 /* train --ink-head: the ink plane (prob254, 255 unknown) -> target t = p x 255 ((v x 255 + 127) / 254, the sampler's encode) and mask m (known) */
 __global__ void ink_tg_k(const uint8_t *ink, size_t n, uint8_t *t, uint8_t *m) {
     const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
