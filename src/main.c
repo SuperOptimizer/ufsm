@@ -58,6 +58,7 @@ int cmd_refine(int argc, char **argv);       /* src/surf.c */
 int cmd_surf_stats(int argc, char **argv);
 int cmd_wrap_snap(int argc, char **argv);   /* src/wrapsnap.c */
 int cmd_surf_labels(int argc, char **argv);   /* src/surflabels.c */
+int cmd_patch_id(int argc, char **argv);   /* src/patchid.c */
 int cmd_geom_check(int argc, char **argv);   /* src/geomcheck.c */
 int cmd_wrap_match(int argc, char **argv);
 int cmd_ink_cover(int argc, char **argv);
@@ -196,6 +197,7 @@ static int usage(void) {
         "  ufsm surf-snap <wraps-in> <wraps-out> --volume ROOT KEY --vol-um U   tifxyz vertices onto the nearest papyrus ridge\n"
         "  ufsm wrap-snap <wraps-in> <wraps-out> --axis F --axis-um U0 --ct ROOT KEY --ct-um U   .sfc wraps moved along their rays onto the sheets (smooth, order-kept)\n"
         "  ufsm surf-labels <wraps-dir> <out-dir> --axis F --axis-um U0 --dir +-1 --grid-um U --like ROOT KEY   winding codes + pair phase + ignore from .sfc wraps\n"
+        "  ufsm patch-id <wraps-dir> <out-dir> --axis F --axis-um U0 --dir +-1 --sheet ROOT KEY --grid-um U   sheet patches -> per-cell wrap id corrections (+ --gt check)\n"
         "  ufsm geom-check <wraps-dir> --axis F --axis-um U [--out DIR]   wraps geometry QA: spacing, steep walls, jumps, merged / skipped neighbours, holes; guard limits\n"
         "  ufsm refine <wraps-in> <wraps-out> --fields DIR [--range 0.33] [--smooth-um 40]   vertices onto the fields' sheet phase\n"
         "  ufsm surf-stats <wraps-dir> --fields DIR [--ct ROOT KEY --ct-um U]   label-free surface quality (phase, switches, CT)\n"
@@ -4326,6 +4328,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "surf-stats")) return cmd_surf_stats(argc, argv);
     if (!strcmp(cmd, "wrap-snap")) return cmd_wrap_snap(argc, argv);
     if (!strcmp(cmd, "surf-labels")) return cmd_surf_labels(argc, argv);
+    if (!strcmp(cmd, "patch-id")) return cmd_patch_id(argc, argv);
     if (!strcmp(cmd, "geom-check")) return cmd_geom_check(argc, argv);
     if (!strcmp(cmd, "wrap-match")) return cmd_wrap_match(argc, argv);
     if (!strcmp(cmd, "ink-cover")) return cmd_ink_cover(argc, argv);
