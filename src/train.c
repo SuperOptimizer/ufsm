@@ -77,7 +77,7 @@ typedef struct {
     uint8_t *sideb[2], *sdb, *sidet, *sidem, *sidew; float *sscratch, sout[5]; double side_loss;   /* --side: SIDE_* / PHASE_* labels, loss target / mask / weight */
     float *aff_fin, aff_out[48]; double aff_loss;
     uint8_t *pmb[2], *pm, *nt, *nm, *nw; float *iscratch, *nscratch, iout[3], nout[15]; double ink_loss, norm_loss;
-    float *cnt_acc, *cnt_seg, *cnt_out, cnt_h[3]; unsigned *cnt_nv; uint64_t cnt_step; double count_loss;   /* --count-lambda */   /* task unwrap: papyrus mask (ink loss), normal / density targets, mask, weights; scratch and parts of the ink and normal losses */
+    float *cnt_acc, *cnt_seg, *cnt_out, cnt_h[21]; unsigned *cnt_nv; uint64_t cnt_step; double count_loss;   /* --count-lambda */   /* task unwrap: papyrus mask (ink loss), normal / density targets, mask, weights; scratch and parts of the ink and normal losses */
     uint8_t *w4b[2], *wcb[2], *w4, *wc; double *w4ds; float *w4fin, w4h[8]; double w4_loss;   /* --task unwrap2: winding mod 4 and its component per voxel (double-buffered), loss sums, scratch, host parts */
     uint8_t *inkb[2], *ink, *inkt, *inkm, *inkw;   /* --ink-head: the ink plane (double-buffered), its slab target / mask, weight byte (loss parts: iscratch / iout / ink_loss) */
     uint8_t *wdb[2], *wd, *ct4, *cm4, *cw4; float *cscratch, cout4[9]; double cond_loss;   /* --cond: the gauge-shifted winding per voxel, its 4 targets, mask, weights; scratch and parts */
@@ -1025,6 +1025,26 @@ static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
         nn_loss_async_tol((const float *)((const char *)lg + g_norm_ch * l3 * le), d->nt, d->nm, d->nw, seven, 0.f,
                           train ? (float *)((char *)d->gl + g_norm_ch * l3 * eb) : nullptr, d->nscratch, nullptr);
         if (train && g_norm_lambda != 1.f) nn_loss_grad_scale((char *)d->gl + g_norm_ch * l3 * eb, 7 * l3, g_norm_lambda);
+        if (getenv("UFSM_DUMP_DENS")) {   /* diagnostic: the mid-z plane of sigmoid(density logit) x 255 of the first UFSM_DUMP_N (4) windows
+                                               as PREFIX-NN.pgm (+ source / level / corner on stderr), for an A/B against predict --channel */
+            static int ndd = 0; const int N = getenv("UFSM_DUMP_N") ? atoi(getenv("UFSM_DUMP_N")) : 4;
+            if (ndd < N && os.h == os.w) {
+                const int dch_ = getenv("UFSM_DUMP_DENS_CH") ? atoi(getenv("UFSM_DUMP_DENS_CH")) : g_norm_ch + 6;   /* (default: the density channel) */
+                const size_t pl = (size_t)os.h * os.w, off = ((size_t)dch_ * l3 + (size_t)(os.d / 2) * pl) * le;
+                void *hb = malloc(pl * le); uint8_t *img = malloc(pl);
+                if (hb && img) {
+                    nn_sync(); nn_d2h(hb, (const char *)lg + off, pl * le);
+                    for (size_t k = 0; k < pl; k++) { float v; if (le == 2) { _Float16 h; memcpy(&h, (char *)hb + 2 * k, 2); v = (float)h; } else memcpy(&v, (char *)hb + 4 * k, 4);
+                        const float sgm = 1.f / (1.f + expf(-v)); img[k] = (uint8_t)lrintf(255.f * sgm); }
+                    char path[1100]; snprintf(path, sizeof path, "%s-c%d-%02d.pgm", getenv("UFSM_DUMP_DENS"), dch_, ndd);
+                    FILE *f = fopen(path, "wb"); if (f) { fprintf(f, "P5\n%d %d\n255\n", os.w, os.h); fwrite(img, 1, pl, f); fclose(f); }
+                    fprintf(stderr, "dumped channel %d le %d %s (source %d, level %d, um %.3f, corner %lld %lld %lld, window %d^3, plane z %d)\n", dch_, (int)le, path, d->srcb[d->cur], d->lvlb[d->cur], d->um,
+                            (long long)d->cornb[d->cur][0], (long long)d->cornb[d->cur][1], (long long)d->cornb[d->cur][2], os.h, os.d / 2);
+                    ndd++;
+                }
+                free(hb); free(img);
+            }
+        }
         if (g_count_lambda > 0) {   /* turns along sheet-normal segments: the density integral against the true count */
             const size_t dch = (size_t)(g_norm_ch + 6);
             nn_count_strata(g_cnt_ns, g_cnt_edges, d->um);
@@ -1133,7 +1153,7 @@ static double fetch_loss(gpu_state *d, int B, int P, float dice_w, float *out) {
     if (g_pg_lambda > 0 && g_head_slab) { nn_d2h(d->pg_h, d->hs_ds + 56, 2 * sizeof(double)); if (d->hs_train) nn_d2h(d->pg_h, d->hs_ds + 58, sizeof(double));   /* (training: the loss sum of the gradient pass) */
         d->pg_loss = d->pg_h[1] > 0 ? g_pg_lambda * d->pg_h[0] / d->pg_h[1] : 0; }
     d->count_loss = 0;
-    if (g_count_lambda > 0) { nn_d2h(d->cnt_h, d->cnt_out, 3 * sizeof(float)); d->count_loss = g_count_lambda * d->cnt_h[0]; }
+    if (g_count_lambda > 0) { nn_d2h(d->cnt_h, d->cnt_out, 21 * sizeof(float)); d->count_loss = g_count_lambda * d->cnt_h[0]; }
     d->cond_loss = 0;
     if (g_cond) {   /* mean bce over the 4 winding channels, times lambda */
         nn_loss_fetch(d->cscratch, (shape5){1, 4, 1, 1, 1}, d->cout4);
@@ -1516,6 +1536,15 @@ int cmd_train(int argc, char **argv) {
     }
     unet_cfg cfg = {4, {16, 32, 64, 80}, 4, g_cout, 8, 0, 0};
     cfg.down_norm = atoi(opt(argc, argv, "--down-norm", "0"));
+    {   /* --init-from: the donor's down-sampling GroupNorm. Without it the copied trunk runs un-normalised (copy_gn skips the dn layers):
+           wind96 (down_norm 1) warm-started into a down_norm 0 net gave bias-only, spatially constant logits (CAL 11-01). Default: the
+           donor's value; an explicit different --down-norm is refused */
+        const char *ifp = opt(argc, argv, "--init-from", nullptr); unet_cfg dc; int ds;
+        if (ifp && !opt(argc, argv, "--resume", nullptr) && !unet_peek(ifp, &dc, &ds) && dc.down_norm != cfg.down_norm) {
+            if (*opt(argc, argv, "--down-norm", "")) { fprintf(stderr, "--init-from %s has down_norm %d, --down-norm %d: the trunk would run without its normalisation\n", ifp, dc.down_norm, cfg.down_norm); return 2; }
+            fprintf(stderr, "init-from: down_norm %d from the donor %s\n", dc.down_norm, ifp); cfg.down_norm = dc.down_norm;
+        }
+    }
     { const char *ln = opt(argc, argv, "--l0-norm", "gn");   /* level-0 normalisation (unet_cfg.l0_norm): gn, none (affine + SiLU), ema (running statistics), ws (none + weight standardisation), slab (GroupNorm per z-slab) */
       cfg.l0_norm = !strcmp(ln, "none") ? 1 : !strcmp(ln, "ema") ? 2 : !strcmp(ln, "ws") ? 3 : !strcmp(ln, "slab") ? 4 : 0;
       if (!cfg.l0_norm && strcmp(ln, "gn")) { fprintf(stderr, "--l0-norm gn|none|ema|ws|slab\n"); return 2; }
@@ -2295,7 +2324,7 @@ int cmd_train(int argc, char **argv) {
             }
             if (g_count_lambda > 0) {
                 d->cnt_acc = nn_malloc(p3 * sizeof(float)); nn_zero(d->cnt_acc, p3 * sizeof(float));
-                d->cnt_seg = nn_malloc((size_t)3 * g_count_K * sizeof(float)); d->cnt_nv = nn_malloc(sizeof(unsigned)); d->cnt_out = nn_malloc(4 * sizeof(float));
+                d->cnt_seg = nn_malloc((size_t)4 * g_count_K * sizeof(float)); d->cnt_nv = nn_malloc(sizeof(unsigned)); d->cnt_out = nn_malloc(24 * sizeof(float));
             }
         }
         if (g_cond) {
@@ -2587,7 +2616,7 @@ int cmd_train(int argc, char **argv) {
     double best_val = 1e30, vcrit = 0; int nskip = 0; (void)nskip;
     double acc_rn = 0, acc_re = 0, acc_rb = 0;   /* restore: training voxels, error^2, input error^2 since the last log line */
     float parts[8][2 * TCMAX + 1];
-    double acc_emb = 0, acc_embc = 0, acc_ds = 0, acc_vbce = 0, acc_vdice = 0, acc_side = 0, acc_ink = 0, acc_norm = 0, acc_cond = 0, acc_ck = 0, acc_cr = 0, acc_pap = 0, acc_cnt = 0, acc_cnr = 0, acc_w4 = 0, acc_w4w = 0, acc_w4a = 0, acc_pg = 0;   /* (acc_pg: --pgrad-lambda loss; acc_cnt / acc_cnr: --count-lambda loss, Tp / Tg) verso channel, side channel; --cond (loss, known / right counts); --pap-head */
+    double acc_emb = 0, acc_embc = 0, acc_ds = 0, acc_vbce = 0, acc_vdice = 0, acc_side = 0, acc_ink = 0, acc_norm = 0, acc_cond = 0, acc_ck = 0, acc_cr = 0, acc_pap = 0, acc_cnt = 0, acc_cnr = 0, acc_cbin[18] = {0}, acc_w4 = 0, acc_w4w = 0, acc_w4a = 0, acc_pg = 0;   /* (acc_pg: --pgrad-lambda loss; acc_cnt / acc_cnr: --count-lambda loss, Tp / Tg) verso channel, side channel; --cond (loss, known / right counts); --pap-head */
     double acc_inkn = 0, vik[2] = {0};   /* --ink-head: training windows with known ink in the log interval; validation ink bce sum / windows */
     for (int step = step0 + 1; step <= steps && !g_stop; step++) {
         if (trunk_lr != 1.f && trunk_lr_steps > 0 && step == (step0 + 1 > trunk_lr_steps + 1 ? step0 + 1 : trunk_lr_steps + 1)) {   /* --trunk-lr-steps: the trunk back to the full rates */
@@ -2775,8 +2804,9 @@ int cmd_train(int argc, char **argv) {
             if (g_head_only) unet_grad_head_only(d->u, g_head_only - 1);   /* --train-head-only N: head + last N-1 decoder blocks (frozen rest: --wd 0) */
             if (clip > 0 && gn > clip) unet_clip_grad(d->u, clip);
             unet_srste24(d->u, srste);                       /* no-op unless sparse */
-            if (use_anvil) unet_anvil(d->u, anvil_lr * (lr / lr0), anvil_wd, step, steps, lr, 0.9f, 0.999f, 1e-8f, wd);
-            else if (use_muon) unet_muon(d->u, muon_lr * (lr / lr0), muon_beta, lr, 0.9f, 0.999f, 1e-8f, wd, step);   /* Muon lr follows the same schedule shape */
+            const float lrr = lr0 > 0.f ? lr / lr0 : 0.f;   /* (lr0 0: 0 / 0 was NaN -> NaN weights after step 1; CAL 11-01) */
+            if (use_anvil) unet_anvil(d->u, anvil_lr * lrr, anvil_wd, step, steps, lr, 0.9f, 0.999f, 1e-8f, wd);
+            else if (use_muon) unet_muon(d->u, muon_lr * lrr, muon_beta, lr, 0.9f, 0.999f, 1e-8f, wd, step);   /* Muon lr follows the same schedule shape */
             else unet_adamw(d->u, lr, 0.9f, 0.999f, 1e-8f, wd, step);
             unet_ema(d->u, step < 100 ? 0.9f : ema);
             unet_wquant(d->u, (unsigned)step);              /* no-op unless --wq */
@@ -2802,7 +2832,7 @@ int cmd_train(int argc, char **argv) {
         if (g_cond) { acc_cond += G[0].cond_loss / (g_cond_lambda ? g_cond_lambda : 1.f); acc_ck += (double)G[0].cacc_h[0]; acc_cr += (double)G[0].cacc_h[1]; }
         if (g_pap_head) acc_pap += G[0].pout3[0];
         if (g_restore) { acc_rn += G[0].rst_h[0]; acc_re += G[0].rst_h[3]; acc_rb += G[0].rst_h[4]; }
-        if (g_count_lambda > 0) { acc_cnt += G[0].cnt_h[0]; acc_cnr += G[0].cnt_h[2]; }
+        if (g_count_lambda > 0) { acc_cnt += G[0].cnt_h[0]; acc_cnr += G[0].cnt_h[2]; for (int b = 0; b < 18; b++) acc_cbin[b] += G[0].cnt_h[3 + b]; }
         if (step % log_every == 0 || step == steps || g_stop) {
             double dt = now() - tlog;
             double vl = -1, vb = 0, vd = 0, vh[TCMAX] = {0}; int vhn[TCMAX] = {0}; double vw4[6] = {0};   /* unwrap2: wind4 bce, worst-gauge bce, right turns, voxels, phase, normal */
@@ -2947,7 +2977,9 @@ int cmd_train(int argc, char **argv) {
             if (g_pap_head) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " papyrus bce %.4f", acc_pap / nacc); }
             if (g_restore) { size_t na = strlen(affs); const double p = psnr_of(acc_re, acc_rn), pb = psnr_of(acc_rb, acc_rn);
                              snprintf(affs + na, sizeof affs - na, " psnr %.2f input %.2f gain %+.3f (%.0f Mvox/s)", p, pb, p - pb, (double)nacc * g_Pz * P * P / 1e6 / dt); acc_rn = acc_re = acc_rb = 0; }
-            if (g_count_lambda > 0) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " count %.4f (turns pred/true %.3f)", acc_cnt / nacc, acc_cnr / nacc); }
+            if (g_count_lambda > 0) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " count %.4f (turns pred/true %.3f)", acc_cnt / nacc, acc_cnr / nacc);
+                if (g_cnt_ns) { na = strlen(affs); snprintf(affs + na, sizeof affs - na, " bins"); for (int b = 0; b <= g_cnt_ns; b++) { na = strlen(affs); snprintf(affs + na, sizeof affs - na, " %.3f", acc_cbin[2 * b + 1] > 0 ? acc_cbin[2 * b] / acc_cbin[2 * b + 1] : 0.); } }
+                memset(acc_cbin, 0, sizeof acc_cbin); }
             if (g_aff) { const float *a = G[0].aff_out; size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " aff %.4f (d1 bce %.3f dice %.3f | d8 bce %.3f dice %.3f)", G[0].aff_loss,
                                     (a[0] + a[6] + a[12]) / 3, (a[1] + a[7] + a[13]) / 3, (a[18] + a[24] + a[30]) / 3, (a[19] + a[25] + a[31]) / 3); }
             fprintf(stderr, "step %6d lr %.2e loss %.4f bce %.4f dice %.4f%s gn %.2f %.2f samp/s %.1f Mvox/s (wait %.0f%%)%s%s\n", step, lr, acc_loss / nacc, acc_bce / nacc, acc_dice / nacc, affs, acc_g / nacc,
