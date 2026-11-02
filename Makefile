@@ -75,7 +75,7 @@ SRC += src/villawind.c src/villawind_net.c src/vwt_net.c src/vwt_train.c src/vwt
 SRC += src/inksplat.c src/hercuvit.c src/hercuvit_net.c src/ink3dext.c src/ink3dext_net.c src/surfrecto.c src/surfrecto_net.c
 SRC += src/tfx.c
 SRC += src/embz.c src/fit_emb.c src/embpca.c src/embcalib.c src/sample_emb.c
-SRC += src/vwt_sample.c src/raycheck.c src/patchraster.c src/hiresphase.c src/fitjoin.c src/wrapcheck.c src/phasegate.c src/ctcal.c src/fieldsoracle.c src/packmap.c src/scanprep.c src/pairacc.c src/wbench.c src/wrapsnap.c src/surflabels.c src/geomcheck.c src/patchid.c
+SRC += src/vwt_sample.c src/raycheck.c src/patchraster.c src/hiresphase.c src/fitjoin.c src/wrapcheck.c src/phasegate.c src/ctcal.c src/fieldsoracle.c src/packmap.c src/scanprep.c src/pairacc.c src/wbench.c src/wrapsnap.c src/surflabels.c src/geomcheck.c src/patchid.c src/rectoruler.c src/rectocls.c src/rectosp.c
 SRC += src/view.c src/reg.c src/reg_cli.c src/reg_view.c src/reg_init.c src/reg_render.c src/reg_ink.c src/srpairs.c
 SRC += src/srpair.c
 SRC += src/storebench.c src/phasepack.c
@@ -408,6 +408,9 @@ suite-bins: $(B)/test_fit_join
 $(B)/test_wrap_check: tests/test_wrap_check.c $(B)/wrapcheck.o $(B)/fit.o $(B)/fit_emb.o $(B)/embz.o $(B)/z3w.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/coreline.o $(B)/json.o $(B)/zarr3.o $(B)/zarr2.o $(B)/store.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 suite-bins: $(B)/test_wrap_check
+$(B)/test_recto: tests/test_recto.c $(B)/rectoruler.o $(B)/rectocls.o $(B)/rectosp.o $(B)/reg.o $(B)/fit.o $(B)/fit_emb.o $(B)/embz.o $(B)/z3w.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/coreline.o $(B)/json.o $(B)/zarr3.o $(B)/zarr2.o $(B)/store.o $(B)/nn.o $(B)/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
+suite-bins: $(B)/test_recto
 $(B)/test_pairacc: tests/test_pairacc.c $(B)/pairacc.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ -lm
 suite-bins: $(B)/test_pairacc
