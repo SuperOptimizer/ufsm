@@ -19,7 +19,20 @@ struct sr_net {
     float *hw; float hb;
     float *margin; size_t cap;
     int keep; xt kept[2 * SR_ST - 1];
+    int oldgn; float *mr; double *acc;   /* oldgn (UFSM_SURFRECTO_XGN=1): xnet xgn instead of the one-pass IN kernels */
 };
+static sr_net *g_n;   /* the net of the running forward (IN scratch) */
+void sr_in_stats(const void *x, int C, long long S, float eps, float *mr_dev, double *acc_dev);
+void sr_in_apply(void *x, int C, size_t nvox, const float *mr_dev, const float *g_dev, const float *b_dev, int lrelu);
+void sr_in_scse(void *h, const void *res, size_t nvox, int C, const float *mr_dev, const float *g_dev, const float *b_dev,
+                const float *sw_dev, float sb, const float *cg_dev);
+/* InstanceNorm (affine, eps 1e-5) + optional LeakyReLU, in place */
+static void inorm(xt t, const cin *c, int lrelu) {
+    if (g_n->oldgn) { xgn(t, t.c, c->g, c->b, 1e-5f, nullptr, lrelu ? XA_LRELU : XA_NONE, t); return; }
+    const size_t S = (size_t)t.d * t.h * t.w;
+    sr_in_stats(t.p, t.c, (long long)S, 1e-5f, g_n->mr, g_n->acc);
+    sr_in_apply(t.p, t.c, S, g_n->mr, c->g, c->b, lrelu);
+}
 
 static const wl_tensor *need(const wl_dict *d, const char *name) {
     const wl_tensor *t = wl_get(d, name);
@@ -61,6 +74,7 @@ sr_net *sr_load(const char *pth) {
     wl_dict *d = wl_load(pth, "model");
     if (!d) { fprintf(stderr, "surfrecto: %s: %s\n", pth, wl_error()); return nullptr; }
     sr_net *n = calloc(1, sizeof *n); int rc = 0;
+    { const char *e = getenv("UFSM_SURFRECTO_XGN"); n->oldgn = e && atoi(e); }
     char p[256];
     rc |= cin_of(d, &n->stem, "shared_encoder.stem.convs.0", 3, 1, 1);
     if (!rc && wl_get(d, "shared_encoder.stem.convs.1.conv.weight")) { fprintf(stderr, "surfrecto: more than one stem conv\n"); rc = -1; }
@@ -114,7 +128,7 @@ void sr_free(sr_net *n) {
     }
     for (int s = 0; s < SR_ST - 1; s++) { xconv_free(&n->up[s]); cin_free(&n->dec[s]); }
     for (int k = 0; k < 2 * SR_ST - 1; k++) xt_free(&n->kept[k]);
-    xfree_dev(n->hw); xfree_dev(n->margin);
+    xfree_dev(n->hw); xfree_dev(n->margin); xfree_dev(n->mr); xfree_dev(n->acc);
     free(n);
 }
 
@@ -133,16 +147,22 @@ static void keep_of(sr_net *n, int k, xt t) {
 /* BasicBlockD + scSE; x stays owned by the caller */
 static xt rblock_fwd(const rblock *R, xt x) {
     xt h = xconv_fwd(&R->c1.c, x, nullptr, XA_NONE);
-    xgn(h, h.c, R->c1.g, R->c1.b, 1e-5f, nullptr, XA_LRELU, h);
+    inorm(h, &R->c1, 1);
     xt h2 = xconv_fwd(&R->c2.c, h, nullptr, XA_NONE); xt_free(&h);
-    xgn(h2, h2.c, R->c2.g, R->c2.b, 1e-5f, nullptr, XA_NONE, h2);
     xt r = x, pooled = {0};
     if (R->pool) { pooled = xavgpool3d_k2(x); r = pooled; }
     if (R->has_sk) {
-        r = xconv_fwd(&R->sk.c, r, nullptr, XA_NONE); xgn(r, r.c, R->sk.g, R->sk.b, 1e-5f, nullptr, XA_NONE, r);
+        r = xconv_fwd(&R->sk.c, r, nullptr, XA_NONE); inorm(r, &R->sk, 0);
         if (pooled.p) xt_free(&pooled);
     }
-    sr_scse(h2.p, r.p, (size_t)h2.n * h2.d * h2.h * h2.w, h2.c, R->sw, R->sb, R->cg);
+    const size_t nv = (size_t)h2.n * h2.d * h2.h * h2.w;
+    if (g_n->oldgn) {
+        xgn(h2, h2.c, R->c2.g, R->c2.b, 1e-5f, nullptr, XA_NONE, h2);
+        sr_scse(h2.p, r.p, nv, h2.c, R->sw, R->sb, R->cg);
+    } else {
+        sr_in_stats(h2.p, h2.c, (long long)nv, 1e-5f, g_n->mr, g_n->acc);
+        sr_in_scse(h2.p, r.p, nv, h2.c, g_n->mr, R->c2.g, R->c2.b, R->sw, R->sb, R->cg);
+    }
     if (R->has_sk || R->pool) xt_free(&r);
     return h2;
 }
@@ -152,9 +172,11 @@ const float *sr_forward(sr_net *n, const uint8_t *u8_dev, int P, float mean, flo
     const float lo = 0.f, hi = 255.f, a = 1.f / fmaxf(stdv, 1e-8f), b = -mean * a;
     xt x = xinput_u8(u8_dev, 1, P, P, P, &lo, &hi, &a, &b);
     if (!x.p) { fprintf(stderr, "surfrecto: out of device memory (input)\n"); return nullptr; }
+    g_n = n;
+    if (!n->mr) { n->mr = xmalloc_dev(sizeof(float) * 2 * 512); n->acc = xmalloc_dev(sizeof(double) * 2 * 512); }
     xt h = xconv_fwd(&n->stem.c, x, nullptr, XA_NONE); xt_free(&x);
-    if (!h.p) { fprintf(stderr, "surfrecto: out of device memory (stem)\n"); return nullptr; }
-    xgn(h, h.c, n->stem.g, n->stem.b, 1e-5f, nullptr, XA_LRELU, h);
+    if (!h.p || !n->mr || !n->acc) { fprintf(stderr, "surfrecto: out of device memory (stem)\n"); return nullptr; }
+    inorm(h, &n->stem, 1);
     x = h;
     xt skip[SR_ST];
     for (int s = 0; s < SR_ST; s++) {
@@ -173,7 +195,7 @@ const float *sr_forward(sr_net *n, const uint8_t *u8_dev, int P, float mean, flo
         xt c = xconcat(u, skip[SR_ST - 2 - s]); xt_free(&u); xt_free(&skip[SR_ST - 2 - s]);
         xt hh = xconv_fwd(&n->dec[s].c, c, nullptr, XA_NONE); xt_free(&c);
         if (!hh.p) { fprintf(stderr, "surfrecto: out of device memory (decoder %d)\n", s); return nullptr; }
-        xgn(hh, hh.c, n->dec[s].g, n->dec[s].b, 1e-5f, nullptr, XA_LRELU, hh);
+        inorm(hh, &n->dec[s], 1);
         lo_t = hh; keep_of(n, SR_ST + s, hh);
     }
     const size_t nv = (size_t)P * P * P;

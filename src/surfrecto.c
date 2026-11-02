@@ -274,10 +274,11 @@ int cmd_surfrecto_predict(int argc, char **argv) {
     if (!raw && argc >= 6 && argv[2][0] != '-') ck = argv[2];
     if (!ck || (!raw && argc < 6)) {
         fprintf(stderr, "usage: ufsm surfrecto-predict CKPT CT-ROOT CT-KEY OUT --box z0,y0,x0,z1,y1,x1 [--um 2.4] [--window 256] [--overlap 0.5]\n"
-                        "         [--tta 0] [--air 0] [--shard 512] [--gpu 0] [--gpu-mem GB] [--threads N] [--cache DIR]\n"
+                        "         [--tta 0] [--air 0] [--shard 512] [--gpu 0] [--gpu-mem GB] [--threads N] [--cache DIR] [--part i/n]\n"
                         "  scrollprize/surface_recto_3dunet (checkpoint_inference_ready.pth) on a CT box (level-0 voxels, end-exclusive; the model\n"
                         "  works on 2.4 um CT). OUT/<um>: uint8 rint(255 p(recto surface)), full CT shape (voxel = CT voxel), 0 outside the box.\n"
                         "  --tta 1: 8-flip mirror TTA (villa default, 8x the time). --air A: also skip windows whose CT max < A.\n"
+                        "  --part i/n: compute only the i-th of n shares of the box's 512-row y shard rows (one process per GPU into the same OUT).\n"
                         "  ufsm surfrecto-predict --ckpt PTH --raw-in WINDOW.u8 --raw-out DIR [--window 256] [--keep 1] [--tta 1]   one window (parity)\n");
         return 2;
     }
@@ -307,10 +308,25 @@ int cmd_surfrecto_predict(int argc, char **argv) {
         if (bv[3 + a] > V[a]) bv[3 + a] = V[a];
         if (bv[3 + a] <= bv[a]) { fprintf(stderr, "surfrecto: empty box along axis %d (volume %lld %lld %lld)\n", a, (long long)V[0], (long long)V[1], (long long)V[2]); return 2; }
         if (V[a] < P) { fprintf(stderr, "surfrecto: the volume is smaller than the window along axis %d\n", a); return 2; }
-        C.box0[a] = bv[a]; C.box1[a] = bv[3 + a]; C.G[a] = grid_of(bv[a], bv[3 + a], V[a], P, S);
+        C.box0[a] = bv[a]; C.box1[a] = bv[3 + a];
     }
+    /* --part i/n: this process computes the box's i-th share of 512-row shard rows along y (n processes, e.g. one per GPU, write
+       disjoint shards of the same array; each blends only its own windows) */
+    int part_i = 0, part_n = 1;
+    if (opt(argc, argv, "--part", nullptr) && (sscanf(opt(argc, argv, "--part", ""), "%d/%d", &part_i, &part_n) != 2 || part_n < 1 || part_i < 0 || part_i >= part_n)) {
+        fprintf(stderr, "surfrecto: --part i/n with 0 <= i < n\n"); return 2;
+    }
+    if (part_n > 1) {
+        const int64_t r0 = C.box0[1] / SH, r1 = (C.box1[1] - 1) / SH + 1, nr = r1 - r0;
+        const int64_t a = r0 + nr * part_i / part_n, b = r0 + nr * (part_i + 1) / part_n;
+        if (a >= b) { fprintf(stderr, "surfrecto: part %d/%d is empty (%lld shard rows)\n", part_i, part_n, (long long)nr); return 0; }
+        if (a * SH > C.box0[1]) C.box0[1] = a * SH;
+        if (b * SH < C.box1[1]) C.box1[1] = b * SH;
+        fprintf(stderr, "surfrecto: part %d/%d: y %lld - %lld\n", part_i, part_n, (long long)C.box0[1], (long long)C.box1[1]);
+    }
+    for (int a = 0; a < 3; a++) C.G[a] = grid_of(C.box0[a], C.box1[a], V[a], P, S);
     const long long nwin_all = (long long)C.G[0].n * C.G[1].n * C.G[2].n;
-    const double boxvox = (double)(bv[3] - bv[0]) * (bv[4] - bv[1]) * (bv[5] - bv[2]);
+    const double boxvox = (double)(C.box1[0] - C.box0[0]) * (C.box1[1] - C.box0[1]) * (C.box1[2] - C.box0[2]);
     fprintf(stderr, "surfrecto: CT %lldx%lldx%lld, box %lld,%lld,%lld - %lld,%lld,%lld (%.3g voxels), window %d stride %d, grid %dx%dx%d = %lld windows, tta %d\n",
             (long long)V[0], (long long)V[1], (long long)V[2], bv[0], bv[1], bv[2], bv[3], bv[4], bv[5], boxvox, P, S, C.G[0].n, C.G[1].n, C.G[2].n, nwin_all, tta);
 
