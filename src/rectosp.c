@@ -1,11 +1,11 @@
 /* ufsm recto-sp IN-FIELDS OUT-FIELDS --src ROOT KEY UM [--rows R0,R1] [--stride 4] [--half-um 400] [--prom 25] [--sigma 0.5] [--sep-um 20]
-                [--blend 1] [--gate 0.4,2.5] [--min-net-um 0] [--min-int 3] [--rsp-in DIR] [--threads N] [--cache DIR]
+                [--blend 1] [--gate 0.4,2.5] [--min-net-um 0] [--blend-ramp LO,HI,A0,A1] [--min-int 3] [--rsp-in DIR] [--threads N] [--cache DIR]
    Recto predictions as a count target for count-field: the sheet spacing sp of a fit-field set replaced by the spacing of recto hits
    along the field normal. Per field cell on a --stride grid (cells with material): the source profile along the principal axis of the
    cell's n n^T over +-half-um (trilinear, step half a source voxel), peaks as recto-ruler (rr_peaks: smoothing --sigma source voxels,
    prominence --prom 0..255, merged closer than --sep-um), the median normal width of the up to 5 hit intervals around the cell centre
    (>= --min-int intervals) = one turn each (--cls MODEL: ufsm recto-cls turns per interval, spacing = their widths / turns) -> rsp (units of h / 8 native voxels, as sp; 0 none), written to the stride block.
-   OUT gets sp = net^(1 - a) rsp^a (a = --blend) where rsp / net lies inside --gate, net sp elsewhere; rsp (the raw recto spacing); the
+   OUT gets sp = net^(1 - a) rsp^a (a = --blend; --blend-ramp LO,HI,A0,A1: a = A0 where the network spacing <= LO um, A1 >= HI, linear between) where rsp / net lies inside --gate, net sp elsewhere; rsp (the raw recto spacing); the
    other planes linked to IN's; fields.json copied. --rsp-in DIR: reuse DIR/rsp (only the blend runs). --rows R0,R1: box rows computed (the
    others keep the net sp). The source is on the fields' scan (UM its voxel um; native = fields' um). Arrays: 512^3 shards, lossless. */
 #include "fit.h"
@@ -159,6 +159,7 @@ int cmd_recto_sp(int argc, char **argv) {
     int R0 = 0, R1 = shp[0]; { const char *r = rs_opt(argc, argv, "--rows", nullptr); if (r && sscanf(r, "%d,%d", &R0, &R1) != 2) { fprintf(stderr, "recto-sp: --rows R0,R1\n"); return 2; } if (R0 < 0) R0 = 0; if (R1 > shp[0]) R1 = shp[0]; }
     double blend = atof(rs_opt(argc, argv, "--blend", "1")), glo = 0.4, ghi = 2.5; sscanf(rs_opt(argc, argv, "--gate", "0.4,2.5"), "%lf,%lf", &glo, &ghi);
     const char *rspin = rs_opt(argc, argv, "--rsp-in", nullptr); const double minnet = atof(rs_opt(argc, argv, "--min-net-um", "0"));
+    double rlo = 0, rhi = 0, ra0 = 0, ra1 = 0; const int ramp = sscanf(rs_opt(argc, argv, "--blend-ramp", ""), "%lf,%lf,%lf,%lf", &rlo, &rhi, &ra0, &ra1) == 4 && rhi > rlo;
     z3 *zrin = nullptr; if (rspin && !(zrin = z3_open(store_open(rspin), "rsp", nullptr))) { fprintf(stderr, "recto-sp: --rsp-in: %s\n", z3_error()); return 1; }
     z3 *zs = nullptr; double sum = 0, F = 1; const char *cache = rs_opt(argc, argv, "--cache", nullptr);
     if (!zrin) { for (int i = 4; i + 3 < argc; i++) if (!strcmp(argv[i], "--src")) { if (!(zs = z3_open(store_open(argv[i + 1]), argv[i + 2], cache))) { fprintf(stderr, "recto-sp: --src: %s\n", z3_error()); return 1; } sum = atof(argv[i + 3]); }
@@ -210,7 +211,9 @@ int cmd_recto_sp(int argc, char **argv) {
             if (!rsp[i]) continue;
             const double r = (double)rsp[i] / net[i]; if (r < glo || r > ghi) continue;
             if (net[i] * h / 8.0 * um < minnet) continue;   /* --min-net-um: only where the network spacing is at least this wide */
-            const double v = exp((1 - blend) * log(net[i]) + blend * log(rsp[i])); net[i] = (uint8_t)(v < 1 ? 1 : v > 255 ? 255 : lround(v)); nrep++;
+            double a = blend;
+            if (ramp) { const double su = net[i] * h / 8.0 * um; a = su <= rlo ? ra0 : su >= rhi ? ra1 : ra0 + (ra1 - ra0) * (su - rlo) / (rhi - rlo); }   /* --blend-ramp: by the network spacing */
+            const double v = exp((1 - a) * log(net[i]) + a * log(rsp[i])); net[i] = (uint8_t)(v < 1 ? 1 : v > 255 ? 255 : lround(v)); nrep++;
         }
         /* write the shard row (outside the box: the input sp) */
         for (int pass = 0; pass < (wrs ? 2 : 1); pass++) {
@@ -234,8 +237,8 @@ int cmd_recto_sp(int argc, char **argv) {
     }
     fprintf(stderr, "\n");
     if (z3w_close(wsp) || (wrs && z3w_close(wrs))) { fprintf(stderr, "recto-sp: close: %s\n", z3w_error()); return 1; }
-    printf("recto-sp: %s -> %s: %lld cells probed, %.3f with a recto spacing; sp replaced on %.3f of the material cells (blend %g, gate %g..%g), %.0f s\n",
-           in, out, tc, tc ? (double)te / tc : 0, nmat ? (double)nrep / nmat : 0, blend, glo, ghi, rs_now() - t0);
+    printf("recto-sp: %s -> %s: %lld cells probed, %.3f with a recto spacing; sp replaced on %.3f of the material cells (blend %g%s, gate %g..%g), %.0f s\n",
+           in, out, tc, tc ? (double)te / tc : 0, nmat ? (double)nrep / nmat : 0, blend, ramp ? " ramp" : "", glo, ghi, rs_now() - t0);
     free(shard); rr_cls_free(cls); z3_close(zsp); if (zs) z3_close(zs); if (zrin) z3_close(zrin);
     return 0;
 }
