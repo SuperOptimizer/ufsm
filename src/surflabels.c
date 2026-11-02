@@ -81,7 +81,7 @@ typedef struct {
 } sl_wrap;
 
 typedef struct { int wi, r0, c0; float lo[3], hi[3]; } sl_tile;   /* quads rows r0 .. r0 + SL_TR, cols c0 .. c0 + SL_TC (band-relative rows) */
-typedef struct { float p[3], d, r; uint32_t h; uint8_t q; } sl_rec;   /* r: the cell coherence (NAN: none) */
+typedef struct { float p[3], d, r, dm; uint32_t h; uint8_t q; } sl_rec;   /* dm: mm to the nearest voted anchor cell (NAN: none) */   /* r: the cell coherence (NAN: none) */
 typedef struct { sl_rec *r; size_t n, cap; } sl_recs;
 
 typedef struct {
@@ -97,7 +97,8 @@ typedef struct {
     /* stats */
     _Atomic long long ncode, nconf, nknown, nkept, nig[IG_N], gtk, g10, g25, kgtk, kg10, kg25, nblk, gbins[PHASE_AGREE_BINS], kbins[PHASE_AGREE_BINS];
     sl_recs *recs; uint32_t pa_T; int nt;
-    const char *an_patches; int an_mode, an_cr, an_ns; uint32_t ncell; _Atomic uint32_t *an_hist, *an_pres; float *an_d; double an_tol;   /* anchors: mode 1 vote, 2 apply */
+    const char *an_patches; int an_mode, an_cr, an_ns; uint32_t ncell; _Atomic uint32_t *an_hist, *an_pres; _Atomic int64_t *an_cs; float *an_d, *an_dist; double an_tol;
+    _Atomic long long dk_gk[5], dk_g25[5];   /* apply + GT: phase agreement per distance bin (mm along the surface to the nearest voted cell: 0, 0-2.5, 2.5-10, 10-30, 30+) */   /* anchors: mode 1 vote, 2 apply */
     double gsplit; int ghalf;          /* --gt-half A|B with --gt-split-mm: GT used only in z blocks of that parity (A even, B odd) */
     int coh_cell, ct_scale; double min_coh; _Atomic long long ch_kn[COH_BINS + 1], ch_gk[COH_BINS + 1], ch_g10[COH_BINS + 1], ch_g25[COH_BINS + 1];   /* bin COH_BINS: no coherence (too few voxels) */
 } sl_job;
@@ -217,6 +218,7 @@ static void *sl_pap_run(void *arg) {
     return nullptr;
 }
 
+static inline int an_dbin(float dm) { return !isfinite(dm) ? -1 : dm <= 0 ? 0 : dm <= 2.5f ? 1 : dm <= 10 ? 2 : dm <= 30 ? 3 : 4; }
 /* ---- the labelling pass: blocks ---- */
 static int sl_tile_hits(const sl_tile *t, const double lo[3], const double hi[3]) {
     for (int d = 0; d < 3; d++) if (t->hi[d] < lo[d] || t->lo[d] > hi[d]) return 0;
@@ -271,7 +273,8 @@ static void sl_raster_tile(const sl_job *J, const sl_tile *t, const int64_t o[3]
             const size_t vi = ((size_t)vox[0] * N + vox[1]) * N + vox[2];
             const uint8_t code = sl_code(w00 * q[0] + w01 * q[1] + w10 * q[2] + w11 * q[3]);
             if (bad && !drop[vi]) drop[vi] = (uint8_t)bad;
-            if (codes[vi] == 0) { codes[vi] = code; wid[vi] = (uint16_t)(t->wi + 1); if (cell) { cell[vi] = cid; if (J->an_mode == 1) atomic_fetch_add_explicit(&J->an_pres[cid], 1, memory_order_relaxed); } }
+            if (codes[vi] == 0) { codes[vi] = code; wid[vi] = (uint16_t)(t->wi + 1); if (cell) { cell[vi] = cid; if (J->an_mode == 1) { atomic_fetch_add_explicit(&J->an_pres[cid], 1, memory_order_relaxed);
+                    for (int d = 0; d < 3; d++) atomic_fetch_add_explicit(&J->an_cs[3 * (size_t)cid + d], o[d] + vox[d], memory_order_relaxed); } } }
             else if (codes[vi] != 255 && abs(sl_cdiff(codes[vi], code)) > 4) codes[vi] = 255;
         }
     }
@@ -403,7 +406,8 @@ static int sl_block(sl_job *J, sl_scratch *X, int si, int bk, int tid) {
             if (!ig0) { cgk[rb]++; cg10[rb] += d < 0.1; cg25[rb] += d < 0.25; }
             const int bin = phase_agree_bin(d);
             gtk++; g10 += d < 0.1; g25 += d < 0.25; gb[bin]++;
-            if (!ig) { kgtk++; kg10 += d < 0.1; kg25 += d < 0.25; kb[bin]++; }
+            if (!ig) { kgtk++; kg10 += d < 0.1; kg25 += d < 0.25; kb[bin]++;
+                       if (J->an_dist && X->lo[i] >= 0) { const int db = an_dbin(J->an_dist[X->cell[X->lo[i]]]); if (db >= 0) { atomic_fetch_add_explicit(&J->dk_gk[db], 1, memory_order_relaxed); atomic_fetch_add_explicit(&J->dk_g25[db], d < 0.25, memory_order_relaxed); } } }
             if (w) { atomic_fetch_add_explicit(&w->gk, 1, memory_order_relaxed); atomic_fetch_add_explicit(&w->g10, d < 0.1, memory_order_relaxed); atomic_fetch_add_explicit(&w->g25, d < 0.25, memory_order_relaxed);
                      if (!ig) { atomic_fetch_add_explicit(&w->kgk, 1, memory_order_relaxed); atomic_fetch_add_explicit(&w->kg10, d < 0.1, memory_order_relaxed); atomic_fetch_add_explicit(&w->kg25, d < 0.25, memory_order_relaxed); } }
         }
@@ -413,7 +417,7 @@ static int sl_block(sl_job *J, sl_scratch *X, int si, int bk, int tid) {
             if (h < J->pa_T) {
                 const double wo = (X->codes[X->lo[i]] - 1) / 18.0 + (double)ph / PHASE_PERIOD, d = wo - (gc - 1) / 18.0;
                 if (R->n == R->cap) { R->cap = R->cap ? 2 * R->cap : 4096; R->r = realloc(R->r, R->cap * sizeof *R->r); }
-                R->r[R->n++] = (sl_rec){{(float)(gz * mm), (float)(gy * mm), (float)(gx * mm)}, (float)d, r, h, (uint8_t)gc};
+                R->r[R->n++] = (sl_rec){{(float)(gz * mm), (float)(gy * mm), (float)(gx * mm)}, (float)d, r, J->an_dist ? J->an_dist[X->cell[X->lo[i]]] : NAN, h, (uint8_t)gc};
             }
         }
     }
@@ -487,7 +491,7 @@ static int an_neighbours(const sl_job *J, uint32_t c, uint32_t nb[4]) {   /* alo
     else { const int k = an_index_of_id(J, w->id - (int)J->dir); if (k >= 0 && cr < J->W[k].ncr) nb[n++] = J->W[k].cbase + (uint32_t)(cr * ns + ns - 1); }
     return n;
 }
-static int an_assign(sl_job *J, const char *out, int nmin, double smin, int reach) {
+static int an_assign(sl_job *J, const char *out, int nmin, double smin, double reach) {
     const uint32_t nc = J->ncell; float *D = malloc((size_t)nc * 4); uint8_t *st = calloc(nc, 1); int32_t *dist = malloc((size_t)nc * 4); uint32_t *qu = malloc((size_t)nc * 4);
     if (!D || !st || !dist || !qu) return -1;
     size_t qn = 0;
@@ -510,24 +514,43 @@ static int an_assign(sl_job *J, const char *out, int nmin, double smin, int reac
             const int k = an_index_of_id(J, id); if (k < 0 || row0 < 0 || sc < 0 || sc >= J->an_ns || row0 / J->an_cr >= J->W[k].ncr) continue;
             const uint32_t c = J->W[k].cbase + (uint32_t)((row0 / J->an_cr) * J->an_ns + sc); if (st[c] != AN_KNOWN) { st[c] = AN_MASK; nbrk++; } }
         fclose(f); } }
-    for (size_t qh = 0; qh < qn; qh++) {   /* propagation along the surface (BFS: the nearest anchored cell's offset), through present, unmasked cells */
-        const uint32_t c = qu[qh]; if (dist[c] >= reach) continue;
-        uint32_t nb[4]; const int k = an_neighbours(J, c, nb);
-        for (int j = 0; j < k; j++) { const uint32_t e = nb[j]; if (dist[e] >= 0 || !J->an_pres[e] || st[e] == AN_MASK) continue;
-            dist[e] = dist[c] + 1; D[e] = D[c]; st[e] = AN_PROP; qu[qn++] = e; }
-    }
+    /* propagation along the surface: Dijkstra over cell centres (mm), the nearest voted cell's offset, through present, unmasked cells */
+    float *dm = malloc((size_t)nc * 4); float *cen = malloc((size_t)nc * 12); if (!dm || !cen) return -1;
+    for (uint32_t c = 0; c < nc; c++) { dm[c] = st[c] == AN_KNOWN ? 0.f : INFINITY; const double p = J->an_pres[c];
+        for (int d = 0; d < 3; d++) cen[3 * c + d] = p ? (float)(J->an_cs[3 * (size_t)c + d] / p * J->gum * 1e-3) : NAN; }
+    { size_t hn = qn, hc = qn + 16; uint32_t *hp = malloc(hc * 4); memcpy(hp, qu, qn * 4);   /* binary heap on dm */
+      #define HLESS(a, b) (dm[hp[a]] < dm[hp[b]] || (dm[hp[a]] == dm[hp[b]] && hp[a] < hp[b]))
+      for (size_t i = hn / 2; i-- > 0;) { size_t j = i; for (;;) { size_t l = 2 * j + 1, m = j; if (l < hn && HLESS(l, m)) m = l; if (l + 1 < hn && HLESS(l + 1, m)) m = l + 1; if (m == j) break; uint32_t t = hp[j]; hp[j] = hp[m]; hp[m] = t; j = m; } }
+      uint8_t *done = calloc(nc, 1);
+      while (hn) {
+          const uint32_t c = hp[0]; hp[0] = hp[--hn];
+          { size_t j = 0; for (;;) { size_t l = 2 * j + 1, m = j; if (l < hn && HLESS(l, m)) m = l; if (l + 1 < hn && HLESS(l + 1, m)) m = l + 1; if (m == j) break; uint32_t t = hp[j]; hp[j] = hp[m]; hp[m] = t; j = m; } }
+          if (done[c]) continue;
+          done[c] = 1; if (dm[c] > reach) continue;
+          uint32_t nb[4]; const int k = an_neighbours(J, c, nb);
+          for (int j = 0; j < k; j++) { const uint32_t e = nb[j]; if (done[e] || !J->an_pres[e] || st[e] == AN_MASK || st[e] == AN_KNOWN) continue;
+              float dd = 0; for (int d = 0; d < 3; d++) { const float t = cen[3 * e + d] - cen[3 * c + d]; dd += t * t; } dd = sqrtf(dd); if (!isfinite(dd)) continue;
+              if (dm[c] + dd < dm[e]) { dm[e] = dm[c] + dd; D[e] = D[c]; st[e] = AN_PROP;
+                  if (hn == hc) { hc *= 2; hp = realloc(hp, hc * 4); }
+                  size_t j2 = hn++; hp[j2] = e; while (j2 && HLESS(j2, (j2 - 1) / 2)) { uint32_t t = hp[j2]; hp[j2] = hp[(j2 - 1) / 2]; hp[(j2 - 1) / 2] = t; j2 = (j2 - 1) / 2; } } }
+      }
+      #undef HLESS
+      free(hp); free(done); }
+    for (uint32_t c = 0; c < nc; c++) if (st[c] == AN_PROP && dm[c] > reach) { st[c] = AN_FAR; D[c] = NAN; dm[c] = INFINITY; }
+    qn = 0; for (uint32_t c = 0; c < nc; c++) qn += st[c] == AN_KNOWN || st[c] == AN_PROP;
+    free(cen);
     /* fronts of different offsets meeting: the propagated cells next to a cell of another offset (> 1/4 turn) are masked */
     uint8_t *mk = calloc(nc, 1); long nfront = 0;
     for (uint32_t c = 0; c < nc; c++) { if (st[c] != AN_PROP) continue; uint32_t nb[4]; const int k = an_neighbours(J, c, nb);
         for (int j = 0; j < k; j++) if (isfinite(D[nb[j]]) && fabs(an_cdiff(D[c], D[nb[j]])) > 0.25) { mk[c] = 1; break; } }
-    for (uint32_t c = 0; c < nc; c++) if (mk[c]) { st[c] = AN_MASK; D[c] = NAN; nfront++; }
+    for (uint32_t c = 0; c < nc; c++) if (mk[c]) { st[c] = AN_MASK; D[c] = NAN; dm[c] = INFINITY; nfront++; }
     free(mk);
     /* the file: header, per wrap id + h, then D (float) and status (uint8) per cell */
     FILE *f = fopen(out, "wb"); if (!f) { fprintf(stderr, "wrap-anchor: cannot write %s\n", out); return -1; }
     const int32_t hd[5] = {J->nw, J->an_cr, J->an_ns, (int32_t)J->dir, (int32_t)nc};
-    fwrite("UFSMANC1", 1, 8, f); fwrite(hd, 4, 5, f);
+    fwrite("UFSMANC2", 1, 8, f); fwrite(hd, 4, 5, f);
     for (int k = 0; k < J->nw; k++) { const int32_t a[2] = {J->W[k].id, J->W[k].h}; fwrite(a, 4, 2, f); }
-    fwrite(D, 4, nc, f); fwrite(st, 1, nc, f);
+    fwrite(D, 4, nc, f); fwrite(dm, 4, nc, f); fwrite(st, 1, nc, f);
     if (fclose(f)) return -1;
     /* per-wrap stats (voxel-weighted: the cells' rasterised voxels) */
     char tp[1600]; snprintf(tp, sizeof tp, "%s.tsv", out); FILE *t = fopen(tp, "w"); if (!t) return -1;
@@ -549,17 +572,17 @@ static int an_assign(sl_job *J, const char *out, int nmin, double smin, int reac
     fclose(t);
     printf("wrap-anchor: %u cells, %ld anchored by votes, %ld propagated, %ld masked at offset fronts, %ld patch breaks; voxel shares: anchored %.4f, masked %.4f -> %s (+ .tsv)\n",
            nc, nknown, (long)qn - nknown, nfront, nbrk, tv ? ta / tv : 0, tv ? tm / tv : 0, out);
-    free(D); free(st); free(dist); free(qu);
+    free(D); free(st); free(dist); free(qu); free(dm);
     return 0;
 }
 static int an_load(sl_job *J, const char *p) {
     FILE *f = fopen(p, "rb"); if (!f) { fprintf(stderr, "surf-labels: cannot read --anchor %s\n", p); return -1; }
     char mg[8]; int32_t hd[5];
-    if (fread(mg, 1, 8, f) != 8 || memcmp(mg, "UFSMANC1", 8) || fread(hd, 4, 5, f) != 5 || hd[0] != J->nw || hd[1] != J->an_cr || hd[2] != J->an_ns || hd[3] != (int32_t)J->dir || (uint32_t)hd[4] != J->ncell) {
+    if (fread(mg, 1, 8, f) != 8 || memcmp(mg, "UFSMANC2", 8) || fread(hd, 4, 5, f) != 5 || hd[0] != J->nw || hd[1] != J->an_cr || hd[2] != J->an_ns || hd[3] != (int32_t)J->dir || (uint32_t)hd[4] != J->ncell) {
         fprintf(stderr, "surf-labels: --anchor %s: not for these wraps (wrap count / --anchor-cell / dir / cells differ)\n", p); fclose(f); return -1; }
     for (int k = 0; k < J->nw; k++) { int32_t a[2]; if (fread(a, 4, 2, f) != 2 || a[0] != J->W[k].id || a[1] != J->W[k].h) { fprintf(stderr, "surf-labels: --anchor %s: wrap w%03d differs\n", p, J->W[k].id); fclose(f); return -1; } }
-    J->an_d = malloc((size_t)J->ncell * 4);
-    if (!J->an_d || fread(J->an_d, 4, J->ncell, f) != J->ncell) { fclose(f); return -1; }
+    J->an_d = malloc((size_t)J->ncell * 4); J->an_dist = malloc((size_t)J->ncell * 4);
+    if (!J->an_d || !J->an_dist || fread(J->an_d, 4, J->ncell, f) != J->ncell || fread(J->an_dist, 4, J->ncell, f) != J->ncell) { fclose(f); return -1; }
     fclose(f); return 0;
 }
 
@@ -678,7 +701,7 @@ int cmd_surf_labels(int argc, char **argv) {
         uint64_t tot = 0; for (int k = 0; k < nw; k++) { W[k].cbase = (uint32_t)tot; W[k].ncr = (W[k].h + J.an_cr - 1) / J.an_cr; tot += (uint64_t)W[k].ncr * J.an_ns; }
         if (tot >= 0xffffffffull) { fprintf(stderr, "surf-labels: too many anchor cells\n"); return 1; }
         J.ncell = (uint32_t)tot;
-        if (J.an_mode == 1) { J.an_hist = calloc((size_t)tot * AN_BINS, 4); J.an_pres = calloc(tot, 4); if (!J.an_hist || !J.an_pres) { fprintf(stderr, "wrap-anchor: no memory for %llu cells\n", (unsigned long long)tot); return 1; } }
+        if (J.an_mode == 1) { J.an_hist = calloc((size_t)tot * AN_BINS, 4); J.an_pres = calloc(tot, 4); J.an_cs = calloc(3 * tot, 8); if (!J.an_hist || !J.an_pres || !J.an_cs) { fprintf(stderr, "wrap-anchor: no memory for %llu cells\n", (unsigned long long)tot); return 1; } }
     }
     if (dir_auto) {   /* the spiral sense: wrap k's theta = pi end meets wrap k + dir's theta = -pi start (W = U - dir theta / 2 pi = k) */
         long vp = 0, vm = 0;
@@ -853,6 +876,16 @@ int cmd_surf_labels(int argc, char **argv) {
           g.n = k2; pa_score(&g, mmv, 4, 200000, 0x5eed, a, ac, na, nc); free(g.r); }
         printf("surf-labels: pair winding right vs GT (%zu records):", all.n);
         for (int k = 0; k < 4; k++) printf(" %g mm %.4f cross %.4f (%zu / %zu)%s", mmv[k], a[k], ac[k], na[k], nc[k], k < 3 ? " |" : "\n");
+        if (J.an_dist) {   /* anchors: accuracy against the distance along the surface to the nearest voted cell */
+            static const char *dl[5] = {"voted", "0-2.5mm", "2.5-10mm", "10-30mm", "30+mm"};
+            printf("surf-labels: anchored accuracy vs distance to the nearest voted cell:\n  dist      gt_both      |d|<.25  pairs 0.5mm 1mm   2mm   4mm\n");
+            for (int b = 0; b < 5; b++) {
+                size_t k2 = 0; pa_buf g = all; g.r = malloc((n ? n : 1) * sizeof *g.r);
+                for (size_t k = 0; k < n; k++) if (an_dbin(tmp[k].dm) == b) g.r[k2++] = all.r[k];
+                g.n = k2; double a2[4] = {NAN, NAN, NAN, NAN}, ac2[4]; size_t na2[4], nc2[4]; if (k2 > 100) pa_score(&g, mmv, 4, 100000, 0x5eed, a2, ac2, na2, nc2); free(g.r);
+                printf("  %-9s %-12lld %.4f   %.4f %.4f %.4f %.4f  (%zu records)\n", dl[b], (long long)J.dk_gk[b], J.dk_gk[b] ? (double)J.dk_g25[b] / J.dk_gk[b] : 0, a2[0], a2[1], a2[2], a2[3], k2);
+            }
+        }
         if (J.ct && J.coh_cell > 0) {   /* the coherence gate's curve: per threshold, kept share, phase agreement and pair accuracy */
             long long tk = 0; for (int b = 0; b <= COH_BINS; b++) tk += J.ch_kn[b];
             printf("surf-labels: CT coherence curve (cell %d voxels; voxels not ignored otherwise; r >= t kept, no-coherence cells dropped):\n  t      kept_share  gt_both      |d|<.25  |d|<.1   pairs 0.5mm 1mm   2mm   4mm\n", J.coh_cell);
@@ -872,7 +905,7 @@ int cmd_surf_labels(int argc, char **argv) {
         free(all.r);
     } else { for (int t = 0; t < nt; t++) free(J.recs[t].r); }
     free(J.recs);
-    if (J.an_mode == 1 && an_assign(&J, out, atoi(sl_opt(argc, argv, "--anchor-min", "20")), atof(sl_opt(argc, argv, "--anchor-share", "0.7")), atoi(sl_opt(argc, argv, "--anchor-reach", "1000000")))) return 1;
+    if (J.an_mode == 1 && an_assign(&J, out, atoi(sl_opt(argc, argv, "--anchor-min", "20")), atof(sl_opt(argc, argv, "--anchor-share", "0.7")), atof(sl_opt(argc, argv, "--anchor-reach-mm", "1e9")))) return 1;
     const char *tsv = sl_opt(argc, argv, "--tsv", nullptr);
     if (tsv) {
         FILE *f = fopen(tsv, "w"); if (!f) { fprintf(stderr, "surf-labels: cannot write %s\n", tsv); return 1; }
@@ -883,7 +916,7 @@ int cmd_surf_labels(int argc, char **argv) {
         fclose(f);
     }
     for (int k = 0; k < nw; k++) { free(W[k].rz0); free(W[k].rz1); free(W[k].badrow); free(W[k].badcell); free(W[k].ra); free(W[k].rb); sfc_cache_destroy(W[k].ca); sfc_close(W[k].r); }
-    free(W); free(J.hold); free((void *)J.an_hist); free((void *)J.an_pres); free(J.an_d);
+    free(W); free(J.hold); free((void *)J.an_hist); free((void *)J.an_pres); free((void *)J.an_cs); free(J.an_d); free(J.an_dist);
     if (J.ct) z3_close(J.ct);
     if (J.gt) z3_close(J.gt);
     return 0;
