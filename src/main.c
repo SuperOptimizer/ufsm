@@ -58,6 +58,7 @@ int cmd_refine(int argc, char **argv);       /* src/surf.c */
 int cmd_surf_stats(int argc, char **argv);
 int cmd_wrap_snap(int argc, char **argv);   /* src/wrapsnap.c */
 int cmd_surf_labels(int argc, char **argv);   /* src/surflabels.c */
+int cmd_side_face(int argc, char **argv);   /* src/sideface.c */
 int cmd_patch_id(int argc, char **argv);   /* src/patchid.c */
 int cmd_recto_ruler(int argc, char **argv);   /* src/rectoruler.c */
 int cmd_recto_cls(int argc, char **argv);   /* src/rectocls.c */
@@ -234,6 +235,7 @@ static int usage(void) {
         "  ufsm store-bench <root> <array-key> [--box 128,256,512] [--n 8] [--par 1] [--threads 16]   HTTP zarr fetch benchmark\n"
         "  ufsm phase-pack ROOT KEY OUT --row R [--level 19] [--threads 8] / phase-unpack IN DIR / phase-cmp RA KA RB KB --row R   6-bit phase-label transfer\n"
         "  ufsm papyrus-labels <ct-root> <ct-key> <out-group> --box z,y,x,nz,ny,nx   papyrus / void training labels of a CT box (gap labels, no cutoff)\n"
+        "  ufsm side-face <phase-root> <phase-key> <ct-root> <ct-key> <out-group> <out-um> [--iso 64]   face-anchored phase: each wrap moved onto its sheet's recto face (train --rv labels)\n"
         "  ufsm overlay <out.png> <ct-root> <ct-key> --plane z,y,x,h,w --labels G1,G2   a CT plane beside label panels (void blue, ignored yellow)\n"
         "root: local dir or https://.../volcomp ; keys are paths under root\n");
     return 2;
@@ -4599,6 +4601,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "surf-stats")) return cmd_surf_stats(argc, argv);
     if (!strcmp(cmd, "wrap-snap")) return cmd_wrap_snap(argc, argv);
     if (!strcmp(cmd, "surf-labels") || !strcmp(cmd, "wrap-anchor")) return cmd_surf_labels(argc, argv);
+    if (!strcmp(cmd, "side-face")) return cmd_side_face(argc, argv);
     if (!strcmp(cmd, "surf-labels")) return cmd_surf_labels(argc, argv);
     if (!strcmp(cmd, "patch-id")) return cmd_patch_id(argc, argv);
     if (!strcmp(cmd, "recto-ruler")) return cmd_recto_ruler(argc, argv);
