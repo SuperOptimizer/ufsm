@@ -8,6 +8,11 @@
 #   holdouts: $HO boxes of this CT + 0.5 mm -> ignore 4;
 #   fixed surfaces: WSRC=<dir> uses <dir>/S/wraps_snap (else <dir>/S/wraps) first (e.g. /vesuvius/ufsm/v2/count/unroll), with its
 #   wrapcheck.tsv; GEOM=<dir> adds --geom <dir>/S (geom-check output of those wraps); ROWS=a,b adds --rows a,b (end caps).
+# Scope (main 11-02): labels whose turn counts come from our fit alone carry its count errors (P4 4 mm pairs ~.30): they are LOCAL
+#   (sheet position, normals, short-range pairs, ink; no long-range winding / count loss). ANCH=<anchor file(s), comma list> (ufsm
+#   wrap-anchor from published GT, all GT votes: no --gt-split) adds --anchor: only anchored cells labelled (unanchored -> ignore 7),
+#   counts corrected -> GLOBAL. Write the local set to $OUT (default V2/labels) and the anchored set to OUT=V2/labels_anch.
+#   $O/scope holds "local" or "global"; scripts/v2/mksources.sh tags each source with it ("scope": "local" | "global").
 # Output $OUT/S/{codes,phase,ignore}.zarr/<grid um>, surflabels.log, wraps.tsv, phasecheck.txt, done marker. Env: U (ufsm binary), TH.
 set -uo pipefail
 S=$1; shift
@@ -28,12 +33,14 @@ gum=$(awk -v u=$ctum -v l=$ctlev 'BEGIN {printf "%.10g", u * 2 ^ l}')
 gates=(); [ -s "$wc" ] && gates+=(--wrapcheck $wc); [ -n "${PEAKS:-}" ] && gates+=(--band-peaks $PEAKS)
 op=${ONPAP:-0.2}; [ "$op" != 0 ] && gates+=(--min-onpap $op)
 [ -n "${GEOM:-}" ] && [ -s ${GEOM}/$S/cells.tsv ] && gates+=(--geom $GEOM/$S); [ -n "${ROWS:-}" ] && gates+=(--rows $ROWS)
+an=(); scope=local; [ -n "${ANCH:-}" ] && { an=(--anchor $ANCH); scope=global; }
 ho=(); [ -s "$HO" ] && ho=(--exclude $HO --exclude-ct "$(basename $ctk)" --exclude-mm 0.5)
-echo "surflabels $S: $src wraps $W, trim ${trim[*]:-none}, grid $gum um (level $ctlev), gates ${gates[*]}" > $O/surflabels.log
+echo "surflabels $S: $src wraps $W, trim ${trim[*]:-none}, grid $gum um (level $ctlev), gates ${gates[*]}, scope $scope ${an[*]}" > $O/surflabels.log
 rm -rf $O/codes.zarr $O/phase.zarr $O/ignore.zarr
 /usr/bin/time -v nice -n 10 $U surf-labels $W $O --axis $ax --axis-um $ctum --dir auto --grid-um $gum --like $CTL $ctk/$ctlev --ct $CTL $ctk/$ctlev \
-  "${trim[@]}" "${gates[@]}" "${ho[@]}" --tsv $O/wraps.tsv --threads $TH "$@" >> $O/surflabels.log 2>&1 || { echo "surflabels $S: FAILED" >> $O/surflabels.log; exit 1; }
+  "${trim[@]}" "${gates[@]}" "${an[@]}" "${ho[@]}" --tsv $O/wraps.tsv --threads $TH "$@" >> $O/surflabels.log 2>&1 || { echo "surflabels $S: FAILED" >> $O/surflabels.log; exit 1; }
 key=$(ls $O/phase.zarr | grep -v zarr.json | head -1)
 $U phase-check $O/phase.zarr $key --axis $ax --scan-um $ctum --phase-um $gum --threads $TH > $O/phasecheck.txt 2>> $O/surflabels.log
 echo "$S $src $(grep -o 'kept share [0-9.]*' $O/surflabels.log) $(grep -oE 'outward [0-9.]+' $O/phasecheck.txt) $(grep -oE 'pass|FAIL' $O/phasecheck.txt | tail -1)" | tee -a $O/surflabels.log
+echo $scope > $O/scope
 touch $O/done

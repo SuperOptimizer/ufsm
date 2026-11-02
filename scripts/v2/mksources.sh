@@ -6,6 +6,11 @@
 #     prob254, ift3-24000 in the recto band; source "ink_weight" PINKW 0.3, human ink 1 = V2TRAIN's per-source ink loss weight) when it exists
 #     + "focus" (phase-packing --map of the labels, w FOCUSW 2: packed chunks drawn more often). Weights by labelled mm3
 #     (phase-packing's labelled voxels with neighbours x um^3), sharing SURF (0.60) of the total.
+#     Scope (11-02): every surface source carries "scope" from V2/labels/<S>/scope ("local" when absent): our fit's turn counts are
+#     only locally right, so a "local" source trains sheet position / normals / short-range pairs / ink but NOT the long-range winding
+#     (wind mod 4) or count losses (V2TRAIN's sampler / loss honour "scope"). Where published GT anchors exist (V2/labels_anch/<S>,
+#     surflabels.sh ANCH=..., scope "global"), a second source "<S>-v2anch" with the anchored phase (unanchored voxels unknown) and all
+#     losses, weight x ANCHW (1) by its own labelled mm3 within the same SURF share.
 #  2. Paris 4 GT (PK8: june / july phaseA/B + its PH1-3 / HOLD holdout dummies, CT root -> V2/ct): GTSHARE (0.25) of the total, so the
 #     published GT outweighs any single surface source (high weight).
 #  3. human ink sources (scripts/v2/inkhuman.tsv = ift3's tight human ink-splat sets, V2/ink/human/tight; 0139 / 1667 left out):
@@ -37,18 +42,30 @@ tail -n +2 $V2/scrolls.tsv | while IFS=$'\t' read -r S SPLIT NW WR WC SJ SL AX C
   mm3=$(awk -v n=${nk:-0} -v u=$key 'BEGIN { printf "%.2f", n * u * u * u * 1e-9 }')
   [ "$CR" != - ] || { echo "mksources: $S: CT not fetched yet, left out" >&2; continue; }
   ink=-; [ -e $V2/ink/pseudo/$S.done ] && ink=$V2/ink/pseudo/$S.zarr
-  echo "$S $CR $K $UM $LV $AX $key $mm3 $ink" >> $T/surf.txt
+  sc=local; [ -s $V2/labels/$S/scope ] && sc=$(cat $V2/labels/$S/scope)
+  echo "$S $CR $K $UM $LV $AX $key $mm3 $ink $V2/labels/$S/phase.zarr $sc $S-v2surf" >> $T/surf.txt
+  A=$V2/labels_anch/$S/phase.zarr   # (anchored: global; the focus map of the local set, same grid)
+  if [ -e $V2/labels_anch/$S/done ] && [ -d $A ]; then
+    Fa=$V2/focus/$S-anch
+    if [ ! -s $Fa.txt ] || [ $A/$key/zarr.json -nt $Fa.txt ]; then
+      read -r fz fy fx < <(jq -r '.shape | map(tostring) | join(" ")' $A/$key/zarr.json)
+      $U phase-packing $A $key --um $key --box 0,0,0,$fz,$fy,$fx --threads $TH > $Fa.txt 2>&1 || { echo "mksources: $S: anchored phase-packing failed" >&2; continue; }
+    fi
+    na=$(sed -nE 's/.*: ([0-9]+) labelled voxels with neighbours.*/\1/p' $Fa.txt | head -1)
+    ma=$(awk -v n=${na:-0} -v u=$key -v a=${ANCHW:-1} 'BEGIN { printf "%.2f", a * n * u * u * u * 1e-9 }')
+    echo "$S $CR $K $UM $LV $AX $key $ma - $A global $S-v2anch" >> $T/surf.txt
+  fi
 done
 [ -s $T/surf.txt ] || { echo "mksources: no labelled train scroll yet" >&2; exit 1; }
 SV=$(awk -v m=${MINMM3:-1} '$8 >= m { s += $8 } END { print s + 0 }' $T/surf.txt)
 printf "%-14s %10s %8s %s\n" scroll mm3 weight pseudo-ink >&2
-while read -r S CR K UM LV AX key mm3 ink; do
+while read -r S CR K UM LV AX key mm3 ink PR SC NAME; do
   awk -v m=$mm3 -v t=${MINMM3:-1} 'BEGIN { exit !(m >= t) }' || { printf "%-14s %10s (left out: < MINMM3)\n" $S $mm3 >&2; continue; }
   w=$(awk -v m=$mm3 -v v=$SV -v s=$SURF 'BEGIN { printf "%.6f", s * m / v }')
-  printf "%-14s %10s %8s %s\n" $S $mm3 $w $ink >&2
-  jq -nc --arg n "$S-v2surf" --arg r $CR --arg c $K --argjson um $UM --argjson lv $LV --arg ax $AX --argjson w $w --arg pr $V2/labels/$S/phase.zarr \
+  printf "%-14s %10s %8s %s %s\n" $NAME $mm3 $w $SC $ink >&2
+  jq -nc --arg n "$NAME" --arg sc $SC --arg r $CR --arg c $K --argjson um $UM --argjson lv $LV --arg ax $AX --argjson w $w --arg pr $PR \
      --arg pk $key --arg ink $ink --argjson iw $PINKW --arg fm $V2/focus/$S.raw --argjson fw $FOCUSW \
-    '{name: $n, root: $r, ct: $c, um: $um, weight: $w} + (if $ax != "-" then {axis: $ax} else {} end)
+    '{name: $n, scope: $sc, root: $r, ct: $c, um: $um, weight: $w} + (if $ax != "-" then {axis: $ax} else {} end)
      + (if $lv == 2 then {min_level: 2, max_level: 2} else {min_level: 0, max_level: 0} end)
      + {targets: ({band: {radius: 20, span: 19, phase: {root: $pr, key: $pk, level: $lv}}}
                   + (if $ink != "-" then {ink: {root: $ink, group: ".", encoding: "prob254"}} else {} end)),
