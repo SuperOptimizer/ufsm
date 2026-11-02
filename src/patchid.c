@@ -25,6 +25,7 @@
 #include "store.h"
 #include "surfcomp.h"
 #include "sysinfo.h"
+#include "zarr2.h"
 #include "zarr3.h"
 #include <dirent.h>
 #include <math.h>
@@ -162,7 +163,7 @@ static void pi_lpush(pi_links *L, pi_link x) { if (L->n == L->cap) { L->cap = L-
 typedef struct {
     pi_wrap *W; int nw; axis *ax; double s0, f, dir;
     int B, BAND, nby, nbx, nbz; int64_t o[3];   /* band origin (z, y, x) in grid voxels; band extent BAND x nby B x nbx B */
-    int asplit;   /* --anchor-split S: GT votes for the patch ids only from z slabs floor(z / S) even, scores only on the odd ones */
+    int asplit;   /* --anchor-split-mm M (S = M in grid rows): GT votes for the patch ids only from z blocks floor(z / S) even (surf-labels --gt-half A), scores only on the odd ones (B) */
     int64_t NY, NX; uint8_t thr; int min_comp, range, gt_range, min_link, bad_gap; double ratio; _Atomic long long nbad;
     uint8_t *sheet, *gt; uint16_t *lab; uint32_t *base; uint16_t *ncomp; float *phi;   /* per band block: atom count, centre angle (NAN: skipped) */
     uint32_t *prev; float *prev_phi; int have_prev;   /* the previous band's last z plane: global atom ids (PI_NONE) and its block angles */
@@ -453,6 +454,17 @@ static int pi_cmp_vote(const void *a, const void *b) { const pi_vote *x = a, *y 
 typedef struct { uint32_t root; int Jstar, ok; uint32_t votes; double share, purity; int Gmode; } pi_patch;
 static int pi_cmp_patch(const void *a, const void *b) { const pi_patch *x = a, *y = b; return (x->root > y->root) - (x->root < y->root); }
 
+/* a uint8 volume: zarr v3 (ours) or v2 (the upstream predictions), with an optional disk cache for HTTP roots */
+typedef struct { z3 *a; z2 *b; const int64_t *shape; } pi_vol;
+static int pi_vopen(pi_vol *v, const char *root, const char *key, const char *cache) {
+    memset(v, 0, sizeof *v);
+    if ((v->a = z3_open(store_open(root), key, cache))) { v->shape = z3_meta_of(v->a)->shape; return 0; }
+    if ((v->b = z2_open(store_open(root), key, cache))) { z2_assume_present(v->b, 1); v->shape = z2_meta_of(v->b)->shape; return 0; }
+    fprintf(stderr, "patch-id: cannot open %s %s (%s / %s)\n", root, key, z3_error(), z2_error()); return -1;
+}
+static int pi_vread(pi_vol *v, const int64_t o[3], const int64_t n[3], uint8_t *out, int nt) { return v->a ? z3_read(v->a, o, n, out, nt) : z2_read(v->b, o, n, out, nt); }
+static void pi_vclose(pi_vol *v) { if (v->a) z3_close(v->a); if (v->b) z2_close(v->b); }
+
 static int pi_cmpu(const void *a, const void *b) { const uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b; return (x > y) - (x < y); }
 
 int cmd_patch_id(int argc, char **argv) {
@@ -469,7 +481,7 @@ int cmd_patch_id(int argc, char **argv) {
     J.B = atoi(pi_opt(argc, argv, "--block", "32")); J.BAND = atoi(pi_opt(argc, argv, "--band", "64"));
     J.thr = (uint8_t)atoi(pi_opt(argc, argv, "--thr", "1")); J.min_comp = atoi(pi_opt(argc, argv, "--min-comp", "8"));
     J.range = atoi(pi_opt(argc, argv, "--range", "3")); J.gt_range = atoi(pi_opt(argc, argv, "--gt-range", "4"));
-    J.min_link = atoi(pi_opt(argc, argv, "--min-link", "16")); J.bad_gap = atoi(pi_opt(argc, argv, "--bad-gap", "2")); J.asplit = atoi(pi_opt(argc, argv, "--anchor-split", "0")); J.ratio = atof(pi_opt(argc, argv, "--ratio", "0.3"));
+    J.min_link = atoi(pi_opt(argc, argv, "--min-link", "16")); J.bad_gap = atoi(pi_opt(argc, argv, "--bad-gap", "2")); J.ratio = atof(pi_opt(argc, argv, "--ratio", "0.3"));
     const long long min_votes = atoll(pi_opt(argc, argv, "--min-votes", "500")); const double min_share = atof(pi_opt(argc, argv, "--min-share", "0.5"));
     if (sscanf(pi_opt(argc, argv, "--cells", "32,32"), "%d,%d", &J.CR, &J.NS) != 2 || J.CR < 1 || J.NS < 1) { fprintf(stderr, "patch-id: --cells R,S\n"); return 2; }
     J.dir = dir;
@@ -479,11 +491,14 @@ int cmd_patch_id(int argc, char **argv) {
     }
     axis ax = {0}; if (axis_load(&ax, axp)) { fprintf(stderr, "patch-id: cannot load the axis %s\n", axp); return 1; }
     J.ax = &ax;
-    z3 *zs = z3_open(store_open(argv[si + 1]), argv[si + 2], nullptr); if (!zs) { fprintf(stderr, "patch-id: --sheet: %s\n", z3_error()); return 1; }
-    const int64_t *shape = z3_meta_of(zs)->shape;
-    z3 *zg = nullptr;
-    { const int gi = pi_idx(argc, argv, "--gt"); if (gi > 0) { if (gi + 2 >= argc) return 2; zg = z3_open(store_open(argv[gi + 1]), argv[gi + 2], nullptr);
-        if (!zg || memcmp(z3_meta_of(zg)->shape, shape, 3 * sizeof *shape)) { fprintf(stderr, "patch-id: --gt %s %s: cannot open or not on the sheet grid\n", argv[gi + 1], argv[gi + 2]); return 1; } } }
+    const char *cache = pi_opt(argc, argv, "--cache", nullptr);
+    pi_vol VS, VG = {0}; if (pi_vopen(&VS, argv[si + 1], argv[si + 2], cache)) return 1;
+    const int64_t *shape = VS.shape;
+    pi_vol *zg = nullptr; int gs = 1;   /* gs: the GT grid is gs x coarser than the sheet grid (1 or 2; e.g. 0139's 18.72 um codes) */
+    { const int gi = pi_idx(argc, argv, "--gt"); if (gi > 0) { if (gi + 2 >= argc) return 2; if (pi_vopen(&VG, argv[gi + 1], argv[gi + 2], cache)) return 1; zg = &VG;
+        int ok = 0; for (gs = 1; gs <= 2 && !ok; gs++) { ok = 1; for (int d = 0; d < 3; d++) if (llabs(VG.shape[d] * gs - shape[d]) > gs - 1 + (gs > 1)) ok = 0; if (ok) break; }
+        if (!ok) { fprintf(stderr, "patch-id: --gt %s %s: not on the sheet grid or 2x coarser\n", argv[gi + 1], argv[gi + 2]); return 1; } } }
+    J.asplit = (int)lround(atof(pi_opt(argc, argv, "--anchor-split-mm", "0")) * 1000 / gum); if (J.asplit < 0) J.asplit = 0;
     /* wraps */
     DIR *dd = opendir(in); if (!dd) { fprintf(stderr, "patch-id: cannot open %s\n", in); return 1; }
     int nw = 0, cap = 64; pi_wrap *W = calloc(cap, sizeof *W); struct dirent *de;
@@ -532,10 +547,18 @@ int cmd_patch_id(int argc, char **argv) {
         memset(J.sheet, 0, bvox); if (J.gt) memset(J.gt, 0, bvox);
         { const int64_t o[3] = {z0, oy, ox}, n[3] = {nz, ey - oy, ex - ox};
           uint8_t *tmp = malloc((size_t)n[0] * n[1] * n[2]); if (!tmp) return 1;
-          for (int pass = 0; pass < (zg ? 2 : 1); pass++) {
-              if (z3_read(pass ? zg : zs, o, n, tmp, J.nt)) { fprintf(stderr, "patch-id: %s\n", z3_error()); return 1; }
-              uint8_t *dst = pass ? J.gt : J.sheet;
-              for (int64_t a = 0; a < n[0]; a++) for (int64_t b = 0; b < n[1]; b++) memcpy(dst + ((size_t)a * J.NY + b) * J.NX, tmp + ((size_t)a * n[1] + b) * n[2], (size_t)n[2]);
+          if (pi_vread(&VS, o, n, tmp, J.nt)) { fprintf(stderr, "patch-id: sheet read: %s %s\n", z3_error(), z2_error()); return 1; }
+          for (int64_t a = 0; a < n[0]; a++) for (int64_t b = 0; b < n[1]; b++) memcpy(J.sheet + ((size_t)a * J.NY + b) * J.NX, tmp + ((size_t)a * n[1] + b) * n[2], (size_t)n[2]);
+          if (zg) {   /* the GT band (on its grid, gs x coarser: nearest upsampling) */
+              int64_t go[3], gn[3]; for (int d = 0; d < 3; d++) { go[d] = o[d] / gs; gn[d] = (o[d] + n[d] - 1) / gs - go[d] + 1; if (go[d] + gn[d] > VG.shape[d]) gn[d] = VG.shape[d] - go[d]; }
+              uint8_t *gb = gs == 1 ? tmp : malloc((size_t)gn[0] * gn[1] * gn[2]);
+              if (!gb || pi_vread(&VG, go, gn, gb, J.nt)) { fprintf(stderr, "patch-id: GT read: %s %s\n", z3_error(), z2_error()); return 1; }
+              for (int64_t a = 0; a < n[0]; a++) { const int64_t ga = (o[0] + a) / gs - go[0]; if (ga >= gn[0]) continue;
+                  for (int64_t b = 0; b < n[1]; b++) { const int64_t gy = (o[1] + b) / gs - go[1]; if (gy >= gn[1]) continue;
+                      uint8_t *d = J.gt + ((size_t)a * J.NY + b) * J.NX; const uint8_t *src = gb + ((size_t)ga * gn[1] + gy) * gn[2];
+                      if (gs == 1) memcpy(d, src, (size_t)n[2]);
+                      else for (int64_t c = 0; c < n[2]; c++) { const int64_t gx = (o[2] + c) / gs - go[2]; d[c] = gx < gn[2] ? src[gx] : 0; } } }
+              if (gb != tmp) free(gb);
           }
           free(tmp); }
         { pi_loadjob L = {&J, (double)z0 - 1, (double)z1 + 1, 0, 0}; pthread_t th[64]; for (int t = 0; t < J.nt; t++) pthread_create(&th[t], nullptr, pi_load_run, &L); for (int t = 0; t < J.nt; t++) pthread_join(th[t], nullptr);
@@ -583,6 +606,11 @@ int cmd_patch_id(int argc, char **argv) {
     /* GT gauge: the circular mean fraction, then the modal whole turn */
     double gre = 0, gim = 0; for (int t = 0; t < J.nt; t++) { gre += J.gre[t]; gim += J.gim[t]; }
     const double gfr = atan2(gim, gre) / (2 * M_PI);
+    /* --oracle 1 / --anchor-out (GT or anchor codes as the vote): a patch is kept with >= --min-anchor GT votes (on the anchor half with
+       --anchor-split-mm), >= --min-purity of them on one sheet */
+    const int oracle = atoi(pi_opt(argc, argv, "--oracle", "0")) || pi_opt(argc, argv, "--anchor-out", nullptr);
+    const long long min_anchor = atoll(pi_opt(argc, argv, "--min-anchor", "50")); const double min_purity = atof(pi_opt(argc, argv, "--min-purity", "0.6"));
+    if (oracle && !zg) { fprintf(stderr, "patch-id: --oracle / --anchor-out need --gt ROOT KEY (the anchor codes)\n"); return 2; }
     /* votes per root */
     size_t nvo = 0; pi_vote *VO = malloc((ALL.n + 1) * sizeof *VO); int *Tof = malloc((ALL.n + 1) * sizeof *Tof); uint32_t *Rof = malloc((ALL.n + 1) * sizeof *Rof);
     for (size_t i = 0; i < ALL.n; i++) {
@@ -599,7 +627,7 @@ int cmd_patch_id(int argc, char **argv) {
         for (size_t j = i; j < e;) { size_t f = j; long long s = 0; while (f < e && VO[f].J == VO[j].J) { s += VO[f].n; if (VO[f].G < 14) { gh[VO[f].G] += VO[f].n; gtot += VO[f].n; } f++; } tot += s; if (s > best) { best = s; bj = VO[j].J; } j = f; }
         long long gm = 0; int gmb = -1; for (int b = 0; b < 14; b++) if (gh[b] > gm) { gm = gh[b]; gmb = b; }
         if (npa == cpa) { cpa *= 2; PA = realloc(PA, cpa * sizeof *PA); }
-        PA[npa++] = (pi_patch){VO[i].root, bj, tot >= min_votes && best >= min_share * tot, (uint32_t)(tot > UINT32_MAX ? UINT32_MAX : tot), tot ? (double)best / tot : 0, gtot ? (double)gm / gtot : NAN, gmb};
+        PA[npa++] = (pi_patch){VO[i].root, bj, oracle ? gtot >= min_anchor && gm >= min_purity * gtot : tot >= min_votes && best >= min_share * tot, (uint32_t)(tot > UINT32_MAX ? UINT32_MAX : tot), tot ? (double)best / tot : 0, gtot ? (double)gm / gtot : NAN, gmb};
         i = e;
     }
     free(VO);
@@ -611,7 +639,6 @@ int cmd_patch_id(int argc, char **argv) {
     int gm = 0; for (int b = 1; b < 14; b++) if (eh[b] > eh[gm]) gm = b;
     /* --oracle 1 (validation only): each kept patch takes its GT-modal sheet instead of the wraps' majority (the ceiling of patch
        relabelling with perfect anchors) */
-    const int oracle = atoi(pi_opt(argc, argv, "--oracle", "0"));
     #define PI_DK(P, Jv) (oracle && (P)->Gmode >= 0 ? ((((P)->Gmode - gm - (Jv)) % 14 + 21) % 14 - 7) : (P)->Jstar - (Jv))
     /* per record: the correction */
     int8_t *dk = malloc(ALL.n + 1); uint8_t *dok = calloc(ALL.n + 1, 1); uint32_t *pid = malloc((ALL.n + 1) * 4);
@@ -710,7 +737,41 @@ int cmd_patch_id(int argc, char **argv) {
       printf("patch-id: patch votes: largest %u, vote-weighted median %u\n", npa ? vs[npa - 1] : 0, med);
       free(vs); }
     free(cell_dk);
+    /* --anchor-out FILE: per anchor cell an offset D (q_corrected = q + D, turns), the surf-labels --anchor / wrap-anchor file (UFSMANC2):
+       cells with anchor votes of their own (the anchor half) take their modal GT offset (status 1), the others the offset their patches
+       carry (Gmode - J per vote, modal over the cell's patched votes, >= .6 of them: status 2); else none (NAN, 0); mixed: 3 */
+    { const char *ao = pi_opt(argc, argv, "--anchor-out", nullptr);
+      if (ao) {
+          const uint32_t nc = J.cbase[nw]; float *D = malloc((size_t)nc * 4), *dm = malloc((size_t)nc * 4); uint8_t *st = calloc(nc, 1);
+          long long nk = 0, np = 0, nm = 0;
+          for (uint32_t c = 0; c < nc; c++) { D[c] = NAN; dm[c] = INFINITY; }
+          for (size_t i = 0; i < ALL.n;) {
+              size_t e = i; while (e < ALL.n && ALL.r[e].cell == ALL.r[i].cell) e++;
+              const uint32_t cell = ALL.r[i].cell; long long hd[14] = {0}, hp[14] = {0}, nd = 0, npv = 0;
+              for (size_t j = i; j < e; j++) {
+                  const pi_rec *r = &ALL.r[j];
+                  if (r->eb < 14 && (J.asplit <= 0 || r->side)) { hd[r->eb] += r->n; nd += r->n; }
+                  if (Rof[j] == PI_NONE) continue;
+                  pi_patch key = {Rof[j], 0, 0, 0, 0, 0, 0}; const pi_patch *P = bsearch(&key, PA, npa, sizeof *PA, pi_cmp_patch);
+                  if (!P || !P->ok || P->Gmode < 0) continue;
+                  const int Jv = r->jv - (int)dir * Tof[j]; hp[((P->Gmode - Jv) % 14 + 14) % 14] += r->n; npv += r->n;
+              }
+              const long long *h = nd >= 50 ? hd : hp; const long long tot = nd >= 50 ? nd : npv;
+              if (tot > 0) { int b = 0; for (int k = 1; k < 14; k++) if (h[k] > h[b]) b = k;
+                  if (h[b] >= 0.6 * tot) { D[cell] = (float)((b > 6 ? b - 14 : b) + gfr); dm[cell] = 0; st[cell] = nd >= 50 ? 1 : 2; if (nd >= 50) nk++; else np++; }
+                  else { st[cell] = 3; nm++; } }
+              i = e;
+          }
+          FILE *f = fopen(ao, "wb"); if (!f) { fprintf(stderr, "patch-id: cannot write %s\n", ao); return 1; }
+          const int32_t hd5[5] = {nw, J.CR, J.NS, (int32_t)dir, (int32_t)nc};
+          fwrite("UFSMANC2", 1, 8, f); fwrite(hd5, 4, 5, f);
+          for (int k = 0; k < nw; k++) { const int32_t a[2] = {W[k].id, W[k].h}; fwrite(a, 4, 2, f); }
+          fwrite(D, 4, nc, f); fwrite(dm, 4, nc, f); fwrite(st, 1, nc, f);
+          if (fclose(f)) return 1;
+          printf("patch-id: anchor file %s: %u cells, %lld with own anchor votes, %lld from patches, %lld mixed\n", ao, nc, nk, np, nm);
+          free(D); free(dm); free(st);
+      } }
     free(ALL.r); free(dk); free(dok); free(pid); free(Rof); free(Tof); free(PA); free(WS);
-    z3_close(zs); if (zg) z3_close(zg);
+    pi_vclose(&VS); if (zg) pi_vclose(zg);
     return 0;
 }
