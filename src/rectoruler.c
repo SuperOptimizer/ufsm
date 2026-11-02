@@ -91,6 +91,8 @@ static double rr_sample(const rr_job *J, const rr_src *s, double y, double x) { 
     const double K = J->um / s->cum;   /* native -> coarse L0 voxels */
     const double c[3] = {(gx + 0.5) * K - 0.5, (gy + 0.5) * K - 0.5, (J->zg + 0.5) * K - 0.5}; double f[3]; rmap_c2f(s->map, c, f);
     const double L = s->lf;
+    if (s->hasbox) { const double gz = (f[2] + 0.5) / L - 0.5, gyy = (f[1] + 0.5) / L - 0.5, gxx = (f[0] + 0.5) / L - 0.5;
+                     if (gz < s->vb[0] || gyy < s->vb[1] || gxx < s->vb[2] || gz >= s->vb[3] || gyy >= s->vb[4] || gxx >= s->vb[5]) return NAN; }
     const double fz = (f[2] + 0.5) / L - 0.5 - s->po[0], fy = (f[1] + 0.5) / L - 0.5 - s->po[1], fx = (f[0] + 0.5) / L - 0.5 - s->po[2];
     const int64_t z0 = (int64_t)floor(fz), y0 = (int64_t)floor(fy), x0 = (int64_t)floor(fx); const double tz = fz - z0, ty = fy - y0, tx = fx - x0;
     if (z0 < 0 || y0 < 0 || x0 < 0 || z0 + 1 >= s->pn[0] || y0 + 1 >= s->pn[1] || x0 + 1 >= s->pn[2]) return NAN;
