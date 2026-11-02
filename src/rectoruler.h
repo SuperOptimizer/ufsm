@@ -11,7 +11,7 @@ enum { RR_NF = 25,            /* features of a hit interval (rr_feat in rectorul
                                  22-24 the other sources' hits strictly inside */
        RR_REC = RR_NF + 4,    /* a dump record: features, GT turns, global native z, ray, start (native voxels along the ray) */
        RR_K = 4,              /* classes: 0, 1, 2, 3+ turns */
-       RR_NCOL = 29 };        /* fit, density, CT, (pkw, pk, run) per source (8), cls, clsE: pkw hits in the half-shifted window, pk / run offset-free (cumulative hit index linear between hits) */
+       RR_NCOL = 30 };        /* fit, density, CT, (pkw, pk, run) per source (8), cls, clsE: pkw hits in the half-shifted window, pk / run offset-free (cumulative hit index linear between hits) */
 
 typedef struct { float pos, h, prom, wid; } rr_hit;   /* samples along the ray; height / prominence 0..255; half-prominence width (samples) */
 typedef struct { float z, r, gtq, gapn, sp; int ray, ia, ib; float t[RR_NCOL]; } rr_iv;   /* one GT interval and each source's turns */
