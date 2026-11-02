@@ -59,6 +59,9 @@ int cmd_surf_stats(int argc, char **argv);
 int cmd_wrap_snap(int argc, char **argv);   /* src/wrapsnap.c */
 int cmd_surf_labels(int argc, char **argv);   /* src/surflabels.c */
 int cmd_patch_id(int argc, char **argv);   /* src/patchid.c */
+int cmd_recto_ruler(int argc, char **argv);   /* src/rectoruler.c */
+int cmd_recto_cls(int argc, char **argv);   /* src/rectocls.c */
+int cmd_recto_sp(int argc, char **argv);   /* src/rectosp.c */
 int cmd_geom_check(int argc, char **argv);   /* src/geomcheck.c */
 int cmd_wrap_match(int argc, char **argv);
 int cmd_ink_cover(int argc, char **argv);
@@ -199,6 +202,9 @@ static int usage(void) {
         "  ufsm surf-labels <wraps-dir> <out-dir> --axis F --axis-um U0 --dir +-1 --grid-um U --like ROOT KEY   winding codes + pair phase + ignore from .sfc wraps\n"
         "  ufsm wrap-anchor <wraps-dir> <anchor-file> --gt ROOT KEY [surf-labels flags]   per-cell winding offsets of our wraps from published-segment codes (surf-labels --anchor)\n"
         "  ufsm patch-id <wraps-dir> <out-dir> --axis F --axis-um U0 --dir +-1 --sheet ROOT KEY --grid-um U   sheet patches -> per-cell wrap id corrections (+ --gt check)\n"
+        "  ufsm recto-ruler <model> <fields-dir> --codes ROOT KEY --src NAME ROOT KEY UM ...   recto predictions as a winding ruler vs GT (peaks per GT turn, interval dumps)\n"
+        "  ufsm recto-cls train OUT DUMPS | eval MODEL DUMPS   interval classifier (turns between recto hits), boosted trees\n"
+        "  ufsm recto-sp IN-FIELDS OUT-FIELDS --src ROOT KEY UM [--blend 1]   fields with sp from recto hit spacing along the normal (count-field count target)\n"
         "  ufsm geom-check <wraps-dir> --axis F --axis-um U [--out DIR]   wraps geometry QA: spacing, steep walls, jumps, merged / skipped neighbours, holes; guard limits\n"
         "  ufsm refine <wraps-in> <wraps-out> --fields DIR [--range 0.33] [--smooth-um 40]   vertices onto the fields' sheet phase\n"
         "  ufsm surf-stats <wraps-dir> --fields DIR [--ct ROOT KEY --ct-um U]   label-free surface quality (phase, switches, CT)\n"
@@ -4575,6 +4581,9 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "surf-labels") || !strcmp(cmd, "wrap-anchor")) return cmd_surf_labels(argc, argv);
     if (!strcmp(cmd, "surf-labels")) return cmd_surf_labels(argc, argv);
     if (!strcmp(cmd, "patch-id")) return cmd_patch_id(argc, argv);
+    if (!strcmp(cmd, "recto-ruler")) return cmd_recto_ruler(argc, argv);
+    if (!strcmp(cmd, "recto-cls")) return cmd_recto_cls(argc, argv);
+    if (!strcmp(cmd, "recto-sp")) return cmd_recto_sp(argc, argv);
     if (!strcmp(cmd, "geom-check")) return cmd_geom_check(argc, argv);
     if (!strcmp(cmd, "wrap-match")) return cmd_wrap_match(argc, argv);
     if (!strcmp(cmd, "ink-cover")) return cmd_ink_cover(argc, argv);
