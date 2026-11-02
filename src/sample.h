@@ -131,6 +131,8 @@ typedef struct {
                                 on its own plane, not in the target channels (whose packed form stays hard); unknown where CT 0, where the
                                 scanner augmentation ignores labels and on crushed / torn / delaminated / re-bent windows; warped windows
                                 pull it trilinearly over known corners (all corners of weight > 1e-7 known, else unknown) */
+    int rv_iso;              /* train --rv 1 (task unwrap2): the ink plane carries papyrus instead of ink: 254 where the clean CT >= the source's
+                                "iso" (else this cutoff), 0 below (void), 255 unknown (CT 0, scanner-augmentation ignores); warped like the ink */
     int restore;             /* 2: real SR pairs (sources with "sr_pair", src/srpair.h): batch.t row = [target P^3 (through the pair's intensity map) |
                                 the native input crop (P / 4)^3], both under one symmetry and tone LUT. 1, task restore: no target reads; batch.t holds the clean CT window alone (B x P^3, tone LUT and symmetry applied),
                                 batch.x / x16 and batch.m are absent (the trainer degrades the window on the device); training windows lie inside a

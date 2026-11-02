@@ -95,12 +95,14 @@ typedef struct {
     uint8_t **bc, **bp, **bi; _Atomic int *pend; pthread_mutex_t mu;
     _Atomic long next; long nitems; _Atomic int fail;
     /* stats */
+    _Atomic long long sdn, sda, ksdn, ksda; int side_iso;   /* with --gt and --ct: recto / verso side agreement on papyrus (CT >= side_iso): both phases on the same half turn (train --rv's rule) */
     _Atomic long long ncode, nconf, nknown, nkept, nig[IG_N], gtk, g10, g25, kgtk, kg10, kg25, nblk, gbins[PHASE_AGREE_BINS], kbins[PHASE_AGREE_BINS];
     sl_recs *recs; uint32_t pa_T; int nt;
     const char *an_patches; int an_mode, an_cr, an_ns; uint32_t ncell; _Atomic uint32_t *an_hist, *an_pres; _Atomic int64_t *an_cs; float *an_d, *an_dist; double an_tol;
     _Atomic long long dk_gk[5], dk_g25[5];   /* apply + GT: phase agreement per distance bin (mm along the surface to the nearest voted cell: 0, 0-2.5, 2.5-10, 10-30, 30+) */   /* anchors: mode 1 vote, 2 apply */
     double gsplit; int ghalf;
     z3 *ag_r; int ag_s, ag_R, ag_rmin; _Atomic long long ag_kn[34], ag_gk[34], ag_g25[34];   /* --agree: recto field (on a grid ag_s x coarser), search +-ag_R voxels; bins 0..ag_R, ag_R + 1 = no agreement */          /* --gt-half A|B with --gt-split-mm: GT used only in z blocks of that parity (A even, B odd) */
+    _Atomic long long ch_sn[COH_BINS + 1], ch_sa[COH_BINS + 1];   /* side agreement on papyrus per coherence bin (before the gate) */
     int coh_cell, ct_scale; double min_coh; _Atomic long long ch_kn[COH_BINS + 1], ch_gk[COH_BINS + 1], ch_g10[COH_BINS + 1], ch_g25[COH_BINS + 1];   /* bin COH_BINS: no coherence (too few voxels) */
 } sl_job;
 
@@ -367,6 +369,7 @@ static int sl_block(sl_job *J, sl_scratch *X, int si, int bk, int tid) {
     uint8_t *oc = J->bc[si], *op = J->bp[si], *oi = J->bi[si];
     pthread_mutex_unlock(&J->mu);
     if (!oc || !op || !oi) return -1;
+    long long sdn = 0, sda = 0, ksdn = 0, ksda = 0, csn[COH_BINS + 1] = {0}, csa[COH_BINS + 1] = {0};
     long long ncode = 0, nconf = 0, nknown = 0, nkept = 0, nig[IG_N] = {0}, gtk = 0, g10 = 0, g25 = 0, kgtk = 0, kg10 = 0, kg25 = 0, gb[PHASE_AGREE_BINS] = {0}, kb[PHASE_AGREE_BINS] = {0};
     sl_recs *R = &J->recs[tid]; const double mm = J->gum * 1e-3;
     /* local CT coherence of the label phase: per cell of coh_cell^3 voxels, the correlation of the CT with cos(2 pi phase) over the
@@ -445,6 +448,11 @@ static int sl_block(sl_job *J, sl_scratch *X, int si, int bk, int tid) {
             if (!ig0) { cgk[rb]++; cg10[rb] += d < 0.1; cg25[rb] += d < 0.25; if (J->ag_r) { agk[agv]++; ag25[agv] += d < 0.25; } }
             const int bin = phase_agree_bin(d);
             gtk++; g10 += d < 0.1; g25 += d < 0.25; gb[bin]++;
+            if (J->ct && J->side_iso > 0 && X->ct[((size_t)z * B + y) * B + x] >= J->side_iso) {
+                const int sa = (ph < PHASE_PERIOD / 2) == (gp < PHASE_PERIOD / 2);
+                sdn++; sda += sa; if (!ig) { ksdn++; ksda += sa; }
+                if (!ig0) { csn[rb]++; csa[rb] += sa; }
+            }
             if (!ig) { kgtk++; kg10 += d < 0.1; kg25 += d < 0.25; kb[bin]++;
                        if (J->an_dist && X->lo[i] >= 0) { const int db = an_dbin(J->an_dist[X->cell[X->lo[i]]]); if (db >= 0) { atomic_fetch_add_explicit(&J->dk_gk[db], 1, memory_order_relaxed); atomic_fetch_add_explicit(&J->dk_g25[db], d < 0.25, memory_order_relaxed); } } }
             if (w) { atomic_fetch_add_explicit(&w->gk, 1, memory_order_relaxed); atomic_fetch_add_explicit(&w->g10, d < 0.1, memory_order_relaxed); atomic_fetch_add_explicit(&w->g25, d < 0.25, memory_order_relaxed);
@@ -465,6 +473,8 @@ static int sl_block(sl_job *J, sl_scratch *X, int si, int bk, int tid) {
     for (int k = 0; k < 34; k++) { atomic_fetch_add(&J->ag_kn[k], akn[k]); atomic_fetch_add(&J->ag_gk[k], agk[k]); atomic_fetch_add(&J->ag_g25[k], ag25[k]); }
     for (int k = 0; k <= COH_BINS; k++) { atomic_fetch_add(&J->ch_kn[k], ckn[k]); atomic_fetch_add(&J->ch_gk[k], cgk[k]); atomic_fetch_add(&J->ch_g10[k], cg10[k]); atomic_fetch_add(&J->ch_g25[k], cg25[k]); }
     atomic_fetch_add(&J->gtk, gtk); atomic_fetch_add(&J->g10, g10); atomic_fetch_add(&J->g25, g25);
+    for (int k = 0; k <= COH_BINS; k++) { atomic_fetch_add(&J->ch_sn[k], csn[k]); atomic_fetch_add(&J->ch_sa[k], csa[k]); }
+    atomic_fetch_add(&J->sdn, sdn); atomic_fetch_add(&J->sda, sda); atomic_fetch_add(&J->ksdn, ksdn); atomic_fetch_add(&J->ksda, ksda);
     atomic_fetch_add(&J->kgtk, kgtk); atomic_fetch_add(&J->kg10, kg10); atomic_fetch_add(&J->kg25, kg25);
     for (int k = 0; k < PHASE_AGREE_BINS; k++) { atomic_fetch_add(&J->gbins[k], gb[k]); atomic_fetch_add(&J->kbins[k], kb[k]); }
     atomic_fetch_add(&J->nblk, 1);
@@ -666,6 +676,7 @@ int cmd_surf_labels(int argc, char **argv) {
     if (J.ag_s < 1 || J.ag_R < 1 || J.ag_R > 32) { fprintf(stderr, "surf-labels: --agree-scale >= 1, --agree-range 1..32\n"); return 2; }
     J.an_tol = atof(sl_opt(argc, argv, "--anchor-tol-um", "30")) / gum; if (J.an_tol < 1.5) J.an_tol = 1.5;
     J.gsplit = atof(sl_opt(argc, argv, "--gt-split-mm", "0")) * 1000 / gum; J.ghalf = !strcmp(sl_opt(argc, argv, "--gt-half", "A"), "B");
+    J.side_iso = atoi(sl_opt(argc, argv, "--side-iso", "60"));   /* (with --gt and --ct: the side agreement's papyrus cutoff) */
     J.coh_cell = atoi(sl_opt(argc, argv, "--coh-cell", "32")); J.min_coh = atof(sl_opt(argc, argv, "--min-coh", "-2"));
     if (J.coh_cell < 0 || (J.coh_cell && B % J.coh_cell)) { fprintf(stderr, "surf-labels: --coh-cell must divide --block\n"); return 2; }
     J.gum = gum; J.dir = dir; J.S = S; J.B = B; J.rmax = (float)rmax; J.Hh = (int)ceil(rmax) + 2; J.bake = atoi(sl_opt(argc, argv, "--bake", "1")); J.nt = nt;
@@ -922,6 +933,8 @@ int cmd_surf_labels(int argc, char **argv) {
                J.gtk ? (double)J.gbins[0] / J.gtk : 0, J.gtk ? (double)J.gbins[1] / J.gtk : 0, J.gtk ? (double)J.gbins[2] / J.gtk : 0, J.gtk ? (double)J.gbins[3] / J.gtk : 0, J.gtk ? (double)J.gbins[4] / J.gtk : 0,
                (long long)J.kgtk, J.kgtk ? (double)J.kg10 / J.kgtk : 0, J.kgtk ? (double)J.kg25 / J.kgtk : 0,
                J.kgtk ? (double)J.kbins[0] / J.kgtk : 0, J.kgtk ? (double)J.kbins[1] / J.kgtk : 0, J.kgtk ? (double)J.kbins[2] / J.kgtk : 0, J.kgtk ? (double)J.kbins[3] / J.kgtk : 0, J.kgtk ? (double)J.kbins[4] / J.kgtk : 0);
+        if (J.sdn) printf("surf-labels: vs GT side (recto / verso half turn) on papyrus (CT >= %d): raw %lld voxels, agreement %.4f; kept %lld, agreement %.4f\n",
+                          J.side_iso, (long long)J.sdn, (double)J.sda / J.sdn, (long long)J.ksdn, J.ksdn ? (double)J.ksda / J.ksdn : 0);
         size_t n = 0; for (int t = 0; t < nt; t++) n += J.recs[t].n;
         pa_buf all = {0}; all.r = malloc((n ? n : 1) * sizeof *all.r); all.cap = n ? n : 1; all.T = J.pa_T;
         sl_rec *tmp = malloc((n ? n : 1) * sizeof *tmp); size_t m = 0;   /* (sorted with all.r: tmp[k] is record k's source) */
@@ -960,17 +973,17 @@ int cmd_surf_labels(int argc, char **argv) {
         }
         if (J.ct && J.coh_cell > 0) {   /* the coherence gate's curve: per threshold, kept share, phase agreement and pair accuracy */
             long long tk = 0; for (int b = 0; b <= COH_BINS; b++) tk += J.ch_kn[b];
-            printf("surf-labels: CT coherence curve (cell %d voxels; voxels not ignored otherwise; r >= t kept, no-coherence cells dropped):\n  t      kept_share  gt_both      |d|<.25  |d|<.1   pairs 0.5mm 1mm   2mm   4mm\n", J.coh_cell);
+            printf("surf-labels: CT coherence curve (cell %d voxels; voxels not ignored otherwise; r >= t kept, no-coherence cells dropped):\n  t      kept_share  gt_both      |d|<.25  |d|<.1   pairs 0.5mm 1mm   2mm   4mm    side(papyrus)\n", J.coh_cell);
             for (int ti = -5; ti <= 16; ti++) {
-                const double t = ti == -5 ? -2 : 0.05 * ti; long long kn = 0, gk = 0, g10 = 0, g25 = 0;
+                const double t = ti == -5 ? -2 : 0.05 * ti; long long kn = 0, gk = 0, g10 = 0, g25 = 0, sn = 0, sa = 0;
                 for (int b = 0; b <= COH_BINS; b++) { const double lo = b < COH_BINS ? -1 + 2.0 * b / COH_BINS : NAN;
                     if (t > -2 && !(lo >= t - 1e-9)) { continue; }
-                    kn += J.ch_kn[b]; gk += J.ch_gk[b]; g10 += J.ch_g10[b]; g25 += J.ch_g25[b]; }
+                    kn += J.ch_kn[b]; gk += J.ch_gk[b]; g10 += J.ch_g10[b]; g25 += J.ch_g25[b]; sn += J.ch_sn[b]; sa += J.ch_sa[b]; }
                 size_t k2 = 0; pa_buf g = all; g.r = malloc((n ? n : 1) * sizeof *g.r);
                 for (size_t k = 0; k < n; k++) if (t <= -2 || tmp[k].r >= t - 1e-9) g.r[k2++] = all.r[k];
                 g.n = k2; double a2[4], ac2[4]; size_t na2[4], nc2[4]; pa_score(&g, mmv, 4, 100000, 0x5eed, a2, ac2, na2, nc2); free(g.r);
                 char tl[16]; if (t <= -2) snprintf(tl, sizeof tl, "off"); else snprintf(tl, sizeof tl, "%+.2f", t);
-                printf("  %-6s %.4f      %-12lld %.4f   %.4f   %.4f %.4f %.4f %.4f\n", tl, tk ? (double)kn / tk : 0, gk, gk ? (double)g25 / gk : 0, gk ? (double)g10 / gk : 0, a2[0], a2[1], a2[2], a2[3]);
+                printf("  %-6s %.4f      %-12lld %.4f   %.4f   %.4f %.4f %.4f %.4f  %.4f\n", tl, tk ? (double)kn / tk : 0, gk, gk ? (double)g25 / gk : 0, gk ? (double)g10 / gk : 0, a2[0], a2[1], a2[2], a2[3], sn ? (double)sa / sn : 0);
             }
         }
         free(tmp);

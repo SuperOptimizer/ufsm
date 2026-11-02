@@ -251,6 +251,9 @@ suite-bins: $(B)/test_predict_unwrap2
 $(B)/test_unwrap2_ink: tests/test_unwrap2_ink.c $(B)/unet.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/z3w.o $(B)/nn.o $(B)/nn_fp8.o | $(B)/ufsm $(B)/make_wind_fixture
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 suite-bins: $(B)/test_unwrap2_ink $(B)/make_wind_fixture
+$(B)/test_rv: tests/test_rv.c $(B)/nn.o $(B)/nn_fp8.o | $(B)/ufsm $(B)/make_wind_fixture
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
+suite-bins: $(B)/test_rv
 $(B)/test_score_par: tests/test_score_par.c $(B)/z3w.o $(B)/zarr3.o $(B)/store.o $(B)/json.o | $(B)/ufsm
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) -lm
 suite-bins: $(B)/test_score_par

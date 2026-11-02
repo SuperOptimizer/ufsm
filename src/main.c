@@ -3902,7 +3902,9 @@ static int png_write_rgb(const char *path, int w, int h, const uint8_t *rgb) {
    its ufsm.origin_zyx): void (0 inside the scroll) tinted blue, ignored (128) yellow, papyrus left grey. Panels left to right in
    --labels order after the plain CT, 4 white pixels apart; --zoom N repeats pixels. */
 static int cmd_overlay(int argc, char **argv) {
-    if (argc < 5) { fprintf(stderr, "usage: ufsm overlay <out.png> <ct-root> <ct-key> --plane z,y,x,h,w [--axis z|y|x] [--labels G1,G2,..] [--prob G1,G2,..] [--ids G1,..] [--um 2.4] [--zoom 1] [--cache DIR]\n"
+    if (argc < 5) { fprintf(stderr, "usage: ufsm overlay <out.png> <ct-root> <ct-key> --plane z,y,x,h,w [--axis z|y|x] [--labels G1,G2,..] [--prob G1,G2,..] [--rv G,..] [--sides G,..] [--iso 64] [--ids G1,..] [--um 2.4] [--zoom 1] [--cache DIR]\n"
+                                  "  --rv: predict --channel rv volumes (recto side red, verso blue); --sides: stored phase rasters (recto half red, verso blue on CT >= --iso);\n"
+                                  "  a group DIR@KEY reads array KEY instead of the --um level name\n"
                                   "  --labels: papyrus label groups (void blue, ignored yellow); --prob: uint8 probability groups (predict output, binary\n"
                                   "  labels), red with alpha p / 255; --ids: integer instance groups (any width; e.g. ufsm hercuvit ids), one hashed colour per id\n"
                                   "  over the CT (0 = none); each group's level is named by --um, its origin_zyx attribute places it. --axis y / x: the plane is\n"
@@ -3914,6 +3916,14 @@ static int cmd_overlay(int argc, char **argv) {
     for (char *s = lab, *tok; nl < 16 && (tok = strtok(s, ",")); s = nullptr) names[nl++] = tok;
     char prb[4096]; snprintf(prb, sizeof prb, "%s", opt(argc, argv, "--prob", "")); const int nlab = nl;   /* panels [0, nlab) labels, then probabilities */
     for (char *s = prb, *tok; nl < 16 && (tok = strtok(s, ",")); s = nullptr) names[nl++] = tok;
+    /* --rv G: predict --channel rv volumes (255 (1 + p_recto - p_verso) / 2): recto side red, verso side blue; --sides G: stored phase
+       rasters (band.h PHASE_*): the recto half turn red, the verso half blue on papyrus (CT >= --iso 64), unknown untinted. A group
+       "DIR@KEY" reads array KEY instead of the --um level name. Panels: labels, prob, rv, sides, then ids */
+    char rvg[4096]; snprintf(rvg, sizeof rvg, "%s", opt(argc, argv, "--rv", "")); const int nprob0 = nl;
+    for (char *s = rvg, *tok; nl < 16 && (tok = strtok(s, ",")); s = nullptr) names[nl++] = tok;
+    char sdg[4096]; snprintf(sdg, sizeof sdg, "%s", opt(argc, argv, "--sides", "")); const int nrv = nl;
+    for (char *s = sdg, *tok; nl < 16 && (tok = strtok(s, ",")); s = nullptr) names[nl++] = tok;
+    const int iso = atoi(opt(argc, argv, "--iso", "64"));
     char idg[4096]; snprintf(idg, sizeof idg, "%s", opt(argc, argv, "--ids", "")); const int nprob = nl;   /* then instance-id panels [nprob, nl) */
     for (char *s = idg, *tok; nl < 16 && (tok = strtok(s, ",")); s = nullptr) names[nl++] = tok;
     const size_t n2 = (size_t)H * W; uint8_t *ct = malloc(n2), *lb = malloc(n2 * (nl ? nl : 1)); uint32_t *idv = malloc(n2 * 4 * (nl - nprob ? nl - nprob : 1)); uint8_t *tb = malloc(n2 * 8);
@@ -3922,10 +3932,11 @@ static int cmd_overlay(int argc, char **argv) {
     const int64_t o[3] = {pz[0], pz[1], pz[2]}, n[3] = {ax == 'z' ? 1 : H, ax == 'z' ? H : ax == 'y' ? 1 : W, ax == 'x' ? 1 : W};
     if (z3_read(cz, o, n, ct, 8)) { fprintf(stderr, "overlay: %s\n", z3_error()); return 1; }
     for (int i = 0; i < nl; i++) {
-        long long po[3] = {0, 0, 0}; char jp[1400]; snprintf(jp, sizeof jp, "%s/%s/zarr.json", names[i], lv); FILE *jf = fopen(jp, "rb"); char jb[8192] = {0};
+        char *at = strchr((char *)names[i], '@'); const char *gk = lv; if (at) { *at = 0; gk = at + 1; }
+        long long po[3] = {0, 0, 0}; char jp[1400]; snprintf(jp, sizeof jp, "%s/%s/zarr.json", names[i], gk); FILE *jf = fopen(jp, "rb"); char jb[8192] = {0};
         if (jf) { size_t nr = fread(jb, 1, sizeof jb - 1, jf); (void)nr; fclose(jf); }
         const char *q = strstr(jb, "\"origin_zyx\":"); if (q) sscanf(q + 13, " [%lld,%lld,%lld]", po, po + 1, po + 2);
-        z3 *lz = i < nprob ? z3_open(store_open(names[i]), lv, nullptr) : z3_open_typed(store_open(names[i]), lv, nullptr); if (!lz) { fprintf(stderr, "overlay: %s: %s\n", names[i], z3_error()); return 1; }
+        z3 *lz = i < nprob ? z3_open(store_open(names[i]), gk, nullptr) : z3_open_typed(store_open(names[i]), gk, nullptr); if (!lz) { fprintf(stderr, "overlay: %s: %s\n", names[i], z3_error()); return 1; }
         const int64_t lo[3] = {pz[0] - po[0], pz[1] - po[1], pz[2] - po[2]};
         if (i < nprob) { if (z3_read(lz, lo, n, lb + n2 * i, 8)) { fprintf(stderr, "overlay: %s: %s\n", names[i], z3_error()); return 1; } }
         else {   /* instance ids: any integer width, as uint32 */
@@ -3943,6 +3954,12 @@ static int cmd_overlay(int argc, char **argv) {
                  if (v) { uint32_t hsh = v * 2654435761u; hsh ^= hsh >> 15; hsh *= 2246822519u; hsh ^= hsh >> 13;
                           const int cr = 60 + (int)(hsh & 0xff) * 195 / 255, cg = 60 + (int)((hsh >> 8) & 0xff) * 195 / 255, cb = 60 + (int)((hsh >> 16) & 0xff) * 195 / 255;
                           r = (2 * g + 3 * cr) / 5; gg = (2 * g + 3 * cg) / 5; b = (2 * g + 3 * cb) / 5; } }
+        else if (p && p - 1 >= nrv) { const int v = lb[n2 * (p - 1) + (size_t)y * W + x];   /* sides of a stored phase on papyrus */
+                 if (v < 252 && g >= iso) { if (v < 126) { r = (g + 2 * 255) / 3; gg = g / 3; b = g / 3; } else { r = g / 3; gg = (g + 120) / 3; b = (g + 2 * 255) / 3; } } }
+        else if (p && p - 1 >= nprob0) { const int v = lb[n2 * (p - 1) + (size_t)y * W + x], a = v > 128 ? 2 * (v - 128) : 2 * (128 - v);   /* rv: red recto, blue verso */
+                 const int a2 = a > 255 ? 255 : a;
+                 if (v >= 128) { r = (g * (255 - a2) + 255 * a2) / 255; gg = (g * (255 - a2) + 30 * a2) / 255; b = (g * (255 - a2) + 20 * a2) / 255; }
+                 else { r = (g * (255 - a2) + 20 * a2) / 255; gg = (g * (255 - a2) + 90 * a2) / 255; b = (g * (255 - a2) + 255 * a2) / 255; } }
         else if (p && p - 1 >= nlab) { const int a = lb[n2 * (p - 1) + (size_t)y * W + x];   /* probability: red over the CT */
                  r = (g * (255 - a) + 255 * a) / 255; gg = (g * (255 - a) + 30 * a) / 255; b = (g * (255 - a) + 20 * a) / 255; }
         else if (p) { const uint8_t v = lb[n2 * (p - 1) + (size_t)y * W + x];
