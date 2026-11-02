@@ -11,6 +11,7 @@
    - a holdout box (--exclude) -> ignore 4;
    - --geom: defect cells / slipping z bins of geom-check -> no codes there;
    - --min-coh: CT ridges on the sheets keep the labels, ridges midway between them (labels half a turn off) -> ignore 5;
+   - --anchor A,A (union) = --anchor A;
    - wrap-anchor: wraps miscounted (+10 turns, a false extra turn after wrap 3) against the true codes as GT, votes in alternate z
      blocks: every anchored code equals the GT code, the held-out blocks included;
    - same bytes with 1 and 4 threads; --dir auto picks -1 on the dir -1 spiral (same bytes as --dir -1). */
@@ -153,7 +154,7 @@ int main(void) {
                       "--radius", "12", "--threads", "4", "--gt", gtr, "9.6", "--gt-split-mm", "0.1536", "--gt-half", "A", "--anchor-cell", "4,16", "--anchor-min", "5"};
         CHECK(!cmd_surf_labels((int)(sizeof av / sizeof *av), av), "wrap-anchor failed");
         char *bv[] = {"ufsm", "surf-labels", wdp, od, "--axis", ax, "--axis-um", "9.6", "--dir", "1", "--grid-um", "9.6", "--shape", "64,256,256", "--shard", "128", "--block", "32",
-                      "--radius", "12", "--threads", "4", "--gt", gtr, "9.6", "--gt-split-mm", "0.1536", "--gt-half", "B", "--anchor-cell", "4,16", "--anchor", an};
+                      "--radius", "12", "--threads", "4", "--gt", gtr, "9.6", "--gt-split-mm", "0.1536", "--gt-half", "B", "--anchor-cell", "4,16", "--anchor", an};   /* (bv[3], the last: replaced below) */
         CHECK(!cmd_surf_labels((int)(sizeof bv / sizeof *bv), bv), "surf-labels --anchor failed");
         char r[600]; snprintf(r, sizeof r, "%s/codes.zarr", od); uint8_t *ac = readall(r, "9.6"); snprintf(r, sizeof r, "%s/p1/codes.zarr", root); uint8_t *gc = readall(r, "9.6");
         snprintf(r, sizeof r, "%s/phase.zarr", od); uint8_t *ph = readall(r, "9.6");
@@ -164,6 +165,12 @@ int main(void) {
         printf("test_surflabels: wrap-anchor: %ld anchored codes on GT codes, %ld off by > 1/9 turn (%ld of them in held-out z blocks); %ld phase voxels kept\n", both, bad, z1, kept);
         CHECK(both > 50000 && bad == 0 && kept > 1300000, "anchored codes do not match the GT (the +10 / +11 turn miscount not undone)");
         free(ac); free(gc); free(ph);
+        /* --anchor A,B union: the file with itself = the file alone (same bytes) */
+        char an2[900], od2[400]; snprintf(an2, sizeof an2, "%s,%s", an, an); snprintf(od2, sizeof od2, "%s/ax2", root);
+        bv[3] = od2; bv[sizeof bv / sizeof *bv - 1] = an2;
+        CHECK(!cmd_surf_labels((int)(sizeof bv / sizeof *bv), bv), "surf-labels --anchor A,A failed");
+        char cmd2[1400]; snprintf(cmd2, sizeof cmd2, "cd %s && for s in $(cd ax/codes.zarr/9.6 && find c -type f); do cmp -s ax/codes.zarr/9.6/$s ax2/codes.zarr/9.6/$s || exit 1; done", root);
+        CHECK(!system(cmd2), "--anchor A,A differs from --anchor A");
     }
     {   /* --agree smoke: the CT ridges on the sheets as both CT and recto prediction */
         char ax[400], wdp[400], od[400], ct[400], gtr[400]; snprintf(ax, sizeof ax, "%s/axis.json", root); snprintf(wdp, sizeof wdp, "%s/wp", root); snprintf(od, sizeof od, "%s/agree", root);

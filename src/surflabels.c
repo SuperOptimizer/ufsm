@@ -616,7 +616,22 @@ static int an_assign(sl_job *J, const char *out, int nmin, double smin, double r
     free(D); free(st); free(dist); free(qu); free(dm);
     return 0;
 }
-static int an_load(sl_job *J, const char *p) {
+static int an_load1(sl_job *J, const char *p);
+/* --anchor A[,B,...]: the union of several anchor files of the same wraps / cells: per cell the first file whose D is set (finite) */
+static int an_load(sl_job *J, const char *list) {
+    char *t = strdup(list), *sv = nullptr; float *d = nullptr, *dm = nullptr; int nf = 0; long took[16] = {0};
+    for (char *q = strtok_r(t, ",", &sv); q; q = strtok_r(nullptr, ",", &sv), nf++) {
+        J->an_d = J->an_dist = nullptr;
+        if (an_load1(J, q)) { free(t); free(d); free(dm); return -1; }
+        if (!d) { d = J->an_d; dm = J->an_dist; for (uint32_t c = 0; c < J->ncell; c++) if (isfinite(d[c])) took[0]++; continue; }
+        for (uint32_t c = 0; c < J->ncell; c++) if (!isfinite(d[c]) && isfinite(J->an_d[c])) { d[c] = J->an_d[c]; dm[c] = J->an_dist[c]; if (nf < 16) took[nf]++; }
+        free(J->an_d); free(J->an_dist);
+    }
+    free(t); J->an_d = d; J->an_dist = dm;
+    if (nf > 1) { fprintf(stderr, "surf-labels: --anchor union of %d files: cells set from each:", nf); for (int k = 0; k < nf && k < 16; k++) fprintf(stderr, " %ld", took[k]); fprintf(stderr, " of %u\n", J->ncell); }
+    return d ? 0 : -1;
+}
+static int an_load1(sl_job *J, const char *p) {
     FILE *f = fopen(p, "rb"); if (!f) { fprintf(stderr, "surf-labels: cannot read --anchor %s\n", p); return -1; }
     char mg[8]; int32_t hd[5];
     if (fread(mg, 1, 8, f) != 8 || memcmp(mg, "UFSMANC2", 8) || fread(hd, 4, 5, f) != 5 || hd[0] != J->nw || hd[1] != J->an_cr || hd[2] != J->an_ns || hd[3] != (int32_t)J->dir || (uint32_t)hd[4] != J->ncell) {
