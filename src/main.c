@@ -76,6 +76,7 @@ int cmd_ink_ensemble(int argc, char **argv);
 int cmd_wl_dump(int argc, char **argv);
 int cmd_dinovol_embed(int argc, char **argv);   /* src/dinovol.c */
 int cmd_hercuvit(int argc, char **argv);   /* src/hercuvit.c */
+int cmd_surfrecto_predict(int argc, char **argv);   /* src/surfrecto.c */
 int cmd_villawind(int argc, char **argv);   /* src/villawind.c */
 int cmd_vwt_infer(int argc, char **argv);   /* src/vwt_infer.c */
 int cmd_wtrunk_bench(int argc, char **argv);   /* src/wtrunk.c */
@@ -168,6 +169,7 @@ static int usage(void) {
         "  ufsm wl-dump <weights> [key]   the tensors of a safetensors / torch zip weight file\n"
         "  ufsm dinovol-embed ROOT KEY OUT --ckpt PT --box z,y,x,nz,ny,nx   scrollprize dinovol tokens / dense / ink embeddings (zarr v3)\n"
         "  ufsm hercuvit ROOT KEY OUT --ckpt PTH --box z,y,x,nz,ny,nx   HercuViT v0 sheet surface probability + per-window instance ids\n"
+        "  ufsm surfrecto-predict CKPT ROOT KEY OUT --box z0,y0,x0,z1,y1,x1   scrollprize/surface_recto_3dunet recto probability (2.4 um CT) -> uint8 zarr\n"
         "  ufsm villawind ray-check ROOT KEY WINDINGS.json --ckpt PTH   villa winding model (scrollprize/winding_model_9um) turn counts on human rays\n"
         "  ufsm ink3d-ext --weights W --ct ROOT KEY --box z,y,x,nz,ny,nx --out GROUP [--out-um 9.6,4.8]   published 3D ink net (gambiarra) on a 2.4 um CT box -> prob254 zarr\n"
         "  ufsm vol-cmp A_ROOT A_KEY B_ROOT B_KEY --box z,y,x,nz,ny,nx   two uint8 volumes (zarr v3 / v2): Pearson / Spearman + value mapping\n"
@@ -4526,6 +4528,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "wl-dump")) return cmd_wl_dump(argc, argv);
     if (!strcmp(cmd, "dinovol-embed")) return cmd_dinovol_embed(argc, argv);
     if (!strcmp(cmd, "hercuvit")) return cmd_hercuvit(argc, argv);
+    if (!strcmp(cmd, "surfrecto-predict")) return cmd_surfrecto_predict(argc, argv);
     if (!strcmp(cmd, "villawind")) return cmd_villawind(argc, argv);
     if (!strcmp(cmd, "vwt-train")) return cmd_vwt_train(argc, argv);
     if (!strcmp(cmd, "vwt-tile")) return cmd_vwt_tile(argc, argv);
