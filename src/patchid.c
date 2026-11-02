@@ -681,19 +681,21 @@ int cmd_patch_id(int argc, char **argv) {
     /* pair winding accuracy on the sampled GT-coded vertices (src/pairacc.h): before, per-vote fix, per-cell fix */
     { size_t ns = 0; for (int t = 0; t < J.nt; t++) ns += J.tsmp[t].n;
       if (zg && ns > 100) {
-          pa_buf pb[3]; for (int v = 0; v < 3; v++) pa_init(&pb[v], ns + 16);
+          pa_buf pb[5]; for (int v = 0; v < 5; v++) pa_init(&pb[v], ns + 16);   /* 3, 4: the samples in kept patches only, before / vote fix */
           for (int t = 0; t < J.nt; t++) for (size_t i = 0; i < J.tsmp[t].n; i++) {
-              const pi_smp *q = &J.tsmp[t].s[i]; int d1 = 0;
+              const pi_smp *q = &J.tsmp[t].s[i]; int d1 = 0, inp = 0;
               if (q->comp != PI_NONE) { int T; const uint32_t root = pi_find(&U, q->comp, &T); pi_patch key = {root, 0, 0, 0, 0, 0, 0};
                   const pi_patch *P = bsearch(&key, PA, npa, sizeof *PA, pi_cmp_patch);
-                  if (P && P->ok) { const int d = PI_DK(P, q->jv - (int)dir * T); if (d >= -PI_DKR && d <= PI_DKR) d1 = d; } }
+                  if (P && P->ok) { const int d = PI_DK(P, q->jv - (int)dir * T); if (d >= -PI_DKR && d <= PI_DKR) { d1 = d; inp = 1; } } }
               const int e = q->eb, dd[3] = {0, d1, cell_dk[q->cell]};
               const uint64_t key = ((uint64_t)t << 40) ^ i;
               for (int v = 0; v < 3; v++) pa_add(&pb[v], q->p[0], q->p[1], q->p[2], (float)-(e - dd[v]), q->gc, key);
+              if (inp) for (int v = 0; v < 2; v++) pa_add(&pb[3 + v], q->p[0], q->p[1], q->p[2], (float)-(e - dd[v]), q->gc, key);
           }
-          const double dist[4] = {0.5, 1, 2, 4}; const char *nm[3] = {"before", "vote fix", "cell fix"};
-          for (int v = 0; v < 3; v++) { double acc[4], accx[4]; size_t n[4], nx[4]; pa_score(&pb[v], dist, 4, 200000, 7, acc, accx, n, nx);
-              printf("patch-id: pair winding right (%zu samples) %-8s: 0.5 mm %.4f | 1 mm %.4f | 2 mm %.4f | 4 mm %.4f\n", ns, nm[v], acc[0], acc[1], acc[2], acc[3]);
+          const double dist[4] = {0.5, 1, 2, 4}; const char *nm[5] = {"before", "vote fix", "cell fix", "in-patch before", "in-patch fix"};
+          for (int v = 0; v < 5; v++) { double acc[4], accx[4]; size_t n[4], nx[4]; pa_score(&pb[v], dist, 4, 200000, 7, acc, accx, n, nx);
+              if (v == 3) ns = pb[3].n;
+              printf("patch-id: pair winding right (%zu samples) %-15s: 0.5 mm %.4f | 1 mm %.4f | 2 mm %.4f | 4 mm %.4f\n", ns, nm[v], acc[0], acc[1], acc[2], acc[3]);
               pa_free(&pb[v]); }
       } }
     { /* patch size / purity over every patch with enough votes (also those without a majority) */
