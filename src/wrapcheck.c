@@ -20,6 +20,7 @@
    the fields may be any box holding it at the same native grid. CPU only, rays on --threads threads. */
 #include "fit.h"
 #include "sysinfo.h"
+#include "zarr2.h"
 #include "zarr3.h"
 #include "store.h"
 #include <math.h>
@@ -275,12 +276,14 @@ int cmd_wrap_check(int argc, char **argv) {
     const char *zr = wc_opt(argc, argv, "--zr", nullptr); if (zr && sscanf(zr, "%lf,%lf", &zr0, &zr1) != 2) { fprintf(stderr, "wrap-check: --zr Z0,Z1\n"); return 2; }
     if (nz < 1 || nth < 4 || !(sigma > 0) || !(zr1 > zr0)) { fprintf(stderr, "wrap-check: bad --nz / --nth / --sigma / --zr\n"); return 2; }
     fit_set_threads(nt);
-    z3 *cz = nullptr, *qz = nullptr, *rz = nullptr; double ctum = 0, cf = 1, rum = 0;
+    z3 *cz = nullptr, *qz = nullptr, *rz = nullptr; z2 *rz2 = nullptr;   /* (--recto: zarr v3, or v2 as the upstream predictions) */ double ctum = 0, cf = 1, rum = 0;
     const double rthr = atof(wc_opt(argc, argv, "--recto-thr", "128")), rfthr = atof(wc_opt(argc, argv, "--r-thr", "128"));
     { const int ri = wc_idx(argc, argv, "--recto");   /* --recto ROOT KEY --recto-um U: a recto / surface volume (uint8; runs >= --recto-thr) */
       if (ri > 0) { if (ri + 2 >= argc) { fprintf(stderr, "wrap-check: --recto ROOT KEY\n"); return 2; }
           rum = atof(wc_opt(argc, argv, "--recto-um", "0")); if (!(rum > 0)) { fprintf(stderr, "wrap-check: --recto needs --recto-um\n"); return 2; }
-          if (!(rz = z3_open(store_open(argv[ri + 1]), argv[ri + 2], wc_opt(argc, argv, "--cache", nullptr)))) { fprintf(stderr, "wrap-check: %s\n", z3_error()); return 1; } } }
+          if (!(rz = z3_open(store_open(argv[ri + 1]), argv[ri + 2], wc_opt(argc, argv, "--cache", nullptr))) &&
+              !(rz2 = z2_open(store_open(argv[ri + 1]), argv[ri + 2], wc_opt(argc, argv, "--cache", nullptr)))) { fprintf(stderr, "wrap-check: --recto: %s / %s\n", z3_error(), z2_error()); return 1; }
+          if (rz2) z2_assume_present(rz2, 1); } }
     const int ci = wc_idx(argc, argv, "--ct"), qi = wc_idx(argc, argv, "--codes");
     if (ci > 0) {
         if (ci + 2 >= argc) { fprintf(stderr, "wrap-check: --ct ROOT KEY\n"); return 2; }
@@ -313,8 +316,8 @@ int cmd_wrap_check(int argc, char **argv) {
         float *ctp = nullptr, *rvp = nullptr; uint8_t *cdp = nullptr;
         J.rthr = rthr; J.rfthr = rfthr; if (rplane) J.rf = b.f.recto;
         if (rplane && !b.f.recto) { fprintf(stderr, "wrap-check: --r-plane 1 but the fields have no r plane\n"); return 1; }
-        if (rz) {   /* the recto rows covering native z [zg - 0.5, zg + 0.5), averaged (as the CT) */
-            const z3_meta *zm = z3_meta_of(rz); const double RF = um / rum;
+        if (rz || rz2) {   /* the recto rows covering native z [zg - 0.5, zg + 0.5), averaged (as the CT) */
+            const int64_t *zsh = rz ? z3_meta_of(rz)->shape : z2_meta_of(rz2)->shape; const struct { const int64_t *shape; } zm0 = {zsh}, *zm = &zm0; const double RF = um / rum;
             int64_t c0 = (int64_t)floor((zg - 0.5) * RF), c1 = (int64_t)ceil((zg + 0.5) * RF); if (c1 <= c0) c1 = c0 + 1;
             if (c0 < 0) c0 = 0;
             if (c1 > zm->shape[0]) c1 = zm->shape[0];
@@ -322,7 +325,7 @@ int cmd_wrap_check(int argc, char **argv) {
             for (int d = 1; d < 3; d++) { if (o3[d] < 0) { n3[d] += o3[d]; o3[d] = 0; } if (o3[d] + n3[d] > zm->shape[d]) n3[d] = zm->shape[d] - o3[d]; }
             if (n3[0] > 0 && n3[1] > 1 && n3[2] > 1) {
                 uint8_t *raw = malloc((size_t)n3[0] * n3[1] * n3[2]);
-                if (!raw || z3_read(rz, o3, n3, raw, nt)) { fprintf(stderr, "wrap-check: recto read failed: %s\n", z3_error()); return 1; }
+                if (!raw || (rz ? z3_read(rz, o3, n3, raw, nt) : z2_read(rz2, o3, n3, raw, nt))) { fprintf(stderr, "wrap-check: recto read failed: %s %s\n", z3_error(), z2_error()); return 1; }
                 const size_t pl = (size_t)n3[1] * n3[2]; rvp = calloc(pl, sizeof(float));
                 for (int64_t a = 0; a < n3[0]; a++) for (size_t i = 0; i < pl; i++) rvp[i] += raw[a * pl + i];
                 for (size_t i = 0; i < pl; i++) rvp[i] /= (float)n3[0];
@@ -401,7 +404,7 @@ int cmd_wrap_check(int argc, char **argv) {
             }
             free(s); free(cnt);
         }
-        free(all); fit_set_free(fs); if (rs) fit_set_free(rs); if (cz) z3_close(cz); if (rz) z3_close(rz); z3_close(qz);
+        free(all); fit_set_free(fs); if (rs) fit_set_free(rs); if (cz) z3_close(cz); if (rz) z3_close(rz); if (rz2) z2_close(rz2); z3_close(qz);
         return 0;
     }
     /* radius bands of 1 mm */
