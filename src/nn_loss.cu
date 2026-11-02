@@ -247,13 +247,20 @@ extern "C" void nn_loss_grad_only(const void *logits, const uint8_t *t, const ui
    of the logit gradient. out2 (device): mean loss, valid segments, mean Tp / Tg (the count ratio). */
 __device__ __forceinline__ int cnt_pdiff(int a, int b) { int d = a - b; d -= 252 * (d > 126); d += 252 * (d <= -126); return d; }
 __device__ __forceinline__ uint64_t cnt_mix(uint64_t x) { x ^= x >> 30; x *= 0xbf58476d1ce4e5b9ull; x ^= x >> 27; x *= 0x94d049bb133111ebull; return x ^ (x >> 31); }
+struct cnt_strata { int n; float e[8]; };   /* nn_count_strata: n spacing-bin edges (voxels, ascending); n 0 = off */
+static cnt_strata g_cnt_strata;
+extern "C" void nn_count_strata(int n, const float *edges_um, float um) {
+    g_cnt_strata.n = (n > 0 && n <= 8 && um > 0) ? n : 0;
+    for (int i = 0; i < g_cnt_strata.n; i++) g_cnt_strata.e[i] = edges_um[i] / um;
+}
 template <typename LT> __global__ void count_seg_k(const LT *dl, const uint8_t *ph, int D, int H, int W, int s, int K, int L, float dscale, uint64_t seed,
-                                                   float *acc, float *seg, unsigned *nvalid) {
+                                                   float *acc, float *seg, unsigned *nvalid, cnt_strata st) {
     const int k = blockIdx.x * blockDim.x + threadIdx.x; if (k >= K) return;
     seg[3 * k] = -1.f;
     const size_t HW = (size_t)H * W, n = (size_t)D * HW;
     uint64_t h = cnt_mix(seed * 0x9e3779b97f4a7c15ull + (uint64_t)k * 0xc2b2ae3d27d4eb4full);
-    for (int tries = 0; tries < 16; tries++) {
+    const int want = st.n ? k % (st.n + 1) : -1, ntries = st.n ? 64 : 16;   /* strata: segment k wants spacing bin k mod (n + 1); the last 16 tries take any bin */
+    for (int tries = 0; tries < ntries; tries++) {
         h = cnt_mix(h + 0x9e3779b97f4a7c15ull);
         const size_t i0 = (size_t)(h % n); const int z = (int)(i0 / HW), y = (int)(i0 / W % H), x = (int)(i0 % W);
         if (ph[i0] >= 252 || z < s || z >= D - s || y < s || y >= H - s || x < s || x >= W - s) continue;
@@ -262,6 +269,10 @@ template <typename LT> __global__ void count_seg_k(const LT *dl, const uint8_t *
         int ok = 1; for (int q = 0; q < 6; q++) ok &= a[q] < 252; if (!ok) continue;
         float g[3] = {(float)cnt_pdiff(a[0], a[1]), (float)cnt_pdiff(a[2], a[3]), (float)cnt_pdiff(a[4], a[5])};
         const float gn = sqrtf(g[0] * g[0] + g[1] * g[1] + g[2] * g[2]); if (gn < 1e-3f) continue;
+        if (want >= 0 && tries < ntries - 16) {   /* the GT sheet spacing here: 2 s 252 / |phase difference over 2 s| voxels */
+            const float sp = 2.f * s * 252.f / gn; int b = 0; while (b < st.n && sp >= st.e[b]) b++;
+            if (b != want) continue;
+        }
         for (int q = 0; q < 3; q++) g[q] /= gn;
         float tg = 0.f, tp = 0.f; int prev = ph[i0], valid = 1;
         for (int j = 0; j < L && valid; j++) {
@@ -300,8 +311,8 @@ extern "C" void nn_count_loss(const void *dens_logits, const uint8_t *phase, int
                               float lambda, void *dens_grad, float *acc, float *seg, unsigned *nvalid, float *out2) {
     const size_t n = (size_t)d * h * w;
     cudaMemsetAsync(nvalid, 0, sizeof *nvalid);
-    if (g_logits_h16) count_seg_k<f16><<<nblk(K, 128), 128>>>((const f16 *)dens_logits, phase, d, h, w, s, K, L, dscale, seed, acc, seg, nvalid);
-    else count_seg_k<float><<<nblk(K, 128), 128>>>((const float *)dens_logits, phase, d, h, w, s, K, L, dscale, seed, acc, seg, nvalid);
+    if (g_logits_h16) count_seg_k<f16><<<nblk(K, 128), 128>>>((const f16 *)dens_logits, phase, d, h, w, s, K, L, dscale, seed, acc, seg, nvalid, g_cnt_strata);
+    else count_seg_k<float><<<nblk(K, 128), 128>>>((const float *)dens_logits, phase, d, h, w, s, K, L, dscale, seed, acc, seg, nvalid, g_cnt_strata);
     count_sum_k<<<1, 32>>>(seg, K, nvalid, out2);
     if (dens_grad) {
         if (!g_loss_g16) count_apply_k<float><<<nblk(n, 256), 256>>>((float *)dens_grad, acc, n, nvalid, lambda);

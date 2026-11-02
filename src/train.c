@@ -137,7 +137,7 @@ static int g_hs_z;         /* its planes per slab */
 static int g_ds; static float g_ds_w = 0.5f, g_ds_frac = 1.f; static int g_ds_anneal = 1;   /* --deep-sup K: decoder levels 1..K, weight w^j x frac */
 static int g_distill, g_distill_lev = 3, g_distill_div; static float g_distill_w = 1.f; static float g_distill_pap;   /* --distill-papyrus F: targets only on head cells >= F papyrus */ static size_t g_distill_n;   /* --distill C: a C-channel 1^3 head on decoder level --distill-level
                                                                                                     (cells of g_distill_div^3 window voxels; g_distill_n int8 targets per batch), cosine loss x --distill-weight */
-static float g_count_lambda; static int g_count_K = 1024, g_count_L = 64;   /* --count-lambda / -segments / -length: the count loss (nn_count_loss) */
+static float g_count_lambda; static int g_count_K = 1024, g_count_L = 64; static int g_cnt_ns; static float g_cnt_edges[8];   /* --count-strata */   /* --count-lambda / -segments / -length: the count loss (nn_count_loss) */
 static float g_pg_lambda, g_pg_dist[4] = {2.f}; static int g_pg_nd = 1, g_pg_angle, g_pg_mask;   /* --pgrad-lambda / --pgrad-dist (D[,D...], up to 4): the phase wavenumber loss (nn_pgrad_slab; head slabs only) */
 /* --task papyrus: papyrus vs void inside the scroll, labels made by the sampler from the clean CT at a random cutoff per patch
    (src/papyrus.h) in target channel 0; --pap-cond 1 conditions the stem bias on that cutoff in input units (batch.um, unet_set_cond) */
@@ -1027,6 +1027,7 @@ static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
         if (train && g_norm_lambda != 1.f) nn_loss_grad_scale((char *)d->gl + g_norm_ch * l3 * eb, 7 * l3, g_norm_lambda);
         if (g_count_lambda > 0) {   /* turns along sheet-normal segments: the density integral against the true count */
             const size_t dch = (size_t)(g_norm_ch + 6);
+            nn_count_strata(g_cnt_ns, g_cnt_edges, d->um);
             nn_count_loss((const char *)lg + dch * l3 * le, d->sdb, os.d, os.h, os.w, g_norm_s, g_count_K, g_count_L, g_dens_scale,
                           ((uint64_t)d->dev << 48) ^ d->cnt_step++, g_count_lambda, train ? (char *)d->gl + dch * l3 * eb : nullptr, d->cnt_acc, d->cnt_seg, d->cnt_nv, d->cnt_out);
         }
@@ -1330,6 +1331,11 @@ int cmd_train(int argc, char **argv) {
           if (!(g_pg_lambda >= 0) || bad) { fprintf(stderr,"--pgrad-lambda >= 0, --pgrad-dist D[,D...] (1..16, up to 4)\n"); return 2; } }
         /* --count-lambda L (> 0): the count loss: per step --count-segments K segments of --count-length voxels along the true sheet
            normal, |log| of the predicted density integral over the true turns (nn_count_loss); needs --density-code 1 */
+        {   /* --count-strata E1,..,En (um, ascending, n <= 8): count segments drawn evenly from the n + 1 GT spacing bins (default off) */
+            const char *cs = opt(argc,argv,"--count-strata",""); g_cnt_ns = 0;
+            for (const char *q = cs; *q && g_cnt_ns < 8; ) { char *e; float v = strtof(q, &e); if (e == q) break; g_cnt_edges[g_cnt_ns++] = v; q = *e == ',' ? e + 1 : e; }
+            for (int i = 1; i < g_cnt_ns; i++) if (g_cnt_edges[i] <= g_cnt_edges[i - 1]) { fprintf(stderr,"--count-strata: ascending um edges\n"); return 2; }
+        }
         g_count_lambda = (float)atof(opt(argc,argv,"--count-lambda","0")); g_count_K = atoi(opt(argc,argv,"--count-segments","1024")); g_count_L = atoi(opt(argc,argv,"--count-length","64"));
         if (g_count_lambda < 0 || (g_count_lambda > 0 && (g_dens_code != 1 || g_count_K < 1 || g_count_K > 65536 || g_count_L < 4 || g_count_L > 1024 || !strcmp(opt(argc,argv,"--split","0"),"z")))) {
             fprintf(stderr,"--count-lambda: needs --density-code 1, --count-segments 1..65536, --count-length 4..1024, no --split\n"); return 2;
@@ -2416,7 +2422,7 @@ int cmd_train(int argc, char **argv) {
     }
     if (g_count_lambda > 0) {   /* the count loss */
         size_t n=strlen(runtime_extra); runtime_extra[n-1]=0;
-        snprintf(runtime_extra+n-1,sizeof runtime_extra-n+1,",\"count_loss\":{\"lambda\":%.9g,\"segments\":%d,\"length\":%d}}",g_count_lambda,g_count_K,g_count_L);
+        snprintf(runtime_extra+n-1,sizeof runtime_extra-n+1,",\"count_loss\":{\"lambda\":%.9g,\"segments\":%d,\"length\":%d,\"strata\":%d}}",g_count_lambda,g_count_K,g_count_L,g_cnt_ns);
     }
     if (g_Pz != P) {   /* slab windows: the training window's depth (predict --window-z) */
         size_t n=strlen(runtime_extra); runtime_extra[n-1]=0;
