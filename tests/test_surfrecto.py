@@ -150,6 +150,21 @@ def box_check(td, np):
           f"outside-box max {max(got[:8].max(), got[-8:].max(), got[:, :8].max(), got[:, -8:].max(), got[:, :, :8].max(), got[:, :, -8:].max()):.0f}, inside mean {got[8:-8, 8:-8, 8:-8].mean():.1f}")
     if d.max() > 1 or (d > 0).mean() > 1e-3:
         print("FAIL: blend"); fails += 1
+    # --part 0/2 + 1/2 (128^3 shards: two shard rows in y) into one array == the whole-box run (same global grid, no seam)
+    outp = td / "parts"
+    for i in range(2):
+        r = subprocess.run([str(UFSM), "surfrecto-predict", str(R.CKPT), CT_ROOT, CT_KEY, str(outp), "--box", ",".join(map(str, box)),
+                            "--window", str(Pw), "--overlap", "0.5", "--threads", "4", "--cache", str(CACHE), "--shard", "128", "--part", f"{i}/2"],
+                           capture_output=True, text=True)
+        if r.returncode:
+            print(f"FAIL: predict --part {i}/2: {r.stderr[-400:]}"); return fails + 1
+    rawp = td / "parts.u8"
+    subprocess.run([str(UFSM), "read", str(outp), "2.4", *map(str, lo), *map(str, n), str(rawp)], capture_output=True)
+    gp = np.fromfile(rawp, np.uint8).reshape(n).astype(np.float64)
+    dpt = np.abs(gp - got)
+    print(f"--part 0/2 + 1/2 vs the whole box: uint8 |d| max {dpt.max():.0f}, {100 * (dpt > 0).mean():.4f}% differ")
+    if dpt.max() > 2 or (dpt > 0).mean() > 0.02:   # GPU run-to-run noise only (margin |d| ~0.05 flips ~0.6% of the roundings)
+        print("FAIL: parts"); fails += 1
     # the first window: dumped margin vs --raw-in of the same CT
     o = [int(v) for v in sorted(have)[0][4:-4].split("_")]
     w = td / "w0.u8"

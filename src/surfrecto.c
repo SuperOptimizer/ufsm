@@ -274,11 +274,12 @@ int cmd_surfrecto_predict(int argc, char **argv) {
     if (!raw && argc >= 6 && argv[2][0] != '-') ck = argv[2];
     if (!ck || (!raw && argc < 6)) {
         fprintf(stderr, "usage: ufsm surfrecto-predict CKPT CT-ROOT CT-KEY OUT --box z0,y0,x0,z1,y1,x1 [--um 2.4] [--window 256] [--overlap 0.5]\n"
-                        "         [--tta 0] [--air 0] [--shard 512] [--gpu 0] [--gpu-mem GB] [--threads N] [--cache DIR] [--part i/n]\n"
+                        "         [--tta 0] [--air 0] [--shard 512] [--gpu 0] [--gpu-mem GB] [--threads N] [--cache DIR] [--part i/n] [--grid-box B]\n"
                         "  scrollprize/surface_recto_3dunet (checkpoint_inference_ready.pth) on a CT box (level-0 voxels, end-exclusive; the model\n"
                         "  works on 2.4 um CT). OUT/<um>: uint8 rint(255 p(recto surface)), full CT shape (voxel = CT voxel), 0 outside the box.\n"
                         "  --tta 1: 8-flip mirror TTA (villa default, 8x the time). --air A: also skip windows whose CT max < A.\n"
                         "  --part i/n: compute only the i-th of n shares of the box's 512-row y shard rows (one process per GPU into the same OUT).\n"
+                        "  --grid-box B: the window grid of box B (containing --box), so a sub-box rerun matches a whole-B run seamlessly.\n"
                         "  ufsm surfrecto-predict --ckpt PTH --raw-in WINDOW.u8 --raw-out DIR [--window 256] [--keep 1] [--tta 1]   one window (parity)\n");
         return 2;
     }
@@ -324,7 +325,21 @@ int cmd_surfrecto_predict(int argc, char **argv) {
         if (b * SH < C.box1[1]) C.box1[1] = b * SH;
         fprintf(stderr, "surfrecto: part %d/%d: y %lld - %lld\n", part_i, part_n, (long long)C.box0[1], (long long)C.box1[1]);
     }
-    for (int a = 0; a < 3; a++) C.G[a] = grid_of(C.box0[a], C.box1[a], V[a], P, S);
+    /* the window grid is that of the whole --box (or --grid-box), restricted to the windows touching this process's box: parts and
+       later reruns of a sub-box (--box inside --grid-box) reproduce the whole-box result exactly, without seams */
+    long long gb[6]; for (int k = 0; k < 6; k++) gb[k] = bv[k];
+    if (opt(argc, argv, "--grid-box", nullptr) && sscanf(opt(argc, argv, "--grid-box", ""), "%lld,%lld,%lld,%lld,%lld,%lld", gb, gb + 1, gb + 2, gb + 3, gb + 4, gb + 5) != 6) {
+        fprintf(stderr, "surfrecto: --grid-box z0,y0,x0,z1,y1,x1\n"); return 2;
+    }
+    for (int a = 0; a < 3; a++) {
+        if (gb[a] < 0) gb[a] = 0;
+        if (gb[3 + a] > V[a]) gb[3 + a] = V[a];
+        if (gb[a] > C.box0[a] || gb[3 + a] < C.box1[a]) { fprintf(stderr, "surfrecto: --grid-box must contain --box\n"); return 2; }
+        grid1 g = grid_of(gb[a], gb[3 + a], V[a], P, S); int m = 0;
+        for (int k = 0; k < g.n; k++) if (g.s[k] < C.box1[a] && g.s[k] + P > C.box0[a]) g.s[m++] = g.s[k];
+        g.n = m; C.G[a] = g;
+        if (!m) { fprintf(stderr, "surfrecto: no window touches the box along axis %d\n", a); return 2; }
+    }
     const long long nwin_all = (long long)C.G[0].n * C.G[1].n * C.G[2].n;
     const double boxvox = (double)(C.box1[0] - C.box0[0]) * (C.box1[1] - C.box0[1]) * (C.box1[2] - C.box0[2]);
     fprintf(stderr, "surfrecto: CT %lldx%lldx%lld, box %lld,%lld,%lld - %lld,%lld,%lld (%.3g voxels), window %d stride %d, grid %dx%dx%d = %lld windows, tta %d\n",
