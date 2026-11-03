@@ -480,14 +480,14 @@ __global__ void rv_tg_k(const uint8_t *ph, const uint8_t *pap, size_t n, uint8_t
     m[i] = 1;
 }
 extern "C" void nn_rv_targets(const uint8_t *phase, const uint8_t *pap, size_t n, uint8_t *t, uint8_t *m) { rv_tg_k<<<nblk(n, 256), 256>>>(phase, pap, n, t, m); KCHECK(); }
-/* predict --channel rv (train --rv checkpoints): the two side logits [recto | verso] of a window -> channel 0 := logit of
-   (1 + p_recto - p_verso) / 2, so the written uint8 is 255 (1 + p_r - p_v) / 2: recto side high, verso side low, void ~128 */
+/* predict --channel rv (train --rv checkpoints): the two side logits [recto | verso] of a window -> channel 0 := the logit whose
+   written uint8 is 1 + 254 (1 + p_r - p_v) / 2: recto side high (255), verso side low (1), void ~128; 0 = outside the scan (CT 0) */
 template <typename T> __global__ void rv_fuse_k(T *lg, size_t n) {
     const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     if (i >= n) return;
     const float a = (float)lg[i], b = (float)lg[n + i];
     const float pr = 1.f / (1.f + __expf(-a)), pv = 1.f / (1.f + __expf(-b));
-    float q = 0.5f + 0.5f * (pr - pv); q = fminf(fmaxf(q, 1e-4f), 1.f - 1e-4f);
+    float q = (1.f + 254.f * (0.5f + 0.5f * (pr - pv))) / 255.f; q = fminf(fmaxf(q, 1.5f / 255.f), 1.f - 1e-4f);   /* 1..255: 0 stays the CT-0 mask */
     lg[i] = (T)__logf(q / (1.f - q));
 }
 extern "C" void nn_rv_fuse(void *lg, size_t n, int h16) {

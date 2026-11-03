@@ -74,6 +74,15 @@ int main(int argc, char **argv) {
     {   char p[600]; snprintf(p, sizeof p, "%s/pf/zarr.json", d); char *z = slurp(p);
         CHECK(z && strstr(z, "recto / verso side"), "the fused volume's content attribute"); free(z); }
     CHECK(sh("%s predict %s/b/last.ckpt %s/fx ct %s/pz --fit-zarr %s/fz %s > %s/pz.log 2>&1", U, d, d, d, d, pr, d) != 0, "--fit-zarr accepted an rv checkpoint");
+    /* (5) side-face on the fixture (its wraps sit on the sheets' inner faces): faces found, boundaries at void, output readable */
+    CHECK(!sh("%s side-face %s/fx/phase 1 %s/fx/ct 19.2 %s/sf 19.2 --iso 100 --per-voxel 1 --threads 2 --block 64 --shard 128 > %s/sf.log 2> %s/sf.err", U, d, d, d, d, d), "side-face (%s/sf.err)", d);
+    {   char p[600]; snprintf(p, sizeof p, "%s/sf.log", d); char *lg = slurp(p);
+        const char *f = lg ? strstr(lg, "face found ") : nullptr; const double ff = f ? atof(f + 11) : -1;
+        const char *b = lg ? strstr(lg, "face-anchored verso->recto boundaries") : nullptr; const char *v = b ? strstr(b, "void ") : nullptr; const double bv = v ? atof(v + 5) : -1;
+        CHECK(ff > 0.95 && bv > 0.95, "side-face: face found %g, anchored boundaries at void %g (want > 0.95)", ff, bv);
+        free(lg);
+        CHECK(!sh("test -e %s/sf/19.2/zarr.json", d), "side-face output array");
+    }
     /* (4) refused combination */
     CHECK(sh("%s train %s/fx/sources.json --out %s/c --steps 1 --ink-head 1 %s > %s/c.log 2>&1", U, d, d, common, d) != 0, "--rv with --ink-head accepted");
     if (!fails) sh("rm -rf %s", d);
