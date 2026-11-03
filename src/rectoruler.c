@@ -402,7 +402,8 @@ static int rr_read_plane(rr_src *s, double zg, double um, const double morg[3], 
             for (int d = 0; d < 3; d++) { if (v[d] < lo[d]) lo[d] = v[d]; if (v[d] > hi[d]) hi[d] = v[d]; }
         }
         for (int d = 0; d < 3; d++) {
-            const int64_t a = (int64_t)floor(lo[d]) - 3, b = (int64_t)ceil(hi[d]) + 4;
+            int64_t a = (int64_t)floor(lo[d]) - 3, b = (int64_t)ceil(hi[d]) + 4;
+            if (s->hasbox) { if (a < (int64_t)s->vb[d] - 1) a = (int64_t)s->vb[d] - 1; if (b > (int64_t)s->vb[d + 3] + 2) b = (int64_t)s->vb[d + 3] + 2; }   /* only the --src-box part */
             s->po[d] = a < 0 ? 0 : a; int64_t e = b > s->shape[d] ? s->shape[d] : b; s->pn[d] = e - s->po[d];
             if (s->pn[d] < 2) { s->pn[0] = 0; return 0; }
         }
