@@ -46,7 +46,7 @@ int main(int argc, char **argv) {
     }
     char d[] = "/tmp/test_rv_XXXXXX"; if (!mkdtemp(d)) return 1;
     CHECK(!sh("%s %s/fx 256 2 > %s/fx.log 2>&1", argv[2], d, d), "fixture");
-    const char *common = "--task unwrap2 --rv 1 --rv-iso 100 --P 64 --B 1 --gpus 0 --workers 2 --sampler-slots 4 --val-batches 2 --val-every 1000 --log-every 1 "
+    const char *common = "--task unwrap2 --rv 1 --rv-iso 100 --levels 1 --P 64 --B 1 --gpus 0 --workers 2 --sampler-slots 4 --val-batches 2 --val-every 1000 --log-every 1 "
                          "--ckpt-every 1000 --fp4 2 --input-prec 8 --warmup 0 --seed 5 --wind4-tile 0 --widths 16,32,64";
     /* (2) from scratch, then a resume */
     CHECK(!sh("UFSM_GRAD_MX8=1 %s train %s/fx/sources.json --out %s/b --steps 6 %s > %s/b.log 2>&1", U, d, d, common, d), "rv net (%s/b.log)", d);
@@ -59,7 +59,7 @@ int main(int argc, char **argv) {
         if (f) { if (!fgets(hdr, sizeof hdr, f)) hdr[0] = 0; fclose(f); }
         CHECK(strstr(hdr, "\"unwrap\":{\"version\":2") && strstr(hdr, "\"rv\":{\"version\":1,\"recto\":0,\"verso\":1,\"iso\":100"), "checkpoint header: unwrap 2 with the rv block");
     }
-    CHECK(!sh("UFSM_GRAD_MX8=1 %s train %s/fx/sources.json --out %s/b --steps 8 --phase-interp 1 --resume %s/b/last.ckpt %s > %s/b2.log 2>&1", U, d, d, d, common, d), "resume (%s/b2.log)", d);
+    CHECK(!sh("UFSM_GRAD_MX8=1 %s train %s/fx/sources.json --out %s/b --steps 8 --resume %s/b/last.ckpt %s > %s/b2.log 2>&1", U, d, d, d, common, d), "resume (%s/b2.log)", d);
     {   char p[600]; snprintf(p, sizeof p, "%s/b2.log", d); char *lg = slurp(p);
         CHECK(lg && strstr(lg, "resumed") && strstr(lg, " rv bce "), "resume trains the rv head on");
         free(lg);
@@ -82,6 +82,15 @@ int main(int argc, char **argv) {
         CHECK(ff > 0.95 && bv > 0.95, "side-face: face found %g, anchored boundaries at void %g (want > 0.95)", ff, bv);
         free(lg);
         CHECK(!sh("test -e %s/sf/19.2/zarr.json", d), "side-face output array");
+    }
+    /* (6) side-gate on the fixture's level-0 phase against itself as GT: one papyrus run per turn on most voxels, kept agreement 1 */
+    CHECK(!sh("%s side-gate %s/fx/phase0 0 %s/fx/ct 9.6 %s/sg 9.6 --iso 100 --runs 1,1 --gt %s/fx/phase0 0 --threads 2 --block 64 --shard 128 > %s/sg.log 2> %s/sg.err", U, d, d, d, d, d, d), "side-gate (%s/sg.err)", d);
+    {   char p[600]; snprintf(p, sizeof p, "%s/sg.log", d); char *lg = slurp(p);
+        const char *k = lg ? strstr(lg, "kept ") : nullptr; const char *sh_ = k ? strstr(k, "(") : nullptr; const double ks = sh_ ? atof(sh_ + 1) : -1;
+        const char *a = lg ? strstr(lg, "agreement ") : nullptr; const double ag = a ? atof(a + 10) : -1;
+        CHECK(ks > 0.5 && ag > 0.999, "side-gate: kept share %g (want > 0.5), agreement vs itself %g (want 1)", ks, ag);
+        free(lg);
+        CHECK(!sh("test -e %s/sg/9.6/zarr.json", d), "side-gate output array");
     }
     /* (4) refused combination */
     CHECK(sh("%s train %s/fx/sources.json --out %s/c --steps 1 --ink-head 1 %s > %s/c.log 2>&1", U, d, d, common, d) != 0, "--rv with --ink-head accepted");

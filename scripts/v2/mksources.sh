@@ -75,7 +75,7 @@ done < $T/surf.txt
 P4K=$(jq -r '.sources[0].ct' $PK8)
 [ -e $V2/ct/$P4K ] || { echo "mksources: $V2/ct/$P4K missing" >&2; exit 1; }
 GW=$(jq '[.sources[].weight] | add' $PK8)
-jq -c --arg r $V2/ct --argjson s $(awk -v g=$GTS -v w=$GW 'BEGIN { print g / w }') '.sources[] | .root = $r | .weight = (.weight * $s)' $PK8 > $T/gt.jsonl
+jq -c --arg r $V2/ct --argjson s $(awk -v g=$GTS -v w=$GW 'BEGIN { print g / w }') '.sources[] | .root = $r | .weight = (.weight * $s) | .max_level = (.max_level // .min_level)' $PK8 > $T/gt.jsonl   # (one training level: the stored phase's)
 # 3. human ink (ift3's relative weights, scaled to INKSHARE)
 IW=$(awk -F'\t' '!/^#/ { s += $6 } END { print s }' $H/inkhuman.tsv)
 awk -F'\t' '!/^#/' $H/inkhuman.tsv | while IFS=$'\t' read -r n S vol um lv w lab hold ax; do
@@ -98,4 +98,7 @@ jq -c '.boxes[]' $HO | while read -r b; do
 done
 cat $T/all.jsonl $( [ -s $T/hold.jsonl ] && echo $T/hold.jsonl ) | jq -c --arg h $HO '. + {holdout_file: $h}' |
   jq -s --arg c $V2/cache '{cache: $c, sources: .}' > $OUT
+# labels at the training level (11-03 rule; train refuses anything coarser): every stored phase on the grid of the source's one training level
+jq -e '[.sources[] | select(.targets.band.phase) | select(.min_level != .targets.band.phase.level or .max_level != .targets.band.phase.level) | .name] as $b
+  | if ($b | length) > 0 then error("stored phase not at the training level: \($b | join(", "))") else true end' $OUT > /dev/null
 echo "mksources: $OUT: $(jq '.sources | length' $OUT) sources: $(wc -l < $T/surf.jsonl) surface ($SURF, $SV mm3), Paris 4 GT ($GTS), $(wc -l < $T/ink.jsonl) human ink ($INKS), $( [ -s $T/hold.jsonl ] && wc -l < $T/hold.jsonl || echo 0) holdout dummies" >&2

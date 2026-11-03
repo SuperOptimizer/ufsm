@@ -236,6 +236,12 @@ sources *sources_load(const char *path) {
                 const z3_meta *bm = z3_meta_of(s->band), *pm = s->phase ? z3_meta_of(s->phase) : nullptr;
                 const int sh = s->phase_level - 1;   /* the label grid is level 1: shapes halve per level above it */
                 if (s->phase_only) {}
+                else if (pm && sh == -1) {   /* the phase on the level-0 grid (labels at the training level): twice the label grid */
+                    if ((pm->shape[0] + 1) >> 1 != bm->shape[0] || (pm->shape[1] + 1) >> 1 != bm->shape[1] || (pm->shape[2] + 1) >> 1 != bm->shape[2]) {
+                        fprintf(stderr, "sources: %s: the level-0 stored phase %s/%s is not twice the band codes' shape\n", s->name, proot ? proot : "?", pkey);
+                        json_free(j); sources_free(S); return nullptr;
+                    }
+                }
                 else if (!pm || sh < 0 || sh > 4 ||pm->shape[0] != (bm->shape[0] + (1 << sh) - 1) >> sh || pm->shape[1] != (bm->shape[1] + (1 << sh) - 1) >> sh || pm->shape[2] != (bm->shape[2] + (1 << sh) - 1) >> sh) {
                     fprintf(stderr, "sources: %s: cannot open the stored phase %s/%s or its shape differs from the band codes'\n", s->name, proot ? proot : "?", pkey);
                     json_free(j); sources_free(S); return nullptr;

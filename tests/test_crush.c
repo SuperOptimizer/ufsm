@@ -125,7 +125,7 @@ static void cls_agree(const crush_map *m, const uint8_t *ct, const an_ctx *a, in
     for (int c = 0; c < 2; c++) ag[c] = n[c] ? (double)ok[c] / n[c] : 0;
 }
 static void window_tests(const char *dir) {
-    char path[1400]; snprintf(path, sizeof path, "%s/sources.json", dir);
+    char path[1400]; snprintf(path, sizeof path, "%s/sources-l1.json", dir);
     sources *S = sources_load(path); assert(S);
     source *s = &S->src[0];
     z3 *ct1 = source_ct(s, 1), *ct0 = source_ct(s, 0); assert(ct1 && ct0 && s->phase && s->phase_level == 1);
@@ -285,7 +285,7 @@ static int same(const snap *a, const snap *b, size_t p3) {
 }
 static void drop(snap *o) { for (int i = 0; i < NB; i++) { free(o[i].x); free(o[i].side); free(o[i].w4); free(o[i].wc); } }
 static void sampler_tests(const char *dir) {
-    char path[1400]; snprintf(path, sizeof path, "%s/sources.json", dir);
+    char path[1400]; snprintf(path, sizeof path, "%s/sources-l1.json", dir);
     sources *S = sources_load(path); assert(S);
     const int PW = 64; const size_t p3 = (size_t)PW * PW * PW;
     sample_cfg c = sample_cfg_default();

@@ -18,7 +18,7 @@ int main(int argc, char **argv) {
         snprintf(path, sizeof path, "%s/%s", argv[1], label ? "labels" : "ct");
         if (z3w_write_group(path, &um, 1, label ? "labels" : "ct", nullptr)) return 1;
     }
-    /* Coarse binary bands, sampled on the finer CT grid by erosion tests. */
+    /* Binary bands for the erosion tests, at 2 um and (below) 1 um. */
     const int64_t coarse_shape[3] = {64,64,64}; const double coarse_um = 2;
     char path[1400]; snprintf(path, sizeof path, "%s/binary/2", argv[1]);
     z3w *w = z3w_create_mask(path, coarse_shape, 128, nullptr);
@@ -26,8 +26,16 @@ int main(int argc, char **argv) {
     for (int z=0; z<128; z++) for (int y=0; y<128; y++) for (int x=0; x<128; x++)
         data[(z*128+y)*128+x] = x%8==3 || x%8==4 ? 255 : 0;
     if (z3w_write_shard(w,0,0,0,data,2) || z3w_close(w)) return 1;
+    /* the same bands on the 1 um grid (labels at the training level, 11-03): the 2 um cells as the old nearest upsampling read them
+       (fine q -> coarse (q + 1) >> 1: x % 16 in 5..8) */
+    snprintf(path, sizeof path, "%s/binary/1", argv[1]);
+    if (!(w = z3w_create_mask(path, shape, 128, nullptr))) return 1;
+    for (int z=0; z<128; z++) for (int y=0; y<128; y++) for (int x=0; x<128; x++)
+        data[(z*128+y)*128+x] = x%16>=5 && x%16<=8 ? 255 : 0;
+    if (z3w_write_shard(w,0,0,0,data,2) || z3w_close(w)) return 1;
+    const double bum[2] = {1, coarse_um};
     snprintf(path,sizeof path,"%s/binary",argv[1]);
-    if (z3w_write_group(path,&coarse_um,1,"binary",nullptr)) return 1;
+    if (z3w_write_group(path,bum,2,"binary",nullptr)) return 1;
     /* predict --full-grid / --resume / --occupancy: a two-level CT (1 and 2 um) of 256 x 128 x 128 whose z < 136 is air */
     const int64_t ashape[3] = {256, 128, 128}, cshape[3] = {128, 64, 64}; const double aum[2] = {1, 2};
     snprintf(path, sizeof path, "%s/ctair/1", argv[1]);

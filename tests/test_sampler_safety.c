@@ -46,7 +46,7 @@ int main(int argc, char **argv) {
     {
         char path[1400]; snprintf(path,sizeof path,"%s/erosion-sources.json",argv[1]);
         FILE *f=fopen(path,"w"); assert(f);
-        fprintf(f,"{\"sources\":[{\"name\":\"a\",\"root\":\"%s\",\"ct\":\"ct\",\"um\":1,\"targets\":{\"recto\":{\"root\":\"%s\",\"group\":\"binary\",\"encoding\":\"binary\",\"min_level\":1}}}]}\n",argv[1],argv[1]);
+        fprintf(f,"{\"sources\":[{\"name\":\"a\",\"root\":\"%s\",\"ct\":\"ct\",\"um\":1,\"targets\":{\"recto\":{\"root\":\"%s\",\"group\":\"binary\",\"encoding\":\"binary\"}}}]}\n",argv[1],argv[1]);
         assert(!fclose(f)); sources *E=sources_load(path); assert(E);
         int64_t etiles[2][4]={{0,9,15,4},{0,25,31,20}};
         cover_plan ep={.P=16,.count=2,.tiles=etiles}; sample_cfg ec=config();
@@ -65,7 +65,7 @@ int main(int argc, char **argv) {
             }
             exact &= sampler_next(esp)==nullptr && !sampler_failed(esp); sampler_stop(esp);
         }
-        check("native erosion after coarse upsampling, real halo",exact);
+        check("native erosion of a level-0 binary target, real halo",exact);
         ec.nworkers=1; ec.soft=2; sampler *esp=sampler_start(E,&ec); assert(esp);
         batch *eb=sampler_next(esp); assert(eb);
         check("erosion precedes softening and retains unit core",eb->t[2]==255 && eb->t[3]==255 && eb->t[1]==225);
@@ -75,6 +75,13 @@ int main(int argc, char **argv) {
         sampler_release(esp,eb); sampler_stop(esp); E->src[0].um=1; ec.soft=2; ec.soft_um=0;
         ec.cover=nullptr; ec.level_p[1]=1; esp=sampler_start(E,&ec);
         check("erosion allows coarser levels (it erodes level 0 only)",esp!=nullptr); sampler_stop(esp);
+        sources_free(E);
+        /* no coarse labels (11-03): the same target read from its 2 um rung ("min_level": 1) for 1 um windows is refused at start */
+        f=fopen(path,"w"); assert(f);
+        fprintf(f,"{\"sources\":[{\"name\":\"a\",\"root\":\"%s\",\"ct\":\"ct\",\"um\":1,\"targets\":{\"recto\":{\"root\":\"%s\",\"group\":\"binary\",\"encoding\":\"binary\",\"min_level\":1}}}]}\n",argv[1],argv[1]);
+        assert(!fclose(f)); E=sources_load(path); assert(E);
+        sample_cfg cc=config(); esp=sampler_start(E,&cc);
+        check("a target stored coarser than the window is refused",esp==nullptr); if (esp) sampler_stop(esp);
         sources_free(E);
     }
     sources *S = fixture(argv[1], ",\"holdout\":[7,11,13,51,53,55]");

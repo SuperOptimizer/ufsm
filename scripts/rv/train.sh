@@ -22,7 +22,7 @@ AUG="--zfix 1 --symmetry-p 0.5 --geometry-aug 1 --rotate-deg 5 --rotate-p 0.2 --
   --aug none --aug-strength 1 --aug-blur-p 0.7 --aug-blur-s 1.6 --aug-lowres-p 0.1 --aug-lowres-s 0.6 --aug-paganin-p 0.2 --aug-paganin-s 1.0 \
   --aug-tone-p 0.3 --aug-gin-p 0.15 --aug-noise-p 0.15 --aug-cnoise-p 0.1 \
   --aug-sharpen-p 0.03 --aug-ring-p 0.1 --aug-slice-p 0.1 --aug-quant-p 0.1 --aug-bias-p 0.15 --aug-cupping-p 0.1 ${HISTAUG:-}"
-HEADS="--task unwrap2 --rv 1 --phase-interp 1 --rv-iso ${ISO:-64} --wind4-lambda ${WIND4L:-0.25} --density-scale 4 --density-code 1 --packed-weight 8 --normal-step 1"
+HEADS="--task unwrap2 --rv 1 --rv-iso ${ISO:-64} --wind4-lambda ${WIND4L:-0.25} --density-scale 4 --density-code 1 --packed-weight 8 --normal-step 1"
 ARGS=($SRCJ --out $o --gpus 0 --P $P --B 1 $ARCH $HEADS --steps $STEPS --sched wsd --cooldown 0.2 --opt muon \
   --fp4 2 --gpu-aug 2 --input-prec 8 --mem ${MEMMODE:-auto} --val-store disk --workers ${WORKERS:-12} --sampler-slots ${SLOTS:-16} \
   --log-every ${LOGE:-50} --val-every ${VAL:-2000} --val-batches ${VALB:-16} --ckpt-every ${CKPT:-1000} --seed ${SEED:-3} --val-seed 1 \

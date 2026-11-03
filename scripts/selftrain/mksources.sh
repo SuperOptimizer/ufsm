@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # mksources.sh ARM OUT.json: the student's sources = GT (Paris 4 June / July from sources-pk8 with its PH1-3 / HOLD holdouts and packing
-# focus; PHerc0139 published-wrap GT, level-1 stored phase) + one phase-only pseudo-label source per scan of round R (A/r$R/labels/ARM/<S>,
+# focus; PHerc0139 published-wrap GT, the native 9.362 um stored phase) + one phase-only pseudo-label source per scan of round R (A/r$R/labels/ARM/<S>,
 # fit --winding-mod14 3 codes on the scan's training level). Pseudo sources share PSHARE (0.35) of the total weight, split by labelled
 # volume (mm^3 = gated voxels from A/r$R/stats/*.ARM.txt); GT keeps its relative weights. Bench holdouts (HO, all scrolls
 # boxes): "holdout_file" on every source + weight-1e-6 copies holding each box grown by MARGIN_MM 0.5 (the sampler holds a source's box out of every source of
@@ -11,10 +11,10 @@ ARM=$1 OUT=$2; A=${A:-/vesuvius/ufsm/selftrain}; R=${R:-0}; RD=$A/r$R; D=$(dirna
 HO=${HO:-/vesuvius/ufsm/wbench/holdouts.json}; PK8=${PK8:-/vesuvius/ufsm/paris4/wnew/sources-pk8.json}; CT=/vesuvius/ufsm/u0/vol
 GT=/vesuvius/ufsm/gt; T=$(mktemp -d); trap 'rm -rf $T' EXIT
 # GT: Paris 4 (all pk8 entries, holdout dummies included) + 0139
-jq -c '.sources[]' $PK8 > $T/gt.jsonl
-jq -nc --arg r $CT --arg g $GT/PHerc0139-wind-20261016 '{name: "PHerc0139-wind", root: $r, ct: "PHerc0139/20250728140407-9.362um-1.2m-113keV-masked.zarr",
-  um: 9.362, max_level: 0, axis: "/vesuvius/ufsm/gt/axis/PHerc0139-umb-scan.json", trust_band: 5, weight: 0.0958,
-  targets: {band: {root: ($g + "/codes"), key: "18.72", radius: 20, span: 19, phase: {root: ($g + "/phase"), key: "18.72", level: 1}}}}' >> $T/gt.jsonl
+jq -c '.sources[] | .max_level = (.max_level // .min_level)' $PK8 > $T/gt.jsonl   # (one training level: the stored phase's)
+jq -nc --arg r $CT --arg g ${P0139:-/vesuvius/ufsm/v2/rv/gt/p0139full} '{name: "PHerc0139-wind", root: $r, ct: "PHerc0139/20250728140407-9.362um-1.2m-113keV-masked.zarr",
+  um: 9.362, min_level: 0, max_level: 0, axis: "/vesuvius/ufsm/gt/axis/PHerc0139-umb-scan.json", trust_band: 5, weight: 0.0958,
+  targets: {band: {radius: 20, span: 19, phase: {root: ($g + "/phase"), key: "9.362", level: 0}}}}' >> $T/gt.jsonl   # (native 9.362 phase: labels at the training level)
 GW=$(jq -s 'map(.weight) | add' $T/gt.jsonl)
 # pseudo: labelled volume per scan
 awk -F'\t' '!/^#/ && $8 == "go"' $D/scans.tsv | while IFS=$'\t' read -r S SC LV UM VOL AX NB ST; do
@@ -35,7 +35,7 @@ while read -r S SC LV UM VOL AX mm3 nl nt key; do
   w=$(awk -v m=$mm3 -v v=$PV -v p=$PW 'BEGIN {printf "%.6f", p * m / v}')
   printf "%-14s %8s %12s %6.1f%% %s\n" $S $mm3 $nl $(awk -v a=$nl -v b=$nt 'BEGIN {print b ? 100 * a / b : 0}') $w >&2
   jq -nc --arg n "$S-pseudo-r$R-$ARM" --arg r $CT --arg c $VOL --argjson um $UM --argjson lv $LV --arg ax $AX --argjson w $w --arg pr $RD/labels/$ARM/$S --arg pk $key \
-    '{name: $n, root: $r, ct: $c, um: $um, axis: $ax, weight: $w} + (if $lv == 2 then {min_level: 2} else {max_level: 0} end)
+    '{name: $n, root: $r, ct: $c, um: $um, axis: $ax, weight: $w} + (if $lv == 2 then {min_level: 2, max_level: 2} else {min_level: 0, max_level: 0} end)
      + {targets: {band: {radius: 20, span: 19, phase: {root: $pr, key: $pk, level: $lv}}}}' >> $T/ps.jsonl
 done < $T/ps.txt
 # bench holdouts (HO, every scroll incl. Paris 4's July-only slabs): every source carries "holdout_file" (the sampler holds out the
@@ -51,4 +51,7 @@ jq -c '.boxes[]' $HO | while read -r b; do
           holdout: [$b.l0[0] - $m, $b.l0[1] - $m, $b.l0[2] - $m, $b.l0[3] + 2 * $m, $b.l0[4] + 2 * $m, $b.l0[5] + 2 * $m]}' >> $T/hold.jsonl
 done
 cat $T/all.jsonl $( [ -s $T/hold.jsonl ] && echo $T/hold.jsonl ) | jq -c --arg h $HO '. + {holdout_file: $h}' | jq -s '{cache: "/vesuvius/ufsm/cache", sources: .}' > $OUT
+# labels at the training level (11-03 rule; train refuses anything coarser): every stored phase on the grid of the source's one training level
+jq -e '[.sources[] | select(.targets.band.phase) | select(.min_level != .targets.band.phase.level or .max_level != .targets.band.phase.level) | .name] as $b
+  | if ($b | length) > 0 then error("stored phase not at the training level: \($b | join(", "))") else true end' $OUT > /dev/null
 echo "mksources: $OUT: $(jq '.sources | length' $OUT) sources, GT weight $GW, pseudo weight $PW (share $PS) over $PV mm3" >&2
