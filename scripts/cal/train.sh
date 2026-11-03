@@ -10,7 +10,7 @@ AUG="--zfix 1 --symmetry-p 0.5 --geometry-aug 1 --rotate-deg 5 --rotate-p 0.2 --
 R=(--init-from /root/pod/ckpt/wind96-wk1-best.ckpt); [ -f $o/last.ckpt ] && R=(--resume $o/last.ckpt)
 export MALLOC_ARENA_MAX=4
 echo $$ > $o.pid
-nice -n 5 $U train ${SRC:-$C/sources-cal.json} --out $o --gpus 0 --P ${P:-512} --B 1 \
+nice -n 5 $U train ${SRC:-$C/sources-cal.json} --out $o --gpus 0 --P ${P:-512} --B 1 --phase-interp 1 \
   --widths 32,64,96,128,160,192 --dec-widths 0,32 --scale-cond 1 --task unwrap2 --density-scale 4 --density-code 1 --packed-weight 8 --normal-step 1 \
   --density-packed 0 --count-lambda ${CL:-0.05} --count-segments 1024 --count-length 64 --count-strata ${STRATA:-70,115,130,230} \
   --trunk-lr-mult 0.25 --trunk-lr-steps 2000 \

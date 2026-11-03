@@ -1431,6 +1431,14 @@ static int phase_window(z3 *a, const int64_t o[3], int D, int P, int shift, uint
     tp_put(ph, N);
     return 0;
 }
+/* train --phase-interp 1 (cfg.phase_interp1): a stored phase ONE level coarser than the window read circular-trilinearly (wrap-aware, as
+   shift >= 2 always is) instead of the nearest coarse voxel, whose 2x staircase moves the recto / verso edge by up to a voxel (P4 19.2 copy
+   vs the 9.6 GT: papyrus side agreement nearest .84-.87, circular trilinear .93-.95). Only the phase itself (not ignore masks / windings) */
+static _Atomic int g_phase_interp1;
+static int phase_window_p(z3 *a, const int64_t o[3], int D, int P, int shift, uint8_t *side) {
+    if (shift == 1 && atomic_load(&g_phase_interp1)) return phase_window_interp(a, o, D, P, shift, side);
+    return phase_window(a, o, D, P, shift, side);
+}
 
 /* the source's aux volume (src/sources.h) over a window of its level; outside the volume 0 */
 static int aux_window(source *s, const int64_t o[3], int P, uint8_t *dst) {
@@ -2048,7 +2056,7 @@ static int tear_draw(sampler *sp, source *s, int l, const int64_t o[3], int P, i
     if (training_hits_holdout_box(sp, s, po, pn, l)) return 0;
     uint8_t *ctp = tp_get(pp3, 0), *php = tp_get(pp3 + 64, 0);
     if (!ctp || !php) { tp_put(ctp, pp3); tp_put(php, pp3 + 64); return -1; }
-    if (z3_read(source_ct(s, l), po, pn, ctp, 1) || phase_window(s->phase, po, Pp, Pp, pshift, php)) { tp_put(ctp, pp3); tp_put(php, pp3 + 64); return -1; }
+    if (z3_read(source_ct(s, l), po, pn, ctp, 1) || phase_window_p(s->phase, po, Pp, Pp, pshift, php)) { tp_put(ctp, pp3); tp_put(php, pp3 + 64); return -1; }
     double n[3], spacing = 0;
     if (sa_phase_normal(php, Pp, Pp, Pp, M, P / 32 > 1 ? P / 32 : 1, n, &spacing) < 32 || !(spacing > 2)) { tp_put(ctp, pp3); tp_put(php, pp3 + 64); return 0; }
     sa_tear *t = &g_crush.tear; sa_tear_make(t, seed, P, n, spacing, maxd);
@@ -2092,7 +2100,7 @@ static int delam_draw(sampler *sp, source *s, int l, const int64_t o[3], int P, 
     if (training_hits_holdout_box(sp, s, po, pn, l)) return 0;
     uint8_t *ctp = tp_get(pp3, 0), *php = tp_get(pp3 + 64, 0);
     if (!ctp || !php) { tp_put(ctp, pp3); tp_put(php, pp3 + 64); return -1; }
-    if (z3_read(source_ct(s, l), po, pn, ctp, 1) || phase_window(s->phase, po, Pp, Pp, pshift, php)) { tp_put(ctp, pp3); tp_put(php, pp3 + 64); return -1; }
+    if (z3_read(source_ct(s, l), po, pn, ctp, 1) || phase_window_p(s->phase, po, Pp, Pp, pshift, php)) { tp_put(ctp, pp3); tp_put(php, pp3 + 64); return -1; }
     double n[3], spacing = 0;
     const int iso = s->iso > 0 ? s->iso : c->iso > 0 ? c->iso : sa_ct_quantile(ctp, pp3, .5);
     sa_delam *d = &g_crush.delam;
@@ -2233,7 +2241,7 @@ static int density_draw(sampler *sp, source *s, const int64_t o[3], int Pz, int 
     if (!g_crush.ph) {   /* the window's stored phase, kept for the label path (g_crush.pre 0: its conflict mask still applies) */
         if (!(g_crush.ph = tp_get(p3 + 64, 0))) { tp_put(ph, p3 + 64); return -1; }
         g_crush.n = p3; g_crush.pre = 0;
-        if (phase_window(s->phase, o, Pz, P, pshift, g_crush.ph)) { tp_put(ph, p3 + 64); return -1; }
+        if (phase_window_p(s->phase, o, Pz, P, pshift, g_crush.ph)) { tp_put(ph, p3 + 64); return -1; }
         memset(g_crush.ph + p3, PHASE_UNKNOWN, 64);
     }
     memcpy(ph, g_crush.ph, p3);
@@ -2808,7 +2816,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
             uint8_t *sw = tp_get(p3 + 64, 0);   /* (+ 64: warp_phase_w4 reads byte pairs as 32-bit words) */
             int air_done = 0;   /* (phase_air ran with the winding input) */
             uint16_t *wq = nullptr;   /* warped --task unwrap2: the winding and its component for warp_phase_w4 (one pass with the phase) */
-            if (!sw || (g_crush.ph ? (memcpy(sw, g_crush.ph, p3), 0) : phase_window(s->phase, o, Pz, P, pshift, sw))) { tp_put(sw, p3 + 64); return -1; }
+            if (!sw || (g_crush.ph ? (memcpy(sw, g_crush.ph, p3), 0) : phase_window_p(s->phase, o, Pz, P, pshift, sw))) { tp_put(sw, p3 + 64); return -1; }
             if (s->phase_sign < 0) phase_negate(sw, p3);   /* (before the winding mod 4: it unwraps this phase) */
             if (s->phase_ign && pshift < 2 && !g_crush.pre) {   /* (--aug-tear: applied before the cut) (interpolated 2.4 um windows: no mask) "ignore": label sets that disagree there (ufsm phase-conflict): unknown, not trained on */
                 uint8_t *ig = tp_get(p3, 0);
@@ -3232,6 +3240,7 @@ int sources_prefetch(sources *S, int maxlev, int nthreads, double fraction, int 
     return 0;
 }
 sampler *sampler_start(sources *S, const sample_cfg *cfg) {
+    atomic_store(&g_phase_interp1, cfg->phase_interp1);
     if (!S || S->n <= 0 || cfg->P <= 0 || cfg->B <= 0 || cfg->nworkers <= 0 || cfg->nbuf <= 0) { fprintf(stderr, "sampler: invalid sources, patch, batch, workers or buffer count\n"); return nullptr; }
     if (cfg->gpu_input && !sample_gpu_input_ok(cfg)) { fprintf(stderr, "sampler: --gpu-input needs 16-bit batches and no warps, sheet prior, slab appearance plan, aux or condition inputs\n"); return nullptr; }
     if (cfg->erode < 0 || cfg->erode > 1 || (cfg->erode && (cfg->P < 2 || cfg->dilate || cfg->sheet))) {

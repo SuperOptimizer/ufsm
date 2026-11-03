@@ -1767,6 +1767,7 @@ int cmd_train(int argc, char **argv) {
     sc.band = g_aff; sc.side = g_side; sc.pmask = g_unwrap;   /* unwrap: the phase only (band codes per window, or the stored phase) */ sc.side_air = atoi(opt(argc, argv, "--side-air", "0"));
     sc.ink_plane = IPLANE;   /* --ink-head: the sources' "ink" targets on their own plane (batch.ink); --rv: the papyrus plane there */
     sc.rv_iso = g_rv ? atoi(opt(argc, argv, "--rv-iso", "60")) : 0;
+    sc.phase_interp1 = atoi(opt(argc, argv, "--phase-interp", "0"));   /* 1: stored phases one level coarser read circular-trilinearly (src/sample.c phase_window_p) */
     sc.wind4 = g_unwrap2; sc.wind4_step = atoi(opt(argc, argv, "--wind4-step", "80")); sc.wind4_min = atoi(opt(argc, argv, "--wind4-min", "512"));   /* unwrap2: band_wind4's join limit (phase codes) and smallest component */
     sc.emb_ch = g_distill; sc.emb_div = g_distill_div; sc.emb_pap = g_distill_pap;   /* --distill: the feature targets per head cell */
     { const int t = atoi(opt(argc, argv, "--wind4-tile", "64")); sc.wind4_tile = t > 0 ? t : -1; }   /* unwrap2: one gauge per tile of T voxels (>= P / 6), 0 = per window */

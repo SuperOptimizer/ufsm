@@ -59,7 +59,7 @@ int main(int argc, char **argv) {
         if (f) { if (!fgets(hdr, sizeof hdr, f)) hdr[0] = 0; fclose(f); }
         CHECK(strstr(hdr, "\"unwrap\":{\"version\":2") && strstr(hdr, "\"rv\":{\"version\":1,\"recto\":0,\"verso\":1,\"iso\":100"), "checkpoint header: unwrap 2 with the rv block");
     }
-    CHECK(!sh("UFSM_GRAD_MX8=1 %s train %s/fx/sources.json --out %s/b --steps 8 --resume %s/b/last.ckpt %s > %s/b2.log 2>&1", U, d, d, d, common, d), "resume (%s/b2.log)", d);
+    CHECK(!sh("UFSM_GRAD_MX8=1 %s train %s/fx/sources.json --out %s/b --steps 8 --phase-interp 1 --resume %s/b/last.ckpt %s > %s/b2.log 2>&1", U, d, d, d, common, d), "resume (%s/b2.log)", d);
     {   char p[600]; snprintf(p, sizeof p, "%s/b2.log", d); char *lg = slurp(p);
         CHECK(lg && strstr(lg, "resumed") && strstr(lg, " rv bce "), "resume trains the rv head on");
         free(lg);
