@@ -2161,6 +2161,8 @@ int cmd_train(int argc, char **argv) {
             if (getenv("UFSM_MEM_FREE_GB") && atof(getenv("UFSM_MEM_FREE_GB")) > 0) {   /* plan for another card's free memory (UFSM_MEM_DRY sizing for a busy GPU) */
                 fmin = (size_t)(atof(getenv("UFSM_MEM_FREE_GB")) * 1e9); fprintf(stderr, "memory: UFSM_MEM_FREE_GB: planning for %.2f GB free\n", fmin / 1e9);
             }
+            size_t mg_head = 0;   /* multi-GPU headroom per card (default 0.5 GB): peer contexts, gradient exchange and small late scratch */
+            if (ng > 1) { const char *h = getenv("UFSM_MG_HEADROOM_GB"); mg_head = (size_t)((h ? atof(h) : 0.5) * 1e9); fmin = fmin > mg_head ? fmin - mg_head : 0; }
             if (g_val_u) {   /* --val-P: the validation copy's inference build at N^3 stays out of the training budget */
                 g_val_reserve = unet_infer_bytes(g_val_u, (shape5){B, g_xc, g_valP, g_valP, g_valP});
                 g_val_reserve += g_val_reserve * 2 / 5 + ((size_t)256 << 20);   /* (the dry build counts ~3/4 of what it takes: 1.08 GB at 384^3) */
@@ -2219,6 +2221,11 @@ int cmd_train(int argc, char **argv) {
                             pass ? "" : ", no host offloads", tb / 1e9, tb / 14 / 1e9, grec / 1e9, trainer / 1e9, (need - grec - tb - tb / 14 - trainer - ((size_t)550 << 20)) / 1e9, (double)((size_t)550 << 20) / 1e9, need / 1e9);
                 if (need < min_need) { min_need = need; minc = c; min_hoff = pass; }   /* (no fit: the smallest mode evaluated) */
                 if (need <= fmin) { pick = c; pick_hoff = pass; pick_off = unet_last_offload_bytes(); pick_need = need; }
+            }
+            if (pick < 0 && ng > 1) {   /* multi-GPU: no try-anyway (the other cards' buffers eat the slack: P 640 on 2 x 16 GB aborted in gn_dsums, 11-03) */
+                fprintf(stderr, "memory: no mode fits %.2f GB free per GPU with the %d-GPU headroom (%.2f GB kept; smallest mode needs %.2f GB): refusing "
+                        "(use a smaller --P, fewer GPUs, or UFSM_MG_HEADROOM_GB)\n", fmin / 1e9, ng, mg_head / 1e9, (minc >= 0 ? min_need : need) / 1e9);
+                return 2;
             }
             if (pick < 0) { pick = minc >= 0 ? minc : auto16 ? nc - 1 : 8; pick_hoff = minc >= 0 ? min_hoff : 1; fprintf(stderr, "memory: no mode fits %.2f GB free (smallest needs %.2f GB); trying %s\n", fmin / 1e9, (minc >= 0 ? min_need : need) / 1e9, cand[pick].what); }
             else {   /* the mode, its device bytes per level-0 voxel of the window and its PCIe traffic per step */

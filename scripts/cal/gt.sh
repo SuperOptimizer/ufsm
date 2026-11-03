@@ -3,7 +3,9 @@
 # (lib.sh / named.sh / each.sh / p4.sh, 2026-10-19 wind-sense). Labels: codes + pair-rule phase at 2x the scan voxel (8-9 um scans: level 1)
 # or 9.6 um (2.4 um scans). Never invents adjacency: named = authors' wNNN numbering (set A) + the rest wind-assigned onto A;
 # each = every segment its own set, phases fused (gauge-free). Sense from all segments' geometry (wind-seed --k 0 dry); refused if undetermined.
-set -uo pipefail; S=$1; C=/root/cal; U=${U:-/root/pod/ufsm/build/ufsm}; T=${T:-12}; X=$C/axis
+# NATIVE=1 (11-03, no coarse labels): codes + phase at the scan's own voxel (level 0, --gs 2, radius 768 um) for 8-9 um scans.
+# Env C (/root/cal: the tree with axis/, seg/, gt/), X (axis dir, default $C/axis).
+set -uo pipefail; S=$1; C=${C:-/root/cal}; U=${U:-/root/pod/ufsm/build/ufsm}; T=${T:-12}; X=${X:-$C/axis}
 B=https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com
 step() { echo "== $(date +%T) $*"; }
 conf() { case $1 in   # VOLID UM SH AX MODE HIRES
@@ -46,6 +48,8 @@ step sense; [ -s $C/gt/dry-$S/set.json ] || nice -n 5 $U wind-seed $C/gt/dry-$S 
 jq -c '{sense, sense_determined, score, sense_margin, pitch, surfaces}' $C/gt/dry-$S/set.json; rm -rf $C/gt/dry-$S/*.tifxyz
 DET=$(jq -r .sense_determined $C/gt/dry-$S/set.json); SN=$(jq -r .sense $C/gt/dry-$S/set.json)
 if [ "$HI" = 1 ]; then LV=2; GS=4; LUM=9.6; R=160; [ $S = PHercMANBp ] && LUM=9.596; else LV=1; GS=2; LUM=$(echo "$UM*2" | bc -l | sed 's/0*$//'); R=$(echo "384/$UM" | bc); fi
+if [ -n "${NATIVE:-}" ]; then [ "$HI" = 1 ] && { echo "$S: NATIVE is for 8-9 um scans (2.4 um scans already train on their 9.6 level 2)"; exit 2; }
+  LV=0; GS=2; LUM=$UM; R=$(echo "768/$UM" | bc); fi
 RS=(); [ $S = PHercParis4 ] && RS=(--codes-grid 1 --box 36864,5120,5120,20480,24576,25600 --resume 1)
 case $MODE in
 p4|named)

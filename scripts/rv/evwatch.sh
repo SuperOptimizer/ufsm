@@ -20,7 +20,7 @@ while :; do
       while [ -f $o.launcher.pid ] && kill -0 $(cat $o.launcher.pid) 2>/dev/null; do sleep 10; done
       rm -f $o.stop
     fi
-    GPU=${eg:-$(sed -nE 's/.* GPU=([0-9]+) .*/\1/p' $o.relaunch)} bash $H/eval.sh $c $n-$st >> $o.evwatch.log 2>&1
+    GPU=${eg:-$(sed -nE 's/.* GPU=([0-9]+)[^ ]* .*/\1/p' $o.relaunch)} bash $H/eval.sh $c $n-$st >> $o.evwatch.log 2>&1
     touch $o/snap/$st.evaldone
     if [ "$pause" = 1 ]; then bash $o.relaunch; echo "$(date) relaunched" >> $o.evwatch.log; sleep 120; fi
   done
