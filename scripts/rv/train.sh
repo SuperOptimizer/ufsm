@@ -6,12 +6,14 @@
 # --mem auto (the planner's leanest storage that fits), --gpu-aug 2, packed sheets x8 (also on the rv loss).
 # Sources: scripts/rv/mksources.sh. Auto-resume from <run>/last.ckpt; STOP file <run>.stop (checked between relaunches; a running
 # trainer: kill -TERM $(cat <run>.pid), graceful). Checkpoints every CKPT (1000) steps, snapshots kept every SNAP (5000).
-# Env: R (run root, /vesuvius/ufsm/v2/rv/runs), U (binary), SRCJ, GPU (0), LOCK (flock file; "" = none), P (576), ARCH, WORKERS (12),
+# Env: R (run root, /vesuvius/ufsm/v2/rv/runs), U (binary), SRCJ, GPU (0, or "0,1": both, data parallel), LOCK (flock files, comma list; "" = none), P (576), ARCH, WORKERS (12),
 #      SLOTS (16), MEMMODE (auto), ALR / MLR, WIND4L (0.25), ISO (64), EXTRA. Needs MemAvailable >= MINMEM GB (40).
 set -u
 NAME=${1:?NAME}; STEPS=${2:?STEPS}
 R=${R:-/vesuvius/ufsm/v2/rv/runs}; U=${U:-/vesuvius/ufsm/v2/rv/bin/ufsm}; SRCJ=${SRCJ:-/vesuvius/ufsm/v2/rv/sources-rv.json}
-GPU=${GPU:-0}; LOCK=${LOCK-/vesuvius/ufsm/opt/gpu$GPU.lock}; P=${P:-576}
+GPU=${GPU:-0}; P=${P:-576}   # GPU: one id or a list "0,1" (data parallel over them: --gpus 0..n-1 of CUDA_VISIBLE_DEVICES=GPU)
+LOCK=${LOCK-$(echo $GPU | tr , '\n' | sed 's|.*|/vesuvius/ufsm/opt/gpu&.lock|' | paste -sd,)}   # comma list of flock files, one per GPU
+NG=$(echo $GPU | tr , '\n' | wc -l); GPUS=$(seq -s, 0 $((NG - 1)))
 ARCH=${ARCH:---widths 16,16,32,64,128,192,256}
 o=$R/$NAME; mkdir -p $o; cd $R || exit 1
 export MALLOC_ARENA_MAX=4
@@ -23,7 +25,7 @@ AUG="--zfix 1 --symmetry-p 0.5 --geometry-aug 1 --rotate-deg 5 --rotate-p 0.2 --
   --aug-tone-p 0.3 --aug-gin-p 0.15 --aug-noise-p 0.15 --aug-cnoise-p 0.1 \
   --aug-sharpen-p 0.03 --aug-ring-p 0.1 --aug-slice-p 0.1 --aug-quant-p 0.1 --aug-bias-p 0.15 --aug-cupping-p 0.1 ${HISTAUG:-}"
 HEADS="--task unwrap2 --rv 1 --rv-iso ${ISO:-64} --wind4-lambda ${WIND4L:-0.25} --density-scale 4 --density-code 1 --packed-weight 8 --normal-step 1"
-ARGS=($SRCJ --out $o --gpus 0 --P $P --B 1 $ARCH $HEADS --steps $STEPS --sched wsd --cooldown 0.2 --opt muon \
+ARGS=($SRCJ --out $o --gpus $GPUS --P $P --B 1 $ARCH $HEADS --steps $STEPS --sched wsd --cooldown 0.2 --opt muon \
   --fp4 2 --gpu-aug 2 --input-prec 8 --mem ${MEMMODE:-auto} --val-store disk --workers ${WORKERS:-12} --sampler-slots ${SLOTS:-16} \
   --log-every ${LOGE:-50} --val-every ${VAL:-2000} --val-batches ${VALB:-16} --ckpt-every ${CKPT:-1000} --seed ${SEED:-3} --val-seed 1 \
   --warmup 2000 --muon-lr ${MLR:-0.02} --lr ${ALR:-0.001} $AUG ${EXTRA:-})
@@ -46,7 +48,7 @@ for i in $(seq 0 ${RELAUNCH:-20}); do
   RS=(); [ -f $o/last.ckpt ] && RS=(--resume $o/last.ckpt)
   echo "$(date) start $i (GPU $GPU, lock ${LOCK:-none}): $U train ${ARGS[*]} ${RS[*]}" >> $o.resume.log
   # the GPU lock is held by this launcher (fd 9) for its lifetime, so <run>.pid is the trainer itself (SIGTERM = graceful save)
-  if [ -n "$LOCK" ] && [ -z "${LOCKED:-}" ]; then exec 9> $LOCK; flock 9; LOCKED=1; echo "$(date) holding $LOCK" >> $o.resume.log; fi
+  if [ -n "$LOCK" ] && [ -z "${LOCKED:-}" ]; then fd=9; for lk in ${LOCK//,/ }; do eval "exec $fd> $lk"; flock $fd; fd=$((fd + 1)); done; LOCKED=1; echo "$(date) holding $LOCK" >> $o.resume.log; fi
   CUDA_VISIBLE_DEVICES=$GPU nice -n 5 $U train "${ARGS[@]}" "${RS[@]}" >> $o.log 2>&1 & echo $! > $o.pid; wait $!; rc=$?
   echo "$(date) exit rc=$rc" >> $o.resume.log
   last=$(awk '/^step +[0-9]+ / {s=$2} END {print s + 0}' $o.log)
