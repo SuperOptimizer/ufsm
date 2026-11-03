@@ -8,6 +8,7 @@
 # trainer: kill -TERM $(cat <run>.pid), graceful). Checkpoints every CKPT (1000) steps, snapshots kept every SNAP (5000).
 # Env: R (run root, /vesuvius/ufsm/v2/rv/runs), U (binary), SRCJ, GPU (0, or "0,1": both, data parallel), LOCK (flock files, comma list; "" = none), P (576), ARCH, WORKERS (12),
 #      SLOTS (16), MEMMODE (auto), ALR / MLR, WIND4L (0.25), ISO (64), EXTRA. Needs MemAvailable >= MINMEM GB (40).
+#      MAXFAIL (3): the same nonzero rc that many times in a row with no new step stops the relaunch loop.
 set -u
 NAME=${1:?NAME}; STEPS=${2:?STEPS}
 R=${R:-/vesuvius/ufsm/v2/rv/runs}; U=${U:-/vesuvius/ufsm/v2/rv/bin/ufsm}; SRCJ=${SRCJ:-/vesuvius/ufsm/v2/rv/sources-rv.json}
@@ -54,6 +55,10 @@ for i in $(seq 0 ${RELAUNCH:-20}); do
   last=$(awk '/^step +[0-9]+ / {s=$2} END {print s + 0}' $o.log)
   [ "$last" -ge "$STEPS" ] && break
   [ $rc = 0 ] && [ -f $o.stop ] && break
+  # a deterministic failure (no new step, same nonzero rc: e.g. a device OOM at start) stops the loop after MAXFAIL (3) tries
+  if [ $rc != 0 ] && [ "$last" = "${prev_last:-x}" ] && [ $rc = "${prev_rc:-x}" ]; then nfail=$((${nfail:-1} + 1)); else nfail=1; fi
+  prev_last=$last; prev_rc=$rc
+  if [ $rc != 0 ] && [ $nfail -ge ${MAXFAIL:-3} ]; then echo "$(date) rc=$rc $nfail times in a row with no new step (last $last): giving up, see $o.log" >> $o.resume.log; break; fi
   sleep 60
 done
 rm -f $o.pid
