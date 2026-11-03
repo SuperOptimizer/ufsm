@@ -15,7 +15,9 @@
    "coarse.um"); its samples are read through fine(c) = A^-1 (c + D(c)).
    --src-box NAME Z0,Y0,X0,Z1,Y1,X1: the source's valid box (its voxels; partial predictions): NaN outside, its columns only on GT
    intervals sampled inside it.
-   --ens NAME OP A,B: a source from the samples of A, B (OP mean | max), after each is scaled to 0..255.
+   --ens NAME OP A,B: a source from the samples of A, B (OP mean | max | gmean | norm = each member scaled to its 99th percentile along
+   the ray, then the mean), NaN where any member is.
+   --vote A,B,..: column vote = the median over those sources' pk turns per GT interval (a per-interval consensus).
    --dump FILE --dump-src NAME: per interval between consecutive pk hits of NAME inside a GT-covered stretch, the feature vector
    (rr_feat) and the GT turns (Q(b) - Q(a), Q piecewise linear between GT sheet centres) -> FILE (float32 records, header "RRD1").
    --cls MODEL (ufsm recto-cls train): the classifier's turns per hit interval of --dump-src summed along the ray; columns cls (argmax)
@@ -62,7 +64,7 @@ typedef struct {
     const uint8_t *cd; int64_t qo[2], qn[2];
     rr_src *S; int ns; double zg;   /* global native z */
     int nth; double sigma, prom, sep, win, thr, ctsig, ctprom;
-    int dsrc; const rr_cls *cls;
+    int dsrc; const rr_cls *cls; int vote[RR_MAXS], nvote;
     rr_iv **out; int *nout; float **dump; int *ndump;
 } rr_job;
 
@@ -89,6 +91,8 @@ static double rr_sample(const rr_job *J, const rr_src *s, double y, double x) { 
     const double K = J->um / s->cum;   /* native -> coarse L0 voxels */
     const double c[3] = {(gx + 0.5) * K - 0.5, (gy + 0.5) * K - 0.5, (J->zg + 0.5) * K - 0.5}; double f[3]; rmap_c2f(s->map, c, f);
     const double L = s->lf;
+    if (s->hasbox) { const double gz = (f[2] + 0.5) / L - 0.5, gyy = (f[1] + 0.5) / L - 0.5, gxx = (f[0] + 0.5) / L - 0.5;
+                     if (gz < s->vb[0] || gyy < s->vb[1] || gxx < s->vb[2] || gz >= s->vb[3] || gyy >= s->vb[4] || gxx >= s->vb[5]) return NAN; }
     const double fz = (f[2] + 0.5) / L - 0.5 - s->po[0], fy = (f[1] + 0.5) / L - 0.5 - s->po[1], fx = (f[0] + 0.5) / L - 0.5 - s->po[2];
     const int64_t z0 = (int64_t)floor(fz), y0 = (int64_t)floor(fy), x0 = (int64_t)floor(fx); const double tz = fz - z0, ty = fy - y0, tx = fx - x0;
     if (z0 < 0 || y0 < 0 || x0 < 0 || z0 + 1 >= s->pn[0] || y0 + 1 >= s->pn[1] || x0 + 1 >= s->pn[2]) return NAN;
@@ -234,10 +238,19 @@ static void rr_rays(void *ctx, int a0, int a1, int t) {
             const float *p = J->ct + y0 * J->cn[1] + x0;
             C[i] = (float)((1 - ty) * ((1 - tx) * p[0] + tx * p[1]) + ty * ((1 - tx) * p[J->cn[1]] + tx * p[J->cn[1] + 1]));
         }
-        for (int s = 0; s < J->ns; s++) if (J->S[s].ens) for (int i = 0; i < n; i++) {   /* ensembles */
-            double acc = J->S[s].ens == 2 ? -1 : 0; int c = 0;
-            for (int e = 0; e < J->S[s].ne; e++) { const float v = V[J->S[s].ea[e]][i]; if (!(v == v)) continue; if (J->S[s].ens == 2) acc = fmax(acc, v); else acc += v; c++; }
-            V[s][i] = c ? (float)(J->S[s].ens == 2 ? acc : acc / c) : NAN;
+        for (int s = 0; s < J->ns; s++) if (J->S[s].ens) {   /* ensembles: 1 mean, 2 max, 3 geometric mean, 4 mean of the members each scaled
+                                                                  to its own 99th percentile along the ray (rank-free normalisation); NaN when any member is NaN */
+            double sc[RR_MAXS]; for (int e = 0; e < J->S[s].ne; e++) sc[e] = 1;
+            if (J->S[s].ens == 4) for (int e = 0; e < J->S[s].ne; e++) {
+                const float *v = V[J->S[s].ea[e]]; int m = 0; for (int i = 0; i < n; i++) if (v[i] == v[i] && mat[i]) tmp[m++] = v[i];
+                if (m > 10) { qsort(tmp, m, sizeof(float), cmp_f); const double q = tmp[(int)(0.99 * (m - 1))]; sc[e] = q > 1 ? 255.0 / q : 1; } }
+            for (int i = 0; i < n; i++) {
+                double acc = J->S[s].ens == 2 ? -1 : J->S[s].ens == 3 ? 0 : 0; int c = 0, bad = 0;
+                for (int e = 0; e < J->S[s].ne; e++) { const float v = V[J->S[s].ea[e]][i]; if (!(v == v)) { bad = 1; continue; }
+                    const double w = fmin(255, v * sc[e]);
+                    if (J->S[s].ens == 2) acc = fmax(acc, w); else if (J->S[s].ens == 3) acc += log(w + 1); else acc += w; c++; }
+                V[s][i] = c && !bad ? (float)(J->S[s].ens == 2 ? acc : J->S[s].ens == 3 ? exp(acc / c) - 1 : acc / c) : NAN;
+            }
         }
         /* hits per source */
         rr_hit *H[RR_MAXS] = {0}; int nH[RR_MAXS] = {0}; float *R[RR_MAXS] = {0}; int nR[RR_MAXS] = {0};
@@ -299,8 +312,10 @@ static void rr_rays(void *ctx, int a0, int a1, int t) {
                     if (ok && C) { int c0 = 0; for (int p = 0; p < nct; p++) c0 += ctpk[p] >= ra + g2 && ctpk[p] < rb + g2; v.t[2] = (float)c0; }
                     for (int s = 0; s < J->ns; s++) {
                         if (J->S[s].hasbox) { int fin = 1; const int k0 = (int)fmax(0, ra - g2), k1 = (int)fmin(n - 1, rb + g2); for (int k = k0; k <= k1 && fin; k++) if (!(V[s][k] == V[s][k])) fin = 0; if (!fin) continue; }
-                        if (ok) v.t[3 + 3 * s] = (float)rr_count_hits(H[s], nH[s], ra + g2, rb + g2);
+                        if (ok) v.t[3 + 3 * s] = (float)rr_count_hits(H[s], nH[s], ra + g2, rb + g2);   /* (vote: below) */
                         v.t[4 + 3 * s] = (float)rr_lin(&H[s][0].pos, 4, nH[s], ra, rb); v.t[5 + 3 * s] = (float)rr_lin(R[s], 1, nR[s], ra, rb); }
+                    if (J->nvote) { float m[RR_MAXS]; int c = 0; for (int e = 0; e < J->nvote; e++) { const float t = v.t[4 + 3 * J->vote[e]]; if (t == t) m[c++] = t; }
+                        if (c == J->nvote) { qsort(m, c, sizeof(float), cmp_f); v.t[5 + 3 * J->ns] = c & 1 ? m[c / 2] : 0.5f * (m[c / 2 - 1] + m[c / 2]); } }
                     v.ia = ia; v.ib = ib;
                     if (no == capo) { capo *= 2; o = realloc(o, sizeof(rr_iv) * capo); }
                     o[no++] = v;
@@ -441,7 +456,7 @@ int cmd_recto_ruler(int argc, char **argv) {
             ns++; i += 4;
         } else if (!strcmp(argv[i], "--ens")) {
             if (i + 3 >= argc || ns == RR_MAXS) { fprintf(stderr, "recto-ruler: --ens NAME mean|max A,B\n"); return 2; }
-            rr_src *s = &S[ns]; snprintf(s->name, sizeof s->name, "%s", argv[i + 1]); s->ens = !strcmp(argv[i + 2], "max") ? 2 : 1; s->um = um;
+            rr_src *s = &S[ns]; snprintf(s->name, sizeof s->name, "%s", argv[i + 1]); s->ens = !strcmp(argv[i + 2], "max") ? 2 : !strcmp(argv[i + 2], "gmean") ? 3 : !strcmp(argv[i + 2], "norm") ? 4 : 1; s->um = um;
             char buf[512]; snprintf(buf, sizeof buf, "%s", argv[i + 3]);
             for (char *tok = strtok(buf, ","); tok; tok = strtok(nullptr, ",")) { int f = -1; for (int k = 0; k < ns; k++) if (!strcmp(S[k].name, tok)) f = k;
                 if (f < 0) { fprintf(stderr, "recto-ruler: --ens: no source %s (sources first)\n", tok); return 2; } s->ea[s->ne++] = f; if (S[f].um < s->um) s->um = S[f].um; }
@@ -471,6 +486,10 @@ int cmd_recto_ruler(int argc, char **argv) {
                                           cf = atof(argv[i + 2]) > 0 ? atof(argv[i + 2]) / um : 1; }
     }
     if (!qz) { fprintf(stderr, "recto-ruler: --codes ROOT KEY needed\n"); return 2; }
+    int vote[RR_MAXS], nvote = 0;
+    { const char *vl = rr_opt(argc, argv, "--vote", nullptr);
+      if (vl) { char buf[512]; snprintf(buf, sizeof buf, "%s", vl); for (char *t = strtok(buf, ","); t; t = strtok(nullptr, ",")) { int f = -1; for (int k = 0; k < ns; k++) if (!strcmp(S[k].name, t)) f = k;
+                if (f < 0 || nvote == RR_MAXS) { fprintf(stderr, "recto-ruler: --vote: no source %s\n", t); return 2; } vote[nvote++] = f; } } }
     int dsrc = -1; const char *dn = rr_opt(argc, argv, "--dump-src", nullptr);
     if (dn) { for (int k = 0; k < ns; k++) if (!strcmp(S[k].name, dn)) dsrc = k; if (dsrc < 0) { fprintf(stderr, "recto-ruler: --dump-src %s: no such source\n", dn); return 2; } }
     const char *dumpf = rr_opt(argc, argv, "--dump", nullptr), *clsf = rr_opt(argc, argv, "--cls", nullptr);
@@ -496,7 +515,8 @@ int cmd_recto_ruler(int argc, char **argv) {
         fit_fields_buf b; if (fit_fields_load(argv[3], fz, fz + 1, 1, &b)) { fprintf(stderr, "recto-ruler: cannot load field row %d\n", fz); return 1; }
         rr_job J = {.fs = fs, .m = m, .zl = zl, .step = step, .um = um, .h = h, .cf = cf, .morg = {morg[0], morg[1], morg[2]}, .w = b.f.w, .sp = b.f.sp, .pc = b.f.pc, .ps = b.f.ps,
                     .tyy = b.f.t[1], .txx = b.f.t[2], .tyx = b.f.t[5], .FH = fsh[1], .FW = fsh[2], .fo = {morg[1] - forg[1], morg[2] - forg[2]}, .F = F, .S = S, .ns = ns, .zg = zg,
-                    .nth = nth, .sigma = sigma, .prom = prom, .sep = sep, .win = win, .thr = thr, .ctsig = 1.2, .ctprom = 1, .dsrc = dsrc, .cls = cls};
+                    .nth = nth, .sigma = sigma, .prom = prom, .sep = sep, .win = win, .thr = thr, .ctsig = 1.2, .ctprom = 1, .dsrc = dsrc, .cls = cls, .nvote = nvote};
+        memcpy(J.vote, vote, sizeof vote);
         float *ctp = nullptr; uint8_t *cdp = nullptr;
         for (int s = 0; s < ns; s++) if (rr_read_plane(&S[s], zg, um, morg, Y, X, nt)) { fprintf(stderr, "recto-ruler: %s read failed: %s %s\n", S[s].name, z3_error(), z2_error()); return 1; }
         if (cz) {
@@ -547,17 +567,17 @@ int cmd_recto_ruler(int argc, char **argv) {
     if (df) fclose(df);
     if (!ni) { printf("recto-ruler: no GT intervals\n"); return 1; }
     /* tables */
-    const int NS = 3 + 3 * ns + 2; char nm[3 + 3 * RR_MAXS + 2][80];
+    const int NS = 3 + 3 * ns + 3; char nm[3 + 3 * RR_MAXS + 3][80];
     snprintf(nm[0], 80, "fit"); snprintf(nm[1], 80, "density"); snprintf(nm[2], 80, "CT");
     for (int s = 0; s < ns; s++) { snprintf(nm[3 + 3 * s], 80, "%s.pkw", S[s].name); snprintf(nm[4 + 3 * s], 80, "%s.pk", S[s].name); snprintf(nm[5 + 3 * s], 80, "%s.run", S[s].name); }
-    snprintf(nm[3 + 3 * ns], 80, "cls"); snprintf(nm[4 + 3 * ns], 80, "clsE");
+    snprintf(nm[3 + 3 * ns], 80, "cls"); snprintf(nm[4 + 3 * ns], 80, "clsE"); snprintf(nm[5 + 3 * ns], 80, "vote");
     const double gb[] = {0, 70, 85, 100, 115, 130, 150, 180, 230, 1e9}; const int ngb = 9;
     FILE *tf = nullptr; const char *tsv = rr_opt(argc, argv, "--tsv", nullptr); if (tsv && !(tf = fopen(tsv, "w"))) { fprintf(stderr, "recto-ruler: cannot write %s\n", tsv); return 1; }
     if (tf) fprintf(tf, "table\tbin\tsource\tn\tper_gt_turn\toff\n");
     FILE *tf2 = tf;
     for (int tab = 0; tab < 3; tab++) {
         const int nbin = tab ? ngb : 20;
-        double (*s)[3 + 3 * RR_MAXS + 2][4] = calloc(nbin + 1, sizeof *s); long long *cnt = calloc(nbin + 1, sizeof(long long));
+        double (*s)[3 + 3 * RR_MAXS + 3][4] = calloc(nbin + 1, sizeof *s); long long *cnt = calloc(nbin + 1, sizeof(long long));
         for (size_t i = 0; i < ni; i++) {
             const rr_iv *v = &all[i]; int b;
             if (tab) { const double gv = tab == 1 ? v->gapn : v->sp; if (!(gv == gv)) continue; b = 0; while (b + 1 < ngb && gv >= gb[b + 1]) b++; } else { b = (int)(v->r * um / 2000); if (b >= nbin) b = nbin - 1; }
@@ -566,12 +586,12 @@ int cmd_recto_ruler(int argc, char **argv) {
                 for (int bb = 0; bb < 2; bb++) { double *a = s[bb ? nbin : b][k]; a[0] += v->t[k]; a[1] += v->gtq; a[2]++; a[3] += fabs(v->t[k] - v->gtq) >= 0.5; } }
         }
         printf("  GT intervals by %s: turns per GT turn / share off >= 0.5 turn\n  %-11s %8s", tab == 1 ? "normal gap per GT turn (um)" : tab == 2 ? "network spacing sp (um)" : "radius (mm)", tab ? "gap(um)" : "radius", "n");
-        for (int k = 0; k < NS; k++) { if (k >= 3 + 3 * ns && !cls) continue; printf("  %13s", nm[k]); }
+        for (int k = 0; k < NS; k++) { if ((k == 3 + 3 * ns || k == 4 + 3 * ns) && !cls) continue; if (k == 5 + 3 * ns && !nvote) continue; printf("  %13s", nm[k]); }
         printf("\n");
         for (int b = 0; b <= nbin; b++) { if (cnt[b] < 50) continue;
             char bl[32]; if (b == nbin) snprintf(bl, sizeof bl, "all"); else if (tab) snprintf(bl, sizeof bl, "%.0f-%.0f", gb[b], b + 1 < ngb ? gb[b + 1] : 9999.0); else snprintf(bl, sizeof bl, "%d-%d", 2 * b, 2 * b + 2);
             printf("  %-11s %8lld", bl, cnt[b]);
-            for (int k = 0; k < NS; k++) { if (k >= 3 + 3 * ns && !cls) continue; const double *a = s[b][k]; if (a[2] < 20) printf("  %13s", "-"); else printf("  %6.3f/%.3f", a[0] / a[1], a[3] / a[2]);
+            for (int k = 0; k < NS; k++) { if ((k == 3 + 3 * ns || k == 4 + 3 * ns) && !cls) continue; if (k == 5 + 3 * ns && !nvote) continue; const double *a = s[b][k]; if (a[2] < 20) printf("  %13s", "-"); else printf("  %6.3f/%.3f", a[0] / a[1], a[3] / a[2]);
                 if (tf && a[2] >= 20) fprintf(tf, "%s\t%s\t%s\t%.0f\t%.4f\t%.4f\n", tab == 0 ? "radius" : tab == 1 ? "gap" : "sp", bl, nm[k], a[2], a[0] / a[1], a[3] / a[2]); }
             printf("\n"); }
         free(s); free(cnt);
@@ -579,10 +599,10 @@ int cmd_recto_ruler(int argc, char **argv) {
     {   /* long spans: L consecutive GT intervals on one ray (contiguous: same z / ray, sheet shared), each source's turns summed vs the GT turns */
         const int Ls[3] = {5, 10, 20};
         printf("  spans of L consecutive GT intervals: turns per GT turn / share |error| >= 1 turn / mean |error| (turns)\n  %-11s %8s", "L", "n");
-        for (int k = 0; k < NS; k++) { if (k >= 3 + 3 * ns && !cls) continue; if (k >= 3 && k < 3 + 3 * ns && (k - 3) % 3 != 1) continue; printf("  %19s", nm[k]); }
+        for (int k = 0; k < NS; k++) { if ((k == 3 + 3 * ns || k == 4 + 3 * ns) && !cls) continue; if (k == 5 + 3 * ns && !nvote) continue; if (k >= 3 && k < 3 + 3 * ns && (k - 3) % 3 != 1) continue; printf("  %19s", nm[k]); }
         printf("\n");
         for (int li = 0; li < 3; li++) {
-            const int L = Ls[li]; double a[3 + 3 * RR_MAXS + 2][4]; memset(a, 0, sizeof a); long long nsp = 0;
+            const int L = Ls[li]; double a[3 + 3 * RR_MAXS + 3][4]; memset(a, 0, sizeof a); long long nsp = 0;
             for (size_t i = 0; i + L <= ni; i += 1) {
                 int ok = 1; for (int q = 1; q < L && ok; q++) { const rr_iv *u = &all[i + q - 1], *v = &all[i + q]; if (v->z != u->z || v->ray != u->ray || v->ia != u->ib) ok = 0; }
                 if (!ok) continue;
@@ -590,14 +610,14 @@ int cmd_recto_ruler(int argc, char **argv) {
                 for (int k = 0; k < NS; k++) { double st = 0, sg = 0; int okk = 1; for (int q = 0; q < L; q++) { const float t = all[i + q].t[k]; if (!(t == t)) { okk = 0; break; } st += t; sg += all[i + q].gtq; }
                     if (!okk) continue; a[k][0] += st; a[k][1] += sg; a[k][2]++; a[k][3] += fabs(st - sg) >= 1; a[k][3] += 0; }
             }
-            double ae[3 + 3 * RR_MAXS + 2] = {0};
+            double ae[3 + 3 * RR_MAXS + 3] = {0};
             for (size_t i = 0; i + L <= ni; i++) {
                 int ok = 1; for (int q = 1; q < L && ok; q++) { const rr_iv *u = &all[i + q - 1], *v = &all[i + q]; if (v->z != u->z || v->ray != u->ray || v->ia != u->ib) ok = 0; }
                 if (!ok) continue;
                 for (int k = 0; k < NS; k++) { double st = 0, sg = 0; int okk = 1; for (int q = 0; q < L; q++) { const float t = all[i + q].t[k]; if (!(t == t)) { okk = 0; break; } st += t; sg += all[i + q].gtq; } if (okk) ae[k] += fabs(st - sg); }
             }
             printf("  %-11d %8lld", L, nsp);
-            for (int k = 0; k < NS; k++) { if (k >= 3 + 3 * ns && !cls) continue; if (k >= 3 && k < 3 + 3 * ns && (k - 3) % 3 != 1) continue;
+            for (int k = 0; k < NS; k++) { if ((k == 3 + 3 * ns || k == 4 + 3 * ns) && !cls) continue; if (k == 5 + 3 * ns && !nvote) continue; if (k >= 3 && k < 3 + 3 * ns && (k - 3) % 3 != 1) continue;
                 if (a[k][2] < 20) printf("  %19s", "-"); else printf("  %5.3f/%.3f/%5.2f", a[k][0] / a[k][1], a[k][3] / a[k][2], ae[k] / a[k][2]);
                 if (tf2 && a[k][2] >= 20) fprintf(tf2, "span\t%d\t%s\t%.0f\t%.4f\t%.4f\t%.4f\n", L, nm[k], a[k][2], a[k][0] / a[k][1], a[k][3] / a[k][2], ae[k] / a[k][2]); }
             printf("\n");
