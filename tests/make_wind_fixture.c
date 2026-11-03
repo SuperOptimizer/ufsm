@@ -1,6 +1,6 @@
 /* A synthetic band + stored-phase source (the --task unwrap2 desk sources' layout: CT pyramid, band codes and a stored phase on the
    level-1 grid, an axis, no recto / ink targets) for sampler benchmarks and tests: make_wind_fixture DIR [N 1024] [q 2]
-   DIR/ct (levels 0..4, N^3 at level 0, volcomp q lossy), DIR/band/1 and DIR/phase/1 ((N/2)^3), DIR/axis.json, DIR/sources.json (phase level 1); DIR/phase2/2 and DIR/sources2.json (phase level 2, a holdout box).
+   DIR/ct (levels 0..4, N^3 at level 0, volcomp q lossy), DIR/band/1 and DIR/phase/1 ((N/2)^3), DIR/axis.json, DIR/phase0/0 (N^3) and DIR/sources.json (phase level 0), DIR/sources-l1.json (phase/1 level 1, level-1 windows); DIR/phase2/2 and DIR/sources2.json (phase level 2, a holdout box).
    A spiral scroll (radius 0.47 N, sheet pitch 24 voxels) around a slightly tilted axis; the phase is the winding's fraction where the
    labels reach (radius < 0.44 N, outside a few unlabelled blobs), unknown elsewhere; CT 0 outside the scroll. */
 #include "z3w.h"
@@ -90,6 +90,19 @@ static int make_wind_fixture(const char *D, int n_, float q) {
     snprintf(p, sizeof p, "%s/band/1", D); if (fx_write_arr(p, hs, 0.f, 0, fx_cut, &cb)) return 1;
     snprintf(p, sizeof p, "%s/phase/1", D); if (fx_write_arr(p, hs, 0.f, PHASE_UNKNOWN, fx_cut, &cp)) return 1;
     free(bd); free(ph);
+    {   /* the stored phase on the level-0 grid (voxel j at level-0 j): sources.json / sources-ink.json (labels at the training level, 11-03) */
+        const size_t g = (size_t)fx_N; uint8_t *p0 = malloc(g * g * g); if (!p0) return 1;
+        for (size_t z = 0; z < g; z++) for (size_t y = 0; y < g; y++) for (size_t x = 0; x < g; x++) {
+            const double Z = (double)z, Y = (double)y, X = (double)x; double cy, cx; fx_axis_at(Z, &cy, &cx);
+            const double r = hypot(Y - cy, X - cx), w = fx_wind(Z, Y, X), f = w - floor(w);
+            const int blob = (((int)(Z / 96) * 7 + (int)(Y / 96) * 3 + (int)(X / 96)) % 5) == 0;
+            int c = (int)(f * PHASE_PERIOD); if (c >= PHASE_PERIOD) c = PHASE_PERIOD - 1;
+            p0[(z * g + y) * g + x] = r < .44 * fx_N && !blob ? (uint8_t)c : PHASE_UNKNOWN;
+        }
+        const int64_t gs[3] = {(int64_t)g, (int64_t)g, (int64_t)g}; fx_volctx c0 = {p0, (int64_t)g};
+        snprintf(p, sizeof p, "%s/phase0/0", D); if (fx_write_arr(p, gs, 0.f, PHASE_UNKNOWN, fx_cut, &c0)) return 1;
+        free(p0);
+    }
     {   /* the phase one level coarser (level 2: voxel j at level-0 4 j + 1.5), for sources2.json (phase level 2: interpolated into
            level-0 windows, read directly by level-2 windows) */
         const size_t g = h / 2; uint8_t *p2 = malloc(g * g * g);
@@ -127,14 +140,18 @@ static int make_wind_fixture(const char *D, int n_, float q) {
     fprintf(f, "]}\n"); fclose(f);
     snprintf(p, sizeof p, "%s/sources.json", D); f = fopen(p, "w"); if (!f) return 1;
     fprintf(f, "{\"sources\": [{\"name\": \"wind-fixture\", \"root\": \"%s\", \"ct\": \"ct\", \"um\": 9.6, \"axis\": \"%s/axis.json\", \"weight\": 1,\n"
-               "  \"targets\": {\"band\": {\"root\": \"%s/band\", \"key\": \"1\", \"radius\": 80, \"span\": 75, \"phase\": {\"root\": \"%s/phase\", \"key\": \"1\", \"level\": 1}}}}]}\n", D, D, D, D);
+               "  \"targets\": {\"band\": {\"root\": \"%s/band\", \"key\": \"1\", \"radius\": 80, \"span\": 75, \"phase\": {\"root\": \"%s/phase0\", \"key\": \"0\", \"level\": 0}}}}]}\n", D, D, D, D);
     fclose(f);
     if (fx_ink) {   /* train --ink-head: + the ink target */
     snprintf(p, sizeof p, "%s/sources-ink.json", D); f = fopen(p, "w"); if (!f) return 1;
     fprintf(f, "{\"sources\": [{\"name\": \"wind-fixture-ink\", \"root\": \"%s\", \"ct\": \"ct\", \"um\": 9.6, \"axis\": \"%s/axis.json\", \"weight\": 1, \"ink_weight\": 1,\n"
                "  \"targets\": {\"ink\": {\"root\": \"%s/ink\", \"group\": \".\", \"encoding\": \"prob254\"},\n"
-               "               \"band\": {\"root\": \"%s/band\", \"key\": \"1\", \"radius\": 80, \"span\": 75, \"phase\": {\"root\": \"%s/phase\", \"key\": \"1\", \"level\": 1}}}}]}\n", D, D, D, D, D);
+               "               \"band\": {\"root\": \"%s/band\", \"key\": \"1\", \"radius\": 80, \"span\": 75, \"phase\": {\"root\": \"%s/phase0\", \"key\": \"0\", \"level\": 0}}}}]}\n", D, D, D, D, D);
     fclose(f); }
+    snprintf(p, sizeof p, "%s/sources-l1.json", D); f = fopen(p, "w"); if (!f) return 1;   /* the level-1 phase: for level-1 windows (read directly) */
+    fprintf(f, "{\"sources\": [{\"name\": \"wind-fixture\", \"root\": \"%s\", \"ct\": \"ct\", \"um\": 9.6, \"axis\": \"%s/axis.json\", \"weight\": 1,\n"
+               "  \"targets\": {\"band\": {\"root\": \"%s/band\", \"key\": \"1\", \"radius\": 80, \"span\": 75, \"phase\": {\"root\": \"%s/phase\", \"key\": \"1\", \"level\": 1}}}}]}\n", D, D, D, D);
+    fclose(f);
     snprintf(p, sizeof p, "%s/sources2.json", D); f = fopen(p, "w"); if (!f) return 1;   /* + a holdout box, the phase at level 2 */
     fprintf(f, "{\"sources\": [{\"name\": \"wind-fixture2\", \"root\": \"%s\", \"ct\": \"ct\", \"um\": 9.6, \"axis\": \"%s/axis.json\", \"weight\": 1,\n"
                "  \"holdout\": [0, 0, 0, %d, %d, %d],\n"

@@ -17,7 +17,9 @@
    circular-trilinearly. Validation printed at the end: papyrus with a known phase, found / cell / unknown shares, the recto share, and
    at every verso -> recto boundary on papyrus (x recto, its inward neighbour verso) the mean CT profile along the normal (-4..+4 voxels)
    and the share whose inward neighbour is void (a real face), for the raw phase and the face-anchored one. --agree ROOT KEY (another
-   phase raster on the output grid, e.g. our surfaces' phase put through side-face too): the papyrus side agreement with it. */
+   phase raster on the output grid, e.g. our surfaces' phase put through side-face too): the papyrus side agreement with it.
+   --no-snap 1: no walks, the output is the phase as read (with --phase-scale 2: --interp linear (circular trilinear) or nearest, the
+   sampler's read of a one-level-coarser stored phase): with --agree, the side agreement of a coarse label copy with the fine one. */
 #include "band.h"
 #include "store.h"
 #include "sysinfo.h"
@@ -41,7 +43,7 @@ static const char *sf_opt(int argc, char **argv, const char *name, const char *d
 enum { SF_PROF = 9 };   /* CT profile samples -4..+4 */
 typedef struct {
     z3 *ph, *ct, *ag; int pscale, iso, cap, cell, mincell, B, H, S; double reach;
-    int64_t shape[3], bo[3], bn[3]; int pervox;
+    int64_t shape[3], bo[3], bn[3]; int pervox, nosnap, nearest;
 } sf_job;
 
 static float sf_cs[PHASE_PERIOD], sf_sn[PHASE_PERIOD];
@@ -66,6 +68,10 @@ static int sf_block(sf_job *J, const int64_t o[3], const int n[3], uint8_t *out,
           const int64_t co[3] = {(ho[0] >> 1) - 1, (ho[1] >> 1) - 1, (ho[2] >> 1) - 1}, cn[3] = {D / 2 + 3, Y / 2 + 3, X / 2 + 3};
           uint8_t *c = malloc((size_t)cn[0] * cn[1] * cn[2]); if (!c) goto done;
           if (z3_read(J->ph, co, cn, c, 1)) { free(c); goto done; }
+          if (J->nearest) {   /* --interp nearest: what the sampler's phase_window does for a stored phase one level coarser */
+              for (int z = 0; z < D; z++) for (int y = 0; y < Y; y++) for (int x = 0; x < X; x++)
+                  ph[((size_t)z * Y + y) * X + x] = c[((size_t)(((ho[0] + z + 1) >> 1) - co[0]) * cn[1] + (((ho[1] + y + 1) >> 1) - co[1])) * cn[2] + (((ho[2] + x + 1) >> 1) - co[2])];
+          } else
           for (int z = 0; z < D; z++) for (int y = 0; y < Y; y++) for (int x = 0; x < X; x++) {
               const double p[3] = {(ho[0] + z + 0.5) / 2 - 0.5 - co[0], (ho[1] + y + 0.5) / 2 - 0.5 - co[1], (ho[2] + x + 0.5) / 2 - 0.5 - co[2]};
               int b[3]; double f[3]; for (int d = 0; d < 3; d++) { b[d] = (int)floor(p[d]); f[d] = p[d] - b[d]; if (b[d] < 0) { b[d] = 0; f[d] = 0; } if (b[d] > cn[d] - 2) { b[d] = (int)cn[d] - 2; f[d] = 1; } }
@@ -119,6 +125,7 @@ static int sf_block(sf_job *J, const int64_t o[3], const int n[3], uint8_t *out,
         const size_t i = ((size_t)z * Y + y) * X + x, oi = ((size_t)(z - H) * n[1] + (y - H)) * n[2] + (x - H);
         int v = ph[i];
         if (v >= PHASE_PERIOD) { out[oi] = PHASE_UNKNOWN; continue; }
+        if (J->nosnap) { out[oi] = (uint8_t)v; if (pp[i]) { st[0]++; st[1]++; st[5] += v < PHASE_PERIOD / 2; st[4] += v < PHASE_PERIOD / 2; } continue; }   /* --no-snap 1: the phase as read */
         int d = J->pervox ? dl[i] : 255, how = 0;
         if (d == 255) { const float *c = cs + 3 * (((size_t)(z / C) * cy + y / C) * cx + x / C);
                         if (c[2] >= J->mincell && c[0] * c[0] + c[1] * c[1] >= 0.25f * c[2] * c[2]) { d = sf_code(c[0], c[1]); how = 1; } else how = 2; }
@@ -192,7 +199,7 @@ static void *sf_worker(void *arg) {
 
 int cmd_side_face(int argc, char **argv) {
     if (argc < 8) { fprintf(stderr, "usage: ufsm side-face <phase-root> <phase-key> <ct-root> <ct-key> <out-group> <out-um> [--iso 64] [--phase-scale 1|2] [--reach 3] [--cap 48]\n"
-                                    "       [--cell 16] [--per-voxel 0] [--min-cell 8] [--box z,y,x,nz,ny,nx] [--block 128] [--shard 512] [--threads 16] [--cache DIR] [--agree ROOT KEY] [--no-out 1]\n"); return 2; }
+                                    "       [--cell 16] [--per-voxel 0] [--min-cell 8] [--box z,y,x,nz,ny,nx] [--block 128] [--shard 512] [--threads 16] [--cache DIR] [--agree ROOT KEY] [--no-out 1] [--no-snap 1] [--interp linear|nearest]\n"); return 2; }
     for (int k = 0; k < PHASE_PERIOD; k++) { sf_cs[k] = (float)cos(2 * M_PI * k / PHASE_PERIOD); sf_sn[k] = (float)sin(2 * M_PI * k / PHASE_PERIOD); }
     sf_job J; memset(&J, 0, sizeof J);
     const char *cache = sf_opt(argc, argv, "--cache", nullptr);
@@ -200,6 +207,7 @@ int cmd_side_face(int argc, char **argv) {
     if (!J.ph || !J.ct) { fprintf(stderr, "side-face: %s\n", z3_error()); return 1; }
     J.pscale = atoi(sf_opt(argc, argv, "--phase-scale", "1")); J.iso = atoi(sf_opt(argc, argv, "--iso", "64")); J.reach = atof(sf_opt(argc, argv, "--reach", "3"));
     J.cap = atoi(sf_opt(argc, argv, "--cap", "48")); J.cell = atoi(sf_opt(argc, argv, "--cell", "16")); J.mincell = atoi(sf_opt(argc, argv, "--min-cell", "8")); J.pervox = atoi(sf_opt(argc, argv, "--per-voxel", "0"));
+    J.nosnap = atoi(sf_opt(argc, argv, "--no-snap", "0")); J.nearest = !strcmp(sf_opt(argc, argv, "--interp", "linear"), "nearest");
     J.B = atoi(sf_opt(argc, argv, "--block", "128")); J.S = atoi(sf_opt(argc, argv, "--shard", "512")); J.H = J.cap + 2;
     if ((J.pscale != 1 && J.pscale != 2) || J.iso < 1 || J.cap < 2 || J.cell < 1 || J.B < 16 || J.S % J.B) { fprintf(stderr, "side-face: bad options (--phase-scale 1|2, --shard a multiple of --block)\n"); return 2; }
     const z3_meta *cm = z3_meta_of(J.ct), *pm = z3_meta_of(J.ph);

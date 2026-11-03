@@ -98,9 +98,13 @@ int main(int argc, char **argv) {
            crop is the level-0 CT box of 32^3 centred on the window (sview_origin), vok set; crops inside the volume compared voxel for voxel;
            windows of level rung 0 and 1 (a level-1 window's crop: the 2x finer level-0 detail at its centre) */
         for (int si = 0; si < S->n; si++) { S->src[si].view = 1; S->src[si].view_level = 0; }
+        sources *S0 = S;
         const int Pv = 32; const size_t pv3 = (size_t)Pv * Pv * Pv; uint8_t *ref = malloc(pv3);
         int ok = 1, ncmp = 0, nwin = 0, ncoarse = 0;
+        char p1[1400]; snprintf(p1, sizeof p1, "%s/sources-l1.json", dir); sources *S1 = sources_load(p1); assert(S1);   /* (level-1 windows: the level-1 phase) */
+        for (int si = 0; si < S1->n; si++) { S1->src[si].view = 1; S1->src[si].view_level = 0; }
         for (int rung = 0; rung < 2; rung++) {
+            sources *S = rung ? S1 : S0;
             sample_cfg c4 = c; c4.deterministic = 0; c4.nworkers = 1; c4.nbuf = 2; c4.B = 2; c4.geometry_augment = 0; c4.augment = 0; c4.view_P = 32;
             memset(c4.level_p, 0, sizeof c4.level_p); c4.level_p[rung] = 1;
             sampler *sv = sampler_start(S, &c4); assert(sv);
@@ -121,23 +125,23 @@ int main(int argc, char **argv) {
             }
             sampler_stop(sv);
         }
-        free(ref);
+        free(ref); sources_free(S1);
         for (int si = 0; si < S->n; si++) S->src[si].view = 0;
         printf("wind sampler: views: %d windows, %d crops compared (%d of coarser windows)\n", nwin, ncmp, ncoarse);
         check("scan fusion views: crop = the level-0 CT box centred on the window", ok && ncmp > 0 && ncoarse > 0);
     }
     drop(a); drop(b); drop(d); sources_free(S);
-    {   /* sparse labels: a stored phase known in one of the 8 chunks of a 512 fixture's level-1 grid; windows are drawn around it
-           (the phase-chunk occupancy index), none rejected for lack of CT, most of them labelled */
+    {   /* sparse labels: a stored phase known in one of the 8 chunks of a 512 fixture's level-0 phase grid (labels at the training level);
+           windows are drawn around it (the phase-chunk occupancy index), none rejected for lack of CT, most of them labelled */
         char d2[1500]; snprintf(d2, sizeof d2, "%s/sparse", dir);
         if (make_wind_fixture(d2, 512, 4.f)) { fprintf(stderr, "fixture failed\n"); return 1; }
-        const int h = 256; uint8_t *ph = malloc((size_t)h * h * h); assert(ph);
+        const int h = 512; uint8_t *ph = malloc((size_t)h * h * h); assert(ph);
         for (int z = 0; z < h; z++) for (int y = 0; y < h; y++) for (int x = 0; x < h; x++) {
-            const double w = fx_wind(2.0 * z + .5, 2.0 * y + .5, 2.0 * x + .5), f = w - floor(w);
-            const int in = z >= 128 && y < 128 && x >= 128; int cc = (int)(f * PHASE_PERIOD); if (cc >= PHASE_PERIOD) cc = PHASE_PERIOD - 1;
+            const double w = fx_wind(z, y, x), f = w - floor(w);
+            const int in = z >= 256 && y < 256 && x >= 256; int cc = (int)(f * PHASE_PERIOD); if (cc >= PHASE_PERIOD) cc = PHASE_PERIOD - 1;
             ph[((size_t)z * h + y) * h + x] = in ? (uint8_t)cc : PHASE_UNKNOWN;
         }
-        char pp[1600]; snprintf(pp, sizeof pp, "%s/phase/1", d2); char cmd[1700]; snprintf(cmd, sizeof cmd, "rm -rf '%s'", pp); if (system(cmd)) return 1;
+        char pp[1600]; snprintf(pp, sizeof pp, "%s/phase0/0", d2); char cmd[1700]; snprintf(cmd, sizeof cmd, "rm -rf '%s'", pp); if (system(cmd)) return 1;
         const int64_t hs[3] = {h, h, h}; fx_volctx cv = {ph, h};
         if (fx_write_arr(pp, hs, 0.f, PHASE_UNKNOWN, fx_cut, &cv)) return 1;
         free(ph);

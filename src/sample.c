@@ -3231,6 +3231,38 @@ int sources_prefetch(sources *S, int maxlev, int nthreads, double fraction, int 
     fprintf(stderr, "prefetch: %zu chunks over all sources (window %d)\n", all, P);
     return 0;
 }
+/* No coarse labels (user rule 11-03): every label a training window reads is stored on the window's own grid. A target stored coarser
+   than a level the source is drawn at (a pyramid target upsampled from its finest rung, a stored phase / winding / ignore mask one or
+   more levels up, band codes on their 2x label grid) is a hard error at sampler start, no opt-out. (Finer stored targets pooled down,
+   region arrays at level 0 and "emb" heads on their own pooled grid are not upsampled labels.) */
+static int label_res_check(sampler *sp, source *s, int si, int region_ch) {
+    const sample_cfg *c = &sp->cfg; static const char *chn[NCH] = {"recto", "sheet"};
+    if (c->restore) return 0;
+    for (int l = s->min_level < 0 ? 0 : s->min_level; l < MAXLEV; l++) {
+        if (c->level_p[l] <= 0 || (s->max_level >= 0 && l > s->max_level) || (region_ch >= 0 && l > 1) || !level_ok(sp, s, si, l, region_ch)) continue;
+        const double um = s->um * ldexp(1.0, l);
+        for (int ch = 0; ch < NCH; ch++) {
+            int st = l;
+            if (ch == region_ch || !s->tgt_key[ch] || !source_tgt_for_level(s, ch, l, &st) || st <= l) continue;
+            fprintf(stderr, "sampler: %s: target \"%s\" (%s) is stored at %g um, coarser than the training level %d (%g um): labels must be stored at the training level\n",
+                    s->name, chn[ch], s->tgt_key[ch], s->um * ldexp(1.0, st), l, um);
+            return -1;
+        }
+        const int pshift = s->phase ? s->phase_level - l : 0;
+        const int stored = !c->band && c->side == 2 && s->phase && !c->phase_dense && pshift == 0 && s->phase_direct;
+        if (s->phase && pshift > 0) {
+            fprintf(stderr, "sampler: %s: target \"phase\"%s%s is stored at %g um, coarser than the training level %d (%g um): labels must be stored at the training level\n",
+                    s->name, s->wind ? " (+ winding)" : "", s->phase_ign ? " (+ ignore mask)" : "", s->um * ldexp(1.0, s->phase_level), l, um);
+            return -1;
+        }
+        if (s->band && !s->phase_only && (c->band || c->side) && !stored) {
+            fprintf(stderr, "sampler: %s: target \"band\" codes are stored at %g um (the 2x label grid), coarser than the training level %d (%g um): "
+                            "labels must be stored at the training level (a stored phase with \"level\": %d)\n", s->name, um * 2, l, um, l);
+            return -1;
+        }
+    }
+    return 0;
+}
 sampler *sampler_start(sources *S, const sample_cfg *cfg) {
     if (!S || S->n <= 0 || cfg->P <= 0 || cfg->B <= 0 || cfg->nworkers <= 0 || cfg->nbuf <= 0) { fprintf(stderr, "sampler: invalid sources, patch, batch, workers or buffer count\n"); return nullptr; }
     if (cfg->gpu_input && !sample_gpu_input_ok(cfg)) { fprintf(stderr, "sampler: --gpu-input needs 16-bit batches and no warps, sheet prior, slab appearance plan, aux or condition inputs\n"); return nullptr; }
@@ -3297,6 +3329,7 @@ sampler *sampler_start(sources *S, const sample_cfg *cfg) {
         }
         for (int c = 0; c < NCH; c++) if (s->reg[c] && s->reg[c]->n) region_ch = c;
         for (int l = s->min_level < 0 ? 0 : s->min_level; l < MAXLEV; l++) if (sp->cfg.level_p[l] > 0 && (region_ch < 0 || l <= 1) && level_ok(sp, s, i, l, region_ch)) eligible = 1;
+        if (eligible && s->weight > 0 && label_res_check(sp, s, i, region_ch)) { free(sp->cum); free(sp->lvl_ok); free(sp); return nullptr; }
         if (!isfinite(s->weight) || s->weight < 0) { fprintf(stderr, "sampler: invalid source weight: %s\n", s->name); free(sp->cum); free(sp->lvl_ok); free(sp); return nullptr; }
         if (!eligible && s->weight > 0) fprintf(stderr, "sampler: %s excluded: no %s patch fits %dx%dx%d and the enabled levels\n", s->name, cfg->holdout ? "validation" : "training", PZ(cfg), cfg->P, cfg->P);
         acc += eligible ? s->weight : 0; sp->cum[i] = acc;

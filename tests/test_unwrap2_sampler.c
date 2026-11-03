@@ -1,6 +1,6 @@
 /* train --task unwrap2 sampler on a synthetic NON-CUBIC band + phase-only source (no recto / ink target: the multi-scroll sources the
    desk's wind2 run trains on; Y != X like PHerc0172, the source of its crash windows). CT 160 x 96 x 224 voxels (level 0) and 80 x 48 x 112
-   (level 1); band codes and a stored phase on level 1, the phase known only in a slab of x (so many windows hold no phase at all); an axis
+   (level 1); band codes on level 1 and a stored phase on level 0 (the training level), the phase known only in a slab of x (so many windows hold no phase at all); an axis
    outside the box. Windows of P 64 at level 0 with the trainer's settings (side 2, winding mod 4 targets, --gpu-input records, symmetries,
    rotation / elastic warps, deterministic), with --min-phase 0 and 0.01. Checks per window: phase codes < 252 or 255; w4 / comp both
    known or both 255, comp < 255, w4 < 252; the input finite; the radial record's header (corner within the volume, D = P = 64, symmetry
@@ -40,7 +40,11 @@ static uint8_t phase1(int64_t z, int64_t y, int64_t x) {   /* level 1: W = 0.09 
     (void)z; if (x < 40 || x >= 80) return PHASE_UNKNOWN;
     const double W = 0.09 * x + 0.03 * y; return (uint8_t)((int)lround((W - floor(W)) * 252) % 252);
 }
-static uint8_t phase1neg(int64_t z, int64_t y, int64_t x) { const uint8_t q = phase1(z, y, x); return q < 252 ? (uint8_t)((252 - q) % 252) : q; }   /* W -> -W */
+static uint8_t phase0(int64_t z, int64_t y, int64_t x) {   /* the same field on the level-0 grid (labels at the training level): W = 0.045 x + 0.015 y, x in [80, 160) */
+    (void)z; if (x < 80 || x >= 160) return PHASE_UNKNOWN;
+    const double W = 0.045 * x + 0.015 * y; return (uint8_t)((int)lround((W - floor(W)) * 252) % 252);
+}
+static uint8_t phase0neg(int64_t z, int64_t y, int64_t x) { const uint8_t q = phase0(z, y, x); return q < 252 ? (uint8_t)((252 - q) % 252) : q; }
 static uint8_t codes1(int64_t z, int64_t y, int64_t x) { return phase1(z, y, x) == 0 ? 37 : 0; }
 
 static uint8_t *g_rec;   /* non-null: run() records every window's phase / w4 / comp (3 p3 per window) */
@@ -90,12 +94,12 @@ int main(int argc, char **argv) {
     snprintf(p, sizeof p, "%s/codes", dir);
     if (write_array(p, "16", s1, 0, codes1) || z3w_write_group(p, &um1, 1, "codes", nullptr)) { fprintf(stderr, "FAIL: codes\n"); return 1; }
     snprintf(p, sizeof p, "%s/phase", dir);
-    if (write_array(p, "16", s1, PHASE_UNKNOWN, phase1) || z3w_write_group(p, &um1, 1, "phase", nullptr)) { fprintf(stderr, "FAIL: phase\n"); return 1; }
+    if (write_array(p, "8", s0, PHASE_UNKNOWN, phase0) || z3w_write_group(p, um, 1, "phase", nullptr)) { fprintf(stderr, "FAIL: phase\n"); return 1; }
     snprintf(p, sizeof p, "%s/axis.json", dir); FILE *f = fopen(p, "w");
     fprintf(f, "{\"control_points\": [{\"z\": 0, \"y\": -300.5, \"x\": 110.25}, {\"z\": 159, \"y\": -280.0, \"x\": 120.0}]}\n"); fclose(f);
     snprintf(p, sizeof p, "%s/sources.json", dir); f = fopen(p, "w");
     fprintf(f, "{\"sources\": [{\"name\": \"noncubic\", \"root\": \"%s\", \"ct\": \"ct\", \"um\": 8, \"max_level\": 0, \"weight\": 1,\n"
-               " \"targets\": {\"band\": {\"root\": \"%s/codes\", \"key\": \"16\", \"radius\": 80, \"span\": 75, \"phase\": {\"root\": \"%s/phase\", \"key\": \"16\", \"level\": 1}}},\n"
+               " \"targets\": {\"band\": {\"root\": \"%s/codes\", \"key\": \"16\", \"radius\": 80, \"span\": 75, \"phase\": {\"root\": \"%s/phase\", \"key\": \"8\", \"level\": 0}}},\n"
                " \"axis\": \"%s/axis.json\"}]}\n", dir, dir, dir, dir);
     fclose(f);
     sources *S = sources_load(p);
@@ -110,13 +114,13 @@ int main(int argc, char **argv) {
        (p -> (252 - p) mod 252) and read with phase_sign -1 trains byte-identical phase / winding mod 4 / component targets; read
        without it, the targets differ (the check sees the sign) */
     snprintf(p, sizeof p, "%s/phaseneg", dir);
-    if (write_array(p, "16", s1, PHASE_UNKNOWN, phase1neg) || z3w_write_group(p, &um1, 1, "phase", nullptr)) { fprintf(stderr, "FAIL: negated phase\n"); return 1; }
+    if (write_array(p, "8", s0, PHASE_UNKNOWN, phase0neg) || z3w_write_group(p, um, 1, "phase", nullptr)) { fprintf(stderr, "FAIL: negated phase\n"); return 1; }
     char q[1400]; const int nw = 24; const size_t win = (size_t)3 * 64 * 64 * 64;
     uint8_t *rec[3]; for (int k = 0; k < 3; k++) rec[k] = malloc(nw * win);
     for (int k = 0; k < 3; k++) {   /* 0 the original, 1 negated + phase_sign -1, 2 negated as is */
         snprintf(q, sizeof q, "%s/sources-sign%d.json", dir, k); f = fopen(q, "w");
         fprintf(f, "{\"sources\": [{\"name\": \"noncubic\", \"root\": \"%s\", \"ct\": \"ct\", \"um\": 8, \"max_level\": 0, \"weight\": 1,\n"
-                   " \"targets\": {\"band\": {\"root\": \"%s/codes\", \"key\": \"16\", \"radius\": 80, \"span\": 75, \"phase\": {\"root\": \"%s/%s\", \"key\": \"16\", \"level\": 1%s}}},\n"
+                   " \"targets\": {\"band\": {\"root\": \"%s/codes\", \"key\": \"16\", \"radius\": 80, \"span\": 75, \"phase\": {\"root\": \"%s/%s\", \"key\": \"8\", \"level\": 0%s}}},\n"
                    " \"axis\": \"%s/axis.json\"}]}\n", dir, dir, dir, k ? "phaseneg" : "phase", k == 1 ? ", \"phase_sign\": -1" : "", dir);
         fclose(f);
         sources *Sk = sources_load(q); if (!Sk) { fprintf(stderr, "FAIL: sources_load %s\n", q); return 1; }
@@ -133,7 +137,7 @@ int main(int argc, char **argv) {
     for (int k = 0; k < 3; k++) free(rec[k]);
     snprintf(q, sizeof q, "%s/sources-bad.json", dir); f = fopen(q, "w");
     fprintf(f, "{\"sources\": [{\"name\": \"bad\", \"root\": \"%s\", \"ct\": \"ct\", \"um\": 8, \"max_level\": 0, \"weight\": 1,\n"
-               " \"targets\": {\"band\": {\"root\": \"%s/codes\", \"key\": \"16\", \"phase\": {\"root\": \"%s/phase\", \"key\": \"16\", \"level\": 1, \"phase_sign\": 2}}}}]}\n", dir, dir, dir);
+               " \"targets\": {\"band\": {\"root\": \"%s/codes\", \"key\": \"16\", \"phase\": {\"root\": \"%s/phase\", \"key\": \"8\", \"level\": 0, \"phase_sign\": 2}}}}]}\n", dir, dir, dir);
     fclose(f);
     sources *Sb = sources_load(q); CHECK(!Sb, "\"phase_sign\": 2 accepted"); if (Sb) sources_free(Sb);
     {   /* train --distill through the sampler: an "emb" group at level 1 (step 4) whose cell vectors encode their own position; without
@@ -156,7 +160,7 @@ int main(int argc, char **argv) {
         zw_free(&w); free(buf);
         snprintf(q, sizeof q, "%s/sources-emb.json", dir); f = fopen(q, "w");
         fprintf(f, "{\"sources\": [{\"name\": \"noncubic\", \"root\": \"%s\", \"ct\": \"ct\", \"um\": 8, \"max_level\": 0, \"weight\": 1,\n"
-                   " \"targets\": {\"band\": {\"root\": \"%s/codes\", \"key\": \"16\", \"radius\": 80, \"span\": 75, \"phase\": {\"root\": \"%s/phase\", \"key\": \"16\", \"level\": 1}}},\n"
+                   " \"targets\": {\"band\": {\"root\": \"%s/codes\", \"key\": \"16\", \"radius\": 80, \"span\": 75, \"phase\": {\"root\": \"%s/phase\", \"key\": \"8\", \"level\": 0}}},\n"
                    " \"emb\": {\"groups\": [\"%s/emb\"], \"name\": \"pca\", \"level\": 1}, \"axis\": \"%s/axis.json\"}]}\n", dir, dir, dir, dir, dir);
         fclose(f);
         sources *Se = sources_load(q); if (!Se) { fprintf(stderr, "FAIL: sources_load %s\n", q); return 1; }

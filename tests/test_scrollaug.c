@@ -66,7 +66,7 @@ static void xscan_tests(const char *dir) {
     /* the read: the shifted partner = the CT at origin - shift (level 1, zyx shift 2, -1, 3), exact; outside the partner 0 */
     {
         snprintf(p, sizeof p, "%s/map-sh.json", dir); sview *v = sview_open(p, 0, 9.6, nullptr); assert(v);
-        snprintf(p, sizeof p, "%s/sources.json", dir); sources *S = sources_load(p); assert(S);
+        snprintf(p, sizeof p, "%s/sources-l1.json", dir); sources *S = sources_load(p); assert(S);
         z3 *ct = source_ct(&S->src[0], 1); const int64_t o[3] = {40, 30, 20}, n[3] = {24, 40, 32}, os[3] = {38, 31, 17};
         const size_t N = (size_t)n[0] * n[1] * n[2]; uint8_t *a = malloc(N), *b = malloc(N);
         assert(!sview_read_level(v, 1, o, n, a) && !z3_read(ct, os, n, b, 1));
@@ -148,7 +148,7 @@ static void tear_tests(const char *dir) {
         free(ph); free(ct); free(w4); free(wc); free(oc); free(op); free(ow); free(oq);
     }
     /* the sampler: default off, p 1 deterministic, and the winding mod 4 jumps across the cut where the phase stays smooth-looking */
-    char p[1400]; snprintf(p, sizeof p, "%s/sources.json", dir); sources *S = sources_load(p); assert(S);
+    char p[1400]; snprintf(p, sizeof p, "%s/sources-l1.json", dir); sources *S = sources_load(p); assert(S);
     const int PW = 64; const size_t p3 = (size_t)PW * PW * PW;
     sample_cfg c = base_cfg(PW); c.snap = 0; c.symmetry_p = 0; c.rotate_p = 0; c.elastic_p = 0; c.zoom_p = 0; c.affine_p = 0;
     snap a[NB], b[NB], d[NB], e[NB];
@@ -226,7 +226,7 @@ static void delam_tests(const char *dir) {
         check("delam hole: CT only darkened, labels unchanged", nhole >= 12 && hole_lab && hole_dark && hole_n > 100);
         free(ph); free(ct); free(oc); free(op); free(w4); free(wc);
     }
-    char p[1400]; snprintf(p, sizeof p, "%s/sources.json", dir); sources *S = sources_load(p); assert(S);
+    char p[1400]; snprintf(p, sizeof p, "%s/sources-l1.json", dir); sources *S = sources_load(p); assert(S);
     const int PW = 64; const size_t p3 = (size_t)PW * PW * PW;
     sample_cfg c = base_cfg(PW); c.snap = 0; c.symmetry_p = 0; c.rotate_p = 0; c.elastic_p = 0; c.zoom_p = 0; c.affine_p = 0;
     snap a[NB], b[NB], d[NB], e[NB];
@@ -285,7 +285,7 @@ static void density_tests(const char *dir) {
         check("density apply: gains differ between wraps (>= 3x the spread within one)", between > .05 && between > 3 * within);
         free(ph); free(ct); free(out); free(id);
     }
-    char p[1400]; snprintf(p, sizeof p, "%s/sources.json", dir); sources *S = sources_load(p); assert(S);
+    char p[1400]; snprintf(p, sizeof p, "%s/sources-l1.json", dir); sources *S = sources_load(p); assert(S);
     const int PW = 64; const size_t p3 = (size_t)PW * PW * PW;
     sample_cfg c = base_cfg(PW); c.snap = 0; c.symmetry_p = 0; c.rotate_p = 0; c.elastic_p = 0; c.zoom_p = 0; c.affine_p = 0;
     snap a[NB], d[NB], e[NB];
@@ -353,7 +353,7 @@ static void curv_tests(const char *dir) {
         check("curv map: rings about the moved axis -> rings about the source axis (radial spacing kept; flat: planes), arc length kept", ering < 1e-6 && eflat < 1e-6 && earc < 1e-6);
         check("curv map: det > 0 off the seam, the radial line through the centre unmoved, the seam only behind the axis", detok && emono < 1e-6 && nmask > 0 && nmask_front == 0);
     }
-    char p[1400]; snprintf(p, sizeof p, "%s/sources.json", dir); sources *S = sources_load(p); assert(S);
+    char p[1400]; snprintf(p, sizeof p, "%s/sources-l1.json", dir); sources *S = sources_load(p); assert(S);
     const int PW = 32;   /* (the fixture scroll: radius 60 at level 1; bent windows need the axis >= 0.75 P away) */ const size_t p3 = (size_t)PW * PW * PW;
     sample_cfg c = base_cfg(PW); c.snap = 0; c.symmetry_p = 0; c.rotate_p = 0; c.elastic_p = 0; c.zoom_p = 0; c.affine_p = 0; c.wind4_min = 100;   /* (6^3 tiles at P 32) */
     snap a[NB], d[NB], e[NB];
@@ -402,7 +402,7 @@ static void incl_tests(const char *dir) {
         check("inclusions apply: local (< 5% of the voxels), bright grains / debris and dark bubbles", changed > 0 && changed < .05 * 6 * p3 && up > 0 && down > 0);
         free(in); free(ct); free(out);
     }
-    char p[1400]; snprintf(p, sizeof p, "%s/sources.json", dir); sources *S = sources_load(p); assert(S);
+    char p[1400]; snprintf(p, sizeof p, "%s/sources-l1.json", dir); sources *S = sources_load(p); assert(S);
     const int PW = 64; const size_t p3 = (size_t)PW * PW * PW;
     sample_cfg c = base_cfg(PW); c.snap = 0; c.symmetry_p = 0; c.rotate_p = 0; c.elastic_p = 0; c.zoom_p = 0; c.affine_p = 0;
     snap a[NB], d[NB], e[NB];

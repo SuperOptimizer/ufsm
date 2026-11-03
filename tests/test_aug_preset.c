@@ -18,7 +18,7 @@ static uint64_t mix(uint64_t h, const void *p, size_t n) {
 }
 enum { N0 = 128 };
 /* CT: level 0 (1 um, 128^3) and level 1 (2 um, the 2^3 means); sheets along x (period 16, papyrus x % 16 in 3..12, CT 110..160,
-   void 30); side labels on the 2 um grid: recto where (x % 16) < 8, else verso (void is decided by the CT cutoff) */
+   void 30); side labels on the 1 and 2 um grids: recto where (x % 16) < 8 (level-0 x), else verso (void is decided by the CT cutoff) */
 static void fixture(const char *dir) {
     uint8_t *v0 = malloc((size_t)N0 * N0 * N0), *v1 = calloc((size_t)N0 * N0 * N0, 1);
     for (int z = 0; z < N0; z++) for (int y = 0; y < N0; y++) for (int x = 0; x < N0; x++) {
@@ -43,11 +43,14 @@ static void fixture(const char *dir) {
     for (int z = 0; z < h; z++) for (int y = 0; y < h; y++) for (int x = 0; x < h; x++) b1[((size_t)z * N0 + y) * N0 + x] = (2 * x) % 16 < 8 ? RV_RECTO : RV_VERSO;
     snprintf(path, sizeof path, "%s/side/2", dir); w = z3w_create(path, s1, 128, 0, 0, nullptr); assert(w);
     assert(!z3w_write_shard(w, 0, 0, 0, b1, 2) && !z3w_close(w));
-    snprintf(path, sizeof path, "%s/side", dir); assert(!z3w_write_group(path, um + 1, 1, "side", nullptr));
+    for (int z = 0; z < N0; z++) for (int y = 0; y < N0; y++) for (int x = 0; x < N0; x++) b1[((size_t)z * N0 + y) * N0 + x] = x % 16 < 8 ? RV_RECTO : RV_VERSO;
+    snprintf(path, sizeof path, "%s/side/1", dir); w = z3w_create(path, s0, 128, 0, 0, nullptr); assert(w);   /* (labels at every training level: 1 um too) */
+    assert(!z3w_write_shard(w, 0, 0, 0, b1, 2) && !z3w_close(w));
+    snprintf(path, sizeof path, "%s/side", dir); assert(!z3w_write_group(path, um, 2, "side", nullptr));
     snprintf(path, sizeof path, "%s/sources.json", dir);
     FILE *f = fopen(path, "w"); assert(f);
     fprintf(f, "{\"sources\":[{\"name\":\"s\",\"root\":\"%s\",\"ct\":\"ct\",\"um\":1,\"iso\":60,\"targets\":{\"recto\":{\"root\":\"%s\",\"group\":\"side\","
-               "\"encoding\":\"side\",\"min_level\":1}}}]}\n", dir, dir);
+               "\"encoding\":\"side\"}}}]}\n", dir, dir);
     assert(!fclose(f));
     free(v0); free(v1); free(b1);
 }
