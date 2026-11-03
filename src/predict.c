@@ -784,7 +784,7 @@ int cmd_predict(int argc, char **argv) {
     const double radial_sign = atof(opt(argc, argv, "--radial-sign", "1"));   /* -1: reversed direction input (a recto model then marks the verso face) */
     if (radial_sign != 1 && radial_sign != -1) { fprintf(stderr, "predict: --radial-sign must be 1 or -1\n"); return 2; }
     const char *chs = opt(argc, argv, "--channel", "0");   /* output channel to write (band_affinity: 1..6 = affinities; "ink": a task unwrap2 --ink-head checkpoint's ink channel) */
-    /* --channel rv (train --task unwrap2 --rv checkpoints): both side channels in one pass, written as 255 (1 + p_recto - p_verso) / 2 */
+    /* --channel rv (train --task unwrap2 --rv checkpoints): both side channels in one pass, written as 1 + 254 (1 + p_recto - p_verso) / 2, 0 where CT 0 */
     const int rvfuse = !strcmp(chs, "rv");
     { char *h = checkpoint_header_line(ckpt); const int isrv = h && strstr(h, "\"rv\":{\"version\":1"); free(h);
       if (rvfuse && !isrv) { fprintf(stderr, "predict: --channel rv: %s is not a train --rv checkpoint\n", ckpt); return 2; }
@@ -881,7 +881,7 @@ int cmd_predict(int argc, char **argv) {
     char content[96]; if (pap && pcut >= 0) snprintf(content, sizeof content, "papyrus probability at cutoff %g", pcut); else snprintf(content, sizeof content, "%s probability", pap ? "papyrus" : "recto");
     if (!strcmp(chs, "ink")) snprintf(content, sizeof content, "ink probability (unwrap2 channel %d)", out_ch);
     if (rvfuse) { if (half || hmode == 2) { fprintf(stderr, "predict: --channel rv: full-resolution checkpoints only\n"); return 2; }
-                  snprintf(content, sizeof content, "recto / verso side: 255 (1 + p_recto - p_verso) / 2"); }
+                  snprintf(content, sizeof content, "recto / verso side: 1 + 254 (1 + p_recto - p_verso) / 2 (0: CT 0)"); }
     const char *gn_stats = opt(argc, argv, "--gn-stats", embedded && runtime.gn_stored ? "stored" : "legacy");
     if (strcmp(gn_stats, "stored") && strcmp(gn_stats, "legacy")) { fprintf(stderr, "--gn-stats must be stored or legacy\n"); return 2; }
     nn_set_gn_stored(!strcmp(gn_stats, "stored"));
