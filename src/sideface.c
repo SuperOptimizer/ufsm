@@ -1,5 +1,5 @@
 /* ufsm side-face <phase-root> <phase-key> <ct-root> <ct-key> <out-group> <out-um> [--iso 64] [--phase-scale 1|2] [--reach 3]
-                  [--cap 48] [--cell 8] [--min-cell 8] [--box z,y,x,nz,ny,nx] [--block 128] [--shard 512] [--threads 16] [--cache DIR]
+                  [--cap 48] [--cell 16] [--per-voxel 0] [--min-cell 8] [--box z,y,x,nz,ny,nx] [--block 128] [--shard 512] [--threads 16] [--cache DIR]
                   [--agree ROOT KEY] [--no-out 1]
    Face-anchored recto / verso labels (user 11-02, rv): the side rule k..k+0.5 = recto, k+0.5..k+1 = verso of a pair-rule phase raster
    (band.h PHASE_*), but with each wrap moved onto its sheet's RECTO (inner) face in the CT, so every sheet gets one clean verso -> recto
@@ -7,9 +7,10 @@
    Per papyrus voxel x (CT >= --iso) with a known phase and gradient g (central circular differences, turns per voxel): walk inward along
    -g / |g| (toward the umbilicus: the phase falls) in 1-voxel steps up to min(--reach x the local spacing 1/|g|, --cap) voxels until the
    CT drops below --iso: the last papyrus voxel q is the inner face of x's sheet run (touching sheets: the run's innermost face). The wrap
-   offset there is delta = phi(q); the face-anchored phase is phi' = phi - delta (mod 1 turn): 0 at the inner face, rising outward by the
-   GT spacing, so touching sheets keep alternating (the mod). Voxels whose walk finds no face (packed beyond the reach, the block edge,
-   CT 0) take the circular mean delta of the found voxels of their --cell^3 cell (>= --min-cell samples, resultant >= 0.5), else unknown.
+   offset there is delta = phi(q). delta is smoothed into a field: the circular mean of the found voxels of each --cell^3 cell (16; >=
+   --min-cell samples, resultant >= 0.5; else unknown) (--per-voxel 1: a voxel's own delta where its walk found a face: noisy in packed
+   papyrus); the face-anchored phase is phi' = phi - delta (mod 1 turn): ~0 at the inner faces, rising outward by the GT spacing, so
+   touching sheets keep alternating (the mod).
    Void voxels with a known phase take their cell's delta (or keep phi). Output: <out-group>/<out-um> phi' codes (PHASE_*, 255 unknown),
    the CT grid, 512^3 shards: a drop-in "phase" for train sources (train --rv: recto = phi' < 1/2 turn on papyrus).
    --phase-scale 2: the phase raster is on a 2x coarser grid than the CT / output (e.g. PHerc0139 GT 18.72 on the 9.362 scan): read
@@ -40,7 +41,7 @@ static const char *sf_opt(int argc, char **argv, const char *name, const char *d
 enum { SF_PROF = 9 };   /* CT profile samples -4..+4 */
 typedef struct {
     z3 *ph, *ct, *ag; int pscale, iso, cap, cell, mincell, B, H, S; double reach;
-    int64_t shape[3], bo[3], bn[3];
+    int64_t shape[3], bo[3], bn[3]; int pervox;
 } sf_job;
 
 static float sf_cs[PHASE_PERIOD], sf_sn[PHASE_PERIOD];
@@ -118,7 +119,7 @@ static int sf_block(sf_job *J, const int64_t o[3], const int n[3], uint8_t *out,
         const size_t i = ((size_t)z * Y + y) * X + x, oi = ((size_t)(z - H) * n[1] + (y - H)) * n[2] + (x - H);
         int v = ph[i];
         if (v >= PHASE_PERIOD) { out[oi] = PHASE_UNKNOWN; continue; }
-        int d = dl[i], how = 0;
+        int d = J->pervox ? dl[i] : 255, how = 0;
         if (d == 255) { const float *c = cs + 3 * (((size_t)(z / C) * cy + y / C) * cx + x / C);
                         if (c[2] >= J->mincell && c[0] * c[0] + c[1] * c[1] >= 0.25f * c[2] * c[2]) { d = sf_code(c[0], c[1]); how = 1; } else how = 2; }
         if (pp[i]) { st[0]++; st[how == 0 ? 1 : how == 1 ? 2 : 3]++; st[5] += v < PHASE_PERIOD / 2; }
@@ -191,14 +192,14 @@ static void *sf_worker(void *arg) {
 
 int cmd_side_face(int argc, char **argv) {
     if (argc < 8) { fprintf(stderr, "usage: ufsm side-face <phase-root> <phase-key> <ct-root> <ct-key> <out-group> <out-um> [--iso 64] [--phase-scale 1|2] [--reach 3] [--cap 48]\n"
-                                    "       [--cell 8] [--min-cell 8] [--box z,y,x,nz,ny,nx] [--block 128] [--shard 512] [--threads 16] [--cache DIR] [--agree ROOT KEY] [--no-out 1]\n"); return 2; }
+                                    "       [--cell 16] [--per-voxel 0] [--min-cell 8] [--box z,y,x,nz,ny,nx] [--block 128] [--shard 512] [--threads 16] [--cache DIR] [--agree ROOT KEY] [--no-out 1]\n"); return 2; }
     for (int k = 0; k < PHASE_PERIOD; k++) { sf_cs[k] = (float)cos(2 * M_PI * k / PHASE_PERIOD); sf_sn[k] = (float)sin(2 * M_PI * k / PHASE_PERIOD); }
     sf_job J; memset(&J, 0, sizeof J);
     const char *cache = sf_opt(argc, argv, "--cache", nullptr);
     J.ph = z3_open(store_open(argv[2]), argv[3], cache); J.ct = z3_open(store_open(argv[4]), argv[5], cache);
     if (!J.ph || !J.ct) { fprintf(stderr, "side-face: %s\n", z3_error()); return 1; }
     J.pscale = atoi(sf_opt(argc, argv, "--phase-scale", "1")); J.iso = atoi(sf_opt(argc, argv, "--iso", "64")); J.reach = atof(sf_opt(argc, argv, "--reach", "3"));
-    J.cap = atoi(sf_opt(argc, argv, "--cap", "48")); J.cell = atoi(sf_opt(argc, argv, "--cell", "8")); J.mincell = atoi(sf_opt(argc, argv, "--min-cell", "8"));
+    J.cap = atoi(sf_opt(argc, argv, "--cap", "48")); J.cell = atoi(sf_opt(argc, argv, "--cell", "16")); J.mincell = atoi(sf_opt(argc, argv, "--min-cell", "8")); J.pervox = atoi(sf_opt(argc, argv, "--per-voxel", "0"));
     J.B = atoi(sf_opt(argc, argv, "--block", "128")); J.S = atoi(sf_opt(argc, argv, "--shard", "512")); J.H = J.cap + 2;
     if ((J.pscale != 1 && J.pscale != 2) || J.iso < 1 || J.cap < 2 || J.cell < 1 || J.B < 16 || J.S % J.B) { fprintf(stderr, "side-face: bad options (--phase-scale 1|2, --shard a multiple of --block)\n"); return 2; }
     const z3_meta *cm = z3_meta_of(J.ct), *pm = z3_meta_of(J.ph);
