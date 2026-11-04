@@ -129,17 +129,18 @@ typedef struct {
     uint8_t *crops; float *lut; int *keep;
     atomic_int next;
 } prep_job;
+static int mask_hit(const uint8_t *mask, const int64_t m0[3], const int64_t mn[3], int mb, int64_t oz, int64_t oy, int64_t ox) {
+    const int64_t o[3] = {oz, oy, ox}; int64_t b0[3], b1[3];
+    for (int a = 0; a < 3; a++) { b0[a] = (o[a] - m0[a]) / mb; b1[a] = (o[a] + G.out - 1 - m0[a]) / mb; if (b0[a] < 0) b0[a] = 0; if (b1[a] >= mn[a]) b1[a] = mn[a] - 1; if (b1[a] < b0[a]) return 0; }
+    for (int64_t z = b0[0]; z <= b1[0]; z++) for (int64_t y = b0[1]; y <= b1[1]; y++) for (int64_t x = b0[2]; x <= b1[2]; x++)
+        if (mask[((size_t)z * mn[1] + y) * mn[2] + x]) return 1;
+    return 0;
+}
 static void *prep_worker(void *arg) {
     prep_job *J = arg;
     for (;;) {
         const int j = atomic_fetch_add(&J->next, 1); if (j >= J->nj) break;
-        if (J->mask) {   /* skip crops whose output cube touches no surface block */
-            const int64_t o[3] = {J->oz, J->oy[j], J->ox[j]}; int64_t b0[3], b1[3]; int hit = 0;
-            for (int a = 0; a < 3; a++) { b0[a] = (o[a] - J->m0[a]) / J->mb; b1[a] = (o[a] + G.out - 1 - J->m0[a]) / J->mb; if (b0[a] < 0) b0[a] = 0; if (b1[a] >= J->mn[a]) b1[a] = J->mn[a] - 1; }
-            for (int64_t z = b0[0]; z <= b1[0] && !hit; z++) for (int64_t y = b0[1]; y <= b1[1] && !hit; y++) for (int64_t x = b0[2]; x <= b1[2]; x++)
-                if (J->mask[((size_t)z * J->mn[1] + y) * J->mn[2] + x]) { hit = 1; break; }
-            if (!hit) { J->keep[j] = 0; continue; }
-        }
+        if (J->mask && !mask_hit(J->mask, J->m0, J->mn, J->mb, J->oz, J->oy[j], J->ox[j])) { J->keep[j] = 0; continue; }   /* no surface near its output */
         const int64_t pz = 2 * (int64_t)J->oz - G.poff - J->zs, py = 2 * (int64_t)J->oy[j] - G.poff - J->ys, px = 2 * (int64_t)J->ox[j] - G.poff - J->xs;
         const uint8_t *pb = J->slab + ((size_t)pz * J->sy + py) * J->sx + px, *cb = pb + ((size_t)G.poff * J->sy + G.poff) * J->sx + G.poff;
         if (crop_max(cb, J->sy, J->sx) < J->air) { J->keep[j] = 0; continue; }
@@ -229,6 +230,11 @@ static int run_band(run_ctx *C, int tz0, int tz1, int y0, int y1, int x0, int x1
         /* rows below oz are final */
         int e1 = oz < tz1 ? oz : tz1; e1 &= ~1;
         if (e1 > fin) { emit(C, TY, TX, fin, e1, y0, x0, b48, s48, b96, s96, SH); fin = e1; }
+        if (C->mask) {   /* --surface: a crop row whose crops all miss the surface reads no CT */
+            int any = 0;
+            for (int j = 0; j < nj && !any; j++) any = mask_hit(C->mask, C->m0, C->mn, C->mb, oz, oy[j], ox[j]);
+            if (!any) { C->nair += nj; zs = INT64_MIN; continue; }
+        }
         /* the CT slab [2 oz - poff, 2 oz - poff + parent) */
         const double tc = now_s();
         const int64_t nzs = 2 * (int64_t)oz - G.poff; int64_t keep = 0;

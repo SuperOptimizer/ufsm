@@ -37,6 +37,7 @@ typedef struct {
     int nstage, lattice[8], steps[8];   /* delta lattice spacing (native voxels) and Adam steps per stage */
     float lr, lr_knot;              /* Adam learning rates for delta and the knots */
     float w_phase, w_normal, w_density, w_nondeg, w_smooth, w_decay;
+    float nondeg_floor;             /* the anti-compression hinge (fit --nondeg-floor): |grad W| >= floor x rho, one-sided (0: 0.4) */
     float w_wind4;                  /* the winding mod 4 term (fields with dz dy dx dq planes; analytic loss, phase stages, ramped like the phase) */
     float w_recto;                  /* recto anchors r^2 (1 - cos 2 pi W) (fields with an r plane; phase stages, ramped like the phase; 0: off) */
     int phase_stage;                /* stages before it fit the gradient terms only (normal, density: no integer ambiguity, they
@@ -123,6 +124,14 @@ typedef struct {
        16..128 native voxels apart along one fibre whose network phase stays within half a turn along it should have W(b) - W(a) = that
        phase change (a loss term in every fit stage, src/fit.c fib_pairs); fib_zoff: the fields' first native z in the fibres' frame */
     const float *fib; const int *fib_off; int fib_n; float w_fib; double fib_zoff;
+    int fib_nspan, fib_span[8];     /* pair spans (native voxels along the fibre; default 16 32 64 128) */
+    float uw_rep_fib;               /* fibre votes in the slip repair (fit --uw-rep-fib W with --fibers; 0 off): src/fit.c uwr_fib */
+    float fib_conf, fib_dmax; int fib_gap;   /* fibre trace (fib_pairs): phase confidence >= fib_conf (0.2), gaps <= fib_gap samples bridged (2),
+                                       a per-sample phase change > fib_dmax turns cuts the stretch (0.5: off) */
+    float uw_rep_fib_hop; int uw_rep_fib_min;   /* hop gate: drop a fibre whose in-piece pairs vote non-zero more than this fraction (>= 1 off);
+                                       uw_rep_fib_min 1: also drop fibres with < 4 in-piece pairs (unchecked) */
+    float w_fib_cons; int fib_cons_len;   /* per-fibre consensus (winding-field's shared unknown per fibre segment): each stretch, cut into
+                                       pieces of <= fib_cons_len native voxels, pulls W - phase of its points to their mean (Huber); 0 off */
     struct fit_stream *stream;      /* GPU fits (fit_fields_load_stream): the fields already on the device and the gradient stages' pooled
                                        fields made while loading (the host fields then carry no normal planes); nullptr: fit_run_dir uploads
                                        and pools the host fields itself */
@@ -196,6 +205,7 @@ typedef struct {
     const uint8_t *ctm; float w_ct, ct_pow, ct_phi, ct_floor;   /* CT parity 128 + 127 m (m > 0 papyrus, < 0 void; fit_ct_parity), weight,
                                                (1 - conf)^ct_pow (>= ct_floor), papyrus phase; nullptr none; loss in parts[FIT_P_CT] */
     const uint8_t *cs; float w_cs, cs_tol;  /* CT sheet spacing (sp units), weight, log tolerance to sp; loss in parts[FIT_P_CSPACE] */
+    float nd_floor;                         /* the nondegeneracy floor: |grad W| below nd_floor x the predicted density is penalised (0: 0.4) */
 } fit_dev;
 /* the data terms over every field voxel: loss parts (double[FIT_NPARTS], FIT_P_*, accumulated; the smoothness slot untouched)
    and the gradients of delta and of the knots (accumulated: zero them first) */

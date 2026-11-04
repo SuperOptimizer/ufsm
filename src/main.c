@@ -824,6 +824,12 @@ static int cmd_band(int argc, char **argv) {
    fields over 9 predict windows: mean ids 0.827 -> 0.893).
    --fibers FILE --w-fib W: published fibre polylines (ufsm fiber-export for this fields dir) as a pair term W(b) - W(a) = the network phase
    change along the fibre, on point pairs 16..128 native voxels apart whose phase stays within half a turn (src/fit.c fib_pairs).
+   --w-fib-cons W [--fib-cons-len 256]: per-fibre consensus instead (each stretch's W - phase pulled to its mean, Huber). --fib-spans
+   16,32,64,128: pair spans. --fib-conf 0.2 --fib-gap 2 --fib-dmax 0.5: the fibre trace (phase confidence, bridged gap samples, per-sample
+   phase change that cuts a stretch). Paris 4 (15 boxes with AFV fibres): the loss terms move ids < 0.001 at W 0.1-0.3, hurt at 1.
+   --uw-rep-fib W (with --fibers, --uw-repair): the same pairs as votes in the slip repair (src/fit.c uwr_fib): W 16 ids +0.021 (P 0.999;
+   J34 +0.14, HOLD -0.03), W >= 64 overrides the phase. --uw-rep-fib-hop F [--uw-rep-fib-min 1]: drop fibres whose in-piece pairs vote
+   non-zero (flags ~0 fibres: the trace already follows the phase). --nondeg-floor F (0.4) --w-nondeg W: the nondegeneracy hinge.
    --phase-stretch S [--phase-stretch-r R]: the phase confidence x exp(-log2(s)^2 / 2 S^2), s the phase stretch (|grad phase| x spacing
    over a (2R+1)^3 box, R default 1), before the fit: where the phase skips sheets the density sets the turn count (0 off). */
 /* U (the unwrapped radius in turns; sheets where U - dir theta / 2 pi is an integer) for the scorer: fill(ctx, og, n3, step, codes, U)
@@ -1411,10 +1417,19 @@ static int cmd_fit(int argc, char **argv) {
     c.uw_rep_cs = (float)atof(opt(argc, argv, "--uw-rep-cs", "0")); c.uw_rep_dump = opt(argc, argv, "--uw-rep-dump", nullptr);
     static fib_set fibs;   /* --fibers FILE (ufsm fiber-export for this fields dir) --w-fib W: same-fibre pair term in the fit stages */
     c.w_fib = (float)atof(opt(argc, argv, "--w-fib", "0"));
+    c.uw_rep_fib = (float)atof(opt(argc, argv, "--uw-rep-fib", "0"));
+    c.fib_conf = (float)atof(opt(argc, argv, "--fib-conf", "0.2")); c.fib_gap = atoi(opt(argc, argv, "--fib-gap", "2")); c.fib_dmax = (float)atof(opt(argc, argv, "--fib-dmax", "0.5"));
+    c.uw_rep_fib_hop = (float)atof(opt(argc, argv, "--uw-rep-fib-hop", "1")); c.uw_rep_fib_min = atoi(opt(argc, argv, "--uw-rep-fib-min", "0"));
+    c.w_fib_cons = (float)atof(opt(argc, argv, "--w-fib-cons", "0")); c.fib_cons_len = atoi(opt(argc, argv, "--fib-cons-len", "256"));
+    if (*opt(argc, argv, "--fib-spans", "")) { c.fib_nspan = 0; char *t = strdup(opt(argc, argv, "--fib-spans", "")); for (char *q = strtok(t, ","); q && c.fib_nspan < 8; q = strtok(nullptr, ",")) c.fib_span[c.fib_nspan++] = atoi(q); free(t); }
+    if (!(c.w_fib_cons >= 0) || c.fib_cons_len < 8) { fprintf(stderr, "fit: --w-fib-cons >= 0, --fib-cons-len >= 8\n"); return 2; }
+    c.nondeg_floor = (float)atof(opt(argc, argv, "--nondeg-floor", "0"));   /* the anti-compression hinge |grad W| >= floor x rho (0: 0.4) */
+    if (*opt(argc, argv, "--w-nondeg", "")) c.w_nondeg = (float)atof(opt(argc, argv, "--w-nondeg", "1"));
+    if (!(c.nondeg_floor >= 0) || !(c.w_nondeg >= 0)) { fprintf(stderr, "fit: --nondeg-floor and --w-nondeg must be >= 0\n"); return 2; }
     if (*opt(argc, argv, "--fibers", "")) {
         if (fib_load(opt(argc, argv, "--fibers", ""), &fibs)) { fprintf(stderr, "fit: cannot read --fibers %s\n", opt(argc, argv, "--fibers", "")); return 1; }
         c.fib = fibs.pts; c.fib_off = fibs.off; c.fib_n = fibs.n;
-        if (!(c.w_fib > 0)) fprintf(stderr, "fit: --fibers without --w-fib W > 0 (unused)\n");
+        if (!(c.w_fib > 0) && !(c.w_fib_cons > 0) && !(c.uw_rep_fib > 0)) fprintf(stderr, "fit: --fibers without --w-fib / --w-fib-cons / --uw-rep-fib W > 0 (unused)\n");
     }
     c.uw_rep_qpow = (float)atof(opt(argc, argv, "--uw-rep-qpow", "3")); c.uw_rep_stretch = (float)atof(opt(argc, argv, "--uw-rep-stretch", "0.5"));
     c.uw_rep_sr = atoi(opt(argc, argv, "--uw-rep-sr", "1")); c.uw_rep_seed = (float)atof(opt(argc, argv, "--uw-rep-seed", *opt(argc, argv, "--seed-model", "") ? "16" : "0"));   /* (fit --slab chaining: off unless given) */ c.uw_rep_geo_init = atoi(opt(argc, argv, "--uw-rep-geo-init", "0")); c.uw_rep_off = atoi(opt(argc, argv, "--uw-rep-off", "0")); c.uw_rep_cons = atoi(opt(argc, argv, "--uw-rep-cons", "1")); c.phase_stretch = (float)atof(opt(argc, argv, "--phase-stretch", "0")); c.phase_stretch_r = atoi(opt(argc, argv, "--phase-stretch-r", "1"));
