@@ -106,6 +106,7 @@ int cmd_dino_boxes(int argc, char **argv);
 int cmd_tifxyz_map(int argc, char **argv);
 int cmd_tifxyz_orient(int argc, char **argv);
 int cmd_tifxyz_bbox(int argc, char **argv);
+int cmd_tifxyz_crop(int argc, char **argv);
 int cmd_tifxyz_shards(int argc, char **argv);
 int cmd_png2jpg(int argc, char **argv);
 int cmd_tifxyz_sfc(int argc, char **argv);
@@ -4580,6 +4581,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "tifxyz-map")) return cmd_tifxyz_map(argc, argv);
     if (!strcmp(cmd, "tifxyz-orient")) return cmd_tifxyz_orient(argc, argv);
     if (!strcmp(cmd, "tifxyz-bbox")) return cmd_tifxyz_bbox(argc, argv);
+    if (!strcmp(cmd, "tifxyz-crop")) return cmd_tifxyz_crop(argc, argv);
     if (!strcmp(cmd, "tifxyz-shards")) return cmd_tifxyz_shards(argc, argv);
     if (!strcmp(cmd, "png2jpg")) return cmd_png2jpg(argc, argv);
     if (!strcmp(cmd, "tifxyz-sfc")) return cmd_tifxyz_sfc(argc, argv);

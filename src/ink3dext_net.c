@@ -7,16 +7,18 @@
 #include <stdlib.h>
 #include <string.h>
 
-enum { GB_ST = 5 };
-static const int gb_feat[GB_ST] = {32, 64, 128, 256, 320}, gb_nblk[GB_ST] = {1, 2, 2, 2, 2};
+enum { GB_MAXST = 8, GB_MAXBLK = 8 };
 
 typedef struct { xconv c; float *g, *b; } cin;               /* conv + InstanceNorm affine (device) */
 typedef struct { cin c1, c2, sk; int has_sk, pool; } rblock;
 struct gb_net {
-    rblock enc[GB_ST][2];
-    xconv up[GB_ST - 1]; cin dec[GB_ST - 1];
+    int nst, nblk[GB_MAXST], feat[GB_MAXST], has_stem;
+    i3_geom g;
+    cin stem;
+    rblock enc[GB_MAXST][GB_MAXBLK];
+    xconv up[GB_MAXST - 1]; cin dec[GB_MAXST - 1];
     float *hw; float hb;
-    float *logits; int cap;
+    float *logits, *pooled; int cap;
 };
 
 static const wl_tensor *need(const wl_dict *d, const char *name) {
@@ -38,12 +40,33 @@ static int cin_of(const wl_dict *d, cin *c, const char *pfx, int k, int s, int b
 }
 static void cin_free(cin *c) { xconv_free(&c->c); xfree_dev(c->g); xfree_dev(c->b); }
 
-gb_net *gb_load(const char *weights) {
-    wl_dict *d = wl_load(weights, nullptr);
+/* model geometry (src/ink3dext.h) */
+static int geom_of(const char *model, i3_geom *g) {
+    if (!strcmp(model, "gambiarra")) { *g = (i3_geom){.crop = 128, .pool_in = 2, .net_in = 64, .pool_out = 1, .out = 64, .parent = 256, .poff = 64}; return 0; }
+    if (!strcmp(model, "dino3d")) { *g = (i3_geom){.crop = 256, .pool_in = 1, .net_in = 256, .pool_out = 2, .out = 128, .parent = 256, .poff = 0}; return 0; }
+    fprintf(stderr, "ink3d-ext: unknown --model %s (gambiarra | dino3d)\n", model); return -1;
+}
+
+gb_net *gb_load(const char *weights, const char *model, i3_geom *geo) {
+    i3_geom G; if (geom_of(model, &G)) return nullptr;
+    wl_dict *d = wl_load(weights, nullptr);   /* .pth: ema_model first (the recommended inference weights) */
     if (!d) { fprintf(stderr, "ink3d-ext: %s: %s\n", weights, wl_error()); return nullptr; }
-    gb_net *n = calloc(1, sizeof *n); int rc = 0;
+    gb_net *n = calloc(1, sizeof *n); int rc = 0; n->g = G;
     char p[256];
-    for (int s = 0; s < GB_ST && !rc; s++) for (int k = 0; k < gb_nblk[s] && !rc; k++) {
+    /* stages / blocks / widths from the tensor names */
+    while (n->nst < GB_MAXST) { snprintf(p, sizeof p, "shared_encoder.stages.%d.blocks.0.conv1.conv.weight", n->nst); if (!wl_get(d, p)) break; n->nst++; }
+    if (n->nst < 2) { fprintf(stderr, "ink3d-ext: %s: no encoder stages\n", weights); rc = -1; }
+    for (int s = 0; s < n->nst && !rc; s++) {
+        while (n->nblk[s] < GB_MAXBLK) { snprintf(p, sizeof p, "shared_encoder.stages.%d.blocks.%d.conv1.conv.weight", s, n->nblk[s]); if (!wl_get(d, p)) break; n->nblk[s]++; }
+        snprintf(p, sizeof p, "shared_encoder.stages.%d.blocks.%d.conv1.conv.weight", s, n->nblk[s]);
+        if (wl_get(d, p)) { fprintf(stderr, "ink3d-ext: stage %d has more than %d blocks\n", s, GB_MAXBLK); rc = -1; }
+    }
+    n->has_stem = wl_get(d, "shared_encoder.stem.convs.0.conv.weight") != nullptr;
+    if (!rc && n->has_stem) {
+        rc |= cin_of(d, &n->stem, "shared_encoder.stem.convs.0", 3, 1, 1);
+        if (wl_get(d, "shared_encoder.stem.convs.1.conv.weight")) { fprintf(stderr, "ink3d-ext: stem has more than one conv\n"); rc = -1; }
+    }
+    for (int s = 0; s < n->nst && !rc; s++) for (int k = 0; k < n->nblk[s] && !rc; k++) {
         rblock *R = &n->enc[s][k]; const int st = k == 0 && s > 0 ? 2 : 1;
         snprintf(p, sizeof p, "shared_encoder.stages.%d.blocks.%d.conv1", s, k); rc |= cin_of(d, &R->c1, p, 3, st, 1);
         snprintf(p, sizeof p, "shared_encoder.stages.%d.blocks.%d.conv2", s, k); rc |= cin_of(d, &R->c2, p, 3, 1, 1);
@@ -51,9 +74,11 @@ gb_net *gb_load(const char *weights) {
         snprintf(p, sizeof p, "shared_encoder.stages.%d.blocks.%d.skip.%d.conv.weight", s, k, R->pool);
         R->has_sk = wl_get(d, p) != nullptr;
         if (R->has_sk) { snprintf(p, sizeof p, "shared_encoder.stages.%d.blocks.%d.skip.%d", s, k, R->pool); rc |= cin_of(d, &R->sk, p, 1, 1, 0); }
-        else if (R->pool || (k == 0 && s == 0)) { fprintf(stderr, "ink3d-ext: stage %d block %d has no skip projection\n", s, k); rc = -1; }
+        else if (k == 0 && s == 0 && !n->has_stem) { fprintf(stderr, "ink3d-ext: stage %d block %d has no skip projection\n", s, k); rc = -1; }
+        /* (a strided block keeping its width: skip = AvgPool3d(2) alone) */
+        if (!rc && k == 0) n->feat[s] = R->c1.c.co;
     }
-    for (int s = 0; s < GB_ST - 1 && !rc; s++) {
+    for (int s = 0; s < n->nst - 1 && !rc; s++) {
         char q[256];
         snprintf(p, sizeof p, "shared_decoder.transpconvs.%d.weight", s); snprintf(q, sizeof q, "shared_decoder.transpconvs.%d.bias", s);
         const wl_tensor *w = need(d, p), *b = need(d, q);
@@ -67,28 +92,30 @@ gb_net *gb_load(const char *weights) {
         const wl_tensor *w = need(d, "task_heads.ink.weight"), *b = need(d, "task_heads.ink.bias");
         if (!w || !b || w->numel != 32) rc = -1; else { n->hw = xdev_floats(w->data, 32); n->hb = b->data[0]; rc |= !n->hw; }
     }
-    if (!rc && wl_get(d, "shared_encoder.stages.5.blocks.0.conv1.conv.weight")) { fprintf(stderr, "ink3d-ext: more than %d stages\n", GB_ST); rc = -1; }
-    for (int s = 0; s < GB_ST && !rc; s++) {   /* widths */
-        if (n->enc[s][0].c1.c.co != gb_feat[s]) { fprintf(stderr, "ink3d-ext: stage %d width %d (expected %d)\n", s, n->enc[s][0].c1.c.co, gb_feat[s]); rc = -1; }
-        snprintf(p, sizeof p, "shared_encoder.stages.%d.blocks.%d.conv1.conv.weight", s, gb_nblk[s]);
-        if (wl_get(d, p)) { fprintf(stderr, "ink3d-ext: stage %d has more than %d blocks\n", s, gb_nblk[s]); rc = -1; }
+    if (!rc && G.net_in % (1 << (n->nst - 1))) { fprintf(stderr, "ink3d-ext: input %d not divisible by 2^%d\n", G.net_in, n->nst - 1); rc = -1; }
+    if (!rc) {
+        fprintf(stderr, "ink3d-ext: %s: %d stages (", model, n->nst);
+        for (int s = 0; s < n->nst; s++) fprintf(stderr, "%s%d x%d", s ? ", " : "", n->feat[s], n->nblk[s]);
+        fprintf(stderr, ")%s; crop %d^3 level 0 -> net %d^3 -> out %d^3 at 4.8 um\n", n->has_stem ? ", stem" : "", G.crop, G.net_in, G.out);
     }
     wl_free(d);
     if (rc || xnet_check("ink3d-ext load")) { fprintf(stderr, "ink3d-ext: cannot load %s\n", weights); gb_free(n); return nullptr; }
+    if (geo) *geo = G;
     return n;
 }
 
 void gb_free(gb_net *n) {
     if (!n) return;
-    for (int s = 0; s < GB_ST; s++) for (int k = 0; k < 2; k++) {
+    if (n->has_stem) cin_free(&n->stem);
+    for (int s = 0; s < n->nst; s++) for (int k = 0; k < n->nblk[s]; k++) {
         rblock *R = &n->enc[s][k]; cin_free(&R->c1); cin_free(&R->c2); if (R->has_sk) cin_free(&R->sk);
     }
-    for (int s = 0; s < GB_ST - 1; s++) { xconv_free(&n->up[s]); cin_free(&n->dec[s]); }
-    xfree_dev(n->hw); xfree_dev(n->logits);
+    for (int s = 0; s < n->nst - 1; s++) { xconv_free(&n->up[s]); cin_free(&n->dec[s]); }
+    xfree_dev(n->hw); xfree_dev(n->logits); xfree_dev(n->pooled);
     free(n);
 }
 
-/* BasicBlockD: LReLU(IN(conv2(LReLU(IN(conv1 x)))) + skip(x)), skip = IN(conv1x1([avgpool2] x)) or x. Frees x when consume. */
+/* BasicBlockD: LReLU(IN(conv2(LReLU(IN(conv1 x)))) + skip(x)), skip = IN(conv1x1([avgpool2] x)) or x. */
 static xt rblock_fwd(const rblock *R, xt x) {
     xt h = xconv_fwd(&R->c1.c, x, nullptr, XA_NONE);
     xgn(h, h.c, R->c1.g, R->c1.b, 1e-5f, nullptr, XA_LRELU, h);
@@ -98,46 +125,59 @@ static xt rblock_fwd(const rblock *R, xt x) {
         xt src = x; if (R->pool) { pooled = xavgpool3d_k2(x); src = pooled; }
         r = xconv_fwd(&R->sk.c, src, nullptr, XA_NONE); xgn(r, r.c, R->sk.g, R->sk.b, 1e-5f, nullptr, XA_NONE, r);
         if (pooled.p) xt_free(&pooled);
-    }
+    } else if (R->pool) r = xavgpool3d_k2(x);   /* same width, strided: the pooled input */
     xgn(h2, h2.c, R->c2.g, R->c2.b, 1e-5f, &r, XA_LRELU, h2);
-    if (R->has_sk) xt_free(&r);
+    if (R->has_sk || R->pool) xt_free(&r);
     return h2;
 }
 
 int gb_forward(gb_net *n, const uint8_t *u8_dev, const float *lut_dev, int B, const float **logits_dev) {
-    xt x = xt_new(B, I3_OUT, I3_OUT, I3_OUT, 1);
+    const int N = n->g.net_in;
+    xt x = xt_new(B, N, N, N, 1);
     if (!x.p) { fprintf(stderr, "ink3d-ext: out of device memory (input)\n"); return -1; }
-    i3_prep(u8_dev, lut_dev, B, x.p);
-    xt skip[GB_ST];
-    for (int s = 0; s < GB_ST; s++) {
-        for (int k = 0; k < gb_nblk[s]; k++) {
+    i3_prep(u8_dev, lut_dev, B, n->g.crop, n->g.pool_in, x.p);
+    if (n->has_stem) {
+        xt y = xconv_fwd(&n->stem.c, x, nullptr, XA_NONE); xt_free(&x);
+        xgn(y, y.c, n->stem.g, n->stem.b, 1e-5f, nullptr, XA_LRELU, y);
+        x = y;
+    }
+    xt skip[GB_MAXST];
+    for (int s = 0; s < n->nst; s++) {
+        for (int k = 0; k < n->nblk[s]; k++) {
             xt y = rblock_fwd(&n->enc[s][k], x);
             if (!(s > 0 && k == 0)) xt_free(&x);   /* the previous stage's output stays as its skip */
             x = y;
         }
         skip[s] = x;
     }
-    xt lo = skip[GB_ST - 1];
-    for (int s = 0; s < GB_ST - 1; s++) {
+    xt lo = skip[n->nst - 1];
+    for (int s = 0; s < n->nst - 1; s++) {
         xt u = xconv_fwd(&n->up[s], lo, nullptr, XA_NONE);
         xt_free(&lo);
-        xt c = xconcat(u, skip[GB_ST - 2 - s]); xt_free(&u); xt_free(&skip[GB_ST - 2 - s]);
+        xt c = xconcat(u, skip[n->nst - 2 - s]); xt_free(&u); xt_free(&skip[n->nst - 2 - s]);
         xt h = xconv_fwd(&n->dec[s].c, c, nullptr, XA_NONE); xt_free(&c);
         xgn(h, h.c, n->dec[s].g, n->dec[s].b, 1e-5f, nullptr, XA_LRELU, h);
         lo = h;
     }
-    if (n->cap < B) { xfree_dev(n->logits); n->logits = xmalloc_dev((size_t)B * I3_OUT * I3_OUT * I3_OUT * 4); n->cap = n->logits ? B : 0; }
-    if (!n->logits) { xt_free(&lo); fprintf(stderr, "ink3d-ext: out of device memory (logits)\n"); return -1; }
+    const size_t nv = (size_t)N * N * N, ov = (size_t)n->g.out * n->g.out * n->g.out;
+    if (n->cap < B) {
+        xfree_dev(n->logits); xfree_dev(n->pooled); n->pooled = nullptr;
+        n->logits = xmalloc_dev((size_t)B * nv * 4);
+        if (n->g.pool_out > 1) n->pooled = xmalloc_dev((size_t)B * ov * 4);
+        n->cap = n->logits && (n->g.pool_out == 1 || n->pooled) ? B : 0;
+    }
+    if (!n->cap) { xt_free(&lo); fprintf(stderr, "ink3d-ext: out of device memory (logits)\n"); return -1; }
     xhead(lo, n->hw, n->hb, n->logits);
     xt_free(&lo);
-    *logits_dev = n->logits;
+    if (n->g.pool_out == 2) { i3_pool2(n->logits, B, N, n->pooled); *logits_dev = n->pooled; }
+    else *logits_dev = n->logits;
     return xnet_check("ink3d-ext forward");
 }
 
-size_t gb_crop_bytes_gpu(void) {
-    /* 64^3 voxels: the input, stage-0 tensors (32 ch: conv1 / conv2 / skip / output), the 64-channel concat, the decoder output;
-       the coarser levels add ~1 / 4 */
-    const size_t v = (size_t)I3_OUT * I3_OUT * I3_OUT;
+size_t gb_crop_bytes_gpu(const gb_net *n) {
+    /* N^3 voxels at the network input: the input, stage-0 tensors (32 ch: conv1 / conv2 / skip / output), the 64-channel concat, the
+       decoder output; the coarser levels add ~1 / 4 */
+    const size_t v = (size_t)n->g.net_in * n->g.net_in * n->g.net_in;
     return v * 2 * (1 + 8 + 4 * 32 + 64 + 32 + 32) * 5 / 4 + v * 4;
 }
 

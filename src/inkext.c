@@ -68,6 +68,15 @@ static int isurf_crop(isurf *s, int c0, int r0, int cw, int rh) {
     return 0;
 }
 static void isurf_free(isurf *s) { free(s->X); free(s->Y); free(s->Z); }
+/* the valid vertices of a tifxyz / .sfc as z, y, x triples in its own voxels (*vox_um: their size); 0 on success (ink3d-ext --surface) */
+int ie_surface_points(const char *path, float **zyx, size_t *n, double *vox_um) {
+    isurf S; if (isurf_load(&S, path)) return -1;
+    size_t k = 0; float *o = malloc((size_t)S.w * S.h * 3 * sizeof *o);
+    if (!o) { isurf_free(&S); return -1; }
+    for (size_t i = 0; i < (size_t)S.w * S.h; i++) if (S.Z[i] >= 0) { o[3 * k] = S.Z[i]; o[3 * k + 1] = S.Y[i]; o[3 * k + 2] = S.X[i]; k++; }
+    *zyx = o; *n = k; *vox_um = S.vox_um; isurf_free(&S);
+    return 0;
+}
 /* point and unit normal at grid coordinates (gu, gv); 0 if the four corner vertices are valid */
 static inline int surf_pn(const isurf *s, double gu, double gv, double P[3], double N[3], double du[3], double dv[3]) {
     int c0 = (int)gu, r0 = (int)gv; if (c0 >= s->w - 1) c0 = s->w - 2; if (r0 >= s->h - 1) r0 = s->h - 2; if (c0 < 0 || r0 < 0) return -1;
@@ -281,7 +290,35 @@ typedef struct {
     uint8_t **stk; int stk_n, stk_w, stk_h;   /* --layers: a pre-rendered stack (ascending normal offsets) instead of the renderer */
     uint8_t *dump; int dump_req, render_only;  /* --dump-layers: the rendered model-grid stack [D][Hm][Wm] (run_surface allocates) */
     int norm_sheet;   /* --norm sheet (Reader / ink9um): one normalize_robust over a row sample of the whole surface for every tile */
+    int tta, tta_depth;   /* --tta K: the probability averaged over K of the 8 square symmetries of each tile; --tta-depth 1: each also with the layer order reversed */
 } irun;
+
+/* --tta: symmetry c of a T x T tile (bit 2 transpose, then bit 0 flip x, bit 1 flip y): the transformed tile's pixel (y, x) is the source
+   pixel tta2_src(c, y, x); all 8 are distinct, so K <= 8 passes are K different views (order: identity, rot 180, transposes, flips) */
+static const int tta2_order[8] = {0, 3, 4, 7, 1, 2, 5, 6};
+static inline int tta2_src(int c, int T, int y, int x) { int a = y, b = x; if (c & 4) { const int t = a; a = b; b = t; } if (c & 1) b = T - 1 - b; if (c & 2) a = T - 1 - a; return a * T + b; }
+/* the batch through every requested view: out = the mean probability in the tiles' own orientation (tbuf, obuf: scratch of the batch size) */
+static int ie_forward_tta(const irun *X, const uint8_t *tiles, int nb, int D, int T, float *out, uint8_t *tbuf, float *obuf) {
+    const size_t TT = (size_t)T * T; int np = 0;
+    for (int dpass = 0; dpass <= (X->tta_depth ? 1 : 0); dpass++) for (int k = 0; k < X->tta; k++) {
+        const int c = tta2_order[k];
+        if (!c && !dpass) { if (ie_forward(X->net, tiles, nb, obuf, 0)) return -1; }
+        else {
+            for (int t = 0; t < nb; t++) for (int i = 0; i < D; i++) {
+                const uint8_t *src = tiles + ((size_t)t * D + (dpass ? D - 1 - i : i)) * TT; uint8_t *dst = tbuf + ((size_t)t * D + i) * TT;
+                if (!c) memcpy(dst, src, TT); else for (int y = 0; y < T; y++) for (int x = 0; x < T; x++) dst[y * T + x] = src[tta2_src(c, T, y, x)];
+            }
+            if (ie_forward(X->net, tbuf, nb, obuf, 0)) return -1;
+        }
+        for (int t = 0; t < nb; t++) {
+            const float *o = obuf + (size_t)t * TT; float *a = out + (size_t)t * TT;
+            for (int y = 0; y < T; y++) for (int x = 0; x < T; x++) { const int si = c ? tta2_src(c, T, y, x) : y * T + x; a[si] = np ? a[si] + o[y * T + x] : o[y * T + x]; }
+        }
+        np++;
+    }
+    const float inv = 1.f / np; for (size_t i = 0; i < (size_t)nb * TT; i++) out[i] *= inv;
+    return 0;
+}
 
 /* the network side of run_surface in its own thread: batches handed over by the renderer (double buffered), forward,
    blend into num / den, so the CPU render of the next rows overlaps the GPU */
@@ -300,7 +337,13 @@ static void *gpu_worker(void *a) {
         if (!G->has && G->quit) { pthread_mutex_unlock(&G->mu); break; }
         pthread_mutex_unlock(&G->mu);
         const int nb = G->nb; const double t0 = inow();
-        if (!G->fail && ie_forward(X->net, G->tiles, nb, G->out, 0)) G->fail = 1;
+        if (X->tta > 1 || X->tta_depth) {   /* (scratch for the transformed batch and one view's output, kept across batches) */
+            static _Thread_local uint8_t *tb; static _Thread_local float *ob; static _Thread_local size_t cap;
+            const size_t need = (size_t)X->batch * D * T * T;
+            if (need > cap) { free(tb); free(ob); tb = malloc(need); ob = malloc((size_t)X->batch * T * T * sizeof *ob); cap = tb && ob ? need : 0; }
+            if (!cap) G->fail = 1;
+            if (!G->fail && ie_forward_tta(X, G->tiles, nb, D, T, G->out, tb, ob)) G->fail = 1;
+        } else if (!G->fail && ie_forward(X->net, G->tiles, nb, G->out, 0)) G->fail = 1;
         G->tg += inow() - t0; G->ntiles += nb;
         if (!G->fail) for (int k = 0; k < nb; k++) {
             const float *o = G->out + (size_t)k * T * T; const uint8_t *tl = G->tiles + (size_t)k * D * T * T;
@@ -533,6 +576,8 @@ int cmd_ink_ext(int argc, char **argv) {
                         "  --weights W1,W2,..: an ensemble (mean probability) of checkpoints of the model (e.g. ink9um seed42 + seed43)\n"
                         "  --shift S: every layer S layers further along +N (fractional ok; --layers: rounded, the window moves in the stack)\n"
                         "  --zwin a,b,..: also average over these extra layer shifts (the ink_9um card's z-window ensemble, e.g. -1,0,1)\n"
+                        "  --tta K: each tile's probability averaged over K (1..8) square symmetries (flips, transposes; exact, no resampling)\n"
+                        "  --tta-depth 1: each view also with the layer order reversed (the read direction flipped inside the tile)\n"
                         "  --calib: write (p - 0.25) / 0.5 clipped to [0, 1] (koine BCE label smoothing 0.5: reader3 / ink9um no-ink sits near 0.25)\n"); return 2;
     }
     const int kind = ie_model_kind(mname); if (kind < 0) { fprintf(stderr, "ink-ext: unknown model %s\n", mname); return 2; }
@@ -583,7 +628,9 @@ int cmd_ink_ext(int argc, char **argv) {
     X.dump_req = iopt(argc, argv, "--dump-layers", nullptr) != nullptr; X.render_only = iflag(argc, argv, "--render-only"); X.kind = kind; X.net = net; X.sp = &ie_specs[kind]; X.stride = atoi(iopt(argc, argv, "--stride", "0")); X.reverse = iflag(argc, argv, "--reverse");
     X.blend_norm = !strcmp(iopt(argc, argv, "--blend", "official"), "norm");   /* v8in: sum(p g) / sum(g) instead of inference.py sum(p g) / count (its stride grid) */
     X.no_overlap = iflag(argc, argv, "--no-overlap");   /* stride = the tile, uniform weights (no blending), empty tiles skipped, v8in without its coverage-mask rule */
-    X.norm_sheet = !strcmp(iopt(argc, argv, "--norm", "tile"), "sheet");   /* Reader / ink9um input normalisation: tile (official, per tile) or sheet */
+    X.norm_sheet = !strcmp(iopt(argc, argv, "--norm", "tile"), "sheet");
+    X.tta = atoi(iopt(argc, argv, "--tta", "1")); X.tta_depth = atoi(iopt(argc, argv, "--tta-depth", "0")) != 0;
+    if (X.tta < 1 || X.tta > 8) { fprintf(stderr, "ink-ext: --tta 1..8\n"); return 2; }   /* Reader / ink9um input normalisation: tile (official, per tile) or sheet */
     X.nth = ufsm_threads(atoi(iopt(argc, argv, "--threads", "0")), 16); X.px_um = atof(iopt(argc, argv, "--px-um", "0")); if (!(X.px_um > 0)) X.px_um = X.sp->px_um;
     X.ct_mem = (size_t)(atof(iopt(argc, argv, "--ct-mem", "3")) * (1 << 30));
     X.batch = atoi(iopt(argc, argv, "--batch", "0"));
@@ -624,6 +671,14 @@ surfaces:;
         if (lonly) { memset(&S, 0, sizeof S); snprintf(S.name, sizeof S.name, "%s", iopt(argc, argv, "--name", "layers")); S.scale = 1; S.vox_um = X.px_um; S.w = S.h = 2; }
         else if (isurf_load(&S, argv[a + 1])) { fprintf(stderr, "ink-ext: cannot read tifxyz %s\n", argv[a + 1]); rc = 1; continue; }
         { const double su = atof(iopt(argc, argv, "--surf-um", "0")); if (su > 0) S.vox_um = su; }   /* tifxyz voxel size when its meta has none (default 2.399) */
+        if (!lonly && X.nlev) {   /* surface coordinates in other voxels than the CT's level 0 (e.g. 9.596 um level-2 wraps of a 2.399 um scan): rescaled into
+                                     level-0 voxels; S.vox_um (the physical grid spacing, R.du) is kept */
+            const double f = S.vox_um / X.lev_um[0];
+            if (fabs(f - 1) > 0.01) {
+                for (size_t i = 0; i < (size_t)S.w * S.h; i++) if (S.Z[i] >= 0) { S.X[i] *= (float)f; S.Y[i] *= (float)f; S.Z[i] *= (float)f; }
+                fprintf(stderr, "ink-ext: %s: surface in %.3f um voxels, CT level 0 %.3f um: coordinates x %.4f\n", S.name, S.vox_um, X.lev_um[0], f);
+            }
+        }
         const char *gc = iopt(argc, argv, "--grid-crop", nullptr); int cc[4];   /* c0,r0,cols,rows of the tifxyz grid */
         if (gc && (sscanf(gc, "%d,%d,%d,%d", cc, cc + 1, cc + 2, cc + 3) != 4 || isurf_crop(&S, cc[0], cc[1], cc[2], cc[3]))) { fprintf(stderr, "ink-ext: bad --grid-crop\n"); return 2; }
         const char *pre = iopt(argc, argv, "--prefix", ""); char nm[600]; snprintf(nm, sizeof nm, "%s%s", pre, S.name);
@@ -889,6 +944,28 @@ int cmd_tifxyz_bbox(int argc, char **argv) {
     fprintf(stderr, "tifxyz-bbox: %ld pixels above %d\n", n, th);
     free(img); isurf_free(&S);
     return 0;
+}
+
+/* ufsm tifxyz-crop <tifxyz|wNNN.sfc> <out-dir> c0,r0,cols,rows [--px 1]: a window of a surface's grid as its own tifxyz (same step,
+   voxel size and winding; bbox / area recomputed by tifxyz_write). --px 1: the window in render pixels (render --scale 1: grid x step)
+   instead of grid vertices, e.g. a crop picked on a wrap render or an ink-ext map. */
+int cmd_tifxyz_crop(int argc, char **argv) {
+    if (argc < 5) { fprintf(stderr, "usage: ufsm tifxyz-crop <tifxyz|wNNN.sfc> <out-dir> c0,r0,cols,rows [--px 1]\n"); return 2; }
+    isurf S; if (isurf_load(&S, argv[2])) { fprintf(stderr, "tifxyz-crop: cannot read %s\n", argv[2]); return 1; }
+    double c[4]; if (sscanf(argv[4], "%lf,%lf,%lf,%lf", c, c + 1, c + 2, c + 3) != 4 || c[2] <= 0 || c[3] <= 0) { fprintf(stderr, "tifxyz-crop: window c0,r0,cols,rows\n"); return 2; }
+    if (atoi(iopt(argc, argv, "--px", "0"))) for (int k = 0; k < 4; k++) c[k] *= S.scale;   /* render px -> grid vertices */
+    const int c0 = (int)floor(c[0]), r0 = (int)floor(c[1]), cw = (int)ceil(c[0] + c[2]) - c0 + 1, rh = (int)ceil(c[1] + c[3]) - r0 + 1;
+    if (isurf_crop(&S, c0, r0, cw, rh)) { fprintf(stderr, "tifxyz-crop: window outside the %s grid\n", argv[2]); isurf_free(&S); return 1; }
+    int wind = -1;
+    {   char p[1400]; snprintf(p, sizeof p, "%s/meta.json", argv[2]); FILE *f = tfx_meta_fopen(p);
+        if (f) { char m[16384] = {0}; const size_t mn = fread(m, 1, sizeof m - 1, f); (void)mn; fclose(f); const char *q = strstr(m, "\"winding\""); if (q && (q = strchr(q, ':'))) wind = atoi(q + 1); } }
+    char src[1400]; snprintf(src, sizeof src, "ufsm tifxyz-crop of %s: grid columns %d..%d, rows %d..%d", argv[2], c0 < 0 ? 0 : c0, (c0 < 0 ? 0 : c0) + S.w - 1, r0 < 0 ? 0 : r0, (r0 < 0 ? 0 : r0) + S.h - 1);
+    long nv = 0; for (size_t i = 0; i < (size_t)S.w * S.h; i++) nv += S.Z[i] > 0;
+    const int rc = tifxyz_write(argv[3], S.w, S.h, S.X, S.Y, S.Z, 1.0 / S.scale, S.vox_um, wind, src);
+    if (rc) fprintf(stderr, "tifxyz-crop: cannot write %s\n", argv[3]);
+    else printf("tifxyz-crop: %s -> %s: %d x %d vertices (%ld valid)\n", argv[2], argv[3], S.w, S.h, nv);
+    isurf_free(&S);
+    return rc ? 1 : 0;
 }
 
 /* ufsm wl-dump <weights> [sub]: the tensors of a safetensors / torch zip file (name, shape, mean |v|) */

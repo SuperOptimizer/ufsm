@@ -720,7 +720,7 @@ int cmd_predict(int argc, char **argv) {
                         "                       checkpoint's ink channel; with --fit-zarr / --fit-fields the volume of that channel beside the fields, one pass)\n"
                         "       [--fit-fields DIR] [--fit-h 8]   task unwrap checkpoints: also the winding fitter's input fields of the box (ufsm fit DIR)\n"
                         "       [--fit-zarr DIR]                 the same fields as zarr arrays, flushed slab by slab (whole volumes)\n"
-                        "       [--tta K]   the fit fields averaged over K window symmetries (z / y / x flips, y <-> x swap; 1..12, src/tta.h)\n"
+                        "       [--tta K]   the fit fields, or without --fit-*: the probability, averaged over K window symmetries (z / y / x flips, y <-> x swap; 1..12, src/tta.h)\n"
                         "       [--view-level L] [--view-map REG.json]   scan-fusion checkpoints (view_P): the view crop per window from level L of this scan\n"
                         "                   or, with a map, the registered partner scan on this scan's level-L grid (use the training window size)\n"
                         "       [--fit-w4-d 32]   task unwrap2 checkpoints: the winding mod 4 relative planes dz dy dx dq over this many voxels (<= the halos)\n"
@@ -812,10 +812,11 @@ int cmd_predict(int argc, char **argv) {
     if (ffct && !ffd) { fprintf(stderr, "predict: --fit-ct needs --fit-fields or --fit-zarr\n"); return 2; }
     const int ffna = ffct ? 14 : 12;   /* accumulator planes */
     const int ffzm = ffz != nullptr;
-    /* --tta K: the fit fields averaged over K window symmetries (src/tta.h; identity first); the probability output is the last pass */
+    /* --tta K: the fit fields averaged over K window symmetries (src/tta.h; identity first; the probability output is then the last pass);
+       without --fit-*: the probability output itself is the mean of the K passes' probabilities (fp16 accumulator, 2 B per window voxel) */
     const int tta = atoi(opt(argc, argv, "--tta", "1"));
     const int fea = atoi(opt(argc, argv, "--feather", "0"));   /* --feather B (above) */
-    if (tta < 1 || tta > TTA_MAX || (tta > 1 && !ffd)) { fprintf(stderr, "predict: --tta 1..%d, with --fit-fields / --fit-zarr\n", TTA_MAX); return 2; }
+    if (tta < 1 || tta > TTA_MAX) { fprintf(stderr, "predict: --tta 1..%d\n", TTA_MAX); return 2; }
     if (tta > 1 && ffct) { fprintf(stderr, "predict: --tta with --fit-ct is not supported (the CT planes pool one pass); add them later with ufsm ct-fields\n"); return 2; }
     float q = (float)atof(opt(argc, argv, "--q", "8"));
     const int iso = atoi(opt(argc, argv, "--iso", "0"));   /* the void cutoff: probability outputs 0 where CT < iso (the fit keeps CT > 0) */
@@ -932,6 +933,7 @@ int cmd_predict(int argc, char **argv) {
     if (split) gpu = gpus[0];
     if (half && (split || sheet_task || ufsm_env_on("UFSM_PRED_HOSTPATH"))) { fprintf(stderr, "predict: half-resolution checkpoints run on one GPU per window, the device path\n"); return 2; }
     const int nwork = split ? 1 : ngpu;   /* worker processes */
+    if (!ffd && tta > 1 && (split || half || sheet_task || rvfuse)) { fprintf(stderr, "predict: probability --tta: not with --split, half-resolution, sheet or recto/verso-fused outputs\n"); return 2; }
     if (ffd && out_ch && tta > 1) { fprintf(stderr, "predict: --channel N with --fit-* and --tta: not supported (the probability volume would come from the last symmetry pass)\n"); return 2; }
     if (ffd && (split || ngpu > 1)) { fprintf(stderr, "predict: --fit-fields runs on one GPU\n"); return 2; }   /* (--channel N: the probability volume of channel N beside the fields, e.g. --channel ink) */
     z3 *auxz = nullptr; uint8_t *auxd = nullptr, *auxh = nullptr;   /* --aux ROOT KEY: the fifth input of 5-input checkpoints (train --aux-input) */
@@ -1066,7 +1068,7 @@ int cmd_predict(int argc, char **argv) {
             unet_set_slab_direct(d);
             const size_t w3 = (size_t)cz[k] * cw[k] * cw[k], e3 = fea ? (size_t)(ix + fea) * (ix + fea) * (ix + fea) : 0,
                          acc = ffz ? (size_t)iz * ix * ix / ((size_t)ffh * ffh * ffh) * 64 : 0,
-                         need = unet_infer_bytes(u, (shape5){1, 4, cz[k], cw[k], cw[k]}) + w3 / 8 + e3 + acc + (size_t)shard * shard * shard + ((size_t)3 << 29);
+                         need = unet_infer_bytes(u, (shape5){1, 4, cz[k], cw[k], cw[k]}) + w3 / 8 + e3 + acc + (tta > 1 ? 3 * w3 : 0) + (size_t)shard * shard * shard + ((size_t)3 << 29);   /* (--tta: the saved CT + the probability accumulator) */
             if ((need <= fr || (k == 0 && d == 0)) && cost < bc - 1e-9) { bc = cost; bk = k; bd = d; }
         }
         unet_set_slab_direct(bd ? 2 : 0);
@@ -1593,7 +1595,7 @@ int cmd_predict(int argc, char **argv) {
             if (tta > 1 && !ctsave) { ctsave = nn_malloc(w3); dyt = malloc(2 * (size_t)W * sizeof(float)); if (!ctsave || !dyt) { fprintf(stderr, "predict: no memory for --tta\n"); return 1; } }
             if (tta > 1) nn_d2d(ctsave, ctd, w3);
             const tta_ctx TC = {.u = u, .ctd = ctd, .ctsave = ctsave, .mean = (float)mean, .isd = (float)(1.0 / sd), .dyo = dyo, .dxo = dxo, .dyt = dyt, .dyd = dyd,
-                                .axis = ax.n > 0 ? (int)radial_sign : 0, .xs = xs, .h16 = h16, .D = Wz, .W = W, .nch = cfg.cout, .ch_normal = ff_nrm};
+                                .axis = ax.n > 0 ? (int)radial_sign : 0, .xs = xs, .h16 = h16, .D = Wz, .W = W, .nch = ffd ? cfg.cout : 1, .ch_normal = ffd ? ff_nrm : -1};   /* (without fit fields the head computes only the written, scalar channel) */
             if (ct_shared && ctmi != ctm) nn_pred_ctmask_t(ctd, w3, ctmi, iso);
             if (ffct && ct_shared) nn_d2d_async(ctcp, ctd, w3);   /* --fit-ct reads the CT after the forward */
             if (sheet_task) {
@@ -1679,6 +1681,14 @@ int cmd_predict(int argc, char **argv) {
             }
             if (ffd && out_ch) lg = (const float *)((const char *)lg + (size_t)out_ch * w3 * (unet_logits_h16(u) ? 2 : 4));   /* every head computed: channel out_ch of the [c][window] logits for the probability volume (e.g. --channel ink beside --fit-zarr) */
             if (sheet_task) lg += (size_t)out_ch * w3;   /* channel c of the [c][W^3] logits (B = 1); otherwise the only one */
+            if (!ffd && tta > 1) {   /* --tta on the probability: the mean of the K passes' probabilities, as logit(mean) in the last pass's buffer */
+                static void *tacc; if (!tacc && !(tacc = nn_malloc_try(w3 * 2))) { fprintf(stderr, "predict: --tta: no device memory for the accumulator (%.2f GB)\n", w3 * 2 / 1e9); return 1; }
+                const int lh0 = unet_logits_h16(u);
+                nn_tta_pacc(lg, lh0, w3, tacc, 1);
+                for (int p = 1; p < tta; p++) { lg = tta_pass(&TC, tta_order[p]); nn_tta_pacc(lg, unet_logits_h16(u), w3, tacc, 0); }
+                nn_tta_pmean((void *)lg, unet_logits_h16(u), w3, tacc, tta);
+                nn_set_logits_h16(unet_logits_h16(u));
+            }
             if (sheet_task) {
                 nn_sheet_gate((float *)lg+w3,lg,ctd,W,sheet_rows);
                 nn_d2h(sheet_window,lg+w3,w3*4);
