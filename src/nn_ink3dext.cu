@@ -8,37 +8,56 @@
 #define ST ((cudaStream_t)xnet_stream())
 static unsigned nblocks(size_t n, int t) { size_t b = (n + t - 1) / t; return b > 65535u * 16 ? 65535u * 16 : (unsigned)b; }
 
-__global__ void k_i3_prep(const uint8_t *u8, const float *lut, int B, __half *out) {
-    const size_t total = (size_t)B * I3_OUT * I3_OUT * I3_OUT;
+/* crop C^3 u8 -> net input (C / pool)^3 fp16: mean of the lut values over each pool^3 block (pool 1: the lut value) */
+__global__ void k_i3_prep(const uint8_t *u8, const float *lut, int B, int C, int pool, __half *out) {
+    const int N = C / pool;
+    const size_t total = (size_t)B * N * N * N;
     for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < total; i += (size_t)gridDim.x * blockDim.x) {
-        const int x = (int)(i % I3_OUT); size_t t = i / I3_OUT; const int y = (int)(t % I3_OUT); t /= I3_OUT; const int z = (int)(t % I3_OUT); const size_t b = t / I3_OUT;
-        const uint8_t *s = u8 + b * (size_t)I3_CROP * I3_CROP * I3_CROP + ((size_t)(2 * z) * I3_CROP + 2 * y) * I3_CROP + 2 * x;
+        const int x = (int)(i % N); size_t t = i / N; const int y = (int)(t % N); t /= N; const int z = (int)(t % N); const size_t b = t / N;
+        const uint8_t *s = u8 + b * (size_t)C * C * C + ((size_t)(pool * z) * C + pool * y) * C + pool * x;
         const float *L = lut + b * 256;
-        float a = 0.f;   /* torch avg_pool3d sums the 8 values in z, y, x order */
-        for (int dz = 0; dz < 2; dz++) for (int dy = 0; dy < 2; dy++) for (int dx = 0; dx < 2; dx++)
-            a += L[s[((size_t)dz * I3_CROP + dy) * I3_CROP + dx]];
-        out[i] = __float2half_rn(a / 8.f);
+        float a = 0.f;   /* torch avg_pool3d sums the values in z, y, x order */
+        for (int dz = 0; dz < pool; dz++) for (int dy = 0; dy < pool; dy++) for (int dx = 0; dx < pool; dx++)
+            a += L[s[((size_t)dz * C + dy) * C + dx]];
+        out[i] = __float2half_rn(a / (float)(pool * pool * pool));
     }
 }
-extern "C" void i3_prep(const uint8_t *u8, const float *lut, int B, void *out_half) {
-    const size_t n = (size_t)B * I3_OUT * I3_OUT * I3_OUT;
-    k_i3_prep<<<nblocks(n, 256), 256, 0, ST>>>(u8, lut, B, (__half *)out_half);
+extern "C" void i3_prep(const uint8_t *u8, const float *lut, int B, int C, int pool, void *out_half) {
+    const int N = C / pool; const size_t n = (size_t)B * N * N * N;
+    k_i3_prep<<<nblocks(n, 256), 256, 0, ST>>>(u8, lut, B, C, pool, (__half *)out_half);
 }
 
-/* villa volume.gaussian(): a delta through scipy gaussian_filter (sigma 8, truncate 4: radius 32), divided by its maximum =
-   prod over axes exp(-(i - 32)^2 / 128) */
-__constant__ float c_g1[I3_OUT];
-static int g_g1_init = 0;
-static void g1_init(void) {
-    if (g_g1_init) return;
-    float g[I3_OUT];
-    for (int i = 0; i < I3_OUT; i++) g[i] = (float)exp(-0.5 * (double)(i - 32) * (i - 32) / 64.0);
-    cudaMemcpyToSymbol(c_g1, g, sizeof g); g_g1_init = 1;
-}
-__global__ void k_i3_blend(float *acc, float *wsum, int R, int TY, int TX, const float *logits, const int *org, int B, int z0, int z1) {
-    const size_t total = (size_t)B * I3_OUT * I3_OUT * I3_OUT;
+/* logits [B][N^3] -> [B][(N / 2)^3]: mean of each 2^3 block */
+__global__ void k_i3_pool2(const float *in, int B, int N, float *out) {
+    const int M = N / 2; const size_t total = (size_t)B * M * M * M;
     for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < total; i += (size_t)gridDim.x * blockDim.x) {
-        const int x = (int)(i % I3_OUT); size_t t = i / I3_OUT; const int y = (int)(t % I3_OUT); t /= I3_OUT; const int z = (int)(t % I3_OUT); const int b = (int)(t / I3_OUT);
+        const int x = (int)(i % M); size_t t = i / M; const int y = (int)(t % M); t /= M; const int z = (int)(t % M); const size_t b = t / M;
+        const float *s = in + b * (size_t)N * N * N + ((size_t)(2 * z) * N + 2 * y) * N + 2 * x;
+        float a = 0.f;
+        for (int dz = 0; dz < 2; dz++) for (int dy = 0; dy < 2; dy++) for (int dx = 0; dx < 2; dx++) a += s[((size_t)dz * N + dy) * N + dx];
+        out[i] = a / 8.f;
+    }
+}
+extern "C" void i3_pool2(const float *in, int B, int N, float *out) {
+    const int M = N / 2; const size_t n = (size_t)B * M * M * M;
+    k_i3_pool2<<<nblocks(n, 256), 256, 0, ST>>>(in, B, N, out);
+}
+
+/* villa volume.gaussian(): a delta through scipy gaussian_filter (sigma O / 8, truncate 4), divided by its maximum =
+   prod over axes exp(-(i - O / 2)^2 / (2 sigma^2)); O = 64 (gambiarra): sigma 8 */
+enum { I3_OMAX = 256 };
+__constant__ float c_g1[I3_OMAX];
+static int g_g1_O = 0;
+static void g1_init(int O) {
+    if (g_g1_O == O) return;
+    float g[I3_OMAX]; const double sg = O / 8.0;
+    for (int i = 0; i < O; i++) g[i] = (float)exp(-0.5 * (double)(i - O / 2) * (i - O / 2) / (sg * sg));
+    cudaMemcpyToSymbol(c_g1, g, sizeof(float) * O); g_g1_O = O;
+}
+__global__ void k_i3_blend(float *acc, float *wsum, int R, int TY, int TX, const float *logits, const int *org, int B, int z0, int z1, int O) {
+    const size_t total = (size_t)B * O * O * O;
+    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < total; i += (size_t)gridDim.x * blockDim.x) {
+        const int x = (int)(i % O); size_t t = i / O; const int y = (int)(t % O); t /= O; const int z = (int)(t % O); const int b = (int)(t / O);
         const int gz = org[3 * b] + z, ty = org[3 * b + 1] + y, tx = org[3 * b + 2] + x;
         if (gz < z0 || gz >= z1 || ty < 0 || ty >= TY || tx < 0 || tx >= TX) continue;
         const float g = c_g1[z] * c_g1[y] * c_g1[x];
@@ -46,10 +65,10 @@ __global__ void k_i3_blend(float *acc, float *wsum, int R, int TY, int TX, const
         atomicAdd(acc + o, g * logits[i]); atomicAdd(wsum + o, g);
     }
 }
-extern "C" void i3_blend(float *acc, float *wsum, int R, int TY, int TX, const float *logits, const int *org_dev, int B, int z0, int z1) {
-    g1_init();
-    const size_t n = (size_t)B * I3_OUT * I3_OUT * I3_OUT;
-    k_i3_blend<<<nblocks(n, 256), 256, 0, ST>>>(acc, wsum, R, TY, TX, logits, org_dev, B, z0, z1);
+extern "C" void i3_blend(float *acc, float *wsum, int R, int TY, int TX, const float *logits, const int *org_dev, int B, int z0, int z1, int O) {
+    g1_init(O);
+    const size_t n = (size_t)B * O * O * O;
+    k_i3_blend<<<nblocks(n, 256), 256, 0, ST>>>(acc, wsum, R, TY, TX, logits, org_dev, B, z0, z1, O);
 }
 
 __device__ __forceinline__ int hbin(float v) { const float b = floorf((v + 16.f) * 2.f); return b < 0.f ? 0 : b >= 64.f ? 65 : 1 + (int)b; }

@@ -46,3 +46,29 @@ extern "C" void nn_tta_logits(void *lg, int h16, int D, int W, int code, int nch
     else tta_lg_k<uint32_t><<<nblk(n, 256), 256>>>((uint32_t *)lg, D, W, code, m, 0x80000000u);
     KCHECK();
 }
+
+/* predict --tta K on a probability output (no fit fields): each pass's probability summed into an fp16 accumulator (2 B per window
+   voxel; the mean is written as uint8, so the ~1e-3 fp16 step of a sum <= 12 is below the output's 1/255), then the mean back into
+   the logit buffer as logit(mean) for the unchanged placement kernels */
+template <typename LT> __global__ void tta_pacc_k(const LT *lg, size_t n, f16 *acc, int first) {
+    const size_t v = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (v >= n) return;
+    const float p = 1.f / (1.f + expf(-(float)lg[v]));
+    acc[v] = __float2half(first ? p : __half2float(acc[v]) + p);
+}
+template <typename LT> __global__ void tta_pmean_k(LT *lg, size_t n, const f16 *acc, float inv) {
+    const size_t v = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (v >= n) return;
+    float p = __half2float(acc[v]) * inv; p = p < 1e-6f ? 1e-6f : p > 1.f - 1e-6f ? 1.f - 1e-6f : p;
+    lg[v] = (LT)logf(p / (1.f - p));
+}
+extern "C" void nn_tta_pacc(const void *lg, int h16, size_t n, void *acc, int first) {
+    if (h16) tta_pacc_k<f16><<<nblk(n, 256), 256>>>((const f16 *)lg, n, (f16 *)acc, first);
+    else tta_pacc_k<float><<<nblk(n, 256), 256>>>((const float *)lg, n, (f16 *)acc, first);
+    KCHECK();
+}
+extern "C" void nn_tta_pmean(void *lg, int h16, size_t n, const void *acc, int k) {
+    if (h16) tta_pmean_k<f16><<<nblk(n, 256), 256>>>((f16 *)lg, n, (const f16 *)acc, 1.f / k);
+    else tta_pmean_k<float><<<nblk(n, 256), 256>>>((float *)lg, n, (const f16 *)acc, 1.f / k);
+    KCHECK();
+}

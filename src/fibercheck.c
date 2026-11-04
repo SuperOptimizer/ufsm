@@ -14,7 +14,9 @@
    extrapolated straight) and "rand3d" (any direction). Columns: n, P(one sheet) by the GT, and with a fit (wbench fields + fit dir)
    P(fit sheet difference != GT's) on all and on GT-one-sheet pairs (the same-sheet information a fibre would add). Packed: the GT
    spacing at a (1 / |grad phase|) under --packed-um. Strict: both ends within --strict turn of the box's circular-mean fibre phase
-   (registration noise baseline). Also the phase of the fibre points by family (H vs V layer: which side of the sheet). */
+   (registration noise baseline). Also the phase of the fibre points by family (H vs V layer: which side of the sheet).
+   With a fit: a GT-free score table (fibre drift by span = the fit's split share of path-one fibre pairs, with the random / straight
+   pairs' split share as anti-collapse controls, after winding-field's evaluator) that needs no labels. */
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -412,6 +414,17 @@ int cmd_fiber_check(int argc, char **argv) {
     for (int di = 0; di < nd; di++) for (int q = 0; q < NPK; q++) { const long *x = PA[di][q]; if (!x[0]) continue;
         printf("%d\t%s\t%ld\t%.4f\t%.4f\t%.4f\t%.4f\t%ld\t%.4f\t%.4f\n", D[di], PK[q], x[0], (double)x[7] / x[0], (double)x[1] / x[0], x[1] ? (double)x[2] / x[1] : NAN,
                x[0] - x[1] ? (double)x[3] / (x[0] - x[1]) : NAN, x[4], x[4] ? (double)x[5] / x[4] : NAN, x[5] ? (double)x[6] / x[5] : NAN); }
+    /* GT-free fit score (winding-field's fibre drift by span, with its anti-collapse controls): drift = the share of fibre pairs whose
+       network phase stays on one sheet along the fibre (path one) that the fit splits (lower = better); separation = the share of
+       random-direction / straight-extrapolated pairs at the same chord that the fit splits (a constant or compressed W drives drift AND
+       separation to 0); ratio = drift / separation (lower = better). No labels are read for these columns. */
+    if (ftp) {
+        printf("\nGT-free fit score (fibre drift by span with anti-collapse controls)\nd\tcells\tn_path_one\tdrift\tsep_rand3d\tsep_straight\tratio_rand3d\n");
+        for (int di = 0; di < nd; di++) for (int q = 0; q < NPK; q++) { const long *x = PA[di][q]; if (!x[1]) continue;
+            const pacc *R3 = &T[3][di][q][0], *SL = &T[2][di][q][0];
+            const double dr = (double)x[5] / x[1], s3 = R3->nf ? (double)R3->nfd / R3->nf : NAN, s2 = SL->nf ? (double)SL->nfd / SL->nf : NAN;
+            printf("%d\t%s\t%ld\t%.4f\t%.4f\t%.4f\t%.4f\n", D[di], PK[q], x[1], dr, s3, s2, s3 > 0 ? dr / s3 : NAN); }
+    }
     for (int q = 0; q < 2; q++) if (hv[q][0]) printf("layer order (%s): %ld H points with a V point of the same sheet within 4 voxels: V outward of H (along grad phase) %.3f, mean offset %+.2f voxels; |offset| >= 1: %ld, outward %.3f; V phase larger %.3f\n",
         q ? "packed" : "all", hv[q][0], (double)hv[q][1] / hv[q][0], hvd[q] / hv[q][0], hv[q][2], hv[q][2] ? (double)hv[q][3] / hv[q][2] : NAN, (double)hv[q][4] / hv[q][0]);
     if (so) fclose(so);

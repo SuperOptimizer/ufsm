@@ -315,8 +315,9 @@ Runtime notes:
 ```sh
 ufsm ink-blend <out> --um U --tile SZ,SY,SX --grids z,y,x:z,y,x:... <in1> <in2> ... [--origins z,y,x:...] [--levels 4] [--shard 512] [--q 32]
 ufsm ink-seam <zarr> --um U [--period 512] [--offset 0] [--n 24] [--block 16]   # window-seam jump (border vs interior |dv|; --block 16: vs the codec-block faces)
-ufsm ink-ext --model v8in|hecate24|hecate96|reader3|ink9um --weights W --surface TIFXYZ --ct ROOT KEY --out DIR   # external 2.5D ink nets
-ufsm ink3d-ext --weights W --ct ROOT KEY --box ... --out GROUP       # the published 3D ink net (gambiarra) on a 2.4 um CT box
+ufsm ink-ext --model v8in|hecate24|hecate96|reader3|ink9um --weights W --surface TIFXYZ --ct ROOT KEY --out DIR [--tta K] [--tta-depth 1] [--zwin a,b] [--shift S]   # external 2.5D ink nets (--tta: K of the 8 tile symmetries averaged; --tta-depth: also the reversed layer order; surfaces in other voxels than the CT level 0, e.g. 9.596 um wraps of a 2.399 um scan, are rescaled)
+ufsm tifxyz-crop <tifxyz|wNNN.sfc> <out-dir> c0,r0,cols,rows [--px 1]   # a grid window as its own tifxyz (--px: the window in render pixels)
+ufsm ink3d-ext --model gambiarra|dino3d --weights W --ct ROOT KEY/0 --box ... --out GROUP [--surface S[,..]]   # published 3D ink nets on a 2.4 um CT box: gambiarra (128^3 crops pooled to 4.8 um) or dino3d = scrollprize/ink_3d_dino_guided (256^3 crops at 2.4 um, ema_model of the .pth); --surface: only crops near the surfaces
 ufsm ink-splat <out-group> --surface TIFXYZ --labels L --ct ROOT KEY --ct-um U --iso I [--band -4,4]   # 2D ink labels -> 3D label zarr
 ufsm ink-score --surface TIFXYZ --labels L --map NAME=MAP.tif ..     # F1 / AUC of 2D ink maps vs a segment's labels
 ```

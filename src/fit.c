@@ -43,6 +43,7 @@ fit_cfg fit_cfg_default(void) {
     c.w_cspacing = 0.f; c.cs_tol = 0.25f; c.ct_flood = 0;
     c.seed_z0 = -1e30;
     c.uw_repair = 0; c.uw_rep_qpow = 1.f; c.uw_rep_sr = 1; c.uw_rep_seed = 0.f; c.uw_rep_gd = 8; c.phase_stretch_r = 1;   /* local slip repair off by default */
+    c.uw_rep_fib = 0.f; c.uw_rep_fib_hop = 1.f; c.uw_rep_fib_min = 0; c.fib_conf = 0.2f; c.fib_gap = 2; c.fib_dmax = 0.5f;   /* fibre votes off, hop gate off */
     c.emb = nullptr; c.uw_rep_emb = 0.f; c.uw_rep_emb_m0 = 0.3f; c.emb_phi = 0.f; c.uw_rep_emb_rmax = 2; c.uw_rep_emb_sub = 2;   /* embedding evidence off */
     c.uw_rep_emb_nd = 2; c.uw_rep_emb_d[0] = 16; c.uw_rep_emb_d[1] = 48; c.uw_rep_emb_d[2] = 128;   /* emb-calib (HOLD): P(r right) 0.99 at conf >= 0.2 for D <= 48, 0.88 at 128 */
     return c;
@@ -760,6 +761,8 @@ static size_t uw_two_level(uw_ctx *x, double split, int T, size_t nr, int verbos
     return reached;
 }
 
+typedef struct { float a[3], b[3], d, base; int fib; } fib_pair;
+static fib_pair *fib_pairs(const fit_fields *f, const fit_cfg *c, size_t *np_);
 /* Local slip repair (fit_cfg uw_repair, fitter Phase 4). The quality-ordered flood is a maximum spanning tree: where the phase has a
    dislocation (a loop whose wrapped differences do not sum to zero, e.g. two sheets merged over a patch) the tree closes the loop
    wherever its order happens to, and a whole region beyond can come out a turn off (a "slip": on the held-out Paris 4 box half the
@@ -991,6 +994,45 @@ static void uwr_apply(void *a, int z0, int z1, int th) {   /* the shifts, and th
     }
     u->nseam[th] = ns;
 }
+/* fibre evidence (fit_cfg uw_rep_fib): each same-fibre pair (fib_pairs: network phase unwrapped along the fibre, no hop) whose ends sit
+   in two pieces votes the integer that makes the flooded W(b) - W(a) equal the phase change along the fibre; weight uw_rep_fib x the
+   lower confidence. A vote, not a loss: the L1 solve outvotes the fibres that cross sheets (~30% of 1 mm pairs on Paris 4). */
+static size_t uwr_fib(uwr_ctx *u, l1_vote **v, size_t *nv, size_t *nskip) {
+    uw_ctx *x = u->x; const uw_geo *g = &x->g; const fit_fields *f = x->f; const uw_vox *V = x->V; const fit_cfg *c = u->c;
+    size_t np = 0, nadd = 0, sk = 0; fib_pair *P = fib_pairs(f, c, &np); if (!P) { *nskip = 0; return 0; }
+    l1_vote *o = realloc(*v, (*nv + np + 1) * sizeof **v); if (!o) { free(P); *nskip = 0; return 0; } *v = o;
+    /* the hop gate (fit_cfg uw_rep_fib_hop < 1): a fibre's pairs whose two ends sit in one piece (integers already consistent there) should
+       vote 0; a fibre with more than that fraction of in-piece pairs voting non-zero hops between sheets, and casts no votes */
+    const int nf = c->fib_n; int *nin = calloc(nf + 1, sizeof *nin), *nbad = calloc(nf + 1, sizeof *nbad); uint8_t *pass = calloc(np + 1, 1);
+    int32_t *rv = calloc(np + 1, sizeof *rv); uint32_t *pa = calloc(np + 1, sizeof *pa), *pb = calloc(np + 1, sizeof *pb); int *bqv = calloc(np + 1, sizeof *bqv);
+    if (!nin || !nbad || !pass || !rv || !pa || !pb || !bqv) abort();
+    for (size_t k = 0; k < np; k++) {
+        const fib_pair *e = &P[k];
+        const int z = (int)floor(e->a[0] / f->h), y = (int)floor(e->a[1] / f->h), xx = (int)floor(e->a[2] / f->h);
+        const int zn = (int)floor(e->b[0] / f->h), yn = (int)floor(e->b[1] / f->h), xn = (int)floor(e->b[2] / f->h);
+        if (z < 0 || y < 0 || xx < 0 || z >= g->D || y >= g->H || xx >= g->W || zn < 0 || yn < 0 || xn < 0 || zn >= g->D || yn >= g->H || xn >= g->W) continue;
+        const uint32_t i = ub_id(g, z, y, xx), j = ub_id(g, zn, yn, xn); if (V[i].k == UK_UNSET || V[j].k == UK_UNSET) continue;
+        const uint32_t ga = uwr_gid(u, z, y, xx, i), gb = uwr_gid(u, zn, yn, xn, j);
+        double th0, th1; uwr_Wm(x, z, y, xx, &th0); uwr_Wm(x, zn, yn, xn, &th1);
+        const double dWc = (uw_U(x, j) - uw_U(x, i)) - x->m->dir * wrap_pi(th1 - th0) / (2 * M_PI);
+        const double r = e->d - dWc, rr = round(r);
+        if (fabs(r - rr) > 0.3) { sk++; continue; }
+        if (ga == gb) { nin[e->fib]++; nbad[e->fib] += rr != 0; continue; }
+        pass[k] = 1; rv[k] = (int32_t)rr; pa[k] = ga; pb[k] = gb; bqv[k] = V[i].bk < V[j].bk ? V[i].bk : V[j].bk;
+    }
+    const double hop = c->uw_rep_fib_hop; size_t ngate = 0, nfg = 0, nfib = 0;
+    if (hop < 1) for (int r = 0; r < nf; r++) { if (nin[r] >= 4) { nfib++; if (nbad[r] > hop * nin[r]) nfg++; } }
+    for (size_t k = 0; k < np; k++) {
+        if (!pass[k]) continue;
+        const int r = P[k].fib;
+        if (hop < 1 && (nin[r] < 4 ? c->uw_rep_fib_min > 0 : nbad[r] > hop * nin[r])) { ngate++; continue; }
+        const double wv = c->uw_rep_fib * bqv[k];
+        if (wv >= 1) { o[(*nv)++] = (l1_vote){pa[k], pb[k], rv[k], (int64_t)lround(wv)}; nadd++; }
+    }
+    if (c->verbose && hop < 1) fprintf(stderr, "fit: slip repair: fibre hop gate %.2f: %zu of %zu checked fibres hop; %zu votes dropped\n", hop, nfg, nfib, ngate);
+    free(nin); free(nbad); free(pass); free(rv); free(pa); free(pb); free(bqv);
+    free(P); *nskip = sk; return nadd;
+}
 static void uw_repair1(uw_ctx *x, size_t nr, const fit_cfg *c, int o_) {
     const uw_geo *g = &x->g; const double t0 = nn_wall_seconds(); const fit_fields *f = x->f;
     const int T = c->uw_repair;
@@ -1020,6 +1062,10 @@ static void uw_repair1(uw_ctx *x, size_t nr, const fit_cfg *c, int o_) {
     size_t nv = 0; for (int t = 0; t < x->nt; t++) nv += u.nv[t];
     l1_vote *v = malloc((nv ? nv : 1) * sizeof *v); nv = 0;
     for (int t = 0; t < x->nt; t++) { if (u.nv[t]) memcpy(v + nv, u.v[t], u.nv[t] * sizeof *v); nv += u.nv[t]; free(u.v[t]); }
+    if (c->fib && c->fib_n > 0 && c->uw_rep_fib > 0) {
+        size_t sk = 0; const size_t nfv = uwr_fib(&u, &v, &nv, &sk);
+        if (c->verbose) fprintf(stderr, "fit: slip repair: %zu fibre votes between pieces (weight %g; %zu off by a fraction, skipped)\n", nfv, (double)c->uw_rep_fib, sk);
+    }
     uint32_t nn = (uint32_t)np + (u.wref > 0); size_t na = 0;   /* the seed anchor: node np, tied to each piece holding seeded voxels (shift 0 wanted) */
     if (c->seed && c->uw_rep_seed > 0 && np) {
         int64_t *aw = calloc(np, sizeof *aw);
@@ -1519,11 +1565,12 @@ static void fit_pool_rows(void *a_, int r0, int r1, int t_) {
    on one sheet (published Paris 4 fibres + wind96 phase: 93% one GT sheet at 0.3-1.2 mm; src/fibercheck.c): W(b) - W(a) should equal that
    path change dP (the phase is W mod 1). Loss w_fib x mean Huber(W(b) - W(a) - dP, 0.25) over the pairs, on the lattice delta (the
    knots' part is fixed per stage: base). */
-typedef struct { float a[3], b[3], d, base; } fib_pair;
 static fib_pair *fib_pairs(const fit_fields *f, const fit_cfg *c, size_t *np_) {
     size_t np = 0, cap = 0; fib_pair *P = nullptr; const double h = f->h;
-    static const int DD[4] = {16, 32, 64, 128};
+    static const int DD0[4] = {16, 32, 64, 128}; int DD[8], ND = 4;
+    if (c->fib_nspan > 0) { ND = c->fib_nspan; for (int k = 0; k < ND; k++) DD[k] = c->fib_span[k]; } else for (int k = 0; k < 4; k++) DD[k] = DD0[k];
     float *q = nullptr; double *U = nullptr; size_t qcap = 0;
+    const double fconf = c->fib_conf > 0 ? c->fib_conf : 0.2, fdmax = c->fib_dmax > 0 ? c->fib_dmax : 0.5; const int fgap = c->fib_gap >= 0 ? c->fib_gap : 2;
     for (int r = 0; r < c->fib_n; r++) {
         const float *p = c->fib + 3 * (size_t)c->fib_off[r]; const int n = c->fib_off[r + 1] - c->fib_off[r]; if (n < 2) continue;
         size_t ns = 0; double acc = 0, next = 0, last = NAN; int gap = 99;
@@ -1538,10 +1585,11 @@ static fib_pair *fib_pairs(const fit_fields *f, const fit_cfg *c, size_t *np_) {
                 const int iz = (int)floor(s[0] / h), iy = (int)floor(s[1] / h), ix = (int)floor(s[2] / h);
                 if (iz >= 0 && iy >= 0 && ix >= 0 && iz < f->D && iy < f->H && ix < f->W) {
                     const size_t i = ((size_t)iz * f->H + iy) * f->W + ix; const double cc = (f->pc[i] - 128) / 127.0, sn = (f->ps[i] - 128) / 127.0;
-                    if (f->w[i] && hypot(cc, sn) >= 0.2) {
-                        const double ph = atan2(sn, cc) / (2 * M_PI);
-                        U[ns] = gap <= 2 && last == last ? last + (ph - last - floor(ph - last + 0.5)) : ph;
-                        if (!(gap <= 2 && last == last)) U[ns] += 1000.0 * (double)(np + ns + 1);   /* a new stretch: no pair across the break */
+                    if (f->w[i] && hypot(cc, sn) >= fconf) {
+                        const double ph = atan2(sn, cc) / (2 * M_PI), dph = ph - last - floor(ph - last + 0.5);
+                        const int cont = gap <= fgap && last == last && fabs(dph) <= fdmax * (gap + 1);   /* fib_dmax: a fast phase change cuts the stretch */
+                        U[ns] = cont ? last + dph : ph;
+                        if (!cont) U[ns] += 1000.0 * (double)(np + ns + 1);   /* a new stretch: no pair across the break */
                         last = U[ns]; gap = 0;
                     }
                 }
@@ -1552,16 +1600,91 @@ static fib_pair *fib_pairs(const fit_fields *f, const fit_cfg *c, size_t *np_) {
         }
         for (size_t b = 0; b < ns; b++) {
             if (!(U[b] == U[b])) continue;
-            for (int di = 0; di < 4; di++) {
-                if (b < (size_t)DD[di]) break;
+            for (int di = 0; di < ND; di++) {
+                if (b < (size_t)DD[di]) continue;
                 const size_t a = b - DD[di]; if (a % 4 || !(U[a] == U[a])) continue;
                 const double dp = U[b] - U[a]; if (fabs(dp) >= 0.5) continue;   /* a turn crossed (or a break): the fibre hopped */
                 if (np == cap) { cap = cap ? 2 * cap : 65536; P = realloc(P, cap * sizeof *P); if (!P) abort(); }
-                fib_pair *e = &P[np++]; for (int k = 0; k < 3; k++) { e->a[k] = q[3 * a + k]; e->b[k] = q[3 * b + k]; } e->d = (float)dp; e->base = 0;
+                fib_pair *e = &P[np++]; for (int k = 0; k < 3; k++) { e->a[k] = q[3 * a + k]; e->b[k] = q[3 * b + k]; } e->d = (float)dp; e->base = 0; e->fib = r;
             }
         }
     }
     free(q); free(U); *np_ = np; return P;
+}
+/* the consensus points (fit_cfg w_fib_cons): every 4th native-voxel step of each fibre stretch that the pair term would use (network
+   phase unwrapped along the fibre, confidence >= 0.2, gaps <= 2 bridged), cut into pieces of <= fib_cons_len steps; seg = piece id,
+   u = the unwrapped phase, base = the knots' part of W (per stage, theta unwrapped along the piece) */
+static void lattice_w(int L, int lz, int ly, int lx, double z, double y, double x, size_t idx[8], double w[8]);
+typedef struct { float p[3], u, base; int seg; } fib_cpt;
+static fib_cpt *fib_cons_points(const fit_fields *f, const fit_cfg *c, size_t *np_, int *nseg_) {
+    size_t np = 0, cap = 0; int seg = -1; fib_cpt *P = nullptr; const double h = f->h; const int maxl = c->fib_cons_len > 8 ? c->fib_cons_len : 256;
+    for (int r = 0; r < c->fib_n; r++) {
+        const float *p = c->fib + 3 * (size_t)c->fib_off[r]; const int n = c->fib_off[r + 1] - c->fib_off[r]; if (n < 2) continue;
+        double acc = 0, next = 0, last = NAN; int gap = 99, step = 0, plen = 0; size_t seg0 = np;
+        for (int k = 1; k < n; k++) {
+            const double a[3] = {p[3 * k - 3] - c->fib_zoff, p[3 * k - 2], p[3 * k - 1]}, d[3] = {p[3 * k] - p[3 * k - 3], p[3 * k + 1] - p[3 * k - 2], p[3 * k + 2] - p[3 * k - 1]};
+            const double L = sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+            for (; L > 0 && next <= acc + L; next += 1, step++) {
+                const double t = (next - acc) / L, s[3] = {a[0] + t * d[0], a[1] + t * d[1], a[2] + t * d[2]};
+                double u = NAN;
+                const int iz = (int)floor(s[0] / h), iy = (int)floor(s[1] / h), ix = (int)floor(s[2] / h);
+                if (iz >= 0 && iy >= 0 && ix >= 0 && iz < f->D && iy < f->H && ix < f->W) {
+                    const size_t i = ((size_t)iz * f->H + iy) * f->W + ix; const double cc = (f->pc[i] - 128) / 127.0, sn = (f->ps[i] - 128) / 127.0;
+                    if (f->w[i] && hypot(cc, sn) >= 0.2) {
+                        const double ph = atan2(sn, cc) / (2 * M_PI);
+                        const int cont = gap <= 2 && last == last;
+                        u = cont ? last + (ph - last - floor(ph - last + 0.5)) : ph;
+                        if (!cont || plen >= maxl) { if (np - seg0 < 8) np = seg0; seg++; seg0 = np; plen = 0; }   /* a new piece (short ones dropped) */
+                        last = u; gap = 0;
+                    }
+                }
+                if (!(u == u)) { gap++; continue; }
+                plen++;
+                if (step % 4) continue;
+                if (np == cap) { cap = cap ? 2 * cap : 65536; P = realloc(P, cap * sizeof *P); if (!P) abort(); }
+                P[np++] = (fib_cpt){{(float)s[0], (float)s[1], (float)s[2]}, (float)u, 0.f, seg};
+            }
+            acc += L;
+        }
+        if (np - seg0 < 8) np = seg0;
+    }
+    /* renumber the pieces densely */
+    int ns = 0, prev = -1; for (size_t i = 0; i < np; i++) { if (P[i].seg != prev) { prev = P[i].seg; ns++; } P[i].seg = ns - 1; }
+    *np_ = np; *nseg_ = ns; return P;
+}
+/* the knots' part of W at the consensus points (theta unwrapped along each piece from its first point) */
+static void fib_cons_base(fib_cpt *P, size_t n, const fit_model *m) {
+    double th0 = 0, acc = 0; int sg = -1;
+    for (size_t i = 0; i < n; i++) {
+        double th; const double b = fit_base(m, P[i].p[0], P[i].p[1], P[i].p[2], &th);
+        if (P[i].seg != sg) { sg = P[i].seg; th0 = th; acc = th; }
+        else { double dt = th - th0; dt -= 2 * M_PI * floor(dt / (2 * M_PI) + 0.5); acc += dt; th0 = th; }
+        P[i].base = (float)(b - m->dir * acc / (2 * M_PI));
+    }
+}
+/* loss w x mean Huber(e_i - mean_seg e, 0.25) with e_i = W(p_i) - u_i, and its gradient (added to g); off = the share of points more
+   than half a turn from their piece's consensus */
+static double fib_cons_grad(const fib_cpt *P, size_t n, int nseg, const float *d, int L, int lz, int ly, int lx, double wt, float *g, double *off) {
+    double loss = 0; size_t bad = 0; const double hub = 0.25;
+    double *e = malloc(n * sizeof *e), *ms = calloc((size_t)nseg, sizeof *ms), *hs = calloc((size_t)nseg, sizeof *hs); int *cn = calloc((size_t)nseg, sizeof *cn);
+    size_t (*ix)[8] = malloc(n * sizeof *ix); double (*wx)[8] = malloc(n * sizeof *wx);
+    if (!e || !ms || !hs || !cn || !ix || !wx) abort();
+    for (size_t i = 0; i < n; i++) {
+        lattice_w(L, lz, ly, lx, P[i].p[0], P[i].p[1], P[i].p[2], ix[i], wx[i]);
+        double W = P[i].base; for (int c = 0; c < 8; c++) W += wx[i][c] * d[ix[i][c]];
+        e[i] = W - P[i].u; ms[P[i].seg] += e[i]; cn[P[i].seg]++;
+    }
+    for (int s = 0; s < nseg; s++) if (cn[s]) ms[s] /= cn[s];
+    for (size_t i = 0; i < n; i++) {   /* residuals; per piece the mean of the Huber derivatives (the shared unknown's share) */
+        const double r = e[i] - ms[P[i].seg], ar = fabs(r);
+        loss += ar < hub ? 0.5 * r * r : hub * (ar - 0.5 * hub); bad += ar >= 0.5;
+        e[i] = ar < hub ? r : hub * (r > 0 ? 1 : -1); hs[P[i].seg] += e[i];
+    }
+    for (int s = 0; s < nseg; s++) if (cn[s]) hs[s] /= cn[s];
+    if (g) for (size_t i = 0; i < n; i++) { const double gr = wt / n * (e[i] - hs[P[i].seg]); for (int c = 0; c < 8; c++) g[ix[i][c]] += (float)(gr * wx[i][c]); }
+    if (off) *off = n ? (double)bad / n : 0;
+    free(e); free(ms); free(hs); free(cn); free(ix); free(wx);
+    return n ? wt * loss / n : 0;
 }
 /* trilinear lattice weights at a point (as lattice_at) */
 static void lattice_w(int L, int lz, int ly, int lx, double z, double y, double x, size_t idx[8], double w[8]) {
@@ -1819,8 +1942,10 @@ static fit_model *fit_run_dir(const fit_fields *f, const fit_cfg *c) {
     const double norm = ndata ? 1.0 / ndata : 1;
     int kstep = 0;
     size_t nfp = 0; fib_pair *fpairs = c->fib && c->fib_n > 0 && c->w_fib > 0 ? fib_pairs(f, c, &nfp) : nullptr;
+    size_t ncp = 0; int ncs = 0; fib_cpt *fcons = c->fib && c->fib_n > 0 && c->w_fib_cons > 0 ? fib_cons_points(f, c, &ncp, &ncs) : nullptr;
     float *fph = nullptr, *fpg = nullptr;   /* host copies of delta and its gradient (GPU backend) */
     if (c->verbose && fpairs) fprintf(stderr, "fit: fibre pair term: %zu pairs (weight %g)\n", nfp, (double)c->w_fib);
+    if (c->verbose && fcons) fprintf(stderr, "fit: fibre consensus term: %zu points in %d pieces (weight %g, pieces <= %d voxels)\n", ncp, ncs, (double)c->w_fib_cons, c->fib_cons_len);
     for (int st = 0; st < c->nstage; st++) {
         const double tst = nn_wall_seconds();
         const int L = c->lattice[st], lz = (int)ceil(f->D * f->h / L) + 1, ly = (int)ceil(f->H * f->h / L) + 1, lx = (int)ceil(f->W * f->h / L) + 1;
@@ -1832,6 +1957,7 @@ static fit_model *fit_run_dir(const fit_fields *f, const fit_cfg *c) {
                 double dth = (tb - ta) / (2 * M_PI); dth -= floor(dth + 0.5); fpairs[i].base = (float)((Wb + m->dir * tb / (2 * M_PI)) - (Wa + m->dir * ta / (2 * M_PI)) - m->dir * dth); }
             if (!cpu) { free(fph); free(fpg); fph = malloc(nl * 4); fpg = malloc(nl * 4); }
         }
+        if (ncp) { fib_cons_base(fcons, ncp, m); if (!cpu && !nfp) { free(fph); free(fpg); fph = malloc(nl * 4); fpg = malloc(nl * 4); } }
         if (fst && fst->drop_pooled && st == c->phase_stage)   /* the pooled stages are done (one direction: no second run) */
             for (int q = 0; q < fst->nfp; q++) if (fst->dpool[q]) { nn_free(fst->dpool[q]); fst->dpool[q] = nullptr; }
         if (st == c->phase_stage && c->w_phase > 0) {   /* the current knots too: W reads them */
@@ -1893,6 +2019,7 @@ static fit_model *fit_run_dir(const fit_fields *f, const fit_cfg *c) {
             fd.pc = pa[0]; fd.ps = pa[1]; for (int k = 0; k < 6; k++) fd.t[k] = pa[2 + k]; fd.sp = pa[8]; fd.w = pa[9];
             const double pn = pdata ? 1.0 / pdata : 1;
             fd.w_normal = (float)(c->w_normal * pn); fd.w_density = (float)(c->w_density * pn); fd.w_nondeg = (float)(c->w_nondeg * pn); fd.w_pgrad = (float)(c->w_pgrad * pn);
+            fd.nd_floor = c->nondeg_floor;
             if (pp.pg) { pgd = fb_alloc(cpu, 4 * np * sizeof(float)); fb_put(cpu, pgd, pp.pg, 4 * np * sizeof(float)); free(pp.pg); fd.pg = pgd; }
             if (pp.cs && dcs) { pcs = fb_alloc(cpu, np); fb_put(cpu, pcs, pp.cs, np); fd.cs = pcs; fd.w_cs = (float)(c->w_cspacing * pn); }
             free(pp.cs);
@@ -1914,13 +2041,19 @@ static fit_model *fit_run_dir(const fit_fields *f, const fit_cfg *c) {
                 fit_loss2_cpu(&cl, dparts, gd);
                 fit_smooth_cpu(dd, lz, ly, lx, ws, wdec, dwn, lap, dparts, gd);
                 if (nfp) fpl = fib_pair_grad(fpairs, nfp, dd, L, lz, ly, lx, c->w_fib, gd, &fpo);
+                if (ncp) fpl += fib_cons_grad(fcons, ncp, ncs, dd, L, lz, ly, lx, c->w_fib_cons, gd, nullptr);
                 fit_adam_cpu(dd, gd, md, vd, nl, c->lr, it + 1);
                 ++kstep;   /* the knots are fixed (analytic terms) */
             } else {
                 if (c->analytic) nn_fit_loss2(&fd, dparts, gd);   /* random voxel subsets of ~batch per step */
                 else nn_fit_loss(&fd, dparts, gd, gpi, gof);
                 nn_fit_smooth(dd, lz, ly, lx, ws, wdec, dwn, lap, dparts, gd);
-                if (nfp) { fb_get(cpu, fph, dd, nl * 4); fb_get(cpu, fpg, gd, nl * 4); fpl = fib_pair_grad(fpairs, nfp, fph, L, lz, ly, lx, c->w_fib, fpg, &fpo); fb_put(cpu, gd, fpg, nl * 4); }
+                if (nfp || ncp) {
+                    fb_get(cpu, fph, dd, nl * 4); fb_get(cpu, fpg, gd, nl * 4);
+                    if (nfp) fpl = fib_pair_grad(fpairs, nfp, fph, L, lz, ly, lx, c->w_fib, fpg, &fpo);
+                    if (ncp) fpl += fib_cons_grad(fcons, ncp, ncs, fph, L, lz, ly, lx, c->w_fib_cons, fpg, nullptr);
+                    fb_put(cpu, gd, fpg, nl * 4);
+                }
                 nn_adamw(dd, gd, md, vd, nl, c->lr, 0.9f, 0.999f, 1e-8f, 0.f, it + 1);
                 ++kstep;
                 nn_adamw(dof, gof, mof, vof, nk, c->lr_knot, 0.9f, 0.999f, 1e-8f, 0.f, kstep);
@@ -1952,7 +2085,7 @@ static fit_model *fit_run_dir(const fit_fields *f, const fit_cfg *c) {
     if (dwd) fb_free(cpu, dwd);
     if (drec) fb_free(cpu, drec);
     if (dctm && !cpu) nn_free(dctm);
-    free(fpairs); free(fph); free(fpg);
+    free(fpairs); free(fcons); free(fph); free(fpg);
     free(hctm); if (dcs) fb_free(cpu, dcs);
     return m;
 }

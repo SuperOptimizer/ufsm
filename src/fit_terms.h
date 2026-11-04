@@ -88,7 +88,7 @@ FIT_HD void fit_grad_terms(const fit_dev *f, size_t i, const float g[3], float w
     if (f->sp[i]) {
         const float rho = 8.f / (f->h * (float)f->sp[i]), lr = logf(gl) - logf(rho);
         if (f->w_density > 0.f) { const float c = f->w_density * weight; lp[3] += c * lr * lr; for (int d = 0; d < 3; d++) dg[d] += c * 2.f * lr * g[d] / g2; }
-        const float lo = 0.4f * rho - gl;
+        const float lo = (f->nd_floor > 0.f ? f->nd_floor : 0.4f) * rho - gl;
         if (lo > 0.f && f->w_nondeg > 0.f) { const float c = f->w_nondeg * weight; lp[4] += c * lo * lo; for (int d = 0; d < 3; d++) dg[d] += -c * 2.f * lo * g[d] / gl; }
     }
 }

@@ -7,6 +7,7 @@
    density and the winding mod 4 heads are scalars (invariant). The untransformed logits of every pass are pooled into the same
    field accumulators, so the fit fields average the passes (the phase as a complex mean: disagreement lowers its confidence). */
 #pragma once
+#include <stddef.h>
 #include <stdint.h>
 
 enum { TTA_FZ = 1, TTA_FY = 2, TTA_FX = 4, TTA_SWAP = 8, TTA_MAX = 12 };
@@ -54,6 +55,9 @@ extern "C" {
 #endif
 void nn_tta_ct(const uint8_t *src, uint8_t *dst, int D, int W, int code);
 void nn_tta_logits(void *lg, int h16, int D, int W, int code, int nch, const int *src, const int *sgn);
+/* probability TTA (predict --tta without fit fields): acc (fp16, n) = [acc +] sigmoid(lg); lg = logit(acc / k) */
+void nn_tta_pacc(const void *lg, int h16, size_t n, void *acc, int first);
+void nn_tta_pmean(void *lg, int h16, size_t n, const void *acc, int k);
 #ifdef __cplusplus
 }
 #endif
