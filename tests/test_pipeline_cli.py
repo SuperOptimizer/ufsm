@@ -9,7 +9,11 @@ import tempfile
 
 
 def gpu_count():
-    """GPUs nvidia-smi lists (the two-worker grid check needs two)"""
+    """GPUs this process may use (the two-worker grid check needs two): CUDA_VISIBLE_DEVICES when set (the suite pins a gpu test
+    to one), else the GPUs nvidia-smi lists"""
+    vis = os.environ.get('CUDA_VISIBLE_DEVICES')
+    if vis is not None:
+        return len([d for d in vis.split(',') if d.strip()])
     try:
         lines = subprocess.run(['nvidia-smi', '-L'], capture_output=True, text=True).stdout.splitlines()
         return sum(line.startswith('GPU ') for line in lines)
