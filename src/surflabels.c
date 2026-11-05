@@ -3,7 +3,7 @@
                    [--wrapcheck TSV] [--first K] [--last K] [--drop w1,w2,..] [--band-peaks LO,HI]
                    [--ct ROOT KEY [--ct-scale 1|2] [--min-onpap 0.2] [--ct-level 80] [--ct-range 15]]   (--ct-scale 2: the CT is on the 2x finer grid)
                    [--exclude holdouts.json --exclude-ct NAME [--exclude-mm 0.5]]
-                   [--geom DIR [--slip-max 0.5] [--slip-d 2]] [--radius 20] [--block 256] [--shard 512] [--bake 1] [--min-coh T [--coh-cell 32]] [--gt ROOT KEY] [--tsv OUT] [--threads N]
+                   [--weight-coh T0,T1 (with --ct: OUT/weight.zarr, the trainer's phase confidence)] [--geom DIR [--slip-max 0.5] [--slip-d 2]] [--radius 20] [--block 256] [--shard 512] [--bake 1] [--min-coh T [--coh-cell 32]] [--gt ROOT KEY] [--tsv OUT] [--threads N]
    Winding labels straight from our whole-scroll wraps (ufsm wraps / wrap-snap .sfc, rows = z, wrap k = the fit's level set W = k
    with W = U - dir theta / 2 pi, theta = atan2 around the axis in (-pi, pi]): every wrap's quads are rasterised on the scan's training
    grid (--grid-um; --like a CT level array of that grid gives the shape) with the sheet coordinate q = k + dir theta / 2 pi (continuous
@@ -95,7 +95,8 @@ typedef struct {
     /* band */
     int64_t sz; sl_tile *tiles; size_t ntile; size_t *off; uint32_t *refs; int64_t ns[3];
     int *slist; int nsl; int nbs;     /* shards (sy * ns2 + sx) with tiles; blocks per shard */
-    uint8_t **bc, **bp, **bi; _Atomic int *pend; pthread_mutex_t mu;
+    uint8_t **bc, **bp, **bi, **bw; _Atomic int *pend; pthread_mutex_t mu;
+    z3w *ww; double wc0, wc1;          /* --weight-coh T0,T1: OUT/weight.zarr, per kept voxel 255 x clamp((r - T0) / (T1 - T0)) of its cell's CT coherence r */
     _Atomic long next; long nitems; _Atomic int fail;
     /* stats */
     _Atomic long long sdn, sda, ksdn, ksda; int side_iso;   /* with --gt and --ct: recto / verso side agreement on papyrus (CT >= side_iso): both phases on the same half turn (train --rv's rule) */
@@ -367,12 +368,12 @@ static int sl_block(sl_job *J, sl_scratch *X, int si, int bk, int tid) {
     pthread_mutex_lock(&J->mu);
     if (!J->bc[si]) {
         const size_t S3 = (size_t)S * S * S;
-        J->bc[si] = calloc(S3, 1); J->bp[si] = malloc(S3); J->bi[si] = calloc(S3, 1);
+        J->bc[si] = calloc(S3, 1); J->bp[si] = malloc(S3); J->bi[si] = calloc(S3, 1); if (J->ww) J->bw[si] = calloc(S3, 1);
         if (J->bp[si]) memset(J->bp[si], PHASE_UNKNOWN, S3);
     }
-    uint8_t *oc = J->bc[si], *op = J->bp[si], *oi = J->bi[si];
+    uint8_t *oc = J->bc[si], *op = J->bp[si], *oi = J->bi[si], *ow = J->ww ? J->bw[si] : nullptr;
     pthread_mutex_unlock(&J->mu);
-    if (!oc || !op || !oi) return -1;
+    if (!oc || !op || !oi || (J->ww && !ow)) return -1;
     long long sdn = 0, sda = 0, ksdn = 0, ksda = 0, csn[COH_BINS + 1] = {0}, csa[COH_BINS + 1] = {0};
     long long ncode = 0, nconf = 0, nknown = 0, nkept = 0, nig[IG_N] = {0}, gtk = 0, g10 = 0, g25 = 0, kgtk = 0, kg10 = 0, kg25 = 0, gb[PHASE_AGREE_BINS] = {0}, kb[PHASE_AGREE_BINS] = {0};
     sl_recs *R = &J->recs[tid]; const double mm = J->gum * 1e-3;
@@ -438,6 +439,7 @@ static int sl_block(sl_job *J, sl_scratch *X, int si, int bk, int tid) {
         oc[oo] = c && c != 255 && !X->drop[i] ? (uint8_t)c : 0; ncode += oc[oo] != 0;
         oi[oo] = (uint8_t)ig;
         op[oo] = (uint8_t)(J->bake && ig ? PHASE_UNKNOWN : ph);
+        if (ow) { double wv = 0; if (!ig && ph != PHASE_UNKNOWN && isfinite(r)) { wv = (r - J->wc0) / (J->wc1 - J->wc0); wv = wv < 0 ? 0 : wv > 1 ? 1 : wv; } ow[oo] = (uint8_t)lround(255 * wv); }
         if (ph == PHASE_UNKNOWN) continue;
         nknown++; nig[ig]++; if (!ig) nkept++;
         const int wi = X->wid[X->lo[i]] - 1; sl_wrap *w = wi >= 0 ? &J->W[wi] : nullptr;
@@ -498,10 +500,11 @@ static void *sl_block_run(void *arg) {
         if (sl_block(J, &X, si, bk, tid)) { fprintf(stderr, "surf-labels: block failed (memory or read: %s)\n", z3_error()); atomic_store(&J->fail, 1); }
         if (atomic_fetch_sub(&J->pend[si], 1) == 1) {   /* the shard's last block: write it */
             const int64_t sy = J->slist[si] / J->ns[2], sx = J->slist[si] % J->ns[2];
-            if (J->bc[si] && J->wc && (z3w_write_shard(J->wc, J->sz, sy, sx, J->bc[si], 1) || z3w_write_shard(J->wp, J->sz, sy, sx, J->bp[si], 1) || z3w_write_shard(J->wi, J->sz, sy, sx, J->bi[si], 1))) {
+            if (J->bc[si] && J->wc && (z3w_write_shard(J->wc, J->sz, sy, sx, J->bc[si], 1) || z3w_write_shard(J->wp, J->sz, sy, sx, J->bp[si], 1) || z3w_write_shard(J->wi, J->sz, sy, sx, J->bi[si], 1)
+                                       || (J->ww && z3w_write_shard(J->ww, J->sz, sy, sx, J->bw[si], 1)))) {
                 fprintf(stderr, "surf-labels: %s\n", z3w_error()); atomic_store(&J->fail, 1);
             }
-            free(J->bc[si]); free(J->bp[si]); free(J->bi[si]); J->bc[si] = J->bp[si] = J->bi[si] = nullptr;
+            free(J->bc[si]); free(J->bp[si]); free(J->bi[si]); J->bc[si] = J->bp[si] = J->bi[si] = nullptr; if (J->ww) { free(J->bw[si]); J->bw[si] = nullptr; }
         }
     }
     free(X.codes); free(X.drop); free(X.phase); free(X.wid); free(X.lo); free(X.hi); free(X.gtc); free(X.gph); free(X.ct); free(X.tl); free(X.coh); free(X.cacc); free(X.ct2); free(X.cell); free(X.cth); free(X.rh); free(X.ag); free(X.tmp2);
@@ -893,6 +896,13 @@ int cmd_surf_labels(int argc, char **argv) {
     snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"content\":\"phase ignore mask: 0 keep, 1 dropped wrap, 2 conflict, 3 masked CT, 4 holdout\",\"source\":\"surf-labels %s\"}}", in);
     snprintf(p, sizeof p, "%s/ignore.zarr/%s", out, lv); J.wi = z3w_create(p, J.shape, S, 0, 0, attrs);
     snprintf(p, sizeof p, "%s/ignore.zarr", out); if (!J.wi || z3w_write_group(p, &gum, 1, "surf-labels-ignore", attrs)) { fprintf(stderr, "%s\n", z3w_error()); return 1; }
+    if (sl_opt(argc, argv, "--weight-coh", nullptr)) {   /* the confidence map for the trainer's sources "phase": {"weight"} */
+        if (sscanf(sl_opt(argc, argv, "--weight-coh", ""), "%lf,%lf", &J.wc0, &J.wc1) != 2 || !(J.wc1 > J.wc0) || !J.ct || J.coh_cell <= 0) {
+            fprintf(stderr, "surf-labels: --weight-coh T0,T1 (T1 > T0) needs --ct and --coh-cell > 0\n"); return 2; }
+        snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"content\":\"phase confidence 0..255: 255 x clamp((r - %g) / (%g - %g)) of the cell's CT coherence r, 0 where ignored\",\"source\":\"surf-labels %s\"}}", J.wc0, J.wc1, J.wc0, in);
+        snprintf(p, sizeof p, "%s/weight.zarr/%s", out, lv); J.ww = z3w_create(p, J.shape, S, 0, 0, attrs);
+        snprintf(p, sizeof p, "%s/weight.zarr", out); if (!J.ww || z3w_write_group(p, &gum, 1, "surf-labels-weight", attrs)) { fprintf(stderr, "%s\n", z3w_error()); return 1; }
+    }
     }
     J.recs = calloc(nt, sizeof *J.recs);
     J.pa_T = (uint32_t)(4294967295.0 * fmin(1.0, atof(sl_opt(argc, argv, "--pa-keep", "0.02"))));
@@ -933,19 +943,19 @@ int cmd_surf_labels(int argc, char **argv) {
         J.tiles = tiles; J.ntile = ntile;
         J.slist = malloc(nsh * sizeof *J.slist); J.nsl = 0;
         for (size_t s = 0; s < nsh; s++) if (J.off[s + 1] > J.off[s]) J.slist[J.nsl++] = (int)s;
-        J.bc = calloc(J.nsl, sizeof *J.bc); J.bp = calloc(J.nsl, sizeof *J.bp); J.bi = calloc(J.nsl, sizeof *J.bi); J.pend = malloc(J.nsl * sizeof *J.pend);
+        J.bc = calloc(J.nsl, sizeof *J.bc); J.bp = calloc(J.nsl, sizeof *J.bp); J.bi = calloc(J.nsl, sizeof *J.bi); J.bw = calloc(J.nsl, sizeof *J.bw); J.pend = malloc(J.nsl * sizeof *J.pend);
         for (int k = 0; k < J.nsl; k++) atomic_store(&J.pend[k], J.nbs);
         J.nitems = (long)J.nsl * J.nbs; atomic_store(&J.next, 0);
         pthread_t th[64]; void *args[64][2]; const int m = nt < 64 ? nt : 64;
         for (int q = 0; q < m; q++) { args[q][0] = &J; args[q][1] = (void *)(intptr_t)q; pthread_create(&th[q], nullptr, sl_block_run, args[q]); }
         for (int q = 0; q < m; q++) pthread_join(th[q], nullptr);
-        free(J.bc); free(J.bp); free(J.bi); free((void *)J.pend); free(J.slist); free(J.refs); free(J.off); free(tiles);
+        free(J.bc); free(J.bp); free(J.bi); free(J.bw); free((void *)J.pend); free(J.slist); free(J.refs); free(J.off); free(tiles);
         J.tiles = nullptr; J.refs = nullptr; J.off = nullptr;
         if (atomic_load(&J.fail)) return 1;
         fprintf(stderr, "\rsurf-labels: shard row %lld of %lld: %zu tiles, %lld blocks so far, %.0fs   ", (long long)sz + 1, (long long)J.ns[0], ntile, (long long)J.nblk, sl_now() - tl);
     }
     for (int k = 0; k < nw; k++) { free(W[k].g); free(W[k].v); W[k].g = nullptr; W[k].v = nullptr; }
-    if (J.wc && (z3w_close(J.wc) | z3w_close(J.wp) | z3w_close(J.wi))) { fprintf(stderr, "surf-labels: %s\n", z3w_error()); return 1; }
+    if (J.wc && (z3w_close(J.wc) | z3w_close(J.wp) | z3w_close(J.wi) | (J.ww ? z3w_close(J.ww) : 0))) { fprintf(stderr, "surf-labels: %s\n", z3w_error()); return 1; }
     const double v3 = pow(gum * 1e-3, 3);
     fprintf(stderr, "\n");
     printf("surf-labels: %d of %d wraps kept, %lld coded voxels, %lld conflict; phase known %lld (%.1f mm3), kept %lld (%.1f mm3), kept share %.4f; ignored: dropped wrap %lld, conflict %lld, CT %lld, holdout %lld, CT coherence %lld, anchor inconsistent %lld, unanchored %lld; %.0fs\n",

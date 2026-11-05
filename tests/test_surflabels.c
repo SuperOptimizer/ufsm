@@ -10,7 +10,7 @@
    - --gt with the dir +1 codes as GT: phase agreement and pair accuracy 1.0 against itself;
    - a holdout box (--exclude) -> ignore 4;
    - --geom: defect cells / slipping z bins of geom-check -> no codes there;
-   - --min-coh: CT ridges on the sheets keep the labels, ridges midway between them (labels half a turn off) -> ignore 5;
+   - --min-coh: CT ridges on the sheets keep the labels, ridges midway between them (labels half a turn off) -> ignore 5; --weight-coh: 0 off the kept labels;
    - --anchor A,A (union) = --anchor A;
    - wrap-anchor: wraps miscounted (+10 turns, a false extra turn after wrap 3) against the true codes as GT, votes in alternate z
      blocks: every anchored code equals the GT code, the held-out blocks included;
@@ -150,13 +150,17 @@ int main(void) {
         snprintf(ct, sizeof ct, "%s/ct%d", root, v); char o[32]; snprintf(o, sizeof o, "coh%d", v);
         char ax[400], wdp[400], od[400]; snprintf(ax, sizeof ax, "%s/axis.json", root); snprintf(wdp, sizeof wdp, "%s/wp", root); snprintf(od, sizeof od, "%s/%s", root, o);
         char *av[] = {"ufsm", "surf-labels", wdp, od, "--axis", ax, "--axis-um", "9.6", "--dir", "1", "--grid-um", "9.6", "--shape", "64,256,256", "--shard", "128", "--block", "32",
-                      "--radius", "12", "--threads", "4", "--ct", ct, "0", "--coh-cell", "16", "--min-coh", "0.3"};
+                      "--radius", "12", "--threads", "4", "--ct", ct, "0", "--coh-cell", "16", "--min-coh", "0.3", "--weight-coh", "0.3,0.6"};
         CHECK(!cmd_surf_labels((int)(sizeof av / sizeof *av), av), "surf-labels --min-coh failed");
         char r[600]; snprintf(r, sizeof r, "%s/ignore.zarr", od); uint8_t *ig = readall(r, "9.6"); snprintf(r, sizeof r, "%s/phase.zarr", od); uint8_t *ph = readall(r, "9.6");
         long kept = 0, coh = 0; for (size_t i = 0; ig && ph && i < (size_t)NZ * NY * NX; i++) { kept += ph[i] != PHASE_UNKNOWN; coh += ig[i] == 5; }
         printf("test_surflabels: CT ridges %s: %ld kept, %ld coherence-gated\n", v ? "midway (wrong labels)" : "on the sheets", kept, coh);
         if (v == 0) CHECK(kept > 10 * coh && kept > 100000, "labels on CT-coherent sheets were gated");
         else CHECK(coh > 10 * kept && coh > 100000, "labels half a turn off the CT ridges were kept");
+        snprintf(r, sizeof r, "%s/weight.zarr", od); uint8_t *wt = readall(r, "9.6"); long wbad = 0, wpos = 0;   /* --weight-coh: 0 wherever ignored / unknown, > 0 on kept coherent labels */
+        for (size_t i = 0; wt && ph && i < (size_t)NZ * NY * NX; i++) { wbad += wt[i] && ph[i] == PHASE_UNKNOWN; wpos += wt[i] > 0; }
+        CHECK(wt && !wbad && (v == 1 || wpos > kept / 2), "--weight-coh: weight on unknown phase or missing on kept labels");
+        free(wt);
         free(ig); free(ph);
     } }
     {   /* --geom: geom-check defect cells covering wrap 3 (rows 0..63, every 1/64 turn), slip z bins on wrap 6 rows 16..31 */
