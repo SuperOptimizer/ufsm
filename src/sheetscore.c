@@ -1,4 +1,5 @@
 /* ufsm sheet-score OURS_ROOT OURS_KEY GT_ROOT GT_KEY [--tol 1] [--prec-r 8] [--cell 64] [--box z,y,x,nz,ny,nx] [--block 128] [--threads N] [--tsv OUT]
+                 [--axis F --axis-um U0 --grid-um G --sense-fix S]   (S = dir_ours - dir_gt: 2 or -2 when the code sets use opposite spiral senses)
    Sheet-level score of our surfaces against GT surfaces, both as winding_mod14 code rasters on the same grid (codes 1 + round(18 q) mod 252,
    0 empty, 255 conflict: ufsm surf-labels / raster --value / the GT codes zarrs). A "sheet voxel" is a code 1..252.
      recall     GT sheet voxels with one of ours within --tol voxels (Chebyshev; ours dilated) / GT sheet voxels
@@ -10,6 +11,7 @@
                 matched-voxel-weighted mean over cells (1 = no local skips / switches / merges)
      global ids the share on the box-wide most common k (one gauge for the box; mod 14 turns)
    --tsv: per cell z y x n_matched dominant_share k. Deterministic for any thread count. */
+#include "sources.h"
 #include "store.h"
 #include "zarr3.h"
 #include <math.h>
@@ -26,8 +28,9 @@ static inline int ss_sheet(uint8_t c) { return c >= 1 && c <= 252; }
 typedef struct {
     z3 *ours, *gt; int64_t b0[3], bn[3]; int B, tol, pr, cell, nt; int64_t nb[3];
     _Atomic long next; long nitems; _Atomic int fail;
-    _Atomic long long gt_n, gt_hit, our_n, our_reg, our_hit, al_n, mis_n, hist[14];
-    double *cnum, *cden; int *ck; long long *cn; int64_t nc[3];   /* per cell (global cell index): dominant count, aligned count, k */
+    _Atomic long long gt_n, gt_hit, our_n, our_reg, our_hit, al_n, mis_n, hist[14], fh[10];   /* fh: |fractional offset| in 0.05-turn bins (0 .. 0.5) */
+    double *cnum, *cden; int *ck; long long *cn; int64_t nc[3];
+    axis ax; int has_ax; double ax_s, sfix;   /* --axis F --axis-um U --grid-um G --sense-fix S: d -= S theta / 2 pi (ax_s: grid voxel -> axis voxel) */   /* per cell (global cell index): dominant count, aligned count, k */
 } ss_job;
 
 /* separable box max (Chebyshev dilation by r) of a 0/1 mask n[0] x n[1] x n[2], in place, with scratch */
@@ -69,7 +72,7 @@ static int ss_block(ss_job *J, long it, uint8_t *bufo, uint8_t *bufg, uint8_t *m
     memcpy(mr, mg, NN);
     ss_dilate(mo, n, J->tol, tmp);   /* ours within tol */
     ss_dilate(mr, n, J->pr, tmp);    /* GT-covered region */
-    long long gt_n = 0, gt_hit = 0, our_n = 0, our_reg = 0, our_hit = 0, al = 0, mis = 0, hist[14] = {0};
+    long long gt_n = 0, gt_hit = 0, our_n = 0, our_reg = 0, our_hit = 0, al = 0, mis = 0, hist[14] = {0}, fh[10] = {0};
     const int C = J->cell; const int64_t ncz = (cn[0] + C - 1) / C, ncy = (cn[1] + C - 1) / C, ncx = (cn[2] + C - 1) / C;
     memset(chist, 0, sizeof(long long) * 14 * (size_t)(ncz * ncy * ncx));
     const int T = J->tol;
@@ -94,8 +97,14 @@ static int ss_block(ss_job *J, long it, uint8_t *bufo, uint8_t *bufg, uint8_t *m
         if (found < 0) continue;
         our_hit++;
         double d = ((double)bufo[i] - (double)found) / 18.0;   /* turns, mod 14 */
+        if (J->has_ax) {   /* the two code sets on opposite spiral senses (or one sense, --sense-fix 0): q_ours - q_gt = k + S theta / 2 pi */
+            const double gz = (double)(o[0] + zz), gy = (double)(o[1] + yy), gx = (double)(o[2] + xx); double cy, cx;
+            axis_at(&J->ax, (gz + 0.5) * J->ax_s - 0.5, &cy, &cx); cy = (cy + 0.5) / J->ax_s - 0.5; cx = (cx + 0.5) / J->ax_s - 0.5;
+            d -= J->sfix * atan2(gy - cy, gx - cx) / (2 * M_PI);
+        }
         d = fmod(d, 14.0); if (d < 0) d += 14.0;
         const double fr = d - floor(d + 0.5);
+        { int fb = (int)(fabs(fr) / 0.05); if (fb > 9) fb = 9; fh[fb]++; }
         if (fabs(fr) >= 0.25) { mis++; continue; }
         int k = (int)floor(d + 0.5) % 14;
         al++; hist[k]++;
@@ -104,6 +113,7 @@ static int ss_block(ss_job *J, long it, uint8_t *bufo, uint8_t *bufg, uint8_t *m
     atomic_fetch_add(&J->gt_n, gt_n); atomic_fetch_add(&J->gt_hit, gt_hit); atomic_fetch_add(&J->our_n, our_n); atomic_fetch_add(&J->our_reg, our_reg);
     atomic_fetch_add(&J->our_hit, our_hit); atomic_fetch_add(&J->al_n, al); atomic_fetch_add(&J->mis_n, mis);
     for (int k = 0; k < 14; k++) atomic_fetch_add(&J->hist[k], hist[k]);
+    for (int k = 0; k < 10; k++) atomic_fetch_add(&J->fh[k], fh[k]);
     /* cells: the block's cells are whole cells of the global cell grid when --block is a multiple of --cell (checked) */
     for (int64_t a = 0; a < ncz; a++) for (int64_t b = 0; b < ncy; b++) for (int64_t c = 0; c < ncx; c++) {
         const long long *h = chist + 14 * (size_t)((a * ncy + b) * ncx + c); long long s = 0, m = 0; int km = 0;
@@ -146,6 +156,10 @@ int cmd_sheet_score(int argc, char **argv) {
         fprintf(stderr, "sheet-score: --tol 0..8, --prec-r tol..64, --cell >= 8 dividing --block, --threads >= 1\n"); return 2;
     }
     for (int d = 0; d < 3; d++) { J.b0[d] = 0; J.bn[d] = so[d]; }
+    { const char *ap = ss_opt(argc, argv, "--axis", nullptr);
+      if (ap) { const double au = atof(ss_opt(argc, argv, "--axis-um", "0")), gu = atof(ss_opt(argc, argv, "--grid-um", "0"));
+                if (!(au > 0) || !(gu > 0) || axis_load(&J.ax, ap)) { fprintf(stderr, "sheet-score: --axis F needs --axis-um U --grid-um G and a readable axis\n"); return 2; }
+                J.has_ax = 1; J.ax_s = gu / au; J.sfix = atof(ss_opt(argc, argv, "--sense-fix", "0")); } }
     const char *bx = ss_opt(argc, argv, "--box", nullptr);
     if (bx) { long long v[6]; if (sscanf(bx, "%lld,%lld,%lld,%lld,%lld,%lld", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) != 6) { fprintf(stderr, "sheet-score: --box z,y,x,nz,ny,nx\n"); return 2; }
         for (int d = 0; d < 3; d++) { J.b0[d] = v[d] < 0 ? 0 : v[d]; J.bn[d] = v[d] + v[3 + d] > so[d] ? so[d] - J.b0[d] : v[3 + d] - (J.b0[d] - v[d]);
@@ -168,6 +182,9 @@ int cmd_sheet_score(int argc, char **argv) {
            gt_n ? (double)J.gt_hit / gt_n : 0, (long long)J.gt_hit, gt_n, our_reg ? (double)our_hit / our_reg : 0, our_hit, our_reg, (long long)J.our_n);
     printf("sheet-score: aligned %.4f of matched | cell ids %.4f | global ids %.4f (offset %d turns mod 14)\n",
            our_hit ? (double)al / our_hit : 0, cd > 0 ? cn / cd : 0, hs ? (double)hm / hs : 0, km);
+    printf("sheet-score: |fractional turn offset| of matched voxels (0.05-turn bins, 0..0.5; peaked at 0 = same spiral sense and axis, flat = a sense / axis mismatch):");
+    for (int k = 0; k < 10; k++) printf(" %.3f", our_hit ? (double)J.fh[k] / our_hit : 0);
+    printf("\n");
     const char *tsv = ss_opt(argc, argv, "--tsv", nullptr);
     if (tsv) {
         FILE *f = fopen(tsv, "w"); if (!f) { fprintf(stderr, "sheet-score: cannot write %s\n", tsv); return 1; }

@@ -3,7 +3,7 @@
                    [--wrapcheck TSV] [--first K] [--last K] [--drop w1,w2,..] [--band-peaks LO,HI]
                    [--ct ROOT KEY [--ct-scale 1|2] [--min-onpap 0.2] [--ct-level 80] [--ct-range 15]]   (--ct-scale 2: the CT is on the 2x finer grid)
                    [--exclude holdouts.json --exclude-ct NAME [--exclude-mm 0.5]]
-                   [--weight-coh T0,T1 (with --ct: OUT/weight.zarr, the trainer's phase confidence)] [--geom DIR [--slip-max 0.5] [--slip-d 2]] [--radius 20] [--block 256] [--shard 512] [--bake 1] [--min-coh T [--coh-cell 32]] [--gt ROOT KEY] [--tsv OUT] [--threads N]
+                   [--weight-coh T0,T1 (with --ct: OUT/weight.zarr, the trainer's phase confidence)] [--geom DIR [--slip-max 0.5] [--slip-d 2]] [--radius 20] [--block 256] [--shard 512] [--bake 1] [--min-coh T [--coh-cell 32]] [--gt ROOT KEY [--gt-dir 1|-1]] [--tsv OUT] [--threads N]
    Winding labels straight from our whole-scroll wraps (ufsm wraps / wrap-snap .sfc, rows = z, wrap k = the fit's level set W = k
    with W = U - dir theta / 2 pi, theta = atan2 around the axis in (-pi, pi]): every wrap's quads are rasterised on the scan's training
    grid (--grid-um; --like a CT level array of that grid gives the shape) with the sheet coordinate q = k + dir theta / 2 pi (continuous
@@ -88,7 +88,7 @@ typedef struct { float p[3], d, r, dm; uint32_t h; uint8_t q, ag; } sl_rec;   /*
 typedef struct { sl_rec *r; size_t n, cap; } sl_recs;
 
 typedef struct {
-    sl_wrap *W; int nw; axis *ax; double s0, f, dir;   /* s0: wrap voxel -> axis voxel; f: wrap voxel -> grid voxel */
+    sl_wrap *W; int nw; axis *ax; double s0, f, dir, gdir;   /* gdir: the GT codes' spiral sense (--gt-dir; default = dir) */   /* s0: wrap voxel -> axis voxel; f: wrap voxel -> grid voxel */
     int64_t shape[3]; int S, B, Hh; float rmax; int bake;
     z3w *wc, *wp, *wi; z3 *ct, *gt; double gum;
     double (*hold)[6]; int nhold;     /* holdout boxes, grid voxels (z, y, x, nz, ny, nx) */
@@ -468,7 +468,11 @@ static int sl_block(sl_job *J, sl_scratch *X, int si, int bk, int tid) {
         if (!ig0 && gc >= 1 && gc <= 252) {   /* pair accuracy record: our winding at a GT-coded voxel */
             const uint64_t key = ((uint64_t)gz << 42) ^ ((uint64_t)gy << 21) ^ (uint64_t)gx; const uint32_t h = (uint32_t)(sl_mix(key) >> 32);
             if (h < J->pa_T) {
-                const double wo = (X->codes[X->lo[i]] - 1) / 18.0 + (double)ph / PHASE_PERIOD, d = wo - (gc - 1) / 18.0;
+                const double wo = (X->codes[X->lo[i]] - 1) / 18.0 + (double)ph / PHASE_PERIOD; double d = wo - (gc - 1) / 18.0;
+                if (J->gdir != J->dir) {   /* --gt-dir: the GT q = K + gdir theta / 2 pi, ours K' + dir theta / 2 pi: compare in the GT's sense */
+                    const double sw = J->s0 / J->f; double cy, cx; axis_at(J->ax, (gz + 0.5) * sw - 0.5, &cy, &cx); cy = (cy + 0.5) / sw - 0.5; cx = (cx + 0.5) / sw - 0.5;
+                    d -= (J->dir - J->gdir) * atan2((double)gy - cy, (double)gx - cx) / (2 * M_PI);
+                }
                 if (R->n == R->cap) { R->cap = R->cap ? 2 * R->cap : 4096; R->r = realloc(R->r, R->cap * sizeof *R->r); }
                 R->r[R->n++] = (sl_rec){{(float)(gz * mm), (float)(gy * mm), (float)(gx * mm)}, (float)d, r, J->an_dist ? J->an_dist[X->cell[X->lo[i]]] : NAN, h, (uint8_t)gc, (uint8_t)agv};
             }
@@ -815,6 +819,9 @@ int cmd_surf_labels(int argc, char **argv) {
         dir = vp > vm ? 1 : -1; J.dir = dir;
         fprintf(stderr, "surf-labels: --dir auto: %+g (cut votes +1 %ld, -1 %ld)\n", dir, vp, vm);
     }
+    { const char *gd = sl_opt(argc, argv, "--gt-dir", nullptr); J.gdir = gd ? atof(gd) : J.dir;
+      if (gd && J.gdir != 1 && J.gdir != -1) { fprintf(stderr, "surf-labels: --gt-dir 1|-1\n"); return 2; }
+      if (gd && J.gdir != J.dir) fprintf(stderr, "surf-labels: --gt-dir %+g: the GT codes wind the other way; pair records compared in the GT's sense\n", J.gdir); }
     fprintf(stderr, "surf-labels: %d wraps, %lld vertices, %.4g um wraps -> grid %lldx%lldx%lld at %.4g um, dir %+g, radius %.1f, scan %.1fs\n",
             nw, nvt, W[0].um, (long long)J.shape[0], (long long)J.shape[1], (long long)J.shape[2], gum, dir, rmax, sl_now() - t0);
     if (J.an_mode == 2 && an_load(&J, sl_opt(argc, argv, "--anchor", ""))) return 1;
