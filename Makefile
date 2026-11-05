@@ -75,7 +75,7 @@ SRC += src/villawind.c src/villawind_net.c src/vwt_net.c src/vwt_train.c src/vwt
 SRC += src/inksplat.c src/hercuvit.c src/hercuvit_net.c src/ink3dext.c src/ink3dext_net.c src/surfrecto.c src/surfrecto_net.c
 SRC += src/tfx.c
 SRC += src/embz.c src/fit_emb.c src/embpca.c src/embcalib.c src/sample_emb.c
-SRC += src/vwt_sample.c src/raycheck.c src/patchraster.c src/hiresphase.c src/fitjoin.c src/wrapcheck.c src/phasegate.c src/ctcal.c src/fieldsoracle.c src/packmap.c src/scanprep.c src/pairacc.c src/wbench.c src/wrapsnap.c src/surflabels.c src/sideface.c src/sidegate.c src/geomcheck.c src/patchid.c src/rectoruler.c src/rectocls.c src/rectosp.c
+SRC += src/vwt_sample.c src/raycheck.c src/patchraster.c src/hiresphase.c src/fitjoin.c src/wrapcheck.c src/phasegate.c src/ctcal.c src/fieldsoracle.c src/packmap.c src/scanprep.c src/pairacc.c src/wbench.c src/wrapsnap.c src/surflabels.c src/sheetscore.c src/sideface.c src/sidegate.c src/geomcheck.c src/patchid.c src/rectoruler.c src/rectocls.c src/rectosp.c
 SRC += src/view.c src/reg.c src/reg_cli.c src/reg_view.c src/reg_init.c src/reg_render.c src/reg_ink.c src/srpairs.c
 SRC += src/srpair.c
 SRC += src/storebench.c src/phasepack.c
@@ -458,6 +458,9 @@ SAMPLE_TEST_OBJ = $(B)/edt.o $(B)/band.o $(B)/sheet.o $(B)/ct_augment.o $(B)/sca
 $(B)/test_wrapsnap: tests/test_wrapsnap.c $(B)/wrapsnap.o $(B)/tfx.o $(B)/surfcomp.o $(B)/tiffw.o $(SAMPLE_TEST_OBJ) $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 suite-bins: $(B)/test_wrapsnap
+$(B)/test_sheetscore: tests/test_sheetscore.c $(B)/sheetscore.o $(SAMPLE_TEST_OBJ) $(B)/nn.o $(B)/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
+suite-bins: $(B)/test_sheetscore
 $(B)/test_surflabels: tests/test_surflabels.c $(B)/surflabels.o $(B)/pairacc.o $(B)/tfx.o $(B)/surfcomp.o $(B)/tiffw.o $(SAMPLE_TEST_OBJ) $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 suite-bins: $(B)/test_surflabels
