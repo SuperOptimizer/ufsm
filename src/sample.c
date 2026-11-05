@@ -1371,6 +1371,22 @@ static int phase_window_interp(z3 *a, const int64_t o[3], int D, int P, int shif
     tp_put(ph, N);
     return 0;
 }
+/* sources "phase": {"weight"}: per 8^3 block of a Pz x P x P window, the block keeps its phase with probability (mean w) / 255
+   (a draw from seed and the block index; w outside the array reads 255 = keep), else its voxels become unknown. Exposed for tests. */
+void phase_weight_drop(uint8_t *ph, const uint8_t *w, int Pz, int P, uint64_t seed) {
+    const int bz = (Pz + 7) / 8, by = (P + 7) / 8, bx = (P + 7) / 8;
+    for (int a = 0; a < bz; a++) for (int b = 0; b < by; b++) for (int d = 0; d < bx; d++) {
+        unsigned long sum = 0, n = 0;
+        for (int z = a * 8; z < a * 8 + 8 && z < Pz; z++) for (int y = b * 8; y < b * 8 + 8 && y < P; y++) for (int x = d * 8; x < d * 8 + 8 && x < P; x++) {
+            const size_t k = ((size_t)z * P + y) * P + x; if (ph[k] == PHASE_UNKNOWN) continue; sum += w[k]; n++; }
+        if (!n) continue;
+        uint64_t h = seed + 0x9e3779b97f4a7c15ull * (uint64_t)(((size_t)a * by + b) * bx + d + 1);
+        h = (h ^ (h >> 30)) * 0xbf58476d1ce4e5b9ull; h = (h ^ (h >> 27)) * 0x94d049bb133111ebull; h ^= h >> 31;
+        if ((double)(h >> 11) * (1.0 / 9007199254740992.0) * 255.0 < (double)sum / n) continue;   /* kept */
+        for (int z = a * 8; z < a * 8 + 8 && z < Pz; z++) for (int y = b * 8; y < b * 8 + 8 && y < P; y++) for (int x = d * 8; x < d * 8 + 8 && x < P; x++)
+            ph[((size_t)z * P + y) * P + x] = PHASE_UNKNOWN;
+    }
+}
 /* a stored phase / winding read against the convention (sources "phase_sign": -1): codes 0..251 negated mod 252, unknown kept */
 static void phase_negate(uint8_t *p, size_t n) { for (size_t k = 0; k < n; k++) if (p[k] < PHASE_PERIOD && p[k]) p[k] = (uint8_t)(PHASE_PERIOD - p[k]); }
 /* the stored phase's air test in one pass: sw unknown where CT <= air or CT 0; pw (optional, --task unwrap2's winding input,
@@ -2816,7 +2832,13 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
                 for (size_t k = 0; k < p3; k++) if (ig[k] && ig[k] != PHASE_UNKNOWN) sw[k] = PHASE_UNKNOWN;   /* (outside the mask array: 255 = keep) */
                 tp_put(ig, p3);
             }
-            if (c->wind4) {   /* the winding mod 4: the phase unwrapped before the air test (gaps join the windings), outside the scroll (CT 0) not */
+            if (s->phase_wt && pshift < 2 && !g_crush.pre) {   /* "weight": each 8^3 block of the window keeps its phase with probability w / 255 */
+                uint8_t *wt = tp_get(p3, 0);
+                if (!wt || phase_window(s->phase_wt, o, Pz, P, pshift, wt)) { tp_put(wt, p3); tp_put(sw, p3 + 64); return -1; }
+                phase_weight_drop(sw, wt, Pz, P, r->s[1] ^ (uint64_t)tile_index ^ c->seed ^ ((uint64_t)o[0] << 40) ^ ((uint64_t)o[1] << 20) ^ (uint64_t)o[2]);
+                tp_put(wt, p3);
+            }
+            if (c->wind4 && !s->scope_local) {   /* ("scope": "local": the winding mod 4 stays unknown, below) */   /* the winding mod 4: the phase unwrapped before the air test (gaps join the windings), outside the scroll (CT 0) not */
                 uint8_t *pw = tp_get(p3, 0), *ww = tp_get(p3, 0), *wc = tp_get(p3, 0);
                 if (!pw || !ww || !wc) { tp_put(pw, p3); tp_put(ww, p3); tp_put(wc, p3); tp_put(sw, p3 + 64); return -1; }
                 phase_air(ctu, sw, pw, p3, c->side_air); air_done = 1;   /* (the winding input and the air test in one pass) */
@@ -3266,6 +3288,10 @@ static int label_res_check(sampler *sp, source *s, int si, int region_ch) {
 sampler *sampler_start(sources *S, const sample_cfg *cfg) {
     if (!S || S->n <= 0 || cfg->P <= 0 || cfg->B <= 0 || cfg->nworkers <= 0 || cfg->nbuf <= 0) { fprintf(stderr, "sampler: invalid sources, patch, batch, workers or buffer count\n"); return nullptr; }
     if (cfg->gpu_input && !sample_gpu_input_ok(cfg)) { fprintf(stderr, "sampler: --gpu-input needs 16-bit batches and no warps, sheet prior, slab appearance plan, aux or condition inputs\n"); return nullptr; }
+    { int nl = 0, nw = 0; for (int i = 0; i < S->n; i++) { nl += S->src[i].scope_local; nw += S->src[i].phase_wt != nullptr; }
+      if (nl || nw) fprintf(stderr, "sampler: %d of %d sources scope local (no winding mod 4 target)%s, %d with a phase weight (8^3 blocks kept with probability w)\n",
+                            nl, S->n, cfg->wind4 ? "" : " (no --wind4 in this run: no effect)", nw);
+      for (int i = 0; i < S->n; i++) if (S->src[i].phase_wt && (cfg->crush.p > 0)) { fprintf(stderr, "sampler: note: phase weights are not applied on crushed / torn / re-bent windows\n"); break; } }
     if (cfg->erode < 0 || cfg->erode > 1 || (cfg->erode && (cfg->P < 2 || cfg->dilate || cfg->sheet))) {
         fprintf(stderr, "sampler: erode must be 0 or 1, with P >= 2, no dilation and no winding task\n"); return nullptr;
     }

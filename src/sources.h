@@ -109,6 +109,11 @@ typedef struct {
                          rising outward from the axis, fit.h W): windows read p -> (252 - p) mod 252 (unknown stays unknown); the
                          winding mod 4 targets unwrap the negated phase, so they follow. Default +1. (2026-10-19: the 10-16 multi-scroll
                          wind-seed sets with a wrongly voted spiral sense, e.g. Paris 4 June / July, 0500P2) */
+    z3 *phase_wt;    /* optional "phase": {..., "weight": {"root", "key"}}: uint8 confidence on the stored phase's grid (0..255 = 0..1): each 8^3
+                        block of a window keeps its phase with probability w (a per-block draw), so the phase / winding losses see the label
+                        with expected weight w (ufsm surf-labels gate confidence); applied where the ignore mask is (not on crushed / torn windows) */
+    int scope_local; /* "scope": "local": the labels are right only locally (our own fits' turn counts drift): the winding mod 4 target
+                        (task unwrap2 --wind4) stays unknown for this source; phase, normals and density train as usual. "global" (default) */
     z3 *phase_ign;   /* optional "phase": {..., "ignore": {"root", "key"}}: a uint8 array on the stored phase's grid, nonzero = the phase there is not trained on (ufsm phase-conflict) */
     uint8_t *focus; int64_t focus_grid[3]; float focus_w;   /* optional "focus": {"map": RAW, "w": K} (ufsm phase-packing --map: per coarse occupancy cell 0 none, else
                                                               1 + 254 x packed share): the position draw takes a cell 1 + K x share times as often */

@@ -134,6 +134,9 @@ sources *sources_load(const char *path) {
         s->weight = json_num(json_get(e, "weight"), 1.0);
         s->ink_weight = json_num(json_get(e, "ink_weight"), 1.0);
         s->trust_band = (int)json_num(json_get(e, "trust_band"), 0);
+        { const char *sc = json_str(json_get(e, "scope"), "global");
+          if (!strcmp(sc, "local")) s->scope_local = 1;
+          else if (strcmp(sc, "global")) { fprintf(stderr, "sources: %s: \"scope\" must be \"local\" or \"global\"\n", s->name); json_free(j); sources_free(S); return nullptr; } }
         s->iso = (int)json_num(json_get(e, "iso"), 0);
         s->pap_level = (int)json_num(json_get(e, "papyrus"), s->iso);
         s->head = (int)json_num(json_get(e, "head"), 0);
@@ -256,6 +259,16 @@ sources *sources_load(const char *path) {
                         json_free(j); sources_free(S); return nullptr;
                     }
                 }
+                const json *pw = json_get(pt, "weight");   /* confidence on the stored phase's grid: 0..255 = keep probability per 8^3 block */
+                if (pw) {
+                    const char *wr = json_str(json_get(pw, "root"), nullptr), *wk = json_str(json_get(pw, "key"), "");
+                    store *ws = wr ? store_open(wr) : nullptr; s->phase_wt = ws ? z3_open(ws, wk, nullptr) : nullptr;
+                    const z3_meta *wm = s->phase_wt ? z3_meta_of(s->phase_wt) : nullptr;
+                    if (!wm || memcmp(wm->shape, pm->shape, sizeof wm->shape)) {
+                        fprintf(stderr, "sources: %s: cannot open the phase weight %s/%s or its shape differs from the stored phase's\n", s->name, wr ? wr : "?", wk);
+                        json_free(j); sources_free(S); return nullptr;
+                    }
+                }
                 const json *wt = json_get(bt, "winding");   /* the winding mod 14 on the stored phase's grid */
                 if (wt) {
                     const char *wroot = json_str(json_get(wt, "root"), nullptr), *wkey = json_str(json_get(wt, "key"), pkey);
@@ -366,7 +379,7 @@ void sources_free(sources *S) {
     for (int i = 0; i < S->n; i++) {
         source *s = &S->src[i];
         for (int l = 0; l < MAXLEV; l++) z3_close(s->ct[l]);
-        if (s->band != s->phase) z3_close(s->band); z3_close(s->phase); z3_close(s->wind); z3_close(s->aux); z3_close(s->phase_ign); free(s->box); free(s->hold); free(s->focus); free(s->mask); srpair_free(s->srp);
+        if (s->band != s->phase) z3_close(s->band); z3_close(s->phase); z3_close(s->wind); z3_close(s->aux); z3_close(s->phase_ign); z3_close(s->phase_wt); free(s->box); free(s->hold); free(s->focus); free(s->mask); srpair_free(s->srp);
         for (int c = 0; c < NCH; c++) {
             for (int l = 0; l < MAXLEV; l++) z3_close(s->tgt[c][l]);
             if (s->reg[c]) {

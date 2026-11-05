@@ -45,6 +45,9 @@ static uint8_t phase0(int64_t z, int64_t y, int64_t x) {   /* the same field on 
     const double W = 0.045 * x + 0.015 * y; return (uint8_t)((int)lround((W - floor(W)) * 252) % 252);
 }
 static uint8_t phase0neg(int64_t z, int64_t y, int64_t x) { const uint8_t q = phase0(z, y, x); return q < 252 ? (uint8_t)((252 - q) % 252) : q; }
+static uint8_t ct_w255(int64_t z, int64_t y, int64_t x) { (void)z; (void)y; (void)x; return 255; }
+static uint8_t ct_w0(int64_t z, int64_t y, int64_t x) { (void)z; (void)y; (void)x; return 0; }
+static uint8_t ct_w128(int64_t z, int64_t y, int64_t x) { (void)z; (void)y; (void)x; return 128; }
 static uint8_t codes1(int64_t z, int64_t y, int64_t x) { return phase1(z, y, x) == 0 ? 37 : 0; }
 
 static uint8_t *g_rec;   /* non-null: run() records every window's phase / w4 / comp (3 p3 per window) */
@@ -134,6 +137,47 @@ int main(int argc, char **argv) {
     CHECK(kn > 0, "no known phase in the sign windows");
     CHECK(d01 == 0, "phase_sign -1 on the negated phase: %zu target bytes differ from the original", d01);
     CHECK(d02 > kn / 2, "the negated phase read as is differs in only %zu target bytes (the comparison cannot see the sign)", d02);
+    {   /* "scope": "local" (the winding mod 4 target unknown, the phase as is) and "phase": {"weight"} (8^3 blocks kept with probability
+           w / 255): weight 255 = byte-identical to the original, weight 0 = no known phase, weight 128 = about half the known phase */
+        static const uint8_t wv[3] = {255, 0, 128};
+        for (int k = 0; k < 3; k++) {
+            snprintf(p, sizeof p, "%s/w%d", dir, wv[k]);
+            uint8_t (*fill)(int64_t, int64_t, int64_t) = k == 0 ? ct_w255 : k == 1 ? ct_w0 : ct_w128;
+            if (write_array(p, "8", s0, 255, fill) || z3w_write_group(p, um, 1, "weight", nullptr)) { fprintf(stderr, "FAIL: weight array\n"); return 1; }
+        }
+        uint8_t *r2[4]; for (int k = 0; k < 4; k++) r2[k] = malloc(nw * win);
+        for (int k = 0; k < 4; k++) {   /* 0 scope local, 1 weight 255, 2 weight 0, 3 weight 128 */
+            char extra[256] = ""; if (k) snprintf(extra, sizeof extra, ", \"weight\": {\"root\": \"%s/w%d\", \"key\": \"8\"}", dir, wv[k - 1]);
+            snprintf(q, sizeof q, "%s/sources-sw%d.json", dir, k); f = fopen(q, "w");
+            fprintf(f, "{\"sources\": [{\"name\": \"noncubic\", \"root\": \"%s\", \"ct\": \"ct\", \"um\": 8, \"max_level\": 0, \"weight\": 1%s,\n"
+                       " \"targets\": {\"band\": {\"root\": \"%s/codes\", \"key\": \"16\", \"radius\": 80, \"span\": 75, \"phase\": {\"root\": \"%s/phase\", \"key\": \"8\", \"level\": 0%s}}},\n"
+                       " \"axis\": \"%s/axis.json\"}]}\n", dir, k == 0 ? ", \"scope\": \"local\"" : "", dir, dir, extra, dir);
+            fclose(f);
+            sources *Sk = sources_load(q); if (!Sk) { fprintf(stderr, "FAIL: sources_load %s\n", q); return 1; }
+            g_rec = r2[k]; size_t e, w; if (run(Sk, k == 2 ? 0 : 0.01, nw, &e, &w)) return 1; g_rec = nullptr;
+            sources_free(Sk);
+        }
+        size_t lph = 0, lw4 = 0, d1 = 0, k2 = 0, k3 = 0;
+        for (int i = 0; i < nw; i++) for (size_t k = 0; k < win / 3; k++) {
+            const size_t a = i * win + k;
+            lph += r2[0][a] != rec[0][a]; lw4 += r2[0][a + win / 3] != 255 || r2[0][a + 2 * win / 3] != 255;
+            k2 += r2[2][a] < 252; k3 += r2[3][a] < 252;
+        }
+        for (size_t k = 0; k < nw * win; k++) d1 += r2[1][k] != rec[0][k];
+        printf("scope local: %zu phase bytes differ, %zu w4 / comp set; weight 255: %zu bytes differ; weight 0: %zu known; weight 128: %zu of %zu known (%.2f)\n",
+               lph, lw4, d1, k2, k3, kn, kn ? (double)k3 / kn : 0);
+        CHECK(lph == 0, "scope local changed %zu phase bytes", lph);
+        CHECK(lw4 == 0, "scope local: %zu winding mod 4 / component voxels set", lw4);
+        CHECK(d1 == 0, "weight 255: %zu target bytes differ from the unweighted source", d1);
+        CHECK(k2 == 0, "weight 0: %zu known phase voxels", k2);
+        CHECK(kn && k3 > kn / 4 && k3 < kn * 3 / 4, "weight 128 kept %zu of %zu known phase voxels", k3, kn);
+        for (int k = 0; k < 4; k++) free(r2[k]);
+        snprintf(q, sizeof q, "%s/sources-badscope.json", dir); f = fopen(q, "w");
+        fprintf(f, "{\"sources\": [{\"name\": \"bad\", \"root\": \"%s\", \"ct\": \"ct\", \"um\": 8, \"max_level\": 0, \"scope\": \"near\",\n"
+                   " \"targets\": {\"band\": {\"root\": \"%s/codes\", \"key\": \"16\", \"phase\": {\"root\": \"%s/phase\", \"key\": \"8\", \"level\": 0}}}}]}\n", dir, dir, dir);
+        fclose(f);
+        sources *Sb2 = sources_load(q); CHECK(!Sb2, "\"scope\": \"near\" accepted"); if (Sb2) sources_free(Sb2);
+    }
     for (int k = 0; k < 3; k++) free(rec[k]);
     snprintf(q, sizeof q, "%s/sources-bad.json", dir); f = fopen(q, "w");
     fprintf(f, "{\"sources\": [{\"name\": \"bad\", \"root\": \"%s\", \"ct\": \"ct\", \"um\": 8, \"max_level\": 0, \"weight\": 1,\n"

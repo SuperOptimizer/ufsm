@@ -14,6 +14,7 @@
    - --anchor A,A (union) = --anchor A;
    - wrap-anchor: wraps miscounted (+10 turns, a false extra turn after wrap 3) against the true codes as GT, votes in alternate z
      blocks: every anchored code equals the GT code, the held-out blocks included;
+   - the same wraps joined into one strip.sfc (+ strip.tsv column ranges) give the same bytes as the wrap files;
    - same bytes with 1 and 4 threads; --dir auto picks -1 on the dir -1 spiral (same bytes as --dir -1). */
 #include "band.h"
 #include "store.h"
@@ -66,6 +67,21 @@ static void wraps(const char *dir, int sense, int dup) {
         free(x); free(y); free(z);
     }
 }
+static void strip_of(const char *dir, int sense) {   /* the dir +1 / -1 wraps 1..7 joined side by side as ONE strip.sfc (ufsm strip's layout) + strip.tsv */
+    const int H = NZ / 2, Wc = 720, W = 7 * Wc;
+    float *x = malloc((size_t)W * H * 4), *y = malloc((size_t)W * H * 4), *z = malloc((size_t)W * H * 4);
+    for (int k = 1; k <= 7; k++) for (int r = 0; r < H; r++) for (int c = 0; c < Wc; c++) {
+        const size_t i = (size_t)r * W + (size_t)(k - 1) * Wc + c;
+        const double th = M_PI - (c + 0.5) * 2 * M_PI / Wc, rr = rk(k + sense * th / (2 * M_PI));
+        x[i] = (float)(C0 + rr * cos(th)); y[i] = (float)(C0 + rr * sin(th)); z[i] = (float)(2 * r);
+    }
+    char p[600]; snprintf(p, sizeof p, "%s/strip", dir); tifxyz_write(p, W, H, x, y, z, 2, 9.6, 0, "test");
+    free(x); free(y); free(z);
+    snprintf(p, sizeof p, "%s/strip.tsv", dir); FILE *f = fopen(p, "w");
+    fprintf(f, "seg\twrap\tname\tcol0\tncols\twrap_col0\tseam_gap_pitch\n");
+    for (int k = 7; k >= 1; k--) fprintf(f, "%d\t%d\tw%03d\t%d\t%d\t0\t0\n", 7 - k, k, k, (k - 1) * Wc, Wc);   /* (outermost first, as ufsm strip writes) */
+    fclose(f);
+}
 static int run(const char *root, const char *wd, const char *out, const char *dir, const char *threads, const char *extra1, const char *extra2, const char *gt) {
     char ax[400], wdp[400], o[400], gtr[400]; snprintf(ax, sizeof ax, "%s/axis.json", root); snprintf(wdp, sizeof wdp, "%s/%s", root, wd); snprintf(o, sizeof o, "%s/%s", root, out);
     char *av[40]; int n = 0;
@@ -102,11 +118,27 @@ int main(void) {
     snprintf(p, sizeof p, "%s/wm", root); wraps(p, -1, 0);
     snprintf(p, sizeof p, "%s/wd", root); wraps(p, 1, 1);
     { const int ids[8] = {0, 11, 12, 13, 15, 16, 17, 18}; snprintf(p, sizeof p, "%s/wx", root); wraps_ids(p, ids); }   /* +10 turns, then a false extra turn between wraps 3 and 4 */
+    snprintf(p, sizeof p, "%s/ws", root); snprintf(cmd, sizeof cmd, "mkdir -p %s", p); if (system(cmd)) return 1; strip_of(p, 1);
     tifxyz_set_sfc(0);
     CHECK(!run(root, "wp", "p1", "1", "1", nullptr, nullptr, nullptr), "surf-labels dir +1 (1 thread) failed");
     CHECK(!run(root, "wp", "p4", "1", "4", nullptr, nullptr, nullptr), "surf-labels dir +1 (4 threads) failed");
     snprintf(cmd, sizeof cmd, "cd %s && for a in codes phase ignore; do for s in $(cd p1/$a.zarr/9.6 && find c -type f); do cmp -s p1/$a.zarr/9.6/$s p4/$a.zarr/9.6/$s || exit 1; done; done", root);
     CHECK(!system(cmd), "outputs differ between 1 and 4 threads");
+    CHECK(!run(root, "ws/strip.sfc", "st", "1", "4", nullptr, nullptr, nullptr), "surf-labels on a strip.sfc failed");   /* one strip = its wraps (strip.tsv columns) */
+    {   /* (the wraps and the strip are separate lossy .sfc encodings, tolerance 0.01 voxel: a few voxels at the sheet edges may differ) */
+        static const char *arr[3] = {"codes", "phase", "ignore"}; size_t nd[3] = {0, 0, 0}, nk = 0, big = 0;
+        for (int a = 0; a < 3; a++) {
+            char ra[700], rb[700]; snprintf(ra, sizeof ra, "%s/p4/%s.zarr", root, arr[a]); snprintf(rb, sizeof rb, "%s/st/%s.zarr", root, arr[a]);
+            uint8_t *A = readall(ra, "9.6"), *B = readall(rb, "9.6"); if (!A || !B) { CHECK(0, "cannot read the strip / wrap labels"); free(A); free(B); continue; }
+            for (size_t k = 0; k < (size_t)NZ * NY * NX; k++) {
+                nd[a] += A[k] != B[k];
+                if (a == 1 && A[k] < 252) { nk++; if (B[k] < 252) { int d = abs((int)A[k] - (int)B[k]); if (d > 126) d = 252 - d; big += d > 3; } else big++; }
+            }
+            free(A); free(B);
+        }
+        printf("test_surflabels: strip.sfc vs wrap files: codes %zu, phase %zu, ignore %zu voxels differ; %zu of %zu known phase voxels off by > 3 codes or lost\n", nd[0], nd[1], nd[2], big, nk);
+        CHECK(nk > 100000 && big * 1000 <= nk && nd[0] * 200 <= nk && nd[2] * 1000 <= (size_t)NZ * NY * NX, "labels from the strip.sfc differ from the same wraps as files");
+    }
     CHECK(!run(root, "wm", "m", "-1", "4", nullptr, nullptr, nullptr), "surf-labels dir -1 failed");
     CHECK(!run(root, "wm", "ma", "auto", "2", nullptr, nullptr, nullptr), "surf-labels --dir auto (-1) failed");
     snprintf(cmd, sizeof cmd, "cd %s && for a in codes phase ignore; do for s in $(cd m/$a.zarr/9.6 && find c -type f); do cmp -s m/$a.zarr/9.6/$s ma/$a.zarr/9.6/$s || exit 1; done; done", root);

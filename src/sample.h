@@ -207,6 +207,7 @@ int sources_prefetch(sources *S, int maxlev, int nthreads, double fraction, int 
 /* the stored phase interpolated into a window of a 2^shift finer grid (shift >= 2): ph the grid region read (ln[0] x ln[1] x ln[2] codes,
    first voxel lo, PHASE_UNKNOWN outside the array), o the window corner, D x P x P codes out. sample_phase_interp: separable, polynomial
    atan2 (the sampler's path); _ref: 8 neighbours per voxel, atan2f (codes agree but for +-1 at float ties; tests/test_phase_interp.c) */
+void phase_weight_drop(uint8_t *ph, const uint8_t *w, int Pz, int P, uint64_t seed);   /* sources "phase" "weight": 8^3 blocks kept with probability w / 255 */
 void sample_phase_interp(const uint8_t *ph, const int64_t ln[3], const int64_t lo[3], const int64_t o[3], int D, int P, int shift, uint8_t *side);
 void sample_phase_interp_ref(const uint8_t *ph, const int64_t ln[3], const int64_t lo[3], const int64_t o[3], int D, int P, int shift, uint8_t *side);
 sampler *sampler_start(sources *S, const sample_cfg *cfg);
