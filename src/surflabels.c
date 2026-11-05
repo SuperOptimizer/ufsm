@@ -1,4 +1,5 @@
-/* ufsm surf-labels WRAPS OUT --axis F --axis-um U0 --dir +-1|auto --grid-um U (--shape Z,Y,X | --like ROOT KEY)
+/* ufsm surf-labels WRAPS OUT   (WRAPS: a dir of wNNN.sfc, or one strip.sfc whose wraps are the column ranges of strip.tsv beside it / --strip-tsv)
+   ufsm surf-labels WRAPS OUT --axis F --axis-um U0 --dir +-1|auto --grid-um U (--shape Z,Y,X | --like ROOT KEY)
                    [--wrapcheck TSV] [--first K] [--last K] [--drop w1,w2,..] [--band-peaks LO,HI]
                    [--ct ROOT KEY [--ct-scale 1|2] [--min-onpap 0.2] [--ct-level 80] [--ct-range 15]]   (--ct-scale 2: the CT is on the 2x finer grid)
                    [--exclude holdouts.json --exclude-ct NAME [--exclude-mm 0.5]]
@@ -45,6 +46,7 @@
 #include "z3w.h"
 #include "zarr3.h"
 #include <dirent.h>
+#include <sys/stat.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -68,6 +70,7 @@ static inline uint64_t sl_mix(uint64_t x) { x += 0x9e3779b97f4a7c15ull; x = (x ^
 
 typedef struct {
     int id, w, h, keep; char path[1400], why[24];
+    int c0, cw;                       /* a strip input: the wrap's columns c0 .. c0 + cw of the strip (cw 0: the whole file) */
     sfc_reader *r; sfc_cache *ca; uint32_t ch; double um;
     float *rz0, *rz1;                 /* per row: grid z min / max of its valid vertices (rz0 > rz1: none) */
     float *ra, *rb;                   /* per row (--dir auto): the radius of the valid vertex nearest theta = pi (ra) / -pi (rb) when within 0.15 rad of it, else NAN */
@@ -112,6 +115,7 @@ static int sl_open(sl_wrap *w) {
     if (sfc_open_file(w->path, &w->r)) { fprintf(stderr, "surf-labels: cannot open %s\n", w->path); return -1; }
     int c = sfc_find_channel(w->r, "x"); if (c < 0) c = 0; w->ch = (uint32_t)c;
     const sfc_channel *ch = sfc_channel_info(w->r, w->ch); w->w = (int)ch->width; w->h = (int)ch->height;
+    if (w->cw > 0) { if (w->c0 < 0 || w->c0 + w->cw > w->w) { fprintf(stderr, "surf-labels: %s: strip columns %d + %d past its width %d\n", w->path, w->c0, w->cw, w->w); return -1; } w->w = w->cw; }
     const uint64_t ml = sfc_metadata_size(w->r); char *meta = calloc(ml + 1, 1);
     if (ml && sfc_read_metadata(w->r, meta, ml)) { free(meta); fprintf(stderr, "surf-labels: no metadata in %s\n", w->path); return -1; }
     const char *q = strstr(meta, "\"voxel_size_um\":"); w->um = q ? atof(q + 16) : 0; free(meta);
@@ -130,7 +134,7 @@ static void *sl_scan_run(void *arg) {
         const double f = w->um / J->gum;
         for (int r0 = 0; r0 < w->h && xyz && v; r0 += R) {
             const int n = r0 + R <= w->h ? R : w->h - r0; memset(v, 0, (size_t)n * w->w);
-            if (sfc_cache_read_xyz_region(w->ca, w->ch, 0, (uint64_t)r0, (uint32_t)w->w, (uint32_t)n, xyz, 12, (size_t)w->w * 12, v)) { atomic_store(&S->fail, 1); break; }
+            if (sfc_cache_read_xyz_region(w->ca, w->ch, (uint64_t)w->c0, (uint64_t)r0, (uint32_t)w->w, (uint32_t)n, xyz, 12, (size_t)w->w * 12, v)) { atomic_store(&S->fail, 1); break; }
             const double sw = J->s0 * w->um / J->W[0].um;
             for (int r = 0; r < n; r++) {
                 float lo = 1e30f, hi = -1e30f; double tmax = -10, tmin = 10, rmx = NAN, rmn = NAN;
@@ -158,7 +162,7 @@ static int sl_load_band(sl_job *J, sl_wrap *w, double z0, double z1) {
     const int n = b - a + 1; const size_t nv = (size_t)n * w->w;
     float *xyz = malloc(nv * 12); w->g = malloc(nv * 16); w->v = calloc(nv, 1);
     if (!xyz || !w->g || !w->v) { free(xyz); return -1; }
-    if (sfc_cache_read_xyz_region(w->ca, w->ch, 0, (uint64_t)a, (uint32_t)w->w, (uint32_t)n, xyz, 12, (size_t)w->w * 12, w->v)) { free(xyz); return -1; }
+    if (sfc_cache_read_xyz_region(w->ca, w->ch, (uint64_t)w->c0, (uint64_t)a, (uint32_t)w->w, (uint32_t)n, xyz, 12, (size_t)w->w * 12, w->v)) { free(xyz); return -1; }
     const double f = w->um / J->gum, sw = J->s0 * w->um / J->W[0].um;   /* wrap voxels -> grid voxels; -> axis voxels (s0: the first wrap's) */
     for (size_t i = 0; i < nv; i++) {
         if (!w->v[i] || !(xyz[3 * i + 2] >= 0)) { w->v[i] = 0; continue; }
@@ -704,8 +708,27 @@ int cmd_surf_labels(int argc, char **argv) {
       if (gi > 0) { if (gi + 2 >= argc) return 2; J.gt = z3_open(store_open(argv[gi + 1]), argv[gi + 2], nullptr);
         if (!J.gt || memcmp(z3_meta_of(J.gt)->shape, J.shape, sizeof J.shape)) { fprintf(stderr, "surf-labels: --gt %s %s: cannot open or not on the grid\n", argv[gi + 1], argv[gi + 2]); return 1; } } }
     /* the wraps */
+    int nw = 0, cap = 64; sl_wrap *W = calloc(cap, sizeof *W);
+    struct stat ist;
+    if (!stat(in, &ist) && S_ISREG(ist.st_mode)) {
+        /* a strip (ufsm strip's strip.sfc): its wraps are column ranges, from strip.tsv beside it (or --strip-tsv): seg wrap name col0 ncols .. */
+        char tp[1400]; const char *ts = sl_opt(argc, argv, "--strip-tsv", nullptr);
+        if (ts) snprintf(tp, sizeof tp, "%s", ts); else { snprintf(tp, sizeof tp, "%s", in); char *sl = strrchr(tp, '/'); snprintf(sl ? sl + 1 : tp, sizeof tp - (sl ? (size_t)(sl + 1 - tp) : 0), "strip.tsv"); }
+        FILE *f = fopen(tp, "r"); if (!f) { fprintf(stderr, "surf-labels: %s is a file (a strip): cannot read its column table %s\n", in, tp); return 1; }
+        char line[512];
+        while (fgets(line, sizeof line, f)) {
+            int seg, id, c0, n; char nm[64];
+            if (sscanf(line, "%d %d %63s %d %d", &seg, &id, nm, &c0, &n) != 5 || n <= 0) continue;
+            for (int k = 0; k < nw; k++) if (W[k].id == id) { fprintf(stderr, "surf-labels: %s: wrap %d twice\n", tp, id); fclose(f); return 1; }
+            if (nw == cap) { cap *= 2; W = realloc(W, cap * sizeof *W); }
+            memset(&W[nw], 0, sizeof W[nw]); W[nw].id = id; W[nw].keep = 1; W[nw].c0 = c0; W[nw].cw = n; snprintf(W[nw].path, sizeof W[nw].path, "%s", in); nw++;
+        }
+        fclose(f);
+        if (!nw) { fprintf(stderr, "surf-labels: no wraps in %s\n", tp); return 1; }
+        fprintf(stderr, "surf-labels: strip %s: %d wraps from %s\n", in, nw, tp);
+    } else {
     DIR *dd = opendir(in); if (!dd) { fprintf(stderr, "surf-labels: cannot open %s\n", in); return 1; }
-    int nw = 0, cap = 64; sl_wrap *W = calloc(cap, sizeof *W); struct dirent *de;
+    struct dirent *de;
     while ((de = readdir(dd))) {
         int id; char tail[8] = ""; if (sscanf(de->d_name, "w%d.%7s", &id, tail) != 2 || strcmp(tail, "sfc")) continue;
         if (nw == cap) { cap *= 2; W = realloc(W, cap * sizeof *W); }
@@ -713,6 +736,7 @@ int cmd_surf_labels(int argc, char **argv) {
     }
     closedir(dd);
     if (!nw) { fprintf(stderr, "surf-labels: no wNNN.sfc in %s\n", in); return 1; }
+    }
     if (nw > 65534) { fprintf(stderr, "surf-labels: too many wraps\n"); return 1; }
     qsort(W, nw, sizeof *W, sl_cmp_id);
     for (int k = 0; k < nw; k++) { if (sl_open(&W[k])) return 1; if (fabs(W[k].um - W[0].um) > 1e-9) { fprintf(stderr, "surf-labels: wraps at different voxel sizes\n"); return 1; } W[k].peaks = NAN; W[k].onpap = NAN; }

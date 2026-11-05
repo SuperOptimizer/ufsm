@@ -204,7 +204,7 @@ static int usage(void) {
         "  ufsm wrap-check <model> <fields-dir> [--ct ROOT KEY --ct-um U] [--codes ROOT KEY]   duplicate / merged wraps: CT peaks between adjacent wraps along radial rays\n"
         "  ufsm surf-snap <wraps-in> <wraps-out> --volume ROOT KEY --vol-um U   tifxyz vertices onto the nearest papyrus ridge\n"
         "  ufsm wrap-snap <wraps-in> <wraps-out> --axis F --axis-um U0 --ct ROOT KEY --ct-um U   .sfc wraps moved along their rays onto the sheets (smooth, order-kept)\n"
-        "  ufsm surf-labels <wraps-dir> <out-dir> --axis F --axis-um U0 --dir +-1 --grid-um U --like ROOT KEY   winding codes + pair phase + ignore from .sfc wraps\n"
+        "  ufsm surf-labels <wraps-dir|strip.sfc> <out-dir> --axis F --axis-um U0 --dir +-1 --grid-um U --like ROOT KEY   winding codes + pair phase + ignore from .sfc wraps\n"
         "  ufsm wrap-anchor <wraps-dir> <anchor-file> --gt ROOT KEY [surf-labels flags]   per-cell winding offsets of our wraps from published-segment codes (surf-labels --anchor)\n"
         "  ufsm patch-id <wraps-dir> <out-dir> --axis F --axis-um U0 --dir +-1 --sheet ROOT KEY --grid-um U   sheet patches -> per-cell wrap id corrections (+ --gt check)\n"
         "  ufsm recto-ruler <model> <fields-dir> --codes ROOT KEY --src NAME ROOT KEY UM ...   recto predictions as a winding ruler vs GT (peaks per GT turn, interval dumps)\n"

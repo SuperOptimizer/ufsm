@@ -6,6 +6,7 @@
 #   grid: the CT level ct_level (local $CTL/ct_key/level) -> --like, --ct (CT 0 = ignore 3), grid um = ct_um x 2^level, axis um = ct_um;
 #   gates: wrapcheck dup/merged, ONPAP (default 0.2: --min-onpap with the local CT; 0 = off), PEAKS (e.g. 0.85,1.15; default off);
 #   holdouts: $HO boxes of this CT + 0.5 mm -> ignore 4;
+#   STRIP=1: the single strip.sfc (dirname of strip_json) in place of the wraps (surf-labels reads its wraps from strip.tsv);
 #   fixed surfaces: WSRC=<dir> uses <dir>/S/wraps_snap (else <dir>/S/wraps) first (e.g. /vesuvius/ufsm/v2/count/unroll), with its
 #   wrapcheck.tsv; GEOM=<dir> adds --geom <dir>/S (geom-check output of those wraps); ROWS=a,b adds --rows a,b (end caps).
 # Scope (main 11-02): labels whose turn counts come from our fit alone carry its count errors (P4 4 mm pairs ~.30): they are LOCAL
@@ -25,6 +26,8 @@ W=$wraps; src=unsnapped
 [ -d $SNAP/$S/wraps_snap ] && [ -n "$(ls $SNAP/$S/wraps_snap | grep -m1 '\.sfc$')" ] && { W=$SNAP/$S/wraps_snap; src=snapped; }
 if [ -n "${WSRC:-}" ]; then for d in wraps_snap wraps; do
   [ -d $WSRC/$S/$d ] && [ -n "$(ls $WSRC/$S/$d | grep -m1 '\.sfc$')" ] && { W=$WSRC/$S/$d; src="fixed $d"; [ -s $WSRC/$S/wrapcheck.tsv ] && wc=$WSRC/$S/wrapcheck.tsv; [ -s $WSRC/$S/axis.json ] && ax=$WSRC/$S/axis.json; break; }; done; fi
+# STRIP=1: the scroll's single spiral surface (strip.sfc beside strip_json; its wraps = strip.tsv column ranges) instead of per-wrap files
+if [ "${STRIP:-0}" = 1 ]; then W=$(dirname "$sj")/strip.sfc; src=strip; [ -s "$W" ] || { echo "surflabels: STRIP=1 but no $W" >&2; exit 2; }; fi
 trim=()
 if [ -n "${TRIM_S:-}" ]; then trim=(--first ${TRIM_S%,*} --last ${TRIM_S#*,})   # (env first: fixed surfaces have their own trim)
 elif [ -s "$sj" ]; then read -r a b <<< "$(jq -r '.wraps | "\(min) \(max)"' $sj)"; trim=(--first $a --last $b); fi
