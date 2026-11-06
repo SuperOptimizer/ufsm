@@ -84,6 +84,80 @@ The current-pipeline baseline is scored on GT voxels covered by our spiral, abou
 - **CT intensity peaks are useless for counting:** they pick up fibre layers and overcount 60–100% of gaps.
 - **The greedy pruning and median-sweep solve are fragile.** Which group of patches becomes the largest graph component can flip, as in psolve3 on C3.
 
+## C port: `ufsm patch-solve` (src/patchsolve.c, 2026-11-06)
+
+`ufsm patch-solve --paths BOX/paths --prob BOX/prob.raw --gt BOX/gt.raw --box Z,Y,X,512,512,512 --axis AXIS --axis-scale 0.25 --sgn -1`
+does psolve4 end to end in C (ridge computed internally, 0.3 s per box on the desk) and solves with the exact L1 solver (`l1pot`).
+Test: `tests/test_patchsolve.c` (concentric sheets, one untraced sheet that must be counted).
+
+- **Parity:** identical graph to psolve4 (C2 79 nodes / 1012 edges / agreement .896; C3 87 / 981 / .917; C7 65 / 799).
+- **Scores (right sheet + turn):** C7 .997, C3 .92 (psolve4 .89), C2 .52 (psolve4 .71). The exact solve reaches a far lower energy on C2
+  (violated weight .065 vs .141). psolve4's .71 was a lucky local minimum (its rounds jump .55 -> .69), so the C2 votes themselves are wrong.
+- **Oracle (`--oracle 1`, GT turn differences as edge values):** C2 .912 and C3 .950, which equal the purity ceilings. The solver
+  and the patches are fine; the whole gap is gap counts (23.5% of C2's edge weight is wrong, 12% of C3's).
+- **Vote models tried (`--votes pair|ray`, `--counter ridge|prob|pitch|maxrp`, lists allowed):**
+  - Every variant leaves C2 at .52-.56.
+  - `ray` votes give C3 .93; `maxrp` (max of the ridge count and dr / box pitch) gives C2 .71 but breaks C7 (.50).
+  - Defaults stay pair + ridge,prob.
+- **Why (`--cross-tsv` dump):** in C2, 29% of GT gap-2 crossings and 39% of GT gap-3 crossings are counted one short. The miscounted
+  gap-2 crossings have the same dr (8-16 voxels) as true gap-1 crossings, so no counter built on the current detector can fix them.
+  Same-sheet duplicate traces also always vote d >= 1 (C7: 646 crossings at dr ~4); they are a small effect.
+- **Conclusion:** step 4 below (a detector that separates touching sheets) is the blocker. Step 2 is done and gives no gain on C2.
+
+## Own tracer: `ufsm sheet-trace` (src/sheettrace.c, 2026-11-06)
+
+VC3D cannot run at corpus scale: its CUDA path is commented out (`GrowPatch.cpp`), so each grower is CPU Ceres at about 0.25 mm²/s.
+On C7 with 256 seeds it reached recall .57 / purity .98 in 36 min.
+
+`sheet-trace` builds a column grid, (z, u) every `--step` voxels, with rays from the axis or parallel to a fixed direction. Prob peaks
+along each ray (≥ `--thr`, sub-voxel) become height fields r(u, z). A step to a neighbouring column is taken only when exactly one peak
+lies within `--tol` of the extrapolated r. On C7 it reaches the same recall at purity .995 in about 1 s per 512³ box.
+
+- **`--tile T`** writes each patch as T×T-cell tiles. **links.tsv** records the same-sheet links: seams between tiles of one patch
+  (0.5% wrong on C7, 9% on C3) and contacts. Contacts are 45–58% wrong, from weak leftover patches, so `patch-solve` uses seams only.
+  `patch-solve --cut 0 --links links.tsv --frame frame.txt` then cuts staircase patches (sheet switches through merges) where the gap votes
+  disagree.
+- **`--dir auto`** picks the ray frame from the structure tensor: parallel rays along the dominant normal when the radial alignment is < .7,
+  the coherence is ≥ .5 and the axis is outside the box. Crushed scrolls need it, because radial rays run along their sheets: 0125's traced
+  share went .40 → .98, 0009B .42 → .98, Paris 4 .88 → .97.
+- **`--regions R`** gives an R×R xy grid of regions, each with its own frame (folds). A shared 2-voxel cell grid stops duplicates, and
+  rseam links join regions. It is neutral on the GT boxes and gave 0191 .69 → .76.
+- **`--extra CODES`** adds second sheet evidence, e.g. an older spiral raster. Its peaks join the columns where m7 has none within
+  `--extra-sep` voxels; `--extra-gap` g > 0 limits them to gaps ≥ g × the column pitch.
+  - Paris 4 HOLD, with our c2f surfaces: recall .70 → .79, solve .53 → .88, effective .37 → .70.
+  - 1667, whose old spiral has false sheets: C7 solve .93 → .34.
+  - The GT-free violated share rises in both cases, so it cannot be chosen automatically. It is off by default; use it only with an extra
+    source known to be good.
+- **`--nms R`** (default 5 voxels): along each ray, keep only the strongest peak within ±R. m7 often peaks on both faces of one sheet
+  (HOLD: about 20k same-sheet crossings at Δr ≈ 7).
+  - On 0139, recall rises on every box: 139-1 .36 → .42, 139-5 .748 → .756.
+  - On 1667 and HOLD it is neutral to slightly positive. R = 3 is worse on C3.
+- **Recall is saturated against m7:** lower thresholds, smaller tiles or step 1 move recall by ≤ .015, and over 99% of peaks are owned.
+  The remaining misses are detector misses.
+- **`--jpg`** writes a QA image: the mid-z prob with traced peaks coloured by tile; red = untraced. `ufsm raw2jpg` draws any slice.
+
+**GT boxes** (`scripts/v3/ev_box.sh`; effective = recall × solve accuracy):
+
+| box | recall | tile purity | solve | effective | VC3D-cut effective |
+|---|---|---|---|---|---|
+| C7 | .57 | .997 | .93 | .54 | .23 |
+| C3 | .54 | .96 | .77 (.50 on another run) | .42 | .21 |
+| C2 | .44 | .96 | .56 | .25 | .10 |
+| HOLD (P4) | .70 | .988 | .53 | .37 | – |
+| 139-5 | .64 | .997 | .71 | .46 | – |
+| 139-1 (48% packed) | .34 | .96 | .27 | .09 | – |
+
+The solve is the limit, not the tracer. With GT edge values (`--oracle 1`) HOLD reaches .97 and C3 .94, but the gap counts are wrong
+where m7 misses or merges sheets. The single-gauge score is unstable: C3 gives .77 or .50 on near-identical traces.
+
+**Corpus** (`scripts/v3/corpus_trace.sh`: one 512³ box per scroll at half the papyrus extent, m7 prob from the mirror; GT-free QA
+in `/mnt/scratch/v2/trace/corpus/summary.tsv`; `corpus_cmp.sh` compares runs):
+- 31 of 33 scrolls traced in 6–15 s per box. Paris 3 has no m7 prediction; 0175B's m7 is empty at the box.
+- Traced share and vote agreement are both > .9 on 0009B, 0125, 0139, 0211, 0257, 0306B, 0483A, 0800, 0813, 0841, 1218, 1447, 1451,
+  1545, 1667 and Paris 4.
+- Weak: 0268 (.56), 0826 (.65), 0358 (.65). Their m7 prediction has no coherent sheets there (QA image), so the detector is the problem,
+  not the tracer.
+
 ## Next steps (P4 of the plan)
 
 1. **Port the solver to C** as `src/patchsolve.c` (`ufsm patch-solve`), with a test.
