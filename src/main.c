@@ -59,6 +59,11 @@ int cmd_surf_stats(int argc, char **argv);
 int cmd_wrap_snap(int argc, char **argv);   /* src/wrapsnap.c */
 int cmd_surf_labels(int argc, char **argv);   /* src/surflabels.c */
 int cmd_sheet_score(int argc, char **argv);   /* src/sheetscore.c */
+int cmd_patch_solve(int argc, char **argv);   /* src/patchsolve.c */
+int cmd_trace_prep(int argc, char **argv);    /* src/tracebox.c */
+int cmd_patch_score(int argc, char **argv);   /* src/tracebox.c */
+int cmd_sheet_trace(int argc, char **argv);   /* src/sheettrace.c */
+int cmd_raw2jpg(int argc, char **argv);       /* src/tracebox.c */
 int cmd_side_face(int argc, char **argv);   /* src/sideface.c */
 int cmd_side_gate(int argc, char **argv);   /* src/sidegate.c */
 int cmd_patch_id(int argc, char **argv);   /* src/patchid.c */
@@ -205,6 +210,11 @@ static int usage(void) {
         "  ufsm wrap-check <model> <fields-dir> [--ct ROOT KEY --ct-um U] [--codes ROOT KEY]   duplicate / merged wraps: CT peaks between adjacent wraps along radial rays\n"
         "  ufsm surf-snap <wraps-in> <wraps-out> --volume ROOT KEY --vol-um U   tifxyz vertices onto the nearest papyrus ridge\n"
         "  ufsm wrap-snap <wraps-in> <wraps-out> --axis F --axis-um U0 --ct ROOT KEY --ct-um U   .sfc wraps moved along their rays onto the sheets (smooth, order-kept)\n"
+        "  ufsm trace-prep --prob P --box Z0,Y0,X0,NZ,NY,NX --axis A --out DIR [--field ridge|prob] [--seeds 64]   tracer box input: radial ridge as an OME zarr v2 pyramid + seeds\n"
+        "  ufsm raw2jpg IN.raw W H OUT.jpg [--mark Y,X]..   a uint8 raw slice as a grey JPEG (QA)\n"
+        "  ufsm sheet-trace --prob P --box Z0,Y0,X0,NZ,NY,NX --axis A --out DIR [--tol 2] [--step 2]   fast sheet patch tracer: radial peaks linked as height fields r(theta, z)\n"
+        "  ufsm patch-score --paths DIR --gt G --box Z0,Y0,X0,NZ,NY,NX --axis A [--sgn S]   traced patches vs GT codes: sheet recall, precision, purity\n"
+        "  ufsm patch-solve --paths DIR --prob P --box Z0,Y0,X0,NZ,NY,NX --axis A [--gt G] ..   global turn numbers of traced sheet patches (ray gap votes, exact L1)\n"
         "  ufsm sheet-score <ours-root> <ours-key> <gt-root> <gt-key> [--tol 1] [--prec-r 8] [--cell 64] [--box ..]   sheet recall / precision / local + global turn consistency of winding code rasters\n"
         "  ufsm surf-labels <wraps-dir|strip.sfc> <out-dir> --axis F --axis-um U0 --dir +-1 --grid-um U --like ROOT KEY   winding codes + pair phase + ignore from .sfc wraps\n"
         "  ufsm wrap-anchor <wraps-dir> <anchor-file> --gt ROOT KEY [surf-labels flags]   per-cell winding offsets of our wraps from published-segment codes (surf-labels --anchor)\n"
@@ -4623,6 +4633,11 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "wrap-snap")) return cmd_wrap_snap(argc, argv);
     if (!strcmp(cmd, "surf-labels") || !strcmp(cmd, "wrap-anchor")) return cmd_surf_labels(argc, argv);
     if (!strcmp(cmd, "sheet-score")) return cmd_sheet_score(argc, argv);
+    if (!strcmp(cmd, "patch-solve")) return cmd_patch_solve(argc, argv);
+    if (!strcmp(cmd, "trace-prep")) return cmd_trace_prep(argc, argv);
+    if (!strcmp(cmd, "patch-score")) return cmd_patch_score(argc, argv);
+    if (!strcmp(cmd, "sheet-trace")) return cmd_sheet_trace(argc, argv);
+    if (!strcmp(cmd, "raw2jpg")) return cmd_raw2jpg(argc, argv);
     if (!strcmp(cmd, "side-face")) return cmd_side_face(argc, argv);
     if (!strcmp(cmd, "side-gate")) return cmd_side_gate(argc, argv);
     if (!strcmp(cmd, "surf-labels")) return cmd_surf_labels(argc, argv);
