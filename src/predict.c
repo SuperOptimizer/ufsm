@@ -32,6 +32,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+void nn_lat_pred_input(const uint8_t *ct, int D, int W, float mean, float isd, const float *dyo, const float *dxo, int axis, void *y);   /* (nn_lat.cu) */
 void nn_lat_place_rv(const void *lg, int lh16, int d, int h, int w, const uint8_t *ct, const uint32_t *bits, int iso, int hz, int halo, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh);   /* (nn_lat.cu) */
 static void pred_axis(unet *u, int valid, int D, const float *dy, const float *dx);
 
@@ -1187,7 +1188,7 @@ int cmd_predict(int argc, char **argv) {
     const int Dl = split ? W / 2 + H0 : Wz;   /* planes per GPU */
     shape5 xs = {1, !half && (cfg.cin == 5 || cfg.cin == 7) ? cfg.cin : 4, Dl, W, W};   /* (7: a train --cond net, its condition inputs zero here) */
     const shape5 xn = half ? (shape5){1, cfg.cin, W / hdiv, W / hdiv, W / hdiv} : xs;   /* the network's input */
-    void *x2 = nullptr, *lrt = nullptr; float *lgf = nullptr;   /* half: the network's input, the intermediate grid (div 4), the full-resolution logits */
+    int latin = 0; void *x2 = nullptr, *lrt = nullptr; float *lgf = nullptr;   /* half: the network's input, the intermediate grid (div 4), the full-resolution logits */
     /* the 16-bit input in the network's shared a1 scratch when it has one (free until the stem conv, after the input conversion) */
     unet_build(u, xn, 0);
     const int ct_stem = unet_ct_stem(u);   /* unet_forward_ct: no 16-bit input */
@@ -1221,9 +1222,12 @@ int cmd_predict(int argc, char **argv) {
         ctmi = ct_shared && iso > 1 ? nn_malloc((w3 + 31) / 32 * 4) : ctm;   /* --iso: the outputs' own mask (the fit keeps ctm) */
         xd = ct_stem || half || auxz || cfg.cin == 7 ? nullptr : h16 && !sheet_task ? unet_input_scratch(u, 4 * w3 * 2) : nullptr;
         xd_shared = xd != nullptr;
-        if (!xd && !ct_stem) xd = nn_malloc((size_t)xs.c * w3 * (h16 ? 2 : 4));
+        /* a latent-grid net's input goes from the CT bytes straight to the cell grid (nn_lat_pred_input): no full-resolution 4-channel
+           window (8 bytes a voxel) or half-resolution intermediate (UFSM_PRED_LAT_INPUT=0: nn_pred_input_d + nn_lowres_input) */
+        latin = half && hdiv == 4 && hmode == 1 && xs.c == 4 && cfg.cin == 4 && h16 && !auxz && !sheet_task && (!getenv("UFSM_PRED_LAT_INPUT") || ufsm_env_on("UFSM_PRED_LAT_INPUT"));
+        if (!xd && !ct_stem && !latin) xd = nn_malloc((size_t)xs.c * w3 * (h16 ? 2 : 4));
         if (auxz) { auxd = nn_malloc(w3); auxh = malloc(w3); }
-        if (half) { x2 = nn_malloc(shape_numel(xn) * (h16 ? 2 : 4)); if (hdiv > 2) lrt = nn_malloc(w3 / 8 * 16); }   /* (lgf: at its first use; the direct latent rv path has none) */
+        if (half) { x2 = nn_malloc(shape_numel(xn) * (h16 ? 2 : 4)); if (hdiv > 2 && !latin) lrt = nn_malloc(w3 / 8 * 16); }   /* (lgf, and lrt with the direct latent input: at their first use; the direct latent rv path has none) */
         if (ct_stem) fprintf(stderr, "predict: in-place slab inference from the CT window (%.1f B per window voxel)\n", (double)unet_activation_bytes(u) / w3);
         if (tta > 1 && (!ct_stem || !ct_shared || degrade || auxz || cfg.cin != 4)) { fprintf(stderr, "predict: --tta needs the CT-stem device path (no --aug-*, --aux, extra inputs)\n"); return 2; }
     }
@@ -1599,7 +1603,7 @@ int cmd_predict(int argc, char **argv) {
             nn_h2d(dyd, dyo, 2 * (size_t)W * sizeof(float));
             if (pprof) { nn_sync(); p_h2d += now() - pt; pt = now(); }
             if ((xd_shared && unet_input_scratch(u, 4 * w3 * 2) != xd) || (ct_shared && unet_input_scratch2(u, w3) != ctd)) { fprintf(stderr, "predict: the network was rebuilt under its input scratch\n"); return 1; }
-            if (!ct_stem) nn_pred_input_d(ctd, Wz, W, (float)mean, (float)(1.0 / sd), dyd, dxd, ax.n > 0 ? (int)radial_sign : 0, xd, h16);
+            if (!ct_stem && !latin) nn_pred_input_d(ctd, Wz, W, (float)mean, (float)(1.0 / sd), dyd, dxd, ax.n > 0 ? (int)radial_sign : 0, xd, h16);
             nn_ptick("input build");
             if (cfg.cin == 7 && !half) nn_zero((char *)xd + 4 * w3 * (h16 ? 2 : 4), 3 * w3 * (h16 ? 2 : 4));   /* no condition: inputs 4-6 zero */
             if (auxz) {   /* the fifth channel: the aux volume over this window (level coordinates as the CT; outside 0) */
@@ -1640,13 +1644,16 @@ int cmd_predict(int argc, char **argv) {
             const float *l2d = nullptr;
             if (ldir) {
                 nn_ptick("other");
-                nn_lowres_input(xd, xs, hdiv, hmode, lrt, x2, h16); nn_ptick("input pool");
+                if (latin) nn_lat_pred_input(ctd, Wz, W, (float)mean, (float)(1.0 / sd), dyd, dxd, ax.n > 0 ? (int)radial_sign : 0, x2); else nn_lowres_input(xd, xs, hdiv, hmode, lrt, x2, h16);
+                nn_ptick("input pool");
                 l2d = unet_forward_x(u, x2, xn, 0, h16); nn_ptick("trunk forward");
                 lg = nullptr;
             } else if (half) {   /* the network on blocks of the window: its input from the 4-channel window, its logits back to full resolution */
                 nn_ptick("other");
                 if (!lgf) lgf = nn_malloc(w3 * 4 * (rvfuse ? 2 : 1));
-                nn_lowres_input(xd, xs, hdiv, hmode, lrt, x2, h16); nn_ptick("input pool");
+                if (hdiv > 2 && !lrt) lrt = nn_malloc(w3 / 8 * 16);
+                if (latin) nn_lat_pred_input(ctd, Wz, W, (float)mean, (float)(1.0 / sd), dyd, dxd, ax.n > 0 ? (int)radial_sign : 0, x2); else nn_lowres_input(xd, xs, hdiv, hmode, lrt, x2, h16);
+                nn_ptick("input pool");
                 const float *l2 = unet_forward_x(u, x2, xn, 0, h16); nn_ptick("trunk forward");
                 nn_lowres_output(l2, unet_logits_h16(u), (shape5){1, rvfuse ? 2 : 1, W / hdiv, W / hdiv, W / hdiv}, hdiv, hmode, (float *)lrt, lgf);   /* (--channel rv on a latent-grid net: both side logits) */
                 lg = lgf; nn_ptick("upsample");

@@ -247,6 +247,39 @@ extern "C" void nn_lat_place_rv(const void *lg, int lh16, int d, int h, int w, c
     KCHECK();
 }
 
+/* predict on a latent-grid net: the network's input (4 channels on the cell grid, 16-bit storage) straight from the uint8 CT window:
+   per cell the 4^3 voxel values of pred_in_k (rounded to the storage type as it stores them), averaged over 2^3 twice as
+   nn_lowres_input does (each mean rounded to the storage type, the same summation order): the same values without the window's
+   4-channel 16-bit input (8 bytes a voxel) and its half-resolution intermediate (1 byte a voxel) */
+template <typename HT>
+__global__ void lat_pred_in_k(const uint8_t *ct, int D, int W, float mean, float isd, const float *dyo, const float *dxo, int axis, HT *y) {
+    const int d = D / 4, h = W / 4;
+    const size_t cv = (size_t)d * h * h, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= cv) return;
+    const int cz = (int)(i / ((size_t)h * h)), cy = (int)(i / h % h), cx = (int)(i % h);
+    float o[3] = {0.f, 0.f, 0.f};   /* channels 0, 2, 3 (1 is zero) */
+#pragma unroll
+    for (int k2 = 0; k2 < 8; k2++) {   /* the half-resolution voxels of the cell, (z, y, x) bits as half_in_k */
+        float s[3] = {0.f, 0.f, 0.f};
+#pragma unroll
+        for (int k = 0; k < 8; k++) {
+            const int z = 4 * cz + 2 * (k2 >> 2) + (k >> 2), yy = 4 * cy + 2 * (k2 >> 1 & 1) + (k >> 1 & 1), xx = 4 * cx + 2 * (k2 & 1) + (k & 1);
+            const float dy = dyo[z] + (float)yy, dx = dxo[z] + (float)xx, inv = axis ? (float)axis / (sqrtf(dy * dy + dx * dx) + 1e-6f) : 0.f;
+            s[0] += h2f<HT>(f2h<HT>(((float)ct[((size_t)z * W + yy) * W + xx] - mean) * isd));
+            s[1] += h2f<HT>(f2h<HT>(dy * inv)); s[2] += h2f<HT>(f2h<HT>(dx * inv));
+        }
+#pragma unroll
+        for (int c = 0; c < 3; c++) o[c] += h2f<HT>(f2h<HT>(0.125f * s[c]));
+    }
+    y[i] = f2h<HT>(0.125f * o[0]); y[cv + i] = f2h<HT>(0.f); y[2 * cv + i] = f2h<HT>(0.125f * o[1]); y[3 * cv + i] = f2h<HT>(0.125f * o[2]);
+}
+extern "C" void nn_lat_pred_input(const uint8_t *ct, int D, int W, float mean, float isd, const float *dyo, const float *dxo, int axis, void *y) {
+    const size_t cv = (size_t)(D / 4) * (W / 4) * (W / 4);
+    if (g_h16) lat_pred_in_k<f16><<<nblk(cv, 128), 128>>>(ct, D, W, mean, isd, dyo, dxo, axis, (f16 *)y);
+    else lat_pred_in_k<bf16><<<nblk(cv, 128), 128>>>(ct, D, W, mean, isd, dyo, dxo, axis, (bf16 *)y);
+    KCHECK();
+}
+
 static int g_lat_slow = -1;   /* UFSM_LAT_SLOW=1 / nn_lat_set_slow: the per-voxel kernels for every slab (A/B, train's UFSM_LAT_CHECK) */
 static int lat_slow(void) { if (g_lat_slow < 0) { const char *e = getenv("UFSM_LAT_SLOW"); g_lat_slow = e && *e == '1'; } return g_lat_slow; }
 extern "C" int nn_lat_set_slow(int on) { const int was = lat_slow(); g_lat_slow = on; return was; }
