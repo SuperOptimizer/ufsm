@@ -986,6 +986,13 @@ int z3_read_sub_dev(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out,
 int z3_read_sub_dev_lean(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads, uint32_t submask, uint8_t *dchunk, uint32_t *dev_mask) {
     return z3_read_sub_dev_impl(z, o, n, out, nthreads, submask, dchunk, dev_mask, 1);
 }
+/* the fill value over the part of the read box o + n that the array box b0 .. b1 (exclusive) covers (one byte per voxel) */
+static void fill_part(const z3_meta *m, uint8_t *out, const int64_t o[3], const int64_t n[3], const int64_t b0[3], const int64_t b1[3]) {
+    int64_t lo[3], hi[3];
+    for (int i = 0; i < 3; i++) { lo[i] = b0[i] > o[i] ? b0[i] : o[i]; hi[i] = b1[i] < o[i] + n[i] ? b1[i] : o[i] + n[i]; if (hi[i] <= lo[i]) return; }
+    for (int64_t zz = lo[0]; zz < hi[0]; zz++) for (int64_t yy = lo[1]; yy < hi[1]; yy++)
+        memset(out + ((size_t)(zz - o[0]) * n[1] + (size_t)(yy - o[1])) * n[2] + (size_t)(lo[2] - o[2]), m->fill, (size_t)(hi[2] - lo[2]));
+}
 static int z3_read_impl(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads, uint32_t submask, uint8_t *dsink, uint32_t *dmask, int lean) {
     const z3_meta *m = &z->m;
     const size_t nv = (size_t)n[0] * n[1] * n[2];
@@ -1018,7 +1025,11 @@ static int z3_read_impl(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *
                 if (m->sharded) {
                     present = load_index(z, skey, idx);
                     if (present < 0) { rc = -1; break; }
-                    if (!present) { if (inside) { z3_fill(m, out, nv, nthreads); inside = 0; } continue; }   /* (a missing shard: filled) */
+                    if (!present) {   /* (a missing shard: filled; inside a sharded array of bytes only its part, else all once) */
+                        if (inside && m->esize == 1) { const int64_t b0[3] = {sz * m->shard[0], sy * m->shard[1], sx * m->shard[2]}, b1[3] = {b0[0] + m->shard[0], b0[1] + m->shard[1], b0[2] + m->shard[2]}; fill_part(m, out, o, n, b0, b1); }
+                        else if (inside) { z3_fill(m, out, nv, nthreads); inside = 0; }
+                        continue;
+                    }
                 }
                 /* inner chunk range within this shard that intersects the box */
                 int c0[3], c1[3];
@@ -1050,7 +1061,14 @@ static int z3_read_impl(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *
             }
     free(idx);
     if (rc) { free(items); return -1; }
-    if (inside) for (int i = 0; i < nitems; i++) if (!items[i].present) { z3_fill(m, out, nv, nthreads); inside = 0; break; }   /* (an absent chunk: filled) */
+    if (inside && m->esize == 1) {   /* (an absent chunk: its part filled, the present ones are copied over theirs: the sparse stored phases hold many) */
+        for (int i = 0; i < nitems; i++) if (!items[i].present) {
+            const work *w = &items[i];
+            const int64_t b0[3] = {w->sz * m->shard[0] + (int64_t)w->cz * m->chunk[0], w->sy * m->shard[1] + (int64_t)w->cy * m->chunk[1], w->sx * m->shard[2] + (int64_t)w->cx * m->chunk[2]};
+            const int64_t b1[3] = {b0[0] + m->chunk[0], b0[1] + m->chunk[1], b0[2] + m->chunk[2]};
+            fill_part(m, out, o, n, b0, b1);
+        }
+    } else if (inside) for (int i = 0; i < nitems; i++) if (!items[i].present) { z3_fill(m, out, nv, nthreads); inside = 0; break; }   /* (an absent chunk: filled) */
     range_work *ranges = nullptr; int nranges = 0;
     /* HTTP sharded reads go through range tasks: neighbouring cold chunks of one shard (file order, gap <= UFSM_Z3_GAP bytes,
        default 64 KiB; span <= UFSM_Z3_SPAN, default 2 MiB) become one request unless UFSM_Z3_COALESCE=0; with UFSM_HTTP_MULTI=1
