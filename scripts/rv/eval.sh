@@ -8,6 +8,7 @@
 # --shard SH 128, --occupancy 5), on the scan level the fields use; then recto-ruler with --src rv (peaks of the fused signal = recto-side
 # runs: one per sheet even where sheets touch) and --src rvr (the same volume, hit = run, --thr 160).
 # Out: $E/<TAG>/<scroll>/{pred,ruler.log}; summary $E/<TAG>.txt. Prediction zarrs are deleted after the ruler unless KEEP=1.
+# WZ="" for latent-grid checkpoints (train --lat 4: cubic windows only), WINDOW (640).
 # Env: U (rv binary), RU (ruler binary: RECTO's src2), GPU (1), LOCK, E (/vesuvius/ufsm/v2/rv/eval), TH (16), WIN (640/64, z 192/64).
 set -u
 CK=$1; T=$2; SC=${3:-p1667 p139 p4}
@@ -36,7 +37,7 @@ for S in $SC; do
     for r in $rows; do
       L=(); [ -n "$LOCK" ] && L=(flock $LOCK)
       CUDA_VISIBLE_DEVICES=$GPU "${L[@]}" nice -n 5 $U predict $CK $CTR $CK_ $D/pred --um $U0 --level $LV --box $((r * SH)),$oy,$ox,$SH,$((my * h)),$((mx * h)) \
-        --full-grid 1 --resume 1 --shard $SH --window 640 --halo 64 --window-z $((SH + 64)) --halo-z 32 --levels 1 --channel rv \
+        --full-grid 1 --resume 1 --shard $SH --window ${WINDOW:-640} --halo 64 ${WZ---window-z $((SH + 64)) --halo-z 32} --levels 1 --channel rv \
         --threads $TH --gpu 0 --q 0 >> $D/pred.log 2>&1 || { echo "$S: predict row $r failed (see $D/pred.log)" | tee -a $E/$T.txt; continue 2; }
     done
     echo "$S: predicted $(echo $rows | wc -w) shard rows of $SH in $(( $(date +%s) - t0 )) s" | tee -a $E/$T.txt; touch $D/pred.done

@@ -887,7 +887,7 @@ int cmd_predict(int argc, char **argv) {
     if (*opt(argc, argv, "--papyrus-cut", "") && !(pap && pap_cond)) { fprintf(stderr, "predict: --papyrus-cut needs a cutoff-conditioned papyrus checkpoint\n"); return 2; }
     char content[96]; if (pap && pcut >= 0) snprintf(content, sizeof content, "papyrus probability at cutoff %g", pcut); else snprintf(content, sizeof content, "%s probability", pap ? "papyrus" : "recto");
     if (!strcmp(chs, "ink")) snprintf(content, sizeof content, "ink probability (unwrap2 channel %d)", out_ch);
-    if (rvfuse) { if (half || hmode == 2) { fprintf(stderr, "predict: --channel rv: full-resolution checkpoints only\n"); return 2; }
+    if (rvfuse) { if ((half && half != 3) || hmode == 2) { fprintf(stderr, "predict: --channel rv: full-resolution or latent-grid (train --lat 4) checkpoints only\n"); return 2; }
                   snprintf(content, sizeof content, "recto / verso side: 1 + 254 (1 + p_recto - p_verso) / 2 (0: CT 0)"); }
     const char *gn_stats = opt(argc, argv, "--gn-stats", embedded && runtime.gn_stored ? "stored" : "legacy");
     if (strcmp(gn_stats, "stored") && strcmp(gn_stats, "legacy")) { fprintf(stderr, "--gn-stats must be stored or legacy\n"); return 2; }
@@ -1206,7 +1206,7 @@ int cmd_predict(int argc, char **argv) {
         xd_shared = xd != nullptr;
         if (!xd && !ct_stem) xd = nn_malloc((size_t)xs.c * w3 * (h16 ? 2 : 4));
         if (auxz) { auxd = nn_malloc(w3); auxh = malloc(w3); }
-        if (half) { x2 = nn_malloc(shape_numel(xn) * (h16 ? 2 : 4)); lgf = nn_malloc(w3 * 4); if (hdiv > 2) lrt = nn_malloc(w3 / 8 * 16); }
+        if (half) { x2 = nn_malloc(shape_numel(xn) * (h16 ? 2 : 4)); lgf = nn_malloc(w3 * 4 * (rvfuse ? 2 : 1)); if (hdiv > 2) lrt = nn_malloc(w3 / 8 * 16); }
         if (ct_stem) fprintf(stderr, "predict: in-place slab inference from the CT window (%.1f B per window voxel)\n", (double)unet_activation_bytes(u) / w3);
         if (tta > 1 && (!ct_stem || !ct_shared || degrade || auxz || cfg.cin != 4)) { fprintf(stderr, "predict: --tta needs the CT-stem device path (no --aug-*, --aux, extra inputs)\n"); return 2; }
     }
@@ -1617,11 +1617,11 @@ int cmd_predict(int argc, char **argv) {
             if (half) {   /* the network on blocks of the window: its input from the 4-channel window, its logits back to full resolution */
                 nn_lowres_input(xd, xs, hdiv, hmode, lrt, x2, h16);
                 const float *l2 = unet_forward_x(u, x2, xn, 0, h16);
-                nn_lowres_output(l2, unet_logits_h16(u), (shape5){1, 1, W / hdiv, W / hdiv, W / hdiv}, hdiv, hmode, (float *)lrt, lgf);
+                nn_lowres_output(l2, unet_logits_h16(u), (shape5){1, rvfuse ? 2 : 1, W / hdiv, W / hdiv, W / hdiv}, hdiv, hmode, (float *)lrt, lgf);   /* (--channel rv on a latent-grid net: both side logits) */
                 lg = lgf;
             } else lg = ct_stem ? unet_forward_ct(u, ctd, (float)mean, (float)(1.0 / sd), dyd, dxd, ax.n > 0 ? (int)radial_sign : 0, xs, h16)
                                 : unet_forward_x(u, xd, xs, 0, h16);
-            if (rvfuse) nn_rv_fuse((void *)lg, w3, unet_logits_h16(u));
+            if (rvfuse) nn_rv_fuse((void *)lg, w3, !half && unet_logits_h16(u));
             pred_mem_out(u, o);
             if (ctpre && i + 1 < rd.ntiles && atomic_load(&rd.filled) > i + 1) {   /* the next window's CT during this forward (its slot stays held
                                                                                          until that window's statistics, as with the plain upload) */
