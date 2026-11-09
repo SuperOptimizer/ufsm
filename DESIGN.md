@@ -6,6 +6,15 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Host RAM of train --lat at large windows (2026-11-09)
+- Accounting: `UFSM_HOSTMEM=1` (a `hostmem:` line per log line: pinned by caller, slots, per worker `big` / `ttmp` / pool residency via
+  mincore, mallinfo2), `UFSM_TP_LOG=1` (worker 0's pool calls by line), `UFSM_BATCH_HASH=1` (per-plane batch hashes, with --det 1).
+- The lat recipe (unwrap2 --rv, --gpu-aug 2) was 7 B/vox per slot + 11 B/vox per worker (P960 W18 S6: 213 GB, the OOMs). Now 5 + 5:
+  tm / pm slot planes skipped (sample_cfg.slot_skip), the stored-phase block's 4 planes in dead worker scratch (ttmp, big + P^3,
+  big + 9 P^3) for unwarped / device-warped windows, the ink plane built in the slot. Batches byte-identical (30 --det batches).
+- A worker builds into a slot it claims, so at most S - 1 windows are built at once: W8 S3 is slot-bound (P640: 38% wait; W4 S5 0%).
+  Use S = W + 2. P960 W8 S10 ~81 GB, P1280 W4 S6 ~106 GB (model 1.2 GB + P^3 (5 W + 5 S)). Details: HOSTMEM_REPORT.md.
+
 ## Own dense embedding net (dino-train) and the dinovol port (2026-10-21/22)
 - `ufsm dinovol-embed` runs the scrollprize dinovol ViT (HF scrollprize/dinovol_8um_ps192_102126) in C/CUDA with embed_volume.py's
   lattice / blending / normalisation; `dinovol-read`, `dinovol-eval` (the sheet-identity check; `--codes` classifies misses by the winding

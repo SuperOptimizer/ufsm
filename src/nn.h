@@ -6,6 +6,7 @@
 /* boolean environment switch: set and not "0" (UFSM_X=0 means off) */
 static inline int ufsm_env_on(const char *n) { const char *e = getenv(n); return e && *e && strcmp(e, "0") != 0; }
 #include <stddef.h>
+#include <stdio.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -39,6 +40,8 @@ void *nn_managed_alloc(size_t bytes);    /* CUDA managed memory (may exceed the 
 void *nn_malloc_try(size_t bytes);       /* device memory, nullptr (no sticky error) when it does not fit */
 void *nn_host_alloc_try(size_t bytes);   /* the same, nullptr when the host cannot pin that much */
 void nn_host_free(void *p);
+size_t nn_host_bytes(void);            /* live pinned host bytes (nn_host_alloc*) */
+void nn_host_report(FILE *f);         /* the same by caller address */
 /* pipelined uploads: an async copy on a per-device copy stream (pinned source), events to order it against the compute stream */
 void nn_h2d_copy_stream(void *dst, const void *src, size_t bytes);
 void nn_d2h_copy_stream(void *dst, const void *src, size_t bytes);   /* device -> pinned host on the copy stream */
