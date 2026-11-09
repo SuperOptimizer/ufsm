@@ -881,7 +881,7 @@ int cmd_predict(int argc, char **argv) {
                           "of the box (--grid-origin anchored) and join them with scripts/unroll/fields_cat.sh\n");
           return 2;
       } }
-    if (ffd && (cfg.cout < 11 || half || sheet_task)) { fprintf(stderr, "predict: --fit-fields needs a task unwrap checkpoint (11+ outputs) at full resolution\n"); return 2; }
+    if (ffd && (cfg.cout < 11 || (half && half != 3) || sheet_task)) { fprintf(stderr, "predict: --fit-fields needs a task unwrap checkpoint (11+ outputs) at full resolution or on the latent grid (train --lat 4)\n"); return 2; }
     /* the head layout: task unwrap (recto 0, ink 1, phase 2-3, normal 4-9, density 10) or unwrap2 (phase 0-1, normal 2-7, density 8,
        winding mod 4 9-10: no recto; the winding mod 4 pooled into the relative planes dz dy dx dq over --fit-w4-d voxels) */
     const int ffu2 = ffd && checkpoint_unwrap_version(ckpt) == 2;
@@ -1216,7 +1216,7 @@ int cmd_predict(int argc, char **argv) {
         xd_shared = xd != nullptr;
         if (!xd && !ct_stem) xd = nn_malloc((size_t)xs.c * w3 * (h16 ? 2 : 4));
         if (auxz) { auxd = nn_malloc(w3); auxh = malloc(w3); }
-        if (half) { x2 = nn_malloc(shape_numel(xn) * (h16 ? 2 : 4)); lgf = nn_malloc(w3 * 4 * (rvfuse ? 2 : 1)); if (lat_store) { lz_h = nn_host_alloc(w3 / 64 * (lz_c + 1)); lz_d = nn_malloc(w3 / 64 * (lz_c + 1)); } if (hdiv > 2) lrt = nn_malloc(w3 / 8 * 16); }
+        if (half) { x2 = nn_malloc(shape_numel(xn) * (h16 ? 2 : 4)); lgf = nn_malloc(ffd ? w3 * 2 * cfg.cout : w3 * 4 * (rvfuse ? 2 : 1));   /* (fit fields from a latent-grid net: every head at full resolution, fp16) */ if (lat_store) { lz_h = nn_host_alloc(w3 / 64 * (lz_c + 1)); lz_d = nn_malloc(w3 / 64 * (lz_c + 1)); } if (hdiv > 2) lrt = nn_malloc(w3 / 8 * 16); }
         if (ct_stem) fprintf(stderr, "predict: in-place slab inference from the CT window (%.1f B per window voxel)\n", (double)unet_activation_bytes(u) / w3);
         if (tta > 1 && (!ct_stem || !ct_shared || degrade || auxz || cfg.cin != 4)) { fprintf(stderr, "predict: --tta needs the CT-stem device path (no --aug-*, --aux, extra inputs)\n"); return 2; }
     }
@@ -1642,7 +1642,8 @@ int cmd_predict(int argc, char **argv) {
                 if (latc) nn_lat_input_x(xd, W / 4, W / 4, W / 4, lbas, lgain, latc, lstep, x2);   /* the learned cell channels of a --lat-basis checkpoint */
                 else nn_lowres_input(xd, xs, hdiv, hmode, lrt, x2, h16);
                 const float *l2 = unet_forward_x(u, x2, xn, 0, h16);
-                nn_lowres_output(l2, unet_logits_h16(u), (shape5){1, rvfuse ? 2 : 1, W / hdiv, W / hdiv, W / hdiv}, hdiv, hmode, (float *)lrt, lgf);   /* (--channel rv on a latent-grid net: both side logits) */
+                if (ffd) nn_lat_up_slab(l2, unet_logits_h16(u), cfg.cout, W / 4, W / 4, W / 4, 0, W, lgf);   /* [cout][W][W][W] fp16: the accumulators' layout */
+                else nn_lowres_output(l2, unet_logits_h16(u), (shape5){1, rvfuse ? 2 : 1, W / hdiv, W / hdiv, W / hdiv}, hdiv, hmode, (float *)lrt, lgf);   /* (--channel rv on a latent-grid net: both side logits) */
                 lg = lgf;
             } else lg = ct_stem ? unet_forward_ct(u, ctd, (float)mean, (float)(1.0 / sd), dyd, dxd, ax.n > 0 ? (int)radial_sign : 0, xs, h16)
                                 : unet_forward_x(u, xd, xs, 0, h16);
@@ -1653,7 +1654,7 @@ int cmd_predict(int argc, char **argv) {
                 if (pre_i >= 0) nn_stream_wait(1, ev_preu);   /* (the previous prefetch's device copy has read ctpre) */
                 nn_h2d_copy_stream(ctpre, rd.buf[(i + 1) % NSLOT], w3); nn_event_record(ev_pre, 1); pre_i = i + 1;
             }
-            nn_set_logits_h16(!half && unet_logits_h16(u));   /* the readers of lg below */
+            nn_set_logits_h16(half ? ffd != nullptr : unet_logits_h16(u));   /* the readers of lg below */
             const uint8_t *ctk = ct_shared && ctcp ? ctcp : ctd; (void)ctk;   /* --fit-ct: the CT window as it was before the forward */
             { static int memi = -1; if (memi < 0) memi = ufsm_env_on("UFSM_PRED_MEMINFO"); if (memi == 1) { nn_sync(); fprintf(stderr, "\npredict: GPU free after the first window %.2f GB\n", nn_mem_free() / 1e9); memi = 2; } }
             if (gn_save) unet_gn_accumulate(u);
