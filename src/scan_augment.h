@@ -76,7 +76,7 @@ unsigned scan_aug_plan(const scan_aug_cfg *c, uint64_t seed, uint8_t *ctu, uint8
 void scan_aug_exec(const scan_plan *p, uint8_t *ctu, void *scratch);   /* scratch: 5 P^3 bytes */
 /* the output's air (0) set of a plan on its shifted input bytes: air[k] = 1 where the output will be 0 */
 void scan_plan_air(const scan_plan *p, const uint8_t *ctu, uint8_t *air);
-void scan_plan_notair(const scan_plan *p, uint8_t *ctu);   /* the same negated, in place (ctu = 1 where the output is material) */
+void scan_plan_notair(const scan_plan *p, uint8_t *ctu, uint8_t *copy);   /* the same negated, in place (ctu = 1 where the output is material); copy (or nullptr): the bytes before, in the same pass */
 /* train --gpu-aug: what the device needs besides the window's bytes to build its CT channel (src/nn_aug.cu nn_aug_ct): the plan (when
    scan), write_x's intensity jitter with the device's own noise stream (the sampler still draws write_x's), the normalisation */
 typedef struct {

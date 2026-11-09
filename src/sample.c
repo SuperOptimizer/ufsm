@@ -2460,7 +2460,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
         uint8_t *dst = ttmp + (size_t)ch * p3;
         if (c->papyrus) { memset(dst, 0, p3); continue; }   /* task papyrus: labels from the CT below */
         if (c->ink_plane && ch == CH_SHEET) {   /* --ink-head: the source's "ink" target onto its own plane (prob254 as stored), not a channel */
-            memset(dst, 0, p3);
+            if (!tdead) memset(dst, 0, p3);   /* (w 0: tdead, unread) */
             if (!inkw) { fprintf(stderr, "sampler: no ink plane buffer\n"); return -1; }
             if (c->rv_iso > 0) {   /* --rv: papyrus (clean CT >= the cutoff) 254, void 0; unknown on CT 0 below (mask) */
                 const int it = s->iso > 0 ? s->iso : c->rv_iso;
@@ -2693,11 +2693,16 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
             const uint8_t v0 = d0[k], v1 = d1[k];
             ign[k] = (v0 == 255) | (v1 == 255); d0[k] = v0 == 255 ? 0 : (uint8_t)(v0 + (v0 >= 127)); d1[k] = v1 == 255 ? 0 : (uint8_t)(v1 + (v1 >= 127));
         }
-    } else memset(ign, 0, p3);
-    for (int ch = 0; ch < NCH && !(NCH == 2 && w[0] && w[1]); ch++) {
-        if (!w[ch]) continue;
-        uint8_t *dst = ttmp + (size_t)ch * p3;
-        for (size_t k = 0; k < p3; k++) { const uint8_t v = dst[k]; ign[k] |= v == 255; dst[k] = v == 255 ? 0 : (uint8_t)(v + (v >= 127)); }   /* (v * 255 + 127) / 254 for v < 255 */
+    } else {   /* the first channel with a target writes the mask, the others OR into it; none: zeros */
+        int first = 1;
+        for (int ch = 0; ch < NCH; ch++) {
+            if (!w[ch]) continue;
+            uint8_t *dst = ttmp + (size_t)ch * p3;
+            if (first) for (size_t k = 0; k < p3; k++) { const uint8_t v = dst[k]; ign[k] = v == 255; dst[k] = v == 255 ? 0 : (uint8_t)(v + (v >= 127)); }   /* (v * 255 + 127) / 254 for v < 255 */
+            else for (size_t k = 0; k < p3; k++) { const uint8_t v = dst[k]; ign[k] |= v == 255; dst[k] = v == 255 ? 0 : (uint8_t)(v + (v >= 127)); }
+            first = 0;
+        }
+        if (first) memset(ign, 0, p3);
     }
     float pap_t = 0;
     if (c->papyrus) {   /* task papyrus: channel 0 (probability x 255) and its ignore band from the clean CT, before the scanner augmentation */
@@ -2741,8 +2746,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
             const unsigned on = scan_aug_plan(&c->scan, rnext(r), ctu, ttmp, NCH, ign, P, o, cyz, cxz, s->ax.n > 0, m->chunk, !c->sheet && !c->band && !c->side, &grec->plan);
             grec->scan = on != 0;
             if (on) {
-                memcpy(b->ct8 + (size_t)i * p3, ctu, p3);
-                scan_plan_notair(&grec->plan, ctu);   /* (= !scan_plan_air: one pass, in place) */
+                scan_plan_notair(&grec->plan, ctu, b->ct8 + (size_t)i * p3);   /* (the bytes as read into ct8, then ctu = !scan_plan_air in place: one pass) */
             }
         } else if (scan_aug_apply(&c->scan, rnext(r), ctu, ttmp, NCH, ign, P, o, cyz, cxz, s->ax.n > 0, m->chunk, !c->sheet && !c->band && !c->side, big + p3)) {
             size_t nz2;   /* (integer sums: the same doubles as accumulating the bytes in double, exact below 2^53) */
