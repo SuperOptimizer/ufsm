@@ -215,7 +215,7 @@ Estimates from the model. S = W + 2. Set UFSM_STORE_NOCACHE=1 and keep THP off (
 | 960 | 10 / 12 | 90 GB | ~250-300 Mvox/s if 10 cores are free |
 | 1024 | 8 / 10 | 89 GB | ~200-240 |
 | 1152 | 6 / 8 | 99 GB | ~150-180 |
-| 1152 | 4 / 6, RT 2 | 74 GB | ~170-200 on 8 threads |
+| 1152 | 4 / 6, RT 2 | 72 GB | ~170-200 on 8 threads |
 | 1280 | 4 / 6, RT 2 | 98 GB | ~170-200 on 8 threads |
 | 1280 | 3 / 5, RT 3 | 79 GB | ~150-200 on 9 threads |
 

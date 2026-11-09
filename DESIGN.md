@@ -14,6 +14,10 @@ No teacher models, no distillation. All upstream data is re-exported once into t
   big + 9 P^3) for unwarped / device-warped windows, the ink plane built in the slot. Batches byte-identical (30 --det batches).
 - A worker builds into a slot it claims, so at most S - 1 windows are built at once: W8 S3 is slot-bound (P640: 38% wait; W4 S5 0%).
   Use S = W + 2. P960 W8 S10 ~81 GB, P1280 W4 S6 ~106 GB (model 1.2 GB + P^3 (5 W + 5 S)). Details: HOSTMEM_REPORT.md.
+- Round 2: UFSM_SAMPLER_ONLY (GPU-free loader benchmark), UFSM_SAMPLER_PROF=2 (thread CPU per stage), UFSM_SAMPLER_RT (threads per
+  window, byte-identical). Loader CPU -11% per window (fused / skipped P^3 passes; P512 --det: 5.92 -> 5.25 thread-s, cycles -9%); per
+  worker 4 B/vox (phase built in place). The loader is CPU / DRAM-bandwidth bound at ~25-30 Mvox/s per core (decode 25%, wind4 25%);
+  reads ~0.33 B/vox, 80% phase labels, page-cache hit ~0: UFSM_STORE_NOCACHE=1; THP madvise off with --gpu-aug 2 (compaction stalls).
 
 ## Own dense embedding net (dino-train) and the dinovol port (2026-10-21/22)
 - `ufsm dinovol-embed` runs the scrollprize dinovol ViT (HF scrollprize/dinovol_8um_ps192_102126) in C/CUDA with embed_volume.py's
