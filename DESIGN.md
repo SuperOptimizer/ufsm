@@ -6,6 +6,40 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Latent-grid networks and latcomp v1: train --lat 4, learned cell channels, latent stores (2026-11-09)
+- Why: at the production voxel net level 0 is ~86% of the activations (61.8 B per window voxel at P576). `train --lat 4` (task unwrap2 /
+  --rv; unet_cfg.half_res 3) runs the U-Net on the 4^3 cells of the window (widths 32,64,128,192,256, 5 levels); the losses stay at
+  full resolution: head_slab_pass upsamples the coarse logits one 32-plane slab at a time (nn_lat_up_slab: the pool4 chain of
+  nn_lowres_output, per axis a 3-tap filter of the cell grid; separable per-cell kernel since perf-20261109) and gathers each slab's
+  gradient back onto the cells (nn_lat_up_adj, the exact adjoint; tests/test_lat.c). The input is built on the device from the
+  augmented CT channel and the radial records (nn_input_lat: cell means).
+- Memory: label planes (phase, winding mod 4 + component, papyrus) live in pinned host memory and reach the device per head slab
+  (lab_stream: warped on the device as before, scratch = the input buffer, D2H; UFSM_LAT_STREAM=check: 0 of 8.7e9 slab bytes differ).
+  Device peak at P960: 10.2 -> 7.7 GB (one 5060 Ti; the voxel net fits P576). Host RAM is the limit above that (HOSTMEM_REPORT.md).
+  Two size limits of the scanner augmentation showed above P768: the Paganin x pass's shared memory (rows per block now follow 96 KB)
+  and the radial table (SA_MAXTAB 16 x SA_MAXP; SA_MAXP 1536).
+- Speed (perf-20261109, same batch, P768): the full-resolution slab work was 90% of a step (upsampling 605 ms of 1307); with the
+  separable upsampling and the two-stage adjoint a step is 602 ms (752 Mvox/s on the GPU side). The loader is the bottleneck:
+  ~60-78 Mvox/s per worker, and at most (slots - 1) windows are built at once (use --sampler-slots = --workers + 2).
+- latcomp v1, the learned cell channels (src/latfit.c, `train --lat-fit FILE`, `--lat-basis FILE --lat-c 13|29 --lat-step S
+  [--lat-step-jitter J]`): a cell's 64 z-scored CT values on an orthonormal basis fitted on real augmented training windows: row 0 the
+  cell mean, then the principal axes of the mean-removed cells. 24 windows of the rv recipe (778k cells): the mean carries 86% of the
+  voxel variance; of the rest 75% is in 3 axes, 96% in 13, 98.5% in 29. Coefficients are quantised with one step (orthonormal: the
+  rate-optimal allocation), |q| <= 127 (the mean: 16 bits), scaled by 1 / max(sigma, step) (the mean by 1/8) and fed with the 3 radial
+  cell means as C + 3 = 32 inputs (nn_input_latc in the trainer, nn_lat_input_x in predict: byte-identical, test_gpu_input). Rate /
+  distortion (zeroth-order entropy, z-scored CT): C 29 step 0.25: 0.89 bit per voxel, 23.9 dB; C 13 step 0.5: 0.47 bit, 20.5 dB. The
+  transform rides in the checkpoint header (lat_c / lat_step / lat_gain / lat_basis; UFSM_CHECKPOINT_HEADER 131072). The 32-input first
+  conv needs one MX format for its input and output: `--fp8 1` for now (the 4-input stem kernels take <= 8 channels).
+- Latent stores (`ufsm lc-encode BASIS ROOT KEY OUT`, src/lc_cli.c): sharded zarr v3 int8 [Z/4][Y/4][X/4](C + 1) through the embz
+  writer (zstd): the mean index as two bytes, then the axes. Coefficients are of the raw CT bytes with step_raw = step x sd_ref: a
+  window's z-score is linear (all voxels count, air included), so a reader gets the trainer's channels as
+  (q step_raw - [mean] 8 mean_w) / sd_w with mean_w / sd_w from the coefficients themselves (58.664 / 33.01 against the CT's
+  58.664 / 33.29 on a P1667 window). `predict --latents STORE` feeds a --lat-basis checkpoint from a store (nn_lat_input_q; the CT is
+  still read for the air mask and the radial channels). PHerc1667 level 2, a dense 768 x 1024^2 box: 0.175 B per voxel on disk
+  (5.7x under uint8; entropy 0.16), rms error 4.8 grey levels (34.5 dB).
+- Open: accuracy of the pair m768 (cell means) / k768 (learned channels) against rv1d2 on p1667 (FINDINGS.md when done); a tANS
+  container instead of zstd; a first conv for 32 fp8 inputs into fp4; predict without the CT read; compressed outputs.
+
 ## Host RAM of train --lat at large windows (2026-11-09)
 - Accounting: `UFSM_HOSTMEM=1` (a `hostmem:` line per log line: pinned by caller, slots, per worker `big` / `ttmp` / pool residency via
   mincore, mallinfo2), `UFSM_TP_LOG=1` (worker 0's pool calls by line), `UFSM_BATCH_HASH=1` (per-plane batch hashes, with --det 1).
