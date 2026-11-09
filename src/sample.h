@@ -126,6 +126,8 @@ typedef struct {
     int replay;              /* train --replay K (>= 1): each built window is delivered K times, replays 2..K with a new device-side augmentation drawn
                                 on the CPU from the same source-grid planes (a new symmetry + warp record, scanner plan without new label-touching ops,
                                 intensity jitter): sampler_replay_ok lists the configurations (--gpu-aug 2 batches) */
+    int replay_gap;          /* train --replay-gap G: a replay is handed out once G batches left since its window's previous use (FIFO over
+                                the released windows; earlier only when no new window is ready, never under --det 1); 0: (slots - workers) K / (K - 1), at least 2, at most the slot count */
     int slot_skip;           /* batch planes the trainer never reads, not allocated nor filled (host RAM: 1 byte per window voxel per slot each):
                                 1 batch.tm (train: g_tm_unused, the unwrap2 head slabs), 2 batch.pm (unwrap2 without --pap-head) */
     int wind4;               /* train --task unwrap2 (side 2, stored phase): batch.w4 / wcomp, the relative winding mod 4 of each window
