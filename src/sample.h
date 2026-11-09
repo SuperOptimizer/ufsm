@@ -123,6 +123,9 @@ typedef struct {
     int pack_tm;             /* targets and mask as one code byte per voxel (batch.tm: SAMPLE_TM_* bits; t, m nullptr): every target value
                                 0 or 255 and the mask 0 / 1 (hard two-class targets, e.g. the side encoding; a soft value aborts). The
                                 trainer unpacks on the device (nn_unpack_tm): host batches 3 -> 1 byte per voxel */
+    int replay;              /* train --replay K (>= 1): each built window is delivered K times, replays 2..K with a new device-side augmentation drawn
+                                on the CPU from the same source-grid planes (a new symmetry + warp record, scanner plan without new label-touching ops,
+                                intensity jitter): sampler_replay_ok lists the configurations (--gpu-aug 2 batches) */
     int slot_skip;           /* batch planes the trainer never reads, not allocated nor filled (host RAM: 1 byte per window voxel per slot each):
                                 1 batch.tm (train: g_tm_unused, the unwrap2 head slabs), 2 batch.pm (unwrap2 without --pap-head) */
     int wind4;               /* train --task unwrap2 (side 2, stored phase): batch.w4 / wcomp, the relative winding mod 4 of each window
@@ -218,6 +221,7 @@ sampler *sampler_start(sources *S, const sample_cfg *cfg);
 batch *sampler_next(sampler *sp);
 int sampler_failed(const sampler *sp);   /* read failure or exhausted draw retries; stopped samplers never publish partial batches */
 void sampler_release(sampler *sp, batch *b);
+int sampler_replay_ok(const sample_cfg *c);   /* --replay is possible for this configuration */
 void sampler_hostmem(const sampler *sp, FILE *f, size_t pinned);   /* UFSM_HOSTMEM=1: host memory by owner (stderr line "hostmem:"; pinned: nn_host_bytes()) */
 void sampler_stop(sampler *sp);
 /* Stats: patches rejected / produced since start. */
