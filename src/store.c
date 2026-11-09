@@ -325,7 +325,27 @@ static int64_t local_size(const store *s, const char *key) {
     return r ? (e == ENOENT || e == ENOTDIR ? -2 : -1) : (int64_t)st.st_size;
 }
 
+/* local read accounting (store_io_report): per store root the reads, bytes and wall time in open + pread (page-cache hits are fast;
+   with /proc/self/io read_bytes vs rchar the share served from the disk) */
+#define IO_NR 64
+static struct { const store *s; _Atomic uint64_t n, bytes, ns; } g_io[IO_NR];
+static _Atomic int g_nio;
+static void io_note(const store *s, uint64_t bytes, uint64_t ns) {
+    int k = -1, n = atomic_load(&g_nio);
+    for (int i = 0; i < n && i < IO_NR; i++) if (g_io[i].s == s) { k = i; break; }
+    if (k < 0) { static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER; pthread_mutex_lock(&mu); n = atomic_load(&g_nio);
+                 for (int i = 0; i < n; i++) if (g_io[i].s == s) k = i;
+                 if (k < 0 && n < IO_NR) { g_io[n].s = s; k = n; atomic_store(&g_nio, n + 1); } pthread_mutex_unlock(&mu); }
+    if (k < 0) return;
+    atomic_fetch_add(&g_io[k].n, 1); atomic_fetch_add(&g_io[k].bytes, bytes); atomic_fetch_add(&g_io[k].ns, ns);
+}
+void store_io_report(FILE *f) {
+    for (int i = 0; i < atomic_load(&g_nio); i++)
+        fprintf(f, "store io: %8.1f MB in %8llu reads, %7.2f s in open + pread (%6.0f MB/s) %s\n", g_io[i].bytes / 1e6, (unsigned long long)g_io[i].n,
+                g_io[i].ns / 1e9, g_io[i].ns ? g_io[i].bytes / 1e6 / (g_io[i].ns / 1e9) : 0., g_io[i].s->root);
+}
 static int64_t local_read(const store *s, const char *key, int64_t off, int64_t len, uint8_t *out) {
+    struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
     char *p = join(s, key);
     int fd = p ? open(p, O_RDONLY) : -1;
     int e = errno;
@@ -342,6 +362,7 @@ static int64_t local_read(const store *s, const char *key, int64_t off, int64_t 
     if (nocache < 0) { const char *v = getenv("UFSM_STORE_NOCACHE"); nocache = v && *v == '1'; }
     if (nocache && got > 0) posix_fadvise(fd, off, got, POSIX_FADV_DONTNEED);
     close(fd);
+    clock_gettime(CLOCK_MONOTONIC, &t1); io_note(s, (uint64_t)(got > 0 ? got : 0), (uint64_t)((t1.tv_sec - t0.tv_sec) * 1000000000ll + (t1.tv_nsec - t0.tv_nsec)));
     return got == len ? got : -1;
 }
 

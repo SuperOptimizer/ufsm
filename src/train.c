@@ -4,6 +4,7 @@
 #include "sysinfo.h"
 #include "checkpoint.h"
 #include "sample.h"
+#include "store.h"
 #include "papyrus.h"
 #include "restore.h"
 #include "srpair.h"
@@ -337,8 +338,8 @@ static void view_set(gpu_state *d, int B) {
 static void axr_set(gpu_state *d, int i) { if (g_axr) unet_set_attn_axis(d->u, d->axv[i] ? d->axh[i] : nullptr, d->axn[i], d->axs[i]); }
 /* once the memory mode is set: the GPU-built input needs the 16-bit -> MX input conversion (unet_input_converted: MX activations with
    MX gradients or an input policy) */
-static void gpu_input_settle(sample_cfg *sc) {
-    g_gpu_in = g_gpu_want && unet_input_converted();
+static void gpu_input_settle(sample_cfg *sc, int assume_mx) {   /* (assume_mx: UFSM_SAMPLER_ONLY, no network: as with an MX input) */
+    g_gpu_in = g_gpu_want && (assume_mx || unet_input_converted());
     g_xs = g_gpu_in ? 1 : g_xc; sc->gpu_input = g_gpu_in;
     g_gpu_aug = g_gpu_aug_want && g_gpu_in && sample_gpu_aug_ok(sc) ? 1 : 0;
     if (g_gpu_aug && g_gpu_aug_want == 2) { if (sample_gpu_lwarp_ok(sc)) g_gpu_aug = 2; else fprintf(stderr, "--gpu-aug 2: the labels' warp needs packed targets and no sheet / pmask / gap / distill / cond / band / aux labels; --gpu-aug 1\n"); }
@@ -2099,6 +2100,30 @@ int cmd_train(int argc, char **argv) {
     { const char *lv = opt(argc, argv, "--levels", nullptr); if (lv) { char *t = strdup(lv); int l = 0; memset(sc.level_p, 0, sizeof sc.level_p); for (char *q = strtok(t, ","); q && l < MAXLEV; q = strtok(nullptr, ",")) sc.level_p[l++] = atof(q); free(t); } }
     if (g_sheet) { memset(sc.level_p,0,sizeof sc.level_p); sc.level_p[0]=1; if (S->n!=1) { fprintf(stderr,"winding v1 requires one registered source\n"); return 2; } }
 
+    {   /* UFSM_SAMPLER_ONLY=N: the training sampler of this exact recipe alone (no GPU: plain host slots, CUDA_VISIBLE_DEVICES= is fine), N
+           batches taken as fast as they come, then the loader rate, the per-stage profile and the host memory; the planes the head slabs
+           skip (slot_skip) as a B 1 unwrap2 run would (UFSM_TM_KEEP=1 keeps them) */
+        const char *so = getenv("UFSM_SAMPLER_ONLY");
+        if (so && atoi(so) > 0) {
+            setenv("UFSM_SAMPLER_NOPIN", "1", 1); gpu_input_settle(&sc, 1);
+            sc.slot_skip = g_unwrap2 && B == 1 && !g_ds && !ufsm_env_on("UFSM_TM_KEEP") ? 1 | (!pm_used() ? 2 : 0) : 0;
+            sampler *sq = sampler_start(S, &sc); if (!sq) { fprintf(stderr, "cannot start the sampler\n"); return 1; }
+            const int nb = atoi(so); const double t0 = now(); double tf = 0;
+            for (int i = 0; i < nb; i++) {
+                batch *b = sampler_next(sq); if (!b) { fprintf(stderr, "sampler stopped after %d batches\n", i); break; }
+                if (i == 0) tf = now() - t0;
+                sampler_release(sq, b);
+                if ((i + 1) % 10 == 0 || i + 1 == nb) { const double dt = now() - t0 - tf;
+                    fprintf(stderr, "sampler-only: %d batches, %.1f s (first %.1f s), %.1f Mvox/s after the first\n", i + 1, now() - t0, tf, i > 0 ? (double)i * B * g_Pz * P * P / 1e6 / dt : 0.); }
+            }
+            sampler_hostmem(sq, stderr, 0);
+            uint64_t prod = 0, rej = 0; sampler_stats(sq, &prod, &rej); fprintf(stderr, "sampler-only: produced %llu rejected %llu\n", (unsigned long long)prod, (unsigned long long)rej);
+            sampler_prof_print(sq);
+            store_io_report(stderr);
+            { FILE *io = fopen("/proc/self/io", "r"); char ln[128]; while (io && fgets(ln, sizeof ln, io)) if (!strncmp(ln, "rchar", 5) || !strncmp(ln, "read_bytes", 10)) fprintf(stderr, "proc io: %s", ln); if (io) fclose(io); }
+            sampler_stop(sq); return 0;
+        }
+    }
     size_t p3 = (size_t)g_Pz * P * P, p3l = split ? (size_t)P * P * g_Dl : p3;   /* per-GPU voxels of a window */
     gpu_state G[8];
     int step0 = 0;
@@ -2377,7 +2402,7 @@ int cmd_train(int argc, char **argv) {
         }
     }
     if (g_half && !g_pkf && lean) { fprintf(stderr, "--half-res: not with the lean memory modes\n"); return 2; }
-    gpu_input_settle(&sc);   /* (the memory mode is set: the input layout of the batches) */
+    gpu_input_settle(&sc, 0);   /* (the memory mode is set: the input layout of the batches) */
     if (newdef && !workers_asked && g_gpu_aug == 2) { workers = 3; sc.nworkers = workers; fprintf(stderr, "sampler: 3 workers (the new-run default with --gpu-aug 2; --workers N sets it)\n"); }
     for (int g = 0; g < ng; g++) {   /* per-GPU batch buffers. lean: one, shared by both slots, inside the model's gradient buffers when
                                         they are large enough: [targets | mask | input if the forward copies it] in B (lean 1: after the
