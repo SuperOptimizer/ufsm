@@ -64,6 +64,9 @@ int cmd_trace_prep(int argc, char **argv);    /* src/tracebox.c */
 int cmd_patch_score(int argc, char **argv);   /* src/tracebox.c */
 int cmd_sheet_trace(int argc, char **argv);   /* src/sheettrace.c */
 int cmd_raw2jpg(int argc, char **argv);       /* src/tracebox.c */
+int cmd_gt_support(int argc, char **argv);    /* src/tracebox.c */
+int cmd_gt_gate(int argc, char **argv);       /* src/tracebox.c */
+int cmd_phase_diff(int argc, char **argv);    /* src/tracebox.c */
 int cmd_side_face(int argc, char **argv);   /* src/sideface.c */
 int cmd_side_gate(int argc, char **argv);   /* src/sidegate.c */
 int cmd_patch_id(int argc, char **argv);   /* src/patchid.c */
@@ -211,7 +214,10 @@ static int usage(void) {
         "  ufsm surf-snap <wraps-in> <wraps-out> --volume ROOT KEY --vol-um U   tifxyz vertices onto the nearest papyrus ridge\n"
         "  ufsm wrap-snap <wraps-in> <wraps-out> --axis F --axis-um U0 --ct ROOT KEY --ct-um U   .sfc wraps moved along their rays onto the sheets (smooth, order-kept)\n"
         "  ufsm trace-prep --prob P --box Z0,Y0,X0,NZ,NY,NX --axis A --out DIR [--field ridge|prob] [--seeds 64]   tracer box input: radial ridge as an OME zarr v2 pyramid + seeds\n"
-        "  ufsm raw2jpg IN.raw W H OUT.jpg [--mark Y,X]..   a uint8 raw slice as a grey JPEG (QA)\n"
+        "  ufsm gt-gate --gt ROOT --gt-key K --prob ROOT --prob-key K --axis A --out DIR [--min-support 0.75] [--sup-r 2] [--skip-check 0] [--dir auto|radial|par] [--orient-deg A] [--interval 1]\n"
+        "      [--phase R --phase-key K [--ignore R --ignore-key K] --phase-out DIR [--min-keep 0.3] [--shard-frac 1]]   label ignore mask: GT cells whose sheets are off the CT; --phase: that phase with gated cells unknown (lossless)\n"
+        "  ufsm gt-support --gt G --prob P --box Z0,Y0,X0,NZ,NY,NX --axis A   share of GT sheet voxels on CT-visible (prob ridge) sheets, by GT spacing\n"
+        "  ufsm raw2jpg IN.raw W H OUT.jpg [--rgb] [--mark Y,X]..   a uint8 raw slice as a grey JPEG (QA)\n"
         "  ufsm sheet-trace --prob P --box Z0,Y0,X0,NZ,NY,NX --axis A --out DIR [--tol 2] [--step 2]   fast sheet patch tracer: radial peaks linked as height fields r(theta, z)\n"
         "  ufsm patch-score --paths DIR --gt G --box Z0,Y0,X0,NZ,NY,NX --axis A [--sgn S]   traced patches vs GT codes: sheet recall, precision, purity\n"
         "  ufsm patch-solve --paths DIR --prob P --box Z0,Y0,X0,NZ,NY,NX --axis A [--gt G] ..   global turn numbers of traced sheet patches (ray gap votes, exact L1)\n"
@@ -4638,6 +4644,9 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "patch-score")) return cmd_patch_score(argc, argv);
     if (!strcmp(cmd, "sheet-trace")) return cmd_sheet_trace(argc, argv);
     if (!strcmp(cmd, "raw2jpg")) return cmd_raw2jpg(argc, argv);
+    if (!strcmp(cmd, "gt-support")) return cmd_gt_support(argc, argv);
+    if (!strcmp(cmd, "gt-gate")) return cmd_gt_gate(argc, argv);
+    if (!strcmp(cmd, "phase-diff")) return cmd_phase_diff(argc, argv);
     if (!strcmp(cmd, "side-face")) return cmd_side_face(argc, argv);
     if (!strcmp(cmd, "side-gate")) return cmd_side_gate(argc, argv);
     if (!strcmp(cmd, "surf-labels")) return cmd_surf_labels(argc, argv);

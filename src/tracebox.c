@@ -288,15 +288,18 @@ int cmd_patch_score(int argc, char **argv) {
 #undef IDX
 }
 
-/* ufsm raw2jpg IN.raw W H OUT.jpg [--mark Y,X]..: a uint8 W x H raw slice as a grey JPEG (QA), optional red crosses */
+/* ufsm raw2jpg IN.raw W H OUT.jpg [--rgb] [--mark Y,X]..: a uint8 W x H raw slice as a grey JPEG (QA), optional red crosses; --rgb: the raw is
+   W x H interleaved RGB triples */
 #include "imgops.h"
 int cmd_raw2jpg(int argc, char **argv) {
-    if (argc < 6) { fprintf(stderr, "usage: ufsm raw2jpg IN.raw W H OUT.jpg [--mark Y,X]..\n"); return 2; }
+    if (argc < 6) { fprintf(stderr, "usage: ufsm raw2jpg IN.raw W H OUT.jpg [--rgb] [--mark Y,X]..\n"); return 2; }
     const int W = atoi(argv[3]), H = atoi(argv[4]); if (W <= 0 || H <= 0) return 2;
     uint8_t *g = malloc((size_t)W * H), *rgb = malloc((size_t)W * H * 3); if (!g || !rgb) return 1;
-    FILE *f = fopen(argv[2], "rb"); const size_t got = f ? fread(g, 1, (size_t)W * H, f) : 0; if (f) fclose(f);
-    if (got != (size_t)W * H) { fprintf(stderr, "raw2jpg: %s: expected %d bytes\n", argv[2], W * H); return 1; }
-    for (size_t i = 0; i < (size_t)W * H; i++) rgb[3 * i] = rgb[3 * i + 1] = rgb[3 * i + 2] = g[i];
+    int rgbin = 0; for (int i = 6; i < argc; i++) rgbin |= !strcmp(argv[i], "--rgb");
+    const size_t want = (size_t)W * H * (rgbin ? 3 : 1);
+    FILE *f = fopen(argv[2], "rb"); const size_t got = f ? fread(rgbin ? rgb : g, 1, want, f) : 0; if (f) fclose(f);
+    if (got != want) { fprintf(stderr, "raw2jpg: %s: expected %zu bytes\n", argv[2], want); return 1; }
+    if (!rgbin) for (size_t i = 0; i < (size_t)W * H; i++) rgb[3 * i] = rgb[3 * i + 1] = rgb[3 * i + 2] = g[i];
     for (int i = 6; i + 1 < argc; i++) if (!strcmp(argv[i], "--mark")) {
         int y, x; if (sscanf(argv[i + 1], "%d,%d", &y, &x) != 2) continue;
         for (int d = -8; d <= 8; d++) {
@@ -305,4 +308,294 @@ int cmd_raw2jpg(int argc, char **argv) {
         }
     }
     const int rc = jpeg_write_rgb(argv[5], W, H, rgb, 90); free(g); free(rgb); return rc ? 1 : 0;
+}
+
+/* ufsm gt-support --gt G --prob P --box Z0,Y0,X0,NZ,NY,NX --axis A [--axis-scale S] [--frame F] [--threads N]
+   Do GT sheets sit on CT-visible sheets? For every GT sheet voxel (codes 1..252): the distance to the nearest radial ridge voxel of the
+   prob (p >= 64 radial non-max; Chebyshev <= 1, <= 2, > 2) and the local GT spacing = the distance along the outward ray to the next GT
+   sheet voxel of another code (0.5-voxel steps, up to 64). Report: support shares per spacing bin (< 8, 8-12, 12-16, 16-24, >= 24 voxels,
+   none within 64). Low support at small spacing = GT sheets that do not follow the CT where sheets are packed (label noise for training). */
+int cmd_gt_support(int argc, char **argv) {
+    int64_t o[3], n[3];
+    const char *gtp = tb_opt(argc, argv, "--gt", nullptr), *probp = tb_opt(argc, argv, "--prob", nullptr), *axp = tb_opt(argc, argv, "--axis", nullptr);
+    const double axs = atof(tb_opt(argc, argv, "--axis-scale", "1"));
+    int nt = atoi(tb_opt(argc, argv, "--threads", "0")); if (nt <= 0) nt = (int)sysconf(_SC_NPROCESSORS_ONLN);
+    if (!gtp || !probp || !axp || tb_box(tb_opt(argc, argv, "--box", nullptr), o, n) || axs <= 0) {
+        fprintf(stderr, "usage: ufsm gt-support --gt G [--gt-key K] --prob P [--prob-key K] --box Z0,Y0,X0,NZ,NY,NX --axis A [--axis-scale S] [--frame F]\n"); return 2;
+    }
+    ps_geo G; if (ps_geo_init(&G, axp, axs, o, n)) { fprintf(stderr, "gt-support: cannot load axis %s\n", axp); return 1; }
+    const char *fr = tb_opt(argc, argv, "--frame", nullptr); if (fr && ps_frame_load(&G, fr)) { fprintf(stderr, "gt-support: cannot read %s\n", fr); return 1; }
+    uint8_t *gt = ps_box(gtp, tb_opt(argc, argv, "--gt-key", nullptr), tb_opt(argc, argv, "--cache", nullptr), o, n, nt);
+    uint8_t *pb = ps_box(probp, tb_opt(argc, argv, "--prob-key", nullptr), tb_opt(argc, argv, "--cache", nullptr), o, n, nt);
+    if (!gt || !pb) return 1;
+    const size_t N = (size_t)(n[0] * n[1] * n[2]); const int64_t NY = n[1], NX = n[2];
+#define IDX(z, y, x) (((size_t)(z) * NY + (size_t)(y)) * NX + (size_t)(x))
+    uint8_t *rg = malloc(N); if (!rg) return 1;
+    ps_ridge(pb, rg, n, &G, nt); free(pb);
+    long long cnt[6][3] = {{0}};   /* spacing bin x support (<= 1, <= 2, > 2) */
+    const double edges[5] = {8, 12, 16, 24, 1e9};
+    for (int64_t z = 0; z < n[0]; z++) for (int64_t y = 0; y < NY; y++) for (int64_t x = 0; x < NX; x++) {
+        const int c = gt[IDX(z, y, x)]; if (c < 1 || c > 252) continue;
+        int d = 3;
+        for (int r = 1; r <= 2 && d == 3; r++)
+            for (int dz = -r; dz <= r && d == 3; dz++) for (int dy = -r; dy <= r && d == 3; dy++) for (int dx = -r; dx <= r && d == 3; dx++) {
+                const int64_t zz = z + dz, yy = y + dy, xx = x + dx; if (zz < 0 || yy < 0 || xx < 0 || zz >= n[0] || yy >= NY || xx >= NX) continue;
+                if (rg[IDX(zz, yy, xx)]) d = r;
+            }
+        double uy, ux; ps_ray_dir(&G, (double)z, (double)y, (double)x, &uy, &ux);
+        double sp = -1; int left = 0;
+        for (double t = 0.5; t <= 64; t += 0.5) {
+            const int64_t yy = (int64_t)lround(y + t * uy), xx = (int64_t)lround(x + t * ux); if (yy < 0 || xx < 0 || yy >= NY || xx >= NX) break;
+            const int g = gt[IDX(z, yy, xx)]; const int sheet = g >= 1 && g <= 252;
+            int dc = sheet ? abs(g - c) % 252 : 0; dc = dc > 126 ? 252 - dc : dc;   /* codes run along a sheet with theta: another sheet = >= half a turn apart */
+            if (!sheet || dc < 9) { left = 1; continue; }   /* must leave this sheet first */
+            if (left) { sp = t; break; }
+        }
+        int b = 5; if (sp > 0) for (b = 0; b < 4 && sp >= edges[b]; b++);
+        cnt[b][d <= 1 ? 0 : d == 2 ? 1 : 2]++;
+    }
+    const char *bn[6] = {"< 8", "8-12", "12-16", "16-24", ">= 24", "none <= 64"};
+    long long tot[3] = {0}; printf("gt-support: GT sheet voxels on the prob ridge (Chebyshev <= 1 / <= 2 / > 2) by GT spacing along the ray (voxels)\n");
+    for (int b = 0; b < 6; b++) {
+        const long long s = cnt[b][0] + cnt[b][1] + cnt[b][2]; for (int k = 0; k < 3; k++) tot[k] += cnt[b][k];
+        printf("  spacing %-11s n %10lld  on ridge %.3f  <= 2 %.3f  unsupported %.3f\n", bn[b], s, s ? (double)cnt[b][0] / s : 0, s ? (double)(cnt[b][0] + cnt[b][1]) / s : 0, s ? (double)cnt[b][2] / s : 0);
+    }
+    const long long s = tot[0] + tot[1] + tot[2];
+    printf("  all                n %10lld  on ridge %.3f  <= 2 %.3f  unsupported %.3f\n", s, s ? (double)tot[0] / s : 0, s ? (double)(tot[0] + tot[1]) / s : 0, s ? (double)tot[2] / s : 0);
+    free(gt); free(rg); return 0;
+#undef IDX
+}
+
+/* ufsm gt-gate --gt ROOT --gt-key K --prob ROOT --prob-key K --axis A [--axis-scale S] --out DIR [--um U] [--cell 64] [--min-support 0.75]
+                [--min-n 200] [--box Z0,Y0,X0,NZ,NY,NX] [--jobs 8] [--cache C]
+   A training-label gate for GT whose sheets do not follow the CT: per --cell^3 cell the share of its GT sheet voxels (codes 1..252) within
+   Chebyshev 2 of the radial prob ridge (gt-support); cells with >= --min-n sheet voxels and a share < --min-support are 255 in the output mask
+   (uint8 zarr on the GT grid, 512^3 shards, written at DIR/<um>; use as a stored phase's "ignore"), the rest 0. Shards without GT sheets
+   are skipped (fill 0). Prints the share of GT sheet voxels gated. */
+#include "z3w.h"
+#include "band.h"
+#include <pthread.h>
+#include <stdatomic.h>
+typedef struct {
+    z3 *gt, *pb, *ph, *ig; z3w *w, *wp; const char *axp; double axs; int64_t shape[3], b0[3], bn[3], ns[3]; int cell, minn, skip, supr, interval; double mins, shfrac, minkeep, odeg; _Atomic long long pshards, ocells;
+    _Atomic long next; long nitems; _Atomic long long sheet, gated, cells, gcells; _Atomic long long npar, nfr; const char *dir; _Atomic int fail;
+} gg_job;
+static void *gg_work(void *arg) {
+    gg_job *J = arg; const int S = 512, H = J->skip || J->interval ? 40 : 3;
+    uint8_t *gt = malloc((size_t)(S + 2 * H) * (S + 2 * H) * (S + 2 * H)), *pb = malloc((size_t)(S + 2 * H) * (S + 2 * H) * (S + 2 * H)),
+            *rg = malloc((size_t)(S + 2 * H) * (S + 2 * H) * (S + 2 * H)), *out = malloc((size_t)S * S * S);
+    uint8_t *phb = J->odeg > 0 ? malloc((size_t)(S + 2 * H) * (S + 2 * H) * (S + 2 * H)) : nullptr;   /* --orient-deg: our phase with the halo */
+    for (;;) {
+        const long it = atomic_fetch_add(&J->next, 1); if (it >= J->nitems) break;
+        const int64_t si[3] = {it / (J->ns[1] * J->ns[2]), it / J->ns[2] % J->ns[1], it % J->ns[2]};
+        int64_t s0[3], o[3], n[3], c0[3], cn[3];
+        for (int d = 0; d < 3; d++) {
+            s0[d] = si[d] * S;   /* shard origin (array) */
+            int64_t lo = s0[d] > J->b0[d] ? s0[d] : J->b0[d], hi = s0[d] + S < J->b0[d] + J->bn[d] ? s0[d] + S : J->b0[d] + J->bn[d]; if (hi > J->shape[d]) hi = J->shape[d];
+            c0[d] = lo; cn[d] = hi - lo;   /* core: the box part of the shard */
+            o[d] = lo - H < 0 ? 0 : lo - H; n[d] = (hi + H > J->shape[d] ? J->shape[d] : hi + H) - o[d];
+        }
+        if (cn[0] <= 0 || cn[1] <= 0 || cn[2] <= 0) continue;
+        if (z3_read(J->gt, o, n, gt, 1)) { atomic_store(&J->fail, 1); continue; }
+        const size_t NN = (size_t)(n[0] * n[1] * n[2]); size_t ns_ = 0; for (size_t i = 0; i < NN; i++) ns_ += gt[i] >= 1 && gt[i] <= 252;
+        if (!ns_) continue;   /* (the gated phase leaves it unknown: no labelled sheet in reach) */
+        if (z3_read(J->pb, o, n, pb, 1)) { atomic_store(&J->fail, 1); continue; }
+        ps_geo G; if (ps_geo_init(&G, J->axp, J->axs, o, n)) { atomic_store(&J->fail, 1); continue; }
+        if (strcmp(J->dir, "radial")) {   /* --dir auto: parallel rays where the shard's sheets have one clear orientation off radial (crushed scrolls; sheet-trace's rule) */
+            double jxx = 0, jxy = 0, jyy = 0;
+            for (int64_t z = 0; z < n[0]; z += 16) { const uint8_t *sl = pb + (size_t)z * n[1] * n[2];
+                for (int64_t y = 1; y + 1 < n[1]; y += 2) for (int64_t x = 1; x + 1 < n[2]; x += 2) {
+                    const double gx = (double)sl[y * n[2] + x + 1] - sl[y * n[2] + x - 1], gy = (double)sl[(y + 1) * n[2] + x] - sl[(y - 1) * n[2] + x];
+                    jxx += gx * gx; jxy += gx * gy; jyy += gy * gy; } }
+            const double phi = 0.5 * atan2(2 * jxy, jxx - jyy), coh = (jxx + jyy) > 0 ? sqrt((jxx - jyy) * (jxx - jyy) + 4 * jxy * jxy) / (jxx + jyy) : 0;
+            double ny_ = sin(phi), nx_ = cos(phi), ay, ax; ps_axis(&G, n[0] / 2.0, &ay, &ax);
+            const double cy = 0.5 * n[1], cx = 0.5 * n[2], ey = cy - ay, ex = cx - ax, el = hypot(ey, ex) + 1e-9;
+            if (ny_ * ey + nx_ * ex < 0) { ny_ = -ny_; nx_ = -nx_; }
+            const int axis_in = ay >= 0 && ax >= 0 && ay < n[1] && ax < n[2];
+            G.par = !strcmp(J->dir, "par") || (!axis_in && (ny_ * ey + nx_ * ex) / el < 0.7 && coh >= 0.5);
+            if (G.par) { G.ny = ny_; G.nx = nx_; G.ty = nx_; G.tx = -ny_; G.cy = cy; G.cx = cx; }
+            atomic_fetch_add(&J->npar, G.par); atomic_fetch_add(&J->nfr, 1);
+        }
+        ps_ridge(pb, rg, n, &G, 1);
+        const int C = J->cell; const int64_t nc[3] = {(S + C - 1) / C, (S + C - 1) / C, (S + C - 1) / C};
+        long *cs = calloc((size_t)(nc[0] * nc[1] * nc[2]) * 2, sizeof *cs);
+        #define GI(z, y, x) (((size_t)(z) * n[1] + (size_t)(y)) * n[2] + (size_t)(x))
+        for (int64_t z = c0[0]; z < c0[0] + cn[0]; z++) for (int64_t y = c0[1]; y < c0[1] + cn[1]; y++) for (int64_t x = c0[2]; x < c0[2] + cn[2]; x++) {
+            const int64_t lz = z - o[0], ly = y - o[1], lx = x - o[2]; const uint8_t c = gt[GI(lz, ly, lx)]; if (c < 1 || c > 252) continue;
+            int sup = 0;
+            if (J->interval) {   /* --interval: exactly one CT ridge run between this sheet (t = 0) and the next labelled sheet outward. A constant
+                                    offset of our sheets from the ridges (recto face vs sheet middle) keeps one run per interval; 0 = merged
+                                    sheets, 2+ = a skipped sheet. Voxels without a next sheet within 36 voxels are left out of the cell share. */
+                double uy, ux; ps_ray_dir(&G, (double)lz, (double)ly, (double)lx, &uy, &ux); int prev = 0, runs = 0, found = 0, left = 0;
+                for (double t = 0; t <= 36; t += 0.5) {
+                    const int64_t yy = (int64_t)lround(ly + t * uy), xx = (int64_t)lround(lx + t * ux); if (yy < 0 || xx < 0 || yy >= n[1] || xx >= n[2]) break;
+                    const uint8_t g = gt[GI(lz, yy, xx)]; const int sheet = g >= 1 && g <= 252; int dc = sheet ? abs((int)g - (int)c) % 252 : 0; dc = dc > 126 ? 252 - dc : dc;
+                    if (!sheet || dc >= 9) left = 1;
+                    if (sheet && dc >= 9 && left) { found = 1; break; }
+                    const int r_ = rg[GI(lz, yy, xx)] != 0; runs += r_ && !prev; prev = r_;
+                }
+                if (!found) continue;
+                sup = runs == 1;
+            }
+            const int SR = J->interval ? -1 : J->supr;
+            for (int dz = -SR; dz <= SR && !sup; dz++) for (int dy = -SR; dy <= SR && !sup; dy++) for (int dx = -SR; dx <= SR && !sup; dx++) {
+                const int64_t zz = lz + dz, yy = ly + dy, xx = lx + dx; if (zz < 0 || yy < 0 || xx < 0 || zz >= n[0] || yy >= n[1] || xx >= n[2]) continue;
+                sup = rg[GI(zz, yy, xx)];
+            }
+            if (sup && J->skip && !J->interval) {   /* --skip-check: a CT sheet (ridge run) strictly between this sheet and the next labelled one outward = a skipped sheet */
+                double uy, ux; ps_ray_dir(&G, (double)lz, (double)ly, (double)lx, &uy, &ux); int left = 0, prev = 1, nrs = 0, found = 0; double t0 = -1, rs[16];
+                double t = 0.5;
+                for (; t <= 36; t += 0.5) {
+                    const int64_t yy = (int64_t)lround(ly + t * uy), xx = (int64_t)lround(lx + t * ux); if (yy < 0 || xx < 0 || yy >= n[1] || xx >= n[2]) break;
+                    const uint8_t g = gt[GI(lz, yy, xx)]; const int sheet = g >= 1 && g <= 252; int dc = sheet ? abs((int)g - (int)c) % 252 : 0; dc = dc > 126 ? 252 - dc : dc;
+                    if (sheet && dc >= 9 && left) { found = 1; break; }   /* the next labelled sheet */
+                    if (!sheet || dc >= 9) { if (!left) t0 = t; left = 1; }
+                    const int r_ = rg[GI(lz, yy, xx)]; if (left && t > t0 + 2.5 && r_ && !prev && nrs < 16) rs[nrs++] = t; prev = r_;
+                }
+                int runs = 0; if (found) for (int q = 0; q < nrs; q++) runs += rs[q] < t - 2.5;   /* runs well clear of both sheets */
+                if (runs > 0) sup = 0;
+            }
+            const size_t ci = ((size_t)((z - s0[0]) / C) * nc[1] + (size_t)((y - s0[1]) / C)) * nc[2] + (size_t)((x - s0[2]) / C);
+            cs[2 * ci]++; cs[2 * ci + 1] += sup;
+        }
+        double *jt = nullptr;   /* --orient-deg A: per cell the structure tensors of the m7 prob (CT sheets) and of our phase (our sheets): a cell whose
+                                   sheet normals differ by more than A degrees is bad (sheets veering off the CT direction), whatever the support says */
+        if (J->odeg > 0) {
+            if (z3_read(J->ph, o, n, phb, 1)) { atomic_store(&J->fail, 1); free(cs); continue; }
+            jt = calloc((size_t)(nc[0] * nc[1] * nc[2]) * 12, sizeof *jt);
+            for (int64_t z = c0[0]; z < c0[0] + cn[0]; z += 2) for (int64_t y = c0[1]; y < c0[1] + cn[1]; y += 2) for (int64_t x = c0[2]; x < c0[2] + cn[2]; x += 2) {
+                const int64_t lz = z - o[0], ly = y - o[1], lx = x - o[2];
+                if (lz < 1 || ly < 1 || lx < 1 || lz + 1 >= n[0] || ly + 1 >= n[1] || lx + 1 >= n[2]) continue;
+                const size_t ci = ((size_t)((z - s0[0]) / C) * nc[1] + (size_t)((y - s0[1]) / C)) * nc[2] + (size_t)((x - s0[2]) / C);
+                double *a = jt + 12 * ci;
+                const double gz = (double)pb[GI(lz + 1, ly, lx)] - pb[GI(lz - 1, ly, lx)], gy = (double)pb[GI(lz, ly + 1, lx)] - pb[GI(lz, ly - 1, lx)],
+                             gx = (double)pb[GI(lz, ly, lx + 1)] - pb[GI(lz, ly, lx - 1)];
+                a[0] += gz * gz; a[1] += gy * gy; a[2] += gx * gx; a[3] += gz * gy; a[4] += gz * gx; a[5] += gy * gx;
+                const uint8_t pz0 = phb[GI(lz - 1, ly, lx)], pz1 = phb[GI(lz + 1, ly, lx)], py0 = phb[GI(lz, ly - 1, lx)], py1 = phb[GI(lz, ly + 1, lx)],
+                              px0 = phb[GI(lz, ly, lx - 1)], px1 = phb[GI(lz, ly, lx + 1)];
+                if (pz0 >= 252 || pz1 >= 252 || py0 >= 252 || py1 >= 252 || px0 >= 252 || px1 >= 252) continue;
+                #define CD(p1, p0) ((double)((((int)(p1) - (int)(p0)) % 252 + 378) % 252 - 126))
+                const double qz = CD(pz1, pz0), qy = CD(py1, py0), qx = CD(px1, px0);
+                #undef CD
+                a[6] += qz * qz; a[7] += qy * qy; a[8] += qx * qx; a[9] += qz * qy; a[10] += qz * qx; a[11] += qy * qx;
+            }
+        }
+        memset(out, 0, (size_t)S * S * S); long long g = 0, sh = 0, cl = 0, gc = 0;
+        for (int64_t cz = 0; cz < nc[0]; cz++) for (int64_t cy = 0; cy < nc[1]; cy++) for (int64_t cx = 0; cx < nc[2]; cx++) {
+            const size_t ci = ((size_t)cz * nc[1] + (size_t)cy) * nc[2] + (size_t)cx; const long tot = cs[2 * ci]; sh += tot;
+            if (tot < J->minn) continue;
+            cl++;
+            if (jt) {   /* the dominant eigenvectors (power iteration) of both tensors; gate when they disagree by more than --orient-deg */
+                const double *a = jt + 12 * ci; double v[2][3];
+                for (int k = 0; k < 2; k++) {
+                    const double *m = a + 6 * k; double e[3] = {0.577, 0.577, 0.577};
+                    for (int it = 0; it < 30; it++) {
+                        double f[3] = {m[0] * e[0] + m[3] * e[1] + m[4] * e[2], m[3] * e[0] + m[1] * e[1] + m[5] * e[2], m[4] * e[0] + m[5] * e[1] + m[2] * e[2]};
+                        const double l = sqrt(f[0] * f[0] + f[1] * f[1] + f[2] * f[2]); if (l <= 0) break; for (int q = 0; q < 3; q++) e[q] = f[q] / l;
+                    }
+                    memcpy(v[k], e, sizeof e);
+                }
+                const double tr = a[6] + a[7] + a[8], dt = fabs(v[0][0] * v[1][0] + v[0][1] * v[1][1] + v[0][2] * v[1][2]);
+                if (tr > 0 && a[0] + a[1] + a[2] > 0 && dt < cos(J->odeg * M_PI / 180)) {
+                    atomic_fetch_add(&J->ocells, 1); gc++; g += tot;
+                    for (int64_t z = cz * C; z < (cz + 1) * C && z < S; z++) for (int64_t y = cy * C; y < (cy + 1) * C && y < S; y++)
+                        memset(out + ((size_t)z * S + (size_t)y) * S + (size_t)(cx * C), 255, (size_t)(C < S - cx * C ? C : S - cx * C));
+                    continue;
+                }
+            }
+            if ((double)cs[2 * ci + 1] / (double)tot >= J->mins) continue;
+            gc++; g += tot;
+            for (int64_t z = cz * C; z < (cz + 1) * C && z < S; z++) for (int64_t y = cy * C; y < (cy + 1) * C && y < S; y++)
+                memset(out + ((size_t)z * S + (size_t)y) * S + (size_t)(cx * C), 255, (size_t)(C < S - cx * C ? C : S - cx * C));
+        }
+        #undef GI
+        free(cs); free(jt);
+        atomic_fetch_add(&J->sheet, sh); atomic_fetch_add(&J->gated, g); atomic_fetch_add(&J->cells, cl); atomic_fetch_add(&J->gcells, gc);
+        if (gc && z3w_write_shard(J->w, si[0], si[1], si[2], out, 1)) atomic_store(&J->fail, 1);
+        uint64_t hh = (uint64_t)it * 0x9E3779B97F4A7C15ull; hh ^= hh >> 31; hh *= 0xBF58476D1CE4E5B9ull; hh ^= hh >> 29;
+        if (J->wp && sh > 0 && (double)(sh - g) / (double)sh >= J->minkeep && (double)(hh >> 11) / 9007199254740992.0 < J->shfrac) {   /* --phase: the stored phase of this shard with gated cells (and --ignore) unknown; only shards keeping >= --min-keep of their sheet voxels, a --shard-frac hash subsample (disk) */
+            atomic_fetch_add(&J->pshards, 1);
+            int64_t sn[3]; for (int d = 0; d < 3; d++) sn[d] = J->shape[d] - s0[d] < S ? J->shape[d] - s0[d] : S;   /* (edge shards: clipped read, unknown beyond) */
+            if (z3_read(J->ph, s0, sn, gt, 1) || (J->ig && z3_read(J->ig, s0, sn, rg, 1))) { atomic_store(&J->fail, 1); continue; }
+            memset(pb, PHASE_UNKNOWN, (size_t)S * S * S);
+            for (int64_t z = 0; z < sn[0]; z++) for (int64_t y = 0; y < sn[1]; y++) for (int64_t x = 0; x < sn[2]; x++) {
+                const size_t i = ((size_t)z * S + (size_t)y) * S + (size_t)x, j = ((size_t)z * sn[1] + (size_t)y) * sn[2] + (size_t)x;
+                pb[i] = out[i] || (J->ig && rg[j]) ? PHASE_UNKNOWN : gt[j];
+            }
+            if (z3w_write_shard(J->wp, si[0], si[1], si[2], pb, 1)) atomic_store(&J->fail, 1);
+        }
+    }
+    free(gt); free(pb); free(rg); free(out); free(phb); return nullptr;
+}
+int cmd_gt_gate(int argc, char **argv) {
+    const char *gtr = tb_opt(argc, argv, "--gt", nullptr), *gtk = tb_opt(argc, argv, "--gt-key", nullptr), *pr = tb_opt(argc, argv, "--prob", nullptr),
+               *pk = tb_opt(argc, argv, "--prob-key", nullptr), *axp = tb_opt(argc, argv, "--axis", nullptr), *out = tb_opt(argc, argv, "--out", nullptr), *cache = tb_opt(argc, argv, "--cache", nullptr);
+    gg_job J = {.axp = axp, .axs = atof(tb_opt(argc, argv, "--axis-scale", "1")), .cell = atoi(tb_opt(argc, argv, "--cell", "64")), .minn = atoi(tb_opt(argc, argv, "--min-n", "200")),
+                .mins = atof(tb_opt(argc, argv, "--min-support", "0.75")), .skip = atoi(tb_opt(argc, argv, "--skip-check", "0")), .supr = atoi(tb_opt(argc, argv, "--sup-r", "2")), .dir = tb_opt(argc, argv, "--dir", "auto"), .odeg = atof(tb_opt(argc, argv, "--orient-deg", "0")), .interval = atoi(tb_opt(argc, argv, "--interval", "0"))};
+    const int jobs = atoi(tb_opt(argc, argv, "--jobs", "8"));
+    if (!gtr || !gtk || !pr || !pk || !axp || !out || J.axs <= 0 || J.cell < 8 || J.cell > 512 || 512 % J.cell || jobs < 1 || jobs > 64) {
+        fprintf(stderr, "usage: ufsm gt-gate --gt ROOT --gt-key K --prob ROOT --prob-key K --axis A [--axis-scale S] --out DIR [--um U] [--cell 64 (divides 512)]\n"
+                        "         [--min-support 0.75] [--min-n 200] [--box Z0,Y0,X0,NZ,NY,NX] [--jobs 8] [--cache C]\n"); return 2;
+    }
+    store *gs = store_open(gtr), *ps = store_open(pr); J.gt = gs ? z3_open(gs, gtk, cache) : nullptr; J.pb = ps ? z3_open(ps, pk, cache) : nullptr;
+    if (!J.gt || !J.pb) { fprintf(stderr, "gt-gate: cannot open %s/%s or %s/%s\n", gtr, gtk, pr, pk); return 1; }
+    const z3_meta *gm = z3_meta_of(J.gt), *pm = z3_meta_of(J.pb);
+    if (memcmp(gm->shape, pm->shape, sizeof gm->shape)) { fprintf(stderr, "gt-gate: the GT and prob shapes differ\n"); return 1; }
+    memcpy(J.shape, gm->shape, sizeof J.shape);
+    const char *bs = tb_opt(argc, argv, "--box", nullptr);
+    if (bs) { if (tb_box(bs, J.b0, J.bn)) return 2; } else for (int d = 0; d < 3; d++) { J.b0[d] = 0; J.bn[d] = J.shape[d]; }
+    for (int d = 0; d < 3; d++) J.ns[d] = (J.shape[d] + 511) / 512;
+    J.nitems = J.ns[0] * J.ns[1] * J.ns[2];
+    const double um = atof(tb_opt(argc, argv, "--um", "0")) > 0 ? atof(tb_opt(argc, argv, "--um", "0")) : (gm->scale_um > 0 ? gm->scale_um : 1);
+    char key[64], dir[1200]; z3w_level_name(um, key, sizeof key); snprintf(dir, sizeof dir, "%s/%s", out, key);
+    mkdir(out, 0755); J.w = z3w_create(dir, J.shape, 512, 0, 0, nullptr); if (!J.w) { fprintf(stderr, "gt-gate: cannot create %s: %s\n", dir, z3w_error()); return 1; }
+    const char *phr = tb_opt(argc, argv, "--phase", nullptr), *phk = tb_opt(argc, argv, "--phase-key", nullptr), *pho = tb_opt(argc, argv, "--phase-out", nullptr);
+    J.shfrac = atof(tb_opt(argc, argv, "--shard-frac", "1")); J.minkeep = atof(tb_opt(argc, argv, "--min-keep", "0.3"));
+    if (phr && phk) { store *qs = store_open(phr); J.ph = qs ? z3_open(qs, phk, nullptr) : nullptr;
+        if (!J.ph || memcmp(z3_meta_of(J.ph)->shape, J.shape, sizeof J.shape)) { fprintf(stderr, "gt-gate: cannot open %s/%s or its shape differs\n", phr, phk); return 1; } }
+    if (J.odeg > 0 && !J.ph) { fprintf(stderr, "gt-gate: --orient-deg needs --phase / --phase-key (our sheet directions)\n"); return 2; }
+    if (phr && phk && pho) {   /* the gated phase (PHASE_* codes, unknown 255), lossless */
+        const char *igr = tb_opt(argc, argv, "--ignore", nullptr), *igk = tb_opt(argc, argv, "--ignore-key", nullptr);
+        if (igr && igk) { store *is = store_open(igr); J.ig = is ? z3_open(is, igk, nullptr) : nullptr; if (!J.ig) { fprintf(stderr, "gt-gate: cannot open %s/%s\n", igr, igk); return 1; } }
+        if (!J.ph || memcmp(z3_meta_of(J.ph)->shape, J.shape, sizeof J.shape)) { fprintf(stderr, "gt-gate: cannot open %s/%s or its shape differs\n", phr, phk); return 1; }
+        char pd[1200]; mkdir(pho, 0755); snprintf(pd, sizeof pd, "%s/%s", pho, key);
+        J.wp = z3w_create(pd, J.shape, 512, 0, PHASE_UNKNOWN, nullptr);
+        if (!J.wp) { fprintf(stderr, "gt-gate: cannot create %s: %s\n", pd, z3w_error()); return 1; }
+    }
+    pthread_t th[64]; for (int t = 0; t < jobs; t++) pthread_create(&th[t], nullptr, gg_work, &J); for (int t = 0; t < jobs; t++) pthread_join(th[t], nullptr);
+    if (J.wp && (z3w_close(J.wp) || z3w_write_group(tb_opt(argc, argv, "--phase-out", ""), &um, 1, "phase", nullptr))) { fprintf(stderr, "gt-gate: phase write failure\n"); return 1; }
+    if (z3w_close(J.w) || z3w_write_group(out, &um, 1, "gt-gate", nullptr) || atomic_load(&J.fail)) { fprintf(stderr, "gt-gate: read / write failure\n"); return 1; }
+    const long long sh = atomic_load(&J.sheet), g = atomic_load(&J.gated);
+    printf("gt-gate: %lld GT sheet voxels, %lld cells with >= %d, %lld gated (support < %.2f) holding %.3f of the sheet voxels -> %s (key %s)\n",
+           sh, (long long)atomic_load(&J.cells), J.minn, (long long)atomic_load(&J.gcells), J.mins, sh ? (double)g / sh : 0, out, key);
+    if (J.odeg > 0) printf("gt-gate: --orient-deg %.0f: %lld cells gated for sheet direction (ours vs the m7 structure tensor)\n", J.odeg, (long long)atomic_load(&J.ocells));
+    printf("gt-gate: ray frame --dir %s: %lld of %lld shards parallel\n", J.dir, (long long)atomic_load(&J.npar), (long long)atomic_load(&J.nfr));
+    if (J.wp) printf("gt-gate: gated phase: %lld shards written (--min-keep %.2f, --shard-frac %.2f) -> %s\n", (long long)atomic_load(&J.pshards), J.minkeep, J.shfrac, tb_opt(argc, argv, "--phase-out", ""));
+    z3_close(J.gt); z3_close(J.pb); return 0;
+}
+
+/* ufsm phase-diff ROOT_A KEY_A ROOT_B KEY_B --box Z0,Y0,X0,NZ,NY,NX [--ct ROOT KEY --iso 64] [--threads N]
+   Histogram (20 bins over one turn, centred) of the phase difference A - B (PHASE_* codes 0..251, others unknown) where both are known
+   (and CT >= iso with --ct): a constant offset (e.g. surfaces on different papyrus faces) vs a spread (noise / wrong turns). */
+int cmd_phase_diff(int argc, char **argv) {
+    int64_t o[3], n[3]; int nt = atoi(tb_opt(argc, argv, "--threads", "0")); if (nt <= 0) nt = 16;
+    if (argc < 7 || tb_box(tb_opt(argc, argv, "--box", nullptr), o, n)) { fprintf(stderr, "usage: ufsm phase-diff ROOT_A KEY_A ROOT_B KEY_B --box Z0,Y0,X0,NZ,NY,NX [--ct ROOT KEY --iso 64]\n"); return 2; }
+    uint8_t *a = ps_box(argv[2], argv[3], nullptr, o, n, nt), *b = ps_box(argv[4], argv[5], nullptr, o, n, nt); if (!a || !b) return 1;
+    uint8_t *ct = nullptr; const int iso = atoi(tb_opt(argc, argv, "--iso", "64"));
+    uint8_t *mk[4] = {nullptr}; int nmk = 0, mkeep[4] = {0};   /* --mask R K (skip where nonzero) / --keep R K (skip where zero) */
+    for (int i = 6; i + 2 < argc; i++) {
+        if (!strcmp(argv[i], "--ct")) { ct = ps_box(argv[i + 1], argv[i + 2], nullptr, o, n, nt); if (!ct) return 1; }
+        if ((!strcmp(argv[i], "--mask") || !strcmp(argv[i], "--keep")) && nmk < 4) { mkeep[nmk] = !strcmp(argv[i], "--keep"); mk[nmk] = ps_box(argv[i + 1], argv[i + 2], nullptr, o, n, nt); if (!mk[nmk++]) return 1; }
+    }
+    const size_t N = (size_t)(n[0] * n[1] * n[2]); long long h[20] = {0}, tot = 0, side = 0;
+    for (size_t i = 0; i < N; i++) {
+        if (a[i] >= 252 || b[i] >= 252 || (ct && ct[i] < iso)) continue;
+        int skip = 0; for (int m = 0; m < nmk; m++) skip |= mkeep[m] ? !mk[m][i] : mk[m][i] != 0; if (skip) continue;
+        side += (a[i] < 126) == (b[i] < 126);   /* same half turn: recto (phase k .. k + 0.5) / verso */
+        int d = (int)a[i] - (int)b[i]; d = ((d % 252) + 252) % 252; if (d >= 126) d -= 252;   /* -126..125 */
+        int k = (int)floor((d + 126) / 12.6); k = k < 0 ? 0 : k > 19 ? 19 : k; h[k]++; tot++;
+    }
+    printf("phase-diff: %lld voxels with both phases%s; side agreement %.4f; A - B in turns (bin centre: share)\n", tot, ct ? " on papyrus" : "", tot ? (double)side / tot : 0);
+    for (int k = 0; k < 20; k++) printf("  %+.3f %.3f %s\n", -0.475 + 0.05 * k, tot ? (double)h[k] / tot : 0, "");
+    free(a); free(b); free(ct); for (int m = 0; m < nmk; m++) free(mk[m]); return 0;
 }
