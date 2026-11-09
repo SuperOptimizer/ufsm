@@ -57,6 +57,7 @@ typedef struct {
     int hsplit;                  /* lean, head slabs: the next batch's derived-target planes (side / winding) go up once the backward's head step
                                     read them (ev_hs), the input and packed targets (inside gout[0]) after the step's loss fetch (upload_tail) */
     uint8_t *lbh[4], *lbs[4];      /* g_lstream: the host label planes (phase, w4, component, ink / papyrus) and their device slab buffers */
+    uint8_t *lbs2[4]; void *evl_up[2], *evl_free[2];   /* the second slab set and the events of the upload pipeline (head_slab_pass: slab j + 1 uploads on the aux stream while slab j computes); lbs2[0] nullptr: uploads in the compute stream */
     void *ev_hs;                 /* hsplit: the head slabs' backward pass of the current step finished (stream 0) */
     int lean;                    /* one batch buffer; logit gradient in the model's gradient buffer B */
     int gl_inside;               /* lean: the logit gradient lives in the model's gradient buffers (setup checked the batch overlap) */
@@ -779,6 +780,7 @@ static void verso_target(gpu_state *d, shape5 xs) {
    step, head_slab_cb): the head again, each loss's gradient in place over the slab's logits, the head backward of the slab. The
    per-voxel arithmetic is the whole-window path's (fp64 sums in another order; the head backward's SR seed is the backward's) */
 int nn_lat_set_slow(int on);   /* (nn_lat.cu) */
+void nn_h2d_stream(int k, void *d, const void *s, size_t n);   /* (nn_core.cu) */
 static void head_slab_pass(gpu_state *d, int pass) {
     const int D = g_Pz, H = d->hs_P, W = d->hs_P, Z = d->hs_z;
     const size_t hw = (size_t)H * W, l3 = (size_t)D * hw;
@@ -793,15 +795,35 @@ static void head_slab_pass(gpu_state *d, int pass) {
         const size_t ns = (size_t)nz * hw, vb = (size_t)z0 * hw;
 #define LGC(c) ((char *)d->hs_lg + (size_t)(c) * ns * 2)
         const uint8_t *sdb = d->sdb, *ink = d->ink, *w4 = d->w4, *wc = d->wc;
+        const int sj = z0 / Z, pipe = g_lstream && d->lbs2[0]; uint8_t *const *const lb = pipe && (sj & 1) ? d->lbs2 : d->lbs;
         if (g_lstream) {   /* this slab's label planes from the host (the phase with the gradient stencil's g_norm_s planes each side); the kernels index window voxels */
             const int za = z0 - g_norm_s > 0 ? z0 - g_norm_s : 0, zb = z1 + g_norm_s < D ? z1 + g_norm_s : D;
-            if (g_side) { nn_h2d_async(d->lbs[0], d->lbh[0] + (size_t)za * hw, (size_t)(zb - za) * hw); sdb = d->lbs[0] - (size_t)za * hw; }
-            if (g_unwrap2) { nn_h2d_async(d->lbs[1], d->lbh[1] + vb, ns); nn_h2d_async(d->lbs[2], d->lbh[2] + vb, ns); w4 = d->lbs[1] - vb; wc = d->lbs[2] - vb; }
-            if (IPLANE) { nn_h2d_async(d->lbs[3], d->lbh[3] + vb, ns); ink = d->lbs[3] - vb; }
+            if (pipe) {   /* the uploads on the aux stream, one slab ahead into the other buffer set: the PCIe copies (4 bytes a voxel per pass; 73 ms of a
+                             P768 pass when they sat in the compute stream) run under the previous slab's kernels. A set is rewritten after the kernels
+                             of its last slab (evl_free), the slab's kernels wait for their set (evl_up) */
+                for (int q = sj ? sj + 1 : 0; q <= sj + 1 && q * Z < D; q++) {
+                    const int y0 = q * Z, y1 = y0 + Z < D ? y0 + Z : D, ya = y0 - g_norm_s > 0 ? y0 - g_norm_s : 0, yb = y1 + g_norm_s < D ? y1 + g_norm_s : D, st = q & 1;
+                    uint8_t *const *const l2 = st ? d->lbs2 : d->lbs; const size_t n2 = (size_t)(y1 - y0) * hw, v2 = (size_t)y0 * hw;
+                    if (!q) nn_stream_wait(2, d->ev_up[d->cur]);   /* (the host planes: this batch's upload wrote them) */
+                    nn_stream_wait(2, d->evl_free[st]);
+                    if (g_side) nn_h2d_stream(2, l2[0], d->lbh[0] + (size_t)ya * hw, (size_t)(yb - ya) * hw);
+                    if (g_unwrap2) { nn_h2d_stream(2, l2[1], d->lbh[1] + v2, n2); nn_h2d_stream(2, l2[2], d->lbh[2] + v2, n2); }
+                    if (IPLANE) nn_h2d_stream(2, l2[3], d->lbh[3] + v2, n2);
+                    nn_event_record(d->evl_up[st], 2);
+                }
+                nn_stream_wait(0, d->evl_up[sj & 1]);
+            } else {
+                if (g_side) nn_h2d_async(lb[0], d->lbh[0] + (size_t)za * hw, (size_t)(zb - za) * hw);
+                if (g_unwrap2) { nn_h2d_async(lb[1], d->lbh[1] + vb, ns); nn_h2d_async(lb[2], d->lbh[2] + vb, ns); }
+                if (IPLANE) nn_h2d_async(lb[3], d->lbh[3] + vb, ns);
+            }
+            if (g_side) sdb = lb[0] - (size_t)za * hw;
+            if (g_unwrap2) { w4 = lb[1] - vb; wc = lb[2] - vb; }
+            if (IPLANE) ink = lb[3] - vb;
             if (g_lcheck) {   /* the streamed slab against the device planes */
                 const uint8_t *dv[4] = {d->sdb + (size_t)za * hw, d->w4 + vb, d->wc + vb, d->ink + vb}; const size_t nb[4] = {(size_t)(zb - za) * hw, ns, ns, ns};
                 uint8_t *ha = malloc(nb[0]), *hb = malloc(nb[0]); static long tot, bad; nn_sync();
-                for (int k = 0; k < 4; k++) { nn_d2h(ha, d->lbs[k], nb[k]); nn_d2h(hb, dv[k], nb[k]); size_t nd = 0; for (size_t j = 0; j < nb[k]; j++) nd += ha[j] != hb[j]; tot += (long)nb[k]; bad += (long)nd; }
+                for (int k = 0; k < 4; k++) { nn_d2h(ha, lb[k], nb[k]); nn_d2h(hb, dv[k], nb[k]); size_t nd = 0; for (size_t j = 0; j < nb[k]; j++) nd += ha[j] != hb[j]; tot += (long)nb[k]; bad += (long)nd; }
                 free(ha); free(hb); if (z1 == D) fprintf(stderr, "lat stream check: pass %d, %ld of %ld slab bytes differ so far\n", pass, bad, tot);
             }
         }
@@ -849,6 +871,7 @@ static void head_slab_pass(gpu_state *d, int pass) {
             nn_loss_stats_acc(LGC(g_norm_ch), d->nt, d->nm, d->nw, seven, d->hs_ds + 20);
             if (g_pg_lambda > 0) nn_pgrad_slab(d->hs_train ? nullptr : LGC(g_side_ch), d->hs_train ? nullptr : LGC(g_side_ch + 1), sdb, d->sidem, D, H, W, z0, z1, g_norm_s, g_pg_dist, g_pg_nd, g_pg_angle, g_pg_mask, d->hs_ds + 56, nullptr);   /* (training: the pair weights only; the loss sum comes from the gradient pass, + 58) */
             PT("losses");
+            if (pipe) nn_event_record(d->evl_free[sj & 1], 0);
             continue;
         }
         if (!g_unwrap2) {
@@ -888,6 +911,7 @@ static void head_slab_pass(gpu_state *d, int pass) {
             }
         }
         PT("adjoint");
+        if (pipe) nn_event_record(d->evl_free[sj & 1], 0);
 #undef LGC
 #undef PT
     }
@@ -2429,6 +2453,11 @@ int cmd_train(int argc, char **argv) {
         const size_t lp3 = g_lstream && !g_lcheck ? 256 : (size_t)B * p3;   /* g_lstream: no device label planes */
         if (g_lstream) {
             for (int k = 0; k < 4; k++) { d->lbh[k] = nn_host_alloc(p3); d->lbs[k] = nn_malloc((size_t)(g_hs_z + (k ? 0 : 2 * g_norm_s)) * P * P); }
+            if (!getenv("UFSM_LAT_PIPE") || ufsm_env_on("UFSM_LAT_PIPE")) {   /* the second slab set of the upload pipeline (4 x 32 planes: 0.08 GB at P768); none when the device is full */
+                for (int k = 0; k < 4; k++) if (!(d->lbs2[k] = nn_malloc_try((size_t)(g_hs_z + (k ? 0 : 2 * g_norm_s)) * P * P))) { for (int j = 0; j < k; j++) nn_free(d->lbs2[j]); d->lbs2[0] = nullptr; break; }
+                if (d->lbs2[0]) for (int k = 0; k < 2; k++) { d->evl_up[k] = nn_event_create(); d->evl_free[k] = nn_event_create(); nn_event_record(d->evl_up[k], 0); nn_event_record(d->evl_free[k], 0); }
+                else fprintf(stderr, "latent grid: no device memory for the second label slab set, slab uploads in the compute stream\n");
+            }
             if (g == 0) fprintf(stderr, "latent grid: label planes in pinned host memory (%.2f GB), uploaded per head slab (-%.2f GB on the device; UFSM_LAT_STREAM=0 off)\n", 4 * p3 / 1e9, 4 * p3 / 1e9);
         }
         if (g_side) {
