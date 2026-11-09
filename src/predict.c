@@ -881,7 +881,7 @@ int cmd_predict(int argc, char **argv) {
                           "of the box (--grid-origin anchored) and join them with scripts/unroll/fields_cat.sh\n");
           return 2;
       } }
-    if (ffd && (cfg.cout < 11 || half || sheet_task)) { fprintf(stderr, "predict: --fit-fields needs a task unwrap checkpoint (11+ outputs) at full resolution\n"); return 2; }
+    if (ffd && (cfg.cout < 11 || (half && half != 3) || sheet_task)) { fprintf(stderr, "predict: --fit-fields needs a task unwrap checkpoint (11+ outputs) at full resolution or on the latent grid (train --lat 4)\n"); return 2; }
     /* the head layout: task unwrap (recto 0, ink 1, phase 2-3, normal 4-9, density 10) or unwrap2 (phase 0-1, normal 2-7, density 8,
        winding mod 4 9-10: no recto; the winding mod 4 pooled into the relative planes dz dy dx dq over --fit-w4-d voxels) */
     const int ffu2 = ffd && checkpoint_unwrap_version(ckpt) == 2;
@@ -1020,7 +1020,7 @@ int cmd_predict(int argc, char **argv) {
         if (k) nn_init(gpus[1]);
         if (gnh) unet_gn_freeze(uk, gnh);
         if (ffd || sweep_out) unet_set_head_channels(uk, 0, cfg.cout);   /* every head: the recto channel 0 is written, the others pooled (or swept) */
-        else if (rvfuse) unet_set_head_channels(uk, 0, 2);   /* --channel rv: both side logits, fused into channel 0 after the forward */
+        else if (rvfuse) unet_set_head_channels(uk, 0, cfg.lat_guide ? cfg.cout : 2);   /* --channel rv: both side logits, fused into channel 0 after the forward */
         else if (!sheet_task) unet_set_head_channels(uk, hmode == 2 ? 8 * out_ch : out_ch, hmode == 2 ? 8 : 1);   /* only the written logit channel (desk widths: -24 B per window voxel) */
         /* fp16 logits (MX activations): the readers below take them as they are (nn_set_logits_h16 after each forward); the 11 heads
            of --fit-zarr were 44 B per window voxel in fp32, which pushed 640^3 windows past the 16 GB card (paged: 40x slower).
@@ -1216,7 +1216,7 @@ int cmd_predict(int argc, char **argv) {
         xd_shared = xd != nullptr;
         if (!xd && !ct_stem) xd = nn_malloc((size_t)xs.c * w3 * (h16 ? 2 : 4));
         if (auxz) { auxd = nn_malloc(w3); auxh = malloc(w3); }
-        if (half) { x2 = nn_malloc(shape_numel(xn) * (h16 ? 2 : 4)); lgf = nn_malloc(w3 * 4 * (rvfuse ? 2 : 1)); if (lat_store) { lz_h = nn_host_alloc(w3 / 64 * (lz_c + 1)); lz_d = nn_malloc(w3 / 64 * (lz_c + 1)); } if (hdiv > 2) lrt = nn_malloc(w3 / 8 * 16); }
+        if (half) { x2 = nn_malloc(shape_numel(xn) * (h16 ? 2 : 4)); lgf = nn_malloc(ffd ? w3 * 2 * cfg.cout : w3 * 4 * (rvfuse ? 2 : 1));   /* (fit fields from a latent-grid net: every head at full resolution, fp16) */ if (lat_store) { lz_h = nn_host_alloc(w3 / 64 * (lz_c + 1)); lz_d = nn_malloc(w3 / 64 * (lz_c + 1)); } if (hdiv > 2) lrt = nn_malloc(w3 / 8 * 16); }
         if (ct_stem) fprintf(stderr, "predict: in-place slab inference from the CT window (%.1f B per window voxel)\n", (double)unet_activation_bytes(u) / w3);
         if (tta > 1 && (!ct_stem || !ct_shared || degrade || auxz || cfg.cin != 4)) { fprintf(stderr, "predict: --tta needs the CT-stem device path (no --aug-*, --aux, extra inputs)\n"); return 2; }
     }
@@ -1633,7 +1633,7 @@ int cmd_predict(int argc, char **argv) {
                     const int64_t oc[3] = {(o[0] - lz_org[0]) / 4, (o[1] - lz_org[1]) / 4, (o[2] - lz_org[2]) / 4}, nc[3] = {wc, wc, wc};
                     if (zr_read_i8(&lzr, oc, nc, lz_h)) { fprintf(stderr, "predict: --latents: read failed\n"); return 1; }
                     double s1 = 0, s2 = 0;   /* the window's mean / sd from the coefficients (orthonormal axes: sum of squares = the cell's energy, less the dropped axes') */
-                    for (size_t k = 0; k < ncell; k++) { const int8_t *q = lz_h + k * (lz_c + 1); const double dc = ((int)q[0] + 128 + 256 * (int)q[1]) * lz_sraw; s1 += dc; double e = dc * dc; for (int c = 2; c <= lz_c; c++) e += (double)q[c] * q[c] * lz_sraw * lz_sraw; s2 += e; }
+                    for (size_t k = 0; k < ncell; k++) { const int8_t *q = lz_h + k * (lz_c + 1); const double dc = ((int)(uint8_t)q[0] + 256 * (int)q[1]) * lz_sraw; s1 += dc; double e = dc * dc; for (int c = 2; c <= lz_c; c++) e += (double)q[c] * q[c] * lz_sraw * lz_sraw; s2 += e; }
                     const double lmean = s1 / (8.0 * (double)ncell), lvar = s2 / (64.0 * (double)ncell) - lmean * lmean, lsd = sqrt(lvar > 0 ? lvar : 0) + 1e-3;
                     { static int once; if (!once++ && ufsm_env_on("UFSM_LAT_DEBUG")) fprintf(stderr, "\npredict --latents: first window mean / sd from the latents %.3f / %.3f, from the CT %.3f / %.3f\n", lmean, lsd, mean, sd); }
                     nn_h2d(lz_d, lz_h, ncell * (lz_c + 1));
@@ -1642,18 +1642,30 @@ int cmd_predict(int argc, char **argv) {
                 if (latc) nn_lat_input_x(xd, W / 4, W / 4, W / 4, lbas, lgain, latc, lstep, x2);   /* the learned cell channels of a --lat-basis checkpoint */
                 else nn_lowres_input(xd, xs, hdiv, hmode, lrt, x2, h16);
                 const float *l2 = unet_forward_x(u, x2, xn, 0, h16);
-                nn_lowres_output(l2, unet_logits_h16(u), (shape5){1, rvfuse ? 2 : 1, W / hdiv, W / hdiv, W / hdiv}, hdiv, hmode, (float *)lrt, lgf);   /* (--channel rv on a latent-grid net: both side logits) */
+                if (ffd) nn_lat_up_slab(l2, unet_logits_h16(u), cfg.cout, W / 4, W / 4, W / 4, 0, W, lgf);   /* [cout][W][W][W] fp16: the accumulators' layout */
+                else if (rvfuse && cfg.lat_guide) {   /* the guided head: the two side logits and their 5 coefficient planes one 32-plane slab at a time (fp16), the CT terms, into [2][W][W][W] */
+                    static void *gsl; const size_t hw_ = (size_t)W * W, ns_ = 32 * hw_, cv_ = w3 / 64, es_ = unet_logits_h16(u) ? 2 : 4; const int nb_ = cfg.cout - cfg.lat_guide;
+                    if (!gsl) gsl = nn_malloc(7 * ns_ * 2);
+                    if (!h16) { fprintf(stderr, "predict: the guided head needs 16-bit inputs\n"); return 2; }
+                    for (int z0 = 0; z0 < W; z0 += 32) {
+                        nn_lat_up_slab(l2, unet_logits_h16(u), 2, W / 4, W / 4, W / 4, z0, 32, gsl);
+                        nn_lat_up_slab((const char *)l2 + (size_t)nb_ * cv_ * es_, unet_logits_h16(u), 5, W / 4, W / 4, W / 4, z0, 32, (char *)gsl + 2 * ns_ * 2);
+                        nn_lat_guide(xd, W, W, W, z0, 32, gsl, 2, 0, 0);
+                        for (int c = 0; c < 2; c++) nn_d2d_async((char *)lgf + ((size_t)c * w3 + (size_t)z0 * hw_) * 2, (char *)gsl + (size_t)c * ns_ * 2, ns_ * 2);
+                    }
+                }
+                else nn_lowres_output(l2, unet_logits_h16(u), (shape5){1, rvfuse ? 2 : 1, W / hdiv, W / hdiv, W / hdiv}, hdiv, hmode, (float *)lrt, lgf);   /* (--channel rv on a latent-grid net: both side logits) */
                 lg = lgf;
             } else lg = ct_stem ? unet_forward_ct(u, ctd, (float)mean, (float)(1.0 / sd), dyd, dxd, ax.n > 0 ? (int)radial_sign : 0, xs, h16)
                                 : unet_forward_x(u, xd, xs, 0, h16);
-            if (rvfuse) nn_rv_fuse((void *)lg, w3, !half && unet_logits_h16(u));
+            if (rvfuse) nn_rv_fuse((void *)lg, w3, half ? cfg.lat_guide != 0 : unet_logits_h16(u));
             pred_mem_out(u, o);
             if (ctpre && i + 1 < rd.ntiles && atomic_load(&rd.filled) > i + 1) {   /* the next window's CT during this forward (its slot stays held
                                                                                          until that window's statistics, as with the plain upload) */
                 if (pre_i >= 0) nn_stream_wait(1, ev_preu);   /* (the previous prefetch's device copy has read ctpre) */
                 nn_h2d_copy_stream(ctpre, rd.buf[(i + 1) % NSLOT], w3); nn_event_record(ev_pre, 1); pre_i = i + 1;
             }
-            nn_set_logits_h16(!half && unet_logits_h16(u));   /* the readers of lg below */
+            nn_set_logits_h16(half ? ffd != nullptr || (rvfuse && cfg.lat_guide) : unet_logits_h16(u));   /* the readers of lg below */
             const uint8_t *ctk = ct_shared && ctcp ? ctcp : ctd; (void)ctk;   /* --fit-ct: the CT window as it was before the forward */
             { static int memi = -1; if (memi < 0) memi = ufsm_env_on("UFSM_PRED_MEMINFO"); if (memi == 1) { nn_sync(); fprintf(stderr, "\npredict: GPU free after the first window %.2f GB\n", nn_mem_free() / 1e9); memi = 2; } }
             if (gn_save) unet_gn_accumulate(u);

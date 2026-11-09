@@ -182,6 +182,8 @@ void nn_input_latc(const void *ct16, shape5 xs, const void *rec, const float *ba
 /* predict --latents: the cell channels from a latcomp store's indices q (int8 [d][h][w](C + 1), lc_cli.c layout; raw-domain step) with the window's
    mean / 1 / sd; the radial means from x's channels 1-3 */
 void nn_lat_input_q(const void *q, const void *x, int d, int h, int w, const float *gain, int C, float step_raw, float mean, float isd, void *y);
+/* the guided head (unet_cfg.lat_guide): see nn_lat.cu lat_guide_k */
+void nn_lat_guide(const void *x, int D, int H, int W, int z0, int nz, void *lg, int base, int c0, int dir);
 void nn_lat_input_x(const void *x, int d, int h, int w, const float *bas, const float *gain, int C, float step, void *y);
 /* latent-grid logits -> one z-slab of fine logits and back (src/nn_lat.cu; the pool4 chain of nn_lowres_output, B 1): coarse lg
    [C][d][h][w] (fp16 when lh16, else fp32) -> fine planes [z0, z0 + nz) of the 4d x 4h x 4w window, fp16 [C][nz][4h][4w] in y;

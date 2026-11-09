@@ -1,6 +1,6 @@
 /* latcomp v1 stores (latfit.h): ufsm lc-encode writes a CT volume as quantised cell coefficients, ufsm lc-info reads one back.
    A store is a sharded zarr v3 int8 array [Z/4][Y/4][X/4](C + 1) (embz.h writer: zstd inner chunks): channels 0-1 the cell-mean
-   coefficient's quantiser index (low byte - 128, high byte: it is >= 0 for uint8 CT), 2.. the C - 1 principal-axis indices (|q| <= 127).
+   coefficient's quantiser index (low byte as uint8, high byte: it is >= 0 for uint8 CT; an absent chunk's zeros are air), 2.. the C - 1 principal-axis indices (|q| <= 127).
    Coefficients are of the raw CT bytes with one step for all (step_raw = step x sd_ref, sd_ref a typical window sd in grey levels):
    a window's z-score (v - mean) / sd is linear, so a reader gets the trainer's normalised channels as (q step_raw - [mean channel] 8 mean) / sd
    with the window's mean / sd from the coefficients themselves. basis.lcb in the store is the transform. */
@@ -27,12 +27,12 @@ static void *enc_run(void *arg) {
         float v[64]; double s2 = 0; int any = 0;
         for (int k = 0; k < 64; k++) { const uint8_t b = j->ct[((size_t)(4 * z + (k >> 4)) * Y + 4 * y + (k >> 2 & 3)) * X + 4 * x + (k & 3)]; v[k] = b; any |= b; s2 += (double)b * b; }
         int8_t *o = j->out + ((size_t)(z * cy + y) * cx + x) * (C + 1);
-        if (!any) { o[0] = -128; memset(o + 1, 0, C); j->hist[0][0]++; for (int c = 1; c <= C; c++) j->hist[c][128]++; continue; }   /* air */
+        if (!any) { memset(o, 0, C + 1); j->hist[0][0]++; for (int c = 1; c <= C; c++) j->hist[c][128]++; continue; }   /* air */
         double kept = 0, qe = 0;
         for (int c = 0; c < C; c++) {
             float s = 0; for (int k = 0; k < 64; k++) s += j->lb->b[c][k] * v[k];
             int q = (int)lrintf(s / j->step);
-            if (c == 0) { q = q < 0 ? 0 : q > 32767 ? 32767 : q; o[0] = (int8_t)((q & 255) - 128); o[1] = (int8_t)(q >> 8); j->hist[0][q & 255]++; j->hist[1][(q >> 8) + 128]++; }
+            if (c == 0) { q = q < 0 ? 0 : q > 32767 ? 32767 : q; o[0] = (int8_t)(uint8_t)(q & 255); o[1] = (int8_t)(q >> 8); j->hist[0][q & 255]++; j->hist[1][(q >> 8) + 128]++; }
             else { q = q < -127 ? -127 : q > 127 ? 127 : q; o[c + 1] = (int8_t)q; j->hist[c + 1][q + 128]++; }
             kept += (double)s * s; const double e = s - q * j->step; qe += e * e;
         }

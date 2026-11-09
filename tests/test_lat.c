@@ -65,6 +65,38 @@ int main(void) {
         nn_free(d_lc); nn_free(d_ref); nn_free(d_tmp); nn_free(d_g); nn_free(d_gref); nn_free(d_sl); nn_free(d_gs); nn_free(d_gc);
         free(lc); free(ref); free(g); free(gref); free(gc); free(lc16); free(fine); free(g16);
     }
+    {   /* the guided head (nn_lat_guide): dir 0 against a host reference; dir 1 is its adjoint in the coefficient planes: <fwd(b) - l, g> = <b, bwd(g)> */
+        const int D = 12, H = 8, W = 8, base = 2, NC = base + 5; const size_t hw = (size_t)H * W, fv = (size_t)D * hw;
+        uint16_t *x = malloc(fv * 2); for (size_t k = 0; k < fv; k++) x[k] = f2h(ru());
+        void *d_x = nn_malloc(fv * 2); nn_h2d(d_x, x, fv * 2);
+        static const int Zs[3] = {4, 12, 8};
+        for (int si = 0; si < 3; si++) {
+            const int Z = Zs[si]; double e0 = 0, dot1 = 0, dot2 = 0;
+            for (int z0 = 0; z0 < D; z0 += Z) {
+                const int nz = z0 + Z < D ? Z : D - z0; const size_t ns = (size_t)nz * hw;
+                uint16_t *l = malloc(NC * ns * 2), *o = malloc(NC * ns * 2), *g = malloc(NC * ns * 2), *bg = malloc(NC * ns * 2);
+                for (size_t k = 0; k < NC * ns; k++) { l[k] = f2h(ru()); g[k] = f2h(ru()); }
+                void *d_l = nn_malloc(NC * ns * 2), *d_g = nn_malloc(NC * ns * 2);
+                nn_h2d(d_l, l, NC * ns * 2); nn_lat_guide(d_x, D, H, W, z0, nz, d_l, base, 0, 0); nn_d2h(o, d_l, NC * ns * 2);
+                nn_h2d(d_g, g, NC * ns * 2); nn_lat_guide(d_x, D, H, W, z0, nz, d_g, base, 0, 1); nn_d2h(bg, d_g, NC * ns * 2);
+                for (size_t i = 0; i < ns; i++) {
+                    const int z = z0 + (int)(i / hw), y = (int)(i / W % H), xx = (int)(i % W); const size_t v = (size_t)z * hw + (size_t)y * W + xx;
+                    const float f[4] = {h2f(x[v]), 0.5f * (h2f(x[v + (z + 1 < D ? hw : 0)]) - h2f(x[v - (z > 0 ? hw : 0)])),
+                                        0.5f * (h2f(x[v + (y + 1 < H ? W : 0)]) - h2f(x[v - (y > 0 ? W : 0)])), 0.5f * (h2f(x[v + (xx + 1 < W ? 1 : 0)]) - h2f(x[v - (xx > 0 ? 1 : 0)]))};
+#define BP(k) h2f(l[(base + (k)) * ns + i])
+                    const float t = BP(2) * f[1] + BP(3) * f[2] + BP(4) * f[3], a0 = BP(0) * f[0] + t, a1 = BP(1) * f[0] - t;
+                    e0 = fmax(e0, fabs(h2f(o[i]) - (h2f(l[i]) + a0)) / (1e-2 + fabs(h2f(l[i]) + a0))); e0 = fmax(e0, fabs(h2f(o[ns + i]) - (h2f(l[ns + i]) + a1)) / (1e-2 + fabs(h2f(l[ns + i]) + a1)));
+                    dot1 += (double)a0 * h2f(g[i]) + (double)a1 * h2f(g[ns + i]);
+                    for (int k = 0; k < 5; k++) dot2 += (double)BP(k) * h2f(bg[(base + k) * ns + i]);
+#undef BP
+                }
+                free(l); free(o); free(g); free(bg); nn_free(d_l); nn_free(d_g);
+            }
+            const double de = fabs(dot1 - dot2) / (1e-9 + fabs(dot1)); cases++;
+            if (!(e0 < 3e-3) || !(de < 2e-3)) { fprintf(stderr, "FAIL: guided head, slab %d: forward rel err %.3g, adjoint dot rel err %.3g\n", Z, e0, de); fails++; }
+        }
+        free(x); nn_free(d_x);
+    }
     const char *e = nn_check(); if (e) { fprintf(stderr, "FAIL: CUDA error %s\n", e); fails++; }
     if (fails) { printf("test_lat: %d of %d cases FAIL\n", fails, cases); return 1; }
     printf("test_lat: ok (%d cases: slab upsampling = the pool4 chain, adjoint = nn_lowres_grad, dot products)\n", cases);
