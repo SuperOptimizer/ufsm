@@ -2839,9 +2839,9 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
             if (c->side) memset(b->side + (size_t)i * p3, SIDE_UNKNOWN, p3);
         } else if (stored_phase) {   /* the stored phase (ufsm phase-raster, ufsm downsample --mode phase) */
             /* unwarped or device-warped windows (and no sheet prior): the block's planes in worker scratch that is dead here instead of the
-               pool (4 window planes less per worker: ~4 B per voxel at P 960, 3.5 GB): the targets (ttmp, last read by the packing above,
-               2 P^3 + 4 KB) and big + P^3 .. 3 P^3 (the region / scan / distance scratch, free after the scanner augmentation; written
-               again only by write_spatial_tm, which these windows skip) */
+               pool (4 window planes less per worker: 4 B per voxel, 3.5 GB at P 960): the targets (ttmp, last read by the packing above,
+               2 P^3 + 4 KB), big + P^3 (the region / scan scratch, free after the scanner augmentation) and big + 9 P^3 (the loss mask,
+               last read by the packing too); write_spatial_tm and the sheet prior would read them again, and these windows skip both */
             const int ph_own = !c->sheet && (!spatial.active || lw);
 #define PH_GET(own_, n_) (ph_own ? (uint8_t *)(own_) : (uint8_t *)tp_get((n_), 0))
 #define PH_PUT(p_, n_) do { if (!ph_own) tp_put((p_), (n_)); } while (0)
@@ -2863,7 +2863,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
                 PH_PUT(wt, p3);
             }
             if (c->wind4 && !s->scope_local) {   /* ("scope": "local": the winding mod 4 stays unknown, below) */   /* the winding mod 4: the phase unwrapped before the air test (gaps join the windings), outside the scroll (CT 0) not */
-                uint8_t *pw = PH_GET(ttmp + p3 + 64, p3), *ww = PH_GET(big + p3, p3), *wc = PH_GET(big + 2 * p3, p3);
+                uint8_t *pw = PH_GET(ttmp + p3 + 64, p3), *ww = PH_GET(big + p3, p3), *wc = PH_GET(big + 9 * p3, p3);
                 if (!pw || !ww || !wc) { PH_PUT(pw, p3); PH_PUT(ww, p3); PH_PUT(wc, p3); PH_PUT(sw, p3 + 64); return -1; }
                 phase_air(ctu, sw, pw, p3, c->side_air); air_done = 1;   /* (the winding input and the air test in one pass) */
                 const int wt = c->wind4_tile < 0 ? 0 : c->wind4_tile > (P + 5) / 6 ? c->wind4_tile : (P + 5) / 6;   /* (<= 6^3 tiles: one gauge each fits the loss's 255) */
@@ -3493,7 +3493,7 @@ size_t resident_bytes(const void *p, size_t n) {   /* touched (resident) bytes o
     free(v); return r * pg;
 }
 /* UFSM_HOSTMEM=1: where the host bytes are (racy reads of the workers' pools: a debugging aid, not exact under churn) */
-void sampler_hostmem(const sampler *sp, FILE *f) {
+void sampler_hostmem(const sampler *sp, FILE *f, size_t pinned) {
     const double p3 = sp ? (double)P3(sp) : 1.0, G = 1e9;
     double bigr = 0, bigv = 0, ttr = 0, ttv = 0, tpv = 0, tpr = 0, tpk = 0; int nw = 0; char cls[512] = ""; size_t cl = 0;
     for (int w = 0; w < WM_MAX; w++) {
@@ -3512,7 +3512,7 @@ void sampler_hostmem(const sampler *sp, FILE *f) {
     if (st) { while (fgets(line, sizeof line, st)) if (!strncmp(line, "VmRSS:", 6)) rss = atol(line + 6); fclose(st); }
     fprintf(f, "hostmem: rss %.2f GB | pinned %.2f GB (slots %.2f) | workers %d: big %.2f/%.2f GB res/virt, ttmp %.2f/%.2f, pool %.2f virt (peak %.2f, pooled res %.2f)"
                " | malloc arena %.2f GB in use %.2f free %.2f mmapped %.2f | p3 %.0f M; pool classes of a worker (x p3):%s\n",
-            rss / 1048576.0, nn_host_bytes() / G, g_slot_bytes / G, nw, bigr / G, bigv / G, ttr / G, ttv / G, tpv / G, tpk / G, tpr / G,
+            rss / 1048576.0, pinned / G, g_slot_bytes / G, nw, bigr / G, bigv / G, ttr / G, ttv / G, tpv / G, tpk / G, tpr / G,
             (mi.arena) / G, mi.uordblks / G, mi.fordblks / G, mi.hblkhd / G, p3 / 1e6, cls);
 }
 void sampler_stop(sampler *sp) {
