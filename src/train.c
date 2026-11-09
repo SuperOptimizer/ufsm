@@ -94,6 +94,7 @@ typedef struct {
 } gpu_state;
 /* task band_affinity: output channel 0 = recto (dense loss on target channel 0), channels 1..K = affinities for g_aff_off */
 static const char *g_lat_fit; static int g_lat_fit_n = 24, g_lat_fit_k;   /* --lat-fit FILE [--lat-fit-n N]: fit the cell transform (latfit.h) on N training windows, write it, exit */
+static float g_lat_jit;   /* --lat-step-jitter J: each training window quantised with step x 2^(J u), u uniform in [-1, 1] (a latent store's step in window-normalised units varies with the window's sd) */
 static int g_lat_c, g_lat_have; static float g_lat_step, g_lat_bas[29 * 64], g_lat_gain[29];   /* --lat-basis FILE [--lat-c 29 --lat-step 0.25]: the learned cell channels (latfit.h) */
 static int g_lcheck;    /* UFSM_LAT_STREAM=check: the device planes as well, every slab compared byte for byte */
 static int g_lstream;   /* --lat: the label planes (phase, winding mod 4 + component, papyrus) live in pinned host memory and reach the device one head slab at a time (lab_stream; UFSM_LAT_STREAM=0 off) */
@@ -951,6 +952,11 @@ static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
     const shape5 hs = {B, g_cout, q, q, q};   /* --half-res: the network's grid, the full-resolution output channels */
     mem_pre(d, B, train);
     view_set(d, B);
+    if (g_lat_c && g_lat_jit > 0.f) {
+        const float *jb, *jg; float jst = 0.f; unet_lat_basis(d->u, &jb, &jg, &jst);   /* (the checkpoint's own step on a resume) */
+        static uint64_t js = 0x7f4a7c159e3779b9ull; js ^= js << 13; js ^= js >> 7; js ^= js << 17;
+        unet_set_lat_step(d->u, train && jst > 0.f ? jst * exp2f(g_lat_jit * (float)((js >> 11) * (2.0 / 9007199254740992.0) - 1.0)) : 0.f);
+    }
     if (g_lat_fit && train) {   /* the cell transform's fit on this window's device-built CT channel */
         const size_t p3_ = (size_t)g_Pz * P * P; uint16_t *hx = malloc(p3_ * 2); nn_sync(); nn_d2h(hx, d->x, p3_ * 2);
         latfit_acc(hx, g_Pz, P, 5, g_lat_fit_k); free(hx);
@@ -1718,6 +1724,7 @@ int cmd_train(int argc, char **argv) {
             if (P % (4 << (cfg.nlev - 1)) || g_Pz % (4 << (cfg.nlev - 1))) { fprintf(stderr, "--lat 4: P must be divisible by %d\n", 4 << (cfg.nlev - 1)); return 2; }
             g_half = 0; cfg.half_res = 3; cfg.cin = 4; cfg.cout = g_cout;
             const char *lbp = opt(argc, argv, "--lat-basis", nullptr);
+            g_lat_jit = (float)atof(opt(argc, argv, "--lat-step-jitter", "0"));
             if (resume) { unet_cfg pc; int st; if (!unet_peek(resume, &pc, &st) && pc.half_res == 3 && pc.cin > 4) { g_lat_c = pc.cin - 3; cfg.cin = pc.cin; lbp = nullptr; } }   /* (its transform comes with the checkpoint) */
             if (lbp) {
                 lat_basis *lb = malloc(sizeof *lb); if (lat_basis_load(lbp, lb)) { fprintf(stderr, "--lat-basis: cannot read %s (train --lat-fit writes it)\n", lbp); return 2; }

@@ -288,6 +288,7 @@ void unet_set_input_rad(unet *u, const void *rec);
 /* latent-grid nets (half_res 3) with the learned cell transform (latfit.h): bas [C][64], gain [C], the quantiser step (0: none); cfg.cin = C + 3.
    Saved in the checkpoint header and set again by unet_load. unet_lat_basis: C (0: plain cell means) and the device copies. */
 void unet_set_lat_basis(unet *u, const float *bas, const float *gain, int C, float step);
+void unet_set_lat_step(unet *u, float step);   /* the next forwards' quantiser step (train --lat-step-jitter); 0: the transform's */
 int unet_lat_basis(const unet *u, const float **bas, const float **gain, float *step);
 int unet_logits_h16(const unet *u);   /* the logits unet_forward returns are fp16 (lean 2 training: the logit gradient fits after them) */
 /* head slabs (training): the forward skips the 1^3 head and allocates no whole-window logits; the caller runs it per z-slab

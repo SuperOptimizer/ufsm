@@ -149,7 +149,7 @@ struct unet {
     int xin_shared, xin_out, a2_stale, fwd_train;       /* training: the network input lives in dec[0].a2's buffer (host copy in between); the
                                                 buffer holds the input since a backward (a repeated backward re-runs dec[0].c2) */
     size_t xin_bytes; void *h_xin, *ev_xin[4];
-    float *lat_bas, *lat_gain, lat_step, lat_hb[29 * 64], lat_hg[29]; int lat_C;   /* unet_set_lat_basis: the learned cell transform of a latent-grid net (cfg.cin = lat_C + 3) */
+    float *lat_bas, *lat_gain, lat_step, lat_run_step, lat_hb[29 * 64], lat_hg[29]; int lat_C;   /* unet_set_lat_basis: the learned cell transform of a latent-grid net (cfg.cin = lat_C + 3) */
     const void *rad;                         /* unet_set_input_rad (train --gpu-input): the 16-bit input is the CT alone, these radial records
                                                 build the 4 MX input channels (nn_input_rad) */
     int a0_share, a2_out;                    /* level-0 A in dec[0].a2's buffer; enc[0].a2 on the host from its forward to dec[0]'s conv1 weight
@@ -1624,6 +1624,7 @@ void unet_set_lat_basis(unet *u, const float *bas, const float *gain, int C, flo
     if (!u->lat_bas) { u->lat_bas = nn_malloc(29 * 64 * 4); u->lat_gain = nn_malloc(29 * 4); }
     nn_h2d(u->lat_bas, u->lat_hb, (size_t)C * 64 * 4); nn_h2d(u->lat_gain, u->lat_hg, (size_t)C * 4);
 }
+void unet_set_lat_step(unet *u, float step) { u->lat_run_step = step; }   /* this forward's quantiser step (training jitter); 0: the transform's own */
 int unet_lat_basis(const unet *u, const float **bas, const float **gain, float *step) { if (u->lat_C) { *bas = u->lat_bas; *gain = u->lat_gain; *step = u->lat_step; } return u->lat_C; }
 int unet_logits_h16(const unet *u) { return u->built && u->logits_h16; }
 void unet_set_fp16_logits(unet *u, int on) {   /* takes effect at the next build */
@@ -2525,7 +2526,7 @@ const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x
     else if (x_h16 && act_mx8() && xin_mx) {
         if (!u->xin) u->xin = dalloc_input(u, xs);
         if (u->rad && u->cfg.half_res == 2) nn_input_rad_pack(x, xs, u->rad, u->xin);   /* --half-res pack: x is the full-resolution CT channel */
-        else if (u->rad && u->cfg.half_res == 3 && u->lat_C) nn_input_latc(x, xs, u->rad, u->lat_bas, u->lat_gain, u->lat_C, u->lat_step, u->xin);   /* --lat-basis: the learned cell channels */
+        else if (u->rad && u->cfg.half_res == 3 && u->lat_C) nn_input_latc(x, xs, u->rad, u->lat_bas, u->lat_gain, u->lat_C, u->lat_run_step > 0.f ? u->lat_run_step : u->lat_step, u->xin);   /* --lat-basis: the learned cell channels */
         else if (u->rad && u->cfg.half_res == 3) nn_input_lat(x, xs, u->rad, u->xin);   /* train --lat 4: the 4^3 cell means, x the full-resolution CT channel */
         else if (u->rad && u->l0rx) { u->l0x_ct = x; for (int k = 0; k < 16; k++) u->l0x_held[k] = -1; }   /* (stage S4: per slab in the stream, l0x_need) */
         else if (u->rad) nn_input_rad(x, xs, u->rad, u->xin);   /* --gpu-input: x is the CT channel, the radial channels from the records */
