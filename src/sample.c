@@ -2437,12 +2437,9 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
         tp_put(pm, p3);
     }
     /* targets */
-    static _Thread_local uint8_t *inkw_tl; static _Thread_local size_t inkw_n;   /* --ink-head: the window's ink plane (a worker's own buffer) */
-    uint8_t *inkw = nullptr;
-    if (c->ink_plane) {
-        if (inkw_n < p3) { free(inkw_tl); inkw_tl = malloc(p3); inkw_n = inkw_tl ? p3 : 0; }
-        inkw = inkw_tl;
-    }
+    /* --ink-head: the window's ink plane, built in the batch's own plane (on the source grid; the symmetry / host warp below moves it
+       through big + P^3, free by then): no worker buffer of P^3 bytes */
+    uint8_t *inkw = c->ink_plane ? b->ink + (size_t)i * p3 : nullptr;
     uint8_t w[NCH] = {0};
     int tmax = 0;
     for (int ch = 0; ch < NCH; ch++) {
@@ -2841,40 +2838,47 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
             if (c->band) memset(b->band + (size_t)i * p3, BAND_UNKNOWN, p3);
             if (c->side) memset(b->side + (size_t)i * p3, SIDE_UNKNOWN, p3);
         } else if (stored_phase) {   /* the stored phase (ufsm phase-raster, ufsm downsample --mode phase) */
-            uint8_t *sw = tp_get(p3 + 64, 0);   /* (+ 64: warp_phase_w4 reads byte pairs as 32-bit words) */
+            /* unwarped or device-warped windows (and no sheet prior): the block's planes in worker scratch that is dead here instead of the
+               pool (4 window planes less per worker: ~4 B per voxel at P 960, 3.5 GB): the targets (ttmp, last read by the packing above,
+               2 P^3 + 4 KB) and big + P^3 .. 3 P^3 (the region / scan / distance scratch, free after the scanner augmentation; written
+               again only by write_spatial_tm, which these windows skip) */
+            const int ph_own = !c->sheet && (!spatial.active || lw);
+#define PH_GET(own_, n_) (ph_own ? (uint8_t *)(own_) : (uint8_t *)tp_get((n_), 0))
+#define PH_PUT(p_, n_) do { if (!ph_own) tp_put((p_), (n_)); } while (0)
+            uint8_t *sw = PH_GET(ttmp, p3 + 64);   /* (+ 64: warp_phase_w4 reads byte pairs as 32-bit words) */
             int air_done = 0;   /* (phase_air ran with the winding input) */
             uint16_t *wq = nullptr;   /* warped --task unwrap2: the winding and its component for warp_phase_w4 (one pass with the phase) */
-            if (!sw || (g_crush.ph ? (memcpy(sw, g_crush.ph, p3), 0) : phase_window(s->phase, o, Pz, P, pshift, sw))) { tp_put(sw, p3 + 64); return -1; }
+            if (!sw || (g_crush.ph ? (memcpy(sw, g_crush.ph, p3), 0) : phase_window(s->phase, o, Pz, P, pshift, sw))) { PH_PUT(sw, p3 + 64); return -1; }
             if (s->phase_sign < 0) phase_negate(sw, p3);   /* (before the winding mod 4: it unwraps this phase) */
             if (s->phase_ign && pshift < 2 && !g_crush.pre) {   /* (--aug-tear: applied before the cut) (interpolated 2.4 um windows: no mask) "ignore": label sets that disagree there (ufsm phase-conflict): unknown, not trained on */
-                uint8_t *ig = tp_get(p3, 0);
-                if (!ig || (g_crush.ig ? (memcpy(ig, g_crush.ig, p3), 0) : phase_window(s->phase_ign, o, Pz, P, pshift, ig))) { tp_put(ig, p3); tp_put(sw, p3 + 64); return -1; }
+                uint8_t *ig = PH_GET(big + p3, p3);
+                if (!ig || (g_crush.ig ? (memcpy(ig, g_crush.ig, p3), 0) : phase_window(s->phase_ign, o, Pz, P, pshift, ig))) { PH_PUT(ig, p3); PH_PUT(sw, p3 + 64); return -1; }
                 for (size_t k = 0; k < p3; k++) if (ig[k] && ig[k] != PHASE_UNKNOWN) sw[k] = PHASE_UNKNOWN;   /* (outside the mask array: 255 = keep) */
-                tp_put(ig, p3);
+                PH_PUT(ig, p3);
             }
             if (s->phase_wt && pshift < 2 && !g_crush.pre) {   /* "weight": each 8^3 block of the window keeps its phase with probability w / 255 */
-                uint8_t *wt = tp_get(p3, 0);
-                if (!wt || phase_window(s->phase_wt, o, Pz, P, pshift, wt)) { tp_put(wt, p3); tp_put(sw, p3 + 64); return -1; }
+                uint8_t *wt = PH_GET(big + p3, p3);
+                if (!wt || phase_window(s->phase_wt, o, Pz, P, pshift, wt)) { PH_PUT(wt, p3); PH_PUT(sw, p3 + 64); return -1; }
                 phase_weight_drop(sw, wt, Pz, P, r->s[1] ^ (uint64_t)tile_index ^ c->seed ^ ((uint64_t)o[0] << 40) ^ ((uint64_t)o[1] << 20) ^ (uint64_t)o[2]);
-                tp_put(wt, p3);
+                PH_PUT(wt, p3);
             }
             if (c->wind4 && !s->scope_local) {   /* ("scope": "local": the winding mod 4 stays unknown, below) */   /* the winding mod 4: the phase unwrapped before the air test (gaps join the windings), outside the scroll (CT 0) not */
-                uint8_t *pw = tp_get(p3, 0), *ww = tp_get(p3, 0), *wc = tp_get(p3, 0);
-                if (!pw || !ww || !wc) { tp_put(pw, p3); tp_put(ww, p3); tp_put(wc, p3); tp_put(sw, p3 + 64); return -1; }
+                uint8_t *pw = PH_GET(ttmp + p3 + 64, p3), *ww = PH_GET(big + p3, p3), *wc = PH_GET(big + 2 * p3, p3);
+                if (!pw || !ww || !wc) { PH_PUT(pw, p3); PH_PUT(ww, p3); PH_PUT(wc, p3); PH_PUT(sw, p3 + 64); return -1; }
                 phase_air(ctu, sw, pw, p3, c->side_air); air_done = 1;   /* (the winding input and the air test in one pass) */
                 const int wt = c->wind4_tile < 0 ? 0 : c->wind4_tile > (P + 5) / 6 ? c->wind4_tile : (P + 5) / 6;   /* (<= 6^3 tiles: one gauge each fits the loss's 255) */
                 if (g_crush.w4) { memcpy(ww, g_crush.w4, p3); memcpy(wc, g_crush.wc, p3); }   /* (--aug-tear: unwrapped before the cut) */
                 else if (band_wind4_tiled(pw, Pz, P, P, wt, c->wind4_step > 0 ? c->wind4_step : 80, c->wind4_min > 0 ? (size_t)c->wind4_min : 512, wt ? 1 : 15, ww, wc, nullptr) < 0) {
-                    tp_put(pw, p3); tp_put(ww, p3); tp_put(wc, p3); tp_put(sw, p3 + 64); return -1;
+                    PH_PUT(pw, p3); PH_PUT(ww, p3); PH_PUT(wc, p3); PH_PUT(sw, p3 + 64); return -1;
                 }
                 if (lw) { memcpy(b->w4 + (size_t)i * p3, ww, p3); memcpy(b->wcomp + (size_t)i * p3, wc, p3); }   /* (source grid: the device warps) */
                 else if (spatial.active) {
-                    if (!(wq = tp_get(2 * p3, 0))) { tp_put(pw, p3); tp_put(ww, p3); tp_put(wc, p3); tp_put(sw, p3 + 64); return -1; }
+                    if (!(wq = tp_get(2 * p3, 0))) { PH_PUT(pw, p3); PH_PUT(ww, p3); PH_PUT(wc, p3); PH_PUT(sw, p3 + 64); return -1; }
                     warp_w4_pack(ww, wc, wq, p3);
                 }
                 else { sym_u8(ww, b->w4 + (size_t)i * p3, Pz, P, y); sym_u8(wc, b->wcomp + (size_t)i * p3, Pz, P, y); }
                 w4_set = 1;   /* (warped: warp_phase_w4 below writes every voxel) */
-                tp_put(pw, p3); tp_put(ww, p3); tp_put(wc, p3);
+                PH_PUT(pw, p3); PH_PUT(ww, p3); PH_PUT(wc, p3);
             }
             if (!air_done) phase_air(ctu, sw, nullptr, p3, c->side_air);
             if (c->phase_near_um > 0) for (size_t k = 0; k < p3; k++) if (!near || !near[k]) sw[k] = SIDE_UNKNOWN;   /* no labelled wrap: none */
@@ -2884,7 +2888,9 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
                 warp_phase_w4(sw, wq, b->side + (size_t)i * p3, wq ? b->w4 + (size_t)i * p3 : nullptr, wq ? b->wcomp + (size_t)i * p3 : nullptr, P, y, &spatial);
                 tp_put(wq, 2 * p3);
             } else sym_u8(sw, b->side + (size_t)i * p3, Pz, P, y);
-            tp_put(sw, p3 + 64);
+            PH_PUT(sw, p3 + 64);
+#undef PH_GET
+#undef PH_PUT
         } else {
             if (Pz != P) { fprintf(stderr, "sampler: slab windows take the phase from a stored raster (sources \"phase\" at this level or one coarser)\n"); return -1; }
             uint8_t *bw = tp_get(p3, 0), *sw = c->side ? tp_get(p3, 0) : nullptr;
@@ -2900,10 +2906,11 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
     }
     if (c->wind4 && !w4_set) { memset(b->w4 + (size_t)i * p3, 255, p3); memset(b->wcomp + (size_t)i * p3, 255, p3); }
     if (inkw) {   /* --ink-head: the ink plane through the symmetry / warp (--gpu-aug 2 warped windows: the source grid, warped on the device) */
-        uint8_t *bi = b->ink + (size_t)i * p3;
-        if (lw) memcpy(bi, inkw, p3);
-        else if (spatial.active) sample_warp_ink(inkw, bi, P, y.perm, y.flip, &spatial);
-        else sym_u8(inkw, bi, Pz, P, y);
+        uint8_t *bi = b->ink + (size_t)i * p3, *src = big + p3;   /* (lw: already in place) */
+        if (!lw) {
+            memcpy(src, inkw, p3);
+            if (spatial.active) sample_warp_ink(src, bi, P, y.perm, y.flip, &spatial); else sym_u8(src, bi, Pz, P, y);
+        }
     }
     if (c->emb_ch) {   /* train --distill: the feature targets through the same symmetry and warp (none on crushed / torn / re-bent windows) */
         const size_t ge = (size_t)(Pz / c->emb_div) * (P / c->emb_div) * (P / c->emb_div);
@@ -3070,11 +3077,11 @@ static void *worker(void *arg) {
     rseed(&r, sp->cfg.seed * 1000003ull + (uint64_t)wa->id);
     size_t p3 = P3(sp);
     float *xtmp = malloc(3 * (size_t)sp->cfg.P * sizeof(float));   /* per-z axis centres and a row of noise */
-    uint8_t *ttmp = wbig_alloc(NCH * p3, 0);
+    uint8_t *ttmp = wbig_alloc(NCH * p3 + 4096, 0);   /* (+ 4 KB: the stored-phase block's two planes, P^3 + 64 and P^3, in it) */
     uint8_t *big = wbig_alloc(10 * p3, 0);   /* [0,P^3) CT (also the coarse probe), [P^3, 9P^3) (2P)^3 region scratch, [9P^3, 10P^3) mask */
     static atomic_int nwm; const int wid = atomic_fetch_add(&nwm, 1);
     g_tp_p3 = p3;
-    if (wid < WM_MAX) { tp_wid = wid; g_wm[tp_wid].pool = &tpool; g_wm[tp_wid].big = big; g_wm[tp_wid].bign = 10 * p3; g_wm[tp_wid].ttmp = ttmp; g_wm[tp_wid].ttn = NCH * p3; }
+    if (wid < WM_MAX) { tp_wid = wid; g_wm[tp_wid].pool = &tpool; g_wm[tp_wid].big = big; g_wm[tp_wid].bign = 10 * p3; g_wm[tp_wid].ttmp = ttmp; g_wm[tp_wid].ttn = NCH * p3 + 4096; }
     const int det = sp->cfg.deterministic;
     float *noise_state = sp->cfg.ct_augment ? malloc(((size_t)sp->cfg.P * sp->cfg.P + sp->cfg.P) * sizeof(float)) : nullptr;
     chain_st *chs = calloc((size_t)sp->cfg.B, sizeof *chs);   /* (window chains: one per sample slot) */
