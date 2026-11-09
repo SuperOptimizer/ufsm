@@ -232,3 +232,44 @@ Estimates from the model. S = W + 2. Set UFSM_STORE_NOCACHE=1 and keep THP off (
    CPU). The box is bandwidth-bound, so fewer DRAM passes pay directly.
 5. **xoshiro jump-ahead instead of burning P^3/4 draws** to keep the CPU path's stream: ~2.4% of instructions.
 6. **CT straight into the slot** (saves the ct8 memcpy). RAM gain only if the post-scan 0/1 mask finds a free plane.
+
+## Round 2b: window replay, system time, THP (2026-11-09)
+Commits: 8f628d2 (`--replay`), 790e62b (band_wind4 arrays, NOCACHE default), 489ce05 (THP heuristic).
+
+### Window replay (`train --replay K`, default 1)
+What a replay is:
+- Each built window is delivered K times. Replays 2..K are prepared on one sampler thread from the window's own slot.
+- The device-side records are redrawn the way the sampler draws them: a new cube symmetry (augment mode, symmetry_p) and a warp
+  record (rotation is forced if none came up, because the labels need the device warp); elastic / zoom / affine at their usual
+  probabilities; a new scanner plan; new intensity jitter and noise seed; the axis record and um follow the new warp.
+- In the new scanner plan, the label-touching ops (seam, air, dropped slices, cutouts, chunk dropouts) are never drawn anew. The
+  window's own air / drop / cutout / chunk boxes are carried over, so the labels (ink unknown on dropped slices, the CT > 0 air
+  test) stay exact.
+- The label planes of an unwarped window with a non-identity symmetry are put back on the source grid first (sym_inverse,
+  self-tested on all 48 symmetries at sampler start). The CT bytes (ct8) are on the source grid already.
+- No voxel work is redone: no read, decode, targets or phase block.
+
+Measured:
+- Replay 0 batches are byte-identical to K=1 (`--det 1`, 12 windows, every plane).
+- Delivered loader rate (UFSM_SAMPLER_ONLY, P512, 4 workers, non-det): K=1 131 Mvox/s, K=2 245, K=3 375 (1.9x / 2.9x). The replay
+  thread is not the bottleneck.
+- A 20-step GPU run at P384 with K=2 trains normally: finite losses in the same range as K=1.
+
+Caveats:
+- Every replay is warped (rotation <= --rotate-deg).
+- A replay keeps the original window's source, position, level, axis jitter and dropout / cutout / chunk boxes.
+- The K replays of a window arrive back to back, so K consecutive steps are correlated: start with K=2.
+- Configurations: `sampler_replay_ok` (--gpu-aug 2 cubes; no sheet / band / gap / condition / distill / view / cover / chain, pm
+  only when skipped).
+
+### System time
+- In production (P768, W8 S10) each run's scope sat at its memory.max with ~10 GB of page cache.
+- Every page read was paid for by a direct reclaim in the reading worker: pgscan_direct ~15k pages/s per run, matching the read
+  rate; kswapd did nothing.
+- Train now sets **UFSM_STORE_NOCACHE=1** by default (`=0` keeps the cache). The cgroup file charge goes to 0 and throughput is
+  unchanged (measured earlier).
+- Page faults (perf -e page-faults on a production run for 15 s): 90% came from band_wind4's union-find arrays, which grew by
+  realloc per tile and were freed after it; the other 10% from the read path copying into fresh buffers. The arrays now stay with
+  the thread (byte-identical; test_wind4 OK).
+- THP: worker-scratch MADV_HUGEPAGE is now used by default only with host warps (--gpu-aug < 2) and MemFree > 16 GB at sampler
+  start. UFSM_SAMPLER_THP=0/1 forces it either way.
