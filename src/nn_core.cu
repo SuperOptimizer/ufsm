@@ -360,6 +360,8 @@ cudaStream_t copy_stream(void) {
     if (!st[d]) CK(cudaStreamCreateWithFlags(&st[d], cudaStreamNonBlocking));
     return st[d];
 }
+extern "C" void nn_d2h_copy_stream(void *d, const void *s, size_t n) { CK(cudaMemcpyAsync(d, s, n, cudaMemcpyDeviceToHost, copy_stream())); }   /* d must be pinned */
+extern "C" void nn_h2d_async(void *d, const void *s, size_t n) { CK(cudaMemcpyAsync(d, s, n, cudaMemcpyHostToDevice, 0)); }   /* stream 0, in order with its kernels; s pinned */
 extern "C" void nn_h2d_copy_stream(void *d, const void *s, size_t n) { CK(cudaMemcpyAsync(d, s, n, cudaMemcpyHostToDevice, copy_stream())); }   /* s must be pinned */
 extern "C" void *nn_event_create(void) { cudaEvent_t e; CK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming)); return (void *)e; }
 static cudaStream_t aux_stream(void) {   /* device-to-device copies overlapped with compute (nn_d2d_aux) */

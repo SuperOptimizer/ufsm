@@ -41,6 +41,8 @@ void *nn_host_alloc_try(size_t bytes);   /* the same, nullptr when the host cann
 void nn_host_free(void *p);
 /* pipelined uploads: an async copy on a per-device copy stream (pinned source), events to order it against the compute stream */
 void nn_h2d_copy_stream(void *dst, const void *src, size_t bytes);
+void nn_d2h_copy_stream(void *dst, const void *src, size_t bytes);   /* device -> pinned host on the copy stream */
+void nn_h2d_async(void *dst, const void *src, size_t bytes);         /* pinned host -> device on stream 0 (asynchronous, in stream order) */
 void *nn_event_create(void);
 void nn_event_record(void *ev, int on_copy_stream);      /* 0: compute stream, 1: copy stream, 2: the aux stream (nn_d2d_aux) */
 void nn_stream_wait(int copy_stream_waits, void *ev);    /* make the copy stream (1), the aux stream (2) or the compute stream (0) wait for ev */
