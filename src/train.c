@@ -4,6 +4,7 @@
 #include "sysinfo.h"
 #include "checkpoint.h"
 #include "sample.h"
+#include "store.h"
 #include "papyrus.h"
 #include "restore.h"
 #include "srpair.h"
@@ -2110,6 +2111,8 @@ int cmd_train(int argc, char **argv) {
             sampler_hostmem(sq, stderr, 0);
             uint64_t prod = 0, rej = 0; sampler_stats(sq, &prod, &rej); fprintf(stderr, "sampler-only: produced %llu rejected %llu\n", (unsigned long long)prod, (unsigned long long)rej);
             sampler_prof_print(sq);
+            store_io_report(stderr);
+            { FILE *io = fopen("/proc/self/io", "r"); char ln[128]; while (io && fgets(ln, sizeof ln, io)) if (!strncmp(ln, "rchar", 5) || !strncmp(ln, "read_bytes", 10)) fprintf(stderr, "proc io: %s", ln); if (io) fclose(io); }
             sampler_stop(sq); return 0;
         }
     }

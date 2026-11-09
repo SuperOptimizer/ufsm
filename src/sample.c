@@ -210,6 +210,7 @@ static batch alloc_batch(const sample_cfg *c) {
     b.x = c->xfmt || c->restore ? nullptr : halloc((size_t)c->B * xc * p3 * sizeof(float));   /* pinned: the trainer uploads asynchronously */
     b.x16 = c->xfmt && !c->restore && !c->gpu_aug ? halloc((size_t)c->B * xc * p3 * 2) : nullptr;   /* (--gpu-aug: the device builds the CT channel) */
     b.ct8 = c->gpu_aug ? halloc((size_t)c->B * p3) : nullptr; b.aug = c->gpu_aug ? halloc((size_t)c->B * sizeof(scan_ct_rec)) : nullptr;
+    if (b.aug) memset(b.aug, 0, (size_t)c->B * sizeof(scan_ct_rec));   /* (the records' padding is never written: zero, so equal batches hash equal) */
     b.t = c->pack_tm ? nullptr : halloc((size_t)c->B * (c->restore == 1 ? 1 : NCH) * p3);   /* (task restore: the clean CT alone; real pairs: target + input crop) */
     b.m = c->pack_tm || c->restore ? nullptr : halloc((size_t)c->B * p3);
     b.tm = c->pack_tm && !(c->slot_skip & 1) ? halloc((size_t)c->B * p3) : nullptr;   /* one code byte per voxel instead of NCH + 1 */
@@ -341,6 +342,8 @@ static int pick_level(sampler *sp, source *s, rng *r, int region_ch) {
 }
 
 /* Fill patch i of batch b. Returns 0 on success, 1 if rejected (try again), -1 on I/O error. */
+static int g_rt = 1;   /* UFSM_SAMPLER_RT=T: threads per window for its big reads (CT, phase, targets: z3_read decodes chunks in parallel) and the
+                          winding-mod-4 tiles; the same bytes for any T. Fewer windows in flight (RAM) for the same loader rate */
 static int g_prof_cpu;   /* UFSM_SAMPLER_PROF=2: the stages in thread CPU time (else wall time: I/O waits and contention count) */
 static double tnow(void) { struct timespec t; clock_gettime(g_prof_cpu ? CLOCK_THREAD_CPUTIME_ID : CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 #define PROF_MARK(stage) do { if (sp->prof) { double t_ = tnow(); atomic_fetch_add(&sp->prof_ns[stage], (uint_fast64_t)((t_ - pt) * 1e9)); pt = t_; } } while (0)
@@ -1381,7 +1384,7 @@ static int phase_window_interp(z3 *a, const int64_t o[3], int D, int P, int shif
     if (rn[0] > 0 && rn[1] > 0 && rn[2] > 0) {
         const size_t rnn = (size_t)rn[0] * rn[1] * rn[2];
         uint8_t *tmp = tp_get(rnn, 0);
-        if (!tmp || z3_read(a, ro, rn, tmp, 1)) { tp_put(tmp, rnn); tp_put(ph, N); return -1; }
+        if (!tmp || z3_read(a, ro, rn, tmp, g_rt)) { tp_put(tmp, rnn); tp_put(ph, N); return -1; }
         for (int64_t z = 0; z < rn[0]; z++) for (int64_t y = 0; y < rn[1]; y++)
             memcpy(ph + ((size_t)(z + ro[0] - lo[0]) * ln[1] + (y + ro[1] - lo[1])) * ln[2] + (ro[2] - lo[2]), tmp + ((size_t)z * rn[1] + y) * rn[2], (size_t)rn[2]);
         tp_put(tmp, rnn);
@@ -1437,10 +1440,10 @@ static int phase_window(z3 *a, const int64_t o[3], int D, int P, int shift, uint
     if (!shift) {   /* the window's own grid: read straight into it (outside the volume unknown), no staging copies */
         const size_t n = (size_t)D * P * P;
         if (rn[0] <= 0 || rn[1] <= 0 || rn[2] <= 0) { memset(side, PHASE_UNKNOWN, n); return 0; }
-        if (rn[0] == D && rn[1] == P && rn[2] == P) return z3_read(a, ro, rn, side, 1) ? -1 : 0;
+        if (rn[0] == D && rn[1] == P && rn[2] == P) return z3_read(a, ro, rn, side, g_rt) ? -1 : 0;
         const size_t rnn = (size_t)rn[0] * rn[1] * rn[2];
         uint8_t *tmp = tp_get(rnn, 0);
-        if (!tmp || z3_read(a, ro, rn, tmp, 1)) { tp_put(tmp, rnn); return -1; }
+        if (!tmp || z3_read(a, ro, rn, tmp, g_rt)) { tp_put(tmp, rnn); return -1; }
         memset(side, PHASE_UNKNOWN, n);
         for (int64_t z = 0; z < rn[0]; z++) for (int64_t y = 0; y < rn[1]; y++)
             memcpy(side + ((size_t)(z + ro[0] - lo[0]) * P + (y + ro[1] - lo[1])) * P + (ro[2] - lo[2]), tmp + ((size_t)z * rn[1] + y) * rn[2], (size_t)rn[2]);
@@ -1454,7 +1457,7 @@ static int phase_window(z3 *a, const int64_t o[3], int D, int P, int shift, uint
     if (rn[0] > 0 && rn[1] > 0 && rn[2] > 0) {
         const size_t rnn = (size_t)rn[0] * rn[1] * rn[2];
         uint8_t *tmp = tp_get(rnn, 0);
-        if (!tmp || z3_read(a, ro, rn, tmp, 1)) { tp_put(tmp, rnn); tp_put(ph, N); return -1; }
+        if (!tmp || z3_read(a, ro, rn, tmp, g_rt)) { tp_put(tmp, rnn); tp_put(ph, N); return -1; }
         for (int64_t z = 0; z < rn[0]; z++) for (int64_t y = 0; y < rn[1]; y++)
             memcpy(ph + ((size_t)(z + ro[0] - lo[0]) * ln[1] + (y + ro[1] - lo[1])) * ln[2] + (ro[2] - lo[2]), tmp + ((size_t)z * rn[1] + y) * rn[2], (size_t)rn[2]);
         tp_put(tmp, rnn);
@@ -2402,7 +2405,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
         if (ok && !crushed && !torn && c->delam_p > 0 && runif(r) < c->delam_p && (delam = delam_draw(sp, s, l, o, P, psh, r, ctu)) < 0) return -1;
         if (ok && !crushed && !torn && !delam && c->curv_p > 0 && runif(r) < c->curv_p && (curved = curv_draw(sp, s, l, o, P, psh, r, big + p3, 8 * p3, ctu)) < 0) return -1;
     }
-    if (!crushed && !torn && !delam && !curved && z3_read(ct, o, n, ctu, 1)) return -1;
+    if (!crushed && !torn && !delam && !curved && z3_read(ct, o, n, ctu, g_rt)) return -1;
     PROF_MARK(PS_READ);
     size_t nz = 0;
     double sum = 0, sq = 0;
@@ -2459,7 +2462,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
             }
             z3 *tz = s->tgt_key[ch] && s->tgt_prob[ch] && !crushed && !torn && !delam && !curved ? source_tgt_for_level(s, ch, l, nullptr) : nullptr;
             if (!tz) memset(inkw, 255, p3);
-            else if (source_read_target(s, ch, l, o, n, inkw, 1)) return -1;
+            else if (source_read_target(s, ch, l, o, n, inkw, g_rt)) return -1;
             if (getenv("UFSM_INK_DEBUG")) { size_t kn = 0, ki = 0; for (size_t k = 0; k < p3; k++) { kn += inkw[k] != 255; ki += inkw[k] != 255 && inkw[k] > 127; } fprintf(stderr, "ink window: tz %p known %zu ink %zu\n", (void *)tz, kn, ki); }
             continue;
         }
@@ -2484,7 +2487,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
                 uint8_t *haloed = big + p3;   /* existing (2P)^3 scratch, P >= 2 */
                 if (source_read_target(s, ch, l, eo, en, haloed, 1)) return -1;
                 target_erode1(haloed, dst, P);
-            } else if (source_read_target(s, ch, l, o, n, dst, 1)) return -1;
+            } else if (source_read_target(s, ch, l, o, n, dst, g_rt)) return -1;
             w[ch] = 1;
             if (s->tgt_side[ch]) {   /* side labels (band.h RV_*) -> channel 0 recto-side papyrus, channel 1 verso-side papyrus (clean CT >= the
                                         source's cutoff); void 0 in both; papyrus of unknown side ignored in both; CT 0 masked below */
@@ -2881,7 +2884,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
                 phase_air(ctu, sw, pw, p3, c->side_air); air_done = 1;   /* (the winding input and the air test in one pass) */
                 const int wt = c->wind4_tile < 0 ? 0 : c->wind4_tile > (P + 5) / 6 ? c->wind4_tile : (P + 5) / 6;   /* (<= 6^3 tiles: one gauge each fits the loss's 255) */
                 if (g_crush.w4) { memcpy(ww, g_crush.w4, p3); memcpy(wc, g_crush.wc, p3); }   /* (--aug-tear: unwrapped before the cut) */
-                else if (band_wind4_tiled(pw, Pz, P, P, wt, c->wind4_step > 0 ? c->wind4_step : 80, c->wind4_min > 0 ? (size_t)c->wind4_min : 512, wt ? 1 : 15, ww, wc, nullptr) < 0) {
+                else if (band_wind4_tiled_mt(pw, Pz, P, P, wt, c->wind4_step > 0 ? c->wind4_step : 80, c->wind4_min > 0 ? (size_t)c->wind4_min : 512, wt ? 1 : 15, ww, wc, nullptr, g_rt) < 0) {
                     PH_PUT(pw, p3); PH_PUT(ww, p3); PH_PUT(wc, p3); PH_PUT(sw, p3 + 64); return -1;
                 }
                 if (lw) { memcpy(b->w4 + (size_t)i * p3, ww, p3); memcpy(b->wcomp + (size_t)i * p3, wc, p3); }   /* (source grid: the device warps) */
@@ -3388,7 +3391,7 @@ sampler *sampler_start(sources *S, const sample_cfg *cfg) {
         memset(sp->cfg.level_p, 0, sizeof sp->cfg.level_p); sp->cfg.level_p[0] = 1;
     }
     { unsigned sb; memcpy(&sb, &cfg->soft, 4); atomic_store(&sp->soft_bits, sb); }
-    sp->prof = ufsm_env_on("UFSM_SAMPLER_PROF"); { const char *e = getenv("UFSM_SAMPLER_PROF"); g_prof_cpu = e && atoi(e) == 2; }
+    sp->prof = ufsm_env_on("UFSM_SAMPLER_PROF"); { const char *e = getenv("UFSM_SAMPLER_PROF"); g_prof_cpu = e && atoi(e) == 2; e = getenv("UFSM_SAMPLER_RT"); g_rt = e && atoi(e) > 1 ? atoi(e) : 1; }
     sp->lvl_ok = calloc((size_t)S->n, sizeof *sp->lvl_ok);
     sources_open_all(S, 32);   /* every (source, level, channel) store opened up front in parallel: lazily they serialise on one lock (254 opens, 17 s) */
     sp->cum = malloc((size_t)S->n * sizeof(double));
