@@ -1864,6 +1864,9 @@ int cmd_train(int argc, char **argv) {
             fprintf(stderr, "%s\n", k ? "" : " no source (untrained)");
         }
     }
+    if (!getenv("UFSM_STORE_NOCACHE")) setenv("UFSM_STORE_NOCACHE", "1", 1);   /* the loader's reads leave no page cache (UFSM_STORE_NOCACHE=0 keeps it): its hit
+        rate is ~0 (2026-11-09 production: rchar 176 GB, read_bytes 190 GB in 40 min) while every cached page charged to the run's cgroup at its cap
+        meant a direct reclaim in a reading worker (pgscan_direct ~15k pages/s per run) */
     sample_cfg sc = sample_cfg_default();
     sc.P = P; sc.Pz = g_Pz != P ? g_Pz : 0; sc.B = B; sc.nworkers = workers; sc.nbuf = atoi(opt(argc, argv, "--sampler-slots", "0")) > 0 ? atoi(opt(argc, argv, "--sampler-slots", "0")) : 4 * ng + 2;   /* batches in flight (each worker fills one; pinned memory per slot) */ sc.seed = seed; sc.xfmt = g_xfmt;
     if (workers > sc.nbuf - ng)   /* a worker fills a slot of its own and the trainer holds about one per GPU: workers beyond the free slots wait, and each

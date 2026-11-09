@@ -3177,7 +3177,7 @@ static void *worker(void *arg) {
         pthread_mutex_unlock(&sp->mu);
     }
     if (tp_wid >= 0) { g_wm[tp_wid].pool = nullptr; g_wm[tp_wid].big = g_wm[tp_wid].ttmp = nullptr; }
-    free(xtmp); free(ttmp); free(big); free(noise_state); free(chs); tp_drain();
+    free(xtmp); free(ttmp); free(big); free(noise_state); free(chs); tp_drain(); band_wind4_thread_free();
     free(wa);
     return nullptr;
 }
@@ -3516,7 +3516,12 @@ sampler *sampler_start(sources *S, const sample_cfg *cfg) {
         memset(sp->cfg.level_p, 0, sizeof sp->cfg.level_p); sp->cfg.level_p[0] = 1;
     }
     { unsigned sb; memcpy(&sb, &cfg->soft, 4); atomic_store(&sp->soft_bits, sb); }
-    g_thp_default = cfg->gpu_aug != 2;
+    {   /* huge pages for the worker scratch only with host warps (--gpu-aug < 2) and free memory to back them without compaction (MemFree > 16 GB) */
+        long mf = 0; FILE *mi = fopen("/proc/meminfo", "r"); char ln[128];
+        while (mi && fgets(ln, sizeof ln, mi)) if (!strncmp(ln, "MemFree:", 8)) { mf = atol(ln + 8); break; }
+        if (mi) fclose(mi);
+        g_thp_default = cfg->gpu_aug != 2 && mf > 16l << 20;
+    }
     sp->prof = ufsm_env_on("UFSM_SAMPLER_PROF"); { const char *e = getenv("UFSM_SAMPLER_PROF"); g_prof_cpu = e && atoi(e) == 2; e = getenv("UFSM_SAMPLER_RT"); g_rt = e && atoi(e) > 1 ? atoi(e) : 1; }
     sp->lvl_ok = calloc((size_t)S->n, sizeof *sp->lvl_ok);
     sources_open_all(S, 32);   /* every (source, level, channel) store opened up front in parallel: lazily they serialise on one lock (254 opens, 17 s) */
