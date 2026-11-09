@@ -103,7 +103,7 @@ __global__ void lat_input_q_k(const int8_t *q, const f16 *x, int d, int h, int w
     if (i >= cv) return;
     const int z = (int)(i / ((size_t)h * w)), yy = (int)(i / w % h), xx = (int)(i % w), H = 4 * h, W = 4 * w; const size_t fv = (size_t)64 * cv;
     const int8_t *qc = q + i * (C + 1);
-    const float dc = (float)((int)qc[0] + 128 + 256 * (int)qc[1]) * sraw;
+    const float dc = (float)((int)(uint8_t)qc[0] + 256 * (int)qc[1]) * sraw;
     y[i] = __float2half_rn((dc - 8.f * mean) * isd * gain[0]);
     for (int c = 1; c < C; c++) y[(size_t)c * cv + i] = __float2half_rn((float)qc[c + 1] * sraw * isd * gain[c]);
     float acc[3] = {0.f, 0.f, 0.f};

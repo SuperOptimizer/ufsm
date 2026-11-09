@@ -1633,7 +1633,7 @@ int cmd_predict(int argc, char **argv) {
                     const int64_t oc[3] = {(o[0] - lz_org[0]) / 4, (o[1] - lz_org[1]) / 4, (o[2] - lz_org[2]) / 4}, nc[3] = {wc, wc, wc};
                     if (zr_read_i8(&lzr, oc, nc, lz_h)) { fprintf(stderr, "predict: --latents: read failed\n"); return 1; }
                     double s1 = 0, s2 = 0;   /* the window's mean / sd from the coefficients (orthonormal axes: sum of squares = the cell's energy, less the dropped axes') */
-                    for (size_t k = 0; k < ncell; k++) { const int8_t *q = lz_h + k * (lz_c + 1); const double dc = ((int)q[0] + 128 + 256 * (int)q[1]) * lz_sraw; s1 += dc; double e = dc * dc; for (int c = 2; c <= lz_c; c++) e += (double)q[c] * q[c] * lz_sraw * lz_sraw; s2 += e; }
+                    for (size_t k = 0; k < ncell; k++) { const int8_t *q = lz_h + k * (lz_c + 1); const double dc = ((int)(uint8_t)q[0] + 256 * (int)q[1]) * lz_sraw; s1 += dc; double e = dc * dc; for (int c = 2; c <= lz_c; c++) e += (double)q[c] * q[c] * lz_sraw * lz_sraw; s2 += e; }
                     const double lmean = s1 / (8.0 * (double)ncell), lvar = s2 / (64.0 * (double)ncell) - lmean * lmean, lsd = sqrt(lvar > 0 ? lvar : 0) + 1e-3;
                     { static int once; if (!once++ && ufsm_env_on("UFSM_LAT_DEBUG")) fprintf(stderr, "\npredict --latents: first window mean / sd from the latents %.3f / %.3f, from the CT %.3f / %.3f\n", lmean, lsd, mean, sd); }
                     nn_h2d(lz_d, lz_h, ncell * (lz_c + 1));
