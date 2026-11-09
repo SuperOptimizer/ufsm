@@ -97,6 +97,25 @@ __global__ void lat_input_x_k(const f16 *x, int d, int h, int w, const float *ba
     }
     for (int c = 0; c < 3; c++) y[(size_t)(C + c) * cv + i] = __float2half_rn(acc[c] * (1.f / 64.f));
 }
+__global__ void lat_input_q_k(const int8_t *q, const f16 *x, int d, int h, int w, const float *gain, int C, float sraw, float mean, float isd, f16 *y) {
+    const size_t cv = (size_t)d * h * w, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= cv) return;
+    const int z = (int)(i / ((size_t)h * w)), yy = (int)(i / w % h), xx = (int)(i % w), H = 4 * h, W = 4 * w; const size_t fv = (size_t)64 * cv;
+    const int8_t *qc = q + i * (C + 1);
+    const float dc = (float)((int)qc[0] + 128 + 256 * (int)qc[1]) * sraw;
+    y[i] = __float2half_rn((dc - 8.f * mean) * isd * gain[0]);
+    for (int c = 1; c < C; c++) y[(size_t)c * cv + i] = __float2half_rn((float)qc[c + 1] * sraw * isd * gain[c]);
+    float acc[3] = {0.f, 0.f, 0.f};
+    for (int k = 0; k < 64; k++) {
+        const size_t j = ((size_t)(4 * z + (k >> 4)) * H + 4 * yy + (k >> 2 & 3)) * W + 4 * xx + (k & 3);
+        for (int c = 0; c < 3; c++) acc[c] += __half2float(x[(size_t)(1 + c) * fv + j]);
+    }
+    for (int c = 0; c < 3; c++) y[(size_t)(C + c) * cv + i] = __float2half_rn(acc[c] * (1.f / 64.f));
+}
+extern "C" void nn_lat_input_q(const void *q, const void *x, int d, int h, int w, const float *gain, int C, float step_raw, float mean, float isd, void *y) {
+    const size_t cv = (size_t)d * h * w;
+    lat_input_q_k<<<nblk(cv, 128), 128>>>((const int8_t *)q, (const f16 *)x, d, h, w, gain, C, step_raw, mean, isd, (f16 *)y); KCHECK();
+}
 extern "C" void nn_lat_input_x(const void *x, int d, int h, int w, const float *bas, const float *gain, int C, float step, void *y) {
     const size_t cv = (size_t)d * h * w;
     lat_input_x_k<<<nblk(cv, 128), 128>>>((const f16 *)x, d, h, w, bas, gain, C, step, (f16 *)y); KCHECK();

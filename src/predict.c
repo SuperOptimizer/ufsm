@@ -19,6 +19,7 @@
 #include "sweep.h"
 #include "z3w.h"
 #include "zarr3.h"
+#include "embz.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <math.h>
@@ -792,6 +793,15 @@ int cmd_predict(int argc, char **argv) {
     const char *chs = opt(argc, argv, "--channel", "0");   /* output channel to write (band_affinity: 1..6 = affinities; "ink": a task unwrap2 --ink-head checkpoint's ink channel) */
     /* --channel rv (train --task unwrap2 --rv checkpoints): both side channels in one pass, written as 1 + 254 (1 + p_recto - p_verso) / 2, 0 where CT 0 */
     const int rvfuse = !strcmp(chs, "rv");
+    /* --latents STORE (ufsm lc-encode): a --lat-basis checkpoint's cell channels come from the stored quantised coefficients (the window's
+       mean / sd from them too), not from the CT window, which is still read for the air mask and the radial channels */
+    const char *lat_store = opt(argc, argv, "--latents", nullptr); zr lzr; double lz_sraw = 0; long long lz_org[3] = {0, 0, 0}; int lz_c = 0; int8_t *lz_h = nullptr; void *lz_d = nullptr;
+    if (lat_store) {
+        char zp[1200]; snprintf(zp, sizeof zp, "%s/zarr.json", lat_store); FILE *zf = fopen(zp, "r"); static char zt[65536]; size_t zn = zf ? fread(zt, 1, sizeof zt - 1, zf) : 0; if (zf) fclose(zf); zt[zn] = 0;
+        const char *q1 = strstr(zt, "\"step_raw\":"), *q2 = strstr(zt, "\"origin\":["), *q3 = strstr(zt, "\"lat_c\":");
+        if (!q1 || !q2 || !q3 || sscanf(q2 + 10, "%lld,%lld,%lld", lz_org, lz_org + 1, lz_org + 2) != 3 || zr_open(&lzr, lat_store)) { fprintf(stderr, "predict: --latents %s is not a latcomp store (ufsm lc-encode)\n", lat_store); return 2; }
+        lz_sraw = atof(q1 + 11); lz_c = atoi(q3 + 8);
+    }
     { char *h = checkpoint_header_line(ckpt); const int isrv = h && strstr(h, "\"rv\":{\"version\":1"); free(h);
       if (rvfuse && !isrv) { fprintf(stderr, "predict: --channel rv: %s is not a train --rv checkpoint\n", ckpt); return 2; }
       if (isrv && (opt(argc, argv, "--fit-fields", nullptr) || opt(argc, argv, "--fit-zarr", nullptr))) { fprintf(stderr, "predict: %s is a recto / verso (train --rv) checkpoint: channels 0-1 are not the phase (no --fit-*)\n", ckpt); return 2; } }
@@ -1206,7 +1216,7 @@ int cmd_predict(int argc, char **argv) {
         xd_shared = xd != nullptr;
         if (!xd && !ct_stem) xd = nn_malloc((size_t)xs.c * w3 * (h16 ? 2 : 4));
         if (auxz) { auxd = nn_malloc(w3); auxh = malloc(w3); }
-        if (half) { x2 = nn_malloc(shape_numel(xn) * (h16 ? 2 : 4)); lgf = nn_malloc(w3 * 4 * (rvfuse ? 2 : 1)); if (hdiv > 2) lrt = nn_malloc(w3 / 8 * 16); }
+        if (half) { x2 = nn_malloc(shape_numel(xn) * (h16 ? 2 : 4)); lgf = nn_malloc(w3 * 4 * (rvfuse ? 2 : 1)); if (lat_store) { lz_h = nn_host_alloc(w3 / 64 * (lz_c + 1)); lz_d = nn_malloc(w3 / 64 * (lz_c + 1)); } if (hdiv > 2) lrt = nn_malloc(w3 / 8 * 16); }
         if (ct_stem) fprintf(stderr, "predict: in-place slab inference from the CT window (%.1f B per window voxel)\n", (double)unet_activation_bytes(u) / w3);
         if (tta > 1 && (!ct_stem || !ct_shared || degrade || auxz || cfg.cin != 4)) { fprintf(stderr, "predict: --tta needs the CT-stem device path (no --aug-*, --aux, extra inputs)\n"); return 2; }
     }
@@ -1616,6 +1626,19 @@ int cmd_predict(int argc, char **argv) {
             const float *lg;
             if (half) {   /* the network on blocks of the window: its input from the 4-channel window, its logits back to full resolution */
                 const float *lbas, *lgain; float lstep; const int latc = half == 3 ? unet_lat_basis(u, &lbas, &lgain, &lstep) : 0;
+                if (lat_store && (!latc || latc != lz_c)) { fprintf(stderr, "predict: --latents: the store has %d cell channels, the checkpoint %d\n", lz_c, latc); return 2; }
+                if (lat_store) {
+                    const int wc = W / 4; const size_t ncell = (size_t)wc * wc * wc;
+                    if ((o[0] - lz_org[0]) % 4 || (o[1] - lz_org[1]) % 4 || (o[2] - lz_org[2]) % 4) { fprintf(stderr, "predict: --latents: windows must start on the store's cell grid (box / --grid-origin multiples of 4 from its origin)\n"); return 2; }
+                    const int64_t oc[3] = {(o[0] - lz_org[0]) / 4, (o[1] - lz_org[1]) / 4, (o[2] - lz_org[2]) / 4}, nc[3] = {wc, wc, wc};
+                    if (zr_read_i8(&lzr, oc, nc, lz_h)) { fprintf(stderr, "predict: --latents: read failed\n"); return 1; }
+                    double s1 = 0, s2 = 0;   /* the window's mean / sd from the coefficients (orthonormal axes: sum of squares = the cell's energy, less the dropped axes') */
+                    for (size_t k = 0; k < ncell; k++) { const int8_t *q = lz_h + k * (lz_c + 1); const double dc = ((int)q[0] + 128 + 256 * (int)q[1]) * lz_sraw; s1 += dc; double e = dc * dc; for (int c = 2; c <= lz_c; c++) e += (double)q[c] * q[c] * lz_sraw * lz_sraw; s2 += e; }
+                    const double lmean = s1 / (8.0 * (double)ncell), lvar = s2 / (64.0 * (double)ncell) - lmean * lmean, lsd = sqrt(lvar > 0 ? lvar : 0) + 1e-3;
+                    { static int once; if (!once++ && ufsm_env_on("UFSM_LAT_DEBUG")) fprintf(stderr, "\npredict --latents: first window mean / sd from the latents %.3f / %.3f, from the CT %.3f / %.3f\n", lmean, lsd, mean, sd); }
+                    nn_h2d(lz_d, lz_h, ncell * (lz_c + 1));
+                    nn_lat_input_q(lz_d, xd, wc, wc, wc, lgain, latc, (float)lz_sraw, (float)lmean, (float)(1.0 / lsd), x2);
+                } else
                 if (latc) nn_lat_input_x(xd, W / 4, W / 4, W / 4, lbas, lgain, latc, lstep, x2);   /* the learned cell channels of a --lat-basis checkpoint */
                 else nn_lowres_input(xd, xs, hdiv, hmode, lrt, x2, h16);
                 const float *l2 = unet_forward_x(u, x2, xn, 0, h16);
