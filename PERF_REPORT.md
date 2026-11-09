@@ -79,7 +79,7 @@ writes 22 B a voxel of fp16 logits (10 GB in 29 ms), the gradient pass reads and
 | 268a84e | predict (all nets): place kernels over the interior-shard intersection | 64 launches over 512^3 voxels -> over 128^3 each | output files identical |
 | 268a84e | predict: up to 8 writer threads when a shard has fewer chunks than `--threads` (`UFSM_PRED_WRITERS`) | 29-window box 8.1 -> 4.7 s (shared GPU) | output files identical |
 | 8931e9d | predict: `nn_lat_pred_input`, cell-grid input straight from the CT bytes | input build + pooling 30 -> 3 ms per window (shared GPU); no 8 + 2 B/voxel | output bytes identical |
-| (last) | headers, test_lat predict cases, DESIGN.md, this report | | test_lat 118 cases, test_gpu_input, test_gpu_aug pass on GPU 1 |
+| 517a5cc | headers, test_lat predict cases, DESIGN.md, this report | | test_lat 118 cases, test_gpu_input, test_gpu_aug pass on GPU 1 |
 
 Losses on a repeated batch: step 1 matches to the printed digits (1.6863 both, gn 7.14 against 7.12) between the old and new slab
 kernels; later steps drift (1.6860 against 1.6889 at step 2). The kernels themselves agree to one fp16 code and 1e-7 (the direct
