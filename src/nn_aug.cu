@@ -137,20 +137,20 @@ __global__ void aug_exp_zy_k(__half *F, int P, int axis, float a) {
     for (int i = 1; i < P; i++) { const size_t j = base + i * st; y = b * h2f(F[j]) + a * y; F[j] = f2h(y); }
     for (int i = P - 2; i >= 0; i--) { const size_t j = base + i * st; y = b * h2f(F[j]) + a * y; F[j] = f2h(y); }
 }
-/* along the contiguous axis: 32 rows per block in shared memory (as floats in the passes), one thread per row */
-__global__ void aug_exp_x_k(__half *F, int P, float a) {
+/* along the contiguous axis: R rows per block (32, fewer when 32 P floats pass the 96 KB of shared memory: P > 768) in shared memory (as floats in the passes), one thread per row */
+__global__ void aug_exp_x_k(__half *F, int P, float a, int R) {
     extern __shared__ float shf[];
-    const size_t r0 = (size_t)blockIdx.x * 32, nrow = (size_t)P * P;
-    for (int j = threadIdx.x; j < 32 * P; j += blockDim.x) { const size_t r = r0 + j / P; shf[j] = r < nrow ? h2f(F[r0 * P + j]) : 0.f; }
+    const size_t r0 = (size_t)blockIdx.x * R, nrow = (size_t)P * P;
+    for (int j = threadIdx.x; j < R * P; j += blockDim.x) { const size_t r = r0 + j / P; shf[j] = r < nrow ? h2f(F[r0 * P + j]) : 0.f; }
     __syncthreads();
-    if (threadIdx.x < 32 && r0 + threadIdx.x < nrow) {
+    if (threadIdx.x < R && r0 + threadIdx.x < nrow) {
         float *v = shf + (size_t)threadIdx.x * P; const float b = 1 - a;
         float y = b * v[0] + a * v[0]; v[0] = y;
         for (int i = 1; i < P; i++) { y = b * v[i] + a * y; v[i] = y; }
         for (int i = P - 2; i >= 0; i--) { y = b * v[i] + a * y; v[i] = y; }
     }
     __syncthreads();
-    for (int j = threadIdx.x; j < 32 * P; j += blockDim.x) { const size_t r = r0 + j / P; if (r < nrow) F[r0 * P + j] = f2h(shf[j]); }
+    for (int j = threadIdx.x; j < R * P; j += blockDim.x) { const size_t r = r0 + j / P; if (r < nrow) F[r0 * P + j] = f2h(shf[j]); }
 }
 /* GIN's output at (z, y, x): the normalised CT's k^3 neighbourhood (edges replicated); plane z - 1 from prevp when given (its
    original values, the plane itself already blended) */
@@ -379,7 +379,8 @@ static void aug_scan(aug_dev *a, const scan_plan *p, int P, __half *F, cudaStrea
     if (on & 1u << SA_PAGANIN) {
         aug_exp_zy_k<<<nblk(P2, 128), 128, 0, s>>>(F, P, 0, p->pag_a);
         aug_exp_zy_k<<<nblk(P2, 128), 128, 0, s>>>(F, P, 1, p->pag_a);
-        aug_exp_x_k<<<nblk(P2, 32), 256, (size_t)32 * P * 4, s>>>(F, P, p->pag_a);
+        const int R = 32 * P * 4 <= 96 * 1024 ? 32 : 96 * 1024 / (P * 4);
+        aug_exp_x_k<<<nblk(P2, R), 256, (size_t)R * P * 4, s>>>(F, P, p->pag_a, R);
     }
     if (on & 1u << SA_GIN) {
         CK(cudaMemsetAsync(a->dsc, 0, 2 * sizeof(double), s)); CK(cudaMemsetAsync(a->usc, 0, sizeof(unsigned long long), s));
