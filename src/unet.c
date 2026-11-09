@@ -4239,6 +4239,7 @@ int unet_save(const unet *u, const char *path, int step, const char *extra) {
     { int any = 0; for (int i = 0; i < u->cfg.nlev; i++) any |= u->cfg.enc_blocks[i] != 0;
       if (any) { fputs(",\"enc_blocks\":[", f); for (int i = 0; i < u->cfg.nlev; i++) fprintf(f, "%s%d", i ? "," : "", u->cfg.enc_blocks[i]); fputc(']', f); } }
     if (u->cfg.half_res) fprintf(f, ",\"half_res\":%d", u->cfg.half_res);
+    if (u->cfg.lat_guide) fprintf(f, ",\"lat_guide\":%d", u->cfg.lat_guide);
     if (u->lat_C) {   /* the cell transform: rows of 64 weights, the gains, the step */
         fprintf(f, ",\"lat_c\":%d,\"lat_step\":%.9g,\"lat_gain\":[", u->lat_C, u->lat_step);
         for (int i = 0; i < u->lat_C; i++) fprintf(f, "%s%.9g", i ? "," : "", u->lat_hg[i]);
@@ -4303,6 +4304,7 @@ static int read_header(FILE *f, unet_cfg *cfg, int *step, size_t *np) {
     if ((p = strstr(line, "\"dec_widths\":["))) { p += 14; for (int i = 0; i < UNET_MAXLEV && *p && *p != ']'; i++) { cfg->dec_widths[i] = (int)strtol(p, (char **)&p, 10); if (*p == ',') p++; } }
     if ((p = strstr(line, "\"enc_blocks\":["))) { p += 14; for (int i = 0; i < UNET_MAXLEV && *p && *p != ']'; i++) { cfg->enc_blocks[i] = (int)strtol(p, (char **)&p, 10); if (*p == ',') p++; } }
     if ((p = strstr(line, "\"half_res\":"))) cfg->half_res = atoi(p + 11);
+    if ((p = strstr(line, "\"lat_guide\":"))) cfg->lat_guide = atoi(p + 12);
     cfg->w4_2d = (p = strstr(line, "\"w4_2d\":")) ? atoi(p + 8) : 0;
     if ((p = strstr(line, "\"ds_levels\":"))) cfg->ds_levels = atoi(p + 12);
     cfg->emb_lev = (p = strstr(line, "\"emb_lev\":")) ? atoi(p + 10) : 0;

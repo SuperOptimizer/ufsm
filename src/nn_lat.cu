@@ -117,6 +117,37 @@ extern "C" void nn_lat_input_q(const void *q, const void *x, int d, int h, int w
     const size_t cv = (size_t)d * h * w;
     lat_input_q_k<<<nblk(cv, 128), 128>>>((const int8_t *)q, (const f16 *)x, d, h, w, gain, C, step_raw, mean, isd, (f16 *)y); KCHECK();
 }
+/* The guided head of latent-grid nets (unet_cfg.lat_guide 5: the MX head's weight gradient takes <= 16 outputs, 11 + 5): the two side
+   channels' fine logits are their upsampled coarse logits plus terms in the voxel's z-scored CT value x and its central differences
+   grad x (edge-clamped), with 5 more coarse outputs as coefficients: l_0 += b_0 x + B . grad x, l_1 += b_1 x - B . grad x (the two faces
+   of a sheet lie on opposite sides of its CT ridge: one direction B, opposite signs). The cell grid cannot place a sheet's faces
+   inside a cell; the CT can. One slab [.][nz][H][W] of fp16 planes lg: dir 0 adds the terms to planes c0, c0 + 1 from the
+   coefficient planes base .. base + 4 (b_0, b_1, B_z, B_y, B_x); dir 1 (planes c0, c0 + 1 hold the loss gradient) writes the
+   coefficients' gradients over those planes. x: the window's CT channel [D][H][W] (fp16). */
+__global__ void lat_guide_k(const f16 *x, int D, int H, int W, int z0, int nz, f16 *lg, int base, int c0, int dir) {
+    const size_t hw = (size_t)H * W, ns = (size_t)nz * hw, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= ns) return;
+    const int z = z0 + (int)(i / hw), y = (int)(i / W % H), xx = (int)(i % W);
+    const size_t v = (size_t)z * hw + (size_t)y * W + xx;
+    const float f[4] = {__half2float(x[v]),
+                        0.5f * (__half2float(x[v + (z + 1 < D ? hw : 0)]) - __half2float(x[v - (z > 0 ? hw : 0)])),
+                        0.5f * (__half2float(x[v + (y + 1 < H ? W : 0)]) - __half2float(x[v - (y > 0 ? W : 0)])),
+                        0.5f * (__half2float(x[v + (xx + 1 < W ? 1 : 0)]) - __half2float(x[v - (xx > 0 ? 1 : 0)]))};
+    f16 *b = lg + (size_t)base * ns + i, *l0 = lg + (size_t)c0 * ns + i, *l1 = l0 + ns;
+    if (!dir) {
+        const float t = __half2float(b[2 * ns]) * f[1] + __half2float(b[3 * ns]) * f[2] + __half2float(b[4 * ns]) * f[3];
+        *l0 = __float2half_rn(__half2float(*l0) + __half2float(b[0]) * f[0] + t);
+        *l1 = __float2half_rn(__half2float(*l1) + __half2float(b[ns]) * f[0] - t);
+    } else {
+        const float g0 = __half2float(*l0), g1 = __half2float(*l1), gd = g0 - g1;
+        b[0] = __float2half_rn(g0 * f[0]); b[ns] = __float2half_rn(g1 * f[0]);
+        b[2 * ns] = __float2half_rn(gd * f[1]); b[3 * ns] = __float2half_rn(gd * f[2]); b[4 * ns] = __float2half_rn(gd * f[3]);
+    }
+}
+extern "C" void nn_lat_guide(const void *x, int D, int H, int W, int z0, int nz, void *lg, int base, int c0, int dir) {
+    const size_t ns = (size_t)nz * H * W;
+    lat_guide_k<<<nblk(ns, 256), 256>>>((const f16 *)x, D, H, W, z0, nz, (f16 *)lg, base, c0, dir); KCHECK();
+}
 extern "C" void nn_lat_input_x(const void *x, int d, int h, int w, const float *bas, const float *gain, int C, float step, void *y) {
     const size_t cv = (size_t)d * h * w;
     lat_input_x_k<<<nblk(cv, 128), 128>>>((const f16 *)x, d, h, w, bas, gain, C, step, (f16 *)y); KCHECK();
