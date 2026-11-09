@@ -12,6 +12,7 @@
 #include "sources.h"
 #include "split.h"
 #include "unet.h"
+#include "latfit.h"
 #include "nn_lp.h"
 #include <math.h>
 #include <signal.h>
@@ -92,6 +93,8 @@ typedef struct {
                                                                                       loss sums (device / last fetched), the recipe of the next forward */
 } gpu_state;
 /* task band_affinity: output channel 0 = recto (dense loss on target channel 0), channels 1..K = affinities for g_aff_off */
+static const char *g_lat_fit; static int g_lat_fit_n = 24, g_lat_fit_k;   /* --lat-fit FILE [--lat-fit-n N]: fit the cell transform (latfit.h) on N training windows, write it, exit */
+static int g_lat_c, g_lat_have; static float g_lat_step, g_lat_bas[29 * 64], g_lat_gain[29];   /* --lat-basis FILE [--lat-c 29 --lat-step 0.25]: the learned cell channels (latfit.h) */
 static int g_lcheck;    /* UFSM_LAT_STREAM=check: the device planes as well, every slab compared byte for byte */
 static int g_lstream;   /* --lat: the label planes (phase, winding mod 4 + component, papyrus) live in pinned host memory and reach the device one head slab at a time (lab_stream; UFSM_LAT_STREAM=0 off) */
 static int g_lat;   /* --lat 4: the network on the 4^3 cells of the window (unet_cfg.half_res 3, pool4), the losses in full-resolution head slabs (nn_lat_*) */
@@ -948,6 +951,12 @@ static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
     const shape5 hs = {B, g_cout, q, q, q};   /* --half-res: the network's grid, the full-resolution output channels */
     mem_pre(d, B, train);
     view_set(d, B);
+    if (g_lat_fit && train) {   /* the cell transform's fit on this window's device-built CT channel */
+        const size_t p3_ = (size_t)g_Pz * P * P; uint16_t *hx = malloc(p3_ * 2); nn_sync(); nn_d2h(hx, d->x, p3_ * 2);
+        latfit_acc(hx, g_Pz, P, 5, g_lat_fit_k); free(hx);
+        fprintf(stderr, "lat-fit: window %d of %d\n", g_lat_fit_k + 1, g_lat_fit_n);
+        if (++g_lat_fit_k >= g_lat_fit_n) exit(latfit_finish(g_lat_fit));
+    }
     const float *lg;
     if (g_restore && g_rpairs) {   /* real pairs: the input crop (target row 1) upsampled x4 onto the window, then (x - 128) / 64 */
         const float st4[3] = {4.f, 4.f, 4.f}, ph0[3] = {0.f, 0.f, 0.f}; const size_t p3_ = (size_t)g_Pz * P * P;
@@ -967,7 +976,7 @@ static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
         const float *l2 = unet_forward_x(d->u, d->x2, (shape5){B, unet_cfg_of(d->u)->cin, q, q, q}, train, g_xfmt != 0);
         nn_lowres_output(l2, unet_logits_h16(d->u), hs, g_hdiv, hm, (float *)d->lrt, d->lgf);
         lg = d->lgf;
-    } else if (g_lat) lg = unet_forward_x(d->u, d->x, (shape5){B, 4, g_Pz / 4, P / 4, P / 4}, train, g_xfmt != 0);   /* --lat: x the full-resolution CT channel */
+    } else if (g_lat) lg = unet_forward_x(d->u, d->x, (shape5){B, unet_cfg_of(d->u)->cin, g_Pz / 4, P / 4, P / 4}, train, g_xfmt != 0);   /* --lat: x the full-resolution CT channel */
     else lg = unet_forward_x(d->u, d->x, xs, train, g_xfmt != 0);
     d->lg = lg;
     mem_post(d, B, train);
@@ -1699,6 +1708,8 @@ int cmd_train(int argc, char **argv) {
         if (!g_half && strcmp(hr, "none")) { fprintf(stderr, "--half-res none|pool|pack|pool4|pack4\n"); return 2; }
         if (resume) { unet_cfg pc; int st; if (!unet_peek(resume, &pc, &st)) g_half = pc.half_res; }
         g_lat = atoi(opt(argc, argv, "--lat", "0"));
+        g_lat_fit = opt(argc, argv, "--lat-fit", nullptr); g_lat_fit_n = atoi(opt(argc, argv, "--lat-fit-n", "24"));
+        if (g_lat_fit && (!g_lat || g_xfmt == 2)) { /* (checked again once the input format is known) */ }
         if (g_lat && g_lat != 4) { fprintf(stderr, "--lat: 4 (the network on 4^3 cells)\n"); return 2; }
         if (g_half == 3 && g_unwrap2) g_lat = 4;   /* (a resumed --lat checkpoint) */
         if (g_lat) {
@@ -1706,6 +1717,16 @@ int cmd_train(int argc, char **argv) {
             if (!nn_get_f16()) { fprintf(stderr, "--lat 4: fp16 training (--f16 1)\n"); return 2; }
             if (P % (4 << (cfg.nlev - 1)) || g_Pz % (4 << (cfg.nlev - 1))) { fprintf(stderr, "--lat 4: P must be divisible by %d\n", 4 << (cfg.nlev - 1)); return 2; }
             g_half = 0; cfg.half_res = 3; cfg.cin = 4; cfg.cout = g_cout;
+            const char *lbp = opt(argc, argv, "--lat-basis", nullptr);
+            if (resume) { unet_cfg pc; int st; if (!unet_peek(resume, &pc, &st) && pc.half_res == 3 && pc.cin > 4) { g_lat_c = pc.cin - 3; cfg.cin = pc.cin; lbp = nullptr; } }   /* (its transform comes with the checkpoint) */
+            if (lbp) {
+                lat_basis *lb = malloc(sizeof *lb); if (lat_basis_load(lbp, lb)) { fprintf(stderr, "--lat-basis: cannot read %s (train --lat-fit writes it)\n", lbp); return 2; }
+                g_lat_c = atoi(opt(argc, argv, "--lat-c", "29")); g_lat_step = (float)atof(opt(argc, argv, "--lat-step", "0.25"));
+                if (g_lat_c != 13 && g_lat_c != 29) { fprintf(stderr, "--lat-c: 13 or 29 (16 or 32 network inputs with the 3 radial channels)\n"); return 2; }
+                for (int c = 0; c < g_lat_c; c++) { memcpy(g_lat_bas + c * 64, lb->b[c], 64 * 4); g_lat_gain[c] = c ? 1.f / fmaxf(lb->sigma[c], fmaxf(g_lat_step, 1e-3f)) : 0.125f; }
+                free(lb); cfg.cin = g_lat_c + 3; g_lat_have = 1;
+                fprintf(stderr, "latent grid: %d learned cell channels from %s (step %g; the cell mean and %d principal axes), 3 radial means\n", g_lat_c, lbp, g_lat_step, g_lat_c - 1);
+            }
             fprintf(stderr, "latent grid: the network runs on %d^3 cells of 4^3 voxels (%d inputs, %d outputs); losses at full resolution in head slabs\n", P / 4, cfg.cin, cfg.cout);
         }
         g_hdiv = unet_hr_div(g_half);
@@ -2045,6 +2066,7 @@ int cmd_train(int argc, char **argv) {
         /* fp16 logits in their own buffer (MX activations; the losses read them as unet_logits_h16 says): 11 unwrap heads at P 384
            are 2.5 GB in fp32. Not for half-resolution nets (the losses read the fp32 upsampled copy) or sheet nets; UFSM_LOGITS32=1 */
         unet_set_fp16_logits(d->u, (!g_half || g_pkf) && !g_sheet && !ufsm_env_on("UFSM_LOGITS32"));
+        if (g_lat_have) unet_set_lat_basis(d->u, g_lat_bas, g_lat_gain, g_lat_c, g_lat_step);
         if (resume) {
             const int grow = atoi(opt(argc, argv, "--grow-head", "0"));   /* band_affinity warm start from a recto checkpoint */
             step0 = grow ? unet_load_grow(d->u, resume, 1, 1.f) : unet_load(d->u, resume);

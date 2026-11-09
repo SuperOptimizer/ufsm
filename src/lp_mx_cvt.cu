@@ -200,6 +200,33 @@ __global__ void input_lat_k(const TI *ct, const uint8_t *recs, size_t rec_bytes,
     for (int c = 0; c < 4; c++) r[c] = rnd16<TI>(acc[c] * (1.f / 64.f));
     mx_store_row_b<B>(y, mx_sc<B>(y, N, 4, cv), i, 8, r);
 }
+/* train --lat 4 --lat-basis: C learned channels per cell instead of the CT mean: the cell's 64 CT values on the rows of bas ([C][64],
+   latfit.h: row 0 the mean direction), quantised to step (0: not quantised; |q| <= 127, the mean 32767: what a latent store keeps),
+   times gain[c]; then the 3 radial cell means. C + 3 channels in one MX row (16 or 32 wide) */
+template <int B, typename TI>
+__global__ void input_latc_k(const TI *ct, const uint8_t *recs, size_t rec_bytes, int N, int d, int p, const float *bas, const float *gain, int C, float step, uint8_t *y) {
+    const size_t cv = (size_t)d * p * p, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= (size_t)N * cv) return;
+    const int n = (int)(i / cv); const size_t v = i % cv;
+    const int z = (int)(v / ((size_t)p * p)), yy = (int)((v / p) % p), xx = (int)(v % p), D = 4 * d, P = 4 * p;
+    float acc[3] = {0.f, 0.f, 0.f}, cv64[64];
+    for (int k = 0; k < 64; k++) {
+        const int fz = 4 * z + (k >> 4), fy = 4 * yy + (k >> 2 & 3), fx = 4 * xx + (k & 3);
+        float r4[4] = {0.f, 0.f, 0.f, 0.f};
+        rad_full4<TI>(ct, recs, rec_bytes, N, D, P, n, fz, fy, fx, (((size_t)n * D + fz) * P + fy) * P + fx, r4);
+        cv64[k] = r4[0]; for (int c = 0; c < 3; c++) acc[c] += r4[1 + c];
+    }
+    float r[32];
+#pragma unroll
+    for (int k = 0; k < 32; k++) r[k] = 0.f;
+    for (int c = 0; c < C; c++) {
+        float s = 0.f; for (int k = 0; k < 64; k++) s += bas[c * 64 + k] * cv64[k];
+        if (step > 0.f) { const float lim = c ? 127.f : 32767.f; s = fminf(lim, fmaxf(-lim, rintf(s / step))) * step; }
+        r[c] = rnd16<TI>(s * gain[c]);
+    }
+    for (int c = 0; c < 3; c++) r[C + c] = rnd16<TI>(acc[c] * (1.f / 64.f));
+    mx_store_row_b<B>(y, mx_sc<B>(y, N, C + 3, cv), i, mx_bw(C + 3), r);
+}
 /* --half-res pack with --gpu-input: the network's 8 input channels on the 2x2x2 blocks of the window, straight from the full-resolution
    16-bit CT channel and the radial records: each sub-voxel's 4 channels as input_rad_k (rounded to the 16-bit type), then nn_half_input
    mode 2 (the block means of the 4 channels, the CT's Haar details along z, y, x and its mean absolute deviation, each rounded to the
@@ -268,6 +295,15 @@ extern "C" void lp_input_rad_pack(const void *ct16, int dt, const void *rec, siz
     if (bits == 4) { if (dt == 2) IRP(4, __half); else IRP(4, bf16); }
     else { if (dt == 2) IRP(8, __half); else IRP(8, bf16); }
 #undef IRP
+    LPCK();
+}
+extern "C" void lp_input_latc(const void *ct16, int dt, const void *rec, size_t rec_bytes, int N, int d, int p, const float *bas, const float *gain, int C, float step, void *y, int bits) {
+    const size_t n = (size_t)N * d * p * p;
+    const uint8_t *rr = (const uint8_t *)rec; uint8_t *yy = (uint8_t *)y;
+#define ILC(B, T) input_latc_k<B, T><<<nblk_(n, 128), 128>>>((const T *)ct16, rr, rec_bytes, N, d, p, bas, gain, C, step, yy)
+    if (bits == 4) { if (dt == 2) ILC(4, __half); else ILC(4, bf16); }
+    else { if (dt == 2) ILC(8, __half); else ILC(8, bf16); }
+#undef ILC
     LPCK();
 }
 extern "C" void lp_input_lat(const void *ct16, int dt, const void *rec, size_t rec_bytes, int N, int d, int p, void *y, int bits) {

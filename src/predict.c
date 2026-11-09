@@ -1615,7 +1615,9 @@ int cmd_predict(int argc, char **argv) {
             if (g_pv && tta > 1) nn_d2d(g_pvsave, g_pvd, (size_t)g_pvP * g_pvP * g_pvP);
             const float *lg;
             if (half) {   /* the network on blocks of the window: its input from the 4-channel window, its logits back to full resolution */
-                nn_lowres_input(xd, xs, hdiv, hmode, lrt, x2, h16);
+                const float *lbas, *lgain; float lstep; const int latc = half == 3 ? unet_lat_basis(u, &lbas, &lgain, &lstep) : 0;
+                if (latc) nn_lat_input_x(xd, W / 4, W / 4, W / 4, lbas, lgain, latc, lstep, x2);   /* the learned cell channels of a --lat-basis checkpoint */
+                else nn_lowres_input(xd, xs, hdiv, hmode, lrt, x2, h16);
                 const float *l2 = unet_forward_x(u, x2, xn, 0, h16);
                 nn_lowres_output(l2, unet_logits_h16(u), (shape5){1, rvfuse ? 2 : 1, W / hdiv, W / hdiv, W / hdiv}, hdiv, hmode, (float *)lrt, lgf);   /* (--channel rv on a latent-grid net: both side logits) */
                 lg = lgf;

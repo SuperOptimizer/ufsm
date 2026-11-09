@@ -80,6 +80,27 @@ __global__ void lat_adj_k(const f16 *g, int C, int d, int h, int w, int z0, int 
     gc[(size_t)c * d * pl + (size_t)cz * pl + (size_t)cy * w + cx] += s;
 }
 
+/* predict on a --lat-basis checkpoint: input_latc_k's channels from the host-path 4-channel fp16 window */
+__global__ void lat_input_x_k(const f16 *x, int d, int h, int w, const float *bas, const float *gain, int C, float step, f16 *y) {
+    const size_t cv = (size_t)d * h * w, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= cv) return;
+    const int z = (int)(i / ((size_t)h * w)), yy = (int)(i / w % h), xx = (int)(i % w), H = 4 * h, W = 4 * w; const size_t fv = (size_t)64 * cv;
+    float acc[3] = {0.f, 0.f, 0.f}, v[64];
+    for (int k = 0; k < 64; k++) {
+        const size_t j = ((size_t)(4 * z + (k >> 4)) * H + 4 * yy + (k >> 2 & 3)) * W + 4 * xx + (k & 3);
+        v[k] = __half2float(x[j]); for (int c = 0; c < 3; c++) acc[c] += __half2float(x[(size_t)(1 + c) * fv + j]);
+    }
+    for (int c = 0; c < C; c++) {
+        float s = 0.f; for (int k = 0; k < 64; k++) s += bas[c * 64 + k] * v[k];
+        if (step > 0.f) { const float lim = c ? 127.f : 32767.f; s = fminf(lim, fmaxf(-lim, rintf(s / step))) * step; }
+        y[(size_t)c * cv + i] = __float2half_rn(s * gain[c]);
+    }
+    for (int c = 0; c < 3; c++) y[(size_t)(C + c) * cv + i] = __float2half_rn(acc[c] * (1.f / 64.f));
+}
+extern "C" void nn_lat_input_x(const void *x, int d, int h, int w, const float *bas, const float *gain, int C, float step, void *y) {
+    const size_t cv = (size_t)d * h * w;
+    lat_input_x_k<<<nblk(cv, 128), 128>>>((const f16 *)x, d, h, w, bas, gain, C, step, (f16 *)y); KCHECK();
+}
 extern "C" void nn_lat_up_slab(const void *lg, int lh16, int C, int d, int h, int w, int z0, int nz, void *y) {
     const size_t ns = (size_t)nz * 16 * h * w;
     if (lh16) lat_up_k<f16><<<nblk(ns, 256), 256>>>((const f16 *)lg, C, d, h, w, z0, nz, (f16 *)y);

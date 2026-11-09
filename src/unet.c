@@ -149,6 +149,7 @@ struct unet {
     int xin_shared, xin_out, a2_stale, fwd_train;       /* training: the network input lives in dec[0].a2's buffer (host copy in between); the
                                                 buffer holds the input since a backward (a repeated backward re-runs dec[0].c2) */
     size_t xin_bytes; void *h_xin, *ev_xin[4];
+    float *lat_bas, *lat_gain, lat_step, lat_hb[29 * 64], lat_hg[29]; int lat_C;   /* unet_set_lat_basis: the learned cell transform of a latent-grid net (cfg.cin = lat_C + 3) */
     const void *rad;                         /* unet_set_input_rad (train --gpu-input): the 16-bit input is the CT alone, these radial records
                                                 build the 4 MX input channels (nn_input_rad) */
     int a0_share, a2_out;                    /* level-0 A in dec[0].a2's buffer; enc[0].a2 on the host from its forward to dec[0]'s conv1 weight
@@ -1617,6 +1618,13 @@ int unet_lean_nob(const unet *u) { return u->nob; }
 /* the logits sit in the buffer the head's backward-data writes (gout[0]: fp16 logits of the lean 2 MX-fp4 layout) */
 int unet_logits_in_gx(const unet *u) { return u->built && u->train && u->logits && u->logits == u->gout[0]; }
 void unet_set_input_rad(unet *u, const void *rec) { u->rad = rec; }
+void unet_set_lat_basis(unet *u, const float *bas, const float *gain, int C, float step) {
+    if (C < 1 || C > 29 || u->cfg.cin != C + 3) { fprintf(stderr, "unet: the cell transform has %d channels, the network %d inputs (C + 3)\n", C, u->cfg.cin); abort(); }
+    memcpy(u->lat_hb, bas, (size_t)C * 64 * 4); memcpy(u->lat_hg, gain, (size_t)C * 4); u->lat_C = C; u->lat_step = step;
+    if (!u->lat_bas) { u->lat_bas = nn_malloc(29 * 64 * 4); u->lat_gain = nn_malloc(29 * 4); }
+    nn_h2d(u->lat_bas, u->lat_hb, (size_t)C * 64 * 4); nn_h2d(u->lat_gain, u->lat_hg, (size_t)C * 4);
+}
+int unet_lat_basis(const unet *u, const float **bas, const float **gain, float *step) { if (u->lat_C) { *bas = u->lat_bas; *gain = u->lat_gain; *step = u->lat_step; } return u->lat_C; }
 int unet_logits_h16(const unet *u) { return u->built && u->logits_h16; }
 void unet_set_fp16_logits(unet *u, int on) {   /* takes effect at the next build */
     if (u->lh16_req == !!on) return;
@@ -2517,6 +2525,7 @@ const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x
     else if (x_h16 && act_mx8() && xin_mx) {
         if (!u->xin) u->xin = dalloc_input(u, xs);
         if (u->rad && u->cfg.half_res == 2) nn_input_rad_pack(x, xs, u->rad, u->xin);   /* --half-res pack: x is the full-resolution CT channel */
+        else if (u->rad && u->cfg.half_res == 3 && u->lat_C) nn_input_latc(x, xs, u->rad, u->lat_bas, u->lat_gain, u->lat_C, u->lat_step, u->xin);   /* --lat-basis: the learned cell channels */
         else if (u->rad && u->cfg.half_res == 3) nn_input_lat(x, xs, u->rad, u->xin);   /* train --lat 4: the 4^3 cell means, x the full-resolution CT channel */
         else if (u->rad && u->l0rx) { u->l0x_ct = x; for (int k = 0; k < 16; k++) u->l0x_held[k] = -1; }   /* (stage S4: per slab in the stream, l0x_need) */
         else if (u->rad) nn_input_rad(x, xs, u->rad, u->xin);   /* --gpu-input: x is the CT channel, the radial channels from the records */
@@ -4145,6 +4154,7 @@ void unet_wquant(unet *u, unsigned seed) { (void)u; (void)seed; }   /* kept for 
 /* ---- checkpoints ---- */
 static int g_loaded_sparse = 0, g_loaded_wq = 0, g_loaded_muon = 0;   /* set by the header parser, applied by unet_load */
 static float g_loaded_hbR[UNET_MAXCONV]; static int g_loaded_hbR_n = 0;   /* Hyperball radii of the header */
+static int g_loaded_lat_c; static float g_loaded_lat_step, g_loaded_lat_gain[29], g_loaded_lat_bas[29 * 64];   /* the cell transform of the last header read */
 static long g_loaded_l0_n; static int g_loaded_l0_warm, g_loaded_l0_cnt; static float g_loaded_l0_mom, g_loaded_l0_run[16 * 256];   /* cfg.l0_norm ema */
 /* debug: per block, the GroupNorm statistics of the last forward (mean / rstd of a1 and a2 per sample and group:
    non-finite counts and extremes) and the largest |weight| of each conv. Localises a non-finite forward. */
@@ -4228,6 +4238,11 @@ int unet_save(const unet *u, const char *path, int step, const char *extra) {
     { int any = 0; for (int i = 0; i < u->cfg.nlev; i++) any |= u->cfg.enc_blocks[i] != 0;
       if (any) { fputs(",\"enc_blocks\":[", f); for (int i = 0; i < u->cfg.nlev; i++) fprintf(f, "%s%d", i ? "," : "", u->cfg.enc_blocks[i]); fputc(']', f); } }
     if (u->cfg.half_res) fprintf(f, ",\"half_res\":%d", u->cfg.half_res);
+    if (u->lat_C) {   /* the cell transform: rows of 64 weights, the gains, the step */
+        fprintf(f, ",\"lat_c\":%d,\"lat_step\":%.9g,\"lat_gain\":[", u->lat_C, u->lat_step);
+        for (int i = 0; i < u->lat_C; i++) fprintf(f, "%s%.9g", i ? "," : "", u->lat_hg[i]);
+        fputs("],\"lat_basis\":[", f); for (int i = 0; i < u->lat_C * 64; i++) fprintf(f, "%s%.9g", i ? "," : "", u->lat_hb[i]); fputc(']', f);
+    }
     if (u->cfg.w4_2d) fprintf(f, ",\"w4_2d\":%d", u->cfg.w4_2d);
     if (u->cfg.ds_levels) fprintf(f, ",\"ds_levels\":%d", u->cfg.ds_levels);
     if (u->cfg.emb_lev) fprintf(f, ",\"emb_lev\":%d,\"emb_ch\":%d", u->cfg.emb_lev, u->cfg.emb_ch);
@@ -4316,6 +4331,13 @@ static int read_header(FILE *f, unet_cfg *cfg, int *step, size_t *np) {
     if ((p = strstr(line, "\"l0_norm\":"))) cfg->l0_norm = atoi(p + 10);
     if ((p = strstr(line, "\"l0_slab\":"))) cfg->l0_slab = atoi(p + 10);
     g_loaded_l0_cnt = 0;
+    g_loaded_lat_c = (p = strstr(line, "\"lat_c\":")) ? atoi(p + 8) : 0; if (g_loaded_lat_c < 0 || g_loaded_lat_c > 29) return -1;
+    if (g_loaded_lat_c) {
+        int ng = 0, nb = 0; g_loaded_lat_step = (p = strstr(line, "\"lat_step\":")) ? strtof(p + 11, nullptr) : 0.f;
+        if ((p = strstr(line, "\"lat_gain\":["))) { p += 12; while (ng < 29 && *p && *p != ']') { g_loaded_lat_gain[ng++] = strtof(p, (char **)&p); if (*p == ',') p++; } }
+        if ((p = strstr(line, "\"lat_basis\":["))) { p += 13; while (nb < 29 * 64 && *p && *p != ']') { g_loaded_lat_bas[nb++] = strtof(p, (char **)&p); if (*p == ',') p++; } }
+        if (ng != g_loaded_lat_c || nb != g_loaded_lat_c * 64) return -1;
+    }
     if ((p = strstr(line, "\"l0_n\":"))) g_loaded_l0_n = atol(p + 7);
     if ((p = strstr(line, "\"l0_warm\":"))) g_loaded_l0_warm = atoi(p + 10);
     if ((p = strstr(line, "\"l0_mom\":"))) g_loaded_l0_mom = strtof(p + 9, nullptr);
@@ -4353,6 +4375,7 @@ int unet_load(unet *u, const char *path) {
     free(h);
     fclose(f);
     u->mx_R_nload = g_loaded_hbR_n; memcpy(u->mx_R_load, g_loaded_hbR, (size_t)g_loaded_hbR_n * 4); u->mx_R_ok = 0;   /* none: from the weights */
+    if (g_loaded_lat_c && u->cfg.cin == g_loaded_lat_c + 3) unet_set_lat_basis(u, g_loaded_lat_bas, g_loaded_lat_gain, g_loaded_lat_c, g_loaded_lat_step);
     if (g_loaded_sparse) unet_set_sparse24(u, 1);
     if (g_loaded_wq) unet_set_wq(u, g_loaded_wq);
     if (u->cfg.l0_norm == 2) {   /* the running statistics (a checkpoint without them: a fresh warm-up) */

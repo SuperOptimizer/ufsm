@@ -172,6 +172,10 @@ void nn_input_rad_pack(const void *ct16, shape5 xs, const void *rec, void *y);
 /* train --lat 4 (pool4) with --gpu-input: the 4-channel MX input on the 4^3 cells of the window (xs {n, 4, d, h, h}: the cell grid), each
    channel the cell mean of nn_input_rad's full-resolution value (warp included) from the full-resolution 16-bit CT channel ct16 */
 void nn_input_lat(const void *ct16, shape5 xs, const void *rec, void *y);
+/* the same with the learned cell transform (latfit.h): xs.c = C + 3 (16 or 32): C quantised coefficients x gain, then the radial means */
+void nn_input_latc(const void *ct16, shape5 xs, const void *rec, const float *bas, const float *gain, int C, float step, void *y);
+/* predict: the same channels from the full-resolution 4-channel fp16 window x ([4][4d][4h][4w]: CT, radial) into y (fp16 [C + 3][d][h][w]) */
+void nn_lat_input_x(const void *x, int d, int h, int w, const float *bas, const float *gain, int C, float step, void *y);
 /* latent-grid logits -> one z-slab of fine logits and back (src/nn_lat.cu; the pool4 chain of nn_lowres_output, B 1): coarse lg
    [C][d][h][w] (fp16 when lh16, else fp32) -> fine planes [z0, z0 + nz) of the 4d x 4h x 4w window, fp16 [C][nz][4h][4w] in y;
    nn_lat_up_adj adds the adjoint of such a slab's fp16 gradient g into the fp32 coarse gradient gc [C][d][h][w] */
