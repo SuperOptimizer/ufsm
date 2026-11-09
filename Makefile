@@ -557,6 +557,9 @@ $(B)/test_scan_augment: tests/test_scan_augment.c src/scan_augment.c src/scan_au
 
 $(B)/aug_preview: tools/aug_preview.c $(SAMPLE_TEST_OBJ)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
+# open-data label builder helper (tools/build_open_surfaces.py): geometric dedup of tifxyz segments
+$(B)/surface_dedup: tools/surface_dedup.c $(B)/tiff.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ -lm -lz
 
 $(B)/test_target_erode: tests/test_target_erode.c src/target_erode.h | $(B)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< -o $@

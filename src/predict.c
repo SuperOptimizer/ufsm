@@ -535,6 +535,7 @@ typedef struct {
     int W, halo, shard, Dl, H0, kss, h16, sign, sb, fail; int64_t ns[3], nss[3], bn[3], bo[3];
     const axis *ax; double scale, t0; long ndone, nskip;
     double pcut; int pcond;   /* task papyrus: the cutoff (raw CT units) of a conditioned net, else < 0; its conditioning (papyrus.h) */
+    double norm_mean, norm_sd;   /* --norm: fixed input z-score when norm_sd > 0 */
 } pjob_t;
 static void psplit_flush(pjob_t *J, int side, int64_t qz, int64_t qy, int64_t qx) {   /* both sides: the owned planes to the host shard; side 0 submits */
     pside_t *S = &J->s[side];
@@ -589,7 +590,8 @@ static void psplit_job(int side, void *arg) {
         pthread_mutex_lock(&rd->mu); if (atomic_load(&rd->consumed) < i + 1) atomic_store(&rd->consumed, i + 1); pthread_cond_broadcast(&rd->cv); pthread_mutex_unlock(&rd->mu);
         if (h[3] > 0) { J->fail = J->fail ? J->fail : 2; return; }   /* (both halves see it at the same collective) */
         if (h[0] == 0) { if (!side) J->nskip++; continue; }
-        const double w3 = (double)W * W * W, wmean = h[1] / w3, var = h[2] / w3 - wmean * wmean, sd = sqrt(var > 0 ? var : 0) + 1e-3;
+        const double w3 = (double)W * W * W, wmean0 = h[1] / w3, var = h[2] / w3 - wmean0 * wmean0;
+        const double wmean = J->norm_sd > 0 ? J->norm_mean : wmean0, sd = J->norm_sd > 0 ? J->norm_sd : sqrt(var > 0 ? var : 0) + 1e-3;
         if (J->pcut >= 0 && J->pcond == 1) unet_set_cond(S->u, (float)((J->pcut - wmean) / sd));   /* papyrus: the cutoff in this window's input units */
         const double mean = J->pcut >= 0 && J->pcond == 2 ? J->pcut : wmean;                        /* (or the input's zero) */
         const int64_t o[3] = {J->bo[0] + t->tz, J->bo[1] + t->ty, J->bo[2] + t->tx};
@@ -727,6 +729,7 @@ int cmd_predict(int argc, char **argv) {
                         "       [--fit-ct 1]                     with them the CT planes ct / cs (fit --w-ct / --w-cspacing; ufsm ct-fields adds them later)\n"
                         "       [--no-out 1]                     skip writing the prediction volume's shards (e.g. only the --fit-zarr fields)\n"
                         "       [--fit-q 8] [--fit-q-phase 4]   volcomp quantiser of the --fit-zarr arrays (0 lossless; the phase planes pc / ps: --fit-q-phase)\n"
+                        "       [--norm MEAN,SD]   fixed input normalization (uint8 CT units) instead of each window's own mean / sd\n"
                         "       [--radial-sign 1|-1]   -1 reverses the direction input (the CT is unchanged): a recto model then marks the verso face\n"
                         "       [--gn-save FILE]   pool the GroupNorm statistics of every window processed into FILE (calibration)\n"
                         "       [--gn-frozen FILE]   use FILE's pooled GroupNorm statistics instead of each window's (no dependence on the window)\n"
@@ -749,6 +752,9 @@ int cmd_predict(int argc, char **argv) {
     double um = atof(opt(argc, argv, "--um", "0"));
     int level = atoi(opt(argc, argv, "--level", "0")), W = atoi(opt(argc, argv, "--window", "288")), halo = atoi(opt(argc, argv, "--halo", "8"));
     int shard = atoi(opt(argc, argv, "--shard", "512")), gpu = atoi(opt(argc, argv, "--gpu", "0")), nlev = atoi(opt(argc, argv, "--levels", "4"));
+    double norm_mean = 0, norm_sd = 0;   /* --norm MEAN,SD: fixed input normalization (uint8 CT units) instead of each window's own mean / sd */
+    { const char *nm = opt(argc, argv, "--norm", nullptr);
+      if (nm && (sscanf(nm, "%lf,%lf", &norm_mean, &norm_sd) != 2 || !(norm_sd > 0))) { fprintf(stderr, "predict: --norm needs MEAN,SD with SD > 0\n"); return 2; } }
     const double input_gain = atof(opt(argc, argv, "--input-gain", "1")), input_bias = atof(opt(argc, argv, "--input-bias", "0"));
     if (!isfinite(input_gain) || input_gain <= 0 || !isfinite(input_bias)) { fprintf(stderr, "predict: --input-gain must be finite and positive; --input-bias finite\n"); return 2; }
     const int input_affine = input_gain != 1 || input_bias != 0;
@@ -1492,7 +1498,7 @@ int cmd_predict(int argc, char **argv) {
         J.rd = &rd; J.WR = &WR; J.tiles = rd.tiles; J.ntiles = rd.ntiles;
         J.W = W; J.halo = halo; J.shard = shard; J.Dl = Dl; J.H0 = H0; J.kss = kss; J.h16 = h16; J.sign = (int)radial_sign;
         for (int d = 0; d < 3; d++) { J.ns[d] = ns[d]; J.nss[d] = nss[d]; J.bn[d] = bn[d]; J.bo[d] = bo[d]; }
-        J.ax = &ax; J.scale = scale; J.t0 = t0; J.pcut = pcut; J.pcond = pap_cond;
+        J.ax = &ax; J.scale = scale; J.t0 = t0; J.pcut = pcut; J.pcond = pap_cond; J.norm_mean = norm_mean; J.norm_sd = norm_sd;
         split_run(sctx, psplit_job, &J);
         for (int k = 0; k < 2; k++) { nn_init(gpus[k]); const char *e = nn_check(); if (e) { fprintf(stderr, "cuda (GPU %d): %s\n", gpus[k], e); J.fail = 3; } }
         nn_init(gpu);
@@ -1558,6 +1564,7 @@ int cmd_predict(int argc, char **argv) {
             }
             if (nz == 0) { nskip++; pthread_mutex_lock(&rd.mu); atomic_store(&rd.consumed, i + 1); pthread_cond_broadcast(&rd.cv); pthread_mutex_unlock(&rd.mu); continue; }
             double mean = sum / (double)w3, var = sq / (double)w3 - mean * mean, sd = sqrt(var > 0 ? var : 0) + 1e-3;
+            if (norm_sd > 0) { mean = norm_mean; sd = norm_sd; }   /* --norm: one fixed z-score for every window */
             if (pcut >= 0 && pap_cond == 1) unet_set_cond(u, (float)((pcut - mean) / sd));   /* papyrus: the cutoff in this window's input units */
             if (pcut >= 0 && pap_cond == 2) mean = pcut;                                         /* (or the input's zero) */
             /* G * ((CT - mean) / sd) + B in both explicit-input and fused-stem paths (predict --input-gain / --input-bias): the original CT
