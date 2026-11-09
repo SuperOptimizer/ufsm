@@ -971,6 +971,37 @@ static void z3_fill(const z3_meta *m, uint8_t *out, size_t nv, int nthreads) {
     }
 }
 static int z3_read_impl(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads, uint32_t submask, uint8_t *dsink, uint32_t *dmask, int lean);
+/* whether any stored chunk intersects the box o + n (sharded arrays: from the shard indices, no chunk read): 1 yes, 0 none (a read
+   would be all fill), -1 error; unsharded arrays: 1 */
+int z3_box_any(z3 *z, const int64_t o[3], const int64_t n[3]) {
+    const z3_meta *m = &z->m;
+    if (!m->sharded) return 1;
+    int64_t lo[3], hi[3], s0[3], s1[3];
+    for (int i = 0; i < 3; i++) {
+        lo[i] = o[i] < 0 ? 0 : o[i]; hi[i] = o[i] + n[i] > m->shape[i] ? m->shape[i] : o[i] + n[i];
+        if (hi[i] <= lo[i]) return 0;
+        s0[i] = lo[i] / m->shard[i]; s1[i] = (hi[i] - 1) / m->shard[i];
+    }
+    ientry *idx = malloc((size_t)z->nc * sizeof *idx); if (!idx) return -1;
+    int any = 0;
+    for (int64_t sz = s0[0]; sz <= s1[0] && !any; sz++) for (int64_t sy = s0[1]; sy <= s1[1] && !any; sy++) for (int64_t sx = s0[2]; sx <= s1[2] && !any; sx++) {
+        char skey[1200]; shard_key(z, sz, sy, sx, skey, sizeof skey);
+        const int present = load_index(z, skey, idx);
+        if (present < 0) { free(idx); return -1; }
+        if (!present) continue;
+        int c0[3], c1[3];
+        for (int i = 0; i < 3; i++) {
+            const int64_t sb = (i == 0 ? sz : i == 1 ? sy : sx) * m->shard[i], a = lo[i] > sb ? lo[i] - sb : 0, b = (hi[i] < sb + m->shard[i] ? hi[i] : sb + m->shard[i]) - sb - 1;
+            c0[i] = (int)(a / m->chunk[i]); c1[i] = (int)(b / m->chunk[i]);
+        }
+        for (int cz = c0[0]; cz <= c1[0] && !any; cz++) for (int cy = c0[1]; cy <= c1[1] && !any; cy++) for (int cx = c0[2]; cx <= c1[2] && !any; cx++) {
+            const ientry *e = &idx[(cz * z->cgrid[1] + cy) * z->cgrid[2] + cx];
+            any = !(e->off == UINT64_MAX && e->len == UINT64_MAX) && e->len;
+        }
+    }
+    free(idx);
+    return any;
+}
 int z3_read(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads) { return z3_read_impl(z, o, n, out, nthreads, 0, nullptr, nullptr, 0); }
 int z3_read_sub(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads, uint32_t submask) { return z3_read_impl(z, o, n, out, nthreads, submask, nullptr, nullptr, 0); }
 static int z3_read_sub_dev_impl(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads, uint32_t submask, uint8_t *dchunk, uint32_t *dev_mask, int lean) {

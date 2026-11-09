@@ -195,7 +195,7 @@ static size_t P3(const sampler *sp) { return (size_t)PZ(&sp->cfg) * sp->cfg.P * 
 /* batch buffers: pinned (the trainer uploads asynchronously), or plain malloc with UFSM_SAMPLER_NOPIN=1 (CPU-only benchmarks) */
 static _Atomic size_t g_slot_bytes;   /* pinned (or malloc'd) batch slot bytes, every sampler (UFSM_HOSTMEM) */
 static int nopin(void) { static int v = -1; if (v < 0) { const char *e = getenv("UFSM_SAMPLER_NOPIN"); v = e && atoi(e); } return v; }
-static void *halloc(size_t n) { atomic_fetch_add(&g_slot_bytes, n); if (nopin()) { void *p = malloc(n ? n : 1); if (!p) abort(); return p; } return nn_host_alloc(n); }
+static void *halloc(size_t n) { atomic_fetch_add(&g_slot_bytes, n); if (nopin()) { void *p = malloc(n ? n : 1); if (!p) abort(); memset(p, 0, n); return p; } return nn_host_alloc(n); }   /* (memset: faulted in like the pinned slots, so CPU-only benchmarks see no first-touch faults) */
 static void hfree(void *p) { if (nopin()) free(p); else nn_host_free(p); }
 static batch alloc_batch(const sample_cfg *c) {
     size_t p3 = (size_t)PZ(c) * c->P * c->P;
@@ -1165,13 +1165,18 @@ static size_t tp_class(size_t n) { return n >= ((size_t)1 << 20) ? (n + ((size_t
 /* window-sized worker scratch (>= 4 MB): 2 MB aligned with transparent huge pages requested (the system's THP mode is often
    "madvise"): the warp writer's gathers and the volume passes otherwise walk 4 KB page tables over hundreds of MB per window. Pages
    are still only backed when touched. free() releases it as any malloc block. */
+static int g_thp_default = 1;   /* (sampler_start: 0 with --gpu-aug 2) */
 static void *wbig_alloc(size_t n, int zero) {
     const size_t H = (size_t)2 << 20;
     if (n < ((size_t)4 << 20)) return zero ? calloc(n ? n : 1, 1) : malloc(n ? n : 1);
     void *p = nullptr;
     if (posix_memalign(&p, H, n)) return nullptr;
 #ifdef MADV_HUGEPAGE
-    madvise(p, (n + H - 1) & ~(H - 1), MADV_HUGEPAGE);
+    /* UFSM_SAMPLER_THP=0/1 (default: on unless every warp runs on the device, --gpu-aug 2): with THP defrag "madvise" each first touch
+       of a huge page may compact memory synchronously, under memory pressure minutes of system time (2026-11-09: 493 s system vs 125 s
+       user for 24 P512 windows); the --gpu-aug 2 recipe gains nothing from them (cycles equal within noise) */
+    const char *e = getenv("UFSM_SAMPLER_THP");
+    if (e ? atoi(e) != 0 : g_thp_default) madvise(p, (n + H - 1) & ~(H - 1), MADV_HUGEPAGE);
 #endif
     if (zero) memset(p, 0, n);
     return p;
@@ -2876,7 +2881,8 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
             uint16_t *wq = nullptr;   /* warped --task unwrap2: the winding and its component for warp_phase_w4 (one pass with the phase) */
             if (!sw || (g_crush.ph ? (memcpy(sw, g_crush.ph, p3), 0) : phase_window(s->phase, o, Pz, P, pshift, sw))) { SW_PUT(); return -1; }
             if (s->phase_sign < 0) phase_negate(sw, p3);   /* (before the winding mod 4: it unwraps this phase) */
-            if (s->phase_ign && pshift < 2 && !g_crush.pre) {   /* (--aug-tear: applied before the cut) (interpolated 2.4 um windows: no mask) "ignore": label sets that disagree there (ufsm phase-conflict): unknown, not trained on */
+            const int ign_none = s->phase_ign && pshift == 0 && !g_crush.ig && z3_box_any(s->phase_ign, o, (const int64_t[3]){Pz, P, P}) == 0;   /* (no stored chunk in the window: all fill, which keeps every phase) */
+            if (s->phase_ign && pshift < 2 && !g_crush.pre && !ign_none) {   /* (--aug-tear: applied before the cut) (interpolated 2.4 um windows: no mask) "ignore": label sets that disagree there (ufsm phase-conflict): unknown, not trained on */
                 uint8_t *ig = PH_GET(big + 9 * p3, p3);
                 if (!ig || (g_crush.ig ? (memcpy(ig, g_crush.ig, p3), 0) : phase_window(s->phase_ign, o, Pz, P, pshift, ig))) { PH_PUT(ig, p3); SW_PUT(); return -1; }
                 for (size_t k = 0; k < p3; k++) if (ig[k] && ig[k] != PHASE_UNKNOWN) sw[k] = PHASE_UNKNOWN;   /* (outside the mask array: 255 = keep) */
@@ -3414,6 +3420,7 @@ sampler *sampler_start(sources *S, const sample_cfg *cfg) {
         memset(sp->cfg.level_p, 0, sizeof sp->cfg.level_p); sp->cfg.level_p[0] = 1;
     }
     { unsigned sb; memcpy(&sb, &cfg->soft, 4); atomic_store(&sp->soft_bits, sb); }
+    g_thp_default = cfg->gpu_aug != 2;
     sp->prof = ufsm_env_on("UFSM_SAMPLER_PROF"); { const char *e = getenv("UFSM_SAMPLER_PROF"); g_prof_cpu = e && atoi(e) == 2; e = getenv("UFSM_SAMPLER_RT"); g_rt = e && atoi(e) > 1 ? atoi(e) : 1; }
     sp->lvl_ok = calloc((size_t)S->n, sizeof *sp->lvl_ok);
     sources_open_all(S, 32);   /* every (source, level, channel) store opened up front in parallel: lazily they serialise on one lock (254 opens, 17 s) */
