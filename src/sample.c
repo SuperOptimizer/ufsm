@@ -10,6 +10,7 @@
 #include "view.h"
 #include "scrollaug.h"
 #include "sample_emb.h"
+#include <malloc.h>
 #include <math.h>
 #include <stddef.h>
 #include <pthread.h>
@@ -192,8 +193,9 @@ static int PZ(const sample_cfg *c) { return c->Pz > 0 ? c->Pz : c->P; }   /* win
 static size_t P3(const sampler *sp) { return (size_t)PZ(&sp->cfg) * sp->cfg.P * sp->cfg.P; }
 
 /* batch buffers: pinned (the trainer uploads asynchronously), or plain malloc with UFSM_SAMPLER_NOPIN=1 (CPU-only benchmarks) */
+static _Atomic size_t g_slot_bytes;   /* pinned (or malloc'd) batch slot bytes, every sampler (UFSM_HOSTMEM) */
 static int nopin(void) { static int v = -1; if (v < 0) { const char *e = getenv("UFSM_SAMPLER_NOPIN"); v = e && atoi(e); } return v; }
-static void *halloc(size_t n) { if (nopin()) { void *p = malloc(n ? n : 1); if (!p) abort(); return p; } return nn_host_alloc(n); }
+static void *halloc(size_t n) { atomic_fetch_add(&g_slot_bytes, n); if (nopin()) { void *p = malloc(n ? n : 1); if (!p) abort(); return p; } return nn_host_alloc(n); }
 static void hfree(void *p) { if (nopin()) free(p); else nn_host_free(p); }
 static batch alloc_batch(const sample_cfg *c) {
     size_t p3 = (size_t)PZ(c) * c->P * c->P;
@@ -794,8 +796,11 @@ int sample_write_spatial_test(const uint8_t *ctu, const uint8_t *tgt, const uint
     }
     free(table);
 }
-static void *tp_get(size_t n, int zero);
-static void tp_put(void *p, size_t n);
+static void *tp_get_(size_t n, int zero, int line);
+static void tp_put_(void *p, size_t n, int line);
+#define tp_get(n, z) tp_get_((n), (z), __LINE__)
+#define tp_put(p, n) tp_put_((p), (n), __LINE__)
+size_t resident_bytes(const void *p, size_t n);
 /* TM (packed targets, hard and CT-only only; T, M unused): the code bytes of sample_pack_tm written straight from the warp (no
    T / M window buffers); when the targets turn out not to be 0 / 255 or the writer's fast path does not apply, T / M go to pooled
    scratch and are packed after, aborting as draw() did */
@@ -1144,7 +1149,14 @@ static uint64_t mix64(uint64_t x) { x ^= x >> 30; x *= 0xbf58476d1ce4e5b9ull; x 
    so every sample paid ~14k page faults per buffer under the process-wide mmap lock that all workers share. Sizes of 1 MB and
    more are rounded up to whole MB (windows clipped at a volume edge reuse the same buffers); zero = calloc semantics over n. */
 #define TP_N 32
-static _Thread_local struct { void *b[TP_N]; size_t n[TP_N]; int k; } tpool;
+typedef struct { void *b[TP_N]; size_t n[TP_N]; int k; } tp_pool;
+static _Thread_local tp_pool tpool;
+/* UFSM_HOSTMEM=1 accounting (sampler_hostmem): each worker registers its fixed scratch and its pool; tp_get / tp_put keep the
+   pool's allocated bytes (pooled or lent out) per worker; residency is read with mincore (anonymous pages count when touched) */
+#define WM_MAX 256
+static struct { tp_pool *pool; const uint8_t *big, *ttmp; size_t bign, ttn; _Atomic size_t tpv, tplent, tppeak; } g_wm[WM_MAX];
+static _Thread_local int tp_wid = -1;
+static size_t g_tp_p3 = 1;   /* (UFSM_TP_LOG: sizes in window voxels) */
 static size_t tp_class(size_t n) { return n >= ((size_t)1 << 20) ? (n + ((size_t)1 << 20) - 1) & ~(((size_t)1 << 20) - 1) : n; }
 /* window-sized worker scratch (>= 4 MB): 2 MB aligned with transparent huge pages requested (the system's THP mode is often
    "madvise"): the warp writer's gathers and the volume passes otherwise walk 4 KB page tables over hundreds of MB per window. Pages
@@ -1160,22 +1172,29 @@ static void *wbig_alloc(size_t n, int zero) {
     if (zero) memset(p, 0, n);
     return p;
 }
-static void *tp_get(size_t n, int zero) {   /* the smallest pooled buffer of n's class up to 1.25 times it (window sizes vary by a few MB) */
+static _Thread_local size_t tp_live; static _Thread_local int tp_logn = -1;
+static int tp_log(void) { if (tp_logn < 0) { const char *e = getenv("UFSM_TP_LOG"); tp_logn = tp_wid == 0 && e ? atoi(e) : 0; } return tp_logn > 0; }
+static void *tp_get_(size_t n, int zero, int line) {   /* the smallest pooled buffer of n's class up to 1.25 times it (window sizes vary by a few MB) */
     const size_t c = tp_class(n), cmax = c >= ((size_t)1 << 20) ? c + c / 4 : c;
     int best = -1;
     for (int i = 0; i < tpool.k; i++) if (tpool.n[i] >= c && tpool.n[i] <= cmax && (best < 0 || tpool.n[i] < tpool.n[best])) best = i;
+    tp_live += c; if (tp_log()) fprintf(stderr, "tplog get L%d %.3f live %.3f%s\n", line, (double)n / (double)g_tp_p3, (double)tp_live / (double)g_tp_p3, best >= 0 ? "" : " NEW");
     if (best >= 0) {   /* (put back under n's class later: a pooled size never exceeds the block's) */
         void *p = tpool.b[best]; tpool.k--; tpool.b[best] = tpool.b[tpool.k]; tpool.n[best] = tpool.n[tpool.k];
         if (zero) memset(p, 0, n);
         return p;
     }
-    return wbig_alloc(c, zero);
+    void *p = wbig_alloc(c, zero);
+    if (p && tp_wid >= 0) { const size_t v = atomic_fetch_add(&g_wm[tp_wid].tpv, c) + c; if (v > g_wm[tp_wid].tppeak) g_wm[tp_wid].tppeak = v; }
+    return p;
 }
-static void tp_put(void *p, size_t n) {
+static void tp_put_(void *p, size_t n, int line) {
     if (!p) return;
-    if (tpool.k < TP_N) { tpool.b[tpool.k] = p; tpool.n[tpool.k] = tp_class(n); tpool.k++; } else free(p);
+    tp_live -= tp_class(n); if (tp_log()) fprintf(stderr, "tplog put L%d %.3f live %.3f\n", line, (double)n / (double)g_tp_p3, (double)tp_live / (double)g_tp_p3);
+    if (tpool.k < TP_N) { tpool.b[tpool.k] = p; tpool.n[tpool.k] = tp_class(n); tpool.k++; }
+    else { free(p); if (tp_wid >= 0) atomic_fetch_sub(&g_wm[tp_wid].tpv, tp_class(n)); }
 }
-static void tp_drain(void) { while (tpool.k) free(tpool.b[--tpool.k]); }
+static void tp_drain(void) { while (tpool.k) { tpool.k--; free(tpool.b[tpool.k]); if (tp_wid >= 0) atomic_fetch_sub(&g_wm[tp_wid].tpv, tpool.n[tpool.k]); } }
 static int band_window(source *s, const int64_t o[3], int P, uint8_t *out, uint8_t *side, int phase, int dense, uint64_t seed) {
     band_params bp = {s->band_radius, s->band_span, 0};
     const int halo = (int)ceilf((bp.radius + bp.span) / 2.f) + 2;
@@ -3052,6 +3071,9 @@ static void *worker(void *arg) {
     float *xtmp = malloc(3 * (size_t)sp->cfg.P * sizeof(float));   /* per-z axis centres and a row of noise */
     uint8_t *ttmp = wbig_alloc(NCH * p3, 0);
     uint8_t *big = wbig_alloc(10 * p3, 0);   /* [0,P^3) CT (also the coarse probe), [P^3, 9P^3) (2P)^3 region scratch, [9P^3, 10P^3) mask */
+    static atomic_int nwm; const int wid = atomic_fetch_add(&nwm, 1);
+    g_tp_p3 = p3;
+    if (wid < WM_MAX) { tp_wid = wid; g_wm[tp_wid].pool = &tpool; g_wm[tp_wid].big = big; g_wm[tp_wid].bign = 10 * p3; g_wm[tp_wid].ttmp = ttmp; g_wm[tp_wid].ttn = NCH * p3; }
     const int det = sp->cfg.deterministic;
     float *noise_state = sp->cfg.ct_augment ? malloc(((size_t)sp->cfg.P * sp->cfg.P + sp->cfg.P) * sizeof(float)) : nullptr;
     chain_st *chs = calloc((size_t)sp->cfg.B, sizeof *chs);   /* (window chains: one per sample slot) */
@@ -3086,6 +3108,7 @@ static void *worker(void *arg) {
         for (int i = 0; i < sp->cfg.B && !atomic_load(&sp->stop);) {
             if (det && (sp->cfg.cover || (spin == 0 && fail == 0))) rseed(&r, sp->cfg.seed * 0x9e3779b97f4a7c15ull + (sp->cfg.cover_start + (uint64_t)(jb * sp->cfg.B + i)) * 1000003ull + 1);   /* per-sample stream */
             int rc = draw(sp, b, i, &r, xtmp, ttmp, big, sp->cfg.cover_start + (uint64_t)(jb * sp->cfg.B + i), noise_state, chs ? chs + i : nullptr);
+            if (tp_log()) { fprintf(stderr, "tplog draw rc %d big res by p3:", rc); for (int q = 0; q < 10; q++) fprintf(stderr, " %.2f", resident_bytes(big + q * p3, p3) / (double)p3); fprintf(stderr, " ttmp %.2f\n", resident_bytes(ttmp, 2 * p3) / (double)p3); }
             if (rc == 0) { i++; filled = i; fail = 0; spin = 0; }
             else if (rc > 0 && ++spin == (1u << 22)) { fprintf(stderr, "sampler: %u consecutive draws rejected or impossible (P=%d), stopping\n", spin, sp->cfg.P); atomic_store(&sp->failed, 1); atomic_store(&sp->stop, 1); }
             else if (rc < 0) { fprintf(stderr, "sampler: %s\n", z3_error()); if (++fail > 20) { fprintf(stderr, "sampler: 20 consecutive read failures, stopping\n"); atomic_store(&sp->failed, 1); atomic_store(&sp->stop, 1); } }
@@ -3096,6 +3119,7 @@ static void *worker(void *arg) {
         pthread_cond_broadcast(&sp->cv_free);
         pthread_mutex_unlock(&sp->mu);
     }
+    if (tp_wid >= 0) { g_wm[tp_wid].pool = nullptr; g_wm[tp_wid].big = g_wm[tp_wid].ttmp = nullptr; }
     free(xtmp); free(ttmp); free(big); free(noise_state); free(chs); tp_drain();
     free(wa);
     return nullptr;
@@ -3428,6 +3452,21 @@ batch *sampler_next(sampler *sp) {
     }
     sp->state[k] = TAKEN;
     pthread_mutex_unlock(&sp->mu);
+    if (ufsm_env_on("UFSM_BATCH_HASH")) {   /* debugging (with train --det 1): one hash per batch plane, to show a change leaves the batches byte-identical */
+        const batch *b = &sp->slots[k]; const size_t B = (size_t)sp->cfg.B, p3 = P3(sp);
+        static _Atomic long nb; const long id = atomic_fetch_add(&nb, 1);
+        const struct { const char *n; const void *p; size_t z; } f[] = {{"ct8", b->ct8, B * p3}, {"aug", b->aug, B * sizeof(scan_ct_rec)}, {"rad", b->rad, B * NN_RAD_REC(PZ(&sp->cfg))},
+            {"side", b->side, B * p3}, {"w4", b->w4, B * p3}, {"wcomp", b->wcomp, B * p3}, {"ink", b->ink, B * p3}, {"tm", b->tm, B * p3}, {"pm", b->pm, B * p3},
+            {"x16", b->x16, B * (size_t)b->xch * p3 * 2}, {"um", b->um, B * sizeof(float)}, {"src", b->src, B * sizeof(int16_t)}, {"w", b->w, B * NCH}};
+        fprintf(stderr, "batchhash %ld", id);
+        for (size_t q = 0; q < sizeof f / sizeof f[0]; q++) if (f[q].p) {
+            uint64_t h = 0x9e3779b97f4a7c15ull; const uint8_t *c = f[q].p;
+            for (size_t j = 0; j + 8 <= f[q].z; j += 8) { uint64_t v; memcpy(&v, c + j, 8); h = (h ^ v) * 0xff51afd7ed558ccdull; h ^= h >> 32; }
+            for (size_t j = f[q].z & ~(size_t)7; j < f[q].z; j++) h = (h ^ c[j]) * 0x100000001b3ull;
+            fprintf(stderr, " %s %016llx", f[q].n, (unsigned long long)h);
+        }
+        fprintf(stderr, "\n");
+    }
     return &sp->slots[k];
 }
 
@@ -3438,6 +3477,36 @@ void sampler_release(sampler *sp, batch *b) {
     pthread_mutex_unlock(&sp->mu);
 }
 
+size_t resident_bytes(const void *p, size_t n) {   /* touched (resident) bytes of an anonymous range */
+    if (!p || !n) return 0;
+    const size_t pg = (size_t)sysconf(_SC_PAGESIZE); const uintptr_t a = (uintptr_t)p & ~(pg - 1), e = ((uintptr_t)p + n + pg - 1) & ~(pg - 1);
+    const size_t np = (e - a) / pg; unsigned char *v = malloc(np); if (!v) return 0;
+    size_t r = 0; if (mincore((void *)a, e - a, v) == 0) for (size_t i = 0; i < np; i++) r += v[i] & 1;
+    free(v); return r * pg;
+}
+/* UFSM_HOSTMEM=1: where the host bytes are (racy reads of the workers' pools: a debugging aid, not exact under churn) */
+void sampler_hostmem(const sampler *sp, FILE *f) {
+    const double p3 = sp ? (double)P3(sp) : 1.0, G = 1e9;
+    double bigr = 0, bigv = 0, ttr = 0, ttv = 0, tpv = 0, tpr = 0, tpk = 0; int nw = 0; char cls[512] = ""; size_t cl = 0;
+    for (int w = 0; w < WM_MAX; w++) {
+        if (!g_wm[w].big) continue;
+        nw++; bigv += g_wm[w].bign; bigr += resident_bytes(g_wm[w].big, g_wm[w].bign); ttv += g_wm[w].ttn; ttr += resident_bytes(g_wm[w].ttmp, g_wm[w].ttn);
+        tpv += g_wm[w].tpv; tpk += g_wm[w].tppeak;
+        tp_pool *tp = g_wm[w].pool; if (!tp) continue;
+        const int k = tp->k;
+        for (int i = 0; i < k && i < TP_N; i++) {
+            tpr += resident_bytes(tp->b[i], tp->n[i]);
+        }
+        if (cl == 0) for (int i = 0; i < k && i < TP_N && cl < sizeof cls - 16; i++) cl += (size_t)snprintf(cls + cl, sizeof cls - cl, " %.2f", tp->n[i] / p3);
+    }
+    struct mallinfo2 mi = mallinfo2();
+    long rss = 0; FILE *st = fopen("/proc/self/status", "r"); char line[256];
+    if (st) { while (fgets(line, sizeof line, st)) if (!strncmp(line, "VmRSS:", 6)) rss = atol(line + 6); fclose(st); }
+    fprintf(f, "hostmem: rss %.2f GB | pinned %.2f GB (slots %.2f) | workers %d: big %.2f/%.2f GB res/virt, ttmp %.2f/%.2f, pool %.2f virt (peak %.2f, pooled res %.2f)"
+               " | malloc arena %.2f GB in use %.2f free %.2f mmapped %.2f | p3 %.0f M; pool classes of a worker (x p3):%s\n",
+            rss / 1048576.0, nn_host_bytes() / G, g_slot_bytes / G, nw, bigr / G, bigv / G, ttr / G, ttv / G, tpv / G, tpk / G, tpr / G,
+            (mi.arena) / G, mi.uordblks / G, mi.fordblks / G, mi.hblkhd / G, p3 / 1e6, cls);
+}
 void sampler_stop(sampler *sp) {
     if (!sp) return;
     atomic_store(&sp->stop, 1);

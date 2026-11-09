@@ -350,11 +350,29 @@ extern "C" void nn_d2d_kernel(void *d, const void *s, size_t n) {   /* a kernel 
 extern "C" void nn_sync(void) { CK(cudaDeviceSynchronize()); }
 /* a fault of an earlier kernel (sticky: the context is lost, every later call fails): its message, else nullptr (callers stop instead of writing zeros) */
 extern "C" const char *nn_device_error(void) { const cudaError_t e = cudaDeviceSynchronize(); if (e == cudaSuccess) return nullptr; cudaGetLastError(); return cudaGetErrorString(e); }
-extern "C" void *nn_host_alloc(size_t n) { void *p = nullptr; CK(cudaMallocHost(&p, n)); return p; }
+/* pinned host accounting (nn_host_bytes, nn_host_report): every live cudaMallocHost block with its size and caller, so the trainer
+   can split its RSS into pinned and pageable (UFSM_HOSTMEM=1); a few hundred blocks at most, a linear table under a mutex */
+#include <mutex>
+static std::mutex g_hmu; static struct { void *p; size_t n; void *ra; } g_hb[4096]; static int g_nhb; static size_t g_hbytes;
+static void host_track(void *p, size_t n, void *ra) {
+    if (!p) return; std::lock_guard<std::mutex> l(g_hmu);
+    if (g_nhb < 4096) { g_hb[g_nhb].p = p; g_hb[g_nhb].n = n; g_hb[g_nhb].ra = ra; g_nhb++; } g_hbytes += n;
+}
+static void host_untrack(void *p) {
+    std::lock_guard<std::mutex> l(g_hmu);
+    for (int i = 0; i < g_nhb; i++) if (g_hb[i].p == p) { g_hbytes -= g_hb[i].n; g_hb[i] = g_hb[--g_nhb]; return; }
+}
+extern "C" size_t nn_host_bytes(void) { std::lock_guard<std::mutex> l(g_hmu); return g_hbytes; }
+extern "C" void nn_host_report(FILE *f) {   /* live pinned bytes by caller (resolve with addr2line -e build/ufsm -f) */
+    std::lock_guard<std::mutex> l(g_hmu); void *ra[256]; size_t by[256], nb[256]; int k = 0;
+    for (int i = 0; i < g_nhb; i++) { int j = 0; while (j < k && ra[j] != g_hb[i].ra) j++; if (j == k) { if (k == 256) continue; ra[k] = g_hb[i].ra; by[k] = 0; nb[k] = 0; k++; } by[j] += g_hb[i].n; nb[j]++; }
+    for (int j = 0; j < k; j++) fprintf(f, "hostmem: pinned %8.3f GB in %4zu blocks from %p\n", by[j] / 1e9, nb[j], ra[j]);
+}
+extern "C" void *nn_host_alloc(size_t n) { void *p = nullptr; CK(cudaMallocHost(&p, n)); host_track(p, n, __builtin_return_address(0)); return p; }
 extern "C" void *nn_managed_alloc(size_t n) { void *p = nullptr; if (cudaMallocManaged(&p, n ? n : 4) != cudaSuccess) { cudaGetLastError(); return nullptr; } return p; }
 extern "C" void *nn_malloc_try(size_t n) { void *p = nullptr; if (cudaMalloc(&p, n ? n : 4) != cudaSuccess) { cudaGetLastError(); return nullptr; } alloc_log(n, __builtin_return_address(0)); return p; }
-extern "C" void *nn_host_alloc_try(size_t n) { void *p = nullptr; if (cudaMallocHost(&p, n) != cudaSuccess) { cudaGetLastError(); return nullptr; } return p; }
-extern "C" void nn_host_free(void *p) { if (p) CK(cudaFreeHost(p)); }
+extern "C" void *nn_host_alloc_try(size_t n) { void *p = nullptr; if (cudaMallocHost(&p, n) != cudaSuccess) { cudaGetLastError(); return nullptr; } host_track(p, n, __builtin_return_address(0)); return p; }
+extern "C" void nn_host_free(void *p) { if (p) { host_untrack(p); CK(cudaFreeHost(p)); } }
 cudaStream_t copy_stream(void) {
     static cudaStream_t st[8]; int d = 0; cudaGetDevice(&d); d &= 7;
     if (!st[d]) CK(cudaStreamCreateWithFlags(&st[d], cudaStreamNonBlocking));

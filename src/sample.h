@@ -7,6 +7,7 @@
 #include "scan_augment.h"
 #include "crush.h"
 #include <stdint.h>
+#include <stdio.h>
 
 typedef struct {
     int P;                   /* patch edge (y, x; and z unless Pz) */
@@ -215,6 +216,7 @@ sampler *sampler_start(sources *S, const sample_cfg *cfg);
 batch *sampler_next(sampler *sp);
 int sampler_failed(const sampler *sp);   /* read failure or exhausted draw retries; stopped samplers never publish partial batches */
 void sampler_release(sampler *sp, batch *b);
+void sampler_hostmem(const sampler *sp, FILE *f);   /* UFSM_HOSTMEM=1: host memory by owner (stderr line "hostmem:") */
 void sampler_stop(sampler *sp);
 /* Stats: patches rejected / produced since start. */
 void sampler_stats(const sampler *sp, uint64_t *produced, uint64_t *rejected);
