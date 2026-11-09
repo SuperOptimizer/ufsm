@@ -202,9 +202,11 @@ extern "C" int nn_head_fwd_z(const float *x, const nn_gn_t *gx_gn, shape5 xs, co
 }
 extern "C" int nn_head_bwd_z(const float *x, const nn_gn_t *gx_gn, shape5 xs, const void *gy16, int cout, const float *w, float *gw, float *gb, float *gx,
                              size_t vb, size_t nv, int first) {
-    static thread_local unsigned seed;
+    /* per device: data parallel drives every GPU from one host thread (a thread_local device buffer of GPU 0 used on GPU 1 = illegal
+       address, 11-06); dv = the current device */
+    static thread_local unsigned seedd[8]; int dv = 0; cudaGetDevice(&dv); dv &= 7; unsigned &seed = seedd[dv];
     if (g_tf32 && head_z16_ok(x, gx, xs, cout) && GBF) {   /* 16-bit storage */
-        static thread_local float *part; static thread_local int pn;
+        static thread_local float *partd[8]; static thread_local int pnd[8]; float *&part = partd[dv]; int &pn = pnd[dv];
         const int np = (xs.c + 1) * HZ_NB * 16;
         if (pn < np) { if (part) cudaFree(part); CK(cudaMalloc(&part, (size_t)np * 4)); pn = np; }
         const size_t S = shape_spatial(xs);
@@ -225,7 +227,8 @@ extern "C" int nn_head_bwd_z(const float *x, const nn_gn_t *gx_gn, shape5 xs, co
     if (xs.c != 32) {   /* no fused kernel (16-channel input): the whole path's steps per range -- nn_head_bwd_x's declined draw, the weight /
                            bias gradients (nn_conv3d_bwd_weight_x's 1^3 kernel), the backward-data into MX gx (bwd_data_impl's: the
                            transposed weights, its draw) -- so gx's bits and the seed count equal one whole call's */
-        static thread_local unsigned seed2; static thread_local float *wt; static thread_local int wtn;
+        static thread_local unsigned seed2d[8]; static thread_local float *wtd[8]; static thread_local int wtnd[8];
+        unsigned &seed2 = seed2d[dv]; float *&wt = wtd[dv]; int &wtn = wtnd[dv];
         if (first) seed = MXDT(gx) == 4 ? sr_seed() : 0u;
         (void)seed;
         exec_prec(2, 0);

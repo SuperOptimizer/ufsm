@@ -11,7 +11,7 @@ __global__ void gn_finalize_k(const double *sums, int NG, size_t len, float eps,
 double *gn_dsums(size_t n) {   /* small persistent device scratch for the double sums, per device; sized in GroupNorm sum slots (GN_SLOT_BYTES >= a double) */
     static double *buf[10]; static size_t cap[10];
     int d = zs_slot();   /* (both split halves on one GPU: per half) */
-    if (n > cap[d]) { if (buf[d]) cudaFree(buf[d]); if (cudaMalloc(&buf[d], n * GN_SLOT_BYTES) != cudaSuccess) { fprintf(stderr, "gn_dsums: no device memory (slot %d)\n", d); abort(); } cap[d] = n; }
+    if (n > cap[d]) { if (buf[d]) cudaFree(buf[d]); { const cudaError_t e = cudaMalloc(&buf[d], n * GN_SLOT_BYTES); if (e != cudaSuccess) { int dv = -1; cudaGetDevice(&dv); fprintf(stderr, "gn_dsums: cudaMalloc %zu slots failed on slot %d (device %d): %s\n", n, d, dv, cudaGetErrorString(e)); abort(); } } cap[d] = n; }
     return buf[d];
 }
 /* --split z: the GroupNorm sum slots of both GPUs added (zs_reduce adds doubles across the GPUs: the slots go through doubles and back, exactly
@@ -480,6 +480,14 @@ __global__ void rv_tg_k(const uint8_t *ph, const uint8_t *pap, size_t n, uint8_t
     m[i] = 1;
 }
 extern "C" void nn_rv_targets(const uint8_t *phase, const uint8_t *pap, size_t n, uint8_t *t, uint8_t *m) { rv_tg_k<<<nblk(n, 256), 256>>>(phase, pap, n, t, m); KCHECK(); }
+/* --rv-verso-w W: the loss weight of verso-side papyrus voxels times W (after the packed weights; capped at 255): the side classes are
+   imbalanced (~60% of labelled papyrus is recto side) and the model under-calls verso */
+__global__ void rv_verso_w_k(const uint8_t *t, uint8_t *m, size_t n, float w) {
+    const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= n || !m[i] || t[n + i] != 255) return;
+    m[i] = (uint8_t)fminf(255.f, rintf((float)m[i] * w));
+}
+extern "C" void nn_rv_verso_w(const uint8_t *t, uint8_t *m, size_t n, float w) { rv_verso_w_k<<<nblk(n, 256), 256>>>(t, m, n, w); KCHECK(); }
 /* predict --channel rv (train --rv checkpoints): the two side logits [recto | verso] of a window -> channel 0 := the logit whose
    written uint8 is 1 + 254 (1 + p_r - p_v) / 2: recto side high (255), verso side low (1), void ~128; 0 = outside the scan (CT 0) */
 template <typename T> __global__ void rv_fuse_k(T *lg, size_t n) {

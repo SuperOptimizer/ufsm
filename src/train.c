@@ -130,7 +130,7 @@ static int g_ink2, g_ink2_ch = -1;
    BCE against the stored phase's halves (recto: phase < 1/2 turn, from a recto face k to midway to k + 1; verso: the outer half) on
    papyrus (the sampler's papyrus plane = clean CT >= the source's "iso", else --rv-iso), 0 / 0 on void; papyrus of unknown phase masked.
    The papyrus plane rides the ink plane's buffers (no --ink-head then). The phase still drives the normal / density / winding heads */
-static int g_rv;
+static int g_rv; static float g_rv_vw = 1.f;   /* --rv-verso-w: verso-side papyrus loss weight multiplier */
 #define IPLANE (g_ink2 || g_rv)   /* the ink plane's buffers: --ink-head's ink or --rv's papyrus */
 static int g_unwrap, g_norm_ch, g_norm_s = 4; static float g_ink_lambda = 1.f, g_ink_dice = 0.f, g_norm_lambda = 1.f, g_dens_lambda = 1.f, g_dens_scale = 32.f;   /* --density-lambda: the density channel's BCE weight (default --normal-lambda) */
 static int g_dens_code; static float g_packed_w, g_packed_um = 120.f;   /* --density-code, --packed-weight, --packed-um (task unwrap) */
@@ -774,6 +774,7 @@ static void head_slab_pass(gpu_state *d, int pass) {
         if (g_rv) {   /* --rv: the side slot's targets (the phase targets above stay for the winding mod 4 / gradient terms) */
             nn_rv_targets(d->sdb + vb, d->ink + vb, ns, d->inkt, d->inkm);
             if (g_packed_w > 1) nn_packed_mask_z(d->sdb, D, H, W, g_norm_s, d->um, g_packed_um, g_packed_w, d->inkm, z0, z1);   /* packed sheets weigh more */
+            if (g_rv_vw != 1.f) nn_rv_verso_w(d->inkt, d->inkm, ns, g_rv_vw);
         }
         uint8_t *const st = g_rv ? d->inkt : d->sidet, *const sm = g_rv ? d->inkm : d->sidem;   /* the side slot's targets / mask */
         if (g_rv && !pass && z0 == 0 && ufsm_env_on("UFSM_RV_CHECK")) {   /* what the rv loss reads on this slab: recto / verso / void / masked counts */
@@ -1243,7 +1244,7 @@ int cmd_train(int argc, char **argv) {
     if (argc < 3) {
         fprintf(stderr, "usage: ufsm train <sources.json> --out DIR [--P 512] [--B 1] [--steps 20000] [--lr 1e-3] [--warmup 500] [--wd 0.01]\n"
                         "       [--dice 0.5] [--ema 0.999] [--widths 16,32,64,80] [--down-norm 1] [--gpus 0,1] [--workers 12 (new runs with --gpu-aug 2: 3)] [--gpu-aug 0|1|2 (new runs: 2)] [--sampler-slots N] [--seed 0] [--det 1] [--resume CKPT] [--finetune 1] [--fp4 0|1|2 (default 2)] [--mem auto|auto16|default|wide] [--opt adamw|muon|anvil] [--muon-lr 0.02] [--muon-beta 0.95] [--anvil-lr 0.023] [--anvil-wd 2.25] [--sched cos|wsd] [--cooldown 0.2]\n"
-                        "       [--rv 1 [--rv-iso 64]]\n"
+                        "       [--rv 1 [--rv-iso 64] [--rv-verso-w 1]]\n"
                         "       [--val-batches 8] [--val-P N (validation windows of N^3 whatever P: the same voxels across window sizes)] [--log-every 20] [--val-every 500] [--ckpt-every 1000] [--clip 5] [--levels 0.5,0.25,0.15,0.1] [--fp32] [--f16 1] [--gscale 1024] [--prec 1|2|3|4] [--input-prec 0|4|8] [--policy enc0=1,dec0.c1=fp16:fp16:fp8,...] [--qat 2|3] [--wq 8|4] [--sparse24 STEP] [--srste 2e-4] [--pos-weight 1] [--tol 0..2] [--sr 1]\n"
                         "       [--seconds S] [--warmup-seconds S (default 5%% of time budget)] (time-based schedule and final checkpoint)\n"
                         "       [--schedule-seconds S --schedule-elapsed S]   wall-time LR horizon across finite-cover evaluation pauses\n"
@@ -1347,6 +1348,8 @@ int cmd_train(int argc, char **argv) {
             g_w4_lambda = (float)atof(opt(argc,argv,"--wind4-lambda","1"));
             g_ink2 = atoi(opt(argc,argv,"--ink-head","0"));   /* --ink-head 1: the ink logit as output channel 11 (the universal model) */
             g_rv = atoi(opt(argc,argv,"--rv","0"));
+            g_rv_vw = (float)atof(opt(argc,argv,"--rv-verso-w","1"));
+            if (!(g_rv_vw > 0 && g_rv_vw <= 16)) { fprintf(stderr,"--rv-verso-w: 0 .. 16\n"); return 2; }
             if (g_rv < 0 || g_rv > 1 || (g_rv && (g_ink2 || atof(opt(argc,argv,"--phase-trunc","0")) > 0 || atof(opt(argc,argv,"--pgrad-lambda","0")) > 0 || atoi(opt(argc,argv,"--rv-iso","60")) < 1 || atoi(opt(argc,argv,"--rv-iso","60")) > 255))) {
                 fprintf(stderr,"--rv 1: no --ink-head / --phase-trunc / --pgrad-lambda (the side slot is not a phase); --rv-iso 1..255\n"); return 2;
             }
