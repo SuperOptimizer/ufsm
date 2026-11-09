@@ -32,6 +32,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+void nn_lat_place_rv(const void *lg, int lh16, int d, int h, int w, const uint8_t *ct, const uint32_t *bits, int iso, int hz, int halo, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh);   /* (nn_lat.cu) */
 static void pred_axis(unet *u, int valid, int D, const float *dy, const float *dx);
 
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
@@ -80,9 +81,12 @@ static void *reader_main(void *arg) {
    (2 by default; one window per k^3 shards: up to 2 k^3, UFSM_PRED_WBUF, so the shards of a window are compressed while the next window
    runs instead of the main thread waiting on each shard's predecessor); buffers are written in submission (ring) order */
 #define WBUF_MAX 32
+#define WRITERS_MAX 8   /* writer threads: shards with fewer chunks than --threads (--shard 128: one 128^3 chunk, compressed by one thread whatever
+                           --threads says, 144 MB/s: 64 shards of a 640^3 window took 0.9 s against 0.15 s of GPU work) are written several at a time */
 typedef struct { z3w *w; int nthreads; size_t bytes; uint8_t *buf[WBUF_MAX]; int64_t sz[WBUF_MAX], sy[WBUF_MAX], sx[WBUF_MAX]; int pending[WBUF_MAX]; int nb, next;
                  atomic_int failed; pthread_mutex_t mu; pthread_cond_t cv; int stop;
                  int gpu, async, skip; void *evs[WBUF_MAX], *evd[WBUF_MAX]; double t_write; long n_write;
+                 int nw, wt, taken[WBUF_MAX]; pthread_t wth[WRITERS_MAX];   /* nw writer threads (writer_start), wt threads inside each shard's write; taken: a writer holds buffer k */
                  int64_t off[3]; int donefd; atomic_long nsub, ndone; } writer_t;   /* off: shard index offset (--full-grid); donefd: the --resume log (-1 none) */   /* (UFSM_PRED_PROF: seconds compressing / writing, shards) */   /* async: buffer k arrives by a copy on the offload stream (evd[k]) */
 static void *writer_main(void *arg) {
     writer_t *W = arg;
@@ -90,15 +94,20 @@ static void *writer_main(void *arg) {
     for (;;) {
         pthread_mutex_lock(&W->mu);
         int k = -1;
-        while (k < 0 && !W->stop) { if (W->pending[W->next]) k = W->next; else pthread_cond_wait(&W->cv, &W->mu); }
+        while (k < 0 && !W->stop) {   /* the oldest submitted buffer no writer holds (ring order from next) */
+            for (int j = 0; j < W->nb && k < 0; j++) { const int q = (W->next + j) % W->nb; if (W->pending[q] && !W->taken[q]) k = q; }
+            if (k < 0) pthread_cond_wait(&W->cv, &W->mu);
+        }
         if (k < 0) { pthread_mutex_unlock(&W->mu); return nullptr; }
+        W->taken[k] = 1; W->next = (k + 1) % W->nb;
         pthread_mutex_unlock(&W->mu);
         if (W->async) nn_event_sync(W->evd[k]);   /* the shard's device-to-host copy (queued without blocking the main thread) */
         const double tw = now();
-        if (!W->skip && z3w_write_shard(W->w, W->sz[k] + W->off[0], W->sy[k] + W->off[1], W->sx[k] + W->off[2], W->buf[k], W->nthreads)) atomic_store(&W->failed, 1);   /* skip: --no-out 1 */
+        if (!W->skip && z3w_write_shard(W->w, W->sz[k] + W->off[0], W->sy[k] + W->off[1], W->sx[k] + W->off[2], W->buf[k], W->wt > 0 ? W->wt : W->nthreads)) atomic_store(&W->failed, 1);   /* skip: --no-out 1 */
         else if (W->donefd >= 0) dprintf(W->donefd, "%lld %lld %lld\n", (long long)(W->sz[k] + W->off[0]), (long long)(W->sy[k] + W->off[1]), (long long)(W->sx[k] + W->off[2]));   /* (O_APPEND: whole lines across GPU workers) */
-        W->t_write += now() - tw; W->n_write++; atomic_fetch_add(&W->ndone, 1);
-        pthread_mutex_lock(&W->mu); W->pending[k] = 0; W->next = (k + 1) % W->nb; pthread_cond_broadcast(&W->cv); pthread_mutex_unlock(&W->mu);
+        const double dw = now() - tw;
+        pthread_mutex_lock(&W->mu); W->t_write += dw; W->n_write++; W->pending[k] = 0; W->taken[k] = 0; pthread_cond_broadcast(&W->cv); pthread_mutex_unlock(&W->mu);
+        atomic_fetch_add(&W->ndone, 1);
     }
 }
 /* the device shard dsh into buffer k: on the offload stream (the main stream waits for it on the device before dsh is reused, the writer
@@ -475,11 +484,12 @@ static int ffw_finish(ffw_t *W, pthread_t th) {
     return atomic_load(&W->fail);
 }
 
-static int writer_finish(writer_t *W, pthread_t th) {
+static int writer_finish(writer_t *W) {
     pthread_mutex_lock(&W->mu);
     for (int k = 0; k < W->nb; k++) while (W->pending[k]) pthread_cond_wait(&W->cv, &W->mu);   /* every buffer of the ring written */
     W->stop = 1; pthread_cond_broadcast(&W->cv); pthread_mutex_unlock(&W->mu);
-    pthread_join(th, nullptr); return atomic_load(&W->failed);
+    for (int i = 0; i < W->nw; i++) pthread_join(W->wth[i], nullptr);
+    return atomic_load(&W->failed);
 }
 static const char *opt(int argc, char **argv, const char *name, const char *dflt) {
     for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], name)) return argv[i + 1];
@@ -1161,7 +1171,14 @@ int cmd_predict(int argc, char **argv) {
     uint8_t *dsh = gpath && !split ? nn_malloc(WR.bytes) : nullptr; void *stsc = nn_malloc(64); pthread_mutex_init(&WR.mu, nullptr); pthread_cond_init(&WR.cv, nullptr);
     WR.gpu = gpu; WR.async = gpath && !split && !(getenv("UFSM_PRED_SYNC_D2H") && atoi(getenv("UFSM_PRED_SYNC_D2H")));
     if (WR.async) for (int k = 0; k < WBUF_MAX; k++) { WR.evs[k] = nn_event_create(); WR.evd[k] = nn_event_create(); }
-    pthread_t wth; pthread_create(&wth, nullptr, writer_main, &WR);
+    {   /* the writer threads: --threads over the shard's chunks; shards of fewer chunks than threads several at a time (UFSM_PRED_WRITERS) */
+        const int nc = (shard / 128) * (shard / 128) * (shard / 128) > 0 ? (shard / 128) * (shard / 128) * (shard / 128) : 1, nt = nthreads > 0 ? nthreads : (int)ufsm_ncpu();
+        WR.nw = getenv("UFSM_PRED_WRITERS") ? atoi(getenv("UFSM_PRED_WRITERS")) : nt / nc;
+        if (WR.nw < 1) WR.nw = 1;
+        if (WR.nw > WRITERS_MAX) WR.nw = WRITERS_MAX;
+        WR.wt = nt / WR.nw > 0 ? nt / WR.nw : 1;
+        for (int i = 0; i < WR.nw; i++) pthread_create(&WR.wth[i], nullptr, writer_main, &WR);
+    }
     int sb = 0; uint8_t *sbuf = WR.buf[0];
     /* the window goes up as uint8; the input channels are built on the device in the network's storage type */
     const int h16 = nn_get_tf32() && nn_get_act_bf16() && !ufsm_env_on("UFSM_ACT_MX8");
@@ -1206,7 +1223,7 @@ int cmd_predict(int argc, char **argv) {
         xd_shared = xd != nullptr;
         if (!xd && !ct_stem) xd = nn_malloc((size_t)xs.c * w3 * (h16 ? 2 : 4));
         if (auxz) { auxd = nn_malloc(w3); auxh = malloc(w3); }
-        if (half) { x2 = nn_malloc(shape_numel(xn) * (h16 ? 2 : 4)); lgf = nn_malloc(w3 * 4 * (rvfuse ? 2 : 1)); if (hdiv > 2) lrt = nn_malloc(w3 / 8 * 16); }
+        if (half) { x2 = nn_malloc(shape_numel(xn) * (h16 ? 2 : 4)); if (hdiv > 2) lrt = nn_malloc(w3 / 8 * 16); }   /* (lgf: at its first use; the direct latent rv path has none) */
         if (ct_stem) fprintf(stderr, "predict: in-place slab inference from the CT window (%.1f B per window voxel)\n", (double)unet_activation_bytes(u) / w3);
         if (tta > 1 && (!ct_stem || !ct_shared || degrade || auxz || cfg.cin != 4)) { fprintf(stderr, "predict: --tta needs the CT-stem device path (no --aug-*, --aux, extra inputs)\n"); return 2; }
     }
@@ -1554,13 +1571,14 @@ int cmd_predict(int argc, char **argv) {
         {
             size_t nz = rd.nz[k]; double sum = rd.sum[k], sq = rd.sq[k];
             if (gpath) {   /* upload (pinned), statistics on the device, then the slot is free for the reader */
+                nn_ptick("wait reader + host");
                 pt = now();
                 if (pre_i == i) {   /* prefetched: the copy stream's upload, then one device copy (the prefetch buffer free again after it) */
                     nn_stream_wait(0, ev_pre); nn_d2d_async(ctd, ctpre, w3); nn_event_record(ev_preu, 0);
                 } else nn_h2d(ctd, ctu, w3);
                 nn_pred_stats(ctd, w3, stsc, &nz, &sum, &sq);
                 pthread_mutex_lock(&rd.mu); atomic_store(&rd.consumed, i + 1); pthread_cond_broadcast(&rd.cv); pthread_mutex_unlock(&rd.mu);
-                p_h2d += now() - pt;
+                p_h2d += now() - pt; nn_ptick("upload + CT stats");
             }
             if (nz == 0) { nskip++; pthread_mutex_lock(&rd.mu); atomic_store(&rd.consumed, i + 1); pthread_cond_broadcast(&rd.cv); pthread_mutex_unlock(&rd.mu); continue; }
             double mean = sum / (double)w3, var = sq / (double)w3 - mean * mean, sd = sqrt(var > 0 ? var : 0) + 1e-3;
@@ -1582,6 +1600,7 @@ int cmd_predict(int argc, char **argv) {
             if (pprof) { nn_sync(); p_h2d += now() - pt; pt = now(); }
             if ((xd_shared && unet_input_scratch(u, 4 * w3 * 2) != xd) || (ct_shared && unet_input_scratch2(u, w3) != ctd)) { fprintf(stderr, "predict: the network was rebuilt under its input scratch\n"); return 1; }
             if (!ct_stem) nn_pred_input_d(ctd, Wz, W, (float)mean, (float)(1.0 / sd), dyd, dxd, ax.n > 0 ? (int)radial_sign : 0, xd, h16);
+            nn_ptick("input build");
             if (cfg.cin == 7 && !half) nn_zero((char *)xd + 4 * w3 * (h16 ? 2 : 4), 3 * w3 * (h16 ? 2 : 4));   /* no condition: inputs 4-6 zero */
             if (auxz) {   /* the fifth channel: the aux volume over this window (level coordinates as the CT; outside 0) */
                 const z3_meta *am = z3_meta_of(auxz); int64_t ao[3], an[3]; int inb = 1;
@@ -1614,14 +1633,26 @@ int cmd_predict(int argc, char **argv) {
             if (pred_view_set(u, o, Wz, W)) return 1;
             if (g_pv && tta > 1) nn_d2d(g_pvsave, g_pvd, (size_t)g_pvP * g_pvP * g_pvP);
             const float *lg;
-            if (half) {   /* the network on blocks of the window: its input from the 4-channel window, its logits back to full resolution */
-                nn_lowres_input(xd, xs, hdiv, hmode, lrt, x2, h16);
-                const float *l2 = unet_forward_x(u, x2, xn, 0, h16);
+            /* --channel rv on a latent-grid net, one window per k^3 shards: the cell grid's two side logits go straight into each shard's
+               bytes (nn_lat_place_rv); no full-resolution logits (UFSM_PRED_LAT_DIRECT=0: the fp32 volume, nn_rv_fuse, nn_pred_place) */
+            static int latdir = -1; if (latdir < 0) latdir = !getenv("UFSM_PRED_LAT_DIRECT") || ufsm_env_on("UFSM_PRED_LAT_DIRECT");
+            const int ldir = latdir && half && hdiv == 4 && hmode == 1 && rvfuse && gpath && sup && !fea && !ffd && tta <= 1 && !sheet_task && Wz == W;
+            const float *l2d = nullptr;
+            if (ldir) {
+                nn_ptick("other");
+                nn_lowres_input(xd, xs, hdiv, hmode, lrt, x2, h16); nn_ptick("input pool");
+                l2d = unet_forward_x(u, x2, xn, 0, h16); nn_ptick("trunk forward");
+                lg = nullptr;
+            } else if (half) {   /* the network on blocks of the window: its input from the 4-channel window, its logits back to full resolution */
+                nn_ptick("other");
+                if (!lgf) lgf = nn_malloc(w3 * 4 * (rvfuse ? 2 : 1));
+                nn_lowres_input(xd, xs, hdiv, hmode, lrt, x2, h16); nn_ptick("input pool");
+                const float *l2 = unet_forward_x(u, x2, xn, 0, h16); nn_ptick("trunk forward");
                 nn_lowres_output(l2, unet_logits_h16(u), (shape5){1, rvfuse ? 2 : 1, W / hdiv, W / hdiv, W / hdiv}, hdiv, hmode, (float *)lrt, lgf);   /* (--channel rv on a latent-grid net: both side logits) */
-                lg = lgf;
+                lg = lgf; nn_ptick("upsample");
             } else lg = ct_stem ? unet_forward_ct(u, ctd, (float)mean, (float)(1.0 / sd), dyd, dxd, ax.n > 0 ? (int)radial_sign : 0, xs, h16)
                                 : unet_forward_x(u, xd, xs, 0, h16);
-            if (rvfuse) nn_rv_fuse((void *)lg, w3, !half && unet_logits_h16(u));
+            if (rvfuse && !ldir) { nn_rv_fuse((void *)lg, w3, !half && unet_logits_h16(u)); nn_ptick("rv fuse"); }
             pred_mem_out(u, o);
             if (ctpre && i + 1 < rd.ntiles && atomic_load(&rd.filled) > i + 1) {   /* the next window's CT during this forward (its slot stays held
                                                                                          until that window's statistics, as with the plain upload) */
@@ -1740,15 +1771,21 @@ int cmd_predict(int argc, char **argv) {
                     const int64_t qo[3] = {qz * shard, qy * shard, qx * shard}, qe[3] = {qo[0] + shard < bn[0] ? qo[0] + shard : bn[0], qo[1] + shard < bn[1] ? qo[1] + shard : bn[1], qo[2] + shard < bn[2] ? qo[2] + shard : bn[2]};
                     if (WR.skip) { if (writer_submit(&WR, sb, qz, qy, qx)) { fprintf(stderr, "%s\n", z3w_error()); return 1; } sb = writer_next(&WR, sb); sbuf = WR.buf[sb]; continue; }   /* --no-out */
                     nn_zero(dsh, WR.bytes);
-                    if (ct_shared) nn_pred_place_m(lg, ctmi, W, halo, (int)(tz - qo[0]), (int)(ty - qo[1]), (int)(tx - qo[2]), (int)(qe[0] - qo[0]), (int)(qe[1] - qo[1]), (int)(qe[2] - qo[2]), shard, dsh);
+                    if (ldir) nn_lat_place_rv(l2d, unet_logits_h16(u), W / 4, W / 4, W / 4, ct_shared ? nullptr : ctd, ct_shared ? ctmi : nullptr, nn_get_pred_iso(), halo, halo,
+                                              (int)(tz - qo[0]), (int)(ty - qo[1]), (int)(tx - qo[2]), (int)(qe[0] - qo[0]), (int)(qe[1] - qo[1]), (int)(qe[2] - qo[2]), shard, dsh);
+                    else if (ct_shared) nn_pred_place_m(lg, ctmi, W, halo, (int)(tz - qo[0]), (int)(ty - qo[1]), (int)(tx - qo[2]), (int)(qe[0] - qo[0]), (int)(qe[1] - qo[1]), (int)(qe[2] - qo[2]), shard, dsh);
                     else nn_pred_place(lg, ctd, W, halo, (int)(tz - qo[0]), (int)(ty - qo[1]), (int)(tx - qo[2]), (int)(qe[0] - qo[0]), (int)(qe[1] - qo[1]), (int)(qe[2] - qo[2]), shard, dsh);
+                    nn_ptick("place kernels");
                     writer_d2h(&WR, sb, dsh);
+                    nn_ptick("shard d2h");
                     if (writer_submit(&WR, sb, qz, qy, qx)) { fprintf(stderr, "%s\n", z3w_error()); return 1; }
                     sb = writer_next(&WR, sb); sbuf = WR.buf[sb];
+                    nn_ptick("writer wait");
                 }
                 const char *e = nn_check();
                 if (e) { fprintf(stderr, "cuda: %s\n", e); return 1; }
                 if (pprof) { nn_sync(); p_gpu += now() - pt; }
+                nn_ptick("other");
                 ntiles++;
                 fprintf(stderr, "\rsuper-shard %ld/%ld  %ld tiles (%ld air)  %.0fs   ", i + 1, rd.ntiles, ntiles, nskip, now() - t0);
                 continue;
@@ -1791,6 +1828,7 @@ int cmd_predict(int argc, char **argv) {
         if (ff) { fprintf(stderr, "predict: --feather: %s\n", ff == 2 ? "out of host memory for the spills" : z3w_error()); return 1; }
         if (pprof) p_copy += now() - tw;
     }
+    if (nn_ptick_on()) { fprintf(stderr, "\n"); nn_ptick_report((int)(ntiles > 0 ? ntiles : 1)); }
     if (pprof) fprintf(stderr, "\npredict profile (s): main: wait-reader %.2f h2d %.2f gpu(fwd+d2h) %.2f interior-copy %.2f writer-wait %.2f fit-writer-wait %.2f | reader: read %.2f stats %.2f slot-wait %.2f | wall %.2f, %ld tiles\n",
                        p_wait, p_h2d, p_gpu, p_copy, p_wr, p_ffw, rd.t_read, rd.t_stats, rd.t_wait, now() - t0, ntiles);
     if (!sup && cur_shard >= 0 && any) { if (gpath && !WR.skip) writer_d2h(&WR, sb, dsh); if (writer_submit(&WR, sb, sz, sy, sx)) { fprintf(stderr, "%s\n", z3w_error()); return 1; } }
@@ -1798,8 +1836,8 @@ int cmd_predict(int argc, char **argv) {
     if (sheet_task && cur_shard>=0 && sheet_write_shard(out,sheet_shard,shard,sz,sy,sx)) return 1;
     if (ufsm_env_on("UFSM_PROF")) { fprintf(stderr, "\n"); unet_prof_report(); }
     { const double tf = now();
-      if (writer_finish(&WR, wth)) { fprintf(stderr, "%s\n", z3w_error()); return 1; }
-      if (pprof) fprintf(stderr, "predict profile (s): writer: %.2f compressing %ld shards (%.0f MB/s), tail after the last window %.2f\n",
+      if (writer_finish(&WR)) { fprintf(stderr, "%s\n", z3w_error()); return 1; }
+      if (pprof) fprintf(stderr, "predict profile (s): writer: %.2f thread-seconds compressing %ld shards (%.0f MB/s per writer thread), tail after the last window %.2f\n",
                          WR.t_write, WR.n_write, WR.t_write > 0 ? WR.n_write * (double)WR.bytes / WR.t_write / 1e6 : 0., now() - tf); }
     if (ffzm) {   /* the last field slabs, the axis table and fields.json (format zarr) */
         for (; ffslab * FZ < ffF[0]; ffslab++) ffw_push(&ffw, (ffw_job){.kind = 1, .slab = ffslab});

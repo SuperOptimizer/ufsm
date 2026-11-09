@@ -173,6 +173,80 @@ __global__ void lat_adj_z_k(const float *t, int C, int d, int h, int w, int z0, 
     gc[((size_t)c * d + cz) * pl + yx] += s;
 }
 
+/* predict --channel rv on a latent-grid checkpoint: the two side logits of the cell grid (lg [2][d][h][w]) straight into a device shard
+   buffer: upsampled per coarse cell as lat_up4_k (fp32, not rounded to fp16), fused as nn_rv_fuse and quantised as nn_pred_place, masked
+   by the window's CT (ct >= iso, or the mask bits). Writes window voxels [z0, z1) x [y0, y1) x [x0, x1) (the interior inside the shard)
+   at dsh[(o + voxel)]; the window's fp32 logit volume (8 bytes a voxel for the two channels), its fuse and its place pass never exist. */
+template <typename T>
+__global__ void lat_place_rv_k(const T *lg, int d, int h, int w, const uint8_t *ct, const uint32_t *bits, int iso, int z0, int y0, int x0, int z1, int y1, int x1,
+                               int oz, int oy, int ox, int shard, uint8_t *dsh) {
+    const int H = 4 * h, W = 4 * w, c0z = z0 >> 2, c0y = y0 >> 2, c0x = x0 >> 2, ncy = ((y1 + 3) >> 2) - c0y, ncx = ((x1 + 3) >> 2) - c0x, ncz = ((z1 + 3) >> 2) - c0z;
+    const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= (size_t)ncz * ncy * ncx) return;
+    const int cz = c0z + (int)(i / ((size_t)ncy * ncx)), cy = c0y + (int)(i / ncx % ncy), cx = c0x + (int)(i % ncx);
+    const int iz[3] = {max(cz - 1, 0), cz, min(cz + 1, d - 1)}, iy[3] = {max(cy - 1, 0), cy, min(cy + 1, h - 1)}, ix[3] = {max(cx - 1, 0), cx, min(cx + 1, w - 1)};
+    const size_t cv = (size_t)d * h * w;
+    float v[2][3][3][3];
+#pragma unroll
+    for (int c = 0; c < 2; c++)
+#pragma unroll
+        for (int a = 0; a < 3; a++)
+#pragma unroll
+            for (int b = 0; b < 3; b++) {
+                const size_t row = (size_t)c * cv + ((size_t)iz[a] * h + iy[b]) * w;
+#pragma unroll
+                for (int e = 0; e < 3; e++) v[c][a][b][e] = ldv(lg, row + ix[e]);
+            }
+#pragma unroll
+    for (int rz = 0; rz < 4; rz++) {
+        const int z = 4 * cz + rz;
+        if (z < z0 || z >= z1) continue;
+        float p[2][3][3];
+#pragma unroll
+        for (int c = 0; c < 2; c++)
+#pragma unroll
+            for (int b = 0; b < 3; b++)
+#pragma unroll
+                for (int e = 0; e < 3; e++) p[c][b][e] = LW[rz][0] * v[c][0][b][e] + LW[rz][1] * v[c][1][b][e] + LW[rz][2] * v[c][2][b][e];
+#pragma unroll
+        for (int ry = 0; ry < 4; ry++) {
+            const int y = 4 * cy + ry;
+            if (y < y0 || y >= y1) continue;
+            float q[2][3];
+#pragma unroll
+            for (int c = 0; c < 2; c++)
+#pragma unroll
+                for (int e = 0; e < 3; e++) q[c][e] = LW[ry][0] * p[c][0][e] + LW[ry][1] * p[c][1][e] + LW[ry][2] * p[c][2][e];
+            const size_t kr = ((size_t)z * H + y) * W, gr = ((size_t)(oz + z) * shard + (oy + y)) * shard + ox;
+#pragma unroll
+            for (int rx = 0; rx < 4; rx++) {
+                const int x = 4 * cx + rx;
+                if (x < x0 || x >= x1) continue;
+                const size_t k = kr + x;
+                uint8_t o = 0;
+                if (ct ? ct[k] >= iso : (bits[k >> 5] >> (k & 31)) & 1u) {
+                    const float a = LW[rx][0] * q[0][0] + LW[rx][1] * q[0][1] + LW[rx][2] * q[0][2], b = LW[rx][0] * q[1][0] + LW[rx][1] * q[1][1] + LW[rx][2] * q[1][2];
+                    const float pr = 1.f / (1.f + __expf(-a)), pv = 1.f / (1.f + __expf(-b));
+                    float f = (1.f + 254.f * (0.5f + 0.5f * (pr - pv))) / 255.f; f = fminf(fmaxf(f, 1.5f / 255.f), 1.f - 1e-4f);   /* (nn_rv_fuse) */
+                    const float l = __logf(f / (1.f - f));
+                    o = (uint8_t)(255.f / (1.f + __expf(-l)) + 0.5f);   /* (nn_pred_place) */
+                }
+                dsh[gr + x] = o;
+            }
+        }
+    }
+}
+extern "C" void nn_lat_place_rv(const void *lg, int lh16, int d, int h, int w, const uint8_t *ct, const uint32_t *bits, int iso, int hz, int halo,
+                                int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh) {
+    const int D = 4 * d, H = 4 * h, W = 4 * w;
+    const int z0 = max(hz, -oz), y0 = max(halo, -oy), x0 = max(halo, -ox), z1 = min(D - hz, ez - oz), y1 = min(H - halo, ey - oy), x1 = min(W - halo, ex - ox);
+    if (z1 <= z0 || y1 <= y0 || x1 <= x0) return;
+    const size_t n = (size_t)(((z1 + 3) >> 2) - (z0 >> 2)) * (((y1 + 3) >> 2) - (y0 >> 2)) * (((x1 + 3) >> 2) - (x0 >> 2));
+    if (lh16) lat_place_rv_k<f16><<<nblk(n, 128), 128>>>((const f16 *)lg, d, h, w, ct, bits, iso, z0, y0, x0, z1, y1, x1, oz, oy, ox, shard, dsh);
+    else lat_place_rv_k<float><<<nblk(n, 128), 128>>>((const float *)lg, d, h, w, ct, bits, iso, z0, y0, x0, z1, y1, x1, oz, oy, ox, shard, dsh);
+    KCHECK();
+}
+
 static int g_lat_slow = -1;   /* UFSM_LAT_SLOW=1 / nn_lat_set_slow: the per-voxel kernels for every slab (A/B, train's UFSM_LAT_CHECK) */
 static int lat_slow(void) { if (g_lat_slow < 0) { const char *e = getenv("UFSM_LAT_SLOW"); g_lat_slow = e && *e == '1'; } return g_lat_slow; }
 extern "C" int nn_lat_set_slow(int on) { const int was = lat_slow(); g_lat_slow = on; return was; }

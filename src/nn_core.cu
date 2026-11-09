@@ -438,7 +438,7 @@ extern "C" void nn_ptick(const char *name) {
     if (name) {
         int k = 0; while (k < g_ptn && strcmp(g_ptname[k], name)) k++;
         if (k == g_ptn && g_ptn < 64) g_ptname[g_ptn++] = name;
-        if (k < 64) { g_ptms[k] += t - g_ptlast; g_ptcnt[k]++; }
+        if (k < 64 && g_ptlast > 0) { g_ptms[k] += t - g_ptlast; g_ptcnt[k]++; }
     }
     g_ptlast = pt_now();
 }
