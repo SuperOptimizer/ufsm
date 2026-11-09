@@ -82,7 +82,7 @@ int main(void) {
         for (int si = 0; si < 48; si++) {
             sym y = sym_of(si);
             write_x_ref(ct, P, o, 101.5, 37.25, cy, cx, y, 1.1f, -0.05f, A);
-            write_x(ct, P, o, 101.5f, (float)(1.0 / 37.25), 1, cyf, cxf, y, 1, 1.1f, -0.05f, 0.f, &r, nrow, 0, B, nullptr);
+            write_x(ct, P, o, 101.5f, (float)(1.0 / 37.25), 1, cyf, cxf, y, 1, 1.1f, -0.05f, 0.f, &r, nrow, 0, B, nullptr, nullptr);
             for (size_t k = 0; k < 4 * p3; k++) { double d = fabs((double)A[k] - B[k]); if (d > worst) worst = d; }
         }
         printf("fused input writer vs old path, 48 symmetries: max abs diff %.3g\n", worst);
@@ -99,8 +99,8 @@ int main(void) {
         int checked=0;
         for (int si=0;si<48;si++) {
             sym y=sym_of(si);
-            write_x_aug(ct,P,o,0,1,1,cy,cx,y,0,1,0,0,&r,nrow,0,input,nullptr,nullptr,nullptr,nullptr,&sheet,params);
-            write_x_aug(ct,P,o,0,1,1,cy,cx,y,0,1,0,0,&r,nrow,1,nullptr,half,nullptr,nullptr,nullptr,&sheet,params);
+            write_x_aug(ct,P,o,0,1,1,cy,cx,y,0,1,0,0,&r,nrow,0,input,nullptr,nullptr,nullptr,nullptr,&sheet,params,nullptr);
+            write_x_aug(ct,P,o,0,1,1,cy,cx,y,0,1,0,0,&r,nrow,1,nullptr,half,nullptr,nullptr,nullptr,&sheet,params,nullptr);
             for (int z=0;z<P;z++) for (int yy=0;yy<P;yy++) for (int x=0;x<P;x++) {
                 int out[3]={z,yy,x}; double world[3];
                 for (int d=0;d<3;d++) world[y.perm[d]]=o[y.perm[d]]+(y.flip[d]?P-1-out[d]:out[d]);

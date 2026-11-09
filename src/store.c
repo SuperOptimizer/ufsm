@@ -10,6 +10,9 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <time.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/socket.h>
 
 struct store {
     char *root;      /* without trailing '/' */
@@ -217,6 +220,14 @@ static size_t on_read_hdr(char *buf, size_t sz, size_t nm, void *ud) {
     return on_ratelimit_hdr(buf, sz, nm, nullptr);
 }
 
+/* UFSM_TCP_MSS=N: cap the TCP segment size of every HTTP connection (hosts behind a path-MTU black hole, e.g. some
+   cloud GPU containers without NET_ADMIN, stall in the TLS handshake otherwise) */
+static int http_sockopt(void *clientp, curl_socket_t fd, curlsocktype purpose) {
+    (void)purpose; int mss = *(const int *)clientp;
+    if (mss > 0) setsockopt(fd, IPPROTO_TCP, TCP_MAXSEG, &mss, sizeof mss);
+    return CURL_SOCKOPT_OK;
+}
+static int http_mss = -1;
 static CURL *fresh_handle(const store *s) {
     if (!tl_http) {
         pthread_mutex_lock(&http_global_mu);
@@ -244,6 +255,8 @@ static CURL *fresh_handle(const store *s) {
     curl_easy_setopt(c, CURLOPT_TCP_KEEPALIVE, 1L);
     curl_easy_setopt(c, CURLOPT_MAXCONNECTS, 2L);
     curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
+    if (http_mss < 0) { const char *e = getenv("UFSM_TCP_MSS"); http_mss = e ? atoi(e) : 0; }
+    if (http_mss > 0) { curl_easy_setopt(c, CURLOPT_SOCKOPTFUNCTION, http_sockopt); curl_easy_setopt(c, CURLOPT_SOCKOPTDATA, &http_mss); }
     curl_easy_setopt(c, CURLOPT_FAILONERROR, 1L);
     return c;
 }

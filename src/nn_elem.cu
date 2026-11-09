@@ -316,6 +316,62 @@ extern "C" void nn_srste24(float *g, const float *w, int co, int ci, int taps, f
     size_t ng = (size_t)co * (ci / 4) * taps; srste24_k<<<nblk(ng, 256), 256>>>(g, w, co, ci, taps, lambda); KCHECK();
 }
 extern "C" void nn_sigmoid(const float *x, size_t n, float *y) { sigm_k<<<nblk(n, 256), 256>>>(x, y, n); KCHECK(); }
+__global__ void flip32_k(unsigned *x, size_t n) { size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; if (i < n) x[i] ^= 0x80000000u; }
+__global__ void flip16_k(unsigned short *x, size_t n) { size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; if (i < n) x[i] ^= (unsigned short)0x8000; }
+extern "C" void nn_flip_sign(void *x, size_t n, int h16) {
+    if (h16) flip16_k<<<nblk(n, 256), 256>>>((unsigned short *)x, n); else flip32_k<<<nblk(n, 256), 256>>>((unsigned *)x, n);
+    KCHECK();
+}
+template <typename LT> __global__ void prob_u8_k(const LT *lg, size_t n, uint8_t *out, float hard) {
+    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float p = 1.f / (1.f + expf(-lgv(lg, i)));
+    out[i] = hard > 0 ? (p >= hard ? 255 : 0) : (uint8_t)(255.f * p + 0.5f);
+}
+extern "C" void nn_prob_u8(const float *logits, size_t n, uint8_t *out, float hard) {   /* logits fp16 when nn_set_logits_h16 */
+    if (g_logits_h16) prob_u8_k<f16><<<nblk(n, 256), 256>>>((const f16 *)logits, n, out, hard); else prob_u8_k<float><<<nblk(n, 256), 256>>>(logits, n, out, hard);
+    KCHECK();
+}
+template <typename T> __device__ __forceinline__ float ldin(const T *x, size_t i);
+template <> __device__ __forceinline__ float ldin<float>(const float *x, size_t i) { return x[i]; }
+template <> __device__ __forceinline__ float ldin<__half>(const __half *x, size_t i) { return __half2float(x[i]); }
+template <> __device__ __forceinline__ float ldin<__nv_bfloat16>(const __nv_bfloat16 *x, size_t i) { return __bfloat162float(x[i]); }
+__device__ __forceinline__ int pat(const uint8_t *p, int d, int h, int w, float z, float y, float x) {
+    int a = __float2int_rn(z), b = __float2int_rn(y), c = __float2int_rn(x);
+    if (a < 0 || b < 0 || c < 0 || a >= d || b >= h || c >= w) return -1;
+    return p[((size_t)a * h + b) * w + c];
+}
+__device__ __forceinline__ int is_ridge(const uint8_t *p, int d, int h, int w, float z, float y, float x, float nz, float ny, float nx, int thr) {
+    const int v = pat(p, d, h, w, z, y, x);
+    if (v < thr) return 0;
+    for (int s = 1; s <= 2; s++)
+        if (pat(p, d, h, w, z + s * nz, y + s * ny, x + s * nx) > v || pat(p, d, h, w, z - s * nz, y - s * ny, x - s * nx) > v) return 0;
+    return 1;
+}
+template <typename T> __global__ void ridge_k(const uint8_t *p, const T *xin, int d, int h, int w, int thr, uint8_t *out) {
+    const size_t n = (size_t)d * h * w, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const int x = (int)(i % w), y = (int)((i / w) % h), z = (int)(i / ((size_t)w * h));
+    float nz = ldin<T>(xin, n + i), ny = ldin<T>(xin, 2 * n + i), nx = ldin<T>(xin, 3 * n + i);
+    const float m = sqrtf(nz * nz + ny * ny + nx * nx);
+    if (m < 1e-3f) { out[i] = 0; return; }
+    nz /= m; ny /= m; nx /= m;
+    int r = 0;
+    for (int s = -1; s <= 1 && !r; s++) r = is_ridge(p, d, h, w, z + s * nz, y + s * ny, x + s * nx, nz, ny, nx, thr);
+    out[i] = r ? 255 : 0;
+}
+__global__ void fill_unl_k(uint8_t *t, uint8_t *m, const uint8_t *vm, const uint8_t *src, size_t n) {
+    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i < n && !m[i] && vm[i]) { t[i] = src[i]; m[i] = 1; }
+}
+extern "C" void nn_fill_unlabelled(uint8_t *t, uint8_t *m, const uint8_t *vm, const uint8_t *src, size_t n) { fill_unl_k<<<nblk(n, 256), 256>>>(t, m, vm, src, n); KCHECK(); }
+extern "C" void nn_ridge_u8(const uint8_t *p, const void *x, int xfmt, int d, int h, int w, int thr, uint8_t *out) {
+    const size_t n = (size_t)d * h * w;
+    if (xfmt == 1) ridge_k<__half><<<nblk(n, 256), 256>>>(p, (const __half *)x, d, h, w, thr, out);
+    else if (xfmt == 2) ridge_k<__nv_bfloat16><<<nblk(n, 256), 256>>>(p, (const __nv_bfloat16 *)x, d, h, w, thr, out);
+    else ridge_k<float><<<nblk(n, 256), 256>>>(p, (const float *)x, d, h, w, thr, out);
+    KCHECK();
+}
 extern "C" void nn_pred_input(const uint8_t *ct, int W, float mean, float isd, const float *dyo, const float *dxo, int axis, void *x, int h16) {
     size_t n = (size_t)W * W * W;
     if (!h16) pred_in_k<float><<<nblk(n, 256), 256>>>(ct, W, mean, isd, dyo, dxo, axis, (float *)x);

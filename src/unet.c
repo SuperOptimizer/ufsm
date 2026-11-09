@@ -78,6 +78,7 @@ struct unet {
     unsigned char *wq_r, *wq_rsc, *wq_re, *wq_rsce;  /* fp4: fp8 error-feedback residuals (live, EMA) */
     size_t wq_qoff[64], wq_soff[64]; int wq_n; unsigned ema_step;   /* per 3^3 conv (for_each_conv3 order): offsets into the packed arrays */
     int using_ema;
+    size_t sc_w; float sc_c; float *stem_b;   /* scale_cond: offset of the conditioning vector, current scale code, effective stem bias */
     block enc[UNET_MAXLEV], dec[UNET_MAXLEV];
     convp down[UNET_MAXLEV], head;
     gnp dn[UNET_MAXLEV];          /* down_norm: GroupNorm after down[i] */
@@ -186,6 +187,7 @@ unet *unet_create(const unet_cfg *cfg) {
     for (int i = L - 2; i >= 0; i--) off = add_block(u, &u->dec[i], w[i] + w[i + 1], w[i], off);
     off = add_conv(u, &u->head, w[0], cfg->cout, 1, 1, off);
     if (cfg->down_norm) for (int i = 0; i < L - 1; i++) off = add_gn(u, &u->dn[i], w[i], off);
+    if (cfg->scale_cond) { u->sc_w = off; off += (size_t)w[0]; }
     u->np = off;
     if (ufsm_env_on("UFSM_DEBUG")) {
         for (int i = 0; i < L; i++) fprintf(stderr, "enc%d c1.w %zu c1.b %zu n1 %zu c2.w %zu c2.b %zu n2 %zu\n", i, u->enc[i].c1.w, u->enc[i].c1.b, u->enc[i].n1.gamma, u->enc[i].c2.w, u->enc[i].c2.b, u->enc[i].n2.gamma);
@@ -207,7 +209,7 @@ void unet_free(unet *u) {
     free_acts(u);
     nn_free(u->p); nn_free(u->g); nn_free(u->m); nn_free(u->v); nn_free(u->ema);
     nn_free(u->gn_scratch); nn_free(u->red_scratch); nn_free(u->wg_tmp);
-    nn_free(u->wm); nn_free(u->muon_mom); nn_free(u->muon_work); nn_free(u->muon_descs);
+    nn_free(u->wm); nn_free(u->muon_mom); nn_free(u->muon_work); nn_free(u->muon_descs); nn_free(u->stem_b);
     nn_free(u->anvil_v1); nn_free(u->anvil_pool); nn_free(u->anvil_descs);
     nn_free(u->wq_q); nn_free(u->wq_sc); nn_free(u->wq_qe); nn_free(u->wq_sce);
     nn_free(u->wq_r); nn_free(u->wq_rsc); nn_free(u->wq_re); nn_free(u->wq_rsce);
@@ -817,6 +819,9 @@ shape5 unet_out_shape(const unet *u, shape5 xs) { xs.c = u->cfg.cout; return xs;
 
 /* ---- forward ---- */
 static const float *P(const unet *u, size_t off) { return u->fw + off; }
+/* conv1 bias of an encoder block: the scale-conditioned effective bias for the stem */
+static const float *B1(const unet *u, const block *b) { return b == &u->enc[0] && u->cfg.scale_cond ? u->stem_b : P(u, b->c1.b); }
+void unet_set_scale(unet *u, double um) { u->sc_c = unet_scale_code(um); }
 void unet_apply_sparse24(unet *u);
 
 /* the GroupNorm (params + stats) of a block's output: silu(gn(a2)) = s2 */
@@ -967,8 +972,8 @@ static void block_fwd(unet *u, block *b, int level, const float *x) {
             nn_d2d(b->pm1, b->m1, (size_t)b->ys.n * G * 4); nn_d2d(b->pr1, b->r1, (size_t)b->ys.n * G * 4); nn_d2d(b->pm2, b->m2, (size_t)b->ys.n * G * 4); nn_d2d(b->pr2, b->r2, (size_t)b->ys.n * G * 4);
         }
         if (b->xb) { if (dec_conv1(u, b, level, b->a1, G, b->m1, b->r1, nullptr, nullptr, nullptr)) rc_fail("decoder conv1"); }   /* [up2(coarse) | silu(gn(skip a2))] */
-        else if (b->in2) PROF(0, nn_conv3d_fwd_split(x, b->in2, b->c_split, b->xs, 0, nullptr, nullptr, nullptr, nullptr, P(u, b->c1.w), P(u, b->c1.b), b->c1.cout, b->a1, G, 1e-5f, b->m1, b->r1));
-        else { nn_gn_t gi = gn_in(u, b); PROF(0, nn_conv3d_fwd_gn_stats(x, b->xs, gi.G, gi.gamma, gi.beta, gi.mean, gi.rstd, P(u, b->c1.w), P(u, b->c1.b), b->c1.cout, b->a1, G, 1e-5f, b->m1, b->r1)); }   /* down_norm: gn + silu of the input in staging */
+        else if (b->in2) PROF(0, nn_conv3d_fwd_split(x, b->in2, b->c_split, b->xs, 0, nullptr, nullptr, nullptr, nullptr, P(u, b->c1.w), B1(u, b), b->c1.cout, b->a1, G, 1e-5f, b->m1, b->r1));
+        else { nn_gn_t gi = gn_in(u, b); PROF(0, nn_conv3d_fwd_gn_stats(x, b->xs, gi.G, gi.gamma, gi.beta, gi.mean, gi.rstd, P(u, b->c1.w), B1(u, b), b->c1.cout, b->a1, G, 1e-5f, b->m1, b->r1)); }   /* down_norm: gn + silu of the input in staging */
         FQ(b->a1, b->ys); FQ_AFF(b->a1, b->ys, b->pm1, b->pr1, G);
         sp_halo(u, b->a1, b->ys, 0);
         if (b == &u->enc[0] && u->xin_shared && u->fwd_train && u->h_xin) {   /* the stem has read the input: to the host during conv2 and the coarser levels */
@@ -992,7 +997,7 @@ static void block_fwd(unet *u, block *b, int level, const float *x) {
         if (b->s2) { PROF(3, nn_gn_silu_apply(b->a2, b->ys, G, P(u, b->n2.gamma), P(u, b->n2.beta), b->m2, b->r2, b->s2)); FQ(b->s2, b->ys); FQ_POST(b->s2, b->ys); }
         return;
     }
-    PROF(0, nn_conv3d_fwd(x, b->xs, P(u, b->c1.w), P(u, b->c1.b), b->c1.cout, 3, 1, b->a1));
+    PROF(0, nn_conv3d_fwd(x, b->xs, P(u, b->c1.w), B1(u, b), b->c1.cout, 3, 1, b->a1));
     PROF(3, nn_gn_fwd_silu(b->a1, b->ys, G, 1e-5f, P(u, b->n1.gamma), P(u, b->n1.beta), t1, b->m1, b->r1));
     PROF(0, nn_conv3d_fwd(t1, b->ys, P(u, b->c2.w), P(u, b->c2.b), b->c2.cout, 3, 1, b->a2));
     PROF(3, nn_gn_fwd_silu(b->a2, b->ys, G, 1e-5f, P(u, b->n2.gamma), P(u, b->n2.beta), b->s2, b->m2, b->r2));
@@ -1008,6 +1013,12 @@ const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x
     if (sp_on(u) && (!nn_get_tf32() || !ABF)) { fprintf(stderr, "unet: the spatial split needs the tensor-core path with 16-bit or MX storage\n"); abort(); }
     sp_cfg(u);
     unet_apply_sparse24(u);
+    if (u->cfg.scale_cond) {   /* stem bias b + c v for this forward (and the recompute passes of its backward) */
+        const int c0 = u->enc[0].c1.cout;
+        if (!u->stem_b) u->stem_b = nn_malloc((size_t)c0 * 4);
+        nn_d2d(u->stem_b, P(u, u->enc[0].c1.b), (size_t)c0 * 4);
+        nn_axpy(u->stem_b, u->sc_c, P(u, u->sc_w), (size_t)c0);
+    }
     int L = u->cfg.nlev;
     const int *w = u->cfg.widths;
     const float *cur = x;
@@ -1118,7 +1129,7 @@ static float *block_bwd(unet *u, block *b, int level, const float *gy, float *gx
         nn_set_conv(0);
         int r;
         if (b->xb) r = dec_conv1(u, b, level, b->a1, G, nullptr, nullptr, nullptr, nullptr, nullptr);
-        else { nn_gn_t gi = gn_in(u, b); PROF(0, r = nn_conv3d_fwd_x(b->in, gi.G ? &gi : nullptr, nullptr, nullptr, 0, 0, b->xs, P(u, b->c1.w), P(u, b->c1.b), b->c1.cout, 3, 1, b->a1, G, 0.f, nullptr, nullptr)); }
+        else { nn_gn_t gi = gn_in(u, b); PROF(0, r = nn_conv3d_fwd_x(b->in, gi.G ? &gi : nullptr, nullptr, nullptr, 0, 0, b->xs, P(u, b->c1.w), B1(u, b), b->c1.cout, 3, 1, b->a1, G, 0.f, nullptr, nullptr)); }
         if (r) rc_fail("conv1 recompute");
         FQ(b->a1, b->ys);
         sp_halo(u, b->a1, b->ys, 0);
@@ -1352,6 +1363,8 @@ void unet_backward_x(unet *u, const void *gv, int g_h16) {
     }
     if (gscale != 1.f) nn_scale(g, 1.f / gscale, u->np);   /* activation gradients were scaled for 16-bit storage */
     if (share_enc_a1()) u->sea_stale = 1;   /* the decoders' a1 buffers now hold the encoders' */
+    /* d/dv of the stem bias b + c v is c d/db (exact when the gradient was zeroed before this backward: one backward per step) */
+    if (u->cfg.scale_cond) nn_axpy(g + u->sc_w, u->sc_c, g + u->enc[0].c1.b, (size_t)u->enc[0].c1.cout);
     g_in_bwd = 0;
 }
 
@@ -1472,6 +1485,19 @@ void unet_anvil(unet *u, float lr, float wd, int step, int steps, float lr_adam,
     adamw_nonconv(u, lr_adam, b1, b2, eps, wd_adam, step);
 }
 void unet_ema(unet *u, float decay) { if (u->wq) wq_ema(u, decay); else nn_ema(u->ema, u->p, u->np, decay); }
+const float *unet_live_params(const unet *u) { return u->p; }
+/* zero every gradient but the output head's (weights and biases): train only the head on frozen features */
+void unet_grad_head_only(unet *u, int blocks) {   /* blocks: also train the last decoder blocks dec[blocks-1] .. dec[0] */
+    const int k = blocks < 0 ? 0 : blocks > u->cfg.nlev - 1 ? u->cfg.nlev - 1 : blocks;
+    const size_t hb = k ? u->dec[k - 1].c1.w : u->head.w, he = u->head.b + (size_t)u->cfg.cout;
+    if (hb) nn_zero(u->g, hb * 4);
+    if (he < u->np) nn_zero(u->g + he, (u->np - he) * 4);
+}
+/* the forward reads live (unet_apply_sparse24 resets fw from it every call), so the swap goes through live */
+void unet_use_params(unet *u, const float *w) {
+    u->live = w ? (float *)w : u->using_ema ? u->ema : u->p;
+    if (!u->sparse24) u->fw = u->live;
+}
 void unet_use_ema(unet *u, int on) { u->live = on ? u->ema : u->p; u->using_ema = on; if (!u->sparse24) u->fw = u->live; }
 /* ---- 2:4 structured sparsity: the forward reads a masked copy of the live weights; SR-STE keeps the master weights dense ---- */
 static void for_each_conv3(unet *u, void (*fn)(unet *, const convp *, void *), void *arg) {
@@ -1611,7 +1637,7 @@ int unet_save(const unet *u, const char *path, int step, const char *extra) {
     if (!f) return -1;
     fprintf(f, "UFSM{\"nlev\":%d,\"widths\":[", u->cfg.nlev);
     for (int i = 0; i < u->cfg.nlev; i++) fprintf(f, "%s%d", i ? "," : "", u->cfg.widths[i]);
-    fprintf(f, "],\"cin\":%d,\"cout\":%d,\"G\":%d,\"down_norm\":%d,\"nparams\":%zu,\"step\":%d,\"sparse24\":%d,\"wq\":%d,\"muon_mom\":%d,\"extra\":%s}\n", u->cfg.cin, u->cfg.cout, u->cfg.G, u->cfg.down_norm, u->np, step, u->sparse24, u->wq, u->muon_mom != nullptr, extra ? extra : "{}");
+    fprintf(f, "],\"cin\":%d,\"cout\":%d,\"G\":%d,\"down_norm\":%d,\"scale_cond\":%d,\"nparams\":%zu,\"step\":%d,\"sparse24\":%d,\"wq\":%d,\"muon_mom\":%d,\"extra\":%s}\n", u->cfg.cin, u->cfg.cout, u->cfg.G, u->cfg.down_norm, u->cfg.scale_cond, u->np, step, u->sparse24, u->wq, u->muon_mom != nullptr, extra ? extra : "{}");
     float *h = malloc(u->np * 4);
     const float *arrs[4] = {u->p, u->ema, u->m, u->v};
     for (int a = 0; a < 4; a++) { nn_d2h(h, arrs[a], u->np * 4); if (fwrite(h, 4, u->np, f) != u->np) { fclose(f); free(h); return -1; } }
@@ -1637,6 +1663,7 @@ static int read_header(FILE *f, unet_cfg *cfg, int *step, size_t *np) {
     if ((p = strstr(line, "\"cout\":"))) cfg->cout = atoi(p + 7);
     if ((p = strstr(line, "\"G\":"))) cfg->G = atoi(p + 4);
     if ((p = strstr(line, "\"down_norm\":"))) cfg->down_norm = atoi(p + 12);
+    if ((p = strstr(line, "\"scale_cond\":"))) cfg->scale_cond = atoi(p + 13);
     if ((p = strstr(line, "\"nparams\":"))) *np = (size_t)atoll(p + 10);
     if ((p = strstr(line, "\"step\":"))) *step = atoi(p + 7);
     if ((p = strstr(line, "\"sparse24\":"))) g_loaded_sparse = atoi(p + 11);
@@ -1729,7 +1756,11 @@ static int copy_gn(unet *u, const unet *o, const gnp *a, const gnp *b) {
     nn_d2d(u->p + a->beta, o->p + b->beta, (size_t)a->c * 4); nn_d2d(u->ema + a->beta, o->ema + b->beta, (size_t)a->c * 4);
     return 1;
 }
-int unet_init_from(unet *u, const char *path) {
+int unet_init_from(unet *u, const char *path) { return unet_init_from_map(u, path, nullptr); }
+/* head_rows (u's cout entries, or nullptr = shape-matched copy): output row co of u's head takes the checkpoint's head row
+   head_rows[co] (weights and bias), -1 = keep the fresh row. E.g. a verso warm start {0, 0, 1, 2, ...}: recto copied into the
+   new verso channel 1, the old rows 1.. shifted up by one. */
+int unet_init_from_map(unet *u, const char *path, const int *head_rows) {
     unet_cfg oc; int step;
     if (unet_peek(path, &oc, &step) || oc.cin != u->cfg.cin) return -1;
     unet *o = unet_create(&oc);
@@ -1746,7 +1777,24 @@ int unet_init_from(unet *u, const char *path) {
         const block *a = &u->dec[i], *b = &o->dec[i];   /* dec[i] works at level i in both nets */
         n += copy_conv(u, o, &a->c1, &b->c1) + copy_gn(u, o, &a->n1, &b->n1) + copy_conv(u, o, &a->c2, &b->c2) + copy_gn(u, o, &a->n2, &b->n2);
     }
-    n += copy_conv(u, o, &u->head, &o->head);
+    if (!head_rows) n += copy_conv(u, o, &u->head, &o->head);
+    else if (u->head.cin == o->head.cin && u->head.k == o->head.k) {
+        const size_t row = (size_t)u->head.cin * u->head.k * u->head.k * u->head.k;
+        for (int co = 0; co < u->cfg.cout; co++) {
+            const int src = head_rows[co];
+            if (src < 0) continue;
+            if (src >= oc.cout) { unet_free(o); return -1; }
+            for (int e = 0; e < 2; e++) {
+                float *dst = e ? u->ema : u->p; const float *sp = e ? o->ema : o->p;
+                nn_d2d(dst + u->head.w + co * row, sp + o->head.w + src * row, row * 4);
+                nn_d2d(dst + u->head.b + co, sp + o->head.b + src, 4);
+            }
+        }
+        n++;
+    } else { unet_free(o); return -1; }
+    if (u->cfg.scale_cond && oc.scale_cond && u->enc[0].c1.cout == o->enc[0].c1.cout) {
+        nn_d2d(u->p + u->sc_w, o->p + o->sc_w, (size_t)u->enc[0].c1.cout * 4); nn_d2d(u->ema + u->sc_w, o->ema + o->sc_w, (size_t)u->enc[0].c1.cout * 4); n++;
+    }
     unet_free(o);
     nn_zero(u->m, u->np * 4); nn_zero(u->v, u->np * 4);
     if (u->muon_mom) nn_zero(u->muon_mom, u->np * 4);

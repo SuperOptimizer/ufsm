@@ -168,7 +168,7 @@ static int on_nested(const char *name, int is_dir, int64_t size, void *ud) {
     return 0;
 }
 
-typedef struct { z2 *z; const int64_t (*chunks)[3]; int nchunks; uint8_t *shard; int S; int64_t so[3]; int labels; atomic_int failed; } fill_job;
+typedef struct { z2 *z; const int64_t (*chunks)[3]; int nchunks; uint8_t *shard; int S; int64_t so[3]; int labels; atomic_int failed; int prob127; } fill_job;
 static void fill_chunk(int i, int tid, void *ud) {
     fill_job *j = ud;
     const z2_meta *m = z2_meta_of(j->z);
@@ -182,7 +182,7 @@ static void fill_chunk(int i, int tid, void *ud) {
         const uint8_t *src = buf + ((size_t)z * n[1] + y) * n[2];
         for (int64_t x = 0; x < n[2] && gx + x < j->S; x++) {
             uint8_t v = src[x];
-            dst[x] = j->labels ? (v == 2 ? 255 : v ? 254 : 0) : v;
+            dst[x] = j->labels ? (v == 2 ? 255 : v ? 254 : 0) : j->prob127 ? (uint8_t)(v >= 127 ? 254 : 2 * v) : v;   /* --prob127: p * 127 -> the targets' p * 254 */
         }
     }
     free(buf);
@@ -191,7 +191,7 @@ static void fill_chunk(int i, int tid, void *ud) {
 static int cmp3(const void *a, const void *b) { const int64_t *p = a, *q = b; for (int d = 0; d < 3; d++) if (p[d] != q[d]) return p[d] < q[d] ? -1 : 1; return 0; }
 
 int cmd_ingest_labels(int argc, char **argv) {
-    if (argc < 5) { fprintf(stderr, "usage: ufsm ingest-labels <root> <zarr-key> <out-dir> --um U [--levels L] [--token FILE] [--cache DIR] [--threads N] [--raw] [--shard 1024] [--zmax Z]\n"); return 2; }
+    if (argc < 5) { fprintf(stderr, "usage: ufsm ingest-labels <root> <zarr-key> <out-dir> --um U [--levels L] [--token FILE] [--cache DIR] [--threads N] [--raw] [--shard 1024] [--zmax Z] [--blocks FILE] [--prob127] [--q Q]\n"); return 2; }
     const char *root = argv[2], *key = argv[3], *out = argv[4];
     double um = atof(opt(argc, argv, "--um", "0"));
     int nlev = atoi(opt(argc, argv, "--levels", "6"));
@@ -200,6 +200,11 @@ int cmd_ingest_labels(int argc, char **argv) {
     for (int i = 1; i < argc; i++) if (!strcmp(argv[i], "--raw")) labels = 0;
     int shard = atoi(opt(argc, argv, "--shard", "1024"));
     int64_t zmax = atoll(opt(argc, argv, "--zmax", "0"));
+    const char *blocks = opt(argc, argv, "--blocks", nullptr);   /* only these shards ("sz sy sx" per line, shard units): no listing, missing chunks read as 0 */
+    int prob127 = 0;
+    for (int i = 1; i < argc; i++) if (!strcmp(argv[i], "--prob127")) prob127 = 1;   /* uint8 p * 127 (ink-3d predictions) -> p * 254, raw */
+    if (prob127) labels = 0;
+    const float q = (float)atof(opt(argc, argv, "--q", "0"));   /* volcomp quality of the raw / prob store (0 lossless) */
     if (um <= 0) { fprintf(stderr, "--um required\n"); return 2; }
     store *s = store_open(root);
     char *tok = hf_token(opt(argc, argv, "--token", nullptr));
@@ -214,9 +219,18 @@ int cmd_ingest_labels(int argc, char **argv) {
     if (shard % m->chunk[0] || shard % m->chunk[1] || shard % m->chunk[2]) { fprintf(stderr, "shard must be a multiple of the source chunk\n"); return 1; }
     chunklist cl = {0};
     double t0 = now();
-    if (m->sep == '/') { nested nd = {&cl, s, akey, 0, 0, 0}; store_list(s, akey, on_nested, &nd); }
+    if (blocks) {
+        FILE *bf = fopen(blocks, "r"); if (!bf) { fprintf(stderr, "cannot read %s\n", blocks); return 1; }
+        long long b[3]; const int c0 = shard / m->chunk[0], c1 = shard / m->chunk[1], c2 = shard / m->chunk[2];
+        while (fscanf(bf, "%lld %lld %lld", &b[0], &b[1], &b[2]) == 3)
+            for (int a = 0; a < c0; a++) for (int bb = 0; bb < c1; bb++) for (int c = 0; c < c2; c++) {
+                if (cl.n == cl.cap) { cl.cap = cl.cap ? cl.cap * 2 : 1024; cl.c = realloc(cl.c, (size_t)cl.cap * sizeof *cl.c); }
+                cl.c[cl.n][0] = b[0] * c0 + a; cl.c[cl.n][1] = b[1] * c1 + bb; cl.c[cl.n][2] = b[2] * c2 + c; cl.n++;
+            }
+        fclose(bf);
+    } else if (m->sep == '/') { nested nd = {&cl, s, akey, 0, 0, 0}; store_list(s, akey, on_nested, &nd); }
     else store_list(s, akey, on_chunk, &cl);
-    qsort(cl.c, (size_t)cl.n, sizeof *cl.c, cmp3);
+    if (!blocks) qsort(cl.c, (size_t)cl.n, sizeof *cl.c, cmp3);   /* --blocks: kept in the file's order (each shard's chunks are contiguous) */
     fprintf(stderr, "%d chunks listed in %.0fs\n", cl.n, now() - t0);
     if (!cl.n) return 1;
     int64_t shape[3]; memcpy(shape, m->shape, sizeof shape);
@@ -225,8 +239,8 @@ int cmd_ingest_labels(int argc, char **argv) {
     z3w_level_name(um, lv, sizeof lv);
     snprintf(ldir, sizeof ldir, "%s/%s", out, lv);
     char attrs[512];
-    snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"content\":\"%s\",\"source\":\"%s/%s\",\"encoding\":\"%s\"}}", labels ? "labels" : "raw", root, key, labels ? "0=bg,254=surface,255=ignore" : "uint8");
-    z3w *w = z3w_create(ldir, shape, shard, 0.f, labels ? 255 : 0, attrs);
+    snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"content\":\"%s\",\"source\":\"%s/%s\",\"encoding\":\"%s\"}}", labels ? "labels" : prob127 ? "prob" : "raw", root, key, labels ? "0=bg,254=surface,255=ignore" : prob127 ? "p*254 (source p*127)" : "uint8");
+    z3w *w = z3w_create(ldir, shape, shard, labels ? 0.f : q, labels ? 255 : 0, attrs);
     if (!w) { fprintf(stderr, "%s\n", z3w_error()); return 1; }
     size_t sv = (size_t)shard * shard * shard;
     uint8_t *buf = malloc(sv);
@@ -236,7 +250,7 @@ int cmd_ingest_labels(int argc, char **argv) {
     while (i < cl.n) {
         if (used[i]) { i++; continue; }
         int64_t sz = cl.c[i][0] / cpp, sy = cl.c[i][1] / cpp, sx = cl.c[i][2] / cpp;
-        if (sz * shard >= shape[0]) break;
+        if (sz * shard >= shape[0]) { if (blocks) { i++; continue; } break; }
         /* sorted by z, y, x: all chunks of this shard lie inside the run of chunk-rows with the same sz */
         int cnt = 0;
         int64_t (*sel)[3] = malloc((size_t)cpp * cpp * cpp * sizeof *sel);
@@ -244,7 +258,7 @@ int cmd_ingest_labels(int argc, char **argv) {
             if (!used[j] && cl.c[j][1] / cpp == sy && cl.c[j][2] / cpp == sx) { memcpy(sel[cnt++], cl.c[j], sizeof *sel); used[j] = 1; }
         if (!cnt) { free(sel); i++; continue; }
         memset(buf, labels ? 255 : 0, sv);
-        fill_job fj = {z, sel, cnt, buf, shard, {sz * shard, sy * shard, sx * shard}, labels, 0};
+        fill_job fj = {z, sel, cnt, buf, shard, {sz * shard, sy * shard, sx * shard}, labels, 0, prob127};
         parallel_for(cnt, nthreads, fill_chunk, &fj);
         if (atomic_load(&fj.failed)) return 1;
         if (z3w_write_shard(w, sz, sy, sx, buf, nthreads)) { fprintf(stderr, "%s\n", z3w_error()); return 1; }
@@ -255,7 +269,7 @@ int cmd_ingest_labels(int argc, char **argv) {
     fprintf(stderr, "\nlevel 0 done: %d shards\n", nshards);
     z3w_close(w);
     free(buf); free(used);
-    for (int l = 1; l < nlev; l++) if (pyramid_build_level(out, um, l, shape, shard, 0.f, labels, nthreads, attrs)) return 1;
+    for (int l = 1; l < nlev; l++) if (pyramid_build_level(out, um, l, shape, shard, labels ? 0.f : q, labels, nthreads, attrs)) return 1;
     const char *slash = strrchr(key, '/');
     pyramid_write_group(out, um, nlev, slash ? slash + 1 : key, attrs);
     z2_close(z); store_close(s); free(tok);

@@ -204,6 +204,22 @@ cudaStream_t copy_stream(void) {
     if (!st[d]) CK(cudaStreamCreateWithFlags(&st[d], cudaStreamNonBlocking));
     return st[d];
 }
+template <int FMT> __global__ void expand_dir8_k(unsigned short *x, const signed char *d, size_t l3, size_t n) {
+    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const size_t b = i / (3 * l3), r = i - b * 3 * l3, ch = r / l3, v = r - ch * l3;
+    const float f = (float)d[i] * (1.f / 127.f);
+    unsigned short h;
+    if (FMT == 1) { __half t = __float2half_rn(f); memcpy(&h, &t, 2); } else { __nv_bfloat16 t = __float2bfloat16_rn(f); memcpy(&h, &t, 2); }
+    x[(b * 4 + 1 + ch) * l3 + v] = h;
+}
+/* batches with the radial unit vector as int8 (sampler dir8): d = B x 3 x l3 -> 16-bit input channels 1..3 of x (B x 4 x l3) */
+extern "C" void nn_expand_dir8(void *x, const int8_t *d, int B, size_t l3, int fmt, int on_copy_stream) {
+    const size_t n = (size_t)B * 3 * l3; cudaStream_t st = on_copy_stream ? copy_stream() : 0;
+    if (fmt == 1) expand_dir8_k<1><<<(unsigned)((n + 255) / 256), 256, 0, st>>>((unsigned short *)x, (const signed char *)d, l3, n);
+    else expand_dir8_k<2><<<(unsigned)((n + 255) / 256), 256, 0, st>>>((unsigned short *)x, (const signed char *)d, l3, n);
+    CK(cudaGetLastError());
+}
 extern "C" void nn_h2d_copy_stream(void *d, const void *s, size_t n) { CK(cudaMemcpyAsync(d, s, n, cudaMemcpyHostToDevice, copy_stream())); }   /* s must be pinned */
 extern "C" void *nn_event_create(void) { cudaEvent_t e; CK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming)); return (void *)e; }
 extern "C" void nn_event_record(void *e, int on_copy_stream) { CK(cudaEventRecord((cudaEvent_t)e, on_copy_stream ? copy_stream() : 0)); }

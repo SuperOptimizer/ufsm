@@ -79,18 +79,22 @@ static int sym_is_rotation(sym y) {
     return ((odd[p] + y.flip[0] + y.flip[1] + y.flip[2]) & 1) == 0;
 }
 
+/* per output axis an offset table (source stride of the axis it reads, reversed when flipped), and 16 x 16 x 64 output tiles so
+   a permutation that walks the source along z still reuses the cache lines of a tile */
 #define APPLY_SYM(T, name)                                                                        \
     static void name(const T *in, T *out, int P, sym y) {                                         \
         if (y.perm[0] == 0 && y.perm[1] == 1 && !y.flip[0] && !y.flip[1] && !y.flip[2]) { memcpy(out, in, (size_t)P * P * P * sizeof(T)); return; } \
-        int64_t stride[3] = {(int64_t)P * P, P, 1};                                                \
-        for (int z = 0; z < P; z++)                                                               \
-            for (int yy = 0; yy < P; yy++)                                                        \
-                for (int x = 0; x < P; x++) {                                                     \
-                    int i[3] = {z, yy, x};                                                        \
-                    int64_t q = 0;                                                                \
-                    for (int d = 0; d < 3; d++) q += stride[y.perm[d]] * (y.flip[d] ? P - 1 - i[d] : i[d]); \
-                    out[((int64_t)z * P + yy) * P + x] = in[q];                                   \
-                }                                                                                 \
+        const int64_t stride[3] = {(int64_t)P * P, P, 1};                                          \
+        int64_t *tab = malloc(3 * (size_t)P * sizeof *tab); if (!tab) abort();                     \
+        for (int d = 0; d < 3; d++) for (int i = 0; i < P; i++) tab[d * P + i] = stride[y.perm[d]] * (y.flip[d] ? P - 1 - i : i); \
+        const int64_t *tz = tab, *ty = tab + P, *tx = tab + 2 * P;                                 \
+        for (int zb = 0; zb < P; zb += 16) for (int yb = 0; yb < P; yb += 16) for (int xb = 0; xb < P; xb += 64) \
+            for (int z = zb; z < zb + 16 && z < P; z++) for (int yy = yb; yy < yb + 16 && yy < P; yy++) { \
+                const int64_t q0 = tz[z] + ty[yy]; T *o = out + ((int64_t)z * P + yy) * P;           \
+                const int xe = xb + 64 < P ? xb + 64 : P;                                          \
+                for (int x = xb; x < xe; x++) o[x] = in[q0 + tx[x]];                               \
+            }                                                                                     \
+        free(tab);                                                                                \
     }
 APPLY_SYM(uint8_t, sym_u8)
 
@@ -125,19 +129,21 @@ static batch alloc_batch(const sample_cfg *c) {
     size_t p3 = (size_t)c->P * c->P * c->P;
     batch b;
     b.x = c->xfmt ? nullptr : nn_host_alloc((size_t)c->B * 4 * p3 * sizeof(float));   /* pinned: the trainer uploads asynchronously */
-    b.x16 = c->xfmt ? nn_host_alloc((size_t)c->B * 4 * p3 * 2) : nullptr;
+    b.x16 = c->xfmt ? nn_host_alloc((size_t)c->B * (c->dir8 ? 1 : 4) * p3 * 2) : nullptr;
+    b.xd8 = c->xfmt && c->dir8 ? nn_host_alloc((size_t)c->B * 3 * p3) : nullptr;
     b.t = nn_host_alloc((size_t)c->B * NCH * p3);
     b.m = nn_host_alloc((size_t)c->B * p3);
     b.w = nn_host_alloc((size_t)c->B * NCH);
     b.src = malloc((size_t)c->B * sizeof(int16_t));
     b.level = malloc((size_t)c->B * sizeof(int8_t));
+    b.um = malloc((size_t)c->B * sizeof(float));
     b.corner = malloc((size_t)c->B * sizeof *b.corner);
     b.sheet = calloc((size_t)c->B, sizeof *b.sheet);
     b.band = c->band ? nn_host_alloc((size_t)c->B * p3) : nullptr;
     return b;
 }
 
-static void free_batch(batch *b) { if (b->band) nn_host_free(b->band); if (b->x) nn_host_free(b->x); if (b->x16) nn_host_free(b->x16); nn_host_free(b->t); nn_host_free(b->m); nn_host_free(b->w); free(b->src); free(b->level); free(b->corner); if (b->sheet) { sheet_batch_free(b->sheet[0]); free(b->sheet); } }
+static void free_batch(batch *b) { if (b->xd8) nn_host_free(b->xd8); if (b->band) nn_host_free(b->band); if (b->x) nn_host_free(b->x); if (b->x16) nn_host_free(b->x16); nn_host_free(b->t); nn_host_free(b->m); nn_host_free(b->w); free(b->src); free(b->level); free(b->um); free(b->corner); if (b->sheet) { sheet_batch_free(b->sheet[0]); free(b->sheet); } }
 
 /* Level choice for a source: restrict cfg.level_p to levels the CT has and every target of the source
    can provide (pyramid: same level; regions: levels 0..1). Returns -1 if nothing is usable. */
@@ -225,7 +231,7 @@ static int pick_level(sampler *sp, source *s, rng *r, int region_ch) {
         p[l] = sp->cfg.level_p[l];
         if (p[l] <= 0) continue;
         if (region_ch >= 0 && l > 1) { p[l] = 0; continue; }
-        if (l < s->min_level) { p[l] = 0; continue; }
+        if (l < s->min_level || (s->max_level >= 0 && l > s->max_level)) { p[l] = 0; continue; }
         if (!level_ok(sp, s, si, l, region_ch)) { p[l] = 0; continue; }
         tot += p[l];
     }
@@ -238,8 +244,8 @@ static int pick_level(sampler *sp, source *s, rng *r, int region_ch) {
 /* Fill patch i of batch b. Returns 0 on success, 1 if rejected (try again), -1 on I/O error. */
 static double tnow(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 #define PROF_MARK(stage) do { if (sp->prof) { double t_ = tnow(); atomic_fetch_add(&sp->prof_ns[stage], (uint_fast64_t)((t_ - pt) * 1e9)); pt = t_; } } while (0)
-enum { PS_SRC, PS_LEVEL, PS_PICK, PS_PROBE, PS_READ, PS_STATS, PS_TARGETS, PS_DILATE, PS_SOFT, PS_TRUST, PS_ENCODE, PS_ZSCORE, PS_AUGMENT, PS_X16, PS_N };
-static const char *prof_names[PS_N] = {"src", "level", "pick", "probe", "ctread", "ctstats", "targets", "dilate", "soft", "trust", "encode", "zscore", "augment", "x16"};
+enum { PS_SRC, PS_LEVEL, PS_PICK, PS_PROBE, PS_READ, PS_STATS, PS_TARGETS, PS_DILATE, PS_SOFT, PS_TRUST, PS_ENCODE, PS_ZSCORE, PS_AUGMENT, PS_X16, PS_SCAN, PS_N };
+static const char *prof_names[PS_N] = {"src", "level", "pick", "probe", "ctread", "ctstats", "targets", "dilate", "soft", "trust", "encode", "zscore", "augment", "x16", "scan"};
 /* 3-4-5 chamfer distance (3 per voxel step) from the voxels of t that are annotated surface (0 < t < 255): two raster
    passes. Returns 0 (dm all CH_INF) when the patch has no surface. */
 #define CH_INF 60000
@@ -297,6 +303,7 @@ static double inv_ncdf(double p) {
 }
 static void ntab_init(void) { for (int i = 0; i < 65536; i++) g_ntab[i] = (float)inv_ncdf((i + 0.5) / 65536.0); }
 static inline uint16_t bf16_rn(float f) { uint32_t u; memcpy(&u, &f, 4); u += 0x7fffu + ((u >> 16) & 1u); return (uint16_t)(u >> 16); }
+static inline int8_t dir_q8(float v) { v = fminf(fmaxf(v * 127.f, -127.f), 127.f); return (int8_t)(v >= 0 ? v + .5f : v - .5f); }   /* cfg.dir8: a unit-vector component */
 /* The network input of one patch in one pass: channel 0 = z-scored CT with the intensity jitter (gain ia, offset ib,
    noise isg N(0,1)), channels 1..3 = the radial unit vector (source z component 0), all read through the cube
    symmetry y (output axis d reads source axis perm[d], reversed when flipped; vector channel 1 + d = (-1)^flip[d] *
@@ -304,7 +311,7 @@ static inline uint16_t bf16_rn(float f) { uint32_t u; memcpy(&u, &f, 4); u += 0x
    2 bf16). One rng draw per 4 voxels, as the old separate jitter pass. nrow: P floats of scratch. */
 static void write_x_aug(const uint8_t *ctu, int P, const int64_t o[3], float fmean, float fisd, int hasax, const float *cyz, const float *cxz,
                     sym y, int jitter, float ia, float ib, float isg, rng *r, float *nrow, int xfmt, float *X, uint16_t *H, const ct_aug_plan *ap, float *noise_row_state, float *noise_plane_state,
-                    const sheet_dataset *sheet,const double (*sheet_params)[4]) {
+                    const sheet_dataset *sheet,const double (*sheet_params)[4], int8_t *D) {
     pthread_once(&g_ntab_once, ntab_init);
     const size_t p3 = (size_t)P * P * P;
     const float sgn[3] = {y.flip[0] ? -1.f : 1.f, y.flip[1] ? -1.f : 1.f, y.flip[2] ? -1.f : 1.f};
@@ -340,15 +347,18 @@ static void write_x_aug(const uint8_t *ctu, int P, const int64_t o[3], float fme
                     v1=(float)((prior-sheet->center)/sheet->scale);
                 }
                 const size_t k = ko + x;
-                if (xfmt == 1) { _Float16 h0 = (_Float16)v0, h1 = (_Float16)v1, h2 = (_Float16)v2, h3 = (_Float16)v3; memcpy(&H[k], &h0, 2); memcpy(&H[p3 + k], &h1, 2); memcpy(&H[2 * p3 + k], &h2, 2); memcpy(&H[3 * p3 + k], &h3, 2); }
+                if (D) {   /* dir8: CT in 16 bits, the unit vector as int8 */
+                    if (xfmt == 1) { _Float16 h0 = (_Float16)v0; memcpy(&H[k], &h0, 2); } else H[k] = bf16_rn(v0);
+                    D[k] = dir_q8(v1); D[p3 + k] = dir_q8(v2); D[2 * p3 + k] = dir_q8(v3);
+                } else if (xfmt == 1) { _Float16 h0 = (_Float16)v0, h1 = (_Float16)v1, h2 = (_Float16)v2, h3 = (_Float16)v3; memcpy(&H[k], &h0, 2); memcpy(&H[p3 + k], &h1, 2); memcpy(&H[2 * p3 + k], &h2, 2); memcpy(&H[3 * p3 + k], &h3, 2); }
                 else if (xfmt == 2) { H[k] = bf16_rn(v0); H[p3 + k] = bf16_rn(v1); H[2 * p3 + k] = bf16_rn(v2); H[3 * p3 + k] = bf16_rn(v3); }
                 else { X[k] = v0; X[p3 + k] = v1; X[2 * p3 + k] = v2; X[3 * p3 + k] = v3; }
             }
         }
 }
 static void write_x(const uint8_t *ctu, int P, const int64_t o[3], float fmean, float fisd, int hasax, const float *cyz, const float *cxz,
-                    sym y, int jitter, float ia, float ib, float isg, rng *r, float *nrow, int xfmt, float *X, uint16_t *H) {
-    write_x_aug(ctu, P, o, fmean, fisd, hasax, cyz, cxz, y, jitter, ia, ib, isg, r, nrow, xfmt, X, H, nullptr, nullptr, nullptr,nullptr,nullptr);
+                    sym y, int jitter, float ia, float ib, float isg, rng *r, float *nrow, int xfmt, float *X, uint16_t *H, int8_t *D) {
+    write_x_aug(ctu, P, o, fmean, fisd, hasax, cyz, cxz, y, jitter, ia, ib, isg, r, nrow, xfmt, X, H, nullptr, nullptr, nullptr,nullptr,nullptr,D);
 }
 /* Continuous geometry uses source coordinates for CT, labels, q0 and the axis.
    Only valid source voxels are supervised: rotated cube corners are ignored.
@@ -359,50 +369,147 @@ static void write_spatial(const uint8_t *ctu,const uint8_t *target,const uint8_t
                          int hasax,const float *cy,const float *cx,sym sy,const spatial_aug *a,
                          float gain,float offset,float noise,rng *r,float *nrow,int xfmt,float *X,uint16_t *H,
                          const ct_aug_plan *ap,float *noise_row,float *noise_plane,
-                         const sheet_dataset *sheet,const double (*params)[4],float *appearance) {
+                         const sheet_dataset *sheet,const double (*params)[4],float *appearance,const uint8_t *tw,uint32_t *pk,int8_t *D) {
     pthread_once(&g_ntab_once,ntab_init);
-    size_t p3=(size_t)P*P*P; float *table=malloc(6*(size_t)P*sizeof *table);
+    size_t p3=(size_t)P*P*P; float *table=malloc(12*(size_t)P*sizeof *table);
     if (!table) abort();
     spatial_aug_tables(a,table);
+    /* the pull is separable: v[d] and jac[d] depend on output coordinate d only (spatial_aug_pull, same float operations) */
+    float *vt=table+6*(size_t)P,*jt=table+9*(size_t)P; const float c=.5f*(a->P-1),sc=(float)a->scale;
+    for (int d=0;d<3;d++) for (int u=0;u<P;u++) { vt[d*P+u]=u-c-table[d*a->P+u]; jt[d*P+u]=1.f/(1.f-table[(3+d)*a->P+u]); }
+    float Rf[3][3],Af[3][3]; for (int i=0;i<3;i++) for (int j=0;j<3;j++) { Rf[i][j]=(float)a->R[i][j]; Af[i][j]=(float)a->A[i][j]; }
+    int used[NCH],nused=0; for (int ch=0;ch<NCH;ch++) { if (!tw || tw[ch]) used[nused++]=ch; else memset(T+(size_t)ch*p3,0,p3); }   /* channels without a target stay 0 */
+    /* the input value of every source voxel once (the trilinear pull reads each one up to 8 times): ct_aug_value with a
+       filter, the plan's lut, or the plain z-score: the same float expression as per corner before */
     if (ap && ap->filter_mode) {
         for (int z=0;z<P;z++) for (int y=0;y<P;y++) for (int x=0;x<P;x++)
             appearance[((size_t)z*P+y)*P+x]=ct_aug_value(ap,ctu,P,z,y,x);
-    }
+    } else if (ap) { for (size_t j=0;j<p3;j++) appearance[j]=ap->lut[ctu[j]]; }
+    else for (size_t j=0;j<p3;j++) appearance[j]=((float)ctu[j]-mean)*isd;
+    /* mask and up to two target bytes of every source voxel in one word: one gather per corner (NCH == 2) */
+    { const uint8_t *ta=nused>=1?target+(size_t)used[0]*p3:mask,*tb=nused>=2?target+(size_t)used[1]*p3:mask;
+      for (size_t j=0;j<p3;j++) pk[j]=(uint32_t)(mask[j]!=0)|(uint32_t)ta[j]<<8|(uint32_t)tb[j]<<16; }
     const float sign[3]={sy.flip[0]?-1:1,sy.flip[1]?-1:1,sy.flip[2]?-1:1};
-    for (int z=0;z<P;z++) for (int y=0;y<P;y++) {
+    /* output tiles (TZ x TY x TX) keep the trilinear reads of a tile inside a small source neighbourhood (cube symmetries can
+       turn output x into source z, a plane stride per voxel): the noise rows of a z slab are drawn first, in the row order
+       of the untiled loop, so the rng sequence and every voxel's value are unchanged */
+    enum { TZ = 8, TY = 16, TX = 32 };
+    float *nslab=malloc((size_t)TZ*P*P*sizeof *nslab);
+    if (!nslab) abort();
+    for (int zb=0;zb<P;zb+=TZ) {
+    const int ze=zb+TZ<P?zb+TZ:P;
+    for (int z=zb;z<ze;z++) for (int y=0;y<P;y++) {
         for (int x=0;x+4<=P;x+=4) { uint64_t v=rnext(r); for (int j=0;j<4;j++) nrow[x+j]=g_ntab[(v>>(16*j))&65535]; }
         for (int x=P&~3;x<P;x++) nrow[x]=g_ntab[rnext(r)&65535];
         if (ap && ap->noise_rho>0) ct_aug_noise_row(ap,nrow,noise_row,noise_plane,P,z,y);
-        for (int x=0;x<P;x++) {
+        memcpy(nslab+((size_t)(z-zb)*P+y)*P,nrow,(size_t)P*sizeof *nrow);
+    }
+    for (int yb=0;yb<P;yb+=TY) for (int xb=0;xb<P;xb+=TX)
+    for (int z=zb;z<ze;z++) for (int y=yb;y<yb+TY && y<P;y++) {
+        const float *nr=nslab+((size_t)(z-zb)*P+y)*P;
+        const float v0=vt[z],v1=vt[P+y]; float s01[3];   /* the z and y terms of the pull, once per row */
+        for (int d=0;d<3;d++) s01[d]=Rf[0][d]*v0+Rf[1][d]*v1;
+        if (!sheet) {   /* the row segment as array passes the compiler vectorizes; the same float operations per voxel as below */
+            const int x0=xb,n=(xb+TX<P?xb+TX:P)-xb; const float jz=jt[z],jy=jt[P+y],Pm1=(float)(P-1);
+            float U[3][TX],V[3][TX],F[3][TX],CV[TX],TV[NCH][TX],O[4][TX]; int32_t BS[3][TX],IN[TX],VA[TX],J[TX];
+            if (a->affine) for (int i=0;i<n;i++) {
+                const float v2=vt[2*P+x0+i],w0=s01[0]+Rf[2][0]*v2,w1=s01[1]+Rf[2][1]*v2,w2=s01[2]+Rf[2][2]*v2;
+                for (int d=0;d<3;d++) U[d][i]=c+sc*(Af[d][0]*w0+Af[d][1]*w1+Af[d][2]*w2);
+            } else for (int i=0;i<n;i++) { const float v2=vt[2*P+x0+i]; for (int d=0;d<3;d++) U[d][i]=c+sc*(s01[d]+Rf[2][d]*v2); }
+            for (int d=0;d<3;d++) { float *dst=V[sy.perm[d]]; const float *src=U[d];
+                if (sy.flip[d]) for (int i=0;i<n;i++) dst[i]=Pm1-src[i]; else for (int i=0;i<n;i++) dst[i]=src[i]; }
+            for (int i=0;i<n;i++) IN[i]=(V[0][i]>=0)&(V[0][i]<=Pm1)&(V[1][i]>=0)&(V[1][i]<=Pm1)&(V[2][i]>=0)&(V[2][i]<=Pm1);
+            for (int d=0;d<3;d++) for (int i=0;i<n;i++) {   /* inside: (int)v capped at P-2, f = v - base, as before; outside: clamped, unused */
+                const float vc=fminf(fmaxf(V[d][i],0.f),Pm1); int bb=(int)vc; bb=bb>P-2?P-2:bb; BS[d][i]=bb; F[d][i]=vc-(float)bb; }
+            for (int i=0;i<n;i++) { CV[i]=0; VA[i]=1; J[i]=(BS[0][i]*P+BS[1][i])*P+BS[2][i]; }
+            for (int q=0;q<nused;q++) for (int i=0;i<n;i++) TV[q][i]=0;
+            const int32_t off[8]={0,1,P,P+1,P*P,P*P+1,P*P+P,P*P+P+1};
+            float Fm[3][TX]; for (int d=0;d<3;d++) for (int i=0;i<n;i++) Fm[d][i]=1-F[d][i];
+            for (int cc=0;cc<8;cc++) {   /* corner (bz, by, bx) = bits of cc; weight = g0 * g1 * g2 in the original order */
+                const float *g0=cc>>2?F[0]:Fm[0],*g1=(cc>>1)&1?F[1]:Fm[1],*g2=cc&1?F[2]:Fm[2]; const int32_t oc=off[cc];
+                if (nused<2) for (int i=0;i<n;i++) {
+                    const float weight=g0[i]*g1[i]*g2[i]; const int on=IN[i]&(weight>1e-7f);
+                    const int32_t j=J[i]+oc; const uint32_t w4=pk[j];
+                    VA[i]&=(!on)|(int)(w4&1u);
+                    CV[i]+=on?weight*appearance[j]:0.f;
+                    TV[0][i]+=on?weight*(float)((w4>>8)&255u):0.f;
+                } else for (int i=0;i<n;i++) {
+                    const float weight=g0[i]*g1[i]*g2[i]; const int on=IN[i]&(weight>1e-7f);
+                    const int32_t j=J[i]+oc; const uint32_t w4=pk[j];
+                    VA[i]&=(!on)|(int)(w4&1u);
+                    CV[i]+=on?weight*appearance[j]:0.f;
+                    TV[0][i]+=on?weight*(float)((w4>>8)&255u):0.f;
+                    TV[1][i]+=on?weight*(float)((w4>>16)&255u):0.f;
+                }
+            }
+            if (ap && !ap->filter_mode && P>1) for (int d=0;d<3;d++) for (int i=0;i<n;i++) CV[i]+=ap->shading[d]*(2*V[d][i]/(P-1)-1);
+            const size_t k0=((size_t)z*P+y)*P+x0;
+            for (int i=0;i<n;i++) { O[0][i]=IN[i]?gain*CV[i]+offset+noise*nr[x0+i]:0.f; M[k0+i]=(uint8_t)(IN[i]&VA[i]); }
+            for (int q=0;q<nused;q++) for (int i=0;i<n;i++) T[(size_t)used[q]*p3+k0+i]=IN[i]?(uint8_t)(TV[q][i]+.5f):0;
+            float cdy[3],cdx[3]; for (int d=0;d<3;d++) { cdy[d]=sy.perm[d]==1?sign[d]:0.f; cdx[d]=sy.perm[d]==2?sign[d]:0.f; }   /* discrete = sign * radial[perm] */
+            const float Ai[3][3]={{(float)a->Ainv[0][0],(float)a->Ainv[0][1],(float)a->Ainv[0][2]},{(float)a->Ainv[1][0],(float)a->Ainv[1][1],(float)a->Ainv[1][2]},{(float)a->Ainv[2][0],(float)a->Ainv[2][1],(float)a->Ainv[2][2]}};
+            const int aff=a->affine; const float hx=hasax?1.f:0.f;
+            for (int i=0;i<n;i++) {
+                const float frac=F[0][i]; const int b0=BS[0][i];
+                const float ayy=cy[b0]*(1-frac)+cy[b0+1]*frac,axx=cx[b0]*(1-frac)+cx[b0+1]*frac;
+                const float dy=(float)o[1]+V[1][i]-ayy,dx=(float)o[2]+V[2][i]-axx;
+                const float radius=sqrtf(dy*dy+dx*dx)+1e-6f, ry=hx*(dy/radius), rx=hx*(dx/radius);
+                float d0=cdy[0]*ry+cdx[0]*rx,d1=cdy[1]*ry+cdx[1]*rx,d2=cdy[2]*ry+cdx[2]*rx;
+                if (aff) { const float q0=Ai[0][0]*d0+Ai[0][1]*d1+Ai[0][2]*d2,q1=Ai[1][0]*d0+Ai[1][1]*d1+Ai[1][2]*d2,q2=Ai[2][0]*d0+Ai[2][1]*d1+Ai[2][2]*d2; d0=q0; d1=q1; d2=q2; }
+                const float t0=jz*(Rf[0][0]*d0+Rf[0][1]*d1+Rf[0][2]*d2),t1=jy*(Rf[1][0]*d0+Rf[1][1]*d1+Rf[1][2]*d2),t2=jt[2*P+x0+i]*(Rf[2][0]*d0+Rf[2][1]*d1+Rf[2][2]*d2);
+                float norm=1e-12f; norm+=t0*t0; norm+=t1*t1; norm+=t2*t2; norm=sqrtf(norm);
+                O[1][i]=IN[i]?t0/norm:0.f; O[2][i]=IN[i]?t1/norm:0.f; O[3][i]=IN[i]?t2/norm:0.f;
+            }
+            if (D) {
+                if (xfmt==1) { _Float16 *h=(_Float16 *)(H+k0); for (int i=0;i<n;i++) h[i]=(_Float16)O[0][i]; } else for (int i=0;i<n;i++) H[k0+i]=bf16_rn(O[0][i]);
+                for (int ch=1;ch<4;ch++) { int8_t *dd=D+(size_t)(ch-1)*p3+k0; for (int i=0;i<n;i++) dd[i]=dir_q8(O[ch][i]); }
+            } else for (int ch=0;ch<4;ch++) {
+                if (xfmt==1) { _Float16 *h=(_Float16 *)(H+(size_t)ch*p3+k0); for (int i=0;i<n;i++) h[i]=(_Float16)O[ch][i]; }
+                else if (xfmt==2) for (int i=0;i<n;i++) H[(size_t)ch*p3+k0+i]=bf16_rn(O[ch][i]);
+                else for (int i=0;i<n;i++) X[(size_t)ch*p3+k0+i]=O[ch][i];
+            }
+            continue;
+        }
+        for (int x=xb;x<xb+TX && x<P;x++) {
             size_t k=((size_t)z*P+y)*P+x;
-            float u[3],jac[3],v[3]; spatial_aug_pull(a,table,z,y,x,u,jac);
+            float u[3],v[3]; const float v2=vt[2*P+x];
+            const float jac[3]={jt[z],jt[P+y],jt[2*P+x]};
+            if (a->affine) {
+                float w[3]; for (int d=0;d<3;d++) w[d]=s01[d]+Rf[2][d]*v2;
+                for (int d=0;d<3;d++) u[d]=c+sc*(Af[d][0]*w[0]+Af[d][1]*w[1]+Af[d][2]*w[2]);
+            } else for (int d=0;d<3;d++) u[d]=c+sc*(s01[d]+Rf[2][d]*v2);
             for (int d=0;d<3;d++) v[sy.perm[d]]=sy.flip[d]?P-1-u[d]:u[d];
             float out[4]={0}; int inside=1;
             for (int d=0;d<3;d++) if (v[d]<0 || v[d]>P-1) inside=0;
-            for (int ch=0;ch<NCH;ch++) T[(size_t)ch*p3+k]=0;
-            M[k]=0;
-            if (inside) {
+            if (!inside) { for (int q=0;q<nused;q++) T[(size_t)used[q]*p3+k]=0; M[k]=0; }
+            else {
                 int base[3]; float f[3];
                 for (int d=0;d<3;d++) { base[d]=(int)v[d]; if (base[d]>=P-1) base[d]=P-2; f[d]=v[d]-base[d]; }
                 float tv[NCH]={0},cv=0; int valid=1;
-                for (int bz=0;bz<2;bz++) for (int by=0;by<2;by++) for (int bx=0;bx<2;bx++) {
-                    float weight=(bz?f[0]:1-f[0])*(by?f[1]:1-f[1])*(bx?f[2]:1-f[2]);
-                    if (weight<=1e-7f) continue;
-                    size_t j=((size_t)(base[0]+bz)*P+base[1]+by)*P+base[2]+bx;
-                    valid &= mask[j]!=0;
-                    float val=ap && ap->filter_mode?appearance[j]:ap?ap->lut[ctu[j]]:((float)ctu[j]-mean)*isd;
-                    cv+=weight*val;
-                    for (int ch=0;ch<NCH;ch++) tv[ch]+=weight*target[(size_t)ch*p3+j];
+                {   /* the 8 corners unrolled, branch-free: a corner of weight <= 1e-7 adds +0 and does not need a mask */
+                    const size_t P2=(size_t)P*P,j0=(size_t)base[0]*P2+(size_t)base[1]*P+base[2];
+                    const size_t off[8]={0,1,(size_t)P,(size_t)P+1,P2,P2+1,P2+P,P2+P+1};
+                    const float g0[2]={1-f[0],f[0]},g1[2]={1-f[1],f[1]},g2[2]={1-f[2],f[2]};
+                    const uint8_t *t0=target+(size_t)used[0]*p3;
+                    for (int cc=0;cc<8;cc++) {
+                        const float weight=g0[cc>>2]*g1[(cc>>1)&1]*g2[cc&1];
+                        const size_t j=j0+off[cc]; const int on=weight>1e-7f;
+                        valid &= !on | (mask[j]!=0);
+                        cv+=on?weight*appearance[j]:0.f;
+                        if (nused==1) tv[0]+=on?weight*t0[j]:0.f;
+                        else for (int q=0;q<nused;q++) tv[q]+=on?weight*target[(size_t)used[q]*p3+j]:0.f;
+                    }
                 }
                 if (ap && !ap->filter_mode && P>1) for (int d=0;d<3;d++) cv+=ap->shading[d]*(2*v[d]/(P-1)-1);
-                out[0]=gain*cv+offset+noise*nrow[x]; M[k]=(uint8_t)valid;
-                for (int ch=0;ch<NCH;ch++) T[(size_t)ch*p3+k]=(uint8_t)lroundf(tv[ch]);
+                out[0]=gain*cv+offset+noise*nr[x]; M[k]=(uint8_t)valid;
+                for (int q=0;q<nused;q++) T[(size_t)used[q]*p3+k]=(uint8_t)(tv[q]+.5f);   /* tv in [0, 255]: lroundf */
                 float frac=f[0],ayy=cy[base[0]]*(1-frac)+cy[base[0]+1]*frac;
                 float axx=cx[base[0]]*(1-frac)+cx[base[0]+1]*frac;
                 float dy=(float)o[1]+v[1]-ayy,dx=(float)o[2]+v[2]-axx;
                 float radius=sqrtf(dy*dy+dx*dx)+1e-6f;
                 float radial[3]={0,hasax?dy/radius:0,hasax?dx/radius:0},discrete[3],transported[3];
                 for (int d=0;d<3;d++) discrete[d]=sign[d]*radial[sy.perm[d]];
+                if (a->affine) { float q[3]; for (int d=0;d<3;d++) q[d]=(float)a->Ainv[d][0]*discrete[0]+(float)a->Ainv[d][1]*discrete[1]+(float)a->Ainv[d][2]*discrete[2]; memcpy(discrete,q,sizeof q); }
                 float norm=1e-12f;
                 for (int d=0;d<3;d++) { transported[d]=jac[d]*((float)a->R[d][0]*discrete[0]+(float)a->R[d][1]*discrete[1]+(float)a->R[d][2]*discrete[2]); norm+=transported[d]*transported[d]; }
                 norm=sqrtf(norm); for (int d=0;d<3;d++) out[1+d]=transported[d]/norm;
@@ -412,14 +519,16 @@ static void write_spatial(const uint8_t *ctu,const uint8_t *target,const uint8_t
                     out[1]=(float)((prior-sheet->center)/sheet->scale);
                 }
             }
-            for (int ch=0;ch<4;ch++) {
+            if (D) { if (xfmt==1) { _Float16 h=(_Float16)out[0]; memcpy(H+k,&h,2); } else H[k]=bf16_rn(out[0]); for (int ch=1;ch<4;ch++) D[(size_t)(ch-1)*p3+k]=dir_q8(out[ch]); }
+            else for (int ch=0;ch<4;ch++) {
                 size_t j=(size_t)ch*p3+k;
                 if (xfmt==1) { _Float16 h=(_Float16)out[ch]; memcpy(H+j,&h,2); }
                 else if (xfmt==2) H[j]=bf16_rn(out[ch]); else X[j]=out[ch];
             }
         }
     }
-    free(table);
+    }
+    free(nslab); free(table);
 }
 /* Keep complete sparse terms only. q/q0 are material scalar coordinates and
    are invariant under reflection/deformation; coordinates use the same warp
@@ -573,7 +682,7 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
         } else if (s->tgt_key[ch]) {
             z3 *tz = source_tgt_for_level(s, ch, l, nullptr);
             if (!tz) { if (c->cover) return -1; memset(dst, 0, p3); continue; }
-            if (c->erode) {
+            if (c->erode && !s->tgt_prob[ch] && l == 0) {
                 int64_t eo[3] = {o[0]-1, o[1]-1, o[2]-1}, en[3] = {P+2, P+2, P+2};
                 uint8_t *haloed = big + p3;   /* existing (2P)^3 scratch, P >= 2 */
                 if (source_read_target(s, ch, l, eo, en, haloed, 1)) return -1;
@@ -590,7 +699,7 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
         int D = c->dilate >> l; if (D < 1) D = 1;
         uint8_t *tmp2 = big + 2 * p3;
         for (int ch = 0; ch < NCH; ch++) {
-            if (!w[ch]) continue;
+            if (!w[ch] || s->tgt_prob[ch]) continue;
             uint8_t *dst = ttmp + (size_t)ch * p3;
             for (int pass = 0; pass < 3; pass++) {
                 size_t str = pass == 0 ? 1 : pass == 1 ? (size_t)P : (size_t)P * P;
@@ -613,14 +722,14 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
     int dm_ch = -1, dm_any = 0;                   /* channel the map currently holds, and whether that channel had any surface */
 #define CHAMFER_FOR(ch_) do { if (dm_ch != (ch_)) { dm_ch = (ch_); dm_any = chamfer345(ttmp + (size_t)(ch_) * p3, dm, P); } } while (0)
     if (soft0 > 0 && region_ch < 0) {
-        float sigma = soft0 / (float)(1 << l); if (sigma < 0.75f) sigma = 0.75f;
+        float sigma = (c->soft_um ? soft0 / (float)s->um : soft0) / (float)(1 << l); if (sigma < 0.75f) sigma = 0.75f;
         float shift=morph/(float)(1<<l);
         /* exp(-(d/3)^2 / (2 sigma^2)) tabulated over the chamfer distance (3 per voxel); beyond dcut it rounds to 0 */
         int dcut = (int)(3.f * (sigma * 4.5f+fmaxf(0,shift))) + 1; if (dcut > 4000) dcut = 4000;
         uint8_t *etab = big + 4 * p3;
         for (int d = 0; d <= dcut; d++) { float df = fmaxf(0,d / 3.f-shift); int t = (int)(254.f * expf(-0.5f * df * df / (sigma * sigma)) + 0.5f); etab[d] = (uint8_t)(t > 254 ? 254 : t); }
         for (int ch = 0; ch < NCH; ch++) {
-            if (!w[ch]) continue;
+            if (!w[ch] || s->tgt_prob[ch]) continue;
             uint8_t *dst = ttmp + (size_t)ch * p3;
             CHAMFER_FOR(ch);
             if (!dm_any) continue;   /* no surface in the patch: nothing to soften */
@@ -632,7 +741,7 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
     if (s->trust_band > 0) {
         int R = s->trust_band >> l; if (R < 1) R = 1;
         for (int ch = 0; ch < NCH; ch++) {
-            if (!w[ch]) continue;
+            if (!w[ch] || s->tgt_prob[ch]) continue;
             uint8_t *dst = ttmp + (size_t)ch * p3;
             CHAMFER_FOR(ch);   /* measured from the hard surface (the soft values added above are not surface) */
             if (!dm_any) { for (size_t k = 0; k < p3; k++) if (dst[k] == 0) dst[k] = 255; continue; }   /* nothing annotated: ignore all background */
@@ -656,6 +765,15 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
     double scale = (double)(1 << l);
     float *cyz = xtmp, *cxz = xtmp + P, *nrow = xtmp + 2 * P;
     for (int z = 0; z < P; z++) { double cy, cx; axis_at(&s->ax, (double)(o[0] + z) * scale, &cy, &cx); cyz[z] = (float)(cy / scale); cxz[z] = (float)(cx / scale); }
+    if (c->augment && scan_aug_enabled(&c->scan)) {   /* scanner domains on the source grid; the per-patch z-score follows them, as at inference */
+        PROF_MARK(PS_ZSCORE);
+        if (scan_aug_apply(&c->scan, rnext(r), ctu, ttmp, NCH, ign, P, o, cyz, cxz, s->ax.n > 0, m->chunk, !c->sheet && !c->band, big + p3)) {
+            sum = sq = 0;
+            for (size_t k = 0; k < p3; k++) { sum += ctu[k]; sq += (double)ctu[k] * ctu[k]; }
+            mean = sum / (double)p3; var = sq / (double)p3 - mean * mean; sd = sqrt(var > 0 ? var : 0) + 1e-3;
+        }
+        PROF_MARK(PS_SCAN);
+    }
     uint8_t *mask = big + 9 * p3;   /* ign lives here: fold CT > 0 into it */
     for (size_t k = 0; k < p3; k++) mask[k] = ctu[k] != 0 && !mask[k];
     PROF_MARK(PS_ZSCORE);
@@ -691,32 +809,43 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
         if (ap.noise_rho > 0) isg = ap.noise_sigma;
     }
     spatial_aug spatial={0};
-    if (c->augment && c->geometry_augment) spatial_aug_make(&spatial,rnext(r),P,c->rotate_degrees,c->rotate_p,c->elastic,c->elastic_p);
+    /* band-labelled native samples keep the exact voxel grid (the band field is not interpolated) */
+    const int band_sample = c->band && s->band && l == 0;
+    if (c->augment && c->geometry_augment && s->geometry && !band_sample) {
+        spatial_aug_make(&spatial,rnext(r),P,c->rotate_degrees,c->rotate_p,c->elastic,c->elastic_p);
+        if (c->zoom_p > 0 && c->zoom_min > 0 && c->zoom_min < 1 && runif(r) < c->zoom_p) spatial_aug_zoom(&spatial, exp(runif(r) * log(c->zoom_min)));
+        if (c->affine_p > 0 && c->scan.strength > 0 && runif(r) < c->affine_p)
+            spatial_aug_affine(&spatial, rnext(r), c->affine_aniso * c->scan.strength, c->affine_shear * c->scan.strength);
+    }
+    b->um[i] = (float)(s->um * (double)(1 << l) * (spatial.active ? spatial.scale * cbrt(spatial.det) : 1.0));   /* affine: the volume-preserving voxel size */
     if (!spatial.active) {
-        for (int ch = 0; ch < NCH; ch++) sym_u8(ttmp + (size_t)ch * p3, T + (size_t)ch * p3, P, y);
+        for (int ch = 0; ch < NCH; ch++) { if (w[ch]) sym_u8(ttmp + (size_t)ch * p3, T + (size_t)ch * p3, P, y); else memset(T + (size_t)ch * p3, 0, p3); }   /* no target: all 0 */
         sym_u8(mask, M, P, y);
     }
     if (c->band) {   /* band labels: computed on the source grid, unknown on CT air, then the same symmetry as CT and targets */
-        if (!s->band || l != 0 || spatial.active) return -1;
-        uint8_t *bw = malloc(p3);
-        if (!bw || band_window(s, o, P, bw)) { free(bw); return -1; }
-        for (size_t k = 0; k < p3; k++) if (!ctu[k]) bw[k] = BAND_UNKNOWN;
-        sym_u8(bw, b->band + (size_t)i * p3, P, y);
-        free(bw);
+        if (!band_sample || spatial.active) memset(b->band + (size_t)i * p3, BAND_UNKNOWN, p3);   /* no band labels: affinities unsupervised */
+        else {
+            uint8_t *bw = malloc(p3);
+            if (!bw || band_window(s, o, P, bw)) { free(bw); return -1; }
+            for (size_t k = 0; k < p3; k++) if (!ctu[k]) bw[k] = BAND_UNKNOWN;
+            sym_u8(bw, b->band + (size_t)i * p3, P, y);
+            free(bw);
+        }
     }
     PROF_MARK(PS_AUGMENT);
     float *X = c->xfmt ? nullptr : b->x + (size_t)i * 4 * p3;
-    uint16_t *H = c->xfmt ? b->x16 + (size_t)i * 4 * p3 : nullptr;
+    uint16_t *H = c->xfmt ? b->x16 + (size_t)i * (c->dir8 ? 1 : 4) * p3 : nullptr;
+    int8_t *D8 = c->xfmt && c->dir8 && !c->sheet ? b->xd8 + (size_t)i * 3 * p3 : nullptr;   /* the sheet task's channel 1 is not a unit vector */
     double (*params)[4]=nullptr;
     if (c->sheet) {
         params=malloc((size_t)P*sizeof *params);
         for (int sz=0;sz<P;sz++) sheet_parameters(c->sheet,o[0]+sz,params[sz]);
     }
     if (spatial.active) write_spatial(ctu,ttmp,mask,T,M,P,o,(float)mean,(float)(1.0/sd),s->ax.n>0,cyz,cxz,y,&spatial,
-            ia,ib,isg,r,nrow,c->xfmt,X,H,app,noise_state,noise_state?noise_state+P:nullptr,c->sheet,params,(float *)(big+5*p3));
+            ia,ib,isg,r,nrow,c->xfmt,X,H,app,noise_state,noise_state?noise_state+P:nullptr,c->sheet,params,(float *)(big+5*p3),w,(uint32_t *)(big+p3),D8);
     else if (app || c->sheet) write_x_aug(ctu, P, o, (float)mean, (float)(1.0 / sd), s->ax.n > 0, cyz, cxz, y, c->augment != 0, ia, ib, isg, r, nrow, c->xfmt,
-            X, H, app, noise_state, noise_state ? noise_state + P : nullptr,c->sheet,params);
-    else write_x(ctu, P, o, (float)mean, (float)(1.0 / sd), s->ax.n > 0, cyz, cxz, y, c->augment != 0, ia, ib, isg, r, nrow, c->xfmt, X, H);
+            X, H, app, noise_state, noise_state ? noise_state + P : nullptr,c->sheet,params,D8);
+    else write_x(ctu, P, o, (float)mean, (float)(1.0 / sd), s->ax.n > 0, cyz, cxz, y, c->augment != 0, ia, ib, isg, r, nrow, c->xfmt, X, H, D8);
     free(params);
     if (c->sheet) {
         sheet_batch_free(b->sheet[i]);
@@ -902,15 +1031,14 @@ int sources_prefetch(sources *S, int maxlev, int nthreads, double fraction) {
 }
 sampler *sampler_start(sources *S, const sample_cfg *cfg) {
     if (!S || S->n <= 0 || cfg->P <= 0 || cfg->B <= 0 || cfg->nworkers <= 0 || cfg->nbuf <= 0) { fprintf(stderr, "sampler: invalid sources, patch, batch, workers or buffer count\n"); return nullptr; }
+    if (cfg->dir8 && (!cfg->xfmt || cfg->sheet)) { fprintf(stderr, "sampler: dir8 needs 16-bit input (xfmt) and no sheet task\n"); return nullptr; }
     if (cfg->erode < 0 || cfg->erode > 1 || (cfg->erode && (cfg->P < 2 || cfg->dilate || cfg->sheet))) {
         fprintf(stderr, "sampler: erode must be 0 or 1, with P >= 2, no dilation and no winding task\n"); return nullptr;
     }
     if (cfg->erode) {
-        for (int l = 1; l < MAXLEV; l++) if (!cfg->cover && cfg->level_p[l] > 0) {
-            fprintf(stderr, "sampler: erosion requires native level 0 (--levels 1,0,0,0)\n"); return nullptr;
-        }
+        /* erosion applies to binary targets at native level 0 only (coarser levels and "prob" targets are read as stored) */
         for (int i = 0; i < S->n; i++) for (int ch = 0; ch < NCH; ch++) {
-            if (S->src[i].reg[ch] || (S->src[i].tgt_key[ch] && !S->src[i].tgt_binary[ch])) {
+            if (S->src[i].reg[ch] || (S->src[i].tgt_key[ch] && !S->src[i].tgt_binary[ch] && !S->src[i].tgt_prob[ch])) {
                 fprintf(stderr, "sampler: erosion requires binary pyramid targets\n"); return nullptr;
             }
         }

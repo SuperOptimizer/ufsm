@@ -4,6 +4,7 @@
 #include "sources.h"
 #include "cover.h"
 #include "sheet.h"
+#include "scan_augment.h"
 #include <stdint.h>
 
 typedef struct {
@@ -20,6 +21,7 @@ typedef struct {
     int dilate;              /* > 0: dilate the surface band of pyramid targets by this many level-0 voxels (curriculum for thin targets) */
     int erode;               /* 0 or 1: native-grid face-neighbour erosion of binary targets before softening */
     float soft;              /* > 0: soft ridge target exp(-(d/soft)^2/2) around the surface (d = chamfer distance in level-0 voxels) */
+    int soft_um;             /* 1: soft (and its annealed values) is in um, the same physical width for every source and level */
     int snap;                /* align training windows to the CT chunk grid (3x fewer chunks decoded per window) */
     int deterministic;       /* 1: batch j holds samples j*B .. j*B+B-1, each drawn with its own rng seeded by (seed, index), and
                                 batches come out in order: runs with the same seed see the same data regardless of thread timing */
@@ -31,19 +33,29 @@ typedef struct {
     float axis_jitter;      /* max auxiliary axis error in native voxels, p=.1, angle capped at 2 degrees */
     int geometry_augment;  /* all 48 symmetries, including Z flips, with registered continuous warps */
     float rotate_degrees, rotate_p, elastic, elastic_p;
+    float zoom_min, zoom_p;  /* zoom-in augmentation: with probability zoom_p the window shows a 1/z of the read cube, z uniform
+                                in log over [zoom_min, 1] (zoom_min < 1), so the effective voxel size is level size * z;
+                                needs geometry_augment; sources with "geometry": 0 and band-labelled native samples are never zoomed */
     float label_morph, label_morph_p; /* signed soft-band distance offset; centreline preserved */
+    scan_aug_cfg scan;       /* scanner-domain CT augmentation on the source grid (src/scan_augment.h); every p 0 = off */
+    float affine_p, affine_aniso, affine_shear; /* anisotropic scale (log, per axis) + shear, magnitudes x scan.strength;
+                                needs geometry_augment, same sources as the zoom */
     const sheet_dataset *sheet; /* borrowed sparse geometry, native-level B=1 task */
     int band;                /* 1: fill batch.band from each source's band target (task band_affinity, native level, no geometry warp) */
+    int dir8;                /* with xfmt: batch.x16 holds channel 0 (CT) only and batch.xd8 the radial unit vector (channels 1..3) as
+                                round(127 v) int8; the trainer expands it on the device (pinned slot memory 8 -> 5 bytes per voxel) */
 } sample_cfg;
 
 typedef struct {
     float *x;                /* B x 4 x P^3: z-scored CT, radial z (0), radial y, radial x; nullptr when cfg.xfmt */
-    uint16_t *x16;           /* the same in 16 bits when cfg.xfmt (then the only copy), else nullptr */
+    uint16_t *x16;           /* the same in 16 bits when cfg.xfmt (then the only copy), else nullptr; cfg.dir8: B x 1 x P^3 (CT only) */
+    int8_t *xd8;             /* cfg.dir8: B x 3 x P^3 radial unit vector * 127, else nullptr */
     uint8_t *t;              /* B x NCH x P^3: target probability * 255 (from the label encoding) */
     uint8_t *m;              /* B x P^3: 1 where CT > 0 and the label is not ignore (loss mask) */
     uint8_t *w;              /* B x NCH: 1 if channel has a teacher in this sample */
     int16_t *src;            /* B: source index */
     int8_t *level;           /* B: CT level */
+    float *um;               /* B: effective voxel size of the input (source um * 2^level * zoom) */
     int64_t (*corner)[3];    /* B: level-0 corner */
     sheet_batch **sheet;     /* B sparse records; null for legacy task */
     uint8_t *band;           /* B x P^3 band per voxel (src/band.h: 1/18-turn steps mod 252, 255 unknown) when cfg.band */

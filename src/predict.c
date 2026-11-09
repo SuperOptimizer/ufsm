@@ -125,7 +125,11 @@ int cmd_predict(int argc, char **argv) {
                         "       [--reference reference.json]   required for a surface_winding checkpoint, native level 0\n"
                         "       [--grid-origin z,y,x]   anchor tile interiors in selected-level CT voxels, independent of the output box\n"
                         "       [--gpus 0,1]   one worker per GPU over the shards of the same output (needs --box)\n"
-                        "       [--channel 0]   output channel written (band_affinity checkpoints: 1..6 = affinities z1 y1 x1 z8 y8 x8)\n");
+                        "       [--resume 1]   skip the output shards an earlier run of the same command already wrote\n"
+                        "       [--occupancy FILE]   uint8 per output shard (z-major over the box), 0 = skipped (no CT)\n"
+                        "       [--norm MEAN,SD]   fixed input normalization (uint8 CT units) instead of each window's own mean / sd: no seams between windows, one calibration for a whole scroll\n"
+                        "       [--channel 0]   output channel written (band_affinity checkpoints: 1..6 = affinities z1 y1 x1 z8 y8 x8)\n"
+                        "       [--radial-sign 1|-1]   -1 reverses the direction input (the CT is unchanged): a recto model then marks the verso face\n");
         fprintf(stderr, "  Default window: shard + 32 with halo 16 (one window per shard) when it fits the GPU, else 288 with halo 8. For exact shard tiling, window - 2*halo should divide the shard size: 544 with halo 16 gives 512; 288 with halo 16 gives 256. Validate window and halo with the checkpoint.\n");
         return 2;
     }
@@ -136,8 +140,13 @@ int cmd_predict(int argc, char **argv) {
     const int win_given = *opt(argc, argv, "--window", "") || *opt(argc, argv, "--halo", "");
     int nthreads = atoi(opt(argc, argv, "--threads", "16"));
     const int use_ema = atoi(opt(argc, argv, "--ema", "1")) != 0;
+    const double radial_sign = atof(opt(argc, argv, "--radial-sign", "1"));   /* -1: reversed direction input (a recto model then marks the verso face) */
+    if (radial_sign != 1 && radial_sign != -1) { fprintf(stderr, "predict: --radial-sign must be 1 or -1\n"); return 2; }
     const int out_ch = atoi(opt(argc, argv, "--channel", "0"));   /* output channel to write (band_affinity: 1..6 = affinities) */
     float q = (float)atof(opt(argc, argv, "--q", "8"));
+    double norm_mean = 0, norm_sd = 0;   /* --norm: fixed z-score of the input in place of the per-window statistics */
+    { const char *nm = opt(argc, argv, "--norm", nullptr);
+      if (nm && (sscanf(nm, "%lf,%lf", &norm_mean, &norm_sd) != 2 || !(norm_sd > 0))) { fprintf(stderr, "--norm needs MEAN,SD with SD > 0\n"); return 2; } }
     const char *cache = opt(argc, argv, "--cache", nullptr), *axisf = opt(argc, argv, "--axis", nullptr);
     const char *grid = opt(argc, argv, "--grid-origin", nullptr);
     int64_t grid_origin[3] = {0, 0, 0}; char grid_attrs[128] = "";
@@ -238,6 +247,10 @@ int cmd_predict(int argc, char **argv) {
     if (unet_load(u, ckpt) < 0) { fprintf(stderr, "cannot load %s\n", ckpt); return 1; }
     unet_use_ema(u, use_ema);
     if (!sheet_task) unet_set_head_channels(u, out_ch, 1);   /* only the written logit channel (desk widths: -24 B per window voxel) */
+    if (cfg.scale_cond) {   /* voxel-size conditioning: the CT level's voxel size, or --scale-um to override */
+        const double sum_ = atof(opt(argc, argv, "--scale-um", "0"));
+        unet_set_scale(u, sum_ > 0 ? sum_ : um * (1 << level));
+    }
     store *s = store_open(root);
     char ak[1200];
     snprintf(ak, sizeof ak, "%s/level%d", key, level);
@@ -299,12 +312,23 @@ int cmd_predict(int argc, char **argv) {
     int64_t ns[3];
     for (int d = 0; d < 3; d++) ns[d] = (bn[d] + shard - 1) / shard;
     double t0 = now(); long ntiles = 0, nskip = 0;
+    const int skip_existing = atoi(opt(argc, argv, "--resume", "0")) != 0; long nresumed = 0;
+    uint8_t *occ = nullptr;   /* --occupancy FILE: uint8 per output shard (z-major, ceil(box/shard) each axis), 0 = no CT, skipped */
+    { const char *of = opt(argc, argv, "--occupancy", nullptr);
+      if (of) { size_t n = (size_t)ns[0] * ns[1] * ns[2]; FILE *f = fopen(of, "rb"); occ = malloc(n);
+                if (!f || fread(occ, 1, n, f) != n || fgetc(f) != EOF) { fprintf(stderr, "--occupancy %s: need exactly %zu bytes (%lld x %lld x %lld shards)\n", of, n, (long long)ns[0], (long long)ns[1], (long long)ns[2]); return 2; }
+                fclose(f); } }
     /* enumerate the tiles in shard order, then let the reader run ahead */
     reader_t rd = {0}; rd.ct = ct; rd.bo = bo; rd.W = W; rd.nthreads = nthreads;
     long cap = 0;
     for (int64_t sz = 0; sz < ns[0]; sz++) for (int64_t sy = 0; sy < ns[1]; sy++) for (int64_t sx = 0; sx < ns[2]; sx++) {
         int64_t so[3] = {sz * shard, sy * shard, sx * shard}, se[3], first[3];
         if (ngpu > 1 && (((sz * ns[1] + sy) * ns[2] + sx) % ngpu) != part) continue;   /* another worker's shard */
+        if (occ && !occ[(sz * ns[1] + sy) * ns[2] + sx]) continue;   /* --occupancy: a shard without CT */
+        if (skip_existing) {   /* --resume 1: shards already written by an earlier run of the same command (written by rename, so complete) */
+            char sp[1500]; snprintf(sp, sizeof sp, "%s/c/%lld/%lld/%lld", ldir, (long long)sz, (long long)sy, (long long)sx);
+            if (access(sp, F_OK) == 0) { nresumed++; continue; }
+        }
         for (int d = 0; d < 3; d++) se[d] = so[d] + shard < bn[d] ? so[d] + shard : bn[d];
         for (int d = 0; d < 3; d++) {
             int64_t phase = grid ? (bo[d] + so[d] - grid_origin[d]) % stride : 0;
@@ -367,6 +391,7 @@ int cmd_predict(int argc, char **argv) {
             }
             if (nz == 0) { nskip++; pthread_mutex_lock(&rd.mu); atomic_store(&rd.consumed, i + 1); pthread_cond_broadcast(&rd.cv); pthread_mutex_unlock(&rd.mu); continue; }
             double mean = sum / (double)w3, var = sq / (double)w3 - mean * mean, sd = sqrt(var > 0 ? var : 0) + 1e-3;
+            if (norm_sd > 0) { mean = norm_mean; sd = norm_sd; }
             for (int z = 0; z < W; z++) {   /* window origin relative to the axis at this slice (double on the host, small in float) */
                 double cy, cx;
                 axis_at(&ax, (double)(o[0] + z) * scale, &cy, &cx);
@@ -378,7 +403,7 @@ int cmd_predict(int argc, char **argv) {
             nn_h2d(dyd, dyo, 2 * (size_t)W * sizeof(float));
             if (pprof) { nn_sync(); p_h2d += now() - pt; pt = now(); }
             if (xd_shared && unet_input_scratch(u, 4 * w3 * 2) != xd) { fprintf(stderr, "predict: the network was rebuilt under its input scratch\n"); return 1; }
-            nn_pred_input(ctd, W, (float)mean, (float)(1.0 / sd), dyd, dxd, ax.n > 0, xd, h16);
+            nn_pred_input(ctd, W, (float)mean, (float)(1.0 / sd), dyd, dxd, ax.n > 0 ? (int)radial_sign : 0, xd, h16);
             if (sheet_task) {
                 for (int z=0;z<W;z++) { double a[4]; sheet_parameters(sheet,o[0]+z,a); sheet_rows[4*z]=(float)(o[1]-a[0]); sheet_rows[4*z+1]=(float)(o[2]-a[1]); sheet_rows[4*z+2]=(float)(1/a[2]); sheet_rows[4*z+3]=(float)a[3]; }
                 nn_sheet_input(xd,W,sheet_rows,(float)sheet->center,(float)sheet->scale,h16);
@@ -438,7 +463,7 @@ int cmd_predict(int argc, char **argv) {
     pthread_join(rth, nullptr);
     for (int k = 0; k < NSLOT; k++) { if (gpath) nn_host_free(rd.buf[k]); else free(rd.buf[k]); }
     free(rd.tiles);
-    fprintf(stderr, "\rshard %lld/%lld  %ld tiles (%ld air)  %.0fs   \n", (long long)(ns[0] * ns[1] * ns[2]), (long long)(ns[0] * ns[1] * ns[2]), ntiles, nskip, now() - t0);
+    fprintf(stderr, "\rshard %lld/%lld  %ld tiles (%ld air, %ld shards resumed)  %.0fs   \n", (long long)(ns[0] * ns[1] * ns[2]), (long long)(ns[0] * ns[1] * ns[2]), ntiles, nskip, nresumed, now() - t0);
     z3w_close(w);
     if (ngpu > 1) { fprintf(stderr, "gpu %d: %ld tiles in %.0fs\n", gpu, ntiles, now() - t0); z3_close(ct); store_close(s); unet_free(u); return 0; }   /* worker: the parent builds the pyramid */
     for (int l = 1; l < nlev; l++) if (pyramid_build_level(out, um_l, l, bn, shard, q, 0, nthreads, attrs)) return 1;
