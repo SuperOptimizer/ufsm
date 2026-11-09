@@ -212,7 +212,7 @@ static batch alloc_batch(const sample_cfg *c) {
     b.ct8 = c->gpu_aug ? halloc((size_t)c->B * p3) : nullptr; b.aug = c->gpu_aug ? halloc((size_t)c->B * sizeof(scan_ct_rec)) : nullptr;
     b.t = c->pack_tm ? nullptr : halloc((size_t)c->B * (c->restore == 1 ? 1 : NCH) * p3);   /* (task restore: the clean CT alone; real pairs: target + input crop) */
     b.m = c->pack_tm || c->restore ? nullptr : halloc((size_t)c->B * p3);
-    b.tm = c->pack_tm ? halloc((size_t)c->B * p3) : nullptr;   /* one code byte per voxel instead of NCH + 1 */
+    b.tm = c->pack_tm && !(c->slot_skip & 1) ? halloc((size_t)c->B * p3) : nullptr;   /* one code byte per voxel instead of NCH + 1 */
     b.w = halloc((size_t)c->B * NCH);
     b.src = malloc((size_t)c->B * sizeof(int16_t));
     b.level = malloc((size_t)c->B * sizeof(int8_t));
@@ -221,7 +221,7 @@ static batch alloc_batch(const sample_cfg *c) {
     b.sheet = calloc((size_t)c->B, sizeof *b.sheet);
     b.band = c->band ? halloc((size_t)c->B * p3) : nullptr;
     b.side = c->side ? halloc((size_t)c->B * p3) : nullptr;
-    b.pm = c->pmask ? halloc((size_t)c->B * p3) : nullptr;
+    b.pm = c->pmask && !(c->slot_skip & 2) ? halloc((size_t)c->B * p3) : nullptr;
     b.wind = c->cond ? halloc((size_t)c->B * p3) : nullptr;
     b.pap = c->pap_head ? halloc((size_t)c->B * p3) : nullptr;
     b.w4 = c->wind4 ? halloc((size_t)c->B * p3) : nullptr;
@@ -2799,14 +2799,15 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
     uint8_t *Tw = nullptr;   /* (packed and warped: the warped targets and mask before packing) */
     uint8_t *TMd = nullptr;   /* packed, warped, CT-only, nothing else reading T / M: the warp writes the codes into the batch */
     const int lw = c->gpu_aug == 2 && spatial.active;   /* --gpu-aug 2: this window's labels warp on the device (source-grid labels in the batch) */
+    uint8_t *tmscr = nullptr;   /* (slot_skip 1: the packed codes the direct warp writes, discarded) */
     if (lw) {
         size_t bad = 0;
-        if (sample_pack_tm(ttmp, ttmp + p3, mask, p3, b->tm + (size_t)i * p3, &bad)) {
+        if (b->tm && sample_pack_tm(ttmp, ttmp + p3, mask, p3, b->tm + (size_t)i * p3, &bad)) {
             fprintf(stderr, "sampler: packed targets need hard 0 / 255 targets and a 0 / 1 mask (voxel %zu); train --pack-targets 0\n", bad);
             abort();
         }
     }
-    else if (c->pack_tm && spatial.active && c->gpu_input && !c->sheet && !c->pmask) TMd = b->tm + (size_t)i * p3;
+    else if (c->pack_tm && spatial.active && c->gpu_input && !c->sheet && !c->pmask) { TMd = b->tm ? b->tm + (size_t)i * p3 : (tmscr = tp_get(p3, 0)); if (!TMd) return -1; }
     else if (c->pack_tm && spatial.active) {
         if (!(Tw = tp_get((NCH + 1) * p3, 0))) return -1;
         T = Tw; M = Tw + NCH * p3;
@@ -2818,12 +2819,12 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
                     bad, ttmp[bad], ttmp[p3 + bad], mask[bad]);
             abort();
         }
-        sym_u8(mask, b->tm + (size_t)i * p3, Pz, P, y);
+        if (b->tm) sym_u8(mask, b->tm + (size_t)i * p3, Pz, P, y);
     } else if (!spatial.active) {
         for (int ch = 0; ch < NCH; ch++) sym_u8(ttmp + (size_t)ch * p3, T + (size_t)ch * p3, Pz, P, y);
         sym_u8(mask, M, Pz, P, y);
     }
-    if (c->pmask && !spatial.active) {   /* CT > 0 through the same symmetry (big + 2 P^3, the soft / trust distance map, is free here) */
+    if (c->pmask && !spatial.active && b->pm) {   /* CT > 0 through the same symmetry (big + 2 P^3, the soft / trust distance map, is free here) */
         uint8_t *pt = big + 2 * p3;
         for (size_t k = 0; k < p3; k++) pt[k] = ctu[k] != 0;
         sym_u8(pt, b->pm + (size_t)i * p3, Pz, P, y);
@@ -2938,7 +2939,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
                  app, noise_state, noise_state ? noise_state + P : nullptr, c->gpu_input);   /* the CT appearance plan in the row-vectorised writer (cubes) */
     if (c->gpu_input) rad_record((char *)b->rad + (size_t)i * NN_RAD_REC(Pz), o, Pz, P, s->ax.n > 0, y, cyz, cxz, &spatial);   /* the radial channels: on the device */
     if (c->axis_rec > 0) axis_record(b->axr + (size_t)i * SAMPLE_AXR(Pz > P ? Pz : P), o, Pz, P, s->ax.n > 0, y, cyz, cxz, &spatial, c->axis_rec);
-    free(params);
+    free(params); tp_put(tmscr, p3);
     if (c->aux) {   /* the fifth channel: the source's aux volume at this level (zeros elsewhere), the CT's symmetry, v / 127.5 - 1 */
         uint8_t *aw = tp_get(p3, 1), *as = tp_get(p3, 0);
         if (!aw || !as || (s->aux && s->aux_level == l && aux_window(s, o, P, aw))) { tp_put(aw, p3); tp_put(as, p3); return -1; }
@@ -2981,10 +2982,10 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
         if (spatial.active) warp_sheet_batch(b->sheet[i],&spatial,M);
         w[1]=0; /* winding is supervised by the sparse regression objective */
     }
-    if (spatial.active && c->pmask && !lw) memcpy(b->pm + (size_t)i * p3, M, p3);   /* warped samples: the warped loss mask (--gpu-aug 2: the device's, from the packed mask bit) */
+    if (spatial.active && c->pmask && !lw && b->pm) memcpy(b->pm + (size_t)i * p3, M, p3);   /* warped samples: the warped loss mask (--gpu-aug 2: the device's, from the packed mask bit) */
     if (Tw) {
         size_t bad = 0;
-        if (sample_pack_tm(Tw, Tw + p3, Tw + NCH * p3, p3, b->tm + (size_t)i * p3, &bad)) {
+        if (b->tm && sample_pack_tm(Tw, Tw + p3, Tw + NCH * p3, p3, b->tm + (size_t)i * p3, &bad)) {
             fprintf(stderr, "sampler: packed targets need hard 0 / 255 targets and a 0 / 1 mask after the warp (voxel %zu); train --pack-targets 0\n", bad);
             abort();
         }
