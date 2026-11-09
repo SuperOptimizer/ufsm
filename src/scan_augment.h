@@ -48,7 +48,7 @@ unsigned scan_aug_apply(const scan_aug_cfg *c, uint64_t seed, uint8_t *ctu, uint
    air (output 0) unless SA_AIR, and the chunk boxes go to air (scan_plan_air): the output's zero set is known without the float work.
    scan_aug_exec runs the float ops of a plan on those bytes (CPU; the GPU executor reads the same plan). */
 #define SA_MAXTAP 48
-#define SA_MAXP 1024
+#define SA_MAXP 1536   /* (1024 until the latent-grid windows; the zy pass keeps P x 32 halves in shared memory: 96 KB at 1536) */
 #define SA_MAXTAB 8192
 #define SA_MAXBOX 64
 typedef struct { int P, s[SA_MAXP], n[SA_MAXP]; float w[SA_MAXP][SA_MAXTAP]; } scan_bop;   /* out[i] = sum_t w[i][t] in[s[i] + t] */
