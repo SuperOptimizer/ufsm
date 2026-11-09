@@ -163,7 +163,7 @@ APPLY_SYM(uint8_t, sym_u8)
 
 /* ---- sampler ---- */
 
-typedef enum { FREE, FILLING, READY, TAKEN } slot_state;
+typedef enum { FREE, FILLING, READY, TAKEN, REPLAY } slot_state;   /* REPLAY: released with replays left, its records being redrawn */
 
 struct sampler {
     sources *S;
@@ -174,6 +174,7 @@ struct sampler {
     pthread_mutex_t mu;
     pthread_cond_t cv_free, cv_ready;
     pthread_t *th;
+    int *rleft; unsigned char *rq; pthread_t rth; int rth_on; _Atomic uint64_t replays;   /* --replay: per slot replays left, in the replay pipeline (REPLAY or READY as one); its thread */
     atomic_int stop, failed;
     atomic_uint_fast64_t produced, rejected;
     atomic_uint_fast64_t rej_why[4];   /* draws dropped: coarse CT probe, CT read (min_fg), empty targets, holdout overlap (not in rejected) */
@@ -3170,6 +3171,7 @@ static void *worker(void *arg) {
         }
         pthread_mutex_lock(&sp->mu);
         sp->state[k] = filled == sp->cfg.B && !atomic_load(&sp->stop) ? READY : FREE;
+        if (sp->rleft) sp->rleft[k] = sp->cfg.replay - 1;
         pthread_cond_broadcast(&sp->cv_ready);
         pthread_cond_broadcast(&sp->cv_free);
         pthread_mutex_unlock(&sp->mu);
@@ -3364,7 +3366,101 @@ static int label_res_check(sampler *sp, source *s, int si, int region_ch) {
     }
     return 0;
 }
+/* ---- --replay: the same window again with a new device-side augmentation ---- */
+static sym sym_inverse(sym y) { sym z; for (int d = 0; d < 3; d++) { z.perm[y.perm[d]] = d; z.flip[y.perm[d]] = y.flip[d]; } return z; }
+static int sym_identity(sym y) { return y.perm[0] == 0 && y.perm[1] == 1 && y.perm[2] == 2 && !y.flip[0] && !y.flip[1] && !y.flip[2]; }
+/* the configurations whose batches replay: --gpu-aug 2 cubes, every label plane a source-grid or symmetry-applied byte plane the device warps */
+int sampler_replay_ok(const sample_cfg *c) {
+    return c->gpu_aug == 2 && (c->Pz <= 0 || c->Pz == c->P) && !c->sheet && !c->band && !c->pap_head && !c->cond && !c->emb_ch && !c->view_P && !c->cover &&
+           !c->papyrus && !c->restore && (!c->pmask || (c->slot_skip & 2)) && !c->chain_p;
+}
+/* window i of slot b, replay rep (1..): its records redrawn from the window's own state. The label planes of a window that was neither
+   warped nor left on the source grid (an unwarped window with a symmetry) go back to the source grid (the inverse symmetry through
+   scratch) and every replay gets a warp record: a new cube symmetry, rotation / elastic / zoom / affine as the sampler draws them
+   (rotation forced when none came up); the scanner plan is drawn anew with the label-touching ops (seam, air, dropped slices,
+   cutouts, chunk dropouts) carried over from the window's own plan, so its labels stay exact; new intensity jitter and noise seed */
+static void replay_window(sampler *sp, batch *b, int i, int rep, uint8_t **scr) {
+    const sample_cfg *c = &sp->cfg; const int Pz = PZ(c), P = c->P; const size_t p3 = P3(sp);
+    char *rec = (char *)b->rad + (size_t)i * NN_RAD_REC(Pz); int32_t h[8]; memcpy(h, rec, sizeof h);
+    float *cyz = malloc(2 * (size_t)Pz * sizeof *cyz); if (!cyz) abort(); float *cxz = cyz + Pz;
+    memcpy(cyz, rec + sizeof h, (size_t)Pz * sizeof *cyz); memcpy(cxz, rec + sizeof h + (size_t)Pz * sizeof *cyz, (size_t)Pz * sizeof *cxz);
+    sym y0; for (int d = 0; d < 3; d++) { y0.perm[d] = h[5] >> (2 * d) & 3; y0.flip[d] = h[5] >> (8 + d) & 1; }
+    const int warped0 = h[6] & 1, hasax = h[4];
+    scan_ct_rec *g = (scan_ct_rec *)b->aug + i;
+    rng r; rseed(&r, mix64(g->nseed ^ (uint64_t)rep * 0x9e3779b97f4a7c15ull ^ c->seed));
+    const source *s = &sp->S->src[b->src[i]]; const int l = b->level[i];
+    int64_t o[3]; for (int d = 0; d < 3; d++) o[d] = b->corner[i][d] >> l;
+    const int geom = c->augment && c->geometry_augment && s->geometry && Pz == P;
+    sym y = y0; spatial_aug sa = {0};
+    if (geom) {
+        if (!warped0 && !sym_identity(y0)) {   /* back to the source grid */
+            if (!*scr && !(*scr = malloc(p3))) abort();
+            const sym yi = sym_inverse(y0);
+            uint8_t *pl[5] = {b->side, b->w4, b->wcomp, b->ink, b->tm};
+            for (int q = 0; q < 5; q++) if (pl[q]) { uint8_t *v = pl[q] + (size_t)i * p3; memcpy(*scr, v, p3); sym_u8(*scr, v, Pz, P, yi); }
+        }
+        y = sym_of((int)rint_below(&r, 48));
+        if (c->augment == 4) y = sym_of(0);
+        if (c->augment == 2) while (!sym_is_rotation(y)) y = sym_of((int)rint_below(&r, 48));
+        if (c->augment == 3) while (y.perm[0] != 0 || y.flip[0]) y = sym_of((int)rint_below(&r, 48));
+        if (c->symmetry_p < 1 && runif(&r) >= c->symmetry_p) y = sym_of(0);
+        spatial_aug_make(&sa, rnext(&r), P, c->rotate_degrees, c->rotate_p, c->elastic, c->elastic_p);
+        if (!sa.active) spatial_aug_make(&sa, rnext(&r), P, c->rotate_degrees > 0 ? c->rotate_degrees : 5, 1.f, c->elastic, c->elastic_p);   /* (the labels need the device warp) */
+        if (c->zoom_p > 0 && c->zoom_min > 0 && c->zoom_min < 1 && runif(&r) < c->zoom_p) spatial_aug_zoom(&sa, exp(runif(&r) * log(c->zoom_min)));
+        if (c->affine_p > 0 && c->scan.strength > 0 && runif(&r) < c->affine_p) spatial_aug_affine(&sa, rnext(&r), c->affine_aniso * c->scan.strength, c->affine_shear * c->scan.strength);
+    }
+    const spatial_aug *ap = geom && sa.active ? &sa : nullptr;
+    rad_record(rec, o, Pz, P, hasax, y, cyz, cxz, ap);
+    if (c->axis_rec > 0) axis_record(b->axr + (size_t)i * SAMPLE_AXR(Pz > P ? Pz : P), o, Pz, P, hasax, y, cyz, cxz, ap, c->axis_rec);
+    b->um[i] = (float)(s->um * (double)(1 << l) * (ap ? sa.scale * cbrt(sa.det) : 1.0));
+    if (c->augment) {   /* intensity jitter as the sampler draws it (with --ct-aug the window's noise sigma stays) */
+        const double a = exp((runif(&r) * 2 - 1) * 0.22), bb = (runif(&r) * 2 - 1) * 0.2, sg = runif(&r) * 0.1;
+        g->ia = (float)a; g->ib = (float)bb; if (!c->ct_augment) g->isg = (float)sg;
+    }
+    g->nseed = r.s[0] ^ rotl(r.s[2], 23) ^ ((uint64_t)i << 48) ^ ((uint64_t)rep << 40);
+    if (c->augment && scan_aug_enabled(&c->scan)) {
+        scan_plan *old = malloc(sizeof *old); if (!old) abort(); *old = g->plan;
+        scan_aug_cfg c2 = c->scan; c2.drop_ignore = 0;
+        c2.p[SA_SEAM] = c2.p[SA_AIR] = c2.p[SA_DROPSLICE] = c2.p[SA_CUTOUT] = c2.p[SA_CHUNK] = 0;
+        const int chunk[3] = {128, 128, 128};
+        const unsigned on = scan_aug_plan(&c2, rnext(&r), b->ct8 + (size_t)i * p3, nullptr, 0, nullptr, P, o, cyz, cxz, hasax, chunk, 0, &g->plan);
+        scan_plan *p = &g->plan; const unsigned lm = 1u << SA_AIR | 1u << SA_DROPSLICE | 1u << SA_CUTOUT | 1u << SA_CHUNK;
+        if (!on) { p->mean = old->mean; p->sd = old->sd; p->ns = old->ns; }
+        p->P = P; p->on |= old->on & lm;
+        p->air_level = old->air_level;
+        p->ndrop = old->ndrop; memcpy(p->drop_z, old->drop_z, sizeof p->drop_z); memcpy(p->drop_mode, old->drop_mode, sizeof p->drop_mode);
+        p->ncut = old->ncut; memcpy(p->cut_b0, old->cut_b0, sizeof p->cut_b0); memcpy(p->cut_b1, old->cut_b1, sizeof p->cut_b1); memcpy(p->cut_noisy, old->cut_noisy, sizeof p->cut_noisy);
+        p->nchunk = old->nchunk; memcpy(p->chunk_b0, old->chunk_b0, sizeof p->chunk_b0); memcpy(p->chunk_b1, old->chunk_b1, sizeof p->chunk_b1);
+        g->scan = p->on != 0;
+        free(old);
+    }
+    free(cyz);
+}
+static void *replay_thread(void *arg) {
+    sampler *sp = arg; uint8_t *scr = nullptr;
+    pthread_mutex_lock(&sp->mu);
+    while (!atomic_load(&sp->stop)) {
+        int k = -1;
+        for (int j = 0; j < sp->nslots; j++) if (sp->state[j] == REPLAY) { k = j; break; }
+        if (k < 0) { pthread_cond_wait(&sp->cv_free, &sp->mu); continue; }
+        sp->state[k] = FILLING; const int rep = sp->cfg.replay - sp->rleft[k];
+        pthread_mutex_unlock(&sp->mu);
+        for (int i = 0; i < sp->cfg.B; i++) replay_window(sp, &sp->slots[k], i, rep, &scr);
+        atomic_fetch_add(&sp->replays, 1);
+        pthread_mutex_lock(&sp->mu);
+        sp->rleft[k]--; sp->state[k] = READY;
+        pthread_cond_broadcast(&sp->cv_ready);
+    }
+    pthread_mutex_unlock(&sp->mu); free(scr);
+    return nullptr;
+}
+static int replay_selftest(void) {   /* sym_inverse undoes every cube symmetry (sym_u8 twice on a 5^3 cube) */
+    uint8_t a[125], t[125], u[125]; for (int k = 0; k < 125; k++) a[k] = (uint8_t)k;
+    for (int q = 0; q < 48; q++) { const sym y = sym_of(q); sym_u8(a, t, 5, 5, y); sym_u8(t, u, 5, 5, sym_inverse(y)); if (memcmp(a, u, 125)) return -1; }
+    return 0;
+}
 sampler *sampler_start(sources *S, const sample_cfg *cfg) {
+    if (cfg->replay > 1 && (!sampler_replay_ok(cfg) || replay_selftest())) { fprintf(stderr, "sampler: --replay needs --gpu-aug 2 cube batches without sheet / band / gap / condition / distill / view / cover / chain / papyrus-mask planes\n"); return nullptr; }
     if (!S || S->n <= 0 || cfg->P <= 0 || cfg->B <= 0 || cfg->nworkers <= 0 || cfg->nbuf <= 0) { fprintf(stderr, "sampler: invalid sources, patch, batch, workers or buffer count\n"); return nullptr; }
     if (cfg->gpu_input && !sample_gpu_input_ok(cfg)) { fprintf(stderr, "sampler: --gpu-input needs 16-bit batches and no warps, sheet prior, slab appearance plan, aux or condition inputs\n"); return nullptr; }
     { int nl = 0, nw = 0; for (int i = 0; i < S->n; i++) { nl += S->src[i].scope_local; nw += S->src[i].phase_wt != nullptr; }
@@ -3487,6 +3583,12 @@ sampler *sampler_start(sources *S, const sample_cfg *cfg) {
         wa->sp = sp; wa->id = i;
         pthread_create(&sp->th[i], nullptr, worker, wa);
     }
+    if (cfg->replay > 1) {
+        sp->rleft = calloc((size_t)sp->nslots, sizeof *sp->rleft); sp->rq = calloc((size_t)sp->nslots, 1);
+        sp->rth_on = sp->rleft && sp->rq && !pthread_create(&sp->rth, nullptr, replay_thread, sp);
+        if (!sp->rth_on) { fprintf(stderr, "sampler: cannot start the replay thread\n"); free(sp->rleft); free(sp->rq); sp->rleft = nullptr; sp->rq = nullptr; }
+        else fprintf(stderr, "sampler: window replay x%d (a new symmetry / warp / scanner plan / jitter per replay, on the device)\n", cfg->replay);
+    }
     return sp;
 }
 
@@ -3495,6 +3597,12 @@ batch *sampler_next(sampler *sp) {
     int k = -1;
     while (k < 0) {
         if (atomic_load(&sp->stop)) { pthread_mutex_unlock(&sp->mu); return nullptr; }
+        if (sp->rq) {   /* --replay: a released window's replay comes before any new window (deterministic in the trainer's call order) */
+            int any = 0;
+            for (int j = 0; j < sp->nslots && k < 0; j++) if (sp->rq[j]) { any = 1; if (sp->state[j] == READY) { k = j; sp->rq[j] = 0; } }
+            if (k >= 0) break;
+            if (any) { pthread_cond_wait(&sp->cv_ready, &sp->mu); continue; }
+        }
         if (sp->cfg.cover && (uint64_t)sp->next_take >= sp->cfg.cover->count - sp->cfg.cover_start) { pthread_mutex_unlock(&sp->mu); return nullptr; }
         if (sp->cfg.deterministic) {   /* in batch order */
             int s = (int)(sp->next_take % sp->nslots);
@@ -3528,8 +3636,10 @@ batch *sampler_next(sampler *sp) {
 
 void sampler_release(sampler *sp, batch *b) {
     pthread_mutex_lock(&sp->mu);
-    sp->state[b - sp->slots] = FREE;
-    if (sp->cfg.deterministic) pthread_cond_broadcast(&sp->cv_free); else pthread_cond_signal(&sp->cv_free);
+    const int k = (int)(b - sp->slots);
+    if (sp->rleft && sp->rleft[k] > 0 && !atomic_load(&sp->stop)) { sp->state[k] = REPLAY; sp->rq[k] = 1; pthread_cond_broadcast(&sp->cv_free); pthread_mutex_unlock(&sp->mu); return; }
+    sp->state[k] = FREE;
+    if (sp->cfg.deterministic || sp->rq) pthread_cond_broadcast(&sp->cv_free); else pthread_cond_signal(&sp->cv_free);   /* (--replay: the replay thread waits there too) */
     pthread_mutex_unlock(&sp->mu);
 }
 
@@ -3571,7 +3681,9 @@ void sampler_stop(sampler *sp) {
     pthread_cond_broadcast(&sp->cv_ready);
     pthread_mutex_unlock(&sp->mu);
     for (int i = 0; i < sp->cfg.nworkers; i++) pthread_join(sp->th[i], nullptr);
+    if (sp->rth_on) pthread_join(sp->rth, nullptr);
     for (int i = 0; i < sp->nslots; i++) free_batch(&sp->slots[i]);
+    free(sp->rleft); free(sp->rq);
     for (int i = 0; i < sp->S->n; i++) free(sp->occ[i].idx);
     free(sp->occ); free(sp->slot_j); free(sp->slots); free(sp->state); free(sp->th); free(sp->cum); free(sp->lvl_ok);
     free(sp);
