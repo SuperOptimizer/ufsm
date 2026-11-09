@@ -198,6 +198,7 @@ int unet_save(const unet *u, const char *path, int step, const char *extra_json)
 int unet_load(unet *u, const char *path);
 int unet_load_grow(unet *u, const char *path, int keep, float new_bias);   /* warm start into a wider head (src/unet.c) */
 int unet_init_from(unet *u, const char *path);   /* partial warm start: shape-matching layers of another net (src/unet.c) */
+void unet_set_init_shift(int s);   /* the next unet_init_from*: u's level i from the donor's level i + s */
 int unet_init_from_map(unet *u, const char *path, const int *head_rows);   /* the same with an explicit head row map (src/unet.c) */
 /* Retain surface response, zero the new scalar input and winding output,
    including EMA/Adam/Muon state for those parameters. */

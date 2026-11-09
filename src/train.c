@@ -2158,6 +2158,7 @@ int cmd_train(int argc, char **argv) {
             if (g_restore) unet_zero_head(d->u);   /* residual net: output == input at step 0 */
             const char *init_from = opt(argc, argv, "--init-from", nullptr);   /* partial warm start from another architecture */
             if (init_from) {
+                unet_set_init_shift(atoi(opt(argc, argv, "--init-shift", "0")));   /* a latent-grid net from a voxel donor: --init-shift 2 */
                 int rows[16];   /* --verso: recto copied into the verso channel, the donor's other rows (affinities) shifted up */
                 if (g_verso) { unet_cfg dc; int ds; if (unet_peek(init_from, &dc, &ds)) { fprintf(stderr, "cannot read %s\n", init_from); return 1; }
                     rows[0] = 0; rows[1] = g_verso_zero ? -1 : 0;
