@@ -782,10 +782,15 @@ static void verso_target(gpu_state *d, shape5 xs) {
    statistics, summed over the slabs and finished into its scratch (fetch_loss reads them as before); pass 1 (the backward's head
    step, head_slab_cb): the head again, each loss's gradient in place over the slab's logits, the head backward of the slab. The
    per-voxel arithmetic is the whole-window path's (fp64 sums in another order; the head backward's SR seed is the backward's) */
+int nn_lat_set_slow(int on);   /* (nn_lat.cu) */
 static void head_slab_pass(gpu_state *d, int pass) {
     const int D = g_Pz, H = d->hs_P, W = d->hs_P, Z = d->hs_z;
     const size_t hw = (size_t)H * W, l3 = (size_t)D * hw;
     nn_set_logits_h16(1);
+    static int lchk = -1; if (lchk < 0) lchk = g_lat && ufsm_env_on("UFSM_LAT_CHECK");
+    /* UFSM_PTICK: the slab phases by pass */
+    static const char *const ptn[2][5] = {{"p0 label h2d", "p0 upsample", "p0 targets", "p0 loss stats", ""}, {"p1 label h2d", "p1 upsample", "p1 targets", "p1 loss grads", "p1 adjoint"}};
+#define PT(w) nn_ptick(ptn[pass][!strcmp(w, "label h2d") ? 0 : !strcmp(w, "upsample") ? 1 : !strcmp(w, "targets") ? 2 : !strcmp(w, "losses") ? 3 : 4])
     if (!pass) { nn_zero(d->hs_ds, 64 * sizeof(double)); if (g_unwrap2) nn_zero(d->w4ds, nn_wind4_sums()); }
     for (int z0 = 0; z0 < D; z0 += Z) {
         const int z1 = z0 + Z < D ? z0 + Z : D, nz = z1 - z0;
@@ -804,8 +809,19 @@ static void head_slab_pass(gpu_state *d, int pass) {
                 free(ha); free(hb); if (z1 == D) fprintf(stderr, "lat stream check: pass %d, %ld of %ld slab bytes differ so far\n", pass, bad, tot);
             }
         }
+        PT("label h2d");
         if (g_lat) nn_lat_up_slab(d->lg, unet_logits_h16(d->u), g_cout, D / 4, H / 4, W / 4, z0, nz, d->hs_lg);   /* --lat: the cell grid's logits on this slab */
         else if (unet_head_fwd_z(d->u, z0, z1, d->hs_lg)) { fprintf(stderr, "head slabs: the head is not covered (MX activations; UFSM_HEAD_SLAB=0)\n"); abort(); }
+        if (lchk && !pass) {   /* UFSM_LAT_CHECK=1: the separable upsampling against the per-voxel kernel, every slab */
+            const size_t nb = (size_t)g_cout * ns * 2; void *d2 = nn_malloc(nb); uint16_t *ha = malloc(nb), *hb = malloc(nb);
+            const int was = nn_lat_set_slow(1); nn_lat_up_slab(d->lg, unet_logits_h16(d->u), g_cout, D / 4, H / 4, W / 4, z0, nz, d2); nn_lat_set_slow(was);
+            nn_sync(); nn_d2h(ha, d->hs_lg, nb); nn_d2h(hb, d2, nb); nn_free(d2);
+            static double mx, sq, sr; static size_t nd, nt_, n1;
+            for (size_t k = 0; k < nb / 2; k++) { _Float16 x, y; memcpy(&x, ha + k, 2); memcpy(&y, hb + k, 2); const double e = fabs((double)x - (double)y); nd += ha[k] != hb[k]; n1 += abs((int)(int16_t)ha[k] - (int)(int16_t)hb[k]) > 1; if (e > mx) mx = e; sq += e * e; sr += (double)y * (double)y; }
+            nt_ += nb / 2; free(ha); free(hb);
+            if (z1 == D) { fprintf(stderr, "lat check: upsampling: %zu of %zu fp16 logits differ (%zu by more than one code), max |difference| %.3g, rms difference / rms %.3g\n", nd, nt_, n1, mx, sqrt(sq / (sr > 0 ? sr : 1))); mx = sq = sr = 0; nd = nt_ = n1 = 0; }
+        }
+        PT("upsample");
         const shape5 one = {1, 1, nz, H, W}, two = {1, 2, nz, H, W}, seven = {1, 7, nz, H, W};
         nn_phase_targets(sdb + vb, ns, d->sidet, d->sidem);
         if (g_rv) {   /* --rv: the side slot's targets (the phase targets above stay for the winding mod 4 / gradient terms) */
@@ -826,6 +842,7 @@ static void head_slab_pass(gpu_state *d, int pass) {
         if (g_ptrunc_on) nn_phase_trunc(LGC(g_side_ch), LGC(g_side_ch + 1), d->sidet, d->sidem, ns, g_ptrunc_tau, g_ptrunc_kappa);   /* robust phase loss (both passes: the same mask) */
         if (g_packed_w > 1) nn_packed_mask_z(sdb, D, H, W, g_norm_s, d->um, g_packed_um, g_packed_w, d->sidem, z0, z1);   /* packed sheets weigh more */
         nn_unwrap_targets2_z(sdb, D, H, W, g_norm_s, g_dens_scale, g_dens_code, d->um, g_packed_um, g_packed_w, d->nt, d->nm, z0, z1);
+        PT("targets");
         if (!pass) {
             if (!g_unwrap2) {
                 nn_loss_stats_acc(LGC(0), d->t + vb, d->m + vb, d->w, one, d->hs_ds);
@@ -835,6 +852,7 @@ static void head_slab_pass(gpu_state *d, int pass) {
             nn_loss_stats_acc(LGC(g_side_ch), st, sm, d->sidew, two, d->hs_ds + 10);
             nn_loss_stats_acc(LGC(g_norm_ch), d->nt, d->nm, d->nw, seven, d->hs_ds + 20);
             if (g_pg_lambda > 0) nn_pgrad_slab(d->hs_train ? nullptr : LGC(g_side_ch), d->hs_train ? nullptr : LGC(g_side_ch + 1), sdb, d->sidem, D, H, W, z0, z1, g_norm_s, g_pg_dist, g_pg_nd, g_pg_angle, g_pg_mask, d->hs_ds + 56, nullptr);   /* (training: the pair weights only; the loss sum comes from the gradient pass, + 58) */
+            PT("losses");
             continue;
         }
         if (!g_unwrap2) {
@@ -858,9 +876,24 @@ static void head_slab_pass(gpu_state *d, int pass) {
             if (g_norm_lambda != 1.f) nn_loss_grad_scale(LGC(g_norm_ch), 6 * ns, g_norm_lambda);
             if (g_dens_lambda != 1.f) nn_loss_grad_scale(LGC(g_norm_ch + 6), ns, g_dens_lambda);
         }
-        if (g_lat) nn_lat_up_adj(d->hs_lg, g_cout, D / 4, H / 4, W / 4, z0, nz, d->latg);   /* --lat: the slab's gradient onto the cell grid */
+        PT("losses");
+        if (g_lat) nn_lat_up_adj(d->hs_lg, g_cout, D / 4, H / 4, W / 4, z0, nz, d->latg, g_cout <= 28 ? d->nt : nullptr);   /* (scratch: the normal targets, 7 bytes a voxel, are done for this slab) */   /* --lat: the slab's gradient onto the cell grid */
         else if (unet_head_bwd_z(d->u, z0, z1, d->hs_lg, z0 == 0)) { fprintf(stderr, "head slabs: the fused head backward is not covered (UFSM_HEAD_SLAB=0)\n"); abort(); }
+        if (lchk) {   /* UFSM_LAT_CHECK=1: the separable adjoint against the per-voxel gather (the slab's gradient is still in hs_lg) */
+            static float *gc2; const size_t nc = (size_t)g_cout * (D / 4) * (H / 4) * (W / 4);
+            if (!gc2) gc2 = nn_malloc(nc * 4);
+            if (z0 == 0) nn_zero(gc2, nc * 4);
+            const int was = nn_lat_set_slow(1); nn_lat_up_adj(d->hs_lg, g_cout, D / 4, H / 4, W / 4, z0, nz, gc2, nullptr); nn_lat_set_slow(was);
+            if (z1 == D) {
+                float *ha = malloc(nc * 4), *hb = malloc(nc * 4); nn_sync(); nn_d2h(ha, d->latg, nc * 4); nn_d2h(hb, gc2, nc * 4);
+                double mx = 0, mb = 0, sq = 0, sr = 0; for (size_t k = 0; k < nc; k++) { const double e = fabs((double)ha[k] - hb[k]); if (e > mx) mx = e; if (fabs(hb[k]) > mb) mb = fabs(hb[k]); sq += e * e; sr += (double)hb[k] * hb[k]; }
+                fprintf(stderr, "lat check: adjoint: max |difference| %.3g of max |gradient| %.3g, rms difference / rms %.3g\n", mx, mb, sqrt(sq / (sr > 0 ? sr : 1)));
+                free(ha); free(hb);
+            }
+        }
+        PT("adjoint");
 #undef LGC
+#undef PT
     }
     if (!pass) {
         const shape5 w1 = {1, 1, D, H, W}, w2 = {1, 2, D, H, W}, w7 = {1, 7, D, H, W};
@@ -982,7 +1015,7 @@ static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
         const float *l2 = unet_forward_x(d->u, d->x2, (shape5){B, unet_cfg_of(d->u)->cin, q, q, q}, train, g_xfmt != 0);
         nn_lowres_output(l2, unet_logits_h16(d->u), hs, g_hdiv, hm, (float *)d->lrt, d->lgf);
         lg = d->lgf;
-    } else if (g_lat) lg = unet_forward_x(d->u, d->x, (shape5){B, unet_cfg_of(d->u)->cin, g_Pz / 4, P / 4, P / 4}, train, g_xfmt != 0);   /* --lat: x the full-resolution CT channel */
+    } else if (g_lat) { nn_ptick("other"); lg = unet_forward_x(d->u, d->x, (shape5){B, unet_cfg_of(d->u)->cin, g_Pz / 4, P / 4, P / 4}, train, g_xfmt != 0); nn_ptick("trunk forward"); }   /* --lat: x the full-resolution CT channel */
     else lg = unet_forward_x(d->u, d->x, xs, train, g_xfmt != 0);
     d->lg = lg;
     mem_post(d, B, train);
@@ -1017,7 +1050,7 @@ static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
             nn_zero(d->latg, nc * 4);
             head_slab_pass(d, 1);
             nn_f32_to_h16(d->latg, nc, d->latgl, 1.f);   /* (the slab gradients carry the gradient scale already) */
-            d->gl = d->latgl;
+            d->gl = d->latgl; nn_ptick("other");
         }
         if (prof) nn_prof_end();
         return;
@@ -2871,7 +2904,7 @@ int cmd_train(int argc, char **argv) {
             restore_train_recipe(d, step, g), run_batch(d, B, P, dice_w, 1);
             test_nan_inject(d, step, 1, P);
             if (sync_check(d, step, "forward and losses")) return 1;
-            unet_backward_x(d->u, g_half && !g_pkf ? d->glh : d->gl, g_g16);
+            unet_backward_x(d->u, g_half && !g_pkf ? d->glh : d->gl, g_g16); nn_ptick("trunk backward");
             test_nan_inject(d, step, 2, P);
             if (sync_check(d, step, "backward")) return 1;
             diag_nonfinite(d, "parameter gradients", unet_grad_ptr(d->u), unet_nparams(d->u), 0);
@@ -2933,6 +2966,7 @@ int cmd_train(int argc, char **argv) {
             gpu_state *d = &G[g];
             nn_init(d->dev);
             if (prof) nn_prof_begin(7);
+            nn_ptick("other");
             if (g == 0) gn = unet_grad_norm(d->u);          /* identical on every GPU after averaging */
             if (plan && (!isfinite(gn) || fwd_nan)) {
                 fprintf(stderr, "cover tile %llu has non-finite forward/gradients; aborting without advancing its cursor\n", (unsigned long long)coverage.cursor);
@@ -2957,6 +2991,7 @@ int cmd_train(int argc, char **argv) {
             unet_ema(d->u, step < 100 ? 0.9f : ema);
             unet_wquant(d->u, (unsigned)step);              /* no-op unless --wq */
             if (prof) nn_prof_end();
+            nn_ptick("optimizer");
         }
         for (int g = 0; g < ng; g++) if (G[g].tail_due) { nn_init(G[g].dev); upload_tail(&G[g], B, P); }   /* (upsplit: after the loss / gradient-norm
                                                                                                            fetches' small copies, during the optimiser) */
@@ -3136,6 +3171,7 @@ int cmd_train(int argc, char **argv) {
               if (hm) { sampler_hostmem(sp, stderr, nn_host_bytes()); if (hmn++ == 1) nn_host_report(stderr); } }
             if (log) { fprintf(log, "%d,%.3e,%.5f,%.5f,%.5f,%.0f,%.4f,%s,%.3f,%.3f\n", step, lr, acc_loss / nacc, acc_bce / nacc, acc_dice / nacc, active, acc_g / nacc, vstr, (double)nacc * B * nl / dt, wait); fflush(log); }
             if (prof) { fprintf(stderr, "per-op GPU ms over the last %d steps (all GPUs):\n", log_every); unet_prof_report(); }
+            nn_ptick_report(log_every);
             acc_inkn = 0; acc_emb = acc_embc = 0; acc_ds = 0; acc_loss = acc_bce = acc_dice = acc_g = acc_vbce = acc_vdice = acc_side = acc_ink = acc_norm = acc_cond = acc_ck = acc_cr = acc_pap = acc_cnt = acc_cnr = acc_w4 = acc_w4w = acc_w4a = acc_pg = 0; nacc = 0; tlog = now(); wait = 0;
         }
         if (step % ckpt_every == 0 || step == steps || g_stop) {
