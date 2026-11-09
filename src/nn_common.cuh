@@ -1978,7 +1978,6 @@ template <typename LT> __global__ void pred_out_k(const LT *lg, const uint8_t *c
 extern "C" void nn_pred_output(const float *lg, const uint8_t *ct, size_t n, uint8_t *out);
 /* the probability of the window's interior (halo .. W - halo) written straight into a device shard buffer (shard^3, x fastest):
    window voxel (z, y, x) lands at shard voxel (oz + z, oy + y, ox + x) when inside [0, e) (o = window origin - shard origin) */
-template <typename LT> __global__ void pred_place_k(const LT *lg, const uint8_t *ct, int D, int W, int hz, int halo, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh);
 extern "C" void nn_pred_place(const float *lg, const uint8_t *ct, int W, int halo, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh);
 /* exact window statistics (nonzero count, sum, sum of squares) of a uint8 window: integer sums, as the host loop computed */
 __global__ void pred_stats_k(const uint8_t *ct, size_t n, unsigned long long *acc);

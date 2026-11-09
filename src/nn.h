@@ -63,6 +63,7 @@ size_t nn_ring_bytes(void);
 /* event profiler (no host syncs): bracket ops, then collect per-category GPU milliseconds */
 void nn_prof_begin(int k);
 void nn_prof_end(void);
+void nn_h2d_stream(int k, void *d, const void *s, size_t n);   /* an asynchronous upload on stream k (0 compute, 1 copy, 2 aux: nn_stream_wait / nn_event_record); s pinned */
 int nn_ptick_on(void); void nn_ptick(const char *name); void nn_ptick_report(int steps);   /* UFSM_PTICK=1: synchronised phase timer (nn_core.cu) */
 void nn_prof_collect(double *out, int nk);
 
@@ -178,6 +179,15 @@ void nn_input_lat(const void *ct16, shape5 xs, const void *rec, void *y);
    nn_lat_up_adj adds the adjoint of such a slab's fp16 gradient g into the fp32 coarse gradient gc [C][d][h][w] */
 void nn_lat_up_slab(const void *lg, int lh16, int C, int d, int h, int w, int z0, int nz, void *y);
 void nn_lat_up_adj(const void *g, int C, int d, int h, int w, int z0, int nz, float *gc, void *scratch);   /* scratch: C nz h w fp32 for the separable path (z0, nz multiples of 4), or nullptr */
+int nn_lat_set_slow(int on);   /* the per-voxel kernels for every slab (UFSM_LAT_SLOW=1; train's UFSM_LAT_CHECK compares against them); returns the previous setting */
+/* predict on a latent-grid net: the network's 4-channel input on the cell grid ([4][D/4][W/4][W/4], 16-bit storage as nn_set_f16) straight
+   from a D x W x W uint8 CT window = nn_pred_input_d then nn_lowres_input (div 4, mode 1), without the full-resolution input */
+void nn_lat_pred_input(const uint8_t *ct, int D, int W, float mean, float isd, const float *dyo, const float *dxo, int axis, void *y);
+/* predict --channel rv on a latent-grid net: the two side logits of the cell grid (lg [2][d][h][w], fp16 / fp32) upsampled, fused
+   (nn_rv_fuse) and quantised (nn_pred_place) into a device shard: window voxel v of the interior ([hz, 4 d - hz) x [halo, 4 h - halo) x
+   [halo, 4 w - halo)) lands at shard voxel o + v when inside [0, e); 0 where the CT (ct >= iso, or ct nullptr: the mask bits) is not set */
+void nn_lat_place_rv(const void *lg, int lh16, int d, int h, int w, const uint8_t *ct, const uint32_t *bits, int iso, int hz, int halo,
+                     int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh);
 /* train --gpu-aug (src/nn_aug.cu): a window's CT channel built on the device from its source-grid bytes ct8_h (P^3, pinned) and record
    rec_h (scan_augment.h scan_ct_rec: the scanner plan, jitter, normalisation): the scanner ops in 16-bit storage in ct16 (the channel's
    own buffer), the output bytes' z-score, then the symmetry / warp of rad_d (the device copy of the window's NN_RAD_REC record, uploaded

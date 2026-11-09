@@ -523,8 +523,11 @@ static void upload(gpu_state *d, const batch *b, int B, int P) {
     if (g_restore) { restore_upload(d, b, d->cur, B, P, 0); return; }
     if (d->side >= 0) { upload_slab(d, b, d->cur, B, P, 0); return; }
     size_t p3 = (size_t)g_Pz * P * P;
+    nn_ptick("loader wait + host");   /* (UFSM_PTICK with UFSM_SYNC_UPLOAD=1: the upload's phases) */
     if (g_lstream) { if (b->ct8) nn_h2d(d->rad, b->rad, rad_bytes(B)); lab_stream(d, b, d->cur, d->rad, B, P, 0); }   /* (before the input: its buffer is the scratch) */
+    nn_ptick("label upload + warp + d2h");
     ct_upload(b, d->x, d->rad, B, P, 0);
+    nn_ptick("CT upload + gpu-aug");
     if (g_tm_unused) {}
     else if (g_pack) { lab_upload(0, b, d->m, lw_pm(b) ? d->pm : nullptr, b->tm, b->pm, d->rad, B, P, 0); if (!g_pkf) nn_unpack_tm(d->t, d->m, B, p3, 0); }   /* (--pack-targets excludes --heads; the
                                                                                                        direct pack loss reads the codes) */
@@ -543,6 +546,7 @@ static void upload(gpu_state *d, const batch *b, int B, int P) {
     if (g_distill) nn_h2d(d->embt, b->emb, g_distill_n);
     if (g_pap_head) nn_h2d(d->pap, b->pap, (size_t)B * p3);
     if (b->ct8) nn_sync();   /* (--gpu-aug: nn_aug_ct / nn_label_warp copy from the pinned batch asynchronously; the caller may release it now) */
+    nn_ptick("other uploads");
 }
 /* asynchronous upload of a pinned sampler batch into buffer i on the copy stream, after the compute that last used it */
 static void upload_async(gpu_state *d, const batch *b, int i, int B, int P) {
@@ -779,8 +783,6 @@ static void verso_target(gpu_state *d, shape5 xs) {
    statistics, summed over the slabs and finished into its scratch (fetch_loss reads them as before); pass 1 (the backward's head
    step, head_slab_cb): the head again, each loss's gradient in place over the slab's logits, the head backward of the slab. The
    per-voxel arithmetic is the whole-window path's (fp64 sums in another order; the head backward's SR seed is the backward's) */
-int nn_lat_set_slow(int on);   /* (nn_lat.cu) */
-void nn_h2d_stream(int k, void *d, const void *s, size_t n);   /* (nn_core.cu) */
 static void head_slab_pass(gpu_state *d, int pass) {
     const int D = g_Pz, H = d->hs_P, W = d->hs_P, Z = d->hs_z;
     const size_t hw = (size_t)H * W, l3 = (size_t)D * hw;
@@ -860,6 +862,15 @@ static void head_slab_pass(gpu_state *d, int pass) {
         if (g_ptrunc_on) nn_phase_trunc(LGC(g_side_ch), LGC(g_side_ch + 1), d->sidet, d->sidem, ns, g_ptrunc_tau, g_ptrunc_kappa);   /* robust phase loss (both passes: the same mask) */
         if (g_packed_w > 1) nn_packed_mask_z(sdb, D, H, W, g_norm_s, d->um, g_packed_um, g_packed_w, d->sidem, z0, z1);   /* packed sheets weigh more */
         nn_unwrap_targets2_z(sdb, D, H, W, g_norm_s, g_dens_scale, g_dens_code, d->um, g_packed_um, g_packed_w, d->nt, d->nm, z0, z1);
+        if (lchk && !pass) {   /* UFSM_LAT_CHECK=1: how dense the supervision is (slabs with every mask zero could skip their kernels: none in the rv recipe) */
+            uint8_t *h = malloc(3 * ns); nn_sync(); nn_d2h(h, d->sidem, ns); nn_d2h(h + ns, sm, ns); nn_d2h(h + 2 * ns, d->nm, ns);
+            static size_t nsl, nemp, nvox, nsup[3]; size_t c[3] = {0, 0, 0};
+            for (int q = 0; q < 3; q++) for (size_t k = 0; k < ns; k++) c[q] += h[q * ns + k] != 0;
+            nsl++; nemp += !(c[0] | c[1] | c[2]); nvox += ns; for (int q = 0; q < 3; q++) nsup[q] += c[q];
+            if (z1 == D) { fprintf(stderr, "lat check: supervised voxels: phase %.1f%% side %.1f%% normal %.1f%%, %zu of %zu slabs with none\n", 100. * nsup[0] / nvox, 100. * nsup[1] / nvox, 100. * nsup[2] / nvox, nemp, nsl);
+                           nsl = nemp = nvox = 0; nsup[0] = nsup[1] = nsup[2] = 0; }
+            free(h);
+        }
         PT("targets");
         if (!pass) {
             if (!g_unwrap2) {

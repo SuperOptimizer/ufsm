@@ -32,8 +32,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-void nn_lat_pred_input(const uint8_t *ct, int D, int W, float mean, float isd, const float *dyo, const float *dxo, int axis, void *y);   /* (nn_lat.cu) */
-void nn_lat_place_rv(const void *lg, int lh16, int d, int h, int w, const uint8_t *ct, const uint32_t *bits, int iso, int hz, int halo, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh);   /* (nn_lat.cu) */
 static void pred_axis(unet *u, int valid, int D, const float *dy, const float *dx);
 
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
@@ -1103,10 +1101,15 @@ int cmd_predict(int argc, char **argv) {
         const int div = 1 << (cfg.nlev - 1), md = hdiv * div;
         const int ctin = !half && !ufsm_env_on("UFSM_PRED_HOSTPATH");   /* the device path puts the CT window in the level-0 skip buffer (unet_input_scratch2) */
         int hk = 16; while ((2 * hk) % md && hk < shard / 4) hk += 8;
+        /* a latent-grid net writing --channel rv from k >= 2 shards a window holds no full-resolution tensor but the CT bytes (nn_lat_pred_input,
+           nn_lat_place_rv): no 14 bytes a voxel in the estimate. k stays <= 4: with one 128^3 chunk per shard the run is bound by the shard
+           writers and the CT reader, and windows of 8^3 shards skip less air (box 1024 x 3072^2 of PHerc1667: 4608 shards compressed against 3584) */
+        const int lat_lean = half && hdiv == 4 && hmode == 1 && cfg.cin == 4 && rvfuse && !ffd && tta <= 1 && !fea && !auxz && nn_get_tf32() && nn_get_act_bf16() && !ufsm_env_on("UFSM_ACT_MX8")
+                             && (!getenv("UFSM_PRED_LAT_INPUT") || ufsm_env_on("UFSM_PRED_LAT_INPUT")) && (!getenv("UFSM_PRED_LAT_DIRECT") || ufsm_env_on("UFSM_PRED_LAT_DIRECT"));
         for (int k = 4; k >= 1; k--) {
             const int Wc = k * shard + 2 * hk;
             if (Wc % md || (k > 1 && (bn[0] < (int64_t)k * shard || bn[1] < (int64_t)k * shard || bn[2] < (int64_t)k * shard))) continue;
-            const size_t wc3 = (size_t)Wc * Wc * Wc, need = (half ? unet_infer_bytes(u, (shape5){1, cfg.cin, Wc / hdiv, Wc / hdiv, Wc / hdiv}) + 14 * wc3 : unet_infer_bytes(u, (shape5){1, 4, Wc, Wc, Wc}))
+            const size_t wc3 = (size_t)Wc * Wc * Wc, need = (half ? unet_infer_bytes(u, (shape5){1, cfg.cin, Wc / hdiv, Wc / hdiv, Wc / hdiv}) + (lat_lean && k > 1 ? 0 : 14) * wc3 : unet_infer_bytes(u, (shape5){1, 4, Wc, Wc, Wc}))
                                                      + (ctin ? 0 : wc3) + wc3 / 8 + (size_t)shard * shard * shard + ((size_t)1 << 30);   /* (+ the CT window unless it lives in the network's level-0 buffer, its mask bits) */
             if (need <= nn_mem_free()) { W = Wc; halo = hk; break; }
         }
