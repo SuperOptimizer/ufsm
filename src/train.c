@@ -1766,6 +1766,9 @@ int cmd_train(int argc, char **argv) {
     }
     sample_cfg sc = sample_cfg_default();
     sc.P = P; sc.Pz = g_Pz != P ? g_Pz : 0; sc.B = B; sc.nworkers = workers; sc.nbuf = atoi(opt(argc, argv, "--sampler-slots", "0")) > 0 ? atoi(opt(argc, argv, "--sampler-slots", "0")) : 4 * ng + 2;   /* batches in flight (each worker fills one; pinned memory per slot) */ sc.seed = seed; sc.xfmt = g_xfmt;
+    if (workers > sc.nbuf - ng)   /* a worker fills a slot of its own and the trainer holds about one per GPU: workers beyond the free slots wait, and each
+                                     holds its window scratch (5 bytes per voxel; P 640, 2026-11-09: 4 workers 3 slots 46% wait, 8 workers 3 slots 38%, 4 workers 5 slots 0%) */
+        fprintf(stderr, "sampler: %d workers but %d slots: at most %d windows are built at once (--sampler-slots %d to use every worker)\n", workers, sc.nbuf, sc.nbuf - ng > 1 ? sc.nbuf - ng : 1, workers + 2 * ng);
     g_axr = unet_cfg_axis(&cfg); sc.axis_rec = g_axr ? g_hdiv : 0;   /* the scroll axis per window */
     if (g_axr && split) { fprintf(stderr, "--attn-axis radial / --attn-pe scroll / --attn-deform-init normal: not with --split z\n"); return 2; }
     if (g_axr && !cfg.attn_deform) fprintf(stderr, "attention: %s, %s positions around each window's scroll axis\n", cfg.attn_axis ? "radial (along the rays from the axis)" : "full", cfg.attn_pe == 3 ? "scroll RoPE" : "grid");
