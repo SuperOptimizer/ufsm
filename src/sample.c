@@ -3177,7 +3177,7 @@ static void *worker(void *arg) {
         pthread_mutex_unlock(&sp->mu);
     }
     if (tp_wid >= 0) { g_wm[tp_wid].pool = nullptr; g_wm[tp_wid].big = g_wm[tp_wid].ttmp = nullptr; }
-    free(xtmp); free(ttmp); free(big); free(noise_state); free(chs); tp_drain();
+    free(xtmp); free(ttmp); free(big); free(noise_state); free(chs); tp_drain(); band_wind4_thread_free();
     free(wa);
     return nullptr;
 }
