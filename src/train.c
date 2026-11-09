@@ -62,6 +62,7 @@ typedef struct {
     char *bat_lo, *bat_hi;       /* lean: the batch's bytes inside the model's buffers (a logit gradient placed later must avoid them) */
     int gl_inplace;              /* the logit gradient over the fp16 logits (g_gl_inplace) */
     float *pg_acc; double pg_h[2], pg_loss;   /* --pgrad-lambda: slab logit gradient (2 planes x slab, fp32), sums w loss / w (hs_ds + 56: + 20..54 hold the normal loss stats), loss */
+    float *latg; void *latgl;   /* --lat: the fp32 coarse logit gradient the head slabs accumulate, its 16-bit copy for the backward */
     void *hs_lg; double *hs_ds; float hs_dice; int hs_z, hs_P, hs_train;   /* head slabs (g_head_slab): fp16 logits of one slab, loss sums, recto dice, planes per slab, window width, a training pass (the backward follows) */
     int64_t cornb[2][3]; int lvlb[2];   /* level-0 corner / level of the batch in each buffer (verso dump) */
     int srcb[2], last;           /* the batch's source in each buffer (-1 unknown); the buffer of the last training step's batch (diagnostics) */
@@ -90,6 +91,7 @@ typedef struct {
                                                                                       loss sums (device / last fetched), the recipe of the next forward */
 } gpu_state;
 /* task band_affinity: output channel 0 = recto (dense loss on target channel 0), channels 1..K = affinities for g_aff_off */
+static int g_lat;   /* --lat 4: the network on the 4^3 cells of the window (unet_cfg.half_res 3, pool4), the losses in full-resolution head slabs (nn_lat_*) */
 static int g_half, g_hdiv = 1;   /* --half-res: 1 pool, 2 pack, 3 pool4, 4 pack4 (unet_cfg.half_res), g_hdiv its factor; the losses see g_cout
                                     full-resolution channels */
 static int g_pkf;   /* --half-res pack, the direct path: the losses read the network's packed logits (nn_loss_pack) and write its packed
@@ -768,7 +770,8 @@ static void head_slab_pass(gpu_state *d, int pass) {
         const int z1 = z0 + Z < D ? z0 + Z : D, nz = z1 - z0;
         const size_t ns = (size_t)nz * hw, vb = (size_t)z0 * hw;
 #define LGC(c) ((char *)d->hs_lg + (size_t)(c) * ns * 2)
-        if (unet_head_fwd_z(d->u, z0, z1, d->hs_lg)) { fprintf(stderr, "head slabs: the head is not covered (MX activations; UFSM_HEAD_SLAB=0)\n"); abort(); }
+        if (g_lat) nn_lat_up_slab(d->lg, unet_logits_h16(d->u), g_cout, D / 4, H / 4, W / 4, z0, nz, d->hs_lg);   /* --lat: the cell grid's logits on this slab */
+        else if (unet_head_fwd_z(d->u, z0, z1, d->hs_lg)) { fprintf(stderr, "head slabs: the head is not covered (MX activations; UFSM_HEAD_SLAB=0)\n"); abort(); }
         const shape5 one = {1, 1, nz, H, W}, two = {1, 2, nz, H, W}, seven = {1, 7, nz, H, W};
         nn_phase_targets(d->sdb + vb, ns, d->sidet, d->sidem);
         if (g_rv) {   /* --rv: the side slot's targets (the phase targets above stay for the winding mod 4 / gradient terms) */
@@ -821,7 +824,8 @@ static void head_slab_pass(gpu_state *d, int pass) {
             if (g_norm_lambda != 1.f) nn_loss_grad_scale(LGC(g_norm_ch), 6 * ns, g_norm_lambda);
             if (g_dens_lambda != 1.f) nn_loss_grad_scale(LGC(g_norm_ch + 6), ns, g_dens_lambda);
         }
-        if (unet_head_bwd_z(d->u, z0, z1, d->hs_lg, z0 == 0)) { fprintf(stderr, "head slabs: the fused head backward is not covered (UFSM_HEAD_SLAB=0)\n"); abort(); }
+        if (g_lat) nn_lat_up_adj(d->hs_lg, g_cout, D / 4, H / 4, W / 4, z0, nz, d->latg);   /* --lat: the slab's gradient onto the cell grid */
+        else if (unet_head_bwd_z(d->u, z0, z1, d->hs_lg, z0 == 0)) { fprintf(stderr, "head slabs: the fused head backward is not covered (UFSM_HEAD_SLAB=0)\n"); abort(); }
 #undef LGC
     }
     if (!pass) {
@@ -933,7 +937,8 @@ static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
         const float *l2 = unet_forward_x(d->u, d->x2, (shape5){B, unet_cfg_of(d->u)->cin, q, q, q}, train, g_xfmt != 0);
         nn_lowres_output(l2, unet_logits_h16(d->u), hs, g_hdiv, hm, (float *)d->lrt, d->lgf);
         lg = d->lgf;
-    } else lg = unet_forward_x(d->u, d->x, xs, train, g_xfmt != 0);
+    } else if (g_lat) lg = unet_forward_x(d->u, d->x, (shape5){B, 4, g_Pz / 4, P / 4, P / 4}, train, g_xfmt != 0);   /* --lat: x the full-resolution CT channel */
+    else lg = unet_forward_x(d->u, d->x, xs, train, g_xfmt != 0);
     d->lg = lg;
     mem_post(d, B, train);
     if (train && !g_half && !g_head_slab && !g_pkf) diag_nonfinite(d, "logits", lg, (size_t)B * g_cout * xs.d * P * P, unet_logits_h16(d->u) ? 1 : 0);   /* (UFSM_SYNC_CHECK) */
@@ -962,6 +967,13 @@ static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
         if (prof) nn_prof_begin(6);
         d->gl = nullptr; d->hs_dice = dice_w; d->hs_train = train;
         head_slab_pass(d, 0);
+        if (g_lat && train) {   /* --lat: the gradient pass now (the network's head is whole on the cell grid), into the coarse gradient */
+            const size_t nc = (size_t)g_cout * (g_Pz / 4) * (P / 4) * (P / 4);
+            nn_zero(d->latg, nc * 4);
+            head_slab_pass(d, 1);
+            nn_f32_to_h16(d->latg, nc, d->latgl, 1.f);   /* (the slab gradients carry the gradient scale already) */
+            d->gl = d->latgl;
+        }
         if (prof) nn_prof_end();
         return;
     }
@@ -1656,6 +1668,16 @@ int cmd_train(int argc, char **argv) {
         g_half = !strcmp(hr, "pool") ? 1 : !strcmp(hr, "pack") ? 2 : !strcmp(hr, "pool4") ? 3 : !strcmp(hr, "pack4") ? 4 : 0;
         if (!g_half && strcmp(hr, "none")) { fprintf(stderr, "--half-res none|pool|pack|pool4|pack4\n"); return 2; }
         if (resume) { unet_cfg pc; int st; if (!unet_peek(resume, &pc, &st)) g_half = pc.half_res; }
+        g_lat = atoi(opt(argc, argv, "--lat", "0"));
+        if (g_lat && g_lat != 4) { fprintf(stderr, "--lat: 4 (the network on 4^3 cells)\n"); return 2; }
+        if (g_half == 3 && g_unwrap2) g_lat = 4;   /* (a resumed --lat checkpoint) */
+        if (g_lat) {
+            if (!g_unwrap2 || split || overfit || g_verso || g_aff) { fprintf(stderr, "--lat 4: task unwrap2 only (no --split, --overfit, verso, affinities)\n"); return 2; }
+            if (!nn_get_f16()) { fprintf(stderr, "--lat 4: fp16 training (--f16 1)\n"); return 2; }
+            if (P % (4 << (cfg.nlev - 1)) || g_Pz % (4 << (cfg.nlev - 1))) { fprintf(stderr, "--lat 4: P must be divisible by %d\n", 4 << (cfg.nlev - 1)); return 2; }
+            g_half = 0; cfg.half_res = 3; cfg.cin = 4; cfg.cout = g_cout;
+            fprintf(stderr, "latent grid: the network runs on %d^3 cells of 4^3 voxels (%d inputs, %d outputs); losses at full resolution in head slabs\n", P / 4, cfg.cin, cfg.cout);
+        }
         g_hdiv = unet_hr_div(g_half);
         if (g_half) {
             const int pk = unet_hr_mode(g_half) == 2;
@@ -1895,6 +1917,7 @@ int cmd_train(int argc, char **argv) {
            UFSM_DUMP_BATCH (it shows the 4 channels): the host-built 4 channels as before */
         const int want = atoi(opt(argc, argv, "--gpu-input", "1"));
         g_gpu_want = want && g_xfmt && unet_act_mx() && !split && (!g_half || g_pkf) && g_xc == 4 && sample_gpu_input_ok(&sc) && !getenv("UFSM_DUMP_BATCH");
+        if (g_lat && !g_gpu_want) { fprintf(stderr, "--lat 4: needs the device-built input (--gpu-input 1, MX activations, 16-bit batches)\n"); return 2; }
         g_gpu_asked = atoi(opt(argc, argv, "--gpu-input", "0"));   /* (an explicit request: say when it cannot apply) */
         g_gpu_aug_asked = opt(argc, argv, "--gpu-aug", nullptr) != nullptr;
         g_gpu_aug_want = atoi(opt(argc, argv, "--gpu-aug", newdef ? "2" : "0"));   /* --gpu-aug 1: the CT channel built on the device (nn_aug_ct); 2: also the warped windows' labels (nn_label_warp) */
@@ -2085,7 +2108,7 @@ int cmd_train(int argc, char **argv) {
         g_hs_z = getenv("UFSM_HEAD_SLAB_Z") ? atoi(getenv("UFSM_HEAD_SLAB_Z")) : 32;
         if (g_hs_z < 1) g_hs_z = 1;
         if (g_hs_z > g_Pz) g_hs_z = g_Pz;
-        for (int g = 0; g < ng; g++) unet_set_head_ext(G[g].u, g_head_slab);
+        for (int g = 0; g < ng; g++) unet_set_head_ext(G[g].u, g_head_slab && !g_lat);
         if (g_pg_lambda > 0 && !g_head_slab) { fprintf(stderr, "--pgrad-lambda needs the head-slab loss path (task unwrap2, B 1, no --split / --verso)\n"); return 2; }
         if (g_valP == P && !getenv("UFSM_VALP_FORCE")) g_valP = 0;   /* (UFSM_VALP_FORCE=1: the separate validation network at the training size, a test) */
         if (g_valP) {   /* --val-P: the plain recto-style losses on whole cube windows; validation on GPU 0 */
@@ -2172,7 +2195,7 @@ int cmd_train(int argc, char **argv) {
                 fmin = fmin > g_val_reserve ? fmin - g_val_reserve : 0;
                 fprintf(stderr, "memory: --val-P %d keeps %.2f GB free for the validation network\n", g_valP, g_val_reserve / 1e9);
             }
-            const shape5 xs = g_half ? (shape5){B, cfg.cin, P / g_hdiv, P / g_hdiv, P / g_hdiv} : (shape5){B, cfg.cin, split ? g_Dl : g_Pz, P, P};   /* split: this GPU's slab of the window */
+            const shape5 xs = g_lat ? (shape5){B, cfg.cin, g_Pz / 4, P / 4, P / 4} : g_half ? (shape5){B, cfg.cin, P / g_hdiv, P / g_hdiv, P / g_hdiv} : (shape5){B, cfg.cin, split ? g_Dl : g_Pz, P, P};   /* split: this GPU's slab of the window */
             const size_t p3 = p3l;
             int pick = -1, pick_hoff = 1, minc = -1, min_hoff = 1; size_t need = 0, pick_off = 0, pick_need = 0, min_need = (size_t)-1;
             {   /* the batch tail [targets | mask] the three-level-0-buffer layout holds at X3's end (its dry builds size X3 for it) */
@@ -2219,6 +2242,7 @@ int cmd_train(int argc, char **argv) {
                 const size_t grec = unet_grad_mx4() && (cfg.widths[0] % 32 == 0 || lp_gyrec_narrow()) && (getenv("UFSM_GYREC") ? atoi(getenv("UFSM_GYREC")) : 1)
                                     ? (gdef ? (size_t)100 << 20 : (size_t)B * cfg.widths[0] * p3 * 136 / 256) : 0;
                 need = grec + tb + tb / 14 + trainer + (nn_get_loss_tol() ? (size_t)B * p3 : 0) + (g_aff ? (size_t)2 * B * p3 : 0) + (g_unwrap ? (g_head_slab ? (size_t)4 * B * p3 + (size_t)g_hs_z * P * P * (2 * g_cout + 11) + 4096 : (size_t)15 * B * p3) + (g_unwrap2 ? (size_t)4 * B * p3 : 0) + (IPLANE ? (size_t)2 * B * p3 + (size_t)(g_rv ? 3 : 2) * g_hs_z * P * P : 0) : 0) + (g_cond ? (size_t)7 * B * p3 : 0) + (g_pap_head ? (size_t)4 * B * p3 : 0) + (g_restore ? (size_t)B * p3 * (cand[c].lean ? 5 : 1) + restore_scratch_bytes(g_Pz, P, P, fminf(g_rr.sc_step[0], 4.f)) + 256 : 0) + ((size_t)550 << 20) + (split ? (size_t)4 * B * 32 * P * P * 2 : 0) + (g_gpu_aug_want && gin ? nn_aug_device_bytes(P) + (g_gpu_aug_want == 2 ? nn_label_warp_device_bytes(P) : 0) : 0);   /* split: two slots of halo send / receive planes */   /* kernel workspaces: measured device growth / tracked ~1.07 + 0.3 GB, + 0.2 GB margin for other processes */
+                if (g_lat) need += (xin_sep ? 0 : xinb) + batb + (size_t)g_cout * (p3 / 64) * 6;   /* --lat: the full-resolution batch beside the cell-grid network, the coarse logit gradient (fp32 + 16-bit) */
                 if (ufsm_env_on("UFSM_MEM_REPORT"))   /* the planner's terms of this mode */
                     fprintf(stderr, "memory plan: mode %d (%s%s): network %.2f + workspace %.2f + gy records %.2f + trainer %.2f + task %.2f + fixed %.2f = %.2f GB\n", c, cand[c].what,
                             pass ? "" : ", no host offloads", tb / 1e9, tb / 14 / 1e9, grec / 1e9, trainer / 1e9, (need - grec - tb - tb / 14 - trainer - ((size_t)550 << 20)) / 1e9, (double)((size_t)550 << 20) / 1e9, need / 1e9);
@@ -2266,10 +2290,10 @@ int cmd_train(int argc, char **argv) {
         size_t goff = 0;
         int xin_in = 0;
         d->gl = nullptr; d->gl_inside = 0; d->gl_inplace = g_gl_inplace;
-        if (lean && !g_restore) {   /* (restore: target, mask, input and logit gradient in their own buffers: the MX chunk transient of a
+        if (lean && !g_restore && !g_lat) {   /* (--lat: the batch is the full-resolution window, the network the cell grid: own buffers. restore: target, mask, input and logit gradient in their own buffers: the MX chunk transient of a
                                        16-channel level 0 does not fit beside them in the gradient buffer) */
             unet_set_batch_bytes(d->u, xin_b ? xbb : 0, tbb + mbb);
-            unet_build(d->u, g_half ? (shape5){B, cfg.cin, P / g_hdiv, P / g_hdiv, P / g_hdiv} : (shape5){B, cfg.cin, split ? g_Dl : g_Pz, P, P}, 1);
+            unet_build(d->u, g_lat ? (shape5){B, cfg.cin, g_Pz / 4, P / 4, P / 4} : g_half ? (shape5){B, cfg.cin, P / g_hdiv, P / g_hdiv, P / g_hdiv} : (shape5){B, cfg.cin, split ? g_Dl : g_Pz, P, P}, 1);
             goff = unet_lean_nob(d->u) ? 0 : glb;
             void *l3t = nullptr;
             if (unet_l0_3buf(d->u) && (bs = unet_batch_scratch2(d->u, xin_b ? xbb : 0, tbb + mbb, &l3t))) {   /* three level-0 buffers: the input in X2,
@@ -2351,6 +2375,7 @@ int cmd_train(int argc, char **argv) {
             if (g_head_slab) {
                 d->hs_z = g_hs_z; d->hs_P = P;
                 d->hs_lg = nn_malloc((size_t)g_cout * tp3 * 2); d->hs_ds = nn_malloc(64 * sizeof(double));
+                if (g_lat) { const size_t nc = (size_t)g_cout * (g_Pz / 4) * (P / 4) * (P / 4); d->latg = nn_malloc(nc * 4); d->latgl = nn_malloc(nc * 2); }
                 if (g_pg_lambda > 0) { d->pg_acc = nn_malloc(2 * tp3 * sizeof(float)); nn_zero(d->pg_acc, 2 * tp3 * sizeof(float)); }
                 unet_set_head_cb(d->u, head_slab_cb, d);
                 if (g == 0) fprintf(stderr, "head slabs: %d planes per slab (%.0f MB of logits and targets instead of %.2f GB)\n", g_hs_z,

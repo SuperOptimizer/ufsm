@@ -2517,6 +2517,7 @@ const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x
     else if (x_h16 && act_mx8() && xin_mx) {
         if (!u->xin) u->xin = dalloc_input(u, xs);
         if (u->rad && u->cfg.half_res == 2) nn_input_rad_pack(x, xs, u->rad, u->xin);   /* --half-res pack: x is the full-resolution CT channel */
+        else if (u->rad && u->cfg.half_res == 3) nn_input_lat(x, xs, u->rad, u->xin);   /* train --lat 4: the 4^3 cell means, x the full-resolution CT channel */
         else if (u->rad && u->l0rx) { u->l0x_ct = x; for (int k = 0; k < 16; k++) u->l0x_held[k] = -1; }   /* (stage S4: per slab in the stream, l0x_need) */
         else if (u->rad) nn_input_rad(x, xs, u->rad, u->xin);   /* --gpu-input: x is the CT channel, the radial channels from the records */
         else nn_h16_to_mx(x, xs, u->xin);
@@ -2528,7 +2529,7 @@ const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x
         }
     }
     if (u->rad && !(x_h16 && act_mx8() && xin_mx && !u->ctin.on)) { fprintf(stderr, "unet_forward_x: radial input records need the 16-bit -> MX input conversion\n"); abort(); }
-    u->l3_ct = u->l3b && train && u->rad && u->cfg.half_res != 2 && x_h16 && xin_mx && u->h_xin && l3_ct_on() && l3_ct_off(u) && l3_ct_bytes(u) <= u->xin_bytes
+    u->l3_ct = u->l3b && train && u->rad && u->cfg.half_res != 2 && u->cfg.half_res != 3 && x_h16 && xin_mx && u->h_xin && l3_ct_on() && l3_ct_off(u) && l3_ct_bytes(u) <= u->xin_bytes
                && (const char *)x >= (const char *)u->l3x[2] && (const char *)x + l3_ct_bytes(u) <= (const char *)u->l3x[2] + u->l3xb[2];
     if (u->l3_ct) {   /* (l3b, GPU-built input) the CT to the host: enc[0]'s conv2 writes X2 after it */
         nn_offload_copy(u->h_xin, x, l3_ct_bytes(u), 1, u->ev_xin[0], u->ev_xin[1]);
