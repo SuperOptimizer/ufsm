@@ -63,6 +63,7 @@ size_t nn_ring_bytes(void);
 /* event profiler (no host syncs): bracket ops, then collect per-category GPU milliseconds */
 void nn_prof_begin(int k);
 void nn_prof_end(void);
+int nn_ptick_on(void); void nn_ptick(const char *name); void nn_ptick_report(int steps);   /* UFSM_PTICK=1: synchronised phase timer (nn_core.cu) */
 void nn_prof_collect(double *out, int nk);
 
 /* Tensor-core TF32 path for the 3^3 stride-1 convolutions (default on; fp32 CUDA-core kernels otherwise). */
@@ -176,7 +177,7 @@ void nn_input_lat(const void *ct16, shape5 xs, const void *rec, void *y);
    [C][d][h][w] (fp16 when lh16, else fp32) -> fine planes [z0, z0 + nz) of the 4d x 4h x 4w window, fp16 [C][nz][4h][4w] in y;
    nn_lat_up_adj adds the adjoint of such a slab's fp16 gradient g into the fp32 coarse gradient gc [C][d][h][w] */
 void nn_lat_up_slab(const void *lg, int lh16, int C, int d, int h, int w, int z0, int nz, void *y);
-void nn_lat_up_adj(const void *g, int C, int d, int h, int w, int z0, int nz, float *gc);
+void nn_lat_up_adj(const void *g, int C, int d, int h, int w, int z0, int nz, float *gc, void *scratch);   /* scratch: C nz h w fp32 for the separable path (z0, nz multiples of 4), or nullptr */
 /* train --gpu-aug (src/nn_aug.cu): a window's CT channel built on the device from its source-grid bytes ct8_h (P^3, pinned) and record
    rec_h (scan_augment.h scan_ct_rec: the scanner plan, jitter, normalisation): the scanner ops in 16-bit storage in ct16 (the channel's
    own buffer), the output bytes' z-score, then the symmetry / warp of rad_d (the device copy of the window's NN_RAD_REC record, uploaded

@@ -2517,7 +2517,7 @@ const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x
     else if (x_h16 && act_mx8() && xin_mx) {
         if (!u->xin) u->xin = dalloc_input(u, xs);
         if (u->rad && u->cfg.half_res == 2) nn_input_rad_pack(x, xs, u->rad, u->xin);   /* --half-res pack: x is the full-resolution CT channel */
-        else if (u->rad && u->cfg.half_res == 3) nn_input_lat(x, xs, u->rad, u->xin);   /* train --lat 4: the 4^3 cell means, x the full-resolution CT channel */
+        else if (u->rad && u->cfg.half_res == 3) { nn_input_lat(x, xs, u->rad, u->xin); nn_ptick("input pool"); }   /* train --lat 4: the 4^3 cell means, x the full-resolution CT channel */
         else if (u->rad && u->l0rx) { u->l0x_ct = x; for (int k = 0; k < 16; k++) u->l0x_held[k] = -1; }   /* (stage S4: per slab in the stream, l0x_need) */
         else if (u->rad) nn_input_rad(x, xs, u->rad, u->xin);   /* --gpu-input: x is the CT channel, the radial channels from the records */
         else nn_h16_to_mx(x, xs, u->xin);

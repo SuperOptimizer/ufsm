@@ -425,6 +425,28 @@ extern "C" void nn_prof_collect(double *out, int nk) {
     for (int i = 0; i < g_nev; i++) { float ms = 0; cudaEventElapsedTime(&ms, g_ev[i][0], g_ev[i][1]); if (g_evk[i] < nk) out[g_evk[i]] += ms; }
     g_nev = 0;
 }
+/* UFSM_PTICK=1: phase timer. nn_ptick(name) synchronises the device and adds the wall time since the previous tick to the bucket name
+   (the phase that just ended); nn_ptick(nullptr) only restarts the clock; nn_ptick_report prints and resets. Off: a load and a branch. */
+static int g_ptick = -1, g_ptn; static const char *g_ptname[64]; static double g_ptms[64], g_ptlast; static long g_ptcnt[64];
+static double pt_now(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec * 1e3 + ts.tv_nsec * 1e-6; }
+extern "C" int nn_ptick_on(void) { if (g_ptick < 0) { const char *e = getenv("UFSM_PTICK"); g_ptick = e && *e && strcmp(e, "0"); } return g_ptick; }
+extern "C" void nn_ptick(const char *name) {
+    if (!nn_ptick_on()) return;
+    cudaDeviceSynchronize();
+    const double t = pt_now();
+    if (name) {
+        int k = 0; while (k < g_ptn && strcmp(g_ptname[k], name)) k++;
+        if (k == g_ptn && g_ptn < 64) g_ptname[g_ptn++] = name;
+        if (k < 64) { g_ptms[k] += t - g_ptlast; g_ptcnt[k]++; }
+    }
+    g_ptlast = pt_now();
+}
+extern "C" void nn_ptick_report(int steps) {
+    if (!nn_ptick_on() || !g_ptn) return;
+    double tot = 0; for (int k = 0; k < g_ptn; k++) tot += g_ptms[k];
+    fprintf(stderr, "ptick: ms per step over %d steps (synchronised phases; total %.1f)\n", steps, tot / steps);
+    for (int k = 0; k < g_ptn; k++) { fprintf(stderr, "  %-22s %9.2f ms  %5.1f%%  (%ld calls)\n", g_ptname[k], g_ptms[k] / steps, 100 * g_ptms[k] / tot, g_ptcnt[k] / steps); g_ptms[k] = 0; g_ptcnt[k] = 0; }
+}
 extern "C" size_t nn_mem_free(void) { size_t f = 0, t = 0; cudaMemGetInfo(&f, &t); return f; }
 extern "C" void ufsm_no_verify_types(const char *fn) {
     fprintf(stderr, "%s: bf16 / fp32 tensor-core kernels are not in this build (rebuild with make VERIFY=1)\n", fn); abort();
