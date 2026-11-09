@@ -167,6 +167,14 @@ void nn_input_rad(const void *ct16, shape5 xs, const void *rec, void *y);
 /* --half-res pack: the same from the full-resolution CT channel [n][8 d h w] and records of NN_RAD_REC(2 d), into the network's
    8-channel input on the 2x2x2 blocks (xs {n, 8, d, h, h}): bit for bit write_x -> nn_half_input(mode 2) -> nn_h16_to_mx */
 void nn_input_rad_pack(const void *ct16, shape5 xs, const void *rec, void *y);
+/* train --lat 4 (pool4) with --gpu-input: the 4-channel MX input on the 4^3 cells of the window (xs {n, 4, d, h, h}: the cell grid), each
+   channel the cell mean of nn_input_rad's full-resolution value (warp included) from the full-resolution 16-bit CT channel ct16 */
+void nn_input_lat(const void *ct16, shape5 xs, const void *rec, void *y);
+/* latent-grid logits -> one z-slab of fine logits and back (src/nn_lat.cu; the pool4 chain of nn_lowres_output, B 1): coarse lg
+   [C][d][h][w] (fp16 when lh16, else fp32) -> fine planes [z0, z0 + nz) of the 4d x 4h x 4w window, fp16 [C][nz][4h][4w] in y;
+   nn_lat_up_adj adds the adjoint of such a slab's fp16 gradient g into the fp32 coarse gradient gc [C][d][h][w] */
+void nn_lat_up_slab(const void *lg, int lh16, int C, int d, int h, int w, int z0, int nz, void *y);
+void nn_lat_up_adj(const void *g, int C, int d, int h, int w, int z0, int nz, float *gc);
 /* train --gpu-aug (src/nn_aug.cu): a window's CT channel built on the device from its source-grid bytes ct8_h (P^3, pinned) and record
    rec_h (scan_augment.h scan_ct_rec: the scanner plan, jitter, normalisation): the scanner ops in 16-bit storage in ct16 (the channel's
    own buffer), the output bytes' z-score, then the symmetry / warp of rad_d (the device copy of the window's NN_RAD_REC record, uploaded

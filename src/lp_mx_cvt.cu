@@ -84,13 +84,10 @@ extern "C" void lp_h16_to_mx4(const void *x, int dt, int N, int C, size_t S, voi
 template <typename TI> __device__ __forceinline__ float rnd16(float v);
 template <> __device__ __forceinline__ float rnd16<__half>(float v) { return __half2float(__float2half_rn(v)); }
 template <> __device__ __forceinline__ float rnd16<bf16>(float v) { return __bfloat162float(__float2bfloat16_rn(v)); }
-template <int B, typename TI>
-__global__ void input_rad_k(const TI *ct, const uint8_t *recs, size_t rec_bytes, int N, int D, int P, uint8_t *y, int z0 = 0, int nz = 0) {   /* grid (x blocks, y, n nz);
-                                                                     z-window: planes [z0, z0 + nz) (nz 0: all D) */
-    const int NZ = nz ? nz : D, ix = blockIdx.x * blockDim.x + threadIdx.x, iy = blockIdx.y, n = blockIdx.z / NZ, iz = z0 + (int)blockIdx.z - n * NZ;   /* (the voxel without 64-bit
-                                                                                                                     divisions: they were most of the time) */
-    if (ix >= P) return;
-    const size_t S = (size_t)D * P * P, i = (((size_t)n * D + iz) * P + iy) * P + ix;
+/* the 4 input channels of one voxel (CT, then the radial unit vector through the window's symmetry or warp), the expressions of
+   input_rad_k in order (bit for bit): voxel (n, iz, iy, ix) of an N x D x P x P window, i its linear index */
+template <typename TI>
+__device__ __forceinline__ void rad_full4(const TI *ct, const uint8_t *recs, size_t rec_bytes, int N, int D, int P, int n, int iz, int iy, int ix, size_t i, float *r4) {
     const int *h = (const int *)(recs + (size_t)n * rec_bytes);
     const float *cyz = (const float *)(h + 8), *cxz = cyz + h[2];
     const int o1 = h[0], o2 = h[1], hasax = h[4], pf = h[5];
@@ -156,7 +153,7 @@ __global__ void input_rad_k(const TI *ct, const uint8_t *recs, size_t rec_bytes,
 #pragma unroll
             for (int d = 0; d < 3; d++) r[1 + d] = rnd16<TI>(__fdiv_rn(tr[d], norm));
         }
-        mx_store_row_b<B>(y, mx_sc<B>(y, N, 4, S), i, 8, r);
+        for (int k = 0; k < 4; k++) r4[k] = r[k];
         return;
     }
     float comp[3] = {0.f, 0.f, 0.f};
@@ -167,7 +164,41 @@ __global__ void input_rad_k(const TI *ct, const uint8_t *recs, size_t rec_bytes,
     }
 #pragma unroll
     for (int d = 0; d < 3; d++) r[1 + d] = rnd16<TI>(__fmul_rn((pf >> (8 + d)) & 1 ? -1.f : 1.f, comp[(pf >> (2 * d)) & 3]));   /* sign x component (signed zeros as the host) */
+    for (int k = 0; k < 4; k++) r4[k] = r[k];
+}
+template <int B, typename TI>
+__global__ void input_rad_k(const TI *ct, const uint8_t *recs, size_t rec_bytes, int N, int D, int P, uint8_t *y, int z0 = 0, int nz = 0) {   /* grid (x blocks, y, n nz);
+                                                                     z-window: planes [z0, z0 + nz) (nz 0: all D) */
+    const int NZ = nz ? nz : D, ix = blockIdx.x * blockDim.x + threadIdx.x, iy = blockIdx.y, n = blockIdx.z / NZ, iz = z0 + (int)blockIdx.z - n * NZ;
+    if (ix >= P) return;
+    const size_t S = (size_t)D * P * P, i = (((size_t)n * D + iz) * P + iy) * P + ix;
+    float r[32];
+#pragma unroll
+    for (int k = 0; k < 32; k++) r[k] = 0.f;
+    rad_full4<TI>(ct, recs, rec_bytes, N, D, P, n, iz, iy, ix, i, r);
     mx_store_row_b<B>(y, mx_sc<B>(y, N, 4, S), i, 8, r);
+}
+/* train --lat 4 (pool4) with --gpu-input: the network's 4 input channels on the 4^3 cells of the window, each the cell mean (fp32 sum in
+   sub-voxel order, then rounded to the 16-bit type) of rad_full4's full-resolution channels (the warp included), straight from the
+   16-bit CT channel and the radial records, without a full-resolution 4-channel window. One thread per cell; d, h (= w): the cell grid */
+template <int B, typename TI>
+__global__ void input_lat_k(const TI *ct, const uint8_t *recs, size_t rec_bytes, int N, int d, int p, uint8_t *y) {
+    const size_t cv = (size_t)d * p * p, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= (size_t)N * cv) return;
+    const int n = (int)(i / cv); const size_t v = i % cv;
+    const int z = (int)(v / ((size_t)p * p)), yy = (int)((v / p) % p), xx = (int)(v % p), D = 4 * d, P = 4 * p;
+    float acc[4] = {0.f, 0.f, 0.f, 0.f};
+    for (int k = 0; k < 64; k++) {
+        const int fz = 4 * z + (k >> 4), fy = 4 * yy + (k >> 2 & 3), fx = 4 * xx + (k & 3);
+        float r4[4] = {0.f, 0.f, 0.f, 0.f};
+        rad_full4<TI>(ct, recs, rec_bytes, N, D, P, n, fz, fy, fx, (((size_t)n * D + fz) * P + fy) * P + fx, r4);
+        for (int c = 0; c < 4; c++) acc[c] += r4[c];
+    }
+    float r[32];
+#pragma unroll
+    for (int k = 0; k < 32; k++) r[k] = 0.f;
+    for (int c = 0; c < 4; c++) r[c] = rnd16<TI>(acc[c] * (1.f / 64.f));
+    mx_store_row_b<B>(y, mx_sc<B>(y, N, 4, cv), i, 8, r);
 }
 /* --half-res pack with --gpu-input: the network's 8 input channels on the 2x2x2 blocks of the window, straight from the full-resolution
    16-bit CT channel and the radial records: each sub-voxel's 4 channels as input_rad_k (rounded to the 16-bit type), then nn_half_input
@@ -237,6 +268,15 @@ extern "C" void lp_input_rad_pack(const void *ct16, int dt, const void *rec, siz
     if (bits == 4) { if (dt == 2) IRP(4, __half); else IRP(4, bf16); }
     else { if (dt == 2) IRP(8, __half); else IRP(8, bf16); }
 #undef IRP
+    LPCK();
+}
+extern "C" void lp_input_lat(const void *ct16, int dt, const void *rec, size_t rec_bytes, int N, int d, int p, void *y, int bits) {
+    const size_t n = (size_t)N * d * p * p;
+    const uint8_t *rr = (const uint8_t *)rec; uint8_t *yy = (uint8_t *)y;
+#define ILT(B, T) input_lat_k<B, T><<<nblk_(n, 128), 128>>>((const T *)ct16, rr, rec_bytes, N, d, p, yy)
+    if (bits == 4) { if (dt == 2) ILT(4, __half); else ILT(4, bf16); }
+    else { if (dt == 2) ILT(8, __half); else ILT(8, bf16); }
+#undef ILT
     LPCK();
 }
 extern "C" void lp_input_rad(const void *ct16, int dt, const void *rec, size_t rec_bytes, int N, int D, int P, void *y, int bits) {
