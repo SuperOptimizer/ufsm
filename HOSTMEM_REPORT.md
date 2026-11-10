@@ -475,3 +475,23 @@ test_rv passes on the combined tree.
 
   A slot is 1.88 GB at P960 and 2.28 GB at P1024 (2.125 B/vox); the RSS step per added slot is 1.76 / 2.13 GB. A worker
   holds 2.8-3.3 GB at P960 and 3.4-3.8 GB at P1024. The trainer's own host memory (CUDA context, val buffer, offloads) is not included.
+
+### Trainer's own host memory (P768, the two production runs, read-only /proc snapshots, 2026-11-09)
+
+wz768 (ufsm.lat11, W6 S10, no --rv, lat-guide 3) RSS 32.3 GB; g768 (W10 S12, --rv, lat-guide 1) RSS 47.3 GB. From their smaps
+(GiB; a P768 plane is 0.422 GiB):
+
+| | wz768 | g768 |
+|---|---|---|
+| pinned (/dev/zero) total | 19.57 | 27.52 |
+|  - sampler slots (S x 4 resp. 5 planes, this binary) | 16.88 | 25.31 |
+|  = trainer pinned: 4 P^3 planes + other | 1.69 + 1.00 | 1.69 + 0.52 |
+| worker scratch mapping (W x 5.4 GB virt), resident | 10.13 (1.69 / worker = 4 B/vox) | 16.88 (1.69 / worker) |
+| other anon + heap (trainer, CUDA libs) | ~0.9 | ~0.5 |
+| **trainer's own** | **~3.6** | **~2.7** |
+
+Sampler-only runs of the same binary and flags (CUDA_VISIBLE_DEVICES=, 16-30 batches) reproduce the slot sizes exactly
+(1.81 / 2.27 GB per slot) but leave worker scratch at 1.36 - 1.4 GB / worker: steady-state workers touch their whole 4 B/vox
+(1.81 GB at P768) only after hours. **The round-3d P960 / P1024 table's worker column is therefore low**; use 4 B/vox per
+worker (3.54 GB at P960, 4.29 GB at P1024) for budgets. Budget at P1024, W4 S6, --gpu-aug 3 + ink bits: slots 6 x 2.28 = 13.7 +
+workers 4 x 4.29 = 17.2 + trainer (4 planes 4.3 + other ~1-2.3 if it scales with P^3) ~6 = **~37 GB per trainer**; two trainers ~74 GB.
