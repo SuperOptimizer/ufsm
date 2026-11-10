@@ -6,6 +6,84 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## The batch upload measured part by part; cheaper scan-augmentation kernels; the wide stride-2 backward on tensor cores (2026-11-10, branch perf-20261109)
+
+**Why.** The P1152 guided rv run made 370-420 Mvox/s against a same-batch figure of 786: the same-batch mode (`UFSM_BENCH_SAME`) skips
+the loader and the upload. Under lean 2 there is one input buffer, so the next batch's upload runs after the step, serial to it.
+
+**The fused head on a quiet card** (GPU 0, same batch, free-running, one binary with the env switches):
+
+| samples/s | slab chain (`UFSM_LAT_FUSE=0`) | fused | fused + light pass 0 |
+|---|---|---|---|
+| rv, lat_guide 5, P1024 | 0.74 | 0.83 | 0.91 (980 Mvox/s) |
+| rv, P512 | 5.26 | 5.47 | 6.12 |
+| winding, lat_guide 64, P1024 | 0.40 | | 0.42 |
+| winding, P512 | 3.09 | | 3.20 |
+
+**The upload of one rv P1024 batch** (quiet card, `UFSM_PTICK=2`, `UFSM_SYNC_UPLOAD=1`; one batch, with blur, correlated noise and gin all
+on; 1.7 s against 1.1 s of step compute):
+
+| part | ms | note |
+|---|---|---|
+| correlated noise | 577 | p 0.1 |
+| load + blur ops | 311 | p 0.7 |
+| gin | 102 | p 0.15 |
+| other scan ops | 31 | |
+| CT sums + warp / write | 110 | every batch |
+| CT bytes up | 38 | every batch |
+| label builds on the device (papyrus 185, side 168, w4 5) | 358 | every batch; mostly the 1 GB source plane going up |
+| label planes back to the host | 178 | every batch (the label stream) |
+| per-slab label upload in the two head passes | 380 | inside the step, on the aux stream |
+
+Weighted by the ops' probabilities: labels ~0.5 s outside the step, scan augmentation ~0.32 s, CT ~0.15 s, per average step. An earlier
+split at P512 beside another process (copies ~11% of the upload) does not hold at P1024.
+
+**No overlap without memory.** With guided heads the full-resolution input is read until the end of the gradient pass (the guide), and
+the label builds use the input buffer as their scratch, so uploading batch N+1 during step N needs a second input buffer or 2 P^3 bytes of
+label scratch: 2-3 GB at P1152, which the window does not have. Not done.
+
+**Correlated noise in chunks of planes.** It ran two kernels per z plane (2 P launches of P threads each). Now three kernels per 64 MB chunk
+of planes: the x recurrences of the chunk's rows, y per (plane, column), z per (y, x) with the carried plane. Byte-identical to the
+per-plane kernels (`test_gpu_aug`, chunks of 1 / 5 / P / default planes). P512, op on, beside another process: 316 -> 26 ms.
+
+**Separable operators (blur, lowres).** Micro-benchmark `TGA_BENCH=P build-verify/test_gpu_aug` (GPU 1 beside a training run, so
+indicative), ms per pass:
+
+| P, taps | z / y shared-memory | z / y line | x, one row a block | x, rows + weight table |
+|---|---|---|---|---|
+| 768, 13 | 17.5 | 11.8 | 56.8 | 12.7 |
+| 1024, 5 | | 22.8 | 67.1 | 25.2 |
+| 1024, 13 | | 27.7 | 137.2 | 30.1 |
+| 1024, 21 | | 37.5 | 193.7 | 36.8 |
+
+- z / y: one thread per line with a ring of the last 64 original values (in place, coalesced across x) instead of P x 32 halves of shared
+  memory per block (64 KB at P1024: one block per SM). A host check (`bop_ring_ok`) falls back to the shared-memory kernel when a row's
+  taps would leave the ring.
+- x: the old kernel loaded a different row of the weight table per thread (8 ms per tap and Gvoxel against 1 in z / y, where a warp
+  shares its row). Now R rows per block in shared memory and the weights from a table of the operator's distinct rows, built on the
+  device (`aug_bop_uniq_k`; more than 64 distinct rows: the plan's own rows). A thread-per-row ring variant measured 80-90 ms flat.
+- Byte-identical to the first kernels (`test_gpu_aug`: a 5-tap, an irregular 16-tap and a 9-tap operator, and the table's fallback).
+
+**The 96-wide net's stride-2 convs.** `UFSM_PROF=layers`, winding P512, 10 steps, beside another process: the trunk's convs are 75% of
+the profile and scale with the products (dec0.c1, 224 -> 96: 560 ms; enc0.c2 and dec0.c2, 96 -> 96: ~230 ms each), no slow path there.
+The down convs were: the fp4 tensor-core stride-2 backward-data existed for 16 / 32 / 64 channels only, wider layers ran the dilated fp8
+conv through MX-fp8 copies (a full-resolution conv's work for an eighth of the products). `bwd_data_s2_f4_k` now takes 96 and 128
+channels: two K units per tap (the tap's gy blocks 2 j, 2 j + 1; 96: a zero fourth block), 85 KB of shared memory at 128.
+
+| ms per 10 steps | before | after |
+|---|---|---|
+| down0 (96) bwd_data | 134.1 | 22.7 |
+| down1 (128) bwd_data | 31.4 | 4.5 |
+| all conv bwd_data | 524 | 327 |
+
+`test_grad_mx4`: 96 and 128 against the fp32 reference like 64 (one draw 0.166, mean of 16 0.042). 160 channels (down2) stay on the
+fp8 route (three K units per tap do not fit the shared memory). The stride-2 forward and weight gradient stay fp8 at these widths: the
+general fp4 forward (`UFSM_S2_F4G=1`, off for its unexplained drift in test_split) measured 62 against 81 ms, and a fit over the two
+nets (17 ms at 32 -> 32, 83 at 96 -> 96) puts ~35 ms of a 96-channel level-0 conv in reading and transforming its input, which a
+stride-2 conv pays in full.
+
+**Not measured:** the new augmentation kernels and the 96 / 128 backward in a real run on a quiet card.
+
 ## The latent head's full-resolution passes fused per coarse cell; an uncontended step profile (2026-11-10, branch perf-20261109)
 
 Profile first (GPU 0 alone for 5.5 minutes, fp4, streamed head, `--gpu-aug 3`, same batch, `UFSM_PTICK=2`: the target / loss / upsample
