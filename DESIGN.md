@@ -114,6 +114,14 @@ trunk forward 84, trunk backward 310, slab adjoint 206, slab upsampling 50, labe
   (`UFSM_MALLOC_FILL`) changes nothing, so no unwritten memory is read. K repeated backwards without a rebuild stay unbiased
   (enc[0] 0.153 at 24, 0.080 at 96): the draws are valid, their assignment differs between the first backward after a build and
   the later ones, and between layouts. The op is not located.
+- **Resolved as far as production goes (22:30): the irreproducibility below needs level 1 narrower than level 0.** It appears only
+  with the test's first widths {96, 64, 96}; {96, 128, 160}, {96, 96, 96} and {32, 32, 32} reproduce every tensor to 1e-9 (one net
+  twice, two equal nets, whole head against per range), and so does {96, 64, 96} with `--input-prec 8`. On {96, 64, 96} each
+  backward of one net differs from the last in enc[0] and down0 (0.25-0.5), with identical logits and seed counts; it goes away
+  with `UFSM_GN_DEFER=0` or `UFSM_COARSE_GRAD_SHARE=0`. So a size assumption of the coarse-gradient share (gout[1]'s home in
+  dec[0].a2's buffer beside the 32-channel fp4 input) fails when w[1] < w[0]; the production nets (96,128,160,192 and
+  32,64,128,192,256) are not that case. test_lat_head now uses (32,64,96) and (96,128,160) and holds enc[0] to the same bound;
+  `TLH_W1=64 TLH_W2=96 TLH_REPRO=1` shows the defect. Not fixed.
 - **Found on the way, not fixed: with a 96-wide level 0 under the lean-2 sharing modes (share_enc_a1 + a0_share) enc[0]'s parameter
   gradients are not reproduced between two equal backwards** (two nets with equal parameters, or the head whole against per range:
   rel 0.17-0.26 on enc[0], every other tensor equal to 1e-9; it depends on the allocation layout; 32-wide nets reproduce exactly;

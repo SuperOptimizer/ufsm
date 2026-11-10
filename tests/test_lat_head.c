@@ -50,10 +50,11 @@ int main(void) {
     setenv("UFSM_HEAD_FUSED", "0", 1);   /* the 8-output comparison net with 32 inputs: the separate kernels too (the fused <= 16-output kernel keys its SR otherwise) */
     unet_set_act_mx4(1); unet_set_grad_mx8(1); unet_set_grad_mx4(1); unet_set_input_prec(4); unet_set_recompute(1); unet_set_chunk_up(2); unet_set_lean(2);
     unet_set_share_enc_a1(1); unet_set_a0_share(1);   /* (the trainer's lean-2 modes; TLH_SHARE: others) */
+    if (getenv("TLH_IPREC")) unet_set_input_prec(atoi(getenv("TLH_IPREC")));
     if (getenv("TLH_SHARE")) { const int m = atoi(getenv("TLH_SHARE")); if (m & 1) unet_set_share_enc_a1(1); if (m & 2) unet_set_a0_share(1); if (m & 4) unet_set_a0_share(0); if (m & 8) unet_set_share_enc_a1(0); if (m & 16) unet_set_lean(0); if (m & 32) unet_set_chunk_up(0); }
     for (int wc = 0; wc < 2; wc++) {
         const int C0 = wc ? 96 : 32;
-        unet_cfg cfg = {3, {C0, 64, 96}, 32, CO, 8, 1, 0};   /* (three levels as the trainer's smallest nets) */
+        unet_cfg cfg = {3, {C0, getenv("TLH_W1") ? atoi(getenv("TLH_W1")) : C0 + 32, getenv("TLH_W2") ? atoi(getenv("TLH_W2")) : C0 + 64}, 32, CO, 8, 1, 0};   /* (32,64,96) and (96,128,160): the production nets' first levels */   /* (three levels as the trainer's smallest nets) */
         const shape5 xs = {1, 32, 16, 16, 16};
         const size_t nx = shape_numel(xs), S = nx / 32, no = S * CO;
         float *hx = malloc(nx * 4), *hg = malloc(no * 4);
@@ -62,9 +63,9 @@ int main(void) {
         float *x = nn_malloc(nx * 4), *gy = nn_malloc(no * 4); nn_h2d(x, hx, nx * 4); nn_h2d(gy, hg, no * 4);
         unet *u = unet_create(&cfg); unet_init(u, 41 + wc); unet_set_fp16_logits(u, 1);
         const size_t np = unet_nparams(u); size_t ow, ob; unet_head_offsets(u, &ow, &ob);
-        /* enc[0]'s parameters (the far end of the backward) are compared apart: with a 96-wide level 0 under the lean-2 sharing modes their
-           gradients are not reproduced between two equal backwards (another SR key on the way; found 2026-11-09, not the head's: every other
-           tensor is equal to the last bits); they are unbiased, which the last check holds them to */
+        /* enc[0]'s parameters (the far end of the backward) are also reported apart. Widths {96, 64, 96} (TLH_W1=64 TLH_W2=96: level 1
+           narrower than level 0, with the 32-channel fp4 input under the lean-2 sharing modes) do not reproduce enc[0] / down0 between two
+           equal backwards (found 2026-11-09, DESIGN.md); the widths here do, to the last bits */
         const size_t ne0 = (size_t)C0 * cfg.cin * 27 + C0 + 2 * C0 + (size_t)C0 * C0 * 27 + C0 + 2 * C0;
         float *par = malloc(np * 4); nn_d2h(par, unet_live_params(u), np * 4);
         for (size_t i = 0; i < (size_t)CO; i++) par[ob + i] = 0.5f * frand();   /* (unet_init: all biases -2) */
@@ -83,6 +84,7 @@ int main(void) {
         if (unet_head_ext_fwd(u, did, did + (size_t)C0 * C0, C0, da)) { printf("  dec[0]'s output through identity rows: not covered  FAIL\n"); bad++; }
         nn_sync(); nn_d2h(a16, da, S * C0 * 2);
         nn_set_sr_step(3100); unet_backward_x(u, gl, 1); const unsigned ctr0 = nn_sr_ctr(); unet_grad_d2h(u, ga);
+        if (getenv("TLH_REPRO")) printf("    a GroupNorm apply still pending after the backward: %d\n", lp_gnpend_flush());
         { const char *e = nn_check(); if (e) { printf("  CUDA error %s  FAIL\n", e); bad++; } }
         /* host references */
         float *a = malloc(S * C0 * 4), *lref = malloc(no * 4), *lgot = malloc(no * 4), *gwr = calloc((size_t)CO * C0 + CO, 4);
@@ -108,7 +110,13 @@ int main(void) {
         if (!ok1) bad++;
         if (getenv("TLH_REPRO")) {   /* the same backward again on this net, and on a second net of the same configuration */
             float *g2 = malloc(np * 4), *g3 = malloc(np * 4);
-            nn_set_sr_step(3000); unet_forward(u, x, xs, 1); unet_zero_grad(u); nn_set_sr_step(3100); unet_backward_x(u, gl, 1); unet_grad_d2h(u, g2);
+            uint16_t *l2 = malloc(no * 2); float *g5 = malloc(np * 4);
+            nn_set_sr_step(3000); const float *lq = unet_forward(u, x, xs, 1); nn_sync(); nn_d2h(l2, lq, no * 2); unet_zero_grad(u); nn_set_sr_step(3100); unet_backward_x(u, gl, 1); const unsigned cq = nn_sr_ctr(); unet_grad_d2h(u, g2);
+            size_t ld = 0; for (size_t i = 0; i < no; i++) ld += l2[i] != lw[i];
+            nn_set_sr_step(3000); unet_forward(u, x, xs, 1); unet_zero_grad(u); nn_set_sr_step(3100); unet_backward_x(u, gl, 1); unet_grad_d2h(u, g5);
+            printf("    repro: second forward's logits differ %zu, seeds %u / %u; third backward vs second: enc[0] %.3g rest %.3g\n", ld, cq, ctr0, rel2(g5, g2, ne0), rel2(g5 + ne0, g2 + ne0, np - ne0));
+            if (getenv("TLH_DETAIL")) detail(&cfg, g2, ga);
+            free(l2); free(g5);
             unet *e = unet_create(&cfg); unet_init(e, 3); unet_set_fp16_logits(e, 1); nn_h2d((float *)unet_live_params(e), par, np * 4);
             nn_set_sr_step(3000); unet_forward(e, x, xs, 1); unet_zero_grad(e); nn_set_sr_step(3100); unet_backward_x(e, gl, 1); unet_grad_d2h(e, g3);
             printf("    repro: same net again enc[0] %.3g rest %.3g; second equal net enc[0] %.3g rest %.3g\n", rel2(g2, ga, ne0), rel2(g2 + ne0, ga + ne0, np - ne0), rel2(g3, ga, ne0), rel2(g3 + ne0, ga + ne0, np - ne0));
@@ -135,7 +143,7 @@ int main(void) {
             nn_set_sr_step(3100); unet_backward_x(v, gl8, 1); unet_grad_d2h(v, g8);
             size_t lneq = 0; for (size_t i = 0; i < 8 * S; i++) lneq += l8[i] != lw[c0 * S + i];
             const double et = rel2(g4 + ne0, g8 + ne0, ow - ne0), ee = rel2(g4, g8, ne0), eh = rel2(g4 + ow + (size_t)c0 * C0, g8 + ow8, (size_t)8 * C0), ed = rel2(g4 + ob + CO, g8 + ob8 + 8, np8 - ob8 - 8);
-            const int ok = lay && !lneq && et < 1e-5 && eh < 1e-5 && ed < 1e-5;
+            const int ok = lay && !lneq && et < 1e-5 && ee < 1e-5 && eh < 1e-5 && ed < 1e-5;
             printf("  %d -> %d head, gradient on outputs %d..%d vs the 8-output net: layout %d, logits differ %zu, trunk grads rel %.3g (enc[0] %.3g), head rows %.3g, down norms %.3g%s\n",
                    C0, CO, c0, c0 + 7, lay, lneq, et, ee, eh, ed, ok ? "" : "  FAIL");
             if (!ok) bad++;
@@ -186,7 +194,7 @@ int main(void) {
             nn_set_sr_step(3100); unet_backward_x(e, nullptr, 1); const unsigned c1 = nn_sr_ctr(); unet_grad_d2h(e, g4);
             if (getenv("TLH_DUMP")) nn_storage_dump("ext bwd");
             size_t lneq = 0; for (size_t i = 0; i < no; i++) lneq += ls[i] != lw[i];
-            const double eg = rel2(g4 + ne0, ga + ne0, np - ne0), ee = rel2(g4, ga, ne0); const int ok = !l2 && !hc.bad && !lneq && eg < 1e-6 && c1 == ctr0 && m1 + no * 2 <= m0;
+            const double eg = rel2(g4 + ne0, ga + ne0, np - ne0), ee = rel2(g4, ga, ne0); const int ok = !l2 && !hc.bad && !lneq && eg < 1e-6 && ee < 1e-6 && c1 == ctr0 && m1 + no * 2 <= m0;
             printf("  %d -> %d head per %d cell planes vs whole: logits differ %zu, grads rel %.3g (enc[0] %.3g), seeds %u / %u, train bytes %zu -> %zu%s\n", C0, CO, HZ, lneq, eg, ee, c1, ctr0, m0, m1, ok ? "" : "  FAIL");
             if (!ok) bad++;
             if (getenv("TLH_DETAIL")) printf("    trunk %.3g head.w %.3g head.b %.3g tail %.3g\n", rel2(g4, ga, ow), rel2(g4 + ow, ga + ow, (size_t)CO * C0), rel2(g4 + ob, ga + ob, CO), rel2(g4 + ob + CO, ga + ob + CO, np - ob - CO));
