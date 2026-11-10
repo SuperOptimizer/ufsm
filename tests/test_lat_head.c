@@ -51,7 +51,7 @@ int main(void) {
     unet_set_act_mx4(1); unet_set_grad_mx8(1); unet_set_grad_mx4(1); unet_set_input_prec(4); unet_set_recompute(1); unet_set_chunk_up(2); unet_set_lean(2);
     unet_set_share_enc_a1(1); unet_set_a0_share(1);   /* (the trainer's lean-2 modes; TLH_SHARE: others) */
     if (getenv("TLH_FP8")) {   /* the --fp8 1 trainer: MX-fp8 activations and convs, the fp8 input (running checkpoints resume in it) */
-        if (nn_set_prec_policy("all=fp8:fp8:fp8")) bad++;
+        if (nn_set_prec_policy(getenv("TLH_POLICY") ? getenv("TLH_POLICY") : "all=fp8:fp8:fp8")) bad++;   /* (TLH_POLICY: bisecting one layer's precision) */
         unet_set_act_mx4(0); unet_set_act_mx8(1); unet_set_grad_mx4(0); unet_set_input_prec(8);
     }
     if (getenv("TLH_IPREC")) unet_set_input_prec(atoi(getenv("TLH_IPREC")));

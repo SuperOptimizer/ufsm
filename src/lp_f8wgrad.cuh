@@ -28,7 +28,7 @@ __global__ void __launch_bounds__(288, FAST ? BW8F_MINB : BW8_MINB) conv_bwd_w_f
     uint8_t *sxs = sgs + BMo * 8;                   /* [CH][4 slots] */
     float *sbias = (float *)(sxs + CH * 4);         /* [BMo] */
     chan_t *ctab8 = (chan_t *)(smem_raw + (((unsigned char *)(sbias + BMo) - smem_raw + 31) & ~31));   /* offset from smem_raw: an integer round trip would make every access below a generic load */   /* [CH] MX x: per-channel descriptors */
-    unsigned *amx = (unsigned *)(ctab8 + CH);      /* [2][CH] MX x: per-channel plane amax (bits), double-buffered by plane */
+    unsigned *amx = (unsigned *)(ctab8 + CH);      /* [3][CH] MX x: per-channel plane amax (bits), three buffers by plane pass (FAST: [2][2][CH]) */
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
     const int ci0 = blockIdx.y * CH, co0 = blockIdx.z * BMo;
     int bz = blockIdx.x;   /* spatial tiles use grid.x: grid.z is limited to 65535 */
@@ -56,7 +56,7 @@ __global__ void __launch_bounds__(288, FAST ? BW8F_MINB : BW8_MINB) conv_bwd_w_f
     const bool upt = sp.up && ci0 < Cx;   /* fused decoder upsample: this tile reads the half-resolution x (host: Cx % CH == 0) */
     if constexpr (IS_MX(T)) {
         if (threadIdx.x < CH) { const int ci = ci0 + threadIdx.x; ctab8[threadIdx.x] = make_chan(ci < Ci ? ci : Ci, Ci, Cx, n, upt ? plane / 8 : plane, x, sp, gp, N); }
-        if (threadIdx.x < 2 * CH) amx[threadIdx.x] = 0u;
+        if (threadIdx.x < 3 * CH) amx[threadIdx.x] = 0u;
         __syncthreads();
         uni = (coop & 1) && ctab8[0].p != nullptr && (ctab8[0].nib & 7) == 0;
 #pragma unroll
@@ -369,7 +369,7 @@ __global__ void __launch_bounds__(288, FAST ? BW8F_MINB : BW8_MINB) conv_bwd_w_f
             mma_zstep(oz0);
         }
     } else
-    for (int zt = zt_begin; zt < nzt && zt < tz0 + (zc + 1) * ZC; zt++) {
+    for (int zt = zt_begin, npass = 0; zt < nzt && zt < tz0 + (zc + 1) * ZC; zt++) {
         const int oz0 = zt * 2;
         const int np = zt == zt_begin ? 4 : 2, gz_first = zt == zt_begin ? oz0 - 1 : oz0 + 1;
         __syncthreads();
@@ -379,7 +379,7 @@ __global__ void __launch_bounds__(288, FAST ? BW8F_MINB : BW8_MINB) conv_bwd_w_f
             const bool Gany = gp.G != 0 || sp.gp2.G != 0;
             for (int pi = 0; pi < np; pi++) {
                 const int gz = gz_first + pi, slot = (gz + 1) & 3;
-                unsigned *am = amx + (pi & 1) * CH;
+                unsigned *am = amx + (npass % 3) * CH;
                 const int gyy = oy0 - 1 + row, gx = ox0 - 1 + p;
                 const bool inb = tid < 180 && gz >= 0 && gz < D && gyy >= 0 && gyy < H && gx >= 0 && gx < W;
                 float v[CH];
@@ -410,7 +410,13 @@ __global__ void __launch_bounds__(288, FAST ? BW8F_MINB : BW8_MINB) conv_bwd_w_f
 #pragma unroll
                     for (int q = 0; q < CH; q++) dst[q * X8_CS] = cvt_e4m3(v[q] * mq[q]);
                 }
-                if (tid < CH) { sxs[tid * 4 + slot] = (uint8_t)(mx_exp(__uint_as_float(am[tid]), 1.f / 448.f) + 127); amx[((pi + 1) & 1) * CH + tid] = 0u; }
+                /* the buffer two passes ahead is reset (its last readers are done, and its next reductions come after the next pass's
+                   barrier). With two buffers this reset hit the next pass's buffer with no barrier before that pass's reductions: a warp
+                   already there lost its maximum, the plane's scale came out too small and its bytes saturated. Seen as a weight
+                   gradient off by 1e-4..5e-3 in ~1 backward in 10 when other processes took the card in turns (test_lat_head~FP8, three
+                   copies), never alone. lp_s2.cu's kernels already had three buffers */
+                if (tid < CH) { sxs[tid * 4 + slot] = (uint8_t)(mx_exp(__uint_as_float(am[tid]), 1.f / 448.f) + 127); amx[((npass + 2) % 3) * CH + tid] = 0u; }
+                npass++;
             }
         } else
         /* X: warp per (channel, plane): 10 rows x (4 aligned float4 for x = ox0..ox0+15, plus the halo voxels
@@ -618,7 +624,7 @@ template <typename T, typename TG> void bwd_w_f8_t(const void *x, shape5 xs, con
     int NT = xs.c <= 8 ? 1 : MT == 1 && xs.c % 24 == 0 && !sp.up ? 3 : 2;   /* 24 input channels per block when cout = 16: gy restaged less (dec0.c1: -6%); fused up: 16-channel tiles */
     if (getenv("UFSM_F8_NT")) NT = atoi(getenv("UFSM_F8_NT"));
     if (getenv("UFSM_F8_MT")) MT = atoi(getenv("UFSM_F8_MT"));
-    size_t smem = (size_t)8 * NT * X8_CS + 16 * MT * (G8_CS + 8) + 8 * NT * 4 + 16 * MT * 4 + 16 + 32 + (size_t)8 * NT * (sizeof(chan_t) + 8);   /* + MX x channel table, amax */
+    size_t smem = (size_t)8 * NT * X8_CS + 16 * MT * (G8_CS + 8) + 8 * NT * 4 + 16 * MT * 4 + 16 + 32 + (size_t)8 * NT * (sizeof(chan_t) + 12);   /* + MX x channel table, amax (three buffers) */
     { int a, c; if (zw_win(ys.d, &a, &c)) {   /* z-window: gy planes [a, c) (z-steps of 2) */
         if (a % 2 || (c % 2 && c != ys.d)) { fprintf(stderr, "lp_bwd_w_f8: z-window [%d, %d) not on z-steps\n", a, c); abort(); }
         sp.zw0 = a; sp.zw1 = c; } }

@@ -59,7 +59,11 @@ memory plan has room for stay on the device (`d->ldev`), the rest stream as befo
   steps, P256) and for the winding net; `--det 1` step lines are identical with the planes on the device, partly, and streamed
   (rv and winding, 12 steps). `test_gpu_aug` covers the pack / unpack kernels. The check mode died without a papyrus plane (it read a
   null plane); fixed.
-- **Not measured yet:** the real-loader gain on a quiet card.
+- Real loader, rv P768, quiet GPU 1, 2 workers / 3 slots, `--det 1` (the same batches), all four planes on the device against
+  `UFSM_LAT_LDEV=0`: 1.123 -> 1.223 samples/s, the mean of steps 4-14 (+9%; loader wait 0%). In a profiled step (`UFSM_PTICK=2`,
+  synchronous upload, which also counts copies that otherwise overlap) the copy-back fell from 69 to 18 ms and the slab uploads from
+  156 to 9 ms, the step from 896 to 688 ms. P512 beside a training run: 3.60 -> 3.92. **Not measured:** P1024 / P1152 (the dev
+  memory slice had no room for the loader).
 
 **Phase and winding planes at 6 and 4 bits** (`UFSM_LAB_QBITS`: the training batches' planes quantised to 2^n cyclic levels on the
 device, validation on the stored bytes; P256, `--det 1`, GPU 1 beside a training run, one seed each). Validation after the last step:
@@ -88,6 +92,20 @@ arm itself moved by < 1e-4). A decision for 4 bits needs a longer run at a worki
 next batch's upload ran during the step and overwrote them while the head passes still uploaded slabs: each step trained on a mix of
 two batches' labels (`--det 1`: 13 outcomes in 14 runs, from step 4, losses 2.0810 against 2.0562). The upload now waits for the step,
 as under lean; 10 of 10 runs agree and equal a run with device planes. Lean runs never overlapped.
+
+**A weight gradient that changed when other processes shared the card (fixed).** `test_lat_head~FP8` failed in ~1 run in 10 when
+three copies ran on one GPU and never alone (0 of 55): one conv's weight gradient off by 1e-4..5e-3, everything else equal to 5e-8.
+`UFSM_WG_TRACE=1` (hashes of what `lp_bwd_w_f8` reads, a random projection of what it adds) caught calls with byte-identical
+activations, gradients, GroupNorm parameters and seed whose output differed, at 96 -> 96, 128 -> 128 and 160 -> 96. Cause: the MX-input
+path of `conv_bwd_w_f8_k` keeps per-channel plane maxima in two alternating shared-memory buffers; after a plane's barrier warp 0
+reset the *next* plane's buffer, with no barrier before the other warps' reductions into it. A warp that got there first lost its
+maximum, the plane's scale came out too small and its e4m3 bytes saturated. Alone the reset practically always wins; with the GPU
+time-sliced between short-lived processes it did not. Three buffers now (reset two passes ahead, as `lp_s2.cu`'s kernels already
+did): old kernel 18 failing lines in 120 runs, new 0, interleaved under the same load. Not removed by blocking launches, and not
+triggered by a steady training run as the neighbour (0 of 40) or by CPU load (0 of 30). Exposure: every `--fp8 1` run beside
+benchmark or eval processes (all convs), and in fp4 mode the layers whose weight gradient still runs this kernel on an MX input
+(the first conv); the fp4-mode test showed 0 failing lines in 252 runs, so the size there is unknown. `lp_f8fwd.cuh` has the
+two-buffer pattern too, but with a barrier between the reset and the next reductions.
 
 **--det 1.** Runs with the same seed printed different lines in 20-70% of cases, always first at step 26 (rv P256), in three
 outcomes. The batches (hashes, slots), the input and the label planes are identical; the weights are not: after the first update 321
