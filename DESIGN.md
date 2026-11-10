@@ -32,6 +32,15 @@ CT store 0.82 GB per box Gvox (26.8 GB), latent store 0.97 GB per box Gvox (31.8
 of 128-row boxes with 384-voxel windows; in material regions the latent store (0.13 B/vox on disk for the fixture) is not smaller than the
 volcomp CT, so the store is not an IO saving at this level: the gain is the cheaper window input.
 
+Fit fields (2026-11-10): `--fit-zarr` / `--fit-ct` from the store read the rebuilt CT. tests/test_latents.sh bounds the CT-vs-store
+correlation per group of planes, each plane standardised and the group pooled: single components of 6-step nets swing between training
+seeds (t0 0.64-0.95, t2 0.62-0.95 over seeds 5-10 on latcomp 6dea200; one failed a 0.7 bound after an unrelated planner change), the
+groups do not (min / max over the 6 seeds, guided head 2 | sub-cell head 3: phase .93/.96 | .79/.83, normal .82/.88 | .85/.89, spacing
+.78/.86 | .72/.86, material .944, winding mod 4 .78/.87 | .83/.85, its directions .58/.62 | .58/.68, --fit-ct ct .9995, cs .81/.96);
+bounds are those minima less ~0.1. With 30 steps the same seed reaches phase .96 / .91, normal .92 / .96, directions .78 / .75: the
+disagreement is the young nets' sensitivity, not the store. lc-encode's sd_ref now comes from mostly-material shards (the masked Paris 4
+level 2 had starved the old stride sample: sd 1, a 125 GB store at PSNR 25 dB); a box without material is refused.
+
 ## Real device peaks of the latent nets, the planner's task term, the wide stride-2 backward in chunks (2026-11-09, branch perf-20261109)
 
 Measured in a 5-minute window on an empty GPU 1 (16 GB), per-process peak from nvidia-smi, 3 steps each (1 MiB = 1.049e-3 GB; the

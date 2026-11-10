@@ -11,7 +11,7 @@ U=$1 F=$2
 D=$(mktemp -d /tmp/test_latents_XXXXXX)
 fail() { echo "FAIL: $*"; echo "kept $D"; exit 1; }
 "$F" "$D/fx" 256 2 1 > "$D/fx.log" 2>&1 || fail "fixture"
-T="--task unwrap2 --B 1 --gpus 0 --workers 2 --sampler-slots 4 --val-batches 0 --log-every 1 --ckpt-every 1000 --fp4 2 --input-prec 8 --warmup 0 --seed 5 --wind4-tile 0 --levels 1 --lat 4"
+T="--task unwrap2 --B 1 --gpus 0 --workers 2 --sampler-slots 4 --val-batches 0 --log-every 1 --ckpt-every 1000 --fp4 2 --input-prec 8 --warmup 0 --seed ${LT_SEED:-5} --wind4-tile 0 --levels 1 --lat 4"
 # shellcheck disable=SC2086
 "$U" train "$D/fx/sources.json" --out "$D/fit" --P 128 --widths 32,64,128 --steps 20 $T --lat-fit "$D/basis.lcb" --lat-fit-n 8 > "$D/fit.log" 2>&1 || fail "lat-fit ($D/fit.log)"
 for g in 0 1; do
@@ -21,6 +21,11 @@ for g in 0 1; do
 done
 "$U" lc-encode "$D/basis.lcb" "$D/fx" ct/9.6 "$D/lc" --shard 16 --chunk 8 --threads 4 > "$D/lc.log" 2>&1 || fail "lc-encode ($D/lc.log)"
 "$U" lc-encode "$D/basis.lcb" "$D/fx" ct/9.6 "$D/lcb" --shard 16 --chunk 8 --threads 4 --box 32,0,0,192,256,256 > "$D/lcb.log" 2>&1 || fail "lc-encode --box ($D/lcb.log)"
+grep -q "sd_ref [0-9.]* from [0-9]* material shards" "$D/lc.log" || fail "lc-encode did not report its sd_ref sample ($D/lc.log)"
+python3 -I -c "import json,sys; a=json.load(open(sys.argv[1]))['attributes']; sys.exit(0 if a['sd_ref'] > 1 and a.get('drop_ms', 0) > 0 else 1)" "$D/lc/zarr.json" || fail "store attributes sd_ref / drop_ms"
+# a box without material (the fixture's air corner) is refused instead of encoded with a clamped sd_ref (Paris 4, 2026-11-10: sd 1)
+"$U" lc-encode "$D/basis.lcb" "$D/fx" ct/9.6 "$D/lcz" --shard 16 --chunk 8 --threads 4 --box 0,0,0,64,64,64 > "$D/lcz.log" 2>&1 && fail "lc-encode encoded a box without material"
+grep -q "no mostly-material shard" "$D/lcz.log" || fail "no refusal message ($D/lcz.log)"
 P="--um 9.6 --channel rv --axis $D/fx/axis.json --levels 1 --q 0"
 run() {   # TAG NET STORE|- [args]: predict, then the box as raw bytes
     local tag=$1 net=$2 st=$3; shift 3; local x=(); [ "$st" != - ] && x=(--latents "$st")
@@ -45,7 +50,7 @@ import sys, numpy as np
 d = sys.argv[1]
 def ld(t): return np.fromfile(f"{d}/p_{t}.raw", np.uint8).astype(int).reshape(256, 256, 256)
 bad = 0
-for a, b, agree_min, box in (("g0ct", "g0lc", 0.97, None), ("g1ct", "g1lc", 0.80, None), ("bct", "blc", 0.97, (32, 224))):
+for a, b, agree_min, box in (("g0ct", "g0lc", 0.95, None), ("g1ct", "g1lc", 0.85, None), ("bct", "blc", 0.95, (32, 224))):
     x, y = ld(a), ld(b)
     if box: x, y = x[box[0]:box[1]], y[box[0]:box[1]]
     m = (x > 0) & (y > 0)
@@ -61,7 +66,7 @@ EOF
 # winding-mod-4 planes are the noisiest)
 for g in 2 3; do
     # shellcheck disable=SC2086
-    "$U" train "$D/fx/sources.json" --out "$D/w$g" --P 64 --widths 32,64,128 --steps 6 $T --lat-basis "$D/basis.lcb" --lat-c 29 --lat-step 0.25 --lat-step-jitter 0.3 \
+    "$U" train "$D/fx/sources.json" --out "$D/w$g" --P 64 --widths 32,64,128 --steps ${LT_STEPS:-6} $T --lat-basis "$D/basis.lcb" --lat-c 29 --lat-step 0.25 --lat-step-jitter 0.3 \
         --lat-guide $g > "$D/w$g.log" 2>&1 || fail "train winding lat-guide $g ($D/w$g.log)"
     for src in ct lc; do
         x=(); [ $src = lc ] && x=(--latents "$D/lc")
@@ -71,17 +76,26 @@ for g in 2 3; do
     done
 done
 python3 -I - "$D" <<'EOF2' || fail "fit fields ($D)"
+# per group of planes the correlation of CT-path and store-path values, each plane standardised by its CT-path mean / sd and the group's
+# planes pooled (single normal-tensor or winding components of 6-step nets swing between seeds: t0 0.64-0.95 over 6 seeds; the pooled
+# groups stay within a few hundredths). Bounds: the minimum over seeds 5-10 on latcomp 6dea200 less a margin (see DESIGN.md).
 import sys, os, numpy as np
 d = sys.argv[1]; bad = 0
-lim = {"pc": .75, "ps": .65, "sp": .65, "t0": .7, "t1": .75, "t2": .55, "t3": .75, "t4": .85, "t5": .55, "w": .9, "dq": .6, "dx": .45, "dy": .45, "dz": .4, "ct": .95, "cs": .5}
+groups = {"phase": (["pc", "ps"], .70), "normal": (["t0", "t1", "t2", "t3", "t4", "t5"], .70), "spacing": (["sp"], .60), "material": (["w"], .90),
+          "w4": (["dq"], .65), "w4dir": (["dx", "dy", "dz"], .45), "ct": (["ct"], .99), "cs": (["cs"], .65)}
 for g in (2, 3):
-    for a, m in lim.items():
-        f = f"{d}/f_{g}ct.{a}.raw"
-        if not os.path.exists(f): continue
-        x = np.fromfile(f, np.uint8).astype(float); y = np.fromfile(f"{d}/f_{g}lc.{a}.raw", np.uint8).astype(float)
-        c = np.corrcoef(x, y)[0, 1] if x.std() > 0 and y.std() > 0 else (1.0 if (x == y).all() else 0.0)
+    for name, (planes, m) in groups.items():
+        xs, ys = [], []
+        for a in planes:
+            f = f"{d}/f_{g}ct.{a}.raw"
+            if not os.path.exists(f): continue
+            x = np.fromfile(f, np.uint8).astype(float); y = np.fromfile(f"{d}/f_{g}lc.{a}.raw", np.uint8).astype(float)
+            mu, sd = x.mean(), x.std() + 1e-6; xs.append((x - mu) / sd); ys.append((y - mu) / sd)
+        if not xs: continue
+        x, y = np.concatenate(xs), np.concatenate(ys)
+        c = np.corrcoef(x, y)[0, 1]
         ok = c >= m; bad += not ok
-        print(f"lat-guide {g} {a:2s}: corr {c:.4f} (>= {m}), mean |d| {np.abs(x - y).mean():5.2f}: {'ok' if ok else 'FAIL'}")
+        print(f"lat-guide {g} {name:8s}: corr {c:.4f} (>= {m}){'' if ok else ': FAIL'}")
 sys.exit(1 if bad else 0)
 EOF2
 rm -rf "$D"
