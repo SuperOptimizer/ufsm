@@ -21,6 +21,7 @@ test_pack_tm                                   | gpu          |     1 | ./$B/tes
 test_wind4                                     | gpu          |     1 | ./$B/test_wind4
 test_w4dev                                     | gpu          |       10 | ./$B/test_w4dev
 test_lat_conv0                                 | gpu          |        3 | UFSM_F8W_MIXED_CZ=4 ./$B/test_lat_conv0
+test_lat_head                                  | gpu          |        5 | ./$B/test_lat_head
 test_pgrad                                     | gpu          |     1 | ./$B/test_pgrad
 test_gyrec                                     | gpu2         |     1 | ./$B/test_gyrec
 test_unwrap2_sampler                           | gpu          |     9 | ./$B/test_unwrap2_sampler $TMPDIR/unwrap2_fixture
