@@ -506,7 +506,10 @@ extern "C" int lp_bwd_w1_mx_b(const void *x, int xdt, shape5 xs, const void *gy,
 extern "C" int lp_bwd_w1_mx_b_r(const void *x, int xdt, shape5 xs, const void *gy, int gydt, shape5 ys, float *gw, float *gb, gnp_t gp, size_t vb, size_t vn) {
     if (!((xs.c == 16 || xs.c % 32 == 0) && (ys.c <= 16 || ys.c % 8 == 0) && gydt == 2 && (!gp.G || xs.c % gp.G == 0) && (xdt == 4 || xdt == 8))) return 0;
     const size_t S = shape_spatial(xs);
-    const int nper = slab_nper(gp, 8192);
+    /* a short range (the latent nets' streamed head: 8 cell planes) at 8192 voxels a block left most of the GPU idle (9 blocks at
+       P384: every pass took as long as the whole grid's); >= 128 blocks where the range allows (fp32 partial sums in another order) */
+    int tgt = 8192; while (tgt > 512 && vn / tgt < 128) tgt >>= 1;
+    const int nper = slab_nper(gp, tgt);
     const dim3 grid((unsigned)((vn + nper - 1) / nper), xs.n);
     for (int co0 = 0; co0 < ys.c; co0 += 8)
         for (int blk = 0; blk < (xs.c == 16 ? 1 : xs.c / 32); blk++) {

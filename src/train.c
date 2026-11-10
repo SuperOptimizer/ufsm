@@ -68,6 +68,7 @@ typedef struct {
     int gl_inplace;              /* the logit gradient over the fp16 logits (g_gl_inplace) */
     float *pg_acc; double pg_h[2], pg_loss;   /* --pgrad-lambda: slab logit gradient (2 planes x slab, fp32), sums w loss / w (hs_ds + 56: + 20..54 hold the normal loss stats), loss */
     float *latg; void *latgl;   /* --lat: the fp32 coarse logit gradient the head slabs accumulate, its 16-bit copy for the backward */
+    void *lgc, *latgc;          /* g_lat_hs: a slab's cell logits (hs_z / 4 + 2 planes); the finished planes' 16-bit gradient for unet_head_bwd_z (latg / latgl: rolling, the same planes) */
     void *hs_lg; double *hs_ds; float hs_dice; int hs_z, hs_P, hs_train;   /* head slabs (g_head_slab): fp16 logits of one slab, loss sums, recto dice, planes per slab, window width, a training pass (the backward follows) */
     int64_t cornb[2][3]; int lvlb[2];   /* level-0 corner / level of the batch in each buffer (verso dump) */
     int srcb[2], last;           /* the batch's source in each buffer (-1 unknown); the buffer of the last training step's batch (diagnostics) */
@@ -105,6 +106,9 @@ static int g_lat_guide;   /* --lat-guide 1: the guided head (5 coefficient plane
 static float g_lat_jit;   /* --lat-step-jitter J: each training window quantised with step x 2^(J u), u uniform in [-1, 1] (a latent store's step in window-normalised units varies with the window's sd) */
 static int g_lat_c, g_lat_have; static float g_lat_step, g_lat_bas[29 * 64], g_lat_gain[29];   /* --lat-basis FILE [--lat-c 29 --lat-step 0.25]: the learned cell channels (latfit.h) */
 static int g_lcheck;    /* UFSM_LAT_STREAM=check: the device planes as well, every slab compared byte for byte */
+static int g_lat_hs;    /* --lat: the head streamed with the slabs (no whole cell logits, no whole coarse gradient): head_slab_pass runs the network's head on the
+                           cell planes a slab reads (unet_head_fwd_z, both passes) and, in the backward's head callback, hands each slab's finished
+                           planes of the coarse gradient to unet_head_bwd_z from a rolling buffer. lat_guide 0 / 64; UFSM_LAT_HEAD_STREAM=0 off */
 static int g_lstream;   /* --lat: the label planes (phase, winding mod 4 + component, papyrus) live in pinned host memory and reach the device one head slab at a time (lab_stream; UFSM_LAT_STREAM=0 off) */
 static int g_lat;   /* --lat 4: the network on the 4^3 cells of the window (unet_cfg.half_res 3, pool4), the losses in full-resolution head slabs (nn_lat_*) */
 static int g_half, g_hdiv = 1;   /* --half-res: 1 pool, 2 pack, 3 pool4, 4 pack4 (unet_cfg.half_res), g_hdiv its factor; the losses see g_cout
@@ -797,18 +801,6 @@ static void verso_target(gpu_state *d, shape5 xs) {
    statistics, summed over the slabs and finished into its scratch (fetch_loss reads them as before); pass 1 (the backward's head
    step, head_slab_cb): the head again, each loss's gradient in place over the slab's logits, the head backward of the slab. The
    per-voxel arithmetic is the whole-window path's (fp64 sums in another order; the head backward's SR seed is the backward's) */
-/* experiment (UFSM_LAT_LG_MX / UFSM_LAT_GL_MX = 8 | 4): the cell grid's fp16 logits / logit gradient rounded through MX-fp8 / MX-fp4 rows
-   (32-channel blocks per cell, round to nearest) in place: what storing them in MX would do to the losses, before any kernel reads MX */
-static void lat_mx_trip(gpu_state *d, void *h16, const char *env, int which) {
-    static int on[2] = {-1, -1}; if (on[which] < 0) { const char *e = getenv(env); on[which] = e ? atoi(e) : 0; if (on[which]) fprintf(stderr, "%s=%d: the cell %s through MX-fp%d\n", env, on[which], which ? "logit gradient" : "logits", on[which]); }
-    if (on[which] != 4 && on[which] != 8) return;
-    const shape5 s = {1, LNC, g_Pz / 4, d->hs_P / 4, d->hs_P / 4}; const size_t S = shape_spatial(s), n = S * LNC;
-    static void *mx[4]; static float *f[4];
-    if (!mx[d->dev]) { mx[d->dev] = nn_malloc(nn_mx8_bytes(s)); f[d->dev] = nn_malloc(n * 4); }
-    if (on[which] == 8) { lp_h16_to_mx8(h16, 2, 1, LNC, S, mx[d->dev]); lp_mx8_to_f32(mx[d->dev], 1, LNC, S, f[d->dev]); }
-    else { lp_h16_to_mx4(h16, 2, 1, LNC, S, mx[d->dev]); lp_mx4_to_f32(mx[d->dev], 1, LNC, S, f[d->dev]); }
-    nn_f32_to_h16(f[d->dev], n, h16, 1.f);
-}
 static void head_slab_pass(gpu_state *d, int pass) {
     const int D = g_Pz, H = d->hs_P, W = d->hs_P, Z = d->hs_z;
     const size_t hw = (size_t)H * W, l3 = (size_t)D * hw;
@@ -856,7 +848,11 @@ static void head_slab_pass(gpu_state *d, int pass) {
             }
         }
         PT("label h2d");
-        if (g_lat) nn_lat_up_slab(d->lg, unet_logits_h16(d->u), LUPC, D / 4, H / 4, W / 4, z0, nz, d->hs_lg);   /* --lat: the cell grid's logits on this slab */
+        const int q0 = z0 / 4 - 1, qc = Z / 4 + 2, qa = q0 > 0 ? q0 : 0, qb = z1 / 4 + 1 < D / 4 ? z1 / 4 + 1 : D / 4;   /* g_lat_hs: the cell planes [qa, qb) this slab reads / adds to; the rolling buffers start at plane q0 */
+        if (g_lat_hs) {
+            if (unet_head_fwd_z(d->u, qa, qb, d->lgc)) { fprintf(stderr, "latent head stream: the head is not covered per slab (UFSM_LAT_HEAD_STREAM=0)\n"); abort(); }
+            nn_lat_up_slab_c(d->lgc, 1, LUPC, D / 4, H / 4, W / 4, z0, nz, d->hs_lg, qa, qb - qa);
+        } else if (g_lat) nn_lat_up_slab(d->lg, unet_logits_h16(d->u), LUPC, D / 4, H / 4, W / 4, z0, nz, d->hs_lg);   /* --lat: the cell grid's logits on this slab */
         else if (unet_head_fwd_z(d->u, z0, z1, d->hs_lg)) { fprintf(stderr, "head slabs: the head is not covered (MX activations; UFSM_HEAD_SLAB=0)\n"); abort(); }
         if (lchk && !pass) {   /* UFSM_LAT_CHECK=1: the separable upsampling against the per-voxel kernel, every slab */
             const size_t nb = (size_t)LUPC * ns * 2; void *d2 = nn_malloc(nb); uint16_t *ha = malloc(nb), *hb = malloc(nb);
@@ -868,7 +864,8 @@ static void head_slab_pass(gpu_state *d, int pass) {
             if (z1 == D) { fprintf(stderr, "lat check: upsampling: %zu of %zu fp16 logits differ (%zu by more than one code), max |difference| %.3g, rms difference / rms %.3g\n", nd, nt_, n1, mx, sqrt(sq / (sr > 0 ? sr : 1))); mx = sq = sr = 0; nd = nt_ = n1 = 0; }
         }
         PT("upsample");
-        if (g_lat && g_lat_guide == 64) nn_lat_shuffle(d->lg, unet_logits_h16(d->u), D / 4, H / 4, W / 4, 16, 2, z0, nz, (char *)d->hs_lg + (size_t)g_side_ch * ns * 2);   /* the sub-cell head */
+        if (g_lat_hs && g_lat_guide == 64) nn_lat_shuffle_c(d->lgc, 1, D / 4, H / 4, W / 4, 16, 2, z0, nz, (char *)d->hs_lg + (size_t)g_side_ch * ns * 2, qa, qb - qa);
+        else if (g_lat && g_lat_guide == 64) nn_lat_shuffle(d->lg, unet_logits_h16(d->u), D / 4, H / 4, W / 4, 16, 2, z0, nz, (char *)d->hs_lg + (size_t)g_side_ch * ns * 2);   /* the sub-cell head */
         else if (g_lat && g_lat_guide) LGUIDE(0);   /* --lat-guide: the side channels' sub-cell terms from the CT */
         const shape5 one = {1, 1, nz, H, W}, two = {1, 2, nz, H, W}, seven = {1, 7, nz, H, W};
         nn_phase_targets(sdb + vb, ns, d->sidet, d->sidem);
@@ -936,6 +933,22 @@ static void head_slab_pass(gpu_state *d, int pass) {
         }
         PT("losses");
         if (g_lat && g_lat_guide == 8) nn_zero((char *)d->hs_lg + (size_t)g_cout * ns * 2, (size_t)(24 - g_cout) * ns * 2);   /* (the unused outputs: no gradient) */
+        if (g_lat_hs) {   /* the slab's gradient into the rolling planes [q0, q0 + qc); the planes no later slab adds to ([q0, z1 / 4 - 1), to the end at the last
+                             slab) through the head's backward; the last two carried to the front for the next slab */
+            const size_t pl = (size_t)(H / 4) * (W / 4); const int f0 = qa, f1 = z1 == D ? D / 4 : z1 / 4 - 1;
+            if (z0 == 0) nn_zero(d->latg, (size_t)LGFC * qc * pl * 4);
+            if (g_lat_guide == 64) nn_lat_shuffle_adj_c((char *)d->hs_lg + (size_t)g_side_ch * ns * 2, D / 4, H / 4, W / 4, 16, 2, z0, nz, d->latgl, q0, qc);
+            nn_lat_up_adj_c(d->hs_lg, LUPC, D / 4, H / 4, W / 4, z0, nz, d->latg, d->nt, q0, qc);
+            PT("adjoint");
+            if (f1 > f0) {
+                nn_lat_grad_fin(d->latg, LGFC, d->latgl, LNC, pl, qc, f0 - q0, f1 - f0, d->latgc);
+                if (unet_head_bwd_z(d->u, f0, f1, d->latgc, z0 == 0)) { fprintf(stderr, "latent head stream: the head backward is not covered per slab (UFSM_LAT_HEAD_STREAM=0)\n"); abort(); }
+            }
+            if (z1 < D) nn_lat_grad_carry(d->latg, LGFC, d->latgl, LNC, pl, qc, Z / 4, 2);
+            nn_ptick("trunk backward");
+            if (pipe) nn_event_record(d->evl_free[sj & 1], 0);
+            continue;
+        }
         if (g_lat && g_lat_guide == 64) nn_lat_shuffle_adj((char *)d->hs_lg + (size_t)g_side_ch * ns * 2, D / 4, H / 4, W / 4, 16, 2, z0, nz, d->latgl);
         else if (g_lat && g_lat_guide) LGUIDE(1);   /* the coefficient planes' gradients */
         if (g_lat) nn_lat_up_adj(d->hs_lg, LUPC, D / 4, H / 4, W / 4, z0, nz, d->latg, d->nt);   /* (scratch: the normal targets, 7 bytes a voxel, are done for this slab) */   /* --lat: the slab's gradient onto the cell grid */
@@ -1080,7 +1093,6 @@ static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
     } else if (g_lat) { nn_ptick("other"); lg = unet_forward_x(d->u, d->x, (shape5){B, unet_cfg_of(d->u)->cin, g_Pz / 4, P / 4, P / 4}, train, g_xfmt != 0); nn_ptick("trunk forward"); }   /* --lat: x the full-resolution CT channel */
     else lg = unet_forward_x(d->u, d->x, xs, train, g_xfmt != 0);
     d->lg = lg;
-    if (g_lat) lat_mx_trip(d, (void *)lg, "UFSM_LAT_LG_MX", 0);
     mem_post(d, B, train);
     if (train && !g_half && !g_head_slab && !g_pkf) diag_nonfinite(d, "logits", lg, (size_t)B * g_cout * xs.d * P * P, unet_logits_h16(d->u) ? 1 : 0);   /* (UFSM_SYNC_CHECK) */
     d->ds_fresh = g_ds && train;   /* validation batches have no deep-supervision losses */
@@ -1108,13 +1120,12 @@ static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
         if (prof) nn_prof_begin(6);
         d->gl = nullptr; d->hs_dice = dice_w; d->hs_train = train;
         head_slab_pass(d, 0);
-        if (g_lat && train) {   /* --lat: the gradient pass now (the network's head is whole on the cell grid), into the coarse gradient */
+        if (g_lat && train && !g_lat_hs) {   /* --lat: the gradient pass now (the network's head is whole on the cell grid), into the coarse gradient */
             const size_t nc = (size_t)LGFC * (g_Pz / 4) * (P / 4) * (P / 4);
             nn_zero(d->latg, nc * 4);
             head_slab_pass(d, 1);
             if (d->hsplit) nn_event_record(d->ev_hs, 0);   /* (the callback's record: this mode runs the gradient pass here) */
             nn_f32_to_h16(d->latg, nc, d->latgl, 1.f);   /* (the slab gradients carry the gradient scale already) */
-            lat_mx_trip(d, d->latgl, "UFSM_LAT_GL_MX", 1);
             d->gl = d->latgl; nn_ptick("other");
         }
         if (prof) nn_prof_end();
@@ -2312,7 +2323,8 @@ int cmd_train(int argc, char **argv) {
         g_hs_z = getenv("UFSM_HEAD_SLAB_Z") ? atoi(getenv("UFSM_HEAD_SLAB_Z")) : 32;
         if (g_hs_z < 1) g_hs_z = 1;
         if (g_hs_z > g_Pz) g_hs_z = g_Pz;
-        for (int g = 0; g < ng; g++) unet_set_head_ext(G[g].u, g_head_slab && !g_lat);
+        g_lat_hs = g_lat && g_head_slab && (g_lat_guide == 0 || g_lat_guide == 64) && g_hs_z % 4 == 0 && g_hs_z >= 8 && g_hs_z < g_Pz && !ufsm_env_on("UFSM_LAT_CHECK") && (!getenv("UFSM_LAT_HEAD_STREAM") || ufsm_env_on("UFSM_LAT_HEAD_STREAM"));
+        for (int g = 0; g < ng; g++) unet_set_head_ext(G[g].u, g_head_slab && (!g_lat || g_lat_hs));
         if (g_pg_lambda > 0 && !g_head_slab) { fprintf(stderr, "--pgrad-lambda needs the head-slab loss path (task unwrap2, B 1, no --split / --verso)\n"); return 2; }
         if (g_valP == P && !getenv("UFSM_VALP_FORCE")) g_valP = 0;   /* (UFSM_VALP_FORCE=1: the separate validation network at the training size, a test) */
         if (g_valP) {   /* --val-P: the plain recto-style losses on whole cube windows; validation on GPU 0 */
@@ -2446,7 +2458,7 @@ int cmd_train(int argc, char **argv) {
                 const size_t grec = unet_grad_mx4() && (cfg.widths[0] % 32 == 0 || lp_gyrec_narrow()) && (getenv("UFSM_GYREC") ? atoi(getenv("UFSM_GYREC")) : 1)
                                     ? (gdef ? (size_t)100 << 20 : (size_t)B * cfg.widths[0] * p3 * 136 / 256) : 0;
                 need = grec + tb + tb / 14 + trainer + (nn_get_loss_tol() ? (size_t)B * p3 : 0) + (g_aff ? (size_t)2 * B * p3 : 0) + (g_unwrap ? (g_head_slab ? (size_t)4 * B * p3 + (size_t)g_hs_z * P * P * (2 * g_cout + 11) + 4096 : (size_t)15 * B * p3) + (g_unwrap2 ? (size_t)4 * B * p3 : 0) + (IPLANE ? (size_t)2 * B * p3 + (size_t)(g_rv ? 3 : 2) * g_hs_z * P * P : 0) : 0) + (g_cond ? (size_t)7 * B * p3 : 0) + (g_pap_head ? (size_t)4 * B * p3 : 0) + (g_restore ? (size_t)B * p3 * (cand[c].lean ? 5 : 1) + restore_scratch_bytes(g_Pz, P, P, fminf(g_rr.sc_step[0], 4.f)) + 256 : 0) + ((size_t)550 << 20) + (split ? (size_t)4 * B * 32 * P * P * 2 : 0) + (g_gpu_aug_want && gin ? nn_aug_device_bytes(P) + (g_gpu_aug_want == 2 ? nn_label_warp_device_bytes(P) : 0) : 0);   /* split: two slots of halo send / receive planes */   /* kernel workspaces: measured device growth / tracked ~1.07 + 0.3 GB, + 0.2 GB margin for other processes */
-                if (g_lat) need += (xin_sep ? 0 : xinb) + (g_tm_unused ? 0 : batb) + ((size_t)LNC * 2 + (size_t)LGFC * 4) * (p3 / 64);   /* --lat: the full-resolution batch beside the cell-grid network, the coarse logit gradient (fp32 + 16-bit) */
+                if (g_lat) need += (xin_sep ? 0 : xinb) + (g_tm_unused ? 0 : batb) + (g_lat_hs ? ((size_t)LNC * 6 + (size_t)LGFC * 4) * (size_t)(g_hs_z / 4 + 2) * (P / 4) * (P / 4) : ((size_t)LNC * 2 + (size_t)LGFC * 4) * (p3 / 64));   /* --lat: the full-resolution batch beside the cell-grid network, the coarse logit gradient (fp32 + 16-bit) */
                 if (ufsm_env_on("UFSM_MEM_REPORT"))   /* the planner's terms of this mode */
                     fprintf(stderr, "memory plan: mode %d (%s%s): network %.2f + workspace %.2f + gy records %.2f + trainer %.2f + task %.2f + fixed %.2f = %.2f GB\n", c, cand[c].what,
                             pass ? "" : ", no host offloads", tb / 1e9, tb / 14 / 1e9, grec / 1e9, trainer / 1e9, (need - grec - tb - tb / 14 - trainer - ((size_t)550 << 20)) / 1e9, (double)((size_t)550 << 20) / 1e9, need / 1e9);
@@ -2591,7 +2603,12 @@ int cmd_train(int argc, char **argv) {
             if (g_head_slab) {
                 d->hs_z = g_hs_z; d->hs_P = P;
                 d->hs_lg = nn_malloc((size_t)(g_lat ? LUPC : g_cout) * tp3 * 2); d->hs_ds = nn_malloc(64 * sizeof(double));
-                if (g_lat) { const size_t nc = (size_t)LNC * (g_Pz / 4) * (P / 4) * (P / 4); d->latg = nn_malloc(nc / LNC * LGFC * 4); d->latgl = nn_malloc(nc * 2); }
+                if (g_lat_hs) {   /* (the streamed head: hs_z / 4 + 2 cell planes of logits, fp32 sums, sub-cell gradient and the head's 16-bit gradient) */
+                    const size_t nq = (size_t)(g_hs_z / 4 + 2) * (P / 4) * (P / 4);
+                    d->lgc = nn_malloc(nq * LNC * 2); d->latg = nn_malloc(nq * LGFC * 4); d->latgl = nn_malloc(nq * LNC * 2); d->latgc = nn_malloc(nq * LNC * 2);
+                    if (g == 0) fprintf(stderr, "latent head stream: the head per slab on %d cell planes (%.0f MB instead of %.2f GB of cell logits and gradients; UFSM_LAT_HEAD_STREAM=0 off)\n",
+                                        g_hs_z / 4 + 2, (double)nq * (LNC * 6 + LGFC * 4) / 1e6, (double)(p3 / 64) * (LNC * 4 + LGFC * 4) / 1e9);
+                } else if (g_lat) { const size_t nc = (size_t)LNC * (g_Pz / 4) * (P / 4) * (P / 4); d->latg = nn_malloc(nc / LNC * LGFC * 4); d->latgl = nn_malloc(nc * 2); }
                 if (g_pg_lambda > 0) { d->pg_acc = nn_malloc(2 * tp3 * sizeof(float)); nn_zero(d->pg_acc, 2 * tp3 * sizeof(float)); }
                 unet_set_head_cb(d->u, head_slab_cb, d);
                 if (g == 0) fprintf(stderr, "head slabs: %d planes per slab (%.0f MB of logits and targets instead of %.2f GB)\n", g_hs_z,

@@ -232,6 +232,12 @@ extern "C" int nn_storage(const void *p) {
     for (int i = 0; i < g_nreg; i++) if (c >= g_reg[i].p && c < g_reg[i].p + g_reg[i].n && g_reg[i].n < n) { dt = g_reg[i].dt; n = g_reg[i].n; }
     return dt;
 }
+extern "C" void nn_storage_dump(const char *tag) {   /* debug: the registry (stale entries of freed buffers show as overlaps) */
+    for (int i = 0; i < g_nreg; i++) {
+        int ov = 0; for (int j = 0; j < g_nreg; j++) if (j != i && g_reg[j].p < g_reg[i].p + g_reg[i].n && g_reg[i].p < g_reg[j].p + g_reg[j].n) ov++;
+        fprintf(stderr, "%s reg %2d: %p + %zu dt %d%s\n", tag, i, (const void *)g_reg[i].p, g_reg[i].n, g_reg[i].dt, ov ? "  OVERLAPS" : "");
+    }
+}
 extern "C" size_t nn_mx8_bytes(shape5 s) { int bw = s.c <= 8 ? 8 : s.c <= 16 ? 16 : 32, nb = (s.c + bw - 1) / bw; return (size_t)s.n * nb * shape_spatial(s) * (bw + 1); }   /* = lp_mx8_bytes */
 extern "C" size_t nn_mx4_bytes(shape5 s) { int bw = s.c <= 8 ? 8 : s.c <= 16 ? 16 : 32, nb = (s.c + bw - 1) / bw; return (size_t)s.n * nb * shape_spatial(s) * (bw / 2 + 1); }   /* = lp_mx4_bytes */
 extern "C" size_t nn_mx_bytes(shape5 s, int dt) { return dt == 4 ? nn_mx4_bytes(s) : nn_mx8_bytes(s); }   /* registry dt */
@@ -429,6 +435,8 @@ extern "C" void nn_offload_copy(void *dst, const void *src, size_t n, int to_hos
     CK(cudaStreamWaitEvent(offload_stream(), (cudaEvent_t)ev_start, 0));
     CK(cudaMemcpyAsync(dst, src, n, to_host ? cudaMemcpyDeviceToHost : cudaMemcpyHostToDevice, offload_stream()));
     CK(cudaEventRecord((cudaEvent_t)ev_done, offload_stream()));
+    static int sy = -1; if (sy < 0) sy = getenv("UFSM_OFFLOAD_SYNC") != nullptr;   /* debug: every offload copy completes before the call returns (a missing event wait shows as a changed result) */
+    if (sy) CK(cudaDeviceSynchronize());
 }
 cudaEvent_t g_ev[NPROF][2];
 int g_evk[NPROF], g_nev, g_ev_init;

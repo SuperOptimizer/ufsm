@@ -20,14 +20,14 @@ __host__ __device__ static inline void lat_taps(int f, int n, int *idx, float *w
 }
 
 template <typename T>
-__global__ void lat_up_k(const T *lg, int C, int d, int h, int w, int z0, int nz, f16 *y) {   /* one thread per fine voxel of the slab, all channels */
+__global__ void lat_up_k(const T *lg, int C, int d, int h, int w, int z0, int nz, f16 *y, int q0, int qd) {   /* one thread per fine voxel of the slab, all channels; lg holds cell planes [q0, q0 + qd) */
     const int H = 4 * h, W = 4 * w;
     const size_t ns = (size_t)nz * H * W, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     if (i >= ns) return;
     const int fz = z0 + (int)(i / ((size_t)H * W)), fy = (int)(i / W % H), fx = (int)(i % W);
     int iz[4], iy[4], ix[4]; float wz[4], wy[4], wx[4];
     lat_taps(fz, d, iz, wz); lat_taps(fy, h, iy, wy); lat_taps(fx, w, ix, wx);
-    const size_t cv = (size_t)d * h * w;
+    const size_t cv = (size_t)qd * h * w;
     for (int c = 0; c < C; c++) {
         const T *l = lg + (size_t)c * cv;
         float s = 0.f;
@@ -35,7 +35,7 @@ __global__ void lat_up_k(const T *lg, int C, int d, int h, int w, int z0, int nz
         for (int a = 0; a < 4; a++)
 #pragma unroll
             for (int b = 0; b < 4; b++) {
-                const size_t row = ((size_t)iz[a] * h + iy[b]) * w;
+                const size_t row = ((size_t)(iz[a] - q0) * h + iy[b]) * w;
                 const float wab = wz[a] * wy[b];
 #pragma unroll
                 for (int e = 0; e < 4; e++) s += wab * wx[e] * ldv(l, row + ix[e]);
@@ -55,7 +55,7 @@ __device__ static inline float lat_wt(int f, int c, int n) {
 
 /* coarse voxels of planes [cz0, cz1) gather the slab's fine gradient (fine planes [z0, z0 + nz)) of their support: fine indices
    4 c - 6 .. 4 c + 9 along each axis (taps reach at most 1.5 coarse cells, plus the edge clamps, which only fold onto the edge cells) */
-__global__ void lat_adj_k(const f16 *g, int C, int d, int h, int w, int z0, int nz, int cz0, int cz1, float *gc) {
+__global__ void lat_adj_k(const f16 *g, int C, int d, int h, int w, int z0, int nz, int cz0, int cz1, float *gc, int q0, int qd) {
     const int H = 4 * h, W = 4 * w;
     const size_t pl = (size_t)h * w, nc = (size_t)(cz1 - cz0) * pl, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     if (i >= nc * C) return;
@@ -78,7 +78,7 @@ __global__ void lat_adj_k(const f16 *g, int C, int d, int h, int w, int z0, int 
             for (int k = 0; k < nx; k++) if (wxs[k] != 0.f) s += wyz * wxs[k] * __half2float(row[fx0 + k]);
         }
     }
-    gc[(size_t)c * d * pl + (size_t)cz * pl + (size_t)cy * w + cx] += s;
+    gc[(size_t)c * qd * pl + (size_t)(cz - q0) * pl + (size_t)cy * w + cx] += s;
 }
 
 /* predict on a --lat-basis checkpoint: input_latc_k's channels from the host-path 4-channel fp16 window */
@@ -169,29 +169,55 @@ __global__ void lat_guide4_k(const f16 *x, int D, int H, int W, int z0, int nz, 
    dir 0 (shuf_k): adds the terms to the slab planes y [ng][nz][H][W] (fp16) from the coarse logits lg [C][d][h][w]; the adjoint
    (shuf_adj_k): the planes hold the loss gradient, written (each coarse element has exactly one voxel: no sum, so straight into the 16-bit
    gradient the backward reads) into gc [C][d][h][w] fp16. */
-template <typename T> __global__ void lat_shuf_k(const T *lg, int d, int h, int w, int base, int ng, int z0, int nz, f16 *y) {
-    const int H = 4 * h, W = 4 * w; const size_t hw = (size_t)H * W, ns = (size_t)nz * hw, nc = (size_t)d * h * w, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+template <typename T> __global__ void lat_shuf_k(const T *lg, int d, int h, int w, int base, int ng, int z0, int nz, f16 *y, int q0, int qd) {
+    const int H = 4 * h, W = 4 * w; const size_t hw = (size_t)H * W, ns = (size_t)nz * hw, nc = (size_t)qd * h * w, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     if (i >= ns) return;
     const int z = z0 + (int)(i / hw), yy = (int)(i / W % H), x = (int)(i % W);
-    const size_t cell = ((size_t)(z >> 2) * h + (yy >> 2)) * w + (x >> 2); const int sub = 16 * (z & 3) + 4 * (yy & 3) + (x & 3);
+    const size_t cell = ((size_t)((z >> 2) - q0) * h + (yy >> 2)) * w + (x >> 2); const int sub = 16 * (z & 3) + 4 * (yy & 3) + (x & 3);
     for (int j = 0; j < ng; j++) y[(size_t)j * ns + i] = __float2half_rn(__half2float(y[(size_t)j * ns + i]) + (float)lg[(size_t)(base + 64 * j + sub) * nc + cell]);
 }
-__global__ void lat_shuf_adj_k(const f16 *g, int d, int h, int w, int base, int ng, int z0, int nz, f16 *gc) {
-    const int H = 4 * h, W = 4 * w; const size_t hw = (size_t)H * W, ns = (size_t)nz * hw, nc = (size_t)d * h * w, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+__global__ void lat_shuf_adj_k(const f16 *g, int d, int h, int w, int base, int ng, int z0, int nz, f16 *gc, int q0, int qd) {
+    const int H = 4 * h, W = 4 * w; const size_t hw = (size_t)H * W, ns = (size_t)nz * hw, nc = (size_t)qd * h * w, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     if (i >= ns) return;
     const int z = z0 + (int)(i / hw), yy = (int)(i / W % H), x = (int)(i % W);
-    const size_t cell = ((size_t)(z >> 2) * h + (yy >> 2)) * w + (x >> 2); const int sub = 16 * (z & 3) + 4 * (yy & 3) + (x & 3);
+    const size_t cell = ((size_t)((z >> 2) - q0) * h + (yy >> 2)) * w + (x >> 2); const int sub = 16 * (z & 3) + 4 * (yy & 3) + (x & 3);
     for (int j = 0; j < ng; j++) gc[(size_t)(base + 64 * j + sub) * nc + cell] = g[(size_t)j * ns + i];
 }
-extern "C" void nn_lat_shuffle(const void *lg, int lh16, int d, int h, int w, int base, int ng, int z0, int nz, void *y) {
+/* _c: lg / gc hold cell planes [q0, q0 + qd) only ([C][qd][h][w]; the planes the slab touches must lie inside) */
+extern "C" void nn_lat_shuffle_c(const void *lg, int lh16, int d, int h, int w, int base, int ng, int z0, int nz, void *y, int q0, int qd) {
     const size_t ns = (size_t)nz * 16 * h * w;
-    if (lh16) lat_shuf_k<f16><<<nblk(ns, 256), 256>>>((const f16 *)lg, d, h, w, base, ng, z0, nz, (f16 *)y);
-    else lat_shuf_k<float><<<nblk(ns, 256), 256>>>((const float *)lg, d, h, w, base, ng, z0, nz, (f16 *)y);
+    if (lh16) lat_shuf_k<f16><<<nblk(ns, 256), 256>>>((const f16 *)lg, d, h, w, base, ng, z0, nz, (f16 *)y, q0, qd);
+    else lat_shuf_k<float><<<nblk(ns, 256), 256>>>((const float *)lg, d, h, w, base, ng, z0, nz, (f16 *)y, q0, qd);
     KCHECK();
 }
-extern "C" void nn_lat_shuffle_adj(const void *g, int d, int h, int w, int base, int ng, int z0, int nz, void *gc) {
+extern "C" void nn_lat_shuffle(const void *lg, int lh16, int d, int h, int w, int base, int ng, int z0, int nz, void *y) { nn_lat_shuffle_c(lg, lh16, d, h, w, base, ng, z0, nz, y, 0, d); }
+extern "C" void nn_lat_shuffle_adj_c(const void *g, int d, int h, int w, int base, int ng, int z0, int nz, void *gc, int q0, int qd) {
     const size_t ns = (size_t)nz * 16 * h * w;
-    lat_shuf_adj_k<<<nblk(ns, 256), 256>>>((const f16 *)g, d, h, w, base, ng, z0, nz, (f16 *)gc); KCHECK();
+    lat_shuf_adj_k<<<nblk(ns, 256), 256>>>((const f16 *)g, d, h, w, base, ng, z0, nz, (f16 *)gc, q0, qd); KCHECK();
+}
+extern "C" void nn_lat_shuffle_adj(const void *g, int d, int h, int w, int base, int ng, int z0, int nz, void *gc) { nn_lat_shuffle_adj_c(g, d, h, w, base, ng, z0, nz, gc, 0, d); }
+/* the rolling coarse gradient of the streamed latent head (train.c head_slab_pass): a [nf][cap][pl] fp32 sums and sb [C][cap][pl] fp16
+   (channels >= nf: the sub-cell outputs' gradient) hold cap cell planes. fin: planes [i0, i0 + np) of every channel as fp16
+   gc [C][np][pl] (channels < nf rounded as nn_f32_to_h16 does), what unet_head_bwd_z reads. carry: planes [from, from + n) move to
+   [0, n), a's other planes are zeroed (sb's are rewritten whole by the next slab) */
+__global__ void lat_gfin_k(const float *a, int nf, const f16 *sb, int C, size_t pl, int cap, int i0, int np, f16 *gc) {
+    const size_t n = (size_t)np * pl, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= n * C) return;
+    const int c = (int)(i / n); const size_t v = i % n, src = ((size_t)c * cap + i0) * pl + v;
+    gc[i] = c < nf ? f2h<f16>(a[src]) : sb[src];
+}
+__global__ void lat_gcarry_k(float *a, int nf, f16 *sb, int C, size_t pl, int cap, int from, int n) {
+    const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= pl * C) return;
+    const int c = (int)(i / pl); const size_t v = i % pl;
+    if (c < nf) { float *r = a + (size_t)c * cap * pl + v; for (int k = 0; k < cap; k++) r[(size_t)k * pl] = k < n ? r[(size_t)(from + k) * pl] : 0.f; }
+    else { f16 *r = sb + (size_t)c * cap * pl + v; for (int k = 0; k < n; k++) r[(size_t)k * pl] = r[(size_t)(from + k) * pl]; }
+}
+extern "C" void nn_lat_grad_fin(const float *a, int nf, const void *sb, int C, size_t pl, int cap, int i0, int np, void *gc) {
+    lat_gfin_k<<<nblk((size_t)np * pl * C, 256), 256>>>(a, nf, (const f16 *)sb, C, pl, cap, i0, np, (f16 *)gc); KCHECK();
+}
+extern "C" void nn_lat_grad_carry(float *a, int nf, void *sb, int C, size_t pl, int cap, int from, int n) {
+    lat_gcarry_k<<<nblk(pl * C, 256), 256>>>(a, nf, (f16 *)sb, C, pl, cap, from, n); KCHECK();
 }
 extern "C" void nn_lat_guide4(const void *x, int D, int H, int W, int z0, int nz, void *lg, int base, int c0, int ng, int dir) {
     const size_t ns = (size_t)nz * H * W;
@@ -213,13 +239,13 @@ extern "C" void nn_lat_input_x(const void *x, int d, int h, int w, const float *
    sums associate differently from lat_up_k's 64-term chain (fp32 rounding before the fp16 store). */
 __device__ static const float LW[4][3] = {{0.375f, 0.625f, 0.f}, {0.1875f, 0.75f, 0.0625f}, {0.0625f, 0.75f, 0.1875f}, {0.f, 0.625f, 0.375f}};
 template <typename T>
-__global__ void lat_up4_k(const T *lg, int C, int d, int h, int w, int z0, int nz, f16 *y) {
+__global__ void lat_up4_k(const T *lg, int C, int d, int h, int w, int z0, int nz, f16 *y, int q0, int qd) {
     const int H = 4 * h, W = 4 * w;
     const size_t pl = (size_t)h * w, nc = (size_t)(nz / 4) * pl, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     if (i >= nc) return;
     const int sz = (int)(i / pl), cz = z0 / 4 + sz, cy = (int)(i / w % h), cx = (int)(i % w);
     const int iz[3] = {max(cz - 1, 0), cz, min(cz + 1, d - 1)}, iy[3] = {max(cy - 1, 0), cy, min(cy + 1, h - 1)}, ix[3] = {max(cx - 1, 0), cx, min(cx + 1, w - 1)};
-    const size_t cv = (size_t)d * pl, ns = (size_t)nz * H * W;
+    const size_t cv = (size_t)qd * pl, ns = (size_t)nz * H * W;
     for (int c = 0; c < C; c++) {
         const T *l = lg + (size_t)c * cv;
         float v[3][3][3];
@@ -227,7 +253,7 @@ __global__ void lat_up4_k(const T *lg, int C, int d, int h, int w, int z0, int n
         for (int a = 0; a < 3; a++)
 #pragma unroll
             for (int b = 0; b < 3; b++) {
-                const size_t row = ((size_t)iz[a] * h + iy[b]) * w;
+                const size_t row = ((size_t)(iz[a] - q0) * h + iy[b]) * w;
 #pragma unroll
                 for (int e = 0; e < 3; e++) v[a][b][e] = ldv(l, row + ix[e]);
             }
@@ -285,7 +311,7 @@ __global__ void lat_adj_xy_k(const f16 *g, int C, int h, int w, int nz, float *t
     t[i] = s;
 }
 /* stage 2 (z): coarse planes [cz0, cz1) add their fine planes of the slab */
-__global__ void lat_adj_z_k(const float *t, int C, int d, int h, int w, int z0, int nz, int cz0, int cz1, float *gc) {
+__global__ void lat_adj_z_k(const float *t, int C, int d, int h, int w, int z0, int nz, int cz0, int cz1, float *gc, int q0, int qd) {
     const size_t pl = (size_t)h * w, nc = (size_t)(cz1 - cz0) * pl, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     if (i >= nc * C) return;
     const int c = (int)(i / nc); const size_t v = i % nc;
@@ -294,7 +320,7 @@ __global__ void lat_adj_z_k(const float *t, int C, int d, int h, int w, int z0, 
     const float *tc = t + (size_t)c * nz * pl + yx;
     float s = 0.f;
     for (int k = k0; k < k1; k++) { const int fz = 4 * cz - 3 + k - z0; if (fz >= 0 && fz < nz) s += wz[k] * tc[(size_t)fz * pl]; }
-    gc[((size_t)c * d + cz) * pl + yx] += s;
+    gc[((size_t)c * qd + (cz - q0)) * pl + yx] += s;
 }
 
 /* predict --channel rv on a latent-grid checkpoint: the two side logits of the cell grid (lg [2][d][h][w]) straight into a device shard
@@ -535,34 +561,38 @@ extern "C" void nn_lat_pred_input(const uint8_t *ct, int D, int W, float mean, f
 static int g_lat_slow = -1;   /* UFSM_LAT_SLOW=1 / nn_lat_set_slow: the per-voxel kernels for every slab (A/B, train's UFSM_LAT_CHECK) */
 static int lat_slow(void) { if (g_lat_slow < 0) { const char *e = getenv("UFSM_LAT_SLOW"); g_lat_slow = e && *e == '1'; } return g_lat_slow; }
 extern "C" int nn_lat_set_slow(int on) { const int was = lat_slow(); g_lat_slow = on; return was; }
-extern "C" void nn_lat_up_slab(const void *lg, int lh16, int C, int d, int h, int w, int z0, int nz, void *y) {
+extern "C" void nn_lat_up_slab_c(const void *lg, int lh16, int C, int d, int h, int w, int z0, int nz, void *y, int q0, int qd) {
     const size_t ns = (size_t)nz * 16 * h * w;
     const int slow = lat_slow();
     if (!slow && z0 % 4 == 0 && nz % 4 == 0) {
         const size_t nc = (size_t)(nz / 4) * h * w;
-        if (lh16) lat_up4_k<f16><<<nblk(nc, 128), 128>>>((const f16 *)lg, C, d, h, w, z0, nz, (f16 *)y);
-        else lat_up4_k<float><<<nblk(nc, 128), 128>>>((const float *)lg, C, d, h, w, z0, nz, (f16 *)y);
+        if (lh16) lat_up4_k<f16><<<nblk(nc, 128), 128>>>((const f16 *)lg, C, d, h, w, z0, nz, (f16 *)y, q0, qd);
+        else lat_up4_k<float><<<nblk(nc, 128), 128>>>((const float *)lg, C, d, h, w, z0, nz, (f16 *)y, q0, qd);
         KCHECK(); return;
     }
-    if (lh16) lat_up_k<f16><<<nblk(ns, 256), 256>>>((const f16 *)lg, C, d, h, w, z0, nz, (f16 *)y);
-    else lat_up_k<float><<<nblk(ns, 256), 256>>>((const float *)lg, C, d, h, w, z0, nz, (f16 *)y);
+    if (lh16) lat_up_k<f16><<<nblk(ns, 256), 256>>>((const f16 *)lg, C, d, h, w, z0, nz, (f16 *)y, q0, qd);
+    else lat_up_k<float><<<nblk(ns, 256), 256>>>((const float *)lg, C, d, h, w, z0, nz, (f16 *)y, q0, qd);
     KCHECK();
 }
-extern "C" void nn_lat_up_adj(const void *g, int C, int d, int h, int w, int z0, int nz, float *gc, void *scratch) {
+extern "C" void nn_lat_up_slab(const void *lg, int lh16, int C, int d, int h, int w, int z0, int nz, void *y) { nn_lat_up_slab_c(lg, lh16, C, d, h, w, z0, nz, y, 0, d); }
+extern "C" void nn_lat_up_adj_c(const void *g, int C, int d, int h, int w, int z0, int nz, float *gc, void *scratch, int q0, int qd) {
     const int slow = lat_slow();
     if (!slow && scratch && z0 % 4 == 0 && nz % 4 == 0) {   /* two separable gathers through scratch (c nz h w fp32: 7 bytes per slab voxel hold 28 channels; more go in groups of 28) */
         const int a0 = max(z0 / 4 - 1, 0), a1 = min((z0 + nz) / 4 + 1, d);
         for (int c0 = 0; c0 < C; c0 += 28) {
             const int c = min(28, C - c0); const size_t n1 = (size_t)c * nz * h * w;
             lat_adj_xy_k<<<nblk(n1, 256), 256>>>((const f16 *)g + (size_t)c0 * nz * 16 * h * w, c, h, w, nz, (float *)scratch);
-            lat_adj_z_k<<<nblk((size_t)(a1 - a0) * h * w * c, 256), 256>>>((const float *)scratch, c, d, h, w, z0, nz, a0, a1, gc + (size_t)c0 * d * h * w);
+            lat_adj_z_k<<<nblk((size_t)(a1 - a0) * h * w * c, 256), 256>>>((const float *)scratch, c, d, h, w, z0, nz, a0, a1, gc + (size_t)c0 * qd * h * w, q0, qd);
         }
         KCHECK(); return;
     }
     /* coarse planes whose support meets fine planes [z0, z0 + nz) */
     int cz0 = (z0 - 9) / 4; if (z0 - 9 < 0) cz0 = 0;
     int cz1 = (z0 + nz + 6 + 3) / 4 + 1; if (cz1 > d) cz1 = d;
+    if (cz0 < q0) cz0 = q0;   /* (a chunk holds every plane with a non-zero weight: z0 / 4 - 1 .. (z0 + nz) / 4) */
+    if (cz1 > q0 + qd) cz1 = q0 + qd;
     const size_t n = (size_t)(cz1 - cz0) * h * w * C;
-    if (n) lat_adj_k<<<nblk(n, 256), 256>>>((const f16 *)g, C, d, h, w, z0, nz, cz0, cz1, gc);
+    if (n) lat_adj_k<<<nblk(n, 256), 256>>>((const f16 *)g, C, d, h, w, z0, nz, cz0, cz1, gc, q0, qd);
     KCHECK();
 }
+extern "C" void nn_lat_up_adj(const void *g, int C, int d, int h, int w, int z0, int nz, float *gc, void *scratch) { nn_lat_up_adj_c(g, C, d, h, w, z0, nz, gc, scratch, 0, d); }
