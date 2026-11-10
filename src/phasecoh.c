@@ -26,7 +26,7 @@ enum { PC_S = 512, PC_WB = 10 };
 typedef struct {
     z3 *ph, *ct; z3w *w, *w2; int64_t shape[3], ns[3]; int cell; double t0, t1, u0, u1; long long zb0, zb1;
     _Atomic long next; long nitems; _Atomic int fail; float cs[PHASE_PERIOD];
-    _Atomic long long known, hist[PC_WB + 1], hist2[PC_WB + 1], cells, cells_r; _Atomic long long wsum, wsum2;   /* hist bin PC_WB: weight 255 */
+    _Atomic long long known, hist[PC_WB + 1], hist2[PC_WB + 1], cells, cells_r; _Atomic long long wsum, wsum2, ge[3];   /* known voxels in cells with r >= 0.2 / 0.3 / 0.4 */   /* hist bin PC_WB: weight 255 */
 } pc_job;
 
 static int pc_shard(pc_job *J, long it, uint8_t *ph, uint8_t *ct, uint8_t *w, uint8_t *w2, double *acc, float *r) {
@@ -55,10 +55,11 @@ static int pc_shard(pc_job *J, long it, uint8_t *ph, uint8_t *ct, uint8_t *w, ui
         if (vv > 1e-9 && cc > 1e-9) { r[k] = (float)(cv / sqrt(vv * cc)); cells_r++; }
     }
     memset(w, 0, (size_t)PC_S * PC_S * PC_S); if (J->w2) memset(w2, 0, (size_t)PC_S * PC_S * PC_S);
-    long long hist[PC_WB + 1] = {0}, hist2[PC_WB + 1] = {0}, ws = 0, ws2 = 0;
+    long long hist[PC_WB + 1] = {0}, hist2[PC_WB + 1] = {0}, ws = 0, ws2 = 0, ge[3] = {0};
     for (int64_t z = 0; z < n[0]; z++) for (int64_t y = 0; y < n[1]; y++) for (int64_t x = 0; x < n[2]; x++) {
         const size_t i = ((size_t)z * n[1] + y) * n[2] + x; if (ph[i] == PHASE_UNKNOWN) continue;
         const float rr = r[((size_t)(z / C) * nc[1] + y / C) * nc[2] + x / C];
+        if (isfinite(rr)) { if (rr >= 0.2f) ge[0]++; if (rr >= 0.3f) ge[1]++; if (rr >= 0.4f) ge[2]++; }
         double wv = 0; if (isfinite(rr)) { wv = (rr - J->t0) / (J->t1 - J->t0); wv = wv < 0 ? 0 : wv > 1 ? 1 : wv; }
         const int q = (int)lround(255 * wv); w[((size_t)z * PC_S + y) * PC_S + x] = (uint8_t)q; ws += q;
         hist[q == 255 ? PC_WB : q * PC_WB / 255]++;
@@ -66,7 +67,7 @@ static int pc_shard(pc_job *J, long it, uint8_t *ph, uint8_t *ct, uint8_t *w, ui
                      const int q2 = (int)lround(255 * u); w2[((size_t)z * PC_S + y) * PC_S + x] = (uint8_t)q2; ws2 += q2; hist2[q2 == 255 ? PC_WB : q2 * PC_WB / 255]++; }
     }
     if (z3w_write_shard(J->w, sz, sy, sx, w, 1) || (J->w2 && z3w_write_shard(J->w2, sz, sy, sx, w2, 1))) return -1;
-    atomic_fetch_add(&J->wsum2, ws2); for (int b = 0; b <= PC_WB; b++) atomic_fetch_add(&J->hist2[b], hist2[b]);
+    atomic_fetch_add(&J->wsum2, ws2); for (int t = 0; t < 3; t++) atomic_fetch_add(&J->ge[t], ge[t]); for (int b = 0; b <= PC_WB; b++) atomic_fetch_add(&J->hist2[b], hist2[b]);
     atomic_fetch_add(&J->known, (long long)nk); atomic_fetch_add(&J->wsum, ws); atomic_fetch_add(&J->cells, cells); atomic_fetch_add(&J->cells_r, cells_r);
     for (int b = 0; b <= PC_WB; b++) atomic_fetch_add(&J->hist[b], hist[b]);
     return 0;
@@ -117,6 +118,7 @@ int cmd_phase_coh(int argc, char **argv) {
     const long long kn = J.known;
     printf("phase-coh: %lld known-phase voxels, %lld cells with labels (%lld with a coherence), mean weight %.4f; weight %g..%g\n", kn, (long long)J.cells, (long long)J.cells_r,
            kn ? (double)J.wsum / (255.0 * kn) : 0, J.t0, J.t1);
+    printf("phase-coh: known voxels in cells with coherence >= 0.2 / 0.3 / 0.4: %.4f %.4f %.4f\n", kn ? (double)J.ge[0] / kn : 0, kn ? (double)J.ge[1] / kn : 0, kn ? (double)J.ge[2] / kn : 0);
     printf("phase-coh: share of known voxels by weight (0-0.1 ... 0.9-1, =1):");
     for (int b = 0; b <= PC_WB; b++) printf(" %.4f", kn ? (double)J.hist[b] / kn : 0);
     printf("\n");
