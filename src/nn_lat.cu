@@ -660,10 +660,16 @@ extern "C" void nn_lat_pred_input_q(const void *q, int D, int W, float mean, flo
 struct fuse_lam { float v[7]; };
 template <typename T>
 __global__ void lat_fuse_k(const T *lg, int qd, int q0, int d, int h, int w, int z0, int nz, int c0, int n, int guide, int gb, const f16 *x, const uint8_t *t,
-                           const uint8_t *m, const uint8_t *wch, const float *st, float pw, float gscale, float rec_w, int unit_c, fuse_lam lam, float *part) {
+                           const uint8_t *m, const uint8_t *wch, const float *st, float pw, float gscale, float rec_w, int unit_c, fuse_lam lam, float *part, double *ds) {
     const int H = 4 * h, W = 4 * w, D = 4 * d, C = guide ? 2 : n, nk = guide ? 7 : n;
     const size_t pl = (size_t)h * w, ncs = (size_t)(nz / 4) * pl, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
-    if (i >= ncs) return;
+    /* ds: also the loss sums 1 .. 4 of nn_loss_stats_acc (the statistics pass then only counts the mask weights: nn_lat_fuse_stats mask_only) */
+    float acc[7][4];
+    if (ds) for (int k = 0; k < 7; k++) for (int j = 0; j < 4; j++) acc[k][j] = 0.f;
+#define FUSE_LSUM(k, xv, tbv, mbv) do { if (ds) { const float mw_ = (float)(mbv), x_ = (xv), p_ = (tbv) * (1.f / 255.f); const float sg_ = 1.f / (1.f + __expf(-x_)); \
+        const float spp_ = fmaxf(x_, 0.f) + log1pf(__expf(-fabsf(x_))); const float bce_ = pw * p_ * (spp_ - x_) + (1.f - p_) * spp_; \
+        acc[k][0] += mw_ * bce_; acc[k][1] += sg_ * p_; acc[k][2] += sg_; acc[k][3] += p_; } } while (0)
+    if (i < ncs) {
     const int sz = (int)(i / pl), cz = z0 / 4 + sz, cy = (int)(i / w % h), cx = (int)(i % w);
     const int iz[3] = {max(cz - 1, 0), cz, min(cz + 1, d - 1)}, iy[3] = {max(cy - 1, 0), cy, min(cy + 1, h - 1)}, ix[3] = {max(cx - 1, 0), cx, min(cx + 1, w - 1)};
     const size_t cv = (size_t)qd * pl, hw = (size_t)H * W, ns = (size_t)nz * hw;
@@ -704,6 +710,7 @@ __global__ void lat_fuse_k(const T *lg, int qd, int q0, int d, int h, int w, int
                                 if (!mb) continue;
                                 const float u = __half2float(__float2half_rn(LW[rx][0] * q[0] + LW[rx][1] * q[1] + LW[rx][2] * q[2]));
                                 float g = __half2float(loss_grad_v<f16, f16>(nullptr, C, ns, st, 0.f, fin, pw, gscale, 0, nullptr, D, H, W, rec_w, k, 0, vr + rx, u, t4 >> (8 * rx) & 255u, mb));
+                                FUSE_LSUM(k, u, t4 >> (8 * rx) & 255u, mb);
                                 if (lam.v[k] != 1.f) g = __half2float(f2h<f16>(lam.v[k] * g));
 #pragma unroll
                                 for (int e = 0; e < 3; e++) gq[e] += LW[rx][e] * g;
@@ -729,8 +736,7 @@ __global__ void lat_fuse_k(const T *lg, int qd, int q0, int d, int h, int w, int
 #pragma unroll
                     for (int e = 0; e < 3; e++) part[((size_t)k * 27 + (a * 3 + b) * 3 + e) * ncs + i] = ga[a][b][e];
         }
-        return;
-    }
+    } else {
     /* the guided side pair: 7 cell channels at once */
     float v[7][27], ga[7][27];
     for (int k = 0; k < 7; k++) {
@@ -771,6 +777,8 @@ __global__ void lat_fuse_k(const T *lg, int qd, int q0, int d, int h, int w, int
                     const float l0 = __half2float(__float2half_rn(u[0] + u[2] * f0 + tt)), l1 = __half2float(__float2half_rn(u[1] + u[3] * f0 - tt));
                     float g0 = on0 ? __half2float(loss_grad_v<f16, f16>(nullptr, 2, ns, st, 0.f, fin, pw, gscale, 0, nullptr, D, H, W, rec_w, 0, 0, vr + rx, l0, ta >> (8 * rx) & 255u, mb)) : 0.f;
                     float g1 = on1 ? __half2float(loss_grad_v<f16, f16>(nullptr, 2, ns, st, 0.f, fin, pw, gscale, 0, nullptr, D, H, W, rec_w, 1, 0, vr + rx, l1, tb >> (8 * rx) & 255u, mb)) : 0.f;
+                    if (on0) FUSE_LSUM(0, l0, ta >> (8 * rx) & 255u, mb);
+                    if (on1) FUSE_LSUM(1, l1, tb >> (8 * rx) & 255u, mb);
                     if (lam.v[0] != 1.f) { g0 = __half2float(f2h<f16>(lam.v[0] * g0)); g1 = __half2float(f2h<f16>(lam.v[0] * g1)); }
                     const float gd = g0 - g1;
                     const float gk[7] = {g0, g1, __half2float(__float2half_rn(g0 * f0)), __half2float(__float2half_rn(g1 * f0)), __half2float(__float2half_rn(gd * f1)),
@@ -789,12 +797,25 @@ __global__ void lat_fuse_k(const T *lg, int qd, int q0, int d, int h, int w, int
     }
     for (int k = 0; k < nk; k++)
         for (int s = 0; s < 27; s++) part[((size_t)k * 27 + s) * ncs + i] = ga[k][s];
+    }
+    }
+#undef FUSE_LSUM
+    if (!ds) return;
+    __shared__ double r[128];
+    for (int k = 0; k < C; k++)
+        for (int j = 0; j < 4; j++) {
+            r[threadIdx.x] = acc[k][j];
+            __syncthreads();
+            for (int o = 64; o > 0; o >>= 1) { if (threadIdx.x < o) r[threadIdx.x] += r[threadIdx.x + o]; __syncthreads(); }
+            if (threadIdx.x == 0) atomicAdd(&ds[k * 5 + 1 + j], r[0]);
+            __syncthreads();
+        }
 }
 /* the statistics pass fused the same way (nn_loss_stats_acc's sums of a group from the cell logits: loss_stats_k's per-voxel arithmetic on
    lat_up4_k's / lat_guide_k's fp16-rounded logits; fp32 partials per cell, fp64 per block, added to ds [5 per channel]) */
 template <typename T>
 __global__ void lat_fuse_stats_k(const T *lg, int qd, int q0, int d, int h, int w, int z0, int nz, int c0, int n, int guide, int gb, const f16 *x, const uint8_t *t,
-                                 const uint8_t *m, const uint8_t *wch, float pw, int unit_c, double *ds) {
+                                 const uint8_t *m, const uint8_t *wch, float pw, int unit_c, double *ds, int mask_only) {
     const int H = 4 * h, W = 4 * w, D = 4 * d, nk = guide ? 2 : n;
     const size_t pl = (size_t)h * w, ncs = (size_t)(nz / 4) * pl, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     float acc[7][5];
@@ -806,7 +827,16 @@ __global__ void lat_fuse_stats_k(const T *lg, int qd, int q0, int d, int h, int 
 #define FUSE_STAT(k, xv, tbv, mbv) do { const float mw_ = (float)(mbv), x_ = (xv), p_ = (tbv) * (1.f / 255.f); const float sg_ = 1.f / (1.f + __expf(-x_)); \
             const float spp_ = fmaxf(x_, 0.f) + log1pf(__expf(-fabsf(x_))); const float bce_ = pw * p_ * (spp_ - x_) + (1.f - p_) * spp_; \
             acc[k][0] += mw_; acc[k][1] += mw_ * bce_; acc[k][2] += sg_ * p_; acc[k][3] += sg_; acc[k][4] += p_; } while (0)
-        if (!guide) {
+        if (mask_only) {   /* the mask weight sums alone (no logit, no target: the gradient pass adds the other four sums) */
+            float sw = 0.f, su = 0.f;
+            for (int r = 0; r < 16; r++) {
+                const unsigned m4 = *(const unsigned *)(m + ((size_t)(4 * sz + (r >> 2)) * H + 4 * cy + (r & 3)) * W + 4 * cx);
+                if (!m4) continue;
+#pragma unroll
+                for (int rx = 0; rx < 4; rx++) { const unsigned mb = m4 >> (8 * rx) & 255u; sw += (float)mb; su += mb ? 1.f : 0.f; }
+            }
+            for (int k = 0; k < nk; k++) if (wch[k]) acc[k][0] = !guide && k == unit_c ? su : sw;
+        } else if (!guide) {
             for (int k = 0; k < n; k++) {
                 if (!wch[k]) continue;
                 const T *l = lg + (size_t)(c0 + k) * cv; const bool unit = k == unit_c;
@@ -893,7 +923,7 @@ __global__ void lat_fuse_stats_k(const T *lg, int qd, int q0, int d, int h, int 
     }
     __shared__ double r[128];
     for (int k = 0; k < nk; k++)
-        for (int j = 0; j < 5; j++) {
+        for (int j = 0; j < (mask_only ? 1 : 5); j++) {
             r[threadIdx.x] = acc[k][j];
             __syncthreads();
             for (int o = 64; o > 0; o >>= 1) { if (threadIdx.x < o) r[threadIdx.x] += r[threadIdx.x + o]; __syncthreads(); }
@@ -902,11 +932,11 @@ __global__ void lat_fuse_stats_k(const T *lg, int qd, int q0, int d, int h, int 
         }
 }
 extern "C" void nn_lat_fuse_stats(const void *lg, int lh16, int lq0, int lqd, int d, int h, int w, int z0, int nz, int c0, int n, int guide, int gb, const void *x,
-                                  const uint8_t *t, const uint8_t *m, const uint8_t *wch, float pw, int unit_c, double *ds) {
+                                  const uint8_t *t, const uint8_t *m, const uint8_t *wch, float pw, int unit_c, double *ds, int mask_only) {
     if (z0 % 4 || nz % 4 || n > 7 || (guide && n != 2)) { fprintf(stderr, "nn_lat_fuse_stats: whole coarse planes, at most 7 channels (a guided pair: 2)\n"); abort(); }
     const size_t ncs = (size_t)(nz / 4) * h * w;
-    if (lh16) lat_fuse_stats_k<f16><<<nblk(ncs, 128), 128>>>((const f16 *)lg, lqd, lq0, d, h, w, z0, nz, c0, n, guide, gb, (const f16 *)x, t, m, wch, pw, unit_c, ds);
-    else lat_fuse_stats_k<float><<<nblk(ncs, 128), 128>>>((const float *)lg, lqd, lq0, d, h, w, z0, nz, c0, n, guide, gb, (const f16 *)x, t, m, wch, pw, unit_c, ds);
+    if (lh16) lat_fuse_stats_k<f16><<<nblk(ncs, 128), 128>>>((const f16 *)lg, lqd, lq0, d, h, w, z0, nz, c0, n, guide, gb, (const f16 *)x, t, m, wch, pw, unit_c, ds, mask_only);
+    else lat_fuse_stats_k<float><<<nblk(ncs, 128), 128>>>((const float *)lg, lqd, lq0, d, h, w, z0, nz, c0, n, guide, gb, (const f16 *)x, t, m, wch, pw, unit_c, ds, mask_only);
     KCHECK();
 }
 /* the (source cell, slot) pairs along one axis whose neighbour is cell c of n: c - 1 (slot 2), c (1), c + 1 (0), and the clamped folds */
@@ -946,12 +976,12 @@ __global__ void lat_fuse_fin_k(const float *part, int nk, int d, int h, int w, i
 extern "C" size_t nn_lat_fuse_part(int n, int h, int w, int nz) { return (size_t)n * 27 * (nz / 4) * h * w * sizeof(float); }
 extern "C" void nn_lat_fuse_grad(const void *lg, int lh16, int lq0, int lqd, int d, int h, int w, int z0, int nz, int c0, int n, int guide, int gb, const void *x,
                                  const uint8_t *t, const uint8_t *m, const uint8_t *wch, const float *st, float pw, float rec_w, int unit_c, const float *lam,
-                                 float *part, float *gc, int gq0, int gqd) {
+                                 float *part, float *gc, int gq0, int gqd, double *ds) {
     if (z0 % 4 || nz % 4 || n > 7 || (guide && n != 2)) { fprintf(stderr, "nn_lat_fuse_grad: whole coarse planes, at most 7 channels (a guided pair: 2)\n"); abort(); }
     fuse_lam L; for (int k = 0; k < 7; k++) L.v[k] = k < n ? lam[k] : 1.f;
     const int nk = guide ? 7 : n; const size_t ncs = (size_t)(nz / 4) * h * w;
-    if (lh16) lat_fuse_k<f16><<<nblk(ncs, 128), 128>>>((const f16 *)lg, lqd, lq0, d, h, w, z0, nz, c0, n, guide, gb, (const f16 *)x, t, m, wch, st, pw, g_gscale, rec_w, unit_c, L, part);
-    else lat_fuse_k<float><<<nblk(ncs, 128), 128>>>((const float *)lg, lqd, lq0, d, h, w, z0, nz, c0, n, guide, gb, (const f16 *)x, t, m, wch, st, pw, g_gscale, rec_w, unit_c, L, part);
+    if (lh16) lat_fuse_k<f16><<<nblk(ncs, 128), 128>>>((const f16 *)lg, lqd, lq0, d, h, w, z0, nz, c0, n, guide, gb, (const f16 *)x, t, m, wch, st, pw, g_gscale, rec_w, unit_c, L, part, ds);
+    else lat_fuse_k<float><<<nblk(ncs, 128), 128>>>((const float *)lg, lqd, lq0, d, h, w, z0, nz, c0, n, guide, gb, (const f16 *)x, t, m, wch, st, pw, g_gscale, rec_w, unit_c, L, part, ds);
     const int a0 = max(z0 / 4 - 1, 0), a1 = min((z0 + nz) / 4 + 1, d);
     lat_fuse_fin_k<<<nblk((size_t)(a1 - a0) * h * w * nk, 256), 256>>>(part, nk, d, h, w, z0, nz, a0, a1, gc, gq0, gqd, c0, guide ? gb : -1);
     KCHECK();

@@ -836,6 +836,9 @@ static void head_slab_pass(gpu_state *d, int pass) {
     /* the gradient pass fused (g_lat_fuse): the slab chain keeps the channel ranges fr (the winding mod 4 pair; without the guided head also the side pair and the other heads' outputs) */
     const int fuse = g_lat_fuse && d->fpart && (!pass || (d->hs_train && nn_get_loss_grad_h16())), fside = fuse && g_lat_guide == 5;
     const int fr[2][2] = {{0, fside ? 0 : g_norm_ch}, {g_norm_ch + 7, fside ? g_cout : LUPC}};
+    /* a training step's statistics pass only counts the fused groups' mask weights (all the gradient reads); their loss sums come from the gradient pass, finalised after it (UFSM_LAT_LIGHT0=0: both in the statistics pass) */
+    static int light_on = -1; if (light_on < 0) light_on = !getenv("UFSM_LAT_LIGHT0") || ufsm_env_on("UFSM_LAT_LIGHT0");
+    const int light = g_lat_fuse && d->fpart && d->hs_train && nn_get_loss_grad_h16() && light_on;
     static int fine = -1; if (fine < 0) fine = getenv("UFSM_PTICK") && atoi(getenv("UFSM_PTICK")) >= 2;   /* UFSM_PTICK=2: the target / loss kernels one by one (both passes summed) */
 #define FT(w) do { if (fine) nn_ptick(w); } while (0)
     if (!pass) { nn_zero(d->hs_ds, 64 * sizeof(double)); if (g_unwrap2) nn_zero(d->w4ds, nn_wind4_sums()); }
@@ -938,10 +941,10 @@ static void head_slab_pass(gpu_state *d, int pass) {
             FT("  s wind4 stats");
             if (g_ink2) { nn_ink_targets(ink + vb, ns, d->inkt, d->inkm); nn_loss_stats_acc(LGC(g_ink2_ch), d->inkt, d->inkm, d->inkw, one, d->hs_ds + 5); }   /* --ink-head (the recto / ink v1 slots are free) */
             float pw0 = 1.f, rw0 = 0.f; int u70 = -1; if (fuse) nn_loss_cfg_get(&pw0, &rw0, &u70);
-            if (fside) nn_lat_fuse_stats(d->lgc, 1, qa, qb - qa, D / 4, H / 4, W / 4, z0, nz, g_side_ch, 2, 1, g_cout, d->x, st, sm, d->sidew, pw0, -1, d->hs_ds + 10);
+            if (fside) nn_lat_fuse_stats(d->lgc, 1, qa, qb - qa, D / 4, H / 4, W / 4, z0, nz, g_side_ch, 2, 1, g_cout, d->x, st, sm, d->sidew, pw0, -1, d->hs_ds + 10, light);
             else nn_loss_stats_acc(LGC(g_side_ch), st, sm, d->sidew, two, d->hs_ds + 10);
             FT("  s side stats");
-            if (fuse) nn_lat_fuse_stats(d->lgc, 1, qa, qb - qa, D / 4, H / 4, W / 4, z0, nz, g_norm_ch, 7, 0, -1, nullptr, d->nt, d->nm, d->nw, pw0, u70, d->hs_ds + 20);
+            if (fuse) nn_lat_fuse_stats(d->lgc, 1, qa, qb - qa, D / 4, H / 4, W / 4, z0, nz, g_norm_ch, 7, 0, -1, nullptr, d->nt, d->nm, d->nw, pw0, u70, d->hs_ds + 20, light);
             else nn_loss_stats_acc(LGC(g_norm_ch), d->nt, d->nm, d->nw, seven, d->hs_ds + 20);
             FT("  s normal stats");
             if (g_pg_lambda > 0) nn_pgrad_slab(d->hs_train ? nullptr : LGC(g_side_ch), d->hs_train ? nullptr : LGC(g_side_ch + 1), sdb, d->sidem, D, H, W, z0, z1, g_norm_s, g_pg_dist, g_pg_nd, g_pg_angle, g_pg_mask, d->hs_ds + 56, nullptr);   /* (training: the pair weights only; the loss sum comes from the gradient pass, + 58) */
@@ -986,9 +989,9 @@ static void head_slab_pass(gpu_state *d, int pass) {
             if (fuse) {   /* the fused groups straight from the cell logits (before the slab adjoint takes the normal targets as its scratch) */
                 float pw, rw; int u7; nn_loss_cfg_get(&pw, &rw, &u7);
                 const float ls = g_side_lambda, ln[7] = {g_norm_lambda, g_norm_lambda, g_norm_lambda, g_norm_lambda, g_norm_lambda, g_norm_lambda, g_dens_lambda};
-                if (fside) nn_lat_fuse_grad(d->lgc, 1, qa, qb - qa, D / 4, H / 4, W / 4, z0, nz, g_side_ch, 2, 1, g_cout, d->x, st, sm, d->sidew, d->sscratch, pw, rw, -1, &ls, d->fpart, d->latg, q0, qc);
+                if (fside) nn_lat_fuse_grad(d->lgc, 1, qa, qb - qa, D / 4, H / 4, W / 4, z0, nz, g_side_ch, 2, 1, g_cout, d->x, st, sm, d->sidew, d->sscratch, pw, rw, -1, &ls, d->fpart, d->latg, q0, qc, light ? d->hs_ds + 10 : nullptr);
                 FT("  f fused side");
-                nn_lat_fuse_grad(d->lgc, 1, qa, qb - qa, D / 4, H / 4, W / 4, z0, nz, g_norm_ch, 7, 0, -1, nullptr, d->nt, d->nm, d->nw, d->nscratch, pw, rw, u7, ln, d->fpart, d->latg, q0, qc);
+                nn_lat_fuse_grad(d->lgc, 1, qa, qb - qa, D / 4, H / 4, W / 4, z0, nz, g_norm_ch, 7, 0, -1, nullptr, d->nt, d->nm, d->nw, d->nscratch, pw, rw, u7, ln, d->fpart, d->latg, q0, qc, light ? d->hs_ds + 20 : nullptr);
                 FT("  f fused normal");
                 for (int r = 0; r < 2; r++) if (fr[r][1] > fr[r][0]) nn_lat_up_adj_c(LGC(fr[r][0]), fr[r][1] - fr[r][0], D / 4, H / 4, W / 4, z0, nz, d->latg + (size_t)fr[r][0] * qc * pl, d->nt, q0, qc);
             } else nn_lat_up_adj_c(d->hs_lg, LUPC, D / 4, H / 4, W / 4, z0, nz, d->latg, d->nt, q0, qc);
@@ -1036,6 +1039,10 @@ static void head_slab_pass(gpu_state *d, int pass) {
         } else nn_wind4_fin(d->w4ds, d->w4fin);
         if (g_ink2) nn_loss_stats_fin(d->hs_ds + 5, d->inkw, w1, d->iscratch);
         nn_loss_stats_fin(d->hs_ds + 10, d->sidew, w2, d->sscratch);
+        nn_loss_stats_fin(d->hs_ds + 20, d->nw, w7, d->nscratch);
+    } else if (fuse && light) {   /* the logged losses: the same finalisation with the gradient pass's sums (the mask sums and the active count are unchanged) */
+        const shape5 w2 = {1, 2, D, H, W}, w7 = {1, 7, D, H, W};
+        if (fside) nn_loss_stats_fin(d->hs_ds + 10, d->sidew, w2, d->sscratch);
         nn_loss_stats_fin(d->hs_ds + 20, d->nw, w7, d->nscratch);
     }
 }
