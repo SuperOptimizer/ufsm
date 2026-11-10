@@ -356,7 +356,15 @@ extern "C" void nn_free(void *p) {
     CK(cudaFree(p));
 }
 extern "C" void nn_zero(void *p, size_t n) { CKR(cudaMemset(p, 0, n)); }
-extern "C" void nn_h2d(void *d, const void *s, size_t n) { CKR(cudaMemcpy(d, s, n, cudaMemcpyHostToDevice)); }
+/* A pageable upload of <= 64 KB returns once the bytes are staged: the device write is queued on the default stream. Work on the default
+   stream is ordered after it; work on the copy / aux / offload streams is not, unless an event of the default stream is waited for
+   (test_pack_tm raced this way). UFSM_H2D_SYNC=1 synchronises the default stream after every such upload: a run that changes under
+   it has an unordered reader. */
+extern "C" void nn_h2d(void *d, const void *s, size_t n) {
+    CKR(cudaMemcpy(d, s, n, cudaMemcpyHostToDevice));
+    static int sy = -1; if (sy < 0) sy = getenv("UFSM_H2D_SYNC") ? atoi(getenv("UFSM_H2D_SYNC")) : 0;
+    if (sy && n <= ((size_t)64 << 10)) CK(cudaStreamSynchronize(0));
+}
 extern "C" void nn_d2h(void *d, const void *s, size_t n) { CKR(cudaMemcpy(d, s, n, cudaMemcpyDeviceToHost)); }
 extern "C" void nn_d2d(void *d, const void *s, size_t n) { CKR(cudaMemcpy(d, s, n, cudaMemcpyDeviceToDevice)); }
 extern "C" void nn_copy_async(void *d, const void *s, size_t n) { CKR(cudaMemcpyAsync(d, s, n, cudaMemcpyDefault, 0)); }   /* any direction (pinned host), ordered with the kernels */

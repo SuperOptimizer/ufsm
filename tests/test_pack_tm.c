@@ -29,10 +29,16 @@ static int unit(void) {
                 if (sample_pack_tm(t + (2 * n) * p3, t + (2 * n + 1) * p3, m + n * p3, p3, code + n * p3, &bad)) { fprintf(stderr, "pack refused a hard batch at %zu\n", bad); fails++; }
             uint8_t *dt = nn_malloc((size_t)nb * 2 * p3), *dm = nn_malloc((size_t)nb * p3);
             memset(gt, 0x5a, (size_t)nb * 2 * p3); nn_h2d(dt, gt, (size_t)nb * 2 * p3);   /* (stale bytes: the unpack writes every one) */
+            nn_sync();   /* a pageable host -> device cudaMemcpy of <= 64 KB returns once the bytes are staged: the device write is queued on the
+                            default stream, which the non-blocking copy stream does not wait for (the stale tail landed after the unpack: 1 in 8 runs) */
             if (stream) { nn_h2d_copy_stream(dm, code, (size_t)nb * p3); nn_unpack_tm(dt, dm, nb, p3, 1); void *ev = nn_event_create(); nn_event_record(ev, 1); nn_event_sync(ev); }
             else { nn_h2d(dm, code, (size_t)nb * p3); nn_unpack_tm(dt, dm, nb, p3, 0); }
             nn_d2h(gt, dt, (size_t)nb * 2 * p3); nn_d2h(gm, dm, (size_t)nb * p3);
-            if (memcmp(gt, t, (size_t)nb * 2 * p3) || memcmp(gm, m, (size_t)nb * p3)) { fprintf(stderr, "unpack mismatch: %d samples, stream %d\n", nb, stream); fails++; }
+            if (memcmp(gt, t, (size_t)nb * 2 * p3) || memcmp(gm, m, (size_t)nb * p3)) { fprintf(stderr, "unpack mismatch: %d samples, stream %d\n", nb, stream); fails++;
+                if (getenv("TPT_DETAIL")) { size_t nt = 0, nm = 0, ft = 0, lt = 0, fm = 0, lm = 0, n5a = 0;
+                    for (size_t k = 0; k < (size_t)nb * 2 * p3; k++) if (gt[k] != t[k]) { if (!nt++) ft = k; lt = k; n5a += gt[k] == 0x5a; }
+                    for (size_t k = 0; k < (size_t)nb * p3; k++) if (gm[k] != m[k]) { if (!nm++) fm = k; lm = k; }
+                    fprintf(stderr, "  targets: %zu differ (%zu .. %zu, %zu still 0x5a) of %zu; mask: %zu differ (%zu .. %zu; got %d want %d, code %d) of %zu\n", nt, ft, lt, n5a, (size_t)nb * 2 * p3, nm, fm, lm, gm[fm], m[fm], code[fm], (size_t)nb * p3); } }
             /* a soft target value and a mask weight of 2 are refused, at their index */
             t[p3 + 77] = 200;
             if (!sample_pack_tm(t, t + p3, m, p3, code, &bad) || bad != 77) { fprintf(stderr, "soft target not refused (%zu)\n", bad); fails++; }

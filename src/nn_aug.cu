@@ -554,7 +554,8 @@ extern "C" void nn_label_warp(int kind, const uint8_t *a_h, const uint8_t *b_h, 
     cudaStream_t s = on_copy_stream ? copy_stream() : 0;
     const size_t p3 = (size_t)P * P * P;
     if (!a->cssn) { CK(cudaMalloc(&a->cssn, 2 * 256 * sizeof(float))); CK(cudaMemcpy(a->cssn, cs_h, LW_PERIOD * sizeof(float), cudaMemcpyHostToDevice));
-                    CK(cudaMemcpy(a->cssn + 256, sn_h, LW_PERIOD * sizeof(float), cudaMemcpyHostToDevice)); }
+                    CK(cudaMemcpy(a->cssn + 256, sn_h, LW_PERIOD * sizeof(float), cudaMemcpyHostToDevice));
+                    CK(cudaStreamSynchronize(0)); }   /* (once: a pageable upload of <= 64 KB is only staged on return, its device write queued on the default stream; the kernels below may run on the copy stream) */
     if (a->used) CK(cudaStreamWaitEvent(s, a->done, 0));
     CK(cudaMemcpyAsync(a->stage, a_h, p3, cudaMemcpyHostToDevice, s));
     if (kind == 2) CK(cudaMemcpyAsync(a->stage + p3, b_h, p3, cudaMemcpyHostToDevice, s));
@@ -603,7 +604,8 @@ extern "C" void nn_w4runs_label(const uint8_t *side_h, const void *runs, const v
     if (!r->noff) { CK(cudaMemsetAsync(da, 255, p3, s)); CK(cudaMemsetAsync(db, 255, p3, s)); return; }   /* (no winding: unknown) */
     aug_dev *a = aug_get(P, 2);
     if (!a->cssn) { CK(cudaMalloc(&a->cssn, 2 * 256 * sizeof(float))); CK(cudaMemcpy(a->cssn, cs_h, LW_PERIOD * sizeof(float), cudaMemcpyHostToDevice));
-                    CK(cudaMemcpy(a->cssn + 256, sn_h, LW_PERIOD * sizeof(float), cudaMemcpyHostToDevice)); }
+                    CK(cudaMemcpy(a->cssn + 256, sn_h, LW_PERIOD * sizeof(float), cudaMemcpyHostToDevice));
+                    CK(cudaStreamSynchronize(0)); }   /* (once: a pageable upload of <= 64 KB is only staged on return, its device write queued on the default stream; the kernels below may run on the copy stream) */
     if (a->used) CK(cudaStreamWaitEvent(s, a->done, 0));
     CK(cudaMemcpyAsync(a->stage, side_h, p3, cudaMemcpyHostToDevice, s));
     if (nn_w4runs_apply(a->stage, P, P, P, r->tile, r->ms, r, a->stage, a->stage + p3, (void *)s)) { fprintf(stderr, "nn_w4runs_label: CUDA error\n"); abort(); }
