@@ -4,6 +4,7 @@
 # shard grid), then predict --channel rv from the CT and from the store. The outputs differ only by the store's quantiser (the
 # kernels' half-step bound: test_lat), so the check is a bound on the disagreement, plus: the cell-grid input and the full-resolution
 # input give the same bytes; no CT voxel is read (store io of the CT root: metadata only); windows off the store's cell grid are refused.
+# Then fit fields (--fit-zarr, --fit-ct) of two winding nets (sub-cell head, general guided head) from the CT and from the store, per-field bounds.
 # Usage: test_latents.sh <ufsm binary> <make_wind_fixture binary>
 set -u
 U=$1 F=$2
@@ -55,5 +56,33 @@ for a, b, agree_min, box in (("g0ct", "g0lc", 0.97, None), ("g1ct", "g1lc", 0.80
     bad += not ok
 sys.exit(1 if bad else 0)
 EOF
+# fit fields (--fit-zarr) from latent-grid winding nets: the sub-cell head (--lat-guide 3, as wz768) and the general guided head
+# (--lat-guide 2, its CT terms from the rebuilt CT), and --fit-ct's planes from the rebuilt CT; bounds per field (6-step nets: the
+# winding-mod-4 planes are the noisiest)
+for g in 2 3; do
+    # shellcheck disable=SC2086
+    "$U" train "$D/fx/sources.json" --out "$D/w$g" --P 64 --widths 32,64,128 --steps 6 $T --lat-basis "$D/basis.lcb" --lat-c 29 --lat-step 0.25 --lat-step-jitter 0.3 \
+        --lat-guide $g > "$D/w$g.log" 2>&1 || fail "train winding lat-guide $g ($D/w$g.log)"
+    for src in ct lc; do
+        x=(); [ $src = lc ] && x=(--latents "$D/lc")
+        "$U" predict "$D/w$g/last.ckpt" "$D/fx" ct "$D/fo_$g$src" --fit-zarr "$D/f_$g$src" --um 9.6 --level 0 --window 160 --halo 16 --shard 128 --levels 1 --threads 4 --fit-h 4 \
+            --fit-ct $((g == 2)) --axis "$D/fx/axis.json" "${x[@]}" > "$D/f_$g$src.log" 2>&1 || fail "predict --fit-zarr lat-guide $g $src ($D/f_$g$src.log)"
+        for a in pc ps sp t0 t1 t2 t3 t4 t5 w dq dx dy dz ct cs; do [ -d "$D/f_$g$src/$a" ] && "$U" read "$D/f_$g$src" $a 0 0 0 64 64 64 "$D/f_$g$src.$a.raw" > /dev/null 2>&1; done
+    done
+done
+python3 -I - "$D" <<'EOF2' || fail "fit fields ($D)"
+import sys, os, numpy as np
+d = sys.argv[1]; bad = 0
+lim = {"pc": .75, "ps": .65, "sp": .65, "t0": .7, "t1": .75, "t2": .55, "t3": .75, "t4": .85, "t5": .55, "w": .9, "dq": .6, "dx": .45, "dy": .45, "dz": .4, "ct": .95, "cs": .5}
+for g in (2, 3):
+    for a, m in lim.items():
+        f = f"{d}/f_{g}ct.{a}.raw"
+        if not os.path.exists(f): continue
+        x = np.fromfile(f, np.uint8).astype(float); y = np.fromfile(f"{d}/f_{g}lc.{a}.raw", np.uint8).astype(float)
+        c = np.corrcoef(x, y)[0, 1] if x.std() > 0 and y.std() > 0 else (1.0 if (x == y).all() else 0.0)
+        ok = c >= m; bad += not ok
+        print(f"lat-guide {g} {a:2s}: corr {c:.4f} (>= {m}), mean |d| {np.abs(x - y).mean():5.2f}: {'ok' if ok else 'FAIL'}")
+sys.exit(1 if bad else 0)
+EOF2
 rm -rf "$D"
 echo "test_latents: ok"
