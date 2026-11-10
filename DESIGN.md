@@ -24,7 +24,11 @@ memory plan has room for stay on the device (`d->ldev`), the rest stream as befo
   steps, P256) and for the winding net; `--det 1` step lines are identical with the planes on the device, partly, and streamed
   (rv and winding, 12 steps). `test_gpu_aug` covers the pack / unpack kernels. The check mode died without a papyrus plane (it read a
   null plane); fixed.
-- **Not measured yet:** the real-loader gain on a quiet card.
+- Real loader, rv P768, quiet GPU 1, 2 workers / 3 slots, `--det 1` (the same batches), all four planes on the device against
+  `UFSM_LAT_LDEV=0`: 1.123 -> 1.223 samples/s, the mean of steps 4-14 (+9%; loader wait 0%). In a profiled step (`UFSM_PTICK=2`,
+  synchronous upload, which also counts copies that otherwise overlap) the copy-back fell from 69 to 18 ms and the slab uploads from
+  156 to 9 ms, the step from 896 to 688 ms. P512 beside a training run: 3.60 -> 3.92. **Not measured:** P1024 / P1152 (the dev
+  memory slice had no room for the loader).
 
 **Phase and winding planes at 6 and 4 bits** (`UFSM_LAB_QBITS`: the training batches' planes quantised to 2^n cyclic levels on the
 device, validation on the stored bytes; P256, `--det 1`, GPU 1 beside a training run, one seed each). Validation after the last step:
