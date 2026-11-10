@@ -1457,20 +1457,24 @@ void phase_weight_drop(uint8_t *ph, const uint8_t *w, int Pz, int P, uint64_t se
 static void phase_negate(uint8_t *p, size_t n) { for (size_t k = 0; k < n; k++) if (p[k] < PHASE_PERIOD && p[k]) p[k] = (uint8_t)(PHASE_PERIOD - p[k]); }
 /* the stored phase's air test in one pass: sw unknown where CT <= air or CT 0; pw (optional, --task unwrap2's winding input,
    taken before the test): the phase where CT > 0, else unknown */
-static void phase_air(const uint8_t *ctu, uint8_t *sw, uint8_t *pw, size_t n, int air) {
-    size_t k = 0;
+static size_t phase_air(const uint8_t *ctu, uint8_t *sw, uint8_t *pw, size_t n, int air) {   /* returns the known phases (< PHASE_PERIOD) of sw out */
+    size_t k = 0, kn = 0;
 #ifdef __AVX2__
     {
         const __m256i z = _mm256_setzero_si256(), U = _mm256_set1_epi8((char)SIDE_UNKNOWN), A = _mm256_set1_epi8((char)(air > 255 ? 255 : air < 0 ? 0 : air));
+        const __m256i L = _mm256_set1_epi8((char)(PHASE_PERIOD - 1));
         for (; k + 32 <= n; k += 32) {
             const __m256i v = _mm256_loadu_si256((const __m256i *)(ctu + k)), s = _mm256_loadu_si256((const __m256i *)(sw + k));
             const __m256i v0 = _mm256_cmpeq_epi8(v, z), cond = air < 0 ? v0 : _mm256_cmpeq_epi8(_mm256_min_epu8(v, A), v);   /* (v <= air: min == v) */
             if (pw) _mm256_storeu_si256((__m256i *)(pw + k), _mm256_blendv_epi8(s, U, v0));
-            _mm256_storeu_si256((__m256i *)(sw + k), _mm256_blendv_epi8(s, U, cond));
+            const __m256i so = _mm256_blendv_epi8(s, U, cond);
+            _mm256_storeu_si256((__m256i *)(sw + k), so);
+            kn += (size_t)__builtin_popcount((unsigned)_mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_min_epu8(so, L), so)));   /* (so <= PERIOD - 1) */
         }
     }
 #endif
-    for (; k < n; k++) { const uint8_t v = ctu[k], s = sw[k]; if (pw) pw[k] = v ? s : SIDE_UNKNOWN; if (v <= air || !v) sw[k] = SIDE_UNKNOWN; }
+    for (; k < n; k++) { const uint8_t v = ctu[k], s = sw[k]; if (pw) pw[k] = v ? s : SIDE_UNKNOWN; if (v <= air || !v) sw[k] = SIDE_UNKNOWN; kn += sw[k] < PHASE_PERIOD; }
+    return kn;
 }
 static int phase_window(z3 *a, const int64_t o[3], int D, int P, int shift, uint8_t *side) {   /* a: s->phase, or s->wind (same grid); D x P x P */
     if (shift >= 2) return phase_window_interp(a, o, D, P, shift, side);
@@ -2902,6 +2906,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
     /* --task unwrap2: the winding mod 4 and its component come from a stored phase below (warped or through the symmetry: every
        voxel written); else unknown (255) */
     int w4_set = 0;
+    size_t ph_known = SIZE_MAX;   /* the known phases of the window's side plane (--min-phase), counted in phase_air; SIZE_MAX: count it */
     PROF_MARK(PS_SYMPACK);
     /* the targets (ttmp) and the loss mask (big + 9 P^3) are dead from here for unwarped / device-warped windows without a sheet prior
        (write_spatial_tm and sheet_sample would read them): their planes are scratch below */
@@ -2948,7 +2953,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
             if (c->wind4 && !s->scope_local) {   /* ("scope": "local": the winding mod 4 stays unknown, below) */   /* the winding mod 4: the phase unwrapped before the air test (gaps join the windings), outside the scroll (CT 0) not */
                 uint8_t *pw = PH_GET(ttmp + p3 + 64, p3);
                 if (!pw) { SW_PUT(); return -1; }
-                phase_air(ctu, sw, pw, p3, c->side_air); air_done = 1;   /* (the winding input and the air test in one pass) */
+                ph_known = phase_air(ctu, sw, pw, p3, c->side_air); air_done = 1;   /* (the winding input and the air test in one pass) */
                 if (ph_own) {   /* the phase's output now (the winding below reads pw only): its plane is free for the winding */
                     if (c->phase_near_um > 0) for (size_t k = 0; k < p3; k++) if (!near || !near[k]) sw[k] = SIDE_UNKNOWN;   /* no labelled wrap: none */
                     if (!direct) sym_u8(sw, side_o, Pz, P, y);
@@ -2972,7 +2977,8 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
                 PROF_MARK(PS_WIND4);
                 PH_PUT(pw, p3); if (!ph_own) { PH_PUT(ww, p3); PH_PUT(wc, p3); }
             }
-            if (!air_done) phase_air(ctu, sw, nullptr, p3, c->side_air);
+            if (!air_done) ph_known = phase_air(ctu, sw, nullptr, p3, c->side_air);
+            if (c->phase_near_um > 0 || (spatial.active && !lw)) ph_known = SIZE_MAX;   /* (the count of side_o: changed below / by the host warp; a symmetry keeps it) */
             if (!side_done) {
                 if (c->phase_near_um > 0) for (size_t k = 0; k < p3; k++) if (!near || !near[k]) sw[k] = SIDE_UNKNOWN;   /* no labelled wrap: none */
                 if (direct) {}   /* (in place) */
@@ -3057,8 +3063,8 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
     tp_put(near, p3);
     if (c->side == 2 && c->min_phase > 0 && !s->ct_only) {   /* --min-phase: windows with (almost) no known phase supervise nothing (sources with band / phase
                                                  targets only draw anywhere in the scroll): rejected */
-        const uint8_t *sd = b->side + (size_t)i * p3; size_t kn = 0;
-        for (size_t k = 0; k < p3; k++) kn += sd[k] < PHASE_PERIOD;
+        const uint8_t *sd = b->side + (size_t)i * p3; size_t kn = ph_known;
+        if (kn == SIZE_MAX) { kn = 0; for (size_t k = 0; k < p3; k++) kn += sd[k] < PHASE_PERIOD; }
         if (inkw && !c->rv_iso) { const uint8_t *ik = b->ink + (size_t)i * p3; for (size_t k = 0; k < p3; k++) kn += ik[k] != 255; }   /* (--ink-head: known ink supervises too: ink-only sources draw) */
         if ((double)kn < c->min_phase * (double)p3) { if (Tw) tp_put(Tw, (NCH + 1) * p3); atomic_fetch_add(&sp->rejected, 1); atomic_fetch_add(&sp->rej_why[2], 1); return 1; }   /* (counted as empty targets) */
     }
