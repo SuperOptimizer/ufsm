@@ -37,8 +37,10 @@ Numbers (thread CPU, machine shared with two production trainers and their loade
 - one stored P512 window, tile 86: CPU path 0.65-0.75 CPU-s, device path 0.155 CPU-s (0.125 of it the replay), 0.37-0.41 s wall
   behind a trainer on the same GPU.
 - sampler alone (`UFSM_SAMPLER_ONLY=16 UFSM_SAMPLER_PROF=2`, P512, `--det 1`, 4 workers, two alternating runs each): the wind4 stage
-  473 / 529 -> 281 / 210 ms a window (the stage also holds phase_air and the side output), all stages 1.69 / 1.79 -> 1.74 / 1.38
-  CPU-s a window. The first pair is within the machine's run-to-run drift; the stage itself is -51%.
+  473 / 529 -> 281 / 210 ms a window (the stage also holds phase_air and the side output): -51%. All stages, second pair only (the
+  first pair's full profiles were not kept): 1.79 -> 1.38 CPU-s a window, of which the wind4 stage gives 0.32; the rest of that
+  difference is the machine's run-to-run drift (ctread equal, augment / phout lower), so the supported figure is about -0.25 to
+  -0.3 CPU-s a window of this mix (~-15%).
 
 ## Latent-grid training and inference speed (2026-11-09, branch perf-20261109)
 
