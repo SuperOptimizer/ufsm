@@ -131,6 +131,41 @@ kernels. Buffers: the plane is uint8 x 2 per voxel on the host, uploaded per 32-
 arises (it is a label, not an activation). Expected size of the effect is unknown; the tangent-vs-normal medians above (7 .. 9 degrees
 against GT normals) say the fibres are consistent with the sheets to that accuracy, which is the ceiling of what this term can teach.
 
+**4, design only: a soft same-fibre pair term for the phase and winding-mod-4 heads.** A fibre lies in one sheet, so two points of one
+fibre <= 0.3 mm apart should get the same winding: for the phase head (unit vector u = (cos, sin) of the two phase channels at `g_side_ch`
+in task unwrap2) and for the w4 head (`g_w4_ch`, the same form with the angle 2 pi w / 4) the term is L = lambda (1 - u_a . u_b) over
+pairs (a, b), capped per pair (the measured 5 .. 7 % of pairs beyond half a turn at 0.3 mm are outliers by construction and must not pull).
+It uses no winding label, so it is the one winding signal available on scrolls without a trusted spiral; alone it has the constant
+solution, so it only ever runs beside the supervised phase loss, lambda small. What the loss path dictates: logits exist one 32-plane
+z-slab at a time (`head_slab_pass`), so both points of a pair must lie in the same slab - 32 planes at 9.6 um is 0.31 mm, the same range
+the measurements support, and H fibres run inside a slab anyway; and the loss gradients are half floats without an atomic add, so the
+sampler emits DISJOINT pairs (a voxel in at most one pair), which makes the scatter two plain writes per pair. Sampler: per source a
+prebuilt pair-point file (UFIB polylines + a 64^3 cell index, built once by a `fiber-raster`-like pass from the AFV or from traced
+predictions), per window up to 4096 pairs = 32 KB of int32 voxel indices, uploaded with the label planes of the slab they fall in. The
+points are moved by the window's own spatial transform; flips, the 5 degree rotations and the axis jitter are affine and cost a 3 x 4
+product per point (microseconds per window, nothing next to the CT decode); the elastic warp is stored as output -> input and has no
+cheap forward map, so windows with it (p 0.15) carry no pairs. Kernel `nn_pair_cos(LGC(ch), pairs, n, lambda, cap, grad, stats)` after
+the phase / w4 gradients are written (the block around `src/train.c:976..1021`), statistic = mean 1 - cos into `d->hs_ds`; the fused
+latent path refuses the flag as for 3b; `--fibpair-lambda 0` default, no parameters, old checkpoints unchanged. Test: central differences
+against a host reference. The measured ceiling: 0.93 .. 0.95 of such pairs agree in the GT's own phase, so the term can remove gross
+sheet switches along fibres, not refine a good phase.
+
+**Centring, snapped wraps, and masks without directions (later the same day).** The judge is already free of centring: every statistic
+is a difference of the unwrapped phase along one fibre (pairs: phase at s + d minus phase at s; excursions: against the stretch's own
+start), so a wrap that sits a constant few voxels off its sheet changes nothing; only an offset that varies by half a pitch along a
+fibre would. Measured: hostmem's snapped 1299 wraps (`latcal/wraps_snap/PHerc1299`, mean |shift| 4.15 um) give H 0.5957 / V 0.6722 at
+0.6 mm and 751 / 509 excursions per m, against 0.5961 / 0.6738 and 748 / 506 unsnapped. So the 1299 row is not centring. Per tile
+(19 tiles with >= 0.3 m) the persistent rate is 210 .. 1278 per m, median 374, against Paris 4's 67 .. 576, median 189: the excess is
+spread over the whole section, with one tile (y 3584, x 2048) far worse.
+`fiber-trace --presence-only 1 / --mask ROOT KEY` takes the axis from the presence itself (smallest eigenvector of its gradient structure
+tensor over 5^3 voxels), so lines can be traced through a plain mask - our own H / V predictions. On the official Paris 4 presence at
+38.4 um, where a fibre is about one voxel wide, it is clearly weaker than the direction channels: 25,864 lines of mean length 31 voxels
+against 86,597 of 74, pairs at 0.6 mm 0.861 H / 0.874 V against 0.925 / 0.908. `scripts/fibers/eval_hold.sh RUN` is the validation of
+the H / V model built on it: predict both channels on the Paris 4 HOLD box (another scanner setting, never trained on), trace each mask,
+judge against the GT phase. Reference rows on HOLD (6 tiles of 256^2 x 512, pairs at 0.6 mm H / V): published v2 fibres 0.952 / 0.902
+(3.5 m), official prediction with directions 0.966 / 0.876 (2.3 m), presence only 0.888 / 0.758 (0.24 m: too little to rank on, so
+the script also prints the traced length). The predict flags in it are untested until a GPU is free.
+
 **PHerc1218 (no fibres published): two routes.** (a) One-off inference with the public model, outside the pipeline: clone villa, its
 bootstrap venv (PyTorch cu128), `python -m vesuvius.neural_tracing.fiber_trace_3d.infer` with the SD2 checkpoint on level 0 of the 8.64 um
 scan (the card's own recipe for a 9.36 um scan, "transfer use"). For the judge one 640-slice slab is enough: 7593^2 x 640 voxels = 1,152

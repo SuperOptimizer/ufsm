@@ -60,7 +60,23 @@ int main(void) {
         CHECK(F.fam[r] == (k >= 5 && k < 8 ? 'V' : 'H'), "streamline %d (fibre %d): family %c", r, k, F.fam[r]);
     }
     for (int k = 0; k < NF; k++) CHECK(seen[k] == 1, "fibre %d traced %d times", k, seen[k]);
-    fib_free(&F); for (int c = 0; c < 3; c++) free(v[c]);
+    fib_free(&F);
+    /* --presence-only: the axis from the presence's structure tensor; the same fibres, a looser tolerance (the ends, where the tube stops);
+       the straight fibres come out as one line each, the radius-40 arc may break into pieces and run twice side by side (the 5^3 tensor on a 3-voxel tube) */
+    char *ap[] = {"ufsm", "fiber-trace", root, key, out, "--box", "0,0,0,64,128,128", "--scaledown", "3", "--threads", "2", "--presence-only", "1"};
+    CHECK(!cmd_fiber_trace(13, ap), "fiber-trace --presence-only");
+    fib_set G = {0}; CHECK(!fib_load(out, &G), "load the presence-only streamlines"); int seen2[NF] = {0}; double w2 = 0, tl[NF] = {0};
+    for (int r = 0; r < G.n; r++) {
+        const int a = G.off[r], b = G.off[r + 1]; const float *m = G.pts + 3 * (size_t)((a + b) / 2); double t[3], best = 1e9; int k = -1, in;
+        for (int j = 0; j < NF; j++) { const double d = fibre(j, (m[0] + 0.5) / 8 - 0.5, (m[1] + 0.5) / 8 - 0.5, (m[2] + 0.5) / 8 - 0.5, t, &in); if (d < best) { best = d; k = j; } }
+        seen2[k]++; double len = 0;
+        for (int i = a; i < b; i++) { const float *q = G.pts + 3 * (size_t)i; const double d = fibre(k, (q[0] + 0.5) / 8 - 0.5, (q[1] + 0.5) / 8 - 0.5, (q[2] + 0.5) / 8 - 0.5, t, &in); if (d > w2) w2 = d;
+            if (i > a) len += sqrt(pow(q[0] - q[-3], 2) + pow(q[1] - q[-2], 2) + pow(q[2] - q[-1], 2)) / 8; }
+        tl[k] += len;
+    }
+    CHECK(w2 < 1.5, "presence-only: %.2f voxels off the axis", w2);
+    for (int k = 0; k < NF; k++) CHECK(tl[k] > 0.8 * fibre_len(k) && (k == 8 ? tl[k] < 2.2 * fibre_len(k) : tl[k] < fibre_len(k) + 6 && seen2[k] == 1), "presence-only: fibre %d traced %d times, length %.1f of %.1f", k, seen2[k], tl[k], fibre_len(k));
+    fib_free(&G); for (int c = 0; c < 3; c++) free(v[c]);
     snprintf(p, sizeof p, "rm -rf %s", root); if (!fails && system(p)) fails++;
     printf(fails ? "test_fibertrace: %d FAILED\n" : "test_fibertrace: ok\n", fails);
     return fails ? 1 : 0;
