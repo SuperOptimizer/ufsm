@@ -185,6 +185,11 @@ void nn_input_latc(const void *ct16, shape5 xs, const void *rec, const float *ba
 /* predict --latents: the cell channels from a latcomp store's indices q (int8 [d][h][w](C + 1), lc_cli.c layout; raw-domain step) with the window's
    mean / 1 / sd; the radial means from x's channels 1-3 */
 void nn_lat_input_q(const void *q, const void *x, int d, int h, int w, const float *gain, int C, float step_raw, float mean, float isd, void *y);
+/* predict --latents: the CT window rebuilt from a window of stored cells (nn_lat.cu lat_synth_k: 1..255 in material cells, 0 in air
+   cells), and a --lat-basis net's input straight from the cells with the radial channels from the axis offsets (lat_pred_in_q_k) */
+void nn_lat_synth_ct(const void *q, int C, const float *bas, float step_raw, int D, int W, uint8_t *ct);
+void nn_lat_pred_input_q(const void *q, int D, int W, float mean, float isd, const float *dyo, const float *dxo, int axis,
+                         const float *gain, int C, float step_raw, void *y);
 /* the guided head (unet_cfg.lat_guide): see nn_lat.cu lat_guide_k */
 /* the sub-cell head (unet_cfg.lat_guide 64): see nn_lat.cu lat_shuf_k */
 void nn_lat_shuffle(const void *lg, int lh16, int d, int h, int w, int base, int ng, int z0, int nz, void *y);
