@@ -180,6 +180,7 @@ typedef struct {
     uint8_t *wind;           /* B x P^3 winding mod 14 + gauge (band.h band_winding encoding, 255 unknown) when cfg.cond */
     uint8_t *pap;            /* B x P^3 papyrus labels when cfg.pap_head: 0 void, 1 papyrus, 255 ignored */
     uint8_t *w4, *wcomp;     /* B x P^3 each when cfg.wind4: winding mod 4 (63 codes per turn, 255 unknown) and its component (0..14, 255 none) */
+    int use;                 /* sampler_next: 0 a new window, k its k-th replay (--replay) */
     void *w4r;               /* cfg.w4_runs: B band_w4dev.h w4runs (the winding as runs, malloc'd and kept per slot) instead of w4 / wcomp; side then
                                 holds every window's phase on the source grid (the device applies the symmetry, nn_label_sym / nn_w4runs_label) */
     uint8_t *ink;            /* B x P^3 when cfg.ink_plane: ink prob254 (0..254, 255 unknown) */
@@ -235,6 +236,9 @@ batch *sampler_next(sampler *sp);
 int sampler_failed(const sampler *sp);   /* read failure or exhausted draw retries; stopped samplers never publish partial batches */
 void sampler_release(sampler *sp, batch *b);
 int sampler_replay_ok(const sample_cfg *c);   /* --replay is possible for this configuration */
+/* one hash per batch plane, the planes as the plain (byte-plane) path holds them: ink bits and w4 runs rebuilt on the host; names[q] /
+   hs[q] for q < the return value (<= max). UFSM_BATCH_HASH=1 prints them per sampler_next */
+int sampler_batch_hash(const sampler *sp, const batch *b, const char **names, uint64_t *hs, int max);
 void sample_ink_from_bits(const uint8_t *ct8, const uint8_t *bits, int it, size_t n, uint8_t *out);   /* the --rv plane from ct8 + batch.inkb (source grid) */
 void sampler_hostmem(const sampler *sp, FILE *f, size_t pinned);   /* UFSM_HOSTMEM=1: host memory by owner (stderr line "hostmem:"; pinned: nn_host_bytes()) */
 void sampler_stop(sampler *sp);

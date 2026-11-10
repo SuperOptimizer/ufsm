@@ -203,5 +203,6 @@ test_sysinfo                                   |              |     5 | ./$B/tes
 test_volcomp_fast                              |              |    25 | ./$B/test_volcomp_fast
 test_z3_autosub                                |              |    10 | ./$B/test_z3_autosub
 test_z3_sink                                   |              |    10 | ./$B/test_z3_sink
+test_replay_lean                               |              |    15 | ./$B/test_replay_lean
 test_gpudec                                    | gpu          |    10 | ./$B/test_gpudec
 test_lat                                       | gpu          |     1 | ./$B/test_lat

@@ -3725,6 +3725,47 @@ sampler *sampler_start(sources *S, const sample_cfg *cfg) {
     return sp;
 }
 
+/* one hash per batch plane, the planes as the plain path holds them (ink bits / w4 runs: the device's planes rebuilt on the host, the
+   window's symmetry for unwarped windows): names[q] / hs[q] for q < the return value (UFSM_BATCH_HASH, tests) */
+int sampler_batch_hash(const sampler *sp, const batch *b, const char **names, uint64_t *hs, int max) {
+    const size_t B = (size_t)sp->cfg.B, p3 = P3(sp);
+    uint8_t *inkr = b->inkb ? malloc(B * p3) : nullptr;   /* (ink_bits: the plane as the device builds it, for the same "ink" hash) */
+    uint8_t *sdr = nullptr, *w4r = nullptr, *wcr = nullptr;   /* (w4_runs: side, w4, wcomp as the plane path holds them: the device's rebuild + symmetry, on the host) */
+    if (b->w4r) {
+        sdr = malloc(B * p3); w4r = malloc(B * p3); wcr = malloc(B * p3); uint8_t *g = malloc(p3), *gw = malloc(p3), *gc = malloc(p3); if (!sdr || !w4r || !wcr || !g || !gw || !gc) abort();
+        for (size_t q = 0; q < B; q++) {
+            int32_t h[8]; memcpy(h, (const char *)b->rad + q * NN_RAD_REC(PZ(&sp->cfg)), sizeof h);
+            sym y; for (int d = 0; d < 3; d++) { y.perm[d] = h[5] >> (2 * d) & 3; y.flip[d] = h[5] >> (8 + d) & 1; }
+            const w4runs *wr = (const w4runs *)b->w4r + q; const uint8_t *sd = b->side + q * p3;
+            if (wr->noff) w4runs_apply_host(sd, PZ(&sp->cfg), sp->cfg.P, sp->cfg.P, wr->tile, wr->ms, wr, gw, gc); else { memset(gw, 255, p3); memset(gc, 255, p3); }
+            if (h[6] & 1) { memcpy(sdr + q * p3, sd, p3); memcpy(w4r + q * p3, gw, p3); memcpy(wcr + q * p3, gc, p3); }
+            else { sym_u8(sd, sdr + q * p3, PZ(&sp->cfg), sp->cfg.P, y); sym_u8(gw, w4r + q * p3, PZ(&sp->cfg), sp->cfg.P, y); sym_u8(gc, wcr + q * p3, PZ(&sp->cfg), sp->cfg.P, y); }
+        }
+        free(g); free(gw); free(gc);
+    }
+    if (inkr) {
+        uint8_t *g = malloc(p3); if (!g) abort();
+        for (size_t q = 0; q < B; q++) {
+            sample_ink_from_bits(b->ct8 + q * p3, b->inkb + q * p3 / 8, b->ink_it[q], p3, g);
+            int32_t h[8]; memcpy(h, (const char *)b->rad + q * NN_RAD_REC(PZ(&sp->cfg)), sizeof h);
+            sym y; for (int d = 0; d < 3; d++) { y.perm[d] = h[5] >> (2 * d) & 3; y.flip[d] = h[5] >> (8 + d) & 1; }
+            if (h[6] & 1) memcpy(inkr + q * p3, g, p3); else sym_u8(g, inkr + q * p3, PZ(&sp->cfg), sp->cfg.P, y);
+        }
+        free(g);
+    }
+    const struct { const char *n; const void *p; size_t z; } f[] = {{"ct8", b->ct8, B * p3}, {"aug", b->aug, B * sizeof(scan_ct_rec)}, {"rad", b->rad, B * NN_RAD_REC(PZ(&sp->cfg))},
+        {"side", sdr ? sdr : b->side, B * p3}, {"w4", w4r ? w4r : b->w4, B * p3}, {"wcomp", wcr ? wcr : b->wcomp, B * p3}, {"ink", inkr ? inkr : b->ink, B * p3}, {"tm", b->tm, B * p3}, {"pm", b->pm, B * p3}, {"inkb", b->inkb, B * p3 / 8},
+        {"x16", b->x16, B * (size_t)b->xch * p3 * 2}, {"um", b->um, B * sizeof(float)}, {"src", b->src, B * sizeof(int16_t)}, {"w", b->w, B * NCH}};
+    int n = 0;
+    for (size_t q = 0; q < sizeof f / sizeof f[0] && n < max; q++) if (f[q].p) {
+    uint64_t h = 0x9e3779b97f4a7c15ull; const uint8_t *c = f[q].p;
+    for (size_t j = 0; j + 8 <= f[q].z; j += 8) { uint64_t v; memcpy(&v, c + j, 8); h = (h ^ v) * 0xff51afd7ed558ccdull; h ^= h >> 32; }
+    for (size_t j = f[q].z & ~(size_t)7; j < f[q].z; j++) h = (h ^ c[j]) * 0x100000001b3ull;
+    names[n] = f[q].n; hs[n++] = h;
+    }
+    free(inkr); free(sdr); free(w4r); free(wcr);
+    return n;
+}
 batch *sampler_next(sampler *sp) {
     pthread_mutex_lock(&sp->mu);
     int k = -1;
@@ -3757,48 +3798,16 @@ batch *sampler_next(sampler *sp) {
             pthread_cond_wait(&sp->cv_ready, &sp->mu);
         }
     }
+    sp->slots[k].use = sp->rleft ? sp->cfg.replay - 1 - sp->rleft[k] : 0;
     sp->state[k] = TAKEN; if (sp->rdue) sp->rdue[k] = sp->nserved + sp->rgap;   /* (its next use: rgap batches after this one) */
     sp->nserved++;
     pthread_mutex_unlock(&sp->mu);
     if (ufsm_env_on("UFSM_BATCH_HASH")) {   /* debugging (with train --det 1): one hash per batch plane, to show a change leaves the batches byte-identical */
-        const batch *b = &sp->slots[k]; const size_t B = (size_t)sp->cfg.B, p3 = P3(sp);
         static _Atomic long nb; const long id = atomic_fetch_add(&nb, 1);
-        uint8_t *inkr = b->inkb ? malloc(B * p3) : nullptr;   /* (ink_bits: the plane as the device builds it, for the same "ink" hash) */
-        uint8_t *sdr = nullptr, *w4r = nullptr, *wcr = nullptr;   /* (w4_runs: side, w4, wcomp as the plane path holds them: the device's rebuild + symmetry, on the host) */
-        if (b->w4r) {
-            sdr = malloc(B * p3); w4r = malloc(B * p3); wcr = malloc(B * p3); uint8_t *g = malloc(p3), *gw = malloc(p3), *gc = malloc(p3); if (!sdr || !w4r || !wcr || !g || !gw || !gc) abort();
-            for (size_t q = 0; q < B; q++) {
-                int32_t h[8]; memcpy(h, (const char *)b->rad + q * NN_RAD_REC(PZ(&sp->cfg)), sizeof h);
-                sym y; for (int d = 0; d < 3; d++) { y.perm[d] = h[5] >> (2 * d) & 3; y.flip[d] = h[5] >> (8 + d) & 1; }
-                const w4runs *wr = (const w4runs *)b->w4r + q; const uint8_t *sd = b->side + q * p3;
-                if (wr->noff) w4runs_apply_host(sd, PZ(&sp->cfg), sp->cfg.P, sp->cfg.P, wr->tile, wr->ms, wr, gw, gc); else { memset(gw, 255, p3); memset(gc, 255, p3); }
-                if (h[6] & 1) { memcpy(sdr + q * p3, sd, p3); memcpy(w4r + q * p3, gw, p3); memcpy(wcr + q * p3, gc, p3); }
-                else { sym_u8(sd, sdr + q * p3, PZ(&sp->cfg), sp->cfg.P, y); sym_u8(gw, w4r + q * p3, PZ(&sp->cfg), sp->cfg.P, y); sym_u8(gc, wcr + q * p3, PZ(&sp->cfg), sp->cfg.P, y); }
-            }
-            free(g); free(gw); free(gc);
-        }
-        if (inkr) {
-            uint8_t *g = malloc(p3); if (!g) abort();
-            for (size_t q = 0; q < B; q++) {
-                sample_ink_from_bits(b->ct8 + q * p3, b->inkb + q * p3 / 8, b->ink_it[q], p3, g);
-                int32_t h[8]; memcpy(h, (const char *)b->rad + q * NN_RAD_REC(PZ(&sp->cfg)), sizeof h);
-                sym y; for (int d = 0; d < 3; d++) { y.perm[d] = h[5] >> (2 * d) & 3; y.flip[d] = h[5] >> (8 + d) & 1; }
-                if (h[6] & 1) memcpy(inkr + q * p3, g, p3); else sym_u8(g, inkr + q * p3, PZ(&sp->cfg), sp->cfg.P, y);
-            }
-            free(g);
-        }
-        const struct { const char *n; const void *p; size_t z; } f[] = {{"ct8", b->ct8, B * p3}, {"aug", b->aug, B * sizeof(scan_ct_rec)}, {"rad", b->rad, B * NN_RAD_REC(PZ(&sp->cfg))},
-            {"side", sdr ? sdr : b->side, B * p3}, {"w4", w4r ? w4r : b->w4, B * p3}, {"wcomp", wcr ? wcr : b->wcomp, B * p3}, {"ink", inkr ? inkr : b->ink, B * p3}, {"tm", b->tm, B * p3}, {"pm", b->pm, B * p3}, {"inkb", b->inkb, B * p3 / 8},
-            {"x16", b->x16, B * (size_t)b->xch * p3 * 2}, {"um", b->um, B * sizeof(float)}, {"src", b->src, B * sizeof(int16_t)}, {"w", b->w, B * NCH}};
+        const char *nm[32]; uint64_t hv[32]; const int n = sampler_batch_hash(sp, &sp->slots[k], nm, hv, 32);
         fprintf(stderr, "batchhash %ld", id);
-        for (size_t q = 0; q < sizeof f / sizeof f[0]; q++) if (f[q].p) {
-            uint64_t h = 0x9e3779b97f4a7c15ull; const uint8_t *c = f[q].p;
-            for (size_t j = 0; j + 8 <= f[q].z; j += 8) { uint64_t v; memcpy(&v, c + j, 8); h = (h ^ v) * 0xff51afd7ed558ccdull; h ^= h >> 32; }
-            for (size_t j = f[q].z & ~(size_t)7; j < f[q].z; j++) h = (h ^ c[j]) * 0x100000001b3ull;
-            fprintf(stderr, " %s %016llx", f[q].n, (unsigned long long)h);
-        }
+        for (int q = 0; q < n; q++) fprintf(stderr, " %s %016llx", nm[q], (unsigned long long)hv[q]);
         fprintf(stderr, "\n");
-        free(inkr); free(sdr); free(w4r); free(wcr);
     }
     return &sp->slots[k];
 }

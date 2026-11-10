@@ -553,6 +553,9 @@ suite-bins: $(B)/test_z3_autosub
 $(B)/test_z3_sink: tests/test_z3_sink.c $(B)/z3w.o $(B)/zarr3.o $(B)/store.o $(B)/json.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
 suite-bins: $(B)/test_z3_sink
+$(B)/test_replay_lean: tests/test_replay_lean.c $(B)/sample.o $(SAMPLE_TEST_OBJ) $(B)/nn.o $(B)/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_replay_lean.c $(B)/sample.o $(SAMPLE_TEST_OBJ) $(B)/nn.o $(B)/nn_fp8.o -o $@ $(LDLIBS) $(CUDALIBS)
+suite-bins: $(B)/test_replay_lean
 
 $(B)/test_ct_augment: tests/test_ct_augment.c $(B)/ct_augment.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ -lm
