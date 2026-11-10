@@ -136,7 +136,8 @@ sources *sources_load(const char *path) {
         s->trust_band = (int)json_num(json_get(e, "trust_band"), 0);
         { const char *sc = json_str(json_get(e, "scope"), "global");
           if (!strcmp(sc, "local")) s->scope_local = 1;
-          else if (strcmp(sc, "global")) { fprintf(stderr, "sources: %s: \"scope\" must be \"local\" or \"global\"\n", s->name); json_free(j); sources_free(S); return nullptr; } }
+          else if (!strcmp(sc, "w4")) s->scope_local = 2;
+          else if (strcmp(sc, "global")) { fprintf(stderr, "sources: %s: \"scope\" must be \"local\", \"w4\" or \"global\"\n", s->name); json_free(j); sources_free(S); return nullptr; } }
         s->iso = (int)json_num(json_get(e, "iso"), 0);
         s->pap_level = (int)json_num(json_get(e, "papyrus"), s->iso);
         s->head = (int)json_num(json_get(e, "head"), 0);
