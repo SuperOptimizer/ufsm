@@ -6,6 +6,56 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## The latent head's full-resolution passes fused per coarse cell; an uncontended step profile (2026-11-10, branch perf-20261109)
+
+Profile first (GPU 0 alone for 5.5 minutes, fp4, streamed head, `--gpu-aug 3`, same batch, `UFSM_PTICK=2`: the target / loss / upsample
+kernels ticked one by one; a tick costs ~0.05 ms on a quiet card and ~2.3 ms beside another process, which made an earlier shared-card
+table worthless for the per-slab rows). rv = 32,64,128,192,256 with lat_guide 5, P 1024, free-running 0.74 samp/s = 1351 ms:
+
+| phase | ms |
+|---|---|
+| head forward per slab + upsample (both passes) | 214 |
+| targets (both passes): phase 28, rv 31, packed mask rv 44 / side 32, normal 55 | 189 |
+| trunk backward (with the per-slab head backward) | 182 |
+| upsample adjoint | 178 |
+| loss gradients: normal 111, side 42, wind4 20 | 174 |
+| guide forward (both passes) / adjoint | 111 / 48 |
+| loss statistics: normal 54, side 21, wind4 12 | 87 |
+| trunk forward / input pool / optimizer | 71 / 64 / 12 |
+| (label slab uploads, both passes: overlap the kernels when free-running) | 315 |
+
+The head path is 1001 of 1330 ms. Winding (96,128,160,192, lat_guide 64) at P 1024, 2500 ms: trunk backward 1134, trunk forward 380,
+head forward + upsample 296, loss gradients 164, adjoint 123, targets 115, shuffle 101, statistics 82: there the 96-wide trunk is 60%.
+Same-batch mode has no upload: the first batch's upload measured 1150 ms (CT + gpu-aug) + 500 ms (labels) at P 1024, and the P 1152
+production run makes 420 - 430 Mvox/s against 786 same-batch. A real-loader P 512 run (shared card) splits the upload into scan
+augmentation kernels 41%, label builds on the device 38%, the label planes' copy back to the host 11%, CT sums + write 6%, CT bytes 4%:
+kernels, not the bus. In lean 2 the upload runs after the step (one buffer), so it adds to it. Labels kept on the device instead of
+streamed: +1.7% same-batch at P 512, not worth 4 - 10 B per voxel.
+
+The fused passes (`nn_lat_fuse_grad`, `nn_lat_fuse_stats`, default on; `UFSM_LAT_FUSE=0` off): one thread per coarse cell computes its 4^3
+fine logits (lat_up4_k's arithmetic, each rounded to fp16 as the slab stored it), the guided head's CT terms, the BCE gradient
+(loss_grad_v, rounded to fp16 and scaled as the slab chain left it) and the transposed upsampling onto the cell's 3^3 neighbours, for a
+loss group at a time: the normal / density channels (every latent head), and the guided side pair with its 5 coefficient channels
+(lat_guide 5). 27 fp32 partials per cell and channel go to a scratch (`fpart`, 378 P^2 bytes: 0.5 GB at P 1152, in the planner);
+a second kernel gathers each cell's partials in a fixed order (no atomics: two runs give the same bits). The winding mod 4 pair and the
+other heads' side channels keep the slab chain on their channel ranges. The statistics pass is fused the same way, and in a training
+step it only counts the groups' mask weights (all the gradient reads: weight sums and the active count; `UFSM_LAT_LIGHT0=0` off):
+the logged loss sums are taken in the gradient pass and finalised after it (fetch_loss runs after the backward).
+
+Tests: test_lat_fuse (24 cases: coarse gradient against the slab chain max 1.4e-7 of the largest value, statistics 8e-8, mask-only +
+gradient-pass sums 8e-8, two fused runs bit-equal). A real rv step: 58 of 14.2 M fp16 codes of the coarse gradient differ by one code
+against the chain, 0 between fused and fused + light; winding losses equal to 4 digits over 10 steps; rv losses equal at step 1 and
+then differ in the third decimal, as two identical rv runs sometimes do.
+
+| free-running, quiet card | baseline | fused (both passes) |
+|---|---|---|
+| rv P 1024 | 0.74 samp/s (1351 ms) | 0.84 (1190 ms) |
+| rv P 512 | 5.28 (189 ms) | 5.70 (175 ms) |
+| winding P 1024 / P 512 | 0.40 / 3.11 | 0.42 / 3.27 |
+
+The fused kernels are compute-bound (fused statistics 29 ms at P 512 against 12 ms for the slab kernels they replace; the gain is the
+skipped upsample and slab traffic). The light statistics pass is not timed yet (no quiet card since).
+
 ## Real device peaks of the latent nets, the planner's task term, the wide stride-2 backward in chunks (2026-11-09, branch perf-20261109)
 
 Measured in a 5-minute window on an empty GPU 1 (16 GB), per-process peak from nvidia-smi, 3 steps each (1 MiB = 1.049e-3 GB; the
