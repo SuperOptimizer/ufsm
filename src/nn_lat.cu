@@ -162,6 +162,36 @@ __global__ void lat_guide4_k(const f16 *x, int D, int H, int W, int z0, int nz, 
         else { const float g = __half2float(*l); for (int k = 0; k < 4; k++) b[(size_t)k * ns] = __float2half_rn(g * f[k]); }
     }
 }
+/* The sub-cell ("cell-shuffle") head of latent-grid nets (unet_cfg.lat_guide 64; the head has 144 outputs): sheets 4-10 voxels apart
+   repeat every 1-2.5 cells, which no interpolation of one value per cell can follow (the plain head found under half the turns of
+   PHerc1667, the phase loss of a winding net stayed at ln 2). Each guided channel j (the phase / side pair) therefore has 64 more
+   coarse outputs, one per voxel of the cell: l_j(v) = up(coarse_j)(v) + S[base + 64 j + sub(v)](cell(v)), sub = 16 (z & 3) + 4 (y & 3) + (x & 3).
+   dir 0 (shuf_k): adds the terms to the slab planes y [ng][nz][H][W] (fp16) from the coarse logits lg [C][d][h][w]; the adjoint
+   (shuf_adj_k): the planes hold the loss gradient, written (each coarse element has exactly one voxel) into gc [C][d][h][w] fp32. */
+template <typename T> __global__ void lat_shuf_k(const T *lg, int d, int h, int w, int base, int ng, int z0, int nz, f16 *y) {
+    const int H = 4 * h, W = 4 * w; const size_t hw = (size_t)H * W, ns = (size_t)nz * hw, nc = (size_t)d * h * w, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= ns) return;
+    const int z = z0 + (int)(i / hw), yy = (int)(i / W % H), x = (int)(i % W);
+    const size_t cell = ((size_t)(z >> 2) * h + (yy >> 2)) * w + (x >> 2); const int sub = 16 * (z & 3) + 4 * (yy & 3) + (x & 3);
+    for (int j = 0; j < ng; j++) y[(size_t)j * ns + i] = __float2half_rn(__half2float(y[(size_t)j * ns + i]) + (float)lg[(size_t)(base + 64 * j + sub) * nc + cell]);
+}
+__global__ void lat_shuf_adj_k(const f16 *g, int d, int h, int w, int base, int ng, int z0, int nz, float *gc) {
+    const int H = 4 * h, W = 4 * w; const size_t hw = (size_t)H * W, ns = (size_t)nz * hw, nc = (size_t)d * h * w, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= ns) return;
+    const int z = z0 + (int)(i / hw), yy = (int)(i / W % H), x = (int)(i % W);
+    const size_t cell = ((size_t)(z >> 2) * h + (yy >> 2)) * w + (x >> 2); const int sub = 16 * (z & 3) + 4 * (yy & 3) + (x & 3);
+    for (int j = 0; j < ng; j++) gc[(size_t)(base + 64 * j + sub) * nc + cell] = __half2float(g[(size_t)j * ns + i]);
+}
+extern "C" void nn_lat_shuffle(const void *lg, int lh16, int d, int h, int w, int base, int ng, int z0, int nz, void *y) {
+    const size_t ns = (size_t)nz * 16 * h * w;
+    if (lh16) lat_shuf_k<f16><<<nblk(ns, 256), 256>>>((const f16 *)lg, d, h, w, base, ng, z0, nz, (f16 *)y);
+    else lat_shuf_k<float><<<nblk(ns, 256), 256>>>((const float *)lg, d, h, w, base, ng, z0, nz, (f16 *)y);
+    KCHECK();
+}
+extern "C" void nn_lat_shuffle_adj(const void *g, int d, int h, int w, int base, int ng, int z0, int nz, float *gc) {
+    const size_t ns = (size_t)nz * 16 * h * w;
+    lat_shuf_adj_k<<<nblk(ns, 256), 256>>>((const f16 *)g, d, h, w, base, ng, z0, nz, gc); KCHECK();
+}
 extern "C" void nn_lat_guide4(const void *x, int D, int H, int W, int z0, int nz, void *lg, int base, int c0, int ng, int dir) {
     const size_t ns = (size_t)nz * H * W;
     lat_guide4_k<<<nblk(ns, 256), 256>>>((const f16 *)x, D, H, W, z0, nz, (f16 *)lg, base, c0, ng, dir); KCHECK();

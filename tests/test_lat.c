@@ -210,6 +210,37 @@ int main(void) {
         nn_free(d_ct); nn_free(d_dy); nn_free(d_x); nn_free(d_t); nn_free(d_a); nn_free(d_b); nn_free(d_lc); nn_free(d_l16); nn_free(d_lt); nn_free(d_lf); nn_free(d_bits); nn_free(d_s0); nn_free(d_s1);
         free(ct); free(dy); free(ha); free(hb); free(lc); free(lc16); free(s0); free(s1);
     }
+    {   /* the sub-cell head (nn_lat_shuffle / _adj): forward against a host reference (fp16 and fp32 coarse logits), the adjoint by dot products */
+        const int d = 3, h = 2, w = 2, D = 12, H = 8, W = 8, base = 3, ng = 2, C = base + 64 * ng; const size_t nc = (size_t)d * h * w, hw = (size_t)H * W;
+        float *lf = malloc(C * nc * 4); uint16_t *lh_ = malloc(C * nc * 2);
+        for (size_t k = 0; k < C * nc; k++) { lh_[k] = f2h(ru()); lf[k] = h2f(lh_[k]); }
+        void *d_lf = nn_malloc(C * nc * 4), *d_lh = nn_malloc(C * nc * 2), *d_gc = nn_malloc(C * nc * 4); nn_h2d(d_lf, lf, C * nc * 4); nn_h2d(d_lh, lh_, C * nc * 2);
+        float *gc = malloc(C * nc * 4);
+        for (int f = 0; f < 2; f++) {
+            double e0 = 0, dot1 = 0, dot2 = 0; nn_zero(d_gc, C * nc * 4);
+            for (int z0 = 0; z0 < D; z0 += 4) {
+                const int nz = 4; const size_t ns = (size_t)nz * hw;
+                uint16_t *y = malloc(ng * ns * 2), *o = malloc(ng * ns * 2), *g = malloc(ng * ns * 2);
+                for (size_t k = 0; k < ng * ns; k++) { y[k] = f2h(ru()); g[k] = f2h(ru()); }
+                void *d_y = nn_malloc(ng * ns * 2), *d_g = nn_malloc(ng * ns * 2);
+                nn_h2d(d_y, y, ng * ns * 2); nn_lat_shuffle(f ? d_lh : d_lf, f, d, h, w, base, ng, z0, nz, d_y); nn_d2h(o, d_y, ng * ns * 2);
+                nn_h2d(d_g, g, ng * ns * 2); nn_lat_shuffle_adj(d_g, d, h, w, base, ng, z0, nz, d_gc);
+                for (size_t i = 0; i < ns; i++) {
+                    const int z = z0 + (int)(i / hw), yy = (int)(i / W % H), x = (int)(i % W); const size_t cell = ((size_t)(z >> 2) * h + (yy >> 2)) * w + (x >> 2); const int sb = 16 * (z & 3) + 4 * (yy & 3) + (x & 3);
+                    for (int j = 0; j < ng; j++) {
+                        const float t = lf[(size_t)(base + 64 * j + sb) * nc + cell], sref = h2f(y[j * ns + i]) + t;
+                        e0 = fmax(e0, fabs(h2f(o[j * ns + i]) - sref) / (1e-2 + fabs(sref))); dot1 += (double)t * h2f(g[j * ns + i]);
+                    }
+                }
+                free(y); free(o); free(g); nn_free(d_y); nn_free(d_g);
+            }
+            nn_d2h(gc, d_gc, C * nc * 4);
+            for (size_t k = (size_t)base * nc; k < C * nc; k++) dot2 += (double)lf[k] * gc[k];
+            const double de = fabs(dot1 - dot2) / (1e-9 + fabs(dot1)); cases++;
+            if (!(e0 < 3e-3) || !(de < 1e-4)) { fprintf(stderr, "FAIL: sub-cell head (%s logits): forward rel err %.3g, adjoint dot rel err %.3g\n", f ? "fp16" : "fp32", e0, de); fails++; }
+        }
+        free(lf); free(lh_); free(gc); nn_free(d_lf); nn_free(d_lh); nn_free(d_gc);
+    }
     const char *e = nn_check(); if (e) { fprintf(stderr, "FAIL: CUDA error %s\n", e); fails++; }
     if (fails) { printf("test_lat: %d of %d cases FAIL\n", fails, cases); return 1; }
     printf("test_lat: ok (%d cases: slab upsampling = the pool4 chain, adjoint = nn_lowres_grad, dot products; predict: direct input and rv bytes = the full-resolution chain)\n", cases);
