@@ -6,6 +6,32 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Inference from the stored latent volume, without the CT (2026-11-10, branch latinf-20261109)
+
+`predict --latents STORE` (an `ufsm lc-encode` store of the CT level) reads no CT voxel; the CT store is opened for its metadata only
+(3 metadata reads per run). The reader thread reads each window's Wz/4 x W/4 x W/4 cells of C + 1 bytes (`zr_read_i8_mt`: the window's
+chunks decoded by `--threads` store handles; one thread made a 1.36 Gvox p1667 row 0.29 Gvox/s, 10-16 threads 1.4), and all-air windows are
+dropped before upload. On the device `nn_lat_synth_ct` rebuilds the window's CT (inverse transform; 1..255 in material cells, 0 in air
+cells), so the statistics (the z-score), the "0 where CT 0" masks (cell granularity in air) and the guided heads' CT terms run unchanged on it;
+the network input comes from the stored coefficients directly (`nn_lat_pred_input_q`: no second quantiser; radial channels from the axis
+offsets). Occupancy: the store's shard indices (absent or all-zero chunks; a 32-voxel grid). Windows must lie on the store's cell grid (box,
+grid origin, halo and stride multiples of 4 from its origin; refused otherwise). Tests: test_lat (rebuilt CT = host inverse transform within
+1 code; input within half a stored step of the CT path's unquantised channels, radial channels bit-equal), tests/test_latents.sh.
+
+Gate, p1667 recto-ruler (scripts/rv/eval.sh, `LATENTS=/mnt/scratch/lat/p1667-l2.lc`), g768 snap 10000 (guided head, fp8), `--window 384`,
+24 shard rows of 128 (32.7 Gvox), turns per GT turn / share off >= 0.5 turn, all radii:
+
+| source | rv.pkw | rv.pk | rv.run |
+|---|---|---|---|
+| CT (level 2) | 0.852 / 0.494 | 0.799 / 0.447 | 1.136 / 0.429 |
+| latents (KLT29, step 0.25) | 0.830 / 0.496 | 0.805 / 0.434 | 1.109 / 0.424 |
+
+Equal within noise (rv.pk and rv.run slightly better from the store, rv.pkw slightly worse). Rate on GPU 1 beside the wz768 trainer, warm
+page cache, the same three rows alternating: CT 0.49 / 0.38 / 0.35, latents 0.58 / 0.47 / 0.37 Gvox/s (wall per predict process). Bytes read:
+CT store 0.82 GB per box Gvox (26.8 GB), latent store 0.97 GB per box Gvox (31.8 GB), both including the windows' halos and the 3x z overread
+of 128-row boxes with 384-voxel windows; in material regions the latent store (0.13 B/vox on disk for the fixture) is not smaller than the
+volcomp CT, so the store is not an IO saving at this level: the gain is the cheaper window input.
+
 ## Latent nets with learned cell channels under fp4 activations; the guided heads' adjoint (2026-11-09, branch perf-20261109)
 
 The winding latent net (w768: widths 96,128,160,192, 29 learned cell channels + 3 radial means, `--lat-guide 2`, `--fp8 1`) took
