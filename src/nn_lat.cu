@@ -658,6 +658,28 @@ extern "C" void nn_lat_pred_input_q(const void *q, int D, int W, float mean, flo
    the sums associate differently (fp32 rounding). Groups: n plain BCE channels c0 .. c0 + n - 1 (targets t [n][ns], one mask), or
    guide 1: the two side channels c0, c0 + 1 with the 5 coefficient channels gb .. gb + 4 (part k = 2 .. 6). */
 struct fuse_lam { float v[7]; };
+/* a block's sums of n per-thread floats (blocks of 128 threads, every thread calls it): warp shuffles in fp64, the 4 warp sums through
+   shared memory, thread 0 adds sum j to ds[idx[j]] (one barrier; the per-value shared-memory tree took 9 barriers a value: 2.1 of
+   the mask-only statistics' 2.4 ms per P 768 slab) */
+__device__ __forceinline__ void fuse_block_add(const float *acc, int n, const int *idx, double *ds, double (*sh)[36]) {
+    const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
+    for (int j = 0; j < n; j++) {
+        double v = (double)acc[j];
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(0xffffffffu, v, o);
+        if (lane == 0) sh[wp][j] = v;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) for (int j = 0; j < n; j++) { const double v = sh[0][j] + sh[1][j] + sh[2][j] + sh[3][j]; if (v != 0.) atomicAdd(&ds[idx[j]], v); }
+}
+/* loss_grad_v for the head slabs' case (no dice, no tolerance band; --recall goes through loss_grad_v itself): the same operations in the
+   same order with the channel's statistics in registers (inm = max(nm, 1), fsc = fin[2 C + 1]); s: the sigmoid, for the loss sums */
+__device__ __forceinline__ float fuse_grad_v(float x, unsigned tb, unsigned mb, float inm, float fsc, float pw, float gscale, float *s_) {
+    const float p = tb * (1.f / 255.f), s = 1.f / (1.f + expf(-x)), mw = (float)mb;
+    *s_ = s;
+    const float g = mw * ((1.f - p) * s - pw * p * (1.f - s)) / inm;
+    return __half2float(f2h<f16>(g * fsc * gscale));
+}
 template <typename T>
 __global__ void lat_fuse_k(const T *lg, int qd, int q0, int d, int h, int w, int z0, int nz, int c0, int n, int guide, int gb, const f16 *x, const uint8_t *t,
                            const uint8_t *m, const uint8_t *wch, const float *st, float pw, float gscale, float rec_w, int unit_c, fuse_lam lam, float *part, double *ds) {
@@ -666,9 +688,10 @@ __global__ void lat_fuse_k(const T *lg, int qd, int q0, int d, int h, int w, int
     /* ds: also the loss sums 1 .. 4 of nn_loss_stats_acc (the statistics pass then only counts the mask weights: nn_lat_fuse_stats mask_only) */
     float acc[7][4];
     if (ds) for (int k = 0; k < 7; k++) for (int j = 0; j < 4; j++) acc[k][j] = 0.f;
-#define FUSE_LSUM(k, xv, tbv, mbv) do { if (ds) { const float mw_ = (float)(mbv), x_ = (xv), p_ = (tbv) * (1.f / 255.f); const float sg_ = 1.f / (1.f + __expf(-x_)); \
+#define FUSE_LSUM(k, xv, tbv, mbv, sg_) do { if (ds) { const float mw_ = (float)(mbv), x_ = (xv), p_ = (tbv) * (1.f / 255.f); \
         const float spp_ = fmaxf(x_, 0.f) + log1pf(__expf(-fabsf(x_))); const float bce_ = pw * p_ * (spp_ - x_) + (1.f - p_) * spp_; \
-        acc[k][0] += mw_ * bce_; acc[k][1] += sg_ * p_; acc[k][2] += sg_; acc[k][3] += p_; } } while (0)
+        acc[k][0] += mw_ * bce_; acc[k][1] += (sg_) * p_; acc[k][2] += (sg_); acc[k][3] += p_; } } while (0)
+    const bool slow = rec_w > 0.f;   /* --recall: loss_grad_v as it stands */
     if (i < ncs) {
     const int sz = (int)(i / pl), cz = z0 / 4 + sz, cy = (int)(i / w % h), cx = (int)(i % w);
     const int iz[3] = {max(cz - 1, 0), cz, min(cz + 1, d - 1)}, iy[3] = {max(cy - 1, 0), cy, min(cy + 1, h - 1)}, ix[3] = {max(cx - 1, 0), cx, min(cx + 1, w - 1)};
@@ -678,6 +701,7 @@ __global__ void lat_fuse_k(const T *lg, int qd, int q0, int d, int h, int w, int
         for (int k = 0; k < n; k++) {
             const T *l = lg + (size_t)(c0 + k) * cv;
             const bool on = wch[k] != 0, unit = k == unit_c;
+            const float inm = fmaxf(st[k * 5], 1.f), fsc = fin[2 * C + 1];
             float v[3][3][3], ga[3][3][3];
 #pragma unroll
             for (int a = 0; a < 3; a++)
@@ -709,8 +733,11 @@ __global__ void lat_fuse_k(const T *lg, int qd, int q0, int d, int h, int w, int
                                 unsigned mb = m4 >> (8 * rx) & 255u; if (unit && mb) mb = 1u;
                                 if (!mb) continue;
                                 const float u = __half2float(__float2half_rn(LW[rx][0] * q[0] + LW[rx][1] * q[1] + LW[rx][2] * q[2]));
-                                float g = __half2float(loss_grad_v<f16, f16>(nullptr, C, ns, st, 0.f, fin, pw, gscale, 0, nullptr, D, H, W, rec_w, k, 0, vr + rx, u, t4 >> (8 * rx) & 255u, mb));
-                                FUSE_LSUM(k, u, t4 >> (8 * rx) & 255u, mb);
+                                float sg = 0.f;
+                                float g = slow ? __half2float(loss_grad_v<f16, f16>(nullptr, C, ns, st, 0.f, fin, pw, gscale, 0, nullptr, D, H, W, rec_w, k, 0, vr + rx, u, t4 >> (8 * rx) & 255u, mb))
+                                               : fuse_grad_v(u, t4 >> (8 * rx) & 255u, mb, inm, fsc, pw, gscale, &sg);
+                                if (slow) sg = 1.f / (1.f + __expf(-u));
+                                FUSE_LSUM(k, u, t4 >> (8 * rx) & 255u, mb, sg);
                                 if (lam.v[k] != 1.f) g = __half2float(f2h<f16>(lam.v[k] * g));
 #pragma unroll
                                 for (int e = 0; e < 3; e++) gq[e] += LW[rx][e] * g;
@@ -748,6 +775,7 @@ __global__ void lat_fuse_k(const T *lg, int qd, int q0, int d, int h, int w, int
             }
     }
     const bool on0 = wch[0] != 0, on1 = wch[1] != 0;
+    const float inm0 = fmaxf(st[0], 1.f), inm1 = fmaxf(st[5], 1.f), fsc = fin[5];
     for (int rz = 0; rz < 4; rz++) {
         float p[7][9], gp[7][9];
         for (int k = 0; k < 7; k++)
@@ -775,10 +803,16 @@ __global__ void lat_fuse_k(const T *lg, int qd, int q0, int d, int h, int w, int
                     for (int k = 0; k < 7; k++) u[k] = __half2float(__float2half_rn(LW[rx][0] * q[k][0] + LW[rx][1] * q[k][1] + LW[rx][2] * q[k][2]));
                     const float tt = u[4] * f1 + u[5] * f2 + u[6] * f3;
                     const float l0 = __half2float(__float2half_rn(u[0] + u[2] * f0 + tt)), l1 = __half2float(__float2half_rn(u[1] + u[3] * f0 - tt));
-                    float g0 = on0 ? __half2float(loss_grad_v<f16, f16>(nullptr, 2, ns, st, 0.f, fin, pw, gscale, 0, nullptr, D, H, W, rec_w, 0, 0, vr + rx, l0, ta >> (8 * rx) & 255u, mb)) : 0.f;
-                    float g1 = on1 ? __half2float(loss_grad_v<f16, f16>(nullptr, 2, ns, st, 0.f, fin, pw, gscale, 0, nullptr, D, H, W, rec_w, 1, 0, vr + rx, l1, tb >> (8 * rx) & 255u, mb)) : 0.f;
-                    if (on0) FUSE_LSUM(0, l0, ta >> (8 * rx) & 255u, mb);
-                    if (on1) FUSE_LSUM(1, l1, tb >> (8 * rx) & 255u, mb);
+                    float g0 = 0.f, g1 = 0.f, s0 = 0.f, s1 = 0.f;
+                    if (slow) {
+                        if (on0) { g0 = __half2float(loss_grad_v<f16, f16>(nullptr, 2, ns, st, 0.f, fin, pw, gscale, 0, nullptr, D, H, W, rec_w, 0, 0, vr + rx, l0, ta >> (8 * rx) & 255u, mb)); s0 = 1.f / (1.f + __expf(-l0)); }
+                        if (on1) { g1 = __half2float(loss_grad_v<f16, f16>(nullptr, 2, ns, st, 0.f, fin, pw, gscale, 0, nullptr, D, H, W, rec_w, 1, 0, vr + rx, l1, tb >> (8 * rx) & 255u, mb)); s1 = 1.f / (1.f + __expf(-l1)); }
+                    } else {
+                        if (on0) g0 = fuse_grad_v(l0, ta >> (8 * rx) & 255u, mb, inm0, fsc, pw, gscale, &s0);
+                        if (on1) g1 = fuse_grad_v(l1, tb >> (8 * rx) & 255u, mb, inm1, fsc, pw, gscale, &s1);
+                    }
+                    if (on0) FUSE_LSUM(0, l0, ta >> (8 * rx) & 255u, mb, s0);
+                    if (on1) FUSE_LSUM(1, l1, tb >> (8 * rx) & 255u, mb, s1);
                     if (lam.v[0] != 1.f) { g0 = __half2float(f2h<f16>(lam.v[0] * g0)); g1 = __half2float(f2h<f16>(lam.v[0] * g1)); }
                     const float gd = g0 - g1;
                     const float gk[7] = {g0, g1, __half2float(__float2half_rn(g0 * f0)), __half2float(__float2half_rn(g1 * f0)), __half2float(__float2half_rn(gd * f1)),
@@ -801,15 +835,10 @@ __global__ void lat_fuse_k(const T *lg, int qd, int q0, int d, int h, int w, int
     }
 #undef FUSE_LSUM
     if (!ds) return;
-    __shared__ double r[128];
-    for (int k = 0; k < C; k++)
-        for (int j = 0; j < 4; j++) {
-            r[threadIdx.x] = acc[k][j];
-            __syncthreads();
-            for (int o = 64; o > 0; o >>= 1) { if (threadIdx.x < o) r[threadIdx.x] += r[threadIdx.x + o]; __syncthreads(); }
-            if (threadIdx.x == 0) atomicAdd(&ds[k * 5 + 1 + j], r[0]);
-            __syncthreads();
-        }
+    __shared__ double sh[4][36];
+    float fl[28]; int ix[28];
+    for (int k = 0; k < C; k++) for (int j = 0; j < 4; j++) { fl[k * 4 + j] = acc[k][j]; ix[k * 4 + j] = k * 5 + 1 + j; }
+    fuse_block_add(fl, C * 4, ix, ds, sh);
 }
 /* the statistics pass fused the same way (nn_loss_stats_acc's sums of a group from the cell logits: loss_stats_k's per-voxel arithmetic on
    lat_up4_k's / lat_guide_k's fp16-rounded logits; fp32 partials per cell, fp64 per block, added to ds [5 per channel]) */
@@ -921,15 +950,10 @@ __global__ void lat_fuse_stats_k(const T *lg, int qd, int q0, int d, int h, int 
         }
 #undef FUSE_STAT
     }
-    __shared__ double r[128];
-    for (int k = 0; k < nk; k++)
-        for (int j = 0; j < (mask_only ? 1 : 5); j++) {
-            r[threadIdx.x] = acc[k][j];
-            __syncthreads();
-            for (int o = 64; o > 0; o >>= 1) { if (threadIdx.x < o) r[threadIdx.x] += r[threadIdx.x + o]; __syncthreads(); }
-            if (threadIdx.x == 0) atomicAdd(&ds[k * 5 + j], r[0]);
-            __syncthreads();
-        }
+    __shared__ double sh[4][36];
+    float fl[35]; int ix[35]; int nv = 0;
+    for (int k = 0; k < nk; k++) for (int j = 0; j < (mask_only ? 1 : 5); j++) { fl[nv] = acc[k][j]; ix[nv++] = k * 5 + j; }
+    fuse_block_add(fl, nv, ix, ds, sh);
 }
 extern "C" void nn_lat_fuse_stats(const void *lg, int lh16, int lq0, int lqd, int d, int h, int w, int z0, int nz, int c0, int n, int guide, int gb, const void *x,
                                   const uint8_t *t, const uint8_t *m, const uint8_t *wch, float pw, int unit_c, double *ds, int mask_only) {
