@@ -39,7 +39,7 @@ mkdir -p $o/snap
 ( while kill -0 $$ 2>/dev/null; do
     if [ -f $o/last.ckpt ] && [ $o/last.ckpt -nt $o/snap/.seen ]; then
       sleep 20; cp $o/last.ckpt $o/snap/.tmp && touch $o/snap/.seen
-      st=$(head -c 400 $o/snap/.tmp | grep -o '"step":[0-9]*' | head -1 | cut -d: -f2)
+      st=$(head -c 200000 $o/snap/.tmp | head -1 | grep -o '"step":[0-9]*' | head -1 | cut -d: -f2)
       if [ -n "$st" ] && [ $((st % ${SNAP:-5000})) = 0 ] && [ "$st" -gt 0 ]; then mv $o/snap/.tmp $o/snap/$st.ckpt; echo "$(date) snapshot $st" >> $o.resume.log; fi
     fi; sleep 60; done ) &
 for i in $(seq 0 ${RELAUNCH:-20}); do

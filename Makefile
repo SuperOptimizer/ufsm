@@ -84,6 +84,7 @@ SRC += src/countfield.c src/countanat.c
 SRC += src/flatten.c src/faces.c src/faces_cli.c
 SRC += src/sheetcut.c
 SRC += src/strip.c
+SRC += src/latfit.c src/lc_cli.c
 OBJ  = $(patsubst src/%.c,$(B)/%.o,$(SRC)) $(B)/surfcomp.o
 
 all: $(B)/ufsm

@@ -6,6 +6,7 @@
 /* boolean environment switch: set and not "0" (UFSM_X=0 means off) */
 static inline int ufsm_env_on(const char *n) { const char *e = getenv(n); return e && *e && strcmp(e, "0") != 0; }
 #include <stddef.h>
+#include <stdio.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -39,6 +40,8 @@ void *nn_managed_alloc(size_t bytes);    /* CUDA managed memory (may exceed the 
 void *nn_malloc_try(size_t bytes);       /* device memory, nullptr (no sticky error) when it does not fit */
 void *nn_host_alloc_try(size_t bytes);   /* the same, nullptr when the host cannot pin that much */
 void nn_host_free(void *p);
+size_t nn_host_bytes(void);            /* live pinned host bytes (nn_host_alloc*) */
+void nn_host_report(FILE *f);         /* the same by caller address */
 /* pipelined uploads: an async copy on a per-device copy stream (pinned source), events to order it against the compute stream */
 void nn_h2d_copy_stream(void *dst, const void *src, size_t bytes);
 void nn_d2h_copy_stream(void *dst, const void *src, size_t bytes);   /* device -> pinned host on the copy stream */
@@ -174,6 +177,15 @@ void nn_input_rad_pack(const void *ct16, shape5 xs, const void *rec, void *y);
 /* train --lat 4 (pool4) with --gpu-input: the 4-channel MX input on the 4^3 cells of the window (xs {n, 4, d, h, h}: the cell grid), each
    channel the cell mean of nn_input_rad's full-resolution value (warp included) from the full-resolution 16-bit CT channel ct16 */
 void nn_input_lat(const void *ct16, shape5 xs, const void *rec, void *y);
+/* the same with the learned cell transform (latfit.h): xs.c = C + 3 (16 or 32): C quantised coefficients x gain, then the radial means */
+void nn_input_latc(const void *ct16, shape5 xs, const void *rec, const float *bas, const float *gain, int C, float step, void *y);
+/* predict: the same channels from the full-resolution 4-channel fp16 window x ([4][4d][4h][4w]: CT, radial) into y (fp16 [C + 3][d][h][w]) */
+/* predict --latents: the cell channels from a latcomp store's indices q (int8 [d][h][w](C + 1), lc_cli.c layout; raw-domain step) with the window's
+   mean / 1 / sd; the radial means from x's channels 1-3 */
+void nn_lat_input_q(const void *q, const void *x, int d, int h, int w, const float *gain, int C, float step_raw, float mean, float isd, void *y);
+/* the guided head (unet_cfg.lat_guide): see nn_lat.cu lat_guide_k */
+void nn_lat_guide(const void *x, int D, int H, int W, int z0, int nz, void *lg, int base, int c0, int dir);
+void nn_lat_input_x(const void *x, int d, int h, int w, const float *bas, const float *gain, int C, float step, void *y);
 /* latent-grid logits -> one z-slab of fine logits and back (src/nn_lat.cu; the pool4 chain of nn_lowres_output, B 1): coarse lg
    [C][d][h][w] (fp16 when lh16, else fp32) -> fine planes [z0, z0 + nz) of the 4d x 4h x 4w window, fp16 [C][nz][4h][4w] in y;
    nn_lat_up_adj adds the adjoint of such a slab's fp16 gradient g into the fp32 coarse gradient gc [C][d][h][w] */
@@ -183,6 +195,13 @@ int nn_lat_set_slow(int on);   /* the per-voxel kernels for every slab (UFSM_LAT
 /* predict on a latent-grid net: the network's 4-channel input on the cell grid ([4][D/4][W/4][W/4], 16-bit storage as nn_set_f16) straight
    from a D x W x W uint8 CT window = nn_pred_input_d then nn_lowres_input (div 4, mode 1), without the full-resolution input */
 void nn_lat_pred_input(const uint8_t *ct, int D, int W, float mean, float isd, const float *dyo, const float *dxo, int axis, void *y);
+/* nn_lat_place_rv for the guided head (the coefficient planes: cell channels nb .. nb + 4; ctg: the window's CT bytes as read, mean / isd
+   its z-score) = nn_lat_up_slab + nn_lat_guide + nn_rv_fuse (fp16) + nn_pred_place */
+void nn_lat_place_rvg(const void *lg, int lh16, int nb, int d, int h, int w, const uint8_t *ctg, float mean, float isd, const uint8_t *ct, const uint32_t *bits,
+                      int iso, int hz, int halo, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh);
+/* the same for a --lat-basis checkpoint = nn_pred_input_d then nn_lat_input_x (fp16 storage): [C + 3][D/4][W/4][W/4] */
+void nn_lat_pred_input_c(const uint8_t *ct, int D, int W, float mean, float isd, const float *dyo, const float *dxo, int axis,
+                         const float *bas, const float *gain, int C, float step, void *y);
 /* predict --channel rv on a latent-grid net: the two side logits of the cell grid (lg [2][d][h][w], fp16 / fp32) upsampled, fused
    (nn_rv_fuse) and quantised (nn_pred_place) into a device shard: window voxel v of the interior ([hz, 4 d - hz) x [halo, 4 h - halo) x
    [halo, 4 w - halo)) lands at shard voxel o + v when inside [0, e); 0 where the CT (ct >= iso, or ct nullptr: the mask bits) is not set */

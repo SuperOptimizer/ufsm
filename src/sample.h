@@ -7,6 +7,7 @@
 #include "scan_augment.h"
 #include "crush.h"
 #include <stdint.h>
+#include <stdio.h>
 
 typedef struct {
     int P;                   /* patch edge (y, x; and z unless Pz) */
@@ -122,6 +123,8 @@ typedef struct {
     int pack_tm;             /* targets and mask as one code byte per voxel (batch.tm: SAMPLE_TM_* bits; t, m nullptr): every target value
                                 0 or 255 and the mask 0 / 1 (hard two-class targets, e.g. the side encoding; a soft value aborts). The
                                 trainer unpacks on the device (nn_unpack_tm): host batches 3 -> 1 byte per voxel */
+    int slot_skip;           /* batch planes the trainer never reads, not allocated nor filled (host RAM: 1 byte per window voxel per slot each):
+                                1 batch.tm (train: g_tm_unused, the unwrap2 head slabs), 2 batch.pm (unwrap2 without --pap-head) */
     int wind4;               /* train --task unwrap2 (side 2, stored phase): batch.w4 / wcomp, the relative winding mod 4 of each window
                                 (src/band.h band_wind4: the stored phase unwrapped over the window before the air test, its components
                                 kept as separate gauges); warped samples pull it through the warp within one component */
@@ -215,6 +218,7 @@ sampler *sampler_start(sources *S, const sample_cfg *cfg);
 batch *sampler_next(sampler *sp);
 int sampler_failed(const sampler *sp);   /* read failure or exhausted draw retries; stopped samplers never publish partial batches */
 void sampler_release(sampler *sp, batch *b);
+void sampler_hostmem(const sampler *sp, FILE *f, size_t pinned);   /* UFSM_HOSTMEM=1: host memory by owner (stderr line "hostmem:"; pinned: nn_host_bytes()) */
 void sampler_stop(sampler *sp);
 /* Stats: patches rejected / produced since start. */
 void sampler_stats(const sampler *sp, uint64_t *produced, uint64_t *rejected);

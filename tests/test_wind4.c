@@ -135,6 +135,13 @@ int main(void) {
             printf("spiral around the axis, tiles of 16: %d components, %zu of %zu kept, %zu dropped\n", nt, st.kept, st.known, st.dropped_conflict);
             const double f = check_targets("spiral around the axis, tiles of 16", Wt, w4, cp, n, nt, 1.0 / 63 + 1e-3);
             CHECK(nt >= 24 && f > 0.85, "tiles: %d components, kept %.3f", nt, f);
+            for (int th = 2; th <= 5; th += 3) {   /* band_wind4_tiled_mt: the same bytes, counts and stats on th threads */
+                uint8_t *w4m = malloc(n), *cpm = malloc(n); band_wind4_stats sm;
+                const int ntm = band_wind4_tiled_mt(ph, D, H, W, 16, 80, 512, 1, w4m, cpm, &sm, th);
+                CHECK(ntm == nt && !memcmp(w4m, w4, n) && !memcmp(cpm, cp, n) && sm.kept == st.kept && sm.known == st.known && sm.dropped_conflict == st.dropped_conflict && sm.runs == st.runs,
+                      "band_wind4_tiled_mt on %d threads differs (%d vs %d components)", th, ntm, nt);
+                free(w4m); free(cpm);
+            }
         }
         free(Wt); free(ph); free(w4); free(cp);
     }

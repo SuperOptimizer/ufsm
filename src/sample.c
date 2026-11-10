@@ -10,6 +10,7 @@
 #include "view.h"
 #include "scrollaug.h"
 #include "sample_emb.h"
+#include <malloc.h>
 #include <math.h>
 #include <stddef.h>
 #include <pthread.h>
@@ -181,7 +182,7 @@ struct sampler {
     atomic_uint soft_bits;   /* current soft-target sigma (float bits), set by sampler_set_soft */
     int64_t *slot_j;         /* deterministic mode: batch index held by each slot */
     int64_t next_claim, next_take;   /* deterministic mode: next batch index to fill / to hand out (under mu) */
-    atomic_uint_fast64_t prof_ns[16];
+    atomic_uint_fast64_t prof_ns[24];
     unsigned char (*lvl_ok)[2][MAXLEV];   /* per source: cached level availability (0 unknown, 1 no, 2 yes) */   /* per-stage nanoseconds (env UFSM_SAMPLER_PROF): read, targets, dilate, soft, trust, encode, zscore, augment, x16, other */
     int prof;
     double *cum;   /* cumulative source weights */
@@ -192,8 +193,9 @@ static int PZ(const sample_cfg *c) { return c->Pz > 0 ? c->Pz : c->P; }   /* win
 static size_t P3(const sampler *sp) { return (size_t)PZ(&sp->cfg) * sp->cfg.P * sp->cfg.P; }
 
 /* batch buffers: pinned (the trainer uploads asynchronously), or plain malloc with UFSM_SAMPLER_NOPIN=1 (CPU-only benchmarks) */
+static _Atomic size_t g_slot_bytes;   /* pinned (or malloc'd) batch slot bytes, every sampler (UFSM_HOSTMEM) */
 static int nopin(void) { static int v = -1; if (v < 0) { const char *e = getenv("UFSM_SAMPLER_NOPIN"); v = e && atoi(e); } return v; }
-static void *halloc(size_t n) { if (nopin()) { void *p = malloc(n ? n : 1); if (!p) abort(); return p; } return nn_host_alloc(n); }
+static void *halloc(size_t n) { atomic_fetch_add(&g_slot_bytes, n); if (nopin()) { void *p = malloc(n ? n : 1); if (!p) abort(); memset(p, 0, n); return p; } return nn_host_alloc(n); }   /* (memset: faulted in like the pinned slots, so CPU-only benchmarks see no first-touch faults) */
 static void hfree(void *p) { if (nopin()) free(p); else nn_host_free(p); }
 static batch alloc_batch(const sample_cfg *c) {
     size_t p3 = (size_t)PZ(c) * c->P * c->P;
@@ -208,9 +210,10 @@ static batch alloc_batch(const sample_cfg *c) {
     b.x = c->xfmt || c->restore ? nullptr : halloc((size_t)c->B * xc * p3 * sizeof(float));   /* pinned: the trainer uploads asynchronously */
     b.x16 = c->xfmt && !c->restore && !c->gpu_aug ? halloc((size_t)c->B * xc * p3 * 2) : nullptr;   /* (--gpu-aug: the device builds the CT channel) */
     b.ct8 = c->gpu_aug ? halloc((size_t)c->B * p3) : nullptr; b.aug = c->gpu_aug ? halloc((size_t)c->B * sizeof(scan_ct_rec)) : nullptr;
+    if (b.aug) memset(b.aug, 0, (size_t)c->B * sizeof(scan_ct_rec));   /* (the records' padding is never written: zero, so equal batches hash equal) */
     b.t = c->pack_tm ? nullptr : halloc((size_t)c->B * (c->restore == 1 ? 1 : NCH) * p3);   /* (task restore: the clean CT alone; real pairs: target + input crop) */
     b.m = c->pack_tm || c->restore ? nullptr : halloc((size_t)c->B * p3);
-    b.tm = c->pack_tm ? halloc((size_t)c->B * p3) : nullptr;   /* one code byte per voxel instead of NCH + 1 */
+    b.tm = c->pack_tm && !(c->slot_skip & 1) ? halloc((size_t)c->B * p3) : nullptr;   /* one code byte per voxel instead of NCH + 1 */
     b.w = halloc((size_t)c->B * NCH);
     b.src = malloc((size_t)c->B * sizeof(int16_t));
     b.level = malloc((size_t)c->B * sizeof(int8_t));
@@ -219,7 +222,7 @@ static batch alloc_batch(const sample_cfg *c) {
     b.sheet = calloc((size_t)c->B, sizeof *b.sheet);
     b.band = c->band ? halloc((size_t)c->B * p3) : nullptr;
     b.side = c->side ? halloc((size_t)c->B * p3) : nullptr;
-    b.pm = c->pmask ? halloc((size_t)c->B * p3) : nullptr;
+    b.pm = c->pmask && !(c->slot_skip & 2) ? halloc((size_t)c->B * p3) : nullptr;
     b.wind = c->cond ? halloc((size_t)c->B * p3) : nullptr;
     b.pap = c->pap_head ? halloc((size_t)c->B * p3) : nullptr;
     b.w4 = c->wind4 ? halloc((size_t)c->B * p3) : nullptr;
@@ -339,10 +342,13 @@ static int pick_level(sampler *sp, source *s, rng *r, int region_ch) {
 }
 
 /* Fill patch i of batch b. Returns 0 on success, 1 if rejected (try again), -1 on I/O error. */
-static double tnow(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
+static int g_rt = 1;   /* UFSM_SAMPLER_RT=T: threads per window for its big reads (CT, phase, targets: z3_read decodes chunks in parallel) and the
+                          winding-mod-4 tiles; the same bytes for any T. Fewer windows in flight (RAM) for the same loader rate */
+static int g_prof_cpu;   /* UFSM_SAMPLER_PROF=2: the stages in thread CPU time (else wall time: I/O waits and contention count) */
+static double tnow(void) { struct timespec t; clock_gettime(g_prof_cpu ? CLOCK_THREAD_CPUTIME_ID : CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 #define PROF_MARK(stage) do { if (sp->prof) { double t_ = tnow(); atomic_fetch_add(&sp->prof_ns[stage], (uint_fast64_t)((t_ - pt) * 1e9)); pt = t_; } } while (0)
-enum { PS_SRC, PS_LEVEL, PS_PICK, PS_PROBE, PS_READ, PS_STATS, PS_TARGETS, PS_DILATE, PS_SOFT, PS_TRUST, PS_ENCODE, PS_ZSCORE, PS_AUGMENT, PS_X16, PS_SCAN, PS_N };
-static const char *prof_names[PS_N] = {"src", "level", "pick", "probe", "ctread", "ctstats", "targets", "dilate", "soft", "trust", "encode", "zscore", "augment", "x16", "scan"};
+enum { PS_SRC, PS_LEVEL, PS_PICK, PS_PROBE, PS_READ, PS_STATS, PS_TARGETS, PS_DILATE, PS_SOFT, PS_TRUST, PS_ENCODE, PS_ZSCORE, PS_AUGMENT, PS_X16, PS_SCAN, PS_SYMPACK, PS_PHREAD, PS_WIND4, PS_PHOUT, PS_N };   /* (the last four: parts of the old "augment") */
+static const char *prof_names[PS_N] = {"src", "level", "pick", "probe", "ctread", "ctstats", "targets", "dilate", "soft", "trust", "encode", "zscore", "augment", "x16", "scan", "sympack", "phread", "wind4", "phout"};
 /* 3-4-5 chamfer distance (3 per voxel step) from the voxels of t that are annotated surface (0 < t < 255): two raster
    passes. Returns 0 (dm all CH_INF) when the patch has no surface. */
 #define CH_INF 60000
@@ -794,8 +800,11 @@ int sample_write_spatial_test(const uint8_t *ctu, const uint8_t *tgt, const uint
     }
     free(table);
 }
-static void *tp_get(size_t n, int zero);
-static void tp_put(void *p, size_t n);
+static void *tp_get_(size_t n, int zero, int line);
+static void tp_put_(void *p, size_t n, int line);
+#define tp_get(n, z) tp_get_((n), (z), __LINE__)
+#define tp_put(p, n) tp_put_((p), (n), __LINE__)
+size_t resident_bytes(const void *p, size_t n);
 /* TM (packed targets, hard and CT-only only; T, M unused): the code bytes of sample_pack_tm written straight from the warp (no
    T / M window buffers); when the targets turn out not to be 0 / 255 or the writer's fast path does not apply, T / M go to pooled
    scratch and are packed after, aborting as draw() did */
@@ -1144,38 +1153,57 @@ static uint64_t mix64(uint64_t x) { x ^= x >> 30; x *= 0xbf58476d1ce4e5b9ull; x 
    so every sample paid ~14k page faults per buffer under the process-wide mmap lock that all workers share. Sizes of 1 MB and
    more are rounded up to whole MB (windows clipped at a volume edge reuse the same buffers); zero = calloc semantics over n. */
 #define TP_N 32
-static _Thread_local struct { void *b[TP_N]; size_t n[TP_N]; int k; } tpool;
+typedef struct { void *b[TP_N]; size_t n[TP_N]; int k; } tp_pool;
+static _Thread_local tp_pool tpool;
+/* UFSM_HOSTMEM=1 accounting (sampler_hostmem): each worker registers its fixed scratch and its pool; tp_get / tp_put keep the
+   pool's allocated bytes (pooled or lent out) per worker; residency is read with mincore (anonymous pages count when touched) */
+#define WM_MAX 256
+static struct { tp_pool *pool; const uint8_t *big, *ttmp; size_t bign, ttn; _Atomic size_t tpv, tplent, tppeak; } g_wm[WM_MAX];
+static _Thread_local int tp_wid = -1;
+static size_t g_tp_p3 = 1;   /* (UFSM_TP_LOG: sizes in window voxels) */
 static size_t tp_class(size_t n) { return n >= ((size_t)1 << 20) ? (n + ((size_t)1 << 20) - 1) & ~(((size_t)1 << 20) - 1) : n; }
 /* window-sized worker scratch (>= 4 MB): 2 MB aligned with transparent huge pages requested (the system's THP mode is often
    "madvise"): the warp writer's gathers and the volume passes otherwise walk 4 KB page tables over hundreds of MB per window. Pages
    are still only backed when touched. free() releases it as any malloc block. */
+static int g_thp_default = 1;   /* (sampler_start: 0 with --gpu-aug 2) */
 static void *wbig_alloc(size_t n, int zero) {
     const size_t H = (size_t)2 << 20;
     if (n < ((size_t)4 << 20)) return zero ? calloc(n ? n : 1, 1) : malloc(n ? n : 1);
     void *p = nullptr;
     if (posix_memalign(&p, H, n)) return nullptr;
 #ifdef MADV_HUGEPAGE
-    madvise(p, (n + H - 1) & ~(H - 1), MADV_HUGEPAGE);
+    /* UFSM_SAMPLER_THP=0/1 (default: on unless every warp runs on the device, --gpu-aug 2): with THP defrag "madvise" each first touch
+       of a huge page may compact memory synchronously, under memory pressure minutes of system time (2026-11-09: 493 s system vs 125 s
+       user for 24 P512 windows); the --gpu-aug 2 recipe gains nothing from them (cycles equal within noise) */
+    const char *e = getenv("UFSM_SAMPLER_THP");
+    if (e ? atoi(e) != 0 : g_thp_default) madvise(p, (n + H - 1) & ~(H - 1), MADV_HUGEPAGE);
 #endif
     if (zero) memset(p, 0, n);
     return p;
 }
-static void *tp_get(size_t n, int zero) {   /* the smallest pooled buffer of n's class up to 1.25 times it (window sizes vary by a few MB) */
+static _Thread_local size_t tp_live; static _Thread_local int tp_logn = -1;
+static int tp_log(void) { if (tp_logn < 0) { const char *e = getenv("UFSM_TP_LOG"); tp_logn = tp_wid == 0 && e ? atoi(e) : 0; } return tp_logn > 0; }
+static void *tp_get_(size_t n, int zero, int line) {   /* the smallest pooled buffer of n's class up to 1.25 times it (window sizes vary by a few MB) */
     const size_t c = tp_class(n), cmax = c >= ((size_t)1 << 20) ? c + c / 4 : c;
     int best = -1;
     for (int i = 0; i < tpool.k; i++) if (tpool.n[i] >= c && tpool.n[i] <= cmax && (best < 0 || tpool.n[i] < tpool.n[best])) best = i;
+    tp_live += c; if (tp_log()) fprintf(stderr, "tplog get L%d %.3f live %.3f%s\n", line, (double)n / (double)g_tp_p3, (double)tp_live / (double)g_tp_p3, best >= 0 ? "" : " NEW");
     if (best >= 0) {   /* (put back under n's class later: a pooled size never exceeds the block's) */
         void *p = tpool.b[best]; tpool.k--; tpool.b[best] = tpool.b[tpool.k]; tpool.n[best] = tpool.n[tpool.k];
         if (zero) memset(p, 0, n);
         return p;
     }
-    return wbig_alloc(c, zero);
+    void *p = wbig_alloc(c, zero);
+    if (p && tp_wid >= 0) { const size_t v = atomic_fetch_add(&g_wm[tp_wid].tpv, c) + c; if (v > g_wm[tp_wid].tppeak) g_wm[tp_wid].tppeak = v; }
+    return p;
 }
-static void tp_put(void *p, size_t n) {
+static void tp_put_(void *p, size_t n, int line) {
     if (!p) return;
-    if (tpool.k < TP_N) { tpool.b[tpool.k] = p; tpool.n[tpool.k] = tp_class(n); tpool.k++; } else free(p);
+    tp_live -= tp_class(n); if (tp_log()) fprintf(stderr, "tplog put L%d %.3f live %.3f\n", line, (double)n / (double)g_tp_p3, (double)tp_live / (double)g_tp_p3);
+    if (tpool.k < TP_N) { tpool.b[tpool.k] = p; tpool.n[tpool.k] = tp_class(n); tpool.k++; }
+    else { free(p); if (tp_wid >= 0) atomic_fetch_sub(&g_wm[tp_wid].tpv, tp_class(n)); }
 }
-static void tp_drain(void) { while (tpool.k) free(tpool.b[--tpool.k]); }
+static void tp_drain(void) { while (tpool.k) { tpool.k--; free(tpool.b[tpool.k]); if (tp_wid >= 0) atomic_fetch_sub(&g_wm[tp_wid].tpv, tpool.n[tpool.k]); } }
 static int band_window(source *s, const int64_t o[3], int P, uint8_t *out, uint8_t *side, int phase, int dense, uint64_t seed) {
     band_params bp = {s->band_radius, s->band_span, 0};
     const int halo = (int)ceilf((bp.radius + bp.span) / 2.f) + 2;
@@ -1361,7 +1389,7 @@ static int phase_window_interp(z3 *a, const int64_t o[3], int D, int P, int shif
     if (rn[0] > 0 && rn[1] > 0 && rn[2] > 0) {
         const size_t rnn = (size_t)rn[0] * rn[1] * rn[2];
         uint8_t *tmp = tp_get(rnn, 0);
-        if (!tmp || z3_read(a, ro, rn, tmp, 1)) { tp_put(tmp, rnn); tp_put(ph, N); return -1; }
+        if (!tmp || z3_read(a, ro, rn, tmp, g_rt)) { tp_put(tmp, rnn); tp_put(ph, N); return -1; }
         for (int64_t z = 0; z < rn[0]; z++) for (int64_t y = 0; y < rn[1]; y++)
             memcpy(ph + ((size_t)(z + ro[0] - lo[0]) * ln[1] + (y + ro[1] - lo[1])) * ln[2] + (ro[2] - lo[2]), tmp + ((size_t)z * rn[1] + y) * rn[2], (size_t)rn[2]);
         tp_put(tmp, rnn);
@@ -1417,10 +1445,10 @@ static int phase_window(z3 *a, const int64_t o[3], int D, int P, int shift, uint
     if (!shift) {   /* the window's own grid: read straight into it (outside the volume unknown), no staging copies */
         const size_t n = (size_t)D * P * P;
         if (rn[0] <= 0 || rn[1] <= 0 || rn[2] <= 0) { memset(side, PHASE_UNKNOWN, n); return 0; }
-        if (rn[0] == D && rn[1] == P && rn[2] == P) return z3_read(a, ro, rn, side, 1) ? -1 : 0;
+        if (rn[0] == D && rn[1] == P && rn[2] == P) return z3_read(a, ro, rn, side, g_rt) ? -1 : 0;
         const size_t rnn = (size_t)rn[0] * rn[1] * rn[2];
         uint8_t *tmp = tp_get(rnn, 0);
-        if (!tmp || z3_read(a, ro, rn, tmp, 1)) { tp_put(tmp, rnn); return -1; }
+        if (!tmp || z3_read(a, ro, rn, tmp, g_rt)) { tp_put(tmp, rnn); return -1; }
         memset(side, PHASE_UNKNOWN, n);
         for (int64_t z = 0; z < rn[0]; z++) for (int64_t y = 0; y < rn[1]; y++)
             memcpy(side + ((size_t)(z + ro[0] - lo[0]) * P + (y + ro[1] - lo[1])) * P + (ro[2] - lo[2]), tmp + ((size_t)z * rn[1] + y) * rn[2], (size_t)rn[2]);
@@ -1434,7 +1462,7 @@ static int phase_window(z3 *a, const int64_t o[3], int D, int P, int shift, uint
     if (rn[0] > 0 && rn[1] > 0 && rn[2] > 0) {
         const size_t rnn = (size_t)rn[0] * rn[1] * rn[2];
         uint8_t *tmp = tp_get(rnn, 0);
-        if (!tmp || z3_read(a, ro, rn, tmp, 1)) { tp_put(tmp, rnn); tp_put(ph, N); return -1; }
+        if (!tmp || z3_read(a, ro, rn, tmp, g_rt)) { tp_put(tmp, rnn); tp_put(ph, N); return -1; }
         for (int64_t z = 0; z < rn[0]; z++) for (int64_t y = 0; y < rn[1]; y++)
             memcpy(ph + ((size_t)(z + ro[0] - lo[0]) * ln[1] + (y + ro[1] - lo[1])) * ln[2] + (ro[2] - lo[2]), tmp + ((size_t)z * rn[1] + y) * rn[2], (size_t)rn[2]);
         tp_put(tmp, rnn);
@@ -2382,7 +2410,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
         if (ok && !crushed && !torn && c->delam_p > 0 && runif(r) < c->delam_p && (delam = delam_draw(sp, s, l, o, P, psh, r, ctu)) < 0) return -1;
         if (ok && !crushed && !torn && !delam && c->curv_p > 0 && runif(r) < c->curv_p && (curved = curv_draw(sp, s, l, o, P, psh, r, big + p3, 8 * p3, ctu)) < 0) return -1;
     }
-    if (!crushed && !torn && !delam && !curved && z3_read(ct, o, n, ctu, 1)) return -1;
+    if (!crushed && !torn && !delam && !curved && z3_read(ct, o, n, ctu, g_rt)) return -1;
     PROF_MARK(PS_READ);
     size_t nz = 0;
     double sum = 0, sq = 0;
@@ -2418,14 +2446,14 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
         tp_put(pm, p3);
     }
     /* targets */
-    static _Thread_local uint8_t *inkw_tl; static _Thread_local size_t inkw_n;   /* --ink-head: the window's ink plane (a worker's own buffer) */
-    uint8_t *inkw = nullptr;
-    if (c->ink_plane) {
-        if (inkw_n < p3) { free(inkw_tl); inkw_tl = malloc(p3); inkw_n = inkw_tl ? p3 : 0; }
-        inkw = inkw_tl;
-    }
+    /* --ink-head: the window's ink plane, built in the batch's own plane (on the source grid; the symmetry / host warp below moves it
+       through big + P^3, free by then): no worker buffer of P^3 bytes */
+    uint8_t *inkw = c->ink_plane ? b->ink + (size_t)i * p3 : nullptr;
     uint8_t w[NCH] = {0};
     int tmax = 0;
+    /* a channel without a target (w 0) is read again only by the packing / the host warp / the sheet prior / papyrus labels: with the
+       packed plane skipped (slot_skip 1), the labels warped on the device and none of the others, it needs no zeroing */
+    const int tdead = c->pack_tm && (c->slot_skip & 1) && c->gpu_aug == 2 && !c->sheet && !c->papyrus && !c->pap_head && region_ch < 0;
     for (int ch = 0; ch < NCH; ch++) {
         uint8_t *dst = ttmp + (size_t)ch * p3;
         if (c->papyrus) { memset(dst, 0, p3); continue; }   /* task papyrus: labels from the CT below */
@@ -2439,7 +2467,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
             }
             z3 *tz = s->tgt_key[ch] && s->tgt_prob[ch] && !crushed && !torn && !delam && !curved ? source_tgt_for_level(s, ch, l, nullptr) : nullptr;
             if (!tz) memset(inkw, 255, p3);
-            else if (source_read_target(s, ch, l, o, n, inkw, 1)) return -1;
+            else if (source_read_target(s, ch, l, o, n, inkw, g_rt)) return -1;
             if (getenv("UFSM_INK_DEBUG")) { size_t kn = 0, ki = 0; for (size_t k = 0; k < p3; k++) { kn += inkw[k] != 255; ki += inkw[k] != 255 && inkw[k] > 127; } fprintf(stderr, "ink window: tz %p known %zu ink %zu\n", (void *)tz, kn, ki); }
             continue;
         }
@@ -2464,7 +2492,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
                 uint8_t *haloed = big + p3;   /* existing (2P)^3 scratch, P >= 2 */
                 if (source_read_target(s, ch, l, eo, en, haloed, 1)) return -1;
                 target_erode1(haloed, dst, P);
-            } else if (source_read_target(s, ch, l, o, n, dst, 1)) return -1;
+            } else if (source_read_target(s, ch, l, o, n, dst, g_rt)) return -1;
             w[ch] = 1;
             if (s->tgt_side[ch]) {   /* side labels (band.h RV_*) -> channel 0 recto-side papyrus, channel 1 verso-side papyrus (clean CT >= the
                                         source's cutoff); void 0 in both; papyrus of unknown side ignored in both; CT 0 masked below */
@@ -2507,7 +2535,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
                 w[CH_SHEET] = 1;
                 if (any && !c->cover) tmax = 254;
             }
-        } else memset(dst, 0, p3);
+        } else if (!tdead) memset(dst, 0, p3);
         if ((s->tgt_erode[ch] || s->tgt_dilate[ch]) && w[ch] && ch != region_ch) {   /* source band thickness: erode / dilate N voxels (3-4-5 chamfer) */
             uint8_t *mk = tp_get(p3, 0), *dm2 = tp_get(p3, 0);
             if (!mk || !dm2) { tp_put(mk, p3); tp_put(dm2, p3); tp_put(dpap, p3); return -1; }
@@ -2531,7 +2559,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
             const int lr = 3 * c->iso_lift > 255 ? 255 : 3 * c->iso_lift;
             for (size_t k = 0; k < p3; k++) if (dst[k] && dst[k] != 255 && dpap[k] > lr) dst[k] = 255;
         }
-        if (w[ch] && !c->cover) {   /* largest known target value (only the empty-patch rejection reads it) */
+        if (w[ch] && !c->cover && tmax < 254) {   /* largest known target value (only the empty-patch rejection reads it; 254 is the largest there is) */
             uint8_t mx = 0; size_t k0 = 0;
 #ifdef __AVX2__
             {   /* (an integer maximum: any order) */
@@ -2657,8 +2685,14 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
     /* label encoding -> target probability * 255 and the ignore mask (255 = ignore) */
     PROF_MARK(PS_TRUST);
     uint8_t *ign = big + 9 * p3;
-    memset(ign, 0, p3);
-    for (int ch = 0; ch < NCH; ch++) {
+    if (NCH == 2 && w[0] && w[1]) {   /* both channels in one pass (the same bytes as the per-channel loops below: ignore = either is 255) */
+        uint8_t *d0 = ttmp, *d1 = ttmp + p3;
+        for (size_t k = 0; k < p3; k++) {
+            const uint8_t v0 = d0[k], v1 = d1[k];
+            ign[k] = (v0 == 255) | (v1 == 255); d0[k] = v0 == 255 ? 0 : (uint8_t)(v0 + (v0 >= 127)); d1[k] = v1 == 255 ? 0 : (uint8_t)(v1 + (v1 >= 127));
+        }
+    } else memset(ign, 0, p3);
+    for (int ch = 0; ch < NCH && !(NCH == 2 && w[0] && w[1]); ch++) {
         if (!w[ch]) continue;
         uint8_t *dst = ttmp + (size_t)ch * p3;
         for (size_t k = 0; k < p3; k++) { const uint8_t v = dst[k]; ign[k] |= v == 255; dst[k] = v == 255 ? 0 : (uint8_t)(v + (v >= 127)); }   /* (v * 255 + 127) / 254 for v < 255 */
@@ -2706,8 +2740,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
             grec->scan = on != 0;
             if (on) {
                 memcpy(b->ct8 + (size_t)i * p3, ctu, p3);
-                uint8_t *air = big + p3; scan_plan_air(&grec->plan, ctu, air);
-                for (size_t k = 0; k < p3; k++) ctu[k] = !air[k];
+                scan_plan_notair(&grec->plan, ctu);   /* (= !scan_plan_air: one pass, in place) */
             }
         } else if (scan_aug_apply(&c->scan, rnext(r), ctu, ttmp, NCH, ign, P, o, cyz, cxz, s->ax.n > 0, m->chunk, !c->sheet && !c->band && !c->side, big + p3)) {
             size_t nz2;   /* (integer sums: the same doubles as accumulating the bytes in double, exact below 2^53) */
@@ -2719,8 +2752,8 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
     if (grec && !grec->scan) memcpy(b->ct8 + (size_t)i * p3, ctu, p3);   /* (the bytes as read) */
     if (s->norm_s > 0) { mean = s->norm_c; sd = s->norm_s; }   /* "norm": the scan's fixed normalisation (ufsm scanprep median / scale) instead of the window z-score */
     uint8_t *mask = big + 9 * p3;   /* ign lives here: fold CT > 0 into it */
-    for (size_t k = 0; k < p3; k++) mask[k] = (ctu[k] != 0) & (mask[k] == 0);
-    if (inkw) for (size_t k = 0; k < p3; k++) if (!mask[k]) inkw[k] = 255;   /* --ink-head: unknown on CT 0 and where the scanner augmentation ignores labels */
+    if (inkw) for (size_t k = 0; k < p3; k++) { const uint8_t mk = (ctu[k] != 0) & (mask[k] == 0); mask[k] = mk; inkw[k] = mk ? inkw[k] : 255; }   /* --ink-head: unknown on CT 0 and where the scanner augmentation ignores labels */
+    else for (size_t k = 0; k < p3; k++) mask[k] = (ctu[k] != 0) & (mask[k] == 0);
     PROF_MARK(PS_ZSCORE);
     /* packed targets (cfg.pack_tm): unwarped samples pack the code in the source frame over the mask (one symmetry copy into the batch);
        warped ones warp into pooled scratch and pack after */
@@ -2780,31 +2813,34 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
     uint8_t *Tw = nullptr;   /* (packed and warped: the warped targets and mask before packing) */
     uint8_t *TMd = nullptr;   /* packed, warped, CT-only, nothing else reading T / M: the warp writes the codes into the batch */
     const int lw = c->gpu_aug == 2 && spatial.active;   /* --gpu-aug 2: this window's labels warp on the device (source-grid labels in the batch) */
+    uint8_t *tmscr = nullptr;   /* (slot_skip 1: the packed codes the direct warp writes, discarded) */
     if (lw) {
         size_t bad = 0;
-        if (sample_pack_tm(ttmp, ttmp + p3, mask, p3, b->tm + (size_t)i * p3, &bad)) {
+        if (b->tm && sample_pack_tm(ttmp, ttmp + p3, mask, p3, b->tm + (size_t)i * p3, &bad)) {
             fprintf(stderr, "sampler: packed targets need hard 0 / 255 targets and a 0 / 1 mask (voxel %zu); train --pack-targets 0\n", bad);
             abort();
         }
     }
-    else if (c->pack_tm && spatial.active && c->gpu_input && !c->sheet && !c->pmask) TMd = b->tm + (size_t)i * p3;
+    else if (c->pack_tm && spatial.active && c->gpu_input && !c->sheet && !c->pmask) { TMd = b->tm ? b->tm + (size_t)i * p3 : (tmscr = tp_get(p3, 0)); if (!TMd) return -1; }
     else if (c->pack_tm && spatial.active) {
         if (!(Tw = tp_get((NCH + 1) * p3, 0))) return -1;
         T = Tw; M = Tw + NCH * p3;
     }
     if (!spatial.active && c->pack_tm) {
         size_t bad = 0;
+        if (b->tm || c->sheet) {   /* (slot_skip 1: no packed plane to fill, and only the sheet prior would read the packed mask) */
         if (sample_pack_tm(ttmp, ttmp + p3, mask, p3, mask, &bad)) {
             fprintf(stderr, "sampler: packed targets need hard 0 / 255 targets and a 0 / 1 mask (voxel %zu: %d %d %d); train --pack-targets 0\n",
                     bad, ttmp[bad], ttmp[p3 + bad], mask[bad]);
             abort();
         }
-        sym_u8(mask, b->tm + (size_t)i * p3, Pz, P, y);
+        if (b->tm) sym_u8(mask, b->tm + (size_t)i * p3, Pz, P, y);
+        }
     } else if (!spatial.active) {
         for (int ch = 0; ch < NCH; ch++) sym_u8(ttmp + (size_t)ch * p3, T + (size_t)ch * p3, Pz, P, y);
         sym_u8(mask, M, Pz, P, y);
     }
-    if (c->pmask && !spatial.active) {   /* CT > 0 through the same symmetry (big + 2 P^3, the soft / trust distance map, is free here) */
+    if (c->pmask && !spatial.active && b->pm) {   /* CT > 0 through the same symmetry (big + 2 P^3, the soft / trust distance map, is free here) */
         uint8_t *pt = big + 2 * p3;
         for (size_t k = 0; k < p3; k++) pt[k] = ctu[k] != 0;
         sym_u8(pt, b->pm + (size_t)i * p3, Pz, P, y);
@@ -2816,55 +2852,92 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
     /* --task unwrap2: the winding mod 4 and its component come from a stored phase below (warped or through the symmetry: every
        voxel written); else unknown (255) */
     int w4_set = 0;
+    PROF_MARK(PS_SYMPACK);
+    /* the targets (ttmp) and the loss mask (big + 9 P^3) are dead from here for unwarped / device-warped windows without a sheet prior
+       (write_spatial_tm and sheet_sample would read them): their planes are scratch below */
+    const int scr_own = !c->sheet && (!spatial.active || lw);
+    const int sym_id = y.perm[0] == 0 && y.perm[1] == 1 && y.perm[2] == 2 && !y.flip[0] && !y.flip[1] && !y.flip[2];
     if (c->band || c->side) {   /* band labels: computed on the source grid, unknown on CT air, then the same symmetry as CT and targets */
         if (!band_sample || (spatial.active && !stored_phase)) {   /* no band labels: affinities (and sides) unsupervised */
             if (c->band) memset(b->band + (size_t)i * p3, BAND_UNKNOWN, p3);
             if (c->side) memset(b->side + (size_t)i * p3, SIDE_UNKNOWN, p3);
         } else if (stored_phase) {   /* the stored phase (ufsm phase-raster, ufsm downsample --mode phase) */
-            uint8_t *sw = tp_get(p3 + 64, 0);   /* (+ 64: warp_phase_w4 reads byte pairs as 32-bit words) */
-            int air_done = 0;   /* (phase_air ran with the winding input) */
+            /* unwarped or device-warped windows (and no sheet prior): the block's planes in worker scratch that is dead here instead of the
+               pool (4 window planes less per worker: 4 B per voxel, 3.5 GB at P 960): the targets (ttmp, last read by the packing above,
+               2 P^3 + 4 KB), big + P^3 (the region / scan scratch, free after the scanner augmentation) and big + 9 P^3 (the loss mask,
+               last read by the packing too); write_spatial_tm and the sheet prior would read them again, and these windows skip both */
+            /* the block's planes for unwarped / device-warped windows without a sheet prior (ph_own): in worker scratch that is dead here (the
+               targets ttmp, last read by the packing above, and the loss mask big + 9 P^3) instead of the pool; "direct" windows (warped on the
+               device, or unwarped with the identity symmetry: the output is the source grid) build the phase, the winding and its component
+               straight in their batch planes. The phase's output is written before the winding (its plane then holds the winding): 4 window
+               planes per worker with the CT. write_spatial_tm and the sheet prior would read the scratch again; these windows skip both */
+            const int ph_own = scr_own, direct = ph_own && (lw || (!spatial.active && sym_id));
+            uint8_t *const side_o = b->side + (size_t)i * p3;
+#define PH_GET(own_, n_) (ph_own ? (uint8_t *)(own_) : (uint8_t *)tp_get((n_), 0))
+#define PH_PUT(p_, n_) do { if (!ph_own) tp_put((p_), (n_)); } while (0)
+            uint8_t *sw = direct ? side_o : PH_GET(ttmp, p3 + 64);   /* (+ 64: warp_phase_w4 reads byte pairs as 32-bit words) */
+#define SW_PUT() do { if (!direct) PH_PUT(sw, p3 + 64); } while (0)
+            int air_done = 0, side_done = 0;   /* (phase_air ran with the winding input; the phase's output written) */
             uint16_t *wq = nullptr;   /* warped --task unwrap2: the winding and its component for warp_phase_w4 (one pass with the phase) */
-            if (!sw || (g_crush.ph ? (memcpy(sw, g_crush.ph, p3), 0) : phase_window(s->phase, o, Pz, P, pshift, sw))) { tp_put(sw, p3 + 64); return -1; }
+            if (!sw || (g_crush.ph ? (memcpy(sw, g_crush.ph, p3), 0) : phase_window(s->phase, o, Pz, P, pshift, sw))) { SW_PUT(); return -1; }
             if (s->phase_sign < 0) phase_negate(sw, p3);   /* (before the winding mod 4: it unwraps this phase) */
-            if (s->phase_ign && pshift < 2 && !g_crush.pre) {   /* (--aug-tear: applied before the cut) (interpolated 2.4 um windows: no mask) "ignore": label sets that disagree there (ufsm phase-conflict): unknown, not trained on */
-                uint8_t *ig = tp_get(p3, 0);
-                if (!ig || (g_crush.ig ? (memcpy(ig, g_crush.ig, p3), 0) : phase_window(s->phase_ign, o, Pz, P, pshift, ig))) { tp_put(ig, p3); tp_put(sw, p3 + 64); return -1; }
+            const int ign_none = s->phase_ign && pshift == 0 && !g_crush.ig && z3_box_any(s->phase_ign, o, (const int64_t[3]){Pz, P, P}) == 0;   /* (no stored chunk in the window: all fill, which keeps every phase) */
+            if (s->phase_ign && pshift < 2 && !g_crush.pre && !ign_none) {   /* (--aug-tear: applied before the cut) (interpolated 2.4 um windows: no mask) "ignore": label sets that disagree there (ufsm phase-conflict): unknown, not trained on */
+                uint8_t *ig = PH_GET(big + 9 * p3, p3);
+                if (!ig || (g_crush.ig ? (memcpy(ig, g_crush.ig, p3), 0) : phase_window(s->phase_ign, o, Pz, P, pshift, ig))) { PH_PUT(ig, p3); SW_PUT(); return -1; }
                 for (size_t k = 0; k < p3; k++) if (ig[k] && ig[k] != PHASE_UNKNOWN) sw[k] = PHASE_UNKNOWN;   /* (outside the mask array: 255 = keep) */
-                tp_put(ig, p3);
+                PH_PUT(ig, p3);
             }
             if (s->phase_wt && pshift < 2 && !g_crush.pre) {   /* "weight": each 8^3 block of the window keeps its phase with probability w / 255 */
-                uint8_t *wt = tp_get(p3, 0);
-                if (!wt || phase_window(s->phase_wt, o, Pz, P, pshift, wt)) { tp_put(wt, p3); tp_put(sw, p3 + 64); return -1; }
+                uint8_t *wt = PH_GET(big + 9 * p3, p3);
+                if (!wt || phase_window(s->phase_wt, o, Pz, P, pshift, wt)) { PH_PUT(wt, p3); SW_PUT(); return -1; }
                 phase_weight_drop(sw, wt, Pz, P, r->s[1] ^ (uint64_t)tile_index ^ c->seed ^ ((uint64_t)o[0] << 40) ^ ((uint64_t)o[1] << 20) ^ (uint64_t)o[2]);
-                tp_put(wt, p3);
+                PH_PUT(wt, p3);
             }
+            PROF_MARK(PS_PHREAD);
             if (c->wind4 && !s->scope_local) {   /* ("scope": "local": the winding mod 4 stays unknown, below) */   /* the winding mod 4: the phase unwrapped before the air test (gaps join the windings), outside the scroll (CT 0) not */
-                uint8_t *pw = tp_get(p3, 0), *ww = tp_get(p3, 0), *wc = tp_get(p3, 0);
-                if (!pw || !ww || !wc) { tp_put(pw, p3); tp_put(ww, p3); tp_put(wc, p3); tp_put(sw, p3 + 64); return -1; }
+                uint8_t *pw = PH_GET(ttmp + p3 + 64, p3);
+                if (!pw) { SW_PUT(); return -1; }
                 phase_air(ctu, sw, pw, p3, c->side_air); air_done = 1;   /* (the winding input and the air test in one pass) */
+                if (ph_own) {   /* the phase's output now (the winding below reads pw only): its plane is free for the winding */
+                    if (c->phase_near_um > 0) for (size_t k = 0; k < p3; k++) if (!near || !near[k]) sw[k] = SIDE_UNKNOWN;   /* no labelled wrap: none */
+                    if (!direct) sym_u8(sw, side_o, Pz, P, y);
+                    side_done = 1;
+                }
+                uint8_t *ww = direct ? b->w4 + (size_t)i * p3 : ph_own ? ttmp : PH_GET(big + p3, p3), *wc = direct ? b->wcomp + (size_t)i * p3 : PH_GET(big + 9 * p3, p3);
+                if (!ww || !wc) { PH_PUT(pw, p3); if (!ph_own) { PH_PUT(ww, p3); PH_PUT(wc, p3); } SW_PUT(); return -1; }
                 const int wt = c->wind4_tile < 0 ? 0 : c->wind4_tile > (P + 5) / 6 ? c->wind4_tile : (P + 5) / 6;   /* (<= 6^3 tiles: one gauge each fits the loss's 255) */
                 if (g_crush.w4) { memcpy(ww, g_crush.w4, p3); memcpy(wc, g_crush.wc, p3); }   /* (--aug-tear: unwrapped before the cut) */
-                else if (band_wind4_tiled(pw, Pz, P, P, wt, c->wind4_step > 0 ? c->wind4_step : 80, c->wind4_min > 0 ? (size_t)c->wind4_min : 512, wt ? 1 : 15, ww, wc, nullptr) < 0) {
-                    tp_put(pw, p3); tp_put(ww, p3); tp_put(wc, p3); tp_put(sw, p3 + 64); return -1;
+                else if (band_wind4_tiled_mt(pw, Pz, P, P, wt, c->wind4_step > 0 ? c->wind4_step : 80, c->wind4_min > 0 ? (size_t)c->wind4_min : 512, wt ? 1 : 15, ww, wc, nullptr, g_rt) < 0) {
+                    PH_PUT(pw, p3); if (!ph_own) { PH_PUT(ww, p3); PH_PUT(wc, p3); } SW_PUT(); return -1;
                 }
-                if (lw) { memcpy(b->w4 + (size_t)i * p3, ww, p3); memcpy(b->wcomp + (size_t)i * p3, wc, p3); }   /* (source grid: the device warps) */
+                if (direct) {}   /* (in place) */
+                else if (lw) { memcpy(b->w4 + (size_t)i * p3, ww, p3); memcpy(b->wcomp + (size_t)i * p3, wc, p3); }   /* (source grid: the device warps) */
                 else if (spatial.active) {
-                    if (!(wq = tp_get(2 * p3, 0))) { tp_put(pw, p3); tp_put(ww, p3); tp_put(wc, p3); tp_put(sw, p3 + 64); return -1; }
+                    if (!(wq = tp_get(2 * p3, 0))) { PH_PUT(pw, p3); PH_PUT(ww, p3); PH_PUT(wc, p3); SW_PUT(); return -1; }
                     warp_w4_pack(ww, wc, wq, p3);
                 }
                 else { sym_u8(ww, b->w4 + (size_t)i * p3, Pz, P, y); sym_u8(wc, b->wcomp + (size_t)i * p3, Pz, P, y); }
                 w4_set = 1;   /* (warped: warp_phase_w4 below writes every voxel) */
-                tp_put(pw, p3); tp_put(ww, p3); tp_put(wc, p3);
+                PROF_MARK(PS_WIND4);
+                PH_PUT(pw, p3); if (!ph_own) { PH_PUT(ww, p3); PH_PUT(wc, p3); }
             }
             if (!air_done) phase_air(ctu, sw, nullptr, p3, c->side_air);
-            if (c->phase_near_um > 0) for (size_t k = 0; k < p3; k++) if (!near || !near[k]) sw[k] = SIDE_UNKNOWN;   /* no labelled wrap: none */
-            if (lw) memcpy(b->side + (size_t)i * p3, sw, p3);   /* (source grid: the device warps) */
-            else if (spatial.active) {   /* (slabs never warp: sampler_start) */
-                memset(sw + p3, PHASE_UNKNOWN, 64);
-                warp_phase_w4(sw, wq, b->side + (size_t)i * p3, wq ? b->w4 + (size_t)i * p3 : nullptr, wq ? b->wcomp + (size_t)i * p3 : nullptr, P, y, &spatial);
-                tp_put(wq, 2 * p3);
-            } else sym_u8(sw, b->side + (size_t)i * p3, Pz, P, y);
-            tp_put(sw, p3 + 64);
+            if (!side_done) {
+                if (c->phase_near_um > 0) for (size_t k = 0; k < p3; k++) if (!near || !near[k]) sw[k] = SIDE_UNKNOWN;   /* no labelled wrap: none */
+                if (direct) {}   /* (in place) */
+                else if (lw) memcpy(side_o, sw, p3);   /* (source grid: the device warps) */
+                else if (spatial.active) {   /* (slabs never warp: sampler_start) */
+                    memset(sw + p3, PHASE_UNKNOWN, 64);
+                    warp_phase_w4(sw, wq, side_o, wq ? b->w4 + (size_t)i * p3 : nullptr, wq ? b->wcomp + (size_t)i * p3 : nullptr, P, y, &spatial);
+                    tp_put(wq, 2 * p3);
+                } else sym_u8(sw, side_o, Pz, P, y);
+            }
+            SW_PUT();
+            PROF_MARK(PS_PHOUT);
+#undef SW_PUT
+#undef PH_GET
+#undef PH_PUT
         } else {
             if (Pz != P) { fprintf(stderr, "sampler: slab windows take the phase from a stored raster (sources \"phase\" at this level or one coarser)\n"); return -1; }
             uint8_t *bw = tp_get(p3, 0), *sw = c->side ? tp_get(p3, 0) : nullptr;
@@ -2880,10 +2953,11 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
     }
     if (c->wind4 && !w4_set) { memset(b->w4 + (size_t)i * p3, 255, p3); memset(b->wcomp + (size_t)i * p3, 255, p3); }
     if (inkw) {   /* --ink-head: the ink plane through the symmetry / warp (--gpu-aug 2 warped windows: the source grid, warped on the device) */
-        uint8_t *bi = b->ink + (size_t)i * p3;
-        if (lw) memcpy(bi, inkw, p3);
-        else if (spatial.active) sample_warp_ink(inkw, bi, P, y.perm, y.flip, &spatial);
-        else sym_u8(inkw, bi, Pz, P, y);
+        uint8_t *bi = b->ink + (size_t)i * p3, *src = scr_own ? ttmp + p3 + 64 : big + p3;   /* (lw, or unwarped with the identity: already in place) */
+        if (!lw && !(sym_id && !spatial.active)) {
+            memcpy(src, inkw, p3);
+            if (spatial.active) sample_warp_ink(src, bi, P, y.perm, y.flip, &spatial); else sym_u8(src, bi, Pz, P, y);
+        }
     }
     if (c->emb_ch) {   /* train --distill: the feature targets through the same symmetry and warp (none on crushed / torn / re-bent windows) */
         const size_t ge = (size_t)(Pz / c->emb_div) * (P / c->emb_div) * (P / c->emb_div);
@@ -2919,7 +2993,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
                  app, noise_state, noise_state ? noise_state + P : nullptr, c->gpu_input);   /* the CT appearance plan in the row-vectorised writer (cubes) */
     if (c->gpu_input) rad_record((char *)b->rad + (size_t)i * NN_RAD_REC(Pz), o, Pz, P, s->ax.n > 0, y, cyz, cxz, &spatial);   /* the radial channels: on the device */
     if (c->axis_rec > 0) axis_record(b->axr + (size_t)i * SAMPLE_AXR(Pz > P ? Pz : P), o, Pz, P, s->ax.n > 0, y, cyz, cxz, &spatial, c->axis_rec);
-    free(params);
+    free(params); tp_put(tmscr, p3);
     if (c->aux) {   /* the fifth channel: the source's aux volume at this level (zeros elsewhere), the CT's symmetry, v / 127.5 - 1 */
         uint8_t *aw = tp_get(p3, 1), *as = tp_get(p3, 0);
         if (!aw || !as || (s->aux && s->aux_level == l && aux_window(s, o, P, aw))) { tp_put(aw, p3); tp_put(as, p3); return -1; }
@@ -2962,10 +3036,10 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
         if (spatial.active) warp_sheet_batch(b->sheet[i],&spatial,M);
         w[1]=0; /* winding is supervised by the sparse regression objective */
     }
-    if (spatial.active && c->pmask && !lw) memcpy(b->pm + (size_t)i * p3, M, p3);   /* warped samples: the warped loss mask (--gpu-aug 2: the device's, from the packed mask bit) */
+    if (spatial.active && c->pmask && !lw && b->pm) memcpy(b->pm + (size_t)i * p3, M, p3);   /* warped samples: the warped loss mask (--gpu-aug 2: the device's, from the packed mask bit) */
     if (Tw) {
         size_t bad = 0;
-        if (sample_pack_tm(Tw, Tw + p3, Tw + NCH * p3, p3, b->tm + (size_t)i * p3, &bad)) {
+        if (b->tm && sample_pack_tm(Tw, Tw + p3, Tw + NCH * p3, p3, b->tm + (size_t)i * p3, &bad)) {
             fprintf(stderr, "sampler: packed targets need hard 0 / 255 targets and a 0 / 1 mask after the warp (voxel %zu); train --pack-targets 0\n", bad);
             abort();
         }
@@ -3050,8 +3124,11 @@ static void *worker(void *arg) {
     rseed(&r, sp->cfg.seed * 1000003ull + (uint64_t)wa->id);
     size_t p3 = P3(sp);
     float *xtmp = malloc(3 * (size_t)sp->cfg.P * sizeof(float));   /* per-z axis centres and a row of noise */
-    uint8_t *ttmp = wbig_alloc(NCH * p3, 0);
+    uint8_t *ttmp = wbig_alloc(NCH * p3 + 4096, 0);   /* (+ 4 KB: the stored-phase block's two planes, P^3 + 64 and P^3, in it) */
     uint8_t *big = wbig_alloc(10 * p3, 0);   /* [0,P^3) CT (also the coarse probe), [P^3, 9P^3) (2P)^3 region scratch, [9P^3, 10P^3) mask */
+    static atomic_int nwm; const int wid = atomic_fetch_add(&nwm, 1);
+    g_tp_p3 = p3;
+    if (wid < WM_MAX) { tp_wid = wid; g_wm[tp_wid].pool = &tpool; g_wm[tp_wid].big = big; g_wm[tp_wid].bign = 10 * p3; g_wm[tp_wid].ttmp = ttmp; g_wm[tp_wid].ttn = NCH * p3 + 4096; }
     const int det = sp->cfg.deterministic;
     float *noise_state = sp->cfg.ct_augment ? malloc(((size_t)sp->cfg.P * sp->cfg.P + sp->cfg.P) * sizeof(float)) : nullptr;
     chain_st *chs = calloc((size_t)sp->cfg.B, sizeof *chs);   /* (window chains: one per sample slot) */
@@ -3086,6 +3163,7 @@ static void *worker(void *arg) {
         for (int i = 0; i < sp->cfg.B && !atomic_load(&sp->stop);) {
             if (det && (sp->cfg.cover || (spin == 0 && fail == 0))) rseed(&r, sp->cfg.seed * 0x9e3779b97f4a7c15ull + (sp->cfg.cover_start + (uint64_t)(jb * sp->cfg.B + i)) * 1000003ull + 1);   /* per-sample stream */
             int rc = draw(sp, b, i, &r, xtmp, ttmp, big, sp->cfg.cover_start + (uint64_t)(jb * sp->cfg.B + i), noise_state, chs ? chs + i : nullptr);
+            if (tp_log()) { fprintf(stderr, "tplog draw rc %d big res by p3:", rc); for (int q = 0; q < 10; q++) fprintf(stderr, " %.2f", resident_bytes(big + q * p3, p3) / (double)p3); fprintf(stderr, " ttmp %.2f\n", resident_bytes(ttmp, 2 * p3) / (double)p3); }
             if (rc == 0) { i++; filled = i; fail = 0; spin = 0; }
             else if (rc > 0 && ++spin == (1u << 22)) { fprintf(stderr, "sampler: %u consecutive draws rejected or impossible (P=%d), stopping\n", spin, sp->cfg.P); atomic_store(&sp->failed, 1); atomic_store(&sp->stop, 1); }
             else if (rc < 0) { fprintf(stderr, "sampler: %s\n", z3_error()); if (++fail > 20) { fprintf(stderr, "sampler: 20 consecutive read failures, stopping\n"); atomic_store(&sp->failed, 1); atomic_store(&sp->stop, 1); } }
@@ -3096,6 +3174,7 @@ static void *worker(void *arg) {
         pthread_cond_broadcast(&sp->cv_free);
         pthread_mutex_unlock(&sp->mu);
     }
+    if (tp_wid >= 0) { g_wm[tp_wid].pool = nullptr; g_wm[tp_wid].big = g_wm[tp_wid].ttmp = nullptr; }
     free(xtmp); free(ttmp); free(big); free(noise_state); free(chs); tp_drain();
     free(wa);
     return nullptr;
@@ -3341,7 +3420,8 @@ sampler *sampler_start(sources *S, const sample_cfg *cfg) {
         memset(sp->cfg.level_p, 0, sizeof sp->cfg.level_p); sp->cfg.level_p[0] = 1;
     }
     { unsigned sb; memcpy(&sb, &cfg->soft, 4); atomic_store(&sp->soft_bits, sb); }
-    sp->prof = ufsm_env_on("UFSM_SAMPLER_PROF");
+    g_thp_default = cfg->gpu_aug != 2;
+    sp->prof = ufsm_env_on("UFSM_SAMPLER_PROF"); { const char *e = getenv("UFSM_SAMPLER_PROF"); g_prof_cpu = e && atoi(e) == 2; e = getenv("UFSM_SAMPLER_RT"); g_rt = e && atoi(e) > 1 ? atoi(e) : 1; }
     sp->lvl_ok = calloc((size_t)S->n, sizeof *sp->lvl_ok);
     sources_open_all(S, 32);   /* every (source, level, channel) store opened up front in parallel: lazily they serialise on one lock (254 opens, 17 s) */
     sp->cum = malloc((size_t)S->n * sizeof(double));
@@ -3428,6 +3508,21 @@ batch *sampler_next(sampler *sp) {
     }
     sp->state[k] = TAKEN;
     pthread_mutex_unlock(&sp->mu);
+    if (ufsm_env_on("UFSM_BATCH_HASH")) {   /* debugging (with train --det 1): one hash per batch plane, to show a change leaves the batches byte-identical */
+        const batch *b = &sp->slots[k]; const size_t B = (size_t)sp->cfg.B, p3 = P3(sp);
+        static _Atomic long nb; const long id = atomic_fetch_add(&nb, 1);
+        const struct { const char *n; const void *p; size_t z; } f[] = {{"ct8", b->ct8, B * p3}, {"aug", b->aug, B * sizeof(scan_ct_rec)}, {"rad", b->rad, B * NN_RAD_REC(PZ(&sp->cfg))},
+            {"side", b->side, B * p3}, {"w4", b->w4, B * p3}, {"wcomp", b->wcomp, B * p3}, {"ink", b->ink, B * p3}, {"tm", b->tm, B * p3}, {"pm", b->pm, B * p3},
+            {"x16", b->x16, B * (size_t)b->xch * p3 * 2}, {"um", b->um, B * sizeof(float)}, {"src", b->src, B * sizeof(int16_t)}, {"w", b->w, B * NCH}};
+        fprintf(stderr, "batchhash %ld", id);
+        for (size_t q = 0; q < sizeof f / sizeof f[0]; q++) if (f[q].p) {
+            uint64_t h = 0x9e3779b97f4a7c15ull; const uint8_t *c = f[q].p;
+            for (size_t j = 0; j + 8 <= f[q].z; j += 8) { uint64_t v; memcpy(&v, c + j, 8); h = (h ^ v) * 0xff51afd7ed558ccdull; h ^= h >> 32; }
+            for (size_t j = f[q].z & ~(size_t)7; j < f[q].z; j++) h = (h ^ c[j]) * 0x100000001b3ull;
+            fprintf(stderr, " %s %016llx", f[q].n, (unsigned long long)h);
+        }
+        fprintf(stderr, "\n");
+    }
     return &sp->slots[k];
 }
 
@@ -3438,6 +3533,36 @@ void sampler_release(sampler *sp, batch *b) {
     pthread_mutex_unlock(&sp->mu);
 }
 
+size_t resident_bytes(const void *p, size_t n) {   /* touched (resident) bytes of an anonymous range */
+    if (!p || !n) return 0;
+    const size_t pg = (size_t)sysconf(_SC_PAGESIZE); const uintptr_t a = (uintptr_t)p & ~(pg - 1), e = ((uintptr_t)p + n + pg - 1) & ~(pg - 1);
+    const size_t np = (e - a) / pg; unsigned char *v = malloc(np); if (!v) return 0;
+    size_t r = 0; if (mincore((void *)a, e - a, v) == 0) for (size_t i = 0; i < np; i++) r += v[i] & 1;
+    free(v); return r * pg;
+}
+/* UFSM_HOSTMEM=1: where the host bytes are (racy reads of the workers' pools: a debugging aid, not exact under churn) */
+void sampler_hostmem(const sampler *sp, FILE *f, size_t pinned) {
+    const double p3 = sp ? (double)P3(sp) : 1.0, G = 1e9;
+    double bigr = 0, bigv = 0, ttr = 0, ttv = 0, tpv = 0, tpr = 0, tpk = 0; int nw = 0; char cls[512] = ""; size_t cl = 0;
+    for (int w = 0; w < WM_MAX; w++) {
+        if (!g_wm[w].big) continue;
+        nw++; bigv += g_wm[w].bign; bigr += resident_bytes(g_wm[w].big, g_wm[w].bign); ttv += g_wm[w].ttn; ttr += resident_bytes(g_wm[w].ttmp, g_wm[w].ttn);
+        tpv += g_wm[w].tpv; tpk += g_wm[w].tppeak;
+        tp_pool *tp = g_wm[w].pool; if (!tp) continue;
+        const int k = tp->k;
+        for (int i = 0; i < k && i < TP_N; i++) {
+            tpr += resident_bytes(tp->b[i], tp->n[i]);
+        }
+        if (cl == 0) for (int i = 0; i < k && i < TP_N && cl < sizeof cls - 16; i++) cl += (size_t)snprintf(cls + cl, sizeof cls - cl, " %.2f", tp->n[i] / p3);
+    }
+    struct mallinfo2 mi = mallinfo2();
+    long rss = 0; FILE *st = fopen("/proc/self/status", "r"); char line[256];
+    if (st) { while (fgets(line, sizeof line, st)) if (!strncmp(line, "VmRSS:", 6)) rss = atol(line + 6); fclose(st); }
+    fprintf(f, "hostmem: rss %.2f GB | pinned %.2f GB (slots %.2f) | workers %d: big %.2f/%.2f GB res/virt, ttmp %.2f/%.2f, pool %.2f virt (peak %.2f, pooled res %.2f)"
+               " | malloc arena %.2f GB in use %.2f free %.2f mmapped %.2f | p3 %.0f M; pool classes of a worker (x p3):%s\n",
+            rss / 1048576.0, pinned / G, g_slot_bytes / G, nw, bigr / G, bigv / G, ttr / G, ttv / G, tpv / G, tpk / G, tpr / G,
+            (mi.arena) / G, mi.uordblks / G, mi.fordblks / G, mi.hblkhd / G, p3 / 1e6, cls);
+}
 void sampler_stop(sampler *sp) {
     if (!sp) return;
     atomic_store(&sp->stop, 1);

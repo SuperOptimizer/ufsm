@@ -34,6 +34,7 @@ typedef struct {
     int ds_levels;         /* deep supervision: a 1^3 head (cout outputs) on each decoder level 1..ds_levels (params appended last); a training
                               forward computes their fp32 logits (unet_ds_logits), the trainer's loss gradients come back through
                               unet_set_ds_grad and join each level's gradient before its decoder backward */
+    int lat_guide;         /* latent-grid nets (half_res 3): 5 = the guided head (nn_lat_guide): cout = the task's outputs + 5 coefficient planes */
     int half_res;          /* the caller runs the network on 2x2x2 blocks of its window (nn_half_*): 1 pool (cin 4, the block means; logits
                               upsampled trilinearly), 2 pack (cin 8: the block means, the CT's sub-voxel gradients and contrast;
                               cout 8 per output, one per sub-voxel); 3 pool4, 4 pack4: the network on 4^3 blocks (a 2x pool / trilinear 2x
@@ -285,6 +286,11 @@ int unet_logits_in_gx(const unet *u);   /* the logits share the head's input-gra
 /* train --gpu-input: the next forwards' 16-bit x is the CT channel alone ([n][S]) and rec (device, n records of NN_RAD_REC(D) bytes, nn.h)
    holds each sample's radial record: the 4 MX input channels are built on the device (nn_input_rad). nullptr: x has all 4 channels */
 void unet_set_input_rad(unet *u, const void *rec);
+/* latent-grid nets (half_res 3) with the learned cell transform (latfit.h): bas [C][64], gain [C], the quantiser step (0: none); cfg.cin = C + 3.
+   Saved in the checkpoint header and set again by unet_load. unet_lat_basis: C (0: plain cell means) and the device copies. */
+void unet_set_lat_basis(unet *u, const float *bas, const float *gain, int C, float step);
+void unet_set_lat_step(unet *u, float step);   /* the next forwards' quantiser step (train --lat-step-jitter); 0: the transform's */
+int unet_lat_basis(const unet *u, const float **bas, const float **gain, float *step);
 int unet_logits_h16(const unet *u);   /* the logits unet_forward returns are fp16 (lean 2 training: the logit gradient fits after them) */
 /* head slabs (training): the forward skips the 1^3 head and allocates no whole-window logits; the caller runs it per z-slab
    (unet_head_fwd_z after the forward), and the backward calls cb(ctx) at the head's step, which runs unet_head_fwd_z, the loss

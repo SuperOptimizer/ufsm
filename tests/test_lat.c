@@ -65,6 +65,38 @@ int main(void) {
         nn_free(d_lc); nn_free(d_ref); nn_free(d_tmp); nn_free(d_g); nn_free(d_gref); nn_free(d_sl); nn_free(d_gs); nn_free(d_gc);
         free(lc); free(ref); free(g); free(gref); free(gc); free(lc16); free(fine); free(g16);
     }
+    {   /* the guided head (nn_lat_guide): dir 0 against a host reference; dir 1 is its adjoint in the coefficient planes: <fwd(b) - l, g> = <b, bwd(g)> */
+        const int D = 12, H = 8, W = 8, base = 2, NC = base + 5; const size_t hw = (size_t)H * W, fv = (size_t)D * hw;
+        uint16_t *x = malloc(fv * 2); for (size_t k = 0; k < fv; k++) x[k] = f2h(ru());
+        void *d_x = nn_malloc(fv * 2); nn_h2d(d_x, x, fv * 2);
+        static const int Zs[3] = {4, 12, 8};
+        for (int si = 0; si < 3; si++) {
+            const int Z = Zs[si]; double e0 = 0, dot1 = 0, dot2 = 0;
+            for (int z0 = 0; z0 < D; z0 += Z) {
+                const int nz = z0 + Z < D ? Z : D - z0; const size_t ns = (size_t)nz * hw;
+                uint16_t *l = malloc(NC * ns * 2), *o = malloc(NC * ns * 2), *g = malloc(NC * ns * 2), *bg = malloc(NC * ns * 2);
+                for (size_t k = 0; k < NC * ns; k++) { l[k] = f2h(ru()); g[k] = f2h(ru()); }
+                void *d_l = nn_malloc(NC * ns * 2), *d_g = nn_malloc(NC * ns * 2);
+                nn_h2d(d_l, l, NC * ns * 2); nn_lat_guide(d_x, D, H, W, z0, nz, d_l, base, 0, 0); nn_d2h(o, d_l, NC * ns * 2);
+                nn_h2d(d_g, g, NC * ns * 2); nn_lat_guide(d_x, D, H, W, z0, nz, d_g, base, 0, 1); nn_d2h(bg, d_g, NC * ns * 2);
+                for (size_t i = 0; i < ns; i++) {
+                    const int z = z0 + (int)(i / hw), y = (int)(i / W % H), xx = (int)(i % W); const size_t v = (size_t)z * hw + (size_t)y * W + xx;
+                    const float f[4] = {h2f(x[v]), 0.5f * (h2f(x[v + (z + 1 < D ? hw : 0)]) - h2f(x[v - (z > 0 ? hw : 0)])),
+                                        0.5f * (h2f(x[v + (y + 1 < H ? W : 0)]) - h2f(x[v - (y > 0 ? W : 0)])), 0.5f * (h2f(x[v + (xx + 1 < W ? 1 : 0)]) - h2f(x[v - (xx > 0 ? 1 : 0)]))};
+#define BP(k) h2f(l[(base + (k)) * ns + i])
+                    const float t = BP(2) * f[1] + BP(3) * f[2] + BP(4) * f[3], a0 = BP(0) * f[0] + t, a1 = BP(1) * f[0] - t;
+                    e0 = fmax(e0, fabs(h2f(o[i]) - (h2f(l[i]) + a0)) / (1e-2 + fabs(h2f(l[i]) + a0))); e0 = fmax(e0, fabs(h2f(o[ns + i]) - (h2f(l[ns + i]) + a1)) / (1e-2 + fabs(h2f(l[ns + i]) + a1)));
+                    dot1 += (double)a0 * h2f(g[i]) + (double)a1 * h2f(g[ns + i]);
+                    for (int k = 0; k < 5; k++) dot2 += (double)BP(k) * h2f(bg[(base + k) * ns + i]);
+#undef BP
+                }
+                free(l); free(o); free(g); free(bg); nn_free(d_l); nn_free(d_g);
+            }
+            const double de = fabs(dot1 - dot2) / (1e-9 + fabs(dot1)); cases++;
+            if (!(e0 < 3e-3) || !(de < 2e-3)) { fprintf(stderr, "FAIL: guided head, slab %d: forward rel err %.3g, adjoint dot rel err %.3g\n", Z, e0, de); fails++; }
+        }
+        free(x); nn_free(d_x);
+    }
     /* predict: the direct cell-grid input (nn_lat_pred_input) against nn_pred_input_d + nn_lowres_input, and the direct rv bytes
        (nn_lat_place_rv) against nn_lowres_output + nn_rv_fuse + nn_pred_place_d, shards at aligned and odd offsets, uint8 CT and mask bits */
     for (int f16 = 1; f16 >= 0; f16--) {
@@ -85,6 +117,21 @@ int main(void) {
             cases++;
             if (n1 || nd > 4 * cv / 100) { fprintf(stderr, "FAIL: nn_lat_pred_input (f16 %d, axis %d): %zu of %zu values differ, %zu by more than one code\n", f16, axis, nd, 4 * cv, n1); fails++; }
         }
+        if (f16) for (int axis = 0; axis <= 1; axis++) for (int q = 0; q < 2; q++) {   /* a --lat-basis checkpoint's input: C = 5 random axes, with / without the quantiser */
+            const int C = 5; float *bs = malloc(C * 64 * 4), gn[5] = {0.11f, 0.7f, 1.3f, 0.9f, 2.1f};
+            for (int k = 0; k < C * 64; k++) bs[k] = 0.3f * ru();
+            float *d_bs = nn_malloc(C * 64 * 4), *d_gn = nn_malloc(C * 4); void *d_ya = nn_malloc((C + 3) * cv * 2), *d_yb = nn_malloc((C + 3) * cv * 2);
+            uint16_t *ya = malloc((C + 3) * cv * 2), *yb = malloc((C + 3) * cv * 2);
+            nn_h2d(d_bs, bs, C * 64 * 4); nn_h2d(d_gn, gn, C * 4);
+            nn_pred_input_d(d_ct, D, W, 117.3f, 1.f / 41.7f, d_dy, d_dy + D, axis, d_x, 1);
+            nn_lat_input_x(d_x, d, h, h, d_bs, d_gn, C, q ? 0.05f : 0.f, d_ya);
+            nn_lat_pred_input_c(d_ct, D, W, 117.3f, 1.f / 41.7f, d_dy, d_dy + D, axis, d_bs, d_gn, C, q ? 0.05f : 0.f, d_yb);
+            nn_d2h(ya, d_ya, (C + 3) * cv * 2); nn_d2h(yb, d_yb, (C + 3) * cv * 2);
+            size_t nd = 0, n1 = 0; for (size_t k = 0; k < (C + 3) * cv; k++) { nd += ya[k] != yb[k]; n1 += abs((int)ya[k] - (int)yb[k]) > 1; }
+            cases++;
+            if (n1 > (q ? (C + 3) * cv / 500 : 0) || nd > (C + 3) * cv / 50) { fprintf(stderr, "FAIL: nn_lat_pred_input_c (axis %d, step %d): %zu of %zu values differ, %zu by more than one code\n", axis, q, nd, (C + 3) * cv, n1); fails++; }   /* (quantised: a last-bit difference before rint can move a value by a step) */
+            free(bs); free(ya); free(yb); nn_free(d_bs); nn_free(d_gn); nn_free(d_ya); nn_free(d_yb);
+        }
         /* the rv bytes: random side logits on the cell grid */
         float *lc = malloc(2 * cv * 4); uint16_t *lc16 = malloc(2 * cv * 2);
         for (size_t k = 0; k < 2 * cv; k++) { lc16[k] = f2h(3.f * ru()); lc[k] = h2f(lc16[k]); }
@@ -103,6 +150,30 @@ int main(void) {
             size_t nd = 0, n1 = 0, nz = 0; for (size_t k = 0; k < (size_t)S * S * S; k++) { nd += s0[k] != s1[k]; n1 += abs((int)s0[k] - (int)s1[k]) > 1 || (s0[k] == 0) != (s1[k] == 0); nz += s0[k] != 0; }
             cases++;
             if (n1 || nd > nz / 50 + 2 || (oi < 4 && !nz)) { fprintf(stderr, "FAIL: nn_lat_place_rv (f16 %d, offset %d, mode %d): %zu of %zu written bytes differ, %zu by more than 1 or in the mask\n", f16, oi, m, nd, nz, n1); fails++; }
+        }
+        if (f16) {   /* the guided head's direct bytes (nn_lat_place_rvg) against nn_lat_up_slab + nn_lat_guide + nn_rv_fuse + nn_pred_place: 9 cell channels, the coefficients in 4 .. 8 */
+            const int NC = 9, nb = 4; const size_t hw = (size_t)W * W;
+            float *gc = malloc(NC * cv * 4); uint16_t *gc16 = malloc(NC * cv * 2);
+            for (size_t k = 0; k < NC * cv; k++) { gc16[k] = f2h((k < 2 * cv ? 3.f : 0.5f) * ru()); gc[k] = h2f(gc16[k]); }
+            void *d_gc = nn_malloc(NC * cv * 4), *d_g16 = nn_malloc(NC * cv * 2), *d_sl = nn_malloc(7 * w3 * 2);
+            nn_h2d(d_gc, gc, NC * cv * 4); nn_h2d(d_g16, gc16, NC * cv * 2);
+            for (int m = 0; m < 2; m++) {   /* m: fp16 cell logits */
+                const void *src = m ? d_g16 : d_gc; const size_t es = m ? 2 : 4;
+                nn_lat_up_slab(src, m, 2, d, h, h, 0, D, d_sl); nn_lat_up_slab((const char *)src + nb * cv * es, m, 5, d, h, h, 0, D, (char *)d_sl + 2 * w3 * 2);
+                nn_lat_guide(d_x, D, W, W, 0, D, d_sl, 2, 0, 0); nn_rv_fuse(d_sl, w3, 1); nn_set_logits_h16(1);
+                for (int oi = 0; oi < 5; oi++) for (int mb = 0; mb < 2; mb++) {
+                    const int *o = offs[oi], ez = oi == 2 ? 17 : S, ey = oi == 2 ? 19 : S, ex = S;
+                    nn_zero(d_s0, (size_t)S * S * S); nn_zero(d_s1, (size_t)S * S * S);
+                    if (mb) nn_pred_place_m_d(d_sl, d_bits, D, W, hz, halo, o[0], o[1], o[2], ez, ey, ex, S, d_s0); else nn_pred_place_d(d_sl, d_ct, D, W, hz, halo, o[0], o[1], o[2], ez, ey, ex, S, d_s0);
+                    nn_lat_place_rvg(src, m, nb, d, h, h, d_ct, 117.3f, 1.f / 41.7f, mb ? nullptr : d_ct, mb ? d_bits : nullptr, nn_get_pred_iso(), hz, halo, o[0], o[1], o[2], ez, ey, ex, S, d_s1);
+                    nn_d2h(s0, d_s0, (size_t)S * S * S); nn_d2h(s1, d_s1, (size_t)S * S * S);
+                    size_t nd = 0, n1 = 0, nz = 0; for (size_t k = 0; k < (size_t)S * S * S; k++) { nd += s0[k] != s1[k]; n1 += abs((int)s0[k] - (int)s1[k]) > 1 || (s0[k] == 0) != (s1[k] == 0); nz += s0[k] != 0; }
+                    cases++;
+                    if (n1 > nz / 500 || nd > nz / 20 + 2 || (oi < 4 && !nz)) { fprintf(stderr, "FAIL: nn_lat_place_rvg (offset %d, fp16 logits %d, mask %d): %zu of %zu written bytes differ, %zu by more than 1 or in the mask\n", oi, m, mb, nd, nz, n1); fails++; }
+                }
+            }
+            nn_set_logits_h16(0); (void)hw;
+            free(gc); free(gc16); nn_free(d_gc); nn_free(d_g16); nn_free(d_sl);
         }
         nn_free(d_ct); nn_free(d_dy); nn_free(d_x); nn_free(d_t); nn_free(d_a); nn_free(d_b); nn_free(d_lc); nn_free(d_l16); nn_free(d_lt); nn_free(d_lf); nn_free(d_bits); nn_free(d_s0); nn_free(d_s1);
         free(ct); free(dy); free(ha); free(hb); free(lc); free(lc16); free(s0); free(s1);

@@ -195,6 +195,11 @@ extern "C" void nn_input_lat(const void *ct16, shape5 xs, const void *rec, void 
     lp_input_lat(ct16, g_h16 ? 2 : 1, rec, NN_RAD_REC(4 * xs.d), xs.n, xs.d, xs.h, y, ISMX4(y) ? 4 : 8);
     KCHECK();
 }
+extern "C" void nn_input_latc(const void *ct16, shape5 xs, const void *rec, const float *bas, const float *gain, int C, float step, void *y) {
+    if (!ISMX(y) || xs.c != C + 3 || (xs.c != 16 && xs.c != 32) || xs.h != xs.w) { fprintf(stderr, "nn_input_latc: an MX input of C + 3 = 16 or 32 channels, square planes\n"); abort(); }
+    lp_input_latc(ct16, g_h16 ? 2 : 1, rec, NN_RAD_REC(4 * xs.d), xs.n, xs.d, xs.h, bas, gain, C, step, y, ISMX4(y) ? 4 : 8);
+    KCHECK();
+}
 extern "C" void nn_input_rad_pack(const void *ct16, shape5 xs, const void *rec, void *y) {
     if (!ISMX(y) || xs.c != 8 || xs.h != xs.w) { fprintf(stderr, "nn_input_rad_pack: an MX input of 8 channels, square planes\n"); abort(); }
     lp_input_rad_pack(ct16, g_h16 ? 2 : 1, rec, NN_RAD_REC(2 * xs.d), xs.n, xs.d, xs.h, y, ISMX4(y) ? 4 : 8);

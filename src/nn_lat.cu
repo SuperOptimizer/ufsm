@@ -81,6 +81,77 @@ __global__ void lat_adj_k(const f16 *g, int C, int d, int h, int w, int z0, int 
     gc[(size_t)c * d * pl + (size_t)cz * pl + (size_t)cy * w + cx] += s;
 }
 
+/* predict on a --lat-basis checkpoint: input_latc_k's channels from the host-path 4-channel fp16 window */
+__global__ void lat_input_x_k(const f16 *x, int d, int h, int w, const float *bas, const float *gain, int C, float step, f16 *y) {
+    const size_t cv = (size_t)d * h * w, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= cv) return;
+    const int z = (int)(i / ((size_t)h * w)), yy = (int)(i / w % h), xx = (int)(i % w), H = 4 * h, W = 4 * w; const size_t fv = (size_t)64 * cv;
+    float acc[3] = {0.f, 0.f, 0.f}, v[64];
+    for (int k = 0; k < 64; k++) {
+        const size_t j = ((size_t)(4 * z + (k >> 4)) * H + 4 * yy + (k >> 2 & 3)) * W + 4 * xx + (k & 3);
+        v[k] = __half2float(x[j]); for (int c = 0; c < 3; c++) acc[c] += __half2float(x[(size_t)(1 + c) * fv + j]);
+    }
+    for (int c = 0; c < C; c++) {
+        float s = 0.f; for (int k = 0; k < 64; k++) s += bas[c * 64 + k] * v[k];
+        if (step > 0.f) { const float lim = c ? 127.f : 32767.f; s = fminf(lim, fmaxf(-lim, rintf(s / step))) * step; }
+        y[(size_t)c * cv + i] = __float2half_rn(s * gain[c]);
+    }
+    for (int c = 0; c < 3; c++) y[(size_t)(C + c) * cv + i] = __float2half_rn(acc[c] * (1.f / 64.f));
+}
+__global__ void lat_input_q_k(const int8_t *q, const f16 *x, int d, int h, int w, const float *gain, int C, float sraw, float mean, float isd, f16 *y) {
+    const size_t cv = (size_t)d * h * w, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= cv) return;
+    const int z = (int)(i / ((size_t)h * w)), yy = (int)(i / w % h), xx = (int)(i % w), H = 4 * h, W = 4 * w; const size_t fv = (size_t)64 * cv;
+    const int8_t *qc = q + i * (C + 1);
+    const float dc = (float)((int)(uint8_t)qc[0] + 256 * (int)qc[1]) * sraw;
+    y[i] = __float2half_rn((dc - 8.f * mean) * isd * gain[0]);
+    for (int c = 1; c < C; c++) y[(size_t)c * cv + i] = __float2half_rn((float)qc[c + 1] * sraw * isd * gain[c]);
+    float acc[3] = {0.f, 0.f, 0.f};
+    for (int k = 0; k < 64; k++) {
+        const size_t j = ((size_t)(4 * z + (k >> 4)) * H + 4 * yy + (k >> 2 & 3)) * W + 4 * xx + (k & 3);
+        for (int c = 0; c < 3; c++) acc[c] += __half2float(x[(size_t)(1 + c) * fv + j]);
+    }
+    for (int c = 0; c < 3; c++) y[(size_t)(C + c) * cv + i] = __float2half_rn(acc[c] * (1.f / 64.f));
+}
+extern "C" void nn_lat_input_q(const void *q, const void *x, int d, int h, int w, const float *gain, int C, float step_raw, float mean, float isd, void *y) {
+    const size_t cv = (size_t)d * h * w;
+    lat_input_q_k<<<nblk(cv, 128), 128>>>((const int8_t *)q, (const f16 *)x, d, h, w, gain, C, step_raw, mean, isd, (f16 *)y); KCHECK();
+}
+/* The guided head of latent-grid nets (unet_cfg.lat_guide 5: the MX head's weight gradient takes <= 16 outputs, 11 + 5): the two side
+   channels' fine logits are their upsampled coarse logits plus terms in the voxel's z-scored CT value x and its central differences
+   grad x (edge-clamped), with 5 more coarse outputs as coefficients: l_0 += b_0 x + B . grad x, l_1 += b_1 x - B . grad x (the two faces
+   of a sheet lie on opposite sides of its CT ridge: one direction B, opposite signs). The cell grid cannot place a sheet's faces
+   inside a cell; the CT can. One slab [.][nz][H][W] of fp16 planes lg: dir 0 adds the terms to planes c0, c0 + 1 from the
+   coefficient planes base .. base + 4 (b_0, b_1, B_z, B_y, B_x); dir 1 (planes c0, c0 + 1 hold the loss gradient) writes the
+   coefficients' gradients over those planes. x: the window's CT channel [D][H][W] (fp16). */
+__global__ void lat_guide_k(const f16 *x, int D, int H, int W, int z0, int nz, f16 *lg, int base, int c0, int dir) {
+    const size_t hw = (size_t)H * W, ns = (size_t)nz * hw, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= ns) return;
+    const int z = z0 + (int)(i / hw), y = (int)(i / W % H), xx = (int)(i % W);
+    const size_t v = (size_t)z * hw + (size_t)y * W + xx;
+    const float f[4] = {__half2float(x[v]),
+                        0.5f * (__half2float(x[v + (z + 1 < D ? hw : 0)]) - __half2float(x[v - (z > 0 ? hw : 0)])),
+                        0.5f * (__half2float(x[v + (y + 1 < H ? W : 0)]) - __half2float(x[v - (y > 0 ? W : 0)])),
+                        0.5f * (__half2float(x[v + (xx + 1 < W ? 1 : 0)]) - __half2float(x[v - (xx > 0 ? 1 : 0)]))};
+    f16 *b = lg + (size_t)base * ns + i, *l0 = lg + (size_t)c0 * ns + i, *l1 = l0 + ns;
+    if (!dir) {
+        const float t = __half2float(b[2 * ns]) * f[1] + __half2float(b[3 * ns]) * f[2] + __half2float(b[4 * ns]) * f[3];
+        *l0 = __float2half_rn(__half2float(*l0) + __half2float(b[0]) * f[0] + t);
+        *l1 = __float2half_rn(__half2float(*l1) + __half2float(b[ns]) * f[0] - t);
+    } else {
+        const float g0 = __half2float(*l0), g1 = __half2float(*l1), gd = g0 - g1;
+        b[0] = __float2half_rn(g0 * f[0]); b[ns] = __float2half_rn(g1 * f[0]);
+        b[2 * ns] = __float2half_rn(gd * f[1]); b[3 * ns] = __float2half_rn(gd * f[2]); b[4 * ns] = __float2half_rn(gd * f[3]);
+    }
+}
+extern "C" void nn_lat_guide(const void *x, int D, int H, int W, int z0, int nz, void *lg, int base, int c0, int dir) {
+    const size_t ns = (size_t)nz * H * W;
+    lat_guide_k<<<nblk(ns, 256), 256>>>((const f16 *)x, D, H, W, z0, nz, (f16 *)lg, base, c0, dir); KCHECK();
+}
+extern "C" void nn_lat_input_x(const void *x, int d, int h, int w, const float *bas, const float *gain, int C, float step, void *y) {
+    const size_t cv = (size_t)d * h * w;
+    lat_input_x_k<<<nblk(cv, 128), 128>>>((const f16 *)x, d, h, w, bas, gain, C, step, (f16 *)y); KCHECK();
+}
 /* --- the fast paths: slabs of whole coarse planes (z0 and nz multiples of 4; the head slabs are 32 planes) ---
    Per axis the chain collapses to 3 taps: fine 4 c + r reads coarse c - 1, c, c + 1 (edge-clamped; the clamps of the mid grid only occur
    where they fold onto the same edge cell) with the weights LW[r]. One thread per coarse cell writes its 4^3 fine voxels of every channel
@@ -247,6 +318,82 @@ extern "C" void nn_lat_place_rv(const void *lg, int lh16, int d, int h, int w, c
     KCHECK();
 }
 
+/* the same for the guided head (lat_guide_k, dir 0): the two side logits and the 5 coefficient planes (cell channels nb .. nb + 4)
+   upsampled per voxel, each rounded to fp16 as nn_lat_up_slab stores them, the CT terms from the window's bytes ctg (the z-scored value
+   rounded to fp16 as the input stores it, its central differences edge-clamped in the window), the sum and the fused logit rounded to
+   fp16 as lat_guide_k / nn_rv_fuse store them: nn_lat_up_slab + nn_lat_guide + nn_rv_fuse + nn_pred_place without the [7][32][W][W]
+   slabs, the [2][W][W][W] fp16 logits and the 4-channel full-resolution input */
+template <typename T>
+__global__ void lat_place_rvg_k(const T *lg, int nb, int d, int h, int w, const uint8_t *ctg, float mean, float isd, const uint8_t *ct, const uint32_t *bits, int iso,
+                                int z0, int y0, int x0, int z1, int y1, int x1, int oz, int oy, int ox, int shard, uint8_t *dsh) {
+    const int D = 4 * d, H = 4 * h, W = 4 * w, c0z = z0 >> 2, c0y = y0 >> 2, c0x = x0 >> 2, ncy = ((y1 + 3) >> 2) - c0y, ncx = ((x1 + 3) >> 2) - c0x, ncz = ((z1 + 3) >> 2) - c0z;
+    const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= (size_t)ncz * ncy * ncx) return;
+    const int cz = c0z + (int)(i / ((size_t)ncy * ncx)), cy = c0y + (int)(i / ncx % ncy), cx = c0x + (int)(i % ncx);
+    const int iz[3] = {max(cz - 1, 0), cz, min(cz + 1, d - 1)}, iy[3] = {max(cy - 1, 0), cy, min(cy + 1, h - 1)}, ix[3] = {max(cx - 1, 0), cx, min(cx + 1, w - 1)};
+    const size_t cv = (size_t)d * h * w, hw = (size_t)H * W;
+    float v[7][3][3][3];
+    for (int c = 0; c < 7; c++)
+#pragma unroll
+        for (int a = 0; a < 3; a++)
+#pragma unroll
+            for (int b = 0; b < 3; b++) {
+                const size_t row = (size_t)(c < 2 ? c : nb + c - 2) * cv + ((size_t)iz[a] * h + iy[b]) * w;
+#pragma unroll
+                for (int e = 0; e < 3; e++) v[c][a][b][e] = ldv(lg, row + ix[e]);
+            }
+#define XH(k_) __half2float(__float2half(((float)ctg[k_] - mean) * isd))
+    for (int rz = 0; rz < 4; rz++) {
+        const int z = 4 * cz + rz;
+        if (z < z0 || z >= z1) continue;
+        for (int ry = 0; ry < 4; ry++) {
+            const int y = 4 * cy + ry;
+            if (y < y0 || y >= y1) continue;
+            float q[7][3];
+            for (int c = 0; c < 7; c++)
+#pragma unroll
+                for (int e = 0; e < 3; e++) {
+                    float p[3];
+#pragma unroll
+                    for (int b = 0; b < 3; b++) p[b] = LW[rz][0] * v[c][0][b][e] + LW[rz][1] * v[c][1][b][e] + LW[rz][2] * v[c][2][b][e];
+                    q[c][e] = LW[ry][0] * p[0] + LW[ry][1] * p[1] + LW[ry][2] * p[2];
+                }
+            const size_t kr = ((size_t)z * H + y) * W, gr = ((size_t)(oz + z) * shard + (oy + y)) * shard + ox;
+            for (int rx = 0; rx < 4; rx++) {
+                const int x = 4 * cx + rx;
+                if (x < x0 || x >= x1) continue;
+                const size_t k = kr + x;
+                uint8_t o = 0;
+                if (ct ? ct[k] >= iso : (bits[k >> 5] >> (k & 31)) & 1u) {
+                    float u[7];
+#pragma unroll
+                    for (int c = 0; c < 7; c++) u[c] = __half2float(__float2half_rn(LW[rx][0] * q[c][0] + LW[rx][1] * q[c][1] + LW[rx][2] * q[c][2]));
+                    const float f0 = XH(k), f1 = 0.5f * (XH(k + (z + 1 < D ? hw : 0)) - XH(k - (z > 0 ? hw : 0))),
+                                f2 = 0.5f * (XH(k + (y + 1 < H ? W : 0)) - XH(k - (y > 0 ? W : 0))), f3 = 0.5f * (XH(k + (x + 1 < W ? 1 : 0)) - XH(k - (x > 0 ? 1 : 0)));
+                    const float t = u[4] * f1 + u[5] * f2 + u[6] * f3;
+                    const float a = __half2float(__float2half_rn(u[0] + u[2] * f0 + t)), b = __half2float(__float2half_rn(u[1] + u[3] * f0 - t));
+                    const float pr = 1.f / (1.f + __expf(-a)), pv = 1.f / (1.f + __expf(-b));
+                    float f = (1.f + 254.f * (0.5f + 0.5f * (pr - pv))) / 255.f; f = fminf(fmaxf(f, 1.5f / 255.f), 1.f - 1e-4f);   /* (nn_rv_fuse, fp16) */
+                    const float l = __half2float(__float2half(__logf(f / (1.f - f))));
+                    o = (uint8_t)(255.f / (1.f + __expf(-l)) + 0.5f);   /* (nn_pred_place) */
+                }
+                dsh[gr + x] = o;
+            }
+        }
+    }
+#undef XH
+}
+extern "C" void nn_lat_place_rvg(const void *lg, int lh16, int nb, int d, int h, int w, const uint8_t *ctg, float mean, float isd, const uint8_t *ct, const uint32_t *bits,
+                                 int iso, int hz, int halo, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh) {
+    const int D = 4 * d, H = 4 * h, W = 4 * w;
+    const int z0 = max(hz, -oz), y0 = max(halo, -oy), x0 = max(halo, -ox), z1 = min(D - hz, ez - oz), y1 = min(H - halo, ey - oy), x1 = min(W - halo, ex - ox);
+    if (z1 <= z0 || y1 <= y0 || x1 <= x0) return;
+    const size_t n = (size_t)(((z1 + 3) >> 2) - (z0 >> 2)) * (((y1 + 3) >> 2) - (y0 >> 2)) * (((x1 + 3) >> 2) - (x0 >> 2));
+    if (lh16) lat_place_rvg_k<f16><<<nblk(n, 128), 128>>>((const f16 *)lg, nb, d, h, w, ctg, mean, isd, ct, bits, iso, z0, y0, x0, z1, y1, x1, oz, oy, ox, shard, dsh);
+    else lat_place_rvg_k<float><<<nblk(n, 128), 128>>>((const float *)lg, nb, d, h, w, ctg, mean, isd, ct, bits, iso, z0, y0, x0, z1, y1, x1, oz, oy, ox, shard, dsh);
+    KCHECK();
+}
+
 /* predict on a latent-grid net: the network's input (4 channels on the cell grid, 16-bit storage) straight from the uint8 CT window:
    per cell the 4^3 voxel values of pred_in_k (rounded to the storage type as it stores them), averaged over 2^3 twice as
    nn_lowres_input does (each mean rounded to the storage type, the same summation order): the same values without the window's
@@ -272,6 +419,34 @@ __global__ void lat_pred_in_k(const uint8_t *ct, int D, int W, float mean, float
         for (int c = 0; c < 3; c++) o[c] += h2f<HT>(f2h<HT>(0.125f * s[c]));
     }
     y[i] = f2h<HT>(0.125f * o[0]); y[cv + i] = f2h<HT>(0.f); y[2 * cv + i] = f2h<HT>(0.125f * o[1]); y[3 * cv + i] = f2h<HT>(0.125f * o[2]);
+}
+/* the same for a --lat-basis checkpoint: lat_input_x_k's channels (C projections of the cell's 64 z-scored CT values onto the basis,
+   quantised by step, times the gains; then the cell means of input channels 1-3) from the CT bytes, each voxel value rounded to fp16
+   as pred_in_k stores it, the same summation order */
+__global__ void lat_pred_in_bas_k(const uint8_t *ct, int D, int W, float mean, float isd, const float *dyo, const float *dxo, int axis,
+                                  const float *bas, const float *gain, int C, float step, f16 *y) {
+    const int d = D / 4, h = W / 4;
+    const size_t cv = (size_t)d * h * h, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= cv) return;
+    const int z = (int)(i / ((size_t)h * h)), yy = (int)(i / h % h), xx = (int)(i % h);
+    float acc[3] = {0.f, 0.f, 0.f}, v[64];
+    for (int k = 0; k < 64; k++) {
+        const int fz = 4 * z + (k >> 4), fy = 4 * yy + (k >> 2 & 3), fx = 4 * xx + (k & 3);
+        const float dy = dyo[fz] + (float)fy, dx = dxo[fz] + (float)fx, inv = axis ? (float)axis / (sqrtf(dy * dy + dx * dx) + 1e-6f) : 0.f;
+        v[k] = __half2float(__float2half(((float)ct[((size_t)fz * W + fy) * W + fx] - mean) * isd));
+        acc[1] += __half2float(__float2half(dy * inv)); acc[2] += __half2float(__float2half(dx * inv));
+    }
+    for (int c = 0; c < C; c++) {
+        float s = 0.f; for (int k = 0; k < 64; k++) s += bas[c * 64 + k] * v[k];
+        if (step > 0.f) { const float lim = c ? 127.f : 32767.f; s = fminf(lim, fmaxf(-lim, rintf(s / step))) * step; }
+        y[(size_t)c * cv + i] = __float2half_rn(s * gain[c]);
+    }
+    for (int c = 0; c < 3; c++) y[(size_t)(C + c) * cv + i] = __float2half_rn(acc[c] * (1.f / 64.f));
+}
+extern "C" void nn_lat_pred_input_c(const uint8_t *ct, int D, int W, float mean, float isd, const float *dyo, const float *dxo, int axis,
+                                    const float *bas, const float *gain, int C, float step, void *y) {
+    const size_t cv = (size_t)(D / 4) * (W / 4) * (W / 4);
+    lat_pred_in_bas_k<<<nblk(cv, 128), 128>>>(ct, D, W, mean, isd, dyo, dxo, axis, bas, gain, C, step, (f16 *)y); KCHECK();
 }
 extern "C" void nn_lat_pred_input(const uint8_t *ct, int D, int W, float mean, float isd, const float *dyo, const float *dxo, int axis, void *y) {
     const size_t cv = (size_t)(D / 4) * (W / 4) * (W / 4);
