@@ -208,6 +208,13 @@ void nn_lat_up_adj_c(const void *g, int C, int d, int h, int w, int z0, int nz, 
 void nn_lat_shuffle_c(const void *lg, int lh16, int d, int h, int w, int base, int ng, int z0, int nz, void *y, int q0, int qd);
 void nn_lat_shuffle_adj_c(const void *g, int d, int h, int w, int base, int ng, int z0, int nz, void *gc, int q0, int qd);
 void nn_lat_grad_fin(const float *a, int nf, const void *sb, int C, size_t pl, int cap, int i0, int np, void *gc);
+/* the head slabs' gradient pass fused for one loss group (nn_lat.cu): upsample + guide + BCE logit gradient + transposed upsample
+   without the fp16 slab; part: nn_lat_fuse_part bytes of scratch */
+size_t nn_lat_fuse_part(int n, int h, int w, int nz);
+void nn_lat_fuse_grad(const void *lg, int lh16, int lq0, int lqd, int d, int h, int w, int z0, int nz, int c0, int n, int guide, int gb, const void *x,
+                      const uint8_t *t, const uint8_t *m, const uint8_t *wch, const float *st, float pw, float rec_w, int unit_c, const float *lam,
+                      float *part, float *gc, int gq0, int gqd);
+void nn_loss_cfg_get(float *pw, float *rec_w, int *unit7);   /* the BCE's positive weight, --recall weight, 7-channel unit-mask channel */
 void nn_lat_grad_carry(float *a, int nf, void *sb, int C, size_t pl, int cap, int from, int n);
 void nn_lat_up_adj(const void *g, int C, int d, int h, int w, int z0, int nz, float *gc, void *scratch);   /* scratch: C nz h w fp32 for the separable path (z0, nz multiples of 4), or nullptr */
 int nn_lat_set_slow(int on);   /* the per-voxel kernels for every slab (UFSM_LAT_SLOW=1; train's UFSM_LAT_CHECK compares against them); returns the previous setting */

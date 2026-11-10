@@ -646,3 +646,194 @@ extern "C" void nn_lat_pred_input_q(const void *q, int D, int W, float mean, flo
     const size_t cv = (size_t)(D / 4) * (W / 4) * (W / 4);
     lat_pred_in_q_k<<<nblk(cv, 128), 128>>>((const int8_t *)q, D, W, mean, isd, dyo, dxo, axis, gain, C, step_raw, (f16 *)y); KCHECK();
 }
+
+/* --- the head slabs' gradient pass fused (train --lat, streamed head): per coarse cell its 4^3 fine logits (lat_up4_k's arithmetic, each
+   rounded to fp16 as the slab stored it), the guided head's terms (lat_guide_k), the BCE logit gradient (loss_grad_v, rounded to fp16
+   and scaled as nn_loss_grad_only / nn_loss_grad_scale left it) and the transposed upsampling of that gradient onto the cell's 3^3
+   neighbourhood, without the fp16 slab in between: the slab path moved ~8 bytes per fine voxel and channel through memory (upsample
+   store, gradient load and store, adjoint load), this one the targets and 27 fp32 partials per cell and channel (1.7 B per voxel).
+   Stage 1 (lat_fuse_k): one thread per coarse cell of the slab writes part[k][slot][cell], slot = (a 3 + b) 3 + e the neighbour
+   (iz[a], iy[b], ix[e]) of lat_up4_k. Stage 2 (lat_fuse_fin_k): every coarse cell gathers the partials addressed to it in a fixed
+   order (no atomics: the same bits every run) and adds them to the rolling gradient planes. The values are those of the slab path;
+   the sums associate differently (fp32 rounding). Groups: n plain BCE channels c0 .. c0 + n - 1 (targets t [n][ns], one mask), or
+   guide 1: the two side channels c0, c0 + 1 with the 5 coefficient channels gb .. gb + 4 (part k = 2 .. 6). */
+struct fuse_lam { float v[7]; };
+template <typename T>
+__global__ void lat_fuse_k(const T *lg, int qd, int q0, int d, int h, int w, int z0, int nz, int c0, int n, int guide, int gb, const f16 *x, const uint8_t *t,
+                           const uint8_t *m, const uint8_t *wch, const float *st, float pw, float gscale, float rec_w, int unit_c, fuse_lam lam, float *part) {
+    const int H = 4 * h, W = 4 * w, D = 4 * d, C = guide ? 2 : n, nk = guide ? 7 : n;
+    const size_t pl = (size_t)h * w, ncs = (size_t)(nz / 4) * pl, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= ncs) return;
+    const int sz = (int)(i / pl), cz = z0 / 4 + sz, cy = (int)(i / w % h), cx = (int)(i % w);
+    const int iz[3] = {max(cz - 1, 0), cz, min(cz + 1, d - 1)}, iy[3] = {max(cy - 1, 0), cy, min(cy + 1, h - 1)}, ix[3] = {max(cx - 1, 0), cx, min(cx + 1, w - 1)};
+    const size_t cv = (size_t)qd * pl, hw = (size_t)H * W, ns = (size_t)nz * hw;
+    const float *fin = st + (size_t)5 * C;
+    if (!guide) {
+        for (int k = 0; k < n; k++) {
+            const T *l = lg + (size_t)(c0 + k) * cv;
+            const bool on = wch[k] != 0, unit = k == unit_c;
+            float v[3][3][3], ga[3][3][3];
+#pragma unroll
+            for (int a = 0; a < 3; a++)
+#pragma unroll
+                for (int b = 0; b < 3; b++) {
+                    const size_t row = ((size_t)(iz[a] - q0) * h + iy[b]) * w;
+#pragma unroll
+                    for (int e = 0; e < 3; e++) { v[a][b][e] = ldv(l, row + ix[e]); ga[a][b][e] = 0.f; }
+                }
+            if (on) {
+#pragma unroll
+                for (int rz = 0; rz < 4; rz++) {
+                    float p[3][3], gp[3][3];
+#pragma unroll
+                    for (int b = 0; b < 3; b++)
+#pragma unroll
+                        for (int e = 0; e < 3; e++) { p[b][e] = LW[rz][0] * v[0][b][e] + LW[rz][1] * v[1][b][e] + LW[rz][2] * v[2][b][e]; gp[b][e] = 0.f; }
+#pragma unroll
+                    for (int ry = 0; ry < 4; ry++) {
+                        float q[3], gq[3] = {0.f, 0.f, 0.f};
+#pragma unroll
+                        for (int e = 0; e < 3; e++) q[e] = LW[ry][0] * p[0][e] + LW[ry][1] * p[1][e] + LW[ry][2] * p[2][e];
+                        const size_t vr = ((size_t)(4 * sz + rz) * H + 4 * cy + ry) * W + 4 * cx;
+                        const unsigned m4 = *(const unsigned *)(m + vr);
+                        if (m4) {
+                            const unsigned t4 = *(const unsigned *)(t + (size_t)k * ns + vr);
+#pragma unroll
+                            for (int rx = 0; rx < 4; rx++) {
+                                unsigned mb = m4 >> (8 * rx) & 255u; if (unit && mb) mb = 1u;
+                                if (!mb) continue;
+                                const float u = __half2float(__float2half_rn(LW[rx][0] * q[0] + LW[rx][1] * q[1] + LW[rx][2] * q[2]));
+                                float g = __half2float(loss_grad_v<f16, f16>(nullptr, C, ns, st, 0.f, fin, pw, gscale, 0, nullptr, D, H, W, rec_w, k, 0, vr + rx, u, t4 >> (8 * rx) & 255u, mb));
+                                if (lam.v[k] != 1.f) g = __half2float(f2h<f16>(lam.v[k] * g));
+#pragma unroll
+                                for (int e = 0; e < 3; e++) gq[e] += LW[rx][e] * g;
+                            }
+                        }
+#pragma unroll
+                        for (int b = 0; b < 3; b++)
+#pragma unroll
+                            for (int e = 0; e < 3; e++) gp[b][e] += LW[ry][b] * gq[e];
+                    }
+#pragma unroll
+                    for (int a = 0; a < 3; a++)
+#pragma unroll
+                        for (int b = 0; b < 3; b++)
+#pragma unroll
+                            for (int e = 0; e < 3; e++) ga[a][b][e] += LW[rz][a] * gp[b][e];
+                }
+            }
+#pragma unroll
+            for (int a = 0; a < 3; a++)
+#pragma unroll
+                for (int b = 0; b < 3; b++)
+#pragma unroll
+                    for (int e = 0; e < 3; e++) part[((size_t)k * 27 + (a * 3 + b) * 3 + e) * ncs + i] = ga[a][b][e];
+        }
+        return;
+    }
+    /* the guided side pair: 7 cell channels at once */
+    float v[7][27], ga[7][27];
+    for (int k = 0; k < 7; k++) {
+        const T *l = lg + (size_t)(k < 2 ? c0 + k : gb + k - 2) * cv;
+        for (int a = 0; a < 3; a++)
+            for (int b = 0; b < 3; b++) {
+                const size_t row = ((size_t)(iz[a] - q0) * h + iy[b]) * w;
+                for (int e = 0; e < 3; e++) { v[k][(a * 3 + b) * 3 + e] = ldv(l, row + ix[e]); ga[k][(a * 3 + b) * 3 + e] = 0.f; }
+            }
+    }
+    const bool on0 = wch[0] != 0, on1 = wch[1] != 0;
+    for (int rz = 0; rz < 4; rz++) {
+        float p[7][9], gp[7][9];
+        for (int k = 0; k < 7; k++)
+            for (int j = 0; j < 9; j++) { p[k][j] = LW[rz][0] * v[k][j] + LW[rz][1] * v[k][9 + j] + LW[rz][2] * v[k][18 + j]; gp[k][j] = 0.f; }
+        const int z = z0 + 4 * sz + rz;
+        for (int ry = 0; ry < 4; ry++) {
+            float q[7][3], gq[7][3];
+            for (int k = 0; k < 7; k++)
+                for (int e = 0; e < 3; e++) { q[k][e] = LW[ry][0] * p[k][e] + LW[ry][1] * p[k][3 + e] + LW[ry][2] * p[k][6 + e]; gq[k][e] = 0.f; }
+            const int y = 4 * cy + ry;
+            const size_t vr = ((size_t)(4 * sz + rz) * H + y) * W + 4 * cx;
+            const unsigned m4 = *(const unsigned *)(m + vr);
+            if (m4) {
+                const unsigned ta = *(const unsigned *)(t + vr), tb = *(const unsigned *)(t + ns + vr);
+                for (int rx = 0; rx < 4; rx++) {
+                    const unsigned mb = m4 >> (8 * rx) & 255u;
+                    if (!mb) continue;
+                    const int xx = 4 * cx + rx;
+                    const size_t gv = (size_t)z * hw + (size_t)y * W + xx;
+                    const float f0 = __half2float(x[gv]),
+                                f1 = 0.5f * (__half2float(x[gv + (z + 1 < D ? hw : 0)]) - __half2float(x[gv - (z > 0 ? hw : 0)])),
+                                f2 = 0.5f * (__half2float(x[gv + (y + 1 < H ? W : 0)]) - __half2float(x[gv - (y > 0 ? W : 0)])),
+                                f3 = 0.5f * (__half2float(x[gv + (xx + 1 < W ? 1 : 0)]) - __half2float(x[gv - (xx > 0 ? 1 : 0)]));
+                    float u[7];
+                    for (int k = 0; k < 7; k++) u[k] = __half2float(__float2half_rn(LW[rx][0] * q[k][0] + LW[rx][1] * q[k][1] + LW[rx][2] * q[k][2]));
+                    const float tt = u[4] * f1 + u[5] * f2 + u[6] * f3;
+                    const float l0 = __half2float(__float2half_rn(u[0] + u[2] * f0 + tt)), l1 = __half2float(__float2half_rn(u[1] + u[3] * f0 - tt));
+                    float g0 = on0 ? __half2float(loss_grad_v<f16, f16>(nullptr, 2, ns, st, 0.f, fin, pw, gscale, 0, nullptr, D, H, W, rec_w, 0, 0, vr + rx, l0, ta >> (8 * rx) & 255u, mb)) : 0.f;
+                    float g1 = on1 ? __half2float(loss_grad_v<f16, f16>(nullptr, 2, ns, st, 0.f, fin, pw, gscale, 0, nullptr, D, H, W, rec_w, 1, 0, vr + rx, l1, tb >> (8 * rx) & 255u, mb)) : 0.f;
+                    if (lam.v[0] != 1.f) { g0 = __half2float(f2h<f16>(lam.v[0] * g0)); g1 = __half2float(f2h<f16>(lam.v[0] * g1)); }
+                    const float gd = g0 - g1;
+                    const float gk[7] = {g0, g1, __half2float(__float2half_rn(g0 * f0)), __half2float(__float2half_rn(g1 * f0)), __half2float(__float2half_rn(gd * f1)),
+                                         __half2float(__float2half_rn(gd * f2)), __half2float(__float2half_rn(gd * f3))};
+                    for (int k = 0; k < 7; k++)
+                        for (int e = 0; e < 3; e++) gq[k][e] += LW[rx][e] * gk[k];
+                }
+            }
+            for (int k = 0; k < 7; k++)
+                for (int b = 0; b < 3; b++)
+                    for (int e = 0; e < 3; e++) gp[k][b * 3 + e] += LW[ry][b] * gq[k][e];
+        }
+        for (int k = 0; k < 7; k++)
+            for (int a = 0; a < 3; a++)
+                for (int j = 0; j < 9; j++) ga[k][a * 9 + j] += LW[rz][a] * gp[k][j];
+    }
+    for (int k = 0; k < nk; k++)
+        for (int s = 0; s < 27; s++) part[((size_t)k * 27 + s) * ncs + i] = ga[k][s];
+}
+/* the (source cell, slot) pairs along one axis whose neighbour is cell c of n: c - 1 (slot 2), c (1), c + 1 (0), and the clamped folds */
+__device__ __forceinline__ int fuse_src(int c, int n, int *src, int *slot) {
+    int k = 0;
+    if (c > 0) { src[k] = c - 1; slot[k++] = 2; }
+    src[k] = c; slot[k++] = 1;
+    if (c + 1 < n) { src[k] = c + 1; slot[k++] = 0; }
+    if (c == 0) { src[k] = 0; slot[k++] = 0; }
+    if (c == n - 1) { src[k] = n - 1; slot[k++] = 2; }
+    return k;
+}
+__global__ void lat_fuse_fin_k(const float *part, int nk, int d, int h, int w, int z0, int nz, int cz0, int cz1, float *gc, int q0, int qd, int c0, int gb) {
+    const size_t pl = (size_t)h * w, nc = (size_t)(cz1 - cz0) * pl, ncs = (size_t)(nz / 4) * pl, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= nc * nk) return;
+    const int k = (int)(i / nc); const size_t v = i % nc;
+    const int cz = cz0 + (int)(v / pl), cy = (int)(v % pl / w), cx = (int)(v % w), s0 = z0 / 4, sn = nz / 4;
+    int zs[4], za[4], ys[4], ya[4], xs[4], xa[4];
+    const int nzs = fuse_src(cz, d, zs, za), nys = fuse_src(cy, h, ys, ya), nxs = fuse_src(cx, w, xs, xa);
+    const float *pk = part + (size_t)k * 27 * ncs;
+    float s = 0.f;
+    for (int a = 0; a < nzs; a++) {
+        if (zs[a] < s0 || zs[a] >= s0 + sn) continue;
+        float sy = 0.f;
+        for (int b = 0; b < nys; b++) {
+            float sx = 0.f;
+            for (int e = 0; e < nxs; e++) sx += pk[(size_t)((za[a] * 3 + ya[b]) * 3 + xa[e]) * ncs + ((size_t)(zs[a] - s0) * h + ys[b]) * w + xs[e]];
+            sy += sx;
+        }
+        s += sy;
+    }
+    const int ch = gb >= 0 && k >= 2 ? gb + k - 2 : c0 + k;
+    gc[((size_t)ch * qd + (cz - q0)) * pl + (size_t)cy * w + cx] += s;
+}
+/* lg: the cell logits [.][lqd][h][w] from plane lq0 (fp16 if lh16); st: the group's loss scratch (nn_loss_stats_fin); part: 27 n
+   floats per coarse cell of the slab (n = 7 for a guided group); gc: the rolling gradient planes [.][gqd][h][w] from plane gq0 */
+extern "C" size_t nn_lat_fuse_part(int n, int h, int w, int nz) { return (size_t)n * 27 * (nz / 4) * h * w * sizeof(float); }
+extern "C" void nn_lat_fuse_grad(const void *lg, int lh16, int lq0, int lqd, int d, int h, int w, int z0, int nz, int c0, int n, int guide, int gb, const void *x,
+                                 const uint8_t *t, const uint8_t *m, const uint8_t *wch, const float *st, float pw, float rec_w, int unit_c, const float *lam,
+                                 float *part, float *gc, int gq0, int gqd) {
+    if (z0 % 4 || nz % 4 || n > 7 || (guide && n != 2)) { fprintf(stderr, "nn_lat_fuse_grad: whole coarse planes, at most 7 channels (a guided pair: 2)\n"); abort(); }
+    fuse_lam L; for (int k = 0; k < 7; k++) L.v[k] = k < n ? lam[k] : 1.f;
+    const int nk = guide ? 7 : n; const size_t ncs = (size_t)(nz / 4) * h * w;
+    if (lh16) lat_fuse_k<f16><<<nblk(ncs, 128), 128>>>((const f16 *)lg, lqd, lq0, d, h, w, z0, nz, c0, n, guide, gb, (const f16 *)x, t, m, wch, st, pw, g_gscale, rec_w, unit_c, L, part);
+    else lat_fuse_k<float><<<nblk(ncs, 128), 128>>>((const float *)lg, lqd, lq0, d, h, w, z0, nz, c0, n, guide, gb, (const f16 *)x, t, m, wch, st, pw, g_gscale, rec_w, unit_c, L, part);
+    const int a0 = max(z0 / 4 - 1, 0), a1 = min((z0 + nz) / 4 + 1, d);
+    lat_fuse_fin_k<<<nblk((size_t)(a1 - a0) * h * w * nk, 256), 256>>>(part, nk, d, h, w, z0, nz, a0, a1, gc, gq0, gqd, c0, guide ? gb : -1);
+    KCHECK();
+}
