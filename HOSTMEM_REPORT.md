@@ -273,3 +273,68 @@ Caveats:
   the thread (byte-identical; test_wind4 OK).
 - THP: worker-scratch MADV_HUGEPAGE is now used by default only with host warps (--gpu-aug < 2) and MemFree > 16 GB at sampler
   start. UFSM_SAMPLER_THP=0/1 forces it either way.
+
+## Round 3: replay interleave, decode into the window, fewer passes (2026-11-09)
+Commits: 001274f (replay interleave), fbda89d / 491b3e9 / 72c5d5e / 1068d87 / 3948381 (pass cuts), 145368d (z3 window sink),
+f089678 (rng jump-ahead). origin/latcomp-20261109 is merged in. At every step the batches are byte-identical (`--det 1` plane
+hashes, 24 P512 windows; also with --min-phase 0.3, which rejected 5 windows, and with air / cutout / dropslice at p 0.4, compared
+against the round-2b binary).
+
+### Window replay, interleaved (`--replay K --replay-gap G`)
+- A window that has replays left keeps its slot. Its next use is handed out G batches after its previous one (FIFO over the
+  released windows).
+- Non-det: a replay can come earlier only when no new window is ready. `--det 1`: a replay is also forced when its slot holds the
+  next batch index. Every decision depends only on the trainer's call order, so runs are deterministic.
+- Default G = (slots - workers) K / (K - 1), clamped to 2 .. slots. A held window keeps its slot for ~(K-1) G / K batches per new
+  window, and this G leaves every worker a slot to build in. For more spacing, add slots: `--sampler-slots workers + 2 + extra`.
+  With K=3 about 1/3 of the workers are needed, so trading workers (4 B/vox each) for slots (5 B/vox each) is about RAM-neutral.
+- Measured: two `--det 1 --replay 3` runs are byte-identical; K=1 is unchanged. P512, 4 workers, 6 slots, K=3: the mean distance
+  between uses of a window is 3.3-4.5 batches, and 0-4 of ~40 uses are adjacent. Mvox/s matches the back-to-back order within noise.
+  A 40-step GPU-1 run at P512 (K=3, 3 workers, 8 slots, G=7) trains normally.
+- Delivered loader rate (P512, 4 workers, 6 slots, non-det, load avg ~8): K=1 428 Mvox/s, K=2 773, K=3 985. The round-2b numbers
+  (131 / 245 / 375) were taken at load ~25; the box's load moves these by 2-3x.
+
+What stays the same across the K uses (everything done on the CPU before upload):
+- source, level and window position
+- the CT bytes (ct8) and every label plane (side, w4, wcomp, ink, tm)
+- the CPU warps (--aug-crush / tear / delam / curv) and the zoom-out read
+- the axis jitter (the umbilicus estimate)
+- the label-touching scanner ops: seam, air, dropped slices, cutouts, chunk dropouts
+- the --ct-aug noise sigma
+
+What is new on each use (on the device):
+- the cube symmetry
+- the rotation / elastic / zoom-in / affine warp (a rotation is forced when none is drawn)
+- the scanner plan of the intensity ops (blur, noise, paganin, tone, ring, quant, bias, cupping, lowres, sharpen, ...)
+- the intensity jitter and the noise seed
+
+### Loader CPU
+| change | effect |
+|---|---|
+| z3 window sink (145368d): lossy, lossless-coded and constant volcomp chunks decode straight into the request box. There is no 128^3 chunk buffer and no copy_chunk; blocks outside the box are entropy-decoded but skip the IDCT / rebuild. Not used for z3_read_sub, device sinks, the shared cache or the GPU decoder. | single-thread 512^3 reads: phase -12.5% CPU, CT -2.6% |
+| xoshiro jump-ahead (f089678): the P^3/4 skipped draws become one GF(2) matrix T^n (built once per count, self-tested at sampler start) | -1.6% instructions |
+| the ink-channel zeroing skipped when unread; the ignore mask written by the first labelled channel, or lazily zeroed (only papyrus labels, the sheet prior, the host scanner path or ignore-writing scanner ops need it); the CT->ct8 copy fused into scan_plan_notair; the --rv papyrus plane built from ct8 in the mask pass; the loss mask not written when nothing reads it (tdead); the --min-phase count taken inside phase_air | ~5 P^3 passes / streams fewer per window |
+
+Total, A/B against the round-2b binary (P512 --det 1, 24 windows, alternating runs, user+sys CPU per Gvox):
+- load ~8: 13.08 -> 11.81 (-9.7%), new faster in 3 of 4 pairs
+- earlier, load ~8-10: 12.86 -> 12.17 (-5.4%), new faster in 4 of 5 pairs
+
+So about -5 to -10%. The machine's load (production loaders) moves single runs by +-20%, so only paired runs are meaningful.
+
+Profile now (P512, perf):
+- volcomp decode ~30% (the lossless phase's entropy decode ~19%, lossy CT ~11%)
+- band_wind4 + w4_tiled 17%
+- phase_air 7%, sym_u8 6%, scan_plan_notair 6%
+- the mask / ink pass, which is DRAM-bound (four streams)
+- memset 4.5%: the w4 / wcomp 255 fill of windows without a stored phase, plus fill_part
+
+### Not done
+- **band_wind4:** waiting for the perf agent to say who takes it (it was asked to move band_wind4 / symmetry to the GPU). band.c
+  is untouched.
+- **Faster lossless phase codec:** a format change, so every phase store would need re-encoding. Not started.
+- **Ink plane from ct8 plus a 1-bit known mask** (-0.875 B/vox per slot): needs the trainer's upload paths (lab_upload, label
+  streaming) and a device kernel. Not started, pending the lead's call; replay lowers the worker count, which already cuts RAM.
+- **The w4 / wcomp unknown fill (2 P^3 memsets) as a per-window device fill:** a trainer change.
+- **Tests:** the CPU fast tier plus the GPU / sampler tests on GPU 1 pass (15/15). With `-g none`, 10 tests that need CUDA but
+  have no `gpu` tag fail on master too: test_gpu_input, test_unwrap2_sampler, test_l0_stream, test_gpu_aug, test_fit*,
+  test_wtrunk, test_nn.

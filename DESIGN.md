@@ -137,6 +137,11 @@ has the full tables and what was measured on a busy GPU.
   window, byte-identical). Loader CPU -11% per window (fused / skipped P^3 passes; P512 --det: 5.92 -> 5.25 thread-s, cycles -9%); per
   worker 4 B/vox (phase built in place). The loader is CPU / DRAM-bandwidth bound at ~25-30 Mvox/s per core (decode 25%, wind4 25%);
   reads ~0.33 B/vox, 80% phase labels, page-cache hit ~0: UFSM_STORE_NOCACHE=1; THP madvise off with --gpu-aug 2 (compaction stalls).
+- Round 3: `--replay K` interleaved (`--replay-gap G`, FIFO, default (S - W) K / (K - 1); --det 1 byte-identical between runs). P512 W4
+  S6 at load ~8: K=1 428, K=2 773, K=3 985 Mvox/s delivered. z3_read decodes volcomp chunks straight into the request box (window sink,
+  UFSM_Z3_SINK=0 off; tests/test_z3_sink): phase reads -12.5% CPU. xoshiro GF(2) jump-ahead for skipped draws; five more P^3 passes /
+  streams cut (the ignore and loss masks only when read, the rv plane from ct8). Loader -5..-10% CPU per Gvox vs round 2b (paired A/B),
+  batches byte-identical.
 
 ## Own dense embedding net (dino-train) and the dinovol port (2026-10-21/22)
 - `ufsm dinovol-embed` runs the scrollprize dinovol ViT (HF scrollprize/dinovol_8um_ps192_102126) in C/CUDA with embed_volume.py's
