@@ -2229,6 +2229,10 @@ int cmd_train(int argc, char **argv) {
                 if (w4map && g_ink2) unet_head_row_reset(d->u, g_ink2_ch, (float)atof(opt(argc, argv, "--ink-bias", "-2")));   /* (a fresh ink row: zero weights, the prior bias; the donor's function elsewhere) */
                 if (g == 0) fprintf(stderr, "initialised %d layer tensors from %s (the rest fresh)\n", nt, init_from);
             }
+            if (g_lat_guide == 64) {   /* the sub-cell outputs start at zero: the net begins as the interpolated head (random rows gave a 4-voxel lattice wherever the labels do not reach) */
+                for (int co = 16; co < cfg.cout; co++) unet_head_row_reset(d->u, co, 0.f);
+                if (g == 0) fprintf(stderr, "sub-cell head: outputs 16-%d start at zero\n", cfg.cout - 1);
+            }
             if (g_sheet && unet_start_sheet(d->u)) return 2;
         }
         if (wq) unet_set_wq(d->u, wq);
