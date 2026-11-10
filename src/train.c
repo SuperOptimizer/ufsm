@@ -390,8 +390,10 @@ static int val_fields(batch *b, int B, size_t p3, void **f[VAL_NF], size_t sz[VA
     if (g_aff) VF(b->band, (size_t)B * p3);
     if (g_side) VF(b->side, (size_t)B * p3);
     if (g_unwrap) VF(b->pm, (size_t)B * p3);
-    if (g_unwrap2 && b->w4) { VF(b->w4, (size_t)B * p3); VF(b->wcomp, (size_t)B * p3); }
-    if (IPLANE && b->ink) VF(b->ink, (size_t)B * p3);
+    if (g_unwrap2) { VF(b->w4, (size_t)B * p3); VF(b->wcomp, (size_t)B * p3); }   /* (validation batches always hold the byte planes: vc is copied before
+                                                                                   sc.w4_runs / sc.ink_bits, and its gpu_aug 0 drops both; the fields
+                                                                                   must not depend on the batch: empty destinations are laid out by it) */
+    if (IPLANE) VF(b->ink, (size_t)B * p3);
     if (g_cond) VF(b->wind, (size_t)B * p3);
     if (g_pap_head) VF(b->pap, (size_t)B * p3);
     if (g_view) { VF(b->xv, (size_t)B * g_view * g_view * g_view); VF(b->vok, (size_t)B); }   /* (after the fields of runs without views: their hash unchanged) */
@@ -2827,6 +2829,7 @@ int cmd_train(int argc, char **argv) {
             if (!b) { nval = i; break; }
             void **fb[VAL_NF], **fv[VAL_NF]; size_t sz[VAL_NF];
             const int nf = val_fields(b, B, p3v, fb, sz); val_fields(&val[i], B, p3v, fv, sz);
+            for (int k = 0; k < nf; k++) if (!*fb[k]) { fprintf(stderr, "validation batch: field %d of %d not filled by the sampler\n", k, nf); return 1; }
             for (int k = 0; k < nf; k++) vhash = hash_bytes(vhash, *fb[k], sz[k]);
             for (int k = 0; k < nf; k++)
                 if (vmode == VAL_RAM) { *fv[k] = malloc(sz[k]); memcpy(*fv[k], *fb[k], sz[k]); }
