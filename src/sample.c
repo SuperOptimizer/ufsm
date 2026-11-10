@@ -3805,7 +3805,7 @@ batch *sampler_next(sampler *sp) {
     if (ufsm_env_on("UFSM_BATCH_HASH")) {   /* debugging (with train --det 1): one hash per batch plane, to show a change leaves the batches byte-identical */
         static _Atomic long nb; const long id = atomic_fetch_add(&nb, 1);
         const char *nm[32]; uint64_t hv[32]; const int n = sampler_batch_hash(sp, &sp->slots[k], nm, hv, 32);
-        fprintf(stderr, "batchhash %ld", id);
+        fprintf(stderr, "batchhash %ld slot %d", id, k);
         for (int q = 0; q < n; q++) fprintf(stderr, " %s %016llx", nm[q], (unsigned long long)hv[q]);
         fprintf(stderr, "\n");
     }

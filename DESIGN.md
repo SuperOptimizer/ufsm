@@ -41,6 +41,140 @@ bounds are those minima less ~0.1. With 30 steps the same seed reaches phase .96
 disagreement is the young nets' sensitivity, not the store. lc-encode's sd_ref now comes from mostly-material shards (the masked Paris 4
 level 2 had starved the old stride sample: sd 1, a 125 GB store at PSNR 25 dB); a box without material is refused.
 
+## Label planes kept on the device where the plan has room; what --det 1 fixes and what it does not (2026-11-10, branch perf-20261109)
+
+**Labels.** The latent nets' label stream builds each plane on the device, copies it back to pinned host memory and uploads it again per
+head slab in both head passes (rv P1024: 178 ms of copy-back per batch, 380 ms of slab uploads inside the step). Now the planes the
+memory plan has room for stay on the device (`d->ldev`), the rest stream as before:
+
+- Order: the `--rv` papyrus plane as 2-bit classes (unknown / papyrus / void: all `rv_tg_k` reads; an `--ink-head` plane stays bytes),
+  then phase, winding, component as bytes. The spare is the plan's free bytes minus its need, with 1 GB left. P1024 rv: everything.
+  P1152 rv (plan need 12.22 of 16.20 GB): papyrus + phase, 1.9 GB.
+- A byte plane is read in place by the target kernels; the packed plane is expanded per slab into the slab buffer (`nn_lab_unpack`,
+  on the aux stream in the upload pipeline).
+- The component is not 4 bits: the tiled winding numbers its components per tile, ids pass 14. Packed so, 6% of its slab bytes were
+  wrong in the stream check.
+- `UFSM_LAT_LDEV=mask` forces a set (bit k: phase, winding, component, papyrus), `0` is the stream alone.
+- Checks: `UFSM_LAT_STREAM=check` (which keeps reference byte planes) reports 0 differing slab bytes for rv (all four planes, 12
+  steps, P256) and for the winding net; `--det 1` step lines are identical with the planes on the device, partly, and streamed
+  (rv and winding, 12 steps). `test_gpu_aug` covers the pack / unpack kernels. The check mode died without a papyrus plane (it read a
+  null plane); fixed.
+- **Not measured yet:** the real-loader gain on a quiet card.
+
+**Phase and winding planes at 6 and 4 bits** (`UFSM_LAB_QBITS`: the training batches' planes quantised to 2^n cyclic levels on the
+device, validation on the stored bytes; P256, `--det 1`, GPU 1 beside a training run, one seed each). Validation after the last step:
+
+| arm | net | phase bce | normal bce | wind4 bce | turn acc |
+|---|---|---|---|---|---|
+| 600 steps from scratch, 8 bits | winding | 0.69164 | 0.54111 | 0.67356 | 0.3507 |
+| 6 bits | | 0.69127 | 0.53992 | 0.67389 | 0.3484 |
+| 4 bits | | 0.68629 | 0.55046 | 0.67359 | 0.3478 |
+| 600 steps from scratch, 8 bits | rv | 0.65439 | 0.61485 | 0.81120 | 0.3570 |
+| 6 bits | | 0.65032 | 0.61675 | 0.80235 | 0.3561 |
+| 4 bits | | 0.65462 | 0.61704 | 0.80636 | 0.3564 |
+| 300 steps on from wz768's step 2000, 8 bits | winding | 0.67876 | 0.51487 | 0.65902 | 0.3999 |
+| 6 bits | | 0.67870 | 0.51491 | 0.65897 | 0.4006 |
+| 4 bits | | 0.67864 | 0.51514 | 0.65848 | 0.4023 |
+| 300 steps on from g768's step 9000, 8 bits | rv | 0.55067 | 0.51373 | 0.65902 | 0.3738 |
+| 6 bits | | 0.55066 | 0.51374 | 0.65899 | 0.3737 |
+| 4 bits | | 0.55058 | 0.51388 | 0.65893 | 0.3736 |
+
+6 bits: no difference beyond the arms' noise. 4 bits: the normal bce is higher in three of four comparisons (+0.0002, +0.0003, +0.009
+from scratch on the winding net; the normal targets are a difference stencil on the phase), nothing else moves. Weak evidence: the
+from-scratch runs had not learned phase or winding yet (bce ~0.69), and the resumed runs sat in the schedule's cooldown (the 8-bit
+arm itself moved by < 1e-4). A decision for 4 bits needs a longer run at a working learning rate.
+
+**A label mix-up with two device buffers.** The stream has one set of host label planes. Under `--mem fast` (two device buffers) the
+next batch's upload ran during the step and overwrote them while the head passes still uploaded slabs: each step trained on a mix of
+two batches' labels (`--det 1`: 13 outcomes in 14 runs, from step 4, losses 2.0810 against 2.0562). The upload now waits for the step,
+as under lean; 10 of 10 runs agree and equal a run with device planes. Lean runs never overlapped.
+
+**--det 1.** Runs with the same seed printed different lines in 20-70% of cases, always first at step 26 (rv P256), in three
+outcomes. The batches (hashes, slots), the input and the label planes are identical; the weights are not: after the first update 321
+of 12.6 M parameters differ by one float unit, mostly conv biases. The bias and weight gradients are summed across blocks with float
+atomicAdd (`lp_f4wgrad.cuh`, `lp_f8wgrad.cuh`, `lp_s2.cu`, `lp_mx_conv1.cu`, `lp_mx_gnbwd.cu`), so the order varies. The fp4 weight
+quantisation hides the difference until a weight crosses a boundary, which is where the runs split. Left as is (decision: no
+order-independent sums now): `--det 1` fixes batches and seeds, not the last bit. `UFSM_DET_TRACE=1` prints per-step hashes of input,
+label planes and weights; `UFSM_DET_PDUMP` / `UFSM_DET_PSTEP` dump one step's weights.
+
+## The batch upload measured part by part; cheaper scan-augmentation kernels; the wide stride-2 backward on tensor cores (2026-11-10, branch perf-20261109)
+
+**Why.** The P1152 guided rv run made 370-420 Mvox/s against a same-batch figure of 786: the same-batch mode (`UFSM_BENCH_SAME`) skips
+the loader and the upload. Under lean 2 there is one input buffer, so the next batch's upload runs after the step, serial to it.
+
+**The fused head on a quiet card** (GPU 0, same batch, free-running, one binary with the env switches):
+
+| samples/s | slab chain (`UFSM_LAT_FUSE=0`) | fused | fused + light pass 0 |
+|---|---|---|---|
+| rv, lat_guide 5, P1024 | 0.74 | 0.83 | 0.91 (980 Mvox/s) |
+| rv, P512 | 5.26 | 5.47 | 6.12 |
+| winding, lat_guide 64, P1024 | 0.40 | | 0.42 |
+| winding, P512 | 3.09 | | 3.20 |
+
+**The upload of one rv P1024 batch** (quiet card, `UFSM_PTICK=2`, `UFSM_SYNC_UPLOAD=1`; one batch, with blur, correlated noise and gin all
+on; 1.7 s against 1.1 s of step compute):
+
+| part | ms | note |
+|---|---|---|
+| correlated noise | 577 | p 0.1 |
+| load + blur ops | 311 | p 0.7 |
+| gin | 102 | p 0.15 |
+| other scan ops | 31 | |
+| CT sums + warp / write | 110 | every batch |
+| CT bytes up | 38 | every batch |
+| label builds on the device (papyrus 185, side 168, w4 5) | 358 | every batch; mostly the 1 GB source plane going up |
+| label planes back to the host | 178 | every batch (the label stream) |
+| per-slab label upload in the two head passes | 380 | inside the step, on the aux stream |
+
+Weighted by the ops' probabilities: labels ~0.5 s outside the step, scan augmentation ~0.32 s, CT ~0.15 s, per average step. An earlier
+split at P512 beside another process (copies ~11% of the upload) does not hold at P1024.
+
+**No overlap without memory.** With guided heads the full-resolution input is read until the end of the gradient pass (the guide), and
+the label builds use the input buffer as their scratch, so uploading batch N+1 during step N needs a second input buffer or 2 P^3 bytes of
+label scratch: 2-3 GB at P1152, which the window does not have. Not done.
+
+**Correlated noise in chunks of planes.** It ran two kernels per z plane (2 P launches of P threads each). Now three kernels per 64 MB chunk
+of planes: the x recurrences of the chunk's rows, y per (plane, column), z per (y, x) with the carried plane. Byte-identical to the
+per-plane kernels (`test_gpu_aug`, chunks of 1 / 5 / P / default planes). P512, op on, beside another process: 316 -> 26 ms.
+
+**Separable operators (blur, lowres).** Micro-benchmark `TGA_BENCH=P build-verify/test_gpu_aug` (GPU 1 beside a training run, so
+indicative), ms per pass:
+
+| P, taps | z / y shared-memory | z / y line | x, one row a block | x, rows + weight table |
+|---|---|---|---|---|
+| 768, 13 | 17.5 | 11.8 | 56.8 | 12.7 |
+| 1024, 5 | | 22.8 | 67.1 | 25.2 |
+| 1024, 13 | | 27.7 | 137.2 | 30.1 |
+| 1024, 21 | | 37.5 | 193.7 | 36.8 |
+
+- z / y: one thread per line with a ring of the last 64 original values (in place, coalesced across x) instead of P x 32 halves of shared
+  memory per block (64 KB at P1024: one block per SM). A host check (`bop_ring_ok`) falls back to the shared-memory kernel when a row's
+  taps would leave the ring.
+- x: the old kernel loaded a different row of the weight table per thread (8 ms per tap and Gvoxel against 1 in z / y, where a warp
+  shares its row). Now R rows per block in shared memory and the weights from a table of the operator's distinct rows, built on the
+  device (`aug_bop_uniq_k`; more than 64 distinct rows: the plan's own rows). A thread-per-row ring variant measured 80-90 ms flat.
+- Byte-identical to the first kernels (`test_gpu_aug`: a 5-tap, an irregular 16-tap and a 9-tap operator, and the table's fallback).
+
+**The 96-wide net's stride-2 convs.** `UFSM_PROF=layers`, winding P512, 10 steps, beside another process: the trunk's convs are 75% of
+the profile and scale with the products (dec0.c1, 224 -> 96: 560 ms; enc0.c2 and dec0.c2, 96 -> 96: ~230 ms each), no slow path there.
+The down convs were: the fp4 tensor-core stride-2 backward-data existed for 16 / 32 / 64 channels only, wider layers ran the dilated fp8
+conv through MX-fp8 copies (a full-resolution conv's work for an eighth of the products). `bwd_data_s2_f4_k` now takes 96 and 128
+channels: two K units per tap (the tap's gy blocks 2 j, 2 j + 1; 96: a zero fourth block), 85 KB of shared memory at 128.
+
+| ms per 10 steps | before | after |
+|---|---|---|
+| down0 (96) bwd_data | 134.1 | 22.7 |
+| down1 (128) bwd_data | 31.4 | 4.5 |
+| all conv bwd_data | 524 | 327 |
+
+`test_grad_mx4`: 96 and 128 against the fp32 reference like 64 (one draw 0.166, mean of 16 0.042). 160 channels (down2) stay on the
+fp8 route (three K units per tap do not fit the shared memory). The stride-2 forward and weight gradient stay fp8 at these widths: the
+general fp4 forward (`UFSM_S2_F4G=1`, off for its unexplained drift in test_split) measured 62 against 81 ms, and a fit over the two
+nets (17 ms at 32 -> 32, 83 at 96 -> 96) puts ~35 ms of a 96-channel level-0 conv in reading and transforming its input, which a
+stride-2 conv pays in full.
+
+**Not measured:** the new augmentation kernels and the 96 / 128 backward in a real run on a quiet card.
+
 ## The latent head's full-resolution passes fused per coarse cell; an uncontended step profile (2026-11-10, branch perf-20261109)
 
 Profile first (GPU 0 alone for 5.5 minutes, fp4, streamed head, `--gpu-aug 3`, same batch, `UFSM_PTICK=2`: the target / loss / upsample

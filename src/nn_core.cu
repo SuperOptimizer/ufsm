@@ -1,6 +1,7 @@
 /* CUDA ops: core section of the former nn.cu */
 #include "nn_common.cuh"
 #include <dlfcn.h>
+#include <unistd.h>
 
 int g_tf32 = 1;
 int g_gn_stored = 0;
@@ -225,6 +226,14 @@ extern "C" void *nn_malloc(size_t n) {
         size_t fr = 0, tot = 0; cudaGetLastError(); cudaMemGetInfo(&fr, &tot);
         fprintf(stderr, "nn_malloc: cudaMalloc of %.2f GB failed (%s; %.2f of %.2f GB free on the device)\n", n / 1e9, cudaGetErrorString(e), fr / 1e9, tot / 1e9);
         if (g_err == cudaSuccess) { g_err = e; g_err_file = __FILE__; g_err_line = __LINE__; g_err_what = "cudaMalloc in nn_malloc"; }
+        /* no caller takes a null buffer (the optional ones use nn_malloc_try): returning it let the next kernels write through null, and
+           the run ended many lines later in "an illegal memory access was encountered" from an unrelated allocation (fit-field predict
+           beside a training run). End here, with the size and the caller. UFSM_MALLOC_NULL=1: the old return (debugging) */
+        if (!ufsm_env_on("UFSM_MALLOC_NULL")) {
+            Dl_info di; void *ra = __builtin_return_address(0); const size_t off = dladdr(ra, &di) && di.dli_fbase ? (size_t)((char *)ra - (char *)di.dli_fbase) : (size_t)ra;
+            fprintf(stderr, "cuda: out of memory: the device has no room for a %.2f GB buffer (caller 0x%zx); stopping\n", n / 1e9, off);
+            fflush(nullptr); _exit(1);
+        }
         return nullptr;
     }
     { static int fill = -2; if (fill == -2) fill = getenv("UFSM_MALLOC_FILL") ? atoi(getenv("UFSM_MALLOC_FILL")) : -1;   /* debug: every new device buffer filled with this byte
@@ -449,6 +458,37 @@ extern "C" void nn_h2d_stream(int k, void *d, const void *s, size_t n) { CK(cuda
 extern "C" void nn_event_record(void *e, int on_copy_stream) { CK(cudaEventRecord((cudaEvent_t)e, stream_of(on_copy_stream))); }
 extern "C" void nn_stream_wait(int copy_stream_waits, void *e) { CK(cudaStreamWaitEvent(stream_of(copy_stream_waits), (cudaEvent_t)e, 0)); }
 extern "C" void nn_event_sync(void *e) { CK(cudaEventSynchronize((cudaEvent_t)e)); }
+/* train --lat: label planes kept on the device in packed form (train.c d->ldev). bits 8: the bytes; 4: codes 0..14 and 255 (-> 15;
+   unused: the winding component's ids pass 14 with tiles); 2: the --rv papyrus plane's classes (255 unknown -> 3, >= 127 papyrus -> 1 (254 back), void -> 0: all rv_tg_k reads).
+   nn_lab_pack: n voxels of s into d; nn_lab_unpack: voxels [v0, v0 + n) of p into d[0..n). stream k: 0 compute, 1 copy, 2 aux */
+__global__ void lab_pack_k(const uint8_t *s, uint8_t *d, size_t n, int bits) {
+    const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x, per = 8 / bits;
+    if (i * per >= n) return;
+    unsigned o = 0;
+    for (size_t j = 0; j < per && i * per + j < n; j++) {
+        const unsigned v = s[i * per + j];
+        o |= (bits == 8 ? v : bits == 4 ? (v > 14 ? 15u : v) : (v == 255 ? 3u : v >= 127 ? 1u : 0u)) << (bits * j);
+    }
+    d[i] = (uint8_t)o;
+}
+__global__ void lab_unpack_k(const uint8_t *p, uint8_t *d, size_t v0, size_t n, int bits) {
+    const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const size_t v = v0 + i;
+    if (bits == 8) d[i] = p[v];
+    else if (bits == 4) { const unsigned c = p[v >> 1] >> (4 * (v & 1)) & 15u; d[i] = (uint8_t)(c == 15 ? 255 : c); }
+    else { const unsigned c = p[v >> 2] >> (2 * (v & 3)) & 3u; d[i] = (uint8_t)(c == 3 ? 255 : c ? 254 : 0); }
+}
+/* experiment (train UFSM_LAB_QBITS): a cyclic label plane (phase / winding: codes 0..251, >= 252 kept) to 2^bits levels, in place */
+__global__ void lab_quant_k(uint8_t *s, size_t n, int bits) {
+    const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const int v = s[i], L = 1 << bits;
+    if (v < 252) s[i] = (uint8_t)(((v * L + 126) / 252 % L * 252 + L / 2) / L);
+}
+extern "C" void nn_lab_quant(int k, uint8_t *s, size_t n, int bits) { lab_quant_k<<<nblk(n, 256), 256, 0, stream_of(k)>>>(s, n, bits); KCHECK(); }
+extern "C" void nn_lab_pack(int k, const uint8_t *s, uint8_t *d, size_t n, int bits) { lab_pack_k<<<nblk((n * bits + 7) / 8, 256), 256, 0, stream_of(k)>>>(s, d, n, bits); KCHECK(); }
+extern "C" void nn_lab_unpack(int k, const uint8_t *p, uint8_t *d, size_t v0, size_t n, int bits) { lab_unpack_k<<<nblk(n, 256), 256, 0, stream_of(k)>>>(p, d, v0, n, bits); KCHECK(); }
 static cudaStream_t offload_stream(void) {   /* activation offload: its own stream, so it never queues behind batch uploads */
     static cudaStream_t st[8]; int d = 0; cudaGetDevice(&d); d &= 7;
     if (!st[d]) CK(cudaStreamCreateWithFlags(&st[d], cudaStreamNonBlocking));

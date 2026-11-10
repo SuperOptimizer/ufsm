@@ -59,6 +59,7 @@ typedef struct {
                                     after the step's loss fetch (X3 is the stem's gradient until the step's end) */
     int hsplit;                  /* lean, head slabs: the next batch's derived-target planes (side / winding) go up once the backward's head step
                                     read them (ev_hs), the input and packed targets (inside gout[0]) after the step's loss fetch (upload_tail) */
+    uint8_t *ldev[4]; int ldbits[4];   /* g_lstream: the planes the device has room for stay there, packed (ldbits 8 / 4 / 2: nn_lab_pack); no host plane, no slab uploads */
     uint8_t *lbh[4], *lbs[4];      /* g_lstream: the host label planes (phase, w4, component, ink / papyrus) and their device slab buffers */
     uint8_t *lbs2[4]; void *evl_up[2], *evl_free[2];   /* the second slab set and the events of the upload pipeline (head_slab_pass: slab j + 1 uploads on the aux stream while slab j computes); lbs2[0] nullptr: uploads in the compute stream */
     void *ev_hs;                 /* hsplit: the head slabs' backward pass of the current step finished (stream 0) */
@@ -112,6 +113,7 @@ static int g_lat_fuse;  /* the streamed head's gradient pass fused per loss grou
 static int g_lat_hs;    /* --lat: the head streamed with the slabs (no whole cell logits, no whole coarse gradient): head_slab_pass runs the network's head on the
                            cell planes a slab reads (unet_head_fwd_z, both passes) and, in the backward's head callback, hands each slab's finished
                            planes of the coarse gradient to unet_head_bwd_z from a rolling buffer. Every head; UFSM_LAT_HEAD_STREAM=0 off */
+static size_t g_plan_spare;   /* the memory plan's free device bytes beyond the picked mode's need (the label planes kept on the device: d->ldev) */
 static int g_lstream;   /* --lat: the label planes (phase, winding mod 4 + component, papyrus) live in pinned host memory and reach the device one head slab at a time (lab_stream; UFSM_LAT_STREAM=0 off) */
 static int g_lat;   /* --lat 4: the network on the 4^3 cells of the window (unet_cfg.half_res 3, pool4), the losses in full-resolution head slabs (nn_lat_*) */
 static int g_half, g_hdiv = 1;   /* --half-res: 1 pool, 2 pack, 3 pool4, 4 pack4 (unet_cfg.half_res), g_hdiv its factor; the losses see g_cout
@@ -506,9 +508,14 @@ static void lab_upload(int kind, const batch *b, uint8_t *da, uint8_t *db, const
 static void lab_stream(gpu_state *d, const batch *b, int i, const void *rad, int B, int P, int async) {
     const size_t p3 = (size_t)g_Pz * P * P; uint8_t *s = (uint8_t *)d->xb[i];
     void (*dh)(void *, const void *, size_t) = async ? nn_d2h_copy_stream : nn_d2h;
-    if (g_side) { lab_upload(1, b, s, nullptr, b->side, nullptr, rad, B, P, async); nn_ptick_fine("    x side build"); dh(d->lbh[0], s, p3); nn_ptick_fine("    x side d2h"); }
-    if (g_unwrap2) { lab_upload(2, b, s, s + p3, b->w4, b->wcomp, rad, B, P, async); nn_ptick_fine("    x w4 build"); dh(d->lbh[1], s, p3); dh(d->lbh[2], s + p3, p3); nn_ptick_fine("    x w4 d2h (2 planes)"); }
-    if (IPLANE) { lab_upload(3, b, s, nullptr, b->ink, nullptr, rad, B, P, async); nn_ptick_fine("    x ink build"); dh(d->lbh[3], s, p3); nn_ptick_fine("    x ink d2h"); }
+    /* experiment UFSM_LAB_QBITS=n (4 / 6): the training batches' phase and winding planes at 2^n levels (asynchronous uploads only: validation
+       uploads synchronously and keeps its bytes), to measure what a narrower device plane would cost; UFSM_LAB_QPLANES: 1 phase, 2 winding, 3 both */
+    static int qb = -1, qp = 3; if (qb < 0) { qb = getenv("UFSM_LAB_QBITS") ? atoi(getenv("UFSM_LAB_QBITS")) : 0; if (getenv("UFSM_LAB_QPLANES")) qp = atoi(getenv("UFSM_LAB_QPLANES")); }
+#define LKEEP(k, src) do { if (qb > 0 && qb < 8 && async && (k) < 2 && (qp >> (k) & 1)) nn_lab_quant(1, (src), p3, qb); if (d->ldev[k]) nn_lab_pack(async ? 1 : 0, (src), d->ldev[k], p3, d->ldbits[k]); else dh(d->lbh[k], (src), p3); } while (0)   /* to the device plane (packed), or back to the host */
+    if (g_side) { lab_upload(1, b, s, nullptr, b->side, nullptr, rad, B, P, async); nn_ptick_fine("    x side build"); LKEEP(0, s); nn_ptick_fine("    x side d2h"); }
+    if (g_unwrap2) { lab_upload(2, b, s, s + p3, b->w4, b->wcomp, rad, B, P, async); nn_ptick_fine("    x w4 build"); LKEEP(1, s); LKEEP(2, s + p3); nn_ptick_fine("    x w4 d2h (2 planes)"); }
+    if (IPLANE) { lab_upload(3, b, s, nullptr, b->ink, nullptr, rad, B, P, async); nn_ptick_fine("    x ink build"); LKEEP(3, s); nn_ptick_fine("    x ink d2h"); }
+#undef LKEEP
 }
 /* the input channel(s) and radial records of a batch into the device buffers x / rad (async: on the copy stream). --gpu-aug batches
    (batch.ct8): the records first, then each window's CT channel built on the device from its bytes (nn_aug_ct) */
@@ -617,7 +624,11 @@ static void upload_async(gpu_state *d, const batch *b, int i, int B, int P) {
         return;
     }
     nn_stream_wait(1, d->ev_done[i]);   /* the step two back: this upload overlaps the current step */
-    if (d->lean) nn_stream_wait(1, d->ev_done[i ^ 1]);   /* lean: one buffer (inside the gradient buffers), free after the current step */
+    if (d->lean || g_lstream) nn_stream_wait(1, d->ev_done[i ^ 1]);   /* lean: one buffer (inside the gradient buffers), free after the current step.
+                                                                          The label stream: one set of host planes (d->lbh), which the current step's head slabs
+                                                                          upload from until its gradient pass ends; written earlier (--mem fast: two device
+                                                                          buffers, the upload overlapping the step), the step trained on a mix of its own and
+                                                                          the next batch's labels (--det 1 runs differed from step 4, 13 outcomes in 14 runs) */
     if (g_restore) restore_upload(d, b, i, B, P, 1);
     else if (d->side >= 0) upload_slab(d, b, i, B, P, 1);
     else {
@@ -858,24 +869,33 @@ static void head_slab_pass(gpu_state *d, int pass) {
                     uint8_t *const *const l2 = st ? d->lbs2 : d->lbs; const size_t n2 = (size_t)(y1 - y0) * hw, v2 = (size_t)y0 * hw;
                     if (!q) nn_stream_wait(2, d->ev_up[d->cur]);   /* (the host planes: this batch's upload wrote them) */
                     nn_stream_wait(2, d->evl_free[st]);
-                    if (g_side) nn_h2d_stream(2, l2[0], d->lbh[0] + (size_t)ya * hw, (size_t)(yb - ya) * hw);
-                    if (g_unwrap2) { nn_h2d_stream(2, l2[1], d->lbh[1] + v2, n2); nn_h2d_stream(2, l2[2], d->lbh[2] + v2, n2); }
-                    if (IPLANE) nn_h2d_stream(2, l2[3], d->lbh[3] + v2, n2);
+                    /* (a plane kept on the device: its bytes are read in place; a packed one is expanded into the slab buffer) */
+#define LSLAB(st_, k, dst, v0, n) do { if (!d->ldev[k]) nn_h2d_stream(st_, (dst), d->lbh[k] + (v0), (n)); else if (d->ldbits[k] != 8) nn_lab_unpack(st_, d->ldev[k], (dst), (v0), (n), d->ldbits[k]); } while (0)
+                    if (g_side) LSLAB(2, 0, l2[0], (size_t)ya * hw, (size_t)(yb - ya) * hw);
+                    if (g_unwrap2) { LSLAB(2, 1, l2[1], v2, n2); LSLAB(2, 2, l2[2], v2, n2); }
+                    if (IPLANE) LSLAB(2, 3, l2[3], v2, n2);
                     nn_event_record(d->evl_up[st], 2);
                 }
                 nn_stream_wait(0, d->evl_up[sj & 1]);
             } else {
-                if (g_side) nn_h2d_async(lb[0], d->lbh[0] + (size_t)za * hw, (size_t)(zb - za) * hw);
-                if (g_unwrap2) { nn_h2d_async(lb[1], d->lbh[1] + vb, ns); nn_h2d_async(lb[2], d->lbh[2] + vb, ns); }
-                if (IPLANE) nn_h2d_async(lb[3], d->lbh[3] + vb, ns);
+#define LSLAB0(k, dst, v0, n) do { if (!d->ldev[k]) nn_h2d_async((dst), d->lbh[k] + (v0), (n)); else if (d->ldbits[k] != 8) nn_lab_unpack(0, d->ldev[k], (dst), (v0), (n), d->ldbits[k]); } while (0)
+                if (g_side) LSLAB0(0, lb[0], (size_t)za * hw, (size_t)(zb - za) * hw);
+                if (g_unwrap2) { LSLAB0(1, lb[1], vb, ns); LSLAB0(2, lb[2], vb, ns); }
+                if (IPLANE) LSLAB0(3, lb[3], vb, ns);
             }
-            if (g_side) sdb = lb[0] - (size_t)za * hw;
-            if (g_unwrap2) { w4 = lb[1] - vb; wc = lb[2] - vb; }
-            if (IPLANE) ink = lb[3] - vb;
+#define LPTR(k, off) (d->ldev[k] && d->ldbits[k] == 8 ? d->ldev[k] : lb[k] - (off))   /* (indexed by window voxel) */
+            if (g_side) sdb = LPTR(0, (size_t)za * hw);
+            if (g_unwrap2) { w4 = LPTR(1, vb); wc = LPTR(2, vb); }
+            if (IPLANE) ink = LPTR(3, vb);
             if (g_lcheck) {   /* the streamed slab against the device planes */
                 const uint8_t *dv[4] = {d->sdb + (size_t)za * hw, d->w4 + vb, d->wc + vb, d->ink + vb}; const size_t nb[4] = {(size_t)(zb - za) * hw, ns, ns, ns};
                 uint8_t *ha = malloc(nb[0]), *hb = malloc(nb[0]); static long tot, bad; nn_sync();
-                for (int k = 0; k < 4; k++) { nn_d2h(ha, lb[k], nb[k]); nn_d2h(hb, dv[k], nb[k]); size_t nd = 0; for (size_t j = 0; j < nb[k]; j++) nd += ha[j] != hb[j]; tot += (long)nb[k]; bad += (long)nd; }
+                const uint8_t *cv[4] = {sdb + (size_t)za * hw, w4 + vb, wc + vb, ink + vb};   /* what the kernels read: slab buffers, or the device-kept planes */
+                for (int k = 0; k < 4; k++) { if (k == 0 ? !g_side : k == 3 ? !IPLANE : !g_unwrap2) continue;   /* (no such plane: the check read a null plane and died without --rv / --ink-head) */
+                    nn_d2h(ha, cv[k], nb[k]); nn_d2h(hb, dv[k], nb[k]); size_t nd = 0;
+                    const int cls = d->ldev[k] && d->ldbits[k] == 2;   /* (the papyrus classes: what rv_tg_k reads) */
+                    for (size_t j = 0; j < nb[k]; j++) nd += cls ? ha[j] != (hb[j] == 255 ? 255 : hb[j] >= 127 ? 254 : 0) : ha[j] != hb[j];
+                    tot += (long)nb[k]; bad += (long)nd; }
                 free(ha); free(hb); if (z1 == D) fprintf(stderr, "lat stream check: pass %d, %ld of %ld slab bytes differ so far\n", pass, bad, tot);
             }
         }
@@ -999,8 +1019,10 @@ static void head_slab_pass(gpu_state *d, int pass) {
             if (f1 > f0) {
                 nn_lat_grad_fin(d->latg, LGFC, d->latgl, LNC, pl, qc, f0 - q0, f1 - f0, d->latgc);
                 if (getenv("UFSM_LATG_DUMP")) {   /* the finished coarse gradient planes of every slab of the first step, appended (fp16; fused against chain) */
-                    static int done; if (!done) { const size_t nb = (size_t)LNC * (f1 - f0) * pl * 2; void *hb = malloc(nb); nn_sync(); nn_d2h(hb, d->latgc, nb);
-                        FILE *f = fopen(getenv("UFSM_LATG_DUMP"), z0 ? "ab" : "wb"); if (f) { fwrite(hb, 1, nb, f); fclose(f); } free(hb); if (z1 == D) done = 1; }
+                    static int done, nth = -1; if (nth < 0) nth = getenv("UFSM_LATG_STEP") ? atoi(getenv("UFSM_LATG_STEP")) - 1 : 0;   /* (UFSM_LATG_STEP=n: the nth gradient pass instead) */
+                    if (done == nth) { const size_t nb = (size_t)LNC * (f1 - f0) * pl * 2; void *hb = malloc(nb); nn_sync(); nn_d2h(hb, d->latgc, nb);
+                        FILE *f = fopen(getenv("UFSM_LATG_DUMP"), z0 ? "ab" : "wb"); if (f) { fwrite(hb, 1, nb, f); fclose(f); } free(hb); }
+                    if (z1 == D && done <= nth) done++;
                 }
                 if (unet_head_bwd_z(d->u, f0, f1, d->latgc, z0 == 0)) { fprintf(stderr, "latent head stream: the head backward is not covered per slab (UFSM_LAT_HEAD_STREAM=0)\n"); abort(); }
             }
@@ -2018,6 +2040,10 @@ int cmd_train(int argc, char **argv) {
     if (g_axr && !cfg.attn_deform) fprintf(stderr, "attention: %s, %s positions around each window's scroll axis\n", cfg.attn_axis ? "radial (along the rays from the axis)" : "full", cfg.attn_pe == 3 ? "scroll RoPE" : "grid");
     if (g_axr && cfg.attn_deform) fprintf(stderr, "attention: deformable offsets in each token's normal / tangent / axis frame around the window's scroll axis\n");
     sc.deterministic = atoi(opt(argc, argv, "--det", "0"));   /* same batches for the same seed regardless of thread timing (paired comparisons; off: a slow worker can stall the ring) */
+    /* (--det 1 fixes the batches and the seeds, not the last float bit: the bias and weight gradients are summed across blocks with
+       atomicAdd (lp_f4wgrad.cuh, lp_f8wgrad.cuh, lp_s2.cu, lp_mx_conv1.cu, lp_mx_gnbwd.cu), so ~300 of 12.6 M parameters differ by one
+       unit after the first update. The fp4 weight quantisation hides that until a weight crosses a boundary: runs print the same lines
+       for some tens of steps, then split into a few outcomes. UFSM_DET_TRACE=1 shows the per-step hashes. DESIGN.md, 2026-11-10) */
     g_mem = cfg.attn_blocks > 0 && cfg.attn_mem > 0;   /* window memory tokens, trained along window chains */
     g_view = cfg.attn_blocks > 0 ? cfg.view_P : 0; sc.view_P = g_view;   /* scan fusion: the sampler's view crops */
     if (cfg.view_P && (cfg.attn_blocks <= 0 || cfg.attn_axis || split || g_restore || cfg.view_patch <= 0 || cfg.view_P % cfg.view_patch || cfg.view_P & 1)) {
@@ -2564,6 +2590,7 @@ int cmd_train(int argc, char **argv) {
                         pick_need / 1e9, fmin / 1e9, (double)pick_need / (double)vox, upb / 1e9, pick_off / 1e9, (double)pick_off / (double)vox,
                         fastest || !pick_off ? "" : "; --mem fast skips them where the window fits without");
             }
+            g_plan_spare = pick >= 0 && fmin > pick_need ? fmin - pick_need : 0;
             unet_set_host_offloads(pick_hoff);
             unet_set_chunk_up(cand[pick].chunk); unet_set_recompute(cand[pick].rc); unet_set_grad_mx8(cand[pick].gmx); unet_set_lean(cand[pick].lean); unet_set_share_enc_a1(cand[pick].sea || (pick_hoff && sea_force));
             unet_set_l0_3buf(cand[pick].l3);
@@ -2667,7 +2694,23 @@ int cmd_train(int argc, char **argv) {
         if (g_lat && !g_lstream && g_gpu_want && g == 0 && !ufsm_env_on("UFSM_PLAN_LABELS_DEV")) fprintf(stderr, "latent grid: no label stream (the memory plan counted the label planes on the host: UFSM_PLAN_LABELS_DEV=1 for the device count)\n");
         const size_t lp3 = g_lstream && !g_lcheck ? 256 : (size_t)B * p3;   /* g_lstream: no device label planes */
         if (g_lstream) {
-            for (int k = 0; k < 4; k++) { d->lbh[k] = nn_host_alloc(p3); d->lbs[k] = nn_malloc((size_t)(g_hs_z + (k ? 0 : 2 * g_norm_s)) * P * P); }
+            {   /* the planes the plan's spare device memory holds stay on the device (no copy back to the host, no slab uploads): the --rv
+                   papyrus classes in 2 bits (an --ink-head plane: bytes), then the phase, the winding and its component as bytes (the
+                   component is not 4 bits: the tiled winding numbers one component per tile, ids past 14; packed so, 6% of its bytes were
+                   wrong in the stream check); 1 GB of the spare is left. UFSM_LAT_LDEV=mask (bit k: plane k = phase, winding, component, papyrus) forces a set, 0 none */
+                static const int order[4] = {3, 0, 1, 2}; const int used[4] = {g_side != 0, g_unwrap2 != 0, g_unwrap2 != 0, IPLANE != 0};
+                const int bits[4] = {8, 8, 8, g_rv && !g_ink2 ? 2 : 8}; const char *le = getenv("UFSM_LAT_LDEV"); const int force = le ? atoi(le) : -1;
+                size_t spare = g_plan_spare > ((size_t)1 << 30) ? g_plan_spare - ((size_t)1 << 30) : 0, got = 0; char what[96] = "";
+                for (int q = 0; q < 4; q++) {
+                    const int k = order[q]; const size_t nb = (p3 * bits[k] + 7) / 8 + 8;
+                    if (!used[k] || (force >= 0 ? !(force >> k & 1) : nb > spare)) continue;
+                    if (!(d->ldev[k] = nn_malloc_try(nb))) continue;
+                    d->ldbits[k] = bits[k]; if (force < 0) spare -= nb; got += nb;
+                    static const char *nm[4] = {"phase", "winding", "component", "papyrus"}; snprintf(what + strlen(what), sizeof what - strlen(what), " %s (%d bits)", nm[k], bits[k]);
+                }
+                if (g == 0 && got) fprintf(stderr, "latent grid: label planes kept on the device:%s, %.2f GB (plan spare %.2f GB; UFSM_LAT_LDEV=0 off)\n", what, got / 1e9, g_plan_spare / 1e9);
+            }
+            for (int k = 0; k < 4; k++) { d->lbh[k] = d->ldev[k] ? nullptr : nn_host_alloc(p3); d->lbs[k] = nn_malloc((size_t)(g_hs_z + (k ? 0 : 2 * g_norm_s)) * P * P); }
             if (!getenv("UFSM_LAT_PIPE") || ufsm_env_on("UFSM_LAT_PIPE")) {   /* the second slab set of the upload pipeline (4 x 32 planes: 0.08 GB at P768); none when the device is full */
                 for (int k = 0; k < 4; k++) if (!(d->lbs2[k] = nn_malloc_try((size_t)(g_hs_z + (k ? 0 : 2 * g_norm_s)) * P * P))) { for (int j = 0; j < k; j++) nn_free(d->lbs2[j]); d->lbs2[0] = nullptr; break; }
                 if (d->lbs2[0]) for (int k = 0; k < 2; k++) { d->evl_up[k] = nn_event_create(); d->evl_free[k] = nn_event_create(); nn_event_record(d->evl_up[k], 0); nn_event_record(d->evl_free[k], 0); }
@@ -3120,6 +3163,15 @@ int cmd_train(int argc, char **argv) {
                 d->pending = b;
             }
             nn_stream_wait(0, d->ev_up[d->cur]);           /* compute waits for the upload */
+            if (getenv("UFSM_DET_TRACE")) {   /* debugging (--det 1): hashes of what this step starts from: the input channel, the streamed label planes, the parameters */
+                nn_event_sync(d->ev_up[d->cur]); nn_sync();
+                const size_t p3t = (size_t)g_Pz * P * P, nx = (size_t)B * g_xs * p3t * xbytes(); uint8_t *hb = malloc(nx > p3t ? nx : p3t);
+                uint64_t hx = 1469598103934665603ull, hl[4] = {0, 0, 0, 0};
+                nn_d2h(hb, d->x, nx); for (size_t q = 0; q < nx; q++) hx = (hx ^ hb[q]) * 1099511628211ull;
+                if (g_lstream) for (int k = 0; k < 4; k++) if (d->lbh[k]) { uint64_t h = 1469598103934665603ull; for (size_t q = 0; q < p3t; q++) h = (h ^ d->lbh[k][q]) * 1099511628211ull; hl[k] = h; }
+                fprintf(stderr, "dettrace step %d: x %016llx labels %016llx %016llx %016llx %016llx params %016llx\n", step, (unsigned long long)hx, (unsigned long long)hl[0], (unsigned long long)hl[1], (unsigned long long)hl[2], (unsigned long long)hl[3], (unsigned long long)unet_param_hash(d->u));
+                free(hb);
+            }
             if (sparse_at && step >= sparse_at && !unet_get_sparse24(d->u)) { unet_set_sparse24(d->u, 1); if (g == 0) fprintf(stderr, "step %d: 2:4 sparsity on (SR-STE lambda %g)\n", step, srste); }
             unet_zero_grad(d->u);
             d->last = d->cur;
