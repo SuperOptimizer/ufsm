@@ -214,6 +214,8 @@ size_t nn_lat_fuse_part(int n, int h, int w, int nz);
 void nn_lat_fuse_grad(const void *lg, int lh16, int lq0, int lqd, int d, int h, int w, int z0, int nz, int c0, int n, int guide, int gb, const void *x,
                       const uint8_t *t, const uint8_t *m, const uint8_t *wch, const float *st, float pw, float rec_w, int unit_c, const float *lam,
                       float *part, float *gc, int gq0, int gqd);
+void nn_lat_fuse_stats(const void *lg, int lh16, int lq0, int lqd, int d, int h, int w, int z0, int nz, int c0, int n, int guide, int gb, const void *x,
+                       const uint8_t *t, const uint8_t *m, const uint8_t *wch, float pw, int unit_c, double *ds);   /* nn_loss_stats_acc of the group, fused */
 void nn_loss_cfg_get(float *pw, float *rec_w, int *unit7);   /* the BCE's positive weight, --recall weight, 7-channel unit-mask channel */
 void nn_lat_grad_carry(float *a, int nf, void *sb, int C, size_t pl, int cap, int from, int n);
 void nn_lat_up_adj(const void *g, int C, int d, int h, int w, int z0, int nz, float *gc, void *scratch);   /* scratch: C nz h w fp32 for the separable path (z0, nz multiples of 4), or nullptr */

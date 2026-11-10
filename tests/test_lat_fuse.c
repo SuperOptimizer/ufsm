@@ -34,6 +34,7 @@ int main(void) {
         nn_h2d(dl, hl, C * cv * 2); nn_h2d(dx, hx, fv * 2); nn_h2d(dws, hws, 2); nn_h2d(dwn, hwn, 7);
         const shape5 w2 = {1, 2, D, H, W}, w7 = {1, 7, D, H, W};
         double *ds = nn_malloc(64 * sizeof(double)); nn_zero(ds, 64 * sizeof(double));
+        double *ds2 = nn_malloc(64 * sizeof(double)); nn_zero(ds2, 64 * sizeof(double));
         float *ss = nn_malloc(nn_loss_scratch(w2) + 64), *sn = nn_malloc(nn_loss_scratch(w7) + 64);
         float *ga = nn_malloc(C * cv * 4), *gb = nn_malloc(C * cv * 4), *gb2 = nn_malloc(C * cv * 4), *scr = nn_malloc((size_t)C * Z * pl * 4);
         float *part = nn_malloc(nn_lat_fuse_part(7, h, w, Z));
@@ -50,7 +51,12 @@ int main(void) {
                 nn_lat_up_slab_c(dl, 1, C, d, h, w, z0, nz, slab, 0, d);
                 nn_lat_guide(dx, D, H, W, z0, nz, slab, 11, 0, 0);
 #define LG(c) ((char *)slab + (size_t)(c) * ns * 2)
-                if (!pass) { nn_loss_stats_acc(LG(0), dts, dms, dws, two, ds + 10); nn_loss_stats_acc(LG(2), dtn, dmn, dwn, seven, ds + 20); continue; }
+                if (!pass) {
+                    nn_loss_stats_acc(LG(0), dts, dms, dws, two, ds + 10); nn_loss_stats_acc(LG(2), dtn, dmn, dwn, seven, ds + 20);
+                    nn_lat_fuse_stats(dl, 1, 0, d, d, h, w, z0, nz, 0, 2, 1, 11, dx, dts, dms, dws, pw, -1, ds2 + 10);
+                    nn_lat_fuse_stats(dl, 1, 0, d, d, h, w, z0, nz, 2, 7, 0, -1, nullptr, dtn, dmn, dwn, pw, u7, ds2 + 20);
+                    continue;
+                }
                 nn_loss_grad_only(LG(0), dts, dms, dws, two, 0.f, LG(0), ss);
                 if (lam_side != 1.f) nn_loss_grad_scale(LG(0), 2 * ns, lam_side);
                 nn_loss_grad_only(LG(2), dtn, dmn, dwn, seven, 0.f, LG(2), sn);
@@ -66,7 +72,13 @@ int main(void) {
                 }
 #undef LG
             }
-            if (!pass) { nn_loss_stats_fin(ds + 10, dws, w2, ss); nn_loss_stats_fin(ds + 20, dwn, w7, sn); }
+            if (!pass) {   /* the fused statistics against the chain's (before nn_loss_stats_fin reduces them) */
+                double ha[64], hb[64]; nn_sync(); nn_d2h(ha, ds, sizeof ha); nn_d2h(hb, ds2, sizeof hb);
+                double se = 0; int nzs = 0; for (int k = 10; k < 55; k++) { const double e = fabs(ha[k] - hb[k]) / (fabs(ha[k]) + 1e-12); if (e > se) se = e; nzs += ha[k] != 0; }
+                const int sbad = !(se < 2e-5) || nzs < 30;
+                printf("  %dx%dx%d cells, slabs of %d, variant %d: statistics: max relative difference %.2g over %d sums%s\n", d, h, w, Z, var, se, nzs, sbad ? "  FAIL" : ""); fails += sbad; cases++;
+                nn_loss_stats_fin(ds + 10, dws, w2, ss); nn_loss_stats_fin(ds + 20, dwn, w7, sn);
+            }
         }
         float *ra = malloc(C * cv * 4), *rb = malloc(C * cv * 4), *rb2 = malloc(C * cv * 4);
         nn_sync(); nn_d2h(ra, ga, C * cv * 4); nn_d2h(rb, gb, C * cv * 4); nn_d2h(rb2, gb2, C * cv * 4);
@@ -82,7 +94,7 @@ int main(void) {
         fails += bad; cases++;
         if (bad && getenv("TLF_DBG")) { int shown = 0; for (size_t k = 0; k < C * cv && shown < 16; k++) if (fabs((double)ra[k] - rb[k]) > 1e-4 * mg) { printf("    c %zu cell %zu: chain %g fused %g\n", k / cv, k % cv, ra[k], rb[k]); shown++; } }
         free(hl); free(hx); free(hts); free(hms); free(htn); free(hmn); free(ra); free(rb); free(rb2);
-        nn_free(dl); nn_free(dx); nn_free(slab); nn_free(dts); nn_free(dms); nn_free(dtn); nn_free(dmn); nn_free(dws); nn_free(dwn); nn_free(ds); nn_free(ss); nn_free(sn);
+        nn_free(dl); nn_free(dx); nn_free(slab); nn_free(dts); nn_free(dms); nn_free(dtn); nn_free(dmn); nn_free(dws); nn_free(dwn); nn_free(ds); nn_free(ds2); nn_free(ss); nn_free(sn);
         nn_free(ga); nn_free(gb); nn_free(gb2); nn_free(scr); nn_free(part);
     }
     nn_set_grad_scale(1.f);
