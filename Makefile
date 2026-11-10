@@ -79,7 +79,7 @@ SRC += src/vwt_sample.c src/raycheck.c src/patchraster.c src/hiresphase.c src/fi
 SRC += src/view.c src/reg.c src/reg_cli.c src/reg_view.c src/reg_init.c src/reg_render.c src/reg_ink.c src/srpairs.c
 SRC += src/srpair.c
 SRC += src/storebench.c src/phasepack.c
-SRC += src/afv.c src/fibercheck.c src/fitphase.c src/wrapdump.c src/fiberjudge.c
+SRC += src/afv.c src/fibercheck.c src/fitphase.c src/wrapdump.c src/fiberjudge.c src/fibertrace.c src/fiberraster.c
 SRC += src/countfield.c src/countanat.c
 SRC += src/flatten.c src/faces.c src/faces_cli.c
 SRC += src/sheetcut.c
@@ -477,6 +477,12 @@ suite-bins: $(B)/test_surflabels
 $(B)/test_fiberjudge: tests/test_fiberjudge.c $(B)/fiberjudge.o $(B)/wrapdump.o $(B)/fitphase.o $(B)/afv.o $(B)/fitjoin.o $(B)/phasegate.o $(B)/fit.o $(B)/fit_emb.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/coreline.o $(B)/tfx.o $(B)/surfcomp.o $(B)/tiffw.o $(SAMPLE_TEST_OBJ) $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 suite-bins: $(B)/test_fiberjudge
+$(B)/test_fibertrace: tests/test_fibertrace.c $(B)/fibertrace.o $(B)/afv.o $(B)/zarr2.o $(B)/store.o $(B)/json.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
+suite-bins: $(B)/test_fibertrace
+$(B)/test_fiberraster: tests/test_fiberraster.c $(B)/fiberraster.o $(B)/afv.o $(B)/z3w.o $(B)/zarr3.o $(B)/store.o $(B)/json.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
+suite-bins: $(B)/test_fiberraster
 $(B)/test_patchid: tests/test_patchid.c $(B)/patchid.o $(B)/pairacc.o $(B)/tfx.o $(B)/surfcomp.o $(B)/tiffw.o $(SAMPLE_TEST_OBJ) $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 suite-bins: $(B)/test_patchid
