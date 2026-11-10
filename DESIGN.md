@@ -6,6 +6,39 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Latent nets with learned cell channels under fp4 activations; the guided heads' adjoint (2026-11-09, branch perf-20261109)
+
+The winding latent net (w768: widths 96,128,160,192, 29 learned cell channels + 3 radial means, `--lat-guide 2`, `--fp8 1`) took
+3.2 s a P768 step against 1.3 s for the 32-wide rv net. Same-batch profile at P512 on an idle GPU 1, synchronised phases: 841 ms =
+trunk forward 84, trunk backward 310, slab adjoint 206, slab upsampling 50, label upload 37, targets 34, loss kernels 35, CT upload
++ gpu-aug 50, input 8, optimizer 9.
+- **Adjoint.** `nn_lat_up_adj` took the per-voxel gather whenever C > 28 (its scratch, the normal targets' 7 B a voxel, holds 28
+  channels of the intermediate): the guide-2 head has 32. It now runs the separable pair in channel groups of 28: 206 -> 60 ms,
+  step 841 -> 687 ms. `UFSM_LAT_CHECK`: rms difference / rms 1.3e-7 against the gather.
+- **`--fp8 1` was the rest.** Per conv, ms a step at P512: fp8 forward 83 / backward-data 58 / weight gradient 234 / GN 14; the same
+  net in fp4 (4 inputs): 48 / 46 / 57 / 5. `--fp8 1` was passed only because the first conv (32 MX-fp8 inputs) could not write
+  MX-fp4 activations: both mixed paths existed for <= 8 input channels only (the 4-channel stem's small kernel and its FAST weight
+  gradient).
+  - forward: the general fp8 kernel is now instantiated for MX-fp8 in / MX-fp4 out (it was templated on both; only the stem's
+    small kernel was compiled for mixed types), reached for any channel count from `conv3d` and `lp_conv_fwd_f8`.
+  - weight gradient: no kernel stages MX-fp4 gradients for a general fp8 conv, so `lp_bwd_w_f8` runs the MX-fp8 / MX-fp8 kernel on
+    z chunks (`bwd_w_f8_mixed`): the chunk's gradient rows re-encoded as MX-fp8 (exact: e2m1 values under their block scale are
+    e4m3 values) with a zero plane on either side, the input's planes with their halo copied; <= 96 MB of copies whatever the
+    window. fp8 compute on the exact operands, as the stem's FAST path does. (The fp4 weight-gradient kernel also accepts it with
+    `--policy all=fp4:fp4:fp4`, but rounds the cell channels to e2m1 in the gradient.)
+  - `tests/test_lat_conv0`: forward against a host fp32 convolution (rms error / rms 0.038 for fp8 rows, 0.119 for fp4 rows =
+    the e2m1 rounding, worst error 0.26 of the row's largest value) and the chunked weight gradient against the host sum and the
+    whole-tensor fp8 kernel (differences <= 2e-8 of the rms for 1, 3 and 6 chunks; the bias sums exact).
+  A `--lat-basis` run without `--fp8 1` now trains (default `--fp4 2` policy, `enc0.c1=fp16` = the fp8 compute above). Same batch,
+  P512, idle GPU: 687 -> 483 ms a step (measured with the fp4 weight gradient for conv0; the chunked fp8 one was built after the
+  GPU was taken and is timed only functionally: conv0's weight gradient is ~3 ms of either). Trunk forward 83 -> 48, backward
+  306 -> 124. Losses after 4 same-batch steps at P256: 2.4380 (fp4 trunk) against 2.4396 (`--fp8 1`).
+  **This is a precision change, not a rounding-level one**: the trunk's activations and gradients are stored and multiplied in fp4
+  as in every 4-input net; weights, optimizer state and the checkpoint format are untouched, and a `--fp8 1` checkpoint resumes
+  under fp4 (tried on a 6-step one). `--fp8 1` runs exactly as before.
+- Left in the slab section (P512, ms): upsampling 50 and adjoint 60 still cover all 32 planes of the guide-2 head although 13 are
+  unused; label upload 37 is hidden by the upload pipeline outside the synchronised profile.
+
 ## The winding mod 4 labels on the GPU: train --gpu-aug 3 (2026-11-09, branch perf-20261109)
 
 `band_wind4_tiled` was ~25% of the loader's CPU (hostmem round 2). Its bytes depend on the order of the unions (which run ends up

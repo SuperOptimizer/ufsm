@@ -69,7 +69,34 @@ static int stem_gnfuse(const void *x, int xbf, shape5 xs, const void *gy, shape5
     g_f8w_gnf = f8w_gnf_t{(const uint8_t *)ax, (const float4 *)cf};
     return 1;
 }
+/* The network input conv with more than 8 MX-fp8 input channels and MX-fp4 gradients (a latent net's learned cell channels under
+   fp4 activations): no kernel stages fp4 gradients for it, so the MX-fp8 / MX-fp8 kernel runs on z chunks, each chunk's gradient
+   re-encoded as MX-fp8 (exact) with a zero plane on either side and the input's planes with their halo copied (the weight gradient
+   is a sum over output voxels; the zero halo rows add nothing, the input's halo planes are the taps of the chunk's border rows).
+   <= ~96 MB of chunk copies. */
+static void bwd_w_f8_mixed(const void *x, shape5 xs, const void *gy, shape5 ys, float *gw, float *gb, gnp_t gp, split_t sp) {
+    int a_, c_;
+    if (xs.n != 1 || ys.n != 1 || sp.up || sp.x2 || gp.G != 0 || sp.gp2.G != 0 || zw_win(ys.d, &a_, &c_) || xs.d != ys.d) { fprintf(stderr, "lp_bwd_w_f8: MX-fp8 x (%d channels) with MX-fp4 gradients: only the plain network input conv (N 1, no GroupNorm of x, no z-window)\n", xs.c); abort(); }
+    const size_t HW = (size_t)xs.h * xs.w, pb = HW * ((size_t)mx_nb(xs.c) * (mx_bw(xs.c) + 1) + (size_t)mx_nb(ys.c) * (mx_bw(ys.c) + 1));   /* bytes a plane of both copies */
+    int CZ = (int)(((size_t)96 << 20) / pb) - 2; CZ &= ~1; if (CZ < 2) CZ = 2;
+    { static int cze = -1; if (cze < 0) cze = getenv("UFSM_F8W_MIXED_CZ") ? atoi(getenv("UFSM_F8W_MIXED_CZ")) : 0; if (cze > 0) CZ = cze; }   /* (tests: several chunks of a small tensor) */
+    if (CZ > xs.d) CZ = xs.d;
+    static uint8_t *tb[8]; static size_t tcap[8];
+    const int dv = cur_dev_(); const size_t need = (size_t)(CZ + 2) * pb;
+    if (need > tcap[dv]) { if (tb[dv]) cudaFree(tb[dv]); if (cudaMalloc(&tb[dv], need) != cudaSuccess) { fprintf(stderr, "lp_bwd_w_f8: no device memory for %.0f MB of chunk copies\n", need / 1e6); abort(); } tcap[dv] = need; }
+    const uint32_t sr0 = sp.sr;
+    for (int a = 0; a < xs.d; a += CZ) {
+        const int c = a + CZ < xs.d ? a + CZ : xs.d, z0 = a > 0 ? a - 1 : 0, z1 = c < xs.d ? c + 1 : xs.d, nz = z1 - z0;
+        uint8_t *tx = tb[dv], *tg = tx + (size_t)nz * HW * mx_nb(xs.c) * (mx_bw(xs.c) + 1);
+        lp_mx8_slice_z(x, xs.c, xs.d, HW, z0, nz, tx);
+        lp_mx4_to_mx8_z(gy, ys.c, ys.d, HW, z0, nz, a, c, tg);
+        shape5 xs2 = xs, ys2 = ys; xs2.d = ys2.d = nz;
+        if (sr0) sp.sr = sr0 + 0x9E3779B9u * (uint32_t)(a + 1);   /* (the rounding keys are per chunk element: another stream per chunk) */
+        bwd_w_f8_t<mx8_t, mx8_t>(tx, xs2, (const mx8_t *)tg, ys2, gw, gb, gp, sp);
+    }
+}
 extern "C" int lp_bwd_w_f8(const void *x, int xbf, shape5 xs, const void *gy, int gybf, shape5 ys, float *gw, float *gb, gnp_t gp, split_t sp) {
+    if (gybf == 4 && xbf == 3 && xs.c > 8) { lp_gnpend_flush_of(gy); bwd_w_f8_mixed(x, xs, gy, ys, gw, gb, gp, sp); LPCK(); return 0; }
     if (gybf == 4) {   /* MX-fp4 gradients: the network input conv (FAST path) only */
         const int fuse = stem_gnfuse(x, xbf, xs, gy, ys, sp);
         if (!fuse) lp_gnpend_flush_of(gy);

@@ -608,7 +608,8 @@ template <typename T, typename TO = T> void fwd_f8_t(const void *x, shape5 xs, c
         else small_f8<16, T, TO>(x, xs, w, b, cout, y, gp, osum, Go, sp);
         return;
     }
-    if constexpr (!std::is_same<T, TO>::value) {   /* mixed in / out types exist only for the network stem (Ci <= 8, small kernel):
+    if constexpr (!std::is_same<T, TO>::value && !(IS_MX8(T) && IS_MX4(TO))) {   /* mixed in / out types exist only for the network stem (Ci <= 8, small kernel;
+                                                       MX-fp8 in / MX-fp4 out also in the general kernels: a latent net's 32 learned cell channels into fp4 activations):
                                                        the general kernels are not instantiated for them (compile time) */
         fprintf(stderr, "lp_conv_fwd_f8: mixed input / output storage needs the small-channel kernel (Ci %d, UFSM_F8_NOSMALL unset)\n", xs.c); abort();
     } else {
