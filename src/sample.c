@@ -2731,6 +2731,8 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
     /* label encoding -> target probability * 255 and the ignore mask (255 = ignore) */
     PROF_MARK(PS_TRUST);
     uint8_t *ign = big + 9 * p3;
+    int ign_zero = 0;   /* 1: ign is all zero but not written yet (no channel with a target: the mask pass then reads only the CT) */
+#define IGN_REAL() ((void)(ign_zero && (memset(ign, 0, p3), ign_zero = 0, 1)))
     if (NCH == 2 && w[0] && w[1]) {   /* both channels in one pass (the same bytes as the per-channel loops below: ignore = either is 255) */
         uint8_t *d0 = ttmp, *d1 = ttmp + p3;
         for (size_t k = 0; k < p3; k++) {
@@ -2746,13 +2748,13 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
             else for (size_t k = 0; k < p3; k++) { const uint8_t v = dst[k]; ign[k] |= v == 255; dst[k] = v == 255 ? 0 : (uint8_t)(v + (v >= 127)); }
             first = 0;
         }
-        if (first) memset(ign, 0, p3);
+        if (first) ign_zero = 1;   /* (zeroed only when something reads or ORs into it: IGN_REAL) */
     }
     float pap_t = 0;
     if (c->papyrus) {   /* task papyrus: channel 0 (probability x 255) and its ignore band from the clean CT, before the scanner augmentation */
         const double u_mode = runif(r), u_t = runif(r), u_tau = runif(r);
         pap_t = papyrus_cutoff(c->papyrus, ctu, p3, u_mode, u_t);
-        papyrus_labels(ctu, P, c->papyrus, pap_t, u_tau, ttmp, ign, ttmp + p3, big + p3);   /* channel 1 as scratch, scratch 8 P^3 */
+        IGN_REAL(); papyrus_labels(ctu, P, c->papyrus, pap_t, u_tau, ttmp, ign, ttmp + p3, big + p3);   /* channel 1 as scratch, scratch 8 P^3 */
         memset(ttmp + p3, 0, p3);
         w[0] = 1;
     }
@@ -2765,7 +2767,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
         tp_put(pt, p3); tp_put(pg, p3); tp_put(pf, p3);
     }
     PROF_MARK(PS_ENCODE);
-    if (c->sheet) sheet_mask_contacts(c->sheet,o,P,ign);
+    if (c->sheet) { IGN_REAL(); sheet_mask_contacts(c->sheet,o,P,ign); }
     /* input channels (z-scored CT, radial unit vector) written in one pass straight into the batch with the symmetry
        and the jitter applied on the way (16-bit when cfg.xfmt, else fp32): no fp32 intermediates */
     double mean = sum / (double)p3, var = sq / (double)p3 - mean * mean, sd = sqrt(var > 0 ? var : 0) + 1e-3;
@@ -2787,12 +2789,14 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
         PROF_MARK(PS_ZSCORE);
         if (grec) {   /* --gpu-aug: the decisions and the label side here, the float ops on the device; ctu then holds only the output's zero
                          set (0 / 1: every later CPU reader of ctu needs no more with side_air 0, sample_gpu_aug_ok) */
+            const scan_aug_cfg *sc_ = &c->scan;   /* (the plan writes the mask only for these ops: seam, air, dropped slices / cutouts that ignore) */
+            if ((sc_->p[SA_SEAM] > 0 && !c->sheet && !c->band && !c->side) || sc_->p[SA_AIR] > 0 || (sc_->drop_ignore && (sc_->p[SA_DROPSLICE] > 0 || sc_->p[SA_CUTOUT] > 0))) IGN_REAL();
             const unsigned on = scan_aug_plan(&c->scan, rnext(r), ctu, ttmp, NCH, ign, P, o, cyz, cxz, s->ax.n > 0, m->chunk, !c->sheet && !c->band && !c->side, &grec->plan);
             grec->scan = on != 0;
             if (on) {
                 scan_plan_notair(&grec->plan, ctu, b->ct8 + (size_t)i * p3);   /* (the bytes as read into ct8, then ctu = !scan_plan_air in place: one pass) */
             }
-        } else if (scan_aug_apply(&c->scan, rnext(r), ctu, ttmp, NCH, ign, P, o, cyz, cxz, s->ax.n > 0, m->chunk, !c->sheet && !c->band && !c->side, big + p3)) {
+        } else if ((IGN_REAL(), 1) && scan_aug_apply(&c->scan, rnext(r), ctu, ttmp, NCH, ign, P, o, cyz, cxz, s->ax.n > 0, m->chunk, !c->sheet && !c->band && !c->side, big + p3)) {
             size_t nz2;   /* (integer sums: the same doubles as accumulating the bytes in double, exact below 2^53) */
             u8_stats(ctu, p3, &nz2, &sum, &sq);
             mean = sum / (double)p3; var = sq / (double)p3 - mean * mean; sd = sqrt(var > 0 ? var : 0) + 1e-3;
@@ -2802,12 +2806,19 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
     if (grec && !grec->scan) memcpy(b->ct8 + (size_t)i * p3, ctu, p3);   /* (the bytes as read) */
     if (s->norm_s > 0) { mean = s->norm_c; sd = s->norm_s; }   /* "norm": the scan's fixed normalisation (ufsm scanprep median / scale) instead of the window z-score */
     uint8_t *mask = big + 9 * p3;   /* ign lives here: fold CT > 0 into it */
+    /* (MK: the loss mask at k; ign_zero: nothing ignored, the mask is the CT test alone and ign is not read) */
+#define MK(k) (ign_zero ? (uint8_t)(ctu[k] != 0) : (uint8_t)((ctu[k] != 0) & (mask[k] == 0)))
     if (ink_it) {   /* (the --rv papyrus plane: ct8 >= cutoff 254, else 0; unknown where masked) */
         const uint8_t *c8 = b->ct8 + (size_t)i * p3; const uint8_t it = (uint8_t)(ink_it > 255 ? 255 : ink_it);
-        if (ink_it > 255) for (size_t k = 0; k < p3; k++) { const uint8_t mk = (ctu[k] != 0) & (mask[k] == 0); mask[k] = mk; inkw[k] = mk ? 0 : 255; }
+        if (ink_it > 255) for (size_t k = 0; k < p3; k++) { const uint8_t mk = MK(k); mask[k] = mk; inkw[k] = mk ? 0 : 255; }
+        else if (ign_zero) for (size_t k = 0; k < p3; k++) { const uint8_t mk = ctu[k] != 0; mask[k] = mk; inkw[k] = mk ? (c8[k] >= it ? 254 : 0) : 255; }
         else for (size_t k = 0; k < p3; k++) { const uint8_t mk = (ctu[k] != 0) & (mask[k] == 0); mask[k] = mk; inkw[k] = mk ? (c8[k] >= it ? 254 : 0) : 255; }
-    } else if (inkw) for (size_t k = 0; k < p3; k++) { const uint8_t mk = (ctu[k] != 0) & (mask[k] == 0); mask[k] = mk; inkw[k] = mk ? inkw[k] : 255; }   /* --ink-head: unknown on CT 0 and where the scanner augmentation ignores labels */
+    } else if (inkw) for (size_t k = 0; k < p3; k++) { const uint8_t mk = MK(k); mask[k] = mk; inkw[k] = mk ? inkw[k] : 255; }   /* --ink-head: unknown on CT 0 and where the scanner augmentation ignores labels */
+    else if (ign_zero) for (size_t k = 0; k < p3; k++) mask[k] = ctu[k] != 0;
     else for (size_t k = 0; k < p3; k++) mask[k] = (ctu[k] != 0) & (mask[k] == 0);
+    ign_zero = 0;   /* (mask written) */
+#undef MK
+#undef IGN_REAL
     PROF_MARK(PS_ZSCORE);
     /* packed targets (cfg.pack_tm): unwarped samples pack the code in the source frame over the mask (one symmetry copy into the batch);
        warped ones warp into pooled scratch and pack after */
