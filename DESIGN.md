@@ -6,6 +6,139 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Fibre judge in C, streamlines from the official prediction, PHerc1299, the public human fibre annotations, H / V labels (2026-11-10, branch fibers-20261110)
+
+Follow-up of the section below. New commands, each with a fast-tier test on synthetic data: `ufsm fiber-judge` (`src/fiberjudge.c`,
+`test_fiberjudge`, which also covers `wrap-dump` and `fit-phase-box`), `ufsm fiber-trace` (`src/fibertrace.c`, `test_fibertrace`),
+`ufsm fiber-raster` (`src/fiberraster.c`, `test_fiberraster`). All CPU. Scratch: `/vesuvius/ufsm/fibers/work`; drivers `tools/trace_1299.sh`,
+`scripts/fibers/`.
+
+**`fiber-judge`** is `tools/fibjudge.py`'s measure: fibres (an AFV, optionally through a published transform, or a UFIB file of level-0
+points) against our winding from the wraps (nearest vertex per wrap-id parity, phase = d1 / (d1 + d2) between the two sheets), a band-phase
+store, or a joined fit set. Per 512^2 x NZ tile and family: labelled arc, excursions (hysteresis 0.75 turn after a 9-sample median),
+PERSISTENT sheet changes (|sum of the signed excursions| per labelled stretch; excursions - persistent = there-and-back), pairs within half
+a turn at each distance. Against the Python on the same 0175A tile: same 214,718 samples, arc 0.9414 / 0.9096 m (0.9405 / 0.9095), excursions
+185 / 478 (183 / 476), pairs at 64 voxels 4592 / 5378 (4586 / 5372) - the nearest-vertex search is exact here, the KD-tree's was not;
+38 s for the tile against minutes. Its "persistent" is not the Python's "net" (that one rounded end - start of 8-sample medians: 127 / 257
+on this tile against 99 / 224): numbers of the two must not be mixed. Paris4_v1 against GT reproduces: 0.9376 at 0.61 mm, 122.8
+excursions / m (Python 0.937, 125).
+
+**`fiber-trace`** integrates streamlines through the official prediction (presence, nx, ny). The encoding is not documented with the
+data; measured against the uploader's Paris4_v1 streamlines in two level-4 chunks (2538 + 2554 samples): the axis is stored on the z >= 0
+hemisphere, t = ((nx - 128) / 127, (ny - 128) / 127, +sqrt(1 - x^2 - y^2)) in (x, y, z): |cos| median 0.996 / 0.997 at presence >= 64 (the
+three other axis assignments 0.25 .. 0.95). Tracer = the community description of v1 (seed = presence maximum per 8^3 cell at >= 64,
+trilinear sum of presence-weighted dyads, principal axis by power iteration, support 0.2, coherence lambda_1 / trace 0.65 (my reading of
+"coherence"), 35 degrees a step, midpoint, 256 steps each way), plus a rule v1 does not describe: a seed within 1 voxel of an earlier line
+is skipped (without it every voxel of a fibre's cross-section starts its own parallel line: 142,715 lines instead of 86,597 on the Paris 4
+box, same judge numbers). Family: V when the mean squared axial tangent component is > 1/2.
+Validation on Paris 4 against GT, slab z 11328 + 512 at 9.6 um, 92 tiles (pairs within half a turn at 0.6 mm; excursions / persistent per m):
+
+| fibres | arc m | H pairs | V pairs | H exc / pers | V exc / pers |
+|---|---|---|---|---|---|
+| mine, level 4 (38.4 um) | 139.9 | 0.9249 | 0.9084 | 142 / 111 | 201 / 149 |
+| Paris4_v1 (no family) | 44.5 | 0.9376 | | 123 / 98 | |
+| mine, level 3 vs level 4, the same 16 tiles | 255 / 52 | 0.9135 / 0.9159 | 0.8707 / 0.8668 | 155 / 155 | 267 / 274 |
+
+So my tracer is slightly below v1 (longer lines: it has no length cap by family) and level 3 (19.2 um) buys nothing over level 4 for this
+judge: against the wraps the two levels also agree (H 0.762 / 0.760, V 0.681 / 0.675). 19.2 um is 5 voxels per sheet pitch (median gap
+of wrapcheck.tsv: 1299 98 um, 1218 93, Paris 4 114, 1447 / 0175A / 0125 101): too coarse to place a line inside a sheet, enough to follow
+it, and the judge only asks which sheet the line is in.
+
+**PHerc1299** (official prediction on scan 20260309130042 = our CT; presence aligned with our CT: correlation 0.451 at level 4, 0.09 .. 0.13
+for the flipped / transposed frames; presence >= 64 in 16.6 % of papyrus). Slab z 10944 + 512 at 9.596 um (the same slab size as the other
+rows), 26 tiles, my level-3 streamlines (66 m labelled):
+
+| scroll, fibres -> basis | H pairs 0.6 mm | V pairs 0.6 mm | H exc / pers per m | V exc / pers per m |
+|---|---|---|---|---|
+| Paris 4, v2 AFV -> wraps (section below) | 0.761 | 0.709 | 400 | 497 |
+| Paris 4, my streamlines -> wraps | 0.775 | 0.728 | 342 / 206 | 417 / 199 |
+| 1447, v2 AFV -> wraps | 0.764 | 0.735 | 407 | 477 |
+| 0175A, v2 AFV -> wraps | 0.746 | 0.689 | 473 | 528 |
+| 0125, v2 AFV -> wraps | 0.588 | 0.570 | 845 | 875 |
+| **1299, my streamlines -> wraps (unsnapped, 88)** | **0.596** | **0.674** | 748 / 637 | 506 / 339 |
+| 1299, my streamlines -> surf-labels (`latcal/labels/PHerc1299`) | 0.684 | 0.739 | 697 / 660 | 453 / 378 |
+
+By this judge 1299 sits with 0125, below Paris 4 / 1447 / 0175A, and its excursions are 85 % persistent on H (Paris 4: 60 %). What this
+does and does not show: the Paris 4 rows say my streamlines judge like the v2 fibres do there; nothing validates the streamlines ON 1299
+(no GT, no human fibres published for it), so the 1299 row is an upper bound on our labels' error, not a measurement of it. A second,
+local measure does not separate the scrolls: fibre tangent against the normal of the labels (gradient of the phase raster, 128-slice
+box): 1299 |t . n| median 0.138 H / 0.134 V (7.9 / 7.7 degrees out of the sheet), Paris 4 against GT 0.120 / 0.159 (6.9 / 9.2). A persistent
+rate of 600 / m at a 100 um pitch is a mean slope of 0.06 = 3.5 degrees, inside what the tangent test cannot resolve. The user's own
+reading of 1299 is "quite good"; the judge's row does not overturn that, it says the fibre evidence on 1299 is not clean enough to decide.
+PHerc1218 has no official fibre prediction (only lasagna and surfaces) and no AFV: see the routes below.
+
+**The official model, its code and its training annotations are public.** Weights: Hugging Face `scrollprize/lasagna-fiber`, ungated,
+three checkpoints (`5scroll_json_eligible_refinement_128_sd1_16x8_ema_20260915_212757/snapshots/best_ema_0p999.pt` 220 MB = the model of
+the open-data predictions; `s1a_128_1_..._best91_5k.pt` and `s1a_128_2_..._best_25_9k.pt` 344 MB each). Its card documents the two S1A
+checkpoints only (U-Net depth 5, base 16, pixel-shuffle decoder, BatchNorm, z-score input, 128^3 patches, 7 raw outputs = 6 direction
+values + presence, bf16; "trained on S1A NML fibers registered to the PHercParis4 2.4 um volume"); no licence field. Code: GitHub
+`ScrollPrize/villa`, `vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/` (`infer`, `train`, annotations, evaluation; revision
+9bcb5938 recorded in the predictions, "dirty"). Annotations: the Hugging Face storage bucket `scrollprize/datasets` (listable and
+downloadable without credentials today, although this file's first paragraph calls it gated), `spiral/<scroll>/fibers/*.json`, type
+`vc3d_fiber`: control points, the traced line (`line_points`, level-0 xyz of the 2.4 um scan, 8 voxels apart), per segment the tracing mode
+(trace through a fibre prediction / cspline / lasagna), an automatic H / V tag, branches, review tags. Downloaded (289 MB,
+`/vesuvius/ufsm/fibers/raw/hf_fibers`):
+
+| scroll | files | line m (H / V) | control points | tags |
+|---|---|---|---|---|
+| PHercParis4 | 136 | 12.93 (7.26 / 5.67) | 5,639 | all "reviewed", 4 "problems" |
+| PHerc0139 | 411 | 30.66 (15.78 / 14.87) | 13,570 | none |
+| PHerc0332 | 77 | 2.48 (2.00 / 0.48) | 13,394 (12,870 cspline) | 7 "reviewed" |
+| PHerc1451 | 72 | 7.17 (5.03 / 2.14) | 6,240 | none |
+
+53 m in 696 files on four scrolls; the run name says five and the fifth is not in the bucket (I infer PHerc1299, the fifth scroll with
+a prediction; not verified). Also public, not downloaded: the open-data `PHercParis4/representations/spiral/20260411134726-spiral-dataset-20261019084150/`
+holds `fibers.afv` (11.1 GB), `fiber_directions.npz` (2.7 GB) and `eval_fibers/*.json`.
+The human lines sit on the predicted fibres (Paris 4, level 4: presence mean 146 on the line, 32 two voxels beside it; |cos| to the
+predicted axis median 0.997), which is how they were made: mostly traced THROUGH a fibre prediction between human control points.
+Against GT they are not cleaner than the automatic fibres. Whole GT band (z 8704 + 3584, 54 tiles, 2.74 m labelled): H pairs 0.850 at
+0.6 mm, 340 excursions / m (243 persistent); V 0.797, 500 (323). In the 33 tiles of the 11328 slab that hold both: human 0.793, 446 / m
+(295 persistent); my streamlines in the same tiles weighted by the human arc 0.867, 261 (194); Paris4_v1 0.900, 199 (155). Human lines
+run on where the automatic tracers stop (through low coherence), and those are the places where the GT phase is least certain too; I
+did not separate the two causes.
+
+**Same winding along a fibre as a training constraint: the number.** Persistent sheet changes per metre against GT on Paris 4: Paris4_v1
+98, my streamlines 111 H / 149 V, human-reviewed lines 243 H / 323 V; the codes-only floor of the section below, on its 10 good tiles,
+was <= 14. One change per 7 .. 10 mm on the automatic fibres, with the GT's own errors inside that figure. A hard constraint is not
+supported by any of these sets; a soft pair term over <= 0.3 mm (pairs within half a turn 0.93 .. 0.95) is, and so is the vote use that
+already measured positive (`--uw-rep-fib`, section below).
+
+**`fiber-raster` and the H / V mask model (not trained).** `fiber-raster` writes two prob254 volumes on the level-0 CT grid: plane H is
+254 within 2 voxels of an H fibre axis, 0 within 2 voxels of a V axis and in air (CT < 64), 255 elsewhere (the guard ring, crossings,
+fibres without family, and all papyrus no tracing covers: the AFVs hold fibres > 1 mm only); plane V the reverse. One 512-slice band of
+0175A: 171 M H and 178 M V fibre voxels, 4.3 min at 2 threads, 880 MB. `scripts/fibers/mklabels.sh` (1447 whole, 0175A z 1024..11776;
+running at the time of writing), `mksources.sh` (targets "recto" = H, "sheet" = V, `encoding: prob254`, wbench holdouts),
+`train_hv.sh NAME STEPS` = `scripts/rv/train.sh` with the default two-channel mask task (`--dice 0.5 --pos-weight 4`), P 512, the 7-level
+net 16,16,32,64,128,192,256, MX-fp4, `--mem auto`. Expected memory, inferred from the voxel net's recorded 61.8 B per window voxel at
+P576 (the latent-grid section of 2026-11-09): about 8.3 GB of activations at P 512, 11.8 GB at P 576 on a 16 GB card, with
+2 head channels instead of 11; not measured for this task - the first launch should be `UFSM_MEM_DRY=1` and a 200-step smoke run.
+Nothing here has run on a GPU.
+
+**3b, design only: the normal head should be orthogonal to fibres.** With N = the predicted sign-free normal dyad (6 channels at
+`g_norm_ch`, `sigmoid` outputs coding n n^T as nn_unwrap_targets2 writes it) and t a fibre tangent, the term is L = lambda t^T N t at fibre
+voxels (0 when the fibre lies in the predicted sheet, 1 when it is along the normal). It needs no winding label, so it trains the normal
+head where we have fibres and no spiral. Sites: (1) a label plane: the sampler's batch gets `fib` = B x P^3 x 2 bytes (the tangent on the
+z >= 0 hemisphere, the published nx / ny encoding, 128,128 with a zero third byte = none), rasterised like `fiber-raster` from a sources
+entry `"fibers": {root, group}` (two more uint8 volumes, a `fiber-raster` option still to be written), rotated by the spatial augmentations as a
+direction (the normal targets avoid this by being derived from the warped phase; the tangent plane cannot, so `spatial_augment.c` has to
+apply its local rotation to it - the one new piece of sampler work); (2) `head_slab_pass` (`src/train.c:846`):
+after `nn_unwrap_targets2_z` (line 952) builds `d->nt / d->nm`, a kernel `nn_fib_ortho(LGC(g_norm_ch), fib + vb, ns, lambda, grad)` adds
+dL/dN_k = lambda c_k t_i t_j into the six normal gradient channels after `nn_loss_grad_only` (line 999) has written them, and its sum into
+`d->hs_ds` for the log; in pass 0 only the statistic. The whole-window path (line 1306..1315) gets the same call; the fused latent path
+(`nn_lat_fuse_grad`, line 1021) does not and the flag must refuse `--lat` until it does. (3) flag `--fib-lambda` (default 0: checkpoints
+and old runs unchanged; no new parameters). Test: central differences of the kernel against a host reference, as for the other loss
+kernels. Buffers: the plane is uint8 x 2 per voxel on the host, uploaded per 32-plane slab with the other label planes; no fp4 question
+arises (it is a label, not an activation). Expected size of the effect is unknown; the tangent-vs-normal medians above (7 .. 9 degrees
+against GT normals) say the fibres are consistent with the sheets to that accuracy, which is the ceiling of what this term can teach.
+
+**PHerc1218 (no fibres published): two routes.** (a) One-off inference with the public model, outside the pipeline: clone villa, its
+bootstrap venv (PyTorch cu128), `python -m vesuvius.neural_tracing.fiber_trace_3d.infer` with the SD2 checkpoint on level 0 of the 8.64 um
+scan (the card's own recipe for a 9.36 um scan, "transfer use"). For the judge one 640-slice slab is enough: 7593^2 x 640 voxels = 1,152
+tiles of 320^3 net (512 with overlap 96); the whole scroll is 42,048. Needs a free GPU; I have no throughput figure for that model and did
+not run it. (b) Our own H / V predictor from the labels above, then `ufsm predict` on 1218: 1447, 0175A and 1218 are the same acquisition
+(8.64 um, 1.2 m, 116 keV), so no transfer gap, but it needs the training run first and gives masks, not directions (streamlines would
+need the direction planes of 3b). (a) is the quicker way to a 1218 row; (b) is the one that stays in the pipeline.
+
 ## Published automated fibre volumes: what they are, how good, fibres as a judge of our spirals, plan (2026-11-10, branch fibers-20261110)
 
 Source: `https://dl.ash2txt.org/community-uploads/qual/AutomatedFiberVolumes/` (community upload, 11 `.afv` files + one PNG set). Local copy
@@ -154,6 +287,26 @@ form on the w4 / phase heads (two points of one fibre in a window: equal w4 clas
 sampler; (4) fibre mask as an auxiliary head or as `--aux-input`: only after (a) exists for all 33 scrolls, since an input channel must
 exist at inference. Measure on wbench against wind96 (p05x, ids; `BOXES=core`): Paris 4 boxes are the only bench boxes with AFV fibres, so
 (2) and (3) are first tried with Paris 4 fibres at 19.2 um cells where the 10-30 um registration error is under a fifth of a cell.
+
+## The 10-26 / 11-05 fibre work: fiber-check, fiber-export, fibre terms in the fit (recovered 2026-11-10 from commit messages)
+
+This section was not written at the time. Everything in it is copied from the messages of commits 6a0e2d1 (2026-10-26) and d397bf4
+(2026-11-05); the numbers are as recorded there and were not re-measured.
+
+- 6a0e2d1: `ufsm fiber-check` (published AFV fibre polylines against GT sheets: same-fibre pairs, tangent / straight / rand3d baselines,
+  a path-unwrapped network-phase filter, H / V layer order, a CT translation search, label facing); `ufsm fiber-export` (box-local
+  polylines); `fit --fibers F --w-fib W` (pair loss W(b) - W(a) = the phase change along the fibre, in every fit stage); `src/afv.c` reads
+  the AFV SQLite through a dlopen'ed libsqlite3; `test_afv`.
+- d397bf4: `--uw-rep-fib W` (with `--fibers`, `--uw-repair`): same-fibre pairs vote integer shifts between repair pieces in the L1 solve
+  (`src/fit.c` uwr_fib). Paris 4, 15 boxes with AFV fibres: W 16 ids +0.021 [+0.006, +0.040], P 0.999, p05x flat (J34 +0.14, J22 / J23 / J26
+  +0.05, HOLD -0.03); W >= 64 overrides the phase (J34 -0.14 at 256).
+- d397bf4: fibre loss terms `--fib-spans`, `--w-fib-cons` / `--fib-cons-len` (per-fibre consensus, winding-field style): at W 0.1 .. 0.3 they
+  move ids < 0.001, at 1 they hurt.
+- d397bf4: fibre trace knobs `--fib-conf` / `--fib-gap` / `--fib-dmax` and the hop gate `--uw-rep-fib-hop` / `--uw-rep-fib-min`, all off by
+  default: the stricter trace drops the fibres that fix slips, the hop gate flags ~0 fibres.
+- d397bf4: `fiber-check --fit-pat`: a GT-free fit score (fibre drift / separation); drift against ids Spearman -0.62 over 11 J boxes.
+- Reading it with today's numbers: the vote use gains because a vote needs only the majority of fibres to be right over a short span;
+  the loss terms ask every fibre to hold its sheet, and one persistent change per 7 .. 10 mm (section above) is why they do not pay.
 
 ## Inference from the stored latent volume, without the CT (2026-11-10, branch latinf-20261109)
 
