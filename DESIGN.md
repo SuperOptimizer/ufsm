@@ -20,8 +20,18 @@ planner prints 1e9-byte GB). rv = 32,64,128,192,256 with lat_guide 5; winding = 
 | P 1024 | refused by the planner (18.61 / 19.34) | | 8.55 / 11.92 |
 
 The resumes' losses are equal streamed and stored (wz768 1.1792 1.1791 1.1791; g768 1.2592 1.2590 1.2589). The rv P 960 run made no
-step and logged no error (not explained). The "now" column has no real step behind it above P 512 yet for the chunked kernel: the
-card is shared again. P 512 beside the production run: winding 2.46 GB real / 2.67 planned, rv 1.88 / 1.91.
+step and logged no error (not explained). P 512 beside the production run: winding 2.46 GB real / 2.67 planned, rv 1.88 / 1.91.
+
+Second window (2026-11-10 00:21 - 00:30, after both fixes below; fp4, streamed head, `--mem auto` picked mode 4 without an
+override every time; one sampler slot and 2 workers to stay under a 20 GB host cap; 3 - 6 steps, same batch):
+
+| run | real peak | planner | rate |
+|---|---|---|---|
+| rv P 960 / 1024 / 1088 / 1152 / 1216 | 7.28 / 8.49 / 9.96 / 11.52 / 13.25 GB | 7.41 / 8.72 / 10.20 / 11.84 / 13.66 | 0.87 / 0.74 / 0.60 / 0.51 / 0.43 samp/s (770 - 795 Mvox/s) |
+| winding P 960 / 1024 / 1088 | 9.99 / 11.75 / 13.83 GB | 10.33 / 12.16 / 14.22 | 0.48 / 0.40 / 0.33 samp/s (425 - 435 Mvox/s) |
+
+The planner is 2 - 3.5% above the real peak over the whole range. The first window's rv P 960 run with 0 steps was the host cap,
+not the device: the kernel log has the cgroup OOM kill at 23:05:17 with 20.0 GB of shared memory (three sampler slots at P 960).
 
 Two planner errors and one kernel:
 
