@@ -572,14 +572,14 @@ int main(void) {
         printf("  %-46s gw fp4 vs fp8 gy %.3g, bias %.3g%s\n", w3 == 2 ? "wgrad s2 32 -> 32 Wo 10, gy MX-fp4 (FAST)" : which ? "wgrad s2 32 -> 32, gy MX-fp4 (FAST)" : "wgrad stem 4 -> 32, gy MX-fp4 (FAST)", d, db, ok ? "" : "  FAIL");
         if (!ok) bad++;
     }
-    for (int C = 8; C <= 96; C += C <= 16 ? C : 32) for (int accum = 0; accum < 2; accum++) {   /* stride-2 backward-data, MX-fp4 gy / gx (tensor cores; 96: the dilated fp8 path via MX-fp8 copies) */
+    for (int C = 8; C <= 160; C += C <= 16 ? C : 32) for (int accum = 0; accum < 2; accum++) {   /* stride-2 backward-data, MX-fp4 gy / gx (tensor cores to 128; 160: the dilated fp8 path via MX-fp8 copies) */
         shape5 xs = {1, C, 16, 16, 32}, ys = {1, C, 8, 8, 16};
         size_t nx = shape_numel(xs), ny = shape_numel(ys);
         float *w = dev_rand((size_t)C * C * 27, 0.1f), *gy = dev_rand_wide(ny, 1e-3f), *g0 = dev_rand(nx, 1e-3f);
         void *gym = mx4_from(gy, ys); float *gyd = deq4(gym, ys);
         void *g0m = mx4_from(g0, xs); float *g0d = deq4(g0m, xs);
         mode_ref();   /* the scratch sized for the fp32 reference (it needs the whole output there) */
-        float *wr = C == 16 || C == 32 || C == 64 ? w_s2b_e2m1(w, C) : w;   /* 16 / 32 / 64 channels: the fp4 kernels (their weights in e2m1); 8: bf16 tensor cores */
+        float *wr = C == 16 || (C >= 32 && C <= 128) ? w_s2b_e2m1(w, C) : w;   /* 16 / 32 / 64 / 96 / 128 channels: the fp4 kernels (their weights in e2m1); 8: bf16 tensor cores */
         float *gxr = dev_zero(nx), *scr = nn_malloc(nn_conv3d_scratch(xs, C, 3) + 4096); nn_conv3d_bwd_data(gyd, ys, wr, xs, 3, 2, gxr, scr);   /* fp32: no accumulate variant; add the old gradient */
         if (accum) nn_axpy(gxr, 1.f, g0d, nx);
         void *gxm = mx4_new(xs); float *acc = dev_zero(nx), *one = dev_zero(nx), *tmp = dev_zero(nx);
