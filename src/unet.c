@@ -3738,7 +3738,12 @@ float *unet_grad_ptr(unet *u) { return u->g; }
 void unet_grad_d2h(unet *u, float *host) { nn_d2h(host, u->g, u->np * 4); }
 void unet_grad_h2d(unet *u, const float *host) { nn_h2d(u->g, host, u->np * 4); }
 double unet_grad_norm(unet *u) { return sqrt(nn_sumsq(u->g, u->np, u->red_scratch)); }
-double unet_param_norm(unet *u) { return sqrt(nn_sumsq(u->fw, u->np, u->red_scratch)); }   /* debugging (train UFSM_DET_TRACE): the forward weights' norm */
+uint64_t unet_param_hash(unet *u) {   /* debugging (train UFSM_DET_TRACE): FNV-1a of the forward weights' bytes */
+    const size_t nb = u->np * sizeof(float); uint8_t *h = malloc(nb); uint64_t x = 1469598103934665603ull;
+    nn_sync(); nn_d2h(h, u->fw, nb); for (size_t q = 0; q < nb; q++) x = (x ^ h[q]) * 1099511628211ull;
+    { static int nc; if (getenv("UFSM_DET_PDUMP") && ++nc == (getenv("UFSM_DET_PSTEP") ? atoi(getenv("UFSM_DET_PSTEP")) : 2)) { FILE *f = fopen(getenv("UFSM_DET_PDUMP"), "wb"); if (f) { fwrite(h, 1, nb, f); fclose(f); } } }   /* (the nth call's weights, raw) */
+    free(h); return x;
+}
 void unet_clip_grad(unet *u, double max_norm) {
     double n = unet_grad_norm(u);
     if (n > max_norm && n > 0) nn_scale(u->g, (float)(max_norm / n), u->np);

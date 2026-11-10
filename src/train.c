@@ -3132,7 +3132,7 @@ int cmd_train(int argc, char **argv) {
                 uint64_t hx = 1469598103934665603ull, hl[4] = {0, 0, 0, 0};
                 nn_d2h(hb, d->x, nx); for (size_t q = 0; q < nx; q++) hx = (hx ^ hb[q]) * 1099511628211ull;
                 if (g_lstream) for (int k = 0; k < 4; k++) if (d->lbh[k]) { uint64_t h = 1469598103934665603ull; for (size_t q = 0; q < p3t; q++) h = (h ^ d->lbh[k][q]) * 1099511628211ull; hl[k] = h; }
-                fprintf(stderr, "dettrace step %d: x %016llx labels %016llx %016llx %016llx %016llx params %.9g\n", step, (unsigned long long)hx, (unsigned long long)hl[0], (unsigned long long)hl[1], (unsigned long long)hl[2], (unsigned long long)hl[3], unet_param_norm(d->u));
+                fprintf(stderr, "dettrace step %d: x %016llx labels %016llx %016llx %016llx %016llx params %016llx\n", step, (unsigned long long)hx, (unsigned long long)hl[0], (unsigned long long)hl[1], (unsigned long long)hl[2], (unsigned long long)hl[3], (unsigned long long)unet_param_hash(d->u));
                 free(hb);
             }
             if (sparse_at && step >= sparse_at && !unet_get_sparse24(d->u)) { unet_set_sparse24(d->u, 1); if (g == 0) fprintf(stderr, "step %d: 2:4 sparsity on (SR-STE lambda %g)\n", step, srste); }
