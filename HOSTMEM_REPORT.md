@@ -397,3 +397,57 @@ few % at most. With --replay K the loader cost per delivered voxel drops by K, w
 - Fast CPU tier: 81 passed.
 - GPU tests on GPU 1: test_gpu_aug, test_gpu_input, test_unwrap2_sampler, test_l0_stream, test_wind*, test_pack_tm pass.
 - The 11 CUDA-dependent entries are now tagged gpu (3bafbbd), so with `-g none` they SKIP.
+
+## Round 3c: w4 / wcomp slot drop with --gpu-aug 3, replay + lean test (2026-11-09)
+
+### w4 runs (6c9112b)
+On by default with --gpu-aug 3; `UFSM_W4_RUNS=0` turns it off.
+- **What the slot holds:** band_wind4_tiled's decision per run instead of the w4 / wcomp planes (band_w4dev.h `w4runs`): per
+  strip row the index of its first run, and per run its turns to the root (ro) and its component (cb). Measured ~0.035-0.06 runs
+  per voxel at P512, i.e. ~0.06 B/vox, pageable.
+- **The phase:** every window's phase stays on the source grid. With side_air 0 the side plane is exactly the winding input.
+- **At upload, on the device:**
+  - nn_w4runs_label rebuilds w4 / comp from the side plane, per strip: perf's w4_runs_k + w4_out_k, through nn_w4runs_apply.
+  - The result then goes through lw_w4_k (warped windows) or the cube symmetry (unwarped windows).
+  - nn_label_sym applies the symmetry to the phase of unwarped windows.
+- **nn_w4.cu (perf's file, existing behaviour unchanged):**
+  - ctx_run gets an optional runs output.
+  - The kernels' row bodies become `__host__ __device__`, giving a CPU fallback (cpu_runs) with the same offsets, replay and
+    numbering.
+  - w4runs_apply_host rebuilds the planes on the host.
+  - band.c gets weak stubs for binaries without nn.o.
+- **When it is used:** sampler_start keeps it only with cubes, side_air 0, no --phase-near-um / --aug-tear / sheet / band, and
+  nn.o linked.
+- **Effect:** a slot is 2.125 B/vox (CT + phase + ink bits). Pinned slots for P384 x 5: 1.17 -> 0.61 GB. Estimate at P768:
+  S12 + S10 = 22 slots x 0.96 GB = 21 GB pinned (41 GB with ink bits alone, 50 before).
+
+Byte-identical, checked three ways:
+- test_w4dev, extended: 72 cases x (device runs, CPU runs) x (host rebuild, device rebuild), all equal to band_wind4_tiled.
+- the sampler's batch hashes with the planes rebuilt on the host: 24 --det P512 windows, and --replay 3 against the round-3 hashes.
+- a 20-step --det 1 P384 GPU run with --gpu-aug 3: the losses equal UFSM_W4_RUNS=0 and --gpu-aug 2.
+
+### tests/test_replay_lean (c403504, fast tier, CPU)
+- The unwrap2 --rv --gpu-aug 2 sampler with ink bits + w4 runs (the CPU runs path) + --replay 2, against the plain byte-plane path.
+- Every new window (batch.use 0) hashes the same plane by plane (sampler_batch_hash); every replay keeps its window's CT and is
+  warped.
+- Passes: 12 windows, 12 replays.
+
+### Fast tier
+**latcomp 3f4e740 + my branch** (clean worktree, GPU 1):
+
+| test | failure | cause |
+|---|---|---|
+| test_rv | test_rv.c:71, recto and verso volumes identical | predict; perf's fix is in the combined tree |
+| test_unwrap2_ink | test_unwrap2_ink.c:64, the --init-from warm start at lr 0 changes the trunk weights | not the sampler |
+| test_cover_training | | gpu2 test, run on one GPU |
+| render GPU tests | | GPU memory taken by the production trainer; pass on rerun |
+| test_pack_tm | | flake; pass on rerun |
+| the Python tests | | needed the build/ binaries; pass once built |
+
+**latcomp + perf + my branch:** 177 passed. Failing:
+- test_unwrap2_ink (as above)
+- test_cover_training (gpu2)
+- test_pack_tm part 1: a device-unpack mismatch on the copy stream in 1 of 5 runs, a race in the test or in nn_unpack_tm, not the
+  sampler
+
+test_rv passes on the combined tree.
