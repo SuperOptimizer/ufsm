@@ -33,3 +33,6 @@ typedef struct { int n, npts; int *off; char *fam; float *pts; } fib_set;
 int fib_save(const char *path, const fib_set *f);
 int fib_load(const char *path, fib_set *f);   /* 0 or -1 */
 void fib_free(fib_set *f);
+/* a published transform.json (3x4 "transformation_matrix": our scan's level-0 xyz -> the AFV scan's xyz) and the inverse of its 3x3 part
+   ; 0 or -1 */
+int fc_transform(const char *path, double M[3][4], double Mi[3][3]);

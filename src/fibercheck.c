@@ -433,21 +433,6 @@ int cmd_fiber_check(int argc, char **argv) {
 }
 
 /* the published transform (label-scan L0 xyz -> AFV xyz) and its inverse */
-static int fc_transform(const char *path, double M[3][4], double Mi[3][3]) {
-    FILE *f = fopen(path, "rb"); if (!f) return -1;
-    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET); char *t = malloc(n + 1); if (fread(t, 1, n, f) != (size_t)n) n = 0; t[n] = 0; fclose(f);
-    json *j = json_parse(t, n); free(t); const json *m = j ? json_get(j, "transformation_matrix") : nullptr;
-    if (!m || m->n < 3) { json_free(j); return -1; }
-    for (int r = 0; r < 3; r++) for (int c = 0; c < 4; c++) M[r][c] = json_num(json_at(json_at(m, r), c), NAN);
-    json_free(j);
-    const double a = M[0][0], b = M[0][1], c = M[0][2], d = M[1][0], e = M[1][1], f2 = M[1][2], g = M[2][0], h = M[2][1], k = M[2][2];
-    const double det = a * (e * k - f2 * h) - b * (d * k - f2 * g) + c * (d * h - e * g);
-    if (!(fabs(det) > 1e-12)) return -1;
-    Mi[0][0] = (e * k - f2 * h) / det; Mi[0][1] = (c * h - b * k) / det; Mi[0][2] = (b * f2 - c * e) / det;
-    Mi[1][0] = (f2 * g - d * k) / det; Mi[1][1] = (a * k - c * g) / det; Mi[1][2] = (c * d - a * f2) / det;
-    Mi[2][0] = (d * h - e * g) / det; Mi[2][1] = (b * g - a * h) / det; Mi[2][2] = (a * e - b * d) / det;
-    return 0;
-}
 
 /* ufsm fiber-export <afv> <fields-dir> <out.fib> --tr T.json [--level 2] [--margin 8] [--shift dz,dy,dx] [--min-pts 4]
    The AFV fibres over a fit-fields box (fields.json origin / shape / h, native = --level voxels of the label scan) in the fields'
