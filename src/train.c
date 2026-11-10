@@ -1709,7 +1709,10 @@ int cmd_train(int argc, char **argv) {
     { int nl = 1; for (const char *q = opt(argc, argv, "--widths", "16,32,64,80"); *q; q++) nl += *q == ','; nn_set_nlev(nl < UNET_MAXLEV ? nl : UNET_MAXLEV); }   /* layer names of the policy */
     if (fp4) {
         unet_set_act_mx4(1); setenv("UFSM_ACT_MX4", "1", 0); nn_set_sr(1);
-        if (nn_set_prec_policy(fp4 >= 2 ? "all=fp4:fp4:fp4,enc0.c1=fp16" : "all=fp4:fp4:fp8,enc0.c1=fp16")) return 2;
+        /* a latent net's learned cell channels (--lat-basis: 32 MX inputs, no 16-bit stem): its first conv is an fp4 conv like the rest
+           (MX-fp8 inputs, --input-prec 8, go through the fp8 forward kernel into fp4 rows; the weight gradient is the fp4 kernel's) */
+        const int latb = *opt(argc, argv, "--lat-basis", "") != 0;
+        if (nn_set_prec_policy(fp4 >= 2 ? latb ? "all=fp4:fp4:fp4" : "all=fp4:fp4:fp4,enc0.c1=fp16" : latb ? "all=fp4:fp4:fp8" : "all=fp4:fp4:fp8,enc0.c1=fp16")) return 2;
         if (fp4 >= 2) setenv("UFSM_F4_WGRAD", "1", 0);
     }
     if (fp8) { unet_set_act_mx8(1); nn_set_sr(1); if (nn_set_prec_policy("all=fp8:fp8:fp8,enc0.c1=fp16")) return 2; }
@@ -2257,6 +2260,10 @@ int cmd_train(int argc, char **argv) {
                 if (nt < 0) { fprintf(stderr, "cannot initialise from %s\n", init_from); return 1; }
                 if (w4map && g_ink2) unet_head_row_reset(d->u, g_ink2_ch, (float)atof(opt(argc, argv, "--ink-bias", "-2")));   /* (a fresh ink row: zero weights, the prior bias; the donor's function elsewhere) */
                 if (g == 0) fprintf(stderr, "initialised %d layer tensors from %s (the rest fresh)\n", nt, init_from);
+            }
+            if (g_lat_guide == 64) {   /* the sub-cell outputs start at zero: the net begins as the interpolated head (random rows gave a 4-voxel lattice wherever the labels do not reach) */
+                for (int co = 16; co < cfg.cout; co++) unet_head_row_reset(d->u, co, 0.f);
+                if (g == 0) fprintf(stderr, "sub-cell head: outputs 16-%d start at zero\n", cfg.cout - 1);
             }
             if (g_sheet && unet_start_sheet(d->u)) return 2;
         }

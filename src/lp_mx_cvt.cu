@@ -352,6 +352,38 @@ extern "C" void lp_fakeq_w4(float *w, int Co, int Ci, int T, int Bo, int Bi) {
     fq_w4_2d_k<<<nblk_(nw * 32, 128), 128>>>(w, Co, Ci, T, Bo, Bi);
     LPCK();
 }
+/* z-slices of MX tensors (N 1, C channels, depth D, HW voxels a plane) as MX-fp8 tensors of depth nz (planes z0 .. z0 + nz): an MX-fp4
+   tensor's rows re-encoded (exact: e2m1 values and their block scale are e4m3 values under the row's own scale), the planes outside
+   [za, zc) zero; an MX-fp8 tensor's rows copied. The network input conv's weight gradient for more than 8 MX-fp8 input channels with
+   MX-fp4 gradients (lp_bwd_w_f8) runs the MX-fp8 kernel on such slices. */
+__global__ void mx4_to_mx8_z_k(const uint8_t *x, uint8_t *y, int C, int D, size_t HW, int z0, int nz, int za, int zc) {
+    const int bw = mx_bw(C), nb = mx_nb(C); const size_t S = (size_t)D * HW, S2 = (size_t)nz * HW;
+    const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= (size_t)nb * S2) return;
+    const size_t v = i % S2; const int blk = (int)(i / S2), z = z0 + (int)(v / HW);
+    float r[32];
+#pragma unroll
+    for (int k = 0; k < 32; k++) r[k] = 0.f;
+    if (z >= za && z < zc) mx_load_row_b<4>(x, mx_sc<4>(x, 1, C, S), (size_t)blk * S + (size_t)z * HW + v % HW, bw, r);
+    mx_store_row_b<8>(y, mx_sc<8>(y, 1, C, S2), i, bw, r);
+}
+extern "C" void lp_mx4_to_mx8_z(const void *x4, int C, int D, size_t HW, int z0, int nz, int za, int zc, void *y8) {
+    const size_t n = (size_t)mx_nb(C) * nz * HW;
+    mx4_to_mx8_z_k<<<nblk_(n, 256), 256>>>((const uint8_t *)x4, (uint8_t *)y8, C, D, HW, z0, nz, za, zc); LPCK();
+}
+__global__ void mx8_slice_z_k(const uint8_t *x, uint8_t *y, int C, int D, size_t HW, int z0, int nz) {
+    const int bw = mx_bw(C), nb = mx_nb(C); const size_t S = (size_t)D * HW, S2 = (size_t)nz * HW;
+    const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= (size_t)nb * S2) return;
+    const size_t ri = (i / S2) * S + (size_t)z0 * HW + i % S2;
+    const uint8_t *sx = mx_sc<8>(x, 1, C, S); uint8_t *sy = mx_sc<8>(y, 1, C, S2);
+    for (int k = 0; k < bw; k += 4) *(unsigned *)(y + i * bw + k) = *(const unsigned *)(x + ri * bw + k);
+    sy[i] = sx[ri];
+}
+extern "C" void lp_mx8_slice_z(const void *x8, int C, int D, size_t HW, int z0, int nz, void *y8) {
+    const size_t n = (size_t)mx_nb(C) * nz * HW;
+    mx8_slice_z_k<<<nblk_(n, 256), 256>>>((const uint8_t *)x8, (uint8_t *)y8, C, D, HW, z0, nz); LPCK();
+}
 /* MX -> fp32 [n][C][S] (tests) */
 template <int B>
 __global__ void mx_to_f32_k(const uint8_t *x, float *y, int N, int C, size_t S) {
