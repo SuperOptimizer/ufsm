@@ -2808,7 +2808,14 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
     uint8_t *mask = big + 9 * p3;   /* ign lives here: fold CT > 0 into it */
     /* (MK: the loss mask at k; ign_zero: nothing ignored, the mask is the CT test alone and ign is not read) */
 #define MK(k) (ign_zero ? (uint8_t)(ctu[k] != 0) : (uint8_t)((ctu[k] != 0) & (mask[k] == 0)))
-    if (ink_it) {   /* (the --rv papyrus plane: ct8 >= cutoff 254, else 0; unknown where masked) */
+    /* tdead: the loss mask itself is read by nobody below (no packed plane, no sheet prior, the labels warped on the device): only the
+       ink plane is written (one write stream fewer; the pass is DRAM-bound) */
+    if (tdead && ink_it && ink_it <= 255) {
+        const uint8_t *c8 = b->ct8 + (size_t)i * p3; const uint8_t it = (uint8_t)ink_it;
+        if (ign_zero) for (size_t k = 0; k < p3; k++) inkw[k] = ctu[k] ? (c8[k] >= it ? 254 : 0) : 255;
+        else for (size_t k = 0; k < p3; k++) inkw[k] = ctu[k] && !mask[k] ? (c8[k] >= it ? 254 : 0) : 255;
+    } else if (tdead && !inkw) {}
+    else if (ink_it) {   /* (the --rv papyrus plane: ct8 >= cutoff 254, else 0; unknown where masked) */
         const uint8_t *c8 = b->ct8 + (size_t)i * p3; const uint8_t it = (uint8_t)(ink_it > 255 ? 255 : ink_it);
         if (ink_it > 255) for (size_t k = 0; k < p3; k++) { const uint8_t mk = MK(k); mask[k] = mk; inkw[k] = mk ? 0 : 255; }
         else if (ign_zero) for (size_t k = 0; k < p3; k++) { const uint8_t mk = ctu[k] != 0; mask[k] = mk; inkw[k] = mk ? (c8[k] >= it ? 254 : 0) : 255; }
@@ -2816,7 +2823,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
     } else if (inkw) for (size_t k = 0; k < p3; k++) { const uint8_t mk = MK(k); mask[k] = mk; inkw[k] = mk ? inkw[k] : 255; }   /* --ink-head: unknown on CT 0 and where the scanner augmentation ignores labels */
     else if (ign_zero) for (size_t k = 0; k < p3; k++) mask[k] = ctu[k] != 0;
     else for (size_t k = 0; k < p3; k++) mask[k] = (ctu[k] != 0) & (mask[k] == 0);
-    ign_zero = 0;   /* (mask written) */
+    ign_zero = 0;   /* (mask written, or dead: tdead) */
 #undef MK
 #undef IGN_REAL
     PROF_MARK(PS_ZSCORE);
