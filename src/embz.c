@@ -132,6 +132,45 @@ static int zr_read_any(zr *r, const int64_t o[3], const int64_t n[3], float *out
     return 0;
 }
 int zr_read(zr *r, const int64_t o[3], const int64_t n[3], float *out) { return zr_read_any(r, o, n, out, nullptr); }
+/* zr_read_i8 with T handles of the same store (one decoded-chunk cache each), the region's chunks dealt round-robin to T threads */
+typedef struct { zr *r; const int64_t *o, *n; int8_t *out; const int64_t *c0, *c1; int t, T; } zr_mt_job;
+static void *zr_mt_run(void *arg) {
+    zr_mt_job *j = arg; zr *r = j->r; const int C = r->C ? r->C : 1, c = r->chunk; long k = 0;
+    for (int64_t cz = j->c0[0]; cz <= j->c1[0]; cz++) for (int64_t cy = j->c0[1]; cy <= j->c1[1]; cy++) for (int64_t cx = j->c0[2]; cx <= j->c1[2]; cx++) {
+        if (k++ % j->T != j->t) continue;
+        const uint8_t *ch = zr_chunk(r, cz * c, cy * c, cx * c);
+        if (!ch) continue;
+        int64_t a[3], b[3]; const int64_t cc[3] = {cz, cy, cx};
+        for (int d = 0; d < 3; d++) {
+            a[d] = cc[d] * c; b[d] = a[d] + c;
+            if (a[d] < j->o[d]) a[d] = j->o[d];
+            if (b[d] > j->o[d] + j->n[d]) b[d] = j->o[d] + j->n[d];
+            if (b[d] > r->shape[d]) b[d] = r->shape[d];
+        }
+        for (int64_t gz = a[0]; gz < b[0]; gz++) for (int64_t gy = a[1]; gy < b[1]; gy++) {
+            const size_t e0 = ((size_t)((gz % c) * c + gy % c) * c + a[2] % c) * C, w = (size_t)(b[2] - a[2]) * C;
+            const size_t di = ((size_t)((gz - j->o[0]) * j->n[1] + (gy - j->o[1])) * j->n[2] + (size_t)(a[2] - j->o[2])) * C;
+            memcpy(j->out + di, ch + e0, w);
+        }
+    }
+    return nullptr;
+}
+int zr_read_i8_mt(zr *rs, int T, const int64_t o[3], const int64_t n[3], int8_t *out) {
+    zr *r = &rs[0]; const int C = r->C ? r->C : 1, c = r->chunk;
+    if (r->dt != 0) return -1;
+    if (T <= 1) return zr_read_i8(r, o, n, out);
+    memset(out, 0, (size_t)n[0] * n[1] * n[2] * C);
+    int64_t c0[3], c1[3];
+    for (int d = 0; d < 3; d++) {
+        const int64_t lo = o[d] < 0 ? 0 : o[d], hi = o[d] + n[d] > r->shape[d] ? r->shape[d] : o[d] + n[d];
+        if (hi <= lo) return 0;
+        c0[d] = lo / c; c1[d] = (hi - 1) / c;
+    }
+    pthread_t th[64]; zr_mt_job J[64]; if (T > 64) T = 64;
+    for (int t = 0; t < T; t++) { J[t] = (zr_mt_job){&rs[t], o, n, out, c0, c1, t, T}; pthread_create(&th[t], nullptr, zr_mt_run, &J[t]); }
+    for (int t = 0; t < T; t++) pthread_join(th[t], nullptr);
+    return 0;
+}
 int zr_read_i8(zr *r, const int64_t o[3], const int64_t n[3], int8_t *out) { return zr_read_any(r, o, n, nullptr, out); }
 /* an output with its optional per-vector scale array */
 

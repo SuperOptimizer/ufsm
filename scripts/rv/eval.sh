@@ -10,6 +10,8 @@
 # Out: $E/<TAG>/<scroll>/{pred,ruler.log}; summary $E/<TAG>.txt. Prediction zarrs are deleted after the ruler unless KEEP=1.
 # WZ="" for latent-grid checkpoints (train --lat 4: cubic windows only), WINDOW (640).
 # Env: U (rv binary), RU (ruler binary: RECTO's src2), GPU (1), LOCK, E (/vesuvius/ufsm/v2/rv/eval), TH (16), WIN (640/64, z 192/64).
+# LATENTS=STORE: predict from that ufsm lc-encode store of the scroll's CT level instead of the CT (--latents; one scroll per run, e.g.
+# SC=p1667 with /mnt/scratch/lat/p1667-l2.lc; --lat-basis checkpoints); each row's predict log then ends with its read accounting (UFSM_PRED_IO).
 set -u
 CK=$1; T=$2; SC=${3:-p1667 p139 p4}
 U=${U:-/vesuvius/ufsm/v2/rv/bin/ufsm.ev}; RU=${RU:-/vesuvius/ufsm/v2/recto/src2/build/ufsm}; GPU=${GPU:-1}; LOCK=${LOCK-/vesuvius/ufsm/opt/gpu$GPU.lock}
@@ -34,11 +36,12 @@ for S in $SC; do
          print int(z / sh) }' | sort -un)
   if [ ! -e $D/pred.done ]; then
     t0=$(date +%s)
+    LX=(); [ -n "${LATENTS:-}" ] && LX=(--latents "$LATENTS")
     for r in $rows; do
       L=(); [ -n "$LOCK" ] && L=(flock $LOCK)
-      CUDA_VISIBLE_DEVICES=$GPU "${L[@]}" nice -n 5 $U predict $CK $CTR $CK_ $D/pred --um $U0 --level $LV --box $((r * SH)),$oy,$ox,$SH,$((my * h)),$((mx * h)) \
+      CUDA_VISIBLE_DEVICES=$GPU UFSM_PRED_IO=1 "${L[@]}" nice -n 5 $U predict $CK $CTR $CK_ $D/pred --um $U0 --level $LV --box $((r * SH)),$oy,$ox,$SH,$((my * h)),$((mx * h)) \
         --full-grid 1 --resume 1 --shard $SH --window ${WINDOW:-640} --halo 64 ${WZ---window-z $((SH + 64)) --halo-z 32} --levels 1 --channel rv \
-        --threads $TH --gpu 0 --q 0 >> $D/pred.log 2>&1 || { echo "$S: predict row $r failed (see $D/pred.log)" | tee -a $E/$T.txt; continue 2; }
+        --threads $TH --gpu 0 --q 0 "${LX[@]}" >> $D/pred.log 2>&1 || { echo "$S: predict row $r failed (see $D/pred.log)" | tee -a $E/$T.txt; continue 2; }
     done
     echo "$S: predicted $(echo $rows | wc -w) shard rows of $SH in $(( $(date +%s) - t0 )) s" | tee -a $E/$T.txt; touch $D/pred.done
   fi

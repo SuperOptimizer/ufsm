@@ -51,7 +51,7 @@ typedef struct {
     pthread_mutex_t mu; pthread_cond_t cv;
     double t_read, t_stats, t_wait;   /* UFSM_PRED_PROF: seconds in z3_read, the stats scan, waiting for a free slot */
     int nostats;                      /* the window statistics are computed on the device (default path) */
-    zr *lz; const long long *lzo; int lzc;   /* --latents: the window's stored cells instead of its CT (nz[k]: 0 when every cell is air) */
+    zr *lz; const long long *lzo; int lzc, lzt;   /* (lzt handles of the store, one decoding thread each) */   /* --latents: the window's stored cells instead of its CT (nz[k]: 0 when every cell is air) */
 } reader_t;
 static void *reader_main(void *arg) {
     reader_t *r = arg;
@@ -67,7 +67,7 @@ static void *reader_main(void *arg) {
         int64_t o[3] = {r->bo[0] + t->tz, r->bo[1] + t->ty, r->bo[2] + t->tx}, n[3] = {r->Wz, r->W, r->W};
         if (r->lz) {   /* --latents: Wz/4 x W/4 x W/4 cells of C + 1 bytes (absent / outside: 0, air) */
             const int64_t oc[3] = {(o[0] - r->lzo[0]) / 4, (o[1] - r->lzo[1]) / 4, (o[2] - r->lzo[2]) / 4}, nc[3] = {r->Wz / 4, r->W / 4, r->W / 4};
-            if (zr_read_i8(r->lz, oc, nc, (int8_t *)r->buf[k])) atomic_store(&r->failed, 1);
+            if (zr_read_i8_mt(r->lz, r->lzt, oc, nc, (int8_t *)r->buf[k])) atomic_store(&r->failed, 1);
             else {
                 const size_t nb = (size_t)nc[0] * nc[1] * nc[2] * (r->lzc + 1); const uint64_t *b8 = (const uint64_t *)r->buf[k]; uint64_t any = 0;
                 for (size_t j = 0; j < nb / 8 && !any; j++) any |= b8[j];
@@ -1554,7 +1554,8 @@ int cmd_predict(int argc, char **argv) {
                 return 2;
             }
         }
-        rd.lz = &lzr; rd.lzo = lz_org; rd.lzc = lz_c;
+        rd.lzt = nthreads < 1 ? 1 : nthreads > 32 ? 32 : nthreads; rd.lz = calloc((size_t)rd.lzt, sizeof(zr)); rd.lzo = lz_org; rd.lzc = lz_c;
+        for (int t = 0; t < rd.lzt; t++) if (zr_open(&rd.lz[t], lat_store)) { fprintf(stderr, "predict: --latents: cannot open %s\n", lat_store); return 1; }
         const float *lg_; float ls_; const int lc_ = unet_lat_basis(u, &lz_bas, &lg_, &ls_);
         if (!gpath || lc_ != lz_c || !lz_d) { fprintf(stderr, "predict: --latents needs the device path and a --lat-basis checkpoint with the store's %d cell channels (it has %d)\n", lz_c, lc_); return 2; }
         {   /* the store's transform must be the checkpoint's: the rebuilt CT and the channels both assume it */
