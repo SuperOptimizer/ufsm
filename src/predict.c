@@ -1316,7 +1316,8 @@ int cmd_predict(int argc, char **argv) {
         if (!xd && !ct_stem && !latin) xd = nn_malloc((size_t)xs.c * w3 * (h16 ? 2 : 4));
         if (auxz) { auxd = nn_malloc(w3); auxh = malloc(w3); }
         if (half) { x2 = nn_malloc(shape_numel(xn) * (h16 ? 2 : 4));   /* (lgf, and lrt with the direct latent input: at their first use; the direct latent rv path has none) */
-            if (lat_store) { lz_d = nn_malloc(w3 / 64 * (lz_c + 1)); } if (hdiv > 2 && !latin) lrt = nn_malloc(w3 / 8 * 16); }
+            if (hdiv > 2 && !latin) lrt = nn_malloc(w3 / 8 * 16); }
+        if (lat_store && gpath) lz_d = nn_malloc(w3 / 64 * (lz_c + 1));   /* (a voxel checkpoint too: its CT window rebuilt from the cells) */
         if (ct_stem) fprintf(stderr, "predict: in-place slab inference from the CT window (%.1f B per window voxel)\n", (double)unet_activation_bytes(u) / w3);
         if (tta > 1 && (!ct_stem || !ct_shared || degrade || auxz || cfg.cin != 4)) { fprintf(stderr, "predict: --tta needs the CT-stem device path (no --aug-*, --aux, extra inputs)\n"); return 2; }
     }
@@ -1607,6 +1608,13 @@ int cmd_predict(int argc, char **argv) {
         rd.lzt = nthreads < 1 ? 1 : nthreads > 32 ? 32 : nthreads; rd.lz = calloc((size_t)rd.lzt, sizeof(zr)); rd.lzo = lz_org; rd.lzc = lz_c;
         for (int t = 0; t < rd.lzt; t++) if (zr_open(&rd.lz[t], lat_store)) { fprintf(stderr, "predict: --latents: cannot open %s\n", lat_store); return 1; }
         const float *lg_; float ls_; const int lc_ = unet_lat_basis(u, &lz_bas, &lg_, &ls_);
+        if (!lc_ && !half && gpath && lz_d) {   /* a voxel checkpoint (no --lat-basis): fed the CT rebuilt from the store's cells with the store's own transform
+                                                    (the codec test: a CT net on the decoded CT against the real one) */
+            char bp[1200]; snprintf(bp, sizeof bp, "%s/basis.lcb", lat_store); lat_basis *lb = malloc(sizeof *lb);
+            if (!lb || lat_basis_load(bp, lb)) { fprintf(stderr, "predict: --latents: cannot read %s\n", bp); return 1; }
+            float *db = nn_malloc((size_t)lz_c * 64 * 4); nn_h2d(db, lb->b, (size_t)lz_c * 64 * 4); free(lb); lz_bas = db;
+            fprintf(stderr, "predict: --latents with a voxel checkpoint: its CT windows rebuilt from the %d stored components\n", lz_c);
+        } else
         if (!gpath || lc_ != lz_c || !lz_d) { fprintf(stderr, "predict: --latents needs the device path and a --lat-basis checkpoint with the store's %d cell channels (it has %d)\n", lz_c, lc_); return 2; }
         {   /* the store's transform must be the checkpoint's: the rebuilt CT and the channels both assume it */
             char bp[1200]; snprintf(bp, sizeof bp, "%s/basis.lcb", lat_store); lat_basis *lb = malloc(sizeof *lb); float *hb = malloc((size_t)lz_c * 64 * 4); double dm = 0;
