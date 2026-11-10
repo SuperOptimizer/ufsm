@@ -94,8 +94,13 @@ trunk forward 84, trunk backward 310, slab adjoint 206, slab upsampling 50, labe
   Cost: the head forward runs in both passes with 2 halo planes per 8, and the head backward runs per range; the range weight
   gradient used 8192 voxels a block (9 blocks for 8 planes at P384: each of its 54 passes as long as the whole grid's), now >= 128
   blocks (`lp_bwd_w1_mx_b_r`). Timings so far only with ws768 on the same GPU (P384, winding net, synchronised phases, two runs
-  each): 424 / 465 ms streamed against 404 / 438 whole; an idle-GPU number is owed.
+  each): 466 / 424 ms streamed against 404 / 439 whole, i.e. inside the contention noise; an idle-GPU number is owed.
   `nn_head_bwd_z` takes the general path for more than 16 outputs (the fused kernel is <= 16; 32 inputs -> 144 was "not covered").
+- Planner (`UFSM_MEM_DRY=1`, smallest mode, GB; streamed / whole head): P768 rv 8.73 / 13.06, winding 8.80 / 13.13; P896 13.22 / 20.18
+  and 13.35 / 20.31; P960 15.99 / 24.58 and 16.15 / 24.75; P1024 19.13 / 29.61 and 19.34 / 29.81. Of the 19.13 GB at P1024 the
+  network is 1.48 and the "task" term 16.87 (15.7 B a voxel): it still counts the label planes that `lab_stream` keeps on the host.
+  One real run to compare (P384 rv, ws768 on the same card): process peak 1.20 GB by nvidia-smi at 1 Hz (CUDA context included)
+  against the planner's 1.83. Real P896-1024 steps are owed (a free GPU).
 - **Found on the way, not fixed: with a 96-wide level 0 under the lean-2 sharing modes (share_enc_a1 + a0_share) enc[0]'s parameter
   gradients are not reproduced between two equal backwards** (two nets with equal parameters, or the head whole against per range:
   rel 0.17-0.26 on enc[0], every other tensor equal to 1e-9; it depends on the allocation layout; 32-wide nets reproduce exactly;
