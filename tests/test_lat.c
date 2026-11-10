@@ -214,10 +214,10 @@ int main(void) {
         const int d = 3, h = 2, w = 2, D = 12, H = 8, W = 8, base = 3, ng = 2, C = base + 64 * ng; const size_t nc = (size_t)d * h * w, hw = (size_t)H * W;
         float *lf = malloc(C * nc * 4); uint16_t *lh_ = malloc(C * nc * 2);
         for (size_t k = 0; k < C * nc; k++) { lh_[k] = f2h(ru()); lf[k] = h2f(lh_[k]); }
-        void *d_lf = nn_malloc(C * nc * 4), *d_lh = nn_malloc(C * nc * 2), *d_gc = nn_malloc(C * nc * 4); nn_h2d(d_lf, lf, C * nc * 4); nn_h2d(d_lh, lh_, C * nc * 2);
-        float *gc = malloc(C * nc * 4);
+        void *d_lf = nn_malloc(C * nc * 4), *d_lh = nn_malloc(C * nc * 2), *d_gc = nn_malloc(C * nc * 2); nn_h2d(d_lf, lf, C * nc * 4); nn_h2d(d_lh, lh_, C * nc * 2);
+        uint16_t *gc = malloc(C * nc * 2);
         for (int f = 0; f < 2; f++) {
-            double e0 = 0, dot1 = 0, dot2 = 0; nn_zero(d_gc, C * nc * 4);
+            double e0 = 0, dot1 = 0, dot2 = 0; nn_zero(d_gc, C * nc * 2);
             for (int z0 = 0; z0 < D; z0 += 4) {
                 const int nz = 4; const size_t ns = (size_t)nz * hw;
                 uint16_t *y = malloc(ng * ns * 2), *o = malloc(ng * ns * 2), *g = malloc(ng * ns * 2);
@@ -234,8 +234,8 @@ int main(void) {
                 }
                 free(y); free(o); free(g); nn_free(d_y); nn_free(d_g);
             }
-            nn_d2h(gc, d_gc, C * nc * 4);
-            for (size_t k = (size_t)base * nc; k < C * nc; k++) dot2 += (double)lf[k] * gc[k];
+            nn_d2h(gc, d_gc, C * nc * 2);
+            for (size_t k = (size_t)base * nc; k < C * nc; k++) dot2 += (double)lf[k] * h2f(gc[k]);
             const double de = fabs(dot1 - dot2) / (1e-9 + fabs(dot1)); cases++;
             if (!(e0 < 3e-3) || !(de < 1e-4)) { fprintf(stderr, "FAIL: sub-cell head (%s logits): forward rel err %.3g, adjoint dot rel err %.3g\n", f ? "fp16" : "fp32", e0, de); fails++; }
         }

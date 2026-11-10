@@ -186,7 +186,7 @@ void nn_lat_input_q(const void *q, const void *x, int d, int h, int w, const flo
 /* the guided head (unet_cfg.lat_guide): see nn_lat.cu lat_guide_k */
 /* the sub-cell head (unet_cfg.lat_guide 64): see nn_lat.cu lat_shuf_k */
 void nn_lat_shuffle(const void *lg, int lh16, int d, int h, int w, int base, int ng, int z0, int nz, void *y);
-void nn_lat_shuffle_adj(const void *g, int d, int h, int w, int base, int ng, int z0, int nz, float *gc);
+void nn_lat_shuffle_adj(const void *g, int d, int h, int w, int base, int ng, int z0, int nz, void *gc);   /* gc: fp16 */
 void nn_lat_guide4(const void *x, int D, int H, int W, int z0, int nz, void *lg, int base, int c0, int ng, int dir);   /* 4 coefficients per guided channel */
 void nn_lat_guide(const void *x, int D, int H, int W, int z0, int nz, void *lg, int base, int c0, int dir);
 void nn_lat_input_x(const void *x, int d, int h, int w, const float *bas, const float *gain, int C, float step, void *y);
