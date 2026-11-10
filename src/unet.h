@@ -34,7 +34,8 @@ typedef struct {
     int ds_levels;         /* deep supervision: a 1^3 head (cout outputs) on each decoder level 1..ds_levels (params appended last); a training
                               forward computes their fp32 logits (unet_ds_logits), the trainer's loss gradients come back through
                               unet_set_ds_grad and join each level's gradient before its decoder backward */
-    int lat_guide;         /* latent-grid nets (half_res 3): 5 = the guided head (nn_lat_guide): cout = the task's outputs + 5 coefficient planes */
+    int lat_guide;         /* latent-grid nets (half_res 3): 5 = the guided head (nn_lat_guide): cout = the task's outputs + 5 coefficient planes; 8 = the general form
+                              (nn_lat_guide4): cout 32, the last 8 are 4 coefficients for each of the 2 guided channels */
     int half_res;          /* the caller runs the network on 2x2x2 blocks of its window (nn_half_*): 1 pool (cin 4, the block means; logits
                               upsampled trilinearly), 2 pack (cin 8: the block means, the CT's sub-voxel gradients and contrast;
                               cout 8 per output, one per sub-voxel); 3 pool4, 4 pack4: the network on 4^3 blocks (a 2x pool / trilinear 2x
