@@ -28,6 +28,7 @@
 #include <unistd.h>
 
 int cmd_surf_labels(int argc, char **argv);
+int cmd_phase_coh(int argc, char **argv);
 static int fails = 0;
 #define CHECK(c, m) do { if (!(c)) { fprintf(stderr, "FAIL: %s\n", m); fails++; } } while (0)
 #define NZ 64
@@ -167,6 +168,16 @@ int main(void) {
         snprintf(r, sizeof r, "%s/weight.zarr", od); uint8_t *wt = readall(r, "9.6"); long wbad = 0, wpos = 0;   /* --weight-coh: 0 wherever ignored / unknown, > 0 on kept coherent labels */
         for (size_t i = 0; wt && ph && i < (size_t)NZ * NY * NX; i++) { wbad += wt[i] && ph[i] == PHASE_UNKNOWN; wpos += wt[i] > 0; }
         CHECK(wt && !wbad && (v == 1 || wpos > kept / 2), "--weight-coh: weight on unknown phase or missing on kept labels");
+        if (v == 0) {   /* ufsm phase-coh on the stored phase: surf-labels' weight within rounding (cells with ignored voxels may differ) */
+            char pr[600], pc[600]; snprintf(pr, sizeof pr, "%s/phase.zarr", od); snprintf(pc, sizeof pc, "%s/pc", od);
+            char *cv[] = {"ufsm", "phase-coh", pr, "9.6", ct, "0", pc, "--weight", "0.3,0.6", "--weight2", "0.3,0.6", "--cell", "16", "--threads", "3"};
+            CHECK(!cmd_phase_coh((int)(sizeof cv / sizeof *cv), cv), "phase-coh failed");
+            snprintf(r, sizeof r, "%s/pc/weight.zarr", od); uint8_t *w2 = readall(r, "9.6"); long nk = 0, nd = 0;
+            for (size_t i = 0; w2 && wt && ph && i < (size_t)NZ * NY * NX; i++) if (ph[i] != PHASE_UNKNOWN) { nk++; nd += abs((int)w2[i] - (int)wt[i]) > 1; }
+            printf("test_surflabels: phase-coh vs surf-labels --weight-coh: %ld of %ld known voxels differ by > 1\n", nd, nk);
+            CHECK(w2 && nk > 100000 && nd * 20 < nk, "phase-coh weight differs from surf-labels' on > 5% of the known voxels");
+            free(w2);
+        }
         free(wt);
         free(ig); free(ph);
     } }
