@@ -120,6 +120,19 @@ template <int BI, int BO> __global__ void mx_recode_k(const uint8_t *x, uint8_t 
     mx_load_row_b<BI>(x, mx_sc<BI>(x, N, C, S), i, bw, r);
     mx_store_row_b<BO>(y, mx_sc<BO>(y, N, C, S), i, bw, r, sr);
 }
+/* MX-fp8 planes [0, nz) of a chunk x (depth dc) into planes [z0, z0 + nz) of the MX-fp4 tensor y (depth D), SR keyed by y's rows (as
+   mx_recode_k over the whole tensor: the same bits) */
+__global__ void mx8z_to_mx4_k(const uint8_t *x, uint8_t *y, int C, size_t HW, int dc, int D, int z0, int nz, unsigned sr) {
+    const int bw = mx_bw(C), nb = mx_nb(C); const size_t Sc = (size_t)dc * HW, S = (size_t)D * HW, n = (size_t)nz * HW;
+    const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= (size_t)nb * n) return;
+    const size_t blk = i / n, v = i % n;
+    float r[32];
+    mx_load_row_b<8>(x, mx_sc<8>(x, 1, C, Sc), blk * Sc + v, bw, r);
+    mx_store_row_b<4>(y, mx_sc<4>(y, 1, C, S), blk * S + (size_t)z0 * HW + v, bw, r, sr);
+}
+static int g_s2b_cz = -1;   /* fine planes per chunk of the MX-fp4 route below (0: whole; -1: env UFSM_S2B_CZ, else ~96 MB of MX-fp8 rows) */
+extern "C" void lp_set_s2b_cz(int cz) { g_s2b_cz = cz; }
 extern "C" int lp_bwd_data_s2_mx_tc(const void *gy, shape5 ys, const float *w, shape5 xs, void *gx, int accum, int gdt, int xdt, unsigned osr);   /* lp_mx_s2bwd_tc.cu */
 /* returns the compute precision used: 2 (fp8 tensor cores, wide layers), 1 (bf16 tensor cores, 16 / 32 channels) or 0 (fp32) */
 extern "C" int lp_bwd_data_s2_mx(const void *gy, shape5 ys, const float *w, shape5 xs, void *gx, int accum, int gdt, int xdt, unsigned osr) {
@@ -139,6 +152,27 @@ extern "C" int lp_bwd_data_s2_mx(const void *gy, shape5 ys, const float *w, shap
     if (gdt == 4 || xdt == 4) {   /* MX-fp4 gradients on the wide (small, coarse) levels: through MX-fp8 copies (gy and the old gx exact,
                                      the result back to fp4 with SR) */
         const size_t Sy = shape_spatial(ys), Sx = shape_spatial(xs), ry = (size_t)ys.n * mx_nb(ys.c) * Sy, rx = (size_t)xs.n * mx_nb(xs.c) * Sx;
+        /* in chunks of fine planes: the whole-layer MX-fp8 copies (gx, the dilated gy, the accumulate temp: 3 x 99 bytes a voxel at 96
+           channels) were 4.6 bytes per window voxel of a 96-wide latent net's level 0 (4.1 GB at P960, unplanned). Fine planes
+           [z0, z1) (even bounds) read coarse planes z0 / 2 .. z1 / 2: the chunk runs one fine plane further (plane z1: computed, not
+           stored; the next chunk owns it). The fp8 results and the SR keys are the whole tensor's: the same bits */
+        const size_t HWx = (size_t)xs.h * xs.w, HWy = (size_t)ys.h * ys.w, pb = (size_t)mx_nb(xs.c > ys.c ? xs.c : ys.c) * HWx * 33;
+        int cz = g_s2b_cz >= 0 ? g_s2b_cz : getenv("UFSM_S2B_CZ") ? atoi(getenv("UFSM_S2B_CZ")) : (int)(((size_t)96 << 20) / pb) & ~1;
+        if (g_s2b_cz < 0 && !getenv("UFSM_S2B_CZ") && cz < 2) cz = 2;
+        if (cz >= 2 && cz < xs.d && xs.n == 1 && xs.d % 2 == 0 && ys.d == xs.d / 2 && cz % 2 == 0) {
+            int pr = 0;
+            for (int z0 = 0; z0 < xs.d; z0 += cz) {
+                const int z1 = z0 + cz < xs.d ? z0 + cz : xs.d, f1 = z1 < xs.d ? z1 + 1 : z1, nf = f1 - z0, c0 = z0 / 2, c1 = z1 < xs.d ? z1 / 2 + 1 : ys.d, ncz = c1 - c0;
+                shape5 xc = xs, yc = ys; xc.d = nf; yc.d = ncz;
+                uint8_t *gy8 = lp_buf<uint8_t>(5, lp_mx8_bytes(1, ys.c, (size_t)ncz * HWy)), *gx8 = lp_buf<uint8_t>(4, lp_mx8_bytes(1, xs.c, (size_t)nf * HWx));
+                lp_mx4_to_mx8_z(gy, ys.c, ys.d, HWy, c0, ncz, 0, ys.d, gy8);
+                if (accum) lp_mx4_to_mx8_z(gx, xs.c, xs.d, HWx, z0, nf, 0, xs.d, gx8);
+                pr = lp_bwd_data_s2_mx(gy8, yc, w, xc, gx8, accum, 3, 3, 0u);
+                mx8z_to_mx4_k<<<nblk_((size_t)mx_nb(xs.c) * (z1 - z0) * HWx, 256), 256>>>(gx8, (uint8_t *)gx, xs.c, HWx, nf, xs.d, z0, z1 - z0, osr);
+            }
+            LPCK();
+            return pr;
+        }
         uint8_t *gy8 = lp_buf<uint8_t>(5, lp_mx8_bytes(ys.n, ys.c, Sy)), *gx8 = lp_buf<uint8_t>(4, lp_mx8_bytes(xs.n, xs.c, Sx));   /* slots 4 (the wgrad gy pre-pass, free here) and 5 */
         mx_recode_k<4, 8><<<nblk_(ry, 256), 256>>>((const uint8_t *)gy, gy8, ys.n, ys.c, Sy, 0u);
         if (accum) mx_recode_k<4, 8><<<nblk_(rx, 256), 256>>>((const uint8_t *)gx, gx8, xs.n, xs.c, Sx, 0u);

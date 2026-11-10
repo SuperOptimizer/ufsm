@@ -2483,12 +2483,21 @@ int cmd_train(int argc, char **argv) {
                                     ? (gdef ? (size_t)100 << 20 : (size_t)B * cfg.widths[0] * p3 * 136 / 256) : 0;
                 need = grec + tb + tb / 14 + trainer + (nn_get_loss_tol() ? (size_t)B * p3 : 0) + (g_aff ? (size_t)2 * B * p3 : 0) + (g_unwrap ? (g_head_slab ? (size_t)4 * B * p3 + (size_t)g_hs_z * P * P * (2 * g_cout + 11) + 4096 : (size_t)15 * B * p3) + (g_unwrap2 ? (size_t)4 * B * p3 : 0) + (IPLANE ? (size_t)2 * B * p3 + (size_t)(g_rv ? 3 : 2) * g_hs_z * P * P : 0) : 0) + (g_cond ? (size_t)7 * B * p3 : 0) + (g_pap_head ? (size_t)4 * B * p3 : 0) + (g_restore ? (size_t)B * p3 * (cand[c].lean ? 5 : 1) + restore_scratch_bytes(g_Pz, P, P, fminf(g_rr.sc_step[0], 4.f)) + 256 : 0) + ((size_t)550 << 20) + (split ? (size_t)4 * B * 32 * P * P * 2 : 0) + (g_gpu_aug_want && gin ? nn_aug_device_bytes(P) + (g_gpu_aug_want == 2 ? nn_label_warp_device_bytes(P) : 0) : 0);   /* split: two slots of halo send / receive planes */   /* kernel workspaces: measured device growth / tracked ~1.07 + 0.3 GB, + 0.2 GB margin for other processes */
                 if (g_lat) need += (xin_sep ? 0 : xinb) + (g_tm_unused ? 0 : batb) + (g_lat_hs ? ((size_t)LNC * (LGFC < LNC ? 6 : 4) + (size_t)LGFC * 4) * (size_t)(g_hs_z / 4 + 2) * (P / 4) * (P / 4) : ((size_t)LNC * 2 + (size_t)LGFC * 4) * (p3 / 64));   /* --lat: the full-resolution batch beside the cell-grid network, the coarse logit gradient (fp32 + 16-bit) */
+                /* the wide MX-fp4 stride-2 backward-data (lp_bwd_data_s2_mx, more than 64 channels: no direct tensor-core kernel) works
+                   through MX-fp8 chunks of ~96 MB (gx, the dilated gy, the accumulate temp), at least 3 fine planes each; the lp_buf
+                   slots keep them (measured 3 x 102 MB at a 96-wide P 512 latent net, outside tb / 14) */
+                if (unet_grad_mx4() && cfg.nlev > 1 && cfg.widths[0] > 64) {
+                    const size_t e0 = g_lat ? P / g_lat : P, wm = cfg.widths[1] > cfg.widths[0] ? cfg.widths[1] : cfg.widths[0], pb = (wm + 31) / 32 * e0 * e0 * 33;
+                    const size_t ch = ((size_t)96 << 20) + pb > 3 * pb ? ((size_t)96 << 20) + pb : 3 * pb, whole = (size_t)B * (g_lat ? p3 / ((size_t)g_lat * g_lat * g_lat) : p3) * ((wm + 31) / 32) * 33;
+                    need += 3 * (ch < whole ? ch : whole);
+                }
                 /* the label stream (g_lstream, decided below by the same conditions): the side / winding / component / ink planes stay on the host;
                    the device holds two slab sets of them instead of the window's (2 buffers each unless lean) */
-                if (g_lat && g_head_slab && B == 1 && g_xs == 1 && xbytes() == 2 && g_side && !(g_pg_lambda > 0) && !(g_count_lambda > 0) && (!getenv("UFSM_LAT_STREAM") || (ufsm_env_on("UFSM_LAT_STREAM") && strcmp(getenv("UFSM_LAT_STREAM"), "check")))
+                if (g_lat && g_head_slab && B == 1 && (g_xs == 1 || g_gpu_want) && xbytes() == 2 && g_side && !(g_pg_lambda > 0) && !(g_count_lambda > 0) && (!getenv("UFSM_LAT_STREAM") || (ufsm_env_on("UFSM_LAT_STREAM") && strcmp(getenv("UFSM_LAT_STREAM"), "check")))   /* (g_xs settles after the planner: --gpu-input wanted = 1 channel) */
                     && !ufsm_env_on("UFSM_PLAN_LABELS_DEV")) {
                     const size_t dev = (size_t)4 * B * p3 + (g_unwrap2 ? (size_t)4 * B * p3 : 0) + (IPLANE ? (size_t)2 * B * p3 : 0), slabs = (size_t)2 * (4 * g_hs_z + 2 * g_norm_s) * P * P;
                     if (need > dev) need = need - dev + slabs;
+                    need += need / 14;   /* measured device peaks ran 3 - 5% over this count (rv 32-wide: 1.88 GB real / 1.82 at P 512, 6.15 / 5.83 at P 896; fp8 96-wide winding 8.84 / 8.27 at P 768; source not found): the 10 B per voxel dropped above was the margin before */
                 }
                 if (ufsm_env_on("UFSM_MEM_REPORT"))   /* the planner's terms of this mode */
                     fprintf(stderr, "memory plan: mode %d (%s%s): network %.2f + workspace %.2f + gy records %.2f + trainer %.2f + task %.2f + fixed %.2f = %.2f GB\n", c, cand[c].what,
@@ -2610,6 +2619,7 @@ int cmd_train(int argc, char **argv) {
         }
         g_lstream = g_lat && g_head_slab && B == 1 && g_xs == 1 && xbytes() == 2 && g_side && !(g_pg_lambda > 0) && !(g_count_lambda > 0) && (!getenv("UFSM_LAT_STREAM") || ufsm_env_on("UFSM_LAT_STREAM"));
         g_lcheck = g_lstream && getenv("UFSM_LAT_STREAM") && !strcmp(getenv("UFSM_LAT_STREAM"), "check");
+        if (g_lat && !g_lstream && g_gpu_want && g == 0 && !ufsm_env_on("UFSM_PLAN_LABELS_DEV")) fprintf(stderr, "latent grid: no label stream (the memory plan counted the label planes on the host: UFSM_PLAN_LABELS_DEV=1 for the device count)\n");
         const size_t lp3 = g_lstream && !g_lcheck ? 256 : (size_t)B * p3;   /* g_lstream: no device label planes */
         if (g_lstream) {
             for (int k = 0; k < 4; k++) { d->lbh[k] = nn_host_alloc(p3); d->lbs[k] = nn_malloc((size_t)(g_hs_z + (k ? 0 : 2 * g_norm_s)) * P * P); }
