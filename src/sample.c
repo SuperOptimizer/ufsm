@@ -265,12 +265,13 @@ static batch alloc_batch(const sample_cfg *c) {
     b.pap = c->pap_head ? halloc((size_t)c->B * p3) : nullptr;
     b.w4 = c->wind4 ? halloc((size_t)c->B * p3) : nullptr;
     b.wcomp = c->wind4 ? halloc((size_t)c->B * p3) : nullptr;
-    b.ink = c->ink_plane ? halloc((size_t)c->B * p3) : nullptr;
+    b.ink = c->ink_plane && !c->ink_bits ? halloc((size_t)c->B * p3) : nullptr;
+    b.inkb = c->ink_bits ? halloc((size_t)c->B * p3 / 8) : nullptr; b.ink_it = c->ink_bits ? calloc((size_t)c->B, sizeof *b.ink_it) : nullptr;
     b.emb = c->emb_ch ? halloc((size_t)c->B * c->emb_ch * (size_t)(PZ(c) / c->emb_div) * (c->P / c->emb_div) * (c->P / c->emb_div)) : nullptr;
     return b;
 }
 
-static void free_batch(batch *b) { if (b->ink) hfree(b->ink); if (b->ct8) hfree(b->ct8); if (b->aug) hfree(b->aug); if (b->emb) hfree(b->emb); if (b->xv) hfree(b->xv); free(b->vok); free(b->chid); free(b->chidx); free(b->choff); if (b->w4) hfree(b->w4); if (b->wcomp) hfree(b->wcomp); if (b->tm) hfree(b->tm); if (b->rad) hfree(b->rad); if (b->axr) hfree(b->axr); if (b->pap) hfree(b->pap); if (b->wind) hfree(b->wind); if (b->band) hfree(b->band); if (b->side) hfree(b->side); if (b->pm) hfree(b->pm); if (b->x) hfree(b->x); if (b->x16) hfree(b->x16); if (b->t) hfree(b->t); if (b->m) hfree(b->m); hfree(b->w); free(b->src); free(b->level); free(b->um); free(b->corner); if (b->sheet) { sheet_batch_free(b->sheet[0]); free(b->sheet); } }
+static void free_batch(batch *b) { if (b->ink) hfree(b->ink); if (b->inkb) hfree(b->inkb); free(b->ink_it); if (b->ct8) hfree(b->ct8); if (b->aug) hfree(b->aug); if (b->emb) hfree(b->emb); if (b->xv) hfree(b->xv); free(b->vok); free(b->chid); free(b->chidx); free(b->choff); if (b->w4) hfree(b->w4); if (b->wcomp) hfree(b->wcomp); if (b->tm) hfree(b->tm); if (b->rad) hfree(b->rad); if (b->axr) hfree(b->axr); if (b->pap) hfree(b->pap); if (b->wind) hfree(b->wind); if (b->band) hfree(b->band); if (b->side) hfree(b->side); if (b->pm) hfree(b->pm); if (b->x) hfree(b->x); if (b->x16) hfree(b->x16); if (b->t) hfree(b->t); if (b->m) hfree(b->m); hfree(b->w); free(b->src); free(b->level); free(b->um); free(b->corner); if (b->sheet) { sheet_batch_free(b->sheet[0]); free(b->sheet); } }
 
 /* Level choice for a source: restrict cfg.level_p to levels the CT has and every target of the source
    can provide (pyramid: same level; regions: levels 0..1). Returns -1 if nothing is usable. */
@@ -2490,10 +2491,11 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
     /* targets */
     /* --ink-head: the window's ink plane, built in the batch's own plane (on the source grid; the symmetry / host warp below moves it
        through big + P^3, free by then): no worker buffer of P^3 bytes */
-    uint8_t *inkw = c->ink_plane ? b->ink + (size_t)i * p3 : nullptr;
+    uint8_t *inkw = c->ink_plane && !c->ink_bits ? b->ink + (size_t)i * p3 : nullptr;
+    uint8_t *inkbits = c->ink_bits ? b->inkb + (size_t)i * p3 / 8 : nullptr;   /* (ink_bits: the known bits instead, written in the mask pass) */
     /* --rv with --gpu-aug: the papyrus plane from ct8 (the clean CT as read, = ctu here unless a seam shifts ctu first) in the mask pass
        below, one pass fewer (ink_it: the cutoff, 0 = built here) */
-    const int ink_it = inkw && c->rv_iso > 0 && c->gpu_aug && (!c->augment || !scan_aug_enabled(&c->scan) || c->scan.p[SA_SEAM] <= 0 || c->sheet || c->band || c->side)
+    const int ink_it = (inkw || inkbits) && c->rv_iso > 0 && c->gpu_aug && (!c->augment || !scan_aug_enabled(&c->scan) || c->scan.p[SA_SEAM] <= 0 || c->sheet || c->band || c->side)
                        ? (s->iso > 0 ? s->iso : c->rv_iso) : 0;
     uint8_t w[NCH] = {0};
     int tmax = 0;
@@ -2505,7 +2507,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
         if (c->papyrus) { memset(dst, 0, p3); continue; }   /* task papyrus: labels from the CT below */
         if (c->ink_plane && ch == CH_SHEET) {   /* --ink-head: the source's "ink" target onto its own plane (prob254 as stored), not a channel */
             if (!tdead) memset(dst, 0, p3);   /* (w 0: tdead, unread) */
-            if (!inkw) { fprintf(stderr, "sampler: no ink plane buffer\n"); return -1; }
+            if (!inkw && !inkbits) { fprintf(stderr, "sampler: no ink plane buffer\n"); return -1; }
             if (c->rv_iso > 0) {   /* --rv: papyrus (clean CT >= the cutoff) 254, void 0; unknown on CT 0 below (mask) */
                 const int it = s->iso > 0 ? s->iso : c->rv_iso;
                 if (!ink_it) for (size_t k = 0; k < p3; k++) inkw[k] = ctu[k] >= it ? 254 : 0;
@@ -2810,7 +2812,15 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
 #define MK(k) (ign_zero ? (uint8_t)(ctu[k] != 0) : (uint8_t)((ctu[k] != 0) & (mask[k] == 0)))
     /* tdead: the loss mask itself is read by nobody below (no packed plane, no sheet prior, the labels warped on the device): only the
        ink plane is written (one write stream fewer; the pass is DRAM-bound) */
-    if (tdead && ink_it && ink_it <= 255) {
+    if (inkbits) {   /* (ink_bits: the known bit of each voxel; the plane itself on the device) */
+        if (!ink_it) { fprintf(stderr, "sampler: ink bits without the rv cutoff\n"); return -1; }
+        b->ink_it[i] = (int16_t)(ink_it > 256 ? 256 : ink_it);
+        for (size_t k8 = 0; k8 < p3 / 8; k8++) {
+            unsigned v = 0;
+            for (int j = 0; j < 8; j++) { const size_t k = 8 * k8 + (size_t)j; const unsigned mk = ign_zero ? ctu[k] != 0 : (ctu[k] != 0) & (mask[k] == 0); if (!tdead) mask[k] = (uint8_t)mk; v |= mk << j; }
+            inkbits[k8] = (uint8_t)v;
+        }
+    } else if (tdead && ink_it && ink_it <= 255) {
         const uint8_t *c8 = b->ct8 + (size_t)i * p3; const uint8_t it = (uint8_t)ink_it;
         if (ign_zero) for (size_t k = 0; k < p3; k++) inkw[k] = ctu[k] ? (c8[k] >= it ? 254 : 0) : 255;
         else for (size_t k = 0; k < p3; k++) inkw[k] = ctu[k] && !mask[k] ? (c8[k] >= it ? 254 : 0) : 255;
@@ -3439,6 +3449,10 @@ static int label_res_check(sampler *sp, source *s, int si, int region_ch) {
     }
     return 0;
 }
+/* the --rv papyrus plane from the CT bytes and the known bits (batch.inkb; the host reference of nn_ink_bits before its symmetry / warp) */
+void sample_ink_from_bits(const uint8_t *ct8, const uint8_t *bits, int it, size_t n, uint8_t *out) {
+    for (size_t k = 0; k < n; k++) out[k] = bits[k >> 3] >> (k & 7) & 1 ? (it <= 255 && ct8[k] >= it ? 254 : 0) : 255;
+}
 /* ---- --replay: the same window again with a new device-side augmentation ---- */
 static sym sym_inverse(sym y) { sym z; for (int d = 0; d < 3; d++) { z.perm[y.perm[d]] = d; z.flip[y.perm[d]] = y.flip[d]; } return z; }
 static int sym_identity(sym y) { return y.perm[0] == 0 && y.perm[1] == 1 && y.perm[2] == 2 && !y.flip[0] && !y.flip[1] && !y.flip[2]; }
@@ -3588,6 +3602,12 @@ sampler *sampler_start(sources *S, const sample_cfg *cfg) {
     sampler *sp = calloc(1, sizeof *sp);
     sp->S = S;
     sp->cfg = *cfg;
+    if (sp->cfg.ink_bits) {   /* the bits stand for the plane only where draw_ builds it from the CT in the mask pass (ink_it): else the byte plane */
+        const sample_cfg *c = &sp->cfg;
+        const int ok = c->ink_plane && c->rv_iso > 0 && c->gpu_aug == 2 && (c->Pz <= 0 || c->Pz == c->P) && !(c->P & 1) &&
+                       (!c->augment || !scan_aug_enabled(&c->scan) || c->scan.p[SA_SEAM] <= 0 || c->sheet || c->band || c->side);
+        if (!ok) sp->cfg.ink_bits = 0;
+    }
     if (cfg->cover) {
         if (cfg->holdout || cfg->B != 1 || cfg->cover->P != cfg->P || cfg->cover_start >= cfg->cover->count) { free(sp); return nullptr; }
         sp->cfg.deterministic = 1; sp->cfg.snap = 0;
@@ -3634,7 +3654,7 @@ sampler *sampler_start(sources *S, const sample_cfg *cfg) {
     sp->slot_j = calloc((size_t)sp->nslots, sizeof *sp->slot_j);
     sp->slots = calloc((size_t)sp->nslots, sizeof *sp->slots);
     sp->state = calloc((size_t)sp->nslots, sizeof *sp->state);
-    for (int i = 0; i < sp->nslots; i++) sp->slots[i] = alloc_batch(cfg);
+    for (int i = 0; i < sp->nslots; i++) sp->slots[i] = alloc_batch(&sp->cfg);
     pthread_mutex_init(&sp->mu, nullptr);
     pthread_cond_init(&sp->cv_free, nullptr);
     pthread_cond_init(&sp->cv_ready, nullptr);
@@ -3719,8 +3739,19 @@ batch *sampler_next(sampler *sp) {
     if (ufsm_env_on("UFSM_BATCH_HASH")) {   /* debugging (with train --det 1): one hash per batch plane, to show a change leaves the batches byte-identical */
         const batch *b = &sp->slots[k]; const size_t B = (size_t)sp->cfg.B, p3 = P3(sp);
         static _Atomic long nb; const long id = atomic_fetch_add(&nb, 1);
+        uint8_t *inkr = b->inkb ? malloc(B * p3) : nullptr;   /* (ink_bits: the plane as the device builds it, for the same "ink" hash) */
+        if (inkr) {
+            uint8_t *g = malloc(p3); if (!g) abort();
+            for (size_t q = 0; q < B; q++) {
+                sample_ink_from_bits(b->ct8 + q * p3, b->inkb + q * p3 / 8, b->ink_it[q], p3, g);
+                int32_t h[8]; memcpy(h, (const char *)b->rad + q * NN_RAD_REC(PZ(&sp->cfg)), sizeof h);
+                sym y; for (int d = 0; d < 3; d++) { y.perm[d] = h[5] >> (2 * d) & 3; y.flip[d] = h[5] >> (8 + d) & 1; }
+                if (h[6] & 1) memcpy(inkr + q * p3, g, p3); else sym_u8(g, inkr + q * p3, PZ(&sp->cfg), sp->cfg.P, y);
+            }
+            free(g);
+        }
         const struct { const char *n; const void *p; size_t z; } f[] = {{"ct8", b->ct8, B * p3}, {"aug", b->aug, B * sizeof(scan_ct_rec)}, {"rad", b->rad, B * NN_RAD_REC(PZ(&sp->cfg))},
-            {"side", b->side, B * p3}, {"w4", b->w4, B * p3}, {"wcomp", b->wcomp, B * p3}, {"ink", b->ink, B * p3}, {"tm", b->tm, B * p3}, {"pm", b->pm, B * p3},
+            {"side", b->side, B * p3}, {"w4", b->w4, B * p3}, {"wcomp", b->wcomp, B * p3}, {"ink", inkr ? inkr : b->ink, B * p3}, {"tm", b->tm, B * p3}, {"pm", b->pm, B * p3}, {"inkb", b->inkb, B * p3 / 8},
             {"x16", b->x16, B * (size_t)b->xch * p3 * 2}, {"um", b->um, B * sizeof(float)}, {"src", b->src, B * sizeof(int16_t)}, {"w", b->w, B * NCH}};
         fprintf(stderr, "batchhash %ld", id);
         for (size_t q = 0; q < sizeof f / sizeof f[0]; q++) if (f[q].p) {
@@ -3730,6 +3761,7 @@ batch *sampler_next(sampler *sp) {
             fprintf(stderr, " %s %016llx", f[q].n, (unsigned long long)h);
         }
         fprintf(stderr, "\n");
+        free(inkr);
     }
     return &sp->slots[k];
 }

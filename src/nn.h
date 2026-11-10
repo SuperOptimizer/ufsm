@@ -202,6 +202,9 @@ void nn_aug_last_bytes(uint8_t *out, int P);   /* tests: the last window's outpu
    radial record on the device; cs_h / sn_h sample_phase_cssn's tables. Same stream order as nn_aug_ct (its staging buffer, 2 P^3). */
 void nn_label_warp(int kind, const uint8_t *a_h, const uint8_t *b_h, const void *rad_d, int P, uint8_t *da, uint8_t *db, const float *cs_h, const float *sn_h, int on_copy_stream);
 size_t nn_label_warp_device_bytes(int P);
+/* --rv ink bits: one window's papyrus plane on the device from its CT bytes and known bits (pinned host; sample.h batch.inkb, cutoff it),
+   then the window's warp (rad_d, warped) or cube symmetry (symcode: the radial record's h[5]) into da. Same staging / order as nn_label_warp */
+void nn_ink_bits(const uint8_t *ct8_h, const uint8_t *bits_h, int it, const void *rad_d, int warped, int symcode, int P, uint8_t *da, int on_copy_stream);
 /* packed targets (sample.h SAMPLE_TM_*: bit 0 target 0 = 255, bit 1 target 1 = 255, bit 2 mask) of nb samples of p3 voxels in m ->
    t (nb x 2 x p3: 0 / 255) and the 0 / 1 mask in m, in place; on the copy stream (after an nn_h2d_copy_stream of the codes) or the
    compute stream */

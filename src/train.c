@@ -383,7 +383,7 @@ static int val_fields(batch *b, int B, size_t p3, void **f[VAL_NF], size_t sz[VA
     if (g_side) VF(b->side, (size_t)B * p3);
     if (g_unwrap) VF(b->pm, (size_t)B * p3);
     if (g_unwrap2) { VF(b->w4, (size_t)B * p3); VF(b->wcomp, (size_t)B * p3); }
-    if (IPLANE) VF(b->ink, (size_t)B * p3);
+    if (IPLANE && b->ink) VF(b->ink, (size_t)B * p3);
     if (g_cond) VF(b->wind, (size_t)B * p3);
     if (g_pap_head) VF(b->pap, (size_t)B * p3);
     if (g_view) { VF(b->xv, (size_t)B * g_view * g_view * g_view); VF(b->vok, (size_t)B); }   /* (after the fields of runs without views: their hash unchanged) */
@@ -455,6 +455,13 @@ static int pm_used(void) { return g_unwrap && (!g_unwrap2 || g_pap_head); }
 static void lab_upload(int kind, const batch *b, uint8_t *da, uint8_t *db, const uint8_t *ha, const uint8_t *hb, const void *rad, int B, int P, int async) {
     void (*cp)(void *, const void *, size_t) = async ? nn_h2d_copy_stream : nn_h2d;
     const size_t p3 = (size_t)g_Pz * P * P;
+    if (kind == 3 && b->inkb) {   /* --rv ink bits: the plane built on the device from ct8 + the known bits, then its warp / symmetry */
+        for (int s = 0; s < B; s++) {
+            int32_t h[8]; memcpy(h, (const char *)b->rad + (size_t)s * NN_RAD_REC(g_Pz), sizeof h);
+            nn_ink_bits(b->ct8 + (size_t)s * p3, b->inkb + (size_t)s * p3 / 8, b->ink_it[s], (const char *)rad + (size_t)s * NN_RAD_REC(g_Pz), h[6] & 1, h[5], P, da + (size_t)s * p3, async);
+        }
+        return;
+    }
     if (g_gpu_aug != 2 || !b->ct8) { cp(da, ha, (size_t)B * p3); if (db) cp(db, hb, (size_t)B * p3); return; }
     const float *cs, *sn; sample_phase_cssn(&cs, &sn);
     for (int s = 0; s < B; s++) {
@@ -2110,6 +2117,7 @@ int cmd_train(int argc, char **argv) {
         if (so && atoi(so) > 0) {
             setenv("UFSM_SAMPLER_NOPIN", "1", 1); gpu_input_settle(&sc, 1);
             sc.slot_skip = g_unwrap2 && B == 1 && !g_ds && !ufsm_env_on("UFSM_TM_KEEP") ? 1 | (!pm_used() ? 2 : 0) : 0;
+            sc.ink_bits = g_rv && (!getenv("UFSM_INK_BITS") || ufsm_env_on("UFSM_INK_BITS"));
             sc.replay = atoi(opt(argc, argv, "--replay", "1")); sc.replay_gap = atoi(opt(argc, argv, "--replay-gap", "0"));
             sampler *sq = sampler_start(S, &sc); if (!sq) { fprintf(stderr, "cannot start the sampler\n"); return 1; }
             const int nb = atoi(so); const double t0 = now(); double tf = 0;
@@ -2810,6 +2818,7 @@ int cmd_train(int argc, char **argv) {
                 "beat more workers: each idle worker holds ~16 P^3 bytes of scratch, a slot %.2f GB)\n", sc.nbuf, workers, 2 * ng + 2,
                 (double)B * g_Pz * P * P * ((size_t)g_xs * xbytes() + (g_pack ? 1 : NCH + 1) + (g_side != 0) + 2 * (g_unwrap2 != 0) + (IPLANE != 0)) / 1e9);
     sc.slot_skip = g_tm_unused ? 1 | (!pm_used() ? 2 : 0) : 0;   /* (after the validation config's copy: its stored batches keep every plane) */
+    sc.ink_bits = g_rv && (!getenv("UFSM_INK_BITS") || ufsm_env_on("UFSM_INK_BITS"));   /* --rv: the papyrus plane as 1 known bit per voxel + ct8, built on the device (lab_upload); sampler_start may drop it */
     sc.replay_gap = atoi(opt(argc, argv, "--replay-gap", "0"));   /* (0: the slot count) */
     sc.replay = atoi(opt(argc, argv, "--replay", "1"));   /* --replay K: each window trained K times, replays with a new device-side augmentation (sample.h) */
     sampler *sp = sampler_start(S, &sc);
