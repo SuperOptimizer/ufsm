@@ -37,6 +37,42 @@ static uint64_t rnext(rng *r) {
 static void rseed(rng *r, uint64_t seed) {
     for (int i = 0; i < 4; i++) { seed += 0x9e3779b97f4a7c15ull; uint64_t z = seed; z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull; z = (z ^ (z >> 27)) * 0x94d049bb133111ebull; r->s[i] = z ^ (z >> 31); }
 }
+/* rskip(r, n) = n calls of rnext (the state only): xoshiro's step is linear over GF(2), so n steps are one 256 x 256 bit matrix T^n
+   (square-and-multiply, built once per n and kept: the windows of a run skip one or two fixed counts, P^3 / 4 draws each, 1-2% of a
+   loader's CPU as a loop); n below 4096 loops */
+typedef struct { uint64_t n; uint64_t m[256][4]; } rjump;   /* m[i]: the state bits that XOR into new bit i */
+static void rj_mul(uint64_t (*c)[4], const uint64_t (*a)[4], const uint64_t (*b)[4]) {   /* c = a b (c distinct from a, b) */
+    for (int i = 0; i < 256; i++) {
+        uint64_t r0 = 0, r1 = 0, r2 = 0, r3 = 0;
+        for (int w = 0; w < 4; w++) for (uint64_t v = a[i][w]; v; v &= v - 1) { const int j = w * 64 + __builtin_ctzll(v); r0 ^= b[j][0]; r1 ^= b[j][1]; r2 ^= b[j][2]; r3 ^= b[j][3]; }
+        c[i][0] = r0; c[i][1] = r1; c[i][2] = r2; c[i][3] = r3;
+    }
+}
+static const rjump *rj_get(uint64_t n) {
+    static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER; static rjump *tab[4]; static int nt;
+    pthread_mutex_lock(&mu);
+    for (int k = 0; k < nt; k++) if (tab[k]->n == n) { const rjump *j = tab[k]; pthread_mutex_unlock(&mu); return j; }
+    rjump *j = nt < 4 ? malloc(sizeof *j) : nullptr; uint64_t (*t)[4] = malloc(3 * 256 * sizeof *t);
+    if (!j || !t) { free(j); free(t); pthread_mutex_unlock(&mu); return nullptr; }
+    uint64_t (*sq)[4] = t, (*tmp)[4] = t + 256, (*acc)[4] = t + 512;
+    memset(sq, 0, 256 * sizeof *sq);
+    for (int c = 0; c < 256; c++) { rng e = {{0}}; e.s[c / 64] = 1ull << (c % 64); rnext(&e); for (int i = 0; i < 256; i++) if (e.s[i / 64] >> (i % 64) & 1) sq[i][c / 64] |= 1ull << (c % 64); }
+    memset(acc, 0, 256 * sizeof *acc); for (int i = 0; i < 256; i++) acc[i][i / 64] = 1ull << (i % 64);
+    for (uint64_t e = n; e; e >>= 1) {
+        if (e & 1) { rj_mul(tmp, acc, sq); memcpy(acc, tmp, 256 * sizeof *acc); }
+        if (e >> 1) { rj_mul(tmp, sq, sq); memcpy(sq, tmp, 256 * sizeof *sq); }
+    }
+    j->n = n; memcpy(j->m, acc, sizeof j->m); free(t); tab[nt++] = j;
+    pthread_mutex_unlock(&mu);
+    return j;
+}
+static void rskip(rng *r, uint64_t n) {
+    const rjump *j = n >= 4096 ? rj_get(n) : nullptr;
+    if (!j) { for (; n; n--) rnext(r); return; }
+    uint64_t o[4] = {0};
+    for (int i = 0; i < 256; i++) { const uint64_t v = (j->m[i][0] & r->s[0]) ^ (j->m[i][1] & r->s[1]) ^ (j->m[i][2] & r->s[2]) ^ (j->m[i][3] & r->s[3]); o[i / 64] |= (uint64_t)(__builtin_popcountll(v) & 1) << (i % 64); }
+    memcpy(r->s, o, sizeof o);
+}
 static double runif(rng *r) { return (double)(rnext(r) >> 11) * 0x1.0p-53; }
 static int64_t rint_below(rng *r, int64_t n) { return n <= 1 ? 0 : (int64_t)(runif(r) * (double)n); }
 
@@ -1421,20 +1457,24 @@ void phase_weight_drop(uint8_t *ph, const uint8_t *w, int Pz, int P, uint64_t se
 static void phase_negate(uint8_t *p, size_t n) { for (size_t k = 0; k < n; k++) if (p[k] < PHASE_PERIOD && p[k]) p[k] = (uint8_t)(PHASE_PERIOD - p[k]); }
 /* the stored phase's air test in one pass: sw unknown where CT <= air or CT 0; pw (optional, --task unwrap2's winding input,
    taken before the test): the phase where CT > 0, else unknown */
-static void phase_air(const uint8_t *ctu, uint8_t *sw, uint8_t *pw, size_t n, int air) {
-    size_t k = 0;
+static size_t phase_air(const uint8_t *ctu, uint8_t *sw, uint8_t *pw, size_t n, int air) {   /* returns the known phases (< PHASE_PERIOD) of sw out */
+    size_t k = 0, kn = 0;
 #ifdef __AVX2__
     {
         const __m256i z = _mm256_setzero_si256(), U = _mm256_set1_epi8((char)SIDE_UNKNOWN), A = _mm256_set1_epi8((char)(air > 255 ? 255 : air < 0 ? 0 : air));
+        const __m256i L = _mm256_set1_epi8((char)(PHASE_PERIOD - 1));
         for (; k + 32 <= n; k += 32) {
             const __m256i v = _mm256_loadu_si256((const __m256i *)(ctu + k)), s = _mm256_loadu_si256((const __m256i *)(sw + k));
             const __m256i v0 = _mm256_cmpeq_epi8(v, z), cond = air < 0 ? v0 : _mm256_cmpeq_epi8(_mm256_min_epu8(v, A), v);   /* (v <= air: min == v) */
             if (pw) _mm256_storeu_si256((__m256i *)(pw + k), _mm256_blendv_epi8(s, U, v0));
-            _mm256_storeu_si256((__m256i *)(sw + k), _mm256_blendv_epi8(s, U, cond));
+            const __m256i so = _mm256_blendv_epi8(s, U, cond);
+            _mm256_storeu_si256((__m256i *)(sw + k), so);
+            kn += (size_t)__builtin_popcount((unsigned)_mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_min_epu8(so, L), so)));   /* (so <= PERIOD - 1) */
         }
     }
 #endif
-    for (; k < n; k++) { const uint8_t v = ctu[k], s = sw[k]; if (pw) pw[k] = v ? s : SIDE_UNKNOWN; if (v <= air || !v) sw[k] = SIDE_UNKNOWN; }
+    for (; k < n; k++) { const uint8_t v = ctu[k], s = sw[k]; if (pw) pw[k] = v ? s : SIDE_UNKNOWN; if (v <= air || !v) sw[k] = SIDE_UNKNOWN; kn += sw[k] < PHASE_PERIOD; }
+    return kn;
 }
 static int phase_window(z3 *a, const int64_t o[3], int D, int P, int shift, uint8_t *side) {   /* a: s->phase, or s->wind (same grid); D x P x P */
     if (shift >= 2) return phase_window_interp(a, o, D, P, shift, side);
@@ -2451,6 +2491,10 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
     /* --ink-head: the window's ink plane, built in the batch's own plane (on the source grid; the symmetry / host warp below moves it
        through big + P^3, free by then): no worker buffer of P^3 bytes */
     uint8_t *inkw = c->ink_plane ? b->ink + (size_t)i * p3 : nullptr;
+    /* --rv with --gpu-aug: the papyrus plane from ct8 (the clean CT as read, = ctu here unless a seam shifts ctu first) in the mask pass
+       below, one pass fewer (ink_it: the cutoff, 0 = built here) */
+    const int ink_it = inkw && c->rv_iso > 0 && c->gpu_aug && (!c->augment || !scan_aug_enabled(&c->scan) || c->scan.p[SA_SEAM] <= 0 || c->sheet || c->band || c->side)
+                       ? (s->iso > 0 ? s->iso : c->rv_iso) : 0;
     uint8_t w[NCH] = {0};
     int tmax = 0;
     /* a channel without a target (w 0) is read again only by the packing / the host warp / the sheet prior / papyrus labels: with the
@@ -2460,11 +2504,11 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
         uint8_t *dst = ttmp + (size_t)ch * p3;
         if (c->papyrus) { memset(dst, 0, p3); continue; }   /* task papyrus: labels from the CT below */
         if (c->ink_plane && ch == CH_SHEET) {   /* --ink-head: the source's "ink" target onto its own plane (prob254 as stored), not a channel */
-            memset(dst, 0, p3);
+            if (!tdead) memset(dst, 0, p3);   /* (w 0: tdead, unread) */
             if (!inkw) { fprintf(stderr, "sampler: no ink plane buffer\n"); return -1; }
             if (c->rv_iso > 0) {   /* --rv: papyrus (clean CT >= the cutoff) 254, void 0; unknown on CT 0 below (mask) */
                 const int it = s->iso > 0 ? s->iso : c->rv_iso;
-                for (size_t k = 0; k < p3; k++) inkw[k] = ctu[k] >= it ? 254 : 0;
+                if (!ink_it) for (size_t k = 0; k < p3; k++) inkw[k] = ctu[k] >= it ? 254 : 0;
                 continue;
             }
             z3 *tz = s->tgt_key[ch] && s->tgt_prob[ch] && !crushed && !torn && !delam && !curved ? source_tgt_for_level(s, ch, l, nullptr) : nullptr;
@@ -2687,23 +2731,30 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
     /* label encoding -> target probability * 255 and the ignore mask (255 = ignore) */
     PROF_MARK(PS_TRUST);
     uint8_t *ign = big + 9 * p3;
+    int ign_zero = 0;   /* 1: ign is all zero but not written yet (no channel with a target: the mask pass then reads only the CT) */
+#define IGN_REAL() ((void)(ign_zero && (memset(ign, 0, p3), ign_zero = 0, 1)))
     if (NCH == 2 && w[0] && w[1]) {   /* both channels in one pass (the same bytes as the per-channel loops below: ignore = either is 255) */
         uint8_t *d0 = ttmp, *d1 = ttmp + p3;
         for (size_t k = 0; k < p3; k++) {
             const uint8_t v0 = d0[k], v1 = d1[k];
             ign[k] = (v0 == 255) | (v1 == 255); d0[k] = v0 == 255 ? 0 : (uint8_t)(v0 + (v0 >= 127)); d1[k] = v1 == 255 ? 0 : (uint8_t)(v1 + (v1 >= 127));
         }
-    } else memset(ign, 0, p3);
-    for (int ch = 0; ch < NCH && !(NCH == 2 && w[0] && w[1]); ch++) {
-        if (!w[ch]) continue;
-        uint8_t *dst = ttmp + (size_t)ch * p3;
-        for (size_t k = 0; k < p3; k++) { const uint8_t v = dst[k]; ign[k] |= v == 255; dst[k] = v == 255 ? 0 : (uint8_t)(v + (v >= 127)); }   /* (v * 255 + 127) / 254 for v < 255 */
+    } else {   /* the first channel with a target writes the mask, the others OR into it; none: zeros */
+        int first = 1;
+        for (int ch = 0; ch < NCH; ch++) {
+            if (!w[ch]) continue;
+            uint8_t *dst = ttmp + (size_t)ch * p3;
+            if (first) for (size_t k = 0; k < p3; k++) { const uint8_t v = dst[k]; ign[k] = v == 255; dst[k] = v == 255 ? 0 : (uint8_t)(v + (v >= 127)); }   /* (v * 255 + 127) / 254 for v < 255 */
+            else for (size_t k = 0; k < p3; k++) { const uint8_t v = dst[k]; ign[k] |= v == 255; dst[k] = v == 255 ? 0 : (uint8_t)(v + (v >= 127)); }
+            first = 0;
+        }
+        if (first) ign_zero = 1;   /* (zeroed only when something reads or ORs into it: IGN_REAL) */
     }
     float pap_t = 0;
     if (c->papyrus) {   /* task papyrus: channel 0 (probability x 255) and its ignore band from the clean CT, before the scanner augmentation */
         const double u_mode = runif(r), u_t = runif(r), u_tau = runif(r);
         pap_t = papyrus_cutoff(c->papyrus, ctu, p3, u_mode, u_t);
-        papyrus_labels(ctu, P, c->papyrus, pap_t, u_tau, ttmp, ign, ttmp + p3, big + p3);   /* channel 1 as scratch, scratch 8 P^3 */
+        IGN_REAL(); papyrus_labels(ctu, P, c->papyrus, pap_t, u_tau, ttmp, ign, ttmp + p3, big + p3);   /* channel 1 as scratch, scratch 8 P^3 */
         memset(ttmp + p3, 0, p3);
         w[0] = 1;
     }
@@ -2716,7 +2767,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
         tp_put(pt, p3); tp_put(pg, p3); tp_put(pf, p3);
     }
     PROF_MARK(PS_ENCODE);
-    if (c->sheet) sheet_mask_contacts(c->sheet,o,P,ign);
+    if (c->sheet) { IGN_REAL(); sheet_mask_contacts(c->sheet,o,P,ign); }
     /* input channels (z-scored CT, radial unit vector) written in one pass straight into the batch with the symmetry
        and the jitter applied on the way (16-bit when cfg.xfmt, else fp32): no fp32 intermediates */
     double mean = sum / (double)p3, var = sq / (double)p3 - mean * mean, sd = sqrt(var > 0 ? var : 0) + 1e-3;
@@ -2738,13 +2789,14 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
         PROF_MARK(PS_ZSCORE);
         if (grec) {   /* --gpu-aug: the decisions and the label side here, the float ops on the device; ctu then holds only the output's zero
                          set (0 / 1: every later CPU reader of ctu needs no more with side_air 0, sample_gpu_aug_ok) */
+            const scan_aug_cfg *sc_ = &c->scan;   /* (the plan writes the mask only for these ops: seam, air, dropped slices / cutouts that ignore) */
+            if ((sc_->p[SA_SEAM] > 0 && !c->sheet && !c->band && !c->side) || sc_->p[SA_AIR] > 0 || (sc_->drop_ignore && (sc_->p[SA_DROPSLICE] > 0 || sc_->p[SA_CUTOUT] > 0))) IGN_REAL();
             const unsigned on = scan_aug_plan(&c->scan, rnext(r), ctu, ttmp, NCH, ign, P, o, cyz, cxz, s->ax.n > 0, m->chunk, !c->sheet && !c->band && !c->side, &grec->plan);
             grec->scan = on != 0;
             if (on) {
-                memcpy(b->ct8 + (size_t)i * p3, ctu, p3);
-                scan_plan_notair(&grec->plan, ctu);   /* (= !scan_plan_air: one pass, in place) */
+                scan_plan_notair(&grec->plan, ctu, b->ct8 + (size_t)i * p3);   /* (the bytes as read into ct8, then ctu = !scan_plan_air in place: one pass) */
             }
-        } else if (scan_aug_apply(&c->scan, rnext(r), ctu, ttmp, NCH, ign, P, o, cyz, cxz, s->ax.n > 0, m->chunk, !c->sheet && !c->band && !c->side, big + p3)) {
+        } else if ((IGN_REAL(), 1) && scan_aug_apply(&c->scan, rnext(r), ctu, ttmp, NCH, ign, P, o, cyz, cxz, s->ax.n > 0, m->chunk, !c->sheet && !c->band && !c->side, big + p3)) {
             size_t nz2;   /* (integer sums: the same doubles as accumulating the bytes in double, exact below 2^53) */
             u8_stats(ctu, p3, &nz2, &sum, &sq);
             mean = sum / (double)p3; var = sq / (double)p3 - mean * mean; sd = sqrt(var > 0 ? var : 0) + 1e-3;
@@ -2754,8 +2806,26 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
     if (grec && !grec->scan) memcpy(b->ct8 + (size_t)i * p3, ctu, p3);   /* (the bytes as read) */
     if (s->norm_s > 0) { mean = s->norm_c; sd = s->norm_s; }   /* "norm": the scan's fixed normalisation (ufsm scanprep median / scale) instead of the window z-score */
     uint8_t *mask = big + 9 * p3;   /* ign lives here: fold CT > 0 into it */
-    if (inkw) for (size_t k = 0; k < p3; k++) { const uint8_t mk = (ctu[k] != 0) & (mask[k] == 0); mask[k] = mk; inkw[k] = mk ? inkw[k] : 255; }   /* --ink-head: unknown on CT 0 and where the scanner augmentation ignores labels */
+    /* (MK: the loss mask at k; ign_zero: nothing ignored, the mask is the CT test alone and ign is not read) */
+#define MK(k) (ign_zero ? (uint8_t)(ctu[k] != 0) : (uint8_t)((ctu[k] != 0) & (mask[k] == 0)))
+    /* tdead: the loss mask itself is read by nobody below (no packed plane, no sheet prior, the labels warped on the device): only the
+       ink plane is written (one write stream fewer; the pass is DRAM-bound) */
+    if (tdead && ink_it && ink_it <= 255) {
+        const uint8_t *c8 = b->ct8 + (size_t)i * p3; const uint8_t it = (uint8_t)ink_it;
+        if (ign_zero) for (size_t k = 0; k < p3; k++) inkw[k] = ctu[k] ? (c8[k] >= it ? 254 : 0) : 255;
+        else for (size_t k = 0; k < p3; k++) inkw[k] = ctu[k] && !mask[k] ? (c8[k] >= it ? 254 : 0) : 255;
+    } else if (tdead && !inkw) {}
+    else if (ink_it) {   /* (the --rv papyrus plane: ct8 >= cutoff 254, else 0; unknown where masked) */
+        const uint8_t *c8 = b->ct8 + (size_t)i * p3; const uint8_t it = (uint8_t)(ink_it > 255 ? 255 : ink_it);
+        if (ink_it > 255) for (size_t k = 0; k < p3; k++) { const uint8_t mk = MK(k); mask[k] = mk; inkw[k] = mk ? 0 : 255; }
+        else if (ign_zero) for (size_t k = 0; k < p3; k++) { const uint8_t mk = ctu[k] != 0; mask[k] = mk; inkw[k] = mk ? (c8[k] >= it ? 254 : 0) : 255; }
+        else for (size_t k = 0; k < p3; k++) { const uint8_t mk = (ctu[k] != 0) & (mask[k] == 0); mask[k] = mk; inkw[k] = mk ? (c8[k] >= it ? 254 : 0) : 255; }
+    } else if (inkw) for (size_t k = 0; k < p3; k++) { const uint8_t mk = MK(k); mask[k] = mk; inkw[k] = mk ? inkw[k] : 255; }   /* --ink-head: unknown on CT 0 and where the scanner augmentation ignores labels */
+    else if (ign_zero) for (size_t k = 0; k < p3; k++) mask[k] = ctu[k] != 0;
     else for (size_t k = 0; k < p3; k++) mask[k] = (ctu[k] != 0) & (mask[k] == 0);
+    ign_zero = 0;   /* (mask written, or dead: tdead) */
+#undef MK
+#undef IGN_REAL
     PROF_MARK(PS_ZSCORE);
     /* packed targets (cfg.pack_tm): unwarped samples pack the code in the source frame over the mask (one symmetry copy into the batch);
        warped ones warp into pooled scratch and pack after */
@@ -2854,6 +2924,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
     /* --task unwrap2: the winding mod 4 and its component come from a stored phase below (warped or through the symmetry: every
        voxel written); else unknown (255) */
     int w4_set = 0;
+    size_t ph_known = SIZE_MAX;   /* the known phases of the window's side plane (--min-phase), counted in phase_air; SIZE_MAX: count it */
     PROF_MARK(PS_SYMPACK);
     /* the targets (ttmp) and the loss mask (big + 9 P^3) are dead from here for unwarped / device-warped windows without a sheet prior
        (write_spatial_tm and sheet_sample would read them): their planes are scratch below */
@@ -2900,7 +2971,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
             if (c->wind4 && !s->scope_local) {   /* ("scope": "local": the winding mod 4 stays unknown, below) */   /* the winding mod 4: the phase unwrapped before the air test (gaps join the windings), outside the scroll (CT 0) not */
                 uint8_t *pw = PH_GET(ttmp + p3 + 64, p3);
                 if (!pw) { SW_PUT(); return -1; }
-                phase_air(ctu, sw, pw, p3, c->side_air); air_done = 1;   /* (the winding input and the air test in one pass) */
+                ph_known = phase_air(ctu, sw, pw, p3, c->side_air); air_done = 1;   /* (the winding input and the air test in one pass) */
                 if (ph_own) {   /* the phase's output now (the winding below reads pw only): its plane is free for the winding */
                     if (c->phase_near_um > 0) for (size_t k = 0; k < p3; k++) if (!near || !near[k]) sw[k] = SIDE_UNKNOWN;   /* no labelled wrap: none */
                     if (!direct) sym_u8(sw, side_o, Pz, P, y);
@@ -2924,7 +2995,8 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
                 PROF_MARK(PS_WIND4);
                 PH_PUT(pw, p3); if (!ph_own) { PH_PUT(ww, p3); PH_PUT(wc, p3); }
             }
-            if (!air_done) phase_air(ctu, sw, nullptr, p3, c->side_air);
+            if (!air_done) ph_known = phase_air(ctu, sw, nullptr, p3, c->side_air);
+            if (c->phase_near_um > 0 || (spatial.active && !lw)) ph_known = SIZE_MAX;   /* (the count of side_o: changed below / by the host warp; a symmetry keeps it) */
             if (!side_done) {
                 if (c->phase_near_um > 0) for (size_t k = 0; k < p3; k++) if (!near || !near[k]) sw[k] = SIDE_UNKNOWN;   /* no labelled wrap: none */
                 if (direct) {}   /* (in place) */
@@ -2985,12 +3057,12 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
         params=malloc((size_t)P*sizeof *params);
         for (int sz=0;sz<P;sz++) sheet_parameters(c->sheet,o[0]+sz,params[sz]);
     }
-    if (lw) for (size_t q = (size_t)Pz * P * (size_t)(P / 4 + P % 4); q; q--) rnext(r);   /* (write_spatial_tm's noise draws) */
+    if (lw) rskip(r, (uint64_t)Pz * P * (uint64_t)(P / 4 + P % 4));   /* (write_spatial_tm's noise draws) */
     else if (spatial.active) write_spatial_tm(ctu,ttmp,mask,T,M,P,o,(float)mean,(float)(1.0/sd),s->ax.n>0,cyz,cxz,y,&spatial,
             ia,ib,isg,r,nrow,c->xfmt,X,H,app,noise_state,noise_state?noise_state+P:nullptr,c->sheet,params,(float *)(big+p3),c->pack_tm,c->gpu_input,TMd);
     else if (c->sheet || (app && Pz != P)) write_x_aug(ctu, P, o, (float)mean, (float)(1.0 / sd), s->ax.n > 0, cyz, cxz, y, c->augment != 0, ia, ib, isg, r, nrow, c->xfmt,
             X, H, app, noise_state, noise_state ? noise_state + P : nullptr,c->sheet,params);
-    else if (grec) { if (c->augment) for (size_t q = (size_t)Pz * P * (size_t)(P / 4 + P % 4); q; q--) rnext(r); }   /* (write_x's jitter draws) */
+    else if (grec) { if (c->augment) rskip(r, (uint64_t)Pz * P * (uint64_t)(P / 4 + P % 4)); }   /* (write_x's jitter draws) */
     else write_x(ctu, Pz, P, o, (float)mean, (float)(1.0 / sd), s->ax.n > 0, cyz, cxz, y, c->augment != 0, ia, ib, isg, r, nrow, c->xfmt, X, H,
                  app, noise_state, noise_state ? noise_state + P : nullptr, c->gpu_input);   /* the CT appearance plan in the row-vectorised writer (cubes) */
     if (c->gpu_input) rad_record((char *)b->rad + (size_t)i * NN_RAD_REC(Pz), o, Pz, P, s->ax.n > 0, y, cyz, cxz, &spatial);   /* the radial channels: on the device */
@@ -3009,8 +3081,8 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
     tp_put(near, p3);
     if (c->side == 2 && c->min_phase > 0 && !s->ct_only) {   /* --min-phase: windows with (almost) no known phase supervise nothing (sources with band / phase
                                                  targets only draw anywhere in the scroll): rejected */
-        const uint8_t *sd = b->side + (size_t)i * p3; size_t kn = 0;
-        for (size_t k = 0; k < p3; k++) kn += sd[k] < PHASE_PERIOD;
+        const uint8_t *sd = b->side + (size_t)i * p3; size_t kn = ph_known;
+        if (kn == SIZE_MAX) { kn = 0; for (size_t k = 0; k < p3; k++) kn += sd[k] < PHASE_PERIOD; }
         if (inkw && !c->rv_iso) { const uint8_t *ik = b->ink + (size_t)i * p3; for (size_t k = 0; k < p3; k++) kn += ik[k] != 255; }   /* (--ink-head: known ink supervises too: ink-only sources draw) */
         if ((double)kn < c->min_phase * (double)p3) { if (Tw) tp_put(Tw, (NCH + 1) * p3); atomic_fetch_add(&sp->rejected, 1); atomic_fetch_add(&sp->rej_why[2], 1); return 1; }   /* (counted as empty targets) */
     }
@@ -3455,12 +3527,17 @@ static void *replay_thread(void *arg) {
     pthread_mutex_unlock(&sp->mu); free(scr);
     return nullptr;
 }
+static int rskip_selftest(void) {   /* the jump = the loop (a count the cache keeps: 4099 + every bit pattern below) */
+    rng a, b; rseed(&a, 12345); b = a; rskip(&a, 4099); for (int q = 0; q < 4099; q++) rnext(&b);
+    return memcmp(a.s, b.s, sizeof a.s) ? -1 : 0;
+}
 static int replay_selftest(void) {   /* sym_inverse undoes every cube symmetry (sym_u8 twice on a 5^3 cube) */
     uint8_t a[125], t[125], u[125]; for (int k = 0; k < 125; k++) a[k] = (uint8_t)k;
     for (int q = 0; q < 48; q++) { const sym y = sym_of(q); sym_u8(a, t, 5, 5, y); sym_u8(t, u, 5, 5, sym_inverse(y)); if (memcmp(a, u, 125)) return -1; }
     return 0;
 }
 sampler *sampler_start(sources *S, const sample_cfg *cfg) {
+    if (rskip_selftest()) { fprintf(stderr, "sampler: rng jump-ahead self-test failed\n"); return nullptr; }
     if (cfg->replay > 1 && (!sampler_replay_ok(cfg) || replay_selftest())) { fprintf(stderr, "sampler: --replay needs --gpu-aug 2 cube batches without sheet / band / gap / condition / distill / view / cover / chain / papyrus-mask planes\n"); return nullptr; }
     if (!S || S->n <= 0 || cfg->P <= 0 || cfg->B <= 0 || cfg->nworkers <= 0 || cfg->nbuf <= 0) { fprintf(stderr, "sampler: invalid sources, patch, batch, workers or buffer count\n"); return nullptr; }
     if (cfg->gpu_input && !sample_gpu_input_ok(cfg)) { fprintf(stderr, "sampler: --gpu-input needs 16-bit batches and no warps, sheet prior, slab appearance plan, aux or condition inputs\n"); return nullptr; }
@@ -3595,7 +3672,7 @@ sampler *sampler_start(sources *S, const sample_cfg *cfg) {
         /* default gap: a window's slot is held ~(K-1) G / K batches per new window, so G = (slots - workers) K / (K-1) leaves every worker
            a slot to build in (more interleave wants more slots: --sampler-slots workers + 2 + extra) */
         sp->rgap = cfg->replay_gap > 0 ? cfg->replay_gap : (sp->nslots - cfg->nworkers) * cfg->replay / (cfg->replay - 1);
-        if (sp->rgap < 2) sp->rgap = 2; if (sp->rgap > sp->nslots) sp->rgap = sp->nslots;
+        sp->rgap = sp->rgap < 2 ? 2 : sp->rgap > sp->nslots ? sp->nslots : sp->rgap;
         sp->rth_on = sp->rleft && sp->rq && sp->rdue && sp->rseq && !pthread_create(&sp->rth, nullptr, replay_thread, sp);
         if (!sp->rth_on) { fprintf(stderr, "sampler: cannot start the replay thread\n"); free(sp->rleft); free(sp->rq); free(sp->rdue); free(sp->rseq); sp->rleft = nullptr; sp->rq = nullptr; sp->rdue = sp->rseq = nullptr; }
         else fprintf(stderr, "sampler: window replay x%d, interleaved: a replay %d batches after its window's previous use%s (a new symmetry / warp / scanner plan / jitter per replay, on the device)\n",

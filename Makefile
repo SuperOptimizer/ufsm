@@ -548,6 +548,9 @@ $(B)/test_typed_zarr: tests/test_typed_zarr.c $(B)/z3w.o $(B)/zarr3.o $(B)/store
 $(B)/test_z3_autosub: tests/test_z3_autosub.c $(B)/z3w.o $(B)/zarr3.o $(B)/store.o $(B)/json.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
 suite-bins: $(B)/test_z3_autosub
+$(B)/test_z3_sink: tests/test_z3_sink.c $(B)/z3w.o $(B)/zarr3.o $(B)/store.o $(B)/json.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
+suite-bins: $(B)/test_z3_sink
 
 $(B)/test_ct_augment: tests/test_ct_augment.c $(B)/ct_augment.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ -lm
