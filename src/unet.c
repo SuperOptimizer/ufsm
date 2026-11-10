@@ -1332,8 +1332,12 @@ static void build_acts(unet *u, shape5 xs, int train) {
                 const size_t hb = act_bytes_of(u->dec[0].ys);
                 size_t need = 256;
                 for (int i = 1; i < L; i++) need += (gobs[i] + 255) & ~(size_t)255;
-                u->gco = gco_on() && gmx && u->nob && u->a0_share && recompute() == 1 && !recompute_a1() && L > 1 && grad_dt() == act_dt()
+                /* not with level 1 narrower than level 0: {96, 64, 96} with a 32-channel fp4 input gave enc[0] / down0 gradients that changed
+                   from one backward to the next (11-09, tests/test_lat_head TLH_W1=64 TLH_W2=96; the share's sizes assume w[1] >= w[0]) */
+                const int narrow1 = L > 1 && u->cfg.widths[1] < u->cfg.widths[0];
+                u->gco = gco_on() && gmx && u->nob && u->a0_share && recompute() == 1 && !recompute_a1() && L > 1 && grad_dt() == act_dt() && !narrow1
                          && need <= hb && ((gobs[1] + 255) & ~(size_t)255) + 256 <= act_bytes_of(u->dec[0].ys);
+                { static int said; if (narrow1 && gco_on() && !said++) fprintf(stderr, "unet: level 1 (%d channels) is narrower than level 0 (%d): coarse-gradient share off\n", u->cfg.widths[1], u->cfg.widths[0]); }
             }
             if (u->l3b) {   /* X3 (unet.l3b): level 0's A, the input (5 B per voxel), then the coarse forward homes from 256 on, then the fp16 logits
                                and their gradient: all below the trainer's batch tail at its end (unet_batch_scratch2) */

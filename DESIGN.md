@@ -58,6 +58,88 @@ trunk forward 84, trunk backward 310, slab adjoint 206, slab upsampling 50, labe
   winding: trunk 197 (of it the 96 -> 144 head 37: forward 8, data gradient 14, weight gradient 15), slab section 123, CT upload +
   gpu-aug 50, label upload 15, input 8, optimizer 9; rv: slab section 143 (label upload 38, targets 35, loss kernels 36, upsampling
   15, adjoint 19), uploads 72, trunk 51 (head 12), optimizer 12. For the rv net the full-resolution passes, not the trunk, are the step.
+- **What is not fp4 in a latent step, and whether it could be** (sub-cell head, bytes per window voxel): the cell logits `lg` (144
+  channels, fp16, 4.5 B = 2.0 GB at P768) and their gradient `latgl` (the same), `latg` (16 channels of fp32 sums, 1.0 B: sums of
+  ~100 slab terms, kept), the slab logits `hs_lg` (fp16, one slab), GroupNorm statistics / weights / optimizer state (fp32, 0.12 GB).
+  Experiment switches `UFSM_LAT_LG_MX` / `UFSM_LAT_GL_MX` = 8 | 4 round `lg` / `latgl` through MX rows in place (32-channel blocks per
+  cell, round to nearest; no kernel reads MX yet). The same 300 steps as above (run-to-run spread of the baseline: 1.3792 / 1.3799,
+  the first ~20 steps identical):
+
+  | | step 1 | 1-50 | 51-100 | 101-200 | 201-300 |
+  |---|---|---|---|---|---|
+  | fp16 both (default) | 2.6364 | 2.7342 | 2.1850 | 1.5853 | 1.3792 |
+  | logits MX-fp8 | 2.6347 | 2.7313 | 2.1832 | 1.5851 | 1.3799 |
+  | logits MX-fp4 | 2.6103 | 2.7081 | 2.1714 | 1.5859 | 1.3837 |
+  | gradient MX-fp8 | 2.6364 | 2.7333 | 2.1815 | 1.5857 | 1.3820 |
+  | gradient MX-fp4 | 2.6364 | 2.7325 | 2.1837 | 1.5870 | 1.3801 |
+  | logits fp8 + gradient fp8 | 2.6347 | 2.7312 | 2.1828 | 1.5853 | 1.3805 |
+  | logits fp8 + gradient fp4 | 2.6347 | 2.7332 | 2.1830 | 1.5857 | 1.3806 |
+  | logits fp4 + gradient fp4 | 2.6103 | 2.7077 | 2.1716 | 1.5870 | 1.3820 |
+
+  Nothing separates from the baseline's own spread at 300 steps. fp4 logits move the step-1 loss by 1% (the same weights, another
+  rounding of the outputs), fp8 logits by 0.06%. Real MX storage (logits fp8 2.3 B, gradient fp4 1.2 B: -5.5 B a voxel, 2.5 GB at
+  P768) needs the head forward writing MX rows, `nn_lat_up_slab` / `nn_lat_shuffle` reading them, the adjoints' final store in MX and
+  the head's weight gradient reading an MX gy: not written. It saves memory only, no step time.
+- **The streamed head (default for `--lat-guide 0 / 3`; `UFSM_LAT_HEAD_STREAM=0` off): neither `lg` nor `latgl` nor the whole `latg`
+  exists.** The network is built with head slabs (`unet_set_head_ext`): `head_slab_pass` runs the head on the cell planes a slab reads
+  (`unet_head_fwd_z` on planes z0/4 - 1 .. z1/4, both passes; `nn_lat_up_slab_c` / `nn_lat_shuffle_c` take a chunk of cell planes), and
+  the gradient pass moved into the backward's head callback: each slab adds into a rolling buffer of hs_z / 4 + 2 planes (fp32 sums of
+  the 16 interpolated outputs, fp16 of the sub-cell ones), the planes no later slab reaches go through `unet_head_bwd_z` at once
+  (`nn_lat_grad_fin`), the last two are carried over (`nn_lat_grad_carry`). No rounding is added: the logits are the whole head's bit
+  for bit, the gradients equal up to the weight gradient's summation order (tests/test_lat_head: 32 / 96 -> 144 per 3 cell planes
+  against the whole head, logits 0 differ, gradients 2e-8 / 4e-8). Bytes of cell logits and gradients: P256 38 MB instead of 170 MB;
+  the planner's bytes per voxel 71.4 -> 63.4 (winding net), 71.7 -> 63.7 (rv); at P768 4.6 GB -> 0.33 GB. Training: the rv net
+  (32 wide) gives the same loss to 4 decimals through 40 same-batch steps (1.9671 ... 1.8012 both ways); the winding net (96 wide)
+  the same through step 4 and 1.6316 / 1.6322 at step 40, which is that net's own run-to-run spread (below).
+  Cost: the head forward runs in both passes with 2 halo planes per 8, and the head backward runs per range; the range weight
+  gradient used 8192 voxels a block (9 blocks for 8 planes at P384: each of its 54 passes as long as the whole grid's), now >= 128
+  blocks (`lp_bwd_w1_mx_b_r`). Timings so far only with ws768 on the same GPU (P384, winding net, synchronised phases, two runs
+  each): 466 / 424 ms streamed against 404 / 439 whole, i.e. inside the contention noise; an idle-GPU number is owed.
+  `nn_head_bwd_z` takes the general path for more than 16 outputs (the fused kernel is <= 16; 32 inputs -> 144 was "not covered").
+- Planner (`UFSM_MEM_DRY=1`, smallest mode, GB; streamed / whole head): P768 rv 8.73 / 13.06, winding 8.80 / 13.13; P896 13.22 / 20.18
+  and 13.35 / 20.31; P960 15.99 / 24.58 and 16.15 / 24.75; P1024 19.13 / 29.61 and 19.34 / 29.81. Of the 19.13 GB at P1024 the
+  network is 1.48 and the "task" term 16.87 (15.7 B a voxel): it still counts the label planes that `lab_stream` keeps on the host.
+  One real run to compare (P384 rv, ws768 on the same card): process peak 1.20 GB by nvidia-smi at 1 Hz (CUDA context included)
+  against the planner's 1.83. Real P896-1024 steps are owed (a free GPU).
+- Later the same evening: every head streams (the guided ones too: their coefficient planes are interpolated outputs, all through the
+  fp32 sums; no sub-cell buffer). 40 same-batch steps, streamed / stored: `--lat-guide 1` rv net 2.7170, 2.6549, 2.5046 both;
+  `--lat-guide 2` winding net 2.3987 both at step 4, 2.1172 / 2.1187 at step 40 (the 96-wide spread); plain head 1.9676, 1.9132
+  both, 1.7992 / 1.7994 at step 40. tests/test_lat: the chunk kernels and the rolling gradient against the whole arrays (slab
+  values bit for bit, coarse gradient within one fp16 code). No checkpoint field changes: running fp8 checkpoints resume as before.
+  The planner's task term now leaves out the label planes the label stream keeps on the host (`UFSM_PLAN_LABELS_DEV=1`: the old
+  count).
+- About the 96-wide irreproducibility below, measured after writing it: one net repeats its own backward exactly only for 32-wide
+  nets; a 96-wide net's second backward on the same build differs from its first (enc[0] 0.375, the rest 0.15) while a second net
+  of the same configuration reproduces the first net's first backward outside enc[0]. Filling every new device buffer with a byte
+  (`UFSM_MALLOC_FILL`) changes nothing, so no unwritten memory is read. K repeated backwards without a rebuild stay unbiased
+  (enc[0] 0.153 at 24, 0.080 at 96): the draws are valid, their assignment differs between the first backward after a build and
+  the later ones, and between layouts. The op is not located.
+- **Resolved as far as production goes (22:30): the irreproducibility below needs level 1 narrower than level 0.** It appears only
+  with the test's first widths {96, 64, 96}; {96, 128, 160}, {96, 96, 96} and {32, 32, 32} reproduce every tensor to 1e-9 (one net
+  twice, two equal nets, whole head against per range), and so does {96, 64, 96} with `--input-prec 8`. On {96, 64, 96} each
+  backward of one net differs from the last in enc[0] and down0 (0.25-0.5), with identical logits and seed counts; it goes away
+  with `UFSM_GN_DEFER=0` or `UFSM_COARSE_GRAD_SHARE=0`. So a size assumption of the coarse-gradient share (gout[1]'s home in
+  dec[0].a2's buffer beside the 32-channel fp4 input) fails when w[1] < w[0]; the production nets (96,128,160,192 and
+  32,64,128,192,256) are not that case. test_lat_head now uses (32,64,96) and (96,128,160) and holds enc[0] to the same bound;
+  `TLH_W1=64 TLH_W2=96 TLH_REPRO=1` shows the defect. Not fixed.
+- 22:40: the streamed head under `--fp8 1` aborted ("the head backward is not covered per slab") when a g768 / wz768 checkpoint was
+  resumed: the per-range head backward's entries wanted storage code 4 / 8 while nn's MXDT names MX-fp8 3. Now the general path for
+  MX-fp8 x or gx (as the whole path's fused kernel declines it). Copies of g768/snap/9000 (guide 5) and wz768/snap/2000 (guide 64)
+  resumed at P256, 4 steps at the runs' learning rates, streamed and stored: 1.2750, 1.0221, 1.1934, 0.8154 and 1.1716, 1.2295,
+  1.3785, 1.1394 both ways. `test_lat_head~FP8` (TLH_FP8=1) runs the head test in that mode. Two `--det 1` runs of 40 steps
+  give identical step lines for the rv and the winding net (streamed, fp4).
+- Coarse-gradient share: off when widths[1] < widths[0] (one stderr line); the narrow net then repeats its backward exactly, but
+  still fails against the 8-output net and under 16-bit gradients (`TLH_NARROW_ALL=1`): open.
+- **Found on the way, not fixed: with a 96-wide level 0 under the lean-2 sharing modes (share_enc_a1 + a0_share) enc[0]'s parameter
+  gradients are not reproduced between two equal backwards** (two nets with equal parameters, or the head whole against per range:
+  rel 0.17-0.26 on enc[0], every other tensor equal to 1e-9; it depends on the allocation layout; 32-wide nets reproduce exactly;
+  synchronous offload copies, `UFSM_OFFLOAD_SYNC=1`, change nothing; the storage registry shows no stale entry, `nn_storage_dump`).
+  The gradients are valid draws: their mean over K backwards approaches the 16-bit-gradient reference as 1 / sqrt(K) (0.153 at 24,
+  0.080 at 96, as the 32-wide net's 0.189 / 0.095). So some SR key or rounding input on the way to enc[0] differs per run for 3-block
+  rows; this is probably why two `--det 1` runs of the winding net part after ~20 steps. test_lat_head compares enc[0] apart for
+  that reason.
+- The slab loop stays two passes: the side / normal gradients divide by the window's mask sums and the count of active channels, the
+  winding term by its gauges, all known only after every slab's targets (and the winding logits) were seen.
 - Left in the slab section (P512, ms): upsampling 50 and adjoint 60 still cover all 32 planes of the guide-2 head although 13 are
   unused; label upload 37 is hidden by the upload pipeline outside the synchronised profile.
 

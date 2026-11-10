@@ -218,6 +218,8 @@ $(B)/test_mx4: tests/test_mx4.c $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 $(B)/test_grad_mx4: tests/test_grad_mx4.c $(B)/unet.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
+$(B)/test_lat_head: tests/test_lat_head.c $(B)/unet.o $(B)/nn.o $(B)/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 $(B)/test_l3_sched: tests/test_l3_sched.c $(B)/unet.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 
@@ -667,6 +669,7 @@ suite-bins: $(B)/test_gpu_input $(B)/test_lat
 suite-bins: $(B)/test_pack_tm
 suite-bins: $(B)/test_wind4
 suite-bins: $(B)/test_w4dev
+suite-bins: $(B)/test_lat_head
 suite-bins: $(B)/test_lat_conv0
 suite-bins: $(B)/test_pgrad
 suite-bins: $(B)/test_gyrec

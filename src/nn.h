@@ -156,6 +156,7 @@ void nn_f32_to_bf16(const float *x, size_t n, void *y);   /* converts to the cur
 void nn_set_storage(const void *p, size_t bytes, int dt);
 int nn_storage(const void *p);          /* 8 = MX-fp8, 4 = MX-fp4, 0 = default */
 void nn_storage_forget(const void *p);
+void nn_storage_dump(const char *tag);   /* debug: prints the storage registry */
 size_t nn_mx8_bytes(shape5 s);
 size_t nn_mx4_bytes(shape5 s);
 size_t nn_mx_bytes(shape5 s, int dt);   /* registry dt 8 / 4 */
@@ -195,6 +196,14 @@ void nn_lat_input_x(const void *x, int d, int h, int w, const float *bas, const 
    [C][d][h][w] (fp16 when lh16, else fp32) -> fine planes [z0, z0 + nz) of the 4d x 4h x 4w window, fp16 [C][nz][4h][4w] in y;
    nn_lat_up_adj adds the adjoint of such a slab's fp16 gradient g into the fp32 coarse gradient gc [C][d][h][w] */
 void nn_lat_up_slab(const void *lg, int lh16, int C, int d, int h, int w, int z0, int nz, void *y);
+/* _c: the cell-grid array holds planes [q0, q0 + qd) only ([C][qd][h][w]); nn_lat_grad_fin / _carry: the streamed head's rolling
+   coarse gradient (nn_lat.cu) */
+void nn_lat_up_slab_c(const void *lg, int lh16, int C, int d, int h, int w, int z0, int nz, void *y, int q0, int qd);
+void nn_lat_up_adj_c(const void *g, int C, int d, int h, int w, int z0, int nz, float *gc, void *scratch, int q0, int qd);
+void nn_lat_shuffle_c(const void *lg, int lh16, int d, int h, int w, int base, int ng, int z0, int nz, void *y, int q0, int qd);
+void nn_lat_shuffle_adj_c(const void *g, int d, int h, int w, int base, int ng, int z0, int nz, void *gc, int q0, int qd);
+void nn_lat_grad_fin(const float *a, int nf, const void *sb, int C, size_t pl, int cap, int i0, int np, void *gc);
+void nn_lat_grad_carry(float *a, int nf, void *sb, int C, size_t pl, int cap, int from, int n);
 void nn_lat_up_adj(const void *g, int C, int d, int h, int w, int z0, int nz, float *gc, void *scratch);   /* scratch: C nz h w fp32 for the separable path (z0, nz multiples of 4), or nullptr */
 int nn_lat_set_slow(int on);   /* the per-voxel kernels for every slab (UFSM_LAT_SLOW=1; train's UFSM_LAT_CHECK compares against them); returns the previous setting */
 /* predict on a latent-grid net: the network's 4-channel input on the cell grid ([4][D/4][W/4][W/4], 16-bit storage as nn_set_f16) straight
