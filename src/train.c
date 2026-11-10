@@ -1033,7 +1033,7 @@ static int sync_check(gpu_state *d, int step, const char *what) {
     nn_sync();
     const char *e = nn_check();
     if (!e) return 0;
-    fprintf(stderr, "cuda error at step %d after the %s: %s\n", step, what, e);
+    fprintf(stderr, "cuda error at step %d after the %s: %s at %s\n", step, what, e, nn_check_site());
     window_note(d, g_Sdiag, "  window");
     return 1;
 }
@@ -3120,7 +3120,10 @@ int cmd_train(int argc, char **argv) {
         committed_step = step;
         if (plan) { coverage.cursor = (uint64_t)(step - coverage.base_step); if (cover_checkpoint_extra(runtime_extra, &coverage, checkpoint_extra, sizeof checkpoint_extra)) return 2; }
         const char *e = nn_check();
-        if (e) { fprintf(stderr, "cuda error at step %d: %s\n", step, e); for (int q = 0; q < nl; q++) window_note(&G[q], S, "  window"); return 1; }
+        if (e) { fprintf(stderr, "cuda error at step %d: %s at %s (no checkpoint written)\n", step, e, nn_check_site()); for (int q = 0; q < nl; q++) window_note(&G[q], S, "  window"); return 1; }
+        { static int fault = -2; if (fault == -2) fault = getenv("UFSM_TEST_CUDA_FAULT") ? atoi(getenv("UFSM_TEST_CUDA_FAULT")) : -1;   /* tests: a failed copy
+                                                                                   (a null host source) after step N's check, as a validation pass's upload can fail */
+          if (fault == step) nn_h2d(G[0].x, nullptr, 16); }
         if ((seconds && now() - t0 >= seconds) || (schedule_seconds && schedule_elapsed+now()-t0>=schedule_seconds) ||
             (limit_seconds && now() - t0 >= limit_seconds) || (stop_at && step >= stop_at)) g_stop = 1;
         acc_loss += loss / nl; acc_bce += parts[0][0]; acc_dice += parts[0][g_aff || g_unwrap || g_heads ? NCH : g_half ? g_cout : cfg.cout]; acc_g += gn; nacc++;

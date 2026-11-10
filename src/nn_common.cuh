@@ -98,7 +98,8 @@ extern "C" int nn_get_grad_bf16(void);
 
 extern cudaError_t g_err;
 extern "C" const char *lp_check(void);
-#define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess && g_err == cudaSuccess) { g_err = e_; if (ufsm_env_on("UFSM_CUDA_TRACE")) fprintf(stderr,"CUDA at %s:%d (%s): %s\n",__FILE__,__LINE__,#x,cudaGetErrorString(e_)); } } while (0)
+extern const char *g_err_file, *g_err_what; extern int g_err_line;   /* the call site of the latched g_err (nn_check_site) */
+#define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess && g_err == cudaSuccess) { g_err = e_; g_err_file = __FILE__; g_err_line = __LINE__; g_err_what = #x; if (ufsm_env_on("UFSM_CUDA_TRACE")) fprintf(stderr,"CUDA at %s:%d (%s): %s\n",__FILE__,__LINE__,#x,cudaGetErrorString(e_)); } } while (0)
 #define KCHECK() CK(cudaGetLastError())
 
 extern "C" int nn_init(int device);

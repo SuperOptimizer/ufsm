@@ -4227,6 +4227,10 @@ void unet_debug_acts(const unet *u) {
     for (int i = L - 2; i >= 0; i--) { const block *b = &u->dec[i]; fprintf(stderr, "dec%d:", i); dbg_tensor("a1", b->a1, b->ys); dbg_tensor("a2", b->a2, b->ys); fprintf(stderr, "\n"); }
 }
 int unet_save(const unet *u, const char *path, int step, const char *extra) {
+    {   /* a latched CUDA error: the device weights are not trustworthy (a failed copy / launch left them stale or zero): no checkpoint */
+        nn_sync(); const char *e = nn_check();
+        if (e) { fprintf(stderr, "unet_save: CUDA error %s at %s: %s not written\n", e, nn_check_site(), path); return -1; }
+    }
     char tmp[1400];
     snprintf(tmp, sizeof tmp, "%s.tmp", path);
     FILE *f = fopen(tmp, "wb");

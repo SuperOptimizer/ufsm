@@ -21,6 +21,7 @@ static inline size_t shape_spatial(shape5 s) { return (size_t)s.d * s.h * s.w; }
 /* ---- device / memory ---- */
 int nn_init(int device);                 /* selects the device; returns 0 on success */
 const char *nn_check(void);              /* nullptr if no error since the last call, else the message */
+const char *nn_check_site(void);         /* the call site of the error the last nn_check returned ("" for none; low-precision kernels: their own latch) */
 void *nn_malloc(size_t bytes);
 void nn_free(void *p);
 void nn_zero(void *p, size_t bytes);
