@@ -124,6 +124,13 @@ int main(void) {
     CHECK(!run(root, "wp", "p4", "1", "4", nullptr, nullptr, nullptr), "surf-labels dir +1 (4 threads) failed");
     snprintf(cmd, sizeof cmd, "cd %s && for a in codes phase ignore; do for s in $(cd p1/$a.zarr/9.6 && find c -type f); do cmp -s p1/$a.zarr/9.6/$s p4/$a.zarr/9.6/$s || exit 1; done; done", root);
     CHECK(!system(cmd), "outputs differ between 1 and 4 threads");
+    /* --zband: a band holding the whole grid writes the same bytes; a band past it writes no shard */
+    CHECK(!run(root, "wp", "zb", "1", "4", "--zband", "0,64", nullptr), "surf-labels --zband 0,64 failed");
+    snprintf(cmd, sizeof cmd, "cd %s && for a in codes phase ignore; do for s in $(cd p4/$a.zarr/9.6 && find c -type f); do cmp -s p4/$a.zarr/9.6/$s zb/$a.zarr/9.6/$s || exit 1; done; done", root);
+    CHECK(!system(cmd), "--zband over the whole grid changed the outputs");
+    CHECK(!run(root, "wp", "zc", "1", "4", "--zband", "128,256", nullptr), "surf-labels --zband 128,256 failed");
+    snprintf(cmd, sizeof cmd, "test -z \"$(find %s/zc/phase.zarr/9.6 -path '*/c/*' -type f 2>/dev/null)\"", root);
+    CHECK(!system(cmd), "--zband past the grid still wrote phase shards");
     CHECK(!run(root, "ws/strip.sfc", "st", "1", "4", nullptr, nullptr, nullptr), "surf-labels on a strip.sfc failed");   /* one strip = its wraps (strip.tsv columns) */
     {   /* (the wraps and the strip are separate lossy .sfc encodings, tolerance 0.01 voxel: a few voxels at the sheet edges may differ) */
         static const char *arr[3] = {"codes", "phase", "ignore"}; size_t nd[3] = {0, 0, 0}, nk = 0, big = 0;

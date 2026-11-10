@@ -3,7 +3,7 @@
                    [--wrapcheck TSV] [--first K] [--last K] [--drop w1,w2,..] [--band-peaks LO,HI]
                    [--ct ROOT KEY [--ct-scale 1|2] [--min-onpap 0.2] [--ct-level 80] [--ct-range 15]]   (--ct-scale 2: the CT is on the 2x finer grid)
                    [--exclude holdouts.json --exclude-ct NAME [--exclude-mm 0.5]]
-                   [--weight-coh T0,T1 (with --ct: OUT/weight.zarr, the trainer's phase confidence)] [--geom DIR [--slip-max 0.5] [--slip-d 2]] [--radius 20] [--block 256] [--shard 512] [--bake 1] [--min-coh T [--coh-cell 32]] [--gt ROOT KEY [--gt-dir 1|-1]] [--tsv OUT] [--threads N]
+                   [--zband Z0,Z1 (only the shard rows meeting grid z Z0..Z1: calibration runs)] [--weight-coh T0,T1 (with --ct: OUT/weight.zarr, the trainer's phase confidence)] [--geom DIR [--slip-max 0.5] [--slip-d 2]] [--radius 20] [--block 256] [--shard 512] [--bake 1] [--min-coh T [--coh-cell 32]] [--gt ROOT KEY [--gt-dir 1|-1]] [--tsv OUT] [--threads N]
    Winding labels straight from our whole-scroll wraps (ufsm wraps / wrap-snap .sfc, rows = z, wrap k = the fit's level set W = k
    with W = U - dir theta / 2 pi, theta = atan2 around the axis in (-pi, pi]): every wrap's quads are rasterised on the scan's training
    grid (--grid-um; --like a CT level array of that grid gives the shape) with the sheet coordinate q = k + dir theta / 2 pi (continuous
@@ -915,7 +915,9 @@ int cmd_surf_labels(int argc, char **argv) {
     J.pa_T = (uint32_t)(4294967295.0 * fmin(1.0, atof(sl_opt(argc, argv, "--pa-keep", "0.02"))));
     /* pass 2: z bands of one shard row */
     const double tl = sl_now(); J.nbs = (S / B) * (S / B) * (S / B);
+    long long zb0 = 0, zb1 = -1; if (sscanf(sl_opt(argc, argv, "--zband", ""), "%lld,%lld", &zb0, &zb1) != 2) { zb0 = 0; zb1 = -1; }   /* calibration: only the shard rows meeting grid z [Z0, Z1) (the rest stays unwritten) */
     for (int64_t sz = 0; sz < J.ns[0]; sz++) {
+        if (zb1 > zb0 && ((sz + 1) * S <= zb0 || sz * S >= zb1)) continue;
         J.sz = sz;
         const double z0 = (double)sz * S - J.Hh - 2, z1 = (double)(sz + 1) * S + J.Hh + 1;
         if (sl_load_all(&J, z0, z1, nt)) { fprintf(stderr, "surf-labels: wrap read failed\n"); return 1; }
