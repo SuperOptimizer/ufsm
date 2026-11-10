@@ -1,5 +1,6 @@
 #include "sample.h"
 #include "band.h"
+#include "band_w4dev.h"
 #include "target_erode.h"
 #include "papyrus.h"
 #include "nn.h"
@@ -2153,7 +2154,8 @@ static int tear_draw(sampler *sp, source *s, int l, const int64_t o[3], int P, i
     if (c->wind4) {
         wwp = tp_get(pp3, 0); wcp = tp_get(pp3, 0);
         const int wt0 = c->wind4_tile < 0 ? 0 : c->wind4_tile > (P + 5) / 6 ? c->wind4_tile : (P + 5) / 6, wt = wt0 && wt0 < (Pp + 5) / 6 ? (Pp + 5) / 6 : wt0;
-        if (!wwp || !wcp || band_wind4_tiled(php, Pp, Pp, Pp, wt, c->wind4_step > 0 ? c->wind4_step : 80, c->wind4_min > 0 ? (size_t)c->wind4_min : 512, wt ? 1 : 15, wwp, wcp, nullptr) < 0) {
+        if (!wwp || !wcp || ((!c->w4_dev || band_wind4_dev(php, Pp, Pp, Pp, wt, c->wind4_step > 0 ? c->wind4_step : 80, c->wind4_min > 0 ? (size_t)c->wind4_min : 512, wt ? 1 : 15, wwp, wcp, nullptr) < 0) &&
+                             band_wind4_tiled(php, Pp, Pp, Pp, wt, c->wind4_step > 0 ? c->wind4_step : 80, c->wind4_min > 0 ? (size_t)c->wind4_min : 512, wt ? 1 : 15, wwp, wcp, nullptr) < 0)) {
             tp_put(wwp, pp3); tp_put(wcp, pp3); tp_put(ctp, pp3); tp_put(php, pp3 + 64); return -1;
         }
     }
@@ -2991,7 +2993,8 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
                 if (!ww || !wc) { PH_PUT(pw, p3); if (!ph_own) { PH_PUT(ww, p3); PH_PUT(wc, p3); } SW_PUT(); return -1; }
                 const int wt = c->wind4_tile < 0 ? 0 : c->wind4_tile > (P + 5) / 6 ? c->wind4_tile : (P + 5) / 6;   /* (<= 6^3 tiles: one gauge each fits the loss's 255) */
                 if (g_crush.w4) { memcpy(ww, g_crush.w4, p3); memcpy(wc, g_crush.wc, p3); }   /* (--aug-tear: unwrapped before the cut) */
-                else if (band_wind4_tiled_mt(pw, Pz, P, P, wt, c->wind4_step > 0 ? c->wind4_step : 80, c->wind4_min > 0 ? (size_t)c->wind4_min : 512, wt ? 1 : 15, ww, wc, nullptr, g_rt) < 0) {
+                else if ((!c->w4_dev || band_wind4_dev(pw, Pz, P, P, wt, c->wind4_step > 0 ? c->wind4_step : 80, c->wind4_min > 0 ? (size_t)c->wind4_min : 512, wt ? 1 : 15, ww, wc, nullptr) < 0) &&   /* (--gpu-aug 3: the same bytes from the device) */
+                         band_wind4_tiled_mt(pw, Pz, P, P, wt, c->wind4_step > 0 ? c->wind4_step : 80, c->wind4_min > 0 ? (size_t)c->wind4_min : 512, wt ? 1 : 15, ww, wc, nullptr, g_rt) < 0) {
                     PH_PUT(pw, p3); if (!ph_own) { PH_PUT(ww, p3); PH_PUT(wc, p3); } SW_PUT(); return -1;
                 }
                 if (direct) {}   /* (in place) */

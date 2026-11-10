@@ -100,6 +100,7 @@ typedef struct {
                                 input units ((t - mean) / sd, times the intensity jitter: the conditioning code) instead of a voxel size */
     int gpu_input;           /* train --gpu-input (needs xfmt and sample_gpu_input_ok): batch.x16 holds the CT channel only and batch.rad
                                 each sample's radial record (nn.h nn_input_rad builds the 4 input channels on the device, bit for bit) */
+    int w4_dev;              /* train --gpu-aug 3: the winding mod 4 through band_wind4_dev (band_w4dev.h; the same bytes; the CPU path if it declines) */
     int gpu_aug;             /* train --gpu-aug (with gpu_input, cubes, no --ct-aug, side_air 0; sample_gpu_aug_ok): batch.ct8 holds each window's
                                 source-grid bytes (after the seam shift) and batch.aug its scan_ct_rec (scanner plan, jitter, normalisation); the
                                 device builds the CT channel (nn.h nn_aug_ct); batch.x16 is absent. The labels and masks are the CPU path's, byte

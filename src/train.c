@@ -4,6 +4,7 @@
 #include "sysinfo.h"
 #include "checkpoint.h"
 #include "sample.h"
+#include "band_w4dev.h"
 #include "store.h"
 #include "papyrus.h"
 #include "restore.h"
@@ -259,6 +260,7 @@ static size_t xbytes(void) { return g_xfmt ? 2 : 4; }
 static const void *bx(const batch *b) { return g_xfmt ? (const void *)b->x16 : (const void *)b->x; }
 /* --gpu-input (default when the configuration allows it, sample_gpu_input_ok): batches carry the CT channel only (g_xs 1) and per sample a
    radial record; the network's 4 MX input channels are built on the device (nn_input_rad). g_xs: input channels per sample in the batches */
+static int g_w4dev_want, g_w4devs[8], g_w4n;   /* --gpu-aug 3 (band_w4dev.h) on the trainer's GPUs */
 static int g_gpu_in, g_xs = 4, g_gpu_want, g_gpu_asked, g_pack, g_gpu_aug, g_gpu_aug_want, g_gpu_aug_asked;   /* g_gpu_aug: --gpu-aug (sample.h gpu_aug: the device builds the CT channel, nn_aug_ct) */
 static int g_xs_unused_;   /* g_pack: --pack-targets (batch.tm, nn_unpack_tm on upload) */
 static size_t rad_bytes(int B) { return g_gpu_in ? (size_t)B * NN_RAD_REC(g_Pz) : 0; }
@@ -348,6 +350,8 @@ static void gpu_input_settle(sample_cfg *sc, int assume_mx) {   /* (assume_mx: U
     g_gpu_aug = g_gpu_aug_want && g_gpu_in && sample_gpu_aug_ok(sc) ? 1 : 0;
     if (g_gpu_aug && g_gpu_aug_want == 2) { if (sample_gpu_lwarp_ok(sc)) g_gpu_aug = 2; else fprintf(stderr, "--gpu-aug 2: the labels' warp needs packed targets and no sheet / pmask / gap / distill / cond / band / aux labels; --gpu-aug 1\n"); }
     sc->gpu_aug = g_gpu_aug;
+    sc->w4_dev = g_w4dev_want && g_gpu_aug == 2 && sc->wind4 && g_w4n > 0;
+    if (sc->w4_dev) { w4dev_init(g_w4devs, g_w4n); fprintf(stderr, "input: the winding mod 4 labels' runs and codes on the GPU, its union-find on the host (--gpu-aug 3; the same bytes as --gpu-aug 2)\n"); }
     if (g_gpu_aug) fprintf(stderr, "input: the scanner augmentation, z-score, symmetry / warp and jitter of the CT channel on the GPU (--gpu-aug 0: on the CPU)\n");
     if (g_gpu_aug == 2) fprintf(stderr, "input: the warped windows' packed targets, phase and winding mod 4 warped on the GPU (--gpu-aug 1: on the CPU)\n");
     if (g_gpu_aug_asked && g_gpu_aug_want && !g_gpu_aug) fprintf(stderr, "--gpu-aug: not available here (needs --gpu-input, cubes, no --ct-aug, --side-air 0, no --overfit / --split); CPU augmentation\n");
@@ -929,10 +933,10 @@ static void head_slab_pass(gpu_state *d, int pass) {
         if (g_lat && g_lat_guide == 8) nn_zero((char *)d->hs_lg + (size_t)g_cout * ns * 2, (size_t)(24 - g_cout) * ns * 2);   /* (the unused outputs: no gradient) */
         if (g_lat && g_lat_guide == 64) nn_lat_shuffle_adj((char *)d->hs_lg + (size_t)g_side_ch * ns * 2, D / 4, H / 4, W / 4, 16, 2, z0, nz, d->latgl);
         else if (g_lat && g_lat_guide) LGUIDE(1);   /* the coefficient planes' gradients */
-        if (g_lat) nn_lat_up_adj(d->hs_lg, LUPC, D / 4, H / 4, W / 4, z0, nz, d->latg, LUPC <= 28 ? d->nt : nullptr);   /* (scratch: the normal targets, 7 bytes a voxel, are done for this slab) */   /* --lat: the slab's gradient onto the cell grid */
+        if (g_lat) nn_lat_up_adj(d->hs_lg, LUPC, D / 4, H / 4, W / 4, z0, nz, d->latg, d->nt);   /* (scratch: the normal targets, 7 bytes a voxel, are done for this slab; any channel count: groups of 28) */   /* --lat: the slab's gradient onto the cell grid */
         else if (unet_head_bwd_z(d->u, z0, z1, d->hs_lg, z0 == 0)) { fprintf(stderr, "head slabs: the fused head backward is not covered (UFSM_HEAD_SLAB=0)\n"); abort(); }
         if (lchk) {   /* UFSM_LAT_CHECK=1: the separable adjoint against the per-voxel gather (the slab's gradient is still in hs_lg) */
-            static float *gc2; const size_t nc = (size_t)g_cout * (D / 4) * (H / 4) * (W / 4);
+            static float *gc2; const size_t nc = (size_t)LNC * (D / 4) * (H / 4) * (W / 4);   /* (every cell channel: the guided heads have more than the task's) */
             if (!gc2) gc2 = nn_malloc(nc * 4);
             if (z0 == 0) nn_zero(gc2, nc * 4);
             const int was = nn_lat_set_slow(1); nn_lat_up_adj(d->hs_lg, LUPC, D / 4, H / 4, W / 4, z0, nz, gc2, nullptr); nn_lat_set_slow(was);
@@ -1700,6 +1704,7 @@ int cmd_train(int argc, char **argv) {
     for (int i = 1; i < argc; i++) if (!strcmp(argv[i], "--fp32")) nn_set_tf32(0);
     int devs[8], ng = 0;
     { char *t = strdup(opt(argc, argv, "--gpus", opt(argc, argv, "--gpu", "0"))); for (char *q = strtok(t, ","); q && ng < 8; q = strtok(nullptr, ",")) devs[ng++] = atoi(q); free(t); }
+    for (int k = 0; k < ng; k++) g_w4devs[k] = devs[k]; g_w4n = ng;
     nn_init(devs[0]);   /* env precision knobs are read here; the storage modes decide the batch formats */
     g_xfmt = nn_get_tf32() && nn_get_act_bf16() && !ufsm_env_on("UFSM_ACT_MX8") ? (nn_get_f16() ? 1 : 2) : 0;
     g_g16 = nn_get_tf32() && nn_get_act_bf16() && nn_get_grad_bf16();
@@ -2077,7 +2082,8 @@ int cmd_train(int argc, char **argv) {
         g_gpu_asked = atoi(opt(argc, argv, "--gpu-input", "0"));   /* (an explicit request: say when it cannot apply) */
         g_gpu_aug_asked = opt(argc, argv, "--gpu-aug", nullptr) != nullptr;
         g_gpu_aug_want = atoi(opt(argc, argv, "--gpu-aug", newdef ? "2" : "0"));   /* --gpu-aug 1: the CT channel built on the device (nn_aug_ct); 2: also the warped windows' labels (nn_label_warp) */
-        if (g_gpu_aug_want < 0 || g_gpu_aug_want > 2) { fprintf(stderr, "--gpu-aug: 0, 1 or 2\n"); return 2; }
+        if (g_gpu_aug_want < 0 || g_gpu_aug_want > 3) { fprintf(stderr, "--gpu-aug: 0, 1, 2 or 3\n"); return 2; }
+        if (g_gpu_aug_want == 3) { g_w4dev_want = 1; g_gpu_aug_want = 2; }   /* 3: 2 and the winding mod 4's per-voxel work on the device (band_wind4_dev: the same label bytes) */
         if (atoi(opt(argc, argv, "--overfit", "0")) || split) g_gpu_aug_want = 0;
         /* the MX input conversion it needs depends on the memory mode (MX gradients): settled after the planner (gpu_input_settle) */
     }
