@@ -1243,11 +1243,11 @@ int cmd_predict(int argc, char **argv) {
         /* --fit-zarr from a latent-grid net (--no-out 1, no --fit-ct: its ray reads the whole window): the heads upsampled (and guided) only over
            the planes of each z chunk of field cells, not [cout][W^3] fp16 (10 GB at W 640); UFSM_PRED_FIT_SLAB=0: the whole window */
         fzs = ffd && ffzm && half && hdiv == 4 && hmode == 1 && h16 && gpath && !ffct && tta <= 1 && !fea && !sheet_task && !slab && WR.skip && !(W % 4) && (!getenv("UFSM_PRED_FIT_SLAB") || ufsm_env_on("UFSM_PRED_FIT_SLAB"));
-        gdir = cfg.lat_guide == 5 && half && hdiv == 4 && hmode == 1 && rvfuse && gpath && !fea && !ffd && tta <= 1 && !sheet_task && !slab && (!getenv("UFSM_PRED_LAT_DIRECT") || ufsm_env_on("UFSM_PRED_LAT_DIRECT"));
-        if ((gdir || (fzs && cfg.lat_guide == 8)) && ct_shared && !ctcp && !(ctcp = nn_malloc(w3))) { fprintf(stderr, "predict: no device memory for the guided head's CT copy\n"); return 1; }   /* (the forward overwrites ctd) */
+        gdir = (cfg.lat_guide == 5 || cfg.lat_guide == 64) && half && hdiv == 4 && hmode == 1 && rvfuse && gpath && !fea && !ffd && tta <= 1 && !sheet_task && !slab && (!getenv("UFSM_PRED_LAT_DIRECT") || ufsm_env_on("UFSM_PRED_LAT_DIRECT"));
+        if (((gdir && cfg.lat_guide == 5) || (fzs && cfg.lat_guide == 8)) && ct_shared && !ctcp && !(ctcp = nn_malloc(w3))) { fprintf(stderr, "predict: no device memory for the guided head's CT copy\n"); return 1; }   /* (the forward overwrites ctd) */
         { const float *b_, *g_; float s_; const int lc_ = half == 3 ? unet_lat_basis(u, &b_, &g_, &s_) : 0;   /* (--latents and the guided head's slab path read the full-resolution input; a
                                                                                                                  --lat-basis checkpoint: nn_lat_pred_input_c, fp16 storage) */
-          latin = half && hdiv == 4 && hmode == 1 && xs.c == 4 && (lc_ ? nn_get_f16() != 0 : cfg.cin == 4) && h16 && !auxz && !sheet_task && !lat_store && (!cfg.lat_guide || gdir || fzs)
+          latin = half && hdiv == 4 && hmode == 1 && xs.c == 4 && (lc_ ? nn_get_f16() != 0 : cfg.cin == 4) && h16 && !auxz && !sheet_task && !lat_store && (!cfg.lat_guide || cfg.lat_guide == 64 || gdir || fzs)   /* (the sub-cell head reads no CT) */
                   && (!getenv("UFSM_PRED_LAT_INPUT") || ufsm_env_on("UFSM_PRED_LAT_INPUT")); }
         if (!xd && !ct_stem && !latin) xd = nn_malloc((size_t)xs.c * w3 * (h16 ? 2 : 4));
         if (auxz) { auxd = nn_malloc(w3); auxh = malloc(w3); }
@@ -1389,7 +1389,7 @@ int cmd_predict(int argc, char **argv) {
               ffzc = (int)(nzc < (cap ? cap : 1) ? nzc : (cap ? cap : 1));
               if (tta > 1) ffzc = (int)nzc;   /* every pass pools into one accumulator of the whole interior */
               if (ffd && ffzm && half && hdiv == 4 && WR.skip && !ffct && tta <= 1) {   /* a latent-grid net's z-chunk slabs (fzs): <= ~768 MB of fp16 head planes a chunk */
-                  const size_t pls = ((size_t)768 << 20) / ((size_t)(cfg.lat_guide == 8 ? 19 : cfg.cout) * W * W * 2), czc = pls / (size_t)ffh;
+                  const size_t pls = ((size_t)768 << 20) / ((size_t)(cfg.lat_guide == 8 ? 19 : cfg.lat_guide == 64 ? 11 : cfg.cout) * W * W * 2), czc = pls / (size_t)ffh;
                   if ((size_t)ffzc > (czc ? czc : 1)) ffzc = (int)(czc ? czc : 1);
               }
               ffwn = (size_t)ffzc * pc; }
@@ -1674,8 +1674,8 @@ int cmd_predict(int argc, char **argv) {
             const float *l2d = nullptr;
             if (half) {   /* the network on blocks of the window: its input from the 4-channel window, its logits back to full resolution */
                 const float *lbas, *lgain; float lstep; const int latc = half == 3 ? unet_lat_basis(u, &lbas, &lgain, &lstep) : 0;
-                if (latin && cfg.lat_guide && !ldir && !fzs) { fprintf(stderr, "predict: the guided head without one window per k^3 shards needs the full-resolution input: rerun with UFSM_PRED_LAT_INPUT=0\n"); return 2; }
-                if (!ldir && !fzs && !lgf) lgf = nn_malloc(ffd ? w3 * 2 * (cfg.lat_guide == 8 ? 19 : cfg.cout) : w3 * 4 * (rvfuse ? 2 : 1));   /* (fit fields from a latent-grid net: every head at full resolution, fp16) */
+                if (latin && cfg.lat_guide && cfg.lat_guide != 64 && !ldir && !fzs) { fprintf(stderr, "predict: the guided head without one window per k^3 shards needs the full-resolution input: rerun with UFSM_PRED_LAT_INPUT=0\n"); return 2; }
+                if (!ldir && !fzs && !lgf) lgf = nn_malloc(ffd ? w3 * 2 * (cfg.lat_guide == 8 ? 19 : cfg.lat_guide == 64 ? 11 : cfg.cout) : w3 * 4 * (rvfuse ? 2 : 1));   /* (fit fields from a latent-grid net: every head at full resolution, fp16) */
                 if (!ldir && !fzs && hdiv > 2 && !lrt) lrt = nn_malloc(w3 / 8 * 16);
                 nn_ptick("other");
                 if (lat_store && (!latc || latc != lz_c)) { fprintf(stderr, "predict: --latents: the store has %d cell channels, the checkpoint %d\n", lz_c, latc); return 2; }
@@ -1705,13 +1705,22 @@ int cmd_predict(int argc, char **argv) {
                     nn_lat_up_slab((const char *)l2 + (size_t)24 * cv_ * es_, unet_logits_h16(u), 8, W / 4, W / 4, W / 4, 0, W, (char *)lgf + (size_t)11 * w3 * 2);
                     nn_lat_guide4(xd, W, W, W, 0, W, lgf, 11, 0, 2, 0);
                 }
+                else if (ffd && cfg.lat_guide == 64) {   /* the sub-cell head: the 11 task planes, the phase pair's per-voxel terms */
+                    nn_lat_up_slab(l2, unet_logits_h16(u), 11, W / 4, W / 4, W / 4, 0, W, lgf);
+                    nn_lat_shuffle(l2, unet_logits_h16(u), W / 4, W / 4, W / 4, 16, 2, 0, W, lgf);
+                }
                 else if (ffd) nn_lat_up_slab(l2, unet_logits_h16(u), cfg.cout, W / 4, W / 4, W / 4, 0, W, lgf);   /* [cout][W][W][W] fp16: the accumulators' layout */
                 else if (rvfuse && cfg.lat_guide) {   /* the guided head: the two side logits and their 5 coefficient planes one 32-plane slab at a time (fp16), the CT terms, into [2][W][W][W] */
                     static void *gsl; const size_t hw_ = (size_t)W * W, ns_ = 32 * hw_, cv_ = w3 / 64, es_ = unet_logits_h16(u) ? 2 : 4; const int nb_ = cfg.cout - cfg.lat_guide;
                     if (!gsl) gsl = nn_malloc(10 * ns_ * 2);
-                    if (!h16) { fprintf(stderr, "predict: the guided head needs 16-bit inputs\n"); return 2; }
+                    if (!h16 && cfg.lat_guide != 64) { fprintf(stderr, "predict: the guided head needs 16-bit inputs\n"); return 2; }
                     for (int z0 = 0; z0 < W; z0 += 32) {
                         nn_lat_up_slab(l2, unet_logits_h16(u), 2, W / 4, W / 4, W / 4, z0, 32, gsl);
+                        if (cfg.lat_guide == 64) {   /* the sub-cell head: the side pair's per-voxel terms */
+                            nn_lat_shuffle(l2, unet_logits_h16(u), W / 4, W / 4, W / 4, 16, 2, z0, 32, gsl);
+                            for (int c = 0; c < 2; c++) nn_d2d_async((char *)lgf + ((size_t)c * w3 + (size_t)z0 * hw_) * 2, (char *)gsl + (size_t)c * ns_ * 2, ns_ * 2);
+                            continue;
+                        }
                         nn_lat_up_slab((const char *)l2 + (size_t)(cfg.lat_guide == 8 ? 24 : nb_) * cv_ * es_, unet_logits_h16(u), cfg.lat_guide, W / 4, W / 4, W / 4, z0, 32, (char *)gsl + 2 * ns_ * 2);
                         if (cfg.lat_guide == 8) nn_lat_guide4(xd, W, W, W, z0, 32, gsl, 2, 0, 2, 0); else nn_lat_guide(xd, W, W, W, z0, 32, gsl, 2, 0, 0);
                         for (int c = 0; c < 2; c++) nn_d2d_async((char *)lgf + ((size_t)c * w3 + (size_t)z0 * hw_) * 2, (char *)gsl + (size_t)c * ns_ * 2, ns_ * 2);
@@ -1763,11 +1772,12 @@ int cmd_predict(int argc, char **argv) {
                                              (int)(bn[1] - (int64_t)c0[1] * ffh < (int64_t)nc3[1] * ffh ? bn[1] - (int64_t)c0[1] * ffh : (int64_t)nc3[1] * ffh),
                                              (int)(bn[2] - (int64_t)c0[2] * ffh < (int64_t)nc3[2] * ffh ? bn[2] - (int64_t)c0[2] * ffh : (int64_t)nc3[2] * ffh)};
                         if (fzs) {   /* the chunk's planes a .. b of the window (whole coarse planes around them: the fast upsampling), the accumulators on the slab as a window of its own; the winding's planes with its +-d neighbours */
-                            const int a = (int)(cz * ffh - tz), bq = a + lbox[0], zs = a & ~3, ze = (bq + 3) & ~3, nzs = ze - zs, wc = W / 4, lh = unet_logits_h16(u), g8 = cfg.lat_guide == 8, cup = g8 ? 11 : cfg.cout;
+                            const int a = (int)(cz * ffh - tz), bq = a + lbox[0], zs = a & ~3, ze = (bq + 3) & ~3, nzs = ze - zs, wc = W / 4, lh = unet_logits_h16(u), g8 = cfg.lat_guide == 8, g64 = cfg.lat_guide == 64, cup = g8 || g64 ? 11 : cfg.cout;
                             const size_t hw = (size_t)W * W, ns = (size_t)nzs * hw, cv_ = w3 / 64, es_ = lh ? 2 : 4;
                             if (!fzA) { fzP = ffzc * ffh + 8; fzA = nn_malloc((size_t)(cup + (g8 ? 8 : 0)) * fzP * hw * 2); if (ffw4d) fzB = nn_malloc((size_t)2 * (fzP + 2 * ffw4d) * hw * 2); if (g8) fzX = nn_malloc((size_t)(fzP + 2) * hw * 2); }
                             if (nzs > fzP || a < hz || bq > Wz - hz) { fprintf(stderr, "predict: --fit-zarr: a z chunk outside its slab (%d .. %d of %d)\n", a, bq, fzP); return 1; }
                             nn_lat_up_slab(l2d, lh, cup, wc, wc, wc, zs, nzs, fzA);
+                            if (g64) nn_lat_shuffle(l2d, lh, wc, wc, wc, 16, 2, zs, nzs, fzA);   /* the sub-cell head: the phase pair's per-voxel terms */
                             if (g8) {   /* the general guided head: the 8 coefficient planes (the head's last), the CT terms into the phase channels 0-1 */
                                 const int x0 = zs > 0 ? zs - 1 : 0, x1 = ze < W ? ze + 1 : W;
                                 nn_lat_up_slab((const char *)l2d + (size_t)24 * cv_ * es_, lh, 8, wc, wc, wc, zs, nzs, (char *)fzA + (size_t)11 * ns * 2);
@@ -1860,7 +1870,9 @@ int cmd_predict(int argc, char **argv) {
                     const int64_t qo[3] = {qz * shard, qy * shard, qx * shard}, qe[3] = {qo[0] + shard < bn[0] ? qo[0] + shard : bn[0], qo[1] + shard < bn[1] ? qo[1] + shard : bn[1], qo[2] + shard < bn[2] ? qo[2] + shard : bn[2]};
                     if (WR.skip) { if (writer_submit(&WR, sb, qz, qy, qx)) { fprintf(stderr, "%s\n", z3w_error()); return 1; } sb = writer_next(&WR, sb); sbuf = WR.buf[sb]; continue; }   /* --no-out */
                     nn_zero(dsh, WR.bytes);
-                    if (ldir && cfg.lat_guide) nn_lat_place_rvg(l2d, unet_logits_h16(u), cfg.cout - cfg.lat_guide, W / 4, W / 4, W / 4, ct_shared ? ctcp : ctd, (float)mean, (float)(1.0 / sd), ct_shared ? nullptr : ctd, ct_shared ? ctmi : nullptr, nn_get_pred_iso(), halo, halo,
+                    if (ldir && cfg.lat_guide == 64) nn_lat_place_rvs(l2d, unet_logits_h16(u), 16, W / 4, W / 4, W / 4, ct_shared ? nullptr : ctd, ct_shared ? ctmi : nullptr, nn_get_pred_iso(), halo, halo,
+                                              (int)(tz - qo[0]), (int)(ty - qo[1]), (int)(tx - qo[2]), (int)(qe[0] - qo[0]), (int)(qe[1] - qo[1]), (int)(qe[2] - qo[2]), shard, dsh);
+                    else if (ldir && cfg.lat_guide) nn_lat_place_rvg(l2d, unet_logits_h16(u), cfg.cout - cfg.lat_guide, W / 4, W / 4, W / 4, ct_shared ? ctcp : ctd, (float)mean, (float)(1.0 / sd), ct_shared ? nullptr : ctd, ct_shared ? ctmi : nullptr, nn_get_pred_iso(), halo, halo,
                                               (int)(tz - qo[0]), (int)(ty - qo[1]), (int)(tx - qo[2]), (int)(qe[0] - qo[0]), (int)(qe[1] - qo[1]), (int)(qe[2] - qo[2]), shard, dsh);
                     else if (ldir) nn_lat_place_rv(l2d, unet_logits_h16(u), W / 4, W / 4, W / 4, ct_shared ? nullptr : ctd, ct_shared ? ctmi : nullptr, nn_get_pred_iso(), halo, halo,
                                               (int)(tz - qo[0]), (int)(ty - qo[1]), (int)(tx - qo[2]), (int)(qe[0] - qo[0]), (int)(qe[1] - qo[1]), (int)(qe[2] - qo[2]), shard, dsh);

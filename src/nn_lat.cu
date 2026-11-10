@@ -162,6 +162,37 @@ __global__ void lat_guide4_k(const f16 *x, int D, int H, int W, int z0, int nz, 
         else { const float g = __half2float(*l); for (int k = 0; k < 4; k++) b[(size_t)k * ns] = __float2half_rn(g * f[k]); }
     }
 }
+/* The sub-cell ("cell-shuffle") head of latent-grid nets (unet_cfg.lat_guide 64; the head has 144 outputs): sheets 4-10 voxels apart
+   repeat every 1-2.5 cells, which no interpolation of one value per cell can follow (the plain head found under half the turns of
+   PHerc1667, the phase loss of a winding net stayed at ln 2). Each guided channel j (the phase / side pair) therefore has 64 more
+   coarse outputs, one per voxel of the cell: l_j(v) = up(coarse_j)(v) + S[base + 64 j + sub(v)](cell(v)), sub = 16 (z & 3) + 4 (y & 3) + (x & 3).
+   dir 0 (shuf_k): adds the terms to the slab planes y [ng][nz][H][W] (fp16) from the coarse logits lg [C][d][h][w]; the adjoint
+   (shuf_adj_k): the planes hold the loss gradient, written (each coarse element has exactly one voxel: no sum, so straight into the 16-bit
+   gradient the backward reads) into gc [C][d][h][w] fp16. */
+template <typename T> __global__ void lat_shuf_k(const T *lg, int d, int h, int w, int base, int ng, int z0, int nz, f16 *y) {
+    const int H = 4 * h, W = 4 * w; const size_t hw = (size_t)H * W, ns = (size_t)nz * hw, nc = (size_t)d * h * w, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= ns) return;
+    const int z = z0 + (int)(i / hw), yy = (int)(i / W % H), x = (int)(i % W);
+    const size_t cell = ((size_t)(z >> 2) * h + (yy >> 2)) * w + (x >> 2); const int sub = 16 * (z & 3) + 4 * (yy & 3) + (x & 3);
+    for (int j = 0; j < ng; j++) y[(size_t)j * ns + i] = __float2half_rn(__half2float(y[(size_t)j * ns + i]) + (float)lg[(size_t)(base + 64 * j + sub) * nc + cell]);
+}
+__global__ void lat_shuf_adj_k(const f16 *g, int d, int h, int w, int base, int ng, int z0, int nz, f16 *gc) {
+    const int H = 4 * h, W = 4 * w; const size_t hw = (size_t)H * W, ns = (size_t)nz * hw, nc = (size_t)d * h * w, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= ns) return;
+    const int z = z0 + (int)(i / hw), yy = (int)(i / W % H), x = (int)(i % W);
+    const size_t cell = ((size_t)(z >> 2) * h + (yy >> 2)) * w + (x >> 2); const int sub = 16 * (z & 3) + 4 * (yy & 3) + (x & 3);
+    for (int j = 0; j < ng; j++) gc[(size_t)(base + 64 * j + sub) * nc + cell] = g[(size_t)j * ns + i];
+}
+extern "C" void nn_lat_shuffle(const void *lg, int lh16, int d, int h, int w, int base, int ng, int z0, int nz, void *y) {
+    const size_t ns = (size_t)nz * 16 * h * w;
+    if (lh16) lat_shuf_k<f16><<<nblk(ns, 256), 256>>>((const f16 *)lg, d, h, w, base, ng, z0, nz, (f16 *)y);
+    else lat_shuf_k<float><<<nblk(ns, 256), 256>>>((const float *)lg, d, h, w, base, ng, z0, nz, (f16 *)y);
+    KCHECK();
+}
+extern "C" void nn_lat_shuffle_adj(const void *g, int d, int h, int w, int base, int ng, int z0, int nz, void *gc) {
+    const size_t ns = (size_t)nz * 16 * h * w;
+    lat_shuf_adj_k<<<nblk(ns, 256), 256>>>((const f16 *)g, d, h, w, base, ng, z0, nz, (f16 *)gc); KCHECK();
+}
 extern "C" void nn_lat_guide4(const void *x, int D, int H, int W, int z0, int nz, void *lg, int base, int c0, int ng, int dir) {
     const size_t ns = (size_t)nz * H * W;
     lat_guide4_k<<<nblk(ns, 256), 256>>>((const f16 *)x, D, H, W, z0, nz, (f16 *)lg, base, c0, ng, dir); KCHECK();
@@ -272,7 +303,7 @@ __global__ void lat_adj_z_k(const float *t, int C, int d, int h, int w, int z0, 
    at dsh[(o + voxel)]; the window's fp32 logit volume (8 bytes a voxel for the two channels), its fuse and its place pass never exist. */
 template <typename T>
 __global__ void lat_place_rv_k(const T *lg, int d, int h, int w, const uint8_t *ct, const uint32_t *bits, int iso, int z0, int y0, int x0, int z1, int y1, int x1,
-                               int oz, int oy, int ox, int shard, uint8_t *dsh) {
+                               int oz, int oy, int ox, int shard, uint8_t *dsh, int sb) {
     const int H = 4 * h, W = 4 * w, c0z = z0 >> 2, c0y = y0 >> 2, c0x = x0 >> 2, ncy = ((y1 + 3) >> 2) - c0y, ncx = ((x1 + 3) >> 2) - c0x, ncz = ((z1 + 3) >> 2) - c0z;
     const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     if (i >= (size_t)ncz * ncy * ncx) return;
@@ -318,10 +349,16 @@ __global__ void lat_place_rv_k(const T *lg, int d, int h, int w, const uint8_t *
                 const size_t k = kr + x;
                 uint8_t o = 0;
                 if (ct ? ct[k] >= iso : (bits[k >> 5] >> (k & 31)) & 1u) {
-                    const float a = LW[rx][0] * q[0][0] + LW[rx][1] * q[0][1] + LW[rx][2] * q[0][2], b = LW[rx][0] * q[1][0] + LW[rx][1] * q[1][1] + LW[rx][2] * q[1][2];
+                    float a = LW[rx][0] * q[0][0] + LW[rx][1] * q[0][1] + LW[rx][2] * q[0][2], b = LW[rx][0] * q[1][0] + LW[rx][1] * q[1][1] + LW[rx][2] * q[1][2];
+                    if (sb >= 0) {   /* the sub-cell head (lat_shuf_k): the pair's per-voxel outputs, with the slab path's fp16 roundings */
+                        const size_t cell = (size_t)(sb + 16 * rz + 4 * ry + rx) * cv + ((size_t)cz * h + cy) * w + cx;
+                        a = __half2float(__float2half_rn(__half2float(__float2half_rn(a)) + ldv(lg, cell)));
+                        b = __half2float(__float2half_rn(__half2float(__float2half_rn(b)) + ldv(lg, cell + 64 * cv)));
+                    }
                     const float pr = 1.f / (1.f + __expf(-a)), pv = 1.f / (1.f + __expf(-b));
                     float f = (1.f + 254.f * (0.5f + 0.5f * (pr - pv))) / 255.f; f = fminf(fmaxf(f, 1.5f / 255.f), 1.f - 1e-4f);   /* (nn_rv_fuse) */
-                    const float l = __logf(f / (1.f - f));
+                    float l = __logf(f / (1.f - f));
+                    if (sb >= 0) l = __half2float(__float2half(l));   /* (fused in fp16) */
                     o = (uint8_t)(255.f / (1.f + __expf(-l)) + 0.5f);   /* (nn_pred_place) */
                 }
                 dsh[gr + x] = o;
@@ -329,14 +366,22 @@ __global__ void lat_place_rv_k(const T *lg, int d, int h, int w, const uint8_t *
         }
     }
 }
+extern "C" void nn_lat_place_rvs(const void *lg, int lh16, int sb, int d, int h, int w, const uint8_t *ct, const uint32_t *bits, int iso, int hz, int halo,
+                                 int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh);
 extern "C" void nn_lat_place_rv(const void *lg, int lh16, int d, int h, int w, const uint8_t *ct, const uint32_t *bits, int iso, int hz, int halo,
                                 int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh) {
+    nn_lat_place_rvs(lg, lh16, -1, d, h, w, ct, bits, iso, hz, halo, oz, oy, ox, ez, ey, ex, shard, dsh);
+}
+/* sb >= 0: the sub-cell head (unet_cfg.lat_guide 64), its side pair's per-voxel outputs at cell channels sb + 64 j + sub
+   = nn_lat_up_slab + nn_lat_shuffle + nn_rv_fuse (fp16) + nn_pred_place */
+extern "C" void nn_lat_place_rvs(const void *lg, int lh16, int sb, int d, int h, int w, const uint8_t *ct, const uint32_t *bits, int iso, int hz, int halo,
+                                 int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh) {
     const int D = 4 * d, H = 4 * h, W = 4 * w;
     const int z0 = max(hz, -oz), y0 = max(halo, -oy), x0 = max(halo, -ox), z1 = min(D - hz, ez - oz), y1 = min(H - halo, ey - oy), x1 = min(W - halo, ex - ox);
     if (z1 <= z0 || y1 <= y0 || x1 <= x0) return;
     const size_t n = (size_t)(((z1 + 3) >> 2) - (z0 >> 2)) * (((y1 + 3) >> 2) - (y0 >> 2)) * (((x1 + 3) >> 2) - (x0 >> 2));
-    if (lh16) lat_place_rv_k<f16><<<nblk(n, 128), 128>>>((const f16 *)lg, d, h, w, ct, bits, iso, z0, y0, x0, z1, y1, x1, oz, oy, ox, shard, dsh);
-    else lat_place_rv_k<float><<<nblk(n, 128), 128>>>((const float *)lg, d, h, w, ct, bits, iso, z0, y0, x0, z1, y1, x1, oz, oy, ox, shard, dsh);
+    if (lh16) lat_place_rv_k<f16><<<nblk(n, 128), 128>>>((const f16 *)lg, d, h, w, ct, bits, iso, z0, y0, x0, z1, y1, x1, oz, oy, ox, shard, dsh, sb);
+    else lat_place_rv_k<float><<<nblk(n, 128), 128>>>((const float *)lg, d, h, w, ct, bits, iso, z0, y0, x0, z1, y1, x1, oz, oy, ox, shard, dsh, sb);
     KCHECK();
 }
 
