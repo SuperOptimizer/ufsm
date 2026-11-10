@@ -51,6 +51,12 @@ static __device__ __forceinline__ int air_at(const scan_plan *p, const uint8_t *
     return a;
 }
 
+/* voxel k's (z, y, x): 32-bit divisions where the index allows (P <= 1625; a 64-bit division costs several times more per voxel) */
+static __device__ __forceinline__ void lw_zyx(size_t k, int P, int io[3]) {
+    if (k >> 32) { const size_t P2 = (size_t)P * P; io[0] = (int)(k / P2); io[1] = (int)(k / P % P); io[2] = (int)(k % P); return; }
+    const unsigned ku = (unsigned)k, P2 = (unsigned)P * (unsigned)P, z = ku / P2, r = ku - z * P2, y = r / (unsigned)P;
+    io[0] = (int)z; io[1] = (int)y; io[2] = (int)(r - y * (unsigned)P);
+}
 __global__ void aug_load_k(const uint8_t *in, __half *F, size_t n, int air, float level) {
     const size_t k = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     if (k >= n) return;
@@ -176,7 +182,7 @@ extern "C" void nn_aug_bop_bench(int P, int taps, double *out) {
 __global__ void aug_point_k(__half *F, const scan_plan *p, int P, int what) {   /* what: 0 bias, 1 radial, 2 slice */
     const size_t P2 = (size_t)P * P, n = P2 * P, k = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     if (k >= n) return;
-    const int z = (int)(k / P2), y = (int)(k / P % P), x = (int)(k % P);
+    int zyx_[3]; lw_zyx(k, P, zyx_); const int z = zyx_[0], y = zyx_[1], x = zyx_[2];
     float f = h2f(F[k]);
     if (what == 0) {
         const int g = p->bias_g; const float sc = (float)(g - 1) / (float)(P - 1);
@@ -295,7 +301,7 @@ __global__ void aug_gin_stats_k(const __half *F, const uint8_t *in, const scan_p
     const size_t P2 = (size_t)P * P, n = P2 * P, k = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     float g1 = 0, g2 = 0; unsigned gn = 0;
     if (k < n) {
-        const int z = (int)(k / P2), y = (int)(k / P % P), x = (int)(k % P);
+        int zyx_[3]; lw_zyx(k, P, zyx_); const int z = zyx_[0], y = zyx_[1], x = zyx_[2];
         if (!air_at(p, in, k, z, y, x, 0)) { const float o = gin_at(F, nullptr, p, P, z, y, x, (float)p->mean, (float)(1 / p->sd)); g1 = o; g2 = o * o; gn = 1; }
     }
     for (int s = 16; s; s >>= 1) { g1 += __shfl_down_sync(~0u, g1, s); g2 += __shfl_down_sync(~0u, g2, s); gn += __shfl_down_sync(~0u, gn, s); }
@@ -309,7 +315,7 @@ __global__ void aug_gin_fin_k(const double *dsc, const unsigned long long *usc, 
 __global__ void aug_gin1_k(__half *F, const scan_plan *p, int P, const float *scal) {
     const size_t P2 = (size_t)P * P, n = P2 * P, k = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     if (k >= n) return;
-    const int z = (int)(k / P2), y = (int)(k / P % P), x = (int)(k % P);
+    int zyx_[3]; lw_zyx(k, P, zyx_); const int z = zyx_[0], y = zyx_[1], x = zyx_[2];
     const float mean = (float)p->mean, sd = (float)p->sd, al = (float)p->gin_alpha;
     const float G = gin_at(F, nullptr, p, P, z, y, x, mean, 1.f / sd);
     F[k] = f2h(al * (mean + sd * (G - scal[2]) / scal[3]) + (1 - al) * h2f(F[k]));
@@ -356,7 +362,7 @@ __global__ void aug_hist_k(const __half *F, const uint8_t *in, const scan_plan *
     __syncthreads();
     const size_t P2 = (size_t)P * P, n = P2 * P, k = 7 * (blockIdx.x * (size_t)blockDim.x + threadIdx.x);
     if (k < n) {
-        const int z = (int)(k / P2), y = (int)(k / P % P), x = (int)(k % P);
+        int zyx_[3]; lw_zyx(k, P, zyx_); const int z = zyx_[0], y = zyx_[1], x = zyx_[2];
         if (!air_at(p, in, k, z, y, x, 1)) { const float v = fminf(fmaxf(h2f(F[k]), 1.f), 255.f); atomicAdd(&h[(int)v], 1u); }
     }
     __syncthreads();
@@ -384,27 +390,49 @@ __global__ void aug_hist_apply_k(__half *F, const float *hm, const scan_plan *p,
 /* the output bytes (tone unless the histogram ran, quantisation, rounding to 1..255, air 0) and their sums */
 __global__ void aug_final_k(const __half *F, uint8_t *io, const scan_plan *p, int P, unsigned long long *usc) {
     const size_t P2 = (size_t)P * P, n = P2 * P, k = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
-    unsigned long long s1 = 0, s2 = 0;
+    unsigned s1 = 0, s2 = 0;   /* (a block's sums fit 32 bits: 256 voxels of at most 255) */
+    __shared__ unsigned sh[2][8];
     if (k < n) {
-        const int z = (int)(k / P2), y = (int)(k / P % P), x = (int)(k % P);
+        int zyx[3]; lw_zyx(k, P, zyx); const int z = zyx[0], y = zyx[1], x = zyx[2];
         const int air = air_at(p, io, k, z, y, x, 1);
         float f = h2f(F[k]);
         if (p->tone && !p->hist_on) { const float v = fminf(fmaxf(f, 0.f), 255.f); const int i = (int)v; f = p->lut[i] + (v - i) * (p->lut[i + 1] - p->lut[i]); }
         if (p->step > 0) f = (floorf(f * (1 / p->step)) + .5f) * p->step;
         const float v = fminf(fmaxf(f + .5f, 1.f), 255.5f); const unsigned q = air ? 0u : (unsigned)(int)v;
         __syncwarp();
-        s1 = q; s2 = (unsigned long long)q * q;
+        s1 = q; s2 = q * q;
         io[k] = (uint8_t)q;   /* (air_at read io[k] above: each voxel reads only its own input byte) */
     }
     for (int s = 16; s; s >>= 1) { s1 += __shfl_down_sync(~0u, s1, s); s2 += __shfl_down_sync(~0u, s2, s); }
-    if ((threadIdx.x & 31) == 0) { atomicAdd(&usc[1], s1); atomicAdd(&usc[2], s2); }
+    if ((threadIdx.x & 31) == 0) { sh[0][threadIdx.x >> 5] = s1; sh[1][threadIdx.x >> 5] = s2; }
+    __syncthreads();
+    if (threadIdx.x == 0) {   /* one pair of atomics a block (was one a warp: 8 M contended 64-bit adds at P1024) */
+        unsigned long long a1 = 0, a2 = 0; for (int w = 0; w < (int)(blockDim.x >> 5); w++) { a1 += sh[0][w]; a2 += sh[1][w]; }
+        atomicAdd(&usc[1], a1); atomicAdd(&usc[2], a2);
+    }
 }
-__global__ void aug_sums_k(const uint8_t *in, size_t n, unsigned long long *usc) {   /* the sums of unaugmented bytes */
-    const size_t k = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
-    unsigned long long s1 = 0, s2 = 0;
-    if (k < n) { s1 = in[k]; s2 = s1 * s1; }
+/* the sums of unaugmented bytes: AUG_SUM_T bytes a thread (four 64-bit loads; in: cudaMalloc-aligned), one pair of atomics a block
+   (the first version, a voxel a thread and a pair of atomics a warp, cost more than the CT channel's write) */
+enum { AUG_SUM_T = 32 };
+__global__ void aug_sums_k(const uint8_t *in, size_t n, unsigned long long *usc) {
+    const size_t k0 = (blockIdx.x * (size_t)blockDim.x + threadIdx.x) * AUG_SUM_T;
+    unsigned s1 = 0, s2 = 0;   /* (a block: 8192 bytes, sums < 2^30) */
+    __shared__ unsigned sh[2][8];
+    if (k0 + AUG_SUM_T <= n) {
+#pragma unroll
+        for (int j = 0; j < AUG_SUM_T / 8; j++) {
+            const unsigned long long w = ((const unsigned long long *)(in + k0))[j];
+#pragma unroll
+            for (int b = 0; b < 8; b++) { const unsigned v = (unsigned)(w >> (8 * b)) & 255u; s1 += v; s2 += v * v; }
+        }
+    } else for (size_t k = k0; k < n; k++) { const unsigned v = in[k]; s1 += v; s2 += v * v; }
     for (int s = 16; s; s >>= 1) { s1 += __shfl_down_sync(~0u, s1, s); s2 += __shfl_down_sync(~0u, s2, s); }
-    if ((threadIdx.x & 31) == 0) { atomicAdd(&usc[1], s1); atomicAdd(&usc[2], s2); }
+    if ((threadIdx.x & 31) == 0) { sh[0][threadIdx.x >> 5] = s1; sh[1][threadIdx.x >> 5] = s2; }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        unsigned long long a1 = 0, a2 = 0; for (int w = 0; w < (int)(blockDim.x >> 5); w++) { a1 += sh[0][w]; a2 += sh[1][w]; }
+        atomicAdd(&usc[1], a1); atomicAdd(&usc[2], a2);
+    }
 }
 __global__ void aug_norm_k(const unsigned long long *usc, size_t n, const scan_ct_rec *rec, float *scal) {   /* draw()'s z-score */
     if (rec->fixed) { scal[0] = rec->fmean; scal[1] = rec->fisd; return; }
@@ -422,7 +450,7 @@ __global__ void aug_write_k(const uint8_t *in, int P, const float *rad, const sc
     if (k >= n) return;
     const int32_t *h = (const int32_t *)rad; const int sb = h[5], warped = h[6] & 1, affine = h[6] >> 1 & 1;
     const int perm[3] = {sb & 3, sb >> 2 & 3, sb >> 4 & 3}, flip[3] = {sb >> 8 & 1, sb >> 9 & 1, sb >> 10 & 1};
-    const int io[3] = {(int)(k / P2), (int)(k / P % P), (int)(k % P)};
+    int io[3]; lw_zyx(k, P, io);
     const float mean = scal[0], isd = scal[1];
     float v;
     if (!warped) {
@@ -585,7 +613,7 @@ extern "C" void nn_aug_ct(const uint8_t *ct8_h, const void *rec_h_, const void *
         nn_ptick_fine("    x ct scan aug");
     } else {
         CK(cudaMemsetAsync(a->usc + 1, 0, 2 * sizeof(unsigned long long), s));
-        aug_sums_k<<<nblk(p3, 256), 256, 0, s>>>(a->stage, p3, a->usc);
+        aug_sums_k<<<nblk(nblk(p3, AUG_SUM_T), 256), 256, 0, s>>>(a->stage, p3, a->usc);
     }
     aug_norm_k<<<1, 1, 0, s>>>(a->usc, p3, a->rec, a->scal);
     aug_write_k<<<nblk(p3, 256), 256, 0, s>>>(a->stage, P, (const float *)rad_d, a->rec, a->scal, a->ntab, ct16);
@@ -603,12 +631,6 @@ static __device__ __forceinline__ float fa(float a, float b) { return __fadd_rn(
 static __device__ __forceinline__ float fs(float a, float b) { return __fsub_rn(a, b); }
 /* the source position of output voxel k (sample.c spatial_aug_pull through the symmetry, as write_spatial_tm's fast path): base corner
    index, fractions; 0 outside */
-/* voxel k's (z, y, x): 32-bit divisions where the index allows (P <= 1625; a 64-bit division costs several times more per voxel) */
-static __device__ __forceinline__ void lw_zyx(size_t k, int P, int io[3]) {
-    if (k >> 32) { const size_t P2 = (size_t)P * P; io[0] = (int)(k / P2); io[1] = (int)(k / P % P); io[2] = (int)(k % P); return; }
-    const unsigned ku = (unsigned)k, P2 = (unsigned)P * (unsigned)P, z = ku / P2, r = ku - z * P2, y = r / (unsigned)P;
-    io[0] = (int)z; io[1] = (int)y; io[2] = (int)(r - y * (unsigned)P);
-}
 static __device__ __forceinline__ int lw_coords(const float *rad, int P, size_t k, size_t *b0, float F[3]) {
     const int32_t *h = (const int32_t *)rad; const int sb = h[5], affine = h[6] >> 1 & 1;
     const int perm[3] = {sb & 3, sb >> 2 & 3, sb >> 4 & 3}, flip[3] = {sb >> 8 & 1, sb >> 9 & 1, sb >> 10 & 1};

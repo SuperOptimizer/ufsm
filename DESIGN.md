@@ -73,6 +73,12 @@ profiler sync point costs a time slice): label builds + copies 87 -> 45 ms per s
 1.905 samp/s; 20-step loss identical (2.4004), `UFSM_LAT_STREAM=check` 0 bytes differ, host-stream path and the winding
 head equal too. Not measured at P1024 (no quiet card); by voxel count the saving there is ~350 ms of a ~2.3 s step.
 
+**The CT byte sums.** `aug_sums_k` (a voxel a thread, two 64-bit atomics a warp) is now 32 bytes a thread and one pair of atomics
+a block; `aug_final_k` one pair a block; every per-voxel index split in nn_aug.cu uses 32-bit divisions (`lw_zyx`). Same sums, same
+channel (`TGA_CTBENCH=1 test_gpu_aug 512`, hashes equal). `nn_aug_ct` with its upload, P512, shared GPU 1: no scanner op 16.9 ->
+11.5 ms (symmetry), 22-24 -> 16 ms (warped); with a scanner op (load + final + write) 22-30 ms unchanged within the noise.
+Real loader with the label changes above: 1.832 -> 1.908 samp/s (+4%, contended both).
+
 **A weight gradient that changed when other processes shared the card (fixed).** `test_lat_head~FP8` failed in ~1 run in 10 when
 three copies ran on one GPU and never alone (0 of 55): one conv's weight gradient off by 1e-4..5e-3, everything else equal to 5e-8.
 `UFSM_WG_TRACE=1` (hashes of what `lp_bwd_w_f8` reads, a random projection of what it adds) caught calls with byte-identical
