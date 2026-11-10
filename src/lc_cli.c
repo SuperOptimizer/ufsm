@@ -20,7 +20,7 @@ static const char *opt(int argc, char **argv, const char *name, const char *dflt
     for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], name)) return argv[i + 1];
     return dflt;
 }
-typedef struct { const uint8_t *ct; int8_t *out; int n[3], C, z0, z1; float step; const lat_basis *lb; double se, sv; long hist[30][256]; } enc_job;
+typedef struct { const uint8_t *ct; int8_t *out; int n[3], C, z0, z1; float step; const lat_basis *lb; double se, sv, sd; long hist[30][256]; } enc_job;
 static void *enc_run(void *arg) {
     enc_job *j = arg; const int C = j->C, cy = j->n[1] / 4, cx = j->n[2] / 4; const size_t Y = j->n[1], X = j->n[2];
     for (int z = j->z0; z < j->z1; z++) for (int y = 0; y < cy; y++) for (int x = 0; x < cx; x++) {
@@ -36,7 +36,7 @@ static void *enc_run(void *arg) {
             else { q = q < -127 ? -127 : q > 127 ? 127 : q; o[c + 1] = (int8_t)q; j->hist[c + 1][q + 128]++; }
             kept += (double)s * s; const double e = s - q * j->step; qe += e * e;
         }
-        j->se += fmax(s2 - kept, 0) + qe; j->sv += 64;
+        j->se += fmax(s2 - kept, 0) + qe; j->sd += fmax(s2 - kept, 0); j->sv += 64;
     }
     return nullptr;
 }
@@ -89,7 +89,18 @@ int cmd_lc_encode(int argc, char **argv) {
         fprintf(stderr, "\rlc-encode: cell planes %lld / %lld", (long long)(sz + SH), (long long)cshape[0]);
     }
     zw_free(&W); fprintf(stderr, "\n");
-    double se = 0, sv = 0, bits = 0; const double ncell = (double)cshape[0] * cshape[1] * cshape[2];
+    double se = 0, sv = 0, sdr = 0, bits = 0;
+    for (int t = 0; t < nth; t++) sdr += J[t].sd;
+    {   /* "drop_ms": the energy of the dropped axes per material voxel (grey levels^2): a reader's window variance from the kept coefficients
+           (or the rebuilt CT) is low by it times the window's material share (predict --latents adds it back; stores without it: nothing) */
+        char zp[1200]; snprintf(zp, sizeof zp, "%s/zarr.json", argv[5]); FILE *f = fopen(zp, "rb"); static char zt[65536]; size_t zn = f ? fread(zt, 1, sizeof zt - 1, f) : 0; if (f) fclose(f); zt[zn] = 0;
+        char *q = strstr(zt, "\"latcomp\":1,"); double sv0 = 0; for (int t = 0; t < nth; t++) sv0 += J[t].sv;
+        if (q && zn + 64 < sizeof zt) {
+            char ins[64]; const int ni = snprintf(ins, sizeof ins, "\"drop_ms\":%.6g,", sv0 > 0 ? sdr / sv0 : 0.0); q += strlen("\"latcomp\":1,");
+            memmove(q + ni, q, strlen(q) + 1); memcpy(q, ins, (size_t)ni);
+            f = fopen(zp, "wb"); if (!f || fwrite(zt, 1, strlen(zt), f) != strlen(zt) || fclose(f)) { fprintf(stderr, "lc-encode: cannot rewrite %s\n", zp); return 1; }
+        } else fprintf(stderr, "lc-encode: no latcomp attributes in %s: drop_ms not written\n", zp);
+    } const double ncell = (double)cshape[0] * cshape[1] * cshape[2];
     for (int c = 0; c <= C; c++) { long h[256] = {0}; for (int t = 0; t < nth; t++) for (int k = 0; k < 256; k++) h[k] += J[t].hist[c][k]; for (int k = 0; k < 256; k++) if (h[k]) { const double p = h[k] / ncell; bits -= p * log2(p); } }
     for (int t = 0; t < nth; t++) { se += J[t].se; sv += J[t].sv; }
     const long db = dir_bytes(argv[5]); const double vox = ncell * 64;
