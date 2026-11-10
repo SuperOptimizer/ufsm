@@ -1688,7 +1688,10 @@ int cmd_train(int argc, char **argv) {
     { int nl = 1; for (const char *q = opt(argc, argv, "--widths", "16,32,64,80"); *q; q++) nl += *q == ','; nn_set_nlev(nl < UNET_MAXLEV ? nl : UNET_MAXLEV); }   /* layer names of the policy */
     if (fp4) {
         unet_set_act_mx4(1); setenv("UFSM_ACT_MX4", "1", 0); nn_set_sr(1);
-        if (nn_set_prec_policy(fp4 >= 2 ? "all=fp4:fp4:fp4,enc0.c1=fp16" : "all=fp4:fp4:fp8,enc0.c1=fp16")) return 2;
+        /* a latent net's learned cell channels (--lat-basis: 32 MX inputs, no 16-bit stem): its first conv is an fp4 conv like the rest
+           (MX-fp8 inputs, --input-prec 8, go through the fp8 forward kernel into fp4 rows; the weight gradient is the fp4 kernel's) */
+        const int latb = *opt(argc, argv, "--lat-basis", "") != 0;
+        if (nn_set_prec_policy(fp4 >= 2 ? latb ? "all=fp4:fp4:fp4" : "all=fp4:fp4:fp4,enc0.c1=fp16" : latb ? "all=fp4:fp4:fp8" : "all=fp4:fp4:fp8,enc0.c1=fp16")) return 2;
         if (fp4 >= 2) setenv("UFSM_F4_WGRAD", "1", 0);
     }
     if (fp8) { unet_set_act_mx8(1); nn_set_sr(1); if (nn_set_prec_policy("all=fp8:fp8:fp8,enc0.c1=fp16")) return 2; }

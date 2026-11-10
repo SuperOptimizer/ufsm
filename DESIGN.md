@@ -36,6 +36,28 @@ trunk forward 84, trunk backward 310, slab adjoint 206, slab upsampling 50, labe
   **This is a precision change, not a rounding-level one**: the trunk's activations and gradients are stored and multiplied in fp4
   as in every 4-input net; weights, optimizer state and the checkpoint format are untouched, and a `--fp8 1` checkpoint resumes
   under fp4 (tried on a 6-step one). `--fp8 1` runs exactly as before.
+- **Default since the evening: every conv of a `--lat-basis` net is fp4** (`all=fp4:fp4:fp4`, no `enc0.c1=fp16` exception: there is
+  no 16-bit stem). Without `--input-prec` the 32 input channels are MX-fp4 too and conv0 is an ordinary fp4 conv; with
+  `--input-prec 8` its forward is the mixed fp8 kernel and its weight gradient the fp4 kernel (the cell channels rounded to e2m1
+  there); the chunked fp8 weight gradient remains for `--policy ...,enc0.c1=fp16` (15 instead of 3 ms a P512 step).
+  300 deterministic steps (`--det 1`, P256, the winding net with the sub-cell head, one seed each; mean loss of steps 1 / 1-50 /
+  51-100 / 101-200 / 201-300):
+
+  | | step 1 | 1-50 | 51-100 | 101-200 | 201-300 |
+  |---|---|---|---|---|---|
+  | `--fp8 1` (as w768 ran) | 2.6173 | 2.6960 | 2.1196 | 1.5390 | 1.3608 |
+  | fp4 trunk, fp8 input, conv0 gradient fp8 (chunked) | 2.6315 | 2.7326 | 2.1845 | 1.5868 | 1.3780 |
+  | fp4 trunk, fp8 input, conv0 gradient fp4 | 2.6315 | 2.7334 | 2.1827 | 1.5859 | 1.3771 |
+  | fp4 trunk, fp4 input (`--input-prec 4`) | 2.6364 | 2.7314 | 2.1830 | 1.5857 | 1.3819 |
+  | the new default (no `--input-prec`: fp4 input) | 2.6364 | 2.7335 | 2.1853 | 1.5872 | 1.3799 |
+
+  fp4 against fp8: +1.3% at 201-300 (one seed; no noise estimate). The input's and conv0's precision make no visible difference
+  inside fp4 (1.377-1.382).
+- **With the sub-cell head (`--lat-guide 3`), P512, idle GPU, same batch**: winding net (96,128,160,192) `--fp8 1` 624 ms, fp4
+  trunk 402 ms (trunk forward 89 -> 54, backward 330 -> 143); rv net (32,...,256) 330 -> 287 ms. What is left in the fp4 steps:
+  winding: trunk 197 (of it the 96 -> 144 head 37: forward 8, data gradient 14, weight gradient 15), slab section 123, CT upload +
+  gpu-aug 50, label upload 15, input 8, optimizer 9; rv: slab section 143 (label upload 38, targets 35, loss kernels 36, upsampling
+  15, adjoint 19), uploads 72, trunk 51 (head 12), optimizer 12. For the rv net the full-resolution passes, not the trunk, are the step.
 - Left in the slab section (P512, ms): upsampling 50 and adjoint 60 still cover all 32 planes of the guide-2 head although 13 are
   unused; label upload 37 is hidden by the upload pipeline outside the synchronised profile.
 
