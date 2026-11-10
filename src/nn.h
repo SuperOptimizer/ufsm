@@ -58,6 +58,9 @@ void nn_event_sync(void *ev);
    ev_done completes with the copy (nn_stream_wait(0, ev_done) before the compute stream touches dst / src again) */
 void nn_offload_copy(void *dst, const void *src, size_t n, int to_host, void *ev_start, void *ev_done);
 size_t nn_mem_free(void);
+/* train --lat: label planes kept on the device, packed (bits 8 bytes, 4 codes 0..14 / 255, 2 --rv papyrus classes); stream k: 0 compute, 1 copy, 2 aux */
+void nn_lab_pack(int k, const uint8_t *s, uint8_t *d, size_t n, int bits);
+void nn_lab_unpack(int k, const uint8_t *p, uint8_t *d, size_t v0, size_t n, int bits);
 /* virtual-memory rings (CUDA VMM): one tensor's whole address range of nreg consecutive regions (reg[r] bytes, slabs of slab[r]), slab
    s of a region backed by physical chunk s mod R of it (kernels address the whole tensor; the schedule keeps fewer than R slabs live).
    nullptr: no VMM, or sizes off the mapping granularity (nn_ring_gran). nn_free releases it; *phys: bytes backed */

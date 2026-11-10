@@ -449,6 +449,29 @@ extern "C" void nn_h2d_stream(int k, void *d, const void *s, size_t n) { CK(cuda
 extern "C" void nn_event_record(void *e, int on_copy_stream) { CK(cudaEventRecord((cudaEvent_t)e, stream_of(on_copy_stream))); }
 extern "C" void nn_stream_wait(int copy_stream_waits, void *e) { CK(cudaStreamWaitEvent(stream_of(copy_stream_waits), (cudaEvent_t)e, 0)); }
 extern "C" void nn_event_sync(void *e) { CK(cudaEventSynchronize((cudaEvent_t)e)); }
+/* train --lat: label planes kept on the device in packed form (train.c d->ldev). bits 8: the bytes; 4: codes 0..14 and 255 (-> 15;
+   unused: the winding component's ids pass 14 with tiles); 2: the --rv papyrus plane's classes (255 unknown -> 3, >= 127 papyrus -> 1 (254 back), void -> 0: all rv_tg_k reads).
+   nn_lab_pack: n voxels of s into d; nn_lab_unpack: voxels [v0, v0 + n) of p into d[0..n). stream k: 0 compute, 1 copy, 2 aux */
+__global__ void lab_pack_k(const uint8_t *s, uint8_t *d, size_t n, int bits) {
+    const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x, per = 8 / bits;
+    if (i * per >= n) return;
+    unsigned o = 0;
+    for (size_t j = 0; j < per && i * per + j < n; j++) {
+        const unsigned v = s[i * per + j];
+        o |= (bits == 8 ? v : bits == 4 ? (v > 14 ? 15u : v) : (v == 255 ? 3u : v >= 127 ? 1u : 0u)) << (bits * j);
+    }
+    d[i] = (uint8_t)o;
+}
+__global__ void lab_unpack_k(const uint8_t *p, uint8_t *d, size_t v0, size_t n, int bits) {
+    const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const size_t v = v0 + i;
+    if (bits == 8) d[i] = p[v];
+    else if (bits == 4) { const unsigned c = p[v >> 1] >> (4 * (v & 1)) & 15u; d[i] = (uint8_t)(c == 15 ? 255 : c); }
+    else { const unsigned c = p[v >> 2] >> (2 * (v & 3)) & 3u; d[i] = (uint8_t)(c == 3 ? 255 : c ? 254 : 0); }
+}
+extern "C" void nn_lab_pack(int k, const uint8_t *s, uint8_t *d, size_t n, int bits) { lab_pack_k<<<nblk((n * bits + 7) / 8, 256), 256, 0, stream_of(k)>>>(s, d, n, bits); KCHECK(); }
+extern "C" void nn_lab_unpack(int k, const uint8_t *p, uint8_t *d, size_t v0, size_t n, int bits) { lab_unpack_k<<<nblk(n, 256), 256, 0, stream_of(k)>>>(p, d, v0, n, bits); KCHECK(); }
 static cudaStream_t offload_stream(void) {   /* activation offload: its own stream, so it never queues behind batch uploads */
     static cudaStream_t st[8]; int d = 0; cudaGetDevice(&d); d &= 7;
     if (!st[d]) CK(cudaStreamCreateWithFlags(&st[d], cudaStreamNonBlocking));

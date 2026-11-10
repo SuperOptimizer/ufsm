@@ -6,6 +6,39 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Label planes kept on the device where the plan has room; what --det 1 fixes and what it does not (2026-11-10, branch perf-20261109)
+
+**Labels.** The latent nets' label stream builds each plane on the device, copies it back to pinned host memory and uploads it again per
+head slab in both head passes (rv P1024: 178 ms of copy-back per batch, 380 ms of slab uploads inside the step). Now the planes the
+memory plan has room for stay on the device (`d->ldev`), the rest stream as before:
+
+- Order: the `--rv` papyrus plane as 2-bit classes (unknown / papyrus / void: all `rv_tg_k` reads; an `--ink-head` plane stays bytes),
+  then phase, winding, component as bytes. The spare is the plan's free bytes minus its need, with 1 GB left. P1024 rv: everything.
+  P1152 rv (plan need 12.22 of 16.20 GB): papyrus + phase, 1.9 GB.
+- A byte plane is read in place by the target kernels; the packed plane is expanded per slab into the slab buffer (`nn_lab_unpack`,
+  on the aux stream in the upload pipeline).
+- The component is not 4 bits: the tiled winding numbers its components per tile, ids pass 14. Packed so, 6% of its slab bytes were
+  wrong in the stream check.
+- `UFSM_LAT_LDEV=mask` forces a set (bit k: phase, winding, component, papyrus), `0` is the stream alone.
+- Checks: `UFSM_LAT_STREAM=check` (which keeps reference byte planes) reports 0 differing slab bytes for rv (all four planes, 12
+  steps, P256) and for the winding net; `--det 1` step lines are identical with the planes on the device, partly, and streamed
+  (rv and winding, 12 steps). `test_gpu_aug` covers the pack / unpack kernels. The check mode died without a papyrus plane (it read a
+  null plane); fixed.
+- **Not measured yet:** the real-loader gain on a quiet card.
+
+**A label mix-up with two device buffers.** The stream has one set of host label planes. Under `--mem fast` (two device buffers) the
+next batch's upload ran during the step and overwrote them while the head passes still uploaded slabs: each step trained on a mix of
+two batches' labels (`--det 1`: 13 outcomes in 14 runs, from step 4, losses 2.0810 against 2.0562). The upload now waits for the step,
+as under lean; 10 of 10 runs agree and equal a run with device planes. Lean runs never overlapped.
+
+**--det 1.** Runs with the same seed printed different lines in 20-70% of cases, always first at step 26 (rv P256), in three
+outcomes. The batches (hashes, slots), the input and the label planes are identical; the weights are not: after the first update 321
+of 12.6 M parameters differ by one float unit, mostly conv biases. The bias and weight gradients are summed across blocks with float
+atomicAdd (`lp_f4wgrad.cuh`, `lp_f8wgrad.cuh`, `lp_s2.cu`, `lp_mx_conv1.cu`, `lp_mx_gnbwd.cu`), so the order varies. The fp4 weight
+quantisation hides the difference until a weight crosses a boundary, which is where the runs split. Left as is (decision: no
+order-independent sums now): `--det 1` fixes batches and seeds, not the last bit. `UFSM_DET_TRACE=1` prints per-step hashes of input,
+label planes and weights; `UFSM_DET_PDUMP` / `UFSM_DET_PSTEP` dump one step's weights.
+
 ## The batch upload measured part by part; cheaper scan-augmentation kernels; the wide stride-2 backward on tensor cores (2026-11-10, branch perf-20261109)
 
 **Why.** The P1152 guided rv run made 370-420 Mvox/s against a same-batch figure of 786: the same-batch mode (`UFSM_BENCH_SAME`) skips

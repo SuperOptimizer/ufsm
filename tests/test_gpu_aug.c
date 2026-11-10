@@ -224,6 +224,22 @@ int main(int argc, char **argv) {
         CHECK(e2e_scan > 0 && e2e_scan < e2e_n && e2e_warp > 0, "the windows cover scanner ops on / off and warps (%d / %d scan, %d warped)", e2e_scan, e2e_n, e2e_warp);
         char rm[1500]; snprintf(rm, sizeof rm, "rm -rf %s", dir); if (system(rm)) {}
     }
+    {   /* train --lat: label planes kept on the device (nn_lab_pack / nn_lab_unpack): bytes; codes 0..14 / 255 in 4 bits; the papyrus classes in 2 */
+        const size_t n = 100003; uint8_t *h = nn_host_alloc(n), *o = malloc(n), *sd = nn_malloc(n), *pd = nn_malloc(n + 8), *od = nn_malloc(n);
+        for (int bits = 8; bits >= 2; bits /= 2) {
+            unsigned r = 12345u + (unsigned)bits;
+            for (size_t i = 0; i < n; i++) { r = r * 1664525u + 1013904223u; const unsigned v = r >> 24; h[i] = (uint8_t)(bits == 4 ? (v % 16 == 15 ? 255 : v % 16) : v % 7 == 0 ? 255 : v); }
+            nn_h2d(sd, h, n); nn_lab_pack(0, sd, pd, n, bits);
+            const size_t v0s[3] = {0, 1, 4097}, ns[3] = {n, 4099, n - 4097}; size_t bad = 0;
+            for (int q = 0; q < 3; q++) {
+                nn_lab_unpack(q == 2 ? 2 : 0, pd, od, v0s[q], ns[q], bits); nn_sync(); nn_d2h(o, od, ns[q]);
+                for (size_t i = 0; i < ns[q]; i++) { const uint8_t v = h[v0s[q] + i]; bad += o[i] != (bits == 2 ? (v == 255 ? 255 : v >= 127 ? 254 : 0) : v); }
+            }
+            CHECK(!bad, "label planes packed to %d bits: %zu voxels differ after unpacking", bits, bad);
+        }
+        nn_host_free(h); free(o); nn_free(sd); nn_free(pd); nn_free(od);
+        printf("test_gpu_aug: packed label planes (8 / 4 / 2 bits) unpack to the bytes / classes over three voxel ranges\n");
+    }
     printf("test_gpu_aug: end to end %d unwrap2 windows (%d with scanner ops, %d warped), CT channel sd beyond the jitter noises <= %.3f\n", e2e_n, e2e_scan, e2e_warp, e2e_worst);
     printf("test_gpu_aug: --gpu-aug 2 device-warped labels, worst window: %zu phase / %zu w4 / %zu component / %zu packed / %zu pmask voxels off the CPU's\n", e2e_lbad[0], e2e_lbad[1], e2e_lbad[2], e2e_lbad[3], e2e_lbad[4]);
     printf("test_gpu_aug: %d cases (%d warped) at P %d: worst bytes mean |d| %.3f, max %d: %s\n", ncase, nwarp, P, worst_mean, worst_max, fails ? "FAIL" : "ok");
