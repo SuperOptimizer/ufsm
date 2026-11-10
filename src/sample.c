@@ -37,6 +37,42 @@ static uint64_t rnext(rng *r) {
 static void rseed(rng *r, uint64_t seed) {
     for (int i = 0; i < 4; i++) { seed += 0x9e3779b97f4a7c15ull; uint64_t z = seed; z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull; z = (z ^ (z >> 27)) * 0x94d049bb133111ebull; r->s[i] = z ^ (z >> 31); }
 }
+/* rskip(r, n) = n calls of rnext (the state only): xoshiro's step is linear over GF(2), so n steps are one 256 x 256 bit matrix T^n
+   (square-and-multiply, built once per n and kept: the windows of a run skip one or two fixed counts, P^3 / 4 draws each, 1-2% of a
+   loader's CPU as a loop); n below 4096 loops */
+typedef struct { uint64_t n; uint64_t m[256][4]; } rjump;   /* m[i]: the state bits that XOR into new bit i */
+static void rj_mul(uint64_t (*c)[4], const uint64_t (*a)[4], const uint64_t (*b)[4]) {   /* c = a b (c distinct from a, b) */
+    for (int i = 0; i < 256; i++) {
+        uint64_t r0 = 0, r1 = 0, r2 = 0, r3 = 0;
+        for (int w = 0; w < 4; w++) for (uint64_t v = a[i][w]; v; v &= v - 1) { const int j = w * 64 + __builtin_ctzll(v); r0 ^= b[j][0]; r1 ^= b[j][1]; r2 ^= b[j][2]; r3 ^= b[j][3]; }
+        c[i][0] = r0; c[i][1] = r1; c[i][2] = r2; c[i][3] = r3;
+    }
+}
+static const rjump *rj_get(uint64_t n) {
+    static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER; static rjump *tab[4]; static int nt;
+    pthread_mutex_lock(&mu);
+    for (int k = 0; k < nt; k++) if (tab[k]->n == n) { const rjump *j = tab[k]; pthread_mutex_unlock(&mu); return j; }
+    rjump *j = nt < 4 ? malloc(sizeof *j) : nullptr; uint64_t (*t)[4] = malloc(3 * 256 * sizeof *t);
+    if (!j || !t) { free(j); free(t); pthread_mutex_unlock(&mu); return nullptr; }
+    uint64_t (*sq)[4] = t, (*tmp)[4] = t + 256, (*acc)[4] = t + 512;
+    memset(sq, 0, 256 * sizeof *sq);
+    for (int c = 0; c < 256; c++) { rng e = {{0}}; e.s[c / 64] = 1ull << (c % 64); rnext(&e); for (int i = 0; i < 256; i++) if (e.s[i / 64] >> (i % 64) & 1) sq[i][c / 64] |= 1ull << (c % 64); }
+    memset(acc, 0, 256 * sizeof *acc); for (int i = 0; i < 256; i++) acc[i][i / 64] = 1ull << (i % 64);
+    for (uint64_t e = n; e; e >>= 1) {
+        if (e & 1) { rj_mul(tmp, acc, sq); memcpy(acc, tmp, 256 * sizeof *acc); }
+        if (e >> 1) { rj_mul(tmp, sq, sq); memcpy(sq, tmp, 256 * sizeof *sq); }
+    }
+    j->n = n; memcpy(j->m, acc, sizeof j->m); free(t); tab[nt++] = j;
+    pthread_mutex_unlock(&mu);
+    return j;
+}
+static void rskip(rng *r, uint64_t n) {
+    const rjump *j = n >= 4096 ? rj_get(n) : nullptr;
+    if (!j) { for (; n; n--) rnext(r); return; }
+    uint64_t o[4] = {0};
+    for (int i = 0; i < 256; i++) { const uint64_t v = (j->m[i][0] & r->s[0]) ^ (j->m[i][1] & r->s[1]) ^ (j->m[i][2] & r->s[2]) ^ (j->m[i][3] & r->s[3]); o[i / 64] |= (uint64_t)(__builtin_popcountll(v) & 1) << (i % 64); }
+    memcpy(r->s, o, sizeof o);
+}
 static double runif(rng *r) { return (double)(rnext(r) >> 11) * 0x1.0p-53; }
 static int64_t rint_below(rng *r, int64_t n) { return n <= 1 ? 0 : (int64_t)(runif(r) * (double)n); }
 
@@ -2989,12 +3025,12 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
         params=malloc((size_t)P*sizeof *params);
         for (int sz=0;sz<P;sz++) sheet_parameters(c->sheet,o[0]+sz,params[sz]);
     }
-    if (lw) for (size_t q = (size_t)Pz * P * (size_t)(P / 4 + P % 4); q; q--) rnext(r);   /* (write_spatial_tm's noise draws) */
+    if (lw) rskip(r, (uint64_t)Pz * P * (uint64_t)(P / 4 + P % 4));   /* (write_spatial_tm's noise draws) */
     else if (spatial.active) write_spatial_tm(ctu,ttmp,mask,T,M,P,o,(float)mean,(float)(1.0/sd),s->ax.n>0,cyz,cxz,y,&spatial,
             ia,ib,isg,r,nrow,c->xfmt,X,H,app,noise_state,noise_state?noise_state+P:nullptr,c->sheet,params,(float *)(big+p3),c->pack_tm,c->gpu_input,TMd);
     else if (c->sheet || (app && Pz != P)) write_x_aug(ctu, P, o, (float)mean, (float)(1.0 / sd), s->ax.n > 0, cyz, cxz, y, c->augment != 0, ia, ib, isg, r, nrow, c->xfmt,
             X, H, app, noise_state, noise_state ? noise_state + P : nullptr,c->sheet,params);
-    else if (grec) { if (c->augment) for (size_t q = (size_t)Pz * P * (size_t)(P / 4 + P % 4); q; q--) rnext(r); }   /* (write_x's jitter draws) */
+    else if (grec) { if (c->augment) rskip(r, (uint64_t)Pz * P * (uint64_t)(P / 4 + P % 4)); }   /* (write_x's jitter draws) */
     else write_x(ctu, Pz, P, o, (float)mean, (float)(1.0 / sd), s->ax.n > 0, cyz, cxz, y, c->augment != 0, ia, ib, isg, r, nrow, c->xfmt, X, H,
                  app, noise_state, noise_state ? noise_state + P : nullptr, c->gpu_input);   /* the CT appearance plan in the row-vectorised writer (cubes) */
     if (c->gpu_input) rad_record((char *)b->rad + (size_t)i * NN_RAD_REC(Pz), o, Pz, P, s->ax.n > 0, y, cyz, cxz, &spatial);   /* the radial channels: on the device */
@@ -3459,12 +3495,17 @@ static void *replay_thread(void *arg) {
     pthread_mutex_unlock(&sp->mu); free(scr);
     return nullptr;
 }
+static int rskip_selftest(void) {   /* the jump = the loop (a count the cache keeps: 4099 + every bit pattern below) */
+    rng a, b; rseed(&a, 12345); b = a; rskip(&a, 4099); for (int q = 0; q < 4099; q++) rnext(&b);
+    return memcmp(a.s, b.s, sizeof a.s) ? -1 : 0;
+}
 static int replay_selftest(void) {   /* sym_inverse undoes every cube symmetry (sym_u8 twice on a 5^3 cube) */
     uint8_t a[125], t[125], u[125]; for (int k = 0; k < 125; k++) a[k] = (uint8_t)k;
     for (int q = 0; q < 48; q++) { const sym y = sym_of(q); sym_u8(a, t, 5, 5, y); sym_u8(t, u, 5, 5, sym_inverse(y)); if (memcmp(a, u, 125)) return -1; }
     return 0;
 }
 sampler *sampler_start(sources *S, const sample_cfg *cfg) {
+    if (rskip_selftest()) { fprintf(stderr, "sampler: rng jump-ahead self-test failed\n"); return nullptr; }
     if (cfg->replay > 1 && (!sampler_replay_ok(cfg) || replay_selftest())) { fprintf(stderr, "sampler: --replay needs --gpu-aug 2 cube batches without sheet / band / gap / condition / distill / view / cover / chain / papyrus-mask planes\n"); return nullptr; }
     if (!S || S->n <= 0 || cfg->P <= 0 || cfg->B <= 0 || cfg->nworkers <= 0 || cfg->nbuf <= 0) { fprintf(stderr, "sampler: invalid sources, patch, batch, workers or buffer count\n"); return nullptr; }
     if (cfg->gpu_input && !sample_gpu_input_ok(cfg)) { fprintf(stderr, "sampler: --gpu-input needs 16-bit batches and no warps, sheet prior, slab appearance plan, aux or condition inputs\n"); return nullptr; }
@@ -3599,7 +3640,7 @@ sampler *sampler_start(sources *S, const sample_cfg *cfg) {
         /* default gap: a window's slot is held ~(K-1) G / K batches per new window, so G = (slots - workers) K / (K-1) leaves every worker
            a slot to build in (more interleave wants more slots: --sampler-slots workers + 2 + extra) */
         sp->rgap = cfg->replay_gap > 0 ? cfg->replay_gap : (sp->nslots - cfg->nworkers) * cfg->replay / (cfg->replay - 1);
-        if (sp->rgap < 2) sp->rgap = 2; if (sp->rgap > sp->nslots) sp->rgap = sp->nslots;
+        sp->rgap = sp->rgap < 2 ? 2 : sp->rgap > sp->nslots ? sp->nslots : sp->rgap;
         sp->rth_on = sp->rleft && sp->rq && sp->rdue && sp->rseq && !pthread_create(&sp->rth, nullptr, replay_thread, sp);
         if (!sp->rth_on) { fprintf(stderr, "sampler: cannot start the replay thread\n"); free(sp->rleft); free(sp->rq); free(sp->rdue); free(sp->rseq); sp->rleft = nullptr; sp->rq = nullptr; sp->rdue = sp->rseq = nullptr; }
         else fprintf(stderr, "sampler: window replay x%d, interleaved: a replay %d batches after its window's previous use%s (a new symmetry / warp / scanner plan / jitter per replay, on the device)\n",
