@@ -470,6 +470,14 @@ __global__ void lab_unpack_k(const uint8_t *p, uint8_t *d, size_t v0, size_t n, 
     else if (bits == 4) { const unsigned c = p[v >> 1] >> (4 * (v & 1)) & 15u; d[i] = (uint8_t)(c == 15 ? 255 : c); }
     else { const unsigned c = p[v >> 2] >> (2 * (v & 3)) & 3u; d[i] = (uint8_t)(c == 3 ? 255 : c ? 254 : 0); }
 }
+/* experiment (train UFSM_LAB_QBITS): a cyclic label plane (phase / winding: codes 0..251, >= 252 kept) to 2^bits levels, in place */
+__global__ void lab_quant_k(uint8_t *s, size_t n, int bits) {
+    const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const int v = s[i], L = 1 << bits;
+    if (v < 252) s[i] = (uint8_t)(((v * L + 126) / 252 % L * 252 + L / 2) / L);
+}
+extern "C" void nn_lab_quant(int k, uint8_t *s, size_t n, int bits) { lab_quant_k<<<nblk(n, 256), 256, 0, stream_of(k)>>>(s, n, bits); KCHECK(); }
 extern "C" void nn_lab_pack(int k, const uint8_t *s, uint8_t *d, size_t n, int bits) { lab_pack_k<<<nblk((n * bits + 7) / 8, 256), 256, 0, stream_of(k)>>>(s, d, n, bits); KCHECK(); }
 extern "C" void nn_lab_unpack(int k, const uint8_t *p, uint8_t *d, size_t v0, size_t n, int bits) { lab_unpack_k<<<nblk(n, 256), 256, 0, stream_of(k)>>>(p, d, v0, n, bits); KCHECK(); }
 static cudaStream_t offload_stream(void) {   /* activation offload: its own stream, so it never queues behind batch uploads */

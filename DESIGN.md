@@ -26,6 +26,29 @@ memory plan has room for stay on the device (`d->ldev`), the rest stream as befo
   null plane); fixed.
 - **Not measured yet:** the real-loader gain on a quiet card.
 
+**Phase and winding planes at 6 and 4 bits** (`UFSM_LAB_QBITS`: the training batches' planes quantised to 2^n cyclic levels on the
+device, validation on the stored bytes; P256, `--det 1`, GPU 1 beside a training run, one seed each). Validation after the last step:
+
+| arm | net | phase bce | normal bce | wind4 bce | turn acc |
+|---|---|---|---|---|---|
+| 600 steps from scratch, 8 bits | winding | 0.69164 | 0.54111 | 0.67356 | 0.3507 |
+| 6 bits | | 0.69127 | 0.53992 | 0.67389 | 0.3484 |
+| 4 bits | | 0.68629 | 0.55046 | 0.67359 | 0.3478 |
+| 600 steps from scratch, 8 bits | rv | 0.65439 | 0.61485 | 0.81120 | 0.3570 |
+| 6 bits | | 0.65032 | 0.61675 | 0.80235 | 0.3561 |
+| 4 bits | | 0.65462 | 0.61704 | 0.80636 | 0.3564 |
+| 300 steps on from wz768's step 2000, 8 bits | winding | 0.67876 | 0.51487 | 0.65902 | 0.3999 |
+| 6 bits | | 0.67870 | 0.51491 | 0.65897 | 0.4006 |
+| 4 bits | | 0.67864 | 0.51514 | 0.65848 | 0.4023 |
+| 300 steps on from g768's step 9000, 8 bits | rv | 0.55067 | 0.51373 | 0.65902 | 0.3738 |
+| 6 bits | | 0.55066 | 0.51374 | 0.65899 | 0.3737 |
+| 4 bits | | 0.55058 | 0.51388 | 0.65893 | 0.3736 |
+
+6 bits: no difference beyond the arms' noise. 4 bits: the normal bce is higher in three of four comparisons (+0.0002, +0.0003, +0.009
+from scratch on the winding net; the normal targets are a difference stencil on the phase), nothing else moves. Weak evidence: the
+from-scratch runs had not learned phase or winding yet (bce ~0.69), and the resumed runs sat in the schedule's cooldown (the 8-bit
+arm itself moved by < 1e-4). A decision for 4 bits needs a longer run at a working learning rate.
+
 **A label mix-up with two device buffers.** The stream has one set of host label planes. Under `--mem fast` (two device buffers) the
 next batch's upload ran during the step and overwrote them while the head passes still uploaded slabs: each step trained on a mix of
 two batches' labels (`--det 1`: 13 outcomes in 14 runs, from step 4, losses 2.0810 against 2.0562). The upload now waits for the step,

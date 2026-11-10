@@ -59,6 +59,7 @@ void nn_event_sync(void *ev);
 void nn_offload_copy(void *dst, const void *src, size_t n, int to_host, void *ev_start, void *ev_done);
 size_t nn_mem_free(void);
 /* train --lat: label planes kept on the device, packed (bits 8 bytes, 4 codes 0..14 / 255, 2 --rv papyrus classes); stream k: 0 compute, 1 copy, 2 aux */
+void nn_lab_quant(int k, uint8_t *s, size_t n, int bits);   /* experiment: a cyclic label plane (codes 0..251) to 2^bits levels in place */
 void nn_lab_pack(int k, const uint8_t *s, uint8_t *d, size_t n, int bits);
 void nn_lab_unpack(int k, const uint8_t *p, uint8_t *d, size_t v0, size_t n, int bits);
 /* virtual-memory rings (CUDA VMM): one tensor's whole address range of nreg consecutive regions (reg[r] bytes, slabs of slab[r]), slab

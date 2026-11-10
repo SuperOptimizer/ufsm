@@ -508,7 +508,10 @@ static void lab_upload(int kind, const batch *b, uint8_t *da, uint8_t *db, const
 static void lab_stream(gpu_state *d, const batch *b, int i, const void *rad, int B, int P, int async) {
     const size_t p3 = (size_t)g_Pz * P * P; uint8_t *s = (uint8_t *)d->xb[i];
     void (*dh)(void *, const void *, size_t) = async ? nn_d2h_copy_stream : nn_d2h;
-#define LKEEP(k, src) do { if (d->ldev[k]) nn_lab_pack(async ? 1 : 0, (src), d->ldev[k], p3, d->ldbits[k]); else dh(d->lbh[k], (src), p3); } while (0)   /* to the device plane (packed), or back to the host */
+    /* experiment UFSM_LAB_QBITS=n (4 / 6): the training batches' phase and winding planes at 2^n levels (asynchronous uploads only: validation
+       uploads synchronously and keeps its bytes), to measure what a narrower device plane would cost; UFSM_LAB_QPLANES: 1 phase, 2 winding, 3 both */
+    static int qb = -1, qp = 3; if (qb < 0) { qb = getenv("UFSM_LAB_QBITS") ? atoi(getenv("UFSM_LAB_QBITS")) : 0; if (getenv("UFSM_LAB_QPLANES")) qp = atoi(getenv("UFSM_LAB_QPLANES")); }
+#define LKEEP(k, src) do { if (qb > 0 && qb < 8 && async && (k) < 2 && (qp >> (k) & 1)) nn_lab_quant(1, (src), p3, qb); if (d->ldev[k]) nn_lab_pack(async ? 1 : 0, (src), d->ldev[k], p3, d->ldbits[k]); else dh(d->lbh[k], (src), p3); } while (0)   /* to the device plane (packed), or back to the host */
     if (g_side) { lab_upload(1, b, s, nullptr, b->side, nullptr, rad, B, P, async); nn_ptick_fine("    x side build"); LKEEP(0, s); nn_ptick_fine("    x side d2h"); }
     if (g_unwrap2) { lab_upload(2, b, s, s + p3, b->w4, b->wcomp, rad, B, P, async); nn_ptick_fine("    x w4 build"); LKEEP(1, s); LKEEP(2, s + p3); nn_ptick_fine("    x w4 d2h (2 planes)"); }
     if (IPLANE) { lab_upload(3, b, s, nullptr, b->ink, nullptr, rad, B, P, async); nn_ptick_fine("    x ink build"); LKEEP(3, s); nn_ptick_fine("    x ink d2h"); }
