@@ -21,6 +21,7 @@ static inline size_t shape_spatial(shape5 s) { return (size_t)s.d * s.h * s.w; }
 /* ---- device / memory ---- */
 int nn_init(int device);                 /* selects the device; returns 0 on success */
 const char *nn_check(void);              /* nullptr if no error since the last call, else the message */
+const char *nn_check_site(void);         /* the call site of the error the last nn_check returned ("" for none; low-precision kernels: their own latch) */
 void *nn_malloc(size_t bytes);
 void nn_free(void *p);
 void nn_zero(void *p, size_t bytes);
@@ -184,6 +185,11 @@ void nn_input_latc(const void *ct16, shape5 xs, const void *rec, const float *ba
 /* predict --latents: the cell channels from a latcomp store's indices q (int8 [d][h][w](C + 1), lc_cli.c layout; raw-domain step) with the window's
    mean / 1 / sd; the radial means from x's channels 1-3 */
 void nn_lat_input_q(const void *q, const void *x, int d, int h, int w, const float *gain, int C, float step_raw, float mean, float isd, void *y);
+/* predict --latents: the CT window rebuilt from a window of stored cells (nn_lat.cu lat_synth_k: 1..255 in material cells, 0 in air
+   cells), and a --lat-basis net's input straight from the cells with the radial channels from the axis offsets (lat_pred_in_q_k) */
+void nn_lat_synth_ct(const void *q, int C, const float *bas, float step_raw, int D, int W, uint8_t *ct);
+void nn_lat_pred_input_q(const void *q, int D, int W, float mean, float isd, const float *dyo, const float *dxo, int axis,
+                         const float *gain, int C, float step_raw, void *y);
 /* the guided head (unet_cfg.lat_guide): see nn_lat.cu lat_guide_k */
 /* the sub-cell head (unet_cfg.lat_guide 64): see nn_lat.cu lat_shuf_k */
 void nn_lat_shuffle(const void *lg, int lh16, int d, int h, int w, int base, int ng, int z0, int nz, void *y);
@@ -237,6 +243,12 @@ void nn_aug_last_bytes(uint8_t *out, int P);   /* tests: the last window's outpu
    radial record on the device; cs_h / sn_h sample_phase_cssn's tables. Same stream order as nn_aug_ct (its staging buffer, 2 P^3). */
 void nn_label_warp(int kind, const uint8_t *a_h, const uint8_t *b_h, const void *rad_d, int P, uint8_t *da, uint8_t *db, const float *cs_h, const float *sn_h, int on_copy_stream);
 size_t nn_label_warp_device_bytes(int P);
+/* --rv ink bits: one window's papyrus plane on the device from its CT bytes and known bits (pinned host; sample.h batch.inkb, cutoff it),
+   then the window's warp (rad_d, warped) or cube symmetry (symcode: the radial record's h[5]) into da. Same staging / order as nn_label_warp */
+void nn_label_sym(const uint8_t *a_h, int symcode, int P, uint8_t *da, int on_copy_stream);   /* a source-grid label plane through the cube symmetry */
+/* --gpu-aug 3 runs slots: w4 / comp from the source-grid phase and the window's runs (band_w4dev.h w4runs), warped or through the symmetry */
+void nn_w4runs_label(const uint8_t *side_h, const void *runs, const void *rad_d, int warped, int symcode, int P, uint8_t *da, uint8_t *db, const float *cs_h, const float *sn_h, int on_copy_stream);
+void nn_ink_bits(const uint8_t *ct8_h, const uint8_t *bits_h, int it, const void *rad_d, int warped, int symcode, int P, uint8_t *da, int on_copy_stream);
 /* packed targets (sample.h SAMPLE_TM_*: bit 0 target 0 = 255, bit 1 target 1 = 255, bit 2 mask) of nb samples of p3 voxels in m ->
    t (nb x 2 x p3: 0 / 255) and the 0 / 1 mask in m, in place; on the copy stream (after an nn_h2d_copy_stream of the codes) or the
    compute stream */

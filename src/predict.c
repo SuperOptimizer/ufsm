@@ -20,6 +20,7 @@
 #include "z3w.h"
 #include "zarr3.h"
 #include "embz.h"
+#include "latfit.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <math.h>
@@ -50,6 +51,7 @@ typedef struct {
     pthread_mutex_t mu; pthread_cond_t cv;
     double t_read, t_stats, t_wait;   /* UFSM_PRED_PROF: seconds in z3_read, the stats scan, waiting for a free slot */
     int nostats;                      /* the window statistics are computed on the device (default path) */
+    zr *lz; const long long *lzo; int lzc, lzt;   /* (lzt handles of the store, one decoding thread each) */   /* --latents: the window's stored cells instead of its CT (nz[k]: 0 when every cell is air) */
 } reader_t;
 static void *reader_main(void *arg) {
     reader_t *r = arg;
@@ -63,6 +65,16 @@ static void *reader_main(void *arg) {
         int k = (int)(i % NSLOT);
         tile_t *t = &r->tiles[i];
         int64_t o[3] = {r->bo[0] + t->tz, r->bo[1] + t->ty, r->bo[2] + t->tx}, n[3] = {r->Wz, r->W, r->W};
+        if (r->lz) {   /* --latents: Wz/4 x W/4 x W/4 cells of C + 1 bytes (absent / outside: 0, air) */
+            const int64_t oc[3] = {(o[0] - r->lzo[0]) / 4, (o[1] - r->lzo[1]) / 4, (o[2] - r->lzo[2]) / 4}, nc[3] = {r->Wz / 4, r->W / 4, r->W / 4};
+            if (zr_read_i8_mt(r->lz, r->lzt, oc, nc, (int8_t *)r->buf[k])) atomic_store(&r->failed, 1);
+            else {
+                const size_t nb = (size_t)nc[0] * nc[1] * nc[2] * (r->lzc + 1); const uint64_t *b8 = (const uint64_t *)r->buf[k]; uint64_t any = 0;
+                for (size_t j = 0; j < nb / 8 && !any; j++) any |= b8[j];
+                for (size_t j = nb / 8 * 8; j < nb && !any; j++) any |= r->buf[k][j];
+                r->nz[k] = any != 0; r->t_read += now() - t1;
+            }
+        } else
         if (z3_read(r->ct, o, n, r->buf[k], r->nthreads)) { atomic_store(&r->failed, 1); }
         else if (r->nostats) r->t_read += now() - t1;
         else {
@@ -804,12 +816,14 @@ int cmd_predict(int argc, char **argv) {
     const int rvfuse = !strcmp(chs, "rv");
     /* --latents STORE (ufsm lc-encode): a --lat-basis checkpoint's cell channels come from the stored quantised coefficients (the window's
        mean / sd from them too), not from the CT window, which is still read for the air mask and the radial channels */
-    const char *lat_store = opt(argc, argv, "--latents", nullptr); zr lzr; double lz_sraw = 0; long long lz_org[3] = {0, 0, 0}; int lz_c = 0; int8_t *lz_h = nullptr; void *lz_d = nullptr;
+    const char *lat_store = opt(argc, argv, "--latents", nullptr); zr lzr; const float *lz_bas = nullptr; double lz_sraw = 0; long long lz_org[3] = {0, 0, 0}; int lz_c = 0; void *lz_d = nullptr;
     if (lat_store) {
         char zp[1200]; snprintf(zp, sizeof zp, "%s/zarr.json", lat_store); FILE *zf = fopen(zp, "r"); static char zt[65536]; size_t zn = zf ? fread(zt, 1, sizeof zt - 1, zf) : 0; if (zf) fclose(zf); zt[zn] = 0;
         const char *q1 = strstr(zt, "\"step_raw\":"), *q2 = strstr(zt, "\"origin\":["), *q3 = strstr(zt, "\"lat_c\":");
         if (!q1 || !q2 || !q3 || sscanf(q2 + 10, "%lld,%lld,%lld", lz_org, lz_org + 1, lz_org + 2) != 3 || zr_open(&lzr, lat_store)) { fprintf(stderr, "predict: --latents %s is not a latcomp store (ufsm lc-encode)\n", lat_store); return 2; }
         lz_sraw = atof(q1 + 11); lz_c = atoi(q3 + 8);
+        if (degrade || opt(argc, argv, "--aux", nullptr) || !strcmp(opt(argc, argv, "--split", "0"), "z") || atoi(opt(argc, argv, "--tta", "1")) > 1 || atoi(opt(argc, argv, "--fit-ct", "0"))) {
+            fprintf(stderr, "predict: --latents: no --aug-*, --aux, --split, --tta or --fit-ct (they read the CT itself)\n"); return 2; }
     }
     { char *h = checkpoint_header_line(ckpt); const int isrv = h && strstr(h, "\"rv\":{\"version\":1"); free(h);
       if (rvfuse && !isrv) { fprintf(stderr, "predict: --channel rv: %s is not a train --rv checkpoint\n", ckpt); return 2; }
@@ -1115,7 +1129,7 @@ int cmd_predict(int argc, char **argv) {
            nn_lat_place_rv): no 14 bytes a voxel in the estimate. k stays <= 4: with one 128^3 chunk per shard the run is bound by the shard
            writers and the CT reader, and windows of 8^3 shards skip less air (box 1024 x 3072^2 of PHerc1667: 4608 shards compressed against 3584) */
         const float *lb_, *lg_; float ls_;   /* (not --latents or the guided head: those hold the full-resolution input) */
-        const int lat_lean = half && hdiv == 4 && hmode == 1 && (cfg.cin == 4 || (half == 3 && unet_lat_basis(u, &lb_, &lg_, &ls_) && nn_get_f16())) && rvfuse && !lat_store && !ffd && tta <= 1 && !fea && !auxz && nn_get_tf32() && nn_get_act_bf16() && !ufsm_env_on("UFSM_ACT_MX8")
+        const int lat_lean = half && hdiv == 4 && hmode == 1 && (cfg.cin == 4 || (half == 3 && unet_lat_basis(u, &lb_, &lg_, &ls_) && nn_get_f16())) && rvfuse && !ffd && tta <= 1 && !fea && !auxz && nn_get_tf32() && nn_get_act_bf16() && !ufsm_env_on("UFSM_ACT_MX8")
                              && (!getenv("UFSM_PRED_LAT_INPUT") || ufsm_env_on("UFSM_PRED_LAT_INPUT")) && (!getenv("UFSM_PRED_LAT_DIRECT") || ufsm_env_on("UFSM_PRED_LAT_DIRECT"));
         for (int k = 4; k >= 1; k--) {
             const int Wc = k * shard + 2 * hk;
@@ -1247,12 +1261,12 @@ int cmd_predict(int argc, char **argv) {
         if (((gdir && cfg.lat_guide == 5) || (fzs && cfg.lat_guide == 8)) && ct_shared && !ctcp && !(ctcp = nn_malloc(w3))) { fprintf(stderr, "predict: no device memory for the guided head's CT copy\n"); return 1; }   /* (the forward overwrites ctd) */
         { const float *b_, *g_; float s_; const int lc_ = half == 3 ? unet_lat_basis(u, &b_, &g_, &s_) : 0;   /* (--latents and the guided head's slab path read the full-resolution input; a
                                                                                                                  --lat-basis checkpoint: nn_lat_pred_input_c, fp16 storage) */
-          latin = half && hdiv == 4 && hmode == 1 && xs.c == 4 && (lc_ ? nn_get_f16() != 0 : cfg.cin == 4) && h16 && !auxz && !sheet_task && !lat_store && (!cfg.lat_guide || cfg.lat_guide == 64 || gdir || fzs)   /* (the sub-cell head reads no CT) */
+          latin = half && hdiv == 4 && hmode == 1 && xs.c == 4 && (lc_ ? nn_get_f16() != 0 : cfg.cin == 4) && h16 && !auxz && !sheet_task && (!cfg.lat_guide || cfg.lat_guide == 64 || gdir || fzs)   /* (the sub-cell head reads no CT) */
                   && (!getenv("UFSM_PRED_LAT_INPUT") || ufsm_env_on("UFSM_PRED_LAT_INPUT")); }
         if (!xd && !ct_stem && !latin) xd = nn_malloc((size_t)xs.c * w3 * (h16 ? 2 : 4));
         if (auxz) { auxd = nn_malloc(w3); auxh = malloc(w3); }
         if (half) { x2 = nn_malloc(shape_numel(xn) * (h16 ? 2 : 4));   /* (lgf, and lrt with the direct latent input: at their first use; the direct latent rv path has none) */
-            if (lat_store) { lz_h = nn_host_alloc(w3 / 64 * (lz_c + 1)); lz_d = nn_malloc(w3 / 64 * (lz_c + 1)); } if (hdiv > 2 && !latin) lrt = nn_malloc(w3 / 8 * 16); }
+            if (lat_store) { lz_d = nn_malloc(w3 / 64 * (lz_c + 1)); } if (hdiv > 2 && !latin) lrt = nn_malloc(w3 / 8 * 16); }
         if (ct_stem) fprintf(stderr, "predict: in-place slab inference from the CT window (%.1f B per window voxel)\n", (double)unet_activation_bytes(u) / w3);
         if (tta > 1 && (!ct_stem || !ct_shared || degrade || auxz || cfg.cin != 4)) { fprintf(stderr, "predict: --tta needs the CT-stem device path (no --aug-*, --aux, extra inputs)\n"); return 2; }
     }
@@ -1262,7 +1276,7 @@ int cmd_predict(int argc, char **argv) {
        whose own region is zero on the coarse level, one coarse voxel of margin, predicts nothing) */
     uint8_t *sskip = nullptr; long nresumed = 0, nocc = 0;
     uint8_t *occb = nullptr; int64_t occo[3] = {0, 0, 0}, occn[3] = {0, 0, 0}; int occf = 1;   /* --occupancy: the coarse level over the box (tile tests below) */
-    if (resume || occl >= 0) {
+    if (resume || occl >= 0 || lat_store) {
         sskip = calloc((size_t)(ns[0] * ns[1] * ns[2]), 1);
         if (!sskip) { fprintf(stderr, "predict: out of memory\n"); return 1; }
         FILE *df = resume ? fopen(donep, "r") : nullptr;
@@ -1275,19 +1289,41 @@ int cmd_predict(int argc, char **argv) {
             }
             fclose(df);
         }
-        if (occl >= 0) {
-            z3 *oc = pyramid_open_level(s, key, occl, um, cache);
-            if (!oc) { fprintf(stderr, "predict: --occupancy: cannot open CT level %d: %s\n", occl, z3_error()); return 1; }
-            const z3_meta *om = z3_meta_of(oc); const int f = 1 << (occl - level);
+        if (occl >= 0 || lat_store) {
+            /* --latents: the occupancy of the store's chunks (a chunk of 32^3 cells is 128^3 voxels; absent / all-zero chunks are air, known
+               from the shard indices: no CT and no cell data read) on a grid of f = 32 voxels, each chunk's material marking every grid voxel
+               it touches (a superset: the store's origin need not be a multiple of 32); else the coarse CT level --occupancy L */
+            z3 *oc = lat_store ? nullptr : pyramid_open_level(s, key, occl, um, cache);
+            if (!lat_store && !oc) { fprintf(stderr, "predict: --occupancy: cannot open CT level %d: %s\n", occl, z3_error()); return 1; }
+            const int f = lat_store ? 32 : 1 << (occl - level);
             int64_t o0[3], n0[3];
             for (int d = 0; d < 3; d++) {
                 int64_t lo = bo[d] / f - 1, hi = (bo[d] + bn[d] + f - 1) / f + 1;
                 if (lo < 0) lo = 0;
-                if (hi > om->shape[d]) hi = om->shape[d];
+                if (!lat_store && hi > z3_meta_of(oc)->shape[d]) hi = z3_meta_of(oc)->shape[d];
                 o0[d] = lo; n0[d] = hi > lo ? hi - lo : 0;
             }
-            uint8_t *ob = n0[0] && n0[1] && n0[2] ? malloc((size_t)(n0[0] * n0[1] * n0[2])) : nullptr;
-            if (n0[0] && n0[1] && n0[2] && (!ob || z3_read(oc, o0, n0, ob, nthreads))) { fprintf(stderr, "predict: --occupancy: cannot read CT level %d: %s\n", occl, z3_error()); return 1; }
+            uint8_t *ob = n0[0] && n0[1] && n0[2] ? (lat_store ? calloc((size_t)(n0[0] * n0[1] * n0[2]), 1) : malloc((size_t)(n0[0] * n0[1] * n0[2]))) : nullptr;
+            if (lat_store && ob) {
+                const int64_t cvx = 4 * (int64_t)lzr.chunk; long nch = 0, nmat = 0;
+                int64_t c0[3], c1[3];
+                for (int d = 0; d < 3; d++) { int64_t a = bo[d] - lz_org[d] - f; c0[d] = a < 0 ? 0 : a / cvx; c1[d] = (bo[d] + bn[d] - lz_org[d] + f + cvx - 1) / cvx; if (c1[d] * lzr.chunk > lzr.shape[d]) c1[d] = (lzr.shape[d] + lzr.chunk - 1) / lzr.chunk; }
+                for (int64_t cz = c0[0]; cz < c1[0]; cz++) for (int64_t cy = c0[1]; cy < c1[1]; cy++) for (int64_t cx = c0[2]; cx < c1[2]; cx++) {
+                    nch++;
+                    if (zr_chunk_empty(&lzr, cz * lzr.chunk, cy * lzr.chunk, cx * lzr.chunk) != 0) continue;
+                    nmat++;
+                    const int64_t cc[3] = {cz, cy, cx}; int64_t a[3], b[3];
+                    for (int d = 0; d < 3; d++) {
+                        const int64_t g0 = lz_org[d] + cc[d] * cvx, g1 = g0 + cvx;
+                        a[d] = g0 / f - o0[d]; b[d] = (g1 - 1) / f + 1 - o0[d];
+                        if (a[d] < 0) a[d] = 0;
+                        if (b[d] > n0[d]) b[d] = n0[d];
+                    }
+                    for (int64_t z = a[0]; z < b[0]; z++) for (int64_t y = a[1]; y < b[1]; y++) memset(ob + ((size_t)z * n0[1] + y) * n0[2] + a[2], 1, b[2] > a[2] ? (size_t)(b[2] - a[2]) : 0);
+                }
+                fprintf(stderr, "predict: --latents occupancy: %ld of %ld store chunks near the box hold material\n", nmat, nch);
+            }
+            if (n0[0] && n0[1] && n0[2] && (!ob || (!lat_store && z3_read(oc, o0, n0, ob, nthreads)))) { fprintf(stderr, "predict: --occupancy: cannot read CT level %d: %s\n", occl, z3_error()); return 1; }
             for (int64_t sz = 0; sz < ns[0]; sz++) for (int64_t sy = 0; sy < ns[1]; sy++) for (int64_t sx = 0; sx < ns[2]; sx++) {
                 uint8_t *e = &sskip[(sz * ns[1] + sy) * ns[2] + sx];
                 if (*e) continue;
@@ -1305,10 +1341,10 @@ int cmd_predict(int argc, char **argv) {
                 if (!hit) { *e = 2; nocc++; }
             }
             occb = ob; occf = f; for (int d = 0; d < 3; d++) { occo[d] = o0[d]; occn[d] = n0[d]; }
-            z3_close(oc);
+            if (oc) z3_close(oc);
         }
-        fprintf(stderr, "predict: %lld shards in the box: %ld already written (--resume), %ld air on CT level %d (--occupancy), %lld to compute\n",
-                (long long)(ns[0] * ns[1] * ns[2]), nresumed, nocc, occl, (long long)(ns[0] * ns[1] * ns[2]) - nresumed - nocc);
+        fprintf(stderr, "predict: %lld shards in the box: %ld already written (--resume), %ld air on %s %d (--occupancy), %lld to compute\n",
+                (long long)(ns[0] * ns[1] * ns[2]), nresumed, nocc, lat_store ? "the latent store, grid" : "CT level", lat_store ? 32 : occl, (long long)(ns[0] * ns[1] * ns[2]) - nresumed - nocc);
     }
     /* interior = k whole shards (k >= 2, the tile grid on the shard grid): one window per k^3 shards, each shard placed from it and
        written (INFERENCE_MEMORY_PLAN.md, memory into speed); otherwise one or more windows per shard, clipped to it */
@@ -1508,6 +1544,29 @@ int cmd_predict(int argc, char **argv) {
     }
     if (occt) fprintf(stderr, "predict: %ld windows to run, %ld more skipped (interior air on CT level %d, --occupancy)\n", rd.ntiles, nocct, occl);
     free(occb); occb = nullptr;
+    if (lat_store) {   /* every window on the store's cell grid */
+        if (W % 4 || Wz % 4) { fprintf(stderr, "predict: --latents: --window (and --window-z) must be multiples of 4\n"); return 2; }
+        for (long i = 0; i < rd.ntiles; i++) {
+            const int64_t o[3] = {bo[0] + rd.tiles[i].tz, bo[1] + rd.tiles[i].ty, bo[2] + rd.tiles[i].tx};
+            for (int d = 0; d < 3; d++) if ((o[d] - lz_org[d]) % 4) {
+                fprintf(stderr, "predict: --latents: window origin %lld,%lld,%lld is off the store's 4-voxel cell grid (origin %lld,%lld,%lld): use a box origin, "
+                                "--grid-origin, halo and stride that are multiples of 4 from it\n", (long long)o[0], (long long)o[1], (long long)o[2], lz_org[0], lz_org[1], lz_org[2]);
+                return 2;
+            }
+        }
+        rd.lzt = nthreads < 1 ? 1 : nthreads > 32 ? 32 : nthreads; rd.lz = calloc((size_t)rd.lzt, sizeof(zr)); rd.lzo = lz_org; rd.lzc = lz_c;
+        for (int t = 0; t < rd.lzt; t++) if (zr_open(&rd.lz[t], lat_store)) { fprintf(stderr, "predict: --latents: cannot open %s\n", lat_store); return 1; }
+        const float *lg_; float ls_; const int lc_ = unet_lat_basis(u, &lz_bas, &lg_, &ls_);
+        if (!gpath || lc_ != lz_c || !lz_d) { fprintf(stderr, "predict: --latents needs the device path and a --lat-basis checkpoint with the store's %d cell channels (it has %d)\n", lz_c, lc_); return 2; }
+        {   /* the store's transform must be the checkpoint's: the rebuilt CT and the channels both assume it */
+            char bp[1200]; snprintf(bp, sizeof bp, "%s/basis.lcb", lat_store); lat_basis *lb = malloc(sizeof *lb); float *hb = malloc((size_t)lz_c * 64 * 4); double dm = 0;
+            if (!lb || !hb || lat_basis_load(bp, lb)) { fprintf(stderr, "predict: --latents: cannot read %s\n", bp); return 1; }
+            nn_d2h(hb, lz_bas, (size_t)lz_c * 64 * 4);
+            for (int c = 0; c < lz_c; c++) for (int k2 = 0; k2 < 64; k2++) dm = fmax(dm, fabs((double)hb[c * 64 + k2] - lb->b[c][k2]));
+            free(lb); free(hb);
+            if (dm > 1e-5) { fprintf(stderr, "predict: --latents: the store's transform differs from the checkpoint's (max |db| %.3g)\n", dm); return 2; }
+        }
+    }
     for (int k = 0; k < NSLOT; k++) rd.buf[k] = gpath ? nn_host_alloc(w3) : malloc(w3);
     rd.nostats = gpath;
     atomic_store(&rd.filled, 0); atomic_store(&rd.consumed, 0); atomic_store(&rd.failed, 0);
@@ -1541,7 +1600,7 @@ int cmd_predict(int argc, char **argv) {
        device copy into ctd): the synchronous upload left the GPU idle ~9 ms per 384 x 640^2 window. Not with --aug-* (degrade rewrites
        the host window first); UFSM_PRED_CTPRE=0 off. long pre_i: the window whose CT ctpre holds (or is receiving) */
     uint8_t *ctpre = nullptr; void *ev_pre = nullptr, *ev_preu = nullptr; long pre_i = -1;
-    if (gpath && !degrade && !split && (!getenv("UFSM_PRED_CTPRE") || ufsm_env_on("UFSM_PRED_CTPRE")) && (ctpre = nn_malloc_try(w3))) {
+    if (gpath && !degrade && !split && !lat_store && (!getenv("UFSM_PRED_CTPRE") || ufsm_env_on("UFSM_PRED_CTPRE")) && (ctpre = nn_malloc_try(w3))) {
         ev_pre = nn_event_create(); ev_preu = nn_event_create();
     }
     if (split) {   /* both GPUs on every window */
@@ -1606,10 +1665,15 @@ int cmd_predict(int argc, char **argv) {
             if (gpath) {   /* upload (pinned), statistics on the device, then the slot is free for the reader */
                 nn_ptick("wait reader + host");
                 pt = now();
+                if (lat_store) {   /* --latents: the window's cells up, its CT rebuilt from them on the device (air windows: nothing) */
+                    if (rd.nz[k]) { nn_h2d(lz_d, ctu, w3 / 64 * (lz_c + 1)); nn_lat_synth_ct(lz_d, lz_c, lz_bas, (float)lz_sraw, Wz, W, ctd); nn_pred_stats(ctd, w3, stsc, &nz, &sum, &sq); }
+                    else nz = 0;
+                } else {
                 if (pre_i == i) {   /* prefetched: the copy stream's upload, then one device copy (the prefetch buffer free again after it) */
                     nn_stream_wait(0, ev_pre); nn_d2d_async(ctd, ctpre, w3); nn_event_record(ev_preu, 0);
                 } else nn_h2d(ctd, ctu, w3);
                 nn_pred_stats(ctd, w3, stsc, &nz, &sum, &sq);
+                }
                 pthread_mutex_lock(&rd.mu); atomic_store(&rd.consumed, i + 1); pthread_cond_broadcast(&rd.cv); pthread_mutex_unlock(&rd.mu);
                 p_h2d += now() - pt; nn_ptick("upload + CT stats");
             }
@@ -1679,17 +1743,9 @@ int cmd_predict(int argc, char **argv) {
                 if (!ldir && !fzs && hdiv > 2 && !lrt) lrt = nn_malloc(w3 / 8 * 16);
                 nn_ptick("other");
                 if (lat_store && (!latc || latc != lz_c)) { fprintf(stderr, "predict: --latents: the store has %d cell channels, the checkpoint %d\n", lz_c, latc); return 2; }
-                if (lat_store) {
-                    const int wc = W / 4; const size_t ncell = (size_t)wc * wc * wc;
-                    if ((o[0] - lz_org[0]) % 4 || (o[1] - lz_org[1]) % 4 || (o[2] - lz_org[2]) % 4) { fprintf(stderr, "predict: --latents: windows must start on the store's cell grid (box / --grid-origin multiples of 4 from its origin)\n"); return 2; }
-                    const int64_t oc[3] = {(o[0] - lz_org[0]) / 4, (o[1] - lz_org[1]) / 4, (o[2] - lz_org[2]) / 4}, nc[3] = {wc, wc, wc};
-                    if (zr_read_i8(&lzr, oc, nc, lz_h)) { fprintf(stderr, "predict: --latents: read failed\n"); return 1; }
-                    double s1 = 0, s2 = 0;   /* the window's mean / sd from the coefficients (orthonormal axes: sum of squares = the cell's energy, less the dropped axes') */
-                    for (size_t k = 0; k < ncell; k++) { const int8_t *q = lz_h + k * (lz_c + 1); const double dc = ((int)(uint8_t)q[0] + 256 * (int)q[1]) * lz_sraw; s1 += dc; double e = dc * dc; for (int c = 2; c <= lz_c; c++) e += (double)q[c] * q[c] * lz_sraw * lz_sraw; s2 += e; }
-                    const double lmean = s1 / (8.0 * (double)ncell), lvar = s2 / (64.0 * (double)ncell) - lmean * lmean, lsd = sqrt(lvar > 0 ? lvar : 0) + 1e-3;
-                    { static int once; if (!once++ && ufsm_env_on("UFSM_LAT_DEBUG")) fprintf(stderr, "\npredict --latents: first window mean / sd from the latents %.3f / %.3f, from the CT %.3f / %.3f\n", lmean, lsd, mean, sd); }
-                    nn_h2d(lz_d, lz_h, ncell * (lz_c + 1));
-                    nn_lat_input_q(lz_d, xd, wc, wc, wc, lgain, latc, (float)lz_sraw, (float)lmean, (float)(1.0 / lsd), x2);
+                if (lat_store) {   /* the cell channels from the stored coefficients, z-scored with the rebuilt window's statistics */
+                    if (latin) nn_lat_pred_input_q(lz_d, Wz, W, (float)mean, (float)(1.0 / sd), dyd, dxd, ax.n > 0 ? (int)radial_sign : 0, lgain, latc, (float)lz_sraw, x2);
+                    else nn_lat_input_q(lz_d, xd, Wz / 4, W / 4, W / 4, lgain, latc, (float)lz_sraw, (float)mean, (float)(1.0 / sd), x2);
                 } else
                 if (latc && latin) nn_lat_pred_input_c(ctd, Wz, W, (float)mean, (float)(1.0 / sd), dyd, dxd, ax.n > 0 ? (int)radial_sign : 0, lbas, lgain, latc, lstep, x2);
                 else if (latc) nn_lat_input_x(xd, W / 4, W / 4, W / 4, lbas, lgain, latc, lstep, x2);   /* the learned cell channels of a --lat-basis checkpoint */
@@ -2035,6 +2091,16 @@ int cmd_predict(int argc, char **argv) {
     for (int l = pp ? 2 : 1; l < nlev; l++) if (pyramid_build_level(out, um_l, l, ash, shard, q, 0, nthreads, attrs)) return 1;
     if (pyramid_write_group(out, um_l, nlev, "ufsm-recto", attrs)) return 1;
     fprintf(stderr, "wrote %s (%ld tiles in %.0fs)\n", out, ntiles, now() - t0);
+    if (ufsm_env_on("UFSM_PRED_IO")) {   /* reads per store root and the process's read bytes per box voxel (--latents against the CT path) */
+        store_io_report(stderr);
+        long long rch = 0, rdb = 0; char ln[128]; FILE *io = fopen("/proc/self/io", "r");
+        while (io && fgets(ln, sizeof ln, io)) { if (!strncmp(ln, "rchar:", 6)) rch = atoll(ln + 6); else if (!strncmp(ln, "read_bytes:", 11)) rdb = atoll(ln + 11); }
+        if (io) fclose(io);
+        const double gv = (double)bn[0] * bn[1] * bn[2] / 1e9, dt = now() - t0;
+        fprintf(stderr, "predict io: box %.4f Gvox in %.2f s (%.3f Gvox/s); read %.4f GB (%.4f GB per Gvox), from disk %.4f GB (%.4f GB per Gvox)%s\n", gv, dt, gv / dt,
+                rch / 1e9, rch / 1e9 / gv, rdb / 1e9, rdb / 1e9 / gv, lat_store ? ", --latents" : "");
+        if (lat_store) fprintf(stderr, "predict io: the latent store: %.4f GB of chunks and indices read (%.4f GB per Gvox)\n", zr_bytes_read() / 1e9, zr_bytes_read() / 1e9 / gv);
+    }
     z3_close(ct); store_close(s); unet_free(u);
     free(sheet_window); free(sheet_shard); free(sheet_rows); sheet_free(sheet);
     return 0;

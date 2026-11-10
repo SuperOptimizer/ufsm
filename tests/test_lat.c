@@ -164,6 +164,58 @@ int main(void) {
             if (n1 > (q ? (C + 3) * cv / 500 : 0) || nd > (C + 3) * cv / 50) { fprintf(stderr, "FAIL: nn_lat_pred_input_c (axis %d, step %d): %zu of %zu values differ, %zu by more than one code\n", axis, q, nd, (C + 3) * cv, n1); fails++; }   /* (quantised: a last-bit difference before rint can move a value by a step) */
             free(bs); free(ya); free(yb); nn_free(d_bs); nn_free(d_gn); nn_free(d_ya); nn_free(d_yb);
         }
+        if (f16) {   /* predict --latents: cells encoded as ufsm lc-encode does (an orthonormal basis, C = 8, raw-domain step), then the rebuilt CT
+                        (nn_lat_synth_ct) against the host inverse transform, and the network input from the cells (nn_lat_pred_input_q) against
+                        the CT path's (nn_lat_pred_input_c, no quantiser): the radial channels equal, the cell channels within half a stored step */
+            const int C = 8; const float sraw = 0.25f * 41.7f, mean = 117.3f, isd = 1.f / 41.7f;
+            static double B[64][64];   /* Gram-Schmidt from the constant vector and random ones */
+            for (int r = 0; r < 64; r++) for (int k = 0; k < 64; k++) B[r][k] = r ? ru() : 1.0;
+            for (int r = 0; r < 64; r++) { for (int q = 0; q < r; q++) { double dt = 0; for (int k = 0; k < 64; k++) dt += B[r][k] * B[q][k]; for (int k = 0; k < 64; k++) B[r][k] -= dt * B[q][k]; }
+                                           double nr = 0; for (int k = 0; k < 64; k++) nr += B[r][k] * B[r][k]; nr = sqrt(nr); for (int k = 0; k < 64; k++) B[r][k] /= nr; }
+            float *bs = malloc(C * 64 * 4), gn[8] = {0.11f, 0.7f, 1.3f, 0.9f, 2.1f, 0.5f, 1.f, 1.7f};
+            for (int c = 0; c < C; c++) for (int k = 0; k < 64; k++) bs[c * 64 + k] = (float)B[c][k];
+            int8_t *qh = malloc(cv * (C + 1)); uint8_t *rc = malloc(w3), *rd = malloc(w3);
+            for (size_t i = 0; i < cv; i++) {   /* lc_cli.c enc_run */
+                const int z = (int)(i / ((size_t)h * h)), y = (int)(i / h % h), x = (int)(i % h); float v[64]; int any = 0;
+                for (int k = 0; k < 64; k++) { const uint8_t bt = ct[((size_t)(4 * z + (k >> 4)) * W + 4 * y + (k >> 2 & 3)) * W + 4 * x + (k & 3)]; v[k] = bt; any |= bt; }
+                int8_t *o = qh + i * (C + 1); float a[8];
+                if (i % 7 == 3) any = 0;   /* (an absent chunk's cells: air) */
+                if (!any) memset(o, 0, C + 1);
+                else for (int c = 0; c < C; c++) {
+                    float sm = 0; for (int k = 0; k < 64; k++) sm += bs[c * 64 + k] * v[k];
+                    int q = (int)lrintf(sm / sraw);
+                    if (c == 0) { q = q < 0 ? 0 : q > 32767 ? 32767 : q; o[0] = (int8_t)(uint8_t)(q & 255); o[1] = (int8_t)(q >> 8); }
+                    else { q = q < -127 ? -127 : q > 127 ? 127 : q; o[c + 1] = (int8_t)q; }
+                }
+                a[0] = (float)((int)(uint8_t)o[0] + 256 * (int)o[1]) * sraw; for (int c = 1; c < C; c++) a[c] = (float)o[c + 1] * sraw;
+                for (int k = 0; k < 64; k++) { float r = 0; for (int c = 0; c < C; c++) r += a[c] * bs[c * 64 + k];
+                    rc[((size_t)(4 * z + (k >> 4)) * W + 4 * y + (k >> 2 & 3)) * W + 4 * x + (k & 3)] = any ? (uint8_t)fminf(255.f, fmaxf(1.f, rintf(r))) : 0; }
+            }
+            float *d_bs = nn_malloc(C * 64 * 4), *d_gn = nn_malloc(C * 4); void *d_q = nn_malloc(cv * (C + 1)), *d_ya = nn_malloc((C + 3) * cv * 2), *d_yb = nn_malloc((C + 3) * cv * 2); uint8_t *d_rc = nn_malloc(w3);
+            nn_h2d(d_bs, bs, C * 64 * 4); nn_h2d(d_gn, gn, C * 4); nn_h2d(d_q, qh, cv * (C + 1));
+            nn_lat_synth_ct(d_q, C, d_bs, sraw, D, W, d_rc); nn_d2h(rd, d_rc, w3);
+            size_t n1 = 0, nz = 0; for (size_t k = 0; k < w3; k++) { n1 += abs((int)rc[k] - (int)rd[k]) > 1 || (rc[k] == 0) != (rd[k] == 0); nz += rc[k] == 0; }
+            cases++;
+            if (n1 || !nz) { fprintf(stderr, "FAIL: nn_lat_synth_ct: %zu of %zu voxels differ from the host inverse transform by more than 1 or in air (%zu air)\n", n1, w3, nz); fails++; }
+            uint16_t *ya = malloc((C + 3) * cv * 2), *yb = malloc((C + 3) * cv * 2);
+            for (int axis = 0; axis <= 1; axis++) {
+                nn_lat_pred_input_c(d_ct, D, W, mean, isd, d_dy, d_dy + D, axis, d_bs, d_gn, C, 0.f, d_ya);
+                nn_lat_pred_input_q(d_q, D, W, mean, isd, d_dy, d_dy + D, axis, d_gn, C, sraw, d_yb);
+                nn_d2h(ya, d_ya, (C + 3) * cv * 2); nn_d2h(yb, d_yb, (C + 3) * cv * 2);
+                size_t bad = 0, nrad = 0; double worst = 0;
+                for (int c = 0; c < C + 3; c++) for (size_t i = 0; i < cv; i++) {
+                    const float va = h2f(ya[(size_t)c * cv + i]), vb = h2f(yb[(size_t)c * cv + i]);
+                    const int8_t *o = qh + i * (C + 1); int any = 0; for (int j = 0; j <= C; j++) any |= o[j];
+                    if (c >= C) { nrad += ya[(size_t)c * cv + i] != yb[(size_t)c * cv + i]; continue; }
+                    if (!any) continue;   /* (all-air cell: the CT path's mean-only value, the store's exact zero: both the air the masks remove) */
+                    const float tol = 0.5f * sraw * isd * gn[c] * 1.002f + 2e-3f * fabsf(va) + 2e-3f * gn[c];
+                    worst = fmax(worst, fabsf(va - vb) / tol); bad += fabsf(va - vb) > tol;
+                }
+                cases++;
+                if (bad || nrad) { fprintf(stderr, "FAIL: nn_lat_pred_input_q (axis %d): %zu cell values beyond half a stored step (worst %.2f x), %zu radial values differ\n", axis, bad, worst, nrad); fails++; }
+            }
+            free(bs); free(qh); free(rc); free(rd); free(ya); free(yb); nn_free(d_bs); nn_free(d_gn); nn_free(d_q); nn_free(d_ya); nn_free(d_yb); nn_free(d_rc);
+        }
         /* the rv bytes: random side logits on the cell grid */
         float *lc = malloc(2 * cv * 4); uint16_t *lc16 = malloc(2 * cv * 2);
         for (size_t k = 0; k < 2 * cv; k++) { lc16[k] = f2h(3.f * ru()); lc[k] = h2f(lc16[k]); }

@@ -338,3 +338,140 @@ Profile now (P512, perf):
 - **Tests:** the CPU fast tier plus the GPU / sampler tests on GPU 1 pass (15/15). With `-g none`, 10 tests that need CUDA but
   have no `gpu` tag fail on master too: test_gpu_input, test_unwrap2_sampler, test_l0_stream, test_gpu_aug, test_fit*,
   test_wtrunk, test_nn.
+
+## Round 3b: ink bits, pinned audit (2026-11-09)
+### --rv ink plane as bits (cf976e8; default on, UFSM_INK_BITS=0 off)
+- A slot holds one known bit per voxel (P^3/8 bytes) plus the per-window cutoff instead of the P^3 papyrus plane.
+- The device builds `known ? (ct8 >= cutoff ? 254 : 0) : 255` on the source grid, then applies the window's cube symmetry
+  (ink_sym_k, = sym_u8) or its warp (lw_ink_k), in nn_ink_bits, called from lab_upload kind 3.
+- sampler_start falls back to the byte plane unless the configuration is --gpu-aug 2 cubes with the rv cutoff and no possible seam.
+- Effect: -0.875 B/vox per slot, all of it pinned. Slots at P512 x6: 4.03 -> 3.33 GB.
+
+Byte-identical, checked four ways:
+- test_gpu_aug's new case: all 48 symmetries plus 8 warps, 4 cutoffs, compared with the host-built plane through sym_u8 /
+  nn_label_warp
+- the sampler's batch hashes, with the plane rebuilt on the host (24 --det windows, also --replay 3)
+- a 20-step --det 1 P384 GPU run: the same losses as UFSM_INK_BITS=0
+
+### Pinned host memory (UFSM_HOSTMEM=1, P384 W3 S5 run, callers resolved with addr2line)
+Per slot, pinned and needed for the async uploads:
+
+| plane | B/vox | note |
+|---|---|---|
+| ct8 | 1 | the CT bytes, also the ink source |
+| side | 1 | the phase |
+| w4 | 1 | winding mod 4 |
+| wcomp | 1 | its component |
+| inkb | 1/8 | the known bits |
+| aug record | ~1 MB per slot | |
+| **total** | **4.125** | 1.87 GB per slot at P768, was 5 |
+
+Per trainer: lbh, the label-stream host planes (train.c:2508), 4 P^3 per GPU (1.8 GB at P768), plus small unet offloads.
+
+The two production trainers (S12 + S10 at P768): 22 slots x 1.87 = 41 GB pinned, was 50.
+
+Findings:
+- Replays reuse their own slot, so nothing is duplicated.
+- Pinned vs pageable makes no RAM difference (both count in the cgroup), so moving slots to pageable memory plus a pinned
+  staging ring would not help.
+- **The next real cut** depends on perf's device band_wind4 (--gpu-aug 3). With side_air 0 and phase_near_um 0 (the defaults),
+  phase_air writes the side plane and the winding input byte-identically. The device can then read pw from the side plane, and
+  slots need no w4 or wcomp: 4.125 -> 2.125 B/vox (-0.9 GB per slot at P768, ~-20 GB for the two trainers).
+  - Catch 1: unwarped symmetry windows would keep the side plane on the source grid, with the symmetry on the device as for ink.
+  - Catch 2: tear / crush windows (their own w4) would need the byte planes or would be refused in that mode.
+  - Proposed to perf.
+- 2.125 B/vox (CT + phase + bits) is the floor without compressing the phase in the slot.
+
+### Profile after round 3 (P512, load ~8)
+- decode 44%: the lossless phase entropy decode 28%, CT 16%
+- band_wind4 + w4_* 22%
+- the elementwise passes ~18%: notair 3.8, phase_air 3.8, memset 3.2, sym_u8 2.8, draw_ 4.9
+
+At low load the passes are cheap (DRAM is not contended); at load ~25 they cost about 2x. The remaining slab fusion is worth a
+few % at most. With --replay K the loader cost per delivered voxel drops by K, which is far larger.
+
+### Tests
+- **test_rv fails on this branch whether ink bits is on or off:** `predict --channel 0` and `--channel 1` give identical volumes
+  with the window sink on or off. My branch does not touch predict.c, so the failure is upstream, from the latcomp predict changes
+  merged in (b1f3677 / 3c6f420 / fcb49fc).
+- Fast CPU tier: 81 passed.
+- GPU tests on GPU 1: test_gpu_aug, test_gpu_input, test_unwrap2_sampler, test_l0_stream, test_wind*, test_pack_tm pass.
+- The 11 CUDA-dependent entries are now tagged gpu (3bafbbd), so with `-g none` they SKIP.
+
+## Round 3c: w4 / wcomp slot drop with --gpu-aug 3, replay + lean test (2026-11-09)
+
+### w4 runs (6c9112b)
+On by default with --gpu-aug 3; `UFSM_W4_RUNS=0` turns it off.
+- **What the slot holds:** band_wind4_tiled's decision per run instead of the w4 / wcomp planes (band_w4dev.h `w4runs`): per
+  strip row the index of its first run, and per run its turns to the root (ro) and its component (cb). Measured ~0.035-0.06 runs
+  per voxel at P512, i.e. ~0.06 B/vox, pageable.
+- **The phase:** every window's phase stays on the source grid. With side_air 0 the side plane is exactly the winding input.
+- **At upload, on the device:**
+  - nn_w4runs_label rebuilds w4 / comp from the side plane, per strip: perf's w4_runs_k + w4_out_k, through nn_w4runs_apply.
+  - The result then goes through lw_w4_k (warped windows) or the cube symmetry (unwarped windows).
+  - nn_label_sym applies the symmetry to the phase of unwarped windows.
+- **nn_w4.cu (perf's file, existing behaviour unchanged):**
+  - ctx_run gets an optional runs output.
+  - The kernels' row bodies become `__host__ __device__`, giving a CPU fallback (cpu_runs) with the same offsets, replay and
+    numbering.
+  - w4runs_apply_host rebuilds the planes on the host.
+  - band.c gets weak stubs for binaries without nn.o.
+- **When it is used:** sampler_start keeps it only with cubes, side_air 0, no --phase-near-um / --aug-tear / sheet / band, and
+  nn.o linked.
+- **Effect:** a slot is 2.125 B/vox (CT + phase + ink bits). Pinned slots for P384 x 5: 1.17 -> 0.61 GB. Estimate at P768:
+  S12 + S10 = 22 slots x 0.96 GB = 21 GB pinned (41 GB with ink bits alone, 50 before).
+
+Byte-identical, checked three ways:
+- test_w4dev, extended: 72 cases x (device runs, CPU runs) x (host rebuild, device rebuild), all equal to band_wind4_tiled.
+- the sampler's batch hashes with the planes rebuilt on the host: 24 --det P512 windows, and --replay 3 against the round-3 hashes.
+- a 20-step --det 1 P384 GPU run with --gpu-aug 3: the losses equal UFSM_W4_RUNS=0 and --gpu-aug 2.
+
+### tests/test_replay_lean (c403504, fast tier, CPU)
+- The unwrap2 --rv --gpu-aug 2 sampler with ink bits + w4 runs (the CPU runs path) + --replay 2, against the plain byte-plane path.
+- Every new window (batch.use 0) hashes the same plane by plane (sampler_batch_hash); every replay keeps its window's CT and is
+  warped.
+- Passes: 12 windows, 12 replays.
+
+### Fast tier
+**latcomp 3f4e740 + my branch** (clean worktree, GPU 1):
+
+| test | failure | cause |
+|---|---|---|
+| test_rv | test_rv.c:71, recto and verso volumes identical | predict; perf's fix is in the combined tree |
+| test_unwrap2_ink | test_unwrap2_ink.c:64, the --init-from warm start at lr 0 changes the trunk weights | not the sampler |
+| test_cover_training | | gpu2 test, run on one GPU |
+| render GPU tests | | GPU memory taken by the production trainer; pass on rerun |
+| test_pack_tm | | flake; pass on rerun |
+| the Python tests | | needed the build/ binaries; pass once built |
+
+**latcomp + perf + my branch:** 177 passed. Failing:
+- test_unwrap2_ink (as above)
+- test_cover_training (gpu2)
+- test_pack_tm part 1: a device-unpack mismatch on the copy stream in 1 of 5 runs, a race in the test or in nn_unpack_tm, not the
+  sampler
+
+test_rv passes on the combined tree.
+
+## Round 3d (2026-11-09): test_unwrap2_ink fix, P960 / P1024 loader dry measurement
+
+- e7229bb: val_fields' `b->ink` / `b->w4` guards (cf976e8, 6c9112b) left the empty validation copies without their ink / winding
+  planes; the validation upload copied from a null host pointer (latched CUDA error) and the trainer saved all-zero checkpoints.
+  Guards removed (validation batches always hold the byte planes); an unfilled validation field is now an error.
+- Measured, not modelled: `UFSM_SAMPLER_ONLY=24`, the rv recipe (scratch hm/sonly3.sh) with `--gpu-aug 3` (w4 runs) + ink bits
+  + `--replay 2`, --lat 4, B 1, GPU 1 for the device winding, memcap 40G. RSS = the process at the end (= /usr/bin/time max RSS);
+  slots are pageable in this mode (UFSM_SAMPLER_NOPIN), the same bytes pinned in a trainer. Rates: delivered Mvox/s with replay 2
+  (12 built windows for 24 batches; short runs, machine shared, +-20 %).
+
+  | P    | workers | slots | RSS GB | slots GB | workers (big + ttmp) GB | delivered Mvox/s |
+  |------|---------|-------|--------|----------|-------------------------|------------------|
+  | 960  | 2       | 4     | 13.6   | 7.5      | 3.5 + 2.7               | 658              |
+  | 960  | 4       | 6     | 24.0   | 11.3     | 7.1 + 6.2               | 1017             |
+  | 960  | 4       | 10    | 31.0   | 18.8     | 7.1 + 6.2               | 1109             |
+  | 960  | 6       | 8     | 30.8   | 15.1     | 9.7 + 7.1               | 1444             |
+  | 1024 | 2       | 4     | 16.4   | 9.1      | 4.3 + 3.2               | 824              |
+  | 1024 | 4       | 6     | 26.8   | 13.7     | 7.5 + 6.4               | 1563             |
+  | 1024 | 4       | 8     | 31.0   | 18.3     | 7.5 + 6.4               | 1390             |
+  | 1024 | 5       | 7     | 32.0   | 16.0     | 9.7 + 7.5               | 1561             |
+
+  A slot is 1.88 GB at P960 and 2.28 GB at P1024 (2.125 B/vox); the RSS step per added slot is 1.76 / 2.13 GB. A worker
+  holds 2.8-3.3 GB at P960 and 3.4-3.8 GB at P1024. The trainer's own host memory (CUDA context, val buffer, offloads) is not included.

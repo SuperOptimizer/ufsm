@@ -100,6 +100,8 @@ typedef struct {
                                 input units ((t - mean) / sd, times the intensity jitter: the conditioning code) instead of a voxel size */
     int gpu_input;           /* train --gpu-input (needs xfmt and sample_gpu_input_ok): batch.x16 holds the CT channel only and batch.rad
                                 each sample's radial record (nn.h nn_input_rad builds the 4 input channels on the device, bit for bit) */
+    int w4_runs;             /* train --gpu-aug 3 (default on, UFSM_W4_RUNS=0 off): batch.w4r instead of the w4 / wcomp planes (host RAM: -2 B per voxel
+                                per slot); sampler_start drops it (0) unless cubes, side_air 0, no --phase-near-um / --aug-tear / sheet, nn.o linked */
     int w4_dev;              /* train --gpu-aug 3: the winding mod 4 through band_wind4_dev (band_w4dev.h; the same bytes; the CPU path if it declines) */
     int gpu_aug;             /* train --gpu-aug (with gpu_input, cubes, no --ct-aug, side_air 0; sample_gpu_aug_ok): batch.ct8 holds each window's
                                 source-grid bytes (after the seam shift) and batch.aug its scan_ct_rec (scanner plan, jitter, normalisation); the
@@ -129,6 +131,8 @@ typedef struct {
                                 intensity jitter): sampler_replay_ok lists the configurations (--gpu-aug 2 batches) */
     int replay_gap;          /* train --replay-gap G: a replay is handed out once G batches left since its window's previous use (FIFO over
                                 the released windows; earlier only when no new window is ready, never under --det 1); 0: (slots - workers) K / (K - 1), at least 2, at most the slot count */
+    int ink_bits;            /* --rv ink plane as batch.inkb (1 bit per voxel) + ct8 instead of batch.ink (host RAM: 7/8 B per voxel per slot);
+                                sampler_start drops it (0) unless --gpu-aug 2 cubes with the rv cutoff and no seam op / packed plane / sheet */
     int slot_skip;           /* batch planes the trainer never reads, not allocated nor filled (host RAM: 1 byte per window voxel per slot each):
                                 1 batch.tm (train: g_tm_unused, the unwrap2 head slabs), 2 batch.pm (unwrap2 without --pap-head) */
     int wind4;               /* train --task unwrap2 (side 2, stored phase): batch.w4 / wcomp, the relative winding mod 4 of each window
@@ -176,7 +180,14 @@ typedef struct {
     uint8_t *wind;           /* B x P^3 winding mod 14 + gauge (band.h band_winding encoding, 255 unknown) when cfg.cond */
     uint8_t *pap;            /* B x P^3 papyrus labels when cfg.pap_head: 0 void, 1 papyrus, 255 ignored */
     uint8_t *w4, *wcomp;     /* B x P^3 each when cfg.wind4: winding mod 4 (63 codes per turn, 255 unknown) and its component (0..14, 255 none) */
+    int use;                 /* sampler_next: 0 a new window, k its k-th replay (--replay) */
+    void *w4r;               /* cfg.w4_runs: B band_w4dev.h w4runs (the winding as runs, malloc'd and kept per slot) instead of w4 / wcomp; side then
+                                holds every window's phase on the source grid (the device applies the symmetry, nn_label_sym / nn_w4runs_label) */
     uint8_t *ink;            /* B x P^3 when cfg.ink_plane: ink prob254 (0..254, 255 unknown) */
+    uint8_t *inkb;           /* cfg.ink_bits: B x P^3 / 8, the --rv papyrus plane's known bit per voxel (bit j of byte k: voxel 8 k + j,
+                                source grid) instead of batch.ink; the plane is known ? (ct8 >= ink_it ? 254 : 0) : 255, built on the device
+                                (nn_ink_bits: the window's symmetry / warp after) */
+    int16_t *ink_it;         /* cfg.ink_bits: B, the window's papyrus cutoff (> 255: no papyrus) */
     void *rad;               /* cfg.gpu_input: B radial records of NN_RAD_REC(Pz) bytes (nn.h), x / x16 then one channel per sample */
     uint8_t *ct8;            /* cfg.gpu_aug: B x P^3 source-grid CT bytes (sample.h gpu_aug), else nullptr */
     void *aug;               /* cfg.gpu_aug: B scan_ct_rec (scan_augment.h) */
@@ -225,6 +236,10 @@ batch *sampler_next(sampler *sp);
 int sampler_failed(const sampler *sp);   /* read failure or exhausted draw retries; stopped samplers never publish partial batches */
 void sampler_release(sampler *sp, batch *b);
 int sampler_replay_ok(const sample_cfg *c);   /* --replay is possible for this configuration */
+/* one hash per batch plane, the planes as the plain (byte-plane) path holds them: ink bits and w4 runs rebuilt on the host; names[q] /
+   hs[q] for q < the return value (<= max). UFSM_BATCH_HASH=1 prints them per sampler_next */
+int sampler_batch_hash(const sampler *sp, const batch *b, const char **names, uint64_t *hs, int max);
+void sample_ink_from_bits(const uint8_t *ct8, const uint8_t *bits, int it, size_t n, uint8_t *out);   /* the --rv plane from ct8 + batch.inkb (source grid) */
 void sampler_hostmem(const sampler *sp, FILE *f, size_t pinned);   /* UFSM_HOSTMEM=1: host memory by owner (stderr line "hostmem:"; pinned: nn_host_bytes()) */
 void sampler_stop(sampler *sp);
 /* Stats: patches rejected / produced since start. */

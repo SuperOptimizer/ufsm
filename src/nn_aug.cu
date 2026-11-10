@@ -4,6 +4,7 @@
    write_spatial_tm channel 0) into the 16-bit CT channel. The CPU made every decision (the plan, the record); the results match the
    CPU path within float tolerance (tests/test_gpu_aug.c), the zero set exactly. Device memory: one P^3 byte staging buffer, the plan, a
    few P^2 planes. */
+#include "band_w4dev.h"
 #include "nn_common.cuh"
 #include "scan_augment.h"
 #include <cuda_fp16.h>
@@ -562,6 +563,65 @@ extern "C" void nn_label_warp(int kind, const uint8_t *a_h, const uint8_t *b_h, 
     else if (kind == 1) lw_phase_k<<<nb, 256, 0, s>>>(a->stage, da, P, rad, a->cssn, a->cssn + 256);
     else if (kind == 3) lw_ink_k<<<nb, 256, 0, s>>>(a->stage, da, P, rad);   /* (the ink plane) */
     else lw_w4_k<<<nb, 256, 0, s>>>(a->stage, a->stage + p3, da, db, P, rad, a->cssn, a->cssn + 256);
+    CK(cudaEventRecord(a->done, s)); a->used = 1;
+    KCHECK();
+}
+/* --rv ink bits (sample.h batch.inkb): the papyrus plane known ? (ct8 >= it ? 254 : 0) : 255 on the source grid, in place over the
+   CT bytes (stage), then through the window's warp (lw_ink_k) or its cube symmetry (= sample.c sym_u8) */
+__global__ void ink_bits_k(uint8_t *st, const uint8_t *bits, int it, size_t n) {
+    const size_t k = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (k >= n) return;
+    st[k] = bits[k >> 3] >> (k & 7) & 1 ? (it <= 255 && st[k] >= it ? 254 : 0) : 255;
+}
+__global__ void ink_sym_k(const uint8_t *src, uint8_t *dst, int P, int code) {   /* out[i0 i1 i2] = in[sum_d stride[perm d] (flip d ? P-1-i_d : i_d)] */
+    const size_t n = (size_t)P * P * P, k = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (k >= n) return;
+    const int64_t i[3] = {(int64_t)(k / ((size_t)P * P)), (int64_t)(k / P % P), (int64_t)(k % P)}, stride[3] = {(int64_t)P * P, P, 1};
+    int64_t q = 0;
+    for (int d = 0; d < 3; d++) { const int pd = code >> (2 * d) & 3, fd = code >> (8 + d) & 1; q += stride[pd] * (fd ? P - 1 - i[d] : i[d]); }
+    dst[k] = src[q];
+}
+/* one window's source-grid label plane through its cube symmetry (symcode: the radial record's h[5]) into da (train --gpu-aug 3 runs
+   slots keep the phase on the source grid) */
+extern "C" void nn_label_sym(const uint8_t *a_h, int symcode, int P, uint8_t *da, int on_copy_stream) {
+    aug_dev *a = aug_get(P, 2);
+    cudaStream_t s = on_copy_stream ? copy_stream() : 0;
+    const size_t p3 = (size_t)P * P * P;
+    if (a->used) CK(cudaStreamWaitEvent(s, a->done, 0));
+    CK(cudaMemcpyAsync(a->stage, a_h, p3, cudaMemcpyHostToDevice, s));
+    ink_sym_k<<<nblk(p3, 256), 256, 0, s>>>(a->stage, da, P, symcode);
+    CK(cudaEventRecord(a->done, s)); a->used = 1;
+    KCHECK();
+}
+/* --gpu-aug 3 runs slots: one window's winding mod 4 and component from its source-grid phase (side_h) and runs (band_w4dev.h w4runs),
+   rebuilt on the device (nn_w4runs_apply, in the staging buffer), then warped (lw_w4_k) or through the symmetry into da / db */
+extern "C" void nn_w4runs_label(const uint8_t *side_h, const void *runs, const void *rad_d, int warped, int symcode, int P, uint8_t *da, uint8_t *db,
+                                const float *cs_h, const float *sn_h, int on_copy_stream) {
+    const w4runs *r = (const w4runs *)runs;
+    cudaStream_t s = on_copy_stream ? copy_stream() : 0;
+    const size_t p3 = (size_t)P * P * P; const unsigned nb = nblk(p3, 256);
+    if (!r->noff) { CK(cudaMemsetAsync(da, 255, p3, s)); CK(cudaMemsetAsync(db, 255, p3, s)); return; }   /* (no winding: unknown) */
+    aug_dev *a = aug_get(P, 2);
+    if (!a->cssn) { CK(cudaMalloc(&a->cssn, 2 * 256 * sizeof(float))); CK(cudaMemcpy(a->cssn, cs_h, LW_PERIOD * sizeof(float), cudaMemcpyHostToDevice));
+                    CK(cudaMemcpy(a->cssn + 256, sn_h, LW_PERIOD * sizeof(float), cudaMemcpyHostToDevice)); }
+    if (a->used) CK(cudaStreamWaitEvent(s, a->done, 0));
+    CK(cudaMemcpyAsync(a->stage, side_h, p3, cudaMemcpyHostToDevice, s));
+    if (nn_w4runs_apply(a->stage, P, P, P, r->tile, r->ms, r, a->stage, a->stage + p3, (void *)s)) { fprintf(stderr, "nn_w4runs_label: CUDA error\n"); abort(); }
+    if (warped) lw_w4_k<<<nb, 256, 0, s>>>(a->stage, a->stage + p3, da, db, P, (const float *)rad_d, a->cssn, a->cssn + 256);
+    else { ink_sym_k<<<nb, 256, 0, s>>>(a->stage, da, P, symcode); ink_sym_k<<<nb, 256, 0, s>>>(a->stage + p3, db, P, symcode); }
+    CK(cudaEventRecord(a->done, s)); a->used = 1;
+    KCHECK();
+}
+extern "C" void nn_ink_bits(const uint8_t *ct8_h, const uint8_t *bits_h, int it, const void *rad_d, int warped, int symcode, int P, uint8_t *da, int on_copy_stream) {
+    aug_dev *a = aug_get(P, 2);
+    cudaStream_t s = on_copy_stream ? copy_stream() : 0;
+    const size_t p3 = (size_t)P * P * P; const unsigned nb = nblk(p3, 256);
+    if (a->used) CK(cudaStreamWaitEvent(s, a->done, 0));
+    CK(cudaMemcpyAsync(a->stage, ct8_h, p3, cudaMemcpyHostToDevice, s));
+    CK(cudaMemcpyAsync(a->stage + p3, bits_h, p3 / 8, cudaMemcpyHostToDevice, s));
+    ink_bits_k<<<nb, 256, 0, s>>>(a->stage, a->stage + p3, it, p3);
+    if (warped) lw_ink_k<<<nb, 256, 0, s>>>(a->stage, da, P, (const float *)rad_d);
+    else ink_sym_k<<<nb, 256, 0, s>>>(a->stage, da, P, symcode);
     CK(cudaEventRecord(a->done, s)); a->used = 1;
     KCHECK();
 }

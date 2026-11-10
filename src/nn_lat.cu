@@ -596,3 +596,53 @@ extern "C" void nn_lat_up_adj_c(const void *g, int C, int d, int h, int w, int z
     KCHECK();
 }
 extern "C" void nn_lat_up_adj(const void *g, int C, int d, int h, int w, int z0, int nz, float *gc, void *scratch) { nn_lat_up_adj_c(g, C, d, h, w, z0, nz, gc, scratch, 0, d); }
+/* predict --latents (a stored ufsm lc-encode volume instead of the CT): q is the window's cells [D/4][W/4][W/4] x (C + 1) int8 (channels
+   0-1 the cell-mean coefficient's index, low byte uint8 / high byte int8; 2.. the principal-axis indices; all bytes 0: air), step_raw the
+   store's raw-domain quantiser step. nn_lat_synth_ct: the window's CT bytes rebuilt from them, v = sum_c q_c step_raw b_c (orthonormal
+   rows: the inverse transform), rounded and clamped to 1..255 in material cells and 0 in air cells, so every reader of the CT window
+   (statistics, occupancy, the "0 where CT 0" output masks at cell granularity, the guided heads' CT terms) runs unchanged on it. */
+__global__ void lat_synth_k(const int8_t *q, int C, const float *bas, float sraw, int d, int h, int w, uint8_t *ct) {
+    const size_t cv = (size_t)d * h * w, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= cv) return;
+    const int z = (int)(i / ((size_t)h * w)), yy = (int)(i / w % h), xx = (int)(i % w), H = 4 * h, W = 4 * w;
+    const int8_t *qc = q + i * (C + 1);
+    int any = 0; for (int c = 0; c <= C; c++) any |= qc[c];
+    float a[32]; a[0] = (float)((int)(uint8_t)qc[0] + 256 * (int)qc[1]) * sraw;
+    for (int c = 1; c < C; c++) a[c] = (float)qc[c + 1] * sraw;
+    for (int k = 0; k < 64; k++) {
+        float v = 0.f; for (int c = 0; c < C; c++) v += a[c] * bas[c * 64 + k];
+        const size_t j = ((size_t)(4 * z + (k >> 4)) * H + 4 * yy + (k >> 2 & 3)) * W + 4 * xx + (k & 3);
+        ct[j] = any ? (uint8_t)fminf(255.f, fmaxf(1.f, rintf(v))) : (uint8_t)0;
+    }
+}
+extern "C" void nn_lat_synth_ct(const void *q, int C, const float *bas, float step_raw, int D, int W, uint8_t *ct) {
+    const size_t cv = (size_t)(D / 4) * (W / 4) * (W / 4);
+    lat_synth_k<<<nblk(cv, 128), 128>>>((const int8_t *)q, C, bas, step_raw, D / 4, W / 4, W / 4, ct); KCHECK();
+}
+/* the network input of a --lat-basis checkpoint from the stored coefficients (nn_lat_pred_input_c's channels without the CT): channel c
+   (q_c step_raw - [c = 0] 8 mean) isd gain_c (the window's z-score is linear; no second quantiser), then the cell means of the radial
+   channels from the window's axis offsets alone, each voxel value rounded to fp16 as lat_pred_in_bas_k does */
+__global__ void lat_pred_in_q_k(const int8_t *q, int D, int W, float mean, float isd, const float *dyo, const float *dxo, int axis,
+                                const float *gain, int C, float sraw, f16 *y) {
+    const int d = D / 4, h = W / 4;
+    const size_t cv = (size_t)d * h * h, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= cv) return;
+    const int z = (int)(i / ((size_t)h * h)), yy = (int)(i / h % h), xx = (int)(i % h);
+    const int8_t *qc = q + i * (C + 1);
+    const float dc = (float)((int)(uint8_t)qc[0] + 256 * (int)qc[1]) * sraw;
+    y[i] = __float2half_rn((dc - 8.f * mean) * isd * gain[0]);
+    for (int c = 1; c < C; c++) y[(size_t)c * cv + i] = __float2half_rn((float)qc[c + 1] * sraw * isd * gain[c]);
+    float acc[2] = {0.f, 0.f};
+    for (int k = 0; k < 64; k++) {
+        const int fz = 4 * z + (k >> 4), fy = 4 * yy + (k >> 2 & 3), fx = 4 * xx + (k & 3);
+        const float dy = dyo[fz] + (float)fy, dx = dxo[fz] + (float)fx, inv = axis ? (float)axis / (sqrtf(dy * dy + dx * dx) + 1e-6f) : 0.f;
+        acc[0] += __half2float(__float2half(dy * inv)); acc[1] += __half2float(__float2half(dx * inv));
+    }
+    y[(size_t)C * cv + i] = __float2half_rn(0.f);
+    y[(size_t)(C + 1) * cv + i] = __float2half_rn(acc[0] * (1.f / 64.f)); y[(size_t)(C + 2) * cv + i] = __float2half_rn(acc[1] * (1.f / 64.f));
+}
+extern "C" void nn_lat_pred_input_q(const void *q, int D, int W, float mean, float isd, const float *dyo, const float *dxo, int axis,
+                                    const float *gain, int C, float step_raw, void *y) {
+    const size_t cv = (size_t)(D / 4) * (W / 4) * (W / 4);
+    lat_pred_in_q_k<<<nblk(cv, 128), 128>>>((const int8_t *)q, D, W, mean, isd, dyo, dxo, axis, gain, C, step_raw, (f16 *)y); KCHECK();
+}

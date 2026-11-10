@@ -74,6 +74,7 @@ test_spiralfit                                 |              |    32 | ./$B/tes
 test_tta                                       | gpu          |     1 | ./$B/test_tta
 test_predict_unwrap2                           | gpu          |     5 | ./$B/test_predict_unwrap2 ./$B/ufsm
 test_unwrap2_ink                               | gpu          |    40 | ./$B/test_unwrap2_ink ./$B/ufsm ./$B/make_wind_fixture
+test_cuda_abort                                | gpu          |    25 | bash tests/test_cuda_abort.sh ./$B/ufsm ./$B/make_wind_fixture
 test_rv                                        | gpu          |    30 | ./$B/test_rv ./$B/ufsm ./$B/make_wind_fixture
 test_score_par                                 |              |     8 | ./$B/test_score_par ./$B/ufsm
 test_grid_sparse                               | gpu          |     2 | ./$B/test_grid_sparse
@@ -206,5 +207,7 @@ test_sysinfo                                   |              |     5 | ./$B/tes
 test_volcomp_fast                              |              |    25 | ./$B/test_volcomp_fast
 test_z3_autosub                                |              |    10 | ./$B/test_z3_autosub
 test_z3_sink                                   |              |    10 | ./$B/test_z3_sink
+test_replay_lean                               |              |    15 | ./$B/test_replay_lean
 test_gpudec                                    | gpu          |    10 | ./$B/test_gpudec
 test_lat                                       | gpu          |     1 | ./$B/test_lat
+test_latents                                   | gpu          |    15 | bash tests/test_latents.sh ./$B/ufsm ./$B/make_wind_fixture

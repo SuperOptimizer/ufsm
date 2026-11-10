@@ -264,14 +264,16 @@ static batch alloc_batch(const sample_cfg *c) {
     b.pm = c->pmask && !(c->slot_skip & 2) ? halloc((size_t)c->B * p3) : nullptr;
     b.wind = c->cond ? halloc((size_t)c->B * p3) : nullptr;
     b.pap = c->pap_head ? halloc((size_t)c->B * p3) : nullptr;
-    b.w4 = c->wind4 ? halloc((size_t)c->B * p3) : nullptr;
-    b.wcomp = c->wind4 ? halloc((size_t)c->B * p3) : nullptr;
-    b.ink = c->ink_plane ? halloc((size_t)c->B * p3) : nullptr;
+    b.w4 = c->wind4 && !c->w4_runs ? halloc((size_t)c->B * p3) : nullptr;
+    b.wcomp = c->wind4 && !c->w4_runs ? halloc((size_t)c->B * p3) : nullptr;
+    b.w4r = c->w4_runs ? calloc((size_t)c->B, sizeof(w4runs)) : nullptr;
+    b.ink = c->ink_plane && !c->ink_bits ? halloc((size_t)c->B * p3) : nullptr;
+    b.inkb = c->ink_bits ? halloc((size_t)c->B * p3 / 8) : nullptr; b.ink_it = c->ink_bits ? calloc((size_t)c->B, sizeof *b.ink_it) : nullptr;
     b.emb = c->emb_ch ? halloc((size_t)c->B * c->emb_ch * (size_t)(PZ(c) / c->emb_div) * (c->P / c->emb_div) * (c->P / c->emb_div)) : nullptr;
     return b;
 }
 
-static void free_batch(batch *b) { if (b->ink) hfree(b->ink); if (b->ct8) hfree(b->ct8); if (b->aug) hfree(b->aug); if (b->emb) hfree(b->emb); if (b->xv) hfree(b->xv); free(b->vok); free(b->chid); free(b->chidx); free(b->choff); if (b->w4) hfree(b->w4); if (b->wcomp) hfree(b->wcomp); if (b->tm) hfree(b->tm); if (b->rad) hfree(b->rad); if (b->axr) hfree(b->axr); if (b->pap) hfree(b->pap); if (b->wind) hfree(b->wind); if (b->band) hfree(b->band); if (b->side) hfree(b->side); if (b->pm) hfree(b->pm); if (b->x) hfree(b->x); if (b->x16) hfree(b->x16); if (b->t) hfree(b->t); if (b->m) hfree(b->m); hfree(b->w); free(b->src); free(b->level); free(b->um); free(b->corner); if (b->sheet) { sheet_batch_free(b->sheet[0]); free(b->sheet); } }
+static void free_batch(batch *b, int B) { if (b->w4r) { for (int q = 0; q < B; q++) { w4runs *r = (w4runs *)b->w4r + q; free(r->off); free(r->ro); free(r->cb); } free(b->w4r); } if (b->ink) hfree(b->ink); if (b->inkb) hfree(b->inkb); free(b->ink_it); if (b->ct8) hfree(b->ct8); if (b->aug) hfree(b->aug); if (b->emb) hfree(b->emb); if (b->xv) hfree(b->xv); free(b->vok); free(b->chid); free(b->chidx); free(b->choff); if (b->w4) hfree(b->w4); if (b->wcomp) hfree(b->wcomp); if (b->tm) hfree(b->tm); if (b->rad) hfree(b->rad); if (b->axr) hfree(b->axr); if (b->pap) hfree(b->pap); if (b->wind) hfree(b->wind); if (b->band) hfree(b->band); if (b->side) hfree(b->side); if (b->pm) hfree(b->pm); if (b->x) hfree(b->x); if (b->x16) hfree(b->x16); if (b->t) hfree(b->t); if (b->m) hfree(b->m); hfree(b->w); free(b->src); free(b->level); free(b->um); free(b->corner); if (b->sheet) { sheet_batch_free(b->sheet[0]); free(b->sheet); } }
 
 /* Level choice for a source: restrict cfg.level_p to levels the CT has and every target of the source
    can provide (pyramid: same level; regions: levels 0..1). Returns -1 if nothing is usable. */
@@ -2492,10 +2494,11 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
     /* targets */
     /* --ink-head: the window's ink plane, built in the batch's own plane (on the source grid; the symmetry / host warp below moves it
        through big + P^3, free by then): no worker buffer of P^3 bytes */
-    uint8_t *inkw = c->ink_plane ? b->ink + (size_t)i * p3 : nullptr;
+    uint8_t *inkw = c->ink_plane && !c->ink_bits ? b->ink + (size_t)i * p3 : nullptr;
+    uint8_t *inkbits = c->ink_bits ? b->inkb + (size_t)i * p3 / 8 : nullptr;   /* (ink_bits: the known bits instead, written in the mask pass) */
     /* --rv with --gpu-aug: the papyrus plane from ct8 (the clean CT as read, = ctu here unless a seam shifts ctu first) in the mask pass
        below, one pass fewer (ink_it: the cutoff, 0 = built here) */
-    const int ink_it = inkw && c->rv_iso > 0 && c->gpu_aug && (!c->augment || !scan_aug_enabled(&c->scan) || c->scan.p[SA_SEAM] <= 0 || c->sheet || c->band || c->side)
+    const int ink_it = (inkw || inkbits) && c->rv_iso > 0 && c->gpu_aug && (!c->augment || !scan_aug_enabled(&c->scan) || c->scan.p[SA_SEAM] <= 0 || c->sheet || c->band || c->side)
                        ? (s->iso > 0 ? s->iso : c->rv_iso) : 0;
     uint8_t w[NCH] = {0};
     int tmax = 0;
@@ -2507,7 +2510,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
         if (c->papyrus) { memset(dst, 0, p3); continue; }   /* task papyrus: labels from the CT below */
         if (c->ink_plane && ch == CH_SHEET) {   /* --ink-head: the source's "ink" target onto its own plane (prob254 as stored), not a channel */
             if (!tdead) memset(dst, 0, p3);   /* (w 0: tdead, unread) */
-            if (!inkw) { fprintf(stderr, "sampler: no ink plane buffer\n"); return -1; }
+            if (!inkw && !inkbits) { fprintf(stderr, "sampler: no ink plane buffer\n"); return -1; }
             if (c->rv_iso > 0) {   /* --rv: papyrus (clean CT >= the cutoff) 254, void 0; unknown on CT 0 below (mask) */
                 const int it = s->iso > 0 ? s->iso : c->rv_iso;
                 if (!ink_it) for (size_t k = 0; k < p3; k++) inkw[k] = ctu[k] >= it ? 254 : 0;
@@ -2812,7 +2815,15 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
 #define MK(k) (ign_zero ? (uint8_t)(ctu[k] != 0) : (uint8_t)((ctu[k] != 0) & (mask[k] == 0)))
     /* tdead: the loss mask itself is read by nobody below (no packed plane, no sheet prior, the labels warped on the device): only the
        ink plane is written (one write stream fewer; the pass is DRAM-bound) */
-    if (tdead && ink_it && ink_it <= 255) {
+    if (inkbits) {   /* (ink_bits: the known bit of each voxel; the plane itself on the device) */
+        if (!ink_it) { fprintf(stderr, "sampler: ink bits without the rv cutoff\n"); return -1; }
+        b->ink_it[i] = (int16_t)(ink_it > 256 ? 256 : ink_it);
+        for (size_t k8 = 0; k8 < p3 / 8; k8++) {
+            unsigned v = 0;
+            for (int j = 0; j < 8; j++) { const size_t k = 8 * k8 + (size_t)j; const unsigned mk = ign_zero ? ctu[k] != 0 : (ctu[k] != 0) & (mask[k] == 0); if (!tdead) mask[k] = (uint8_t)mk; v |= mk << j; }
+            inkbits[k8] = (uint8_t)v;
+        }
+    } else if (tdead && ink_it && ink_it <= 255) {
         const uint8_t *c8 = b->ct8 + (size_t)i * p3; const uint8_t it = (uint8_t)ink_it;
         if (ign_zero) for (size_t k = 0; k < p3; k++) inkw[k] = ctu[k] ? (c8[k] >= it ? 254 : 0) : 255;
         else for (size_t k = 0; k < p3; k++) inkw[k] = ctu[k] && !mask[k] ? (c8[k] >= it ? 254 : 0) : 255;
@@ -2976,9 +2987,17 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
                 ph_known = phase_air(ctu, sw, pw, p3, c->side_air); air_done = 1;   /* (the winding input and the air test in one pass) */
                 if (ph_own) {   /* the phase's output now (the winding below reads pw only): its plane is free for the winding */
                     if (c->phase_near_um > 0) for (size_t k = 0; k < p3; k++) if (!near || !near[k]) sw[k] = SIDE_UNKNOWN;   /* no labelled wrap: none */
-                    if (!direct) sym_u8(sw, side_o, Pz, P, y);
+                    if (!direct) { if (c->w4_runs) memcpy(side_o, sw, p3); else sym_u8(sw, side_o, Pz, P, y); }   /* (w4_runs: the source grid, the device's symmetry) */
                     side_done = 1;
                 }
+                if (c->w4_runs) {   /* (--gpu-aug 3 runs slots: the decision per run; the device rebuilds the planes from the side plane = pw) */
+                    const int wt = c->wind4_tile < 0 ? 0 : c->wind4_tile > (P + 5) / 6 ? c->wind4_tile : (P + 5) / 6;
+                    if (g_crush.w4 || band_wind4_runs(pw, Pz, P, P, wt, c->wind4_step > 0 ? c->wind4_step : 80, c->wind4_min > 0 ? (size_t)c->wind4_min : 512, wt ? 1 : 15, (w4runs *)b->w4r + i, nullptr) < 0) {
+                        if (g_crush.w4) fprintf(stderr, "sampler: --aug-tear with w4 runs slots\n");
+                        PH_PUT(pw, p3); SW_PUT(); return -1;
+                    }
+                    w4_set = 1; PROF_MARK(PS_WIND4); PH_PUT(pw, p3);
+                } else {
                 uint8_t *ww = direct ? b->w4 + (size_t)i * p3 : ph_own ? ttmp : PH_GET(big + p3, p3), *wc = direct ? b->wcomp + (size_t)i * p3 : PH_GET(big + 9 * p3, p3);
                 if (!ww || !wc) { PH_PUT(pw, p3); if (!ph_own) { PH_PUT(ww, p3); PH_PUT(wc, p3); } SW_PUT(); return -1; }
                 const int wt = c->wind4_tile < 0 ? 0 : c->wind4_tile > (P + 5) / 6 ? c->wind4_tile : (P + 5) / 6;   /* (<= 6^3 tiles: one gauge each fits the loss's 255) */
@@ -2997,6 +3016,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
                 w4_set = 1;   /* (warped: warp_phase_w4 below writes every voxel) */
                 PROF_MARK(PS_WIND4);
                 PH_PUT(pw, p3); if (!ph_own) { PH_PUT(ww, p3); PH_PUT(wc, p3); }
+                }
             }
             if (!air_done) ph_known = phase_air(ctu, sw, nullptr, p3, c->side_air);
             if (c->phase_near_um > 0 || (spatial.active && !lw)) ph_known = SIZE_MAX;   /* (the count of side_o: changed below / by the host warp; a symmetry keeps it) */
@@ -3008,7 +3028,8 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
                     memset(sw + p3, PHASE_UNKNOWN, 64);
                     warp_phase_w4(sw, wq, side_o, wq ? b->w4 + (size_t)i * p3 : nullptr, wq ? b->wcomp + (size_t)i * p3 : nullptr, P, y, &spatial);
                     tp_put(wq, 2 * p3);
-                } else sym_u8(sw, side_o, Pz, P, y);
+                } else if (c->w4_runs) memcpy(side_o, sw, p3);   /* (the source grid) */
+                else sym_u8(sw, side_o, Pz, P, y);
             }
             SW_PUT();
             PROF_MARK(PS_PHOUT);
@@ -3023,12 +3044,15 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
             if (c->band) sym_u8(bw, b->band + (size_t)i * p3, Pz, P, y);
             if (sw) {   /* sides (phases) above CT side_air only: air (CT <= side_air) stays unsupervised */
                 for (size_t k = 0; k < p3; k++) if (ctu[k] <= c->side_air || !ctu[k]) sw[k] = SIDE_UNKNOWN;
-                sym_u8(sw, b->side + (size_t)i * p3, Pz, P, y);
+                if (c->w4_runs) memcpy(b->side + (size_t)i * p3, sw, p3); else sym_u8(sw, b->side + (size_t)i * p3, Pz, P, y);   /* (w4_runs: the source grid) */
             }
             tp_put(bw, p3); tp_put(sw, p3);
         }
     }
-    if (c->wind4 && !w4_set) { memset(b->w4 + (size_t)i * p3, 255, p3); memset(b->wcomp + (size_t)i * p3, 255, p3); }
+    if (c->wind4 && !w4_set) {
+        if (c->w4_runs) { w4runs *wr = (w4runs *)b->w4r + i; wr->noff = wr->nr = 0; }   /* (no winding: the device writes unknown) */
+        else { memset(b->w4 + (size_t)i * p3, 255, p3); memset(b->wcomp + (size_t)i * p3, 255, p3); }
+    }
     if (inkw) {   /* --ink-head: the ink plane through the symmetry / warp (--gpu-aug 2 warped windows: the source grid, warped on the device) */
         uint8_t *bi = b->ink + (size_t)i * p3, *src = scr_own ? ttmp + p3 + 64 : big + p3;   /* (lw, or unwarped with the identity: already in place) */
         if (!lw && !(sym_id && !spatial.active)) {
@@ -3442,6 +3466,10 @@ static int label_res_check(sampler *sp, source *s, int si, int region_ch) {
     }
     return 0;
 }
+/* the --rv papyrus plane from the CT bytes and the known bits (batch.inkb; the host reference of nn_ink_bits before its symmetry / warp) */
+void sample_ink_from_bits(const uint8_t *ct8, const uint8_t *bits, int it, size_t n, uint8_t *out) {
+    for (size_t k = 0; k < n; k++) out[k] = bits[k >> 3] >> (k & 7) & 1 ? (it <= 255 && ct8[k] >= it ? 254 : 0) : 255;
+}
 /* ---- --replay: the same window again with a new device-side augmentation ---- */
 static sym sym_inverse(sym y) { sym z; for (int d = 0; d < 3; d++) { z.perm[y.perm[d]] = d; z.flip[y.perm[d]] = y.flip[d]; } return z; }
 static int sym_identity(sym y) { return y.perm[0] == 0 && y.perm[1] == 1 && y.perm[2] == 2 && !y.flip[0] && !y.flip[1] && !y.flip[2]; }
@@ -3472,7 +3500,7 @@ static void replay_window(sampler *sp, batch *b, int i, int rep, uint8_t **scr) 
         if (!warped0 && !sym_identity(y0)) {   /* back to the source grid */
             if (!*scr && !(*scr = malloc(p3))) abort();
             const sym yi = sym_inverse(y0);
-            uint8_t *pl[5] = {b->side, b->w4, b->wcomp, b->ink, b->tm};
+            uint8_t *pl[5] = {c->w4_runs ? nullptr : b->side, b->w4, b->wcomp, b->ink, b->tm};   /* (w4_runs: the side plane is on the source grid already) */
             for (int q = 0; q < 5; q++) if (pl[q]) { uint8_t *v = pl[q] + (size_t)i * p3; memcpy(*scr, v, p3); sym_u8(*scr, v, Pz, P, yi); }
         }
         y = sym_of((int)rint_below(&r, 48));
@@ -3591,6 +3619,19 @@ sampler *sampler_start(sources *S, const sample_cfg *cfg) {
     sampler *sp = calloc(1, sizeof *sp);
     sp->S = S;
     sp->cfg = *cfg;
+    if (sp->cfg.w4_runs) {   /* the runs stand for the planes where the side plane is the winding input and every label is on the source grid */
+        const sample_cfg *c = &sp->cfg;
+        const int ok = w4runs_available() && c->wind4 && c->side == 2 && c->gpu_aug == 2 && (c->Pz <= 0 || c->Pz == c->P) && c->side_air == 0 && c->phase_near_um <= 0 &&
+                       c->tear_p <= 0 && !c->sheet && !c->band;
+        if (!ok) sp->cfg.w4_runs = 0;
+        else fprintf(stderr, "sampler: the winding mod 4 as runs in the slots (no w4 / wcomp planes: -2 B per voxel per slot), rebuilt on the device at upload\n");
+    }
+    if (sp->cfg.ink_bits) {   /* the bits stand for the plane only where draw_ builds it from the CT in the mask pass (ink_it): else the byte plane */
+        const sample_cfg *c = &sp->cfg;
+        const int ok = c->ink_plane && c->rv_iso > 0 && c->gpu_aug == 2 && (c->Pz <= 0 || c->Pz == c->P) && !(c->P & 1) &&
+                       (!c->augment || !scan_aug_enabled(&c->scan) || c->scan.p[SA_SEAM] <= 0 || c->sheet || c->band || c->side);
+        if (!ok) sp->cfg.ink_bits = 0;
+    }
     if (cfg->cover) {
         if (cfg->holdout || cfg->B != 1 || cfg->cover->P != cfg->P || cfg->cover_start >= cfg->cover->count) { free(sp); return nullptr; }
         sp->cfg.deterministic = 1; sp->cfg.snap = 0;
@@ -3637,7 +3678,7 @@ sampler *sampler_start(sources *S, const sample_cfg *cfg) {
     sp->slot_j = calloc((size_t)sp->nslots, sizeof *sp->slot_j);
     sp->slots = calloc((size_t)sp->nslots, sizeof *sp->slots);
     sp->state = calloc((size_t)sp->nslots, sizeof *sp->state);
-    for (int i = 0; i < sp->nslots; i++) sp->slots[i] = alloc_batch(cfg);
+    for (int i = 0; i < sp->nslots; i++) sp->slots[i] = alloc_batch(&sp->cfg);
     pthread_mutex_init(&sp->mu, nullptr);
     pthread_cond_init(&sp->cv_free, nullptr);
     pthread_cond_init(&sp->cv_ready, nullptr);
@@ -3684,6 +3725,47 @@ sampler *sampler_start(sources *S, const sample_cfg *cfg) {
     return sp;
 }
 
+/* one hash per batch plane, the planes as the plain path holds them (ink bits / w4 runs: the device's planes rebuilt on the host, the
+   window's symmetry for unwarped windows): names[q] / hs[q] for q < the return value (UFSM_BATCH_HASH, tests) */
+int sampler_batch_hash(const sampler *sp, const batch *b, const char **names, uint64_t *hs, int max) {
+    const size_t B = (size_t)sp->cfg.B, p3 = P3(sp);
+    uint8_t *inkr = b->inkb ? malloc(B * p3) : nullptr;   /* (ink_bits: the plane as the device builds it, for the same "ink" hash) */
+    uint8_t *sdr = nullptr, *w4r = nullptr, *wcr = nullptr;   /* (w4_runs: side, w4, wcomp as the plane path holds them: the device's rebuild + symmetry, on the host) */
+    if (b->w4r) {
+        sdr = malloc(B * p3); w4r = malloc(B * p3); wcr = malloc(B * p3); uint8_t *g = malloc(p3), *gw = malloc(p3), *gc = malloc(p3); if (!sdr || !w4r || !wcr || !g || !gw || !gc) abort();
+        for (size_t q = 0; q < B; q++) {
+            int32_t h[8]; memcpy(h, (const char *)b->rad + q * NN_RAD_REC(PZ(&sp->cfg)), sizeof h);
+            sym y; for (int d = 0; d < 3; d++) { y.perm[d] = h[5] >> (2 * d) & 3; y.flip[d] = h[5] >> (8 + d) & 1; }
+            const w4runs *wr = (const w4runs *)b->w4r + q; const uint8_t *sd = b->side + q * p3;
+            if (wr->noff) w4runs_apply_host(sd, PZ(&sp->cfg), sp->cfg.P, sp->cfg.P, wr->tile, wr->ms, wr, gw, gc); else { memset(gw, 255, p3); memset(gc, 255, p3); }
+            if (h[6] & 1) { memcpy(sdr + q * p3, sd, p3); memcpy(w4r + q * p3, gw, p3); memcpy(wcr + q * p3, gc, p3); }
+            else { sym_u8(sd, sdr + q * p3, PZ(&sp->cfg), sp->cfg.P, y); sym_u8(gw, w4r + q * p3, PZ(&sp->cfg), sp->cfg.P, y); sym_u8(gc, wcr + q * p3, PZ(&sp->cfg), sp->cfg.P, y); }
+        }
+        free(g); free(gw); free(gc);
+    }
+    if (inkr) {
+        uint8_t *g = malloc(p3); if (!g) abort();
+        for (size_t q = 0; q < B; q++) {
+            sample_ink_from_bits(b->ct8 + q * p3, b->inkb + q * p3 / 8, b->ink_it[q], p3, g);
+            int32_t h[8]; memcpy(h, (const char *)b->rad + q * NN_RAD_REC(PZ(&sp->cfg)), sizeof h);
+            sym y; for (int d = 0; d < 3; d++) { y.perm[d] = h[5] >> (2 * d) & 3; y.flip[d] = h[5] >> (8 + d) & 1; }
+            if (h[6] & 1) memcpy(inkr + q * p3, g, p3); else sym_u8(g, inkr + q * p3, PZ(&sp->cfg), sp->cfg.P, y);
+        }
+        free(g);
+    }
+    const struct { const char *n; const void *p; size_t z; } f[] = {{"ct8", b->ct8, B * p3}, {"aug", b->aug, B * sizeof(scan_ct_rec)}, {"rad", b->rad, B * NN_RAD_REC(PZ(&sp->cfg))},
+        {"side", sdr ? sdr : b->side, B * p3}, {"w4", w4r ? w4r : b->w4, B * p3}, {"wcomp", wcr ? wcr : b->wcomp, B * p3}, {"ink", inkr ? inkr : b->ink, B * p3}, {"tm", b->tm, B * p3}, {"pm", b->pm, B * p3}, {"inkb", b->inkb, B * p3 / 8},
+        {"x16", b->x16, B * (size_t)b->xch * p3 * 2}, {"um", b->um, B * sizeof(float)}, {"src", b->src, B * sizeof(int16_t)}, {"w", b->w, B * NCH}};
+    int n = 0;
+    for (size_t q = 0; q < sizeof f / sizeof f[0] && n < max; q++) if (f[q].p) {
+    uint64_t h = 0x9e3779b97f4a7c15ull; const uint8_t *c = f[q].p;
+    for (size_t j = 0; j + 8 <= f[q].z; j += 8) { uint64_t v; memcpy(&v, c + j, 8); h = (h ^ v) * 0xff51afd7ed558ccdull; h ^= h >> 32; }
+    for (size_t j = f[q].z & ~(size_t)7; j < f[q].z; j++) h = (h ^ c[j]) * 0x100000001b3ull;
+    names[n] = f[q].n; hs[n++] = h;
+    }
+    free(inkr); free(sdr); free(w4r); free(wcr);
+    return n;
+}
 batch *sampler_next(sampler *sp) {
     pthread_mutex_lock(&sp->mu);
     int k = -1;
@@ -3716,22 +3798,15 @@ batch *sampler_next(sampler *sp) {
             pthread_cond_wait(&sp->cv_ready, &sp->mu);
         }
     }
+    sp->slots[k].use = sp->rleft ? sp->cfg.replay - 1 - sp->rleft[k] : 0;
     sp->state[k] = TAKEN; if (sp->rdue) sp->rdue[k] = sp->nserved + sp->rgap;   /* (its next use: rgap batches after this one) */
     sp->nserved++;
     pthread_mutex_unlock(&sp->mu);
     if (ufsm_env_on("UFSM_BATCH_HASH")) {   /* debugging (with train --det 1): one hash per batch plane, to show a change leaves the batches byte-identical */
-        const batch *b = &sp->slots[k]; const size_t B = (size_t)sp->cfg.B, p3 = P3(sp);
         static _Atomic long nb; const long id = atomic_fetch_add(&nb, 1);
-        const struct { const char *n; const void *p; size_t z; } f[] = {{"ct8", b->ct8, B * p3}, {"aug", b->aug, B * sizeof(scan_ct_rec)}, {"rad", b->rad, B * NN_RAD_REC(PZ(&sp->cfg))},
-            {"side", b->side, B * p3}, {"w4", b->w4, B * p3}, {"wcomp", b->wcomp, B * p3}, {"ink", b->ink, B * p3}, {"tm", b->tm, B * p3}, {"pm", b->pm, B * p3},
-            {"x16", b->x16, B * (size_t)b->xch * p3 * 2}, {"um", b->um, B * sizeof(float)}, {"src", b->src, B * sizeof(int16_t)}, {"w", b->w, B * NCH}};
+        const char *nm[32]; uint64_t hv[32]; const int n = sampler_batch_hash(sp, &sp->slots[k], nm, hv, 32);
         fprintf(stderr, "batchhash %ld", id);
-        for (size_t q = 0; q < sizeof f / sizeof f[0]; q++) if (f[q].p) {
-            uint64_t h = 0x9e3779b97f4a7c15ull; const uint8_t *c = f[q].p;
-            for (size_t j = 0; j + 8 <= f[q].z; j += 8) { uint64_t v; memcpy(&v, c + j, 8); h = (h ^ v) * 0xff51afd7ed558ccdull; h ^= h >> 32; }
-            for (size_t j = f[q].z & ~(size_t)7; j < f[q].z; j++) h = (h ^ c[j]) * 0x100000001b3ull;
-            fprintf(stderr, " %s %016llx", f[q].n, (unsigned long long)h);
-        }
+        for (int q = 0; q < n; q++) fprintf(stderr, " %s %016llx", nm[q], (unsigned long long)hv[q]);
         fprintf(stderr, "\n");
     }
     return &sp->slots[k];
@@ -3788,7 +3863,7 @@ void sampler_stop(sampler *sp) {
     pthread_mutex_unlock(&sp->mu);
     for (int i = 0; i < sp->cfg.nworkers; i++) pthread_join(sp->th[i], nullptr);
     if (sp->rth_on) pthread_join(sp->rth, nullptr);
-    for (int i = 0; i < sp->nslots; i++) free_batch(&sp->slots[i]);
+    for (int i = 0; i < sp->nslots; i++) free_batch(&sp->slots[i], sp->cfg.B);
     free(sp->rleft); free(sp->rq); free(sp->rdue); free(sp->rseq);
     for (int i = 0; i < sp->S->n; i++) free(sp->occ[i].idx);
     free(sp->occ); free(sp->slot_j); free(sp->slots); free(sp->state); free(sp->th); free(sp->cum); free(sp->lvl_ok);

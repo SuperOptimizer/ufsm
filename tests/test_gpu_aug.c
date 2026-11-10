@@ -83,6 +83,31 @@ int main(int argc, char **argv) {
         }
         free(tg);
     }
+    {   /* --rv ink bits (nn_ink_bits): the plane from ct8 + known bits, then the cube symmetry (= sym_u8) or the warp (= nn_label_warp
+           kind 3 of the host-built plane), byte for byte; all 48 symmetries unwarped, 8 warped, cutoffs 1 / 64 / 200 / 256 */
+        uint8_t *c8 = nn_host_alloc(p3), *bits = nn_host_alloc(p3 / 8), *inkh = nn_host_alloc(p3), *ref = malloc(p3), *got = malloc(p3), *dd = nn_malloc(p3);
+        for (size_t k = 0; k < p3; k++) c8[k] = (uint8_t)(ct[k] ^ (k * 2654435761u >> 27));
+        for (size_t k = 0; k < p3 / 8; k++) bits[k] = (uint8_t)(k * 40503u >> 7 ^ k);
+        const float *cs, *sn; sample_phase_cssn(&cs, &sn);
+        int nbad = 0, ncs = 0;
+        for (int q = 0; q < 56; q++) {
+            const int warped = q >= 48, it = (int[]){1, 64, 200, 256}[q % 4];
+            sym sy = sym_of(q % 48); spatial_aug sa = {0};
+            if (warped) { spatial_aug_make(&sa, 1000 + q, P, 10, 1, 1, 1); spatial_aug_zoom(&sa, .8); }
+            rad_record(rad_h, o, P, P, 1, sy, cy0, cx0, warped ? &sa : nullptr); nn_h2d(rad_d, rad_h, NN_RAD_REC(P));
+            int32_t h[8]; memcpy(h, rad_h, sizeof h);
+            sample_ink_from_bits(c8, bits, it, p3, inkh);
+            if (warped) { nn_label_warp(3, inkh, nullptr, rad_d, P, dd, nullptr, cs, sn, 0); nn_d2h(ref, dd, p3); }
+            else sym_u8(inkh, ref, P, P, sy);
+            CHECK((h[6] & 1) == warped, "ink bits case %d: the record's warp flag", q);
+            nn_ink_bits(c8, bits, it, rad_d, h[6] & 1, h[5], P, dd, 0); nn_d2h(got, dd, p3);
+            if (memcmp(ref, got, p3)) nbad++;
+            ncs++;
+        }
+        CHECK(!nbad, "ink bits: %d of %d cases differ from the host-built plane", nbad, ncs);
+        printf("gpu_aug: ink bits = host-built plane (symmetry / warp), %d cases\n", ncs);
+        nn_host_free(c8); nn_host_free(bits); nn_host_free(inkh); free(ref); free(got); nn_free(dd);
+    }
     int e2e_n = 0, e2e_scan = 0, e2e_warp = 0; double e2e_worst = 0; size_t e2e_lbad[5] = {0};
     {   /* end to end: the --task unwrap2 sampler with --gpu-aug 0 and 1 (same seed, deterministic): phase / winding / packed targets / radial
            records byte for byte; the device's CT channel from ct8 + aug against the CPU's x16 within the two jitter noises */

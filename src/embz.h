@@ -10,6 +10,9 @@ void zr_close(zr *r);
 const uint8_t *zr_chunk(zr *r, int64_t z, int64_t y, int64_t x);      /* the decoded chunk holding output cell (z, y, x); nullptr absent */
 int zr_read(zr *r, const int64_t o[3], const int64_t n[3], float *out);   /* float32 [n0][n1][n2](C), outside / absent 0 */
 int zr_read_i8(zr *r, const int64_t o[3], const int64_t n[3], int8_t *out);   /* int8 arrays: the stored values [n0][n1][n2](C) (no value_scale), outside / absent 0; -1 other types */
+int zr_read_i8_mt(zr *rs, int T, const int64_t o[3], const int64_t n[3], int8_t *out);   /* the same with T handles rs[0..T) of one store, T threads */
+long long zr_bytes_read(void);                                         /* compressed chunk + shard index bytes read by all readers */
+int zr_chunk_empty(zr *r, int64_t z, int64_t y, int64_t x);         /* 1 absent / all zero, 0 data, -1 outside (mostly the shard index alone) */
 /* an output with its optional per-vector scale array */
 typedef struct { zr a, s; int has_s; } emb;
 int emb_open(emb *e, const char *group, const char *name);

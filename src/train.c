@@ -394,7 +394,9 @@ static int val_fields(batch *b, int B, size_t p3, void **f[VAL_NF], size_t sz[VA
     if (g_aff) VF(b->band, (size_t)B * p3);
     if (g_side) VF(b->side, (size_t)B * p3);
     if (g_unwrap) VF(b->pm, (size_t)B * p3);
-    if (g_unwrap2) { VF(b->w4, (size_t)B * p3); VF(b->wcomp, (size_t)B * p3); }
+    if (g_unwrap2) { VF(b->w4, (size_t)B * p3); VF(b->wcomp, (size_t)B * p3); }   /* (validation batches always hold the byte planes: vc is copied before
+                                                                                   sc.w4_runs / sc.ink_bits, and its gpu_aug 0 drops both; the fields
+                                                                                   must not depend on the batch: empty destinations are laid out by it) */
     if (IPLANE) VF(b->ink, (size_t)B * p3);
     if (g_cond) VF(b->wind, (size_t)B * p3);
     if (g_pap_head) VF(b->pap, (size_t)B * p3);
@@ -467,6 +469,25 @@ static int pm_used(void) { return g_unwrap && (!g_unwrap2 || g_pap_head); }
 static void lab_upload(int kind, const batch *b, uint8_t *da, uint8_t *db, const uint8_t *ha, const uint8_t *hb, const void *rad, int B, int P, int async) {
     void (*cp)(void *, const void *, size_t) = async ? nn_h2d_copy_stream : nn_h2d;
     const size_t p3 = (size_t)g_Pz * P * P;
+    if (b->w4r && (kind == 1 || kind == 2)) {   /* --gpu-aug 3 runs slots: the phase on the source grid, the winding rebuilt from it on the device */
+        const float *cs, *sn; sample_phase_cssn(&cs, &sn);
+        for (int s = 0; s < B; s++) {
+            int32_t h[8]; memcpy(h, (const char *)b->rad + (size_t)s * NN_RAD_REC(g_Pz), sizeof h);
+            const void *rd = (const char *)rad + (size_t)s * NN_RAD_REC(g_Pz); const uint8_t *sd = b->side + (size_t)s * p3;
+            if (kind == 2) nn_w4runs_label(sd, (const w4runs *)b->w4r + s, rd, h[6] & 1, h[5], P, da + (size_t)s * p3, db + (size_t)s * p3, cs, sn, async);
+            else if (h[6] & 1) nn_label_warp(1, sd, nullptr, rd, P, da + (size_t)s * p3, nullptr, cs, sn, async);
+            else if ((h[5] & 0x73f) == (0 | 1 << 2 | 2 << 4)) cp(da + (size_t)s * p3, sd, p3);   /* (the identity) */
+            else nn_label_sym(sd, h[5], P, da + (size_t)s * p3, async);
+        }
+        return;
+    }
+    if (kind == 3 && b->inkb) {   /* --rv ink bits: the plane built on the device from ct8 + the known bits, then its warp / symmetry */
+        for (int s = 0; s < B; s++) {
+            int32_t h[8]; memcpy(h, (const char *)b->rad + (size_t)s * NN_RAD_REC(g_Pz), sizeof h);
+            nn_ink_bits(b->ct8 + (size_t)s * p3, b->inkb + (size_t)s * p3 / 8, b->ink_it[s], (const char *)rad + (size_t)s * NN_RAD_REC(g_Pz), h[6] & 1, h[5], P, da + (size_t)s * p3, async);
+        }
+        return;
+    }
     if (g_gpu_aug != 2 || !b->ct8) { cp(da, ha, (size_t)B * p3); if (db) cp(db, hb, (size_t)B * p3); return; }
     const float *cs, *sn; sample_phase_cssn(&cs, &sn);
     for (int s = 0; s < B; s++) {
@@ -952,7 +973,7 @@ static void head_slab_pass(gpu_state *d, int pass) {
         }
         if (g_lat && g_lat_guide == 64) nn_lat_shuffle_adj((char *)d->hs_lg + (size_t)g_side_ch * ns * 2, D / 4, H / 4, W / 4, 16, 2, z0, nz, d->latgl);
         else if (g_lat && g_lat_guide) LGUIDE(1);   /* the coefficient planes' gradients */
-        if (g_lat) nn_lat_up_adj(d->hs_lg, LUPC, D / 4, H / 4, W / 4, z0, nz, d->latg, d->nt);   /* (scratch: the normal targets, 7 bytes a voxel, are done for this slab) */   /* --lat: the slab's gradient onto the cell grid */
+        if (g_lat) nn_lat_up_adj(d->hs_lg, LUPC, D / 4, H / 4, W / 4, z0, nz, d->latg, d->nt);   /* (scratch: the normal targets, 7 bytes a voxel, are done for this slab; any channel count: groups of 28) */   /* --lat: the slab's gradient onto the cell grid */
         else if (unet_head_bwd_z(d->u, z0, z1, d->hs_lg, z0 == 0)) { fprintf(stderr, "head slabs: the fused head backward is not covered (UFSM_HEAD_SLAB=0)\n"); abort(); }
         if (lchk) {   /* UFSM_LAT_CHECK=1: the separable adjoint against the per-voxel gather (the slab's gradient is still in hs_lg) */
             static float *gc2; const size_t nc = (size_t)LNC * (D / 4) * (H / 4) * (W / 4);   /* (every cell channel: the guided heads have more than the task's) */
@@ -1038,7 +1059,7 @@ static int sync_check(gpu_state *d, int step, const char *what) {
     nn_sync();
     const char *e = nn_check();
     if (!e) return 0;
-    fprintf(stderr, "cuda error at step %d after the %s: %s\n", step, what, e);
+    fprintf(stderr, "cuda error at step %d after the %s: %s at %s\n", step, what, e, nn_check_site());
     window_note(d, g_Sdiag, "  window");
     return 1;
 }
@@ -2188,6 +2209,8 @@ int cmd_train(int argc, char **argv) {
         if (so && atoi(so) > 0) {
             setenv("UFSM_SAMPLER_NOPIN", "1", 1); gpu_input_settle(&sc, 1);
             sc.slot_skip = g_unwrap2 && B == 1 && !g_ds && !ufsm_env_on("UFSM_TM_KEEP") ? 1 | (!pm_used() ? 2 : 0) : 0;
+            sc.ink_bits = g_rv && (!getenv("UFSM_INK_BITS") || ufsm_env_on("UFSM_INK_BITS"));
+            sc.w4_runs = sc.w4_dev && (!getenv("UFSM_W4_RUNS") || ufsm_env_on("UFSM_W4_RUNS"));
             sc.replay = atoi(opt(argc, argv, "--replay", "1")); sc.replay_gap = atoi(opt(argc, argv, "--replay-gap", "0"));
             sampler *sq = sampler_start(S, &sc); if (!sq) { fprintf(stderr, "cannot start the sampler\n"); return 1; }
             const int nb = atoi(so); const double t0 = now(); double tf = 0;
@@ -2862,6 +2885,7 @@ int cmd_train(int argc, char **argv) {
             if (!b) { nval = i; break; }
             void **fb[VAL_NF], **fv[VAL_NF]; size_t sz[VAL_NF];
             const int nf = val_fields(b, B, p3v, fb, sz); val_fields(&val[i], B, p3v, fv, sz);
+            for (int k = 0; k < nf; k++) if (!*fb[k]) { fprintf(stderr, "validation batch: field %d of %d not filled by the sampler\n", k, nf); return 1; }
             for (int k = 0; k < nf; k++) vhash = hash_bytes(vhash, *fb[k], sz[k]);
             for (int k = 0; k < nf; k++)
                 if (vmode == VAL_RAM) { *fv[k] = malloc(sz[k]); memcpy(*fv[k], *fb[k], sz[k]); }
@@ -2922,6 +2946,8 @@ int cmd_train(int argc, char **argv) {
                 "beat more workers: each idle worker holds ~16 P^3 bytes of scratch, a slot %.2f GB)\n", sc.nbuf, workers, 2 * ng + 2,
                 (double)B * g_Pz * P * P * ((size_t)g_xs * xbytes() + (g_pack ? 1 : NCH + 1) + (g_side != 0) + 2 * (g_unwrap2 != 0) + (IPLANE != 0)) / 1e9);
     sc.slot_skip = g_tm_unused ? 1 | (!pm_used() ? 2 : 0) : 0;   /* (after the validation config's copy: its stored batches keep every plane) */
+    sc.w4_runs = sc.w4_dev && (!getenv("UFSM_W4_RUNS") || ufsm_env_on("UFSM_W4_RUNS"));   /* --gpu-aug 3: the winding as runs, no w4 / wcomp slot planes (sampler_start may drop it) */
+    sc.ink_bits = g_rv && (!getenv("UFSM_INK_BITS") || ufsm_env_on("UFSM_INK_BITS"));   /* --rv: the papyrus plane as 1 known bit per voxel + ct8, built on the device (lab_upload); sampler_start may drop it */
     sc.replay_gap = atoi(opt(argc, argv, "--replay-gap", "0"));   /* (0: the slot count) */
     sc.replay = atoi(opt(argc, argv, "--replay", "1"));   /* --replay K: each window trained K times, replays with a new device-side augmentation (sample.h) */
     sampler *sp = sampler_start(S, &sc);
@@ -3150,7 +3176,10 @@ int cmd_train(int argc, char **argv) {
         committed_step = step;
         if (plan) { coverage.cursor = (uint64_t)(step - coverage.base_step); if (cover_checkpoint_extra(runtime_extra, &coverage, checkpoint_extra, sizeof checkpoint_extra)) return 2; }
         const char *e = nn_check();
-        if (e) { fprintf(stderr, "cuda error at step %d: %s\n", step, e); for (int q = 0; q < nl; q++) window_note(&G[q], S, "  window"); return 1; }
+        if (e) { fprintf(stderr, "cuda error at step %d: %s at %s (no checkpoint written)\n", step, e, nn_check_site()); for (int q = 0; q < nl; q++) window_note(&G[q], S, "  window"); return 1; }
+        { static int fault = -2; if (fault == -2) fault = getenv("UFSM_TEST_CUDA_FAULT") ? atoi(getenv("UFSM_TEST_CUDA_FAULT")) : -1;   /* tests: a failed copy
+                                                                                   (a null host source) after step N's check, as a validation pass's upload can fail */
+          if (fault == step) nn_h2d(G[0].x, nullptr, 16); }
         if ((seconds && now() - t0 >= seconds) || (schedule_seconds && schedule_elapsed+now()-t0>=schedule_seconds) ||
             (limit_seconds && now() - t0 >= limit_seconds) || (stop_at && step >= stop_at)) g_stop = 1;
         acc_loss += loss / nl; acc_bce += parts[0][0]; acc_dice += parts[0][g_aff || g_unwrap || g_heads ? NCH : g_half ? g_cout : cfg.cout]; acc_g += gn; nacc++;
