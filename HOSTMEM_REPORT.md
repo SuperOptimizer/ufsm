@@ -338,3 +338,62 @@ Profile now (P512, perf):
 - **Tests:** the CPU fast tier plus the GPU / sampler tests on GPU 1 pass (15/15). With `-g none`, 10 tests that need CUDA but
   have no `gpu` tag fail on master too: test_gpu_input, test_unwrap2_sampler, test_l0_stream, test_gpu_aug, test_fit*,
   test_wtrunk, test_nn.
+
+## Round 3b: ink bits, pinned audit (2026-11-09)
+### --rv ink plane as bits (cf976e8; default on, UFSM_INK_BITS=0 off)
+- A slot holds one known bit per voxel (P^3/8 bytes) plus the per-window cutoff instead of the P^3 papyrus plane.
+- The device builds `known ? (ct8 >= cutoff ? 254 : 0) : 255` on the source grid, then applies the window's cube symmetry
+  (ink_sym_k, = sym_u8) or its warp (lw_ink_k), in nn_ink_bits, called from lab_upload kind 3.
+- sampler_start falls back to the byte plane unless the configuration is --gpu-aug 2 cubes with the rv cutoff and no possible seam.
+- Effect: -0.875 B/vox per slot, all of it pinned. Slots at P512 x6: 4.03 -> 3.33 GB.
+
+Byte-identical, checked four ways:
+- test_gpu_aug's new case: all 48 symmetries plus 8 warps, 4 cutoffs, compared with the host-built plane through sym_u8 /
+  nn_label_warp
+- the sampler's batch hashes, with the plane rebuilt on the host (24 --det windows, also --replay 3)
+- a 20-step --det 1 P384 GPU run: the same losses as UFSM_INK_BITS=0
+
+### Pinned host memory (UFSM_HOSTMEM=1, P384 W3 S5 run, callers resolved with addr2line)
+Per slot, pinned and needed for the async uploads:
+
+| plane | B/vox | note |
+|---|---|---|
+| ct8 | 1 | the CT bytes, also the ink source |
+| side | 1 | the phase |
+| w4 | 1 | winding mod 4 |
+| wcomp | 1 | its component |
+| inkb | 1/8 | the known bits |
+| aug record | ~1 MB per slot | |
+| **total** | **4.125** | 1.87 GB per slot at P768, was 5 |
+
+Per trainer: lbh, the label-stream host planes (train.c:2508), 4 P^3 per GPU (1.8 GB at P768), plus small unet offloads.
+
+The two production trainers (S12 + S10 at P768): 22 slots x 1.87 = 41 GB pinned, was 50.
+
+Findings:
+- Replays reuse their own slot, so nothing is duplicated.
+- Pinned vs pageable makes no RAM difference (both count in the cgroup), so moving slots to pageable memory plus a pinned
+  staging ring would not help.
+- **The next real cut** depends on perf's device band_wind4 (--gpu-aug 3). With side_air 0 and phase_near_um 0 (the defaults),
+  phase_air writes the side plane and the winding input byte-identically. The device can then read pw from the side plane, and
+  slots need no w4 or wcomp: 4.125 -> 2.125 B/vox (-0.9 GB per slot at P768, ~-20 GB for the two trainers).
+  - Catch 1: unwarped symmetry windows would keep the side plane on the source grid, with the symmetry on the device as for ink.
+  - Catch 2: tear / crush windows (their own w4) would need the byte planes or would be refused in that mode.
+  - Proposed to perf.
+- 2.125 B/vox (CT + phase + bits) is the floor without compressing the phase in the slot.
+
+### Profile after round 3 (P512, load ~8)
+- decode 44%: the lossless phase entropy decode 28%, CT 16%
+- band_wind4 + w4_* 22%
+- the elementwise passes ~18%: notair 3.8, phase_air 3.8, memset 3.2, sym_u8 2.8, draw_ 4.9
+
+At low load the passes are cheap (DRAM is not contended); at load ~25 they cost about 2x. The remaining slab fusion is worth a
+few % at most. With --replay K the loader cost per delivered voxel drops by K, which is far larger.
+
+### Tests
+- **test_rv fails on this branch whether ink bits is on or off:** `predict --channel 0` and `--channel 1` give identical volumes
+  with the window sink on or off. My branch does not touch predict.c, so the failure is upstream, from the latcomp predict changes
+  merged in (b1f3677 / 3c6f420 / fcb49fc).
+- Fast CPU tier: 81 passed.
+- GPU tests on GPU 1: test_gpu_aug, test_gpu_input, test_unwrap2_sampler, test_l0_stream, test_wind*, test_pack_tm pass.
+- The 11 CUDA-dependent entries are now tagged gpu (3bafbbd), so with `-g none` they SKIP.
