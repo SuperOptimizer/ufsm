@@ -830,6 +830,8 @@ static void head_slab_pass(gpu_state *d, int pass) {
     /* UFSM_PTICK: the slab phases by pass */
     static const char *const ptn[2][5] = {{"p0 label h2d", "p0 upsample", "p0 targets", "p0 loss stats", ""}, {"p1 label h2d", "p1 upsample", "p1 targets", "p1 loss grads", "p1 adjoint"}};
 #define PT(w) nn_ptick(ptn[pass][!strcmp(w, "label h2d") ? 0 : !strcmp(w, "upsample") ? 1 : !strcmp(w, "targets") ? 2 : !strcmp(w, "losses") ? 3 : 4])
+    static int fine = -1; if (fine < 0) fine = getenv("UFSM_PTICK") && atoi(getenv("UFSM_PTICK")) >= 2;   /* UFSM_PTICK=2: the target / loss kernels one by one (both passes summed) */
+#define FT(w) do { if (fine) nn_ptick(w); } while (0)
     if (!pass) { nn_zero(d->hs_ds, 64 * sizeof(double)); if (g_unwrap2) nn_zero(d->w4ds, nn_wind4_sums()); }
     for (int z0 = 0; z0 < D; z0 += Z) {
         const int z1 = z0 + Z < D ? z0 + Z : D, nz = z1 - z0;
@@ -884,15 +886,17 @@ static void head_slab_pass(gpu_state *d, int pass) {
             nt_ += nb / 2; free(ha); free(hb);
             if (z1 == D) { fprintf(stderr, "lat check: upsampling: %zu of %zu fp16 logits differ (%zu by more than one code), max |difference| %.3g, rms difference / rms %.3g\n", nd, nt_, n1, mx, sqrt(sq / (sr > 0 ? sr : 1))); mx = sq = sr = 0; nd = nt_ = n1 = 0; }
         }
-        PT("upsample");
+        if (g_lat_hs) FT("  u head fwd + upsample"); else PT("upsample");
         if (g_lat_hs && g_lat_guide == 64) nn_lat_shuffle_c(d->lgc, 1, D / 4, H / 4, W / 4, 16, 2, z0, nz, (char *)d->hs_lg + (size_t)g_side_ch * ns * 2, qa, qb - qa);
         else if (g_lat && g_lat_guide == 64) nn_lat_shuffle(d->lg, unet_logits_h16(d->u), D / 4, H / 4, W / 4, 16, 2, z0, nz, (char *)d->hs_lg + (size_t)g_side_ch * ns * 2);   /* the sub-cell head */
         else if (g_lat && g_lat_guide) LGUIDE(0);   /* --lat-guide: the side channels' sub-cell terms from the CT */
+        if (g_lat_hs) { FT("  u guide / shuffle"); PT("upsample"); }
         const shape5 one = {1, 1, nz, H, W}, two = {1, 2, nz, H, W}, seven = {1, 7, nz, H, W};
-        nn_phase_targets(sdb + vb, ns, d->sidet, d->sidem);
+        nn_phase_targets(sdb + vb, ns, d->sidet, d->sidem); FT("  t phase targets");
         if (g_rv) {   /* --rv: the side slot's targets (the phase targets above stay for the winding mod 4 / gradient terms) */
-            nn_rv_targets(sdb + vb, ink + vb, ns, d->inkt, d->inkm);
+            nn_rv_targets(sdb + vb, ink + vb, ns, d->inkt, d->inkm); FT("  t rv targets");
             if (g_packed_w > 1) nn_packed_mask_z(sdb, D, H, W, g_norm_s, d->um, g_packed_um, g_packed_w, d->inkm, z0, z1);   /* packed sheets weigh more */
+            FT("  t packed mask (rv)");
             if (g_rv_vw != 1.f) nn_rv_verso_w(d->inkt, d->inkm, ns, g_rv_vw);
         }
         uint8_t *const st = g_rv ? d->inkt : d->sidet, *const sm = g_rv ? d->inkm : d->sidem;   /* the side slot's targets / mask */
@@ -907,7 +911,8 @@ static void head_slab_pass(gpu_state *d, int pass) {
         }
         if (g_ptrunc_on) nn_phase_trunc(LGC(g_side_ch), LGC(g_side_ch + 1), d->sidet, d->sidem, ns, g_ptrunc_tau, g_ptrunc_kappa);   /* robust phase loss (both passes: the same mask) */
         if (g_packed_w > 1) nn_packed_mask_z(sdb, D, H, W, g_norm_s, d->um, g_packed_um, g_packed_w, d->sidem, z0, z1);   /* packed sheets weigh more */
-        nn_unwrap_targets2_z(sdb, D, H, W, g_norm_s, g_dens_scale, g_dens_code, d->um, g_packed_um, g_packed_w, d->nt, d->nm, z0, z1);
+        FT("  t packed mask (side)");
+        nn_unwrap_targets2_z(sdb, D, H, W, g_norm_s, g_dens_scale, g_dens_code, d->um, g_packed_um, g_packed_w, d->nt, d->nm, z0, z1); FT("  t normal targets");
         if (lchk && !pass) {   /* UFSM_LAT_CHECK=1: how dense the supervision is (slabs with every mask zero could skip their kernels: none in the rv recipe) */
             uint8_t *h = malloc(3 * ns); nn_sync(); nn_d2h(h, d->sidem, ns); nn_d2h(h + ns, sm, ns); nn_d2h(h + 2 * ns, d->nm, ns);
             static size_t nsl, nemp, nvox, nsup[3]; size_t c[3] = {0, 0, 0};
@@ -923,9 +928,10 @@ static void head_slab_pass(gpu_state *d, int pass) {
                 nn_loss_stats_acc(LGC(0), d->t + vb, d->m + vb, d->w, one, d->hs_ds);
                 nn_loss_stats_acc(LGC(1), d->t + l3 + vb, d->pm + vb, d->w + 1, one, d->hs_ds + 5);
             } else nn_wind4_stats(LGC(g_w4_ch), LGC(g_w4_ch + 1), w4 + vb, wc + vb, d->sidem, ns, d->w4ds);
+            FT("  s wind4 stats");
             if (g_ink2) { nn_ink_targets(ink + vb, ns, d->inkt, d->inkm); nn_loss_stats_acc(LGC(g_ink2_ch), d->inkt, d->inkm, d->inkw, one, d->hs_ds + 5); }   /* --ink-head (the recto / ink v1 slots are free) */
-            nn_loss_stats_acc(LGC(g_side_ch), st, sm, d->sidew, two, d->hs_ds + 10);
-            nn_loss_stats_acc(LGC(g_norm_ch), d->nt, d->nm, d->nw, seven, d->hs_ds + 20);
+            nn_loss_stats_acc(LGC(g_side_ch), st, sm, d->sidew, two, d->hs_ds + 10); FT("  s side stats");
+            nn_loss_stats_acc(LGC(g_norm_ch), d->nt, d->nm, d->nw, seven, d->hs_ds + 20); FT("  s normal stats");
             if (g_pg_lambda > 0) nn_pgrad_slab(d->hs_train ? nullptr : LGC(g_side_ch), d->hs_train ? nullptr : LGC(g_side_ch + 1), sdb, d->sidem, D, H, W, z0, z1, g_norm_s, g_pg_dist, g_pg_nd, g_pg_angle, g_pg_mask, d->hs_ds + 56, nullptr);   /* (training: the pair weights only; the loss sum comes from the gradient pass, + 58) */
             PT("losses");
             if (pipe) nn_event_record(d->evl_free[sj & 1], 0);
@@ -936,6 +942,7 @@ static void head_slab_pass(gpu_state *d, int pass) {
             nn_loss_grad_only(LGC(1), d->t + l3 + vb, d->pm + vb, d->w + 1, one, g_ink_dice, LGC(1), d->iscratch);
             if (g_ink_lambda != 1.f) nn_loss_grad_scale(LGC(1), ns, g_ink_lambda);
         } else nn_wind4_grad(LGC(g_w4_ch), LGC(g_w4_ch + 1), w4 + vb, wc + vb, d->sidem, ns, d->w4fin, g_w4_lambda, LGC(g_w4_ch), LGC(g_w4_ch + 1));
+        FT("  g wind4 grad");
         if (g_ink2) {   /* --ink-head: soft BCE over the known ink voxels, times --ink-lambda x the source's "ink_weight" */
             nn_ink_targets(ink + vb, ns, d->inkt, d->inkm);
             nn_loss_grad_only(LGC(g_ink2_ch), d->inkt, d->inkm, d->inkw, one, 0.f, LGC(g_ink2_ch), d->iscratch);
@@ -943,10 +950,10 @@ static void head_slab_pass(gpu_state *d, int pass) {
             if (iw != 1.f) nn_loss_grad_scale(LGC(g_ink2_ch), ns, iw);
         }
         if (g_pg_lambda > 0) nn_pgrad_slab(LGC(g_side_ch), LGC(g_side_ch + 1), sdb, d->sidem, D, H, W, z0, z1, g_norm_s, g_pg_dist, g_pg_nd, g_pg_angle, g_pg_mask, d->hs_ds + 58, d->pg_acc);   /* (before the BCE gradient overwrites the logits; its sums go to + 58: the logged loss of a training step) */
-        nn_loss_grad_only(LGC(g_side_ch), st, sm, d->sidew, two, 0.f, LGC(g_side_ch), d->sscratch);
+        nn_loss_grad_only(LGC(g_side_ch), st, sm, d->sidew, two, 0.f, LGC(g_side_ch), d->sscratch); FT("  g side grad");
         if (g_side_lambda != 1.f) nn_loss_grad_scale(LGC(g_side_ch), 2 * ns, g_side_lambda);
         if (g_pg_lambda > 0) nn_pgrad_apply(LGC(g_side_ch), LGC(g_side_ch + 1), d->pg_acc, ns, d->hs_ds + 56, g_pg_lambda);
-        nn_loss_grad_only(LGC(g_norm_ch), d->nt, d->nm, d->nw, seven, 0.f, LGC(g_norm_ch), d->nscratch);
+        nn_loss_grad_only(LGC(g_norm_ch), d->nt, d->nm, d->nw, seven, 0.f, LGC(g_norm_ch), d->nscratch); FT("  g normal grad");
         if (g_dens_lambda == g_norm_lambda) { if (g_norm_lambda != 1.f) nn_loss_grad_scale(LGC(g_norm_ch), 7 * ns, g_norm_lambda); }
         else {   /* --density-lambda: the 6 normal channels at --normal-lambda, the density channel (+ 6) at its own weight */
             if (g_norm_lambda != 1.f) nn_loss_grad_scale(LGC(g_norm_ch), 6 * ns, g_norm_lambda);
@@ -959,7 +966,8 @@ static void head_slab_pass(gpu_state *d, int pass) {
             const size_t pl = (size_t)(H / 4) * (W / 4); const int f0 = qa, f1 = z1 == D ? D / 4 : z1 / 4 - 1;
             if (z0 == 0) nn_zero(d->latg, (size_t)LGFC * qc * pl * 4);
             if (g_lat_guide == 64) nn_lat_shuffle_adj_c((char *)d->hs_lg + (size_t)g_side_ch * ns * 2, D / 4, H / 4, W / 4, 16, 2, z0, nz, d->latgl, q0, qc);
-            else if (g_lat_guide) LGUIDE(1);   /* the coefficient planes' gradients (the guided heads: every output is interpolated, all through the fp32 sums) */
+            else if (g_lat_guide) LGUIDE(1);
+            FT("  a guide / shuffle adjoint");   /* the coefficient planes' gradients (the guided heads: every output is interpolated, all through the fp32 sums) */
             nn_lat_up_adj_c(d->hs_lg, LUPC, D / 4, H / 4, W / 4, z0, nz, d->latg, d->nt, q0, qc);
             PT("adjoint");
             if (f1 > f0) {
@@ -991,6 +999,7 @@ static void head_slab_pass(gpu_state *d, int pass) {
         if (pipe) nn_event_record(d->evl_free[sj & 1], 0);
 #undef LGC
 #undef PT
+#undef FT
     }
     if (!pass) {
         const shape5 w1 = {1, 1, D, H, W}, w2 = {1, 2, D, H, W}, w7 = {1, 7, D, H, W};
