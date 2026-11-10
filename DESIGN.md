@@ -32,6 +32,50 @@ CT store 0.82 GB per box Gvox (26.8 GB), latent store 0.97 GB per box Gvox (31.8
 of 128-row boxes with 384-voxel windows; in material regions the latent store (0.13 B/vox on disk for the fixture) is not smaller than the
 volcomp CT, so the store is not an IO saving at this level: the gain is the cheaper window input.
 
+## Real device peaks of the latent nets, the planner's task term, the wide stride-2 backward in chunks (2026-11-09, branch perf-20261109)
+
+Measured in a 5-minute window on an empty GPU 1 (16 GB), per-process peak from nvidia-smi, 3 steps each (1 MiB = 1.049e-3 GB; the
+planner prints 1e9-byte GB). rv = 32,64,128,192,256 with lat_guide 5; winding = 96,128,160,192 with lat_guide 64.
+
+| run | real peak | planner then | planner now |
+|---|---|---|---|
+| P 768 resume of g768 (rv, fp8), streamed / stored head | 4.89 / 5.74 GB | 9.61 / 10.48 | 5.49 streamed |
+| P 768 resume of wz768 (winding, fp8), streamed / stored | 8.84 / 13.03 GB | 11.73 / 16.07 | 8.68 streamed |
+| P 896 fp4 streamed, rv / winding | 6.15 / 11.54 GB | 12.82 / 13.35 | 6.13 / 8.53 (chunked kernel, below) |
+| P 960 fp4 streamed, winding | 13.94 GB | 16.15 | 10.12 (chunked) |
+| P 1024 | refused by the planner (18.61 / 19.34) | | 8.55 / 11.92 |
+
+The resumes' losses are equal streamed and stored (wz768 1.1792 1.1791 1.1791; g768 1.2592 1.2590 1.2589). The rv P 960 run made no
+step and logged no error (not explained). P 512 beside the production run: winding 2.46 GB real / 2.67 planned, rv 1.88 / 1.91.
+
+Second window (2026-11-10 00:21 - 00:30, after both fixes below; fp4, streamed head, `--mem auto` picked mode 4 without an
+override every time; one sampler slot and 2 workers to stay under a 20 GB host cap; 3 - 6 steps, same batch):
+
+| run | real peak | planner | rate |
+|---|---|---|---|
+| rv P 960 / 1024 / 1088 / 1152 / 1216 | 7.28 / 8.49 / 9.96 / 11.52 / 13.25 GB | 7.41 / 8.72 / 10.20 / 11.84 / 13.66 | 0.87 / 0.74 / 0.60 / 0.51 / 0.43 samp/s (770 - 795 Mvox/s) |
+| winding P 960 / 1024 / 1088 | 9.99 / 11.75 / 13.83 GB | 10.33 / 12.16 / 14.22 | 0.48 / 0.40 / 0.33 samp/s (425 - 435 Mvox/s) |
+
+The planner is 2 - 3.5% above the real peak over the whole range. The first window's rv P 960 run with 0 steps was the host cap,
+not the device: the kernel log has the cgroup OOM kill at 23:05:17 with 20.0 GB of shared memory (three sampler slots at P 960).
+
+Two planner errors and one kernel:
+
+- The label-stream correction of the task term (the label planes stay on the host: 10 B per window voxel less) never applied: its
+  condition read g_xs == 1, which gpu_input_settle sets after the planner. It now reads the request (g_gpu_want). With it the count
+  ran 3 - 5% under the real peaks (source not found: at rv P 512 the logged allocations plus the context come to 1.86 GB against 1.82 planned and 1.88 real), so the stream
+  branch adds 1 / 14. A run without the label stream after a plan that assumed it prints one line.
+- The wide MX-fp4 stride-2 backward-data (more than 64 channels: no direct tensor-core kernel) went through whole-layer MX-fp8
+  copies: gx (99 B per level-0 voxel at 96 channels), the dilated gy (132) and the accumulate temp (99), kept by the lp_buf slots:
+  5.2 B per window voxel of a 96-wide latent net, 3.7 GB at P 896, in no planner term. It now runs in chunks of fine planes of
+  ~96 MB (lp_set_s2b_cz / UFSM_S2B_CZ; 0 = whole): fine planes [z0, z1) read coarse planes z0 / 2 .. z1 / 2, the chunk computes
+  one plane further and does not store it. Same bytes as the whole-layer call (test_grad_mx4: 96 -> 128 and 128 -> 160, 2 / 4 / 6
+  planes, with and without accumulate: 0 bytes differ); 3-step losses equal; P 512 peak 2658 -> 2346 MiB; step time unchanged
+  (contended). The planner counts 3 chunks.
+
+P 512 uncontended, streamed vs stored head: winding 429.4 vs 409.5 ms (synchronised sums), 3.10 vs 3.23 samp/s free-running; rv
+542.3 vs 529.7 ms, 5.29 vs 5.33 samp/s. The streamed head costs 1 - 5% of the step for 0.2 - 1.1 GB at P 512 (4 GB at P 768).
+
 ## Latent nets with learned cell channels under fp4 activations; the guided heads' adjoint (2026-11-09, branch perf-20261109)
 
 The winding latent net (w768: widths 96,128,160,192, 29 learned cell channels + 3 radial means, `--lat-guide 2`, `--fp8 1`) took
