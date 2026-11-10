@@ -16,12 +16,12 @@ test_papyrus                                   |              |     1 | ./$B/tes
 test_cond                                      |              |     1 | ./$B/test_cond
 test_scanprep                                  |              |     6 | ./$B/test_scanprep
 test_sweep                                     |              |     1 | ./$B/test_sweep
-test_gpu_input                                 |              |    13 | ./$B/test_gpu_input
+test_gpu_input                                 | gpu          |    13 | ./$B/test_gpu_input
 test_pack_tm                                   | gpu          |     1 | ./$B/test_pack_tm
 test_wind4                                     | gpu          |     1 | ./$B/test_wind4
 test_pgrad                                     | gpu          |     1 | ./$B/test_pgrad
 test_gyrec                                     | gpu2         |     1 | ./$B/test_gyrec
-test_unwrap2_sampler                           |              |     9 | ./$B/test_unwrap2_sampler $TMPDIR/unwrap2_fixture
+test_unwrap2_sampler                           | gpu          |     9 | ./$B/test_unwrap2_sampler $TMPDIR/unwrap2_fixture
 test_restore_task                              | gpu          |     7 | ./$B/test_restore_task
 test_phase_interp                              |              |    20 | ./$B/test_phase_interp
 test_spatial_augment                           |              |    60 | UFSM_TEST_QUICK=1 ./$B/test_spatial_augment
@@ -40,16 +40,16 @@ test_gn_frozen                                 | gpu          |     2 | ./$B/tes
 test_l0_norm                                   | gpu          |     3 | ./$B/test_l0_norm
 test_l0_slab                                   | gpu          |     2 | ./$B/test_l0_slab
 test_zwin                                      | gpu          |     2 | ./$B/test_zwin
-test_l0_stream                                 |              |    15 | ./$B/test_l0_stream
-test_l0_stream~L0_STREAM_POISON=1              |              |    16 | UFSM_L0_STREAM_POISON=1 ./$B/test_l0_stream
+test_l0_stream                                 | gpu          |    15 | ./$B/test_l0_stream
+test_l0_stream~L0_STREAM_POISON=1              | gpu          |    16 | UFSM_L0_STREAM_POISON=1 ./$B/test_l0_stream
 test_infer_mem                                 | gpu          |   200 | UFSM_TEST_QUICK=1 ./$B/test_infer_mem
 test_infer_mem~full                            | gpu2,slow    |   287 | ./$B/test_infer_mem
 test_half                                      | gpu          |     1 | ./$B/test_half
 test_unwrap_targets                            | gpu          |     1 | ./$B/test_unwrap_targets
-test_gpu_aug                                   |              |     6 | ./$B/test_gpu_aug
-test_fit                                       |              |   320 | UFSM_TEST_QUICK=1 ./$B/test_fit
-test_fit~full                                  | slow         |  1281 | ./$B/test_fit
-test_fit_join                                  |              |     9 | ./$B/test_fit_join
+test_gpu_aug                                   | gpu          |     6 | ./$B/test_gpu_aug
+test_fit                                       | gpu          |   320 | UFSM_TEST_QUICK=1 ./$B/test_fit
+test_fit~full                                  | slow,gpu     |  1281 | ./$B/test_fit
+test_fit_join                                  | gpu          |     9 | ./$B/test_fit_join
 test_wrap_check                                |              |     1 | ./$B/test_wrap_check
 test_geom_check                                |              |     3 | ./$B/test_geom_check
 test_pairacc                                   |              |     1 | ./$B/test_pairacc
@@ -75,7 +75,7 @@ test_score_par                                 |              |     8 | ./$B/tes
 test_grid_sparse                               | gpu          |     2 | ./$B/test_grid_sparse
 test_density_lambda                            | gpu          |    40 | ./$B/test_density_lambda ./$B/ufsm ./$B/make_wind_fixture
 test_coreline                                  |              |     2 | ./$B/test_coreline
-test_fit_w4                                    |              |    16 | ./$B/test_fit_w4
+test_fit_w4                                    | gpu          |    16 | ./$B/test_fit_w4
 test_repair                                    |              |    90 | UFSM_TEST_QUICK=1 ./$B/test_repair
 test_repair~full                               | slow         |   475 | ./$B/test_repair
 test_afv                                       |              |     1 | ./$B/test_afv
@@ -106,7 +106,7 @@ test_vwt_mv                                    | gpu          |     1 | ./$B/tes
 test_vwt_fast                                  | gpu          |     2 | ./$B/test_vwt_fast
 test_attn_h16                                  | gpu          |     3 | ./$B/test_attn_h16
 test_vwi                                       | gpu          |     1 | ./$B/test_vwi
-test_wtrunk                                    |              |    10 | ./$B/test_wtrunk
+test_wtrunk                                    | gpu          |    10 | ./$B/test_wtrunk
 test_attn_ray                                  |              |    14 | ./$B/test_attn_ray
 test_attn_dfm                                  |              |    26 | ./$B/test_attn_dfm
 test_hybrid_identity                           | gpu          |     6 | ./$B/test_hybrid_identity
@@ -168,7 +168,7 @@ test_unet~FUSED_UP=0,F16=1                     | gpu          |     3 | UFSM_FUS
 test_unet~RECOMPUTE=2,F16=1                    | gpu          |     3 | UFSM_RECOMPUTE=2 UFSM_F16=1 ./$B/test_unet
 test_json                                      |              |     1 | ./$B/test_json
 test_phasepack                                 |              |     3 | ./$B/test_phasepack
-test_nn                                        |              |    15 | ./$B/test_nn
+test_nn                                        | gpu          |    15 | ./$B/test_nn
 test_unet                                      | gpu          |     3 | ./$B/test_unet
 test_unet~SCALE_COND=1                         | gpu          |     3 | UFSM_SCALE_COND=1 ./$B/test_unet
 test_unet~DS=1                                 | gpu          |     4 | UFSM_DS=1 ./$B/test_unet
