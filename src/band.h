@@ -90,5 +90,6 @@ int band_wind4_ref(const uint8_t *phase, int D, int H, int W, int maxstep, size_
 /* the same per tile of tile^3 voxels (tile <= 0: the whole volume), each tile's components (at most maxcomp, <= 15) their own
    gauges, numbered over the tiles up to comp 254 (the loss's limit): a label inconsistency drops only its tile's component */
 int band_wind4_tiled(const uint8_t *phase, int D, int H, int W, int tile, int maxstep, size_t minsize, int maxcomp, uint8_t *w4, uint8_t *comp, band_wind4_stats *st);
+void band_wind4_thread_free(void);   /* the calling thread's cached band_wind4 arrays (call before a worker thread exits) */
 int band_wind4_tiled_mt(const uint8_t *phase, int D, int H, int W, int tile, int maxstep, size_t minsize, int maxcomp, uint8_t *w4, uint8_t *comp, band_wind4_stats *st, int nthreads);   /* the same bytes on nthreads threads */
 int band_wind4_tiled_ref(const uint8_t *phase, int D, int H, int W, int tile, int maxstep, size_t minsize, int maxcomp, uint8_t *w4, uint8_t *comp, band_wind4_stats *st);   /* (band_wind4_ref per tile) */

@@ -409,6 +409,9 @@ int band_wind4_ref(const uint8_t *phase, int D, int H, int W, int maxstep, size_
     free(map); free(u.r); free(u.size); free(u.edges); free(u.conf); free(s.rid[0]); free(s.rid[1]); free(s.jj[0]); free(s.jj[1]);
     return rc ? -1 : ncomp;
 }
+static _Thread_local w4_uf tl_u;   /* (band_wind4: the thread's union-find arrays between calls) */
+static void w4_tl_free(void) { free(tl_u.r); free(tl_u.size); free(tl_u.edges); free(tl_u.conf); memset(&tl_u, 0, sizeof tl_u); }
+void band_wind4_thread_free(void) { w4_tl_free(); }
 static int w4_grow(w4_uf *u, int32_t cur) {
     if ((size_t)cur >= u->cap) {
         u->cap = u->cap ? 2 * u->cap : 4096;
@@ -540,8 +543,10 @@ static int w4_pass1(w4_scan *s, w4_uf *u, const int16_t *map, uint8_t *w4, uint8
 int band_wind4(const uint8_t *phase, int D, int H, int W, int maxstep, size_t minsize, int maxcomp, uint8_t *w4, uint8_t *comp, band_wind4_stats *st) {
     if (maxcomp > 15) maxcomp = 15;
     const size_t pl = (size_t)H * W;
+    /* the union-find arrays stay with the thread between calls (a window's tiles, and windows): grown per tile by doubling and
+       freed after it they were 90% of a P768 trainer's page faults (2026-11-09, perf -e page-faults on production) */
     w4_scan s = {phase, D, H, W, maxstep, {malloc(pl * 4), malloc(pl * 4)}, {malloc(pl), malloc(pl)}};
-    w4_uf u = {0};
+    w4_uf u = tl_u; u.n = 0;
     uint8_t *jx = malloc(3 * (size_t)W);   /* (the joins of a row: x, y, z) */
     int rc = !s.rid[0] || !s.rid[1] || !s.jj[0] || !s.jj[1] || !jx ? -1 : w4_pass0(&s, &u, jx);
     int16_t *map = rc ? nullptr : malloc((u.n ? u.n : 1) * sizeof *map);
@@ -566,7 +571,8 @@ int band_wind4(const uint8_t *phase, int D, int H, int W, int maxstep, size_t mi
         rc = w4_pass1(&s, &u, map, w4, comp, jx);
     }
     if (st) { st->known = known; st->kept = kept; st->dropped_conflict = dropped_conf; st->ncomp = ncomp; st->runs = u.n; }
-    free(map); free(u.r); free(u.size); free(u.edges); free(u.conf); free(s.rid[0]); free(s.rid[1]); free(s.jj[0]); free(s.jj[1]); free(jx);
+    tl_u = u;   /* (kept: r / size / edges / conf of capacity cap) */
+    free(map); free(s.rid[0]); free(s.rid[1]); free(s.jj[0]); free(s.jj[1]); free(jx);
     return rc ? -1 : ncomp;
 }
 /* band_wind4 per tile of tile^3 voxels (the last tiles of an axis smaller), each tile's components their own gauges: a label
@@ -656,6 +662,7 @@ static void *w4_mt_run(void *arg) {
     free(tp); free(tw); free(tc);
     return nullptr;
 }
+static void *w4_mt_helper(void *arg) { w4_mt_run(arg); w4_tl_free(); return nullptr; }   /* (a helper thread's union-find arrays die with it) */
 int band_wind4_tiled_mt(const uint8_t *phase, int D, int H, int W, int tile, int maxstep, size_t minsize, int maxcomp, uint8_t *w4, uint8_t *comp, band_wind4_stats *st, int nthreads) {
     if (nthreads <= 1 || tile <= 0 || (tile >= D && tile >= H && tile >= W)) return band_wind4_tiled(phase, D, H, W, tile, maxstep, minsize, maxcomp, w4, comp, st);
     w4_mt m = {.phase = phase, .D = D, .H = H, .W = W, .tile = tile, .maxstep = maxstep, .maxcomp = maxcomp, .minsize = minsize, .w4 = w4, .comp = comp,
@@ -666,7 +673,7 @@ int band_wind4_tiled_mt(const uint8_t *phase, int D, int H, int W, int tile, int
     int rc = !m.nc || !m.st || !base ? -1 : 0;
     for (int pass = 0; pass < 2 && !rc; pass++) {
         m.pass = pass; m.base = base; atomic_store(&m.next, 0);
-        for (int i = 1; i < nthreads; i++) up[i] = !pthread_create(&th[i], nullptr, w4_mt_run, &m);
+        for (int i = 1; i < nthreads; i++) up[i] = !pthread_create(&th[i], nullptr, w4_mt_helper, &m);
         w4_mt_run(&m);
         for (int i = 1; i < nthreads; i++) if (up[i]) pthread_join(th[i], nullptr);
         if (atomic_load(&m.fail)) rc = -1;

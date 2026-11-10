@@ -486,8 +486,30 @@ static void copy_chunk(const job *jb, const work *w, const uint8_t *chunk) {
         }
 }
 
-static int decode_into(const z3 *z, const uint8_t *enc, size_t n, uint8_t *dec, ZSTD_DCtx *dctx, uint8_t *scratch, int *mask, uint32_t submask, uint8_t *dsink, _Atomic uint32_t *dmask, int lean, uint32_t *hsub) {
+/* the window sink of chunk w (volcomp_fast.h): its voxels decoded straight into the request's output, without the 128^3 chunk buffer
+   and copy_chunk (3-8% of a training loader's CPU). Byte 128^3 volcomp chunks of a plain host read only: not z3_read_sub (its other
+   substreams read 0), a device-sink read, the shared decoded-chunk cache or the GPU decoder (they keep whole chunks).
+   UFSM_Z3_SINK=0 turns it off (A/B). 0: no sink */
+static _Atomic uint64_t g_z3_sunk;
+uint64_t z3_sink_chunks(void) { return atomic_load(&g_z3_sunk); }
+static int make_sink(const job *jb, const work *w, vfx_sink *k) {
+    const z3_meta *m = &jb->z->m;
+    if (!option_on("UFSM_Z3_SINK") || jb->submask || jb->dsink || !jb->out || m->esize != 1 || m->q < 0 || m->chunk[0] != 128 || m->chunk[1] != 128 || m->chunk[2] != 128 || zshm_on() || gpudec_enabled()) return 0;
+    const int64_t c0[3] = {w->sz * m->shard[0] + (int64_t)w->cz * 128, w->sy * m->shard[1] + (int64_t)w->cy * 128, w->sx * m->shard[2] + (int64_t)w->cx * 128};
+    for (int i = 0; i < 3; i++) {   /* (copy_chunk's box: the request, the chunk and the array shape) */
+        const int64_t lo = jb->o[i] > c0[i] ? jb->o[i] : c0[i]; int64_t hi = c0[i] + 128;
+        if (hi > m->shape[i]) hi = m->shape[i];
+        if (hi > jb->o[i] + jb->n[i]) hi = jb->o[i] + jb->n[i];
+        k->b0[i] = (int)(lo - c0[i]); k->b1[i] = hi > lo ? (int)(hi - c0[i]) : k->b0[i];
+    }
+    k->out = jb->out; k->ys = (size_t)jb->n[2]; k->zs = (size_t)jb->n[1] * jb->n[2];
+    k->off = (ptrdiff_t)(((c0[0] - jb->o[0]) * jb->n[1] + (c0[1] - jb->o[1])) * jb->n[2] + (c0[2] - jb->o[2]));
+    return 1;
+}
+static int decode_into(const z3 *z, const uint8_t *enc, size_t n, uint8_t *dec, ZSTD_DCtx *dctx, uint8_t *scratch, int *mask, uint32_t submask, uint8_t *dsink, _Atomic uint32_t *dmask, int lean, uint32_t *hsub,
+                       const vfx_sink *k, int *sunk) {
     *hsub = 0xffffffffu;   /* the substreams dec holds (all but for a lean device-sink read) */
+    *sunk = 0;   /* 1: decoded into the sink k (dec untouched) */
     const z3_meta *m = &z->m;
     size_t cv = (size_t)m->chunk[0] * m->chunk[1] * m->chunk[2];
     if (mask) *mask = 0;
@@ -507,6 +529,22 @@ static int decode_into(const z3 *z, const uint8_t *enc, size_t n, uint8_t *dec, 
         uint32_t mode;
         if (mask && vll_chunk_mode(enc, n, &mode) == VOLCOMP_OK) *mask = mode == VLL_MODE_MASK || mode == VLL_MODE_MASK_LL;
         volcomp_status st;
+        if (k && cv == VOLCOMP_CHUNK_VOXELS && vll_chunk_mode(enc, n, &mode) == VOLCOMP_OK && (mode == VLL_MODE_LOSSY || mode == VLL_MODE_CODED || mode == VLL_MODE_CONST)) {
+            const uint32_t subs = vfx_sink_subs(k);   /* (an error: the reference path below, whose status and bytes then hold) */
+            if (mode == VLL_MODE_CONST) {
+                if (n == VF_HDR_BYTES + 1u) {
+                    for (int zz = k->b0[0]; zz < k->b1[0]; zz++) for (int yy = k->b0[1]; yy < k->b1[1]; yy++)
+                        memset(k->out + (k->off + (ptrdiff_t)((size_t)zz * k->zs + (size_t)yy * k->ys) + k->b0[2]), enc[VF_HDR_BYTES], (size_t)(k->b1[2] - k->b0[2]));
+                    *sunk = 1; atomic_fetch_add(&g_z3_sunk, 1); return 0;
+                }
+            } else if (mode == VLL_MODE_LOSSY) {
+                vf_parsed p; if (vf_parse(enc, n, &p) == VOLCOMP_OK && vfx_decode_subs_sink(&p, subs, k) == VOLCOMP_OK) { *sunk = 1; atomic_fetch_add(&g_z3_sunk, 1); return 0; }
+            } else {
+                vll_parsed lp; st = vll_parse(enc, n, &lp);
+                for (uint32_t s = 0; s < VF_NSUB && st == VOLCOMP_OK; s++) if (subs >> s & 1) st = vllx_decode_sub_sink(&lp, s, k);
+                if (st == VOLCOMP_OK) { *sunk = 1; atomic_fetch_add(&g_z3_sunk, 1); return 0; }
+            }
+        }
         const int sub = submask && submask != 0xffffffffu;
         if (cv == VOLCOMP_CHUNK_VOXELS && vll_chunk_mode(enc, n, &mode) == VOLCOMP_OK && mode == VLL_MODE_LOSSY) {
             /* lossy (CT): the substreams asked for (all for a full read), from the shared cache (zshm.h) or decoded by
@@ -802,8 +840,9 @@ static int run_task(job *jb, int task, uint8_t *fetched, uint8_t *dec, uint8_t *
             work *w = &jb->items[i + j]; char item[16]; snprintf(item, sizeof item, "%d", w->ci);
             const uint8_t *enc = group + (size_t)(w->off - rg->off); size_t n = (size_t)w->len;
             cache_put(z, skey, item, enc, n); atomic_fetch_add(&g_z3_store_reads, 1);
-            int msk; uint32_t hs;
-            if (decode_into(z, enc, n, dec, dctx, scratch, &msk, jb->submask ? jb->submask : auto_submask(jb, w), jb->dsink, &jb->dmask, jb->lean, &hs)) { rc = -1; break; }
+            int msk, sunk; uint32_t hs; vfx_sink k; const int hk = make_sink(jb, w, &k);   /* (mask-mode chunks are not sunk: the mask cache still gets them) */
+            if (decode_into(z, enc, n, dec, dctx, scratch, &msk, jb->submask ? jb->submask : auto_submask(jb, w), jb->dsink, &jb->dmask, jb->lean, &hs, hk ? &k : nullptr, &sunk)) { rc = -1; break; }
+            if (sunk) continue;
             if (msk) mc_put(z, w, dec, cv);
             copy_out(jb, w, dec, hs);
         }
@@ -837,9 +876,11 @@ static int run_task(job *jb, int task, uint8_t *fetched, uint8_t *dec, uint8_t *
         }
         cache_put(z, skey, item, b, n);
     }
-    int msk; uint32_t hs; int rc = decode_into(z, b, n, dec, dctx, scratch, &msk, jb->submask ? jb->submask : auto_submask(jb, w), jb->dsink, &jb->dmask, jb->lean, &hs);
+    int msk, sunk; uint32_t hs; vfx_sink k; const int hk = make_sink(jb, w, &k);
+    int rc = decode_into(z, b, n, dec, dctx, scratch, &msk, jb->submask ? jb->submask : auto_submask(jb, w), jb->dsink, &jb->dmask, jb->lean, &hs, hk ? &k : nullptr, &sunk);
     free(b);
     if (rc) return -1;
+    if (sunk) return 0;
     if (msk && mc_on) mc_put(z, w, dec, cv);
     copy_out(jb, w, dec, hs);
     return 0;

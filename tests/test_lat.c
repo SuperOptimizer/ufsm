@@ -97,6 +97,38 @@ int main(void) {
         }
         free(x); nn_free(d_x);
     }
+    {   /* the general guided head (nn_lat_guide4): forward against a host reference, dir 1 = its adjoint in the coefficient planes */
+        const int D = 12, H = 8, W = 8, base = 3, ng = 2, NC = base + 4 * ng; const size_t hw = (size_t)H * W, fv = (size_t)D * hw;
+        uint16_t *x = malloc(fv * 2); for (size_t k = 0; k < fv; k++) x[k] = f2h(ru());
+        void *d_x = nn_malloc(fv * 2); nn_h2d(d_x, x, fv * 2);
+        static const int Zs[2] = {4, 12};
+        for (int si = 0; si < 2; si++) {
+            const int Z = Zs[si]; double e0 = 0, dot1 = 0, dot2 = 0;
+            for (int z0 = 0; z0 < D; z0 += Z) {
+                const int nz = z0 + Z < D ? Z : D - z0; const size_t ns = (size_t)nz * hw;
+                uint16_t *l = malloc(NC * ns * 2), *o = malloc(NC * ns * 2), *g = malloc(NC * ns * 2), *bg = malloc(NC * ns * 2);
+                for (size_t k = 0; k < NC * ns; k++) { l[k] = f2h(ru()); g[k] = f2h(ru()); }
+                void *d_l = nn_malloc(NC * ns * 2), *d_g = nn_malloc(NC * ns * 2);
+                nn_h2d(d_l, l, NC * ns * 2); nn_lat_guide4(d_x, D, H, W, z0, nz, d_l, base, 1, ng, 0); nn_d2h(o, d_l, NC * ns * 2);
+                nn_h2d(d_g, g, NC * ns * 2); nn_lat_guide4(d_x, D, H, W, z0, nz, d_g, base, 1, ng, 1); nn_d2h(bg, d_g, NC * ns * 2);
+                for (size_t i = 0; i < ns; i++) {
+                    const int z = z0 + (int)(i / hw), y = (int)(i / W % H), xx = (int)(i % W); const size_t v = (size_t)z * hw + (size_t)y * W + xx;
+                    const float f[4] = {h2f(x[v]), 0.5f * (h2f(x[v + (z + 1 < D ? hw : 0)]) - h2f(x[v - (z > 0 ? hw : 0)])),
+                                        0.5f * (h2f(x[v + (y + 1 < H ? W : 0)]) - h2f(x[v - (y > 0 ? W : 0)])), 0.5f * (h2f(x[v + (xx + 1 < W ? 1 : 0)]) - h2f(x[v - (xx > 0 ? 1 : 0)]))};
+                    for (int j = 0; j < ng; j++) {
+                        float t = 0.f;
+                        for (int k = 0; k < 4; k++) { t += h2f(l[(base + 4 * j + k) * ns + i]) * f[k]; dot2 += (double)h2f(l[(base + 4 * j + k) * ns + i]) * h2f(bg[(base + 4 * j + k) * ns + i]); }
+                        const float s = h2f(l[(1 + j) * ns + i]) + t;
+                        e0 = fmax(e0, fabs(h2f(o[(1 + j) * ns + i]) - s) / (1e-2 + fabs(s))); dot1 += (double)t * h2f(g[(1 + j) * ns + i]);
+                    }
+                }
+                free(l); free(o); free(g); free(bg); nn_free(d_l); nn_free(d_g);
+            }
+            const double de = fabs(dot1 - dot2) / (1e-9 + fabs(dot1)); cases++;
+            if (!(e0 < 3e-3) || !(de < 2e-3)) { fprintf(stderr, "FAIL: guided head (general), slab %d: forward rel err %.3g, adjoint dot rel err %.3g\n", Z, e0, de); fails++; }
+        }
+        free(x); nn_free(d_x);
+    }
     /* predict: the direct cell-grid input (nn_lat_pred_input) against nn_pred_input_d + nn_lowres_input, and the direct rv bytes
        (nn_lat_place_rv) against nn_lowres_output + nn_rv_fuse + nn_pred_place_d, shards at aligned and odd offsets, uint8 CT and mask bits */
     for (int f16 = 1; f16 >= 0; f16--) {

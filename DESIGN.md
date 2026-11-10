@@ -7,6 +7,21 @@ No teacher models, no distillation. All upstream data is re-exported once into t
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
 ## Latent-grid training and inference speed (2026-11-09, branch perf-20261109)
+
+**Update (evening): after merging latcomp (lat basis, --latents, guided heads, fit fields from latent nets).** The predict fast
+paths by checkpoint kind, each compared with the latcomp binary (6-step checkpoints, box 256 x 768 x 768, window 384, halo 64):
+- plain and `--lat-basis` rv: direct input (`nn_lat_pred_input`, basis: `nn_lat_pred_input_c` = the projections of the cell's 64
+  z-scored bytes, fp16 storage only) and direct rv bytes (`nn_lat_place_rv`): 351 / 371 of 151 M bytes differ, all by 1.
+- guided head (`lat_guide` 5), with or without basis: `nn_lat_place_rvg` upsamples the 2 side logits and 5 coefficient planes per
+  voxel and takes the CT terms from a byte copy of the window (the forward overwrites the shared one; 1 B per voxel), with the fp16
+  roundings of the slab path: 0 bytes differ. No 4-channel full-resolution input, no [2][W^3] fp16 logits.
+- `--latents`, `lat_guide` 8 rv, fit fields with `--fit-ct` / `--tta` / without `--no-out 1`: the latcomp path unchanged.
+- `--fit-zarr --no-out 1` from a latent net (`fzs` in predict.c; `UFSM_PRED_FIT_SLAB=0` off): the heads are upsampled (and guided,
+  `lat_guide` 8: x for the slab from the bytes, `nn_lat_ct_x`) only over the planes of each z chunk of field cells, the accumulators
+  run on the slab as a window of its own (z offset, mask pointer offset; the winding planes in a 2-channel slab with their +-d
+  neighbours). Chunks are capped at 768 MB of head planes. All 141 field files byte-identical to latcomp's for a phase, a
+  basis + guide-2 and a guide-2 checkpoint. A 640 window (guide 2, 19 planes) took 2.9 GB of the device beside an 11 GB trainer;
+  the whole-window buffer alone was 10 GB.
 Numbers: one RTX 5060 Ti 16 GB, `train --lat 4 --task unwrap2 --rv 1` (widths 32,64,128,192,256, 11 output channels), P 768, one batch
 repeated (`UFSM_BENCH_SAME=1`), phases timed with `UFSM_PTICK=1` (nn_ptick: device synchronised after every phase). PERF_REPORT.md
 has the full tables and what was measured on a busy GPU.

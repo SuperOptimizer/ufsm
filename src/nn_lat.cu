@@ -144,6 +144,28 @@ __global__ void lat_guide_k(const f16 *x, int D, int H, int W, int z0, int nz, f
         b[2 * ns] = __float2half_rn(gd * f[1]); b[3 * ns] = __float2half_rn(gd * f[2]); b[4 * ns] = __float2half_rn(gd * f[3]);
     }
 }
+/* the general form (unet_cfg.lat_guide 8; the head has 32 outputs, the coefficient planes are its last 4 ng): each guided channel j
+   has its own 4 coefficients, l_j += b_j0 x + b_j(1..3) . grad x (the phase channels of the winding nets have no face antisymmetry).
+   dir 1 also zeroes nothing: the caller zeroes the unused planes. */
+__global__ void lat_guide4_k(const f16 *x, int D, int H, int W, int z0, int nz, f16 *lg, int base, int c0, int ng, int dir) {
+    const size_t hw = (size_t)H * W, ns = (size_t)nz * hw, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= ns) return;
+    const int z = z0 + (int)(i / hw), y = (int)(i / W % H), xx = (int)(i % W);
+    const size_t v = (size_t)z * hw + (size_t)y * W + xx;
+    const float f[4] = {__half2float(x[v]),
+                        0.5f * (__half2float(x[v + (z + 1 < D ? hw : 0)]) - __half2float(x[v - (z > 0 ? hw : 0)])),
+                        0.5f * (__half2float(x[v + (y + 1 < H ? W : 0)]) - __half2float(x[v - (y > 0 ? W : 0)])),
+                        0.5f * (__half2float(x[v + (xx + 1 < W ? 1 : 0)]) - __half2float(x[v - (xx > 0 ? 1 : 0)]))};
+    for (int j = 0; j < ng; j++) {
+        f16 *b = lg + (size_t)(base + 4 * j) * ns + i, *l = lg + (size_t)(c0 + j) * ns + i;
+        if (!dir) { float s = __half2float(*l); for (int k = 0; k < 4; k++) s += __half2float(b[(size_t)k * ns]) * f[k]; *l = __float2half_rn(s); }
+        else { const float g = __half2float(*l); for (int k = 0; k < 4; k++) b[(size_t)k * ns] = __float2half_rn(g * f[k]); }
+    }
+}
+extern "C" void nn_lat_guide4(const void *x, int D, int H, int W, int z0, int nz, void *lg, int base, int c0, int ng, int dir) {
+    const size_t ns = (size_t)nz * H * W;
+    lat_guide4_k<<<nblk(ns, 256), 256>>>((const f16 *)x, D, H, W, z0, nz, (f16 *)lg, base, c0, ng, dir); KCHECK();
+}
 extern "C" void nn_lat_guide(const void *x, int D, int H, int W, int z0, int nz, void *lg, int base, int c0, int dir) {
     const size_t ns = (size_t)nz * H * W;
     lat_guide_k<<<nblk(ns, 256), 256>>>((const f16 *)x, D, H, W, z0, nz, (f16 *)lg, base, c0, dir); KCHECK();
@@ -382,6 +404,16 @@ __global__ void lat_place_rvg_k(const T *lg, int nb, int d, int h, int w, const 
         }
     }
 #undef XH
+}
+/* planes z0 .. z0 + nz of a window's z-scored CT channel as the 16-bit input stores it (pred_in_k), from its bytes: the guided head's
+   x for one slab (predict --fit-zarr in z chunks) */
+__global__ void lat_ct_x_k(const uint8_t *ct, size_t n, float mean, float isd, f16 *x) {
+    const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i < n) x[i] = __float2half(((float)ct[i] - mean) * isd);
+}
+extern "C" void nn_lat_ct_x(const uint8_t *ct, int W, int z0, int nz, float mean, float isd, void *x) {
+    const size_t hw = (size_t)W * W, n = (size_t)nz * hw;
+    lat_ct_x_k<<<nblk(n, 256), 256>>>(ct + (size_t)z0 * hw, n, mean, isd, (f16 *)x); KCHECK();
 }
 extern "C" void nn_lat_place_rvg(const void *lg, int lh16, int nb, int d, int h, int w, const uint8_t *ctg, float mean, float isd, const uint8_t *ct, const uint32_t *bits,
                                  int iso, int hz, int halo, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh) {
