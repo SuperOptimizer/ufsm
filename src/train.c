@@ -508,12 +508,16 @@ static void lab_upload(int kind, const batch *b, uint8_t *da, uint8_t *db, const
 static void lab_stream(gpu_state *d, const batch *b, int i, const void *rad, int B, int P, int async) {
     const size_t p3 = (size_t)g_Pz * P * P; uint8_t *s = (uint8_t *)d->xb[i];
     void (*dh)(void *, const void *, size_t) = async ? nn_d2h_copy_stream : nn_d2h;
+    nn_aug_stage_reset();
     /* experiment UFSM_LAB_QBITS=n (4 / 6): the training batches' phase and winding planes at 2^n levels (asynchronous uploads only: validation
        uploads synchronously and keeps its bytes), to measure what a narrower device plane would cost; UFSM_LAB_QPLANES: 1 phase, 2 winding, 3 both */
     static int qb = -1, qp = 3; if (qb < 0) { qb = getenv("UFSM_LAB_QBITS") ? atoi(getenv("UFSM_LAB_QBITS")) : 0; if (getenv("UFSM_LAB_QPLANES")) qp = atoi(getenv("UFSM_LAB_QPLANES")); }
 #define LKEEP(k, src) do { if (qb > 0 && qb < 8 && async && (k) < 2 && (qp >> (k) & 1)) nn_lab_quant(1, (src), p3, qb); if (d->ldev[k]) nn_lab_pack(async ? 1 : 0, (src), d->ldev[k], p3, d->ldbits[k]); else dh(d->lbh[k], (src), p3); } while (0)   /* to the device plane (packed), or back to the host */
-    if (g_side) { lab_upload(1, b, s, nullptr, b->side, nullptr, rad, B, P, async); nn_ptick_fine("    x side build"); LKEEP(0, s); nn_ptick_fine("    x side d2h"); }
-    if (g_unwrap2) { lab_upload(2, b, s, s + p3, b->w4, b->wcomp, rad, B, P, async); nn_ptick_fine("    x w4 build"); LKEEP(1, s); LKEEP(2, s + p3); nn_ptick_fine("    x w4 d2h (2 planes)"); }
+    /* a plane kept on the device as bytes is built in place (no scratch copy); LDIR: its destination */
+#define LDIR(k, src) (d->ldev[k] && d->ldbits[k] == 8 && B == 1 && !(qb > 0 && qb < 8 && async && (k) < 2 && (qp >> (k) & 1)) ? d->ldev[k] : (src))
+    if (g_side) { uint8_t *t0 = LDIR(0, s); lab_upload(1, b, t0, nullptr, b->side, nullptr, rad, B, P, async); nn_ptick_fine("    x side build"); if (t0 == s) LKEEP(0, s); nn_ptick_fine("    x side d2h"); }
+    if (g_unwrap2) { uint8_t *t1 = LDIR(1, s), *t2 = LDIR(2, s + p3); lab_upload(2, b, t1, t2, b->w4, b->wcomp, rad, B, P, async); nn_ptick_fine("    x w4 build"); if (t1 == s) LKEEP(1, s); if (t2 == s + p3) LKEEP(2, s + p3); nn_ptick_fine("    x w4 d2h (2 planes)"); }
+#undef LDIR
     if (IPLANE) { lab_upload(3, b, s, nullptr, b->ink, nullptr, rad, B, P, async); nn_ptick_fine("    x ink build"); LKEEP(3, s); nn_ptick_fine("    x ink d2h"); }
 #undef LKEEP
 }
@@ -563,6 +567,7 @@ static void dump_win(const batch *b, int B, int P) {
 }
 static void upload(gpu_state *d, const batch *b, int B, int P) {
     dump_win(b, B, P);
+    nn_aug_stage_reset();   /* (the label / CT staging buffer holds nothing of this batch yet; the sampler reuses its host planes) */
     if (d->upsplit || d->hsplit) nn_event_sync(d->ev_up[d->cur]);   /* (an asynchronous head / tail into the same buffer may still be in flight) */
     d->sheet=b->sheet?b->sheet[0]:nullptr;
     d->um = d->umb[d->cur] = b->um ? b->um[0] : 0.f;
@@ -599,6 +604,7 @@ static void upload(gpu_state *d, const batch *b, int B, int P) {
 }
 /* asynchronous upload of a pinned sampler batch into buffer i on the copy stream, after the compute that last used it */
 static void upload_async(gpu_state *d, const batch *b, int i, int B, int P) {
+    nn_aug_stage_reset();
     d->sheet=b->sheet?b->sheet[0]:nullptr;
     d->umb[i] = b->um ? b->um[0] : 0.f;
     if (b->corner && b->level) { memcpy(d->cornb[i], b->corner[0], sizeof d->cornb[0]); d->lvlb[i] = b->level[0]; }
@@ -659,6 +665,7 @@ static void upload_async(gpu_state *d, const batch *b, int i, int B, int P) {
 static void upload_tail(gpu_state *d, int B, int P) {
     const batch *b = d->tail_due;
     if (!b) return;
+    nn_aug_stage_reset();
     const int i = d->cur;   /* (lean: both buffer indices alias) */
     const size_t p3 = (size_t)g_Pz * P * P;
     nn_stream_wait(1, d->ev_done[i]); nn_stream_wait(1, d->ev_done[i ^ 1]);

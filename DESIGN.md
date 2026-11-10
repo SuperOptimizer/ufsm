@@ -58,6 +58,21 @@ next batch's upload ran during the step and overwrote them while the head passes
 two batches' labels (`--det 1`: 13 outcomes in 14 runs, from step 4, losses 2.0810 against 2.0562). The upload now waits for the step,
 as under lean; 10 of 10 runs agree and equal a run with device planes. Lean runs never overlapped.
 
+**The label builds of the batch upload (2026-11-10).** With the planes kept on the device the builds were the largest upload item
+(P1024: phase 265-275, winding 320-340, papyrus 120-150 ms). Four changes, all with the same bytes:
+(1) the warp kernels' phase code took a double-precision `atan2` per voxel (double runs at 1 / 64 of the single rate on these
+cards): the single-precision one now decides wherever its value is more than 2e-3 from a rounding boundary, the double one only
+there (1 voxel in 250); voxel indices are split with 32-bit divisions. (2) `--gpu-aug 3` uploaded the source-grid phase twice (phase,
+then the winding rebuilt from it) and the CT bytes twice (papyrus bits, then the CT channel): the staging buffer now remembers
+which host plane it holds (`aug_dev.key`, reset per batch by `nn_aug_stage_reset`), and the papyrus kernels read the CT bytes and
+the known bits directly instead of writing the plane over the staged bytes first. (3) Planes kept as bytes are built in place
+instead of in the input buffer and copied. Tests: fast against reference kernels (`nn_label_warp_ref`) byte for byte;
+`nn_w4runs_label` (untested before) against the host-rebuilt planes, alone and from the staged phase; the CT channel after
+`nn_ink_bits` equal to the one on its own. rv guided P512, `--gpu-aug 3`, GPU 1 shared with a P896 training run (contended, every
+profiler sync point costs a time slice): label builds + copies 87 -> 45 ms per step, CT upload 29 -> 23 ms; real loader 1.845 ->
+1.905 samp/s; 20-step loss identical (2.4004), `UFSM_LAT_STREAM=check` 0 bytes differ, host-stream path and the winding
+head equal too. Not measured at P1024 (no quiet card); by voxel count the saving there is ~350 ms of a ~2.3 s step.
+
 **A weight gradient that changed when other processes shared the card (fixed).** `test_lat_head~FP8` failed in ~1 run in 10 when
 three copies ran on one GPU and never alone (0 of 55): one conv's weight gradient off by 1e-4..5e-3, everything else equal to 5e-8.
 `UFSM_WG_TRACE=1` (hashes of what `lp_bwd_w_f8` reads, a random projection of what it adds) caught calls with byte-identical

@@ -107,13 +107,25 @@ int main(int argc, char **argv) {
             CHECK((h[6] & 1) == warped, "ink bits case %d: the record's warp flag", q);
             nn_ink_bits(c8, bits, it, rad_d, h[6] & 1, h[5], P, dd, 0); nn_d2h(got, dd, p3);
             if (memcmp(ref, got, p3)) nbad++;
+            nn_label_warp_ref(1); nn_ink_bits(c8, bits, it, rad_d, h[6] & 1, h[5], P, dd, 0); nn_label_warp_ref(0); nn_d2h(got, dd, p3);   /* (the plane written first) */
+            if (memcmp(ref, got, p3)) nbad++;
+            if (q % 8 == 0) {   /* the CT bytes stay staged: nn_aug_ct right after it (no second upload) writes the same channel as on its own */
+                scan_ct_rec *rc = nn_host_alloc(sizeof *rc); memset(rc, 0, sizeof *rc); rc->xfmt = 1;
+                void *hd = nn_malloc(2 * p3); uint16_t *h0 = malloc(2 * p3), *h1 = malloc(2 * p3);
+                nn_aug_stage_reset(); nn_aug_ct(c8, rc, rad_d, P, hd, 0); nn_d2h(h0, hd, 2 * p3);
+                nn_aug_stage_reset(); nn_ink_bits(c8, bits, it, rad_d, h[6] & 1, h[5], P, dd, 0); nn_aug_last_bytes(got, P);
+                CHECK(!memcmp(got, c8, p3), "ink bits case %d: the staged CT bytes changed", q);
+                nn_aug_ct(c8, rc, rad_d, P, hd, 0); nn_d2h(h1, hd, 2 * p3);
+                CHECK(!memcmp(h0, h1, 2 * p3), "ink bits case %d: the CT channel from the bytes staged by nn_ink_bits differs", q);
+                nn_aug_stage_reset(); nn_free(hd); free(h0); free(h1); nn_host_free(rc);
+            }
             ncs++;
         }
         CHECK(!nbad, "ink bits: %d of %d cases differ from the host-built plane", nbad, ncs);
         printf("gpu_aug: ink bits = host-built plane (symmetry / warp), %d cases\n", ncs);
         nn_host_free(c8); nn_host_free(bits); nn_host_free(inkh); free(ref); free(got); nn_free(dd);
     }
-    int e2e_n = 0, e2e_scan = 0, e2e_warp = 0; double e2e_worst = 0; size_t e2e_lbad[5] = {0};
+    int e2e_n = 0, e2e_scan = 0, e2e_warp = 0, e2e_runs = 0; size_t e2e_rknown = 0, e2e_fknown = 0; double e2e_worst = 0; size_t e2e_lbad[5] = {0};
     {   /* end to end: the --task unwrap2 sampler with --gpu-aug 0 and 1 (same seed, deterministic): phase / winding / packed targets / radial
            records byte for byte; the device's CT channel from ct8 + aug against the CPU's x16 within the two jitter noises */
         enum { PW = 64, NB = 16 }; const size_t q3 = (size_t)PW * PW * PW;
@@ -167,6 +179,45 @@ int main(int argc, char **argv) {
                 nn_label_warp(2, c82[i] + q3, c82[i] + 2 * q3, rd, PW, dl + q3, dl + 2 * q3, cs, sn, 0);
                 nn_label_warp(0, c82[i] + 3 * q3, nullptr, rd, PW, dl + 3 * q3, dl + 4 * q3, cs, sn, 0);   /* (with the pmask plane) */
                 nn_d2h(gl, dl, 5 * q3);
+                {   /* the kernels as used (single-precision atan2 away from the rounding boundaries) against the reference ones: the same bytes */
+                    uint8_t *gr = malloc(3 * q3);
+                    nn_label_warp_ref(1);
+                    nn_label_warp(1, c82[i], nullptr, rd, PW, dl, nullptr, cs, sn, 0);
+                    nn_label_warp(2, c82[i] + q3, c82[i] + 2 * q3, rd, PW, dl + q3, dl + 2 * q3, cs, sn, 0);
+                    nn_label_warp_ref(0); nn_d2h(gr, dl, 3 * q3);
+                    size_t nd = 0, kn = 0; for (size_t k = 0; k < 3 * q3; k++) { nd += gr[k] != gl[k]; kn += k < 2 * q3 && gr[k] < 252; }
+                    CHECK(!nd, "window %d: the fast label warp differs from the reference kernels at %zu bytes (%zu known codes)", i, nd, kn);
+                    e2e_fknown += kn;
+                    free(gr);
+                }
+                {   /* --gpu-aug 3 runs slots (nn_w4runs_label): the winding rebuilt on the device from the source-grid phase and its runs,
+                       then warped / through a symmetry, against the host-rebuilt planes through nn_label_warp / nn_label_sym; on its own and
+                       with the phase plane left staged by the phase's own call */
+                    w4runs ru = {0}; uint8_t *wh = nn_host_alloc(2 * q3), *g0 = malloc(2 * q3), *g1 = malloc(2 * q3);
+                    const int nc = band_wind4_runs(c82[i], PW, PW, PW, 0, 80, 512, 15, &ru, nullptr);
+                    if (nc >= 0 && ru.noff) {
+                        w4runs_apply_host(c82[i], PW, PW, PW, ru.tile, ru.ms, &ru, wh, wh + q3);
+                        for (int wv = 0; wv < 2; wv++) {
+                            const int code = wv ? hh[5] : (1 | 0 << 2 | 2 << 4 | 1 << 9);   /* (unwarped: a transposition and a flip) */
+                            nn_aug_stage_reset();
+                            if (wv) { nn_label_warp_ref(1); nn_label_warp(2, wh, wh + q3, rd, PW, dl, dl + q3, cs, sn, 0); nn_label_warp_ref(0); }
+                            else { nn_label_sym(wh, code, PW, dl, 0); nn_label_sym(wh + q3, code, PW, dl + q3, 0); }
+                            nn_d2h(g0, dl, 2 * q3);
+                            nn_aug_stage_reset(); nn_w4runs_label(c82[i], &ru, rd, wv, code, PW, dl, dl + q3, cs, sn, 0); nn_d2h(g1, dl, 2 * q3);
+                            size_t nd = 0, kn = 0; for (size_t k = 0; k < 2 * q3; k++) { nd += g0[k] != g1[k]; kn += g0[k] != 255; }
+                            CHECK(!nd, "window %d: nn_w4runs_label (%s) differs from the host-rebuilt planes at %zu bytes (%zu known)", i, wv ? "warp" : "symmetry", nd, kn);
+                            e2e_rknown += kn;
+                            nn_aug_stage_reset();
+                            if (wv) nn_label_warp(1, c82[i], nullptr, rd, PW, dl + 2 * q3, nullptr, cs, sn, 0); else nn_label_sym(c82[i], code, PW, dl + 2 * q3, 0);
+                            nn_w4runs_label(c82[i], &ru, rd, wv, code, PW, dl, dl + q3, cs, sn, 0); nn_d2h(g1, dl, 2 * q3);
+                            CHECK(!memcmp(g0, g1, 2 * q3), "window %d: nn_w4runs_label (%s) from the staged phase plane differs", i, wv ? "warp" : "symmetry");
+                            e2e_runs++;
+                        }
+                        nn_aug_stage_reset(); nn_label_warp(1, c82[i], nullptr, rd, PW, dl, nullptr, cs, sn, 0);   /* (dl's phase plane again, for the checks below) */
+                        nn_label_warp(2, c82[i] + q3, c82[i] + 2 * q3, rd, PW, dl + q3, dl + 2 * q3, cs, sn, 0);
+                    }
+                    free(ru.off); free(ru.ro); free(ru.cb); nn_host_free(wh); free(g0); free(g1);
+                }
                 size_t bad[5] = {0};
                 for (int pl = 0; pl < 5; pl++) for (size_t k = 0; k < q3; k++) bad[pl] += gl[pl * q3 + k] != lab[0][i][pl * q3 + k];
                 for (int pl = 0; pl < 5; pl++) if (bad[pl] > e2e_lbad[pl]) e2e_lbad[pl] = bad[pl];
@@ -222,6 +273,9 @@ int main(int argc, char **argv) {
         nn_free(rd); nn_free(hd); free(hg);
         CHECK(cn_n > 0, "no window with scanner ops for the chunked correlated-noise check"); printf("test_gpu_aug: chunked correlated noise and line-kernel separable operators byte-identical to the per-plane / shared-memory kernels on %d windows (chunks default, 1, 5, %d planes)\n", cn_n, PW);
         CHECK(e2e_scan > 0 && e2e_scan < e2e_n && e2e_warp > 0, "the windows cover scanner ops on / off and warps (%d / %d scan, %d warped)", e2e_scan, e2e_n, e2e_warp);
+        CHECK(e2e_fknown > q3 / 4, "the fast label warp saw only %zu known codes", e2e_fknown);
+        CHECK(e2e_runs > 0 && e2e_rknown > 0, "no window with winding runs for nn_w4runs_label (%d cases, %zu known bytes)", e2e_runs, e2e_rknown);
+        printf("test_gpu_aug: label warps with the single-precision atan2 = the reference kernels (%zu known codes); nn_w4runs_label = the host-rebuilt planes, %d cases (%zu known bytes), also from the staged phase plane\n", e2e_fknown, e2e_runs, e2e_rknown);
         char rm[1500]; snprintf(rm, sizeof rm, "rm -rf %s", dir); if (system(rm)) {}
     }
     {   /* train --lat: label planes kept on the device (nn_lab_pack / nn_lab_unpack): bytes; codes 0..14 / 255 in 4 bits; the papyrus classes in 2 */
