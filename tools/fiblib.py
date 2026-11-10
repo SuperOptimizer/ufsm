@@ -48,7 +48,7 @@ def runs_in_box(db, mp, box, step=1.0, min_len=2.0):
 
 wrap = lambda v: v - np.floor(v + 0.5)
 
-def phase_stats(runs, ph, box, D=(16, 32, 64, 128, 256), hyst=0.75, S=1):
+def phase_stats(runs, ph, box, D=(16, 32, 64, 128, 256), hyst=0.75, S=1, sampler=None):
     """Fibre runs against a band-phase raster box (uint8, 0..251 = turn x 252, 255 unknown). Per family f (0 H, 1 V, 2 ?):
     arc[f] labelled arc (level voxels), sw[f] sheet switches with hysteresis (after a 9-sample median; a there-and-back excursion counts 2),
     net[f] persistent switches (|round(end - start)| of each labelled stretch, medians of 8 samples), pair[f][di] = n, |dphi| < 0.25, < 0.5."""
@@ -59,7 +59,10 @@ def phase_stats(runs, ph, box, D=(16, 32, 64, 128, 256), hyst=0.75, S=1):
         q = np.rint(r - [bz, by, bx]).astype(np.int64)
         inb = np.all((q >= 0) & (q < np.array([nz, ny, nx])), axis=1)
         if S > 1: q = q // S   # ph holds one value per S^3 voxels (fit-phase-box --step S)
-        v = np.full(len(r), 255, np.uint8); v[inb] = ph[q[inb, 0], q[inb, 1], q[inb, 2]]
+        v = np.full(len(r), 255, np.uint8)
+        if sampler is not None:   # sampler(points (n, 3) global level zyx) -> uint8 phase (255 unknown), e.g. wrap_phase below
+            if inb.any(): v[inb] = sampler(r[inb])
+        else: v[inb] = ph[q[inb, 0], q[inb, 1], q[inb, 2]]
         ok = v <= 251; out["pts"] += int(inb.sum()); out["lab"] += int(ok.sum())
         if ok.sum() < 16: continue
         phi = v / 252.0; edges = np.flatnonzero(np.diff(np.concatenate([[0], ok.astype(np.int8), [0]]))); fs = 0; used = False
@@ -111,3 +114,19 @@ def offset_clusters(gt_codes, our_codes, our_phase, R=4, nmax=200000, seed=1):
         res = (len(k), p.max(), float(np.sum(p * p)), abs(z), sgn)
         if best is None or res[2] > best[2]: best = res
     return best
+
+def wrap_phase(trees, pts, R=40.0):
+    """Band phase (pair rule) of points between the two nearest wrap sheets, from wrap vertices (ufsm wrap-dump). trees = ((tree, q) of the
+    even-id wraps, (tree, q) of the odd-id wraps): cKDTrees of the vertices (zyx) and their along-spiral coordinate q = -id + column / width
+    (continuous along the spiral: the end of wrap k + 1 joins the start of wrap k; radially adjacent sheets differ by about 1 and, away
+    from the theta cut, in id parity). The nearer of the two parities' nearest vertices is sheet 1 (d1, q1), the other sheet 2 when
+    0.5 <= |q2 - q1| < 1.5: phase = frac(sign(q2 - q1) d1 / (d1 + d2)); 255 otherwise (no second sheet within R, or the cut)."""
+    (ta, qa), (tb, qb) = trees
+    da, ia = ta.query(pts, k=1, distance_upper_bound=R); db_, ib = tb.query(pts, k=1, distance_upper_bound=R)
+    ok = np.isfinite(da) & np.isfinite(db_); ia = np.where(ok, ia, 0); ib = np.where(ok, ib, 0)
+    a1 = da <= db_; d1 = np.where(a1, da, db_); d2 = np.where(a1, db_, da); q1 = np.where(a1, qa[ia], qb[ib]); q2 = np.where(a1, qb[ib], qa[ia])
+    dq = q2 - q1; ok &= (np.abs(dq) >= 0.5) & (np.abs(dq) < 1.5)
+    out = np.full(len(pts), 255, np.uint8)
+    with np.errstate(invalid="ignore", divide="ignore"): ph = np.sign(dq) * d1 / (d1 + d2)
+    ph = ph - np.floor(ph); out[ok] = np.minimum(251, np.floor(ph[ok] * 252)).astype(np.uint8)
+    return out

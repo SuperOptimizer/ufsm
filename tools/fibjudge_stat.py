@@ -10,10 +10,10 @@ for p in sys.argv[1:]:
         rows.append(dict(zip(hdr, c)))
 def pr(r, w, d):   # pooled H+V pair share within half a turn at distance d
     n = s = 0
-    for f in "HV":
+    for f in "HVU":
         a, b = r[f"{w}_{f}_p{d}"].split(":"); n += float(a); s += float(b)
     return n, s
-def tot(r, w, k): return sum(float(r[f"{w}_{f}_{k}"]) for f in "HV")
+def tot(r, w, k): return sum(float(r[f"{w}_{f}_{k}"]) for f in "HVU")
 print(f"{len(rows)} boxes")
 for w in ("our", "gt"):
     A = sum(tot(r, w, "arc_m") for r in rows); S = sum(tot(r, w, "sw") for r in rows); N = sum(tot(r, w, "net") for r in rows)
@@ -21,8 +21,9 @@ for w in ("our", "gt"):
     for d in (16, 32, 64, 128, 256):
         n = sum(pr(r, w, d)[0] for r in rows); s = sum(pr(r, w, d)[1] for r in rows); line += f"  d{d}: {s:.0f}/{n:.0f} = {s / max(n, 1):.4f}"
     print(line)
-    for f in "HV":
+    for f in "HVU":
         A = sum(float(r[f"{w}_{f}_arc_m"]) for r in rows); S = sum(float(r[f"{w}_{f}_sw"]) for r in rows); N = sum(float(r[f"{w}_{f}_net"]) for r in rows)
+        if A == 0: continue
         n, s = (sum(float(r[f"{w}_{f}_p64"].split(":")[k]) for r in rows) for k in (0, 1))
         print(f"   {f}: arc {A:.1f} m, excursions {S / max(A, 1e-9):.0f} /m, persistent {N / max(A, 1e-9):.0f} /m, d64 pairs {s:.0f}/{n:.0f} = {s / max(n, 1):.4f}")
 ok = [r for r in rows if r["oc_n"] != "na" and float(r["oc_n"]) >= 3000 and tot(r, "our", "arc_m") >= 0.2 and pr(r, "our", 32)[0] >= 200]

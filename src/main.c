@@ -251,6 +251,7 @@ static int usage(void) {
         "  ufsm fiber-check <afv> --tr T.json --boxes B.tsv --names A,B --codes R K --phase R K   do published fibre polylines link points of one GT sheet?\n"
         "  ufsm fiber-export <afv> <fields-dir> <out.fib> --tr T.json    fibre polylines in a fit box's coordinates for fit --fibers\n"
         "  ufsm fit-phase-box <fit-set> z y x nz ny nx <out.raw> [--level L] [--step 2]   a fit set's winding phase over a CT box (uint8 band phase; fibre judge)\n"
+        "  ufsm wrap-dump <wraps-dir> <out.f32> --z z0,z1 [--yx y0,y1,x0,x1] [--every 2]   wrap vertices of a slab as float32 (z, y, x, id, column / width) records\n"
         "  ufsm field-blend <out> <fields1> <fields2> ... [--weights a,b,..] [--tile SZ,SY,SX --grids z,y,x:..] [--conf mean]  fit fields averaged (phase: confidence-weighted complex mean; --tile: overlapping predicts, centre-weighted)\n"
         "  ufsm wind-score <sweep-dir> <codes-root> <codes-key>             the fit --codes score of a predict --cond-sweep winding raster\n"
         "  ufsm store-bench <root> <array-key> [--box 128,256,512] [--n 8] [--par 1] [--threads 16]   HTTP zarr fetch benchmark\n"
@@ -4494,6 +4495,7 @@ int cmd_strip_crop(int argc, char **argv);
 int cmd_fiber_check(int argc, char **argv);    /* src/fibercheck.c */
 int cmd_fiber_export(int argc, char **argv);   /* src/fibercheck.c */
 int cmd_fit_phase_box(int argc, char **argv);  /* src/fitphase.c */
+int cmd_wrap_dump(int argc, char **argv);      /* src/wrapdump.c */
 int cmd_count_field(int argc, char **argv);   /* src/countfield.c */
 int cmd_hires_phase(int argc, char **argv);   /* src/hiresphase.c */
 int cmd_phase_gate(int argc, char **argv);   /* src/phasegate.c */
@@ -4553,6 +4555,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "fiber-check")) return cmd_fiber_check(argc, argv);
     if (!strcmp(cmd, "fiber-export")) return cmd_fiber_export(argc, argv);
     if (!strcmp(cmd, "fit-phase-box")) return cmd_fit_phase_box(argc, argv);
+    if (!strcmp(cmd, "wrap-dump")) return cmd_wrap_dump(argc, argv);
     if (!strcmp(cmd, "count-field")) return cmd_count_field(argc, argv);
     if (!strcmp(cmd, "hires-phase")) return cmd_hires_phase(argc, argv);
     if (!strcmp(cmd, "phase-gate")) return cmd_phase_gate(argc, argv);
