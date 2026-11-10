@@ -19,7 +19,30 @@ void launch_bwd_w_tc(const void *x, int xbf, shape5 xs, const void *gy, int gybf
     }
     if (ISMX(x)) {
         if (sr_on()) sp.sr = sr_seed();   /* MX activations still need SR when gy is requantised to fp8 */
-        lp_bwd_w_f8(x, MXDT(x), xs, gy, ISMX(gy) ? MXDT(gy) : LPDT(gybf), ys, gw, gb, gp, sp); return;
+        /* debugging UFSM_WG_TRACE=1: per call, hashes of what the kernel reads (x, gy, the GroupNorm parameters, the seed) and a random
+           projection of what it adds to gw (the atomic adds' order moves the last bits, the projection by ~1e-7; a wrong call by more) */
+        static int tr = -1; if (tr < 0) tr = ufsm_env_on("UFSM_WG_TRACE");
+        float *g0 = nullptr; size_t nw = (size_t)ys.c * xs.c * 27; uint64_t hx = 0, hg = 0, hp = 0;
+        if (tr) {
+            CK(cudaDeviceSynchronize());
+            auto fnv = [](const void *d, size_t n) { uint8_t *h = (uint8_t *)malloc(n); cudaMemcpy(h, d, n, cudaMemcpyDeviceToHost); uint64_t v = 1469598103934665603ull; for (size_t i = 0; i < n; i++) v = (v ^ h[i]) * 1099511628211ull; free(h); return v; };
+            shape5 xh = xs; if (sp.up) { xh.d = (xs.d + 1) / 2; xh.h = (xs.h + 1) / 2; xh.w = (xs.w + 1) / 2; }   /* (a fused upsample: x is the coarse tensor) */
+            if (sp.x2) xh.c = sp.c_split;
+            hx = fnv(x, MXDT(x) == 4 ? nn_mx4_bytes(xh) : nn_mx8_bytes(xh)); hg = fnv(gy, ISMX(gy) ? (MXDT(gy) == 4 ? nn_mx4_bytes(ys) : nn_mx8_bytes(ys)) : shape_numel(ys) * 2);
+            if (gp.G) { const int NG = xs.n * gp.G; hp = fnv(gp.gamma, xs.c * 4) ^ fnv(gp.beta, xs.c * 4) * 3 ^ fnv(gp.mean, NG * 4) * 5 ^ fnv(gp.rstd, NG * 4) * 7; }
+            g0 = (float *)malloc(nw * 4); cudaMemcpy(g0, gw, nw * 4, cudaMemcpyDeviceToHost); cudaGetLastError();
+        }
+        lp_bwd_w_f8(x, MXDT(x), xs, gy, ISMX(gy) ? MXDT(gy) : LPDT(gybf), ys, gw, gb, gp, sp);
+        if (tr) {
+            CK(cudaDeviceSynchronize());
+            float *g1 = (float *)malloc(nw * 4); cudaMemcpy(g1, gw, nw * 4, cudaMemcpyDeviceToHost);
+            double pr = 0, n2 = 0; unsigned r = 12345u;
+            for (size_t i = 0; i < nw; i++) { r = r * 1664525u + 1013904223u; const double d = (double)g1[i] - g0[i]; pr += (r >> 31 ? d : -d); n2 += d * d; }
+            fprintf(stderr, "wgtrace %d->%d %dx%dx%d x%d g%d sr %08x up %d x %016llx gy %016llx gn %016llx x2 %d : proj %.10g norm %.10g\n", xs.c, ys.c, xs.d, xs.h, xs.w, MXDT(x), ISMX(gy) ? MXDT(gy) : 16, sp.sr, sp.up,
+                    (unsigned long long)hx, (unsigned long long)hg, (unsigned long long)hp, sp.x2 != nullptr, pr, sqrt(n2));
+            free(g0); free(g1);
+        }
+        return;
     }
     if ((eff_prec_w() == 2 || eff_prec_w() == 3) && !sp.up) { if (sr_on()) sp.sr = sr_seed(); }
     if ((eff_prec_w() == 2 || eff_prec_w() == 3) && !sp.up) { lp_bwd_w_f8(x, LPDT(xbf), xs, gy, LPDT(gybf), ys, gw, gb, gp, sp); return; }   /* prec 4 (fp16) keeps the 16-bit kernel for the weight gradient */
