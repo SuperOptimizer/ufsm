@@ -797,6 +797,18 @@ static void verso_target(gpu_state *d, shape5 xs) {
    statistics, summed over the slabs and finished into its scratch (fetch_loss reads them as before); pass 1 (the backward's head
    step, head_slab_cb): the head again, each loss's gradient in place over the slab's logits, the head backward of the slab. The
    per-voxel arithmetic is the whole-window path's (fp64 sums in another order; the head backward's SR seed is the backward's) */
+/* experiment (UFSM_LAT_LG_MX / UFSM_LAT_GL_MX = 8 | 4): the cell grid's fp16 logits / logit gradient rounded through MX-fp8 / MX-fp4 rows
+   (32-channel blocks per cell, round to nearest) in place: what storing them in MX would do to the losses, before any kernel reads MX */
+static void lat_mx_trip(gpu_state *d, void *h16, const char *env, int which) {
+    static int on[2] = {-1, -1}; if (on[which] < 0) { const char *e = getenv(env); on[which] = e ? atoi(e) : 0; if (on[which]) fprintf(stderr, "%s=%d: the cell %s through MX-fp%d\n", env, on[which], which ? "logit gradient" : "logits", on[which]); }
+    if (on[which] != 4 && on[which] != 8) return;
+    const shape5 s = {1, LNC, g_Pz / 4, d->hs_P / 4, d->hs_P / 4}; const size_t S = shape_spatial(s), n = S * LNC;
+    static void *mx[4]; static float *f[4];
+    if (!mx[d->dev]) { mx[d->dev] = nn_malloc(nn_mx8_bytes(s)); f[d->dev] = nn_malloc(n * 4); }
+    if (on[which] == 8) { lp_h16_to_mx8(h16, 2, 1, LNC, S, mx[d->dev]); lp_mx8_to_f32(mx[d->dev], 1, LNC, S, f[d->dev]); }
+    else { lp_h16_to_mx4(h16, 2, 1, LNC, S, mx[d->dev]); lp_mx4_to_f32(mx[d->dev], 1, LNC, S, f[d->dev]); }
+    nn_f32_to_h16(f[d->dev], n, h16, 1.f);
+}
 static void head_slab_pass(gpu_state *d, int pass) {
     const int D = g_Pz, H = d->hs_P, W = d->hs_P, Z = d->hs_z;
     const size_t hw = (size_t)H * W, l3 = (size_t)D * hw;
@@ -1068,6 +1080,7 @@ static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
     } else if (g_lat) { nn_ptick("other"); lg = unet_forward_x(d->u, d->x, (shape5){B, unet_cfg_of(d->u)->cin, g_Pz / 4, P / 4, P / 4}, train, g_xfmt != 0); nn_ptick("trunk forward"); }   /* --lat: x the full-resolution CT channel */
     else lg = unet_forward_x(d->u, d->x, xs, train, g_xfmt != 0);
     d->lg = lg;
+    if (g_lat) lat_mx_trip(d, (void *)lg, "UFSM_LAT_LG_MX", 0);
     mem_post(d, B, train);
     if (train && !g_half && !g_head_slab && !g_pkf) diag_nonfinite(d, "logits", lg, (size_t)B * g_cout * xs.d * P * P, unet_logits_h16(d->u) ? 1 : 0);   /* (UFSM_SYNC_CHECK) */
     d->ds_fresh = g_ds && train;   /* validation batches have no deep-supervision losses */
@@ -1101,6 +1114,7 @@ static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
             head_slab_pass(d, 1);
             if (d->hsplit) nn_event_record(d->ev_hs, 0);   /* (the callback's record: this mode runs the gradient pass here) */
             nn_f32_to_h16(d->latg, nc, d->latgl, 1.f);   /* (the slab gradients carry the gradient scale already) */
+            lat_mx_trip(d, d->latgl, "UFSM_LAT_GL_MX", 1);
             d->gl = d->latgl; nn_ptick("other");
         }
         if (prof) nn_prof_end();

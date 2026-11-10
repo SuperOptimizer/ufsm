@@ -58,6 +58,30 @@ trunk forward 84, trunk backward 310, slab adjoint 206, slab upsampling 50, labe
   winding: trunk 197 (of it the 96 -> 144 head 37: forward 8, data gradient 14, weight gradient 15), slab section 123, CT upload +
   gpu-aug 50, label upload 15, input 8, optimizer 9; rv: slab section 143 (label upload 38, targets 35, loss kernels 36, upsampling
   15, adjoint 19), uploads 72, trunk 51 (head 12), optimizer 12. For the rv net the full-resolution passes, not the trunk, are the step.
+- **What is not fp4 in a latent step, and whether it could be** (sub-cell head, bytes per window voxel): the cell logits `lg` (144
+  channels, fp16, 4.5 B = 2.0 GB at P768) and their gradient `latgl` (the same), `latg` (16 channels of fp32 sums, 1.0 B: sums of
+  ~100 slab terms, kept), the slab logits `hs_lg` (fp16, one slab), GroupNorm statistics / weights / optimizer state (fp32, 0.12 GB).
+  Experiment switches `UFSM_LAT_LG_MX` / `UFSM_LAT_GL_MX` = 8 | 4 round `lg` / `latgl` through MX rows in place (32-channel blocks per
+  cell, round to nearest; no kernel reads MX yet). The same 300 steps as above (run-to-run spread of the baseline: 1.3792 / 1.3799,
+  the first ~20 steps identical):
+
+  | | step 1 | 1-50 | 51-100 | 101-200 | 201-300 |
+  |---|---|---|---|---|---|
+  | fp16 both (default) | 2.6364 | 2.7342 | 2.1850 | 1.5853 | 1.3792 |
+  | logits MX-fp8 | 2.6347 | 2.7313 | 2.1832 | 1.5851 | 1.3799 |
+  | logits MX-fp4 | 2.6103 | 2.7081 | 2.1714 | 1.5859 | 1.3837 |
+  | gradient MX-fp8 | 2.6364 | 2.7333 | 2.1815 | 1.5857 | 1.3820 |
+  | gradient MX-fp4 | 2.6364 | 2.7325 | 2.1837 | 1.5870 | 1.3801 |
+  | logits fp8 + gradient fp8 | 2.6347 | 2.7312 | 2.1828 | 1.5853 | 1.3805 |
+  | logits fp8 + gradient fp4 | 2.6347 | 2.7332 | 2.1830 | 1.5857 | 1.3806 |
+  | logits fp4 + gradient fp4 | 2.6103 | 2.7077 | 2.1716 | 1.5870 | 1.3820 |
+
+  Nothing separates from the baseline's own spread at 300 steps. fp4 logits move the step-1 loss by 1% (the same weights, another
+  rounding of the outputs), fp8 logits by 0.06%. Real MX storage (logits fp8 2.3 B, gradient fp4 1.2 B: -5.5 B a voxel, 2.5 GB at
+  P768) needs the head forward writing MX rows, `nn_lat_up_slab` / `nn_lat_shuffle` reading them, the adjoints' final store in MX and
+  the head's weight gradient reading an MX gy: not written. It saves memory only, no step time.
+- The slab loop stays two passes: the side / normal gradients divide by the window's mask sums and the count of active channels, the
+  winding term by its gauges, all known only after every slab's targets (and the winding logits) were seen.
 - Left in the slab section (P512, ms): upsampling 50 and adjoint 60 still cover all 32 planes of the guide-2 head although 13 are
   unused; label upload 37 is hidden by the upload pipeline outside the synchronised profile.
 
