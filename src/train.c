@@ -922,10 +922,10 @@ static void head_slab_pass(gpu_state *d, int pass) {
         PT("losses");
         if (g_lat && g_lat_guide == 8) nn_zero((char *)d->hs_lg + (size_t)g_cout * ns * 2, (size_t)(24 - g_cout) * ns * 2);   /* (the unused outputs: no gradient) */
         if (g_lat && g_lat_guide) LGUIDE(1);   /* the coefficient planes' gradients */
-        if (g_lat) nn_lat_up_adj(d->hs_lg, LNC, D / 4, H / 4, W / 4, z0, nz, d->latg, LNC <= 28 ? d->nt : nullptr);   /* (scratch: the normal targets, 7 bytes a voxel, are done for this slab) */   /* --lat: the slab's gradient onto the cell grid */
+        if (g_lat) nn_lat_up_adj(d->hs_lg, LNC, D / 4, H / 4, W / 4, z0, nz, d->latg, d->nt);   /* (scratch: the normal targets, 7 bytes a voxel, are done for this slab) */   /* --lat: the slab's gradient onto the cell grid */
         else if (unet_head_bwd_z(d->u, z0, z1, d->hs_lg, z0 == 0)) { fprintf(stderr, "head slabs: the fused head backward is not covered (UFSM_HEAD_SLAB=0)\n"); abort(); }
         if (lchk) {   /* UFSM_LAT_CHECK=1: the separable adjoint against the per-voxel gather (the slab's gradient is still in hs_lg) */
-            static float *gc2; const size_t nc = (size_t)g_cout * (D / 4) * (H / 4) * (W / 4);
+            static float *gc2; const size_t nc = (size_t)LNC * (D / 4) * (H / 4) * (W / 4);   /* (every cell channel: the guided heads have more than the task's) */
             if (!gc2) gc2 = nn_malloc(nc * 4);
             if (z0 == 0) nn_zero(gc2, nc * 4);
             const int was = nn_lat_set_slow(1); nn_lat_up_adj(d->hs_lg, LNC, D / 4, H / 4, W / 4, z0, nz, gc2, nullptr); nn_lat_set_slow(was);

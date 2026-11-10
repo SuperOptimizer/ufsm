@@ -505,11 +505,13 @@ extern "C" void nn_lat_up_slab(const void *lg, int lh16, int C, int d, int h, in
 }
 extern "C" void nn_lat_up_adj(const void *g, int C, int d, int h, int w, int z0, int nz, float *gc, void *scratch) {
     const int slow = lat_slow();
-    if (!slow && scratch && z0 % 4 == 0 && nz % 4 == 0) {   /* two separable gathers through scratch (C nz h w fp32) */
-        const size_t n1 = (size_t)C * nz * h * w;
-        lat_adj_xy_k<<<nblk(n1, 256), 256>>>((const f16 *)g, C, h, w, nz, (float *)scratch);
+    if (!slow && scratch && z0 % 4 == 0 && nz % 4 == 0) {   /* two separable gathers through scratch (c nz h w fp32: 7 bytes per slab voxel hold 28 channels; more go in groups of 28) */
         const int a0 = max(z0 / 4 - 1, 0), a1 = min((z0 + nz) / 4 + 1, d);
-        lat_adj_z_k<<<nblk((size_t)(a1 - a0) * h * w * C, 256), 256>>>((const float *)scratch, C, d, h, w, z0, nz, a0, a1, gc);
+        for (int c0 = 0; c0 < C; c0 += 28) {
+            const int c = min(28, C - c0); const size_t n1 = (size_t)c * nz * h * w;
+            lat_adj_xy_k<<<nblk(n1, 256), 256>>>((const f16 *)g + (size_t)c0 * nz * 16 * h * w, c, h, w, nz, (float *)scratch);
+            lat_adj_z_k<<<nblk((size_t)(a1 - a0) * h * w * c, 256), 256>>>((const float *)scratch, c, d, h, w, z0, nz, a0, a1, gc + (size_t)c0 * d * h * w);
+        }
         KCHECK(); return;
     }
     /* coarse planes whose support meets fine planes [z0, z0 + nz) */
