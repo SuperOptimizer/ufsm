@@ -4476,25 +4476,31 @@ static int copy_conv_in(unet *u, const unet *o, const convp *a, const convp *b) 
     }
     return 1;
 }
+/* --init-shift S (latent-grid nets from a voxel donor): u's level i takes the donor's level i + S (encoder, down, decoder, residual
+   blocks; u's first conv, which reads another input, and the head stay fresh) */
+static int g_init_shift;
+void unet_set_init_shift(int s) { g_init_shift = s > 0 ? s : 0; }
 int unet_init_from_map(unet *u, const char *path, const int *head_rows) {
-    unet_cfg oc; int step;
+    unet_cfg oc; int step; const int S = g_init_shift;
     if (unet_peek(path, &oc, &step) || oc.cin > u->cfg.cin) return -1;   /* (more inputs: the stem grows, copy_conv_in) */
     unet *o = unet_create(&oc);
     if (unet_load(o, path) < 0) { unet_free(o); return -1; }
     int n = 0;
-    const int L = u->cfg.nlev < oc.nlev ? u->cfg.nlev : oc.nlev;
+    if (S >= oc.nlev) { unet_free(o); return -1; }
+    const int L = u->cfg.nlev < oc.nlev - S ? u->cfg.nlev : oc.nlev - S;
     for (int i = 0; i < L; i++) {
-        const block *a = &u->enc[i], *b = &o->enc[i];
-        n += (i == 0 && oc.cin < u->cfg.cin ? copy_conv_in(u, o, &a->c1, &b->c1) : copy_conv(u, o, &a->c1, &b->c1)) + copy_gn(u, o, &a->n1, &b->n1) +
+        const block *a = &u->enc[i], *b = &o->enc[i + S];
+        n += (i == 0 && S ? 0 : i == 0 && oc.cin < u->cfg.cin ? copy_conv_in(u, o, &a->c1, &b->c1) : copy_conv(u, o, &a->c1, &b->c1)) + (i == 0 && S ? 0 : copy_gn(u, o, &a->n1, &b->n1)) +
              copy_conv(u, o, &a->c2, &b->c2) + copy_gn(u, o, &a->n2, &b->n2);
     }
     for (int i = 0; i < L - 1; i++) {
-        n += copy_conv(u, o, &u->down[i], &o->down[i]);
-        if (u->cfg.down_norm && oc.down_norm) n += copy_gn(u, o, &u->dn[i], &o->dn[i]);
-        const block *a = &u->dec[i], *b = &o->dec[i];   /* dec[i] works at level i in both nets */
+        n += copy_conv(u, o, &u->down[i], &o->down[i + S]);
+        if (u->cfg.down_norm && oc.down_norm) n += copy_gn(u, o, &u->dn[i], &o->dn[i + S]);
+        const block *a = &u->dec[i], *b = &o->dec[i + S];   /* dec[i] works at level i in both nets */
         n += copy_conv(u, o, &a->c1, &b->c1) + copy_gn(u, o, &a->n1, &b->n1) + copy_conv(u, o, &a->c2, &b->c2) + copy_gn(u, o, &a->n2, &b->n2);
     }
-    if (!head_rows) n += copy_conv(u, o, &u->head, &o->head);
+    if (S) { }   /* (the head reads another level's features: fresh) */
+    else if (!head_rows) n += copy_conv(u, o, &u->head, &o->head);
     else if (u->head.cin == o->head.cin && u->head.k == o->head.k) {
         const size_t row = (size_t)u->head.cin * u->head.k * u->head.k * u->head.k;
         for (int co = 0; co < u->cfg.cout; co++) {
@@ -4509,13 +4515,13 @@ int unet_init_from_map(unet *u, const char *path, const int *head_rows) {
         }
         n++;
     } else { unet_free(o); return -1; }
-    if (u->cfg.scale_cond && oc.scale_cond && u->enc[0].c1.cout == o->enc[0].c1.cout) {
+    if (!S && u->cfg.scale_cond && oc.scale_cond && u->enc[0].c1.cout == o->enc[0].c1.cout) {
         nn_d2d(u->p + u->sc_w, o->p + o->sc_w, (size_t)u->enc[0].c1.cout * 4); nn_d2d(u->ema + u->sc_w, o->ema + o->sc_w, (size_t)u->enc[0].c1.cout * 4); n++;
     }
     for (int i = 0; i < L; i++) for (int k = 0; k < u->cfg.enc_blocks[i]; k++) {   /* residual blocks: the donor's, or identity blocks whose output
                                                                                     normalisation is the level's (the net then computes the donor's function) */
         const block *a = &u->rb[i][k];
-        if (k < oc.enc_blocks[i]) { const block *b = &o->rb[i][k]; n += copy_conv(u, o, &a->c1, &b->c1) + copy_gn(u, o, &a->n1, &b->n1) + copy_conv(u, o, &a->c2, &b->c2) + copy_gn(u, o, &a->n2, &b->n2); }
+        if (k < oc.enc_blocks[i + S]) { const block *b = &o->rb[i + S][k]; n += copy_conv(u, o, &a->c1, &b->c1) + copy_gn(u, o, &a->n1, &b->n1) + copy_conv(u, o, &a->c2, &b->c2) + copy_gn(u, o, &a->n2, &b->n2); }
         else if (a->n2.c == u->enc[i].n2.c) for (int e = 0; e < 2; e++) {
             float *arr = e ? u->ema : u->p;
             nn_d2d(arr + a->n2.gamma, arr + u->enc[i].n2.gamma, (size_t)a->n2.c * 4); nn_d2d(arr + a->n2.beta, arr + u->enc[i].n2.beta, (size_t)a->n2.c * 4);

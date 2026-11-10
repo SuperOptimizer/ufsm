@@ -415,6 +415,7 @@ extern "C" void nn_d2d_aux(void *d, const void *s, size_t n) {
     }
     CK(cudaMemcpyAsync(d, s, n, cudaMemcpyDeviceToDevice, aux_stream()));
 }
+extern "C" void nn_h2d_stream(int k, void *d, const void *s, size_t n) { CK(cudaMemcpyAsync(d, s, n, cudaMemcpyHostToDevice, stream_of(k))); }   /* stream k: 0 compute, 1 copy, 2 aux; s pinned */
 extern "C" void nn_event_record(void *e, int on_copy_stream) { CK(cudaEventRecord((cudaEvent_t)e, stream_of(on_copy_stream))); }
 extern "C" void nn_stream_wait(int copy_stream_waits, void *e) { CK(cudaStreamWaitEvent(stream_of(copy_stream_waits), (cudaEvent_t)e, 0)); }
 extern "C" void nn_event_sync(void *e) { CK(cudaEventSynchronize((cudaEvent_t)e)); }
@@ -455,7 +456,7 @@ extern "C" void nn_ptick(const char *name) {
     if (name) {
         int k = 0; while (k < g_ptn && strcmp(g_ptname[k], name)) k++;
         if (k == g_ptn && g_ptn < 64) g_ptname[g_ptn++] = name;
-        if (k < 64) { g_ptms[k] += t - g_ptlast; g_ptcnt[k]++; }
+        if (k < 64 && g_ptlast > 0) { g_ptms[k] += t - g_ptlast; g_ptcnt[k]++; }
     }
     g_ptlast = pt_now();
 }

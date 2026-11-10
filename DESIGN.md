@@ -6,6 +6,55 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Latent-grid training and inference speed (2026-11-09, branch perf-20261109)
+
+**Update (evening): after merging latcomp (lat basis, --latents, guided heads, fit fields from latent nets).** The predict fast
+paths by checkpoint kind, each compared with the latcomp binary (6-step checkpoints, box 256 x 768 x 768, window 384, halo 64):
+- plain and `--lat-basis` rv: direct input (`nn_lat_pred_input`, basis: `nn_lat_pred_input_c` = the projections of the cell's 64
+  z-scored bytes, fp16 storage only) and direct rv bytes (`nn_lat_place_rv`): 351 / 371 of 151 M bytes differ, all by 1.
+- guided head (`lat_guide` 5), with or without basis: `nn_lat_place_rvg` upsamples the 2 side logits and 5 coefficient planes per
+  voxel and takes the CT terms from a byte copy of the window (the forward overwrites the shared one; 1 B per voxel), with the fp16
+  roundings of the slab path: 0 bytes differ. No 4-channel full-resolution input, no [2][W^3] fp16 logits.
+- `--latents`, `lat_guide` 8 rv, fit fields with `--fit-ct` / `--tta` / without `--no-out 1`: the latcomp path unchanged.
+- `--fit-zarr --no-out 1` from a latent net (`fzs` in predict.c; `UFSM_PRED_FIT_SLAB=0` off): the heads are upsampled (and guided,
+  `lat_guide` 8: x for the slab from the bytes, `nn_lat_ct_x`) only over the planes of each z chunk of field cells, the accumulators
+  run on the slab as a window of its own (z offset, mask pointer offset; the winding planes in a 2-channel slab with their +-d
+  neighbours). Chunks are capped at 768 MB of head planes. All 141 field files byte-identical to latcomp's for a phase, a
+  basis + guide-2 and a guide-2 checkpoint. A 640 window (guide 2, 19 planes) took 2.9 GB of the device beside an 11 GB trainer;
+  the whole-window buffer alone was 10 GB.
+Numbers: one RTX 5060 Ti 16 GB, `train --lat 4 --task unwrap2 --rv 1` (widths 32,64,128,192,256, 11 output channels), P 768, one batch
+repeated (`UFSM_BENCH_SAME=1`), phases timed with `UFSM_PTICK=1` (nn_ptick: device synchronised after every phase). PERF_REPORT.md
+has the full tables and what was measured on a busy GPU.
+- The profile before: 1307 ms a step (347 Mvox/s). The cell-grid trunk (pool + forward + backward + optimiser) was 131 ms; the
+  full-resolution head slabs took the rest: upsampling 605 ms (two passes), adjoint 220, label slab uploads 148, loss kernels 119,
+  target kernels 84.
+- `nn_lat_up_slab`: per axis the pool4 chain (two trilinear 2x steps) is a 3-tap filter of the cell grid (fine 4 c + r reads c - 1, c,
+  c + 1 with weights {.375 .625 0}, {.1875 .75 .0625}, {.0625 .75 .1875}, {0 .625 .375}; the mid grid's clamps only occur where
+  they fold onto the same edge cell). One thread per coarse cell writes its 4^3 voxels of every channel separably from 27 loads, each
+  fine row as one 8-byte store: 302 -> 29 ms a pass (now bound by writing 22 bytes a voxel). `nn_lat_up_adj`: stage 1 gathers each
+  fine plane onto the coarse (y, x) grid (10 x 10 loads per coarse cell and plane, weights from a table), stage 2 adds the planes
+  along z; the scratch is the slab's normal-target buffer (free after the losses): 220 -> 52 ms. Slabs that are not whole coarse
+  planes keep the per-voxel kernels (`UFSM_LAT_SLOW=1` forces them). `UFSM_LAT_CHECK=1` runs both in the trainer: 6.4e3 of 1.48e9 fp16
+  logits differ by one code, the coarse gradient by 1e-7 of its rms. Step 1 of a repeated batch has the same loss to the printed
+  digits and gn 7.14 against 7.12; later steps drift apart (the MX-fp4 trunk amplifies one-code differences).
+- Label slab uploads (`UFSM_LAT_STREAM`): slab j + 1 goes up on the aux stream into a second buffer set while slab j computes
+  (`UFSM_LAT_PIPE=0`: in the compute stream as before; +0.08 GB at P768, skipped when the device is full). Stream check 0 differing
+  bytes, losses identical with it on and off. Best 5-step windows on a shared GPU: 930 Mvox/s with, 564-636 without.
+- After: 602 ms a step measured without the upload pipeline (752 Mvox/s), <= 487 ms with it. Not adopted: one fused target kernel
+  (same time within noise: the targets are bound by their 14 written bytes a voxel; its normal targets differed by one code in 2e-4
+  of the voxels), 64-plane slabs (+2.5%, within noise), skipping unsupervised slabs (0 of 128 slabs in 8 windows; 51-94% of the
+  voxels carry the side loss).
+- The sampler now limits training: ~7.7 CPU-seconds per P512 window in steady state (17 Mvox/s per worker), and at start 86% of the
+  trainer's CPU samples sat in THP direct compaction (wbig_alloc's MADV_HUGEPAGE with defrag = defer+madvise on a full page cache).
+- predict `--channel rv` on a latent checkpoint: `nn_lat_pred_input` builds the cell-grid input from the CT bytes (the values of
+  nn_pred_input_d + nn_lowres_input, output bytes identical), `nn_lat_place_rv` writes each shard's bytes from the cell logits (the
+  upsampling above, nn_rv_fuse and nn_pred_place in one kernel: 1139 of 4.6e8 bytes differ by 1); no full-resolution input (8 B a
+  voxel), half-resolution intermediate (2 B) or fp32 logits (8 B): `--window 1152` fits beside a P768 trainer. The place kernels of
+  every predict run one thread per voxel of the interior-shard intersection (they ran over the whole interior per shard). With
+  `--shard 128` a shard is one 128^3 chunk, so `--threads` had no effect on the single writer thread (144 MB/s): up to 8 writer
+  threads now (`UFSM_PRED_WRITERS`). Box 1024 x 3072^2 of PHerc1667 at window 640, back to back at machine load 20: 66.0 -> 16.5 s
+  (7.6 s at a quieter moment; the writers and the CT reader bound it). tests/test_lat.c covers both new
+  kernels against the full-resolution chain.
 ## Latent-grid networks and latcomp v1: train --lat 4, learned cell channels, latent stores (2026-11-09)
 - Why: at the production voxel net level 0 is ~86% of the activations (61.8 B per window voxel at P576). `train --lat 4` (task unwrap2 /
   --rv; unet_cfg.half_res 3) runs the U-Net on the 4^3 cells of the window (widths 32,64,128,192,256, 5 levels); the losses stay at
