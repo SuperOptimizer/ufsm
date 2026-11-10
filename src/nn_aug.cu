@@ -26,6 +26,7 @@ typedef struct {
     float *ntab;                      /* the jitter noise table (sample.c g_ntab) */
     float *cssn;                      /* --gpu-aug 2: the phase codes' cos, sin (256 each) */
     cudaEvent_t done; int used;       /* the last window's work (the staging buffer is shared by both streams' calls) */
+    const void *key;
 } aug_dev;
 static aug_dev g_ad[8];
 
@@ -460,10 +461,15 @@ __global__ void aug_ntab_k(float *t) {   /* sample.c ntab_init: the normal quant
     if (i < 65536) t[i] = (float)normcdfinv((i + 0.5) / 65536.0);
 }
 
+/* the staging buffer's reuse between the calls of one batch upload: aug_dev.key is the pinned host plane whose bytes it holds unchanged
+   (nullptr: none). train calls nn_aug_stage_reset before each batch's uploads (the sampler reuses its host planes for later batches) */
+static int g_lw_ref = 0;
+extern "C" void nn_label_warp_ref(int on) { g_lw_ref = on; }   /* tests: the reference kernels (double atan2 everywhere, the ink plane written first, no reuse) */
+extern "C" void nn_aug_stage_reset(void) { int dv = 0; cudaGetDevice(&dv); g_ad[dv & 7].key = nullptr; }
 static aug_dev *aug_get(int P, int ns) {   /* ns: the staging buffer in P^3 bytes (1 the CT, 2 with the labels) */
     int dv = 0; cudaGetDevice(&dv); aug_dev *a = &g_ad[dv & 7];
     const size_t p3 = (size_t)P * P * P, p2 = (size_t)P * P;
-    if (a->stage_n < ns * p3) { if (a->stage) { CK(cudaDeviceSynchronize()); cudaFree(a->stage); } CK(cudaMalloc(&a->stage, ns * p3)); a->stage_n = ns * p3; }
+    if (a->stage_n < ns * p3) { a->key = nullptr; if (a->stage) { CK(cudaDeviceSynchronize()); cudaFree(a->stage); } CK(cudaMalloc(&a->stage, ns * p3)); a->stage_n = ns * p3; }
     if (a->pl_n < p2) { for (int i = 0; i < 4; i++) { if (a->pl[i]) cudaFree(a->pl[i]); CK(cudaMalloc(&a->pl[i], p2 * sizeof(float))); } a->pl_n = p2; }
     { const size_t zc = AUG_CN_BYTES / (p2 * sizeof(float)) < 1 ? 1 : AUG_CN_BYTES / (p2 * sizeof(float)), want = (zc < (size_t)P ? zc : (size_t)P) * p2;
       if (a->cn_n < want) { if (a->cn) { CK(cudaDeviceSynchronize()); cudaFree(a->cn); } CK(cudaMalloc(&a->cn, want * sizeof(float))); a->cn_n = want; } }
@@ -569,7 +575,8 @@ extern "C" void nn_aug_ct(const uint8_t *ct8_h, const void *rec_h_, const void *
     cudaStream_t s = on_copy_stream ? copy_stream() : 0;
     const size_t p3 = (size_t)P * P * P;
     if (a->used) CK(cudaStreamWaitEvent(s, a->done, 0));
-    CK(cudaMemcpyAsync(a->stage, ct8_h, p3, cudaMemcpyHostToDevice, s));
+    if (a->key != ct8_h) CK(cudaMemcpyAsync(a->stage, ct8_h, p3, cudaMemcpyHostToDevice, s));   /* (else: staged by nn_ink_bits just before) */
+    a->key = nullptr;   /* (the scanner operators write their bytes back into the staging buffer) */
     CK(cudaMemcpyAsync(a->rec, rec_h, offsetof(scan_ct_rec, plan), cudaMemcpyHostToDevice, s));
     nn_ptick_fine("    x ct bytes h2d");
     if (rec_h->scan) {
@@ -596,11 +603,16 @@ static __device__ __forceinline__ float fa(float a, float b) { return __fadd_rn(
 static __device__ __forceinline__ float fs(float a, float b) { return __fsub_rn(a, b); }
 /* the source position of output voxel k (sample.c spatial_aug_pull through the symmetry, as write_spatial_tm's fast path): base corner
    index, fractions; 0 outside */
+/* voxel k's (z, y, x): 32-bit divisions where the index allows (P <= 1625; a 64-bit division costs several times more per voxel) */
+static __device__ __forceinline__ void lw_zyx(size_t k, int P, int io[3]) {
+    if (k >> 32) { const size_t P2 = (size_t)P * P; io[0] = (int)(k / P2); io[1] = (int)(k / P % P); io[2] = (int)(k % P); return; }
+    const unsigned ku = (unsigned)k, P2 = (unsigned)P * (unsigned)P, z = ku / P2, r = ku - z * P2, y = r / (unsigned)P;
+    io[0] = (int)z; io[1] = (int)y; io[2] = (int)(r - y * (unsigned)P);
+}
 static __device__ __forceinline__ int lw_coords(const float *rad, int P, size_t k, size_t *b0, float F[3]) {
     const int32_t *h = (const int32_t *)rad; const int sb = h[5], affine = h[6] >> 1 & 1;
     const int perm[3] = {sb & 3, sb >> 2 & 3, sb >> 4 & 3}, flip[3] = {sb >> 8 & 1, sb >> 9 & 1, sb >> 10 & 1};
-    const size_t P2 = (size_t)P * P;
-    const int io[3] = {(int)(k / P2), (int)(k / P % P), (int)(k % P)};
+    int io[3]; lw_zyx(k, P, io);
     const float *tb = rad + 8 + 2 * (size_t)P, *R = tb + 6 * (size_t)P, *A = R + 9; const float sc = R[27];
     const float c = .5f * (P - 1);
     float vt[3]; for (int d = 0; d < 3; d++) vt[d] = fs(fs((float)io[d], c), tb[d * P + io[d]]);
@@ -623,7 +635,16 @@ static __device__ __forceinline__ float lw_w(const float F[3], int cn) {   /* co
     return fm(fm(bz ? F[0] : fs(1.f, F[0]), by ? F[1] : fs(1.f, F[1])), bx ? F[2] : fs(1.f, F[2]));
 }
 static __device__ __forceinline__ size_t lw_off(int P, int cn) { return ((size_t)(cn >> 2) * P + (cn >> 1 & 1)) * P + (cn & 1); }
-static __device__ __forceinline__ uint8_t lw_code(float sx, float sy) {   /* sample.c warp_code_of */
+/* ref 0: the single-precision atan2 decides wherever its t is more than 2e-3 from a rounding boundary (its error in t is < 1e-4: a few
+   ulp of pi times 40, plus the product's); the double one, 1 voxel in 250, only at the boundaries. The same codes as ref 1 (tests), at
+   a fraction of the time: double precision runs at 1 / 64 of the single rate on these cards */
+template <int REF> static __device__ __forceinline__ uint8_t lw_code(float sx, float sy) {   /* sample.c warp_code_of */
+    if (!REF) {
+        float tf = atan2f(sy, sx) * (float)(LW_PERIOD / (2 * 3.14159265358979323846));
+        if (tf < 0) tf += (float)LW_PERIOD;
+        const float fr = tf - floorf(tf);
+        if (fabsf(fr - .5f) > 2e-3f && tf == tf) { const int q = (int)(tf + .5f); return (uint8_t)(q >= LW_PERIOD ? q - LW_PERIOD : q); }
+    }
     float t = fm((float)atan2((double)sy, (double)sx), (float)(LW_PERIOD / (2 * 3.14159265358979323846)));
     if (t < 0) t = fa(t, (float)LW_PERIOD);
     const int q = __float2int_rn(t); return (uint8_t)(q >= LW_PERIOD ? q - LW_PERIOD : q);
@@ -641,7 +662,7 @@ __global__ void lw_tm_k(const uint8_t *src, uint8_t *dst, uint8_t *pm, int P, co
     dst[k] = (uint8_t)(t | (ok ? 4 : 0)); if (pm) pm[k] = (uint8_t)ok;
 }
 /* the phase (circular mean of the known corners' codes) */
-__global__ void lw_phase_k(const uint8_t *src, uint8_t *dst, int P, const float *rad, const float *cs, const float *sn) {
+template <int REF> __global__ void lw_phase_k(const uint8_t *src, uint8_t *dst, int P, const float *rad, const float *cs, const float *sn) {
     const size_t n = (size_t)P * P * P, k = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     if (k >= n) return;
     size_t b0; float F[3]; uint8_t out = LW_UNKNOWN;
@@ -652,13 +673,13 @@ __global__ void lw_phase_k(const uint8_t *src, uint8_t *dst, int P, const float 
             if (!(w > 1e-7f) || p >= LW_PERIOD) continue;
             sx = fa(sx, fm(w, cs[p])); sy = fa(sy, fm(w, sn[p])); wk = fa(wk, w);
         }
-        if (!(wk < .5f || fa(fm(sx, sx), fm(sy, sy)) < 1e-8f)) out = lw_code(sx, sy);
+        if (!(wk < .5f || fa(fm(sx, sx), fm(sy, sy)) < 1e-8f)) out = lw_code<REF>(sx, sy);
     }
     dst[k] = out;
 }
 /* the winding mod 4 and its component: the nearest corner's component (fraction >= .5), the circular mean over the corners of that
    component; 255 / 255 else */
-__global__ void lw_w4_k(const uint8_t *w4, const uint8_t *cp, uint8_t *dw, uint8_t *dc, int P, const float *rad, const float *cs, const float *sn) {
+template <int REF> __global__ void lw_w4_k(const uint8_t *w4, const uint8_t *cp, uint8_t *dw, uint8_t *dc, int P, const float *rad, const float *cs, const float *sn) {
     const size_t n = (size_t)P * P * P, k = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     if (k >= n) return;
     size_t b0; float F[3]; uint8_t ow = 255, oc = 255;
@@ -671,14 +692,19 @@ __global__ void lw_w4_k(const uint8_t *w4, const uint8_t *cp, uint8_t *dw, uint8
                 if (!(w > 1e-7f) || cp[j] != c0 || q >= LW_PERIOD) continue;
                 sx = fa(sx, fm(w, cs[q])); sy = fa(sy, fm(w, sn[q])); wk = fa(wk, w);
             }
-            if (!(wk < .5f || fa(fm(sx, sx), fm(sy, sy)) < 1e-8f)) { ow = lw_code(sx, sy); oc = (uint8_t)c0; }
+            if (!(wk < .5f || fa(fm(sx, sx), fm(sy, sy)) < 1e-8f)) { ow = lw_code<REF>(sx, sy); oc = (uint8_t)c0; }
         }
     }
     dw[k] = ow; dc[k] = oc;
 }
 /* the ink plane (train --ink-head, prob254, 255 unknown): trilinear over the corners when every corner of weight > 1e-7 is known, else
    unknown; outside unknown (sample.c sample_warp_ink) */
-__global__ void lw_ink_k(const uint8_t *src, uint8_t *dst, int P, const float *rad) {
+/* bits (optional, --rv ink bits): src is the CT bytes and the plane's value is ink_val's, taken at the corners (= ink_bits_k's plane, without
+   writing it: the staged CT bytes stay as nn_aug_ct needs them) */
+static __device__ __forceinline__ int ink_val(const uint8_t *src, const uint8_t *bits, int it, size_t j) {
+    return !bits ? src[j] : bits[j >> 3] >> (j & 7) & 1 ? (it <= 255 && src[j] >= it ? 254 : 0) : 255;
+}
+__global__ void lw_ink_k(const uint8_t *src, uint8_t *dst, int P, const float *rad, const uint8_t *bits = nullptr, int it = 0) {
     const size_t n = (size_t)P * P * P, k = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     if (k >= n) return;
     size_t b0; float F[3]; uint8_t out = 255;
@@ -687,7 +713,7 @@ __global__ void lw_ink_k(const uint8_t *src, uint8_t *dst, int P, const float *r
         for (int cn = 0; cn < 8; cn++) {
             const float w = lw_w(F, cn);
             if (!(w > 1e-7f)) continue;
-            const int q = src[b0 + lw_off(P, cn)];
+            const int q = ink_val(src, bits, it, b0 + lw_off(P, cn));
             if (q == 255) { ok = 0; break; }
             acc = fa(acc, fm(w, (float)q));
         }
@@ -709,11 +735,15 @@ extern "C" void nn_label_warp(int kind, const uint8_t *a_h, const uint8_t *b_h, 
     if (a->used) CK(cudaStreamWaitEvent(s, a->done, 0));
     CK(cudaMemcpyAsync(a->stage, a_h, p3, cudaMemcpyHostToDevice, s));
     if (kind == 2) CK(cudaMemcpyAsync(a->stage + p3, b_h, p3, cudaMemcpyHostToDevice, s));
+    nn_ptick_fine("      y label h2d");
     const unsigned nb = nblk(p3, 256); const float *rad = (const float *)rad_d;
     if (kind == 0) lw_tm_k<<<nb, 256, 0, s>>>(a->stage, da, db, P, rad);   /* (db: the pmask plane, or nullptr) */
-    else if (kind == 1) lw_phase_k<<<nb, 256, 0, s>>>(a->stage, da, P, rad, a->cssn, a->cssn + 256);
+    else if (kind == 1 && g_lw_ref) lw_phase_k<1><<<nb, 256, 0, s>>>(a->stage, da, P, rad, a->cssn, a->cssn + 256);
+    else if (kind == 1) lw_phase_k<0><<<nb, 256, 0, s>>>(a->stage, da, P, rad, a->cssn, a->cssn + 256);
     else if (kind == 3) lw_ink_k<<<nb, 256, 0, s>>>(a->stage, da, P, rad);   /* (the ink plane) */
-    else lw_w4_k<<<nb, 256, 0, s>>>(a->stage, a->stage + p3, da, db, P, rad, a->cssn, a->cssn + 256);
+    else if (g_lw_ref) lw_w4_k<1><<<nb, 256, 0, s>>>(a->stage, a->stage + p3, da, db, P, rad, a->cssn, a->cssn + 256);
+    else lw_w4_k<0><<<nb, 256, 0, s>>>(a->stage, a->stage + p3, da, db, P, rad, a->cssn, a->cssn + 256);
+    a->key = kind == 1 && !g_lw_ref ? a_h : nullptr;   /* (the phase plane stays staged: nn_w4runs_label's source) */
     CK(cudaEventRecord(a->done, s)); a->used = 1;
     KCHECK();
 }
@@ -724,13 +754,14 @@ __global__ void ink_bits_k(uint8_t *st, const uint8_t *bits, int it, size_t n) {
     if (k >= n) return;
     st[k] = bits[k >> 3] >> (k & 7) & 1 ? (it <= 255 && st[k] >= it ? 254 : 0) : 255;
 }
-__global__ void ink_sym_k(const uint8_t *src, uint8_t *dst, int P, int code) {   /* out[i0 i1 i2] = in[sum_d stride[perm d] (flip d ? P-1-i_d : i_d)] */
+__global__ void ink_sym_k(const uint8_t *src, uint8_t *dst, int P, int code, const uint8_t *bits = nullptr, int it = 0) {   /* out[i0 i1 i2] = in[sum_d stride[perm d] (flip d ? P-1-i_d : i_d)]; bits: lw_ink_k's */
     const size_t n = (size_t)P * P * P, k = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     if (k >= n) return;
-    const int64_t i[3] = {(int64_t)(k / ((size_t)P * P)), (int64_t)(k / P % P), (int64_t)(k % P)}, stride[3] = {(int64_t)P * P, P, 1};
+    int i[3]; lw_zyx(k, P, i);
+    const int64_t stride[3] = {(int64_t)P * P, P, 1};
     int64_t q = 0;
     for (int d = 0; d < 3; d++) { const int pd = code >> (2 * d) & 3, fd = code >> (8 + d) & 1; q += stride[pd] * (fd ? P - 1 - i[d] : i[d]); }
-    dst[k] = src[q];
+    dst[k] = (uint8_t)ink_val(src, bits, it, (size_t)q);
 }
 /* one window's source-grid label plane through its cube symmetry (symcode: the radial record's h[5]) into da (train --gpu-aug 3 runs
    slots keep the phase on the source grid) */
@@ -740,7 +771,9 @@ extern "C" void nn_label_sym(const uint8_t *a_h, int symcode, int P, uint8_t *da
     const size_t p3 = (size_t)P * P * P;
     if (a->used) CK(cudaStreamWaitEvent(s, a->done, 0));
     CK(cudaMemcpyAsync(a->stage, a_h, p3, cudaMemcpyHostToDevice, s));
+    nn_ptick_fine("      y label h2d");
     ink_sym_k<<<nblk(p3, 256), 256, 0, s>>>(a->stage, da, P, symcode);
+    a->key = g_lw_ref ? nullptr : a_h;
     CK(cudaEventRecord(a->done, s)); a->used = 1;
     KCHECK();
 }
@@ -757,9 +790,13 @@ extern "C" void nn_w4runs_label(const uint8_t *side_h, const void *runs, const v
                     CK(cudaMemcpy(a->cssn + 256, sn_h, LW_PERIOD * sizeof(float), cudaMemcpyHostToDevice));
                     CK(cudaStreamSynchronize(0)); }   /* (once: a pageable upload of <= 64 KB is only staged on return, its device write queued on the default stream; the kernels below may run on the copy stream) */
     if (a->used) CK(cudaStreamWaitEvent(s, a->done, 0));
-    CK(cudaMemcpyAsync(a->stage, side_h, p3, cudaMemcpyHostToDevice, s));
+    if (a->key != side_h) CK(cudaMemcpyAsync(a->stage, side_h, p3, cudaMemcpyHostToDevice, s));   /* (else: staged by the phase plane's call just before) */
+    a->key = nullptr;
+    nn_ptick_fine("      y label h2d");
     if (nn_w4runs_apply(a->stage, P, P, P, r->tile, r->ms, r, a->stage, a->stage + p3, (void *)s)) { fprintf(stderr, "nn_w4runs_label: CUDA error\n"); abort(); }
-    if (warped) lw_w4_k<<<nb, 256, 0, s>>>(a->stage, a->stage + p3, da, db, P, (const float *)rad_d, a->cssn, a->cssn + 256);
+    nn_ptick_fine("      y w4 runs apply");
+    if (warped && g_lw_ref) lw_w4_k<1><<<nb, 256, 0, s>>>(a->stage, a->stage + p3, da, db, P, (const float *)rad_d, a->cssn, a->cssn + 256);
+    else if (warped) lw_w4_k<0><<<nb, 256, 0, s>>>(a->stage, a->stage + p3, da, db, P, (const float *)rad_d, a->cssn, a->cssn + 256);
     else { ink_sym_k<<<nb, 256, 0, s>>>(a->stage, da, P, symcode); ink_sym_k<<<nb, 256, 0, s>>>(a->stage + p3, db, P, symcode); }
     CK(cudaEventRecord(a->done, s)); a->used = 1;
     KCHECK();
@@ -771,9 +808,17 @@ extern "C" void nn_ink_bits(const uint8_t *ct8_h, const uint8_t *bits_h, int it,
     if (a->used) CK(cudaStreamWaitEvent(s, a->done, 0));
     CK(cudaMemcpyAsync(a->stage, ct8_h, p3, cudaMemcpyHostToDevice, s));
     CK(cudaMemcpyAsync(a->stage + p3, bits_h, p3 / 8, cudaMemcpyHostToDevice, s));
-    ink_bits_k<<<nb, 256, 0, s>>>(a->stage, a->stage + p3, it, p3);
-    if (warped) lw_ink_k<<<nb, 256, 0, s>>>(a->stage, da, P, (const float *)rad_d);
-    else ink_sym_k<<<nb, 256, 0, s>>>(a->stage, da, P, symcode);
+    nn_ptick_fine("      y label h2d");
+    if (g_lw_ref) {   /* (tests: the plane written over the CT bytes first) */
+        ink_bits_k<<<nb, 256, 0, s>>>(a->stage, a->stage + p3, it, p3);
+        if (warped) lw_ink_k<<<nb, 256, 0, s>>>(a->stage, da, P, (const float *)rad_d);
+        else ink_sym_k<<<nb, 256, 0, s>>>(a->stage, da, P, symcode);
+        a->key = nullptr;
+    } else {   /* the plane's values taken at the kernels' reads: the CT bytes stay staged for nn_aug_ct, which follows in train's upload */
+        if (warped) lw_ink_k<<<nb, 256, 0, s>>>(a->stage, da, P, (const float *)rad_d, a->stage + p3, it);
+        else ink_sym_k<<<nb, 256, 0, s>>>(a->stage, da, P, symcode, a->stage + p3, it);
+        a->key = ct8_h;
+    }
     CK(cudaEventRecord(a->done, s)); a->used = 1;
     KCHECK();
 }

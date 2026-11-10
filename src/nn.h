@@ -162,6 +162,8 @@ void nn_set_storage(const void *p, size_t bytes, int dt);
 int nn_storage(const void *p);          /* 8 = MX-fp8, 4 = MX-fp4, 0 = default */
 void nn_storage_forget(const void *p);
 void nn_storage_dump(const char *tag);   /* debug: prints the storage registry */
+void nn_label_warp_ref(int on);   /* tests: the label warps' reference kernels */
+void nn_aug_stage_reset(void);     /* before a batch's label / CT uploads: the staging buffer holds no plane of this batch yet */
 size_t nn_mx8_bytes(shape5 s);
 size_t nn_mx4_bytes(shape5 s);
 size_t nn_mx_bytes(shape5 s, int dt);   /* registry dt 8 / 4 */
