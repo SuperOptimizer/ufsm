@@ -366,10 +366,13 @@ static void aug_scan(aug_dev *a, const scan_plan *p, int P, __half *F, cudaStrea
     if (p->bop_on[0]) aug_bop_zy_k<<<dim3(nblk(P, 32), P), dim3(32, 8), (size_t)P * 32 * 2, s>>>(F, &pd->bop[0], P, 0);
     if (p->bop_on[1]) aug_bop_zy_k<<<dim3(nblk(P, 32), P), dim3(32, 8), (size_t)P * 32 * 2, s>>>(F, &pd->bop[1], P, 1);
     if (p->bop_on[2]) aug_bop_x_k<<<(unsigned)P2, 128, (size_t)P * 4, s>>>(F, &pd->bop[2], P);
+    nn_ptick_fine("      y load + blur ops");
     if (on & 1u << SA_BIAS) aug_point_k<<<nb, 256, 0, s>>>(F, pd, P, 0);
     if (on & (1u << SA_RING | 1u << SA_CUPPING)) aug_point_k<<<nb, 256, 0, s>>>(F, pd, P, 1);
     if (on & 1u << SA_SLICE) aug_point_k<<<nb, 256, 0, s>>>(F, pd, P, 2);
+    nn_ptick_fine("      y point ops");
     if (on & 1u << SA_NOISE) { aug_noise_k<<<nb, 256, 0, s>>>(F, pd, P, q); q += P2 * hp; }
+    nn_ptick_fine("      y noise");
     if (on & 1u << SA_CNOISE) {
         for (int z = 0; z < P; z++) {
             aug_cnoise_x_k<<<nblk(P, 64), 64, 0, s>>>(pd, P, z, q, a->pl[0]);
@@ -377,12 +380,14 @@ static void aug_scan(aug_dev *a, const scan_plan *p, int P, __half *F, cudaStrea
         }
         q += P2 * hp;
     }
+    nn_ptick_fine("      y correlated noise");
     if (on & 1u << SA_PAGANIN) {
         aug_exp_zy_k<<<nblk(P2, 128), 128, 0, s>>>(F, P, 0, p->pag_a);
         aug_exp_zy_k<<<nblk(P2, 128), 128, 0, s>>>(F, P, 1, p->pag_a);
         const int R = 32 * P * 4 <= 96 * 1024 ? 32 : 96 * 1024 / (P * 4);
         aug_exp_x_k<<<nblk(P2, R), 256, (size_t)R * P * 4, s>>>(F, P, p->pag_a, R);
     }
+    nn_ptick_fine("      y paganin");
     if (on & 1u << SA_GIN) {
         CK(cudaMemsetAsync(a->dsc, 0, 2 * sizeof(double), s)); CK(cudaMemsetAsync(a->usc, 0, sizeof(unsigned long long), s));
         aug_gin_stats_k<<<nb, 256, 0, s>>>(F, a->stage, pd, P, a->dsc, a->usc);
@@ -393,6 +398,7 @@ static void aug_scan(aug_dev *a, const scan_plan *p, int P, __half *F, cudaStrea
             aug_gin3_b_k<<<nblk(P2, 256), 256, 0, s>>>(F, pd, P, z, a->pl[3], a->pl[2], a->scal);
         }
     }
+    nn_ptick_fine("      y gin");
     for (int i = 0; i < p->ndrop; i++) {
         const int z = p->drop_z[i], mode = p->drop_mode[i];
         aug_plane_k<<<nblk(P2, 256), 256, 0, s>>>(F, pd, P, z, z ? z - 1 : 1, mode, q);
@@ -403,6 +409,7 @@ static void aug_scan(aug_dev *a, const scan_plan *p, int P, __half *F, cudaStrea
         if (n) aug_cut_k<<<nblk(n, 256), 256, 0, s>>>(F, pd, P, i, q);
         if (p->cut_noisy[i]) q += (uint64_t)(b1[0] - b0[0]) * (b1[1] - b0[1]) * hp;
     }
+    nn_ptick_fine("      y planes + cuts");
     if (p->hist_on) {
         if (p->tone) aug_lut_k<<<nb, 256, 0, s>>>(F, pd->lut, p3);
         CK(cudaMemsetAsync(a->hcnt, 0, 256 * sizeof(unsigned), s)); CK(cudaMemsetAsync(a->usc + 3, 0, sizeof(unsigned long long), s));
@@ -410,6 +417,7 @@ static void aug_scan(aug_dev *a, const scan_plan *p, int P, __half *F, cudaStrea
         aug_hist_map_k<<<1, 1, 0, s>>>(a->hcnt, a->usc, pd, a->hm);
         aug_hist_apply_k<<<nb, 256, 0, s>>>(F, a->hm, pd, p3);
     }
+    nn_ptick_fine("      y tone + histogram");
     CK(cudaMemsetAsync(a->usc + 1, 0, 2 * sizeof(unsigned long long), s));
     aug_final_k<<<nb, 256, 0, s>>>(F, a->stage, pd, P, a->usc);
 }
@@ -424,15 +432,18 @@ extern "C" void nn_aug_ct(const uint8_t *ct8_h, const void *rec_h_, const void *
     if (a->used) CK(cudaStreamWaitEvent(s, a->done, 0));
     CK(cudaMemcpyAsync(a->stage, ct8_h, p3, cudaMemcpyHostToDevice, s));
     CK(cudaMemcpyAsync(a->rec, rec_h, offsetof(scan_ct_rec, plan), cudaMemcpyHostToDevice, s));
+    nn_ptick_fine("    x ct bytes h2d");
     if (rec_h->scan) {
         CK(cudaMemcpyAsync(a->plan, &rec_h->plan, sizeof(scan_plan), cudaMemcpyHostToDevice, s));
         aug_scan(a, &rec_h->plan, P, (__half *)ct16, s);   /* (the CT channel's buffer as the work volume) */
+        nn_ptick_fine("    x ct scan aug");
     } else {
         CK(cudaMemsetAsync(a->usc + 1, 0, 2 * sizeof(unsigned long long), s));
         aug_sums_k<<<nblk(p3, 256), 256, 0, s>>>(a->stage, p3, a->usc);
     }
     aug_norm_k<<<1, 1, 0, s>>>(a->usc, p3, a->rec, a->scal);
     aug_write_k<<<nblk(p3, 256), 256, 0, s>>>(a->stage, P, (const float *)rad_d, a->rec, a->scal, a->ntab, ct16);
+    nn_ptick_fine("    x ct sums + write");
     CK(cudaEventRecord(a->done, s)); a->used = 1;
     KCHECK();
 }
