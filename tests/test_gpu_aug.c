@@ -16,6 +16,11 @@ static int fails;
 static float h2f_host(uint16_t h) { _Float16 t; memcpy(&t, &h, 2); return (float)t; }
 
 int main(int argc, char **argv) {
+    if (getenv("TGA_BENCH")) {   /* TGA_BENCH=P: the separable operator passes' times */
+        const int Pb = atoi(getenv("TGA_BENCH")); nn_init(0);
+        for (int taps = 5; taps <= 21; taps += 8) { double o[6]; nn_aug_bop_bench(Pb, taps, o); printf("bop P %d, %d taps: z shared %.1f ms, line %.1f | y shared %.1f, line %.1f | x row a block %.1f, rows + table %.1f\n", Pb, taps, o[0], o[1], o[2], o[3], o[4], o[5]); }
+        return 0;
+    }
     const int P = argc > 1 ? atoi(argv[1]) : 96; const size_t p3 = (size_t)P * P * P;
     nn_init(0);
     uint8_t *ct = malloc(p3), *tgt = malloc(2 * p3 + 64), *msk = malloc(p3), *ign = malloc(p3), *TM = malloc(p3);
@@ -147,7 +152,7 @@ int main(int argc, char **argv) {
             }
             if (sp) sampler_stop(sp);
         }
-        void *rd = nn_malloc(NN_RAD_REC(PW)), *hd = nn_malloc(2 * q3); uint16_t *hg = malloc(2 * q3);
+        void *rd = nn_malloc(NN_RAD_REC(PW)), *hd = nn_malloc(2 * q3); uint16_t *hg = malloc(2 * q3); int cn_n = 0;
         for (int i = 0; i < NB; i++) {
             CHECK(!memcmp(lab[0][i], lab[1][i], 5 * q3), "window %d: phase / winding / packed targets differ between --gpu-aug 0 and 1", i);
             CHECK(!memcmp(rr[0][i], rr[1][i], NN_RAD_REC(PW)), "window %d: radial records differ", i);
@@ -176,6 +181,37 @@ int main(int argc, char **argv) {
                 const double a = h2f_host(xa[i][k]), g = h2f_host(hg[k]), d = g - a; s1 += d; s2 += d * d;
                 if (warped) zbad += (xa[i][k] == 0) != (hg[k] == 0) && (a == 0 ? fabs(g) : fabs(a)) > 1e-6;   /* (outside the warp: exactly 0 in both) */
             }
+            if (ra[i]->scan && cn_n < 3) {   /* the chunked correlated-noise kernels against the per-plane ones: the same bytes at every chunk size */
+                scan_ct_rec *rc = nn_host_alloc(sizeof *rc); memcpy(rc, ra[i], sizeof *rc);
+                rc->plan.on |= 1u << SA_CNOISE; if (!(ra[i]->plan.on & 1u << SA_CNOISE)) { rc->plan.cnoise_rho = .6f; rc->plan.cnoise_s0 = 6.f; }
+                uint16_t *h0 = malloc(2 * q3), *h1 = malloc(2 * q3);
+                nn_aug_cnoise_chunk(0); nn_aug_ct(c8[i], rc, rd, PW, hd, 0); nn_d2h(h0, hd, 2 * q3);
+                CHECK(memcmp(h0, hg, 2 * q3) || (ra[i]->plan.on & 1u << SA_CNOISE), "window %d: correlated noise switched on changes nothing", i);
+                const int czs[] = {-1, 1, 5, PW};
+                for (int j = 0; j < 4; j++) {
+                    nn_aug_cnoise_chunk(czs[j]); nn_aug_ct(c8[i], rc, rd, PW, hd, 0); nn_d2h(h1, hd, 2 * q3);
+                    size_t nd = 0; for (size_t k = 0; k < q3; k++) nd += h0[k] != h1[k];
+                    CHECK(!nd, "window %d: correlated noise in chunks of %d planes differs from the per-plane kernels at %zu voxels", i, czs[j], nd);
+                }
+                nn_aug_cnoise_chunk(-1);
+                /* the line kernel of the separable operators (z, y) against the shared-memory one: a 5-tap blur on z, an irregular 4-cell
+                   operator (lowres-like, wide rows behind and ahead) on y, a 9-tap one on x (rows per block + weight table against one row a block) */
+                for (int ax = 0; ax < 3; ax++) {
+                    scan_bop *bo = &rc->plan.bop[ax]; memset(bo, 0, sizeof *bo); bo->P = PW; rc->plan.bop_on[ax] = 1;
+                    for (int q = 0; q < PW; q++) {
+                        int s0 = ax == 1 ? q / 4 * 4 - 6 : q - 2 - ax, n0 = ax == 1 ? 16 : 5 + 2 * ax; if (s0 < 0) { n0 += s0; s0 = 0; } if (s0 + n0 > PW) n0 = PW - s0;
+                        bo->s[q] = s0; bo->n[q] = n0; float sw = 0;
+                        for (int k = 0; k < n0; k++) { bo->w[q][k] = 1.f + (float)((q * 7 + k * 3) % 5) + (ax == 2 && cn_n == 1 ? (float)q : 0.f); sw += bo->w[q][k]; }   /* (the second window: every x row distinct, past the weight table) */
+                        for (int k = 0; k < n0; k++) bo->w[q][k] /= sw;
+                    }
+                }
+                nn_aug_bop_line(0); nn_aug_ct(c8[i], rc, rd, PW, hd, 0); nn_d2h(h0, hd, 2 * q3);
+                nn_aug_bop_line(1); nn_aug_ct(c8[i], rc, rd, PW, hd, 0); nn_d2h(h1, hd, 2 * q3);
+                { size_t nd = 0, nc = 0; for (size_t k = 0; k < q3; k++) { nd += h0[k] != h1[k]; nc += h0[k] != hg[k]; }
+                  CHECK(!nd, "window %d: separable operators through the line kernel differ from the shared-memory kernel at %zu voxels", i, nd);
+                  CHECK(nc > q3 / 4, "window %d: the test operators change only %zu voxels", i, nc); }
+                free(h0); free(h1); nn_host_free(rc); cn_n++;
+            }
             const double m = s1 / (double)q3, sdv = sqrt(fmax(s2 / (double)q3 - m * m, 0)), lim = sqrt(2.) * ra[i]->isg + .08;
             CHECK(fabs(m) < .03 + ra[i]->isg * .05 && sdv < lim, "window %d (scan %d, warp %d, isg %.3f): CT channel difference mean %.4f sd %.4f (limit %.3f)", i, ra[i]->scan, warped, ra[i]->isg, m, sdv, lim);
             CHECK(zbad < q3 / 1000, "window %d: %zu voxels inside the warp in one channel, outside in the other", i, zbad);
@@ -184,6 +220,7 @@ int main(int argc, char **argv) {
             free(xa[i]); free(lab[0][i]); free(lab[1][i]); free(rr[0][i]); free(rr[1][i]); nn_host_free(c8[i]); nn_host_free(ra[i]);
         }
         nn_free(rd); nn_free(hd); free(hg);
+        CHECK(cn_n > 0, "no window with scanner ops for the chunked correlated-noise check"); printf("test_gpu_aug: chunked correlated noise and line-kernel separable operators byte-identical to the per-plane / shared-memory kernels on %d windows (chunks default, 1, 5, %d planes)\n", cn_n, PW);
         CHECK(e2e_scan > 0 && e2e_scan < e2e_n && e2e_warp > 0, "the windows cover scanner ops on / off and warps (%d / %d scan, %d warped)", e2e_scan, e2e_n, e2e_warp);
         char rm[1500]; snprintf(rm, sizeof rm, "rm -rf %s", dir); if (system(rm)) {}
     }

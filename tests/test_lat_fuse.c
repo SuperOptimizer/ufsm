@@ -11,8 +11,62 @@ static uint64_t rs = 0x9e3779b97f4a7c15ull;
 static uint64_t rn(void) { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return rs; }
 static float ru(void) { return (float)((rn() >> 11) * (1.0 / 9007199254740992.0)) * 2.f - 1.f; }
 static uint16_t f2h(float f) { _Float16 h = (_Float16)f; uint16_t u; memcpy(&u, &h, 2); return u; }
+#include <time.h>
+static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + 1e-9 * t.tv_nsec; }
+/* TLF_BENCH=P: one 32-plane slab of a P^2 window, ms per call (min and median of 80; beside another process on the card only the min means anything: its time slices add 2 - 6 ms steps) of the fused kernels and of the slab chain's pieces */
+static int bench(int P) {
+    const int d = 8, h = P / 4, w = P / 4, D = 32, H = P, W = P, C = 16, R = 80;
+    const size_t pl = (size_t)h * w, cv = (size_t)d * pl, ns = (size_t)D * H * W;
+    uint16_t *hl = malloc(C * cv * 2); for (size_t k = 0; k < C * cv; k++) hl[k] = f2h(2.f * ru());
+    uint16_t *hx = malloc(ns * 2); for (size_t k = 0; k < ns; k++) hx[k] = f2h(1.5f * ru());
+    uint8_t *ht = malloc(7 * ns), *hm = malloc(ns);
+    for (size_t k = 0; k < 7 * ns; k++) ht[k] = (uint8_t)(rn() >> 20);
+    for (size_t k = 0; k < ns; k++) { const unsigned r = (unsigned)(rn() % 10); hm[k] = r < 2 ? 0 : r < 8 ? 1 : 8; }
+    uint8_t one7[7] = {1, 1, 1, 1, 1, 1, 1};
+    void *dl = nn_malloc(C * cv * 2), *dx = nn_malloc(ns * 2), *slab = nn_malloc(C * ns * 2);
+    uint8_t *dt = nn_malloc(7 * ns), *dm = nn_malloc(ns), *dw = nn_malloc(8);
+    nn_h2d(dl, hl, C * cv * 2); nn_h2d(dx, hx, ns * 2); nn_h2d(dt, ht, 7 * ns); nn_h2d(dm, hm, ns); nn_h2d(dw, one7, 7);
+    const shape5 two = {1, 2, D, H, W}, seven = {1, 7, D, H, W};
+    double *ds = nn_malloc(64 * sizeof(double)); nn_zero(ds, 64 * sizeof(double));
+    float *ss = nn_malloc(nn_loss_scratch(two) + 64), *sn = nn_malloc(nn_loss_scratch(seven) + 64), *g = nn_malloc(C * cv * 4), *scr = nn_malloc((size_t)C * D * pl * 4), *part = nn_malloc(nn_lat_fuse_part(7, h, w, D));
+    nn_zero(g, C * cv * 4);
+    float pw, rw; int u7; nn_loss_cfg_get(&pw, &rw, &u7);
+    const float l1[7] = {1, 1, 1, 1, 1, 1, 1};
+    nn_lat_up_slab_c(dl, 1, C, d, h, w, 0, D, slab, 0, d);
+    nn_loss_stats_acc(slab, dt, dm, dw, two, ds + 10); nn_loss_stats_acc((char *)slab + 2 * ns * 2, dt, dm, dw, seven, ds + 20);
+    nn_loss_stats_fin(ds + 10, dw, two, ss); nn_loss_stats_fin(ds + 20, dw, seven, sn); nn_sync();
+    static const char *nm[] = {"fused grad normal (7 ch)", "fused grad normal + loss sums", "fused grad guided side", "fused grad guided side + loss sums", "fused stats normal", "fused stats guided side",
+                               "fused stats normal, mask only", "chain: upsample 16 ch", "chain: guide fwd", "chain: stats normal", "chain: grad normal (in place)", "chain: adjoint 16 ch"};
+    printf("bench P %d, one 32-plane slab (%.1f Mvox):\n", P, ns / 1e6);
+    for (int k = 0; k < 12; k++) {
+        double t[80];
+        for (int r = 0; r < R; r++) {
+            if (k == 10) { nn_lat_up_slab_c(dl, 1, C, d, h, w, 0, D, slab, 0, d); }
+            nn_sync(); const double t0 = now();
+            switch (k) {
+            case 0: nn_lat_fuse_grad(dl, 1, 0, d, d, h, w, 0, D, 2, 7, 0, -1, nullptr, dt, dm, dw, sn, pw, rw, u7, l1, part, g, 0, d, nullptr); break;
+            case 1: nn_lat_fuse_grad(dl, 1, 0, d, d, h, w, 0, D, 2, 7, 0, -1, nullptr, dt, dm, dw, sn, pw, rw, u7, l1, part, g, 0, d, ds + 20); break;
+            case 2: nn_lat_fuse_grad(dl, 1, 0, d, d, h, w, 0, D, 0, 2, 1, 11, dx, dt, dm, dw, ss, pw, rw, -1, l1, part, g, 0, d, nullptr); break;
+            case 3: nn_lat_fuse_grad(dl, 1, 0, d, d, h, w, 0, D, 0, 2, 1, 11, dx, dt, dm, dw, ss, pw, rw, -1, l1, part, g, 0, d, ds + 10); break;
+            case 4: nn_lat_fuse_stats(dl, 1, 0, d, d, h, w, 0, D, 2, 7, 0, -1, nullptr, dt, dm, dw, pw, u7, ds + 20, 0); break;
+            case 5: nn_lat_fuse_stats(dl, 1, 0, d, d, h, w, 0, D, 0, 2, 1, 11, dx, dt, dm, dw, pw, -1, ds + 10, 0); break;
+            case 6: nn_lat_fuse_stats(dl, 1, 0, d, d, h, w, 0, D, 2, 7, 0, -1, nullptr, dt, dm, dw, pw, u7, ds + 20, 1); break;
+            case 7: nn_lat_up_slab_c(dl, 1, C, d, h, w, 0, D, slab, 0, d); break;
+            case 8: nn_lat_guide(dx, D, H, W, 0, D, slab, 11, 0, 0); break;
+            case 9: nn_loss_stats_acc((char *)slab + 2 * ns * 2, dt, dm, dw, seven, ds + 20); break;
+            case 10: nn_loss_grad_only((char *)slab + 2 * ns * 2, dt, dm, dw, seven, 0.f, (char *)slab + 2 * ns * 2, sn); break;
+            case 11: nn_lat_up_adj_c(slab, C, d, h, w, 0, D, g, scr, 0, d); break;
+            }
+            nn_sync(); t[r] = (now() - t0) * 1e3;
+        }
+        for (int a = 0; a < R; a++) for (int c = a + 1; c < R; c++) if (t[c] < t[a]) { const double x = t[a]; t[a] = t[c]; t[c] = x; }
+        printf("  %-36s min %7.2f ms  median %7.2f ms\n", nm[k], t[0], t[R / 2]);
+    }
+    return 0;
+}
 int main(void) {
     nn_init(0); nn_set_f16(1); nn_set_logits_h16(1); nn_set_loss_grad_h16(1); nn_set_loss_unit_ch7(6);
+    if (getenv("TLF_BENCH")) return bench(atoi(getenv("TLF_BENCH")));
     int fails = 0, cases = 0;
     static const int dims[4][4] = {{6, 5, 7, 8}, {4, 4, 4, 4}, {8, 3, 6, 16}, {2, 2, 3, 8}};   /* d h w, slab planes */
     for (int tc = 0; tc < 8; tc++) {

@@ -10,10 +10,13 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 
+#define AUG_CN_BYTES ((size_t)64 << 20)   /* the correlated noise's chunk of planes */
 typedef struct {
     uint8_t *stage; size_t stage_n;   /* the window's bytes: input, then output */
     scan_plan *plan;                  /* the device copy of the plan */
     scan_ct_rec *rec;                 /* the device copy of the record (without its plan) */
+    float *uw; uint16_t *ui; int *nu; /* the x operator's distinct weight rows (aug_bop_uniq_k) */
+    float *cn; size_t cn_n;           /* correlated noise: a chunk of planes (aug_cnoise_*_ck) */
     float *pl[4]; size_t pl_n;        /* P^2 planes: correlated-noise rows / state, GIN ring / plane */
     double *dsc;                      /* GIN g1, g2 */
     unsigned long long *usc;          /* GIN gn; output sum, sum of squares; hist count */
@@ -81,6 +84,94 @@ __global__ void aug_bop_zy_k(__half *F, const scan_bop *b, int P, int axis) {
         F[base + i * st + x] = f2h(a);
     }
 }
+/* the same along axis 0 or 1 with one thread per line (u, x), coalesced across x, and no shared memory (aug_bop_zy_k's P x 32 halves
+   are 64 KB of the SM's 100 KB at P 1024: one block of 256 threads per SM). In place through a ring of the last BOP_RING original
+   values: position c is read once, before any output at or beyond it is written; bop_ring_ok checks on the host that every row's
+   taps are still in the ring. The sums and their order are aug_bop_zy_k's */
+#define BOP_RING 64
+static int bop_ring_ok(const scan_bop *b, int P) {
+    int c = 0;
+    for (int i = 0; i < P; i++) {
+        const int need = b->s[i] + b->n[i] > i + 1 ? b->s[i] + b->n[i] : i + 1;
+        if (b->s[i] < 0 || need > P || b->n[i] < 1) return 0;
+        if (need > c) c = need;
+        if (c - b->s[i] > BOP_RING) return 0;
+    }
+    return 1;
+}
+__global__ void aug_bop_line_k(__half *F, const scan_bop *b, int P, int axis) {
+    const size_t P2 = (size_t)P * P, t = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (t >= P2) return;
+    const int u = (int)(t / P), x = (int)(t % P);
+    const size_t st = axis == 0 ? P2 : (size_t)P, base = (axis == 0 ? (size_t)u * P : (size_t)u * P2) + x;
+    float ring[BOP_RING]; int c = 0;
+    for (int i = 0; i < P; i++) {
+        const float *w = b->w[i]; const int s = b->s[i], n = b->n[i], need = s + n > i + 1 ? s + n : i + 1;
+        for (; c < need; c++) ring[c & (BOP_RING - 1)] = h2f(F[base + c * st]);
+        float a = w[0] * ring[s & (BOP_RING - 1)];
+        for (int k = 1; k < n; k++) a += w[k] * ring[(s + k) & (BOP_RING - 1)];
+        F[base + i * st] = f2h(a);
+    }
+}
+/* along x with R rows per block (R P halves in shared memory, the outputs strided over 256 threads) and the rows' weights from a
+   table of the operator's distinct rows (uw[ui[i]], built on the device by aug_bop_uniq_k: a blur's interior rows are one row, so a
+   warp's taps load a few cache lines instead of one row of b->w per thread; that cost 8 ms per tap and Gvoxel, against 1 in the z / y
+   passes where a warp shares its row). *nu == 0 (more than BOP_UNIQ distinct rows): b->w. The sums and their order are aug_bop_x_k's.
+   P 1024, 13 taps: 30 ms against 137 */
+#define BOP_UNIQ 64
+__global__ void aug_bop_uniq_k(const scan_bop *b, int P, float *uw, uint16_t *ui, int *nu) {
+    int U = 0, un[BOP_UNIQ];
+    for (int i = 0; i < P; i++) {
+        const int n = b->n[i]; int u = U - 1;   /* (the last rows first: neighbours repeat) */
+        for (; u >= 0; u--) if (un[u] == n) {
+            int k = 0; while (k < n && __float_as_uint(uw[(size_t)u * SA_MAXTAP + k]) == __float_as_uint(b->w[i][k])) k++;
+            if (k == n) break;
+        }
+        if (u < 0) { if (U == BOP_UNIQ) { *nu = 0; return; } u = U++; un[u] = n; for (int k = 0; k < n; k++) uw[(size_t)u * SA_MAXTAP + k] = b->w[i][k]; }
+        ui[i] = (uint16_t)u;
+    }
+    *nu = U;
+}
+__global__ void aug_bop_xu_k(__half *F, const scan_bop *b, int P, int R, const float *uw, const uint16_t *ui, const int *nu) {
+    extern __shared__ __half shu[];
+    const size_t r0 = (size_t)blockIdx.x * R, nrow = (size_t)P * P; __half *blk = F + r0 * P;
+    const int n = (int)((r0 + R <= nrow ? R : nrow - r0) * P), tab = *nu > 0;
+    for (int j = threadIdx.x; j < n; j += blockDim.x) shu[j] = blk[j];
+    __syncthreads();
+    for (int j = threadIdx.x; j < n; j += blockDim.x) {
+        const int i = j % P; const __half *row = shu + (j - i);
+        const float *w = tab ? uw + (size_t)ui[i] * SA_MAXTAP : b->w[i]; const int s = b->s[i], nt = b->n[i];
+        float a = w[0] * h2f(row[s]);
+        for (int t = 1; t < nt; t++) a += w[t] * h2f(row[s + t]);
+        blk[j] = f2h(a);
+    }
+}
+static int g_bop_line = 1;   /* tests: 0 = the shared-memory kernel */
+extern "C" void nn_aug_bop_line(int on) { g_bop_line = on; }
+/* tests / tuning: ms of one pass of a taps-wide operator over a P^3 window: out[0] z shared-memory (0 above its default shared-memory
+   limit), [1] z line, [2] y shared, [3] y line, [4] x one row a block, [5] x rows + table */
+extern "C" void nn_aug_bop_bench(int P, int taps, double *out) {
+    const size_t P2 = (size_t)P * P, p3 = P2 * P; __half *F; scan_bop *bd, *bh = (scan_bop *)calloc(1, sizeof *bh); float *uw; uint16_t *ui; int *nu;
+    CK(cudaMalloc(&F, p3 * 2)); CK(cudaMalloc(&bd, sizeof *bd)); CK(cudaMemset(F, 0, p3 * 2));
+    CK(cudaMalloc(&uw, BOP_UNIQ * SA_MAXTAP * 4)); CK(cudaMalloc(&ui, SA_MAXP * 2)); CK(cudaMalloc(&nu, 4));
+    for (int i = 0; i < P; i++) { int s0 = i - taps / 2, n = taps; if (s0 < 0) { n += s0; s0 = 0; } if (s0 + n > P) n = P - s0; bh->s[i] = s0; bh->n[i] = n; for (int k = 0; k < n; k++) bh->w[i][k] = 1.f / n; }
+    bh->P = P; CK(cudaMemcpy(bd, bh, sizeof *bh, cudaMemcpyHostToDevice)); CK(cudaDeviceSynchronize());
+    const int R = 16384 / P < 1 ? 1 : 16384 / P;
+    for (int m = 0; m < 6; m++) {
+        double best = 1e30;
+        for (int r = 0; r < 4; r++) {
+            CK(cudaDeviceSynchronize()); timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
+            if (m == 4) aug_bop_x_k<<<(unsigned)P2, 128, (size_t)P * 4>>>(F, bd, P);
+            else if (m == 5) { aug_bop_uniq_k<<<1, 1>>>(bd, P, uw, ui, nu); aug_bop_xu_k<<<nblk(P2, R), 256, (size_t)R * P * 2>>>(F, bd, P, R, uw, ui, nu); }
+            else if (m & 1) aug_bop_line_k<<<nblk(P2, 128), 128>>>(F, bd, P, m / 2);
+            else if ((size_t)P * 32 * 2 <= 48 * 1024) aug_bop_zy_k<<<dim3(nblk(P, 32), P), dim3(32, 8), (size_t)P * 32 * 2>>>(F, bd, P, m / 2);
+            KCHECK(); CK(cudaDeviceSynchronize()); clock_gettime(CLOCK_MONOTONIC, &t1);
+            const double ms = (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) * 1e-6; if (ms < best) best = ms;
+        }
+        out[m] = best;
+    }
+    cudaFree(F); cudaFree(bd); cudaFree(uw); cudaFree(ui); cudaFree(nu); free(bh);
+}
 __global__ void aug_point_k(__half *F, const scan_plan *p, int P, int what) {   /* what: 0 bias, 1 radial, 2 slice */
     const size_t P2 = (size_t)P * P, n = P2 * P, k = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     if (k >= n) return;
@@ -127,6 +218,37 @@ __global__ void aug_cnoise_yz_k(__half *F, const scan_plan *p, int P, int z, con
         const float vz = z ? rho * PP[i] + scale * vy : vy; PP[i] = vz;
         pl[i] = f2h(h2f(pl[i]) + s0 * vz);
     }
+}
+static int g_cn_z = -1;   /* planes per chunk (-1: what the chunk buffer holds; 0: the per-plane kernels; tests) */
+/* the same in chunks of planes [z0, z0 + nzc) (one kernel pair per plane ran 2 P launches of P threads each: 577 ms of a P 1024 window,
+   the card nearly idle): the x recurrences of nzc P rows at once, then y per (plane, column), then z per (y, x) through the chunk with
+   the carried plane PP. Each element's operations and their order are the per-plane kernels'. S: nzc P^2 floats */
+__global__ void aug_cnoise_x_ck(const scan_plan *p, int P, int z0, int nzc, uint64_t q0, float *S) {
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= nzc * P) return;
+    const int zr = t / P, y = t % P, z = z0 + zr;
+    const float rho = p->cnoise_rho, scale = sqrtf(1.f - rho * rho); const uint64_t hp = (uint64_t)(P + 1) / 2, qr = q0 + ((uint64_t)z * P + y) * hp;
+    float last = 0; float *row = S + ((size_t)zr * P + y) * P;
+    for (int x = 0; x < P; x++) { const float g = gauss_at(p->ns, qr, x), vx = x ? rho * last + scale * g : g; last = vx; row[x] = vx; }
+}
+__global__ void aug_cnoise_y_ck(const scan_plan *p, int P, int nzc, float *S) {
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= nzc * P) return;
+    const int zr = t / P, x = t % P;
+    const float rho = p->cnoise_rho, scale = sqrtf(1.f - rho * rho);
+    float prev = 0; float *col = S + (size_t)zr * P * P + x;
+    for (int y = 0; y < P; y++) { const float vx = col[(size_t)y * P], vy = y ? rho * prev + scale * vx : vx; prev = vy; col[(size_t)y * P] = vy; }
+}
+__global__ void aug_cnoise_z_ck(__half *F, const scan_plan *p, int P, int z0, int nzc, const float *S, float *PP) {
+    const size_t P2 = (size_t)P * P, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= P2) return;
+    const float rho = p->cnoise_rho, scale = sqrtf(1.f - rho * rho), s0 = p->cnoise_s0;
+    float pz = z0 ? PP[i] : 0.f;
+    for (int zr = 0; zr < nzc; zr++) {
+        const int z = z0 + zr; const float vy = S[(size_t)zr * P2 + i], vz = z ? rho * pz + scale * vy : vy; pz = vz;
+        __half *f = F + (size_t)z * P2 + i; *f = f2h(h2f(*f) + s0 * vz);
+    }
+    PP[i] = pz;
 }
 /* paganin's two-sided exponential along axis 0 or 1: one thread per line (u, x), coalesced across x */
 __global__ void aug_exp_zy_k(__half *F, int P, int axis, float a) {
@@ -343,8 +465,11 @@ static aug_dev *aug_get(int P, int ns) {   /* ns: the staging buffer in P^3 byte
     const size_t p3 = (size_t)P * P * P, p2 = (size_t)P * P;
     if (a->stage_n < ns * p3) { if (a->stage) { CK(cudaDeviceSynchronize()); cudaFree(a->stage); } CK(cudaMalloc(&a->stage, ns * p3)); a->stage_n = ns * p3; }
     if (a->pl_n < p2) { for (int i = 0; i < 4; i++) { if (a->pl[i]) cudaFree(a->pl[i]); CK(cudaMalloc(&a->pl[i], p2 * sizeof(float))); } a->pl_n = p2; }
+    { const size_t zc = AUG_CN_BYTES / (p2 * sizeof(float)) < 1 ? 1 : AUG_CN_BYTES / (p2 * sizeof(float)), want = (zc < (size_t)P ? zc : (size_t)P) * p2;
+      if (a->cn_n < want) { if (a->cn) { CK(cudaDeviceSynchronize()); cudaFree(a->cn); } CK(cudaMalloc(&a->cn, want * sizeof(float))); a->cn_n = want; } }
     if (!a->plan) {
         CK(cudaMalloc(&a->plan, sizeof(scan_plan))); CK(cudaMalloc(&a->rec, sizeof(scan_ct_rec)));
+        CK(cudaMalloc(&a->uw, 64 * SA_MAXTAP * sizeof(float))); CK(cudaMalloc(&a->ui, SA_MAXP * sizeof(uint16_t))); CK(cudaMalloc(&a->nu, sizeof(int)));
         CK(cudaMalloc(&a->dsc, 2 * sizeof(double))); CK(cudaMalloc(&a->usc, 4 * sizeof(unsigned long long)));
         CK(cudaMalloc(&a->hcnt, 256 * sizeof(unsigned))); CK(cudaMalloc(&a->hm, 257 * sizeof(float))); CK(cudaMalloc(&a->scal, 4 * sizeof(float)));
         CK(cudaMalloc(&a->ntab, 65536 * sizeof(float))); aug_ntab_k<<<256, 256>>>(a->ntab); KCHECK(); CK(cudaDeviceSynchronize());
@@ -354,7 +479,8 @@ static aug_dev *aug_get(int P, int ns) {   /* ns: the staging buffer in P^3 byte
     }
     return a;
 }
-extern "C" size_t nn_aug_device_bytes(int P) { const size_t p3 = (size_t)P * P * P; return p3 + 4 * (size_t)P * P * 4 + sizeof(scan_plan) + sizeof(scan_ct_rec) + 65536 * 4 + 8192; }
+extern "C" void nn_aug_cnoise_chunk(int nz) { g_cn_z = nz; }
+extern "C" size_t nn_aug_device_bytes(int P) { const size_t p3 = (size_t)P * P * P, p2 = (size_t)P * P, zc = AUG_CN_BYTES / (p2 * 4) < 1 ? 1 : AUG_CN_BYTES / (p2 * 4); return p3 + 4 * p2 * 4 + (zc < (size_t)P ? zc : (size_t)P) * p2 * 4 + sizeof(scan_plan) + sizeof(scan_ct_rec) + 65536 * 4 + 8192; }
 extern "C" size_t nn_label_warp_device_bytes(int P) { return (size_t)P * P * P + 2048; }   /* --gpu-aug 2: the second P^3 of staging, the tables */
 
 /* the scanner ops of rec_h's plan on F (P^3 16-bit, the input bytes loaded), the stream s */
@@ -363,9 +489,15 @@ static void aug_scan(aug_dev *a, const scan_plan *p, int P, __half *F, cudaStrea
     const uint64_t hp = (uint64_t)(P + 1) / 2; uint64_t q = 0;   /* the noise stream's calls so far */
     scan_plan *pd = a->plan;
     aug_load_k<<<nb, 256, 0, s>>>(a->stage, F, p3, (on & 1u << SA_AIR) != 0, p->air_level);
-    if (p->bop_on[0]) aug_bop_zy_k<<<dim3(nblk(P, 32), P), dim3(32, 8), (size_t)P * 32 * 2, s>>>(F, &pd->bop[0], P, 0);
-    if (p->bop_on[1]) aug_bop_zy_k<<<dim3(nblk(P, 32), P), dim3(32, 8), (size_t)P * 32 * 2, s>>>(F, &pd->bop[1], P, 1);
-    if (p->bop_on[2]) aug_bop_x_k<<<(unsigned)P2, 128, (size_t)P * 4, s>>>(F, &pd->bop[2], P);
+    for (int ax = 0; ax < 2; ax++) if (p->bop_on[ax]) {
+        if (g_bop_line && bop_ring_ok(&p->bop[ax], P)) aug_bop_line_k<<<nblk(P2, 128), 128, 0, s>>>(F, &pd->bop[ax], P, ax);
+        else aug_bop_zy_k<<<dim3(nblk(P, 32), P), dim3(32, 8), (size_t)P * 32 * 2, s>>>(F, &pd->bop[ax], P, ax);
+    }
+    if (p->bop_on[2]) {
+        const int R = 16384 / P < 1 ? 1 : 16384 / P;   /* 32 KB of halves */
+        if (g_bop_line) { aug_bop_uniq_k<<<1, 1, 0, s>>>(&pd->bop[2], P, a->uw, a->ui, a->nu); aug_bop_xu_k<<<nblk(P2, R), 256, (size_t)R * P * 2, s>>>(F, &pd->bop[2], P, R, a->uw, a->ui, a->nu); }
+        else aug_bop_x_k<<<(unsigned)P2, 128, (size_t)P * 4, s>>>(F, &pd->bop[2], P);
+    }
     nn_ptick_fine("      y load + blur ops");
     if (on & 1u << SA_BIAS) aug_point_k<<<nb, 256, 0, s>>>(F, pd, P, 0);
     if (on & (1u << SA_RING | 1u << SA_CUPPING)) aug_point_k<<<nb, 256, 0, s>>>(F, pd, P, 1);
@@ -374,7 +506,14 @@ static void aug_scan(aug_dev *a, const scan_plan *p, int P, __half *F, cudaStrea
     if (on & 1u << SA_NOISE) { aug_noise_k<<<nb, 256, 0, s>>>(F, pd, P, q); q += P2 * hp; }
     nn_ptick_fine("      y noise");
     if (on & 1u << SA_CNOISE) {
-        for (int z = 0; z < P; z++) {
+        const int zmax = (int)(a->cn_n / P2), zc = g_cn_z < 0 || g_cn_z > zmax ? zmax : g_cn_z;
+        if (zc >= 1) for (int z = 0; z < P; z += zc) {
+            const int nzc = z + zc < P ? zc : P - z;
+            aug_cnoise_x_ck<<<nblk((size_t)nzc * P, 64), 64, 0, s>>>(pd, P, z, nzc, q, a->cn);
+            aug_cnoise_y_ck<<<nblk((size_t)nzc * P, 64), 64, 0, s>>>(pd, P, nzc, a->cn);
+            aug_cnoise_z_ck<<<nblk(P2, 256), 256, 0, s>>>(F, pd, P, z, nzc, a->cn, a->pl[1]);
+        }
+        else for (int z = 0; z < P; z++) {
             aug_cnoise_x_k<<<nblk(P, 64), 64, 0, s>>>(pd, P, z, q, a->pl[0]);
             aug_cnoise_yz_k<<<nblk(P, 64), 64, 0, s>>>(F, pd, P, z, a->pl[0], a->pl[1]);
         }
