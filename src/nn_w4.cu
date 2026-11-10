@@ -19,15 +19,13 @@
 namespace {
 enum { NCTX = 2, MAXDEV = 8, UNK = 0xFFFF };
 
-__device__ __forceinline__ int w4_joined(int va, int vb, int ms, int *t) {   /* w4_row_joins: joined, *t the turn the step adds (-1, 0, 1) */
+__host__ __device__ __forceinline__ int w4_joined(int va, int vb, int ms, int *t) {   /* w4_row_joins: joined, *t the turn the step adds (-1, 0, 1) */
     const int d = vb - va, st = d >= 126 ? d - 252 : d < -126 ? d + 252 : d;
     *t = (st > d) - (st < d);
     return va < 252 && vb < 252 && st <= ms && st >= -ms;
 }
 /* strip [nz][ny][W], tiles of T along x; row r = (z * ny + y) * ntx + tx */
-__global__ void w4_runs_k(const uint8_t *ph, int nz, int ny, int W, int T, int ntx, int ms, uint16_t *R, uint32_t *nrun) {
-    const size_t r = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
-    if (r >= (size_t)nz * ny * ntx) return;
+__host__ __device__ __forceinline__ void w4_runs_row(size_t r, const uint8_t *ph, int nz, int ny, int W, int T, int ntx, int ms, uint16_t *R, uint32_t *nrun) {   /* (one row: w4_runs_k, the CPU fallback) */
     const int tx = (int)(r % ntx), x0 = tx * T, x1 = min(W, x0 + T); const size_t row = (r / ntx) * W;
     int ord = -1, j = 0, prev = 255;
     for (int x = x0; x < x1; x++) {
@@ -39,10 +37,12 @@ __global__ void w4_runs_k(const uint8_t *ph, int nz, int ny, int W, int T, int n
     }
     nrun[r] = (uint32_t)(ord + 1);
 }
-__global__ void w4_events_k(const uint8_t *ph, const uint16_t *R, int nz, int ny, int W, int T, int ntx, int ms, int emit, const uint32_t *runoff, const uint32_t *evoff,
-                            uint32_t *nev, w4d_run *runs, w4d_ev *ev) {
+__global__ void w4_runs_k(const uint8_t *ph, int nz, int ny, int W, int T, int ntx, int ms, uint16_t *R, uint32_t *nrun) {
     const size_t r = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
-    if (r >= (size_t)nz * ny * ntx) return;
+    if (r < (size_t)nz * ny * ntx) w4_runs_row(r, ph, nz, ny, W, T, ntx, ms, R, nrun);
+}
+__host__ __device__ __forceinline__ void w4_events_row(size_t r, const uint8_t *ph, const uint16_t *R, int nz, int ny, int W, int T, int ntx, int ms, int emit, const uint32_t *runoff, const uint32_t *evoff,
+                                                      uint32_t *nev, w4d_run *runs, w4d_ev *ev) {   /* (one row: w4_events_k, the CPU fallback) */
     const int tx = (int)(r % ntx), x0 = tx * T, x1 = min(W, x0 + T), y = (int)(r / ntx % ny), z = (int)(r / ntx / ny); const size_t row = (r / ntx) * W, pl = (size_t)ny * W;
     const int has[2] = {y > 0, z > 0}; const size_t nb[2] = {row - W, row - pl}, nr[2] = {r - ntx, r - (size_t)ny * ntx};   /* the y / z neighbour rows */
     const uint32_t ro = emit ? runoff[r] : 0, eo = emit ? evoff[r] : 0;
@@ -69,9 +69,12 @@ __global__ void w4_events_k(const uint8_t *ph, const uint16_t *R, int nz, int ny
     close();
     if (!emit) nev[r] = ne;
 }
-__global__ void w4_out_k(uint8_t *ph, const uint16_t *R, int nz, int ny, int W, int T, int ntx, const uint32_t *runoff, const uint8_t *rro, const uint8_t *rcb, uint8_t *comp) {
-    const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
-    if (i >= (size_t)nz * ny * W) return;
+__global__ void w4_events_k(const uint8_t *ph, const uint16_t *R, int nz, int ny, int W, int T, int ntx, int ms, int emit, const uint32_t *runoff, const uint32_t *evoff,
+                            uint32_t *nev, w4d_run *runs, w4d_ev *ev) {
+    const size_t r = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (r < (size_t)nz * ny * ntx) w4_events_row(r, ph, R, nz, ny, W, T, ntx, ms, emit, runoff, evoff, nev, runs, ev);
+}
+__host__ __device__ __forceinline__ void w4_out_vox(size_t i, uint8_t *ph, const uint16_t *R, int nz, int ny, int W, int T, int ntx, const uint32_t *runoff, const uint8_t *rro, const uint8_t *rcb, uint8_t *comp) {
     const uint16_t q = R[i]; uint8_t w = 255, c = 255;
     if (q != UNK) {
         const size_t r = (i / W) * ntx + (i % W) / T; const uint32_t run = runoff[r] + (q >> 2);
@@ -79,6 +82,10 @@ __global__ void w4_out_k(uint8_t *ph, const uint16_t *R, int nz, int ny, int W, 
         if (c != 255) w = (uint8_t)(((ph[i] + 252 * ((q + rro[run]) & 3) + 2) / 4) % 252);   /* (w4_tab) */
     }
     ph[i] = w; comp[i] = c;
+}
+__global__ void w4_out_k(uint8_t *ph, const uint16_t *R, int nz, int ny, int W, int T, int ntx, const uint32_t *runoff, const uint8_t *rro, const uint8_t *rcb, uint8_t *comp) {
+    const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i < (size_t)nz * ny * W) w4_out_vox(i, ph, R, nz, ny, W, T, ntx, runoff, rro, rcb, comp);
 }
 
 /* --- the host side: band.c's union-find (w4_find / w4_join / the component choice of band_wind4) replayed over the run events. A
@@ -183,7 +190,70 @@ template <typename T> int hgrow(T **p, size_t need, size_t el) {
     if (*p) cudaFreeHost(*p); *p = nullptr;
     return cudaHostAlloc((void **)p, need * el, cudaHostAllocDefault) == cudaSuccess ? 0 : -2;
 }
-int ctx_run(w4ctx *c, const uint8_t *phase, int D, int H, int W, int tile, int ms, size_t minsize, int maxcomp, uint8_t *w4, uint8_t *comp, band_wind4_stats *st) {
+/* w4runs: one strip's run offsets (+ base: the runs of the strips before) and LUT appended */
+int runs_append(w4runs *o, const uint32_t *off, size_t rows, uint32_t base, const uint8_t *ro, const uint8_t *cb, size_t nr) {
+    if (o->noff + rows > o->cap_off) {
+        const size_t cap = (o->noff + rows) * 5 / 4 + 1024; uint32_t *p = (uint32_t *)realloc(o->off, cap * sizeof *p); if (!p) return -1; o->off = p; o->cap_off = cap;
+    }
+    if (o->nr + nr > o->cap_r) {
+        const size_t cap = (o->nr + nr) * 5 / 4 + 4096; uint8_t *a = (uint8_t *)realloc(o->ro, cap); if (!a) return -1; o->ro = a;
+        uint8_t *b = (uint8_t *)realloc(o->cb, cap); if (!b) return -1; o->cb = b; o->cap_r = cap;
+    }
+    for (size_t r = 0; r < rows; r++) o->off[o->noff + r] = off[r] + base;
+    memcpy(o->ro + o->nr, ro, nr); memcpy(o->cb + o->nr, cb, nr);
+    o->noff += rows; o->nr += nr;
+    return 0;
+}
+/* the tile geometry band_wind4_dev uses (one: the whole window as one tile) */
+void w4_geom(int D, int H, int W, int tile, int *one, int *T, int *ntx) {
+    *one = tile <= 0 || (tile >= D && tile >= H && tile >= W); *T = *one ? (D > H ? (D > W ? D : W) : (H > W ? H : W)) : tile; *ntx = (W + *T - 1) / *T;
+}
+/* the runs path on the CPU (no device): the row bodies of w4_runs_k / w4_events_k in loops, the same offsets, replay and numbering */
+int cpu_runs(const uint8_t *phase, int D, int H, int W, int tile, int ms, size_t minsize, int maxcomp, w4runs *o, band_wind4_stats *st) {
+    int one, T, ntx; w4_geom(D, H, W, tile, &one, &T, &ntx);
+    if (T >= 16384 || ntx > 1023) return -1;
+    const int mc = maxcomp > 15 ? 15 : maxcomp;
+    int next = 0; band_wind4_stats acc = {0}; o->noff = o->nr = 0;
+    const size_t sv = (size_t)(T < D ? T : D) * (T < H ? T : H) * W, sr = (size_t)(T < D ? T : D) * (T < H ? T : H) * ntx;
+    uint8_t *ph = (uint8_t *)malloc(sv); uint16_t *R = (uint16_t *)malloc(sv * 2); uint32_t *cnt = (uint32_t *)malloc(2 * sr * 4), *off = (uint32_t *)malloc(2 * sr * 4);
+    w4d_run *runs = nullptr; w4d_ev *ev = nullptr; uint8_t *lut = nullptr; size_t capr = 0, cape = 0; int rc = 0; uint32_t gbase = 0;
+    if (!ph || !R || !cnt || !off) rc = -1;
+    for (int z0 = 0; z0 < D && !rc; z0 += T) for (int y0 = 0; y0 < H && !rc; y0 += T) {
+        const int nz = D - z0 < T ? D - z0 : T, ny = H - y0 < T ? H - y0 : T;
+        const size_t rows = (size_t)nz * ny * ntx;
+        for (int z = 0; z < nz; z++) for (int y = 0; y < ny; y++) memcpy(ph + ((size_t)z * ny + y) * W, phase + ((size_t)(z0 + z) * H + y0 + y) * W, (size_t)W);
+        for (size_t r = 0; r < rows; r++) w4_runs_row(r, ph, nz, ny, W, T, ntx, ms, R, cnt);
+        for (size_t r = 0; r < rows; r++) w4_events_row(r, ph, R, nz, ny, W, T, ntx, ms, 0, nullptr, nullptr, cnt + rows, nullptr, nullptr);
+        size_t nr = 0, ne = 0, tr0[1025], te0[1025];
+        for (int tx = 0; tx < ntx; tx++) {
+            tr0[tx] = nr; te0[tx] = ne;
+            for (size_t zy = 0; zy < (size_t)nz * ny; zy++) { const size_t r = zy * ntx + tx; off[r] = (uint32_t)nr; off[rows + r] = (uint32_t)ne; nr += cnt[r]; ne += cnt[rows + r]; }
+        }
+        tr0[ntx] = nr; te0[ntx] = ne;
+        if (nr > 0xfffffff0u || ne > 0xfffffff0u || (uint64_t)gbase + nr > 0xfffffff0u) { rc = -1; break; }
+        if (nr > capr) { capr = nr + nr / 4 + 4096; free(runs); free(lut); runs = (w4d_run *)malloc(capr * sizeof *runs); lut = (uint8_t *)malloc(2 * capr); if (!runs || !lut) { rc = -1; break; } }
+        if (ne > cape) { cape = ne + ne / 4 + 4096; free(ev); ev = (w4d_ev *)malloc(cape * sizeof *ev); if (!ev) { rc = -1; break; } }
+        for (size_t r = 0; r < rows; r++) w4_events_row(r, ph, R, nz, ny, W, T, ntx, ms, 1, off, off + rows, nullptr, runs, ev);
+        uint8_t *ro = lut, *cb = lut + nr;
+        for (int tx = 0; tx < ntx && !rc; tx++) {
+            const size_t a = tr0[tx], n = tr0[tx + 1] - a;
+            const int nc = replay(runs + a, n, ev + te0[tx], te0[tx + 1] - te0[tx], (uint32_t)a, minsize, mc, ro + a, cb + a, &acc);
+            if (nc < 0) { rc = -1; break; }
+            const int base = next; next += nc;
+            if (!one) for (size_t k = a; k < a + n; k++) { if (cb[k] == 255 || base + cb[k] > 254) { cb[k] = 255; ro[k] = 255; } else cb[k] = (uint8_t)(base + cb[k]); }
+        }
+        if (!rc && runs_append(o, off, rows, gbase, ro, cb, nr)) rc = -1;
+        gbase += (uint32_t)nr;
+    }
+    free(ph); free(R); free(cnt); free(off); free(runs); free(ev); free(lut);
+    if (rc) return -1;
+    if (!one && next > 255) next = 255;
+    acc.ncomp = next; o->ncomp = next;
+    if (st) *st = acc;
+    return next;
+}
+int ctx_run(w4ctx *c, const uint8_t *phase, int D, int H, int W, int tile, int ms, size_t minsize, int maxcomp, uint8_t *w4, uint8_t *comp, band_wind4_stats *st, w4runs *ro_out = nullptr) {
+    uint32_t gbase = 0; if (ro_out) ro_out->noff = ro_out->nr = 0;
     CK(cudaSetDevice(c->dev));
     if (!c->ready) { CK(cudaStreamCreate(&c->st)); c->ready = 1; }
     const int one = tile <= 0 || (tile >= D && tile >= H && tile >= W), T = one ? (D > H ? (D > W ? D : W) : (H > W ? H : W)) : tile, ntx = (W + T - 1) / T;
@@ -242,6 +312,10 @@ int ctx_run(w4ctx *c, const uint8_t *phase, int D, int H, int W, int tile, int m
         }
         if (prof) { clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t1); static double tr; static size_t se, sr; tr += (t1.tv_sec - t0.tv_sec) + 1e-9 * (t1.tv_nsec - t0.tv_nsec); se += ne; sr += nr;
                     if (z0 + T >= D && y0 + T >= H) fprintf(stderr, "band_wind4_dev: replay %.3f CPU-s so far, %zu runs, %zu events\n", tr, sr, se); }
+        if (ro_out) {   /* (the runs path: the offsets and LUT kept, no planes) */
+            if ((uint64_t)gbase + nr > 0xfffffff0u || runs_append(ro_out, c->h_off, rows, gbase, ro, cb, nr)) return -1;
+            gbase += (uint32_t)nr; continue;
+        }
         if (nr) CK(cudaMemcpyAsync(c->d_lut, c->h_lut, 2 * nr, cudaMemcpyHostToDevice, c->st));
         w4_out_k<<<(unsigned)((vox + 255) / 256), 256, 0, c->st>>>(c->d_ph, c->d_R, nz, ny, W, T, ntx, c->d_off, c->d_lut, c->d_lut + nr, c->d_c);
         CK(cudaMemcpy2DAsync(w4 + off0, (size_t)H * W, c->d_ph, (size_t)ny * W, (size_t)ny * W, nz, cudaMemcpyDeviceToHost, c->st));
@@ -250,11 +324,82 @@ int ctx_run(w4ctx *c, const uint8_t *phase, int D, int H, int W, int tile, int m
         if (cudaGetLastError() != cudaSuccess) return -2;
     }
     if (!one && next > 255) next = 255;
-    acc.ncomp = next;
+    acc.ncomp = next; if (ro_out) ro_out->ncomp = next;
     if (st) *st = acc;
     return next;
 }
+struct w4app { uint8_t *d_ph, *d_c; uint16_t *d_R; uint32_t *d_cnt; size_t vox, rows; uint32_t *d_off; size_t noff; uint8_t *d_lut; size_t nlut; };   /* (per device: the trainer uploads on one copy stream per device, so the scratch is reused in stream order) */
+w4app g_app[MAXDEV]; pthread_mutex_t g_app_mu[MAXDEV] = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_MUTEX_INITIALIZER, PTHREAD_MUTEX_INITIALIZER, PTHREAD_MUTEX_INITIALIZER,
+                                                           PTHREAD_MUTEX_INITIALIZER, PTHREAD_MUTEX_INITIALIZER, PTHREAD_MUTEX_INITIALIZER, PTHREAD_MUTEX_INITIALIZER};
 }   // namespace
+
+extern "C" int w4runs_available(void) { return 1; }
+extern "C" int band_wind4_runs(const uint8_t *phase, int D, int H, int W, int tile, int maxstep, size_t minsize, int maxcomp, w4runs *o, band_wind4_stats *st) {
+    o->tile = tile; o->ms = maxstep;
+    if (g_nctx && !g_bad) {
+        int one, T, ntx; w4_geom(D, H, W, tile, &one, &T, &ntx);
+        if (T < 16384) {
+            w4ctx *c = nullptr;
+            for (int k = 0; k < g_nctx && !c; k++) { w4ctx *t = &g_ctx[(g_next + k) % g_nctx]; if (!pthread_mutex_trylock(&t->mu)) c = t; }
+            if (!c) { c = &g_ctx[__sync_fetch_and_add(&g_next, 1) % g_nctx]; pthread_mutex_lock(&c->mu); } else __sync_fetch_and_add(&g_next, 1);
+            const int rc = ctx_run(c, phase, D, H, W, tile, maxstep, minsize, maxcomp, nullptr, nullptr, st, o);
+            pthread_mutex_unlock(&c->mu);
+            if (rc != -2) return rc;
+            static int once; if (!once++) fprintf(stderr, "band_wind4_runs: CUDA error or no device memory on GPU %d (%s): the CPU from here on\n", c->dev, cudaGetErrorString(cudaPeekAtLastError()));
+            g_bad = 1;
+        }
+    }
+    return cpu_runs(phase, D, H, W, tile, maxstep, minsize, maxcomp, o, st);
+}
+extern "C" void w4runs_apply_host(const uint8_t *phase, int D, int H, int W, int tile, int ms, const w4runs *o, uint8_t *w4, uint8_t *comp) {
+    int one, T, ntx; w4_geom(D, H, W, tile, &one, &T, &ntx); (void)one;
+    const size_t sv = (size_t)(T < D ? T : D) * (T < H ? T : H) * W;
+    uint8_t *ph = (uint8_t *)malloc(sv), *cp = (uint8_t *)malloc(sv); uint16_t *R = (uint16_t *)malloc(sv * 2); uint32_t *cnt = (uint32_t *)malloc((sv / W + 1) * ntx * 4);
+    if (!ph || !cp || !R || !cnt) abort();
+    size_t ob = 0;
+    for (int z0 = 0; z0 < D; z0 += T) for (int y0 = 0; y0 < H; y0 += T) {
+        const int nz = D - z0 < T ? D - z0 : T, ny = H - y0 < T ? H - y0 : T; const size_t rows = (size_t)nz * ny * ntx, vox = (size_t)nz * ny * W;
+        for (int z = 0; z < nz; z++) for (int y = 0; y < ny; y++) memcpy(ph + ((size_t)z * ny + y) * W, phase + ((size_t)(z0 + z) * H + y0 + y) * W, (size_t)W);
+        for (size_t r = 0; r < rows; r++) w4_runs_row(r, ph, nz, ny, W, T, ntx, ms, R, cnt);
+        for (size_t i = 0; i < vox; i++) w4_out_vox(i, ph, R, nz, ny, W, T, ntx, o->off + ob, o->ro, o->cb, cp);
+        for (int z = 0; z < nz; z++) for (int y = 0; y < ny; y++) {
+            const size_t a = ((size_t)z * ny + y) * W, b = ((size_t)(z0 + z) * H + y0 + y) * W;
+            memcpy(w4 + b, ph + a, (size_t)W); memcpy(comp + b, cp + a, (size_t)W);
+        }
+        ob += rows;
+    }
+    free(ph); free(cp); free(R); free(cnt);
+}
+extern "C" int nn_w4runs_apply(const uint8_t *phase_d, int D, int H, int W, int tile, int ms, const w4runs *o, uint8_t *w4_d, uint8_t *comp_d, void *stream) {
+    int dv = 0; if (cudaGetDevice(&dv) != cudaSuccess) return -1; dv &= MAXDEV - 1;
+    cudaStream_t s = (cudaStream_t)stream; int one, T, ntx; w4_geom(D, H, W, tile, &one, &T, &ntx); (void)one;
+    const size_t sv = (size_t)(T < D ? T : D) * (T < H ? T : H) * W;
+    pthread_mutex_lock(&g_app_mu[dv]); w4app *a = &g_app[dv]; int rc = 0;
+#define AK(x) do { if ((x) != cudaSuccess) { rc = -1; goto out; } } while (0)
+    if (sv > a->vox) { cudaFree(a->d_ph); cudaFree(a->d_c); cudaFree(a->d_R); a->vox = 0; AK(cudaMalloc(&a->d_ph, sv)); AK(cudaMalloc(&a->d_c, sv)); AK(cudaMalloc(&a->d_R, 2 * sv)); a->vox = sv; }
+    { const size_t rmax = (size_t)(T < D ? T : D) * (T < H ? T : H) * ntx; if (rmax > a->rows) { cudaFree(a->d_cnt); a->rows = 0; AK(cudaMalloc(&a->d_cnt, rmax * 4)); a->rows = rmax; } }
+    if (o->noff > a->noff) { cudaFree(a->d_off); a->noff = 0; AK(cudaMalloc(&a->d_off, (o->noff + o->noff / 4 + 1024) * 4)); a->noff = o->noff + o->noff / 4 + 1024; }
+    if (2 * o->nr > a->nlut) { cudaFree(a->d_lut); a->nlut = 0; AK(cudaMalloc(&a->d_lut, 2 * o->nr + o->nr / 2 + 8192)); a->nlut = 2 * o->nr + o->nr / 2 + 8192; }
+    AK(cudaMemcpyAsync(a->d_off, o->off, o->noff * 4, cudaMemcpyHostToDevice, s));
+    if (o->nr) { AK(cudaMemcpyAsync(a->d_lut, o->ro, o->nr, cudaMemcpyHostToDevice, s)); AK(cudaMemcpyAsync(a->d_lut + o->nr, o->cb, o->nr, cudaMemcpyHostToDevice, s)); }
+    {
+        size_t ob = 0;
+        for (int z0 = 0; z0 < D; z0 += T) for (int y0 = 0; y0 < H; y0 += T) {
+            const int nz = D - z0 < T ? D - z0 : T, ny = H - y0 < T ? H - y0 : T; const size_t rows = (size_t)nz * ny * ntx, vox = (size_t)nz * ny * W, off0 = ((size_t)z0 * H + y0) * W;
+            AK(cudaMemcpy2DAsync(a->d_ph, (size_t)ny * W, phase_d + off0, (size_t)H * W, (size_t)ny * W, nz, cudaMemcpyDeviceToDevice, s));
+            w4_runs_k<<<(unsigned)((rows + 127) / 128), 128, 0, s>>>(a->d_ph, nz, ny, W, T, ntx, ms, a->d_R, a->d_cnt);   /* (the run counts: unused here) */
+            w4_out_k<<<(unsigned)((vox + 255) / 256), 256, 0, s>>>(a->d_ph, a->d_R, nz, ny, W, T, ntx, a->d_off + ob, a->d_lut, a->d_lut + o->nr, a->d_c);
+            AK(cudaMemcpy2DAsync(w4_d + off0, (size_t)H * W, a->d_ph, (size_t)ny * W, (size_t)ny * W, nz, cudaMemcpyDeviceToDevice, s));
+            AK(cudaMemcpy2DAsync(comp_d + off0, (size_t)H * W, a->d_c, (size_t)ny * W, (size_t)ny * W, nz, cudaMemcpyDeviceToDevice, s));
+            ob += rows;
+        }
+    }
+    AK(cudaGetLastError());
+out:
+#undef AK
+    pthread_mutex_unlock(&g_app_mu[dv]);
+    return rc;
+}
 
 extern "C" void w4dev_init(const int *devices, int n) {
     g_nctx = 0;

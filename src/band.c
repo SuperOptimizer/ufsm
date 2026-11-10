@@ -2,6 +2,7 @@
 /* Band field from a winding_mod14 raster (see band.h). Exact Euclidean feature transform (Felzenszwalb-Huttenlocher lower
    envelopes, separable over x, y, z) carrying the index of the nearest surface voxel. */
 #include "band.h"
+#include "band_w4dev.h"
 #include <math.h>
 #include <pthread.h>
 #ifdef __AVX2__
@@ -694,4 +695,13 @@ int band_wind4_tiled_ref(const uint8_t *phase, int D, int H, int W, int tile, in
 [[gnu::weak]] int band_wind4_dev(const uint8_t *phase, int D, int H, int W, int tile, int maxstep, size_t minsize, int maxcomp, uint8_t *w4, uint8_t *comp, band_wind4_stats *st) {
     (void)phase; (void)D; (void)H; (void)W; (void)tile; (void)maxstep; (void)minsize; (void)maxcomp; (void)w4; (void)comp; (void)st;
     return -2;
+}
+/* the runs path of band_w4dev.h (train --gpu-aug 3 slots without the w4 / comp planes) needs nn.o: without it the sampler keeps the planes */
+[[gnu::weak]] int w4runs_available(void) { return 0; }
+[[gnu::weak]] int band_wind4_runs(const uint8_t *phase, int D, int H, int W, int tile, int maxstep, size_t minsize, int maxcomp, w4runs *o, band_wind4_stats *st) {
+    (void)phase; (void)D; (void)H; (void)W; (void)tile; (void)maxstep; (void)minsize; (void)maxcomp; (void)o; (void)st;
+    return -1;
+}
+[[gnu::weak]] void w4runs_apply_host(const uint8_t *phase, int D, int H, int W, int tile, int maxstep, const w4runs *o, uint8_t *w4, uint8_t *comp) {
+    (void)phase; (void)tile; (void)maxstep; (void)o; memset(w4, 255, (size_t)D * H * W); memset(comp, 255, (size_t)D * H * W);
 }

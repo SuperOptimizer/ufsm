@@ -390,7 +390,7 @@ static int val_fields(batch *b, int B, size_t p3, void **f[VAL_NF], size_t sz[VA
     if (g_aff) VF(b->band, (size_t)B * p3);
     if (g_side) VF(b->side, (size_t)B * p3);
     if (g_unwrap) VF(b->pm, (size_t)B * p3);
-    if (g_unwrap2) { VF(b->w4, (size_t)B * p3); VF(b->wcomp, (size_t)B * p3); }
+    if (g_unwrap2 && b->w4) { VF(b->w4, (size_t)B * p3); VF(b->wcomp, (size_t)B * p3); }
     if (IPLANE && b->ink) VF(b->ink, (size_t)B * p3);
     if (g_cond) VF(b->wind, (size_t)B * p3);
     if (g_pap_head) VF(b->pap, (size_t)B * p3);
@@ -463,6 +463,18 @@ static int pm_used(void) { return g_unwrap && (!g_unwrap2 || g_pap_head); }
 static void lab_upload(int kind, const batch *b, uint8_t *da, uint8_t *db, const uint8_t *ha, const uint8_t *hb, const void *rad, int B, int P, int async) {
     void (*cp)(void *, const void *, size_t) = async ? nn_h2d_copy_stream : nn_h2d;
     const size_t p3 = (size_t)g_Pz * P * P;
+    if (b->w4r && (kind == 1 || kind == 2)) {   /* --gpu-aug 3 runs slots: the phase on the source grid, the winding rebuilt from it on the device */
+        const float *cs, *sn; sample_phase_cssn(&cs, &sn);
+        for (int s = 0; s < B; s++) {
+            int32_t h[8]; memcpy(h, (const char *)b->rad + (size_t)s * NN_RAD_REC(g_Pz), sizeof h);
+            const void *rd = (const char *)rad + (size_t)s * NN_RAD_REC(g_Pz); const uint8_t *sd = b->side + (size_t)s * p3;
+            if (kind == 2) nn_w4runs_label(sd, (const w4runs *)b->w4r + s, rd, h[6] & 1, h[5], P, da + (size_t)s * p3, db + (size_t)s * p3, cs, sn, async);
+            else if (h[6] & 1) nn_label_warp(1, sd, nullptr, rd, P, da + (size_t)s * p3, nullptr, cs, sn, async);
+            else if ((h[5] & 0x73f) == (0 | 1 << 2 | 2 << 4)) cp(da + (size_t)s * p3, sd, p3);   /* (the identity) */
+            else nn_label_sym(sd, h[5], P, da + (size_t)s * p3, async);
+        }
+        return;
+    }
     if (kind == 3 && b->inkb) {   /* --rv ink bits: the plane built on the device from ct8 + the known bits, then its warp / symmetry */
         for (int s = 0; s < B; s++) {
             int32_t h[8]; memcpy(h, (const char *)b->rad + (size_t)s * NN_RAD_REC(g_Pz), sizeof h);
@@ -2167,6 +2179,7 @@ int cmd_train(int argc, char **argv) {
             setenv("UFSM_SAMPLER_NOPIN", "1", 1); gpu_input_settle(&sc, 1);
             sc.slot_skip = g_unwrap2 && B == 1 && !g_ds && !ufsm_env_on("UFSM_TM_KEEP") ? 1 | (!pm_used() ? 2 : 0) : 0;
             sc.ink_bits = g_rv && (!getenv("UFSM_INK_BITS") || ufsm_env_on("UFSM_INK_BITS"));
+            sc.w4_runs = sc.w4_dev && (!getenv("UFSM_W4_RUNS") || ufsm_env_on("UFSM_W4_RUNS"));
             sc.replay = atoi(opt(argc, argv, "--replay", "1")); sc.replay_gap = atoi(opt(argc, argv, "--replay-gap", "0"));
             sampler *sq = sampler_start(S, &sc); if (!sq) { fprintf(stderr, "cannot start the sampler\n"); return 1; }
             const int nb = atoi(so); const double t0 = now(); double tf = 0;
@@ -2874,6 +2887,7 @@ int cmd_train(int argc, char **argv) {
                 "beat more workers: each idle worker holds ~16 P^3 bytes of scratch, a slot %.2f GB)\n", sc.nbuf, workers, 2 * ng + 2,
                 (double)B * g_Pz * P * P * ((size_t)g_xs * xbytes() + (g_pack ? 1 : NCH + 1) + (g_side != 0) + 2 * (g_unwrap2 != 0) + (IPLANE != 0)) / 1e9);
     sc.slot_skip = g_tm_unused ? 1 | (!pm_used() ? 2 : 0) : 0;   /* (after the validation config's copy: its stored batches keep every plane) */
+    sc.w4_runs = sc.w4_dev && (!getenv("UFSM_W4_RUNS") || ufsm_env_on("UFSM_W4_RUNS"));   /* --gpu-aug 3: the winding as runs, no w4 / wcomp slot planes (sampler_start may drop it) */
     sc.ink_bits = g_rv && (!getenv("UFSM_INK_BITS") || ufsm_env_on("UFSM_INK_BITS"));   /* --rv: the papyrus plane as 1 known bit per voxel + ct8, built on the device (lab_upload); sampler_start may drop it */
     sc.replay_gap = atoi(opt(argc, argv, "--replay-gap", "0"));   /* (0: the slot count) */
     sc.replay = atoi(opt(argc, argv, "--replay", "1"));   /* --replay K: each window trained K times, replays with a new device-side augmentation (sample.h) */

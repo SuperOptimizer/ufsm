@@ -100,6 +100,8 @@ typedef struct {
                                 input units ((t - mean) / sd, times the intensity jitter: the conditioning code) instead of a voxel size */
     int gpu_input;           /* train --gpu-input (needs xfmt and sample_gpu_input_ok): batch.x16 holds the CT channel only and batch.rad
                                 each sample's radial record (nn.h nn_input_rad builds the 4 input channels on the device, bit for bit) */
+    int w4_runs;             /* train --gpu-aug 3 (default on, UFSM_W4_RUNS=0 off): batch.w4r instead of the w4 / wcomp planes (host RAM: -2 B per voxel
+                                per slot); sampler_start drops it (0) unless cubes, side_air 0, no --phase-near-um / --aug-tear / sheet, nn.o linked */
     int w4_dev;              /* train --gpu-aug 3: the winding mod 4 through band_wind4_dev (band_w4dev.h; the same bytes; the CPU path if it declines) */
     int gpu_aug;             /* train --gpu-aug (with gpu_input, cubes, no --ct-aug, side_air 0; sample_gpu_aug_ok): batch.ct8 holds each window's
                                 source-grid bytes (after the seam shift) and batch.aug its scan_ct_rec (scanner plan, jitter, normalisation); the
@@ -178,6 +180,8 @@ typedef struct {
     uint8_t *wind;           /* B x P^3 winding mod 14 + gauge (band.h band_winding encoding, 255 unknown) when cfg.cond */
     uint8_t *pap;            /* B x P^3 papyrus labels when cfg.pap_head: 0 void, 1 papyrus, 255 ignored */
     uint8_t *w4, *wcomp;     /* B x P^3 each when cfg.wind4: winding mod 4 (63 codes per turn, 255 unknown) and its component (0..14, 255 none) */
+    void *w4r;               /* cfg.w4_runs: B band_w4dev.h w4runs (the winding as runs, malloc'd and kept per slot) instead of w4 / wcomp; side then
+                                holds every window's phase on the source grid (the device applies the symmetry, nn_label_sym / nn_w4runs_label) */
     uint8_t *ink;            /* B x P^3 when cfg.ink_plane: ink prob254 (0..254, 255 unknown) */
     uint8_t *inkb;           /* cfg.ink_bits: B x P^3 / 8, the --rv papyrus plane's known bit per voxel (bit j of byte k: voxel 8 k + j,
                                 source grid) instead of batch.ink; the plane is known ? (ct8 >= ink_it ? 254 : 0) : 255, built on the device

@@ -61,6 +61,26 @@ int main(int argc, char **argv) {
         const int mc = T ? (v ? 3 : 1) : 15;
         const int n0 = band_wind4_tiled(ph, D, H, W, T, ms, minsize, mc, w0, c0, &s0), n1 = band_wind4_dev(ph, D, H, W, T, ms, minsize, mc, w1, c1, &s1);
         size_t dw = 0, dc = 0; for (size_t i = 0; i < n; i++) { dw += w0[i] != w1[i]; dc += c0[i] != c1[i]; }
+        /* the runs path (slots without the planes): device and CPU runs, rebuilt on the host and on the device */
+        for (int pass = 0; pass < 2; pass++) {
+            if (pass == 1) w4dev_init(&dev, 0);   /* (no device: band_wind4_runs takes the CPU loops) */
+            w4runs ru = {0}; band_wind4_stats s2 = {0};
+            const int n2 = band_wind4_runs(ph, D, H, W, T, ms, minsize, mc, &ru, &s2);
+            uint8_t *w2 = malloc(n), *c2 = malloc(n); memset(w2, 7, n); memset(c2, 7, n);
+            w4runs_apply_host(ph, D, H, W, T, ms, &ru, w2, c2);
+            size_t ew = 0, ec = 0; for (size_t i = 0; i < n; i++) { ew += w0[i] != w2[i]; ec += c0[i] != c2[i]; }
+            uint8_t *dp = nn_malloc(n), *dw4 = nn_malloc(n), *dcp = nn_malloc(n); nn_h2d(dp, ph, n);
+            const int ra = nn_w4runs_apply(dp, D, H, W, T, ms, &ru, dw4, dcp, nullptr); nn_sync();
+            nn_d2h(w2, dw4, n); nn_d2h(c2, dcp, n);
+            size_t gw = 0, gc = 0; for (size_t i = 0; i < n; i++) { gw += w0[i] != w2[i]; gc += c0[i] != c2[i]; }
+            if (n2 != n0 || ew || ec || ra || gw || gc || s2.runs != s0.runs || s2.kept != s0.kept || ru.ncomp != n0) {
+                fprintf(stderr, "FAIL runs (%s): %dx%dx%d tile %d field %d step %d: components %d / %d, host rebuild %zu / %zu bytes differ, device rebuild rc %d %zu / %zu\n",
+                        pass ? "cpu" : "device", D, H, W, T, kind, ms, n0, n2, ew, ec, ra, gw, gc);
+                fails++;
+            }
+            nn_free(dp); nn_free(dw4); nn_free(dcp); free(w2); free(c2); free(ru.off); free(ru.ro); free(ru.cb);
+            if (pass == 1) w4dev_init(&dev, 1);
+        }
         cases++; runs += s0.runs; dropped += s0.dropped_conflict;
         if (n0 != n1 || dw || dc || s0.known != s1.known || s0.kept != s1.kept || s0.dropped_conflict != s1.dropped_conflict || s0.runs != s1.runs || s0.ncomp != s1.ncomp) {
             fprintf(stderr, "FAIL: %dx%dx%d tile %d field %d step %d: components %d / %d, %zu w4 and %zu component bytes differ, known %zu / %zu kept %zu / %zu dropped %zu / %zu runs %zu / %zu\n",
