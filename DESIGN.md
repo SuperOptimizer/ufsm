@@ -122,6 +122,14 @@ trunk forward 84, trunk backward 310, slab adjoint 206, slab upsampling 50, labe
   dec[0].a2's buffer beside the 32-channel fp4 input) fails when w[1] < w[0]; the production nets (96,128,160,192 and
   32,64,128,192,256) are not that case. test_lat_head now uses (32,64,96) and (96,128,160) and holds enc[0] to the same bound;
   `TLH_W1=64 TLH_W2=96 TLH_REPRO=1` shows the defect. Not fixed.
+- 22:40: the streamed head under `--fp8 1` aborted ("the head backward is not covered per slab") when a g768 / wz768 checkpoint was
+  resumed: the per-range head backward's entries wanted storage code 4 / 8 while nn's MXDT names MX-fp8 3. Now the general path for
+  MX-fp8 x or gx (as the whole path's fused kernel declines it). Copies of g768/snap/9000 (guide 5) and wz768/snap/2000 (guide 64)
+  resumed at P256, 4 steps at the runs' learning rates, streamed and stored: 1.2750, 1.0221, 1.1934, 0.8154 and 1.1716, 1.2295,
+  1.3785, 1.1394 both ways. `test_lat_head~FP8` (TLH_FP8=1) runs the head test in that mode. Two `--det 1` runs of 40 steps
+  give identical step lines for the rv and the winding net (streamed, fp4).
+- Coarse-gradient share: off when widths[1] < widths[0] (one stderr line); the narrow net then repeats its backward exactly, but
+  still fails against the 8-output net and under 16-bit gradients (`TLH_NARROW_ALL=1`): open.
 - **Found on the way, not fixed: with a 96-wide level 0 under the lean-2 sharing modes (share_enc_a1 + a0_share) enc[0]'s parameter
   gradients are not reproduced between two equal backwards** (two nets with equal parameters, or the head whole against per range:
   rel 0.17-0.26 on enc[0], every other tensor equal to 1e-9; it depends on the allocation layout; 32-wide nets reproduce exactly;

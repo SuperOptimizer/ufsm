@@ -222,9 +222,10 @@ extern "C" int nn_head_bwd_z(const float *x, const nn_gn_t *gx_gn, shape5 xs, co
         (void)first;
         return 0;
     }
-    if (!g_tf32 || !ISMX(x) || !ISMX(gx) || !GBF || !g_h16) return -1;
+    if (!g_tf32 || !ISMX(x) || !ISMX(gx) || !GBF || !g_h16) { if (getenv("UFSM_HEAD_Z_DEBUG")) fprintf(stderr, "nn_head_bwd_z: tf32 %d x storage %d gx storage %d GBF %d h16 %d\n", g_tf32, nn_storage(x), nn_storage(gx), (int)GBF, g_h16); return -1; }
     shape5 ys = xs; ys.c = cout;
-    if (xs.c != 32 || cout > 16) {   /* no fused kernel (16-channel input; more than 16 outputs: the latent nets' 144): the whole path's steps per range -- nn_head_bwd_x's declined draw, the weight /
+    if (xs.c != 32 || cout > 16 || MXDT(x) == 3 || MXDT(gx) == 3) {   /* no fused kernel (16-channel input; more than 16 outputs: the latent nets' 144; MX-fp8 x or gx, which the fused kernel's
+                                                                          entry declines as the whole path's nn_head_bwd_x does): the whole path's steps per range -- nn_head_bwd_x's declined draw, the weight /
                            bias gradients (nn_conv3d_bwd_weight_x's 1^3 kernel), the backward-data into MX gx (bwd_data_impl's: the
                            transposed weights, its draw) -- so gx's bits and the seed count equal one whole call's */
         static thread_local unsigned seed2d[8]; static thread_local float *wtd[8]; static thread_local int wtnd[8];

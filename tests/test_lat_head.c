@@ -50,6 +50,10 @@ int main(void) {
     setenv("UFSM_HEAD_FUSED", "0", 1);   /* the 8-output comparison net with 32 inputs: the separate kernels too (the fused <= 16-output kernel keys its SR otherwise) */
     unet_set_act_mx4(1); unet_set_grad_mx8(1); unet_set_grad_mx4(1); unet_set_input_prec(4); unet_set_recompute(1); unet_set_chunk_up(2); unet_set_lean(2);
     unet_set_share_enc_a1(1); unet_set_a0_share(1);   /* (the trainer's lean-2 modes; TLH_SHARE: others) */
+    if (getenv("TLH_FP8")) {   /* the --fp8 1 trainer: MX-fp8 activations and convs, the fp8 input (running checkpoints resume in it) */
+        if (nn_set_prec_policy("all=fp8:fp8:fp8")) bad++;
+        unet_set_act_mx4(0); unet_set_act_mx8(1); unet_set_grad_mx4(0); unet_set_input_prec(8);
+    }
     if (getenv("TLH_IPREC")) unet_set_input_prec(atoi(getenv("TLH_IPREC")));
     if (getenv("TLH_SHARE")) { const int m = atoi(getenv("TLH_SHARE")); if (m & 1) unet_set_share_enc_a1(1); if (m & 2) unet_set_a0_share(1); if (m & 4) unet_set_a0_share(0); if (m & 8) unet_set_share_enc_a1(0); if (m & 16) unet_set_lean(0); if (m & 32) unet_set_chunk_up(0); }
     for (int wc = 0; wc < 3; wc++) {   /* wc 2: {96, 64, 96}, level 1 narrower than level 0 (the coarse-gradient share is switched off for it: unet.c) */
@@ -147,34 +151,39 @@ int main(void) {
             void *glz = nn_malloc(no * 2), *gl8 = nn_malloc(8 * S * 2); nn_f32_to_h16(dgz, no, glz, gs); nn_f32_to_h16(dgz + c0 * S, 8 * S, gl8, gs);
             uint16_t *l8 = malloc(8 * S * 2);
             nn_set_sr_step(3000); unet_forward(u, x, xs, 1); unet_zero_grad(u); nn_set_sr_step(3100); unet_backward_x(u, glz, 1); unet_grad_d2h(u, g4);
-            nn_set_sr_step(3000); const float *lv = unet_forward(v, x, xs, 1); unet_zero_grad(v); nn_sync(); nn_d2h(l8, lv, 8 * S * 2);
+            nn_set_sr_step(3000); const float *lv = unet_forward(v, x, xs, 1); unet_zero_grad(v); nn_sync();
+            const int v16 = unet_logits_h16(v);   /* (fp32 logits where the layout gives them no 16-bit buffer of their own: MX-fp8, 96 inputs, 8 outputs) */
+            float *l8f = malloc(8 * S * 4); if (v16) nn_d2h(l8, lv, 8 * S * 2); else nn_d2h(l8f, lv, 8 * S * 4);
             nn_set_sr_step(3100); unet_backward_x(v, gl8, 1); unet_grad_d2h(v, g8);
-            size_t lneq = 0; for (size_t i = 0; i < 8 * S; i++) lneq += l8[i] != lw[c0 * S + i];
+            size_t lneq = 0; double lmax = 0;
+            for (size_t i = 0; i < 8 * S; i++) { const float a8 = v16 ? h2f(l8[i]) : l8f[i], b8 = h2f(lw[c0 * S + i]); const double dd = fabs((double)a8 - b8); if (dd > lmax) lmax = dd; lneq += v16 ? l8[i] != lw[c0 * S + i] : !(dd <= 2e-3 * (1 + fabs(b8))); }   /* (fp32 against fp16: one fp16 rounding) */
+            free(l8f);
             const double et = rel2(g4 + ne0, g8 + ne0, ow - ne0), ee = rel2(g4, g8, ne0), eh = rel2(g4 + ow + (size_t)c0 * C0, g8 + ow8, (size_t)8 * C0), ed = rel2(g4 + ob + CO, g8 + ob8 + 8, np8 - ob8 - 8);
             const int ok = lay && !lneq && et < 1e-5 && ee < 1e-5 && eh < 1e-5 && ed < 1e-5;
-            printf("  %d -> %d head, gradient on outputs %d..%d vs the 8-output net: layout %d, logits differ %zu, trunk grads rel %.3g (enc[0] %.3g), head rows %.3g, down norms %.3g%s\n",
-                   C0, CO, c0, c0 + 7, lay, lneq, et, ee, eh, ed, ok ? "" : "  FAIL");
+            printf("  %d -> %d head, gradient on outputs %d..%d vs the 8-output net: layout %d, logits differ %zu (max %.3g), trunk grads rel %.3g (enc[0] %.3g), head rows %.3g, down norms %.3g%s\n",
+                   C0, CO, c0, c0 + 7, lay, lneq, lmax, et, ee, eh, ed, ok ? "" : "  FAIL");
             if (!ok) bad++;
             if (getenv("TLH_DETAIL") && (et > 1e-5 || ee > 1e-5)) detail(&cfg, g4, g8);
             unet_free(v); free(p8); free(g8); free(gz); free(l8); nn_free(dgz); nn_free(glz); nn_free(gl8);
         }
         /* (b) dense logit gradient: MX-fp4 gradients (SR) against the 16-bit-gradient backward, mean of K */
         double one = 0; float *rm = calloc(np, 4);
-        for (int k = 0; k < K; k++) {
+        const int fp8 = getenv("TLH_FP8") != nullptr;   /* (MX-fp8 gradients round to nearest: no draws to average; the 16-bit comparison is the fp4 runs') */
+        for (int k = 0; k < K && !fp8; k++) {
             unet_set_grad_mx8(0); unet_set_grad_mx4(0); nn_set_sr_step(6000 + k); unet_forward(u, x, xs, 1); unet_zero_grad(u); unet_backward_x(u, gl, 1); unet_grad_d2h(u, gr);
             unet_set_grad_mx8(1); unet_set_grad_mx4(1); nn_set_sr_step(6000 + k); unet_forward(u, x, xs, 1); unet_zero_grad(u); unet_backward_x(u, gl, 1); unet_grad_d2h(u, g4);
             for (size_t i = 0; i < ow; i++) { dm[i] += (g4[i] - gr[i]) / K; rm[i] += gr[i] / K; }
             if (!k) one = rel2(g4, gr, ow);
         }
         double a2 = 0, r2 = 0; for (size_t i = 0; i < ow; i++) { a2 += (double)dm[i] * dm[i]; r2 += (double)rm[i] * rm[i]; }
-        const double avg = sqrt(a2 / r2); const int ok2 = isfinite(one) && one > 0 && avg < one * 2.0 / sqrt((double)K) + 0.01;
+        const double avg = sqrt(a2 / r2); const int ok2 = fp8 || (isfinite(one) && one > 0 && avg < one * 2.0 / sqrt((double)K) + 0.01);
         double e2 = 0, f2 = 0; for (size_t i = 0; i < ne0; i++) { e2 += (double)dm[i] * dm[i]; f2 += (double)rm[i] * rm[i]; }
-        const double avg0 = sqrt(e2 / f2), one0 = rel2(g4, gr, ne0); const int ok3 = avg0 < 2.5 / sqrt((double)K) + 0.02;
+        const double avg0 = sqrt(e2 / f2), one0 = rel2(g4, gr, ne0); const int ok3 = fp8 || avg0 < 2.5 / sqrt((double)K) + 0.02;
         printf("  %d -> %d head, enc[0] grads alone: last draw %.3g, mean of %d %.3g%s\n", C0, CO, one0, K, avg0, ok3 ? "" : "  FAIL");
         if (!ok3) bad++;
         printf("  %d -> %d head, trunk param. grads, MX-fp4 vs 16-bit gradients: one %.3g, mean of %d %.3g%s\n", C0, CO, one, K, avg, ok2 ? "" : "  FAIL");
         if (!ok2) bad++;
-        if (getenv("TLH_REPRO")) {   /* K more backwards on the built net (no rebuild between them, as training steps): still unbiased? */
+        if (getenv("TLH_REPRO") && !fp8) {   /* K more backwards on the built net (no rebuild between them, as training steps): still unbiased? */
             float *m2 = calloc(np, 4);
             for (int k = 0; k < K; k++) { nn_set_sr_step(6000 + k); unet_forward(u, x, xs, 1); unet_zero_grad(u); unet_backward_x(u, gl, 1); unet_grad_d2h(u, g4); for (size_t i = 0; i < ow; i++) m2[i] += g4[i] / K; }
             double e0 = 0, r0 = 0, e1 = 0, r1 = 0;
