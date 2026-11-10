@@ -424,15 +424,18 @@ extern "C" void nn_aug_ct(const uint8_t *ct8_h, const void *rec_h_, const void *
     if (a->used) CK(cudaStreamWaitEvent(s, a->done, 0));
     CK(cudaMemcpyAsync(a->stage, ct8_h, p3, cudaMemcpyHostToDevice, s));
     CK(cudaMemcpyAsync(a->rec, rec_h, offsetof(scan_ct_rec, plan), cudaMemcpyHostToDevice, s));
+    nn_ptick_fine("    x ct bytes h2d");
     if (rec_h->scan) {
         CK(cudaMemcpyAsync(a->plan, &rec_h->plan, sizeof(scan_plan), cudaMemcpyHostToDevice, s));
         aug_scan(a, &rec_h->plan, P, (__half *)ct16, s);   /* (the CT channel's buffer as the work volume) */
+        nn_ptick_fine("    x ct scan aug");
     } else {
         CK(cudaMemsetAsync(a->usc + 1, 0, 2 * sizeof(unsigned long long), s));
         aug_sums_k<<<nblk(p3, 256), 256, 0, s>>>(a->stage, p3, a->usc);
     }
     aug_norm_k<<<1, 1, 0, s>>>(a->usc, p3, a->rec, a->scal);
     aug_write_k<<<nblk(p3, 256), 256, 0, s>>>(a->stage, P, (const float *)rad_d, a->rec, a->scal, a->ntab, ct16);
+    nn_ptick_fine("    x ct sums + write");
     CK(cudaEventRecord(a->done, s)); a->used = 1;
     KCHECK();
 }

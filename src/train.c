@@ -506,9 +506,9 @@ static void lab_upload(int kind, const batch *b, uint8_t *da, uint8_t *db, const
 static void lab_stream(gpu_state *d, const batch *b, int i, const void *rad, int B, int P, int async) {
     const size_t p3 = (size_t)g_Pz * P * P; uint8_t *s = (uint8_t *)d->xb[i];
     void (*dh)(void *, const void *, size_t) = async ? nn_d2h_copy_stream : nn_d2h;
-    if (g_side) { lab_upload(1, b, s, nullptr, b->side, nullptr, rad, B, P, async); dh(d->lbh[0], s, p3); }
-    if (g_unwrap2) { lab_upload(2, b, s, s + p3, b->w4, b->wcomp, rad, B, P, async); dh(d->lbh[1], s, p3); dh(d->lbh[2], s + p3, p3); }
-    if (IPLANE) { lab_upload(3, b, s, nullptr, b->ink, nullptr, rad, B, P, async); dh(d->lbh[3], s, p3); }
+    if (g_side) { lab_upload(1, b, s, nullptr, b->side, nullptr, rad, B, P, async); nn_ptick_fine("    x side build"); dh(d->lbh[0], s, p3); nn_ptick_fine("    x side d2h"); }
+    if (g_unwrap2) { lab_upload(2, b, s, s + p3, b->w4, b->wcomp, rad, B, P, async); nn_ptick_fine("    x w4 build"); dh(d->lbh[1], s, p3); dh(d->lbh[2], s + p3, p3); nn_ptick_fine("    x w4 d2h (2 planes)"); }
+    if (IPLANE) { lab_upload(3, b, s, nullptr, b->ink, nullptr, rad, B, P, async); nn_ptick_fine("    x ink build"); dh(d->lbh[3], s, p3); nn_ptick_fine("    x ink d2h"); }
 }
 /* the input channel(s) and radial records of a batch into the device buffers x / rad (async: on the copy stream). --gpu-aug batches
    (batch.ct8): the records first, then each window's CT channel built on the device from its bytes (nn_aug_ct) */

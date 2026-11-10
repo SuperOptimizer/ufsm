@@ -69,6 +69,7 @@ void nn_prof_begin(int k);
 void nn_prof_end(void);
 void nn_h2d_stream(int k, void *d, const void *s, size_t n);   /* an asynchronous upload on stream k (0 compute, 1 copy, 2 aux: nn_stream_wait / nn_event_record); s pinned */
 int nn_ptick_on(void); void nn_ptick(const char *name); void nn_ptick_report(int steps);   /* UFSM_PTICK=1: synchronised phase timer (nn_core.cu) */
+void nn_ptick_fine(const char *name);   /* the same with UFSM_PTICK=2 only (ticks inside a phase) */
 void nn_prof_collect(double *out, int nk);
 
 /* Tensor-core TF32 path for the 3^3 stride-1 convolutions (default on; fp32 CUDA-core kernels otherwise). */

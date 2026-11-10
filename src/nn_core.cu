@@ -492,6 +492,7 @@ extern "C" void nn_ptick(const char *name) {
     }
     g_ptlast = pt_now();
 }
+extern "C" void nn_ptick_fine(const char *name) { static int f = -1; if (f < 0) { const char *e = getenv("UFSM_PTICK"); f = e && atoi(e) >= 2; } if (f) nn_ptick(name); }   /* UFSM_PTICK=2 */
 extern "C" void nn_ptick_report(int steps) {
     if (!nn_ptick_on() || !g_ptn) return;
     double tot = 0; for (int k = 0; k < g_ptn; k++) tot += g_ptms[k];
