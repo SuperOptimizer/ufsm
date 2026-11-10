@@ -451,3 +451,27 @@ Byte-identical, checked three ways:
   sampler
 
 test_rv passes on the combined tree.
+
+## Round 3d (2026-11-09): test_unwrap2_ink fix, P960 / P1024 loader dry measurement
+
+- e7229bb: val_fields' `b->ink` / `b->w4` guards (cf976e8, 6c9112b) left the empty validation copies without their ink / winding
+  planes; the validation upload copied from a null host pointer (latched CUDA error) and the trainer saved all-zero checkpoints.
+  Guards removed (validation batches always hold the byte planes); an unfilled validation field is now an error.
+- Measured, not modelled: `UFSM_SAMPLER_ONLY=24`, the rv recipe (scratch hm/sonly3.sh) with `--gpu-aug 3` (w4 runs) + ink bits
+  + `--replay 2`, --lat 4, B 1, GPU 1 for the device winding, memcap 40G. RSS = the process at the end (= /usr/bin/time max RSS);
+  slots are pageable in this mode (UFSM_SAMPLER_NOPIN), the same bytes pinned in a trainer. Rates: delivered Mvox/s with replay 2
+  (12 built windows for 24 batches; short runs, machine shared, +-20 %).
+
+  | P    | workers | slots | RSS GB | slots GB | workers (big + ttmp) GB | delivered Mvox/s |
+  |------|---------|-------|--------|----------|-------------------------|------------------|
+  | 960  | 2       | 4     | 13.6   | 7.5      | 3.5 + 2.7               | 658              |
+  | 960  | 4       | 6     | 24.0   | 11.3     | 7.1 + 6.2               | 1017             |
+  | 960  | 4       | 10    | 31.0   | 18.8     | 7.1 + 6.2               | 1109             |
+  | 960  | 6       | 8     | 30.8   | 15.1     | 9.7 + 7.1               | 1444             |
+  | 1024 | 2       | 4     | 16.4   | 9.1      | 4.3 + 3.2               | 824              |
+  | 1024 | 4       | 6     | 26.8   | 13.7     | 7.5 + 6.4               | 1563             |
+  | 1024 | 4       | 8     | 31.0   | 18.3     | 7.5 + 6.4               | 1390             |
+  | 1024 | 5       | 7     | 32.0   | 16.0     | 9.7 + 7.5               | 1561             |
+
+  A slot is 1.88 GB at P960 and 2.28 GB at P1024 (2.125 B/vox); the RSS step per added slot is 1.76 / 2.13 GB. A worker
+  holds 2.8-3.3 GB at P960 and 3.4-3.8 GB at P1024. The trainer's own host memory (CUDA context, val buffer, offloads) is not included.
