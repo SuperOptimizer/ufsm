@@ -247,6 +247,8 @@ void nn_lat_place_rv(const void *lg, int lh16, int d, int h, int w, const uint8_
    before on the same stream) with the jitter into ct16. Device scratch: nn_aug_device_bytes(P) (one P^3 byte staging buffer). */
 void nn_aug_ct(const uint8_t *ct8_h, const void *rec_h, const void *rad_d, int P, void *ct16, int on_copy_stream);
 size_t nn_aug_device_bytes(int P);
+void nn_aug_bop_line(int on);   /* tests: 0 = the separable operators through the first kernels (z / y in shared memory, x one row a block) */
+void nn_aug_bop_bench(int P, int taps, double *out);   /* tuning: ms per pass, out[6] = z shared / z line / y shared / y line / x one row a block / x rows + weight table */
 void nn_aug_cnoise_chunk(int nz);   /* tests: the correlated noise in chunks of nz planes (0: the per-plane kernels, -1: the default chunk) */
 void nn_aug_last_bytes(uint8_t *out, int P);   /* tests: the last window's output bytes */
 /* train --gpu-aug 2: one warped window's labels warped on the device from the source-grid labels the sampler shipped (sample_cfg.gpu_aug
