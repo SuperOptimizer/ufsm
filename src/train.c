@@ -2214,13 +2214,27 @@ int cmd_train(int argc, char **argv) {
             sc.replay = atoi(opt(argc, argv, "--replay", "1")); sc.replay_gap = atoi(opt(argc, argv, "--replay-gap", "0"));
             sampler *sq = sampler_start(S, &sc); if (!sq) { fprintf(stderr, "cannot start the sampler\n"); return 1; }
             const int nb = atoi(so); const double t0 = now(); double tf = 0;
+            /* per source: windows, and per window the shares of material (CT > 0), known phase and known winding mod 4 (w4 per voxel only
+               without --w4 runs: UFSM_W4_RUNS=0) over the window's voxels (source grid) */
+            double (*cov)[5] = calloc((size_t)S->n, sizeof *cov);
             for (int i = 0; i < nb; i++) {
                 batch *b = sampler_next(sq); if (!b) { fprintf(stderr, "sampler stopped after %d batches\n", i); break; }
                 if (i == 0) tf = now() - t0;
+                for (int n = 0; n < B && cov; n++) {
+                    const int si = b->src ? b->src[n] : -1; if (si < 0 || si >= S->n) continue;
+                    const size_t nv = (size_t)g_Pz * P * P; size_t mat = 0, ph = 0, w4 = 0, phm = 0;
+                    const uint8_t *ct = b->ct8 ? b->ct8 + n * nv : nullptr, *sd = b->side ? b->side + n * nv : nullptr, *w = b->w4 ? b->w4 + n * nv : nullptr;
+                    for (size_t v = 0; v < nv; v++) { const int m = ct ? ct[v] > 0 : 1; mat += m; if (sd && sd[v] != PHASE_UNKNOWN) { ph++; phm += m; } if (w && w[v] != 255) w4++; }
+                    cov[si][0] += 1; cov[si][1] += (double)mat / nv; cov[si][2] += (double)ph / nv; cov[si][3] += mat ? (double)phm / mat : 0; cov[si][4] += (double)w4 / nv;
+                }
                 sampler_release(sq, b);
                 if ((i + 1) % 10 == 0 || i + 1 == nb) { const double dt = now() - t0 - tf;
                     fprintf(stderr, "sampler-only: %d batches, %.1f s (first %.1f s), %.1f Mvox/s after the first\n", i + 1, now() - t0, tf, i > 0 ? (double)i * B * g_Pz * P * P / 1e6 / dt : 0.); }
             }
+            for (int s = 0; cov && s < S->n; s++) if (cov[s][0] > 0) { const double k = cov[s][0];
+                fprintf(stderr, "sampler-only: source %-34s windows %5.0f  material %.3f  phase known %.3f (of material %.3f)  w4 known %.3f\n", S->src[s].name, k,
+                        cov[s][1] / k, cov[s][2] / k, cov[s][3] / k, cov[s][4] / k); }
+            free(cov);
             sampler_hostmem(sq, stderr, 0);
             uint64_t prod = 0, rej = 0; sampler_stats(sq, &prod, &rej); fprintf(stderr, "sampler-only: produced %llu rejected %llu\n", (unsigned long long)prod, (unsigned long long)rej);
             sampler_prof_print(sq);
