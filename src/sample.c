@@ -2487,6 +2487,10 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
     /* --ink-head: the window's ink plane, built in the batch's own plane (on the source grid; the symmetry / host warp below moves it
        through big + P^3, free by then): no worker buffer of P^3 bytes */
     uint8_t *inkw = c->ink_plane ? b->ink + (size_t)i * p3 : nullptr;
+    /* --rv with --gpu-aug: the papyrus plane from ct8 (the clean CT as read, = ctu here unless a seam shifts ctu first) in the mask pass
+       below, one pass fewer (ink_it: the cutoff, 0 = built here) */
+    const int ink_it = inkw && c->rv_iso > 0 && c->gpu_aug && (!c->augment || !scan_aug_enabled(&c->scan) || c->scan.p[SA_SEAM] <= 0 || c->sheet || c->band || c->side)
+                       ? (s->iso > 0 ? s->iso : c->rv_iso) : 0;
     uint8_t w[NCH] = {0};
     int tmax = 0;
     /* a channel without a target (w 0) is read again only by the packing / the host warp / the sheet prior / papyrus labels: with the
@@ -2500,7 +2504,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
             if (!inkw) { fprintf(stderr, "sampler: no ink plane buffer\n"); return -1; }
             if (c->rv_iso > 0) {   /* --rv: papyrus (clean CT >= the cutoff) 254, void 0; unknown on CT 0 below (mask) */
                 const int it = s->iso > 0 ? s->iso : c->rv_iso;
-                for (size_t k = 0; k < p3; k++) inkw[k] = ctu[k] >= it ? 254 : 0;
+                if (!ink_it) for (size_t k = 0; k < p3; k++) inkw[k] = ctu[k] >= it ? 254 : 0;
                 continue;
             }
             z3 *tz = s->tgt_key[ch] && s->tgt_prob[ch] && !crushed && !torn && !delam && !curved ? source_tgt_for_level(s, ch, l, nullptr) : nullptr;
@@ -2794,7 +2798,11 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
     if (grec && !grec->scan) memcpy(b->ct8 + (size_t)i * p3, ctu, p3);   /* (the bytes as read) */
     if (s->norm_s > 0) { mean = s->norm_c; sd = s->norm_s; }   /* "norm": the scan's fixed normalisation (ufsm scanprep median / scale) instead of the window z-score */
     uint8_t *mask = big + 9 * p3;   /* ign lives here: fold CT > 0 into it */
-    if (inkw) for (size_t k = 0; k < p3; k++) { const uint8_t mk = (ctu[k] != 0) & (mask[k] == 0); mask[k] = mk; inkw[k] = mk ? inkw[k] : 255; }   /* --ink-head: unknown on CT 0 and where the scanner augmentation ignores labels */
+    if (ink_it) {   /* (the --rv papyrus plane: ct8 >= cutoff 254, else 0; unknown where masked) */
+        const uint8_t *c8 = b->ct8 + (size_t)i * p3; const uint8_t it = (uint8_t)(ink_it > 255 ? 255 : ink_it);
+        if (ink_it > 255) for (size_t k = 0; k < p3; k++) { const uint8_t mk = (ctu[k] != 0) & (mask[k] == 0); mask[k] = mk; inkw[k] = mk ? 0 : 255; }
+        else for (size_t k = 0; k < p3; k++) { const uint8_t mk = (ctu[k] != 0) & (mask[k] == 0); mask[k] = mk; inkw[k] = mk ? (c8[k] >= it ? 254 : 0) : 255; }
+    } else if (inkw) for (size_t k = 0; k < p3; k++) { const uint8_t mk = (ctu[k] != 0) & (mask[k] == 0); mask[k] = mk; inkw[k] = mk ? inkw[k] : 255; }   /* --ink-head: unknown on CT 0 and where the scanner augmentation ignores labels */
     else for (size_t k = 0; k < p3; k++) mask[k] = (ctu[k] != 0) & (mask[k] == 0);
     PROF_MARK(PS_ZSCORE);
     /* packed targets (cfg.pack_tm): unwarped samples pack the code in the source frame over the mask (one symmetry copy into the batch);
