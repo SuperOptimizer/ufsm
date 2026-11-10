@@ -262,6 +262,45 @@ int main(void) {
         }
         free(lf); free(lh_); free(gc); nn_free(d_lf); nn_free(d_lh); nn_free(d_gc);
     }
+    {   /* the streamed head's chunks (train.c g_lat_hs): a slab's planes from a chunk of cell planes (nn_lat_up_slab_c / nn_lat_shuffle_c) equal
+           the whole array's bit for bit; the rolling coarse gradient (nn_lat_up_adj_c + nn_lat_shuffle_adj_c into Z / 4 + 2 planes, the
+           finished planes through nn_lat_grad_fin, two carried by nn_lat_grad_carry) equals the whole-array adjoint + nn_f32_to_h16
+           (the fp32 sums up to their order across slabs: one fp16 code) */
+        const int d = 12, h = 6, w = 5, D = 4 * d, H = 4 * h, W = 4 * w, C = 144, NF = 16, UPC = 11, Z = 16, cap = Z / 4 + 2;
+        const size_t pl = (size_t)h * w, nc = (size_t)d * pl, hw = (size_t)H * W, ns = (size_t)Z * hw;
+        uint16_t *lg = malloc(C * nc * 2), *g = malloc(UPC * ns * 2), *ya = malloc(UPC * ns * 2), *yb = malloc(UPC * ns * 2), *ra = malloc(C * nc * 2), *rb = malloc(C * nc * 2);
+        for (size_t k = 0; k < C * nc; k++) lg[k] = f2h(ru());
+        void *d_lg = nn_malloc(C * nc * 2), *d_ch = nn_malloc(C * cap * pl * 2), *d_ya = nn_malloc(UPC * ns * 2), *d_yb = nn_malloc(UPC * ns * 2), *d_g = nn_malloc(UPC * ns * 2);
+        float *d_gw = nn_malloc(NF * nc * 4), *d_a = nn_malloc(NF * cap * pl * 4), *d_scr = nn_malloc(UPC * ns * 4);
+        void *d_glw = nn_malloc(C * nc * 2), *d_sb = nn_malloc(C * cap * pl * 2), *d_gc = nn_malloc(C * cap * pl * 2), *d_out = nn_malloc(C * nc * 2);
+        nn_h2d(d_lg, lg, C * nc * 2); nn_zero(d_gw, NF * nc * 4); nn_zero(d_a, NF * cap * pl * 4); nn_zero(d_glw, C * nc * 2); nn_zero(d_out, C * nc * 2);
+        size_t ydiff = 0;
+        for (int z0 = 0; z0 < D; z0 += Z) {
+            const int z1 = z0 + Z, q0 = z0 / 4 - 1, qa = q0 > 0 ? q0 : 0, qb = z1 / 4 + 1 < d ? z1 / 4 + 1 : d;
+            for (int c = 0; c < C; c++) nn_d2d((char *)d_ch + (size_t)c * (qb - qa) * pl * 2, (const char *)d_lg + ((size_t)c * nc + qa * pl) * 2, (size_t)(qb - qa) * pl * 2);   /* the head's chunk */
+            nn_lat_up_slab(d_lg, 1, UPC, d, h, w, z0, Z, d_ya); nn_lat_shuffle(d_lg, 1, d, h, w, 16, 2, z0, Z, d_ya);
+            nn_lat_up_slab_c(d_ch, 1, UPC, d, h, w, z0, Z, d_yb, qa, qb - qa); nn_lat_shuffle_c(d_ch, 1, d, h, w, 16, 2, z0, Z, d_yb, qa, qb - qa);
+            nn_d2h(ya, d_ya, UPC * ns * 2); nn_d2h(yb, d_yb, UPC * ns * 2);
+            for (size_t k = 0; k < UPC * ns; k++) ydiff += ya[k] != yb[k];
+            for (size_t k = 0; k < UPC * ns; k++) g[k] = f2h(ru() * 0.01f);
+            nn_h2d(d_g, g, UPC * ns * 2);
+            nn_lat_shuffle_adj(d_g, d, h, w, 16, 2, z0, Z, d_glw); nn_lat_up_adj(d_g, UPC, d, h, w, z0, Z, d_gw, d_scr);   /* whole arrays */
+            nn_lat_shuffle_adj_c(d_g, d, h, w, 16, 2, z0, Z, d_sb, q0, cap); nn_lat_up_adj_c(d_g, UPC, d, h, w, z0, Z, d_a, d_scr, q0, cap);   /* rolling */
+            const int f0 = qa, f1 = z1 == D ? d : z1 / 4 - 1;
+            nn_lat_grad_fin(d_a, NF, d_sb, C, pl, cap, f0 - q0, f1 - f0, d_gc);
+            for (int c = 0; c < C; c++) nn_d2d((char *)d_out + ((size_t)c * nc + f0 * pl) * 2, (const char *)d_gc + (size_t)c * (f1 - f0) * pl * 2, (size_t)(f1 - f0) * pl * 2);
+            if (z1 < D) nn_lat_grad_carry(d_a, NF, d_sb, C, pl, cap, Z / 4, 2);
+        }
+        { const int was = nn_get_f16(); nn_set_f16(1); nn_f32_to_h16(d_gw, NF * nc, d_glw, 1.f); nn_set_f16(was); }   /* (train.c's stored path: the 16 fp32 channels into the fp16 gradient) */
+        nn_d2h(ra, d_glw, C * nc * 2); nn_d2h(rb, d_out, C * nc * 2);
+        size_t gd = 0, g1 = 0; double gmax = 0;
+        for (size_t k = 0; k < C * nc; k++) { if (ra[k] != rb[k]) { gd++; if (abs((int)(int16_t)ra[k] - (int)(int16_t)rb[k]) > 1) g1++; } if (fabs(h2f(ra[k])) > gmax) gmax = fabs(h2f(ra[k])); }
+        if (getenv("TL_DBG")) { int shown = 0; for (size_t k = 0; k < C * nc && shown < 12; k++) if (ra[k] != rb[k]) { printf("  k %zu (c %zu plane %zu): whole %g rolling %g\n", k, k / nc, k % nc / pl, h2f(ra[k]), h2f(rb[k])); shown++; k += 317; } }
+        cases++;
+        if (ydiff || g1 || !(gmax > 0) || gd > C * nc / 50) { fprintf(stderr, "FAIL: streamed head chunks: %zu slab values differ, coarse gradient %zu of %zu differ (%zu by more than one code), max |g| %.3g\n", ydiff, gd, C * nc, g1, gmax); fails++; }
+        free(lg); free(g); free(ya); free(yb); free(ra); free(rb);
+        nn_free(d_lg); nn_free(d_ch); nn_free(d_ya); nn_free(d_yb); nn_free(d_g); nn_free(d_gw); nn_free(d_a); nn_free(d_scr); nn_free(d_glw); nn_free(d_sb); nn_free(d_gc); nn_free(d_out);
+    }
     const char *e = nn_check(); if (e) { fprintf(stderr, "FAIL: CUDA error %s\n", e); fails++; }
     if (fails) { printf("test_lat: %d of %d cases FAIL\n", fails, cases); return 1; }
     printf("test_lat: ok (%d cases: slab upsampling = the pool4 chain, adjoint = nn_lowres_grad, dot products; predict: direct input and rv bytes = the full-resolution chain)\n", cases);

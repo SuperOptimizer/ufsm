@@ -214,6 +214,9 @@ extern "C" void *nn_malloc(size_t n) {
         if (g_err == cudaSuccess) g_err = e;
         return nullptr;
     }
+    { static int fill = -2; if (fill == -2) fill = getenv("UFSM_MALLOC_FILL") ? atoi(getenv("UFSM_MALLOC_FILL")) : -1;   /* debug: every new device buffer filled with this byte
+                                                                                                                         (a result that changes with it reads memory nobody wrote) */
+      if (fill >= 0) cudaMemset(p, fill, n); }
     alloc_log(n, __builtin_return_address(0)); return p;
 }
 g_reg_t g_reg[NN_MAXREG];

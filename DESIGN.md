@@ -101,6 +101,19 @@ trunk forward 84, trunk backward 310, slab adjoint 206, slab upsampling 50, labe
   network is 1.48 and the "task" term 16.87 (15.7 B a voxel): it still counts the label planes that `lab_stream` keeps on the host.
   One real run to compare (P384 rv, ws768 on the same card): process peak 1.20 GB by nvidia-smi at 1 Hz (CUDA context included)
   against the planner's 1.83. Real P896-1024 steps are owed (a free GPU).
+- Later the same evening: every head streams (the guided ones too: their coefficient planes are interpolated outputs, all through the
+  fp32 sums; no sub-cell buffer). 40 same-batch steps, streamed / stored: `--lat-guide 1` rv net 2.7170, 2.6549, 2.5046 both;
+  `--lat-guide 2` winding net 2.3987 both at step 4, 2.1172 / 2.1187 at step 40 (the 96-wide spread); plain head 1.9676, 1.9132
+  both, 1.7992 / 1.7994 at step 40. tests/test_lat: the chunk kernels and the rolling gradient against the whole arrays (slab
+  values bit for bit, coarse gradient within one fp16 code). No checkpoint field changes: running fp8 checkpoints resume as before.
+  The planner's task term now leaves out the label planes the label stream keeps on the host (`UFSM_PLAN_LABELS_DEV=1`: the old
+  count).
+- About the 96-wide irreproducibility below, measured after writing it: one net repeats its own backward exactly only for 32-wide
+  nets; a 96-wide net's second backward on the same build differs from its first (enc[0] 0.375, the rest 0.15) while a second net
+  of the same configuration reproduces the first net's first backward outside enc[0]. Filling every new device buffer with a byte
+  (`UFSM_MALLOC_FILL`) changes nothing, so no unwritten memory is read. K repeated backwards without a rebuild stay unbiased
+  (enc[0] 0.153 at 24, 0.080 at 96): the draws are valid, their assignment differs between the first backward after a build and
+  the later ones, and between layouts. The op is not located.
 - **Found on the way, not fixed: with a 96-wide level 0 under the lean-2 sharing modes (share_enc_a1 + a0_share) enc[0]'s parameter
   gradients are not reproduced between two equal backwards** (two nets with equal parameters, or the head whole against per range:
   rel 0.17-0.26 on enc[0], every other tensor equal to 1e-9; it depends on the allocation layout; 32-wide nets reproduce exactly;

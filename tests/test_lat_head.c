@@ -106,6 +106,14 @@ int main(void) {
         const int ok1 = ef < 2e-3 && ew < 2e-3 && eb < 1e-4 && amax > 0.1;
         printf("  %d -> %d head through unet vs host: logits rel %.3g (max abs %.3g, |a| max %.3g), weight grad rel %.3g, bias grad rel %.3g%s\n", C0, CO, ef, emax, amax, ew, eb, ok1 ? "" : "  FAIL");
         if (!ok1) bad++;
+        if (getenv("TLH_REPRO")) {   /* the same backward again on this net, and on a second net of the same configuration */
+            float *g2 = malloc(np * 4), *g3 = malloc(np * 4);
+            nn_set_sr_step(3000); unet_forward(u, x, xs, 1); unet_zero_grad(u); nn_set_sr_step(3100); unet_backward_x(u, gl, 1); unet_grad_d2h(u, g2);
+            unet *e = unet_create(&cfg); unet_init(e, 3); unet_set_fp16_logits(e, 1); nn_h2d((float *)unet_live_params(e), par, np * 4);
+            nn_set_sr_step(3000); unet_forward(e, x, xs, 1); unet_zero_grad(e); nn_set_sr_step(3100); unet_backward_x(e, gl, 1); unet_grad_d2h(e, g3);
+            printf("    repro: same net again enc[0] %.3g rest %.3g; second equal net enc[0] %.3g rest %.3g\n", rel2(g2, ga, ne0), rel2(g2 + ne0, ga + ne0, np - ne0), rel2(g3, ga, ne0), rel2(g3 + ne0, ga + ne0, np - ne0));
+            unet_free(e); free(g2); free(g3);
+        }
         /* (a) 8 logit-gradient channels: the same trunk gradients as the 8-output net with those head rows */
         for (int c0 = 0; c0 < CO; c0 += 72) {   /* output groups 0 and 9 (channels 0..7 interpolated, 72..79 sub-cell) */
             unet_cfg c8 = cfg; c8.cout = 8;
@@ -150,6 +158,14 @@ int main(void) {
         if (!ok3) bad++;
         printf("  %d -> %d head, trunk param. grads, MX-fp4 vs 16-bit gradients: one %.3g, mean of %d %.3g%s\n", C0, CO, one, K, avg, ok2 ? "" : "  FAIL");
         if (!ok2) bad++;
+        if (getenv("TLH_REPRO")) {   /* K more backwards on the built net (no rebuild between them, as training steps): still unbiased? */
+            float *m2 = calloc(np, 4);
+            for (int k = 0; k < K; k++) { nn_set_sr_step(6000 + k); unet_forward(u, x, xs, 1); unet_zero_grad(u); unet_backward_x(u, gl, 1); unet_grad_d2h(u, g4); for (size_t i = 0; i < ow; i++) m2[i] += g4[i] / K; }
+            double e0 = 0, r0 = 0, e1 = 0, r1 = 0;
+            for (size_t i = 0; i < ow; i++) { const double dd = (double)m2[i] - rm[i]; if (i < ne0) { e0 += dd * dd; r0 += (double)rm[i] * rm[i]; } else { e1 += dd * dd; r1 += (double)rm[i] * rm[i]; } }
+            printf("    repeated backwards without rebuild, mean of %d vs the 16-bit reference: enc[0] %.3g, rest %.3g; last draw enc[0] %.3g rest %.3g\n", K, sqrt(e0 / r0), sqrt(e1 / r1), rel2(g4, gr, ne0), rel2(g4 + ne0, gr + ne0, ow - ne0));
+            free(m2);
+        }
         {   /* the head per range of 3 cell planes (unet_set_head_ext; the trainer's streamed latent head): the logits bit for bit, the gradients
                up to the weight gradient's summation order, the same SR draws, no whole logits in the build */
             const size_t hw = (size_t)xs.h * xs.w; const size_t m0 = unet_train_bytes(u, xs);
