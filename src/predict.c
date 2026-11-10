@@ -816,12 +816,13 @@ int cmd_predict(int argc, char **argv) {
     const int rvfuse = !strcmp(chs, "rv");
     /* --latents STORE (ufsm lc-encode): a --lat-basis checkpoint's cell channels come from the stored quantised coefficients (the window's
        mean / sd from them too), not from the CT window, which is still read for the air mask and the radial channels */
-    const char *lat_store = opt(argc, argv, "--latents", nullptr); zr lzr; const float *lz_bas = nullptr; double lz_sraw = 0; long long lz_org[3] = {0, 0, 0}; int lz_c = 0; void *lz_d = nullptr;
+    const char *lat_store = opt(argc, argv, "--latents", nullptr); zr lzr; const float *lz_bas = nullptr; double lz_sraw = 0, lz_drop = 0; long long lz_org[3] = {0, 0, 0}; int lz_c = 0; void *lz_d = nullptr;
     if (lat_store) {
         char zp[1200]; snprintf(zp, sizeof zp, "%s/zarr.json", lat_store); FILE *zf = fopen(zp, "r"); static char zt[65536]; size_t zn = zf ? fread(zt, 1, sizeof zt - 1, zf) : 0; if (zf) fclose(zf); zt[zn] = 0;
         const char *q1 = strstr(zt, "\"step_raw\":"), *q2 = strstr(zt, "\"origin\":["), *q3 = strstr(zt, "\"lat_c\":");
         if (!q1 || !q2 || !q3 || sscanf(q2 + 10, "%lld,%lld,%lld", lz_org, lz_org + 1, lz_org + 2) != 3 || zr_open(&lzr, lat_store)) { fprintf(stderr, "predict: --latents %s is not a latcomp store (ufsm lc-encode)\n", lat_store); return 2; }
         lz_sraw = atof(q1 + 11); lz_c = atoi(q3 + 8);
+        { const char *q4 = strstr(zt, "\"drop_ms\":"); lz_drop = q4 ? atof(q4 + 10) : 0; }   /* (stores before the attribute: no correction) */
         if (degrade || opt(argc, argv, "--aux", nullptr) || !strcmp(opt(argc, argv, "--split", "0"), "z") || atoi(opt(argc, argv, "--tta", "1")) > 1 || atoi(opt(argc, argv, "--fit-ct", "0"))) {
             fprintf(stderr, "predict: --latents: no --aug-*, --aux, --split, --tta or --fit-ct (they read the CT itself)\n"); return 2; }
     }
@@ -1666,7 +1667,8 @@ int cmd_predict(int argc, char **argv) {
                 nn_ptick("wait reader + host");
                 pt = now();
                 if (lat_store) {   /* --latents: the window's cells up, its CT rebuilt from them on the device (air windows: nothing) */
-                    if (rd.nz[k]) { nn_h2d(lz_d, ctu, w3 / 64 * (lz_c + 1)); nn_lat_synth_ct(lz_d, lz_c, lz_bas, (float)lz_sraw, Wz, W, ctd); nn_pred_stats(ctd, w3, stsc, &nz, &sum, &sq); }
+                    if (rd.nz[k]) { nn_h2d(lz_d, ctu, w3 / 64 * (lz_c + 1)); nn_lat_synth_ct(lz_d, lz_c, lz_bas, (float)lz_sraw, Wz, W, ctd); nn_pred_stats(ctd, w3, stsc, &nz, &sum, &sq);
+                                  sq += lz_drop * (double)nz; }   /* (the dropped axes' energy in the material voxels: the CT window's variance) */
                     else nz = 0;
                 } else {
                 if (pre_i == i) {   /* prefetched: the copy stream's upload, then one device copy (the prefetch buffer free again after it) */
@@ -1680,6 +1682,7 @@ int cmd_predict(int argc, char **argv) {
             if (nz == 0) { nskip++; pthread_mutex_lock(&rd.mu); atomic_store(&rd.consumed, i + 1); pthread_cond_broadcast(&rd.cv); pthread_mutex_unlock(&rd.mu); continue; }
             double mean = sum / (double)w3, var = sq / (double)w3 - mean * mean, sd = sqrt(var > 0 ? var : 0) + 1e-3;
             if (norm_sd > 0) { mean = norm_mean; sd = norm_sd; }   /* --norm: one fixed z-score for every window */
+            { static int dbg = -1; if (dbg < 0) dbg = ufsm_env_on("UFSM_LAT_DEBUG") ? 4 : 0; if (dbg > 0) { dbg--; fprintf(stderr, "\npredict: window %lld,%lld,%lld mean %.3f sd %.3f (%zu nonzero)%s\n", (long long)o[0], (long long)o[1], (long long)o[2], mean, sd, nz, lat_store ? " --latents" : ""); } }
             if (pcut >= 0 && pap_cond == 1) unet_set_cond(u, (float)((pcut - mean) / sd));   /* papyrus: the cutoff in this window's input units */
             if (pcut >= 0 && pap_cond == 2) mean = pcut;                                         /* (or the input's zero) */
             /* G * ((CT - mean) / sd) + B in both explicit-input and fused-stem paths (predict --input-gain / --input-bias): the original CT
