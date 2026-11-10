@@ -1,6 +1,7 @@
 /* CUDA ops: core section of the former nn.cu */
 #include "nn_common.cuh"
 #include <dlfcn.h>
+#include <unistd.h>
 
 int g_tf32 = 1;
 int g_gn_stored = 0;
@@ -225,6 +226,14 @@ extern "C" void *nn_malloc(size_t n) {
         size_t fr = 0, tot = 0; cudaGetLastError(); cudaMemGetInfo(&fr, &tot);
         fprintf(stderr, "nn_malloc: cudaMalloc of %.2f GB failed (%s; %.2f of %.2f GB free on the device)\n", n / 1e9, cudaGetErrorString(e), fr / 1e9, tot / 1e9);
         if (g_err == cudaSuccess) { g_err = e; g_err_file = __FILE__; g_err_line = __LINE__; g_err_what = "cudaMalloc in nn_malloc"; }
+        /* no caller takes a null buffer (the optional ones use nn_malloc_try): returning it let the next kernels write through null, and
+           the run ended many lines later in "an illegal memory access was encountered" from an unrelated allocation (fit-field predict
+           beside a training run). End here, with the size and the caller. UFSM_MALLOC_NULL=1: the old return (debugging) */
+        if (!ufsm_env_on("UFSM_MALLOC_NULL")) {
+            Dl_info di; void *ra = __builtin_return_address(0); const size_t off = dladdr(ra, &di) && di.dli_fbase ? (size_t)((char *)ra - (char *)di.dli_fbase) : (size_t)ra;
+            fprintf(stderr, "cuda: out of memory: the device has no room for a %.2f GB buffer (caller 0x%zx); stopping\n", n / 1e9, off);
+            fflush(nullptr); _exit(1);
+        }
         return nullptr;
     }
     { static int fill = -2; if (fill == -2) fill = getenv("UFSM_MALLOC_FILL") ? atoi(getenv("UFSM_MALLOC_FILL")) : -1;   /* debug: every new device buffer filled with this byte
