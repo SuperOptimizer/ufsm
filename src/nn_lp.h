@@ -72,6 +72,8 @@ int lp_gn_silu_bwd_apply_defer(const void *x, int xdt, shape5 s, int G, const fl
                                const void *gy, void *gx, const float *AB, unsigned gsr, unsigned rsr);   /* 1: left pending */
 int lp_gnpend_flush(void);        /* run a pending apply now (whole layer, no records); 1 when there was one */
 int lp_gnpend_of(const void *gx); /* an apply is pending into gx (this GPU) */
+void lp_mx4_to_mx8_z(const void *x4, int C, int D, size_t HW, int z0, int nz, int za, int zc, void *y8);   /* lp_mx_cvt.cu: z-slices as MX-fp8 tensors */
+void lp_mx8_slice_z(const void *x8, int C, int D, size_t HW, int z0, int nz, void *y8);
 int lp_gnpend_flush_of(const void *gx);   /* flush when the pending apply writes gx (a reader of gx that does not run it) */
 void lp_gnpend_slab(int zt0, int zt1, uint8_t *out, float *gb, int last);   /* the pending apply over z-steps [zt0, zt1), that slab's records into out */
 const void *lp_gnpend_take(const void *gx, const void **gy, const float **cf);   /* a consumer that fuses the pending apply (N 1, MX-fp4 x, <= 1024 channels): its x (the activation),

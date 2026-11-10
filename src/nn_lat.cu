@@ -303,7 +303,7 @@ __global__ void lat_adj_z_k(const float *t, int C, int d, int h, int w, int z0, 
    at dsh[(o + voxel)]; the window's fp32 logit volume (8 bytes a voxel for the two channels), its fuse and its place pass never exist. */
 template <typename T>
 __global__ void lat_place_rv_k(const T *lg, int d, int h, int w, const uint8_t *ct, const uint32_t *bits, int iso, int z0, int y0, int x0, int z1, int y1, int x1,
-                               int oz, int oy, int ox, int shard, uint8_t *dsh) {
+                               int oz, int oy, int ox, int shard, uint8_t *dsh, int sb) {
     const int H = 4 * h, W = 4 * w, c0z = z0 >> 2, c0y = y0 >> 2, c0x = x0 >> 2, ncy = ((y1 + 3) >> 2) - c0y, ncx = ((x1 + 3) >> 2) - c0x, ncz = ((z1 + 3) >> 2) - c0z;
     const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     if (i >= (size_t)ncz * ncy * ncx) return;
@@ -349,10 +349,16 @@ __global__ void lat_place_rv_k(const T *lg, int d, int h, int w, const uint8_t *
                 const size_t k = kr + x;
                 uint8_t o = 0;
                 if (ct ? ct[k] >= iso : (bits[k >> 5] >> (k & 31)) & 1u) {
-                    const float a = LW[rx][0] * q[0][0] + LW[rx][1] * q[0][1] + LW[rx][2] * q[0][2], b = LW[rx][0] * q[1][0] + LW[rx][1] * q[1][1] + LW[rx][2] * q[1][2];
+                    float a = LW[rx][0] * q[0][0] + LW[rx][1] * q[0][1] + LW[rx][2] * q[0][2], b = LW[rx][0] * q[1][0] + LW[rx][1] * q[1][1] + LW[rx][2] * q[1][2];
+                    if (sb >= 0) {   /* the sub-cell head (lat_shuf_k): the pair's per-voxel outputs, with the slab path's fp16 roundings */
+                        const size_t cell = (size_t)(sb + 16 * rz + 4 * ry + rx) * cv + ((size_t)cz * h + cy) * w + cx;
+                        a = __half2float(__float2half_rn(__half2float(__float2half_rn(a)) + ldv(lg, cell)));
+                        b = __half2float(__float2half_rn(__half2float(__float2half_rn(b)) + ldv(lg, cell + 64 * cv)));
+                    }
                     const float pr = 1.f / (1.f + __expf(-a)), pv = 1.f / (1.f + __expf(-b));
                     float f = (1.f + 254.f * (0.5f + 0.5f * (pr - pv))) / 255.f; f = fminf(fmaxf(f, 1.5f / 255.f), 1.f - 1e-4f);   /* (nn_rv_fuse) */
-                    const float l = __logf(f / (1.f - f));
+                    float l = __logf(f / (1.f - f));
+                    if (sb >= 0) l = __half2float(__float2half(l));   /* (fused in fp16) */
                     o = (uint8_t)(255.f / (1.f + __expf(-l)) + 0.5f);   /* (nn_pred_place) */
                 }
                 dsh[gr + x] = o;
@@ -360,14 +366,22 @@ __global__ void lat_place_rv_k(const T *lg, int d, int h, int w, const uint8_t *
         }
     }
 }
+extern "C" void nn_lat_place_rvs(const void *lg, int lh16, int sb, int d, int h, int w, const uint8_t *ct, const uint32_t *bits, int iso, int hz, int halo,
+                                 int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh);
 extern "C" void nn_lat_place_rv(const void *lg, int lh16, int d, int h, int w, const uint8_t *ct, const uint32_t *bits, int iso, int hz, int halo,
                                 int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh) {
+    nn_lat_place_rvs(lg, lh16, -1, d, h, w, ct, bits, iso, hz, halo, oz, oy, ox, ez, ey, ex, shard, dsh);
+}
+/* sb >= 0: the sub-cell head (unet_cfg.lat_guide 64), its side pair's per-voxel outputs at cell channels sb + 64 j + sub
+   = nn_lat_up_slab + nn_lat_shuffle + nn_rv_fuse (fp16) + nn_pred_place */
+extern "C" void nn_lat_place_rvs(const void *lg, int lh16, int sb, int d, int h, int w, const uint8_t *ct, const uint32_t *bits, int iso, int hz, int halo,
+                                 int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh) {
     const int D = 4 * d, H = 4 * h, W = 4 * w;
     const int z0 = max(hz, -oz), y0 = max(halo, -oy), x0 = max(halo, -ox), z1 = min(D - hz, ez - oz), y1 = min(H - halo, ey - oy), x1 = min(W - halo, ex - ox);
     if (z1 <= z0 || y1 <= y0 || x1 <= x0) return;
     const size_t n = (size_t)(((z1 + 3) >> 2) - (z0 >> 2)) * (((y1 + 3) >> 2) - (y0 >> 2)) * (((x1 + 3) >> 2) - (x0 >> 2));
-    if (lh16) lat_place_rv_k<f16><<<nblk(n, 128), 128>>>((const f16 *)lg, d, h, w, ct, bits, iso, z0, y0, x0, z1, y1, x1, oz, oy, ox, shard, dsh);
-    else lat_place_rv_k<float><<<nblk(n, 128), 128>>>((const float *)lg, d, h, w, ct, bits, iso, z0, y0, x0, z1, y1, x1, oz, oy, ox, shard, dsh);
+    if (lh16) lat_place_rv_k<f16><<<nblk(n, 128), 128>>>((const f16 *)lg, d, h, w, ct, bits, iso, z0, y0, x0, z1, y1, x1, oz, oy, ox, shard, dsh, sb);
+    else lat_place_rv_k<float><<<nblk(n, 128), 128>>>((const float *)lg, d, h, w, ct, bits, iso, z0, y0, x0, z1, y1, x1, oz, oy, ox, shard, dsh, sb);
     KCHECK();
 }
 
@@ -536,11 +550,13 @@ extern "C" void nn_lat_up_slab(const void *lg, int lh16, int C, int d, int h, in
 }
 extern "C" void nn_lat_up_adj(const void *g, int C, int d, int h, int w, int z0, int nz, float *gc, void *scratch) {
     const int slow = lat_slow();
-    if (!slow && scratch && z0 % 4 == 0 && nz % 4 == 0) {   /* two separable gathers through scratch (C nz h w fp32) */
-        const size_t n1 = (size_t)C * nz * h * w;
-        lat_adj_xy_k<<<nblk(n1, 256), 256>>>((const f16 *)g, C, h, w, nz, (float *)scratch);
+    if (!slow && scratch && z0 % 4 == 0 && nz % 4 == 0) {   /* two separable gathers through scratch (c nz h w fp32: 7 bytes per slab voxel hold 28 channels; more go in groups of 28) */
         const int a0 = max(z0 / 4 - 1, 0), a1 = min((z0 + nz) / 4 + 1, d);
-        lat_adj_z_k<<<nblk((size_t)(a1 - a0) * h * w * C, 256), 256>>>((const float *)scratch, C, d, h, w, z0, nz, a0, a1, gc);
+        for (int c0 = 0; c0 < C; c0 += 28) {
+            const int c = min(28, C - c0); const size_t n1 = (size_t)c * nz * h * w;
+            lat_adj_xy_k<<<nblk(n1, 256), 256>>>((const f16 *)g + (size_t)c0 * nz * 16 * h * w, c, h, w, nz, (float *)scratch);
+            lat_adj_z_k<<<nblk((size_t)(a1 - a0) * h * w * c, 256), 256>>>((const float *)scratch, c, d, h, w, z0, nz, a0, a1, gc + (size_t)c0 * d * h * w);
+        }
         KCHECK(); return;
     }
     /* coarse planes whose support meets fine planes [z0, z0 + nz) */

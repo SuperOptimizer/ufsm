@@ -6,6 +6,97 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Latent nets with learned cell channels under fp4 activations; the guided heads' adjoint (2026-11-09, branch perf-20261109)
+
+The winding latent net (w768: widths 96,128,160,192, 29 learned cell channels + 3 radial means, `--lat-guide 2`, `--fp8 1`) took
+3.2 s a P768 step against 1.3 s for the 32-wide rv net. Same-batch profile at P512 on an idle GPU 1, synchronised phases: 841 ms =
+trunk forward 84, trunk backward 310, slab adjoint 206, slab upsampling 50, label upload 37, targets 34, loss kernels 35, CT upload
++ gpu-aug 50, input 8, optimizer 9.
+- **Adjoint.** `nn_lat_up_adj` took the per-voxel gather whenever C > 28 (its scratch, the normal targets' 7 B a voxel, holds 28
+  channels of the intermediate): the guide-2 head has 32. It now runs the separable pair in channel groups of 28: 206 -> 60 ms,
+  step 841 -> 687 ms. `UFSM_LAT_CHECK`: rms difference / rms 1.3e-7 against the gather.
+- **`--fp8 1` was the rest.** Per conv, ms a step at P512: fp8 forward 83 / backward-data 58 / weight gradient 234 / GN 14; the same
+  net in fp4 (4 inputs): 48 / 46 / 57 / 5. `--fp8 1` was passed only because the first conv (32 MX-fp8 inputs) could not write
+  MX-fp4 activations: both mixed paths existed for <= 8 input channels only (the 4-channel stem's small kernel and its FAST weight
+  gradient).
+  - forward: the general fp8 kernel is now instantiated for MX-fp8 in / MX-fp4 out (it was templated on both; only the stem's
+    small kernel was compiled for mixed types), reached for any channel count from `conv3d` and `lp_conv_fwd_f8`.
+  - weight gradient: no kernel stages MX-fp4 gradients for a general fp8 conv, so `lp_bwd_w_f8` runs the MX-fp8 / MX-fp8 kernel on
+    z chunks (`bwd_w_f8_mixed`): the chunk's gradient rows re-encoded as MX-fp8 (exact: e2m1 values under their block scale are
+    e4m3 values) with a zero plane on either side, the input's planes with their halo copied; <= 96 MB of copies whatever the
+    window. fp8 compute on the exact operands, as the stem's FAST path does. (The fp4 weight-gradient kernel also accepts it with
+    `--policy all=fp4:fp4:fp4`, but rounds the cell channels to e2m1 in the gradient.)
+  - `tests/test_lat_conv0`: forward against a host fp32 convolution (rms error / rms 0.038 for fp8 rows, 0.119 for fp4 rows =
+    the e2m1 rounding, worst error 0.26 of the row's largest value) and the chunked weight gradient against the host sum and the
+    whole-tensor fp8 kernel (differences <= 2e-8 of the rms for 1, 3 and 6 chunks; the bias sums exact).
+  A `--lat-basis` run without `--fp8 1` now trains (default `--fp4 2` policy, `enc0.c1=fp16` = the fp8 compute above). Same batch,
+  P512, idle GPU: 687 -> 483 ms a step (measured with the fp4 weight gradient for conv0; the chunked fp8 one was built after the
+  GPU was taken and is timed only functionally: conv0's weight gradient is ~3 ms of either). Trunk forward 83 -> 48, backward
+  306 -> 124. Losses after 4 same-batch steps at P256: 2.4380 (fp4 trunk) against 2.4396 (`--fp8 1`).
+  **This is a precision change, not a rounding-level one**: the trunk's activations and gradients are stored and multiplied in fp4
+  as in every 4-input net; weights, optimizer state and the checkpoint format are untouched, and a `--fp8 1` checkpoint resumes
+  under fp4 (tried on a 6-step one). `--fp8 1` runs exactly as before.
+- **Default since the evening: every conv of a `--lat-basis` net is fp4** (`all=fp4:fp4:fp4`, no `enc0.c1=fp16` exception: there is
+  no 16-bit stem). Without `--input-prec` the 32 input channels are MX-fp4 too and conv0 is an ordinary fp4 conv; with
+  `--input-prec 8` its forward is the mixed fp8 kernel and its weight gradient the fp4 kernel (the cell channels rounded to e2m1
+  there); the chunked fp8 weight gradient remains for `--policy ...,enc0.c1=fp16` (15 instead of 3 ms a P512 step).
+  300 deterministic steps (`--det 1`, P256, the winding net with the sub-cell head, one seed each; mean loss of steps 1 / 1-50 /
+  51-100 / 101-200 / 201-300):
+
+  | | step 1 | 1-50 | 51-100 | 101-200 | 201-300 |
+  |---|---|---|---|---|---|
+  | `--fp8 1` (as w768 ran) | 2.6173 | 2.6960 | 2.1196 | 1.5390 | 1.3608 |
+  | fp4 trunk, fp8 input, conv0 gradient fp8 (chunked) | 2.6315 | 2.7326 | 2.1845 | 1.5868 | 1.3780 |
+  | fp4 trunk, fp8 input, conv0 gradient fp4 | 2.6315 | 2.7334 | 2.1827 | 1.5859 | 1.3771 |
+  | fp4 trunk, fp4 input (`--input-prec 4`) | 2.6364 | 2.7314 | 2.1830 | 1.5857 | 1.3819 |
+  | the new default (no `--input-prec`: fp4 input) | 2.6364 | 2.7335 | 2.1853 | 1.5872 | 1.3799 |
+
+  fp4 against fp8: +1.3% at 201-300 (one seed; no noise estimate). The input's and conv0's precision make no visible difference
+  inside fp4 (1.377-1.382).
+- **With the sub-cell head (`--lat-guide 3`), P512, idle GPU, same batch**: winding net (96,128,160,192) `--fp8 1` 624 ms, fp4
+  trunk 402 ms (trunk forward 89 -> 54, backward 330 -> 143); rv net (32,...,256) 330 -> 287 ms. What is left in the fp4 steps:
+  winding: trunk 197 (of it the 96 -> 144 head 37: forward 8, data gradient 14, weight gradient 15), slab section 123, CT upload +
+  gpu-aug 50, label upload 15, input 8, optimizer 9; rv: slab section 143 (label upload 38, targets 35, loss kernels 36, upsampling
+  15, adjoint 19), uploads 72, trunk 51 (head 12), optimizer 12. For the rv net the full-resolution passes, not the trunk, are the step.
+- Left in the slab section (P512, ms): upsampling 50 and adjoint 60 still cover all 32 planes of the guide-2 head although 13 are
+  unused; label upload 37 is hidden by the upload pipeline outside the synchronised profile.
+
+## The winding mod 4 labels on the GPU: train --gpu-aug 3 (2026-11-09, branch perf-20261109)
+
+`band_wind4_tiled` was ~25% of the loader's CPU (hostmem round 2). Its bytes depend on the order of the unions (which run ends up
+the root fixes the component's gauge; the conflict count of an inconsistent component depends on the spanning tree; union by size
+reads the sizes at that moment), so a parallel connected-components pass cannot reproduce them. The split that keeps the bytes
+(`src/nn_w4.cu`, `band_w4dev.h`):
+- device, per strip of one tile in z and y (<= T^2 W voxels, 4 B each + the events): the runs along x of each tile row (one thread a
+  row; per voxel the run's ordinal in the row and its turns since the run's start), then per run its length and its *events*: the
+  first voxel that joins a new y / z neighbour run (position in the run, relative turn), plus the count and 4-bin turn histogram of
+  the run's further voxels joining that same run. A count pass, the host's prefix sums (tiles in raster order, rows in scan order =
+  the CPU's run numbering), an emit pass.
+- host: band.c's union-find replayed over the events in the same order (a run's voxels up to an event are added to its
+  component's size before the union, as `w4_pass0` flushes them; the histogram gives the edges and conflicts of the repeated joins),
+  the same component choice.
+- device: pass 1 from one root offset and component byte per run; the two planes come back by DMA into the (pinned) batch planes.
+A P512 window of the P4 phase has 6.0 M runs (16-19 voxels a run) and 14.4 M events (16 B each), against 134 M voxels.
+
+The sampler's workers call `band_wind4_dev` directly (own streams, two contexts per trainer GPU behind mutexes, polling waits: a
+stream sync would spin a core behind the trainer's kernels); on any CUDA error it returns -2 and the worker takes the CPU call from
+then on. `--gpu-aug 3` = `--gpu-aug 2` + `sample_cfg.w4_dev`; sample.c changes only at its two winding calls.
+
+Checks: `tests/test_w4dev` (72 cases: spirals with holes, vortex lines whose loops gain a turn (10.8 M voxels in components dropped
+for conflicts), random phases, windows off the tile grid, one tile with 15 components, 1-voxel tiles) byte-identical to
+`band_wind4_tiled` in w4, the component plane, the count and the statistics; two stored P512 phase windows identical;
+`UFSM_BATCH_HASH` of 16 `--det 1` P512 batches identical between `--gpu-aug 2` and `3`; a 6-step deterministic training run prints
+the same losses.
+
+Numbers (thread CPU, machine shared with two production trainers and their loaders):
+- one stored P512 window, tile 86: CPU path 0.65-0.75 CPU-s, device path 0.155 CPU-s (0.125 of it the replay), 0.37-0.41 s wall
+  behind a trainer on the same GPU.
+- sampler alone (`UFSM_SAMPLER_ONLY=16 UFSM_SAMPLER_PROF=2`, P512, `--det 1`, 4 workers, two alternating runs each): the wind4 stage
+  473 / 529 -> 281 / 210 ms a window (the stage also holds phase_air and the side output): -51%. All stages, second pair only (the
+  first pair's full profiles were not kept): 1.79 -> 1.38 CPU-s a window, of which the wind4 stage gives 0.32; the rest of that
+  difference is the machine's run-to-run drift (ctread equal, augment / phout lower), so the supported figure is about -0.25 to
+  -0.3 CPU-s a window of this mix (~-15%).
+
 ## Latent-grid training and inference speed (2026-11-09, branch perf-20261109)
 
 **Update (evening): after merging latcomp (lat basis, --latents, guided heads, fit fields from latent nets).** The predict fast

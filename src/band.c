@@ -689,3 +689,9 @@ int band_wind4_tiled_mt(const uint8_t *phase, int D, int H, int W, int tile, int
 int band_wind4_tiled_ref(const uint8_t *phase, int D, int H, int W, int tile, int maxstep, size_t minsize, int maxcomp, uint8_t *w4, uint8_t *comp, band_wind4_stats *st) {
     return w4_tiled(band_wind4_ref, phase, D, H, W, tile, maxstep, minsize, maxcomp, w4, comp, st);
 }
+/* band_w4dev.h without the device code (tools and tests that link the sampler but not nn.o): the caller takes the CPU path. nn_w4.cu's
+   definition replaces this one wherever nn.o is linked. */
+[[gnu::weak]] int band_wind4_dev(const uint8_t *phase, int D, int H, int W, int tile, int maxstep, size_t minsize, int maxcomp, uint8_t *w4, uint8_t *comp, band_wind4_stats *st) {
+    (void)phase; (void)D; (void)H; (void)W; (void)tile; (void)maxstep; (void)minsize; (void)maxcomp; (void)w4; (void)comp; (void)st;
+    return -2;
+}

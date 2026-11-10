@@ -25,7 +25,7 @@ extern template void fwd_f8_t<bf16, mx8_t>(const void *x, shape5 xs, const float
 
 extern "C" int lp_conv_fwd_f8(const void *x, int xbf, shape5 xs, const float *w, const float *b, int cout, void *y, int ybf, gnp_t gp, double *osum, int Go, split_t sp) {
     if ((xbf == 3 || xbf == 4) && (ybf == 3 || ybf == 4) && xbf != ybf) {
-        if (xs.c > 8 || sp.x2 || sp.y2 || sp.up || sp.accum) { fprintf(stderr, "lp_conv_fwd_f8: mixed MX input/output only for the network stem (Ci <= 8)\n"); abort(); }
+        if ((xs.c > 8 && xbf != 3) || sp.x2 || sp.y2 || sp.up || sp.accum) { fprintf(stderr, "lp_conv_fwd_f8: mixed MX input/output only for the network input (Ci <= 8, or MX-fp8 in / MX-fp4 out)\n"); abort(); }   /* (more than 8 fp8 channels into fp4: a latent net's learned cell channels, the general kernel) */
         if (xbf == 3) fwd_f8_t<mx8_t, mx4_t>(x, xs, w, b, cout, y, gp, osum, Go, sp);
         else fwd_f8_t<mx4_t, mx8_t>(x, xs, w, b, cout, y, gp, osum, Go, sp);
         LPCK();

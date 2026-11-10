@@ -204,6 +204,27 @@ int main(void) {
                     if (n1 > nz / 500 || nd > nz / 20 + 2 || (oi < 4 && !nz)) { fprintf(stderr, "FAIL: nn_lat_place_rvg (offset %d, fp16 logits %d, mask %d): %zu of %zu written bytes differ, %zu by more than 1 or in the mask\n", oi, m, mb, nd, nz, n1); fails++; }
                 }
             }
+            {   /* the sub-cell head's direct bytes (nn_lat_place_rvs) against nn_lat_up_slab + nn_lat_shuffle + nn_rv_fuse + nn_pred_place: 144 cell channels */
+                const int NS = 144; float *sc = malloc(NS * cv * 4); uint16_t *sc16 = malloc(NS * cv * 2);
+                for (size_t k = 0; k < NS * cv; k++) { sc16[k] = f2h((k < 2 * cv ? 3.f : 1.5f) * ru()); sc[k] = h2f(sc16[k]); }
+                void *d_sc = nn_malloc(NS * cv * 4), *d_s16 = nn_malloc(NS * cv * 2);
+                nn_h2d(d_sc, sc, NS * cv * 4); nn_h2d(d_s16, sc16, NS * cv * 2);
+                for (int m = 0; m < 2; m++) {
+                    const void *src = m ? d_s16 : d_sc;
+                    nn_lat_up_slab(src, m, 2, d, h, h, 0, D, d_sl); nn_lat_shuffle(src, m, d, h, h, 16, 2, 0, D, d_sl); nn_rv_fuse(d_sl, w3, 1); nn_set_logits_h16(1);
+                    for (int oi = 0; oi < 5; oi++) for (int mb = 0; mb < 2; mb++) {
+                        const int *o = offs[oi], ez = oi == 2 ? 17 : S, ey = oi == 2 ? 19 : S, ex = S;
+                        nn_zero(d_s0, (size_t)S * S * S); nn_zero(d_s1, (size_t)S * S * S);
+                        if (mb) nn_pred_place_m_d(d_sl, d_bits, D, W, hz, halo, o[0], o[1], o[2], ez, ey, ex, S, d_s0); else nn_pred_place_d(d_sl, d_ct, D, W, hz, halo, o[0], o[1], o[2], ez, ey, ex, S, d_s0);
+                        nn_lat_place_rvs(src, m, 16, d, h, h, mb ? nullptr : d_ct, mb ? d_bits : nullptr, nn_get_pred_iso(), hz, halo, o[0], o[1], o[2], ez, ey, ex, S, d_s1);
+                        nn_d2h(s0, d_s0, (size_t)S * S * S); nn_d2h(s1, d_s1, (size_t)S * S * S);
+                        size_t nd = 0, n1 = 0, nz = 0; for (size_t k = 0; k < (size_t)S * S * S; k++) { nd += s0[k] != s1[k]; n1 += abs((int)s0[k] - (int)s1[k]) > 1 || (s0[k] == 0) != (s1[k] == 0); nz += s0[k] != 0; }
+                        cases++;
+                        if (n1 > nz / 500 || nd > nz / 20 + 2 || (oi < 4 && !nz)) { fprintf(stderr, "FAIL: nn_lat_place_rvs (offset %d, fp16 logits %d, mask %d): %zu of %zu written bytes differ, %zu by more than 1 or in the mask\n", oi, m, mb, nd, nz, n1); fails++; }
+                    }
+                }
+                free(sc); free(sc16); nn_free(d_sc); nn_free(d_s16);
+            }
             nn_set_logits_h16(0); (void)hw;
             free(gc); free(gc16); nn_free(d_gc); nn_free(d_g16); nn_free(d_sl);
         }
