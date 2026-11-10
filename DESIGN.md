@@ -6,6 +6,40 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## The winding mod 4 labels on the GPU: train --gpu-aug 3 (2026-11-09, branch perf-20261109)
+
+`band_wind4_tiled` was ~25% of the loader's CPU (hostmem round 2). Its bytes depend on the order of the unions (which run ends up
+the root fixes the component's gauge; the conflict count of an inconsistent component depends on the spanning tree; union by size
+reads the sizes at that moment), so a parallel connected-components pass cannot reproduce them. The split that keeps the bytes
+(`src/nn_w4.cu`, `band_w4dev.h`):
+- device, per strip of one tile in z and y (<= T^2 W voxels, 4 B each + the events): the runs along x of each tile row (one thread a
+  row; per voxel the run's ordinal in the row and its turns since the run's start), then per run its length and its *events*: the
+  first voxel that joins a new y / z neighbour run (position in the run, relative turn), plus the count and 4-bin turn histogram of
+  the run's further voxels joining that same run. A count pass, the host's prefix sums (tiles in raster order, rows in scan order =
+  the CPU's run numbering), an emit pass.
+- host: band.c's union-find replayed over the events in the same order (a run's voxels up to an event are added to its
+  component's size before the union, as `w4_pass0` flushes them; the histogram gives the edges and conflicts of the repeated joins),
+  the same component choice.
+- device: pass 1 from one root offset and component byte per run; the two planes come back by DMA into the (pinned) batch planes.
+A P512 window of the P4 phase has 6.0 M runs (16-19 voxels a run) and 14.4 M events (16 B each), against 134 M voxels.
+
+The sampler's workers call `band_wind4_dev` directly (own streams, two contexts per trainer GPU behind mutexes, polling waits: a
+stream sync would spin a core behind the trainer's kernels); on any CUDA error it returns -2 and the worker takes the CPU call from
+then on. `--gpu-aug 3` = `--gpu-aug 2` + `sample_cfg.w4_dev`; sample.c changes only at its two winding calls.
+
+Checks: `tests/test_w4dev` (72 cases: spirals with holes, vortex lines whose loops gain a turn (10.8 M voxels in components dropped
+for conflicts), random phases, windows off the tile grid, one tile with 15 components, 1-voxel tiles) byte-identical to
+`band_wind4_tiled` in w4, the component plane, the count and the statistics; two stored P512 phase windows identical;
+`UFSM_BATCH_HASH` of 16 `--det 1` P512 batches identical between `--gpu-aug 2` and `3`; a 6-step deterministic training run prints
+the same losses.
+
+Numbers (thread CPU, machine shared with two production trainers and their loaders):
+- one stored P512 window, tile 86: CPU path 0.65-0.75 CPU-s, device path 0.155 CPU-s (0.125 of it the replay), 0.37-0.41 s wall
+  behind a trainer on the same GPU.
+- sampler alone (`UFSM_SAMPLER_ONLY=16 UFSM_SAMPLER_PROF=2`, P512, `--det 1`, 4 workers, two alternating runs each): the wind4 stage
+  473 / 529 -> 281 / 210 ms a window (the stage also holds phase_air and the side output), all stages 1.69 / 1.79 -> 1.74 / 1.38
+  CPU-s a window. The first pair is within the machine's run-to-run drift; the stage itself is -51%.
+
 ## Latent-grid training and inference speed (2026-11-09, branch perf-20261109)
 
 **Update (evening): after merging latcomp (lat basis, --latents, guided heads, fit fields from latent nets).** The predict fast
