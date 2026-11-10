@@ -617,7 +617,11 @@ static void upload_async(gpu_state *d, const batch *b, int i, int B, int P) {
         return;
     }
     nn_stream_wait(1, d->ev_done[i]);   /* the step two back: this upload overlaps the current step */
-    if (d->lean) nn_stream_wait(1, d->ev_done[i ^ 1]);   /* lean: one buffer (inside the gradient buffers), free after the current step */
+    if (d->lean || g_lstream) nn_stream_wait(1, d->ev_done[i ^ 1]);   /* lean: one buffer (inside the gradient buffers), free after the current step.
+                                                                          The label stream: one set of host planes (d->lbh), which the current step's head slabs
+                                                                          upload from until its gradient pass ends; written earlier (--mem fast: two device
+                                                                          buffers, the upload overlapping the step), the step trained on a mix of its own and
+                                                                          the next batch's labels (--det 1 runs differed from step 4, 13 outcomes in 14 runs) */
     if (g_restore) restore_upload(d, b, i, B, P, 1);
     else if (d->side >= 0) upload_slab(d, b, i, B, P, 1);
     else {
@@ -999,8 +1003,10 @@ static void head_slab_pass(gpu_state *d, int pass) {
             if (f1 > f0) {
                 nn_lat_grad_fin(d->latg, LGFC, d->latgl, LNC, pl, qc, f0 - q0, f1 - f0, d->latgc);
                 if (getenv("UFSM_LATG_DUMP")) {   /* the finished coarse gradient planes of every slab of the first step, appended (fp16; fused against chain) */
-                    static int done; if (!done) { const size_t nb = (size_t)LNC * (f1 - f0) * pl * 2; void *hb = malloc(nb); nn_sync(); nn_d2h(hb, d->latgc, nb);
-                        FILE *f = fopen(getenv("UFSM_LATG_DUMP"), z0 ? "ab" : "wb"); if (f) { fwrite(hb, 1, nb, f); fclose(f); } free(hb); if (z1 == D) done = 1; }
+                    static int done, nth = -1; if (nth < 0) nth = getenv("UFSM_LATG_STEP") ? atoi(getenv("UFSM_LATG_STEP")) - 1 : 0;   /* (UFSM_LATG_STEP=n: the nth gradient pass instead) */
+                    if (done == nth) { const size_t nb = (size_t)LNC * (f1 - f0) * pl * 2; void *hb = malloc(nb); nn_sync(); nn_d2h(hb, d->latgc, nb);
+                        FILE *f = fopen(getenv("UFSM_LATG_DUMP"), z0 ? "ab" : "wb"); if (f) { fwrite(hb, 1, nb, f); fclose(f); } free(hb); }
+                    if (z1 == D && done <= nth) done++;
                 }
                 if (unet_head_bwd_z(d->u, f0, f1, d->latgc, z0 == 0)) { fprintf(stderr, "latent head stream: the head backward is not covered per slab (UFSM_LAT_HEAD_STREAM=0)\n"); abort(); }
             }
@@ -3120,6 +3126,15 @@ int cmd_train(int argc, char **argv) {
                 d->pending = b;
             }
             nn_stream_wait(0, d->ev_up[d->cur]);           /* compute waits for the upload */
+            if (getenv("UFSM_DET_TRACE")) {   /* debugging (--det 1): hashes of what this step starts from: the input channel, the streamed label planes, the parameters */
+                nn_event_sync(d->ev_up[d->cur]); nn_sync();
+                const size_t p3t = (size_t)g_Pz * P * P, nx = (size_t)B * g_xs * p3t * xbytes(); uint8_t *hb = malloc(nx > p3t ? nx : p3t);
+                uint64_t hx = 1469598103934665603ull, hl[4] = {0, 0, 0, 0};
+                nn_d2h(hb, d->x, nx); for (size_t q = 0; q < nx; q++) hx = (hx ^ hb[q]) * 1099511628211ull;
+                if (g_lstream) for (int k = 0; k < 4; k++) if (d->lbh[k]) { uint64_t h = 1469598103934665603ull; for (size_t q = 0; q < p3t; q++) h = (h ^ d->lbh[k][q]) * 1099511628211ull; hl[k] = h; }
+                fprintf(stderr, "dettrace step %d: x %016llx labels %016llx %016llx %016llx %016llx params %.9g\n", step, (unsigned long long)hx, (unsigned long long)hl[0], (unsigned long long)hl[1], (unsigned long long)hl[2], (unsigned long long)hl[3], unet_param_norm(d->u));
+                free(hb);
+            }
             if (sparse_at && step >= sparse_at && !unet_get_sparse24(d->u)) { unet_set_sparse24(d->u, 1); if (g == 0) fprintf(stderr, "step %d: 2:4 sparsity on (SR-STE lambda %g)\n", step, srste); }
             unet_zero_grad(d->u);
             d->last = d->cur;

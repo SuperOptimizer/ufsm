@@ -3738,6 +3738,7 @@ float *unet_grad_ptr(unet *u) { return u->g; }
 void unet_grad_d2h(unet *u, float *host) { nn_d2h(host, u->g, u->np * 4); }
 void unet_grad_h2d(unet *u, const float *host) { nn_h2d(u->g, host, u->np * 4); }
 double unet_grad_norm(unet *u) { return sqrt(nn_sumsq(u->g, u->np, u->red_scratch)); }
+double unet_param_norm(unet *u) { return sqrt(nn_sumsq(u->fw, u->np, u->red_scratch)); }   /* debugging (train UFSM_DET_TRACE): the forward weights' norm */
 void unet_clip_grad(unet *u, double max_norm) {
     double n = unet_grad_norm(u);
     if (n > max_norm && n > 0) nn_scale(u->g, (float)(max_norm / n), u->np);
