@@ -147,6 +147,7 @@ void lp_conv1_to_mx(const void *x, int gdt, int N, int Ci, size_t S, const float
 void lp_conv1_to_mx_r(const void *x, int gdt, int N, int Ci, size_t S, const float *w, int Co, void *y, int ydt, unsigned sr, size_t vb, size_t vn);   /* rows [vb, vb + vn) */   /* ydt 3 MX-fp8, 4 MX-fp4 (exact SR keyed by sr) */
 void lp_up2_bwd_mx(const void *gy, shape5 xs, void *gx, int gdt, int xdt, unsigned osr);   /* gdt / xdt: MX dt 3 (fp8) or 4 (fp4, gx with exact SR keyed by osr) */
 void lp_up2_bwd_mx_slice(const void *gy, shape5 xs, void *gx, int ctot, int c0, int gdt, int xdt, unsigned osr);   /* channels [c0, c0 + xs.c) of an MX-fp8 gx (ctot ch) */
+void lp_set_s2b_cz(int cz);   /* fine planes per chunk of the wide MX-fp4 stride-2 backward-data (0 whole, -1 default: ~96 MB of MX-fp8 rows) */
 int lp_bwd_data_s2_mx(const void *gy, shape5 ys, const float *w, shape5 xs, void *gx, int accum, int gdt, int xdt, unsigned osr);   /* returns the compute precision (3 fp4, 2 fp8, 1 bf16, 0 fp32) */
 const char *lp_check(void);
 void lp_f32_to_bf16(const float *x, size_t n, void *y);   /* test helpers */
