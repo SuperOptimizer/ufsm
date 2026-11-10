@@ -58,14 +58,24 @@ int cmd_lc_encode(int argc, char **argv) {
     for (int i = 0; i < 3; i++) if (box[i] % 4 || box[3 + i] % V || box[3 + i] <= 0 || box[i] < 0 || box[i] + box[3 + i] > m->shape[i] + V) { fprintf(stderr, "lc-encode: the box origin must be a multiple of 4 and its size of %d voxels\n", V); return 2; }
     uint8_t *ct = malloc((size_t)V * V * V); int8_t *out = malloc((size_t)SH * SH * SH * (C + 1));
     double sd = atof(opt(argc, argv, "--sd", "0"));
-    if (!(sd > 0)) {   /* sd_ref: the sd over a lattice of shards (all voxels, as a window's z-score counts them) */
-        double s1 = 0, s2 = 0, n = 0; const int64_t ns[3] = {box[3] / V, box[4] / V, box[5] / V}; const int64_t tot = ns[0] * ns[1] * ns[2], stp = tot / 24 > 0 ? tot / 24 : 1;
-        for (int64_t i = stp / 2; i < tot; i += stp) {
-            const int64_t o[3] = {box[0] + i / (ns[1] * ns[2]) * V, box[1] + i / ns[2] % ns[1] * V, box[2] + i % ns[2] * V}, nn[3] = {V, V, V};
+    if (!(sd > 0)) {   /* sd_ref: the sd (all voxels, as a window's z-score counts them) of up to 24 mostly-material shards of a 5^3 lattice over
+                          the box, nearest its centre first (a plain stride over the shard index hit only air in masked scans: sd 1, step_raw 0.25) */
+        double s1 = 0, s2 = 0, n = 0; int used = 0; const int64_t ns[3] = {box[3] / V, box[4] / V, box[5] / V};
+        int ord[125]; double dist[125];
+        for (int k = 0; k < 125; k++) { const int a = k / 25 - 2, b = k / 5 % 5 - 2, c = k % 5 - 2; ord[k] = k; dist[k] = a * a + b * b + c * c + 1e-3 * k; }
+        for (int a = 1; a < 125; a++) for (int b = a; b > 0 && dist[ord[b]] < dist[ord[b - 1]]; b--) { const int t = ord[b]; ord[b] = ord[b - 1]; ord[b - 1] = t; }
+        for (int q = 0; q < 125 && used < 24; q++) {
+            const int k = ord[q], l[3] = {k / 25, k / 5 % 5, k % 5}; int64_t o[3]; const int64_t nn[3] = {V, V, V};
+            for (int d = 0; d < 3; d++) o[d] = box[d] + (int64_t)((l[d] + 0.5) * ns[d] / 5) * V;
             if (z3_read(z, o, nn, ct, nth)) { fprintf(stderr, "lc-encode: read failed: %s\n", z3_error()); return 1; }
-            for (size_t k = 0; k < (size_t)V * V * V; k += 7) { s1 += ct[k]; s2 += (double)ct[k] * ct[k]; n++; }
+            size_t nzv = 0; for (size_t v = 0; v < (size_t)V * V * V; v += 7) nzv += ct[v] != 0;
+            if (nzv * 7 < (size_t)V * V * V / 2) continue;   /* (mostly air) */
+            for (size_t v = 0; v < (size_t)V * V * V; v += 7) { s1 += ct[v]; s2 += (double)ct[v] * ct[v]; n++; }
+            used++;
         }
+        if (!used) { fprintf(stderr, "lc-encode: no mostly-material shard on the box's 5^3 lattice: give --sd\n"); return 2; }
         sd = sqrt(fmax(s2 / n - (s1 / n) * (s1 / n), 1e-6)); if (sd < 1) sd = 1;
+        fprintf(stderr, "lc-encode: sd_ref %.2f from %d material shards\n", sd, used);
     }
     const float sraw = step * (float)sd;
     char attrs[1024]; snprintf(attrs, sizeof attrs, "{\"latcomp\":1,\"lat_c\":%d,\"step\":%.9g,\"sd_ref\":%.9g,\"step_raw\":%.9g,\"stride\":4,\"origin\":[%lld,%lld,%lld],\"ct\":\"%s\"}", C, step, sd, sraw,
