@@ -86,13 +86,22 @@ for s in src:   # teacher fibre targets on the winding entries
     if os.path.exists(f"{d}/done"):
         s["targets"]["fibre_h"] = {"root": f"{d}/H", "group": ".", "encoding": "prob254"}
         s["targets"]["fibre_v"] = {"root": f"{d}/V", "group": ".", "encoding": "prob254"}; s["heads"] = dict(s["heads"], fibre=0.3)
-tot = sum(s["weight"] for s in src); ft = sum(s["weight"] for s in fsrc); share = FS if fsrc else 0.0
-for s in src: s["weight"] = round(s["weight"] / tot * (1 - share), 4)
+# 3-D ink GT (inkB, U4): INK (the fragment, /vesuvius/ufsm/inkgt/sources-inkgt.json) as ink-only entries (heads ink 1, the others 0;
+# no band, so the sampler draws in the occupancy cells), their labelled-voxel weights floored at INKFLOOR (0.02 of the fragment, so the
+# small scans 0814 / MAN5 / 0500P2 are seen at all) and scaled to INKSHARE (0.15) of all windows; their own holdout file (every wbench
+# box, the 9.36 boxes mapped into the fine scans, the ink eval crops).
+INK = os.environ.get("INK", "/vesuvius/ufsm/inkgt/sources-inkgt.json"); IS = float(os.environ.get("INKSHARE", "0.15")); IF = float(os.environ.get("INKFLOOR", "0.02"))
+isrc = json.load(open(INK))["sources"] if os.path.exists(INK) else []
+for s in isrc: s["weight"] = max(s["weight"], IF)
+tot = sum(s["weight"] for s in src); ft = sum(s["weight"] for s in fsrc); it = sum(s["weight"] for s in isrc)
+share = FS if fsrc else 0.0; ishare = IS if isrc else 0.0
+for s in src: s["weight"] = round(s["weight"] / tot * (1 - share - ishare), 4)
 for s in fsrc: s["weight"] = round(s["weight"] / ft * share, 4)
-src += fsrc
+for s in isrc: s["weight"] = round(s["weight"] / it * ishare, 4)
+src += fsrc + isrc
 json.dump({"cache": T.get("cache", "/vesuvius/ufsm/cache"), "sources": src}, open(out, "w"), indent=1)
 for s in src:
     tg = s["targets"]; ph = tg["band"]["phase"] if "band" in tg else None
-    r = (ph.get("root") or "onfly:" + ph["onfly"]["root"]) if ph else tg["fibre_h"]["root"]
-    print(f"{s['name']:22s} um {s['um']:<6} levels {s['min_level']}-{s['max_level']} weight {s['weight']:.3f} heads {','.join(s['heads'])} {r}")
+    r = (ph.get("root") or "onfly:" + ph["onfly"]["root"]) if ph else next(iter(tg.values()))["root"]
+    print(f"{s['name']:22s} um {s['um']:<6} levels {s['min_level']}-{s['max_level']} weight {s['weight']:.3f} heads {','.join(k for k, v in s['heads'].items() if v)} {r}")
 print("->", out)
