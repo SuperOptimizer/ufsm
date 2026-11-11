@@ -59,7 +59,7 @@ PY
       case $n in p4A) d=gt/paris4/phaseA;; p4B) d=gt/paris4/phaseB;; p0139) d=gt/p0139full/phase;; p0500) d=gt/PHerc0500P2-wind/phase;; 1667A48) d=gt/1667/phaseA48;; 1667B48) d=gt/1667/phaseB48;; esac
       [ -d $K/$d ] || { echo "$n: $d not built"; continue; }
       echo "$n: $( (cd $K/$d && md5sum -c $f 2>/dev/null) | grep -c ': OK$') of $(wc -l < $f) sampled shards identical to the desk's"; done;;
-  bench) for P in ${DRYP:-896 1152 1280}; do UFSM_MEM_DRY=1 UFSM_MEM_REPORT=1 RELAUNCH=0 u1run dry$P 10 $P $U; echo "P $P: $(grep -m1 '^memory:' $K/runs/dry$P.log | cut -c1-200)"; done
+  bench) for P in ${DRYP:-896 1152 1280}; do UFSM_MEM_DRY=1 UFSM_MEM_REPORT=1 RELAUNCH=0 u1run dry$P 10 $P $U; echo "P $P: $(grep -m1 'GB free per GPU\|no mode fits' $K/runs/dry$P.log | cut -c1-200)"; done
     BP=${BENCHP:-1152}; RELAUNCH=0 LOGE=25 u1run bench$BP 150 $BP $U
     grep '^step' $K/runs/bench$BP.log | tail -3 | cut -c1-220; grep -iE 'wait|samp/s' $K/runs/bench$BP.log | tail -2 | cut -c1-220;;
   resume) [ -f $K/ckpt/u1-resume.ckpt ] || { echo "no staged checkpoint (pod_pack.sh OUT SNAP)"; exit 1; }
