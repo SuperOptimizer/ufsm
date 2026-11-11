@@ -59,28 +59,39 @@ static int ft_flag(int argc, char **argv, const char *k) { for (int i = 5; i < a
 /* The fibre axis from the presence alone (--presence-only, --mask): the gradient structure tensor of the presence (central differences,
    products summed over a 5^3 box) has its SMALLEST eigenvalue along a tube; that eigenvector, on the z >= 0 hemisphere, is written
    in the published encoding (nx, ny). Streamed in z: five planes of the six in-plane-filtered products are kept. */
-static void ft_ridge_axis(const uint8_t *pr, const int64_t n[3], uint8_t *nx, uint8_t *ny) {
-    const int64_t H = n[1], W = n[2]; const size_t hw = (size_t)H * W; float *ring = malloc(5 * 6 * hw * sizeof(float)), *tmp = malloc(hw * sizeof(float)), *raw = malloc(6 * hw * sizeof(float));
+static void ft_ridge_axis(const uint8_t *pr, const int64_t n[3], uint8_t *nx, uint8_t *ny, int R, char prior) {
+    const int64_t H = n[1], W = n[2]; const size_t hw = (size_t)H * W; const int RW = 2 * R + 1; float *ring = malloc((size_t)RW * 6 * hw * sizeof(float)), *tmp = malloc(hw * sizeof(float)), *raw = malloc(6 * hw * sizeof(float));
     #define PRV(z, y, x) ((float)pr[((size_t)(z < 0 ? 0 : z >= n[0] ? n[0] - 1 : z) * H + (size_t)(y < 0 ? 0 : y >= H ? H - 1 : y)) * W + (size_t)(x < 0 ? 0 : x >= W ? W - 1 : x)])
-    for (int64_t zz = 0; zz < n[0] + 2; zz++) {
-        if (zz < n[0]) {   /* plane zz: products, then the separable 5 x 5 in-plane box sum, into its ring slot */
-            float *R = ring + (size_t)(zz % 5) * 6 * hw;
+    for (int64_t zz = 0; zz < n[0] + R; zz++) {
+        if (zz < n[0]) {   /* plane zz: products, then the separable (2R+1)^2 in-plane box sum, into its ring slot */
+            float *Rg = ring + (size_t)(zz % RW) * 6 * hw;
             for (int64_t y = 0; y < H; y++) for (int64_t x = 0; x < W; x++) { const size_t i = (size_t)y * W + x;
                 const float gz = PRV(zz + 1, y, x) - PRV(zz - 1, y, x), gy = PRV(zz, y + 1, x) - PRV(zz, y - 1, x), gx = PRV(zz, y, x + 1) - PRV(zz, y, x - 1);
                 raw[i] = gz * gz; raw[hw + i] = gy * gy; raw[2 * hw + i] = gx * gx; raw[3 * hw + i] = gz * gy; raw[4 * hw + i] = gz * gx; raw[5 * hw + i] = gy * gx; }
-            for (int c = 0; c < 6; c++) { const float *a = raw + c * hw; float *o = R + c * hw;
-                for (int64_t y = 0; y < H; y++) for (int64_t x = 0; x < W; x++) { float s = 0; for (int64_t k = x - 2; k <= x + 2; k++) s += a[(size_t)y * W + (size_t)(k < 0 ? 0 : k >= W ? W - 1 : k)]; tmp[(size_t)y * W + x] = s; }
-                for (int64_t y = 0; y < H; y++) for (int64_t x = 0; x < W; x++) { float s = 0; for (int64_t k = y - 2; k <= y + 2; k++) s += tmp[(size_t)(k < 0 ? 0 : k >= H ? H - 1 : k) * W + x]; o[(size_t)y * W + x] = s; } }
+            for (int c = 0; c < 6; c++) { const float *a = raw + c * hw; float *o = Rg + c * hw;
+                for (int64_t y = 0; y < H; y++) for (int64_t x = 0; x < W; x++) { float s = 0; for (int64_t k = x - R; k <= x + R; k++) s += a[(size_t)y * W + (size_t)(k < 0 ? 0 : k >= W ? W - 1 : k)]; tmp[(size_t)y * W + x] = s; }
+                for (int64_t y = 0; y < H; y++) for (int64_t x = 0; x < W; x++) { float s = 0; for (int64_t k = y - R; k <= y + R; k++) s += tmp[(size_t)(k < 0 ? 0 : k >= H ? H - 1 : k) * W + x]; o[(size_t)y * W + x] = s; } }
         }
-        const int64_t z = zz - 2; if (z < 0) continue;   /* planes z - 2 .. z + 2 are in the ring (clamped at the ends) */
+        const int64_t z = zz - R; if (z < 0) continue;   /* planes z - R .. z + R are in the ring (clamped at the ends) */
         for (size_t i = 0; i < hw; i++) {
             double T[6] = {0, 0, 0, 0, 0, 0};
-            for (int64_t k = z - 2; k <= z + 2; k++) { const int64_t kk = k < 0 ? 0 : k >= n[0] ? n[0] - 1 : k; const float *R = ring + (size_t)(kk % 5) * 6 * hw; for (int c = 0; c < 6; c++) T[c] += R[c * hw + i]; }
+            for (int64_t k = z - R; k <= z + R; k++) { const int64_t kk = k < 0 ? 0 : k >= n[0] ? n[0] - 1 : k; const float *Rk = ring + (size_t)(kk % RW) * 6 * hw; for (int c = 0; c < 6; c++) T[c] += Rk[c * hw + i]; }
             const size_t j = (size_t)z * hw + i; nx[j] = ny[j] = 128; const double tr = T[0] + T[1] + T[2]; if (!(tr > 0)) continue;
             /* smallest eigenvector of T: the largest of (tr I - T), by power iteration (T is positive semidefinite) */
             const double M[6] = {tr - T[0], tr - T[1], tr - T[2], -T[3], -T[4], -T[5]}; double v[3] = {0.577, 0.577, 0.577};
             for (int it = 0; it < 40; it++) { const double w[3] = {M[0] * v[0] + M[3] * v[1] + M[4] * v[2], M[3] * v[0] + M[1] * v[1] + M[5] * v[2], M[4] * v[0] + M[5] * v[1] + M[2] * v[2]};
                 const double m = sqrt(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]); if (!(m > 0)) break; v[0] = w[0] / m; v[1] = w[1] / m; v[2] = w[2] / m; }
+            if (prior) {   /* the layer's normal (largest eigenvector of T); the axis = the family's direction in that plane:
+                              H: the horizontal in-plane direction normal x z; V: z minus its normal component (our predicted masks mark a
+                              fibre LAYER, so the tube axis of the mask itself is ambiguous inside it; DESIGN.md 2026-11-11) */
+                double u[3] = {0.577, 0.577, 0.577};
+                for (int it = 0; it < 40; it++) { const double w[3] = {T[0] * u[0] + T[3] * u[1] + T[4] * u[2], T[3] * u[0] + T[1] * u[1] + T[5] * u[2], T[4] * u[0] + T[5] * u[1] + T[2] * u[2]};
+                    const double m = sqrt(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]); if (!(m > 0)) break; u[0] = w[0] / m; u[1] = w[1] / m; u[2] = w[2] / m; }
+                double a[3];
+                if (prior == 'H') { a[0] = 0; a[1] = u[2]; a[2] = -u[1]; }   /* u x (1, 0, 0) in (z, y, x): (0, u_x, -u_y) */
+                else { a[0] = 1 - u[0] * u[0]; a[1] = -u[0] * u[1]; a[2] = -u[0] * u[2]; }
+                const double m = sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]); if (m > 1e-6) for (int c = 0; c < 3; c++) v[c] = a[c] / m;
+            }
             if (v[0] < 0) { v[0] = -v[0]; v[1] = -v[1]; v[2] = -v[2]; }
             nx[j] = (uint8_t)lround(128 + 127 * v[2]); ny[j] = (uint8_t)lround(128 + 127 * v[1]);
         }
@@ -88,13 +99,29 @@ static void ft_ridge_axis(const uint8_t *pr, const int64_t n[3], uint8_t *nx, ui
     #undef PRV
     free(ring); free(tmp); free(raw);
 }
+/* --blur R (derived axes only): separable (2R+1)^3 box mean of the presence, in place (bridges short dips of a predicted tube) */
+static void ft_blur(uint8_t *v, const int64_t n[3], int R) {
+    const size_t nv = (size_t)n[0] * n[1] * n[2]; float *a = malloc(nv * sizeof(float)), *b = malloc(nv * sizeof(float)); if (!a || !b) { free(a); free(b); return; }
+    for (size_t i = 0; i < nv; i++) a[i] = v[i];
+    const size_t st[3] = {(size_t)n[1] * n[2], (size_t)n[2], 1};
+    for (int d = 0; d < 3; d++) {
+        for (size_t i = 0; i < nv; i++) { const int64_t c = (int64_t)(i / st[d] % (size_t)n[d]); double s = 0; int m = 0;
+            for (int64_t k = c - R; k <= c + R; k++) if (k >= 0 && k < n[d]) { s += a[i + (size_t)(k - c) * st[d] * 1 - 0]; m++; }
+            b[i] = (float)(s / m); }
+        float *t = a; a = b; b = t;
+    }
+    for (size_t i = 0; i < nv; i++) v[i] = (uint8_t)lrintf(a[i] > 255 ? 255 : a[i]);
+    free(a); free(b);
+}
 typedef struct { const ft_vol *V; double sup, coh, cturn, h; } ft_par;
 /* the direction at p continuing prev (sign-aligned), 0 if the field ends there */
+/* stop reasons (counted per streamline end): */
+enum { FT_OK = 0, FT_SUP = 1, FT_COH = 2, FT_TURN = 3, FT_BOX = 4, FT_HALF = 5, FT_NSTOP = 6 };
 static int ft_dir(const ft_par *P, const double p[3], const double prev[3], double d[3]) {
-    double T[6], s; if (!ft_tensor(P->V, p, T, &s) || s < P->sup) return 0;
-    if (ft_axis(T, prev, d) < P->coh) return 0;
+    double T[6], s; if (!ft_tensor(P->V, p, T, &s)) return FT_BOX; if (s < P->sup) return FT_SUP;
+    if (ft_axis(T, prev, d) < P->coh) return FT_COH;
     const double c = d[0] * prev[0] + d[1] * prev[1] + d[2] * prev[2]; if (c < 0) for (int k = 0; k < 3; k++) d[k] = -d[k];
-    return fabs(c) >= P->cturn;
+    return fabs(c) >= P->cturn ? FT_OK : FT_TURN;
 }
 /* a seed = (255 - presence) << 40 | voxel index: sorted ascending = falling presence, then position */
 static int ft_seed_cmp(const void *a, const void *b) { const uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b; return (x > y) - (x < y); }
@@ -111,6 +138,9 @@ int cmd_fiber_trace(int argc, char **argv) {
     ft_par P = {.sup = atof(ft_opt(argc, argv, "--support", "0.2")), .coh = atof(ft_opt(argc, argv, "--coh", "0.65")), .cturn = cos(atof(ft_opt(argc, argv, "--turn", "35")) * M_PI / 180), .h = atof(ft_opt(argc, argv, "--step", "1"))};
     if (sd < 0 || sd > 8 || bin < 1 || half < 1 || sep < 0 || sep > 8 || !(P.h > 0)) { fprintf(stderr, "fiber-trace: bad options\n"); return 2; }
     const char *cache = ft_opt(argc, argv, "--cache", nullptr); uint8_t *vol[3] = {nullptr, nullptr, nullptr}; int64_t o[3], n[3];
+    const int str = atoi(ft_opt(argc, argv, "--st-r", "2")), blur = atoi(ft_opt(argc, argv, "--blur", "0"));
+    const int prior_on = atoi(ft_opt(argc, argv, "--axis-prior", "0"));   /* with --family H|V: the axis from the layer normal + the family direction */
+    if (str < 1 || str > 8 || blur < 0 || blur > 4) { fprintf(stderr, "fiber-trace: --st-r 1..8, --blur 0..4\n"); return 2; }
     const int mi = ft_flag(argc, argv, "--mask"), derive = mi || atoi(ft_opt(argc, argv, "--presence-only", "0")); const char famf = ft_opt(argc, argv, "--family", "?")[0];
     static const char *const nm[3] = {"presence", "nx", "ny"};
     if (mi) {   /* a mask probability (zarr v3 uint8, prob254: 255 unknown read as 0) as the presence */
@@ -137,7 +167,8 @@ int cmd_fiber_trace(int argc, char **argv) {
         if (!vol[k] || z2_read(z, o, n, vol[k], nth)) { fprintf(stderr, "fiber-trace: read of %s failed: %s\n", key, z2_error()); return 1; }
         z2_close(z);
     }
-    if (derive) { vol[1] = malloc((size_t)n[0] * n[1] * n[2]); vol[2] = malloc((size_t)n[0] * n[1] * n[2]); if (!vol[1] || !vol[2]) return 1; ft_ridge_axis(vol[0], n, vol[1], vol[2]); }
+    if (derive) { vol[1] = malloc((size_t)n[0] * n[1] * n[2]); vol[2] = malloc((size_t)n[0] * n[1] * n[2]); if (!vol[1] || !vol[2]) return 1; if (blur > 0) ft_blur(vol[0], n, blur);
+        ft_ridge_axis(vol[0], n, vol[1], vol[2], str, prior_on && (famf == 'H' || famf == 'V') ? famf : 0); }
     const ft_vol V = {vol[0], vol[1], vol[2], {n[0], n[1], n[2]}}; P.V = &V; const size_t nv = (size_t)n[0] * n[1] * n[2];
     /* seeds: the presence maximum of each bin^3 cell */
     const int64_t g[3] = {(n[0] + bin - 1) / bin, (n[1] + bin - 1) / bin, (n[2] + bin - 1) / bin}; uint64_t *sd_ = malloc(((size_t)g[0] * g[1] * g[2] + 1) * sizeof *sd_); size_t ns = 0, npres = 0;
@@ -151,29 +182,32 @@ int cmd_fiber_trace(int argc, char **argv) {
     qsort(sd_, ns, sizeof *sd_, ft_seed_cmp);
     uint8_t *occ = calloc((nv + 7) / 8, 1); fib_set F = {0}; size_t capr = 1 << 16, capp = 1 << 20;
     F.off = malloc((capr + 1) * sizeof(int)); F.fam = malloc(capr + 1); F.pts = malloc(capp * 12); F.off[0] = 0;
-    double *line = malloc((size_t)(2 * half + 1) * 24); const double sc = ldexp(1.0, sd); size_t skipped = 0, shortl = 0; double tot = 0;
+    double *line = malloc((size_t)(2 * half + 1) * 24); const double sc = ldexp(1.0, sd); size_t skipped = 0, shortl = 0, nstop[FT_NSTOP] = {0}; double tot = 0;
     for (size_t si = 0; si < ns; si++) {
         const size_t i = (size_t)(sd_[si] & ((1ull << 40) - 1)); if (occ[i >> 3] >> (i & 7) & 1) { skipped++; continue; }
         const double p0[3] = {(double)(i / ((size_t)n[1] * n[2])), (double)(i / n[2] % n[1]), (double)(i % n[2])};
         const double x = (V.nx[i] - 128) / 127.0, y = (V.ny[i] - 128) / 127.0, zz = 1 - x * x - y * y; const double d0[3] = {zz > 0 ? sqrt(zz) : 0, y, x};
         double ds[3]; { double T[6], s; if (!ft_tensor(&V, p0, T, &s) || s < P.sup || ft_axis(T, d0, ds) < P.coh) continue; }
         /* the line: backward half reversed, the seed, forward half */
-        int nb = 0, nf = 0; double *fw = line + (size_t)half * 3, *seedp = fw;
+        int nb = 0, nf = 0, ends[2] = {FT_HALF, FT_HALF}; double *fw = line + (size_t)half * 3, *seedp = fw;
         for (int side = 0; side < 2; side++) {
             double p[3] = {p0[0], p0[1], p0[2]}, d[3] = {side ? -ds[0] : ds[0], side ? -ds[1] : ds[1], side ? -ds[2] : ds[2]};
+            int why = FT_HALF;
             for (int k = 0; k < half; k++) {
-                double d1[3], d2[3], pm[3]; if (!ft_dir(&P, p, d, d1)) break;
+                double d1[3], d2[3], pm[3]; int r = ft_dir(&P, p, d, d1); if (r) { why = r; break; }
                 for (int a = 0; a < 3; a++) pm[a] = p[a] + 0.5 * P.h * d1[a];
-                if (!ft_dir(&P, pm, d1, d2)) break;
-                if (d2[0] * d[0] + d2[1] * d[1] + d2[2] * d[2] < P.cturn) break;
+                if ((r = ft_dir(&P, pm, d1, d2))) { why = r; break; }
+                if (d2[0] * d[0] + d2[1] * d[1] + d2[2] * d[2] < P.cturn) { why = FT_TURN; break; }
                 for (int a = 0; a < 3; a++) { p[a] += P.h * d2[a]; d[a] = d2[a]; }
-                if (!(p[0] >= 0 && p[1] >= 0 && p[2] >= 0 && p[0] <= (double)(n[0] - 1) && p[1] <= (double)(n[1] - 1) && p[2] <= (double)(n[2] - 1))) break;
+                if (!(p[0] >= 0 && p[1] >= 0 && p[2] >= 0 && p[0] <= (double)(n[0] - 1) && p[1] <= (double)(n[1] - 1) && p[2] <= (double)(n[2] - 1))) { why = FT_BOX; break; }
                 double *q = side ? seedp - 3 * (++nb) : seedp + 3 * (++nf); q[0] = p[0]; q[1] = p[1]; q[2] = p[2];
             }
+            ends[side] = why;
         }
         seedp[0] = p0[0]; seedp[1] = p0[1]; seedp[2] = p0[2];
         const int np = nb + nf + 1; const double *q0 = seedp - 3 * nb; occ[i >> 3] |= (uint8_t)(1 << (i & 7));
         if ((np - 1) * P.h < minlen) { shortl++; continue; }
+        nstop[ends[0]]++; nstop[ends[1]]++;
         double tz2 = 0;
         for (int k = 0; k < np; k++) { const double *q = q0 + 3 * k; const int64_t c[3] = {llround(q[0]), llround(q[1]), llround(q[2])};
             for (int64_t z = c[0] - sep; z <= c[0] + sep; z++) for (int64_t y = c[1] - sep; y <= c[1] + sep; y++) for (int64_t x = c[2] - sep; x <= c[2] + sep; x++) {
@@ -190,6 +224,7 @@ int cmd_fiber_trace(int argc, char **argv) {
     printf("fiber-trace: box %lld %lld %lld + %lld %lld %lld at scaledown %d: presence >= %d in %.4f of the voxels, %zu seeds (%zu on an earlier line, %zu shorter than %.0f)\n",
            (long long)o[0], (long long)o[1], (long long)o[2], (long long)n[0], (long long)n[1], (long long)n[2], sd, thr, (double)npres / (double)nv, ns, skipped, shortl, minlen);
     printf("fiber-trace: %d streamlines (%zu H, %zu V), %d points, total length %.0f prediction voxels, mean %.1f -> %s\n", F.n, nH, (size_t)F.n - nH, F.npts, tot, F.n ? tot / F.n : 0, argv[4]);
+    printf("fiber-trace: line ends (kept lines): support %zu, coherence %zu, turn %zu, box %zu, half %zu\n", nstop[FT_SUP], nstop[FT_COH], nstop[FT_TURN], nstop[FT_BOX], nstop[FT_HALF]);
     if (fib_save(argv[4], &F)) { fprintf(stderr, "fiber-trace: cannot write %s\n", argv[4]); return 1; }
     free(line); free(occ); free(sd_); fib_free(&F); for (int k = 0; k < 3; k++) free(vol[k]);
     return 0;

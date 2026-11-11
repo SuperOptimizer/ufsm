@@ -87,6 +87,7 @@ test_afv                                       |              |     1 | ./$B/tes
 test_fiberjudge                                |              |     2 | ./$B/test_fiberjudge
 test_fibertrace                                |              |     1 | ./$B/test_fibertrace
 test_fiberraster                               |              |     2 | ./$B/test_fiberraster
+test_fiber_link                                |              |     1 | ./$B/test_fiber_link
 test_flatten                                   |              |    11 | ./$B/test_flatten
 test_flatten_gpu                               | gpu          |    80 | ./$B/test_flatten_gpu
 test_strip                                     |              |     4 | ./$B/test_strip
