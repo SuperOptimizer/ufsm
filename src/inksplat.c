@@ -21,6 +21,7 @@
 #include <time.h>
 
 #include "pyramid.h"
+#include "zcache.h"
 
 static double snow(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 enum { SH = 512, CH = 128, NCS = SH / CH, TS = 64 };
@@ -1051,7 +1052,7 @@ typedef struct { int surf, lab, msk; int64_t lr0, lc0, lw, lh; int ntx, nty; dou
 typedef struct { int32_t lo[3], hi[3]; uint32_t unit, tile; } iftile;
 typedef struct ifent { int64_t key; uint8_t *data; int empty; struct ifent *prev, *next, *hnext; } ifent;
 typedef struct {
-    inksplat_cfg c; int L; double V, off, reach; int64_t shape[3]; z3 *base_ct;
+    inksplat_cfg c; int L; double V, off, reach; int64_t shape[3]; z3 *base_ct; zcache *zc;   /* zc: decoded CT chunks shared by neighbouring chunks' boxes */
     ssurf *S; int nS; char (*Spath)[1024];
     lsrc *Ls; int nL; char (*Lpath)[1024];
     ifunit *U; int nU;
@@ -1063,6 +1064,7 @@ static struct { _Atomic uint64_t reads, chunks, empty, hits, px, us, ct_us; } g_
 static int inkfly_find(char (*paths)[1024], int n, const char *p) { for (int i = 0; i < n; i++) if (!strcmp(paths[i], p)) return i; return -1; }
 static void inkfly_free(void *p) {
     inkfly *f = p; if (!f) return;
+    if (f->zc) zcache_close(f->zc);
     for (int i = 0; i < f->nS; i++) ssurf_free(&f->S[i]);
     for (int i = 0; i < f->nL; i++) lsrc_close(&f->Ls[i]);
     for (size_t i = 0; i < f->nhash; i++) for (ifent *e = f->hash[i], *nx; e; e = nx) { nx = e->hnext; free(e->data); free(e); }
@@ -1092,75 +1094,90 @@ static int inkfly_chunk(inkfly *f, const int64_t o[3], const int64_t n[3], uint8
         }
     }
     if (!nc) { free(cand); return 0; }
-    /* the CT box: union of the candidates' boxes, as face_worker / prof_worker size theirs */
-    double lo3[3] = {1e300, 1e300, 1e300}, hi3[3] = {-1e300, -1e300, -1e300};
-    for (size_t q = 0; q < nc; q++) for (int d = 0; d < 3; d++) { if (f->T[cand[q]].lo[d] < lo3[d]) lo3[d] = f->T[cand[q]].lo[d]; if (f->T[cand[q]].hi[d] > hi3[d]) hi3[d] = f->T[cand[q]].hi[d]; }
-    int64_t co[3], cn[3]; size_t ncv = 1;
-    for (int d = 0; d < 3; d++) { co[d] = (int64_t)floor((lo3[d] - f->off) / V) - 1; cn[d] = (int64_t)ceil((hi3[d] - f->off) / V) + 2 - co[d]; ncv *= (size_t)cn[d]; }
-    uint8_t *ctb = malloc(ncv); uint8_t *ni = calloc(cv, 1), *nn = calloc(cv, 1), *pi = calloc(cv, 1), *pn = calloc(cv, 1);
-    int rc = -1;
-    if (!ctb || !ni || !nn || !pi || !pn) goto done;
-    { const double tc = snow();
-      if (z3_read(f->base_ct, co, cn, ctb, 1)) { fprintf(stderr, "ink-splat onfly: CT read: %s\n", z3_error()); goto done; }
-      atomic_fetch_add(&g_ifs.ct_us, (uint64_t)((snow() - tc) * 1e6)); }
     /* sort candidates by unit */
     for (size_t i = 1; i < nc; i++) { uint32_t t = cand[i]; size_t j = i; while (j > 0 && (f->T[cand[j - 1]].unit > f->T[t].unit || (f->T[cand[j - 1]].unit == f->T[t].unit && f->T[cand[j - 1]].tile > f->T[t].tile))) { cand[j] = cand[j - 1]; j--; } cand[j] = t; }
-    const int lo = (int)floor(c->face_lo), hi = (int)ceil(c->face_hi), ns = hi - lo + 1;
-    float raw[256], sm[256];
-    const double hpx0 = 0.45 * V;
+    /* pass 1 per unit: the label rectangle of its candidate tiles, and the supervised pixels whose surface point is near the chunk */
+    typedef struct { const ifunit *u; uint8_t *lab, *msk; int64_t rr0, rc0, rw, rh; size_t np; int64_t *pk; double *PN; } ugrp;
+    size_t ng = 0, gcap = 8; ugrp *UG = calloc(gcap, sizeof *UG);
+    double lo3[3] = {1e300, 1e300, 1e300}, hi3[3] = {-1e300, -1e300, -1e300}; size_t nnear = 0;
+    uint8_t *ctb = nullptr, *ni = nullptr, *nn = nullptr, *pi = nullptr, *pn = nullptr; int rc = -1;
+    const double slack = f->reach + 3;
     for (size_t q0 = 0; q0 < nc;) {
         size_t q1 = q0; const ifunit *u = &f->U[f->T[cand[q0]].unit]; while (q1 < nc && f->T[cand[q1]].unit == f->T[cand[q0]].unit) q1++;
         int64_t rr0 = INT64_MAX, rc0 = INT64_MAX, rr1 = 0, rc1 = 0;
         for (size_t q = q0; q < q1; q++) { const int t = (int)f->T[cand[q]].tile, tx = t % u->ntx, ty = t / u->ntx;
             const int64_t r0 = (int64_t)ty * TS, c0 = (int64_t)tx * TS, r1 = r0 + TS < u->lh ? r0 + TS : u->lh, c1 = c0 + TS < u->lw ? c0 + TS : u->lw;
-            if (r0 < rr0) rr0 = r0; if (c0 < rc0) rc0 = c0; if (r1 > rr1) rr1 = r1; if (c1 > rc1) rc1 = c1; }
-        const int64_t rh = rr1 - rr0, rw = rc1 - rc0;
-        uint8_t *lab = malloc((size_t)rh * rw), *msk = u->msk >= 0 ? malloc((size_t)rh * rw) : nullptr; int8_t *face = malloc((size_t)rh * rw);
-        if (!lab || !face || (u->msk >= 0 && !msk) || lsrc_read(&f->Ls[u->lab], u->lr0 + rr0, u->lc0 + rc0, rh, rw, lab, 1) ||
-            (msk && lsrc_read(&f->Ls[u->msk], u->lr0 + rr0, u->lc0 + rc0, rh, rw, msk, 1))) { free(lab); free(msk); free(face); goto done; }
-        if (u->lab01) for (size_t k = 0; k < (size_t)rh * rw; k++) lab[k] *= 255;
-        if (msk && u->msk01) for (size_t k = 0; k < (size_t)rh * rw; k++) msk[k] *= 255;
-        geo G = {0}; G.c = c; G.S = &f->S[u->surf]; G.F = u->F; G.sign = c->flip ? -1 : 1; G.lab = lab; G.msk = msk; G.lw = rw; G.lh = rh;
+            if (r0 < rr0) { rr0 = r0; } if (c0 < rc0) { rc0 = c0; } if (r1 > rr1) { rr1 = r1; } if (c1 > rc1) { rc1 = c1; } }
+        if (ng == gcap) { gcap *= 2; UG = realloc(UG, gcap * sizeof *UG); }
+        ugrp *g = &UG[ng++]; memset(g, 0, sizeof *g); g->u = u; g->rr0 = rr0; g->rc0 = rc0; g->rh = rr1 - rr0; g->rw = rc1 - rc0;
+        g->lab = malloc((size_t)g->rh * g->rw); g->msk = u->msk >= 0 ? malloc((size_t)g->rh * g->rw) : nullptr;
+        if (!g->lab || (u->msk >= 0 && !g->msk) || lsrc_read(&f->Ls[u->lab], u->lr0 + rr0, u->lc0 + rc0, g->rh, g->rw, g->lab, 1) ||
+            (g->msk && lsrc_read(&f->Ls[u->msk], u->lr0 + rr0, u->lc0 + rc0, g->rh, g->rw, g->msk, 1))) goto done;
+        if (u->lab01) for (size_t k = 0; k < (size_t)g->rh * g->rw; k++) g->lab[k] *= 255;
+        if (g->msk && u->msk01) for (size_t k = 0; k < (size_t)g->rh * g->rw; k++) g->msk[k] *= 255;
+        geo G = {0}; G.c = c; G.S = &f->S[u->surf]; G.F = u->F; G.lab = g->lab; G.msk = g->msk; G.lw = g->rw; G.lh = g->rh;
         G.lr0 = u->lr0 + rr0; G.lc0 = u->lc0 + rc0; G.offr = c->label_off[0]; G.offc = c->label_off[1];
-        double hpx = hpx0 / u->F; if (hpx > 1) hpx = 1; const int nsub = (int)ceil(1 / hpx);
-        const double span = c->face_b - c->face_a; const int nt = (int)ceil(span / (0.45 * V)) + 1; const double tstep = nt > 1 ? span / (nt - 1) : 0;
+        size_t pcap = 1024; g->pk = malloc(pcap * sizeof *g->pk); g->PN = malloc(pcap * 6 * sizeof *g->PN);
         for (size_t q = q0; q < q1; q++) {
             const int t = (int)f->T[cand[q]].tile, tx = t % u->ntx, ty = t / u->ntx;
             const int64_t r0 = (int64_t)ty * TS, c0 = (int64_t)tx * TS, r1 = r0 + TS < u->lh ? r0 + TS : u->lh, c1 = c0 + TS < u->lw ? c0 + TS : u->lw;
             for (int64_t r = r0 - rr0; r < r1 - rr0; r++) for (int64_t cc = c0 - rc0; cc < c1 - rc0; cc++) {
-                const size_t pk = (size_t)r * rw + cc; face[pk] = FACE_NONE;
                 if (!px_sup(&G, r, cc)) continue;
                 double gu, gv, P[3], N[3]; px_grid(&G, (double)r, (double)cc, &gu, &gv);
                 if (ssurf_pn(G.S, gu, gv, P, N)) continue;
-                {   /* a pixel whose splat samples (|t| <= reach, sub-samples within a pixel) cannot reach the chunk is skipped */
-                    int far = 0; for (int d = 0; d < 3 && !far; d++) far = P[d] < a0[d] - f->reach - 3 || P[d] > b0[d] + f->reach + 3;
-                    if (far) continue; }
-                atomic_fetch_add(&g_ifs.px, 1);
-                for (int i = 0; i < ns; i++) {
-                    const double tt = (lo + i) * G.sign; double qq[3];
-                    for (int d = 0; d < 3; d++) qq[d] = (P[d] + tt * N[d] - f->off) / V - co[d];
-                    const float v = tri_box(ctb, cn, qq[0], qq[1], qq[2]); raw[i] = v < 0 ? 0 : v;
-                }
-                for (int i = 0; i < ns; i++) sm[i] = 0.25f * (raw[i > 0 ? i - 1 : 0] + 2 * raw[i] + raw[i < ns - 1 ? i + 1 : ns - 1]);
-                const int fo = face_of(sm, ns, lo, c->iso, c->face_run, c->face_gap); face[pk] = (int8_t)fo;
-                if (fo == FACE_NONE) continue;
-                const double ta = fo + c->face_a; const uint8_t lv = lab[pk]; const int ink = lv >= 128;
-                for (int a = 0; a < nsub; a++) for (int b = 0; b < nsub; b++) {
-                    double P2[3], N2[3];
-                    px_grid(&G, r + (a + 0.5) / nsub - 0.5, cc + (b + 0.5) / nsub - 0.5, &gu, &gv);
-                    if (ssurf_pn(G.S, gu, gv, P2, N2)) continue;
-                    for (int k = 0; k < nt; k++) {
-                        const double tt = (ta + k * tstep) * G.sign; int64_t vi[3]; int in = 1;
-                        for (int d = 0; d < 3; d++) { vi[d] = (int64_t)floor((P2[d] + tt * N2[d] - f->off) / V + 0.5) - o[d]; if (vi[d] < 0 || vi[d] >= n[d]) { in = 0; break; } }
-                        if (!in) continue;
-                        const size_t k2 = ((size_t)vi[0] * n[1] + vi[1]) * n[2] + vi[2];
-                        if (ink) { if (ni[k2] < 255) ni[k2]++; if (lv > pi[k2]) pi[k2] = lv; }
-                        else { if (nn[k2] < 255) nn[k2]++; if (lv > pn[k2]) pn[k2] = lv; }
-                    }
+                int far = 0; for (int d = 0; d < 3 && !far; d++) far = P[d] < a0[d] - slack || P[d] > b0[d] + slack;   /* samples cannot reach the chunk */
+                if (far) continue;
+                if (g->np == pcap) { pcap *= 2; g->pk = realloc(g->pk, pcap * sizeof *g->pk); g->PN = realloc(g->PN, pcap * 6 * sizeof *g->PN); }
+                g->pk[g->np] = r * g->rw + cc; memcpy(g->PN + 6 * g->np, P, sizeof P); memcpy(g->PN + 6 * g->np + 3, N, sizeof N); g->np++;
+                for (int d = 0; d < 3; d++) { if (P[d] - slack < lo3[d]) lo3[d] = P[d] - slack; if (P[d] + slack > hi3[d]) hi3[d] = P[d] + slack; }
+            }
+        }
+        nnear += g->np; q0 = q1;
+    }
+    if (!nnear) { rc = 0; goto done; }
+    /* the CT box: the near pixels' surface points +- every sample's reach (the values do not depend on the box) */
+    int64_t co[3], cn[3]; size_t ncv = 1;
+    for (int d = 0; d < 3; d++) { co[d] = (int64_t)floor((lo3[d] - f->off) / V) - 1; cn[d] = (int64_t)ceil((hi3[d] - f->off) / V) + 2 - co[d]; ncv *= (size_t)cn[d]; }
+    ctb = malloc(ncv); ni = calloc(cv, 1); nn = calloc(cv, 1); pi = calloc(cv, 1); pn = calloc(cv, 1);
+    if (!ctb || !ni || !nn || !pi || !pn) goto done;
+    { const double tc = snow();
+      if (f->zc ? zcache_read(f->zc, f->base_ct, co, cn, ctb) : z3_read(f->base_ct, co, cn, ctb, 1)) { fprintf(stderr, "ink-splat onfly: CT read: %s\n", z3_error()); goto done; }
+      atomic_fetch_add(&g_ifs.ct_us, (uint64_t)((snow() - tc) * 1e6)); }
+    const int lo = (int)floor(c->face_lo), hi = (int)ceil(c->face_hi), ns = hi - lo + 1;
+    float raw[256], sm[256];
+    const double hpx0 = 0.45 * V;
+    for (size_t gi = 0; gi < ng; gi++) {
+        ugrp *g = &UG[gi]; const ifunit *u = g->u; if (!g->np) continue;
+        geo G = {0}; G.c = c; G.S = &f->S[u->surf]; G.F = u->F; G.sign = c->flip ? -1 : 1; G.lab = g->lab; G.msk = g->msk; G.lw = g->rw; G.lh = g->rh;
+        G.lr0 = u->lr0 + g->rr0; G.lc0 = u->lc0 + g->rc0; G.offr = c->label_off[0]; G.offc = c->label_off[1];
+        double hpx = hpx0 / u->F; if (hpx > 1) hpx = 1; const int nsub = (int)ceil(1 / hpx);
+        const double span = c->face_b - c->face_a; const int nt = (int)ceil(span / (0.45 * V)) + 1; const double tstep = nt > 1 ? span / (nt - 1) : 0;
+        atomic_fetch_add(&g_ifs.px, g->np);
+        for (size_t ip = 0; ip < g->np; ip++) {
+            const int64_t pk = g->pk[ip], r = pk / g->rw, cc = pk % g->rw; const double *P = g->PN + 6 * ip, *N = P + 3;
+            for (int i = 0; i < ns; i++) {
+                const double tt = (lo + i) * G.sign; double qq[3];
+                for (int d = 0; d < 3; d++) qq[d] = (P[d] + tt * N[d] - f->off) / V - co[d];
+                const float v = tri_box(ctb, cn, qq[0], qq[1], qq[2]); raw[i] = v < 0 ? 0 : v;
+            }
+            for (int i = 0; i < ns; i++) sm[i] = 0.25f * (raw[i > 0 ? i - 1 : 0] + 2 * raw[i] + raw[i < ns - 1 ? i + 1 : ns - 1]);
+            const int fo = face_of(sm, ns, lo, c->iso, c->face_run, c->face_gap);
+            if (fo == FACE_NONE) continue;
+            const double ta = fo + c->face_a; const uint8_t lv = g->lab[pk]; const int ink = lv >= 128;
+            for (int a = 0; a < nsub; a++) for (int b = 0; b < nsub; b++) {
+                double gu, gv, P2[3], N2[3];
+                px_grid(&G, r + (a + 0.5) / nsub - 0.5, cc + (b + 0.5) / nsub - 0.5, &gu, &gv);
+                if (ssurf_pn(G.S, gu, gv, P2, N2)) continue;
+                for (int k = 0; k < nt; k++) {
+                    const double tt = (ta + k * tstep) * G.sign; int64_t vi[3]; int in = 1;
+                    for (int d = 0; d < 3; d++) { vi[d] = (int64_t)floor((P2[d] + tt * N2[d] - f->off) / V + 0.5) - o[d]; if (vi[d] < 0 || vi[d] >= n[d]) { in = 0; break; } }
+                    if (!in) continue;
+                    const size_t k2 = ((size_t)vi[0] * n[1] + vi[1]) * n[2] + vi[2];
+                    if (ink) { if (ni[k2] < 255) ni[k2]++; if (lv > pi[k2]) pi[k2] = lv; }
+                    else { if (nn[k2] < 255) nn[k2]++; if (lv > pn[k2]) pn[k2] = lv; }
                 }
             }
         }
-        free(lab); free(msk); free(face);
         /* finalize this unit (as splat_worker) and merge by known max */
         for (size_t k = 0; k < cv; k++) {
             const int h = ni[k] + nn[k]; if (!h) continue;
@@ -1179,11 +1196,11 @@ static int inkfly_chunk(inkfly *f, const int64_t o[3], const int64_t n[3], uint8
             }
             ni[k] = nn[k] = pi[k] = pn[k] = 0;
         }
-        q0 = q1;
     }
     rc = 0;
 done:
-    free(cand); free(ctb); free(ni); free(nn); free(pi); free(pn);
+    for (size_t gi = 0; gi < ng; gi++) { free(UG[gi].lab); free(UG[gi].msk); free(UG[gi].pk); free(UG[gi].PN); }
+    free(UG); free(cand); free(ctb); free(ni); free(nn); free(pi); free(pn);
     return rc;
 }
 enum { IFC = 128 };   /* cached chunk edge (level-L voxels) */
@@ -1324,6 +1341,7 @@ z3 *inkfly_open(z3 *ct, const char *segs_path, const inksplat_cfg *cfg, size_t c
             free(fill);
         }
     }
+    f->zc = zcache_open((size_t)1 << 30);
     f->nhash = 1 << 16; f->hash = calloc(f->nhash, sizeof *f->hash); f->cap_bytes = (cache_mb ? cache_mb : 2048) << 20;
     z3 *z = z3_open_derived(ct, 255, inkfly_derive, f, inkfly_free);
     if (!z) { inkfly_free(f); z3_close(ct); return nullptr; }
