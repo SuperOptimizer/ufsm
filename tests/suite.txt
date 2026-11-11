@@ -58,6 +58,7 @@ test_fit~full                                  | slow,gpu     |  1281 | ./$B/tes
 test_fit_join                                  | gpu          |     9 | ./$B/test_fit_join
 test_wrap_check                                |              |     1 | ./$B/test_wrap_check
 test_geom_check                                |              |     3 | ./$B/test_geom_check
+test_sheetpbr                                  |              |     2 | ./$B/test_sheetpbr
 test_pairacc                                   |              |     1 | ./$B/test_pairacc
 test_wbench_stats                              |              |     2 | bash tests/test_wbench_stats.sh $B/ufsm
 test_gpuq                                      | flaky        |    14 | bash tests/test_gpuq.sh

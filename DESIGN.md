@@ -6,6 +6,130 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Physically based sheet rendering: what ink looks like on the surface without an ink model (2026-11-11, branch pbr-20261111)
+`ufsm sheet-pbr <tifxyz-dir> <out-dir> --ct ROOT KEY --crop U0,V0,N [--ss S]` renders the papyrus surface of a published segment crop
+as a physical object (src/sheetpbr.c). Surface: the tifxyz grid through Catmull-Rom splines (C1, no 48 um grid-cell creases), outward
+normal by the crop's convexity (recto = inner face, faces.h convention). Profiles along the normal every 0.25 voxel (trilinear CT,
+`--interp cubic` tricubic). Recto face: the steepest rise (air -> papyrus) of the smoothed profile, first on an 8-px lattice within
+[-15, +5] voxels of the mesh, robustly smoothed (Gaussian 3 cells, points > 3 voxels off dropped, 4 rounds), then as ONE continuous
+surface by dynamic programming (row Viterbi then column Viterbi over the offset within +-6 voxels of that, transition cost 0.5 |dt|,
+|dt| <= 1 voxel per sample, column pass tied to the row result), refined sub-voxel (parabola through the derivative) within +-0.5
+voxel of the DP surface. Verso: the steepest fall around its neighbourhood median. Shading of the recto height field seen from the
+recto side: Lambert + GGX (alpha 0.35, F0 0.04), 12 raking lights at 15 deg with cast shadows, horizon AO, exposure 2 / 98 % + gamma.
+Diagnostics: near-surface CT (first 4.8 um inside), thickness, high-pass / roughness / curvature of the height, `--xsec` cross-sections
+with the faces drawn, `--layers` CT on parallel layers, `--profiles`.
+
+Data: Paris 4 segments 20260701183125-w028-037, ...26-w038-045, ...27-w046-052 (open-data bucket, the 2.4 um tifxyz on
+20260411134726, CT level 0 from the volcomp mirror, q 8). Crops (2048^2 px = 4.9 x 4.9 mm) chosen where the published 2D ink
+prediction covers ~35 % of a fully surfaced 2 x 2-tile block. The reference is that published ink PREDICTION
+(new_canon_autoresearch_recipe, a model output): no human ink labels exist for these 2026 segments; the HF bucket's
+ink/phercparis4/wNN_<2023 segment> sets are on the 7.91 um 2023 scan and need the 2023 -> 2026 registration.
+
+Findings:
+- The 2.4 um meshes are tilted / offset relative to the sheets (cross-sections: the bands cross t = 0 at ~2 deg, tens of voxels over
+  a crop) — consistent with segments carried over from the 7.91 um scan. Sheets in the inner wraps are packed: no clean void, gaps are
+  8-10 voxel dips, ~20 voxels between interfaces (fibre layers / sheets), so a per-sample interface finder hops between interfaces
+  (first draft: piecewise-flat plateaus). After the DP: per-sample steepest rise more than 1 voxel off the continuous surface at
+  35.5 / 37.8 / 39.0 % of samples (w046 / w038 / w028); runner-up edge >= 0.7 of the best (ambiguous) at 7.5 / 9.3 / 9.3 %; faces
+  found at 86-87 %; mean recto-verso distance 20-25 voxels (48-60 um).
+- The shaded surface shows the papyrus itself (horizontal / vertical fibre strips, relief, crackle in the near-surface CT); fine
+  diagonal hatching in the raking lights is a sampling artefact (0.25-voxel DP offsets), not texture.
+- AUC against the ink prediction (pos >= 160, neg <= 64; raw / detrended by a 0.7 mm Gaussian; tie-aware ranks):
+
+| map | w028-037 | w038-045 | w046-052 |
+|---|---|---|---|
+| flat CT at the mesh | 0.577 / 0.539 | 0.530 / 0.526 | 0.433 / 0.420 |
+| max CT +-3 | 0.586 / 0.539 | 0.553 / 0.546 | 0.426 / 0.412 |
+| near-recto CT | 0.567 / 0.527 | 0.567 / 0.558 | 0.462 / 0.463 |
+| thickness | 0.479 / 0.529 | 0.462 / 0.451 | 0.538 / 0.576 |
+| recto height | 0.568 / 0.605 | 0.558 / 0.522 | 0.518 / 0.517 |
+| height high-pass | 0.486 / 0.484 | 0.493 / 0.492 | 0.495 / 0.494 |
+| roughness | 0.548 / 0.644 | 0.494 / 0.423 | 0.550 / 0.458 |
+| curvature | 0.510 / 0.507 | 0.503 / 0.501 | 0.505 / 0.505 |
+| RTI min (12 lights) | 0.489 / 0.438 | 0.503 / 0.532 | 0.466 / 0.499 |
+| PBR (GGX + shadows + AO) | 0.457 / 0.445 | 0.497 / 0.502 | 0.471 / 0.485 |
+| best single CT layer | t -35: 0.553 / 0.582 | t -2: 0.532 / 0.529 | t +2: 0.433 / 0.419 |
+
+  No physical surface map separates the predicted ink: every AUC is within 0.40-0.64 and the sign flips between crops (flat CT 0.58
+  on w028, 0.43 on w046). Two readings, not yet separated: carbon ink leaves no relief / density signature our sampling resolves at
+  2.4 um with q 8 compression; or the reference itself (a model prediction, on a mesh that does not sit on one face) marks letters at
+  a layer our tracked recto is not on. Next: human-labelled segments (the 2023-scan labels through the new registration), the 1.129 um
+  scan (meshes exist, on-20260608103018), --ss 2 / 4 on sub-crops, and the face on the side the ink model's input layers sit.
+1.129 um (`--reg MAP.json`): the mesh stays on the 2.4 um scan, every sample point goes through the published ufsm reg map
+PHercParis4/transforms/20260608103018_to_20260411134726/reg.json (affine + field, held-out p50 0.85 um) into the 1.129 um scan
+20260608103018, the normal through the map's local Jacobian; offsets and all voxel parameters in 1.129 um voxels (ratio 2.126),
+sampled at --ss 2 (1.13 um along the surface). Coverage: the 1.129 um scan spans 2.4 um z ~28000-56600; crop w028-037 (z ~63000) is
+outside it and w038-045's crop lies in its masked-out zeros, so 1024-px sub-crops were used: w046 (centre of the w046 crop) and two
+substitutes picked the same way inside the coverage, w028s (u 103424, v 27648) and w038s (u 90112, v 44032). The registration holds
+at the surface: cracks, inclusions and fibre strips coincide in the 2.4 and 1.129 um renders (out/cmp_*.png, the same 1 x 1 mm).
+At 1.129 um the recto edge is less decided: runner-up edge >= 0.7 of the best at 26-31 % of samples (2.4 um: 8-9 %), the DP surface
+departs from the per-sample steepest rise at 42-56 % (2.4 um: 23-36 %): more noise per voxel, and fine structure (fibre bundles,
+crackle) makes several real edges. AUC vs the ink prediction, 2.4 um | 1.129 um, raw / detrended:
+
+| map | w046 | w028s | w038s |
+|---|---|---|---|
+| flat CT | 0.307 / 0.372 \| 0.331 / 0.411 | 0.424 / 0.425 \| 0.449 / 0.465 | 0.650 / 0.613 \| 0.629 / 0.558 |
+| near-recto CT | 0.434 / 0.502 \| 0.457 / 0.510 | 0.544 / 0.548 \| 0.538 / 0.546 | 0.520 / 0.551 \| 0.582 / 0.566 |
+| thickness | 0.630 / 0.827 \| 0.650 / 0.583 | 0.399 / 0.402 \| 0.431 / 0.465 | 0.590 / 0.505 \| 0.564 / 0.452 |
+| recto height | 0.546 / 0.574 \| 0.562 / 0.555 | 0.459 / 0.460 \| 0.481 / 0.492 | 0.567 / 0.635 \| 0.578 / 0.599 |
+| roughness | 0.515 / 0.524 \| 0.493 / 0.516 | 0.574 / 0.365 \| 0.593 / 0.415 | 0.495 / 0.383 \| 0.506 / 0.377 |
+| RTI min | 0.506 / 0.392 \| 0.507 / 0.350 | 0.455 / 0.513 \| 0.470 / 0.656 | 0.532 / 0.353 \| 0.515 / 0.291 |
+| PBR | 0.487 / 0.461 \| 0.509 / 0.451 | 0.450 / 0.480 \| 0.441 / 0.525 | 0.515 / 0.514 \| 0.506 / 0.506 |
+
+  The finer scan does not change the picture: no map separates the predicted ink consistently, the signs flip between crops
+  (flat CT 0.31 on w046, 0.65 on w038s), and 1.129 um numbers track the 2.4 um ones within a few hundredths.
+Outputs: /vesuvius/ufsm/pbr/out/<crop>/{contact.png, png/*.png, *.f32, map.json, auc.json}.
+
+### Addendum: against HUMAN ink labels (2026-11-11)
+
+- The public human labels (HF scrollprize/datasets ink/phercparis4, 8 segments w00..w09) are already on the 2.4 um
+  20260411134726 scan (their meshes reach z ~74000, x ~26000; the 2023 scan's shape is 14258 x 7888 x 8096). So no 2023 -> 2026
+  map was needed. Pipeline: ink-splat each label segment (label + supervision mask) into one sparse prob254 zarr (band +-4
+  voxels, 255 = unknown), then `sheet-pbr --labels`. For each output pixel the sampler walks the normal +-D around our tracked
+  recto. It picks the labelled run nearest the face and returns its majority label (human_ink) and its offset from the face
+  (human_off). Voxels outside the label box count as unknown, not as no ink.
+- Picking crops by geometry alone gave 0 % labelled on 9 crops: the label segments run near our sheets but are unsupervised
+  there. So crops were re-picked by distance to supervised label pixels (tools/pbr hcand2.txt; >= 60 % of the mesh vertices
+  within 12 voxels). That gave L1-L5 plus w028 and hC. w028s is 7.4 % labelled and its label surface sits -28 voxels from our
+  face, i.e. on the neighbouring sheet, so it is excluded.
+
+| crop (seg, u, v, px) | labelled | ink | label - recto mean / mean abs (2.4 \| 1.13) |
+|---|---|---|---|
+| w028 (w028-037 122880 10240, 2048) | 99.2 % | 36.5 % | +4.6 / 9.8 \| - |
+| hC (w028-037 61440 21504, 1024) | 26.6 % | 50.6 % | +7.3 / 11.3 \| +6.9 / 11.5 |
+| L1 (w028-037 77824 19456) | 100 % | 38.9 % | +5.5 / 7.9 \| +5.8 / 8.0 |
+| L2 (w028-037 54272 26624) | 99.6 % | 47.6 % | +3.4 / 6.5 \| +4.0 / 6.7 |
+| L3 (w010-027 62464 23552) | 100 % | 40.3 % | +3.1 / 6.6 \| +5.3 / 8.4 |
+| L4 (w010-027 72704 37888) | 99.5 % | 42.9 % | +8.1 / 9.9 \| +7.9 / 9.6 |
+| L5 (w038-045 167936 24576) | 100 % | 44.2 % | +0.6 / 7.1 \| +1.7 / 7.3 |
+
+  The label surfaces are on the same sheet as our face. They sit on average 1-8 mesh voxels outward of it (|d| 6.5-10 voxels,
+  i.e. 16-24 um, about one sheet thickness of jitter), never a whole wrap off, except w028s.
+
+AUC vs HUMAN labels, raw / detrended (2.4 um; 1.129 um in parentheses):
+
+| map | w028 | hC | L1 | L2 | L3 | L4 | L5 | pooled (z-scored per crop) |
+|---|---|---|---|---|---|---|---|---|
+| recto offset | 0.41/0.38 | 0.73/0.72 (0.70) | 0.65/0.56 (0.63) | 0.57/0.56 (0.50) | 0.46/0.46 (0.45) | 0.53/0.52 (0.55) | 0.39/0.45 (0.36) | 0.493 (0.529) |
+| flat CT | 0.58/0.56 | 0.37/0.38 (0.39) | 0.44/0.47 (0.42) | 0.44/0.47 (0.42) | 0.53/0.52 (0.52) | 0.53/0.52 (0.54) | 0.53/0.50 (0.53) | 0.525 (0.481) |
+| near-recto CT | 0.56/0.53 | 0.54/0.56 (0.45) | 0.53/0.52 (0.46) | 0.50/0.52 (0.47) | 0.53/0.53 (0.54) | 0.50/0.50 (0.53) | 0.52/0.53 (0.51) | 0.534 (0.499) |
+| thickness | 0.48/0.52 | 0.55/0.51 (0.57) | 0.39/0.44 (0.43) | 0.46/0.44 (0.51) | 0.46/0.45 (0.43) | 0.54/0.54 (0.49) | 0.57/0.56 (0.59) | 0.485 (0.497) |
+| recto height | 0.60/0.62 | 0.27/0.28 (0.30) | 0.35/0.43 (0.38) | 0.43/0.44 (0.50) | 0.54/0.54 (0.55) | 0.47/0.48 (0.45) | 0.61/0.55 (0.64) | 0.507 (0.471) |
+| roughness | 0.55/0.58 | 0.54/0.63 (0.56) | 0.55/0.44 (0.52) | 0.65/0.38 (0.57) | 0.50/0.49 (0.51) | 0.53/0.45 (0.52) | 0.54/0.50 (0.54) | 0.511 (0.517) |
+| PBR | 0.47/0.47 | 0.46/0.45 (0.45) | 0.48/0.45 (0.49) | 0.41/0.47 (0.47) | 0.50/0.51 (0.50) | 0.48/0.49 (0.49) | 0.47/0.49 (0.46) | 0.462 (0.478) |
+| RTI min | 0.49/0.47 | 0.46/0.41 (0.49) | 0.48/0.39 (0.50) | 0.42/0.53 (0.52) | 0.49/0.51 (0.50) | 0.48/0.54 (0.49) | 0.48/0.56 (0.48) | 0.467 (0.503) |
+| AO | 0.46/0.46 | 0.46/0.46 (0.45) | 0.44/0.43 (0.47) | 0.37/0.41 (0.45) | 0.51/0.51 (0.50) | 0.47/0.48 (0.48) | 0.46/0.49 (0.46) | 0.454 (0.472) |
+
+- Result: against human labels, as against the predictions, no label-free surface map separates ink. Pooled AUCs are
+  0.45-0.53. Per-crop values reach 0.27 / 0.73 (hC height, recto offset), but the sign flips between crops: recto offset is
+  0.73 on hC and 0.39 on L5, and height is 0.27 on hC and 0.61 on L5.
+- Caveat: the human labels are coarse polygons at letter scale. A 1024-px crop (2.46 mm) holds only one or two label
+  boundaries (see cmph_L1.png: the crop splits into one ink half and one no-ink half). So a per-crop AUC mostly measures
+  "which half of the crop", and detrending at sigma 300 px is close to the crop size. A test with real power needs >= 8 mm
+  crops spanning many letters, scored at stroke edges.
+- Images: /vesuvius/ufsm/pbr/out/cmph_{L1,L4,hC}.png (human label | flat | near-recto | PBR | raking light | recto offset,
+  2.4 um row over 1.129 um row), out/h_{s24,s113}_<crop>/contact_human.png, auc_human.txt.
+
 ## fiber-trace on the GPU: the per-voxel axis, byte-identical (2026-11-11, branch gtrace-20261111)
 
 A `--mask` trace is almost all per-voxel work: on the Paris 4 HOLD box (512 x 576 x 768 at 9.6 um, fibhv-a step-10000 H mask) the CPU
