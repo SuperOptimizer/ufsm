@@ -6,6 +6,77 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## The winding phase on the fly from the codes (2026-11-11, branch univ-20261111)
+
+User: the phase computed from the codes per window, "on the gpu", "so that we dont have so many artifacts". A 4.8 um phase set is ~10x
+its codes (PHerc1667 A: phase 46 GB vs codes 4.5 GB; volcomp q0, the ramp varies everywhere) and a deterministic function of them.
+
+- `z3_open_derived` (zarr3.h): an array whose `z3_read` computes its values from a base array; meta, chunk map, `z3_box_any` and shard
+  presence come from the base, so every phase reader (phase_window direct / upsampled / interpolated, crush layers, occupancy) works
+  unchanged.
+- `band_onfly.h`: the pair rule (band_field_phase_pair) over the read box plus a halo of ceil(rmax) + 2, in tiles that fit a device
+  budget, on the GPU (band_pair_gpu, slots reserved before the trainer's planner; `--onfly-gpu / --onfly-slots / --onfly-mb`), CPU
+  fallback. Sources: `"phase": {"onfly": {"root", "key", "rmax"}, "level": L}` (rmax = phase-raster --radius / --gs, codes voxels).
+- Byte identity: the phase at a voxel depends only on labelled voxels within rmax of it. Measured: PHerc1667 A48 / B48, 3 + 3 windows
+  of 896^3, 0 differing voxels against phase-raster's stored sets; test_phase_onfly (fixture: CPU, GPU, 64 MB tiles with seams, and
+  two --det training runs on the stored vs the onfly phase: identical losses).
+- Paris 4 p4full (--gs 4) was computed on the 4.8 um codes pooled 2x inside phase-raster; `ufsm codes-pool2` writes those pooled codes
+  (praster_read, byte-exact) so the onfly phase over them matches p4full. (Pooling on the GPU cannot match: CUDA's atan2 differs from
+  glibc's at the exact half-step ties the circular mean produces.)
+
+Cost (per 896^3 window, rmax 80 at 4.8 um / 82 at 9.36 um):
+
+| where | tiles (voxels / window) | pair rule | codes read (CPU decode) | total |
+|---|---|---|---|---|
+| desk 5060 Ti (shared with u1), 1 GB tiles | 64 x 436^3 (4.7x) | 8.5 s | 1.2 s | 8.8 s |
+| + warp-per-line x pass (12x on that kernel) and envelope chunks sized to the tile (1.7x) | 512^3 test: 8 tiles | 0.62 s for 8 x 420^3 (was 1.2 s) | | |
+| RTX PRO 6000 pod, one 1064^3 tile (16 GB budget), before the kernel changes | 1 (1.67x) | 1.5 s | 2-4 s | 4.7 s |
+
+nsys on a 420^3 tile (desk): x pass 45 -> 1.8 ms, the y / z envelopes 99 -> 57 ms (90% of what remains), pair kernel 4-8 ms, copies
+13 ms. Rastering a whole set once is ~1.6T voxel-work (1667 A: 77 min on the desk GPU); one u1-length run at ~16% onfly windows
+recomputes ~15T. What remains on the CPU and why: the codes decode (volcomp lossless mode 1: nn_gpudec only decodes the lossy mode 0),
+the padded-box copy and the D2H of the phase into the sampler's label planes (the sampler builds planes on the host). Next: GPU decode
+of the lossless codes chunks, the envelope passes in shared memory, and the phase kept on the device for the GPU input build.
+
+## Universal net: the fibre head in unwrap2 (--fib-head L) (2026-11-11, branch univ-20261111)
+
+Why: `--fib-dir` (fibhv-c / fibhv-d: the H / V fibre masks plus the tube direction) ran as its own task. It used the two batch target
+channels, needed a whole-window loss, and excluded every unwrap2 head. The universal net (U5) needs it as one more head on the
+shared trunk.
+
+How:
+- **Targets:** two new target slots, "fibre_h" and "fibre_v" (`CH_FIBH` / `CH_FIBV`, NTG 5), each a prob254 tube raster with
+  255 = unknown. A builder maps fibhv data's recto to fibre_h and sheet to fibre_v.
+- **Planes:** they become two more aux label planes (roles `AUX_FIBH` / `AUX_FIBV`):
+  - The registry now holds up to 5 aux planes (sampler `batch.aux[0..3]`, `aux_ch[j]` = the plane's target slot; `ink_ch` when
+    the fibre H plane is plane 0).
+  - Every per-plane stream array grows to `NLPL` = 8.
+  - The two fibre planes are streamed with ±`g_fd_r` halo planes per head slab (`lhalo`); the slab upload, pointer and stream-check
+    code is now one loop over the planes.
+- **Head (`--fib-head L`):** channels after rv: H mask, V mask, then the direction t·tᵀ (6) and the family bit (V).
+  - Masks: soft BCE over the known voxels (`nn_ink_targets`).
+  - Direction: per slab from the two planes (`nn_fib_head_dir`: `fib_dir_k` with 255-unknown planes), as a 7-BCE without
+    --pos-weight, like --fib-dir.
+  - Weights: λ × the source's "fibre" head weight. The logged loss is λ (mask bce + dir bce); the step line shows
+    "fib bce … dir …".
+- **Padding:** more than 16 outputs are padded to a multiple of 16 (outputs `g_pad_ch..`, zero gradient). The 1³ MX head kernels
+  run in passes of 16, and 20 or 22 outputs had no head backward.
+- **Init and header:**
+  - `--init-from` a net with the same layout without the head (u1: cout 13) copies rows 0..12; the fibre rows start fresh
+    (bias `--fib-bias` −2 on the masks).
+  - The runtime header carries the --fib-dir channel map at its offset ("fib_dir": {"head": 1, "channels": {"H": 13, …}}).
+- **Not yet:** with `--lat-guide 3`, the sub-cell layout still caps the interpolated outputs at 16, so the fibre head runs with
+  `--lat 4` alone or with voxel trunks. Lifting that cap is the sub-cell rv / ink step.
+
+Tests:
+- `test_fibhead`: on random tubes, every 24-plane slab's direction targets equal `nn_fib_dir_targets` over the whole window
+  (13962 targets). With a third of H unknown, none of the unknown voxels gets a target.
+- `test_fibhead_train` (wind fixture tube rasters `fibh` / `fibv`, sources-fibhv.json):
+  - The voxel run logs the fibre losses on 100% of windows.
+  - The latent `--rv 2` run's stream check finds 0 of 26.7 M slab bytes differing (the halos included), and it logs identically to
+    a run with the planes kept on the device.
+  - Init-from rows 0–12 and resume both work, and the checkpoint header has the channel map.
+
 ## Data-parallel training: one host thread per GPU (2026-11-11, branch univ-20261111)
 
 Why: u1 (P 896 latent, two desk GPUs) ran at 0.54 samples/s with one host thread launching both GPUs. A step queues more kernels

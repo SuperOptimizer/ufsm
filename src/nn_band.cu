@@ -9,12 +9,16 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 #include "bandgpu.h"
 #include "band.h"
 
 #define BG_CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { fprintf(stderr, "band gpu: %s (%s:%d)\n", cudaGetErrorString(e_), __FILE__, __LINE__); return -1; } } while (0)
 #define BINF 1e20f
-enum { BT = 128, LCH = 32768 };   /* threads per block; lines per envelope chunk */
+enum { BT = 128, LCH = 32768 };   /* threads per block; lines per envelope chunk (at least) */
+/* lines per envelope chunk: at least LCH, else as many as keep the scratch (16 B x (L + 1) per line) at ~4 B per block voxel; 2026-11-11:
+   32768 lines left a 188-SM card at ~170 threads per SM and the y / z passes latency-bound (89% of the pair rule) */
+static long bg_lines(long N, long L, long nlines) { long c = N / (4 * (L + 1)); if (c < LCH) c = LCH; return nlines < c ? nlines : c; }
 
 __device__ static inline int bg_seed(uint8_t c, int par) { const int lab = c > 0 && c < 255; const int k = lab ? (c - 1) / BAND_STEPS : 0; return lab && (k & 1) == par; }
 
@@ -28,6 +32,32 @@ __global__ void k_bg_x(const uint8_t *codes, int nlines, int nx, int par, int32_
         if (bg_seed(sd[q], par)) next = q;
         const int l = ir[q], best = l < 0 ? next : next < 0 ? l : (q - l <= next - q ? l : next);
         ir[q] = best < 0 ? -1 : (int32_t)(li * nx + best);   /* cap BINF: every distance kept */
+    }
+}
+
+/* the same x pass, one warp per line (2026-11-11: k_bg_x's thread per line read nx-strided bytes, 45 ms of a 420^3 tile's 165): the
+   nearest seed at or left of q by a carried inclusive max-scan, at or right of q by a carried suffix min-scan, the same tie rule */
+__global__ void k_bg_xw(const uint8_t *codes, long nlines, int nx, int par, int32_t *idx) {
+    const long li = (long)blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5); const int lane = threadIdx.x & 31; if (li >= nlines) return;
+    const uint8_t *sd = codes + li * nx; int32_t *ir = idx + li * nx; const unsigned FULL = 0xffffffffu; const int BIG = 0x7fffffff;
+    int carry = -1;
+    for (int q0 = 0; q0 < nx; q0 += 32) {
+        const int q = q0 + lane; int v = q < nx && bg_seed(sd[q], par) ? q : -1;
+        for (int o = 1; o < 32; o <<= 1) { const int t = __shfl_up_sync(FULL, v, o); if (lane >= o && t > v) v = t; }
+        if (carry > v) v = carry;
+        if (q < nx) ir[q] = v;
+        carry = __shfl_sync(FULL, v, 31);
+    }
+    carry = BIG;
+    for (int q0 = (nx - 1) / 32 * 32; q0 >= 0; q0 -= 32) {
+        const int q = q0 + lane; int v = q < nx && bg_seed(sd[q], par) ? q : BIG;
+        for (int o = 1; o < 32; o <<= 1) { const int t = __shfl_down_sync(FULL, v, o); if (lane + o < 32 && t < v) v = t; }
+        if (carry < v) v = carry;
+        if (q < nx) {
+            const int l = ir[q], next = v == BIG ? -1 : v, best = l < 0 ? next : next < 0 ? l : (q - l <= next - q ? l : next);
+            ir[q] = best < 0 ? -1 : (int32_t)(li * nx + best);
+        }
+        carry = __shfl_sync(FULL, v, 0);
     }
 }
 
@@ -108,6 +138,7 @@ enum { BG_MAXS = 16 };
 static bg_ctx g_ctx[BG_MAXS];
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_cv = PTHREAD_COND_INITIALIZER;
 static int g_slots = 2, g_dev = 0;
+static const int g_xw = !getenv("UFSM_BAND_X1");   /* (UFSM_BAND_X1: the thread-per-line x pass, for A/B) */
 
 extern "C" void band_pair_gpu_slots(int slots, int device) { pthread_mutex_lock(&g_mu); g_slots = slots < 1 ? 1 : slots > BG_MAXS ? BG_MAXS : slots; g_dev = device; pthread_mutex_unlock(&g_mu); }
 extern "C" void band_pair_gpu_free(void) {   /* every idle context's buffers (call once no block thread is inside) */
@@ -118,12 +149,8 @@ extern "C" void band_pair_gpu_free(void) {   /* every idle context's buffers (ca
     cudaGetLastError(); pthread_mutex_unlock(&g_mu);
 }
 
-static int bg_run(bg_ctx &G, const uint8_t *codes, const int n[3], float rmax, uint8_t *phase) {
-    const long nz = n[0], ny = n[1], nx = n[2], N = nz * ny * nx, sy = nx, sz = ny * nx;
-    if (N >= (1L << 31)) return -1;   /* int32 feature indices */
-    BG_CK(cudaSetDevice(g_dev));   /* (per host thread state: set every call) */
+static int bg_alloc(bg_ctx &G, long N, long Lmax, long lc) {
     if (!G.init) { BG_CK(cudaStreamCreateWithFlags(&G.st, cudaStreamNonBlocking)); G.init = 1; }
-    const long Lmax = nz > ny ? nz : ny, nlines = (nz * nx > ny * nx ? nz * nx : ny * nx), lc = nlines < LCH ? nlines : LCH;
     if ((size_t)N > G.cap) {
         cudaFree(G.codes); cudaFree(G.phase); cudaFree(G.ie); cudaFree(G.io); G.codes = G.phase = nullptr; G.ie = G.io = nullptr;
         BG_CK(cudaMalloc(&G.codes, N)); BG_CK(cudaMalloc(&G.phase, N)); BG_CK(cudaMalloc(&G.ie, N * 4)); BG_CK(cudaMalloc(&G.io, N * 4)); G.cap = N;
@@ -133,10 +160,19 @@ static int bg_run(bg_ctx &G, const uint8_t *codes, const int n[3], float rmax, u
         const size_t e = (size_t)(Lmax + 1) * lc;
         BG_CK(cudaMalloc(&G.F, e * 4)); BG_CK(cudaMalloc(&G.Z, e * 4)); BG_CK(cudaMalloc(&G.S, e * 4)); BG_CK(cudaMalloc(&G.V, e * 4)); G.lcap = e;
     }
+    return 0;
+}
+static int bg_run(bg_ctx &G, const uint8_t *codes, const int n[3], float rmax, uint8_t *phase) {
+    const long nz = n[0], ny = n[1], nx = n[2], N = nz * ny * nx, sy = nx, sz = ny * nx;
+    if (N >= (1L << 31)) return -1;   /* int32 feature indices */
+    BG_CK(cudaSetDevice(g_dev));   /* (per host thread state: set every call) */
+    const long Lmax = nz > ny ? nz : ny, nlines = (nz * nx > ny * nx ? nz * nx : ny * nx), lc = bg_lines(N, Lmax, nlines);
+    if (bg_alloc(G, N, Lmax, lc)) return -1;
     BG_CK(cudaMemcpyAsync(G.codes, codes, N, cudaMemcpyHostToDevice, G.st));
     for (int par = 0; par < 2; par++) {
         int32_t *id = par ? G.io : G.ie;
-        k_bg_x<<<(unsigned)((nz * ny + BT - 1) / BT), BT, 0, G.st>>>(G.codes, (int)(nz * ny), (int)nx, par, id);
+        if (g_xw) k_bg_xw<<<(unsigned)((nz * ny + 7) / 8), 256, 0, G.st>>>(G.codes, nz * ny, (int)nx, par, id);
+        else k_bg_x<<<(unsigned)((nz * ny + BT - 1) / BT), BT, 0, G.st>>>(G.codes, (int)(nz * ny), (int)nx, par, id);
         for (int ax = 1; ax < 3; ax++) {
             const long L = ax == 1 ? ny : nz, st = ax == 1 ? sy : sz, nl = (ax == 1 ? nz : ny) * nx;
             for (long l0 = 0; l0 < nl; l0 += lc) {
@@ -152,6 +188,15 @@ static int bg_run(bg_ctx &G, const uint8_t *codes, const int n[3], float rmax, u
     return 0;
 }
 
+extern "C" int band_pair_gpu_reserve(int edge) {   /* all g_slots contexts sized for edge^3 blocks (so a memory planner sees them) */
+    const long E = edge, N = E * E * E, lines = E * E, lc = bg_lines(N, E, lines); int rc = 0;
+    pthread_mutex_lock(&g_mu);
+    if (cudaSetDevice(g_dev) != cudaSuccess) rc = -1;
+    for (int k = 0; k < g_slots && !rc; k++) if (!g_ctx[k].busy) rc = bg_alloc(g_ctx[k], N, E, lc);
+    pthread_mutex_unlock(&g_mu);
+    if (rc) cudaGetLastError();
+    return rc;
+}
 extern "C" int band_pair_gpu(const uint8_t *codes, const int n[3], float rmax, uint8_t *phase) {
     int k = -1;
     pthread_mutex_lock(&g_mu);
