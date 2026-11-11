@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# scripts/univ/podeval.sh CKPT TAG [PREDICT_BIN]: scripts/univ/eval.sh on a pod with the desk's labels (kit: scripts/univ/podkit_eval.sh).
+# Copies CKPT (and PREDICT_BIN, the binary that knows the checkpoint, e.g. a run's ufsm.bin) to the pod, runs eval.sh there with the env
+# given here (TASKS, DLVS, WZARGS, WIN, HALO, INKP, FIBCH, ...: every eval.sh variable set in this environment is passed through), then copies
+# the wbench rows (K/wb/res/TAG*.tsv) and the matrix back next to the desk's (/vesuvius/ufsm/wbench/{res,univ}). POD="HOST PORT" (pod 2).
+set -u
+CK=$(readlink -f "${1:?ckpt}"); T=${2:?tag}; PB=${3:-}; read -r HOST PORT <<< "${POD:-root@213.173.107.10 27064}"; K=${K:-/workspace/ue}
+E="ssh -p $PORT -i $HOME/.ssh/id_ed25519 -o BatchMode=yes"; WB=/vesuvius/ufsm/wbench
+rsync -aL -e "$E" $CK $HOST:$K/ckpt/$T.ckpt < /dev/null || exit 1
+UPV=""; [ -n "$PB" ] && { rsync -aL -e "$E" $PB $HOST:$K/ckpt/$T.bin < /dev/null || exit 1; UPV="UP=$K/ckpt/$T.bin RVU=$K/ckpt/$T.bin"; }
+PASS=""; for v in TASKS DLVS WZARGS WIN HALO INKP FIBCH LV_INK RVSC REFS THREADS; do [ -n "${!v+x}" ] && PASS="$PASS $v='${!v}'"; done
+$E $HOST "cd $K/ufsm && env SITE=pod K=$K WB=$K/wb GPU=0 INKW=$K/ckpt/ckpt_78k_fullsup.pth FIBPH=$K/wbgt/paris4-wind-20261019 $UPV $PASS \
+  bash scripts/univ/eval.sh $K/ckpt/$T.ckpt $T > $K/wb/univ_$T.out 2>&1" < /dev/null
+mkdir -p $WB/univ/pod; rsync -a -e "$E" "$HOST:$K/wb/res/$T*.tsv" $WB/univ/pod/ < /dev/null; rsync -a -e "$E" $HOST:$K/wb/univ/$T.matrix.txt $HOST:$K/wb/univ/$T.log $WB/univ/pod/ < /dev/null
+echo "pod rows and matrix -> $WB/univ/pod/ ($T)"
