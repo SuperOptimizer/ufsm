@@ -13,17 +13,17 @@
 #         (F1 / AUC vs the human labels inside the supervision mask)                                                             -> $E/TAG/ink/scores.tsv
 # Summary: $E/TAG.matrix.txt (wbench-stats paired CIs against REFS, default "wind96 lat-wz896-12000"; rv / fib / ink rows; xres vs native).
 # Env: GPU (1), LKF (a flock file, e.g. /tmp/gpu1-bench.lock, when sharing the GPU with timing runs), UP (predict binary for wbench), U (this tree's build/ufsm), WIN / HALO / WZARGS as
-# wbench (latent-grid checkpoints: WZARGS= ), THREADS (8). Reruns skip finished pieces (wbench rows, rv txt, fib / ink outputs).
+# wbench (latent-grid checkpoints: WZARGS= ), THREADS (8); off the desk: SITE=pod WB=$K/wb K=<kit> (scripts/univ/podkit_eval.sh), INKW / FIBPH paths. Reruns skip finished pieces (wbench rows, rv txt, fib / ink outputs).
 set -u
 CK=$(readlink -f "${1:?ckpt}"); T=${2:?tag}; TASKS=${TASKS:-wind dlv xres rv fib ink}
-H=$(cd "$(dirname "$0")/../.." && pwd); U=${U:-$H/build/ufsm}; WB=/vesuvius/ufsm/wbench; E=${E:-$WB/univ}; RVE=${RVE:-/mnt/scratch/rv/eval}
+H=$(cd "$(dirname "$0")/../.." && pwd); U=${U:-$H/build/ufsm}; WB=${WB:-/vesuvius/ufsm/wbench}; SITE=${SITE:-desk}; E=${E:-$WB/univ}; RVE=${RVE:-/mnt/scratch/rv/eval}
 M=https://dl.ash2txt.org/community-uploads/forrest/volcomp; P4K=PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr
 GPU=${GPU:-1}; THREADS=${THREADS:-8}; REFS=${REFS:-wind96 lat-wz896-12000}; DLVS=${DLVS:--1 1}; RVSC=${RVSC:-p1667 p139 p4}
 FIBCH=${FIBCH:-}; INKP=${INKP:-}; LKF=${LKF:-}; mkdir -p $E/$T
 lk() { if [ -n "$LKF" ]; then flock $LKF "$@"; else "$@"; fi; }   # LKF=/tmp/gpu1-bench.lock: serialise with timing benches
 log() { echo "$(date '+%m-%d %H:%M:%S') $*" | tee -a $E/$T.log; }
 wb() {   # wb TAG [env...]: one wbench run (memcap, GPU lock)
-  local t=$1; shift; lk env SITE=desk GPU=$GPU SLABS=0 THREADS=$THREADS "$@" ~/bin/memcap -m 40G bash $H/scripts/wbench/wbench.sh $CK $t >> $E/$T/wbench_$t.out 2>&1; }
+  local t=$1; shift; lk env SITE=$SITE WB=$WB GPU=$GPU SLABS=0 THREADS=$THREADS "$@" ~/bin/memcap -m 40G bash $H/scripts/wbench/wbench.sh $CK $t >> $E/$T/wbench_$t.out 2>&1; }
 has() { [[ " $TASKS " == *" $1 "* ]]; }
 log "univ eval $T ckpt $CK tasks [$TASKS]"
 
@@ -47,7 +47,7 @@ if has fib && [ "${FIB:-1}" = 1 ] && [ -n "$FIBCH" ]; then   # FIBCH e.g. "H=0 V
   for f in H V; do [ -e $o/$f/9.6/zarr.json ] || continue; for m in tube dyad; do x=""; [ $m = dyad ] && { [ -d $o/dyad ] || continue; x="--dyad $o/dyad"; }
     [ -s $o/$f-$m.judge ] && continue
     nice -n 10 $U fiber-trace - - $o/$f-$m.fib --mask $o/$f 9.6 --mask-origin 12288,4096,3584 --box $BOX --scaledown 2 --family $f --half 1024 --min-len 48 --threads 4 $x > $o/trace_$f-$m.log 2>&1
-    { python3 -I $H/scripts/univ/fiblen.py $o/$f-$m.fib; nice -n 10 $U fiber-judge $o/$f-$m.fib --phase /vesuvius/ufsm/gt/paris4-wind-20261019 phaseA/9.6 $J 2>&1 | grep "$f:"; } > $o/$f-$m.judge
+    { python3 -I $H/scripts/univ/fiblen.py $o/$f-$m.fib; nice -n 10 $U fiber-judge $o/$f-$m.fib --phase ${FIBPH:-/vesuvius/ufsm/gt/paris4-wind-20261019} phaseA/9.6 $J 2>&1 | grep "$f:"; } > $o/$f-$m.judge
   done; done
 fi
 if has ink && [ "${INK:-1}" = 1 ] && [ -n "$INKP" ]; then   # INKP = ink3dext | ch:N (channel N of CKPT, ink at 2.4 um level LV_INK (default 1 = 4.8 um))
@@ -55,7 +55,7 @@ if has ink && [ "${INK:-1}" = 1 ] && [ -n "$INKP" ]; then   # INKP = ink3dext | 
   grep -v '^#' $C/crops.tsv | while IFS=$'\t' read -r cr seg ns fi box; do
     grep -qP "^$cr\t" $o/scores.tsv && continue
     v=$o/vol; lvi=1
-    if [ "$INKP" = ink3dext ]; then lk $U ink3d-ext --weights /vesuvius/ufsm/teachers/dino3d/ckpt_78k_fullsup.pth --ct $M $P4K --box $box --out $v --out-um 4.8 --gpu $GPU --cache $WB/cache > $o/ink_$cr.log 2>&1 || { log "ink: $cr predict failed"; continue; }; key=4.8
+    if [ "$INKP" = ink3dext ]; then lk $U ink3d-ext --weights ${INKW:-/vesuvius/ufsm/teachers/dino3d/ckpt_78k_fullsup.pth} --ct $M $P4K --box $box --out $v --out-um 4.8 --gpu $GPU --cache $WB/cache > $o/ink_$cr.log 2>&1 || { log "ink: $cr predict failed"; continue; }; key=4.8
     else lvi=${LV_INK:-1}; ch=${INKP#ch:}; key=$(python3 -I -c "print(round(2.4 * 2 ** $lvi, 3))")
       lk ${UP:-$U} predict $CK $M $P4K $v --um 2.4 --level $lvi --box $box --channel $ch --gpu $GPU --threads 6 --cache $WB/cache > $o/ink_$cr.log 2>&1 || { log "ink: $cr predict failed"; continue; }; fi
     s=$o/surf/$cr; mkdir -p $s/w; python3 -I - $C/$cr $s/w/$cr $lvi <<'PY'   # the crop surface in the ink volume's voxels (render samples volume voxels)
