@@ -1,4 +1,4 @@
-/* ufsm fiber-raster <fibres.afv | fibres.fib> OUT --um U (--shape Z,Y,X | --ct ROOT KEY [--iso 64]) [--level 0] [--tr T.json]
+/* ufsm fiber-raster <fibres.afv | fibres.fib> OUT --um U (--shape Z,Y,X | --ct ROOT KEY [--iso 64]) [--level 0] [--tr T.json | --map reg.json]
        [--zband Z0,Z1] [--radius 2] [--guard 3] [--ring 0] [--extra all-lengths.afv] [--resume 0|1] [--shard 512] [--threads 4]
    Training labels for fibre-family mask heads from fibre polylines (an AFV, or UFIB level-0 points): two prob254 volumes on the level-L
    CT grid (U = that grid's voxel size), OUT/H/<U> and OUT/V/<U> (zarr v3, lossless, fill 255 = unknown), usable as the "recto" and
@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "afv.h"
+#include "reg.h"
 #include "store.h"
 #include "z3w.h"
 #include "zarr3.h"
@@ -28,7 +29,7 @@
 static const char *fr_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 4; i + 1 < argc; i++) if (!strcmp(argv[i], k)) return argv[i + 1]; return d; }
 static int fr_opti(int argc, char **argv, const char *k) { for (int i = 4; i + 1 < argc; i++) if (!strcmp(argv[i], k)) return i; return 0; }
 typedef struct {
-    afv *A, *X; const fib_set *F, *XF; double (*fbb)[6], (*xbb)[6]; pthread_mutex_t mu; int has_tr; double M[3][4], Mi[3][3]; double sc;
+    afv *A, *X; const fib_set *F, *XF; double (*fbb)[6], (*xbb)[6]; pthread_mutex_t mu; int has_tr; double M[3][4], Mi[3][3]; double sc; const rmap *map;   /* --map: a ufsm reg map (coarse = the AFV's scan) instead of --tr */
     int64_t shape[3]; int S, iso, resume; double rad, guard, ring; z3 *ct; z3w *w[2]; char dir[2][2200]; atomic_long skipped;
     int64_t s0[3], ns[3]; atomic_long next; atomic_int fail; atomic_llong cnt[4];   /* H 254, H 0, V 254, V 0 (voxels) */
 } fr_job;
@@ -56,7 +57,7 @@ static void *fr_worker(void *arg) {
         if (J->A) {
             double qlo[3] = {1e30, 1e30, 1e30}, qhi[3] = {-1e30, -1e30, -1e30};
             for (int c = 0; c < 8; c++) { const double g[3] = {((c & 1 ? hi[2] : lo[2]) + 0.5) * J->sc - 0.5, ((c & 2 ? hi[1] : lo[1]) + 0.5) * J->sc - 0.5, ((c & 4 ? hi[0] : lo[0]) + 0.5) * J->sc - 0.5}; double a[3];
-                for (int k = 0; k < 3; k++) a[k] = J->has_tr ? J->M[k][0] * g[0] + J->M[k][1] * g[1] + J->M[k][2] * g[2] + J->M[k][3] : g[k];
+                if (J->map) rmap_f2c(J->map, g, a); else for (int k = 0; k < 3; k++) a[k] = J->has_tr ? J->M[k][0] * g[0] + J->M[k][1] * g[1] + J->M[k][2] * g[2] + J->M[k][3] : g[k];
                 for (int k = 0; k < 3; k++) { if (a[k] < qlo[k]) qlo[k] = a[k]; if (a[k] > qhi[k]) qhi[k] = a[k]; } }
             pthread_mutex_lock(&J->mu); nr = afv_query(J->A, qlo, qhi, &Rn); pthread_mutex_unlock(&J->mu);
             if (nr < 0) { atomic_store(&J->fail, 1); break; }
@@ -73,7 +74,8 @@ static void *fr_worker(void *arg) {
             for (int i = 0; i < q->n; i++) {
                 double p[3];
                 if (own) { double g[3] = {q->xyz[3 * i], q->xyz[3 * i + 1], q->xyz[3 * i + 2]};
-                    if (J->has_tr) { const double u[3] = {g[0] - J->M[0][3], g[1] - J->M[1][3], g[2] - J->M[2][3]}; for (int k = 0; k < 3; k++) g[k] = J->Mi[k][0] * u[0] + J->Mi[k][1] * u[1] + J->Mi[k][2] * u[2]; }
+                    if (J->map) { const double c[3] = {g[0], g[1], g[2]}; rmap_c2f(J->map, c, g); }
+                    else if (J->has_tr) { const double u[3] = {g[0] - J->M[0][3], g[1] - J->M[1][3], g[2] - J->M[2][3]}; for (int k = 0; k < 3; k++) g[k] = J->Mi[k][0] * u[0] + J->Mi[k][1] * u[1] + J->Mi[k][2] * u[2]; }
                     for (int k = 0; k < 3; k++) p[k] = (g[2 - k] + 0.5) / J->sc - 0.5;
                 } else { const float *g = J->F->pts + 3 * (size_t)(J->F->off[q->fiber] + i); for (int k = 0; k < 3; k++) p[k] = (g[k] + 0.5) / J->sc - 0.5; }
                 /* the segment prev -> p in steps of <= 1 voxel */
@@ -139,7 +141,7 @@ int cmd_fiber_raster(int argc, char **argv) {
     fr_job J = {0}; const double um = atof(fr_opt(argc, argv, "--um", "0")); long long sh[3] = {0, 0, 0}; const int ci = fr_opti(argc, argv, "--ct");
     const int has_shape = sscanf(fr_opt(argc, argv, "--shape", ""), "%lld,%lld,%lld", &sh[0], &sh[1], &sh[2]) == 3;
     if (argc < 6 || !(um > 0) || (!has_shape && !ci)) {
-        fprintf(stderr, "usage: ufsm fiber-raster <fibres.afv|.fib> OUT --um U (--shape Z,Y,X | --ct ROOT KEY [--iso 64]) [--level 0] [--tr T.json] [--zband Z0,Z1]\n"
+        fprintf(stderr, "usage: ufsm fiber-raster <fibres.afv|.fib> OUT --um U (--shape Z,Y,X | --ct ROOT KEY [--iso 64]) [--level 0] [--tr T.json | --map reg.json] [--zband Z0,Z1]\n"
                         "       [--radius 2] [--guard 3] [--shard 512] [--threads 4]   H / V fibre mask labels (prob254: OUT/H/<U>, OUT/V/<U>)\n");
         return 2;
     }
@@ -154,6 +156,8 @@ int cmd_fiber_raster(int argc, char **argv) {
     for (int k = 0; k < 3; k++) { J.shape[k] = sh[k]; if (sh[k] < 1) { fprintf(stderr, "fiber-raster: bad shape\n"); return 2; } }
     const char *trp = fr_opt(argc, argv, "--tr", nullptr); J.has_tr = trp != nullptr;
     if (trp && fc_transform(trp, J.M, J.Mi)) { fprintf(stderr, "fiber-raster: cannot read the transform %s\n", trp); return 1; }
+    const char *mapp = fr_opt(argc, argv, "--map", nullptr);   /* --map reg.json: AFV points through the reg map (affine + displacement field) */
+    if (mapp) { if (trp) { fprintf(stderr, "fiber-raster: --tr or --map, not both\n"); return 2; } rvol *fv; double cu, fu; J.map = reg_map_open(mapp, fr_opt(argc, argv, "--cache", nullptr), &fv, &cu, &fu); if (!J.map) return 1; }
     fib_set F = {0};
     { FILE *f = fopen(argv[2], "rb"); char mg[4] = ""; if (!f || fread(mg, 1, 4, f) != 4) { fprintf(stderr, "fiber-raster: cannot read %s\n", argv[2]); return 1; } fclose(f);
       if (!memcmp(mg, "UFIB", 4)) {
