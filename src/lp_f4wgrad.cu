@@ -38,7 +38,7 @@ extern template void bwd_w_f4_t<bf16, float>(const void *x, shape5 xs, const flo
 extern template void bwd_w_f4_t<float, float>(const void *x, shape5 xs, const float *gy, shape5 ys, float *gw, float *gb, gnp_t gp, split_t sp, int had);
 #endif
 
-int g_f4w_gy4 = 0;
+thread_local int g_f4w_gy4 = 0;   /* (per thread: set around one call; one host thread per GPU) */
 extern "C" int lp_bwd_w_f4(const void *x, int xbf, shape5 xs, const void *gy, int gybf, shape5 ys, float *gw, float *gb, gnp_t gp, split_t sp, int had) {
     if (gybf == 4) {   /* MX-fp4 gradients: the gy pre-pass decodes the fp4 rows; the kernels read only its records */
         if (xbf != 4 && xbf != 3) { fprintf(stderr, "lp_bwd_w_f4: MX-fp4 gradients need an MX x\n"); abort(); }

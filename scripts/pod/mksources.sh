@@ -7,7 +7,7 @@ src() { jq -nc --arg n $1 --arg ct $2 --argjson um $3 --argjson lv $4 --arg ax $
   '{name: $n, scope: "global", root: $M, ct: $ct, um: $um, min_level: $lv, max_level: $lv, axis: $ax, iso: 64, weight: $w, holdout_file: $ho,
     targets: {band: {radius: 20, span: 19, phase: {root: $pr, key: $pk, level: $lv}}}}'; }
 { src PHercParis4-june PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr 2.4 2 $K/small/axis/paris4-axis-0.json 0.36 $K/gt/paris4/phaseA 9.6
-  src PHercParis4-july PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr 2.4 2 $K/small/axis/paris4-axis-0.json 0.20 $K/gt/paris4/phaseB 9.6
+  [ -e $K/gt/paris4/phaseB/zarr.json ] && src PHercParis4-july PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr 2.4 2 $K/small/axis/paris4-axis-0.json 0.20 $K/gt/paris4/phaseB 9.6
   src PHerc0139-gt PHerc0139/volumes/20250728140407-9.362um-1.2m-113keV-masked.zarr 9.362 0 $K/small/axis/PHerc0139-unroll-axis.json 0.22 $K/gt/p0139full/phase 9.362
   src PHerc0500P2-gt PHerc0500P2/volumes/20250820143440-9.362um-1.2m-113keV-masked.zarr 9.362 0 $K/small/axis/PHerc0500P2-20250820143440.json 0.04 $K/gt/PHerc0500P2-wind/phase 9.362
 } | jq -s --arg c $K/cache '{cache: $c, sources: .}' > $OUT

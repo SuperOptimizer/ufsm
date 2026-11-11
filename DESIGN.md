@@ -6,6 +6,194 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Data-parallel training: one host thread per GPU (2026-11-11, branch univ-20261111)
+
+Why: u1 (P 896 latent, two desk GPUs) ran at 0.54 samples/s with one host thread launching both GPUs. A step queues more kernels
+than the driver's launch queue holds, so the thread blocked in GPU 0's backward launches while GPU 1 sat idle (perf: host time in
+the launch path; each GPU ~75 % busy, idle out of phase). The first fix, phased launches (every GPU's forward before any backward,
+d1924ea), gave 0.62 samples/s (+13 %). This step gives each GPU its own persistent host thread, so each GPU's launches block only
+that GPU. The target is a step close to the slower GPU's compute alone.
+
+How:
+- `train.c` gets a pool of persistent workers (`gpool_post` / `gpool_wait`), one per GPU, started on first use. They are kept
+  alive because their thread-local device scratch must outlive a step.
+- Each step is `gstep_fwd` + `gstep_bwd`, run by the GPU's worker. The main thread keeps the GPU-ordered `sampler_next` /
+  upload / release, the gradient exchange, the losses and the optimizer.
+- The schedules: `UFSM_MGPU_THREADS=0` gives one thread with phased launches, and `UFSM_MGPU_PHASED=0` as well gives forward +
+  backward per GPU in turn. All three draw the same numbers:
+  - The SR counter is per GPU (base `g << 24`; GPU 0 gets what one GPU always had) and is carried from the forward to the backward
+    in `gpu_state.sr_ctr`.
+  - The `--lat-step-jitter` generator is per GPU (`lat_js`).
+  - `gpu_state G[8]` is now zeroed, because the fields added later relied on garbage.
+- nn's mutable per-call state is `thread_local`: the layer / sub / pass / block ids, the SR counter, pos weight, the logit /
+  head / loss fp16 flags, `gn_const`, `g_actbf`, `g_gyrec_off`, `g_f4w_gy4`, and `unet.c`'s `g_in_bwd`. A worker starts from the
+  main thread's values (`nn_tls_capture` / `nn_tls_install`). The storage registry takes a mutex.
+- `split.c` hands the same `nn_tls` on with the turn, so `--split z`'s two alternating threads still see one sequence of it.
+  Without this, `test_cover_training` (split) went non-finite.
+
+The races the gate found (each one only changed bits in some runs):
+- **`g_gyrec_off`:** `unet_backward_x` sets it around decoder blocks. One thread's restore could leave the other thread's records
+  off.
+- **`g_f4w_gy4`:** a "the gy holds MX-fp4 rows" flag that `lp_bwd_w_f4` sets around one call. It aborted ("need the gy
+  pre-pass") or decoded the wrong rows. It was found by bisection: `UFSM_GRAD_MX4=0` gave 0 / 30 differing runs, against 25 / 30
+  with the flag shared.
+- **The fine-stem backward's float `atomicAdd`s:** these made `--det 1` runs differ in the last bits, and a discrete choice later
+  amplified the difference into visible loss changes. The fix is per-block partial rows, added in block order by `fstem_red_k`.
+  test_fstem is unchanged: 3.5e-4 relative against the host.
+
+Gate: `test_univ2` now also runs the u1 recipe (`--det 1`, 30 steps, latent, rv, rungs, FiLM, fstem, uw, grad-cos 3, replay 3) under
+threads, phased and in turn, and requires identical step / validation / grad-cos lines.
+- Before the fixes: 7–10 of 10 threaded runs differed.
+- After: 0 / 12 (full recipe), 0 / 12 (replay 1), 0 / 8 (no fstem).
+- Phased and in-turn runs agree with each other in every repeat.
+- One GPU is identical to the previous binary.
+- The parameter gradients still differ in ~700 of 394 k entries between two identical phased runs (FiLM / stem / a few GN
+  affines: ~3e-8 relative). These come from other float atomics in the fp16 head-gradient path. The MX-fp4 trunk gradients absorb
+  them, and they do not show in the logged lines.
+
+## Universal net A6: the fine voxel stem (--fstem C, --fstem-drop P) (2026-11-11, branch univ-20261111)
+
+Why: the latbeat verdict above. The latent net's phase deficit against wind96 is resolution: 38.4 um cells hold 1.5-4 cells per sheet
+period at 60-150 um spacing. **`--fstem 16`** (latent grid, `--lat 4 --lat-guide 3`, task unwrap2) adds a second path into the head
+beside the trunk. It reads the CT channel itself at stride 2: per 2^3-voxel block a 4^3 conv (taps 2 i - 1 .. 2 i + 2 per axis, zero
+outside the window), 16 silu features (19.2 um at 9.6 um voxels), and a 16 -> nout projection added to every head output that the
+head slabs hold as voxel logits. That is every output except the fused normal / density group: phase, wind4, rv, ink (7 with --rv 2
+--ink-head 1). It is added after the upsampling + sub-cell shuffle and before the losses, and in the backward the parameter gradients
+are read straight from the slab's gradient planes before the adjoints. Parameters (W1 16 x 64, b1, W2 7 x 16) are appended last;
+W1 is He-initialised and b1 / W2 are zero, so the net computes its donor's function (step 1 logs the stem-less run's losses exactly,
+test_heads (7)). AdamW (non-matrix). Header key "fstem":[C,nout] only when on; `--init-from` copies a stem with the same shape; a
+resume must repeat --fstem. **Level dropout** `--fstem-drop 0.25`: a training window runs without the stem (forward and backward),
+drawn per GPU and step, so the net keeps working without the fine level. Validation and predict always use it. `predict` adds it in
+the fit-field (11 planes) and `--channel rv` / side-pair paths. With a stem it falls back from the latent fast paths (lat_lean,
+direct rv, latin, fit-field z-slabs), which read no CT; those are to be ported when U2 needs the speed.
+
+Kernels (`src/nn_fstem.cu`): row tiles of up to 128 blocks of one (z, y) block row, the 16 input rows staged in shared memory once.
+The forward does the 64 -> 16 product on the tensor cores (mma m16n8k16 fp16, W1 in fp16). The backward recomputes the same way and
+does the parameter-gradient products dW1 = sum dpre x taps and dW2 = sum go x h in tf32 MMA (fp32 range: the pre-activation gradients
+are ~1e-5 and would be fp16 subnormals), in half tiles (22 KB of shared memory, 4 blocks an SM). P 256 window, RTX 5060 Ti:
+
+| version | forward (x2 a step: statistics + gradient pass) | backward |
+|---|---|---|
+| per-thread scalar (taps from global) | 2.1 ms | 9.6 ms |
+| + register-blocked outer products, 128-block tiles | 2.1 | 3.4 |
+| + staged rows (row tiles) | 2.2 | 4.3 |
+| + tensor-core forward / recompute | 0.74 | 4.0 |
+| + half tiles (occupancy 17 -> 33 %) | 0.74 | 3.1 |
+| + tf32 parameter products | 0.74 | 2.8 |
+| + gradient gather on all threads | 0.75 | 2.5 |
+
+ncu on the last backward: long-scoreboard (global loads) and barrier stalls dominate. Next levers: double-buffered staging, the
+gather through one aligned 4-byte pass. Training step, P 256, latent, all heads, `UFSM_BENCH_SAME=1`, 40 steps, no dropout:
+widths 32..128: 26.2 -> 30.9 ms (+18 %); widths 96,128,160,192: 45.6 -> 50.4 ms (+10.6 %; ~8 % at the default dropout 0.25). The
+stem scales with voxels, the trunk with voxels x width^2, so wider trunks pay less.
+
+Tests: `test_fstem` (new): the kernels against a double host reference on a 10 x 12 x 14 window in two slabs. The reference's gradient
+is taken by central differences over all 1152 parameters. Forward worst |error| / (1 + |want|) 1.8e-4; gradient 3.5e-4 relative to
+the largest (fp16 W1 in the tensor-core products, tf32 sums; the fp32 scalar kernel gave 1.6e-7). The other channels stay
+untouched, and an odd slab start is refused. `test_heads` (7): step 1 with --fstem 16 logs the stem-less run's losses; header
+[16,7]; resume; a resume without --fstem is refused; predict --channel rv runs. Fixture, 8 steps, all heads, latent, P 64: loss
+3.268 without -> 3.256 with the stem (from step 2 on, every step lower). That is a fixture number; whether the stem closes the
+packed-sheet gap is U2's measurement (wbench Paris 4 packed boxes).
+
+## Universal net A7: learned task weights (--uw 1) and the head-gradient cosines (--grad-cos N) (2026-11-11, branch univ-20261111)
+
+**`--uw 1`** (Kendall, Gal and Cipolla 2018): one learned log variance s_h per head (phase, normal + density shared, winding mod 4,
+rv, ink; the fibre-normal term is a regulariser, not a likelihood, and keeps its lambda). Each head's gradient is scaled by
+exp(-s_h) through the same per-source head multiplier as A2's "heads" key (`src_head_w`), so no new device path. The objective is
+sum_h exp(-s_h) L_h + s_h, with s_h stepped on the host by Adam from each step's logged head loss (dL/ds = 1 - exp(-s) L).
+The rate is --uw-lr (1e-3), and s is clamped to [-4, 4]. The s_h and the Adam step count are written to the checkpoint header
+("uw":{"t":..,"s":[..]}, only with --uw) and resumed. The step line shows the weights in effect. Without --uw every multiplier is
+the float 1, so the old layouts are unchanged (test_heads).
+
+**`--grad-cos N`**: every N steps, the cosines between the heads' gradients at the head input (the trunk's shared level-0 features).
+The head is a 1^3 conv W (cout x C), so the input gradient of task a summed over the cells is W^T g_a. The pairwise dot products are
+sum_{i in a, j in b} (W W^T)_ij S_ij, with S the Gram of the logit-gradient planes. S is accumulated per head slab with `nn_gram16`
+inside the step's single backward: one K(K+1)/2-pair reduction per slab, versus a backward per task. Channels map to tasks as
+follows: interpolated outputs by head; latent guided / sub-cell outputs (16-143) to the phase. Cost: zero on steps that do not log.
+Gradients of the deeper trunk are not separated (they would need a backward per task); the head input is where all heads meet.
+
+Tests: `test_gram` (new): fp16 / bf16, K 1 / 7 / 13, strided rows, two accumulating calls against a double host sum; worst error
+relative to |x_i||x_j| is 1.2e-7. `test_heads` (6): latent + all heads with --uw 1 --uw-lr 0.05 --grad-cos 2; the cosine lines
+name every pair, the header holds t 4 and a resume continues to t 6.
+Fixture numbers (6 steps, P 64, all heads): |cos| <= 0.17 between every pair, i.e. the heads barely interfere at the head input on
+this fixture. The largest values are normal/wind4 (+0.16..0.17 at step 4) and normal/rv (-0.11..-0.17). After 6 steps at lr 0.05
+the weights moved phase 1.02, normal 0.80, wind4 1.31, rv 1.35, ink 1.26. These are numbers from a 6-step fixture run; a
+real run's cosines and the weights' end point are for U1 / U2 to measure.
+
+## Universal net A4 + A5: levels by physical voxel size, per-level scale FiLM (2026-11-11, branch univ-20261111)
+
+**A4, `--um-rungs U[:W],..`** (sample.h `nrung`): instead of `--levels` (a probability per pyramid index, the same index for a 2.4 and a
+9.4 um scan), each window draws a physical rung U (weight W, default 1) among the rungs its source reaches and reads the source's level
+nearest U (|log2(level um / U)| <= `--rung-tol`, 0.5 octave; levels whose labels are stored coarser than the level are not a rung of
+that source, so a global rung list over mixed scans needs no per-source levels; `label_res_check` still refuses them under `--levels`).
+`--rung-shift-p P` moves the drawn rung to a list neighbour (scale augmentation over whole octaves, labels read at that level as now;
+the continuous `--zoom-*` warps stay for in-between scales). Validation keeps the rungs without the shift. The start-up log lists per
+source which level serves which rung. Deliberately not done: resampling a scan to the exact rung (a 7.9 um scan at the 9.6 rung reads
+7.9 um voxels; the scale FiLM below gets the true size) and a window fixed in mm (`--fov-mm`): with fixed-size device buffers a fixed
+physical field of view needs every window resampled to one grid, which for a 9.4 um scan on the 2.4 um voxel grid of the L9.6 trunk
+is a 4x upsampling that reads a 4^3 = 64x larger cube than it uses (or a read path that reads the central part and resamples, touching
+every label reader). Both can come later if the cross-resolution gate (U1: one checkpoint within 0.01 of itself at 4.8 / 9.6 / 19.2
+feeds) needs them; the feeds themselves are native levels, which this trains.
+
+**A5, `--film K`** (unet_cfg.film, K 1 or 2): every encoder and decoder block's output GroupNorm affine is FiLM'd,
+gamma (1 + sum_k c_k A_k), beta + sum_k c_k D_k, with c = log2(um / 4.8) of the window's grid (b.um: level x zoom / affine) and, for
+K 2, of the level read (b.level's voxel size, no zoom). A / D are per channel and code, appended last in `unet_create`, zero-initialised
+(a donor's function is unchanged; `--init-from` copies a FiLM donor's pairs), header key `"film":K` only when on; old checkpoints load
+unchanged. Implementation: the forward copies the live weights into a forward copy (as `--l0-norm ws` does) and writes the effective
+affines there (`src/nn_film.cu`, one tiny kernel per norm, 2 L - 1 of them), so every GN reader (fused conv + GN statistics, recompute,
+the slab paths, the next block's input norm) sees them without new code paths; the backward turns the effective affines' gradient
+into gamma's, A's and D's (exact: the gradient is zeroed before each backward, as for `scale_cond`). The old `--scale-cond` stem bias
+stays. B 1 (one code vector per forward; every unwrap task is B 1). `predict` sets the codes from the CT level's voxel size
+(`--scale-um` / `--film-data-um` override). Cost: one device copy of the weights (4 B per parameter) and 2 L - 1 launches per forward.
+
+Tests: `test_unet~FILM=2` (FD over every FiLM parameter, 112 of them, + 60 random others, random A / D, codes 1 / -0.6): worst relative
+error 5.3e-5; the tensor-core path against fp32 on the big net with FiLM: gradient rel L2 0.020 (0.018 without). `test_rungs` (new):
+two scans at 2.4 and 7.9 um, rungs 9.6 -> levels 2 / 0 only; rungs 4.8,9.6 -> A both levels about evenly, B level 0 only; shift 1 on
+2.4,4.8 -> A both levels, B (no rung) excluded; rung 38.4 -> no sampler. `test_heads` (5): two fixture sources whose labels allow one
+level each train together under `--um-rungs 19.2,38.4 --film 2` (latent, `--rv 2`), header `"film":2`, resume. The seven old layouts
+still log the reference losses.
+
+## Universal net A1 + A2: the head registry, rv on its own channels, per-source head weights (2026-11-11, branch univ-20261111)
+
+Step A1 / A2 of the universal latent net plan (one net with every head). Before this, ink (`--ink-head`), the rv papyrus (`--rv`) and the
+fibre tubes (`--fib-normal-lambda`) shared the single ink plane `IPLANE`, so they excluded each other, and rv took over the phase slots 0-1.
+
+**Aux planes.** `train` now keeps a list of aux label planes, one per enabled head that reads one, in a fixed order: papyrus (rv), ink,
+fibre (`aux_setup`, `g_aux_of[role]`). Plane 0 is the sampler's `batch.ink` (stream plane 3) exactly as before; planes 1-2 are the new
+`batch.aux[0..1]` (stream planes 4-5), read from the source's "ink" (CH_SHEET) or new "fibre" (CH_FIB, alias "fiber") target slot, made
+unknown where the loss mask is off, pulled through the same symmetry / host warp (`sample_warp_ink`), the `--replay` back-to-source-grid
+pass and the device warps (`lab_upload` kind 3), streamed per head slab (`lab_stream`, `LSLAB`) or kept on the device (`ldev`, the papyrus
+plane in 2 bits, the others bytes). With one head on, every buffer, upload, stream plane and planner term is the old one. The fibre
+plane reads the source's "fibre" target, else (no ink head) its "sheet" / "ink" one, so the old fibre sources work unchanged. The only
+exclusion left between the three is `--rv 1` + `--phase-trunc` / `--pgrad-lambda` (its side slot is not a phase). Source target slots
+grew to NTG = 3 (`CH_FIB`, never a batch channel); `label_res_check` and `level_ok` see it.
+
+**rv on its own pair.** `--rv 2`: recto / verso papyrus on two new output channels after the ink channel (unwrap2: phase 0-1, normal 2-7,
+density 8, winding mod 4 9-10, ink 11, rv 12-13; without ink rv 11-12), the phase trained as without --rv; BCE x `--rv-lambda` (logged
+as `rv bce` next to `phase bce`). Own slab targets `rvt` / `rvm`, loss sums at `hs_ds + 64` (the slab sums grew to 128 doubles), its own
+scratch. Checkpoint header `"rv":{"version":2,"recto":12,"verso":13,...}`; `--rv 1` keeps version 1 and the old layout. `--init-from` a
+donor without the pair resets rows 12-13 (zero weights, `--rv-bias`, default 0), and a plain unwrap2 donor (11 outputs) maps rows 0-10
+for `--rv 2` as it did for `--ink-head`. `predict --channel rv` on a version-2 checkpoint fuses channels 12-13 (interpolated, never the
+guided / sub-cell pair; the direct latent placement paths are off for it); `--fit-*` works on it (the phase is in 0-1). The latent
+fused gradient (`g_lat_fuse`) stays on with `--rv 2` (rv in the slab chain).
+
+**Per-source heads (A2).** A source's `"heads": {"phase": 1, "rv": 0, "ink": {"on": 1, "lambda": 0.5}, ...}` (phase, normal, density,
+wind4, rv, ink, fibre; a number is a multiplier, 0 off) scales that head's logit gradient on the source's windows (`src_head_w`, folded
+into the existing lambdas, so a weight 1 is the same float product); unknown names are refused. Absent labels keep mask 0 as before.
+
+Tests: `test_heads` (new, fast tier, 12 s). (1) the seven old single-head layouts (plain unwrap2, `--ink-head`, `--rv 1`,
+`--fib-normal-lambda`, and `--lat 4 --lat-guide 3` plain / rv / ink) log exactly the losses and gradient norms (4 decimals, every step
+and the validation) of the binary before the registry (`tests/heads_ref.txt`, per GPU name; the weights are not bit-reproducible run to
+run under `--det 1`, 24 873 bytes of 6.2 MB differed between two master runs, the logged losses are). Checked for both builds: VERIFY
+(the suite's) and the production fp16 build, whose latent runs take the fused gradient: 7 / 7 equal to master (60ff701) in each.
+(2) `--rv 2 --ink-head 1 --fib-normal-lambda 0.1` with the fibre plane from a "fibre" target, whole-window and latent: finite phase /
+rv / ink / fibn losses, header names rv 12-13 and ink 11; the latent stream check (`UFSM_LAT_STREAM=check`) 0 of 16 M slab bytes differ,
+the device-kept planes (`UFSM_LAT_LDEV=63`) give the streamed run's losses. (3) `predict --channel rv` on both against its channels
+12 / 13 (lossless stores): worst 1.0 code. (4) a source with every head at 0 trains with gradient norm 0.00; a misspelt head is refused.
+`--rv 2` latent with and without `UFSM_LAT_FUSE` (fp16 build): identical losses. Still open from A1: `--fib-dir` (the H / V fibre mask
+task, a surface task with its own whole-window path) is not yet a head of unwrap2, and the `--lat-guide 3` sub-cell head refines only
+the phase pair (rv / ink are interpolated).
+
 ## Fibre-normal arms: the seed-repeat noise floor and an untested source-mix confound (2026-11-11, branch fibnote-20261111)
 
 Closes the fibre-in-the-winding-net arms (section "Fibres in the winding network", below); the work moves to the universal latent net.
@@ -107,7 +295,22 @@ arc-weighted median and the arc share in lines >= 1 / 2 mm. fibhv-c on HOLD with
 | V dyad | 642 -> 7509 | 0.34 -> 4.64 | 0.52 -> 0.60 | 0.000 -> 0.070 | 0.000 -> 0.000 |
 
 Launch (pod 1, RTX PRO 4000): 9 sources, init 59 layer tensors from fibhv-c 21000; step 100 at 199 Mvox/s, loader wait 21 % (the
-Paris 4 / human-line CT streams from the mirror into the cache). Evals at steps 3000, 9000, 15000, 21000, 27000 (pod 2 predicts).
+Paris 4 / human-line CT streams from the mirror into the cache), 217 Mvox/s and 0 % wait by step 11600. Evals at steps 3000, 9000,
+15000, 21000, 27000 (pod 2 predicts and traces, the desk judges).
+
+HOLD (Paris 4, now in-domain), fibhv-c 12000 -> fibhv-d 3000 -> 9000 (lines, arc m, arc-median mm, >= 1 mm, >= 2 mm; pairs at 0.6 mm):
+
+| trace | fibhv-c 12000 | fibhv-d 3000 | fibhv-d 9000 |
+|---|---|---|---|
+| H tube | 6988, 4.40, 0.61, 9.5 %, 0.7 %; .955 | 9899, 6.48, 0.64, 13.5 %, 0.4 %; .951 | 11041, 7.41, 0.66, 15.9 %, 0.9 %; .941 |
+| H dyad | 4218, 2.48, 0.57, 4.3 %, 0.0 %; .932 | 7232, 4.42, 0.60, 7.0 %, 0.0 %; .948 | 6597, 3.93, 0.58, 5.3 %, 0.0 %; .950 |
+| V tube | 7259, 4.56, 0.61, 8.7 %, 0.2 %; .864 | 10380, 6.76, 0.63, 13.4 %, 0.6 %; .900 | 10578, 7.00, 0.64, 13.9 %, 0.8 %; .886 |
+| V dyad | 7509, 4.64, 0.60, 7.0 %, 0.0 %; .904 | 11791, 7.65, 0.63, 11.5 %, 0.2 %; .887 | 12857, 8.44, 0.64, 13.0 %, 0.3 %; .894 |
+
+More traced fibre (+68 % arc on H tube at 9000) and a larger share in lines >= 1 mm at about the same sheet fidelity; lines >= 2 mm
+stay under 1 %. 1447-HOLD (cross-check) stays flat between 3000 and 9000 (H tube arc-median 0.59, V tube 0.64). The 1447 mask-vs-label
+score in evald.sh does not work yet (`ufsm eval` reads 0 valid voxels from the copied label shards). The first desk orchestrator never
+started the pod eval: its `pgrep -f` guard matched its own ssh command line; evald_desk.sh now uses a pid file.
 
 ## phase-raster's pair rule lean and on the GPU, byte-identical (2026-11-11, branch labelfast-20261111)
 

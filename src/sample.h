@@ -19,6 +19,9 @@ typedef struct {
     int nbuf;                /* ring depth (batches) */
     uint64_t seed;
     double level_p[MAXLEV];  /* relative probability of each CT level (rung offset); 0 = never */
+    int nrung; float rung_um[8], rung_w[8];   /* train --um-rungs U:W,..: levels picked by physical voxel size instead of level_p: a window draws rung k with
+                                weight W among the rungs its source reaches, and reads the source's level nearest to U um (|log2| <= rung_tol octaves) */
+    float rung_tol, rung_shift_p;   /* (0: 0.5); --rung-shift-p: the drawn rung moved to a neighbouring one (both ways alike) with this probability */
     double min_fg;           /* reject a patch whose CT nonzero fraction is below this */
     double empty_keep;       /* probability of keeping a patch whose target is all zero */
     int augment;             /* 0 = none, 1 = all 48 cube symmetries + intensity, 2 = the 24 proper rotations + intensity */
@@ -144,6 +147,11 @@ typedef struct {
                                 on its own plane, not in the target channels (whose packed form stays hard); unknown where CT 0, where the
                                 scanner augmentation ignores labels and on crushed / torn / delaminated / re-bent windows; warped windows
                                 pull it trilinearly over known corners (all corners of weight > 1e-7 known, else unknown) */
+    int ink_fib;             /* the ink plane is the fibre plane (train --fib-normal-lambda without --ink-head / --rv): the source's "fibre" target,
+                                else its "sheet" / "ink" one (the layout before the registry) */
+    int aux_n, aux_fib[2];   /* train head registry: aux_n (0..2) more prob254 planes batch.aux[j], read and warped like the ink plane: aux_fib[j] 0 the
+                                source's "ink" (CH_SHEET) target, 1 its "fibre" (CH_FIB) target (fib_sheet: else the "ink" one) */
+    int fib_sheet;
     int rv_iso;              /* train --rv 1 (task unwrap2): the ink plane carries papyrus instead of ink: 254 where the clean CT >= the source's
                                 "iso" (else this cutoff), 0 below (void), 255 unknown (CT 0, scanner-augmentation ignores); warped like the ink */
     int restore;             /* 2: real SR pairs (sources with "sr_pair", src/srpair.h): batch.t row = [target P^3 (through the pair's intensity map) |
@@ -184,6 +192,7 @@ typedef struct {
     void *w4r;               /* cfg.w4_runs: B band_w4dev.h w4runs (the winding as runs, malloc'd and kept per slot) instead of w4 / wcomp; side then
                                 holds every window's phase on the source grid (the device applies the symmetry, nn_label_sym / nn_w4runs_label) */
     uint8_t *ink;            /* B x P^3 when cfg.ink_plane: ink prob254 (0..254, 255 unknown) */
+    uint8_t *aux[2];         /* B x P^3 each for j < cfg.aux_n: the extra prob254 planes (ink / fibre), as batch.ink */
     uint8_t *inkb;           /* cfg.ink_bits: B x P^3 / 8, the --rv papyrus plane's known bit per voxel (bit j of byte k: voxel 8 k + j,
                                 source grid) instead of batch.ink; the plane is known ? (ct8 >= ink_it ? 254 : 0) : 255, built on the device
                                 (nn_ink_bits: the window's symmetry / warp after) */

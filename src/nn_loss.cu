@@ -1,7 +1,7 @@
 /* CUDA ops: loss section of the former nn.cu */
 #include "nn_common.cuh"
 
-float g_posw = 1.f;
+thread_local float g_posw = 1.f;
 extern "C" void nn_set_pos_weight(float w) { g_posw = w; }
 int g_tol = 0;
 extern "C" void nn_set_loss_tol(int r) { g_tol = r < 0 ? 0 : r > 2 ? 2 : r; }
@@ -10,9 +10,9 @@ static int g_unit_ch7 = -1;   /* nn_set_loss_unit_ch7: in 7-channel losses (task
 extern "C" void nn_set_loss_unit_ch7(int c) { g_unit_ch7 = c; }
 #define UNITC(C) ((C) == 7 ? g_unit_ch7 : -1)
 extern "C" void nn_loss_cfg_get(float *pw, float *rec_w, int *unit7);
-int g_logits_h16 = 0;   /* the logits the losses read are fp16 (unet_logits_h16: lean training with the logit gradient beside them) */
+thread_local int g_logits_h16 = 0;   /* the logits the losses read are fp16 (unet_logits_h16: lean training with the logit gradient beside them) */
 extern "C" void nn_set_logits_h16(int on) { g_logits_h16 = on; }
-int g_head_h16 = 0;
+thread_local int g_head_h16 = 0;
 extern "C" void nn_set_head_out_h16(int on) { g_head_h16 = on; }
 template <typename LT> __global__ void loss_stats_k(const LT *lg, const uint8_t *t, const uint8_t *m, const uint8_t *w, int C, size_t S, double *ds, float pw,
                                                    int tol, uint8_t *code, int D, int H, int W, int unit_c = -1) {
@@ -75,7 +75,7 @@ __global__ void loss_fin_k(const float *st, const uint8_t *w, int N, int C, floa
     fin[2 * C] = (float)active;
     fin[2 * C + 1] = active ? 1.f / active : 0.f;
 }
-int g_loss_g16 = 0;
+thread_local int g_loss_g16 = 0;
 static float g_recall = 0.f;   /* --recall weight (recto channel): 1 - (sum s p + 1) / (sum p + 1), a skeleton-recall term for thin labels */
 extern "C" void nn_set_recall(float w) { g_recall = w < 0.f ? 0.f : w; }
 extern "C" void nn_loss_cfg_get(float *pw, float *rec_w, int *unit7) { *pw = g_posw; *rec_w = g_recall; *unit7 = g_unit_ch7; }

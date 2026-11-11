@@ -17,7 +17,7 @@ using namespace nvcuda;
 
 extern int g_tf32;
 extern int g_gn_stored;
-extern int g_gn_const;   /* nn_set_gn_const (src/nn_l0norm.cu) */
+extern thread_local int g_gn_const;   /* nn_set_gn_const (src/nn_l0norm.cu) */
 extern "C" void nn_set_gn_stored(int on);
 extern "C" int nn_get_gn_stored(void);
 extern "C" void nn_set_f16(int on);
@@ -27,7 +27,7 @@ extern "C" void nn_set_prec(int p);
 extern "C" int nn_get_prec(void);
 /* per-layer precision: unet.c tags each conv with a layer id; a layer may override the global tensor-core precision */
 #define NN_MAXLAYER 32
-extern int g_layer, g_lprec[NN_MAXLAYER];
+extern thread_local int g_layer; extern int g_lprec[NN_MAXLAYER];
 extern int g_lprec_init;
 void lprec_init(void);
 extern "C" void nn_set_layer(int id);
@@ -37,12 +37,12 @@ extern "C" const char *nn_layer_name(int id, char *buf);
 extern "C" void nn_set_layer_prec(int id, int p);
 /* finer policy: per conv of a layer (sub 0 = c1, 1 = c2; down / head use sub 0) and per pass (0 forward, 1 backward-data,
    2 weight gradient); 0 = not set (falls back to the layer precision, then the global one) */
-extern int g_sub, g_pass;
+extern thread_local int g_sub, g_pass, g_block;
 extern unsigned g_exec_prec[NN_MAXLAYER][2][3];
 void exec_prec(int pass, int p);
 /* stochastic rounding of fp8 gradient operands: one seed per conv call, derived from the step (deterministic per step) */
 extern int g_sr;
-extern unsigned g_sr_step, g_sr_ctr;
+extern unsigned g_sr_step; extern thread_local unsigned g_sr_ctr;
 int sr_on(void);
 unsigned sr_seed(void);
 extern "C" void nn_set_sr(int on);
@@ -76,7 +76,7 @@ extern "C" const char *nn_prec_name(int p);
    per-pass values fwd:bwd_data:wgrad (e.g. dec0=fp16:fp16:fp8). Later entries override earlier ones. */
 extern "C" int nn_set_prec_policy(const char *pol);
 extern "C" int nn_get_tf32(void);
-extern int g_actbf;
+extern thread_local int g_actbf;
 extern "C" void nn_set_act_bf16(int on);
 extern "C" int nn_get_act_bf16(void);
 #define ABF (g_tf32 && g_actbf)
@@ -2126,7 +2126,7 @@ extern "C" void nn_concat_bwd(const float *gy, int ca, int cb, shape5 s, float *
 
 /* ================= loss =================
    scratch layout per (n,c): [nmask, bce_sum, sum_sig_p, sum_sig, sum_p] (5 floats). */
-extern float g_posw;
+extern thread_local float g_posw;
 extern "C" void nn_set_pos_weight(float w);
 /* Offset-tolerant positives (nn_set_loss_tol r > 0, channel 0 only). For a supervised voxel with target p >= 0.5 the
    positive BCE term p * softplus(-x) uses the maximum logit over the supervised voxels within r steps along the local
@@ -2170,8 +2170,8 @@ __device__ __forceinline__ int tol_normal(const uint8_t *tp, int z, int y, int x
 template <typename LT> __device__ __forceinline__ float lgv(const LT *p, size_t i);
 template <> __device__ __forceinline__ float lgv<float>(const float *p, size_t i) { return p[i]; }
 template <> __device__ __forceinline__ float lgv<f16>(const f16 *p, size_t i) { return __half2float(p[i]); }
-extern int g_logits_h16;
-extern int g_head_h16;   /* the MX head (1^3 conv) writes fp16 logits (nn_set_head_out_h16) */
+extern thread_local int g_logits_h16;
+extern thread_local int g_head_h16;   /* the MX head (1^3 conv) writes fp16 logits (nn_set_head_out_h16) */
 /* maximum logit over the supervised voxels i + k * dir, |k| <= r; returns the logit and sets the code */
 template <typename LT>
 __device__ __forceinline__ float tol_line_max(const LT *l, const uint8_t *mp, int z, int y, int x, int D, int H, int W, int d, int r, uint8_t *code) {
@@ -2249,7 +2249,7 @@ template <typename GT, typename LT = float> __global__ void __launch_bounds__(25
         if (v < S) gl[b0 + v] = loss_grad_v<GT, LT>(t, C, S, st, dice_w, fin, pw, gscale, tol, code, D, H, W, rec_w, nc, n, v, x[k], tb[k], mb[k]);
     }
 }
-extern int g_loss_g16;
+extern thread_local int g_loss_g16;
 extern "C" void nn_set_loss_grad_h16(int on);
 /* scratch: 5 floats per (n,c) statistics followed by 2C+2 finalized values */
 extern "C" size_t nn_loss_scratch(shape5 s);

@@ -11,7 +11,7 @@ int g_prec = 1, g_pref = 1;
 extern "C" void nn_set_tf32(int on) { g_tf32 = on; g_prec = on ? g_pref : 0; }
 extern "C" void nn_set_prec(int p) { g_prec = p; g_tf32 = p > 0; if (p > 0) g_pref = p; }   /* the fp8/fp4 kernels accept fp32, bf16 or fp16 storage */
 extern "C" int nn_get_prec(void) { return g_prec; }
-int g_layer = -1, g_lprec[NN_MAXLAYER];
+thread_local int g_layer = -1; int g_lprec[NN_MAXLAYER];   /* (g_layer, g_sub, g_pass, g_block, g_sr_ctr: per host thread, nn_tls_*) */
 /* U-Net depth L behind the layer ids: enc0..enc(L-1) = 0..L-1, down0..down(L-2) = L..2L-2, dec(L-2)..dec0 = 2L-1..3L-3,
    head = 3L-2 (L = 4: the original enc0..3 = 0..3, down0..2 = 4..6, dec2..0 = 7..9, head = 10) */
 int g_nlev = 4;
@@ -37,14 +37,14 @@ int g_lprec_init = 0;
 void lprec_init(void) { if (!g_lprec_init) { for (int i = 0; i < NN_MAXLAYER; i++) g_lprec[i] = -1; g_lprec_init = 1; } }
 extern "C" void nn_set_layer(int id) { g_layer = id; }
 extern "C" void nn_set_layer_prec(int id, int p) { lprec_init(); if (id >= 0 && id < NN_MAXLAYER) g_lprec[id] = p; }
-int g_sub = -1, g_pass = 0;
+thread_local int g_sub = -1, g_pass = 0;
 unsigned g_exec_prec[NN_MAXLAYER][2][3];
 void exec_prec(int pass, int p) {
     if (g_layer >= 0 && g_layer < NN_MAXLAYER)
         __atomic_fetch_or(&g_exec_prec[g_layer][g_sub > 0 ? 1 : 0][pass], 1u << p, __ATOMIC_RELAXED);
 }
 int g_sr = -1;
-unsigned g_sr_step = 0, g_sr_ctr = 0;
+unsigned g_sr_step = 0; thread_local unsigned g_sr_ctr = 0;
 int sr_on(void) { if (g_sr < 0) { const char *e = getenv("UFSM_SR"); g_sr = e ? atoi(e) : 0; } return g_sr; }
 unsigned sr_seed(void) {
     unsigned h = g_sr_step * 0x9e3779b9u ^ (++g_sr_ctr) * 0x85ebca6bu;
@@ -56,12 +56,21 @@ extern "C" void nn_set_sr_step(unsigned step) { g_sr_step = step; g_sr_ctr = 0; 
 /* the seed sequence of a step, for callers that reorder the ops drawing from it (unet's three level-0 buffers): the draw counter,
    set back to replay a draw, one draw, and whether the SR of the fp8 / fp4 operands is on */
 extern "C" unsigned nn_sr_ctr(void) { return g_sr_ctr; }
+/* the per-thread op state (train's per-GPU host threads start from the main thread's: nn_tls_capture there, nn_tls_install in the worker) */
+extern "C" void nn_tls_capture(nn_tls *t) {
+    t->layer = g_layer; t->sub = g_sub; t->pass = g_pass; t->block = g_block; t->sr_ctr = g_sr_ctr;
+    t->posw = g_posw; t->logits_h16 = g_logits_h16; t->head_h16 = g_head_h16; t->loss_g16 = g_loss_g16; t->gn_const = g_gn_const; t->actbf = g_actbf;
+}
+extern "C" void nn_tls_install(const nn_tls *t) {
+    g_layer = t->layer; g_sub = t->sub; g_pass = t->pass; g_block = t->block; g_sr_ctr = t->sr_ctr;
+    g_posw = t->posw; g_logits_h16 = t->logits_h16; g_head_h16 = t->head_h16; g_loss_g16 = t->loss_g16; g_gn_const = t->gn_const; g_actbf = t->actbf;
+}
 extern "C" void nn_sr_set_ctr(unsigned c) { g_sr_ctr = c; }
 extern "C" unsigned nn_sr_seed(void) { return sr_seed(); }
 extern "C" int nn_sr_on(void) { return sr_on(); }
 extern "C" void nn_exec_prec_note(int pass, int p) { exec_prec(pass, p); }   /* an op run outside nn (the executed-precision table) */
 extern "C" void nn_wmemo_clear(void) { lp_wmemo_clear(); }
-int g_block = 0;   /* nn_set_block: several convs under one layer id (residual blocks) memoise their weights apart */
+thread_local int g_block = 0;   /* nn_set_block: several convs under one layer id (residual blocks) memoise their weights apart */
 extern "C" void nn_set_block(int blk) { g_block = blk < 0 ? 0 : blk > 15 ? 15 : blk; }
 unsigned conv_wkey(void) { return g_layer >= 0 ? (unsigned)((g_layer * 2 + (g_sub > 0 ? g_sub : 0)) * 4 + g_pass + 1 + 256 * g_block) : 0u; }
 signed char g_lprec3[NN_MAXLAYER][2][3];
@@ -146,7 +155,7 @@ extern "C" int nn_set_prec_policy(const char *pol) {
     return 0;
 }
 extern "C" int nn_get_tf32(void) { return g_tf32; }
-int g_actbf = 1;
+thread_local int g_actbf = 1;   /* (per thread: bwd_data's fp32 fallback clears it around one call; nn_tls carries it) */
 extern "C" void nn_set_act_bf16(int on) { g_actbf = on; }
 extern "C" int nn_get_act_bf16(void) { return g_actbf; }
 int g_h16 = 0;
@@ -243,18 +252,26 @@ extern "C" void *nn_malloc(size_t n) {
 }
 g_reg_t g_reg[NN_MAXREG];
 int g_nreg;
-extern "C" void nn_storage_forget(const void *p) { for (int i = 0; i < g_nreg; i++) if (g_reg[i].p == (const char *)p) { g_reg[i] = g_reg[--g_nreg]; return; } }
+#include <pthread.h>
+static pthread_mutex_t g_reg_mu = PTHREAD_MUTEX_INITIALIZER;   /* (train's per-GPU host threads register and look up concurrently) */
+static void storage_forget_locked(const void *p) { for (int i = 0; i < g_nreg; i++) if (g_reg[i].p == (const char *)p) { g_reg[i] = g_reg[--g_nreg]; return; } }
+extern "C" void nn_storage_forget(const void *p) { pthread_mutex_lock(&g_reg_mu); storage_forget_locked(p); pthread_mutex_unlock(&g_reg_mu); }
 extern "C" void nn_set_storage(const void *p, size_t bytes, int dt) {
-    nn_storage_forget(p);
-    if (!p || !dt) return;
-    if (g_nreg >= NN_MAXREG) { fprintf(stderr, "nn_set_storage: registry full\n"); abort(); }
-    g_reg[g_nreg].p = (const char *)p; g_reg[g_nreg].n = bytes; g_reg[g_nreg].dt = dt; g_nreg++;
+    pthread_mutex_lock(&g_reg_mu);
+    storage_forget_locked(p);
+    if (p && dt) {
+        if (g_nreg >= NN_MAXREG) { fprintf(stderr, "nn_set_storage: registry full\n"); abort(); }
+        g_reg[g_nreg].p = (const char *)p; g_reg[g_nreg].n = bytes; g_reg[g_nreg].dt = dt; g_nreg++;
+    }
+    pthread_mutex_unlock(&g_reg_mu);
 }
 /* the innermost registration containing p: a buffer placed inside another one (an inference temp in a level buffer) keeps its own type */
 extern "C" int nn_storage(const void *p) {
     const char *c = (const char *)p;
     int dt = 0; size_t n = SIZE_MAX;
+    pthread_mutex_lock(&g_reg_mu);
     for (int i = 0; i < g_nreg; i++) if (c >= g_reg[i].p && c < g_reg[i].p + g_reg[i].n && g_reg[i].n < n) { dt = g_reg[i].dt; n = g_reg[i].n; }
+    pthread_mutex_unlock(&g_reg_mu);
     return dt;
 }
 extern "C" void nn_storage_dump(const char *tag) {   /* debug: the registry (stale entries of freed buffers show as overlaps) */

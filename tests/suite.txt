@@ -27,6 +27,9 @@ test_lat_head~FP8                              | gpu          |        4 | TLH_F
 test_pgrad                                     | gpu          |     1 | ./$B/test_pgrad
 test_gyrec                                     | gpu2         |     1 | ./$B/test_gyrec
 test_unwrap2_sampler                           | gpu          |     9 | ./$B/test_unwrap2_sampler $TMPDIR/unwrap2_fixture
+test_rungs                                     | gpu          |     3 | ./$B/test_rungs $TMPDIR/rungs_fixture
+test_gram                                      | gpu          |     2 | ./$B/test_gram
+test_fstem                                     | gpu          |     3 | ./$B/test_fstem
 test_restore_task                              | gpu          |     7 | ./$B/test_restore_task
 test_phase_interp                              |              |    20 | ./$B/test_phase_interp
 test_spatial_augment                           |              |    60 | UFSM_TEST_QUICK=1 ./$B/test_spatial_augment
@@ -82,6 +85,8 @@ test_predict_unwrap2                           | gpu          |     5 | ./$B/tes
 test_unwrap2_ink                               | gpu          |    40 | ./$B/test_unwrap2_ink ./$B/ufsm ./$B/make_wind_fixture
 test_cuda_abort                                | gpu          |    25 | bash tests/test_cuda_abort.sh ./$B/ufsm ./$B/make_wind_fixture
 test_rv                                        | gpu          |    30 | ./$B/test_rv ./$B/ufsm ./$B/make_wind_fixture
+test_heads                                     | gpu          |   120 | ./$B/test_heads ./$B/ufsm ./$B/make_wind_fixture tests/heads_ref.txt
+test_uw_fixed_point                             |              |     1 | UFSM_UW_SELFTEST=1 ./$B/ufsm train
 test_score_par                                 |              |     8 | ./$B/test_score_par ./$B/ufsm
 test_grid_sparse                               | gpu          |     2 | ./$B/test_grid_sparse
 test_density_lambda                            | gpu          |    40 | ./$B/test_density_lambda ./$B/ufsm ./$B/make_wind_fixture
@@ -146,6 +151,7 @@ test_pipeline_cli                              | gpu          |    85 | python3 
 test_ingest_lut                                |              |     3 | python3 tests/test_ingest_lut.py
 test_ink_blend                                 |              |     4 | python3 tests/test_ink_blend.py
 test_cover_training                            | gpu2         |    16 | python3 tests/test_cover_training.py
+test_univ2                                     | gpu2         |    40 | tests/test_univ2.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/univ2
 test_checkpoint                                | gpu          |     2 | ./$B/test_checkpoint
 test_optimizer_owners                          | gpu          |     3 | ./$B/test_optimizer_owners
 test_wide_up_grad                              | gpu          |     5 | ./$B/test_wide_up_grad
@@ -190,6 +196,7 @@ test_phasepack                                 |              |     3 | ./$B/tes
 test_nn                                        | gpu          |    15 | ./$B/test_nn
 test_unet                                      | gpu          |     3 | ./$B/test_unet
 test_unet~SCALE_COND=1                         | gpu          |     3 | UFSM_SCALE_COND=1 ./$B/test_unet
+test_unet~FILM=2                               | gpu          |     3 | UFSM_FILM=2 ./$B/test_unet
 test_unet~DS=1                                 | gpu          |     4 | UFSM_DS=1 ./$B/test_unet
 test_unet~EMB=3                                | gpu          |     4 | UFSM_EMB=3 ./$B/test_unet
 test_unet~EMB=3,DS=1,RECOMPUTE=2               | gpu          |     5 | UFSM_EMB=3 UFSM_DS=1 UFSM_RECOMPUTE=2 ./$B/test_unet

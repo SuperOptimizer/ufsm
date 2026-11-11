@@ -82,7 +82,12 @@ void nn_set_tf32(int on);
    backward-data with fp8 weight gradient. nn_set_tf32(0) selects exact fp32; nn_set_tf32(1) restores the last precision. */
 void nn_set_prec(int p);
 void nn_set_sr(int on);              /* stochastic rounding of the fp8 gradient operands: backward-data input, weight-gradient gy (env UFSM_SR=1) */
-void nn_set_sr_step(unsigned step);  /* reseed per training step (deterministic per step) */
+void nn_set_sr_step(unsigned step);
+/* the per-host-thread op state (layer ids, the stochastic-rounding counter, the loss / logit formats, ...): one host thread per GPU starts
+   from the main thread's (capture in the main thread, install in the worker) */
+typedef struct { int layer, sub, pass, block; unsigned sr_ctr; float posw; int logits_h16, head_h16, loss_g16, gn_const, actbf; } nn_tls;
+void nn_tls_capture(nn_tls *t);
+void nn_tls_install(const nn_tls *t);  /* reseed per training step (deterministic per step) */
 unsigned nn_sr_ctr(void);            /* the step's seed draw counter (reordered ops replay draws: nn_sr_set_ctr) */
 void nn_sr_set_ctr(unsigned c);
 unsigned nn_sr_seed(void);           /* one draw of the step's seed sequence (what an op drawing a seed would get) */
@@ -380,6 +385,17 @@ void nn_gn_apply(const float *x, shape5 s, int G, const float *gamma, const floa
 void nn_silu_fwd(const float *x, size_t n, float *y);
 void nn_silu_bwd(const float *x, const float *gy, size_t n, float *gx);   /* gx SET */
 void nn_axpy(float *y, float a, const float *x, size_t n);               /* y += a x */
+/* unet cfg.film (src/nn_film.cu): a GroupNorm's effective gamma / beta (offsets gam / bet, C channels) from its K x C pairs A, D at fo and the
+   K host codes, written into fw; the backward turns the effective pair's gradient in g into gamma's, A's and D's */
+void nn_film_fwd(const float *p, float *fw, size_t gam, size_t bet, size_t fo, int C, int K, const float *codes);
+void nn_film_bwd(const float *p, float *g, size_t gam, size_t bet, size_t fo, int C, int K, const float *codes);
+/* the Gram of K planes of 16-bit values (bf16 1, else fp16) with row stride ld over N entries: S[i K + j] += sum_n x_i x_j for j >= i (src/nn_gram.cu; train --grad-cos) */
+void nn_gram16(const void *x, int bf16, int K, size_t N, size_t ld, double *S);
+/* the fine voxel stem (src/nn_fstem.cu, train --fstem): params W1 [C][64] (4^3 taps at stride 2), b1 [C], W2 [nout][C]; fwd adds W2 silu(W1 x + b1)
+   to the fp16 logit planes chs[o] (slab planes [z0, z0 + nz) of a D x H x W window, ns voxels a plane) on each 2^3 block; bwd accumulates the
+   parameter gradients from fp16 gradient planes of that layout into gp. 1: a shape the kernels do not take (odd sizes, C or nout > 16) */
+int nn_fstem_fwd(const void *x, int D, int H, int W, int z0, int nz, const float *p, int C, int nout, const int *chs, void *lg, size_t ns);
+int nn_fstem_bwd(const void *x, int D, int H, int W, int z0, int nz, const float *p, int C, int nout, const int *chs, const void *g, size_t ns, float *gp);
 void nn_scale(float *y, float a, size_t n);
 void nn_u8_to_f32(const uint8_t *x, size_t n, float scale, float *y);
 

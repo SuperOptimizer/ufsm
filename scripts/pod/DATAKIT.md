@@ -32,6 +32,12 @@ Paris 4 phase A + B are 86 + 57 GB on the desk, codes 28 GB, q-9p6 10 GB, the se
 behind q-9p6 43 GB (delete after q-9p6). With other agents' caches on the 250 GB pod, phase B did not fit; a pod for the full Paris 4
 set needs >= 400 GB, or train on June (A) only.
 
+Pod 2 state (2026-11-11, after the disk filled to 100 % beside the 4.8 um relabel): `gt/paris4/codesB` (17 GB, the July codes) and
+`gt/p0139full/phaseA` (8.5 GB, the k0139 intermediate; `p0139full/phase` is fused and kept) are deleted, as are `seg/PHerc0139`,
+`seg/PHerc1667`, `seg/PHerc0500P2` (public, refetch with fetchsegs.sh). Phase B was never built, so `sources-wind-gt-pod.json` has
+June, 0139 and 0500P2 only (mksources.sh adds July only when `gt/paris4/phaseB` exists). Rebuilding July needs `p4kit.sh` from the
+codes step (~14 min at T=4) and ~60 GB more disk.
+
 ## Not covered
 
 - PHerc1667 GT (only the wbench 1667 boxes need it; its 10-16 codes at 4.798 um and phase came from a pre-10-19 pipeline). Copy the

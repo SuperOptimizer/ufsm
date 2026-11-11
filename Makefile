@@ -229,6 +229,12 @@ $(B)/test_lat_head: tests/test_lat_head.c $(B)/unet.o $(B)/nn.o $(B)/nn_fp8.o
 $(B)/test_l3_sched: tests/test_l3_sched.c $(B)/unet.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 
+$(B)/test_fstem: tests/test_fstem.c $(B)/nn.o $(B)/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
+suite-bins: $(B)/test_fstem
+$(B)/test_gram: tests/test_gram.c $(B)/nn.o $(B)/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
+suite-bins: $(B)/test_gram
 $(B)/test_unet: tests/test_unet.c $(B)/unet.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 $(B)/test_gn_frozen: tests/test_gn_frozen.c $(B)/unet.o $(B)/nn.o $(B)/nn_fp8.o
@@ -270,6 +276,9 @@ suite-bins: $(B)/test_unwrap2_ink $(B)/make_wind_fixture
 $(B)/test_rv: tests/test_rv.c $(B)/nn.o $(B)/nn_fp8.o | $(B)/ufsm $(B)/make_wind_fixture
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 suite-bins: $(B)/test_rv
+$(B)/test_heads: tests/test_heads.c | $(B)/ufsm $(B)/make_wind_fixture
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ -lm
+suite-bins: $(B)/test_heads
 $(B)/test_score_par: tests/test_score_par.c $(B)/z3w.o $(B)/zarr3.o $(B)/store.o $(B)/json.o | $(B)/ufsm
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) -lm
 suite-bins: $(B)/test_score_par
@@ -576,6 +585,9 @@ $(B)/test_lat_conv0: tests/test_lat_conv0.c $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 $(B)/test_w4dev: tests/test_w4dev.c $(B)/band.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
+$(B)/test_rungs: tests/test_rungs.c $(B)/sample.o $(B)/sample_emb.o $(B)/embz.o $(B)/edt.o $(B)/band.o $(B)/sheet.o $(B)/ct_augment.o $(B)/scan_augment.o $(B)/spatial_augment.o $(B)/crush.o $(B)/scrollaug.o $(B)/cover.o $(B)/sources.o $(B)/srpair.o $(B)/view.o $(B)/reg.o $(B)/zarr3.o $(B)/zarr2.o $(B)/store.o $(B)/json.o $(B)/z3w.o $(B)/tiff.o $(B)/zipr.o $(B)/hf.o $(B)/nn.o $(B)/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm -lcurl -lzstd -lblosc -lz -lcrypto
+suite-bins: $(B)/test_rungs
 $(B)/test_unwrap2_sampler: tests/test_unwrap2_sampler.c $(B)/sample.o $(B)/sample_emb.o $(B)/embz.o $(B)/edt.o $(B)/band.o $(B)/sheet.o $(B)/ct_augment.o $(B)/scan_augment.o $(B)/spatial_augment.o $(B)/crush.o $(B)/scrollaug.o $(B)/cover.o $(B)/sources.o $(B)/srpair.o $(B)/view.o $(B)/reg.o $(B)/zarr3.o $(B)/zarr2.o $(B)/store.o $(B)/json.o $(B)/z3w.o $(B)/tiff.o $(B)/zipr.o $(B)/hf.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm -lcurl -lzstd -lblosc -lz -lcrypto
 $(B)/test_phase_interp: tests/test_phase_interp.c $(B)/sample.o $(B)/sample_emb.o $(B)/embz.o $(B)/edt.o $(B)/band.o $(B)/sheet.o $(B)/ct_augment.o $(B)/scan_augment.o $(B)/spatial_augment.o $(B)/crush.o $(B)/scrollaug.o $(B)/cover.o $(B)/sources.o $(B)/srpair.o $(B)/view.o $(B)/reg.o $(B)/zarr3.o $(B)/zarr2.o $(B)/store.o $(B)/json.o $(B)/z3w.o $(B)/tiff.o $(B)/zipr.o $(B)/hf.o $(B)/nn.o $(B)/nn_fp8.o
