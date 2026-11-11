@@ -67,20 +67,37 @@ for k, base, nm, w in (("A", p4, "PHercParis4-june48", 0.2), ("B", p4b, "PHercPa
     e = lvl1(p4, nm, r, round(w * frac, 4), f"B1 4.8 um phase, June codes at level 1, PARTIAL: {len(sh)-len(miss)} of {len(sh)} packed shards complete, the rest held out ({hf})")
     e["holdout_file"] = hf; e["partial"] = True; src.append(e)
 FIB = os.environ.get("FIB", "/mnt/scratch/univ/fibre"); FIBT = os.environ.get("FIBT", f"{FIB}/teacher"); FS = float(os.environ.get("FIBSHARE", "0.2"))
+# The fibre-only entries with the planes computed on the fly from the polylines (univA, 2026-11-11: {"fibre": {afv, plane, radius,
+# guard, ring, iso, extra, map}}, byte-identical to the stored fiber-raster output at every level), so the stored labels / labels2
+# rasters (79 GB, lost with pod 1) are not rebuilt. The nine fibhv-d sets with the recipes of scripts/fibers/mklabels2.sh (the ring
+# sets: radius 2, guard 2, ring 3, the all-lengths AFV as the veto, CT air negatives at iso 64) and mklabels3.sh (no air test: iso -1);
+# their fibhv-d metre weights (floor 0.03 / 0.015) scaled to FIBSHARE, fibhv-d's holdouts. A set is skipped while its AFV is missing.
+RAW = os.environ.get("FIBRAW", "/vesuvius/ufsm/fibers/raw"); FO = os.environ.get("FIBON", "/vesuvius/ufsm/fibers/onfly")
+P4MAP = "/vesuvius/ufsm/reg/PParis4_2026to2023/reg.json"
+FSETS = [  # name, scroll / scan, um, level, afv, extra, map, iso, fibhv-d weight
+    ("PHerc1447-fib", "PHerc1447/volumes/20250521151220-8.640um-1.2m-116keV-masked.zarr", 8.64, 0, f"{RAW}/PHerc1447_1mm_v2.afv", f"{RAW}/PHerc1447_all_v2.afv", None, 64, 0.2766, "1447"),
+    ("PHerc0175A-fib", "PHerc0175A/volumes/20250521115057-8.640um-1.2m-116keV-masked.zarr", 8.64, 0, f"{RAW}/PHerc0175A_1mm_v2.afv", f"{RAW}/0175A_SMALLMORE.afv", None, 64, 0.2140, "0175A"),
+    ("PHercParis4-fib", "PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr", 2.4, 2, f"{RAW}/Paris4_1mm_v2.afv", f"{RAW}/Paris4_all_v2.afv@map,{RAW}/Paris4_v1.afv", P4MAP, -1, 0.1927, "p4"),
+    ("PHercParis4-spiral", "PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr", 2.4, 2, f"{RAW}/spiral_fibers.afv", f"{RAW}/Paris4_v1.afv", None, -1, 0.1818, "p4"),
+    ("PHerc0125-fib", "PHerc0125/volumes/20250821151825-9.362um-1.2m-113keV-masked.zarr", 9.362, 0, f"{RAW}/PHerc0125_3mm_v2.afv", "", None, -1, 0.03, "0125"),
+    ("PHerc0139-hf", "PHerc0139/volumes/20260102150214-2.399um-0.2m-78keV-masked.zarr", 2.399, 2, f"{FO}/PHerc0139.fib", "", None, -1, 0.03, "0139"),
+    ("PHercParis4-hf", "PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr", 2.4, 2, f"{FO}/PHercParis4.fib", "", None, -1, 0.03, "p4"),
+    ("PHerc1451-hf", "PHerc1451/volumes/20260319101107-2.399um-0.2m-78keV-masked.zarr", 2.399, 2, f"{FO}/PHerc1451.fib", "", None, -1, 0.03, "1451"),
+    ("PHerc0332-hf", "PHerc0332/volumes/20251211183505-2.399um-0.2m-78keV-masked.zarr", 2.399, 2, f"{FO}/PHerc0332.fib", "", None, -1, 0.015, "0332")]
 fsrc = []
-if os.path.exists(f"{FIB}/sources-fibhv-d.json"):
-    pod = {"/workspace/fibd/labels": f"{FIB}/labels", "/workspace/fibers/labels2": f"{FIB}/labels2", "/workspace/fibers/meta": f"{FIB}/meta",
-           "/workspace/fibd/sources-fibhv-d.holdouts.json": f"{FIB}/sources-fibhv-d.holdouts.json"}
-    def loc(v):
-        for a, b in pod.items():
-            if isinstance(v, str) and v.startswith(a): return b + v[len(a):]
-        return v
-    for s in json.load(open(f"{FIB}/sources-fibhv-d.json"))["sources"]:
-        tg = s.pop("targets"); h, v = loc(tg["recto"]["root"]), loc(tg["sheet"]["root"])
-        if not (os.path.exists(f"{h}/zarr.json") and os.path.exists(f"{v}/zarr.json")): continue
-        e = {k: loc(x) for k, x in s.items()}
-        if e["root"].startswith("/workspace"): e["root"] = MIRROR   # pod-local CT copies (1447, 0175A) -> the mirror + cache
-        e["targets"] = {"fibre_h": dict(tg["recto"], root=h), "fibre_v": dict(tg["sheet"], root=v)}; e["heads"] = {"fibre": 1}; fsrc.append(e)
+for nm, ct, um, lv, afv, ex, mp, iso, w, ax in FSETS:
+    need = [afv] + [x.split("@")[0] for x in ex.split(",") if x] + ([mp] if mp else [])
+    import time   # a file still being downloaded (modified in the last 5 min, or a .bad checksum marker) counts as missing
+    def ready(x): return os.path.exists(x) and not os.path.exists(x + ".bad") and time.time() - os.path.getmtime(x) > 300
+    if not all(ready(x) for x in need): print(f"{nm}: skipped (missing or still downloading {[x for x in need if not ready(x)]})"); continue
+    def plane(pl):
+        f = {"afv": afv, "plane": pl, "radius": 2, "guard": 2, "ring": 3, "iso": iso}
+        if ex: f["extra"] = ex
+        if mp: f["map"] = mp
+        return {"fibre": f}
+    fsrc.append({"name": nm, "scope": "local", "root": MIRROR, "ct": ct, "um": um, "min_level": lv, "max_level": lv, "axis": f"{FO}/axis-{ax}.json",
+                 "iso": 64, "holdout_file": f"{FO}/holdouts-fibre.json", "weight": w, "heads": {"fibre": 1},
+                 "targets": {"fibre_h": plane("H"), "fibre_v": plane("V")}})
 for s in src:   # teacher fibre targets on the winding entries
     d = f"{FIBT}/{s['name']}"
     if os.path.exists(f"{d}/done"):
@@ -91,9 +108,9 @@ for s in src:   # teacher fibre targets on the winding entries
 # onto that entry (heads ink 1), so one window trains winding + rv + ink; its holdouts become the union of the entry's and the ink file
 # (the wbench boxes first, so the validation box stays first; plus the mapped 9.36 boxes and the ink eval crops). The other scans (0139
 # and 0500P2, whose winding GT is on the 9.362 um scans, and 0814 / 0841 / 0009B / MAN5) stay ink-only entries, together INKSHARE of
-# the windows (0 until univA confirms that ink-only windows skip the winding losses; then 0.05), labelled-voxel weights floored at
+# the windows (0.05; univA confirmed 2026-11-11 that ink-only windows train with the winding losses at 0), labelled-voxel weights floored at
 # INKFLOOR (0.02 of the fragment).
-INK = os.environ.get("INK", "/vesuvius/ufsm/inkgt/sources-inkgt.json"); IS = float(os.environ.get("INKSHARE", "0")); IF = float(os.environ.get("INKFLOOR", "0.02"))
+INK = os.environ.get("INK", "/vesuvius/ufsm/inkgt/sources-inkgt.json"); IS = float(os.environ.get("INKSHARE", "0.05")); IF = float(os.environ.get("INKFLOOR", "0.02"))
 def scan(ct): return ct.split("/")[-1]
 def hunion(name, files):
     boxes, seen = [], set()
@@ -120,6 +137,6 @@ src += fsrc + isrc
 json.dump({"cache": T.get("cache", "/vesuvius/ufsm/cache"), "sources": src}, open(out, "w"), indent=1)
 for s in src:
     tg = s["targets"]; ph = tg["band"]["phase"] if "band" in tg else None
-    r = (ph.get("root") or "onfly:" + ph["onfly"]["root"]) if ph else next(iter(tg.values()))["root"]
+    r = (ph.get("root") or "onfly:" + ph["onfly"]["root"]) if ph else (lambda v: v.get("root") or "onfly:" + v["fibre"]["afv"])(next(iter(tg.values())))
     print(f"{s['name']:22s} um {s['um']:<6} levels {s['min_level']}-{s['max_level']} weight {s['weight']:.3f} heads {','.join(k for k, v in s['heads'].items() if v)} {r}")
 print("->", out)
