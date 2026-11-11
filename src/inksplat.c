@@ -1238,7 +1238,7 @@ static int inkfly_derive(void *ctx, z3 *base, const int64_t o[3], const int64_t 
     return 0;
 }
 /* the coarser level: known-max 2x pooling of the level below (an onfly array), as the stored pyramid */
-typedef struct { z3 *fine; } ifpool;
+typedef struct { z3 *fine; int own; } ifpool;
 static int inkfly_pool_derive(void *ctx, z3 *base, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads) {
     (void)base; ifpool *p = ctx; const int64_t fo[3] = {2 * o[0], 2 * o[1], 2 * o[2]}, fn[3] = {2 * n[0], 2 * n[1], 2 * n[2]};
     uint8_t *b = malloc((size_t)fn[0] * fn[1] * fn[2]); if (!b) return -1;
@@ -1252,16 +1252,16 @@ static int inkfly_pool_derive(void *ctx, z3 *base, const int64_t o[3], const int
     }
     free(b); return 0;
 }
-static void inkfly_pool_free(void *p) { ifpool *q = p; if (q) z3_close(q->fine); free(q); }
-z3 *inkfly_open_pooled(z3 *ct_coarse, z3 *fine) {
-    ifpool *p = calloc(1, sizeof *p); p->fine = fine;
+static void inkfly_pool_free(void *p) { ifpool *q = p; if (q && q->own) z3_close(q->fine); free(q); }
+z3 *inkfly_open_pooled(z3 *ct_coarse, z3 *fine, int own_fine) {
+    ifpool *p = calloc(1, sizeof *p); p->fine = fine; p->own = own_fine;
     z3 *z = z3_open_derived(ct_coarse, 255, inkfly_pool_derive, p, inkfly_pool_free);
-    if (!z) { free(p); z3_close(fine); z3_close(ct_coarse); }
+    if (!z) { free(p); if (own_fine) z3_close(fine); z3_close(ct_coarse); }
     return z;
 }
 
 /* SEGS: {"segments": [{"tifxyz": DIR, "labels": L, "mask": M, "crop": [c0, r0, w, h]}, ..]}; ct: the CT at level cfg->level (owned) */
-z3 *inkfly_open(z3 *ct, const char *segs_path, const inksplat_cfg *cfg, size_t cache_mb) {
+z3 *inkfly_open(z3 *ct, const char *segs_path, const inksplat_cfg *cfg, size_t cache_mb, void **handle) {
     const double t0 = snow();
     FILE *fp = fopen(segs_path, "rb"); if (!fp) { fprintf(stderr, "ink onfly: cannot open %s\n", segs_path); z3_close(ct); return nullptr; }
     fseek(fp, 0, SEEK_END); long sz = ftell(fp); fseek(fp, 0, SEEK_SET); char *txt = malloc((size_t)sz + 1); size_t rd = fread(txt, 1, (size_t)sz, fp); fclose(fp); txt[rd] = 0;
@@ -1327,6 +1327,7 @@ z3 *inkfly_open(z3 *ct, const char *segs_path, const inksplat_cfg *cfg, size_t c
     f->nhash = 1 << 16; f->hash = calloc(f->nhash, sizeof *f->hash); f->cap_bytes = (cache_mb ? cache_mb : 2048) << 20;
     z3 *z = z3_open_derived(ct, 255, inkfly_derive, f, inkfly_free);
     if (!z) { inkfly_free(f); z3_close(ct); return nullptr; }
+    if (handle) *handle = f;
     fprintf(stderr, "ink onfly: %s: %d label windows, %d meshes, %zu supervised tiles indexed in %.1fs (level %d, face [%g, %g], iso %d, %d held-out boxes, cache %zu MB)\n",
             segs_path, f->nU, f->nS, f->nT, snow() - t0, f->L, cfg->face_a, cfg->face_b, cfg->iso, cfg->nexcl, cache_mb ? cache_mb : 2048);
     return z;
@@ -1373,7 +1374,7 @@ int cmd_ink_onfly(int argc, char **argv) {
     const int nth = ufsm_threads(atoi(sopt(argc, argv, "--threads", "0")), 8);
     store *cs = store_open(argv[ci + 1]); z3 *ct = cs ? pyramid_open_level(cs, argv[ci + 2], c.level, c.ct_um, c.cache) : nullptr;
     if (!ct) { fprintf(stderr, "ink-onfly: CT level %d: %s\n", c.level, z3_error()); return 1; }
-    z3 *z = inkfly_open(ct, argv[2], &c, (size_t)atol(sopt(argc, argv, "--cache-mb", "2048")));
+    z3 *z = inkfly_open(ct, argv[2], &c, (size_t)atol(sopt(argc, argv, "--cache-mb", "2048")), nullptr);
     if (!z) return 1;
     const int L = c.level; int64_t o[3], n[3]; size_t nv = 1;
     for (int d = 0; d < 3; d++) { o[d] = b[d] >> L; n[d] = ((b[d] + b[d + 3] + (1 << L) - 1) >> L) - o[d]; nv *= (size_t)n[d]; }
@@ -1409,4 +1410,12 @@ int cmd_ink_onfly(int argc, char **argv) {
     }
     free(A); z3_close(z); store_close(cs);
     return 0;
+}
+int inkfly_cells(void *handle, int lev, const int64_t shape[3], uint8_t *bits) {
+    const inkfly *f = handle; if (!f) return -1; const int64_t cs = (int64_t)1 << lev; size_t n = 0;
+    for (size_t t = 0; t < f->nT; t++) {
+        int64_t a[3], b[3]; for (int d = 0; d < 3; d++) { a[d] = f->T[t].lo[d] / cs; b[d] = f->T[t].hi[d] / cs; if (a[d] < 0) a[d] = 0; if (b[d] >= shape[d]) b[d] = shape[d] - 1; }
+        for (int64_t z = a[0]; z <= b[0]; z++) for (int64_t y = a[1]; y <= b[1]; y++) for (int64_t x = a[2]; x <= b[2]; x++) { uint8_t *q = &bits[((size_t)z * shape[1] + y) * shape[2] + x]; n += !*q; *q = 1; }
+    }
+    return (int)(n > 2000000000 ? 2000000000 : n);
 }

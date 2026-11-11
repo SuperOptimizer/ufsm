@@ -65,8 +65,10 @@ uint8_t *inksplat_label_window(const char *path, int64_t r0, int64_t c0, int64_t
    byte-identical to `ink-splat --face --merge` over the same windows with the same options. segs: {"segments": [{"tifxyz", "labels",
    "mask", "crop": [c0, r0, w, h]}, ..]}. cfg: level, ct_um, iso, face_*, thr, flip, nexcl / excl, label_scale, label_off, cache. */
 typedef struct z3 z3;
-z3 *inkfly_open(z3 *ct, const char *segs, const inksplat_cfg *cfg, size_t cache_mb);
-z3 *inkfly_open_pooled(z3 *ct_coarse, z3 *fine);   /* the next level: known-max 2x pooling of fine (owned), on ct_coarse's grid (owned) */
+z3 *inkfly_open(z3 *ct, const char *segs, const inksplat_cfg *cfg, size_t cache_mb, void **handle);   /* handle (nullable): for inkfly_cells */
+/* the level-lev cells (grid shape) a supervised label tile's box (reach included) touches -> bits[] = 1 (the sampler's draw cells) */
+int inkfly_cells(void *handle, int lev, const int64_t shape[3], uint8_t *bits);
+z3 *inkfly_open_pooled(z3 *ct_coarse, z3 *fine, int own_fine);   /* the next level: known-max 2x pooling of fine, on ct_coarse's grid (owned) */
 void inkfly_stats(uint64_t *reads, uint64_t *chunks, uint64_t *empty, uint64_t *hits, uint64_t *px, double *sec);
 int inkfly_holdouts(const char *holdout_file, const char *ct_key, inksplat_cfg *cfg);   /* boxes whose ct basename is ct_key's -> cfg->excl */
 int cmd_ink_onfly(int argc, char **argv);

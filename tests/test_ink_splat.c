@@ -163,7 +163,7 @@ int main(void) {
         CHECK(ref && !z3_read(ref, z0, nn, rb, 4), "read face2");
         store *cs = store_open(dir); z3 *ct0 = z3_open(cs, "ct.zarr/1", nullptr);
         inksplat_cfg c8 = c7; c8.crop[2] = 0; c8.merge = 0; c8.level = 0;
-        z3 *fly = ct0 ? inkfly_open(ct0, sj, &c8, 64) : nullptr; CHECK(fly != nullptr, "inkfly_open");
+        z3 *fly = ct0 ? inkfly_open(ct0, sj, &c8, 64, nullptr) : nullptr; CHECK(fly != nullptr, "inkfly_open");
         if (fly) {
             for (int pass = 0; pass < 2; pass++) {   /* cold, then from the cache; odd boxes */
                 const int64_t bo[3] = {37, 11, 5}, bn[3] = {NV - 60, NV - 20, NV - 9}; uint8_t *fb = malloc((size_t)bn[0] * bn[1] * bn[2]);
