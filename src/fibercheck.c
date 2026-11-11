@@ -23,6 +23,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "afv.h"
+#include "reg.h"
 #include "fit.h"
 #include "json.h"
 #include "sources.h"
@@ -439,12 +440,14 @@ int cmd_fiber_check(int argc, char **argv) {
    box-local native coordinates, clipped to the box plus --margin native voxels (a fibre leaving and re-entering becomes two runs), for
    fit --fibers. --shift adds a translation (native voxels, e.g. a local registration correction). */
 int cmd_fiber_export(int argc, char **argv) {
-    if (argc < 5) { fprintf(stderr, "usage: ufsm fiber-export <afv | a.fib[,b.fib...]> <fields-dir> <out.fib> [--tr T.json] [--level 2] [--margin 8] [--shift dz,dy,dx] [--min-pts 4]\n"
+    if (argc < 5) { fprintf(stderr, "usage: ufsm fiber-export <afv | a.fib[,b.fib...]> <fields-dir> <out.fib> [--tr T.json | --map reg.json [--cache DIR]] [--level 2] [--margin 8] [--shift dz,dy,dx] [--min-pts 4]\n"
                                     "  UFIB inputs (ufsm fiber-trace output: level-0 voxels of the scan, z y x) need no --tr\n"); return 2; }
     int ufib = 0; { FILE *mf = fopen(strchr(argv[2], ',') ? "" : argv[2], "rb"); char mg[4] = {0};
         if (strchr(argv[2], ',')) ufib = 1; else if (mf) { ufib = fread(mg, 1, 4, mf) == 4 && !memcmp(mg, "UFIB", 4); } if (mf) fclose(mf); }
     const char *trp = fc_opt(argc, argv, "--tr", nullptr); double M[3][4] = {{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}}, Mi[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
-    if (!ufib && (!trp || fc_transform(trp, M, Mi))) { fprintf(stderr, "fiber-export: --tr needs a transform.json with a transformation_matrix\n"); return 2; }
+    const char *mapp = fc_opt(argc, argv, "--map", nullptr); const rmap *RM = nullptr;   /* ufsm reg map: coarse = the AFV's scan, fine = ours (affine + field) */
+    if (mapp && !ufib) { rvol *fv; double cu, fu; RM = reg_map_open(mapp, fc_opt(argc, argv, "--cache", nullptr), &fv, &cu, &fu); if (!RM) return 1; }
+    else if (!ufib && (!trp || fc_transform(trp, M, Mi))) { fprintf(stderr, "fiber-export: --tr needs a transform.json with a transformation_matrix (or --map reg.json)\n"); return 2; }
     const int level = atoi(fc_opt(argc, argv, "--level", "2")), minp = atoi(fc_opt(argc, argv, "--min-pts", "4")); const double mg = atof(fc_opt(argc, argv, "--margin", "8")), sc = ldexp(1.0, level);
     double sh[3] = {0, 0, 0}; if (*fc_opt(argc, argv, "--shift", "") && sscanf(fc_opt(argc, argv, "--shift", ""), "%lf,%lf,%lf", &sh[0], &sh[1], &sh[2]) != 3) { fprintf(stderr, "fiber-export: --shift dz,dy,dx\n"); return 2; }
     char fp[1200]; snprintf(fp, sizeof fp, "%s/fields.json", argv[3]);
@@ -459,7 +462,8 @@ int cmd_fiber_export(int argc, char **argv) {
     for (int c = 0; c < 8; c++) {
         const double pz = sc * (org[0] - sh[0] + ((c & 1) ? ext[0] + mg : -mg) + 0.5) - 0.5, py = sc * (org[1] - sh[1] + ((c & 2) ? ext[1] + mg : -mg) + 0.5) - 0.5, px = sc * (org[2] - sh[2] + ((c & 4) ? ext[2] + mg : -mg) + 0.5) - 0.5;
         const double v[3] = {px, py, pz};
-        for (int r = 0; r < 3; r++) { const double q = M[r][0] * v[0] + M[r][1] * v[1] + M[r][2] * v[2] + M[r][3]; if (q < lo[r]) lo[r] = q; if (q > hi[r]) hi[r] = q; }
+        double qq[3]; if (RM) rmap_f2c(RM, v, qq); else for (int r = 0; r < 3; r++) qq[r] = M[r][0] * v[0] + M[r][1] * v[1] + M[r][2] * v[2] + M[r][3];
+        for (int r = 0; r < 3; r++) { if (qq[r] < lo[r]) lo[r] = qq[r]; if (qq[r] > hi[r]) hi[r] = qq[r]; }
     }
     afv_run *R = nullptr; int nr = 0;
     if (ufib) {   /* traced fibres: runs of level-0 (z, y, x) points, as AFV runs in (x, y, z) under the identity transform */
@@ -486,7 +490,7 @@ int cmd_fiber_export(int argc, char **argv) {
         int open = 0;   /* a run is open while its points stay inside */
         for (int k = 0; k < R[i].n; k++) {
             const double u[3] = {R[i].xyz[3 * k] - M[0][3], R[i].xyz[3 * k + 1] - M[1][3], R[i].xyz[3 * k + 2] - M[2][3]};
-            double l0[3]; for (int a = 0; a < 3; a++) l0[a] = Mi[a][0] * u[0] + Mi[a][1] * u[1] + Mi[a][2] * u[2];
+            double l0[3]; if (RM) rmap_c2f(RM, R[i].xyz + 3 * (size_t)k, l0); else for (int a = 0; a < 3; a++) l0[a] = Mi[a][0] * u[0] + Mi[a][1] * u[1] + Mi[a][2] * u[2];
             const double q[3] = {(l0[2] + 0.5) / sc - 0.5 + sh[0] - org[0], (l0[1] + 0.5) / sc - 0.5 + sh[1] - org[1], (l0[0] + 0.5) / sc - 0.5 + sh[2] - org[2]};
             const int in = q[0] >= -mg && q[1] >= -mg && q[2] >= -mg && q[0] < ext[0] + mg && q[1] < ext[1] + mg && q[2] < ext[2] + mg;
             if (!in) {   /* close the run (dropped when too short) */
