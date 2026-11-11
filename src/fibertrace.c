@@ -13,7 +13,8 @@
    once, not once per cell or once per voxel of its cross-section. Family: V when the mean squared axial component of the tangent is above 1/2, else H (the scroll axis is z).
    --presence-only 1 ignores nx / ny and takes the axis from the presence itself (the smallest eigenvector of its gradient structure
    tensor over 5^3 voxels); --mask ROOT KEY does the same on a zarr v3 probability volume (our own H / V mask predictions; <root> and
-   <key-prefix> are then unused, pass -), with --family H|V naming the family of every line.
+   <key-prefix> are then unused, pass -), with --family H|V naming the family of every line; --dyad DIR takes the axis from the direction
+   head's predicted dyad channels DIR/c2 .. DIR/c7 instead (train --fib-dir).
    Output: UFIB, points = level-0 scan voxels (z, y, x), voxel index = centre: (p + 0.5) 2^s - 0.5. --box is in prediction voxels.
    CPU; the reads are threaded, the tracing is one thread (the seed order makes it sequential). */
 #include <math.h>
@@ -142,13 +143,14 @@ int cmd_fiber_trace(int argc, char **argv) {
     const int prior_on = atoi(ft_opt(argc, argv, "--axis-prior", "0"));
     const int bridge = atoi(ft_opt(argc, argv, "--bridge", "0")); size_t nbridge = 0;   /* steps straight on through a support dip */   /* with --family H|V: the axis from the layer normal + the family direction */
     if (str < 1 || str > 8 || blur < 0 || blur > 4) { fprintf(stderr, "fiber-trace: --st-r 1..8, --blur 0..4\n"); return 2; }
+    long long mo_g[3] = {0, 0, 0};   /* --mask-origin (also the dyad channels' origin) */
     const int mi = ft_flag(argc, argv, "--mask"), derive = mi || atoi(ft_opt(argc, argv, "--presence-only", "0")); const char famf = ft_opt(argc, argv, "--family", "?")[0];
     static const char *const nm[3] = {"presence", "nx", "ny"};
     if (mi) {   /* a mask probability (zarr v3 uint8, prob254: 255 unknown read as 0) as the presence */
         if (mi + 2 >= argc) { fprintf(stderr, "fiber-trace: --mask ROOT KEY\n"); return 2; }
         store *s = store_open(argv[mi + 1]); z3 *z = s ? z3_open(s, argv[mi + 2], cache) : nullptr; if (!z) { fprintf(stderr, "fiber-trace: cannot open the mask %s %s\n", argv[mi + 1], argv[mi + 2]); return 1; }
         /* --mask-origin Z,Y,X: the mask store's origin in --box coordinates (predict --box writes a box-local store; its origin_zyx) */
-        long long mo[3] = {0, 0, 0}; const char *mos = ft_opt(argc, argv, "--mask-origin", nullptr);
+        long long *mo = mo_g; const char *mos = ft_opt(argc, argv, "--mask-origin", nullptr);
         if (mos && sscanf(mos, "%lld,%lld,%lld", &mo[0], &mo[1], &mo[2]) != 3) { fprintf(stderr, "fiber-trace: --mask-origin Z,Y,X\n"); return 2; }
         int64_t lo[3];
         for (int d = 0; d < 3; d++) { const int64_t sh = z3_meta_of(z)->shape[d] + mo[d]; o[d] = b[d] < mo[d] ? mo[d] : b[d]; const int64_t e = b[d] + b[3 + d] > sh ? sh : b[d] + b[3 + d]; n[d] = e - o[d]; lo[d] = o[d] - mo[d]; }
@@ -169,7 +171,24 @@ int cmd_fiber_trace(int argc, char **argv) {
         z2_close(z);
     }
     if (derive) { vol[1] = malloc((size_t)n[0] * n[1] * n[2]); vol[2] = malloc((size_t)n[0] * n[1] * n[2]); if (!vol[1] || !vol[2]) return 1; if (blur > 0) ft_blur(vol[0], n, blur);
-        ft_ridge_axis(vol[0], n, vol[1], vol[2], str, prior_on && (famf == 'H' || famf == 'V') ? famf : 0); }
+        const char *dy = ft_opt(argc, argv, "--dyad", nullptr);
+        if (mi && dy) {   /* --dyad DIR: the direction head's six predicted dyad channels (train --fib-dir; predict --channel 2..7 into DIR/c2 .. DIR/c7,
+                             same level key and box frame as the mask): the axis = the principal eigenvector of the decoded dyad, not the mask's tube */
+            const size_t nv = (size_t)n[0] * n[1] * n[2]; uint8_t *dc[6]; const int64_t lo[3] = {o[0] - mo_g[0], o[1] - mo_g[1], o[2] - mo_g[2]};
+            for (int c = 0; c < 6; c++) { char root[1400]; snprintf(root, sizeof root, "%s/c%d", dy, 2 + c);
+                store *s = store_open(root); z3 *z = s ? z3_open(s, argv[mi + 2], cache) : nullptr; dc[c] = malloc(nv);
+                if (!z || !dc[c] || z3_read(z, lo, n, dc[c], nth)) { fprintf(stderr, "fiber-trace: cannot read the dyad channel %s %s\n", root, argv[mi + 2]); return 1; }
+                z3_close(z); }
+            for (size_t i = 0; i < nv; i++) {
+                const double C[6] = {dc[0][i] / 255., dc[1][i] / 255., dc[2][i] / 255., dc[3][i] / 255. - 0.5, dc[4][i] / 255. - 0.5, dc[5][i] / 255. - 0.5};
+                double v[3] = {0, 0, 0}; v[C[0] >= C[1] && C[0] >= C[2] ? 0 : C[1] >= C[2] ? 1 : 2] = 1;
+                for (int it = 0; it < 16; it++) { const double w[3] = {C[0] * v[0] + C[3] * v[1] + C[4] * v[2], C[3] * v[0] + C[1] * v[1] + C[5] * v[2], C[4] * v[0] + C[5] * v[1] + C[2] * v[2]};
+                    const double m = sqrt(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]); if (!(m > 0)) break; v[0] = w[0] / m; v[1] = w[1] / m; v[2] = w[2] / m; }
+                if (v[0] < 0) { v[0] = -v[0]; v[1] = -v[1]; v[2] = -v[2]; }
+                vol[1][i] = (uint8_t)lround(128 + 127 * v[2]); vol[2][i] = (uint8_t)lround(128 + 127 * v[1]);
+            }
+            for (int c = 0; c < 6; c++) free(dc[c]);
+        } else ft_ridge_axis(vol[0], n, vol[1], vol[2], str, prior_on && (famf == 'H' || famf == 'V') ? famf : 0); }
     const ft_vol V = {vol[0], vol[1], vol[2], {n[0], n[1], n[2]}}; P.V = &V; const size_t nv = (size_t)n[0] * n[1] * n[2];
     /* seeds: the presence maximum of each bin^3 cell */
     const int64_t g[3] = {(n[0] + bin - 1) / bin, (n[1] + bin - 1) / bin, (n[2] + bin - 1) / bin}; uint64_t *sd_ = malloc(((size_t)g[0] * g[1] * g[2] + 1) * sizeof *sd_); size_t ns = 0, npres = 0;
@@ -200,7 +219,8 @@ int cmd_fiber_trace(int argc, char **argv) {
                     double pb[3] = {p[0], p[1], p[2]}; int kb = 0, ok = 0;
                     for (kb = 1; kb <= bridge; kb++) { for (int a = 0; a < 3; a++) pb[a] += P.h * d[a]; if (ft_dir(&P, pb, d, d1) == FT_OK) { ok = 1; break; } }
                     if (ok) { for (int b = 1; b <= kb; b++) { double *q = side ? seedp - 3 * (++nb) : seedp + 3 * (++nf); for (int a = 0; a < 3; a++) q[a] = p[a] + b * P.h * d[a]; }
-                        for (int a = 0; a < 3; a++) p[a] = pb[a]; k += kb; nbridge++; r = FT_OK; }
+                        for (int a = 0; a < 3; a++) { p[a] = pb[a]; }
+                        k += kb; nbridge++; r = FT_OK; }
                 }
                 if (r) { why = r; break; }
                 for (int a = 0; a < 3; a++) pm[a] = p[a] + 0.5 * P.h * d1[a];
