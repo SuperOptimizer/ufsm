@@ -50,7 +50,22 @@ arc-weighted median and the arc share in lines >= 1 / 2 mm. fibhv-c on HOLD with
 | V dyad | 642 -> 7509 | 0.34 -> 4.64 | 0.52 -> 0.60 | 0.000 -> 0.070 | 0.000 -> 0.000 |
 
 Launch (pod 1, RTX PRO 4000): 9 sources, init 59 layer tensors from fibhv-c 21000; step 100 at 199 Mvox/s, loader wait 21 % (the
-Paris 4 / human-line CT streams from the mirror into the cache). Evals at steps 3000, 9000, 15000, 21000, 27000 (pod 2 predicts).
+Paris 4 / human-line CT streams from the mirror into the cache), 217 Mvox/s and 0 % wait by step 11600. Evals at steps 3000, 9000,
+15000, 21000, 27000 (pod 2 predicts and traces, the desk judges).
+
+HOLD (Paris 4, now in-domain), fibhv-c 12000 -> fibhv-d 3000 -> 9000 (lines, arc m, arc-median mm, >= 1 mm, >= 2 mm; pairs at 0.6 mm):
+
+| trace | fibhv-c 12000 | fibhv-d 3000 | fibhv-d 9000 |
+|---|---|---|---|
+| H tube | 6988, 4.40, 0.61, 9.5 %, 0.7 %; .955 | 9899, 6.48, 0.64, 13.5 %, 0.4 %; .951 | 11041, 7.41, 0.66, 15.9 %, 0.9 %; .941 |
+| H dyad | 4218, 2.48, 0.57, 4.3 %, 0.0 %; .932 | 7232, 4.42, 0.60, 7.0 %, 0.0 %; .948 | 6597, 3.93, 0.58, 5.3 %, 0.0 %; .950 |
+| V tube | 7259, 4.56, 0.61, 8.7 %, 0.2 %; .864 | 10380, 6.76, 0.63, 13.4 %, 0.6 %; .900 | 10578, 7.00, 0.64, 13.9 %, 0.8 %; .886 |
+| V dyad | 7509, 4.64, 0.60, 7.0 %, 0.0 %; .904 | 11791, 7.65, 0.63, 11.5 %, 0.2 %; .887 | 12857, 8.44, 0.64, 13.0 %, 0.3 %; .894 |
+
+More traced fibre (+68 % arc on H tube at 9000) and a larger share in lines >= 1 mm at about the same sheet fidelity; lines >= 2 mm
+stay under 1 %. 1447-HOLD (cross-check) stays flat between 3000 and 9000 (H tube arc-median 0.59, V tube 0.64). The 1447 mask-vs-label
+score in evald.sh does not work yet (`ufsm eval` reads 0 valid voxels from the copied label shards). The first desk orchestrator never
+started the pod eval: its `pgrep -f` guard matched its own ssh command line; evald_desk.sh now uses a pid file.
 
 ## Paris 4: the 2023 7.91 um scan registered to our 2.4 um scan (2026-11-11, branch p4reg-20261111)
 
