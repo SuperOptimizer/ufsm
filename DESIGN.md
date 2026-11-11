@@ -80,6 +80,56 @@ crackle) makes several real edges. AUC vs the ink prediction, 2.4 um | 1.129 um,
   (flat CT 0.31 on w046, 0.65 on w038s), and 1.129 um numbers track the 2.4 um ones within a few hundredths.
 Outputs: /vesuvius/ufsm/pbr/out/<crop>/{contact.png, png/*.png, *.f32, map.json, auc.json}.
 
+### Addendum: against HUMAN ink labels (2026-11-11)
+
+- The public human labels (HF scrollprize/datasets ink/phercparis4, 8 segments w00..w09) are already on the 2.4 um
+  20260411134726 scan (their meshes reach z ~74000, x ~26000; the 2023 scan's shape is 14258 x 7888 x 8096). So no 2023 -> 2026
+  map was needed. Pipeline: ink-splat each label segment (label + supervision mask) into one sparse prob254 zarr (band +-4
+  voxels, 255 = unknown), then `sheet-pbr --labels`. For each output pixel the sampler walks the normal +-D around our tracked
+  recto. It picks the labelled run nearest the face and returns its majority label (human_ink) and its offset from the face
+  (human_off). Voxels outside the label box count as unknown, not as no ink.
+- Picking crops by geometry alone gave 0 % labelled on 9 crops: the label segments run near our sheets but are unsupervised
+  there. So crops were re-picked by distance to supervised label pixels (tools/pbr hcand2.txt; >= 60 % of the mesh vertices
+  within 12 voxels). That gave L1-L5 plus w028 and hC. w028s is 7.4 % labelled and its label surface sits -28 voxels from our
+  face, i.e. on the neighbouring sheet, so it is excluded.
+
+| crop (seg, u, v, px) | labelled | ink | label - recto mean / mean abs (2.4 \| 1.13) |
+|---|---|---|---|
+| w028 (w028-037 122880 10240, 2048) | 99.2 % | 36.5 % | +4.6 / 9.8 \| - |
+| hC (w028-037 61440 21504, 1024) | 26.6 % | 50.6 % | +7.3 / 11.3 \| +6.9 / 11.5 |
+| L1 (w028-037 77824 19456) | 100 % | 38.9 % | +5.5 / 7.9 \| +5.8 / 8.0 |
+| L2 (w028-037 54272 26624) | 99.6 % | 47.6 % | +3.4 / 6.5 \| +4.0 / 6.7 |
+| L3 (w010-027 62464 23552) | 100 % | 40.3 % | +3.1 / 6.6 \| +5.3 / 8.4 |
+| L4 (w010-027 72704 37888) | 99.5 % | 42.9 % | +8.1 / 9.9 \| +7.9 / 9.6 |
+| L5 (w038-045 167936 24576) | 100 % | 44.2 % | +0.6 / 7.1 \| +1.7 / 7.3 |
+
+  The label surfaces are on the same sheet as our face. They sit on average 1-8 mesh voxels outward of it (|d| 6.5-10 voxels,
+  i.e. 16-24 um, about one sheet thickness of jitter), never a whole wrap off, except w028s.
+
+AUC vs HUMAN labels, raw / detrended (2.4 um; 1.129 um in parentheses):
+
+| map | w028 | hC | L1 | L2 | L3 | L4 | L5 | pooled (z-scored per crop) |
+|---|---|---|---|---|---|---|---|---|
+| recto offset | 0.41/0.38 | 0.73/0.72 (0.70) | 0.65/0.56 (0.63) | 0.57/0.56 (0.50) | 0.46/0.46 (0.45) | 0.53/0.52 (0.55) | 0.39/0.45 (0.36) | 0.493 (0.529) |
+| flat CT | 0.58/0.56 | 0.37/0.38 (0.39) | 0.44/0.47 (0.42) | 0.44/0.47 (0.42) | 0.53/0.52 (0.52) | 0.53/0.52 (0.54) | 0.53/0.50 (0.53) | 0.525 (0.481) |
+| near-recto CT | 0.56/0.53 | 0.54/0.56 (0.45) | 0.53/0.52 (0.46) | 0.50/0.52 (0.47) | 0.53/0.53 (0.54) | 0.50/0.50 (0.53) | 0.52/0.53 (0.51) | 0.534 (0.499) |
+| thickness | 0.48/0.52 | 0.55/0.51 (0.57) | 0.39/0.44 (0.43) | 0.46/0.44 (0.51) | 0.46/0.45 (0.43) | 0.54/0.54 (0.49) | 0.57/0.56 (0.59) | 0.485 (0.497) |
+| recto height | 0.60/0.62 | 0.27/0.28 (0.30) | 0.35/0.43 (0.38) | 0.43/0.44 (0.50) | 0.54/0.54 (0.55) | 0.47/0.48 (0.45) | 0.61/0.55 (0.64) | 0.507 (0.471) |
+| roughness | 0.55/0.58 | 0.54/0.63 (0.56) | 0.55/0.44 (0.52) | 0.65/0.38 (0.57) | 0.50/0.49 (0.51) | 0.53/0.45 (0.52) | 0.54/0.50 (0.54) | 0.511 (0.517) |
+| PBR | 0.47/0.47 | 0.46/0.45 (0.45) | 0.48/0.45 (0.49) | 0.41/0.47 (0.47) | 0.50/0.51 (0.50) | 0.48/0.49 (0.49) | 0.47/0.49 (0.46) | 0.462 (0.478) |
+| RTI min | 0.49/0.47 | 0.46/0.41 (0.49) | 0.48/0.39 (0.50) | 0.42/0.53 (0.52) | 0.49/0.51 (0.50) | 0.48/0.54 (0.49) | 0.48/0.56 (0.48) | 0.467 (0.503) |
+| AO | 0.46/0.46 | 0.46/0.46 (0.45) | 0.44/0.43 (0.47) | 0.37/0.41 (0.45) | 0.51/0.51 (0.50) | 0.47/0.48 (0.48) | 0.46/0.49 (0.46) | 0.454 (0.472) |
+
+- Result: against human labels, as against the predictions, no label-free surface map separates ink. Pooled AUCs are
+  0.45-0.53. Per-crop values reach 0.27 / 0.73 (hC height, recto offset), but the sign flips between crops: recto offset is
+  0.73 on hC and 0.39 on L5, and height is 0.27 on hC and 0.61 on L5.
+- Caveat: the human labels are coarse polygons at letter scale. A 1024-px crop (2.46 mm) holds only one or two label
+  boundaries (see cmph_L1.png: the crop splits into one ink half and one no-ink half). So a per-crop AUC mostly measures
+  "which half of the crop", and detrending at sigma 300 px is close to the crop size. A test with real power needs >= 8 mm
+  crops spanning many letters, scored at stroke edges.
+- Images: /vesuvius/ufsm/pbr/out/cmph_{L1,L4,hC}.png (human label | flat | near-recto | PBR | raking light | recto offset,
+  2.4 um row over 1.129 um row), out/h_{s24,s113}_<crop>/contact_human.png, auc_human.txt.
+
 ## Own dense embedding net (dino-train) and the dinovol port (2026-10-21/22)
 - `ufsm dinovol-embed` runs the scrollprize dinovol ViT (HF scrollprize/dinovol_8um_ps192_102126) in C/CUDA with embed_volume.py's
   lattice / blending / normalisation; `dinovol-read`, `dinovol-eval` (the sheet-identity check; `--codes` classifies misses by the winding
