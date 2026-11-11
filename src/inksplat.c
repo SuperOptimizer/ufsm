@@ -211,7 +211,9 @@ typedef struct {
     double F, offr, offc;                              /* canvas pixels per label pixel; canvas offset (--label-offset) */
     double sign, ta, tb;                               /* band in level-0 voxels along sign N */
     int ntiles_x, ntiles_y;
+    int8_t *face;                                      /* --face: per label pixel the open-face offset (level-0 voxels along sign N), FACE_NONE */
 } geo;
+enum { FACE_NONE = -128 };
 static inline int px_sup(const geo *G, int64_t r, int64_t c) { return !G->msk || G->msk[(size_t)r * G->lw + c] >= 128; }
 static inline void px_grid(const geo *G, double r, double c, double *gu, double *gv) {   /* label pixel (window coords, may be fractional) -> grid */
     *gu = ((c + G->lc0 + 0.5) * G->F - 0.5 + G->offc) * G->S->scale; *gv = ((r + G->lr0 + 0.5) * G->F - 0.5 + G->offr) * G->S->scale;
@@ -248,7 +250,7 @@ typedef struct {
     z3 *ct; z3w *w; z3 *old; vol *pred;
     double hpx; int nsub, nt; double tstep;
     pthread_mutex_t mu;
-    uint64_t n_ink, n_no, n_rej, n_hit, cm[2][2];   /* cm[splat ink][pred ink] over the written known voxels (--pred at this level) */
+    uint64_t n_ink, n_no, n_rej, n_hit, n_excl, cm[2][2], vh[255];   /* cm[splat ink][pred ink] over the written known voxels (--pred at this level) */
     uint8_t *chunks_used; int64_t cg[3];            /* 128-chunk occupancy of the written voxels (block origins) */
     int64_t bb_lo[3], bb_hi[3];
     _Atomic int failed;
@@ -268,13 +270,15 @@ static void *splat_worker(void *arg) {
             const int64_t r0 = (int64_t)ty * TS, c0 = (int64_t)tx * TS, r1 = r0 + TS < G->lh ? r0 + TS : G->lh, c1 = c0 + TS < G->lw ? c0 + TS : G->lw;
             for (int64_t r = r0; r < r1; r++) for (int64_t cc = c0; cc < c1; cc++) {
                 if (!px_sup(G, r, cc)) continue;
+                const double ta = G->face ? (G->face[(size_t)r * G->lw + cc] == FACE_NONE ? NAN : G->face[(size_t)r * G->lw + cc] + c->face_a) : G->ta;
+                if (isnan(ta)) continue;
                 const uint8_t lv = G->lab[(size_t)r * G->lw + cc]; const int ink = lv >= 128;
                 for (int a = 0; a < J->nsub; a++) for (int b = 0; b < J->nsub; b++) {
                     double gu, gv, P[3], N[3];
                     px_grid(G, r + (a + 0.5) / J->nsub - 0.5, cc + (b + 0.5) / J->nsub - 0.5, &gu, &gv);
                     if (ssurf_pn(G->S, gu, gv, P, N)) continue;
                     for (int k = 0; k < J->nt; k++) {
-                        const double tt = (G->ta + k * J->tstep) * G->sign;
+                        const double tt = (ta + k * J->tstep) * G->sign;
                         int64_t vi[3]; int in = 1;
                         for (int d = 0; d < 3; d++) { vi[d] = (int64_t)floor((P[d] + tt * N[d] - J->off) / J->V + 0.5) - so[d]; if (vi[d] < 0 || vi[d] >= SH) { in = 0; break; } }
                         if (!in) continue;
@@ -296,7 +300,7 @@ static void *splat_worker(void *arg) {
             have_old = 1;
         }
         if (!have_old) memset(buf, 255, sv);
-        uint64_t ni = 0, nn = 0, nr = 0, nh = 0, cm[2][2] = {{0, 0}, {0, 0}}; int any = 0;
+        uint64_t ni = 0, nn = 0, nr = 0, nh = 0, nx = 0, cm[2][2] = {{0, 0}, {0, 0}}, vh[255] = {0}; int any = 0;
         for (int ci = 0; ci < NCS * NCS * NCS; ci++) {
             acc *ac = A[ci]; if (!ac) continue;
             const int64_t co[3] = {so[0] + (ci / (NCS * NCS)) * CH, so[1] + (ci / NCS % NCS) * CH, so[2] + (ci % NCS) * CH}, cn[3] = {CH, CH, CH};
@@ -308,11 +312,19 @@ static void *splat_worker(void *arg) {
                 nh++;
                 const int64_t z = co[0] + (int64_t)(k >> 14), y = co[1] + (int64_t)(k >> 7 & 127), x = co[2] + (int64_t)(k & 127);
                 if (z >= J->oshape[0] || y >= J->oshape[1] || x >= J->oshape[2]) continue;
+                if (c->nexcl) {   /* --exclude: the voxel's level-0 extent [j V, (j + 1) V) touches a held-out box */
+                    const int64_t Vi = (int64_t)J->V; int ex = 0;
+                    for (int e = 0; e < c->nexcl && !ex; e++) {
+                        const int64_t *b = c->excl[e];
+                        ex = (z + 1) * Vi > b[0] && z * Vi < b[0] + b[3] && (y + 1) * Vi > b[1] && y * Vi < b[1] + b[4] && (x + 1) * Vi > b[2] && x * Vi < b[2] + b[5];
+                    }
+                    if (ex) { nx++; continue; }
+                }
                 if (!ctb[k] || ctb[k] < c->iso) { nr++; continue; }
                 const int isink = ac->ni[k] && ac->ni[k] >= c->thr * h;
                 const uint8_t v = (uint8_t)(((isink ? ac->pi[k] : ac->pn[k]) * 254 + 127) / 255);
                 const size_t bi = ((size_t)(z - so[0]) * SH + (size_t)(y - so[1])) * SH + (size_t)(x - so[2]);
-                buf[bi] = buf[bi] == 255 ? v : (buf[bi] > v ? buf[bi] : v);
+                buf[bi] = buf[bi] == 255 ? v : (buf[bi] > v ? buf[bi] : v); vh[v]++;
                 if (isink) ni++; else nn++;
                 if (pb && pb[k] != c->pred_skip) cm[v >= 127][pb[k] >= c->pred_thr]++;
                 cany = 1;
@@ -326,7 +338,7 @@ static void *splat_worker(void *arg) {
         if (atomic_load(&J->failed)) break;
         if ((any || have_old) && z3w_write_shard(J->w, sz, sy, sx, buf, 2)) { fprintf(stderr, "ink-splat: %s\n", z3w_error()); atomic_store(&J->failed, 1); break; }
         pthread_mutex_lock(&J->mu);
-        J->n_ink += ni; J->n_no += nn; J->n_rej += nr; J->n_hit += nh;
+        J->n_ink += ni; J->n_no += nn; J->n_rej += nr; J->n_hit += nh; J->n_excl += nx; for (int q = 0; q < 255; q++) J->vh[q] += vh[q];
         for (int a = 0; a < 2; a++) for (int b = 0; b < 2; b++) J->cm[a][b] += cm[a][b];
         for (int d = 0; d < 3; d++) { if (blo[d] < J->bb_lo[d]) J->bb_lo[d] = blo[d]; if (bhi[d] > J->bb_hi[d]) J->bb_hi[d] = bhi[d]; }
         pthread_mutex_unlock(&J->mu);
@@ -335,6 +347,66 @@ done:
     for (int ci = 0; ci < NCS * NCS * NCS; ci++) free(A[ci]);
     free(A); free(buf); free(ctb); free(pb);
     return nullptr;
+}
+
+/* ---------------- --face: the open face per label pixel ---------------- */
+enum { FBLK = 4 };   /* tiles per face block side (256 label px): one CT box per block, fewer repeated chunk decodes */
+typedef struct { const geo *G; double V, off; z3 *ct; int nbx, nby, nblk; _Atomic int next, failed; _Atomic uint64_t nsup, nface; uint64_t hist[256]; pthread_mutex_t mu; } fjob;
+static inline float tri_box(const uint8_t *b, const int64_t n[3], double z, double y, double x);
+/* the open face of one CT column s[0 .. n) (t = lo + i): the first papyrus run of >= run samples ending at t >= -4 and starting at
+   t <= 8, followed by >= gap samples below iso; FACE_NONE when the column has none */
+static int face_of(const float *s, int n, int lo, int iso, int run, int gap) {
+    for (int i = 0; i < n;) {
+        if (s[i] < iso) { i++; continue; }
+        int j = i; while (j < n && s[j] >= iso) j++;   /* papyrus run [i, j) */
+        const int t0 = lo + i, t1 = lo + j - 1;
+        if (j - i >= run && t1 >= -4 && t0 <= 8) {
+            int g = 0; while (j + g < n && s[j + g] < iso && g < gap) g++;
+            return g >= gap && t1 >= -127 && t1 <= 127 ? t1 : FACE_NONE;
+        }
+        if (t0 > 8) return FACE_NONE;
+        i = j;
+    }
+    return FACE_NONE;
+}
+static void *face_worker(void *arg) {
+    fjob *J = arg; const geo *G = J->G; const inksplat_cfg *c = G->c;
+    const int lo = (int)floor(c->face_lo), hi = (int)ceil(c->face_hi), n = hi - lo + 1;
+    float *raw = malloc(n * sizeof *raw), *sm = malloc(n * sizeof *sm); uint64_t h[256] = {0}, ns = 0, nf = 0;
+    for (int b; (b = atomic_fetch_add(&J->next, 1)) < J->nblk && !atomic_load(&J->failed);) {
+        const int bx = b % J->nbx, by = b / J->nbx;
+        double lo3[3] = {1e300, 1e300, 1e300}, hi3[3] = {-1e300, -1e300, -1e300}; int any = 0;
+        for (int ty = by * FBLK; ty < (by + 1) * FBLK && ty < G->ntiles_y; ty++) for (int tx = bx * FBLK; tx < (bx + 1) * FBLK && tx < G->ntiles_x; tx++) {
+            double a[3], e[3]; if (!tile_box(G, tx, ty, (double)(abs(lo) > abs(hi) ? abs(lo) : abs(hi)) + 1, a, e)) continue;
+            for (int d = 0; d < 3; d++) { if (a[d] < lo3[d]) lo3[d] = a[d]; if (e[d] > hi3[d]) hi3[d] = e[d]; } any = 1;
+        }
+        if (!any) continue;
+        int64_t o[3], nb[3]; size_t nv = 1;
+        for (int d = 0; d < 3; d++) { o[d] = (int64_t)floor((lo3[d] - J->off) / J->V) - 1; nb[d] = (int64_t)ceil((hi3[d] - J->off) / J->V) + 2 - o[d]; nv *= (size_t)nb[d]; }
+        if (nv > (size_t)1 << 31) { fprintf(stderr, "ink-splat: face block %d box too large, skipped\n", b); continue; }
+        uint8_t *cb = malloc(nv);
+        if (!cb || z3_read(J->ct, o, nb, cb, 1)) { fprintf(stderr, "ink-splat: face CT read failed\n"); free(cb); atomic_store(&J->failed, 1); break; }
+        const int64_t r0 = (int64_t)by * FBLK * TS, c0 = (int64_t)bx * FBLK * TS, r1 = r0 + FBLK * TS < G->lh ? r0 + FBLK * TS : G->lh, c1 = c0 + FBLK * TS < G->lw ? c0 + FBLK * TS : G->lw;
+        for (int64_t r = r0; r < r1; r++) for (int64_t cc = c0; cc < c1; cc++) {
+            if (!px_sup(G, r, cc)) continue;
+            double gu, gv, P[3], N[3]; px_grid(G, (double)r, (double)cc, &gu, &gv);
+            if (ssurf_pn(G->S, gu, gv, P, N)) continue;
+            ns++;
+            for (int i = 0; i < n; i++) {
+                const double tt = (lo + i) * G->sign; double q[3];
+                for (int d = 0; d < 3; d++) q[d] = (P[d] + tt * N[d] - J->off) / J->V - o[d];
+                const float v = tri_box(cb, nb, q[0], q[1], q[2]); raw[i] = v < 0 ? 0 : v;
+            }
+            for (int i = 0; i < n; i++) sm[i] = 0.25f * (raw[i > 0 ? i - 1 : 0] + 2 * raw[i] + raw[i < n - 1 ? i + 1 : n - 1]);
+            const int f = face_of(sm, n, lo, c->iso, c->face_run, c->face_gap);
+            G->face[(size_t)r * G->lw + cc] = (int8_t)f;
+            if (f != FACE_NONE) { nf++; h[f + 128]++; }
+        }
+        free(cb);
+    }
+    atomic_fetch_add(&J->nsup, ns); atomic_fetch_add(&J->nface, nf);
+    pthread_mutex_lock(&J->mu); for (int k = 0; k < 256; k++) J->hist[k] += h[k]; pthread_mutex_unlock(&J->mu);
+    free(raw); free(sm); return nullptr;
 }
 
 /* ---------------- profile ---------------- */
@@ -368,11 +440,12 @@ static void *prof_worker(void *arg) {
             if ((r + G->lr0) % st) continue;
             for (int64_t cc = c0; cc < c1; cc++) {
                 if ((cc + G->lc0) % st || !px_sup(G, r, cc)) continue;
+                const int fo = G->face ? G->face[(size_t)r * G->lw + cc] : 0; if (fo == FACE_NONE) continue;   /* --face: t relative to the open face */
                 const int cls = G->lab[(size_t)r * G->lw + cc] >= 128;
                 double gu, gv, Pp[3], N[3]; px_grid(G, (double)r, (double)cc, &gu, &gv);
                 if (ssurf_pn(G->S, gu, gv, Pp, N)) continue;
                 for (int i = -T; i <= T; i++) {
-                    const double tt = i * c->layer_vox * G->sign; double q[3];
+                    const double tt = (fo + i * c->layer_vox) * G->sign; double q[3];
                     for (int d = 0; d < 3; d++) q[d] = (Pp[d] + tt * N[d] - J->off) / J->V - o[d];
                     const float cv = tri_box(cb, n, q[0], q[1], q[2]), pv = pb ? tri_box(pb, n, q[0], q[1], q[2]) : 0.f;
                     if (cv < 0) continue;
@@ -408,6 +481,7 @@ static void band_score(const prof *P, int T, int a, int b, double *iou, double *
 void inksplat_defaults(inksplat_cfg *c) {
     memset(c, 0, sizeof *c);
     c->label_z = c->mask_z = -1; c->band_a = -4; c->band_b = 4; c->layer_vox = 1; c->thr = 0.5; c->coarse = -1; c->threads = 6;
+    c->face_a = -6; c->face_b = 0; c->face_lo = -6; c->face_hi = 20; c->face_run = 3; c->face_gap = 2;
     c->iso = 1; c->pred_level = -1; c->pred_thr = 128; c->pred_skip = -1; c->stride = 4;
 }
 
@@ -503,6 +577,29 @@ int inksplat_run(const inksplat_cfg *c) {
     if (!ct0) { fprintf(stderr, "ink-splat: CT level 0: %s\n", z3_error()); goto out1; }
     int64_t shape0[3]; memcpy(shape0, z3_meta_of(ct0)->shape, sizeof shape0);
 
+    char face_json[2048] = "";
+    if (c->face) {   /* --face: the open face per supervised label pixel from the output level's CT (before the profile, which then runs face-relative) */
+        const double V = (double)(1 << c->level); z3 *ct = c->level ? pyramid_open_level(cts, c->ct_key, c->level, c->ct_um, c->cache) : ct0;
+        if (!ct) { fprintf(stderr, "ink-splat: CT level %d: %s\n", c->level, z3_error()); goto out2; }
+        G.face = malloc((size_t)G.lw * G.lh); if (!G.face) goto out2;
+        memset(G.face, (uint8_t)(int8_t)FACE_NONE, (size_t)G.lw * G.lh);
+        fjob FJ = {0}; FJ.G = &G; FJ.V = V; FJ.off = (V - 1) / 2; FJ.ct = ct; FJ.nbx = (G.ntiles_x + FBLK - 1) / FBLK; FJ.nby = (G.ntiles_y + FBLK - 1) / FBLK;
+        FJ.nblk = FJ.nbx * FJ.nby; pthread_mutex_init(&FJ.mu, nullptr);
+        pthread_t th[64]; const int nt = c->threads < 1 ? 1 : c->threads > 64 ? 64 : c->threads;
+        for (int i = 0; i < nt; i++) pthread_create(&th[i], nullptr, face_worker, &FJ);
+        for (int i = 0; i < nt; i++) pthread_join(th[i], nullptr);
+        if (ct != ct0) z3_close(ct);
+        if (atomic_load(&FJ.failed)) goto out2;
+        const uint64_t ns = atomic_load(&FJ.nsup), nf = atomic_load(&FJ.nface); double cum = 0; int q[5] = {0}; const double qs[5] = {0.1, 0.25, 0.5, 0.75, 0.9};
+        for (int k = 0, qi = 0; k < 256 && qi < 5; k++) { cum += FJ.hist[k]; while (qi < 5 && nf && cum >= qs[qi] * nf) q[qi++] = k - 128; }
+        fprintf(stderr, "ink-splat: %s: open face found at %llu of %llu supervised px (%.1f%%); face offset p10 / p25 / p50 / p75 / p90 %d / %d / %d / %d / %d level-0 voxels along %+dN; band [f%+g, f%+g]\n",
+                name, (unsigned long long)nf, (unsigned long long)ns, ns ? 100.0 * nf / ns : 0, q[0], q[1], q[2], q[3], q[4], (int)G.sign, c->face_a, c->face_b);
+        int o = snprintf(face_json, sizeof face_json, "\"face\": {\"band\": [%g, %g], \"search\": [%g, %g], \"run\": %d, \"gap\": %d, \"px\": %llu, \"found\": %llu, \"q10_25_50_75_90\": [%d, %d, %d, %d, %d], \"hist\": {",
+                         c->face_a, c->face_b, c->face_lo, c->face_hi, c->face_run, c->face_gap, (unsigned long long)ns, (unsigned long long)nf, q[0], q[1], q[2], q[3], q[4]);
+        for (int k = 0, first = 1; k < 256 && o < (int)sizeof face_json - 40; k++) if (FJ.hist[k]) { o += snprintf(face_json + o, sizeof face_json - o, "%s\"%d\": %llu", first ? "" : ", ", k - 128, (unsigned long long)FJ.hist[k]); first = 0; }
+        snprintf(face_json + o, sizeof face_json - o, "}},\n ");
+        G.ta = c->face_lo + c->face_a; G.tb = c->face_hi + c->face_b;   /* (the reach of the tile -> shard pairs) */
+    }
     /* ---- profile ---- */
     char prof_json[65536]; prof_json[0] = 0;
     if (c->profile) {   /* (without --pred: the CT columns only) */
@@ -597,7 +694,7 @@ int inksplat_run(const inksplat_cfg *c) {
         sjob J = {0}; J.G = &G; J.L = L; J.V = V; J.off = (V - 1) / 2; memcpy(J.oshape, oshape, sizeof oshape); J.ct = ct; J.w = w; J.old = old; J.pred = have_pred ? &pv : nullptr;
         for (int d = 0; d < 3; d++) { J.ns[d] = (oshape[d] + SH - 1) / SH; J.cg[d] = (oshape[d] + CH - 1) / CH; J.bb_lo[d] = INT64_MAX; J.bb_hi[d] = -1; }
         J.hpx = 0.45 * V / F; if (J.hpx > 1) J.hpx = 1; J.nsub = (int)ceil(1 / J.hpx);   /* (canvas pixel = one level-0 voxel nominally) */
-        const double span = G.tb - G.ta; J.nt = (int)ceil(span / (0.45 * V)) + 1; J.tstep = J.nt > 1 ? span / (J.nt - 1) : 0;
+        const double span = c->face ? c->face_b - c->face_a : G.tb - G.ta; J.nt = (int)ceil(span / (0.45 * V)) + 1; J.tstep = J.nt > 1 ? span / (J.nt - 1) : 0;
         if ((double)J.cg[0] * J.cg[1] * J.cg[2] > 4e9) { fprintf(stderr, "ink-splat: grid too large\n"); goto out2; }
         J.chunks_used = calloc((size_t)(J.cg[0] * J.cg[1] * J.cg[2]), 1);
         /* tile -> shard pairs */
@@ -631,9 +728,9 @@ int inksplat_run(const inksplat_cfg *c) {
         if (old) z3_close(old);
         if (atomic_load(&J.failed)) { fprintf(stderr, "ink-splat: failed\n"); goto out2; }
         const double known = (double)(J.n_ink + J.n_no);
-        fprintf(stderr, "ink-splat: %s: %llu hit voxels, %llu ink + %llu no-ink written, %llu below iso / masked (%.1f%% on papyrus) in %.1fs\n", name,
-                (unsigned long long)J.n_hit, (unsigned long long)J.n_ink, (unsigned long long)J.n_no, (unsigned long long)J.n_rej, J.n_hit ? 100.0 * known / J.n_hit : 0, snow() - t0);
-        char cmp_json[512] = "";
+        fprintf(stderr, "ink-splat: %s: %llu hit voxels, %llu ink + %llu no-ink written, %llu below iso / masked, %llu excluded (%.1f%% on papyrus) in %.1fs\n", name,
+                (unsigned long long)J.n_hit, (unsigned long long)J.n_ink, (unsigned long long)J.n_no, (unsigned long long)J.n_rej, (unsigned long long)J.n_excl, J.n_hit ? 100.0 * known / J.n_hit : 0, snow() - t0);
+        char cmp_json[8192] = "";
         if (have_pred) {
             const double tp = J.cm[1][1], fp = J.cm[1][0], fn = J.cm[0][1], tn = J.cm[0][0], tot = tp + fp + fn + tn;
             printf("# voxelwise vs prediction >= %d over the %.0f written voxels: agreement %.4f, ink IoU %.4f, precision %.4f, recall %.4f (splat ink %.0f, prediction ink %.0f)\n",
@@ -642,21 +739,27 @@ int inksplat_run(const inksplat_cfg *c) {
                      c->pred_thr, tp, fp, fn, tn, tot ? (tp + tn) / tot : 0, tp + fp + fn ? tp / (tp + fp + fn) : 0);
             fflush(stdout);
         }
+        {   /* the written values of this segment (0 .. 254, before the merge): soft-label percentiles across segments */
+            size_t o = strlen(cmp_json); o += (size_t)snprintf(cmp_json + o, sizeof cmp_json - o, "\"value_hist\": [");
+            for (int q = 0; q < 255 && o < sizeof cmp_json - 32; q++) o += (size_t)snprintf(cmp_json + o, sizeof cmp_json - o, q ? ", %llu" : "%llu", (unsigned long long)J.vh[q]);
+            snprintf(cmp_json + o, sizeof cmp_json - o, "],");
+        }
         /* coarse levels (known-max pooling) and the group */
         if (splat_pyramid(c, shape0)) goto out2;
         /* summary */
         char sp[1400]; if (c->summary) snprintf(sp, sizeof sp, "%s", c->summary); else { snprintf(sp, sizeof sp, "%s/segments", c->out); mkdir_p(sp); snprintf(sp, sizeof sp, "%s/segments/%s.json", c->out, name); }
+        char cmp_all[12288]; snprintf(cmp_all, sizeof cmp_all, "%s%s", face_json, cmp_json);
         FILE *f = fopen(sp, "w");
         if (!f) { fprintf(stderr, "ink-splat: cannot write %s\n", sp); goto out2; }
         int64_t blo[3], bhi[3]; for (int d = 0; d < 3; d++) { blo[d] = J.bb_lo[d] == INT64_MAX ? 0 : J.bb_lo[d] << L; bhi[d] = J.bb_hi[d] < 0 ? 0 : ((J.bb_hi[d] + 1) << L); }
         fprintf(f, "{\"name\": \"%s\", \"surface\": \"%s\", \"labels\": \"%s\", \"mask\": \"%s\", \"ct\": \"%s/%s\", \"ct_um\": %g, \"level\": %d, \"um\": %g, \"iso\": %d,\n"
                    " \"band\": [%g, %g], \"layer_vox\": %g, \"sign\": %d, \"thr\": %g, \"label_px_per_canvas\": %g, \"crop\": [%d, %d, %d, %d],\n"
-                   " \"label_px\": %llu, \"ink_px\": %llu, \"label_cm2\": %.4f, \"ink_cm2\": %.4f, \"hit_voxels\": %llu, \"ink_voxels\": %llu, \"noink_voxels\": %llu, \"rejected_voxels\": %llu,\n"
+                   " \"label_px\": %llu, \"ink_px\": %llu, \"label_cm2\": %.4f, \"ink_cm2\": %.4f, \"hit_voxels\": %llu, \"ink_voxels\": %llu, \"noink_voxels\": %llu, \"rejected_voxels\": %llu, \"excluded_voxels\": %llu,\n"
                    " %s%s%s\"bbox\": [%lld, %lld, %lld, %lld, %lld, %lld],\n \"origins\": [",
                 name, c->surface, c->labels, c->mask ? c->mask : "", c->ct_root, c->ct_key, c->ct_um, L, um, c->iso, c->band_a, c->band_b, c->layer_vox, (int)G.sign, c->thr, F,
                 c->crop[0], c->crop[1], c->crop[2], c->crop[3], (unsigned long long)nsup, (unsigned long long)nink, nsup * cm2, nink * cm2,
-                (unsigned long long)J.n_hit, (unsigned long long)J.n_ink, (unsigned long long)J.n_no, (unsigned long long)J.n_rej,
-                cmp_json, prof_json[0] ? prof_json : "", prof_json[0] ? ",\n " : "",
+                (unsigned long long)J.n_hit, (unsigned long long)J.n_ink, (unsigned long long)J.n_no, (unsigned long long)J.n_rej, (unsigned long long)J.n_excl,
+                cmp_all, prof_json[0] ? prof_json : "", prof_json[0] ? ",\n " : "",
                 (long long)blo[0], (long long)blo[1], (long long)blo[2], (long long)(bhi[0] - blo[0]), (long long)(bhi[1] - blo[1]), (long long)(bhi[2] - blo[2]));
         /* 1024-blocks (level-0 voxels) holding written voxels */
         const int64_t bs = 1024, cs0 = (int64_t)CH << L; int nb = 0;
@@ -683,7 +786,7 @@ int inksplat_run(const inksplat_cfg *c) {
 out2:
     z3_close(ct0);
 out1:
-    free(G.lab); free(G.msk);
+    free(G.lab); free(G.msk); free(G.face);
 out0:
     if (has_mask) lsrc_close(&LM);
     lsrc_close(&LL); ssurf_free(&S);
@@ -772,8 +875,9 @@ int cmd_ink_splat(int argc, char **argv) {
     if (argc < 3 || ci < 0 || ci + 2 >= argc) {
         fprintf(stderr, "usage: ufsm ink-splat <out-group|-> --surface TIFXYZ --labels L [--mask M] --ct ROOT KEY --ct-um U [--level 0] --iso I\n"
                         "         [--band A,B (layers, -4,4)] [--layer-vox 1] [--flip] [--thr 0.5] [--label-z Z] [--label-scale F] [--label-offset r,c] [--crop c0,r0,w,h]\n"
-                        "         [--merge] [--coarse N] [--name NAME] [--summary JSON] [--preview JPG] [--pyramid-only]\n         ufsm ink-splat <out-group> --points VC3D.json --radius-um 5 --ct ROOT KEY --ct-um U [--level 0] --iso I [--merge]   (3D point labels) [--threads 6] [--cache DIR]\n"
+                        "         [--merge] [--coarse N] [--name NAME] [--summary JSON] [--preview JPG] [--pyramid-only] [--exclude z,y,x,nz,ny,nx (level-0, repeatable)]\n         ufsm ink-splat <out-group> --points VC3D.json --radius-um 5 --ct ROOT KEY --ct-um U [--level 0] --iso I [--merge]   (3D point labels) [--threads 6] [--cache DIR]\n"
                         "         [--pred ROOT KEY [--pred-level L] [--pred-thr 128] [--pred-skip V] [--profile T] [--stride 4]]\n"
+                        "         [--face A,B [--face-search -6,20] [--face-run 3] [--face-gap 2]]   (the band per pixel relative to the open face on +N)\n"
                         "  L / M: a .tif / .png, or a zarr array dir (v3 2-D, v2 3-D at --label-z), local or https; '-' as out: profile only\n");
         return 2;
     }
@@ -789,8 +893,20 @@ int cmd_ink_splat(int argc, char **argv) {
     if (cr && sscanf(cr, "%d,%d,%d,%d", c.crop, c.crop + 1, c.crop + 2, c.crop + 3) != 4) { fprintf(stderr, "ink-splat: --crop c0,r0,w,h\n"); return 2; }
     c.merge = sflag(argc, argv, "--merge"); c.coarse = atoi(sopt(argc, argv, "--coarse", "-1")); c.name = sopt(argc, argv, "--name", nullptr); c.summary = sopt(argc, argv, "--summary", nullptr); c.preview = sopt(argc, argv, "--preview", nullptr);
     c.threads = ufsm_threads(atoi(sopt(argc, argv, "--threads", "0")), 6); c.cache = sopt(argc, argv, "--cache", nullptr);
+    for (int i = 2; i + 1 < argc; i++) {
+        if (strcmp(argv[i], "--exclude")) continue;
+        long long b[6];
+        if (c.nexcl >= 64 || sscanf(argv[i + 1], "%lld,%lld,%lld,%lld,%lld,%lld", b, b + 1, b + 2, b + 3, b + 4, b + 5) != 6) { fprintf(stderr, "ink-splat: --exclude z,y,x,nz,ny,nx (at most 64)\n"); return 2; }
+        for (int d = 0; d < 6; d++) c.excl[c.nexcl][d] = b[d];
+        c.nexcl++;
+    }
     if (pi >= 0) { if (pi + 2 >= argc) { fprintf(stderr, "ink-splat: --pred ROOT KEY\n"); return 2; } c.pred_root = argv[pi + 1]; c.pred_key = argv[pi + 2]; }
     c.pred_level = atoi(sopt(argc, argv, "--pred-level", "-1")); c.pred_thr = atoi(sopt(argc, argv, "--pred-thr", "128")); c.pred_skip = atoi(sopt(argc, argv, "--pred-skip", "-1"));
+    { const char *fa = sopt(argc, argv, "--face", nullptr), *fs = sopt(argc, argv, "--face-search", nullptr);
+      if (fa && (sscanf(fa, "%lf,%lf", &c.face_a, &c.face_b) != 2 || c.face_b < c.face_a)) { fprintf(stderr, "ink-splat: --face A,B (A <= B)\n"); return 2; }
+      if (fs && (sscanf(fs, "%lf,%lf", &c.face_lo, &c.face_hi) != 2 || c.face_lo > -4 || c.face_hi < 8 || c.face_hi - c.face_lo > 250)) { fprintf(stderr, "ink-splat: --face-search LO,HI (LO <= -4, HI >= 8)\n"); return 2; }
+      c.face = fa != nullptr; c.face_run = atoi(sopt(argc, argv, "--face-run", "3")); c.face_gap = atoi(sopt(argc, argv, "--face-gap", "2"));
+      if (c.face && (c.face_run < 1 || c.face_gap < 1)) { fprintf(stderr, "ink-splat: --face-run / --face-gap >= 1\n"); return 2; } }
     c.profile = atoi(sopt(argc, argv, "--profile", "0")); c.stride = atoi(sopt(argc, argv, "--stride", "4"));
     store_global_init();
     if (sflag(argc, argv, "--pyramid-only")) return splat_pyramid_only(&c);
@@ -880,4 +996,47 @@ int cmd_ink_score(int argc, char **argv) {
     }
     free(L); free(M); lsrc_close(&LL); if (msk) lsrc_close(&LM); ssurf_free(&S);
     return rc;
+}
+
+/* ufsm ink-vscore: voxelwise score of a 3-D ink prediction (prob254, 255 unknown) against a 3-D reference (an ink-splat zarr) over a box:
+   at the voxels known in both, AUC (tie-aware, 255-bin ranks), the best F1 over thresholds, F1 / precision / recall at 127 (p 0.5). */
+int cmd_ink_vscore(int argc, char **argv) {
+    const int gi = sidx(argc, argv, "--gt"), pi = sidx(argc, argv, "--pred");
+    const char *bx = sopt(argc, argv, "--box", nullptr), *row = sopt(argc, argv, "--row", nullptr), *cache = sopt(argc, argv, "--cache", nullptr);
+    const int L = atoi(sopt(argc, argv, "--level", "1")), nth = ufsm_threads(atoi(sopt(argc, argv, "--threads", "0")), 8);
+    long long b[6];
+    if (gi < 0 || pi < 0 || gi + 2 >= argc || pi + 2 >= argc || !bx || sscanf(bx, "%lld,%lld,%lld,%lld,%lld,%lld", b, b + 1, b + 2, b + 3, b + 4, b + 5) != 6 || L < 0 || L > 6) {
+        fprintf(stderr, "usage: ufsm ink-vscore --gt ROOT KEY --pred ROOT KEY --box z,y,x,nz,ny,nx (level-0) [--level 1] [--row TAG] [--threads 8] [--cache DIR]\n"
+                        "  voxelwise AUC / best F1 / F1 at 0.5 of a prob254 prediction vs a prob254 reference at the voxels known in both (the box on level L)\n"); return 2;
+    }
+    store *gs = store_open(argv[gi + 1]), *ps = store_open(argv[pi + 1]);
+    z3 *g = gs ? z3_open(gs, argv[gi + 2], cache) : nullptr, *p = ps ? z3_open(ps, argv[pi + 2], cache) : nullptr;
+    if (!g || !p) { fprintf(stderr, "ink-vscore: cannot open %s: %s\n", !g ? "--gt" : "--pred", z3_error()); return 1; }
+    int64_t o[3], n[3]; size_t nv = 1;
+    for (int d = 0; d < 3; d++) {
+        const int64_t s = z3_meta_of(g)->shape[d] < z3_meta_of(p)->shape[d] ? z3_meta_of(g)->shape[d] : z3_meta_of(p)->shape[d];
+        o[d] = b[d] >> L; int64_t e = (b[d] + b[d + 3] + (1 << L) - 1) >> L; if (e > s) e = s; if (o[d] < 0) o[d] = 0;
+        n[d] = e - o[d]; if (n[d] <= 0) { fprintf(stderr, "ink-vscore: box outside the arrays\n"); return 1; } nv *= (size_t)n[d];
+    }
+    uint8_t *A = malloc(nv), *B = malloc(nv);
+    if (!A || !B || z3_read(g, o, n, A, nth) || z3_read(p, o, n, B, nth)) { fprintf(stderr, "ink-vscore: read failed: %s\n", z3_error()); return 1; }
+    double h[2][255] = {{0}}; uint64_t ngt = 0;
+    for (size_t k = 0; k < nv; k++) { if (A[k] == 255) continue; ngt++; if (B[k] == 255) continue; h[A[k] >= 127][B[k]]++; }
+    double P = 0, N = 0; for (int v = 0; v < 255; v++) { P += h[1][v]; N += h[0][v]; }
+    double auc = 0, below = 0; for (int v = 0; v < 255; v++) { auc += h[1][v] * (below + 0.5 * h[0][v]); below += h[0][v]; }
+    auc = P > 0 && N > 0 ? auc / (P * N) : NAN;
+    double best = 0; int bt = 0, f5i = 0; double f05 = 0, p05 = 0, r05 = 0, tp = P, fp = N;   /* predicted ink = value >= t */
+    for (int t = 0; t < 255; t++) {
+        const double f1 = tp + fp + P > 0 ? 2 * tp / (tp + fp + P) : 0;
+        if (f1 > best) { best = f1; bt = t; }
+        if (t == 127) { f05 = f1; p05 = tp + fp > 0 ? tp / (tp + fp) : 0; r05 = P > 0 ? tp / P : 0; f5i = 1; }
+        tp -= h[1][t]; fp -= h[0][t];
+    }
+    (void)f5i;
+    printf("%s\t%.0f\t%.0f\t%.4f\t%.4f\t%.4f\t%d\t%.4f\t%.4f\t%.4f\t%.4f\n", row ? row : "-", P, N, P + N > 0 ? (P + N) / ngt : 0, P / fmax(1, P + N), auc, bt, best, f05, p05, r05);
+    fprintf(stderr, "ink-vscore: %s: box %lld,%lld,%lld +%lld,%lld,%lld on level %d: %.0f ink + %.0f no-ink known in both (%.1f%% of the %llu reference voxels): AUC %.4f, best F1 %.4f at >= %d, "
+                    "F1 / P / R at 0.5 %.4f / %.4f / %.4f\n", row ? row : "-", (long long)o[0], (long long)o[1], (long long)o[2], (long long)n[0], (long long)n[1], (long long)n[2], L, P, N,
+            ngt ? 100.0 * (P + N) / ngt : 0, (unsigned long long)ngt, auc, best, bt, f05, p05, r05);
+    free(A); free(B); z3_close(g); z3_close(p); store_close(gs); store_close(ps);
+    return 0;
 }
