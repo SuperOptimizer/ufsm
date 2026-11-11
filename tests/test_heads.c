@@ -177,6 +177,20 @@ int main(int argc, char **argv) {
         CHECK(!sh("head -1 %s/uw/last.ckpt | grep -q '\"uw\":{\"t\":4,'", d), "uw: header t 4");
         CHECK(!sh("UFSM_GRAD_MX8=1 %s train %s/fx/sources-ink.json --out %s/uw --resume %s/uw/last.ckpt %s %s --steps 6 > %s/uw2.log 2>&1 && grep -q '(resumed)' %s/uw2.log && head -1 %s/uw/last.ckpt | grep -q '\"uw\":{\"t\":6,'", U, d, d, d, cm, uf, d, d, d), "uw resume (%s/uw2.log)", d);
     }
+    /* (7) --fstem 16 (latent, all heads): the stem's projection starts at zero, so step 1 logs the stem-less run's losses; the header names
+       "fstem":[16,7]; a resume continues; a resume without --fstem is refused; predict --channel rv runs on it */
+    if (!wr) {
+        const char *ff = "--lat 4 --lat-guide 3 --rv 2 --rv-iso 100 --ink-head 1";
+        CHECK(!sh("UFSM_GRAD_MX8=1 %s train %s/fx/sources-ink.json --out %s/fs0 %s %s > %s/fs0.log 2>&1 && UFSM_GRAD_MX8=1 %s train %s/fx/sources-ink.json --out %s/fs1 %s %s --fstem 16 > %s/fs1.log 2>&1",
+                  U, d, d, common, ff, d, U, d, d, common, ff, d), "fstem runs (%s/fs0.log, fs1.log)", d);
+        CHECK(!sh("[ \"$(grep '^step      1 ' %s/fs0.log | sed 's/ gn .*//')\" = \"$(grep '^step      1 ' %s/fs1.log | sed 's/ gn .*//')\" ] && grep -q 'fine stem: 16' %s/fs1.log", d, d, d),
+              "fstem: step 1 losses differ from the stem-less run's");   /* (the gradient norm counts the stem's own gradients) */
+        CHECK(!sh("head -1 %s/fs1/last.ckpt | grep -q '\"fstem\":\\[16,7\\]'", d), "fstem: header");
+        char cm[2048]; snprintf(cm, sizeof cm, "%s", common); { char *ls = strstr(cm, " --steps 4"); if (ls) memmove(ls, ls + 10, strlen(ls + 10) + 1); }
+        CHECK(!sh("UFSM_GRAD_MX8=1 %s train %s/fx/sources-ink.json --out %s/fs1 --resume %s/fs1/last.ckpt %s %s --fstem 16 --steps 6 > %s/fs2.log 2>&1 && grep -q 'step      6 ' %s/fs2.log", U, d, d, d, cm, ff, d, d), "fstem resume (%s/fs2.log)", d);
+        CHECK(sh("%s train %s/fx/sources-ink.json --out %s/fs1 --resume %s/fs1/last.ckpt %s %s --steps 8 > %s/fs3.log 2>&1", U, d, d, d, cm, ff, d) != 0, "fstem: a resume without --fstem accepted");
+        CHECK(!sh("%s predict %s/fs1/last.ckpt %s/fx ct %s/pfs --channel rv --um 9.6 --level 0 --window 160 --halo 16 --shard 128 --levels 1 --threads 2 --q 0 > %s/pfs.log 2>&1", U, d, d, d, d), "fstem: predict (%s/pfs.log)", d);
+    }
     if (!fails) sh("rm -rf %s", d);
     if (fails) { fprintf(stderr, "test_heads: %d FAILED (kept %s)\n", fails, d); return 1; }
     printf("test_heads: ok\n");

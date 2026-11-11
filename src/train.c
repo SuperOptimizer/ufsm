@@ -91,7 +91,7 @@ typedef struct {
     double *fibacc; void *fiblist; unsigned *fibnl; size_t fibcap; double fib_h[2];   /* --fib-normal-lambda: valid voxels / sum t^T N t (device), the slab list, the fetched sums */
     uint8_t *auxb[3][2], *aux[3], *inkt, *inkm, *inkw;   /* the aux planes (double-buffered; plane j = role g_aux_role[j]); --ink-head: its slab target / mask, weight byte (loss parts: iscratch / iout / ink_loss) */
     uint8_t *rvt, *rvm; float *rvscratch, rvout[5]; double rv_loss;
-    double *gcS; int gc_on;   /* --grad-cos: the step's logit-gradient Gram (device, K x K upper triangle), whether this step collects it */   /* --rv: the slab's recto / verso targets and mask; --rv 2 (own channels): its loss scratch and parts */
+    double *gcS; int gc_on, fs_drop;   /* fs_drop: this training step runs without the fine stem (--fstem-drop) */   /* --grad-cos: the step's logit-gradient Gram (device, K x K upper triangle), whether this step collects it */   /* --rv: the slab's recto / verso targets and mask; --rv 2 (own channels): its loss scratch and parts */
     uint8_t *wdb[2], *wd, *ct4, *cm4, *cw4; float *cscratch, cout4[9]; double cond_loss;   /* --cond: the gauge-shifted winding per voxel, its 4 targets, mask, weights; scratch and parts */
     unsigned long long *cacc, cacc_h[2];   /* --cond: known / right-turn voxel counts of the 14-turn head (device, last batch on the host) */
     uint8_t *papb[2], *pap, *pt1, *pmk1, *pw1; float *pscr, pout3[3]; double pap_loss;   /* --pap-head: labels (double-buffered), target, mask, weight; scratch, parts */
@@ -208,6 +208,11 @@ static void uw_extra(char *dst, size_t n, const char *base) {   /* the checkpoin
    head W (cout x C, 1^3), the dot of tasks a and b summed over the cells is sum_{i in a, j in b} (W W^T)_ij S_ij, S the Gram of the logit
    gradient planes over the cells (nn_gram16 per head slab, inside the one backward of the step) */
 static int g_gc;
+/* A6 --fstem C (latent grid, --lat-guide 3): the fine voxel stem (nn_fstem_fwd) on the CT channel at stride 2 (19.2 um features at 9.6 um voxels,
+   the 38.4 um cells' missing resolution, DESIGN latbeat), its projection added to every head output the slabs hold as voxel logits (all but
+   the fused normal / density group); --fstem-drop P: a training window without it (level dropout: the net keeps working without the fine
+   level, as for scans with no finer data; validation and predict always use it) */
+static int g_fstem, g_fs_n, g_fs_ch[16]; static float g_fs_drop = 0.25f;
 static float src_head_w(int si, int h) { return (si >= 0 && g_S && si < g_S->n ? g_S->src[si].head_w[h] : 1.f) * g_hmul[h]; }   /* the source's "heads" multiplier x --uw */
 static int g_unwrap, g_norm_ch, g_norm_s = 4; static float g_ink_lambda = 1.f, g_ink_dice = 0.f, g_norm_lambda = 1.f, g_dens_lambda = 1.f, g_dens_scale = 32.f;   /* --density-lambda: the density channel's BCE weight (default --normal-lambda) */
 static int g_dens_code; static float g_packed_w, g_packed_um = 120.f;   /* --density-code, --packed-weight, --packed-um (task unwrap) */
@@ -988,6 +993,7 @@ static void head_slab_pass(gpu_state *d, int pass) {
         else if (g_lat && g_lat_guide == 64) nn_lat_shuffle(d->lg, unet_logits_h16(d->u), D / 4, H / 4, W / 4, 16, 2, z0, nz, (char *)d->hs_lg + (size_t)g_side_ch * ns * 2);   /* the sub-cell head */
         else if (g_lat && g_lat_guide && !fside) LGUIDE(0);   /* --lat-guide: the side channels' sub-cell terms from the CT */
         if (g_lat_hs) { FT("  u guide / shuffle"); PT("upsample"); }
+        if (g_fstem && !d->fs_drop && nn_fstem_fwd(d->x, D, H, W, z0, nz, unet_live_params(d->u) + unet_fstem_off(d->u), g_fstem, g_fs_n, g_fs_ch, d->hs_lg, ns)) { fprintf(stderr, "--fstem: slab shape\n"); abort(); }
         const shape5 one = {1, 1, nz, H, W}, two = {1, 2, nz, H, W}, seven = {1, 7, nz, H, W};
         nn_phase_targets(sdb + vb, ns, d->sidet, d->sidem); FT("  t phase targets");
         if (g_rv) {   /* --rv: the side slot's targets (the phase targets above stay for the winding mod 4 / gradient terms) */
@@ -1080,6 +1086,7 @@ static void head_slab_pass(gpu_state *d, int pass) {
                              slab) through the head's backward; the last two carried to the front for the next slab */
             const size_t pl = (size_t)(H / 4) * (W / 4); const int f0 = qa, f1 = z1 == D ? D / 4 : z1 / 4 - 1;
             if (z0 == 0) nn_zero(d->latg, (size_t)LGFC * qc * pl * 4);
+            if (g_fstem && !d->fs_drop) nn_fstem_bwd(d->x, D, H, W, z0, nz, unet_live_params(d->u) + unet_fstem_off(d->u), g_fstem, g_fs_n, g_fs_ch, d->hs_lg, ns, unet_grad_ptr(d->u) + unet_fstem_off(d->u));   /* (before the adjoints reuse the planes) */
             if (g_lat_guide == 64) nn_lat_shuffle_adj_c((char *)d->hs_lg + (size_t)g_side_ch * ns * 2, D / 4, H / 4, W / 4, 16, 2, z0, nz, d->latgl, q0, qc);
             else if (g_lat_guide && !fside) LGUIDE(1);
             FT("  a guide / shuffle adjoint");   /* the coefficient planes' gradients (the guided heads: every output is interpolated, all through the fp32 sums) */
@@ -1112,7 +1119,7 @@ static void head_slab_pass(gpu_state *d, int pass) {
         if (g_lat && g_lat_guide == 64) nn_lat_shuffle_adj((char *)d->hs_lg + (size_t)g_side_ch * ns * 2, D / 4, H / 4, W / 4, 16, 2, z0, nz, d->latgl);
         else if (g_lat && g_lat_guide) LGUIDE(1);   /* the coefficient planes' gradients */
         if (g_lat) nn_lat_up_adj(d->hs_lg, LUPC, D / 4, H / 4, W / 4, z0, nz, d->latg, d->nt);   /* (scratch: the normal targets, 7 bytes a voxel, are done for this slab; any channel count: groups of 28) */   /* --lat: the slab's gradient onto the cell grid */
-        else { if (d->gc_on) nn_gram16(d->hs_lg, 0, g_cout, ns, ns, d->gcS);
+        else { if (d->gc_on) nn_gram16(d->hs_lg, !nn_get_f16(), g_cout, ns, ns, d->gcS);
                if (unet_head_bwd_z(d->u, z0, z1, d->hs_lg, z0 == 0)) { fprintf(stderr, "head slabs: the fused head backward is not covered (UFSM_HEAD_SLAB=0)\n"); abort(); } }
         if (lchk) {   /* UFSM_LAT_CHECK=1: the separable adjoint against the per-voxel gather (the slab's gradient is still in hs_lg) */
             static float *gc2; const size_t nc = (size_t)LNC * (D / 4) * (H / 4) * (W / 4);   /* (every cell channel: the guided heads have more than the task's) */
@@ -2514,6 +2521,15 @@ int cmd_train(int argc, char **argv) {
     size_t p3 = (size_t)g_Pz * P * P, p3l = split ? (size_t)P * P * g_Dl : p3;   /* per-GPU voxels of a window */
     gpu_state G[8];
     int step0 = 0;
+    g_fstem = atoi(opt(argc, argv, "--fstem", "0")); g_fs_drop = (float)atof(opt(argc, argv, "--fstem-drop", "0.25"));
+    if (g_fstem) {
+        if (g_fstem < 1 || g_fstem > 16 || !(g_fs_drop >= 0 && g_fs_drop < 1) || !g_lat || g_lat_guide != 64 || !g_unwrap2 || B != 1) { fprintf(stderr, "--fstem 1..16 (--fstem-drop 0..1): task unwrap2, --lat 4 --lat-guide 3, --B 1\n"); return 2; }
+        g_fs_n = 0; for (int c = 0; c < g_cout; c++) if (c < g_norm_ch || c >= g_norm_ch + 7) g_fs_ch[g_fs_n++] = c;   /* (every voxel-logit output: not the fused normal / density) */
+        if (g_fs_n > 16) { fprintf(stderr, "--fstem: %d outputs (16 at most)\n", g_fs_n); return 2; }
+        cfg.fstem = g_fstem; cfg.fstem_out = g_fs_n;
+        fprintf(stderr, "fine stem: %d silu features of 4^3 voxels at stride 2 into %d head outputs, dropped on %.0f%% of the training windows\n", g_fstem, g_fs_n, 100 * g_fs_drop);
+    }
+    if (resume) { unet_cfg pc; int st; if (!unet_peek(resume, &pc, &st) && (pc.fstem != cfg.fstem || pc.fstem_out != cfg.fstem_out)) { fprintf(stderr, "--resume: the checkpoint's fine stem is %d / %d, the flags ask %d / %d (--fstem)\n", pc.fstem, pc.fstem_out, cfg.fstem, cfg.fstem_out); return 2; } }
     for (int g = 0; g < ng; g++) {
         gpu_state *d = &G[g];
         d->dev = devs[g]; d->side = split ? g : -1;
@@ -2645,6 +2661,7 @@ int cmd_train(int argc, char **argv) {
                     
                      && (!getenv("UFSM_LAT_FUSE") || ufsm_env_on("UFSM_LAT_FUSE"));
         for (int g = 0; g < ng; g++) unet_set_head_ext(G[g].u, g_head_slab && (!g_lat || g_lat_hs));
+        if (g_fstem && !g_lat_hs) { fprintf(stderr, "--fstem: the latent head stream (head slabs of a multiple of 4 planes; not UFSM_LAT_CHECK / UFSM_LAT_HEAD_STREAM=0)\n"); return 2; }
         if (g_pg_lambda > 0 && !g_head_slab) { fprintf(stderr, "--pgrad-lambda needs the head-slab loss path (task unwrap2, B 1, no --split / --verso)\n"); return 2; }
         if (g_valP == P && !getenv("UFSM_VALP_FORCE")) g_valP = 0;   /* (UFSM_VALP_FORCE=1: the separate validation network at the training size, a test) */
         if (g_valP) {   /* --val-P: the plain recto-style losses on whole cube windows; validation on GPU 0 */
@@ -3422,6 +3439,8 @@ int cmd_train(int argc, char **argv) {
             if (sparse_at && step >= sparse_at && !unet_get_sparse24(d->u)) { unet_set_sparse24(d->u, 1); if (g == 0) fprintf(stderr, "step %d: 2:4 sparsity on (SR-STE lambda %g)\n", step, srste); }
             unet_zero_grad(d->u);
             d->last = d->cur;
+            if (g_fstem) { uint64_t h = (uint64_t)step * 0xD1B54A32D192ED03ull + (uint64_t)seed * 31 + (uint64_t)g; h ^= h >> 31; h *= 0xBF58476D1CE4E5B9ull; h ^= h >> 29;
+                           d->fs_drop = (double)(h >> 11) * 0x1p-53 < g_fs_drop; }   /* (--fstem-drop: per GPU and step; reset after the backward) */
             d->gc_on = g_gc && d->gcS && g == 0 && step % g_gc == 0; if (d->gc_on) nn_zero(d->gcS, (size_t)cfg.cout * cfg.cout * sizeof(double));   /* --grad-cos: this step's Gram */
             test_nan_inject(d, step, 0, P);   /* tests: UFSM_TEST_NAN */
             restore_train_recipe(d, step, g), run_batch(d, B, P, dice_w, 1);
@@ -3431,6 +3450,7 @@ int cmd_train(int argc, char **argv) {
             test_nan_inject(d, step, 2, P);
             if (sync_check(d, step, "backward")) return 1;
             diag_nonfinite(d, "parameter gradients", unet_grad_ptr(d->u), unet_nparams(d->u), 0);
+            d->fs_drop = 0;   /* (validation: with the stem) */
             nn_event_record(d->ev_done[d->cur], 0);
             nn_event_sync(d->ev_up[d->cur]);                 /* host buffer of this batch is free again */
             if (overfit || g_bench_same) continue;           /* keep computing on the same device buffer (UFSM_BENCH_SAME: GPU step time without the loader) */

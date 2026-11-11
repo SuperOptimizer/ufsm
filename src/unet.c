@@ -109,7 +109,7 @@ struct unet {
     int l0rx; const void *l0x_ct; int l0x_held[16];   /* the network input in a ring (--gpu-input: rebuilt per slab from the CT channel); slot -> slab */
     void *l0r_hsk; size_t l0r_hskn;    /* the skip gradient's pinned host copy (stage S4's host mode: the device holds a ring) */
     size_t sc_w; float sc_c; float *stem_b;   /* scale_cond: offset of the conditioning vector, current scale code, effective stem bias */
-    size_t film_off; float film_c[4]; float *ffw;   /* cfg.film: the first A / D pair, the current codes, the forward copy of the weights (when nothing else copies them) */
+    size_t film_off, fstem_off; float film_c[4]; float *ffw;   /* cfg.film: the first A / D pair, the current codes, the forward copy of the weights (when nothing else copies them) */
     block enc[UNET_MAXLEV], dec[UNET_MAXLEV];
     convp down[UNET_MAXLEV], head;
     gnp dn[UNET_MAXLEV];          /* down_norm: GroupNorm after down[i] */
@@ -316,6 +316,7 @@ static void film_bwd(unet *u, float *g) {
     size_t fo = u->film_off; const int K = u->cfg.film;
     for (int j = 0; j < 2 * u->cfg.nlev - 1; j++) { const gnp *n = film_norm(u, j); nn_film_bwd(u->live, g, n->gamma, n->beta, fo, n->c, K, u->film_c); fo += (size_t)2 * K * n->c; }
 }
+size_t unet_fstem_off(const unet *u) { return u->fstem_off; }
 void unet_set_film(unet *u, const float *codes, int k) { for (int i = 0; i < 4; i++) u->film_c[i] = i < k && codes ? codes[i] : 0.f; }
 unet *unet_create(const unet_cfg *cfg) {
     unet *u = calloc(1, sizeof *u);
@@ -386,6 +387,8 @@ unet *unet_create(const unet_cfg *cfg) {
     if (cfg->emb_lev) off = add_conv(u, &u->eh, dw_of(cfg, cfg->emb_lev), cfg->emb_ch, 1, 1, off);   /* (params last: older layouts unchanged) */
     if (cfg->film < 0 || cfg->film > 4) { fprintf(stderr, "unet: film takes 0..4 codes\n"); abort(); }
     if (cfg->film) { u->film_off = off; for (int j = 0; j < 2 * L - 1; j++) off += (size_t)2 * cfg->film * film_norm(u, j)->c; }   /* (params last: older layouts unchanged) */
+    if (cfg->fstem < 0 || cfg->fstem > 16 || (cfg->fstem && (cfg->fstem_out < 1 || cfg->fstem_out > 16))) { fprintf(stderr, "unet: fstem takes 1..16 channels and 1..16 outputs\n"); abort(); }
+    if (cfg->fstem) { u->fstem_off = off; off += (size_t)cfg->fstem * 64 + cfg->fstem + (size_t)cfg->fstem_out * cfg->fstem; }   /* (after film: last) */
     u->np = off;
     if (ufsm_env_on("UFSM_DEBUG")) {
         for (int i = 0; i < L; i++) fprintf(stderr, "enc%d c1.w %zu c1.b %zu n1 %zu c2.w %zu c2.b %zu n2 %zu\n", i, u->enc[i].c1.w, u->enc[i].c1.b, u->enc[i].n1.gamma, u->enc[i].c2.w, u->enc[i].c2.b, u->enc[i].n2.gamma);
@@ -504,6 +507,7 @@ void unet_init(unet *u, uint64_t seed) {
             for (int i = 0; i < C; i++) h[u->view_b + i] = 0.f;
         }
     }
+    if (u->cfg.fstem) { const double sd = sqrt(2.0 / 64); for (size_t i = 0; i < (size_t)u->cfg.fstem * 64; i++) h[u->fstem_off + i] = (float)(sd * gauss(&seed)); }   /* (b1, W2 0) */
     nn_h2d(u->p, h, u->np * 4);
     nn_d2d(u->ema, u->p, u->np * 4);
     nn_zero(u->m, u->np * 4); nn_zero(u->v, u->np * 4);
@@ -4346,6 +4350,7 @@ int unet_save(const unet *u, const char *path, int step, const char *extra) {
     if (u->cfg.ds_levels) fprintf(f, ",\"ds_levels\":%d", u->cfg.ds_levels);
     if (u->cfg.emb_lev) fprintf(f, ",\"emb_lev\":%d,\"emb_ch\":%d", u->cfg.emb_lev, u->cfg.emb_ch);
     if (u->cfg.film) fprintf(f, ",\"film\":%d", u->cfg.film);
+    if (u->cfg.fstem) fprintf(f, ",\"fstem\":[%d,%d]", u->cfg.fstem, u->cfg.fstem_out);
     if (u->cfg.attn_blocks) fprintf(f,",\"attn_blocks\":%d,\"attn_pe\":%d,\"attn_reg\":%d,\"attn_mlp\":%d", u->cfg.attn_blocks, u->cfg.attn_pe, u->cfg.attn_reg, u->tbd.F);
     if (u->cfg.attn_vres) fprintf(f, ",\"attn_vres\":%d", u->cfg.attn_vres);
     if (u->cfg.attn_blocks && u->cfg.attn_axis) fprintf(f, ",\"attn_axis\":%d", u->cfg.attn_axis);
@@ -4411,6 +4416,7 @@ static int read_header(FILE *f, unet_cfg *cfg, int *step, size_t *np) {
     cfg->emb_lev = (p = strstr(line, "\"emb_lev\":")) ? atoi(p + 10) : 0;
     cfg->emb_ch = (p = strstr(line, "\"emb_ch\":")) ? atoi(p + 9) : 0;
     cfg->film = (p = strstr(line, "\"film\":")) ? atoi(p + 7) : 0;
+    cfg->fstem = cfg->fstem_out = 0; if ((p = strstr(line, "\"fstem\":["))) { cfg->fstem = atoi(p + 9); const char *q = strchr(p + 9, ','); cfg->fstem_out = q ? atoi(q + 1) : 0; }
     if ((p = strstr(line, "\"attn_blocks\":"))) cfg->attn_blocks = atoi(p + 14);
     if ((p = strstr(line, "\"attn_pe\":"))) cfg->attn_pe = atoi(p + 10);
     if ((p = strstr(line, "\"attn_reg\":"))) cfg->attn_reg = atoi(p + 11);
@@ -4632,10 +4638,14 @@ int unet_init_from_map(unet *u, const char *path, const int *head_rows) {
         }
         n++;
     } else { unet_free(o); return -1; }
-    if (!S && u->cfg.film && oc.film == u->cfg.film && u->film_off && o->np - o->film_off == u->np - u->film_off) {   /* the donor's FiLM pairs (same widths) */
-        const size_t nf = u->np - u->film_off;   /* (film is the last parameter block of both) */
+    const size_t nfu = (u->fstem_off ? u->fstem_off : u->np) - u->film_off, nfo = (o->fstem_off ? o->fstem_off : o->np) - o->film_off;   /* (the FiLM block: before the stem) */
+    if (!S && u->cfg.film && oc.film == u->cfg.film && u->film_off && nfo == nfu) {   /* the donor's FiLM pairs (same widths) */
+        const size_t nf = nfu;
         int same = 1; for (int j = 0; j < 2 * L - 1; j++) same &= film_norm(u, j)->c == film_norm(o, j)->c;
         if (same) { nn_d2d(u->p + u->film_off, o->p + o->film_off, nf * 4); nn_d2d(u->ema + u->film_off, o->ema + o->film_off, nf * 4); inh_add(u, u->film_off, nf); n++; }
+    }
+    if (!S && u->cfg.fstem && oc.fstem == u->cfg.fstem && oc.fstem_out == u->cfg.fstem_out) {   /* the donor's stem */
+        const size_t nf = u->np - u->fstem_off; nn_d2d(u->p + u->fstem_off, o->p + o->fstem_off, nf * 4); nn_d2d(u->ema + u->fstem_off, o->ema + o->fstem_off, nf * 4); inh_add(u, u->fstem_off, nf); n++;
     }
     if (!S && u->cfg.scale_cond && oc.scale_cond && u->enc[0].c1.cout == o->enc[0].c1.cout) {
         nn_d2d(u->p + u->sc_w, o->p + o->sc_w, (size_t)u->enc[0].c1.cout * 4); nn_d2d(u->ema + u->sc_w, o->ema + o->sc_w, (size_t)u->enc[0].c1.cout * 4); n++;

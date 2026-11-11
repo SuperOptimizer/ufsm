@@ -386,6 +386,11 @@ void nn_film_fwd(const float *p, float *fw, size_t gam, size_t bet, size_t fo, i
 void nn_film_bwd(const float *p, float *g, size_t gam, size_t bet, size_t fo, int C, int K, const float *codes);
 /* the Gram of K planes of 16-bit values (bf16 1, else fp16) with row stride ld over N entries: S[i K + j] += sum_n x_i x_j for j >= i (src/nn_gram.cu; train --grad-cos) */
 void nn_gram16(const void *x, int bf16, int K, size_t N, size_t ld, double *S);
+/* the fine voxel stem (src/nn_fstem.cu, train --fstem): params W1 [C][64] (4^3 taps at stride 2), b1 [C], W2 [nout][C]; fwd adds W2 silu(W1 x + b1)
+   to the fp16 logit planes chs[o] (slab planes [z0, z0 + nz) of a D x H x W window, ns voxels a plane) on each 2^3 block; bwd accumulates the
+   parameter gradients from fp16 gradient planes of that layout into gp. 1: a shape the kernels do not take (odd sizes, C or nout > 16) */
+int nn_fstem_fwd(const void *x, int D, int H, int W, int z0, int nz, const float *p, int C, int nout, const int *chs, void *lg, size_t ns);
+int nn_fstem_bwd(const void *x, int D, int H, int W, int z0, int nz, const float *p, int C, int nout, const int *chs, const void *g, size_t ns, float *gp);
 void nn_scale(float *y, float a, size_t n);
 void nn_u8_to_f32(const uint8_t *x, size_t n, float scale, float *y);
 

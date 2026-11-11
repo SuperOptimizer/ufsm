@@ -29,6 +29,7 @@ test_gyrec                                     | gpu2         |     1 | ./$B/tes
 test_unwrap2_sampler                           | gpu          |     9 | ./$B/test_unwrap2_sampler $TMPDIR/unwrap2_fixture
 test_rungs                                     | gpu          |     3 | ./$B/test_rungs $TMPDIR/rungs_fixture
 test_gram                                      | gpu          |     2 | ./$B/test_gram
+test_fstem                                     | gpu          |     3 | ./$B/test_fstem
 test_restore_task                              | gpu          |     7 | ./$B/test_restore_task
 test_phase_interp                              |              |    20 | ./$B/test_phase_interp
 test_spatial_augment                           |              |    60 | UFSM_TEST_QUICK=1 ./$B/test_spatial_augment
@@ -84,7 +85,7 @@ test_predict_unwrap2                           | gpu          |     5 | ./$B/tes
 test_unwrap2_ink                               | gpu          |    40 | ./$B/test_unwrap2_ink ./$B/ufsm ./$B/make_wind_fixture
 test_cuda_abort                                | gpu          |    25 | bash tests/test_cuda_abort.sh ./$B/ufsm ./$B/make_wind_fixture
 test_rv                                        | gpu          |    30 | ./$B/test_rv ./$B/ufsm ./$B/make_wind_fixture
-test_heads                                     | gpu          |    90 | ./$B/test_heads ./$B/ufsm ./$B/make_wind_fixture tests/heads_ref.txt
+test_heads                                     | gpu          |   120 | ./$B/test_heads ./$B/ufsm ./$B/make_wind_fixture tests/heads_ref.txt
 test_score_par                                 |              |     8 | ./$B/test_score_par ./$B/ufsm
 test_grid_sparse                               | gpu          |     2 | ./$B/test_grid_sparse
 test_density_lambda                            | gpu          |    40 | ./$B/test_density_lambda ./$B/ufsm ./$B/make_wind_fixture
