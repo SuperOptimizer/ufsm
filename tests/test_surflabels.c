@@ -188,6 +188,22 @@ int main(void) {
                 CHECK(wb && !bad && pos > 1000, "phase-coh --box-scale is not the weight x the box factor");
                 free(wb);
             }
+            {   /* --papyrus T --pap-dilate 1 --phase-out 1: against a brute-force mask (CT < T with no CT >= T in the 3^3 cube about it) */
+                char pp[600]; snprintf(pp, sizeof pp, "%s/pcp", od); const int T = 140;
+                char *cp[] = {"ufsm", "phase-coh", pr, "9.6", ct, "0", pp, "--weight", "0.3,0.6", "--cell", "16", "--papyrus", "140", "--pap-dilate", "1", "--phase-out", "1", "--threads", "3"};
+                CHECK(!cmd_phase_coh((int)(sizeof cp / sizeof *cp), cp), "phase-coh --papyrus failed");
+                snprintf(r, sizeof r, "%s/pcp/weight.zarr", od); uint8_t *wp = readall(r, "9.6"); snprintf(r, sizeof r, "%s/pcp/phase.zarr", od); uint8_t *pq = readall(r, "9.6");
+                snprintf(r, sizeof r, "%s", ct); uint8_t *cv0 = readall(r, "0"); long bad = 0, air = 0, kept = 0;
+                for (int z = 0; wp && pq && cv0 && z < NZ; z++) for (int y = 0; y < NY; y++) for (int x = 0; x < NX; x++) {
+                    const size_t i = ((size_t)z * NY + y) * NX + x; if (ph[i] == PHASE_UNKNOWN) { bad += pq[i] != PHASE_UNKNOWN || wp[i]; continue; }
+                    int pap = 0; for (int dz = -1; dz <= 1 && !pap; dz++) for (int dy = -1; dy <= 1 && !pap; dy++) for (int dx = -1; dx <= 1 && !pap; dx++) {
+                        const int zz = z + dz, yy = y + dy, xx = x + dx; if (zz < 0 || yy < 0 || xx < 0 || zz >= NZ || yy >= NY || xx >= NX) continue;
+                        pap = cv0[((size_t)zz * NY + yy) * NX + xx] >= T; }
+                    if (pap) { kept++; bad += pq[i] != ph[i] || abs((int)wp[i] - (int)w2[i]) > 1; } else { air++; bad += pq[i] != PHASE_UNKNOWN || wp[i]; } }
+                printf("test_surflabels: phase-coh --papyrus %d dilate 1: %ld known voxels masked as air, %ld kept, %ld voxels off the brute-force mask\n", T, air, kept, bad);
+                CHECK(wp && pq && cv0 && !bad && air > 1000 && kept > 1000, "phase-coh --papyrus is not the dilated CT threshold mask");
+                free(wp); free(pq); free(cv0);
+            }
             free(w2);
         }
         free(wt);
