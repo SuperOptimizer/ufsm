@@ -12,13 +12,14 @@ S = [  # name, CT root, CT key, um, level, axis, label dir, metres
     ("PHerc1447-fib2", CTL, "PHerc1447/volumes/20250521151220-8.640um-1.2m-116keV-masked.zarr", 8.64, 0, "axis-1447.json", f"{L2}/PHerc1447", 5065),
     ("PHerc0175A-fib2", CTL, "PHerc0175A/volumes/20250521115057-8.640um-1.2m-116keV-masked.zarr", 8.64, 0, "axis-0175A.json", f"{L2}/PHerc0175A", 3915),
     ("PHercParis4-fib3", CTM, "PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr", 2.4, 2, "axis-p4.json", f"{L3}/PHercParis4-l2", 3528),
+    ("PHercParis4-spiral", CTM, "PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr", 2.4, 2, "axis-p4.json", f"{L3}/PHercParis4-spiral", 3332),
     ("PHerc0125-fib3", CTM, "PHerc0125/volumes/20250821151825-9.362um-1.2m-113keV-masked.zarr", 9.362, 0, "axis-0125.json", f"{L3}/PHerc0125", 197),
     ("PHerc0139-hf", CTM, "PHerc0139/volumes/20260102150214-2.399um-0.2m-78keV-masked.zarr", 2.399, 2, "axis-0139.json", f"{L3}/hf-PHerc0139", 30.65),
     ("PHercParis4-hf", CTM, "PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr", 2.4, 2, "axis-p4.json", f"{L3}/hf-PHercParis4", 12.92),
     ("PHerc1451-hf", CTM, "PHerc1451/volumes/20260319101107-2.399um-0.2m-78keV-masked.zarr", 2.399, 2, "axis-1451.json", f"{L3}/hf-PHerc1451", 7.17),
     ("PHerc0332-hf", CTM, "PHerc0332/volumes/20251211183505-2.399um-0.2m-78keV-masked.zarr", 2.399, 2, "axis-0332.json", f"{L3}/hf-PHerc0332", 2.48),
 ]
-S = [s for s in S if os.path.exists(f"{s[6]}/done") or os.path.isdir(f"{s[6]}/H")]
+S = [s for s in S if os.path.exists(f"{s[6]}/done")]   # only finished rasters (a later resume picks up new ones)
 fl = {s[0]: (FLOOR / 2 if s[7] < 5 else FLOOR) for s in S}
 tot = sum(s[7] for s in S); w = {s[0]: s[7] / tot for s in S}
 low = {k for k in w if w[k] < fl[k]}; rest = 1 - sum(fl[k] for k in low); big = sum(w[k] for k in w if k not in low)
