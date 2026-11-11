@@ -146,6 +146,10 @@ void unet_set_muon_ext(unet *u, int muonc, int hyperball, float hb_mult);
 /* learning-rate multiplier of every parameter outside the attention stage (the conv trunk: Muon matrices and AdamW parameters alike;
    default 1); the attention stage keeps the scheduled rates. unet_muon / unet_adamw */
 void unet_set_trunk_lr(unet *u, float mult);
+void unet_set_init_lr(unet *u, float mult);   /* train --init-lr-mult: lr x mult for the parameters unet_init_from* copied (kept in checkpoints) */
+size_t unet_inherited(const unet *u);          /* how many parameters are marked inherited */
+const size_t *unet_inherited_ranges(const unet *u, int *n);   /* the inherited ranges as (offset, count) pairs, sorted, merged */
+void unet_params_d2h(const unet *u, float *host);             /* the live parameters (unet_nparams floats) to the host */
 void unet_anvil(unet *u, float lr, float wd, int step, int steps, float lr_adam, float b1, float b2, float eps, float wd_adam);   /* ANVIL II on the 3^3 conv weights, AdamW elsewhere */
 void unet_adamw(unet *u, float lr, float b1, float b2, float eps, float wd, int step);
 void unet_ema(unet *u, float decay);

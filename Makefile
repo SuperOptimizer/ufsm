@@ -397,6 +397,9 @@ $(B)/bench_attn: tests/bench_attn.c $(B)/nn.o $(B)/nn_fp8.o
 $(B)/test_hybrid_identity: tests/test_hybrid_identity.c $(B)/unet.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_hybrid_identity.c $(B)/unet.o $(B)/nn.o $(B)/nn_fp8.o -o $@ $(LDLIBS) $(CUDALIBS)
 suite-bins: $(B)/test_hybrid_identity
+$(B)/test_init_lr: tests/test_init_lr.c $(B)/unet.o $(B)/nn.o $(B)/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_init_lr.c $(B)/unet.o $(B)/nn.o $(B)/nn_fp8.o -o $@ $(LDLIBS) $(CUDALIBS)
+suite-bins: $(B)/test_init_lr
 $(B)/test_dino_pts: tests/test_dino_pts.c src/dino_pts.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_dino_pts.c -o $@ $(LDLIBS)
 suite-bins: $(B)/test_dino_pts
