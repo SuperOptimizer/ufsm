@@ -52,6 +52,24 @@ int main(void) {
     }
     CHECK(!bad && core > 800 && ring > 3000 && far > 100000 && cross > 3, "labels: %ld wrong of %ld core, %ld ring, %ld far, %ld crossing voxels", bad, core, ring, far, cross);
     free(H); free(V);
+    /* --ring 3 (radius 2, guard 2): 4 < d <= 7 from a fibre -> 0 in both planes, unless --extra (UFIB) has a fibre within 4 */
+    { char xf[400], out3[400]; snprintf(xf, sizeof xf, "%s/x.fib", root); snprintf(out3, sizeof out3, "%s/lab3", root);
+      fib_set X = {0}; int off[2] = {0, 41}; char fam[2] = {'H', 0}; float pt[3 * 41]; X.n = 1; X.npts = 41; X.off = off; X.fam = fam; X.pts = pt;
+      for (int i = 0; i < 41; i++) { const double a[3] = {40, 67, 100 + i}; for (int d = 0; d < 3; d++) pt[3 * i + d] = (float)((a[d] + 0.5) * 2 - 0.5); }   /* 7 voxels from fibre 0 */
+      CHECK(!fib_save(xf, &X), "write the extra fibres");
+      char *ar[] = {"ufsm", "fiber-raster", fb, out3, "--um", "9.6", "--shape", "128,256,256", "--level", "1", "--radius", "2", "--guard", "2", "--ring", "3", "--extra", xf, "--shard", "128", "--threads", "3"};
+      CHECK(!cmd_fiber_raster(22, ar), "fiber-raster --ring --extra");
+      H = rd(out3, "H/9.6"); V = rd(out3, "V/9.6"); CHECK(H && V, "read the --ring planes back"); if (!H || !V) return 1;
+      #define AT(z, y, x) (((size_t)(z) * NY + (y)) * NX + (x))
+      CHECK(H[AT(40, 60, 50)] == 254 && V[AT(40, 60, 50)] == 0, "core: H %d V %d", H[AT(40, 60, 50)], V[AT(40, 60, 50)]);
+      CHECK(H[AT(40, 63, 50)] == 255 && V[AT(40, 63, 50)] == 255, "guard (d 3): H %d V %d, want 255", H[AT(40, 63, 50)], V[AT(40, 63, 50)]);
+      CHECK(H[AT(40, 65, 50)] == 0 && V[AT(40, 65, 50)] == 0, "ring (d 5): H %d V %d, want 0", H[AT(40, 65, 50)], V[AT(40, 65, 50)]);
+      CHECK(H[AT(40, 54, 50)] == 0 && V[AT(40, 54, 50)] == 0, "ring (d 6): H %d V %d, want 0", H[AT(40, 54, 50)], V[AT(40, 54, 50)]);
+      CHECK(H[AT(40, 65, 120)] == 255 && V[AT(40, 65, 120)] == 255, "ring next to an extra fibre: H %d V %d, want 255", H[AT(40, 65, 120)], V[AT(40, 65, 120)]);
+      CHECK(H[AT(40, 52, 50)] == 255 && V[AT(40, 52, 50)] == 255, "beyond the ring (d 8): H %d V %d, want 255", H[AT(40, 52, 50)], V[AT(40, 52, 50)]);
+      CHECK(H[AT(10, 150, 50)] == 255, "far papyrus stays unknown: %d", H[AT(10, 150, 50)]);
+      #undef AT
+      free(H); free(V); }
     /* --ct: air -> 0 away from fibres; --zband: only shard row 0 is written */
     { const int64_t shp[3] = {NZ, NY, NX}; snprintf(p, sizeof p, "%s/9.6", ctd); const double um = 9.6; z3w *w = z3w_create(p, shp, 128, 0, 0, nullptr); CHECK(w != nullptr, "CT"); uint8_t *b = malloc((size_t)128 * 128 * 128);
       for (int sy = 0; sy < 2; sy++) for (int sx = 0; sx < 2; sx++) { memset(b, sy == 0 && sx == 0 ? 10 : 100, (size_t)128 * 128 * 128); CHECK(!z3w_write_shard(w, 0, sy, sx, b, 1), "CT shard"); }
