@@ -211,7 +211,9 @@ typedef struct {
     double F, offr, offc;                              /* canvas pixels per label pixel; canvas offset (--label-offset) */
     double sign, ta, tb;                               /* band in level-0 voxels along sign N */
     int ntiles_x, ntiles_y;
+    int8_t *face;                                      /* --face: per label pixel the open-face offset (level-0 voxels along sign N), FACE_NONE */
 } geo;
+enum { FACE_NONE = -128 };
 static inline int px_sup(const geo *G, int64_t r, int64_t c) { return !G->msk || G->msk[(size_t)r * G->lw + c] >= 128; }
 static inline void px_grid(const geo *G, double r, double c, double *gu, double *gv) {   /* label pixel (window coords, may be fractional) -> grid */
     *gu = ((c + G->lc0 + 0.5) * G->F - 0.5 + G->offc) * G->S->scale; *gv = ((r + G->lr0 + 0.5) * G->F - 0.5 + G->offr) * G->S->scale;
@@ -268,13 +270,15 @@ static void *splat_worker(void *arg) {
             const int64_t r0 = (int64_t)ty * TS, c0 = (int64_t)tx * TS, r1 = r0 + TS < G->lh ? r0 + TS : G->lh, c1 = c0 + TS < G->lw ? c0 + TS : G->lw;
             for (int64_t r = r0; r < r1; r++) for (int64_t cc = c0; cc < c1; cc++) {
                 if (!px_sup(G, r, cc)) continue;
+                const double ta = G->face ? (G->face[(size_t)r * G->lw + cc] == FACE_NONE ? NAN : G->face[(size_t)r * G->lw + cc] + c->face_a) : G->ta;
+                if (isnan(ta)) continue;
                 const uint8_t lv = G->lab[(size_t)r * G->lw + cc]; const int ink = lv >= 128;
                 for (int a = 0; a < J->nsub; a++) for (int b = 0; b < J->nsub; b++) {
                     double gu, gv, P[3], N[3];
                     px_grid(G, r + (a + 0.5) / J->nsub - 0.5, cc + (b + 0.5) / J->nsub - 0.5, &gu, &gv);
                     if (ssurf_pn(G->S, gu, gv, P, N)) continue;
                     for (int k = 0; k < J->nt; k++) {
-                        const double tt = (G->ta + k * J->tstep) * G->sign;
+                        const double tt = (ta + k * J->tstep) * G->sign;
                         int64_t vi[3]; int in = 1;
                         for (int d = 0; d < 3; d++) { vi[d] = (int64_t)floor((P[d] + tt * N[d] - J->off) / J->V + 0.5) - so[d]; if (vi[d] < 0 || vi[d] >= SH) { in = 0; break; } }
                         if (!in) continue;
@@ -343,6 +347,66 @@ done:
     for (int ci = 0; ci < NCS * NCS * NCS; ci++) free(A[ci]);
     free(A); free(buf); free(ctb); free(pb);
     return nullptr;
+}
+
+/* ---------------- --face: the open face per label pixel ---------------- */
+enum { FBLK = 4 };   /* tiles per face block side (256 label px): one CT box per block, fewer repeated chunk decodes */
+typedef struct { const geo *G; double V, off; z3 *ct; int nbx, nby, nblk; _Atomic int next, failed; _Atomic uint64_t nsup, nface; uint64_t hist[256]; pthread_mutex_t mu; } fjob;
+static inline float tri_box(const uint8_t *b, const int64_t n[3], double z, double y, double x);
+/* the open face of one CT column s[0 .. n) (t = lo + i): the first papyrus run of >= run samples ending at t >= -4 and starting at
+   t <= 8, followed by >= gap samples below iso; FACE_NONE when the column has none */
+static int face_of(const float *s, int n, int lo, int iso, int run, int gap) {
+    for (int i = 0; i < n;) {
+        if (s[i] < iso) { i++; continue; }
+        int j = i; while (j < n && s[j] >= iso) j++;   /* papyrus run [i, j) */
+        const int t0 = lo + i, t1 = lo + j - 1;
+        if (j - i >= run && t1 >= -4 && t0 <= 8) {
+            int g = 0; while (j + g < n && s[j + g] < iso && g < gap) g++;
+            return g >= gap && t1 >= -127 && t1 <= 127 ? t1 : FACE_NONE;
+        }
+        if (t0 > 8) return FACE_NONE;
+        i = j;
+    }
+    return FACE_NONE;
+}
+static void *face_worker(void *arg) {
+    fjob *J = arg; const geo *G = J->G; const inksplat_cfg *c = G->c;
+    const int lo = (int)floor(c->face_lo), hi = (int)ceil(c->face_hi), n = hi - lo + 1;
+    float *raw = malloc(n * sizeof *raw), *sm = malloc(n * sizeof *sm); uint64_t h[256] = {0}, ns = 0, nf = 0;
+    for (int b; (b = atomic_fetch_add(&J->next, 1)) < J->nblk && !atomic_load(&J->failed);) {
+        const int bx = b % J->nbx, by = b / J->nbx;
+        double lo3[3] = {1e300, 1e300, 1e300}, hi3[3] = {-1e300, -1e300, -1e300}; int any = 0;
+        for (int ty = by * FBLK; ty < (by + 1) * FBLK && ty < G->ntiles_y; ty++) for (int tx = bx * FBLK; tx < (bx + 1) * FBLK && tx < G->ntiles_x; tx++) {
+            double a[3], e[3]; if (!tile_box(G, tx, ty, (double)(abs(lo) > abs(hi) ? abs(lo) : abs(hi)) + 1, a, e)) continue;
+            for (int d = 0; d < 3; d++) { if (a[d] < lo3[d]) lo3[d] = a[d]; if (e[d] > hi3[d]) hi3[d] = e[d]; } any = 1;
+        }
+        if (!any) continue;
+        int64_t o[3], nb[3]; size_t nv = 1;
+        for (int d = 0; d < 3; d++) { o[d] = (int64_t)floor((lo3[d] - J->off) / J->V) - 1; nb[d] = (int64_t)ceil((hi3[d] - J->off) / J->V) + 2 - o[d]; nv *= (size_t)nb[d]; }
+        if (nv > (size_t)1 << 31) { fprintf(stderr, "ink-splat: face block %d box too large, skipped\n", b); continue; }
+        uint8_t *cb = malloc(nv);
+        if (!cb || z3_read(J->ct, o, nb, cb, 1)) { fprintf(stderr, "ink-splat: face CT read failed\n"); free(cb); atomic_store(&J->failed, 1); break; }
+        const int64_t r0 = (int64_t)by * FBLK * TS, c0 = (int64_t)bx * FBLK * TS, r1 = r0 + FBLK * TS < G->lh ? r0 + FBLK * TS : G->lh, c1 = c0 + FBLK * TS < G->lw ? c0 + FBLK * TS : G->lw;
+        for (int64_t r = r0; r < r1; r++) for (int64_t cc = c0; cc < c1; cc++) {
+            if (!px_sup(G, r, cc)) continue;
+            double gu, gv, P[3], N[3]; px_grid(G, (double)r, (double)cc, &gu, &gv);
+            if (ssurf_pn(G->S, gu, gv, P, N)) continue;
+            ns++;
+            for (int i = 0; i < n; i++) {
+                const double tt = (lo + i) * G->sign; double q[3];
+                for (int d = 0; d < 3; d++) q[d] = (P[d] + tt * N[d] - J->off) / J->V - o[d];
+                const float v = tri_box(cb, nb, q[0], q[1], q[2]); raw[i] = v < 0 ? 0 : v;
+            }
+            for (int i = 0; i < n; i++) sm[i] = 0.25f * (raw[i > 0 ? i - 1 : 0] + 2 * raw[i] + raw[i < n - 1 ? i + 1 : n - 1]);
+            const int f = face_of(sm, n, lo, c->iso, c->face_run, c->face_gap);
+            G->face[(size_t)r * G->lw + cc] = (int8_t)f;
+            if (f != FACE_NONE) { nf++; h[f + 128]++; }
+        }
+        free(cb);
+    }
+    atomic_fetch_add(&J->nsup, ns); atomic_fetch_add(&J->nface, nf);
+    pthread_mutex_lock(&J->mu); for (int k = 0; k < 256; k++) J->hist[k] += h[k]; pthread_mutex_unlock(&J->mu);
+    free(raw); free(sm); return nullptr;
 }
 
 /* ---------------- profile ---------------- */
@@ -416,6 +480,7 @@ static void band_score(const prof *P, int T, int a, int b, double *iou, double *
 void inksplat_defaults(inksplat_cfg *c) {
     memset(c, 0, sizeof *c);
     c->label_z = c->mask_z = -1; c->band_a = -4; c->band_b = 4; c->layer_vox = 1; c->thr = 0.5; c->coarse = -1; c->threads = 6;
+    c->face_a = -6; c->face_b = 0; c->face_lo = -6; c->face_hi = 20; c->face_run = 3; c->face_gap = 2;
     c->iso = 1; c->pred_level = -1; c->pred_thr = 128; c->pred_skip = -1; c->stride = 4;
 }
 
@@ -591,6 +656,26 @@ int inksplat_run(const inksplat_cfg *c) {
         z3 *ct = L ? pyramid_open_level(cts, c->ct_key, L, c->ct_um, c->cache) : ct0;
         if (!ct) { fprintf(stderr, "ink-splat: CT level %d: %s\n", L, z3_error()); goto out2; }
         int64_t oshape[3]; memcpy(oshape, z3_meta_of(ct)->shape, sizeof oshape);
+        char face_json[2048] = "";
+        if (c->face) {   /* --face: the open face per supervised label pixel from this level's CT */
+            G.face = malloc((size_t)G.lw * G.lh); if (!G.face) goto out2;
+            memset(G.face, (uint8_t)(int8_t)FACE_NONE, (size_t)G.lw * G.lh);
+            fjob FJ = {0}; FJ.G = &G; FJ.V = V; FJ.off = (V - 1) / 2; FJ.ct = ct; FJ.nbx = (G.ntiles_x + FBLK - 1) / FBLK; FJ.nby = (G.ntiles_y + FBLK - 1) / FBLK;
+            FJ.nblk = FJ.nbx * FJ.nby; pthread_mutex_init(&FJ.mu, nullptr);
+            pthread_t th[64]; const int nt = c->threads < 1 ? 1 : c->threads > 64 ? 64 : c->threads;
+            for (int i = 0; i < nt; i++) pthread_create(&th[i], nullptr, face_worker, &FJ);
+            for (int i = 0; i < nt; i++) pthread_join(th[i], nullptr);
+            if (atomic_load(&FJ.failed)) goto out2;
+            const uint64_t ns = atomic_load(&FJ.nsup), nf = atomic_load(&FJ.nface); double cum = 0; int q[5] = {0}; const double qs[5] = {0.1, 0.25, 0.5, 0.75, 0.9};
+            for (int k = 0, qi = 0; k < 256 && qi < 5; k++) { cum += FJ.hist[k]; while (qi < 5 && nf && cum >= qs[qi] * nf) q[qi++] = k - 128; }
+            fprintf(stderr, "ink-splat: %s: open face found at %llu of %llu supervised px (%.1f%%); face offset p10 / p25 / p50 / p75 / p90 %d / %d / %d / %d / %d level-0 voxels along %+dN; band [f%+g, f%+g]\n",
+                    name, (unsigned long long)nf, (unsigned long long)ns, ns ? 100.0 * nf / ns : 0, q[0], q[1], q[2], q[3], q[4], (int)G.sign, c->face_a, c->face_b);
+            int o = snprintf(face_json, sizeof face_json, "\"face\": {\"band\": [%g, %g], \"search\": [%g, %g], \"run\": %d, \"gap\": %d, \"px\": %llu, \"found\": %llu, \"q10_25_50_75_90\": [%d, %d, %d, %d, %d], \"hist\": {",
+                             c->face_a, c->face_b, c->face_lo, c->face_hi, c->face_run, c->face_gap, (unsigned long long)ns, (unsigned long long)nf, q[0], q[1], q[2], q[3], q[4]);
+            for (int k = 0, first = 1; k < 256 && o < (int)sizeof face_json - 40; k++) if (FJ.hist[k]) { o += snprintf(face_json + o, sizeof face_json - o, "%s\"%d\": %llu", first ? "" : ", ", k - 128, (unsigned long long)FJ.hist[k]); first = 0; }
+            snprintf(face_json + o, sizeof face_json - o, "}},\n ");
+            G.ta = c->face_lo + c->face_a; G.tb = c->face_hi + c->face_b;   /* (the reach of the tile -> shard pairs) */
+        }
         char lv[64], adir[1400]; z3w_level_name(um, lv, sizeof lv); snprintf(adir, sizeof adir, "%s/%s", c->out, lv);
         if (mkdir_p(c->out)) { fprintf(stderr, "ink-splat: mkdir %s\n", c->out); goto out2; }
         const char *attrs = "{\"ufsm\":{\"content\":\"ink-splat\",\"encoding\":\"prob254: p*254, 254 = ink, 0 = no ink, 255 = unknown\"}}";
@@ -605,7 +690,7 @@ int inksplat_run(const inksplat_cfg *c) {
         sjob J = {0}; J.G = &G; J.L = L; J.V = V; J.off = (V - 1) / 2; memcpy(J.oshape, oshape, sizeof oshape); J.ct = ct; J.w = w; J.old = old; J.pred = have_pred ? &pv : nullptr;
         for (int d = 0; d < 3; d++) { J.ns[d] = (oshape[d] + SH - 1) / SH; J.cg[d] = (oshape[d] + CH - 1) / CH; J.bb_lo[d] = INT64_MAX; J.bb_hi[d] = -1; }
         J.hpx = 0.45 * V / F; if (J.hpx > 1) J.hpx = 1; J.nsub = (int)ceil(1 / J.hpx);   /* (canvas pixel = one level-0 voxel nominally) */
-        const double span = G.tb - G.ta; J.nt = (int)ceil(span / (0.45 * V)) + 1; J.tstep = J.nt > 1 ? span / (J.nt - 1) : 0;
+        const double span = c->face ? c->face_b - c->face_a : G.tb - G.ta; J.nt = (int)ceil(span / (0.45 * V)) + 1; J.tstep = J.nt > 1 ? span / (J.nt - 1) : 0;
         if ((double)J.cg[0] * J.cg[1] * J.cg[2] > 4e9) { fprintf(stderr, "ink-splat: grid too large\n"); goto out2; }
         J.chunks_used = calloc((size_t)(J.cg[0] * J.cg[1] * J.cg[2]), 1);
         /* tile -> shard pairs */
@@ -659,6 +744,7 @@ int inksplat_run(const inksplat_cfg *c) {
         if (splat_pyramid(c, shape0)) goto out2;
         /* summary */
         char sp[1400]; if (c->summary) snprintf(sp, sizeof sp, "%s", c->summary); else { snprintf(sp, sizeof sp, "%s/segments", c->out); mkdir_p(sp); snprintf(sp, sizeof sp, "%s/segments/%s.json", c->out, name); }
+        char cmp_all[12288]; snprintf(cmp_all, sizeof cmp_all, "%s%s", face_json, cmp_json);
         FILE *f = fopen(sp, "w");
         if (!f) { fprintf(stderr, "ink-splat: cannot write %s\n", sp); goto out2; }
         int64_t blo[3], bhi[3]; for (int d = 0; d < 3; d++) { blo[d] = J.bb_lo[d] == INT64_MAX ? 0 : J.bb_lo[d] << L; bhi[d] = J.bb_hi[d] < 0 ? 0 : ((J.bb_hi[d] + 1) << L); }
@@ -669,7 +755,7 @@ int inksplat_run(const inksplat_cfg *c) {
                 name, c->surface, c->labels, c->mask ? c->mask : "", c->ct_root, c->ct_key, c->ct_um, L, um, c->iso, c->band_a, c->band_b, c->layer_vox, (int)G.sign, c->thr, F,
                 c->crop[0], c->crop[1], c->crop[2], c->crop[3], (unsigned long long)nsup, (unsigned long long)nink, nsup * cm2, nink * cm2,
                 (unsigned long long)J.n_hit, (unsigned long long)J.n_ink, (unsigned long long)J.n_no, (unsigned long long)J.n_rej, (unsigned long long)J.n_excl,
-                cmp_json, prof_json[0] ? prof_json : "", prof_json[0] ? ",\n " : "",
+                cmp_all, prof_json[0] ? prof_json : "", prof_json[0] ? ",\n " : "",
                 (long long)blo[0], (long long)blo[1], (long long)blo[2], (long long)(bhi[0] - blo[0]), (long long)(bhi[1] - blo[1]), (long long)(bhi[2] - blo[2]));
         /* 1024-blocks (level-0 voxels) holding written voxels */
         const int64_t bs = 1024, cs0 = (int64_t)CH << L; int nb = 0;
@@ -696,7 +782,7 @@ int inksplat_run(const inksplat_cfg *c) {
 out2:
     z3_close(ct0);
 out1:
-    free(G.lab); free(G.msk);
+    free(G.lab); free(G.msk); free(G.face);
 out0:
     if (has_mask) lsrc_close(&LM);
     lsrc_close(&LL); ssurf_free(&S);
@@ -787,6 +873,7 @@ int cmd_ink_splat(int argc, char **argv) {
                         "         [--band A,B (layers, -4,4)] [--layer-vox 1] [--flip] [--thr 0.5] [--label-z Z] [--label-scale F] [--label-offset r,c] [--crop c0,r0,w,h]\n"
                         "         [--merge] [--coarse N] [--name NAME] [--summary JSON] [--preview JPG] [--pyramid-only] [--exclude z,y,x,nz,ny,nx (level-0, repeatable)]\n         ufsm ink-splat <out-group> --points VC3D.json --radius-um 5 --ct ROOT KEY --ct-um U [--level 0] --iso I [--merge]   (3D point labels) [--threads 6] [--cache DIR]\n"
                         "         [--pred ROOT KEY [--pred-level L] [--pred-thr 128] [--pred-skip V] [--profile T] [--stride 4]]\n"
+                        "         [--face A,B [--face-search -6,20] [--face-run 3] [--face-gap 2]]   (the band per pixel relative to the open face on +N)\n"
                         "  L / M: a .tif / .png, or a zarr array dir (v3 2-D, v2 3-D at --label-z), local or https; '-' as out: profile only\n");
         return 2;
     }
@@ -811,6 +898,11 @@ int cmd_ink_splat(int argc, char **argv) {
     }
     if (pi >= 0) { if (pi + 2 >= argc) { fprintf(stderr, "ink-splat: --pred ROOT KEY\n"); return 2; } c.pred_root = argv[pi + 1]; c.pred_key = argv[pi + 2]; }
     c.pred_level = atoi(sopt(argc, argv, "--pred-level", "-1")); c.pred_thr = atoi(sopt(argc, argv, "--pred-thr", "128")); c.pred_skip = atoi(sopt(argc, argv, "--pred-skip", "-1"));
+    { const char *fa = sopt(argc, argv, "--face", nullptr), *fs = sopt(argc, argv, "--face-search", nullptr);
+      if (fa && (sscanf(fa, "%lf,%lf", &c.face_a, &c.face_b) != 2 || c.face_b < c.face_a)) { fprintf(stderr, "ink-splat: --face A,B (A <= B)\n"); return 2; }
+      if (fs && (sscanf(fs, "%lf,%lf", &c.face_lo, &c.face_hi) != 2 || c.face_lo > -4 || c.face_hi < 8 || c.face_hi - c.face_lo > 250)) { fprintf(stderr, "ink-splat: --face-search LO,HI (LO <= -4, HI >= 8)\n"); return 2; }
+      c.face = fa != nullptr; c.face_run = atoi(sopt(argc, argv, "--face-run", "3")); c.face_gap = atoi(sopt(argc, argv, "--face-gap", "2"));
+      if (c.face && (c.face_run < 1 || c.face_gap < 1)) { fprintf(stderr, "ink-splat: --face-run / --face-gap >= 1\n"); return 2; } }
     c.profile = atoi(sopt(argc, argv, "--profile", "0")); c.stride = atoi(sopt(argc, argv, "--stride", "4"));
     store_global_init();
     if (sflag(argc, argv, "--pyramid-only")) return splat_pyramid_only(&c);

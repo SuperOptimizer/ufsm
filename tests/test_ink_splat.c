@@ -123,6 +123,32 @@ int main(void) {
         z3_close(z); store_close(s3);
     }
 
+    /* --face -3,0: the band follows the papyrus slab's open face (d = +6 on +N; flipped: d = -6 on -N), not the mesh: known at
+       |d| 4..5 on the face side, unknown at the mesh (|d| <= 1) and on the other side */
+    for (int flip = 0; flip < 2; flip++) {
+        char o6[512]; snprintf(o6, sizeof o6, "%s/face%d.zarr", dir, flip);
+        inksplat_cfg c6 = c; c6.out = o6; c6.coarse = 0; c6.flip = flip; c6.face = 1; c6.face_a = -3; c6.face_b = 0;
+        CHECK(inksplat_run(&c6) == 0, "face splat %d", flip);
+        store *s6 = store_open(o6); z3 *z = z3_open(s6, "1", nullptr);
+        CHECK(z && !z3_read(z, z0, nn, ob, 4), "read face");
+        long nf = 0, okf = 0, nm = 0, okm = 0, no = 0, oko = 0; const double sg = flip ? -1 : 1;
+        for (int r = 4; r < 110; r += 2) for (int cc = 4; cc < 100; cc += 2) {
+            if (ink_at(r, cc) != ink_at(r - 3, cc) || ink_at(r, cc) != ink_at(r + 3, cc) || ink_at(r, cc) != ink_at(r, cc - 3) || ink_at(r, cc) != ink_at(r, cc + 3)) continue;
+            double P[3], N[3]; surf_at(cc / STEP, r / STEP, P); normal_at(cc / STEP, r / STEP, N);
+            for (int t = -5; t <= 5; t++) {
+                int64_t vi[3]; for (int d = 0; d < 3; d++) vi[d] = (int64_t)floor(P[d] + sg * t * N[d] + 0.5);
+                if (hole_at(vi[0], vi[1], vi[2]) || hole_at(vi[0], vi[1] - 1, vi[2] - 1) || hole_at(vi[0], vi[1] + 1, vi[2] + 1)) continue;
+                const uint8_t v = ob[(vi[0] * NV + vi[1]) * NV + vi[2]];
+                if (t >= 4) { nf++; okf += v == (ink_at(r, cc) ? 254 : 0); } else if (abs(t) <= 1) { nm++; okm += v == 255; } else if (t <= -3) { no++; oko += v == 255; }
+            }
+        }
+        fprintf(stderr, "face flip %d: face band %ld/%ld, mesh unknown %ld/%ld, far side unknown %ld/%ld\n", flip, okf, nf, okm, nm, oko, no);
+        CHECK(nf > 1000 && okf >= 0.98 * nf, "face band %d: %ld/%ld", flip, okf, nf);
+        CHECK(nm > 1000 && okm >= 0.99 * nm, "face: mesh unknown %d: %ld/%ld", flip, okm, nm);
+        CHECK(no > 1000 && oko >= 0.99 * no, "face: far side unknown %d: %ld/%ld", flip, oko, no);
+        if (z) z3_close(z);
+        store_close(s6);
+    }
     /* --exclude: a held-out box over the low-x half: nothing written there, the rest as before */
     {
         char o5[512]; snprintf(o5, sizeof o5, "%s/excl.zarr", dir);
