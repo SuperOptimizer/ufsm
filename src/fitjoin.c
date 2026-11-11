@@ -31,6 +31,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "fit.h"
+#include "afv.h"
 
 static double fj_knot(const float *v, int nk, int dz, double z) {   /* (fit.c knot_lerp) */
     double k = z / dz; if (k < 0) k = 0; if (k > nk - 1) k = nk - 1;
@@ -265,16 +266,78 @@ static void fj_global(int ns, const fj_hist *hb, const fj_hist *hr, int nx, cons
 
 typedef struct { char **md; fit_model **out; } fj_load_job;   /* the slab models read on threads (~70 MB of lattice each) */
 static void fj_load_rows(void *a, int k0, int k1, int t) { const fj_load_job *J = a; (void)t; for (int k = k0; k < k1; k++) J->out[k] = fit_load(J->md[k]); }
+
+/* Fibre votes on a slab boundary (--fibers F --join-fib W): a fibre lies in one sheet, so over a short arc its two ends have the same W up
+   to the network phase change along it (dP: the phase unwrapped along the fibre, as fit.c fib_pairs). Each fibre is resampled at
+   1 native voxel; for a pair (a, b) <= arc native voxels apart along one unbroken stretch that crosses the boundary z (a below, b at or
+   above), a in slab k-1's box and b in slab k's, the vote is round(W_k(b) - W_k-1(a) - dP) (dropped when the residue is > 0.3 turn).
+   Published / traced fibres change sheet about once per 7 .. 10 mm (DESIGN.md 2026-11-10), so short arcs (default 0.6 mm) and a vote
+   histogram, not a hard constraint. Returns the raw differences (caller histograms them). */
+static double *fj_fib_votes(const fib_set *F, const fit_fields *f, double fz, const fit_model *a, double za, const fit_model *b, double zb, double zB,
+                            double arc, size_t *nout, size_t *npair) {   /* f: field rows from native z fz on */
+    size_t n = 0, cap = 0, np = 0; double *out = nullptr; float *q = nullptr; double *U = nullptr; long *sid = nullptr; size_t qcap = 0; const double h = f->h;
+    const double a1 = za + a->D * a->h, b1 = zb + b->D * b->h;
+    for (int r = 0; r < F->n; r++) {
+        const float *p = F->pts + 3 * (size_t)F->off[r]; const int m = F->off[r + 1] - F->off[r]; if (m < 2) continue;
+        double zl = 1e30, zh = -1e30; for (int k = 0; k < m; k++) { if (p[3 * k] < zl) zl = p[3 * k]; if (p[3 * k] > zh) zh = p[3 * k]; }
+        if (zl >= zB || zh < zB) continue;   /* (the run does not cross the boundary) */
+        size_t ns = 0; double acc = 0, next = 0, last = NAN; int gap = 99; long brk = 0;
+        for (int k = 1; k < m; k++) {
+            const double o[3] = {p[3 * k - 3], p[3 * k - 2], p[3 * k - 1]}, d[3] = {p[3 * k] - o[0], p[3 * k + 1] - o[1], p[3 * k + 2] - o[2]};
+            const double L = sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+            for (; L > 0 && next <= acc + L; next += 1) {
+                const double t = (next - acc) / L, x[3] = {o[0] + t * d[0], o[1] + t * d[1], o[2] + t * d[2]};
+                if (ns == qcap) { qcap = qcap ? 2 * qcap : 4096; q = realloc(q, 3 * qcap * sizeof *q); U = realloc(U, qcap * sizeof *U); sid = realloc(sid, qcap * sizeof *sid); if (!q || !U || !sid) abort(); }
+                for (int e = 0; e < 3; e++) q[3 * ns + e] = (float)x[e];
+                U[ns] = NAN; sid[ns] = -1;
+                const int iz = (int)floor((x[0] - fz) / h), iy = (int)floor(x[1] / h), ix = (int)floor(x[2] / h);
+                if (iz >= 0 && iy >= 0 && ix >= 0 && iz < f->D && iy < f->H && ix < f->W) {
+                    const size_t i = ((size_t)iz * f->H + iy) * f->W + ix; const double cc = (f->pc[i] - 128) / 127.0, sn = (f->ps[i] - 128) / 127.0;
+                    if (f->w[i] && hypot(cc, sn) >= 0.2) {   /* (fit.c fib_pairs: confidence >= 0.2, gaps <= 2 bridged, a fast change cuts) */
+                        const double ph = atan2(sn, cc) / (2 * M_PI), dph = ph - last - floor(ph - last + 0.5);
+                        const int cont = gap <= 2 && last == last && fabs(dph) <= 0.5 * (gap + 1);
+                        if (!cont) brk++;
+                        U[ns] = last = cont ? last + dph : ph; sid[ns] = brk; gap = 0;
+                    }
+                }
+                if (sid[ns] < 0) gap++;
+                ns++;
+            }
+            acc += L;
+        }
+        const size_t A = (size_t)arc;
+        for (size_t i = 0; i < ns; i += 2) {   /* (every 2nd sample starts a pair; its nearest partner across zB on the same stretch) */
+            if (sid[i] < 0) continue;
+            const int ilo = q[3 * i] < zB;
+            for (size_t j = i + 1; j < ns && j <= i + A; j++) {
+                if (sid[j] != sid[i] || (q[3 * j] < zB) == ilo) continue;
+                const size_t lo = ilo ? i : j, hi = ilo ? j : i;
+                if (!(q[3 * lo] >= za && q[3 * lo] < a1 && q[3 * hi] >= zb && q[3 * hi] < b1)) break;
+                const double dp = U[hi] - U[lo]; if (fabs(dp) >= 0.5) break;   /* (a turn crossed: the fibre hopped) */
+                np++;
+                const double v = fit_W(b, q[3 * hi] - zb, q[3 * hi + 1], q[3 * hi + 2]) - fit_W(a, q[3 * lo] - za, q[3 * lo + 1], q[3 * lo + 2]) - dp;
+                if (fabs(v - round(v)) <= 0.3) {
+                    if (n == cap) { cap = cap ? 2 * cap : 4096; out = realloc(out, cap * sizeof *out); if (!out) abort(); }
+                    out[n++] = v;
+                }
+                break;
+            }
+        }
+    }
+    free(q); free(U); free(sid); *nout = n; *npair = np; return out;
+}
+/* the fibre cost of an integer offset d on a boundary: W x -log P_fib(d) (0 without votes) */
+static double fj_fcost(const fj_hist *F, double w, long d) { return F && F->tot && w > 0 ? -w * log((fj_count(F, d, nullptr) + 0.5) / (F->tot + 1.0)) : 0; }
 int cmd_fit_join(int argc, char **argv) {
     if (argc < 7) {
         fprintf(stderr, "usage: ufsm fit-join <out-set> <fields-dir> [--blend 16] [--min-conf 0.3] [--samples 4000000] [--ref MODEL [--ref-w 1] [--chain-w 1] [--ref-samples 200000] [--ref-rows 16]]\n"
-                        "       [--global 1 [--cap 3] [--min-cells 20000]] <slab-model> <z0> <z1> ...\n"
+                        "       [--global 1 [--cap 3] [--min-cells 20000]] [--fibers F.fib --join-fib W [--join-fib-arc 0.6]] <slab-model> <z0> <z1> ...\n"
                         "  slabs of one field box (same y / x crop), interiors [z0, z1) in box-local native z, in z order; --ref: the integer gauges from a global model\n");
         return 2;
     }
     const char *out = argv[2], *fdir = argv[3];
     double blend = 16, minc = 0.3, refw = 1, chainw = 1, cap = 3, mincells = 20000; long long nsamp = 4000000, nref = 200000; const char *refdir = nullptr;
-    int glob = 0, refrows = 16;
+    int glob = 0, refrows = 16; const char *fibp = nullptr; double fibw = 1, fibarc = 0.6;
     int ai = 4;
     for (; ai + 1 < argc && !strncmp(argv[ai], "--", 2); ai += 2) {
         if (!strcmp(argv[ai], "--blend")) blend = atof(argv[ai + 1]);
@@ -288,10 +351,14 @@ int cmd_fit_join(int argc, char **argv) {
         else if (!strcmp(argv[ai], "--global")) glob = atoi(argv[ai + 1]);
         else if (!strcmp(argv[ai], "--cap")) cap = atof(argv[ai + 1]);
         else if (!strcmp(argv[ai], "--min-cells")) mincells = atof(argv[ai + 1]);
+        else if (!strcmp(argv[ai], "--fibers")) fibp = argv[ai + 1];
+        else if (!strcmp(argv[ai], "--join-fib")) fibw = atof(argv[ai + 1]);
+        else if (!strcmp(argv[ai], "--join-fib-arc")) fibarc = atof(argv[ai + 1]);
         else { fprintf(stderr, "fit-join: unknown option %s\n", argv[ai]); return 2; }
     }
     const int ns = (argc - ai) / 3;
     if (ns < 1 || (argc - ai) % 3 || !(blend >= 0) || nsamp < 1 || nref < 1 || !(refw >= 0) || !(chainw >= 0) || refrows < 0 || !(cap > 0) || !(mincells >= 1)) { fprintf(stderr, "fit-join: give <slab-model> <z0> <z1> triples (and --blend >= 0, weights >= 0)\n"); return 2; }
+    if (fibp && (glob || !(fibw >= 0) || !(fibarc > 0))) { fprintf(stderr, "fit-join: --fibers: not with --global; --join-fib >= 0, --join-fib-arc > 0 (mm)\n"); return 2; }
     fit_fields_skip_planes(1 | 2 | 4); fit_fields_ct_planes(0);   /* (the overlaps read pc ps w only) */
     fit_fields_buf g; if (fit_fields_load(fdir, 0, 0, 0, &g)) { fprintf(stderr, "fit-join: cannot read the fields in %s\n", fdir); return 1; }
     const double h = g.h, Z = g.shape[0] * h;
@@ -382,9 +449,38 @@ int cmd_fit_join(int argc, char **argv) {
     free(tk);
     if (glob) printf("fit-join: --global: %d overlap edges (%d between consecutive slabs, %d longer), cost cap %g nats, full weight from %g cells\n", ns - 1 + nx, ns - 1, nx, cap, mincells);
     /* the gauges S_k (slab k minus S_k joins). Without --ref the chain of overlap modes; with --ref the dynamic programme */
+    /* --fibers: per boundary the histogram of fibre votes (fj_fib_votes), a second cost term next to the overlap's */
+    fj_hist *hf = nullptr;
+    if (fibp && fibw > 0) {
+        fib_set F = {0}; if (fib_load(fibp, &F)) { fprintf(stderr, "fit-join: cannot read --fibers %s\n", fibp); return 1; }
+        const double arc = fibarc * 1000.0 / (g.um > 0 ? g.um : 2.4); hf = calloc(ns, sizeof *hf);
+        printf("fit-join: --fibers %s: %d runs; votes over <= %g mm (%.0f native voxels) across each boundary, weight %g\n", fibp, F.n, fibarc, arc, fibw);
+        for (int k = 1; k < ns; k++) {
+            const fit_model *a = s->slab[k - 1], *b = s->slab[k]; size_t nv = 0, npr = 0;
+            int r0 = (int)floor((s->z0[k] - arc) / h) - 1, r1 = (int)ceil((s->z0[k] + arc) / h) + 1; if (r0 < 0) r0 = 0; if (r1 > g.shape[0]) r1 = g.shape[0];
+            fit_fields_skip_planes(1 | 2 | 4 | 8); fit_fields_buf fb;   /* (the field rows around the boundary: pc ps w) */
+            if (fit_fields_load(fdir, r0, r1, 1, &fb)) { fprintf(stderr, "fit-join: cannot load field rows %d..%d for the fibre votes\n", r0, r1); return 1; }
+            double *dv = fj_fib_votes(&F, &fb.f, r0 * h, a, (double)(a->origin[0] - g.origin[0]), b, (double)(b->origin[0] - g.origin[0]), s->z0[k], arc, &nv, &npr);
+            fit_fields_free(&fb);
+            fj_hist_of(dv, nv, &hf[k]); free(dv);
+            printf("  boundary %d|%d: %zu fibre pairs, %zu votes (residue <= 0.3 turn), mode %+ld share %.3f\n", k - 1, k, npr, nv, hf[k].tot ? fj_mode(&hf[k]) : 0,
+                   hf[k].tot ? (double)fj_count(&hf[k], fj_mode(&hf[k]), nullptr) / hf[k].tot : 0);
+        }
+        fib_free(&F);
+    }
     long *S = calloc(ns, sizeof(long)), *Sc = calloc(ns, sizeof(long));
     for (int k = 1; k < ns; k++) Sc[k] = Sc[k - 1] + fj_mode(&hb[k]);   /* (the chain) */
-    if (!refdir) { memcpy(S, Sc, sizeof(long) * ns); if (glob) fj_global(ns, hb, nullptr, nx, xa, xb, hx, refw, chainw, cap, mincells, Sc, S); }
+    if (!refdir) {
+        memcpy(S, Sc, sizeof(long) * ns); if (glob) fj_global(ns, hb, nullptr, nx, xa, xb, hx, refw, chainw, cap, mincells, Sc, S);
+        if (hf) for (int k = 1; k < ns; k++) {   /* the chain with the fibre term: per boundary the offset of least overlap + fibre cost */
+            long bd = fj_mode(&hb[k]); double bc = 1e300;
+            for (int src = 0; src < 2; src++) { const fj_hist *H = src ? &hf[k] : &hb[k];
+                for (int i = 0; i < H->n; i++) { const long d = H->v[i];
+                    const double c = (hb[k].tot ? -chainw * log((fj_count(&hb[k], d, nullptr) + 0.5) / (hb[k].tot + 1.0)) : 0) + fj_fcost(&hf[k], fibw, d);
+                    if (c < bc) { bc = c; bd = d; } } }
+            S[k] = S[k - 1] + bd;
+        }
+    }
     else {
         cbias = cabs(cs) > 0 ? carg(cs) / (2 * M_PI) : 0;
         for (int k = 0; k < ns; k++) if (rraw[k]) {   /* (W_slab - W_ref) - bias, as the pass-1 differences were */
@@ -403,7 +499,8 @@ int cmd_fit_join(int argc, char **argv) {
                 double best = k ? 1e300 : 0; int ba = -1;
                 if (k) for (int i = 0; i < NC; i++) {
                     const long sp = cen[k - 1] + i - RC;
-                    const double v = cost[(size_t)(k - 1) * NC + i] + (hb[k].tot ? -chainw * log((fj_count(&hb[k], sk - sp, nullptr) + 0.5) / (hb[k].tot + 1.0)) : 0);
+                    const double v = cost[(size_t)(k - 1) * NC + i] + (hb[k].tot ? -chainw * log((fj_count(&hb[k], sk - sp, nullptr) + 0.5) / (hb[k].tot + 1.0)) : 0)
+                                   + (hf ? fj_fcost(&hf[k], fibw, sk - sp) : 0);
                     if (v < best) { best = v; ba = i; }
                 }
                 cost[(size_t)k * NC + j] = c + best; arg[(size_t)k * NC + j] = ba;
@@ -424,7 +521,7 @@ int cmd_fit_join(int argc, char **argv) {
         printf("  mean share of the ref's integer at the chosen gauges, cell weighted: %.4f\n", rt ? (double)rs / rt : 0);
         fit_set_free(ref);
     }
-    const int chosen = refdir || glob;
+    const int chosen = refdir || glob || hf;
     printf("  boundary  z(native)  overlap-cells  shift  share(mode)  share(|d - mode| < 0.25)%s\n", chosen ? "  chosen-mode  share(chosen)" : "");
     long long tot_n = 0, tot_c = 0; double tot_share = 0;
     for (int k = 1; k < ns; k++) {
@@ -438,9 +535,10 @@ int cmd_fit_join(int argc, char **argv) {
     if (ns > 1) printf("  mean share(mode) over the boundaries, overlap-cell weighted: %.4f\n", tot_n ? tot_share / tot_n : 0);
     if (ns > 1 && chosen) printf("  integer agreement on the overlaps at the chosen gauges, overlap-cell weighted: %.4f\n", tot_n ? (double)tot_c / tot_n : 0);
     for (int k = 0; k < ns; k++) if (S[k]) for (int q = 0; q < s->slab[k]->nk; q++) s->slab[k]->offset[q] -= (float)S[k];
-    for (int k = 0; k < ns; k++) { fj_hist_free(&hb[k]); if (hr) fj_hist_free(&hr[k]); }
+    if (hf) { int nch = 0; for (int k = 1; k < ns; k++) nch += S[k] - S[k - 1] != Sc[k] - Sc[k - 1]; printf("fit-join: the fibre term changed %d of %d boundary offsets against the overlap chain\n", nch, ns - 1); }
+    for (int k = 0; k < ns; k++) { fj_hist_free(&hb[k]); if (hr) fj_hist_free(&hr[k]); if (hf) fj_hist_free(&hf[k]); }
     for (int q = 0; q < nx; q++) fj_hist_free(&hx[q]);
-    free(hb); free(hr); free(S); free(Sc); free(hx); free(xa); free(xb);
+    free(hb); free(hr); free(hf); free(S); free(Sc); free(hx); free(xa); free(xb);
     /* the global model: the box geometry and axis, the slabs' knots, no lattice */
     fit_model *G = calloc(1, sizeof *G); const fit_model *s0 = s->slab[0];
     G->dir = s0->dir; G->dir_vote = 1; G->knot_dz = s0->knot_dz; G->D = g.shape[0]; G->H = g.shape[1]; G->W = g.shape[2]; G->h = h; G->um = s0->um;
