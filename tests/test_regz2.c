@@ -65,6 +65,13 @@ int main(void) {
     /* a zarr v3 / volcomp store may hold only the coarser levels: covered by test_reg's in-memory pyramid path and the v2 path here;
        a v2 pyramid starting at level 1 is not a pyramid (level "0" missing) and must fail cleanly */
     CHECK(rvol_open(dir, "missing.zarr", nullptr, 1.0) == nullptr, "a missing volume fails cleanly");
+    {   /* a v2 pyramid holding only level 1: level 0 absent (shape doubled), rvol_level_for never picks it */
+        char v2[1100]; snprintf(v2, sizeof v2, "%s/coarse.zarr", dir); mkdir(v2, 0755); write_level(v2, 1, v1, s1, 8, '/');
+        rvol *rc = rvol_open(dir, "coarse.zarr", nullptr, 2.0);
+        CHECK(rc && rc->nl == 2 && !rc->z2[0] && rc->z2[1], "a v2 pyramid with only level 1");
+        if (rc) { CHECK(rc->shape[0][0] == 38, "level 0 shape from level 1: %lld", (long long)rc->shape[0][0]); CHECK(rvol_level_for(rc, 2.0) == 1, "level for 2 um: %d", rvol_level_for(rc, 2.0));
+                  check_box(rc, 1, v1, s1, -2, 3, 4, 10); rvol_close(rc); }
+    }
     free(v0); free(v1);
     char cmd[1200]; snprintf(cmd, sizeof cmd, "rm -r %s", dir); if (system(cmd)) {}
     printf(fails ? "test_regz2: %d FAILED\n" : "test_regz2: OK\n", fails);

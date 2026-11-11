@@ -74,6 +74,7 @@ typedef struct {
     rvol *cv, *fv; const rmap *m;
     int lc, lf, B, R, ss, metric, iters;
     double hp, lp, minfrac;
+    int maskfill;   /* 1: masked voxels (CT 0) take the mean of the unmasked ones before filtering (no mask-edge features) */
 } rmeas;
 typedef struct {
     double c[3];            /* box centre, coarse L0 xyz */

@@ -168,13 +168,13 @@ static void *box_worker(void *p) {
 }
 static int cmd_boxes(int argc, char **argv) {
     if (argc < 5) { fprintf(stderr, "usage: ufsm reg boxes <map.json> <out.jsonl> [--lc 0] [--B 128] [--R 4] [--spacing S (coarse L0 voxels)] [--offset 0] [--metric dog|ncc|grad] [--hp 4] [--lp 0.7]\n"
-        "  [--ss auto|1|2] [--minfrac 0.95] [--occ-min 0.9] [--max 3000] [--threads 12] [--cache DIR] [--zr z0,z1 (coarse L0)] [--iters 4] [--centers FILE (x y z per line)]\n"); return 2; }
+        "  [--ss auto|1|2] [--minfrac 0.95] [--maskfill 0|1 (masked CT 0 -> box mean before filtering)] [--occ-min 0.9] [--max 3000] [--threads 12] [--cache DIR] [--zr z0,z1 (coarse L0)] [--iters 4] [--centers FILE (x y z per line)]\n"); return 2; }
     rctx x; const char *cache = opt(argc, argv, "--cache", nullptr);
     if (ctx_open(&x, argv[3], cache, 1)) return 1;
     rmeas q = {0}; q.cv = x.cv; q.fv = x.fv; q.m = &x.m;
     q.lc = atoi(opt(argc, argv, "--lc", "0")); q.B = atoi(opt(argc, argv, "--B", "128")); q.R = atoi(opt(argc, argv, "--R", "4"));
     const char *mt = opt(argc, argv, "--metric", "dog"); q.metric = !strcmp(mt, "ncc") ? REG_NCC : !strcmp(mt, "grad") ? REG_GRAD : REG_DOG;
-    q.hp = atof(opt(argc, argv, "--hp", "4")); q.lp = atof(opt(argc, argv, "--lp", "0.7")); q.minfrac = atof(opt(argc, argv, "--minfrac", "0.95")); q.iters = atoi(opt(argc, argv, "--iters", "4"));
+    q.hp = atof(opt(argc, argv, "--hp", "4")); q.lp = atof(opt(argc, argv, "--lp", "0.7")); q.minfrac = atof(opt(argc, argv, "--minfrac", "0.95")); q.iters = atoi(opt(argc, argv, "--iters", "4")); q.maskfill = atoi(opt(argc, argv, "--maskfill", "0"));
     const double cum = x.cv->um * (1 << q.lc);
     q.lf = rvol_level_for(x.fv, cum);
     const double ratio = cum / (x.fv->um * (1 << q.lf));
