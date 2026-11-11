@@ -16,6 +16,8 @@ struct split_ctx {
     void (*job)(int, void *); void *arg;
     void *sb[2][2], *rb[2][2]; size_t cap;   /* halo send / receive buffers per slot (0 asynchronous, 1 synchronous) and device */
     double *rd[2]; int rcap;             /* reduce receive buffers per device */
+    nn_tls tls;                          /* the op state (layer ids, formats, SR counter: thread-local in nn) handed on with the turn, so both sides
+                                            and the caller see one sequence of it as when the globals were shared */
 };
 
 static _Thread_local split_ctx *t_ctx;
@@ -37,9 +39,11 @@ void split_free(split_ctx *c) {
 
 /* with mu held: hand the turn to the other side and wait for it to come back */
 static void pass_and_wait(split_ctx *c, int me) {
+    nn_tls_capture(&c->tls);
     c->turn = 1 - me;
     pthread_cond_broadcast(&c->cv);
     while (c->turn != me) pthread_cond_wait(&c->cv, &c->mu);
+    nn_tls_install(&c->tls);
 }
 
 static void grow(split_ctx *c, size_t bytes, int nd) {
@@ -107,9 +111,11 @@ static void *worker(void *p) {
     if (c->dev[0] == c->dev[1]) nn_split_thread_slot(me);
     pthread_mutex_lock(&c->mu);
     while (c->turn != me) pthread_cond_wait(&c->cv, &c->mu);
+    nn_tls_install(&c->tls);
     pthread_mutex_unlock(&c->mu);
     c->job(me, c->arg);
     pthread_mutex_lock(&c->mu);
+    nn_tls_capture(&c->tls);
     c->done[me] = 1;
     if (c->narrived) { fprintf(stderr, "split: side %d finished while side %d waits at a collective\n", me, 1 - me); abort(); }
     if (!c->done[1 - me]) { c->turn = 1 - me; pthread_cond_broadcast(&c->cv); }
@@ -121,7 +127,8 @@ static void *worker(void *p) {
 
 void split_run(split_ctx *c, void (*job)(int, void *), void *arg) {
     c->job = job; c->arg = arg; c->turn = 0; c->done[0] = c->done[1] = 0; c->narrived = 0;
-    pthread_t th[2]; warg_t wa[2];
+    pthread_t th[2]; warg_t wa[2]; nn_tls_capture(&c->tls);
     for (int i = 0; i < 2; i++) { wa[i] = (warg_t){c, i}; pthread_create(&th[i], nullptr, worker, &wa[i]); }
     for (int i = 0; i < 2; i++) pthread_join(th[i], nullptr);
+    nn_tls_install(&c->tls);
 }
