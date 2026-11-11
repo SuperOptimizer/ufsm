@@ -75,6 +75,42 @@ Output: /vesuvius/ufsm/reg/PParis4_2026to2023/ (reg.json for `ufsm reg map` / `f
 schema with the refined affine, field.f32 + field.json, eval_boxes.jsonl, residuals.jsonl, the two fibre-region tables). Work dir:
 /vesuvius/ufsm/reg/P4_2023 (passes, logs, scripts runC.sh / runD.sh / rs.sh).
 
+## Fibre votes in fit-join (stitching): `--fibers --join-fib`, measured at the four Paris 4 slab sites (2026-11-11, branch fibers-20261110)
+
+`ufsm fit-join ... --fibers F.fib --join-fib W [--join-fib-arc 0.6] [--join-fib-gap 0]`: a fibre lies in one sheet, so over a short
+arc its two ends have the same W up to the network phase change along it. For each slab boundary, every fibre stretch that crosses it
+(resampled at 1 native voxel; the phase unwrapped along it as `fit.c` fib_pairs: confidence >= 0.2, gaps <= 2 bridged, a fast change
+cuts) gives pairs (a below, b above, <= arc mm apart, both ends >= gap mm from the boundary, a in slab k-1's box and b in slab k's) that
+vote round(W_k(b) - W_k-1(a) - dP); |dP| >= 0.5 (a hop the phase sees) drops the pair, residues > 0.3 turn are dropped. The votes'
+histogram adds W x -log P_fib(d) to the overlap's chain cost (chain mode and the `--ref` DP; refused with `--global`). Inputs: our own
+fibres, `scripts/fibers/wbfib_sites.sh` (fibhv-a step 10000, V family only: vertical fibres cross z boundaries; a +-72 native-voxel
+band around the boundary over the whole cross-section, 4 y tiles; tracing ~15 min per 2 Gvox tile), exported into the joined crop's
+frame (`fiber-export` now takes UFIB inputs). Test: test_fit_join, `--chain-w 0` (fibres alone) recovers the +3 gauge between two
+slabs of the synthetic spiral with 60 of 240 fibres hopping a sheet at the boundary (the unwrap drops them), ids 1.0000.
+
+Measured with `scripts/fibers/wbjoin_fib.sh` (wbench SLABS=1 protocol: wind96 fields, slabs A [0, 96) / B [64, 160) field cells,
+interiors [32, 160) / [160, 288) native, one boundary per site; slab fits and joined scores with the pinned wbench fitter b29b1bda):
+
+| site | overlap share(mode) | fibre votes (gap 0.3 mm, arc 1.2 mm) | fibre share(mode) | offset: overlap / fibres alone | joined ids, every variant |
+|---|---|---|---|---|---|
+| 4624 | 0.490 | 235,485 | 0.546 | +1 / +1 | 0.2403 |
+| 5392 | 0.521 | 235,334 | 0.495 | +37 / +37 | 0.3268 |
+| 5904 | 0.469 | 321,669 | 0.546 | +101 / +101 | 0.2093 |
+| 6672 | 0.388 | 351,522 | 0.325 | -6 / -6 | 0.2207 |
+
+- The fibres alone pick the overlap's integer at all four sites, so `--join-fib 1` and `4` (with or without the gap) change nothing:
+  joined ids and p4x are identical to the plain join (difference exactly 0 on 4 of 4 sites; no interval to give).
+- Without a gap the votes sample W at fibre points next to the boundary, i.e. the overlap again (shares within 0.03 of the overlap's);
+  with both ends >= 0.3 mm from the boundary, beyond the overlap's edges, the shares are the same. Fibre votes are an independent
+  confirmation of a whole-cross-section slab offset, not a correction: here the offset is never wrong.
+- The joined scores are low (0.21-0.33) because the slab fits are (the A / B fits alone: 0.24-0.37); fit-join has one integer per
+  slab pair, so a mis-join that is wrong in one region and right elsewhere (the 1218 / 1299 story) is invisible to it. Fibre votes
+  can help stitching only at the piece level: the slip repair inside a fit (`--uw-rep-fib`, +0.021 ids on 15 boxes, 2026-11-05) or a
+  per-region join. Next step if wanted: `fit-join` with per-region offsets (the overlap and fibre histograms per y / x tile), checked
+  first with the per-tile overlap modes, which this measurement does not log.
+- Unrelated, found here: this branch's `ufsm fit` stops with "an illegal memory access" after stage 4 on these 96 x 3328 x 3520 crops
+  (sites 4624, 5904, 6672; also on an idle GPU), where the pinned b29b1bda fitter runs (1218 s per slab fit). Not investigated.
+
 ## Fibre retrain: ring labels, a direction head, the smoothed-axis check (2026-11-11, branch fibers-20261110)
 
 Follow-up of the section below (our masks mark fibre layers, not tubes).
@@ -105,6 +141,27 @@ masked), so every augmentation (symmetries, rotation, elastic) is consistent by 
 loss path only (the H / V mask task, B 1; refused with other tasks). test_fib_dir (4 synthetic tubes, |a . axis| >= 0.98 inside).
 30-step smoke at P 256: dir bce 1.00 -> 0.87, mask bce / dice as in the same smoke without the head; the checkpoint records
 `fib_dir` (channels, coding).
+
+**fibhv-b** (pod, `scripts/fibers/POD.md`): fibhv-a's recipe (P 512, 7 levels, MX-fp4, dice 0.5, pos-weight 4, 30000 steps) on the ring
+labels (0175A + 1447, weights by shard rows 0.35 / 0.65 instead of labelled bytes 0.45 / 0.55), 1.7 samp/s at 0-10 % loader wait.
+Paris 4 HOLD at step 5000 against fibhv-a at step 5000 (same eval_hold.sh; persistent = net sheet changes per metre, lower is better):
+
+| run, family | papyrus marked (>= 128) | lines | total m | median mm | p90 mm | persistent /m | pairs 0.3 / 0.6 / 1.2 mm |
+|---|---|---|---|---|---|---|---|
+| fibhv-a H | 0.40 (step 10000) | 12223 | 7.63 | 0.57 | 0.83 | 47.0 | .971 / .957 / .991 |
+| fibhv-b H | 0.07 | 8525 | 5.42 | 0.58 | 0.87 | 60.1 | .966 / .926 / 1.0 (37) |
+| fibhv-a V | 0.47 (step 10000) | 10323 | 6.40 | 0.56 | 0.83 | 101.2 | .945 / .937 / .992 |
+| fibhv-b V | 0.07 | 9213 | 5.77 | 0.58 | 0.85 | 149.6 | .909 / .882 / .983 (57) |
+
+At step 10000 (fibhv-b): H 5103 lines, 3.12 m, median 0.56 mm, p90 0.82, persistent 51.8 /m, pairs .968 / .954 / .889 (9);
+V 6853 lines, 4.24 m, median 0.57, p90 0.84, persistent 142.0 /m, pairs .917 / .903 / .964 (28). No longer lines, fewer of them; the
+change rate stays above fibhv-a's (47.0 H / 101.2 V). fibhv-b was stopped at 10000 and fibhv-c started from it: `--fib-dir 1
+--init-from fibhv-b/snap/10000 --head-map 0,1,-1,...` (the mask head kept, the 7 direction rows fresh; 59 tensors copied), same
+recipe, snapshots every 3000; at step 50 mask bce 0.109 (fibhv-b 0.105), dir bce 1.45, 1.6 samp/s, 9.7 GB.
+
+The ring did what it was meant to: the masks now mark 7 % of the papyrus (tubes) instead of 40-47 % (layers). It did not make the traced
+lines longer at step 5000 (line ends: support 12657, turn 2276, coherence 1470 for H: the tubes fade, they no longer wander), and
+the lines change sheet more often. Step 10000 / 30000 still to come; the direction head (fibhv-c) is the next lever.
 
 **Smoothed axis (`fiber-trace --st-r 3`) as default: no.** Persistent sheet changes per metre (lower is better), base -> st-r 3:
 HOLD H 47.5 -> 41.0 (better), HOLD V 90.6 -> 93.7, PH1 H 272.9 -> 282.0, PH1 V 319.3 -> 343.3, PH2 H 204.3 -> 211.9, PH2 V 196.1 -> 212.5,
