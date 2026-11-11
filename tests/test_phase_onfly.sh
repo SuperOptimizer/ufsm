@@ -2,7 +2,8 @@
 # the on-the-fly pair-rule phase (src/band_onfly.h, sources "phase": {"onfly": {root, key, rmax}}) on the wind fixture's level-1 codes:
 # phase-raster --pair 1 writes the stored phase; ufsm phase-onfly is byte-identical to it on the CPU and (with a GPU) on the GPU, also
 # with small tiles (--budget-mb 64: many tiles per window, halo seams); and two --det training runs, one on the stored phase and one on
-# the onfly phase, log the same losses
+# the onfly phase, log the same losses. With a GPU every tile's codes are decoded on the device (volcomp lossless, k_ll_sub / k_ll_build)
+# and the CPU-decoded path (UFSM_ONFLY_CPU_DECODE=1) is checked too
 # Usage: test_phase_onfly.sh UFSM MAKE_WIND_FIXTURE DIR
 set -eu
 U=$(readlink -f "$1"); MF=$(readlink -f "$2"); D=$3
@@ -15,6 +16,8 @@ R=24   # (phase-raster --radius native voxels; --gs 2: rmax 12 codes voxels)
 grep -q 'byte-identical' cpu.log || { echo "FAIL: no byte-identical line"; exit 1; }
 if nvidia-smi -L > /dev/null 2>&1; then
   "$U" phase-onfly fx/band 1 --rmax 12 --ref ph 4.8 --windows 4 --P 100 --gpu 0 --budget-mb 64 --threads 4 > gpu.log 2>&1 || { echo "FAIL: GPU onfly differs ($D/gpu.log)"; tail -3 gpu.log; exit 1; }
+  grep -qE ' ([1-9][0-9]*) of \1 tiles decoded on the GPU' gpu.log || { echo "FAIL: not every tile's codes decoded on the GPU ($D/gpu.log)"; tail -1 gpu.log; exit 1; }
+  UFSM_ONFLY_CPU_DECODE=1 "$U" phase-onfly fx/band 1 --rmax 12 --ref ph 4.8 --windows 4 --P 100 --gpu 0 --budget-mb 64 --threads 4 > gpuc.log 2>&1 || { echo "FAIL: GPU pair rule on CPU-decoded codes differs ($D/gpuc.log)"; exit 1; }
 fi
 F=$(readlink -f fx); P=$(readlink -f ph)
 python3 - "$F" "$P" <<'PY'

@@ -634,6 +634,10 @@ $(B)/test_side: tests/test_side.c $(B)/band.o
 $(B)/test_band_pair: tests/test_band_pair.c src/band.h src/bandgpu.h $(B)/band.o $(B)/nn_band.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(CUDA)/include $< $(B)/band.o $(B)/nn_band.o -o $@ $(LDLIBS) $(CUDALIBS)
 suite-bins: $(B)/test_band_pair
+# the volcomp lossless codes decode on the GPU (the onfly phase's codes) against z3_read, byte for byte
+$(B)/test_lldec: tests/test_lldec.c $(B)/band_onfly.o $(B)/band.o $(B)/edt.o $(B)/nn_band.o $(B)/z3w.o $(B)/zarr3.o $(B)/store.o $(B)/json.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
+suite-bins: $(B)/test_lldec
 
 $(B)/test_scan_augment: tests/test_scan_augment.c src/scan_augment.c src/scan_augment.h $(B)/ct_augment.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_scan_augment.c $(B)/ct_augment.o -o $@ -lm
