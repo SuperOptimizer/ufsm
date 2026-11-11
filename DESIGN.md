@@ -6,6 +6,41 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Fibre retrain: ring labels, a direction head, the smoothed-axis check (2026-11-11, branch fibers-20261110)
+
+Follow-up of the section below (our masks mark fibre layers, not tubes).
+
+**Fibre spacing** (nearest other fibre axis, voxels of 8.64 um, 4 random 384^3 boxes per AFV, every 7th resampled axis point):
+
+| AFV | same family p5 / p25 / median / p75 | any family p5 / median | share < 5 / 8 voxels (any) |
+|---|---|---|---|
+| PHerc1447_1mm_v2 | 9.1 / 12.3 / 14.7 / 17.2 | 6.3 / 12.3 | 0.01 / 0.15 |
+| PHerc0175A_1mm_v2 | 8.5 / 11.8 / 14.3 / 16.8 | 6.4 / 12.3 | 0.01 / 0.15 |
+| 0175A_SMALLMORE (all lengths) | 0.2 / 0.4 / 0.9 / 11.7 | 0.2 / 6.9 | 0.46 / 0.54 |
+
+The all-lengths tracing is mostly duplicate traces of the same fibres (half its points lie within one voxel of another trace).
+
+**Ring labels** (`fiber-raster --ring K --extra ALL.afv`, `scripts/fibers/mklabels2.sh` -> labels2): positive within radius 2 of an
+axis as before, unknown in a guard out to 4 voxels, then 0 in both planes ("no fibre axis here") out to 7 voxels (35..60 um), unless any
+fibre of the all-lengths tracing lies within 4 voxels; unknown elsewhere in papyrus as before; air 0. The ring ends at 7 < the 9-voxel
+5th percentile of same-family spacing, so a neighbour's tube rarely reaches it. `--resume 1` skips shards already written.
+test_fiberraster covers ring / guard / veto.
+
+**Direction head** (`train --fib-dir L [--fib-dir-r 4]`): 7 more outputs after the two masks: the axis dyad a a^T in the normal head's
+coding (zz, yy, xx, 0.5 + zy, 0.5 + zx, 0.5 + yx; BCE, unit positive weight) and the family (V 1). Choice: a sign-free dyad, not the
+official model's (nx, ny) on the z >= 0 hemisphere: that encoding flips sign exactly at horizontal tangents, i.e. along every H fibre,
+a discontinuity a per-voxel regression cannot fit; the dyad is continuous and the tracer already sums dyads (ft_tensor). Targets are
+computed on the GPU from the augmented label planes (`nn_fib_dir_targets`: the second moment of the voxel's own family tube voxels in
+a 9^3 cube, largest eigenvector, kept where lambda_1 / trace >= 0.6 and >= 9 tube voxels; crossings, unknown and non-tube voxels
+masked), so every augmentation (symmetries, rotation, elastic) is consistent by construction and no label plane changes. Whole-window
+loss path only (the H / V mask task, B 1; refused with other tasks). test_fib_dir (4 synthetic tubes, |a . axis| >= 0.98 inside).
+60-step smoke at P 256: dir bce 1.00 -> 0.69 over 60 steps, the mask losses as without the head; the checkpoint records
+`fib_dir` (channels, coding).
+
+**Smoothed axis (`fiber-trace --st-r 3`) as default: no.** Persistent sheet changes per metre (lower is better), base -> st-r 3:
+HOLD H 47.5 -> 41.0 (better), HOLD V 90.6 -> 93.7, PH1 H 272.9 -> 282.0, PH1 V 319.3 -> 343.3, PH2 H 204.3 -> 211.9, PH2 V 196.1 -> 212.5,
+PH3 H 335.4 -> 354.6, PH3 V 265.5 -> 281.5; the 0.6 mm pair share falls in all 7 of those. Defaults unchanged.
+
 ## Fibre continuity: why our traced fibres are short, `fiber-link`, tracer options (2026-11-11, branch fibers-20261110)
 
 Question: our fibres (fibhv-a step 10000 masks traced with `fiber-trace --mask`) are short; can tracing or joining make them longer
