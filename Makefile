@@ -483,6 +483,9 @@ suite-bins: $(B)/test_fiberjudge
 $(B)/test_fibertrace: tests/test_fibertrace.c $(B)/fibertrace.o $(B)/afv.o $(B)/zarr2.o $(B)/zarr3.o $(B)/store.o $(B)/json.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
 suite-bins: $(B)/test_fibertrace
+$(B)/test_fibertrace_dyad: tests/test_fibertrace_dyad.c $(B)/fibertrace.o $(B)/afv.o $(B)/zarr2.o $(B)/zarr3.o $(B)/z3w.o $(B)/store.o $(B)/json.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
+suite-bins: $(B)/test_fibertrace_dyad
 $(B)/test_fiberraster: tests/test_fiberraster.c $(B)/fiberraster.o $(B)/afv.o $(B)/z3w.o $(B)/zarr3.o $(B)/store.o $(B)/json.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
 suite-bins: $(B)/test_fiberraster
