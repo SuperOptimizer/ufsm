@@ -725,6 +725,55 @@ static const float *tta_pass(const tta_ctx *T, int code) {
     return lg;
 }
 
+/* UFSM_PRED_CELL_Q (measurement for a cell-output prediction store): the latent-grid head's cell logits [C][d][h][w] of each window
+   rounded in place to a per-channel step (one value for all channels or C comma-separated; 0 = statistics only, no rounding), int8
+   indices clamped to +-127; over each window's interior cells (halo cells off) per-channel mean / sd / |max|, index entropy, clipped
+   count and the zstd-3 size of the int8 planes, reported at exit as bytes per voxel (64 voxels per cell). */
+static struct { int on, C; float st[256]; double n, s[256], s2[256], amax[256], zb[256], clip[256]; uint64_t hist[256][255]; void *h; size_t hn; } g_cq;
+static void cellq_report(void) {
+    if (!g_cq.n) return;
+    double tz = 0, te = 0; fprintf(stderr, "cellq: %.0f interior cells (%.3g Gvox), C %d\n", g_cq.n, g_cq.n * 64e-9, g_cq.C);
+    for (int c = 0; c < g_cq.C; c++) {
+        const double m = g_cq.s[c] / g_cq.n, sd = sqrt(fmax(0, g_cq.s2[c] / g_cq.n - m * m)); double e = 0;
+        for (int k = 0; k < 255; k++) if (g_cq.hist[c][k]) { const double p = g_cq.hist[c][k] / g_cq.n; e -= p * log2(p); }
+        tz += g_cq.zb[c]; te += e / 8;
+        fprintf(stderr, "cellq: ch %2d mean %+8.4f sd %7.4f |max| %7.3f step %.4g  H %.3f bit  zstd %.4f B/cell  clipped %.2g\n", c, m, sd, g_cq.amax[c], g_cq.st[c],
+                g_cq.st[c] > 0 ? e : 0., g_cq.zb[c] / g_cq.n, g_cq.clip[c] / g_cq.n);
+    }
+    if (g_cq.st[0] > 0) fprintf(stderr, "cellq: total %.4f B/voxel zstd-3 (H0 %.4f B/voxel), %.3f B/cell\n", tz / (g_cq.n * 64), te / 64, tz / g_cq.n);
+}
+static void cellq_init(int C) {
+    const char *e = getenv("UFSM_PRED_CELL_Q"); g_cq.on = 1; g_cq.C = C < 256 ? C : 256; int k = 0;
+    for (const char *p = e; *p && k < g_cq.C; k++) { g_cq.st[k] = strtof(p, (char **)&p); if (*p == ',') p++; else break; }
+    for (int c = k > 0 ? k : 1; c < g_cq.C; c++) g_cq.st[c] = g_cq.st[k > 0 ? k - 1 : 0];   /* (the last value repeats) */
+    atexit(cellq_report);
+}
+static void cellq_apply(const void *ld, int lh16, int C, int d, int h, int w, int hz, int hxy) {   /* hz, hxy: halo in cells */
+    if (!g_cq.on) cellq_init(C);
+    const size_t n = (size_t)C * d * h * w, es = lh16 ? 2 : 4;
+    if (g_cq.hn < n * es) { free(g_cq.h); g_cq.h = malloc(n * es); g_cq.hn = n * es; }
+    nn_sync(); nn_d2h(g_cq.h, ld, n * es);
+    const int iz = d - 2 * hz, iy = h - 2 * hxy, ix = w - 2 * hxy; if (iz <= 0 || iy <= 0 || ix <= 0) return;
+    const size_t ni = (size_t)iz * iy * ix; int8_t *q = malloc(ni); const size_t zc = ZSTD_compressBound(ni); void *zb = malloc(zc);
+    for (int c = 0; c < g_cq.C; c++) {
+        const float st = g_cq.st[c]; size_t j = 0;
+        for (int z = 0; z < d; z++) for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) {
+            const size_t i = (((size_t)c * d + z) * h + y) * w + x;
+            float v = lh16 ? (float)((_Float16 *)g_cq.h)[i] : ((float *)g_cq.h)[i];
+            int qi = 0;
+            if (st > 0) { const float r = rintf(v / st); qi = r > 127 ? 127 : r < -127 ? -127 : (int)r; v = qi * st; }
+            if (lh16) ((_Float16 *)g_cq.h)[i] = (_Float16)v; else ((float *)g_cq.h)[i] = v;
+            if (z < hz || z >= d - hz || y < hxy || y >= h - hxy || x < hxy || x >= w - hxy) continue;
+            const float o = lh16 ? (float)((_Float16 *)g_cq.h)[i] : v;
+            g_cq.s[c] += o; g_cq.s2[c] += (double)o * o; if (fabs(o) > g_cq.amax[c]) g_cq.amax[c] = fabs(o);
+            if (st > 0) { g_cq.hist[c][qi + 127]++; g_cq.clip[c] += qi == 127 || qi == -127; q[j++] = (int8_t)qi; }
+        }
+        if (st > 0) g_cq.zb[c] += (double)ZSTD_compress(zb, zc, q, ni, 3);
+    }
+    g_cq.n += (double)ni; free(q); free(zb);
+    if (g_cq.st[0] > 0) nn_h2d((void *)ld, g_cq.h, n * es);
+}
+
 int cmd_predict(int argc, char **argv) {
     if (argc < 6) {
         fprintf(stderr, "usage: ufsm predict <ckpt> <root> <ct-group-key> <out-dir> --um U [--level 0] [--box z,y,x,nz,ny,nx] [--window W] [--act-mx8 1]\n"
@@ -1267,7 +1316,8 @@ int cmd_predict(int argc, char **argv) {
         if (!xd && !ct_stem && !latin) xd = nn_malloc((size_t)xs.c * w3 * (h16 ? 2 : 4));
         if (auxz) { auxd = nn_malloc(w3); auxh = malloc(w3); }
         if (half) { x2 = nn_malloc(shape_numel(xn) * (h16 ? 2 : 4));   /* (lgf, and lrt with the direct latent input: at their first use; the direct latent rv path has none) */
-            if (lat_store) { lz_d = nn_malloc(w3 / 64 * (lz_c + 1)); } if (hdiv > 2 && !latin) lrt = nn_malloc(w3 / 8 * 16); }
+            if (hdiv > 2 && !latin) lrt = nn_malloc(w3 / 8 * 16); }
+        if (lat_store && gpath) lz_d = nn_malloc(w3 / 64 * (lz_c + 1));   /* (a voxel checkpoint too: its CT window rebuilt from the cells) */
         if (ct_stem) fprintf(stderr, "predict: in-place slab inference from the CT window (%.1f B per window voxel)\n", (double)unet_activation_bytes(u) / w3);
         if (tta > 1 && (!ct_stem || !ct_shared || degrade || auxz || cfg.cin != 4)) { fprintf(stderr, "predict: --tta needs the CT-stem device path (no --aug-*, --aux, extra inputs)\n"); return 2; }
     }
@@ -1558,6 +1608,13 @@ int cmd_predict(int argc, char **argv) {
         rd.lzt = nthreads < 1 ? 1 : nthreads > 32 ? 32 : nthreads; rd.lz = calloc((size_t)rd.lzt, sizeof(zr)); rd.lzo = lz_org; rd.lzc = lz_c;
         for (int t = 0; t < rd.lzt; t++) if (zr_open(&rd.lz[t], lat_store)) { fprintf(stderr, "predict: --latents: cannot open %s\n", lat_store); return 1; }
         const float *lg_; float ls_; const int lc_ = unet_lat_basis(u, &lz_bas, &lg_, &ls_);
+        if (!lc_ && !half && gpath && lz_d) {   /* a voxel checkpoint (no --lat-basis): fed the CT rebuilt from the store's cells with the store's own transform
+                                                    (the codec test: a CT net on the decoded CT against the real one) */
+            char bp[1200]; snprintf(bp, sizeof bp, "%s/basis.lcb", lat_store); lat_basis *lb = malloc(sizeof *lb);
+            if (!lb || lat_basis_load(bp, lb)) { fprintf(stderr, "predict: --latents: cannot read %s\n", bp); return 1; }
+            float *db = nn_malloc((size_t)lz_c * 64 * 4); nn_h2d(db, lb->b, (size_t)lz_c * 64 * 4); free(lb); lz_bas = db;
+            fprintf(stderr, "predict: --latents with a voxel checkpoint: its CT windows rebuilt from the %d stored components\n", lz_c);
+        } else
         if (!gpath || lc_ != lz_c || !lz_d) { fprintf(stderr, "predict: --latents needs the device path and a --lat-basis checkpoint with the store's %d cell channels (it has %d)\n", lz_c, lc_); return 2; }
         {   /* the store's transform must be the checkpoint's: the rebuilt CT and the channels both assume it */
             char bp[1200]; snprintf(bp, sizeof bp, "%s/basis.lcb", lat_store); lat_basis *lb = malloc(sizeof *lb); float *hb = malloc((size_t)lz_c * 64 * 4); double dm = 0;
@@ -1756,6 +1813,8 @@ int cmd_predict(int argc, char **argv) {
                 else nn_lowres_input(xd, xs, hdiv, hmode, lrt, x2, h16);
                 nn_ptick("input pool");
                 const float *l2 = unet_forward_x(u, x2, xn, 0, h16); nn_ptick("trunk forward");
+                static int cq = -1; if (cq < 0) cq = getenv("UFSM_PRED_CELL_Q") != nullptr;
+                if (cq && half == 3) cellq_apply(l2, unet_logits_h16(u), cfg.cout, Wz / 4, W / 4, W / 4, hz / 4, halo / 4);
                 if (ldir || fzs) l2d = l2;
                 else if (ffd && cfg.lat_guide == 8) {   /* the general guided head: the 11 task planes, then the 8 coefficient planes (the head's last), the CT terms into the phase channels 0-1 */
                     const size_t cv_ = w3 / 64, es_ = unet_logits_h16(u) ? 2 : 4;

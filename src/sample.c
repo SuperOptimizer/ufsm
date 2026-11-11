@@ -2981,7 +2981,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
                 PH_PUT(wt, p3);
             }
             PROF_MARK(PS_PHREAD);
-            if (c->wind4 && !s->scope_local) {   /* ("scope": "local": the winding mod 4 stays unknown, below) */   /* the winding mod 4: the phase unwrapped before the air test (gaps join the windings), outside the scroll (CT 0) not */
+            if (c->wind4 && s->scope_local != 1) {   /* ("scope": "local": the winding mod 4 stays unknown, below; "w4" trains it) */   /* the winding mod 4: the phase unwrapped before the air test (gaps join the windings), outside the scroll (CT 0) not */
                 uint8_t *pw = PH_GET(ttmp + p3 + 64, p3);
                 if (!pw) { SW_PUT(); return -1; }
                 ph_known = phase_air(ctu, sw, pw, p3, c->side_air); air_done = 1;   /* (the winding input and the air test in one pass) */
@@ -3572,7 +3572,7 @@ sampler *sampler_start(sources *S, const sample_cfg *cfg) {
     if (cfg->replay > 1 && (!sampler_replay_ok(cfg) || replay_selftest())) { fprintf(stderr, "sampler: --replay needs --gpu-aug 2 cube batches without sheet / band / gap / condition / distill / view / cover / chain / papyrus-mask planes\n"); return nullptr; }
     if (!S || S->n <= 0 || cfg->P <= 0 || cfg->B <= 0 || cfg->nworkers <= 0 || cfg->nbuf <= 0) { fprintf(stderr, "sampler: invalid sources, patch, batch, workers or buffer count\n"); return nullptr; }
     if (cfg->gpu_input && !sample_gpu_input_ok(cfg)) { fprintf(stderr, "sampler: --gpu-input needs 16-bit batches and no warps, sheet prior, slab appearance plan, aux or condition inputs\n"); return nullptr; }
-    { int nl = 0, nw = 0; for (int i = 0; i < S->n; i++) { nl += S->src[i].scope_local; nw += S->src[i].phase_wt != nullptr; }
+    { int nl = 0, nw = 0; for (int i = 0; i < S->n; i++) { nl += S->src[i].scope_local == 1; nw += S->src[i].phase_wt != nullptr; }
       if (nl || nw) fprintf(stderr, "sampler: %d of %d sources scope local (no winding mod 4 target)%s, %d with a phase weight (8^3 blocks kept with probability w)\n",
                             nl, S->n, cfg->wind4 ? "" : " (no --wind4 in this run: no effect)", nw);
       for (int i = 0; i < S->n; i++) if (S->src[i].phase_wt && (cfg->crush.p > 0)) { fprintf(stderr, "sampler: note: phase weights are not applied on crushed / torn / re-bent windows\n"); break; } }

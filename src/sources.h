@@ -113,7 +113,9 @@ typedef struct {
                         block of a window keeps its phase with probability w (a per-block draw), so the phase / winding losses see the label
                         with expected weight w (ufsm surf-labels gate confidence); applied where the ignore mask is (not on crushed / torn windows) */
     int scope_local; /* "scope": "local": the labels are right only locally (our own fits' turn counts drift): the winding mod 4 target
-                        (task unwrap2 --wind4) stays unknown for this source; phase, normals and density train as usual. "global" (default) */
+                        (task unwrap2 --wind4) stays unknown for this source; phase, normals and density train as usual. 2 = "w4": short-range only (our
+                        gated spirals: consecutive sheets right inside a tile, turn counts not): the winding mod 4 trains (one gauge per tile, as
+                        for every source), any long-range / count loss must skip it. "global" (default) */
     z3 *phase_ign;   /* optional "phase": {..., "ignore": {"root", "key"}}: a uint8 array on the stored phase's grid, nonzero = the phase there is not trained on (ufsm phase-conflict) */
     uint8_t *focus; int64_t focus_grid[3]; float focus_w;   /* optional "focus": {"map": RAW, "w": K} (ufsm phase-packing --map: per coarse occupancy cell 0 none, else
                                                               1 + 254 x packed share): the position draw takes a cell 1 + K x share times as often */

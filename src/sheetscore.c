@@ -10,7 +10,8 @@
      cell ids   per --cell^3 cell (gauge-free): the share of its aligned matched voxels on the cell's most common k; reported as the
                 matched-voxel-weighted mean over cells (1 = no local skips / switches / merges)
      global ids the share on the box-wide most common k (one gauge for the box; mod 14 turns)
-   --tsv: per cell z y x n_matched dominant_share k. Deterministic for any thread count. */
+   --tsv: per cell z y x n_matched dominant_share k. --mask ROOT KEY (uint8 on the same grid, e.g. surf-labels ignore.zarr or a gt-gate
+   mask): our voxels where it is nonzero are dropped first, so a gate is scored by what it keeps. Deterministic for any thread count. */
 #include "sources.h"
 #include "store.h"
 #include "zarr3.h"
@@ -26,7 +27,7 @@ static const char *ss_opt(int argc, char **argv, const char *k, const char *d) {
 static inline int ss_sheet(uint8_t c) { return c >= 1 && c <= 252; }
 
 typedef struct {
-    z3 *ours, *gt; int64_t b0[3], bn[3]; int B, tol, pr, cell, nt; int64_t nb[3];
+    z3 *ours, *gt, *mask; int64_t b0[3], bn[3]; int B, tol, pr, cell, nt; int64_t nb[3];
     _Atomic long next; long nitems; _Atomic int fail;
     _Atomic long long gt_n, gt_hit, our_n, our_reg, our_hit, al_n, mis_n, hist[14], fh[10];   /* fh: |fractional offset| in 0.05-turn bins (0 .. 0.5) */
     double *cnum, *cden; int *ck; long long *cn; int64_t nc[3];
@@ -68,6 +69,10 @@ static int ss_block(ss_job *J, long it, uint8_t *bufo, uint8_t *bufg, uint8_t *m
     const int64_t off[3] = {J->b0[0] + c0[0] - o[0], J->b0[1] + c0[1] - o[1], J->b0[2] + c0[2] - o[2]};   /* core start inside the read region */
     if (z3_read(J->ours, o, n, bufo, 1) || z3_read(J->gt, o, n, bufg, 1)) return -1;
     const size_t NN = (size_t)(n[0] * n[1] * n[2]);
+    if (J->mask) {   /* --mask: our voxels where the gate array is nonzero are not ours (a gate scored by what it keeps) */
+        if (z3_read(J->mask, o, n, mo, 1)) return -1;
+        for (size_t i = 0; i < NN; i++) if (mo[i]) bufo[i] = 0;
+    }
     for (size_t i = 0; i < NN; i++) { mo[i] = ss_sheet(bufo[i]); mg[i] = ss_sheet(bufg[i]); }
     memcpy(mr, mg, NN);
     ss_dilate(mo, n, J->tol, tmp);   /* ours within tol */
@@ -138,7 +143,7 @@ static void *ss_run(void *arg) {
 
 int cmd_sheet_score(int argc, char **argv) {
     if (argc < 6) {
-        fprintf(stderr, "usage: ufsm sheet-score OURS_ROOT OURS_KEY GT_ROOT GT_KEY [--tol 1] [--prec-r 8] [--cell 64] [--box z,y,x,nz,ny,nx] [--block 128] [--threads N] [--tsv OUT]\n");
+        fprintf(stderr, "usage: ufsm sheet-score OURS_ROOT OURS_KEY GT_ROOT GT_KEY [--tol 1] [--prec-r 8] [--cell 64] [--box z,y,x,nz,ny,nx] [--block 128] [--threads N] [--tsv OUT] [--mask ROOT KEY]\n");
         return 2;
     }
     ss_job J = {0};
@@ -156,6 +161,11 @@ int cmd_sheet_score(int argc, char **argv) {
         fprintf(stderr, "sheet-score: --tol 0..8, --prec-r tol..64, --cell >= 8 dividing --block, --threads >= 1\n"); return 2;
     }
     for (int d = 0; d < 3; d++) { J.b0[d] = 0; J.bn[d] = so[d]; }
+    for (int i = 6; i + 2 < argc + 1; i++) if (!strcmp(argv[i], "--mask")) {
+        if (i + 2 >= argc) { fprintf(stderr, "sheet-score: --mask ROOT KEY\n"); return 2; }
+        J.mask = z3_open(store_open(argv[i + 1]), argv[i + 2], nullptr);
+        if (!J.mask || memcmp(z3_meta_of(J.mask)->shape, so, 3 * sizeof *so)) { fprintf(stderr, "sheet-score: --mask %s %s: cannot open or not on the codes' grid\n", argv[i + 1], argv[i + 2]); return 1; }
+        break; }
     { const char *ap = ss_opt(argc, argv, "--axis", nullptr);
       if (ap) { const double au = atof(ss_opt(argc, argv, "--axis-um", "0")), gu = atof(ss_opt(argc, argv, "--grid-um", "0"));
                 if (!(au > 0) || !(gu > 0) || axis_load(&J.ax, ap)) { fprintf(stderr, "sheet-score: --axis F needs --axis-um U --grid-um G and a readable axis\n"); return 2; }
@@ -196,6 +206,6 @@ int cmd_sheet_score(int argc, char **argv) {
         }
         fclose(f);
     }
-    z3_close(J.ours); z3_close(J.gt); free(J.cnum); free(J.cden); free(J.ck); free(J.cn);
+    z3_close(J.ours); z3_close(J.gt); if (J.mask) z3_close(J.mask); free(J.cnum); free(J.cden); free(J.ck); free(J.cn);
     return 0;
 }
