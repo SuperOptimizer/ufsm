@@ -440,11 +440,12 @@ static void *prof_worker(void *arg) {
             if ((r + G->lr0) % st) continue;
             for (int64_t cc = c0; cc < c1; cc++) {
                 if ((cc + G->lc0) % st || !px_sup(G, r, cc)) continue;
+                const int fo = G->face ? G->face[(size_t)r * G->lw + cc] : 0; if (fo == FACE_NONE) continue;   /* --face: t relative to the open face */
                 const int cls = G->lab[(size_t)r * G->lw + cc] >= 128;
                 double gu, gv, Pp[3], N[3]; px_grid(G, (double)r, (double)cc, &gu, &gv);
                 if (ssurf_pn(G->S, gu, gv, Pp, N)) continue;
                 for (int i = -T; i <= T; i++) {
-                    const double tt = i * c->layer_vox * G->sign; double q[3];
+                    const double tt = (fo + i * c->layer_vox) * G->sign; double q[3];
                     for (int d = 0; d < 3; d++) q[d] = (Pp[d] + tt * N[d] - J->off) / J->V - o[d];
                     const float cv = tri_box(cb, n, q[0], q[1], q[2]), pv = pb ? tri_box(pb, n, q[0], q[1], q[2]) : 0.f;
                     if (cv < 0) continue;
@@ -576,6 +577,29 @@ int inksplat_run(const inksplat_cfg *c) {
     if (!ct0) { fprintf(stderr, "ink-splat: CT level 0: %s\n", z3_error()); goto out1; }
     int64_t shape0[3]; memcpy(shape0, z3_meta_of(ct0)->shape, sizeof shape0);
 
+    char face_json[2048] = "";
+    if (c->face) {   /* --face: the open face per supervised label pixel from the output level's CT (before the profile, which then runs face-relative) */
+        const double V = (double)(1 << c->level); z3 *ct = c->level ? pyramid_open_level(cts, c->ct_key, c->level, c->ct_um, c->cache) : ct0;
+        if (!ct) { fprintf(stderr, "ink-splat: CT level %d: %s\n", c->level, z3_error()); goto out2; }
+        G.face = malloc((size_t)G.lw * G.lh); if (!G.face) goto out2;
+        memset(G.face, (uint8_t)(int8_t)FACE_NONE, (size_t)G.lw * G.lh);
+        fjob FJ = {0}; FJ.G = &G; FJ.V = V; FJ.off = (V - 1) / 2; FJ.ct = ct; FJ.nbx = (G.ntiles_x + FBLK - 1) / FBLK; FJ.nby = (G.ntiles_y + FBLK - 1) / FBLK;
+        FJ.nblk = FJ.nbx * FJ.nby; pthread_mutex_init(&FJ.mu, nullptr);
+        pthread_t th[64]; const int nt = c->threads < 1 ? 1 : c->threads > 64 ? 64 : c->threads;
+        for (int i = 0; i < nt; i++) pthread_create(&th[i], nullptr, face_worker, &FJ);
+        for (int i = 0; i < nt; i++) pthread_join(th[i], nullptr);
+        if (ct != ct0) z3_close(ct);
+        if (atomic_load(&FJ.failed)) goto out2;
+        const uint64_t ns = atomic_load(&FJ.nsup), nf = atomic_load(&FJ.nface); double cum = 0; int q[5] = {0}; const double qs[5] = {0.1, 0.25, 0.5, 0.75, 0.9};
+        for (int k = 0, qi = 0; k < 256 && qi < 5; k++) { cum += FJ.hist[k]; while (qi < 5 && nf && cum >= qs[qi] * nf) q[qi++] = k - 128; }
+        fprintf(stderr, "ink-splat: %s: open face found at %llu of %llu supervised px (%.1f%%); face offset p10 / p25 / p50 / p75 / p90 %d / %d / %d / %d / %d level-0 voxels along %+dN; band [f%+g, f%+g]\n",
+                name, (unsigned long long)nf, (unsigned long long)ns, ns ? 100.0 * nf / ns : 0, q[0], q[1], q[2], q[3], q[4], (int)G.sign, c->face_a, c->face_b);
+        int o = snprintf(face_json, sizeof face_json, "\"face\": {\"band\": [%g, %g], \"search\": [%g, %g], \"run\": %d, \"gap\": %d, \"px\": %llu, \"found\": %llu, \"q10_25_50_75_90\": [%d, %d, %d, %d, %d], \"hist\": {",
+                         c->face_a, c->face_b, c->face_lo, c->face_hi, c->face_run, c->face_gap, (unsigned long long)ns, (unsigned long long)nf, q[0], q[1], q[2], q[3], q[4]);
+        for (int k = 0, first = 1; k < 256 && o < (int)sizeof face_json - 40; k++) if (FJ.hist[k]) { o += snprintf(face_json + o, sizeof face_json - o, "%s\"%d\": %llu", first ? "" : ", ", k - 128, (unsigned long long)FJ.hist[k]); first = 0; }
+        snprintf(face_json + o, sizeof face_json - o, "}},\n ");
+        G.ta = c->face_lo + c->face_a; G.tb = c->face_hi + c->face_b;   /* (the reach of the tile -> shard pairs) */
+    }
     /* ---- profile ---- */
     char prof_json[65536]; prof_json[0] = 0;
     if (c->profile) {   /* (without --pred: the CT columns only) */
@@ -656,26 +680,6 @@ int inksplat_run(const inksplat_cfg *c) {
         z3 *ct = L ? pyramid_open_level(cts, c->ct_key, L, c->ct_um, c->cache) : ct0;
         if (!ct) { fprintf(stderr, "ink-splat: CT level %d: %s\n", L, z3_error()); goto out2; }
         int64_t oshape[3]; memcpy(oshape, z3_meta_of(ct)->shape, sizeof oshape);
-        char face_json[2048] = "";
-        if (c->face) {   /* --face: the open face per supervised label pixel from this level's CT */
-            G.face = malloc((size_t)G.lw * G.lh); if (!G.face) goto out2;
-            memset(G.face, (uint8_t)(int8_t)FACE_NONE, (size_t)G.lw * G.lh);
-            fjob FJ = {0}; FJ.G = &G; FJ.V = V; FJ.off = (V - 1) / 2; FJ.ct = ct; FJ.nbx = (G.ntiles_x + FBLK - 1) / FBLK; FJ.nby = (G.ntiles_y + FBLK - 1) / FBLK;
-            FJ.nblk = FJ.nbx * FJ.nby; pthread_mutex_init(&FJ.mu, nullptr);
-            pthread_t th[64]; const int nt = c->threads < 1 ? 1 : c->threads > 64 ? 64 : c->threads;
-            for (int i = 0; i < nt; i++) pthread_create(&th[i], nullptr, face_worker, &FJ);
-            for (int i = 0; i < nt; i++) pthread_join(th[i], nullptr);
-            if (atomic_load(&FJ.failed)) goto out2;
-            const uint64_t ns = atomic_load(&FJ.nsup), nf = atomic_load(&FJ.nface); double cum = 0; int q[5] = {0}; const double qs[5] = {0.1, 0.25, 0.5, 0.75, 0.9};
-            for (int k = 0, qi = 0; k < 256 && qi < 5; k++) { cum += FJ.hist[k]; while (qi < 5 && nf && cum >= qs[qi] * nf) q[qi++] = k - 128; }
-            fprintf(stderr, "ink-splat: %s: open face found at %llu of %llu supervised px (%.1f%%); face offset p10 / p25 / p50 / p75 / p90 %d / %d / %d / %d / %d level-0 voxels along %+dN; band [f%+g, f%+g]\n",
-                    name, (unsigned long long)nf, (unsigned long long)ns, ns ? 100.0 * nf / ns : 0, q[0], q[1], q[2], q[3], q[4], (int)G.sign, c->face_a, c->face_b);
-            int o = snprintf(face_json, sizeof face_json, "\"face\": {\"band\": [%g, %g], \"search\": [%g, %g], \"run\": %d, \"gap\": %d, \"px\": %llu, \"found\": %llu, \"q10_25_50_75_90\": [%d, %d, %d, %d, %d], \"hist\": {",
-                             c->face_a, c->face_b, c->face_lo, c->face_hi, c->face_run, c->face_gap, (unsigned long long)ns, (unsigned long long)nf, q[0], q[1], q[2], q[3], q[4]);
-            for (int k = 0, first = 1; k < 256 && o < (int)sizeof face_json - 40; k++) if (FJ.hist[k]) { o += snprintf(face_json + o, sizeof face_json - o, "%s\"%d\": %llu", first ? "" : ", ", k - 128, (unsigned long long)FJ.hist[k]); first = 0; }
-            snprintf(face_json + o, sizeof face_json - o, "}},\n ");
-            G.ta = c->face_lo + c->face_a; G.tb = c->face_hi + c->face_b;   /* (the reach of the tile -> shard pairs) */
-        }
         char lv[64], adir[1400]; z3w_level_name(um, lv, sizeof lv); snprintf(adir, sizeof adir, "%s/%s", c->out, lv);
         if (mkdir_p(c->out)) { fprintf(stderr, "ink-splat: mkdir %s\n", c->out); goto out2; }
         const char *attrs = "{\"ufsm\":{\"content\":\"ink-splat\",\"encoding\":\"prob254: p*254, 254 = ink, 0 = no ink, 255 = unknown\"}}";
@@ -992,4 +996,47 @@ int cmd_ink_score(int argc, char **argv) {
     }
     free(L); free(M); lsrc_close(&LL); if (msk) lsrc_close(&LM); ssurf_free(&S);
     return rc;
+}
+
+/* ufsm ink-vscore: voxelwise score of a 3-D ink prediction (prob254, 255 unknown) against a 3-D reference (an ink-splat zarr) over a box:
+   at the voxels known in both, AUC (tie-aware, 255-bin ranks), the best F1 over thresholds, F1 / precision / recall at 127 (p 0.5). */
+int cmd_ink_vscore(int argc, char **argv) {
+    const int gi = sidx(argc, argv, "--gt"), pi = sidx(argc, argv, "--pred");
+    const char *bx = sopt(argc, argv, "--box", nullptr), *row = sopt(argc, argv, "--row", nullptr), *cache = sopt(argc, argv, "--cache", nullptr);
+    const int L = atoi(sopt(argc, argv, "--level", "1")), nth = ufsm_threads(atoi(sopt(argc, argv, "--threads", "0")), 8);
+    long long b[6];
+    if (gi < 0 || pi < 0 || gi + 2 >= argc || pi + 2 >= argc || !bx || sscanf(bx, "%lld,%lld,%lld,%lld,%lld,%lld", b, b + 1, b + 2, b + 3, b + 4, b + 5) != 6 || L < 0 || L > 6) {
+        fprintf(stderr, "usage: ufsm ink-vscore --gt ROOT KEY --pred ROOT KEY --box z,y,x,nz,ny,nx (level-0) [--level 1] [--row TAG] [--threads 8] [--cache DIR]\n"
+                        "  voxelwise AUC / best F1 / F1 at 0.5 of a prob254 prediction vs a prob254 reference at the voxels known in both (the box on level L)\n"); return 2;
+    }
+    store *gs = store_open(argv[gi + 1]), *ps = store_open(argv[pi + 1]);
+    z3 *g = gs ? z3_open(gs, argv[gi + 2], cache) : nullptr, *p = ps ? z3_open(ps, argv[pi + 2], cache) : nullptr;
+    if (!g || !p) { fprintf(stderr, "ink-vscore: cannot open %s: %s\n", !g ? "--gt" : "--pred", z3_error()); return 1; }
+    int64_t o[3], n[3]; size_t nv = 1;
+    for (int d = 0; d < 3; d++) {
+        const int64_t s = z3_meta_of(g)->shape[d] < z3_meta_of(p)->shape[d] ? z3_meta_of(g)->shape[d] : z3_meta_of(p)->shape[d];
+        o[d] = b[d] >> L; int64_t e = (b[d] + b[d + 3] + (1 << L) - 1) >> L; if (e > s) e = s; if (o[d] < 0) o[d] = 0;
+        n[d] = e - o[d]; if (n[d] <= 0) { fprintf(stderr, "ink-vscore: box outside the arrays\n"); return 1; } nv *= (size_t)n[d];
+    }
+    uint8_t *A = malloc(nv), *B = malloc(nv);
+    if (!A || !B || z3_read(g, o, n, A, nth) || z3_read(p, o, n, B, nth)) { fprintf(stderr, "ink-vscore: read failed: %s\n", z3_error()); return 1; }
+    double h[2][255] = {{0}}; uint64_t ngt = 0;
+    for (size_t k = 0; k < nv; k++) { if (A[k] == 255) continue; ngt++; if (B[k] == 255) continue; h[A[k] >= 127][B[k]]++; }
+    double P = 0, N = 0; for (int v = 0; v < 255; v++) { P += h[1][v]; N += h[0][v]; }
+    double auc = 0, below = 0; for (int v = 0; v < 255; v++) { auc += h[1][v] * (below + 0.5 * h[0][v]); below += h[0][v]; }
+    auc = P > 0 && N > 0 ? auc / (P * N) : NAN;
+    double best = 0; int bt = 0, f5i = 0; double f05 = 0, p05 = 0, r05 = 0, tp = P, fp = N;   /* predicted ink = value >= t */
+    for (int t = 0; t < 255; t++) {
+        const double f1 = tp + fp + P > 0 ? 2 * tp / (tp + fp + P) : 0;
+        if (f1 > best) { best = f1; bt = t; }
+        if (t == 127) { f05 = f1; p05 = tp + fp > 0 ? tp / (tp + fp) : 0; r05 = P > 0 ? tp / P : 0; f5i = 1; }
+        tp -= h[1][t]; fp -= h[0][t];
+    }
+    (void)f5i;
+    printf("%s\t%.0f\t%.0f\t%.4f\t%.4f\t%.4f\t%d\t%.4f\t%.4f\t%.4f\t%.4f\n", row ? row : "-", P, N, P + N > 0 ? (P + N) / ngt : 0, P / fmax(1, P + N), auc, bt, best, f05, p05, r05);
+    fprintf(stderr, "ink-vscore: %s: box %lld,%lld,%lld +%lld,%lld,%lld on level %d: %.0f ink + %.0f no-ink known in both (%.1f%% of the %llu reference voxels): AUC %.4f, best F1 %.4f at >= %d, "
+                    "F1 / P / R at 0.5 %.4f / %.4f / %.4f\n", row ? row : "-", (long long)o[0], (long long)o[1], (long long)o[2], (long long)n[0], (long long)n[1], (long long)n[2], L, P, N,
+            ngt ? 100.0 * (P + N) / ngt : 0, (unsigned long long)ngt, auc, best, bt, f05, p05, r05);
+    free(A); free(B); z3_close(g); z3_close(p); store_close(gs); store_close(ps);
+    return 0;
 }
