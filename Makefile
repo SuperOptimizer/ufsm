@@ -143,7 +143,6 @@ $(B)/nn_gpudec.o: NVFLAGS = -O3 $(NVARCH) -DUFSM_ARCH=$(ARCH) -fmad=false -Xcomp
 $(B)/nn_cf.o: NVFLAGS = -O3 $(NVARCH) -DUFSM_ARCH=$(ARCH) -fmad=false -Xcompiler -fno-threadsafe-statics -Isrc
 # fiber-trace's axis on the GPU (src/nn_ftrace.cu) is byte-identical to src/ftaxis.c: IEEE division / sqrt, no FMA contraction, no fast math
 $(B)/nn_ftrace.o: NVFLAGS = -O3 $(NVARCH) -DUFSM_ARCH=$(ARCH) -fmad=false -Xcompiler -fno-threadsafe-statics -Isrc
-
 # the phase-raster pair rule on the GPU (src/nn_band.cu) is byte-identical to band.c: IEEE division / sqrt, no FMA contraction, no fast math
 $(B)/nn_band.o: NVFLAGS = -O3 $(NVARCH) -DUFSM_ARCH=$(ARCH) -fmad=false -Xcompiler -fno-threadsafe-statics -Isrc
 # FP8 / FP4 block-scaled mma (kind::mxf8f6f4 / kind::mxf4) needs the arch-specific sm_120a target
