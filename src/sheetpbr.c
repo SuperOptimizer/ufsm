@@ -103,7 +103,7 @@ static double cb_cubic(const cbox *B, double z, double y, double x) {
 typedef struct {
     sgrid G; cbox B; int cubic, W, ss, K; double step, depth, u0, v0, sgn, win1;
     float *tp0, *cr, *cvv;                        /* pass-1 sheet middle, recto and verso offsets per sample (upsampled) */
-    float *grr, *grv;                            /* edge strengths (CT per voxel) */
+    float *grr, *grv, *amb;                      /* edge strengths (CT per voxel); runner-up / best of the recto edge */
     float *r, *v, *thk, *pk, *nin, *nout, *flat, *fmax, *valid;
     atomic_int next;
 } job;
@@ -148,7 +148,7 @@ static int sheet(const job *J, const double P[3], const double n[3], double c, d
 /* pass 2: the faces near their coarse positions (cr, cv: recto / verso offsets from the tracked lattice): the steepest rise of the smoothed
    profile (air -> papyrus, outward) within +-w of cr and the steepest fall within +-w of cv, sub-voxel by a parabola through the
    derivative's extremum */
-static int faces(const job *J, const double P[3], const double n[3], double cr, double cv, double w, double out[8]) {
+static int faces(const job *J, const double P[3], const double n[3], double cr, double cv, double w, double out[10]) {
     const double lo = cr - w - 3, hi = cv + w + 3; const int K = (int)((hi - lo) / J->step) + 1; double f[1024], g[1024];
     if (K < 8 || K > 1024) return 0;
     for (int k = 0; k < K; k++) f[k] = prof(J, P, n, lo + k * J->step);
@@ -158,6 +158,11 @@ static int faces(const job *J, const double P[3], const double n[3], double cr, 
         if (fabs(t - cr) <= w && d > best) { best = d; kr = k; }
         if (fabs(t - cv) <= w && d < worst) { worst = d; kv = k; } }
     if (kr < 2 || kv < 2 || kr + 2 >= K || kv + 2 >= K || best <= 0 || worst >= 0) return 0;
+    double b2 = 0, w2 = 0; const int sep = (int)(1.0 / J->step + 0.5);   /* runner-up extrema >= 1 voxel away: ambiguity */
+    for (int k = 2; k + 2 < K; k++) { const double t = lo + k * J->step, d = g[k + 1] - g[k - 1];
+        const int lmax = d >= g[k] - g[k - 2] && d >= g[k + 2] - g[k], lmin = d <= g[k] - g[k - 2] && d <= g[k + 2] - g[k];
+        if (fabs(t - cr) <= w && abs(k - kr) >= sep && lmax && d > b2) b2 = d;
+        if (fabs(t - cv) <= w && abs(k - kv) >= sep && lmin && d < w2) w2 = d; }
     double e[2]; const int kk[2] = {kr, kv};
     for (int s = 0; s < 2; s++) { const int k = kk[s]; const double a = g[k] - g[k - 2], b = g[k + 1] - g[k - 1], c = g[k + 2] - g[k], den = a - 2 * b + c;
         e[s] = lo + (k + (fabs(den) > 1e-9 ? 0.5 * (a - c) / den : 0)) * J->step; }
@@ -165,7 +170,7 @@ static int faces(const job *J, const double P[3], const double n[3], double cr, 
     double ni = 0, no = 0, pk = 0; int cn = 0;
     for (double t = 0.25; t <= 2.0; t += 0.25, cn++) { ni += prof(J, P, n, e[0] + t); no += prof(J, P, n, e[1] - t); }
     for (double t = e[0]; t <= e[1]; t += 0.5) { const double q = prof(J, P, n, t); if (q > pk) pk = q; }
-    out[0] = e[0]; out[1] = e[1]; out[2] = e[1] - e[0]; out[3] = pk; out[4] = ni / cn; out[5] = no / cn; out[6] = best; out[7] = -worst;
+    out[0] = e[0]; out[1] = e[1]; out[2] = e[1] - e[0]; out[3] = pk; out[4] = ni / cn; out[5] = no / cn; out[6] = best; out[7] = -worst; out[8] = b2 / best; out[9] = w2 / worst;
     return 1;
 }
 /* pass 1: the sheets crossing the normal at one lattice point, as (middle, thickness): runs between void minima of the smoothed profile
@@ -184,12 +189,12 @@ static int sheet_list(const job *J, const double P[3], const double n[3], double
 static void *pass2(void *a) {
     job *J = a; const int W = J->W;
     for (int py; (py = atomic_fetch_add(&J->next, 1)) < W;) for (int px = 0; px < W; px++) {
-        const size_t i = (size_t)py * W + px; double P[3], n[3], o[8];
-        J->valid[i] = 0; J->grr[i] = J->grv[i] = NAN; J->r[i] = J->v[i] = J->thk[i] = J->pk[i] = J->nin[i] = J->nout[i] = J->flat[i] = J->fmax[i] = NAN;
+        const size_t i = (size_t)py * W + px; double P[3], n[3], o[10];
+        J->valid[i] = 0; J->grr[i] = J->grv[i] = J->amb[i] = NAN; J->r[i] = J->v[i] = J->thk[i] = J->pk[i] = J->nin[i] = J->nout[i] = J->flat[i] = J->fmax[i] = NAN;
         if (!frame(J, px, py, P, n)) continue;
         J->flat[i] = (float)prof(J, P, n, 0); double m = 0; for (double t = -3; t <= 3; t += 0.5) { const double q = prof(J, P, n, t); if (q > m) m = q; } J->fmax[i] = (float)m;
         if (!(J->cr[i] == J->cr[i]) || !faces(J, P, n, J->cr[i], J->cvv[i], fmax(1.0, J->tp0[i]), o)) continue;
-        J->grr[i] = (float)(o[6] / (2 * J->step)); J->grv[i] = (float)(o[7] / (2 * J->step));
+        J->grr[i] = (float)(o[6] / (2 * J->step)); J->grv[i] = (float)(o[7] / (2 * J->step)); J->amb[i] = (float)fmax(o[8], o[9]);
         J->r[i] = (float)o[0]; J->v[i] = (float)o[1]; J->thk[i] = (float)o[2]; J->pk[i] = (float)o[3]; J->nin[i] = (float)o[4]; J->nout[i] = (float)o[5]; J->valid[i] = 1;
     }
     return nullptr;
@@ -336,6 +341,55 @@ static float *lat_up(const float *c1, int nc, int L8, int W) {
     free(c2); free(c3); return o;
 }
 
+/* ---- the recto face as one continuous surface: dynamic programming over the offset ----
+   Evidence E(pixel, k): the rise of the smoothed profile (air -> papyrus, outward) at t_k = cr + (k - KD) step, normalised per pixel to
+   its maximum, cost 1 - E. Row pass: Viterbi along every row, transition cost lam |dt| per pixel with |dt| <= smax voxels (a face cannot
+   step more than smax between neighbouring samples); column pass: Viterbi along every column on cost + mu |t - t_row|. */
+typedef struct { job *J; float *E; int KD; } dpectx;
+static void dpe_row(void *a, int y) {
+    const dpectx *C = a; job *J = C->J; const int W = J->W, KE = 2 * C->KD + 1, pad = (int)(2.0 / J->step);
+    for (int x = 0; x < W; x++) { const size_t i = (size_t)y * W + x; float *e = C->E + i * KE; double P[3], n[3], f[1024], g[1024];
+        for (int k = 0; k < KE; k++) e[k] = 0;
+        if (!(J->cr[i] == J->cr[i]) || !frame(J, x, y, P, n)) continue;
+        const int K = KE + 2 * pad; const double lo = J->cr[i] - (C->KD + pad) * J->step;
+        for (int k = 0; k < K; k++) f[k] = prof(J, P, n, lo + k * J->step);
+        smooth1(f, g, K, 0.6 / J->step);
+        double mx = 0; for (int k = 0; k < KE; k++) { const int q = k + pad; const double d = g[q + 1] - g[q - 1]; e[k] = (float)(d > 0 ? d : 0); if (d > mx) mx = d; }
+        if (mx > 0) for (int k = 0; k < KE; k++) e[k] /= (float)mx; }
+}
+typedef struct { const job *J; const float *E; int KD; double lam, smax, mu; const float *prior; float *out; int col; } dpctx;
+static void dp_line(void *a, int l) {   /* one row (col 0) or column (col 1) */
+    const dpctx *C = a; const job *J = C->J; const int W = J->W, KE = 2 * C->KD + 1; const double st = J->step, px = 1.0 / J->ss;
+    float *D = malloc((size_t)W * KE * sizeof *D); int16_t *B = malloc((size_t)W * KE * sizeof *B);
+    for (int j = 0; j < W; j++) { const size_t i = C->col ? (size_t)j * W + l : (size_t)l * W + j; const float *e = C->E + i * KE; const double c0 = J->cr[i];
+        const size_t ip = j ? (C->col ? (size_t)(j - 1) * W + l : (size_t)l * W + j - 1) : 0; const double cp = j ? J->cr[ip] : 0;
+        for (int k = 0; k < KE; k++) { const double t = c0 + (k - C->KD) * st;
+            double u = (c0 == c0) ? 1 - e[k] : 0; if (C->prior && C->prior[i] == C->prior[i]) u += C->mu * fabs(t - C->prior[i]);
+            if (!j || !(c0 == c0) || !(cp == cp)) { D[(size_t)j * KE + k] = (float)u; B[(size_t)j * KE + k] = -1; continue; }
+            double best = 1e30; int bk = -1;
+            for (int q = 0; q < KE; q++) { const double tq = cp + (q - C->KD) * st, dt = fabs(t - tq); if (dt > C->smax * px + 1e-9) continue;
+                const double v = D[(size_t)(j - 1) * KE + q] + C->lam * dt / px; if (v < best) { best = v; bk = q; } }
+            if (bk < 0) { best = 1e30; for (int q = 0; q < KE; q++) if (D[(size_t)(j - 1) * KE + q] < best) { best = D[(size_t)(j - 1) * KE + q]; bk = q; } best += 4; }   /* a break */
+            D[(size_t)j * KE + k] = (float)(best + u); B[(size_t)j * KE + k] = (int16_t)bk; } }
+    int k = 0; for (int q = 1; q < KE; q++) if (D[(size_t)(W - 1) * KE + q] < D[(size_t)(W - 1) * KE + k]) k = q;
+    for (int j = W - 1; j >= 0; j--) { const size_t i = C->col ? (size_t)j * W + l : (size_t)l * W + j;
+        C->out[i] = J->cr[i] == J->cr[i] ? (float)(J->cr[i] + (k - C->KD) * st) : NAN; const int b = B[(size_t)j * KE + k]; if (b >= 0) k = b; }
+    free(D); free(B);
+}
+
+/* NaN-aware median over a (2R + 1)^2 window, rows in parallel */
+typedef struct { const float *in; float *out; int W, R; } mdctx;
+static void md_row(void *a, int y) {
+    const mdctx *C = a; const int W = C->W, R = C->R; float w[441];
+    for (int x = 0; x < W; x++) { int m = 0;
+        for (int j = -R; j <= R; j++) for (int i = -R; i <= R; i++) { const int yy = y + j, xx = x + i; if (yy < 0 || xx < 0 || yy >= W || xx >= W) continue; const float q = C->in[(size_t)yy * W + xx]; if (q == q) w[m++] = q; }
+        if (!m) { C->out[(size_t)y * W + x] = NAN; continue; }
+        const int h = m / 2; int lo = 0, hi = m - 1;   /* quickselect */
+        while (lo < hi) { const float pv = w[(lo + hi) / 2]; int i = lo, j = hi; while (i <= j) { while (w[i] < pv) i++; while (w[j] > pv) j--; if (i <= j) { const float t = w[i]; w[i] = w[j]; w[j] = t; i++; j--; } } if (h <= j) hi = j; else if (h >= i) lo = i; else break; }
+        C->out[(size_t)y * W + x] = w[h]; }
+}
+static void median2d(const float *in, float *out, int W, int R) { mdctx C = {in, out, W, R < 10 ? R : 10}; prows(W, md_row, &C); }
+
 int cmd_sheet_pbr(int argc, char **argv) {
     const char *ctr = nullptr, *ctk = nullptr; long long cu = -1, cv = -1, cn = 0;
     for (int i = 1; i + 2 < argc; i++) if (!strcmp(argv[i], "--ct")) { ctr = argv[i + 1]; ctk = argv[i + 2]; }
@@ -444,12 +498,50 @@ int cmd_sheet_pbr(int argc, char **argv) {
     }
     free(c1); free(c2); free(lgl); free(lgr); free(ugl); free(ugr);
     /* pass 2 */
-    float **M[] = {&J.r, &J.v, &J.thk, &J.pk, &J.nin, &J.nout, &J.flat, &J.fmax, &J.valid, &J.grr, &J.grv};
+    float **M[] = {&J.r, &J.v, &J.thk, &J.pk, &J.nin, &J.nout, &J.flat, &J.fmax, &J.valid, &J.grr, &J.grv, &J.amb};
     for (size_t k = 0; k < sizeof M / sizeof *M; k++) *M[k] = malloc(NN * sizeof(float));
     pthread_t th[64]; const int nt = nth < 64 ? nth : 64;
     for (int t = 0; t < nt; t++) pthread_create(&th[t], nullptr, pass2, &J);
     for (int t = 0; t < nt; t++) pthread_join(th[t], nullptr);
+    size_t ndisagree = 0, ndp = 0;
+    if (atoi(popt(argc, argv, "--dp", "1"))) {
+        const int KD = (int)(atof(popt(argc, argv, "--dp-range", "6")) / J.step + 0.5), KE = 2 * KD + 1;
+        float *E = malloc(NN * KE * sizeof *E), *rrow = malloc(NN * sizeof *rrow), *rdp = malloc(NN * sizeof *rdp);
+        if (!E) { fprintf(stderr, "sheet-pbr: no memory for the DP evidence\n"); return 1; }
+        dpectx EC = {&J, E, KD}; prows(J.W, dpe_row, &EC);
+        const double lam = atof(popt(argc, argv, "--dp-lambda", "0.5")), smax = atof(popt(argc, argv, "--dp-step", "1")), mu = atof(popt(argc, argv, "--dp-mu", "0.5"));
+        dpctx R1 = {&J, E, KD, lam, smax, 0, nullptr, rrow, 0}; prows(J.W, dp_line, &R1);
+        dpctx R2 = {&J, E, KD, lam, smax, mu, rrow, rdp, 1}; prows(J.W, dp_line, &R2);
+        for (size_t i = 0; i < NN; i++) if (rdp[i] == rdp[i] && J.r[i] == J.r[i]) { ndp++; ndisagree += fabsf(rdp[i] - J.r[i]) > 1; }
+        /* the recto face re-found within +-0.5 voxels of the DP surface (sub-voxel), the verso as before around its own median */
+        float *mv = malloc(NN * sizeof *mv); median2d(J.v, mv, J.W, 3 * J.ss);
+        for (size_t i = 0; i < NN; i++) { J.cr[i] = rdp[i]; J.cvv[i] = mv[i] == mv[i] ? mv[i] : NAN; J.tp0[i] = 0.5f; }
+        atomic_store(&J.next, 0);
+        for (int t = 0; t < nt; t++) pthread_create(&th[t], nullptr, pass2, &J);
+        for (int t = 0; t < nt; t++) pthread_join(th[t], nullptr);
+        for (size_t i = 0; i < NN; i++) if (!(J.valid[i] > 0) && rdp[i] == rdp[i]) J.r[i] = rdp[i];   /* the DP surface where no verso was found */
+        free(E); free(rrow); free(rdp); free(mv);
+        fprintf(stderr, "sheet-pbr: DP recto surface: per-sample steepest rise more than 1 voxel from the DP surface at %.1f %% of the samples\n", ndp ? 100.0 * ndisagree / ndp : 0);
+    }
+    /* pass 3, continuity: every sample re-finds its faces within +-cw voxels of the median of its neighbourhood (pass 2 faces), i.e. a
+       face may deviate at most cw from its surroundings; samples that moved by more than cw were discontinuous in pass 2 */
+    const double cw = atof(popt(argc, argv, "--cont-win", "1.25")); const int cr2 = (int)(atof(popt(argc, argv, "--cont-r", "3")) * J.ss + 0.5);
+    size_t namb = 0, nmov = 0, n2 = 0;
+    for (size_t i = 0; i < NN; i++) if (J.valid[i] > 0) { n2++; namb += J.amb[i] >= 0.7; }
+    if (cw > 0 && !atoi(popt(argc, argv, "--dp", "1"))) for (int it = 0; it < 2; it++) {
+        float *mr = malloc(NN * sizeof *mr), *mv = malloc(NN * sizeof *mv), *r0 = malloc(NN * sizeof *r0);
+        median2d(J.r, mr, J.W, cr2); median2d(J.v, mv, J.W, cr2); memcpy(r0, J.r, NN * sizeof *r0);
+        for (size_t i = 0; i < NN; i++) { J.cr[i] = mr[i]; J.cvv[i] = mv[i]; J.tp0[i] = (float)cw; }
+        atomic_store(&J.next, 0);
+        for (int t = 0; t < nt; t++) pthread_create(&th[t], nullptr, pass2, &J);
+        for (int t = 0; t < nt; t++) pthread_join(th[t], nullptr);
+        if (it == 0) for (size_t i = 0; i < NN; i++) nmov += r0[i] == r0[i] && mr[i] == mr[i] && fabsf(r0[i] - mr[i]) > cw;
+        free(mr); free(mv); free(r0);
+    }
     size_t nv = 0; for (size_t i = 0; i < NN; i++) nv += J.valid[i] > 0;
+    fprintf(stderr, "sheet-pbr: faces: %.1f %% of samples found in pass 2; ambiguous recto / verso edge (runner-up >= 0.7 of the best, >= 1 voxel away) %.1f %%; "
+                    "pass-2 recto more than %.2f voxels from its neighbourhood median %.1f %%; found after the continuity passes %.1f %%\n",
+            100.0 * n2 / NN, n2 ? 100.0 * namb / n2 : 0, cw, n2 ? 100.0 * nmov / n2 : 0, 100.0 * nv / NN);
     /* the height field and diagnostics */
     float *H = malloc(NN * sizeof *H), *Hv = malloc(NN * sizeof *Hv), *g = malloc(NN * sizeof *g), *hp = malloc(NN * sizeof *hp), *rough = malloc(NN * sizeof *rough), *curv = malloc(NN * sizeof *curv), *g2 = malloc(NN * sizeof *g2);
     for (size_t i = 0; i < NN; i++) { H[i] = -J.r[i]; Hv[i] = J.v[i]; }
@@ -480,12 +572,12 @@ int cmd_sheet_pbr(int argc, char **argv) {
       fclose(f); }
     /* the maps */
     snprintf(p, sizeof p, "%s/map.json", out); FILE *js = fopen(p, "w"); int first = 1;
-    fprintf(js, "{\"W\":%d,\"ss\":%d,\"crop\":[%lld,%lld,%lld],\"depth\":%g,\"step\":%g,\"interp\":\"%s\",\"outward\":%g,\"valid\":%.4f,\"maps\":[",
-            J.W, J.ss, cu, cv, cn, J.depth, J.step, J.cubic ? "cubic" : "tri", J.sgn, (double)nv / NN);
+    fprintf(js, "{\"dp_disagree\":%.4f,\"amb\":%.4f,\"discont\":%.4f,\"W\":%d,\"ss\":%d,\"crop\":[%lld,%lld,%lld],\"depth\":%g,\"step\":%g,\"interp\":\"%s\",\"outward\":%g,\"valid\":%.4f,\"maps\":[",
+            ndp ? (double)ndisagree / ndp : 0, n2 ? (double)namb / n2 : 0, n2 ? (double)nmov / n2 : 0, J.W, J.ss, cu, cv, cn, J.depth, J.step, J.cubic ? "cubic" : "tri", J.sgn, (double)nv / NN);
     const struct { const char *n; const float *a; } maps[] = {{"recto_off", J.r}, {"verso_off", J.v}, {"thickness", J.thk}, {"peak", J.pk}, {"near_recto", J.nin},
         {"near_verso", J.nout}, {"flat", J.flat}, {"flatmax", J.fmax}, {"height", H}, {"verso_h", Hv}, {"highpass", hp}, {"roughness", rough}, {"curvature", curv},
-        {"edge_recto", J.grr}, {"edge_verso", J.grv}, {"ao", ao}, {"rti_max", rmax}, {"rti_min", rmin}, {"rti_range", rr}, {"pbr", pbr}, {"pbr_density", pbd}};
-    for (size_t k = 0; k < sizeof maps / sizeof *maps; k++) { write_f32(out, maps[k].n, maps[k].a, J.W, js, &first); if (k < 15) write_auto(out, maps[k].n, maps[k].a, J.W); }
+        {"edge_recto", J.grr}, {"edge_verso", J.grv}, {"ambiguity", J.amb}, {"ao", ao}, {"rti_max", rmax}, {"rti_min", rmin}, {"rti_range", rr}, {"pbr", pbr}, {"pbr_density", pbd}};
+    for (size_t k = 0; k < sizeof maps / sizeof *maps; k++) { write_f32(out, maps[k].n, maps[k].a, J.W, js, &first); if (k < 16) write_auto(out, maps[k].n, maps[k].a, J.W); }
     fprintf(js, "]}\n"); fclose(js);
     double ts = 0; for (size_t i = 0; i < NN; i++) if (J.valid[i] > 0) ts += J.thk[i];
     fprintf(stderr, "sheet-pbr: %d x %d samples, sheet found in %.1f %%, mean thickness %.2f voxels -> %s\n", J.W, J.W, 100.0 * nv / NN, nv ? ts / nv : 0, out);
