@@ -6,6 +6,63 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Fibre-normal arms: the seed-repeat noise floor and an untested source-mix confound (2026-11-11, branch fibnote-20261111)
+
+Closes the fibre-in-the-winding-net arms (section "Fibres in the winding network", below); the work moves to the universal latent net.
+All numbers: wbench core, WIN 384 HALO 64, the 39 clean boxes (ceil >= 0.8), step 4000, paired A - B with 95 % CI (`wbench-stats`).
+
+Noise floor, measured: vc384c-r2 is vc384c's recipe with seed 4 instead of 3. vc384c-r2 - vc384c: p05x +0.002 [-0.008, +0.013], ids
+-0.009 [-0.033, +0.011], p1x +0.003 [-0.008, +0.014]. Per set the four Paris 4 boxes alone move +0.020 p05x on the seed. So on these
+39 boxes a p05x difference under ~0.01 and an ids difference under ~0.02-0.03 is not a result; per-set (4-box) deltas under ~0.02 are noise.
+
+| A - B (p05x) | all | note |
+|---|---|---|
+| vcfibA2 (lambda 0.1, map-registered P4 labels) - vc384c | -0.015 [-0.027, -0.003] | P4 -0.028, July -0.022, 1667 +0.021 (ids +0.033) |
+| vcfibU (term only where the normal BCE mask is off) - vc384c | -0.016 [-0.027, -0.005] | July -0.025, 1667 +0.012 |
+| vc384c-r2 - vcfibA2 / - vcfibU | +0.018 [+0.007, +0.027] / +0.019 [+0.009, +0.028] | the loss stands outside seed noise |
+| vcfibA2 - vcfibA (old affine labels) | +0.014 [+0.001, +0.029] | the registration map helped |
+
+Absolute p05x: vc384c 0.668, vc384c-r2 0.671, vcfibA2 0.653, vcfibU 0.652, vcfibA 0.640.
+
+Untested confound: every fibre arm also changed the source list (`sources-wind-gt-fibp4r`: the Paris 4 June / July sources carry the
+fibre raster as their "sheet" target, which also changes how those windows are drawn - the level-5 CT papyrus occupancy fallback in
+`sample.c` - against vc384c's `sources-wind-gt-nvme`). So the Paris 4 / July loss may be the data mix, not the term. The control
+(vcfib0: vcfibA2 exactly with lambda 1e-9 - lambda 0 switches `IPLANE` off and changes the data path) was prepared in
+`runs/vcfib.launch.sh` and never run; run it before drawing a conclusion about the term. Not run either: lambda 0.03, the pair term.
+
+## Latent winding net vs wind96: where the gap is (2026-11-11, branch latbeat-20261111)
+
+wbench core, 39 clean boxes (paired, 95 % CI): wind96 (voxel, WIN 640) p05x 0.677; best latent wz896-12000 (wz768 8000 + 12000 steps,
+P 896, WIN 640) 0.624 (-0.035 vs wind96 at WIN 384, lat-wind96-ct 0.662: -0.038 [-0.057, -0.017]); wzlo2-8000 (wind96 init-shift 2,
+`--init-lr-mult 0.2`) 0.589, equal to wzlo-8000 (`--trunk-lr-mult 0.2`) +0.003 [-0.010, +0.016]: the inherited-layer lr is not the lever;
+wz896's extra training is.
+
+New: `ufsm field-diag A_DIR [B_DIR] --phase ROOT KEY [--bins 60,100,150,250] [--tsv 1]` (src/fielddiag.c): two fit-field sets against
+the label phase raster per label sheet-spacing bin (um / |wrapped grad phase|): phase error |wrap(phase - label)| (confident cells), p10
+(share of labelled cells within 0.1 turn and confident), confidence, normal alignment n^T T n / tr T against the label-phase gradient,
+|log2| spacing error. A = wz896-12000 (WIN 640), B = wind96 at WIN 384 (lat-wind96-ct: the only wind96 core field set kept), all 39 clean
+boxes, cells weighted equally:
+
+| set | spacing um | share | p10 A / B (A-B) | conf A / B | nal A / B (A-B) |
+|---|---|---|---|---|---|
+| all | <60 | 0.026 | .184 / .195 (-.011) | .177 / .196 | .782 / .779 (+.003) |
+| all | 60-100 | 0.166 | .290 / .319 (-.029) | .246 / .285 | .879 / .881 (-.002) |
+| all | 100-150 | 0.329 | .405 / .425 (-.020) | .327 / .364 | .910 / .916 (-.006) |
+| all | 150-250 | 0.333 | .432 / .443 (-.011) | .412 / .425 | .906 / .918 (-.012) |
+| all | >=250 | 0.146 | .503 / .517 (-.014) | .520 / .510 | .838 / .857 (-.019) |
+| paris4 (4) | 60-100 / 100-150 | .34 / .37 | -.032 / -.035 | .214/.246, .314/.364 | -.000 / -.009 |
+| paris4j (28) | 60-100 / 100-150 | .14 / .34 | -.030 / -.020 | .254/.298, .318/.353 | -.003 / -.006 |
+| 1667 (7) | 60-100 / 100-150 | .05 / .14 | +.028 / +.041 | .415/.435, .557/.560 | -.007 / -.007 |
+
+Per box: corr(share of cells with spacing < 100 um, p05x A - B) = -0.31; the 5 most packed boxes (share >= 0.25) lose -0.101 p05x,
+the 25 middle ones -0.027, the 9 least packed -0.033.
+
+Verdict: mostly resolution. The latent net's phase deficit is largest at 60-150 um sheet spacing (6-15 label voxels, 1.5-4 latent
+cells of 38.4 um per sheet period) and on Paris 4, where most sheets are that packed; its confidence there is 10-15 % lower; on 1667
+(wide sheets) its phase is better than wind96's. A smaller second deficit is the normal head at wide spacing (-0.012..-0.05 nal), where
+the latent spacing head is also worse (sperr .54 vs .39 at 150-250 um) while it is better in packed sheets. Next (queued): a stride-2
+voxel stem into the cell-shuffle head (resolution), larger windows (P >= 1152, context), distillation from wind96, more gated data.
+
 ## fibhv-d: the fibre mask model on every published fibre set (2026-11-11, branch fibd-20261111)
 
 Why: fibhv-a..c trained on two scrolls only (PHerc1447 + PHerc0175A `*_1mm_v2`, 8.64 um) and were judged on Paris 4 HOLD, a scroll and

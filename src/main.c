@@ -252,6 +252,8 @@ static int usage(void) {
         "  ufsm phase-gate <in-fields> <out-fields> --ref MODEL [--mode gate|ref]   the network phase replaced by a ref model's where it does not rotate with the sheets\n"
         "  ufsm hires-phase <ct-root> <key> <fields-dir> <out-dir> --ct-um U   fit fields with the sheet phase measured in a finer CT (valleys along the normal)\n"
         "  ufsm phase-packing <phase-root> <phase-key> [--box ..] [--map OUT.raw]   how packed the labelled sheets are (box stats, per-chunk map for the sampler focus)\n"
+        "  ufsm field-diag A_DIR [B_DIR] --phase ROOT KEY [--bins 60,100,150,250]   two fit-field sets vs the label phase per sheet-spacing bin (phase / normal / spacing)\n"
+        "  ufsm fields-phase OUT --like ROOT KEY [--ref ROOT KEY] [--conf 0.5] FIELDS...   teacher pseudo-label phase raster from fit fields (distillation)\n"
         "  ufsm wbench-stats A.tsv [B.tsv] [--metric ids,p1x] [--set clean|all]   winding bench means, stratified bootstrap CIs, paired A-B, MDE (--scroll a,b; --tsv 1)\n"
         "  ufsm ckpt-avg OUT.ckpt IN1.ckpt IN2.ckpt ... [--arrays ema|both]   uniform weight average of snapshots of one run (optimiser state of the last)\n"
         "  ufsm phase-conflict <a-root> <a-key> <b-root> <b-key> <out>   where two label phase sets disagree (> --tol turn): the sampler's phase ignore mask\n"
@@ -4541,6 +4543,8 @@ int cmd_spiral_fit(int argc, char **argv);    /* src/countfield.c */
 int cmd_cf_compare(int argc, char **argv);    /* src/countfield.c */
 int cmd_count_anat(int argc, char **argv);    /* src/countanat.c */
 int cmd_phase_packing(int argc, char **argv);   /* src/packmap.c */
+int cmd_field_diag(int argc, char **argv);   /* src/fielddiag.c */
+int cmd_fields_phase(int argc, char **argv);   /* src/fieldsphase.c */
 int cmd_wbench_stats(int argc, char **argv);   /* src/wbench.c */
 int cmd_ckpt_avg(int argc, char **argv);   /* src/wbench.c */
 int cmd_phase_conflict(int argc, char **argv);   /* src/packmap.c */
@@ -4609,6 +4613,8 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "cf-compare")) return cmd_cf_compare(argc, argv);
     if (!strcmp(cmd, "count-anat")) return cmd_count_anat(argc, argv);
     if (!strcmp(cmd, "phase-packing")) return cmd_phase_packing(argc, argv);
+    if (!strcmp(cmd, "field-diag")) return cmd_field_diag(argc, argv);
+    if (!strcmp(cmd, "fields-phase")) return cmd_fields_phase(argc, argv);
     if (!strcmp(cmd, "wbench-stats")) return cmd_wbench_stats(argc, argv);
     if (!strcmp(cmd, "ckpt-avg")) return cmd_ckpt_avg(argc, argv);
     if (!strcmp(cmd, "phase-conflict")) return cmd_phase_conflict(argc, argv);
