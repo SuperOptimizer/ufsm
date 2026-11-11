@@ -384,6 +384,8 @@ void nn_axpy(float *y, float a, const float *x, size_t n);               /* y +=
    K host codes, written into fw; the backward turns the effective pair's gradient in g into gamma's, A's and D's */
 void nn_film_fwd(const float *p, float *fw, size_t gam, size_t bet, size_t fo, int C, int K, const float *codes);
 void nn_film_bwd(const float *p, float *g, size_t gam, size_t bet, size_t fo, int C, int K, const float *codes);
+/* the Gram of K planes of 16-bit values (bf16 1, else fp16) with row stride ld over N entries: S[i K + j] += sum_n x_i x_j for j >= i (src/nn_gram.cu; train --grad-cos) */
+void nn_gram16(const void *x, int bf16, int K, size_t N, size_t ld, double *S);
 void nn_scale(float *y, float a, size_t n);
 void nn_u8_to_f32(const uint8_t *x, size_t n, float scale, float *y);
 

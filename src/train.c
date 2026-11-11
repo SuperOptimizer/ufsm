@@ -90,7 +90,8 @@ typedef struct {
     uint8_t *w4b[2], *wcb[2], *w4, *wc; double *w4ds; float *w4fin, w4h[8]; double w4_loss;   /* --task unwrap2: winding mod 4 and its component per voxel (double-buffered), loss sums, scratch, host parts */
     double *fibacc; void *fiblist; unsigned *fibnl; size_t fibcap; double fib_h[2];   /* --fib-normal-lambda: valid voxels / sum t^T N t (device), the slab list, the fetched sums */
     uint8_t *auxb[3][2], *aux[3], *inkt, *inkm, *inkw;   /* the aux planes (double-buffered; plane j = role g_aux_role[j]); --ink-head: its slab target / mask, weight byte (loss parts: iscratch / iout / ink_loss) */
-    uint8_t *rvt, *rvm; float *rvscratch, rvout[5]; double rv_loss;   /* --rv: the slab's recto / verso targets and mask; --rv 2 (own channels): its loss scratch and parts */
+    uint8_t *rvt, *rvm; float *rvscratch, rvout[5]; double rv_loss;
+    double *gcS; int gc_on;   /* --grad-cos: the step's logit-gradient Gram (device, K x K upper triangle), whether this step collects it */   /* --rv: the slab's recto / verso targets and mask; --rv 2 (own channels): its loss scratch and parts */
     uint8_t *wdb[2], *wd, *ct4, *cm4, *cw4; float *cscratch, cout4[9]; double cond_loss;   /* --cond: the gauge-shifted winding per voxel, its 4 targets, mask, weights; scratch and parts */
     unsigned long long *cacc, cacc_h[2];   /* --cond: known / right-turn voxel counts of the 14-turn head (device, last batch on the host) */
     uint8_t *papb[2], *pap, *pt1, *pmk1, *pw1; float *pscr, pout3[3]; double pap_loss;   /* --pap-head: labels (double-buffered), target, mask, weight; scratch, parts */
@@ -178,7 +179,36 @@ static void aux_setup(void) {
     const int on[AUX_N] = {g_rv != 0, g_ink2 != 0, g_fibn != 0};
     for (int r = 0; r < AUX_N; r++) if (on[r]) { g_aux_of[r] = g_naux; g_aux_role[g_naux++] = r; }
 }
-static float src_head_w(int si, int h) { return si >= 0 && g_S && si < g_S->n ? g_S->src[si].head_w[h] : 1.f; }   /* the source's "heads" multiplier */
+/* A7 --uw 1 (Kendall et al. 2018): a learned log variance s_h per head (phase, normal + density, winding mod 4, rv, ink; the fibre term is
+   not a likelihood and keeps its lambda): the head's gradient weight exp(-s_h), the objective sum_h exp(-s_h) lambda_h L_h + s_h, s_h by Adam
+   on the host from each step's logged head losses (--uw-lr, 1e-3), clamped to [-4, 4] (weights 0.018 .. 55), carried in the checkpoint
+   header ("uw"). g_hmul: the weights in effect (1 without --uw: the same floats) */
+static int g_uw, g_uw_t; static float g_uw_lr = 1e-3f, g_hmul[SH_N] = {1.f, 1.f, 1.f, 1.f, 1.f, 1.f, 1.f}; static double g_uw_s[SH_N], g_uw_m[SH_N], g_uw_v[SH_N];
+static const int g_uw_head[SH_N] = {1, 1, 0, 1, 1, 1, 0};   /* the heads with an s_h (density shares the normal's) */
+static void uw_apply(void) { for (int h = 0; h < SH_N; h++) g_hmul[h] = g_uw && g_uw_head[h] ? (float)exp(-g_uw_s[h]) : 1.f; if (g_uw) g_hmul[SH_DENSITY] = g_hmul[SH_NORMAL]; }
+static void uw_step(const double L[SH_N]) {   /* one Adam step on the s_h with this step's head losses (lambda-weighted; <= 0 or non-finite: no target, no step) */
+    g_uw_t++;
+    for (int h = 0; h < SH_N; h++) {
+        if (!g_uw_head[h] || !(L[h] > 0) || !isfinite(L[h])) continue;
+        const double gr = 1.0 - exp(-g_uw_s[h]) * L[h];
+        g_uw_m[h] = 0.9 * g_uw_m[h] + 0.1 * gr; g_uw_v[h] = 0.999 * g_uw_v[h] + 0.001 * gr * gr;
+        const double mh = g_uw_m[h] / (1 - pow(0.9, g_uw_t)), vh = g_uw_v[h] / (1 - pow(0.999, g_uw_t));
+        g_uw_s[h] -= g_uw_lr * mh / (sqrt(vh) + 1e-8); g_uw_s[h] = g_uw_s[h] < -4 ? -4 : g_uw_s[h] > 4 ? 4 : g_uw_s[h];
+    }
+    uw_apply();
+}
+static void uw_extra(char *dst, size_t n, const char *base) {   /* the checkpoint header's extra with the s_h */
+    snprintf(dst, n, "%s", base); if (!g_uw) return;
+    size_t k = strlen(dst); if (!k || dst[k - 1] != '}') return; dst[--k] = 0;
+    k += (size_t)snprintf(dst + k, n - k, ",\"uw\":{\"t\":%d,\"s\":[", g_uw_t);
+    for (int h = 0; h < SH_N && k < n; h++) k += (size_t)snprintf(dst + k, n - k, "%s%.9g", h ? "," : "", g_uw_s[h]);
+    if (k < n) snprintf(dst + k, n - k, "]}}");
+}
+/* A7 --grad-cos N: every N steps the cosines between the heads' gradients at the head input (the trunk's shared output features): with the
+   head W (cout x C, 1^3), the dot of tasks a and b summed over the cells is sum_{i in a, j in b} (W W^T)_ij S_ij, S the Gram of the logit
+   gradient planes over the cells (nn_gram16 per head slab, inside the one backward of the step) */
+static int g_gc;
+static float src_head_w(int si, int h) { return (si >= 0 && g_S && si < g_S->n ? g_S->src[si].head_w[h] : 1.f) * g_hmul[h]; }   /* the source's "heads" multiplier x --uw */
 static int g_unwrap, g_norm_ch, g_norm_s = 4; static float g_ink_lambda = 1.f, g_ink_dice = 0.f, g_norm_lambda = 1.f, g_dens_lambda = 1.f, g_dens_scale = 32.f;   /* --density-lambda: the density channel's BCE weight (default --normal-lambda) */
 static int g_dens_code; static float g_packed_w, g_packed_um = 120.f;   /* --density-code, --packed-weight, --packed-um (task unwrap) */
 static float g_ptrunc_tau, g_ptrunc_kappa = 0.5f; static int g_ptrunc_from = 5000, g_ptrunc_on;   /* --phase-trunc TAU [--phase-trunc-conf K] [--phase-trunc-from STEP]: the robust phase loss (nn_phase_trunc), on from STEP */
@@ -1065,6 +1095,7 @@ static void head_slab_pass(gpu_state *d, int pass) {
             PT("adjoint");
             if (f1 > f0) {
                 nn_lat_grad_fin(d->latg, LGFC, d->latgl, LNC, pl, qc, f0 - q0, f1 - f0, d->latgc);
+                if (d->gc_on) nn_gram16(d->latgc, 0, LNC, (size_t)(f1 - f0) * pl, (size_t)(f1 - f0) * pl, d->gcS);   /* --grad-cos: the head input's task dots */
                 if (getenv("UFSM_LATG_DUMP")) {   /* the finished coarse gradient planes of every slab of the first step, appended (fp16; fused against chain) */
                     static int done, nth = -1; if (nth < 0) nth = getenv("UFSM_LATG_STEP") ? atoi(getenv("UFSM_LATG_STEP")) - 1 : 0;   /* (UFSM_LATG_STEP=n: the nth gradient pass instead) */
                     if (done == nth) { const size_t nb = (size_t)LNC * (f1 - f0) * pl * 2; void *hb = malloc(nb); nn_sync(); nn_d2h(hb, d->latgc, nb);
@@ -1081,7 +1112,8 @@ static void head_slab_pass(gpu_state *d, int pass) {
         if (g_lat && g_lat_guide == 64) nn_lat_shuffle_adj((char *)d->hs_lg + (size_t)g_side_ch * ns * 2, D / 4, H / 4, W / 4, 16, 2, z0, nz, d->latgl);
         else if (g_lat && g_lat_guide) LGUIDE(1);   /* the coefficient planes' gradients */
         if (g_lat) nn_lat_up_adj(d->hs_lg, LUPC, D / 4, H / 4, W / 4, z0, nz, d->latg, d->nt);   /* (scratch: the normal targets, 7 bytes a voxel, are done for this slab; any channel count: groups of 28) */   /* --lat: the slab's gradient onto the cell grid */
-        else if (unet_head_bwd_z(d->u, z0, z1, d->hs_lg, z0 == 0)) { fprintf(stderr, "head slabs: the fused head backward is not covered (UFSM_HEAD_SLAB=0)\n"); abort(); }
+        else { if (d->gc_on) nn_gram16(d->hs_lg, 0, g_cout, ns, ns, d->gcS);
+               if (unet_head_bwd_z(d->u, z0, z1, d->hs_lg, z0 == 0)) { fprintf(stderr, "head slabs: the fused head backward is not covered (UFSM_HEAD_SLAB=0)\n"); abort(); } }
         if (lchk) {   /* UFSM_LAT_CHECK=1: the separable adjoint against the per-voxel gather (the slab's gradient is still in hs_lg) */
             static float *gc2; const size_t nc = (size_t)LNC * (D / 4) * (H / 4) * (W / 4);   /* (every cell channel: the guided heads have more than the task's) */
             if (!gc2) gc2 = nn_malloc(nc * 4);
@@ -1185,6 +1217,30 @@ static void diag_nonfinite(gpu_state *d, const char *what, const void *p, size_t
     if (!c) return;
     fprintf(stderr, "diagnostics: %llu non-finite %s of %zu\n", c, what, n);
     window_note(d, g_Sdiag, "  window");
+}
+static void gc_report(gpu_state *d, int step) {   /* the tasks' cosines at the head input from the step's Gram (d->gcS) and the live head weights */
+    const unet_cfg *uc = unet_cfg_of(d->u); const int K = uc->cout, C = uc->widths[0];
+    double *S = malloc((size_t)K * K * sizeof *S); float *W = malloc((size_t)K * C * 4); size_t hw, hb; unet_head_offsets(d->u, &hw, &hb);
+    nn_sync(); nn_d2h(S, d->gcS, (size_t)K * K * sizeof *S); nn_d2h(W, unet_live_params(d->u) + hw, (size_t)K * C * 4);
+    enum { T = 5 }; static const char *tn[T] = {"phase", "normal", "wind4", "rv", "ink"}; int8_t *ct = malloc((size_t)K);
+    for (int c = 0; c < K; c++) {   /* channel -> task (-1 none): the interpolated outputs by their head, the guided / sub-cell outputs the side pair's */
+        int t = -1;
+        if (c < g_cout) t = c == g_side_ch || c == g_side_ch + 1 ? 0 : c >= g_norm_ch && c < g_norm_ch + 7 ? 1 : g_unwrap2 && (c == g_w4_ch || c == g_w4_ch + 1) ? 2 : g_rv == 2 && (c == g_rv_ch || c == g_rv_ch + 1) ? 3 : g_ink2 && c == g_ink2_ch ? 4 : -1;
+        else if (g_lat && g_lat_guide == 64 ? c >= 16 : g_lat && g_lat_guide && g_lat_guide != 8) t = 0;
+        ct[c] = (int8_t)t;
+    }
+    double dot[T][T] = {{0}};
+    for (int i = 0; i < K; i++) for (int j = i; j < K; j++) {
+        if (ct[i] < 0 || ct[j] < 0) continue;
+        double m = 0; for (int c = 0; c < C; c++) m += (double)W[(size_t)i * C + c] * W[(size_t)j * C + c];
+        const double v = m * S[(size_t)i * K + j];
+        dot[ct[i]][ct[j]] += v; if (i != j) dot[ct[j]][ct[i]] += v;
+    }
+    char ln[1024]; size_t n = (size_t)snprintf(ln, sizeof ln, "grad-cos step %d (head input):", step);
+    for (int a = 0; a < T; a++) for (int b = a + 1; b < T; b++) if (dot[a][a] > 0 && dot[b][b] > 0 && n < sizeof ln)
+        n += (size_t)snprintf(ln + n, sizeof ln - n, " %s/%s %+.3f", g_rv == 1 && !a ? "rv" : tn[a], tn[b], dot[a][b] / sqrt(dot[a][a] * dot[b][b]));
+    fprintf(stderr, "%s\n", ln);
+    free(S); free(W); free(ct);
 }
 static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
     shape5 xs = {B, g_xc, d->side >= 0 ? g_Dl : g_Pz, P, P};
@@ -1697,6 +1753,15 @@ int cmd_train(int argc, char **argv) {
             fprintf(stderr,"--fib-normal-lambda >= 0 (--fib-normal-r 1..4, --fib-normal-thr 1..254); task unwrap needs --ink-lambda 0 (its ink channel is the fibre plane there)\n"); return 2;
         }
         aux_setup();   /* the aux planes of --rv / --ink-head / --fib-normal-lambda (one plane each, any combination) */
+        g_uw = atoi(opt(argc,argv,"--uw","0")); g_uw_lr = (float)atof(opt(argc,argv,"--uw-lr","1e-3")); g_gc = atoi(opt(argc,argv,"--grad-cos","0"));
+        if (g_uw < 0 || g_uw > 1 || !(g_uw_lr > 0) || g_gc < 0 || ((g_uw || g_gc) && !g_unwrap2)) { fprintf(stderr,"--uw 0|1 (--uw-lr > 0), --grad-cos N >= 0: task unwrap2\n"); return 2; }
+        if (g_uw && resume) {   /* the s_h of the resumed run */
+            char *h = checkpoint_header_line(resume); const char *q = h ? strstr(h, "\"uw\":{\"t\":") : nullptr;
+            if (q) { g_uw_t = atoi(q + 10); const char *a = strstr(q, "\"s\":["); if (a) { a += 5; for (int k = 0; k < SH_N && a; k++) { g_uw_s[k] = atof(a); a = strchr(a, ','); if (a) a++; } } }
+            free(h);
+        }
+        uw_apply();
+        if (g_uw) fprintf(stderr, "uncertainty weights (--uw 1): learned log variances of phase / normal / winding / rv / ink, lr %g%s\n", g_uw_lr, g_uw_t ? " (resumed)" : "");
         g_dens_scale = (float)atof(opt(argc,argv,"--density-scale","32"));   /* density target min(1, scale rho): 32 at 2.4 um, 8 at 9.6 um (the same physical code) */
         if (!(g_dens_scale > 0)) { fprintf(stderr,"--density-scale > 0\n"); return 2; }
         /* --density-code 1: density target x / (1 + x), x = scale rho (never saturates; 0: min(1, x), which clips every spacing under
@@ -2899,7 +2964,7 @@ int cmd_train(int argc, char **argv) {
             d->nt = nn_malloc((size_t)7 * tp3); d->nm = nn_malloc(tp3);
             if (g_head_slab) {
                 d->hs_z = g_hs_z; d->hs_P = P;
-                d->hs_lg = nn_malloc((size_t)(g_lat ? LUPC : g_cout) * tp3 * 2); d->hs_ds = nn_malloc(128 * sizeof(double));
+                d->hs_lg = nn_malloc((size_t)(g_lat ? LUPC : g_cout) * tp3 * 2); d->hs_ds = nn_malloc(128 * sizeof(double)); if (g_gc) d->gcS = nn_malloc((size_t)cfg.cout * cfg.cout * sizeof(double));
                 if (g_lat_hs) {   /* (the streamed head: hs_z / 4 + 2 cell planes of logits, fp32 sums, sub-cell gradient and the head's 16-bit gradient) */
                     const size_t nq = (size_t)(g_hs_z / 4 + 2) * (P / 4) * (P / 4);
                     d->lgc = nn_malloc(nq * LNC * 2); d->latg = nn_malloc(nq * LGFC * 4); d->latgl = LGFC < LNC ? nn_malloc(nq * LNC * 2) : nullptr; d->latgc = nn_malloc(nq * LNC * 2);
@@ -3357,6 +3422,7 @@ int cmd_train(int argc, char **argv) {
             if (sparse_at && step >= sparse_at && !unet_get_sparse24(d->u)) { unet_set_sparse24(d->u, 1); if (g == 0) fprintf(stderr, "step %d: 2:4 sparsity on (SR-STE lambda %g)\n", step, srste); }
             unet_zero_grad(d->u);
             d->last = d->cur;
+            d->gc_on = g_gc && d->gcS && g == 0 && step % g_gc == 0; if (d->gc_on) nn_zero(d->gcS, (size_t)cfg.cout * cfg.cout * sizeof(double));   /* --grad-cos: this step's Gram */
             test_nan_inject(d, step, 0, P);   /* tests: UFSM_TEST_NAN */
             restore_train_recipe(d, step, g), run_batch(d, B, P, dice_w, 1);
             test_nan_inject(d, step, 1, P);
@@ -3390,6 +3456,14 @@ int cmd_train(int argc, char **argv) {
             for (int g = 1; g < ng; g++) nn_peer_copy(unet_grad_ptr(G[g].u), G[g].dev, unet_grad_ptr(G[0].u), G[0].dev, np * 4);
         }
         for (int g = 0; g < nl; g++) { nn_init(G[g].dev); loss += fetch_loss(&G[g], B, P, dice_w, parts[g]); active += parts[g][2 * NCH]; }   /* split: both sides hold the window's loss */
+        if (G[0].gc_on) { nn_init(G[0].dev); gc_report(&G[0], step); G[0].gc_on = 0; }
+        if (g_uw) {   /* the s_h step: the GPUs' mean lambda-weighted head losses */
+            double L[SH_N] = {0}; int cnt[SH_N] = {0};
+            for (int g = 0; g < nl; g++) { const gpu_state *q = &G[g]; const double v[SH_N] = {g_rv == 1 ? 0 : q->side_loss, q->norm_loss, 0, q->w4_loss, g_rv == 1 ? q->side_loss : q->rv_loss, g_ink2 && q->iout[2] > 0 ? q->ink_loss : 0, 0};
+                for (int h = 0; h < SH_N; h++) if (v[h] > 0 && isfinite(v[h])) { L[h] += v[h]; cnt[h]++; } }
+            for (int h = 0; h < SH_N; h++) L[h] = cnt[h] ? L[h] / cnt[h] : 0;
+            uw_step(L);
+        }
         if (sheet_log) { fprintf(sheet_log,"%d",step); for (int k=0;k<5;k++) fprintf(sheet_log,",%.8g",G[0].sheet_parts[k]); fprintf(sheet_log,",%.8g,%.8g\n",G[0].sheet_loss,g_sheet_ramp); fflush(sheet_log); }
         int fwd_nan = 0;   /* non-finite loss parts: the forward itself produced non-finite logits (not a gradient-scale overflow) */
         if (g_sheet && !isfinite(G[0].sheet_loss)) fwd_nan=1;
@@ -3604,12 +3678,13 @@ int cmd_train(int argc, char **argv) {
                     for (int h = 0; h < g_heads; h++) fprintf(stderr, " %d %.5f (%d)", h, vhn[h] ? vh[h] / vhn[h] : 0.0, vhn[h]);
                     fprintf(stderr, "\n");
                 }
-                if (nval && vcrit < best_val) { best_val = vcrit; char bp[1400]; snprintf(bp, sizeof bp, "%s/best.ckpt", out); if (unet_save(G[0].u, bp, step, checkpoint_extra)) { fprintf(stderr, "cannot save %s\n", bp); return 1; } }
+                if (nval && vcrit < best_val) { best_val = vcrit; char bp[1400]; snprintf(bp, sizeof bp, "%s/best.ckpt", out); if ((g_uw ? (uw_extra(checkpoint_extra, sizeof checkpoint_extra, runtime_extra), 0) : 0) || unet_save(G[0].u, bp, step, checkpoint_extra)) { fprintf(stderr, "cannot save %s\n", bp); return 1; } }
             }
             char affs[1024] = "";
             if (g_verso) snprintf(affs, 64, " verso bce %.4f dice %.4f", acc_vbce / nacc, acc_vdice / nacc);
             if (g_side) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " %s bce %.4f", g_rv == 1 ? "rv" : g_side == 2 ? "phase" : "side", acc_side / nacc); }
             if (g_rv == 2) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " rv bce %.4f", acc_rv / nacc); }
+            if (g_uw) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " uw phase %.3g normal %.3g wind4 %.3g%s%.3g%s%.3g", g_hmul[SH_PHASE], g_hmul[SH_NORMAL], g_hmul[SH_WIND4], g_rv ? " rv " : "", g_rv ? g_hmul[SH_RV] : 0.0, g_ink2 ? " ink " : "", g_ink2 ? g_hmul[SH_INK] : 0.0); }
             if (g_unwrap2) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " normal bce %.4f wind4 bce %.4f (worst gauge %.4f) acc %.3f", acc_norm / nacc, acc_w4 / nacc, acc_w4w / nacc, acc_w4a / nacc); if (g_pg_lambda > 0) { na = strlen(affs); snprintf(affs + na, sizeof affs - na, " pgrad %.4f", acc_pg / nacc); } }
             if (g_fibn) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " fibn %.4f (%.0f%% of windows, %.0f vox)", acc_fibn > 0 ? acc_fib / acc_fibn : 0.0, 100.0 * acc_fibn / nacc, acc_fibn > 0 ? acc_fibv / acc_fibn : 0.0); }
             if (g_ink2) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " ink bce %.4f (%.0f%% of windows)", acc_inkn > 0 ? acc_ink / acc_inkn : 0.0, 100.0 * acc_inkn / nacc); }
@@ -3643,7 +3718,7 @@ int cmd_train(int argc, char **argv) {
         if (step % ckpt_every == 0 || step == steps || g_stop) {
             nn_init(G[0].dev);
             char cp[1400]; snprintf(cp, sizeof cp, "%s/last.ckpt", out);
-            if (unet_save(G[0].u, cp, step, checkpoint_extra)) { fprintf(stderr, "cannot save %s\n", cp); return 1; }
+            if ((g_uw ? (uw_extra(checkpoint_extra, sizeof checkpoint_extra, runtime_extra), 0) : 0) || unet_save(G[0].u, cp, step, checkpoint_extra)) { fprintf(stderr, "cannot save %s\n", cp); return 1; }
         }
         if (step == step0 + 1 || step == steps || g_stop) {
             char mp[1400], em[4096]; snprintf(mp, sizeof mp, "%s/precision.txt", out); WRITE_MANIFEST(mp);
@@ -3652,7 +3727,7 @@ int cmd_train(int argc, char **argv) {
     }
     /* Signals can arrive between log/checkpoint boundaries; save only completed optimizer updates. */
     nn_init(G[0].dev);
-    { char cp[1400]; snprintf(cp, sizeof cp, "%s/last.ckpt", out); if (unet_save(G[0].u, cp, committed_step, checkpoint_extra)) return 1; }
+    { char cp[1400]; snprintf(cp, sizeof cp, "%s/last.ckpt", out); if (g_uw) uw_extra(checkpoint_extra, sizeof checkpoint_extra, runtime_extra); if (unet_save(G[0].u, cp, committed_step, checkpoint_extra)) return 1; }
     if (plan) fprintf(stderr, "cover progress %llu/%llu committed tiles\n", (unsigned long long)coverage.cursor, (unsigned long long)coverage.count);
     uint64_t prod, rej; sampler_stats(sp, &prod, &rej);
     uint64_t why[4]; sampler_reject_reasons(sp, why);

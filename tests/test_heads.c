@@ -167,6 +167,16 @@ int main(int argc, char **argv) {
         CHECK(!sh("UFSM_GRAD_MX8=1 %s train %s/fx/sources-mix.json --out %s/rung --resume %s/rung/last.ckpt %s %s --steps 6 > %s/rung2.log 2>&1 && grep -q 'step      6 ' %s/rung2.log", U, d, d, d, cm, rf, d, d), "rungs + film resume (%s/rung2.log)", d);
         CHECK(sh("%s train %s/fx/sources-mix.json --out %s/rung3 %s %s > %s/rung3.log 2>&1", U, d, d, common, rf, d) != 0, "--levels with --um-rungs accepted");
     }
+    /* (6) --uw 1 + --grad-cos 2 (latent, all heads): the cosine lines name every head pair, the weights move off 1, the header carries
+       "uw" with t 4 and a resume continues from it (t 6) */
+    if (!wr) {
+        const char *uf = "--lat 4 --lat-guide 3 --rv 2 --rv-iso 100 --ink-head 1 --uw 1 --uw-lr 0.05 --grad-cos 2";
+        char cm[2048]; snprintf(cm, sizeof cm, "%s", common); { char *ls = strstr(cm, " --steps 4"); if (ls) memmove(ls, ls + 10, strlen(ls + 10) + 1); }
+        CHECK(!sh("UFSM_GRAD_MX8=1 %s train %s/fx/sources-ink.json --out %s/uw %s %s --steps 4 > %s/uw.log 2>&1", U, d, d, cm, uf, d), "uw + grad-cos run (%s/uw.log)", d);
+        CHECK(!sh("grep -q 'grad-cos step 4 (head input): phase/normal [-+]0[.][0-9]*.*rv/ink [-+]0[.]' %s/uw.log && grep -q 'uw phase [0-9.]* normal 0[.]' %s/uw.log", d, d), "uw + grad-cos: the cosine and weight lines");
+        CHECK(!sh("head -1 %s/uw/last.ckpt | grep -q '\"uw\":{\"t\":4,'", d), "uw: header t 4");
+        CHECK(!sh("UFSM_GRAD_MX8=1 %s train %s/fx/sources-ink.json --out %s/uw --resume %s/uw/last.ckpt %s %s --steps 6 > %s/uw2.log 2>&1 && grep -q '(resumed)' %s/uw2.log && head -1 %s/uw/last.ckpt | grep -q '\"uw\":{\"t\":6,'", U, d, d, d, cm, uf, d, d, d), "uw resume (%s/uw2.log)", d);
+    }
     if (!fails) sh("rm -rf %s", d);
     if (fails) { fprintf(stderr, "test_heads: %d FAILED (kept %s)\n", fails, d); return 1; }
     printf("test_heads: ok\n");
