@@ -166,6 +166,15 @@ judge against the GT phase. Reference rows on HOLD (6 tiles of 256^2 x 512, pair
 (3.5 m), official prediction with directions 0.966 / 0.876 (2.3 m), presence only 0.888 / 0.758 (0.24 m: too little to rank on, so
 the script also prints the traced length). The predict flags in it are untested until a GPU is free.
 
+**Pictures and launch checks (evening).** `tools/fibview.py` / `tools/view1299.sh` -> `/vesuvius/ufsm/fibers/work/view1299/` (20 PNG +
+index.txt): native-resolution CT crops (768 px) with the wraps, the traced fibres and the judge's sheet changes, for the worst / median /
+best 1299 tile and two Paris 4 tiles. In the worst 1299 tile the wraps cut across the visible sheets at an angle while the fibres follow
+the sheets; in the Paris 4 tiles the wraps lie on the sheets. Labels: 0175A 17 GB, 1447 21 GB. `mksources.sh`: weights 0.446 / 0.554.
+Dry planner (GPU 1, planning for 15 GB free): P 512 -> 5.67 GB (network 4.43, 33.0 B per input voxel; MX gradients, chunked, lean 2),
+P 640 -> 10.44 GB with 7.81 GB of host offloads each way per step; P 768: no plan. Sampler (`ufsm sample --bench 10`, 5 workers, no
+CUDA): 3.62 windows / s at P 512 (486 Mvox / s, 1.4 cpu s per window); 16 windows: known voxels 28 % of the mid slice (8.7 .. 51 %), H
+and V positives 1.05 % each, one window without positives, none without labels.
+
 **PHerc1218 (no fibres published): two routes.** (a) One-off inference with the public model, outside the pipeline: clone villa, its
 bootstrap venv (PyTorch cu128), `python -m vesuvius.neural_tracing.fiber_trace_3d.infer` with the SD2 checkpoint on level 0 of the 8.64 um
 scan (the card's own recipe for a 9.36 um scan, "transfer use"). For the judge one 640-slice slab is enough: 7593^2 x 640 voxels = 1,152
