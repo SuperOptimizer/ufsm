@@ -3,7 +3,7 @@
 #include "nn_common.cuh"
 #include "nn_lp.h"
 
-int g_gn_const;   /* nn_gn_bwd / nn_gn_silu_bwd / nn_gn_silu_bwd_head: the group sums (mean and variance terms) scaled by 0 */
+thread_local int g_gn_const;   /* nn_gn_bwd / nn_gn_silu_bwd / nn_gn_silu_bwd_head: the group sums (mean and variance terms) scaled by 0 */
 extern "C" void nn_set_gn_const(int on) { g_gn_const = on; }
 extern "C" int nn_get_gn_const(void) { return g_gn_const; }
 

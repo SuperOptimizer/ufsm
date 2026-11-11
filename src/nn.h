@@ -82,7 +82,12 @@ void nn_set_tf32(int on);
    backward-data with fp8 weight gradient. nn_set_tf32(0) selects exact fp32; nn_set_tf32(1) restores the last precision. */
 void nn_set_prec(int p);
 void nn_set_sr(int on);              /* stochastic rounding of the fp8 gradient operands: backward-data input, weight-gradient gy (env UFSM_SR=1) */
-void nn_set_sr_step(unsigned step);  /* reseed per training step (deterministic per step) */
+void nn_set_sr_step(unsigned step);
+/* the per-host-thread op state (layer ids, the stochastic-rounding counter, the loss / logit formats, ...): one host thread per GPU starts
+   from the main thread's (capture in the main thread, install in the worker) */
+typedef struct { int layer, sub, pass, block; unsigned sr_ctr; float posw; int logits_h16, head_h16, loss_g16, gn_const, actbf; } nn_tls;
+void nn_tls_capture(nn_tls *t);
+void nn_tls_install(const nn_tls *t);  /* reseed per training step (deterministic per step) */
 unsigned nn_sr_ctr(void);            /* the step's seed draw counter (reordered ops replay draws: nn_sr_set_ctr) */
 void nn_sr_set_ctr(unsigned c);
 unsigned nn_sr_seed(void);           /* one draw of the step's seed sequence (what an op drawing a seed would get) */

@@ -703,7 +703,7 @@ extern "C" void lp_gyrec_select(int d) {   /* (tests call it to switch devices b
 }
 static int g_gyrec_narrow = -1;   /* records also for whole 8- / 16-channel levels (-1: env UFSM_GYREC=2) */
 extern "C" void lp_set_gyrec_narrow(int on) { g_gyrec_narrow = on; }
-static int g_gyrec_off = -1;   /* test hook: 1 no records at all (the plain apply), -1 env UFSM_GYREC */
+static thread_local int g_gyrec_off = -1;   /* test hook: 1 no records at all (the plain apply), -1 env UFSM_GYREC; per thread: unet_backward_x sets it around decoder blocks (one host thread per GPU) */
 extern "C" void lp_set_gyrec_off(int off) { g_gyrec_off = off; }
 extern "C" int lp_get_gyrec_off(void) { return g_gyrec_off; }
 extern "C" int lp_gyrec_narrow(void) { return g_gyrec_narrow >= 0 ? g_gyrec_narrow : getenv("UFSM_GYREC") && atoi(getenv("UFSM_GYREC")) >= 2; }
@@ -744,7 +744,7 @@ extern "C" int lp_gn_silu_bwd_apply_rec(const void *x, int xdt, shape5 s, int G,
    gradient runs the plain apply first (lp_gnpend_flush: the same gx bits, no records). */
 typedef struct { const void *x; int xdt; shape5 s; int G; const float *gamma, *beta, *mean, *rstd, *AB; const void *gy; void *gx; unsigned gsr, rsr; int valid, dev; } gnpend_t;
 static thread_local gnpend_t g_gnpend;
-static int g_gn_defer_req;   /* nn_gn_silu_bwd's caller: the next op is the weight gradient of this gradient (lp_gnpend_request) */
+static thread_local int g_gn_defer_req;   /* nn_gn_silu_bwd's caller: the next op is the weight gradient of this gradient (lp_gnpend_request) */
 extern "C" void lp_gnpend_request(int on) { g_gn_defer_req = on; }
 extern "C" int lp_gnpend_env(void) { static int on = -1; if (on < 0) on = getenv("UFSM_GN_DEFER") ? atoi(getenv("UFSM_GN_DEFER")) : 1; return on; }
 extern "C" int lp_gnpend_want(void) {   /* (gy records off -- lp_set_gyrec_off(1), UFSM_GYREC=0: the deferral, a records route, too) */

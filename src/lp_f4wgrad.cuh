@@ -980,7 +980,7 @@ __global__ void __launch_bounds__(WS_NT, 1) conv_bwd_w_f4ws_k(const T *__restric
    only warp-level synchronisation; the BW channels x 4 words are BW / 8 tasks per lane (the 4 words of a block in 4
    consecutive lanes for the amax shuffles). The bias sums stay in registers until the end (block-reduced, one atomic per
    channel and CTA). */
-extern int g_f4w_gy4;   /* lp_bwd_w_f4: the (mx8_t-typed) gy holds MX-fp4 rows; only the gy pre-pass reads it */
+extern thread_local int g_f4w_gy4;   /* lp_bwd_w_f4: the (mx8_t-typed) gy holds MX-fp4 rows; only the gy pre-pass reads it */
 template <int BW, int GB = 8> __global__ void __launch_bounds__(256) gy_pre4_k(const uint8_t *__restrict__ gy, uint8_t *__restrict__ out, float *__restrict__ gb,
                                                                   int N, int Co, int D, int H, int W, int z0, int Zs, unsigned sr) {   /* GB: gy MX bits */
     constexpr int NTASK = BW / 8;   /* (channel, word) tasks per lane */

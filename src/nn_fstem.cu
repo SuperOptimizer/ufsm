@@ -97,12 +97,13 @@ __device__ __forceinline__ void fs_mma_tf32(float *c, const unsigned *a, const u
                  : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
 }
 enum { FS_BH = FS_BT / 2 };   /* the backward's half tiles: 22 KB of shared memory, 4 blocks an SM (one tile at a time: 2, 16 % occupancy, 4.0 ms) */
-__global__ void __launch_bounds__(FS_BT) fstem_bwd_k(const f16 *__restrict__ x, int D, int H, int W, int z0, int nz, const float *__restrict__ p, int C, int nout, fs_chs chs, const f16 *__restrict__ g, size_t ns, float *__restrict__ gp) {
+__global__ void __launch_bounds__(FS_BT) fstem_bwd_k(const f16 *__restrict__ x, int D, int H, int W, int z0, int nz, const float *__restrict__ p, int C, int nout, fs_chs chs, const f16 *__restrict__ g, size_t ns, float *__restrict__ gp) {   /* gp: this block's partial gradient row (part + blockIdx.x * npar) */
     __shared__ float sp[FS_MAXC + FS_MAXO * FS_MAXC];   /* b1, W2 (W1 lives in the A fragments) */
     __shared__ __align__(16) __half sr[16][FS_RW];
     __shared__ float sh[FS_BH][FS_FS], sgp[FS_BH][FS_FS], sgo[FS_BH][FS_OS];
     const int tid = threadIdx.x, n2 = C + nout * C;
     for (int k = tid; k < n2; k += FS_BT) sp[k] = p[C * FS_T + k];
+    gp += (size_t)blockIdx.x * (C * FS_T + n2);
     const float *b1 = sp, *W2 = sp + C;
     const int c0 = 2 * (tid / 16), t0 = 4 * (tid % 16), lane = tid & 31, wp = tid >> 5, gq = lane >> 2, tq = lane & 3;
     unsigned af[4][4];   /* W1's A fragments for the recompute (as the forward: the same fp16 weights) */
@@ -182,10 +183,18 @@ __global__ void __launch_bounds__(FS_BT) fstem_bwd_k(const f16 *__restrict__ x, 
     }
     for (int n = 0; n < 2; n++) for (int r = 0; r < 4; r++) {   /* C fragments: rows gq, gq + 8 (c), columns 2 tq, + 1 */
         const int c = gq + (r >> 1) * 8, k = 8 * (2 * wp + n) + 2 * tq + (r & 1);
-        if (c < C) atomicAdd(&gp[c * FS_T + k], d1[n][r]);
+        if (c < C) gp[c * FS_T + k] = d1[n][r];
     }
-    if (wp < 2) for (int r = 0; r < 4; r++) { const int o = gq + (r >> 1) * 8, c = 8 * wp + 2 * tq + (r & 1); if (o < nout && c < C) atomicAdd(&gp[C * FS_T + C + o * C + c], d2[r]); }
-    if (tid < C) atomicAdd(&gp[C * FS_T + tid], db);
+    if (wp < 2) for (int r = 0; r < 4; r++) { const int o = gq + (r >> 1) * 8, c = 8 * wp + 2 * tq + (r & 1); if (o < nout && c < C) gp[C * FS_T + C + o * C + c] = d2[r]; }
+    if (tid < C) gp[C * FS_T + tid] = db;
+}
+/* the blocks' partial rows added in block order (deterministic: float atomics made --det runs differ in the last bits, which a discrete
+   choice later amplified -- the 2-GPU threads gate caught it) */
+__global__ void fstem_red_k(const float *__restrict__ part, int nb, int npar, float *__restrict__ gp) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= npar) return;
+    float s = 0.f; for (int b = 0; b < nb; b++) s += part[(size_t)b * npar + i];
+    gp[i] += s;
 }
 static fs_chs fs_list(const int *chs, int nout) { fs_chs l; for (int o = 0; o < FS_MAXO; o++) l.c[o] = o < nout ? chs[o] : 0; return l; }
 static int fs_ok(int D, int H, int W, int z0, int nz, int C, int nout) {
@@ -201,6 +210,11 @@ extern "C" int nn_fstem_bwd(const void *x, int D, int H, int W, int z0, int nz, 
     if (!fs_ok(D, H, W, z0, nz, C, nout)) return 1;
     const size_t ntile = (size_t)(nz / 2) * (H / 2) * ((W / 2 + FS_BT - 1) / FS_BT); if (!ntile) return 0;
     const unsigned nbk = (unsigned)(ntile < 1024 ? ntile : 1024);
-    fstem_bwd_k<<<nbk, FS_BT>>>((const f16 *)x, D, H, W, z0, nz, p, C, nout, fs_list(chs, nout), (const f16 *)g, ns, gp); KCHECK();
+    const int npar = C * FS_T + C + nout * C;
+    static float *part[8]; static size_t cap[8]; int dv = 0; cudaGetDevice(&dv); dv &= 7;   /* (per device: one host thread per GPU) */
+    const size_t need = (size_t)nbk * npar;
+    if (need > cap[dv]) { if (part[dv]) cudaFree(part[dv]); if (cudaMalloc(&part[dv], need * 4) != cudaSuccess) { fprintf(stderr, "nn_fstem_bwd: no device memory\n"); abort(); } cap[dv] = need; }
+    fstem_bwd_k<<<nbk, FS_BT>>>((const f16 *)x, D, H, W, z0, nz, p, C, nout, fs_list(chs, nout), (const f16 *)g, ns, part[dv]); KCHECK();
+    fstem_red_k<<<(npar + 127) / 128, 128>>>(part[dv], (int)nbk, npar, gp); KCHECK();
     return 0;
 }

@@ -6,6 +6,51 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Data-parallel training: one host thread per GPU (2026-11-11, branch univ-20261111)
+
+Why: u1 (P 896 latent, two desk GPUs) ran at 0.54 samples/s with one host thread launching both GPUs. A step queues more kernels
+than the driver's launch queue holds, so the thread blocked in GPU 0's backward launches while GPU 1 sat idle (perf: host time in
+the launch path; each GPU ~75 % busy, idle out of phase). The first fix, phased launches (every GPU's forward before any backward,
+d1924ea), gave 0.62 samples/s (+13 %). This step gives each GPU its own persistent host thread, so each GPU's launches block only
+that GPU. The target is a step close to the slower GPU's compute alone.
+
+How:
+- `train.c` gets a pool of persistent workers (`gpool_post` / `gpool_wait`), one per GPU, started on first use. They are kept
+  alive because their thread-local device scratch must outlive a step.
+- Each step is `gstep_fwd` + `gstep_bwd`, run by the GPU's worker. The main thread keeps the GPU-ordered `sampler_next` /
+  upload / release, the gradient exchange, the losses and the optimizer.
+- The schedules: `UFSM_MGPU_THREADS=0` gives one thread with phased launches, and `UFSM_MGPU_PHASED=0` as well gives forward +
+  backward per GPU in turn. All three draw the same numbers:
+  - The SR counter is per GPU (base `g << 24`; GPU 0 gets what one GPU always had) and is carried from the forward to the backward
+    in `gpu_state.sr_ctr`.
+  - The `--lat-step-jitter` generator is per GPU (`lat_js`).
+  - `gpu_state G[8]` is now zeroed, because the fields added later relied on garbage.
+- nn's mutable per-call state is `thread_local`: the layer / sub / pass / block ids, the SR counter, pos weight, the logit /
+  head / loss fp16 flags, `gn_const`, `g_actbf`, `g_gyrec_off`, `g_f4w_gy4`, and `unet.c`'s `g_in_bwd`. A worker starts from the
+  main thread's values (`nn_tls_capture` / `nn_tls_install`). The storage registry takes a mutex.
+- `split.c` hands the same `nn_tls` on with the turn, so `--split z`'s two alternating threads still see one sequence of it.
+  Without this, `test_cover_training` (split) went non-finite.
+
+The races the gate found (each one only changed bits in some runs):
+- **`g_gyrec_off`:** `unet_backward_x` sets it around decoder blocks. One thread's restore could leave the other thread's records
+  off.
+- **`g_f4w_gy4`:** a "the gy holds MX-fp4 rows" flag that `lp_bwd_w_f4` sets around one call. It aborted ("need the gy
+  pre-pass") or decoded the wrong rows. It was found by bisection: `UFSM_GRAD_MX4=0` gave 0 / 30 differing runs, against 25 / 30
+  with the flag shared.
+- **The fine-stem backward's float `atomicAdd`s:** these made `--det 1` runs differ in the last bits, and a discrete choice later
+  amplified the difference into visible loss changes. The fix is per-block partial rows, added in block order by `fstem_red_k`.
+  test_fstem is unchanged: 3.5e-4 relative against the host.
+
+Gate: `test_univ2` now also runs the u1 recipe (`--det 1`, 30 steps, latent, rv, rungs, FiLM, fstem, uw, grad-cos 3, replay 3) under
+threads, phased and in turn, and requires identical step / validation / grad-cos lines.
+- Before the fixes: 7–10 of 10 threaded runs differed.
+- After: 0 / 12 (full recipe), 0 / 12 (replay 1), 0 / 8 (no fstem).
+- Phased and in-turn runs agree with each other in every repeat.
+- One GPU is identical to the previous binary.
+- The parameter gradients still differ in ~700 of 394 k entries between two identical phased runs (FiLM / stem / a few GN
+  affines: ~3e-8 relative). These come from other float atomics in the fp16 head-gradient path. The MX-fp4 trunk gradients absorb
+  them, and they do not show in the logged lines.
+
 ## Universal net A6: the fine voxel stem (--fstem C, --fstem-drop P) (2026-11-11, branch univ-20261111)
 
 Why: the latbeat verdict above. The latent net's phase deficit against wind96 is resolution: 38.4 um cells hold 1.5-4 cells per sheet

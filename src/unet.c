@@ -1777,7 +1777,7 @@ static int fakeq_grad(void) {
 #define FQG(p, s) do { if (fakeq_grad()) nn_fake_quant((p), (s), fakeq_grad()); } while (0)
 static void rc_fail(const char *what) { fprintf(stderr, "unet: recompute mode: %s unsupported\n", what); abort(); }
 /* transient buffer for the upsampled decoder input at level i (shape s), typed as activation storage */
-static int g_in_bwd = 0;   /* inside unet_backward_x (lean mode: B holds the trainer's batch until then) */
+static thread_local int g_in_bwd = 0;   /* inside unet_backward_x (lean mode: B holds the trainer's batch until then) */
 static float *rc_tmp(unet *u, int level, shape5 s, int *reg) {
     if (u->train && lean() && !g_in_bwd) rc_fail("lean mode: a forward transient in the gradient buffer (it holds the batch)");
     if (u->train && u->nob && !u->rc_ok) rc_fail("lean 2: a transient while the level's gradient buffer is live");

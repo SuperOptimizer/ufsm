@@ -23,6 +23,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <pthread.h>
 #include <fcntl.h>
 #include "embz.h"
 #include "sample_emb.h"
@@ -91,7 +92,7 @@ typedef struct {
     double *fibacc; void *fiblist; unsigned *fibnl; size_t fibcap; double fib_h[2];   /* --fib-normal-lambda: valid voxels / sum t^T N t (device), the slab list, the fetched sums */
     uint8_t *auxb[3][2], *aux[3], *inkt, *inkm, *inkw;   /* the aux planes (double-buffered; plane j = role g_aux_role[j]); --ink-head: its slab target / mask, weight byte (loss parts: iscratch / iout / ink_loss) */
     uint8_t *rvt, *rvm; float *rvscratch, rvout[5]; double rv_loss;
-    double *gcS; int gc_on, fs_drop;   /* fs_drop: this training step runs without the fine stem (--fstem-drop) */   /* --grad-cos: the step's logit-gradient Gram (device, K x K upper triangle), whether this step collects it */   /* --rv: the slab's recto / verso targets and mask; --rv 2 (own channels): its loss scratch and parts */
+    double *gcS; int gc_on, fs_drop; uint64_t lat_js; unsigned sr_ctr;   /* lat_js: --lat-step-jitter's generator; sr_ctr: the SR counter between the forward and backward phases */   /* fs_drop: this training step runs without the fine stem (--fstem-drop) */   /* --grad-cos: the step's logit-gradient Gram (device, K x K upper triangle), whether this step collects it */   /* --rv: the slab's recto / verso targets and mask; --rv 2 (own channels): its loss scratch and parts */
     uint8_t *wdb[2], *wd, *ct4, *cm4, *cw4; float *cscratch, cout4[9]; double cond_loss;   /* --cond: the gauge-shifted winding per voxel, its 4 targets, mask, weights; scratch and parts */
     unsigned long long *cacc, cacc_h[2];   /* --cond: known / right-turn voxel counts of the 14-turn head (device, last batch on the host) */
     uint8_t *papb[2], *pap, *pt1, *pmk1, *pw1; float *pscr, pout3[3]; double pap_loss;   /* --pap-head: labels (double-buffered), target, mask, weight; scratch, parts */
@@ -101,6 +102,8 @@ typedef struct {
     uint8_t *rlow; void *rscr; size_t rscr_b; double *rst, rst_h[RP_NST]; float *rrd; restore_recipe rcp;   /* task restore: degraded input (uint8), degradation scratch,
                                                                                       loss sums (device / last fetched), the recipe of the next forward */
 } gpu_state;
+static gpu_state *g_G0;   /* the trainer's per-GPU states (an index for per-GPU streams of host randomness) */
+#define GIDX(d) ((d) >= g_G0 && (d) < g_G0 + 8 ? (int)((d) - g_G0) : 7)
 /* task band_affinity: output channel 0 = recto (dense loss on target channel 0), channels 1..K = affinities for g_aff_off */
 static const char *g_lat_fit; static int g_lat_fit_n = 24, g_lat_fit_k;   /* --lat-fit FILE [--lat-fit-n N]: fit the cell transform (latfit.h) on N training windows, write it, exit */
 static int g_lat_guide;   /* --lat-guide 1: the guided head (5 coefficient planes for the 2 side-slot channels; nn_lat_guide) */
@@ -1225,6 +1228,83 @@ static void diag_nonfinite(gpu_state *d, const char *what, const void *p, size_t
     fprintf(stderr, "diagnostics: %llu non-finite %s of %zu\n", c, what, n);
     window_note(d, g_Sdiag, "  window");
 }
+/* one GPU's training step (the batch is on the device or uploading): the forward + losses, then the backward. The SR counter is per GPU
+   (base g << 24; GPU 0 as one GPU always had), carried from the forward to the backward, so every schedule (one host thread per GPU,
+   phased, in turn) draws the same numbers */
+typedef struct { gpu_state *d; int g, step, B, P; float dice_w; int cout; float srste; int sparse_at, rc; nn_tls out; } gstep_arg;   /* out: the op state after the backward */
+static void test_nan_inject(gpu_state *d, int step, int where, int P);
+static int sync_check(gpu_state *d, int step, const char *what);
+static void diag_nonfinite(gpu_state *d, const char *what, const void *p, size_t n, int h16);
+static void restore_train_recipe(gpu_state *d, int step, int g);
+static void run_batch(gpu_state *d, int B, int P, float dice_w, int train);
+static uint64_t g_seed;
+static void gstep_fwd(gstep_arg *a) {
+    gpu_state *d = a->d; const int g = a->g, step = a->step, B = a->B, P = a->P; const float dice_w = a->dice_w; const uint64_t seed = g_seed;
+    const int sparse_at = a->sparse_at; const float srste = a->srste; (void)B;
+    nn_init(d->dev);
+    nn_sr_set_ctr((unsigned)g << 24);
+            nn_stream_wait(0, d->ev_up[d->cur]);           /* compute waits for the upload */
+            if (getenv("UFSM_DET_TRACE")) {   /* debugging (--det 1): hashes of what this step starts from: the input channel, the streamed label planes, the parameters */
+                nn_event_sync(d->ev_up[d->cur]); nn_sync();
+                const size_t p3t = (size_t)g_Pz * P * P, nx = (size_t)B * g_xs * p3t * xbytes(); uint8_t *hb = malloc(nx > p3t ? nx : p3t);
+                uint64_t hx = 1469598103934665603ull, hl[4] = {0, 0, 0, 0};
+                nn_d2h(hb, d->x, nx); for (size_t q = 0; q < nx; q++) hx = (hx ^ hb[q]) * 1099511628211ull;
+                if (g_lstream) for (int k = 0; k < 4; k++) if (d->lbh[k]) { uint64_t h = 1469598103934665603ull; for (size_t q = 0; q < p3t; q++) h = (h ^ d->lbh[k][q]) * 1099511628211ull; hl[k] = h; }
+                fprintf(stderr, "dettrace step %d: x %016llx labels %016llx %016llx %016llx %016llx params %016llx\n", step, (unsigned long long)hx, (unsigned long long)hl[0], (unsigned long long)hl[1], (unsigned long long)hl[2], (unsigned long long)hl[3], (unsigned long long)unet_param_hash(d->u));
+                free(hb);
+            }
+            if (sparse_at && step >= sparse_at && !unet_get_sparse24(d->u)) { unet_set_sparse24(d->u, 1); if (g == 0) fprintf(stderr, "step %d: 2:4 sparsity on (SR-STE lambda %g)\n", step, srste); }
+            unet_zero_grad(d->u);
+            d->last = d->cur;
+            if (g_fstem) { uint64_t h = (uint64_t)step * 0xD1B54A32D192ED03ull + (uint64_t)seed * 31 + (uint64_t)g; h ^= h >> 31; h *= 0xBF58476D1CE4E5B9ull; h ^= h >> 29;
+                           d->fs_drop = (double)(h >> 11) * 0x1p-53 < g_fs_drop; }   /* (--fstem-drop: per GPU and step; reset after the backward) */
+            d->gc_on = g_gc && d->gcS && g == 0 && step % g_gc == 0; if (d->gc_on) nn_zero(d->gcS, (size_t)a->cout * a->cout * sizeof(double));   /* --grad-cos: this step's Gram */
+            test_nan_inject(d, step, 0, P);   /* tests: UFSM_TEST_NAN */
+            restore_train_recipe(d, step, g), run_batch(d, B, P, dice_w, 1);
+            test_nan_inject(d, step, 1, P);
+            if (sync_check(d, step, "forward and losses")) { a->rc = 1; return; }
+    d->sr_ctr = nn_sr_ctr();
+}
+static void gstep_bwd(gstep_arg *a) {
+    gpu_state *d = a->d; const int step = a->step, P = a->P; (void)P;
+    nn_init(d->dev);
+    nn_sr_set_ctr(d->sr_ctr);
+            unet_backward_x(d->u, g_half && !g_pkf ? d->glh : d->gl, g_g16); nn_ptick("trunk backward");
+            test_nan_inject(d, step, 2, P);
+            if (sync_check(d, step, "backward")) { a->rc = 1; return; }
+            diag_nonfinite(d, "parameter gradients", unet_grad_ptr(d->u), unet_nparams(d->u), 0);
+            d->fs_drop = 0;   /* (validation: with the stem) */
+            nn_event_record(d->ev_done[d->cur], 0);
+            nn_event_sync(d->ev_up[d->cur]);                 /* host buffer of this batch is free again */
+}
+static void gstep_job(void *p) { gstep_arg *a = p; gstep_fwd(a); if (!a->rc) gstep_bwd(a); nn_tls_capture(&a->out); }
+/* the per-GPU host threads (persistent: thread-local device scratch lives as long as they do), started on first use */
+typedef struct { pthread_t th; int dev, started, has; void (*fn)(void *); void *arg; nn_tls tls; } gworker;
+static gworker g_gw[8]; static pthread_mutex_t g_gw_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_gw_cv = PTHREAD_COND_INITIALIZER, g_gw_dcv = PTHREAD_COND_INITIALIZER;
+static int g_gw_pending;
+static void *gworker_main(void *p) {
+    gworker *w = p; nn_init(w->dev);
+    pthread_mutex_lock(&g_gw_mu);
+    for (;;) {
+        while (!w->has) pthread_cond_wait(&g_gw_cv, &g_gw_mu);
+        void (*fn)(void *) = w->fn; void *arg = w->arg; const nn_tls t = w->tls;
+        pthread_mutex_unlock(&g_gw_mu);
+        nn_init(w->dev); nn_tls_install(&t); fn(arg);
+        pthread_mutex_lock(&g_gw_mu);
+        w->has = 0; g_gw_pending--; pthread_cond_broadcast(&g_gw_dcv);
+    }
+    return nullptr;
+}
+static void gpool_post(int g, int dev, void (*fn)(void *), void *arg) {
+    gworker *w = &g_gw[g]; nn_tls t; nn_tls_capture(&t);   /* (the main thread's op state: formats, layer ids) */
+    pthread_mutex_lock(&g_gw_mu);
+    if (!w->started) { w->dev = dev; w->started = 1; pthread_attr_t at; pthread_attr_init(&at); pthread_attr_setstacksize(&at, (size_t)64 << 20);
+                       if (pthread_create(&w->th, &at, gworker_main, w)) { fprintf(stderr, "train: cannot start the host thread of GPU %d\n", dev); abort(); } pthread_attr_destroy(&at); }
+    w->fn = fn; w->arg = arg; w->tls = t; w->has = 1; g_gw_pending++;
+    pthread_cond_broadcast(&g_gw_cv);
+    pthread_mutex_unlock(&g_gw_mu);
+}
+static void gpool_wait(void) { pthread_mutex_lock(&g_gw_mu); while (g_gw_pending > 0) pthread_cond_wait(&g_gw_dcv, &g_gw_mu); pthread_mutex_unlock(&g_gw_mu); }
 static void gc_report(gpu_state *d, int step) {   /* the tasks' cosines at the head input from the step's Gram (d->gcS) and the live head weights */
     const unet_cfg *uc = unet_cfg_of(d->u); const int K = uc->cout, C = uc->widths[0];
     double *S = malloc((size_t)K * K * sizeof *S); float *W = malloc((size_t)K * C * 4); size_t hw, hb; unet_head_offsets(d->u, &hw, &hb);
@@ -1261,7 +1341,7 @@ static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
     view_set(d, B);
     if (g_lat_c && g_lat_jit > 0.f) {
         const float *jb, *jg; float jst = 0.f; unet_lat_basis(d->u, &jb, &jg, &jst);   /* (the checkpoint's own step on a resume) */
-        static uint64_t js = 0x7f4a7c159e3779b9ull; js ^= js << 13; js ^= js >> 7; js ^= js << 17;
+        uint64_t js = d->lat_js ? d->lat_js : 0x7f4a7c159e3779b9ull ^ (uint64_t)GIDX(d) * 0x9E3779B97F4A7C15ull; js ^= js << 13; js ^= js >> 7; js ^= js << 17; d->lat_js = js;   /* (per GPU: the host threads draw in any order; GPU 0's stream is the old one) */
         unet_set_lat_step(d->u, train && jst > 0.f ? jst * exp2f(g_lat_jit * (float)((js >> 11) * (2.0 / 9007199254740992.0) - 1.0)) : 0.f);
     }
     if (g_lat_fit && train) {   /* the cell transform's fit on this window's device-built CT channel */
@@ -1701,7 +1781,7 @@ int cmd_train(int argc, char **argv) {
     const int val_live = atoi(opt(argc, argv, "--val-live", "0"));   /* validate the live weights instead of the EMA (e.g. resume a last.ckpt for one lr-0 step) */
     g_valP = atoi(opt(argc, argv, "--val-P", "0"));   /* (checked once the window and the task are known) */
     const int l0_recal = atoi(opt(argc, argv, "--l0-recal", "4"));   /* --l0-norm ema: windows recalibrating the EMA weights' level-0 statistics before each validation */
-    uint64_t seed = (uint64_t)atoll(opt(argc, argv, "--seed", "0"));
+    uint64_t seed = (uint64_t)atoll(opt(argc, argv, "--seed", "0")); g_seed = seed;
     const char *resume = opt(argc, argv, "--resume", nullptr);
     /* run defaults (2026-10-29): a NEW run (no --resume) defaults to --gpu-aug 2 and 3 sampler workers (with the labels' warp on the GPU
        the sampler keeps a P512 trainer fed with 2-3 workers; CPU augmentation needed ~10 at ~3.2 GB host each) and records that in
@@ -2519,7 +2599,7 @@ int cmd_train(int argc, char **argv) {
         }
     }
     size_t p3 = (size_t)g_Pz * P * P, p3l = split ? (size_t)P * P * g_Dl : p3;   /* per-GPU voxels of a window */
-    gpu_state G[8];
+    gpu_state G[8]; memset(G, 0, sizeof G); g_G0 = G;   /* (zeroed: fields added later rely on it) */
     int step0 = 0;
     g_fstem = atoi(opt(argc, argv, "--fstem", "0")); g_fs_drop = (float)atof(opt(argc, argv, "--fstem-drop", "0.25"));
     if (g_fstem) {
@@ -3365,16 +3445,15 @@ int cmd_train(int argc, char **argv) {
                 for (int g = 0; g < 2; g++) { nn_init(G[g].dev); int nxt = G[g].cur ^ 1; upload_async(&G[g], nb, nxt, B, P); select_buf(&G[g], nxt); }
                 G[0].pending = nb;
             }
-        } else
-        /* several GPUs: every GPU's forward launched (phase 0) before any backward (phase 1). One host thread launches; a P 896 latent
-           step queues more kernels than the driver's launch queue holds, so the host blocked in GPU 0's backward launches while GPU 1 idled
-           for its whole forward (u1: each GPU ~75 % busy, idle out of phase). UFSM_MGPU_PHASED=0: forward + backward per GPU in turn */
-        for (int ph = 0, ph1[64] = {0}, phased = ng > 1 && (!getenv("UFSM_MGPU_PHASED") || ufsm_env_on("UFSM_MGPU_PHASED")); ph < 2; ph++)
+        } else {
+        /* the step on every GPU. One host thread per GPU (default with several; UFSM_MGPU_THREADS=0: one thread, every GPU's forward
+           launched before any backward, UFSM_MGPU_PHASED=0 as well: forward + backward per GPU in turn). A P 896 latent step queues more
+           kernels than the driver's launch queue holds: one launching thread blocked in GPU 0's launches while GPU 1 idled (u1: each GPU
+           ~75 % busy, idle out of phase; phased 0.54 -> 0.62 samples/s). The batches are taken and released here, in GPU order (--det) */
+        int norm[64] = {0};
         for (int g = 0; g < ng; g++) {
             gpu_state *d = &G[g];
-            if (ph == 1 && !ph1[g]) continue;
             nn_init(d->dev);
-            if (ph == 0) {
             want_next[g] = 0;
             if (overfit > 1) {                              /* diagnostic: cycle through the first N batches (host copies, synchronous upload) */
                 static batch *fixed[256]; static int nfixed = 0;
@@ -3432,43 +3511,32 @@ int cmd_train(int argc, char **argv) {
                 upload_tail(d, B, P);                          /* (upsplit: its tail too) */
                 d->pending = b;
             }
-            nn_stream_wait(0, d->ev_up[d->cur]);           /* compute waits for the upload */
-            if (getenv("UFSM_DET_TRACE")) {   /* debugging (--det 1): hashes of what this step starts from: the input channel, the streamed label planes, the parameters */
-                nn_event_sync(d->ev_up[d->cur]); nn_sync();
-                const size_t p3t = (size_t)g_Pz * P * P, nx = (size_t)B * g_xs * p3t * xbytes(); uint8_t *hb = malloc(nx > p3t ? nx : p3t);
-                uint64_t hx = 1469598103934665603ull, hl[4] = {0, 0, 0, 0};
-                nn_d2h(hb, d->x, nx); for (size_t q = 0; q < nx; q++) hx = (hx ^ hb[q]) * 1099511628211ull;
-                if (g_lstream) for (int k = 0; k < 4; k++) if (d->lbh[k]) { uint64_t h = 1469598103934665603ull; for (size_t q = 0; q < p3t; q++) h = (h ^ d->lbh[k][q]) * 1099511628211ull; hl[k] = h; }
-                fprintf(stderr, "dettrace step %d: x %016llx labels %016llx %016llx %016llx %016llx params %016llx\n", step, (unsigned long long)hx, (unsigned long long)hl[0], (unsigned long long)hl[1], (unsigned long long)hl[2], (unsigned long long)hl[3], (unsigned long long)unet_param_hash(d->u));
-                free(hb);
+            norm[g] = 1;
+        }
+        if (!g_stop) {
+            static int thr = -1, phz = -1;
+            if (thr < 0) { thr = !getenv("UFSM_MGPU_THREADS") || ufsm_env_on("UFSM_MGPU_THREADS"); phz = !getenv("UFSM_MGPU_PHASED") || ufsm_env_on("UFSM_MGPU_PHASED"); }
+            gstep_arg ga[64];
+            for (int g = 0; g < ng; g++) ga[g] = (gstep_arg){&G[g], g, step, B, P, dice_w, cfg.cout, srste, sparse_at, 0};
+            if (ng > 1 && thr) {
+                for (int g = 0; g < ng; g++) if (norm[g]) { gpool_post(g, G[g].dev, gstep_job, &ga[g]); }
+                gpool_wait();
+                for (int g = ng - 1; g >= 0; g--) if (norm[g]) { nn_tls_install(&ga[g].out); break; }   /* (the main thread goes on from the last GPU's op state, as one thread does: the uploads' replay draws, the optimizer) */
             }
-            if (sparse_at && step >= sparse_at && !unet_get_sparse24(d->u)) { unet_set_sparse24(d->u, 1); if (g == 0) fprintf(stderr, "step %d: 2:4 sparsity on (SR-STE lambda %g)\n", step, srste); }
-            unet_zero_grad(d->u);
-            d->last = d->cur;
-            if (g_fstem) { uint64_t h = (uint64_t)step * 0xD1B54A32D192ED03ull + (uint64_t)seed * 31 + (uint64_t)g; h ^= h >> 31; h *= 0xBF58476D1CE4E5B9ull; h ^= h >> 29;
-                           d->fs_drop = (double)(h >> 11) * 0x1p-53 < g_fs_drop; }   /* (--fstem-drop: per GPU and step; reset after the backward) */
-            d->gc_on = g_gc && d->gcS && g == 0 && step % g_gc == 0; if (d->gc_on) nn_zero(d->gcS, (size_t)cfg.cout * cfg.cout * sizeof(double));   /* --grad-cos: this step's Gram */
-            test_nan_inject(d, step, 0, P);   /* tests: UFSM_TEST_NAN */
-            restore_train_recipe(d, step, g), run_batch(d, B, P, dice_w, 1);
-            test_nan_inject(d, step, 1, P);
-            if (sync_check(d, step, "forward and losses")) return 1;
-            ph1[g] = phased;
-            if (phased) continue;   /* (the backward in phase 1) */
+            else if (ng > 1 && phz) { for (int g = 0; g < ng; g++) if (norm[g]) gstep_fwd(&ga[g]); for (int g = 0; g < ng; g++) if (norm[g] && !ga[g].rc) gstep_bwd(&ga[g]); }
+            else for (int g = 0; g < ng; g++) if (norm[g]) { gstep_fwd(&ga[g]); if (!ga[g].rc) gstep_bwd(&ga[g]); }
+            for (int g = 0; g < ng; g++) if (ga[g].rc) return 1;
+            for (int g = 0; g < ng; g++) {
+                if (!norm[g]) continue;
+                gpu_state *d = &G[g]; nn_init(d->dev);
+                if (overfit || g_bench_same) continue;           /* keep computing on the same device buffer (UFSM_BENCH_SAME: GPU step time without the loader) */
+                sampler_release(sp, d->pending);
+                /* prefetch the next batch into the other buffer while this step computes; several GPUs: after every GPU's step is
+                   launched (waiting here for GPU 0's next batch held GPU 1's launch back whenever the sampler was behind) */
+                d->pending = nullptr;
+                want_next[g] = step < steps && !g_stop;
             }
-            ph1[g] = 0;
-            unet_backward_x(d->u, g_half && !g_pkf ? d->glh : d->gl, g_g16); nn_ptick("trunk backward");
-            test_nan_inject(d, step, 2, P);
-            if (sync_check(d, step, "backward")) return 1;
-            diag_nonfinite(d, "parameter gradients", unet_grad_ptr(d->u), unet_nparams(d->u), 0);
-            d->fs_drop = 0;   /* (validation: with the stem) */
-            nn_event_record(d->ev_done[d->cur], 0);
-            nn_event_sync(d->ev_up[d->cur]);                 /* host buffer of this batch is free again */
-            if (overfit || g_bench_same) continue;           /* keep computing on the same device buffer (UFSM_BENCH_SAME: GPU step time without the loader) */
-            sampler_release(sp, d->pending);
-            /* prefetch the next batch into the other buffer while this step computes; several GPUs: after every GPU's step is
-               launched (waiting here for GPU 0's next batch held GPU 1's launch back whenever the sampler was behind) */
-            d->pending = nullptr;
-            want_next[g] = step < steps && !g_stop;
+        }
         }
         for (int g = 0; g < ng && !g_stop && !training_failed; g++) {
             if (!want_next[g]) continue;
