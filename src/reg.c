@@ -1,5 +1,6 @@
 /* Scan-to-scan registration core: see reg.h. */
 #include "reg.h"
+#include "zarr2.h"
 #include "store.h"
 #include "zarr3.h"
 #include <math.h>
@@ -82,7 +83,18 @@ static double um_of_key(const char *key) {
 rvol *rvol_open(const char *root, const char *key, const char *cache, double um) {
     store *s = store_open(root); if (!s) return nullptr;
     z3_level lv[10]; const int n = z3_group_levels(s, key, lv, 10);
-    if (n <= 0) { fprintf(stderr, "reg: no levels in %s/%s: %s\n", root, key, z3_error()); return nullptr; }
+    if (n <= 0) {   /* a zarr v2 pyramid (levels "0", "1", ... each half the previous): the scrollprize 2023 scans */
+        rvol *v = calloc(1, sizeof *v); v->um = um > 0 ? um : um_of_key(key); snprintf(v->name, sizeof v->name, "%s", key);
+        for (int l = 0; l < 10; l++) {
+            char k[1200]; snprintf(k, sizeof k, "%s/%d", key, l);
+            z2 *z = z2_open(s, k, cache); if (!z) break;
+            const z2_meta *m = z2_meta_of(z);
+            if (l && (m->shape[0] != (v->shape[l - 1][0] + 1) / 2 && m->shape[0] != v->shape[l - 1][0] / 2)) { z2_close(z); break; }   /* only 2^l pyramids */
+            v->z2[l] = z; for (int a = 0; a < 3; a++) v->shape[l][a] = m->shape[a]; v->nl = l + 1;
+        }
+        if (!v->nl || v->um <= 0) { fprintf(stderr, "reg: no zarr v3 or v2 levels (or no voxel size) in %s/%s: %s\n", root, key, z3_error()); free(v); return nullptr; }
+        return v;
+    }
     rvol *v = calloc(1, sizeof *v);
     v->um = um > 0 ? um : um_of_key(key);
     snprintf(v->name, sizeof v->name, "%s", key);
@@ -130,6 +142,15 @@ int rvol_read_nt(rvol *v, int l, const int64_t o[3], const int64_t n[3], uint8_t
         }
         return -1;
     }
+    if (v->z2[l]) {
+        for (int a = 0; a < 5; a++) {
+            if (!z2_read(v->z2[l], o, n, out, nt)) return 0;
+            fprintf(stderr, "reg: read %s level %d (attempt %d): %s\n", v->name, l, a + 1, z2_error());
+            static const int wait[4] = {2, 8, 30, 60};
+            if (a < 4) sleep(wait[a]);
+        }
+        return -1;
+    }
     const int64_t *s = v->shape[l]; const uint8_t *m = v->mem[l];
     for (int64_t z = 0; z < n[0]; z++) for (int64_t y = 0; y < n[1]; y++) {
         uint8_t *row = out + ((size_t)z * n[1] + y) * n[2];
@@ -141,7 +162,7 @@ int rvol_read_nt(rvol *v, int l, const int64_t o[3], const int64_t n[3], uint8_t
 }
 void rvol_close(rvol *v) {
     if (!v) return;
-    for (int l = 0; l < v->nl; l++) { if (v->z[l]) z3_close(v->z[l]); free(v->mem[l]); }
+    for (int l = 0; l < v->nl; l++) { if (v->z[l]) z3_close(v->z[l]); if (v->z2[l]) z2_close(v->z2[l]); free(v->mem[l]); }
     free(v);
 }
 int rvol_level_for(const rvol *v, double um) {

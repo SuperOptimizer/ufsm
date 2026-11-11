@@ -33,6 +33,7 @@ void rmap_f2c(const rmap *m, const double f[3], double c[3]);   /* fixed-point i
 typedef struct rvol {
     double um; int nl; int64_t shape[10][3];   /* zyx per level */
     void *z[10];                               /* z3 * per level */
+    void *z2[10];                              /* z2 * per level (zarr v2 pyramids, e.g. the 2023 scrollprize scans: levels "0", "1", ...) */
     uint8_t *mem[10];                          /* in-memory levels (tests) */
     char name[256];
 } rvol;
