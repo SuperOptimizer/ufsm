@@ -102,7 +102,8 @@ void axis_at(const axis *a, double z, double *y, double *x) {
 
 /* ---- sources ---- */
 
-static const char *CHNAME[NCH] = {"recto", "sheet"};
+const char *const SHNAME[SH_N] = {"phase", "normal", "density", "wind4", "rv", "ink", "fibre"};
+static const char *CHNAME[NTG] = {"recto", "sheet", "fibre"};
 
 static char *sdup(const char *s) { return s ? strdup(s) : nullptr; }
 
@@ -140,6 +141,21 @@ sources *sources_load(const char *path) {
           else if (strcmp(sc, "global")) { fprintf(stderr, "sources: %s: \"scope\" must be \"local\", \"w4\" or \"global\"\n", s->name); json_free(j); sources_free(S); return nullptr; } }
         s->iso = (int)json_num(json_get(e, "iso"), 0);
         s->pap_level = (int)json_num(json_get(e, "papyrus"), s->iso);
+        {   /* "heads": per-head loss multipliers (a number, or {"on": 0|1, "lambda": x}); unknown names are refused (a typo would train a head silently) */
+            for (int h = 0; h < SH_N; h++) s->head_w[h] = 1.f;
+            const json *hj = json_get(e, "heads");
+            if (hj && hj->type != J_OBJ) { fprintf(stderr, "sources: %s: \"heads\" must be an object {\"phase\": 1, \"rv\": 0, ...}\n", s->name); json_free(j); sources_free(S); return nullptr; }
+            for (size_t k = 0; hj && k < hj->n; k++) {
+                const char *nm = hj->keys[k]; const json *v = hj->items[k]; int h = 0;
+                while (h < SH_N && strcmp(SHNAME[h], nm)) h++;
+                double w = v && v->type == J_NUM ? v->num : v && v->type == J_OBJ ? json_num(json_get(v, "lambda"), 1) * (json_num(json_get(v, "on"), 1) != 0) : -1;
+                if (h == SH_N || !(w >= 0 && w <= 1000)) {
+                    fprintf(stderr, "sources: %s: \"heads\": \"%s\": a head of", s->name, nm); for (int q = 0; q < SH_N; q++) fprintf(stderr, " %s", SHNAME[q]);
+                    fprintf(stderr, ", value a lambda 0..1000 or {\"on\": 0|1, \"lambda\": x}\n"); json_free(j); sources_free(S); return nullptr;
+                }
+                s->head_w[h] = (float)w;
+            }
+        }
         s->head = (int)json_num(json_get(e, "head"), 0);
         if (s->head < 0 || s->head > 6) { fprintf(stderr, "sources: %s: head 0..6\n", s->name); json_free(j); sources_free(S); return nullptr; }
         s->min_level = (int)json_num(json_get(e, "min_level"), 0);
@@ -149,9 +165,10 @@ sources *sources_load(const char *path) {
         if (s->crush_fine > 3) { fprintf(stderr, "sources: %s: crush_fine 0..3\n", s->name); json_free(j); sources_free(S); return nullptr; }
         for (int l = 0; l < MAXLEV; l++) s->ct_present[l] = -1; /* unknown until probed */
         const json *tg = json_get(e, "targets");
-        for (int c = 0; c < NCH; c++) {
+        for (int c = 0; c < NTG; c++) {
             const json *t = json_get(tg, CHNAME[c]);
             if (!t && c == CH_SHEET) t = json_get(tg, "ink");   /* task unwrap: the ink teacher (prob) in target slot 1 */
+            if (!t && c == CH_FIB) t = json_get(tg, "fiber");
             for (int l = 0; l < MAXLEV; l++) s->tgt_present[c][l] = -1;
             if (!t) continue;
             if (t->type == J_STR) { s->tgt_key[c] = strdup(t->str); continue; }
@@ -361,7 +378,7 @@ sources *sources_load(const char *path) {
             s->srp = srpair_open(json_str(json_get(e, "root"), "."), json_str(json_get(sj, "role"), "train"), (int)json_num(json_get(sj, "lut"), 1), (int)json_num(json_get(sj, "cache"), 0));
             if (!s->srp) { json_free(j); sources_free(S); return nullptr; }
             for (int l = 0; l < MAXLEV; l++) s->ct_present[l] = 0;
-            for (int c = 0; c < NCH; c++) for (int l = 0; l < MAXLEV; l++) s->tgt_present[c][l] = 0;
+            for (int c = 0; c < NTG; c++) for (int l = 0; l < MAXLEV; l++) s->tgt_present[c][l] = 0;
         }
         const char *ap = json_str(json_get(e, "axis"), nullptr);
         if (ap && axis_load(&s->ax, ap)) fprintf(stderr, "sources: %s: cannot load axis %s\n", s->name, ap);
@@ -381,7 +398,7 @@ void sources_free(sources *S) {
         source *s = &S->src[i];
         for (int l = 0; l < MAXLEV; l++) z3_close(s->ct[l]);
         if (s->band != s->phase) z3_close(s->band); z3_close(s->phase); z3_close(s->wind); z3_close(s->aux); z3_close(s->phase_ign); z3_close(s->phase_wt); free(s->box); free(s->hold); free(s->focus); free(s->mask); srpair_free(s->srp);
-        for (int c = 0; c < NCH; c++) {
+        for (int c = 0; c < NTG; c++) {
             for (int l = 0; l < MAXLEV; l++) z3_close(s->tgt[c][l]);
             if (s->reg[c]) {
                 for (int k = 0; k < s->reg[c]->n; k++) z3_close(s->reg_z[c][k]);
@@ -458,14 +475,14 @@ typedef struct { sources *S; int from, to; } oa_arg;
 static void *oa_worker(void *p) {
     oa_arg *a = p;
     for (int k = a->from; k < a->to; k++) {
-        int si = k / (MAXLEV * (NCH + 1)), rem = k % (MAXLEV * (NCH + 1)), l = rem / (NCH + 1), c = rem % (NCH + 1);
+        int si = k / (MAXLEV * (NTG + 1)), rem = k % (MAXLEV * (NTG + 1)), l = rem / (NTG + 1), c = rem % (NTG + 1);
         source *s = &a->S->src[si];
-        if (c == NCH) source_ct(s, l); else if (s->tgt_key[c]) source_tgt(s, c, l);
+        if (c == NTG) source_ct(s, l); else if (s->tgt_key[c]) source_tgt(s, c, l);
     }
     return nullptr;
 }
 void sources_open_all(sources *S, int nthreads) {
-    int total = S->n * MAXLEV * (NCH + 1); if (nthreads > total) nthreads = total; if (nthreads < 1) nthreads = 1;
+    int total = S->n * MAXLEV * (NTG + 1); if (nthreads > total) nthreads = total; if (nthreads < 1) nthreads = 1;
     pthread_t *th = malloc(nthreads * sizeof *th); oa_arg *args = malloc(nthreads * sizeof *args);
     for (int t = 0; t < nthreads; t++) { args[t] = (oa_arg){S, total * t / nthreads, total * (t + 1) / nthreads}; pthread_create(&th[t], nullptr, oa_worker, &args[t]); }
     for (int t = 0; t < nthreads; t++) pthread_join(th[t], nullptr);
@@ -498,7 +515,7 @@ z3 *source_tgt(source *s, int ch, int level) {
 }
 
 z3 *source_tgt_for_level(source *s, int ch, int level, int *stored_level) {
-    if (ch < 0 || ch >= NCH || level < 0 || level >= MAXLEV) return nullptr;
+    if (ch < 0 || ch >= NTG || level < 0 || level >= MAXLEV) return nullptr;
     int actual = (s->tgt_binary[ch] || s->tgt_prob[ch] || s->tgt_side[ch]) && level < s->tgt_min_level[ch] ? s->tgt_min_level[ch] : level;   /* coarser: upsampled */
     if (stored_level) *stored_level = actual;
     return source_tgt(s, ch, actual);

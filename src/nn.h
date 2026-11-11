@@ -380,6 +380,10 @@ void nn_gn_apply(const float *x, shape5 s, int G, const float *gamma, const floa
 void nn_silu_fwd(const float *x, size_t n, float *y);
 void nn_silu_bwd(const float *x, const float *gy, size_t n, float *gx);   /* gx SET */
 void nn_axpy(float *y, float a, const float *x, size_t n);               /* y += a x */
+/* unet cfg.film (src/nn_film.cu): a GroupNorm's effective gamma / beta (offsets gam / bet, C channels) from its K x C pairs A, D at fo and the
+   K host codes, written into fw; the backward turns the effective pair's gradient in g into gamma's, A's and D's */
+void nn_film_fwd(const float *p, float *fw, size_t gam, size_t bet, size_t fo, int C, int K, const float *codes);
+void nn_film_bwd(const float *p, float *g, size_t gam, size_t bet, size_t fo, int C, int K, const float *codes);
 void nn_scale(float *y, float a, size_t n);
 void nn_u8_to_f32(const uint8_t *x, size_t n, float scale, float *y);
 

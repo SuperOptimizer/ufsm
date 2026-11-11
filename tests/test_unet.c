@@ -73,8 +73,18 @@ int main(void) {
     if (getenv("UFSM_EMB")) { cfg.emb_lev = 1; cfg.emb_ch = atoi(getenv("UFSM_EMB")); }   /* the distillation head on decoder level 1 */
     if (getenv("UFSM_DEC_CONVS")) for (int l = 0; l < UNET_MAXLEV; l++) cfg.dec_convs[l] = atoi(getenv("UFSM_DEC_CONVS"));   /* one-conv decoders */   /* deep-supervision heads: their gradient path too */
     if (getenv("UFSM_DEC_WIDTHS")) { char *t = strdup(getenv("UFSM_DEC_WIDTHS")); int l = 0; for (char *q = strtok(t, ","); q && l < UNET_MAXLEV; q = strtok(nullptr, ",")) cfg.dec_widths[l++] = atoi(q); free(t); }   /* narrower decoder levels */
+    cfg.film = getenv("UFSM_FILM") ? atoi(getenv("UFSM_FILM")) : 0;   /* per-level scale FiLM: K codes, its A / D pairs random (last in the layout) */
+    static const float film_c[4] = {1.f, -0.6f, 0.3f, 2.f};
     unet *u = unet_create(&cfg);
     unet_init(u, 1);
+    size_t nfilm = 0;
+    if (cfg.film) {
+        for (int i = 0; i < cfg.nlev; i++) nfilm += (size_t)2 * cfg.film * cfg.widths[i];
+        for (int i = 0; i < cfg.nlev - 1; i++) nfilm += (size_t)2 * cfg.film * (cfg.dec_widths[i] ? cfg.dec_widths[i] : cfg.widths[i]);
+        float *hf = malloc(nfilm * 4); for (size_t i = 0; i < nfilm; i++) hf[i] = 0.3f * frand();
+        nn_h2d((float *)unet_live_params(u) + unet_nparams(u) - nfilm, hf, nfilm * 4); free(hf);
+        unet_set_film(u, film_c, cfg.film);
+    }
     if (cfg.l0_norm == 2) unet_set_l0_ema(u, 0.f, 1);   /* ema: the first forward's statistics, kept (momentum 0), constants from the second on */
     if (cfg.scale_cond) unet_set_scale(u, 9.6);   /* code +1 */
     size_t np = unet_nparams(u);
@@ -129,7 +139,7 @@ int main(void) {
     fread(p, 4, np, f); fread(g, 4, np, f); fread(g, 4, np, f); fclose(f);   /* third array = m = g */
     double worst = 0, gmax = 0;
     for (size_t i = 0; i < np; i++) if (fabs(g[i]) > gmax) gmax = fabs(g[i]);
-    int K = getenv("UFSM_DS") || getenv("UFSM_EMB") ? 120 : 60, bad = 0, KS = cfg.scale_cond ? cfg.widths[0] : 0;
+    int K = getenv("UFSM_DS") || getenv("UFSM_EMB") ? 120 : 60, bad = 0, KS = cfg.scale_cond ? cfg.widths[0] : (int)nfilm;   /* (film: every FiLM parameter, last) */
     for (int j = 1; j <= cfg.ds_levels; j++) KS += (cfg.dec_widths[j] ? cfg.dec_widths[j] : cfg.widths[j]) * cfg.cout + cfg.cout;   /* and every deep-supervision head parameter (last) */   /* scale_cond: every entry of the conditioning vector (last in the layout) */
     if (cfg.emb_lev) KS += (cfg.dec_widths[cfg.emb_lev] ? cfg.dec_widths[cfg.emb_lev] : cfg.widths[cfg.emb_lev]) * cfg.emb_ch + cfg.emb_ch;   /* and the distillation head (last) */
     for (int k = 0; k < K + KS; k++) {
@@ -168,8 +178,15 @@ int main(void) {
     big.l0_norm = cfg.l0_norm == 4 ? 0 : cfg.l0_norm;   /* (slab on tensor cores: MX storage only, test_l0_norm) */
     if (getenv("UFSM_BIG_ENC_BLOCKS")) { char *t = strdup(getenv("UFSM_BIG_ENC_BLOCKS")); int l = 0; for (char *q = strtok(t, ","); q && l < UNET_MAXLEV; q = strtok(nullptr, ",")) big.enc_blocks[l++] = atoi(q); free(t); }
     if (getenv("UFSM_BIG_DEC_WIDTHS")) { char *t = strdup(getenv("UFSM_BIG_DEC_WIDTHS")); int l = 0; for (char *q = strtok(t, ","); q && l < UNET_MAXLEV; q = strtok(nullptr, ",")) big.dec_widths[l++] = atoi(q); free(t); }   /* narrower decoder levels */
+    big.film = cfg.film;   /* (the tensor-core paths read the FiLM'd affines too) */
     unet *b = unet_create(&big);
     unet_init(b, 2);
+    if (big.film) {
+        size_t nb = 0; for (int i = 0; i < big.nlev; i++) nb += (size_t)2 * big.film * big.widths[i] * (i < big.nlev - 1 ? 2 : 1);
+        float *hf = malloc(nb * 4); for (size_t i = 0; i < nb; i++) hf[i] = 0.3f * frand();
+        nn_h2d((float *)unet_live_params(b) + unet_nparams(b) - nb, hf, nb * 4); free(hf);
+        unet_set_film(b, film_c, big.film);
+    }
     if (big.l0_norm == 2) unet_set_l0_ema(b, 0.f, 1);
     printf("model (16,32,64,80): %zu params\n", unet_nparams(b));
     int BP = getenv("UFSM_P") ? atoi(getenv("UFSM_P")) : 96, BB = getenv("UFSM_B") ? atoi(getenv("UFSM_B")) : 1;

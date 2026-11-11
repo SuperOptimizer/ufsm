@@ -109,6 +109,7 @@ struct unet {
     int l0rx; const void *l0x_ct; int l0x_held[16];   /* the network input in a ring (--gpu-input: rebuilt per slab from the CT channel); slot -> slab */
     void *l0r_hsk; size_t l0r_hskn;    /* the skip gradient's pinned host copy (stage S4's host mode: the device holds a ring) */
     size_t sc_w; float sc_c; float *stem_b;   /* scale_cond: offset of the conditioning vector, current scale code, effective stem bias */
+    size_t film_off; float film_c[4]; float *ffw;   /* cfg.film: the first A / D pair, the current codes, the forward copy of the weights (when nothing else copies them) */
     block enc[UNET_MAXLEV], dec[UNET_MAXLEV];
     convp down[UNET_MAXLEV], head;
     gnp dn[UNET_MAXLEV];          /* down_norm: GroupNorm after down[i] */
@@ -301,6 +302,21 @@ static size_t add_block(unet *u, block *b, int cin, int cout, size_t off) {
     return off;
 }
 
+/* cfg.film: the FiLM'd norms, j < 2 L - 1: the encoder blocks' output norms (j < L), then the decoders' (level L - 2 down to 0); their A / D pairs in that order */
+static const gnp *film_norm(const unet *u, int j) { const int L = u->cfg.nlev; return j < L ? &u->enc[j].n2 : &u->dec[L - 2 - (j - L)].n2; }
+static void film_fwd(unet *u) {   /* the effective affines into the forward weights (a copy of the live weights: the one sparse24 / ws made, else ffw) */
+    if (!u->cfg.film) return;
+    if (u->wq) { fprintf(stderr, "unet: film needs dense fp32 master weights (no packed weights)\n"); abort(); }
+    if (u->fw == u->live) { if (!u->ffw) u->ffw = nn_malloc(u->np * 4); nn_d2d(u->ffw, u->live, u->np * 4); u->fw = u->ffw; }
+    size_t fo = u->film_off; const int K = u->cfg.film;
+    for (int j = 0; j < 2 * u->cfg.nlev - 1; j++) { const gnp *n = film_norm(u, j); nn_film_fwd(u->live, u->fw, n->gamma, n->beta, fo, n->c, K, u->film_c); fo += (size_t)2 * K * n->c; }
+}
+static void film_bwd(unet *u, float *g) {
+    if (!u->cfg.film) return;
+    size_t fo = u->film_off; const int K = u->cfg.film;
+    for (int j = 0; j < 2 * u->cfg.nlev - 1; j++) { const gnp *n = film_norm(u, j); nn_film_bwd(u->live, g, n->gamma, n->beta, fo, n->c, K, u->film_c); fo += (size_t)2 * K * n->c; }
+}
+void unet_set_film(unet *u, const float *codes, int k) { for (int i = 0; i < 4; i++) u->film_c[i] = i < k && codes ? codes[i] : 0.f; }
 unet *unet_create(const unet_cfg *cfg) {
     unet *u = calloc(1, sizeof *u);
     u->cfg = *cfg;
@@ -368,6 +384,8 @@ unet *unet_create(const unet_cfg *cfg) {
     }
     if (cfg->emb_lev < 0 || (cfg->emb_lev > 0 && (cfg->emb_lev > L - 2 || cfg->emb_ch <= 0))) { fprintf(stderr, "unet: the distillation head takes decoder levels 1..%d and >= 1 channel\n", L - 2); abort(); }
     if (cfg->emb_lev) off = add_conv(u, &u->eh, dw_of(cfg, cfg->emb_lev), cfg->emb_ch, 1, 1, off);   /* (params last: older layouts unchanged) */
+    if (cfg->film < 0 || cfg->film > 4) { fprintf(stderr, "unet: film takes 0..4 codes\n"); abort(); }
+    if (cfg->film) { u->film_off = off; for (int j = 0; j < 2 * L - 1; j++) off += (size_t)2 * cfg->film * film_norm(u, j)->c; }   /* (params last: older layouts unchanged) */
     u->np = off;
     if (ufsm_env_on("UFSM_DEBUG")) {
         for (int i = 0; i < L; i++) fprintf(stderr, "enc%d c1.w %zu c1.b %zu n1 %zu c2.w %zu c2.b %zu n2 %zu\n", i, u->enc[i].c1.w, u->enc[i].c1.b, u->enc[i].n1.gamma, u->enc[i].c2.w, u->enc[i].c2.b, u->enc[i].n2.gamma);
@@ -2503,6 +2521,7 @@ const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x
     if (sp_on(u) && (!nn_get_tf32() || !ABF)) { fprintf(stderr, "unet: the spatial split needs the tensor-core path with 16-bit or MX storage\n"); abort(); }
     sp_cfg(u);
     unet_apply_sparse24(u);
+    film_fwd(u);   /* (cfg.film: the effective norm affines of this forward's codes; its backward reads them too) */
     if (u->cfg.scale_cond) {   /* stem bias b + c v for this forward (and the recompute passes of its backward) */
         const int c0 = u->enc[0].c1.cout;
         if (!u->stem_b) u->stem_b = nn_malloc((size_t)c0 * 4);
@@ -3733,6 +3752,7 @@ void unet_backward_x(unet *u, const void *gv, int g_h16) {
     if (share_enc_a1()) u->sea_stale = 1;   /* the decoders' a1 buffers now hold the encoders' */
     /* d/dv of the stem bias b + c v is c d/db (exact when the gradient was zeroed before this backward: one backward per step) */
     if (u->cfg.scale_cond) nn_axpy(g + u->sc_w, u->sc_c, g + u->enc[0].c1.b, (size_t)u->enc[0].c1.cout);
+    film_bwd(u, g);   /* (exact as the scale_cond term: the gradient was zeroed before this backward) */
     if (u->cfg.l0_norm == 3) ws_backward(u);
     g_in_bwd = 0;
 }
@@ -4110,7 +4130,7 @@ void unet_gn_freeze(unet *u, const float *h) {
 void unet_blend_ema(unet *u, float a) { nn_scale(u->ema, 1.f - a, u->np); nn_axpy(u->ema, a, u->p, u->np); nn_wmemo_clear(); }
 const float *unet_ema_params(const unet *u) { return u->ema; }
 void unet_use_ema(unet *u, int on) { nn_wmemo_clear(); u->live = on ? u->ema : u->p; u->using_ema = on; if (!u->sparse24) u->fw = u->live; }
-const float *unet_fwd_params(const unet *u) { return u->fw; }
+const float *unet_fwd_params(const unet *u) { return u->cfg.film && u->fw == u->ffw ? u->live : u->fw; }   /* (film: the reader applies its own codes to the live weights) */
 /* ---- 2:4 structured sparsity: the forward reads a masked copy of the live weights; SR-STE keeps the master weights dense ---- */
 static void for_each_conv3(unet *u, void (*fn)(unet *, const convp *, void *), void *arg) {
     int L = u->cfg.nlev;
@@ -4325,6 +4345,7 @@ int unet_save(const unet *u, const char *path, int step, const char *extra) {
     if (u->cfg.w4_2d) fprintf(f, ",\"w4_2d\":%d", u->cfg.w4_2d);
     if (u->cfg.ds_levels) fprintf(f, ",\"ds_levels\":%d", u->cfg.ds_levels);
     if (u->cfg.emb_lev) fprintf(f, ",\"emb_lev\":%d,\"emb_ch\":%d", u->cfg.emb_lev, u->cfg.emb_ch);
+    if (u->cfg.film) fprintf(f, ",\"film\":%d", u->cfg.film);
     if (u->cfg.attn_blocks) fprintf(f,",\"attn_blocks\":%d,\"attn_pe\":%d,\"attn_reg\":%d,\"attn_mlp\":%d", u->cfg.attn_blocks, u->cfg.attn_pe, u->cfg.attn_reg, u->tbd.F);
     if (u->cfg.attn_vres) fprintf(f, ",\"attn_vres\":%d", u->cfg.attn_vres);
     if (u->cfg.attn_blocks && u->cfg.attn_axis) fprintf(f, ",\"attn_axis\":%d", u->cfg.attn_axis);
@@ -4389,6 +4410,7 @@ static int read_header(FILE *f, unet_cfg *cfg, int *step, size_t *np) {
     if ((p = strstr(line, "\"ds_levels\":"))) cfg->ds_levels = atoi(p + 12);
     cfg->emb_lev = (p = strstr(line, "\"emb_lev\":")) ? atoi(p + 10) : 0;
     cfg->emb_ch = (p = strstr(line, "\"emb_ch\":")) ? atoi(p + 9) : 0;
+    cfg->film = (p = strstr(line, "\"film\":")) ? atoi(p + 7) : 0;
     if ((p = strstr(line, "\"attn_blocks\":"))) cfg->attn_blocks = atoi(p + 14);
     if ((p = strstr(line, "\"attn_pe\":"))) cfg->attn_pe = atoi(p + 10);
     if ((p = strstr(line, "\"attn_reg\":"))) cfg->attn_reg = atoi(p + 11);
@@ -4610,6 +4632,11 @@ int unet_init_from_map(unet *u, const char *path, const int *head_rows) {
         }
         n++;
     } else { unet_free(o); return -1; }
+    if (!S && u->cfg.film && oc.film == u->cfg.film && u->film_off && o->np - o->film_off == u->np - u->film_off) {   /* the donor's FiLM pairs (same widths) */
+        const size_t nf = u->np - u->film_off;   /* (film is the last parameter block of both) */
+        int same = 1; for (int j = 0; j < 2 * L - 1; j++) same &= film_norm(u, j)->c == film_norm(o, j)->c;
+        if (same) { nn_d2d(u->p + u->film_off, o->p + o->film_off, nf * 4); nn_d2d(u->ema + u->film_off, o->ema + o->film_off, nf * 4); inh_add(u, u->film_off, nf); n++; }
+    }
     if (!S && u->cfg.scale_cond && oc.scale_cond && u->enc[0].c1.cout == o->enc[0].c1.cout) {
         nn_d2d(u->p + u->sc_w, o->p + o->sc_w, (size_t)u->enc[0].c1.cout * 4); nn_d2d(u->ema + u->sc_w, o->ema + o->sc_w, (size_t)u->enc[0].c1.cout * 4); n++;
         inh_add(u, u->sc_w, (size_t)u->enc[0].c1.cout);

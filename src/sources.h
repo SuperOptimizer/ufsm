@@ -28,6 +28,12 @@
 #include <stdint.h>
 
 enum { CH_RECTO = 0, CH_SHEET = 1, NCH = 2 };
+/* target slots of a source: the NCH batch channels, then CH_FIB, a target that only feeds a train aux plane (the "fibre" tube raster of
+   --fib-normal-lambda when an ink plane is on too; never a batch channel) */
+enum { CH_FIB = 2, NTG = 3 };
+/* the heads a source's "heads" key names (sources.c SHNAME) */
+enum { SH_PHASE, SH_NORMAL, SH_DENSITY, SH_WIND4, SH_RV, SH_INK, SH_FIBRE, SH_N };
+extern const char *const SHNAME[SH_N];
 #define MAXLEV 10
 
 typedef struct {
@@ -57,6 +63,8 @@ typedef struct {
     int crush_fine;   /* "crush_fine": N: --aug-crush windows pull their CT from N levels finer of the same scan (a 2^N box mean per voxel);
                          -1 (absent): train --aug-crush-fine */
     int trust_band;   /* > 0: background labels are trusted only within this many level-0 voxels of an annotated surface (partial annotations) */
+    float head_w[SH_N];   /* "heads": {"phase": 1, "rv": 0, "ink": {"on": 1, "lambda": 0.5}, ...}: per train head a loss multiplier for this source's windows
+                             (0 = the head is off here; absent: 1). src/train.c applies it to the head's logit gradient (task unwrap2 head slabs) */
     int head;         /* train --heads: the recto head this source's recto target trains (0: output channel 0; k >= 1: channel 1 + k) */
     int iso;          /* > 0: the scan's void cutoff (papyrus = CT >= iso) for train --iso-void / --iso-lift (0: --iso's value) */
     int pap_level;    /* "papyrus": raw CT >= this is papyrus for train --distill-papyrus (default "iso"; 0: unknown, no gate) */
@@ -65,28 +73,28 @@ typedef struct {
     int nlev;
     /* per channel: either a pyramid (levels keyed like the CT) or a regions set; each target may live in
        its own store ({"root": ..., "group": ...}), else the source's store is used */
-    store *tgt_store[NCH];
-    char *tgt_key[NCH];
-    z3 *tgt[NCH][MAXLEV];
-    int tgt_present[NCH][MAXLEV];
-    int tgt_binary[NCH];      /* target bytes are 0/background, 255/surface; no ignore class */
-    int tgt_min_level[NCH];   /* finest stored CT rung; binary targets can upsample finer requests */
-    int tgt_side[NCH];        /* recto only, "encoding": "side": recto / verso side labels (src/band.h RV_*: phase-raster --pair 2), nearest-upsampled;
+    store *tgt_store[NTG];
+    char *tgt_key[NTG];
+    z3 *tgt[NTG][MAXLEV];
+    int tgt_present[NTG][MAXLEV];
+    int tgt_binary[NTG];      /* target bytes are 0/background, 255/surface; no ignore class */
+    int tgt_min_level[NTG];   /* finest stored CT rung; binary targets can upsample finer requests */
+    int tgt_side[NTG];        /* recto only, "encoding": "side": recto / verso side labels (src/band.h RV_*: phase-raster --pair 2), nearest-upsampled;
                                  the sampler turns them into recto-side / verso-side papyrus (channels 0 / 1) with the source's void cutoff */
-    int tgt_votes[NCH];       /* "encoding": "side-votes" (tgt_side set too): bytes are src/votes.h vote codes, turned into side codes on
+    int tgt_votes[NTG];       /* "encoding": "side-votes" (tgt_side set too): bytes are src/votes.h vote codes, turned into side codes on
                                  read by tgt_vote_lut ("votes": {"rule": "unanimous" | "majority", "min": 1}); "soft": 1 keeps the codes and
                                  the sampler writes recto-side papyrus r / (r + v) (soft targets: not packable) */
-    int tgt_votes_soft[NCH];
-    uint8_t tgt_vote_lut[NCH][256];   /* hard: vote code -> RV_*; soft: vote code -> round(254 r / (r + v)), 255 below "min" votes */
-    int tgt_erode[NCH], tgt_dilate[NCH];   /* binary targets: "erode" / "dilate" N voxels at the training level (bands of every teacher the same
+    int tgt_votes_soft[NTG];
+    uint8_t tgt_vote_lut[NTG][256];   /* hard: vote code -> RV_*; soft: vote code -> round(254 r / (r + v)), 255 below "min" votes */
+    int tgt_erode[NTG], tgt_dilate[NTG];   /* binary targets: "erode" / "dilate" N voxels at the training level (bands of every teacher the same
                                               thickness: e.g. a thick pseudo-label band eroded to the published labels' width) */
-    int tgt_prob[NCH];        /* "encoding": "prob": bytes are round(p * 255) (teacher probabilities, no ignore class); read as
+    int tgt_prob[NTG];        /* "encoding": "prob": bytes are round(p * 255) (teacher probabilities, no ignore class); read as
                                  round(p * 254) and passed through without erode / dilate / soft / trust band */
-    int tgt_prob254[NCH];     /* "encoding": "prob254" (tgt_prob set too): bytes already p * 254 with 255 = unknown (ufsm ink-splat), read as
+    int tgt_prob254[NTG];     /* "encoding": "prob254" (tgt_prob set too): bytes already p * 254 with 255 = unknown (ufsm ink-splat), read as
                                  stored, so unknown stays ignored */
-    regions *reg[NCH];
-    z3 **reg_z[NCH];        /* lazily opened region arrays */
-    z3 *reg_shared[NCH];    /* the shared array when reg[ch]->array is set */
+    regions *reg[NTG];
+    z3 **reg_z[NTG];        /* lazily opened region arrays */
+    z3 *reg_shared[NTG];    /* the shared array when reg[ch]->array is set */
     axis ax;                /* n == 0 when unknown */
     int64_t hold_o[3], hold_n[3];   /* optional held-out box (level-0 voxels); hold_n[0] == 0 when absent (= hold[0]: the validation box) */
     int64_t (*hold)[6]; int nhold;  /* all held-out boxes (z y x nz ny nx, level 0): training windows touch none of them */

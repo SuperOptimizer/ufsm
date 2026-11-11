@@ -6,6 +6,80 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Universal net A4 + A5: levels by physical voxel size, per-level scale FiLM (2026-11-11, branch univ-20261111)
+
+**A4, `--um-rungs U[:W],..`** (sample.h `nrung`): instead of `--levels` (a probability per pyramid index, the same index for a 2.4 and a
+9.4 um scan), each window draws a physical rung U (weight W, default 1) among the rungs its source reaches and reads the source's level
+nearest U (|log2(level um / U)| <= `--rung-tol`, 0.5 octave; levels whose labels are stored coarser than the level are not a rung of
+that source, so a global rung list over mixed scans needs no per-source levels; `label_res_check` still refuses them under `--levels`).
+`--rung-shift-p P` moves the drawn rung to a list neighbour (scale augmentation over whole octaves, labels read at that level as now;
+the continuous `--zoom-*` warps stay for in-between scales). Validation keeps the rungs without the shift. The start-up log lists per
+source which level serves which rung. Deliberately not done: resampling a scan to the exact rung (a 7.9 um scan at the 9.6 rung reads
+7.9 um voxels; the scale FiLM below gets the true size) and a window fixed in mm (`--fov-mm`): with fixed-size device buffers a fixed
+physical field of view needs every window resampled to one grid, which for a 9.4 um scan on the 2.4 um voxel grid of the L9.6 trunk
+is a 4x upsampling that reads a 4^3 = 64x larger cube than it uses (or a read path that reads the central part and resamples, touching
+every label reader). Both can come later if the cross-resolution gate (U1: one checkpoint within 0.01 of itself at 4.8 / 9.6 / 19.2
+feeds) needs them; the feeds themselves are native levels, which this trains.
+
+**A5, `--film K`** (unet_cfg.film, K 1 or 2): every encoder and decoder block's output GroupNorm affine is FiLM'd,
+gamma (1 + sum_k c_k A_k), beta + sum_k c_k D_k, with c = log2(um / 4.8) of the window's grid (b.um: level x zoom / affine) and, for
+K 2, of the level read (b.level's voxel size, no zoom). A / D are per channel and code, appended last in `unet_create`, zero-initialised
+(a donor's function is unchanged; `--init-from` copies a FiLM donor's pairs), header key `"film":K` only when on; old checkpoints load
+unchanged. Implementation: the forward copies the live weights into a forward copy (as `--l0-norm ws` does) and writes the effective
+affines there (`src/nn_film.cu`, one tiny kernel per norm, 2 L - 1 of them), so every GN reader (fused conv + GN statistics, recompute,
+the slab paths, the next block's input norm) sees them without new code paths; the backward turns the effective affines' gradient
+into gamma's, A's and D's (exact: the gradient is zeroed before each backward, as for `scale_cond`). The old `--scale-cond` stem bias
+stays. B 1 (one code vector per forward; every unwrap task is B 1). `predict` sets the codes from the CT level's voxel size
+(`--scale-um` / `--film-data-um` override). Cost: one device copy of the weights (4 B per parameter) and 2 L - 1 launches per forward.
+
+Tests: `test_unet~FILM=2` (FD over every FiLM parameter, 112 of them, + 60 random others, random A / D, codes 1 / -0.6): worst relative
+error 5.3e-5; the tensor-core path against fp32 on the big net with FiLM: gradient rel L2 0.020 (0.018 without). `test_rungs` (new):
+two scans at 2.4 and 7.9 um, rungs 9.6 -> levels 2 / 0 only; rungs 4.8,9.6 -> A both levels about evenly, B level 0 only; shift 1 on
+2.4,4.8 -> A both levels, B (no rung) excluded; rung 38.4 -> no sampler. `test_heads` (5): two fixture sources whose labels allow one
+level each train together under `--um-rungs 19.2,38.4 --film 2` (latent, `--rv 2`), header `"film":2`, resume. The seven old layouts
+still log the reference losses.
+
+## Universal net A1 + A2: the head registry, rv on its own channels, per-source head weights (2026-11-11, branch univ-20261111)
+
+Step A1 / A2 of the universal latent net plan (one net with every head). Before this, ink (`--ink-head`), the rv papyrus (`--rv`) and the
+fibre tubes (`--fib-normal-lambda`) shared the single ink plane `IPLANE`, so they excluded each other, and rv took over the phase slots 0-1.
+
+**Aux planes.** `train` now keeps a list of aux label planes, one per enabled head that reads one, in a fixed order: papyrus (rv), ink,
+fibre (`aux_setup`, `g_aux_of[role]`). Plane 0 is the sampler's `batch.ink` (stream plane 3) exactly as before; planes 1-2 are the new
+`batch.aux[0..1]` (stream planes 4-5), read from the source's "ink" (CH_SHEET) or new "fibre" (CH_FIB, alias "fiber") target slot, made
+unknown where the loss mask is off, pulled through the same symmetry / host warp (`sample_warp_ink`), the `--replay` back-to-source-grid
+pass and the device warps (`lab_upload` kind 3), streamed per head slab (`lab_stream`, `LSLAB`) or kept on the device (`ldev`, the papyrus
+plane in 2 bits, the others bytes). With one head on, every buffer, upload, stream plane and planner term is the old one. The fibre
+plane reads the source's "fibre" target, else (no ink head) its "sheet" / "ink" one, so the old fibre sources work unchanged. The only
+exclusion left between the three is `--rv 1` + `--phase-trunc` / `--pgrad-lambda` (its side slot is not a phase). Source target slots
+grew to NTG = 3 (`CH_FIB`, never a batch channel); `label_res_check` and `level_ok` see it.
+
+**rv on its own pair.** `--rv 2`: recto / verso papyrus on two new output channels after the ink channel (unwrap2: phase 0-1, normal 2-7,
+density 8, winding mod 4 9-10, ink 11, rv 12-13; without ink rv 11-12), the phase trained as without --rv; BCE x `--rv-lambda` (logged
+as `rv bce` next to `phase bce`). Own slab targets `rvt` / `rvm`, loss sums at `hs_ds + 64` (the slab sums grew to 128 doubles), its own
+scratch. Checkpoint header `"rv":{"version":2,"recto":12,"verso":13,...}`; `--rv 1` keeps version 1 and the old layout. `--init-from` a
+donor without the pair resets rows 12-13 (zero weights, `--rv-bias`, default 0), and a plain unwrap2 donor (11 outputs) maps rows 0-10
+for `--rv 2` as it did for `--ink-head`. `predict --channel rv` on a version-2 checkpoint fuses channels 12-13 (interpolated, never the
+guided / sub-cell pair; the direct latent placement paths are off for it); `--fit-*` works on it (the phase is in 0-1). The latent
+fused gradient (`g_lat_fuse`) stays on with `--rv 2` (rv in the slab chain).
+
+**Per-source heads (A2).** A source's `"heads": {"phase": 1, "rv": 0, "ink": {"on": 1, "lambda": 0.5}, ...}` (phase, normal, density,
+wind4, rv, ink, fibre; a number is a multiplier, 0 off) scales that head's logit gradient on the source's windows (`src_head_w`, folded
+into the existing lambdas, so a weight 1 is the same float product); unknown names are refused. Absent labels keep mask 0 as before.
+
+Tests: `test_heads` (new, fast tier, 12 s). (1) the seven old single-head layouts (plain unwrap2, `--ink-head`, `--rv 1`,
+`--fib-normal-lambda`, and `--lat 4 --lat-guide 3` plain / rv / ink) log exactly the losses and gradient norms (4 decimals, every step
+and the validation) of the binary before the registry (`tests/heads_ref.txt`, per GPU name; the weights are not bit-reproducible run to
+run under `--det 1`, 24 873 bytes of 6.2 MB differed between two master runs, the logged losses are). Checked for both builds: VERIFY
+(the suite's) and the production fp16 build, whose latent runs take the fused gradient: 7 / 7 equal to master (60ff701) in each.
+(2) `--rv 2 --ink-head 1 --fib-normal-lambda 0.1` with the fibre plane from a "fibre" target, whole-window and latent: finite phase /
+rv / ink / fibn losses, header names rv 12-13 and ink 11; the latent stream check (`UFSM_LAT_STREAM=check`) 0 of 16 M slab bytes differ,
+the device-kept planes (`UFSM_LAT_LDEV=63`) give the streamed run's losses. (3) `predict --channel rv` on both against its channels
+12 / 13 (lossless stores): worst 1.0 code. (4) a source with every head at 0 trains with gradient norm 0.00; a misspelt head is refused.
+`--rv 2` latent with and without `UFSM_LAT_FUSE` (fp16 build): identical losses. Still open from A1: `--fib-dir` (the H / V fibre mask
+task, a surface task with its own whole-window path) is not yet a head of unwrap2, and the `--lat-guide 3` sub-cell head refines only
+the phase pair (rv / ink are interpolated).
+
 ## Fibre-normal arms: the seed-repeat noise floor and an untested source-mix confound (2026-11-11, branch fibnote-20261111)
 
 Closes the fibre-in-the-winding-net arms (section "Fibres in the winding network", below); the work moves to the universal latent net.

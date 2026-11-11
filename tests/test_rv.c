@@ -1,7 +1,7 @@
 /* train --task unwrap2 --rv 1 (the recto / verso side model): (1) nn_rv_targets on hand-made phase / papyrus codes; (2) a 16-wide
    from-scratch net on the synthetic spiral fixture (tests/make_wind_fixture.c: sheets CT ~150, gaps ~45) trains a few steps on head
    slabs with the papyrus plane (--rv-iso 100), logs a finite "rv bce", names "rv" in the checkpoint header, resumes; (3) predict writes
-   channels 0 (recto side) and 1 (verso side); (4) --rv with --ink-head is refused.
+   channels 0 (recto side) and 1 (verso side); (4) --rv 1 with --phase-trunc is refused.
    Usage: test_rv <ufsm binary> <make_wind_fixture binary> */
 #include "nn.h"
 #include <math.h>
@@ -92,8 +92,8 @@ int main(int argc, char **argv) {
         free(lg);
         CHECK(!sh("test -e %s/sg/9.6/zarr.json", d), "side-gate output array");
     }
-    /* (4) refused combination */
-    CHECK(sh("%s train %s/fx/sources.json --out %s/c --steps 1 --ink-head 1 %s > %s/c.log 2>&1", U, d, d, common, d) != 0, "--rv with --ink-head accepted");
+    /* (4) refused combination (--rv with --ink-head trains since the head registry, tests/test_heads.c): --rv 1 with --phase-trunc (its side slot is not a phase) */
+    CHECK(sh("%s train %s/fx/sources.json --out %s/c --steps 1 --phase-trunc 0.2 %s > %s/c.log 2>&1", U, d, d, common, d) != 0, "--rv 1 with --phase-trunc accepted");
     if (!fails) sh("rm -rf %s", d);
     if (fails) { fprintf(stderr, "test_rv: %d FAILED (kept %s)\n", fails, d); return 1; }
     printf("test_rv: ok\n");
