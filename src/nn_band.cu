@@ -199,6 +199,8 @@ static int bg_run(bg_ctx &G, const uint8_t *codes, const int n[3], float rmax, u
     return 0;
 }
 
+extern "C" void *band_pair_gpu_host_alloc(size_t n) { void *p = nullptr; if (cudaHostAlloc(&p, n, cudaHostAllocPortable) != cudaSuccess) { cudaGetLastError(); return nullptr; } return p; }
+extern "C" void band_pair_gpu_host_free(void *p) { if (p) cudaFreeHost(p); }
 extern "C" int band_pair_gpu_reserve(int edge) {   /* all g_slots contexts sized for edge^3 blocks (so a memory planner sees them) */
     const long E = edge, N = E * E * E, lines = E * E, lc = bg_lines(N, E, lines); int rc = 0;
     pthread_mutex_lock(&g_mu);

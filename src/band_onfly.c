@@ -40,6 +40,31 @@ static int pair_tile(const uint8_t *codes, const int n[3], float rmax, uint8_t *
     return band_field_phase_pair(codes, n, rmax, phase, nullptr);
 }
 
+/* tile buffer sets, a pool of --onfly-slots shared by the reading threads (each read takes one for its tiles), kept between reads
+   (2026-11-11: fresh 1.2 GB mallocs per window page-faulted ~1 s on the pod) and pinned when the pair rule runs on the GPU (the codes up
+   and the phase down at the PCIe rate: the pageable D2H of a 1064^3 tile took 0.9-1.1 s) */
+typedef struct { uint8_t *cb, *pb, *rb; size_t cap; int pinned, busy; } onfly_buf;
+enum { OB_MAX = 16 };
+static onfly_buf g_ob[OB_MAX]; static pthread_mutex_t g_obmu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_obcv = PTHREAD_COND_INITIALIZER;
+static void ob_release(onfly_buf *B) { if (B->pinned) { band_pair_gpu_host_free(B->cb); band_pair_gpu_host_free(B->pb); } else { free(B->cb); free(B->pb); } free(B->rb); B->cb = B->pb = B->rb = nullptr; B->cap = 0; }
+static onfly_buf *ob_take(size_t cap) {
+    const int n = g_slots < OB_MAX ? g_slots : OB_MAX; onfly_buf *B = nullptr;
+    pthread_mutex_lock(&g_obmu);
+    for (;;) { for (int k = 0; k < n; k++) if (!g_ob[k].busy) { B = &g_ob[k]; break; } if (B) break; pthread_cond_wait(&g_obcv, &g_obmu); }
+    B->busy = 1; pthread_mutex_unlock(&g_obmu);
+    if (cap > B->cap) {
+        ob_release(B);
+        B->pinned = g_gpu >= 0 && band_pair_gpu_host_alloc && band_pair_gpu_host_free;
+        if (B->pinned) { B->cb = band_pair_gpu_host_alloc(cap); B->pb = band_pair_gpu_host_alloc(cap); }
+        if (!B->pinned || !B->cb || !B->pb) { if (B->pinned) { band_pair_gpu_host_free(B->cb); band_pair_gpu_host_free(B->pb); } B->pinned = 0; B->cb = malloc(cap); B->pb = malloc(cap); }
+        B->rb = malloc(cap);
+        if (!B->cb || !B->pb || !B->rb) { ob_release(B); pthread_mutex_lock(&g_obmu); B->busy = 0; pthread_cond_signal(&g_obcv); pthread_mutex_unlock(&g_obmu); return nullptr; }
+        B->cap = cap;
+    }
+    return B;
+}
+static void ob_give(onfly_buf *B) { pthread_mutex_lock(&g_obmu); B->busy = 0; pthread_cond_signal(&g_obcv); pthread_mutex_unlock(&g_obmu); }
+
 static int onfly_read(void *vctx, z3 *codes, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads) {
     const onfly_ctx *C = vctx; const z3_meta *m = z3_meta_of(codes); const int h = C->halo;
     atomic_fetch_add(&g_reads, 1);
@@ -50,8 +75,8 @@ static int onfly_read(void *vctx, z3 *codes, const int64_t o[3], const int64_t n
     int cnt[3], ts[3];
     for (int d = 0; d < 3; d++) { const int64_t L = hi[d] - lo[d]; cnt[d] = (int)((L + T - 1) / T); ts[d] = (int)((L + cnt[d] - 1) / cnt[d]); }
     const size_t cap = (size_t)(ts[0] + 2 * h) * (ts[1] + 2 * h) * (ts[2] + 2 * h);
-    uint8_t *cb = malloc(cap), *pb = malloc(cap), *rb = malloc(cap);
-    if (!cb || !pb || !rb) { free(cb); free(pb); free(rb); return -1; }
+    onfly_buf *B = ob_take(cap); if (!B) return -1;
+    uint8_t *cb = B->cb, *pb = B->pb, *rb = B->rb;
     int rc = 0;
     for (int a = 0; a < cnt[0] && !rc; a++) for (int b = 0; b < cnt[1] && !rc; b++) for (int c = 0; c < cnt[2] && !rc; c++) {
         const int ti[3] = {a, b, c}; int64_t to[3], tn[3], co[3], cn[3], ro[3], rn[3]; int ni[3];
@@ -79,7 +104,7 @@ static int onfly_read(void *vctx, z3 *codes, const int64_t o[3], const int64_t n
             memcpy(out + ((size_t)(to[0] - o[0] + z) * n[1] + (to[1] - o[1] + y)) * n[2] + (to[2] - o[2]), pb + ((size_t)(z + h) * cn[1] + (y + h)) * cn[2] + h, (size_t)tn[2]);
     }
     atomic_fetch_add(&g_vout, N);
-    free(cb); free(pb); free(rb);
+    ob_give(B);
     return rc;
 }
 

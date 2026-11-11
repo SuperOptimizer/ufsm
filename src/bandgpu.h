@@ -6,6 +6,7 @@
    (a pool of --gpu-slots contexts, grown on demand; callers wait for a free one), so N slots hold ~10 bytes a block voxel
    each on the device. Returns 0 on success, nonzero on any CUDA failure (the caller falls back to the CPU). */
 #pragma once
+#include <stddef.h>
 #include <stdint.h>
 #ifdef __cplusplus
 extern "C" {
@@ -13,7 +14,9 @@ extern "C" {
 __attribute__((weak)) int band_pair_gpu(const uint8_t *codes, const int n[3], float rmax, uint8_t *phase);
 __attribute__((weak)) void band_pair_gpu_slots(int slots, int device);   /* before the first call: concurrent callers, the device */
 __attribute__((weak)) void band_pair_gpu_free(void);                     /* the idle slots' buffers */
-__attribute__((weak)) int band_pair_gpu_reserve(int edge);              /* every slot's buffers for blocks up to edge^3 now (0 ok) */
+__attribute__((weak)) int band_pair_gpu_reserve(int edge);
+__attribute__((weak)) void *band_pair_gpu_host_alloc(size_t n);      /* pinned host memory (DMA at full PCIe rate), nullptr on failure */
+__attribute__((weak)) void band_pair_gpu_host_free(void *p);              /* every slot's buffers for blocks up to edge^3 now (0 ok) */
 #ifdef __cplusplus
 }
 #endif
