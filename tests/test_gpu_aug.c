@@ -40,6 +40,22 @@ int main(int argc, char **argv) {
     void *rad_h = malloc(NN_RAD_REC(P)), *rad_d = nn_malloc(NN_RAD_REC(P)), *Hd = nn_malloc(2 * p3);
     const int64_t o[3] = {1000, 2000, 3000}; const int chunk[3] = {32, 32, 32};
     double worst_mean = 0; int worst_max = 0, ncase = 0, nwarp = 0;
+    if (getenv("TGA_CTBENCH")) {   /* TGA_CTBENCH=1 test_gpu_aug P: nn_aug_ct's time without scanner ops (sums + write) and with the quantisation alone (load + final + write) */
+        memcpy(cin_p, ct, p3);
+        for (int cs = 0; cs < 4; cs++) {
+            const int warped = cs & 1, scan = cs >> 1; spatial_aug sa = {0}; sym sy = sym_of(7);
+            if (warped) { spatial_aug_make(&sa, 5, P, 10, 1, 1, 1); spatial_aug_zoom(&sa, .8); }
+            rad_record(rad_h, o, P, P, 1, sy, cy0, cx0, warped ? &sa : nullptr); nn_h2d(rad_d, rad_h, NN_RAD_REC(P));
+            memset(rec, 0, sizeof *rec); rec->xfmt = 1; rec->scan = scan;
+            if (scan) { scan_aug_cfg c = {.strength = 1.f, .drop_ignore = 1, .hist = g_t, .nhist = 1}; c.p[SA_QUANT] = 1; memcpy(cin, ct, p3); memset(ign, 0, p3); memcpy(cy, cy0, sizeof cy); memcpy(cx, cx0, sizeof cx);
+                        uint8_t *tg = malloc(2 * p3); memcpy(tg, tgt, 2 * p3); scan_aug_plan(&c, 99, cin, tg, 2, ign, P, o, cy, cx, 1, chunk, 1, pl); rec->plan = *pl; free(tg); }
+            double best = 1e9; uint64_t hsh = 1469598103934665603ull;
+            for (int it = 0; it < 6; it++) { nn_sync(); struct timespec ta, tb; clock_gettime(CLOCK_MONOTONIC, &ta); nn_aug_ct(cin_p, rec, rad_d, P, Hd, 0); nn_sync(); clock_gettime(CLOCK_MONOTONIC, &tb); const double t = (double)(tb.tv_sec - ta.tv_sec) + 1e-9 * (double)(tb.tv_nsec - ta.tv_nsec); if (t < best) best = t; }
+            nn_d2h(Hg, Hd, 2 * p3); for (size_t k = 0; k < 2 * p3; k += 3) hsh = (hsh ^ ((const uint8_t *)Hg)[k]) * 1099511628211ull;
+            printf("ct bench P %d: %s, %s: %.2f ms (best of 6, upload included), channel hash %016llx\n", P, scan ? "quantisation" : "no scanner op", warped ? "warped" : "symmetry", best * 1e3, (unsigned long long)hsh);
+        }
+        return 0;
+    }
     for (int op = -2; op < SA_N; op++) for (int sv = 0; sv < 4; sv++) {
         scan_aug_cfg c = {.strength = sv & 2 ? 2.f : 1.f, .drop_ignore = 1, .hist = g_t, .nhist = 1};
         if (op >= 0) c.p[op] = 1; else if (op == -1) for (int i = 0; i < SA_N; i++) c.p[i] = .45f;   /* (-2: no scanner op) */

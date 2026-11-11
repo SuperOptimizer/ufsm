@@ -28,6 +28,7 @@
 #include <unistd.h>
 
 int cmd_surf_labels(int argc, char **argv);
+int cmd_phase_coh(int argc, char **argv);
 static int fails = 0;
 #define CHECK(c, m) do { if (!(c)) { fprintf(stderr, "FAIL: %s\n", m); fails++; } } while (0)
 #define NZ 64
@@ -124,6 +125,13 @@ int main(void) {
     CHECK(!run(root, "wp", "p4", "1", "4", nullptr, nullptr, nullptr), "surf-labels dir +1 (4 threads) failed");
     snprintf(cmd, sizeof cmd, "cd %s && for a in codes phase ignore; do for s in $(cd p1/$a.zarr/9.6 && find c -type f); do cmp -s p1/$a.zarr/9.6/$s p4/$a.zarr/9.6/$s || exit 1; done; done", root);
     CHECK(!system(cmd), "outputs differ between 1 and 4 threads");
+    /* --zband: a band holding the whole grid writes the same bytes; a band past it writes no shard */
+    CHECK(!run(root, "wp", "zb", "1", "4", "--zband", "0,64", nullptr), "surf-labels --zband 0,64 failed");
+    snprintf(cmd, sizeof cmd, "cd %s && for a in codes phase ignore; do for s in $(cd p4/$a.zarr/9.6 && find c -type f); do cmp -s p4/$a.zarr/9.6/$s zb/$a.zarr/9.6/$s || exit 1; done; done", root);
+    CHECK(!system(cmd), "--zband over the whole grid changed the outputs");
+    CHECK(!run(root, "wp", "zc", "1", "4", "--zband", "128,256", nullptr), "surf-labels --zband 128,256 failed");
+    snprintf(cmd, sizeof cmd, "test -z \"$(find %s/zc/phase.zarr/9.6 -path '*/c/*' -type f 2>/dev/null)\"", root);
+    CHECK(!system(cmd), "--zband past the grid still wrote phase shards");
     CHECK(!run(root, "ws/strip.sfc", "st", "1", "4", nullptr, nullptr, nullptr), "surf-labels on a strip.sfc failed");   /* one strip = its wraps (strip.tsv columns) */
     {   /* (the wraps and the strip are separate lossy .sfc encodings, tolerance 0.01 voxel: a few voxels at the sheet edges may differ) */
         static const char *arr[3] = {"codes", "phase", "ignore"}; size_t nd[3] = {0, 0, 0}, nk = 0, big = 0;
@@ -160,6 +168,44 @@ int main(void) {
         snprintf(r, sizeof r, "%s/weight.zarr", od); uint8_t *wt = readall(r, "9.6"); long wbad = 0, wpos = 0;   /* --weight-coh: 0 wherever ignored / unknown, > 0 on kept coherent labels */
         for (size_t i = 0; wt && ph && i < (size_t)NZ * NY * NX; i++) { wbad += wt[i] && ph[i] == PHASE_UNKNOWN; wpos += wt[i] > 0; }
         CHECK(wt && !wbad && (v == 1 || wpos > kept / 2), "--weight-coh: weight on unknown phase or missing on kept labels");
+        if (v == 0) {   /* ufsm phase-coh on the stored phase: surf-labels' weight within rounding (cells with ignored voxels may differ) */
+            char pr[600], pc[600]; snprintf(pr, sizeof pr, "%s/phase.zarr", od); snprintf(pc, sizeof pc, "%s/pc", od);
+            char *cv[] = {"ufsm", "phase-coh", pr, "9.6", ct, "0", pc, "--weight", "0.3,0.6", "--weight2", "0.3,0.6", "--cell", "16", "--threads", "3"};
+            CHECK(!cmd_phase_coh((int)(sizeof cv / sizeof *cv), cv), "phase-coh failed");
+            snprintf(r, sizeof r, "%s/pc/weight.zarr", od); uint8_t *w2 = readall(r, "9.6"); long nk = 0, nd = 0;
+            for (size_t i = 0; w2 && wt && ph && i < (size_t)NZ * NY * NX; i++) if (ph[i] != PHASE_UNKNOWN) { nk++; nd += abs((int)w2[i] - (int)wt[i]) > 1; }
+            printf("test_surflabels: phase-coh vs surf-labels --weight-coh: %ld of %ld known voxels differ by > 1\n", nd, nk);
+            CHECK(w2 && nk > 100000 && nd * 20 < nk, "phase-coh weight differs from surf-labels' on > 5% of the known voxels");
+            {   /* --box-scale: one box over the lower half in z at 0.5, 0 outside (--box-default 0) = the plain weight x 0.5 inside, 0 outside */
+                char bf[600], pb[600]; snprintf(bf, sizeof bf, "%s/boxes.txt", od); snprintf(pb, sizeof pb, "%s/pcb", od);
+                FILE *f = fopen(bf, "w"); CHECK(f, "boxes.txt"); fprintf(f, "# z y x nz ny nx s\n0 0 0 %d %d %d 0.5\n", NZ / 2, NY, NX); fclose(f);
+                char *cb[] = {"ufsm", "phase-coh", pr, "9.6", ct, "0", pb, "--weight", "0.3,0.6", "--cell", "16", "--box-scale", bf, "--box-default", "0", "--threads", "3"};
+                CHECK(!cmd_phase_coh((int)(sizeof cb / sizeof *cb), cb), "phase-coh --box-scale failed");
+                snprintf(r, sizeof r, "%s/pcb/weight.zarr", od); uint8_t *wb = readall(r, "9.6"); long bad = 0, pos = 0;
+                for (size_t i = 0; wb && w2 && i < (size_t)NZ * NY * NX; i++) {
+                    const int want = i / ((size_t)NY * NX) < (size_t)(NZ / 2) ? (int)lround(w2[i] * 0.5) : 0; bad += abs((int)wb[i] - want) > 1; pos += wb[i] > 0; }
+                printf("test_surflabels: phase-coh --box-scale: %ld voxels off the scaled weight, %ld weighted\n", bad, pos);
+                CHECK(wb && !bad && pos > 1000, "phase-coh --box-scale is not the weight x the box factor");
+                free(wb);
+            }
+            {   /* --papyrus T --pap-dilate 1 --phase-out 1: against a brute-force mask (CT < T with no CT >= T in the 3^3 cube about it) */
+                char pp[600]; snprintf(pp, sizeof pp, "%s/pcp", od); const int T = 140;
+                char *cp[] = {"ufsm", "phase-coh", pr, "9.6", ct, "0", pp, "--weight", "0.3,0.6", "--cell", "16", "--papyrus", "140", "--pap-dilate", "1", "--phase-out", "1", "--threads", "3"};
+                CHECK(!cmd_phase_coh((int)(sizeof cp / sizeof *cp), cp), "phase-coh --papyrus failed");
+                snprintf(r, sizeof r, "%s/pcp/weight.zarr", od); uint8_t *wp = readall(r, "9.6"); snprintf(r, sizeof r, "%s/pcp/phase.zarr", od); uint8_t *pq = readall(r, "9.6");
+                snprintf(r, sizeof r, "%s", ct); uint8_t *cv0 = readall(r, "0"); long bad = 0, air = 0, kept = 0;
+                for (int z = 0; wp && pq && cv0 && z < NZ; z++) for (int y = 0; y < NY; y++) for (int x = 0; x < NX; x++) {
+                    const size_t i = ((size_t)z * NY + y) * NX + x; if (ph[i] == PHASE_UNKNOWN) { bad += pq[i] != PHASE_UNKNOWN || wp[i]; continue; }
+                    int pap = 0; for (int dz = -1; dz <= 1 && !pap; dz++) for (int dy = -1; dy <= 1 && !pap; dy++) for (int dx = -1; dx <= 1 && !pap; dx++) {
+                        const int zz = z + dz, yy = y + dy, xx = x + dx; if (zz < 0 || yy < 0 || xx < 0 || zz >= NZ || yy >= NY || xx >= NX) continue;
+                        pap = cv0[((size_t)zz * NY + yy) * NX + xx] >= T; }
+                    if (pap) { kept++; bad += pq[i] != ph[i] || abs((int)wp[i] - (int)w2[i]) > 1; } else { air++; bad += pq[i] != PHASE_UNKNOWN || wp[i]; } }
+                printf("test_surflabels: phase-coh --papyrus %d dilate 1: %ld known voxels masked as air, %ld kept, %ld voxels off the brute-force mask\n", T, air, kept, bad);
+                CHECK(wp && pq && cv0 && !bad && air > 1000 && kept > 1000, "phase-coh --papyrus is not the dilated CT threshold mask");
+                free(wp); free(pq); free(cv0);
+            }
+            free(w2);
+        }
         free(wt);
         free(ig); free(ph);
     } }

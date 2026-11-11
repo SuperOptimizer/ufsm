@@ -6,6 +6,206 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Universal net A6: the fine voxel stem (--fstem C, --fstem-drop P) (2026-11-11, branch univ-20261111)
+
+Why: the latbeat verdict above. The latent net's phase deficit against wind96 is resolution: 38.4 um cells hold 1.5-4 cells per sheet
+period at 60-150 um spacing. **`--fstem 16`** (latent grid, `--lat 4 --lat-guide 3`, task unwrap2) adds a second path into the head
+beside the trunk. It reads the CT channel itself at stride 2: per 2^3-voxel block a 4^3 conv (taps 2 i - 1 .. 2 i + 2 per axis, zero
+outside the window), 16 silu features (19.2 um at 9.6 um voxels), and a 16 -> nout projection added to every head output that the
+head slabs hold as voxel logits. That is every output except the fused normal / density group: phase, wind4, rv, ink (7 with --rv 2
+--ink-head 1). It is added after the upsampling + sub-cell shuffle and before the losses, and in the backward the parameter gradients
+are read straight from the slab's gradient planes before the adjoints. Parameters (W1 16 x 64, b1, W2 7 x 16) are appended last;
+W1 is He-initialised and b1 / W2 are zero, so the net computes its donor's function (step 1 logs the stem-less run's losses exactly,
+test_heads (7)). AdamW (non-matrix). Header key "fstem":[C,nout] only when on; `--init-from` copies a stem with the same shape; a
+resume must repeat --fstem. **Level dropout** `--fstem-drop 0.25`: a training window runs without the stem (forward and backward),
+drawn per GPU and step, so the net keeps working without the fine level. Validation and predict always use it. `predict` adds it in
+the fit-field (11 planes) and `--channel rv` / side-pair paths. With a stem it falls back from the latent fast paths (lat_lean,
+direct rv, latin, fit-field z-slabs), which read no CT; those are to be ported when U2 needs the speed.
+
+Kernels (`src/nn_fstem.cu`): row tiles of up to 128 blocks of one (z, y) block row, the 16 input rows staged in shared memory once.
+The forward does the 64 -> 16 product on the tensor cores (mma m16n8k16 fp16, W1 in fp16). The backward recomputes the same way and
+does the parameter-gradient products dW1 = sum dpre x taps and dW2 = sum go x h in tf32 MMA (fp32 range: the pre-activation gradients
+are ~1e-5 and would be fp16 subnormals), in half tiles (22 KB of shared memory, 4 blocks an SM). P 256 window, RTX 5060 Ti:
+
+| version | forward (x2 a step: statistics + gradient pass) | backward |
+|---|---|---|
+| per-thread scalar (taps from global) | 2.1 ms | 9.6 ms |
+| + register-blocked outer products, 128-block tiles | 2.1 | 3.4 |
+| + staged rows (row tiles) | 2.2 | 4.3 |
+| + tensor-core forward / recompute | 0.74 | 4.0 |
+| + half tiles (occupancy 17 -> 33 %) | 0.74 | 3.1 |
+| + tf32 parameter products | 0.74 | 2.8 |
+| + gradient gather on all threads | 0.75 | 2.5 |
+
+ncu on the last backward: long-scoreboard (global loads) and barrier stalls dominate. Next levers: double-buffered staging, the
+gather through one aligned 4-byte pass. Training step, P 256, latent, all heads, `UFSM_BENCH_SAME=1`, 40 steps, no dropout:
+widths 32..128: 26.2 -> 30.9 ms (+18 %); widths 96,128,160,192: 45.6 -> 50.4 ms (+10.6 %; ~8 % at the default dropout 0.25). The
+stem scales with voxels, the trunk with voxels x width^2, so wider trunks pay less.
+
+Tests: `test_fstem` (new): the kernels against a double host reference on a 10 x 12 x 14 window in two slabs. The reference's gradient
+is taken by central differences over all 1152 parameters. Forward worst |error| / (1 + |want|) 1.8e-4; gradient 3.5e-4 relative to
+the largest (fp16 W1 in the tensor-core products, tf32 sums; the fp32 scalar kernel gave 1.6e-7). The other channels stay
+untouched, and an odd slab start is refused. `test_heads` (7): step 1 with --fstem 16 logs the stem-less run's losses; header
+[16,7]; resume; a resume without --fstem is refused; predict --channel rv runs. Fixture, 8 steps, all heads, latent, P 64: loss
+3.268 without -> 3.256 with the stem (from step 2 on, every step lower). That is a fixture number; whether the stem closes the
+packed-sheet gap is U2's measurement (wbench Paris 4 packed boxes).
+
+## Universal net A7: learned task weights (--uw 1) and the head-gradient cosines (--grad-cos N) (2026-11-11, branch univ-20261111)
+
+**`--uw 1`** (Kendall, Gal and Cipolla 2018): one learned log variance s_h per head (phase, normal + density shared, winding mod 4,
+rv, ink; the fibre-normal term is a regulariser, not a likelihood, and keeps its lambda). Each head's gradient is scaled by
+exp(-s_h) through the same per-source head multiplier as A2's "heads" key (`src_head_w`), so no new device path. The objective is
+sum_h exp(-s_h) L_h + s_h, with s_h stepped on the host by Adam from each step's logged head loss (dL/ds = 1 - exp(-s) L).
+The rate is --uw-lr (1e-3), and s is clamped to [-4, 4]. The s_h and the Adam step count are written to the checkpoint header
+("uw":{"t":..,"s":[..]}, only with --uw) and resumed. The step line shows the weights in effect. Without --uw every multiplier is
+the float 1, so the old layouts are unchanged (test_heads).
+
+**`--grad-cos N`**: every N steps, the cosines between the heads' gradients at the head input (the trunk's shared level-0 features).
+The head is a 1^3 conv W (cout x C), so the input gradient of task a summed over the cells is W^T g_a. The pairwise dot products are
+sum_{i in a, j in b} (W W^T)_ij S_ij, with S the Gram of the logit-gradient planes. S is accumulated per head slab with `nn_gram16`
+inside the step's single backward: one K(K+1)/2-pair reduction per slab, versus a backward per task. Channels map to tasks as
+follows: interpolated outputs by head; latent guided / sub-cell outputs (16-143) to the phase. Cost: zero on steps that do not log.
+Gradients of the deeper trunk are not separated (they would need a backward per task); the head input is where all heads meet.
+
+Tests: `test_gram` (new): fp16 / bf16, K 1 / 7 / 13, strided rows, two accumulating calls against a double host sum; worst error
+relative to |x_i||x_j| is 1.2e-7. `test_heads` (6): latent + all heads with --uw 1 --uw-lr 0.05 --grad-cos 2; the cosine lines
+name every pair, the header holds t 4 and a resume continues to t 6.
+Fixture numbers (6 steps, P 64, all heads): |cos| <= 0.17 between every pair, i.e. the heads barely interfere at the head input on
+this fixture. The largest values are normal/wind4 (+0.16..0.17 at step 4) and normal/rv (-0.11..-0.17). After 6 steps at lr 0.05
+the weights moved phase 1.02, normal 0.80, wind4 1.31, rv 1.35, ink 1.26. These are numbers from a 6-step fixture run; a
+real run's cosines and the weights' end point are for U1 / U2 to measure.
+
+## Universal net A4 + A5: levels by physical voxel size, per-level scale FiLM (2026-11-11, branch univ-20261111)
+
+**A4, `--um-rungs U[:W],..`** (sample.h `nrung`): instead of `--levels` (a probability per pyramid index, the same index for a 2.4 and a
+9.4 um scan), each window draws a physical rung U (weight W, default 1) among the rungs its source reaches and reads the source's level
+nearest U (|log2(level um / U)| <= `--rung-tol`, 0.5 octave; levels whose labels are stored coarser than the level are not a rung of
+that source, so a global rung list over mixed scans needs no per-source levels; `label_res_check` still refuses them under `--levels`).
+`--rung-shift-p P` moves the drawn rung to a list neighbour (scale augmentation over whole octaves, labels read at that level as now;
+the continuous `--zoom-*` warps stay for in-between scales). Validation keeps the rungs without the shift. The start-up log lists per
+source which level serves which rung. Deliberately not done: resampling a scan to the exact rung (a 7.9 um scan at the 9.6 rung reads
+7.9 um voxels; the scale FiLM below gets the true size) and a window fixed in mm (`--fov-mm`): with fixed-size device buffers a fixed
+physical field of view needs every window resampled to one grid, which for a 9.4 um scan on the 2.4 um voxel grid of the L9.6 trunk
+is a 4x upsampling that reads a 4^3 = 64x larger cube than it uses (or a read path that reads the central part and resamples, touching
+every label reader). Both can come later if the cross-resolution gate (U1: one checkpoint within 0.01 of itself at 4.8 / 9.6 / 19.2
+feeds) needs them; the feeds themselves are native levels, which this trains.
+
+**A5, `--film K`** (unet_cfg.film, K 1 or 2): every encoder and decoder block's output GroupNorm affine is FiLM'd,
+gamma (1 + sum_k c_k A_k), beta + sum_k c_k D_k, with c = log2(um / 4.8) of the window's grid (b.um: level x zoom / affine) and, for
+K 2, of the level read (b.level's voxel size, no zoom). A / D are per channel and code, appended last in `unet_create`, zero-initialised
+(a donor's function is unchanged; `--init-from` copies a FiLM donor's pairs), header key `"film":K` only when on; old checkpoints load
+unchanged. Implementation: the forward copies the live weights into a forward copy (as `--l0-norm ws` does) and writes the effective
+affines there (`src/nn_film.cu`, one tiny kernel per norm, 2 L - 1 of them), so every GN reader (fused conv + GN statistics, recompute,
+the slab paths, the next block's input norm) sees them without new code paths; the backward turns the effective affines' gradient
+into gamma's, A's and D's (exact: the gradient is zeroed before each backward, as for `scale_cond`). The old `--scale-cond` stem bias
+stays. B 1 (one code vector per forward; every unwrap task is B 1). `predict` sets the codes from the CT level's voxel size
+(`--scale-um` / `--film-data-um` override). Cost: one device copy of the weights (4 B per parameter) and 2 L - 1 launches per forward.
+
+Tests: `test_unet~FILM=2` (FD over every FiLM parameter, 112 of them, + 60 random others, random A / D, codes 1 / -0.6): worst relative
+error 5.3e-5; the tensor-core path against fp32 on the big net with FiLM: gradient rel L2 0.020 (0.018 without). `test_rungs` (new):
+two scans at 2.4 and 7.9 um, rungs 9.6 -> levels 2 / 0 only; rungs 4.8,9.6 -> A both levels about evenly, B level 0 only; shift 1 on
+2.4,4.8 -> A both levels, B (no rung) excluded; rung 38.4 -> no sampler. `test_heads` (5): two fixture sources whose labels allow one
+level each train together under `--um-rungs 19.2,38.4 --film 2` (latent, `--rv 2`), header `"film":2`, resume. The seven old layouts
+still log the reference losses.
+
+## Universal net A1 + A2: the head registry, rv on its own channels, per-source head weights (2026-11-11, branch univ-20261111)
+
+Step A1 / A2 of the universal latent net plan (one net with every head). Before this, ink (`--ink-head`), the rv papyrus (`--rv`) and the
+fibre tubes (`--fib-normal-lambda`) shared the single ink plane `IPLANE`, so they excluded each other, and rv took over the phase slots 0-1.
+
+**Aux planes.** `train` now keeps a list of aux label planes, one per enabled head that reads one, in a fixed order: papyrus (rv), ink,
+fibre (`aux_setup`, `g_aux_of[role]`). Plane 0 is the sampler's `batch.ink` (stream plane 3) exactly as before; planes 1-2 are the new
+`batch.aux[0..1]` (stream planes 4-5), read from the source's "ink" (CH_SHEET) or new "fibre" (CH_FIB, alias "fiber") target slot, made
+unknown where the loss mask is off, pulled through the same symmetry / host warp (`sample_warp_ink`), the `--replay` back-to-source-grid
+pass and the device warps (`lab_upload` kind 3), streamed per head slab (`lab_stream`, `LSLAB`) or kept on the device (`ldev`, the papyrus
+plane in 2 bits, the others bytes). With one head on, every buffer, upload, stream plane and planner term is the old one. The fibre
+plane reads the source's "fibre" target, else (no ink head) its "sheet" / "ink" one, so the old fibre sources work unchanged. The only
+exclusion left between the three is `--rv 1` + `--phase-trunc` / `--pgrad-lambda` (its side slot is not a phase). Source target slots
+grew to NTG = 3 (`CH_FIB`, never a batch channel); `label_res_check` and `level_ok` see it.
+
+**rv on its own pair.** `--rv 2`: recto / verso papyrus on two new output channels after the ink channel (unwrap2: phase 0-1, normal 2-7,
+density 8, winding mod 4 9-10, ink 11, rv 12-13; without ink rv 11-12), the phase trained as without --rv; BCE x `--rv-lambda` (logged
+as `rv bce` next to `phase bce`). Own slab targets `rvt` / `rvm`, loss sums at `hs_ds + 64` (the slab sums grew to 128 doubles), its own
+scratch. Checkpoint header `"rv":{"version":2,"recto":12,"verso":13,...}`; `--rv 1` keeps version 1 and the old layout. `--init-from` a
+donor without the pair resets rows 12-13 (zero weights, `--rv-bias`, default 0), and a plain unwrap2 donor (11 outputs) maps rows 0-10
+for `--rv 2` as it did for `--ink-head`. `predict --channel rv` on a version-2 checkpoint fuses channels 12-13 (interpolated, never the
+guided / sub-cell pair; the direct latent placement paths are off for it); `--fit-*` works on it (the phase is in 0-1). The latent
+fused gradient (`g_lat_fuse`) stays on with `--rv 2` (rv in the slab chain).
+
+**Per-source heads (A2).** A source's `"heads": {"phase": 1, "rv": 0, "ink": {"on": 1, "lambda": 0.5}, ...}` (phase, normal, density,
+wind4, rv, ink, fibre; a number is a multiplier, 0 off) scales that head's logit gradient on the source's windows (`src_head_w`, folded
+into the existing lambdas, so a weight 1 is the same float product); unknown names are refused. Absent labels keep mask 0 as before.
+
+Tests: `test_heads` (new, fast tier, 12 s). (1) the seven old single-head layouts (plain unwrap2, `--ink-head`, `--rv 1`,
+`--fib-normal-lambda`, and `--lat 4 --lat-guide 3` plain / rv / ink) log exactly the losses and gradient norms (4 decimals, every step
+and the validation) of the binary before the registry (`tests/heads_ref.txt`, per GPU name; the weights are not bit-reproducible run to
+run under `--det 1`, 24 873 bytes of 6.2 MB differed between two master runs, the logged losses are). Checked for both builds: VERIFY
+(the suite's) and the production fp16 build, whose latent runs take the fused gradient: 7 / 7 equal to master (60ff701) in each.
+(2) `--rv 2 --ink-head 1 --fib-normal-lambda 0.1` with the fibre plane from a "fibre" target, whole-window and latent: finite phase /
+rv / ink / fibn losses, header names rv 12-13 and ink 11; the latent stream check (`UFSM_LAT_STREAM=check`) 0 of 16 M slab bytes differ,
+the device-kept planes (`UFSM_LAT_LDEV=63`) give the streamed run's losses. (3) `predict --channel rv` on both against its channels
+12 / 13 (lossless stores): worst 1.0 code. (4) a source with every head at 0 trains with gradient norm 0.00; a misspelt head is refused.
+`--rv 2` latent with and without `UFSM_LAT_FUSE` (fp16 build): identical losses. Still open from A1: `--fib-dir` (the H / V fibre mask
+task, a surface task with its own whole-window path) is not yet a head of unwrap2, and the `--lat-guide 3` sub-cell head refines only
+the phase pair (rv / ink are interpolated).
+
+## Fibre-normal arms: the seed-repeat noise floor and an untested source-mix confound (2026-11-11, branch fibnote-20261111)
+
+Closes the fibre-in-the-winding-net arms (section "Fibres in the winding network", below); the work moves to the universal latent net.
+All numbers: wbench core, WIN 384 HALO 64, the 39 clean boxes (ceil >= 0.8), step 4000, paired A - B with 95 % CI (`wbench-stats`).
+
+Noise floor, measured: vc384c-r2 is vc384c's recipe with seed 4 instead of 3. vc384c-r2 - vc384c: p05x +0.002 [-0.008, +0.013], ids
+-0.009 [-0.033, +0.011], p1x +0.003 [-0.008, +0.014]. Per set the four Paris 4 boxes alone move +0.020 p05x on the seed. So on these
+39 boxes a p05x difference under ~0.01 and an ids difference under ~0.02-0.03 is not a result; per-set (4-box) deltas under ~0.02 are noise.
+
+| A - B (p05x) | all | note |
+|---|---|---|
+| vcfibA2 (lambda 0.1, map-registered P4 labels) - vc384c | -0.015 [-0.027, -0.003] | P4 -0.028, July -0.022, 1667 +0.021 (ids +0.033) |
+| vcfibU (term only where the normal BCE mask is off) - vc384c | -0.016 [-0.027, -0.005] | July -0.025, 1667 +0.012 |
+| vc384c-r2 - vcfibA2 / - vcfibU | +0.018 [+0.007, +0.027] / +0.019 [+0.009, +0.028] | the loss stands outside seed noise |
+| vcfibA2 - vcfibA (old affine labels) | +0.014 [+0.001, +0.029] | the registration map helped |
+
+Absolute p05x: vc384c 0.668, vc384c-r2 0.671, vcfibA2 0.653, vcfibU 0.652, vcfibA 0.640.
+
+Untested confound: every fibre arm also changed the source list (`sources-wind-gt-fibp4r`: the Paris 4 June / July sources carry the
+fibre raster as their "sheet" target, which also changes how those windows are drawn - the level-5 CT papyrus occupancy fallback in
+`sample.c` - against vc384c's `sources-wind-gt-nvme`). So the Paris 4 / July loss may be the data mix, not the term. The control
+(vcfib0: vcfibA2 exactly with lambda 1e-9 - lambda 0 switches `IPLANE` off and changes the data path) was prepared in
+`runs/vcfib.launch.sh` and never run; run it before drawing a conclusion about the term. Not run either: lambda 0.03, the pair term.
+
+## Latent winding net vs wind96: where the gap is (2026-11-11, branch latbeat-20261111)
+
+wbench core, 39 clean boxes (paired, 95 % CI): wind96 (voxel, WIN 640) p05x 0.677; best latent wz896-12000 (wz768 8000 + 12000 steps,
+P 896, WIN 640) 0.624 (-0.035 vs wind96 at WIN 384, lat-wind96-ct 0.662: -0.038 [-0.057, -0.017]); wzlo2-8000 (wind96 init-shift 2,
+`--init-lr-mult 0.2`) 0.589, equal to wzlo-8000 (`--trunk-lr-mult 0.2`) +0.003 [-0.010, +0.016]: the inherited-layer lr is not the lever;
+wz896's extra training is.
+
+New: `ufsm field-diag A_DIR [B_DIR] --phase ROOT KEY [--bins 60,100,150,250] [--tsv 1]` (src/fielddiag.c): two fit-field sets against
+the label phase raster per label sheet-spacing bin (um / |wrapped grad phase|): phase error |wrap(phase - label)| (confident cells), p10
+(share of labelled cells within 0.1 turn and confident), confidence, normal alignment n^T T n / tr T against the label-phase gradient,
+|log2| spacing error. A = wz896-12000 (WIN 640), B = wind96 at WIN 384 (lat-wind96-ct: the only wind96 core field set kept), all 39 clean
+boxes, cells weighted equally:
+
+| set | spacing um | share | p10 A / B (A-B) | conf A / B | nal A / B (A-B) |
+|---|---|---|---|---|---|
+| all | <60 | 0.026 | .184 / .195 (-.011) | .177 / .196 | .782 / .779 (+.003) |
+| all | 60-100 | 0.166 | .290 / .319 (-.029) | .246 / .285 | .879 / .881 (-.002) |
+| all | 100-150 | 0.329 | .405 / .425 (-.020) | .327 / .364 | .910 / .916 (-.006) |
+| all | 150-250 | 0.333 | .432 / .443 (-.011) | .412 / .425 | .906 / .918 (-.012) |
+| all | >=250 | 0.146 | .503 / .517 (-.014) | .520 / .510 | .838 / .857 (-.019) |
+| paris4 (4) | 60-100 / 100-150 | .34 / .37 | -.032 / -.035 | .214/.246, .314/.364 | -.000 / -.009 |
+| paris4j (28) | 60-100 / 100-150 | .14 / .34 | -.030 / -.020 | .254/.298, .318/.353 | -.003 / -.006 |
+| 1667 (7) | 60-100 / 100-150 | .05 / .14 | +.028 / +.041 | .415/.435, .557/.560 | -.007 / -.007 |
+
+Per box: corr(share of cells with spacing < 100 um, p05x A - B) = -0.31; the 5 most packed boxes (share >= 0.25) lose -0.101 p05x,
+the 25 middle ones -0.027, the 9 least packed -0.033.
+
+Verdict: mostly resolution. The latent net's phase deficit is largest at 60-150 um sheet spacing (6-15 label voxels, 1.5-4 latent
+cells of 38.4 um per sheet period) and on Paris 4, where most sheets are that packed; its confidence there is 10-15 % lower; on 1667
+(wide sheets) its phase is better than wind96's. A smaller second deficit is the normal head at wide spacing (-0.012..-0.05 nal), where
+the latent spacing head is also worse (sperr .54 vs .39 at 150-250 um) while it is better in packed sheets. Next (queued): a stride-2
+voxel stem into the cell-shuffle head (resolution), larger windows (P >= 1152, context), distillation from wind96, more gated data.
+
 ## fibhv-d: the fibre mask model on every published fibre set (2026-11-11, branch fibd-20261111)
 
 Why: fibhv-a..c trained on two scrolls only (PHerc1447 + PHerc0175A `*_1mm_v2`, 8.64 um) and were judged on Paris 4 HOLD, a scroll and
@@ -66,6 +266,222 @@ More traced fibre (+68 % arc on H tube at 9000) and a larger share in lines >= 1
 stay under 1 %. 1447-HOLD (cross-check) stays flat between 3000 and 9000 (H tube arc-median 0.59, V tube 0.64). The 1447 mask-vs-label
 score in evald.sh does not work yet (`ufsm eval` reads 0 valid voxels from the copied label shards). The first desk orchestrator never
 started the pod eval: its `pgrep -f` guard matched its own ssh command line; evald_desk.sh now uses a pid file.
+
+## phase-raster's pair rule lean and on the GPU, byte-identical (2026-11-11, branch labelfast-20261111)
+
+The Paris 4 phase labels (`phase-raster --gs 4 --codes-grid 1 --pair 1 --radius 160`, the p4full flags, 3,549 shards in the box) ran
+on pod 2 at ~8 shards / min on 4 threads, ~7 h per set; 4 threads because each block thread held ~0.8 GB (a 256^3 block plus the
+42-voxel halo, 340^3 = 39 M voxels at ~22 B: codes, a band buffer the pair rule never reads, two seed masks, two float distance arrays,
+two int32 feature-index arrays) under the pod's 31 GB cap.
+
+Profile (desk, 8 dense shards 17-18 / 8-9 / 8-9 of June, perf): Felzenszwalb-Huttenlocher envelopes 40 %, the EDT gather / scatter
+20 %, the pair loop 22 % (index decodes), the zarr read / volcomp encode ~5 %. All compute; the CPU path had ~3.6 cores busy.
+
+Changes (src/band.c, src/main.c, src/nn_band.cu):
+- **Lean EDT**: `edt_feature_cap(..., d2 = nullptr, idx)` keeps only the feature indices; each pass rebuilds the squared distance from
+  the index (after the x pass the feature lies on the voxel's x line, after y in its z plane). Those distances are exact integers
+  (< 2^24) and so equal the stored floats; the envelopes see the same values, the indices come out identical. `band_field_phase_pair`
+  and `band_field_side_pair` use it; the pair rule reuses one seed mask and skips the band buffer: ~10 B / block voxel instead of 22.
+- **GPU pair rule** (`--gpu D [--gpu-slots K]`): the same x sweeps, y / z envelopes (one thread per line, consecutive x per warp, the
+  envelope in [q][line] scratch, 32 k lines per chunk) and pair kernel, built `-fmad=false` without fast math (IEEE div / sqrt,
+  `lrintf`) like nn_gpudec / nn_cf, so every float rounds as in band.c (gcc -std=c23 does not contract). A pool of K device contexts
+  (~0.5 GB each at these flags) shared by the block threads; any CUDA failure falls back to the CPU. Weak symbols: a binary without
+  nn_band.o runs the CPU code.
+
+| 8 dense June shards (desk, 5060 Ti) | wall | peak RSS |
+|---|---|---|
+| before, `--threads 4 --shards 1` (the pod's setting) | 54.5 s | 3.4 GB |
+| before, `--threads 8 --shards 3` | 21.5 s | 18.6 GB |
+| lean CPU, `--threads 4 --shards 1` | 62.9 s | 2.0 GB |
+| lean CPU, `--threads 8 --shards 3` | 14.8 s | 10.5 GB |
+| GPU, `--threads 8 --shards 3 --gpu 1 --gpu-slots 1 / 2 / 4` | 4.6 / 3.7 / 3.6 s | 2.4 GB |
+
+GPU: 15x the pod's old setting at 0.7x its RAM; 64 dense shards (z 18-21, y / x 6-9) in 38.5 s (0.6 s a shard). The lean CPU loses 15 %
+per thread to the index decodes but halves the RAM, so the same 31 GB holds twice the threads. Now the CPU side (read, pool, encode)
+bounds it: more slots buy nothing past 2.
+
+Byte identity: the 8 and the 64 shards equal the desk `v2/rv/gt/p4full/phaseA` shards byte for byte; `tests/test_band_pair.c` (suite,
+gpu tag) checks `band_field_phase_pair` (lean CPU and GPU) and `band_field_side_pair` against the previous band.c code kept verbatim
+in the test, on synthetic spirals with holes, conflicts and a missing wrap, five box shapes (non-cubic and an empty one), two radii:
+0 differing voxels. `scripts/pod/p4kit.sh`: `PS=3 PR="--gpu 0 --gpu-slots 2"` for the phase steps (resume keeps the shards written).
+
+## Manual winding annotation: ufsm annotate-serve / annot-export / annot-regions (2026-11-11, branch annot-20261111)
+
+Why: the automatic judges disagree with the eye (CT coherence ranks 1218 / 1299 low, the fibre judge sees 1299 cross sheets in some
+tiles); the user wants to enter winding labels and verdicts by hand. A local tool, no Python: `ufsm annotate-serve CT-ROOT CT-KEY --um U0
+--store ANN.json [--level L] [--wraps DIR] [--labels ROOT KEY] [--fibers F.fib] [--regions REGIONS.tsv]` serves one page (src/annot_page.html,
+embedded with #embed) on 127.0.0.1 only. Launcher: `scripts/annot/serve.sh PHerc1299|PHerc1218|PHercParis4 [PORT]`.
+
+- Viewer: three planes (z, y, x) through a shared cursor, CT pyramid levels >= L as zoom (shift+wheel), wheel steps the slice, drag pans.
+  Overlays: wrap cuts (each wrap's vertex grid, stride 2, cut by the plane per request; colour and number = wrap index), the label array
+  (phase / codes, base level only; 255 = unknown), fibres within 1.5 voxels of the plane (UFIB, H yellow / V cyan), annotations.
+- Speed (desk, PHerc1299 level 2): a 600 x 400 slice 0.13 s cold (decoded 128^3 chunks are kept in an LRU, --cache-gb 2: neighbouring
+  slices and pans decode nothing new); wrap cuts of 109 snapped wraps over a 2048^2 region 0.12 s; fibre points (5.7 M loaded) 0.01 s.
+  The 109 wraps load in a background thread (the .sfc decoder is not thread-safe) in about a minute; the page polls and redraws.
+- Annotation types (level-0 voxel coordinates): point (p, optional winding w, optional same_as), pair (a, b, dw = w(b) - w(a)),
+  line (pts, optional w: one sheet followed by clicks), region (box, verdict good / bad / unknown), wraperr (p, wrap, kind cuts / skips
+  / doubles / other). The server validates each item, assigns id / time / author (client values are replaced), writes the snapshot
+  (ANN.json, atomic rename) and appends every operation to ANN.json.log (add / del / undo; never rewritten). Undo reverts the newest
+  add or del of the session.
+- Work queue: `ufsm annot-regions OUT.tsv --judge T.tsv ... [--wrapcheck W --wraps D --um0 U]` ranks fibre-judge tiles by persistent
+  sheet changes per metre of fibre (tiles under --min-arc 0.3 m dropped) and adds non-"real" wrap-check verdicts at the wrap's bbox
+  centre (whole-wrap flags: the centre is only a starting point). The page's "next flagged region" button walks it.
+- Consumers: `ufsm annot-export ANN.json`
+  - `--fib OUT.fib`: same-sheet runs (lines, dw 0 pairs, same_as points) as UFIB (family 'M', level-0): `fiber-export` into a fit box and
+    `fit --fibers F --uw-rep-fib W` (branch fibers-20261110) use them as slip-repair votes today.
+  - `--pairs OUT.tsv`: every relation "za ya xa zb yb xb dw" incl. dw != 0 and pairs of winding-numbered points within --dmax. A fitter
+    hook for dw != 0 (fit --annot / --w-annot next to uwr_fib) is not written yet: uwr_fib lives on fibers-20261110, not on this branch.
+  - `--gate OUT.boxes --level L`: region verdicts in the `phase-coh --box-scale` format (good 1, bad 0; unknown omitted).
+  - `--points DIR --like ROOT KEY --level L [--radius 2]`: sparse winding raster (w mod 254, 255 unknown) on a label grid.
+- Test: test_annot (store validate / del / undo / reload / log lines, wrap cut flat + tilted + region filter, server on a z3w fixture
+  pyramid: /info, /slice bytes on two levels incl. the array edge, /ann add / invalid / snapshot, page, 404).
+
+## Physically based sheet rendering: what ink looks like on the surface without an ink model (2026-11-11, branch pbr-20261111)
+`ufsm sheet-pbr <tifxyz-dir> <out-dir> --ct ROOT KEY --crop U0,V0,N [--ss S]` renders the papyrus surface of a published segment crop
+as a physical object (src/sheetpbr.c). Surface: the tifxyz grid through Catmull-Rom splines (C1, no 48 um grid-cell creases), outward
+normal by the crop's convexity (recto = inner face, faces.h convention). Profiles along the normal every 0.25 voxel (trilinear CT,
+`--interp cubic` tricubic). Recto face: the steepest rise (air -> papyrus) of the smoothed profile, first on an 8-px lattice within
+[-15, +5] voxels of the mesh, robustly smoothed (Gaussian 3 cells, points > 3 voxels off dropped, 4 rounds), then as ONE continuous
+surface by dynamic programming (row Viterbi then column Viterbi over the offset within +-6 voxels of that, transition cost 0.5 |dt|,
+|dt| <= 1 voxel per sample, column pass tied to the row result), refined sub-voxel (parabola through the derivative) within +-0.5
+voxel of the DP surface. Verso: the steepest fall around its neighbourhood median. Shading of the recto height field seen from the
+recto side: Lambert + GGX (alpha 0.35, F0 0.04), 12 raking lights at 15 deg with cast shadows, horizon AO, exposure 2 / 98 % + gamma.
+Diagnostics: near-surface CT (first 4.8 um inside), thickness, high-pass / roughness / curvature of the height, `--xsec` cross-sections
+with the faces drawn, `--layers` CT on parallel layers, `--profiles`.
+
+Data: Paris 4 segments 20260701183125-w028-037, ...26-w038-045, ...27-w046-052 (open-data bucket, the 2.4 um tifxyz on
+20260411134726, CT level 0 from the volcomp mirror, q 8). Crops (2048^2 px = 4.9 x 4.9 mm) chosen where the published 2D ink
+prediction covers ~35 % of a fully surfaced 2 x 2-tile block. The reference is that published ink PREDICTION
+(new_canon_autoresearch_recipe, a model output): no human ink labels exist for these 2026 segments; the HF bucket's
+ink/phercparis4/wNN_<2023 segment> sets are on the 7.91 um 2023 scan and need the 2023 -> 2026 registration.
+
+Findings:
+- The 2.4 um meshes are tilted / offset relative to the sheets (cross-sections: the bands cross t = 0 at ~2 deg, tens of voxels over
+  a crop) — consistent with segments carried over from the 7.91 um scan. Sheets in the inner wraps are packed: no clean void, gaps are
+  8-10 voxel dips, ~20 voxels between interfaces (fibre layers / sheets), so a per-sample interface finder hops between interfaces
+  (first draft: piecewise-flat plateaus). After the DP: per-sample steepest rise more than 1 voxel off the continuous surface at
+  35.5 / 37.8 / 39.0 % of samples (w046 / w038 / w028); runner-up edge >= 0.7 of the best (ambiguous) at 7.5 / 9.3 / 9.3 %; faces
+  found at 86-87 %; mean recto-verso distance 20-25 voxels (48-60 um).
+- The shaded surface shows the papyrus itself (horizontal / vertical fibre strips, relief, crackle in the near-surface CT); fine
+  diagonal hatching in the raking lights is a sampling artefact (0.25-voxel DP offsets), not texture.
+- AUC against the ink prediction (pos >= 160, neg <= 64; raw / detrended by a 0.7 mm Gaussian; tie-aware ranks):
+
+| map | w028-037 | w038-045 | w046-052 |
+|---|---|---|---|
+| flat CT at the mesh | 0.577 / 0.539 | 0.530 / 0.526 | 0.433 / 0.420 |
+| max CT +-3 | 0.586 / 0.539 | 0.553 / 0.546 | 0.426 / 0.412 |
+| near-recto CT | 0.567 / 0.527 | 0.567 / 0.558 | 0.462 / 0.463 |
+| thickness | 0.479 / 0.529 | 0.462 / 0.451 | 0.538 / 0.576 |
+| recto height | 0.568 / 0.605 | 0.558 / 0.522 | 0.518 / 0.517 |
+| height high-pass | 0.486 / 0.484 | 0.493 / 0.492 | 0.495 / 0.494 |
+| roughness | 0.548 / 0.644 | 0.494 / 0.423 | 0.550 / 0.458 |
+| curvature | 0.510 / 0.507 | 0.503 / 0.501 | 0.505 / 0.505 |
+| RTI min (12 lights) | 0.489 / 0.438 | 0.503 / 0.532 | 0.466 / 0.499 |
+| PBR (GGX + shadows + AO) | 0.457 / 0.445 | 0.497 / 0.502 | 0.471 / 0.485 |
+| best single CT layer | t -35: 0.553 / 0.582 | t -2: 0.532 / 0.529 | t +2: 0.433 / 0.419 |
+
+  No physical surface map separates the predicted ink: every AUC is within 0.40-0.64 and the sign flips between crops (flat CT 0.58
+  on w028, 0.43 on w046). Two readings, not yet separated: carbon ink leaves no relief / density signature our sampling resolves at
+  2.4 um with q 8 compression; or the reference itself (a model prediction, on a mesh that does not sit on one face) marks letters at
+  a layer our tracked recto is not on. Next: human-labelled segments (the 2023-scan labels through the new registration), the 1.129 um
+  scan (meshes exist, on-20260608103018), --ss 2 / 4 on sub-crops, and the face on the side the ink model's input layers sit.
+1.129 um (`--reg MAP.json`): the mesh stays on the 2.4 um scan, every sample point goes through the published ufsm reg map
+PHercParis4/transforms/20260608103018_to_20260411134726/reg.json (affine + field, held-out p50 0.85 um) into the 1.129 um scan
+20260608103018, the normal through the map's local Jacobian; offsets and all voxel parameters in 1.129 um voxels (ratio 2.126),
+sampled at --ss 2 (1.13 um along the surface). Coverage: the 1.129 um scan spans 2.4 um z ~28000-56600; crop w028-037 (z ~63000) is
+outside it and w038-045's crop lies in its masked-out zeros, so 1024-px sub-crops were used: w046 (centre of the w046 crop) and two
+substitutes picked the same way inside the coverage, w028s (u 103424, v 27648) and w038s (u 90112, v 44032). The registration holds
+at the surface: cracks, inclusions and fibre strips coincide in the 2.4 and 1.129 um renders (out/cmp_*.png, the same 1 x 1 mm).
+At 1.129 um the recto edge is less decided: runner-up edge >= 0.7 of the best at 26-31 % of samples (2.4 um: 8-9 %), the DP surface
+departs from the per-sample steepest rise at 42-56 % (2.4 um: 23-36 %): more noise per voxel, and fine structure (fibre bundles,
+crackle) makes several real edges. AUC vs the ink prediction, 2.4 um | 1.129 um, raw / detrended:
+
+| map | w046 | w028s | w038s |
+|---|---|---|---|
+| flat CT | 0.307 / 0.372 \| 0.331 / 0.411 | 0.424 / 0.425 \| 0.449 / 0.465 | 0.650 / 0.613 \| 0.629 / 0.558 |
+| near-recto CT | 0.434 / 0.502 \| 0.457 / 0.510 | 0.544 / 0.548 \| 0.538 / 0.546 | 0.520 / 0.551 \| 0.582 / 0.566 |
+| thickness | 0.630 / 0.827 \| 0.650 / 0.583 | 0.399 / 0.402 \| 0.431 / 0.465 | 0.590 / 0.505 \| 0.564 / 0.452 |
+| recto height | 0.546 / 0.574 \| 0.562 / 0.555 | 0.459 / 0.460 \| 0.481 / 0.492 | 0.567 / 0.635 \| 0.578 / 0.599 |
+| roughness | 0.515 / 0.524 \| 0.493 / 0.516 | 0.574 / 0.365 \| 0.593 / 0.415 | 0.495 / 0.383 \| 0.506 / 0.377 |
+| RTI min | 0.506 / 0.392 \| 0.507 / 0.350 | 0.455 / 0.513 \| 0.470 / 0.656 | 0.532 / 0.353 \| 0.515 / 0.291 |
+| PBR | 0.487 / 0.461 \| 0.509 / 0.451 | 0.450 / 0.480 \| 0.441 / 0.525 | 0.515 / 0.514 \| 0.506 / 0.506 |
+
+  The finer scan does not change the picture: no map separates the predicted ink consistently, the signs flip between crops
+  (flat CT 0.31 on w046, 0.65 on w038s), and 1.129 um numbers track the 2.4 um ones within a few hundredths.
+Outputs: /vesuvius/ufsm/pbr/out/<crop>/{contact.png, png/*.png, *.f32, map.json, auc.json}.
+
+### Addendum: against HUMAN ink labels (2026-11-11)
+
+- The public human labels (HF scrollprize/datasets ink/phercparis4, 8 segments w00..w09) are already on the 2.4 um
+  20260411134726 scan (their meshes reach z ~74000, x ~26000; the 2023 scan's shape is 14258 x 7888 x 8096). So no 2023 -> 2026
+  map was needed. Pipeline: ink-splat each label segment (label + supervision mask) into one sparse prob254 zarr (band +-4
+  voxels, 255 = unknown), then `sheet-pbr --labels`. For each output pixel the sampler walks the normal +-D around our tracked
+  recto. It picks the labelled run nearest the face and returns its majority label (human_ink) and its offset from the face
+  (human_off). Voxels outside the label box count as unknown, not as no ink.
+- Picking crops by geometry alone gave 0 % labelled on 9 crops: the label segments run near our sheets but are unsupervised
+  there. So crops were re-picked by distance to supervised label pixels (tools/pbr hcand2.txt; >= 60 % of the mesh vertices
+  within 12 voxels). That gave L1-L5 plus w028 and hC. w028s is 7.4 % labelled and its label surface sits -28 voxels from our
+  face, i.e. on the neighbouring sheet, so it is excluded.
+
+| crop (seg, u, v, px) | labelled | ink | label - recto mean / mean abs (2.4 \| 1.13) |
+|---|---|---|---|
+| w028 (w028-037 122880 10240, 2048) | 99.2 % | 36.5 % | +4.6 / 9.8 \| - |
+| hC (w028-037 61440 21504, 1024) | 26.6 % | 50.6 % | +7.3 / 11.3 \| +6.9 / 11.5 |
+| L1 (w028-037 77824 19456) | 100 % | 38.9 % | +5.5 / 7.9 \| +5.8 / 8.0 |
+| L2 (w028-037 54272 26624) | 99.6 % | 47.6 % | +3.4 / 6.5 \| +4.0 / 6.7 |
+| L3 (w010-027 62464 23552) | 100 % | 40.3 % | +3.1 / 6.6 \| +5.3 / 8.4 |
+| L4 (w010-027 72704 37888) | 99.5 % | 42.9 % | +8.1 / 9.9 \| +7.9 / 9.6 |
+| L5 (w038-045 167936 24576) | 100 % | 44.2 % | +0.6 / 7.1 \| +1.7 / 7.3 |
+
+  The label surfaces are on the same sheet as our face. They sit on average 1-8 mesh voxels outward of it (|d| 6.5-10 voxels,
+  i.e. 16-24 um, about one sheet thickness of jitter), never a whole wrap off, except w028s.
+
+AUC vs HUMAN labels, raw / detrended (2.4 um; 1.129 um in parentheses):
+
+| map | w028 | hC | L1 | L2 | L3 | L4 | L5 | pooled (z-scored per crop) |
+|---|---|---|---|---|---|---|---|---|
+| recto offset | 0.41/0.38 | 0.73/0.72 (0.70) | 0.65/0.56 (0.63) | 0.57/0.56 (0.50) | 0.46/0.46 (0.45) | 0.53/0.52 (0.55) | 0.39/0.45 (0.36) | 0.493 (0.529) |
+| flat CT | 0.58/0.56 | 0.37/0.38 (0.39) | 0.44/0.47 (0.42) | 0.44/0.47 (0.42) | 0.53/0.52 (0.52) | 0.53/0.52 (0.54) | 0.53/0.50 (0.53) | 0.525 (0.481) |
+| near-recto CT | 0.56/0.53 | 0.54/0.56 (0.45) | 0.53/0.52 (0.46) | 0.50/0.52 (0.47) | 0.53/0.53 (0.54) | 0.50/0.50 (0.53) | 0.52/0.53 (0.51) | 0.534 (0.499) |
+| thickness | 0.48/0.52 | 0.55/0.51 (0.57) | 0.39/0.44 (0.43) | 0.46/0.44 (0.51) | 0.46/0.45 (0.43) | 0.54/0.54 (0.49) | 0.57/0.56 (0.59) | 0.485 (0.497) |
+| recto height | 0.60/0.62 | 0.27/0.28 (0.30) | 0.35/0.43 (0.38) | 0.43/0.44 (0.50) | 0.54/0.54 (0.55) | 0.47/0.48 (0.45) | 0.61/0.55 (0.64) | 0.507 (0.471) |
+| roughness | 0.55/0.58 | 0.54/0.63 (0.56) | 0.55/0.44 (0.52) | 0.65/0.38 (0.57) | 0.50/0.49 (0.51) | 0.53/0.45 (0.52) | 0.54/0.50 (0.54) | 0.511 (0.517) |
+| PBR | 0.47/0.47 | 0.46/0.45 (0.45) | 0.48/0.45 (0.49) | 0.41/0.47 (0.47) | 0.50/0.51 (0.50) | 0.48/0.49 (0.49) | 0.47/0.49 (0.46) | 0.462 (0.478) |
+| RTI min | 0.49/0.47 | 0.46/0.41 (0.49) | 0.48/0.39 (0.50) | 0.42/0.53 (0.52) | 0.49/0.51 (0.50) | 0.48/0.54 (0.49) | 0.48/0.56 (0.48) | 0.467 (0.503) |
+| AO | 0.46/0.46 | 0.46/0.46 (0.45) | 0.44/0.43 (0.47) | 0.37/0.41 (0.45) | 0.51/0.51 (0.50) | 0.47/0.48 (0.48) | 0.46/0.49 (0.46) | 0.454 (0.472) |
+
+- Result: against human labels, as against the predictions, no label-free surface map separates ink. Pooled AUCs are
+  0.45-0.53. Per-crop values reach 0.27 / 0.73 (hC height, recto offset), but the sign flips between crops: recto offset is
+  0.73 on hC and 0.39 on L5, and height is 0.27 on hC and 0.61 on L5.
+- Caveat: the human labels are coarse polygons at letter scale. A 1024-px crop (2.46 mm) holds only one or two label
+  boundaries (see cmph_L1.png: the crop splits into one ink half and one no-ink half). So a per-crop AUC mostly measures
+  "which half of the crop", and detrending at sigma 300 px is close to the crop size. A test with real power needs >= 8 mm
+  crops spanning many letters, scored at stroke edges.
+- Images: /vesuvius/ufsm/pbr/out/cmph_{L1,L4,hC}.png (human label | flat | near-recto | PBR | raking light | recto offset,
+  2.4 um row over 1.129 um row), out/h_{s24,s113}_<crop>/contact_human.png, auc_human.txt.
+
+## fiber-trace on the GPU: the per-voxel axis, byte-identical (2026-11-11, branch gtrace-20261111)
+
+A `--mask` trace is almost all per-voxel work: on the Paris 4 HOLD box (512 x 576 x 768 at 9.6 um, fibhv-a step-10000 H mask) the CPU
+run takes 128 s, and perf puts 97 % of it in the axis (the presence's gradient structure tensor over 5^3 voxels and two 40-step power
+iterations per voxel, `ft_ridge_axis`); the streamline integration with its sequential "earlier seed wins" occupancy is ~3 %. So only the
+axis moved to the GPU; the integration stays on the CPU and its seed order is unchanged, and no parallel-integration approximation of
+the occupancy rule is needed.
+
+- `src/ftaxis.c` holds the CPU axis (moved out of fibertrace.c unchanged, so tests link it alone); `src/nn_ftrace.cu` the GPU copy, one
+  thread per (y, x) column marching z in 32-plane launches, the in-plane (2R+1)^2 sums per plane in a ring and a sliding z sum.
+- Byte-identical, not just close: the gradient products and their sums are exact integers on both sides (the CPU's float partial sums
+  stay below 2^24 for --st-r <= 6; the GPU path refuses larger R), and the double power iterations run the CPU's operations in its order
+  (nn_ftrace.o: -fmad=false, no fast math, IEEE division / sqrt; gcc -std=c23 does not contract).
+- `ufsm fiber-trace ... --gpu G` (default -1 = CPU); on any CUDA failure it says so and runs the CPU axis.
+- `test_ftrace_gpu` (gpu, fast tier): random tubes in noise on an odd-sized box (37 x 45 x 53, every face clamp), a flat region,
+  --st-r 1 / 2 / 3 x prior none / H / V: 9 of 9 byte-identical.
+- HOLD box, desk GPU 1 (shared with a training run): H 128 s CPU -> 6.6 s with --gpu (19x), V 6.4 s; the H and V .fib files are
+  byte-identical to the CPU's (cmp), so the judge numbers are those of the CPU traces (H 0.956 / V 0.914 at 0.6 mm, DESIGN 2026-11-10).
+  What remains: the sequential tracing (ft_tensor / ft_axis ~35 % of the 6.6 s), the zarr read, CUDA start and the copies. A 512^3
+  tile (134 Mvox, 0.59 of HOLD) should take ~4 s instead of ~4 min per pod core.
+- Not ported: `--blur` (CPU, off by default), `--dyad` (CPU, already a cheap per-voxel decode), the published-prediction path (no
+  derived axis). A GPU integration would only pay once the axis is no longer the cost, i.e. not now.
 
 ## Paris 4: the 2023 7.91 um scan registered to our 2.4 um scan (2026-11-11, branch p4reg-20261111)
 
@@ -600,6 +1016,51 @@ This section was not written at the time. Everything in it is copied from the me
 - Reading it with today's numbers: the vote use gains because a vote needs only the majority of fibres to be right over a short span;
   the loss terms ask every fibre to hold its sheet, and one persistent change per 7 .. 10 mm (section above) is why they do not pay.
 
+## Fibres in the winding network: the normal head orthogonal to fibres (2026-11-11, branch fibnet-20261111)
+
+`train --fib-normal-lambda L` adds L x the mean of t^T N t over a window's fibre voxels: N the sign-free normal dyad of the six normal
+logits exactly as `nn_unwrap_targets2` codes it (p = sigmoid: N_zz, N_yy, N_xx = p0..p2, the off-diagonals p3..p5 - 1/2), t the fibre
+tangent. A fibre lies in its sheet, so (n . t)^2 = 0 is a target that needs no winding label (`src/nn_loss.cu` nn_fibn / nn_fibn_apply).
+
+Where the tangent comes from (a deviation from the 11-10 design, which rotated a stored tangent plane through the spatial augmentation):
+the fibre input is a prob254 tube raster (`ufsm fiber-raster`, radius 2 voxels; 255 unknown) given as a source's "sheet" / "ink" target,
+and it rides the existing ink plane (`IPLANE`): every symmetry, warp, replay and `--gpu-aug` path the ink plane already has applies, and
+nothing new happens in the sampler. On the device the tangent is read off the transformed tube: the gradient structure tensor S of the
+plane over 5^3 voxels is c (I - t t^T) for a tube, so T = I - 2 S / tr S ~ t t^T and t is its leading eigenvector (three power steps).
+Voxels whose T is not near rank one (leading eigenvalue < 0.75, or the other two with squares summing over 0.5: blobs, sheets, crossings,
+tube ends) are skipped. A direction is never transformed, so the 48 symmetries and the warps cannot get it wrong; the cost is that t is
+known only where the raster is a clean tube, and only in the tube's 5-voxel core (the tube raster has no sub-voxel position).
+
+Loss path: head slabs only (`head_slab_pass`). The statistics pass counts the window's valid voxels and sums t^T N t (the logged `fibn`);
+the gradient pass collects each slab's per-voxel d(t^T N t) / dlogit = c_k p_k (1 - p_k) (c = t_z^2, t_y^2, t_x^2, 2 t_z t_y, 2 t_z t_x,
+2 t_y t_x) into a list before the in-place normal BCE gradient overwrites the logits, and adds L / count x the list after the
+--normal-lambda scaling. Only voxels whose stencil (3 planes) lies inside their own slab count: a streamed slab holds only its planes
+(12.5 % of fibre voxels lost at 32-plane slabs). The fused latent gradient (`g_lat_fuse`) is switched off with the flag (the unfused
+latent chain works); the whole-window loss path, `--ink-head` and `--rv` (both own the ink plane) are refused; task unwrap needs
+`--ink-lambda 0` (its CH_SHEET channel is the plane now). No parameters, default 0: checkpoints and old runs unchanged.
+
+Test `test_fibn`: a radius-2 tube along the 48 symmetric images of (1, 2, 3) / sqrt 14 (the device sees only the transformed tube): mean
+|t . d| 0.9978, worst 0.9929 over 1220 axis voxels; kernel count / mean t^T N t equal to a host reference; the gradient against central
+differences of the host loss (worst 8e-9 at a largest gradient 4e-4); two 16-plane slabs with the planes outside each slab poisoned
+count exactly the host's per-slab voxels. First real steps (wind96 from vc384.init.ckpt, P 384, Paris 4 / 0139 / 0500P2 winding GT +
+1447 / 0175A H-fibre sources at 25 % of the weight, lambda 0.1): fibn 0.06 .. 0.10 (wind96's normals already make (n . t)^2 small:
+sin^2 of 14 .. 18 degrees), 260 000 .. 315 000 valid voxels per fibre window, but only 5 of 60 windows came from the fibre sources (8 %
+against their 25 % weight: the sampler rejects more of their draws; not investigated). Planner: 6.43 GB at P 384 (network 4.57). With the
+Paris 4 raster on the two Paris 4 sources (vcfibA's list) 24 % of windows carry fibre voxels (48 of 135 sampled windows had known fibre
+labels; z band 6656..11776 only), fibn 0.051 at step 50; Paris 4 raster: 1.05 G H-tube voxels, 8.6 GB.
+
+Arms (`/vesuvius/ufsm/v2/lat/runs/vcfib.launch.sh`, not started): vcfibA = vc384c exactly (wind96, lr 1e-4 / muon 0.002, task unwrap,
+P 384, 4000 steps) with lambda 0.1 and the Paris 4 H-fibre raster as the "sheet" target of the two Paris 4 sources (the same windows
+as vc384c; only the loss differs); vcfibB adds the 1447 / 0175A fibre sources. Paris 4 raster: `fiber-raster Paris4_1mm_v2.afv --tr
+p4_2026_to_2023.json --level 2 --zband 6656,11776` into /vesuvius/ufsm/fibers/labels/PHercParis4-l2.
+
+**Same-fibre pair term (design only).** The 11-10 design needs sampler pair lists moved by the window's transform. With the tangent on
+the device it does not: pair a voxel v of a clean tube with v + round(d t) (d <= 0.3 mm, 32 planes at 9.6 um) when that voxel is also a
+clean tube voxel with |t_a . t_b| > 0.9; the pair term lambda (1 - u_a . u_b) on the phase (and w4) unit vectors, capped per pair, then
+needs no sampler change either. Collisions in the gradient scatter (two pairs sharing a voxel) are avoided by letting only voxels with
+even (z + y + x) / d parity start a pair, or by the same list-then-add scheme as nn_fibn. Both points must lie in the slab, which a 32-plane
+slab allows for H fibres (they run in the sheet, mostly across z only at small slopes).
+
 ## Inference from the stored latent volume, without the CT (2026-11-10, branch latinf-20261109)
 
 `predict --latents STORE` (an `ufsm lc-encode` store of the CT level) reads no CT voxel; the CT store is opened for its metadata only
@@ -701,6 +1162,12 @@ instead of in the input buffer and copied. Tests: fast against reference kernels
 profiler sync point costs a time slice): label builds + copies 87 -> 45 ms per step, CT upload 29 -> 23 ms; real loader 1.845 ->
 1.905 samp/s; 20-step loss identical (2.4004), `UFSM_LAT_STREAM=check` 0 bytes differ, host-stream path and the winding
 head equal too. Not measured at P1024 (no quiet card); by voxel count the saving there is ~350 ms of a ~2.3 s step.
+
+**The CT byte sums.** `aug_sums_k` (a voxel a thread, two 64-bit atomics a warp) is now 32 bytes a thread and one pair of atomics
+a block; `aug_final_k` one pair a block; every per-voxel index split in nn_aug.cu uses 32-bit divisions (`lw_zyx`). Same sums, same
+channel (`TGA_CTBENCH=1 test_gpu_aug 512`, hashes equal). `nn_aug_ct` with its upload, P512, shared GPU 1: no scanner op 16.9 ->
+11.5 ms (symmetry), 22-24 -> 16 ms (warped); with a scanner op (load + final + write) 22-30 ms unchanged within the noise.
+Real loader with the label changes above: 1.832 -> 1.908 samp/s (+4%, contended both).
 
 **A weight gradient that changed when other processes shared the card (fixed).** `test_lat_head~FP8` failed in ~1 run in 10 when
 three copies ran on one GPU and never alone (0 of 55): one conv's weight gradient off by 1e-4..5e-3, everything else equal to 5e-8.

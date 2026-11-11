@@ -4,6 +4,7 @@
 #include "sample.h"
 #include "sources.h"
 #include "band.h"
+#include "bandgpu.h"
 #include "pairacc.h"
 #include "votes.h"
 #include "wind.h"
@@ -59,6 +60,7 @@ int cmd_surf_stats(int argc, char **argv);
 int cmd_wrap_snap(int argc, char **argv);   /* src/wrapsnap.c */
 int cmd_surf_labels(int argc, char **argv);   /* src/surflabels.c */
 int cmd_sheet_score(int argc, char **argv);   /* src/sheetscore.c */
+int cmd_phase_coh(int argc, char **argv);   /* src/phasecoh.c */
 int cmd_patch_solve(int argc, char **argv);   /* src/patchsolve.c */
 int cmd_trace_prep(int argc, char **argv);    /* src/tracebox.c */
 int cmd_patch_score(int argc, char **argv);   /* src/tracebox.c */
@@ -81,6 +83,7 @@ int cmd_stitch(int argc, char **argv);   /* src/stitch.c */
 int cmd_coreline(int argc, char **argv);   /* src/coreline.c */
 int cmd_coreline_check(int argc, char **argv);   /* src/coreline_check.c */
 int cmd_render_sheets(int argc, char **argv);   /* src/render.c */
+int cmd_sheet_pbr(int argc, char **argv);       /* src/sheetpbr.c */
 int cmd_overlay_red(int argc, char **argv);
 int cmd_tifxyz_scale(int argc, char **argv);
 int cmd_ink_compare(int argc, char **argv);
@@ -171,6 +174,7 @@ static int usage(void) {
         "  ufsm wraps <model-dir> <out-dir> [--step 8] [--fields DIR]          one tifxyz per wrap (level sets of W)\n"
         "  ufsm coreline detect|box|sdist|check ...   a crushed scroll's flattened umbilicus per z (fit fields), half-box fit dirs behind it, check renders\n"
         "  ufsm render-sheets <tifxyz-dir> <out-dir> --ct ROOT KEY --ink ROOT KEY ...   every sheet -> CT + red ink 5-panel JPEGs, one batch\n"
+        "  ufsm sheet-pbr <tifxyz-dir> <out-dir> --ct ROOT KEY --crop U0,V0,N [--ss 1] ...   sub-voxel recto / verso surfaces + PBR shading of a segment crop\n"
         "  ufsm overlay-red <ct-dir> <ink-dir> <out-dir> [ink2 [ink3]]   the 5-panel overlay of existing renders\n"
         "  ufsm tifxyz-scale <src> <dst> <div> [--offset z,y,x]   tifxyz coordinates / div (e.g. 2.4 -> 9.6 um: 4)\n"
         "  ufsm ink-compare <out.jpg> --ct CT.tif --ink LABEL=INK.tif ..   CT | ink panels (half-res JPEG) + ink statistics per render\n"
@@ -210,6 +214,9 @@ static int usage(void) {
         "  ufsm ink-cover <render-dir>   per rendered wrap on papyrus: ink share >= t, mean ink, stroke contrast\n"
         "  ufsm wrapdist <wraps-dir> <labels-root> <labels-key>              wrap vertices vs the nearest labelled sheet\n"
         "  ufsm wrapswitch <wraps-dir> <codes-root> <codes-key>            how often the wraps switch sheets (per cm)\n"
+        "  ufsm annotate-serve <ct-root> <ct-key> --um U0 --store ANN.json [--wraps D] [--labels R K] [--fibers F] [--regions T]   manual winding annotation page (127.0.0.1)\n"
+        "  ufsm annot-export ANN.json [--fib F] [--pairs T] [--gate B --level L] [--points DIR --like R K --level L]   annotations -> fitter votes / gate boxes / sparse codes\n"
+        "  ufsm annot-regions OUT.tsv [--judge T.tsv ..] [--wrapcheck W --wraps D --um0 U]   flagged regions (fibre judge, wrap check) for annotate-serve --regions\n"
         "  ufsm wrap-check <model> <fields-dir> [--ct ROOT KEY --ct-um U] [--codes ROOT KEY]   duplicate / merged wraps: CT peaks between adjacent wraps along radial rays\n"
         "  ufsm surf-snap <wraps-in> <wraps-out> --volume ROOT KEY --vol-um U   tifxyz vertices onto the nearest papyrus ridge\n"
         "  ufsm wrap-snap <wraps-in> <wraps-out> --axis F --axis-um U0 --ct ROOT KEY --ct-um U   .sfc wraps moved along their rays onto the sheets (smooth, order-kept)\n"
@@ -221,6 +228,7 @@ static int usage(void) {
         "  ufsm sheet-trace --prob P --box Z0,Y0,X0,NZ,NY,NX --axis A --out DIR [--tol 2] [--step 2]   fast sheet patch tracer: radial peaks linked as height fields r(theta, z)\n"
         "  ufsm patch-score --paths DIR --gt G --box Z0,Y0,X0,NZ,NY,NX --axis A [--sgn S]   traced patches vs GT codes: sheet recall, precision, purity\n"
         "  ufsm patch-solve --paths DIR --prob P --box Z0,Y0,X0,NZ,NY,NX --axis A [--gt G] ..   global turn numbers of traced sheet patches (ray gap votes, exact L1)\n"
+        "  ufsm phase-coh <phase-root> <key> <ct-root> <ct-key> <out> --weight T0,T1 [--cell 32]   CT-coherence phase weight of a rendered stored phase (re-gate)\n"
         "  ufsm sheet-score <ours-root> <ours-key> <gt-root> <gt-key> [--tol 1] [--prec-r 8] [--cell 64] [--box ..]   sheet recall / precision / local + global turn consistency of winding code rasters\n"
         "  ufsm surf-labels <wraps-dir|strip.sfc> <out-dir> --axis F --axis-um U0 --dir +-1 --grid-um U --like ROOT KEY   winding codes + pair phase + ignore from .sfc wraps\n"
         "  ufsm wrap-anchor <wraps-dir> <anchor-file> --gt ROOT KEY [surf-labels flags]   per-cell winding offsets of our wraps from published-segment codes (surf-labels --anchor)\n"
@@ -244,6 +252,8 @@ static int usage(void) {
         "  ufsm phase-gate <in-fields> <out-fields> --ref MODEL [--mode gate|ref]   the network phase replaced by a ref model's where it does not rotate with the sheets\n"
         "  ufsm hires-phase <ct-root> <key> <fields-dir> <out-dir> --ct-um U   fit fields with the sheet phase measured in a finer CT (valleys along the normal)\n"
         "  ufsm phase-packing <phase-root> <phase-key> [--box ..] [--map OUT.raw]   how packed the labelled sheets are (box stats, per-chunk map for the sampler focus)\n"
+        "  ufsm field-diag A_DIR [B_DIR] --phase ROOT KEY [--bins 60,100,150,250]   two fit-field sets vs the label phase per sheet-spacing bin (phase / normal / spacing)\n"
+        "  ufsm fields-phase OUT --like ROOT KEY [--ref ROOT KEY] [--conf 0.5] FIELDS...   teacher pseudo-label phase raster from fit fields (distillation)\n"
         "  ufsm wbench-stats A.tsv [B.tsv] [--metric ids,p1x] [--set clean|all]   winding bench means, stratified bootstrap CIs, paired A-B, MDE (--scroll a,b; --tsv 1)\n"
         "  ufsm ckpt-avg OUT.ckpt IN1.ckpt IN2.ckpt ... [--arrays ema|both]   uniform weight average of snapshots of one run (optimiser state of the last)\n"
         "  ufsm phase-conflict <a-root> <a-key> <b-root> <b-key> <out>   where two label phase sets disagree (> --tol turn): the sampler's phase ignore mask\n"
@@ -435,7 +445,7 @@ static int band_fit_fields(const uint8_t *ph, const uint8_t *spc, const int n[3]
    a phase on the output grid (another unroll of the same scroll): where it is known and the computed phase differs by more than
    --mask-tol turns, the output is unknown (two separate sources, their conflicts masked, nothing fused); the |difference|
    histogram is reported. The known voxels written are counted (labelled volume, mm^3). */
-typedef struct { z3 *codes; const int64_t *shape; const axis *ax; band_params bp; int halo, blk; int64_t s0[3]; uint8_t *shard; atomic_int next; int nblk[3]; size_t nonempty; pthread_mutex_t mu; int winding; int pf; const int64_t *fshape; int pair; } praster_job;   /* pf 2: the grid is the 4.8 um codes (fshape) pooled 2x */
+typedef struct { z3 *codes; const int64_t *shape; const axis *ax; band_params bp; int halo, blk; int64_t s0[3]; uint8_t *shard; atomic_int next; int nblk[3]; size_t nonempty; pthread_mutex_t mu; int winding; int pf; const int64_t *fshape; int pair; int gpu; } praster_job;   /* pf 2: the grid is the 4.8 um codes (fshape) pooled 2x */
 /* the codes over the grid box ro / rn: read directly (pf 1), or from the 2x finer codes with every 2^3 block pooled (pf 2): empty when
    all are empty, 255 (conflict) when any is or two lie more than a quarter turn apart, else their circular mean */
 static int praster_read(const praster_job *J, const int64_t ro[3], const int64_t rn[3], uint8_t *out) {
@@ -467,6 +477,12 @@ static int praster_read(const praster_job *J, const int64_t ro[3], const int64_t
     free(f);
     return 0;
 }
+/* --pair 1: on the GPU when --gpu (src/nn_band.cu, byte-identical), the CPU on any GPU failure */
+static int praster_pair(const praster_job *J, const uint8_t *codes, const int ni[3], uint8_t *phase) {
+    const float rmax = J->bp.radius / band_gs(J->bp);
+    if (J->gpu >= 0 && band_pair_gpu && !band_pair_gpu(codes, ni, rmax, phase)) return 0;
+    return band_field_phase_pair(codes, ni, rmax, phase, nullptr);
+}
 static void *praster_worker(void *arg) {
     praster_job *J = arg; const int B = J->blk, Hh = J->halo, nb = J->nblk[0] * J->nblk[1] * J->nblk[2];
     for (;;) {
@@ -491,8 +507,8 @@ static void *praster_worker(void *arg) {
         free(tmp);
         double *cy = malloc(n[0] * sizeof(double)), *cx = malloc(n[0] * sizeof(double));
         const double g = band_gs(J->bp); for (int64_t zz = 0; zz < n[0]; zz++) axis_at(J->ax, g * (zz + o[0]) + 0.5 * (g - 1), &cy[zz], &cx[zz]);
-        uint8_t *band = malloc(N), *phase = malloc(N);
-        if (!band || !phase || (J->pair == 2 ? band_field_side_pair(codes, ni, J->bp.radius / band_gs(J->bp), Hh, phase) : J->pair ? band_field_phase_pair(codes, ni, J->bp.radius / band_gs(J->bp), phase, nullptr) : band_field_phase(codes, ni, o, cy, cx, J->bp, band, phase, nullptr))) { fprintf(stderr, "phase-raster: out of memory\n"); free(codes); free(band); free(phase); free(cy); free(cx); continue; }
+        uint8_t *band = J->pair ? nullptr : malloc(N), *phase = malloc(N);   /* the pair rules need no band buffer */
+        if ((!J->pair && !band) || !phase || (J->pair == 2 ? band_field_side_pair(codes, ni, J->bp.radius / band_gs(J->bp), Hh, phase) : J->pair ? praster_pair(J, codes, ni, phase) : band_field_phase(codes, ni, o, cy, cx, J->bp, band, phase, nullptr))) { fprintf(stderr, "phase-raster: out of memory\n"); free(codes); free(band); free(phase); free(cy); free(cx); continue; }
         if (J->winding) for (size_t k = 0; k < N; k++) phase[k] = band_winding(band[k], phase[k]);   /* --winding: mod 14 turns */
         for (int zz = 0; zz < B; zz++) for (int yy = 0; yy < B; yy++)   /* the block interior into the shard buffer (512^3) */
             memcpy(J->shard + ((size_t)(bz * B + zz) * 512 + by * B + yy) * 512 + bx * B, phase + ((size_t)(zz + Hh) * n[1] + yy + Hh) * n[2] + Hh, (size_t)B);
@@ -520,7 +536,7 @@ static void phase_pool2(const uint8_t *src, uint8_t *dst) {
 /* phase-raster: shards taken from list in turn, each by nt block threads (praster_worker) into its own buffer, then (pooled) written */
 typedef struct { z3 *z; const int64_t *shape; const axis *ax; band_params bp; int halo, blk, winding, pf, pair; const int64_t *fshape; z3w *w; int pool, nt;
                  const int64_t (*list)[3]; size_t nlist; atomic_size_t next; size_t nonempty, done; double t0; pthread_mutex_t mu; atomic_int fail;
-                 z3 *mref; double mtol; size_t mhist[PHASE_AGREE_BINS], mmasked, mboth, known; } praster_run;   /* --mask-ref: a phase on the output grid; known: voxels written known */
+                 z3 *mref; double mtol; size_t mhist[PHASE_AGREE_BINS], mmasked, mboth, known; int gpu; } praster_run;   /* --mask-ref: a phase on the output grid; known: voxels written known */
 static void *praster_shards(void *arg) {
     praster_run *R = arg;
     uint8_t *shard = malloc((size_t)512 * 512 * 512), *pooled = R->pool == 2 ? malloc((size_t)256 * 256 * 256) : nullptr, *refbuf = nullptr;
@@ -530,7 +546,7 @@ static void *praster_shards(void *arg) {
         const int64_t sz = R->list[t][0], sy = R->list[t][1], sx = R->list[t][2];
         memset(shard, R->pair == 2 ? RV_UNKNOWN : PHASE_UNKNOWN, (size_t)512 * 512 * 512);
         praster_job J = {R->z, R->shape, R->ax, R->bp, R->halo, R->blk, {sz * 512, sy * 512, sx * 512}, shard, 0, {512 / R->blk, 512 / R->blk, 512 / R->blk}, 0,
-                         PTHREAD_MUTEX_INITIALIZER, R->winding, R->pf, R->fshape, R->pair};
+                         PTHREAD_MUTEX_INITIALIZER, R->winding, R->pf, R->fshape, R->pair, R->gpu};
         pthread_t th[64];
         for (int k = 0; k < R->nt; k++) pthread_create(&th[k], nullptr, praster_worker, &J);
         for (int k = 0; k < R->nt; k++) pthread_join(th[k], nullptr);
@@ -552,7 +568,7 @@ static void *praster_shards(void *arg) {
     free(shard); free(pooled); free(refbuf); return nullptr;
 }
 static int cmd_phase_raster(int argc, char **argv) {
-    if (argc < 5) { fprintf(stderr, "usage: ufsm phase-raster <codes-root> <key> <out-dir> [--axis A] [--radius 80] [--span 75] [--box z,y,x,nz,ny,nx] [--threads 4] [--block 256] [--pool 2] [--resume 1] [--winding 1] [--gs 4] [--codes-grid 1] [--mask-ref ROOT KEY] [--mask-tol 0.1]\n"); return 2; }
+    if (argc < 5) { fprintf(stderr, "usage: ufsm phase-raster <codes-root> <key> <out-dir> [--axis A] [--radius 80] [--span 75] [--box z,y,x,nz,ny,nx] [--threads 4] [--block 256] [--pool 2] [--resume 1] [--winding 1] [--gs 4] [--codes-grid 1] [--mask-ref ROOT KEY] [--mask-tol 0.1] [--gpu D] [--gpu-slots 2]\n"); return 2; }
     const int pool = atoi(opt(argc, argv, "--pool", "1")), resume = atoi(opt(argc, argv, "--resume", "0"));   /* --pool 2: write only the 9.6 um (2x circular-mean) phase; --resume: skip written shards */
     const int winding = atoi(opt(argc, argv, "--winding", "0"));   /* the winding mod 14 turns (band_winding) instead of the 1-turn phase */
     if (pool != 1 && pool != 2) { fprintf(stderr, "phase-raster: --pool 1|2\n"); return 2; }
@@ -603,13 +619,18 @@ static int cmd_phase_raster(int argc, char **argv) {
           mref = z3_open(store_open(argv[mi + 1]), argv[mi + 2], nullptr);
           if (!mref || memcmp(z3_meta_of(mref)->shape, shape, sizeof shape)) { fprintf(stderr, "phase-raster: --mask-ref %s %s: cannot open or its shape differs from the output grid\n", argv[mi + 1], argv[mi + 2]); return 1; }
       } }
-    praster_run R = {.mref = mref, .mtol = mtol, .z = z, .shape = shape, .ax = &ax, .bp = bp, .halo = (int)ceilf((pair == 2 ? 2 * bp.radius : (pair ? 0 : bp.span) + bp.radius) / (float)gs) + 2, .blk = blk, .winding = winding, .pf = pf, .pair = pair,
+    /* --gpu D: the pair rule (--pair 1) on device D (-1: the CPU); --gpu-slots K: block threads on the GPU at once (~0.4 GB each at
+       --block 256 / radius 160 / gs 4); the rest wait for a slot. Byte-identical either way (tests/test_band_pair.c). */
+    const int gpu = pair == 1 ? atoi(opt(argc, argv, "--gpu", "-1")) : -1;
+    if (gpu >= 0) { if (!band_pair_gpu) { fprintf(stderr, "phase-raster: this binary has no GPU pair rule (nn_band.o)\n"); return 2; } band_pair_gpu_slots(atoi(opt(argc, argv, "--gpu-slots", "2")), gpu); }
+    praster_run R = {.gpu = gpu, .mref = mref, .mtol = mtol, .z = z, .shape = shape, .ax = &ax, .bp = bp, .halo = (int)ceilf((pair == 2 ? 2 * bp.radius : (pair ? 0 : bp.span) + bp.radius) / (float)gs) + 2, .blk = blk, .winding = winding, .pf = pf, .pair = pair,
                      .fshape = fshape, .w = w, .pool = pool, .nt = nth < 1 ? 1 : nth > 64 ? 64 : nth, .list = list, .nlist = nlist, .t0 = now(), .mu = PTHREAD_MUTEX_INITIALIZER};
     pthread_t sth[64];
     for (int k = 1; k < nsh; k++) pthread_create(&sth[k], nullptr, praster_shards, &R);
     praster_shards(&R);
     for (int k = 1; k < nsh; k++) pthread_join(sth[k], nullptr);
     free(list);
+    if (gpu >= 0) band_pair_gpu_free();
     if (R.fail) return 1;
     const size_t nonempty = R.nonempty, nshards = nlist;
     if (z3w_close(w)) { fprintf(stderr, "%s\n", z3w_error()); return 1; }
@@ -4489,6 +4510,9 @@ int cmd_fields_pack(int argc, char **argv);   /* src/fieldspack.c */
 int cmd_ink_gate(int argc, char **argv);   /* src/inkgate.c */
 int cmd_fit_join(int argc, char **argv);   /* src/fitjoin.c */
 int cmd_wrap_check(int argc, char **argv);   /* src/wrapcheck.c */
+int cmd_annotate_serve(int argc, char **argv);   /* src/annot.c */
+int cmd_annot_export(int argc, char **argv);   /* src/annot_export.c */
+int cmd_annot_regions(int argc, char **argv);
 int cmd_fields_oracle(int argc, char **argv);   /* src/fieldsoracle.c */
 int cmd_flatten(int argc, char **argv);         /* src/flatten.c */
 int cmd_faces(int argc, char **argv);           /* src/faces_cli.c */
@@ -4519,6 +4543,8 @@ int cmd_spiral_fit(int argc, char **argv);    /* src/countfield.c */
 int cmd_cf_compare(int argc, char **argv);    /* src/countfield.c */
 int cmd_count_anat(int argc, char **argv);    /* src/countanat.c */
 int cmd_phase_packing(int argc, char **argv);   /* src/packmap.c */
+int cmd_field_diag(int argc, char **argv);   /* src/fielddiag.c */
+int cmd_fields_phase(int argc, char **argv);   /* src/fieldsphase.c */
 int cmd_wbench_stats(int argc, char **argv);   /* src/wbench.c */
 int cmd_ckpt_avg(int argc, char **argv);   /* src/wbench.c */
 int cmd_phase_conflict(int argc, char **argv);   /* src/packmap.c */
@@ -4554,6 +4580,9 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "fit")) return cmd_fit(argc, argv);
     if (!strcmp(cmd, "fit-join")) return cmd_fit_join(argc, argv);
     if (!strcmp(cmd, "wrap-check")) return cmd_wrap_check(argc, argv);
+    if (!strcmp(cmd, "annotate-serve")) return cmd_annotate_serve(argc, argv);
+    if (!strcmp(cmd, "annot-export")) return cmd_annot_export(argc, argv);
+    if (!strcmp(cmd, "annot-regions")) return cmd_annot_regions(argc, argv);
     if (!strcmp(cmd, "fields-oracle")) return cmd_fields_oracle(argc, argv);
     if (!strcmp(cmd, "flatten")) return cmd_flatten(argc, argv);
     if (!strcmp(cmd, "faces")) return cmd_faces(argc, argv);
@@ -4584,6 +4613,8 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "cf-compare")) return cmd_cf_compare(argc, argv);
     if (!strcmp(cmd, "count-anat")) return cmd_count_anat(argc, argv);
     if (!strcmp(cmd, "phase-packing")) return cmd_phase_packing(argc, argv);
+    if (!strcmp(cmd, "field-diag")) return cmd_field_diag(argc, argv);
+    if (!strcmp(cmd, "fields-phase")) return cmd_fields_phase(argc, argv);
     if (!strcmp(cmd, "wbench-stats")) return cmd_wbench_stats(argc, argv);
     if (!strcmp(cmd, "ckpt-avg")) return cmd_ckpt_avg(argc, argv);
     if (!strcmp(cmd, "phase-conflict")) return cmd_phase_conflict(argc, argv);
@@ -4599,6 +4630,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "coreline") && argc > 2 && !strcmp(argv[2], "check")) return cmd_coreline_check(argc, argv);
     if (!strcmp(cmd, "coreline")) return cmd_coreline(argc, argv);
     if (!strcmp(cmd, "render-sheets")) return cmd_render_sheets(argc, argv);
+    if (!strcmp(cmd, "sheet-pbr")) return cmd_sheet_pbr(argc, argv);
     if (!strcmp(cmd, "overlay-red")) return cmd_overlay_red(argc, argv);
     if (!strcmp(cmd, "tifxyz-scale")) return cmd_tifxyz_scale(argc, argv);
     if (!strcmp(cmd, "ink-compare")) return cmd_ink_compare(argc, argv);
@@ -4660,6 +4692,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "wrap-snap")) return cmd_wrap_snap(argc, argv);
     if (!strcmp(cmd, "surf-labels") || !strcmp(cmd, "wrap-anchor")) return cmd_surf_labels(argc, argv);
     if (!strcmp(cmd, "sheet-score")) return cmd_sheet_score(argc, argv);
+    if (!strcmp(cmd, "phase-coh")) return cmd_phase_coh(argc, argv);
     if (!strcmp(cmd, "patch-solve")) return cmd_patch_solve(argc, argv);
     if (!strcmp(cmd, "trace-prep")) return cmd_trace_prep(argc, argv);
     if (!strcmp(cmd, "patch-score")) return cmd_patch_score(argc, argv);

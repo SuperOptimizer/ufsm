@@ -109,6 +109,7 @@ struct unet {
     int l0rx; const void *l0x_ct; int l0x_held[16];   /* the network input in a ring (--gpu-input: rebuilt per slab from the CT channel); slot -> slab */
     void *l0r_hsk; size_t l0r_hskn;    /* the skip gradient's pinned host copy (stage S4's host mode: the device holds a ring) */
     size_t sc_w; float sc_c; float *stem_b;   /* scale_cond: offset of the conditioning vector, current scale code, effective stem bias */
+    size_t film_off, fstem_off; float film_c[4]; float *ffw;   /* cfg.film: the first A / D pair, the current codes, the forward copy of the weights (when nothing else copies them) */
     block enc[UNET_MAXLEV], dec[UNET_MAXLEV];
     convp down[UNET_MAXLEV], head;
     gnp dn[UNET_MAXLEV];          /* down_norm: GroupNorm after down[i] */
@@ -122,6 +123,7 @@ struct unet {
     float *xin;                              /* bf16 copy of the network input (act-bf16 mode) */
     float *muon_mom, *muon_work; size_t muon_work_n;   /* Muon momentum (np) and Newton-Schulz scratch */
     void *muon_descs; int muon_nconv, muon_maxco, muon_maxk;   /* batched Muon descriptor table (device) */
+    int muon_ninh, muon_part;                /* --init-lr-mult: inherited convs at the table's front (muon_part: the table was built so) */
     int mx_c, mx_hb; float mx_hb_mult;       /* Muon variants: Muon-C, Hyperball (eta = mx_hb_mult x the Muon lr) */
     void *mx_mcd, *mx_nsd; float *mx_pool; int mx_ns_maxm, mx_ns_maxn;   /* Muon-C tables and one frequency's scratch */
     int *mx_hbf; float *mx_R; double *mx_part; int mx_R_ok;   /* Hyperball flags, radii (device), sums; R valid */
@@ -237,6 +239,9 @@ struct unet {
     float *tb_dfr;                           /* ... cfg.attn_dinit 1: the grid tokens' frames (at_geom.dfr; inside tb_rb, filled by tb_geom) */
     size_t tb_p0;                            /* the attention stage's parameters: [tb_p0, np) (0 without a stage) */
     float trunk_lr;                          /* unet_set_trunk_lr: lr multiplier outside the stage (0 = 1) */
+    size_t *inh; int ninh, inh_cap;          /* parameter ranges [off, off + n) that unet_init_from* copied from a donor (sorted, merged;
+                                                kept through checkpoints: header key init_inh) */
+    int init_lr_on; float init_lr;           /* unet_set_init_lr: lr multiplier of the inherited ranges (train --init-lr-mult) */
     const float *tb_xg;                      /* unet_set_token_grad: extra gradient at the stage output tokens */
 };
 
@@ -297,6 +302,22 @@ static size_t add_block(unet *u, block *b, int cin, int cout, size_t off) {
     return off;
 }
 
+/* cfg.film: the FiLM'd norms, j < 2 L - 1: the encoder blocks' output norms (j < L), then the decoders' (level L - 2 down to 0); their A / D pairs in that order */
+static const gnp *film_norm(const unet *u, int j) { const int L = u->cfg.nlev; return j < L ? &u->enc[j].n2 : &u->dec[L - 2 - (j - L)].n2; }
+static void film_fwd(unet *u) {   /* the effective affines into the forward weights (a copy of the live weights: the one sparse24 / ws made, else ffw) */
+    if (!u->cfg.film) return;
+    if (u->wq) { fprintf(stderr, "unet: film needs dense fp32 master weights (no packed weights)\n"); abort(); }
+    if (u->fw == u->live) { if (!u->ffw) u->ffw = nn_malloc(u->np * 4); nn_d2d(u->ffw, u->live, u->np * 4); u->fw = u->ffw; }
+    size_t fo = u->film_off; const int K = u->cfg.film;
+    for (int j = 0; j < 2 * u->cfg.nlev - 1; j++) { const gnp *n = film_norm(u, j); nn_film_fwd(u->live, u->fw, n->gamma, n->beta, fo, n->c, K, u->film_c); fo += (size_t)2 * K * n->c; }
+}
+static void film_bwd(unet *u, float *g) {
+    if (!u->cfg.film) return;
+    size_t fo = u->film_off; const int K = u->cfg.film;
+    for (int j = 0; j < 2 * u->cfg.nlev - 1; j++) { const gnp *n = film_norm(u, j); nn_film_bwd(u->live, g, n->gamma, n->beta, fo, n->c, K, u->film_c); fo += (size_t)2 * K * n->c; }
+}
+size_t unet_fstem_off(const unet *u) { return u->fstem_off; }
+void unet_set_film(unet *u, const float *codes, int k) { for (int i = 0; i < 4; i++) u->film_c[i] = i < k && codes ? codes[i] : 0.f; }
 unet *unet_create(const unet_cfg *cfg) {
     unet *u = calloc(1, sizeof *u);
     u->cfg = *cfg;
@@ -364,6 +385,10 @@ unet *unet_create(const unet_cfg *cfg) {
     }
     if (cfg->emb_lev < 0 || (cfg->emb_lev > 0 && (cfg->emb_lev > L - 2 || cfg->emb_ch <= 0))) { fprintf(stderr, "unet: the distillation head takes decoder levels 1..%d and >= 1 channel\n", L - 2); abort(); }
     if (cfg->emb_lev) off = add_conv(u, &u->eh, dw_of(cfg, cfg->emb_lev), cfg->emb_ch, 1, 1, off);   /* (params last: older layouts unchanged) */
+    if (cfg->film < 0 || cfg->film > 4) { fprintf(stderr, "unet: film takes 0..4 codes\n"); abort(); }
+    if (cfg->film) { u->film_off = off; for (int j = 0; j < 2 * L - 1; j++) off += (size_t)2 * cfg->film * film_norm(u, j)->c; }   /* (params last: older layouts unchanged) */
+    if (cfg->fstem < 0 || cfg->fstem > 16 || (cfg->fstem && (cfg->fstem_out < 1 || cfg->fstem_out > 16))) { fprintf(stderr, "unet: fstem takes 1..16 channels and 1..16 outputs\n"); abort(); }
+    if (cfg->fstem) { u->fstem_off = off; off += (size_t)cfg->fstem * 64 + cfg->fstem + (size_t)cfg->fstem_out * cfg->fstem; }   /* (after film: last) */
     u->np = off;
     if (ufsm_env_on("UFSM_DEBUG")) {
         for (int i = 0; i < L; i++) fprintf(stderr, "enc%d c1.w %zu c1.b %zu n1 %zu c2.w %zu c2.b %zu n2 %zu\n", i, u->enc[i].c1.w, u->enc[i].c1.b, u->enc[i].n1.gamma, u->enc[i].c2.w, u->enc[i].c2.b, u->enc[i].n2.gamma);
@@ -397,7 +422,7 @@ void unet_free(unet *u) {
     if (!u) return;
     for (int i = 0; i < 4; i++) if (u->l0s_reg[i]) { lp_gn_slab_reg(u->l0s_reg[i], 0, 0, 0, 0); u->l0s_reg[i] = nullptr; }
     free_acts(u);
-    nn_free(u->p); nn_free(u->g); nn_free(u->m); nn_free(u->v); nn_free(u->ema); nn_free(u->hf_w); nn_free(u->l0fg_mx);
+    nn_free(u->p); nn_free(u->g); nn_free(u->m); nn_free(u->v); nn_free(u->ema); nn_free(u->hf_w); nn_free(u->l0fg_mx); free(u->inh);
     nn_free(u->gn_scratch); nn_free(u->red_scratch); nn_free(u->wg_tmp);
     nn_free(u->wm); nn_free(u->muon_mom); nn_free(u->muon_work); nn_free(u->muon_descs); nn_free(u->stem_b);
     nn_free(u->mx_mcd); nn_free(u->mx_nsd); nn_free(u->mx_pool); nn_free(u->mx_hbf); nn_free(u->mx_R); nn_free(u->mx_part); free(u->gn_frz); nn_free(u->gn_frz_d); free(u->gn_acc); nn_free(u->l0run); nn_free(u->l0live); nn_free(u->wsp); nn_free(u->l0s_st); nn_free(u->l0s_tmp); nn_free(u->l0st_g2); nn_free(u->l0st_up); nn_free(u->l0st_poison); nn_free(u->l0h_lg); for (int i = 0; i < UNET_MAXLEV; i++) free(u->rb[i]);
@@ -482,6 +507,7 @@ void unet_init(unet *u, uint64_t seed) {
             for (int i = 0; i < C; i++) h[u->view_b + i] = 0.f;
         }
     }
+    if (u->cfg.fstem) { const double sd = sqrt(2.0 / 64); for (size_t i = 0; i < (size_t)u->cfg.fstem * 64; i++) h[u->fstem_off + i] = (float)(sd * gauss(&seed)); }   /* (b1, W2 0) */
     nn_h2d(u->p, h, u->np * 4);
     nn_d2d(u->ema, u->p, u->np * 4);
     nn_zero(u->m, u->np * 4); nn_zero(u->v, u->np * 4);
@@ -2499,6 +2525,7 @@ const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x
     if (sp_on(u) && (!nn_get_tf32() || !ABF)) { fprintf(stderr, "unet: the spatial split needs the tensor-core path with 16-bit or MX storage\n"); abort(); }
     sp_cfg(u);
     unet_apply_sparse24(u);
+    film_fwd(u);   /* (cfg.film: the effective norm affines of this forward's codes; its backward reads them too) */
     if (u->cfg.scale_cond) {   /* stem bias b + c v for this forward (and the recompute passes of its backward) */
         const int c0 = u->enc[0].c1.cout;
         if (!u->stem_b) u->stem_b = nn_malloc((size_t)c0 * 4);
@@ -3729,6 +3756,7 @@ void unet_backward_x(unet *u, const void *gv, int g_h16) {
     if (share_enc_a1()) u->sea_stale = 1;   /* the decoders' a1 buffers now hold the encoders' */
     /* d/dv of the stem bias b + c v is c d/db (exact when the gradient was zeroed before this backward: one backward per step) */
     if (u->cfg.scale_cond) nn_axpy(g + u->sc_w, u->sc_c, g + u->enc[0].c1.b, (size_t)u->enc[0].c1.cout);
+    film_bwd(u, g);   /* (exact as the scale_cond term: the gradient was zeroed before this backward) */
     if (u->cfg.l0_norm == 3) ws_backward(u);
     g_in_bwd = 0;
 }
@@ -3748,6 +3776,33 @@ void unet_clip_grad(unet *u, double max_norm) {
     double n = unet_grad_norm(u);
     if (n > max_norm && n > 0) nn_scale(u->g, (float)(max_norm / n), u->np);
 }
+/* inherited parameter ranges (train --init-lr-mult): appended by the copy helpers, sorted and merged by inh_norm */
+static void inh_add(unet *u, size_t off, size_t n) {
+    if (!n) return;
+    if (u->ninh == u->inh_cap) { u->inh_cap = u->inh_cap ? 2 * u->inh_cap : 256; u->inh = realloc(u->inh, (size_t)u->inh_cap * 2 * sizeof *u->inh); }
+    u->inh[2 * u->ninh] = off; u->inh[2 * u->ninh + 1] = n; u->ninh++;
+}
+static int inh_cmp(const void *a, const void *b) { const size_t x = *(const size_t *)a, y = *(const size_t *)b; return (x > y) - (x < y); }
+static void inh_norm(unet *u) {
+    if (!u->ninh) return;
+    qsort(u->inh, (size_t)u->ninh, 2 * sizeof *u->inh, inh_cmp);
+    int k = 0;
+    for (int i = 0; i < u->ninh; i++) {
+        const size_t o = u->inh[2 * i], e = o + u->inh[2 * i + 1];
+        if (k && o <= u->inh[2 * (k - 1)] + u->inh[2 * (k - 1) + 1]) { size_t *q = &u->inh[2 * (k - 1)]; if (e > q[0] + q[1]) q[1] = e - q[0]; }
+        else { u->inh[2 * k] = o; u->inh[2 * k + 1] = e - o; k++; }
+    }
+    u->ninh = k;
+}
+static int inh_has(const unet *u, size_t off, size_t n) {   /* [off, off + n) lies inside one inherited range */
+    for (int i = 0; i < u->ninh; i++) if (off >= u->inh[2 * i] && off + n <= u->inh[2 * i] + u->inh[2 * i + 1]) return 1;
+    return 0;
+}
+static int inh_on(const unet *u) { return u->init_lr_on && u->ninh; }
+void unet_set_init_lr(unet *u, float mult) { u->init_lr_on = 1; u->init_lr = mult; }
+size_t unet_inherited(const unet *u) { size_t t = 0; for (int i = 0; i < u->ninh; i++) t += u->inh[2 * i + 1]; return t; }
+const size_t *unet_inherited_ranges(const unet *u, int *n) { *n = u->ninh; return u->inh; }
+void unet_params_d2h(const unet *u, float *host) { nn_d2h(host, u->p, u->np * 4); }
 static void wq_adamw(unet *u, float lr, float b1, float b2, float eps, float wd, int step);
 static void wq_ema(unet *u, float decay);
 static int trunk_lr_on(const unet *u);
@@ -3764,8 +3819,22 @@ static void head_split_adamw(unet *u, size_t off, size_t n, float lr, float b1, 
         pos = e;
     }
 }
+/* --init-lr-mult: [off, off + n) with the inherited ranges at init_lr x lr, the rest at lr */
+static void inh_split_adamw(unet *u, size_t off, size_t n, float lr, float b1, float b2, float eps, float wd, int step) {
+    const size_t end = off + n; size_t pos = off;
+    for (int i = 0; i < u->ninh && pos < end; i++) {
+        const size_t ro = u->inh[2 * i], re = ro + u->inh[2 * i + 1];
+        if (re <= pos) continue;
+        if (ro >= end) break;
+        if (ro > pos) { nn_adamw(u->p + pos, u->g + pos, u->m + pos, u->v + pos, ro - pos, lr, b1, b2, eps, wd, step); pos = ro; }
+        const size_t e = re < end ? re : end;
+        nn_adamw(u->p + pos, u->g + pos, u->m + pos, u->v + pos, e - pos, lr * u->init_lr, b1, b2, eps, wd, step); pos = e;
+    }
+    if (pos < end) nn_adamw(u->p + pos, u->g + pos, u->m + pos, u->v + pos, end - pos, lr, b1, b2, eps, wd, step);
+}
 void unet_adamw(unet *u, float lr, float b1, float b2, float eps, float wd, int step) {
     if (u->wq) wq_adamw(u, lr, b1, b2, eps, wd, step);
+    else if (inh_on(u)) inh_split_adamw(u, 0, u->np, lr, b1, b2, eps, wd, step);
     else if (trunk_lr_on(u)) {   /* the trunk [0, tb_p0) at trunk_lr x lr, the stage at lr */
         nn_adamw(u->p, u->g, u->m, u->v, u->tb_p0, lr * u->trunk_lr, b1, b2, eps, wd, step);
         nn_adamw(u->p + u->tb_p0, u->g + u->tb_p0, u->m + u->tb_p0, u->v + u->tb_p0, u->np - u->tb_p0, lr, b1, b2, eps, wd, step);
@@ -3800,6 +3869,7 @@ typedef struct { float lr, b1, b2, eps, wd; int step; } adam_arg;
 static int trunk_lr_on(const unet *u) { return u->tbn && u->trunk_lr > 0.f && u->trunk_lr != 1.f; }
 static void plain_adamw(unet *u, size_t off, size_t n, void *arg) {
     adam_arg *a = arg;
+    if (inh_on(u)) { inh_split_adamw(u, off, n, a->lr, a->b1, a->b2, a->eps, a->wd, a->step); return; }
     if (head_lr_mode(u)) { head_split_adamw(u, off, n, a->lr, a->b1, a->b2, a->eps, a->wd, a->step); return; }
     if (trunk_lr_on(u) && off < u->tb_p0) {   /* the trunk part at trunk_lr x lr, the stage's part (if the range reaches it) at lr */
         const size_t nt = off + n <= u->tb_p0 ? n : u->tb_p0 - off;
@@ -3821,7 +3891,7 @@ static void muon_conv(unet *u, const convp *c, void *arg) {
     muon_arg *a = arg; int K = c->cin * c->k * c->k * c->k; size_t n = (size_t)c->cout * K;
     size_t need = 2 * n + 2 * (size_t)c->cout * c->cout;
     if (u->muon_work_n < need) { if (u->muon_work) nn_free(u->muon_work); u->muon_work = nn_malloc(need * 4); u->muon_work_n = need; }
-    const float lr = trunk_lr_on(u) && c->w < u->tb_p0 ? a->lr * u->trunk_lr : a->lr;
+    const float lr = trunk_lr_on(u) && c->w < u->tb_p0 ? a->lr * u->trunk_lr : inh_on(u) && inh_has(u, c->w, n) ? a->lr * u->init_lr : a->lr;
     nn_muon(u->p + c->w, u->g + c->w, u->muon_mom + c->w, c->cout, K, lr, a->beta, a->wd, u->muon_work);
 }
 typedef struct { float *p; const float *g; float *mom, *X, *Y, *A, *B; int Co, K; } muon_desc_t;   /* mirrors nn.cu */
@@ -3837,6 +3907,16 @@ static void muon_collect(unet *u, const convp *c, void *arg) {
 static void muon_table(unet *u, muon_build_t *b) {   /* the descriptor table and its scratch pool, built once (offsets first, then pointers) */
     for_each_mat(u, muon_collect, b);
     if (u->muon_descs) return;
+    u->muon_ninh = 0; u->muon_part = inh_on(u);
+    if (inh_on(u)) {   /* --init-lr-mult: the inherited convs first (a stable partition), so one batch per learning rate */
+        muon_desc_t t[UNET_MAXCONV]; int k = 0;
+        for (int pass = 0; pass < 2; pass++) for (int i = 0; i < b->n; i++) {
+            const muon_desc_t *d = &b->h[i]; const size_t off = (size_t)(d->p - u->p), n = (size_t)d->Co * d->K;
+            if (inh_has(u, off, n) == !pass) t[k++] = *d;
+            if (!pass && inh_has(u, off, n)) u->muon_ninh++;
+        }
+        memcpy(b->h, t, sizeof(muon_desc_t) * (size_t)b->n);
+    }
     float *pool = nn_malloc(b->pool * 4);
     for (int i = 0; i < b->n; i++) { muon_desc_t *d = &b->h[i]; d->X = pool + (uintptr_t)d->X; d->Y = pool + (uintptr_t)d->Y; d->A = pool + (uintptr_t)d->A; d->B = pool + (uintptr_t)d->B; }
     u->muon_descs = nn_malloc(sizeof(muon_desc_t) * (size_t)b->n); nn_h2d(u->muon_descs, b->h, sizeof(muon_desc_t) * (size_t)b->n);
@@ -3920,7 +4000,12 @@ void unet_muon(unet *u, float lr_muon, float beta, float lr_adam, float b1, floa
         for_each_mat(u, muon_conv, &a);
     } else {
         if (!u->muon_descs) { muon_build_t b = {0}; muon_table(u, &b); }
-        if (trunk_lr_on(u)) {   /* the table is the trunk's convs, then the stage's 4 x tbn linears (for_each_mat): two batches */
+        if (inh_on(u) && !u->muon_part) { fprintf(stderr, "unet: --init-lr-mult set after the Muon table was built\n"); abort(); }
+        if (inh_on(u)) {   /* the inherited convs first (muon_table), then the fresh ones */
+            const int ni = u->muon_ninh, nf = u->muon_nconv - ni;
+            if (ni) nn_muon_batch(u->muon_descs, ni, u->muon_maxco, u->muon_maxk, lr_muon * u->init_lr, beta, wd);
+            if (nf) nn_muon_batch((const char *)u->muon_descs + sizeof(muon_desc_t) * (size_t)ni, nf, u->muon_maxco, u->muon_maxk, lr_muon, beta, wd);
+        } else if (trunk_lr_on(u)) {   /* the table is the trunk's convs, then the stage's 4 x tbn linears (for_each_mat): two batches */
             const int na = 4 * u->tbn, nt = u->muon_nconv - na;
             nn_muon_batch(u->muon_descs, nt, u->muon_maxco, u->muon_maxk, lr_muon * u->trunk_lr, beta, wd);
             nn_muon_batch((const char *)u->muon_descs + sizeof(muon_desc_t) * (size_t)nt, na, u->muon_maxco, u->muon_maxk, lr_muon, beta, wd);
@@ -4049,7 +4134,7 @@ void unet_gn_freeze(unet *u, const float *h) {
 void unet_blend_ema(unet *u, float a) { nn_scale(u->ema, 1.f - a, u->np); nn_axpy(u->ema, a, u->p, u->np); nn_wmemo_clear(); }
 const float *unet_ema_params(const unet *u) { return u->ema; }
 void unet_use_ema(unet *u, int on) { nn_wmemo_clear(); u->live = on ? u->ema : u->p; u->using_ema = on; if (!u->sparse24) u->fw = u->live; }
-const float *unet_fwd_params(const unet *u) { return u->fw; }
+const float *unet_fwd_params(const unet *u) { return u->cfg.film && u->fw == u->ffw ? u->live : u->fw; }   /* (film: the reader applies its own codes to the live weights) */
 /* ---- 2:4 structured sparsity: the forward reads a masked copy of the live weights; SR-STE keeps the master weights dense ---- */
 static void for_each_conv3(unet *u, void (*fn)(unet *, const convp *, void *), void *arg) {
     int L = u->cfg.nlev;
@@ -4165,6 +4250,8 @@ void unet_wquant(unet *u, unsigned seed) { (void)u; (void)seed; }   /* kept for 
 /* ---- checkpoints ---- */
 static int g_loaded_sparse = 0, g_loaded_wq = 0, g_loaded_muon = 0;   /* set by the header parser, applied by unet_load */
 static float g_loaded_hbR[UNET_MAXCONV]; static int g_loaded_hbR_n = 0;   /* Hyperball radii of the header */
+static size_t *g_loaded_inh; static int g_loaded_ninh;   /* init_inh of the header (pairs) */
+static void inh_add(unet *u, size_t off, size_t n);
 static int g_loaded_lat_c; static float g_loaded_lat_step, g_loaded_lat_gain[29], g_loaded_lat_bas[29 * 64];   /* the cell transform of the last header read */
 static long g_loaded_l0_n; static int g_loaded_l0_warm, g_loaded_l0_cnt; static float g_loaded_l0_mom, g_loaded_l0_run[16 * 256];   /* cfg.l0_norm ema */
 /* debug: per block, the GroupNorm statistics of the last forward (mean / rstd of a1 and a2 per sample and group:
@@ -4262,6 +4349,8 @@ int unet_save(const unet *u, const char *path, int step, const char *extra) {
     if (u->cfg.w4_2d) fprintf(f, ",\"w4_2d\":%d", u->cfg.w4_2d);
     if (u->cfg.ds_levels) fprintf(f, ",\"ds_levels\":%d", u->cfg.ds_levels);
     if (u->cfg.emb_lev) fprintf(f, ",\"emb_lev\":%d,\"emb_ch\":%d", u->cfg.emb_lev, u->cfg.emb_ch);
+    if (u->cfg.film) fprintf(f, ",\"film\":%d", u->cfg.film);
+    if (u->cfg.fstem) fprintf(f, ",\"fstem\":[%d,%d]", u->cfg.fstem, u->cfg.fstem_out);
     if (u->cfg.attn_blocks) fprintf(f,",\"attn_blocks\":%d,\"attn_pe\":%d,\"attn_reg\":%d,\"attn_mlp\":%d", u->cfg.attn_blocks, u->cfg.attn_pe, u->cfg.attn_reg, u->tbd.F);
     if (u->cfg.attn_vres) fprintf(f, ",\"attn_vres\":%d", u->cfg.attn_vres);
     if (u->cfg.attn_blocks && u->cfg.attn_axis) fprintf(f, ",\"attn_axis\":%d", u->cfg.attn_axis);
@@ -4286,6 +4375,9 @@ int unet_save(const unet *u, const char *path, int step, const char *extra) {
         float r[UNET_MAXCONV]; const int nr = u->mx_R_nload ? u->mx_R_nload : u->muon_nconv;
         if (u->mx_R_nload) memcpy(r, u->mx_R_load, (size_t)nr * 4); else nn_d2h(r, u->mx_R, (size_t)nr * 4);
         fputs(",\"hb_R\":[", f); for (int i = 0; i < nr; i++) fprintf(f, "%s%.9g", i ? "," : "", r[i]); fputc(']', f);
+    }
+    if (u->ninh) {   /* the parameter ranges an --init-from copied (train --init-lr-mult on a resumed run) */
+        fputs(",\"init_inh\":[", f); for (int i = 0; i < 2 * u->ninh; i++) fprintf(f, "%s%zu", i ? "," : "", u->inh[i]); fputc(']', f);
     }
     fprintf(f, ",\"extra\":%s}\n", extra ? extra : "{}");
     float *h = malloc(u->np * 4);
@@ -4323,6 +4415,8 @@ static int read_header(FILE *f, unet_cfg *cfg, int *step, size_t *np) {
     if ((p = strstr(line, "\"ds_levels\":"))) cfg->ds_levels = atoi(p + 12);
     cfg->emb_lev = (p = strstr(line, "\"emb_lev\":")) ? atoi(p + 10) : 0;
     cfg->emb_ch = (p = strstr(line, "\"emb_ch\":")) ? atoi(p + 9) : 0;
+    cfg->film = (p = strstr(line, "\"film\":")) ? atoi(p + 7) : 0;
+    cfg->fstem = cfg->fstem_out = 0; if ((p = strstr(line, "\"fstem\":["))) { cfg->fstem = atoi(p + 9); const char *q = strchr(p + 9, ','); cfg->fstem_out = q ? atoi(q + 1) : 0; }
     if ((p = strstr(line, "\"attn_blocks\":"))) cfg->attn_blocks = atoi(p + 14);
     if ((p = strstr(line, "\"attn_pe\":"))) cfg->attn_pe = atoi(p + 10);
     if ((p = strstr(line, "\"attn_reg\":"))) cfg->attn_reg = atoi(p + 11);
@@ -4344,6 +4438,16 @@ static int read_header(FILE *f, unet_cfg *cfg, int *step, size_t *np) {
     if ((p = strstr(line, "\"wq\":"))) g_loaded_wq = atoi(p + 5);
     if ((p = strstr(line, "\"muon_mom\":"))) g_loaded_muon = atoi(p + 11);
     g_loaded_hbR_n = 0;
+    g_loaded_ninh = 0;
+    if ((p = strstr(line, "\"init_inh\":["))) {
+        p += 12; int cap = 0;
+        while (*p && *p != ']') {
+            if (2 * g_loaded_ninh + 2 > cap) { cap = cap ? 2 * cap : 512; g_loaded_inh = realloc(g_loaded_inh, (size_t)cap * sizeof *g_loaded_inh); }
+            g_loaded_inh[2 * g_loaded_ninh] = strtoull(p, (char **)&p, 10); if (*p == ',') p++;
+            g_loaded_inh[2 * g_loaded_ninh + 1] = strtoull(p, (char **)&p, 10); if (*p == ',') p++;
+            g_loaded_ninh++;
+        }
+    }
     if ((p = strstr(line, "\"hb_R\":["))) { p += 8; while (g_loaded_hbR_n < UNET_MAXCONV && *p && *p != ']') { g_loaded_hbR[g_loaded_hbR_n++] = strtof(p, (char **)&p); if (*p == ',') p++; } }
     if ((p = strstr(line, "\"l0_norm\":"))) cfg->l0_norm = atoi(p + 10);
     if ((p = strstr(line, "\"l0_slab\":"))) cfg->l0_slab = atoi(p + 10);
@@ -4392,6 +4496,7 @@ int unet_load(unet *u, const char *path) {
     free(h);
     fclose(f);
     u->mx_R_nload = g_loaded_hbR_n; memcpy(u->mx_R_load, g_loaded_hbR, (size_t)g_loaded_hbR_n * 4); u->mx_R_ok = 0;   /* none: from the weights */
+    u->ninh = 0; for (int i = 0; i < g_loaded_ninh; i++) inh_add(u, g_loaded_inh[2 * i], g_loaded_inh[2 * i + 1]);   /* (none: all fresh) */
     if (g_loaded_lat_c && u->cfg.cin == g_loaded_lat_c + 3) unet_set_lat_basis(u, g_loaded_lat_bas, g_loaded_lat_gain, g_loaded_lat_c, g_loaded_lat_step);
     if (g_loaded_sparse) unet_set_sparse24(u, 1);
     if (g_loaded_wq) unet_set_wq(u, g_loaded_wq);
@@ -4445,6 +4550,7 @@ int unet_load_grow(unet *u, const char *path, int keep, float new_bias) {
    everything else keeps its fresh initialisation, optimiser state starts at zero. Returns the number of copied tensors or -1. */
 static int copy_conv(unet *u, const unet *o, const convp *a, const convp *b) {
     if (a->cin != b->cin || a->cout != b->cout || a->k != b->k || a->stride != b->stride) return 0;
+    inh_add(u, a->w, (size_t)a->cout * a->cin * a->k * a->k * a->k); inh_add(u, a->b, (size_t)a->cout);
     const size_t nw = (size_t)a->cout * a->cin * a->k * a->k * a->k;
     nn_d2d(u->p + a->w, o->p + b->w, nw * 4); nn_d2d(u->ema + a->w, o->ema + b->w, nw * 4);
     nn_d2d(u->p + a->b, o->p + b->b, (size_t)a->cout * 4); nn_d2d(u->ema + a->b, o->ema + b->b, (size_t)a->cout * 4);
@@ -4452,6 +4558,7 @@ static int copy_conv(unet *u, const unet *o, const convp *a, const convp *b) {
 }
 static int copy_gn(unet *u, const unet *o, const gnp *a, const gnp *b) {
     if (a->c != b->c) return 0;
+    inh_add(u, a->gamma, (size_t)a->c); inh_add(u, a->beta, (size_t)a->c);
     nn_d2d(u->p + a->gamma, o->p + b->gamma, (size_t)a->c * 4); nn_d2d(u->ema + a->gamma, o->ema + b->gamma, (size_t)a->c * 4);
     nn_d2d(u->p + a->beta, o->p + b->beta, (size_t)a->c * 4); nn_d2d(u->ema + a->beta, o->ema + b->beta, (size_t)a->c * 4);
     return 1;
@@ -4482,6 +4589,7 @@ int unet_init_from(unet *u, const char *path) { return unet_init_from_map(u, pat
 static int copy_conv_in(unet *u, const unet *o, const convp *a, const convp *b) {
     if (a->cin < b->cin || a->cout != b->cout || a->k != b->k || a->stride != b->stride) return 0;
     const size_t k3 = (size_t)a->k * a->k * a->k, ra = (size_t)a->cin * k3, rb = (size_t)b->cin * k3;
+    inh_add(u, a->w, (size_t)a->cout * ra); inh_add(u, a->b, (size_t)a->cout);
     for (int e = 0; e < 2; e++) {
         float *dst = e ? u->ema : u->p; const float *sp = e ? o->ema : o->p;
         nn_zero(dst + a->w, (size_t)a->cout * ra * 4);
@@ -4499,7 +4607,7 @@ int unet_init_from_map(unet *u, const char *path, const int *head_rows) {
     if (unet_peek(path, &oc, &step) || oc.cin > u->cfg.cin) return -1;   /* (more inputs: the stem grows, copy_conv_in) */
     unet *o = unet_create(&oc);
     if (unet_load(o, path) < 0) { unet_free(o); return -1; }
-    int n = 0;
+    int n = 0; u->ninh = 0;
     if (S >= oc.nlev) { unet_free(o); return -1; }
     const int L = u->cfg.nlev < oc.nlev - S ? u->cfg.nlev : oc.nlev - S;
     for (int i = 0; i < L; i++) {
@@ -4526,11 +4634,22 @@ int unet_init_from_map(unet *u, const char *path, const int *head_rows) {
                 nn_d2d(dst + u->head.w + co * row, sp + o->head.w + src * row, row * 4);
                 nn_d2d(dst + u->head.b + co, sp + o->head.b + src, 4);
             }
+            inh_add(u, u->head.w + co * row, row); inh_add(u, u->head.b + co, 1);
         }
         n++;
     } else { unet_free(o); return -1; }
+    const size_t nfu = (u->fstem_off ? u->fstem_off : u->np) - u->film_off, nfo = (o->fstem_off ? o->fstem_off : o->np) - o->film_off;   /* (the FiLM block: before the stem) */
+    if (!S && u->cfg.film && oc.film == u->cfg.film && u->film_off && nfo == nfu) {   /* the donor's FiLM pairs (same widths) */
+        const size_t nf = nfu;
+        int same = 1; for (int j = 0; j < 2 * L - 1; j++) same &= film_norm(u, j)->c == film_norm(o, j)->c;
+        if (same) { nn_d2d(u->p + u->film_off, o->p + o->film_off, nf * 4); nn_d2d(u->ema + u->film_off, o->ema + o->film_off, nf * 4); inh_add(u, u->film_off, nf); n++; }
+    }
+    if (!S && u->cfg.fstem && oc.fstem == u->cfg.fstem && oc.fstem_out == u->cfg.fstem_out) {   /* the donor's stem */
+        const size_t nf = u->np - u->fstem_off; nn_d2d(u->p + u->fstem_off, o->p + o->fstem_off, nf * 4); nn_d2d(u->ema + u->fstem_off, o->ema + o->fstem_off, nf * 4); inh_add(u, u->fstem_off, nf); n++;
+    }
     if (!S && u->cfg.scale_cond && oc.scale_cond && u->enc[0].c1.cout == o->enc[0].c1.cout) {
         nn_d2d(u->p + u->sc_w, o->p + o->sc_w, (size_t)u->enc[0].c1.cout * 4); nn_d2d(u->ema + u->sc_w, o->ema + o->sc_w, (size_t)u->enc[0].c1.cout * 4); n++;
+        inh_add(u, u->sc_w, (size_t)u->enc[0].c1.cout);
     }
     for (int i = 0; i < L; i++) for (int k = 0; k < u->cfg.enc_blocks[i]; k++) {   /* residual blocks: the donor's, or identity blocks whose output
                                                                                     normalisation is the level's (the net then computes the donor's function) */
@@ -4559,13 +4678,15 @@ int unet_init_from_map(unet *u, const char *path, const int *head_rows) {
             }
             const int nb = u->tbn < o->tbn ? u->tbn : o->tbn;
             if (u->tbd.dCo == o->tbd.dCo && u->tbd.dInit == o->tbd.dInit)
-                for (int k = 0; k < nb; k++) nn_d2d(dst + u->tbp[k].ln1g, sp + o->tbp[k].ln1g, at_block_nparams(&u->tbd) * 4);   /* (one contiguous block) */
+                for (int k = 0; k < nb; k++) { nn_d2d(dst + u->tbp[k].ln1g, sp + o->tbp[k].ln1g, at_block_nparams(&u->tbd) * 4); if (!e) inh_add(u, u->tbp[k].ln1g, at_block_nparams(&u->tbd)); }   /* (one contiguous block;
+                                                     the stage's other copied pieces count as fresh for --init-lr-mult) */
             else for (int k = 0; k < nb; k++) dfm_copy_block(u, o, k, dst, sp);   /* (another deformable layout: tensor by tensor) */
         }
         n += (u->tbn < o->tbn ? u->tbn : o->tbn) + 1;
     }
     if (u->cfg.emb_lev && u->cfg.emb_lev == oc.emb_lev && u->cfg.emb_ch == oc.emb_ch) n += copy_conv(u, o, &u->eh, &o->eh);   /* the donor's distillation head */
     unet_free(o);
+    inh_norm(u);
     nn_zero(u->m, u->np * 4); nn_zero(u->v, u->np * 4);
     if (u->muon_mom) nn_zero(u->muon_mom, u->np * 4);
     u->mx_R_nload = 0; u->mx_R_ok = 0;   /* Hyperball radii from the copied weights */

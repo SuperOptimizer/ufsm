@@ -90,6 +90,13 @@ typedef struct {
                               params appended last, after everything else); a training forward computes its fp32 outputs (unet_emb_logits),
                               the trainer's loss gradient comes back through unet_set_emb_grad and joins the level's gradient before its
                               decoder backward. The main head's outputs do not depend on it (a donor's function is unchanged) */
+    int film;              /* K > 0 (<= 4): per-level scale FiLM: every encoder / decoder block's output GroupNorm affine is gamma (1 + sum_k c_k A_k),
+                              beta + sum_k c_k D_k, with c the window's K codes (unet_set_film: e.g. log2(um / 4.8) of the grid and of the data) and A / D
+                              learned per channel (params appended last, zero-initialised: the net computes its donor's function until they move;
+                              header key "film" only when on). B 1 (one code vector per forward) */
+    int fstem, fstem_out;  /* C > 0 (<= 16): the fine voxel stem of a latent-grid net (nn_fstem_fwd: 4^3 taps at stride 2 of the CT channel, C silu
+                              features, a projection to fstem_out (<= 16) head outputs added on the logits by the trainer's head slabs). Params
+                              appended last (W1 He-initialised, b1 and the projection zero: the donor's function), header key "fstem" only when on */
 } unet_cfg;
 /* the attention stage reads the scroll axis records (unet_set_attn_axis): radial attention, scroll RoPE or normal-frame deformable offsets */
 static inline int unet_cfg_axis(const unet_cfg *c) { return c->attn_blocks > 0 && (c->attn_axis == 1 || c->attn_pe == 3 || (c->attn_deform && c->attn_dinit == 1)); }
@@ -105,6 +112,9 @@ static inline float unet_scale_code(double um) { return um > 0 ? (float)log2(um 
 void unet_set_scale(unet *u, double um);
 /* the conditioning code c itself (scale_cond nets used for another scalar, e.g. task papyrus: the cutoff in input units) */
 void unet_set_cond(unet *u, float c);
+/* cfg.film nets: the K codes of the following forward passes (and their backward) */
+void unet_set_film(unet *u, const float *codes, int k);
+size_t unet_fstem_off(const unet *u);   /* cfg.fstem: the stem's parameters (W1, b1, W2) in the flat parameters */
 void unet_free(unet *u);
 const unet_cfg *unet_cfg_of(const unet *u);
 size_t unet_nparams(const unet *u);
@@ -146,6 +156,10 @@ void unet_set_muon_ext(unet *u, int muonc, int hyperball, float hb_mult);
 /* learning-rate multiplier of every parameter outside the attention stage (the conv trunk: Muon matrices and AdamW parameters alike;
    default 1); the attention stage keeps the scheduled rates. unet_muon / unet_adamw */
 void unet_set_trunk_lr(unet *u, float mult);
+void unet_set_init_lr(unet *u, float mult);   /* train --init-lr-mult: lr x mult for the parameters unet_init_from* copied (kept in checkpoints) */
+size_t unet_inherited(const unet *u);          /* how many parameters are marked inherited */
+const size_t *unet_inherited_ranges(const unet *u, int *n);   /* the inherited ranges as (offset, count) pairs, sorted, merged */
+void unet_params_d2h(const unet *u, float *host);             /* the live parameters (unet_nparams floats) to the host */
 void unet_anvil(unet *u, float lr, float wd, int step, int steps, float lr_adam, float b1, float b2, float eps, float wd_adam);   /* ANVIL II on the 3^3 conv weights, AdamW elsewhere */
 void unet_adamw(unet *u, float lr, float b1, float b2, float eps, float wd, int step);
 void unet_ema(unet *u, float decay);

@@ -380,6 +380,17 @@ void nn_gn_apply(const float *x, shape5 s, int G, const float *gamma, const floa
 void nn_silu_fwd(const float *x, size_t n, float *y);
 void nn_silu_bwd(const float *x, const float *gy, size_t n, float *gx);   /* gx SET */
 void nn_axpy(float *y, float a, const float *x, size_t n);               /* y += a x */
+/* unet cfg.film (src/nn_film.cu): a GroupNorm's effective gamma / beta (offsets gam / bet, C channels) from its K x C pairs A, D at fo and the
+   K host codes, written into fw; the backward turns the effective pair's gradient in g into gamma's, A's and D's */
+void nn_film_fwd(const float *p, float *fw, size_t gam, size_t bet, size_t fo, int C, int K, const float *codes);
+void nn_film_bwd(const float *p, float *g, size_t gam, size_t bet, size_t fo, int C, int K, const float *codes);
+/* the Gram of K planes of 16-bit values (bf16 1, else fp16) with row stride ld over N entries: S[i K + j] += sum_n x_i x_j for j >= i (src/nn_gram.cu; train --grad-cos) */
+void nn_gram16(const void *x, int bf16, int K, size_t N, size_t ld, double *S);
+/* the fine voxel stem (src/nn_fstem.cu, train --fstem): params W1 [C][64] (4^3 taps at stride 2), b1 [C], W2 [nout][C]; fwd adds W2 silu(W1 x + b1)
+   to the fp16 logit planes chs[o] (slab planes [z0, z0 + nz) of a D x H x W window, ns voxels a plane) on each 2^3 block; bwd accumulates the
+   parameter gradients from fp16 gradient planes of that layout into gp. 1: a shape the kernels do not take (odd sizes, C or nout > 16) */
+int nn_fstem_fwd(const void *x, int D, int H, int W, int z0, int nz, const float *p, int C, int nout, const int *chs, void *lg, size_t ns);
+int nn_fstem_bwd(const void *x, int D, int H, int W, int z0, int nz, const float *p, int C, int nout, const int *chs, const void *g, size_t ns, float *gp);
 void nn_scale(float *y, float a, size_t n);
 void nn_u8_to_f32(const uint8_t *x, size_t n, float scale, float *y);
 
@@ -441,6 +452,16 @@ void nn_aff_loss_fetch(const float *fin, int K, float *out);
 void nn_set_pos_weight(float w);   /* BCE weight of positive targets (class balance), default 1 */
 void nn_loss_fetch(const float *scratch, shape5 s, float *out);
 void nn_loss_grad_scale(void *g, size_t n, float a);   /* scale a logit gradient (the losses' storage format) */
+/* train --fib-normal-lambda (src/nn_loss.cu): lambda x mean t^T N t at fibre voxels; N the sign-free normal dyad of the six normal logits
+   at lg (planes of ns, the slab's voxels; fp16 / fp32 as nn_set_logits_h16), t the tube axis of the fibre plane fib (prob254, 255 unknown,
+   indexed by window voxel; D H W the window) from its gradient structure tensor over (2r + 1)^3, at voxels >= thr whose stencil lies in
+   the slab planes [z0, z1), and (nm non-null: planes of ns, the normal loss mask) only where nm is 0. mode 0: acc[0] += valid voxels, acc[1] += t^T N t; mode 1: their per-voxel gradients d(t^T N t) / dlogit into
+   list (cap entries, *nl the count: zero it per slab). nn_fibn_apply adds lambda / acc[0] x the list into the gradient gl (the losses'
+   storage format, planes of ns: call after the normal loss wrote it) */
+size_t nn_fibn_cap(size_t ns);
+size_t nn_fibn_list_bytes(size_t cap);
+void nn_fibn(const void *lg, size_t ns, const uint8_t *fib, int D, int H, int W, int z0, int z1, int r, int thr, const uint8_t *nm, double *acc, void *list, unsigned *nl, size_t cap, int mode);
+void nn_fibn_apply(const void *list, const unsigned *nl, size_t cap, const double *acc, float lambda, void *gl, size_t ns);
 /* Sparse trilinear samples. Ownership is global z in [own_lo,own_hi), so a
    sample crossing a split boundary is reduced once and its corners get the
    correct local gradients. coords is host [np][3], values host [np][2]. */

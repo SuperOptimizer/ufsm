@@ -36,6 +36,8 @@ static uint8_t o_shift(int z, int y, int x) { (void)z; (void)y; return sheet_at(
 static uint8_t o_miss(int z, int y, int x) { const uint8_t c = gt(z, y, x); return c == 1 + 18 * 4 ? 0 : c; }
 static uint8_t o_plus1(int z, int y, int x) { const uint8_t c = gt(z, y, x); return c ? (uint8_t)(1 + (c - 1 + 18) % 252) : 0; }
 static uint8_t o_half(int z, int y, int x) { const uint8_t c = gt(z, y, x); return c && y >= 64 ? (uint8_t)(1 + (c - 1 + 18) % 252) : c; }
+static uint8_t m_half(int z, int y, int x) { (void)z; (void)x; return y >= 64; }   /* --mask: the half with the +1 turn gated out */
+static const char *v_mask;
 static uint8_t o_extra(int z, int y, int x) { const uint8_t c = gt(z, y, x); return c ? c : x == 28 ? (uint8_t)(1 + 18 * 2 + 9) : 0; }
 
 static double v_recall, v_prec, v_cell, v_glob; static int v_off;
@@ -43,8 +45,9 @@ static int score(const char *root, const char *ours, const char *tol, const char
     char o[700], g[700], out[700]; snprintf(o, sizeof o, "%s/%s", root, ours); snprintf(g, sizeof g, "%s/gt", root); snprintf(out, sizeof out, "%s/out.txt", root);
     fflush(stdout); FILE *sv = fopen(out, "w"); if (!sv) return -1;
     const int fd = dup(fileno(stdout)); dup2(fileno(sv), fileno(stdout));
-    char *av[] = {"ufsm", "sheet-score", o, "1", g, "1", "--tol", (char *)tol, "--prec-r", "6", "--cell", "32", "--block", "64", "--threads", (char *)th};
-    const int rc = cmd_sheet_score((int)(sizeof av / sizeof *av), av);
+    char mk[700]; snprintf(mk, sizeof mk, "%s/%s", root, v_mask ? v_mask : "");
+    char *av[] = {"ufsm", "sheet-score", o, "1", g, "1", "--tol", (char *)tol, "--prec-r", "6", "--cell", "32", "--block", "64", "--threads", (char *)th, "--mask", mk, "1"};
+    const int rc = cmd_sheet_score((int)(sizeof av / sizeof *av) - (v_mask ? 0 : 3), av);
     fflush(stdout); dup2(fd, fileno(stdout)); close(fd); fclose(sv);
     FILE *f = fopen(out, "r"); char line[512]; v_recall = v_prec = v_cell = v_glob = -1; v_off = -1;
     while (f && fgets(line, sizeof line, f)) {
@@ -64,7 +67,7 @@ static int score(const char *root, const char *ours, const char *tol, const char
 int main(void) {
     char root[256]; snprintf(root, sizeof root, "%s/test_sheetscore_%d", getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp", (int)getpid());
     char cmd[400]; snprintf(cmd, sizeof cmd, "rm -rf %s && mkdir -p %s", root, root); if (system(cmd)) return 1;
-    struct { const char *n; uint8_t (*f)(int, int, int); } A[] = {{"gt", gt}, {"same", o_same}, {"shift", o_shift}, {"miss", o_miss}, {"plus1", o_plus1}, {"half", o_half}, {"extra", o_extra}};
+    struct { const char *n; uint8_t (*f)(int, int, int); } A[] = {{"gt", gt}, {"same", o_same}, {"shift", o_shift}, {"miss", o_miss}, {"plus1", o_plus1}, {"half", o_half}, {"extra", o_extra}, {"mhalf", m_half}};
     for (size_t i = 0; i < sizeof A / sizeof *A; i++) { char p[600]; snprintf(p, sizeof p, "%s/%s", root, A[i].n); if (put(p, A[i].f)) { fprintf(stderr, "FAIL: write %s\n", A[i].n); return 1; } }
     CHECK(!score(root, "same", "1", "1") && NEAR(v_recall, 1) && NEAR(v_prec, 1) && NEAR(v_cell, 1) && NEAR(v_glob, 1) && v_off == 0, "identical: %g %g %g %g %d", v_recall, v_prec, v_cell, v_glob, v_off);
     const double r1 = v_recall, p1 = v_prec, c1 = v_cell;
@@ -74,6 +77,7 @@ int main(void) {
     CHECK(!score(root, "miss", "1", "4") && NEAR(v_recall, 0.9) && NEAR(v_prec, 1), "missing sheet: %g %g", v_recall, v_prec);
     CHECK(!score(root, "plus1", "1", "4") && NEAR(v_glob, 1) && v_off == 1, "plus one turn: %g offset %d", v_glob, v_off);
     CHECK(!score(root, "half", "1", "4") && NEAR(v_glob, 0.5) && NEAR(v_cell, 1), "half +1 turn: global %g cell %g", v_glob, v_cell);
+    v_mask = "mhalf"; CHECK(!score(root, "half", "1", "4") && NEAR(v_glob, 1) && NEAR(v_cell, 1) && fabs(v_recall - 0.5) < 0.02, "half +1 turn, masked: global %g cell %g recall %g", v_glob, v_cell, v_recall); v_mask = nullptr;
     CHECK(!score(root, "extra", "1", "4") && v_prec < 0.95 && NEAR(v_recall, 1), "extra sheet: precision %g recall %g", v_prec, v_recall);
     snprintf(cmd, sizeof cmd, "rm -rf %s", root); if (system(cmd)) {}
     if (fails) { fprintf(stderr, "test_sheetscore: %d failure(s)\n", fails); return 1; }

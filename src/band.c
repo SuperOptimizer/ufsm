@@ -40,7 +40,9 @@ static void envelope(const float *f, const int32_t *src, int n, float *d, int32_
    run on tiles of ET consecutive x lines (rows of ET contiguous values gathered, one envelope per column, scattered back): one
    strided line at a time missed the cache on every element (5x slower); the envelopes and so the result are the same. */
 enum { ET = 64 };
-/* cap2: squared distances over it are dropped between the passes (every result within cap2 is exact; the rest may come out unknown) */
+/* cap2: squared distances over it are dropped between the passes (every result within cap2 is exact; the rest may come out unknown).
+   d2 nullptr: only the feature index (lean: 4 bytes a voxel instead of 8); the passes rebuild each squared distance from the index, the
+   same exact integer (< 2^24) the stored floats held, so the indices come out identical. */
 static int edt_feature_cap(const uint8_t *seed, const int n[3], float cap2, float *d2, int32_t *idx) {
     const int nz = n[0], ny = n[1], nx = n[2], m = nz > ny ? (nz > nx ? nz : nx) : (ny > nx ? ny : nx);
     float *f = malloc((size_t)m * ET * 4), *dl = malloc((size_t)m * 4), *z = malloc((size_t)(m + 1) * 4);
@@ -48,16 +50,16 @@ static int edt_feature_cap(const uint8_t *seed, const int n[3], float cap2, floa
     if (!f || !dl || !z || !sr || !sl || !v) { free(f); free(dl); free(z); free(sr); free(sl); free(v); return -1; }
     const size_t sy = (size_t)nx, sz = (size_t)ny * nx;
     for (size_t li = 0; li < (size_t)nz * ny; li++) {   /* x: the nearest seed of the line by two sweeps (equidistant: the left one, as the envelope) */
-        const uint8_t *sd = seed + li * sy; float *dr = d2 + li * sy; int32_t *ir = idx + li * sy;
+        const uint8_t *sd = seed + li * sy; float *dr = d2 ? d2 + li * sy : nullptr; int32_t *ir = idx + li * sy;
         int last = -1;
         for (int q = 0; q < nx; q++) { if (sd[q]) last = q; ir[q] = last; }
         int next = -1;
         for (int q = nx - 1; q >= 0; q--) {
             if (sd[q]) next = q;
             const int l = ir[q], best = l < 0 ? next : next < 0 ? l : (q - l <= next - q ? l : next);
-            if (best < 0) { dr[q] = BINF; ir[q] = -1; continue; }
+            if (best < 0) { if (dr) dr[q] = BINF; ir[q] = -1; continue; }
             const float d = (float)(q - best) * (float)(q - best);
-            if (d > cap2) { dr[q] = BINF; ir[q] = -1; } else { dr[q] = d; ir[q] = (int32_t)(li * sy + (size_t)best); }
+            if (d > cap2) { if (dr) dr[q] = BINF; ir[q] = -1; } else { if (dr) dr[q] = d; ir[q] = (int32_t)(li * sy + (size_t)best); }
         }
     }
     for (int ax = 1; ax < 3; ax++) {   /* y, then z: tiles of ET x lines */
@@ -68,16 +70,32 @@ static int edt_feature_cap(const uint8_t *seed, const int n[3], float cap2, floa
             for (int x0 = 0; x0 < nx; x0 += ET) {
                 const int w = nx - x0 < ET ? nx - x0 : ET;
                 for (int q = 0; q < L; q++) {   /* gather: column t of the tile is line x0 + t, stored contiguously at t * L */
-                    const float *dp = d2 + base0 + q * st + x0; const int32_t *ip = idx + base0 + q * st + x0;
-                    for (int t = 0; t < w; t++) { const float fv = dp[t]; f[(size_t)t * L + q] = fv > cap2 ? BINF : fv; sr[(size_t)t * L + q] = ip[t]; }
+                    const int32_t *ip = idx + base0 + q * st + x0;
+                    if (d2) { const float *dp = d2 + base0 + q * st + x0;
+                        for (int t = 0; t < w; t++) { const float fv = dp[t]; f[(size_t)t * L + q] = fv > cap2 ? BINF : fv; sr[(size_t)t * L + q] = ip[t]; }
+                    } else {   /* no d2 (the lean mode): the squared distance from the feature index, the same exact integer the passes store */
+                        const int64_t row = (int64_t)(base0 + q * st);   /* flat index of (this line's z, y, x = 0) */
+                        for (int t = 0; t < w; t++) {
+                            const int32_t fi = ip[t]; float fv = BINF;
+                            if (fi >= 0) {
+                                const int64_t x = x0 + t; int64_t dy = 0, dx;
+                                if (ax == 1) dx = x - ((int64_t)fi - row);   /* after the x pass: the feature is on this x line */
+                                else { const int64_t r = (int64_t)fi - (int64_t)q * (int64_t)sz, fy = r / (int64_t)sy;   /* after y: in this z plane */
+                                       dy = (int64_t)o - fy; dx = x - (r - fy * (int64_t)sy); }
+                                fv = (float)(dy * dy + dx * dx);
+                            }
+                            f[(size_t)t * L + q] = fv > cap2 ? BINF : fv; sr[(size_t)t * L + q] = fi;
+                        }
+                    }
                 }
                 for (int t = 0; t < w; t++) {
                     envelope(f + (size_t)t * L, sr + (size_t)t * L, L, dl, sl, v, z);
                     memcpy(f + (size_t)t * L, dl, (size_t)L * 4); memcpy(sr + (size_t)t * L, sl, (size_t)L * 4);
                 }
                 for (int q = 0; q < L; q++) {   /* scatter */
-                    float *dp = d2 + base0 + q * st + x0; int32_t *ip = idx + base0 + q * st + x0;
-                    for (int t = 0; t < w; t++) { dp[t] = f[(size_t)t * L + q]; ip[t] = sr[(size_t)t * L + q]; }
+                    int32_t *ip = idx + base0 + q * st + x0;
+                    if (d2) { float *dp = d2 + base0 + q * st + x0; for (int t = 0; t < w; t++) dp[t] = f[(size_t)t * L + q]; }
+                    for (int t = 0; t < w; t++) ip[t] = sr[(size_t)t * L + q];
                 }
             }
         }
@@ -210,12 +228,12 @@ int band_field_phase(const uint8_t *codes, const int n[3], const int64_t o[3], c
 
 int band_field_side_pair(const uint8_t *codes, const int n[3], float rmax, int margin, uint8_t *side) {
     const size_t N = (size_t)n[0] * n[1] * n[2], sy = (size_t)n[2], sz = (size_t)n[1] * n[2];
-    uint8_t *seed = malloc(N); float *d2 = malloc(N * 4); int32_t *id[4] = {malloc(N * 4), malloc(N * 4), malloc(N * 4), malloc(N * 4)};
-    int rc = !seed || !d2 || !id[0] || !id[1] || !id[2] || !id[3];
+    uint8_t *seed = malloc(N); int32_t *id[4] = {malloc(N * 4), malloc(N * 4), malloc(N * 4), malloc(N * 4)};   /* (no d2: lean edt) */
+    int rc = !seed || !id[0] || !id[1] || !id[2] || !id[3];
     for (int q = 0; q < 4 && !rc; q++) {   /* the labelled voxels by winding mod 4 (code 1 + 18 q mod 252: k = (code - 1) / 18): k, k +- 1 and
                                               k +- 2 fall in different classes (but across the 14-turn wrap of the codes, where k + 2 may share k's) */
         for (size_t i = 0; i < N; i++) { const int c = codes[i]; seed[i] = c > 0 && c < 255 && (((c - 1) / BAND_STEPS) & 3) == q; }
-        rc = edt_feature_cap(seed, n, 4 * rmax * rmax, d2, id[q]);   /* nothing beyond the bound limit is used */
+        rc = edt_feature_cap(seed, n, 4 * rmax * rmax, nullptr, id[q]);   /* nothing beyond the bound limit is used */
     }
     if (!rc) {
         const float r2 = rmax * rmax, o2 = 4 * r2;
@@ -256,22 +274,24 @@ int band_field_side_pair(const uint8_t *codes, const int n[3], float rmax, int m
             }
         }
     }
-    free(seed); free(d2); for (int q = 0; q < 4; q++) free(id[q]);
+    free(seed); for (int q = 0; q < 4; q++) free(id[q]);
     return rc ? -1 : 0;
 }
 
 int band_field_phase_pair(const uint8_t *codes, const int n[3], float rmax, uint8_t *phase, uint8_t *spacing) { return band_field_phase_pair_ex(codes, n, rmax, phase, spacing, nullptr, nullptr); }
 int band_field_phase_pair_ex(const uint8_t *codes, const int n[3], float rmax, uint8_t *phase, uint8_t *spacing, int32_t *lo, int32_t *hi) {
     const size_t N = (size_t)n[0] * n[1] * n[2], sy = (size_t)n[2], sz = (size_t)n[1] * n[2];
-    uint8_t *se = malloc(N), *so = malloc(N); float *de = malloc(N * 4), *dd = malloc(N * 4); int32_t *ie = malloc(N * 4), *io = malloc(N * 4);
-    int rc = !se || !so || !de || !dd || !ie || !io;
-    if (!rc) {
+    /* lean (2026-11-11): one seed buffer reused per parity and no float distance arrays (edt_feature d2 nullptr; the squared
+       distances are rebuilt from the feature indices, exact integers): 10 instead of 18 bytes a voxel, the same bytes out */
+    uint8_t *sd = malloc(N); int32_t *ie = malloc(N * 4), *io = malloc(N * 4);
+    int rc = !sd || !ie || !io;
+    for (int par = 0; par < 2 && !rc; par++) {
         for (size_t i = 0; i < N; i++) {   /* the labelled voxels by the parity of their winding (code 1 + 18 q mod 252: k = (code - 1) / 18) */
             const int c = codes[i], lab = c > 0 && c < 255;
             const int k = lab ? (c - 1) / BAND_STEPS : 0;
-            se[i] = lab && !(k & 1); so[i] = lab && (k & 1);
+            sd[i] = lab && (k & 1) == par;
         }
-        rc = edt_feature(se, n, de, ie) || edt_feature(so, n, dd, io);
+        rc = edt_feature_cap(sd, n, BINF, nullptr, par ? io : ie);
     }
     if (!rc) {
         const float r2 = rmax * rmax;
@@ -280,15 +300,18 @@ int band_field_phase_pair_ex(const uint8_t *codes, const int n[3], float rmax, u
             if (lo) { lo[i] = -1; hi[i] = -1; }
             const int c = codes[i];
             if (c > 0 && c < 255) { phase[i] = 0; if (lo) { lo[i] = (int32_t)i; hi[i] = (int32_t)i; } continue; }   /* on a labelled recto */
-            if (ie[i] < 0 || io[i] < 0 || de[i] > r2 || dd[i] > r2) continue;
+            if (ie[i] < 0 || io[i] < 0) continue;
             const size_t a = (size_t)ie[i], b = (size_t)io[i];
+            const long z = (long)(i / sz), y = (long)((i / sy) % n[1]), x = (long)(i % sy);
+            const long iaz = (long)(a / sz) - z, iay = (long)((a / sy) % n[1]) - y, iax = (long)(a % sy) - x;
+            const long ibz = (long)(b / sz) - z, iby = (long)((b / sy) % n[1]) - y, ibx = (long)(b % sy) - x;
+            const float de = (float)(iaz * iaz + iay * iay + iax * iax), dd = (float)(ibz * ibz + iby * iby + ibx * ibx);
+            if (de > r2 || dd > r2) continue;
             const int ka = (codes[a] - 1) / BAND_STEPS, kb = (codes[b] - 1) / BAND_STEPS;   /* windings mod 14 */
             int dk = ((kb - ka) % 14 + 14) % 14; if (dk > 7) dk -= 14;
             if (dk != 1 && dk != -1) continue;   /* not consecutive: a missing wrap between */
-            const long z = (long)(i / sz), y = (long)((i / sy) % n[1]), x = (long)(i % sy);
-            const float az = (float)((long)(a / sz) - z), ay = (float)((long)((a / sy) % n[1]) - y), ax = (float)((long)(a % sy) - x);
-            const float bz = (float)((long)(b / sz) - z), by = (float)((long)((b / sy) % n[1]) - y), bx = (float)((long)(b % sy) - x);
-            const float da = sqrtf(de[i]), db = sqrtf(dd[i]);
+            const float az = (float)iaz, ay = (float)iay, ax = (float)iax, bz = (float)ibz, by = (float)iby, bx = (float)ibx;
+            const float da = sqrtf(de), db = sqrtf(dd);
             if (az * bz + ay * by + ax * bx > -0.5f * da * db) continue;   /* both sheets on one side: not between them */
             const float f = dk == 1 ? da / (da + db) : db / (da + db);   /* the way from the lower winding to the higher */
             int q = (int)lrintf(f * PHASE_PERIOD); if (q >= PHASE_PERIOD) q -= PHASE_PERIOD;
@@ -297,7 +320,7 @@ int band_field_phase_pair_ex(const uint8_t *codes, const int n[3], float rmax, u
             if (spacing) { const long sp = lrintf(da + db); spacing[i] = (uint8_t)(sp < 1 ? 1 : sp > 255 ? 255 : sp); }
         }
     }
-    free(se); free(so); free(de); free(dd); free(ie); free(io);
+    free(sd); free(ie); free(io);
     return rc ? -1 : 0;
 }
 

@@ -268,12 +268,13 @@ static batch alloc_batch(const sample_cfg *c) {
     b.wcomp = c->wind4 && !c->w4_runs ? halloc((size_t)c->B * p3) : nullptr;
     b.w4r = c->w4_runs ? calloc((size_t)c->B, sizeof(w4runs)) : nullptr;
     b.ink = c->ink_plane && !c->ink_bits ? halloc((size_t)c->B * p3) : nullptr;
+    for (int j = 0; j < 2; j++) b.aux[j] = j < c->aux_n ? halloc((size_t)c->B * p3) : nullptr;
     b.inkb = c->ink_bits ? halloc((size_t)c->B * p3 / 8) : nullptr; b.ink_it = c->ink_bits ? calloc((size_t)c->B, sizeof *b.ink_it) : nullptr;
     b.emb = c->emb_ch ? halloc((size_t)c->B * c->emb_ch * (size_t)(PZ(c) / c->emb_div) * (c->P / c->emb_div) * (c->P / c->emb_div)) : nullptr;
     return b;
 }
 
-static void free_batch(batch *b, int B) { if (b->w4r) { for (int q = 0; q < B; q++) { w4runs *r = (w4runs *)b->w4r + q; free(r->off); free(r->ro); free(r->cb); } free(b->w4r); } if (b->ink) hfree(b->ink); if (b->inkb) hfree(b->inkb); free(b->ink_it); if (b->ct8) hfree(b->ct8); if (b->aug) hfree(b->aug); if (b->emb) hfree(b->emb); if (b->xv) hfree(b->xv); free(b->vok); free(b->chid); free(b->chidx); free(b->choff); if (b->w4) hfree(b->w4); if (b->wcomp) hfree(b->wcomp); if (b->tm) hfree(b->tm); if (b->rad) hfree(b->rad); if (b->axr) hfree(b->axr); if (b->pap) hfree(b->pap); if (b->wind) hfree(b->wind); if (b->band) hfree(b->band); if (b->side) hfree(b->side); if (b->pm) hfree(b->pm); if (b->x) hfree(b->x); if (b->x16) hfree(b->x16); if (b->t) hfree(b->t); if (b->m) hfree(b->m); hfree(b->w); free(b->src); free(b->level); free(b->um); free(b->corner); if (b->sheet) { sheet_batch_free(b->sheet[0]); free(b->sheet); } }
+static void free_batch(batch *b, int B) { if (b->w4r) { for (int q = 0; q < B; q++) { w4runs *r = (w4runs *)b->w4r + q; free(r->off); free(r->ro); free(r->cb); } free(b->w4r); } if (b->ink) hfree(b->ink); for (int j = 0; j < 2; j++) if (b->aux[j]) hfree(b->aux[j]); if (b->inkb) hfree(b->inkb); free(b->ink_it); if (b->ct8) hfree(b->ct8); if (b->aug) hfree(b->aug); if (b->emb) hfree(b->emb); if (b->xv) hfree(b->xv); free(b->vok); free(b->chid); free(b->chidx); free(b->choff); if (b->w4) hfree(b->w4); if (b->wcomp) hfree(b->wcomp); if (b->tm) hfree(b->tm); if (b->rad) hfree(b->rad); if (b->axr) hfree(b->axr); if (b->pap) hfree(b->pap); if (b->wind) hfree(b->wind); if (b->band) hfree(b->band); if (b->side) hfree(b->side); if (b->pm) hfree(b->pm); if (b->x) hfree(b->x); if (b->x16) hfree(b->x16); if (b->t) hfree(b->t); if (b->m) hfree(b->m); hfree(b->w); free(b->src); free(b->level); free(b->um); free(b->corner); if (b->sheet) { sheet_batch_free(b->sheet[0]); free(b->sheet); } }
 
 /* Level choice for a source: restrict cfg.level_p to levels the CT has and every target of the source
    can provide (pyramid: same level; regions: levels 0..1). Returns -1 if nothing is usable. */
@@ -353,7 +354,7 @@ static int level_ok(sampler *sp, source *s, int si, int l, int region_ch) {
         }
         if (ok && !sp->cfg.restore) {   /* (task restore: no targets) */
             int any = 0;
-            for (int c = 0; c < NCH; c++) {
+            for (int c = 0; c < NTG; c++) {
                 if (c == region_ch) { any = 1; continue; }
                 if (s->tgt_key[c] && source_tgt_for_level(s, c, l, nullptr)) any = 1;
             }
@@ -365,7 +366,38 @@ static int level_ok(sampler *sp, source *s, int si, int l, int region_ch) {
     }
     return cache[l] == 2;
 }
+static int labels_coarse(sampler *sp, source *s, int l, int region_ch, int verbose);
+/* --um-rungs: the level of source s whose voxel size is nearest rung k (within rung_tol octaves, an eligible level), -1 none */
+static int rung_level(sampler *sp, source *s, int si, int k, int region_ch) {
+    const sample_cfg *c = &sp->cfg; const double tol = c->rung_tol > 0 ? c->rung_tol : 0.5; int best = -1; double bd = 1e9;
+    if (!(s->um > 0)) return -1;
+    for (int l = s->min_level < 0 ? 0 : s->min_level; l < MAXLEV; l++) {
+        if ((s->max_level >= 0 && l > s->max_level) || (region_ch >= 0 && l > 1)) break;
+        const double dl = fabs(log2(s->um * ldexp(1.0, l) / c->rung_um[k]));
+        if (dl <= tol + 1e-9 && dl < bd && level_ok(sp, s, si, l, region_ch) && (c->restore || !labels_coarse(sp, s, l, region_ch, 0))) { bd = dl; best = l; }   /* (labels coarser than the level: not this rung) */
+    }
+    return best;
+}
+/* a level the run trains on for source s: level_p > 0, or (--um-rungs) the level of some rung */
+static int level_on(sampler *sp, source *s, int si, int l, int region_ch) {
+    if (!sp->cfg.nrung) return sp->cfg.level_p[l] > 0;
+    for (int k = 0; k < sp->cfg.nrung; k++) if (sp->cfg.rung_w[k] > 0 && rung_level(sp, s, si, k, region_ch) == l) return 1;
+    return 0;
+}
 static int pick_level(sampler *sp, source *s, rng *r, int region_ch) {
+    if (sp->cfg.nrung) {   /* --um-rungs: a rung by weight among those this source reaches, maybe moved one rung (--rung-shift-p), then its level */
+        const int si = (int)(s - sp->S->src), nr = sp->cfg.nrung; int lv[8]; double tot = 0;
+        for (int k = 0; k < nr; k++) { lv[k] = sp->cfg.rung_w[k] > 0 ? rung_level(sp, s, si, k, region_ch) : -1; if (lv[k] >= 0) tot += sp->cfg.rung_w[k]; }
+        if (tot <= 0) return -1;
+        double u = runif(r) * tot; int k = 0;
+        for (; k < nr; k++) if (lv[k] >= 0 && (u -= sp->cfg.rung_w[k]) <= 0) break;
+        if (k == nr) for (k = nr - 1; lv[k] < 0; k--) {}
+        if (sp->cfg.rung_shift_p > 0 && runif(r) < sp->cfg.rung_shift_p) {   /* (the neighbour in the rung list, which is sorted by um; drawn either way) */
+            const int k2 = k + (runif(r) < 0.5 ? -1 : 1), l2 = k2 >= 0 && k2 < nr ? rung_level(sp, s, si, k2, region_ch) : -1;
+            if (l2 >= 0) return l2;
+        }
+        return lv[k];
+    }
     double p[MAXLEV], tot = 0;
     int si = (int)(s - sp->S->src);
     for (int l = 0; l < MAXLEV; l++) {
@@ -1864,6 +1896,13 @@ static void warp_phase_w4(const uint8_t *ph, const uint16_t *wq, uint8_t *dph, u
     free(pp);
 }
 static void warp_w4_pack(const uint8_t *w4, const uint8_t *cp, uint16_t *wq, size_t n) { for (size_t k = 0; k < n; k++) wq[k] = (uint16_t)(w4[k] | cp[k] << 8); }
+/* an ink / fibre plane of a window (prob254 target slot ch, source grid): unknown (255) without such a target or on re-drawn (crushed,
+   torn, ...) windows */
+static int aux_read(source *s, int ch, int l, const int64_t o[3], const int64_t n[3], uint8_t *dst, size_t p3, int redrawn) {
+    z3 *tz = s->tgt_key[ch] && s->tgt_prob[ch] && !redrawn ? source_tgt_for_level(s, ch, l, nullptr) : nullptr;
+    if (!tz) { memset(dst, 255, p3); return 0; }
+    return source_read_target(s, ch, l, o, n, dst, g_rt) ? -1 : 0;
+}
 /* train --ink-head (cfg.ink_plane): the ink prob254 plane of a warped window, pulled through the warp as warp_pw_voxel pulls the phase:
    trilinear over the 8 corners when every corner of weight > 1e-7 is known (< 255), else unknown (255); outside unknown. The weights
    ((wz * wy) * wx) and the sum in corner order, rounded to nearest: nn_aug.cu lw_ink_k makes the same bytes */
@@ -2450,7 +2489,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
         !c->phase_dense && s->phase) {
         const int psh = s->phase_level - l;
         int ok = psh == 1 || (psh == 0 && s->phase_direct);
-        for (int ch = 0; ch < NCH; ch++) ok &= !s->tgt_key[ch] || (c->ink_plane && ch == CH_SHEET);   /* (the ink plane: unknown on these windows) */
+        for (int ch = 0; ch < NTG; ch++) ok &= !s->tgt_key[ch] || (c->ink_plane && (ch == CH_SHEET || ch == CH_FIB));   /* (the ink / aux planes: unknown on these windows) */
         if (ok && c->crush.p > 0 && runif(r) < c->crush.p && (crushed = crush_draw(sp, s, l, o, P, psh, r, big + p3, 8 * p3, ctu)) < 0) return -1;
         if (ok && !crushed && c->tear_p > 0 && runif(r) < c->tear_p && (torn = tear_draw(sp, s, l, o, P, psh, r, ctu)) < 0) return -1;
         if (ok && !crushed && !torn && c->delam_p > 0 && runif(r) < c->delam_p && (delam = delam_draw(sp, s, l, o, P, psh, r, ctu)) < 0) return -1;
@@ -2500,6 +2539,10 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
        below, one pass fewer (ink_it: the cutoff, 0 = built here) */
     const int ink_it = (inkw || inkbits) && c->rv_iso > 0 && c->gpu_aug && (!c->augment || !scan_aug_enabled(&c->scan) || c->scan.p[SA_SEAM] <= 0 || c->sheet || c->band || c->side)
                        ? (s->iso > 0 ? s->iso : c->rv_iso) : 0;
+    for (int j = 0; j < c->aux_n; j++) {   /* the registry's extra planes (source grid, like the ink plane) */
+        const int ch = !c->aux_fib[j] ? CH_SHEET : s->tgt_key[CH_FIB] || !c->fib_sheet ? CH_FIB : CH_SHEET;
+        if (aux_read(s, ch, l, o, n, b->aux[j] + (size_t)i * p3, p3, crushed || torn || delam || curved)) return -1;
+    }
     uint8_t w[NCH] = {0};
     int tmax = 0;
     /* a channel without a target (w 0) is read again only by the packing / the host warp / the sheet prior / papyrus labels: with the
@@ -2516,10 +2559,8 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
                 if (!ink_it) for (size_t k = 0; k < p3; k++) inkw[k] = ctu[k] >= it ? 254 : 0;
                 continue;
             }
-            z3 *tz = s->tgt_key[ch] && s->tgt_prob[ch] && !crushed && !torn && !delam && !curved ? source_tgt_for_level(s, ch, l, nullptr) : nullptr;
-            if (!tz) memset(inkw, 255, p3);
-            else if (source_read_target(s, ch, l, o, n, inkw, g_rt)) return -1;
-            if (getenv("UFSM_INK_DEBUG")) { size_t kn = 0, ki = 0; for (size_t k = 0; k < p3; k++) { kn += inkw[k] != 255; ki += inkw[k] != 255 && inkw[k] > 127; } fprintf(stderr, "ink window: tz %p known %zu ink %zu\n", (void *)tz, kn, ki); }
+            if (aux_read(s, c->ink_fib && s->tgt_key[CH_FIB] ? CH_FIB : CH_SHEET, l, o, n, inkw, p3, crushed || torn || delam || curved)) return -1;
+            if (getenv("UFSM_INK_DEBUG")) { size_t kn = 0, ki = 0; for (size_t k = 0; k < p3; k++) { kn += inkw[k] != 255; ki += inkw[k] != 255 && inkw[k] > 127; } fprintf(stderr, "ink window: known %zu ink %zu\n", kn, ki); }
             continue;
         }
         if (ch == CH_SHEET && s->tgt_side[CH_RECTO]) continue;  /* the verso side: written with the recto side below */
@@ -2815,6 +2856,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
 #define MK(k) (ign_zero ? (uint8_t)(ctu[k] != 0) : (uint8_t)((ctu[k] != 0) & (mask[k] == 0)))
     /* tdead: the loss mask itself is read by nobody below (no packed plane, no sheet prior, the labels warped on the device): only the
        ink plane is written (one write stream fewer; the pass is DRAM-bound) */
+    for (int j = 0; j < c->aux_n; j++) { uint8_t *a = b->aux[j] + (size_t)i * p3; for (size_t k = 0; k < p3; k++) if (!MK(k)) a[k] = 255; }   /* (the extra planes: unknown as the ink plane) */
     if (inkbits) {   /* (ink_bits: the known bit of each voxel; the plane itself on the device) */
         if (!ink_it) { fprintf(stderr, "sampler: ink bits without the rv cutoff\n"); return -1; }
         b->ink_it[i] = (int16_t)(ink_it > 256 ? 256 : ink_it);
@@ -2981,7 +3023,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
                 PH_PUT(wt, p3);
             }
             PROF_MARK(PS_PHREAD);
-            if (c->wind4 && !s->scope_local) {   /* ("scope": "local": the winding mod 4 stays unknown, below) */   /* the winding mod 4: the phase unwrapped before the air test (gaps join the windings), outside the scroll (CT 0) not */
+            if (c->wind4 && s->scope_local != 1) {   /* ("scope": "local": the winding mod 4 stays unknown, below; "w4" trains it) */   /* the winding mod 4: the phase unwrapped before the air test (gaps join the windings), outside the scroll (CT 0) not */
                 uint8_t *pw = PH_GET(ttmp + p3 + 64, p3);
                 if (!pw) { SW_PUT(); return -1; }
                 ph_known = phase_air(ctu, sw, pw, p3, c->side_air); air_done = 1;   /* (the winding input and the air test in one pass) */
@@ -3053,10 +3095,11 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
         if (c->w4_runs) { w4runs *wr = (w4runs *)b->w4r + i; wr->noff = wr->nr = 0; }   /* (no winding: the device writes unknown) */
         else { memset(b->w4 + (size_t)i * p3, 255, p3); memset(b->wcomp + (size_t)i * p3, 255, p3); }
     }
-    if (inkw) {   /* --ink-head: the ink plane through the symmetry / warp (--gpu-aug 2 warped windows: the source grid, warped on the device) */
-        uint8_t *bi = b->ink + (size_t)i * p3, *src = scr_own ? ttmp + p3 + 64 : big + p3;   /* (lw, or unwarped with the identity: already in place) */
+    for (int j = -1; j < c->aux_n; j++) {   /* --ink-head: the ink plane (j -1) and the extra planes through the symmetry / warp (--gpu-aug 2 warped windows: the source grid, warped on the device) */
+        if (j < 0 && !inkw) continue;
+        uint8_t *bi = (j < 0 ? b->ink : b->aux[j]) + (size_t)i * p3, *src = scr_own ? ttmp + p3 + 64 : big + p3;   /* (lw, or unwarped with the identity: already in place) */
         if (!lw && !(sym_id && !spatial.active)) {
-            memcpy(src, inkw, p3);
+            memcpy(src, bi, p3);
             if (spatial.active) sample_warp_ink(src, bi, P, y.perm, y.flip, &spatial); else sym_u8(src, bi, Pz, P, y);
         }
     }
@@ -3111,6 +3154,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
         const uint8_t *sd = b->side + (size_t)i * p3; size_t kn = ph_known;
         if (kn == SIZE_MAX) { kn = 0; for (size_t k = 0; k < p3; k++) kn += sd[k] < PHASE_PERIOD; }
         if (inkw && !c->rv_iso) { const uint8_t *ik = b->ink + (size_t)i * p3; for (size_t k = 0; k < p3; k++) kn += ik[k] != 255; }   /* (--ink-head: known ink supervises too: ink-only sources draw) */
+        for (int j = 0; j < c->aux_n; j++) { const uint8_t *ik = b->aux[j] + (size_t)i * p3; for (size_t k = 0; k < p3; k++) kn += ik[k] != 255; }
         if ((double)kn < c->min_phase * (double)p3) { if (Tw) tp_put(Tw, (NCH + 1) * p3); atomic_fetch_add(&sp->rejected, 1); atomic_fetch_add(&sp->rej_why[2], 1); return 1; }   /* (counted as empty targets) */
     }
     if (c->emb_ch && s->ct_only) {   /* an unlabelled ("ct_only") source supervises only the distillation: windows with < 25% of the head cells targeted are redrawn */
@@ -3468,31 +3512,36 @@ int sources_prefetch(sources *S, int maxlev, int nthreads, double fraction, int 
    than a level the source is drawn at (a pyramid target upsampled from its finest rung, a stored phase / winding / ignore mask one or
    more levels up, band codes on their 2x label grid) is a hard error at sampler start, no opt-out. (Finer stored targets pooled down,
    region arrays at level 0 and "emb" heads on their own pooled grid are not upsampled labels.) */
+/* the labels of source s are stored coarser than level l (verbose: say which); --um-rungs skips such levels, --levels refuses them */
+static int labels_coarse(sampler *sp, source *s, int l, int region_ch, int verbose) {
+    const sample_cfg *c = &sp->cfg; static const char *chn[NTG] = {"recto", "sheet", "fibre"};
+    const double um = s->um * ldexp(1.0, l);
+    for (int ch = 0; ch < NTG; ch++) {
+        int st = l;
+        if (ch == region_ch || !s->tgt_key[ch] || !source_tgt_for_level(s, ch, l, &st) || st <= l) continue;
+        if (verbose) fprintf(stderr, "sampler: %s: target \"%s\" (%s) is stored at %g um, coarser than the training level %d (%g um): labels must be stored at the training level\n",
+                             s->name, chn[ch], s->tgt_key[ch], s->um * ldexp(1.0, st), l, um);
+        return 1;
+    }
+    const int pshift = s->phase ? s->phase_level - l : 0;
+    const int stored = !c->band && c->side == 2 && s->phase && !c->phase_dense && pshift == 0 && s->phase_direct;
+    if (s->phase && pshift > 0) {
+        if (verbose) fprintf(stderr, "sampler: %s: target \"phase\"%s%s is stored at %g um, coarser than the training level %d (%g um): labels must be stored at the training level\n",
+                             s->name, s->wind ? " (+ winding)" : "", s->phase_ign ? " (+ ignore mask)" : "", s->um * ldexp(1.0, s->phase_level), l, um);
+        return 1;
+    }
+    if (s->band && !s->phase_only && (c->band || c->side) && !stored) {
+        if (verbose) fprintf(stderr, "sampler: %s: target \"band\" codes are stored at %g um (the 2x label grid), coarser than the training level %d (%g um): "
+                                     "labels must be stored at the training level (a stored phase with \"level\": %d)\n", s->name, um * 2, l, um, l);
+        return 1;
+    }
+    return 0;
+}
 static int label_res_check(sampler *sp, source *s, int si, int region_ch) {
-    const sample_cfg *c = &sp->cfg; static const char *chn[NCH] = {"recto", "sheet"};
-    if (c->restore) return 0;
+    if (sp->cfg.restore) return 0;
     for (int l = s->min_level < 0 ? 0 : s->min_level; l < MAXLEV; l++) {
-        if (c->level_p[l] <= 0 || (s->max_level >= 0 && l > s->max_level) || (region_ch >= 0 && l > 1) || !level_ok(sp, s, si, l, region_ch)) continue;
-        const double um = s->um * ldexp(1.0, l);
-        for (int ch = 0; ch < NCH; ch++) {
-            int st = l;
-            if (ch == region_ch || !s->tgt_key[ch] || !source_tgt_for_level(s, ch, l, &st) || st <= l) continue;
-            fprintf(stderr, "sampler: %s: target \"%s\" (%s) is stored at %g um, coarser than the training level %d (%g um): labels must be stored at the training level\n",
-                    s->name, chn[ch], s->tgt_key[ch], s->um * ldexp(1.0, st), l, um);
-            return -1;
-        }
-        const int pshift = s->phase ? s->phase_level - l : 0;
-        const int stored = !c->band && c->side == 2 && s->phase && !c->phase_dense && pshift == 0 && s->phase_direct;
-        if (s->phase && pshift > 0) {
-            fprintf(stderr, "sampler: %s: target \"phase\"%s%s is stored at %g um, coarser than the training level %d (%g um): labels must be stored at the training level\n",
-                    s->name, s->wind ? " (+ winding)" : "", s->phase_ign ? " (+ ignore mask)" : "", s->um * ldexp(1.0, s->phase_level), l, um);
-            return -1;
-        }
-        if (s->band && !s->phase_only && (c->band || c->side) && !stored) {
-            fprintf(stderr, "sampler: %s: target \"band\" codes are stored at %g um (the 2x label grid), coarser than the training level %d (%g um): "
-                            "labels must be stored at the training level (a stored phase with \"level\": %d)\n", s->name, um * 2, l, um, l);
-            return -1;
-        }
+        if (!level_on(sp, s, si, l, region_ch) || (s->max_level >= 0 && l > s->max_level) || (region_ch >= 0 && l > 1) || !level_ok(sp, s, si, l, region_ch)) continue;
+        if (labels_coarse(sp, s, l, region_ch, 1)) return -1;
     }
     return 0;
 }
@@ -3530,8 +3579,8 @@ static void replay_window(sampler *sp, batch *b, int i, int rep, uint8_t **scr) 
         if (!warped0 && !sym_identity(y0)) {   /* back to the source grid */
             if (!*scr && !(*scr = malloc(p3))) abort();
             const sym yi = sym_inverse(y0);
-            uint8_t *pl[5] = {c->w4_runs ? nullptr : b->side, b->w4, b->wcomp, b->ink, b->tm};   /* (w4_runs: the side plane is on the source grid already) */
-            for (int q = 0; q < 5; q++) if (pl[q]) { uint8_t *v = pl[q] + (size_t)i * p3; memcpy(*scr, v, p3); sym_u8(*scr, v, Pz, P, yi); }
+            uint8_t *pl[7] = {c->w4_runs ? nullptr : b->side, b->w4, b->wcomp, b->ink, b->tm, b->aux[0], b->aux[1]};   /* (w4_runs: the side plane is on the source grid already) */
+            for (int q = 0; q < 7; q++) if (pl[q]) { uint8_t *v = pl[q] + (size_t)i * p3; memcpy(*scr, v, p3); sym_u8(*scr, v, Pz, P, yi); }
         }
         y = sym_of((int)rint_below(&r, 48));
         if (c->augment == 4) y = sym_of(0);
@@ -3602,7 +3651,7 @@ sampler *sampler_start(sources *S, const sample_cfg *cfg) {
     if (cfg->replay > 1 && (!sampler_replay_ok(cfg) || replay_selftest())) { fprintf(stderr, "sampler: --replay needs --gpu-aug 2 cube batches without sheet / band / gap / condition / distill / view / cover / chain / papyrus-mask planes\n"); return nullptr; }
     if (!S || S->n <= 0 || cfg->P <= 0 || cfg->B <= 0 || cfg->nworkers <= 0 || cfg->nbuf <= 0) { fprintf(stderr, "sampler: invalid sources, patch, batch, workers or buffer count\n"); return nullptr; }
     if (cfg->gpu_input && !sample_gpu_input_ok(cfg)) { fprintf(stderr, "sampler: --gpu-input needs 16-bit batches and no warps, sheet prior, slab appearance plan, aux or condition inputs\n"); return nullptr; }
-    { int nl = 0, nw = 0; for (int i = 0; i < S->n; i++) { nl += S->src[i].scope_local; nw += S->src[i].phase_wt != nullptr; }
+    { int nl = 0, nw = 0; for (int i = 0; i < S->n; i++) { nl += S->src[i].scope_local == 1; nw += S->src[i].phase_wt != nullptr; }
       if (nl || nw) fprintf(stderr, "sampler: %d of %d sources scope local (no winding mod 4 target)%s, %d with a phase weight (8^3 blocks kept with probability w)\n",
                             nl, S->n, cfg->wind4 ? "" : " (no --wind4 in this run: no effect)", nw);
       for (int i = 0; i < S->n; i++) if (S->src[i].phase_wt && (cfg->crush.p > 0)) { fprintf(stderr, "sampler: note: phase weights are not applied on crushed / torn / re-bent windows\n"); break; } }
@@ -3665,7 +3714,7 @@ sampler *sampler_start(sources *S, const sample_cfg *cfg) {
     if (cfg->cover) {
         if (cfg->holdout || cfg->B != 1 || cfg->cover->P != cfg->P || cfg->cover_start >= cfg->cover->count) { free(sp); return nullptr; }
         sp->cfg.deterministic = 1; sp->cfg.snap = 0;
-        memset(sp->cfg.level_p, 0, sizeof sp->cfg.level_p); sp->cfg.level_p[0] = 1;
+        memset(sp->cfg.level_p, 0, sizeof sp->cfg.level_p); sp->cfg.level_p[0] = 1; sp->cfg.nrung = 0;
     }
     { unsigned sb; memcpy(&sb, &cfg->soft, 4); atomic_store(&sp->soft_bits, sb); }
     {   /* huge pages for the worker scratch only with host warps (--gpu-aug < 2) and free memory to back them without compaction (MemFree > 16 GB) */
@@ -3687,7 +3736,7 @@ sampler *sampler_start(sources *S, const sample_cfg *cfg) {
             acc += eligible ? s->weight : 0; sp->cum[i] = acc; continue;
         }
         for (int c = 0; c < NCH; c++) if (s->reg[c] && s->reg[c]->n) region_ch = c;
-        for (int l = s->min_level < 0 ? 0 : s->min_level; l < MAXLEV; l++) if (sp->cfg.level_p[l] > 0 && (region_ch < 0 || l <= 1) && level_ok(sp, s, i, l, region_ch)) eligible = 1;
+        for (int l = s->min_level < 0 ? 0 : s->min_level; l < MAXLEV; l++) if (level_on(sp, s, i, l, region_ch) && (region_ch < 0 || l <= 1) && level_ok(sp, s, i, l, region_ch)) eligible = 1;
         if (eligible && s->weight > 0 && label_res_check(sp, s, i, region_ch)) { free(sp->cum); free(sp->lvl_ok); free(sp); return nullptr; }
         if (!isfinite(s->weight) || s->weight < 0) { fprintf(stderr, "sampler: invalid source weight: %s\n", s->name); free(sp->cum); free(sp->lvl_ok); free(sp); return nullptr; }
         if (!eligible && s->weight > 0) fprintf(stderr, "sampler: %s excluded: no %s patch fits %dx%dx%d and the enabled levels\n", s->name, cfg->holdout ? "validation" : "training", PZ(cfg), cfg->P, cfg->P);
@@ -3784,7 +3833,7 @@ int sampler_batch_hash(const sampler *sp, const batch *b, const char **names, ui
         free(g);
     }
     const struct { const char *n; const void *p; size_t z; } f[] = {{"ct8", b->ct8, B * p3}, {"aug", b->aug, B * sizeof(scan_ct_rec)}, {"rad", b->rad, B * NN_RAD_REC(PZ(&sp->cfg))},
-        {"side", sdr ? sdr : b->side, B * p3}, {"w4", w4r ? w4r : b->w4, B * p3}, {"wcomp", wcr ? wcr : b->wcomp, B * p3}, {"ink", inkr ? inkr : b->ink, B * p3}, {"tm", b->tm, B * p3}, {"pm", b->pm, B * p3}, {"inkb", b->inkb, B * p3 / 8},
+        {"side", sdr ? sdr : b->side, B * p3}, {"w4", w4r ? w4r : b->w4, B * p3}, {"wcomp", wcr ? wcr : b->wcomp, B * p3}, {"ink", inkr ? inkr : b->ink, B * p3}, {"tm", b->tm, B * p3}, {"pm", b->pm, B * p3}, {"inkb", b->inkb, B * p3 / 8}, {"aux0", b->aux[0], B * p3}, {"aux1", b->aux[1], B * p3},
         {"x16", b->x16, B * (size_t)b->xch * p3 * 2}, {"um", b->um, B * sizeof(float)}, {"src", b->src, B * sizeof(int16_t)}, {"w", b->w, B * NCH}};
     int n = 0;
     for (size_t q = 0; q < sizeof f / sizeof f[0] && n < max; q++) if (f[q].p) {
