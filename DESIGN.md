@@ -34,7 +34,7 @@ computed on the GPU from the augmented label planes (`nn_fib_dir_targets`: the s
 a 9^3 cube, largest eigenvector, kept where lambda_1 / trace >= 0.6 and >= 9 tube voxels; crossings, unknown and non-tube voxels
 masked), so every augmentation (symmetries, rotation, elastic) is consistent by construction and no label plane changes. Whole-window
 loss path only (the H / V mask task, B 1; refused with other tasks). test_fib_dir (4 synthetic tubes, |a . axis| >= 0.98 inside).
-60-step smoke at P 256: dir bce 1.00 -> 0.69 over 60 steps, the mask losses as without the head; the checkpoint records
+30-step smoke at P 256: dir bce 1.00 -> 0.87, mask bce / dice as in the same smoke without the head; the checkpoint records
 `fib_dir` (channels, coding).
 
 **Smoothed axis (`fiber-trace --st-r 3`) as default: no.** Persistent sheet changes per metre (lower is better), base -> st-r 3:
