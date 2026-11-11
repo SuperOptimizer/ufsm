@@ -28,10 +28,10 @@ PY
 # the not-yet-pulled output on the pod disk (CAPGB, default 10): the desk pulls continuously (b1_pull_p4A.sh) with --remove-source-files,
 # so --resume cannot see pulled shards and the ledger is what makes a rerun skip finished boxes. (2026-11-11: the first run wrote 8
 # parts in ~25 min, faster than the pull, filled the pod disk and lost 130 boxes to ENOSPC.)
-touch $O.boxes.ok; CAP=${CAPGB:-10}
+touch $O.boxes.ok; CAP=${CAPGB:-8}
 for b in $(cat $K/parts/part-*.boxes); do
   grep -qx "$b" $O.boxes.ok && continue
-  while [ $(du -s --block-size=1G $O 2>/dev/null | cut -f1) -ge $CAP ] || [ $(df --output=avail -B1G /workspace | tail -1) -lt 6 ]; do sleep 30; done
+  while [ $(du -s --block-size=1G $O 2>/dev/null | cut -f1) -ge $CAP ] || [ $(df --output=avail -B1G /workspace | tail -1) -lt ${MINFREE:-15} ]; do sleep 30; done
   find $O -name '*.tmp' -delete 2>/dev/null
   if nice -n 5 $U phase-raster $G/codesA48 4.8 $O --gs 2 --pair 1 --radius 160 --axis $AX --threads $T --shards 3 --resume 1 --box $b --gpu 0 --gpu-slots 2 >> $O.log 2>&1; then
     echo "$b" >> $O.boxes.ok; else echo "box $b failed"; fi
