@@ -32,24 +32,31 @@ def lvl1(base, name, root, weight, note):
     # once level 1 is mirrored with `ufsm mirror`)
     sc, scan = e["ct"].split("/", 1); e["root"] = MIRROR; e["ct"] = f"{sc}/volumes/{scan}" if MIRROR.startswith("http") else e["ct"]
     e["targets"]["band"]["phase"] = {"root": root, "key": "4.8", "level": 1}; return e
-# ONFLY=1 (once univA's on-the-fly phase is on master): 1667 A / B read the phase from their 4.798 codes in the sampler (pair rule, rmax
-# 80 codes voxels = --radius 160 / --gs 2; univA: 0 differing voxels vs phase{A,B}48 on 6 windows of 896^3) instead of the stored sets.
-# Paris 4 June stays stored (partial) until its level-1 codes (codesA48, lost with pod 2) are rebuilt; 0139 / 0500P2 / 1667 9.6 stay
-# stored (fused A / B phase, not on the fly yet).
-ONFLY = os.environ.get("ONFLY", "0") == "1"; C1667 = "/vesuvius/ufsm/gt/PHerc1667-wind-20261016"
+# On-the-fly phase (univA, master 2ea3a91; default since 2026-11-11, ONFLY=0 restores the stored sets): the 4.8 um winding entries read
+# the phase from their level-1 codes in the sampler (pair rule, rmax 80 codes voxels = --radius 160 / --gs 2; codes decoded on the GPU,
+# ~0.12 s per P 896 sample on the pod). 1667 A / B: byte-identical to the stored phase{A,B}48 (univA, 6 windows of 896^3). Paris 4
+# June / July: codes{A,B}48 at level 1 over the whole scroll (the stored June set covered only 316 of the 549 packed 9.6 shards; with
+# no storage cost the packed-region limit is gone); the July codes need the July segments + wind-assign rebuilt first. 0139 / 0500P2 /
+# 1667 9.6 / p4full stay stored (fused A / B phase, not on the fly).
+ONFLY = os.environ.get("ONFLY", "1") == "1"; C1667 = "/vesuvius/ufsm/gt/PHerc1667-wind-20261016"; CP4 = f"{B1}/gt/paris4"
+def onfly(base, name, root, key, weight, note):
+    e = lvl1(base, name, None, weight, note); e["targets"]["band"]["phase"] = {"onfly": {"root": root, "key": key, "rmax": 80}, "level": 1}; return e
 for k in ("A", "B"):
     r = f"{B1}/gt/1667/phase{k}48"
     if ONFLY and os.path.exists(f"{C1667}/codes{k}/zarr.json"):
-        e = lvl1(g1667, f"PHerc1667-{k}48", r, 0.1, f"1667 codes{k} 4.798, phase on the fly (pair rule, rmax 80)")
-        e["targets"]["band"]["phase"] = {"onfly": {"root": f"{C1667}/codes{k}", "key": "4.798", "rmax": 80}, "level": 1}; src.append(e)
+        src.append(onfly(g1667, f"PHerc1667-{k}48", f"{C1667}/codes{k}", "4.798", 0.1, f"1667 codes{k} 4.798, phase on the fly (pair rule, rmax 80)"))
     elif os.path.exists(f"{r}/done"):
         src.append(lvl1(g1667, f"PHerc1667-{k}48", r, 0.1, f"B1 4.8 um phase, 1667 codes{k} (phase-raster --gs 2 --pair 1 --radius 160)"))
-p4 = next(s for s in T["sources"] if s["name"] == "PHercParis4-june"); r = f"{B1}/gt/paris4/phaseA48"
-if os.path.exists(f"{r}/4.8/zarr.json"):
-    # partial (2026-11-11): pod 2 was terminated at 280 of 339 boxes, and ~500 shards of finished boxes were still in flight. Every packed
-    # 9.6 shard (2048^3 level-0 voxels) whose 8 4.8 um shards are not all on the desk is held out (appended after the wbench boxes so the
-    # wbench validation box stays first), and the weight scales with the complete share. The sampler computes the phase on the fly from
-    # the codes once univA's "onfly" key lands; then this stored set is replaced.
+p4 = next(s for s in T["sources"] if s["name"] == "PHercParis4-june"); p4b = next(s for s in T["sources"] if s["name"] == "PHercParis4-july")
+for k, base, nm, w in (("A", p4, "PHercParis4-june48", 0.2), ("B", p4b, "PHercParis4-july48", 0.12)):
+    if ONFLY and os.path.exists(f"{CP4}/codes{k}48/done"):
+        src.append(onfly(base, nm, f"{CP4}/codes{k}48", "4.8", w, f"Paris 4 codes{k}48 at level 1, phase on the fly (pair rule, rmax 80), whole scroll"))
+        continue
+    r = f"{CP4}/phase{k}48"
+    if k != "A" or not os.path.exists(f"{r}/4.8/zarr.json"): continue
+    # stored + partial (2026-11-11): pod 2 was terminated at 280 of 339 boxes, ~500 shards of finished boxes still in flight. Every packed
+    # 9.6 shard (2048^3 level-0 voxels) whose 8 4.8 um shards are not all on the desk is held out (after the wbench boxes, so the wbench
+    # validation box stays first), and the weight scales with the complete share.
     sh = [tuple(map(int, l.split())) for l in open(P4SH) if l.strip()]
     def full(z, y, x): return all(os.path.exists(f"{r}/4.8/c/{2*z+a}/{2*y+b}/{2*x+c}") for a in (0, 1) for b in (0, 1) for c in (0, 1))
     miss = [s for s in sh if not full(*s)]; frac = 1 - len(miss) / len(sh)
@@ -57,7 +64,7 @@ if os.path.exists(f"{r}/4.8/zarr.json"):
     ho["boxes"] += [{"name": f"p4A48-missing-{z}-{y}-{x}", "scroll": "paris4", "ct": ct, "l0": [z*2048, y*2048, x*2048, 2048, 2048, 2048]} for z, y, x in miss]
     ho["note"] = ho.get("note", "") + f"; plus the {len(miss)} packed 9.6 shards of the Paris 4 June 4.8 phase set not complete on the desk (mksources_univ.py)"
     hf = os.path.join(os.path.dirname(out), "p4A48.holdouts.json"); json.dump(ho, open(hf, "w"), indent=1)
-    e = lvl1(p4, "PHercParis4-june48", r, round(0.2 * frac, 4), f"B1 4.8 um phase, June codes at level 1, PARTIAL: {len(sh)-len(miss)} of {len(sh)} packed shards complete, the rest held out ({hf})")
+    e = lvl1(p4, nm, r, round(w * frac, 4), f"B1 4.8 um phase, June codes at level 1, PARTIAL: {len(sh)-len(miss)} of {len(sh)} packed shards complete, the rest held out ({hf})")
     e["holdout_file"] = hf; e["partial"] = True; src.append(e)
 FIB = os.environ.get("FIB", "/mnt/scratch/univ/fibre"); FIBT = os.environ.get("FIBT", f"{FIB}/teacher"); FS = float(os.environ.get("FIBSHARE", "0.2"))
 fsrc = []
