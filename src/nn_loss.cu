@@ -904,12 +904,12 @@ __device__ __forceinline__ int fibn_tangent(const uint8_t *fib, size_t i, int H,
     if (lam < 0.75f || q - lam * lam > 0.5f) return 0;   /* (a blob: lam 1/3; a sheet: a second eigenvalue 1; an anisotropic tube raster: small) */
     t[0] = v[0]; t[1] = v[1]; t[2] = v[2]; return 1;
 }
-template <typename LT> __global__ void fibn_k(const LT *lg, size_t ns, const uint8_t *fib, int D, int H, int W, int z0, int z1, int r, int thr, double *acc,
+template <typename LT> __global__ void fibn_k(const LT *lg, size_t ns, const uint8_t *fib, int D, int H, int W, int z0, int z1, int r, int thr, const uint8_t *nm, double *acc,
                                               fibn_ent *list, unsigned *nl, unsigned cap, int mode) {
     const size_t li = blockIdx.x * (size_t)blockDim.x + threadIdx.x; if (li >= ns) return;
     const size_t hw = (size_t)H * W; const int z = z0 + (int)(li / hw), y = (int)((li / W) % H), x = (int)(li % W), R = r + 1;
     const size_t i = (size_t)z * hw + (size_t)y * W + x;
-    const uint8_t b = fib[i]; if (b == 255 || b < thr) return;
+    const uint8_t b = fib[i]; if (b == 255 || b < thr || (nm && nm[li])) return;   /* (nm: --fib-normal-unsup, only where the normal BCE has no target) */
     if (z - R < z0 || z + R >= z1 || y < R || y + R >= H || x < R || x + R >= W) return;
     (void)D; float t[3]; if (!fibn_tangent(fib, i, H, W, r, t)) return;
     const float c6[6] = {t[0] * t[0], t[1] * t[1], t[2] * t[2], 2.f * t[0] * t[1], 2.f * t[0] * t[2], 2.f * t[1] * t[2]};
@@ -927,9 +927,9 @@ template <typename GT> __global__ void fibn_apply_k(const fibn_ent *list, const 
 }
 extern "C" size_t nn_fibn_cap(size_t ns) { return ns / 8 + 1024; }
 extern "C" size_t nn_fibn_list_bytes(size_t cap) { return cap * sizeof(fibn_ent) + 64; }
-extern "C" void nn_fibn(const void *lg, size_t ns, const uint8_t *fib, int D, int H, int W, int z0, int z1, int r, int thr, double *acc, void *list, unsigned *nl, size_t cap, int mode) {
-    if (g_logits_h16) fibn_k<f16><<<nblk(ns, 256), 256>>>((const f16 *)lg, ns, fib, D, H, W, z0, z1, r, thr, acc, (fibn_ent *)list, nl, (unsigned)cap, mode);
-    else fibn_k<float><<<nblk(ns, 256), 256>>>((const float *)lg, ns, fib, D, H, W, z0, z1, r, thr, acc, (fibn_ent *)list, nl, (unsigned)cap, mode);
+extern "C" void nn_fibn(const void *lg, size_t ns, const uint8_t *fib, int D, int H, int W, int z0, int z1, int r, int thr, const uint8_t *nm, double *acc, void *list, unsigned *nl, size_t cap, int mode) {
+    if (g_logits_h16) fibn_k<f16><<<nblk(ns, 256), 256>>>((const f16 *)lg, ns, fib, D, H, W, z0, z1, r, thr, nm, acc, (fibn_ent *)list, nl, (unsigned)cap, mode);
+    else fibn_k<float><<<nblk(ns, 256), 256>>>((const float *)lg, ns, fib, D, H, W, z0, z1, r, thr, nm, acc, (fibn_ent *)list, nl, (unsigned)cap, mode);
     KCHECK();
 }
 extern "C" void nn_fibn_apply(const void *list, const unsigned *nl, size_t cap, const double *acc, float lambda, void *gl, size_t ns) {

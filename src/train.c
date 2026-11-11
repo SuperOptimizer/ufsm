@@ -158,7 +158,7 @@ static int g_ink2, g_ink2_ch = -1;
    papyrus (the sampler's papyrus plane = clean CT >= the source's "iso", else --rv-iso), 0 / 0 on void; papyrus of unknown phase masked.
    The papyrus plane rides the ink plane's buffers (no --ink-head then). The phase still drives the normal / density / winding heads */
 static int g_rv; static float g_rv_vw = 1.f;   /* --rv-verso-w: verso-side papyrus loss weight multiplier */
-static float g_fibn_lambda; static int g_fibn, g_fibn_r = 2, g_fibn_thr = 128;   /* --fib-normal-lambda: the normal head orthogonal to fibres (the fibre tube plane rides the ink plane) */
+static float g_fibn_lambda; static int g_fibn, g_fibn_r = 2, g_fibn_thr = 128, g_fibn_unsup;   /* --fib-normal-lambda: the normal head orthogonal to fibres (the fibre tube plane rides the ink plane) */
 #define IPLANE (g_ink2 || g_rv || g_fibn)   /* the ink plane's buffers: --ink-head's ink, --rv's papyrus or --fib-normal-lambda's fibre tubes */
 static int g_unwrap, g_norm_ch, g_norm_s = 4; static float g_ink_lambda = 1.f, g_ink_dice = 0.f, g_norm_lambda = 1.f, g_dens_lambda = 1.f, g_dens_scale = 32.f;   /* --density-lambda: the density channel's BCE weight (default --normal-lambda) */
 static int g_dens_code; static float g_packed_w, g_packed_um = 120.f;   /* --density-code, --packed-weight, --packed-um (task unwrap) */
@@ -975,7 +975,7 @@ static void head_slab_pass(gpu_state *d, int pass) {
             FT("  s side stats");
             if (fuse) nn_lat_fuse_stats(d->lgc, 1, qa, qb - qa, D / 4, H / 4, W / 4, z0, nz, g_norm_ch, 7, 0, -1, nullptr, d->nt, d->nm, d->nw, pw0, u70, d->hs_ds + 20, light);
             else nn_loss_stats_acc(LGC(g_norm_ch), d->nt, d->nm, d->nw, seven, d->hs_ds + 20);
-            if (g_fibn) nn_fibn(LGC(g_norm_ch), ns, ink, D, H, W, z0, z1, g_fibn_r, g_fibn_thr, d->fibacc, nullptr, nullptr, 0, 0);   /* (the window's fibre voxels: the gradient's mean) */
+            if (g_fibn) nn_fibn(LGC(g_norm_ch), ns, ink, D, H, W, z0, z1, g_fibn_r, g_fibn_thr, g_fibn_unsup ? d->nm : nullptr, d->fibacc, nullptr, nullptr, 0, 0);   /* (the window's fibre voxels: the gradient's mean) */
             FT("  s normal stats");
             if (g_pg_lambda > 0) nn_pgrad_slab(d->hs_train ? nullptr : LGC(g_side_ch), d->hs_train ? nullptr : LGC(g_side_ch + 1), sdb, d->sidem, D, H, W, z0, z1, g_norm_s, g_pg_dist, g_pg_nd, g_pg_angle, g_pg_mask, d->hs_ds + 56, nullptr);   /* (training: the pair weights only; the loss sum comes from the gradient pass, + 58) */
             PT("losses");
@@ -999,7 +999,7 @@ static void head_slab_pass(gpu_state *d, int pass) {
         FT("  g side grad");
         if (g_side_lambda != 1.f && !fside) nn_loss_grad_scale(LGC(g_side_ch), 2 * ns, g_side_lambda);
         if (g_pg_lambda > 0) nn_pgrad_apply(LGC(g_side_ch), LGC(g_side_ch + 1), d->pg_acc, ns, d->hs_ds + 56, g_pg_lambda);
-        if (g_fibn) { nn_zero(d->fibnl, sizeof(unsigned)); nn_fibn(LGC(g_norm_ch), ns, ink, D, H, W, z0, z1, g_fibn_r, g_fibn_thr, d->fibacc, d->fiblist, d->fibnl, d->fibcap, 1); }   /* (reads the logits: before the in-place gradient) */
+        if (g_fibn) { nn_zero(d->fibnl, sizeof(unsigned)); nn_fibn(LGC(g_norm_ch), ns, ink, D, H, W, z0, z1, g_fibn_r, g_fibn_thr, g_fibn_unsup ? d->nm : nullptr, d->fibacc, d->fiblist, d->fibnl, d->fibcap, 1); }   /* (reads the logits: before the in-place gradient) */
         if (!fuse) nn_loss_grad_only(LGC(g_norm_ch), d->nt, d->nm, d->nw, seven, 0.f, LGC(g_norm_ch), d->nscratch);
         FT("  g normal grad");
         if (fuse) ;
@@ -1633,6 +1633,8 @@ int cmd_train(int argc, char **argv) {
            (scripts/fibers/mklabels.sh), carried on the ink plane through every symmetry / warp; the tangent is read off the warped tube on the device */
         g_fibn_lambda = (float)atof(opt(argc,argv,"--fib-normal-lambda","0")); g_fibn = g_fibn_lambda > 0;
         g_fibn_r = atoi(opt(argc,argv,"--fib-normal-r","2")); g_fibn_thr = atoi(opt(argc,argv,"--fib-normal-thr","128"));
+        g_fibn_unsup = atoi(opt(argc,argv,"--fib-normal-unsup","0"));   /* 1: the fibre term only where the normal BCE has no target (its mask 0) */
+        if (g_fibn_unsup < 0 || g_fibn_unsup > 1) { fprintf(stderr,"--fib-normal-unsup 0|1\n"); return 2; }
         if (!(g_fibn_lambda >= 0) || g_fibn_r < 1 || g_fibn_r > 4 || g_fibn_thr < 1 || g_fibn_thr > 254 || (g_fibn && (g_ink2 || g_rv || (!g_unwrap2 && g_ink_lambda != 0.f)))) {
             fprintf(stderr,"--fib-normal-lambda >= 0 (--fib-normal-r 1..4, --fib-normal-thr 1..254); it uses the ink plane: not with --ink-head / --rv, and task unwrap needs --ink-lambda 0\n"); return 2;
         }

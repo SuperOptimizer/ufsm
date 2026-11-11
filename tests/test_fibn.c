@@ -47,11 +47,11 @@ static int tangent(const uint8_t *fib, size_t i, int H, int W, int r, float t[3]
 }
 static float sig(float x) { return 1.f / (1.f + expf(-x)); }
 /* host: valid voxels of slab [z0, z1) and the sum of t^T N t (logits lg: 6 planes of the slab's ns voxels) */
-static double host_sum(const uint8_t *fib, const float *lg, int D, int H, int W, int z0, int z1, int r, int thr, double *cnt) {
+static double host_sum_m(const uint8_t *fib, const float *lg, int D, int H, int W, int z0, int z1, int r, int thr, const uint8_t *nm, double *cnt) {
     const size_t hw = (size_t)H * W, ns = (size_t)(z1 - z0) * hw; double s = 0; *cnt = 0; const int R = r + 1; (void)D;
     for (size_t li = 0; li < ns; li++) {
         const int z = z0 + (int)(li / hw), y = (int)((li / W) % H), x = (int)(li % W); const size_t i = (size_t)z * hw + (size_t)y * W + x;
-        if (fib[i] == 255 || fib[i] < thr || z - R < z0 || z + R >= z1 || y < R || y + R >= H || x < R || x + R >= W) continue;
+        if (fib[i] == 255 || fib[i] < thr || (nm && nm[li]) || z - R < z0 || z + R >= z1 || y < R || y + R >= H || x < R || x + R >= W) continue;
         float t[3]; if (!tangent(fib, i, H, W, r, t)) continue;
         const float c6[6] = {t[0] * t[0], t[1] * t[1], t[2] * t[2], 2 * t[0] * t[1], 2 * t[0] * t[2], 2 * t[1] * t[2]};
         float L = 0; for (int c = 0; c < 6; c++) { const float p = sig(lg[(size_t)c * ns + li]); L += c6[c] * (c < 3 ? p : p - 0.5f); }
@@ -59,6 +59,7 @@ static double host_sum(const uint8_t *fib, const float *lg, int D, int H, int W,
     }
     return s;
 }
+static double host_sum(const uint8_t *fib, const float *lg, int D, int H, int W, int z0, int z1, int r, int thr, double *cnt) { return host_sum_m(fib, lg, D, H, W, z0, z1, r, thr, nullptr, cnt); }
 static void tube(uint8_t *fib, int D, int H, int W, const double d[3], const double c[3]) {
     for (int z = 0; z < D; z++) for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
         const double v[3] = {z - c[0], y - c[1], x - c[2]}, a = v[0] * d[0] + v[1] * d[1] + v[2] * d[2];
@@ -91,13 +92,13 @@ int main(void) {
             const double dot = fabs(t[0] * d[0] + t[1] * d[1] + t[2] * d[2]); if (dot < worst_dot) worst_dot = dot; sum_dot += dot; ndot++;
         }
         /* whole window: count and sum */
-        nn_zero(dacc, 64); nn_fibn(dlg, n, dfib, D, H, W, 0, D, r, thr, dacc, nullptr, nullptr, 0, 0);
+        nn_zero(dacc, 64); nn_fibn(dlg, n, dfib, D, H, W, 0, D, r, thr, nullptr, dacc, nullptr, nullptr, 0, 0);
         double acc[2]; nn_d2h(acc, dacc, sizeof acc); double hc; const double hs = host_sum(fib, lgf, D, H, W, 0, D, r, thr, &hc);
         CHECK(fabs(acc[0] - hc) <= 0.01 * hc + 2, "symmetry %d: valid voxels %g, host %g", sym, acc[0], hc);
         CHECK(fabs(acc[1] / acc[0] - hs / hc) < 2e-3, "symmetry %d: mean t^T N t %g, host %g", sym, acc[1] / acc[0], hs / hc);
         if (sym == 5) {   /* the gradient against central differences of the host loss lambda / count x sum */
             const float lambda = 0.7f; nn_zero(dg, 6 * n * sizeof(float)); nn_zero(dnl, 64);
-            nn_fibn(dlg, n, dfib, D, H, W, 0, D, r, thr, dacc, dlist, dnl, cap, 1);
+            nn_fibn(dlg, n, dfib, D, H, W, 0, D, r, thr, nullptr, dacc, dlist, dnl, cap, 1);
             nn_fibn_apply(dlist, dnl, cap, dacc, lambda, dg, n); nn_d2h(gh, dg, 6 * n * sizeof(float));
             unsigned nl; nn_d2h(&nl, dnl, sizeof nl);
             CHECK(nl == (unsigned)acc[0], "the gradient list holds %u voxels, the count %g", nl, acc[0]);
@@ -112,6 +113,18 @@ int main(void) {
             }
             printf("gradient: %u fibre voxels, %zu nonzero gradient elements (6 per voxel at most), %d checked, worst |analytic - central| %.2e (max |grad| %.2e)\n", nl, nz, nchk, werr, gmax);
             CHECK(nz <= 6 * (size_t)nl, "gradient outside the fibre voxels: %zu elements", nz);
+            {   /* --fib-normal-unsup: only voxels where the normal loss mask is 0 (here: the mask set on x < W / 2) count and get a gradient */
+                uint8_t *nmh = calloc(n, 1); for (size_t i = 0; i < n; i++) nmh[i] = (int)(i % W) < W / 2; uint8_t *dnm = nn_malloc(n); nn_h2d(dnm, nmh, n);
+                double a3[2], c3; nn_zero(dacc, 64); nn_fibn(dlg, n, dfib, D, H, W, 0, D, r, thr, dnm, dacc, nullptr, nullptr, 0, 0); nn_d2h(a3, dacc, sizeof a3);
+                const double s3 = host_sum_m(fib, lgf, D, H, W, 0, D, r, thr, nmh, &c3);
+                nn_zero(dg, 6 * n * sizeof(float)); nn_zero(dnl, 64); nn_fibn(dlg, n, dfib, D, H, W, 0, D, r, thr, dnm, dacc, dlist, dnl, cap, 1);
+                nn_fibn_apply(dlist, dnl, cap, dacc, lambda, dg, n); float *g3 = malloc(6 * n * sizeof(float)); nn_d2h(g3, dg, 6 * n * sizeof(float));
+                size_t bad = 0; for (int c = 0; c < 6; c++) for (size_t i = 0; i < n; i++) bad += nmh[i] && g3[(size_t)c * n + i] != 0.f;
+                printf("unsup mask: %g valid voxels (host %g, unmasked %g), mean %.5f (host %.5f), %zu gradient elements under the mask\n", a3[0], c3, acc[0], a3[1] / a3[0], s3 / c3, bad);
+                CHECK(fabs(a3[0] - c3) <= 0.01 * c3 + 2 && c3 > 0 && c3 < acc[0], "unsup mask: valid voxels %g, host %g (unmasked %g)", a3[0], c3, acc[0]);
+                CHECK(fabs(a3[1] / a3[0] - s3 / c3) < 2e-3 && bad == 0, "unsup mask: mean %g host %g, %zu masked gradients", a3[1] / a3[0], s3 / c3, bad);
+                free(nmh); free(g3); nn_free(dnm);
+            }
             CHECK(werr < 1e-3 * (gmax > 1e-6 ? gmax : 1e-6) + 1e-7 && nchk > 20, "gradient vs central differences: worst %.3e of %.3e (%d checked)", werr, gmax, nchk);
         }
         if (sym == 9) {   /* two slabs: the sums add up to the host's per-slab sums; the planes outside a slab are never read */
@@ -123,7 +136,7 @@ int main(void) {
                 float *ls = malloc(6 * ns * sizeof(float)); uint16_t *lh = malloc(6 * ns * 2);
                 for (int c = 0; c < 6; c++) for (size_t k = 0; k < ns; k++) { lh[(size_t)c * ns + k] = lgh[(size_t)c * n + (size_t)z0 * H * W + k]; ls[(size_t)c * ns + k] = lgf[(size_t)c * n + (size_t)z0 * H * W + k]; }
                 void *dls = nn_malloc(6 * ns * 2); nn_h2d(dls, lh, 6 * ns * 2);
-                nn_zero(dacc, 64); nn_fibn(dls, ns, dfib, D, H, W, z0, z1, r, thr, dacc, nullptr, nullptr, 0, 0);
+                nn_zero(dacc, 64); nn_fibn(dls, ns, dfib, D, H, W, z0, z1, r, thr, nullptr, dacc, nullptr, nullptr, 0, 0);
                 double a2[2]; nn_d2h(a2, dacc, sizeof a2); double c2; const double s2 = host_sum(fib, ls, D, H, W, z0, z1, r, thr, &c2);
                 printf("slab %d..%d: %g valid voxels (host %g), mean t^T N t %.5f (host %.5f)\n", z0, z1, a2[0], c2, a2[0] > 0 ? a2[1] / a2[0] : 0, c2 > 0 ? s2 / c2 : 0);
                 CHECK(fabs(a2[0] - c2) <= 0.01 * c2 + 2 && c2 > 0, "slab %d: valid voxels %g, host %g", s, a2[0], c2);
