@@ -48,6 +48,12 @@ Paris 4 HOLD at step 5000 against fibhv-a at step 5000 (same eval_hold.sh; persi
 | fibhv-a V | 0.47 (step 10000) | 10323 | 6.40 | 0.56 | 0.83 | 101.2 | .945 / .937 / .992 |
 | fibhv-b V | 0.07 | 9213 | 5.77 | 0.58 | 0.85 | 149.6 | .909 / .882 / .983 (57) |
 
+At step 10000 (fibhv-b): H 5103 lines, 3.12 m, median 0.56 mm, p90 0.82, persistent 51.8 /m, pairs .968 / .954 / .889 (9);
+V 6853 lines, 4.24 m, median 0.57, p90 0.84, persistent 142.0 /m, pairs .917 / .903 / .964 (28). No longer lines, fewer of them; the
+change rate stays above fibhv-a's (47.0 H / 101.2 V). fibhv-b was stopped at 10000 and fibhv-c started from it: `--fib-dir 1
+--init-from fibhv-b/snap/10000 --head-map 0,1,-1,...` (the mask head kept, the 7 direction rows fresh; 59 tensors copied), same
+recipe, snapshots every 3000; at step 50 mask bce 0.109 (fibhv-b 0.105), dir bce 1.45, 1.6 samp/s, 9.7 GB.
+
 The ring did what it was meant to: the masks now mark 7 % of the papyrus (tubes) instead of 40-47 % (layers). It did not make the traced
 lines longer at step 5000 (line ends: support 12657, turn 2276, coherence 1470 for H: the tubes fade, they no longer wander), and
 the lines change sheet more often. Step 10000 / 30000 still to come; the direction head (fibhv-c) is the next lever.
