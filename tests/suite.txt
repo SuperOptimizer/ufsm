@@ -19,6 +19,7 @@ test_sweep                                     |              |     1 | ./$B/tes
 test_gpu_input                                 | gpu          |    13 | ./$B/test_gpu_input
 test_pack_tm                                   | gpu          |     1 | ./$B/test_pack_tm
 test_wind4                                     | gpu          |     1 | ./$B/test_wind4
+test_fibn                                      | gpu          |     2 | ./$B/test_fibn
 test_w4dev                                     | gpu          |       10 | ./$B/test_w4dev
 test_lat_conv0                                 | gpu          |        3 | UFSM_F8W_MIXED_CZ=4 ./$B/test_lat_conv0
 test_lat_head                                  | gpu          |        5 | ./$B/test_lat_head

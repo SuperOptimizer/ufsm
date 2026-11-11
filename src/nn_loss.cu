@@ -873,3 +873,69 @@ extern "C" void nn_pgrad_apply(void *gc, void *gs, float *acc, size_t ns, const 
     else pgrad_apply_k<bf16><<<nblk(ns, 256), 256>>>((bf16 *)gc, (bf16 *)gs, acc, ns, sums, lambda * g_gscale);
     KCHECK();
 }
+/* ---- train --fib-normal-lambda: the normal head orthogonal to fibres ----
+   A fibre lies in its sheet, so at fibre voxels the predicted sign-free normal dyad N should have t^T N t = (n . t)^2 = 0 for the fibre
+   tangent t. N from the six normal logits as nn_unwrap_targets2 codes it: p_c = sigmoid(logit_c), N_zz = p0, N_yy = p1, N_xx = p2,
+   N_zy = p3 - 1/2, N_zx = p4 - 1/2, N_yx = p5 - 1/2 (output coordinates: the window after its symmetry / warp).
+   t comes from the fibre plane itself (prob254 tube raster, 255 unknown read as 0) on the device, after every augmentation: the gradient
+   structure tensor S of the plane over the (2r + 1)^3 neighbourhood is c (I - t t^T) for a tube, so T = I - 2 S / tr S ~ t t^T; t = T's leading eigenvector (three power steps); voxels
+   whose T is not near rank one are skipped (leading eigenvalue < 0.75 or the other two with squares summing over 0.5: blobs, sheets,
+   crossings, tube ends). No direction is ever rotated on the host: the tangent is read in whatever frame the window ends in.
+   Loss: lambda x the mean of t^T N t over the window's valid fibre voxels (count from the statistics pass, acc[0]; acc[1] the sum of t^T N t).
+   Only voxels whose stencil (r + 1 planes) lies inside the slab [z0, z1) and the window count: a streamed slab holds only its own planes. */
+struct fibn_ent { unsigned v; float g[6]; };
+__device__ __forceinline__ float fibn_m(const uint8_t *f, size_t i) { const uint8_t b = f[i]; return b == 255 ? 0.f : b * (1.f / 254.f); }
+__device__ __forceinline__ int fibn_tangent(const uint8_t *fib, size_t i, int H, int W, int r, float t[3]) {
+    const size_t hw = (size_t)H * W; float S[6] = {0, 0, 0, 0, 0, 0};
+    for (int dz = -r; dz <= r; dz++) for (int dy = -r; dy <= r; dy++) for (int dx = -r; dx <= r; dx++) {
+        const size_t u = i + (ptrdiff_t)dz * (ptrdiff_t)hw + (ptrdiff_t)dy * W + dx;
+        const float gz = 0.5f * (fibn_m(fib, u + hw) - fibn_m(fib, u - hw)), gy = 0.5f * (fibn_m(fib, u + W) - fibn_m(fib, u - W)), gx = 0.5f * (fibn_m(fib, u + 1) - fibn_m(fib, u - 1));
+        S[0] += gz * gz; S[1] += gy * gy; S[2] += gx * gx; S[3] += gz * gy; S[4] += gz * gx; S[5] += gy * gx;
+    }
+    const float tr = S[0] + S[1] + S[2]; if (!(tr > 1e-3f)) return 0;
+    const float k = 2.f / tr, T[3][3] = {{1.f - k * S[0], -k * S[3], -k * S[4]}, {-k * S[3], 1.f - k * S[1], -k * S[5]}, {-k * S[4], -k * S[5], 1.f - k * S[2]}};
+    float q = 0.f; for (int a = 0; a < 3; a++) for (int b = 0; b < 3; b++) q += T[a][b] * T[a][b];
+    int c = 0; if (T[1][1] > T[c][c]) c = 1; if (T[2][2] > T[c][c]) c = 2;
+    float v[3] = {T[0][c], T[1][c], T[2][c]};
+    for (int it = 0; it < 3; it++) { float w[3]; for (int a = 0; a < 3; a++) w[a] = T[a][0] * v[0] + T[a][1] * v[1] + T[a][2] * v[2];
+        const float nv = sqrtf(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]); if (!(nv > 1e-6f)) return 0; for (int a = 0; a < 3; a++) v[a] = w[a] / nv; }
+    float Tv[3]; for (int a = 0; a < 3; a++) Tv[a] = T[a][0] * v[0] + T[a][1] * v[1] + T[a][2] * v[2];
+    const float lam = v[0] * Tv[0] + v[1] * Tv[1] + v[2] * Tv[2];   /* the leading eigenvalue (1 for a tube); the other two hold q - lam^2 */
+    if (lam < 0.75f || q - lam * lam > 0.5f) return 0;   /* (a blob: lam 1/3; a sheet: a second eigenvalue 1; an anisotropic tube raster: small) */
+    t[0] = v[0]; t[1] = v[1]; t[2] = v[2]; return 1;
+}
+template <typename LT> __global__ void fibn_k(const LT *lg, size_t ns, const uint8_t *fib, int D, int H, int W, int z0, int z1, int r, int thr, double *acc,
+                                              fibn_ent *list, unsigned *nl, unsigned cap, int mode) {
+    const size_t li = blockIdx.x * (size_t)blockDim.x + threadIdx.x; if (li >= ns) return;
+    const size_t hw = (size_t)H * W; const int z = z0 + (int)(li / hw), y = (int)((li / W) % H), x = (int)(li % W), R = r + 1;
+    const size_t i = (size_t)z * hw + (size_t)y * W + x;
+    const uint8_t b = fib[i]; if (b == 255 || b < thr) return;
+    if (z - R < z0 || z + R >= z1 || y < R || y + R >= H || x < R || x + R >= W) return;
+    (void)D; float t[3]; if (!fibn_tangent(fib, i, H, W, r, t)) return;
+    const float c6[6] = {t[0] * t[0], t[1] * t[1], t[2] * t[2], 2.f * t[0] * t[1], 2.f * t[0] * t[2], 2.f * t[1] * t[2]};
+    float L = 0.f, p[6];
+    for (int c = 0; c < 6; c++) { p[c] = 1.f / (1.f + __expf(-lgv(lg, (size_t)c * ns + li))); L += c6[c] * (c < 3 ? p[c] : p[c] - 0.5f); }
+    if (!mode) { atomicAdd(acc, 1.0); atomicAdd(acc + 1, (double)L); return; }
+    const unsigned k = atomicAdd(nl, 1u); if (k >= cap) return;
+    fibn_ent e; e.v = (unsigned)li; for (int c = 0; c < 6; c++) e.g[c] = c6[c] * p[c] * (1.f - p[c]);
+    list[k] = e;
+}
+template <typename GT> __global__ void fibn_apply_k(const fibn_ent *list, const unsigned *nl, unsigned cap, const double *acc, float lambda, float gscale, GT *gl, size_t ns) {
+    const unsigned k = blockIdx.x * blockDim.x + threadIdx.x, n = *nl < cap ? *nl : cap; if (k >= n) return;
+    const float sc = (float)(lambda / fmax(acc[0], 1.0)) * gscale; const fibn_ent e = list[k];
+    for (int c = 0; c < 6; c++) { GT *g = gl + (size_t)c * ns + e.v; *g = f2h<GT>(h2f(*g) + sc * e.g[c]); }
+}
+extern "C" size_t nn_fibn_cap(size_t ns) { return ns / 8 + 1024; }
+extern "C" size_t nn_fibn_list_bytes(size_t cap) { return cap * sizeof(fibn_ent) + 64; }
+extern "C" void nn_fibn(const void *lg, size_t ns, const uint8_t *fib, int D, int H, int W, int z0, int z1, int r, int thr, double *acc, void *list, unsigned *nl, size_t cap, int mode) {
+    if (g_logits_h16) fibn_k<f16><<<nblk(ns, 256), 256>>>((const f16 *)lg, ns, fib, D, H, W, z0, z1, r, thr, acc, (fibn_ent *)list, nl, (unsigned)cap, mode);
+    else fibn_k<float><<<nblk(ns, 256), 256>>>((const float *)lg, ns, fib, D, H, W, z0, z1, r, thr, acc, (fibn_ent *)list, nl, (unsigned)cap, mode);
+    KCHECK();
+}
+extern "C" void nn_fibn_apply(const void *list, const unsigned *nl, size_t cap, const double *acc, float lambda, void *gl, size_t ns) {
+    const unsigned nb = (unsigned)((cap + 255) / 256);
+    if (!g_loss_g16) fibn_apply_k<float><<<nb, 256>>>((const fibn_ent *)list, nl, (unsigned)cap, acc, lambda, 1.f, (float *)gl, ns);
+    else if (g_h16) fibn_apply_k<f16><<<nb, 256>>>((const fibn_ent *)list, nl, (unsigned)cap, acc, lambda, g_gscale, (f16 *)gl, ns);
+    else fibn_apply_k<bf16><<<nb, 256>>>((const fibn_ent *)list, nl, (unsigned)cap, acc, lambda, g_gscale, (bf16 *)gl, ns);
+    KCHECK();
+}

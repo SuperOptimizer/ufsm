@@ -441,6 +441,16 @@ void nn_aff_loss_fetch(const float *fin, int K, float *out);
 void nn_set_pos_weight(float w);   /* BCE weight of positive targets (class balance), default 1 */
 void nn_loss_fetch(const float *scratch, shape5 s, float *out);
 void nn_loss_grad_scale(void *g, size_t n, float a);   /* scale a logit gradient (the losses' storage format) */
+/* train --fib-normal-lambda (src/nn_loss.cu): lambda x mean t^T N t at fibre voxels; N the sign-free normal dyad of the six normal logits
+   at lg (planes of ns, the slab's voxels; fp16 / fp32 as nn_set_logits_h16), t the tube axis of the fibre plane fib (prob254, 255 unknown,
+   indexed by window voxel; D H W the window) from its gradient structure tensor over (2r + 1)^3, at voxels >= thr whose stencil lies in
+   the slab planes [z0, z1). mode 0: acc[0] += valid voxels, acc[1] += t^T N t; mode 1: their per-voxel gradients d(t^T N t) / dlogit into
+   list (cap entries, *nl the count: zero it per slab). nn_fibn_apply adds lambda / acc[0] x the list into the gradient gl (the losses'
+   storage format, planes of ns: call after the normal loss wrote it) */
+size_t nn_fibn_cap(size_t ns);
+size_t nn_fibn_list_bytes(size_t cap);
+void nn_fibn(const void *lg, size_t ns, const uint8_t *fib, int D, int H, int W, int z0, int z1, int r, int thr, double *acc, void *list, unsigned *nl, size_t cap, int mode);
+void nn_fibn_apply(const void *list, const unsigned *nl, size_t cap, const double *acc, float lambda, void *gl, size_t ns);
 /* Sparse trilinear samples. Ownership is global z in [own_lo,own_hi), so a
    sample crossing a split boundary is reduced once and its corners get the
    correct local gradients. coords is host [np][3], values host [np][2]. */
