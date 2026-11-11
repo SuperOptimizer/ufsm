@@ -13,6 +13,7 @@
 #include <limits.h>
 #include "sources.h"
 #include "band_onfly.h"
+#include "fiberraster.h"
 #include "split.h"
 #include "unet.h"
 #include "latfit.h"
@@ -2327,6 +2328,14 @@ int cmd_train(int argc, char **argv) {
             const int og = atoi(opt(argc, argv, "--onfly-gpu", "0")), os = atoi(opt(argc, argv, "--onfly-slots", "2")), om = atoi(opt(argc, argv, "--onfly-mb", "2048"));
             if (phase_onfly_config(og, os, om, 1)) { fprintf(stderr, "train: --onfly-gpu %d: no GPU pair rule (or the reserve failed)\n", og); return 1; }
             fprintf(stderr, "train: on-the-fly phase on %s %d, %d slots of %d MB (tile edge %d voxels at rmax %g)\n", og >= 0 ? "GPU" : "CPU", og, os, om, phase_onfly_tile_edge(rmax), rmax);
+        }
+        int nfib = 0; for (int i = 0; i < S->n; i++) for (int c = 0; c < NTG; c++) nfib += S->src[i].tgt_fib[c] != nullptr;
+        if (nfib) {   /* "fibre" targets (fiberraster.h): the planes' stamp and combine on --onfly-gpu, buffers for the window's box reserved now */
+            const int og = atoi(opt(argc, argv, "--onfly-gpu", "0")), P0 = atoi(opt(argc, argv, "--P", "64")), e = P0 + 64;
+            const int fg = fiber_onfly_config(og, e);
+            if (fg < 0) { fprintf(stderr, "train: --onfly-gpu %d: no GPU fibre planes (or the reserve failed)\n", og); return 1; }
+            if (fg) fprintf(stderr, "train: on-the-fly fibre planes (%d targets) on GPU %d, buffers for %d^3 boxes\n", nfib, og, e);
+            else fprintf(stderr, "train: on-the-fly fibre planes (%d targets) on the CPU\n", nfib);
         }
     }
     for (int i = 0; g_restore && i < S->n; i++) if (!S->src[i].srp != !g_rpairs) { fprintf(stderr, "--task restore: %s: \"sr_pair\" sources need --sr-pairs 1 and --sr-pairs 1 needs them all\n", S->src[i].name); return 2; }
