@@ -1765,6 +1765,14 @@ int cmd_train(int argc, char **argv) {
     const float trunk_lr = (float)atof(opt(argc, argv, "--trunk-lr-mult", "1"));
     const int trunk_lr_steps = atoi(opt(argc, argv, "--trunk-lr-steps", "0"));   /* > 0: the multiplier only until this step (then x1; a resume past it starts at x1) */
     if (!(trunk_lr >= 0.f) || (trunk_lr != 1.f && use_anvil)) { fprintf(stderr, "--trunk-lr-mult: >= 0, not with --opt anvil\n"); return 2; }
+    /* --init-lr-mult F: the parameters --init-from copied (and only those; the ranges ride in the checkpoint, so a resume keeps them) at
+       F x the scheduled rates, everything fresh (a latent stem, new heads, ...) at the full rates. --init-lr-steps N: F until step N, then
+       a linear ramp to 1 over the next N steps (0 = F for the whole run). (wzlo 2026-11-11: --trunk-lr-mult 0.2 also slowed the fresh
+       latent stem; the copied trunk then waited for inputs it understood: p05x 0.586 vs 0.624 from a full-rate run.) */
+    const float init_lr = (float)atof(opt(argc, argv, "--init-lr-mult", "1"));
+    const int init_lr_steps = atoi(opt(argc, argv, "--init-lr-steps", "0"));
+    if (!(init_lr >= 0.f) || init_lr_steps < 0) { fprintf(stderr, "--init-lr-mult >= 0, --init-lr-steps >= 0\n"); return 2; }
+    if (init_lr != 1.f && (trunk_lr != 1.f || use_anvil || muon_c || hyperball)) { fprintf(stderr, "--init-lr-mult: not with --trunk-lr-mult, --opt anvil, --muon-c or --hyperball\n"); return 2; }
     float anvil_lr = (float)atof(opt(argc, argv, "--anvil-lr", "0.023")), anvil_wd = (float)atof(opt(argc, argv, "--anvil-wd", "2.25"));
     const char *sched = opt(argc, argv, "--sched", "cos");   /* cos | wsd (warmup, constant, linear cooldown over the last --cooldown fraction; extendable runs) */
     int schedule_start = atoi(opt(argc, argv, "--schedule-start", "0"));
@@ -1790,6 +1798,7 @@ int cmd_train(int argc, char **argv) {
     if (qat) { nn_set_prec(qat); nn_set_prec_wgrad(1); }
     if (atoi(opt(argc, argv, "--sr", "0"))) nn_set_sr(1);                                   /* stochastic rounding of fp8 gradient operands */
     int wq = atoi(opt(argc, argv, "--wq", "0"));            /* 8 or 4: true fp8 / fp4 weights (stochastic rounding after each update) */
+    if (wq && init_lr != 1.f) { fprintf(stderr, "--init-lr-mult: not with --wq\n"); return 2; }
     int sparse_at = atoi(opt(argc, argv, "--sparse24", "0"));   /* step from which the 3^3 conv weights are 2:4 sparse (0 = dense) */
     float srste = (float)atof(opt(argc, argv, "--srste", "2e-4"));
     nn_set_pos_weight((float)atof(opt(argc, argv, "--pos-weight", "1")));   /* BCE weight of surface voxels */
@@ -2320,6 +2329,7 @@ int cmd_train(int argc, char **argv) {
         unet_set_wd_nonconv(d->u, (float)atof(opt(argc, argv, "--wd-nonconv", "0")));   /* Muon / ANVIL: no decay on GroupNorm, biases, head */
         unet_set_muon_ext(d->u, muon_c, hyperball, hb_mult);
         if (trunk_lr != 1.f) unet_set_trunk_lr(d->u, trunk_lr);
+        if (init_lr != 1.f) unet_set_init_lr(d->u, init_lr);
         /* fp16 logits in their own buffer (MX activations; the losses read them as unet_logits_h16 says): 11 unwrap heads at P 384
            are 2.5 GB in fp32. Not for half-resolution nets (the losses read the fp32 upsampled copy) or sheet nets; UFSM_LOGITS32=1 */
         unet_set_fp16_logits(d->u, (!g_half || g_pkf) && !g_sheet && !ufsm_env_on("UFSM_LOGITS32"));
@@ -2330,6 +2340,7 @@ int cmd_train(int argc, char **argv) {
             if (step0 < 0) { fprintf(stderr, "cannot load %s\n", resume); return 1; }
             if (atoi(opt(argc, argv, "--finetune", "0"))) step0 = 0;   /* loaded weights/state, fresh schedule */
             if (sheet_init && unet_start_sheet(d->u)) return 2;
+            if (g == 0 && init_lr != 1.f) fprintf(stderr, "--init-lr-mult %g: %zu of %zu parameters inherited (from %s)\n", init_lr, unet_inherited(d->u), unet_nparams(d->u), resume);
         } else {
             unet_init(d->u, seed + 1); /* deterministic: every GPU starts identical */
             if (g_restore) unet_zero_head(d->u);   /* residual net: output == input at step 0 */
@@ -2362,6 +2373,7 @@ int cmd_train(int argc, char **argv) {
                 if (nt < 0) { fprintf(stderr, "cannot initialise from %s\n", init_from); return 1; }
                 if (w4map && g_ink2) unet_head_row_reset(d->u, g_ink2_ch, (float)atof(opt(argc, argv, "--ink-bias", "-2")));   /* (a fresh ink row: zero weights, the prior bias; the donor's function elsewhere) */
                 if (g == 0) fprintf(stderr, "initialised %d layer tensors from %s (the rest fresh)\n", nt, init_from);
+                if (g == 0 && init_lr != 1.f) fprintf(stderr, "--init-lr-mult %g: %zu of %zu parameters inherited\n", init_lr, unet_inherited(d->u), unet_nparams(d->u));
             }
             if (g_lat_guide == 64) {   /* the sub-cell outputs start at zero: the net begins as the interpolated head (random rows gave a 4-voxel lattice wherever the labels do not reach) */
                 for (int co = 16; co < cfg.cout; co++) unet_head_row_reset(d->u, co, 0.f);
@@ -3074,6 +3086,11 @@ int cmd_train(int argc, char **argv) {
         if (trunk_lr != 1.f && trunk_lr_steps > 0 && step == (step0 + 1 > trunk_lr_steps + 1 ? step0 + 1 : trunk_lr_steps + 1)) {   /* --trunk-lr-steps: the trunk back to the full rates */
             for (int g = 0; g < ng; g++) unet_set_trunk_lr(G[g].u, 1.f);
             fprintf(stderr, "step %d: trunk learning rate x1 (--trunk-lr-steps %d)\n", step, trunk_lr_steps);
+        }
+        if (init_lr != 1.f && init_lr_steps > 0 && step > init_lr_steps) {   /* --init-lr-steps: F until N, then a linear ramp to 1 by 2N */
+            const float f = step >= 2 * init_lr_steps ? 1.f : init_lr + (1.f - init_lr) * (float)(step - init_lr_steps) / (float)init_lr_steps;
+            for (int g = 0; g < ng; g++) unet_set_init_lr(G[g].u, f);
+            if (step == init_lr_steps + 1 || step == 2 * init_lr_steps) fprintf(stderr, "step %d: inherited parameters at lr x %.3g (--init-lr-steps %d)\n", step, f, init_lr_steps);
         }
         g_verso_on = g_verso && step >= g_verso_start;
         g_ptrunc_on = g_ptrunc_tau > 0 && step >= g_ptrunc_from;   /* (off again for the validation passes below) */

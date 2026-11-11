@@ -115,6 +115,7 @@ test_wtrunk                                    | gpu          |    10 | ./$B/tes
 test_attn_ray                                  |              |    14 | ./$B/test_attn_ray
 test_attn_dfm                                  |              |    26 | ./$B/test_attn_dfm
 test_hybrid_identity                           | gpu          |     6 | ./$B/test_hybrid_identity
+test_init_lr                                   | gpu          |     3 | ./$B/test_init_lr
 test_dinor                                     | gpu          |    60 | UFSM_TEST_QUICK=1 ./$B/test_dinor
 test_dinor~full                                | gpu,slow     |   104 | ./$B/test_dinor
 test_dino_pts                                  |              |     1 | ./$B/test_dino_pts
