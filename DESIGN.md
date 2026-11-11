@@ -6,6 +6,44 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## phase-raster's pair rule lean and on the GPU, byte-identical (2026-11-11, branch labelfast-20261111)
+
+The Paris 4 phase labels (`phase-raster --gs 4 --codes-grid 1 --pair 1 --radius 160`, the p4full flags, 3,549 shards in the box) ran
+on pod 2 at ~8 shards / min on 4 threads, ~7 h per set; 4 threads because each block thread held ~0.8 GB (a 256^3 block plus the
+42-voxel halo, 340^3 = 39 M voxels at ~22 B: codes, a band buffer the pair rule never reads, two seed masks, two float distance arrays,
+two int32 feature-index arrays) under the pod's 31 GB cap.
+
+Profile (desk, 8 dense shards 17-18 / 8-9 / 8-9 of June, perf): Felzenszwalb-Huttenlocher envelopes 40 %, the EDT gather / scatter
+20 %, the pair loop 22 % (index decodes), the zarr read / volcomp encode ~5 %. All compute; the CPU path had ~3.6 cores busy.
+
+Changes (src/band.c, src/main.c, src/nn_band.cu):
+- **Lean EDT**: `edt_feature_cap(..., d2 = nullptr, idx)` keeps only the feature indices; each pass rebuilds the squared distance from
+  the index (after the x pass the feature lies on the voxel's x line, after y in its z plane). Those distances are exact integers
+  (< 2^24) and so equal the stored floats; the envelopes see the same values, the indices come out identical. `band_field_phase_pair`
+  and `band_field_side_pair` use it; the pair rule reuses one seed mask and skips the band buffer: ~10 B / block voxel instead of 22.
+- **GPU pair rule** (`--gpu D [--gpu-slots K]`): the same x sweeps, y / z envelopes (one thread per line, consecutive x per warp, the
+  envelope in [q][line] scratch, 32 k lines per chunk) and pair kernel, built `-fmad=false` without fast math (IEEE div / sqrt,
+  `lrintf`) like nn_gpudec / nn_cf, so every float rounds as in band.c (gcc -std=c23 does not contract). A pool of K device contexts
+  (~0.5 GB each at these flags) shared by the block threads; any CUDA failure falls back to the CPU. Weak symbols: a binary without
+  nn_band.o runs the CPU code.
+
+| 8 dense June shards (desk, 5060 Ti) | wall | peak RSS |
+|---|---|---|
+| before, `--threads 4 --shards 1` (the pod's setting) | 54.5 s | 3.4 GB |
+| before, `--threads 8 --shards 3` | 21.5 s | 18.6 GB |
+| lean CPU, `--threads 4 --shards 1` | 62.9 s | 2.0 GB |
+| lean CPU, `--threads 8 --shards 3` | 14.8 s | 10.5 GB |
+| GPU, `--threads 8 --shards 3 --gpu 1 --gpu-slots 1 / 2 / 4` | 4.6 / 3.7 / 3.6 s | 2.4 GB |
+
+GPU: 15x the pod's old setting at 0.7x its RAM; 64 dense shards (z 18-21, y / x 6-9) in 38.5 s (0.6 s a shard). The lean CPU loses 15 %
+per thread to the index decodes but halves the RAM, so the same 31 GB holds twice the threads. Now the CPU side (read, pool, encode)
+bounds it: more slots buy nothing past 2.
+
+Byte identity: the 8 and the 64 shards equal the desk `v2/rv/gt/p4full/phaseA` shards byte for byte; `tests/test_band_pair.c` (suite,
+gpu tag) checks `band_field_phase_pair` (lean CPU and GPU) and `band_field_side_pair` against the previous band.c code kept verbatim
+in the test, on synthetic spirals with holes, conflicts and a missing wrap, five box shapes (non-cubic and an empty one), two radii:
+0 differing voxels. `scripts/pod/p4kit.sh`: `PS=3 PR="--gpu 0 --gpu-slots 2"` for the phase steps (resume keeps the shards written).
+
 ## Inference from the stored latent volume, without the CT (2026-11-10, branch latinf-20261109)
 
 `predict --latents STORE` (an `ufsm lc-encode` store of the CT level) reads no CT voxel; the CT store is opened for its metadata only
