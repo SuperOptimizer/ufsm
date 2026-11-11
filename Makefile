@@ -557,6 +557,8 @@ $(B)/test_pgrad: tests/test_pgrad.c $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 $(B)/test_wind4: tests/test_wind4.c $(B)/band.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
+$(B)/test_fibn: tests/test_fibn.c $(B)/nn.o $(B)/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 $(B)/test_lat_conv0: tests/test_lat_conv0.c $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 $(B)/test_w4dev: tests/test_w4dev.c $(B)/band.o $(B)/nn.o $(B)/nn_fp8.o
@@ -697,6 +699,7 @@ suite-bins: $(B)/test_restore_task
 suite-bins: $(B)/test_gpu_input $(B)/test_lat $(B)/test_lat_fuse
 suite-bins: $(B)/test_pack_tm
 suite-bins: $(B)/test_wind4
+suite-bins: $(B)/test_fibn
 suite-bins: $(B)/test_w4dev
 suite-bins: $(B)/test_lat_head
 suite-bins: $(B)/test_lat_conv0

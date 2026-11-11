@@ -3311,7 +3311,37 @@ static occ_index label_occupancy(source *s) {
     int lc = -1; z3 *tz = nullptr;
     for (int l = MAXLEV - 1; l >= 3; l--) { z3 *t = source_tgt(s, 0, l); if (t) { const z3_meta *m = z3_meta_of(t); if ((double)m->shape[0] * m->shape[1] * m->shape[2] < 4.29e9) { lc = l; tz = t; break; } } }
     if (!tz && s->band && s->phase) return phase_occupancy(s);
-    if (!tz) return o;
+    if (!tz) {   /* a target without a coarse level (the fibre tube rasters of fiber-raster: one level-0 array, sharded): the cells of the
+                    scan's level-5 CT that hold papyrus (>= the source's iso) and lie in a stored target chunk. Without an index the windows are
+                    drawn uniformly over the whole scan and most fail the CT probe: 5 of 60 windows came from the 1447 / 0175A fibre sources at
+                    25 % of the weight */
+        for (int ch = 0; ch < NCH && !o.n; ch++) {
+            const int l0 = s->min_level > 0 ? s->min_level : 0, lc = l0 + 5;
+            z3 *t0 = s->tgt_key[ch] && !s->band ? source_tgt(s, ch, l0) : nullptr, *cc = t0 && lc < MAXLEV ? source_ct(s, lc) : nullptr;
+            if (!t0 || !cc) continue;
+            const z3_meta *m0 = z3_meta_of(t0), *mc = z3_meta_of(cc); const int cs = m0->chunk[0];
+            if (cs < 32 || (cs & (cs - 1)) || m0->chunk[1] != cs || m0->chunk[2] != cs) continue;
+            const int sh = __builtin_ctz((unsigned)cs) - 5;   /* level-5 cells per target chunk edge: 2^sh */
+            int64_t g[3]; uint8_t *bits = nullptr; if (z3_chunk_map(t0, g, &bits) <= 0) { free(bits); continue; }
+            const size_t pl = (size_t)mc->shape[1] * mc->shape[2], tot = pl * (size_t)mc->shape[0];
+            uint8_t *cb = tot < 4.29e9 ? malloc(tot) : nullptr; const int64_t zo[3] = {0, 0, 0}, zn[3] = {mc->shape[0], mc->shape[1], mc->shape[2]};
+            if (!cb || z3_read(cc, zo, zn, cb, 8)) { free(cb); free(bits); continue; }
+            const int iso = s->iso > 0 ? s->iso : 1; size_t n = 0;
+            for (int pass = 0; pass < 2; pass++) {
+                for (int64_t z = 0; z < mc->shape[0]; z++) for (int64_t y = 0; y < mc->shape[1]; y++) for (int64_t x = 0; x < mc->shape[2]; x++) {
+                    const size_t k = ((size_t)z * mc->shape[1] + (size_t)y) * mc->shape[2] + (size_t)x;
+                    const int64_t qz = z >> sh, qy = y >> sh, qx = x >> sh;
+                    if (cb[k] < iso || qz >= g[0] || qy >= g[1] || qx >= g[2] || !bits[((size_t)qz * g[1] + (size_t)qy) * g[2] + (size_t)qx]) continue;
+                    if (pass) o.idx[o.n++] = (uint32_t)k; else n++;
+                }
+                if (!pass && (!n || !(o.idx = malloc(n * sizeof *o.idx)))) break;
+            }
+            if (o.n) { o.lev = lc; for (int d = 0; d < 3; d++) o.shape[d] = mc->shape[d];
+                fprintf(stderr, "sampler: %s: %zu of %zu level-%d CT cells hold papyrus inside the stored target chunks (the draw cells)\n", s->name, o.n, tot, lc); }
+            free(cb); free(bits);
+        }
+        return o;
+    }
     const z3_meta *m = z3_meta_of(tz);
     const int binary = s->tgt_binary[0] || m->label_binary;
     const size_t plane = (size_t)m->shape[1] * m->shape[2], tot = plane * (size_t)m->shape[0];

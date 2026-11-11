@@ -87,6 +87,7 @@ typedef struct {
     uint8_t *pmb[2], *pm, *nt, *nm, *nw; float *iscratch, *nscratch, iout[3], nout[15]; double ink_loss, norm_loss, norm_raw;
     float *cnt_acc, *cnt_seg, *cnt_out, cnt_h[21]; unsigned *cnt_nv; uint64_t cnt_step; double count_loss;   /* --count-lambda */   /* task unwrap: papyrus mask (ink loss), normal / density targets, mask, weights; scratch and parts of the ink and normal losses */
     uint8_t *w4b[2], *wcb[2], *w4, *wc; double *w4ds; float *w4fin, w4h[8]; double w4_loss;   /* --task unwrap2: winding mod 4 and its component per voxel (double-buffered), loss sums, scratch, host parts */
+    double *fibacc; void *fiblist; unsigned *fibnl; size_t fibcap; double fib_h[2];   /* --fib-normal-lambda: valid voxels / sum t^T N t (device), the slab list, the fetched sums */
     uint8_t *inkb[2], *ink, *inkt, *inkm, *inkw;   /* --ink-head: the ink plane (double-buffered), its slab target / mask, weight byte (loss parts: iscratch / iout / ink_loss) */
     uint8_t *wdb[2], *wd, *ct4, *cm4, *cw4; float *cscratch, cout4[9]; double cond_loss;   /* --cond: the gauge-shifted winding per voxel, its 4 targets, mask, weights; scratch and parts */
     unsigned long long *cacc, cacc_h[2];   /* --cond: known / right-turn voxel counts of the 14-turn head (device, last batch on the host) */
@@ -158,7 +159,8 @@ static int g_ink2, g_ink2_ch = -1;
    papyrus (the sampler's papyrus plane = clean CT >= the source's "iso", else --rv-iso), 0 / 0 on void; papyrus of unknown phase masked.
    The papyrus plane rides the ink plane's buffers (no --ink-head then). The phase still drives the normal / density / winding heads */
 static int g_rv; static float g_rv_vw = 1.f;   /* --rv-verso-w: verso-side papyrus loss weight multiplier */
-#define IPLANE (g_ink2 || g_rv)   /* the ink plane's buffers: --ink-head's ink or --rv's papyrus */
+static float g_fibn_lambda; static int g_fibn, g_fibn_r = 2, g_fibn_thr = 128, g_fibn_unsup;   /* --fib-normal-lambda: the normal head orthogonal to fibres (the fibre tube plane rides the ink plane) */
+#define IPLANE (g_ink2 || g_rv || g_fibn)   /* the ink plane's buffers: --ink-head's ink, --rv's papyrus or --fib-normal-lambda's fibre tubes */
 static int g_unwrap, g_norm_ch, g_norm_s = 4; static float g_ink_lambda = 1.f, g_ink_dice = 0.f, g_norm_lambda = 1.f, g_dens_lambda = 1.f, g_dens_scale = 32.f;   /* --density-lambda: the density channel's BCE weight (default --normal-lambda) */
 static int g_dens_code; static float g_packed_w, g_packed_um = 120.f;   /* --density-code, --packed-weight, --packed-um (task unwrap) */
 static float g_ptrunc_tau, g_ptrunc_kappa = 0.5f; static int g_ptrunc_from = 5000, g_ptrunc_on;   /* --phase-trunc TAU [--phase-trunc-conf K] [--phase-trunc-from STEP]: the robust phase loss (nn_phase_trunc), on from STEP */
@@ -860,7 +862,7 @@ static void head_slab_pass(gpu_state *d, int pass) {
     const int light = g_lat_fuse && d->fpart && d->hs_train && nn_get_loss_grad_h16() && light_on;
     static int fine = -1; if (fine < 0) fine = getenv("UFSM_PTICK") && atoi(getenv("UFSM_PTICK")) >= 2;   /* UFSM_PTICK=2: the target / loss kernels one by one (both passes summed) */
 #define FT(w) do { if (fine) nn_ptick(w); } while (0)
-    if (!pass) { nn_zero(d->hs_ds, 64 * sizeof(double)); if (g_unwrap2) nn_zero(d->w4ds, nn_wind4_sums()); }
+    if (!pass) { nn_zero(d->hs_ds, 64 * sizeof(double)); if (g_unwrap2) nn_zero(d->w4ds, nn_wind4_sums()); if (g_fibn) nn_zero(d->fibacc, 2 * sizeof(double)); }
     for (int z0 = 0; z0 < D; z0 += Z) {
         const int z1 = z0 + Z < D ? z0 + Z : D, nz = z1 - z0;
         const size_t ns = (size_t)nz * hw, vb = (size_t)z0 * hw;
@@ -974,6 +976,7 @@ static void head_slab_pass(gpu_state *d, int pass) {
             FT("  s side stats");
             if (fuse) nn_lat_fuse_stats(d->lgc, 1, qa, qb - qa, D / 4, H / 4, W / 4, z0, nz, g_norm_ch, 7, 0, -1, nullptr, d->nt, d->nm, d->nw, pw0, u70, d->hs_ds + 20, light);
             else nn_loss_stats_acc(LGC(g_norm_ch), d->nt, d->nm, d->nw, seven, d->hs_ds + 20);
+            if (g_fibn) nn_fibn(LGC(g_norm_ch), ns, ink, D, H, W, z0, z1, g_fibn_r, g_fibn_thr, g_fibn_unsup ? d->nm : nullptr, d->fibacc, nullptr, nullptr, 0, 0);   /* (the window's fibre voxels: the gradient's mean) */
             FT("  s normal stats");
             if (g_pg_lambda > 0) nn_pgrad_slab(d->hs_train ? nullptr : LGC(g_side_ch), d->hs_train ? nullptr : LGC(g_side_ch + 1), sdb, d->sidem, D, H, W, z0, z1, g_norm_s, g_pg_dist, g_pg_nd, g_pg_angle, g_pg_mask, d->hs_ds + 56, nullptr);   /* (training: the pair weights only; the loss sum comes from the gradient pass, + 58) */
             PT("losses");
@@ -997,6 +1000,7 @@ static void head_slab_pass(gpu_state *d, int pass) {
         FT("  g side grad");
         if (g_side_lambda != 1.f && !fside) nn_loss_grad_scale(LGC(g_side_ch), 2 * ns, g_side_lambda);
         if (g_pg_lambda > 0) nn_pgrad_apply(LGC(g_side_ch), LGC(g_side_ch + 1), d->pg_acc, ns, d->hs_ds + 56, g_pg_lambda);
+        if (g_fibn) { nn_zero(d->fibnl, sizeof(unsigned)); nn_fibn(LGC(g_norm_ch), ns, ink, D, H, W, z0, z1, g_fibn_r, g_fibn_thr, g_fibn_unsup ? d->nm : nullptr, d->fibacc, d->fiblist, d->fibnl, d->fibcap, 1); }   /* (reads the logits: before the in-place gradient) */
         if (!fuse) nn_loss_grad_only(LGC(g_norm_ch), d->nt, d->nm, d->nw, seven, 0.f, LGC(g_norm_ch), d->nscratch);
         FT("  g normal grad");
         if (fuse) ;
@@ -1005,6 +1009,7 @@ static void head_slab_pass(gpu_state *d, int pass) {
             if (g_norm_lambda != 1.f) nn_loss_grad_scale(LGC(g_norm_ch), 6 * ns, g_norm_lambda);
             if (g_dens_lambda != 1.f) nn_loss_grad_scale(LGC(g_norm_ch + 6), ns, g_dens_lambda);
         }
+        if (g_fibn) nn_fibn_apply(d->fiblist, d->fibnl, d->fibcap, d->fibacc, g_fibn_lambda, LGC(g_norm_ch), ns);   /* + lambda / count x the fibre term */
         PT("losses");
         if (g_lat && g_lat_guide == 8) nn_zero((char *)d->hs_lg + (size_t)g_cout * ns * 2, (size_t)(24 - g_cout) * ns * 2);   /* (the unused outputs: no gradient) */
         if (g_lat_hs) {   /* the slab's gradient into the rolling planes [q0, q0 + qc); the planes no later slab adds to ([q0, z1 / 4 - 1), to the end at the last
@@ -1440,6 +1445,7 @@ static double fetch_loss(gpu_state *d, int B, int P, float dice_w, float *out) {
             if (g_ink2) { nn_loss_fetch(d->iscratch, (shape5){1, 1, 1, 1, 1}, d->iout); d->ink_loss = g_ink_lambda * d->iout[0]; }   /* (--ink-head: the logged loss at lambda, not the source weight) */
         }
         nn_loss_fetch(d->nscratch, (shape5){1, 7, 1, 1, 1}, d->nout);
+        if (g_fibn) nn_d2h(d->fib_h, d->fibacc, 2 * sizeof(double));   /* --fib-normal-lambda: valid fibre voxels, sum t^T N t (the statistics pass) */
         float nb = 0; for (int c = 0; c < 6; c++) nb += d->nout[c];
         d->norm_raw = (nb + d->nout[6]) / 7; d->norm_loss = (g_norm_lambda * nb + g_dens_lambda * d->nout[6]) / 7;   /* (the logged unweighted mean: norm_raw) */
         if (g_unwrap2) d->w4_loss = g_w4_lambda * d->w4h[0];
@@ -1641,6 +1647,15 @@ int cmd_train(int argc, char **argv) {
         if (!(g_norm_lambda >= 0) || !(g_dens_lambda >= 0)) { fprintf(stderr,"--normal-lambda / --density-lambda >= 0\n"); return 2; }
         g_norm_s = atoi(opt(argc,argv,"--normal-step","4"));
         if (g_norm_s < 1 || g_norm_s > 16) { fprintf(stderr,"--normal-step 1..16\n"); return 2; }
+        /* --fib-normal-lambda L: L x mean t^T N t at fibre voxels (nn_fibn). The sources' "sheet" / "ink" prob254 target is the fibre tube raster
+           (scripts/fibers/mklabels.sh), carried on the ink plane through every symmetry / warp; the tangent is read off the warped tube on the device */
+        g_fibn_lambda = (float)atof(opt(argc,argv,"--fib-normal-lambda","0")); g_fibn = g_fibn_lambda > 0;
+        g_fibn_r = atoi(opt(argc,argv,"--fib-normal-r","2")); g_fibn_thr = atoi(opt(argc,argv,"--fib-normal-thr","128"));
+        g_fibn_unsup = atoi(opt(argc,argv,"--fib-normal-unsup","0"));   /* 1: the fibre term only where the normal BCE has no target (its mask 0) */
+        if (g_fibn_unsup < 0 || g_fibn_unsup > 1) { fprintf(stderr,"--fib-normal-unsup 0|1\n"); return 2; }
+        if (!(g_fibn_lambda >= 0) || g_fibn_r < 1 || g_fibn_r > 4 || g_fibn_thr < 1 || g_fibn_thr > 254 || (g_fibn && (g_ink2 || g_rv || (!g_unwrap2 && g_ink_lambda != 0.f)))) {
+            fprintf(stderr,"--fib-normal-lambda >= 0 (--fib-normal-r 1..4, --fib-normal-thr 1..254); it uses the ink plane: not with --ink-head / --rv, and task unwrap needs --ink-lambda 0\n"); return 2;
+        }
         g_dens_scale = (float)atof(opt(argc,argv,"--density-scale","32"));   /* density target min(1, scale rho): 32 at 2.4 um, 8 at 9.6 um (the same physical code) */
         if (!(g_dens_scale > 0)) { fprintf(stderr,"--density-scale > 0\n"); return 2; }
         /* --density-code 1: density target x / (1 + x), x = scale rho (never saturates; 0: min(1, x), which clips every spacing under
@@ -2249,7 +2264,7 @@ int cmd_train(int argc, char **argv) {
         int hard = S->n > 0;
         for (int i = 0; i < S->n; i++) {   /* soft side votes: fractions; a source without target channels (band codes + stored phase only, the
                                               --task unwrap2 sources) has all-zero targets, which pack (warps: the nearest code, also 0) */
-            int none = 1; for (int c = 0; c < NCH; c++) none &= (!S->src[i].tgt_key[c] && !S->src[i].reg[c]) || (g_ink2 && c == CH_SHEET);   /* (--ink-head: the ink target is a plane of its own) */
+            int none = 1; for (int c = 0; c < NCH; c++) none &= (!S->src[i].tgt_key[c] && !S->src[i].reg[c]) || ((g_ink2 || g_fibn) && c == CH_SHEET);   /* (--ink-head: the ink target is a plane of its own) */
             hard &= (S->src[i].tgt_side[CH_RECTO] && !S->src[i].tgt_votes_soft[CH_RECTO]) || none;
         }
         g_pack = atoi(opt(argc, argv, "--pack-targets", "1")) && hard && !g_heads && !split && !sc.papyrus && sc.dist_sigma <= 0 && !sc.sheet && !overfit && !g_restore;   /* (warped windows take the nearest source voxel's code) */
@@ -2471,12 +2486,14 @@ int cmd_train(int argc, char **argv) {
         g_tm_unused = g_unwrap2 && g_head_slab && !g_ds && !ufsm_env_on("UFSM_TM_KEEP");   /* (the unwrap2 head slabs read only the side / winding planes) */
         if (g_lat && !g_head_slab) { fprintf(stderr, "--lat needs the head-slab loss path (task unwrap2, B 1, no --split / --deep-sup, MX activations; UFSM_HEAD_SLAB on)\n"); return 2; }   /* (its head runs whole on the cell grid: any level-0 width) */
         if (g_rv && !g_head_slab) { fprintf(stderr, "--rv needs the head-slab loss path (task unwrap2, B 1, no --split / --deep-sup, MX activations, level-0 width 16 or 32; UFSM_HEAD_SLAB on)\n"); return 2; }
+        if (g_fibn && !g_head_slab) { fprintf(stderr, "--fib-normal-lambda needs the head-slab loss path (B 1, no --split / --deep-sup, MX activations, level-0 width 16 or 32; UFSM_HEAD_SLAB on)\n"); return 2; }
         if (g_ink2 && !g_head_slab) { fprintf(stderr, "--ink-head needs the head-slab loss path (task unwrap2, B 1, no --split / --deep-sup, MX activations, level-0 width 16 or 32; UFSM_HEAD_SLAB on)\n"); return 2; }
         g_hs_z = getenv("UFSM_HEAD_SLAB_Z") ? atoi(getenv("UFSM_HEAD_SLAB_Z")) : 32;
         if (g_hs_z < 1) g_hs_z = 1;
         if (g_hs_z > g_Pz) g_hs_z = g_Pz;
         g_lat_hs = g_lat && g_head_slab && g_hs_z % 4 == 0 && g_hs_z >= 8 && g_hs_z < g_Pz && !ufsm_env_on("UFSM_LAT_CHECK") && (!getenv("UFSM_LAT_HEAD_STREAM") || ufsm_env_on("UFSM_LAT_HEAD_STREAM"));
-        g_lat_fuse = g_lat_hs && g_unwrap2 && g_side_ch == 0 && g_norm_ch == 2 && g_w4_ch == 9 && !(g_pg_lambda > 0) && !(g_ptrunc_tau > 0) && !g_ink2 && nn_get_loss_grad_h16() && nn_get_f16()
+        g_lat_fuse = g_lat_hs && g_unwrap2 && g_side_ch == 0 && g_norm_ch == 2 && g_w4_ch == 9 && !(g_pg_lambda > 0) && !(g_ptrunc_tau > 0) && !g_ink2 && !g_fibn && nn_get_loss_grad_h16() && nn_get_f16()   /* (--fib-normal-lambda: the unfused chain) */
+                    
                      && (!getenv("UFSM_LAT_FUSE") || ufsm_env_on("UFSM_LAT_FUSE"));
         for (int g = 0; g < ng; g++) unet_set_head_ext(G[g].u, g_head_slab && (!g_lat || g_lat_hs));
         if (g_pg_lambda > 0 && !g_head_slab) { fprintf(stderr, "--pgrad-lambda needs the head-slab loss path (task unwrap2, B 1, no --split / --verso)\n"); return 2; }
@@ -2821,6 +2838,7 @@ int cmd_train(int argc, char **argv) {
                 d->inkt = nn_malloc((g_rv ? 2 : 1) * tp3); d->inkm = nn_malloc(tp3);
                 d->inkw = nn_malloc(1); static const uint8_t one_i = 1; nn_h2d(d->inkw, &one_i, 1);
             }
+            if (g_fibn) { d->fibcap = nn_fibn_cap(tp3); d->fiblist = nn_malloc(nn_fibn_list_bytes(d->fibcap)); d->fibnl = nn_malloc(64); d->fibacc = nn_malloc(64); nn_zero(d->fibacc, 64); }
             if (g_count_lambda > 0) {
                 d->cnt_acc = nn_malloc(p3 * sizeof(float)); nn_zero(d->cnt_acc, p3 * sizeof(float));
                 d->cnt_seg = nn_malloc((size_t)4 * g_count_K * sizeof(float)); d->cnt_nv = nn_malloc(sizeof(unsigned)); d->cnt_out = nn_malloc(24 * sizeof(float));
@@ -3130,6 +3148,7 @@ int cmd_train(int argc, char **argv) {
     double best_val = 1e30, vcrit = 0; int nskip = 0; (void)nskip;
     double acc_rn = 0, acc_re = 0, acc_rb = 0;   /* restore: training voxels, error^2, input error^2 since the last log line */
     float parts[8][2 * TCMAX + 1];
+    double acc_fib = 0, acc_fibv = 0, acc_fibn = 0;   /* --fib-normal-lambda: mean t^T N t over the windows with fibre voxels, their mean count */
     double acc_emb = 0, acc_embc = 0, acc_ds = 0, acc_vbce = 0, acc_vdice = 0, acc_side = 0, acc_ink = 0, acc_norm = 0, acc_cond = 0, acc_ck = 0, acc_cr = 0, acc_pap = 0, acc_cnt = 0, acc_cnr = 0, acc_cbin[18] = {0}, acc_w4 = 0, acc_w4w = 0, acc_w4a = 0, acc_pg = 0;   /* (acc_pg: --pgrad-lambda loss; acc_cnt / acc_cnr: --count-lambda loss, Tp / Tg) verso channel, side channel; --cond (loss, known / right counts); --pap-head */
     double acc_inkn = 0, vik[2] = {0};   /* --ink-head: training windows with known ink in the log interval; validation ink bce sum / windows */
     for (int step = step0 + 1; step <= steps && !g_stop; step++) {
@@ -3359,6 +3378,7 @@ int cmd_train(int argc, char **argv) {
         if (g_side) acc_side += G[0].sout[0];
         if (g_unwrap) { acc_ink += G[0].iout[0]; acc_norm += G[0].norm_raw; }
         if (g_fibdir > 0) acc_norm += G[0].norm_raw;
+        if (g_fibn && G[0].fib_h[0] > 0) { acc_fib += G[0].fib_h[1] / G[0].fib_h[0]; acc_fibv += G[0].fib_h[0]; acc_fibn += 1; }
         if (g_ink2 && G[0].iout[2] > 0) acc_inkn += 1;
         if (g_unwrap2) { acc_w4 += G[0].w4h[0]; acc_w4w += G[0].w4h[5]; acc_w4a += G[0].w4h[1]; } acc_pg += G[0].pg_loss;
         if (g_ds) acc_ds += G[0].ds_loss;
@@ -3500,6 +3520,7 @@ int cmd_train(int argc, char **argv) {
             if (g_verso) snprintf(affs, 64, " verso bce %.4f dice %.4f", acc_vbce / nacc, acc_vdice / nacc);
             if (g_side) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " %s bce %.4f", g_rv ? "rv" : g_side == 2 ? "phase" : "side", acc_side / nacc); }
             if (g_unwrap2) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " normal bce %.4f wind4 bce %.4f (worst gauge %.4f) acc %.3f", acc_norm / nacc, acc_w4 / nacc, acc_w4w / nacc, acc_w4a / nacc); if (g_pg_lambda > 0) { na = strlen(affs); snprintf(affs + na, sizeof affs - na, " pgrad %.4f", acc_pg / nacc); } }
+            if (g_fibn) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " fibn %.4f (%.0f%% of windows, %.0f vox)", acc_fibn > 0 ? acc_fib / acc_fibn : 0.0, 100.0 * acc_fibn / nacc, acc_fibn > 0 ? acc_fibv / acc_fibn : 0.0); }
             if (g_ink2) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " ink bce %.4f (%.0f%% of windows)", acc_inkn > 0 ? acc_ink / acc_inkn : 0.0, 100.0 * acc_inkn / nacc); }
             if (g_ptrunc_tau > 0) { unsigned long long pc[2]; nn_phase_trunc_counts(pc); size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " trunc %.4f", pc[0] ? (double)pc[1] / pc[0] : 0.0); }
             else if (g_unwrap && !g_unwrap2) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " ink bce %.4f normal bce %.4f", acc_ink / nacc, acc_norm / nacc); }
@@ -3526,7 +3547,7 @@ int cmd_train(int argc, char **argv) {
             if (log) { fprintf(log, "%d,%.3e,%.5f,%.5f,%.5f,%.0f,%.4f,%s,%.3f,%.3f\n", step, lr, acc_loss / nacc, acc_bce / nacc, acc_dice / nacc, active, acc_g / nacc, vstr, (double)nacc * B * nl / dt, wait); fflush(log); }
             if (prof) { fprintf(stderr, "per-op GPU ms over the last %d steps (all GPUs):\n", log_every); unet_prof_report(); }
             nn_ptick_report(log_every);
-            acc_inkn = 0; acc_emb = acc_embc = 0; acc_ds = 0; acc_loss = acc_bce = acc_dice = acc_g = acc_vbce = acc_vdice = acc_side = acc_ink = acc_norm = acc_cond = acc_ck = acc_cr = acc_pap = acc_cnt = acc_cnr = acc_w4 = acc_w4w = acc_w4a = acc_pg = 0; nacc = 0; tlog = now(); wait = 0;
+            acc_inkn = 0; acc_fib = acc_fibv = acc_fibn = 0; acc_emb = acc_embc = 0; acc_ds = 0; acc_loss = acc_bce = acc_dice = acc_g = acc_vbce = acc_vdice = acc_side = acc_ink = acc_norm = acc_cond = acc_ck = acc_cr = acc_pap = acc_cnt = acc_cnr = acc_w4 = acc_w4w = acc_w4a = acc_pg = 0; nacc = 0; tlog = now(); wait = 0;
         }
         if (step % ckpt_every == 0 || step == steps || g_stop) {
             nn_init(G[0].dev);
