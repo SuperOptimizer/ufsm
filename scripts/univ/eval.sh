@@ -12,15 +12,15 @@
 #         16 crops of 2048 label px on 8 HF ink/phercparis4 segments), rendered on each crop's surface (render --volume), ink-score
 #         (F1 / AUC vs the human labels inside the supervision mask)                                                             -> $E/TAG/ink/scores.tsv
 # Summary: $E/TAG.matrix.txt (wbench-stats paired CIs against REFS, default "wind96 lat-wz896-12000"; rv / fib / ink rows; xres vs native).
-# Env: GPU (1; takes /tmp/gpu1-bench.lock for GPU 1), UP (predict binary for wbench), U (this tree's build/ufsm), WIN / HALO / WZARGS as
+# Env: GPU (1), LKF (a flock file, e.g. /tmp/gpu1-bench.lock, when sharing the GPU with timing runs), UP (predict binary for wbench), U (this tree's build/ufsm), WIN / HALO / WZARGS as
 # wbench (latent-grid checkpoints: WZARGS= ), THREADS (8). Reruns skip finished pieces (wbench rows, rv txt, fib / ink outputs).
 set -u
 CK=$(readlink -f "${1:?ckpt}"); T=${2:?tag}; TASKS=${TASKS:-wind dlv xres rv fib ink}
 H=$(cd "$(dirname "$0")/../.." && pwd); U=${U:-$H/build/ufsm}; WB=/vesuvius/ufsm/wbench; E=${E:-$WB/univ}; RVE=${RVE:-/mnt/scratch/rv/eval}
 M=https://dl.ash2txt.org/community-uploads/forrest/volcomp; P4K=PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr
 GPU=${GPU:-1}; THREADS=${THREADS:-8}; REFS=${REFS:-wind96 lat-wz896-12000}; DLVS=${DLVS:--1 1}; RVSC=${RVSC:-p1667 p139 p4}
-FIBCH=${FIBCH:-}; INKP=${INKP:-}; LKF=/tmp/gpu$GPU-bench.lock; mkdir -p $E/$T
-lk() { if [ "$GPU" = 1 ]; then flock $LKF "$@"; else "$@"; fi; }
+FIBCH=${FIBCH:-}; INKP=${INKP:-}; LKF=${LKF:-}; mkdir -p $E/$T
+lk() { if [ -n "$LKF" ]; then flock $LKF "$@"; else "$@"; fi; }   # LKF=/tmp/gpu1-bench.lock: serialise with timing benches
 log() { echo "$(date '+%m-%d %H:%M:%S') $*" | tee -a $E/$T.log; }
 wb() {   # wb TAG [env...]: one wbench run (memcap, GPU lock)
   local t=$1; shift; lk env SITE=desk GPU=$GPU SLABS=0 THREADS=$THREADS "$@" ~/bin/memcap -m 40G bash $H/scripts/wbench/wbench.sh $CK $t >> $E/$T/wbench_$t.out 2>&1; }
