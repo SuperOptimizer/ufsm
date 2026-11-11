@@ -6,6 +6,31 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Universal net A7: learned task weights (--uw 1) and the head-gradient cosines (--grad-cos N) (2026-11-11, branch univ-20261111)
+
+**`--uw 1`** (Kendall, Gal and Cipolla 2018): one learned log variance s_h per head (phase, normal + density shared, winding mod 4,
+rv, ink; the fibre-normal term is a regulariser, not a likelihood, and keeps its lambda). Each head's gradient is scaled by
+exp(-s_h) through the same per-source head multiplier as A2's "heads" key (`src_head_w`), so no new device path. The objective is
+sum_h exp(-s_h) L_h + s_h, with s_h stepped on the host by Adam from each step's logged head loss (dL/ds = 1 - exp(-s) L).
+The rate is --uw-lr (1e-3), and s is clamped to [-4, 4]. The s_h and the Adam step count are written to the checkpoint header
+("uw":{"t":..,"s":[..]}, only with --uw) and resumed. The step line shows the weights in effect. Without --uw every multiplier is
+the float 1, so the old layouts are unchanged (test_heads).
+
+**`--grad-cos N`**: every N steps, the cosines between the heads' gradients at the head input (the trunk's shared level-0 features).
+The head is a 1^3 conv W (cout x C), so the input gradient of task a summed over the cells is W^T g_a. The pairwise dot products are
+sum_{i in a, j in b} (W W^T)_ij S_ij, with S the Gram of the logit-gradient planes. S is accumulated per head slab with `nn_gram16`
+inside the step's single backward: one K(K+1)/2-pair reduction per slab, versus a backward per task. Channels map to tasks as
+follows: interpolated outputs by head; latent guided / sub-cell outputs (16-143) to the phase. Cost: zero on steps that do not log.
+Gradients of the deeper trunk are not separated (they would need a backward per task); the head input is where all heads meet.
+
+Tests: `test_gram` (new): fp16 / bf16, K 1 / 7 / 13, strided rows, two accumulating calls against a double host sum; worst error
+relative to |x_i||x_j| is 1.2e-7. `test_heads` (6): latent + all heads with --uw 1 --uw-lr 0.05 --grad-cos 2; the cosine lines
+name every pair, the header holds t 4 and a resume continues to t 6.
+Fixture numbers (6 steps, P 64, all heads): |cos| <= 0.17 between every pair, i.e. the heads barely interfere at the head input on
+this fixture. The largest values are normal/wind4 (+0.16..0.17 at step 4) and normal/rv (-0.11..-0.17). After 6 steps at lr 0.05
+the weights moved phase 1.02, normal 0.80, wind4 1.31, rv 1.35, ink 1.26. These are numbers from a 6-step fixture run; a
+real run's cosines and the weights' end point are for U1 / U2 to measure.
+
 ## Universal net A4 + A5: levels by physical voxel size, per-level scale FiLM (2026-11-11, branch univ-20261111)
 
 **A4, `--um-rungs U[:W],..`** (sample.h `nrung`): instead of `--levels` (a probability per pyramid index, the same index for a 2.4 and a
