@@ -16,9 +16,9 @@
 #define BG_CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { fprintf(stderr, "band gpu: %s (%s:%d)\n", cudaGetErrorString(e_), __FILE__, __LINE__); return -1; } } while (0)
 #define BINF 1e20f
 enum { BT = 128, LCH = 32768 };   /* threads per block; lines per envelope chunk (at least) */
-/* lines per envelope chunk: at least LCH, else as many as keep the scratch (16 B x (L + 1) per line) at ~4 B per block voxel; 2026-11-11:
+/* lines per envelope chunk: at least LCH, else as many as keep the scratch (12 B x (L + 1) per line: S, V, Z) at ~4 B per block voxel; 2026-11-11:
    32768 lines left a 188-SM card at ~170 threads per SM and the y / z passes latency-bound (89% of the pair rule) */
-static long bg_lines(long N, long L, long nlines) { long c = N / (4 * (L + 1)); if (c < LCH) c = LCH; return nlines < c ? nlines : c; }
+static long bg_lines(long N, long L, long nlines) { long c = N / (3 * (L + 1)); if (c < LCH) c = LCH; return nlines < c ? nlines : c; }
 
 __device__ static inline int bg_seed(uint8_t c, int par) { const int lab = c > 0 && c < 255; const int k = lab ? (c - 1) / BAND_STEPS : 0; return lab && (k & 1) == par; }
 
@@ -61,27 +61,27 @@ __global__ void k_bg_xw(const uint8_t *codes, long nlines, int nx, int par, int3
     }
 }
 
-/* lines l0 .. l0 + nl of axis ax (1 y, 2 z): line t = (o, x) with o = (l0 + t) / nx; element q at base0 + q * st + x */
+/* lines l0 .. l0 + nl of axis ax (1 y, 2 z): line t = (o, x) with o = (l0 + t) / nx; element q at base0 + q * st + x. The scratch holds
+   per q only the feature index S (gathered before the line is overwritten), the envelope V and its boundaries Z; the squared distance
+   of q's feature is rebuilt from S(q) wherever it is needed (2026-11-11: dropping the F array cut the scratch traffic by a quarter and
+   lets the chunks hold a third more lines; the same integer / float expressions, so the same bytes) */
+__device__ __forceinline__ float bg_f(int32_t fi, int ax, long q, long o, long x, long base0, long st, long sz, long sy) {
+    if (fi < 0) return BINF;
+    long dy = 0, dx;
+    if (ax == 1) dx = x - ((long)fi - (base0 + q * st));
+    else { const long r = (long)fi - q * sz, fy = r / sy; dy = o - fy; dx = x - (r - fy * sy); }
+    return (float)(dy * dy + dx * dx);
+}
 __global__ void k_bg_env(int32_t *idx, int ax, int ny, int nx, int L, long st, long sz, long sy, long l0, int nl, float *F, int32_t *S, int *V, float *Z) {
     const int t = blockIdx.x * blockDim.x + threadIdx.x; if (t >= nl) return;
     const long line = l0 + t, o = line / nx, x = line % nx;
     const long base0 = ax == 1 ? o * sz : o * sy;
     const long NL = nl;
-#define Fq(q) F[(long)(q) * NL + t]
 #define Sq(q) S[(long)(q) * NL + t]
 #define Vq(q) V[(long)(q) * NL + t]
 #define Zq(q) Z[(long)(q) * NL + t]
-    for (int q = 0; q < L; q++) {   /* gather (band.c lean mode): the squared distance rebuilt from the feature index */
-        const long row = base0 + q * st; const int32_t fi = idx[row + x]; float fv = BINF;
-        if (fi >= 0) {
-            long dy = 0, dx;
-            if (ax == 1) dx = x - ((long)fi - row);
-            else { const long r = (long)fi - (long)q * sz, fy = r / sy; dy = o - fy; dx = x - (r - fy * sy); }
-            fv = (float)(dy * dy + dx * dx);
-        }
-        Fq(q) = fv; Sq(q) = fi;
-    }
-    /* envelope (band.c): the same float expressions in the same order */
+#define Fq(q) bg_f(Sq(q), ax, (q), o, x, base0, st, sz, sy)
+    for (int q = 0; q < L; q++) Sq(q) = idx[base0 + q * st + x];
     int k = 0; int v0 = -1;
     for (int q = 0; q < L; q++) {
         const float fq = Fq(q);
@@ -262,7 +262,7 @@ static int bg_alloc(bg_ctx &G, long N, long Lmax, long lc) {
     if ((size_t)((Lmax + 1) * lc) > G.lcap) {
         cudaFree(G.F); cudaFree(G.Z); cudaFree(G.S); cudaFree(G.V); G.F = G.Z = nullptr; G.S = nullptr; G.V = nullptr;
         const size_t e = (size_t)(Lmax + 1) * lc;
-        BG_CK(cudaMalloc(&G.F, e * 4)); BG_CK(cudaMalloc(&G.Z, e * 4)); BG_CK(cudaMalloc(&G.S, e * 4)); BG_CK(cudaMalloc(&G.V, e * 4)); G.lcap = e;
+        BG_CK(cudaMalloc(&G.Z, e * 4)); BG_CK(cudaMalloc(&G.S, e * 4)); BG_CK(cudaMalloc(&G.V, e * 4)); G.lcap = e;
     }
     return 0;
 }

@@ -18,7 +18,7 @@ static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t
 
 /* device bytes of one tile of edge E (nn_band.cu bg_run: codes + phase + two int32 feature arrays, the envelope scratch of 4 int32 /
    float arrays over (L + 1) x the chunk's lines: ~4 B per voxel, nn_band.cu bg_lines) */
-static double tile_bytes(double E) { double lines = E * E * E / (4 * (E + 1)); if (lines < 32768) lines = 32768; if (lines > E * E) lines = E * E; return E * E * E * 10 + 16 * (E + 1) * lines; }
+static double tile_bytes(double E) { double lines = E * E * E / (3 * (E + 1)); if (lines < 32768) lines = 32768; if (lines > E * E) lines = E * E; return E * E * E * 11 + 12 * (E + 1) * lines + (1 << 26); }   /* (+1 B / voxel and 64 MB: the codes decode scratch, blob) */
 int phase_onfly_tile_edge(float rmax) {
     const int h = (int)ceilf(rmax) + 2; int E = 2 * h + 32;
     while (tile_bytes(E + 8) <= (double)g_budget_mb * (1 << 20)) E += 8;
