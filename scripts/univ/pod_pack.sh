@@ -2,7 +2,8 @@
 # scripts/univ/pod_pack.sh OUT [SNAP]: on the desk, stage everything a fresh universal-net pod cannot fetch itself (scripts/univ/pod_univ.sh),
 # laid out as the pod's K: OUT/small (the datakit layout: axis / umbilicus JSONs, gtaxis, klt1.lcb, holdouts, boxes, wind96, the init
 # checkpoints) and OUT/gt (the label inputs with no public source: PHerc0139 q-surfaces 55 MB, PHerc1667 codes A / B 9.4 GB + its 9.6 um
-# phase 9.8 GB). SNAP: a u1 snapshot (or last.ckpt) to resume on the pod, copied with its run's ufsm.bin commit noted. Also OUT/md5: md5
+# phase 9.8 GB). SNAP: a u1 snapshot (or last.ckpt) to resume on the pod, copied with its run's ufsm.bin (reference only:
+# the desk binary needs glibc 2.43; pod_univ.sh setup rebuilds COMMIT from source) and COMMIT noted. Also OUT/md5: md5
 # sums of 8 sampled label shards per set, which pod_univ.sh `verify` checks against its rebuilt rasters. Everything else (CT, segments,
 # Paris 4 / 0139 / 0500P2 labels) the pod reads from the mirror or rebuilds (datakit.sh). Then from the desk:
 #   rsync -a --info=progress2 -e "ssh -p PORT -i ~/.ssh/id_ed25519" OUT/ root@HOST:/workspace/univ/      (~20 GB, ~75 min at 4.5 MB/s)
