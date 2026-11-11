@@ -1,5 +1,6 @@
 /* Scan-to-scan registration core: see reg.h. */
 #include "reg.h"
+#include "zarr2.h"
 #include "store.h"
 #include "zarr3.h"
 #include <math.h>
@@ -82,21 +83,38 @@ static double um_of_key(const char *key) {
 rvol *rvol_open(const char *root, const char *key, const char *cache, double um) {
     store *s = store_open(root); if (!s) return nullptr;
     z3_level lv[10]; const int n = z3_group_levels(s, key, lv, 10);
-    if (n <= 0) { fprintf(stderr, "reg: no levels in %s/%s: %s\n", root, key, z3_error()); return nullptr; }
+    if (n <= 0) {   /* a zarr v2 pyramid (levels "0", "1", ... each half the previous): the scrollprize 2023 scans */
+        rvol *v = calloc(1, sizeof *v); v->um = um > 0 ? um : um_of_key(key); snprintf(v->name, sizeof v->name, "%s", key);
+        int first = -1;   /* path "l" = level l (2^l L0 voxels); a store may hold only some (the official fibre predictions: "3", "4") */
+        for (int l = 0; l < 10; l++) {
+            char k[1200]; snprintf(k, sizeof k, "%s/%d", key, l);
+            z2 *z = z2_open(s, k, cache); if (!z) continue;
+            const z2_meta *m = z2_meta_of(z);
+            if (first >= 0 && v->z2[l - 1] && m->shape[0] != (v->shape[l - 1][0] + 1) / 2 && m->shape[0] != v->shape[l - 1][0] / 2) { z2_close(z); break; }   /* only 2^l pyramids */
+            v->z2[l] = z; for (int a = 0; a < 3; a++) v->shape[l][a] = m->shape[a]; v->nl = l + 1; if (first < 0) first = l;
+        }
+        if (!v->nl || v->um <= 0) { fprintf(stderr, "reg: no zarr v3 or v2 levels (or no voxel size) in %s/%s: %s\n", root, key, z3_error()); free(v); return nullptr; }
+        for (int l = first - 1; l >= 0; l--) for (int a = 0; a < 3; a++) v->shape[l][a] = 2 * v->shape[l + 1][a];
+        return v;
+    }
     rvol *v = calloc(1, sizeof *v);
     v->um = um > 0 ? um : um_of_key(key);
     snprintf(v->name, sizeof v->name, "%s", key);
-    for (int l = 0; l < n; l++) {
-        const double f = lv[l].um / lv[0].um;
-        if (fabs(f - (double)(1 << l)) > 1e-3) break;   /* only 2^l pyramids */
-        char k[1200]; snprintf(k, sizeof k, "%s/%s", key, lv[l].path);
+    /* level index from the level's voxel size (um * 2^l): a store may hold only the coarser levels (e.g. a local copy from level 2 on);
+       missing finer levels are left unopened (rvol_level_for never picks them) and get their shape from the finest present one */
+    const double u0 = lv[0].um > 0 ? lv[0].um : 1; int first = -1;   /* the group's level-0 scale (um or pixels): levels by ratio to it */
+    for (int i = 0; i < n; i++) {
+        const double f = lv[i].um / u0; const int l = (int)lround(log2(f));
+        if (l < 0 || l >= 10 || fabs(f - (double)(1 << l)) > 1e-3 * f) continue;   /* only 2^l levels */
+        char k[1200]; snprintf(k, sizeof k, "%s/%s", key, lv[i].path);
         z3 *z = z3_open(s, k, cache);
-        if (!z) { fprintf(stderr, "reg: %s: %s\n", k, z3_error()); break; }
+        if (!z) { fprintf(stderr, "reg: %s: %s\n", k, z3_error()); continue; }
         v->z[l] = z; const z3_meta *m = z3_meta_of(z);
         for (int a = 0; a < 3; a++) v->shape[l][a] = m->shape[a];
-        v->nl = l + 1;
+        if (l + 1 > v->nl) v->nl = l + 1; if (first < 0 || l < first) first = l;
     }
     if (!v->nl || v->um <= 0) { fprintf(stderr, "reg: %s: no usable level or voxel size\n", key); free(v); return nullptr; }
+    for (int l = first - 1; l >= 0; l--) for (int a = 0; a < 3; a++) v->shape[l][a] = 2 * v->shape[l + 1][a];
     return v;
 }
 rvol *rvol_mem(double um, int nl, const int64_t shape0[3], uint8_t *level0) {
@@ -130,6 +148,15 @@ int rvol_read_nt(rvol *v, int l, const int64_t o[3], const int64_t n[3], uint8_t
         }
         return -1;
     }
+    if (v->z2[l]) {
+        for (int a = 0; a < 5; a++) {
+            if (!z2_read(v->z2[l], o, n, out, nt)) return 0;
+            fprintf(stderr, "reg: read %s level %d (attempt %d): %s\n", v->name, l, a + 1, z2_error());
+            static const int wait[4] = {2, 8, 30, 60};
+            if (a < 4) sleep(wait[a]);
+        }
+        return -1;
+    }
     const int64_t *s = v->shape[l]; const uint8_t *m = v->mem[l];
     for (int64_t z = 0; z < n[0]; z++) for (int64_t y = 0; y < n[1]; y++) {
         uint8_t *row = out + ((size_t)z * n[1] + y) * n[2];
@@ -141,11 +168,12 @@ int rvol_read_nt(rvol *v, int l, const int64_t o[3], const int64_t n[3], uint8_t
 }
 void rvol_close(rvol *v) {
     if (!v) return;
-    for (int l = 0; l < v->nl; l++) { if (v->z[l]) z3_close(v->z[l]); free(v->mem[l]); }
+    for (int l = 0; l < v->nl; l++) { if (v->z[l]) z3_close(v->z[l]); if (v->z2[l]) z2_close(v->z2[l]); free(v->mem[l]); }
     free(v);
 }
 int rvol_level_for(const rvol *v, double um) {
     int l = 0; while (l + 1 < v->nl && v->um * (1 << (l + 1)) <= um * 1.05) l++;
+    while (l + 1 < v->nl && !v->z[l] && !v->z2[l] && !v->mem[l]) l++;   /* a level the store does not hold: the next coarser one */
     return l;
 }
 
@@ -369,6 +397,10 @@ int reg_quad_peak(const float f[27], double d[3], double *curv) {
 }
 
 /* ---------- one box ---------- */
+static void fill_zeros(float *v, size_t n) {   /* masked voxels (0) -> the mean of the unmasked ones */
+    double sum = 0; size_t c = 0; for (size_t i = 0; i < n; i++) if (v[i] != 0) { sum += v[i]; c++; }
+    if (!c) return; const float m = (float)(sum / c); for (size_t i = 0; i < n; i++) if (v[i] == 0) v[i] = m;
+}
 static double frac_nonzero(const float *v, size_t n) { size_t k = 0; for (size_t i = 0; i < n; i++) k += v[i] > 0; return (double)k / (double)n; }
 static double stdev(const float *v, size_t n) { double s = 0, s2 = 0; for (size_t i = 0; i < n; i++) { s += v[i]; s2 += (double)v[i] * v[i]; } s /= n; return sqrt(fmax(0, s2 / n - s * s)); }
 static void crop(const float *in, const int ni[3], int p, const int no[3], float *out) {
@@ -429,6 +461,7 @@ int reg_measure(const rmeas *q, rbox *b) {
     for (size_t i = 0; i < NC; i++) Cp[i] = cu[i];
     crop(Cp, nC, P, nB, C); b->cfrac = (float)frac_nonzero(C, NB);
     if (b->cfrac < q->minfrac) { st = 1; goto done; }
+    if (q->maskfill) fill_zeros(Cp, NC);
     reg_filter(Cp, nC, q->metric, q->hp, q->lp); crop(Cp, nC, P, nB, C);
     b->cstd = (float)stdev(C, NB);
     /* fine resampled on the expanded grid */
@@ -441,6 +474,7 @@ int reg_measure(const rmeas *q, rbox *b) {
     reg_resample(&fb, q->m, q->lc, q->lf, gorg, nG, zero, q->ss, Gp);
     { const int nI[3] = {B, B, B}; float *t = malloc(NB * sizeof *t); crop(Gp, nG, P + R, nI, t); b->gfrac = (float)frac_nonzero(t, NB); free(t); }
     if (b->gfrac < q->minfrac) { st = 2; goto done; }
+    if (q->maskfill) fill_zeros(Gp, NG);
     reg_filter(Gp, nG, q->metric, q->hp, q->lp); crop(Gp, nG, P, nE, G);
     { const int nI[3] = {B, B, B}; float *t = malloc(NB * sizeof *t); crop(G, nE, R, nI, t); b->gstd = (float)stdev(t, NB); free(t); }
     if (b->cstd < 1e-3 || b->gstd < 1e-3) { st = 3; goto done; }
@@ -492,6 +526,7 @@ int reg_measure(const rmeas *q, rbox *b) {
     float f27[27]; double curv = 0;
     for (int k = 0; k < it; k++) {
         reg_resample(&fb, q->m, q->lc, q->lf, sorg, nS, s, q->ss, Sp);
+        if (q->maskfill) fill_zeros(Sp, NS);
         reg_filter(Sp, nS, q->metric, q->hp, q->lp); crop(Sp, nS, P, nE1, S);
         reg_ncc_map(C, nB, S, 1, f27);
         double d[3]; reg_quad_peak(f27, d, &curv);

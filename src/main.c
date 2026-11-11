@@ -252,6 +252,7 @@ static int usage(void) {
         "  ufsm fit-compare <reference-fields> <fields>                      fit fields vs a reference (phase, spacing, normals)\n"
         "  ufsm fiber-check <afv> --tr T.json --boxes B.tsv --names A,B --codes R K --phase R K   do published fibre polylines link points of one GT sheet?\n"
         "  ufsm fiber-export <afv> <fields-dir> <out.fib> --tr T.json    fibre polylines in a fit box's coordinates for fit --fibers\n"
+        "  ufsm fiber-regscore <afv> (--map reg.json | --tr T.json) --pred ROOT KEY   a scan-to-scan map scored by fibre presence along mapped fibres (per-region residual shifts)\n"
         "  ufsm fit-phase-box <fit-set> z y x nz ny nx <out.raw> [--level L] [--step 2]   a fit set's winding phase over a CT box (uint8 band phase; fibre judge)\n"
         "  ufsm wrap-dump <wraps-dir> <out.f32> --z z0,z1 [--yx y0,y1,x0,x1] [--every 2]   wrap vertices of a slab as float32 (z, y, x, id, column / width) records\n"
         "  ufsm fiber-judge <fibres.afv|.fib> (--wraps DIR | --phase ROOT KEY | --set FITSET) --um U --slab Z0,NZ [--out rows.tsv]   do fibres stay in one sheet of our winding? (label-free judge)\n"
@@ -4500,6 +4501,7 @@ int cmd_strip_mosaic(int argc, char **argv);
 int cmd_strip_crop(int argc, char **argv);
 int cmd_fiber_check(int argc, char **argv);    /* src/fibercheck.c */
 int cmd_fiber_export(int argc, char **argv);   /* src/fibercheck.c */
+int cmd_fiber_regscore(int argc, char **argv);   /* src/fibregscore.c */
 int cmd_fit_phase_box(int argc, char **argv);  /* src/fitphase.c */
 int cmd_wrap_dump(int argc, char **argv);      /* src/wrapdump.c */
 int cmd_fiber_judge(int argc, char **argv);    /* src/fiberjudge.c */
@@ -4565,6 +4567,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "fiber-link")) return cmd_fiber_link(argc, argv);
     if (!strcmp(cmd, "fiber-check")) return cmd_fiber_check(argc, argv);
     if (!strcmp(cmd, "fiber-export")) return cmd_fiber_export(argc, argv);
+    if (!strcmp(cmd, "fiber-regscore")) return cmd_fiber_regscore(argc, argv);
     if (!strcmp(cmd, "fit-phase-box")) return cmd_fit_phase_box(argc, argv);
     if (!strcmp(cmd, "wrap-dump")) return cmd_wrap_dump(argc, argv);
     if (!strcmp(cmd, "fiber-judge")) return cmd_fiber_judge(argc, argv);

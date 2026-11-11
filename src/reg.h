@@ -33,6 +33,7 @@ void rmap_f2c(const rmap *m, const double f[3], double c[3]);   /* fixed-point i
 typedef struct rvol {
     double um; int nl; int64_t shape[10][3];   /* zyx per level */
     void *z[10];                               /* z3 * per level */
+    void *z2[10];                              /* z2 * per level (zarr v2 pyramids, e.g. the 2023 scrollprize scans: levels "0", "1", ...) */
     uint8_t *mem[10];                          /* in-memory levels (tests) */
     char name[256];
 } rvol;
@@ -73,6 +74,7 @@ typedef struct {
     rvol *cv, *fv; const rmap *m;
     int lc, lf, B, R, ss, metric, iters;
     double hp, lp, minfrac;
+    int maskfill;   /* 1: masked voxels (CT 0) take the mean of the unmasked ones before filtering (no mask-edge features) */
 } rmeas;
 typedef struct {
     double c[3];            /* box centre, coarse L0 xyz */
