@@ -6,6 +6,52 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Paris 4: the 2023 7.91 um scan registered to our 2.4 um scan (2026-11-11, branch p4reg-20261111)
+
+Why: the published AFV fibre tracings (Paris4_1mm_v2 etc.) sit in the 2023 scan (PHercParis4 20230205180739, scrollprize
+`full-scrolls/Scroll1/PHercParis4.volpkg/volumes_zarr_standardized/54keV_7.91um_Scroll1A.zarr`, zarr v2), and the only published
+link to our 20260411134726 scan is the open-data affine `PHercParis4/transforms/20260411134726-to-20230205180739-r1` (24 landmarks,
+LS rms 2.45 coarse voxels = 19 um, max 6.4 = 51 um; it is the matrix we had in /vesuvius/ufsm/fibers/meta/p4_2026_to_2023.json).
+The fibre-normal training arm vcfibA lost on Paris 4 and gained on 1667 with fibre labels brought through that affine.
+
+Method: the existing `ufsm reg` pipeline (pair / boxes / fit / stats), coarse = 2023 (7.91 um), fine = ours. Gaps filled:
+- `rvol_open` read zarr v3 only and needed level 0: it now reads zarr v2 pyramids (levels "0", "1", ...) and stores holding only
+  some levels (our local Paris 4 copy starts at level 2; the official fibre predictions hold only 3 and 4); `rvol_level_for` skips
+  absent levels. test_regz2.
+- `reg boxes --maskfill 1` (masked CT 0 -> the box mean before the band-pass). Not used in the final map (see below).
+- `fiber-export --map reg.json`: AFV fibres through a reg map with its field (affine-only map = --tr, 6e-5 voxel).
+- `ufsm fiber-regscore`: an independent check (no CT matching): per region (a cube around a random fibre point, placed with one
+  fixed affine so all maps see the same regions), mean fibre presence of the official prediction on our scan along the mapped AFV
+  fibres, and the per-axis shift maximising it (parabola) = the local residual. `--identity` / `--afv-fine` score fibres on a CT
+  in their own frame or the other way round.
+
+Checks before fitting: AFV v2 on the 2023 CT with no map: per-axis bias <= 0.7 um at 2023 levels 0 / 1 / 2 (the AFV frame is
+Scroll1A's, although the AFV declares a 14258-slice base and Scroll1A has 14376). The 2023 CT is masked inside the scroll too
+(median box coverage 0.84), so the default coverage gate 0.95 kept 8 % of the boxes; 0.75 keeps 82 %.
+
+Passes (coarse level 1 = 15.8 um boxes of 96^3, fine level 2 = 9.6 um, DoG NCC, sub-voxel):
+| pass | boxes | CT hold-out p50 / p90 (um) | fibres (100 regions) presence, residual p50 / p90 (um), bias z |
+|---|---|---|---|
+| published affine | | (eval boxes, below) | 99.8, 17.7 / 48.0, -4.9 |
+| A: 334 boxes (mirror fine CT, gate 0.95), affine + field h 768 | 334 | 8.2 / 17.4 | 98.2, 18.3 / 46.3, +11.4 |
+| C: from A, local fine CT, gate 0.75, spacing 288, h 768 | 6461 | 5.8 / 17.4 | 124.1, 6.5 / 18.9, +0.6 |
+| C, h 512 | 6461 | 4.8 / 13.7 | |
+| C, h 384 | 6461 | 4.2 / 12.2 | 127.7, 4.9 / 12.4, +0.5 |
+| **C, h 256 (final)** | 6461 | **3.7 / 10.5** | **129.6, 4.3 / 10.4, +0.4** |
+| C, h 192 | 6461 | 4.5 / 12.3 | 128.4, 4.7 / 11.9, +0.6 |
+| D: --maskfill 1 from the published affine, h 256 | 2439 | 5.2 / 13.9 | 128.1, 5.1 / 14.5, +0.6 |
+
+- Pass A looked good by CT hold-out (20.5 -> 8.2 um) and was not better by fibres: 334 boxes are too few for the affine + field
+  (the fit moved z by ~16 um). The dense pass C agrees on both measures. Mask filling (D) gave no gain over C: the mask edges
+  were not the problem.
+- Evaluation boxes midway between the fit boxes (offset 144, never fitted), final map: 2440 confident, residual p50 0.369 voxel
+  = 2.9 um, p90 1.23 voxel = 9.7 um, 31.7 % under 1/4 voxel; NCC p50 0.909. Published affine on the same boxes: 2430 confident, p50 2.278 voxel = 18.0 um, p90 4.54 = 35.9 um, 0.0 % under 1/4 voxel.
+- Field 57 x 30 x 33 nodes, spacing 256 coarse voxels (2.0 mm), max |D| 6.0 coarse voxels (48 um).
+
+Output: /vesuvius/ufsm/reg/PParis4_2026to2023/ (reg.json for `ufsm reg map` / `fiber-export --map`, transform.json in the published
+schema with the refined affine, field.f32 + field.json, eval_boxes.jsonl, residuals.jsonl, the two fibre-region tables). Work dir:
+/vesuvius/ufsm/reg/P4_2023 (passes, logs, scripts runC.sh / runD.sh / rs.sh).
+
 ## Fibre retrain: ring labels, a direction head, the smoothed-axis check (2026-11-11, branch fibers-20261110)
 
 Follow-up of the section below (our masks mark fibre layers, not tubes).
