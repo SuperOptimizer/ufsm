@@ -81,6 +81,7 @@ int cmd_stitch(int argc, char **argv);   /* src/stitch.c */
 int cmd_coreline(int argc, char **argv);   /* src/coreline.c */
 int cmd_coreline_check(int argc, char **argv);   /* src/coreline_check.c */
 int cmd_render_sheets(int argc, char **argv);   /* src/render.c */
+int cmd_sheet_pbr(int argc, char **argv);       /* src/sheetpbr.c */
 int cmd_overlay_red(int argc, char **argv);
 int cmd_tifxyz_scale(int argc, char **argv);
 int cmd_ink_compare(int argc, char **argv);
@@ -171,6 +172,7 @@ static int usage(void) {
         "  ufsm wraps <model-dir> <out-dir> [--step 8] [--fields DIR]          one tifxyz per wrap (level sets of W)\n"
         "  ufsm coreline detect|box|sdist|check ...   a crushed scroll's flattened umbilicus per z (fit fields), half-box fit dirs behind it, check renders\n"
         "  ufsm render-sheets <tifxyz-dir> <out-dir> --ct ROOT KEY --ink ROOT KEY ...   every sheet -> CT + red ink 5-panel JPEGs, one batch\n"
+        "  ufsm sheet-pbr <tifxyz-dir> <out-dir> --ct ROOT KEY --crop U0,V0,N [--ss 1] ...   sub-voxel recto / verso surfaces + PBR shading of a segment crop\n"
         "  ufsm overlay-red <ct-dir> <ink-dir> <out-dir> [ink2 [ink3]]   the 5-panel overlay of existing renders\n"
         "  ufsm tifxyz-scale <src> <dst> <div> [--offset z,y,x]   tifxyz coordinates / div (e.g. 2.4 -> 9.6 um: 4)\n"
         "  ufsm ink-compare <out.jpg> --ct CT.tif --ink LABEL=INK.tif ..   CT | ink panels (half-res JPEG) + ink statistics per render\n"
@@ -4578,6 +4580,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "coreline") && argc > 2 && !strcmp(argv[2], "check")) return cmd_coreline_check(argc, argv);
     if (!strcmp(cmd, "coreline")) return cmd_coreline(argc, argv);
     if (!strcmp(cmd, "render-sheets")) return cmd_render_sheets(argc, argv);
+    if (!strcmp(cmd, "sheet-pbr")) return cmd_sheet_pbr(argc, argv);
     if (!strcmp(cmd, "overlay-red")) return cmd_overlay_red(argc, argv);
     if (!strcmp(cmd, "tifxyz-scale")) return cmd_tifxyz_scale(argc, argv);
     if (!strcmp(cmd, "ink-compare")) return cmd_ink_compare(argc, argv);
