@@ -3,6 +3,7 @@
    integer gauge from the true W over the whole box (winding ids >= 99%). Also fit_set_upload with more than 63 slabs: the GPU grid
    evaluation of a 70-slab set equals the CPU one. Coarse-to-fine: a whole-box fit as the global ref: fit-join --ref --chain-w 0 (the
    gauges from the ref alone) is one gauge too, and a slab fitted with --ref-model / --ref-snap 1 takes the ref's integers (>= 99%). */
+#include "afv.h"
 #include "fit.h"
 #include "nn.h"
 #include <math.h>
@@ -12,6 +13,21 @@
 #include <unistd.h>
 
 int cmd_fit_join(int argc, char **argv);
+/* the share of material voxels (every 3rd) whose joined W is one integer gauge from the true W */
+static double ids_true(const fit_set *S, const uint8_t *w, int H, int W, size_t n, double h8, double (*Wt)(double, double, double)) {
+    int hist[81] = {0}; size_t nd = 0, right = 0;
+    for (int pass = 0; pass < 2; pass++) {
+        int k0 = 0; for (int k = 1; k < 81; k++) if (hist[k] > hist[k0]) k0 = k;
+        for (size_t i = 0; i < n; i += 3) {
+            if (!w[i]) continue;
+            const int z = (int)(i / ((size_t)H * W)), y = (int)((i / W) % H), x = (int)(i % W); const double pz = (z + 0.5) * h8, py = (y + 0.5) * h8, px = (x + 0.5) * h8;
+            const double d = fit_set_W(S, pz, py, px) - Wt(pz, py, px);
+            if (!pass) { const long k = lround(d); if (k >= -40 && k <= 40) hist[k + 40]++; nd++; }
+            else right += fabs(d - (k0 - 40)) < 0.5;
+        }
+    }
+    return nd ? (double)right / nd : 0;
+}
 static int fails;
 #define CHECK(c, ...) do { if (!(c)) { fprintf(stderr, "FAIL: " __VA_ARGS__); fputc('\n', stderr); fails++; } } while (0)
 
@@ -93,6 +109,40 @@ int main(void) {
         for (int k = 0; k < 70; k++) fit_free(T.slab[k]);
         free(T.slab); free(T.z0); free(T.z1);
         fit_set_free(S);
+    }
+    {   /* fibre votes (--fibers --join-fib): with the overlap term off (--chain-w 0) the boundary offset comes from the fibres alone.
+           Fibres lie in one sheet (W_true constant along them: r(z) solved per fixed angle), z 160 .. 352 across the boundary at 256; a
+           quarter of them hop one sheet outward at the boundary: the network phase unwrapped along the fibre turns by ~1 there, so those
+           pairs are dropped (|dP| >= 0.5) rather than voting off by one */
+        fib_set F = {0}; F.n = 0; const int NF = 240, NP = 49; F.off = malloc((NF + 1) * sizeof(int)); F.fam = malloc(NF); F.pts = malloc((size_t)NF * NP * 3 * sizeof(float)); F.off[0] = 0;
+        uint64_t rs = 12345; int nhop = 0;
+        for (int f = 0; f < NF; f++) {
+            rs = rs * 6364136223846793005ull + 1442695040888963407ull; const double th = 2 * M_PI * (double)(rs >> 11) / 9007199254740992.0 - M_PI;
+            rs = rs * 6364136223846793005ull + 1442695040888963407ull; const double W0 = 4.2 + 1.4 * (double)(rs >> 11) / 9007199254740992.0;
+            const int hop = f % 4 == 0; nhop += hop;
+            for (int k = 0; k < NP; k++) {
+                const double z = 160 + 4.0 * k, Wv = W0 + (hop && z >= 256 ? 1 : 0);
+                const double r = (Wv + th / (2 * M_PI)) / (1 / (60 + 4 * z / 512) + 0.3 * sin(th) / 300);
+                float *q = F.pts + 3 * (size_t)F.npts; q[0] = (float)z; q[1] = (float)(ax_y(z) + r * sin(th)); q[2] = (float)(ax_x(z) + r * cos(th)); F.npts++;
+            }
+            F.fam[F.n] = 'V'; F.n++; F.off[F.n] = F.npts;
+        }
+        char fp[300], out3[300]; snprintf(fp, sizeof fp, "%s/fib.fib", dir); snprintf(out3, sizeof out3, "%s/set3", dir);
+        CHECK(!fib_save(fp, &F), "save the fibres"); fib_free(&F);
+        char *av3[] = {"ufsm", "fit-join", out3, dir, "--chain-w", "0", "--fibers", fp, "--join-fib", "1", "--join-fib-gap", "0.1", m0, "0", "256", m1, "256", "512"};
+        CHECK(cmd_fit_join(18, av3) == 0, "fit-join --fibers");   /* (both pair ends >= 0.1 mm = 42 native voxels from the boundary) */
+        fit_set *S3 = fit_set_load(out3); CHECK(S3 != nullptr, "load the fibre join");
+        if (S3) {
+            const double acc = ids_true(S3, a[9], H, W, n, H8, W_true);
+            printf("fit-join --chain-w 0 --fibers (%d of %d fibres hop a sheet at the boundary): joined set winding ids right %.4f\n", nhop, NF, acc);
+            CHECK(acc >= 0.99, "fit-join --fibers: winding ids right %.4f < 0.99", acc);
+            fit_set_free(S3);
+        }
+        /* and with the overlap on, the fibres agree with it (no change) */
+        char out4[300]; snprintf(out4, sizeof out4, "%s/set4", dir);
+        char *av4[] = {"ufsm", "fit-join", out4, dir, "--fibers", fp, "--join-fib", "1", m0, "0", "256", m1, "256", "512"};
+        CHECK(cmd_fit_join(14, av4) == 0, "fit-join --fibers with the overlap");
+        fit_set *S4 = fit_set_load(out4); if (S4) { const double acc = ids_true(S4, a[9], H, W, n, H8, W_true); CHECK(acc >= 0.99, "fit-join --fibers + overlap: ids right %.4f", acc); fit_set_free(S4); }
     }
     {   /* coarse-to-fine: the whole box fitted as the ref */
         char ref[300], out2[300]; snprintf(ref, sizeof ref, "%s/ref", dir); snprintf(out2, sizeof out2, "%s/set2", dir);

@@ -519,6 +519,9 @@ void nn_unwrap_targets(const uint8_t *phase, int d, int h, int w, int s, float d
 void nn_unwrap_targets2(const uint8_t *phase, int d, int h, int w, int s, float dscale, int code, float um, float packed_um, float packed_w, uint8_t *t, uint8_t *m);
 void nn_packed_mask(const uint8_t *phase, int d, int h, int w, int s, float um, float packed_um, float packed_w, uint8_t *m);   /* 0/1 mask x the weight */
 void nn_packed_mask_z(const uint8_t *phase, int d, int h, int w, int s, float um, float packed_um, float packed_w, uint8_t *m, int z0, int z1);   /* m: planes [z0, z1) */
+/* train --fib-dir: the axis of the H / V label tubes (t: 2 planes, >= 128 = fibre; m: shared mask) -> 7 target planes (n n^T coding of the
+   axis, family V) and a 0/1 mask, over the (2r + 1)^3 second moment of the voxel's family tube; lambda_1 / trace >= cmin (src/nn_elem.cu) */
+void nn_fib_dir_targets(const uint8_t *t, const uint8_t *m, int d, int h, int w, int r, float cmin, uint8_t *o, uint8_t *om);
 void nn_unwrap_targets2_z(const uint8_t *phase, int d, int h, int w, int s, float dscale, int code, float um, float packed_um, float packed_w, uint8_t *t, uint8_t *m,
                           int z0, int z1);   /* planes [z0, z1) of the window into planes of (z1 - z0) h w */
 /* train --count-lambda: K segments of L voxels along the ground-truth phase gradient; loss |log((sum rho_pred + .05) / (true turns + .05))|

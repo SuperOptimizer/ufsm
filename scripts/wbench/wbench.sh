@@ -8,7 +8,8 @@
 #   Rows: $WB/res/TAG.tsv (boxes), $WB/res/TAG-slabs.tsv, $WB/res/TAG-radius.tsv; logs $WB/runs/TAG/. Compare with ufsm wbench-stats.
 # Env: SITE laptop|desk (default: laptop if ~/ufsm-data exists), GPU (0), BOXES ("clean" default: boxes not tagged label-noise in boxes.tsv | "core": the clean paris4 + paris4j boxes + 12 1667 boxes tagged core (routine snapshot evals) | "all" | "none" | names), REP (2: shifted fits per box, 0 off),
 #   SLABS (1), SLABORC (none|net: slab ceiling, label phase in the slab crops; BOXES=none skips the boxes), SITES (z cells of the slab sites), FIT (extra fit flags; changes the fitter config tag; "{box}" becomes the box name,
-#   e.g. FIT="--emb /vesuvius/ufsm/repr/emb/bench/{box} --uw-rep-emb 2"), FIELDS (TAG0: reuse fields),
+#   e.g. FIT="--emb /vesuvius/ufsm/repr/emb/bench/{box} --uw-rep-emb 2"), JOIN (extra fit-join flags at the slab sites, "{box}" = site<s>, e.g.
+#   JOIN="--fibers /vesuvius/ufsm/fibers/wbsites/{box}.fib --join-fib 1"; changes the fitter config tag), FIELDS (TAG0: reuse fields),
 #   KEEP (1: keep this TAG's fields for later fixed-fields runs; default 1), U (binary; default $WB/bin/ufsm = the pinned build), UP (predict binary, default U: a newer build for checkpoints the fitter pin cannot load),
 #   NOLOCK=1 (the caller holds the GPU lock).
 #   WZARGS= (empty): cube windows, no --window-z (latent-grid checkpoints: train --lat 4), with WIN / HALO.
@@ -20,11 +21,11 @@ SITE=${SITE:-$([ -d $HOME/ufsm-data ] && echo laptop || echo desk)}; GPU=${GPU:-
 . $H/site-$SITE.env
 CK=$(readlink -f "$1"); TAG=$2
 U=${U:-$WB/bin/ufsm}; [ -x $U ] || { echo "no binary $U"; exit 2; }
-BOXES=${BOXES:-clean}; SLABORC=${SLABORC:-}; REP=${REP:-2}; SLABS=${SLABS:-$([ "$SITE" = laptop ] && echo 0 || echo 1)}; SITES=${SITES:-4624 5392 5904 6672}; FIT=${FIT:-}; FIELDS=${FIELDS:-}; KEEP=${KEEP:-1}
+BOXES=${BOXES:-clean}; SLABORC=${SLABORC:-}; REP=${REP:-2}; SLABS=${SLABS:-$([ "$SITE" = laptop ] && echo 0 || echo 1)}; SITES=${SITES:-4624 5392 5904 6672}; FIT=${FIT:-}; JOIN=${JOIN:-}; FIELDS=${FIELDS:-}; KEEP=${KEEP:-1}
 [ "$SITE" = laptop ] && [ "$SLABS" = 1 ] && { echo "wbench: no slab fits on the laptop (OOM in ufsm.slice): run the sites on forlindesk (wgate-slabs.sh) or SLABS=0"; exit 2; }
 BT=${BT:-$H/boxes.tsv}; BIN=$(sha1sum $U | cut -c1-8)
 GF="--gpu $GPU"; [ "${CPU:-0}" = 1 ] && GF="--cpu --threads $THREADS"   # CPU=1: fits on the CPU backend (no GPU; a separate fitter config)
-FCFG=$(echo "$BIN --dir 1 --uw-repair 8 $FIT${CPU:+ cpu$CPU}" | sha1sum | cut -c1-8)   # the fitter config: binary + flags
+FCFG=$(echo "$BIN --dir 1 --uw-repair 8 $FIT${CPU:+ cpu$CPU}${JOIN:+ join $JOIN}" | sha1sum | cut -c1-8)   # the fitter config: binary + flags
 FT=${FIELDS:-$TAG}; FD=$WB/fields/$FT; O=$WB/runs/$TAG; mkdir -p $O $WB/res $WB/ceil $FD $CACHE
 RES=$WB/res/$TAG.tsv; RS=$WB/res/$TAG-slabs.tsv; RR=$WB/res/$TAG-radius.tsv; CEIL=$WB/ceil/$FCFG.tsv
 HDR="tag	box	scroll	ids	ids0	ids_a	ids_b	ids_sd	e08	p05	p1	p2	p4	p05x	p1x	p2x	p4x	pmed	gross	gross100	conf	ceil	ceil_p1x	frac	pred_s	fit_s	bin	fcfg	cnt_bias	cnt_off	cnt_offp	dcnt_bias	dcnt_off	dcnt_offp"
@@ -151,7 +152,7 @@ if [ "$SLABS" = 1 ]; then
     fi
     for k in A B; do lk; UFSM_FIT_THREADS=$THREADS RUNBIG $U fit $d/f$k $GF --out $d/fit$k --codes $QR $QK --score-detail 1 --score-pairs 1 --dir 1 --uw-repair 8 ${FIT//\{box\}/$S} > $d/fit$k.log 2>&1; ulk
       grep -E '^    radius' $d/fit$k.log | awk -v t=$TAG -v s=$S -v k=$k '{gsub(/-/, " "); $0 = $0; print t"\t"s"\t"k"\t"$2"\t"$3"\t"$5"\t"$7"\t"$8"\t"$9"\t"$10"\t"$11}' >> $RR; done
-    RUN $U fit-join $d/joined $d/fC --blend 16 $d/fitA 32 160 $d/fitB 160 288 > $d/join.log 2>&1
+    RUN $U fit-join $d/joined $d/fC --blend 16 ${JOIN//\{box\}/$S} $d/fitA 32 160 $d/fitB 160 288 > $d/join.log 2>&1
     js=$(num $(grep -oE '^ +0\|1 .*' $d/join.log | awk '{print $NF}'))
     lk; UFSM_FIT_THREADS=$THREADS RUNBIG $U fit $d/fC --model $d/joined $GF --codes $QR $QK --score-pairs 1 > $d/joined.log 2>&1; ulk
     t1=$(date +%s); a=$(num $(g_ids $d/fitA.log)); b=$(num $(g_ids $d/fitB.log))

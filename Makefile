@@ -65,6 +65,7 @@ SRC += src/surf.c src/stitch.c src/coreline.c src/coreline_check.c src/fit_ct.c 
 SRC += src/fblend.c
 SRC += src/deform.c src/vwt_aug.c src/zcache.c
 SRC += src/inkblend.c
+SRC += src/ftaxis.c
 SRC += src/inkseam.c
 SRC += src/render.c src/imgops.c src/jpegpar.c src/inkcompare.c
 SRC += src/repack.c
@@ -79,7 +80,7 @@ SRC += src/vwt_sample.c src/raycheck.c src/patchraster.c src/hiresphase.c src/fi
 SRC += src/view.c src/reg.c src/reg_cli.c src/reg_view.c src/reg_init.c src/reg_render.c src/reg_ink.c src/srpairs.c
 SRC += src/srpair.c
 SRC += src/storebench.c src/phasepack.c
-SRC += src/afv.c src/fibercheck.c
+SRC += src/afv.c src/fibercheck.c src/fitphase.c src/wrapdump.c src/fiberjudge.c src/fibertrace.c src/fiberraster.c src/fiberlink.c
 SRC += src/countfield.c src/countanat.c
 SRC += src/flatten.c src/faces.c src/faces_cli.c
 SRC += src/sheetcut.c
@@ -139,6 +140,8 @@ $(B)/nn.o: $(NNOBJ)
 $(B)/nn_gpudec.o: NVFLAGS = -O3 $(NVARCH) -DUFSM_ARCH=$(ARCH) -fmad=false -Xcompiler -fno-threadsafe-statics -Isrc
 # count-field on the GPU mirrors the CPU's rounding (src/nn_cf.cu): IEEE division / sqrt, no FMA contraction, no fast math
 $(B)/nn_cf.o: NVFLAGS = -O3 $(NVARCH) -DUFSM_ARCH=$(ARCH) -fmad=false -Xcompiler -fno-threadsafe-statics -Isrc
+# fiber-trace's axis on the GPU (src/nn_ftrace.cu) is byte-identical to src/ftaxis.c: IEEE division / sqrt, no FMA contraction, no fast math
+$(B)/nn_ftrace.o: NVFLAGS = -O3 $(NVARCH) -DUFSM_ARCH=$(ARCH) -fmad=false -Xcompiler -fno-threadsafe-statics -Isrc
 # FP8 / FP4 block-scaled mma (kind::mxf8f6f4 / kind::mxf4) needs the arch-specific sm_120a target
 # The low-precision kernels are split into one translation unit per kernel family (src/lp_*.cu, shared helpers in
 # src/lp_common.cuh) so make -j compiles them in parallel; $(B)/nn_fp8.o is their relocatable link, so every target
@@ -245,6 +248,9 @@ $(B)/test_lat_fuse: tests/test_lat_fuse.c $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 $(B)/test_unwrap_targets: tests/test_unwrap_targets.c $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
+$(B)/test_fib_dir: tests/test_fib_dir.c $(B)/nn.o $(B)/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
+suite-bins: $(B)/test_fib_dir
 $(B)/test_fit: tests/test_fit.c $(B)/fit.o $(B)/fit_emb.o $(B)/embz.o $(B)/z3w.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/coreline.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 $(B)/test_surf: tests/test_surf.c $(B)/surf.o $(B)/stitch.o $(B)/z3w.o $(B)/fit.o $(B)/fit_emb.o $(B)/embz.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/coreline.o $(B)/tiffw.o $(B)/tiff.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/nn.o $(B)/nn_fp8.o $(B)/imgops.o $(B)/jpegpar.o
@@ -316,7 +322,7 @@ suite-bins: $(B)/test_fit_w4
 $(B)/test_repair: tests/test_repair.c $(B)/fit.o $(B)/fit_emb.o $(B)/embz.o $(B)/z3w.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/coreline.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 suite-bins: $(B)/test_repair
-$(B)/test_afv: tests/test_afv.c $(B)/afv.o
+$(B)/test_afv: tests/test_afv.c $(B)/afv.o $(B)/json.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
 suite-bins: $(B)/test_afv
 $(B)/test_flatten: tests/test_flatten.c $(B)/flatten.o $(B)/imgops.o $(B)/jpegpar.o $(B)/tiffw.o $(B)/tiff.o
@@ -412,7 +418,7 @@ $(B)/test_sheetcut: tests/test_sheetcut.c $(B)/sheetcut.o $(B)/tfx.o $(B)/imgops
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_sheetcut.c $(B)/sheetcut.o $(B)/tfx.o $(B)/imgops.o $(B)/jpegpar.o $(B)/tiffw.o $(B)/tiff.o $(B)/surfcomp.o -o $@ $(LDLIBS)
 suite-bins: $(B)/test_sheetcut
 suite-bins: $(B)/test_tfx
-$(B)/test_fit_join: tests/test_fit_join.c $(B)/fitjoin.o $(B)/phasegate.o $(B)/fit.o $(B)/fit_emb.o $(B)/embz.o $(B)/z3w.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/coreline.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/nn.o $(B)/nn_fp8.o
+$(B)/test_fit_join: tests/test_fit_join.c $(B)/fitjoin.o $(B)/afv.o $(B)/phasegate.o $(B)/fit.o $(B)/fit_emb.o $(B)/embz.o $(B)/z3w.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/coreline.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 suite-bins: $(B)/test_fit_join
 $(B)/test_wrap_check: tests/test_wrap_check.c $(B)/wrapcheck.o $(B)/fit.o $(B)/fit_emb.o $(B)/embz.o $(B)/z3w.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/coreline.o $(B)/json.o $(B)/zarr3.o $(B)/zarr2.o $(B)/store.o $(B)/nn.o $(B)/nn_fp8.o
@@ -477,6 +483,21 @@ suite-bins: $(B)/test_patchsolve
 $(B)/test_surflabels: tests/test_surflabels.c $(B)/surflabels.o $(B)/phasecoh.o $(B)/pairacc.o $(B)/tfx.o $(B)/surfcomp.o $(B)/tiffw.o $(SAMPLE_TEST_OBJ) $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 suite-bins: $(B)/test_surflabels
+$(B)/test_fiberjudge: tests/test_fiberjudge.c $(B)/fiberjudge.o $(B)/wrapdump.o $(B)/fitphase.o $(B)/afv.o $(B)/fitjoin.o $(B)/phasegate.o $(B)/fit.o $(B)/fit_emb.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/coreline.o $(B)/tfx.o $(B)/surfcomp.o $(B)/tiffw.o $(SAMPLE_TEST_OBJ) $(B)/nn.o $(B)/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
+suite-bins: $(B)/test_fiberjudge
+$(B)/test_fibertrace: tests/test_fibertrace.c $(B)/fibertrace.o $(B)/ftaxis.o $(B)/nn_ftrace.o $(B)/afv.o $(B)/zarr2.o $(B)/zarr3.o $(B)/store.o $(B)/json.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
+suite-bins: $(B)/test_fibertrace
+$(B)/test_fiberraster: tests/test_fiberraster.c $(B)/fiberraster.o $(B)/afv.o $(B)/z3w.o $(B)/zarr3.o $(B)/store.o $(B)/json.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
+suite-bins: $(B)/test_fiberraster
+$(B)/test_ftrace_gpu: tests/test_ftrace_gpu.c $(B)/ftaxis.o $(B)/nn_ftrace.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(CUDA)/include $^ -o $@ -lm $(CUDALIBS)
+suite-bins: $(B)/test_ftrace_gpu
+$(B)/test_fiber_link: tests/test_fiber_link.c $(B)/fiberlink.o $(B)/afv.o $(B)/json.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
+suite-bins: $(B)/test_fiber_link
 $(B)/test_patchid: tests/test_patchid.c $(B)/patchid.o $(B)/pairacc.o $(B)/tfx.o $(B)/surfcomp.o $(B)/tiffw.o $(SAMPLE_TEST_OBJ) $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 suite-bins: $(B)/test_patchid
