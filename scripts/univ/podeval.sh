@@ -9,7 +9,7 @@ CK=$(readlink -f "${1:?ckpt}"); T=${2:?tag}; PB=${3:-}; read -r HOST PORT <<< "$
 E="ssh -p $PORT -i $HOME/.ssh/id_ed25519 -o BatchMode=yes"; WB=/vesuvius/ufsm/wbench
 rsync -aL -e "$E" $CK $HOST:$K/ckpt/$T.ckpt < /dev/null || exit 1
 UPV="RVU=$K/ufsm/build/ufsm"; [ -n "$PB" ] && { rsync -aL -e "$E" $PB $HOST:$K/ckpt/$T.bin < /dev/null || exit 1; UPV="UP=$K/ckpt/$T.bin RVU=$K/ckpt/$T.bin"; }
-PASS=""; for v in TASKS DLVS WZARGS WIN HALO INKP FIBCH LV_INK RVSC REFS THREADS; do [ -n "${!v+x}" ] && PASS="$PASS $v='${!v}'"; done
+PASS=""; for v in TASKS DLVS WZARGS WIN HALO INKP FIBCH LV_INK RVSC REFS THREADS INKC INKGT; do [ -n "${!v+x}" ] && PASS="$PASS $v='${!v}'"; done
 $E $HOST "cd $K/ufsm && git pull -q --ff-only; env SITE=pod K=$K WB=$K/wb GPU=${PODGPU:-0} INKW=$K/ckpt/ckpt_78k_fullsup.pth FIBPH=$K/wbgt/paris4-wind-20261019 CTR=https://dl.ash2txt.org/community-uploads/forrest/volcomp VOLP=volumes/ CNT=$K/count RVGT=$K/wbgt RU=$K/ufsm/build/ufsm RVE=$K/rv/eval LOCK= TH=8 $UPV $PASS \
   bash scripts/univ/eval.sh $K/ckpt/$T.ckpt $T > $K/wb/univ_$T.out 2>&1" < /dev/null
 mkdir -p $WB/univ/pod; rsync -a -e "$E" "$HOST:$K/wb/res/$T*.tsv" $WB/univ/pod/ < /dev/null; rsync -a -e "$E" $HOST:$K/wb/univ/$T.matrix.txt $HOST:$K/wb/univ/$T.log $WB/univ/pod/ < /dev/null; rsync -a -e "$E" "$HOST:$K/rv/eval/$T.txt" $WB/univ/pod/rv_$T.txt < /dev/null 2>/dev/null
