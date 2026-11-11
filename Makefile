@@ -281,6 +281,10 @@ suite-bins: $(B)/test_fields_pack
 $(B)/test_ink_gate: tests/test_ink_gate.c $(B)/inkgate.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/z3w.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
 suite-bins: $(B)/test_ink_gate
+$(B)/test_sheetpbr: tests/test_sheetpbr.c $(B)/sheetpbr.o $(B)/reg.o $(B)/imgops.o $(B)/jpegpar.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/z3w.o $(B)/tiffw.o $(B)/tiff.o $(B)/tfx.o $(B)/surfcomp.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
+suite-bins: $(B)/test_sheetpbr
+
 $(B)/test_geom_check: tests/test_geom_check.c $(B)/geomcheck.o $(B)/sources.o $(B)/srpair.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/z3w.o $(B)/tiffw.o $(B)/tiff.o $(B)/tfx.o $(B)/surfcomp.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
 suite-bins: $(B)/test_geom_check

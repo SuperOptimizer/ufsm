@@ -22,6 +22,7 @@
       horizon-based ambient occlusion (16 directions, 24 px); images: light_k.pgm, rti_max / rti_min / rti_range.pgm, ao.pgm,
       normals.ppm, pbr.pgm (light at 135 deg, flat albedo, x AO), pbr_density.pgm (albedo from the near-surface CT). */
 #include "imgops.h"
+#include "reg.h"
 #include "store.h"
 #include "zarr3.h"
 #include <math.h>
@@ -102,6 +103,7 @@ static double cb_cubic(const cbox *B, double z, double y, double x) {
 /* ---- the job ---- */
 typedef struct {
     sgrid G; cbox B; int cubic, W, ss, K; double step, depth, u0, v0, sgn, win1;
+    const rmap *map; double fs;                  /* --reg: the profile scan = the map's fine scan; fs = its voxels per mesh-scan voxel */
     float *tp0, *cr, *cvv;                        /* pass-1 sheet middle, recto and verso offsets per sample (upsampled) */
     float *grr, *grv, *amb;                      /* edge strengths (CT per voxel); runner-up / best of the recto edge */
     float *r, *v, *thk, *pk, *nin, *nout, *flat, *fmax, *valid;
@@ -115,6 +117,11 @@ static int frame(const job *J, int px, int py, double P[3], double n[3]) {
     double Du[3], Dv[3];
     if (!surf_at(&J->G, J->u0 + (px + 0.5) / J->ss - 0.5, J->v0 + (py + 0.5) / J->ss - 0.5, P, Du, Dv)) return 0;
     cross3(Du, Dv, n); norm3(n); for (int k = 0; k < 3; k++) n[k] *= J->sgn;
+    if (J->map) {   /* into the fine scan: the point through the map, the normal through its local Jacobian (finite difference) */
+        const double c0[3] = {P[2], P[1], P[0]}, c1[3] = {P[2] + n[2], P[1] + n[1], P[0] + n[0]}; double f0[3], f1[3];
+        rmap_c2f(J->map, c0, f0); rmap_c2f(J->map, c1, f1);
+        for (int k = 0; k < 3; k++) { P[k] = f0[2 - k]; n[k] = f1[2 - k] - f0[2 - k]; } norm3(n);
+    }
     return 1;
 }
 static void smooth1(const double *f, double *g, int K, double sig) {   /* Gaussian along the profile (sigma in samples) */
@@ -141,7 +148,7 @@ static int sheet(const job *J, const double P[3], const double n[3], double c, d
     if (!(ein == ein) || !(eout == eout)) return 0;
     const double r = c - J->depth + ein * J->step, v = c - J->depth + eout * J->step;
     double ni = 0, no = 0; int cn = 0;
-    for (double t = 0.25; t <= 2.0; t += 0.25, cn++) { ni += prof(J, P, n, r + t); no += prof(J, P, n, v - t); }
+    for (double t = 0.25; t <= 2.0 * J->fs; t += 0.25, cn++) { ni += prof(J, P, n, r + t); no += prof(J, P, n, v - t); }
     out[0] = r; out[1] = v; out[2] = v - r; out[3] = g[kp]; out[4] = ni / cn; out[5] = no / cn; out[6] = 0.5 * (r + v);
     return 1;
 }
@@ -168,7 +175,7 @@ static int faces(const job *J, const double P[3], const double n[3], double cr, 
         e[s] = lo + (k + (fabs(den) > 1e-9 ? 0.5 * (a - c) / den : 0)) * J->step; }
     if (!(e[1] > e[0])) return 0;
     double ni = 0, no = 0, pk = 0; int cn = 0;
-    for (double t = 0.25; t <= 2.0; t += 0.25, cn++) { ni += prof(J, P, n, e[0] + t); no += prof(J, P, n, e[1] - t); }
+    for (double t = 0.25; t <= 2.0 * J->fs; t += 0.25, cn++) { ni += prof(J, P, n, e[0] + t); no += prof(J, P, n, e[1] - t); }
     for (double t = e[0]; t <= e[1]; t += 0.5) { const double q = prof(J, P, n, t); if (q > pk) pk = q; }
     out[0] = e[0]; out[1] = e[1]; out[2] = e[1] - e[0]; out[3] = pk; out[4] = ni / cn; out[5] = no / cn; out[6] = best; out[7] = -worst; out[8] = b2 / best; out[9] = w2 / worst;
     return 1;
@@ -183,7 +190,7 @@ static int sheet_list(const job *J, const double P[3], const double n[3], double
     int gap[256], ng = 0; const double thr = mu - 0.6 * s2;
     for (int k = 1; k + 1 < K && ng < 256; k++) if (g[k] < g[k - 1] && g[k] <= g[k + 1] && g[k] < thr) gap[ng++] = k;
     int m = 0;
-    for (int i = 0; i + 1 < ng && m < maxs; i++) { const double t = (gap[i + 1] - gap[i]) * J->step; if (t < 6 || t > 80) continue; gl[m] = -J->depth + gap[i] * J->step; gr[m] = -J->depth + gap[i + 1] * J->step; mid[m++] = 0.5 * (gl[m] + gr[m]); }
+    for (int i = 0; i + 1 < ng && m < maxs; i++) { const double t = (gap[i + 1] - gap[i]) * J->step; if (t < 6 * J->fs || t > 80 * J->fs) continue; gl[m] = -J->depth + gap[i] * J->step; gr[m] = -J->depth + gap[i + 1] * J->step; mid[m] = 0.5 * (gl[m] + gr[m]); m++; }
     return m;
 }
 static void *pass2(void *a) {
@@ -273,15 +280,15 @@ static int shadowed(const hfield *F, int x, int y, const double L[3], double rel
    mesh, the verso face = the steepest fall within [recto + 4, recto + 40] */
 typedef struct { job *J; float *lr, *lv; int nc, L8; double ra, rb; } mlctx;
 static void ml_row(void *a, int b) {
-    const mlctx *C = a; job *J = C->J; const double lo = C->ra - 2, hi = C->rb + 44; const int K = (int)((hi - lo) / J->step) + 1;
+    const mlctx *C = a; job *J = C->J; const double lo = C->ra - 2 * J->fs, hi = C->rb + 44 * J->fs; const int K = (int)((hi - lo) / J->step) + 1;
     for (int i = 0; i < C->nc; i++) { const size_t q = (size_t)b * C->nc + i; C->lr[q] = C->lv[q] = NAN; double P[3], n[3], f[1024], g[1024];
         const int x = i * C->L8 < J->W ? i * C->L8 : J->W - 1, y = b * C->L8 < J->W ? b * C->L8 : J->W - 1;
         if (K > 1024 || !frame(J, x, y, P, n)) continue;
         for (int k = 0; k < K; k++) f[k] = prof(J, P, n, lo + k * J->step);
-        smooth1(f, g, K, 1.25 / J->step);
+        smooth1(f, g, K, 1.25 * J->fs / J->step);
         double best = 0; int kr = -1; for (int k = 1; k + 1 < K; k++) { const double t = lo + k * J->step; if (t < C->ra || t > C->rb) continue; const double d = g[k + 1] - g[k - 1]; if (d > best) { best = d; kr = k; } }
         if (kr < 0) continue; const double r = lo + kr * J->step; double worst = 0; int kv = -1;
-        for (int k = 1; k + 1 < K; k++) { const double t = lo + k * J->step; if (t < r + 4 || t > r + 40) continue; const double d = g[k + 1] - g[k - 1]; if (d < worst) { worst = d; kv = k; } }
+        for (int k = 1; k + 1 < K; k++) { const double t = lo + k * J->step; if (t < r + 4 * J->fs || t > r + 40 * J->fs) continue; const double d = g[k + 1] - g[k - 1]; if (d < worst) { worst = d; kv = k; } }
         C->lr[q] = (float)r; if (kv >= 0) C->lv[q] = (float)(lo + kv * J->step); }
 }
 /* robust smoothing of a lattice map: Gaussian (sigma cells) over the kept points, points further than tol from it dropped, 4 rounds */
@@ -365,7 +372,7 @@ static void dpe_row(void *a, int y) {
 }
 typedef struct { const job *J; const float *E; int KD; double lam, smax, mu; const float *prior; float *out; int col; } dpctx;
 static void dp_line(void *a, int l) {   /* one row (col 0) or column (col 1) */
-    const dpctx *C = a; const job *J = C->J; const int W = J->W, KE = 2 * C->KD + 1; const double st = J->step, px = 1.0 / J->ss;
+    const dpctx *C = a; const job *J = C->J; const int W = J->W, KE = 2 * C->KD + 1; const double st = J->step, px = J->fs / J->ss;
     float *D = malloc((size_t)W * KE * sizeof *D); int16_t *B = malloc((size_t)W * KE * sizeof *B);
     for (int j = 0; j < W; j++) { const size_t i = C->col ? (size_t)j * W + l : (size_t)l * W + j; const float *e = C->E + i * KE; const double c0 = J->cr[i];
         const size_t ip = j ? (C->col ? (size_t)(j - 1) * W + l : (size_t)l * W + j - 1) : 0; const double cp = j ? J->cr[ip] : 0;
@@ -396,16 +403,28 @@ static void md_row(void *a, int y) {
 }
 static void median2d(const float *in, float *out, int W, int R) { mdctx C = {in, out, W, R < 10 ? R : 10}; prows(W, md_row, &C); }
 
+static rvol *regfv;   /* --reg: the fine volume */
+/* weak: the map loader lives in src/reg_cli.c (the ufsm binary); tests link without it */
+__attribute__((weak)) const rmap *reg_map_open(const char *path, const char *cache, rvol **fv, double *coarse_um, double *fine_um);
+
 int cmd_sheet_pbr(int argc, char **argv) {
     const char *ctr = nullptr, *ctk = nullptr; long long cu = -1, cv = -1, cn = 0;
     for (int i = 1; i + 2 < argc; i++) if (!strcmp(argv[i], "--ct")) { ctr = argv[i + 1]; ctk = argv[i + 2]; }
-    if (argc < 4 || !ctr || sscanf(popt(argc, argv, "--crop", ""), "%lld,%lld,%lld", &cu, &cv, &cn) != 3 || cn < 16) {
+    if (argc < 4 || (!ctr && !*popt(argc, argv, "--reg", "")) || sscanf(popt(argc, argv, "--crop", ""), "%lld,%lld,%lld", &cu, &cv, &cn) != 3 || cn < 16) {
         fprintf(stderr, "usage: ufsm sheet-pbr <tifxyz-dir> <out-dir> --ct ROOT KEY --crop U0,V0,N [--ss 1] [--depth 16] [--step 0.25] [--interp tri|cubic]\n"
-                        "       [--outward 0|1|-1] [--lights 12] [--elev 15] [--relief 1] [--rough 0.35] [--threads 8] [--cache DIR]\n");
+                        "       [--reg MAP.json (profiles from the map's fine scan; --ct not needed)] [--outward 0|1|-1] [--lights 12] [--elev 15] [--relief 1] [--rough 0.35] [--threads 8] [--cache DIR]\n");
         return 2;
     }
     const char *src = argv[2], *out = argv[3]; mkdir(out, 0755);
     job J = {0}; J.ss = atoi(popt(argc, argv, "--ss", "1")); J.depth = atof(popt(argc, argv, "--depth", "16")); J.step = atof(popt(argc, argv, "--step", "0.25"));
+    J.fs = 1;
+    if (*popt(argc, argv, "--reg", "")) {   /* profiles from the map's fine scan (ufsm reg map JSON: coarse = the mesh's scan) */
+        rvol *fv = nullptr; double cum = 0, fum = 0; J.map = reg_map_open ? reg_map_open(popt(argc, argv, "--reg", ""), popt(argc, argv, "--cache", nullptr), &fv, &cum, &fum) : nullptr;
+        if (!J.map || !(cum > 0) || !(fum > 0)) { fprintf(stderr, "sheet-pbr: cannot open the map %s\n", popt(argc, argv, "--reg", "")); return 1; }
+        J.fs = cum / fum; regfv = fv;
+        if (!*popt(argc, argv, "--depth", "")) J.depth *= J.fs;
+        fprintf(stderr, "sheet-pbr: profiles from the fine scan of %s (%g um; %.4f fine voxels per mesh voxel); offsets in fine voxels\n", popt(argc, argv, "--reg", ""), fum, J.fs);
+    }
     J.cubic = !strcmp(popt(argc, argv, "--interp", "tri"), "cubic"); J.win1 = atof(popt(argc, argv, "--win", "6")); J.u0 = cu; J.v0 = cv; J.W = (int)(cn * J.ss); J.K = (int)(2 * J.depth / J.step) + 1;
     const int nth = atoi(popt(argc, argv, "--threads", "8")); g_nth = nth > 0 ? nth : 1; const int nl = atoi(popt(argc, argv, "--lights", "12"));
     const double elev = atof(popt(argc, argv, "--elev", "15")) * M_PI / 180, relief = atof(popt(argc, argv, "--relief", "1")), alpha = atof(popt(argc, argv, "--rough", "0.35"));
@@ -429,16 +448,24 @@ int cmd_sheet_pbr(int argc, char **argv) {
     { double lo[3] = {1e30, 1e30, 1e30}, hi[3] = {-1e30, -1e30, -1e30}; const int st = J.W > 64 ? 4 : 1;
       for (int y = 0; y < J.W + st; y += st) for (int x = 0; x < J.W + st; x += st) { double P[3], n[3];
           if (!frame(&J, x < J.W ? x : J.W - 1, y < J.W ? y : J.W - 1, P, n)) continue;
-          for (int s = -1; s <= 1; s += 2) for (int k = 0; k < 3; k++) { const double q = P[k] + s * (J.depth + 14) * n[k]; if (q < lo[k]) lo[k] = q; if (q > hi[k]) hi[k] = q; } }
+          for (int s = -1; s <= 1; s += 2) for (int k = 0; k < 3; k++) { const double q = P[k] + s * (J.depth + 14 * J.fs) * n[k]; if (q < lo[k]) lo[k] = q; if (q > hi[k]) hi[k] = q; } }
       for (int k = 0; k < 3; k++) { J.B.o[k] = (int64_t)floor(lo[k]) - 4; J.B.n[k] = (int64_t)ceil(hi[k]) + 5 - J.B.o[k]; if (J.B.o[k] < 0) { J.B.n[k] += J.B.o[k]; J.B.o[k] = 0; } }
       const double gb = (double)J.B.n[0] * J.B.n[1] * J.B.n[2] / 1e9;
       fprintf(stderr, "sheet-pbr: CT box z %lld y %lld x %lld + %lld %lld %lld (%.2f GB)\n", (long long)J.B.o[0], (long long)J.B.o[1], (long long)J.B.o[2], (long long)J.B.n[0], (long long)J.B.n[1], (long long)J.B.n[2], gb);
-      if (gb > 12) { fprintf(stderr, "sheet-pbr: the CT box is too large; use a smaller crop\n"); return 1; }
+      if (gb > 16) { fprintf(stderr, "sheet-pbr: the CT box is too large; use a smaller crop\n"); return 1; }
+      if (J.map) {
+          for (int k = 0; k < 3; k++) { if (J.B.o[k] >= regfv->shape[0][k]) { fprintf(stderr, "sheet-pbr: the crop is outside the fine scan\n"); return 1; }
+              if (J.B.o[k] + J.B.n[k] > regfv->shape[0][k]) J.B.n[k] = regfv->shape[0][k] - J.B.o[k]; }
+          J.B.v = malloc((size_t)J.B.n[0] * J.B.n[1] * J.B.n[2]);
+          if (!J.B.v || rvol_read_nt(regfv, 0, J.B.o, J.B.n, J.B.v, nth)) { fprintf(stderr, "sheet-pbr: fine CT read failed\n"); return 1; }
+          size_t nz = 0; const size_t nb = (size_t)J.B.n[0] * J.B.n[1] * J.B.n[2]; for (size_t i = 0; i < nb; i += 97) nz += J.B.v[i] != 0;
+          fprintf(stderr, "sheet-pbr: fine CT box: %.1f %% non-zero voxels\n", 100.0 * nz / ((nb + 96) / 97));
+      } else {
       z3 *z = z3_open(store_open(ctr), ctk, popt(argc, argv, "--cache", nullptr)); if (!z) { fprintf(stderr, "sheet-pbr: cannot open %s %s: %s\n", ctr, ctk, z3_error()); return 1; }
       const z3_meta *zm = z3_meta_of(z); for (int k = 0; k < 3; k++) if (J.B.o[k] + J.B.n[k] > zm->shape[k]) J.B.n[k] = zm->shape[k] - J.B.o[k];
       J.B.v = malloc((size_t)J.B.n[0] * J.B.n[1] * J.B.n[2]);
       if (!J.B.v || z3_read(z, J.B.o, J.B.n, J.B.v, nth)) { fprintf(stderr, "sheet-pbr: CT read failed: %s\n", z3_error()); return 1; }
-      z3_close(z); }
+      z3_close(z); } }
     if (*popt(argc, argv, "--profiles", "")) {   /* diagnostics: raw profiles on a 16 x 16 lattice (float32 [256][K], t = -depth + k step) */
         FILE *pf = fopen(popt(argc, argv, "--profiles", ""), "wb");
         for (int b = 0; b < 16; b++) for (int a = 0; a < 16; a++) { double P[3], n[3]; float f[1024] = {0};
@@ -492,13 +519,13 @@ int cmd_sheet_pbr(int argc, char **argv) {
     J.cr = malloc(NN * sizeof(float)); J.cvv = malloc(NN * sizeof(float));
     for (size_t i = 0; i < NN; i++) { const double t = ugr[i] - ugl[i]; J.cr[i] = (float)(ugl[i] + 0.3 * t); J.cvv[i] = (float)(ugr[i] - 0.3 * t); J.tp0[i] = (float)(0.3 * t); }
     if (!strcmp(popt(argc, argv, "--mode", "mesh"), "mesh")) {   /* the faces near the mesh, robustly smoothed (no sheet hopping) */
-        double ra = -15, rb = 5; sscanf(popt(argc, argv, "--recto-range", "-15,5"), "%lf,%lf", &ra, &rb);
+        double ra = -15, rb = 5; sscanf(popt(argc, argv, "--recto-range", "-15,5"), "%lf,%lf", &ra, &rb); ra *= J.fs; rb *= J.fs;
         float *lr = malloc((size_t)nc * nc * sizeof *lr), *lv = malloc((size_t)nc * nc * sizeof *lv);
         mlctx MC = {&J, lr, lv, nc, L8, ra, rb}; prows(nc, ml_row, &MC);
-        const double sg = atof(popt(argc, argv, "--face-sigma", "3")), tl = atof(popt(argc, argv, "--face-tol", "3"));
+        const double sg = atof(popt(argc, argv, "--face-sigma", "3")), tl = atof(popt(argc, argv, "--face-tol", "3")) * J.fs;
         robust_smooth(lr, nc, sg, tl); robust_smooth(lv, nc, sg, tl);
         float *ur = lat_up(lr, nc, L8, J.W), *uv = lat_up(lv, nc, L8, J.W);
-        const double fw = atof(popt(argc, argv, "--face-win", "3"));
+        const double fw = atof(popt(argc, argv, "--face-win", "3")) * J.fs;
         for (size_t i = 0; i < NN; i++) { J.cr[i] = ur[i]; J.cvv[i] = uv[i]; J.tp0[i] = (float)fw; }
         free(lr); free(lv); free(ur); free(uv);
     }
@@ -513,7 +540,7 @@ int cmd_sheet_pbr(int argc, char **argv) {
     for (size_t i = 0; i < NN; i++) if (J.valid[i] > 0) { n2++; namb += J.amb[i] >= 0.7; }
     size_t ndisagree = 0, ndp = 0;
     if (atoi(popt(argc, argv, "--dp", "1"))) {
-        const int KD = (int)(atof(popt(argc, argv, "--dp-range", "6")) / J.step + 0.5), KE = 2 * KD + 1;
+        const int KD = (int)(atof(popt(argc, argv, "--dp-range", "6")) * J.fs / J.step + 0.5), KE = 2 * KD + 1;
         float *E = malloc(NN * KE * sizeof *E), *rrow = malloc(NN * sizeof *rrow), *rdp = malloc(NN * sizeof *rdp);
         if (!E) { fprintf(stderr, "sheet-pbr: no memory for the DP evidence\n"); return 1; }
         dpectx EC = {&J, E, KD}; prows(J.W, dpe_row, &EC);
@@ -533,7 +560,7 @@ int cmd_sheet_pbr(int argc, char **argv) {
     }
     /* pass 3, continuity: every sample re-finds its faces within +-cw voxels of the median of its neighbourhood (pass 2 faces), i.e. a
        face may deviate at most cw from its surroundings; samples that moved by more than cw were discontinuous in pass 2 */
-    const double cw = atof(popt(argc, argv, "--cont-win", "1.25")); const int cr2 = (int)(atof(popt(argc, argv, "--cont-r", "3")) * J.ss + 0.5);
+    const double cw = atof(popt(argc, argv, "--cont-win", "1.25")) * J.fs; const int cr2 = (int)(atof(popt(argc, argv, "--cont-r", "3")) * J.ss + 0.5);
     if (cw > 0 && !atoi(popt(argc, argv, "--dp", "1"))) for (int it = 0; it < 2; it++) {
         float *mr = malloc(NN * sizeof *mr), *mv = malloc(NN * sizeof *mv), *r0 = malloc(NN * sizeof *r0);
         median2d(J.r, mr, J.W, cr2); median2d(J.v, mv, J.W, cr2); memcpy(r0, J.r, NN * sizeof *r0);
@@ -559,7 +586,7 @@ int cmd_sheet_pbr(int argc, char **argv) {
         curv[i] = (x > 0 && y > 0 && x + 1 < J.W && y + 1 < J.W) ? g2[i - 1] + g2[i + 1] + g2[i - J.W] + g2[i + J.W] - 4 * g2[i] : NAN; }
     /* holes in H (no sheet found): filled from the blurred field for shading only */
     float *Hs = malloc(NN * sizeof *Hs); gblur(H, g, J.W, 3.0 * J.ss); for (size_t i = 0; i < NN; i++) Hs[i] = H[i] == H[i] ? H[i] : (g[i] == g[i] ? g[i] : 0);
-    const hfield F = {Hs, J.W, 1.0 / J.ss};
+    const hfield F = {Hs, J.W, J.fs / J.ss};
     /* shading */
     float *rmax = malloc(NN * sizeof *rmax), *rmin = malloc(NN * sizeof *rmin), *img = malloc(NN * sizeof *img), *ao = malloc(NN * sizeof *ao), *pbr = malloc(NN * sizeof *pbr), *pbd = malloc(NN * sizeof *pbd);
     for (size_t i = 0; i < NN; i++) { rmax[i] = -1e30f; rmin[i] = 1e30f; }
