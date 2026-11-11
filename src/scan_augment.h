@@ -48,8 +48,8 @@ unsigned scan_aug_apply(const scan_aug_cfg *c, uint64_t seed, uint8_t *ctu, uint
    air (output 0) unless SA_AIR, and the chunk boxes go to air (scan_plan_air): the output's zero set is known without the float work.
    scan_aug_exec runs the float ops of a plan on those bytes (CPU; the GPU executor reads the same plan). */
 #define SA_MAXTAP 48
-#define SA_MAXP 1024
-#define SA_MAXTAB 8192
+#define SA_MAXP 1536   /* (1024 until the latent-grid windows; the zy pass keeps P x 32 halves in shared memory: 96 KB at 1536) */
+#define SA_MAXTAB (16 * SA_MAXP)   /* (8192 aborted at P 960: 8780 entries; 4 per voxel of radius range) */
 #define SA_MAXBOX 64
 typedef struct { int P, s[SA_MAXP], n[SA_MAXP]; float w[SA_MAXP][SA_MAXTAP]; } scan_bop;   /* out[i] = sum_t w[i][t] in[s[i] + t] */
 typedef struct {
@@ -76,6 +76,7 @@ unsigned scan_aug_plan(const scan_aug_cfg *c, uint64_t seed, uint8_t *ctu, uint8
 void scan_aug_exec(const scan_plan *p, uint8_t *ctu, void *scratch);   /* scratch: 5 P^3 bytes */
 /* the output's air (0) set of a plan on its shifted input bytes: air[k] = 1 where the output will be 0 */
 void scan_plan_air(const scan_plan *p, const uint8_t *ctu, uint8_t *air);
+void scan_plan_notair(const scan_plan *p, uint8_t *ctu, uint8_t *copy);   /* the same negated, in place (ctu = 1 where the output is material); copy (or nullptr): the bytes before, in the same pass */
 /* train --gpu-aug: what the device needs besides the window's bytes to build its CT channel (src/nn_aug.cu nn_aug_ct): the plan (when
    scan), write_x's intensity jitter with the device's own noise stream (the sampler still draws write_x's), the normalisation */
 typedef struct {

@@ -4668,6 +4668,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "papyrus-labels")) return cmd_papyrus_labels(argc, argv);
     if (!strcmp(cmd, "overlay")) return cmd_overlay(argc, argv);
     if (!strcmp(cmd, "wind-score")) return cmd_wind_score(argc, argv);
+    if (!strcmp(cmd, "lc-encode")) { int cmd_lc_encode(int, char **); return cmd_lc_encode(argc, argv); }   /* latcomp v1 store of a CT volume (src/lc_cli.c) */
     if (!strcmp(cmd, "store-bench")) { int cmd_store_bench(int, char **); return cmd_store_bench(argc, argv); }
     if (!strcmp(cmd, "phase-pack") || !strcmp(cmd, "phase-unpack") || !strcmp(cmd, "phase-cmp") || !strcmp(cmd, "phase-drop")) { int cmd_phase_pack(int, char **); return cmd_phase_pack(argc, argv); }
     if (argc < 4) return usage();

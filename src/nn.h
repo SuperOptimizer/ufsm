@@ -6,6 +6,7 @@
 /* boolean environment switch: set and not "0" (UFSM_X=0 means off) */
 static inline int ufsm_env_on(const char *n) { const char *e = getenv(n); return e && *e && strcmp(e, "0") != 0; }
 #include <stddef.h>
+#include <stdio.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -20,6 +21,7 @@ static inline size_t shape_spatial(shape5 s) { return (size_t)s.d * s.h * s.w; }
 /* ---- device / memory ---- */
 int nn_init(int device);                 /* selects the device; returns 0 on success */
 const char *nn_check(void);              /* nullptr if no error since the last call, else the message */
+const char *nn_check_site(void);         /* the call site of the error the last nn_check returned ("" for none; low-precision kernels: their own latch) */
 void *nn_malloc(size_t bytes);
 void nn_free(void *p);
 void nn_zero(void *p, size_t bytes);
@@ -39,8 +41,12 @@ void *nn_managed_alloc(size_t bytes);    /* CUDA managed memory (may exceed the 
 void *nn_malloc_try(size_t bytes);       /* device memory, nullptr (no sticky error) when it does not fit */
 void *nn_host_alloc_try(size_t bytes);   /* the same, nullptr when the host cannot pin that much */
 void nn_host_free(void *p);
+size_t nn_host_bytes(void);            /* live pinned host bytes (nn_host_alloc*) */
+void nn_host_report(FILE *f);         /* the same by caller address */
 /* pipelined uploads: an async copy on a per-device copy stream (pinned source), events to order it against the compute stream */
 void nn_h2d_copy_stream(void *dst, const void *src, size_t bytes);
+void nn_d2h_copy_stream(void *dst, const void *src, size_t bytes);   /* device -> pinned host on the copy stream */
+void nn_h2d_async(void *dst, const void *src, size_t bytes);         /* pinned host -> device on stream 0 (asynchronous, in stream order) */
 void *nn_event_create(void);
 void nn_event_record(void *ev, int on_copy_stream);      /* 0: compute stream, 1: copy stream, 2: the aux stream (nn_d2d_aux) */
 void nn_stream_wait(int copy_stream_waits, void *ev);    /* make the copy stream (1), the aux stream (2) or the compute stream (0) wait for ev */
@@ -52,6 +58,10 @@ void nn_event_sync(void *ev);
    ev_done completes with the copy (nn_stream_wait(0, ev_done) before the compute stream touches dst / src again) */
 void nn_offload_copy(void *dst, const void *src, size_t n, int to_host, void *ev_start, void *ev_done);
 size_t nn_mem_free(void);
+/* train --lat: label planes kept on the device, packed (bits 8 bytes, 4 codes 0..14 / 255, 2 --rv papyrus classes); stream k: 0 compute, 1 copy, 2 aux */
+void nn_lab_quant(int k, uint8_t *s, size_t n, int bits);   /* experiment: a cyclic label plane (codes 0..251) to 2^bits levels in place */
+void nn_lab_pack(int k, const uint8_t *s, uint8_t *d, size_t n, int bits);
+void nn_lab_unpack(int k, const uint8_t *p, uint8_t *d, size_t v0, size_t n, int bits);
 /* virtual-memory rings (CUDA VMM): one tensor's whole address range of nreg consecutive regions (reg[r] bytes, slabs of slab[r]), slab
    s of a region backed by physical chunk s mod R of it (kernels address the whole tensor; the schedule keeps fewer than R slabs live).
    nullptr: no VMM, or sizes off the mapping granularity (nn_ring_gran). nn_free releases it; *phys: bytes backed */
@@ -61,6 +71,9 @@ size_t nn_ring_bytes(void);
 /* event profiler (no host syncs): bracket ops, then collect per-category GPU milliseconds */
 void nn_prof_begin(int k);
 void nn_prof_end(void);
+void nn_h2d_stream(int k, void *d, const void *s, size_t n);   /* an asynchronous upload on stream k (0 compute, 1 copy, 2 aux: nn_stream_wait / nn_event_record); s pinned */
+int nn_ptick_on(void); void nn_ptick(const char *name); void nn_ptick_report(int steps);   /* UFSM_PTICK=1: synchronised phase timer (nn_core.cu) */
+void nn_ptick_fine(const char *name);   /* the same with UFSM_PTICK=2 only (ticks inside a phase) */
 void nn_prof_collect(double *out, int nk);
 
 /* Tensor-core TF32 path for the 3^3 stride-1 convolutions (default on; fp32 CUDA-core kernels otherwise). */
@@ -148,6 +161,9 @@ void nn_f32_to_bf16(const float *x, size_t n, void *y);   /* converts to the cur
 void nn_set_storage(const void *p, size_t bytes, int dt);
 int nn_storage(const void *p);          /* 8 = MX-fp8, 4 = MX-fp4, 0 = default */
 void nn_storage_forget(const void *p);
+void nn_storage_dump(const char *tag);   /* debug: prints the storage registry */
+void nn_label_warp_ref(int on);   /* tests: the label warps' reference kernels */
+void nn_aug_stage_reset(void);     /* before a batch's label / CT uploads: the staging buffer holds no plane of this batch yet */
 size_t nn_mx8_bytes(shape5 s);
 size_t nn_mx4_bytes(shape5 s);
 size_t nn_mx_bytes(shape5 s, int dt);   /* registry dt 8 / 4 */
@@ -167,18 +183,91 @@ void nn_input_rad(const void *ct16, shape5 xs, const void *rec, void *y);
 /* --half-res pack: the same from the full-resolution CT channel [n][8 d h w] and records of NN_RAD_REC(2 d), into the network's
    8-channel input on the 2x2x2 blocks (xs {n, 8, d, h, h}): bit for bit write_x -> nn_half_input(mode 2) -> nn_h16_to_mx */
 void nn_input_rad_pack(const void *ct16, shape5 xs, const void *rec, void *y);
+/* train --lat 4 (pool4) with --gpu-input: the 4-channel MX input on the 4^3 cells of the window (xs {n, 4, d, h, h}: the cell grid), each
+   channel the cell mean of nn_input_rad's full-resolution value (warp included) from the full-resolution 16-bit CT channel ct16 */
+void nn_input_lat(const void *ct16, shape5 xs, const void *rec, void *y);
+/* the same with the learned cell transform (latfit.h): xs.c = C + 3 (16 or 32): C quantised coefficients x gain, then the radial means */
+void nn_input_latc(const void *ct16, shape5 xs, const void *rec, const float *bas, const float *gain, int C, float step, void *y);
+/* predict: the same channels from the full-resolution 4-channel fp16 window x ([4][4d][4h][4w]: CT, radial) into y (fp16 [C + 3][d][h][w]) */
+/* predict --latents: the cell channels from a latcomp store's indices q (int8 [d][h][w](C + 1), lc_cli.c layout; raw-domain step) with the window's
+   mean / 1 / sd; the radial means from x's channels 1-3 */
+void nn_lat_input_q(const void *q, const void *x, int d, int h, int w, const float *gain, int C, float step_raw, float mean, float isd, void *y);
+/* predict --latents: the CT window rebuilt from a window of stored cells (nn_lat.cu lat_synth_k: 1..255 in material cells, 0 in air
+   cells), and a --lat-basis net's input straight from the cells with the radial channels from the axis offsets (lat_pred_in_q_k) */
+void nn_lat_synth_ct(const void *q, int C, const float *bas, float step_raw, int D, int W, uint8_t *ct);
+void nn_lat_pred_input_q(const void *q, int D, int W, float mean, float isd, const float *dyo, const float *dxo, int axis,
+                         const float *gain, int C, float step_raw, void *y);
+/* the guided head (unet_cfg.lat_guide): see nn_lat.cu lat_guide_k */
+/* the sub-cell head (unet_cfg.lat_guide 64): see nn_lat.cu lat_shuf_k */
+void nn_lat_shuffle(const void *lg, int lh16, int d, int h, int w, int base, int ng, int z0, int nz, void *y);
+void nn_lat_shuffle_adj(const void *g, int d, int h, int w, int base, int ng, int z0, int nz, void *gc);   /* gc: fp16 */
+void nn_lat_guide4(const void *x, int D, int H, int W, int z0, int nz, void *lg, int base, int c0, int ng, int dir);   /* 4 coefficients per guided channel */
+void nn_lat_guide(const void *x, int D, int H, int W, int z0, int nz, void *lg, int base, int c0, int dir);
+void nn_lat_input_x(const void *x, int d, int h, int w, const float *bas, const float *gain, int C, float step, void *y);
+/* latent-grid logits -> one z-slab of fine logits and back (src/nn_lat.cu; the pool4 chain of nn_lowres_output, B 1): coarse lg
+   [C][d][h][w] (fp16 when lh16, else fp32) -> fine planes [z0, z0 + nz) of the 4d x 4h x 4w window, fp16 [C][nz][4h][4w] in y;
+   nn_lat_up_adj adds the adjoint of such a slab's fp16 gradient g into the fp32 coarse gradient gc [C][d][h][w] */
+void nn_lat_up_slab(const void *lg, int lh16, int C, int d, int h, int w, int z0, int nz, void *y);
+/* _c: the cell-grid array holds planes [q0, q0 + qd) only ([C][qd][h][w]); nn_lat_grad_fin / _carry: the streamed head's rolling
+   coarse gradient (nn_lat.cu) */
+void nn_lat_up_slab_c(const void *lg, int lh16, int C, int d, int h, int w, int z0, int nz, void *y, int q0, int qd);
+void nn_lat_up_adj_c(const void *g, int C, int d, int h, int w, int z0, int nz, float *gc, void *scratch, int q0, int qd);
+void nn_lat_shuffle_c(const void *lg, int lh16, int d, int h, int w, int base, int ng, int z0, int nz, void *y, int q0, int qd);
+void nn_lat_shuffle_adj_c(const void *g, int d, int h, int w, int base, int ng, int z0, int nz, void *gc, int q0, int qd);
+void nn_lat_grad_fin(const float *a, int nf, const void *sb, int C, size_t pl, int cap, int i0, int np, void *gc);
+/* the head slabs' gradient pass fused for one loss group (nn_lat.cu): upsample + guide + BCE logit gradient + transposed upsample
+   without the fp16 slab; part: nn_lat_fuse_part bytes of scratch */
+size_t nn_lat_fuse_part(int n, int h, int w, int nz);
+void nn_lat_fuse_grad(const void *lg, int lh16, int lq0, int lqd, int d, int h, int w, int z0, int nz, int c0, int n, int guide, int gb, const void *x,
+                      const uint8_t *t, const uint8_t *m, const uint8_t *wch, const float *st, float pw, float rec_w, int unit_c, const float *lam,
+                      float *part, float *gc, int gq0, int gqd, double *ds);   /* ds: also the group's loss sums 1 .. 4 (after a mask_only statistics pass) */
+void nn_lat_fuse_stats(const void *lg, int lh16, int lq0, int lqd, int d, int h, int w, int z0, int nz, int c0, int n, int guide, int gb, const void *x,
+                       const uint8_t *t, const uint8_t *m, const uint8_t *wch, float pw, int unit_c, double *ds, int mask_only);   /* nn_loss_stats_acc of the group, fused */
+void nn_loss_cfg_get(float *pw, float *rec_w, int *unit7);   /* the BCE's positive weight, --recall weight, 7-channel unit-mask channel */
+void nn_lat_grad_carry(float *a, int nf, void *sb, int C, size_t pl, int cap, int from, int n);
+void nn_lat_up_adj(const void *g, int C, int d, int h, int w, int z0, int nz, float *gc, void *scratch);   /* scratch: C nz h w fp32 for the separable path (z0, nz multiples of 4), or nullptr */
+int nn_lat_set_slow(int on);   /* the per-voxel kernels for every slab (UFSM_LAT_SLOW=1; train's UFSM_LAT_CHECK compares against them); returns the previous setting */
+/* predict on a latent-grid net: the network's 4-channel input on the cell grid ([4][D/4][W/4][W/4], 16-bit storage as nn_set_f16) straight
+   from a D x W x W uint8 CT window = nn_pred_input_d then nn_lowres_input (div 4, mode 1), without the full-resolution input */
+void nn_lat_pred_input(const uint8_t *ct, int D, int W, float mean, float isd, const float *dyo, const float *dxo, int axis, void *y);
+/* nn_lat_place_rv for the sub-cell head (lat_guide 64: the side pair's per-voxel outputs at cell channels sb + 64 j + sub; sb < 0: none)
+   = nn_lat_up_slab + nn_lat_shuffle + nn_rv_fuse (fp16) + nn_pred_place */
+void nn_lat_place_rvs(const void *lg, int lh16, int sb, int d, int h, int w, const uint8_t *ct, const uint32_t *bits, int iso, int hz, int halo,
+                      int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh);
+/* nn_lat_place_rv for the guided head (the coefficient planes: cell channels nb .. nb + 4; ctg: the window's CT bytes as read, mean / isd
+   its z-score) = nn_lat_up_slab + nn_lat_guide + nn_rv_fuse (fp16) + nn_pred_place */
+void nn_lat_place_rvg(const void *lg, int lh16, int nb, int d, int h, int w, const uint8_t *ctg, float mean, float isd, const uint8_t *ct, const uint32_t *bits,
+                      int iso, int hz, int halo, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh);
+void nn_lat_ct_x(const uint8_t *ct, int W, int z0, int nz, float mean, float isd, void *x);   /* planes z0 .. z0 + nz of the fp16 z-scored CT channel [nz][W][W] from the window's bytes */
+/* the same for a --lat-basis checkpoint = nn_pred_input_d then nn_lat_input_x (fp16 storage): [C + 3][D/4][W/4][W/4] */
+void nn_lat_pred_input_c(const uint8_t *ct, int D, int W, float mean, float isd, const float *dyo, const float *dxo, int axis,
+                         const float *bas, const float *gain, int C, float step, void *y);
+/* predict --channel rv on a latent-grid net: the two side logits of the cell grid (lg [2][d][h][w], fp16 / fp32) upsampled, fused
+   (nn_rv_fuse) and quantised (nn_pred_place) into a device shard: window voxel v of the interior ([hz, 4 d - hz) x [halo, 4 h - halo) x
+   [halo, 4 w - halo)) lands at shard voxel o + v when inside [0, e); 0 where the CT (ct >= iso, or ct nullptr: the mask bits) is not set */
+void nn_lat_place_rv(const void *lg, int lh16, int d, int h, int w, const uint8_t *ct, const uint32_t *bits, int iso, int hz, int halo,
+                     int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh);
 /* train --gpu-aug (src/nn_aug.cu): a window's CT channel built on the device from its source-grid bytes ct8_h (P^3, pinned) and record
    rec_h (scan_augment.h scan_ct_rec: the scanner plan, jitter, normalisation): the scanner ops in 16-bit storage in ct16 (the channel's
    own buffer), the output bytes' z-score, then the symmetry / warp of rad_d (the device copy of the window's NN_RAD_REC record, uploaded
    before on the same stream) with the jitter into ct16. Device scratch: nn_aug_device_bytes(P) (one P^3 byte staging buffer). */
 void nn_aug_ct(const uint8_t *ct8_h, const void *rec_h, const void *rad_d, int P, void *ct16, int on_copy_stream);
 size_t nn_aug_device_bytes(int P);
+void nn_aug_bop_line(int on);   /* tests: 0 = the separable operators through the first kernels (z / y in shared memory, x one row a block) */
+void nn_aug_bop_bench(int P, int taps, double *out);   /* tuning: ms per pass, out[6] = z shared / z line / y shared / y line / x one row a block / x rows + weight table */
+void nn_aug_cnoise_chunk(int nz);   /* tests: the correlated noise in chunks of nz planes (0: the per-plane kernels, -1: the default chunk) */
 void nn_aug_last_bytes(uint8_t *out, int P);   /* tests: the last window's output bytes */
 /* train --gpu-aug 2: one warped window's labels warped on the device from the source-grid labels the sampler shipped (sample_cfg.gpu_aug
    2): kind 0 the packed targets / mask a_h -> da (db: the pmask plane, optional), 1 the phase a_h -> da, 2 the winding mod 4 / component a_h, b_h -> da, db; rad_d its
    radial record on the device; cs_h / sn_h sample_phase_cssn's tables. Same stream order as nn_aug_ct (its staging buffer, 2 P^3). */
 void nn_label_warp(int kind, const uint8_t *a_h, const uint8_t *b_h, const void *rad_d, int P, uint8_t *da, uint8_t *db, const float *cs_h, const float *sn_h, int on_copy_stream);
 size_t nn_label_warp_device_bytes(int P);
+/* --rv ink bits: one window's papyrus plane on the device from its CT bytes and known bits (pinned host; sample.h batch.inkb, cutoff it),
+   then the window's warp (rad_d, warped) or cube symmetry (symcode: the radial record's h[5]) into da. Same staging / order as nn_label_warp */
+void nn_label_sym(const uint8_t *a_h, int symcode, int P, uint8_t *da, int on_copy_stream);   /* a source-grid label plane through the cube symmetry */
+/* --gpu-aug 3 runs slots: w4 / comp from the source-grid phase and the window's runs (band_w4dev.h w4runs), warped or through the symmetry */
+void nn_w4runs_label(const uint8_t *side_h, const void *runs, const void *rad_d, int warped, int symcode, int P, uint8_t *da, uint8_t *db, const float *cs_h, const float *sn_h, int on_copy_stream);
+void nn_ink_bits(const uint8_t *ct8_h, const uint8_t *bits_h, int it, const void *rad_d, int warped, int symcode, int P, uint8_t *da, int on_copy_stream);
 /* packed targets (sample.h SAMPLE_TM_*: bit 0 target 0 = 255, bit 1 target 1 = 255, bit 2 mask) of nb samples of p3 voxels in m ->
    t (nb x 2 x p3: 0 / 255) and the 0 / 1 mask in m, in place; on the copy stream (after an nn_h2d_copy_stream of the codes) or the
    compute stream */

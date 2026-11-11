@@ -149,6 +149,7 @@ struct unet {
     int xin_shared, xin_out, a2_stale, fwd_train;       /* training: the network input lives in dec[0].a2's buffer (host copy in between); the
                                                 buffer holds the input since a backward (a repeated backward re-runs dec[0].c2) */
     size_t xin_bytes; void *h_xin, *ev_xin[4];
+    float *lat_bas, *lat_gain, lat_step, lat_run_step, lat_hb[29 * 64], lat_hg[29]; int lat_C;   /* unet_set_lat_basis: the learned cell transform of a latent-grid net (cfg.cin = lat_C + 3) */
     const void *rad;                         /* unet_set_input_rad (train --gpu-input): the 16-bit input is the CT alone, these radial records
                                                 build the 4 MX input channels (nn_input_rad) */
     int a0_share, a2_out;                    /* level-0 A in dec[0].a2's buffer; enc[0].a2 on the host from its forward to dec[0]'s conv1 weight
@@ -1331,8 +1332,12 @@ static void build_acts(unet *u, shape5 xs, int train) {
                 const size_t hb = act_bytes_of(u->dec[0].ys);
                 size_t need = 256;
                 for (int i = 1; i < L; i++) need += (gobs[i] + 255) & ~(size_t)255;
-                u->gco = gco_on() && gmx && u->nob && u->a0_share && recompute() == 1 && !recompute_a1() && L > 1 && grad_dt() == act_dt()
+                /* not with level 1 narrower than level 0: {96, 64, 96} with a 32-channel fp4 input gave enc[0] / down0 gradients that changed
+                   from one backward to the next (11-09, tests/test_lat_head TLH_W1=64 TLH_W2=96; the share's sizes assume w[1] >= w[0]) */
+                const int narrow1 = L > 1 && u->cfg.widths[1] < u->cfg.widths[0];
+                u->gco = gco_on() && gmx && u->nob && u->a0_share && recompute() == 1 && !recompute_a1() && L > 1 && grad_dt() == act_dt() && !narrow1
                          && need <= hb && ((gobs[1] + 255) & ~(size_t)255) + 256 <= act_bytes_of(u->dec[0].ys);
+                { static int said; if (narrow1 && gco_on() && !said++) fprintf(stderr, "unet: level 1 (%d channels) is narrower than level 0 (%d): coarse-gradient share off\n", u->cfg.widths[1], u->cfg.widths[0]); }
             }
             if (u->l3b) {   /* X3 (unet.l3b): level 0's A, the input (5 B per voxel), then the coarse forward homes from 256 on, then the fp16 logits
                                and their gradient: all below the trainer's batch tail at its end (unet_batch_scratch2) */
@@ -1617,6 +1622,14 @@ int unet_lean_nob(const unet *u) { return u->nob; }
 /* the logits sit in the buffer the head's backward-data writes (gout[0]: fp16 logits of the lean 2 MX-fp4 layout) */
 int unet_logits_in_gx(const unet *u) { return u->built && u->train && u->logits && u->logits == u->gout[0]; }
 void unet_set_input_rad(unet *u, const void *rec) { u->rad = rec; }
+void unet_set_lat_basis(unet *u, const float *bas, const float *gain, int C, float step) {
+    if (C < 1 || C > 29 || u->cfg.cin != C + 3) { fprintf(stderr, "unet: the cell transform has %d channels, the network %d inputs (C + 3)\n", C, u->cfg.cin); abort(); }
+    memcpy(u->lat_hb, bas, (size_t)C * 64 * 4); memcpy(u->lat_hg, gain, (size_t)C * 4); u->lat_C = C; u->lat_step = step;
+    if (!u->lat_bas) { u->lat_bas = nn_malloc(29 * 64 * 4); u->lat_gain = nn_malloc(29 * 4); }
+    nn_h2d(u->lat_bas, u->lat_hb, (size_t)C * 64 * 4); nn_h2d(u->lat_gain, u->lat_hg, (size_t)C * 4);
+}
+void unet_set_lat_step(unet *u, float step) { u->lat_run_step = step; }   /* this forward's quantiser step (training jitter); 0: the transform's own */
+int unet_lat_basis(const unet *u, const float **bas, const float **gain, float *step) { if (u->lat_C) { *bas = u->lat_bas; *gain = u->lat_gain; *step = u->lat_step; } return u->lat_C; }
 int unet_logits_h16(const unet *u) { return u->built && u->logits_h16; }
 void unet_set_fp16_logits(unet *u, int on) {   /* takes effect at the next build */
     if (u->lh16_req == !!on) return;
@@ -2517,6 +2530,8 @@ const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x
     else if (x_h16 && act_mx8() && xin_mx) {
         if (!u->xin) u->xin = dalloc_input(u, xs);
         if (u->rad && u->cfg.half_res == 2) nn_input_rad_pack(x, xs, u->rad, u->xin);   /* --half-res pack: x is the full-resolution CT channel */
+        else if (u->rad && u->cfg.half_res == 3 && u->lat_C) { nn_input_latc(x, xs, u->rad, u->lat_bas, u->lat_gain, u->lat_C, u->lat_run_step > 0.f ? u->lat_run_step : u->lat_step, u->xin); nn_ptick("input pool"); }   /* --lat-basis: the learned cell channels */
+        else if (u->rad && u->cfg.half_res == 3) { nn_input_lat(x, xs, u->rad, u->xin); nn_ptick("input pool"); }   /* train --lat 4: the 4^3 cell means, x the full-resolution CT channel */
         else if (u->rad && u->l0rx) { u->l0x_ct = x; for (int k = 0; k < 16; k++) u->l0x_held[k] = -1; }   /* (stage S4: per slab in the stream, l0x_need) */
         else if (u->rad) nn_input_rad(x, xs, u->rad, u->xin);   /* --gpu-input: x is the CT channel, the radial channels from the records */
         else nn_h16_to_mx(x, xs, u->xin);
@@ -2528,7 +2543,7 @@ const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x
         }
     }
     if (u->rad && !(x_h16 && act_mx8() && xin_mx && !u->ctin.on)) { fprintf(stderr, "unet_forward_x: radial input records need the 16-bit -> MX input conversion\n"); abort(); }
-    u->l3_ct = u->l3b && train && u->rad && u->cfg.half_res != 2 && x_h16 && xin_mx && u->h_xin && l3_ct_on() && l3_ct_off(u) && l3_ct_bytes(u) <= u->xin_bytes
+    u->l3_ct = u->l3b && train && u->rad && u->cfg.half_res != 2 && u->cfg.half_res != 3 && x_h16 && xin_mx && u->h_xin && l3_ct_on() && l3_ct_off(u) && l3_ct_bytes(u) <= u->xin_bytes
                && (const char *)x >= (const char *)u->l3x[2] && (const char *)x + l3_ct_bytes(u) <= (const char *)u->l3x[2] + u->l3xb[2];
     if (u->l3_ct) {   /* (l3b, GPU-built input) the CT to the host: enc[0]'s conv2 writes X2 after it */
         nn_offload_copy(u->h_xin, x, l3_ct_bytes(u), 1, u->ev_xin[0], u->ev_xin[1]);
@@ -3723,6 +3738,12 @@ float *unet_grad_ptr(unet *u) { return u->g; }
 void unet_grad_d2h(unet *u, float *host) { nn_d2h(host, u->g, u->np * 4); }
 void unet_grad_h2d(unet *u, const float *host) { nn_h2d(u->g, host, u->np * 4); }
 double unet_grad_norm(unet *u) { return sqrt(nn_sumsq(u->g, u->np, u->red_scratch)); }
+uint64_t unet_param_hash(unet *u) {   /* debugging (train UFSM_DET_TRACE): FNV-1a of the forward weights' bytes */
+    const size_t nb = u->np * sizeof(float); uint8_t *h = malloc(nb); uint64_t x = 1469598103934665603ull;
+    nn_sync(); nn_d2h(h, u->fw, nb); for (size_t q = 0; q < nb; q++) x = (x ^ h[q]) * 1099511628211ull;
+    { static int nc; if (getenv("UFSM_DET_PDUMP") && ++nc == (getenv("UFSM_DET_PSTEP") ? atoi(getenv("UFSM_DET_PSTEP")) : 2)) { FILE *f = fopen(getenv("UFSM_DET_PDUMP"), "wb"); if (f) { fwrite(h, 1, nb, f); fclose(f); } } }   /* (the nth call's weights, raw) */
+    free(h); return x;
+}
 void unet_clip_grad(unet *u, double max_norm) {
     double n = unet_grad_norm(u);
     if (n > max_norm && n > 0) nn_scale(u->g, (float)(max_norm / n), u->np);
@@ -4144,6 +4165,7 @@ void unet_wquant(unet *u, unsigned seed) { (void)u; (void)seed; }   /* kept for 
 /* ---- checkpoints ---- */
 static int g_loaded_sparse = 0, g_loaded_wq = 0, g_loaded_muon = 0;   /* set by the header parser, applied by unet_load */
 static float g_loaded_hbR[UNET_MAXCONV]; static int g_loaded_hbR_n = 0;   /* Hyperball radii of the header */
+static int g_loaded_lat_c; static float g_loaded_lat_step, g_loaded_lat_gain[29], g_loaded_lat_bas[29 * 64];   /* the cell transform of the last header read */
 static long g_loaded_l0_n; static int g_loaded_l0_warm, g_loaded_l0_cnt; static float g_loaded_l0_mom, g_loaded_l0_run[16 * 256];   /* cfg.l0_norm ema */
 /* debug: per block, the GroupNorm statistics of the last forward (mean / rstd of a1 and a2 per sample and group:
    non-finite counts and extremes) and the largest |weight| of each conv. Localises a non-finite forward. */
@@ -4215,6 +4237,10 @@ void unet_debug_acts(const unet *u) {
     for (int i = L - 2; i >= 0; i--) { const block *b = &u->dec[i]; fprintf(stderr, "dec%d:", i); dbg_tensor("a1", b->a1, b->ys); dbg_tensor("a2", b->a2, b->ys); fprintf(stderr, "\n"); }
 }
 int unet_save(const unet *u, const char *path, int step, const char *extra) {
+    {   /* a latched CUDA error: the device weights are not trustworthy (a failed copy / launch left them stale or zero): no checkpoint */
+        nn_sync(); const char *e = nn_check();
+        if (e) { fprintf(stderr, "unet_save: CUDA error %s at %s: %s not written\n", e, nn_check_site(), path); return -1; }
+    }
     char tmp[1400];
     snprintf(tmp, sizeof tmp, "%s.tmp", path);
     FILE *f = fopen(tmp, "wb");
@@ -4227,6 +4253,12 @@ int unet_save(const unet *u, const char *path, int step, const char *extra) {
     { int any = 0; for (int i = 0; i < u->cfg.nlev; i++) any |= u->cfg.enc_blocks[i] != 0;
       if (any) { fputs(",\"enc_blocks\":[", f); for (int i = 0; i < u->cfg.nlev; i++) fprintf(f, "%s%d", i ? "," : "", u->cfg.enc_blocks[i]); fputc(']', f); } }
     if (u->cfg.half_res) fprintf(f, ",\"half_res\":%d", u->cfg.half_res);
+    if (u->cfg.lat_guide) fprintf(f, ",\"lat_guide\":%d", u->cfg.lat_guide);
+    if (u->lat_C) {   /* the cell transform: rows of 64 weights, the gains, the step */
+        fprintf(f, ",\"lat_c\":%d,\"lat_step\":%.9g,\"lat_gain\":[", u->lat_C, u->lat_step);
+        for (int i = 0; i < u->lat_C; i++) fprintf(f, "%s%.9g", i ? "," : "", u->lat_hg[i]);
+        fputs("],\"lat_basis\":[", f); for (int i = 0; i < u->lat_C * 64; i++) fprintf(f, "%s%.9g", i ? "," : "", u->lat_hb[i]); fputc(']', f);
+    }
     if (u->cfg.w4_2d) fprintf(f, ",\"w4_2d\":%d", u->cfg.w4_2d);
     if (u->cfg.ds_levels) fprintf(f, ",\"ds_levels\":%d", u->cfg.ds_levels);
     if (u->cfg.emb_lev) fprintf(f, ",\"emb_lev\":%d,\"emb_ch\":%d", u->cfg.emb_lev, u->cfg.emb_ch);
@@ -4286,6 +4318,7 @@ static int read_header(FILE *f, unet_cfg *cfg, int *step, size_t *np) {
     if ((p = strstr(line, "\"dec_widths\":["))) { p += 14; for (int i = 0; i < UNET_MAXLEV && *p && *p != ']'; i++) { cfg->dec_widths[i] = (int)strtol(p, (char **)&p, 10); if (*p == ',') p++; } }
     if ((p = strstr(line, "\"enc_blocks\":["))) { p += 14; for (int i = 0; i < UNET_MAXLEV && *p && *p != ']'; i++) { cfg->enc_blocks[i] = (int)strtol(p, (char **)&p, 10); if (*p == ',') p++; } }
     if ((p = strstr(line, "\"half_res\":"))) cfg->half_res = atoi(p + 11);
+    if ((p = strstr(line, "\"lat_guide\":"))) cfg->lat_guide = atoi(p + 12);
     cfg->w4_2d = (p = strstr(line, "\"w4_2d\":")) ? atoi(p + 8) : 0;
     if ((p = strstr(line, "\"ds_levels\":"))) cfg->ds_levels = atoi(p + 12);
     cfg->emb_lev = (p = strstr(line, "\"emb_lev\":")) ? atoi(p + 10) : 0;
@@ -4315,6 +4348,13 @@ static int read_header(FILE *f, unet_cfg *cfg, int *step, size_t *np) {
     if ((p = strstr(line, "\"l0_norm\":"))) cfg->l0_norm = atoi(p + 10);
     if ((p = strstr(line, "\"l0_slab\":"))) cfg->l0_slab = atoi(p + 10);
     g_loaded_l0_cnt = 0;
+    g_loaded_lat_c = (p = strstr(line, "\"lat_c\":")) ? atoi(p + 8) : 0; if (g_loaded_lat_c < 0 || g_loaded_lat_c > 29) return -1;
+    if (g_loaded_lat_c) {
+        int ng = 0, nb = 0; g_loaded_lat_step = (p = strstr(line, "\"lat_step\":")) ? strtof(p + 11, nullptr) : 0.f;
+        if ((p = strstr(line, "\"lat_gain\":["))) { p += 12; while (ng < 29 && *p && *p != ']') { g_loaded_lat_gain[ng++] = strtof(p, (char **)&p); if (*p == ',') p++; } }
+        if ((p = strstr(line, "\"lat_basis\":["))) { p += 13; while (nb < 29 * 64 && *p && *p != ']') { g_loaded_lat_bas[nb++] = strtof(p, (char **)&p); if (*p == ',') p++; } }
+        if (ng != g_loaded_lat_c || nb != g_loaded_lat_c * 64) return -1;
+    }
     if ((p = strstr(line, "\"l0_n\":"))) g_loaded_l0_n = atol(p + 7);
     if ((p = strstr(line, "\"l0_warm\":"))) g_loaded_l0_warm = atoi(p + 10);
     if ((p = strstr(line, "\"l0_mom\":"))) g_loaded_l0_mom = strtof(p + 9, nullptr);
@@ -4352,6 +4392,7 @@ int unet_load(unet *u, const char *path) {
     free(h);
     fclose(f);
     u->mx_R_nload = g_loaded_hbR_n; memcpy(u->mx_R_load, g_loaded_hbR, (size_t)g_loaded_hbR_n * 4); u->mx_R_ok = 0;   /* none: from the weights */
+    if (g_loaded_lat_c && u->cfg.cin == g_loaded_lat_c + 3) unet_set_lat_basis(u, g_loaded_lat_bas, g_loaded_lat_gain, g_loaded_lat_c, g_loaded_lat_step);
     if (g_loaded_sparse) unet_set_sparse24(u, 1);
     if (g_loaded_wq) unet_set_wq(u, g_loaded_wq);
     if (u->cfg.l0_norm == 2) {   /* the running statistics (a checkpoint without them: a fresh warm-up) */
@@ -4449,25 +4490,31 @@ static int copy_conv_in(unet *u, const unet *o, const convp *a, const convp *b) 
     }
     return 1;
 }
+/* --init-shift S (latent-grid nets from a voxel donor): u's level i takes the donor's level i + S (encoder, down, decoder, residual
+   blocks; u's first conv, which reads another input, and the head stay fresh) */
+static int g_init_shift;
+void unet_set_init_shift(int s) { g_init_shift = s > 0 ? s : 0; }
 int unet_init_from_map(unet *u, const char *path, const int *head_rows) {
-    unet_cfg oc; int step;
+    unet_cfg oc; int step; const int S = g_init_shift;
     if (unet_peek(path, &oc, &step) || oc.cin > u->cfg.cin) return -1;   /* (more inputs: the stem grows, copy_conv_in) */
     unet *o = unet_create(&oc);
     if (unet_load(o, path) < 0) { unet_free(o); return -1; }
     int n = 0;
-    const int L = u->cfg.nlev < oc.nlev ? u->cfg.nlev : oc.nlev;
+    if (S >= oc.nlev) { unet_free(o); return -1; }
+    const int L = u->cfg.nlev < oc.nlev - S ? u->cfg.nlev : oc.nlev - S;
     for (int i = 0; i < L; i++) {
-        const block *a = &u->enc[i], *b = &o->enc[i];
-        n += (i == 0 && oc.cin < u->cfg.cin ? copy_conv_in(u, o, &a->c1, &b->c1) : copy_conv(u, o, &a->c1, &b->c1)) + copy_gn(u, o, &a->n1, &b->n1) +
+        const block *a = &u->enc[i], *b = &o->enc[i + S];
+        n += (i == 0 && S ? 0 : i == 0 && oc.cin < u->cfg.cin ? copy_conv_in(u, o, &a->c1, &b->c1) : copy_conv(u, o, &a->c1, &b->c1)) + (i == 0 && S ? 0 : copy_gn(u, o, &a->n1, &b->n1)) +
              copy_conv(u, o, &a->c2, &b->c2) + copy_gn(u, o, &a->n2, &b->n2);
     }
     for (int i = 0; i < L - 1; i++) {
-        n += copy_conv(u, o, &u->down[i], &o->down[i]);
-        if (u->cfg.down_norm && oc.down_norm) n += copy_gn(u, o, &u->dn[i], &o->dn[i]);
-        const block *a = &u->dec[i], *b = &o->dec[i];   /* dec[i] works at level i in both nets */
+        n += copy_conv(u, o, &u->down[i], &o->down[i + S]);
+        if (u->cfg.down_norm && oc.down_norm) n += copy_gn(u, o, &u->dn[i], &o->dn[i + S]);
+        const block *a = &u->dec[i], *b = &o->dec[i + S];   /* dec[i] works at level i in both nets */
         n += copy_conv(u, o, &a->c1, &b->c1) + copy_gn(u, o, &a->n1, &b->n1) + copy_conv(u, o, &a->c2, &b->c2) + copy_gn(u, o, &a->n2, &b->n2);
     }
-    if (!head_rows) n += copy_conv(u, o, &u->head, &o->head);
+    if (S) { }   /* (the head reads another level's features: fresh) */
+    else if (!head_rows) n += copy_conv(u, o, &u->head, &o->head);
     else if (u->head.cin == o->head.cin && u->head.k == o->head.k) {
         const size_t row = (size_t)u->head.cin * u->head.k * u->head.k * u->head.k;
         for (int co = 0; co < u->cfg.cout; co++) {
@@ -4482,13 +4529,13 @@ int unet_init_from_map(unet *u, const char *path, const int *head_rows) {
         }
         n++;
     } else { unet_free(o); return -1; }
-    if (u->cfg.scale_cond && oc.scale_cond && u->enc[0].c1.cout == o->enc[0].c1.cout) {
+    if (!S && u->cfg.scale_cond && oc.scale_cond && u->enc[0].c1.cout == o->enc[0].c1.cout) {
         nn_d2d(u->p + u->sc_w, o->p + o->sc_w, (size_t)u->enc[0].c1.cout * 4); nn_d2d(u->ema + u->sc_w, o->ema + o->sc_w, (size_t)u->enc[0].c1.cout * 4); n++;
     }
     for (int i = 0; i < L; i++) for (int k = 0; k < u->cfg.enc_blocks[i]; k++) {   /* residual blocks: the donor's, or identity blocks whose output
                                                                                     normalisation is the level's (the net then computes the donor's function) */
         const block *a = &u->rb[i][k];
-        if (k < oc.enc_blocks[i]) { const block *b = &o->rb[i][k]; n += copy_conv(u, o, &a->c1, &b->c1) + copy_gn(u, o, &a->n1, &b->n1) + copy_conv(u, o, &a->c2, &b->c2) + copy_gn(u, o, &a->n2, &b->n2); }
+        if (k < oc.enc_blocks[i + S]) { const block *b = &o->rb[i + S][k]; n += copy_conv(u, o, &a->c1, &b->c1) + copy_gn(u, o, &a->n1, &b->n1) + copy_conv(u, o, &a->c2, &b->c2) + copy_gn(u, o, &a->n2, &b->n2); }
         else if (a->n2.c == u->enc[i].n2.c) for (int e = 0; e < 2; e++) {
             float *arr = e ? u->ema : u->p;
             nn_d2d(arr + a->n2.gamma, arr + u->enc[i].n2.gamma, (size_t)a->n2.c * 4); nn_d2d(arr + a->n2.beta, arr + u->enc[i].n2.beta, (size_t)a->n2.c * 4);

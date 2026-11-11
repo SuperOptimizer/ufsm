@@ -35,6 +35,7 @@ const char *z3_key(const z3 *z);
 /* Read the box [o, o+n) (z,y,x) into out (C order, n[0]*n[1]*n[2] bytes). Out-of-range parts use fill_value.
    nthreads <= 0 picks the CPU count. Returns 0 on success, -1 on I/O or decode failure. */
 int z3_read(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads);   /* out: n[0] n[1] n[2] * esize bytes */
+int z3_box_any(z3 *z, const int64_t o[3], const int64_t n[3]);   /* any stored chunk in the box (shard indices only): 1, none 0, error -1 */
 /* z3_read decoding only the volcomp substreams in submask of each chunk (bit s = substream s: blocks 16 s .. 16 s + 15, i.e. the
    16 z x 32 y x 128 x slab z0 = 16 (s / 4), y0 = 32 (s % 4)); voxels of the other substreams read as 0. The decoded ones equal a full
    decode byte for byte (volcomp_decode_block's guarantee). submask 0 or all ones, or a chunk that is not a lossy / coded volcomp chunk
@@ -64,3 +65,5 @@ void z3_io_stats(uint64_t *cache_hits, uint64_t *store_reads);
 void z3_shared_cache_stats(uint64_t *hits, uint64_t *misses, uint64_t *stored);   /* chunk reads served from the cache vs fetched from the store */
 int z3_prefetch_chunk(z3 *z, int64_t cz, int64_t cy, int64_t cx);   /* fetch one inner chunk into the cache (no decode): 1 fetched, 0 cached/absent, -1 error */
 int z3_chunk_raw(z3 *z, int64_t cz, int64_t cy, int64_t cx, uint8_t **buf, size_t *n);   /* encoded inner chunk bytes (after zstd): 1 with *buf (malloc), 0 absent, -1 error */
+uint64_t z3_sink_chunks(void);   /* chunks decoded straight into a request's output (the window sink), process-wide */
+

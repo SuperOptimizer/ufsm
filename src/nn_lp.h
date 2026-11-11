@@ -72,6 +72,8 @@ int lp_gn_silu_bwd_apply_defer(const void *x, int xdt, shape5 s, int G, const fl
                                const void *gy, void *gx, const float *AB, unsigned gsr, unsigned rsr);   /* 1: left pending */
 int lp_gnpend_flush(void);        /* run a pending apply now (whole layer, no records); 1 when there was one */
 int lp_gnpend_of(const void *gx); /* an apply is pending into gx (this GPU) */
+void lp_mx4_to_mx8_z(const void *x4, int C, int D, size_t HW, int z0, int nz, int za, int zc, void *y8);   /* lp_mx_cvt.cu: z-slices as MX-fp8 tensors */
+void lp_mx8_slice_z(const void *x8, int C, int D, size_t HW, int z0, int nz, void *y8);
 int lp_gnpend_flush_of(const void *gx);   /* flush when the pending apply writes gx (a reader of gx that does not run it) */
 void lp_gnpend_slab(int zt0, int zt1, uint8_t *out, float *gb, int last);   /* the pending apply over z-steps [zt0, zt1), that slab's records into out */
 const void *lp_gnpend_take(const void *gx, const void **gy, const float **cf);   /* a consumer that fuses the pending apply (N 1, MX-fp4 x, <= 1024 channels): its x (the activation),
@@ -99,6 +101,8 @@ size_t lp_mx4_bytes(int N, int C, size_t S);
 void lp_f32_to_mx4(const float *x, int N, int C, size_t S, void *y);
 void lp_h16_to_mx4(const void *x, int dt, int N, int C, size_t S, void *y);
 void lp_input_rad(const void *ct16, int dt, const void *rec, size_t rec_bytes, int N, int D, int P, void *y, int bits);   /* nn_input_rad */
+void lp_input_latc(const void *ct16, int dt, const void *rec, size_t rec_bytes, int N, int d, int p, const float *bas, const float *gain, int C, float step, void *y, int bits);   /* nn_input_latc */
+void lp_input_lat(const void *ct16, int dt, const void *rec, size_t rec_bytes, int N, int d, int p, void *y, int bits);   /* nn_input_lat */
 void lp_fakeq_w4(float *w, int Co, int Ci, int T, int Bo, int Bi);   /* nn_fakeq_w4_2d / nn_fakeq_w4 */
 void lp_input_rad_pack(const void *ct16, int dt, const void *rec, size_t rec_bytes, int N, int d, int p, void *y, int bits);   /* nn_input_rad_pack */
 void lp_mx4_to_f32(const void *x, int N, int C, size_t S, float *y);
@@ -143,6 +147,7 @@ void lp_conv1_to_mx(const void *x, int gdt, int N, int Ci, size_t S, const float
 void lp_conv1_to_mx_r(const void *x, int gdt, int N, int Ci, size_t S, const float *w, int Co, void *y, int ydt, unsigned sr, size_t vb, size_t vn);   /* rows [vb, vb + vn) */   /* ydt 3 MX-fp8, 4 MX-fp4 (exact SR keyed by sr) */
 void lp_up2_bwd_mx(const void *gy, shape5 xs, void *gx, int gdt, int xdt, unsigned osr);   /* gdt / xdt: MX dt 3 (fp8) or 4 (fp4, gx with exact SR keyed by osr) */
 void lp_up2_bwd_mx_slice(const void *gy, shape5 xs, void *gx, int ctot, int c0, int gdt, int xdt, unsigned osr);   /* channels [c0, c0 + xs.c) of an MX-fp8 gx (ctot ch) */
+void lp_set_s2b_cz(int cz);   /* fine planes per chunk of the wide MX-fp4 stride-2 backward-data (0 whole, -1 default: ~96 MB of MX-fp8 rows) */
 int lp_bwd_data_s2_mx(const void *gy, shape5 ys, const float *w, shape5 xs, void *gx, int accum, int gdt, int xdt, unsigned osr);   /* returns the compute precision (3 fp4, 2 fp8, 1 bf16, 0 fp32) */
 const char *lp_check(void);
 void lp_f32_to_bf16(const float *x, size_t n, void *y);   /* test helpers */

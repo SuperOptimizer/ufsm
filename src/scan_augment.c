@@ -534,6 +534,16 @@ void scan_plan_air(const scan_plan *p, const uint8_t *ctu, uint8_t *air) {
         for (int z = b0[0]; z < b1[0]; z++) for (int y = b0[1]; y < b1[1]; y++) memset(air + z * P2 + (size_t)y * P + b0[2], 1, b1[2] - b0[2]);
     }
 }
+void scan_plan_notair(const scan_plan *p, uint8_t *restrict ctu, uint8_t *restrict copy) {   /* in place: ctu = !scan_plan_air(ctu), one pass; copy (if given) the bytes before */
+    const int P = p->P; const size_t P2 = (size_t)P * P, p3 = P2 * P;
+    if (p->on & 1u << SA_AIR) { if (copy) memcpy(copy, ctu, p3); memset(ctu, 1, p3); }
+    else if (copy) for (size_t k = 0; k < p3; k++) { const uint8_t v = ctu[k]; copy[k] = v; ctu[k] = v != 0; }
+    else for (size_t k = 0; k < p3; k++) ctu[k] = ctu[k] != 0;
+    for (int i = 0; i < p->nchunk; i++) {
+        const int *b0 = p->chunk_b0[i], *b1 = p->chunk_b1[i];
+        for (int z = b0[0]; z < b1[0]; z++) for (int y = b0[1]; y < b1[1]; y++) memset(ctu + z * P2 + (size_t)y * P + b0[2], 0, b1[2] - b0[2]);
+    }
+}
 void scan_aug_exec(const scan_plan *p, uint8_t *ctu, void *scratch) {
     const unsigned on = p->on;
     if (!on) return;

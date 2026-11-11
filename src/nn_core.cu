@@ -1,6 +1,7 @@
 /* CUDA ops: core section of the former nn.cu */
 #include "nn_common.cuh"
 #include <dlfcn.h>
+#include <unistd.h>
 
 int g_tf32 = 1;
 int g_gn_stored = 0;
@@ -189,12 +190,25 @@ int g_gradbf = 1;
 extern "C" void nn_set_grad_bf16(int on) { g_gradbf = on; }
 extern "C" int nn_get_grad_bf16(void) { return g_gradbf; }
 cudaError_t g_err = cudaSuccess;
+const char *g_err_file, *g_err_what; int g_err_line;
+static char g_err_site[512];
+static void *g_err_ra;   /* the caller of the copy / memset wrapper that latched g_err (CKR) */
+#define CKR(x) do { const int had_ = g_err != cudaSuccess; CK(x); if (!had_ && g_err != cudaSuccess) g_err_ra = __builtin_return_address(0); } while (0)
+extern "C" const char *nn_check_site(void) { return g_err_site; }
 extern "C" int nn_init(int device) { if (ufsm_env_on("UFSM_ACTF32")) g_actbf = 0; if (ufsm_env_on("UFSM_GRADF32")) g_gradbf = 0; if (ufsm_env_on("UFSM_F16")) { g_h16 = 1; g_gscale = getenv("UFSM_GSCALE") ? (float)atof(getenv("UFSM_GSCALE")) : 1024.f; } if (cudaSetDevice(device) != cudaSuccess) return -1; if (getenv("UFSM_MEM_REPORT") && atoi(getenv("UFSM_MEM_REPORT")) >= 3) { size_t fr = 0, tot = 0; cudaFree(0); cudaMemGetInfo(&fr, &tot); fprintf(stderr, "nn_init: device used %.1f MB after the context\n", (tot - fr) / 1e6); } return 0; }
 extern "C" const char *nn_check(void) {
     cudaError_t e = g_err;
     g_err = cudaSuccess;
-    if (e == cudaSuccess) e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        int k = snprintf(g_err_site, sizeof g_err_site, "%s:%d (%s)", g_err_file ? g_err_file : "?", g_err_line, g_err_what ? g_err_what : "?");
+        Dl_info di;   /* a copy wrapper's caller: addr2line -f -e <binary> OFFSET names it */
+        if (g_err_ra && k > 0 && (size_t)k < sizeof g_err_site && dladdr(g_err_ra, &di) && di.dli_fbase)
+            snprintf(g_err_site + k, sizeof g_err_site - (size_t)k, " called from %s+0x%zx", di.dli_sname ? di.dli_sname : "binary", di.dli_sname ? (size_t)((char *)g_err_ra - (char *)di.dli_saddr) : (size_t)((char *)g_err_ra - (char *)di.dli_fbase));
+        g_err_ra = nullptr;
+    }
+    else { e = cudaGetLastError(); snprintf(g_err_site, sizeof g_err_site, "%s", e == cudaSuccess ? "" : "cudaGetLastError at the check (an unchecked kernel launch or copy)"); }
     const char *lp_error = lp_check();   /* low-precision kernels clear CUDA's last error into their own buffer */
+    if (e == cudaSuccess && lp_error) snprintf(g_err_site, sizeof g_err_site, "a low-precision kernel (lp_check's latch)");
     return e == cudaSuccess ? lp_error : cudaGetErrorString(e);
 }
 /* UFSM_MEM_REPORT >= 3: every device allocation of >= 16 MB with the device's used bytes after it and the caller's offset in its object
@@ -211,9 +225,20 @@ extern "C" void *nn_malloc(size_t n) {
     if (e != cudaSuccess) {   /* say so (the sticky g_err alone surfaced as a segfault in the next copy to the null pointer) */
         size_t fr = 0, tot = 0; cudaGetLastError(); cudaMemGetInfo(&fr, &tot);
         fprintf(stderr, "nn_malloc: cudaMalloc of %.2f GB failed (%s; %.2f of %.2f GB free on the device)\n", n / 1e9, cudaGetErrorString(e), fr / 1e9, tot / 1e9);
-        if (g_err == cudaSuccess) g_err = e;
+        if (g_err == cudaSuccess) { g_err = e; g_err_file = __FILE__; g_err_line = __LINE__; g_err_what = "cudaMalloc in nn_malloc"; }
+        /* no caller takes a null buffer (the optional ones use nn_malloc_try): returning it let the next kernels write through null, and
+           the run ended many lines later in "an illegal memory access was encountered" from an unrelated allocation (fit-field predict
+           beside a training run). End here, with the size and the caller. UFSM_MALLOC_NULL=1: the old return (debugging) */
+        if (!ufsm_env_on("UFSM_MALLOC_NULL")) {
+            Dl_info di; void *ra = __builtin_return_address(0); const size_t off = dladdr(ra, &di) && di.dli_fbase ? (size_t)((char *)ra - (char *)di.dli_fbase) : (size_t)ra;
+            fprintf(stderr, "cuda: out of memory: the device has no room for a %.2f GB buffer (caller 0x%zx); stopping\n", n / 1e9, off);
+            fflush(nullptr); _exit(1);
+        }
         return nullptr;
     }
+    { static int fill = -2; if (fill == -2) fill = getenv("UFSM_MALLOC_FILL") ? atoi(getenv("UFSM_MALLOC_FILL")) : -1;   /* debug: every new device buffer filled with this byte
+                                                                                                                         (a result that changes with it reads memory nobody wrote) */
+      if (fill >= 0) cudaMemset(p, fill, n); }
     alloc_log(n, __builtin_return_address(0)); return p;
 }
 g_reg_t g_reg[NN_MAXREG];
@@ -231,6 +256,12 @@ extern "C" int nn_storage(const void *p) {
     int dt = 0; size_t n = SIZE_MAX;
     for (int i = 0; i < g_nreg; i++) if (c >= g_reg[i].p && c < g_reg[i].p + g_reg[i].n && g_reg[i].n < n) { dt = g_reg[i].dt; n = g_reg[i].n; }
     return dt;
+}
+extern "C" void nn_storage_dump(const char *tag) {   /* debug: the registry (stale entries of freed buffers show as overlaps) */
+    for (int i = 0; i < g_nreg; i++) {
+        int ov = 0; for (int j = 0; j < g_nreg; j++) if (j != i && g_reg[j].p < g_reg[i].p + g_reg[i].n && g_reg[i].p < g_reg[j].p + g_reg[j].n) ov++;
+        fprintf(stderr, "%s reg %2d: %p + %zu dt %d%s\n", tag, i, (const void *)g_reg[i].p, g_reg[i].n, g_reg[i].dt, ov ? "  OVERLAPS" : "");
+    }
 }
 extern "C" size_t nn_mx8_bytes(shape5 s) { int bw = s.c <= 8 ? 8 : s.c <= 16 ? 16 : 32, nb = (s.c + bw - 1) / bw; return (size_t)s.n * nb * shape_spatial(s) * (bw + 1); }   /* = lp_mx8_bytes */
 extern "C" size_t nn_mx4_bytes(shape5 s) { int bw = s.c <= 8 ? 8 : s.c <= 16 ? 16 : 32, nb = (s.c + bw - 1) / bw; return (size_t)s.n * nb * shape_spatial(s) * (bw / 2 + 1); }   /* = lp_mx4_bytes */
@@ -333,12 +364,20 @@ extern "C" void nn_free(void *p) {
     if (i >= 0) { CK(cudaDeviceSynchronize()); ring_drop(i); return; }
     CK(cudaFree(p));
 }
-extern "C" void nn_zero(void *p, size_t n) { CK(cudaMemset(p, 0, n)); }
-extern "C" void nn_h2d(void *d, const void *s, size_t n) { CK(cudaMemcpy(d, s, n, cudaMemcpyHostToDevice)); }
-extern "C" void nn_d2h(void *d, const void *s, size_t n) { CK(cudaMemcpy(d, s, n, cudaMemcpyDeviceToHost)); }
-extern "C" void nn_d2d(void *d, const void *s, size_t n) { CK(cudaMemcpy(d, s, n, cudaMemcpyDeviceToDevice)); }
-extern "C" void nn_copy_async(void *d, const void *s, size_t n) { CK(cudaMemcpyAsync(d, s, n, cudaMemcpyDefault, 0)); }   /* any direction (pinned host), ordered with the kernels */
-extern "C" void nn_d2d_async(void *d, const void *s, size_t n) { CK(cudaMemcpyAsync(d, s, n, cudaMemcpyDeviceToDevice, 0)); }   /* ordered with the kernels */
+extern "C" void nn_zero(void *p, size_t n) { CKR(cudaMemset(p, 0, n)); }
+/* A pageable upload of <= 64 KB returns once the bytes are staged: the device write is queued on the default stream. Work on the default
+   stream is ordered after it; work on the copy / aux / offload streams is not, unless an event of the default stream is waited for
+   (test_pack_tm raced this way). UFSM_H2D_SYNC=1 synchronises the default stream after every such upload: a run that changes under
+   it has an unordered reader. */
+extern "C" void nn_h2d(void *d, const void *s, size_t n) {
+    CKR(cudaMemcpy(d, s, n, cudaMemcpyHostToDevice));
+    static int sy = -1; if (sy < 0) sy = getenv("UFSM_H2D_SYNC") ? atoi(getenv("UFSM_H2D_SYNC")) : 0;
+    if (sy && n <= ((size_t)64 << 10)) CK(cudaStreamSynchronize(0));
+}
+extern "C" void nn_d2h(void *d, const void *s, size_t n) { CKR(cudaMemcpy(d, s, n, cudaMemcpyDeviceToHost)); }
+extern "C" void nn_d2d(void *d, const void *s, size_t n) { CKR(cudaMemcpy(d, s, n, cudaMemcpyDeviceToDevice)); }
+extern "C" void nn_copy_async(void *d, const void *s, size_t n) { CKR(cudaMemcpyAsync(d, s, n, cudaMemcpyDefault, 0)); }   /* any direction (pinned host), ordered with the kernels */
+extern "C" void nn_d2d_async(void *d, const void *s, size_t n) { CKR(cudaMemcpyAsync(d, s, n, cudaMemcpyDeviceToDevice, 0)); }   /* ordered with the kernels */
 __global__ void d2d_u4_k(uint4 *__restrict__ d, const uint4 *__restrict__ s, size_t n) {
     for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) d[i] = s[i];
 }
@@ -350,16 +389,36 @@ extern "C" void nn_d2d_kernel(void *d, const void *s, size_t n) {   /* a kernel 
 extern "C" void nn_sync(void) { CK(cudaDeviceSynchronize()); }
 /* a fault of an earlier kernel (sticky: the context is lost, every later call fails): its message, else nullptr (callers stop instead of writing zeros) */
 extern "C" const char *nn_device_error(void) { const cudaError_t e = cudaDeviceSynchronize(); if (e == cudaSuccess) return nullptr; cudaGetLastError(); return cudaGetErrorString(e); }
-extern "C" void *nn_host_alloc(size_t n) { void *p = nullptr; CK(cudaMallocHost(&p, n)); return p; }
+/* pinned host accounting (nn_host_bytes, nn_host_report): every live cudaMallocHost block with its size and caller, so the trainer
+   can split its RSS into pinned and pageable (UFSM_HOSTMEM=1); a few hundred blocks at most, a linear table under a mutex */
+#include <mutex>
+static std::mutex g_hmu; static struct { void *p; size_t n; void *ra; } g_hb[4096]; static int g_nhb; static size_t g_hbytes;
+static void host_track(void *p, size_t n, void *ra) {
+    if (!p) return; std::lock_guard<std::mutex> l(g_hmu);
+    if (g_nhb < 4096) { g_hb[g_nhb].p = p; g_hb[g_nhb].n = n; g_hb[g_nhb].ra = ra; g_nhb++; } g_hbytes += n;
+}
+static void host_untrack(void *p) {
+    std::lock_guard<std::mutex> l(g_hmu);
+    for (int i = 0; i < g_nhb; i++) if (g_hb[i].p == p) { g_hbytes -= g_hb[i].n; g_hb[i] = g_hb[--g_nhb]; return; }
+}
+extern "C" size_t nn_host_bytes(void) { std::lock_guard<std::mutex> l(g_hmu); return g_hbytes; }
+extern "C" void nn_host_report(FILE *f) {   /* live pinned bytes by caller (resolve with addr2line -e build/ufsm -f) */
+    std::lock_guard<std::mutex> l(g_hmu); void *ra[256]; size_t by[256], nb[256]; int k = 0;
+    for (int i = 0; i < g_nhb; i++) { int j = 0; while (j < k && ra[j] != g_hb[i].ra) j++; if (j == k) { if (k == 256) continue; ra[k] = g_hb[i].ra; by[k] = 0; nb[k] = 0; k++; } by[j] += g_hb[i].n; nb[j]++; }
+    for (int j = 0; j < k; j++) fprintf(f, "hostmem: pinned %8.3f GB in %4zu blocks from %p\n", by[j] / 1e9, nb[j], ra[j]);
+}
+extern "C" void *nn_host_alloc(size_t n) { void *p = nullptr; CK(cudaMallocHost(&p, n)); host_track(p, n, __builtin_return_address(0)); return p; }
 extern "C" void *nn_managed_alloc(size_t n) { void *p = nullptr; if (cudaMallocManaged(&p, n ? n : 4) != cudaSuccess) { cudaGetLastError(); return nullptr; } return p; }
 extern "C" void *nn_malloc_try(size_t n) { void *p = nullptr; if (cudaMalloc(&p, n ? n : 4) != cudaSuccess) { cudaGetLastError(); return nullptr; } alloc_log(n, __builtin_return_address(0)); return p; }
-extern "C" void *nn_host_alloc_try(size_t n) { void *p = nullptr; if (cudaMallocHost(&p, n) != cudaSuccess) { cudaGetLastError(); return nullptr; } return p; }
-extern "C" void nn_host_free(void *p) { if (p) CK(cudaFreeHost(p)); }
+extern "C" void *nn_host_alloc_try(size_t n) { void *p = nullptr; if (cudaMallocHost(&p, n) != cudaSuccess) { cudaGetLastError(); return nullptr; } host_track(p, n, __builtin_return_address(0)); return p; }
+extern "C" void nn_host_free(void *p) { if (p) { host_untrack(p); CK(cudaFreeHost(p)); } }
 cudaStream_t copy_stream(void) {
     static cudaStream_t st[8]; int d = 0; cudaGetDevice(&d); d &= 7;
     if (!st[d]) CK(cudaStreamCreateWithFlags(&st[d], cudaStreamNonBlocking));
     return st[d];
 }
+extern "C" void nn_d2h_copy_stream(void *d, const void *s, size_t n) { CK(cudaMemcpyAsync(d, s, n, cudaMemcpyDeviceToHost, copy_stream())); }   /* d must be pinned */
+extern "C" void nn_h2d_async(void *d, const void *s, size_t n) { CK(cudaMemcpyAsync(d, s, n, cudaMemcpyHostToDevice, 0)); }   /* stream 0, in order with its kernels; s pinned */
 extern "C" void nn_h2d_copy_stream(void *d, const void *s, size_t n) { CK(cudaMemcpyAsync(d, s, n, cudaMemcpyHostToDevice, copy_stream())); }   /* s must be pinned */
 extern "C" void *nn_event_create(void) { cudaEvent_t e; CK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming)); return (void *)e; }
 static cudaStream_t aux_stream(void) {   /* device-to-device copies overlapped with compute (nn_d2d_aux) */
@@ -395,9 +454,41 @@ extern "C" void nn_d2d_aux(void *d, const void *s, size_t n) {
     }
     CK(cudaMemcpyAsync(d, s, n, cudaMemcpyDeviceToDevice, aux_stream()));
 }
+extern "C" void nn_h2d_stream(int k, void *d, const void *s, size_t n) { CK(cudaMemcpyAsync(d, s, n, cudaMemcpyHostToDevice, stream_of(k))); }   /* stream k: 0 compute, 1 copy, 2 aux; s pinned */
 extern "C" void nn_event_record(void *e, int on_copy_stream) { CK(cudaEventRecord((cudaEvent_t)e, stream_of(on_copy_stream))); }
 extern "C" void nn_stream_wait(int copy_stream_waits, void *e) { CK(cudaStreamWaitEvent(stream_of(copy_stream_waits), (cudaEvent_t)e, 0)); }
 extern "C" void nn_event_sync(void *e) { CK(cudaEventSynchronize((cudaEvent_t)e)); }
+/* train --lat: label planes kept on the device in packed form (train.c d->ldev). bits 8: the bytes; 4: codes 0..14 and 255 (-> 15;
+   unused: the winding component's ids pass 14 with tiles); 2: the --rv papyrus plane's classes (255 unknown -> 3, >= 127 papyrus -> 1 (254 back), void -> 0: all rv_tg_k reads).
+   nn_lab_pack: n voxels of s into d; nn_lab_unpack: voxels [v0, v0 + n) of p into d[0..n). stream k: 0 compute, 1 copy, 2 aux */
+__global__ void lab_pack_k(const uint8_t *s, uint8_t *d, size_t n, int bits) {
+    const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x, per = 8 / bits;
+    if (i * per >= n) return;
+    unsigned o = 0;
+    for (size_t j = 0; j < per && i * per + j < n; j++) {
+        const unsigned v = s[i * per + j];
+        o |= (bits == 8 ? v : bits == 4 ? (v > 14 ? 15u : v) : (v == 255 ? 3u : v >= 127 ? 1u : 0u)) << (bits * j);
+    }
+    d[i] = (uint8_t)o;
+}
+__global__ void lab_unpack_k(const uint8_t *p, uint8_t *d, size_t v0, size_t n, int bits) {
+    const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const size_t v = v0 + i;
+    if (bits == 8) d[i] = p[v];
+    else if (bits == 4) { const unsigned c = p[v >> 1] >> (4 * (v & 1)) & 15u; d[i] = (uint8_t)(c == 15 ? 255 : c); }
+    else { const unsigned c = p[v >> 2] >> (2 * (v & 3)) & 3u; d[i] = (uint8_t)(c == 3 ? 255 : c ? 254 : 0); }
+}
+/* experiment (train UFSM_LAB_QBITS): a cyclic label plane (phase / winding: codes 0..251, >= 252 kept) to 2^bits levels, in place */
+__global__ void lab_quant_k(uint8_t *s, size_t n, int bits) {
+    const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const int v = s[i], L = 1 << bits;
+    if (v < 252) s[i] = (uint8_t)(((v * L + 126) / 252 % L * 252 + L / 2) / L);
+}
+extern "C" void nn_lab_quant(int k, uint8_t *s, size_t n, int bits) { lab_quant_k<<<nblk(n, 256), 256, 0, stream_of(k)>>>(s, n, bits); KCHECK(); }
+extern "C" void nn_lab_pack(int k, const uint8_t *s, uint8_t *d, size_t n, int bits) { lab_pack_k<<<nblk((n * bits + 7) / 8, 256), 256, 0, stream_of(k)>>>(s, d, n, bits); KCHECK(); }
+extern "C" void nn_lab_unpack(int k, const uint8_t *p, uint8_t *d, size_t v0, size_t n, int bits) { lab_unpack_k<<<nblk(n, 256), 256, 0, stream_of(k)>>>(p, d, v0, n, bits); KCHECK(); }
 static cudaStream_t offload_stream(void) {   /* activation offload: its own stream, so it never queues behind batch uploads */
     static cudaStream_t st[8]; int d = 0; cudaGetDevice(&d); d &= 7;
     if (!st[d]) CK(cudaStreamCreateWithFlags(&st[d], cudaStreamNonBlocking));
@@ -408,6 +499,8 @@ extern "C" void nn_offload_copy(void *dst, const void *src, size_t n, int to_hos
     CK(cudaStreamWaitEvent(offload_stream(), (cudaEvent_t)ev_start, 0));
     CK(cudaMemcpyAsync(dst, src, n, to_host ? cudaMemcpyDeviceToHost : cudaMemcpyHostToDevice, offload_stream()));
     CK(cudaEventRecord((cudaEvent_t)ev_done, offload_stream()));
+    static int sy = -1; if (sy < 0) sy = getenv("UFSM_OFFLOAD_SYNC") != nullptr;   /* debug: every offload copy completes before the call returns (a missing event wait shows as a changed result) */
+    if (sy) CK(cudaDeviceSynchronize());
 }
 cudaEvent_t g_ev[NPROF][2];
 int g_evk[NPROF], g_nev, g_ev_init;
@@ -422,6 +515,29 @@ extern "C" void nn_prof_collect(double *out, int nk) {
     for (int i = 0; i < nk; i++) out[i] = 0;
     for (int i = 0; i < g_nev; i++) { float ms = 0; cudaEventElapsedTime(&ms, g_ev[i][0], g_ev[i][1]); if (g_evk[i] < nk) out[g_evk[i]] += ms; }
     g_nev = 0;
+}
+/* UFSM_PTICK=1: phase timer. nn_ptick(name) synchronises the device and adds the wall time since the previous tick to the bucket name
+   (the phase that just ended); nn_ptick(nullptr) only restarts the clock; nn_ptick_report prints and resets. Off: a load and a branch. */
+static int g_ptick = -1, g_ptn; static const char *g_ptname[64]; static double g_ptms[64], g_ptlast; static long g_ptcnt[64];
+static double pt_now(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec * 1e3 + ts.tv_nsec * 1e-6; }
+extern "C" int nn_ptick_on(void) { if (g_ptick < 0) { const char *e = getenv("UFSM_PTICK"); g_ptick = e && *e && strcmp(e, "0"); } return g_ptick; }
+extern "C" void nn_ptick(const char *name) {
+    if (!nn_ptick_on()) return;
+    cudaDeviceSynchronize();
+    const double t = pt_now();
+    if (name) {
+        int k = 0; while (k < g_ptn && strcmp(g_ptname[k], name)) k++;
+        if (k == g_ptn && g_ptn < 64) g_ptname[g_ptn++] = name;
+        if (k < 64 && g_ptlast > 0) { g_ptms[k] += t - g_ptlast; g_ptcnt[k]++; }
+    }
+    g_ptlast = pt_now();
+}
+extern "C" void nn_ptick_fine(const char *name) { static int f = -1; if (f < 0) { const char *e = getenv("UFSM_PTICK"); f = e && atoi(e) >= 2; } if (f) nn_ptick(name); }   /* UFSM_PTICK=2 */
+extern "C" void nn_ptick_report(int steps) {
+    if (!nn_ptick_on() || !g_ptn) return;
+    double tot = 0; for (int k = 0; k < g_ptn; k++) tot += g_ptms[k];
+    fprintf(stderr, "ptick: ms per step over %d steps (synchronised phases; total %.1f)\n", steps, tot / steps);
+    for (int k = 0; k < g_ptn; k++) { fprintf(stderr, "  %-22s %9.2f ms  %5.1f%%  (%ld calls)\n", g_ptname[k], g_ptms[k] / steps, 100 * g_ptms[k] / tot, g_ptcnt[k] / steps); g_ptms[k] = 0; g_ptcnt[k] = 0; }
 }
 extern "C" size_t nn_mem_free(void) { size_t f = 0, t = 0; cudaMemGetInfo(&f, &t); return f; }
 extern "C" void ufsm_no_verify_types(const char *fn) {

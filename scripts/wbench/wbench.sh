@@ -11,6 +11,9 @@
 #   e.g. FIT="--emb /vesuvius/ufsm/repr/emb/bench/{box} --uw-rep-emb 2"), FIELDS (TAG0: reuse fields),
 #   KEEP (1: keep this TAG's fields for later fixed-fields runs; default 1), U (binary; default $WB/bin/ufsm = the pinned build), UP (predict binary, default U: a newer build for checkpoints the fitter pin cannot load),
 #   NOLOCK=1 (the caller holds the GPU lock).
+#   WZARGS= (empty): cube windows, no --window-z (latent-grid checkpoints: train --lat 4), with WIN / HALO.
+#   LATENTS="SCROLL=STORE ..." (e.g. "paris4=/mnt/scratch/lat/p4-l2.lc 1667=/mnt/scratch/lat/p1667-l2b.lc"): those scrolls' fields predicted from
+#   the ufsm lc-encode store of their CT level (predict --latents: --lat-basis checkpoints; paris4j falls back to paris4's store).
 set -u
 H=$(cd "$(dirname "$0")" && pwd)
 SITE=${SITE:-$([ -d $HOME/ufsm-data ] && echo laptop || echo desk)}; GPU=${GPU:-0}
@@ -55,11 +58,15 @@ scroll() {   # scroll SCROLL: R V UM LV AX QR QK PR PK PF (PF: CT voxels per lab
     *) return 1;;
   esac
 }
+lat_for() {   # lat_for SCROLL: its latent store in LATENTS (paris4j: paris4's), or nothing
+  local kv; for kv in ${LATENTS:-}; do [ "${kv%%=*}" = "$1" ] && { echo "${kv#*=}"; return; }; done
+  [ "$1" = paris4j ] && lat_for paris4; return 0; }
 predict() {   # predict OUTFIELDS z y x nz ny nx LOG [big]: fit fields of the box (production window, 19.2 / 18.7 um cells, lossless phase)
-  local f=$1 lg=$8 run=RUN; [ "${9:-}" = big ] && run=RUNBIG; rm -rf $f $f.tmp
-  $run ${UP:-$U} predict $CK $R $V $f.tmp --um $UM --level $LV --box $2,$3,$4,$5,$6,$7 --window-z ${WINZ:-384} --halo-z ${HALOZ:-64} --window ${WIN:-640} --halo ${HALO:-64} --shard 512 \
+  local f=$1 lg=$8 run=RUN lx; [ "${9:-}" = big ] && run=RUNBIG; rm -rf $f $f.tmp
+  lx=$(lat_for ${sc:-}); [ -n "${LATENTS:-}" ] && [ -z "$lx" ] && { echo "wbench: LATENTS has no store for scroll ${sc:-?}" > $lg; return 1; }
+  $run ${UP:-$U} predict $CK $R $V $f.tmp --um $UM --level $LV --box $2,$3,$4,$5,$6,$7 ${WZARGS---window-z ${WINZ:-384} --halo-z ${HALOZ:-64}} --window ${WIN:-640} --halo ${HALO:-64} --shard 512 \
     --grid-origin ${GO:-0,0,0} --ema 1 --q 8 --threads $THREADS --gpu $GPU --axis $AX --levels 1 --fit-zarr $f --fit-h 2 --fit-q 8 --fit-q-phase 0 ${PX:-} \
-    --no-out 1 --cache $CACHE > $lg 2>&1; local rc=$?; rm -rf $f.tmp; return $rc
+    --no-out 1 --cache $CACHE ${lx:+--latents $lx} > $lg 2>&1; local rc=$?; rm -rf $f.tmp; return $rc
 }
 fitsc() {   # fitsc FIELDS OUT LOG [extra]: production fit + codes score + pair accuracy
   local f=$1 o=$2 lg=$3; shift 3

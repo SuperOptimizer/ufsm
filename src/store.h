@@ -5,6 +5,8 @@
 #include <stdint.h>
 
 typedef struct store store;
+#include <stdio.h>
+void store_io_report(FILE *f);   /* local reads per store root: count, bytes, wall time (open + pread) */
 
 store *store_open(const char *root);          /* "/path" or "https://host/prefix" (trailing '/' optional) */
 void store_close(store *s);

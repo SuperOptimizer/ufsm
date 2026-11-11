@@ -4,15 +4,19 @@
    write_spatial_tm channel 0) into the 16-bit CT channel. The CPU made every decision (the plan, the record); the results match the
    CPU path within float tolerance (tests/test_gpu_aug.c), the zero set exactly. Device memory: one P^3 byte staging buffer, the plan, a
    few P^2 planes. */
+#include "band_w4dev.h"
 #include "nn_common.cuh"
 #include "scan_augment.h"
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 
+#define AUG_CN_BYTES ((size_t)64 << 20)   /* the correlated noise's chunk of planes */
 typedef struct {
     uint8_t *stage; size_t stage_n;   /* the window's bytes: input, then output */
     scan_plan *plan;                  /* the device copy of the plan */
     scan_ct_rec *rec;                 /* the device copy of the record (without its plan) */
+    float *uw; uint16_t *ui; int *nu; /* the x operator's distinct weight rows (aug_bop_uniq_k) */
+    float *cn; size_t cn_n;           /* correlated noise: a chunk of planes (aug_cnoise_*_ck) */
     float *pl[4]; size_t pl_n;        /* P^2 planes: correlated-noise rows / state, GIN ring / plane */
     double *dsc;                      /* GIN g1, g2 */
     unsigned long long *usc;          /* GIN gn; output sum, sum of squares; hist count */
@@ -22,6 +26,7 @@ typedef struct {
     float *ntab;                      /* the jitter noise table (sample.c g_ntab) */
     float *cssn;                      /* --gpu-aug 2: the phase codes' cos, sin (256 each) */
     cudaEvent_t done; int used;       /* the last window's work (the staging buffer is shared by both streams' calls) */
+    const void *key;
 } aug_dev;
 static aug_dev g_ad[8];
 
@@ -80,6 +85,94 @@ __global__ void aug_bop_zy_k(__half *F, const scan_bop *b, int P, int axis) {
         F[base + i * st + x] = f2h(a);
     }
 }
+/* the same along axis 0 or 1 with one thread per line (u, x), coalesced across x, and no shared memory (aug_bop_zy_k's P x 32 halves
+   are 64 KB of the SM's 100 KB at P 1024: one block of 256 threads per SM). In place through a ring of the last BOP_RING original
+   values: position c is read once, before any output at or beyond it is written; bop_ring_ok checks on the host that every row's
+   taps are still in the ring. The sums and their order are aug_bop_zy_k's */
+#define BOP_RING 64
+static int bop_ring_ok(const scan_bop *b, int P) {
+    int c = 0;
+    for (int i = 0; i < P; i++) {
+        const int need = b->s[i] + b->n[i] > i + 1 ? b->s[i] + b->n[i] : i + 1;
+        if (b->s[i] < 0 || need > P || b->n[i] < 1) return 0;
+        if (need > c) c = need;
+        if (c - b->s[i] > BOP_RING) return 0;
+    }
+    return 1;
+}
+__global__ void aug_bop_line_k(__half *F, const scan_bop *b, int P, int axis) {
+    const size_t P2 = (size_t)P * P, t = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (t >= P2) return;
+    const int u = (int)(t / P), x = (int)(t % P);
+    const size_t st = axis == 0 ? P2 : (size_t)P, base = (axis == 0 ? (size_t)u * P : (size_t)u * P2) + x;
+    float ring[BOP_RING]; int c = 0;
+    for (int i = 0; i < P; i++) {
+        const float *w = b->w[i]; const int s = b->s[i], n = b->n[i], need = s + n > i + 1 ? s + n : i + 1;
+        for (; c < need; c++) ring[c & (BOP_RING - 1)] = h2f(F[base + c * st]);
+        float a = w[0] * ring[s & (BOP_RING - 1)];
+        for (int k = 1; k < n; k++) a += w[k] * ring[(s + k) & (BOP_RING - 1)];
+        F[base + i * st] = f2h(a);
+    }
+}
+/* along x with R rows per block (R P halves in shared memory, the outputs strided over 256 threads) and the rows' weights from a
+   table of the operator's distinct rows (uw[ui[i]], built on the device by aug_bop_uniq_k: a blur's interior rows are one row, so a
+   warp's taps load a few cache lines instead of one row of b->w per thread; that cost 8 ms per tap and Gvoxel, against 1 in the z / y
+   passes where a warp shares its row). *nu == 0 (more than BOP_UNIQ distinct rows): b->w. The sums and their order are aug_bop_x_k's.
+   P 1024, 13 taps: 30 ms against 137 */
+#define BOP_UNIQ 64
+__global__ void aug_bop_uniq_k(const scan_bop *b, int P, float *uw, uint16_t *ui, int *nu) {
+    int U = 0, un[BOP_UNIQ];
+    for (int i = 0; i < P; i++) {
+        const int n = b->n[i]; int u = U - 1;   /* (the last rows first: neighbours repeat) */
+        for (; u >= 0; u--) if (un[u] == n) {
+            int k = 0; while (k < n && __float_as_uint(uw[(size_t)u * SA_MAXTAP + k]) == __float_as_uint(b->w[i][k])) k++;
+            if (k == n) break;
+        }
+        if (u < 0) { if (U == BOP_UNIQ) { *nu = 0; return; } u = U++; un[u] = n; for (int k = 0; k < n; k++) uw[(size_t)u * SA_MAXTAP + k] = b->w[i][k]; }
+        ui[i] = (uint16_t)u;
+    }
+    *nu = U;
+}
+__global__ void aug_bop_xu_k(__half *F, const scan_bop *b, int P, int R, const float *uw, const uint16_t *ui, const int *nu) {
+    extern __shared__ __half shu[];
+    const size_t r0 = (size_t)blockIdx.x * R, nrow = (size_t)P * P; __half *blk = F + r0 * P;
+    const int n = (int)((r0 + R <= nrow ? R : nrow - r0) * P), tab = *nu > 0;
+    for (int j = threadIdx.x; j < n; j += blockDim.x) shu[j] = blk[j];
+    __syncthreads();
+    for (int j = threadIdx.x; j < n; j += blockDim.x) {
+        const int i = j % P; const __half *row = shu + (j - i);
+        const float *w = tab ? uw + (size_t)ui[i] * SA_MAXTAP : b->w[i]; const int s = b->s[i], nt = b->n[i];
+        float a = w[0] * h2f(row[s]);
+        for (int t = 1; t < nt; t++) a += w[t] * h2f(row[s + t]);
+        blk[j] = f2h(a);
+    }
+}
+static int g_bop_line = 1;   /* tests: 0 = the shared-memory kernel */
+extern "C" void nn_aug_bop_line(int on) { g_bop_line = on; }
+/* tests / tuning: ms of one pass of a taps-wide operator over a P^3 window: out[0] z shared-memory (0 above its default shared-memory
+   limit), [1] z line, [2] y shared, [3] y line, [4] x one row a block, [5] x rows + table */
+extern "C" void nn_aug_bop_bench(int P, int taps, double *out) {
+    const size_t P2 = (size_t)P * P, p3 = P2 * P; __half *F; scan_bop *bd, *bh = (scan_bop *)calloc(1, sizeof *bh); float *uw; uint16_t *ui; int *nu;
+    CK(cudaMalloc(&F, p3 * 2)); CK(cudaMalloc(&bd, sizeof *bd)); CK(cudaMemset(F, 0, p3 * 2));
+    CK(cudaMalloc(&uw, BOP_UNIQ * SA_MAXTAP * 4)); CK(cudaMalloc(&ui, SA_MAXP * 2)); CK(cudaMalloc(&nu, 4));
+    for (int i = 0; i < P; i++) { int s0 = i - taps / 2, n = taps; if (s0 < 0) { n += s0; s0 = 0; } if (s0 + n > P) n = P - s0; bh->s[i] = s0; bh->n[i] = n; for (int k = 0; k < n; k++) bh->w[i][k] = 1.f / n; }
+    bh->P = P; CK(cudaMemcpy(bd, bh, sizeof *bh, cudaMemcpyHostToDevice)); CK(cudaDeviceSynchronize());
+    const int R = 16384 / P < 1 ? 1 : 16384 / P;
+    for (int m = 0; m < 6; m++) {
+        double best = 1e30;
+        for (int r = 0; r < 4; r++) {
+            CK(cudaDeviceSynchronize()); timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
+            if (m == 4) aug_bop_x_k<<<(unsigned)P2, 128, (size_t)P * 4>>>(F, bd, P);
+            else if (m == 5) { aug_bop_uniq_k<<<1, 1>>>(bd, P, uw, ui, nu); aug_bop_xu_k<<<nblk(P2, R), 256, (size_t)R * P * 2>>>(F, bd, P, R, uw, ui, nu); }
+            else if (m & 1) aug_bop_line_k<<<nblk(P2, 128), 128>>>(F, bd, P, m / 2);
+            else if ((size_t)P * 32 * 2 <= 48 * 1024) aug_bop_zy_k<<<dim3(nblk(P, 32), P), dim3(32, 8), (size_t)P * 32 * 2>>>(F, bd, P, m / 2);
+            KCHECK(); CK(cudaDeviceSynchronize()); clock_gettime(CLOCK_MONOTONIC, &t1);
+            const double ms = (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) * 1e-6; if (ms < best) best = ms;
+        }
+        out[m] = best;
+    }
+    cudaFree(F); cudaFree(bd); cudaFree(uw); cudaFree(ui); cudaFree(nu); free(bh);
+}
 __global__ void aug_point_k(__half *F, const scan_plan *p, int P, int what) {   /* what: 0 bias, 1 radial, 2 slice */
     const size_t P2 = (size_t)P * P, n = P2 * P, k = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     if (k >= n) return;
@@ -127,6 +220,37 @@ __global__ void aug_cnoise_yz_k(__half *F, const scan_plan *p, int P, int z, con
         pl[i] = f2h(h2f(pl[i]) + s0 * vz);
     }
 }
+static int g_cn_z = -1;   /* planes per chunk (-1: what the chunk buffer holds; 0: the per-plane kernels; tests) */
+/* the same in chunks of planes [z0, z0 + nzc) (one kernel pair per plane ran 2 P launches of P threads each: 577 ms of a P 1024 window,
+   the card nearly idle): the x recurrences of nzc P rows at once, then y per (plane, column), then z per (y, x) through the chunk with
+   the carried plane PP. Each element's operations and their order are the per-plane kernels'. S: nzc P^2 floats */
+__global__ void aug_cnoise_x_ck(const scan_plan *p, int P, int z0, int nzc, uint64_t q0, float *S) {
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= nzc * P) return;
+    const int zr = t / P, y = t % P, z = z0 + zr;
+    const float rho = p->cnoise_rho, scale = sqrtf(1.f - rho * rho); const uint64_t hp = (uint64_t)(P + 1) / 2, qr = q0 + ((uint64_t)z * P + y) * hp;
+    float last = 0; float *row = S + ((size_t)zr * P + y) * P;
+    for (int x = 0; x < P; x++) { const float g = gauss_at(p->ns, qr, x), vx = x ? rho * last + scale * g : g; last = vx; row[x] = vx; }
+}
+__global__ void aug_cnoise_y_ck(const scan_plan *p, int P, int nzc, float *S) {
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= nzc * P) return;
+    const int zr = t / P, x = t % P;
+    const float rho = p->cnoise_rho, scale = sqrtf(1.f - rho * rho);
+    float prev = 0; float *col = S + (size_t)zr * P * P + x;
+    for (int y = 0; y < P; y++) { const float vx = col[(size_t)y * P], vy = y ? rho * prev + scale * vx : vx; prev = vy; col[(size_t)y * P] = vy; }
+}
+__global__ void aug_cnoise_z_ck(__half *F, const scan_plan *p, int P, int z0, int nzc, const float *S, float *PP) {
+    const size_t P2 = (size_t)P * P, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= P2) return;
+    const float rho = p->cnoise_rho, scale = sqrtf(1.f - rho * rho), s0 = p->cnoise_s0;
+    float pz = z0 ? PP[i] : 0.f;
+    for (int zr = 0; zr < nzc; zr++) {
+        const int z = z0 + zr; const float vy = S[(size_t)zr * P2 + i], vz = z ? rho * pz + scale * vy : vy; pz = vz;
+        __half *f = F + (size_t)z * P2 + i; *f = f2h(h2f(*f) + s0 * vz);
+    }
+    PP[i] = pz;
+}
 /* paganin's two-sided exponential along axis 0 or 1: one thread per line (u, x), coalesced across x */
 __global__ void aug_exp_zy_k(__half *F, int P, int axis, float a) {
     const size_t P2 = (size_t)P * P, t = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
@@ -137,20 +261,20 @@ __global__ void aug_exp_zy_k(__half *F, int P, int axis, float a) {
     for (int i = 1; i < P; i++) { const size_t j = base + i * st; y = b * h2f(F[j]) + a * y; F[j] = f2h(y); }
     for (int i = P - 2; i >= 0; i--) { const size_t j = base + i * st; y = b * h2f(F[j]) + a * y; F[j] = f2h(y); }
 }
-/* along the contiguous axis: 32 rows per block in shared memory (as floats in the passes), one thread per row */
-__global__ void aug_exp_x_k(__half *F, int P, float a) {
+/* along the contiguous axis: R rows per block (32, fewer when 32 P floats pass the 96 KB of shared memory: P > 768) in shared memory (as floats in the passes), one thread per row */
+__global__ void aug_exp_x_k(__half *F, int P, float a, int R) {
     extern __shared__ float shf[];
-    const size_t r0 = (size_t)blockIdx.x * 32, nrow = (size_t)P * P;
-    for (int j = threadIdx.x; j < 32 * P; j += blockDim.x) { const size_t r = r0 + j / P; shf[j] = r < nrow ? h2f(F[r0 * P + j]) : 0.f; }
+    const size_t r0 = (size_t)blockIdx.x * R, nrow = (size_t)P * P;
+    for (int j = threadIdx.x; j < R * P; j += blockDim.x) { const size_t r = r0 + j / P; shf[j] = r < nrow ? h2f(F[r0 * P + j]) : 0.f; }
     __syncthreads();
-    if (threadIdx.x < 32 && r0 + threadIdx.x < nrow) {
+    if (threadIdx.x < R && r0 + threadIdx.x < nrow) {
         float *v = shf + (size_t)threadIdx.x * P; const float b = 1 - a;
         float y = b * v[0] + a * v[0]; v[0] = y;
         for (int i = 1; i < P; i++) { y = b * v[i] + a * y; v[i] = y; }
         for (int i = P - 2; i >= 0; i--) { y = b * v[i] + a * y; v[i] = y; }
     }
     __syncthreads();
-    for (int j = threadIdx.x; j < 32 * P; j += blockDim.x) { const size_t r = r0 + j / P; if (r < nrow) F[r0 * P + j] = f2h(shf[j]); }
+    for (int j = threadIdx.x; j < R * P; j += blockDim.x) { const size_t r = r0 + j / P; if (r < nrow) F[r0 * P + j] = f2h(shf[j]); }
 }
 /* GIN's output at (z, y, x): the normalised CT's k^3 neighbourhood (edges replicated); plane z - 1 from prevp when given (its
    original values, the plane itself already blended) */
@@ -337,13 +461,21 @@ __global__ void aug_ntab_k(float *t) {   /* sample.c ntab_init: the normal quant
     if (i < 65536) t[i] = (float)normcdfinv((i + 0.5) / 65536.0);
 }
 
+/* the staging buffer's reuse between the calls of one batch upload: aug_dev.key is the pinned host plane whose bytes it holds unchanged
+   (nullptr: none). train calls nn_aug_stage_reset before each batch's uploads (the sampler reuses its host planes for later batches) */
+static int g_lw_ref = 0;
+extern "C" void nn_label_warp_ref(int on) { g_lw_ref = on; }   /* tests: the reference kernels (double atan2 everywhere, the ink plane written first, no reuse) */
+extern "C" void nn_aug_stage_reset(void) { int dv = 0; cudaGetDevice(&dv); g_ad[dv & 7].key = nullptr; }
 static aug_dev *aug_get(int P, int ns) {   /* ns: the staging buffer in P^3 bytes (1 the CT, 2 with the labels) */
     int dv = 0; cudaGetDevice(&dv); aug_dev *a = &g_ad[dv & 7];
     const size_t p3 = (size_t)P * P * P, p2 = (size_t)P * P;
-    if (a->stage_n < ns * p3) { if (a->stage) { CK(cudaDeviceSynchronize()); cudaFree(a->stage); } CK(cudaMalloc(&a->stage, ns * p3)); a->stage_n = ns * p3; }
+    if (a->stage_n < ns * p3) { a->key = nullptr; if (a->stage) { CK(cudaDeviceSynchronize()); cudaFree(a->stage); } CK(cudaMalloc(&a->stage, ns * p3)); a->stage_n = ns * p3; }
     if (a->pl_n < p2) { for (int i = 0; i < 4; i++) { if (a->pl[i]) cudaFree(a->pl[i]); CK(cudaMalloc(&a->pl[i], p2 * sizeof(float))); } a->pl_n = p2; }
+    { const size_t zc = AUG_CN_BYTES / (p2 * sizeof(float)) < 1 ? 1 : AUG_CN_BYTES / (p2 * sizeof(float)), want = (zc < (size_t)P ? zc : (size_t)P) * p2;
+      if (a->cn_n < want) { if (a->cn) { CK(cudaDeviceSynchronize()); cudaFree(a->cn); } CK(cudaMalloc(&a->cn, want * sizeof(float))); a->cn_n = want; } }
     if (!a->plan) {
         CK(cudaMalloc(&a->plan, sizeof(scan_plan))); CK(cudaMalloc(&a->rec, sizeof(scan_ct_rec)));
+        CK(cudaMalloc(&a->uw, 64 * SA_MAXTAP * sizeof(float))); CK(cudaMalloc(&a->ui, SA_MAXP * sizeof(uint16_t))); CK(cudaMalloc(&a->nu, sizeof(int)));
         CK(cudaMalloc(&a->dsc, 2 * sizeof(double))); CK(cudaMalloc(&a->usc, 4 * sizeof(unsigned long long)));
         CK(cudaMalloc(&a->hcnt, 256 * sizeof(unsigned))); CK(cudaMalloc(&a->hm, 257 * sizeof(float))); CK(cudaMalloc(&a->scal, 4 * sizeof(float)));
         CK(cudaMalloc(&a->ntab, 65536 * sizeof(float))); aug_ntab_k<<<256, 256>>>(a->ntab); KCHECK(); CK(cudaDeviceSynchronize());
@@ -353,7 +485,8 @@ static aug_dev *aug_get(int P, int ns) {   /* ns: the staging buffer in P^3 byte
     }
     return a;
 }
-extern "C" size_t nn_aug_device_bytes(int P) { const size_t p3 = (size_t)P * P * P; return p3 + 4 * (size_t)P * P * 4 + sizeof(scan_plan) + sizeof(scan_ct_rec) + 65536 * 4 + 8192; }
+extern "C" void nn_aug_cnoise_chunk(int nz) { g_cn_z = nz; }
+extern "C" size_t nn_aug_device_bytes(int P) { const size_t p3 = (size_t)P * P * P, p2 = (size_t)P * P, zc = AUG_CN_BYTES / (p2 * 4) < 1 ? 1 : AUG_CN_BYTES / (p2 * 4); return p3 + 4 * p2 * 4 + (zc < (size_t)P ? zc : (size_t)P) * p2 * 4 + sizeof(scan_plan) + sizeof(scan_ct_rec) + 65536 * 4 + 8192; }
 extern "C" size_t nn_label_warp_device_bytes(int P) { return (size_t)P * P * P + 2048; }   /* --gpu-aug 2: the second P^3 of staging, the tables */
 
 /* the scanner ops of rec_h's plan on F (P^3 16-bit, the input bytes loaded), the stream s */
@@ -362,25 +495,44 @@ static void aug_scan(aug_dev *a, const scan_plan *p, int P, __half *F, cudaStrea
     const uint64_t hp = (uint64_t)(P + 1) / 2; uint64_t q = 0;   /* the noise stream's calls so far */
     scan_plan *pd = a->plan;
     aug_load_k<<<nb, 256, 0, s>>>(a->stage, F, p3, (on & 1u << SA_AIR) != 0, p->air_level);
-    if (p->bop_on[0]) aug_bop_zy_k<<<dim3(nblk(P, 32), P), dim3(32, 8), (size_t)P * 32 * 2, s>>>(F, &pd->bop[0], P, 0);
-    if (p->bop_on[1]) aug_bop_zy_k<<<dim3(nblk(P, 32), P), dim3(32, 8), (size_t)P * 32 * 2, s>>>(F, &pd->bop[1], P, 1);
-    if (p->bop_on[2]) aug_bop_x_k<<<(unsigned)P2, 128, (size_t)P * 4, s>>>(F, &pd->bop[2], P);
+    for (int ax = 0; ax < 2; ax++) if (p->bop_on[ax]) {
+        if (g_bop_line && bop_ring_ok(&p->bop[ax], P)) aug_bop_line_k<<<nblk(P2, 128), 128, 0, s>>>(F, &pd->bop[ax], P, ax);
+        else aug_bop_zy_k<<<dim3(nblk(P, 32), P), dim3(32, 8), (size_t)P * 32 * 2, s>>>(F, &pd->bop[ax], P, ax);
+    }
+    if (p->bop_on[2]) {
+        const int R = 16384 / P < 1 ? 1 : 16384 / P;   /* 32 KB of halves */
+        if (g_bop_line) { aug_bop_uniq_k<<<1, 1, 0, s>>>(&pd->bop[2], P, a->uw, a->ui, a->nu); aug_bop_xu_k<<<nblk(P2, R), 256, (size_t)R * P * 2, s>>>(F, &pd->bop[2], P, R, a->uw, a->ui, a->nu); }
+        else aug_bop_x_k<<<(unsigned)P2, 128, (size_t)P * 4, s>>>(F, &pd->bop[2], P);
+    }
+    nn_ptick_fine("      y load + blur ops");
     if (on & 1u << SA_BIAS) aug_point_k<<<nb, 256, 0, s>>>(F, pd, P, 0);
     if (on & (1u << SA_RING | 1u << SA_CUPPING)) aug_point_k<<<nb, 256, 0, s>>>(F, pd, P, 1);
     if (on & 1u << SA_SLICE) aug_point_k<<<nb, 256, 0, s>>>(F, pd, P, 2);
+    nn_ptick_fine("      y point ops");
     if (on & 1u << SA_NOISE) { aug_noise_k<<<nb, 256, 0, s>>>(F, pd, P, q); q += P2 * hp; }
+    nn_ptick_fine("      y noise");
     if (on & 1u << SA_CNOISE) {
-        for (int z = 0; z < P; z++) {
+        const int zmax = (int)(a->cn_n / P2), zc = g_cn_z < 0 || g_cn_z > zmax ? zmax : g_cn_z;
+        if (zc >= 1) for (int z = 0; z < P; z += zc) {
+            const int nzc = z + zc < P ? zc : P - z;
+            aug_cnoise_x_ck<<<nblk((size_t)nzc * P, 64), 64, 0, s>>>(pd, P, z, nzc, q, a->cn);
+            aug_cnoise_y_ck<<<nblk((size_t)nzc * P, 64), 64, 0, s>>>(pd, P, nzc, a->cn);
+            aug_cnoise_z_ck<<<nblk(P2, 256), 256, 0, s>>>(F, pd, P, z, nzc, a->cn, a->pl[1]);
+        }
+        else for (int z = 0; z < P; z++) {
             aug_cnoise_x_k<<<nblk(P, 64), 64, 0, s>>>(pd, P, z, q, a->pl[0]);
             aug_cnoise_yz_k<<<nblk(P, 64), 64, 0, s>>>(F, pd, P, z, a->pl[0], a->pl[1]);
         }
         q += P2 * hp;
     }
+    nn_ptick_fine("      y correlated noise");
     if (on & 1u << SA_PAGANIN) {
         aug_exp_zy_k<<<nblk(P2, 128), 128, 0, s>>>(F, P, 0, p->pag_a);
         aug_exp_zy_k<<<nblk(P2, 128), 128, 0, s>>>(F, P, 1, p->pag_a);
-        aug_exp_x_k<<<nblk(P2, 32), 256, (size_t)32 * P * 4, s>>>(F, P, p->pag_a);
+        const int R = 32 * P * 4 <= 96 * 1024 ? 32 : 96 * 1024 / (P * 4);
+        aug_exp_x_k<<<nblk(P2, R), 256, (size_t)R * P * 4, s>>>(F, P, p->pag_a, R);
     }
+    nn_ptick_fine("      y paganin");
     if (on & 1u << SA_GIN) {
         CK(cudaMemsetAsync(a->dsc, 0, 2 * sizeof(double), s)); CK(cudaMemsetAsync(a->usc, 0, sizeof(unsigned long long), s));
         aug_gin_stats_k<<<nb, 256, 0, s>>>(F, a->stage, pd, P, a->dsc, a->usc);
@@ -391,6 +543,7 @@ static void aug_scan(aug_dev *a, const scan_plan *p, int P, __half *F, cudaStrea
             aug_gin3_b_k<<<nblk(P2, 256), 256, 0, s>>>(F, pd, P, z, a->pl[3], a->pl[2], a->scal);
         }
     }
+    nn_ptick_fine("      y gin");
     for (int i = 0; i < p->ndrop; i++) {
         const int z = p->drop_z[i], mode = p->drop_mode[i];
         aug_plane_k<<<nblk(P2, 256), 256, 0, s>>>(F, pd, P, z, z ? z - 1 : 1, mode, q);
@@ -401,6 +554,7 @@ static void aug_scan(aug_dev *a, const scan_plan *p, int P, __half *F, cudaStrea
         if (n) aug_cut_k<<<nblk(n, 256), 256, 0, s>>>(F, pd, P, i, q);
         if (p->cut_noisy[i]) q += (uint64_t)(b1[0] - b0[0]) * (b1[1] - b0[1]) * hp;
     }
+    nn_ptick_fine("      y planes + cuts");
     if (p->hist_on) {
         if (p->tone) aug_lut_k<<<nb, 256, 0, s>>>(F, pd->lut, p3);
         CK(cudaMemsetAsync(a->hcnt, 0, 256 * sizeof(unsigned), s)); CK(cudaMemsetAsync(a->usc + 3, 0, sizeof(unsigned long long), s));
@@ -408,6 +562,7 @@ static void aug_scan(aug_dev *a, const scan_plan *p, int P, __half *F, cudaStrea
         aug_hist_map_k<<<1, 1, 0, s>>>(a->hcnt, a->usc, pd, a->hm);
         aug_hist_apply_k<<<nb, 256, 0, s>>>(F, a->hm, pd, p3);
     }
+    nn_ptick_fine("      y tone + histogram");
     CK(cudaMemsetAsync(a->usc + 1, 0, 2 * sizeof(unsigned long long), s));
     aug_final_k<<<nb, 256, 0, s>>>(F, a->stage, pd, P, a->usc);
 }
@@ -420,17 +575,21 @@ extern "C" void nn_aug_ct(const uint8_t *ct8_h, const void *rec_h_, const void *
     cudaStream_t s = on_copy_stream ? copy_stream() : 0;
     const size_t p3 = (size_t)P * P * P;
     if (a->used) CK(cudaStreamWaitEvent(s, a->done, 0));
-    CK(cudaMemcpyAsync(a->stage, ct8_h, p3, cudaMemcpyHostToDevice, s));
+    if (a->key != ct8_h) CK(cudaMemcpyAsync(a->stage, ct8_h, p3, cudaMemcpyHostToDevice, s));   /* (else: staged by nn_ink_bits just before) */
+    a->key = nullptr;   /* (the scanner operators write their bytes back into the staging buffer) */
     CK(cudaMemcpyAsync(a->rec, rec_h, offsetof(scan_ct_rec, plan), cudaMemcpyHostToDevice, s));
+    nn_ptick_fine("    x ct bytes h2d");
     if (rec_h->scan) {
         CK(cudaMemcpyAsync(a->plan, &rec_h->plan, sizeof(scan_plan), cudaMemcpyHostToDevice, s));
         aug_scan(a, &rec_h->plan, P, (__half *)ct16, s);   /* (the CT channel's buffer as the work volume) */
+        nn_ptick_fine("    x ct scan aug");
     } else {
         CK(cudaMemsetAsync(a->usc + 1, 0, 2 * sizeof(unsigned long long), s));
         aug_sums_k<<<nblk(p3, 256), 256, 0, s>>>(a->stage, p3, a->usc);
     }
     aug_norm_k<<<1, 1, 0, s>>>(a->usc, p3, a->rec, a->scal);
     aug_write_k<<<nblk(p3, 256), 256, 0, s>>>(a->stage, P, (const float *)rad_d, a->rec, a->scal, a->ntab, ct16);
+    nn_ptick_fine("    x ct sums + write");
     CK(cudaEventRecord(a->done, s)); a->used = 1;
     KCHECK();
 }
@@ -444,11 +603,16 @@ static __device__ __forceinline__ float fa(float a, float b) { return __fadd_rn(
 static __device__ __forceinline__ float fs(float a, float b) { return __fsub_rn(a, b); }
 /* the source position of output voxel k (sample.c spatial_aug_pull through the symmetry, as write_spatial_tm's fast path): base corner
    index, fractions; 0 outside */
+/* voxel k's (z, y, x): 32-bit divisions where the index allows (P <= 1625; a 64-bit division costs several times more per voxel) */
+static __device__ __forceinline__ void lw_zyx(size_t k, int P, int io[3]) {
+    if (k >> 32) { const size_t P2 = (size_t)P * P; io[0] = (int)(k / P2); io[1] = (int)(k / P % P); io[2] = (int)(k % P); return; }
+    const unsigned ku = (unsigned)k, P2 = (unsigned)P * (unsigned)P, z = ku / P2, r = ku - z * P2, y = r / (unsigned)P;
+    io[0] = (int)z; io[1] = (int)y; io[2] = (int)(r - y * (unsigned)P);
+}
 static __device__ __forceinline__ int lw_coords(const float *rad, int P, size_t k, size_t *b0, float F[3]) {
     const int32_t *h = (const int32_t *)rad; const int sb = h[5], affine = h[6] >> 1 & 1;
     const int perm[3] = {sb & 3, sb >> 2 & 3, sb >> 4 & 3}, flip[3] = {sb >> 8 & 1, sb >> 9 & 1, sb >> 10 & 1};
-    const size_t P2 = (size_t)P * P;
-    const int io[3] = {(int)(k / P2), (int)(k / P % P), (int)(k % P)};
+    int io[3]; lw_zyx(k, P, io);
     const float *tb = rad + 8 + 2 * (size_t)P, *R = tb + 6 * (size_t)P, *A = R + 9; const float sc = R[27];
     const float c = .5f * (P - 1);
     float vt[3]; for (int d = 0; d < 3; d++) vt[d] = fs(fs((float)io[d], c), tb[d * P + io[d]]);
@@ -471,7 +635,16 @@ static __device__ __forceinline__ float lw_w(const float F[3], int cn) {   /* co
     return fm(fm(bz ? F[0] : fs(1.f, F[0]), by ? F[1] : fs(1.f, F[1])), bx ? F[2] : fs(1.f, F[2]));
 }
 static __device__ __forceinline__ size_t lw_off(int P, int cn) { return ((size_t)(cn >> 2) * P + (cn >> 1 & 1)) * P + (cn & 1); }
-static __device__ __forceinline__ uint8_t lw_code(float sx, float sy) {   /* sample.c warp_code_of */
+/* ref 0: the single-precision atan2 decides wherever its t is more than 2e-3 from a rounding boundary (its error in t is < 1e-4: a few
+   ulp of pi times 40, plus the product's); the double one, 1 voxel in 250, only at the boundaries. The same codes as ref 1 (tests), at
+   a fraction of the time: double precision runs at 1 / 64 of the single rate on these cards */
+template <int REF> static __device__ __forceinline__ uint8_t lw_code(float sx, float sy) {   /* sample.c warp_code_of */
+    if (!REF) {
+        float tf = atan2f(sy, sx) * (float)(LW_PERIOD / (2 * 3.14159265358979323846));
+        if (tf < 0) tf += (float)LW_PERIOD;
+        const float fr = tf - floorf(tf);
+        if (fabsf(fr - .5f) > 2e-3f && tf == tf) { const int q = (int)(tf + .5f); return (uint8_t)(q >= LW_PERIOD ? q - LW_PERIOD : q); }
+    }
     float t = fm((float)atan2((double)sy, (double)sx), (float)(LW_PERIOD / (2 * 3.14159265358979323846)));
     if (t < 0) t = fa(t, (float)LW_PERIOD);
     const int q = __float2int_rn(t); return (uint8_t)(q >= LW_PERIOD ? q - LW_PERIOD : q);
@@ -489,7 +662,7 @@ __global__ void lw_tm_k(const uint8_t *src, uint8_t *dst, uint8_t *pm, int P, co
     dst[k] = (uint8_t)(t | (ok ? 4 : 0)); if (pm) pm[k] = (uint8_t)ok;
 }
 /* the phase (circular mean of the known corners' codes) */
-__global__ void lw_phase_k(const uint8_t *src, uint8_t *dst, int P, const float *rad, const float *cs, const float *sn) {
+template <int REF> __global__ void lw_phase_k(const uint8_t *src, uint8_t *dst, int P, const float *rad, const float *cs, const float *sn) {
     const size_t n = (size_t)P * P * P, k = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     if (k >= n) return;
     size_t b0; float F[3]; uint8_t out = LW_UNKNOWN;
@@ -500,13 +673,13 @@ __global__ void lw_phase_k(const uint8_t *src, uint8_t *dst, int P, const float 
             if (!(w > 1e-7f) || p >= LW_PERIOD) continue;
             sx = fa(sx, fm(w, cs[p])); sy = fa(sy, fm(w, sn[p])); wk = fa(wk, w);
         }
-        if (!(wk < .5f || fa(fm(sx, sx), fm(sy, sy)) < 1e-8f)) out = lw_code(sx, sy);
+        if (!(wk < .5f || fa(fm(sx, sx), fm(sy, sy)) < 1e-8f)) out = lw_code<REF>(sx, sy);
     }
     dst[k] = out;
 }
 /* the winding mod 4 and its component: the nearest corner's component (fraction >= .5), the circular mean over the corners of that
    component; 255 / 255 else */
-__global__ void lw_w4_k(const uint8_t *w4, const uint8_t *cp, uint8_t *dw, uint8_t *dc, int P, const float *rad, const float *cs, const float *sn) {
+template <int REF> __global__ void lw_w4_k(const uint8_t *w4, const uint8_t *cp, uint8_t *dw, uint8_t *dc, int P, const float *rad, const float *cs, const float *sn) {
     const size_t n = (size_t)P * P * P, k = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     if (k >= n) return;
     size_t b0; float F[3]; uint8_t ow = 255, oc = 255;
@@ -519,14 +692,19 @@ __global__ void lw_w4_k(const uint8_t *w4, const uint8_t *cp, uint8_t *dw, uint8
                 if (!(w > 1e-7f) || cp[j] != c0 || q >= LW_PERIOD) continue;
                 sx = fa(sx, fm(w, cs[q])); sy = fa(sy, fm(w, sn[q])); wk = fa(wk, w);
             }
-            if (!(wk < .5f || fa(fm(sx, sx), fm(sy, sy)) < 1e-8f)) { ow = lw_code(sx, sy); oc = (uint8_t)c0; }
+            if (!(wk < .5f || fa(fm(sx, sx), fm(sy, sy)) < 1e-8f)) { ow = lw_code<REF>(sx, sy); oc = (uint8_t)c0; }
         }
     }
     dw[k] = ow; dc[k] = oc;
 }
 /* the ink plane (train --ink-head, prob254, 255 unknown): trilinear over the corners when every corner of weight > 1e-7 is known, else
    unknown; outside unknown (sample.c sample_warp_ink) */
-__global__ void lw_ink_k(const uint8_t *src, uint8_t *dst, int P, const float *rad) {
+/* bits (optional, --rv ink bits): src is the CT bytes and the plane's value is ink_val's, taken at the corners (= ink_bits_k's plane, without
+   writing it: the staged CT bytes stay as nn_aug_ct needs them) */
+static __device__ __forceinline__ int ink_val(const uint8_t *src, const uint8_t *bits, int it, size_t j) {
+    return !bits ? src[j] : bits[j >> 3] >> (j & 7) & 1 ? (it <= 255 && src[j] >= it ? 254 : 0) : 255;
+}
+__global__ void lw_ink_k(const uint8_t *src, uint8_t *dst, int P, const float *rad, const uint8_t *bits = nullptr, int it = 0) {
     const size_t n = (size_t)P * P * P, k = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     if (k >= n) return;
     size_t b0; float F[3]; uint8_t out = 255;
@@ -535,7 +713,7 @@ __global__ void lw_ink_k(const uint8_t *src, uint8_t *dst, int P, const float *r
         for (int cn = 0; cn < 8; cn++) {
             const float w = lw_w(F, cn);
             if (!(w > 1e-7f)) continue;
-            const int q = src[b0 + lw_off(P, cn)];
+            const int q = ink_val(src, bits, it, b0 + lw_off(P, cn));
             if (q == 255) { ok = 0; break; }
             acc = fa(acc, fm(w, (float)q));
         }
@@ -552,15 +730,95 @@ extern "C" void nn_label_warp(int kind, const uint8_t *a_h, const uint8_t *b_h, 
     cudaStream_t s = on_copy_stream ? copy_stream() : 0;
     const size_t p3 = (size_t)P * P * P;
     if (!a->cssn) { CK(cudaMalloc(&a->cssn, 2 * 256 * sizeof(float))); CK(cudaMemcpy(a->cssn, cs_h, LW_PERIOD * sizeof(float), cudaMemcpyHostToDevice));
-                    CK(cudaMemcpy(a->cssn + 256, sn_h, LW_PERIOD * sizeof(float), cudaMemcpyHostToDevice)); }
+                    CK(cudaMemcpy(a->cssn + 256, sn_h, LW_PERIOD * sizeof(float), cudaMemcpyHostToDevice));
+                    CK(cudaStreamSynchronize(0)); }   /* (once: a pageable upload of <= 64 KB is only staged on return, its device write queued on the default stream; the kernels below may run on the copy stream) */
     if (a->used) CK(cudaStreamWaitEvent(s, a->done, 0));
     CK(cudaMemcpyAsync(a->stage, a_h, p3, cudaMemcpyHostToDevice, s));
     if (kind == 2) CK(cudaMemcpyAsync(a->stage + p3, b_h, p3, cudaMemcpyHostToDevice, s));
+    nn_ptick_fine("      y label h2d");
     const unsigned nb = nblk(p3, 256); const float *rad = (const float *)rad_d;
     if (kind == 0) lw_tm_k<<<nb, 256, 0, s>>>(a->stage, da, db, P, rad);   /* (db: the pmask plane, or nullptr) */
-    else if (kind == 1) lw_phase_k<<<nb, 256, 0, s>>>(a->stage, da, P, rad, a->cssn, a->cssn + 256);
+    else if (kind == 1 && g_lw_ref) lw_phase_k<1><<<nb, 256, 0, s>>>(a->stage, da, P, rad, a->cssn, a->cssn + 256);
+    else if (kind == 1) lw_phase_k<0><<<nb, 256, 0, s>>>(a->stage, da, P, rad, a->cssn, a->cssn + 256);
     else if (kind == 3) lw_ink_k<<<nb, 256, 0, s>>>(a->stage, da, P, rad);   /* (the ink plane) */
-    else lw_w4_k<<<nb, 256, 0, s>>>(a->stage, a->stage + p3, da, db, P, rad, a->cssn, a->cssn + 256);
+    else if (g_lw_ref) lw_w4_k<1><<<nb, 256, 0, s>>>(a->stage, a->stage + p3, da, db, P, rad, a->cssn, a->cssn + 256);
+    else lw_w4_k<0><<<nb, 256, 0, s>>>(a->stage, a->stage + p3, da, db, P, rad, a->cssn, a->cssn + 256);
+    a->key = kind == 1 && !g_lw_ref ? a_h : nullptr;   /* (the phase plane stays staged: nn_w4runs_label's source) */
+    CK(cudaEventRecord(a->done, s)); a->used = 1;
+    KCHECK();
+}
+/* --rv ink bits (sample.h batch.inkb): the papyrus plane known ? (ct8 >= it ? 254 : 0) : 255 on the source grid, in place over the
+   CT bytes (stage), then through the window's warp (lw_ink_k) or its cube symmetry (= sample.c sym_u8) */
+__global__ void ink_bits_k(uint8_t *st, const uint8_t *bits, int it, size_t n) {
+    const size_t k = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (k >= n) return;
+    st[k] = bits[k >> 3] >> (k & 7) & 1 ? (it <= 255 && st[k] >= it ? 254 : 0) : 255;
+}
+__global__ void ink_sym_k(const uint8_t *src, uint8_t *dst, int P, int code, const uint8_t *bits = nullptr, int it = 0) {   /* out[i0 i1 i2] = in[sum_d stride[perm d] (flip d ? P-1-i_d : i_d)]; bits: lw_ink_k's */
+    const size_t n = (size_t)P * P * P, k = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (k >= n) return;
+    int i[3]; lw_zyx(k, P, i);
+    const int64_t stride[3] = {(int64_t)P * P, P, 1};
+    int64_t q = 0;
+    for (int d = 0; d < 3; d++) { const int pd = code >> (2 * d) & 3, fd = code >> (8 + d) & 1; q += stride[pd] * (fd ? P - 1 - i[d] : i[d]); }
+    dst[k] = (uint8_t)ink_val(src, bits, it, (size_t)q);
+}
+/* one window's source-grid label plane through its cube symmetry (symcode: the radial record's h[5]) into da (train --gpu-aug 3 runs
+   slots keep the phase on the source grid) */
+extern "C" void nn_label_sym(const uint8_t *a_h, int symcode, int P, uint8_t *da, int on_copy_stream) {
+    aug_dev *a = aug_get(P, 2);
+    cudaStream_t s = on_copy_stream ? copy_stream() : 0;
+    const size_t p3 = (size_t)P * P * P;
+    if (a->used) CK(cudaStreamWaitEvent(s, a->done, 0));
+    CK(cudaMemcpyAsync(a->stage, a_h, p3, cudaMemcpyHostToDevice, s));
+    nn_ptick_fine("      y label h2d");
+    ink_sym_k<<<nblk(p3, 256), 256, 0, s>>>(a->stage, da, P, symcode);
+    a->key = g_lw_ref ? nullptr : a_h;
+    CK(cudaEventRecord(a->done, s)); a->used = 1;
+    KCHECK();
+}
+/* --gpu-aug 3 runs slots: one window's winding mod 4 and component from its source-grid phase (side_h) and runs (band_w4dev.h w4runs),
+   rebuilt on the device (nn_w4runs_apply, in the staging buffer), then warped (lw_w4_k) or through the symmetry into da / db */
+extern "C" void nn_w4runs_label(const uint8_t *side_h, const void *runs, const void *rad_d, int warped, int symcode, int P, uint8_t *da, uint8_t *db,
+                                const float *cs_h, const float *sn_h, int on_copy_stream) {
+    const w4runs *r = (const w4runs *)runs;
+    cudaStream_t s = on_copy_stream ? copy_stream() : 0;
+    const size_t p3 = (size_t)P * P * P; const unsigned nb = nblk(p3, 256);
+    if (!r->noff) { CK(cudaMemsetAsync(da, 255, p3, s)); CK(cudaMemsetAsync(db, 255, p3, s)); return; }   /* (no winding: unknown) */
+    aug_dev *a = aug_get(P, 2);
+    if (!a->cssn) { CK(cudaMalloc(&a->cssn, 2 * 256 * sizeof(float))); CK(cudaMemcpy(a->cssn, cs_h, LW_PERIOD * sizeof(float), cudaMemcpyHostToDevice));
+                    CK(cudaMemcpy(a->cssn + 256, sn_h, LW_PERIOD * sizeof(float), cudaMemcpyHostToDevice));
+                    CK(cudaStreamSynchronize(0)); }   /* (once: a pageable upload of <= 64 KB is only staged on return, its device write queued on the default stream; the kernels below may run on the copy stream) */
+    if (a->used) CK(cudaStreamWaitEvent(s, a->done, 0));
+    if (a->key != side_h) CK(cudaMemcpyAsync(a->stage, side_h, p3, cudaMemcpyHostToDevice, s));   /* (else: staged by the phase plane's call just before) */
+    a->key = nullptr;
+    nn_ptick_fine("      y label h2d");
+    if (nn_w4runs_apply(a->stage, P, P, P, r->tile, r->ms, r, a->stage, a->stage + p3, (void *)s)) { fprintf(stderr, "nn_w4runs_label: CUDA error\n"); abort(); }
+    nn_ptick_fine("      y w4 runs apply");
+    if (warped && g_lw_ref) lw_w4_k<1><<<nb, 256, 0, s>>>(a->stage, a->stage + p3, da, db, P, (const float *)rad_d, a->cssn, a->cssn + 256);
+    else if (warped) lw_w4_k<0><<<nb, 256, 0, s>>>(a->stage, a->stage + p3, da, db, P, (const float *)rad_d, a->cssn, a->cssn + 256);
+    else { ink_sym_k<<<nb, 256, 0, s>>>(a->stage, da, P, symcode); ink_sym_k<<<nb, 256, 0, s>>>(a->stage + p3, db, P, symcode); }
+    CK(cudaEventRecord(a->done, s)); a->used = 1;
+    KCHECK();
+}
+extern "C" void nn_ink_bits(const uint8_t *ct8_h, const uint8_t *bits_h, int it, const void *rad_d, int warped, int symcode, int P, uint8_t *da, int on_copy_stream) {
+    aug_dev *a = aug_get(P, 2);
+    cudaStream_t s = on_copy_stream ? copy_stream() : 0;
+    const size_t p3 = (size_t)P * P * P; const unsigned nb = nblk(p3, 256);
+    if (a->used) CK(cudaStreamWaitEvent(s, a->done, 0));
+    CK(cudaMemcpyAsync(a->stage, ct8_h, p3, cudaMemcpyHostToDevice, s));
+    CK(cudaMemcpyAsync(a->stage + p3, bits_h, p3 / 8, cudaMemcpyHostToDevice, s));
+    nn_ptick_fine("      y label h2d");
+    if (g_lw_ref) {   /* (tests: the plane written over the CT bytes first) */
+        ink_bits_k<<<nb, 256, 0, s>>>(a->stage, a->stage + p3, it, p3);
+        if (warped) lw_ink_k<<<nb, 256, 0, s>>>(a->stage, da, P, (const float *)rad_d);
+        else ink_sym_k<<<nb, 256, 0, s>>>(a->stage, da, P, symcode);
+        a->key = nullptr;
+    } else {   /* the plane's values taken at the kernels' reads: the CT bytes stay staged for nn_aug_ct, which follows in train's upload */
+        if (warped) lw_ink_k<<<nb, 256, 0, s>>>(a->stage, da, P, (const float *)rad_d, a->stage + p3, it);
+        else ink_sym_k<<<nb, 256, 0, s>>>(a->stage, da, P, symcode, a->stage + p3, it);
+        a->key = ct8_h;
+    }
     CK(cudaEventRecord(a->done, s)); a->used = 1;
     KCHECK();
 }

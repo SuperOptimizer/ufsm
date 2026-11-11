@@ -190,6 +190,16 @@ extern "C" void nn_input_rad(const void *ct16, shape5 xs, const void *rec, void 
 }
 extern "C" void nn_fakeq_w4_2d(float *w, int Co, int Ci, int T, int B) { lp_fakeq_w4(w, Co, Ci, T, B, B); KCHECK(); }
 extern "C" void nn_fakeq_w4(float *w, int Co, int Ci, int T, int Bo, int Bi) { lp_fakeq_w4(w, Co, Ci, T, Bo, Bi); KCHECK(); }
+extern "C" void nn_input_lat(const void *ct16, shape5 xs, const void *rec, void *y) {
+    if (!ISMX(y) || xs.c != 4 || xs.h != xs.w) { fprintf(stderr, "nn_input_lat: an MX input of 4 channels, square planes\n"); abort(); }
+    lp_input_lat(ct16, g_h16 ? 2 : 1, rec, NN_RAD_REC(4 * xs.d), xs.n, xs.d, xs.h, y, ISMX4(y) ? 4 : 8);
+    KCHECK();
+}
+extern "C" void nn_input_latc(const void *ct16, shape5 xs, const void *rec, const float *bas, const float *gain, int C, float step, void *y) {
+    if (!ISMX(y) || xs.c != C + 3 || (xs.c != 16 && xs.c != 32) || xs.h != xs.w) { fprintf(stderr, "nn_input_latc: an MX input of C + 3 = 16 or 32 channels, square planes\n"); abort(); }
+    lp_input_latc(ct16, g_h16 ? 2 : 1, rec, NN_RAD_REC(4 * xs.d), xs.n, xs.d, xs.h, bas, gain, C, step, y, ISMX4(y) ? 4 : 8);
+    KCHECK();
+}
 extern "C" void nn_input_rad_pack(const void *ct16, shape5 xs, const void *rec, void *y) {
     if (!ISMX(y) || xs.c != 8 || xs.h != xs.w) { fprintf(stderr, "nn_input_rad_pack: an MX input of 8 channels, square planes\n"); abort(); }
     lp_input_rad_pack(ct16, g_h16 ? 2 : 1, rec, NN_RAD_REC(2 * xs.d), xs.n, xs.d, xs.h, y, ISMX4(y) ? 4 : 8);
@@ -822,19 +832,28 @@ extern "C" void nn_pred_output(const float *lg, const uint8_t *ct, size_t n, uin
 static int g_pred_iso = 1;   /* predict --iso: outputs only where CT >= this (1: CT > 0) */
 extern "C" void nn_set_pred_iso(int t) { g_pred_iso = t < 1 ? 1 : t; }
 extern "C" int nn_get_pred_iso(void) { return g_pred_iso; }
-template <typename LT> __global__ void pred_place_k(const LT *lg, const uint8_t *ct, int D, int W, int hz, int halo, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh, int iso) {
-    const int I = W - 2 * halo, Iz = D - 2 * hz;   /* a D x W x W window, interior planes [hz, D - hz) */
-    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
-    if (i >= (size_t)Iz * I * I) return;
-    const int x = halo + (int)(i % I), y = halo + (int)((i / I) % I), z = hz + (int)(i / ((size_t)I * I));
+/* the window voxels a place writes: the interior ([hz, D - hz) x [halo, W - halo)^2) inside the shard ([-o, e - o)): lo / n per axis. The
+   place kernels run one thread per voxel of this box (a thread per interior voxel, most of them outside the shard, was 100 ms of a
+   640^3 latent window's 235 with one window per 4^3 shards: 64 launches over 512^3) */
+typedef struct { int z0, y0, x0, nz, ny, nx; } place_box;
+static place_box place_isect(int D, int W, int hz, int halo, int oz, int oy, int ox, int ez, int ey, int ex) {
+    place_box b; const int z1 = min(D - hz, ez - oz), y1 = min(W - halo, ey - oy), x1 = min(W - halo, ex - ox);
+    b.z0 = max(hz, -oz); b.y0 = max(halo, -oy); b.x0 = max(halo, -ox);
+    b.nz = max(z1 - b.z0, 0); b.ny = max(y1 - b.y0, 0); b.nx = max(x1 - b.x0, 0);
+    return b;
+}
+template <typename LT> __global__ void pred_place_k(const LT *lg, const uint8_t *ct, place_box B, int W, int oz, int oy, int ox, int shard, uint8_t *dsh, int iso) {
+    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;   /* a D x W x W window, interior planes [hz, D - hz) */
+    if (i >= (size_t)B.nz * B.ny * B.nx) return;
+    const int x = B.x0 + (int)(i % B.nx), y = B.y0 + (int)((i / B.nx) % B.ny), z = B.z0 + (int)(i / ((size_t)B.ny * B.nx));
     const int gz = oz + z, gy = oy + y, gx = ox + x;
-    if (gz < 0 || gz >= ez || gy < 0 || gy >= ey || gx < 0 || gx >= ex) return;
     const size_t k = ((size_t)z * W + y) * W + x;
     dsh[((size_t)gz * shard + gy) * shard + gx] = ct[k] >= iso ? (uint8_t)(255.f / (1.f + __expf(-lgv(lg, k))) + 0.5f) : 0;
 }
 extern "C" void nn_pred_place_d(const float *lg, const uint8_t *ct, int D, int W, int hz, int halo, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh) {
-    const size_t I = (size_t)(W - 2 * halo), Iz = (size_t)(D - 2 * hz);
-    LGT((pred_place_k<<<nblk(Iz * I * I, 256), 256>>>(lgt, ct, D, W, hz, halo, oz, oy, ox, ez, ey, ex, shard, dsh, g_pred_iso))); KCHECK();
+    const place_box B = place_isect(D, W, hz, halo, oz, oy, ox, ez, ey, ex); const size_t n = (size_t)B.nz * B.ny * B.nx;
+    if (!n) return;
+    LGT((pred_place_k<<<nblk(n, 256), 256>>>(lgt, ct, B, W, oz, oy, ox, shard, dsh, g_pred_iso))); KCHECK();
 }
 extern "C" void nn_pred_place(const float *lg, const uint8_t *ct, int W, int halo, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh) {
     nn_pred_place_d(lg, ct, W, W, halo, halo, oz, oy, ox, ez, ey, ex, shard, dsh);
@@ -851,19 +870,18 @@ __global__ void pred_ctmask_k(const uint8_t *ct, size_t n, uint32_t *bits, int t
 extern "C" void nn_pred_ctmask(const uint8_t *ct, size_t n, uint32_t *bits) { pred_ctmask_k<<<nblk((n + 31) / 32, 256), 256>>>(ct, n, bits, 1); KCHECK(); }
 /* predict --iso: the bit plane of CT >= t (the probability outputs' mask; the fit keeps the material mask of nn_pred_ctmask) */
 extern "C" void nn_pred_ctmask_t(const uint8_t *ct, size_t n, uint32_t *bits, int t) { pred_ctmask_k<<<nblk((n + 31) / 32, 256), 256>>>(ct, n, bits, t < 1 ? 1 : t); KCHECK(); }
-template <typename LT> __global__ void pred_place_m_k(const LT *lg, const uint32_t *bits, int D, int W, int hz, int halo, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh) {
-    const int I = W - 2 * halo, Iz = D - 2 * hz;
+template <typename LT> __global__ void pred_place_m_k(const LT *lg, const uint32_t *bits, place_box B, int W, int oz, int oy, int ox, int shard, uint8_t *dsh) {
     size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
-    if (i >= (size_t)Iz * I * I) return;
-    const int x = halo + (int)(i % I), y = halo + (int)((i / I) % I), z = hz + (int)(i / ((size_t)I * I));
+    if (i >= (size_t)B.nz * B.ny * B.nx) return;
+    const int x = B.x0 + (int)(i % B.nx), y = B.y0 + (int)((i / B.nx) % B.ny), z = B.z0 + (int)(i / ((size_t)B.ny * B.nx));
     const int gz = oz + z, gy = oy + y, gx = ox + x;
-    if (gz < 0 || gz >= ez || gy < 0 || gy >= ey || gx < 0 || gx >= ex) return;
     const size_t k = ((size_t)z * W + y) * W + x;
     dsh[((size_t)gz * shard + gy) * shard + gx] = (bits[k >> 5] >> (k & 31)) & 1u ? (uint8_t)(255.f / (1.f + __expf(-lgv(lg, k))) + 0.5f) : 0;
 }
 extern "C" void nn_pred_place_m_d(const float *lg, const uint32_t *bits, int D, int W, int hz, int halo, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh) {
-    const size_t I = (size_t)(W - 2 * halo), Iz = (size_t)(D - 2 * hz);
-    LGT((pred_place_m_k<<<nblk(Iz * I * I, 256), 256>>>(lgt, bits, D, W, hz, halo, oz, oy, ox, ez, ey, ex, shard, dsh))); KCHECK();
+    const place_box B = place_isect(D, W, hz, halo, oz, oy, ox, ez, ey, ex); const size_t n = (size_t)B.nz * B.ny * B.nx;
+    if (!n) return;
+    LGT((pred_place_m_k<<<nblk(n, 256), 256>>>(lgt, bits, B, W, oz, oy, ox, shard, dsh))); KCHECK();
 }
 extern "C" void nn_pred_place_m(const float *lg, const uint32_t *bits, int W, int halo, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh) {
     nn_pred_place_m_d(lg, bits, W, W, halo, halo, oz, oy, ox, ez, ey, ex, shard, dsh);

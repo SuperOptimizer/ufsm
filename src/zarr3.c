@@ -486,8 +486,30 @@ static void copy_chunk(const job *jb, const work *w, const uint8_t *chunk) {
         }
 }
 
-static int decode_into(const z3 *z, const uint8_t *enc, size_t n, uint8_t *dec, ZSTD_DCtx *dctx, uint8_t *scratch, int *mask, uint32_t submask, uint8_t *dsink, _Atomic uint32_t *dmask, int lean, uint32_t *hsub) {
+/* the window sink of chunk w (volcomp_fast.h): its voxels decoded straight into the request's output, without the 128^3 chunk buffer
+   and copy_chunk (3-8% of a training loader's CPU). Byte 128^3 volcomp chunks of a plain host read only: not z3_read_sub (its other
+   substreams read 0), a device-sink read, the shared decoded-chunk cache or the GPU decoder (they keep whole chunks).
+   UFSM_Z3_SINK=0 turns it off (A/B). 0: no sink */
+static _Atomic uint64_t g_z3_sunk;
+uint64_t z3_sink_chunks(void) { return atomic_load(&g_z3_sunk); }
+static int make_sink(const job *jb, const work *w, vfx_sink *k) {
+    const z3_meta *m = &jb->z->m;
+    if (!option_on("UFSM_Z3_SINK") || jb->submask || jb->dsink || !jb->out || m->esize != 1 || m->q < 0 || m->chunk[0] != 128 || m->chunk[1] != 128 || m->chunk[2] != 128 || zshm_on() || gpudec_enabled()) return 0;
+    const int64_t c0[3] = {w->sz * m->shard[0] + (int64_t)w->cz * 128, w->sy * m->shard[1] + (int64_t)w->cy * 128, w->sx * m->shard[2] + (int64_t)w->cx * 128};
+    for (int i = 0; i < 3; i++) {   /* (copy_chunk's box: the request, the chunk and the array shape) */
+        const int64_t lo = jb->o[i] > c0[i] ? jb->o[i] : c0[i]; int64_t hi = c0[i] + 128;
+        if (hi > m->shape[i]) hi = m->shape[i];
+        if (hi > jb->o[i] + jb->n[i]) hi = jb->o[i] + jb->n[i];
+        k->b0[i] = (int)(lo - c0[i]); k->b1[i] = hi > lo ? (int)(hi - c0[i]) : k->b0[i];
+    }
+    k->out = jb->out; k->ys = (size_t)jb->n[2]; k->zs = (size_t)jb->n[1] * jb->n[2];
+    k->off = (ptrdiff_t)(((c0[0] - jb->o[0]) * jb->n[1] + (c0[1] - jb->o[1])) * jb->n[2] + (c0[2] - jb->o[2]));
+    return 1;
+}
+static int decode_into(const z3 *z, const uint8_t *enc, size_t n, uint8_t *dec, ZSTD_DCtx *dctx, uint8_t *scratch, int *mask, uint32_t submask, uint8_t *dsink, _Atomic uint32_t *dmask, int lean, uint32_t *hsub,
+                       const vfx_sink *k, int *sunk) {
     *hsub = 0xffffffffu;   /* the substreams dec holds (all but for a lean device-sink read) */
+    *sunk = 0;   /* 1: decoded into the sink k (dec untouched) */
     const z3_meta *m = &z->m;
     size_t cv = (size_t)m->chunk[0] * m->chunk[1] * m->chunk[2];
     if (mask) *mask = 0;
@@ -507,6 +529,22 @@ static int decode_into(const z3 *z, const uint8_t *enc, size_t n, uint8_t *dec, 
         uint32_t mode;
         if (mask && vll_chunk_mode(enc, n, &mode) == VOLCOMP_OK) *mask = mode == VLL_MODE_MASK || mode == VLL_MODE_MASK_LL;
         volcomp_status st;
+        if (k && cv == VOLCOMP_CHUNK_VOXELS && vll_chunk_mode(enc, n, &mode) == VOLCOMP_OK && (mode == VLL_MODE_LOSSY || mode == VLL_MODE_CODED || mode == VLL_MODE_CONST)) {
+            const uint32_t subs = vfx_sink_subs(k);   /* (an error: the reference path below, whose status and bytes then hold) */
+            if (mode == VLL_MODE_CONST) {
+                if (n == VF_HDR_BYTES + 1u) {
+                    for (int zz = k->b0[0]; zz < k->b1[0]; zz++) for (int yy = k->b0[1]; yy < k->b1[1]; yy++)
+                        memset(k->out + (k->off + (ptrdiff_t)((size_t)zz * k->zs + (size_t)yy * k->ys) + k->b0[2]), enc[VF_HDR_BYTES], (size_t)(k->b1[2] - k->b0[2]));
+                    *sunk = 1; atomic_fetch_add(&g_z3_sunk, 1); return 0;
+                }
+            } else if (mode == VLL_MODE_LOSSY) {
+                vf_parsed p; if (vf_parse(enc, n, &p) == VOLCOMP_OK && vfx_decode_subs_sink(&p, subs, k) == VOLCOMP_OK) { *sunk = 1; atomic_fetch_add(&g_z3_sunk, 1); return 0; }
+            } else {
+                vll_parsed lp; st = vll_parse(enc, n, &lp);
+                for (uint32_t s = 0; s < VF_NSUB && st == VOLCOMP_OK; s++) if (subs >> s & 1) st = vllx_decode_sub_sink(&lp, s, k);
+                if (st == VOLCOMP_OK) { *sunk = 1; atomic_fetch_add(&g_z3_sunk, 1); return 0; }
+            }
+        }
         const int sub = submask && submask != 0xffffffffu;
         if (cv == VOLCOMP_CHUNK_VOXELS && vll_chunk_mode(enc, n, &mode) == VOLCOMP_OK && mode == VLL_MODE_LOSSY) {
             /* lossy (CT): the substreams asked for (all for a full read), from the shared cache (zshm.h) or decoded by
@@ -802,8 +840,9 @@ static int run_task(job *jb, int task, uint8_t *fetched, uint8_t *dec, uint8_t *
             work *w = &jb->items[i + j]; char item[16]; snprintf(item, sizeof item, "%d", w->ci);
             const uint8_t *enc = group + (size_t)(w->off - rg->off); size_t n = (size_t)w->len;
             cache_put(z, skey, item, enc, n); atomic_fetch_add(&g_z3_store_reads, 1);
-            int msk; uint32_t hs;
-            if (decode_into(z, enc, n, dec, dctx, scratch, &msk, jb->submask ? jb->submask : auto_submask(jb, w), jb->dsink, &jb->dmask, jb->lean, &hs)) { rc = -1; break; }
+            int msk, sunk; uint32_t hs; vfx_sink k; const int hk = make_sink(jb, w, &k);   /* (mask-mode chunks are not sunk: the mask cache still gets them) */
+            if (decode_into(z, enc, n, dec, dctx, scratch, &msk, jb->submask ? jb->submask : auto_submask(jb, w), jb->dsink, &jb->dmask, jb->lean, &hs, hk ? &k : nullptr, &sunk)) { rc = -1; break; }
+            if (sunk) continue;
             if (msk) mc_put(z, w, dec, cv);
             copy_out(jb, w, dec, hs);
         }
@@ -837,9 +876,11 @@ static int run_task(job *jb, int task, uint8_t *fetched, uint8_t *dec, uint8_t *
         }
         cache_put(z, skey, item, b, n);
     }
-    int msk; uint32_t hs; int rc = decode_into(z, b, n, dec, dctx, scratch, &msk, jb->submask ? jb->submask : auto_submask(jb, w), jb->dsink, &jb->dmask, jb->lean, &hs);
+    int msk, sunk; uint32_t hs; vfx_sink k; const int hk = make_sink(jb, w, &k);
+    int rc = decode_into(z, b, n, dec, dctx, scratch, &msk, jb->submask ? jb->submask : auto_submask(jb, w), jb->dsink, &jb->dmask, jb->lean, &hs, hk ? &k : nullptr, &sunk);
     free(b);
     if (rc) return -1;
+    if (sunk) return 0;
     if (msk && mc_on) mc_put(z, w, dec, cv);
     copy_out(jb, w, dec, hs);
     return 0;
@@ -971,6 +1012,37 @@ static void z3_fill(const z3_meta *m, uint8_t *out, size_t nv, int nthreads) {
     }
 }
 static int z3_read_impl(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads, uint32_t submask, uint8_t *dsink, uint32_t *dmask, int lean);
+/* whether any stored chunk intersects the box o + n (sharded arrays: from the shard indices, no chunk read): 1 yes, 0 none (a read
+   would be all fill), -1 error; unsharded arrays: 1 */
+int z3_box_any(z3 *z, const int64_t o[3], const int64_t n[3]) {
+    const z3_meta *m = &z->m;
+    if (!m->sharded) return 1;
+    int64_t lo[3], hi[3], s0[3], s1[3];
+    for (int i = 0; i < 3; i++) {
+        lo[i] = o[i] < 0 ? 0 : o[i]; hi[i] = o[i] + n[i] > m->shape[i] ? m->shape[i] : o[i] + n[i];
+        if (hi[i] <= lo[i]) return 0;
+        s0[i] = lo[i] / m->shard[i]; s1[i] = (hi[i] - 1) / m->shard[i];
+    }
+    ientry *idx = malloc((size_t)z->nc * sizeof *idx); if (!idx) return -1;
+    int any = 0;
+    for (int64_t sz = s0[0]; sz <= s1[0] && !any; sz++) for (int64_t sy = s0[1]; sy <= s1[1] && !any; sy++) for (int64_t sx = s0[2]; sx <= s1[2] && !any; sx++) {
+        char skey[1200]; shard_key(z, sz, sy, sx, skey, sizeof skey);
+        const int present = load_index(z, skey, idx);
+        if (present < 0) { free(idx); return -1; }
+        if (!present) continue;
+        int c0[3], c1[3];
+        for (int i = 0; i < 3; i++) {
+            const int64_t sb = (i == 0 ? sz : i == 1 ? sy : sx) * m->shard[i], a = lo[i] > sb ? lo[i] - sb : 0, b = (hi[i] < sb + m->shard[i] ? hi[i] : sb + m->shard[i]) - sb - 1;
+            c0[i] = (int)(a / m->chunk[i]); c1[i] = (int)(b / m->chunk[i]);
+        }
+        for (int cz = c0[0]; cz <= c1[0] && !any; cz++) for (int cy = c0[1]; cy <= c1[1] && !any; cy++) for (int cx = c0[2]; cx <= c1[2] && !any; cx++) {
+            const ientry *e = &idx[(cz * z->cgrid[1] + cy) * z->cgrid[2] + cx];
+            any = !(e->off == UINT64_MAX && e->len == UINT64_MAX) && e->len;
+        }
+    }
+    free(idx);
+    return any;
+}
 int z3_read(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads) { return z3_read_impl(z, o, n, out, nthreads, 0, nullptr, nullptr, 0); }
 int z3_read_sub(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads, uint32_t submask) { return z3_read_impl(z, o, n, out, nthreads, submask, nullptr, nullptr, 0); }
 static int z3_read_sub_dev_impl(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads, uint32_t submask, uint8_t *dchunk, uint32_t *dev_mask, int lean) {
@@ -985,6 +1057,13 @@ int z3_read_sub_dev(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out,
 }
 int z3_read_sub_dev_lean(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads, uint32_t submask, uint8_t *dchunk, uint32_t *dev_mask) {
     return z3_read_sub_dev_impl(z, o, n, out, nthreads, submask, dchunk, dev_mask, 1);
+}
+/* the fill value over the part of the read box o + n that the array box b0 .. b1 (exclusive) covers (one byte per voxel) */
+static void fill_part(const z3_meta *m, uint8_t *out, const int64_t o[3], const int64_t n[3], const int64_t b0[3], const int64_t b1[3]) {
+    int64_t lo[3], hi[3];
+    for (int i = 0; i < 3; i++) { lo[i] = b0[i] > o[i] ? b0[i] : o[i]; hi[i] = b1[i] < o[i] + n[i] ? b1[i] : o[i] + n[i]; if (hi[i] <= lo[i]) return; }
+    for (int64_t zz = lo[0]; zz < hi[0]; zz++) for (int64_t yy = lo[1]; yy < hi[1]; yy++)
+        memset(out + ((size_t)(zz - o[0]) * n[1] + (size_t)(yy - o[1])) * n[2] + (size_t)(lo[2] - o[2]), m->fill, (size_t)(hi[2] - lo[2]));
 }
 static int z3_read_impl(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads, uint32_t submask, uint8_t *dsink, uint32_t *dmask, int lean) {
     const z3_meta *m = &z->m;
@@ -1018,7 +1097,11 @@ static int z3_read_impl(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *
                 if (m->sharded) {
                     present = load_index(z, skey, idx);
                     if (present < 0) { rc = -1; break; }
-                    if (!present) { if (inside) { z3_fill(m, out, nv, nthreads); inside = 0; } continue; }   /* (a missing shard: filled) */
+                    if (!present) {   /* (a missing shard: filled; inside a sharded array of bytes only its part, else all once) */
+                        if (inside && m->esize == 1) { const int64_t b0[3] = {sz * m->shard[0], sy * m->shard[1], sx * m->shard[2]}, b1[3] = {b0[0] + m->shard[0], b0[1] + m->shard[1], b0[2] + m->shard[2]}; fill_part(m, out, o, n, b0, b1); }
+                        else if (inside) { z3_fill(m, out, nv, nthreads); inside = 0; }
+                        continue;
+                    }
                 }
                 /* inner chunk range within this shard that intersects the box */
                 int c0[3], c1[3];
@@ -1050,7 +1133,14 @@ static int z3_read_impl(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *
             }
     free(idx);
     if (rc) { free(items); return -1; }
-    if (inside) for (int i = 0; i < nitems; i++) if (!items[i].present) { z3_fill(m, out, nv, nthreads); inside = 0; break; }   /* (an absent chunk: filled) */
+    if (inside && m->esize == 1) {   /* (an absent chunk: its part filled, the present ones are copied over theirs: the sparse stored phases hold many) */
+        for (int i = 0; i < nitems; i++) if (!items[i].present) {
+            const work *w = &items[i];
+            const int64_t b0[3] = {w->sz * m->shard[0] + (int64_t)w->cz * m->chunk[0], w->sy * m->shard[1] + (int64_t)w->cy * m->chunk[1], w->sx * m->shard[2] + (int64_t)w->cx * m->chunk[2]};
+            const int64_t b1[3] = {b0[0] + m->chunk[0], b0[1] + m->chunk[1], b0[2] + m->chunk[2]};
+            fill_part(m, out, o, n, b0, b1);
+        }
+    } else if (inside) for (int i = 0; i < nitems; i++) if (!items[i].present) { z3_fill(m, out, nv, nthreads); inside = 0; break; }   /* (an absent chunk: filled) */
     range_work *ranges = nullptr; int nranges = 0;
     /* HTTP sharded reads go through range tasks: neighbouring cold chunks of one shard (file order, gap <= UFSM_Z3_GAP bytes,
        default 64 KiB; span <= UFSM_Z3_SPAN, default 2 MiB) become one request unless UFSM_Z3_COALESCE=0; with UFSM_HTTP_MULTI=1

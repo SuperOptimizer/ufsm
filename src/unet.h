@@ -34,6 +34,9 @@ typedef struct {
     int ds_levels;         /* deep supervision: a 1^3 head (cout outputs) on each decoder level 1..ds_levels (params appended last); a training
                               forward computes their fp32 logits (unet_ds_logits), the trainer's loss gradients come back through
                               unet_set_ds_grad and join each level's gradient before its decoder backward */
+    int lat_guide;         /* latent-grid nets (half_res 3): 5 = the guided head (nn_lat_guide): cout = the task's outputs + 5 coefficient planes; 8 = the general form
+                              (nn_lat_guide4): cout 32, the last 8 are 4 coefficients for each of the 2 guided channels; 64 = the sub-cell head
+                              (nn_lat_shuffle): cout 144, outputs 16 + 64 j + sub are channel j's (the phase / side pair) value at each of the cell's 64 voxels */
     int half_res;          /* the caller runs the network on 2x2x2 blocks of its window (nn_half_*): 1 pool (cin 4, the block means; logits
                               upsampled trilinearly), 2 pack (cin 8: the block means, the CT's sub-voxel gradients and contrast;
                               cout 8 per output, one per sub-voxel); 3 pool4, 4 pack4: the network on 4^3 blocks (a 2x pool / trilinear 2x
@@ -134,6 +137,7 @@ float *unet_grad_ptr(unet *u);                        /* device pointer of the f
 void unet_grad_d2h(unet *u, float *host);
 void unet_grad_h2d(unet *u, const float *host);
 double unet_grad_norm(unet *u);
+uint64_t unet_param_hash(unet *u);
 void unet_clip_grad(unet *u, double max_norm);          /* scales grads if their norm exceeds max_norm */
 void unet_muon(unet *u, float lr_muon, float beta, float lr_adam, float b1, float b2, float eps, float wd, int step);   /* Muon on the 3^3 conv weights, AdamW elsewhere */
 /* Muon variants for unet_muon: muonc = Muon-C (per-frequency polarisation of the conv kernels), hyperball = fixed weight and
@@ -197,6 +201,7 @@ int unet_save(const unet *u, const char *path, int step, const char *extra_json)
 int unet_load(unet *u, const char *path);
 int unet_load_grow(unet *u, const char *path, int keep, float new_bias);   /* warm start into a wider head (src/unet.c) */
 int unet_init_from(unet *u, const char *path);   /* partial warm start: shape-matching layers of another net (src/unet.c) */
+void unet_set_init_shift(int s);   /* the next unet_init_from*: u's level i from the donor's level i + s */
 int unet_init_from_map(unet *u, const char *path, const int *head_rows);   /* the same with an explicit head row map (src/unet.c) */
 /* Retain surface response, zero the new scalar input and winding output,
    including EMA/Adam/Muon state for those parameters. */
@@ -285,6 +290,11 @@ int unet_logits_in_gx(const unet *u);   /* the logits share the head's input-gra
 /* train --gpu-input: the next forwards' 16-bit x is the CT channel alone ([n][S]) and rec (device, n records of NN_RAD_REC(D) bytes, nn.h)
    holds each sample's radial record: the 4 MX input channels are built on the device (nn_input_rad). nullptr: x has all 4 channels */
 void unet_set_input_rad(unet *u, const void *rec);
+/* latent-grid nets (half_res 3) with the learned cell transform (latfit.h): bas [C][64], gain [C], the quantiser step (0: none); cfg.cin = C + 3.
+   Saved in the checkpoint header and set again by unet_load. unet_lat_basis: C (0: plain cell means) and the device copies. */
+void unet_set_lat_basis(unet *u, const float *bas, const float *gain, int C, float step);
+void unet_set_lat_step(unet *u, float step);   /* the next forwards' quantiser step (train --lat-step-jitter); 0: the transform's */
+int unet_lat_basis(const unet *u, const float **bas, const float **gain, float *step);
 int unet_logits_h16(const unet *u);   /* the logits unet_forward returns are fp16 (lean 2 training: the logit gradient fits after them) */
 /* head slabs (training): the forward skips the 1^3 head and allocates no whole-window logits; the caller runs it per z-slab
    (unet_head_fwd_z after the forward), and the backward calls cb(ctx) at the head's step, which runs unet_head_fwd_z, the loss

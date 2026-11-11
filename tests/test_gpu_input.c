@@ -29,6 +29,61 @@ static float axis_rec_err(const uint16_t *t4, int D, int P, const int64_t o[3], 
     return e;
 }
 
+/* train --lat 4: the reference for nn_input_lat: the 4^3 cell means of the host chain's 16-bit channels (fp32 sum in sub-voxel order
+   z, y, x major to minor, times 1/64), rounded to the 16-bit type (xfmt 1 fp16, 2 bf16), then nn_h16_to_mx; compared byte for byte */
+static uint16_t f2h16(float f, int xfmt) {
+    if (xfmt == 1) { _Float16 h = (_Float16)f; uint16_t u; memcpy(&u, &h, 2); return u; }
+    uint32_t u; memcpy(&u, &f, 4); u += 0x7fffu + ((u >> 16) & 1u); return (uint16_t)(u >> 16);
+}
+static float h16f(uint16_t v, int xfmt) { if (xfmt == 1) return h2f(v); uint32_t u = (uint32_t)v << 16; float f; memcpy(&f, &u, 4); return f; }
+static int lat_check(const uint16_t *h4, const void *d_h1, const void *d_rec, int N, int D, int P, int xfmt, int bits) {
+    const int d = D / 4, p = P / 4; const size_t S = (size_t)D * P * P, cv = (size_t)d * p * p;
+    uint16_t *ref = malloc((size_t)N * 4 * cv * 2);
+    for (int n = 0; n < N; n++) for (int c = 0; c < 4; c++) for (size_t v = 0; v < cv; v++) {
+        const int z = (int)(v / ((size_t)p * p)), y = (int)(v / p % p), x = (int)(v % p);
+        float acc = 0.f;
+        for (int k = 0; k < 64; k++) acc += h16f(h4[((size_t)n * 4 + c) * S + ((size_t)(4 * z + (k >> 4)) * P + 4 * y + (k >> 2 & 3)) * P + 4 * x + (k & 3)], xfmt);
+        ref[((size_t)n * 4 + c) * cv + v] = f2h16(acc * (1.f / 64.f), xfmt);
+    }
+    const shape5 cs = {N, 4, d, p, p}; const size_t mb = nn_mx_bytes(cs, bits);
+    void *d_ref = nn_malloc((size_t)N * 4 * cv * 2), *d_a = nn_malloc(mb), *d_b = nn_malloc(mb);
+    nn_set_storage(d_a, mb, bits); nn_set_storage(d_b, mb, bits);
+    nn_h2d(d_ref, ref, (size_t)N * 4 * cv * 2); nn_h16_to_mx(d_ref, cs, d_a); nn_input_lat(d_h1, cs, d_rec, d_b);
+    uint8_t *a = malloc(mb), *b = malloc(mb); nn_d2h(a, d_a, mb); nn_d2h(b, d_b, mb);
+    const int bad = memcmp(a, b, mb) != 0;
+    free(ref); free(a); free(b); nn_free(d_ref); nn_free(d_a); nn_free(d_b);
+    return bad;
+}
+
+/* the learned cell channels (latfit.h): the trainer's kernel (nn_input_latc: CT channel + records -> MX) against predict's (nn_lat_input_x
+   on the 4-channel fp16 window, then nn_h16_to_mx), byte for byte; predict's against a host reference (fp32 sums in another contraction:
+   a coefficient on a rounding tie may land one quantiser level away) */
+static int latc_check(const uint16_t *h4, const void *d_h1, const void *d_rec, int D, int P, int bits, int C, float step) {
+    const int d = D / 4, p = P / 4; const size_t S = (size_t)D * P * P, cv = (size_t)d * p * p;
+    static float bas[29 * 64], gain[29]; static uint64_t rs = 0x1234567887654321ull;
+    for (int c = 0; c < C; c++) { gain[c] = c ? 0.5f + 0.25f * (c % 9) : 0.125f; for (int k = 0; k < 64; k++) { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; bas[c * 64 + k] = c ? (float)((rs >> 40) * (1.0 / 16777216.0) - 0.5) * 0.3f : 0.125f; } }
+    float *d_bas = nn_malloc(sizeof bas), *d_gain = nn_malloc(sizeof gain); nn_h2d(d_bas, bas, sizeof bas); nn_h2d(d_gain, gain, sizeof gain);
+    const shape5 cs = {1, C + 3, d, p, p}; const size_t mb = nn_mx_bytes(cs, bits), nb = (size_t)(C + 3) * cv * 2;
+    void *d_h4 = nn_malloc(4 * S * 2), *d_x = nn_malloc(nb), *d_a = nn_malloc(mb), *d_b = nn_malloc(mb);
+    nn_set_storage(d_a, mb, bits); nn_set_storage(d_b, mb, bits);
+    nn_h2d(d_h4, h4, 4 * S * 2); nn_lat_input_x(d_h4, d, p, p, d_bas, d_gain, C, step, d_x); nn_h16_to_mx(d_x, cs, d_a);
+    nn_input_latc(d_h1, cs, d_rec, d_bas, d_gain, C, step, d_b);
+    uint8_t *a = malloc(mb), *b = malloc(mb); nn_d2h(a, d_a, mb); nn_d2h(b, d_b, mb);
+    int bad = memcmp(a, b, mb) != 0;
+    uint16_t *xh = malloc(nb); nn_d2h(xh, d_x, nb); size_t off = 0, far = 0;
+    for (int c = 0; c < C + 3; c++) for (size_t v = 0; v < cv; v++) {
+        const int z = (int)(v / ((size_t)p * p)), y = (int)(v / p % p), x = (int)(v % p);
+        float sv = 0.f;
+        for (int k = 0; k < 64; k++) { const size_t j = ((size_t)(4 * z + (k >> 4)) * P + 4 * y + (k >> 2 & 3)) * P + 4 * x + (k & 3); sv += (c < C ? bas[c * 64 + k] : 1.f / 64.f) * h2f(h4[(size_t)(c < C ? 0 : 1 + c - C) * S + j]); }
+        if (c < C) { if (step > 0.f) { const float lim = c ? 127.f : 32767.f; sv = fminf(lim, fmaxf(-lim, rintf(sv / step))) * step; } sv *= gain[c]; }
+        const float e = fabsf(h2f(xh[(size_t)c * cv + v]) - sv), tol = 2e-3f * (1.f + fabsf(sv));
+        if (e > tol) { off++; if (!(c < C && step > 0.f && e <= step * gain[c] + tol)) far++; }
+    }
+    if (far || off > (size_t)(C + 3) * cv / 200) bad |= 2;
+    free(a); free(b); free(xh); nn_free(d_bas); nn_free(d_gain); nn_free(d_h4); nn_free(d_x); nn_free(d_a); nn_free(d_b);
+    return bad;
+}
+
 int main(void) {
     nn_init(0); nn_set_tf32(1); nn_set_act_bf16(1);
     int fails = 0, cases = 0, arcases = 0;
@@ -81,6 +136,12 @@ int main(void) {
                                                    xfmt, bits, shape, sym, ax, k, mxb, ya[k], yb[k]);
                             fails++;
                         }
+                        if (xfmt == 1 && N == 1 && (sym % 7) == 0) for (int lc = 13; lc <= 29; lc += 16) {
+                            const int e = latc_check(h4, d_h1, d_rec, D, P, bits, lc, lc == 13 ? 0.f : 0.25f); cases++;
+                            if (e) { if (fails < 5) fprintf(stderr, "FAIL: learned cell channels (C %d MX-fp%d shape %d sym %d axis %d): %s%s\n", lc, bits, shape, sym, ax, e & 1 ? "trainer / predict kernels differ " : "", e & 2 ? "host reference differs" : ""); fails++; }
+                        }
+                        if (lat_check(h4, d_h1, d_rec, N, D, P, xfmt, bits)) { if (fails < 5) fprintf(stderr, "FAIL: latent input (nn_input_lat) differs (xfmt %d MX-fp%d shape %d sym %d axis %d)\n", xfmt, bits, shape, sym, ax); fails++; }
+                        cases++;
                         {   /* --half-res pack: the 8 input channels on the 2x2x2 blocks (nn_input_rad_pack) against the host chain
                                write_x -> nn_half_input(mode 2) -> nn_h16_to_mx */
                             const shape5 hs = {N, 8, D / 2, P / 2, P / 2};
@@ -148,6 +209,8 @@ int main(void) {
                 nn_h16_to_mx(d_h4, xs, d_ya);
                 nn_input_rad(d_h1, xs, d_rec, d_yb);
                 nn_d2h(ya, d_ya, mxb); nn_d2h(yb, d_yb, mxb);
+                if (lat_check(h4, d_h1, d_rec, N, P, P, xfmt, bits)) { if (fails < 5) fprintf(stderr, "FAIL: warped latent input (nn_input_lat) differs (xfmt %d MX-fp%d sym %d axis %d mode %d)\n", xfmt, bits, sym, ax, mode); fails++; }
+                wcases++;
                 wcases++;
                 if (memcmp(ya, yb, mxb)) {
                     size_t k = 0; while (k < mxb && ya[k] == yb[k]) k++;

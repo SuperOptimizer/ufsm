@@ -6,6 +6,576 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Inference from the stored latent volume, without the CT (2026-11-10, branch latinf-20261109)
+
+`predict --latents STORE` (an `ufsm lc-encode` store of the CT level) reads no CT voxel; the CT store is opened for its metadata only
+(3 metadata reads per run). The reader thread reads each window's Wz/4 x W/4 x W/4 cells of C + 1 bytes (`zr_read_i8_mt`: the window's
+chunks decoded by `--threads` store handles; one thread made a 1.36 Gvox p1667 row 0.29 Gvox/s, 10-16 threads 1.4), and all-air windows are
+dropped before upload. On the device `nn_lat_synth_ct` rebuilds the window's CT (inverse transform; 1..255 in material cells, 0 in air
+cells), so the statistics (the z-score), the "0 where CT 0" masks (cell granularity in air) and the guided heads' CT terms run unchanged on it;
+the network input comes from the stored coefficients directly (`nn_lat_pred_input_q`: no second quantiser; radial channels from the axis
+offsets). Occupancy: the store's shard indices (absent or all-zero chunks; a 32-voxel grid). Windows must lie on the store's cell grid (box,
+grid origin, halo and stride multiples of 4 from its origin; refused otherwise). Tests: test_lat (rebuilt CT = host inverse transform within
+1 code; input within half a stored step of the CT path's unquantised channels, radial channels bit-equal), tests/test_latents.sh.
+
+Gate, p1667 recto-ruler (scripts/rv/eval.sh, `LATENTS=/mnt/scratch/lat/p1667-l2.lc`), g768 snap 10000 (guided head, fp8), `--window 384`,
+24 shard rows of 128 (32.7 Gvox), turns per GT turn / share off >= 0.5 turn, all radii:
+
+| source | rv.pkw | rv.pk | rv.run |
+|---|---|---|---|
+| CT (level 2) | 0.852 / 0.494 | 0.799 / 0.447 | 1.136 / 0.429 |
+| latents (KLT29, step 0.25) | 0.830 / 0.496 | 0.805 / 0.434 | 1.109 / 0.424 |
+
+Equal within noise (rv.pk and rv.run slightly better from the store, rv.pkw slightly worse). Rate on GPU 1 beside the wz768 trainer, warm
+page cache, the same three rows alternating: CT 0.49 / 0.38 / 0.35, latents 0.58 / 0.47 / 0.37 Gvox/s (wall per predict process). Bytes read:
+CT store 0.82 GB per box Gvox (26.8 GB), latent store 0.97 GB per box Gvox (31.8 GB), both including the windows' halos and the 3x z overread
+of 128-row boxes with 384-voxel windows; in material regions the latent store (0.13 B/vox on disk for the fixture) is not smaller than the
+volcomp CT, so the store is not an IO saving at this level: the gain is the cheaper window input.
+
+Fit fields (2026-11-10): `--fit-zarr` / `--fit-ct` from the store read the rebuilt CT. tests/test_latents.sh bounds the CT-vs-store
+correlation per group of planes, each plane standardised and the group pooled: single components of 6-step nets swing between training
+seeds (t0 0.64-0.95, t2 0.62-0.95 over seeds 5-10 on latcomp 6dea200; one failed a 0.7 bound after an unrelated planner change), the
+groups do not (min / max over the 6 seeds, guided head 2 | sub-cell head 3: phase .93/.96 | .79/.83, normal .82/.88 | .85/.89, spacing
+.78/.86 | .72/.86, material .944, winding mod 4 .78/.87 | .83/.85, its directions .58/.62 | .58/.68, --fit-ct ct .9995, cs .81/.96);
+bounds are those minima less ~0.1. With 30 steps the same seed reaches phase .96 / .91, normal .92 / .96, directions .78 / .75: the
+disagreement is the young nets' sensitivity, not the store. lc-encode's sd_ref now comes from mostly-material shards (the masked Paris 4
+level 2 had starved the old stride sample: sd 1, a 125 GB store at PSNR 25 dB); a box without material is refused.
+
+## Label planes kept on the device where the plan has room; what --det 1 fixes and what it does not (2026-11-10, branch perf-20261109)
+
+**Labels.** The latent nets' label stream builds each plane on the device, copies it back to pinned host memory and uploads it again per
+head slab in both head passes (rv P1024: 178 ms of copy-back per batch, 380 ms of slab uploads inside the step). Now the planes the
+memory plan has room for stay on the device (`d->ldev`), the rest stream as before:
+
+- Order: the `--rv` papyrus plane as 2-bit classes (unknown / papyrus / void: all `rv_tg_k` reads; an `--ink-head` plane stays bytes),
+  then phase, winding, component as bytes. The spare is the plan's free bytes minus its need, with 1 GB left. P1024 rv: everything.
+  P1152 rv (plan need 12.22 of 16.20 GB): papyrus + phase, 1.9 GB.
+- A byte plane is read in place by the target kernels; the packed plane is expanded per slab into the slab buffer (`nn_lab_unpack`,
+  on the aux stream in the upload pipeline).
+- The component is not 4 bits: the tiled winding numbers its components per tile, ids pass 14. Packed so, 6% of its slab bytes were
+  wrong in the stream check.
+- `UFSM_LAT_LDEV=mask` forces a set (bit k: phase, winding, component, papyrus), `0` is the stream alone.
+- Checks: `UFSM_LAT_STREAM=check` (which keeps reference byte planes) reports 0 differing slab bytes for rv (all four planes, 12
+  steps, P256) and for the winding net; `--det 1` step lines are identical with the planes on the device, partly, and streamed
+  (rv and winding, 12 steps). `test_gpu_aug` covers the pack / unpack kernels. The check mode died without a papyrus plane (it read a
+  null plane); fixed.
+- Real loader, rv P768, quiet GPU 1, 2 workers / 3 slots, `--det 1` (the same batches), all four planes on the device against
+  `UFSM_LAT_LDEV=0`: 1.123 -> 1.223 samples/s, the mean of steps 4-14 (+9%; loader wait 0%). In a profiled step (`UFSM_PTICK=2`,
+  synchronous upload, which also counts copies that otherwise overlap) the copy-back fell from 69 to 18 ms and the slab uploads from
+  156 to 9 ms, the step from 896 to 688 ms. P512 beside a training run: 3.60 -> 3.92. **Not measured:** P1024 / P1152 (the dev
+  memory slice had no room for the loader).
+
+**Phase and winding planes at 6 and 4 bits** (`UFSM_LAB_QBITS`: the training batches' planes quantised to 2^n cyclic levels on the
+device, validation on the stored bytes; P256, `--det 1`, GPU 1 beside a training run, one seed each). Validation after the last step:
+
+| arm | net | phase bce | normal bce | wind4 bce | turn acc |
+|---|---|---|---|---|---|
+| 600 steps from scratch, 8 bits | winding | 0.69164 | 0.54111 | 0.67356 | 0.3507 |
+| 6 bits | | 0.69127 | 0.53992 | 0.67389 | 0.3484 |
+| 4 bits | | 0.68629 | 0.55046 | 0.67359 | 0.3478 |
+| 600 steps from scratch, 8 bits | rv | 0.65439 | 0.61485 | 0.81120 | 0.3570 |
+| 6 bits | | 0.65032 | 0.61675 | 0.80235 | 0.3561 |
+| 4 bits | | 0.65462 | 0.61704 | 0.80636 | 0.3564 |
+| 300 steps on from wz768's step 2000, 8 bits | winding | 0.67876 | 0.51487 | 0.65902 | 0.3999 |
+| 6 bits | | 0.67870 | 0.51491 | 0.65897 | 0.4006 |
+| 4 bits | | 0.67864 | 0.51514 | 0.65848 | 0.4023 |
+| 300 steps on from g768's step 9000, 8 bits | rv | 0.55067 | 0.51373 | 0.65902 | 0.3738 |
+| 6 bits | | 0.55066 | 0.51374 | 0.65899 | 0.3737 |
+| 4 bits | | 0.55058 | 0.51388 | 0.65893 | 0.3736 |
+
+6 bits: no difference beyond the arms' noise. 4 bits: the normal bce is higher in three of four comparisons (+0.0002, +0.0003, +0.009
+from scratch on the winding net; the normal targets are a difference stencil on the phase), nothing else moves. Weak evidence: the
+from-scratch runs had not learned phase or winding yet (bce ~0.69), and the resumed runs sat in the schedule's cooldown (the 8-bit
+arm itself moved by < 1e-4). A decision for 4 bits needs a longer run at a working learning rate.
+
+**A label mix-up with two device buffers.** The stream has one set of host label planes. Under `--mem fast` (two device buffers) the
+next batch's upload ran during the step and overwrote them while the head passes still uploaded slabs: each step trained on a mix of
+two batches' labels (`--det 1`: 13 outcomes in 14 runs, from step 4, losses 2.0810 against 2.0562). The upload now waits for the step,
+as under lean; 10 of 10 runs agree and equal a run with device planes. Lean runs never overlapped.
+
+**The label builds of the batch upload (2026-11-10).** With the planes kept on the device the builds were the largest upload item
+(P1024: phase 265-275, winding 320-340, papyrus 120-150 ms). Four changes, all with the same bytes:
+(1) the warp kernels' phase code took a double-precision `atan2` per voxel (double runs at 1 / 64 of the single rate on these
+cards): the single-precision one now decides wherever its value is more than 2e-3 from a rounding boundary, the double one only
+there (1 voxel in 250); voxel indices are split with 32-bit divisions. (2) `--gpu-aug 3` uploaded the source-grid phase twice (phase,
+then the winding rebuilt from it) and the CT bytes twice (papyrus bits, then the CT channel): the staging buffer now remembers
+which host plane it holds (`aug_dev.key`, reset per batch by `nn_aug_stage_reset`), and the papyrus kernels read the CT bytes and
+the known bits directly instead of writing the plane over the staged bytes first. (3) Planes kept as bytes are built in place
+instead of in the input buffer and copied. Tests: fast against reference kernels (`nn_label_warp_ref`) byte for byte;
+`nn_w4runs_label` (untested before) against the host-rebuilt planes, alone and from the staged phase; the CT channel after
+`nn_ink_bits` equal to the one on its own. rv guided P512, `--gpu-aug 3`, GPU 1 shared with a P896 training run (contended, every
+profiler sync point costs a time slice): label builds + copies 87 -> 45 ms per step, CT upload 29 -> 23 ms; real loader 1.845 ->
+1.905 samp/s; 20-step loss identical (2.4004), `UFSM_LAT_STREAM=check` 0 bytes differ, host-stream path and the winding
+head equal too. Not measured at P1024 (no quiet card); by voxel count the saving there is ~350 ms of a ~2.3 s step.
+
+**A weight gradient that changed when other processes shared the card (fixed).** `test_lat_head~FP8` failed in ~1 run in 10 when
+three copies ran on one GPU and never alone (0 of 55): one conv's weight gradient off by 1e-4..5e-3, everything else equal to 5e-8.
+`UFSM_WG_TRACE=1` (hashes of what `lp_bwd_w_f8` reads, a random projection of what it adds) caught calls with byte-identical
+activations, gradients, GroupNorm parameters and seed whose output differed, at 96 -> 96, 128 -> 128 and 160 -> 96. Cause: the MX-input
+path of `conv_bwd_w_f8_k` keeps per-channel plane maxima in two alternating shared-memory buffers; after a plane's barrier warp 0
+reset the *next* plane's buffer, with no barrier before the other warps' reductions into it. A warp that got there first lost its
+maximum, the plane's scale came out too small and its e4m3 bytes saturated. Alone the reset practically always wins; with the GPU
+time-sliced between short-lived processes it did not. Three buffers now (reset two passes ahead, as `lp_s2.cu`'s kernels already
+did): old kernel 18 failing lines in 120 runs, new 0, interleaved under the same load. Not removed by blocking launches, and not
+triggered by a steady training run as the neighbour (0 of 40) or by CPU load (0 of 30). Exposure: every `--fp8 1` run beside
+benchmark or eval processes (all convs), and in fp4 mode the layers whose weight gradient still runs this kernel on an MX input
+(the first conv); the fp4-mode test showed 0 failing lines in 252 runs, so the size there is unknown. `lp_f8fwd.cuh` has the
+two-buffer pattern too, but with a barrier between the reset and the next reductions.
+
+**--det 1.** Runs with the same seed printed different lines in 20-70% of cases, always first at step 26 (rv P256), in three
+outcomes. The batches (hashes, slots), the input and the label planes are identical; the weights are not: after the first update 321
+of 12.6 M parameters differ by one float unit, mostly conv biases. The bias and weight gradients are summed across blocks with float
+atomicAdd (`lp_f4wgrad.cuh`, `lp_f8wgrad.cuh`, `lp_s2.cu`, `lp_mx_conv1.cu`, `lp_mx_gnbwd.cu`), so the order varies. The fp4 weight
+quantisation hides the difference until a weight crosses a boundary, which is where the runs split. Left as is (decision: no
+order-independent sums now): `--det 1` fixes batches and seeds, not the last bit. `UFSM_DET_TRACE=1` prints per-step hashes of input,
+label planes and weights; `UFSM_DET_PDUMP` / `UFSM_DET_PSTEP` dump one step's weights.
+
+## The batch upload measured part by part; cheaper scan-augmentation kernels; the wide stride-2 backward on tensor cores (2026-11-10, branch perf-20261109)
+
+**Why.** The P1152 guided rv run made 370-420 Mvox/s against a same-batch figure of 786: the same-batch mode (`UFSM_BENCH_SAME`) skips
+the loader and the upload. Under lean 2 there is one input buffer, so the next batch's upload runs after the step, serial to it.
+
+**The fused head on a quiet card** (GPU 0, same batch, free-running, one binary with the env switches):
+
+| samples/s | slab chain (`UFSM_LAT_FUSE=0`) | fused | fused + light pass 0 |
+|---|---|---|---|
+| rv, lat_guide 5, P1024 | 0.74 | 0.83 | 0.91 (980 Mvox/s) |
+| rv, P512 | 5.26 | 5.47 | 6.12 |
+| winding, lat_guide 64, P1024 | 0.40 | | 0.42 |
+| winding, P512 | 3.09 | | 3.20 |
+
+**The upload of one rv P1024 batch** (quiet card, `UFSM_PTICK=2`, `UFSM_SYNC_UPLOAD=1`; one batch, with blur, correlated noise and gin all
+on; 1.7 s against 1.1 s of step compute):
+
+| part | ms | note |
+|---|---|---|
+| correlated noise | 577 | p 0.1 |
+| load + blur ops | 311 | p 0.7 |
+| gin | 102 | p 0.15 |
+| other scan ops | 31 | |
+| CT sums + warp / write | 110 | every batch |
+| CT bytes up | 38 | every batch |
+| label builds on the device (papyrus 185, side 168, w4 5) | 358 | every batch; mostly the 1 GB source plane going up |
+| label planes back to the host | 178 | every batch (the label stream) |
+| per-slab label upload in the two head passes | 380 | inside the step, on the aux stream |
+
+Weighted by the ops' probabilities: labels ~0.5 s outside the step, scan augmentation ~0.32 s, CT ~0.15 s, per average step. An earlier
+split at P512 beside another process (copies ~11% of the upload) does not hold at P1024.
+
+**No overlap without memory.** With guided heads the full-resolution input is read until the end of the gradient pass (the guide), and
+the label builds use the input buffer as their scratch, so uploading batch N+1 during step N needs a second input buffer or 2 P^3 bytes of
+label scratch: 2-3 GB at P1152, which the window does not have. Not done.
+
+**Correlated noise in chunks of planes.** It ran two kernels per z plane (2 P launches of P threads each). Now three kernels per 64 MB chunk
+of planes: the x recurrences of the chunk's rows, y per (plane, column), z per (y, x) with the carried plane. Byte-identical to the
+per-plane kernels (`test_gpu_aug`, chunks of 1 / 5 / P / default planes). P512, op on, beside another process: 316 -> 26 ms.
+
+**Separable operators (blur, lowres).** Micro-benchmark `TGA_BENCH=P build-verify/test_gpu_aug` (GPU 1 beside a training run, so
+indicative), ms per pass:
+
+| P, taps | z / y shared-memory | z / y line | x, one row a block | x, rows + weight table |
+|---|---|---|---|---|
+| 768, 13 | 17.5 | 11.8 | 56.8 | 12.7 |
+| 1024, 5 | | 22.8 | 67.1 | 25.2 |
+| 1024, 13 | | 27.7 | 137.2 | 30.1 |
+| 1024, 21 | | 37.5 | 193.7 | 36.8 |
+
+- z / y: one thread per line with a ring of the last 64 original values (in place, coalesced across x) instead of P x 32 halves of shared
+  memory per block (64 KB at P1024: one block per SM). A host check (`bop_ring_ok`) falls back to the shared-memory kernel when a row's
+  taps would leave the ring.
+- x: the old kernel loaded a different row of the weight table per thread (8 ms per tap and Gvoxel against 1 in z / y, where a warp
+  shares its row). Now R rows per block in shared memory and the weights from a table of the operator's distinct rows, built on the
+  device (`aug_bop_uniq_k`; more than 64 distinct rows: the plan's own rows). A thread-per-row ring variant measured 80-90 ms flat.
+- Byte-identical to the first kernels (`test_gpu_aug`: a 5-tap, an irregular 16-tap and a 9-tap operator, and the table's fallback).
+
+**The 96-wide net's stride-2 convs.** `UFSM_PROF=layers`, winding P512, 10 steps, beside another process: the trunk's convs are 75% of
+the profile and scale with the products (dec0.c1, 224 -> 96: 560 ms; enc0.c2 and dec0.c2, 96 -> 96: ~230 ms each), no slow path there.
+The down convs were: the fp4 tensor-core stride-2 backward-data existed for 16 / 32 / 64 channels only, wider layers ran the dilated fp8
+conv through MX-fp8 copies (a full-resolution conv's work for an eighth of the products). `bwd_data_s2_f4_k` now takes 96 and 128
+channels: two K units per tap (the tap's gy blocks 2 j, 2 j + 1; 96: a zero fourth block), 85 KB of shared memory at 128.
+
+| ms per 10 steps | before | after |
+|---|---|---|
+| down0 (96) bwd_data | 134.1 | 22.7 |
+| down1 (128) bwd_data | 31.4 | 4.5 |
+| all conv bwd_data | 524 | 327 |
+
+`test_grad_mx4`: 96 and 128 against the fp32 reference like 64 (one draw 0.166, mean of 16 0.042). 160 channels (down2) stay on the
+fp8 route (three K units per tap do not fit the shared memory). The stride-2 forward and weight gradient stay fp8 at these widths: the
+general fp4 forward (`UFSM_S2_F4G=1`, off for its unexplained drift in test_split) measured 62 against 81 ms, and a fit over the two
+nets (17 ms at 32 -> 32, 83 at 96 -> 96) puts ~35 ms of a 96-channel level-0 conv in reading and transforming its input, which a
+stride-2 conv pays in full.
+
+**Not measured:** the new augmentation kernels and the 96 / 128 backward in a real run on a quiet card.
+
+## The latent head's full-resolution passes fused per coarse cell; an uncontended step profile (2026-11-10, branch perf-20261109)
+
+Profile first (GPU 0 alone for 5.5 minutes, fp4, streamed head, `--gpu-aug 3`, same batch, `UFSM_PTICK=2`: the target / loss / upsample
+kernels ticked one by one; a tick costs ~0.05 ms on a quiet card and ~2.3 ms beside another process, which made an earlier shared-card
+table worthless for the per-slab rows). rv = 32,64,128,192,256 with lat_guide 5, P 1024, free-running 0.74 samp/s = 1351 ms:
+
+| phase | ms |
+|---|---|
+| head forward per slab + upsample (both passes) | 214 |
+| targets (both passes): phase 28, rv 31, packed mask rv 44 / side 32, normal 55 | 189 |
+| trunk backward (with the per-slab head backward) | 182 |
+| upsample adjoint | 178 |
+| loss gradients: normal 111, side 42, wind4 20 | 174 |
+| guide forward (both passes) / adjoint | 111 / 48 |
+| loss statistics: normal 54, side 21, wind4 12 | 87 |
+| trunk forward / input pool / optimizer | 71 / 64 / 12 |
+| (label slab uploads, both passes: overlap the kernels when free-running) | 315 |
+
+The head path is 1001 of 1330 ms. Winding (96,128,160,192, lat_guide 64) at P 1024, 2500 ms: trunk backward 1134, trunk forward 380,
+head forward + upsample 296, loss gradients 164, adjoint 123, targets 115, shuffle 101, statistics 82: there the 96-wide trunk is 60%.
+Same-batch mode has no upload: the first batch's upload measured 1150 ms (CT + gpu-aug) + 500 ms (labels) at P 1024, and the P 1152
+production run makes 420 - 430 Mvox/s against 786 same-batch. A real-loader P 512 run (shared card) splits the upload into scan
+augmentation kernels 41%, label builds on the device 38%, the label planes' copy back to the host 11%, CT sums + write 6%, CT bytes 4%:
+kernels, not the bus. In lean 2 the upload runs after the step (one buffer), so it adds to it. Labels kept on the device instead of
+streamed: +1.7% same-batch at P 512, not worth 4 - 10 B per voxel.
+
+The fused passes (`nn_lat_fuse_grad`, `nn_lat_fuse_stats`, default on; `UFSM_LAT_FUSE=0` off): one thread per coarse cell computes its 4^3
+fine logits (lat_up4_k's arithmetic, each rounded to fp16 as the slab stored it), the guided head's CT terms, the BCE gradient
+(loss_grad_v, rounded to fp16 and scaled as the slab chain left it) and the transposed upsampling onto the cell's 3^3 neighbours, for a
+loss group at a time: the normal / density channels (every latent head), and the guided side pair with its 5 coefficient channels
+(lat_guide 5). 27 fp32 partials per cell and channel go to a scratch (`fpart`, 378 P^2 bytes: 0.5 GB at P 1152, in the planner);
+a second kernel gathers each cell's partials in a fixed order (no atomics: two runs give the same bits). The winding mod 4 pair and the
+other heads' side channels keep the slab chain on their channel ranges. The statistics pass is fused the same way, and in a training
+step it only counts the groups' mask weights (all the gradient reads: weight sums and the active count; `UFSM_LAT_LIGHT0=0` off):
+the logged loss sums are taken in the gradient pass and finalised after it (fetch_loss runs after the backward).
+
+Tests: test_lat_fuse (24 cases: coarse gradient against the slab chain max 1.4e-7 of the largest value, statistics 8e-8, mask-only +
+gradient-pass sums 8e-8, two fused runs bit-equal). A real rv step: 58 of 14.2 M fp16 codes of the coarse gradient differ by one code
+against the chain, 0 between fused and fused + light; winding losses equal to 4 digits over 10 steps; rv losses equal at step 1 and
+then differ in the third decimal, as two identical rv runs sometimes do.
+
+| free-running, quiet card | baseline | fused (both passes) |
+|---|---|---|
+| rv P 1024 | 0.74 samp/s (1351 ms) | 0.84 (1190 ms) |
+| rv P 512 | 5.28 (189 ms) | 5.70 (175 ms) |
+| winding P 1024 / P 512 | 0.40 / 3.11 | 0.42 / 3.27 |
+
+The fused kernels are compute-bound (fused statistics 29 ms at P 512 against 12 ms for the slab kernels they replace; the gain is the
+skipped upsample and slab traffic). The light statistics pass is not timed yet (no quiet card since).
+
+## Real device peaks of the latent nets, the planner's task term, the wide stride-2 backward in chunks (2026-11-09, branch perf-20261109)
+
+Measured in a 5-minute window on an empty GPU 1 (16 GB), per-process peak from nvidia-smi, 3 steps each (1 MiB = 1.049e-3 GB; the
+planner prints 1e9-byte GB). rv = 32,64,128,192,256 with lat_guide 5; winding = 96,128,160,192 with lat_guide 64.
+
+| run | real peak | planner then | planner now |
+|---|---|---|---|
+| P 768 resume of g768 (rv, fp8), streamed / stored head | 4.89 / 5.74 GB | 9.61 / 10.48 | 5.49 streamed |
+| P 768 resume of wz768 (winding, fp8), streamed / stored | 8.84 / 13.03 GB | 11.73 / 16.07 | 8.68 streamed |
+| P 896 fp4 streamed, rv / winding | 6.15 / 11.54 GB | 12.82 / 13.35 | 6.13 / 8.53 (chunked kernel, below) |
+| P 960 fp4 streamed, winding | 13.94 GB | 16.15 | 10.12 (chunked) |
+| P 1024 | refused by the planner (18.61 / 19.34) | | 8.55 / 11.92 |
+
+The resumes' losses are equal streamed and stored (wz768 1.1792 1.1791 1.1791; g768 1.2592 1.2590 1.2589). The rv P 960 run made no
+step and logged no error (not explained). P 512 beside the production run: winding 2.46 GB real / 2.67 planned, rv 1.88 / 1.91.
+
+Second window (2026-11-10 00:21 - 00:30, after both fixes below; fp4, streamed head, `--mem auto` picked mode 4 without an
+override every time; one sampler slot and 2 workers to stay under a 20 GB host cap; 3 - 6 steps, same batch):
+
+| run | real peak | planner | rate |
+|---|---|---|---|
+| rv P 960 / 1024 / 1088 / 1152 / 1216 | 7.28 / 8.49 / 9.96 / 11.52 / 13.25 GB | 7.41 / 8.72 / 10.20 / 11.84 / 13.66 | 0.87 / 0.74 / 0.60 / 0.51 / 0.43 samp/s (770 - 795 Mvox/s) |
+| winding P 960 / 1024 / 1088 | 9.99 / 11.75 / 13.83 GB | 10.33 / 12.16 / 14.22 | 0.48 / 0.40 / 0.33 samp/s (425 - 435 Mvox/s) |
+
+The planner is 2 - 3.5% above the real peak over the whole range. The first window's rv P 960 run with 0 steps was the host cap,
+not the device: the kernel log has the cgroup OOM kill at 23:05:17 with 20.0 GB of shared memory (three sampler slots at P 960).
+
+Two planner errors and one kernel:
+
+- The label-stream correction of the task term (the label planes stay on the host: 10 B per window voxel less) never applied: its
+  condition read g_xs == 1, which gpu_input_settle sets after the planner. It now reads the request (g_gpu_want). With it the count
+  ran 3 - 5% under the real peaks (source not found: at rv P 512 the logged allocations plus the context come to 1.86 GB against 1.82 planned and 1.88 real), so the stream
+  branch adds 1 / 14. A run without the label stream after a plan that assumed it prints one line.
+- The wide MX-fp4 stride-2 backward-data (more than 64 channels: no direct tensor-core kernel) went through whole-layer MX-fp8
+  copies: gx (99 B per level-0 voxel at 96 channels), the dilated gy (132) and the accumulate temp (99), kept by the lp_buf slots:
+  5.2 B per window voxel of a 96-wide latent net, 3.7 GB at P 896, in no planner term. It now runs in chunks of fine planes of
+  ~96 MB (lp_set_s2b_cz / UFSM_S2B_CZ; 0 = whole): fine planes [z0, z1) read coarse planes z0 / 2 .. z1 / 2, the chunk computes
+  one plane further and does not store it. Same bytes as the whole-layer call (test_grad_mx4: 96 -> 128 and 128 -> 160, 2 / 4 / 6
+  planes, with and without accumulate: 0 bytes differ); 3-step losses equal; P 512 peak 2658 -> 2346 MiB; step time unchanged
+  (contended). The planner counts 3 chunks.
+
+P 512 uncontended, streamed vs stored head: winding 429.4 vs 409.5 ms (synchronised sums), 3.10 vs 3.23 samp/s free-running; rv
+542.3 vs 529.7 ms, 5.29 vs 5.33 samp/s. The streamed head costs 1 - 5% of the step for 0.2 - 1.1 GB at P 512 (4 GB at P 768).
+
+## Latent nets with learned cell channels under fp4 activations; the guided heads' adjoint (2026-11-09, branch perf-20261109)
+
+The winding latent net (w768: widths 96,128,160,192, 29 learned cell channels + 3 radial means, `--lat-guide 2`, `--fp8 1`) took
+3.2 s a P768 step against 1.3 s for the 32-wide rv net. Same-batch profile at P512 on an idle GPU 1, synchronised phases: 841 ms =
+trunk forward 84, trunk backward 310, slab adjoint 206, slab upsampling 50, label upload 37, targets 34, loss kernels 35, CT upload
++ gpu-aug 50, input 8, optimizer 9.
+- **Adjoint.** `nn_lat_up_adj` took the per-voxel gather whenever C > 28 (its scratch, the normal targets' 7 B a voxel, holds 28
+  channels of the intermediate): the guide-2 head has 32. It now runs the separable pair in channel groups of 28: 206 -> 60 ms,
+  step 841 -> 687 ms. `UFSM_LAT_CHECK`: rms difference / rms 1.3e-7 against the gather.
+- **`--fp8 1` was the rest.** Per conv, ms a step at P512: fp8 forward 83 / backward-data 58 / weight gradient 234 / GN 14; the same
+  net in fp4 (4 inputs): 48 / 46 / 57 / 5. `--fp8 1` was passed only because the first conv (32 MX-fp8 inputs) could not write
+  MX-fp4 activations: both mixed paths existed for <= 8 input channels only (the 4-channel stem's small kernel and its FAST weight
+  gradient).
+  - forward: the general fp8 kernel is now instantiated for MX-fp8 in / MX-fp4 out (it was templated on both; only the stem's
+    small kernel was compiled for mixed types), reached for any channel count from `conv3d` and `lp_conv_fwd_f8`.
+  - weight gradient: no kernel stages MX-fp4 gradients for a general fp8 conv, so `lp_bwd_w_f8` runs the MX-fp8 / MX-fp8 kernel on
+    z chunks (`bwd_w_f8_mixed`): the chunk's gradient rows re-encoded as MX-fp8 (exact: e2m1 values under their block scale are
+    e4m3 values) with a zero plane on either side, the input's planes with their halo copied; <= 96 MB of copies whatever the
+    window. fp8 compute on the exact operands, as the stem's FAST path does. (The fp4 weight-gradient kernel also accepts it with
+    `--policy all=fp4:fp4:fp4`, but rounds the cell channels to e2m1 in the gradient.)
+  - `tests/test_lat_conv0`: forward against a host fp32 convolution (rms error / rms 0.038 for fp8 rows, 0.119 for fp4 rows =
+    the e2m1 rounding, worst error 0.26 of the row's largest value) and the chunked weight gradient against the host sum and the
+    whole-tensor fp8 kernel (differences <= 2e-8 of the rms for 1, 3 and 6 chunks; the bias sums exact).
+  A `--lat-basis` run without `--fp8 1` now trains (default `--fp4 2` policy, `enc0.c1=fp16` = the fp8 compute above). Same batch,
+  P512, idle GPU: 687 -> 483 ms a step (measured with the fp4 weight gradient for conv0; the chunked fp8 one was built after the
+  GPU was taken and is timed only functionally: conv0's weight gradient is ~3 ms of either). Trunk forward 83 -> 48, backward
+  306 -> 124. Losses after 4 same-batch steps at P256: 2.4380 (fp4 trunk) against 2.4396 (`--fp8 1`).
+  **This is a precision change, not a rounding-level one**: the trunk's activations and gradients are stored and multiplied in fp4
+  as in every 4-input net; weights, optimizer state and the checkpoint format are untouched, and a `--fp8 1` checkpoint resumes
+  under fp4 (tried on a 6-step one). `--fp8 1` runs exactly as before.
+- **Default since the evening: every conv of a `--lat-basis` net is fp4** (`all=fp4:fp4:fp4`, no `enc0.c1=fp16` exception: there is
+  no 16-bit stem). Without `--input-prec` the 32 input channels are MX-fp4 too and conv0 is an ordinary fp4 conv; with
+  `--input-prec 8` its forward is the mixed fp8 kernel and its weight gradient the fp4 kernel (the cell channels rounded to e2m1
+  there); the chunked fp8 weight gradient remains for `--policy ...,enc0.c1=fp16` (15 instead of 3 ms a P512 step).
+  300 deterministic steps (`--det 1`, P256, the winding net with the sub-cell head, one seed each; mean loss of steps 1 / 1-50 /
+  51-100 / 101-200 / 201-300):
+
+  | | step 1 | 1-50 | 51-100 | 101-200 | 201-300 |
+  |---|---|---|---|---|---|
+  | `--fp8 1` (as w768 ran) | 2.6173 | 2.6960 | 2.1196 | 1.5390 | 1.3608 |
+  | fp4 trunk, fp8 input, conv0 gradient fp8 (chunked) | 2.6315 | 2.7326 | 2.1845 | 1.5868 | 1.3780 |
+  | fp4 trunk, fp8 input, conv0 gradient fp4 | 2.6315 | 2.7334 | 2.1827 | 1.5859 | 1.3771 |
+  | fp4 trunk, fp4 input (`--input-prec 4`) | 2.6364 | 2.7314 | 2.1830 | 1.5857 | 1.3819 |
+  | the new default (no `--input-prec`: fp4 input) | 2.6364 | 2.7335 | 2.1853 | 1.5872 | 1.3799 |
+
+  fp4 against fp8: +1.3% at 201-300 (one seed; no noise estimate). The input's and conv0's precision make no visible difference
+  inside fp4 (1.377-1.382).
+- **With the sub-cell head (`--lat-guide 3`), P512, idle GPU, same batch**: winding net (96,128,160,192) `--fp8 1` 624 ms, fp4
+  trunk 402 ms (trunk forward 89 -> 54, backward 330 -> 143); rv net (32,...,256) 330 -> 287 ms. What is left in the fp4 steps:
+  winding: trunk 197 (of it the 96 -> 144 head 37: forward 8, data gradient 14, weight gradient 15), slab section 123, CT upload +
+  gpu-aug 50, label upload 15, input 8, optimizer 9; rv: slab section 143 (label upload 38, targets 35, loss kernels 36, upsampling
+  15, adjoint 19), uploads 72, trunk 51 (head 12), optimizer 12. For the rv net the full-resolution passes, not the trunk, are the step.
+- **What is not fp4 in a latent step, and whether it could be** (sub-cell head, bytes per window voxel): the cell logits `lg` (144
+  channels, fp16, 4.5 B = 2.0 GB at P768) and their gradient `latgl` (the same), `latg` (16 channels of fp32 sums, 1.0 B: sums of
+  ~100 slab terms, kept), the slab logits `hs_lg` (fp16, one slab), GroupNorm statistics / weights / optimizer state (fp32, 0.12 GB).
+  Experiment switches `UFSM_LAT_LG_MX` / `UFSM_LAT_GL_MX` = 8 | 4 round `lg` / `latgl` through MX rows in place (32-channel blocks per
+  cell, round to nearest; no kernel reads MX yet). The same 300 steps as above (run-to-run spread of the baseline: 1.3792 / 1.3799,
+  the first ~20 steps identical):
+
+  | | step 1 | 1-50 | 51-100 | 101-200 | 201-300 |
+  |---|---|---|---|---|---|
+  | fp16 both (default) | 2.6364 | 2.7342 | 2.1850 | 1.5853 | 1.3792 |
+  | logits MX-fp8 | 2.6347 | 2.7313 | 2.1832 | 1.5851 | 1.3799 |
+  | logits MX-fp4 | 2.6103 | 2.7081 | 2.1714 | 1.5859 | 1.3837 |
+  | gradient MX-fp8 | 2.6364 | 2.7333 | 2.1815 | 1.5857 | 1.3820 |
+  | gradient MX-fp4 | 2.6364 | 2.7325 | 2.1837 | 1.5870 | 1.3801 |
+  | logits fp8 + gradient fp8 | 2.6347 | 2.7312 | 2.1828 | 1.5853 | 1.3805 |
+  | logits fp8 + gradient fp4 | 2.6347 | 2.7332 | 2.1830 | 1.5857 | 1.3806 |
+  | logits fp4 + gradient fp4 | 2.6103 | 2.7077 | 2.1716 | 1.5870 | 1.3820 |
+
+  Nothing separates from the baseline's own spread at 300 steps. fp4 logits move the step-1 loss by 1% (the same weights, another
+  rounding of the outputs), fp8 logits by 0.06%. Real MX storage (logits fp8 2.3 B, gradient fp4 1.2 B: -5.5 B a voxel, 2.5 GB at
+  P768) needs the head forward writing MX rows, `nn_lat_up_slab` / `nn_lat_shuffle` reading them, the adjoints' final store in MX and
+  the head's weight gradient reading an MX gy: not written. It saves memory only, no step time.
+- **The streamed head (default for `--lat-guide 0 / 3`; `UFSM_LAT_HEAD_STREAM=0` off): neither `lg` nor `latgl` nor the whole `latg`
+  exists.** The network is built with head slabs (`unet_set_head_ext`): `head_slab_pass` runs the head on the cell planes a slab reads
+  (`unet_head_fwd_z` on planes z0/4 - 1 .. z1/4, both passes; `nn_lat_up_slab_c` / `nn_lat_shuffle_c` take a chunk of cell planes), and
+  the gradient pass moved into the backward's head callback: each slab adds into a rolling buffer of hs_z / 4 + 2 planes (fp32 sums of
+  the 16 interpolated outputs, fp16 of the sub-cell ones), the planes no later slab reaches go through `unet_head_bwd_z` at once
+  (`nn_lat_grad_fin`), the last two are carried over (`nn_lat_grad_carry`). No rounding is added: the logits are the whole head's bit
+  for bit, the gradients equal up to the weight gradient's summation order (tests/test_lat_head: 32 / 96 -> 144 per 3 cell planes
+  against the whole head, logits 0 differ, gradients 2e-8 / 4e-8). Bytes of cell logits and gradients: P256 38 MB instead of 170 MB;
+  the planner's bytes per voxel 71.4 -> 63.4 (winding net), 71.7 -> 63.7 (rv); at P768 4.6 GB -> 0.33 GB. Training: the rv net
+  (32 wide) gives the same loss to 4 decimals through 40 same-batch steps (1.9671 ... 1.8012 both ways); the winding net (96 wide)
+  the same through step 4 and 1.6316 / 1.6322 at step 40, which is that net's own run-to-run spread (below).
+  Cost: the head forward runs in both passes with 2 halo planes per 8, and the head backward runs per range; the range weight
+  gradient used 8192 voxels a block (9 blocks for 8 planes at P384: each of its 54 passes as long as the whole grid's), now >= 128
+  blocks (`lp_bwd_w1_mx_b_r`). Timings so far only with ws768 on the same GPU (P384, winding net, synchronised phases, two runs
+  each): 466 / 424 ms streamed against 404 / 439 whole, i.e. inside the contention noise; an idle-GPU number is owed.
+  `nn_head_bwd_z` takes the general path for more than 16 outputs (the fused kernel is <= 16; 32 inputs -> 144 was "not covered").
+- Planner (`UFSM_MEM_DRY=1`, smallest mode, GB; streamed / whole head): P768 rv 8.73 / 13.06, winding 8.80 / 13.13; P896 13.22 / 20.18
+  and 13.35 / 20.31; P960 15.99 / 24.58 and 16.15 / 24.75; P1024 19.13 / 29.61 and 19.34 / 29.81. Of the 19.13 GB at P1024 the
+  network is 1.48 and the "task" term 16.87 (15.7 B a voxel): it still counts the label planes that `lab_stream` keeps on the host.
+  One real run to compare (P384 rv, ws768 on the same card): process peak 1.20 GB by nvidia-smi at 1 Hz (CUDA context included)
+  against the planner's 1.83. Real P896-1024 steps are owed (a free GPU).
+- Later the same evening: every head streams (the guided ones too: their coefficient planes are interpolated outputs, all through the
+  fp32 sums; no sub-cell buffer). 40 same-batch steps, streamed / stored: `--lat-guide 1` rv net 2.7170, 2.6549, 2.5046 both;
+  `--lat-guide 2` winding net 2.3987 both at step 4, 2.1172 / 2.1187 at step 40 (the 96-wide spread); plain head 1.9676, 1.9132
+  both, 1.7992 / 1.7994 at step 40. tests/test_lat: the chunk kernels and the rolling gradient against the whole arrays (slab
+  values bit for bit, coarse gradient within one fp16 code). No checkpoint field changes: running fp8 checkpoints resume as before.
+  The planner's task term now leaves out the label planes the label stream keeps on the host (`UFSM_PLAN_LABELS_DEV=1`: the old
+  count).
+- About the 96-wide irreproducibility below, measured after writing it: one net repeats its own backward exactly only for 32-wide
+  nets; a 96-wide net's second backward on the same build differs from its first (enc[0] 0.375, the rest 0.15) while a second net
+  of the same configuration reproduces the first net's first backward outside enc[0]. Filling every new device buffer with a byte
+  (`UFSM_MALLOC_FILL`) changes nothing, so no unwritten memory is read. K repeated backwards without a rebuild stay unbiased
+  (enc[0] 0.153 at 24, 0.080 at 96): the draws are valid, their assignment differs between the first backward after a build and
+  the later ones, and between layouts. The op is not located.
+- **Resolved as far as production goes (22:30): the irreproducibility below needs level 1 narrower than level 0.** It appears only
+  with the test's first widths {96, 64, 96}; {96, 128, 160}, {96, 96, 96} and {32, 32, 32} reproduce every tensor to 1e-9 (one net
+  twice, two equal nets, whole head against per range), and so does {96, 64, 96} with `--input-prec 8`. On {96, 64, 96} each
+  backward of one net differs from the last in enc[0] and down0 (0.25-0.5), with identical logits and seed counts; it goes away
+  with `UFSM_GN_DEFER=0` or `UFSM_COARSE_GRAD_SHARE=0`. So a size assumption of the coarse-gradient share (gout[1]'s home in
+  dec[0].a2's buffer beside the 32-channel fp4 input) fails when w[1] < w[0]; the production nets (96,128,160,192 and
+  32,64,128,192,256) are not that case. test_lat_head now uses (32,64,96) and (96,128,160) and holds enc[0] to the same bound;
+  `TLH_W1=64 TLH_W2=96 TLH_REPRO=1` shows the defect. Not fixed.
+- 22:40: the streamed head under `--fp8 1` aborted ("the head backward is not covered per slab") when a g768 / wz768 checkpoint was
+  resumed: the per-range head backward's entries wanted storage code 4 / 8 while nn's MXDT names MX-fp8 3. Now the general path for
+  MX-fp8 x or gx (as the whole path's fused kernel declines it). Copies of g768/snap/9000 (guide 5) and wz768/snap/2000 (guide 64)
+  resumed at P256, 4 steps at the runs' learning rates, streamed and stored: 1.2750, 1.0221, 1.1934, 0.8154 and 1.1716, 1.2295,
+  1.3785, 1.1394 both ways. `test_lat_head~FP8` (TLH_FP8=1) runs the head test in that mode. Two `--det 1` runs of 40 steps
+  give identical step lines for the rv and the winding net (streamed, fp4).
+- Coarse-gradient share: off when widths[1] < widths[0] (one stderr line); the narrow net then repeats its backward exactly, but
+  still fails against the 8-output net and under 16-bit gradients (`TLH_NARROW_ALL=1`): open.
+- **Found on the way, not fixed: with a 96-wide level 0 under the lean-2 sharing modes (share_enc_a1 + a0_share) enc[0]'s parameter
+  gradients are not reproduced between two equal backwards** (two nets with equal parameters, or the head whole against per range:
+  rel 0.17-0.26 on enc[0], every other tensor equal to 1e-9; it depends on the allocation layout; 32-wide nets reproduce exactly;
+  synchronous offload copies, `UFSM_OFFLOAD_SYNC=1`, change nothing; the storage registry shows no stale entry, `nn_storage_dump`).
+  The gradients are valid draws: their mean over K backwards approaches the 16-bit-gradient reference as 1 / sqrt(K) (0.153 at 24,
+  0.080 at 96, as the 32-wide net's 0.189 / 0.095). So some SR key or rounding input on the way to enc[0] differs per run for 3-block
+  rows; this is probably why two `--det 1` runs of the winding net part after ~20 steps. test_lat_head compares enc[0] apart for
+  that reason.
+- The slab loop stays two passes: the side / normal gradients divide by the window's mask sums and the count of active channels, the
+  winding term by its gauges, all known only after every slab's targets (and the winding logits) were seen.
+- Left in the slab section (P512, ms): upsampling 50 and adjoint 60 still cover all 32 planes of the guide-2 head although 13 are
+  unused; label upload 37 is hidden by the upload pipeline outside the synchronised profile.
+
+## The winding mod 4 labels on the GPU: train --gpu-aug 3 (2026-11-09, branch perf-20261109)
+
+`band_wind4_tiled` was ~25% of the loader's CPU (hostmem round 2). Its bytes depend on the order of the unions (which run ends up
+the root fixes the component's gauge; the conflict count of an inconsistent component depends on the spanning tree; union by size
+reads the sizes at that moment), so a parallel connected-components pass cannot reproduce them. The split that keeps the bytes
+(`src/nn_w4.cu`, `band_w4dev.h`):
+- device, per strip of one tile in z and y (<= T^2 W voxels, 4 B each + the events): the runs along x of each tile row (one thread a
+  row; per voxel the run's ordinal in the row and its turns since the run's start), then per run its length and its *events*: the
+  first voxel that joins a new y / z neighbour run (position in the run, relative turn), plus the count and 4-bin turn histogram of
+  the run's further voxels joining that same run. A count pass, the host's prefix sums (tiles in raster order, rows in scan order =
+  the CPU's run numbering), an emit pass.
+- host: band.c's union-find replayed over the events in the same order (a run's voxels up to an event are added to its
+  component's size before the union, as `w4_pass0` flushes them; the histogram gives the edges and conflicts of the repeated joins),
+  the same component choice.
+- device: pass 1 from one root offset and component byte per run; the two planes come back by DMA into the (pinned) batch planes.
+A P512 window of the P4 phase has 6.0 M runs (16-19 voxels a run) and 14.4 M events (16 B each), against 134 M voxels.
+
+The sampler's workers call `band_wind4_dev` directly (own streams, two contexts per trainer GPU behind mutexes, polling waits: a
+stream sync would spin a core behind the trainer's kernels); on any CUDA error it returns -2 and the worker takes the CPU call from
+then on. `--gpu-aug 3` = `--gpu-aug 2` + `sample_cfg.w4_dev`; sample.c changes only at its two winding calls.
+
+Checks: `tests/test_w4dev` (72 cases: spirals with holes, vortex lines whose loops gain a turn (10.8 M voxels in components dropped
+for conflicts), random phases, windows off the tile grid, one tile with 15 components, 1-voxel tiles) byte-identical to
+`band_wind4_tiled` in w4, the component plane, the count and the statistics; two stored P512 phase windows identical;
+`UFSM_BATCH_HASH` of 16 `--det 1` P512 batches identical between `--gpu-aug 2` and `3`; a 6-step deterministic training run prints
+the same losses.
+
+Numbers (thread CPU, machine shared with two production trainers and their loaders):
+- one stored P512 window, tile 86: CPU path 0.65-0.75 CPU-s, device path 0.155 CPU-s (0.125 of it the replay), 0.37-0.41 s wall
+  behind a trainer on the same GPU.
+- sampler alone (`UFSM_SAMPLER_ONLY=16 UFSM_SAMPLER_PROF=2`, P512, `--det 1`, 4 workers, two alternating runs each): the wind4 stage
+  473 / 529 -> 281 / 210 ms a window (the stage also holds phase_air and the side output): -51%. All stages, second pair only (the
+  first pair's full profiles were not kept): 1.79 -> 1.38 CPU-s a window, of which the wind4 stage gives 0.32; the rest of that
+  difference is the machine's run-to-run drift (ctread equal, augment / phout lower), so the supported figure is about -0.25 to
+  -0.3 CPU-s a window of this mix (~-15%).
+
+## Latent-grid training and inference speed (2026-11-09, branch perf-20261109)
+
+**Update (evening): after merging latcomp (lat basis, --latents, guided heads, fit fields from latent nets).** The predict fast
+paths by checkpoint kind, each compared with the latcomp binary (6-step checkpoints, box 256 x 768 x 768, window 384, halo 64):
+- plain and `--lat-basis` rv: direct input (`nn_lat_pred_input`, basis: `nn_lat_pred_input_c` = the projections of the cell's 64
+  z-scored bytes, fp16 storage only) and direct rv bytes (`nn_lat_place_rv`): 351 / 371 of 151 M bytes differ, all by 1.
+- guided head (`lat_guide` 5), with or without basis: `nn_lat_place_rvg` upsamples the 2 side logits and 5 coefficient planes per
+  voxel and takes the CT terms from a byte copy of the window (the forward overwrites the shared one; 1 B per voxel), with the fp16
+  roundings of the slab path: 0 bytes differ. No 4-channel full-resolution input, no [2][W^3] fp16 logits.
+- `--latents`, `lat_guide` 8 rv, fit fields with `--fit-ct` / `--tta` / without `--no-out 1`: the latcomp path unchanged.
+- `--fit-zarr --no-out 1` from a latent net (`fzs` in predict.c; `UFSM_PRED_FIT_SLAB=0` off): the heads are upsampled (and guided,
+  `lat_guide` 8: x for the slab from the bytes, `nn_lat_ct_x`) only over the planes of each z chunk of field cells, the accumulators
+  run on the slab as a window of its own (z offset, mask pointer offset; the winding planes in a 2-channel slab with their +-d
+  neighbours). Chunks are capped at 768 MB of head planes. All 141 field files byte-identical to latcomp's for a phase, a
+  basis + guide-2 and a guide-2 checkpoint. A 640 window (guide 2, 19 planes) took 2.9 GB of the device beside an 11 GB trainer;
+  the whole-window buffer alone was 10 GB.
+Numbers: one RTX 5060 Ti 16 GB, `train --lat 4 --task unwrap2 --rv 1` (widths 32,64,128,192,256, 11 output channels), P 768, one batch
+repeated (`UFSM_BENCH_SAME=1`), phases timed with `UFSM_PTICK=1` (nn_ptick: device synchronised after every phase). PERF_REPORT.md
+has the full tables and what was measured on a busy GPU.
+- The profile before: 1307 ms a step (347 Mvox/s). The cell-grid trunk (pool + forward + backward + optimiser) was 131 ms; the
+  full-resolution head slabs took the rest: upsampling 605 ms (two passes), adjoint 220, label slab uploads 148, loss kernels 119,
+  target kernels 84.
+- `nn_lat_up_slab`: per axis the pool4 chain (two trilinear 2x steps) is a 3-tap filter of the cell grid (fine 4 c + r reads c - 1, c,
+  c + 1 with weights {.375 .625 0}, {.1875 .75 .0625}, {.0625 .75 .1875}, {0 .625 .375}; the mid grid's clamps only occur where
+  they fold onto the same edge cell). One thread per coarse cell writes its 4^3 voxels of every channel separably from 27 loads, each
+  fine row as one 8-byte store: 302 -> 29 ms a pass (now bound by writing 22 bytes a voxel). `nn_lat_up_adj`: stage 1 gathers each
+  fine plane onto the coarse (y, x) grid (10 x 10 loads per coarse cell and plane, weights from a table), stage 2 adds the planes
+  along z; the scratch is the slab's normal-target buffer (free after the losses): 220 -> 52 ms. Slabs that are not whole coarse
+  planes keep the per-voxel kernels (`UFSM_LAT_SLOW=1` forces them). `UFSM_LAT_CHECK=1` runs both in the trainer: 6.4e3 of 1.48e9 fp16
+  logits differ by one code, the coarse gradient by 1e-7 of its rms. Step 1 of a repeated batch has the same loss to the printed
+  digits and gn 7.14 against 7.12; later steps drift apart (the MX-fp4 trunk amplifies one-code differences).
+- Label slab uploads (`UFSM_LAT_STREAM`): slab j + 1 goes up on the aux stream into a second buffer set while slab j computes
+  (`UFSM_LAT_PIPE=0`: in the compute stream as before; +0.08 GB at P768, skipped when the device is full). Stream check 0 differing
+  bytes, losses identical with it on and off. Best 5-step windows on a shared GPU: 930 Mvox/s with, 564-636 without.
+- After: 602 ms a step measured without the upload pipeline (752 Mvox/s), <= 487 ms with it. Not adopted: one fused target kernel
+  (same time within noise: the targets are bound by their 14 written bytes a voxel; its normal targets differed by one code in 2e-4
+  of the voxels), 64-plane slabs (+2.5%, within noise), skipping unsupervised slabs (0 of 128 slabs in 8 windows; 51-94% of the
+  voxels carry the side loss).
+- The sampler now limits training: ~7.7 CPU-seconds per P512 window in steady state (17 Mvox/s per worker), and at start 86% of the
+  trainer's CPU samples sat in THP direct compaction (wbig_alloc's MADV_HUGEPAGE with defrag = defer+madvise on a full page cache).
+- predict `--channel rv` on a latent checkpoint: `nn_lat_pred_input` builds the cell-grid input from the CT bytes (the values of
+  nn_pred_input_d + nn_lowres_input, output bytes identical), `nn_lat_place_rv` writes each shard's bytes from the cell logits (the
+  upsampling above, nn_rv_fuse and nn_pred_place in one kernel: 1139 of 4.6e8 bytes differ by 1); no full-resolution input (8 B a
+  voxel), half-resolution intermediate (2 B) or fp32 logits (8 B): `--window 1152` fits beside a P768 trainer. The place kernels of
+  every predict run one thread per voxel of the interior-shard intersection (they ran over the whole interior per shard). With
+  `--shard 128` a shard is one 128^3 chunk, so `--threads` had no effect on the single writer thread (144 MB/s): up to 8 writer
+  threads now (`UFSM_PRED_WRITERS`). Box 1024 x 3072^2 of PHerc1667 at window 640, back to back at machine load 20: 66.0 -> 16.5 s
+  (7.6 s at a quieter moment; the writers and the CT reader bound it). tests/test_lat.c covers both new
+  kernels against the full-resolution chain.
+## Latent-grid networks and latcomp v1: train --lat 4, learned cell channels, latent stores (2026-11-09)
+- Why: at the production voxel net level 0 is ~86% of the activations (61.8 B per window voxel at P576). `train --lat 4` (task unwrap2 /
+  --rv; unet_cfg.half_res 3) runs the U-Net on the 4^3 cells of the window (widths 32,64,128,192,256, 5 levels); the losses stay at
+  full resolution: head_slab_pass upsamples the coarse logits one 32-plane slab at a time (nn_lat_up_slab: the pool4 chain of
+  nn_lowres_output, per axis a 3-tap filter of the cell grid; separable per-cell kernel since perf-20261109) and gathers each slab's
+  gradient back onto the cells (nn_lat_up_adj, the exact adjoint; tests/test_lat.c). The input is built on the device from the
+  augmented CT channel and the radial records (nn_input_lat: cell means).
+- Memory: label planes (phase, winding mod 4 + component, papyrus) live in pinned host memory and reach the device per head slab
+  (lab_stream: warped on the device as before, scratch = the input buffer, D2H; UFSM_LAT_STREAM=check: 0 of 8.7e9 slab bytes differ).
+  Device peak at P960: 10.2 -> 7.7 GB (one 5060 Ti; the voxel net fits P576). Host RAM is the limit above that (HOSTMEM_REPORT.md).
+  Two size limits of the scanner augmentation showed above P768: the Paganin x pass's shared memory (rows per block now follow 96 KB)
+  and the radial table (SA_MAXTAB 16 x SA_MAXP; SA_MAXP 1536).
+- Speed (perf-20261109, same batch, P768): the full-resolution slab work was 90% of a step (upsampling 605 ms of 1307); with the
+  separable upsampling and the two-stage adjoint a step is 602 ms (752 Mvox/s on the GPU side). The loader is the bottleneck:
+  ~60-78 Mvox/s per worker, and at most (slots - 1) windows are built at once (use --sampler-slots = --workers + 2).
+- latcomp v1, the learned cell channels (src/latfit.c, `train --lat-fit FILE`, `--lat-basis FILE --lat-c 13|29 --lat-step S
+  [--lat-step-jitter J]`): a cell's 64 z-scored CT values on an orthonormal basis fitted on real augmented training windows: row 0 the
+  cell mean, then the principal axes of the mean-removed cells. 24 windows of the rv recipe (778k cells): the mean carries 86% of the
+  voxel variance; of the rest 75% is in 3 axes, 96% in 13, 98.5% in 29. Coefficients are quantised with one step (orthonormal: the
+  rate-optimal allocation), |q| <= 127 (the mean: 16 bits), scaled by 1 / max(sigma, step) (the mean by 1/8) and fed with the 3 radial
+  cell means as C + 3 = 32 inputs (nn_input_latc in the trainer, nn_lat_input_x in predict: byte-identical, test_gpu_input). Rate /
+  distortion (zeroth-order entropy, z-scored CT): C 29 step 0.25: 0.89 bit per voxel, 23.9 dB; C 13 step 0.5: 0.47 bit, 20.5 dB. The
+  transform rides in the checkpoint header (lat_c / lat_step / lat_gain / lat_basis; UFSM_CHECKPOINT_HEADER 131072). The 32-input first
+  conv needs one MX format for its input and output: `--fp8 1` for now (the 4-input stem kernels take <= 8 channels).
+- Latent stores (`ufsm lc-encode BASIS ROOT KEY OUT`, src/lc_cli.c): sharded zarr v3 int8 [Z/4][Y/4][X/4](C + 1) through the embz
+  writer (zstd): the mean index as two bytes, then the axes. Coefficients are of the raw CT bytes with step_raw = step x sd_ref: a
+  window's z-score is linear (all voxels count, air included), so a reader gets the trainer's channels as
+  (q step_raw - [mean] 8 mean_w) / sd_w with mean_w / sd_w from the coefficients themselves (58.664 / 33.01 against the CT's
+  58.664 / 33.29 on a P1667 window). `predict --latents STORE` feeds a --lat-basis checkpoint from a store (nn_lat_input_q; the CT is
+  still read for the air mask and the radial channels). PHerc1667 level 2, a dense 768 x 1024^2 box: 0.175 B per voxel on disk
+  (5.7x under uint8; entropy 0.16), rms error 4.8 grey levels (34.5 dB).
+- Open: accuracy of the pair m768 (cell means) / k768 (learned channels) against rv1d2 on p1667 (FINDINGS.md when done); a tANS
+  container instead of zstd; a first conv for 32 fp8 inputs into fp4; predict without the CT read; compressed outputs.
+
+## Host RAM of train --lat at large windows (2026-11-09)
+- Accounting: `UFSM_HOSTMEM=1` (a `hostmem:` line per log line: pinned by caller, slots, per worker `big` / `ttmp` / pool residency via
+  mincore, mallinfo2), `UFSM_TP_LOG=1` (worker 0's pool calls by line), `UFSM_BATCH_HASH=1` (per-plane batch hashes, with --det 1).
+- The lat recipe (unwrap2 --rv, --gpu-aug 2) was 7 B/vox per slot + 11 B/vox per worker (P960 W18 S6: 213 GB, the OOMs). Now 5 + 5:
+  tm / pm slot planes skipped (sample_cfg.slot_skip), the stored-phase block's 4 planes in dead worker scratch (ttmp, big + P^3,
+  big + 9 P^3) for unwarped / device-warped windows, the ink plane built in the slot. Batches byte-identical (30 --det batches).
+- A worker builds into a slot it claims, so at most S - 1 windows are built at once: W8 S3 is slot-bound (P640: 38% wait; W4 S5 0%).
+  Use S = W + 2. P960 W8 S10 ~81 GB, P1280 W4 S6 ~106 GB (model 1.2 GB + P^3 (5 W + 5 S)). Details: HOSTMEM_REPORT.md.
+- Round 2: UFSM_SAMPLER_ONLY (GPU-free loader benchmark), UFSM_SAMPLER_PROF=2 (thread CPU per stage), UFSM_SAMPLER_RT (threads per
+  window, byte-identical). Loader CPU -11% per window (fused / skipped P^3 passes; P512 --det: 5.92 -> 5.25 thread-s, cycles -9%); per
+  worker 4 B/vox (phase built in place). The loader is CPU / DRAM-bandwidth bound at ~25-30 Mvox/s per core (decode 25%, wind4 25%);
+  reads ~0.33 B/vox, 80% phase labels, page-cache hit ~0: UFSM_STORE_NOCACHE=1; THP madvise off with --gpu-aug 2 (compaction stalls).
+- Round 3: `--replay K` interleaved (`--replay-gap G`, FIFO, default (S - W) K / (K - 1); --det 1 byte-identical between runs). P512 W4
+  S6 at load ~8: K=1 428, K=2 773, K=3 985 Mvox/s delivered. z3_read decodes volcomp chunks straight into the request box (window sink,
+  UFSM_Z3_SINK=0 off; tests/test_z3_sink): phase reads -12.5% CPU. xoshiro GF(2) jump-ahead for skipped draws; five more P^3 passes /
+  streams cut (the ignore and loss masks only when read, the rv plane from ct8). Loader -5..-10% CPU per Gvox vs round 2b (paired A/B),
+  batches byte-identical.
+
 ## Own dense embedding net (dino-train) and the dinovol port (2026-10-21/22)
 - `ufsm dinovol-embed` runs the scrollprize dinovol ViT (HF scrollprize/dinovol_8um_ps192_102126) in C/CUDA with embed_volume.py's
   lattice / blending / normalisation; `dinovol-read`, `dinovol-eval` (the sheet-identity check; `--codes` classifies misses by the winding

@@ -98,7 +98,8 @@ extern "C" int nn_get_grad_bf16(void);
 
 extern cudaError_t g_err;
 extern "C" const char *lp_check(void);
-#define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess && g_err == cudaSuccess) { g_err = e_; if (ufsm_env_on("UFSM_CUDA_TRACE")) fprintf(stderr,"CUDA at %s:%d (%s): %s\n",__FILE__,__LINE__,#x,cudaGetErrorString(e_)); } } while (0)
+extern const char *g_err_file, *g_err_what; extern int g_err_line;   /* the call site of the latched g_err (nn_check_site) */
+#define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess && g_err == cudaSuccess) { g_err = e_; g_err_file = __FILE__; g_err_line = __LINE__; g_err_what = #x; if (ufsm_env_on("UFSM_CUDA_TRACE")) fprintf(stderr,"CUDA at %s:%d (%s): %s\n",__FILE__,__LINE__,#x,cudaGetErrorString(e_)); } } while (0)
 #define KCHECK() CK(cudaGetLastError())
 
 extern "C" int nn_init(int device);
@@ -1978,7 +1979,6 @@ template <typename LT> __global__ void pred_out_k(const LT *lg, const uint8_t *c
 extern "C" void nn_pred_output(const float *lg, const uint8_t *ct, size_t n, uint8_t *out);
 /* the probability of the window's interior (halo .. W - halo) written straight into a device shard buffer (shard^3, x fastest):
    window voxel (z, y, x) lands at shard voxel (oz + z, oy + y, ox + x) when inside [0, e) (o = window origin - shard origin) */
-template <typename LT> __global__ void pred_place_k(const LT *lg, const uint8_t *ct, int D, int W, int hz, int halo, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh);
 extern "C" void nn_pred_place(const float *lg, const uint8_t *ct, int W, int halo, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh);
 /* exact window statistics (nonzero count, sum, sum of squares) of a uint8 window: integer sums, as the host loop computed */
 __global__ void pred_stats_k(const uint8_t *ct, size_t n, unsigned long long *acc);

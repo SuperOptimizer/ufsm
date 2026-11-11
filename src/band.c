@@ -1,6 +1,8 @@
+#include <stdatomic.h>
 /* Band field from a winding_mod14 raster (see band.h). Exact Euclidean feature transform (Felzenszwalb-Huttenlocher lower
    envelopes, separable over x, y, z) carrying the index of the nearest surface voxel. */
 #include "band.h"
+#include "band_w4dev.h"
 #include <math.h>
 #include <pthread.h>
 #ifdef __AVX2__
@@ -408,6 +410,9 @@ int band_wind4_ref(const uint8_t *phase, int D, int H, int W, int maxstep, size_
     free(map); free(u.r); free(u.size); free(u.edges); free(u.conf); free(s.rid[0]); free(s.rid[1]); free(s.jj[0]); free(s.jj[1]);
     return rc ? -1 : ncomp;
 }
+static _Thread_local w4_uf tl_u;   /* (band_wind4: the thread's union-find arrays between calls) */
+static void w4_tl_free(void) { free(tl_u.r); free(tl_u.size); free(tl_u.edges); free(tl_u.conf); memset(&tl_u, 0, sizeof tl_u); }
+void band_wind4_thread_free(void) { w4_tl_free(); }
 static int w4_grow(w4_uf *u, int32_t cur) {
     if ((size_t)cur >= u->cap) {
         u->cap = u->cap ? 2 * u->cap : 4096;
@@ -539,8 +544,10 @@ static int w4_pass1(w4_scan *s, w4_uf *u, const int16_t *map, uint8_t *w4, uint8
 int band_wind4(const uint8_t *phase, int D, int H, int W, int maxstep, size_t minsize, int maxcomp, uint8_t *w4, uint8_t *comp, band_wind4_stats *st) {
     if (maxcomp > 15) maxcomp = 15;
     const size_t pl = (size_t)H * W;
+    /* the union-find arrays stay with the thread between calls (a window's tiles, and windows): grown per tile by doubling and
+       freed after it they were 90% of a P768 trainer's page faults (2026-11-09, perf -e page-faults on production) */
     w4_scan s = {phase, D, H, W, maxstep, {malloc(pl * 4), malloc(pl * 4)}, {malloc(pl), malloc(pl)}};
-    w4_uf u = {0};
+    w4_uf u = tl_u; u.n = 0;
     uint8_t *jx = malloc(3 * (size_t)W);   /* (the joins of a row: x, y, z) */
     int rc = !s.rid[0] || !s.rid[1] || !s.jj[0] || !s.jj[1] || !jx ? -1 : w4_pass0(&s, &u, jx);
     int16_t *map = rc ? nullptr : malloc((u.n ? u.n : 1) * sizeof *map);
@@ -565,7 +572,8 @@ int band_wind4(const uint8_t *phase, int D, int H, int W, int maxstep, size_t mi
         rc = w4_pass1(&s, &u, map, w4, comp, jx);
     }
     if (st) { st->known = known; st->kept = kept; st->dropped_conflict = dropped_conf; st->ncomp = ncomp; st->runs = u.n; }
-    free(map); free(u.r); free(u.size); free(u.edges); free(u.conf); free(s.rid[0]); free(s.rid[1]); free(s.jj[0]); free(s.jj[1]); free(jx);
+    tl_u = u;   /* (kept: r / size / edges / conf of capacity cap) */
+    free(map); free(s.rid[0]); free(s.rid[1]); free(s.jj[0]); free(s.jj[1]); free(jx);
     return rc ? -1 : ncomp;
 }
 /* band_wind4 per tile of tile^3 voxels (the last tiles of an axis smaller), each tile's components their own gauges: a label
@@ -619,6 +627,81 @@ static int w4_tiled(w4_fn fn, const uint8_t *phase, int D, int H, int W, int til
 int band_wind4_tiled(const uint8_t *phase, int D, int H, int W, int tile, int maxstep, size_t minsize, int maxcomp, uint8_t *w4, uint8_t *comp, band_wind4_stats *st) {
     return w4_tiled(band_wind4, phase, D, H, W, tile, maxstep, minsize, maxcomp, w4, comp, st);
 }
+/* band_wind4_tiled on nthreads threads: the tiles are independent; each writes its raw codes / tile-local components into its own part
+   of w4 / comp, then the components get their global numbers (a prefix over the tiles' counts, raster order) in place: the same bytes */
+typedef struct {
+    const uint8_t *phase; int D, H, W, tile, maxstep, maxcomp; size_t minsize; uint8_t *w4, *comp;
+    int ntz, nty, ntx; _Atomic int next; int *nc; band_wind4_stats *st; _Atomic int fail; int pass; const int *base;
+} w4_mt;
+static void w4_tile_box(const w4_mt *m, int t, int *z0, int *y0, int *x0, int *nz, int *ny, int *nx) {
+    const int tz = t / (m->nty * m->ntx), ty = t / m->ntx % m->nty, tx = t % m->ntx;
+    *z0 = tz * m->tile; *y0 = ty * m->tile; *x0 = tx * m->tile;
+    *nz = m->D - *z0 < m->tile ? m->D - *z0 : m->tile; *ny = m->H - *y0 < m->tile ? m->H - *y0 : m->tile; *nx = m->W - *x0 < m->tile ? m->W - *x0 : m->tile;
+}
+static void *w4_mt_run(void *arg) {
+    w4_mt *m = arg; const int nt = m->ntz * m->nty * m->ntx; const size_t T3 = (size_t)m->tile * m->tile * m->tile;
+    uint8_t *tp = m->pass ? nullptr : malloc(T3), *tw = m->pass ? nullptr : malloc(T3), *tc = m->pass ? nullptr : malloc(T3);
+    if (!m->pass && (!tp || !tw || !tc)) { atomic_store(&m->fail, 1); free(tp); free(tw); free(tc); return nullptr; }
+    for (int t; (t = atomic_fetch_add(&m->next, 1)) < nt && !atomic_load(&m->fail);) {
+        int z0, y0, x0, nz, ny, nx; w4_tile_box(m, t, &z0, &y0, &x0, &nz, &ny, &nx);
+        if (!m->pass) {
+            for (int z = 0; z < nz; z++) for (int y = 0; y < ny; y++) memcpy(tp + ((size_t)z * ny + y) * nx, m->phase + ((size_t)(z0 + z) * m->H + y0 + y) * m->W + x0, (size_t)nx);
+            m->nc[t] = band_wind4(tp, nz, ny, nx, m->maxstep, m->minsize, m->maxcomp > 15 ? 15 : m->maxcomp, tw, tc, &m->st[t]);
+            if (m->nc[t] < 0) { atomic_store(&m->fail, 1); break; }
+            for (int z = 0; z < nz; z++) for (int y = 0; y < ny; y++) {
+                const size_t so = ((size_t)z * ny + y) * nx, d = ((size_t)(z0 + z) * m->H + y0 + y) * m->W + x0;
+                memcpy(m->w4 + d, tw + so, (size_t)nx); memcpy(m->comp + d, tc + so, (size_t)nx);
+            }
+        } else {
+            const int base = m->base[t];
+            for (int z = 0; z < nz; z++) for (int y = 0; y < ny; y++) {
+                uint8_t *w = m->w4 + ((size_t)(z0 + z) * m->H + y0 + y) * m->W + x0, *c = m->comp + ((size_t)(z0 + z) * m->H + y0 + y) * m->W + x0;
+                for (int x = 0; x < nx; x++) { const int cc = c[x]; if (cc == 255 || base + cc > 254) { w[x] = 255; c[x] = 255; } else c[x] = (uint8_t)(base + cc); }
+            }
+        }
+    }
+    free(tp); free(tw); free(tc);
+    return nullptr;
+}
+static void *w4_mt_helper(void *arg) { w4_mt_run(arg); w4_tl_free(); return nullptr; }   /* (a helper thread's union-find arrays die with it) */
+int band_wind4_tiled_mt(const uint8_t *phase, int D, int H, int W, int tile, int maxstep, size_t minsize, int maxcomp, uint8_t *w4, uint8_t *comp, band_wind4_stats *st, int nthreads) {
+    if (nthreads <= 1 || tile <= 0 || (tile >= D && tile >= H && tile >= W)) return band_wind4_tiled(phase, D, H, W, tile, maxstep, minsize, maxcomp, w4, comp, st);
+    w4_mt m = {.phase = phase, .D = D, .H = H, .W = W, .tile = tile, .maxstep = maxstep, .maxcomp = maxcomp, .minsize = minsize, .w4 = w4, .comp = comp,
+               .ntz = (D + tile - 1) / tile, .nty = (H + tile - 1) / tile, .ntx = (W + tile - 1) / tile};
+    const int nt = m.ntz * m.nty * m.ntx; if (nthreads > nt) nthreads = nt;
+    m.nc = calloc((size_t)nt, sizeof *m.nc); m.st = calloc((size_t)nt, sizeof *m.st); int *base = calloc((size_t)nt, sizeof *base);
+    pthread_t th[64]; int up[64] = {0}; if (nthreads > 64) nthreads = 64;
+    int rc = !m.nc || !m.st || !base ? -1 : 0;
+    for (int pass = 0; pass < 2 && !rc; pass++) {
+        m.pass = pass; m.base = base; atomic_store(&m.next, 0);
+        for (int i = 1; i < nthreads; i++) up[i] = !pthread_create(&th[i], nullptr, w4_mt_helper, &m);
+        w4_mt_run(&m);
+        for (int i = 1; i < nthreads; i++) if (up[i]) pthread_join(th[i], nullptr);
+        if (atomic_load(&m.fail)) rc = -1;
+        if (!pass && !rc) { int next = 0; for (int t = 0; t < nt; t++) { base[t] = next; next += m.nc[t]; } }
+    }
+    int next = 0; band_wind4_stats acc = {0};
+    if (!rc) for (int t = 0; t < nt; t++) { next += m.nc[t]; acc.known += m.st[t].known; acc.kept += m.st[t].kept; acc.dropped_conflict += m.st[t].dropped_conflict; acc.runs += m.st[t].runs; }
+    if (next > 255) next = 255;
+    acc.ncomp = next; if (st && !rc) *st = acc;
+    free(m.nc); free(m.st); free(base);
+    return rc ? -1 : next;
+}
 int band_wind4_tiled_ref(const uint8_t *phase, int D, int H, int W, int tile, int maxstep, size_t minsize, int maxcomp, uint8_t *w4, uint8_t *comp, band_wind4_stats *st) {
     return w4_tiled(band_wind4_ref, phase, D, H, W, tile, maxstep, minsize, maxcomp, w4, comp, st);
+}
+/* band_w4dev.h without the device code (tools and tests that link the sampler but not nn.o): the caller takes the CPU path. nn_w4.cu's
+   definition replaces this one wherever nn.o is linked. */
+[[gnu::weak]] int band_wind4_dev(const uint8_t *phase, int D, int H, int W, int tile, int maxstep, size_t minsize, int maxcomp, uint8_t *w4, uint8_t *comp, band_wind4_stats *st) {
+    (void)phase; (void)D; (void)H; (void)W; (void)tile; (void)maxstep; (void)minsize; (void)maxcomp; (void)w4; (void)comp; (void)st;
+    return -2;
+}
+/* the runs path of band_w4dev.h (train --gpu-aug 3 slots without the w4 / comp planes) needs nn.o: without it the sampler keeps the planes */
+[[gnu::weak]] int w4runs_available(void) { return 0; }
+[[gnu::weak]] int band_wind4_runs(const uint8_t *phase, int D, int H, int W, int tile, int maxstep, size_t minsize, int maxcomp, w4runs *o, band_wind4_stats *st) {
+    (void)phase; (void)D; (void)H; (void)W; (void)tile; (void)maxstep; (void)minsize; (void)maxcomp; (void)o; (void)st;
+    return -1;
+}
+[[gnu::weak]] void w4runs_apply_host(const uint8_t *phase, int D, int H, int W, int tile, int maxstep, const w4runs *o, uint8_t *w4, uint8_t *comp) {
+    (void)phase; (void)tile; (void)maxstep; (void)o; memset(w4, 255, (size_t)D * H * W); memset(comp, 255, (size_t)D * H * W);
 }
