@@ -6,6 +6,55 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Fibre continuity: why our traced fibres are short, `fiber-link`, tracer options (2026-11-11, branch fibers-20261110)
+
+Question: our fibres (fibhv-a step 10000 masks traced with `fiber-trace --mask`) are short; can tracing or joining make them longer
+without making them change sheet? Measured on Paris 4 HOLD (H family unless noted; masks at 9.6 um, scaledown 2; judge = `fiber-judge
+--phase` against GT phaseA as in `scripts/fibers/eval_hold.sh`; "persistent" = net sheet changes per metre of fibre; lengths in mm,
+float64 sums: an earlier float32 cumulative sum overstated totals by up to 16 %).
+
+| variant | lines | total m | median | mean | p90 | share >= 2 mm | persistent /m | pairs 0.3 / 0.6 / 1.2 / 2.4 mm |
+|---|---|---|---|---|---|---|---|---|
+| base (defaults) | 11675 | 7.33 | 0.57 | 0.63 | 0.84 | 0.01 | 47.5 | .969 / .956 / .944 (54) / 1.0 (5) |
+| --support 0.1 | 18182 | 11.86 | 0.58 | 0.65 | 0.90 | 0.01 | 54.2 | .969 / .949 / .981 / 1.0 |
+| --turn 50 | 17547 | 11.53 | 0.59 | 0.66 | 0.90 | 0.02 | 48.7 | .970 / .956 / .984 / 1.0 |
+| --st-r 3 (7^3 structure tensor) | 13983 | 8.55 | 0.56 | 0.61 | 0.83 | 0.00 | 41.0 | .975 / .941 / 1.0 / 1.0 |
+| --blur 1 | 53575 | 47.59 | 0.73 | 0.89 | 1.47 | 0.11 | 70.6 | .962 / .932 / .917 / .895 |
+| --blur 1 --st-r 3 | 70892 | 76.02 | 0.86 | 1.07 | 1.88 | 0.22 | 61.4 | .968 / .943 / .920 / .864 |
+| --blur 1 --st-r 3 --thr 128 --support 0.3 | 57328 | 54.00 | 0.78 | 0.94 | 1.58 | 0.13 | 59.3 | .969 / .943 / .928 / .927 |
+| --bridge 5 | 15466 | 9.82 | 0.57 | 0.63 | 0.86 | 0.01 | 54.8 | .967 / .947 / .944 / 1.0 |
+| --bridge 10 --st-r 3 | 24920 | 15.82 | 0.58 | 0.63 | 0.87 | 0.00 | 58.0 | .968 / .929 / .954 / 1.0 |
+| --axis-prior 1 (family direction in the layer plane) | 11368 | 6.76 | 0.55 | 0.59 | 0.78 | 0.00 | 96.7 | .951 / .880 / .923 / - |
+| base + fiber-link 0.1 mm | 11617 | 7.33 | 0.57 | 0.63 | 0.84 | 0.01 | 47.7 | .969 / .955 / .952 / 1.0 |
+| base + fiber-link 0.3 mm | 11581 | 7.34 | 0.57 | 0.63 | 0.85 | 0.01 | 48.1 | .969 / .954 / .954 / 1.0 |
+| base + overlap merge (Python prototype, 25 um) | 9142 | 6.07 | 0.59 | 0.66 | 0.98 | 0.02 | 53.2 | .968 / .947 / .935 / 1.0 |
+| official prediction, direction channels (reference) | 2204 H+V | 6.01 | 2.34 | 2.73 | 4.65 | 0.79 | H 54.7 / V 176.8 | H .969 / .966 / .961 / .952 |
+
+- Stop reasons of the base trace (line ends of kept lines): support 51 %, turn 31 %, coherence 15 %, box 3 %. Along the extrapolated
+  tangent beyond an end the mask presence falls from a median 117 to 53 within 13 voxels (0.12 mm).
+- The cause is the mask, not the tracer: on HOLD the H mask is >= 128 on 40 % of the papyrus (CT >= 64) and V on 47 %; one of the two
+  on 84 %, both on 3 %. The labels (`fiber-raster`) are positive within 2 voxels of a traced > 1 mm fibre and UNKNOWN elsewhere in
+  papyrus, so the net learned the H / V fibre LAYERS (a recto / verso-like segmentation), not individual fibres. A layer has no axis of
+  its own: the tube structure tensor is ambiguous inside it, and the family-direction prior (axis = H: normal x z, V: z projected into the
+  layer) does not help because the layer itself is blotchy along the fibre direction (lines still 0.55 mm, now ended by support 87 %).
+- Joining does not recover length: only 1 % of ends have a same-family end within 0.3 mm that continues them (gap, angle <= 30 deg,
+  lateral <= 30 um); a line's end is typically 33 um (median) from ANOTHER line running alongside, and 21 % of ends are continued by an
+  aligned neighbour within 25 um, but merging onto those (overlap prototype) adds little length and raises the change rate. On the official
+  prediction's traces linking finds 4-7 links of 2204: those lines end at real ends, not at gaps.
+- Defaults: unchanged. `fiber-link` (default --gap-mm 0.3) is safe to run (no measurable cost in the pair shares or change rate) but gives
+  ~1 % more length on today's traces; the tracer options (--st-r, --blur, --bridge, --axis-prior) stay off: each either changes nothing or
+  buys length with more sheet changes. --st-r 3 alone lowers the change rate (41.0 vs 47.5 /m) at equal length: a candidate default once
+  measured on V and on more boxes.
+- What would make long fibres: the predictor. (a) direction channels as targets (the tangent dyad at tube voxels, like the official
+  model's nx / ny): with direction the official prediction traces 4x longer lines than from its presence alone (2026-11-10: 74 vs 31
+  voxels); (b) negatives between fibres: a 0 shell around each traced fibre beyond its tube, with unknown only where the all-lengths AFV
+  (`*_SMALLMORE`, `*_all_v2`) has another trace, so the mask becomes tubular; (c) train at 19.2 um (tube 2 voxels = 38 um), closer to
+  the official model's scale. (b) is a label change only (`fiber-raster`), (a) needs a 3-channel head.
+
+New: `ufsm fiber-link IN.fib OUT.fib [--gap-mm 0.3] [--angle 30] [--lat-mm 0.03] [--tan-mm 0.05] [--links rows.tsv]` (`src/fiberlink.c`,
+`test_fiber_link`: a broken line rejoins in order, a crossing V line, a parallel and a perpendicular piece stay apart, a cut loop joins
+once); `fiber-trace` prints its stop reasons and takes `--st-r R`, `--blur R`, `--bridge K`, `--axis-prior 1` (mask mode).
+
 ## Fibre judge in C, streamlines from the official prediction, PHerc1299, the public human fibre annotations, H / V labels (2026-11-10, branch fibers-20261110)
 
 Follow-up of the section below. New commands, each with a fast-tier test on synthetic data: `ufsm fiber-judge` (`src/fiberjudge.c`,

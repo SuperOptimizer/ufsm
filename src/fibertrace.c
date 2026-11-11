@@ -139,7 +139,8 @@ int cmd_fiber_trace(int argc, char **argv) {
     if (sd < 0 || sd > 8 || bin < 1 || half < 1 || sep < 0 || sep > 8 || !(P.h > 0)) { fprintf(stderr, "fiber-trace: bad options\n"); return 2; }
     const char *cache = ft_opt(argc, argv, "--cache", nullptr); uint8_t *vol[3] = {nullptr, nullptr, nullptr}; int64_t o[3], n[3];
     const int str = atoi(ft_opt(argc, argv, "--st-r", "2")), blur = atoi(ft_opt(argc, argv, "--blur", "0"));
-    const int prior_on = atoi(ft_opt(argc, argv, "--axis-prior", "0"));   /* with --family H|V: the axis from the layer normal + the family direction */
+    const int prior_on = atoi(ft_opt(argc, argv, "--axis-prior", "0"));
+    const int bridge = atoi(ft_opt(argc, argv, "--bridge", "0")); size_t nbridge = 0;   /* steps straight on through a support dip */   /* with --family H|V: the axis from the layer normal + the family direction */
     if (str < 1 || str > 8 || blur < 0 || blur > 4) { fprintf(stderr, "fiber-trace: --st-r 1..8, --blur 0..4\n"); return 2; }
     const int mi = ft_flag(argc, argv, "--mask"), derive = mi || atoi(ft_opt(argc, argv, "--presence-only", "0")); const char famf = ft_opt(argc, argv, "--family", "?")[0];
     static const char *const nm[3] = {"presence", "nx", "ny"};
@@ -194,7 +195,14 @@ int cmd_fiber_trace(int argc, char **argv) {
             double p[3] = {p0[0], p0[1], p0[2]}, d[3] = {side ? -ds[0] : ds[0], side ? -ds[1] : ds[1], side ? -ds[2] : ds[2]};
             int why = FT_HALF;
             for (int k = 0; k < half; k++) {
-                double d1[3], d2[3], pm[3]; int r = ft_dir(&P, p, d, d1); if (r) { why = r; break; }
+                double d1[3], d2[3], pm[3]; int r = ft_dir(&P, p, d, d1);
+                if (r == FT_SUP && bridge > 0 && k + bridge < half) {   /* --bridge K: straight on through a support dip of up to K steps */
+                    double pb[3] = {p[0], p[1], p[2]}; int kb = 0, ok = 0;
+                    for (kb = 1; kb <= bridge; kb++) { for (int a = 0; a < 3; a++) pb[a] += P.h * d[a]; if (ft_dir(&P, pb, d, d1) == FT_OK) { ok = 1; break; } }
+                    if (ok) { for (int b = 1; b <= kb; b++) { double *q = side ? seedp - 3 * (++nb) : seedp + 3 * (++nf); for (int a = 0; a < 3; a++) q[a] = p[a] + b * P.h * d[a]; }
+                        for (int a = 0; a < 3; a++) p[a] = pb[a]; k += kb; nbridge++; r = FT_OK; }
+                }
+                if (r) { why = r; break; }
                 for (int a = 0; a < 3; a++) pm[a] = p[a] + 0.5 * P.h * d1[a];
                 if ((r = ft_dir(&P, pm, d1, d2))) { why = r; break; }
                 if (d2[0] * d[0] + d2[1] * d[1] + d2[2] * d[2] < P.cturn) { why = FT_TURN; break; }
@@ -224,7 +232,7 @@ int cmd_fiber_trace(int argc, char **argv) {
     printf("fiber-trace: box %lld %lld %lld + %lld %lld %lld at scaledown %d: presence >= %d in %.4f of the voxels, %zu seeds (%zu on an earlier line, %zu shorter than %.0f)\n",
            (long long)o[0], (long long)o[1], (long long)o[2], (long long)n[0], (long long)n[1], (long long)n[2], sd, thr, (double)npres / (double)nv, ns, skipped, shortl, minlen);
     printf("fiber-trace: %d streamlines (%zu H, %zu V), %d points, total length %.0f prediction voxels, mean %.1f -> %s\n", F.n, nH, (size_t)F.n - nH, F.npts, tot, F.n ? tot / F.n : 0, argv[4]);
-    printf("fiber-trace: line ends (kept lines): support %zu, coherence %zu, turn %zu, box %zu, half %zu\n", nstop[FT_SUP], nstop[FT_COH], nstop[FT_TURN], nstop[FT_BOX], nstop[FT_HALF]);
+    printf("fiber-trace: line ends (kept lines): support %zu, coherence %zu, turn %zu, box %zu, half %zu; %zu bridged dips\n", nstop[FT_SUP], nstop[FT_COH], nstop[FT_TURN], nstop[FT_BOX], nstop[FT_HALF], nbridge);
     if (fib_save(argv[4], &F)) { fprintf(stderr, "fiber-trace: cannot write %s\n", argv[4]); return 1; }
     free(line); free(occ); free(sd_); fib_free(&F); for (int k = 0; k < 3; k++) free(vol[k]);
     return 0;
