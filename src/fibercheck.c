@@ -439,9 +439,12 @@ int cmd_fiber_check(int argc, char **argv) {
    box-local native coordinates, clipped to the box plus --margin native voxels (a fibre leaving and re-entering becomes two runs), for
    fit --fibers. --shift adds a translation (native voxels, e.g. a local registration correction). */
 int cmd_fiber_export(int argc, char **argv) {
-    if (argc < 5) { fprintf(stderr, "usage: ufsm fiber-export <afv> <fields-dir> <out.fib> --tr T.json [--level 2] [--margin 8] [--shift dz,dy,dx] [--min-pts 4]\n"); return 2; }
-    const char *trp = fc_opt(argc, argv, "--tr", nullptr); double M[3][4], Mi[3][3];
-    if (!trp || fc_transform(trp, M, Mi)) { fprintf(stderr, "fiber-export: --tr needs a transform.json with a transformation_matrix\n"); return 2; }
+    if (argc < 5) { fprintf(stderr, "usage: ufsm fiber-export <afv | a.fib[,b.fib...]> <fields-dir> <out.fib> [--tr T.json] [--level 2] [--margin 8] [--shift dz,dy,dx] [--min-pts 4]\n"
+                                    "  UFIB inputs (ufsm fiber-trace output: level-0 voxels of the scan, z y x) need no --tr\n"); return 2; }
+    int ufib = 0; { FILE *mf = fopen(strchr(argv[2], ',') ? "" : argv[2], "rb"); char mg[4] = {0};
+        if (strchr(argv[2], ',')) ufib = 1; else if (mf) { ufib = fread(mg, 1, 4, mf) == 4 && !memcmp(mg, "UFIB", 4); } if (mf) fclose(mf); }
+    const char *trp = fc_opt(argc, argv, "--tr", nullptr); double M[3][4] = {{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}}, Mi[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
+    if (!ufib && (!trp || fc_transform(trp, M, Mi))) { fprintf(stderr, "fiber-export: --tr needs a transform.json with a transformation_matrix\n"); return 2; }
     const int level = atoi(fc_opt(argc, argv, "--level", "2")), minp = atoi(fc_opt(argc, argv, "--min-pts", "4")); const double mg = atof(fc_opt(argc, argv, "--margin", "8")), sc = ldexp(1.0, level);
     double sh[3] = {0, 0, 0}; if (*fc_opt(argc, argv, "--shift", "") && sscanf(fc_opt(argc, argv, "--shift", ""), "%lf,%lf,%lf", &sh[0], &sh[1], &sh[2]) != 3) { fprintf(stderr, "fiber-export: --shift dz,dy,dx\n"); return 2; }
     char fp[1200]; snprintf(fp, sizeof fp, "%s/fields.json", argv[3]);
@@ -458,8 +461,25 @@ int cmd_fiber_export(int argc, char **argv) {
         const double v[3] = {px, py, pz};
         for (int r = 0; r < 3; r++) { const double q = M[r][0] * v[0] + M[r][1] * v[1] + M[r][2] * v[2] + M[r][3]; if (q < lo[r]) lo[r] = q; if (q > hi[r]) hi[r] = q; }
     }
-    afv *A = afv_open(argv[2]); if (!A) return 1;
-    afv_run *R; const int nr = afv_query(A, lo, hi, &R); afv_close(A); if (nr < 0) return 1;
+    afv_run *R = nullptr; int nr = 0;
+    if (ufib) {   /* traced fibres: runs of level-0 (z, y, x) points, as AFV runs in (x, y, z) under the identity transform */
+        char lst[4096]; snprintf(lst, sizeof lst, "%s", argv[2]); int cr = 0;
+        for (char *t = strtok(lst, ","); t; t = strtok(nullptr, ",")) {
+            fib_set G = {0}; if (fib_load(t, &G)) { fprintf(stderr, "fiber-export: bad UFIB file %s\n", t); return 1; }
+            for (int r = 0; r < G.n; r++) {
+                const int a = G.off[r], b = G.off[r + 1]; double bl[3] = {1e30, 1e30, 1e30}, bh[3] = {-1e30, -1e30, -1e30};
+                for (int k = a; k < b; k++) for (int c = 0; c < 3; c++) { const double v = G.pts[3 * (size_t)k + 2 - c]; if (v < bl[c]) bl[c] = v; if (v > bh[c]) bh[c] = v; }
+                if (bh[0] < lo[0] || bl[0] > hi[0] || bh[1] < lo[1] || bl[1] > hi[1] || bh[2] < lo[2] || bl[2] > hi[2]) continue;
+                if (nr == cr) { cr = cr ? 2 * cr : 1024; R = realloc(R, (size_t)cr * sizeof *R); }
+                afv_run *q = &R[nr++]; memset(q, 0, sizeof *q); q->n = b - a; q->family = G.fam[r]; q->xyz = malloc((size_t)q->n * 3 * sizeof *q->xyz);
+                for (int k = a; k < b; k++) for (int c = 0; c < 3; c++) q->xyz[3 * (size_t)(k - a) + c] = G.pts[3 * (size_t)k + 2 - c];
+            }
+            fib_free(&G);
+        }
+    } else {
+        afv *A = afv_open(argv[2]); if (!A) return 1;
+        nr = afv_query(A, lo, hi, &R); afv_close(A); if (nr < 0) return 1;
+    }
     fib_set F = {0}; size_t cap = 1 << 16, rcap = 1024; F.pts = malloc(cap * 3 * sizeof(float)); F.off = malloc((rcap + 1) * sizeof(int)); F.fam = malloc(rcap); F.off[0] = 0;
     long nH = 0, nV = 0;
     for (int i = 0; i < nr; i++) {
