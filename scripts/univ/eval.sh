@@ -34,7 +34,10 @@ if has xres && [ "${WIND:-1}" = 1 ]; then
   for d in 0 -1; do log "xres DLV $d"; wb $T-xres$d BT=$WB/xres/boxes-xres.tsv BOXES=all DLV=$d; done
 fi
 if has rv && [ "${RV:-1}" = 1 ]; then
-  if grep -q "^== $T " $RVE/$T.txt 2>/dev/null && [ $(grep -c ' all ' $RVE/$T.txt) -ge $(echo $RVSC | wc -w) ]; then log "rv: done"; else log "rv: $RVSC"; GPU=$GPU bash $H/scripts/rv/eval.sh $CK $T "$RVSC" >> $E/$T/rv.out 2>&1; fi
+  if grep -q "^== $T " $RVE/$T.txt 2>/dev/null && [ $(grep -c ' all ' $RVE/$T.txt) -ge $(echo $RVSC | wc -w) ]; then log "rv: done"; else log "rv: $RVSC"
+    # RVU: the rv predict binary (default rv eval.sh's own); latent-grid checkpoints (WZARGS set and empty) get cubic windows (WZ=)
+    if [ -n "${WZARGS+x}" ] && [ -z "$WZARGS" ]; then GPU=$GPU U=${RVU:-/vesuvius/ufsm/v2/rv/bin/ufsm.ev} WZ= WINDOW=${WIN:-640} bash $H/scripts/rv/eval.sh $CK $T "$RVSC" >> $E/$T/rv.out 2>&1
+    else GPU=$GPU U=${RVU:-/vesuvius/ufsm/v2/rv/bin/ufsm.ev} bash $H/scripts/rv/eval.sh $CK $T "$RVSC" >> $E/$T/rv.out 2>&1; fi; fi
 fi
 if has fib && [ "${FIB:-1}" = 1 ] && [ -n "$FIBCH" ]; then   # FIBCH e.g. "H=0 V=1 dyad=2-7" (channel indices of CKPT)
   o=$E/$T/fib; mkdir -p $o; BOX=12288,4096,3584,512,576,768; J="--um 2.4 --level 2 --slab 12288,512 --region 4096,4608,3584,4352 --tile 256 --d-mm 0.3,0.6,1.2,2.4"
