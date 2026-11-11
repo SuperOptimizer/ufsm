@@ -139,6 +139,8 @@ $(B)/nn.o: $(NNOBJ)
 $(B)/nn_gpudec.o: NVFLAGS = -O3 $(NVARCH) -DUFSM_ARCH=$(ARCH) -fmad=false -Xcompiler -fno-threadsafe-statics -Isrc
 # count-field on the GPU mirrors the CPU's rounding (src/nn_cf.cu): IEEE division / sqrt, no FMA contraction, no fast math
 $(B)/nn_cf.o: NVFLAGS = -O3 $(NVARCH) -DUFSM_ARCH=$(ARCH) -fmad=false -Xcompiler -fno-threadsafe-statics -Isrc
+# the phase-raster pair rule on the GPU (src/nn_band.cu) is byte-identical to band.c: IEEE division / sqrt, no FMA contraction, no fast math
+$(B)/nn_band.o: NVFLAGS = -O3 $(NVARCH) -DUFSM_ARCH=$(ARCH) -fmad=false -Xcompiler -fno-threadsafe-statics -Isrc
 # FP8 / FP4 block-scaled mma (kind::mxf8f6f4 / kind::mxf4) needs the arch-specific sm_120a target
 # The low-precision kernels are split into one translation unit per kernel family (src/lp_*.cu, shared helpers in
 # src/lp_common.cuh) so make -j compiles them in parallel; $(B)/nn_fp8.o is their relocatable link, so every target
@@ -568,6 +570,10 @@ $(B)/test_ct_augment: tests/test_ct_augment.c $(B)/ct_augment.o
 
 $(B)/test_side: tests/test_side.c $(B)/band.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ -lm
+# the lean pair-rule EDTs and the GPU pair rule (nn_band.cu) against the previous band.c code, byte for byte
+$(B)/test_band_pair: tests/test_band_pair.c src/band.h src/bandgpu.h $(B)/band.o $(B)/nn_band.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(CUDA)/include $< $(B)/band.o $(B)/nn_band.o -o $@ $(LDLIBS) $(CUDALIBS)
+suite-bins: $(B)/test_band_pair
 
 $(B)/test_scan_augment: tests/test_scan_augment.c src/scan_augment.c src/scan_augment.h $(B)/ct_augment.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_scan_augment.c $(B)/ct_augment.o -o $@ -lm

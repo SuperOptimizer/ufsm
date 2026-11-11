@@ -36,6 +36,7 @@ test_cover                                     |              |     1 | ./$B/tes
 test_ct_augment                                |              |     1 | ./$B/test_ct_augment
 test_scan_augment                              |              |     2 | ./$B/test_scan_augment
 test_side                                      |              |     1 | ./$B/test_side
+test_band_pair                                 | gpu          |     2 | ./$B/test_band_pair
 test_votes                                     |              |     2 | ./$B/test_votes
 test_wind                                      |              |     1 | ./$B/test_wind
 test_phase_check                               |              |     1 | ./$B/test_phase_check
