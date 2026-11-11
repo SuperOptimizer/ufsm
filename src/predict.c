@@ -934,6 +934,7 @@ int cmd_predict(int argc, char **argv) {
     char geometry_sha[65],reference_sha[65]; int sheet_task=sheet_checkpoint(ckpt,geometry_sha,reference_sha);
     sheet_dataset *sheet=nullptr; const char *geometry=opt(argc,argv,"--geometry",nullptr);
     const char *reference=opt(argc,argv,"--reference",nullptr);
+    { FILE *cf=fopen(ckpt,"rb"); if (!cf) { fprintf(stderr,"predict: cannot open checkpoint %s: %s\n",ckpt,strerror(errno)); return 1; } fclose(cf); }   /* (sheet_checkpoint returns -1 for a missing file too, which read as a contract error) */
     if (sheet_task<0 || (sheet_task && !geometry && !reference) || (!sheet_task && (geometry || reference)) || (geometry && reference)) { fprintf(stderr,"winding prediction requires its --reference or --geometry contract; legacy models do not accept it\n"); return 2; }
     if (sheet_task) {
         sheet=reference?sheet_load_reference(reference):sheet_load(geometry);

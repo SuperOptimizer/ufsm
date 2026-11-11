@@ -56,6 +56,13 @@ scroll() {   # scroll SCROLL: R V UM LV AX QR QK PR PK PF (PF: CT voxels per lab
             QR=$GT/PHerc0814-wind-20261019/codes; QK=18.724; PR=$GT/PHerc0814-wind-20261019/phase; PK=18.724; PF=2;;
     PHerc0500P2) R=$MIRROR; V=PHerc0500P2/volumes/20250820143440-9.362um-1.2m-113keV-masked.zarr; UM=9.362; LV=0; AX=$GT/axis/PHerc0500P2-20250820143440.json
             QR=$GT/PHerc0500P2-wind-20261019/codes; QK=18.724; PR=$GT/PHerc0500P2-wind-20261019/phase; PK=18.724; PF=2;;
+    # cross-res (scripts/univ/xres_prep.sh, BT=$WB/xres/boxes-xres.tsv): the 9.36 um GT boxes on the registered 2.2-2.4 um scans, labels warped to level 3
+    xPHerc0139) R=$MIRROR; V=PHerc0139/volumes/20260102150214-2.399um-0.2m-78keV-masked.zarr; UM=2.399; LV=2; AX=$WB/xres/PHerc0139/axis.json
+            QR=$WB/xres/PHerc0139/codes; QK=19.192; PR=$WB/xres/PHerc0139/phase; PK=19.192; PF=2;;
+    xPHerc0814) R=$MIRROR; V=PHerc0814/volumes/20260309142202-2.399um-0.2m-78keV-masked.zarr; UM=2.399; LV=2; AX=$WB/xres/PHerc0814/axis.json
+            QR=$WB/xres/PHerc0814/codes; QK=19.192; PR=$WB/xres/PHerc0814/phase; PK=19.192; PF=2;;
+    xPHerc0500P2) R=$MIRROR; V=PHerc0500P2/volumes/20250526151718-2.215um-0.4m-111keV-masked.zarr; UM=2.215; LV=2; AX=$WB/xres/PHerc0500P2/axis.json
+            QR=$WB/xres/PHerc0500P2/codes; QK=17.72; PR=$WB/xres/PHerc0500P2/phase; PK=17.72; PF=2;;
     *) return 1;;
   esac
 }
@@ -65,8 +72,15 @@ lat_for() {   # lat_for SCROLL: its latent store in LATENTS (paris4j: paris4's),
 predict() {   # predict OUTFIELDS z y x nz ny nx LOG [big]: fit fields of the box (production window, 19.2 / 18.7 um cells, lossless phase)
   local f=$1 lg=$8 run=RUN lx; [ "${9:-}" = big ] && run=RUNBIG; rm -rf $f $f.tmp
   lx=$(lat_for ${sc:-}); [ -n "${LATENTS:-}" ] && [ -z "$lx" ] && { echo "wbench: LATENTS has no store for scroll ${sc:-?}" > $lg; return 1; }
-  $run ${UP:-$U} predict $CK $R $V $f.tmp --um $UM --level $LV --box $2,$3,$4,$5,$6,$7 ${WZARGS---window-z ${WINZ:-384} --halo-z ${HALOZ:-64}} --window ${WIN:-640} --halo ${HALO:-64} --shard 512 \
-    --grid-origin ${GO:-0,0,0} --ema 1 --q 8 --threads $THREADS --gpu $GPU --axis $AX --levels 1 --fit-zarr $f --fit-h 2 --fit-q 8 --fit-q-phase 0 ${PX:-} \
+  # DLV (resolution test, 2026-11-11): predict at level LV+DLV (DLV -1: 4.8 um input for the 9.6 um boxes, -2: 2.4 um, +1: 19.2 um) with
+  # the box in that level's voxels and --fit-h 2^(1-DLV), so the fit fields keep their 19.2 um cells and the fitter / codes are unchanged.
+  local dl=${DLV:-0} lv=$LV b0=$2 b1=$3 b2=$4 b3=$5 b4=$6 b5=$7 fh=2
+  if [ $dl != 0 ]; then lv=$((LV + dl)); [ $lv -ge 0 ] || { echo "wbench: DLV $dl below level 0 for scroll ${sc:-?}" > $lg; return 1; }
+    if [ $dl -lt 0 ]; then local m=$((1 << -dl)); b0=$((b0 * m)) b1=$((b1 * m)) b2=$((b2 * m)) b3=$((b3 * m)) b4=$((b4 * m)) b5=$((b5 * m)); fh=$((2 * m))
+    else local m=$((1 << dl)); b0=$((b0 / m)) b1=$((b1 / m)) b2=$((b2 / m)) b3=$((b3 / m)) b4=$((b4 / m)) b5=$((b5 / m)); fh=$((2 / m)); fi
+    [ $fh -ge 1 ] || { echo "wbench: DLV $dl leaves no fit cell" > $lg; return 1; }; fi
+  $run ${UP:-$U} predict $CK $R $V $f.tmp --um $UM --level $lv --box $b0,$b1,$b2,$b3,$b4,$b5 ${WZARGS---window-z ${WINZ:-384} --halo-z ${HALOZ:-64}} --window ${WIN:-640} --halo ${HALO:-64} --shard 512 \
+    --grid-origin ${GO:-0,0,0} --ema 1 --q 8 --threads $THREADS --gpu $GPU --axis $AX --levels 1 --fit-zarr $f --fit-h $fh --fit-q 8 --fit-q-phase 0 ${PX:-} \
     --no-out 1 --cache $CACHE ${lx:+--latents $lx} > $lg 2>&1; local rc=$?; rm -rf $f.tmp; return $rc
 }
 fitsc() {   # fitsc FIELDS OUT LOG [extra]: production fit + codes score + pair accuracy
