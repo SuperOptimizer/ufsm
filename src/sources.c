@@ -1,4 +1,5 @@
 #include "sources.h"
+#include "band_onfly.h"
 #include "json.h"
 #include "votes.h"
 #include "srpair.h"
@@ -233,7 +234,7 @@ sources *sources_load(const char *path) {
             const char *broot = json_str(json_get(bt, "root"), nullptr), *bkey = json_str(json_get(bt, "key"), "4.8");
             s->band_radius = (float)json_num(json_get(bt, "radius"), 80); s->band_span = (float)json_num(json_get(bt, "span"), 75);
             const json *pt0 = json_get(bt, "phase");
-            s->phase_only = !broot && pt0 && json_get(pt0, "level");   /* phase-only: the band handle aliases the stored phase (below) */
+            s->phase_only = !broot && pt0 && json_get(pt0, "level");   /* (also an "onfly" phase: the codes are read through it) */   /* phase-only: the band handle aliases the stored phase (below) */
             store *bs = broot ? store_open(broot) : nullptr;
             s->band = bs ? z3_open(bs, bkey, nullptr) : nullptr;
             if ((!s->band && !s->phase_only) || !(s->band_radius > 0) || !(s->band_span >= 0)) {
@@ -245,6 +246,16 @@ sources *sources_load(const char *path) {
                 const char *proot = json_str(json_get(pt, "root"), nullptr), *pkey = json_str(json_get(pt, "key"), "4.8");
                 store *ps = proot ? store_open(proot) : nullptr;
                 s->phase = ps ? z3_open(ps, pkey, nullptr) : nullptr;
+                const json *of = json_get(pt, "onfly");   /* {"root", "key", "rmax"}: the pair-rule phase computed from these codes on read
+                                                             (band_onfly.h; byte-identical to phase-raster --pair 1 on the codes' grid) */
+                if (of && !s->phase) {
+                    const char *cr = json_str(json_get(of, "root"), nullptr), *ck = json_str(json_get(of, "key"), "");
+                    const float rm = (float)json_num(json_get(of, "rmax"), 0);
+                    store *cs = cr ? store_open(cr) : nullptr; z3 *cz = cs ? z3_open(cs, ck, nullptr) : nullptr;
+                    s->phase = cz && rm > 0 ? phase_onfly_open(cz, rm) : nullptr;
+                    if (!s->phase) { z3_close(cz); fprintf(stderr, "sources: %s: phase onfly: cannot open the codes %s/%s or no \"rmax\" > 0\n", s->name, cr ? cr : "?", ck); json_free(j); sources_free(S); return nullptr; }
+                    s->phase_onfly = rm;
+                }
                 s->phase_level = (int)json_num(json_get(pt, "level"), 1); s->phase_direct = json_get(pt, "level") != nullptr;
                 const double sg = json_num(json_get(pt, "phase_sign"), 1);
                 if (sg != 1 && sg != -1) { fprintf(stderr, "sources: %s: \"phase_sign\" must be 1 or -1\n", s->name); json_free(j); sources_free(S); return nullptr; }

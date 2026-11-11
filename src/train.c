@@ -12,6 +12,7 @@
 #include "cover.h"
 #include <limits.h>
 #include "sources.h"
+#include "band_onfly.h"
 #include "split.h"
 #include "unet.h"
 #include "latfit.h"
@@ -2319,6 +2320,15 @@ int cmd_train(int argc, char **argv) {
     g_Sdiag = S;
     if (!S) return 1;
     g_S = S;
+    {   /* sources with an on-the-fly phase (band_onfly.h): the pair rule on --onfly-gpu (default the run's first GPU; -1 the CPU), its
+           --onfly-slots tile buffers of --onfly-mb each reserved now, before the memory planner reads the free device memory */
+        float rmax = 0; for (int i = 0; i < S->n; i++) if (S->src[i].phase_onfly > rmax) rmax = S->src[i].phase_onfly;
+        if (rmax > 0) {
+            const int og = atoi(opt(argc, argv, "--onfly-gpu", "0")), os = atoi(opt(argc, argv, "--onfly-slots", "2")), om = atoi(opt(argc, argv, "--onfly-mb", "2048"));
+            if (phase_onfly_config(og, os, om, 1)) { fprintf(stderr, "train: --onfly-gpu %d: no GPU pair rule (or the reserve failed)\n", og); return 1; }
+            fprintf(stderr, "train: on-the-fly phase on %s %d, %d slots of %d MB (tile edge %d voxels at rmax %g)\n", og >= 0 ? "GPU" : "CPU", og, os, om, phase_onfly_tile_edge(rmax), rmax);
+        }
+    }
     for (int i = 0; g_restore && i < S->n; i++) if (!S->src[i].srp != !g_rpairs) { fprintf(stderr, "--task restore: %s: \"sr_pair\" sources need --sr-pairs 1 and --sr-pairs 1 needs them all\n", S->src[i].name); return 2; }
     if (g_distill) {   /* --distill: which sources have feature targets, and whether their groups open with the head's channel count */
         int ns = 0, bad = 0;
