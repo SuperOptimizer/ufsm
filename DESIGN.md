@@ -32,6 +32,30 @@ Cost (per 896^3 window, rmax 80 at 4.8 um / 82 at 9.36 um):
 | + warp-per-line x pass (12x on that kernel) and envelope chunks sized to the tile (1.7x) | 512^3 test: 8 tiles | 0.62 s for 8 x 420^3 (was 1.2 s) | | |
 | RTX PRO 6000 pod, one 1064^3 tile (16 GB budget), before the kernel changes | 1 (1.67x) | 1.5 s | 2-4 s | 4.7 s |
 
+Then (same day): the codes decoded on the GPU (volcomp lossless mode 1: k_ll_sub one thread per substream with the chunk's 8 tANS
+tables in shared memory, k_ll_build the zigzag / prefix rebuild and the scatter into the box; the CPU only fetches the raw chunks and
+packs tables + aligned substreams; test_lldec: byte-identical to z3_read on SPARSE / DENSE / RAW / CONST blocks, seams, partial edge
+chunks), only the tile interior copied down (pinned), the envelope scratch without the F array:
+
+| PRO 6000 pod, 896^3 window, 9.36 um, rmax 82 | decode | parity 0 + 1 | pair | D2H | wall per window |
+|---|---|---|---|---|---|
+| one 1064^3 tile, codes decoded on the CPU | 2-3 s (CPU, 16 threads) | 0.47 s | 14 ms | 1.0 s pageable | 4.7 s |
+| one 1064^3 tile, GPU decode | 15-20 ms | 0.40-0.48 s | 14 ms | 14 ms (crop) | 0.73-0.81 s |
+| 8 tiles of 616^3 (8 GB budget) | 5-19 ms each | 37-73 ms each | 3 ms | 3 ms | 0.86-1.1 s (GPU ~0.53 s) |
+
+Training on the pod (u1 recipe, P 896, --mem fast, replay 3), an onfly PHerc0139 source vs a stored-phase 0500P2 source: 1.21 vs
+1.55-1.68 samp/s, loader wait 0% in both: the pair rule's ~0.5 s of GPU per window, shared over the window's 3 uses (~0.17 s per
+sample), on the same GPU as the training. Remaining CPU work: the raw chunk fetch / pack (~10-40 ms), the window memset and the copy
+of the interior into the sampler's host label plane (~0.25 s of one worker thread).
+
+Stored artifacts the universal sources still need, and why (2026-11-11):
+- CT (volcomp pyramids, the mirror): the input.
+- codes (winding_mod14 rasters of the q-assigned surfaces): the phase's input; the next step derives them from the meshes.
+- stored phase for the fused sets (PHerc0139, 0500P2, the 1667 9.6 um "phase"): their phase is the circular mean of two code sets
+  where they agree; onfly computes one set. Paris 4 p4full: until its 2x-pooled codes are written (codes-pool2) or it is relabelled.
+- recto / verso, normal, density, wind4 targets: already derived per window in the sampler from the phase (no stored rasters).
+- fibre H / V rasters (79 GB), teacher rasters, registered-twin warps: stored; on-the-fly versions are the later items of the list.
+
 nsys on a 420^3 tile (desk): x pass 45 -> 1.8 ms, the y / z envelopes 99 -> 57 ms (90% of what remains), pair kernel 4-8 ms, copies
 13 ms. Rastering a whole set once is ~1.6T voxel-work (1667 A: 77 min on the desk GPU); one u1-length run at ~16% onfly windows
 recomputes ~15T. What remains on the CPU and why: the codes decode (volcomp lossless mode 1: nn_gpudec only decodes the lossy mode 0),
