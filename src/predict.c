@@ -875,8 +875,11 @@ int cmd_predict(int argc, char **argv) {
         if (degrade || opt(argc, argv, "--aux", nullptr) || !strcmp(opt(argc, argv, "--split", "0"), "z") || atoi(opt(argc, argv, "--tta", "1")) > 1) {
             fprintf(stderr, "predict: --latents: no --aug-*, --aux, --split or --tta (they read the CT itself)\n"); return 2; }   /* (--fit-ct: the rebuilt CT) */
     }
-    { char *h = checkpoint_header_line(ckpt); const int isrv = h && strstr(h, "\"rv\":{\"version\":1"); free(h);
-      if (rvfuse && !isrv) { fprintf(stderr, "predict: --channel rv: %s is not a train --rv checkpoint\n", ckpt); return 2; }
+    int rv2c = -1;   /* train --rv 2 checkpoints: the recto / verso pair on its own channels (rv2c, rv2c + 1), interpolated (never the guided / sub-cell pair) */
+    { char *h = checkpoint_header_line(ckpt); const int isrv = h && strstr(h, "\"rv\":{\"version\":1"); const char *r2 = h ? strstr(h, "\"rv\":{\"version\":2,\"recto\":") : nullptr;
+      if (r2) rv2c = atoi(r2 + strlen("\"rv\":{\"version\":2,\"recto\":"));
+      free(h);
+      if (rvfuse && !isrv && rv2c < 0) { fprintf(stderr, "predict: --channel rv: %s is not a train --rv checkpoint\n", ckpt); return 2; }
       if (isrv && (opt(argc, argv, "--fit-fields", nullptr) || opt(argc, argv, "--fit-zarr", nullptr))) { fprintf(stderr, "predict: %s is a recto / verso (train --rv) checkpoint: channels 0-1 are not the phase (no --fit-*)\n", ckpt); return 2; } }
     const int out_ch = !strcmp(chs, "ink") ? checkpoint_ink_channel(ckpt) : rvfuse ? 0 : atoi(chs);
     if (!strcmp(chs, "ink") && out_ch < 0) { fprintf(stderr, "predict: --channel ink: %s has no ink channel (train --task unwrap2 --ink-head 1)\n", ckpt); return 2; }
@@ -1093,7 +1096,7 @@ int cmd_predict(int argc, char **argv) {
         if (k) nn_init(gpus[1]);
         if (gnh) unet_gn_freeze(uk, gnh);
         if (ffd || sweep_out) unet_set_head_channels(uk, 0, cfg.cout);   /* every head: the recto channel 0 is written, the others pooled (or swept) */
-        else if (rvfuse) unet_set_head_channels(uk, 0, cfg.lat_guide ? cfg.cout : 2);   /* --channel rv: both side logits, fused into channel 0 after the forward */
+        else if (rvfuse) unet_set_head_channels(uk, rv2c >= 0 && !cfg.lat_guide ? rv2c : 0, cfg.lat_guide ? cfg.cout : 2);   /* --channel rv: both side logits, fused into channel 0 after the forward */
         else if (!sheet_task) unet_set_head_channels(uk, hmode == 2 ? 8 * out_ch : out_ch, hmode == 2 ? 8 : 1);   /* only the written logit channel (desk widths: -24 B per window voxel) */
         /* fp16 logits (MX activations): the readers below take them as they are (nn_set_logits_h16 after each forward); the 11 heads
            of --fit-zarr were 44 B per window voxel in fp32, which pushed 640^3 windows past the 16 GB card (paged: 40x slower).
@@ -1105,6 +1108,13 @@ int cmd_predict(int argc, char **argv) {
         if (cfg.scale_cond && !(pcut >= 0 && pap_cond == 1)) {   /* voxel-size conditioning: the CT level's voxel size, or --scale-um to override */
             const double sum_ = atof(opt(argc, argv, "--scale-um", "0"));
             unet_set_scale(uk, sum_ > 0 ? sum_ : um * (1 << level));
+        }
+        if (cfg.film) {   /* per-level scale FiLM (train --film): codes log2(um / 4.8) of the grid and of the data, both the CT level's voxel size (no zoom);
+                             --scale-um / --film-data-um override them (e.g. an upsampled coarse scan: data um its native size) */
+            const double g_ = atof(opt(argc, argv, "--scale-um", "0")), d_ = atof(opt(argc, argv, "--film-data-um", "0")), lu = um * (1 << level);
+            const float c[2] = {unet_scale_code(g_ > 0 ? g_ : lu), unet_scale_code(d_ > 0 ? d_ : g_ > 0 ? g_ : lu)};
+            unet_set_film(uk, c, cfg.film);
+            if (!k) fprintf(stderr, "predict: scale FiLM codes %.3f / %.3f (grid / data um %g / %g)\n", c[0], c[1], g_ > 0 ? g_ : lu, d_ > 0 ? d_ : g_ > 0 ? g_ : lu);
         }
         if (k) nn_init(gpu);
     }
@@ -1179,7 +1189,7 @@ int cmd_predict(int argc, char **argv) {
            nn_lat_place_rv): no 14 bytes a voxel in the estimate. k stays <= 4: with one 128^3 chunk per shard the run is bound by the shard
            writers and the CT reader, and windows of 8^3 shards skip less air (box 1024 x 3072^2 of PHerc1667: 4608 shards compressed against 3584) */
         const float *lb_, *lg_; float ls_;   /* (not --latents or the guided head: those hold the full-resolution input) */
-        const int lat_lean = half && hdiv == 4 && hmode == 1 && (cfg.cin == 4 || (half == 3 && unet_lat_basis(u, &lb_, &lg_, &ls_) && nn_get_f16())) && rvfuse && !ffd && tta <= 1 && !fea && !auxz && nn_get_tf32() && nn_get_act_bf16() && !ufsm_env_on("UFSM_ACT_MX8")
+        const int lat_lean = rv2c < 0 && half && hdiv == 4 && hmode == 1 && (cfg.cin == 4 || (half == 3 && unet_lat_basis(u, &lb_, &lg_, &ls_) && nn_get_f16())) && rvfuse && !ffd && tta <= 1 && !fea && !auxz && nn_get_tf32() && nn_get_act_bf16() && !ufsm_env_on("UFSM_ACT_MX8")
                              && (!getenv("UFSM_PRED_LAT_INPUT") || ufsm_env_on("UFSM_PRED_LAT_INPUT")) && (!getenv("UFSM_PRED_LAT_DIRECT") || ufsm_env_on("UFSM_PRED_LAT_DIRECT"));
         for (int k = 4; k >= 1; k--) {
             const int Wc = k * shard + 2 * hk;
@@ -1307,7 +1317,7 @@ int cmd_predict(int argc, char **argv) {
         /* --fit-zarr from a latent-grid net (--no-out 1, no --fit-ct: its ray reads the whole window): the heads upsampled (and guided) only over
            the planes of each z chunk of field cells, not [cout][W^3] fp16 (10 GB at W 640); UFSM_PRED_FIT_SLAB=0: the whole window */
         fzs = ffd && ffzm && half && hdiv == 4 && hmode == 1 && h16 && gpath && !ffct && tta <= 1 && !fea && !sheet_task && !slab && WR.skip && !(W % 4) && (!getenv("UFSM_PRED_FIT_SLAB") || ufsm_env_on("UFSM_PRED_FIT_SLAB"));
-        gdir = (cfg.lat_guide == 5 || cfg.lat_guide == 64) && half && hdiv == 4 && hmode == 1 && rvfuse && gpath && !fea && !ffd && tta <= 1 && !sheet_task && !slab && (!getenv("UFSM_PRED_LAT_DIRECT") || ufsm_env_on("UFSM_PRED_LAT_DIRECT"));
+        gdir = rv2c < 0 && (cfg.lat_guide == 5 || cfg.lat_guide == 64) && half && hdiv == 4 && hmode == 1 && rvfuse && gpath && !fea && !ffd && tta <= 1 && !sheet_task && !slab && (!getenv("UFSM_PRED_LAT_DIRECT") || ufsm_env_on("UFSM_PRED_LAT_DIRECT"));
         if (((gdir && cfg.lat_guide == 5) || (fzs && cfg.lat_guide == 8)) && ct_shared && !ctcp && !(ctcp = nn_malloc(w3))) { fprintf(stderr, "predict: no device memory for the guided head's CT copy\n"); return 1; }   /* (the forward overwrites ctd) */
         { const float *b_, *g_; float s_; const int lc_ = half == 3 ? unet_lat_basis(u, &b_, &g_, &s_) : 0;   /* (--latents and the guided head's slab path read the full-resolution input; a
                                                                                                                  --lat-basis checkpoint: nn_lat_pred_input_c, fp16 storage) */
@@ -1794,7 +1804,7 @@ int cmd_predict(int argc, char **argv) {
                bytes (nn_lat_place_rv; the guided head: nn_lat_place_rvg, its CT terms from the bytes); no full-resolution logits
                (UFSM_PRED_LAT_DIRECT=0: the fp32 / guided fp16 volume, nn_rv_fuse, nn_pred_place). Not for the fit fields (every head at full resolution) */
             static int latdir = -1; if (latdir < 0) latdir = !getenv("UFSM_PRED_LAT_DIRECT") || ufsm_env_on("UFSM_PRED_LAT_DIRECT");
-            const int ldir = latdir && half && hdiv == 4 && hmode == 1 && rvfuse && (!cfg.lat_guide || gdir) && gpath && sup && !fea && !ffd && tta <= 1 && !sheet_task && Wz == W;
+            const int ldir = latdir && rv2c < 0 && half && hdiv == 4 && hmode == 1 && rvfuse && (!cfg.lat_guide || gdir) && gpath && sup && !fea && !ffd && tta <= 1 && !sheet_task && Wz == W;
             const float *l2d = nullptr;
             if (half) {   /* the network on blocks of the window: its input from the 4-channel window, its logits back to full resolution */
                 const float *lbas, *lgain; float lstep; const int latc = half == 3 ? unet_lat_basis(u, &lbas, &lgain, &lstep) : 0;
@@ -1833,6 +1843,11 @@ int cmd_predict(int argc, char **argv) {
                     if (!gsl) gsl = nn_malloc(10 * ns_ * 2);
                     if (!h16 && cfg.lat_guide != 64) { fprintf(stderr, "predict: the guided head needs 16-bit inputs\n"); return 2; }
                     for (int z0 = 0; z0 < W; z0 += 32) {
+                        if (rv2c >= 0) {   /* --rv 2: its interpolated pair */
+                            nn_lat_up_slab((const char *)l2 + (size_t)rv2c * cv_ * es_, unet_logits_h16(u), 2, W / 4, W / 4, W / 4, z0, 32, gsl);
+                            for (int c = 0; c < 2; c++) nn_d2d_async((char *)lgf + ((size_t)c * w3 + (size_t)z0 * hw_) * 2, (char *)gsl + (size_t)c * ns_ * 2, ns_ * 2);
+                            continue;
+                        }
                         nn_lat_up_slab(l2, unet_logits_h16(u), 2, W / 4, W / 4, W / 4, z0, 32, gsl);
                         if (cfg.lat_guide == 64) {   /* the sub-cell head: the side pair's per-voxel terms */
                             if (!ufsm_env_on("UFSM_PRED_NOSHUF")) nn_lat_shuffle(l2, unet_logits_h16(u), W / 4, W / 4, W / 4, 16, 2, z0, 32, gsl);   /* (diagnostic: the interpolated base alone) */
