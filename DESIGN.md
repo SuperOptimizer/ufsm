@@ -6,6 +6,42 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Fibre votes in fit-join (stitching): `--fibers --join-fib`, measured at the four Paris 4 slab sites (2026-11-11, branch fibers-20261110)
+
+`ufsm fit-join ... --fibers F.fib --join-fib W [--join-fib-arc 0.6] [--join-fib-gap 0]`: a fibre lies in one sheet, so over a short
+arc its two ends have the same W up to the network phase change along it. For each slab boundary, every fibre stretch that crosses it
+(resampled at 1 native voxel; the phase unwrapped along it as `fit.c` fib_pairs: confidence >= 0.2, gaps <= 2 bridged, a fast change
+cuts) gives pairs (a below, b above, <= arc mm apart, both ends >= gap mm from the boundary, a in slab k-1's box and b in slab k's) that
+vote round(W_k(b) - W_k-1(a) - dP); |dP| >= 0.5 (a hop the phase sees) drops the pair, residues > 0.3 turn are dropped. The votes'
+histogram adds W x -log P_fib(d) to the overlap's chain cost (chain mode and the `--ref` DP; refused with `--global`). Inputs: our own
+fibres, `scripts/fibers/wbfib_sites.sh` (fibhv-a step 10000, V family only: vertical fibres cross z boundaries; a +-72 native-voxel
+band around the boundary over the whole cross-section, 4 y tiles; tracing ~15 min per 2 Gvox tile), exported into the joined crop's
+frame (`fiber-export` now takes UFIB inputs). Test: test_fit_join, `--chain-w 0` (fibres alone) recovers the +3 gauge between two
+slabs of the synthetic spiral with 60 of 240 fibres hopping a sheet at the boundary (the unwrap drops them), ids 1.0000.
+
+Measured with `scripts/fibers/wbjoin_fib.sh` (wbench SLABS=1 protocol: wind96 fields, slabs A [0, 96) / B [64, 160) field cells,
+interiors [32, 160) / [160, 288) native, one boundary per site; slab fits and joined scores with the pinned wbench fitter b29b1bda):
+
+| site | overlap share(mode) | fibre votes (gap 0.3 mm, arc 1.2 mm) | fibre share(mode) | offset: overlap / fibres alone | joined ids, every variant |
+|---|---|---|---|---|---|
+| 4624 | 0.490 | 235,485 | 0.546 | +1 / +1 | 0.2403 |
+| 5392 | 0.521 | 235,334 | 0.495 | +37 / +37 | 0.3268 |
+| 5904 | 0.469 | 321,669 | 0.546 | +101 / +101 | 0.2093 |
+| 6672 | 0.388 | 351,522 | 0.325 | -6 / -6 | 0.2207 |
+
+- The fibres alone pick the overlap's integer at all four sites, so `--join-fib 1` and `4` (with or without the gap) change nothing:
+  joined ids and p4x are identical to the plain join (difference exactly 0 on 4 of 4 sites; no interval to give).
+- Without a gap the votes sample W at fibre points next to the boundary, i.e. the overlap again (shares within 0.03 of the overlap's);
+  with both ends >= 0.3 mm from the boundary, beyond the overlap's edges, the shares are the same. Fibre votes are an independent
+  confirmation of a whole-cross-section slab offset, not a correction: here the offset is never wrong.
+- The joined scores are low (0.21-0.33) because the slab fits are (the A / B fits alone: 0.24-0.37); fit-join has one integer per
+  slab pair, so a mis-join that is wrong in one region and right elsewhere (the 1218 / 1299 story) is invisible to it. Fibre votes
+  can help stitching only at the piece level: the slip repair inside a fit (`--uw-rep-fib`, +0.021 ids on 15 boxes, 2026-11-05) or a
+  per-region join. Next step if wanted: `fit-join` with per-region offsets (the overlap and fibre histograms per y / x tile), checked
+  first with the per-tile overlap modes, which this measurement does not log.
+- Unrelated, found here: this branch's `ufsm fit` stops with "an illegal memory access" after stage 4 on these 96 x 3328 x 3520 crops
+  (sites 4624, 5904, 6672; also on an idle GPU), where the pinned b29b1bda fitter runs (1218 s per slab fit). Not investigated.
+
 ## Fibre retrain: ring labels, a direction head, the smoothed-axis check (2026-11-11, branch fibers-20261110)
 
 Follow-up of the section below (our masks mark fibre layers, not tubes).
