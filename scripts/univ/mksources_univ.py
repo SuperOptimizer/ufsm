@@ -86,13 +86,31 @@ for s in src:   # teacher fibre targets on the winding entries
     if os.path.exists(f"{d}/done"):
         s["targets"]["fibre_h"] = {"root": f"{d}/H", "group": ".", "encoding": "prob254"}
         s["targets"]["fibre_v"] = {"root": f"{d}/V", "group": ".", "encoding": "prob254"}; s["heads"] = dict(s["heads"], fibre=0.3)
-# 3-D ink GT (inkB, U4): INK (the fragment, /vesuvius/ufsm/inkgt/sources-inkgt.json) as ink-only entries (heads ink 1, the others 0;
-# no band, so the sampler draws in the occupancy cells), their labelled-voxel weights floored at INKFLOOR (0.02 of the fragment, so the
-# small scans 0814 / MAN5 / 0500P2 are seen at all) and scaled to INKSHARE (0.15) of all windows; their own holdout file (every wbench
-# box, the 9.36 boxes mapped into the fine scans, the ink eval crops).
-INK = os.environ.get("INK", "/vesuvius/ufsm/inkgt/sources-inkgt.json"); IS = float(os.environ.get("INKSHARE", "0.15")); IF = float(os.environ.get("INKFLOOR", "0.02"))
-isrc = json.load(open(INK))["sources"] if os.path.exists(INK) else []
-for s in isrc: s["weight"] = max(s["weight"], IF)
+# 3-D ink GT (inkB, U4; INK = the fragment /vesuvius/ufsm/inkgt/sources-inkgt.json). Per the coordinator (2026-11-11): where a winding
+# entry reads the same CT scan (Paris 4 20260411134726: june, july, june48; 1667 20251217075048: gt, A48, B48), the "ink" target goes
+# onto that entry (heads ink 1), so one window trains winding + rv + ink; its holdouts become the union of the entry's and the ink file
+# (the wbench boxes first, so the validation box stays first; plus the mapped 9.36 boxes and the ink eval crops). The other scans (0139
+# and 0500P2, whose winding GT is on the 9.362 um scans, and 0814 / 0841 / 0009B / MAN5) stay ink-only entries, together INKSHARE of
+# the windows (0 until univA confirms that ink-only windows skip the winding losses; then 0.05), labelled-voxel weights floored at
+# INKFLOOR (0.02 of the fragment).
+INK = os.environ.get("INK", "/vesuvius/ufsm/inkgt/sources-inkgt.json"); IS = float(os.environ.get("INKSHARE", "0")); IF = float(os.environ.get("INKFLOOR", "0.02"))
+def scan(ct): return ct.split("/")[-1]
+def hunion(name, files):
+    boxes, seen = [], set()
+    for f in files:
+        for bx in json.load(open(f))["boxes"]:
+            k = (scan(bx["ct"]), tuple(bx["l0"]))
+            if k not in seen: seen.add(k); boxes.append(bx)
+    hf = os.path.join(os.path.dirname(os.path.abspath(out)), f"holdouts-{name}.json")
+    json.dump({"note": "union of " + ", ".join(files) + " (mksources_univ.py)", "boxes": boxes}, open(hf, "w"), indent=1); return hf
+isrc = []
+for s in (json.load(open(INK))["sources"] if os.path.exists(INK) else []):
+    host = [w for w in src if "band" in w["targets"] and scan(w["ct"]) == scan(s["ct"])]
+    if not host: s["weight"] = max(s["weight"], IF); isrc.append(s); continue
+    for w in host:
+        w["targets"]["ink"] = copy.deepcopy(s["targets"]["ink"]); w["heads"] = dict(w["heads"], ink=1)
+        w["holdout_file"] = hunion(w["name"], [w["holdout_file"], s["holdout_file"]])
+if IS == 0: isrc = []
 tot = sum(s["weight"] for s in src); ft = sum(s["weight"] for s in fsrc); it = sum(s["weight"] for s in isrc)
 share = FS if fsrc else 0.0; ishare = IS if isrc else 0.0
 for s in src: s["weight"] = round(s["weight"] / tot * (1 - share - ishare), 4)
