@@ -32,9 +32,17 @@ def lvl1(base, name, root, weight, note):
     # once level 1 is mirrored with `ufsm mirror`)
     sc, scan = e["ct"].split("/", 1); e["root"] = MIRROR; e["ct"] = f"{sc}/volumes/{scan}" if MIRROR.startswith("http") else e["ct"]
     e["targets"]["band"]["phase"] = {"root": root, "key": "4.8", "level": 1}; return e
+# ONFLY=1 (once univA's on-the-fly phase is on master): 1667 A / B read the phase from their 4.798 codes in the sampler (pair rule, rmax
+# 80 codes voxels = --radius 160 / --gs 2; univA: 0 differing voxels vs phase{A,B}48 on 6 windows of 896^3) instead of the stored sets.
+# Paris 4 June stays stored (partial) until its level-1 codes (codesA48, lost with pod 2) are rebuilt; 0139 / 0500P2 / 1667 9.6 stay
+# stored (fused A / B phase, not on the fly yet).
+ONFLY = os.environ.get("ONFLY", "0") == "1"; C1667 = "/vesuvius/ufsm/gt/PHerc1667-wind-20261016"
 for k in ("A", "B"):
     r = f"{B1}/gt/1667/phase{k}48"
-    if os.path.exists(f"{r}/done"):
+    if ONFLY and os.path.exists(f"{C1667}/codes{k}/zarr.json"):
+        e = lvl1(g1667, f"PHerc1667-{k}48", r, 0.1, f"1667 codes{k} 4.798, phase on the fly (pair rule, rmax 80)")
+        e["targets"]["band"]["phase"] = {"onfly": {"root": f"{C1667}/codes{k}", "key": "4.798", "rmax": 80}, "level": 1}; src.append(e)
+    elif os.path.exists(f"{r}/done"):
         src.append(lvl1(g1667, f"PHerc1667-{k}48", r, 0.1, f"B1 4.8 um phase, 1667 codes{k} (phase-raster --gs 2 --pair 1 --radius 160)"))
 p4 = next(s for s in T["sources"] if s["name"] == "PHercParis4-june"); r = f"{B1}/gt/paris4/phaseA48"
 if os.path.exists(f"{r}/4.8/zarr.json"):
@@ -77,6 +85,7 @@ for s in fsrc: s["weight"] = round(s["weight"] / ft * share, 4)
 src += fsrc
 json.dump({"cache": T.get("cache", "/vesuvius/ufsm/cache"), "sources": src}, open(out, "w"), indent=1)
 for s in src:
-    tg = s["targets"]; r = tg["band"]["phase"]["root"] if "band" in tg else tg["fibre_h"]["root"]
+    tg = s["targets"]; ph = tg["band"]["phase"] if "band" in tg else None
+    r = (ph.get("root") or "onfly:" + ph["onfly"]["root"]) if ph else tg["fibre_h"]["root"]
     print(f"{s['name']:22s} um {s['um']:<6} levels {s['min_level']}-{s['max_level']} weight {s['weight']:.3f} heads {','.join(s['heads'])} {r}")
 print("->", out)
