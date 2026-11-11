@@ -138,7 +138,8 @@ enum { BG_MAXS = 16 };
 static bg_ctx g_ctx[BG_MAXS];
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_cv = PTHREAD_COND_INITIALIZER;
 static int g_slots = 2, g_dev = 0;
-static const int g_xw = !getenv("UFSM_BAND_X1");   /* (UFSM_BAND_X1: the thread-per-line x pass, for A/B) */
+static const int g_xw = !getenv("UFSM_BAND_X1");
+static const int g_timing = getenv("UFSM_BAND_TIMING") != nullptr;   /* per-call stage times on stderr */   /* (UFSM_BAND_X1: the thread-per-line x pass, for A/B) */
 
 extern "C" void band_pair_gpu_slots(int slots, int device) { pthread_mutex_lock(&g_mu); g_slots = slots < 1 ? 1 : slots > BG_MAXS ? BG_MAXS : slots; g_dev = device; pthread_mutex_unlock(&g_mu); }
 extern "C" void band_pair_gpu_free(void) {   /* every idle context's buffers (call once no block thread is inside) */
@@ -168,9 +169,13 @@ static int bg_run(bg_ctx &G, const uint8_t *codes, const int n[3], float rmax, u
     BG_CK(cudaSetDevice(g_dev));   /* (per host thread state: set every call) */
     const long Lmax = nz > ny ? nz : ny, nlines = (nz * nx > ny * nx ? nz * nx : ny * nx), lc = bg_lines(N, Lmax, nlines);
     if (bg_alloc(G, N, Lmax, lc)) return -1;
+    cudaEvent_t ev[6]; const int tim = g_timing; if (tim) for (int k = 0; k < 6; k++) cudaEventCreate(&ev[k]);
+    if (tim) cudaEventRecord(ev[0], G.st);
     BG_CK(cudaMemcpyAsync(G.codes, codes, N, cudaMemcpyHostToDevice, G.st));
+    if (tim) cudaEventRecord(ev[1], G.st);
     for (int par = 0; par < 2; par++) {
         int32_t *id = par ? G.io : G.ie;
+        if (tim && par) cudaEventRecord(ev[2], G.st);
         if (g_xw) k_bg_xw<<<(unsigned)((nz * ny + 7) / 8), 256, 0, G.st>>>(G.codes, nz * ny, (int)nx, par, id);
         else k_bg_x<<<(unsigned)((nz * ny + BT - 1) / BT), BT, 0, G.st>>>(G.codes, (int)(nz * ny), (int)nx, par, id);
         for (int ax = 1; ax < 3; ax++) {
@@ -181,10 +186,16 @@ static int bg_run(bg_ctx &G, const uint8_t *codes, const int n[3], float rmax, u
             }
         }
     }
+    if (tim) cudaEventRecord(ev[3], G.st);
     k_bg_pair<<<(unsigned)((N + 255) / 256), 256, 0, G.st>>>(G.codes, G.ie, G.io, N, (int)ny, sz, sy, rmax * rmax, G.phase);
     BG_CK(cudaGetLastError());
+    if (tim) cudaEventRecord(ev[4], G.st);
     BG_CK(cudaMemcpyAsync(phase, G.phase, N, cudaMemcpyDeviceToHost, G.st));
+    if (tim) cudaEventRecord(ev[5], G.st);
     BG_CK(cudaStreamSynchronize(G.st));
+    if (tim) { float t[5]; for (int k = 0; k < 5; k++) cudaEventElapsedTime(&t[k], ev[k], ev[k + 1]);
+        fprintf(stderr, "band gpu: %ldx%ldx%ld: H2D %.1f ms, parity 0 %.1f, parity 1 %.1f, pair %.1f, D2H %.1f\n", nz, ny, nx, t[0], t[1], t[2], t[3], t[4]);
+        for (int k = 0; k < 6; k++) cudaEventDestroy(ev[k]); }
     return 0;
 }
 
