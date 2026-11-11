@@ -6,6 +6,37 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Manual winding annotation: ufsm annotate-serve / annot-export / annot-regions (2026-11-11, branch annot-20261111)
+
+Why: the automatic judges disagree with the eye (CT coherence ranks 1218 / 1299 low, the fibre judge sees 1299 cross sheets in some
+tiles); the user wants to enter winding labels and verdicts by hand. A local tool, no Python: `ufsm annotate-serve CT-ROOT CT-KEY --um U0
+--store ANN.json [--level L] [--wraps DIR] [--labels ROOT KEY] [--fibers F.fib] [--regions REGIONS.tsv]` serves one page (src/annot_page.html,
+embedded with #embed) on 127.0.0.1 only. Launcher: `scripts/annot/serve.sh PHerc1299|PHerc1218|PHercParis4 [PORT]`.
+
+- Viewer: three planes (z, y, x) through a shared cursor, CT pyramid levels >= L as zoom (shift+wheel), wheel steps the slice, drag pans.
+  Overlays: wrap cuts (each wrap's vertex grid, stride 2, cut by the plane per request; colour and number = wrap index), the label array
+  (phase / codes, base level only; 255 = unknown), fibres within 1.5 voxels of the plane (UFIB, H yellow / V cyan), annotations.
+- Speed (desk, PHerc1299 level 2): a 600 x 400 slice 0.13 s cold (decoded 128^3 chunks are kept in an LRU, --cache-gb 2: neighbouring
+  slices and pans decode nothing new); wrap cuts of 109 snapped wraps over a 2048^2 region 0.12 s; fibre points (5.7 M loaded) 0.01 s.
+  The 109 wraps load in a background thread (the .sfc decoder is not thread-safe) in about a minute; the page polls and redraws.
+- Annotation types (level-0 voxel coordinates): point (p, optional winding w, optional same_as), pair (a, b, dw = w(b) - w(a)),
+  line (pts, optional w: one sheet followed by clicks), region (box, verdict good / bad / unknown), wraperr (p, wrap, kind cuts / skips
+  / doubles / other). The server validates each item, assigns id / time / author (client values are replaced), writes the snapshot
+  (ANN.json, atomic rename) and appends every operation to ANN.json.log (add / del / undo; never rewritten). Undo reverts the newest
+  add or del of the session.
+- Work queue: `ufsm annot-regions OUT.tsv --judge T.tsv ... [--wrapcheck W --wraps D --um0 U]` ranks fibre-judge tiles by persistent
+  sheet changes per metre of fibre (tiles under --min-arc 0.3 m dropped) and adds non-"real" wrap-check verdicts at the wrap's bbox
+  centre (whole-wrap flags: the centre is only a starting point). The page's "next flagged region" button walks it.
+- Consumers: `ufsm annot-export ANN.json`
+  - `--fib OUT.fib`: same-sheet runs (lines, dw 0 pairs, same_as points) as UFIB (family 'M', level-0): `fiber-export` into a fit box and
+    `fit --fibers F --uw-rep-fib W` (branch fibers-20261110) use them as slip-repair votes today.
+  - `--pairs OUT.tsv`: every relation "za ya xa zb yb xb dw" incl. dw != 0 and pairs of winding-numbered points within --dmax. A fitter
+    hook for dw != 0 (fit --annot / --w-annot next to uwr_fib) is not written yet: uwr_fib lives on fibers-20261110, not on this branch.
+  - `--gate OUT.boxes --level L`: region verdicts in the `phase-coh --box-scale` format (good 1, bad 0; unknown omitted).
+  - `--points DIR --like ROOT KEY --level L [--radius 2]`: sparse winding raster (w mod 254, 255 unknown) on a label grid.
+- Test: test_annot (store validate / del / undo / reload / log lines, wrap cut flat + tilted + region filter, server on a z3w fixture
+  pyramid: /info, /slice bytes on two levels incl. the array edge, /ann add / invalid / snapshot, page, 404).
+
 ## Physically based sheet rendering: what ink looks like on the surface without an ink model (2026-11-11, branch pbr-20261111)
 `ufsm sheet-pbr <tifxyz-dir> <out-dir> --ct ROOT KEY --crop U0,V0,N [--ss S]` renders the papyrus surface of a published segment crop
 as a physical object (src/sheetpbr.c). Surface: the tifxyz grid through Catmull-Rom splines (C1, no 48 um grid-cell creases), outward

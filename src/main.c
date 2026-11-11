@@ -213,6 +213,9 @@ static int usage(void) {
         "  ufsm ink-cover <render-dir>   per rendered wrap on papyrus: ink share >= t, mean ink, stroke contrast\n"
         "  ufsm wrapdist <wraps-dir> <labels-root> <labels-key>              wrap vertices vs the nearest labelled sheet\n"
         "  ufsm wrapswitch <wraps-dir> <codes-root> <codes-key>            how often the wraps switch sheets (per cm)\n"
+        "  ufsm annotate-serve <ct-root> <ct-key> --um U0 --store ANN.json [--wraps D] [--labels R K] [--fibers F] [--regions T]   manual winding annotation page (127.0.0.1)\n"
+        "  ufsm annot-export ANN.json [--fib F] [--pairs T] [--gate B --level L] [--points DIR --like R K --level L]   annotations -> fitter votes / gate boxes / sparse codes\n"
+        "  ufsm annot-regions OUT.tsv [--judge T.tsv ..] [--wrapcheck W --wraps D --um0 U]   flagged regions (fibre judge, wrap check) for annotate-serve --regions\n"
         "  ufsm wrap-check <model> <fields-dir> [--ct ROOT KEY --ct-um U] [--codes ROOT KEY]   duplicate / merged wraps: CT peaks between adjacent wraps along radial rays\n"
         "  ufsm surf-snap <wraps-in> <wraps-out> --volume ROOT KEY --vol-um U   tifxyz vertices onto the nearest papyrus ridge\n"
         "  ufsm wrap-snap <wraps-in> <wraps-out> --axis F --axis-um U0 --ct ROOT KEY --ct-um U   .sfc wraps moved along their rays onto the sheets (smooth, order-kept)\n"
@@ -4493,6 +4496,9 @@ int cmd_fields_pack(int argc, char **argv);   /* src/fieldspack.c */
 int cmd_ink_gate(int argc, char **argv);   /* src/inkgate.c */
 int cmd_fit_join(int argc, char **argv);   /* src/fitjoin.c */
 int cmd_wrap_check(int argc, char **argv);   /* src/wrapcheck.c */
+int cmd_annotate_serve(int argc, char **argv);   /* src/annot.c */
+int cmd_annot_export(int argc, char **argv);   /* src/annot_export.c */
+int cmd_annot_regions(int argc, char **argv);
 int cmd_fields_oracle(int argc, char **argv);   /* src/fieldsoracle.c */
 int cmd_flatten(int argc, char **argv);         /* src/flatten.c */
 int cmd_faces(int argc, char **argv);           /* src/faces_cli.c */
@@ -4558,6 +4564,9 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "fit")) return cmd_fit(argc, argv);
     if (!strcmp(cmd, "fit-join")) return cmd_fit_join(argc, argv);
     if (!strcmp(cmd, "wrap-check")) return cmd_wrap_check(argc, argv);
+    if (!strcmp(cmd, "annotate-serve")) return cmd_annotate_serve(argc, argv);
+    if (!strcmp(cmd, "annot-export")) return cmd_annot_export(argc, argv);
+    if (!strcmp(cmd, "annot-regions")) return cmd_annot_regions(argc, argv);
     if (!strcmp(cmd, "fields-oracle")) return cmd_fields_oracle(argc, argv);
     if (!strcmp(cmd, "flatten")) return cmd_flatten(argc, argv);
     if (!strcmp(cmd, "faces")) return cmd_faces(argc, argv);
