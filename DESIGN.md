@@ -6,6 +6,57 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Physically based sheet rendering: what ink looks like on the surface without an ink model (2026-11-11, branch pbr-20261111)
+`ufsm sheet-pbr <tifxyz-dir> <out-dir> --ct ROOT KEY --crop U0,V0,N [--ss S]` renders the papyrus surface of a published segment crop
+as a physical object (src/sheetpbr.c). Surface: the tifxyz grid through Catmull-Rom splines (C1, no 48 um grid-cell creases), outward
+normal by the crop's convexity (recto = inner face, faces.h convention). Profiles along the normal every 0.25 voxel (trilinear CT,
+`--interp cubic` tricubic). Recto face: the steepest rise (air -> papyrus) of the smoothed profile, first on an 8-px lattice within
+[-15, +5] voxels of the mesh, robustly smoothed (Gaussian 3 cells, points > 3 voxels off dropped, 4 rounds), then as ONE continuous
+surface by dynamic programming (row Viterbi then column Viterbi over the offset within +-6 voxels of that, transition cost 0.5 |dt|,
+|dt| <= 1 voxel per sample, column pass tied to the row result), refined sub-voxel (parabola through the derivative) within +-0.5
+voxel of the DP surface. Verso: the steepest fall around its neighbourhood median. Shading of the recto height field seen from the
+recto side: Lambert + GGX (alpha 0.35, F0 0.04), 12 raking lights at 15 deg with cast shadows, horizon AO, exposure 2 / 98 % + gamma.
+Diagnostics: near-surface CT (first 4.8 um inside), thickness, high-pass / roughness / curvature of the height, `--xsec` cross-sections
+with the faces drawn, `--layers` CT on parallel layers, `--profiles`.
+
+Data: Paris 4 segments 20260701183125-w028-037, ...26-w038-045, ...27-w046-052 (open-data bucket, the 2.4 um tifxyz on
+20260411134726, CT level 0 from the volcomp mirror, q 8). Crops (2048^2 px = 4.9 x 4.9 mm) chosen where the published 2D ink
+prediction covers ~35 % of a fully surfaced 2 x 2-tile block. The reference is that published ink PREDICTION
+(new_canon_autoresearch_recipe, a model output): no human ink labels exist for these 2026 segments; the HF bucket's
+ink/phercparis4/wNN_<2023 segment> sets are on the 7.91 um 2023 scan and need the 2023 -> 2026 registration.
+
+Findings:
+- The 2.4 um meshes are tilted / offset relative to the sheets (cross-sections: the bands cross t = 0 at ~2 deg, tens of voxels over
+  a crop) — consistent with segments carried over from the 7.91 um scan. Sheets in the inner wraps are packed: no clean void, gaps are
+  8-10 voxel dips, ~20 voxels between interfaces (fibre layers / sheets), so a per-sample interface finder hops between interfaces
+  (first draft: piecewise-flat plateaus). After the DP: per-sample steepest rise more than 1 voxel off the continuous surface at
+  35.5 / 37.8 / 39.0 % of samples (w046 / w038 / w028); runner-up edge >= 0.7 of the best (ambiguous) at 7.5 / 9.3 / 9.3 %; faces
+  found at 86-87 %; mean recto-verso distance 20-25 voxels (48-60 um).
+- The shaded surface shows the papyrus itself (horizontal / vertical fibre strips, relief, crackle in the near-surface CT); fine
+  diagonal hatching in the raking lights is a sampling artefact (0.25-voxel DP offsets), not texture.
+- AUC against the ink prediction (pos >= 160, neg <= 64; raw / detrended by a 0.7 mm Gaussian; tie-aware ranks):
+
+| map | w028-037 | w038-045 | w046-052 |
+|---|---|---|---|
+| flat CT at the mesh | 0.577 / 0.539 | 0.530 / 0.526 | 0.433 / 0.420 |
+| max CT +-3 | 0.586 / 0.539 | 0.553 / 0.546 | 0.426 / 0.412 |
+| near-recto CT | 0.567 / 0.527 | 0.567 / 0.558 | 0.462 / 0.463 |
+| thickness | 0.479 / 0.529 | 0.462 / 0.451 | 0.538 / 0.576 |
+| recto height | 0.568 / 0.605 | 0.558 / 0.522 | 0.518 / 0.517 |
+| height high-pass | 0.486 / 0.484 | 0.493 / 0.492 | 0.495 / 0.494 |
+| roughness | 0.548 / 0.644 | 0.494 / 0.423 | 0.550 / 0.458 |
+| curvature | 0.510 / 0.507 | 0.503 / 0.501 | 0.505 / 0.505 |
+| RTI min (12 lights) | 0.489 / 0.438 | 0.503 / 0.532 | 0.466 / 0.499 |
+| PBR (GGX + shadows + AO) | 0.457 / 0.445 | 0.497 / 0.502 | 0.471 / 0.485 |
+| best single CT layer | t -35: 0.553 / 0.582 | t -2: 0.532 / 0.529 | t +2: 0.433 / 0.419 |
+
+  No physical surface map separates the predicted ink: every AUC is within 0.40-0.64 and the sign flips between crops (flat CT 0.58
+  on w028, 0.43 on w046). Two readings, not yet separated: carbon ink leaves no relief / density signature our sampling resolves at
+  2.4 um with q 8 compression; or the reference itself (a model prediction, on a mesh that does not sit on one face) marks letters at
+  a layer our tracked recto is not on. Next: human-labelled segments (the 2023-scan labels through the new registration), the 1.129 um
+  scan (meshes exist, on-20260608103018), --ss 2 / 4 on sub-crops, and the face on the side the ink model's input layers sit.
+Outputs: /vesuvius/ufsm/pbr/out/<crop>/{contact.png, png/*.png, *.f32, map.json, auc.json}.
+
 ## Own dense embedding net (dino-train) and the dinovol port (2026-10-21/22)
 - `ufsm dinovol-embed` runs the scrollprize dinovol ViT (HF scrollprize/dinovol_8um_ps192_102126) in C/CUDA with embed_volume.py's
   lattice / blending / normalisation; `dinovol-read`, `dinovol-eval` (the sheet-identity check; `--codes` classifies misses by the winding

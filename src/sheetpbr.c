@@ -231,6 +231,12 @@ static int write_pgm(const char *dir, const char *name, const float *a, int W, d
     free(row); fclose(f); return 0;
 }
 static int write_auto(const char *dir, const char *name, const float *a, int W) { double lo, hi; pctl(a, (size_t)W * W, 0.005, 0.995, &lo, &hi); return write_pgm(dir, name, a, W, lo, hi); }
+/* shaded images: exposure from the 2 / 98 % points, display gamma 1 / 2.2 */
+static int write_shade(const char *dir, const char *name, const float *a, int W) {
+    double lo, hi; pctl(a, (size_t)W * W, 0.02, 0.98, &lo, &hi); const size_t n = (size_t)W * W; float *g = malloc(n * sizeof *g);
+    for (size_t i = 0; i < n; i++) { const double t = (a[i] - lo) / (hi - lo); g[i] = a[i] == a[i] ? (float)pow(t < 0 ? 0 : t > 1 ? 1 : t, 1 / 2.2) : NAN; }
+    const int r = write_pgm(dir, name, g, W, 0, 1); free(g); return r;
+}
 static int write_f32(const char *dir, const char *name, const float *a, int W, FILE *js, int *first) {
     char p[1400]; snprintf(p, sizeof p, "%s/%s.f32", dir, name); FILE *f = fopen(p, "wb"); if (!f) return -1;
     const size_t n = (size_t)W * W; const int ok = fwrite(a, sizeof *a, n, f) == n; fclose(f);
@@ -503,6 +509,8 @@ int cmd_sheet_pbr(int argc, char **argv) {
     pthread_t th[64]; const int nt = nth < 64 ? nth : 64;
     for (int t = 0; t < nt; t++) pthread_create(&th[t], nullptr, pass2, &J);
     for (int t = 0; t < nt; t++) pthread_join(th[t], nullptr);
+    size_t namb = 0, nmov = 0, n2 = 0;   /* pass-2 (unconstrained) statistics */
+    for (size_t i = 0; i < NN; i++) if (J.valid[i] > 0) { n2++; namb += J.amb[i] >= 0.7; }
     size_t ndisagree = 0, ndp = 0;
     if (atoi(popt(argc, argv, "--dp", "1"))) {
         const int KD = (int)(atof(popt(argc, argv, "--dp-range", "6")) / J.step + 0.5), KE = 2 * KD + 1;
@@ -526,8 +534,6 @@ int cmd_sheet_pbr(int argc, char **argv) {
     /* pass 3, continuity: every sample re-finds its faces within +-cw voxels of the median of its neighbourhood (pass 2 faces), i.e. a
        face may deviate at most cw from its surroundings; samples that moved by more than cw were discontinuous in pass 2 */
     const double cw = atof(popt(argc, argv, "--cont-win", "1.25")); const int cr2 = (int)(atof(popt(argc, argv, "--cont-r", "3")) * J.ss + 0.5);
-    size_t namb = 0, nmov = 0, n2 = 0;
-    for (size_t i = 0; i < NN; i++) if (J.valid[i] > 0) { n2++; namb += J.amb[i] >= 0.7; }
     if (cw > 0 && !atoi(popt(argc, argv, "--dp", "1"))) for (int it = 0; it < 2; it++) {
         float *mr = malloc(NN * sizeof *mr), *mv = malloc(NN * sizeof *mv), *r0 = malloc(NN * sizeof *r0);
         median2d(J.r, mr, J.W, cr2); median2d(J.v, mv, J.W, cr2); memcpy(r0, J.r, NN * sizeof *r0);
@@ -562,11 +568,11 @@ int cmd_sheet_pbr(int argc, char **argv) {
     for (int l = 0; l < nl; l++) {
         const double az = 2 * M_PI * l / nl, Lv[3] = {cos(elev) * cos(az), cos(elev) * sin(az), sin(elev)};
         ltctx LC = {&F, Lv, relief, alpha, dlo, dhi, l == (nl * 3) / 8, J.nin, ao, img, rmax, rmin, pbr, pbd}; prows(J.W, lt_row, &LC);
-        char nmb[32]; snprintf(nmb, sizeof nmb, "light_%02d", l); write_auto(out, nmb, img, J.W);
+        char nmb[32]; snprintf(nmb, sizeof nmb, "light_%02d", l); write_shade(out, nmb, img, J.W);
     }
     float *rr = malloc(NN * sizeof *rr); for (size_t i = 0; i < NN; i++) rr[i] = rmax[i] - rmin[i];
-    write_auto(out, "rti_max", rmax, J.W); write_auto(out, "rti_min", rmin, J.W); write_auto(out, "rti_range", rr, J.W); write_auto(out, "ao", ao, J.W);
-    write_auto(out, "pbr", pbr, J.W); write_auto(out, "pbr_density", pbd, J.W);
+    write_shade(out, "rti_max", rmax, J.W); write_shade(out, "rti_min", rmin, J.W); write_auto(out, "rti_range", rr, J.W); write_auto(out, "ao", ao, J.W);
+    write_shade(out, "pbr", pbr, J.W); write_shade(out, "pbr_density", pbd, J.W);
     { snprintf(p, sizeof p, "%s/normals.ppm", out); FILE *f = fopen(p, "wb"); fprintf(f, "P6\n%d %d\n255\n", J.W, J.W);
       for (int y = 0; y < J.W; y++) for (int x = 0; x < J.W; x++) { double N[3]; hnormal(&F, x, y, relief * 4, N); const uint8_t c[3] = {(uint8_t)(127.5 + 127.5 * N[0]), (uint8_t)(127.5 + 127.5 * N[1]), (uint8_t)(127.5 + 127.5 * N[2])}; fwrite(c, 1, 3, f); }
       fclose(f); }
