@@ -13,7 +13,7 @@
 #            default 1152; init wz896, the full augmentation set): samples/s and the loader wait. Raise WORKERS / SLOTS if the wait is high.
 #   resume   u1 on this pod: K/runs/u1/last.ckpt = the staged checkpoint, scripts/univ/u1.train.sh with the u1 recipe (the relaunch
 #            line's flags), the run's own commit's binary; the uw / FiLM / stem / optimizer state and the step come from the checkpoint.
-# Env: K, T (threads; default cgroup CPUs - 4), GPUS (0,1), P (u1: 896), WORKERS / SLOTS (11 / 13 per the desk; raise with RAM).
+# Env: K, T (threads; default cgroup CPUs - 4), GPUS (0,1), SRCJ (sources, default K/sources-u1-pod.json), DRYP (bench dry-run P list), BENCHP, P (u1: 896), WORKERS / SLOTS (11 / 13 per the desk; raise with RAM).
 set -uo pipefail; K=${K:-/workspace/univ}; D=$(dirname "$(readlink -f "$0")"); ST=${*:-setup kit 1667 sources verify}
 GPUS=${GPUS:-0,1}; mkdir -p $K/runs $K/cache; cd $K
 NC=$(python3 -c "import os; print(len(os.sched_getaffinity(0)))"); [ -r /sys/fs/cgroup/cpu.max ] && read -r q per < /sys/fs/cgroup/cpu.max && [ "$q" != max ] && NC=$((q / per)); T=${T:-$((NC > 8 ? NC - 4 : 4))}
@@ -21,7 +21,7 @@ U=$K/ufsm/build/ufsm; UR=$K/ufsm-u1/build/ufsm; [ -f $K/ckpt/u1-commit.txt ] || 
 say() { echo "== $(date '+%F %T') pod_univ: $*"; }
 # u1run NAME STEPS P BINARY: the u1 recipe (scripts/univ/u1.train.sh + the desk relaunch line's flags; auto-resume from K/runs/NAME/last.ckpt,
 # else --init-from wz896), CT from the mirror. The bench / dry runs use the same launcher so their loader wait includes the augmentations.
-u1run() { (cd $K/runs && R=$K/runs U=$4 SRCJ=$K/sources-u1-pod.json GPU=$GPUS LOCK= P=$3 ARCH="--widths 96,128,160,192" WORKERS=${WORKERS:-11} \
+u1run() { (cd $K/runs && R=$K/runs U=$4 SRCJ=${SRCJ:-$K/sources-u1-pod.json} GPU=$GPUS LOCK= P=$3 ARCH="--widths 96,128,160,192" WORKERS=${WORKERS:-11} \
   SLOTS=${SLOTS:-13} MEMMODE=auto ALR=0.0001 MLR=0.002 WIND4L=0.25 ISO=64 MINMEM=${MINMEM:-16} SNAP=1000 \
   EXTRA="--lat 4 --lat-basis $K/small/klt1.lcb --lat-c 29 --lat-step 0.25 --lat-step-jitter 0.3 --lat-guide 3 --replay 3 --um-rungs 4.8,9.6:2,19.2 --rung-shift-p 0.2 --film 2 --fstem 16 --fstem-drop 0.25 --uw 1 --grad-cos 500 --init-from $K/ckpt/wz896.ckpt" \
   nohup bash $D/u1.train.sh $1 $2 >> $K/runs/$1.nohup 2>&1 < /dev/null); }
@@ -59,7 +59,7 @@ PY
       case $n in p4A) d=gt/paris4/phaseA;; p4B) d=gt/paris4/phaseB;; p0139) d=gt/p0139full/phase;; p0500) d=gt/PHerc0500P2-wind/phase;; 1667A48) d=gt/1667/phaseA48;; 1667B48) d=gt/1667/phaseB48;; esac
       [ -d $K/$d ] || { echo "$n: $d not built"; continue; }
       echo "$n: $( (cd $K/$d && md5sum -c $f 2>/dev/null) | grep -c ': OK$') of $(wc -l < $f) sampled shards identical to the desk's"; done;;
-  bench) for P in 896 1152 1280; do UFSM_MEM_DRY=1 UFSM_MEM_REPORT=1 RELAUNCH=0 u1run dry$P 10 $P $U; echo "P $P: $(grep -m1 '^memory:' $K/runs/dry$P.log | cut -c1-200)"; done
+  bench) for P in ${DRYP:-896 1152 1280}; do UFSM_MEM_DRY=1 UFSM_MEM_REPORT=1 RELAUNCH=0 u1run dry$P 10 $P $U; echo "P $P: $(grep -m1 '^memory:' $K/runs/dry$P.log | cut -c1-200)"; done
     BP=${BENCHP:-1152}; RELAUNCH=0 LOGE=25 u1run bench$BP 150 $BP $U
     grep '^step' $K/runs/bench$BP.log | tail -3 | cut -c1-220; grep -iE 'wait|samp/s' $K/runs/bench$BP.log | tail -2 | cut -c1-220;;
   resume) [ -f $K/ckpt/u1-resume.ckpt ] || { echo "no staged checkpoint (pod_pack.sh OUT SNAP)"; exit 1; }
