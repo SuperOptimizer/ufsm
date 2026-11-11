@@ -13,7 +13,7 @@ pooled read the sampler does not have; the 9.6 entries serve the 9.6 rung.
 Env: B1 (the B1 output root, /mnt/scratch/univ/b1), HEADS (JSON, default winding + rv on)."""
 import copy, json, os, sys
 out = sys.argv[1] if len(sys.argv) > 1 else "/vesuvius/ufsm/univ/sources-univ.json"
-B1 = os.environ.get("B1", "/mnt/scratch/univ/b1")
+B1 = os.environ.get("B1", "/mnt/scratch/univ/b1"); MIRROR = os.environ.get("MIRROR", "https://dl.ash2txt.org/community-uploads/forrest/volcomp")
 HEADS = json.loads(os.environ.get("HEADS", '{"phase": 1, "normal": 1, "density": 1, "wind4": 1, "rv": 1}'))
 T = json.load(open("/mnt/scratch/lat/sources/sources-wind-gt-nvme.json")); T1667 = json.load(open("/mnt/scratch/lat/sources/sources-wind-gt1667.json"))
 src = []
@@ -21,6 +21,9 @@ for s in T["sources"]: src.append(dict(copy.deepcopy(s), heads=HEADS))
 g1667 = next(s for s in T1667["sources"] if s["name"] == "PHerc1667-gt"); src.append(dict(copy.deepcopy(g1667), heads=HEADS))
 def lvl1(base, name, root, weight, note):
     e = copy.deepcopy(base); e.update(name=name, min_level=1, max_level=1, weight=weight, heads=HEADS, note=note)
+    # level 1 (4.8 um) of the CT: the desk's local copies hold only levels >= 2 (1667: 2, 4, 5), so the mirror (cached; MIRROR=local path
+    # once level 1 is mirrored with `ufsm mirror`)
+    sc, scan = e["ct"].split("/", 1); e["root"] = MIRROR; e["ct"] = f"{sc}/volumes/{scan}" if MIRROR.startswith("http") else e["ct"]
     e["targets"]["band"]["phase"] = {"root": root, "key": "4.8", "level": 1}; return e
 for k in ("A", "B"):
     r = f"{B1}/gt/1667/phase{k}48"
