@@ -28,6 +28,6 @@ trace $o/1447 8.64 5120,3840,3072 5120,3840,3072,512,768,768 0 53
 L=/workspace/fibd/lab1447; for f in H V; do mkdir -p $L/$f/8.64/c/10
   rsync -a -e "$E" $TP:/workspace/fibers/labels2/PHerc1447/$f/zarr.json $L/$f/ ; rsync -a -e "$E" $TP:/workspace/fibers/labels2/PHerc1447/$f/8.64/zarr.json $L/$f/8.64/
   rsync -a -e "$E" $TP:/workspace/fibers/labels2/PHerc1447/$f/8.64/c/10/ $L/$f/8.64/c/10/
-  $U eval $o/1447/$f 8.64 $L/$f 8.64 --um 8.64 --box 5120,3840,3072,512,768,768 --pred-origin 5120,3840,3072 --thr 0.3,0.5,0.7 > $o/1447/eval_$f.txt 2>&1
+  $U eval $o/1447/$f . $L/$f . --um 8.64 --box 5120,3840,3072,512,768,768 --pred-origin 5120,3840,3072 --thr 0.3,0.5,0.7 > $o/1447/eval_$f.txt 2>&1
 done
 touch $o/done
