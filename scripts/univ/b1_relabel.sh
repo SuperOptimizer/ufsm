@@ -8,7 +8,8 @@
 #               scripts/pod/fetchsegs.sh into $K/seg/PHercParis4; codes rastered at level 1 (raster --level 1).
 #   1667A / 1667B  PHerc1667: the existing 4.798 um codes (/vesuvius/ufsm/gt/PHerc1667-wind-20261016/codes{A,B}).
 # Env: K (work root, /mnt/scratch/univ/b1), U (binary with nn_band.o), GPU (CUDA device for the pair rule; -1 = CPU), LOCK (a flock file
-# held around the phase step, e.g. /tmp/gpu1-bench.lock), T (threads), PS (shards at once), BOX (native box; default the label box).
+# held around the phase step, e.g. /tmp/gpu1-bench.lock), T (threads), PS (shards at once), BOX (native box; default the label box),
+# PHASE=0 (stop after the codes).
 set -uo pipefail; SET=${1:?p4A|p4B|1667A|1667B}; K=${K:-/mnt/scratch/univ/b1}; U=${U:-$K/ufsm.labelfast}; GPU=${GPU:-1}; T=${T:-8}; PS=${PS:-3}
 step() { echo "== $(date +%T) $*"; }
 case $SET in
@@ -29,8 +30,18 @@ case $SET in
   1667*) G0=/vesuvius/ufsm/gt/PHerc1667-wind-20261016; G=$K/gt/1667; mkdir -p $G; AX=${AX:-/mnt/scratch/pods/PHerc1667/unroll/axis.json}; DBOX=""
        C=$G0/codes${SET#1667}; O=$G/phase${SET#1667}48; CK=4.798;;
 esac
+[ "${PHASE:-1}" = 0 ] && { step "codes only (PHASE=0)"; exit 0; }
 B0=${BOX:-$DBOX}; L=""; [ -n "${LOCK:-}" ] && L="flock $LOCK"
-step phase $SET 4.8 "(GPU $GPU, box ${B0:-all})"; s=$(date +%s)
-[ -e $O/done ] || { CUDA_VISIBLE_DEVICES=$GPU $L nice -n 5 $U phase-raster $C $CK $O --gs 2 --pair 1 --radius 160 --axis $AX --threads $T --shards $PS --resume 1 \
-    ${B0:+--box $B0} $([ "$GPU" != -1 ] && echo --gpu 0 --gpu-slots 2) > $O.log 2>&1 && touch $O/done; }
+# SHARDS=FILE: only these 9.6 um shards (z y x per line, 2048^3 native each; scripts/univ/b1_shardpack.py picks the packed ones), runs of
+# consecutive x merged into one --box; otherwise one --box (BOX, default the label box) or the whole raster
+if [ -n "${SHARDS:-}" ]; then BOXES=$(python3 -I -c "
+import sys; r = sorted(tuple(map(int, l.split())) for l in open(sys.argv[1]) if l.strip()); i = 0
+while i < len(r):
+    j = i
+    while j + 1 < len(r) and r[j + 1][:2] == r[i][:2] and r[j + 1][2] == r[j][2] + 1: j += 1
+    z, y, x = r[i]; print(f'{z*2048},{y*2048},{x*2048},2048,2048,{(j-i+1)*2048}'); i = j + 1" $SHARDS); else BOXES=${B0:-all}; fi
+step phase $SET 4.8 "(GPU $GPU, $(echo "$BOXES" | wc -l) boxes)"; s=$(date +%s)
+[ -e $O/done ] || { ok=1; for b in $BOXES; do bb=""; [ "$b" != all ] && bb="--box $b"
+    CUDA_VISIBLE_DEVICES=$GPU $L nice -n 5 $U phase-raster $C $CK $O --gs 2 --pair 1 --radius 160 --axis $AX --threads $T --shards $PS --resume 1 \
+      $bb $([ "$GPU" != -1 ] && echo --gpu 0 --gpu-slots 2) >> $O.log 2>&1 || { ok=0; echo "phase box $b failed"; }; done; [ $ok = 1 ] && touch $O/done; }
 echo "phase $SET: $(( $(date +%s) - s )) s, $(find $O -type f -path '*/c/*' | wc -l) shards, $(du -sh $O | cut -f1); $(tail -1 $O.log)"
