@@ -13,6 +13,7 @@ extern "C" {
 __attribute__((weak)) int band_pair_gpu(const uint8_t *codes, const int n[3], float rmax, uint8_t *phase);
 __attribute__((weak)) void band_pair_gpu_slots(int slots, int device);   /* before the first call: concurrent callers, the device */
 __attribute__((weak)) void band_pair_gpu_free(void);                     /* the idle slots' buffers */
+__attribute__((weak)) int band_pair_gpu_reserve(int edge);              /* every slot's buffers for blocks up to edge^3 now (0 ok) */
 #ifdef __cplusplus
 }
 #endif
