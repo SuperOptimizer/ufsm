@@ -55,6 +55,29 @@ Findings:
   2.4 um with q 8 compression; or the reference itself (a model prediction, on a mesh that does not sit on one face) marks letters at
   a layer our tracked recto is not on. Next: human-labelled segments (the 2023-scan labels through the new registration), the 1.129 um
   scan (meshes exist, on-20260608103018), --ss 2 / 4 on sub-crops, and the face on the side the ink model's input layers sit.
+1.129 um (`--reg MAP.json`): the mesh stays on the 2.4 um scan, every sample point goes through the published ufsm reg map
+PHercParis4/transforms/20260608103018_to_20260411134726/reg.json (affine + field, held-out p50 0.85 um) into the 1.129 um scan
+20260608103018, the normal through the map's local Jacobian; offsets and all voxel parameters in 1.129 um voxels (ratio 2.126),
+sampled at --ss 2 (1.13 um along the surface). Coverage: the 1.129 um scan spans 2.4 um z ~28000-56600; crop w028-037 (z ~63000) is
+outside it and w038-045's crop lies in its masked-out zeros, so 1024-px sub-crops were used: w046 (centre of the w046 crop) and two
+substitutes picked the same way inside the coverage, w028s (u 103424, v 27648) and w038s (u 90112, v 44032). The registration holds
+at the surface: cracks, inclusions and fibre strips coincide in the 2.4 and 1.129 um renders (out/cmp_*.png, the same 1 x 1 mm).
+At 1.129 um the recto edge is less decided: runner-up edge >= 0.7 of the best at 26-31 % of samples (2.4 um: 8-9 %), the DP surface
+departs from the per-sample steepest rise at 42-56 % (2.4 um: 23-36 %): more noise per voxel, and fine structure (fibre bundles,
+crackle) makes several real edges. AUC vs the ink prediction, 2.4 um | 1.129 um, raw / detrended:
+
+| map | w046 | w028s | w038s |
+|---|---|---|---|
+| flat CT | 0.307 / 0.372 \| 0.331 / 0.411 | 0.424 / 0.425 \| 0.449 / 0.465 | 0.650 / 0.613 \| 0.629 / 0.558 |
+| near-recto CT | 0.434 / 0.502 \| 0.457 / 0.510 | 0.544 / 0.548 \| 0.538 / 0.546 | 0.520 / 0.551 \| 0.582 / 0.566 |
+| thickness | 0.630 / 0.827 \| 0.650 / 0.583 | 0.399 / 0.402 \| 0.431 / 0.465 | 0.590 / 0.505 \| 0.564 / 0.452 |
+| recto height | 0.546 / 0.574 \| 0.562 / 0.555 | 0.459 / 0.460 \| 0.481 / 0.492 | 0.567 / 0.635 \| 0.578 / 0.599 |
+| roughness | 0.515 / 0.524 \| 0.493 / 0.516 | 0.574 / 0.365 \| 0.593 / 0.415 | 0.495 / 0.383 \| 0.506 / 0.377 |
+| RTI min | 0.506 / 0.392 \| 0.507 / 0.350 | 0.455 / 0.513 \| 0.470 / 0.656 | 0.532 / 0.353 \| 0.515 / 0.291 |
+| PBR | 0.487 / 0.461 \| 0.509 / 0.451 | 0.450 / 0.480 \| 0.441 / 0.525 | 0.515 / 0.514 \| 0.506 / 0.506 |
+
+  The finer scan does not change the picture: no map separates the predicted ink consistently, the signs flip between crops
+  (flat CT 0.31 on w046, 0.65 on w038s), and 1.129 um numbers track the 2.4 um ones within a few hundredths.
 Outputs: /vesuvius/ufsm/pbr/out/<crop>/{contact.png, png/*.png, *.f32, map.json, auc.json}.
 
 ## Own dense embedding net (dino-train) and the dinovol port (2026-10-21/22)
