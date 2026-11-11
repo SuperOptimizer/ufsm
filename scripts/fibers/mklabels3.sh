@@ -5,6 +5,7 @@
 #                    6656..11776 (level-2 voxels: the 2023 scan's extent); the ring is vetoed near any fibre of Paris4_all_v2 (mapped)
 #                    or Paris4_v1 (native 2.4 um chains, no families).
 #   PHerc0125        PHerc0125_3mm_v2 (native 9.362 um, level 0), z 9216..12288; no all-lengths tracing exists for 0125, so no veto.
+#   PHercParis4-spiral  the open-data spiral dataset fibres.afv (native 2.4 um, level 2), vetoed by Paris4_v1.
 #   hf-<scroll>      the public human fibre lines (tools/hfjson.py -> UFIB) of PHerc0139, PHerc0332, PHerc1451, PHercParis4 on their
 #                    2.4 um scans at level 2 (9.596 / 9.6 um); no veto.
 # No --ct: no air negatives (the sampler draws windows around papyrus inside stored label chunks, fibnet 3d84ada), so no CT is read.
@@ -27,4 +28,8 @@ run hf-PHerc0139 $H/PHerc0139.fib --um 9.596 --shape 19239,6628,6628 --level 2
 run hf-PHerc0332 $H/PHerc0332.fib --um 9.596 --shape 8398,3941,3941 --level 2
 run hf-PHerc1451 $H/PHerc1451.fib --um 9.596 --shape 14986,5203,5203 --level 2
 run hf-PHercParis4 $H/PHercParis4.fib --um 9.6 --shape 18946,8174,8174 --level 2
+# the open-data spiral dataset's fibres (PHercParis4/representations/spiral/20260411134726-spiral-dataset-20261019084150/fibers.afv,
+# 931,104 H / V fibres, 3332 m, native 2.4 um, level-0 z 28000..68000; S3 multipart ETag checked): ring vetoed by the native Paris4_v1 only
+# (--extra @map needs --map, which would also move these native fibres). SPIRAL=0 skips it.
+[ "${SPIRAL:-1}" = 1 ] && run PHercParis4-spiral $A/spiral_fibers.afv --um 9.6 --shape 18946,8174,8174 --level 2 --zband 7000,17000 --extra $A/Paris4_v1.afv
 echo "all done"

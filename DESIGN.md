@@ -6,6 +6,52 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## fibhv-d: the fibre mask model on every published fibre set (2026-11-11, branch fibd-20261111)
+
+Why: fibhv-a..c trained on two scrolls only (PHerc1447 + PHerc0175A `*_1mm_v2`, 8.64 um) and were judged on Paris 4 HOLD, a scroll and
+scanner they never saw; traced lines stayed short (below). fibhv-d = the fibhv-c recipe (H / V masks + direction head `--fib-dir 1`,
+P 512, MX-fp4, ring labels radius 2 / guard 2 / ring 3) initialised from fibhv-c step 21000, on every set we can rasterise:
+
+| source | fibres | positives | ring veto (`--extra`) | grid | metres | weight |
+|---|---|---|---|---|---|---|
+| PHerc1447-fib2 (labels2) | PHerc1447_1mm_v2 | > 1 mm tracings | PHerc1447_all_v2 (all lengths) | 8.64 um L0 | 5065 | 0.277 |
+| PHerc0175A-fib2 (labels2) | PHerc0175A_1mm_v2 | > 1 mm | 0175A_SMALLMORE (all lengths) | 8.64 um L0 | 3915 | 0.214 |
+| PHercParis4-fib3 | Paris4_1mm_v2 (2023 frame) through the ufsm reg map | > 1 mm | Paris4_all_v2 @map + Paris4_v1 (native) | 9.6 um (2.4 L2), z 6656..11776 | 3528 | 0.193 |
+| PHercParis4-spiral | open-data spiral dataset `fibers.afv` (931,104 H / V, mean 3.6 mm, native 2.4 um) | all | Paris4_v1 | 9.6 um, z 7000..17000 | 3332 | 0.182 |
+| PHerc0125-fib3 | PHerc0125_3mm_v2 | > 3 mm | none published | 9.362 um L0, z 9216..12288 | 197 | 0.030 |
+| PHerc0139-hf / PHercParis4-hf / PHerc1451-hf / PHerc0332-hf | public human fibre lines (HF `spiral/<scroll>/fibers`) | all | none | 9.6 um (2.4 L2) | 30.7 / 12.9 / 7.2 / 2.5 | 0.03 / 0.03 / 0.03 / 0.015 |
+
+Choices:
+- Unfiltered tracings (`*_all_v2`, `0175A_SMALLMORE`: 6.5 M / 5.8 M fibres, ~84 % of them < 1 mm) are vetoes, not positives: they are
+  the same tracer's output before the publisher's > 1 mm cut, so as positives they would add mostly fragment tubes of unknown quality;
+  as vetoes they keep untraced short fibres out of the negative ring (the fibhv-b design). `*_5mm_v1` (older tracer, same fibres) is not
+  used: its axes sit a few voxels off the v2 ones and would blur the tubes.
+- Paris4_v1 (native 2.4 um chains) has no H / V families, so it can only veto.
+- The spiral-dataset `eval_fibers/*.json` are left out (evaluation fibres of that dataset).
+- Weights: by traced metres, a floor of 0.03 per source (0.015 for the 2.5 m 0332 set). No air negatives (`--ct`) for the new rasters:
+  the sampler draws windows around papyrus inside stored label chunks (3d84ada), so no CT is read while rasterising.
+- Holdouts: the wbench boxes (incl. Paris 4 HOLD, level-0 49152,16384,14336 + 2048,2304,3072) plus 1447-HOLD (5120,3840,3072 +
+  512,768,768, the densest 1447_1mm_v2 cell). fibhv-a..c trained on 1447-HOLD, so it is a cross-check only.
+
+Code: `fiber-raster --extra A[@map],B..` (up to 4 AFVs, each native or through `--map`); `reg_map_load` (src/regmap.c, the map
+without opening its volumes). Paris4_1mm_v2 through `reg_map_load`: one shard row byte-identical to the l2r raster (40 of 40 shards).
+Scripts: scripts/fibers/mklabels3.sh, mksources3.py, fibhv-d.launch.sh, evald.sh (pod: predict + trace both boxes, 1447 mask vs
+labels), evald_desk.sh (desk: GT judge, lengths), fibre_lens.py.
+
+**Measuring continuity.** `fiber-trace --min-len 48` drops lines shorter than 48 prediction voxels = 0.46 mm at 9.6 um, so the plain
+median of a traced set sits just above that cut whatever the model does (fibhv-c: 0.55-0.57 at every step). fibre_lens.py adds the
+arc-weighted median and the arc share in lines >= 1 / 2 mm. fibhv-c on HOLD with those (step 3000 -> 12000):
+
+| family / trace | lines | arc m | arc-median mm | >= 1 mm | >= 2 mm |
+|---|---|---|---|---|---|
+| H tube | 5335 -> 6988 | 3.18 -> 4.40 | 0.58 -> 0.61 | 0.045 -> 0.095 | 0.002 -> 0.007 |
+| H dyad | 2771 -> 4218 | 1.61 -> 2.48 | 0.56 -> 0.57 | 0.029 -> 0.043 | 0.000 -> 0.000 |
+| V tube | 6074 -> 7259 | 3.73 -> 4.56 | 0.60 -> 0.61 | 0.074 -> 0.087 | 0.002 -> 0.002 |
+| V dyad | 642 -> 7509 | 0.34 -> 4.64 | 0.52 -> 0.60 | 0.000 -> 0.070 | 0.000 -> 0.000 |
+
+Launch (pod 1, RTX PRO 4000): 9 sources, init 59 layer tensors from fibhv-c 21000; step 100 at 199 Mvox/s, loader wait 21 % (the
+Paris 4 / human-line CT streams from the mirror into the cache). Evals at steps 3000, 9000, 15000, 21000, 27000 (pod 2 predicts).
+
 ## Paris 4: the 2023 7.91 um scan registered to our 2.4 um scan (2026-11-11, branch p4reg-20261111)
 
 Why: the published AFV fibre tracings (Paris4_1mm_v2 etc.) sit in the 2023 scan (PHercParis4 20230205180739, scrollprize
