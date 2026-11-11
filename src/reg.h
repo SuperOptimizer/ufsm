@@ -58,6 +58,7 @@ uint8_t *reg_read_fine(rvol *fv, int lf, const rmap *m, int lc, const double org
 
 /* a map JSON (ufsm reg format) and its fine volume, kept open (src/reg_cli.c); nullptr on failure */
 const rmap *reg_map_open(const char *path, const char *cache, rvol **fv, double *coarse_um, double *fine_um);
+const rmap *reg_map_load(const char *path);   /* the map only (no volumes opened); nullptr on failure */
 
 enum { REG_NCC = 0, REG_DOG = 1, REG_GRAD = 2 };
 void reg_gauss(float *v, const int n[3], double sigma);   /* separable, clamped edges, in place */

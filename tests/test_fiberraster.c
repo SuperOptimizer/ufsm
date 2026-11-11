@@ -10,6 +10,7 @@
 #include <string.h>
 #include <unistd.h>
 #include "afv.h"
+#include "reg.h"
 #include "store.h"
 #include "z3w.h"
 #include "zarr3.h"
@@ -69,7 +70,23 @@ int main(void) {
       CHECK(H[AT(40, 52, 50)] == 255 && V[AT(40, 52, 50)] == 255, "beyond the ring (d 8): H %d V %d, want 255", H[AT(40, 52, 50)], V[AT(40, 52, 50)]);
       CHECK(H[AT(10, 150, 50)] == 255, "far papyrus stays unknown: %d", H[AT(10, 150, 50)]);
       #undef AT
-      free(H); free(V); }
+      free(H); free(V);
+      /* --extra lists (2026-11-11): "@map" needs --map; a UFIB extra must stand alone (exit 2 before anything is written) */
+      char xl[900], out4[400]; snprintf(out4, sizeof out4, "%s/lab4", root); snprintf(xl, sizeof xl, "%s@map", xf);
+      char *am[] = {"ufsm", "fiber-raster", fb, out4, "--um", "9.6", "--shape", "128,256,256", "--level", "1", "--ring", "3", "--extra", xl, "--shard", "128"};
+      CHECK(cmd_fiber_raster(16, am) == 2, "--extra X@map without --map is refused");
+      snprintf(xl, sizeof xl, "%s,%s", xf, xf); am[13] = xl;
+      CHECK(cmd_fiber_raster(16, am) == 2, "two UFIB --extra entries are refused");
+      /* reg_map_load (fiber-raster --map): A and a constant 2 x 2 x 2 displacement field, no volumes opened */
+      char mj[400], mf[400]; snprintf(mj, sizeof mj, "%s/reg.json", root); snprintf(mf, sizeof mf, "%s/field.f32", root);
+      FILE *f = fopen(mj, "w"); fprintf(f, "{\"A\": [[0.5,0,0,10],[0,0.5,0,20],[0,0,0.5,30]], \"coarse\": {\"root\": \"/nonexistent\", \"key\": \"x\", \"um\": 8},"
+                                          " \"fine\": {\"root\": \"/nonexistent\", \"key\": \"y\", \"um\": 4}, \"field\": {\"file\": \"field.f32\", \"n\": [2,2,2], \"o\": [0,0,0], \"h\": 1000}}"); fclose(f);
+      float fd[24]; for (int i = 0; i < 8; i++) { fd[3 * i] = 1; fd[3 * i + 1] = -2; fd[3 * i + 2] = 0.5f; }
+      f = fopen(mf, "wb"); fwrite(fd, sizeof fd, 1, f); fclose(f);
+      const rmap *M = reg_map_load(mj); CHECK(M != nullptr, "reg_map_load");
+      if (M) { const double g[3] = {100, 200, 300}; double c[3], b[3]; rmap_f2c(M, g, c); rmap_c2f(M, c, b);
+        CHECK(fabs(b[0] - 100) < 1e-3 && fabs(b[1] - 200) < 1e-3 && fabs(b[2] - 300) < 1e-3, "map round trip %g %g %g", b[0], b[1], b[2]);
+        CHECK(fabs(c[0] - 60) > 0.4 || fabs(c[1] - 120) > 0.4 || fabs(c[2] - 180) > 0.4, "the field moves the point (%g %g %g against the affine's 60 120 180)", c[0], c[1], c[2]); } }
     /* --ct: air -> 0 away from fibres; --zband: only shard row 0 is written */
     { const int64_t shp[3] = {NZ, NY, NX}; snprintf(p, sizeof p, "%s/9.6", ctd); const double um = 9.6; z3w *w = z3w_create(p, shp, 128, 0, 0, nullptr); CHECK(w != nullptr, "CT"); uint8_t *b = malloc((size_t)128 * 128 * 128);
       for (int sy = 0; sy < 2; sy++) for (int sx = 0; sx < 2; sx++) { memset(b, sy == 0 && sx == 0 ? 10 : 100, (size_t)128 * 128 * 128); CHECK(!z3w_write_shard(w, 0, sy, sx, b, 1), "CT shard"); }
