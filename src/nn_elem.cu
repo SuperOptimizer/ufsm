@@ -659,6 +659,49 @@ extern "C" void nn_unwrap_targets2_z(const uint8_t *phase, int d, int h, int w, 
 extern "C" void nn_unwrap_targets(const uint8_t *phase, int d, int h, int w, int s, float dscale, uint8_t *t, uint8_t *m) {
     nn_unwrap_targets2(phase, d, h, w, s, dscale, 0, 0.f, 0.f, 0.f, t, m);
 }
+/* train --fib-dir: the fibre axis of the H / V mask label tubes. t: the two target planes of a B = 1 window (H at 0, V at n; >= 128 =
+   fibre), m: the shared label mask (0 = unknown). A voxel inside exactly one family's tube gets the second moment of that family's
+   tube voxels in the (2r + 1)^3 cube about it (centred on their mean); its largest eigenvector a (power iteration) is the axis, kept
+   where lambda_1 / trace >= cmin and the cube holds >= 2r + 1 of them. Targets (x255) in 7 planes: a_z^2, a_y^2, a_x^2, 0.5 + a_z a_y,
+   0.5 + a_z a_x, 0.5 + a_y a_x (sign-free, the normal coding of nn_unwrap_targets2), and the family (V 1, H 0); mask 1 there, else 0.
+   The labels are augmented with the window, so the axis is in output coordinates. */
+__global__ void fib_dir_k(const uint8_t *t, const uint8_t *m, int D, int H, int W, int r, float cmin, uint8_t *o, uint8_t *om) {
+    const size_t n = (size_t)D * H * W, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    om[i] = 0;
+    for (int c = 0; c < 7; c++) o[c * n + i] = 0;
+    if (!m[i]) return;
+    const int h = t[i] >= 128, v = t[n + i] >= 128; if (h == v) return;
+    const uint8_t *f = t + (v ? n : 0);
+    const int z = (int)(i / ((size_t)H * W)), y = (int)((i / W) % H), x = (int)(i % W);
+    float s1[3] = {0, 0, 0}, s2[6] = {0, 0, 0, 0, 0, 0}; int cnt = 0;
+    for (int dz = -r; dz <= r; dz++) { const int zz = z + dz; if (zz < 0 || zz >= D) continue;
+        for (int dy = -r; dy <= r; dy++) { const int yy = y + dy; if (yy < 0 || yy >= H) continue;
+            const size_t row = ((size_t)zz * H + yy) * W;
+            for (int dx = -r; dx <= r; dx++) { const int xx = x + dx; if (xx < 0 || xx >= W) continue;
+                const size_t j = row + xx; if (!m[j] || f[j] < 128) continue;
+                cnt++; s1[0] += dz; s1[1] += dy; s1[2] += dx;
+                s2[0] += dz * dz; s2[1] += dy * dy; s2[2] += dx * dx; s2[3] += dz * dy; s2[4] += dz * dx; s2[5] += dy * dx; } } }
+    if (cnt < 2 * r + 1) return;
+    const float ic = 1.f / cnt, mz = s1[0] * ic, my = s1[1] * ic, mx = s1[2] * ic;
+    const float C[6] = {s2[0] * ic - mz * mz, s2[1] * ic - my * my, s2[2] * ic - mx * mx, s2[3] * ic - mz * my, s2[4] * ic - mz * mx, s2[5] * ic - my * mx};
+    const float tr = C[0] + C[1] + C[2]; if (!(tr > 0.f)) return;
+    float a[3] = {0, 0, 0}; a[C[0] >= C[1] && C[0] >= C[2] ? 0 : C[1] >= C[2] ? 1 : 2] = 1.f;   /* start on the largest diagonal */
+    float lam = 0.f;
+    for (int it = 0; it < 32; it++) {
+        const float w0 = C[0] * a[0] + C[3] * a[1] + C[4] * a[2], w1 = C[3] * a[0] + C[1] * a[1] + C[5] * a[2], w2 = C[4] * a[0] + C[5] * a[1] + C[2] * a[2];
+        lam = sqrtf(w0 * w0 + w1 * w1 + w2 * w2); if (!(lam > 0.f)) return;
+        a[0] = w0 / lam; a[1] = w1 / lam; a[2] = w2 / lam;
+    }
+    if (lam / tr < cmin) return;
+    const float c7[7] = {a[0] * a[0], a[1] * a[1], a[2] * a[2], 0.5f + a[0] * a[1], 0.5f + a[0] * a[2], 0.5f + a[1] * a[2], v ? 1.f : 0.f};
+    for (int c = 0; c < 7; c++) o[c * n + i] = (uint8_t)__float2int_rn(255.f * fminf(1.f, fmaxf(0.f, c7[c])));
+    om[i] = 1;
+}
+extern "C" void nn_fib_dir_targets(const uint8_t *t, const uint8_t *m, int d, int h, int w, int r, float cmin, uint8_t *o, uint8_t *om) {
+    const size_t n = (size_t)d * h * w;
+    fib_dir_k<<<nblk(n, 256), 256>>>(t, m, d, h, w, r, cmin, o, om); KCHECK();
+}
 /* a 0/1 loss mask times the packed-sheet weight of each voxel (its phase gradient over +-s voxels; unknown gradients keep 1) */
 __global__ void packed_mask_k(const uint8_t *ph, int D, int H, int W, int s, float um, float packed_um, float packed_w, uint8_t *m, size_t i0, size_t n) {
     const size_t li = blockIdx.x * (size_t)blockDim.x + threadIdx.x, i = i0 + li;

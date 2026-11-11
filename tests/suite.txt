@@ -50,6 +50,7 @@ test_infer_mem                                 | gpu          |   200 | UFSM_TES
 test_infer_mem~full                            | gpu2,slow    |   287 | ./$B/test_infer_mem
 test_half                                      | gpu          |     1 | ./$B/test_half
 test_unwrap_targets                            | gpu          |     1 | ./$B/test_unwrap_targets
+test_fib_dir                                   | gpu          |     1 | ./$B/test_fib_dir
 test_gpu_aug                                   | gpu          |     6 | ./$B/test_gpu_aug
 test_fit                                       | gpu          |   320 | UFSM_TEST_QUICK=1 ./$B/test_fit
 test_fit~full                                  | slow,gpu     |  1281 | ./$B/test_fit

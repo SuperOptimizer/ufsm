@@ -124,6 +124,7 @@ static int g_pkf;   /* --half-res pack, the direct path: the losses read the net
 #define TCMAX 8   /* surface-task target / output channels at most (--heads) */
 static int g_heads, g_tc = NCH;   /* --heads H (>= 2): recto heads in output channels 0 and 2..H, sheet in 1; g_tc: target channels on the device */
 static const sources *g_S;        /* --heads: each sample's source names its head */
+static float g_fibdir; static int g_fd_r = 4;   /* --fib-dir L: fibre tube direction head (7 channels after the two masks; nn_fib_dir_targets) */
 static int g_aff, g_cout = NCH; static aff_offsets_t g_aff_off; static float g_aff_lambda = 1.f;
 /* --verso 1: output channel 1 is the verso face. Its target is the model's own recto channel (eval forward, no gradient) with
    the radial input reversed and the CT unchanged: a recto model marks the other face of the sheet when the direction flips
@@ -1253,7 +1254,7 @@ static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
     shape5 os = g_half ? (shape5){B, g_cout, P, P, P} : unet_out_shape(d->u, xs);
     int prof = ufsm_env_on("UFSM_PROF");
     if (prof) nn_prof_begin(6);
-    shape5 ts = os; if (g_aff) ts.c = NCH;   /* B == 1: the target channels are the leading output channels */
+    shape5 ts = os; if (g_aff || g_fibdir > 0) ts.c = NCH;   /* B == 1: the target channels are the leading output channels */
     nn_set_logits_h16((!g_half || g_pkf) && unet_logits_h16(d->u));   /* lean 2: fp16 logits in the gradient buffer */
     if (g_restore && g_rpairs) nn_restore_pair_loss(lg, unet_logits_h16(d->u), d->rlow, d->t, d->t + (size_t)g_Pz * P * P, g_Pz, P, P, &g_rpw, train ? d->gl : nullptr, g_g16, nn_get_f16(),
                                                     nn_get_grad_scale(), d->rst, d->rrd, !train);
@@ -1300,6 +1301,18 @@ static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
         nn_loss_async_tol((const float *)((const char *)lg + g_side_ch * l3 * le), d->sidet, d->sidem, d->sidew, one, 0.f,
                           train ? (float *)((char *)d->gl + g_side_ch * l3 * eb) : nullptr, d->sscratch, nullptr);
         if (train && g_side_lambda != 1.f) nn_loss_grad_scale((char *)d->gl + g_side_ch * l3 * eb, g_side_nc * l3, g_side_lambda);
+    }
+    if (g_fibdir > 0) {   /* --fib-dir: the axis of the H / V label tubes (after the window's augmentation: the targets are in output coordinates) */
+        const size_t l3 = (size_t)os.d * os.h * os.w, eb = g_g16 ? 2 : 4, le = unet_logits_h16(d->u) ? 2 : 4;
+        nn_fib_dir_targets(d->t, d->m, os.d, os.h, os.w, g_fd_r, 0.6f, d->nt, d->nm);
+        if (d->side == 0) nn_zero(d->nm + l3 - (size_t)g_h0 * P * P, (size_t)g_h0 * P * P);
+        else if (d->side == 1) nn_zero(d->nm, (size_t)g_h0 * P * P);
+        const shape5 seven = {1, 7, os.d, os.h, os.w};
+        float pw0, rw0; int u70; nn_loss_cfg_get(&pw0, &rw0, &u70); nn_set_pos_weight(1.f);   /* (soft regression targets: no --pos-weight) */
+        nn_loss_async_tol((const float *)((const char *)lg + g_norm_ch * l3 * le), d->nt, d->nm, d->nw, seven, 0.f,
+                          train ? (float *)((char *)d->gl + g_norm_ch * l3 * eb) : nullptr, d->nscratch, nullptr);
+        nn_set_pos_weight(pw0);
+        if (train && g_fibdir != 1.f) nn_loss_grad_scale((char *)d->gl + g_norm_ch * l3 * eb, 7 * l3, g_fibdir);
     }
     if (g_unwrap) {   /* normal n n^T and density from the phase gradient; split: halo planes are the other GPU's */
         const size_t l3 = (size_t)os.d * os.h * os.w, eb = g_g16 ? 2 : 4, le = unet_logits_h16(d->u) ? 2 : 4;
@@ -1408,9 +1421,14 @@ static void restore_pair_report(const sources *S, const char *out, int step, dou
 static double fetch_loss(gpu_state *d, int B, int P, float dice_w, float *out) {
     if (g_restore) return restore_fetch(d, out);
     shape5 os = g_half ? (shape5){B, g_cout, P, P, P} : unet_out_shape(d->u, (shape5){B, g_xc, d->side >= 0 ? g_Dl : g_Pz, P, P});
-    if (g_aff) os.c = NCH;
+    if (g_aff || g_fibdir > 0) os.c = NCH;
     if (!g_verso_on && !g_unwrap) nn_loss_fetch(d->scratch, os, out);
     d->ink_loss = d->norm_loss = d->norm_raw = d->w4_loss = 0;
+    if (g_fibdir > 0) {   /* the direction head's 7 BCEs: logged unweighted (dir bce), added at lambda */
+        nn_loss_fetch(d->nscratch, (shape5){1, 7, 1, 1, 1}, d->nout);
+        float nb = 0; for (int c = 0; c < 7; c++) nb += d->nout[c];
+        d->norm_raw = nb / 7; d->norm_loss = g_fibdir * nb / 7;
+    }
     if (g_unwrap) {   /* recto parts laid out as the NCH-channel fetch does; the ink and normal / density losses */
         for (int c = 0; c < 2 * NCH + 1; c++) out[c] = 0;
         if (!g_unwrap2) {
@@ -1475,7 +1493,7 @@ static double fetch_loss(gpu_state *d, int B, int P, float dice_w, float *out) {
     }
     int cout = g_half ? g_cout : unet_cfg_of(d->u)->cout;
     double loss = 0; int active = 0;
-    if (g_aff || g_unwrap) cout = NCH;
+    if (g_aff || g_unwrap || g_fibdir > 0) cout = NCH;
     for (int c = 0; c < cout; c++) if (out[c] > 0 || out[cout + c] > 0) { loss += out[c] + dice_w * out[cout + c]; active++; }
     if (g_heads) {   /* each head's loss for the validation table; the logs see the mean over the active recto heads in the NCH layout */
         float rb = 0, rd = 0; int na = 0;
@@ -1835,6 +1853,14 @@ int cmd_train(int argc, char **argv) {
         }
         g_cout = g_tc = g_heads + 1;
         fprintf(stderr, "heads: %d recto heads (output channels 0, 2..%d; the sheet channel 1); each sample trains its source's head\n", g_heads, g_heads);
+    }
+    g_fibdir = (float)atof(opt(argc, argv, "--fib-dir", "0")); g_fd_r = atoi(opt(argc, argv, "--fib-dir-r", "4"));
+    if (g_fibdir > 0) {   /* the H / V fibre mask task (recto = H, sheet = V, prob254) + the tube direction: n n^T of the label tube's axis (6) and its family (V 1, H 0) */
+        if (g_cout != NCH || g_aff || g_unwrap || g_verso || g_side || g_cond || g_pap_head || g_heads || geometry || g_restore || B != 1 || g_fd_r < 2 || g_fd_r > 8) {
+            fprintf(stderr, "--fib-dir: the plain two-channel mask task, B 1, no affinities / unwrap / verso / side / cond / papyrus head / heads; --fib-dir-r 2..8\n"); return 2; }
+        g_norm_ch = g_cout; g_cout += 7;
+        fprintf(stderr, "fib-dir: channels %d-%d the fibre axis t t^T, %d its family (V); from the label tubes' second moments over %d^3 voxels, lambda %g\n",
+                g_norm_ch, g_norm_ch + 5, g_norm_ch + 6, 2 * g_fd_r + 1, g_fibdir);
     }
     unet_cfg cfg = {4, {16, 32, 64, 80}, 4, g_cout, 8, 0, 0};
     cfg.down_norm = atoi(opt(argc, argv, "--down-norm", "0"));
@@ -2559,7 +2585,7 @@ int cmd_train(int argc, char **argv) {
                 const int gdef = (getenv("UFSM_GN_DEFER") ? atoi(getenv("UFSM_GN_DEFER")) : 1) && !split && !cand[c].l3 && cfg.widths[0] % 32 == 0;
                 const size_t grec = unet_grad_mx4() && (cfg.widths[0] % 32 == 0 || lp_gyrec_narrow()) && (getenv("UFSM_GYREC") ? atoi(getenv("UFSM_GYREC")) : 1)
                                     ? (gdef ? (size_t)100 << 20 : (size_t)B * cfg.widths[0] * p3 * 136 / 256) : 0;
-                need = grec + tb + tb / 14 + trainer + (nn_get_loss_tol() ? (size_t)B * p3 : 0) + (g_aff ? (size_t)2 * B * p3 : 0) + (g_unwrap ? (g_head_slab ? (size_t)4 * B * p3 + (size_t)g_hs_z * P * P * (2 * g_cout + 11) + 4096 : (size_t)15 * B * p3) + (g_unwrap2 ? (size_t)4 * B * p3 : 0) + (IPLANE ? (size_t)2 * B * p3 + (size_t)(g_rv ? 3 : 2) * g_hs_z * P * P : 0) : 0) + (g_cond ? (size_t)7 * B * p3 : 0) + (g_pap_head ? (size_t)4 * B * p3 : 0) + (g_restore ? (size_t)B * p3 * (cand[c].lean ? 5 : 1) + restore_scratch_bytes(g_Pz, P, P, fminf(g_rr.sc_step[0], 4.f)) + 256 : 0) + ((size_t)550 << 20) + (split ? (size_t)4 * B * 32 * P * P * 2 : 0) + (g_gpu_aug_want && gin ? nn_aug_device_bytes(P) + (g_gpu_aug_want == 2 ? nn_label_warp_device_bytes(P) : 0) : 0);   /* split: two slots of halo send / receive planes */   /* kernel workspaces: measured device growth / tracked ~1.07 + 0.3 GB, + 0.2 GB margin for other processes */
+                need = grec + tb + tb / 14 + trainer + (nn_get_loss_tol() ? (size_t)B * p3 : 0) + (g_aff ? (size_t)2 * B * p3 : 0) + (g_fibdir > 0 ? (size_t)8 * B * p3 : 0) + (g_unwrap ? (g_head_slab ? (size_t)4 * B * p3 + (size_t)g_hs_z * P * P * (2 * g_cout + 11) + 4096 : (size_t)15 * B * p3) + (g_unwrap2 ? (size_t)4 * B * p3 : 0) + (IPLANE ? (size_t)2 * B * p3 + (size_t)(g_rv ? 3 : 2) * g_hs_z * P * P : 0) : 0) + (g_cond ? (size_t)7 * B * p3 : 0) + (g_pap_head ? (size_t)4 * B * p3 : 0) + (g_restore ? (size_t)B * p3 * (cand[c].lean ? 5 : 1) + restore_scratch_bytes(g_Pz, P, P, fminf(g_rr.sc_step[0], 4.f)) + 256 : 0) + ((size_t)550 << 20) + (split ? (size_t)4 * B * 32 * P * P * 2 : 0) + (g_gpu_aug_want && gin ? nn_aug_device_bytes(P) + (g_gpu_aug_want == 2 ? nn_label_warp_device_bytes(P) : 0) : 0);   /* split: two slots of halo send / receive planes */   /* kernel workspaces: measured device growth / tracked ~1.07 + 0.3 GB, + 0.2 GB margin for other processes */
                 if (g_lat) need += (xin_sep ? 0 : xinb) + (g_tm_unused ? 0 : batb) + (g_lat_hs ? ((size_t)LNC * (LGFC < LNC ? 6 : 4) + (size_t)LGFC * 4) * (size_t)(g_hs_z / 4 + 2) * (P / 4) * (P / 4) + (g_lat_fuse ? nn_lat_fuse_part(7, P / 4, P / 4, g_hs_z) : 0) : ((size_t)LNC * 2 + (size_t)LGFC * 4) * (p3 / 64));   /* --lat: the full-resolution batch beside the cell-grid network, the coarse logit gradient (fp32 + 16-bit) */
                 /* the wide MX-fp4 stride-2 backward-data (lp_bwd_data_s2_mx, more than 64 channels: no direct tensor-core kernel) works
                    through MX-fp8 chunks of ~96 MB (gx, the dilated gy, the accumulate temp), at least 3 fine planes each; the lp_buf
@@ -2732,6 +2758,11 @@ int cmd_train(int argc, char **argv) {
             d->sidew = nn_malloc(2); static const uint8_t one_w[2] = {1, 1}; nn_h2d(d->sidew, one_w, 2);
             d->sscratch = nn_malloc(nn_loss_scratch((shape5){1, g_side_nc, g_Pz, P, P}) + 64);
         }
+        if (g_fibdir > 0) {   /* --fib-dir: the direction targets / mask (whole window, B 1) */
+            d->nt = nn_malloc((size_t)7 * p3); d->nm = nn_malloc(p3);
+            d->nw = nn_malloc(7); static const uint8_t fd_w[7] = {1, 1, 1, 1, 1, 1, 1}; nn_h2d(d->nw, fd_w, 7);
+            d->nscratch = nn_malloc(nn_loss_scratch((shape5){1, 7, g_Pz, P, P}) + 64);
+        }
         if (g_unwrap) {
             if (pm_used()) { d->pmb[0] = nn_malloc((size_t)B * p3); d->pmb[1] = lean ? d->pmb[0] : nn_malloc((size_t)B * p3); }   /* (unwrap2: no ink plane) */ d->pm = d->pmb[d->cur];
             const size_t tp3 = g_head_slab ? (size_t)g_hs_z * P * P : (size_t)B * p3;
@@ -2812,6 +2843,11 @@ int cmd_train(int argc, char **argv) {
         size_t n = strlen(runtime_extra); runtime_extra[n-1] = 0;
         snprintf(runtime_extra+n-1, sizeof runtime_extra-n+1,
             ",\"target\":{\"version\":1,\"erode_native_voxels\":%d,\"erosion_kernel\":\"face6\",\"soft_sigma\":%.9g,\"soft_unit\":\"%s\",\"loss_tolerance_voxels\":%d}}", sc.erode, sc.soft, sc.soft_um ? "um" : "vox", nn_get_loss_tol());
+    }
+    if (g_fibdir > 0) {   /* the fibre direction head's channels (predict --channel picks one; the tracer reads the dyad) */
+        size_t n = strlen(runtime_extra); runtime_extra[n-1] = 0;
+        snprintf(runtime_extra+n-1, sizeof runtime_extra-n+1, ",\"fib_dir\":{\"version\":1,\"channels\":{\"H\":0,\"V\":1,\"dyad\":[%d,%d,%d,%d,%d,%d],\"family_v\":%d},\"encoding\":\"zz yy xx 0.5+zy 0.5+zx 0.5+yx\",\"r\":%d,\"lambda\":%.9g}}",
+                 g_norm_ch, g_norm_ch + 1, g_norm_ch + 2, g_norm_ch + 3, g_norm_ch + 4, g_norm_ch + 5, g_norm_ch + 6, g_fd_r, g_fibdir);
     }
     if (g_heads) {   /* the recto heads' output channels and their sources (predict --channel picks one) */
         char hj[2048]; size_t k = (size_t)snprintf(hj, sizeof hj, ",\"heads\":{\"version\":1,\"recto_channels\":[");
@@ -3287,10 +3323,11 @@ int cmd_train(int argc, char **argv) {
           if (fault == step) nn_h2d(G[0].x, nullptr, 16); }
         if ((seconds && now() - t0 >= seconds) || (schedule_seconds && schedule_elapsed+now()-t0>=schedule_seconds) ||
             (limit_seconds && now() - t0 >= limit_seconds) || (stop_at && step >= stop_at)) g_stop = 1;
-        acc_loss += loss / nl; acc_bce += parts[0][0]; acc_dice += parts[0][g_aff || g_unwrap || g_heads ? NCH : g_half ? g_cout : cfg.cout]; acc_g += gn; nacc++;
+        acc_loss += loss / nl; acc_bce += parts[0][0]; acc_dice += parts[0][g_aff || g_unwrap || g_heads || g_fibdir > 0 ? NCH : g_half ? g_cout : cfg.cout]; acc_g += gn; nacc++;
         if (g_verso_on) { acc_vbce += G[0].vout[0]; acc_vdice += G[0].vout[1]; }
         if (g_side) acc_side += G[0].sout[0];
         if (g_unwrap) { acc_ink += G[0].iout[0]; acc_norm += G[0].norm_raw; }
+        if (g_fibdir > 0) acc_norm += G[0].norm_raw;
         if (g_ink2 && G[0].iout[2] > 0) acc_inkn += 1;
         if (g_unwrap2) { acc_w4 += G[0].w4h[0]; acc_w4w += G[0].w4h[5]; acc_w4a += G[0].w4h[1]; } acc_pg += G[0].pg_loss;
         if (g_ds) acc_ds += G[0].ds_loss;
@@ -3376,7 +3413,7 @@ int cmd_train(int argc, char **argv) {
                         }
                         vl = (vl < 0 ? 0 : vl) + l; vb += vp[0];
                         if (g_ink2 && G[0].iout[2] > 0) { vik[0] += G[0].iout[0]; vik[1] += 1; }
-                        if (g_unwrap2) { vw4[0] += G[0].w4h[0]; vw4[1] += G[0].w4h[5]; vw4[2] += G[0].w4h[1] * G[0].w4h[2]; vw4[3] += G[0].w4h[2]; vw4[4] += G[0].side_loss / (g_side_lambda ? g_side_lambda : 1.f); vw4[5] += G[0].norm_raw; } vd += vp[g_aff || g_unwrap || g_heads ? NCH : g_half ? g_cout : cfg.cout];
+                        if (g_unwrap2) { vw4[0] += G[0].w4h[0]; vw4[1] += G[0].w4h[5]; vw4[2] += G[0].w4h[1] * G[0].w4h[2]; vw4[3] += G[0].w4h[2]; vw4[4] += G[0].side_loss / (g_side_lambda ? g_side_lambda : 1.f); vw4[5] += G[0].norm_raw; } vd += vp[g_aff || g_unwrap || g_heads || g_fibdir > 0 ? NCH : g_half ? g_cout : cfg.cout];
                         if (g_heads) for (int h = 0; h < g_heads; h++) if (G[0].hon[h]) { vh[h] += G[0].hl[h]; vhn[h]++; }
                         if (vq) sampler_release(vq, vbt);
                         got++;
@@ -3435,6 +3472,7 @@ int cmd_train(int argc, char **argv) {
             if (g_ink2) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " ink bce %.4f (%.0f%% of windows)", acc_inkn > 0 ? acc_ink / acc_inkn : 0.0, 100.0 * acc_inkn / nacc); }
             if (g_ptrunc_tau > 0) { unsigned long long pc[2]; nn_phase_trunc_counts(pc); size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " trunc %.4f", pc[0] ? (double)pc[1] / pc[0] : 0.0); }
             else if (g_unwrap && !g_unwrap2) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " ink bce %.4f normal bce %.4f", acc_ink / nacc, acc_norm / nacc); }
+            if (g_fibdir > 0) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " dir bce %.4f", acc_norm / nacc); }
             if (g_ds) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " ds %.4f", acc_ds / nacc); }
             if (g_distill) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " distill %.4f (%.1f%% cells)", acc_emb / nacc, 100. * acc_embc / nacc / ((double)g_distill_n / g_distill));
                 if (g_distill_pap > 0) { static size_t pc0, pk0; const size_t pc = atomic_load(&g_emb_pap_cleared), pk = atomic_load(&g_emb_pap_kept); na = strlen(affs);
