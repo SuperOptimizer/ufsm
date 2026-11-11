@@ -176,6 +176,18 @@ int main(void) {
             for (size_t i = 0; w2 && wt && ph && i < (size_t)NZ * NY * NX; i++) if (ph[i] != PHASE_UNKNOWN) { nk++; nd += abs((int)w2[i] - (int)wt[i]) > 1; }
             printf("test_surflabels: phase-coh vs surf-labels --weight-coh: %ld of %ld known voxels differ by > 1\n", nd, nk);
             CHECK(w2 && nk > 100000 && nd * 20 < nk, "phase-coh weight differs from surf-labels' on > 5% of the known voxels");
+            {   /* --box-scale: one box over the lower half in z at 0.5, 0 outside (--box-default 0) = the plain weight x 0.5 inside, 0 outside */
+                char bf[600], pb[600]; snprintf(bf, sizeof bf, "%s/boxes.txt", od); snprintf(pb, sizeof pb, "%s/pcb", od);
+                FILE *f = fopen(bf, "w"); CHECK(f, "boxes.txt"); fprintf(f, "# z y x nz ny nx s\n0 0 0 %d %d %d 0.5\n", NZ / 2, NY, NX); fclose(f);
+                char *cb[] = {"ufsm", "phase-coh", pr, "9.6", ct, "0", pb, "--weight", "0.3,0.6", "--cell", "16", "--box-scale", bf, "--box-default", "0", "--threads", "3"};
+                CHECK(!cmd_phase_coh((int)(sizeof cb / sizeof *cb), cb), "phase-coh --box-scale failed");
+                snprintf(r, sizeof r, "%s/pcb/weight.zarr", od); uint8_t *wb = readall(r, "9.6"); long bad = 0, pos = 0;
+                for (size_t i = 0; wb && w2 && i < (size_t)NZ * NY * NX; i++) {
+                    const int want = i / ((size_t)NY * NX) < (size_t)(NZ / 2) ? (int)lround(w2[i] * 0.5) : 0; bad += abs((int)wb[i] - want) > 1; pos += wb[i] > 0; }
+                printf("test_surflabels: phase-coh --box-scale: %ld voxels off the scaled weight, %ld weighted\n", bad, pos);
+                CHECK(wb && !bad && pos > 1000, "phase-coh --box-scale is not the weight x the box factor");
+                free(wb);
+            }
             free(w2);
         }
         free(wt);
