@@ -235,3 +235,4 @@ test_gpudec                                    | gpu          |    10 | ./$B/tes
 test_lat                                       | gpu          |     1 | ./$B/test_lat
 test_latents                                   | gpu          |    25 | bash tests/test_latents.sh ./$B/ufsm ./$B/make_wind_fixture
 test_lat_fuse                                  | gpu          |     2 | ./$B/test_lat_fuse
+test_phase_onfly                               | gpu          |    20 | tests/test_phase_onfly.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/onfly
