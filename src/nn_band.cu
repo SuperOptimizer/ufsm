@@ -73,39 +73,39 @@ __device__ __forceinline__ float bg_f(int32_t fi, int ax, long q, long o, long x
     return (float)(dy * dy + dx * dx);
 }
 __global__ void k_bg_env(int32_t *idx, int ax, int ny, int nx, int L, long st, long sz, long sy, long l0, int nl, float *F, int32_t *S, int *V, float *Z) {
+    /* (V and Z interleaved: one 8-byte {Z_k, V_k} per envelope entry in the Z buffer, V unused: the envelope's two loads are one) */
     const int t = blockIdx.x * blockDim.x + threadIdx.x; if (t >= nl) return;
     const long line = l0 + t, o = line / nx, x = line % nx;
     const long base0 = ax == 1 ? o * sz : o * sy;
     const long NL = nl;
+    float2 *VZ = (float2 *)Z;
 #define Sq(q) S[(long)(q) * NL + t]
-#define Vq(q) V[(long)(q) * NL + t]
-#define Zq(q) Z[(long)(q) * NL + t]
+#define VZq(q) VZ[(long)(q) * NL + t]
 #define Fq(q) bg_f(Sq(q), ax, (q), o, x, base0, st, sz, sy)
     for (int q = 0; q < L; q++) Sq(q) = idx[base0 + q * st + x];
-    int k = 0; int v0 = -1;
+    int k = 0; int v0 = -1; float2 cur = make_float2(0.f, 0.f);   /* cur: entry k (Z_k, V_k) */
     for (int q = 0; q < L; q++) {
         const float fq = Fq(q);
         if (fq >= BINF) continue;
-        if (v0 < 0) { v0 = q; Vq(0) = q; Zq(0) = -BINF; Zq(1) = BINF; k = 0; continue; }
+        if (v0 < 0) { v0 = q; k = 0; cur = make_float2(-BINF, __int_as_float(q)); VZq(0) = cur; VZq(1) = make_float2(BINF, 0.f); continue; }
         float sct;
         for (;;) {
-            const int r = Vq(k);
+            const int r = __float_as_int(cur.y);
             sct = ((fq + (float)q * q) - (Fq(r) + (float)r * r)) / (2.f * (q - r));
-            if (sct <= Zq(k) && k > 0) k--; else break;
+            if (sct <= cur.x && k > 0) { k--; cur = VZq(k); } else break;
         }
-        if (sct <= Zq(k)) { Vq(k) = q; Zq(k + 1) = BINF; }
-        else { k++; Vq(k) = q; Zq(k) = sct; Zq(k + 1) = BINF; }
+        if (sct <= cur.x) { cur.y = __int_as_float(q); VZq(k) = cur; VZq(k + 1) = make_float2(BINF, 0.f); }
+        else { k++; cur = make_float2(sct, __int_as_float(q)); VZq(k) = cur; VZq(k + 1) = make_float2(BINF, 0.f); }
     }
     if (v0 < 0) { for (int q = 0; q < L; q++) idx[base0 + q * st + x] = -1; return; }
-    k = 0;
+    k = 0; cur = VZq(0); float2 nxt = VZq(1);
     for (int q = 0; q < L; q++) {
-        while (Zq(k + 1) < q) k++;
-        idx[base0 + q * st + x] = Sq(Vq(k));
+        while (nxt.x < q) { k++; cur = nxt; nxt = VZq(k + 1); }
+        idx[base0 + q * st + x] = Sq(__float_as_int(cur.y));
     }
 #undef Fq
 #undef Sq
-#undef Vq
-#undef Zq
+#undef VZq
 }
 
 __global__ void k_bg_pair(const uint8_t *codes, const int32_t *ie, const int32_t *io, long N, int n1, long sz, long sy, float r2, uint8_t *phase) {
@@ -262,7 +262,7 @@ static int bg_alloc(bg_ctx &G, long N, long Lmax, long lc) {
     if ((size_t)((Lmax + 1) * lc) > G.lcap) {
         cudaFree(G.F); cudaFree(G.Z); cudaFree(G.S); cudaFree(G.V); G.F = G.Z = nullptr; G.S = nullptr; G.V = nullptr;
         const size_t e = (size_t)(Lmax + 1) * lc;
-        BG_CK(cudaMalloc(&G.Z, e * 4)); BG_CK(cudaMalloc(&G.S, e * 4)); BG_CK(cudaMalloc(&G.V, e * 4)); G.lcap = e;
+        BG_CK(cudaMalloc(&G.Z, e * 8)); BG_CK(cudaMalloc(&G.S, e * 4)); BG_CK(cudaMalloc(&G.V, 4)); G.lcap = e;
     }
     return 0;
 }
