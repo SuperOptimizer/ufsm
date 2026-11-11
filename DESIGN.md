@@ -6,6 +6,42 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## The fibre H / V planes on the fly from the polylines (2026-11-11, branch univ-20261111)
+
+Item 5 of the on-the-fly list: fiber-raster's H / V prob254 planes (labels/ 55 GB + labels2/ 6 GB on the desk) computed per read box
+from the AFV / UFIB polylines, so a fibre source needs the CT and the tracing only.
+- fiber-raster's shard body is now `fr_box` (any box: the polyline query and steps over the box + the reach radius + guard + ring,
+  the stamp, the CT air test, the combine); a voxel depends only on the steps within the reach and its own CT byte, so any box gives
+  the shard raster's bytes. `fiber_onfly_open` (fiberraster.h) wraps it as two derived arrays (zarr3.h `z3_open_derived`) over a CT
+  level, H and V from one computation (a reading thread keeps its last box, so the V read after the H read is free).
+- Sources: a target `{"fibre": {"afv", "plane": "H" | "V", "radius", "guard", "ring", "iso", "extra", "map" | "tr"}}` on any channel
+  (fibre_h / fibre_v, or recto / sheet for the older fibre runs); computed on the CT level of the read, so every level has native
+  planes (radius etc. in that level's voxels, as fiber-raster --level). Channels with the same options share one context.
+- GPU (`nn_fibre.cu`, `--onfly-gpu`, buffers for (P + 64)^3 reserved before the planner): the steps (host: from the polylines,
+  compacted to those whose reach cube meets the box) are binned on the device to 4 x 4 x 8 voxel blocks (count, cub scan, fill), one
+  thread per voxel classes each step's code (<= radius, <= radius + guard, stamped) in float with a 1e-2 margin and falls back to
+  fr_stamp's double arithmetic (no FMA, IEEE sqrt) only near a class boundary; the planes depend on the codes only through these
+  classes. CPU fallback (UFSM_FIBRE_CPU=1 or no nn_fibre.o).
+- Byte identity: test_fiberraster (fixture: plain, --ring --extra, --ct; whole / partial / outside boxes; CPU and GPU), test_fibre_onfly
+  (fiber-onfly vs fiber-raster on curved crossing fibres over the wind fixture, GPU and CPU; three --det --fib-head runs, stored /
+  onfly GPU / onfly CPU: identical losses), and PHerc1447 (labels/, radius 2 guard 3 iso 64): 26 windows of 512^3 and 896^3, 0
+  differing bytes against the stored planes.
+
+Per 896^3 PHerc1447 window with fibres (1.6-1.9M steps), desk 5060 Ti (GPU 1):
+
+| stage | CPU fr_box (before) | GPU, 8^3 blocks, double | + int cubes, float classes | + 4x4x8 blocks, device bins |
+|---|---|---|---|---|
+| polylines (sqlite query + steps), CPU | 0.07-0.15 s | same | same | same |
+| stamp + combine | ~13 s (512^3: 2.4-3.9 s) | 0.8-0.9 s kernel | 0.45 s | 52-117 ms kernel |
+| bins / compaction (CPU) | | 0.13-0.2 s | 0.1-0.2 s (8^3), 0.8-1.0 s (4x4x8) | 0.06-0.12 s (compaction only) |
+| H2D + D2H (pinned planes) | | ~0.4 s | ~0.4 s | ~0.1-0.2 s |
+
+Empty windows (air / no tracing): ~0.1-0.15 s GPU (the planes' copies). The CT air test reads the window's CT again (the CLI: 0.7-1.3 s
+on one thread, no cache; in training through the shared decoded-CT cache the sampler's own read warmed). Still on the CPU, and why:
+the sqlite polyline query and the step generation (~0.1 s, irregular), the step compaction (~0.1 s), the CT read for the air test
+(the window's CT is on the device for the GPU input build, but the label planes are built on the host: the device-resident label
+plane step removes both copies).
+
 ## The winding phase on the fly from the codes (2026-11-11, branch univ-20261111)
 
 User: the phase computed from the codes per window, "on the gpu", "so that we dont have so many artifacts". A 4.8 um phase set is ~10x
@@ -54,7 +90,9 @@ Stored artifacts the universal sources still need, and why (2026-11-11):
 - stored phase for the fused sets (PHerc0139, 0500P2, the 1667 9.6 um "phase"): their phase is the circular mean of two code sets
   where they agree; onfly computes one set. Paris 4 p4full: until its 2x-pooled codes are written (codes-pool2) or it is relabelled.
 - recto / verso, normal, density, wind4 targets: already derived per window in the sampler from the phase (no stored rasters).
-- fibre H / V rasters (79 GB), teacher rasters, registered-twin warps: stored; on-the-fly versions are the later items of the list.
+- fibre H / V rasters: on the fly from the AFV / UFIB tracings since the section above (sources "fibre" targets); the stored
+  labels/ and labels2/ can go once no sources file references them.
+- teacher rasters, registered-twin warps: stored; on-the-fly versions are the later items of the list.
 
 nsys on a 420^3 tile (desk): x pass 45 -> 1.8 ms, the y / z envelopes 99 -> 57 ms (90% of what remains), pair kernel 4-8 ms, copies
 13 ms. Rastering a whole set once is ~1.6T voxel-work (1667 A: 77 min on the desk GPU); one u1-length run at ~16% onfly windows

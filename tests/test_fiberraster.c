@@ -2,7 +2,9 @@
    along x, a V fibre along z that passes 30 voxels from it, and an H fibre that crosses a second V fibre. Read back: every voxel
    within the radius of the lone H fibre is 254 in plane H and 0 in plane V (and the reverse on the V fibre), the guard ring and
    everything away from the fibres are 255, the crossing is 255 in both planes, and a second run with --zband writes only that band.
-   With --ct (a CT of 100 with an air block of 10): air away from fibres is 0 in both planes, papyrus stays 255. */
+   With --ct (a CT of 100 with an air block of 10): air away from fibres is 0 in both planes, papyrus stays 255.
+   The planes on the fly (fiber_onfly_open, sources "fibre" targets, 2026-11-11): reads of whole and partial boxes, seams and boxes
+   partly outside the array, byte-identical to the three stored rasters (plain, --ring --extra, --ct). */
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -15,7 +17,7 @@
 #include "z3w.h"
 #include "zarr3.h"
 
-int cmd_fiber_raster(int argc, char **argv);
+#include "fiberraster.h"
 static int fails = 0;
 #define CHECK(c, ...) do { if (!(c)) { fprintf(stderr, "FAIL %s:%d: ", __FILE__, __LINE__); fprintf(stderr, __VA_ARGS__); fprintf(stderr, "\n"); fails++; } } while (0)
 enum { NZ = 128, NY = 256, NX = 256, NP = 120 };
@@ -99,6 +101,28 @@ int main(void) {
       CHECK(H[pap] == 255 && V[pap] == 255, "papyrus away from fibres: H %d V %d, want 255 255", H[pap], V[pap]);
       CHECK(H[onh] == 254 && V[onh] == 0 && V[onv] == 254 && H[onv] == 0, "fibres over air keep their labels (H %d %d, V %d %d)", H[onh], V[onh], V[onv], H[onv]); }
     free(H); free(V);
+    /* on the fly == stored: the plain raster (no air test), --ring 3 --extra (radius 2 guard 2), --ct --iso 64 (shard row 0: --zband 0,100) */
+    { char xf[400], o3[400]; snprintf(xf, sizeof xf, "%s/x.fib", root); snprintf(o3, sizeof o3, "%s/lab3", root);
+      const struct { const char *dir, *extra; double guard, ring; int iso, zmax; } C[3] = {{out, "", 3, 0, -1, NZ}, {o3, xf, 2, 3, -1, NZ}, {out2, "", 3, 0, 64, 128}};
+      const int64_t bx[][6] = {{0, 0, 0, 128, 256, 256}, {5, 30, 17, 60, 100, 90}, {-10, -20, 200, 50, 80, 80}, {64, 120, 120, 64, 16, 136}, {70, 190, 140, 3, 20, 20}};
+      const int ngpu = fiber_onfly_gpu(1) ? 2 : 1;
+      for (int mode = 0; mode < ngpu; mode++) { fiber_onfly_gpu(mode); for (int c = 0; c < 3; c++) {
+          store *cs = store_open(ctd); z3 *pl[2];
+          CHECK(!fiber_onfly_open(fb, C[c].extra, nullptr, nullptr, 2, C[c].guard, C[c].ring, C[c].iso, 1, z3_open(cs, "9.6", nullptr), z3_open(cs, "9.6", nullptr), z3_open(cs, "9.6", nullptr), pl), "fiber_onfly_open %d", c);
+          uint8_t *ref[2] = {rd(C[c].dir, "H/9.6"), rd(C[c].dir, "V/9.6")}; CHECK(ref[0] && ref[1], "stored planes %d", c); if (!ref[0] || !ref[1]) return 1;
+          for (int b = 0; b < (int)(sizeof bx / sizeof bx[0]); b++) for (int k = 0; k < 2; k++) {
+              const int64_t o[3] = {bx[b][0], bx[b][1], bx[b][2]}, n[3] = {bx[b][3], bx[b][4], bx[b][5]}; const size_t nv = (size_t)n[0] * n[1] * n[2]; uint8_t *g = malloc(nv);
+              const int r = z3_read(pl[k], o, n, g, 2); long dif = 0, cnt = 0;
+              for (int64_t z = 0; !r && z < n[0]; z++) for (int64_t y = 0; y < n[1]; y++) for (int64_t x = 0; x < n[2]; x++) {
+                  const int64_t gz = o[0] + z, gy = o[1] + y, gx = o[2] + x; const uint8_t v = g[((size_t)z * n[1] + y) * n[2] + x];
+                  const int in = gz >= 0 && gz < NZ && gy >= 0 && gy < NY && gx >= 0 && gx < NX;
+                  if (in && gz >= C[c].zmax) continue;   /* (not written by the --zband raster) */
+                  cnt++; dif += v != (in ? ref[k][((size_t)gz * NY + gy) * NX + gx] : 255); }
+              CHECK(!r && !dif, "onfly (%s) %d box %d plane %c: rc %d, %ld of %ld voxels differ from the stored raster", mode ? "GPU" : "CPU", c, b, "HV"[k], r, dif, cnt);
+              free(g); }
+          free(ref[0]); free(ref[1]); z3_close(pl[0]); z3_close(pl[1]);
+      } }
+      printf("test_fiberraster: the planes on the fly byte-identical to the stored rasters (CPU%s)\n", ngpu > 1 ? ", GPU" : ""); }
     snprintf(p, sizeof p, "rm -rf %s", root); if (!fails && system(p)) fails++;
     printf(fails ? "test_fiberraster: %d FAILED\n" : "test_fiberraster: ok\n", fails);
     return fails ? 1 : 0;
