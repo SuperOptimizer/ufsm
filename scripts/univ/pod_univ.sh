@@ -22,7 +22,7 @@ say() { echo "== $(date '+%F %T') pod_univ: $*"; }
 # u1run NAME STEPS P BINARY: the u1 recipe (scripts/univ/u1.train.sh + the desk relaunch line's flags; auto-resume from K/runs/NAME/last.ckpt,
 # else --init-from wz896), CT from the mirror. The bench / dry runs use the same launcher so their loader wait includes the augmentations.
 u1run() { (cd $K/runs && R=$K/runs U=$4 SRCJ=${SRCJ:-$K/sources-u1-pod.json} GPU=$GPUS LOCK= P=$3 ARCH="--widths 96,128,160,192" WORKERS=${WORKERS:-11} \
-  SLOTS=${SLOTS:-13} MEMMODE=auto ALR=0.0001 MLR=0.002 WIND4L=0.25 ISO=64 MINMEM=${MINMEM:-16} SNAP=1000 \
+  SLOTS=${SLOTS:-13} MEMMODE=${MEMMODE:-auto} ALR=0.0001 MLR=0.002 WIND4L=0.25 ISO=64 MINMEM=${MINMEM:-16} SNAP=1000 \
   EXTRA="--lat 4 --lat-basis $K/small/klt1.lcb --lat-c 29 --lat-step 0.25 --lat-step-jitter 0.3 --lat-guide 3 --replay 3 --um-rungs 4.8,9.6:2,19.2 --rung-shift-p 0.2 --film 2 --fstem 16 --fstem-drop 0.25 --uw 1 --grad-cos 500 --init-from $K/ckpt/wz896.ckpt" \
   nohup bash $D/u1.train.sh $1 $2 >> $K/runs/$1.nohup 2>&1 < /dev/null); }
 for s in $ST; do say $s; case $s in
