@@ -43,9 +43,9 @@ echo "$CK" > $O/ckpt; echo "$BIN $FIT" > $O/fitter
 
 scroll() {   # scroll SCROLL: R V UM LV AX QR QK PR PK PF (PF: CT voxels per label-phase raster voxel)
   case $1 in
-    paris4) R=$P4ROOT; V=PHercParis4/20260411134726-2.400um-0.2m-78keV-masked.zarr; UM=2.4; LV=2; AX=$AXP4
+    paris4) R=$P4ROOT; V=${P4V:-PHercParis4/20260411134726-2.400um-0.2m-78keV-masked.zarr}; UM=2.4; LV=2; AX=$AXP4
             QR=$GT/paris4-q9p6/q-9p6.zarr; QK=9.6; PR=$GT/paris4-wind-20261019; PK=phaseA/9.6; PF=1;;
-    paris4j) R=$P4ROOT; V=PHercParis4/20260411134726-2.400um-0.2m-78keV-masked.zarr; UM=2.4; LV=2; AX=$AXP4   # July-only labels (codes rebuilt from the published July wraps)
+    paris4j) R=$P4ROOT; V=${P4V:-PHercParis4/20260411134726-2.400um-0.2m-78keV-masked.zarr}; UM=2.4; LV=2; AX=$AXP4   # July-only labels (codes rebuilt from the published July wraps)
             QR=$P4JQ; QK=9.6; PR=$GT/paris4-wind-20261019; PK=phaseB/9.6; PF=1;;
     1667)   R=$MIRROR; V=PHerc1667/volumes/20251217075048-2.399um-0.2m-78keV-masked.zarr; UM=2.399; LV=2; AX=$AX1667
             QR=$GT/PHerc1667-wind-20261016/codes; QK=4.798; PR=$GT/PHerc1667-wind-20261016; PK=phase/9.6; PF=1;;
