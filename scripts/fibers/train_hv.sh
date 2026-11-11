@@ -9,4 +9,8 @@ D=$(dirname "$(readlink -f "$0")")
 export R=${R:-/vesuvius/ufsm/fibers/runs} SRCJ=${SRCJ:-/vesuvius/ufsm/fibers/sources-fibhv.json} U=${U:-/home/forrest/ufsm-fib/build/ufsm}
 export HEADS=${HEADS:-"--dice 0.5 --pos-weight 4"} P=${P:-512}
 mkdir -p $R
+# the trainer in the training memory slice (MEMCAP, default "-t -m 40G"; "" = none): a wrapper, since rv/train.sh runs "$U train ..."
+if [ -n "${MEMCAP--t -m 40G}" ]; then
+  W=$R/ufsm-memcap.sh; printf '#!/bin/bash\nexec ~/bin/memcap %s %q "$@"\n' "${MEMCAP--t -m 40G}" "$U" > $W; chmod +x $W; export U=$W
+fi
 exec bash $D/../rv/train.sh "$@"
