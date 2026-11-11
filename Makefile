@@ -79,7 +79,7 @@ SRC += src/vwt_sample.c src/raycheck.c src/patchraster.c src/hiresphase.c src/fi
 SRC += src/view.c src/reg.c src/reg_cli.c src/reg_view.c src/reg_init.c src/reg_render.c src/reg_ink.c src/srpairs.c
 SRC += src/srpair.c
 SRC += src/storebench.c src/phasepack.c
-SRC += src/afv.c src/fibercheck.c src/fitphase.c src/wrapdump.c src/fiberjudge.c src/fibertrace.c src/fiberraster.c src/fiberlink.c
+SRC += src/afv.c src/fibercheck.c src/fitphase.c src/wrapdump.c src/fiberjudge.c src/fibertrace.c src/fiberraster.c src/fiberlink.c src/fibregscore.c
 SRC += src/countfield.c src/countanat.c
 SRC += src/flatten.c src/faces.c src/faces_cli.c
 SRC += src/sheetcut.c
@@ -693,9 +693,12 @@ suite-bins: $(B)/test_gyrec
 suite-bins: $(B)/test_unwrap2_sampler
 suite-bins: $(B)/test_phase_interp
 suite-bins: $(B)/test_l3_sched
-$(B)/test_reg: tests/test_reg.c $(B)/reg.o $(B)/reg_init.o $(B)/zarr3.o $(B)/store.o $(B)/json.o
+$(B)/test_reg: tests/test_reg.c $(B)/reg.o $(B)/reg_init.o $(B)/zarr3.o $(B)/zarr2.o $(B)/store.o $(B)/json.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
 suite-bins: $(B)/test_reg
+$(B)/test_regz2: tests/test_regz2.c $(B)/reg.o $(B)/zarr3.o $(B)/zarr2.o $(B)/store.o $(B)/json.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
+suite-bins: $(B)/test_regz2
 $(B)/test_reg_render: tests/test_reg_render.c $(OBJ) $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 suite-bins: $(B)/test_reg_render

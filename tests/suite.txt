@@ -63,6 +63,7 @@ test_gpuq                                      | flaky        |    14 | bash tes
 test_robust                                    | gpu          |     1 | ./$B/test_robust
 test_reg                                       |              |    27 | ./$B/test_reg
 test_reg_render                                |              |     3 | ./$B/test_reg_render
+test_regz2                                     |              |     1 | ./$B/test_regz2
 test_surf                                      |              |     3 | ./$B/test_surf
 test_wraps_core                                |              |     1 | ./$B/test_wraps_core
 test_stitch                                    |              |     3 | ./$B/test_stitch
