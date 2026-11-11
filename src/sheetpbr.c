@@ -403,6 +403,27 @@ static void md_row(void *a, int y) {
 }
 static void median2d(const float *in, float *out, int W, int R) { mdctx C = {in, out, W, R < 10 ? R : 10}; prows(W, md_row, &C); }
 
+/* --labels: a sparse 3D label zarr on the mesh's scan (ufsm ink-splat output, prob254: 254 ink, 0 no ink, 255 unknown) sampled along each
+   coarse normal every 0.5 voxel over +-D; the labelled samples split into runs (gaps > 1.5 voxels), the run whose centre is nearest the
+   tracked recto face taken: label = ink when most of its samples are ink, offset = its centre (mesh-scan voxels from the mesh) */
+typedef struct { const job *J; cbox L; double D; const float *r; float *lab, *off; } lbctx;
+static void lb_row(void *a, int y) {
+    const lbctx *C = a; const job *J = C->J; const int W = J->W;
+    for (int x = 0; x < W; x++) { const size_t i = (size_t)y * W + x; C->lab[i] = C->off[i] = NAN; double P[3], Du[3], Dv[3], n[3];
+        if (!surf_at(&J->G, J->u0 + (x + 0.5) / J->ss - 0.5, J->v0 + (y + 0.5) / J->ss - 0.5, P, Du, Dv)) continue;
+        cross3(Du, Dv, n); norm3(n); for (int k = 0; k < 3; k++) n[k] *= J->sgn;
+        const double rc = C->r[i] == C->r[i] ? C->r[i] / J->fs : 0; double bt = 1e30, bo = NAN; int bi = 0, bn = 0;
+        double rs = 0; int rn = 0, ri = 0; double last = -1e30;
+        for (double t = -C->D; t <= C->D + 0.5; t += 0.5) {
+            int v = 255; if (t <= C->D) { const int64_t z = llround(P[0] + t * n[0]), yy = llround(P[1] + t * n[1]), xx = llround(P[2] + t * n[2]); const int in = z >= C->L.o[0] && yy >= C->L.o[1] && xx >= C->L.o[2] && z < C->L.o[0] + C->L.n[0] && yy < C->L.o[1] + C->L.n[1] && xx < C->L.o[2] + C->L.n[2];
+                v = in ? (int)cb_at(&C->L, z, yy, xx) : 255; }   /* outside the label box: unknown, not "no ink" */
+            if (v != 255 && (rn == 0 || t - last <= 1.5)) { rs += t; rn++; ri += v >= 127; last = t; continue; }
+            if (rn) { const double c = rs / rn; if (fabs(c - rc) < bt) { bt = fabs(c - rc); bo = c; bi = ri; bn = rn; } rs = 0; rn = 0; ri = 0; }
+            if (v != 255) { rs = t; rn = 1; ri = v >= 127; last = t; }
+        }
+        if (bn) { C->lab[i] = 2 * bi >= bn ? 1.f : 0.f; C->off[i] = (float)bo; } }
+}
+
 static rvol *regfv;   /* --reg: the fine volume */
 /* weak: the map loader lives in src/reg_cli.c (the ufsm binary); tests link without it */
 __attribute__((weak)) const rmap *reg_map_open(const char *path, const char *cache, rvol **fv, double *coarse_um, double *fine_um);
@@ -575,6 +596,25 @@ int cmd_sheet_pbr(int argc, char **argv) {
     fprintf(stderr, "sheet-pbr: faces: %.1f %% of samples found in pass 2; ambiguous recto / verso edge (runner-up >= 0.7 of the best, >= 1 voxel away) %.1f %%; "
                     "pass-2 recto more than %.2f voxels from its neighbourhood median %.1f %%; found after the continuity passes %.1f %%\n",
             100.0 * n2 / NN, n2 ? 100.0 * namb / n2 : 0, cw, n2 ? 100.0 * nmov / n2 : 0, 100.0 * nv / NN);
+    float *hlab = nullptr, *hoff = nullptr, *hdr = nullptr; size_t nlab = 0, nink = 0; double dsum = 0, dabs = 0;
+    for (int i = 1; i + 2 < argc; i++) if (!strcmp(argv[i], "--labels")) {
+        lbctx LC = {&J, {0}, J.depth / J.fs, J.r, nullptr, nullptr};
+        double lo[3] = {1e30, 1e30, 1e30}, hi[3] = {-1e30, -1e30, -1e30};
+        for (int y = 0; y <= J.W; y += 8) for (int x = 0; x <= J.W; x += 8) { double P[3], Du[3], Dv[3];
+            if (!surf_at(&J.G, J.u0 + ((x < J.W ? x : J.W - 1) + 0.5) / J.ss - 0.5, J.v0 + ((y < J.W ? y : J.W - 1) + 0.5) / J.ss - 0.5, P, Du, Dv)) continue;
+            for (int k = 0; k < 3; k++) { if (P[k] - LC.D - 4 < lo[k]) lo[k] = P[k] - LC.D - 4; if (P[k] + LC.D + 4 > hi[k]) hi[k] = P[k] + LC.D + 4; } }
+        for (int k = 0; k < 3; k++) { LC.L.o[k] = (int64_t)floor(lo[k]); LC.L.n[k] = (int64_t)ceil(hi[k]) - LC.L.o[k] + 1; if (LC.L.o[k] < 0) { LC.L.n[k] += LC.L.o[k]; LC.L.o[k] = 0; } }
+        z3 *z = z3_open(store_open(argv[i + 1]), argv[i + 2], popt(argc, argv, "--cache", nullptr)); if (!z) { fprintf(stderr, "sheet-pbr: cannot open the labels %s %s\n", argv[i + 1], argv[i + 2]); return 1; }
+        const z3_meta *zm = z3_meta_of(z); for (int k = 0; k < 3; k++) if (LC.L.o[k] + LC.L.n[k] > zm->shape[k]) LC.L.n[k] = zm->shape[k] - LC.L.o[k];
+        uint8_t *lv = malloc((size_t)LC.L.n[0] * LC.L.n[1] * LC.L.n[2]); if (!lv || z3_read(z, LC.L.o, LC.L.n, lv, nth)) { fprintf(stderr, "sheet-pbr: label read failed\n"); return 1; }
+        z3_close(z); LC.L.v = lv; hlab = malloc(NN * sizeof *hlab); hoff = malloc(NN * sizeof *hoff); hdr = malloc(NN * sizeof *hdr); LC.lab = hlab; LC.off = hoff;
+        prows(J.W, lb_row, &LC); free(lv);
+        for (size_t q = 0; q < NN; q++) { hdr[q] = NAN; if (!(hlab[q] == hlab[q])) continue; nlab++; nink += hlab[q] > 0.5;
+            if (J.r[q] == J.r[q]) { hdr[q] = (float)(hoff[q] - J.r[q] / J.fs); dsum += hdr[q]; dabs += fabs(hdr[q]); } }
+        fprintf(stderr, "sheet-pbr: labels: %.1f %% of samples labelled (%.1f %% of them ink); label surface - tracked recto: mean %+.2f, mean |d| %.2f mesh-scan voxels\n",
+                100.0 * nlab / NN, nlab ? 100.0 * nink / nlab : 0, nlab ? dsum / nlab : 0, nlab ? dabs / nlab : 0);
+        break;
+    }
     /* the height field and diagnostics */
     float *H = malloc(NN * sizeof *H), *Hv = malloc(NN * sizeof *Hv), *g = malloc(NN * sizeof *g), *hp = malloc(NN * sizeof *hp), *rough = malloc(NN * sizeof *rough), *curv = malloc(NN * sizeof *curv), *g2 = malloc(NN * sizeof *g2);
     for (size_t i = 0; i < NN; i++) { H[i] = -J.r[i]; Hv[i] = J.v[i]; }
@@ -609,8 +649,8 @@ int cmd_sheet_pbr(int argc, char **argv) {
             ndp ? (double)ndisagree / ndp : 0, n2 ? (double)namb / n2 : 0, n2 ? (double)nmov / n2 : 0, J.W, J.ss, cu, cv, cn, J.depth, J.step, J.cubic ? "cubic" : "tri", J.sgn, (double)nv / NN);
     const struct { const char *n; const float *a; } maps[] = {{"recto_off", J.r}, {"verso_off", J.v}, {"thickness", J.thk}, {"peak", J.pk}, {"near_recto", J.nin},
         {"near_verso", J.nout}, {"flat", J.flat}, {"flatmax", J.fmax}, {"height", H}, {"verso_h", Hv}, {"highpass", hp}, {"roughness", rough}, {"curvature", curv},
-        {"edge_recto", J.grr}, {"edge_verso", J.grv}, {"ambiguity", J.amb}, {"ao", ao}, {"rti_max", rmax}, {"rti_min", rmin}, {"rti_range", rr}, {"pbr", pbr}, {"pbr_density", pbd}};
-    for (size_t k = 0; k < sizeof maps / sizeof *maps; k++) { write_f32(out, maps[k].n, maps[k].a, J.W, js, &first); if (k < 16) write_auto(out, maps[k].n, maps[k].a, J.W); }
+        {"edge_recto", J.grr}, {"edge_verso", J.grv}, {"ambiguity", J.amb}, {"human_ink", hlab}, {"human_off", hoff}, {"human_dr", hdr}, {"ao", ao}, {"rti_max", rmax}, {"rti_min", rmin}, {"rti_range", rr}, {"pbr", pbr}, {"pbr_density", pbd}};
+    for (size_t k = 0; k < sizeof maps / sizeof *maps; k++) { if (!maps[k].a) continue; write_f32(out, maps[k].n, maps[k].a, J.W, js, &first); if (k < 19) write_auto(out, maps[k].n, maps[k].a, J.W); }
     fprintf(js, "]}\n"); fclose(js);
     double ts = 0; for (size_t i = 0; i < NN; i++) if (J.valid[i] > 0) ts += J.thk[i];
     fprintf(stderr, "sheet-pbr: %d x %d samples, sheet found in %.1f %%, mean thickness %.2f voxels -> %s\n", J.W, J.W, 100.0 * nv / NN, nv ? ts / nv : 0, out);
