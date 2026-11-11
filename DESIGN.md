@@ -6,6 +6,30 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Fibre-normal arms: the seed-repeat noise floor and an untested source-mix confound (2026-11-11, branch fibnote-20261111)
+
+Closes the fibre-in-the-winding-net arms (section "Fibres in the winding network", below); the work moves to the universal latent net.
+All numbers: wbench core, WIN 384 HALO 64, the 39 clean boxes (ceil >= 0.8), step 4000, paired A - B with 95 % CI (`wbench-stats`).
+
+Noise floor, measured: vc384c-r2 is vc384c's recipe with seed 4 instead of 3. vc384c-r2 - vc384c: p05x +0.002 [-0.008, +0.013], ids
+-0.009 [-0.033, +0.011], p1x +0.003 [-0.008, +0.014]. Per set the four Paris 4 boxes alone move +0.020 p05x on the seed. So on these
+39 boxes a p05x difference under ~0.01 and an ids difference under ~0.02-0.03 is not a result; per-set (4-box) deltas under ~0.02 are noise.
+
+| A - B (p05x) | all | note |
+|---|---|---|
+| vcfibA2 (lambda 0.1, map-registered P4 labels) - vc384c | -0.015 [-0.027, -0.003] | P4 -0.028, July -0.022, 1667 +0.021 (ids +0.033) |
+| vcfibU (term only where the normal BCE mask is off) - vc384c | -0.016 [-0.027, -0.005] | July -0.025, 1667 +0.012 |
+| vc384c-r2 - vcfibA2 / - vcfibU | +0.018 [+0.007, +0.027] / +0.019 [+0.009, +0.028] | the loss stands outside seed noise |
+| vcfibA2 - vcfibA (old affine labels) | +0.014 [+0.001, +0.029] | the registration map helped |
+
+Absolute p05x: vc384c 0.668, vc384c-r2 0.671, vcfibA2 0.653, vcfibU 0.652, vcfibA 0.640.
+
+Untested confound: every fibre arm also changed the source list (`sources-wind-gt-fibp4r`: the Paris 4 June / July sources carry the
+fibre raster as their "sheet" target, which also changes how those windows are drawn - the level-5 CT papyrus occupancy fallback in
+`sample.c` - against vc384c's `sources-wind-gt-nvme`). So the Paris 4 / July loss may be the data mix, not the term. The control
+(vcfib0: vcfibA2 exactly with lambda 1e-9 - lambda 0 switches `IPLANE` off and changes the data path) was prepared in
+`runs/vcfib.launch.sh` and never run; run it before drawing a conclusion about the term. Not run either: lambda 0.03, the pair term.
+
 ## Latent winding net vs wind96: where the gap is (2026-11-11, branch latbeat-20261111)
 
 wbench core, 39 clean boxes (paired, 95 % CI): wind96 (voxel, WIN 640) p05x 0.677; best latent wz896-12000 (wz768 8000 + 12000 steps,
