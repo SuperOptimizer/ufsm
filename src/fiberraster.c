@@ -1,5 +1,5 @@
 /* ufsm fiber-raster <fibres.afv | fibres.fib> OUT --um U (--shape Z,Y,X | --ct ROOT KEY [--iso 64]) [--level 0] [--tr T.json | --map reg.json]
-       [--zband Z0,Z1] [--radius 2] [--guard 3] [--ring 0] [--extra all-lengths.afv] [--resume 0|1] [--shard 512] [--threads 4]
+       [--zband Z0,Z1] [--radius 2] [--guard 3] [--ring 0] [--extra A.afv[@map],B.afv[@map]..] [--resume 0|1] [--shard 512] [--threads 4]
    Training labels for fibre-family mask heads from fibre polylines (an AFV, or UFIB level-0 points): two prob254 volumes on the level-L
    CT grid (U = that grid's voxel size), OUT/H/<U> and OUT/V/<U> (zarr v3, lossless, fill 255 = unknown), usable as the "recto" and
    "sheet" targets of a sources entry ({"root": OUT/H, "encoding": "prob254"}).
@@ -12,6 +12,8 @@
    --ring K (2026-11-11): voxels farther than radius + guard from every fibre but within radius + guard + K of one are 0 in both planes
    ("no fibre axis here": the net learns tubes, not the fibre layer; with ring 0 it marked 84 % of the papyrus H or V, DESIGN.md 2026-11-11),
    except within radius + guard of any fibre of --extra (an all-lengths AFV of the same scan: untraced short fibres stay unknown).
+   --extra takes up to 4 comma-separated AFVs (2026-11-11): an entry is in the CT's own level-0 voxels, or, suffixed "@map", in the
+   --map's coarse frame (e.g. Paris 4: the 2023 all-lengths tracing through the reg map plus the native 2.4 um Paris4_v1 chains).
    Shards (--shard^3) are independent; --zband limits the z range written (level voxels, widened to whole shards). CPU. */
 #include <math.h>
 #include <pthread.h>
@@ -29,7 +31,7 @@
 static const char *fr_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 4; i + 1 < argc; i++) if (!strcmp(argv[i], k)) return argv[i + 1]; return d; }
 static int fr_opti(int argc, char **argv, const char *k) { for (int i = 4; i + 1 < argc; i++) if (!strcmp(argv[i], k)) return i; return 0; }
 typedef struct {
-    afv *A, *X; const fib_set *F, *XF; double (*fbb)[6], (*xbb)[6]; pthread_mutex_t mu; int has_tr; double M[3][4], Mi[3][3]; double sc; const rmap *map;   /* --map: a ufsm reg map (coarse = the AFV's scan) instead of --tr */
+    afv *A, *X[4]; int nX, xmap[4]; const fib_set *F, *XF; double (*fbb)[6], (*xbb)[6]; pthread_mutex_t mu; int has_tr; double M[3][4], Mi[3][3]; double sc; const rmap *map;   /* --map: a ufsm reg map (coarse = the AFV's scan) instead of --tr */
     int64_t shape[3]; int S, iso, resume; double rad, guard, ring; z3 *ct; z3w *w[2]; char dir[2][2200]; atomic_long skipped;
     int64_t s0[3], ns[3]; atomic_long next; atomic_int fail; atomic_llong cnt[4];   /* H 254, H 0, V 254, V 0 (voxels) */
 } fr_job;
@@ -97,12 +99,18 @@ static void *fr_worker(void *arg) {
                         fr_stamp(d[3], so, n, u, J->rad + J->guard); }
                     for (int k = 0; k < 3; k++) prev[k] = p[k]; } }
         }
-        if (J->X && J->ring > 0) {   /* --extra: every other traced fibre (any length / family) vetoes the negative ring within radius + guard of it */
-            double qlo[3], qhi[3]; for (int k = 0; k < 3; k++) { qlo[k] = (lo[2 - k] + 0.5) * J->sc - 0.5; qhi[k] = (hi[2 - k] + 0.5) * J->sc - 0.5; }
-            afv_run *Xr = nullptr; pthread_mutex_lock(&J->mu); const int nx = afv_query(J->X, qlo, qhi, &Xr); pthread_mutex_unlock(&J->mu);
+        for (int e = 0; e < J->nX && J->ring > 0; e++) {   /* --extra: every other traced fibre (any length / family) vetoes the negative ring within radius + guard of it */
+            double qlo[3] = {1e30, 1e30, 1e30}, qhi[3] = {-1e30, -1e30, -1e30};
+            if (J->xmap[e]) {   /* @map: the query box is the shard box's 8 corners through the map (as the main AFV) */
+                for (int c = 0; c < 8; c++) { const double g[3] = {((c & 1 ? hi[2] : lo[2]) + 0.5) * J->sc - 0.5, ((c & 2 ? hi[1] : lo[1]) + 0.5) * J->sc - 0.5, ((c & 4 ? hi[0] : lo[0]) + 0.5) * J->sc - 0.5}; double a[3];
+                    rmap_f2c(J->map, g, a); for (int k = 0; k < 3; k++) { if (a[k] < qlo[k]) qlo[k] = a[k]; if (a[k] > qhi[k]) qhi[k] = a[k]; } }
+            } else for (int k = 0; k < 3; k++) { qlo[k] = (lo[2 - k] + 0.5) * J->sc - 0.5; qhi[k] = (hi[2 - k] + 0.5) * J->sc - 0.5; }
+            afv_run *Xr = nullptr; pthread_mutex_lock(&J->mu); const int nx = afv_query(J->X[e], qlo, qhi, &Xr); pthread_mutex_unlock(&J->mu);
             if (nx < 0) { atomic_store(&J->fail, 1); break; }
             for (int r = 0; r < nx; r++) { double prev[3] = {0, 0, 0};
-                for (int i = 0; i < Xr[r].n; i++) { double p[3]; for (int k = 0; k < 3; k++) p[k] = (Xr[r].xyz[3 * i + 2 - k] + 0.5) / J->sc - 0.5;
+                for (int i = 0; i < Xr[r].n; i++) { double g[3] = {Xr[r].xyz[3 * i], Xr[r].xyz[3 * i + 1], Xr[r].xyz[3 * i + 2]}, p[3];
+                    if (J->xmap[e]) { const double c[3] = {g[0], g[1], g[2]}; rmap_c2f(J->map, c, g); }
+                    for (int k = 0; k < 3; k++) p[k] = (g[2 - k] + 0.5) / J->sc - 0.5;
                     const double len = i ? sqrt(pow(p[0] - prev[0], 2) + pow(p[1] - prev[1], 2) + pow(p[2] - prev[2], 2)) : 0; const int m = i ? (int)ceil(len) : 1;
                     for (int k = 1; k <= m; k++) { const double f = (double)k / m, q[3] = {prev[0] + f * (p[0] - prev[0]), prev[1] + f * (p[1] - prev[1]), prev[2] + f * (p[2] - prev[2])};
                         const double *u = i ? q : p; if (u[0] < lo[0] || u[0] > hi[0] || u[1] < lo[1] || u[1] > hi[1] || u[2] < lo[2] || u[2] > hi[2]) continue;
@@ -110,6 +118,7 @@ static void *fr_worker(void *arg) {
                     for (int k = 0; k < 3; k++) prev[k] = p[k]; } }
             afv_runs_free(Xr, nx);
         }
+        if (atomic_load(&J->fail)) break;
         int have_ct = 0;
         if (J->ct) { int64_t cn[3]; for (int k = 0; k < 3; k++) cn[k] = so[k] + S > J->shape[k] ? J->shape[k] - so[k] : S;
             uint8_t *tmp = malloc((size_t)cn[0] * cn[1] * cn[2]);
@@ -157,7 +166,7 @@ int cmd_fiber_raster(int argc, char **argv) {
     const char *trp = fr_opt(argc, argv, "--tr", nullptr); J.has_tr = trp != nullptr;
     if (trp && fc_transform(trp, J.M, J.Mi)) { fprintf(stderr, "fiber-raster: cannot read the transform %s\n", trp); return 1; }
     const char *mapp = fr_opt(argc, argv, "--map", nullptr);   /* --map reg.json: AFV points through the reg map (affine + displacement field) */
-    if (mapp) { if (trp) { fprintf(stderr, "fiber-raster: --tr or --map, not both\n"); return 2; } rvol *fv; double cu, fu; J.map = reg_map_open(mapp, fr_opt(argc, argv, "--cache", nullptr), &fv, &cu, &fu); if (!J.map) return 1; }
+    if (mapp) { if (trp) { fprintf(stderr, "fiber-raster: --tr or --map, not both\n"); return 2; } J.map = reg_map_load(mapp); if (!J.map) return 1; }
     fib_set F = {0};
     { FILE *f = fopen(argv[2], "rb"); char mg[4] = ""; if (!f || fread(mg, 1, 4, f) != 4) { fprintf(stderr, "fiber-raster: cannot read %s\n", argv[2]); return 1; } fclose(f);
       if (!memcmp(mg, "UFIB", 4)) {
@@ -167,20 +176,33 @@ int cmd_fiber_raster(int argc, char **argv) {
               for (int i = F.off[r]; i < F.off[r + 1]; i++) for (int k = 0; k < 3; k++) { const double v = (F.pts[3 * (size_t)i + k] + 0.5) / J.sc - 0.5; if (v < J.fbb[r][k]) J.fbb[r][k] = v; if (v > J.fbb[r][3 + k]) J.fbb[r][3 + k] = v; } }
       } else if (!(J.A = afv_open(argv[2]))) return 1; }
     fib_set XF = {0};
-    if (*fr_opt(argc, argv, "--extra", "")) { const char *xp = fr_opt(argc, argv, "--extra", ""); FILE *f = fopen(xp, "rb"); char mg[4] = "";
-        if (!f || fread(mg, 1, 4, f) != 4) { fprintf(stderr, "fiber-raster: cannot read %s\n", xp); if (f) fclose(f); return 1; } fclose(f);
-        if (!memcmp(mg, "UFIB", 4)) { if (fib_load(xp, &XF)) { fprintf(stderr, "fiber-raster: bad UFIB file %s\n", xp); return 1; }
-            J.XF = &XF; J.xbb = malloc(((size_t)XF.n + 1) * sizeof *J.xbb);
-            for (int r = 0; r < XF.n; r++) { for (int k = 0; k < 3; k++) { J.xbb[r][k] = 1e30; J.xbb[r][3 + k] = -1e30; }
-                for (int i = XF.off[r]; i < XF.off[r + 1]; i++) for (int k = 0; k < 3; k++) { const double v = (XF.pts[3 * (size_t)i + k] + 0.5) / J.sc - 0.5; if (v < J.xbb[r][k]) J.xbb[r][k] = v; if (v > J.xbb[r][3 + k]) J.xbb[r][3 + k] = v; } }
-        } else if (!(J.X = afv_open(xp))) return 1; }
-    if (J.X && J.has_tr) { fprintf(stderr, "fiber-raster: --extra with --tr is not supported (native AFVs only)\n"); return 2; }
+    if (*fr_opt(argc, argv, "--extra", "")) {   /* one UFIB, or up to 4 AFVs (comma list; "@map" = through --map) */
+        char xs[4096]; snprintf(xs, sizeof xs, "%s", fr_opt(argc, argv, "--extra", "")); char *save = nullptr;
+        for (char *xp = strtok_r(xs, ",", &save); xp; xp = strtok_r(nullptr, ",", &save)) {
+            const size_t L = strlen(xp); const int viamap = L > 4 && !strcmp(xp + L - 4, "@map"); if (viamap) xp[L - 4] = 0;
+            if (viamap && !J.map) { fprintf(stderr, "fiber-raster: --extra %s@map needs --map\n", xp); return 2; }
+            FILE *f = fopen(xp, "rb"); char mg[4] = "";
+            if (!f || fread(mg, 1, 4, f) != 4) { fprintf(stderr, "fiber-raster: cannot read %s\n", xp); if (f) fclose(f); return 1; } fclose(f);
+            if (!memcmp(mg, "UFIB", 4)) {
+                if (J.XF || J.nX || viamap) { fprintf(stderr, "fiber-raster: a UFIB --extra must be the only one (native)\n"); return 2; }
+                if (fib_load(xp, &XF)) { fprintf(stderr, "fiber-raster: bad UFIB file %s\n", xp); return 1; }
+                J.XF = &XF; J.xbb = malloc(((size_t)XF.n + 1) * sizeof *J.xbb);
+                for (int r = 0; r < XF.n; r++) { for (int k = 0; k < 3; k++) { J.xbb[r][k] = 1e30; J.xbb[r][3 + k] = -1e30; }
+                    for (int i = XF.off[r]; i < XF.off[r + 1]; i++) for (int k = 0; k < 3; k++) { const double v = (XF.pts[3 * (size_t)i + k] + 0.5) / J.sc - 0.5; if (v < J.xbb[r][k]) J.xbb[r][k] = v; if (v > J.xbb[r][3 + k]) J.xbb[r][3 + k] = v; } }
+            } else {
+                if (J.XF || J.nX == 4) { fprintf(stderr, "fiber-raster: at most 4 AFV --extra entries, not with a UFIB one\n"); return 2; }
+                if (!(J.X[J.nX] = afv_open(xp))) return 1;
+                J.xmap[J.nX++] = viamap;
+            }
+        }
+    }
+    for (int e = 0; e < J.nX; e++) if (!J.xmap[e] && J.has_tr) { fprintf(stderr, "fiber-raster: a native --extra with --tr is not supported\n"); return 2; }
     long long zb[2] = {0, sh[0]}; if (*fr_opt(argc, argv, "--zband", "") && sscanf(fr_opt(argc, argv, "--zband", ""), "%lld,%lld", &zb[0], &zb[1]) != 2) { fprintf(stderr, "fiber-raster: --zband Z0,Z1\n"); return 2; }
     if (zb[0] < 0) zb[0] = 0;
     if (zb[1] > sh[0]) zb[1] = sh[0];
     if (zb[1] <= zb[0]) { fprintf(stderr, "fiber-raster: empty --zband\n"); return 2; }
     J.s0[0] = zb[0] / J.S; J.ns[0] = (zb[1] + J.S - 1) / J.S - J.s0[0]; for (int k = 1; k < 3; k++) { J.s0[k] = 0; J.ns[k] = (J.shape[k] + J.S - 1) / J.S; }
-    char lv[64], p[2200], at[600]; z3w_level_name(um, lv, sizeof lv);
+    char lv[64], p[2200], at[5000]; z3w_level_name(um, lv, sizeof lv);
     for (int k = 0; k < 2; k++) {
         snprintf(at, sizeof at, "{\"ufsm\":{\"content\":\"fiber-raster %c\",\"encoding\":\"prob254: 254 = a %c fibre, 0 = a %c fibre%s, 255 = unknown\",\"radius\":%g,\"guard\":%g,\"ring\":%g,\"extra\":\"%s\",\"zband\":[%lld,%lld]}}",
                  "HV"[k], "HV"[k], "VH"[k], J.ct ? " or air" : "", J.rad, J.guard, J.ring, fr_opt(argc, argv, "--extra", ""), zb[0], zb[1]);
@@ -197,7 +219,7 @@ int cmd_fiber_raster(int argc, char **argv) {
     printf("fiber-raster: %lld x %lld x %lld level-%d voxels of %g um, z %lld..%lld, radius %g guard %g: H plane %lld fibre / %lld other voxels, V plane %lld / %lld -> %s/{H,V}/%s\n",
            sh[0], sh[1], sh[2], level, um, zb[0], zb[1], J.rad, J.guard, (long long)atomic_load(&J.cnt[0]), (long long)atomic_load(&J.cnt[1]), (long long)atomic_load(&J.cnt[2]), (long long)atomic_load(&J.cnt[3]), argv[3], lv);
     if (J.A) afv_close(J.A);
-    if (J.X) afv_close(J.X);
+    for (int e = 0; e < J.nX; e++) afv_close(J.X[e]);
     fib_free(&XF); free(J.xbb);
     fib_free(&F); free(J.fbb); if (J.ct) z3_close(J.ct);
     return 0;
