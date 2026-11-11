@@ -134,6 +134,11 @@ NNSRC = $(wildcard src/nn_*.cu)
 NNOBJ = $(patsubst src/%.cu,$(B)/%.o,$(NNSRC))
 $(B)/nn_%.o: src/nn_%.cu | $(B)
 	$(NVCC) $(NVFLAGS) $(TYPEFLAGS) -Xfatbin=-compress-all -MMD -MP -c $< -o $@
+# the annotate page as a byte list for compilers without #embed (gcc < 15: the pods' toolchains), made with od (coreutils)
+$(B)/annot_page.inc: src/annot_page.html | $(B)
+	od -An -v -tx1 $< | sed 's/ \([0-9a-f][0-9a-f]\)/0x\1,/g' > $@
+$(B)/annot.o: $(B)/annot_page.inc
+$(B)/annot.o: CPPFLAGS += -I$(B)
 $(B)/nn_flat.o: NVFLAGS += --default-stream per-thread   # concurrent strip-flatten chunks on one device
 $(B)/nn.o: $(NNOBJ)
 	ld -r -o $@ $^
@@ -235,6 +240,9 @@ suite-bins: $(B)/test_fstem
 $(B)/test_gram: tests/test_gram.c $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 suite-bins: $(B)/test_gram
+$(B)/test_fibhead: tests/test_fibhead.c $(B)/nn.o $(B)/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
+suite-bins: $(B)/test_fibhead
 $(B)/test_unet: tests/test_unet.c $(B)/unet.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 $(B)/test_gn_frozen: tests/test_gn_frozen.c $(B)/unet.o $(B)/nn.o $(B)/nn_fp8.o

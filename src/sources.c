@@ -103,7 +103,7 @@ void axis_at(const axis *a, double z, double *y, double *x) {
 /* ---- sources ---- */
 
 const char *const SHNAME[SH_N] = {"phase", "normal", "density", "wind4", "rv", "ink", "fibre"};
-static const char *CHNAME[NTG] = {"recto", "sheet", "fibre"};
+static const char *CHNAME[NTG] = {"recto", "sheet", "fibre", "fibre_h", "fibre_v"};
 
 static char *sdup(const char *s) { return s ? strdup(s) : nullptr; }
 
@@ -169,6 +169,8 @@ sources *sources_load(const char *path) {
             const json *t = json_get(tg, CHNAME[c]);
             if (!t && c == CH_SHEET) t = json_get(tg, "ink");   /* task unwrap: the ink teacher (prob) in target slot 1 */
             if (!t && c == CH_FIB) t = json_get(tg, "fiber");
+            if (!t && c == CH_FIBH) t = json_get(tg, "fiber_h");
+            if (!t && c == CH_FIBV) t = json_get(tg, "fiber_v");
             for (int l = 0; l < MAXLEV; l++) s->tgt_present[c][l] = -1;
             if (!t) continue;
             if (t->type == J_STR) { s->tgt_key[c] = strdup(t->str); continue; }

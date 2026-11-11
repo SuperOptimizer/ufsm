@@ -6,6 +6,45 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Universal net: the fibre head in unwrap2 (--fib-head L) (2026-11-11, branch univ-20261111)
+
+Why: `--fib-dir` (fibhv-c / fibhv-d: the H / V fibre masks plus the tube direction) ran as its own task. It used the two batch target
+channels, needed a whole-window loss, and excluded every unwrap2 head. The universal net (U5) needs it as one more head on the
+shared trunk.
+
+How:
+- **Targets:** two new target slots, "fibre_h" and "fibre_v" (`CH_FIBH` / `CH_FIBV`, NTG 5), each a prob254 tube raster with
+  255 = unknown. A builder maps fibhv data's recto to fibre_h and sheet to fibre_v.
+- **Planes:** they become two more aux label planes (roles `AUX_FIBH` / `AUX_FIBV`):
+  - The registry now holds up to 5 aux planes (sampler `batch.aux[0..3]`, `aux_ch[j]` = the plane's target slot; `ink_ch` when
+    the fibre H plane is plane 0).
+  - Every per-plane stream array grows to `NLPL` = 8.
+  - The two fibre planes are streamed with ±`g_fd_r` halo planes per head slab (`lhalo`); the slab upload, pointer and stream-check
+    code is now one loop over the planes.
+- **Head (`--fib-head L`):** channels after rv: H mask, V mask, then the direction t·tᵀ (6) and the family bit (V).
+  - Masks: soft BCE over the known voxels (`nn_ink_targets`).
+  - Direction: per slab from the two planes (`nn_fib_head_dir`: `fib_dir_k` with 255-unknown planes), as a 7-BCE without
+    --pos-weight, like --fib-dir.
+  - Weights: λ × the source's "fibre" head weight. The logged loss is λ (mask bce + dir bce); the step line shows
+    "fib bce … dir …".
+- **Padding:** more than 16 outputs are padded to a multiple of 16 (outputs `g_pad_ch..`, zero gradient). The 1³ MX head kernels
+  run in passes of 16, and 20 or 22 outputs had no head backward.
+- **Init and header:**
+  - `--init-from` a net with the same layout without the head (u1: cout 13) copies rows 0..12; the fibre rows start fresh
+    (bias `--fib-bias` −2 on the masks).
+  - The runtime header carries the --fib-dir channel map at its offset ("fib_dir": {"head": 1, "channels": {"H": 13, …}}).
+- **Not yet:** with `--lat-guide 3`, the sub-cell layout still caps the interpolated outputs at 16, so the fibre head runs with
+  `--lat 4` alone or with voxel trunks. Lifting that cap is the sub-cell rv / ink step.
+
+Tests:
+- `test_fibhead`: on random tubes, every 24-plane slab's direction targets equal `nn_fib_dir_targets` over the whole window
+  (13962 targets). With a third of H unknown, none of the unknown voxels gets a target.
+- `test_fibhead_train` (wind fixture tube rasters `fibh` / `fibv`, sources-fibhv.json):
+  - The voxel run logs the fibre losses on 100% of windows.
+  - The latent `--rv 2` run's stream check finds 0 of 26.7 M slab bytes differing (the halos included), and it logs identically to
+    a run with the planes kept on the device.
+  - Init-from rows 0–12 and resume both work, and the checkpoint header has the channel map.
+
 ## Data-parallel training: one host thread per GPU (2026-11-11, branch univ-20261111)
 
 Why: u1 (P 896 latent, two desk GPUs) ran at 0.54 samples/s with one host thread launching both GPUs. A step queues more kernels

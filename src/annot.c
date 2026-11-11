@@ -351,12 +351,14 @@ static int load_regions(const char *path) {   /* name z y x size score note (lev
 }
 
 /* ---- HTTP ---------------------------------------------------------------------------------------------------------------------- */
-#if defined(__has_embed)
+#if defined(__has_embed) && !defined(UFSM_NO_EMBED)   /* (UFSM_NO_EMBED: the od path, tests) */
 static const char PAGE_EMBED[] = {
 #embed "annot_page.html"
 , 0};
 #else
-static const char PAGE_EMBED[] = "<html><body>this build has no embedded page (needs #embed, gcc >= 15): run with --page FILE</body></html>";
+static const char PAGE_EMBED[] = {   /* (the Makefile's od byte list of the same file: gcc < 15) */
+#include "annot_page.inc"
+0};
 #endif
 
 static void reply(int fd, int code, const char *type, const void *body, size_t n) {
