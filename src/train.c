@@ -3366,9 +3366,15 @@ int cmd_train(int argc, char **argv) {
                 G[0].pending = nb;
             }
         } else
+        /* several GPUs: every GPU's forward launched (phase 0) before any backward (phase 1). One host thread launches; a P 896 latent
+           step queues more kernels than the driver's launch queue holds, so the host blocked in GPU 0's backward launches while GPU 1 idled
+           for its whole forward (u1: each GPU ~75 % busy, idle out of phase). UFSM_MGPU_PHASED=0: forward + backward per GPU in turn */
+        for (int ph = 0, ph1[64] = {0}, phased = ng > 1 && (!getenv("UFSM_MGPU_PHASED") || ufsm_env_on("UFSM_MGPU_PHASED")); ph < 2; ph++)
         for (int g = 0; g < ng; g++) {
             gpu_state *d = &G[g];
+            if (ph == 1 && !ph1[g]) continue;
             nn_init(d->dev);
+            if (ph == 0) {
             want_next[g] = 0;
             if (overfit > 1) {                              /* diagnostic: cycle through the first N batches (host copies, synchronous upload) */
                 static batch *fixed[256]; static int nfixed = 0;
@@ -3446,6 +3452,10 @@ int cmd_train(int argc, char **argv) {
             restore_train_recipe(d, step, g), run_batch(d, B, P, dice_w, 1);
             test_nan_inject(d, step, 1, P);
             if (sync_check(d, step, "forward and losses")) return 1;
+            ph1[g] = phased;
+            if (phased) continue;   /* (the backward in phase 1) */
+            }
+            ph1[g] = 0;
             unet_backward_x(d->u, g_half && !g_pkf ? d->glh : d->gl, g_g16); nn_ptick("trunk backward");
             test_nan_inject(d, step, 2, P);
             if (sync_check(d, step, "backward")) return 1;
