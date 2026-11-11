@@ -9,9 +9,9 @@ while :; do
   mkdir -p $L/4.8; rsync -a -e "$P" $EP:$R/zarr.json $L/zarr.json 2>/dev/null; rsync -a -e "$P" $EP:$R/4.8/zarr.json $L/4.8/zarr.json 2>/dev/null
   rsync -a --remove-source-files -e "$P" --exclude='*.tmp*' --exclude='.*' $EP:$R/4.8/c/ $L/4.8/c/ 2>/dev/null
   for f in $done_parts; do $P $EP "touch ${f%.done}.pulled" < /dev/null; done
-  if $P $EP "grep -q '^== .* done' $LOGF" < /dev/null; then
+  if $P $EP "test -e $R.all.done" < /dev/null; then
     left=$($P $EP "find $R/4.8/c -type f 2>/dev/null | wc -l" < /dev/null); [ "${left:-1}" = 0 ] && break
   fi
-  sleep 300
+  sleep 60
 done
 touch $L/done; echo "$(date) pulled: $(find $L/4.8/c -type f | wc -l) shards, $(du -sh $L | cut -f1)"

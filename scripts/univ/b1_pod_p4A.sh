@@ -8,8 +8,8 @@
 set -uo pipefail; SH=${1:?shard list}; K=${K:-/workspace/b1}; U=${U:-/workspace/ufsm-master/build/ufsm}; NP=${NP:-8}; T=${T:-12}
 D=$(dirname "$(readlink -f "$0")"); SEG=$K/seg/PHercParis4; G=$K/gt/paris4; AX=$K/axis-0.json; SHP=75784,32693,32693; UM=2.4; mkdir -p $G
 step() { echo "== $(date +%T) $*"; }
-step fetch June; [ -e $SEG/.done ] || [ -s $G/qA/seed.jsonl ] || bash $D/../pod/fetchsegs.sh PHercParis4 $SEG 20260623 | tail -2
-step seed June; if [ ! -s $G/qA/seed.jsonl ]; then A=$(ls -d $SEG/20260623*-w*/mesh/*-on-20260411134726-2.4um.tifxyz | grep -v jordi)
+step fetch June; [ -f $G/codesA48/done ] || [ -e $SEG/.done ] || [ -s $G/qA/seed.jsonl ] || bash $D/../pod/fetchsegs.sh PHercParis4 $SEG 20260623 | tail -2
+step seed June; if [ ! -f $G/codesA48/done ] && [ ! -s $G/qA/seed.jsonl ]; then A=$(ls -d $SEG/20260623*-w*/mesh/*-on-20260411134726-2.4um.tifxyz | grep -v jordi)
   nice -n 5 $U wind-seed $G/qA $A --vol-um $UM --axis $AX > $G/seedA.log 2>&1 || { tail -3 $G/seedA.log; exit 1; }; fi
 [ -s $G/qA/seed.jsonl ] && rm -rf $SEG   # the seed holds mesh copies with q.tif
 step raster June 4.8; [ -f $G/codesA48/done ] || { nice -n 5 $U raster $G/codesA48 --shape $SHP --um $UM --level 1 --binary 0 --levels 1 --threads $T --shard 512 --value q.tif $G/qA/*.tifxyz > $G/rasterA48.log 2>&1 && touch $G/codesA48/done; tail -1 $G/rasterA48.log; }
@@ -24,13 +24,17 @@ while i < len(r):
     z, y, x = r[i]; b.append(f"{z*2048},{y*2048},{x*2048},2048,2048,{(j-i+1)*2048}"); i = j + 1
 for p in range(n): open(f"{sys.argv[3]}/part-{p}.boxes", "w").write("\n".join(b[p::n]) + "\n")
 PY
-for p in $(seq 0 $((NP - 1))); do
-  [ -e $O.part-$p.done ] && continue
-  while [ $(ls $O.part-*.done 2>/dev/null | wc -l) -ge $(( $(ls $O.part-*.pulled 2>/dev/null | wc -l) + 2 )) ]; do sleep 60; done   # <= 2 unpulled parts
-  step phase part $p "($(wc -l < $K/parts/part-$p.boxes) boxes)"; s=$(date +%s)
-  for b in $(cat $K/parts/part-$p.boxes); do
-    nice -n 5 $U phase-raster $G/codesA48 4.8 $O --gs 2 --pair 1 --radius 160 --axis $AX --threads $T --shards 3 --resume 1 --box $b --gpu 0 --gpu-slots 2 >> $O.log 2>&1 || echo "box $b failed"
-  done
-  echo "$(date +%T) part $p: $(( $(date +%s) - s )) s" >> $O.parts.log; touch $O.part-$p.done
+# the phase, box by box, with a ledger of finished boxes ($O.boxes.ok; a failed box, e.g. ENOSPC, is retried on the next run) and a cap on
+# the not-yet-pulled output on the pod disk (CAPGB, default 10): the desk pulls continuously (b1_pull_p4A.sh) with --remove-source-files,
+# so --resume cannot see pulled shards and the ledger is what makes a rerun skip finished boxes. (2026-11-11: the first run wrote 8
+# parts in ~25 min, faster than the pull, filled the pod disk and lost 130 boxes to ENOSPC.)
+touch $O.boxes.ok; CAP=${CAPGB:-10}
+for b in $(cat $K/parts/part-*.boxes); do
+  grep -qx "$b" $O.boxes.ok && continue
+  while [ $(du -s --block-size=1G $O 2>/dev/null | cut -f1) -ge $CAP ] || [ $(df --output=avail -B1G /workspace | tail -1) -lt 6 ]; do sleep 30; done
+  find $O -name '*.tmp' -delete 2>/dev/null
+  if nice -n 5 $U phase-raster $G/codesA48 4.8 $O --gs 2 --pair 1 --radius 160 --axis $AX --threads $T --shards 3 --resume 1 --box $b --gpu 0 --gpu-slots 2 >> $O.log 2>&1; then
+    echo "$b" >> $O.boxes.ok; else echo "box $b failed"; fi
 done
+[ $(sort -u $O.boxes.ok | wc -l) -ge $(cat $K/parts/part-*.boxes | sort -u | wc -l) ] && touch $O.all.done
 step done
