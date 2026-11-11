@@ -6,6 +6,50 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Universal net A6: the fine voxel stem (--fstem C, --fstem-drop P) (2026-11-11, branch univ-20261111)
+
+Why: the latbeat verdict above. The latent net's phase deficit against wind96 is resolution: 38.4 um cells hold 1.5-4 cells per sheet
+period at 60-150 um spacing. **`--fstem 16`** (latent grid, `--lat 4 --lat-guide 3`, task unwrap2) adds a second path into the head
+beside the trunk. It reads the CT channel itself at stride 2: per 2^3-voxel block a 4^3 conv (taps 2 i - 1 .. 2 i + 2 per axis, zero
+outside the window), 16 silu features (19.2 um at 9.6 um voxels), and a 16 -> nout projection added to every head output that the
+head slabs hold as voxel logits. That is every output except the fused normal / density group: phase, wind4, rv, ink (7 with --rv 2
+--ink-head 1). It is added after the upsampling + sub-cell shuffle and before the losses, and in the backward the parameter gradients
+are read straight from the slab's gradient planes before the adjoints. Parameters (W1 16 x 64, b1, W2 7 x 16) are appended last;
+W1 is He-initialised and b1 / W2 are zero, so the net computes its donor's function (step 1 logs the stem-less run's losses exactly,
+test_heads (7)). AdamW (non-matrix). Header key "fstem":[C,nout] only when on; `--init-from` copies a stem with the same shape; a
+resume must repeat --fstem. **Level dropout** `--fstem-drop 0.25`: a training window runs without the stem (forward and backward),
+drawn per GPU and step, so the net keeps working without the fine level. Validation and predict always use it. `predict` adds it in
+the fit-field (11 planes) and `--channel rv` / side-pair paths. With a stem it falls back from the latent fast paths (lat_lean,
+direct rv, latin, fit-field z-slabs), which read no CT; those are to be ported when U2 needs the speed.
+
+Kernels (`src/nn_fstem.cu`): row tiles of up to 128 blocks of one (z, y) block row, the 16 input rows staged in shared memory once.
+The forward does the 64 -> 16 product on the tensor cores (mma m16n8k16 fp16, W1 in fp16). The backward recomputes the same way and
+does the parameter-gradient products dW1 = sum dpre x taps and dW2 = sum go x h in tf32 MMA (fp32 range: the pre-activation gradients
+are ~1e-5 and would be fp16 subnormals), in half tiles (22 KB of shared memory, 4 blocks an SM). P 256 window, RTX 5060 Ti:
+
+| version | forward (x2 a step: statistics + gradient pass) | backward |
+|---|---|---|
+| per-thread scalar (taps from global) | 2.1 ms | 9.6 ms |
+| + register-blocked outer products, 128-block tiles | 2.1 | 3.4 |
+| + staged rows (row tiles) | 2.2 | 4.3 |
+| + tensor-core forward / recompute | 0.74 | 4.0 |
+| + half tiles (occupancy 17 -> 33 %) | 0.74 | 3.1 |
+| + tf32 parameter products | 0.74 | 2.8 |
+| + gradient gather on all threads | 0.75 | 2.5 |
+
+ncu on the last backward: long-scoreboard (global loads) and barrier stalls dominate. Next levers: double-buffered staging, the
+gather through one aligned 4-byte pass. Training step, P 256, latent, all heads, `UFSM_BENCH_SAME=1`, 40 steps, no dropout:
+widths 32..128: 26.2 -> 30.9 ms (+18 %); widths 96,128,160,192: 45.6 -> 50.4 ms (+10.6 %; ~8 % at the default dropout 0.25). The
+stem scales with voxels, the trunk with voxels x width^2, so wider trunks pay less.
+
+Tests: `test_fstem` (new): the kernels against a double host reference on a 10 x 12 x 14 window in two slabs. The reference's gradient
+is taken by central differences over all 1152 parameters. Forward worst |error| / (1 + |want|) 1.8e-4; gradient 3.5e-4 relative to
+the largest (fp16 W1 in the tensor-core products, tf32 sums; the fp32 scalar kernel gave 1.6e-7). The other channels stay
+untouched, and an odd slab start is refused. `test_heads` (7): step 1 with --fstem 16 logs the stem-less run's losses; header
+[16,7]; resume; a resume without --fstem is refused; predict --channel rv runs. Fixture, 8 steps, all heads, latent, P 64: loss
+3.268 without -> 3.256 with the stem (from step 2 on, every step lower). That is a fixture number; whether the stem closes the
+packed-sheet gap is U2's measurement (wbench Paris 4 packed boxes).
+
 ## Universal net A7: learned task weights (--uw 1) and the head-gradient cosines (--grad-cos N) (2026-11-11, branch univ-20261111)
 
 **`--uw 1`** (Kendall, Gal and Cipolla 2018): one learned log variance s_h per head (phase, normal + density shared, winding mod 4,

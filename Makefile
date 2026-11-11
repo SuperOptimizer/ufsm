@@ -229,6 +229,9 @@ $(B)/test_lat_head: tests/test_lat_head.c $(B)/unet.o $(B)/nn.o $(B)/nn_fp8.o
 $(B)/test_l3_sched: tests/test_l3_sched.c $(B)/unet.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 
+$(B)/test_fstem: tests/test_fstem.c $(B)/nn.o $(B)/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
+suite-bins: $(B)/test_fstem
 $(B)/test_gram: tests/test_gram.c $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 suite-bins: $(B)/test_gram

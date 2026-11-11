@@ -1190,7 +1190,7 @@ int cmd_predict(int argc, char **argv) {
            nn_lat_place_rv): no 14 bytes a voxel in the estimate. k stays <= 4: with one 128^3 chunk per shard the run is bound by the shard
            writers and the CT reader, and windows of 8^3 shards skip less air (box 1024 x 3072^2 of PHerc1667: 4608 shards compressed against 3584) */
         const float *lb_, *lg_; float ls_;   /* (not --latents or the guided head: those hold the full-resolution input) */
-        const int lat_lean = rv2c < 0 && half && hdiv == 4 && hmode == 1 && (cfg.cin == 4 || (half == 3 && unet_lat_basis(u, &lb_, &lg_, &ls_) && nn_get_f16())) && rvfuse && !ffd && tta <= 1 && !fea && !auxz && nn_get_tf32() && nn_get_act_bf16() && !ufsm_env_on("UFSM_ACT_MX8")
+        const int lat_lean = !cfg.fstem && rv2c < 0 && half && hdiv == 4 && hmode == 1 && (cfg.cin == 4 || (half == 3 && unet_lat_basis(u, &lb_, &lg_, &ls_) && nn_get_f16())) && rvfuse && !ffd && tta <= 1 && !fea && !auxz && nn_get_tf32() && nn_get_act_bf16() && !ufsm_env_on("UFSM_ACT_MX8")
                              && (!getenv("UFSM_PRED_LAT_INPUT") || ufsm_env_on("UFSM_PRED_LAT_INPUT")) && (!getenv("UFSM_PRED_LAT_DIRECT") || ufsm_env_on("UFSM_PRED_LAT_DIRECT"));
         for (int k = 4; k >= 1; k--) {
             const int Wc = k * shard + 2 * hk;
@@ -1317,12 +1317,12 @@ int cmd_predict(int argc, char **argv) {
            window (8 bytes a voxel) or half-resolution intermediate (UFSM_PRED_LAT_INPUT=0: nn_pred_input_d + nn_lowres_input) */
         /* --fit-zarr from a latent-grid net (--no-out 1, no --fit-ct: its ray reads the whole window): the heads upsampled (and guided) only over
            the planes of each z chunk of field cells, not [cout][W^3] fp16 (10 GB at W 640); UFSM_PRED_FIT_SLAB=0: the whole window */
-        fzs = ffd && ffzm && half && hdiv == 4 && hmode == 1 && h16 && gpath && !ffct && tta <= 1 && !fea && !sheet_task && !slab && WR.skip && !(W % 4) && (!getenv("UFSM_PRED_FIT_SLAB") || ufsm_env_on("UFSM_PRED_FIT_SLAB"));
-        gdir = rv2c < 0 && (cfg.lat_guide == 5 || cfg.lat_guide == 64) && half && hdiv == 4 && hmode == 1 && rvfuse && gpath && !fea && !ffd && tta <= 1 && !sheet_task && !slab && (!getenv("UFSM_PRED_LAT_DIRECT") || ufsm_env_on("UFSM_PRED_LAT_DIRECT"));
+        fzs = !cfg.fstem && ffd && ffzm && half && hdiv == 4 && hmode == 1 && h16 && gpath && !ffct && tta <= 1 && !fea && !sheet_task && !slab && WR.skip && !(W % 4) && (!getenv("UFSM_PRED_FIT_SLAB") || ufsm_env_on("UFSM_PRED_FIT_SLAB"));
+        gdir = !cfg.fstem && rv2c < 0 && (cfg.lat_guide == 5 || cfg.lat_guide == 64) && half && hdiv == 4 && hmode == 1 && rvfuse && gpath && !fea && !ffd && tta <= 1 && !sheet_task && !slab && (!getenv("UFSM_PRED_LAT_DIRECT") || ufsm_env_on("UFSM_PRED_LAT_DIRECT"));
         if (((gdir && cfg.lat_guide == 5) || (fzs && cfg.lat_guide == 8)) && ct_shared && !ctcp && !(ctcp = nn_malloc(w3))) { fprintf(stderr, "predict: no device memory for the guided head's CT copy\n"); return 1; }   /* (the forward overwrites ctd) */
         { const float *b_, *g_; float s_; const int lc_ = half == 3 ? unet_lat_basis(u, &b_, &g_, &s_) : 0;   /* (--latents and the guided head's slab path read the full-resolution input; a
                                                                                                                  --lat-basis checkpoint: nn_lat_pred_input_c, fp16 storage) */
-          latin = half && hdiv == 4 && hmode == 1 && xs.c == 4 && (lc_ ? nn_get_f16() != 0 : cfg.cin == 4) && h16 && !auxz && !sheet_task && (!cfg.lat_guide || cfg.lat_guide == 64 || gdir || fzs)   /* (the sub-cell head reads no CT) */
+          latin = half && hdiv == 4 && hmode == 1 && xs.c == 4 && (lc_ ? nn_get_f16() != 0 : cfg.cin == 4) && h16 && !auxz && !sheet_task && !cfg.fstem && (!cfg.lat_guide || cfg.lat_guide == 64 || gdir || fzs)   /* (the sub-cell head reads no CT; the fine stem does) */
                   && (!getenv("UFSM_PRED_LAT_INPUT") || ufsm_env_on("UFSM_PRED_LAT_INPUT")); }
         if (!xd && !ct_stem && !latin) xd = nn_malloc((size_t)xs.c * w3 * (h16 ? 2 : 4));
         if (auxz) { auxd = nn_malloc(w3); auxh = malloc(w3); }
@@ -1805,7 +1805,7 @@ int cmd_predict(int argc, char **argv) {
                bytes (nn_lat_place_rv; the guided head: nn_lat_place_rvg, its CT terms from the bytes); no full-resolution logits
                (UFSM_PRED_LAT_DIRECT=0: the fp32 / guided fp16 volume, nn_rv_fuse, nn_pred_place). Not for the fit fields (every head at full resolution) */
             static int latdir = -1; if (latdir < 0) latdir = !getenv("UFSM_PRED_LAT_DIRECT") || ufsm_env_on("UFSM_PRED_LAT_DIRECT");
-            const int ldir = latdir && rv2c < 0 && half && hdiv == 4 && hmode == 1 && rvfuse && (!cfg.lat_guide || gdir) && gpath && sup && !fea && !ffd && tta <= 1 && !sheet_task && Wz == W;
+            const int ldir = !cfg.fstem && latdir && rv2c < 0 && half && hdiv == 4 && hmode == 1 && rvfuse && (!cfg.lat_guide || gdir) && gpath && sup && !fea && !ffd && tta <= 1 && !sheet_task && Wz == W;
             const float *l2d = nullptr;
             if (half) {   /* the network on blocks of the window: its input from the 4-channel window, its logits back to full resolution */
                 const float *lbas, *lgain; float lstep; const int latc = half == 3 ? unet_lat_basis(u, &lbas, &lgain, &lstep) : 0;
@@ -1824,6 +1824,10 @@ int cmd_predict(int argc, char **argv) {
                 else nn_lowres_input(xd, xs, hdiv, hmode, lrt, x2, h16);
                 nn_ptick("input pool");
                 const float *l2 = unet_forward_x(u, x2, xn, 0, h16); nn_ptick("trunk forward");
+                /* train --fstem: the fine voxel stem on the CT channel (xd channel 0) into the planes the path holds: output o of the stem's list
+                   (every non-normal / density head output, in channel order) to plane MAP(c) of its channel c (-1: not held) */
+#define PRED_FSTEM(z0_, nz_, planes, ns__, MAP) do { int fm_[16], k_ = 0; for (int c = 0; c < cfg.cout && k_ < cfg.fstem_out; c++) if (c < 2 || c >= 9) { fm_[k_++] = (MAP); } \
+                    if (!xd || !h16 || nn_fstem_fwd(xd, W, W, W, (z0_), (nz_), unet_live_params(u) + unet_fstem_off(u), cfg.fstem, cfg.fstem_out, fm_, (planes), (ns__))) { fprintf(stderr, "predict: the fine stem needs the fp16 input window\n"); return 2; } } while (0)
                 static int cq = -1; if (cq < 0) cq = getenv("UFSM_PRED_CELL_Q") != nullptr;
                 if (cq && half == 3) cellq_apply(l2, unet_logits_h16(u), cfg.cout, Wz / 4, W / 4, W / 4, hz / 4, halo / 4);
                 if (ldir || fzs) l2d = l2;
@@ -1837,6 +1841,7 @@ int cmd_predict(int argc, char **argv) {
                 else if (ffd && cfg.lat_guide == 64) {   /* the sub-cell head: the 11 task planes, the phase pair's per-voxel terms */
                     nn_lat_up_slab(l2, unet_logits_h16(u), 11, W / 4, W / 4, W / 4, 0, W, lgf);
                     nn_lat_shuffle(l2, unet_logits_h16(u), W / 4, W / 4, W / 4, 16, 2, 0, W, lgf);
+                    if (cfg.fstem) PRED_FSTEM(0, W, lgf, w3, c < 11 ? c : -1);   /* (the 11 task planes) */
                 }
                 else if (ffd) nn_lat_up_slab(l2, unet_logits_h16(u), cfg.cout, W / 4, W / 4, W / 4, 0, W, lgf);   /* [cout][W][W][W] fp16: the accumulators' layout */
                 else if (rvfuse && cfg.lat_guide) {   /* the guided head: the two side logits and their 5 coefficient planes one 32-plane slab at a time (fp16), the CT terms, into [2][W][W][W] */
@@ -1846,12 +1851,14 @@ int cmd_predict(int argc, char **argv) {
                     for (int z0 = 0; z0 < W; z0 += 32) {
                         if (rv2c >= 0) {   /* --rv 2: its interpolated pair */
                             nn_lat_up_slab((const char *)l2 + (size_t)rv2c * cv_ * es_, unet_logits_h16(u), 2, W / 4, W / 4, W / 4, z0, 32, gsl);
+                            if (cfg.fstem) PRED_FSTEM(z0, 32, gsl, ns_, c == rv2c || c == rv2c + 1 ? c - rv2c : -1);
                             for (int c = 0; c < 2; c++) nn_d2d_async((char *)lgf + ((size_t)c * w3 + (size_t)z0 * hw_) * 2, (char *)gsl + (size_t)c * ns_ * 2, ns_ * 2);
                             continue;
                         }
                         nn_lat_up_slab(l2, unet_logits_h16(u), 2, W / 4, W / 4, W / 4, z0, 32, gsl);
                         if (cfg.lat_guide == 64) {   /* the sub-cell head: the side pair's per-voxel terms */
                             if (!ufsm_env_on("UFSM_PRED_NOSHUF")) nn_lat_shuffle(l2, unet_logits_h16(u), W / 4, W / 4, W / 4, 16, 2, z0, 32, gsl);   /* (diagnostic: the interpolated base alone) */
+                            if (cfg.fstem) PRED_FSTEM(z0, 32, gsl, ns_, c < 2 ? c : -1);
                             for (int c = 0; c < 2; c++) nn_d2d_async((char *)lgf + ((size_t)c * w3 + (size_t)z0 * hw_) * 2, (char *)gsl + (size_t)c * ns_ * 2, ns_ * 2);
                             continue;
                         }
