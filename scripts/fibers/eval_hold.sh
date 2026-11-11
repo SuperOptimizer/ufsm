@@ -26,7 +26,7 @@ fi
 st=$(head -c 200000 $CK | head -1 | grep -o '"step":[0-9]*' | head -1 | cut -d: -f2); o=$RUN/eval/hold-${st:-x}; mkdir -p $o
 for c in 0 1; do f=$([ $c = 0 ] && echo H || echo V)
   [ -e $o/$f/9.6/zarr.json ] || $U predict $CK $CT $KEY $o/$f --um 2.4 --level 2 --box $BOX --channel $c --gpu $GPU --threads 6 > $o/predict_$f.log 2>&1 || { echo "predict $f failed: $o/predict_$f.log"; exit 1; }
-  nice -n 19 $U fiber-trace - - $o/$f.fib --mask $o/$f 9.6 --box $BOX --scaledown 2 --family $f --half 1024 --min-len 48 --threads 4 > $o/trace_$f.log 2>&1 || { echo "trace $f failed"; exit 1; }
+  nice -n 19 $U fiber-trace - - $o/$f.fib --mask $o/$f 9.6 --mask-origin ${BOX%,*,*,*} --box $BOX --scaledown 2 --family $f --half 1024 --min-len 48 --threads 4 > $o/trace_$f.log 2>&1 || { echo "trace $f failed"; exit 1; }
   tail -1 $o/trace_$f.log
   nice -n 19 $U fiber-judge $o/$f.fib --phase $GT phaseA/9.6 $J --out $o/judge_$f.tsv | tail -3
 done | tee $o/judge.txt

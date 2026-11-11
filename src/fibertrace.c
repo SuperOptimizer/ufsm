@@ -116,10 +116,14 @@ int cmd_fiber_trace(int argc, char **argv) {
     if (mi) {   /* a mask probability (zarr v3 uint8, prob254: 255 unknown read as 0) as the presence */
         if (mi + 2 >= argc) { fprintf(stderr, "fiber-trace: --mask ROOT KEY\n"); return 2; }
         store *s = store_open(argv[mi + 1]); z3 *z = s ? z3_open(s, argv[mi + 2], cache) : nullptr; if (!z) { fprintf(stderr, "fiber-trace: cannot open the mask %s %s\n", argv[mi + 1], argv[mi + 2]); return 1; }
-        for (int d = 0; d < 3; d++) { const int64_t sh = z3_meta_of(z)->shape[d]; o[d] = b[d] < 0 ? 0 : b[d]; const int64_t e = b[d] + b[3 + d] > sh ? sh : b[d] + b[3 + d]; n[d] = e - o[d]; }
+        /* --mask-origin Z,Y,X: the mask store's origin in --box coordinates (predict --box writes a box-local store; its origin_zyx) */
+        long long mo[3] = {0, 0, 0}; const char *mos = ft_opt(argc, argv, "--mask-origin", nullptr);
+        if (mos && sscanf(mos, "%lld,%lld,%lld", &mo[0], &mo[1], &mo[2]) != 3) { fprintf(stderr, "fiber-trace: --mask-origin Z,Y,X\n"); return 2; }
+        int64_t lo[3];
+        for (int d = 0; d < 3; d++) { const int64_t sh = z3_meta_of(z)->shape[d] + mo[d]; o[d] = b[d] < mo[d] ? mo[d] : b[d]; const int64_t e = b[d] + b[3 + d] > sh ? sh : b[d] + b[3 + d]; n[d] = e - o[d]; lo[d] = o[d] - mo[d]; }
         if (n[0] < 2 || n[1] < 2 || n[2] < 2) { fprintf(stderr, "fiber-trace: the box is outside the mask\n"); return 1; }
         vol[0] = malloc((size_t)n[0] * n[1] * n[2]);
-        if (!vol[0] || z3_read(z, o, n, vol[0], nth)) { fprintf(stderr, "fiber-trace: mask read failed\n"); return 1; }
+        if (!vol[0] || z3_read(z, lo, n, vol[0], nth)) { fprintf(stderr, "fiber-trace: mask read failed\n"); return 1; }
         z3_close(z); for (size_t i = 0; i < (size_t)n[0] * n[1] * n[2]; i++) if (vol[0][i] == 255) vol[0][i] = 0;
     }
     for (int k = 0; k < 3 && !mi; k++) {
