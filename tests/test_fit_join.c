@@ -129,8 +129,8 @@ int main(void) {
         }
         char fp[300], out3[300]; snprintf(fp, sizeof fp, "%s/fib.fib", dir); snprintf(out3, sizeof out3, "%s/set3", dir);
         CHECK(!fib_save(fp, &F), "save the fibres"); fib_free(&F);
-        char *av3[] = {"ufsm", "fit-join", out3, dir, "--chain-w", "0", "--fibers", fp, "--join-fib", "1", m0, "0", "256", m1, "256", "512"};
-        CHECK(cmd_fit_join(16, av3) == 0, "fit-join --fibers");
+        char *av3[] = {"ufsm", "fit-join", out3, dir, "--chain-w", "0", "--fibers", fp, "--join-fib", "1", "--join-fib-gap", "0.1", m0, "0", "256", m1, "256", "512"};
+        CHECK(cmd_fit_join(18, av3) == 0, "fit-join --fibers");   /* (both pair ends >= 0.1 mm = 42 native voxels from the boundary) */
         fit_set *S3 = fit_set_load(out3); CHECK(S3 != nullptr, "load the fibre join");
         if (S3) {
             const double acc = ids_true(S3, a[9], H, W, n, H8, W_true);

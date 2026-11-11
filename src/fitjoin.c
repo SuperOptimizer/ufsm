@@ -274,7 +274,7 @@ static void fj_load_rows(void *a, int k0, int k1, int t) { const fj_load_job *J 
    Published / traced fibres change sheet about once per 7 .. 10 mm (DESIGN.md 2026-11-10), so short arcs (default 0.6 mm) and a vote
    histogram, not a hard constraint. Returns the raw differences (caller histograms them). */
 static double *fj_fib_votes(const fib_set *F, const fit_fields *f, double fz, const fit_model *a, double za, const fit_model *b, double zb, double zB,
-                            double arc, size_t *nout, size_t *npair) {   /* f: field rows from native z fz on */
+                            double arc, double gap, size_t *nout, size_t *npair) {   /* f: field rows from native z fz on; gap: both ends >= gap from zB */
     size_t n = 0, cap = 0, np = 0; double *out = nullptr; float *q = nullptr; double *U = nullptr; long *sid = nullptr; size_t qcap = 0; const double h = f->h;
     const double a1 = za + a->D * a->h, b1 = zb + b->D * b->h;
     for (int r = 0; r < F->n; r++) {
@@ -306,12 +306,13 @@ static double *fj_fib_votes(const fib_set *F, const fit_fields *f, double fz, co
             acc += L;
         }
         const size_t A = (size_t)arc;
-        for (size_t i = 0; i < ns; i += 2) {   /* (every 2nd sample starts a pair; its nearest partner across zB on the same stretch) */
+        for (size_t i = 0; i < ns; i += 2) {   /* (every 2nd sample starts a pair; its nearest partner across zB on the same stretch, both ends >= gap from zB) */
             if (sid[i] < 0) continue;
             const int ilo = q[3 * i] < zB;
             for (size_t j = i + 1; j < ns && j <= i + A; j++) {
                 if (sid[j] != sid[i] || (q[3 * j] < zB) == ilo) continue;
                 const size_t lo = ilo ? i : j, hi = ilo ? j : i;
+                if (q[3 * lo] > zB - gap || q[3 * hi] < zB + gap) continue;   /* (an end within gap of the boundary: walk on along the fibre) */
                 if (!(q[3 * lo] >= za && q[3 * lo] < a1 && q[3 * hi] >= zb && q[3 * hi] < b1)) break;
                 const double dp = U[hi] - U[lo]; if (fabs(dp) >= 0.5) break;   /* (a turn crossed: the fibre hopped) */
                 np++;
@@ -331,13 +332,13 @@ static double fj_fcost(const fj_hist *F, double w, long d) { return F && F->tot 
 int cmd_fit_join(int argc, char **argv) {
     if (argc < 7) {
         fprintf(stderr, "usage: ufsm fit-join <out-set> <fields-dir> [--blend 16] [--min-conf 0.3] [--samples 4000000] [--ref MODEL [--ref-w 1] [--chain-w 1] [--ref-samples 200000] [--ref-rows 16]]\n"
-                        "       [--global 1 [--cap 3] [--min-cells 20000]] [--fibers F.fib --join-fib W [--join-fib-arc 0.6]] <slab-model> <z0> <z1> ...\n"
+                        "       [--global 1 [--cap 3] [--min-cells 20000]] [--fibers F.fib --join-fib W [--join-fib-arc 0.6] [--join-fib-gap 0]] <slab-model> <z0> <z1> ...\n"
                         "  slabs of one field box (same y / x crop), interiors [z0, z1) in box-local native z, in z order; --ref: the integer gauges from a global model\n");
         return 2;
     }
     const char *out = argv[2], *fdir = argv[3];
     double blend = 16, minc = 0.3, refw = 1, chainw = 1, cap = 3, mincells = 20000; long long nsamp = 4000000, nref = 200000; const char *refdir = nullptr;
-    int glob = 0, refrows = 16; const char *fibp = nullptr; double fibw = 1, fibarc = 0.6;
+    int glob = 0, refrows = 16; const char *fibp = nullptr; double fibw = 1, fibarc = 0.6, fibgap = 0;
     int ai = 4;
     for (; ai + 1 < argc && !strncmp(argv[ai], "--", 2); ai += 2) {
         if (!strcmp(argv[ai], "--blend")) blend = atof(argv[ai + 1]);
@@ -354,6 +355,7 @@ int cmd_fit_join(int argc, char **argv) {
         else if (!strcmp(argv[ai], "--fibers")) fibp = argv[ai + 1];
         else if (!strcmp(argv[ai], "--join-fib")) fibw = atof(argv[ai + 1]);
         else if (!strcmp(argv[ai], "--join-fib-arc")) fibarc = atof(argv[ai + 1]);
+        else if (!strcmp(argv[ai], "--join-fib-gap")) fibgap = atof(argv[ai + 1]);
         else { fprintf(stderr, "fit-join: unknown option %s\n", argv[ai]); return 2; }
     }
     const int ns = (argc - ai) / 3;
@@ -454,13 +456,13 @@ int cmd_fit_join(int argc, char **argv) {
     if (fibp && fibw > 0) {
         fib_set F = {0}; if (fib_load(fibp, &F)) { fprintf(stderr, "fit-join: cannot read --fibers %s\n", fibp); return 1; }
         const double arc = fibarc * 1000.0 / (g.um > 0 ? g.um : 2.4); hf = calloc(ns, sizeof *hf);
-        printf("fit-join: --fibers %s: %d runs; votes over <= %g mm (%.0f native voxels) across each boundary, weight %g\n", fibp, F.n, fibarc, arc, fibw);
+        printf("fit-join: --fibers %s: %d runs; votes over <= %g mm (%.0f native voxels) across each boundary, both ends >= %g mm from it, weight %g\n", fibp, F.n, fibarc, arc, fibgap, fibw);
         for (int k = 1; k < ns; k++) {
             const fit_model *a = s->slab[k - 1], *b = s->slab[k]; size_t nv = 0, npr = 0;
             int r0 = (int)floor((s->z0[k] - arc) / h) - 1, r1 = (int)ceil((s->z0[k] + arc) / h) + 1; if (r0 < 0) r0 = 0; if (r1 > g.shape[0]) r1 = g.shape[0];
             fit_fields_skip_planes(1 | 2 | 4 | 8); fit_fields_buf fb;   /* (the field rows around the boundary: pc ps w) */
             if (fit_fields_load(fdir, r0, r1, 1, &fb)) { fprintf(stderr, "fit-join: cannot load field rows %d..%d for the fibre votes\n", r0, r1); return 1; }
-            double *dv = fj_fib_votes(&F, &fb.f, r0 * h, a, (double)(a->origin[0] - g.origin[0]), b, (double)(b->origin[0] - g.origin[0]), s->z0[k], arc, &nv, &npr);
+            double *dv = fj_fib_votes(&F, &fb.f, r0 * h, a, (double)(a->origin[0] - g.origin[0]), b, (double)(b->origin[0] - g.origin[0]), s->z0[k], arc, fibgap * 1000.0 / (g.um > 0 ? g.um : 2.4), &nv, &npr);
             fit_fields_free(&fb);
             fj_hist_of(dv, nv, &hf[k]); free(dv);
             printf("  boundary %d|%d: %zu fibre pairs, %zu votes (residue <= 0.3 turn), mode %+ld share %.3f\n", k - 1, k, npr, nv, hf[k].tot ? fj_mode(&hf[k]) : 0,
