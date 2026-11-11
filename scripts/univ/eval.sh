@@ -40,6 +40,13 @@ if has rv && [ "${RV:-1}" = 1 ]; then
     if [ -n "${WZARGS+x}" ] && [ -z "$WZARGS" ]; then E=$RVE GPU=$GPU U=${RVU:-/vesuvius/ufsm/v2/rv/bin/ufsm.ev} WZ= WINDOW=${WIN:-640} bash $H/scripts/rv/eval.sh $CK $T "$RVSC" >> $E/$T/rv.out 2>&1
     else E=$RVE GPU=$GPU U=${RVU:-/vesuvius/ufsm/v2/rv/bin/ufsm.ev} bash $H/scripts/rv/eval.sh $CK $T "$RVSC" >> $E/$T/rv.out 2>&1; fi; fi
 fi
+# latent-grid checkpoints (header "lat_step"): plain predict --channel N / ink skips the fine stem and the ch 0-1 sub-cell shuffle (univI, 2026-11-11),
+# so their ink / fibre heads are not scored via --channel until that fix is merged (LATCH=1 overrides). wind (fit fields) and rv (--channel rv) are fine.
+LATCK=0; head -c 4096 $CK | grep -aq '"lat_step"' && LATCK=1
+if [ $LATCK = 1 ] && [ "${LATCH:-0}" != 1 ]; then
+  has fib && { log "fib: skipped, latent checkpoint (plain --channel path not trained-equivalent until univI's fix; LATCH=1 overrides)"; FIB=0; }
+  case "$INKP" in ch:*) log "ink: skipped, latent checkpoint ($INKP via plain --channel; LATCH=1 overrides)"; INK=0;; esac
+fi
 if has fib && [ "${FIB:-1}" = 1 ] && [ -n "$FIBCH" ]; then   # FIBCH e.g. "H=0 V=1 dyad=2-7" (channel indices of CKPT)
   o=$E/$T/fib; mkdir -p $o; BOX=12288,4096,3584,512,576,768; J="--um 2.4 --level 2 --slab 12288,512 --region 4096,4608,3584,4352 --tile 256 --d-mm 0.3,0.6,1.2,2.4"
   for kv in $FIBCH; do n=${kv%%=*}; cs=${kv#*=}; a=${cs%-*}; b=${cs#*-}
