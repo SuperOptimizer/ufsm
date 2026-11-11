@@ -62,6 +62,8 @@ int main(void) {
         CHECK(rvol_level_for(rv, 15.82) == 1, "level for 15.82 um");
         rvol_close(rv);
     }
+    /* a zarr v3 / volcomp store may hold only the coarser levels: covered by test_reg's in-memory pyramid path and the v2 path here;
+       a v2 pyramid starting at level 1 is not a pyramid (level "0" missing) and must fail cleanly */
     CHECK(rvol_open(dir, "missing.zarr", nullptr, 1.0) == nullptr, "a missing volume fails cleanly");
     free(v0); free(v1);
     char cmd[1200]; snprintf(cmd, sizeof cmd, "rm -r %s", dir); if (system(cmd)) {}

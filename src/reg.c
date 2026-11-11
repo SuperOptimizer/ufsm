@@ -98,17 +98,21 @@ rvol *rvol_open(const char *root, const char *key, const char *cache, double um)
     rvol *v = calloc(1, sizeof *v);
     v->um = um > 0 ? um : um_of_key(key);
     snprintf(v->name, sizeof v->name, "%s", key);
-    for (int l = 0; l < n; l++) {
-        const double f = lv[l].um / lv[0].um;
-        if (fabs(f - (double)(1 << l)) > 1e-3) break;   /* only 2^l pyramids */
-        char k[1200]; snprintf(k, sizeof k, "%s/%s", key, lv[l].path);
+    /* level index from the level's voxel size (um * 2^l): a store may hold only the coarser levels (e.g. a local copy from level 2 on);
+       missing finer levels are left unopened (rvol_level_for never picks them) and get their shape from the finest present one */
+    const double u0 = lv[0].um > 0 ? lv[0].um : 1; int first = -1;   /* the group's level-0 scale (um or pixels): levels by ratio to it */
+    for (int i = 0; i < n; i++) {
+        const double f = lv[i].um / u0; const int l = (int)lround(log2(f));
+        if (l < 0 || l >= 10 || fabs(f - (double)(1 << l)) > 1e-3 * f) continue;   /* only 2^l levels */
+        char k[1200]; snprintf(k, sizeof k, "%s/%s", key, lv[i].path);
         z3 *z = z3_open(s, k, cache);
-        if (!z) { fprintf(stderr, "reg: %s: %s\n", k, z3_error()); break; }
+        if (!z) { fprintf(stderr, "reg: %s: %s\n", k, z3_error()); continue; }
         v->z[l] = z; const z3_meta *m = z3_meta_of(z);
         for (int a = 0; a < 3; a++) v->shape[l][a] = m->shape[a];
-        v->nl = l + 1;
+        if (l + 1 > v->nl) v->nl = l + 1; if (first < 0 || l < first) first = l;
     }
     if (!v->nl || v->um <= 0) { fprintf(stderr, "reg: %s: no usable level or voxel size\n", key); free(v); return nullptr; }
+    for (int l = first - 1; l >= 0; l--) for (int a = 0; a < 3; a++) v->shape[l][a] = 2 * v->shape[l + 1][a];
     return v;
 }
 rvol *rvol_mem(double um, int nl, const int64_t shape0[3], uint8_t *level0) {
@@ -167,6 +171,7 @@ void rvol_close(rvol *v) {
 }
 int rvol_level_for(const rvol *v, double um) {
     int l = 0; while (l + 1 < v->nl && v->um * (1 << (l + 1)) <= um * 1.05) l++;
+    while (l + 1 < v->nl && !v->z[l] && !v->z2[l] && !v->mem[l]) l++;   /* a level the store does not hold: the next coarser one */
     return l;
 }
 
