@@ -149,6 +149,36 @@ int main(void) {
         if (z) z3_close(z);
         store_close(s6);
     }
+    /* on the fly: the derived array over the same window (two crops, merged) == the stored --face splat of those two crops */
+    {
+        char sj[512], js[2048], o7[512]; snprintf(sj, sizeof sj, "%s/segs.json", dir); snprintf(o7, sizeof o7, "%s/face2.zarr", dir);
+        snprintf(js, sizeof js, "{\"segments\": [{\"tifxyz\": \"%s\", \"labels\": \"%s\", \"mask\": \"%s\", \"crop\": [0, 0, %d, %d]},"
+                 " {\"tifxyz\": \"%s\", \"labels\": \"%s\", \"mask\": \"%s\", \"crop\": [0, %d, %d, %d]}]}", surf, lp, mp, CW, CHh / 2, surf, lp, mp, CHh / 2, CW, CHh - CHh / 2);
+        FILE *f = fopen(sj, "w"); fputs(js, f); fclose(f);
+        inksplat_cfg c7 = c; c7.out = o7; c7.coarse = 0; c7.face = 1; c7.face_a = -3; c7.face_b = 0; c7.nexcl = 1;
+        const int64_t bx[6] = {0, 0, 0, NV, NV, NV / 3}; memcpy(c7.excl[0], bx, sizeof bx);
+        c7.crop[0] = 0; c7.crop[1] = 0; c7.crop[2] = CW; c7.crop[3] = CHh / 2; CHECK(inksplat_run(&c7) == 0, "face crop 1");
+        c7.crop[1] = CHh / 2; c7.crop[3] = CHh - CHh / 2; c7.merge = 1; c7.name = "seg_b"; CHECK(inksplat_run(&c7) == 0, "face crop 2");
+        store *s7 = store_open(o7); z3 *ref = z3_open(s7, "1", nullptr); uint8_t *rb = malloc((size_t)NV * NV * NV);
+        CHECK(ref && !z3_read(ref, z0, nn, rb, 4), "read face2");
+        store *cs = store_open(dir); z3 *ct0 = z3_open(cs, "ct.zarr/1", nullptr);
+        inksplat_cfg c8 = c7; c8.crop[2] = 0; c8.merge = 0; c8.level = 0;
+        z3 *fly = ct0 ? inkfly_open(ct0, sj, &c8, 64) : nullptr; CHECK(fly != nullptr, "inkfly_open");
+        if (fly) {
+            for (int pass = 0; pass < 2; pass++) {   /* cold, then from the cache; odd boxes */
+                const int64_t bo[3] = {37, 11, 5}, bn[3] = {NV - 60, NV - 20, NV - 9}; uint8_t *fb = malloc((size_t)bn[0] * bn[1] * bn[2]);
+                CHECK(!z3_read(fly, bo, bn, fb, 4), "read onfly");
+                long diff = 0, kn = 0;
+                for (int64_t z = 0; z < bn[0]; z++) for (int64_t y = 0; y < bn[1]; y++) for (int64_t x = 0; x < bn[2]; x++) {
+                    const uint8_t a = fb[(z * bn[1] + y) * bn[2] + x], b = rb[((z + bo[0]) * NV + y + bo[1]) * NV + x + bo[2]]; diff += a != b; kn += b != 255; }
+                fprintf(stderr, "onfly pass %d: %ld of %ld voxels differ from the stored splat (%ld known)\n", pass, diff, (long)(bn[0] * bn[1] * bn[2]), kn);
+                CHECK(diff == 0 && kn > 10000, "onfly == stored, pass %d: %ld differ, %ld known", pass, diff, kn);
+                free(fb);
+            }
+            z3_close(fly);
+        }
+        free(rb); if (ref) z3_close(ref); store_close(s7); store_close(cs);
+    }
     /* --exclude: a held-out box over the low-x half: nothing written there, the rest as before */
     {
         char o5[512]; snprintf(o5, sizeof o5, "%s/excl.zarr", dir);

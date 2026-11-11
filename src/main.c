@@ -128,6 +128,7 @@ int cmd_phase_score(int argc, char **argv);
 int cmd_ink_splat(int argc, char **argv);   /* src/inksplat.c */
 int cmd_ink_score(int argc, char **argv);   /* src/inksplat.c */
 int cmd_ink_vscore(int argc, char **argv);   /* src/inksplat.c */
+int cmd_ink_onfly(int argc, char **argv);   /* src/inksplat.c */
 
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 static int arg_index(int argc, char **argv, const char *k) { for (int i = 2; i < argc; i++) if (!strcmp(argv[i], k)) return i; return -1; }
@@ -4739,6 +4740,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "ink-splat")) return cmd_ink_splat(argc, argv);
     if (!strcmp(cmd, "ink-score")) return cmd_ink_score(argc, argv);
     if (!strcmp(cmd, "ink-vscore")) return cmd_ink_vscore(argc, argv);
+    if (!strcmp(cmd, "ink-onfly")) return cmd_ink_onfly(argc, argv);
     if (!strcmp(cmd, "ink-cover")) return cmd_ink_cover(argc, argv);
     if (!strcmp(cmd, "ink-ensemble")) return cmd_ink_ensemble(argc, argv);
     if (!strcmp(cmd, "wl-dump")) return cmd_wl_dump(argc, argv);
