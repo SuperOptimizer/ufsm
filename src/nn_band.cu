@@ -15,7 +15,10 @@
 
 #define BG_CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { fprintf(stderr, "band gpu: %s (%s:%d)\n", cudaGetErrorString(e_), __FILE__, __LINE__); return -1; } } while (0)
 #define BINF 1e20f
-enum { BT = 128, LCH = 32768 };   /* threads per block; lines per envelope chunk */
+enum { BT = 128, LCH = 32768 };   /* threads per block; lines per envelope chunk (at least) */
+/* lines per envelope chunk: at least LCH, else as many as keep the scratch (16 B x (L + 1) per line) at ~4 B per block voxel; 2026-11-11:
+   32768 lines left a 188-SM card at ~170 threads per SM and the y / z passes latency-bound (89% of the pair rule) */
+static long bg_lines(long N, long L, long nlines) { long c = N / (4 * (L + 1)); if (c < LCH) c = LCH; return nlines < c ? nlines : c; }
 
 __device__ static inline int bg_seed(uint8_t c, int par) { const int lab = c > 0 && c < 255; const int k = lab ? (c - 1) / BAND_STEPS : 0; return lab && (k & 1) == par; }
 
@@ -163,7 +166,7 @@ static int bg_run(bg_ctx &G, const uint8_t *codes, const int n[3], float rmax, u
     const long nz = n[0], ny = n[1], nx = n[2], N = nz * ny * nx, sy = nx, sz = ny * nx;
     if (N >= (1L << 31)) return -1;   /* int32 feature indices */
     BG_CK(cudaSetDevice(g_dev));   /* (per host thread state: set every call) */
-    const long Lmax = nz > ny ? nz : ny, nlines = (nz * nx > ny * nx ? nz * nx : ny * nx), lc = nlines < LCH ? nlines : LCH;
+    const long Lmax = nz > ny ? nz : ny, nlines = (nz * nx > ny * nx ? nz * nx : ny * nx), lc = bg_lines(N, Lmax, nlines);
     if (bg_alloc(G, N, Lmax, lc)) return -1;
     BG_CK(cudaMemcpyAsync(G.codes, codes, N, cudaMemcpyHostToDevice, G.st));
     for (int par = 0; par < 2; par++) {
@@ -186,7 +189,7 @@ static int bg_run(bg_ctx &G, const uint8_t *codes, const int n[3], float rmax, u
 }
 
 extern "C" int band_pair_gpu_reserve(int edge) {   /* all g_slots contexts sized for edge^3 blocks (so a memory planner sees them) */
-    const long E = edge, N = E * E * E, lines = E * E, lc = lines < LCH ? lines : LCH; int rc = 0;
+    const long E = edge, N = E * E * E, lines = E * E, lc = bg_lines(N, E, lines); int rc = 0;
     pthread_mutex_lock(&g_mu);
     if (cudaSetDevice(g_dev) != cudaSuccess) rc = -1;
     for (int k = 0; k < g_slots && !rc; k++) if (!g_ctx[k].busy) rc = bg_alloc(g_ctx[k], N, E, lc);

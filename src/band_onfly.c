@@ -15,8 +15,8 @@ static _Atomic uint64_t g_reads, g_tiles, g_skipped, g_vout, g_vtile, g_ns_pair,
 static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + 1e-9 * t.tv_nsec; }
 
 /* device bytes of one tile of edge E (nn_band.cu bg_run: codes + phase + two int32 feature arrays, the envelope scratch of 4 int32 /
-   float arrays over (L + 1) x min(lines, 32768)) */
-static double tile_bytes(double E) { const double lines = E * E < 32768 ? E * E : 32768; return E * E * E * 10 + 16 * (E + 1) * lines; }
+   float arrays over (L + 1) x the chunk's lines: ~4 B per voxel, nn_band.cu bg_lines) */
+static double tile_bytes(double E) { double lines = E * E * E / (4 * (E + 1)); if (lines < 32768) lines = 32768; if (lines > E * E) lines = E * E; return E * E * E * 10 + 16 * (E + 1) * lines; }
 int phase_onfly_tile_edge(float rmax) {
     const int h = (int)ceilf(rmax) + 2; int E = 2 * h + 32;
     while (tile_bytes(E + 8) <= (double)g_budget_mb * (1 << 20)) E += 8;
