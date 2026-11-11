@@ -6,6 +6,19 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## B1 4.8 um phase rasters: what was built before the switch to on-the-fly phase (2026-11-11, branch fibd-20261111)
+
+Workstream B1 rasterised the band phase at 4.8 um (`phase-raster --gs 2 --pair 1 --radius 160`, GPU, byte-identical to the CPU path;
+32 shards in 17 s, ~5x the 9.6 bytes). Done: PHerc1667 A / B over the whole scroll (77 / 64 min, 46 / 50 GB). Paris 4 June A was
+limited to the packed shards (spacing < 150 um share >= 0.625: 549 of the 9.6 phaseA shards, 339 boxes) and ran on pod 2's GPU:
+the first run outpaced the desk pull and filled the pod disk (130 boxes lost to ENOSPC); with a box ledger and a disk cap it reached
+280 / 339 boxes before the pod was terminated, ~500 shards still in flight. On the desk: 2998 4.8 shards, 107 GB; 316 of the 549
+packed 9.6 shards are complete. Then the user decided that the sampler computes the winding phase from the codes on the fly (univA),
+so no further stored phase sets are built and the missing boxes are not planned. `scripts/univ/mksources_univ.py` keeps the partial
+Paris 4 set as `PHercParis4-june48` with `"partial": true`, weight 0.2 x 316/549, and a holdout file (`p4A48.holdouts.json`: the wbench
+boxes first, then the 233 incomplete 9.6 shards as 2048^3 level-0 boxes) so no window touches a missing region; the ledger is
+`scripts/univ/p4A48.boxes.ok`. All stored 4.8 entries are replaced by the "onfly" source key when it lands.
+
 ## Data-parallel training: one host thread per GPU (2026-11-11, branch univ-20261111)
 
 Why: u1 (P 896 latent, two desk GPUs) ran at 0.54 samples/s with one host thread launching both GPUs. A step queues more kernels

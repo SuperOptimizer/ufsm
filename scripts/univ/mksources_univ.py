@@ -20,7 +20,7 @@ Env: B1 (the B1 output root, /mnt/scratch/univ/b1), HEADS (JSON, default winding
 (FIB/teacher), FIBSHARE (0.2)."""
 import copy, json, os, sys
 out = sys.argv[1] if len(sys.argv) > 1 else "/vesuvius/ufsm/univ/sources-univ.json"
-B1 = os.environ.get("B1", "/mnt/scratch/univ/b1"); MIRROR = os.environ.get("MIRROR", "https://dl.ash2txt.org/community-uploads/forrest/volcomp")
+B1 = os.environ.get("B1", "/mnt/scratch/univ/b1"); P4SH = os.environ.get("P4SH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "p4A48_shards.tsv")); MIRROR = os.environ.get("MIRROR", "https://dl.ash2txt.org/community-uploads/forrest/volcomp")
 HEADS = json.loads(os.environ.get("HEADS", '{"phase": 1, "normal": 1, "density": 1, "wind4": 1, "rv": 1}'))
 T = json.load(open("/mnt/scratch/lat/sources/sources-wind-gt-nvme.json")); T1667 = json.load(open("/mnt/scratch/lat/sources/sources-wind-gt1667.json"))
 src = []
@@ -37,8 +37,20 @@ for k in ("A", "B"):
     if os.path.exists(f"{r}/done"):
         src.append(lvl1(g1667, f"PHerc1667-{k}48", r, 0.1, f"B1 4.8 um phase, 1667 codes{k} (phase-raster --gs 2 --pair 1 --radius 160)"))
 p4 = next(s for s in T["sources"] if s["name"] == "PHercParis4-june"); r = f"{B1}/gt/paris4/phaseA48"
-if os.path.exists(f"{r}/done") or os.path.exists(f"{r}/pulled"):
-    src.append(lvl1(p4, "PHercParis4-june48", r, 0.2, "B1 4.8 um phase, June codes at level 1, packed shards only (/vesuvius/ufsm/univ/p4A48_shards.tsv)"))
+if os.path.exists(f"{r}/4.8/zarr.json"):
+    # partial (2026-11-11): pod 2 was terminated at 280 of 339 boxes, and ~500 shards of finished boxes were still in flight. Every packed
+    # 9.6 shard (2048^3 level-0 voxels) whose 8 4.8 um shards are not all on the desk is held out (appended after the wbench boxes so the
+    # wbench validation box stays first), and the weight scales with the complete share. The sampler computes the phase on the fly from
+    # the codes once univA's "onfly" key lands; then this stored set is replaced.
+    sh = [tuple(map(int, l.split())) for l in open(P4SH) if l.strip()]
+    def full(z, y, x): return all(os.path.exists(f"{r}/4.8/c/{2*z+a}/{2*y+b}/{2*x+c}") for a in (0, 1) for b in (0, 1) for c in (0, 1))
+    miss = [s for s in sh if not full(*s)]; frac = 1 - len(miss) / len(sh)
+    ho = json.load(open(p4["holdout_file"])); ct = next(b["ct"] for b in ho["boxes"] if b["ct"].startswith("PHercParis4/"))
+    ho["boxes"] += [{"name": f"p4A48-missing-{z}-{y}-{x}", "scroll": "paris4", "ct": ct, "l0": [z*2048, y*2048, x*2048, 2048, 2048, 2048]} for z, y, x in miss]
+    ho["note"] = ho.get("note", "") + f"; plus the {len(miss)} packed 9.6 shards of the Paris 4 June 4.8 phase set not complete on the desk (mksources_univ.py)"
+    hf = os.path.join(os.path.dirname(out), "p4A48.holdouts.json"); json.dump(ho, open(hf, "w"), indent=1)
+    e = lvl1(p4, "PHercParis4-june48", r, round(0.2 * frac, 4), f"B1 4.8 um phase, June codes at level 1, PARTIAL: {len(sh)-len(miss)} of {len(sh)} packed shards complete, the rest held out ({hf})")
+    e["holdout_file"] = hf; e["partial"] = True; src.append(e)
 FIB = os.environ.get("FIB", "/mnt/scratch/univ/fibre"); FIBT = os.environ.get("FIBT", f"{FIB}/teacher"); FS = float(os.environ.get("FIBSHARE", "0.2"))
 fsrc = []
 if os.path.exists(f"{FIB}/sources-fibhv-d.json"):
