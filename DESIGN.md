@@ -6,6 +6,51 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Fibres in the winding network: the normal head orthogonal to fibres (2026-11-11, branch fibnet-20261111)
+
+`train --fib-normal-lambda L` adds L x the mean of t^T N t over a window's fibre voxels: N the sign-free normal dyad of the six normal
+logits exactly as `nn_unwrap_targets2` codes it (p = sigmoid: N_zz, N_yy, N_xx = p0..p2, the off-diagonals p3..p5 - 1/2), t the fibre
+tangent. A fibre lies in its sheet, so (n . t)^2 = 0 is a target that needs no winding label (`src/nn_loss.cu` nn_fibn / nn_fibn_apply).
+
+Where the tangent comes from (a deviation from the 11-10 design, which rotated a stored tangent plane through the spatial augmentation):
+the fibre input is a prob254 tube raster (`ufsm fiber-raster`, radius 2 voxels; 255 unknown) given as a source's "sheet" / "ink" target,
+and it rides the existing ink plane (`IPLANE`): every symmetry, warp, replay and `--gpu-aug` path the ink plane already has applies, and
+nothing new happens in the sampler. On the device the tangent is read off the transformed tube: the gradient structure tensor S of the
+plane over 5^3 voxels is c (I - t t^T) for a tube, so T = I - 2 S / tr S ~ t t^T and t is its leading eigenvector (three power steps).
+Voxels whose T is not near rank one (leading eigenvalue < 0.75, or the other two with squares summing over 0.5: blobs, sheets, crossings,
+tube ends) are skipped. A direction is never transformed, so the 48 symmetries and the warps cannot get it wrong; the cost is that t is
+known only where the raster is a clean tube, and only in the tube's 5-voxel core (the tube raster has no sub-voxel position).
+
+Loss path: head slabs only (`head_slab_pass`). The statistics pass counts the window's valid voxels and sums t^T N t (the logged `fibn`);
+the gradient pass collects each slab's per-voxel d(t^T N t) / dlogit = c_k p_k (1 - p_k) (c = t_z^2, t_y^2, t_x^2, 2 t_z t_y, 2 t_z t_x,
+2 t_y t_x) into a list before the in-place normal BCE gradient overwrites the logits, and adds L / count x the list after the
+--normal-lambda scaling. Only voxels whose stencil (3 planes) lies inside their own slab count: a streamed slab holds only its planes
+(12.5 % of fibre voxels lost at 32-plane slabs). The fused latent gradient (`g_lat_fuse`) is switched off with the flag (the unfused
+latent chain works); the whole-window loss path, `--ink-head` and `--rv` (both own the ink plane) are refused; task unwrap needs
+`--ink-lambda 0` (its CH_SHEET channel is the plane now). No parameters, default 0: checkpoints and old runs unchanged.
+
+Test `test_fibn`: a radius-2 tube along the 48 symmetric images of (1, 2, 3) / sqrt 14 (the device sees only the transformed tube): mean
+|t . d| 0.9978, worst 0.9929 over 1220 axis voxels; kernel count / mean t^T N t equal to a host reference; the gradient against central
+differences of the host loss (worst 8e-9 at a largest gradient 4e-4); two 16-plane slabs with the planes outside each slab poisoned
+count exactly the host's per-slab voxels. First real steps (wind96 from vc384.init.ckpt, P 384, Paris 4 / 0139 / 0500P2 winding GT +
+1447 / 0175A H-fibre sources at 25 % of the weight, lambda 0.1): fibn 0.06 .. 0.10 (wind96's normals already make (n . t)^2 small:
+sin^2 of 14 .. 18 degrees), 260 000 .. 315 000 valid voxels per fibre window, but only 5 of 60 windows came from the fibre sources (8 %
+against their 25 % weight: the sampler rejects more of their draws; not investigated). Planner: 6.43 GB at P 384 (network 4.57). With the
+Paris 4 raster on the two Paris 4 sources (vcfibA's list) 24 % of windows carry fibre voxels (48 of 135 sampled windows had known fibre
+labels; z band 6656..11776 only), fibn 0.051 at step 50; Paris 4 raster: 1.05 G H-tube voxels, 8.6 GB.
+
+Arms (`/vesuvius/ufsm/v2/lat/runs/vcfib.launch.sh`, not started): vcfibA = vc384c exactly (wind96, lr 1e-4 / muon 0.002, task unwrap,
+P 384, 4000 steps) with lambda 0.1 and the Paris 4 H-fibre raster as the "sheet" target of the two Paris 4 sources (the same windows
+as vc384c; only the loss differs); vcfibB adds the 1447 / 0175A fibre sources. Paris 4 raster: `fiber-raster Paris4_1mm_v2.afv --tr
+p4_2026_to_2023.json --level 2 --zband 6656,11776` into /vesuvius/ufsm/fibers/labels/PHercParis4-l2.
+
+**Same-fibre pair term (design only).** The 11-10 design needs sampler pair lists moved by the window's transform. With the tangent on
+the device it does not: pair a voxel v of a clean tube with v + round(d t) (d <= 0.3 mm, 32 planes at 9.6 um) when that voxel is also a
+clean tube voxel with |t_a . t_b| > 0.9; the pair term lambda (1 - u_a . u_b) on the phase (and w4) unit vectors, capped per pair, then
+needs no sampler change either. Collisions in the gradient scatter (two pairs sharing a voxel) are avoided by letting only voxels with
+even (z + y + x) / d parity start a pair, or by the same list-then-add scheme as nn_fibn. Both points must lie in the slab, which a 32-plane
+slab allows for H fibres (they run in the sheet, mostly across z only at small slopes).
+
 ## Inference from the stored latent volume, without the CT (2026-11-10, branch latinf-20261109)
 
 `predict --latents STORE` (an `ufsm lc-encode` store of the CT level) reads no CT voxel; the CT store is opened for its metadata only
