@@ -74,6 +74,7 @@ SRC += src/wload.c src/inkext.c src/inkext_net.c src/dinovol.c src/dinovol_net.c
 SRC += src/villawind.c src/villawind_net.c src/vwt_net.c src/vwt_train.c src/vwt_tile.c src/vwt_infer.c src/wtrunk.c src/vwt_stitch.c src/phasevis.c src/vwt_mv.c
 SRC += src/inksplat.c src/hercuvit.c src/hercuvit_net.c src/ink3dext.c src/ink3dext_net.c src/surfrecto.c src/surfrecto_net.c
 SRC += src/tfx.c
+SRC += src/annot.c src/annot_export.c
 SRC += src/embz.c src/fit_emb.c src/embpca.c src/embcalib.c src/sample_emb.c
 SRC += src/vwt_sample.c src/raycheck.c src/patchraster.c src/hiresphase.c src/fitjoin.c src/wrapcheck.c src/phasegate.c src/ctcal.c src/fieldsoracle.c src/packmap.c src/scanprep.c src/pairacc.c src/wbench.c src/wrapsnap.c src/surflabels.c src/sheetscore.c src/patchsolve.c src/tracebox.c src/sheettrace.c src/sideface.c src/sidegate.c src/geomcheck.c src/patchid.c src/rectoruler.c src/rectocls.c src/rectosp.c
 SRC += src/view.c src/reg.c src/reg_cli.c src/reg_view.c src/reg_init.c src/reg_render.c src/reg_ink.c src/srpairs.c
@@ -403,6 +404,9 @@ suite-bins: $(B)/test_dino_pts
 $(B)/test_dinor: tests/test_dinor.c $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_dinor.c $(B)/nn.o $(B)/nn_fp8.o -o $@ $(LDLIBS) $(CUDALIBS)
 suite-bins: $(B)/test_dinor
+$(B)/test_annot: tests/test_annot.c $(B)/annot.o $(B)/z3w.o $(B)/zarr3.o $(B)/store.o $(B)/json.o $(B)/tfx.o $(B)/imgops.o $(B)/jpegpar.o $(B)/tiffw.o $(B)/tiff.o $(B)/surfcomp.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_annot.c $(B)/annot.o $(B)/z3w.o $(B)/zarr3.o $(B)/store.o $(B)/json.o $(B)/tfx.o $(B)/imgops.o $(B)/jpegpar.o $(B)/tiffw.o $(B)/tiff.o $(B)/surfcomp.o -o $@ $(LDLIBS)
+suite-bins: $(B)/test_annot
 $(B)/test_tfx: tests/test_tfx.c $(B)/tfx.o $(B)/imgops.o $(B)/jpegpar.o $(B)/tiffw.o $(B)/tiff.o $(B)/surfcomp.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_tfx.c $(B)/tfx.o $(B)/imgops.o $(B)/jpegpar.o $(B)/tiffw.o $(B)/tiff.o $(B)/surfcomp.o -o $@ $(LDLIBS)
 $(B)/test_sheetcut: tests/test_sheetcut.c $(B)/sheetcut.o $(B)/tfx.o $(B)/imgops.o $(B)/jpegpar.o $(B)/tiffw.o $(B)/tiff.o $(B)/surfcomp.o

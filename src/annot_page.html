@@ -1,0 +1,178 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>ufsm annotate</title>
+<style>
+body{margin:0;font:13px system-ui,sans-serif;background:#111;color:#ddd;display:flex;height:100vh;overflow:hidden}
+#side{width:330px;padding:8px;overflow:auto;border-right:1px solid #333;flex:none}
+#views{flex:1;display:grid;grid-template-columns:1fr 1fr;grid-template-rows:1fr 1fr;gap:2px;background:#333}
+.pane{position:relative;background:#000;overflow:hidden}
+.pane canvas{position:absolute;left:0;top:0;width:100%;height:100%;image-rendering:pixelated}
+.lbl{position:absolute;left:4px;top:2px;color:#ff0;font-weight:bold;text-shadow:0 0 3px #000;pointer-events:none}
+fieldset{border:1px solid #444;margin:6px 0;padding:4px 6px}
+legend{color:#aaa}
+button{background:#333;color:#ddd;border:1px solid #555;padding:2px 6px;margin:1px;cursor:pointer}
+button.on{background:#264;border-color:#4a8}
+input[type=number]{width:70px;background:#222;color:#ddd;border:1px solid #555}
+select{background:#222;color:#ddd;border:1px solid #555}
+#list{max-height:260px;overflow:auto;font-size:12px}
+#list div{padding:1px 2px;border-bottom:1px solid #222;cursor:pointer}
+#list div:hover{background:#223}
+#help{font-size:11px;color:#999;white-space:pre-wrap}
+#stat{font-size:11px;color:#8c8}
+</style></head><body>
+<div id="side">
+<div><b id="title">ufsm annotate</b> <span id="stat"></span></div>
+<fieldset><legend>cursor (level-0 z y x)</legend>
+<input id="cz" type="number"> <input id="cy" type="number"> <input id="cx" type="number"> <button id="go">go</button>
+<div>level <select id="lev"></select> zoom <select id="mag"><option>1</option><option selected>2</option><option>3</option><option>4</option></select></div>
+<div>contrast <input id="lo" type="number" value="0"> .. <input id="hi" type="number" value="255"></div>
+</fieldset>
+<fieldset><legend>overlays</legend>
+<label><input type="checkbox" id="owr" checked> wraps</label> <label><input type="checkbox" id="olab"> labels</label>
+<label><input type="checkbox" id="ofib" checked> fibres</label> <label><input type="checkbox" id="oann" checked> annotations</label>
+</fieldset>
+<fieldset><legend>tool</legend>
+<button data-t="nav" class="on">navigate</button><button data-t="point">point</button><button data-t="pair">pair</button>
+<button data-t="line">line</button><button data-t="region">region</button><button data-t="wraperr">wrap error</button>
+<div>winding w <input id="w" type="number" value="0"> <label><input type="checkbox" id="winc"> auto +1</label></div>
+<div>pair Δw <input id="dw" type="number" value="0"> (0 = same sheet)</div>
+<div>region <select id="verdict"><option>bad</option><option>good</option><option>unknown</option></select> half-depth <input id="rdepth" type="number" value="64"></div>
+<div>wrap error <select id="kind"><option>cuts</option><option>skips</option><option>doubles</option><option>other</option></select></div>
+<div><button id="undo">undo</button> <button id="finish">finish line</button> <button id="next">next flagged region</button></div>
+</fieldset>
+<div id="rinfo"></div>
+<fieldset><legend>annotations (<span id="nitems">0</span>)</legend><div id="list"></div></fieldset>
+<div id="help">navigate: click = move cursor; drag = pan; wheel = step slice; shift+wheel = zoom level
+point: click a sheet (w = winding; auto +1 counts outward)
+pair: click A, click B (any plane / slice) with Δw
+line: click along a sheet, then "finish line" (Enter)
+region: drag a box on a plane; depth = ± half-depth (level-0 voxels)
+wrap error: click on a wrap line; nearest wrap is recorded
+keys: n / p next / previous slice, u undo, Esc cancel</div>
+</div>
+<div id="views">
+<div class="pane" id="p0"><canvas></canvas><span class="lbl">z plane (y down, x right)</span></div>
+<div class="pane" id="p1"><canvas></canvas><span class="lbl">y plane (z down, x right)</span></div>
+<div class="pane" id="p2"><canvas></canvas><span class="lbl">x plane (z down, y right)</span></div>
+<div class="pane" id="p3" style="padding:8px;overflow:auto"><div id="info"></div></div>
+</div>
+<script>
+"use strict";
+const $=id=>document.getElementById(id);
+const PA=[[1,2],[0,2],[0,1]];
+let INFO=null, cur=[0,0,0], tool="nav", pend=[], items=[], regions=[], ri=-1, base=2, lev=2, mag=2;
+const panes=[0,1,2].map(ax=>({ax,el:$("p"+ax),cv:$("p"+ax).querySelector("canvas"),img:null,lab:null,wr:null,fib:null,c:[0,0],tick:0,segs:[]}));
+async function J(u,o){const r=await fetch(u,o);return r.json();}
+function s(){return 2**lev;}
+function wcol(w){return `hsl(${(w*47)%360},90%,60%)`;}
+async function init(){
+  INFO=await J("/info"); base=INFO.base; lev=base;
+  $("title").textContent="ufsm annotate — "+(INFO.scroll||"");
+  for(const L of INFO.levels){const o=document.createElement("option");o.textContent=L.l;$("lev").appendChild(o);}
+  const L0=INFO.levels[0].shape, f=2**INFO.levels[0].l;
+  cur=[Math.round(L0[0]*f/2),Math.round(L0[1]*f/2),Math.round(L0[2]*f/2)];
+  try{regions=await J("/regions");}catch(e){regions=[];}
+  $("info").textContent=`store ${INFO.store}\nauthor ${INFO.author}\nfibres ${INFO.fibres} pts, labels ${INFO.labels?"yes":"no"}, flagged regions ${regions.length}`;
+  $("info").style.whiteSpace="pre-wrap";
+  await loadItems(); centre(); setCursorInputs(); render();
+  setInterval(async()=>{const i=await J("/info");$("stat").textContent=`wraps ${i.wraps.loaded}/${i.wraps.total}`; if(i.wraps.loaded!==INFO.wraps.loaded){INFO=i;for(const p of panes)p.wr=null;draw();}},3000);
+}
+function centre(){for(const p of panes){p.c=[cur[PA[p.ax][0]],cur[PA[p.ax][1]]];}}
+function setCursorInputs(){$("cz").value=Math.round(cur[0]);$("cy").value=Math.round(cur[1]);$("cx").value=Math.round(cur[2]);}
+function geom(p){const W=p.cv.clientWidth,H=p.cv.clientHeight,nr=Math.ceil(H/mag),nc=Math.ceil(W/mag),S=s();
+  const r0=Math.floor(p.c[0]/S-nr/2),c0=Math.floor(p.c[1]/S-nc/2);return {W,H,nr,nc,S,r0,c0,R0:r0*S,C0:c0*S,R1:(r0+nr)*S,C1:(c0+nc)*S};}
+function toPx(p,g,a,b){return [(b-g.C0)/g.S*mag,(a-g.R0)/g.S*mag];}
+function fromPx(p,g,x,y){return [g.R0+y/mag*g.S,g.C0+x/mag*g.S];}
+async function fetchPane(p){
+  const t=++p.tick,g=geom(p),pos=cur[p.ax];
+  const q=`ax=${p.ax}&pos=${pos}&l=${lev}&r0=${g.r0}&c0=${g.c0}&nr=${g.nr}&nc=${g.nc}`;
+  const rq=`ax=${p.ax}&pos=${pos}&r0=${g.R0}&c0=${g.C0}&r1=${g.R1}&c1=${g.C1}`;
+  const jobs=[fetch("/slice?"+q).then(r=>r.arrayBuffer())];
+  jobs.push($("olab").checked&&INFO.labels&&lev===base?fetch("/lab?"+q).then(r=>r.ok?r.arrayBuffer():null):Promise.resolve(null));
+  jobs.push($("owr").checked?J("/wraps?"+rq):Promise.resolve(null));
+  jobs.push($("ofib").checked&&INFO.fibres?J(`/fib?${rq}&tol=${Math.max(2,g.S*1.5)}`):Promise.resolve(null));
+  const [im,lab,wr,fib]=await Promise.all(jobs); if(t!==p.tick)return;
+  p.g=g;p.img=new Uint8Array(im);p.lab=lab?new Uint8Array(lab):null;p.wr=wr;p.fib=fib;draw1(p);
+}
+function render(){for(const p of panes){p.cv.width=p.cv.clientWidth;p.cv.height=p.cv.clientHeight;fetchPane(p);}setCursorInputs();}
+function draw(){for(const p of panes)if(p.g)draw1(p);}
+const hsl=(h)=>{const f=n=>{const k=(n+h/30)%12;return 255*(0.5-0.5*Math.max(-1,Math.min(k-3,9-k,1)));};return [f(0),f(8),f(4)];};
+function draw1(p){
+  const g=p.g,cx=p.cv.getContext("2d"),lo=+$("lo").value,hi=+$("hi").value,sc=255/Math.max(1,hi-lo);
+  const id=new ImageData(g.nc,g.nr),d=id.data;
+  for(let i=0;i<g.nr*g.nc;i++){let v=(p.img[i]-lo)*sc;v=v<0?0:v>255?255:v;let r=v,gg=v,b=v;
+    if(p.lab){const l=p.lab[i];if(l!==255){const c=hsl(l/255*360);r=0.6*r+0.4*c[0];gg=0.6*gg+0.4*c[1];b=0.6*b+0.4*c[2];}}
+    d[4*i]=r;d[4*i+1]=gg;d[4*i+2]=b;d[4*i+3]=255;}
+  const oc=new OffscreenCanvas(g.nc,g.nr);oc.getContext("2d").putImageData(id,0,0);
+  cx.imageSmoothingEnabled=false;cx.clearRect(0,0,g.W,g.H);cx.drawImage(oc,0,0,g.nc*mag,g.nr*mag);
+  p.segs=[];
+  if(p.wr&&$("owr").checked){cx.lineWidth=1.5;for(const w of p.wr.wraps){cx.strokeStyle=wcol(w.w);cx.beginPath();const S=w.s;
+    for(let i=0;i<S.length;i+=4){const a=toPx(p,g,S[i],S[i+1]),b=toPx(p,g,S[i+2],S[i+3]);cx.moveTo(a[0],a[1]);cx.lineTo(b[0],b[1]);p.segs.push([w.w,a[0],a[1],b[0],b[1]]);}
+    cx.stroke();
+    if(S.length>=4){const a=toPx(p,g,S[0],S[1]);cx.fillStyle=wcol(w.w);cx.fillText(w.w,a[0]+3,a[1]-3);}}}
+  if(p.fib&&$("ofib").checked){for(const [k,col] of [["H","#ff0"],["V","#0ff"],["O","#f0f"]]){cx.fillStyle=col;const F=p.fib[k];
+    for(let i=0;i<F.length;i+=2){const a=toPx(p,g,F[i],F[i+1]);cx.fillRect(a[0]-1,a[1]-1,2,2);}}}
+  if($("oann").checked)drawItems(p,g,cx);
+  const [cr,cc]=[cur[PA[p.ax][0]],cur[PA[p.ax][1]]],q=toPx(p,g,cr,cc);
+  cx.strokeStyle="rgba(255,80,80,0.6)";cx.lineWidth=1;cx.beginPath();cx.moveTo(q[0],0);cx.lineTo(q[0],g.H);cx.moveTo(0,q[1]);cx.lineTo(g.W,q[1]);cx.stroke();
+  cx.fillStyle="#ff0";cx.fillText(`${"zyx"[p.ax]}=${Math.round(cur[p.ax])} L${lev}`,4,g.H-6);
+  if(p.drag&&p.drag.box){cx.strokeStyle="#fff";cx.setLineDash([4,3]);const b=p.drag.box;cx.strokeRect(b[0],b[1],b[2]-b[0],b[3]-b[1]);cx.setLineDash([]);}
+}
+function near(p,v,tol){return Math.abs(v[p.ax]-cur[p.ax])<=tol;}
+function drawItems(p,g,cx){
+  const tol=Math.max(2,g.S*2),[ra,ca]=PA[p.ax];
+  const mark=(v,col,txt,shape)=>{const a=toPx(p,g,v[ra],v[ca]);cx.strokeStyle=col;cx.fillStyle=col;cx.lineWidth=2;cx.beginPath();
+    if(shape==="x"){cx.moveTo(a[0]-5,a[1]-5);cx.lineTo(a[0]+5,a[1]+5);cx.moveTo(a[0]+5,a[1]-5);cx.lineTo(a[0]-5,a[1]+5);}else cx.arc(a[0],a[1],4,0,7);cx.stroke();if(txt!=null)cx.fillText(txt,a[0]+6,a[1]+4);};
+  for(const it of items){
+    if(it.type==="point"&&near(p,it.p,tol))mark(it.p,"#f80",it.w!=null?"w"+it.w:"·");
+    if(it.type==="pair"){if(near(p,it.a,tol))mark(it.a,"#f4f","A Δ"+it.dw);if(near(p,it.b,tol))mark(it.b,"#f4f","B");}
+    if(it.type==="wraperr"&&near(p,it.p,tol))mark(it.p,"#f33","w"+it.wrap+" "+it.kind,"x");
+    if(it.type==="line"){cx.strokeStyle="#fa0";cx.lineWidth=2;cx.beginPath();let on=false;
+      for(const v of it.pts){if(!near(p,v,tol*4)){on=false;continue;}const a=toPx(p,g,v[ra],v[ca]);if(on)cx.lineTo(a[0],a[1]);else cx.moveTo(a[0],a[1]);on=true;}cx.stroke();}
+    if(it.type==="region"){const b=it.box;if(cur[p.ax]<b[p.ax]||cur[p.ax]>=b[p.ax+3])continue;
+      const a=toPx(p,g,b[ra],b[ca]),c=toPx(p,g,b[ra+3],b[ca+3]);cx.strokeStyle=it.verdict==="good"?"#3f3":it.verdict==="bad"?"#f33":"#999";cx.lineWidth=2;cx.strokeRect(a[0],a[1],c[0]-a[0],c[1]-a[1]);cx.fillStyle=cx.strokeStyle;cx.fillText(it.verdict,a[0]+3,a[1]+12);}
+  }
+  for(const v of pend){if(Array.isArray(v)&&near(p,v,tol))mark(v,"#fff","…");}
+}
+async function loadItems(){const s=await J("/ann");items=s.items||[];$("nitems").textContent=items.length;const L=$("list");L.innerHTML="";
+  for(const it of [...items].reverse()){const d=document.createElement("div");const v=it.p||it.a||(it.pts&&it.pts[0])||(it.box&&[(it.box[0]+it.box[3])/2,(it.box[1]+it.box[4])/2,(it.box[2]+it.box[5])/2]);
+    d.textContent=`#${it.id} ${it.type} ${it.w!=null?"w"+it.w:""}${it.dw!=null?"Δ"+it.dw:""}${it.verdict||""}${it.kind?" w"+it.wrap+" "+it.kind:""} @ ${v.map(Math.round).join(",")}`;
+    const del=document.createElement("button");del.textContent="×";del.onclick=async e=>{e.stopPropagation();await fetch("/ann/del?id="+it.id,{method:"POST"});await loadItems();draw();};
+    d.appendChild(del);d.onclick=()=>{cur=v.slice();centre();render();};L.appendChild(d);}}
+async function add(o){const r=await fetch("/ann/add",{method:"POST",body:JSON.stringify(o)});const j=await r.json();if(j.error)alertMsg(j.error);await loadItems();draw();}
+function alertMsg(m){$("stat").textContent=m;}
+function pt3(p,g,x,y){const [a,b]=fromPx(p,g,x,y),v=cur.slice();v[PA[p.ax][0]]=Math.round(a);v[PA[p.ax][1]]=Math.round(b);return v;}
+function nearestWrap(p,x,y){let best=null,bd=1e9;for(const s of p.segs){const [w,x1,y1,x2,y2]=s,dx=x2-x1,dy=y2-y1,L=dx*dx+dy*dy||1;let t=((x-x1)*dx+(y-y1)*dy)/L;t=Math.max(0,Math.min(1,t));const d=Math.hypot(x1+t*dx-x,y1+t*dy-y);if(d<bd){bd=d;best=w;}}return bd<15?best:null;}
+for(const p of panes){
+  p.cv.addEventListener("mousedown",e=>{p.drag={x:e.offsetX,y:e.offsetY,c:p.c.slice(),moved:false};if(tool==="region")p.drag.box=[e.offsetX,e.offsetY,e.offsetX,e.offsetY];});
+  p.cv.addEventListener("mousemove",e=>{if(!p.drag)return;const dx=e.offsetX-p.drag.x,dy=e.offsetY-p.drag.y;if(Math.abs(dx)+Math.abs(dy)>3)p.drag.moved=true;
+    if(tool==="region"){p.drag.box[2]=e.offsetX;p.drag.box[3]=e.offsetY;draw1(p);return;}
+    if(p.drag.moved){const S=s();p.c=[p.drag.c[0]-dy/mag*S,p.drag.c[1]-dx/mag*S];clearTimeout(p.tm);p.tm=setTimeout(()=>fetchPane(p),60);}});
+  p.cv.addEventListener("mouseup",async e=>{const d=p.drag;p.drag=null;if(!d||!p.g)return;const g=p.g,v=pt3(p,g,e.offsetX,e.offsetY);
+    if(tool==="region"&&d.moved){const a=pt3(p,g,d.box[0],d.box[1]),b=pt3(p,g,d.box[2],d.box[3]),h=+$("rdepth").value,box=[0,0,0,0,0,0];
+      for(let k=0;k<3;k++){if(k===p.ax){box[k]=cur[k]-h;box[k+3]=cur[k]+h;}else{box[k]=Math.min(a[k],b[k]);box[k+3]=Math.max(a[k],b[k]);}}
+      await add({type:"region",box,verdict:$("verdict").value});return;}
+    if(d.moved)return;
+    if(tool==="nav"){cur=v;centre();render();return;}
+    if(tool==="point"){const o={type:"point",p:v};if($("w").value!=="")o.w=+$("w").value;await add(o);if($("winc").checked)$("w").value=+$("w").value+1;return;}
+    if(tool==="pair"){pend.push(v);if(pend.length===2){await add({type:"pair",a:pend[0],b:pend[1],dw:+$("dw").value});pend=[];}else draw();return;}
+    if(tool==="line"){pend.push(v);draw();return;}
+    if(tool==="wraperr"){const w=nearestWrap(p,e.offsetX,e.offsetY);if(w==null){alertMsg("click on a wrap line");return;}await add({type:"wraperr",p:v,wrap:w,kind:$("kind").value});}
+  });
+  p.cv.addEventListener("wheel",e=>{e.preventDefault();if(e.shiftKey){const ls=INFO.levels.map(L=>L.l),i=ls.indexOf(lev)+(e.deltaY>0?1:-1);if(i>=0&&i<ls.length){lev=ls[i];$("lev").value=lev;render();}return;}
+    cur[p.ax]+=(e.deltaY>0?1:-1)*s();setCursorInputs();clearTimeout(p.tw);p.tw=setTimeout(()=>{fetchPane(p);for(const q of panes)if(q!==p)draw1(q);},40);},{passive:false});
+}
+async function finishLine(){if(tool==="line"&&pend.length>=2){const o={type:"line",pts:pend};if($("w").value!=="")o.w=+$("w").value;pend=[];await add(o);}}
+document.querySelectorAll("button[data-t]").forEach(b=>b.onclick=()=>{document.querySelectorAll("button[data-t]").forEach(c=>c.classList.remove("on"));b.classList.add("on");tool=b.dataset.t;pend=[];draw();});
+$("undo").onclick=async()=>{await fetch("/ann/undo",{method:"POST"});await loadItems();draw();};
+$("finish").onclick=finishLine;
+$("go").onclick=()=>{cur=[+$("cz").value,+$("cy").value,+$("cx").value];centre();render();};
+$("lev").onchange=()=>{lev=+$("lev").value;render();};$("mag").onchange=()=>{mag=+$("mag").value;render();};
+for(const id of ["lo","hi","olab","owr","ofib","oann"])$(id).onchange=()=>render();
+$("next").onclick=()=>{if(!regions.length){alertMsg("no flagged regions (--regions)");return;}ri=(ri+1)%regions.length;const r=regions[ri];cur=[r.z,r.y,r.x];centre();render();
+  $("rinfo").textContent=`region ${ri+1}/${regions.length}: ${r.name} score ${r.score} ${r.note}`;};
+document.addEventListener("keydown",e=>{if(e.target.tagName==="INPUT")return;
+  if(e.key==="Enter")finishLine();else if(e.key==="Escape"){pend=[];draw();}else if(e.key==="u")$("undo").onclick();
+  else if(e.key==="n"||e.key==="p"){cur[0]+=(e.key==="n"?1:-1)*s();render();}});
+window.addEventListener("resize",()=>render());
+init();
+</script></body></html>

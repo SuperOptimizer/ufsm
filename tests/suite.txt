@@ -100,6 +100,7 @@ test_tiffw                                     |              |     1 | ./$B/tes
 test_render_stream                             |              |     7 | ./$B/test_render_stream
 test_imgops                                    |              |     1 | ./$B/test_imgops
 test_tfx                                       |              |     1 | ./$B/test_tfx
+test_annot                                     |              |     2 | ./$B/test_annot
 test_sheetcut                                  |              |     1 | ./$B/test_sheetcut
 test_dino_loss                                 | gpu          |     1 | ./$B/test_dino_loss
 test_dino_loss~D=16                            | gpu          |     1 | UFSM_TEST_D=16 ./$B/test_dino_loss
