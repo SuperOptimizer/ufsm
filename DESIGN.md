@@ -37,6 +37,21 @@ loss path only (the H / V mask task, B 1; refused with other tasks). test_fib_di
 30-step smoke at P 256: dir bce 1.00 -> 0.87, mask bce / dice as in the same smoke without the head; the checkpoint records
 `fib_dir` (channels, coding).
 
+**fibhv-b** (pod, `scripts/fibers/POD.md`): fibhv-a's recipe (P 512, 7 levels, MX-fp4, dice 0.5, pos-weight 4, 30000 steps) on the ring
+labels (0175A + 1447, weights by shard rows 0.35 / 0.65 instead of labelled bytes 0.45 / 0.55), 1.7 samp/s at 0-10 % loader wait.
+Paris 4 HOLD at step 5000 against fibhv-a at step 5000 (same eval_hold.sh; persistent = net sheet changes per metre, lower is better):
+
+| run, family | papyrus marked (>= 128) | lines | total m | median mm | p90 mm | persistent /m | pairs 0.3 / 0.6 / 1.2 mm |
+|---|---|---|---|---|---|---|---|
+| fibhv-a H | 0.40 (step 10000) | 12223 | 7.63 | 0.57 | 0.83 | 47.0 | .971 / .957 / .991 |
+| fibhv-b H | 0.07 | 8525 | 5.42 | 0.58 | 0.87 | 60.1 | .966 / .926 / 1.0 (37) |
+| fibhv-a V | 0.47 (step 10000) | 10323 | 6.40 | 0.56 | 0.83 | 101.2 | .945 / .937 / .992 |
+| fibhv-b V | 0.07 | 9213 | 5.77 | 0.58 | 0.85 | 149.6 | .909 / .882 / .983 (57) |
+
+The ring did what it was meant to: the masks now mark 7 % of the papyrus (tubes) instead of 40-47 % (layers). It did not make the traced
+lines longer at step 5000 (line ends: support 12657, turn 2276, coherence 1470 for H: the tubes fade, they no longer wander), and
+the lines change sheet more often. Step 10000 / 30000 still to come; the direction head (fibhv-c) is the next lever.
+
 **Smoothed axis (`fiber-trace --st-r 3`) as default: no.** Persistent sheet changes per metre (lower is better), base -> st-r 3:
 HOLD H 47.5 -> 41.0 (better), HOLD V 90.6 -> 93.7, PH1 H 272.9 -> 282.0, PH1 V 319.3 -> 343.3, PH2 H 204.3 -> 211.9, PH2 V 196.1 -> 212.5,
 PH3 H 335.4 -> 354.6, PH3 V 265.5 -> 281.5; the 0.6 mm pair share falls in all 7 of those. Defaults unchanged.
