@@ -1228,6 +1228,31 @@ static void diag_nonfinite(gpu_state *d, const char *what, const void *p, size_t
     fprintf(stderr, "diagnostics: %llu non-finite %s of %zu\n", c, what, n);
     window_note(d, g_Sdiag, "  window");
 }
+/* --uw: the GPUs' mean head losses for the s_h step, unscaled (without --*-lambda): the s_h fit exp(-s_h) = 1 / L_h and the lambdas stay
+   prior multipliers outside it (the gradient weight lambda_h exp(-s_h)). u1 (2026-11-11) fed the lambda-scaled losses: the fixed point
+   became 1 / (lambda L), which undid --wind4-lambda 0.25 (wind4's weight 1.2 -> 4.7 over 1300 steps, total loss rising) */
+static void uw_mean(const gpu_state *G, int nl, double L[SH_N]) {
+    int cnt[SH_N] = {0}; for (int h = 0; h < SH_N; h++) L[h] = 0;
+    for (int g = 0; g < nl; g++) { const gpu_state *q = &G[g];
+        const double v[SH_N] = {g_rv == 1 || !(q->side_loss > 0) ? 0 : q->sout[0], q->norm_loss > 0 ? q->norm_raw : 0, 0, q->w4_loss > 0 ? q->w4h[0] : 0,
+                                g_rv == 1 ? (q->side_loss > 0 ? q->sout[0] : 0) : q->rv_loss > 0 ? q->rvout[0] : 0, g_ink2 && q->iout[2] > 0 && q->ink_loss > 0 ? q->iout[0] : 0, 0};
+        for (int h = 0; h < SH_N; h++) if (v[h] > 0 && isfinite(v[h])) { L[h] += v[h]; cnt[h]++; } }
+    for (int h = 0; h < SH_N; h++) L[h] = cnt[h] ? L[h] / cnt[h] : 0;
+}
+/* tests (UFSM_UW_SELFTEST=1 ufsm train): the s_h fixed point with lambdas != 1 -> exp(-s_h) = 1 / L_h (unscaled) */
+static int uw_selftest(void) {
+    g_uw = 1; g_unwrap2 = 1; g_rv = 2; g_w4_lambda = 0.25f; g_rv_lambda = 3.f; g_side_lambda = 1.f; g_norm_lambda = 0.5f;
+    for (int h = 0; h < SH_N; h++) g_uw_s[h] = g_uw_m[h] = g_uw_v[h] = 0; g_uw_t = 0; g_uw_lr = 1e-2f;
+    gpu_state q[2]; memset(q, 0, sizeof q); const double raw[SH_N] = {0.6, 0.5, 0, 0.58, 0.45, 0, 0};
+    for (int g = 0; g < 2; g++) { q[g].sout[0] = (float)raw[0]; q[g].side_loss = g_side_lambda * raw[0]; q[g].norm_raw = raw[1]; q[g].norm_loss = g_norm_lambda * raw[1];
+                                  q[g].w4h[0] = (float)raw[3]; q[g].w4_loss = g_w4_lambda * raw[3]; q[g].rvout[0] = (float)raw[4]; q[g].rv_loss = g_rv_lambda * raw[4]; }
+    for (int i = 0; i < 6000; i++) { double L[SH_N]; uw_mean(q, 2, L); uw_step(L); }
+    int bad = 0; static const char *nm[SH_N] = {"phase", "normal", "", "wind4", "rv", "", ""};
+    for (int h = 0; h < SH_N; h++) if (raw[h] > 0) { const double w = g_hmul[h], want = 1.0 / raw[h]; const int ok = fabs(w / want - 1) < 0.02; bad += !ok;
+        fprintf(stderr, "uw selftest: %s weight exp(-s) %.4f, 1 / L %.4f%s\n", nm[h], w, want, ok ? "" : "  BAD"); }
+    fprintf(stderr, "uw selftest: %s\n", bad ? "FAIL" : "ok");
+    return bad ? 1 : 0;
+}
 /* one GPU's training step (the batch is on the device or uploading): the forward + losses, then the backward. The SR counter is per GPU
    (base g << 24; GPU 0 as one GPU always had), carried from the forward to the backward, so every schedule (one host thread per GPU,
    phased, in turn) draws the same numbers */
@@ -1706,6 +1731,7 @@ static void split_job(int side, void *a) {
 }
 
 int cmd_train(int argc, char **argv) {
+    if (ufsm_env_on("UFSM_UW_SELFTEST")) return uw_selftest();
     if (argc < 3) {
         fprintf(stderr, "usage: ufsm train <sources.json> --out DIR [--P 512] [--B 1] [--steps 20000] [--lr 1e-3] [--warmup 500] [--wd 0.01]\n"
                         "       [--dice 0.5] [--ema 0.999] [--widths 16,32,64,80] [--down-norm 1] [--gpus 0,1] [--workers 12 (new runs with --gpu-aug 2: 3)] [--gpu-aug 0|1|2 (new runs: 2)] [--sampler-slots N] [--seed 0] [--det 1] [--resume CKPT] [--finetune 1] [--fp4 0|1|2 (default 2)] [--mem auto|auto16|default|wide] [--opt adamw|muon|anvil] [--muon-lr 0.02] [--muon-beta 0.95] [--anvil-lr 0.023] [--anvil-wd 2.25] [--sched cos|wsd] [--cooldown 0.2]\n"
@@ -3555,13 +3581,7 @@ int cmd_train(int argc, char **argv) {
         }
         for (int g = 0; g < nl; g++) { nn_init(G[g].dev); loss += fetch_loss(&G[g], B, P, dice_w, parts[g]); active += parts[g][2 * NCH]; }   /* split: both sides hold the window's loss */
         if (G[0].gc_on) { nn_init(G[0].dev); gc_report(&G[0], step); G[0].gc_on = 0; }
-        if (g_uw) {   /* the s_h step: the GPUs' mean lambda-weighted head losses */
-            double L[SH_N] = {0}; int cnt[SH_N] = {0};
-            for (int g = 0; g < nl; g++) { const gpu_state *q = &G[g]; const double v[SH_N] = {g_rv == 1 ? 0 : q->side_loss, q->norm_loss, 0, q->w4_loss, g_rv == 1 ? q->side_loss : q->rv_loss, g_ink2 && q->iout[2] > 0 ? q->ink_loss : 0, 0};
-                for (int h = 0; h < SH_N; h++) if (v[h] > 0 && isfinite(v[h])) { L[h] += v[h]; cnt[h]++; } }
-            for (int h = 0; h < SH_N; h++) L[h] = cnt[h] ? L[h] / cnt[h] : 0;
-            uw_step(L);
-        }
+        if (g_uw) { double L[SH_N]; uw_mean(G, nl, L); uw_step(L); }   /* the s_h step: the GPUs' mean unscaled head losses */
         if (sheet_log) { fprintf(sheet_log,"%d",step); for (int k=0;k<5;k++) fprintf(sheet_log,",%.8g",G[0].sheet_parts[k]); fprintf(sheet_log,",%.8g,%.8g\n",G[0].sheet_loss,g_sheet_ramp); fflush(sheet_log); }
         int fwd_nan = 0;   /* non-finite loss parts: the forward itself produced non-finite logits (not a gradient-scale overflow) */
         if (g_sheet && !isfinite(G[0].sheet_loss)) fwd_nan=1;
