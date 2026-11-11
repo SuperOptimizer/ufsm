@@ -77,7 +77,7 @@ SRC += src/inksplat.c src/hercuvit.c src/hercuvit_net.c src/ink3dext.c src/ink3d
 SRC += src/tfx.c
 SRC += src/annot.c src/annot_export.c
 SRC += src/embz.c src/fit_emb.c src/embpca.c src/embcalib.c src/sample_emb.c
-SRC += src/vwt_sample.c src/raycheck.c src/patchraster.c src/hiresphase.c src/fitjoin.c src/wrapcheck.c src/phasegate.c src/ctcal.c src/fieldsoracle.c src/packmap.c src/fielddiag.c src/scanprep.c src/pairacc.c src/wbench.c src/wrapsnap.c src/surflabels.c src/sheetscore.c src/phasecoh.c src/patchsolve.c src/tracebox.c src/sheettrace.c src/sideface.c src/sidegate.c src/geomcheck.c src/patchid.c src/rectoruler.c src/rectocls.c src/rectosp.c
+SRC += src/vwt_sample.c src/raycheck.c src/patchraster.c src/hiresphase.c src/fitjoin.c src/wrapcheck.c src/phasegate.c src/ctcal.c src/fieldsoracle.c src/packmap.c src/fielddiag.c src/fieldsphase.c src/scanprep.c src/pairacc.c src/wbench.c src/wrapsnap.c src/surflabels.c src/sheetscore.c src/phasecoh.c src/patchsolve.c src/tracebox.c src/sheettrace.c src/sideface.c src/sidegate.c src/geomcheck.c src/patchid.c src/rectoruler.c src/rectocls.c src/rectosp.c
 SRC += src/view.c src/reg.c src/reg_cli.c src/reg_view.c src/reg_init.c src/reg_render.c src/reg_ink.c src/srpairs.c
 SRC += src/srpair.c
 SRC += src/storebench.c src/phasepack.c
@@ -294,6 +294,9 @@ suite-bins: $(B)/test_fblend
 $(B)/test_fields_pack: tests/test_fields_pack.c $(B)/fieldspack.o $(B)/repack.o $(B)/fit.o $(B)/fit_emb.o $(B)/embz.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/coreline.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/z3w.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 suite-bins: $(B)/test_fields_pack
+$(B)/test_fields_phase: tests/test_fields_phase.c $(B)/fieldsphase.o $(B)/fit.o $(B)/fit_emb.o $(B)/embz.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/coreline.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/z3w.o $(B)/nn.o $(B)/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
+suite-bins: $(B)/test_fields_phase
 $(B)/test_ink_gate: tests/test_ink_gate.c $(B)/inkgate.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/z3w.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
 suite-bins: $(B)/test_ink_gate
