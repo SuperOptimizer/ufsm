@@ -134,6 +134,24 @@ static int make_wind_fixture(const char *D, int n_, float q) {
         const double u0 = 9.6; snprintf(p, sizeof p, "%s/ink", D);
         if (z3w_write_group(p, &u0, 1, "ink", nullptr)) return 1;
     }
+    if (fx_ink) {   /* train --fib-head: H / V fibre tube masks on the level-0 grid (prob254): H tubes circle the axis inside the sheets (winding fraction
+           .40-.50, z mod 10 < 3), V tubes run along z (fraction .60-.70, 30 angular stripes of .15); unknown (255) for z >= 3 N / 4 */
+        const size_t N0 = (size_t)fx_N; uint8_t *fb = malloc(N0 * N0 * N0); if (!fb) return 1;
+        for (int fam = 0; fam < 2; fam++) {
+            for (size_t z = 0; z < N0; z++) for (size_t y = 0; y < N0; y++) for (size_t x = 0; x < N0; x++) {
+                double cy, cx; fx_axis_at((double)z, &cy, &cx);
+                const double w = fx_wind((double)z, (double)y, (double)x), f = w - floor(w), th = atan2((double)y - cy, (double)x - cx), u = (th + M_PI) / (2 * M_PI) * 30;
+                const int in = fx_ct_at((int)z, (int)y, (int)x) && (fam ? f >= .60 && f < .70 && u - floor(u) < .15 : f >= .40 && f < .50 && z % 10 < 3);
+                fb[(z * N0 + y) * N0 + x] = z >= 3 * N0 / 4 ? 255 : in ? 254 : 0;
+            }
+            char nm[64]; z3w_level_name(9.6, nm, sizeof nm); snprintf(p, sizeof p, "%s/fib%c/%s", D, fam ? 'v' : 'h', nm);
+            const int64_t s0[3] = {(int64_t)N0, (int64_t)N0, (int64_t)N0}; fx_volctx cf = {fb, (int64_t)N0};
+            if (fx_write_arr(p, s0, 0.f, 255, fx_cut, &cf)) return 1;
+            const double u0 = 9.6; snprintf(p, sizeof p, "%s/fib%c", D, fam ? 'v' : 'h');
+            if (z3w_write_group(p, &u0, 1, fam ? "fibre_v" : "fibre_h", nullptr)) return 1;
+        }
+        free(fb);
+    }
     snprintf(p, sizeof p, "%s/axis.json", D); FILE *f = fopen(p, "w"); if (!f) return 1;
     fprintf(f, "{\"control_points\": [");
     for (int i = 0; i <= 8; i++) { const double z = (double)fx_N * i / 8; double cy, cx; fx_axis_at(z, &cy, &cx); fprintf(f, "%s{\"z\": %g, \"y\": %g, \"x\": %g}", i ? ", " : "", z, cy, cx); }
@@ -147,6 +165,11 @@ static int make_wind_fixture(const char *D, int n_, float q) {
     fprintf(f, "{\"sources\": [{\"name\": \"wind-fixture-ink\", \"root\": \"%s\", \"ct\": \"ct\", \"um\": 9.6, \"axis\": \"%s/axis.json\", \"weight\": 1, \"ink_weight\": 1,\n"
                "  \"targets\": {\"ink\": {\"root\": \"%s/ink\", \"group\": \".\", \"encoding\": \"prob254\"},\n"
                "               \"band\": {\"root\": \"%s/band\", \"key\": \"1\", \"radius\": 80, \"span\": 75, \"phase\": {\"root\": \"%s/phase0\", \"key\": \"0\", \"level\": 0}}}}]}\n", D, D, D, D, D);
+    fclose(f);
+    snprintf(p, sizeof p, "%s/sources-fibhv.json", D); f = fopen(p, "w"); if (!f) return 1;   /* train --fib-head: + the H / V tube masks */
+    fprintf(f, "{\"sources\": [{\"name\": \"wind-fixture-fib\", \"root\": \"%s\", \"ct\": \"ct\", \"um\": 9.6, \"axis\": \"%s/axis.json\", \"weight\": 1,\n"
+               "  \"targets\": {\"fibre_h\": {\"root\": \"%s/fibh\", \"group\": \".\", \"encoding\": \"prob254\"}, \"fibre_v\": {\"root\": \"%s/fibv\", \"group\": \".\", \"encoding\": \"prob254\"},\n"
+               "               \"band\": {\"root\": \"%s/band\", \"key\": \"1\", \"radius\": 80, \"span\": 75, \"phase\": {\"root\": \"%s/phase0\", \"key\": \"0\", \"level\": 0}}}}]}\n", D, D, D, D, D, D);
     fclose(f); }
     snprintf(p, sizeof p, "%s/sources-l1.json", D); f = fopen(p, "w"); if (!f) return 1;   /* the level-1 phase: for level-1 windows (read directly) */
     fprintf(f, "{\"sources\": [{\"name\": \"wind-fixture\", \"root\": \"%s\", \"ct\": \"ct\", \"um\": 9.6, \"axis\": \"%s/axis.json\", \"weight\": 1,\n"

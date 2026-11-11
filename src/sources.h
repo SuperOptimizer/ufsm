@@ -28,9 +28,10 @@
 #include <stdint.h>
 
 enum { CH_RECTO = 0, CH_SHEET = 1, NCH = 2 };
-/* target slots of a source: the NCH batch channels, then CH_FIB, a target that only feeds a train aux plane (the "fibre" tube raster of
-   --fib-normal-lambda when an ink plane is on too; never a batch channel) */
-enum { CH_FIB = 2, NTG = 3 };
+/* target slots of a source: the NCH batch channels, then the targets that only feed train aux planes (never batch channels): CH_FIB the
+   "fibre" tube raster of --fib-normal-lambda when an ink plane is on too; CH_FIBH / CH_FIBV "fibre_h" / "fibre_v", the H / V fibre tube
+   masks of the unwrap2 fibre head (--fib-head; prob254, 255 unknown) */
+enum { CH_FIB = 2, CH_FIBH = 3, CH_FIBV = 4, NTG = 5 };
 /* the heads a source's "heads" key names (sources.c SHNAME) */
 enum { SH_PHASE, SH_NORMAL, SH_DENSITY, SH_WIND4, SH_RV, SH_INK, SH_FIBRE, SH_N };
 extern const char *const SHNAME[SH_N];
@@ -111,6 +112,7 @@ typedef struct {
                     level 2): samples of level L read it directly, of level L - 1 upsampled 2x */
     int phase_only;                  /* band without "root" + a stored phase with "level": s->band aliases s->phase (never read as codes:
                                         task unwrap2 reads the stored phase only); any phase level, 0 included (pseudo labels on ~9 um scans) */
+    float phase_onfly;               /* > 0: s->phase is computed from codes on read (band_onfly.h), this pair radius (codes voxels) */
     int phase_level, phase_direct;   /* the CT level whose grid the stored phase is on (1: the 4.8 um label grid of 2.4 um scans);
                                         phase_direct: "level" given, so samples of that level read it directly */
     int phase_sign;   /* "phase": {..., "phase_sign": -1}: the stored phase (and "winding") rise inward, against the convention (phase

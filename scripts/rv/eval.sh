@@ -15,17 +15,19 @@
 set -u
 CK=$1; T=$2; SC=${3:-p1667 p139 p4}
 U=${U:-/vesuvius/ufsm/v2/rv/bin/ufsm.ev}; RU=${RU:-/vesuvius/ufsm/v2/recto/src2/build/ufsm}; GPU=${GPU:-1}; LOCK=${LOCK-/vesuvius/ufsm/opt/gpu$GPU.lock}
-E=${E:-/mnt/scratch/rv/eval}; TH=${TH:-16}; SH=${SH:-128}; CTR=/vesuvius/ufsm/v2/ct; C=/vesuvius/ufsm/v2/count
+E=${E:-/mnt/scratch/rv/eval}; TH=${TH:-16}; SH=${SH:-128}; CTR=${CTR:-/vesuvius/ufsm/v2/ct}; C=${CNT:-/vesuvius/ufsm/v2/count}
+# off the desk (2026-11-11, scripts/univ): CTR=<volcomp mirror> VOLP=volumes/ (the mirror keeps scans under <scroll>/volumes/), CNT, RVGT (GT root), RU
+RVGT=${RVGT:-/vesuvius/ufsm/gt}; VOLP=${VOLP:-}
 mkdir -p $E/$T; echo "== $T $CK $(date)" >> $E/$T.txt
 zlist() {   # zlist ZR0 ZR1 NZ: the ruler's --nz z levels (model-local native z)
   awk -v a=$1 -v b=$2 -v n=$3 'BEGIN { for (i = 0; i < n; i++) printf "%s%d", i ? "," : "", int(a + (i + 0.5) * (b - a) / n) }'; }
 for S in $SC; do
   case $S in
-    p1667) M=$C/p1667/pn2/ref; F=$C/p1667/fields; Q="/vesuvius/ufsm/gt/PHerc1667-wind-20261016/codes 4.798"; CK_=PHerc1667/20251217075048-2.399um-0.2m-78keV-masked.zarr; LV=2; UM=9.596; U0=2.399
+    p1667) M=$C/p1667/pn2/ref; F=$C/p1667/fields; Q="$RVGT/PHerc1667-wind-20261016/codes 4.798"; CK_=PHerc1667/${VOLP}20251217075048-2.399um-0.2m-78keV-masked.zarr; LV=2; UM=9.596; U0=2.399
            ZS=$(zlist 500 8800 24); ZB="";;
-    p139)  M=$C/p139/pn2/ref; F=$C/p139/fields; Q="/vesuvius/ufsm/gt/PHerc0139-wind-20261016/codes 18.72"; CK_=PHerc0139/20250728140407-9.362um-1.2m-113keV-masked.zarr; LV=0; UM=9.362; U0=9.362
+    p139)  M=$C/p139/pn2/ref; F=$C/p139/fields; Q="$RVGT/PHerc0139-wind-20261016/codes 18.72"; CK_=PHerc0139/${VOLP}20250728140407-9.362um-1.2m-113keV-masked.zarr; LV=0; UM=9.362; U0=9.362
            ZS=$(zlist 1000 12000 24); ZB="";;
-    p4)    M=$C/p4w/pn2/ref; F=/vesuvius/ufsm/cfit/whole/refcrop; Q="/vesuvius/ufsm/gt/paris4-q9p6/q-9p6.zarr 9.6"; CK_=PHercParis4/20260411134726-2.400um-0.2m-78keV-masked.zarr; LV=2; UM=9.6; U0=2.4
+    p4)    M=$C/p4w/pn2/ref; F=/vesuvius/ufsm/cfit/whole/refcrop; Q="$RVGT/paris4-q9p6/q-9p6.zarr 9.6"; CK_=PHercParis4/${VOLP}20260411134726-2.400um-0.2m-78keV-masked.zarr; LV=2; UM=9.6; U0=2.4
            ZS=8008,8040,8072,8104,9508,9540,9572,9604,11008,11040,11072,11104,12508,12540,12572,12604,14008,14040,14072,14104,15508,15540,15572,15604; ZB="--zblock 1500,1";;
     *) echo "unknown $S"; continue;;
   esac

@@ -29,6 +29,12 @@ typedef struct z3 z3;
 z3 *z3_open(store *s, const char *key, const char *cache_dir);   /* uint8 arrays only */
 z3 *z3_open_typed(store *s, const char *key, const char *cache_dir);   /* also uint16 / int16 / uint32 / int32 / float32 (meta.esize bytes per voxel) */
 void z3_close(z3 *z);
+/* A derived array: z3_read(z) calls derive(ctx, base, o, n, out, nthreads) (o / n any box, like z3_read; out n[0] n[1] n[2] bytes);
+   its meta is base's (shape, shard / chunk grid) with fill_value fill; z3_chunk_map / z3_box_any / z3_shard_present answer from base
+   (the chunks derive can make non-fill). z3_close closes base and calls ctx_free(ctx). Sub-chunk / device reads fail on it. */
+typedef int (*z3_derive_fn)(void *ctx, z3 *base, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads);
+z3 *z3_open_derived(z3 *base, int fill, z3_derive_fn derive, void *ctx, void (*ctx_free)(void *));
+z3 *z3_base_of(const z3 *z);   /* a derived array's base, else nullptr */
 const z3_meta *z3_meta_of(const z3 *z);
 const char *z3_key(const z3 *z);
 

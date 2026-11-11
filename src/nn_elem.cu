@@ -702,6 +702,45 @@ extern "C" void nn_fib_dir_targets(const uint8_t *t, const uint8_t *m, int d, in
     const size_t n = (size_t)d * h * w;
     fib_dir_k<<<nblk(n, 256), 256>>>(t, m, d, h, w, r, cmin, o, om); KCHECK();
 }
+/* train --fib-head (task unwrap2, head slabs): the fib_dir_k targets of window planes [z0, z0 + nz) from the H / V tube planes fh / fv
+   (prob254, 255 unknown; indexed by window voxel, planes [z0 - r, z0 + nz + r) present): fibre = known and >= 128, a neighbour counts
+   where its family's plane is known. With every voxel known these are fib_dir_k's bytes (test_fibhead) */
+__global__ void fib_head_dir_k(const uint8_t *fh, const uint8_t *fv, int D, int H, int W, int z0, int nz, int r, float cmin, uint8_t *o, uint8_t *om) {
+    const size_t hw = (size_t)H * W, n = (size_t)nz * hw, li = blockIdx.x * (size_t)blockDim.x + threadIdx.x, i = (size_t)z0 * hw + li;
+    if (li >= n) return;
+    om[li] = 0;
+    for (int c = 0; c < 7; c++) o[c * n + li] = 0;
+    const int h = fh[i] != 255 && fh[i] >= 128, v = fv[i] != 255 && fv[i] >= 128; if (h == v || fh[i] == 255 || fv[i] == 255) return;
+    const uint8_t *f = v ? fv : fh;
+    const int z = (int)(i / hw), y = (int)((i / W) % H), x = (int)(i % W);
+    float s1[3] = {0, 0, 0}, s2[6] = {0, 0, 0, 0, 0, 0}; int cnt = 0;
+    for (int dz = -r; dz <= r; dz++) { const int zz = z + dz; if (zz < 0 || zz >= D) continue;
+        for (int dy = -r; dy <= r; dy++) { const int yy = y + dy; if (yy < 0 || yy >= H) continue;
+            const size_t row = ((size_t)zz * H + yy) * W;
+            for (int dx = -r; dx <= r; dx++) { const int xx = x + dx; if (xx < 0 || xx >= W) continue;
+                const size_t j = row + xx; if (f[j] == 255 || f[j] < 128) continue;
+                cnt++; s1[0] += dz; s1[1] += dy; s1[2] += dx;
+                s2[0] += dz * dz; s2[1] += dy * dy; s2[2] += dx * dx; s2[3] += dz * dy; s2[4] += dz * dx; s2[5] += dy * dx; } } }
+    if (cnt < 2 * r + 1) return;
+    const float ic = 1.f / cnt, mz = s1[0] * ic, my = s1[1] * ic, mx = s1[2] * ic;
+    const float C[6] = {s2[0] * ic - mz * mz, s2[1] * ic - my * my, s2[2] * ic - mx * mx, s2[3] * ic - mz * my, s2[4] * ic - mz * mx, s2[5] * ic - my * mx};
+    const float tr = C[0] + C[1] + C[2]; if (!(tr > 0.f)) return;
+    float a[3] = {0, 0, 0}; a[C[0] >= C[1] && C[0] >= C[2] ? 0 : C[1] >= C[2] ? 1 : 2] = 1.f;
+    float lam = 0.f;
+    for (int it = 0; it < 32; it++) {
+        const float w0 = C[0] * a[0] + C[3] * a[1] + C[4] * a[2], w1 = C[3] * a[0] + C[1] * a[1] + C[5] * a[2], w2 = C[4] * a[0] + C[5] * a[1] + C[2] * a[2];
+        lam = sqrtf(w0 * w0 + w1 * w1 + w2 * w2); if (!(lam > 0.f)) return;
+        a[0] = w0 / lam; a[1] = w1 / lam; a[2] = w2 / lam;
+    }
+    if (lam / tr < cmin) return;
+    const float c7[7] = {a[0] * a[0], a[1] * a[1], a[2] * a[2], 0.5f + a[0] * a[1], 0.5f + a[0] * a[2], 0.5f + a[1] * a[2], v ? 1.f : 0.f};
+    for (int c = 0; c < 7; c++) o[c * n + li] = (uint8_t)__float2int_rn(255.f * fminf(1.f, fmaxf(0.f, c7[c])));
+    om[li] = 1;
+}
+extern "C" void nn_fib_head_dir(const uint8_t *fh, const uint8_t *fv, int d, int h, int w, int z0, int nz, int r, float cmin, uint8_t *o, uint8_t *om) {
+    const size_t n = (size_t)nz * h * w;
+    fib_head_dir_k<<<nblk(n, 256), 256>>>(fh, fv, d, h, w, z0, nz, r, cmin, o, om); KCHECK();
+}
 /* a 0/1 loss mask times the packed-sheet weight of each voxel (its phase gradient over +-s voxels; unknown gradients keep 1) */
 __global__ void packed_mask_k(const uint8_t *ph, int D, int H, int W, int s, float um, float packed_um, float packed_w, uint8_t *m, size_t i0, size_t n) {
     const size_t li = blockIdx.x * (size_t)blockDim.x + threadIdx.x, i = i0 + li;

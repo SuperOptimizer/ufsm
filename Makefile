@@ -60,7 +60,7 @@ NVFLAGS ?= -O3 $(NVARCH) -DUFSM_ARCH=$(ARCH) -use_fast_math -Xcompiler -fno-thre
 # toolchains (gcc-14 + CUDA 13.2 on the pods failed without it). Harmless where it is not needed.
 CUDALIBS = -L$(CUDA)/lib64 -lcudart -lcublasLt -lstdc++
 
-SRC  = src/json.c src/checkpoint.c src/sheet.c src/store.c src/zarr3.c src/sources.c src/sample.c src/band.c src/ct_augment.c src/scan_augment.c src/spatial_augment.c src/crush.c src/scrollaug.c src/cover.c src/zarr2.c src/tiff.c src/z3w.c src/hf.c src/ingest.c src/zipr.c src/train.c src/restore.c src/restore_cli.c src/unet.c src/split.c src/predict.c src/sweep.c src/eval.c src/fit.c src/tiffw.c src/edt.c src/votes.c src/wind.c src/fuse.c src/phase_check.c
+SRC  = src/json.c src/checkpoint.c src/sheet.c src/store.c src/zarr3.c src/sources.c src/sample.c src/band.c src/ct_augment.c src/scan_augment.c src/spatial_augment.c src/crush.c src/scrollaug.c src/cover.c src/zarr2.c src/tiff.c src/z3w.c src/hf.c src/ingest.c src/zipr.c src/train.c src/restore.c src/restore_cli.c src/unet.c src/split.c src/predict.c src/sweep.c src/eval.c src/fit.c src/tiffw.c src/edt.c src/votes.c src/wind.c src/fuse.c src/phase_check.c src/band_onfly.c
 SRC += src/surf.c src/stitch.c src/coreline.c src/coreline_check.c src/fit_ct.c src/l1pot.c
 SRC += src/fblend.c src/sheetpbr.c src/regmap.c
 SRC += src/deform.c src/vwt_aug.c src/zcache.c
@@ -134,6 +134,11 @@ NNSRC = $(wildcard src/nn_*.cu)
 NNOBJ = $(patsubst src/%.cu,$(B)/%.o,$(NNSRC))
 $(B)/nn_%.o: src/nn_%.cu | $(B)
 	$(NVCC) $(NVFLAGS) $(TYPEFLAGS) -Xfatbin=-compress-all -MMD -MP -c $< -o $@
+# the annotate page as a byte list for compilers without #embed (gcc < 15: the pods' toolchains), made with od (coreutils)
+$(B)/annot_page.inc: src/annot_page.html | $(B)
+	od -An -v -tx1 $< | sed 's/ \([0-9a-f][0-9a-f]\)/0x\1,/g' > $@
+$(B)/annot.o: $(B)/annot_page.inc
+$(B)/annot.o: CPPFLAGS += -I$(B)
 $(B)/nn_flat.o: NVFLAGS += --default-stream per-thread   # concurrent strip-flatten chunks on one device
 $(B)/nn.o: $(NNOBJ)
 	ld -r -o $@ $^
@@ -235,6 +240,9 @@ suite-bins: $(B)/test_fstem
 $(B)/test_gram: tests/test_gram.c $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 suite-bins: $(B)/test_gram
+$(B)/test_fibhead: tests/test_fibhead.c $(B)/nn.o $(B)/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
+suite-bins: $(B)/test_fibhead
 $(B)/test_unet: tests/test_unet.c $(B)/unet.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 $(B)/test_gn_frozen: tests/test_gn_frozen.c $(B)/unet.o $(B)/nn.o $(B)/nn_fp8.o
@@ -313,13 +321,13 @@ $(B)/test_sheetpbr: tests/test_sheetpbr.c $(B)/sheetpbr.o $(B)/reg.o $(B)/zarr2.
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
 suite-bins: $(B)/test_sheetpbr
 
-$(B)/test_geom_check: tests/test_geom_check.c $(B)/geomcheck.o $(B)/sources.o $(B)/srpair.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/z3w.o $(B)/tiffw.o $(B)/tiff.o $(B)/tfx.o $(B)/surfcomp.o
+$(B)/test_geom_check: tests/test_geom_check.c $(B)/geomcheck.o $(B)/sources.o $(B)/band_onfly.o $(B)/band.o $(B)/edt.o $(B)/srpair.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/z3w.o $(B)/tiffw.o $(B)/tiff.o $(B)/tfx.o $(B)/surfcomp.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
 suite-bins: $(B)/test_geom_check
 $(B)/test_countfield: tests/test_countfield.c $(B)/countfield.o $(B)/ctcal.o $(B)/fit.o $(B)/fit_emb.o $(B)/embz.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/coreline.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/z3w.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 suite-bins: $(B)/test_countfield
-$(B)/test_vwt_sample: tests/test_vwt_sample.c $(B)/vwt_sample.o $(B)/imgops.o $(B)/jpegpar.o $(B)/tiffw.o $(B)/tfx.o $(B)/surfcomp.o $(B)/vwt_aug.o $(B)/zcache.o $(B)/deform.o $(B)/edt.o $(B)/band.o $(B)/sheet.o $(B)/ct_augment.o $(B)/scan_augment.o $(B)/spatial_augment.o $(B)/crush.o $(B)/scrollaug.o $(B)/cover.o $(B)/json.o $(B)/store.o $(B)/zarr3.o $(B)/sources.o $(B)/srpair.o $(B)/zarr2.o $(B)/tiff.o $(B)/z3w.o $(B)/hf.o $(B)/zipr.o $(B)/view.o $(B)/reg.o $(B)/sample_emb.o $(B)/embz.o $(B)/nn.o $(B)/nn_fp8.o
+$(B)/test_vwt_sample: tests/test_vwt_sample.c $(B)/vwt_sample.o $(B)/imgops.o $(B)/jpegpar.o $(B)/tiffw.o $(B)/tfx.o $(B)/surfcomp.o $(B)/vwt_aug.o $(B)/zcache.o $(B)/deform.o $(B)/edt.o $(B)/band.o $(B)/sheet.o $(B)/ct_augment.o $(B)/scan_augment.o $(B)/spatial_augment.o $(B)/crush.o $(B)/scrollaug.o $(B)/cover.o $(B)/json.o $(B)/store.o $(B)/zarr3.o $(B)/sources.o $(B)/band_onfly.o $(B)/srpair.o $(B)/zarr2.o $(B)/tiff.o $(B)/z3w.o $(B)/hf.o $(B)/zipr.o $(B)/view.o $(B)/reg.o $(B)/sample_emb.o $(B)/embz.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 suite-bins: $(B)/test_vwt_sample
 $(B)/test_spiralfit: tests/test_spiralfit.c $(B)/countfield.o $(B)/ctcal.o $(B)/fit.o $(B)/fit_emb.o $(B)/embz.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/coreline.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/z3w.o $(B)/nn.o $(B)/nn_fp8.o
@@ -492,7 +500,7 @@ $(B)/test_infer_mem: tests/test_infer_mem.c $(B)/unet.o $(B)/split.o $(B)/nn.o $
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 $(B)/test_split: tests/test_split.c $(B)/unet.o $(B)/split.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
-SAMPLE_TEST_OBJ = $(B)/edt.o $(B)/band.o $(B)/sheet.o $(B)/ct_augment.o $(B)/scan_augment.o $(B)/spatial_augment.o $(B)/crush.o $(B)/scrollaug.o $(B)/cover.o $(B)/json.o $(B)/store.o $(B)/zarr3.o $(B)/sources.o $(B)/srpair.o $(B)/zarr2.o $(B)/tiff.o $(B)/z3w.o $(B)/hf.o $(B)/zipr.o $(B)/view.o $(B)/reg.o $(B)/sample_emb.o $(B)/embz.o
+SAMPLE_TEST_OBJ = $(B)/edt.o $(B)/band.o $(B)/sheet.o $(B)/ct_augment.o $(B)/scan_augment.o $(B)/spatial_augment.o $(B)/crush.o $(B)/scrollaug.o $(B)/cover.o $(B)/json.o $(B)/store.o $(B)/zarr3.o $(B)/sources.o $(B)/band_onfly.o $(B)/srpair.o $(B)/zarr2.o $(B)/tiff.o $(B)/z3w.o $(B)/hf.o $(B)/zipr.o $(B)/view.o $(B)/reg.o $(B)/sample_emb.o $(B)/embz.o
 $(B)/test_wrapsnap: tests/test_wrapsnap.c $(B)/wrapsnap.o $(B)/tfx.o $(B)/surfcomp.o $(B)/tiffw.o $(SAMPLE_TEST_OBJ) $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 suite-bins: $(B)/test_wrapsnap
@@ -567,11 +575,11 @@ $(B)/test_crush: tests/test_crush.c tests/make_wind_fixture.c src/sample.c src/*
 $(B)/test_raster: tests/test_raster.c src/ingest.c src/*.h $(SAMPLE_TEST_OBJ) $(B)/surfcomp.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_raster.c $(SAMPLE_TEST_OBJ) $(B)/surfcomp.o -o $@ $(LDLIBS)
 
-$(B)/bench_sampler: tests/bench_sampler.c $(B)/sample.o $(B)/sample_emb.o $(B)/embz.o $(B)/edt.o $(B)/band.o $(B)/sheet.o $(B)/ct_augment.o $(B)/scan_augment.o $(B)/spatial_augment.o $(B)/crush.o $(B)/scrollaug.o $(B)/cover.o $(B)/sources.o $(B)/srpair.o $(B)/view.o $(B)/reg.o $(B)/zarr3.o $(B)/zarr2.o $(B)/store.o $(B)/json.o $(B)/z3w.o $(B)/tiff.o $(B)/zipr.o $(B)/hf.o $(B)/nn.o $(B)/nn_fp8.o
+$(B)/bench_sampler: tests/bench_sampler.c $(B)/sample.o $(B)/sample_emb.o $(B)/embz.o $(B)/edt.o $(B)/band.o $(B)/sheet.o $(B)/ct_augment.o $(B)/scan_augment.o $(B)/spatial_augment.o $(B)/crush.o $(B)/scrollaug.o $(B)/cover.o $(B)/sources.o $(B)/band_onfly.o $(B)/srpair.o $(B)/view.o $(B)/reg.o $(B)/zarr3.o $(B)/zarr2.o $(B)/store.o $(B)/json.o $(B)/z3w.o $(B)/tiff.o $(B)/zipr.o $(B)/hf.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm -lcurl -lzstd -lblosc -lz -lcrypto
-$(B)/test_gpu_input: tests/test_gpu_input.c $(B)/sample.o $(B)/sample_emb.o $(B)/embz.o $(B)/edt.o $(B)/band.o $(B)/sheet.o $(B)/ct_augment.o $(B)/scan_augment.o $(B)/spatial_augment.o $(B)/crush.o $(B)/scrollaug.o $(B)/cover.o $(B)/sources.o $(B)/srpair.o $(B)/view.o $(B)/reg.o $(B)/zarr3.o $(B)/zarr2.o $(B)/store.o $(B)/json.o $(B)/z3w.o $(B)/tiff.o $(B)/zipr.o $(B)/hf.o $(B)/nn.o $(B)/nn_fp8.o
+$(B)/test_gpu_input: tests/test_gpu_input.c $(B)/sample.o $(B)/sample_emb.o $(B)/embz.o $(B)/edt.o $(B)/band.o $(B)/sheet.o $(B)/ct_augment.o $(B)/scan_augment.o $(B)/spatial_augment.o $(B)/crush.o $(B)/scrollaug.o $(B)/cover.o $(B)/sources.o $(B)/band_onfly.o $(B)/srpair.o $(B)/view.o $(B)/reg.o $(B)/zarr3.o $(B)/zarr2.o $(B)/store.o $(B)/json.o $(B)/z3w.o $(B)/tiff.o $(B)/zipr.o $(B)/hf.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm -lcurl -lzstd -lblosc -lz -lcrypto
-$(B)/test_pack_tm: tests/test_pack_tm.c $(B)/sample.o $(B)/sample_emb.o $(B)/embz.o $(B)/edt.o $(B)/band.o $(B)/sheet.o $(B)/ct_augment.o $(B)/scan_augment.o $(B)/spatial_augment.o $(B)/crush.o $(B)/scrollaug.o $(B)/cover.o $(B)/sources.o $(B)/srpair.o $(B)/view.o $(B)/reg.o $(B)/zarr3.o $(B)/zarr2.o $(B)/store.o $(B)/json.o $(B)/z3w.o $(B)/tiff.o $(B)/zipr.o $(B)/hf.o $(B)/nn.o $(B)/nn_fp8.o
+$(B)/test_pack_tm: tests/test_pack_tm.c $(B)/sample.o $(B)/sample_emb.o $(B)/embz.o $(B)/edt.o $(B)/band.o $(B)/sheet.o $(B)/ct_augment.o $(B)/scan_augment.o $(B)/spatial_augment.o $(B)/crush.o $(B)/scrollaug.o $(B)/cover.o $(B)/sources.o $(B)/band_onfly.o $(B)/srpair.o $(B)/view.o $(B)/reg.o $(B)/zarr3.o $(B)/zarr2.o $(B)/store.o $(B)/json.o $(B)/z3w.o $(B)/tiff.o $(B)/zipr.o $(B)/hf.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm -lcurl -lzstd -lblosc -lz -lcrypto
 $(B)/test_gyrec: tests/test_gyrec.c $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
@@ -585,14 +593,14 @@ $(B)/test_lat_conv0: tests/test_lat_conv0.c $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 $(B)/test_w4dev: tests/test_w4dev.c $(B)/band.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
-$(B)/test_rungs: tests/test_rungs.c $(B)/sample.o $(B)/sample_emb.o $(B)/embz.o $(B)/edt.o $(B)/band.o $(B)/sheet.o $(B)/ct_augment.o $(B)/scan_augment.o $(B)/spatial_augment.o $(B)/crush.o $(B)/scrollaug.o $(B)/cover.o $(B)/sources.o $(B)/srpair.o $(B)/view.o $(B)/reg.o $(B)/zarr3.o $(B)/zarr2.o $(B)/store.o $(B)/json.o $(B)/z3w.o $(B)/tiff.o $(B)/zipr.o $(B)/hf.o $(B)/nn.o $(B)/nn_fp8.o
+$(B)/test_rungs: tests/test_rungs.c $(B)/sample.o $(B)/sample_emb.o $(B)/embz.o $(B)/edt.o $(B)/band.o $(B)/sheet.o $(B)/ct_augment.o $(B)/scan_augment.o $(B)/spatial_augment.o $(B)/crush.o $(B)/scrollaug.o $(B)/cover.o $(B)/sources.o $(B)/band_onfly.o $(B)/srpair.o $(B)/view.o $(B)/reg.o $(B)/zarr3.o $(B)/zarr2.o $(B)/store.o $(B)/json.o $(B)/z3w.o $(B)/tiff.o $(B)/zipr.o $(B)/hf.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm -lcurl -lzstd -lblosc -lz -lcrypto
 suite-bins: $(B)/test_rungs
-$(B)/test_unwrap2_sampler: tests/test_unwrap2_sampler.c $(B)/sample.o $(B)/sample_emb.o $(B)/embz.o $(B)/edt.o $(B)/band.o $(B)/sheet.o $(B)/ct_augment.o $(B)/scan_augment.o $(B)/spatial_augment.o $(B)/crush.o $(B)/scrollaug.o $(B)/cover.o $(B)/sources.o $(B)/srpair.o $(B)/view.o $(B)/reg.o $(B)/zarr3.o $(B)/zarr2.o $(B)/store.o $(B)/json.o $(B)/z3w.o $(B)/tiff.o $(B)/zipr.o $(B)/hf.o $(B)/nn.o $(B)/nn_fp8.o
+$(B)/test_unwrap2_sampler: tests/test_unwrap2_sampler.c $(B)/sample.o $(B)/sample_emb.o $(B)/embz.o $(B)/edt.o $(B)/band.o $(B)/sheet.o $(B)/ct_augment.o $(B)/scan_augment.o $(B)/spatial_augment.o $(B)/crush.o $(B)/scrollaug.o $(B)/cover.o $(B)/sources.o $(B)/band_onfly.o $(B)/srpair.o $(B)/view.o $(B)/reg.o $(B)/zarr3.o $(B)/zarr2.o $(B)/store.o $(B)/json.o $(B)/z3w.o $(B)/tiff.o $(B)/zipr.o $(B)/hf.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm -lcurl -lzstd -lblosc -lz -lcrypto
-$(B)/test_phase_interp: tests/test_phase_interp.c $(B)/sample.o $(B)/sample_emb.o $(B)/embz.o $(B)/edt.o $(B)/band.o $(B)/sheet.o $(B)/ct_augment.o $(B)/scan_augment.o $(B)/spatial_augment.o $(B)/crush.o $(B)/scrollaug.o $(B)/cover.o $(B)/sources.o $(B)/srpair.o $(B)/view.o $(B)/reg.o $(B)/zarr3.o $(B)/zarr2.o $(B)/store.o $(B)/json.o $(B)/z3w.o $(B)/tiff.o $(B)/zipr.o $(B)/hf.o $(B)/nn.o $(B)/nn_fp8.o
+$(B)/test_phase_interp: tests/test_phase_interp.c $(B)/sample.o $(B)/sample_emb.o $(B)/embz.o $(B)/edt.o $(B)/band.o $(B)/sheet.o $(B)/ct_augment.o $(B)/scan_augment.o $(B)/spatial_augment.o $(B)/crush.o $(B)/scrollaug.o $(B)/cover.o $(B)/sources.o $(B)/band_onfly.o $(B)/srpair.o $(B)/view.o $(B)/reg.o $(B)/zarr3.o $(B)/zarr2.o $(B)/store.o $(B)/json.o $(B)/z3w.o $(B)/tiff.o $(B)/zipr.o $(B)/hf.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm -lcurl -lzstd -lblosc -lz -lcrypto
-$(B)/bench_read: tests/bench_read.c $(B)/sample.o $(B)/sample_emb.o $(B)/embz.o $(B)/edt.o $(B)/band.o $(B)/sheet.o $(B)/ct_augment.o $(B)/scan_augment.o $(B)/spatial_augment.o $(B)/crush.o $(B)/scrollaug.o $(B)/cover.o $(B)/sources.o $(B)/srpair.o $(B)/view.o $(B)/reg.o $(B)/zarr3.o $(B)/zarr2.o $(B)/store.o $(B)/json.o $(B)/z3w.o $(B)/tiff.o $(B)/zipr.o $(B)/hf.o $(B)/nn.o $(B)/nn_fp8.o
+$(B)/bench_read: tests/bench_read.c $(B)/sample.o $(B)/sample_emb.o $(B)/embz.o $(B)/edt.o $(B)/band.o $(B)/sheet.o $(B)/ct_augment.o $(B)/scan_augment.o $(B)/spatial_augment.o $(B)/crush.o $(B)/scrollaug.o $(B)/cover.o $(B)/sources.o $(B)/band_onfly.o $(B)/srpair.o $(B)/view.o $(B)/reg.o $(B)/zarr3.o $(B)/zarr2.o $(B)/store.o $(B)/json.o $(B)/z3w.o $(B)/tiff.o $(B)/zipr.o $(B)/hf.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm -lcurl -lzstd -lblosc -lz -lcrypto
 $(B)/fwd_nan: tests/fwd_nan.c $(B)/unet.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
@@ -626,6 +634,10 @@ $(B)/test_side: tests/test_side.c $(B)/band.o
 $(B)/test_band_pair: tests/test_band_pair.c src/band.h src/bandgpu.h $(B)/band.o $(B)/nn_band.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(CUDA)/include $< $(B)/band.o $(B)/nn_band.o -o $@ $(LDLIBS) $(CUDALIBS)
 suite-bins: $(B)/test_band_pair
+# the volcomp lossless codes decode on the GPU (the onfly phase's codes) against z3_read, byte for byte
+$(B)/test_lldec: tests/test_lldec.c $(B)/band_onfly.o $(B)/band.o $(B)/edt.o $(B)/nn_band.o $(B)/z3w.o $(B)/zarr3.o $(B)/store.o $(B)/json.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
+suite-bins: $(B)/test_lldec
 
 $(B)/test_scan_augment: tests/test_scan_augment.c src/scan_augment.c src/scan_augment.h $(B)/ct_augment.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_scan_augment.c $(B)/ct_augment.o -o $@ -lm

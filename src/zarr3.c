@@ -48,6 +48,8 @@ struct z3 {
     pthread_mutex_t imu;
     struct ient_slot { char *key; ientry_t *idx; int present; } *itab;
     size_t icap, icount;
+    /* z3_open_derived: values computed from base by derive (z3_read), the chunk map / box tests / shard presence from base */
+    z3 *base; z3_derive_fn derive; void *dctx; void (*dfree)(void *);
 };
 
 /* ---------- metadata ---------- */
@@ -154,8 +156,20 @@ bad:
 z3 *z3_open(store *s, const char *key, const char *cache_dir) { return z3_open_impl(s, key, cache_dir, 0); }
 z3 *z3_open_typed(store *s, const char *key, const char *cache_dir) { return z3_open_impl(s, key, cache_dir, 1); }
 
+z3 *z3_open_derived(z3 *base, int fill, z3_derive_fn derive, void *ctx, void (*ctx_free)(void *)) {
+    if (!base || !derive) return nullptr;
+    z3 *z = calloc(1, sizeof *z); if (!z) return nullptr;
+    z->m = base->m; z->m.fill = fill; z->m.label_binary = 0; z->nc = base->nc; memcpy(z->cgrid, base->cgrid, sizeof z->cgrid);
+    char k[1200]; snprintf(k, sizeof k, "%s#derived", base->key ? base->key : "");
+    z->key = strdup(k); z->base = base; z->derive = derive; z->dctx = ctx; z->dfree = ctx_free;
+    pthread_mutex_init(&z->imu, nullptr);
+    return z;
+}
+z3 *z3_base_of(const z3 *z) { return z ? z->base : nullptr; }
+
 void z3_close(z3 *z) {
     if (!z) return;
+    if (z->derive) { if (z->dfree) z->dfree(z->dctx); z3_close(z->base); free(z->key); pthread_mutex_destroy(&z->imu); free(z); return; }
     free(z->key);
     free(z->cache);
     for (size_t i = 0; i < z->icap; i++) { free(z->itab[i].key); free(z->itab[i].idx); }
@@ -947,6 +961,7 @@ static int work_cmp(const void *a, const void *b) {
 }
 
 int64_t z3_chunk_map(z3 *z, int64_t grid[3], uint8_t **bits) {
+    if (z->derive) return z3_chunk_map(z->base, grid, bits);
     const z3_meta *m = &z->m; *bits = nullptr;
     if (!m->sharded) return FAIL("chunk map: not a sharded array");
     int64_t ns[3];
@@ -971,6 +986,7 @@ int64_t z3_chunk_map(z3 *z, int64_t grid[3], uint8_t **bits) {
     return n;
 }
 int z3_shard_present(z3 *z, int64_t sz, int64_t sy, int64_t sx) {
+    if (z->derive) return z3_shard_present(z->base, sz, sy, sx);
     char skey[1200];
     shard_key(z, sz, sy, sx, skey, sizeof skey);
     if (z->m.sharded) {
@@ -1015,6 +1031,7 @@ static int z3_read_impl(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *
 /* whether any stored chunk intersects the box o + n (sharded arrays: from the shard indices, no chunk read): 1 yes, 0 none (a read
    would be all fill), -1 error; unsharded arrays: 1 */
 int z3_box_any(z3 *z, const int64_t o[3], const int64_t n[3]) {
+    if (z->derive) return z3_box_any(z->base, o, n);
     const z3_meta *m = &z->m;
     if (!m->sharded) return 1;
     int64_t lo[3], hi[3], s0[3], s1[3];
@@ -1047,6 +1064,7 @@ int z3_read(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nth
 int z3_read_sub(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads, uint32_t submask) { return z3_read_impl(z, o, n, out, nthreads, submask, nullptr, nullptr, 0); }
 static int z3_read_sub_dev_impl(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads, uint32_t submask, uint8_t *dchunk, uint32_t *dev_mask, int lean) {
     *dev_mask = 0;
+    if (z->derive) return FAIL("%s: a derived array has no device reads", z->key);
     const z3_meta *m = &z->m;   /* one whole, aligned 128^3 uint8 chunk; the shared cache off (it stores host bytes) */
     const int one = dchunk && m->chunk[0] == 128 && m->chunk[1] == 128 && m->chunk[2] == 128 && m->esize == 1 && n[0] == 128 && n[1] == 128 && n[2] == 128 &&
                     !(o[0] % 128) && !(o[1] % 128) && !(o[2] % 128) && !zshm_on() && gpudec_enabled();
@@ -1066,6 +1084,7 @@ static void fill_part(const z3_meta *m, uint8_t *out, const int64_t o[3], const 
         memset(out + ((size_t)(zz - o[0]) * n[1] + (size_t)(yy - o[1])) * n[2] + (size_t)(lo[2] - o[2]), m->fill, (size_t)(hi[2] - lo[2]));
 }
 static int z3_read_impl(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads, uint32_t submask, uint8_t *dsink, uint32_t *dmask, int lean) {
+    if (z->derive) { if (submask || dsink || lean) return FAIL("%s: a derived array has no sub-chunk / device reads", z->key); return z->derive(z->dctx, z->base, o, n, out, nthreads); }
     const z3_meta *m = &z->m;
     const size_t nv = (size_t)n[0] * n[1] * n[2];
     /* a box inside the array whose chunks are all present (sharded) is overwritten entirely by the chunk copies: no fill pass (the
