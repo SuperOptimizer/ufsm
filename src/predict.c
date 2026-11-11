@@ -875,6 +875,7 @@ int cmd_predict(int argc, char **argv) {
         if (degrade || opt(argc, argv, "--aux", nullptr) || !strcmp(opt(argc, argv, "--split", "0"), "z") || atoi(opt(argc, argv, "--tta", "1")) > 1) {
             fprintf(stderr, "predict: --latents: no --aug-*, --aux, --split or --tta (they read the CT itself)\n"); return 2; }   /* (--fit-ct: the rebuilt CT) */
     }
+    const int fstem_off = atoi(opt(argc, argv, "--fstem-off", "0"));   /* --fstem-off 1: a train --fstem checkpoint without its fine stem (the ablation; the trunk's fast paths stay off) */
     int rv2c = -1;   /* train --rv 2 checkpoints: the recto / verso pair on its own channels (rv2c, rv2c + 1), interpolated (never the guided / sub-cell pair) */
     { char *h = checkpoint_header_line(ckpt); const int isrv = h && strstr(h, "\"rv\":{\"version\":1"); const char *r2 = h ? strstr(h, "\"rv\":{\"version\":2,\"recto\":") : nullptr;
       if (r2) rv2c = atoi(r2 + strlen("\"rv\":{\"version\":2,\"recto\":"));
@@ -1826,7 +1827,7 @@ int cmd_predict(int argc, char **argv) {
                 const float *l2 = unet_forward_x(u, x2, xn, 0, h16); nn_ptick("trunk forward");
                 /* train --fstem: the fine voxel stem on the CT channel (xd channel 0) into the planes the path holds: output o of the stem's list
                    (every non-normal / density head output, in channel order) to plane MAP(c) of its channel c (-1: not held) */
-#define PRED_FSTEM(z0_, nz_, planes, ns__, MAP) do { int fm_[16], k_ = 0; for (int c = 0; c < cfg.cout && k_ < cfg.fstem_out; c++) if (c < 2 || c >= 9) { fm_[k_++] = (MAP); } \
+#define PRED_FSTEM(z0_, nz_, planes, ns__, MAP) do { if (fstem_off) break; int fm_[16], k_ = 0; for (int c = 0; c < cfg.cout && k_ < cfg.fstem_out; c++) if (c < 2 || c >= 9) { fm_[k_++] = (MAP); } \
                     if (!xd || !h16 || nn_fstem_fwd(xd, W, W, W, (z0_), (nz_), unet_live_params(u) + unet_fstem_off(u), cfg.fstem, cfg.fstem_out, fm_, (planes), (ns__))) { fprintf(stderr, "predict: the fine stem needs the fp16 input window\n"); return 2; } } while (0)
                 static int cq = -1; if (cq < 0) cq = getenv("UFSM_PRED_CELL_Q") != nullptr;
                 if (cq && half == 3) cellq_apply(l2, unet_logits_h16(u), cfg.cout, Wz / 4, W / 4, W / 4, hz / 4, halo / 4);
