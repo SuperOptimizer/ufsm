@@ -740,7 +740,7 @@ static int cmd_phase_onfly(int argc, char **argv) {
         fflush(stdout); wi++; k++;
     }
     phase_onfly_stats st; phase_onfly_get_stats(&st);
-    printf("phase-onfly: %lld windows, %.0f ms per window, tile voxels / output %.2f, %zu differing voxels%s\n", (long long)wi, 1e3 * tsum / (wi ? wi : 1), (double)st.vox_tile / (st.vox_out ? st.vox_out : 1), bad, ref ? (bad ? ": FAIL" : ": byte-identical") : "");
+    printf("phase-onfly: %lld windows, %.0f ms per window, tile voxels / output %.2f, %llu of %llu tiles decoded on the GPU, %zu differing voxels%s\n", (long long)wi, 1e3 * tsum / (wi ? wi : 1), (double)st.vox_tile / (st.vox_out ? st.vox_out : 1), (unsigned long long)st.gpu_tiles, (unsigned long long)st.tiles, bad, ref ? (bad ? ": FAIL" : ": byte-identical") : "");
     free(a); free(b); free(bits); z3_close(ph); z3_close(ref);
     return bad ? 1 : 0;
 }

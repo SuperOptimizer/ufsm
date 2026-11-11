@@ -3899,6 +3899,12 @@ int cmd_train(int argc, char **argv) {
                                     (a[0] + a[6] + a[12]) / 3, (a[1] + a[7] + a[13]) / 3, (a[18] + a[24] + a[30]) / 3, (a[19] + a[25] + a[31]) / 3); }
             fprintf(stderr, "step %6d lr %.2e loss %.4f bce %.4f dice %.4f%s gn %.2f %.2f samp/s %.1f Mvox/s (wait %.0f%%)%s%s\n", step, lr, acc_loss / nacc, acc_bce / nacc, acc_dice / nacc, affs, acc_g / nacc,
                     (double)nacc * B * nl / dt, (double)nacc * B * nl * g_Pz * P * P / 1e6 / dt, 100 * wait / dt, vl >= 0 ? " val " : "", vl >= 0 ? vstr : "");
+            {   /* the on-the-fly phase since the last log line: reads, tiles (on the GPU), the pair rule's seconds per read (summed over threads) */
+                static phase_onfly_stats o0; phase_onfly_stats o1; phase_onfly_get_stats(&o1);
+                if (o1.reads > o0.reads) fprintf(stderr, "  onfly phase: %llu reads, %llu tiles (%llu GPU-decoded), %.0f ms per read in the pair rule, %.0f ms in CPU codes reads\n",
+                                                 (unsigned long long)(o1.reads - o0.reads), (unsigned long long)(o1.tiles - o0.tiles), (unsigned long long)(o1.gpu_tiles - o0.gpu_tiles),
+                                                 1e3 * (o1.s_pair - o0.s_pair) / (double)(o1.reads - o0.reads), 1e3 * (o1.s_read - o0.s_read) / (double)(o1.reads - o0.reads));
+                o0 = o1; }
             { static int memlog = -1; if (memlog < 0) memlog = ufsm_env_on("UFSM_SYNC_CHECK");   /* device memory free per GPU at each log line (a leak) */
               if (memlog) { fprintf(stderr, "  device memory free:"); for (int g = 0; g < ng; g++) { nn_init(G[g].dev); fprintf(stderr, " GPU %d %.1f MB", G[g].dev, nn_mem_free() / 1e6); } fprintf(stderr, "\n"); nn_init(G[0].dev); } }
             { static int hm = -1, hmn = 0; if (hm < 0) hm = ufsm_env_on("UFSM_HOSTMEM");   /* host memory by owner at each log line (sampler_hostmem) */
