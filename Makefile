@@ -65,6 +65,7 @@ SRC += src/surf.c src/stitch.c src/coreline.c src/coreline_check.c src/fit_ct.c 
 SRC += src/fblend.c
 SRC += src/deform.c src/vwt_aug.c src/zcache.c
 SRC += src/inkblend.c
+SRC += src/ftaxis.c
 SRC += src/inkseam.c
 SRC += src/render.c src/imgops.c src/jpegpar.c src/inkcompare.c
 SRC += src/repack.c
@@ -139,6 +140,8 @@ $(B)/nn.o: $(NNOBJ)
 $(B)/nn_gpudec.o: NVFLAGS = -O3 $(NVARCH) -DUFSM_ARCH=$(ARCH) -fmad=false -Xcompiler -fno-threadsafe-statics -Isrc
 # count-field on the GPU mirrors the CPU's rounding (src/nn_cf.cu): IEEE division / sqrt, no FMA contraction, no fast math
 $(B)/nn_cf.o: NVFLAGS = -O3 $(NVARCH) -DUFSM_ARCH=$(ARCH) -fmad=false -Xcompiler -fno-threadsafe-statics -Isrc
+# fiber-trace's axis on the GPU (src/nn_ftrace.cu) is byte-identical to src/ftaxis.c: IEEE division / sqrt, no FMA contraction, no fast math
+$(B)/nn_ftrace.o: NVFLAGS = -O3 $(NVARCH) -DUFSM_ARCH=$(ARCH) -fmad=false -Xcompiler -fno-threadsafe-statics -Isrc
 # FP8 / FP4 block-scaled mma (kind::mxf8f6f4 / kind::mxf4) needs the arch-specific sm_120a target
 # The low-precision kernels are split into one translation unit per kernel family (src/lp_*.cu, shared helpers in
 # src/lp_common.cuh) so make -j compiles them in parallel; $(B)/nn_fp8.o is their relocatable link, so every target
@@ -480,12 +483,15 @@ suite-bins: $(B)/test_surflabels
 $(B)/test_fiberjudge: tests/test_fiberjudge.c $(B)/fiberjudge.o $(B)/wrapdump.o $(B)/fitphase.o $(B)/afv.o $(B)/fitjoin.o $(B)/phasegate.o $(B)/fit.o $(B)/fit_emb.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/coreline.o $(B)/tfx.o $(B)/surfcomp.o $(B)/tiffw.o $(SAMPLE_TEST_OBJ) $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 suite-bins: $(B)/test_fiberjudge
-$(B)/test_fibertrace: tests/test_fibertrace.c $(B)/fibertrace.o $(B)/afv.o $(B)/zarr2.o $(B)/zarr3.o $(B)/store.o $(B)/json.o
-	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
+$(B)/test_fibertrace: tests/test_fibertrace.c $(B)/fibertrace.o $(B)/ftaxis.o $(B)/nn_ftrace.o $(B)/afv.o $(B)/zarr2.o $(B)/zarr3.o $(B)/store.o $(B)/json.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 suite-bins: $(B)/test_fibertrace
 $(B)/test_fiberraster: tests/test_fiberraster.c $(B)/fiberraster.o $(B)/afv.o $(B)/z3w.o $(B)/zarr3.o $(B)/store.o $(B)/json.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
 suite-bins: $(B)/test_fiberraster
+$(B)/test_ftrace_gpu: tests/test_ftrace_gpu.c $(B)/ftaxis.o $(B)/nn_ftrace.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(CUDA)/include $^ -o $@ -lm $(CUDALIBS)
+suite-bins: $(B)/test_ftrace_gpu
 $(B)/test_fiber_link: tests/test_fiber_link.c $(B)/fiberlink.o $(B)/afv.o $(B)/json.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
 suite-bins: $(B)/test_fiber_link

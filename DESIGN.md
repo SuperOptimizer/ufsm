@@ -6,6 +6,29 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## fiber-trace on the GPU: the per-voxel axis, byte-identical (2026-11-11, branch gtrace-20261111)
+
+A `--mask` trace is almost all per-voxel work: on the Paris 4 HOLD box (512 x 576 x 768 at 9.6 um, fibhv-a step-10000 H mask) the CPU
+run takes 128 s, and perf puts 97 % of it in the axis (the presence's gradient structure tensor over 5^3 voxels and two 40-step power
+iterations per voxel, `ft_ridge_axis`); the streamline integration with its sequential "earlier seed wins" occupancy is ~3 %. So only the
+axis moved to the GPU; the integration stays on the CPU and its seed order is unchanged, and no parallel-integration approximation of
+the occupancy rule is needed.
+
+- `src/ftaxis.c` holds the CPU axis (moved out of fibertrace.c unchanged, so tests link it alone); `src/nn_ftrace.cu` the GPU copy, one
+  thread per (y, x) column marching z in 32-plane launches, the in-plane (2R+1)^2 sums per plane in a ring and a sliding z sum.
+- Byte-identical, not just close: the gradient products and their sums are exact integers on both sides (the CPU's float partial sums
+  stay below 2^24 for --st-r <= 6; the GPU path refuses larger R), and the double power iterations run the CPU's operations in its order
+  (nn_ftrace.o: -fmad=false, no fast math, IEEE division / sqrt; gcc -std=c23 does not contract).
+- `ufsm fiber-trace ... --gpu G` (default -1 = CPU); on any CUDA failure it says so and runs the CPU axis.
+- `test_ftrace_gpu` (gpu, fast tier): random tubes in noise on an odd-sized box (37 x 45 x 53, every face clamp), a flat region,
+  --st-r 1 / 2 / 3 x prior none / H / V: 9 of 9 byte-identical.
+- HOLD box, desk GPU 1 (shared with a training run): H 128 s CPU -> 6.6 s with --gpu (19x), V 6.4 s; the H and V .fib files are
+  byte-identical to the CPU's (cmp), so the judge numbers are those of the CPU traces (H 0.956 / V 0.914 at 0.6 mm, DESIGN 2026-11-10).
+  What remains: the sequential tracing (ft_tensor / ft_axis ~35 % of the 6.6 s), the zarr read, CUDA start and the copies. A 512^3
+  tile (134 Mvox, 0.59 of HOLD) should take ~4 s instead of ~4 min per pod core.
+- Not ported: `--blur` (CPU, off by default), `--dyad` (CPU, already a cheap per-voxel decode), the published-prediction path (no
+  derived axis). A GPU integration would only pay once the axis is no longer the cost, i.e. not now.
+
 ## Fibre retrain: ring labels, a direction head, the smoothed-axis check (2026-11-11, branch fibers-20261110)
 
 Follow-up of the section below (our masks mark fibre layers, not tubes).
