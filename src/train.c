@@ -3704,7 +3704,9 @@ int cmd_train(int argc, char **argv) {
             if (g_verso) snprintf(affs, 64, " verso bce %.4f dice %.4f", acc_vbce / nacc, acc_vdice / nacc);
             if (g_side) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " %s bce %.4f", g_rv == 1 ? "rv" : g_side == 2 ? "phase" : "side", acc_side / nacc); }
             if (g_rv == 2) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " rv bce %.4f", acc_rv / nacc); }
-            if (g_uw) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " uw phase %.3g normal %.3g wind4 %.3g%s%.3g%s%.3g", g_hmul[SH_PHASE], g_hmul[SH_NORMAL], g_hmul[SH_WIND4], g_rv ? " rv " : "", g_rv ? g_hmul[SH_RV] : 0.0, g_ink2 ? " ink " : "", g_ink2 ? g_hmul[SH_INK] : 0.0); }
+            if (g_uw) { size_t na = strlen(affs); na += (size_t)snprintf(affs + na, sizeof affs - na, " uw phase %.3g normal %.3g wind4 %.3g", g_hmul[SH_PHASE], g_hmul[SH_NORMAL], g_hmul[SH_WIND4]);
+                        if (g_rv && na < sizeof affs) na += (size_t)snprintf(affs + na, sizeof affs - na, " rv %.3g", g_hmul[SH_RV]);
+                        if (g_ink2 && na < sizeof affs) snprintf(affs + na, sizeof affs - na, " ink %.3g", g_hmul[SH_INK]); }
             if (g_unwrap2) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " normal bce %.4f wind4 bce %.4f (worst gauge %.4f) acc %.3f", acc_norm / nacc, acc_w4 / nacc, acc_w4w / nacc, acc_w4a / nacc); if (g_pg_lambda > 0) { na = strlen(affs); snprintf(affs + na, sizeof affs - na, " pgrad %.4f", acc_pg / nacc); } }
             if (g_fibn) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " fibn %.4f (%.0f%% of windows, %.0f vox)", acc_fibn > 0 ? acc_fib / acc_fibn : 0.0, 100.0 * acc_fibn / nacc, acc_fibn > 0 ? acc_fibv / acc_fibn : 0.0); }
             if (g_ink2) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " ink bce %.4f (%.0f%% of windows)", acc_inkn > 0 ? acc_ink / acc_inkn : 0.0, 100.0 * acc_inkn / nacc); }
