@@ -30,6 +30,15 @@ void nn_ssl_mask(void *x, int es, int Pz, int P, int bv, float ratio, uint64_t s
 void nn_ssl_targets(const float *y, int C, int cd, int ch, int cw, int cv, int bv, float ratio, uint64_t seed, double *mu, int8_t *t);
 /* N distinct cell indices idx[k] = (off + k stride) mod S (stride coprime to S: the caller's ssl_stride) */
 void nn_ssl_idx(int *idx, int N, size_t S, size_t off, size_t stride);
+/* --ssl-ink (gated mean-teacher ink consistency on the latent cells): the teacher's coarse head logits of a chunk lg [nch][n] (fp16, cells
+   [off, off + n) of the cell grid cd x ch x cw, cells of cv voxels) -> t[off + i] = round(254 p) with p = sigmoid(ink logit) where the cell is
+   NOT in a masked block (the student sees it), the teacher is confident (|p - 0.5| >= conf) and, with rv_ch >= 0, on papyrus (max of the
+   rv pair's sigmoids >= 0.5); else 255. cnt (device, 2 x u64) += the gated cells, of which the ink ones (p >= 0.5) */
+void nn_ssl_ink_targets(const void *lg, int ink_ch, int rv_ch, size_t n, size_t off, int cd, int ch, int cw, int cv, int bv, float ratio, uint64_t seed,
+                        float conf, uint8_t *t, unsigned long long *cnt);
+/* the student's soft BCE against them: lg [nch][n] its chunk logits (fp16), g [nch][n] (fp16, zeroed by the caller): channel ink_ch
+   gets scale x (sigmoid(z) - t / 254) at targeted cells; sums (device, 2 doubles) += sum BCE, cells */
+void nn_ssl_ink_grad(const void *lg, int ink_ch, size_t n, size_t off, const uint8_t *t, float scale, void *g, double *sums);
 #ifdef __cplusplus
 }
 #endif

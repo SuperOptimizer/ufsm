@@ -214,6 +214,13 @@ int main(int argc, char **argv) {
         /* (d) a run without the side head resumes with --ssl (the head's block inserted fresh, the rest and the step the checkpoint's) */
         CHECK(!sh("cp -r %s/lat_plain %s/lp2 && UFSM_GRAD_MX8=1 %s train %s/fx/sources-ssl.json --out %s/lp2 --resume %s/lp2/last.ckpt %s %s --ssl-share 0.5 --steps 8 > %s/lp2.log 2>&1"
                   " && grep -q 'has no side head' %s/lp2.log && grep -q 'step      8 ' %s/lp2.log && head -1 %s/lp2/last.ckpt | grep -q '\"emb_lev\":1,\"emb_ch\":8'", d, d, U, d, d, d, cm, sf, d, d, d, d), "ssl: resume of a run without the side head (%s/lp2.log)", d);
+        /* (e) --ssl-ink (latent, ink head): the ink-ssl term on the unlabelled windows is finite and covers the unmasked cells (conf 0, no papyrus gate) */
+        CHECK(!sh("sed 's|}}}}]}|}}}}, {\"name\": \"wind-fixture-u\", \"root\": \"%s/fx\", \"ct\": \"ct\", \"um\": 9.6, \"axis\": \"%s/fx/axis.json\", \"weight\": 1, \"ct_only\": 1}]}|' %s/fx/sources-ink.json > %s/fx/sources-ink-ssl.json"
+                  " && grep -q ct_only %s/fx/sources-ink-ssl.json", d, d, d, d, d), "ink sources with an unlabelled copy (%s/fx/sources-ink.json's ending)", d);
+        CHECK(!sh("UFSM_GRAD_MX8=1 %s train %s/fx/sources-ink-ssl.json --out %s/sslink %s %s --ink-head 1 --ssl-share 0.5 --ssl-ink 1 --ssl-ink-conf 0 --ssl-ink-pap 0 --steps 8 > %s/sslink.log 2>&1", U, d, d, cm, sf, d), "ssl-ink run (%s/sslink.log)", d);
+        { snprintf(p, sizeof p, "%s/sslink.log", d); char *li = slurp(p); int nk = 0, nbad = 0;
+          for (const char *q = li; q && (q = strstr(q, " ink-ssl ")); q++) { const double v = atof(q + 9); const char *c = strchr(q, '('); const double sh_ = c ? atof(c + 1) : 0; nk++; nbad += !(isfinite(v) && v > 0 && sh_ > 30 && sh_ < 90); }
+          CHECK(nk >= 2 && !nbad, "ssl-ink: %d step lines with the term, %d with a non-finite loss or a cell share outside 30..90%%", nk, nbad); free(li); }
         /* (c) unlabelled windows skip the head slabs: the same losses as with the slabs run on zero masks (UFSM_SSL_SLABS=1) */
         CHECK(!sh("UFSM_SSL_SLABS=1 UFSM_GRAD_MX8=1 %s train %s/fx/sources-ssl.json --out %s/sslb %s %s --ssl-share 0.5 --steps 8 > %s/sslb.log 2>&1", U, d, d, cm, sf, d), "ssl run with slabs (%s/sslb.log)", d);
         snprintf(p, sizeof p, "%s/ssl.log", d); l0 = slurp(p); snprintf(p, sizeof p, "%s/sslb.log", d); l1 = slurp(p);

@@ -1,6 +1,7 @@
 /* train --ssl (src/ssl.h): the student's block mask on the CT channel, the teacher's int8 targets, the variance-hinge point indices.
    Launched on the default stream of the current device (the nn layer's compute stream). */
 #include "ssl.h"
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <math.h>
 #include <stdio.h>
@@ -63,5 +64,49 @@ __global__ void k_ssl_idx(int *idx, int N, size_t S, size_t off, size_t stride) 
 }
 extern "C" void nn_ssl_idx(int *idx, int N, size_t S, size_t off, size_t stride) {
     if (N > 0) k_ssl_idx<<<nb_ssl(N, 256), 256>>>(idx, N, S, off % S, stride % S);
+    SSL_CK();
+}
+
+__device__ __forceinline__ float ssl_sig(float z) { return 1.f / (1.f + __expf(-z)); }
+__global__ void k_ssl_ink_t(const __half *lg, int ink_ch, int rv_ch, size_t n, size_t off, int cd, int ch, int cw, int cv, int bv, float ratio, uint64_t seed,
+                            float conf, uint8_t *t, unsigned long long *cnt) {
+    __shared__ unsigned long long sh[2];
+    if (threadIdx.x < 2) sh[threadIdx.x] = 0; __syncthreads();
+    const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i < n) {
+        const size_t s = off + i; const int x = (int)(s % cw), y = (int)((s / cw) % ch), z = (int)(s / ((size_t)cw * ch));
+        const float p = ssl_sig(__half2float(lg[(size_t)ink_ch * n + i]));
+        int on = !ssl_blk_masked(seed, z * cv / bv, y * cv / bv, x * cv / bv, ratio) && fabsf(p - 0.5f) >= conf;
+        if (on && rv_ch >= 0) on = fmaxf(ssl_sig(__half2float(lg[(size_t)rv_ch * n + i])), ssl_sig(__half2float(lg[(size_t)(rv_ch + 1) * n + i]))) >= 0.5f;
+        t[s] = on ? (uint8_t)lrintf(254.f * p) : 255;
+        if (on) { atomicAdd(&sh[0], 1ull); if (p >= 0.5f) atomicAdd(&sh[1], 1ull); }
+    }
+    __syncthreads();
+    if (threadIdx.x < 2 && sh[threadIdx.x]) atomicAdd(&cnt[threadIdx.x], sh[threadIdx.x]);
+}
+extern "C" void nn_ssl_ink_targets(const void *lg, int ink_ch, int rv_ch, size_t n, size_t off, int cd, int ch, int cw, int cv, int bv, float ratio, uint64_t seed,
+                                   float conf, uint8_t *t, unsigned long long *cnt) {
+    if (bv % cv) { fprintf(stderr, "nn_ssl_ink_targets: the mask block (%d voxels) is not a multiple of the cell (%d)\n", bv, cv); abort(); }
+    if (n) k_ssl_ink_t<<<nb_ssl((long long)n, 256), 256>>>((const __half *)lg, ink_ch, rv_ch, n, off, cd, ch, cw, cv, bv, ratio, seed, conf, t, cnt);
+    SSL_CK();
+}
+__global__ void k_ssl_ink_g(const __half *lg, int ink_ch, size_t n, size_t off, const uint8_t *t, float scale, __half *g, double *sums) {
+    __shared__ float sh[2];
+    if (threadIdx.x < 2) sh[threadIdx.x] = 0.f; __syncthreads();
+    const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i < n) {
+        const uint8_t q = t[off + i]; float gv = 0.f;
+        if (q != 255) {
+            const float z = __half2float(lg[(size_t)ink_ch * n + i]), y = q / 254.f, p = ssl_sig(z);
+            gv = scale * (p - y);
+            atomicAdd(&sh[0], fmaxf(z, 0.f) - z * y + log1pf(__expf(-fabsf(z)))); atomicAdd(&sh[1], 1.f);
+        }
+        g[(size_t)ink_ch * n + i] = __float2half(gv);
+    }
+    __syncthreads();
+    if (threadIdx.x < 2 && sh[threadIdx.x] != 0.f) atomicAdd(&sums[threadIdx.x], (double)sh[threadIdx.x]);
+}
+extern "C" void nn_ssl_ink_grad(const void *lg, int ink_ch, size_t n, size_t off, const uint8_t *t, float scale, void *g, double *sums) {
+    if (n) k_ssl_ink_g<<<nb_ssl((long long)n, 256), 256>>>((const __half *)lg, ink_ch, n, off, t, scale, (__half *)g, sums);
     SSL_CK();
 }

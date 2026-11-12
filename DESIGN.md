@@ -86,6 +86,18 @@ down, so the numbers below come from commit messages only:
     without --ssl, mode 4 (lean 2) 11.43 GB; with --ssl 16 --ssl-share 0.25 (35 unlabelled sources = 25.0 % of the weight), the same
     mode, 11.78 GB. The +0.35 GB is network +0.13 (the side head's outputs and parameters in the dry build) + task +0.20 (targets,
     gradient, hinge points, margin) + workspace +0.01. 2.2 GB stay free on a 14 GB budget.
+- `--ssl-ink W [--ssl-ink-conf C (0.3) --ssl-ink-pap 0|1 (1)]` (stage 2, written 11-12 CPU-side, GPU tests pending):
+  - The EMA teacher's coarse head runs per chunk of cell planes (`unet_head_fwd_z` on its live dec[0], streamed latent head only).
+    Its ink channel becomes per-cell targets round(254 p) at the cells the student sees (not in a masked block), where the teacher
+    is confident (|p - 0.5| >= C) and, with --rv 2, on its papyrus (max of the rv pair's sigmoids >= 0.5); 255 = none
+    (`nn_ssl_ink_targets`).
+  - In the head-slab skip of an unlabelled window, the student's own coarse ink logits (the same chunks) give the soft-BCE
+    gradient W x gs / N (sigmoid(z) - p_t) on the ink channel of the head's 16-bit input planes (`nn_ssl_ink_grad`, N = the gated
+    cells), and the other channels stay zero.
+  - Cell level only: no full-resolution slabs, and the fine stem's ink part is absent on both sides.
+  - Logged as `ink-ssl L (gated % of the cells, ink % of the gated)`.
+  - test_ssl (5): targets and gradient against the host. test_heads (8e): a fixture run with the ink head.
+  - Not with UFSM_SSL_SLABS=1 (the term rides on the skip path).
 - Holdouts: inkB added the 10 extra crops to holdouts-ink.json ("inkeval-ho", 98 boxes), on the 0500P2 2.215 um and 0841 2.403 um
   scans. Those two volumes reject 5 / 6 boxes. `EXCLVOL` leaves out 0841's 9.366 um scan (the boxes are not mapped into it) and
   0500P2's 9.362 um scan (a labelled source already), so 35 unlabelled volumes remain.

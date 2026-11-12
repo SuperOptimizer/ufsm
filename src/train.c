@@ -134,6 +134,7 @@ typedef struct {
     void *x2, *glh, *lrt; float *lgf;  /* --half-res: the network's input and logit gradient, the intermediate grid (div 4), the full-resolution fp32 logits */
     uint8_t *ds_t[UNET_MAXLEV], *ds_m[UNET_MAXLEV]; float *ds_gl[UNET_MAXLEV], *ds_scr[UNET_MAXLEV], ds_out[UNET_MAXLEV][2 * 8 + 2]; double ds_loss; int ds_fresh;   /* --deep-sup (fresh: the last batch computed them) */
     int8_t *embb[2], *embt; float *embg; double *embds, embh[2], emb_loss, emb_cells; int emb_fresh;
+    uint8_t *sslit; unsigned long long *sslic, sslich[2]; double *sslis, sslish[2], ssl_ink_loss; size_t ssl_ink_n;   /* --ssl-ink: the teacher's per-cell ink targets (255 none), gated / ink counts, the student's BCE sums */
     int8_t *sslt; float *sslg, *ssle, *sslnrm, *sslge, *sslvo, sslvh[2]; double *sslds, *sslmu, sslh[2], ssl_loss, ssl_cells; int *sslidx, ssl_win, ssl_fresh; uint64_t ssl_rs, ssl_seed;   /* --ssl: the teacher's int8 targets, the side head's fp32 gradient, the variance hinge's points (unit rows, norms, row gradient, out[0] loss / out[1] std), loss sums, channel means; whether this window is an unlabelled one, whether its terms ran; the mask generator */   /* --distill: feature targets (double-buffered), head gradient, loss sums (sum 1 - cos, cells) */
     uint8_t *rlow; void *rscr; size_t rscr_b; double *rst, rst_h[RP_NST]; float *rrd; restore_recipe rcp;   /* task restore: degraded input (uint8), degradation scratch,
                                                                                       loss sums (device / last fetched), the recipe of the next forward */
@@ -281,6 +282,7 @@ static int g_hs_z;         /* its planes per slab */
 static int g_ds; static float g_ds_w = 0.5f, g_ds_frac = 1.f; static int g_ds_anneal = 1;   /* --deep-sup K: decoder levels 1..K, weight w^j x frac */
 static int g_distill, g_distill_lev = 3, g_distill_div; static float g_distill_w = 1.f; static float g_distill_pap;   /* --distill-papyrus F: targets only on head cells >= F papyrus */ static size_t g_distill_n;   /* --distill C: a C-channel 1^3 head on decoder level --distill-level
                                                                                                     (cells of g_distill_div^3 window voxels; g_distill_n int8 targets per batch), cosine loss x --distill-weight */
+static float g_ssl_ink, g_ssl_ink_conf = 0.3f; static int g_ssl_ink_pap = 1;   /* --ssl-ink W [--ssl-ink-conf C --ssl-ink-pap 0|1]: gated mean-teacher ink consistency on the unlabelled windows' latent cells */
 static int g_ssl, g_ssl_lev = 1, g_ssl_bv = 16, g_ssl_npts = 65536; static float g_ssl_w = 0.5f, g_ssl_mask = 0.4f, g_ssl_var = 1.f, g_ssl_gamma, g_ssl_jit = 1.f; static size_t g_ssl_S;   /* --ssl D: masked self-distillation on "ct_only" windows (src/ssl.h): a D-channel side head on decoder level --ssl-level, cells of g_ssl_S per window */
 static float g_count_lambda; static int g_count_K = 1024, g_count_L = 64; static int g_cnt_ns; static float g_cnt_edges[8];   /* --count-strata */   /* --count-lambda / -segments / -length: the count loss (nn_count_loss) */
 static float g_pg_lambda, g_pg_dist[4] = {2.f}; static int g_pg_nd = 1, g_pg_angle, g_pg_mask;   /* --pgrad-lambda / --pgrad-dist (D[,D...], up to 4): the phase wavenumber loss (nn_pgrad_slab; head slabs only) */
@@ -1017,10 +1019,15 @@ static void head_slab_pass(gpu_state *d, int pass) {
     const int ssl_skip = g_lat && d->ssl_win && !getenv("UFSM_SSL_SLABS");   /* --ssl, an unlabelled window: no supervised term, so no slabs (the losses
                                                                                finalise from zero sums; the coarse gradient stays zero; the streamed head's
                                                                                backward gets zero planes). UFSM_SSL_SLABS=1: the slabs as on a labelled window */
-    if (ssl_skip && pass && g_lat_hs) {
+    if (ssl_skip && pass && g_lat_hs) {   /* zero head-input planes, or with --ssl-ink the student's soft BCE against the teacher's cells on the ink channel */
         const size_t pl = (size_t)(H / 4) * (W / 4); const int Dc = D / 4, step = Z / 4 > 0 ? Z / 4 : 1;
-        nn_zero(d->latgc, (size_t)LNC * step * pl * 2);
-        for (int f0 = 0; f0 < Dc; f0 += step) { const int f1 = f0 + step < Dc ? f0 + step : Dc;
+        const int ink = g_ssl_ink > 0 && d->ssl_ink_n > 0 && d->sslit;
+        const float gs = nn_get_loss_grad_h16() ? nn_get_grad_scale() : 1.f, sc = ink ? g_ssl_ink * gs / (float)d->ssl_ink_n : 0.f;
+        size_t zn = 0;   /* (the chunk size the zeroed planes were laid out for: [LNC][n]) */
+        for (int f0 = 0; f0 < Dc; f0 += step) { const int f1 = f0 + step < Dc ? f0 + step : Dc; const size_t n = (size_t)(f1 - f0) * pl;
+            if (n != zn) { nn_zero(d->latgc, (size_t)LNC * n * 2); zn = n; }
+            if (ink) { if (unet_head_fwd_z(d->u, f0, f1, d->lgc)) { fprintf(stderr, "ssl ink: the student's head is not covered per chunk\n"); abort(); }
+                       nn_ssl_ink_grad(d->lgc, g_ink2_ch, n, (size_t)f0 * pl, d->sslit, sc, d->latgc, d->sslis); }
             if (unet_head_bwd_z(d->u, f0, f1, d->latgc, f0 == 0)) { fprintf(stderr, "ssl: the latent head backward is not covered per slab\n"); abort(); } }
         nn_ptick("trunk backward");
     }
@@ -1508,6 +1515,18 @@ static void ssl_teacher(gpu_state *d, shape5 ls, int P) {
     shape5 se; const float *ye = unet_emb_logits(d->u, &se);
     if (!ye || (size_t)se.d * se.h * se.w != g_ssl_S || se.c != g_ssl) { fprintf(stderr, "ssl: no side head outputs of %zu cells after the teacher forward\n", g_ssl_S); abort(); }
     nn_ssl_targets(ye, se.c, se.d, se.h, se.w, 4 << g_ssl_lev, g_ssl_bv, g_ssl_mask, d->ssl_seed, d->sslmu, d->sslt);
+    d->ssl_ink_n = 0;
+    if (g_ssl_ink > 0) {   /* --ssl-ink: the teacher's coarse head on the cell grid, chunk by chunk (its dec[0] output is live), into per-cell ink targets */
+        if (!g_lat_hs || !d->lgc) { fprintf(stderr, "--ssl-ink: the streamed latent head (UFSM_LAT_HEAD_STREAM)\n"); abort(); }
+        const int Dc = g_Pz / 4, Hc = P / 4, st = g_hs_z / 4 > 0 ? g_hs_z / 4 : 1; const size_t pl = (size_t)Hc * Hc;
+        const int rvc = g_ssl_ink_pap && g_rv == 2 ? g_rv_ch : -1;
+        nn_zero(d->sslic, 2 * sizeof(unsigned long long)); nn_zero(d->sslis, 2 * sizeof(double));
+        for (int f0 = 0; f0 < Dc; f0 += st) { const int f1 = f0 + st < Dc ? f0 + st : Dc;
+            if (unet_head_fwd_z(d->u, f0, f1, d->lgc)) { fprintf(stderr, "--ssl-ink: the teacher's head is not covered per chunk\n"); abort(); }
+            nn_ssl_ink_targets(d->lgc, g_ink2_ch, rvc, (size_t)(f1 - f0) * pl, (size_t)f0 * pl, Dc, Hc, Hc, 4, g_ssl_bv, g_ssl_mask, d->ssl_seed, g_ssl_ink_conf, d->sslit, d->sslic); }
+        nn_sync(); nn_d2h(d->sslich, d->sslic, 2 * sizeof(unsigned long long)); d->ssl_ink_n = (size_t)d->sslich[0];
+        nn_ptick("ssl teacher ink");
+    }
     unet_use_ema(d->u, 0);
     if (jst > 0.f) {
         const uint64_t r = rmix(d->ssl_seed ^ 0xA5A5A5A5A5A5A5A5ull); const double u = (double)(r >> 11) * (2.0 / 9007199254740992.0) - 1.0;
@@ -1851,7 +1870,8 @@ static double fetch_loss(gpu_state *d, int B, int P, float dice_w, float *out) {
         nn_d2h(d->embh, d->embds, 2 * sizeof(double)); d->emb_cells = d->embh[1];
         d->emb_loss = d->embh[1] > 0 ? g_distill_w * d->embh[0] / d->embh[1] : 0;
     }
-    d->ssl_loss = d->ssl_cells = 0; d->sslvh[0] = d->sslvh[1] = 0;
+    d->ssl_loss = d->ssl_cells = 0; d->sslvh[0] = d->sslvh[1] = 0; d->ssl_ink_loss = 0;
+    if (g_ssl_ink > 0 && d->ssl_fresh && d->ssl_ink_n) { nn_d2h(d->sslish, d->sslis, 2 * sizeof(double)); d->ssl_ink_loss = d->sslish[1] > 0 ? g_ssl_ink * d->sslish[0] / d->sslish[1] : 0; }
     if (g_ssl && d->ssl_fresh) {   /* --ssl: weight x mean 1 - cos over the targeted cells, the hinge's loss and the points' mean std */
         nn_d2h(d->sslh, d->sslds, 2 * sizeof(double)); nn_d2h(d->sslvh, d->sslvo, 2 * sizeof(float)); d->ssl_cells = d->sslh[1];
         d->ssl_loss = (d->sslh[1] > 0 ? g_ssl_w * d->sslh[0] / d->sslh[1] : 0) + d->sslvh[0];
@@ -1922,7 +1942,7 @@ static double fetch_loss(gpu_state *d, int B, int P, float dice_w, float *out) {
         const float sb = out[CH_SHEET], sd = out[cout + CH_SHEET], act = out[2 * cout];
         out[CH_RECTO] = na ? rb / na : 0; out[CH_SHEET] = sb; out[NCH + CH_RECTO] = na ? rd / na : 0; out[NCH + CH_SHEET] = sd; out[2 * NCH] = act;
     }
-    return (active ? loss / active : 0)+d->sheet_loss+d->aff_loss+d->verso_loss+d->side_loss+d->ink_loss+d->mil_loss+d->norm_loss+d->cond_loss+d->pap_loss+d->count_loss+d->pg_loss+d->ds_loss+d->w4_loss+d->emb_loss+d->ssl_loss+d->rv_loss+d->fib_loss;
+    return (active ? loss / active : 0)+d->sheet_loss+d->aff_loss+d->verso_loss+d->side_loss+d->ink_loss+d->mil_loss+d->norm_loss+d->cond_loss+d->pap_loss+d->count_loss+d->pg_loss+d->ds_loss+d->w4_loss+d->emb_loss+d->ssl_loss+d->ssl_ink_loss+d->rv_loss+d->fib_loss;
 }
 
 /* --split z: forward, loss and backward of one window on both GPUs (src/split.h) */
@@ -2486,6 +2506,9 @@ int cmd_train(int argc, char **argv) {
             if (cfg.l0_norm == 2) { fprintf(stderr, "--ssl: not with --l0-norm ema (the teacher forward would update the running statistics)\n"); return 2; }
             g_ssl_gamma = (float)atof(opt(argc, argv, "--ssl-gamma", "0")); if (!(g_ssl_gamma > 0)) g_ssl_gamma = 1.f / sqrtf((float)g_ssl);
             cfg.emb_lev = g_ssl_lev; cfg.emb_ch = g_ssl;
+            g_ssl_ink = (float)atof(opt(argc, argv, "--ssl-ink", "0")); g_ssl_ink_conf = (float)atof(opt(argc, argv, "--ssl-ink-conf", "0.3")); g_ssl_ink_pap = atoi(opt(argc, argv, "--ssl-ink-pap", "1"));
+            if (g_ssl_ink < 0 || !(g_ssl_ink_conf >= 0 && g_ssl_ink_conf < 0.5f)) { fprintf(stderr, "--ssl-ink W >= 0, --ssl-ink-conf in [0, 0.5)\n"); return 2; }
+            if (g_ssl_ink > 0) fprintf(stderr, "ssl ink: weight %g on the teacher-confident (|p - 0.5| >= %g) unmasked cells%s\n", g_ssl_ink, g_ssl_ink_conf, g_ssl_ink_pap ? " on its papyrus (the rv pair, --rv 2)" : "");
             g_ssl_S = (size_t)(g_Pz / cv) * (P / cv) * (P / cv);
             if ((size_t)g_ssl_npts > g_ssl_S) g_ssl_npts = (int)g_ssl_S;
             fprintf(stderr, "ssl: %d channels on decoder level %d (%d^3 voxels per cell, %zu cells), mask %g of %d^3 blocks, cosine weight %g, variance hinge %g (std >= %.3f, %d points), student step jitter %g octaves\n",
@@ -3377,6 +3400,7 @@ int cmd_train(int argc, char **argv) {
         if (g_ssl) {   /* --ssl: targets, the side head's gradient, the hinge's points, sums */
             const size_t n = (size_t)g_ssl * g_ssl_S, np_ = (size_t)g_ssl_npts;
             d->sslt = nn_malloc(n); d->sslg = nn_malloc(n * 4); d->sslds = nn_malloc(2 * sizeof(double)); d->sslmu = nn_malloc((size_t)g_ssl * sizeof(double));
+            if (g_ssl_ink > 0) { d->sslit = nn_malloc((size_t)(g_Pz / 4) * (P / 4) * (P / 4)); d->sslic = nn_malloc(2 * sizeof(unsigned long long)); d->sslis = nn_malloc(2 * sizeof(double)); }
             d->sslidx = nn_malloc(np_ * sizeof(int)); d->ssle = nn_malloc(np_ * g_ssl * 4); d->sslge = nn_malloc(np_ * g_ssl * 4); d->sslnrm = nn_malloc(np_ * 4); d->sslvo = nn_malloc(8 * 4);
             d->ssl_rs = 0x5D1C0FFEEull ^ (uint64_t)g * 0x9E3779B97F4A7C15ull ^ (uint64_t)atoll(opt(argc, argv, "--seed", "0")) * 0xD1B54A32D192ED03ull;
             if (g == 0) fprintf(stderr, "ssl: %.0f MB of device buffers per GPU\n", (n * 5 + np_ * g_ssl * 8 + np_ * 8) / 1048576.0);
@@ -3818,7 +3842,7 @@ int cmd_train(int argc, char **argv) {
     float parts[8][2 * TCMAX + 1];
     double acc_fib = 0, acc_fibv = 0, acc_fibn = 0;   /* --fib-normal-lambda: mean t^T N t over the windows with fibre voxels, their mean count */
     const int mix_every = atoi(opt(argc, argv, "--mix-every", "0")); double *mixn = nullptr, *mixrv = nullptr, *mixrvn = nullptr;
-    double acc_ssl = 0, acc_sslv = 0, acc_ssls = 0, acc_sslc = 0, acc_ssln = 0;   /* --ssl: cosine part, hinge, std, targeted cells, unlabelled windows (all GPUs) */
+    double acc_ssl = 0, acc_sslv = 0, acc_ssls = 0, acc_sslc = 0, acc_ssln = 0, acc_ssli = 0, acc_sslig = 0, acc_sslip = 0;   /* (+ --ssl-ink: loss, gated share, ink share of the gated) */   /* --ssl: cosine part, hinge, std, targeted cells, unlabelled windows (all GPUs) */
     double acc_emb = 0, acc_embc = 0, acc_ds = 0, acc_vbce = 0, acc_vdice = 0, acc_side = 0, acc_ink = 0, acc_norm = 0, acc_cond = 0, acc_ck = 0, acc_cr = 0, acc_pap = 0, acc_cnt = 0, acc_cnr = 0, acc_cbin[18] = {0}, acc_w4 = 0, acc_w4w = 0, acc_w4a = 0, acc_pg = 0, acc_rv = 0;   /* (acc_pg: --pgrad-lambda loss; acc_cnt / acc_cnr: --count-lambda loss, Tp / Tg) verso channel, side channel; --cond (loss, known / right counts); --pap-head */
     double acc_fh[2] = {0}, acc_fhn = 0;   /* --fib-head: mask / direction bce sums, windows with known fibre labels */
     double acc_inkn = 0, vik[2] = {0}, acc_mil = 0, acc_miln = 0, acc_milr = 0;   /* --ink-mil: raw mean BCE sum / windows with rays / rays */   /* --ink-head: training windows with known ink in the log interval; validation ink bce sum / windows */
@@ -4116,7 +4140,8 @@ int cmd_train(int argc, char **argv) {
         if (g_unwrap2) { acc_w4 += G[0].w4h[0]; acc_w4w += G[0].w4h[5]; acc_w4a += G[0].w4h[1]; } acc_pg += G[0].pg_loss;
         if (g_ds) acc_ds += G[0].ds_loss;
         if (g_distill) { acc_emb += G[0].emb_loss; acc_embc += G[0].emb_cells; }
-        if (g_ssl) for (int g = 0; g < ng; g++) if (G[g].ssl_fresh) { acc_ssl += G[g].ssl_loss - G[g].sslvh[0]; acc_sslv += G[g].sslvh[0]; acc_ssls += G[g].sslvh[1]; acc_sslc += G[g].ssl_cells; acc_ssln += 1; }
+        if (g_ssl) for (int g = 0; g < ng; g++) if (G[g].ssl_fresh) { acc_ssl += G[g].ssl_loss - G[g].sslvh[0]; acc_sslv += G[g].sslvh[0]; acc_ssls += G[g].sslvh[1]; acc_sslc += G[g].ssl_cells; acc_ssln += 1;
+            if (g_ssl_ink > 0) { acc_ssli += G[g].ssl_ink_loss; acc_sslig += (double)G[g].sslich[0] / ((double)(g_Pz / 4) * (P / 4) * (P / 4)); acc_sslip += G[g].sslich[0] ? (double)G[g].sslich[1] / G[g].sslich[0] : 0; } }
         if (g_cond) { acc_cond += G[0].cond_loss / (g_cond_lambda ? g_cond_lambda : 1.f); acc_ck += (double)G[0].cacc_h[0]; acc_cr += (double)G[0].cacc_h[1]; }
         if (g_pap_head) acc_pap += G[0].pout3[0];
         if (g_restore) { acc_rn += G[0].rst_h[0]; acc_re += G[0].rst_h[3]; acc_rb += G[0].rst_h[4]; }
@@ -4267,6 +4292,7 @@ int cmd_train(int argc, char **argv) {
             if (g_fibdir > 0) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " dir bce %.4f", acc_norm / nacc); }
             if (g_ds) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " ds %.4f", acc_ds / nacc); }
             if (g_ssl) { size_t na = strlen(affs); if (acc_ssln > 0) snprintf(affs + na, sizeof affs - na, " ssl %.4f var %.4f std %.3f (%.0f windows, %.1f%% cells)", acc_ssl / acc_ssln, acc_sslv / acc_ssln, acc_ssls / acc_ssln, acc_ssln, 100. * acc_sslc / acc_ssln / g_ssl_S); }   /* (nothing on lines without an unlabelled window: the labelled-only layout logs as before) */
+            if (g_ssl_ink > 0 && acc_ssln > 0) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " ink-ssl %.4f (%.1f%% cells, %.1f%% ink)", acc_ssli / acc_ssln, 100. * acc_sslig / acc_ssln, 100. * acc_sslip / acc_ssln); }
             if (g_distill) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " distill %.4f (%.1f%% cells)", acc_emb / nacc, 100. * acc_embc / nacc / ((double)g_distill_n / g_distill));
                 if (g_distill_pap > 0) { static size_t pc0, pk0; const size_t pc = atomic_load(&g_emb_pap_cleared), pk = atomic_load(&g_emb_pap_kept); na = strlen(affs);
                     if (pc + pk > pc0 + pk0) snprintf(affs + na, sizeof affs - na, " (papyrus gate kept %.1f%% of the targeted)", 100. * (double)(pk - pk0) / (double)(pc + pk - pc0 - pk0)); pc0 = pc; pk0 = pk; } }
@@ -4295,7 +4321,7 @@ int cmd_train(int argc, char **argv) {
             if (log) { fprintf(log, "%d,%.3e,%.5f,%.5f,%.5f,%.0f,%.4f,%s,%.3f,%.3f\n", step, lr, acc_loss / nacc, acc_bce / nacc, acc_dice / nacc, active, acc_g / nacc, vstr, (double)nacc * B * nl / dt, wait); fflush(log); }
             if (prof) { fprintf(stderr, "per-op GPU ms over the last %d steps (all GPUs):\n", log_every); unet_prof_report(); }
             nn_ptick_report(log_every);
-            acc_fh[0] = acc_fh[1] = acc_fhn = 0; acc_inkn = 0; acc_fib = acc_fibv = acc_fibn = 0; acc_emb = acc_embc = 0; acc_ssl = acc_sslv = acc_ssls = acc_sslc = acc_ssln = 0; acc_ds = 0; acc_loss = acc_bce = acc_dice = acc_g = acc_vbce = acc_vdice = acc_side = acc_ink = acc_norm = acc_cond = acc_ck = acc_cr = acc_pap = acc_cnt = acc_cnr = acc_w4 = acc_w4w = acc_w4a = acc_pg = acc_rv = 0; nacc = 0; tlog = now(); wait = 0;
+            acc_fh[0] = acc_fh[1] = acc_fhn = 0; acc_inkn = 0; acc_fib = acc_fibv = acc_fibn = 0; acc_emb = acc_embc = 0; acc_ssl = acc_sslv = acc_ssls = acc_sslc = acc_ssln = acc_ssli = acc_sslig = acc_sslip = 0; acc_ds = 0; acc_loss = acc_bce = acc_dice = acc_g = acc_vbce = acc_vdice = acc_side = acc_ink = acc_norm = acc_cond = acc_ck = acc_cr = acc_pap = acc_cnt = acc_cnr = acc_w4 = acc_w4w = acc_w4a = acc_pg = acc_rv = 0; nacc = 0; tlog = now(); wait = 0;
         }
         if (step % ckpt_every == 0 || step == steps || g_stop) {
             nn_init(G[0].dev);

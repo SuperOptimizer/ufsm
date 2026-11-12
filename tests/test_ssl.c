@@ -127,9 +127,46 @@ static void test_loss(void) {
     free(y); free(yd); free(tf); free(t); free(g); free(idx);
 }
 
+/* (5) --ssl-ink: the teacher's gated per-cell targets and the student's soft-BCE gradient on the ink channel (fp16 logits) vs the host */
+static float h2f(uint16_t h) { _Float16 v; memcpy(&v, &h, 2); return (float)v; }
+static uint16_t f2h(float f) { _Float16 v = (_Float16)f; uint16_t h; memcpy(&h, &v, 2); return h; }
+static double sgm(double z) { return 1 / (1 + exp(-z)); }
+static void test_ink(void) {
+    const int nch = 6, ink = 2, rv = 3, cd = 8, ch = 8, cw = 8, cv = 4, bv = 16; const float ratio = 0.4f, conf = 0.3f, scale = 0.37f; const uint64_t seed = 31;
+    const size_t S = (size_t)cd * ch * cw, half = S / 2;   /* two chunks of half the cells */
+    uint16_t *lg = malloc(S * nch * 2); for (size_t i = 0; i < S * nch; i++) lg[i] = f2h((float)(rn() * 3));
+    uint8_t *ht = malloc(S); size_t hg = 0, hi = 0;
+    for (size_t s = 0; s < S; s++) {
+        const size_t c = s / half, i = s % half; const uint16_t *L = lg + c * half * nch;   /* chunk layout [nch][half] */
+        const int x = (int)(s % cw), y = (int)((s / cw) % ch), z = (int)(s / ((size_t)cw * ch));
+        const double p = sgm(h2f(L[(size_t)ink * half + i]));
+        int on = !ssl_blk_masked(seed, z * cv / bv, y * cv / bv, x * cv / bv, ratio) && fabs(p - 0.5) >= conf;
+        if (on) on = fmax(sgm(h2f(L[(size_t)rv * half + i])), sgm(h2f(L[(size_t)(rv + 1) * half + i]))) >= 0.5;
+        ht[s] = on ? (uint8_t)lrint(254 * p) : 255; hg += on; hi += on && p >= 0.5;
+    }
+    void *dl = nn_malloc(S * nch * 2), *dg = nn_malloc(half * nch * 2); uint8_t *dt = nn_malloc(S), *gt = malloc(S); unsigned long long *dc = nn_malloc(16), hc[2]; double *ds = nn_malloc(16), hs[2];
+    nn_h2d(dl, lg, S * nch * 2); nn_zero(dc, 16); nn_zero(ds, 16);
+    for (int c = 0; c < 2; c++) nn_ssl_ink_targets((char *)dl + c * half * nch * 2, ink, rv, half, c * half, cd, ch, cw, cv, bv, ratio, seed, conf, dt, dc);
+    nn_sync(); nn_d2h(gt, dt, S); nn_d2h(hc, dc, 16);
+    size_t bad = 0; for (size_t s = 0; s < S; s++) bad += abs((int)gt[s] - (int)ht[s]) > (gt[s] == 255 || ht[s] == 255 ? 0 : 1);
+    CHECK(!bad && hc[0] == hg && hc[1] == hi, "ink targets: %zu cells differ, gated %llu / %zu, ink %llu / %zu", bad, hc[0], hg, hc[1], hi);
+    double worst = 0, gmax = 0, L = 0; size_t nt = 0; uint16_t *gg = malloc(half * nch * 2);
+    for (int c = 0; c < 2; c++) {
+        nn_zero(dg, half * nch * 2); nn_ssl_ink_grad((char *)dl + c * half * nch * 2, ink, half, c * half, dt, scale, dg, ds); nn_sync(); nn_d2h(gg, dg, half * nch * 2);
+        for (size_t i = 0; i < half; i++) { const uint8_t q = gt[c * half + i]; const double z = h2f(lg[c * half * nch + (size_t)ink * half + i]);
+            const double want = q == 255 ? 0 : scale * (sgm(z) - q / 254.0); worst = fmax(worst, fabs(h2f(gg[(size_t)ink * half + i]) - want)); gmax = fmax(gmax, fabs(want));
+            if (q != 255) { const double y = q / 254.0; L += fmax(z, 0) - z * y + log1p(exp(-fabs(z))); nt++; }
+            for (int k = 0; k < nch; k++) if (k != ink && gg[(size_t)k * half + i]) { worst = 1e9; } }
+    }
+    nn_d2h(hs, ds, 16);
+    CHECK(worst <= 2e-3 * (gmax > 0 ? gmax : 1) && fabs(hs[0] - L) < 1e-3 * (1 + L) && (size_t)hs[1] == nt, "ink grad: worst %.3g of %.3g, bce %.6f vs %.6f, cells %.0f vs %zu", worst, gmax, hs[0], L, hs[1], nt);
+    printf("ink: %zu of %zu cells gated (%zu ink), %zu target bytes differ, gradient worst %.2e of %.2e, bce sum %.4f (host %.4f)\n", hg, S, hi, bad, worst, gmax, hs[0], L);
+    nn_free(dl); nn_free(dg); nn_free(dt); nn_free(dc); nn_free(ds); free(lg); free(ht); free(gt); free(gg);
+}
+
 int main(void) {
     if (nn_init(0)) { printf("SKIP: no GPU\n"); return 0; }
-    test_mask(2); test_mask(4); test_targets(); test_idx(); test_loss();
+    test_mask(2); test_mask(4); test_targets(); test_idx(); test_loss(); test_ink();
     if (fails) { printf("%d FAILED\n", fails); return 1; }
     printf("PASS\n"); return 0;
 }
