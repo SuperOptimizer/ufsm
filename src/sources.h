@@ -11,6 +11,8 @@
          or [[z, y, x, nz, ny, nx], ...]: several boxes (the first is the validation box; training avoids all)
        "holdout_file": "holdouts.json"   (optional: ufsm wbench boxes {"boxes": [{"ct": KEY, "l0": [6 numbers]}...]}; the entries
          whose ct basename equals this source's ct basename are added to the holdout boxes)
+       "holdout_mode": "mask" | "reject"   (optional: training windows of this source over a held-out box keep their surroundings with
+         every label unknown in the box + a guard (mask), or are redrawn (reject); default train --holdout-mode, mask)
        "weight": 1.0},
       {"name": "Paris4-recto", "root": "...", "ct": "PHercParis4/volumes/...zarr", "um": 2.4,
        "targets": {"recto": {"regions": "PHercParis4/representations/predictions/teacher_regions/recto-2.4um",
@@ -102,7 +104,9 @@ typedef struct {
     z3 *reg_shared[NTG];    /* the shared array when reg[ch]->array is set */
     axis ax;                /* n == 0 when unknown */
     int64_t hold_o[3], hold_n[3];   /* optional held-out box (level-0 voxels); hold_n[0] == 0 when absent (= hold[0]: the validation box) */
-    int64_t (*hold)[6]; int nhold;  /* all held-out boxes (z y x nz ny nx, level 0): training windows touch none of them */
+    int64_t (*hold)[6]; int nhold;  /* all held-out boxes (z y x nz ny nx, level 0): no training label inside them */
+    int hold_mode;          /* "holdout_mode": 0 the sampler's (train --holdout-mode), 1 "mask", 2 "reject": this source's training windows
+                               that overlap a held-out box */
     int64_t (*box)[6]; int nbox;    /* optional "boxes": level-0 boxes [z, y, x, nz, ny, nx]: training windows inside one (by volume; task restore: of local CT) */
     /* optional band target (task band_affinity, src/band.h): winding_mod14 raster array on the 2x label grid,
        {"band": {"root": ..., "key": "4.8", "radius": 80, "span": 75}} under "targets" */
@@ -131,6 +135,7 @@ typedef struct {
                         gated spirals: consecutive sheets right inside a tile, turn counts not): the winding mod 4 trains (one gauge per tile, as
                         for every source), any long-range / count loss must skip it. "global" (default) */
     z3 *phase_ign;   /* optional "phase": {..., "ignore": {"root", "key"}}: a uint8 array on the stored phase's grid, nonzero = the phase there is not trained on (ufsm phase-conflict) */
+    z3 *phase_pl[MAXLEV], *phase_ign_pl[MAXLEV];   /* source_phase_at: the stored phase / ignore pooled to levels coarser than phase_level (lazy views) */
     uint8_t *focus; int64_t focus_grid[3]; float focus_w;   /* optional "focus": {"map": RAW, "w": K} (ufsm phase-packing --map: per coarse occupancy cell 0 none, else
                                                               1 + 254 x packed share): the position draw takes a cell 1 + K x share times as often */
     z3 *wind;    /* optional, with a stored phase: the winding mod 14 turns on the same grid (ufsm phase-raster --winding; band.h
@@ -168,6 +173,9 @@ void sources_free(sources *S);
 /* Lazily open CT / target arrays. Return nullptr if that level does not exist. */
 z3 *source_ct(source *s, int level);
 z3 *source_tgt(source *s, int ch, int level);          /* pyramid target only */
+/* the stored phase on level `level`'s grid: s->phase at phase_level, a lazily made 2^k pooled view of it at coarser levels (ign 1: the
+   "ignore" array the same way); nullptr finer or without one */
+z3 *source_phase_at(source *s, int level, int ign);
 z3 *source_tgt_for_level(source *s, int ch, int level, int *stored_level);
 /* Return labels in the trainer's canonical 0/background,254/surface,255/ignore
    encoding. Binary masks are nearest-neighbour upsampled on their global voxel

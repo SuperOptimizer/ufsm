@@ -215,6 +215,51 @@ int codes_pool2_box(z3 *codes, const int64_t ro[3], const int64_t rn[3], uint8_t
 static int pool2_read(void *ctx, z3 *base, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads) { (void)ctx; return codes_pool2_box(base, o, n, out, nthreads); }
 z3 *codes_pool2_open(z3 *codes) { return z3_open_derived_pool2(codes, 0, pool2_read, nullptr, nullptr); }
 
+/* the 2x pooling of a stored phase (sampler windows coarser than the phase's level): per 2^3 block the circular mean of the known codes,
+   PHASE_UNKNOWN where none is known or their resultant is under half their count (ufsm downsample --mode phase, phase-raster --gs 4's
+   phase_pool2: the same float sums and rounding). ign: the "ignore" array's pooling instead, 1 where any child is set (1..254), else 0 */
+int phase_pool2_box(z3 *ph, const int64_t ro[3], const int64_t rn[3], uint8_t *out, int nthreads, int ign) {
+    const int64_t *fs = z3_meta_of(ph)->shape;
+    static float cs[PHASE_PERIOD], sn[PHASE_PERIOD]; static _Atomic int init;
+    if (!atomic_load(&init)) { for (int k = 0; k < PHASE_PERIOD; k++) { cs[k] = (float)cos(2 * M_PI * k / PHASE_PERIOD); sn[k] = (float)sin(2 * M_PI * k / PHASE_PERIOD); } atomic_store(&init, 1); }
+    memset(out, ign ? 0 : PHASE_UNKNOWN, (size_t)rn[0] * rn[1] * rn[2]);
+    int64_t fo[3], fn[3];
+    for (int d = 1; d < 3; d++) { fo[d] = 2 * ro[d]; const int64_t e = 2 * (ro[d] + rn[d]) < fs[d] ? 2 * (ro[d] + rn[d]) : fs[d]; fn[d] = e - fo[d]; }
+    if (fn[1] <= 0 || fn[2] <= 0) return 0;
+    /* in z slabs of the fine box (<= ~64 MB: a 896^3 window pooled whole read 1792^3 = 5.7 GB per worker) */
+    int64_t sz = (int64_t)(((size_t)64 << 20) / ((size_t)2 * fn[1] * fn[2])); if (sz < 1) sz = 1; if (sz > rn[0]) sz = rn[0];
+    uint8_t *f = malloc((size_t)2 * sz * fn[1] * fn[2]);
+    if (!f) return -1;
+    for (int64_t a0 = 0; a0 < rn[0]; a0 += sz) {
+        const int64_t na = a0 + sz < rn[0] ? sz : rn[0] - a0;
+        fo[0] = 2 * (ro[0] + a0); { const int64_t e = 2 * (ro[0] + a0 + na) < fs[0] ? 2 * (ro[0] + a0 + na) : fs[0]; fn[0] = e - fo[0]; }
+        if (fn[0] <= 0) break;
+        if (z3_read(ph, fo, fn, f, nthreads)) { free(f); return -1; }
+        for (int64_t a = 0; a < na; a++) for (int64_t b = 0; b < rn[1]; b++) for (int64_t c = 0; c < rn[2]; c++) {
+            float x = 0, y = 0; int k = 0, any = 0;
+            for (int q = 0; q < 8; q++) {
+                const int64_t z = 2 * a + (q >> 2 & 1), yy = 2 * b + (q >> 1 & 1), xx = 2 * c + (q & 1);
+                if (z >= fn[0] || yy >= fn[1] || xx >= fn[2]) continue;
+                const int v = f[((size_t)z * fn[1] + yy) * fn[2] + xx];
+                any |= v && v != PHASE_UNKNOWN;
+                if (v < PHASE_PERIOD) { x += cs[v]; y += sn[v]; k++; }
+            }
+            uint8_t o = PHASE_UNKNOWN;
+            if (ign) o = (uint8_t)any;
+            else if (k && x * x + y * y >= 0.25f * k * k) { double t = atan2(y, x) / (2 * M_PI); if (t < 0) t += 1; o = (uint8_t)((int)lround(t * PHASE_PERIOD) % PHASE_PERIOD); }
+            out[((size_t)(a0 + a) * rn[1] + b) * rn[2] + c] = o;
+        }
+    }
+    free(f);
+    return 0;
+}
+static int phpool_read(void *ctx, z3 *base, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads) { return phase_pool2_box(base, o, n, out, nthreads, ctx != nullptr); }
+z3 *phase_pool2_view(z3 *phase, int ign) {
+    z3 *z = z3_open_derived_pool2(phase, ign ? 0 : PHASE_UNKNOWN, phpool_read, ign ? (void *)1 : nullptr, nullptr);
+    z3_derived_borrow(z);
+    return z;
+}
+
 /* the fusion of several onfly (or stored) phase sets (phase-fuse, src/fuse.h fuse_phase: the circular mean where they agree within tol
    turns, else unknown; one set alone kept), per voxel, so a read box needs no halo beyond each set's own */
 typedef struct { z3 *set[FUSE_MAX]; int n; float tol; } fuse_ctx;

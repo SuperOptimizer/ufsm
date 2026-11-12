@@ -6,6 +6,56 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Holdouts masked instead of rejected; coarse rungs get a pooled phase (2026-11-11, branch univ-20261111)
+
+u1 after the fstem restart (5796) drew 0.0% of its windows at 19.2 um, PHerc1667-gt not at all, 1667-A48 / B48 and 0500P2 at 0.6-3.3%. A
+sampler-only run of sources-u1b (150 batches) with per source x level drop counters found two causes:
+
+- **Holdout rejection.** A training window touching any held-out box (any same-CT source's) was dropped and redrawn. 1667 is dense with
+  wbench boxes and coarse windows span 7168 level-0 voxels, so 1667-gt / A48 / B48 and 0500P2 produced 0 windows (15 + 11, 4 + 10 + 2,
+  4 + 1 + 3, 5 draws dropped on overlaps).
+  Now `--holdout-mode mask` (the default; per source `"holdout_mode": "mask" | "reject"`) keeps the window and makes every label unknown in
+  each box grown by `--holdout-guard` (16) voxels of the window's level. The mask is a property of the volume, so it also applies to windows
+  that touch only the guard. It is applied on the source grid before any symmetry or warp:
+  - the stored phase, so w4 / component / w4 runs as well;
+  - band, side and pap labels;
+  - the ignore plane, so the loss mask, ink, rv and aux / fibre planes.
+
+  Sheet-prior, cond and distill windows have no voxel mask and still reject. More than 64 overlapping boxes also reject.
+- **No phase on windows coarser than the stored phase.** phase_window only upsamples. A window at pshift < 0 had an all-unknown side plane
+  and was dropped as "empty targets": Paris 4 june / july at 19.2 um, 0139 at 18.7 um. So u1's coarse rungs never trained phase, before or
+  after the restart.
+  Now such a window reads `source_phase_at(s, l)`, a lazy pooled view: `phase_pool2_view`, a z3_open_derived_pool2 that borrows the
+  phase, with the downsample --mode phase rule (2^3 circular mean, unknown under half resultant). The "ignore" array pools as "any child
+  set"; "weight" is not applied there.
+  Only one level of pooling: a phase two or more levels finer (4.8 -> 19.2 um) would read 64x the window's voxels, so `--um-rungs` skips
+  those levels. The pooling runs in z slabs of <= 64 MB, because pooling a P 896 window whole read 1792^3 = 5.7 GB per worker and the first
+  sampler-only run was OOM-killed in the 64 GB slice.
+  An on-the-fly phase (codes + rmax, or fused sets) does not pool the derived phase, which would derive 8x the voxels and also OOMed. Its
+  next coarser level is opened at load as the same rule on the codes pooled once more (codes_pool2_open) at half rmax. That is
+  byte-identical to phase-raster --gs 4 of the 2x coarser grid (the 1667 9.6 um check in the section below).
+
+Re-run of sources-u1b with the fix: 150 windows, 8 workers, 42 GB RSS under memcap -t.
+
+| | before | after |
+|---|---|---|
+| sources that produced windows | 4 of 8 | 8 of 8 |
+| holdout drops | 0 (none rejected now) | 0 |
+| windows by rung, < 6.8 / 6.8-13.6 / > 13.6 um | 0% at > 13.6 um | 14% / 54% / 32% |
+| holdout-masked windows | | 32 |
+
+Windows per source (from 0 for the 1667s before): 0139 51, Paris 4 june 27, july 24, 1667-gt 21, 1667-A48 12, june48 9, 0500P2 3,
+1667-B48 3.
+
+Tests (test_unwrap2_sampler):
+- the same 40 draws with and without a box: 0 of 177270 box + guard voxels carry a phase / w4 / comp / loss-mask label, and 0 phase bytes
+  differ outside;
+- reject mode draws no window over the box;
+- level-1 windows of a level-0 phase equal phase_pool2_box on their grid (154624 of 154624 pooled-known voxels known, 0 differ, w4 set).
+
+`sampler-only` now prints per source and level: windows, holdout-masked windows, and draws dropped on holdout overlaps, empty targets, the
+coarse probe and CT min_fg.
+
 ## Universal net inference: every head from one trunk pass (predict --heads), the fine stem in the latent fast paths (2026-11-11, branch univinf-20261111)
 
 **What fell back (u1, `--lat 4 --lat-guide 3 --rv 2 --film 2 --fstem 16`, cout 144 = 16 + 128 sub-cell outputs).** Every latent fast
@@ -99,6 +149,13 @@ fibre labels when the draws took every papyrus cell. UFSM_FIBRE_EXTENT=0: the CT
 projection 0: neutral), its Adam / Muon state and EMA reset; one-shot by step (a resume from any other step keeps the stem). For u1
 after univI's fstem forward fix (the forward covered only x mod 256 < 64 of each row; the backward every block): the trunk and heads
 are kept, the stem restarts. test_univ2 checks the reset and that a later resume does not repeat it.
+
+fstem fix: u1 resumed at step 5796 (2026-11-11 20:32) on master e3c997b (univI's fstem forward fix 051d230 + --fstem-reset-at 5796),
+with the scale-robust mix (sources-u1b.json: 0139 / 0500P2 max_level 1, 1667-gt / A48 / B48 max_level 3 with CT levels from the
+mirror (ct_mirror), PHercParis4-june48 onfly at 0.10, 1667 A48 / B48 phase onfly; --rung-shift-p 0.3; --mix-every 250) and the
+launcher outside the memcap scope (u1.train2.sh, ckpt every 250). U1 3000 (pre-fix): native p05x 0.644, but DLV -1 / +1 0.400 / 0.404:
+every source was trained at one rung (4.8 um only 1667 A48 / B48, 19.2 um only Paris 4). Pre-fix snapshots are trunk checks only;
+latres gates from snap 9000 (>= resume + 3000).
 ## B1 4.8 um phase rasters: what was built before the switch to on-the-fly phase (2026-11-11, branch fibd-20261111)
 
 Workstream B1 rasterised the band phase at 4.8 um (`phase-raster --gs 2 --pair 1 --radius 160`, GPU, byte-identical to the CPU path;
