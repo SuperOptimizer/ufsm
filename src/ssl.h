@@ -30,15 +30,24 @@ void nn_ssl_mask(void *x, int es, int Pz, int P, int bv, float ratio, uint64_t s
 void nn_ssl_targets(const float *y, int C, int cd, int ch, int cw, int cv, int bv, float ratio, uint64_t seed, double *mu, int8_t *t);
 /* N distinct cell indices idx[k] = (off + k stride) mod S (stride coprime to S: the caller's ssl_stride) */
 void nn_ssl_idx(int *idx, int N, size_t S, size_t off, size_t stride);
-/* --ssl-ink (gated mean-teacher ink consistency on the latent cells): the teacher's coarse head logits of a chunk lg [nch][n] (fp16, cells
-   [off, off + n) of the cell grid cd x ch x cw, cells of cv voxels) -> t[off + i] = round(254 p) with p = sigmoid(ink logit) where the cell is
-   NOT in a masked block (the student sees it), the teacher is confident (|p - 0.5| >= conf) and, with rv_ch >= 0, on papyrus (max of the
-   rv pair's sigmoids >= 0.5); else 255. cnt (device, 2 x u64) += the gated cells, of which the ink ones (p >= 0.5) */
-void nn_ssl_ink_targets(const void *lg, int ink_ch, int rv_ch, size_t n, size_t off, int cd, int ch, int cw, int cv, int bv, float ratio, uint64_t seed,
-                        float conf, uint8_t *t, unsigned long long *cnt);
-/* the student's soft BCE against them: lg [nch][n] its chunk logits (fp16), g [nch][n] (fp16, zeroed by the caller): channel ink_ch
-   gets scale x (sigmoid(z) - t / 254) at targeted cells; sums (device, 2 doubles) += sum BCE, cells */
-void nn_ssl_ink_grad(const void *lg, int ink_ch, size_t n, size_t off, const uint8_t *t, float scale, void *g, double *sums);
+/* --ssl-heads (gated mean-teacher consistency of the output heads on the latent cells, DESIGN 2026-11-12): per head a mode, its output
+   channels [ch0, ch0 + nch), its target slots [slot0, slot0 + nch) of t ([slot][S] uint8 over the whole cell grid of S cells), a confidence
+   threshold and whether the teacher's papyrus gates it. From the teacher's coarse head logits of a chunk lg [nch][n] (fp16, cells [off,
+   off + n) of the grid cd x ch x cw, cells of cv voxels), a cell is targeted only where the student sees it (NOT in a masked block) and,
+   for pap heads, on the teacher's papyrus (max of the rv pair's sigmoids >= 0.5, rv_ch); then per mode, with p_c = sigmoid(logit_c):
+     SSLH_BCE:   each channel on its own where |p_c - 0.5| >= conf;
+     SSLH_NORM:  the six normal channels (N_zz, N_yy, N_xx = p0..p2, N_zy, N_zx, N_yx = p3..p5 - 1/2) together where |N|_F >= conf
+                 (1 for a clean unit n n^T; directions that disagree inside the cell or an unsure teacher shrink it);
+     SSLH_PHASE: the cos / sin pair together where |v| >= conf, v = (2 p0 - 1, 2 p1 - 1) (the in-turn phase: local, no integer part).
+   t[slot][s] = round(254 p_c) at the targeted channels, else 255. cnt (device, one u64 per slot) += the targeted cells. */
+enum { SSLH_BCE = 0, SSLH_NORM = 1, SSLH_PHASE = 2, SSLH_MAX = 8 };
+typedef struct { int mode, ch0, nch, slot0, pap; float conf; } ssl_head;
+typedef struct { ssl_head h[SSLH_MAX]; int nh, nslot; float scale[SSLH_MAX]; } ssl_heads;   /* (scale: the gradient's, per head) */
+void nn_sslh_targets(const void *lg, const ssl_heads *hs, int rv_ch, size_t n, size_t off, int cd, int ch, int cw, int cv, int bv, float ratio,
+                     uint64_t seed, uint8_t *t, unsigned long long *cnt);
+/* the student's soft BCE against them: lg [nch][n] its chunk logits (fp16), g [nch][n] (fp16, zeroed by the caller): every targeted
+   channel c of head h gets hs->scale[h] x (sigmoid(z) - t / 254); sums (device, 2 doubles per head) += sum BCE, targeted entries */
+void nn_sslh_grad(const void *lg, const ssl_heads *hs, size_t n, size_t off, size_t S, const uint8_t *t, void *g, double *sums);
 #ifdef __cplusplus
 }
 #endif
