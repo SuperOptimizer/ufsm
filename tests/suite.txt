@@ -244,6 +244,7 @@ test_render_stream_gpu                         | gpu          |    10 | ./$B/tes
 test_render_fill_gpu                           | gpu          |    12 | ./$B/test_render_fill_gpu
 test_jpegpar                                   |              |    10 | ./$B/test_jpegpar
 test_sysinfo                                   |              |     5 | ./$B/test_sysinfo
+test_winauto                                   |              |     1 | ./$B/test_winauto
 test_volcomp_fast                              |              |    25 | ./$B/test_volcomp_fast
 test_z3_autosub                                |              |    10 | ./$B/test_z3_autosub
 test_z3_sink                                   |              |    10 | ./$B/test_z3_sink

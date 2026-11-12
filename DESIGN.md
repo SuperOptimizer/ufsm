@@ -6,6 +6,23 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## predict --window auto on a shared card: UFSM_MEM_FREE_GB budget, interior cap 1024 (2026-11-12, branch winauto-20261112)
+
+Pod 3 (one RTX PRO 6000, 98 GB), two unroll lanes: PHerc0814's ink pass (`--window auto`, feathered, halo 32) started on a nearly
+free card and picked 1600^3 (interior 1536), holding 90.4 GB of device memory. The other lane's slab fits (PHercMANB) dropped to
+602 MB of device each (managed-memory spill) and 0814's count-field to 1.7 GB; the ink itself slowed from ~2 s to ~260 s per window
+(149 windows: ~10 h). Killing it brought the fits back to ~6 GB and seconds per slab; the rerun at 576^3 did 2293 windows at ~10 / s.
+
+Change (`src/winauto.h`, used by predict.c; host-only test `test_winauto`):
+- the budget is the device's free memory capped by `UFSM_MEM_FREE_GB` (the variable train's planner already reads), so a job
+  sharing a card can be given its share; `UFSM_PRED_WINDOW_FREE` (planning for another card) still replaces the device figure and
+  is capped the same way;
+- candidates with an interior (window - 2 halo) above `UFSM_PRED_WINDOW_MAX` (default 1024) are never picked. That drops only the
+  ink's 1600^3 (1.13 computed voxels per interior voxel; 1088^3 is 1.20, ~6 % more compute) and keeps the fields' 1152^3 (interior
+  1024). Candidate 0 with copy slabs stays the always-fits fallback; the log line now prints the budget and the cap.
+- pods: scripts/pod/unroll.sh on pod 3 also pins `INKW=576` (two lanes per card); with this change `--window auto` plus
+  `UFSM_MEM_FREE_GB=<share>` does the same without a fixed window.
+
 ## Self-supervision for the latent net: what the 10-21..25 DINO work showed, the plan (2026-11-12, branch latdino-20261112)
 
 User (11-12): "revive the self supervised dino stuff for latent net". Plan only; no GPU run yet.
