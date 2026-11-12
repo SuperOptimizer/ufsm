@@ -7,7 +7,8 @@
        one 16-bit ulp; the host reference itself is central-difference tested in test_ink_mil, so this is the central-difference check
        through head_slab_pass at the logits (the head / trunk backward below them is the existing, tested one);
    (2) --det 1 twice: the logged loss terms (ink mil included) are identical;
-   (3) the ink mil term is logged, finite, on windows with rays.
+   (3) the ink mil term is logged, finite, on windows with rays; the checks also run on warped windows (host and device label warps)
+       and on the latent net (--lat 4 --lat-guide 3, the head stream: the MIL gradient through the slab adjoint).
    The old ink path with --ink-mil off is test_heads (the per-GPU reference losses).
    Usage: test_ink_mil_train <ufsm binary> <make_wind_fixture binary> */
 #define WIND_FIXTURE_NO_MAIN
@@ -89,15 +90,17 @@ int main(int argc, char **argv) {
     const char *warp = "--geometry-aug 1 --rotate-p 1 --elastic-p 1";
     for (int run = 2; run < 4; run++)
         CHECK(!sh("UFSM_MIL_CHECK=1 UFSM_GRAD_MX8=1 %s train %s/sources-mil.json --out %s/r%d --steps 6 %s %s %s --gpu-aug %d > %s/r%d.log 2>&1", U, d, d, run, common, mil, warp, run == 2 ? 0 : 2, d, run), "train run %d (%s/r%d.log)", run, d, run);
-    char *lg[4]; for (int run = 0; run < 4; run++) { snprintf(p, sizeof p, "%s/r%d.log", d, run); lg[run] = slurp(p); }
-    if (!lg[0] || !lg[1] || !lg[2] || !lg[3]) { fprintf(stderr, "FAIL: no logs in %s\n", d); return 1; }
+    /* run 4: the latent net (u1's head stream, --lat 4 --lat-guide 3): the MIL gradient goes through the slab adjoint */
+    CHECK(!sh("UFSM_MIL_CHECK=1 UFSM_GRAD_MX8=1 %s train %s/sources-mil.json --out %s/r4 --steps 6 %s %s --lat 4 --lat-guide 3 > %s/r4.log 2>&1", U, d, d, common, mil, d), "train run 4, latent (%s/r4.log)", d);
+    enum { NRUN = 5 };
+    char *lg[NRUN]; for (int run = 0; run < NRUN; run++) { snprintf(p, sizeof p, "%s/r%d.log", d, run); lg[run] = slurp(p); if (!lg[run]) { fprintf(stderr, "FAIL: no log r%d in %s\n", run, d); return 1; } }
     /* (1) the device MIL loss / gradient against the host reference */
     int nl = 0, ng = 0, withrays = 0; double worst_l = 0, worst_g = 0;
-    for (int run = 0; run < 4; run++) if (run != 1) for (const char *q = lg[run]; (q = strstr(q, "mil check: loss device ")); q++) {
+    for (int run = 0; run < NRUN; run++) if (run != 1) for (const char *q = lg[run]; (q = strstr(q, "mil check: loss device ")); q++) {
         double ld, lh, rel; int nr;
         if (sscanf(q, "mil check: loss device %lf host %lf (relative %lf, %d rays)", &ld, &lh, &rel, &nr) == 4) { nl++; withrays += nr > 0; if (rel > worst_l) worst_l = rel; }
     }
-    for (int run = 0; run < 4; run++) if (run != 1) for (const char *q = lg[run]; (q = strstr(q, "mil check: gradient rms difference")); q++) {
+    for (int run = 0; run < NRUN; run++) if (run != 1) for (const char *q = lg[run]; (q = strstr(q, "mil check: gradient rms difference")); q++) {
         double rms, mx, mg, ulp; int nr;
         if (sscanf(q, "mil check: gradient rms difference / rms %lf, max |difference| %lf of max |gradient| %lf, beyond one 16-bit ulp %lf (%d rays)", &rms, &mx, &mg, &ulp, &nr) == 5) {
             ng++; const double e = mg > 0 ? ulp / mg : ulp; if (e > worst_g) worst_g = e;
@@ -105,9 +108,10 @@ int main(int argc, char **argv) {
         }
     }
     fprintf(stderr, "mil check: %d loss lines (worst relative %.3g), %d gradient lines (worst excess over one ulp / max %.3g)\n", nl, worst_l, ng, worst_g);
-    CHECK(nl >= 6 && ng >= 6, "too few windows with rays: %d loss / %d gradient checks (%s/r0.log)", nl, ng, d);
+    CHECK(nl >= 8 && ng >= 8, "too few windows with rays: %d loss / %d gradient checks (%s/r0.log)", nl, ng, d);
     CHECK(worst_l < 1e-4, "device loss vs host: relative %.3g", worst_l);
     CHECK(worst_g < 1e-3, "device gradient vs host: %.3g beyond one 16-bit ulp (of the max)", worst_g);
+    CHECK(strstr(lg[4], "mil check: gradient") != nullptr, "the latent run checked no MIL gradient (%s/r4.log)", d);
     /* (1b) the rays' geometry (sample.c, UFSM_MIL_CHECK): after the symmetry / warp they still cross the window's known ink, with its label */
     long rh = 0, rn = 0, ra = 0; int nw = 0, nwarp = 0;
     for (int run = 0; run < 3; run++) if (run != 1) for (const char *q = lg[run]; (q = strstr(q, "mil rays: ")); q++) { int h, n, a, w; if (sscanf(q, "mil rays: %d of %d meet known ink along the ray, %d of those agree with its label (warped %d)", &h, &n, &a, &w) == 4) { rh += h; rn += n; ra += a; nw++; nwarp += w; } }
@@ -125,7 +129,7 @@ int main(int argc, char **argv) {
     }
     CHECK(nterm >= 6 && m && isfinite(v) && v > 0 && pct > 0, "the ink mil term (%d step lines, %s/r0.log)", nterm, d);
     if (m) { const char *e = strchr(m, '\n'); fprintf(stderr, "logged:%.*s\n", e ? (int)(e - m) : 80, m); }
-    free(t0); free(t1); for (int run = 0; run < 4; run++) free(lg[run]);
+    free(t0); free(t1); for (int run = 0; run < NRUN; run++) free(lg[run]);
     if (!fails) sh("rm -rf %s", d);
     fprintf(stderr, fails ? "test_ink_mil_train: %d FAILED (kept %s)\n" : "test_ink_mil_train: all passed\n", fails, d);
     return fails != 0;
