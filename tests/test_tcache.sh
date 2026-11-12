@@ -30,9 +30,9 @@ for v in "" "--fstem 8"; do
     EXTRA="--hs-tcache 1"; run flag UFSM_HS_TCACHE_CHECK=1; EXTRA=""; run none UFSM_HS_TCACHE_CHECK=1
     grep -q "derived targets kept from the statistics pass" flag.log || fail "--hs-tcache 1: the cache was not taken ($D/flag.log)"
     grep -q "^memory: --hs-tcache keeps" flag.log || fail "--hs-tcache 1: no planner line ($D/flag.log)"
-    [ "$(losses off)" = "$(losses flag)" ] || fail "losses differ with --hs-tcache 1 ($D/flag.log)"
+    [ "$(losses off$t)" = "$(losses flag)" ] || fail "losses differ with --hs-tcache 1 ($D/flag.log)"
     ! grep -q "derived targets kept\|^memory: --hs-tcache\|^target cache check" none.log || fail "the cache was taken without the flag ($D/none.log)"
-    [ "$(losses off)" = "$(losses none)" ] || fail "losses differ without the flag ($D/none.log)"
+    [ "$(losses off$t)" = "$(losses none)" ] || fail "losses differ without the flag ($D/none.log)"
     echo "  --hs-tcache 1: taken and planned for; default: off"
   fi
 done

@@ -119,7 +119,7 @@ static z3 *z3_open_impl(store *s, const char *key, const char *cache_dir, int ty
     z->s = s;
     z->key = strdup(key);
     { static atomic_uint_fast64_t next_id = 1; z->id = atomic_fetch_add(&next_id, 1); }
-    z->cache = cache_dir && !store_is_local(s) ? strdup(cache_dir) : nullptr;
+    z->cache = store_cache_dir(s, cache_dir);   /* (per root: a cache directory is never shared by two roots) */
     pthread_mutex_init(&z->imu, nullptr);
     z3_meta *m = &z->m;
     m->sep = '/';
