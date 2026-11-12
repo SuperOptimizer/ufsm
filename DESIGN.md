@@ -6,6 +6,38 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## predict --boxes: many boxes in one process; the start-up of a predict run (2026-11-12, branch univdec-20261112)
+
+A predict run's start-up, timestamped on the pod box (5 heads + fit-zarr, 16.6 s elapsed, the window loop 10.5 s):
+
+| from (s) | to (s) | what |
+|---|---|---|
+| 0 | 0.07 | the checkpoint |
+| 0.07 | 0.5 | CUDA init, the store over HTTP, the window plan |
+| 0.5 | 1.5 | head stores + unet_build (device buffers) |
+| 1.6 | 3.65 | 9.7 GB of cudaMallocHost (shard rings 2.1, head rings 7.6) |
+| 14.2 | 15.6 | writer tails |
+| 15.6 | 16.6 | exit: cudaFreeHost + teardown |
+
+wbench (and the compression sweep, the snapshot matrices) ran a process per box.
+- `predict --boxes FILE` runs the single-box path once per line (`z,y,x,nz,ny,nx OUT [ARGS]`, where ARGS go ahead of the command's
+  options), so the outputs are those of a process per box.
+- What carries over is the CUDA context, the CT cache, and nn_pool. nn_pool keeps every nn_malloc* / nn_host_alloc* block of a box and
+  hands it to the next box's request of the same size; device blocks are zeroed, as fresh memory is. It frees the blocks a box did not take.
+- The run state that lived in function statics (lazily sized buffers sized by the first window, the attention memory, the fit writer /
+  prefetch / feather / pyramid structs, unet's g_vtok) is reset per box.
+- The shard rings are also capped at the box's shard count: a small eval box held 2 k^3 pinned buffers per head.
+- One process per checkpoint + CT root; wbench PBATCH=1 makes one per scroll.
+
+Numbers:
+- test_predict_boxes: 4 boxes (three sizes, a repeat, q 8 with the GPU encoder), 5 heads + fit-zarr each; every file is identical to a
+  process per box.
+- Fixture: 8 boxes 0.36 s then 0.10 s a box, max RSS 640 -> 649 MB.
+- Pod, 4 wbench-sized Paris4 boxes (512 x 768^2 at 9.6 um, fit fields as wbench predicts them):
+  - 4 processes: 17.2 s;
+  - --boxes: 5.3 s (2.04, 1.03, 0.86, 0.85 s a box);
+  - 267 files per box identical.
+
 ## --fit-zarr fields fused from the cell logits: nn_fit_accum_lat (2026-11-12, branch univdec-20261112)
 
 The z-slab fit path of a latent-grid net wrote and read full-resolution fp16 planes for each z chunk: upsample + shuffle (11 channels), the
