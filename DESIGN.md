@@ -34,6 +34,11 @@ column of the one-slab judge, y 3584 x 2048, is 0 in every judged z tile (rates 
 weight are scattered (e.g. z, y, x = 2304, 2048, 1536 at 104 /m). With a Paris 4-calibrated ramp, 1299 survives as about a fifth of its
 coherence weight. A softer ramp (e.g. relative to 1299's own distribution) would be a choice, not a measurement: nothing validates the
 fibres on 1299 itself.
+Against fibhvd's per-cell outward-direction score (128^3 cells outside the held-out band, 17,289 cells): fibre-zero tiles hold 0.541 of
+the labelled voxels, 0.224 of them in cells with outward >= 0.95; the correlation of the two per cell is -0.09, and the median fibre
+rate is 411 / 373 / 401 /m in the low / middle / high outward bins. The outward score mostly measures whether a sheet faces the axis
+(0.83 correlation with the gradient's alignment to the radius), not flips, so the two checks are independent and neither confirms the
+other; the combined mask rule is with the lead.
 
 **Papyrus voxel mask (`phase-coh --papyrus T --pap-dilate R --phase-out 1`, latinf 72a2530).** The pair-rule fill labels everything
 between two wraps, and surf-labels ignores only CT 0 (outside the scan mask), so air inside the scroll carried labels. The new options
