@@ -91,6 +91,432 @@ What would make it smaller:
 - the shifted regions: each block upsamples the winding pair and runs the stem on 3 more regions, 2/3 of the stem work. A window-wide
   pass that keeps the winding pair's fp16 logits (4 B a voxel) would remove that.
 - The fit_accum_w4_k order forces a 512-long serial chain per accumulator; the sums can't be split without changing the bytes.
+## The sub-cell head over more than 16 task outputs (2026-11-12, branch subcell-20261112)
+
+`--lat-guide 3`, the sub-cell head, used to have exactly 144 outputs: 16 interpolated base outputs plus 128 sub-cell terms (the
+phase pair x 64 voxels of a 4^3 cell). That capped the task at 16 outputs, and the fibre head needs 13 + 9 = 22.
+- The base is now the task's outputs rounded up to 16 (LBASE). Up to 16 outputs that is 16, the old 144-output head, so old
+  checkpoints load and train unchanged.
+- The fibre head already pads g_cout to 32. That gives 32 + 128 = 160 head outputs.
+- train's shuffle / adjoint calls, the fp32-gradient output count (LGFC), and the zero-init of the sub-cell rows now use LBASE.
+  predict already read the base as cout - 128; its three literal 16s (the fit-field shuffle, the side-pair slab, nn_lat_place_rvs)
+  now use that too.
+- The MX 1x1 conv (lp_conv1_to_mx / _r) takes up to 192 inputs (a CI 192 instantiation for 145..192).
+- test_predict_heads (3): the fibre head on a sub-cell net (rv 2) trains, and its log reports "outputs 32-159 start at zero".
+  predict --heads all writes rv, fib/H, fib/V and fib/fam.
+- Not generalised: the sub-cell terms still refine only the phase pair. The rv / ink / fibre outputs are interpolated.
+
+## Phase on the fly from meshes: the sources key, behind the derived cache (2026-11-12, branch meshsrc-20261112)
+
+The 2.4 um rungs need level-0 codes. Stored, those run ~170 GB for Paris 4 June alone. fibhvd's mesh_codes_open (meshcodes.h)
+rasterises them on read, byte-identical to `ufsm raster --value q.tif --binary 0`. This section adds the sources key that opens it.
+
+**The key:** `"phase": {"level": L, "onfly": {"meshes": {"dir", "value": "q.tif", "map": reg.json, "level": L}, "rmax", "cache_dir",
+"cache_mb"}}`. The same key also works inside a `"sets"` entry. "level" is the codes' CT level and defaults to the phase's level.
+"map" sends the meshes through a reg map into this source's scan (the 1.129 um twins).
+
+**The derived cache:**
+- The pair-rule phase of mesh codes sits behind z3_open_cached.
+- The key is "phase-onfly-pair-v1 rmax R codes <mesh_codes_key>-pool<n>". mesh_codes_key hashes every mesh's TIFF sizes and mtimes,
+  the value name and the map.
+- Defaults: $UFSM_DERIVED_CACHE or ~/.cache/ufsm/derived, with a 1024 MB memory LRU.
+- Phases from stored codes stay uncached, as before.
+- The cell edge is at least 3 rmax, capped at 512, and it is part of the key. The pair rule reads codes with an rmax + 2 halo, so at
+  rmax 160 (the 2.4 um rung) a 128^3 cell computed 44x its voxels. On the pod, 10 workers produced no P 1280 batch in 8 minutes.
+  A 512 cell computes 4.3x its voxels.
+- `"cache": 0` turns the cache off: the phase is computed on every read.
+- **Pod bench** (2026-11-12): sampler-only, 1667 A24 / B24 from the meshes, rmax 160, P 1280, 10 workers.
+  - Uncached: first batch 37 s, then 396 Mvox/s (~5.3 s a 2.1 Gvox window). RSS 45-53 GB.
+  - Disk-cached (512 cells): first batch 312 s, then 214 Mvox/s, 6.7 GB written for 12 windows (0.55 GB a window, few revisits).
+  - Decision: U2 runs the 2.4 um sources with "cache": 0. A run's windows would need TBs of disk cache, and the cached path is slower
+    on first touch. The disk cache pays only where windows revisit a small labelled region.
+
+**The next rung** (phase_pl[L + 1], the scale rungs) rasterises the meshes at level L + 1 directly. That is the stored level-(L + 1)
+raster, and 8x fewer voxels than rasterising level L and pooling. When the CT has no level L + 1, the level-L codes are pooled
+instead.
+
+**test_mesh_phase** uses test_codes_onfly's four meshes (two nested sheets, a crossing plane, holes / NaN q):
+- At level 0, the meshes' phase equals the phase of `ufsm raster`'s stored codes: 0 of 147244 known voxels differ.
+- At level 1, it equals the phase of the level-1 raster: 0 of 59232 differ.
+- A second load computes nothing: 14 cells come from the disk cache, against 17 computed on the first load.
+
+## Universal net eval harness: pod baselines, fed levels, the ink teacher, and the --fit-zarr off-grid bug (2026-11-12, branches univ-eval-20261111 + fitslab-20261111)
+
+`scripts/univ/eval.sh CKPT TAG` builds the task x resolution matrix (wbench core at the native level and fed one level finer / coarser
+(`DLV`), cross-res on the fine scans, rv p1667, fibre HOLD, ink crops); `podeval.sh` runs it on a pod with the desk's labels. All rows
+below are from one pod (RTX PRO 6000, one fitter build 5761fc39): a pod row is never paired with a desk row (desk - pod on wind96:
+p05x -0.002 [-0.008, +0.004]).
+
+**Fed levels (39 clean core boxes, ceil >= 0.8; p05x / ids).** Every net loses about as much off its native level, so a fed row is
+compared with the reference fed the same level, not with the reference's native row (the matrix did the latter until 5b5862f).
+
+| net | native 9.6 um | fed 4.8 um (DLV -1) | fed 19.2 um (DLV +1) |
+|---|---|---|---|
+| wind96p (voxel net) | 0.675 / 0.521 | 0.431 / 0.291 | 0.346 / 0.171 |
+| lat-wz896p (latent, step 12000) | 0.624 / 0.447 | 0.308 / 0.194 (26 boxes) | 0.398 / 0.226 |
+| u1-3000-prefix (universal, 3000 steps, before the fine-stem fix) | 0.644 / 0.492 | 0.400 / 0.266 (26 boxes) | 0.404 / 0.234 |
+
+U1 at 3000 steps minus the reference, paired: native -0.031 [-0.046, -0.015] p05x vs wind96p, +0.020 [+0.004, +0.037] vs lat-wz896p;
+fed 4.8 um +0.021 [-0.002, +0.044] and +0.091 [+0.072, +0.113]; fed 19.2 um +0.058 [+0.034, +0.081] and +0.006 [-0.011, +0.023].
+predict gives each fed level its scale FiLM code (log2(um / 4.8): 0 / 1 / 2, the same `unet_scale_code` as train.c), and U1 trained
+on all three, so the drop is the net at that scale. These U1 rows are a trunk-progress check only (pre-fix stem); gated rows start at
+snapshot 10000 and are tagged `-mh` (masked holdout).
+
+**Masked-holdout control (`holdsplit.py`).** From step 7607 U1 draws windows over the wbench boxes with their labels masked (box +
+16-voxel guard); HOLD and 139-1..8 stay rejected (CT unseen; `u1reject.txt`). The control is U1 - reference on masked vs reject boxes.
+The two groups are different scrolls, so the split is not zero without any masking: u1-3000-prefix (every holdout window rejected) -
+lat-wz896p gives masked - reject +0.018 p05x, +0.049 ids. A gated snapshot's split is read against that.
+
+**rv p1667 (recto-ruler).** A cell is turns per GT turn (1 = right) / share of GT intervals off >= 0.5 turn (lower is better); the
+first column of a ruler row is the reference count fit, not the model. u1-3000-prefix rv.pk 0.391 / 0.724 (rv1d2-10000: 0.926 /
+0.377), rv.run 0.984 / 0.307 (1.135 / 0.384).
+
+**Ink teacher baseline** (ink3d-ext, dino3d 78k, `--surface`: only the 256^3 crops touching each crop's segment), 24 held-out crops,
+`ink-score` of the rendered map vs the human labels and inkB's voxelwise `ink-vscore` vs the 3-D ink-splat references:
+
+| crops | 2-D AUC / best F1 | voxelwise AUC / best F1 |
+|---|---|---|
+| Paris 4 (16) | 0.735 / 0.576 | 0.727 / 0.572 |
+| PHerc0139 (4) | 0.632 / 0.487 | 0.651 / 0.498 |
+| PHerc1667 (4) | 0.566 / 0.496 | 0.561 / 0.508 |
+
+The two scores agree within 0.02 per set. (`ufsm render` reads only wrap dirs named `w*`: the 0139 / 1667 crops rendered nothing until
+eval.sh named the wrap dir `w_<crop>`.)
+
+**predict --fit-zarr with a box off the window grid.** With `--grid-origin` the windows are anchored on the global grid while the
+shards, and with them the field slabs, start at the box. A window can then cover two shards and is run once for each; its image output
+was clipped to the tile's shard, its fit cells only to the box. Where such a window crossed a field-slab boundary (FZ cells in z) its
+cells were written past the slab: a segfault in `ffw_main` on 13 of the 39 clean core boxes at DLV -1 for the latent nets (cube 640 /
+64 windows, stride 512, --fit-h 4: two slabs of 128 cells, e.g. C19 at z 768). Fix (5a71359): the cells are clipped to the tile's
+shard, with an error if cells still span two slabs; `test_predict_fitgrid` (off-grid box over two slabs; fails on the old code).
+
+Did stored rows lose cells silently? No. A box is at risk only if a window interior crosses a slab boundary, which needs more than one
+slab in z; the wbench boxes at DLV 0 / +1 have one. Checked on the pod with the binary the rows were predicted with (a12c5b6) plus only
+the predict.c clip, every array chunk by sha1 against the stored fields (`latres/gridchk.sh`, `gridchk.tsv`): an on-grid control (PH3)
+with the old and the patched binary is identical to the stored fields for wind96p and lat-wz896p; every core box whose z origin at the
+fed level is off the net's z window grid (wind96p: window-z 384 / 64, stride 256; latent nets: stride 512):
+
+| row set | boxes off the grid in z | chunks | differ |
+|---|---|---|---|
+| wind96p DLV 0 / +1 | 15 / 21 | 2530 / 3278 | 0 / 0 |
+| lat-wz896p DLV 0 / +1 | 21 / 40 | 4172 / 6662 | 0 / 0 |
+| u1-3000-prefix DLV 0 / +1 | 21 / 40 | 4172 / 6662 | 0 / 0 |
+
+wind96p's DLV -1 / -2 boxes are on its grid (z origins double to multiples of 256). The latent nets' 13 crashed DLV -1 boxes had no
+rows; lat-wz896p's were predicted with the fix afterwards. No stored row changes.
+
+## Fibre gate of our spiral labels: whole-scroll PHerc1299, PHerc1218 with our fibres, a papyrus voxel mask, fibre rows per scroll (2026-11-12, branches fibers-20261110 + latinf-20261109)
+
+The fibre judge (section "Fibre judge in C" below) turned into a per-tile training gate for our fitted spirals. Rate = persistent sheet
+changes (H + V) per m of labelled fibre in a 512^2 x slab tile; gate 1 at the reference rate, 0 at 2x, linear in between. Tiles with
+< 0.5 m of fibre are not judged and keep the coherence weight (box default 1). Tools: `tools/fj_boxscale.py` (judge rows -> phase-coh
+`--box-scale` file), `tools/fib_cat.py` (per-tile UFIB files -> one), `tools/fib_affine.py` (UFIB through a published transform.json;
+identity is byte-exact, a round trip is within 1e-3 voxel). `phase-coh --box-scale` is cdb87b7 (hostmem). Scratch:
+`/vesuvius/ufsm/fibers/work/{fjfull_1299,fjpap,fj1218,fj0139}`.
+
+**PHerc1299, whole scroll.** The official fibre prediction was traced at level 4 in 17 chunks of 192 slices (`work/trace_1299_full.sh`),
+judged against the snapped render `latcal/labels_snap/PHerc1299`: 426 tiles, 550 m of fibre, 286 tiles with >= 0.3 m. Tile rates are
+104 / 318 / 403 / 473 / 1483 /m (min / q25 / median / q75 / max); the whole scroll is H 561, V 332 /m. The one-slab figure (374) holds
+for the whole scroll. Gate 189 .. 378 /m (Paris 4's median against its wraps): `latcal/fib/PHerc1299-full.boxes`, 271 judged tiles:
+155 at 0, 14 at 1, 102 partial. Weight `latcal/coh_fibF/PHerc1299` (from labels_snap, 0..0.3 coherence ramp x fibre gate):
+
+| 1299 weight | mean weight | known voxels with w >= 0.1 | weight sum vs coherence only |
+|---|---|---|---|
+| coherence only (`coh_snap`) | 0.211 | 0.476 | 1 |
+| one-slab gate, default 1 (hostmem, `coh_fib1`) | 0.205 | | 0.972 |
+| whole-scroll gate (`coh_fibF`) | 0.048 | 0.126 | 0.228 |
+| whole-scroll gate on the papyrus-masked phase (`coh_fibFP`) | 0.045 | 0.121 | 0.217 |
+
+What goes: 96 % of the known voxels lie in judged tiles. The gate is lowest at the ends of the scroll (z < 20 mm: mean factor 0.07;
+z > 100 mm: 0.05) and near the core (radius < 5 mm: 0.04); it is best at z 60..80 mm (0.26) and radius 5..20 mm (about 0.2). The worst
+column of the one-slab judge, y 3584 x 2048, is 0 in every judged z tile (rates 407 .. 1057 /m). The 6 % of tiles that keep a full
+weight are scattered (e.g. z, y, x = 2304, 2048, 1536 at 104 /m). With a Paris 4-calibrated ramp, 1299 survives as about a fifth of its
+coherence weight. A softer ramp (e.g. relative to 1299's own distribution) would be a choice, not a measurement: nothing validates the
+fibres on 1299 itself.
+Against fibhvd's per-cell outward-direction score (128^3 cells outside the held-out band, 17,289 cells): fibre-zero tiles hold 0.541 of
+the labelled voxels, 0.224 of them in cells with outward >= 0.95; the correlation of the two per cell is -0.09, and the median fibre
+rate is 411 / 373 / 401 /m in the low / middle / high outward bins. The outward score mostly measures whether a sheet faces the axis
+(0.83 correlation with the gradient's alignment to the radius), not flips, so the two checks are independent and neither confirms the
+other; the combined mask rule is with the lead.
+
+**Papyrus voxel mask (`phase-coh --papyrus T --pap-dilate R --phase-out 1`, latinf 72a2530).** The pair-rule fill labels everything
+between two wraps, and surf-labels ignores only CT 0 (outside the scan mask), so air inside the scroll carried labels. The new options
+take a known voxel with CT < T and no CT >= T within R voxels (cube) to weight 0 and, with `--phase-out`, to unknown in a masked copy of
+the phase (the sampler's weight works per 8^3 block, so a voxel mask has to be in the phase). The test runs it against a brute-force
+mask: 0 voxels off. With T 64 (the sources' iso), R 2:
+
+| render | known voxels masked as air | fibre judge before -> after (tile median /m; H / V persistent /m) |
+|---|---|---|
+| 1299 snapped, whole scroll | 4.91 G of 35.4 G = 13.9 % | 403 -> 397; H 561 -> 554, V 332 -> 330 |
+| Paris 4 band z 11328 + 512 (snapped, official fibres) | 2.21 G of 16.5 G = 13.4 % | 196 -> 195; 209 / 238 -> 207 / 236 |
+| Paris 4 band, our fibhv-a fibres | (same) | 128 -> 126 |
+
+The mask removes a seventh of the labels, the same share on both scrolls, and leaves the fibre rate where it was. Fibres run in papyrus,
+so they never see the air labels. The mask therefore cleans labels the judge cannot see, and it does not explain 1299's rate. On 1299's
+median tile, the excursions hostmem traced to the fill between wraps are inside papyrus. Masked phase:
+`latcal/papy/PHerc1299/phase.zarr`.
+
+**PHerc1218 with our own fibres** (fibhv-a step 10000, 6 bands of 512 slices, per-tile traces, the lead's pod run), calibrated on the same
+predictor over the Paris 4 slab. All rows are persistent /m, with pairs within half a turn at 0.3 / 0.6 mm:
+
+| fibres -> basis | tile median | H / V | H pairs | V pairs |
+|---|---|---|---|---|
+| fibhv-a Paris 4 -> GT phase | 72 | 94 / 108 | 0.954 / 0.929 | 0.949 / 0.923 |
+| fibhv-a Paris 4 -> our snapped band render | 128 | 157 / 166 | 0.924 / 0.883 | 0.922 / 0.885 |
+| fibhv-a Paris 4 -> our snapped wraps | 196 | 215 / 238 | 0.887 / 0.800 | 0.876 / 0.788 |
+| official Paris 4 -> GT | 111 | 111 / 149 | 0.952 / 0.925 | 0.934 / 0.908 |
+| official Paris 4 -> wraps | 189 | 206 / 199 | 0.871 / 0.775 | 0.837 / 0.728 |
+| **fibhv-a 1218 -> label render (5 bands with labels)** | **584** | 643 / 710 | 0.770 / 0.730 | 0.751 / 0.713 |
+| fibhv-a 1218 z 10240 -> render | 403 | 431 / 436 | 0.817 / 0.788 | 0.806 / 0.770 |
+| fibhv-a 1218 z 10240 -> snapped wraps | 502 | 509 / 535 | 0.760 / 0.673 | 0.742 / 0.641 |
+| fibhv-a 1218 z 10240, y and x swapped (control) | 2845 | | 0.233 / 0.389 | |
+
+On Paris 4 the layer-mask fibres judge like the official ones, and better, because their lines are short. By the same measure 1218's
+labels are 3 .. 5x worse than Paris 4's: band medians are 663 / 649 / 403 / 584 / 727 for z 2048 / 6144 / 10240 / 14336 / 18432 (z 21504
+is past the spiral). The swapped-axis control rules out a frame error. Against the wraps the rate is worse still (502 vs 403 on the
+render's band), as on Paris 4 (196 vs 128). The gate `latcal/fib/PHerc1218-fibhv.boxes` (ramp 128 .. 256) puts 210 of 223 judged tiles at
+0. That conflicts with the user's reading of 1218 and with the GT-free probes (wrapcheck 0 dups, outward 0.989). The open question is
+whether fibhv-a is trustworthy on 1218: it was trained on Paris 4 / 1447 / 0175A labels and is validated on Paris 4 only. The control
+that decides it is fibhv-a on 1447 or 0175A (same 8.64 um acquisition as 1218) against their wraps; with the published v2 fibres those
+scrolls rated like Paris 4. That control needs a GPU and has not run. Until it does, the 1218 gate is not applied.
+
+**Fibre rows per scroll, official prediction against our wraps** (tile median persistent /m; pairs at 0.6 mm H / V): Paris 4 189
+(0.775 / 0.728); PHerc0139 241 (0.775 / 0.668; prediction on scan 20260102150214 traced at level 4, one chunk L4 z 2208 + 192 = our z
+9728 + 768, through the published `20260102150214-to-20250728140407-r1` affine, so registration error is inside the figure); PHerc1299
+~375 (0.596 / 0.674 on one slab). PHerc1451 has a prediction (scan 20260319101107) but no published transform to our 8.64 um scan;
+PHerc0332 is not in our inventory. Against the GT-free table (hostmem's `latcal/probe/ranking.tsv`, plus a rank-average of wrapcheck,
+fit-join, probe outward, coherence and geom-check): the fibres agree with outward that 1299 is the weakest of these scrolls (outward
+0.884, the only FAIL), while 1299 ranks well on fit-join boundary agreement (0.882, 5th of 32) and flattening. 1218 ranks high on
+wrapcheck (0 non-real, 5th on two-plus) and outward (0.989, 2nd of 11), middle on fit-join (0.821, 17th), and low on CT coherence
+(probe coh >= 0.3 0.017, 18th of 24) and CT peaks per turn (0.862, 26th). Coherence ranks 0139 above Paris 4 against GT pair accuracy,
+so it is a within-scroll gate, not a between-scroll ranking (hostmem). Coherence and peaks per turn track the scan (the 8.64 um 1.2 m
+scans score low as a group), not only the labels.
+
+## Old branches folded in (2026-11-12, branch oldmerge-20261112)
+
+Three stale branches whose features master lacked, re-applied onto the current code; the remote branches are deleted (names and shas in
+`/vesuvius/ufsm/deleted-branches-20261112.txt`).
+
+- **stripopt-20261030** (243d57d, merged as is): flatten prolongate: when relaxing more than doubled the stuck-triangle set, go back to
+  the relax state with the fewest stuck triangles and drop only those (P4 core chunks: 293 bad -> 4134 after 200 rounds, 2.4-3% of the
+  mesh dropped as flaps; chunks 189-194 aniso p50 / p95 1.139 / 1.751 -> 1.079 / 1.278).
+- **ink-teach** (2 of 5 commits; `ink-splat --exclude`, value_hist and the 65500 px JPEG skip were already in master through
+  inkgt-20261111, src/inksplat.c is untouched):
+  - `ink-ext --native-only` (8357e4b): only `<name>_<model>_native.tif / .jpg` on the model grid (invalid cells 0, valid-cell area in
+    the log), no canvas TIF (P4 whole-wrap segments: canvas > 10 G px).
+  - `render --known` (2adefad): nearest voxel, 255 (prob254 unknown) skipped, the max over the known values within +-depth; for eye
+    checks of ink-splat label zarrs. Master's render has since become chunk-ordered / GPU by default, and those samplers are
+    trilinear only, so `--known` takes the CPU `render_rows` path (the box read once when it fits UFSM_RENDER_MEM, else per tile)
+    and is refused with `--fill` / `--joint`. test_render_known: both paths against the dense reference on a label volume with an
+    unknown hole and invalid vertices, 0 of 18204 pixels differ; the plain render of the same volume differs (the 255s win).
+- **inkext** (4676177):
+  - `ink-compare --mask M.tif`: statistics and panels only where M > 0 (M on the renders' grid before `--crop`). Implemented in
+    `ink_compare_mem` only, so `--mask` routes there (not streamed: the renders are held in memory). test_render_stream: the
+    statistics equal those of the renders zeroed outside the mask, bit for bit, with and without `--crop`.
+  - `png2jpg --size W,H | --size-like REF.tif` (bilinear resize first); its JPEG input was already in master (magic-byte detection,
+    imgops' jpeg_read_rgb kept instead of the branch's copy).
+  - `ink-ensemble --peak-cover F` (default 0.5: the least covered share of a `--peaks` window).
+
+## The MIL ink loss in the trainer, and ink dice on the universal head (2026-11-12, branch mil-20261112)
+
+Goal: U2 starts with the ink head trained on human GT. The voxel ink target (onfly `--face` splat) only covers label pixels where
+the face search finds an open papyrus face: 31 % (1667) to 42 % (Paris 4) of the supervised pixels have none. The normal-pooled
+MIL loss (villa's normal_pooled_3d; inkB's slab kernels, inkmil.h) supervises those pixels too.
+
+**Flags** (`--task unwrap2 --ink-head 1`):
+- `--ink-mil L` turns the MIL term on. It adds L x the source's ink weight x the mean over the window's rays of
+  BCE(pooled logit, label). The labels are smoothed with `--ink-smooth`, the same as the voxel BCE.
+- `--ink-mil-r 10` and `--ink-mil-step 1` set the reach and step along the normal: K = 2R / step + 1 = 21 samples.
+- `--ink-mil-tau 0` pools with the hard max (villa's choice); tau > 0 uses the soft max, tau log mean exp.
+- `--ink-mil-mode 1` takes only the pixels without an open face (the voxel target's unknowns); mode 0 takes every pixel.
+- `--ink-mil-stride 2` takes every 2nd label row and column (inkB: ~3 us of CPU per ray).
+- `--ink-mil-max 65536` caps the rays per window with an even subsample, because the device buffers are fixed.
+- `--ink-dice W` is now allowed with the ink head: BCE + W x the soft dice of the window's known voxels.
+
+**Rays in the sampler** (sample.c, batch.mil / nmil):
+- inkfly_rays runs on the source's onfly ink target, whichever channel holds it. The window is at the target's level L, or at
+  L + 1 with the points scaled by 1/2.
+- Rays inside the training-holdout mask boxes plus the guard are dropped. These are the same boxes that mask the labels.
+- The rays then go through the window's cube symmetry and warp (`sample_mil_map`). The point maps through the forward map,
+  which inverts sample_warp_ink's pull. The normal maps through a one-voxel step and is renormalised. Rays that leave the window
+  are dropped.
+- Crushed, torn, delaminated and re-bent windows carry no rays.
+
+**Trainer** (head_slab_pass):
+- Pass 0 runs ink_mil_fwd_slab on each slab's fp16 ink logits.
+- After the last slab, ink_mil_fin applies the scale (weights / rays x the 16-bit gradient's scale).
+- Pass 1 runs ink_mil_bwd_slab after the voxel BCE gradient, adding into the slab's gradient in place.
+- The rays go to the device per batch buffer, on the copy stream in the async path.
+- The planner adds mil_bytes: the rays, the accumulator, and inkmil's sort buffers, about 48 B per corner pair (8 per sample).
+  That is 0.55 GB at 65536 rays x 21 samples. Use a smaller `--ink-mil-max` on the 16 GB desk cards.
+- The step loss includes the MIL term. The log adds `ink mil BCE (N% of windows, rays per window)`.
+
+**test_ink_mil_train:**
+- sample_mil_map against sample_warp_ink, using a blob's centroid: 24 of 24 maps agree (8 symmetries x {identity, rotation +
+  elastic, + affine + zoom}). The worst point error is 0.042 voxels and the worst normal error 0.68 deg.
+- On the spiral fixture with one sheet as a tifxyz segment and its ink target on the fly, train --ink-mil 1 --ink-mil-mode 0
+  --ink-dice 0.25 ran 6 steps with symmetries and warps on. Every window drew rays: 506-2443 per window at P 64, stride 2.
+  ink mil fell from 1.036 to 0.72 and ink bce from 1.43 to 0.77.
+- At lr 0, the step-1 loss is 5.98210 with MIL and 4.94610 without; the difference is exactly the logged mil term, 1.03600.
+
+## The human ink targets on the fly, the derived-array chunk cache, and the villa ink recipe (2026-11-11, branch inkfly-20261111)
+
+**On the fly.** The stored splats of the section below (inkgt/gt) are now only the reference. Training reads the same bytes from a
+derived array: `inkfly_open(ct, segs.json, cfg, ...)` (inksplat.c), a sources target `"ink": {"onfly": {"segments", "level",
+"iso", "face", "holdout_file", "cache_mb", "cache_dir"}}`.
+- **Open.** Every label window's mask is read once. The 0/1 -> 0/255 rule is decided per window (as inksplat_run does), and each
+  supervised 64^2 tile's 3-D box (reach 21 voxels) goes into a 1024^3 grid.
+- **Per 128^3 chunk:**
+  - the candidate tiles from the grid;
+  - per window, the label rectangle and the supervised pixels whose surface point can reach the chunk;
+  - the CT box around those points only, through a zcache;
+  - face search and splat with ink-splat's arithmetic (rect offsets split exactly);
+  - known-max merge over windows, with the held-out boxes and CT >= iso applied as in the stored splat.
+- **Level 2** is known-max 2x pooling of the level-1 array, as in the stored pyramid.
+- **Draw cells.** The sampler draws from the label tiles' boxes (inkfly_cells), not from the CT's chunk map. Ink-only sources therefore
+  draw only where labels reach; univA confirmed ink-only sources train with the winding losses at 0.
+
+**The chunk cache (dcache.h, shared).** `z3_open_cached(inner, dir, key, cell, mem_mb)` wraps any array, typically a derived one, so
+the derive signature does not change.
+- Reads are served in cell^3 cells. Each is looked up in a memory LRU, then in DIR/<sha256(key)>/<cz>/<cy>.<cx>; only then is inner
+  read, with an aligned cell box.
+- Concurrent readers of a cell wait for the first one's compute. Processes sharing DIR race only on atomic renames. Deleting DIR is
+  always safe.
+- DIR/<hash>/inputs.txt holds the key. For ink the key is a code-version string, the CT, the cfg, the held-out boxes, the size and
+  mtime of every mesh / label raster, and the segments json, so edited inputs miss the cache.
+- DIR is `"cache_dir"`, else $UFSM_DERIVED_CACHE ("off" = memory only), else ~/.cache/ufsm/derived.
+- Phase and fibre can wrap their derived arrays the same way.
+
+**Gate and cost** (`ufsm ink-onfly SEGS --box .. --ref <stored splat> --dcache DIR`, 8 threads, desk):
+
+| box (4.8 um voxels) | known / ink | cold: cells (labelled) | cold CPU | from disk | result |
+|---|---|---|---|---|---|
+| 1667 around crop w029_0, 863 x 905 x 663 | 0.98 M / 0.26 M | 392 (55) | 6.1 s (CT 3.3 s) | 0.07 s | 0 of 518 M voxels differ |
+| Paris 4 around crop w02_0 (a held-out box inside), 1280 x 1240 x 796 | 4.55 M / 0.90 M | 847 (234) | 25.6 s (CT 7.1 s) | 0.17 s | 0 of 1.26 G voxels differ |
+| MAN5 (before the cache) | 1.2 M / - | | | | 0 differ |
+
+- About 110 ms of CPU per labelled cell computed, against 0.2 ms per cell read from disk and 0.4-1.1 ms per warm 256^3 window.
+  Cells that no label can reach cost nothing (612 of 847 on Paris 4).
+- Disk use is about 12 KB per labelled cell; constant cells take 16 bytes.
+- A whole scan is computed once: about the 40 CPU-min of the stored splats, spread over the first epoch's reads.
+- What remains per process is the index open: Paris 4 33 s -> 10 s, 1667 19 s -> ~6 s, after a row memcpy in lsrc_read (the
+  per-byte copy was half of it) and the windows on 8 threads. Paris 4 is opened by three sources (june / july / june48). The rest
+  is the serial mesh TIFF loads.
+- The index (tile boxes, 0/1 flags) is cached beside the chunks as DIR/<hash>/index.bin, under the same inputs key: Paris 4 opens in 0.7 s from it, against 10.8 s cold.
+- test_ink_splat: on the fly == stored over two merged crops with a held-out box, on odd boxes, cold, from memory, and from disk
+  through a reopened array (0 cells recomputed).
+
+**The GPU port (nn_inkfly.cu, inkflygpu.h).** A cold chunk's compute now runs on the device; the host keeps the I/O.
+- **Host:** the candidate tiles, the label rectangles (lsrc_read), a mesh patch per unit (the rectangle's grid cells +- 1 label px)
+  and the CT box.
+- **Device, two stages on the calling thread's own stream and buffers** (the sampler's workers run concurrently):
+  - near: one thread per label pixel of the candidate tiles computes ssurf_pn and the near test, and appends near pixels with
+    their P / N and the level-0 box their samples reach (atomic min / max). With no near pixel, the chunk is unknown and no CT is read.
+  - finish: per unit, the face (27 trilinear samples, [1 2 1] in float, face_of), then the splat (one thread per pixel x sub-sample,
+    atomic counts and max; the CPU's saturating uint8 counts are min(count, 255)), then the finalize merged by known max.
+- **Exactness:** -fmad=false, IEEE sqrt / division, the CPU's expression order. The bytes match the CPU's: 0 differing voxels on the
+  1667 and Paris 4 gate boxes and in test_ink_splat (open 2, now tagged gpu).
+- **Fallback:** a mesh patch that falls short returns 1 and the CPU code runs. A CUDA failure turns the GPU off for the process.
+- **Device choice:** train uses `--onfly-gpu` (as phase / fibre); ink-onfly uses $UFSM_INKFLY_GPU (default 0); $UFSM_INKFLY_CPU=1
+  forces the CPU.
+
+1667 gate box (55 labelled of 392 cells, 90 with near pixels; desk, both GPUs at 100 % with u1 training):
+
+| | 1 thread: wall / CT / device | 8 threads: wall |
+|---|---|---|
+| CPU | 4.7 s / 1.3 s / - | 1.5 s |
+| GPU | 3.5 s / 2.1 s / 0.9 s (10 ms per chunk) | 1.0 s |
+| GPU + UFSM_GPU_DECODE=1 | 4.3 s / 2.8 s / 1.0 s | 1.9 s |
+
+On the Paris 4 gate box at 8 threads: GPU 8.7 s wall, CPU 15.9 s (the desk was loaded by other suites).
+- The face + splat is now ~10 ms per chunk on a shared GPU, against ~90 ms of CPU.
+- The CT decode (~23 ms of CPU per chunk, decoded chunks shared through the zcache) is now the larger part.
+- nn_gpudec through z3_read (UFSM_GPU_DECODE=1) is byte-identical but slower while the GPUs train: small batches queue behind u1's
+  kernels. CT decode therefore stays on the CPU by default; the decoded CT feeds the device box through one H2D copy.
+- With the disk cache, each chunk is paid once per dataset in any case.
+
+**MIL building blocks (adopt item 1; the loss wiring is univA's head_slab_pass).**
+- **Rays:** `inkfly_rays(handle, o, n, mode, stride, R, ..)` gives the rays of a level-L window: per supervised label pixel whose mesh
+  point lies in the window, the point and unit normal in window voxels, the 2-D label and a weight. Mode 0 takes every pixel; mode 1
+  only those without an open face (the voxel target's unknowns, by the same face search). Pixels within R + 1 voxels of a held-out box
+  are left out.
+- **How many lack a face** (`ink-onfly --rays`, R 10):
+  - 1667 gate box: 1.34 M supervised pixels, 410 k without a face (31 %, 24.6 % ink vs 25.4 % overall);
+  - Paris 4 gate box: 6.53 M, 2.72 M without a face (42 %, 26.6 % ink).
+  The unfaced pixels carry the same ink share, so MIL on them adds unbiased supervision.
+- **Ray cost:** about 3 us of CPU per ray including the face search, so ~0.15 s for a 256^3 window's ~43 k rays; stride 2 gives a
+  quarter of that.
+- **Loss:** `ink_mil_loss_dev` (nn_inkmil.cu, inkmil.h). One thread per ray takes K = 2R / step + 1 trilinear samples of the
+  full-resolution ink logit along the normal and pools them: soft max tau log mean exp(z / tau), or the hard max at tau 0. Then BCE
+  with label smoothing eps, the gradient spread by atomics over the samples' trilinear corners.
+- **test_ink_mil:** the host reference matches central differences (max rel err 1.5e-7 soft, 2e-8 hard), and the GPU matches the host
+  (loss to 1e-6, gradient error 5e-9 of 3e-3).
+
+**The teacher baseline on the 24 held-out crops** (latres, pod: ink3d-ext dino3d 78k, predicted with --surface at 4.8 um;
+/vesuvius/ufsm/wbench/univ/pod/ink3dext/{vscores,scores}.tsv). The 3-D score is ink-vscore against inkgt/evgt; the 2-D score is
+render + ink-score against the human labels.
+
+| scan (crops) | 3-D AUC | 3-D best F1 | 2-D AUC | 2-D best F1 |
+|---|---|---|---|---|
+| Paris 4 (16) | 0.727 | 0.572 | 0.735 | 0.576 |
+| PHerc0139 (4) | 0.651 | 0.498 | 0.632 | 0.487 |
+| PHerc1667 (4) | 0.561 | 0.508 | 0.566 | 0.496 |
+| CT floor (24) | 0.513 | 0.443 | | |
+
+The 3-D and 2-D numbers agree to about 0.02, so the face-placed voxel GT ranks a teacher the way the 2-D labels do. 1667 is barely
+above the floor, which is the scan where human-GT training has the most to add. These are the numbers the U4 ink head has to beat.
+
+**The slab form (for head_slab_pass; option A).** The full-resolution logit of option B is 1.4-2.8 GB at P 896, so the loss runs on
+train's 32-plane fp16 / bf16 slabs instead, within the existing two passes:
+- fwd_slab (pass 0): each sample's corner terms inside the slab are added to its accumulator, so a sample is complete after the last
+  slab wherever the cuts fall.
+- fin (between the passes): pooling, BCE and smoothing turn the accumulators into dL/dz per sample. The per-ray losses are summed in
+  a fixed order.
+- bwd_slab (pass 1): the slab's (voxel, slot) corner terms are radix-sorted and each voxel's run is summed in slot order. There are
+  no float atomics into the gradient, so it is deterministic under --det.
+- test_ink_mil: 1, 3 and 7 slabs match the full-volume reference on the rounded logits (gradient error 9e-7 of 2.7e-3 soft, 3e-6 of
+  1.2e-2 hard; bf16 within 1 %), and a rerun gives identical bytes.
+
+**Validation masks as per-pixel holdouts (adopt item 3).** Segments may carry the published validation raster as "validation"
+(scripts/inkgt/addval.py: open-data validation.zarr/0, HF <seg>_validation_mask_v2.tif, kept only when the shape matches the labels).
+- Found for 54 of 149 label windows: 0009B 2/2, 0139 11/27, 0500P2 2/2, 0814 1/1, 0841 3/3, 1667 35/39. MAN5 and Paris 4 have none.
+- inkfly folds the raster into the supervision mask (0/1 rule as for the mask), with sources onfly `"validation"`:
+  - "exclude" (the default) leaves those pixels out of training;
+  - "only" keeps nothing else, which gives the eval GT;
+  - "off" ignores the raster.
+- ink-splat takes the same option as `--val V --val-mode`. The fold happens before the tile index, the chunks, the GPU upload and the
+  rays, so every path sees the same mask; the cache key gains val_mode, and INKFLY_CODE went to 2.
+- test_ink_splat: exclude and only, on the fly == stored (0 differ), each with known voxels.
+- Not yet applied: the live segs-*.json files on /vesuvius are unchanged until the merge, since old binaries ignore the key and new
+  ones would start excluding.
+
+**The villa ink recipe vs ours.** Read-only survey of ScrollPrize villa: vesuvius/ink_detection on main (the merged
+merge-ink-pipelines configs), plus the paris4-3d-gambiarra and distilled_3d_ink branches.
+
+| | villa | ufsm |
+|---|---|---|
+| labels | 2-D per segment (inklabels / supervision / validation masks); ignore = supervision 0; components cleaned to {0, 255}; several self-training relabel rounds (mean teacher, DINO-guided v1-v3) | the same 2-D human sets (20260918), unchanged; prob254 with 255 unknown |
+| 3-D placement | full_3d: label projected along the normal, ±1 voxel (±3 in the teacher), on the mesh; normal_pooled_3d: max of the 3-D logits over ±10 voxels along the normal, then the 2-D loss (MIL); no notion of which side is the recto | per pixel at the open recto face found in the CT (+N), band [f - 6, f]; no face = unknown (17-48 % of pixels) |
+| input | ~9.6 um isotropic, 17 of 21 surface-parallel slices (z jitter ±2), patch 17 x 128 x 128; or 3-D 256^3 at 2.4 um (DINO teacher) | the scan grid itself (4.8 / 9.6 um levels), 3-D windows; no flattening |
+| model | 3-D stem + depth attention/max pool -> 2-D nnU-Net (output 2-D); full 3-D U-Net; DINOv2 / dinovol encoders; gambiarra 24.5 M 3-D residual U-Net | ink3dext teacher (3-D); the universal net's 3-D ink head on the shared trunk |
+| loss | BCE (label smoothing 0.5 in hybrid, 0.1 in the teacher) + 0.25 dice; SGD 0.01 Nesterov, 78 k iterations, batch 64 with fixed scroll quotas | ink BCE per known voxel (nn_loss_stats over the ink mask), no smoothing, no dice |
+| augmentation | XY mirror, rot90 about z only, intensity (gamma, invert, illumination, noise / blur, cutout); no elastic / scale (normals) | full 3-D spatial + CT augmentation (ct_augment, scan_augment, spatial_augment, crush) |
+| split | validation_mask regions inside trained segments (interpolation), or a whole dataset held out | crop regions + 32-voxel margin held out (24 crops on 0139 / 1667 / Paris 4) plus every wbench box |
+| scoring | val balanced accuracy, val BCE unsmoothed (2-D) | 3-D AUC / F1 at known voxels (ink-vscore) + 2-D render + ink-score |
+
+What we adopt, in this order (lead, 2026-11-11):
+1. **The normal-pooled MIL mode as a second ink target.** Per label pixel, keep the mesh point and normal. In the loss, take the max
+   (or soft-max) of the 3-D ink logits over ±R voxels along the normal and apply BCE to the 2-D label. This recovers the pixels the
+   face search leaves unknown; face labels stay where a face is found. The rays come from the inkfly index; the loss sits in
+   head_slab_pass (univA). Measure both modes on the 24 held-out crops.
+2. Label smoothing 0.1 on the ink BCE.
+3. The published validation_mask_v2 regions as extra holdouts where they exist, so our numbers compare with theirs.
+4. BCE + 0.25 dice as the starting ink loss.
+
+Skipped for now: the scroll quotas and the self-training chains.
+
+Item 2 is in as `train --ink-smooth EPS` (nn_ink_targets_smooth; default 0 so running recipes do not change; test_ink_mil checks it).
+
 
 ## Holdouts masked instead of rejected; coarse rungs get a pooled phase (2026-11-11, branch univ-20261111)
 

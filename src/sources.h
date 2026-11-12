@@ -123,6 +123,7 @@ typedef struct {
                     level 2): samples of level L read it directly, of level L - 1 upsampled 2x */
     int phase_only;                  /* band without "root" + a stored phase with "level": s->band aliases s->phase (never read as codes:
                                         task unwrap2 reads the stored phase only); any phase level, 0 included (pseudo labels on ~9 um scans) */
+    void *ink_fly[NTG];              /* an "onfly" ink target (inksplat.h inkfly_open): its handle, for the draw cells */
     float phase_onfly;               /* > 0: s->phase is computed from codes on read (band_onfly.h), this pair radius (codes voxels) */
     int phase_level, phase_direct;   /* the CT level whose grid the stored phase is on (1: the 4.8 um label grid of 2.4 um scans);
                                         phase_direct: "level" given, so samples of that level read it directly */

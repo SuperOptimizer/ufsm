@@ -145,7 +145,9 @@ test_init_lr                                   | gpu          |     3 | ./$B/tes
 test_dinor                                     | gpu          |    60 | UFSM_TEST_QUICK=1 ./$B/test_dinor
 test_dinor~full                                | gpu,slow     |   104 | ./$B/test_dinor
 test_dino_pts                                  |              |     1 | ./$B/test_dino_pts
-test_ink_splat                                 |              |    10 | ./$B/test_ink_splat
+test_ink_splat                                 | gpu          |    10 | ./$B/test_ink_splat
+test_ink_mil                                   | gpu          |     2 | ./$B/test_ink_mil
+test_ink_mil_train                             | gpu          |    40 | ./$B/test_ink_mil_train ./$B/ufsm ./$B/make_wind_fixture
 test_pyports                                   |              |     1 | ./$B/test_pyports
 test_edt                                       |              |     2 | ./$B/test_edt
 test_volcomp                                   |              |     1 | ./$B/test_volcomp
@@ -229,6 +231,7 @@ test_predict_det                               | gpu          |    11 | ./$B/tes
 test_strip_gpu                                 | gpu          |    10 | ./$B/test_strip_gpu
 test_faces_gpu                                 | gpu          |    10 | ./$B/test_faces_gpu
 test_render_fill                               |              |    10 | ./$B/test_render_fill
+test_render_known                              |              |     5 | ./$B/test_render_known ./$B/ufsm
 test_render_stream_gpu                         | gpu          |    10 | ./$B/test_render_stream_gpu
 test_render_fill_gpu                           | gpu          |    12 | ./$B/test_render_fill_gpu
 test_jpegpar                                   |              |    10 | ./$B/test_jpegpar
@@ -244,4 +247,6 @@ test_latents                                   | gpu          |    25 | bash tes
 test_lat_fuse                                  | gpu          |     2 | ./$B/test_lat_fuse
 test_phase_onfly                               | gpu          |    20 | tests/test_phase_onfly.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/onfly
 test_fibre_onfly                               | gpu          |    25 | tests/test_fibre_onfly.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/fibonfly
+test_codes_onfly                               |              |     8 | tests/test_codes_onfly.sh ./$B/ufsm $TMPDIR/codesonfly
+test_mesh_phase                                |              |     8 | tests/test_mesh_phase.sh ./$B/ufsm ./$B/test_mesh_phase $TMPDIR/meshphase
 test_lldec                                     | gpu          |     3 | ./$B/test_lldec $TMPDIR/lldec

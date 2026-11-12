@@ -98,4 +98,11 @@ for n in rv fib/H fib/V fib/dyad/c2 fib/dyad/c7 fib/fam; do [ -e g/$n/9.6/zarr.j
 H=$(head -1 fb/last.ckpt | grep -o '"fib_dir":{"version":1,"head":1,"channels":{"H":[0-9]*' | grep -o '[0-9]*$')
 UFSM_PRED_HEADS=0 "$U" predict fb/last.ckpt fx ct gh "${P[@]}" --channel $H > gh.log 2>&1 || fail "predict --channel $H, old path ($D/gh.log)"
 cmpb gh g/fib/H 0.01 || fail "fib/H: the heads path against the pool4 path"
+# (3) the fibre head on the sub-cell net (--lat-guide 3 with 32 base outputs: 13 task + 9 fibre + 10 pad, 160 head outputs): trains (the sub-cell
+#     rows from 32 start at zero) and --heads all writes the fibre stores and rv
+"$U" train fx/sources-fibhv.json --out fs "${C[@]}" --lat 4 --lat-guide 3 --rv 2 --rv-iso 100 --fib-head 1 > fs.log 2>&1 || fail "train (3) ($D/fs.log)"
+grep -q 'sub-cell head: outputs 32-159 start at zero' fs.log || fail "(3): not a 32-base sub-cell head ($D/fs.log)"
+grep '^step      3' fs.log | grep -qv 'nan' || fail "(3): no finite step 3 ($D/fs.log)"
+"$U" predict fs/last.ckpt fx ct gs "${P[@]}" --heads all > gs.log 2>&1 || fail "predict --heads all, sub-cell fibre ($D/gs.log)"
+for n in rv fib/H fib/V fib/fam; do [ -e gs/$n/9.6/zarr.json ] || fail "store gs/$n ($D/gs.log)"; done
 echo "test_predict_heads: ok"

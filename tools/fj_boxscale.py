@@ -28,7 +28,7 @@ def main(a):
         for b, arc, p in rows:
             if arc < arc0: n['skip'] += 1; continue
             rate = p / arc; s = min(1.0, max(0.0, (hi - rate) / (hi - lo)))
-            c = min(1.0, (arc - arc0) / (arc1 - arc0)); s = c * s + (1 - c)
+            c = 1.0 if arc1 <= arc0 else min(1.0, (arc - arc0) / (arc1 - arc0)); s = c * s + (1 - c)
             F.write(f'{b[0]} {b[1]} {b[2]} {b[3]} {b[4]} {b[5]} {s:.4f}  # {rate:.0f} {arc:.3f}\n'); n['box'] += 1
     print(f'fj_boxscale: {len(rows)} tiles, {n["box"]} boxes, {n["skip"]} below {arc0} m -> {out}', file=sys.stderr)
 

@@ -4,7 +4,8 @@
      render_rows arithmetic on the whole volume read densely; a tiny budget (decoders wait for the renderers), a large one, --crop;
    - tiffw_write (strips compressed on threads, header patched) read back exactly, at several strip counts;
    - ink-compare streamed (cmd_ink_compare) vs ink_compare_mem: the JPEGs and the statistics (every bit, UFSM_INKCMP_FULL) for the whole
-     render (labels, --stretch, --stretch-ct, --max-px), a crop with --each / --each-ct, --fixed with --full and two inks, the 5% skip. */
+     render (labels, --stretch, --stretch-ct, --max-px), a crop with --each / --each-ct, --fixed with --full and two inks, the 5% skip;
+   - ink-compare --mask: the statistics of the renders zeroed outside the mask, with and without --crop. */
 #include "imgops.h"
 #include "store.h"
 #include "tiff.h"
@@ -300,6 +301,27 @@ int main(void) {
         char *g[] = {"ufsm", "jpeg-fit", o, o, nullptr};
         CHECK(run(cmd_jpeg_fit, g, sv) == 2, "jpeg-fit without --div / --max-px");
         free(a); free(b);
+    }
+    {   /* --mask M.tif: the statistics of the same renders with CT and inks zeroed outside M (M on the uncropped grid, with and without --crop) */
+        uint8_t *M = malloc((size_t)W * H), *c2 = malloc((size_t)W * H), *i2 = malloc((size_t)W * H), *j2 = malloc((size_t)W * H); size_t in = 0;
+        for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
+            const size_t i = (size_t)y * W + x; M[i] = (x > 380 && x < 1100 && y > 300 && y < 900 && (x / 90 + y / 70) % 3) ? 200 : 0; in += M[i] != 0;
+            c2[i] = M[i] ? ct[i] : 0; i2[i] = M[i] ? ink[i] : 0; j2[i] = M[i] ? ink2[i] : 0;
+        }
+        char mp[760], cq[760], iq[760], jq[760], iaa[800], ibb[800], sm[760], sr[760], o[760];
+        snprintf(mp, sizeof mp, "%s/mask.tif", dir); snprintf(cq, sizeof cq, "%s/m_ct.tif", dir); snprintf(iq, sizeof iq, "%s/m_a.tif", dir); snprintf(jq, sizeof jq, "%s/m_b.tif", dir);
+        CHECK(in > (size_t)W * H / 10 && !tiffw_write(mp, W, H, 1, M, 1) && !tiffw_write(cq, W, H, 1, c2, 1) && !tiffw_write(iq, W, H, 1, i2, 1) && !tiffw_write(jq, W, H, 1, j2, 1), "write masked renders");
+        snprintf(iaa, sizeof iaa, "gamb=%s", iq); snprintf(ibb, sizeof ibb, "other=%s", jq); snprintf(sm, sizeof sm, "%s/mask_m.txt", dir); snprintf(sr, sizeof sr, "%s/mask_r.txt", dir);
+        snprintf(o, sizeof o, "%s/mask.jpg", dir);
+        for (int c = 0; c < 2; c++) {
+            char *a[] = {"ufsm", "ink-compare", o, "--ct", cp, "--ink", ia, "--ink", ib, "--px-um", "4.8", "--threads", "2", "--mask", mp, c ? "--crop" : nullptr, "350,280,640,500", nullptr};
+            char *r[] = {"ufsm", "ink-compare", o, "--ct", cq, "--ink", iaa, "--ink", ibb, "--px-um", "4.8", "--threads", "2", c ? "--crop" : nullptr, "350,280,640,500", nullptr};
+            CHECK(run(cmd_ink_compare, a, sm) == 0 && run(cmd_ink_compare, r, sr) == 0, "--mask rc (crop %d)", c);
+            size_t ns; uint8_t *sb = slurp(sm, &ns); CHECK(sb && ns > 40 && same_file(sm, sr), "--mask: statistics differ from the zeroed renders' (crop %d)", c); free(sb);
+        }
+        char *u[] = {"ufsm", "ink-compare", o, "--ct", cp, "--ink", ia, "--ink", ib, "--px-um", "4.8", "--threads", "2", nullptr};   /* and the mask matters */
+        CHECK(run(cmd_ink_compare, u, sm) == 0 && !same_file(sm, sr), "--mask: the unmasked statistics are the same");
+        free(M); free(c2); free(i2); free(j2);
     }
     free(ct); free(ink); free(ink2);
     snprintf(p, sizeof p, "rm -rf '%s'", dir); if (system(p)) {}
