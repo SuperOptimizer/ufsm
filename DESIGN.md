@@ -48,6 +48,13 @@ the labelled / gated phase: the labels were built while holdouts-1299.json had t
 0"), so they hold phase there; the weight, the band's holdout_reject and the sampler keep training out. surf-labels now fails on a holdout
 box with no labelled voxel (test_surflabels).
 
+**PHerc1218 rescored the same way** (its B3 gate rerun, 2026-11-12 04:16: gt-gate removed 0.179 of the sheet voxels, every gated cell for
+sheet direction vs m7, 2319 shards): over the gated phase's 103 696 cells, raw outward 0.9852 (pass), 0.659 of the pairs aligned (vs
+0.33 on 1299: 1218's sheets face its axis), aligned outward **0.9998**. By raw bin, the pair shares are 0.007 / 0.010 / 0.016 / 0.035 /
+0.933 for < 0.6 / 0.6-0.8 / 0.8-0.9 / 0.9-0.95 / >= 0.95, with aligned outward 0.865 / 0.965 / 0.990 / 0.998 / 0.9999. By the 1299 rule
+27 cells read reversed (0.0002 of the pairs): no direction mask for 1218. On the aligned share the two scrolls are comparable: 1218
+0.9998, 1299 0.9961 gated (0.9957 labelled) outside its band.
+
 **Shipped form**: phase on the fly from the kept wraps' codes (2.0 GB, `codes.zarr`, rmax 20 = surf-labels --radius 20) plus the one
 weight array; no stored phase. `phase-onfly --ref (label phase) --weight (the array)` on 12 windows of 512^3: 30.4 M voxels differ from
 the stored label phase overall (the label phase has surf-labels' ignored voxels blanked; the rule fills them), **0 of 587 330 312 voxels
