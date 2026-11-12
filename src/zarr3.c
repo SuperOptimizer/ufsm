@@ -21,6 +21,13 @@
 #include "gpudec.h"
 #define XXH_INLINE_ALL
 #include <xxhash.h>
+/* latvol.c through weak references, so zarr3.o links without it (the test binaries): a latvol array then fails to open
+   (declared weak here, before any use: a check against a declaration that is not yet weak is folded away) */
+__attribute__((weak)) void lv_codec_free(lv_codec *lc);
+__attribute__((weak)) int lv_codec_parse(lv_codec *lc, const uint8_t *b, size_t n);
+__attribute__((weak)) int lv_decode_voxels(const lv_codec *lc, const uint8_t *enc, size_t len, uint8_t *ct, int16_t *scratch);
+typedef struct z3 z3;
+__attribute__((weak)) int lv_box_voxels_gpu(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads);   /* src/latvol_read.c (absent in binaries without it) */
 
 static _Thread_local char errbuf[256];
 const char *z3_error(void) { return errbuf; }
@@ -147,6 +154,7 @@ static z3 *z3_open_impl(store *s, const char *key, const char *cache_dir, int ty
     }
     if (m->latvol) {   /* the codec's side file: the transform, the step, the entropy tables */
         if (m->chunk[0] != 128 || m->chunk[1] != 128 || m->chunk[2] != 128 || m->esize != 1) { FAIL("%s: latvol needs uint8 128^3 inner chunks", key); goto bad; }
+        if (!lv_codec_parse || !lv_codec_free || !lv_decode_voxels) { FAIL("%s: a latvol array, and this binary is built without src/latvol.c", key); goto bad; }
         char sk[1100]; snprintf(sk, sizeof sk, "%s/latvol.bin", key); size_t sn = 0; uint8_t *sb = store_read_all(s, sk, &sn);
         z->lv = sb ? calloc(1, sizeof *z->lv) : nullptr;
         if (!z->lv || lv_codec_parse(z->lv, sb, sn)) { free(sb); FAIL("%s: cannot read the latvol codec %s", key, sk); goto bad; }
@@ -1118,7 +1126,6 @@ static void z3_fill(const z3_meta *m, uint8_t *out, size_t nv, int nthreads) {
     }
 }
 static int z3_read_impl(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads, uint32_t submask, uint8_t *dsink, uint32_t *dmask, int lean);
-__attribute__((weak)) int lv_box_voxels_gpu(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads);   /* src/latvol_read.c (absent in binaries without it) */
 /* whether any stored chunk intersects the box o + n (sharded arrays: from the shard indices, no chunk read): 1 yes, 0 none (a read
    would be all fill), -1 error; unsharded arrays: 1 */
 int z3_box_any(z3 *z, const int64_t o[3], const int64_t n[3]) {

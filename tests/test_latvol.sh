@@ -11,7 +11,7 @@
 #     half a step, test_lat), dev vs ct by the store's quantiser and the dropped axes: bounds on the disagreement. --rv nets with the
 #     plain head and with the fine stem + sub-cell head (the stem reads the rebuilt CT), and fit fields of a winding net with both.
 #     A C 64 store (near-lossless rebuilt CT) feeds the same C 29 checkpoints. The device way reads over HTTP + cache the same bytes.
-# Usage: test_latvol.sh <ufsm binary> <make_wind_fixture binary>
+# Usage: test_latvol.sh <ufsm binary> <make_wind_fixture binary> [<test_latvol_nolink binary>]
 set -u
 U=$1 F=$2
 D=$(mktemp -d /tmp/test_latvol_XXXXXX)
@@ -50,6 +50,10 @@ sys.exit(1 if bad else 0)
 EOF
 "$U" read "$D/lv" ct/9.6 0 0 0 256 256 256 "$D/lv.raw" > /dev/null 2>&1 || fail "read of the latvol level"
 "$U" read "$D/fx" ct/9.6 0 0 0 256 256 256 "$D/ct.raw" > /dev/null 2>&1 || fail "read of the CT"
+# (the two reads above are also the proof that the ufsm binary itself carries the codec: zarr3.o reaches src/latvol.c through weak
+# references, and a ufsm linked without it would fail them.) A binary without the codec refuses the array with a clear error:
+if [ -n "${3:-}" ]; then "$3" "$D/lv" ct/9.6 > "$D/nolink.log" 2>&1 || fail "a binary without latvol.o: $(tail -1 "$D/nolink.log")"; fi
+"$U" info "$D/lv" ct/9.6 2>&1 | grep -q latvol || fail "ufsm info does not report the latvol codec"
 # the voxel reader's GPU path (UFSM_LATVOL_GPU: the box's streams decoded and rebuilt on the device below z3_read) = the host decoder,
 # for the whole level, a box off the cell grid and a box over the array's end
 UFSM_LATVOL_GPU=0 "$U" read "$D/lv" ct/9.6 0 0 0 256 256 256 "$D/lvg.raw" > "$D/lvg.log" 2>&1 || fail "GPU read of the latvol level"
