@@ -469,6 +469,217 @@ __global__ void fit_finalize_w4_k(const float *acc, size_t nf, uint8_t *a) {
 }
 extern "C" void nn_fit_finalize_w4(const float *acc, size_t nf, uint8_t *a) { fit_finalize_w4_k<<<nblk(nf, 256), 256>>>(acc, nf, a); KCHECK(); }
 
+/* nn_fit_accum_lat (fit.h): one block of 512 threads per field cell of 8^3 voxels (2^3 latent cells: --fit-zarr's windows keep the field
+   cells on the cell grid), a voxel per thread in the sums as fit_accum_k. The plane path (predict's z-slab fzs: nn_lat_up_slab +
+   nn_lat_shuffle + nn_fstem_fwd into [11][nz][W][W] fp16 planes, fit_accum_k, then the winding's own planes over +-d and fit_accum_w4_k)
+   wrote and read ~30 B of planes per voxel and ran the stem twice; here the values stay in shared memory, with the same operations in
+   the same order:
+   - the upsampling (lat_up4_k): per (channel, latent cell, z offset) the cell's 3^3 coarse neighbourhood (staged: the 4^3 cells around
+     the field cell) z then y then x, fp16 into the voxel planes L; fl_lw pins the multiply-adds to the form the compiler gives
+     lat_up4_k's sums (fma(w2, c, fma(w0, a, w1 b)): a plain expression here contracts differently, 1 ulp in ~1e-5 of the voxels);
+   - the sub-cell term (lat_shuf_k) and the stem's (fstem_fwd_k's mma sequence, b1, silu, its W2 projection), each added and rounded;
+   - the cell's sums: fit_accum_k's per-thread expressions and its shared-memory tree; the winding mod 4's: per voxel the terms of
+     fit_accum_w4_k, summed over the cell's voxels in its order by one thread per accumulator (a serial chain there too).
+   Regions: 0 the cell's voxels, 1-3 the same shifted by dd (a multiple of 4) along z, y, x: the winding's partner voxels. */
+enum { FL_T = 512, FL_MAXCH = 12, FL_MAXS = 4, FL_C = 16 };
+__device__ static const float FL_LW[4][3] = {{0.375f, 0.625f, 0.f}, {0.1875f, 0.75f, 0.0625f}, {0.0625f, 0.75f, 0.1875f}, {0.f, 0.625f, 0.375f}};
+__device__ __forceinline__ float fl_lw(int r, float a, float b, float c) { return __fmaf_rn(FL_LW[r][2], c, __fmaf_rn(FL_LW[r][0], a, __fmul_rn(FL_LW[r][1], b))); }
+__device__ __forceinline__ float fl_h(float v) { return __half2float(__float2half_rn(v)); }
+struct fl_args {
+    int d, h, w, D, H, W, hz, halo, tz, ty, tx, bz, by, bx, fz0, fy0, fx0, nfy, nfx, F1, F2;
+    size_t nf;
+    int ch_recto, dcode, ch_w4, dd, sbase, C;
+    float dscale, mean, isd;
+    int nch, ndm, ch[FL_MAXCH], slot[FL_MAXCH];   /* region 0's channels (ndm of the cell sums, then the winding pair) and their stem slots (-1 none) */
+    int nsl, so[FL_MAXS], wso[2];                 /* region 0's slots -> stem outputs; regions 1-3: slot u = the winding channel u's output wso[u] (-1 none) */
+    float *dbg;                                   /* (test_fit_lat: region 0's logits of the in-window voxels, [nch][D H W] fp32) */
+};
+static float *g_fl_dbg;
+extern "C" void nn_fit_accum_lat_debug(float *planes) { g_fl_dbg = planes; }
+template <typename T>
+__global__ void __launch_bounds__(FL_T) fit_accum_lat_k(const T *__restrict__ lg, const float *__restrict__ sp, const uint8_t *__restrict__ ctx, const uint8_t *__restrict__ ct,
+                                                       const uint32_t *__restrict__ bits, fl_args A, float *acc, float *acc4) {
+    __shared__ float cs0[FL_MAXCH][64], csw[3][2][64], sst[4][64][FL_MAXS];
+    __shared__ union { float red[12][FL_T]; float shw[FL_T / 32][8][FL_C + 1]; struct { __half l0[FL_MAXCH][FL_T], lw[3][2][FL_T]; } L; } U;
+    const int tid = threadIdx.x, fi = blockIdx.x;
+    const int fz = A.fz0 + fi / (A.nfy * A.nfx), fy = A.fy0 + (fi / A.nfx) % A.nfy, fx = A.fx0 + fi % A.nfx;
+    const int nreg = A.ch_w4 >= 0 ? 4 : 1, C = A.C;
+    int org[4][3];
+    for (int r = 0; r < 4; r++) { org[r][0] = fz * 8 - A.tz; org[r][1] = fy * 8 - A.ty; org[r][2] = fx * 8 - A.tx; if (r) org[r][r - 1] += A.dd; }
+    const size_t cv = (size_t)A.d * A.h * A.w, hw = (size_t)A.H * A.W;
+    /* the coarse neighbourhoods: staged cell q of a region = the clamped cell (o >> 2) - 1 + (q >> 4, q >> 2 & 3, q & 3) */
+    {
+        const int n0 = A.nch * 64, nt = n0 + (nreg - 1) * 2 * 64;
+        for (int k = tid; k < nt; k += FL_T) {
+            const int r = k < n0 ? 0 : 1 + (k - n0) / 128, cc = k < n0 ? k >> 6 : (k - n0) >> 6 & 1, q = k & 63;
+            const int c = r ? A.ch[A.ndm + cc] : A.ch[cc];
+            const int cz = min(max((org[r][0] >> 2) - 1 + (q >> 4), 0), A.d - 1), cy = min(max((org[r][1] >> 2) - 1 + (q >> 2 & 3), 0), A.h - 1), cx = min(max((org[r][2] >> 2) - 1 + (q & 3), 0), A.w - 1);
+            const float v = ldv(lg, (size_t)c * cv + ((size_t)cz * A.h + cy) * A.w + cx);
+            if (r) csw[r - 1][cc][q] = v; else cs0[cc][q] = v;
+        }
+    }
+    /* the stem's outputs on the 4^3 2^3-blocks of each region (block q: (o >> 1) + (q >> 4, q >> 2 & 3, q & 3)), fstem_fwd_k's sequence */
+    if (C) {
+        const int lane = tid & 31, wp = tid >> 5, g = lane >> 2, tq = lane & 3;
+        unsigned af[4][4];
+        for (int s_ = 0; s_ < 4; s_++) for (int r = 0; r < 4; r++) {
+            const int row = g + (r & 1) * 8, col = 16 * s_ + 2 * tq + (r >> 1) * 8;
+            const float w0 = row < C ? sp[row * 64 + col] : 0.f, w1 = row < C ? sp[row * 64 + col + 1] : 0.f;
+            const __half2 h2 = __floats2half2_rn(w0, w1); af[s_][r] = *(const unsigned *)&h2;
+        }
+        const float *b1 = sp + C * 64, *W2 = sp + C * 64 + C;
+        auto tap = [&](int z, int y, int x) -> __half {
+            return z >= 0 && z < A.D && y >= 0 && y < A.H && x >= 0 && x < A.W ? __float2half(((float)ctx[(size_t)z * hw + (size_t)y * A.W + x] - A.mean) * A.isd) : __float2half(0.f);
+        };
+        const int nsr = A.wso[0] >= 0 || A.wso[1] >= 0 ? nreg : 1;
+        for (int tl = wp; tl < nsr * 8; tl += FL_T / 32) {   /* (warp-uniform: every lane takes the same tiles) */
+            const int r = tl >> 3, j0 = (tl & 7) * 8, nsl = r ? 2 : A.nsl;
+            if (!nsl) continue;
+            const int jb = j0 + g, bz = (org[r][0] >> 1) + (jb >> 4), by = (org[r][1] >> 1) + (jb >> 2 & 3), bx = (org[r][2] >> 1) + (jb & 3);
+            float c4[4] = {0.f, 0.f, 0.f, 0.f};
+            for (int s_ = 0; s_ < 4; s_++) {
+                unsigned bf[2];
+                for (int u = 0; u < 2; u++) {   /* taps 16 s + 8 u + 2 tq, + 1: row 4 s + 2 u + tq / 2, x offset 2 (tq & 1) */
+                    const int rr = 4 * s_ + 2 * u + tq / 2, z = 2 * bz - 1 + rr / 4, y = 2 * by - 1 + rr % 4, x = 2 * bx - 1 + 2 * (tq & 1);
+                    const __half2 p2 = __halves2half2(tap(z, y, x), tap(z, y, x + 1)); bf[u] = *(const unsigned *)&p2;
+                }
+                mma16816<f16>(c4, af[s_], bf);
+            }
+            for (int r4 = 0; r4 < 4; r4++) { const int c = g + (r4 >> 1) * 8, b = 2 * tq + (r4 & 1); if (c < C) { const float v = c4[r4] + b1[c]; U.shw[wp][b][c] = v / (1.f + __expf(-v)); } }
+            __syncwarp();
+            const int b = lane & 7, j = j0 + b;
+            for (int k = lane >> 3; k < nsl; k += 4) {
+                const int o = r ? A.wso[k] : A.so[k];
+                if (o < 0) continue;
+                float v = 0.f; for (int c = 0; c < C; c++) v += W2[o * C + c] * U.shw[wp][b][c];
+                sst[r][j][k] = v;
+            }
+            __syncwarp();
+        }
+    }
+    __syncthreads();
+    /* the upsampling, lat_up4_k's chain per (channel, latent cell lc, z offset rz): 16 voxels each into the planes L (fp16) */
+    {
+        const int ni = (A.nch + (nreg - 1) * 2) * 8 * 4;
+        for (int it = tid; it < ni; it += FL_T) {
+            const int rz = it & 3, lc = it >> 2 & 7, kk = it >> 5, cz = lc >> 2, cy = lc >> 1 & 1, cx = lc & 1;
+            const float *S = kk < A.nch ? cs0[kk] : csw[(kk - A.nch) >> 1][(kk - A.nch) & 1];
+            __half *Lo = kk < A.nch ? U.L.l0[kk] : U.L.lw[(kk - A.nch) >> 1][(kk - A.nch) & 1];
+            float p[3][3];
+#pragma unroll
+            for (int b = 0; b < 3; b++)
+#pragma unroll
+                for (int e = 0; e < 3; e++) { const int o = (cy + b) * 4 + cx + e; p[b][e] = fl_lw(rz, S[cz * 16 + o], S[(cz + 1) * 16 + o], S[(cz + 2) * 16 + o]); }
+#pragma unroll
+            for (int ry = 0; ry < 4; ry++) {
+                float q[3];
+#pragma unroll
+                for (int e = 0; e < 3; e++) q[e] = fl_lw(ry, p[0][e], p[1][e], p[2][e]);
+#pragma unroll
+                for (int rx = 0; rx < 4; rx++) Lo[(4 * cz + rz) * 64 + (4 * cy + ry) * 8 + 4 * cx + rx] = __float2half_rn(fl_lw(rx, q[0], q[1], q[2]));
+            }
+        }
+    }
+    __syncthreads();
+    const int lz = tid >> 6, ly = (tid >> 3) & 7, lx = tid & 7, blk = ((lz >> 1) * 4 + (ly >> 1)) * 4 + (lx >> 1), sub = 16 * (lz & 3) + 4 * (ly & 3) + (lx & 3);
+    /* the voxel's logit of staged channel k in region r (regions 1-3: the winding pair, k = ndm, ndm + 1) */
+    auto logit = [&](int r, int k) -> float {
+        float a = __half2float(r ? U.L.lw[r - 1][k - A.ndm][tid] : U.L.l0[k][tid]);
+        const int c = A.ch[k];
+        if (!r && A.sbase >= 0 && c < 2)
+            a = fl_h(a + ldv(lg, (size_t)(A.sbase + 64 * c + sub) * cv + ((size_t)((org[0][0] + lz) >> 2) * A.h + ((org[0][1] + ly) >> 2)) * A.w + ((org[0][2] + lx) >> 2)));
+        const int sl = r ? (A.wso[k - A.ndm] >= 0 ? k - A.ndm : -1) : A.slot[k];
+        if (C && sl >= 0) a = fl_h(a + sst[r][blk][sl]);
+        return a;
+    };
+    auto mat = [&](size_t i) { return bits ? (bits[i >> 5] >> (i & 31)) & 1u : (unsigned)((ct ? ct : ctx)[i] != 0); };
+    const int gz = fz * 8 + lz, gy = fy * 8 + ly, gx = fx * 8 + lx, wz = gz - A.tz, wy = gy - A.ty, wx = gx - A.tx;
+    const bool in = !(gz >= A.bz || gy >= A.by || gx >= A.bx || wz < A.hz || wz >= A.D - A.hz || wy < A.halo || wy >= A.W - A.halo || wx < A.halo || wx >= A.W - A.halo);
+    const size_t i = in ? ((size_t)wz * A.H + wy) * A.W + wx : 0;
+    const bool mi = in && mat(i);
+    if (A.dbg && in) for (int k = 0; k < A.nch; k++) A.dbg[(size_t)k * A.D * hw + i] = logit(0, k);
+    float v[11] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, rmax = 0.f, t9[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
+    if (in) {   /* fit_accum_k's per-voxel values */
+        v[0] += 1.f;
+        if (mi) {
+            auto sg = [&](int k) { return 1.f / (1.f + __expf(-logit(0, k))); };
+            v[1] += 1.f; v[2] += 2.f * sg(0) - 1.f; v[3] += 2.f * sg(1) - 1.f;
+            for (int k = 0; k < 6; k++) v[4 + k] += sg(2 + k) - (k < 3 ? 0.f : 0.5f);
+            { const float sd = sg(8); v[10] += (A.dcode ? fminf(sd, 0.999f) / (1.f - fminf(sd, 0.999f)) : sd) / A.dscale; }
+            if (A.ch_recto >= 0) rmax = fmaxf(rmax, sg(9));
+        }
+    }
+    if (A.ch_w4 >= 0 && mi) {   /* fit_accum_w4_k's terms (0 for a skipped one: its sums start at +0 and never become -0) */
+        const int kw = A.ndm;
+        const float pr = 2.f / (1.f + __expf(-logit(0, kw))) - 1.f, pi = 2.f / (1.f + __expf(-logit(0, kw + 1))) - 1.f;
+        for (int a = 0; a < 3; a++) {
+            if (!mat(i + (a == 0 ? A.dd * hw : a == 1 ? (size_t)A.dd * A.W : (size_t)A.dd))) continue;
+            const float qr = 2.f / (1.f + __expf(-logit(1 + a, kw))) - 1.f, qi = 2.f / (1.f + __expf(-logit(1 + a, kw + 1))) - 1.f;
+            t9[3 * a] = qr * pr + qi * pi; t9[3 * a + 1] = qi * pr - qr * pi; t9[3 * a + 2] = 1.f;
+        }
+    }
+    __syncthreads();   /* (the planes L are read: red overlays them) */
+    for (int k = 0; k < 11; k++) U.red[k][tid] = v[k];
+    U.red[11][tid] = rmax;
+    __syncthreads();
+    for (int o = 256; o > 0; o >>= 1) {   /* fit_accum_k's tree */
+        if (tid < o) { for (int k = 0; k < 11; k++) U.red[k][tid] += U.red[k][tid + o]; U.red[11][tid] = fmaxf(U.red[11][tid], U.red[11][tid + o]); }
+        __syncthreads();
+    }
+    const size_t base = ((size_t)fz * A.F1 + fy) * A.F2 + fx;
+    if (tid == 0 && U.red[0][0] > 0.f) {
+        for (int k = 0; k < 11; k++) if (U.red[k][0] != 0.f) atomicAdd(&acc[k * A.nf + base], U.red[k][0]);
+        atomicMax((int *)&acc[11 * A.nf + base], __float_as_int(U.red[11][0]));
+    }
+    if (A.ch_w4 < 0) return;
+    __syncthreads();
+    for (int k = 0; k < 9; k++) U.red[k][tid] = t9[k];
+    __syncthreads();
+    if (tid < 9) {   /* fit_accum_w4_k's serial sums */
+        float s = 0.f;
+#pragma unroll 16
+        for (int t = 0; t < FL_T; t++) s += U.red[tid][t];
+        if (s != 0.f) atomicAdd(&acc4[tid * A.nf + base], s);
+    }
+}
+extern "C" int nn_fit_accum_lat(const void *lg, int lh16, int d, int h, int w, int sbase, const float *stem, int C, const int *so, const uint8_t *ctx, const uint8_t *ct,
+                                const uint32_t *bits, float mean, float isd, int hz, int halo, int tz, int ty, int tx, const int box[3], int fh, const int F[3],
+                                int ch_recto, int ch_phase, int ch_normal, int ch_density, float dscale, int dcode, float *acc, int ch_w4, int dd, float *acc4) {
+    if (fh != 8 || h != w || (stem && (C < 1 || C > FL_C || !ctx)) || (!bits && !ct && !ctx)) return 1;
+    if ((tz & 3) || (ty & 3) || (tx & 3) || (ch_w4 >= 0 && (dd & 3))) return 1;   /* (field cells and the partner regions on the cell grid) */
+    fl_args A = {};
+    A.d = d; A.h = h; A.w = w; A.D = 4 * d; A.H = 4 * h; A.W = 4 * w; A.hz = hz; A.halo = halo; A.tz = tz; A.ty = ty; A.tx = tx; A.bz = box[0]; A.by = box[1]; A.bx = box[2];
+    A.ch_recto = ch_recto; A.dcode = dcode; A.dscale = dscale; A.ch_w4 = ch_w4; A.dd = dd; A.sbase = sbase; A.C = stem ? C : 0; A.mean = mean; A.isd = isd; A.dbg = g_fl_dbg;
+    if (ch_w4 >= 0 && (dd > halo || dd > hz || dd < 1)) { fprintf(stderr, "nn_fit_accum_lat: offset %d outside the halo (%d, z %d)\n", dd, halo, hz); abort(); }
+    int n = 0;
+    A.ch[n++] = ch_phase; A.ch[n++] = ch_phase + 1; for (int k = 0; k < 6; k++) A.ch[n++] = ch_normal + k; A.ch[n++] = ch_density; if (ch_recto >= 0) A.ch[n++] = ch_recto;
+    A.ndm = n; if (ch_w4 >= 0) { A.ch[n++] = ch_w4; A.ch[n++] = ch_w4 + 1; }
+    A.nch = n; A.nsl = 0; A.wso[0] = A.wso[1] = -1;
+    for (int k = 0; k < n; k++) {
+        const int o = A.C && A.ch[k] < 16 ? so[A.ch[k]] : -1;
+        A.slot[k] = -1;
+        if (o < 0) continue;
+        if (A.nsl >= FL_MAXS) return 1;
+        A.slot[k] = A.nsl; A.so[A.nsl++] = o;
+        if (k >= A.ndm) A.wso[k - A.ndm] = o;
+    }
+    int f0[3], f1[3];
+    const int t[3] = {tz, ty, tx}, wn[3] = {A.D, A.W, A.W}, hn[3] = {hz, halo, halo};
+    for (int k = 0; k < 3; k++) {
+        int lo = t[k] + hn[k], hi = t[k] + wn[k] - hn[k]; if (lo < 0) lo = 0; if (hi > box[k]) hi = box[k];
+        f0[k] = lo / fh; f1[k] = (hi + fh - 1) / fh; if (f1[k] > F[k]) f1[k] = F[k];
+        if (f1[k] <= f0[k]) return 0;
+    }
+    A.fz0 = f0[0]; A.fy0 = f0[1]; A.fx0 = f0[2]; A.nfy = f1[1] - f0[1]; A.nfx = f1[2] - f0[2]; A.F1 = F[1]; A.F2 = F[2];
+    A.nf = (size_t)F[0] * F[1] * F[2];
+    const size_t nb = (size_t)(f1[0] - f0[0]) * A.nfy * A.nfx;
+    if (nb > 0x7fffffff || A.nf > 0x7fffffff) return 1;
+    if (lh16) fit_accum_lat_k<f16><<<(unsigned)nb, FL_T>>>((const f16 *)lg, stem, ctx, ct, bits, A, acc, acc4);
+    else fit_accum_lat_k<float><<<(unsigned)nb, FL_T>>>((const float *)lg, stem, ctx, ct, bits, A, acc, acc4);
+    KCHECK();
+    return 0;
+}
+
 /* fit.c fit_pool (no phase gradient, no CT spacing) of the device fields: one thread per pooled cell, the same sums in the same order
    in double with the roundings of the host (_rn: no fused multiply-adds), so the planes are byte-identical to the host's. dfield: the
    10 planes of n = D H W cells back to back (pc ps t0..t5 sp w), h the field cell size; out: 10 device planes of the pooled box; *cnt +=

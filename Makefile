@@ -246,6 +246,9 @@ suite-bins: $(B)/test_fstem
 $(B)/test_lathead: tests/test_lathead.c $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 suite-bins: $(B)/test_lathead
+$(B)/test_fit_lat: tests/test_fit_lat.c $(B)/nn.o $(B)/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
+suite-bins: $(B)/test_fit_lat
 $(B)/test_gram: tests/test_gram.c $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 suite-bins: $(B)/test_gram

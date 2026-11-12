@@ -3,6 +3,7 @@
 #  (1) a sub-cell net with a fine stem, rv 2 and ink (--lat 4 --lat-guide 3 --fstem 16): --heads all writes <out>/rv and <out>/ink; rv equals
 #      the old slab path (UFSM_PRED_HEADS=0: upsampling + nn_fstem_fwd + nn_rv_fuse) within one code on 0.1 % of the bytes; each head of the
 #      multi-head run equals its single-head run byte for byte; --heads with --fit-zarr writes the same fields as --fit-zarr alone
+#      the fused fit kernel == the plane path byte for byte (the volume and a box inside it)
 #  (1b) the GPU pyramid of the heads == the CPU pyramid at q 0 (shard 128 and 256)
 #  (1c) the heads encoded from the GPU's levels (vcgpu.h) == the CPU encoder, q 8, every shard file of every level
 #  (1d) the CT windows decoded on the GPU (UFSM_PRED_DEVREAD) == the host reader
@@ -47,6 +48,19 @@ cmpb one f1/rv 0 || fail "rv beside --fit-zarr"
 UFSM_PRED_FIT_PLANES_MB=1 "$U" predict s/last.ckpt fx ct f2 "${P[@]}" --fit-zarr f2z --no-out 1 > f2.log 2>&1 || fail "predict --fit-zarr, small chunks ($D/f2.log)"
 for a in pc ps sp t0 t3 w dz dq; do "$U" read f0z/$a "" 0 0 0 32 32 32 fa.raw > /dev/null 2>&1 && "$U" read f2z/$a "" 0 0 0 32 32 32 fb.raw > /dev/null 2>&1 || fail "read fit field $a"
                                    cmp -s fa.raw fb.raw || fail "fit field $a depends on the chunking"; done
+# the fused fit kernel (nn_fit_accum_lat: the sums straight from the cell logits) == the plane path, every field byte for byte (net (1): the
+# sub-cell head and the fine stem); also on a box inside the volume (the box clip at both ends). (--fit-zarr's strides, multiples
+# of --fit-h, and windows, of 16, keep the field cells on the latent cells: a halo is a multiple of 4)
+FF="pc ps t0 t1 t2 t3 t4 t5 sp w dz dy dx dq"
+cmpf() { for a in $FF; do "$U" read $1/$a "" 0 0 0 32 32 32 fa.raw > /dev/null 2>&1 && "$U" read $2/$a "" 0 0 0 32 32 32 fb.raw > /dev/null 2>&1 || fail "read fit field $a ($1 $2)"
+                          cmp -s fa.raw fb.raw || fail "fit field $a: the fused kernel against the plane path ($1 $2)"; done; }
+grep -q "fit fields fused from the cell logits" f0.log || fail "the fused fit kernel did not run ($D/f0.log)"
+UFSM_PRED_FIT_FUSED=0 "$U" predict s/last.ckpt fx ct f3 "${P[@]}" --fit-zarr f3z --no-out 1 > f3.log 2>&1 || fail "predict --fit-zarr, plane path ($D/f3.log)"
+cmpf f0z f3z
+BX=(--box 8,16,24,240,232,224)
+"$U" predict s/last.ckpt fx ct f4 "${P[@]}" "${BX[@]}" --fit-zarr f4z --no-out 1 > f4.log 2>&1 || fail "predict --fit-zarr off-grid box ($D/f4.log)"
+UFSM_PRED_FIT_FUSED=0 "$U" predict s/last.ckpt fx ct f5 "${P[@]}" "${BX[@]}" --fit-zarr f5z --no-out 1 > f5.log 2>&1 || fail "predict --fit-zarr off-grid box, plane path ($D/f5.log)"
+cmpf f4z f5z
 # (1b) the GPU pyramid (each level-0 shard pooled on the device, levels >= 1 encoded from the pieces) against the CPU pyramid (each level
 #      decoded back and pooled): at q 0 the same bytes, shard 128 (pieces below a chunk, gathered raw) and 256 (level 1 encoded at once)
 for sh in 128 256; do
@@ -71,7 +85,8 @@ done
 # (1d) the CT windows decoded on the GPU into device memory (UFSM_PRED_DEVREAD): the same stores as the host reader's (windows over the
 #      array's edges: fill), and the chunks went through the GPU
 UFSM_PRED_DEVREAD=1 UFSM_PRED_PROF=1 "$U" predict s/last.ckpt fx ct dv "${P[@]}" --heads rv,ink > dv.log 2>&1 || fail "predict UFSM_PRED_DEVREAD ($D/dv.log)"
-grep -q 'CT windows decoded into device memory' dv.log && grep -Eq 'device CT windows: [1-9][0-9]* chunks all on the GPU' dv.log || fail "device read not used ($D/dv.log)"
+if grep -q 'gpudec: out of memory' dv.log; then echo "SKIP devread: no device memory (gpudec out of memory on a shared GPU: the host path ran, the device-read check did not; the suite reports the test SKIP)"
+else grep -q 'CT windows decoded into device memory' dv.log && grep -Eq 'device CT windows: [1-9][0-9]* chunks all on the GPU' dv.log || fail "device read not used ($D/dv.log)"; fi
 for n in rv ink; do cmpb h/$n dv/$n 0 || fail "$n: the device-read run differs from the host reader's"; done
 UFSM_GPU_DECODE_ITEMS=4 UFSM_PRED_DEVREAD=1 UFSM_PRED_PROF=1 "$U" predict s/last.ckpt fx ct dvh "${P[@]}" --heads rv > dvh.log 2>&1 || fail "predict UFSM_PRED_DEVREAD, CPU fallbacks ($D/dvh.log)"
 grep -Eq 'device CT windows: 0 chunks all on the GPU, [1-9][0-9]* with host substreams' dvh.log || fail "device read: the host fallback not taken ($D/dvh.log)"

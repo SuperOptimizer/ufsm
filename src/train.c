@@ -3498,6 +3498,16 @@ int cmd_train(int argc, char **argv) {
     split_ctx *sctx = split ? split_create(devs[0], devs[1]) : nullptr;
     nn_init(G[0].dev);
     float *gpeer = ng > 1 ? nn_malloc(np * 4) : nullptr;   /* on GPU 0: incoming gradients of the other GPUs */
+    /* --accum K: gradient accumulation, K windows (steps) per optimizer update. Every step is still one window: its forward / backward, loss,
+       log and mix lines, the lr schedule (so --warmup and --steps count windows); its gradient is added into gacc and the update (clip,
+       Muon / AdamW at optimizer step step / K, EMA) runs on the mean of the accumulated windows at steps that are multiples of K. A
+       non-finite window is left out of the mean. --ckpt-every / SNAP should be multiples of K (a checkpoint between updates drops the
+       partial sum). = batch K exactly (tests/test_accum.sh: lr 0 / --det) */
+    const int accum = atoi(opt(argc, argv, "--accum", "1"));
+    if (accum < 1 || accum > 64) { fprintf(stderr, "--accum K: 1..64\n"); return 2; }
+    float *gacc[64] = {nullptr}; int nacc_win = 0;
+    if (accum > 1) { for (int g = 0; g < ng; g++) { nn_init(G[g].dev); gacc[g] = nn_malloc(np * 4); }
+        fprintf(stderr, "--accum %d: %d windows per optimizer update (the schedule, --warmup and --steps count windows; updates at steps %% %d == 0)\n", accum, accum, accum); }
 
     /* validation set: fixed batches from the held-out boxes (unaugmented), scored on GPU 0 */
     sample_cfg vc = sc; vc.gpu_aug = 0; vc.cover = nullptr; vc.cover_start = 0; vc.ct_augment = 0; vc.axis_jitter = 0; vc.geometry_augment=0; vc.label_morph=0; vc.scan.strength=0; vc.affine_p=0; vc.crush.p=0; vc.xscan_p=0; vc.tear_p=0; vc.delam_p=0; vc.curv_p=0; vc.incl_p=0; vc.density_p=0; { const char *vs = opt(argc, argv, "--val-seed", nullptr); vc.seed = (vs ? (uint64_t)atoll(vs) : seed) + 777; }   /* --val-seed: other training seeds on the same windows */ vc.augment = 0; vc.nworkers = 4; vc.nbuf = 2; vc.holdout = 1; vc.rung_shift_p = 0;
@@ -3826,14 +3836,30 @@ int cmd_train(int argc, char **argv) {
                 }
                 continue;
             }
+            if (accum > 1) {   /* --accum: this window's gradient into the sum; the update only at multiples of K, on the mean */
+                if (g == 0) nacc_win++;
+                const int first = nacc_win == 1;
+                static const char *adump = (const char *)1; if (adump == (const char *)1) adump = getenv("UFSM_ACCUM_DUMP");   /* tests: each window's gradient and each update's */
+#define ADUMP(kind, src) do { if (adump && g == 0) { char fn_[1024]; snprintf(fn_, sizeof fn_, "%s/%c%d.f32", adump, kind, step); float *h_ = malloc(np * 4); nn_d2h(h_, src, np * 4); \
+                              FILE *f_ = fopen(fn_, "wb"); if (f_) { fwrite(h_, 4, np, f_); fclose(f_); } free(h_); } } while (0)
+                ADUMP('w', unet_grad_ptr(d->u));
+                if (first) nn_d2d_async(gacc[g], unet_grad_ptr(d->u), np * 4); else nn_axpy(gacc[g], 1.f, unet_grad_ptr(d->u), np);
+                if (step % accum) continue;
+                nn_d2d_async(unet_grad_ptr(d->u), gacc[g], np * 4); nn_scale(unet_grad_ptr(d->u), 1.f / nacc_win, np);
+                if (g == ng - 1) nacc_win = 0;
+                if (g == 0) gn = unet_grad_norm(d->u);   /* (the update's gradient norm: the mean's) */
+                ADUMP('u', unet_grad_ptr(d->u));
+#undef ADUMP
+            }
             if (g_head_only) unet_grad_head_only(d->u, g_head_only - 1);   /* --train-head-only N: head + last N-1 decoder blocks (frozen rest: --wd 0) */
             if (clip > 0 && gn > clip) unet_clip_grad(d->u, clip);
             unet_srste24(d->u, srste);                       /* no-op unless sparse */
             const float lrr = lr0 > 0.f ? lr / lr0 : 0.f;   /* (lr0 0: 0 / 0 was NaN -> NaN weights after step 1; CAL 11-01) */
-            if (use_anvil) unet_anvil(d->u, anvil_lr * lrr, anvil_wd, step, steps, lr, 0.9f, 0.999f, 1e-8f, wd);
-            else if (use_muon) unet_muon(d->u, muon_lr * lrr, muon_beta, lr, 0.9f, 0.999f, 1e-8f, wd, step);   /* Muon lr follows the same schedule shape */
-            else unet_adamw(d->u, lr, 0.9f, 0.999f, 1e-8f, wd, step);
-            unet_ema(d->u, step < 100 ? 0.9f : ema);
+            const int ostep = accum > 1 ? (step + accum - 1) / accum : step;   /* (the optimizer's own step count: Adam's bias correction) */
+            if (use_anvil) unet_anvil(d->u, anvil_lr * lrr, anvil_wd, ostep, steps / accum, lr, 0.9f, 0.999f, 1e-8f, wd);
+            else if (use_muon) unet_muon(d->u, muon_lr * lrr, muon_beta, lr, 0.9f, 0.999f, 1e-8f, wd, ostep);   /* Muon lr follows the same schedule shape */
+            else unet_adamw(d->u, lr, 0.9f, 0.999f, 1e-8f, wd, ostep);
+            unet_ema(d->u, ostep < 100 ? 0.9f : ema);
             unet_wquant(d->u, (unsigned)step);              /* no-op unless --wq */
             if (prof) nn_prof_end();
             nn_ptick("optimizer");
@@ -4054,6 +4080,7 @@ int cmd_train(int argc, char **argv) {
                 memset(acc_cbin, 0, sizeof acc_cbin); }
             if (g_aff) { const float *a = G[0].aff_out; size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " aff %.4f (d1 bce %.3f dice %.3f | d8 bce %.3f dice %.3f)", G[0].aff_loss,
                                     (a[0] + a[6] + a[12]) / 3, (a[1] + a[7] + a[13]) / 3, (a[18] + a[24] + a[30]) / 3, (a[19] + a[25] + a[31]) / 3); }
+            if (accum > 1) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " (update %d: %d windows each)", step / accum, accum); }   /* --accum: steps are windows */
             fprintf(stderr, "step %6d lr %.2e loss %.4f bce %.4f dice %.4f%s gn %.2f %.2f samp/s %.1f Mvox/s (wait %.0f%%)%s%s\n", step, lr, acc_loss / nacc, acc_bce / nacc, acc_dice / nacc, affs, acc_g / nacc,
                     (double)nacc * B * nl / dt, (double)nacc * B * nl * g_Pz * P * P / 1e6 / dt, 100 * wait / dt, vl >= 0 ? " val " : "", vl >= 0 ? vstr : "");
             {   /* the on-the-fly phase since the last log line: reads, tiles (on the GPU), the pair rule's seconds per read (summed over threads) */
