@@ -87,7 +87,7 @@ SRC += src/afv.c src/fibercheck.c src/fitphase.c src/wrapdump.c src/fiberjudge.c
 SRC += src/countfield.c src/countanat.c
 SRC += src/flatten.c src/faces.c src/faces_cli.c
 SRC += src/sheetcut.c
-SRC += src/strip.c
+SRC += src/strip.c src/stripdistort.c src/wraprepair.c
 SRC += src/latfit.c src/lc_cli.c
 SRC += src/latvol.c src/latvol_cli.c src/latvol_read.c
 OBJ  = $(patsubst src/%.c,$(B)/%.o,$(SRC)) $(B)/surfcomp.o
@@ -549,6 +549,12 @@ SAMPLE_TEST_OBJ = $(B)/edt.o $(B)/band.o $(B)/sheet.o $(B)/ct_augment.o $(B)/sca
 $(B)/test_wrapsnap: tests/test_wrapsnap.c $(B)/wrapsnap.o $(B)/tfx.o $(B)/surfcomp.o $(B)/tiffw.o $(SAMPLE_TEST_OBJ) $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 suite-bins: $(B)/test_wrapsnap
+$(B)/test_wraprepair: tests/test_wraprepair.c $(B)/wraprepair.o $(B)/tfx.o $(B)/surfcomp.o $(B)/tiffw.o $(SAMPLE_TEST_OBJ) $(B)/nn.o $(B)/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
+suite-bins: $(B)/test_wraprepair
+$(B)/test_stripdistort: tests/test_stripdistort.c $(B)/stripdistort.o $(B)/imgops.o $(B)/jpegpar.o $(B)/tiffw.o $(B)/tiff.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
+suite-bins: $(B)/test_stripdistort
 $(B)/test_sheetscore: tests/test_sheetscore.c $(B)/sheetscore.o $(SAMPLE_TEST_OBJ) $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 suite-bins: $(B)/test_sheetscore

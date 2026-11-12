@@ -6,6 +6,81 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Spiral post-processing QA: wrap repair, fibre / GT judges, outlier slabs, flattening distortion (2026-11-12, branch spiralqa-20261112)
+
+On the two u1-13000 unrolls of the day (`/vesuvius/ufsm/unroll/PHerc1667-u1`, `PHercParis4-u1`), CPU only; outputs in `<run>/qa/*`,
+`<run>/wraps_repair`. New: `ufsm wrap-repair` (`src/wraprepair.c`, `test_wraprepair`), `ufsm strip-distort` (`src/stripdistort.c`,
+`test_stripdistort`), `fiber-judge --set` with the set's own um (9.6 um P4 fits judged at level 2; before, it read them as level 0),
+`scripts/spiralqa/fj_scroll.sh`. Referees: 1667 human codes (u1 in-sample except the held boxes); Paris 4 also has GT in our scan's
+frame (`gt/paris4-q9p6/q-9p6.zarr 9.6`, `gt/paris4-wind-20261019 phaseA/9.6`, the wbench roots), used as a referee next to fibres.
+
+**1. Wrap repair.** `wrap-repair` is wrap-check on the .sfc wraps themselves (the strip's input), along rays from the axis: per pair of
+consecutive ids on a ray, CT peaks in the interval (window shifted inward by half the gap for snapped wraps), GT turns, crossings; per
+wrap the wrap-check verdict rule; per 64-row x 10-degree cell the counts. Repair: crossed vertices (touching neighbours) removed, dup
+cells' outer wrap removed, merged cells -> split fragments (off by default). What the CT peak count is worth against GT:
+
+| | GT right | GT 0 / 2+ | "0 peaks" = GT 0 | "2+ peaks" = GT 2+ | dup cells >= 0.8 empty: precision / GT0 recall | merged cells >= 0.8: precision |
+|---|---|---|---|---|---|---|
+| 1667 wraps_snap (6.3 M intervals, 1.52 M with GT) | 0.9785 | 0.0034 / 0.0167 | 0.033 | 0.016 | 0.55 / 0.18 (in strip) | 0.008 |
+| P4 wraps_snap (54.6 M, 9.4 M with GT) | 0.9760 | 0.0016 / 0.0223 | 0.007 | 0.019 | 0.15 / 0.12 | 0.036 |
+
+wrap-check's "merged" verdicts on 1667 (w010-w025, 8 wraps) are false: GT turns 0.99-1.04 there, gt1 0.91-0.999; 1667's ~230 um gaps
+show ~2 CT ridges per sheet (rct 1.4-1.7). Sweeping wrap-check --sigma 1.2-4 / --prom 1-1.5 removes the merged verdicts (prom 1.5) but
+never lifts the per-interval precision above 0.07. So: split never (default --merge-share 2); dup cells only where GT says they are
+right, i.e. 1667 at --dup-share 0.8 (precision 0.67 on the whole set), not P4 (0.15).
+- 1667 `wraps_repair` (dup-share 0.8 + crossings): 3.1 % of vertices removed (mostly the outer dup run trim drops anyway). Whole set GT
+  right 0.9785 -> 0.9801, GT0 0.0034 -> 0.0022; in the strip (pairs to w038 / w039) 0.9811 -> 0.9817, GT0 0.0019 -> 0.0015, GT coverage
+  -0.13 %; verdicts 40 real / 2 dup / 4 merged -> 42 / 0 / 4. wrapswitch (GT codes) switches around the axis 2.16 -> 1.98 per cm, along
+  z 2.55 -> 2.35, coded share 0.558 -> 0.568. Small and real.
+- P4 `wraps_repair` (crossings only: dup cells would remove 8486 GT-right intervals per 1688 dups): 0.32 % of vertices removed;
+  crossings 67115 -> 60443 by the check (it fills radius-table holes of <= 8 angle bins from the neighbours, so a removed touching pair
+  partly reappears), GT right 0.9760 -> 0.9760, GT0 0.0016 -> 0.0015, verdicts 147 / 10 / 0 unchanged. The crossings lie in two
+  opposite angle lobes (the packed, flattened sides), not at the seam. A no-op on P4: keep wraps_snap.
+
+**2. Fibres.** Paris 4: `fibers/raw/spiral_fibers.afv` (open-data spiral fibres, native frame) over z 6656-17152 (level 2), 512^2 x 512
+tiles. 1667: no fibre data exists (no AFV, no traced prediction), so its label-free check is the CT one above (wrap-repair cells) plus
+surf-stats --ct-only (on papyrus 0.530 on wraps_snap -> 0.546 on wraps_repair; adjacent-normal
+angles unchanged, > 30 deg 0.0057 -> 0.0056).
+
+| P4 judge (H + V persistent sheet changes per m) | tiles >= 0.5 m | fibre m | rate | tile median / q75 / q90 |
+|---|---|---|---|---|
+| u1 wraps_snap | 1556 | 3267 | 216 | 185 / 256 / 344 |
+| GT phase (the floor: fibre + label noise) | 1498 | 2665 | 107 | 92 / 148 / 203 |
+
+Flags at >= 378 /m (2x the P4 wraps reference 189, the fibre gate's ramp): 125 tiles, 19 % of all our sheet changes, in two columns
+persisting over z: (y 2048, x 5120) z 7168-9728 and (y 4096-4608, x 6656) z 8192-10752. Against GT per tile (1491 tiles with both):
+flagged tiles rate 534 (ours) vs 192 (GT) /m, unflagged 182 vs 95; 52 % of the flags sit in tiles whose GT rate is normal (< 184); the
+tile rates of ours and GT correlate (Spearman 0.60: part of the rate is the region's fibres, not our winding). Worst tile (z 8704, y 4608,
+x 6656, 1210 /m on the wraps): the fibres follow GT there (pairs within half a turn at 0.6 mm 0.89 / 0.93, 252 / 165 /m), our joined fit
+is GT-wrong (fit --codes on the 256 x 512^2-cell crop: ids right 0.093, |err| median 0.22 turn, |err| < 0.08 turn 0.018). Local refits
+of the crop with the joined set as --ref-model: plain 0.094, --uw-repair 8 0.109, --uw-repair 8 + fibre votes (--uw-rep-fib 16, 250 k
+votes) 0.102. The fields are wrong there (their phase is off GT by > 0.08 turn almost everywhere), so a refit cannot recover it;
+it needs better fields (or labels) in those columns.
+
+**3. Outlier slabs (P4).** The final losses are bimodal (2-3 vs 10-17; s105-s142 all 14-17.7; isolated s030, s054, s070, s080, s091).
+The gap is all the smooth term after the voxel unwrapping (s070 stage 4 smooth 137 vs s069 21; phase / normal / density equal) and
+half of it sits in ~1100 of 831 k lattice columns. Per-slab wrap-check of the joined model (--zr per slab core): s030 0.898 CT
+peaks / turn vs neighbours 0.900, s070 0.912 vs 0.916 / 0.918; the > 8 group 1.01 vs 0.90 follows the z region, not the loss. s070
+refits on the CPU (reproduces 11.417 vs the GPU's 11.4115, 196 s, 17 GB): 3x steps in stages 4 / 5 8.16; --seed-model s069 (its
+integers) 12.71 with the phase term doubled; --init-model s069 + ref 1.28. Slab-core wrap-check 0.907 (orig) / 0.901 / 0.907 / 0.912;
+fibre judge pairs at 0.6 mm (H) 0.7195 / 0.7215 / - / 0.7198; cf-compare orig vs init: 97.7 % of material cells keep their integer.
+Re-joined with the init refit: wrap-check 150 real / 14 dup / 0 merged and 0.947 peaks / turn, identical. The loss is not a quality
+signal here; refitting the other high-loss slabs is not worth a GPU window.
+
+**4. Flattening distortion.** `strip-distort` reads strip-flatten's stripes (x / y / z / gu.tif on the flat uv grid): per pixel the
+Jacobian by +-4 px central differences (one px would measure the strip's 0.25-voxel sfc error, 6 % per edge; spans 4 and 8 agree within
+0.002), dist = max(s1, 1/s2) - 1 (the worst linear stretch), the area ratio, folds (normal against the 9 x 9-block neighbourhood). Per
+stripe `<s>_dist.jpg` (green <= 5 %, yellow 10 %, red >= 20 %, magenta folded; 1 px = 8 grid px) and `<s>_area.jpg`, `tiles.tsv` (1 cm
+tiles with their wrap), `wraps.tsv`, `stripes.tsv`.
+
+| strip | valid cm2 | dist p50 / p95 / p99 | area p50 | trusted (dist <= 5 %) | folded | time |
+|---|---|---|---|---|---|---|
+| 1667 u1 (3 stripes) | 1186 | 0.042 / 0.157 / 0.57 | 1.014 | 0.61 | 0.0009 | 9 s |
+| P4 u1 (22 stripes) | 20636 | 0.077 / 0.187 / 0.36 | 1.072 | 0.27 | 0.0005 | 172 s |
+
+P4's area 1.072 matches its flatten.txt (mesh 22297 cm2 vs flat 20639: the flat strip is ~7 % smaller than the surface); its worst
+wraps are the partial inner ones (w239-w242). In the 1667 images the bad areas repeat once per wrap (the theta-cut seam region).
+
 ## U2's low ink share: ink-only windows counted as empty under --rv; held-out draw cells; 0841 / 0500P2 (2026-11-12, branch inkdraw-20261112)
 
 U2 (unwrap2 + `--rv 2` + `--ink-head 1`) drew 3.5 % of its windows from the 8 human-ink sources at ~25 % of the weight; Paris 4

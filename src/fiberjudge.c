@@ -9,7 +9,8 @@
               other), accepted when their along-spiral coordinates q = -dir id + column / width differ by 0.5 .. 1.5:
               phase = frac(sign(q2 - q1) d1 / (d1 + d2));
      --phase  a band-phase raster (surf-labels phase.zarr or a GT phase; 0..251, 255 unknown) on the level-L grid;
-     --set    a joined fit set: frac(W) (the theta cut is a unit jump of W).
+     --set    a joined fit set (or one model): frac(W) (the theta cut is a unit jump of W); the set's native voxels from its um (level 0
+              when it has none).
    Every fibre is sampled each level voxel; a stretch of known phase is unwrapped along the path, median-filtered (9 samples) and
    followed with a hysteresis of --hyst turn: each time it leaves the current sheet by more than that, |k| excursions are counted and
    the baseline moves k turns. Per tile (--tile^2 x NZ level voxels) and family (H, V, U = no family) the TSV holds: labelled arc (m),
@@ -154,7 +155,10 @@ int cmd_fiber_judge(int argc, char **argv) {
     } else {
         set = fit_set_load(argv[si + 1]); if (!set) { fprintf(stderr, "fiber-judge: cannot load the fit set %s\n", argv[si + 1]); return 1; }
         S.mode = 2; S.set = set; const fit_model *m = set->global;
-        if (!has_reg) { reg[0] = floor(m->origin[1] / sc / tile) * tile; reg[1] = ceil((m->origin[1] + m->H * m->h) / sc / tile) * tile; reg[2] = floor(m->origin[2] / sc / tile) * tile; reg[3] = ceil((m->origin[2] + m->W * m->h) / sc / tile) * tile; }
+        /* the set's native grid: level-L voxel -> set voxel (a set at another voxel size than the scan's level 0, e.g. 9.6 um fits of a
+           2.4 um scan: lum / m->um; models without um are level 0) */
+        if (m->um > 0) S.sc = lum / m->um;
+        if (!has_reg) { reg[0] = floor(m->origin[1] / S.sc / tile) * tile; reg[1] = ceil((m->origin[1] + m->H * m->h) / S.sc / tile) * tile; reg[2] = floor(m->origin[2] / S.sc / tile) * tile; reg[3] = ceil((m->origin[2] + m->W * m->h) / S.sc / tile) * tile; }
     }
     const char *outp = fj_opt(argc, argv, "--out", nullptr); FILE *o = outp ? fopen(outp, "w") : nullptr; if (outp && !o) { fprintf(stderr, "fiber-judge: cannot write %s\n", outp); return 1; }
     if (o) { fprintf(o, "box\truns\tpts\tknown");

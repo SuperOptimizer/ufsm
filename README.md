@@ -333,7 +333,7 @@ level 2), `ink-blend --um 9.6 --tile 1024,1024,1024`; window-border jump 30 -> 6
 ```sh
 ufsm count-field <in-fields> <out-fields> --R 0 --pool 8 --phase-w 4 --iters 1200 --model DIR --model-only 1 [--model-stride 4] [--mem-gb 24]
 ufsm fit <fields-dir> --gpu G --out MODEL [--dir 1|-1] [--ref-model REF --ref-snap 1 --uw-repair 0] [--codes ROOT KEY --score-pairs 1]
-ufsm fit <fields-dir> --model MODEL --codes ROOT KEY [--score-pairs 1]   # score a saved model or set
+ufsm fit <fields-dir> --model MODEL --codes ROOT KEY [--score-pairs 1] [--score-boxes FILE in|out]   # score a saved model or set (--score-boxes: only the label voxels inside / outside the boxes, "z y x nz ny nx" in codes voxels per line)
 ufsm fit-join <out-set> <fields-dir> --blend 16 --ref REF [--global 1 [--cap 3] [--min-cells 20000]] <slab-model> <z0> <z1> ...
 ufsm wrap-check <model-or-set> <fields-dir> --ct ROOT KEY --ct-um U [--codes ROOT KEY] [--zr Z0,Z1] [--tsv OUT]
 ufsm surf-stats <wraps-dir> --fields DIR [--model FIT] [--ct ROOT KEY --ct-um U [--ct-level 80]] [--ct-only 1] [--per-wrap]
