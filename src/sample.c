@@ -1,4 +1,7 @@
 #include "sample.h"
+#include "inksplat.h"
+[[gnu::weak]] int inkfly_cells(void *, int, const int64_t[3], uint8_t *);
+[[gnu::weak]] int inkfly_rays(void *, const int64_t[3], const int64_t[3], int, int, float, inkray **, size_t *);   /* (weak: test binaries without inksplat.o; only called for an onfly target) */
 #include "band.h"
 #include "band_w4dev.h"
 #include "target_erode.h"
@@ -271,11 +274,12 @@ static batch alloc_batch(const sample_cfg *c) {
     b.ink = c->ink_plane && !c->ink_bits ? halloc((size_t)c->B * p3) : nullptr;
     for (int j = 0; j < 4; j++) b.aux[j] = j < c->aux_n ? halloc((size_t)c->B * p3) : nullptr;
     b.inkb = c->ink_bits ? halloc((size_t)c->B * p3 / 8) : nullptr; b.ink_it = c->ink_bits ? calloc((size_t)c->B, sizeof *b.ink_it) : nullptr;
+    b.mil = c->ink_mil ? calloc((size_t)c->B, sizeof *b.mil) : nullptr; b.nmil = c->ink_mil ? calloc((size_t)c->B, sizeof *b.nmil) : nullptr;
     b.emb = c->emb_ch ? halloc((size_t)c->B * c->emb_ch * (size_t)(PZ(c) / c->emb_div) * (c->P / c->emb_div) * (c->P / c->emb_div)) : nullptr;
     return b;
 }
 
-static void free_batch(batch *b, int B) { if (b->w4r) { for (int q = 0; q < B; q++) { w4runs *r = (w4runs *)b->w4r + q; free(r->off); free(r->ro); free(r->cb); } free(b->w4r); } if (b->ink) hfree(b->ink); for (int j = 0; j < 4; j++) if (b->aux[j]) hfree(b->aux[j]); if (b->inkb) hfree(b->inkb); free(b->ink_it); if (b->ct8) hfree(b->ct8); if (b->aug) hfree(b->aug); if (b->emb) hfree(b->emb); if (b->xv) hfree(b->xv); free(b->vok); free(b->chid); free(b->chidx); free(b->choff); if (b->w4) hfree(b->w4); if (b->wcomp) hfree(b->wcomp); if (b->tm) hfree(b->tm); if (b->rad) hfree(b->rad); if (b->axr) hfree(b->axr); if (b->pap) hfree(b->pap); if (b->wind) hfree(b->wind); if (b->band) hfree(b->band); if (b->side) hfree(b->side); if (b->pm) hfree(b->pm); if (b->x) hfree(b->x); if (b->x16) hfree(b->x16); if (b->t) hfree(b->t); if (b->m) hfree(b->m); hfree(b->w); free(b->src); free(b->level); free(b->um); free(b->corner); if (b->sheet) { sheet_batch_free(b->sheet[0]); free(b->sheet); } }
+static void free_batch(batch *b, int B) { if (b->mil) { for (int q = 0; q < B; q++) free(b->mil[q]); free(b->mil); free(b->nmil); } if (b->w4r) { for (int q = 0; q < B; q++) { w4runs *r = (w4runs *)b->w4r + q; free(r->off); free(r->ro); free(r->cb); } free(b->w4r); } if (b->ink) hfree(b->ink); for (int j = 0; j < 4; j++) if (b->aux[j]) hfree(b->aux[j]); if (b->inkb) hfree(b->inkb); free(b->ink_it); if (b->ct8) hfree(b->ct8); if (b->aug) hfree(b->aug); if (b->emb) hfree(b->emb); if (b->xv) hfree(b->xv); free(b->vok); free(b->chid); free(b->chidx); free(b->choff); if (b->w4) hfree(b->w4); if (b->wcomp) hfree(b->wcomp); if (b->tm) hfree(b->tm); if (b->rad) hfree(b->rad); if (b->axr) hfree(b->axr); if (b->pap) hfree(b->pap); if (b->wind) hfree(b->wind); if (b->band) hfree(b->band); if (b->side) hfree(b->side); if (b->pm) hfree(b->pm); if (b->x) hfree(b->x); if (b->x16) hfree(b->x16); if (b->t) hfree(b->t); if (b->m) hfree(b->m); hfree(b->w); free(b->src); free(b->level); free(b->um); free(b->corner); if (b->sheet) { sheet_batch_free(b->sheet[0]); free(b->sheet); } }
 
 /* Level choice for a source: restrict cfg.level_p to levels the CT has and every target of the source
    can provide (pyramid: same level; regions: levels 0..1). Returns -1 if nothing is usable. */
@@ -1943,6 +1947,22 @@ static int aux_read(source *s, int ch, int l, const int64_t o[3], const int64_t 
 /* train --ink-head (cfg.ink_plane): the ink prob254 plane of a warped window, pulled through the warp as warp_pw_voxel pulls the phase:
    trilinear over the 8 corners when every corner of weight > 1e-7 is known (< 255), else unknown (255); outside unknown. The weights
    ((wz * wy) * wx) and the sum in corner order, rounded to nearest: nn_aug.cu lw_ink_k makes the same bytes */
+/* --ink-mil: source-grid rays -> the output window (output = forward(u), u[d] = v[perm[d]], flipped: n[d] - 1 - that; sample_warp_ink's
+   pull inverted); the normal through the map's local linearisation (a 1-voxel step), renormalised; rays outside the window dropped */
+int sample_mil_map(void *rays, int n, const int perm[3], const int flip[3], const void *spatial_, int Pz, int P) {
+    inkray *rs = rays; const spatial_aug *sp = spatial_; int k2 = 0; const int nd[3] = {Pz, P, P};
+    for (int k = 0; k < n; k++) {
+        inkray r = rs[k]; double u[2][3], q[2][3];
+        for (int e = 0; e < 2; e++) for (int d = 0; d < 3; d++) { const double v = r.p[perm[d]] + (e ? r.n[perm[d]] : 0.0); u[e][d] = flip[d] ? nd[d] - 1 - v : v; }
+        if (sp && sp->active) { spatial_aug_forward(sp, u[0], q[0]); spatial_aug_forward(sp, u[1], q[1]); } else memcpy(q, u, sizeof q);
+        double nn2 = 0; for (int d = 0; d < 3; d++) { q[1][d] -= q[0][d]; nn2 += q[1][d] * q[1][d]; }
+        int in = nn2 > 1e-12; for (int d = 0; d < 3; d++) in &= q[0][d] >= -.5 && q[0][d] < nd[d] - .5;
+        if (!in) continue;
+        for (int d = 0; d < 3; d++) { r.p[d] = (float)q[0][d]; r.n[d] = (float)(q[1][d] / sqrt(nn2)); }
+        rs[k2++] = r;
+    }
+    return k2;
+}
 void sample_warp_ink(const uint8_t *src, uint8_t *dst, int P, const int perm[3], const int flip[3], const void *spatial) {
     const spatial_aug *a = spatial;
     float *table = malloc(6 * (size_t)P * sizeof *table); if (!table) abort();
@@ -2588,6 +2608,24 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
         const int ch = c->aux_ch[j] != CH_FIB ? c->aux_ch[j] : s->tgt_key[CH_FIB] || !c->fib_sheet ? CH_FIB : CH_SHEET;
         if (aux_read(s, ch, l, o, n, b->aux[j] + (size_t)i * p3, p3, crushed || torn || delam || curved)) return -1;
     }
+    if (b->mil) {   /* --ink-mil: the window's rays from its onfly ink target (level L = the target's, or the next: scaled), outside every held-out box + guard */
+        b->nmil[i] = 0;
+        int ich = -1; for (int q = 0; q < NTG && ich < 0; q++) if (s->ink_fly[q]) ich = q;   /* (the source's onfly ink target, whichever channel holds it) */
+        const int L = ich >= 0 ? s->tgt_min_level[ich] : 0;
+        if (inkfly_rays && ich >= 0 && l >= L && l <= L + 1 && !crushed && !torn && !delam && !curved) {
+            const int f = 1 << (l - L); const int64_t o2[3] = {o[0] * f, o[1] * f, o[2] * f}, n2[3] = {n[0] * f, n[1] * f, n[2] * f};
+            inkray *rs = nullptr; size_t nr = 0;
+            if (inkfly_rays(s->ink_fly[ich], o2, n2, c->mil_mode, c->mil_stride > 0 ? c->mil_stride : 1, c->mil_R * f, &rs, &nr)) { free(rs); return -1; }
+            size_t k2 = 0;
+            for (size_t k = 0; k < nr; k++) {
+                inkray r = rs[k]; int out = 0;
+                if (f > 1) for (int d = 0; d < 3; d++) r.p[d] = (r.p[d] + .5f) / f - .5f;
+                for (int q = 0; q < nhb && !out; q++) { int in = 1; for (int d = 0; d < 3; d++) in &= r.p[d] >= hb[q][d] - .5f && r.p[d] < hb[q][3 + d] - .5f; out = in; }
+                if (!out) rs[k2++] = r;
+            }
+            free(b->mil[i]); b->mil[i] = rs; b->nmil[i] = (int)k2;
+        }
+    }
     uint8_t w[NCH] = {0};
     int tmax = 0;
     /* a channel without a target (w 0) is read again only by the packing / the host warp / the sheet prior / papyrus labels: with the
@@ -3157,6 +3195,11 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
             if (spatial.active) sample_warp_ink(src, bi, P, y.perm, y.flip, &spatial); else sym_u8(src, bi, Pz, P, y);
         }
     }
+    if (b->mil && b->nmil[i]) {   /* --ink-mil: the rays through the window's symmetry and warp */
+        inkray *rs = b->mil[i]; size_t k2 = (size_t)sample_mil_map(rs, b->nmil[i], y.perm, y.flip, &spatial, Pz, P);
+        if (c->mil_max > 0 && k2 > (size_t)c->mil_max) { for (int k = 0; k < c->mil_max; k++) rs[k] = rs[(size_t)k * k2 / c->mil_max]; k2 = c->mil_max; }   /* (an even subsample: the device buffers' cap) */
+        b->nmil[i] = (int)k2;
+    }
     if (c->emb_ch) {   /* train --distill: the feature targets through the same symmetry and warp (none on crushed / torn / re-bent windows) */
         const size_t ge = (size_t)(Pz / c->emb_div) * (P / c->emb_div) * (P / c->emb_div);
         int8_t *eo = b->emb + (size_t)i * c->emb_ch * ge;
@@ -3422,7 +3465,13 @@ static occ_index label_occupancy(source *s) {
             const z3_meta *m0 = z3_meta_of(t0), *mc = z3_meta_of(cc); const int cs = m0->chunk[0];
             if (cs < (1 << (lc - l0)) || (cs & (cs - 1)) || m0->chunk[1] != cs || m0->chunk[2] != cs) continue;
             const int sh = __builtin_ctz((unsigned)cs) - (lc - l0);   /* level-lc cells per target chunk edge: 2^sh */
-            int64_t g[3]; uint8_t *bits = nullptr; if (z3_chunk_map(t0, g, &bits) <= 0) { free(bits); continue; }
+            int64_t g[3]; uint8_t *bits = nullptr;
+            if (s->ink_fly[ch]) {   /* an onfly ink target: the label tiles' boxes on the level-lc CT grid (its chunk map is the CT's) */
+                for (int d = 0; d < 3; d++) g[d] = mc->shape[d];
+                bits = calloc((size_t)g[0] * g[1] * g[2], 1);
+                if (!bits || inkfly_cells(s->ink_fly[ch], lc, g, bits) <= 0) { free(bits); continue; }
+            } else if (z3_chunk_map(t0, g, &bits) <= 0) { free(bits); continue; }
+            const int fly = s->ink_fly[ch] != nullptr;
             const size_t pl = (size_t)mc->shape[1] * mc->shape[2], tot = pl * (size_t)mc->shape[0];
             uint8_t *cb = tot < 4.29e9 ? malloc(tot) : nullptr; const int64_t zo[3] = {0, 0, 0}, zn[3] = {mc->shape[0], mc->shape[1], mc->shape[2]};
             if (!cb || z3_read(cc, zo, zn, cb, 8)) { free(cb); free(bits); continue; }
@@ -3430,7 +3479,7 @@ static occ_index label_occupancy(source *s) {
             for (int pass = 0; pass < 2; pass++) {
                 for (int64_t z = 0; z < mc->shape[0]; z++) for (int64_t y = 0; y < mc->shape[1]; y++) for (int64_t x = 0; x < mc->shape[2]; x++) {
                     const size_t k = ((size_t)z * mc->shape[1] + (size_t)y) * mc->shape[2] + (size_t)x;
-                    const int64_t qz = z >> sh, qy = y >> sh, qx = x >> sh;
+                    const int64_t qz = fly ? z : z >> sh, qy = fly ? y : y >> sh, qx = fly ? x : x >> sh;
                     if (cb[k] < iso || qz >= g[0] || qy >= g[1] || qx >= g[2] || !bits[((size_t)qz * g[1] + (size_t)qy) * g[2] + (size_t)qx]) continue;
                     if (pass) o.idx[o.n++] = (uint32_t)k; else n++;
                 }

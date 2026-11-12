@@ -81,6 +81,8 @@ int z3_group_levels(store *s, const char *group_key, z3_level *out, int max);
 
 const char *z3_error(void);
 void z3_io_stats(uint64_t *cache_hits, uint64_t *store_reads);
+/* the calling thread's volcomp decodes on the CPU (1) even with the GPU decoder on (predict's device CT windows: CPU workers beside the GPU ones) */
+void z3_thread_cpu_decode(int on);
 /* the shared decoded-substream cache (UFSM_ZCACHE_GB, src/zshm.h) in this process: substream hits, misses, stored */
 void z3_shared_cache_stats(uint64_t *hits, uint64_t *misses, uint64_t *stored);   /* chunk reads served from the cache vs fetched from the store */
 int z3_prefetch_chunk(z3 *z, int64_t cz, int64_t cy, int64_t cx);   /* fetch one inner chunk into the cache (no decode): 1 fetched, 0 cached/absent, -1 error */

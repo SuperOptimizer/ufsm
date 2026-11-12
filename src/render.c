@@ -963,9 +963,16 @@ int cmd_tifxyz_sfc(int argc, char **argv) {
     return rc;
 }
 int cmd_png2jpg(int argc, char **argv) {
-    if (argc < 4) { fprintf(stderr, "usage: ufsm png2jpg <in.png|in.jpg> <out.jpg> [--half] [--max-px N] [--quality 90]\n"); return 2; }
+    if (argc < 4) { fprintf(stderr, "usage: ufsm png2jpg <in.png|in.jpg> <out.jpg|out.tif> [--half] [--max-px N] [--quality 90] [--size W,H | --size-like REF.tif (bilinear resize first)] [--crop x,y,w,h (tif)]\n"); return 2; }
     int is_jpg = 0; { FILE *f = fopen(argv[2], "rb"); uint8_t m[2] = {0}; if (f) { is_jpg = fread(m, 1, 2, f) == 2 && m[0] == 0xff && m[1] == 0xd8; fclose(f); } }
     int w, h; uint8_t *rgb = is_jpg ? jpeg_read_rgb(argv[2], &w, &h) : png_read_rgb(argv[2], &w, &h); if (!rgb) { fprintf(stderr, "png2jpg: cannot read %s\n", argv[2]); return 1; }
+    const char *sz = ropt(argc, argv, "--size", nullptr), *sl = ropt(argc, argv, "--size-like", nullptr); int nw = 0, nh = 0;   /* --size W,H / --size-like REF.tif: resampled (Pillow bilinear) to that size first */
+    if (sl) { uint8_t *r = img_read_u8(sl, &nw, &nh); if (!r) { fprintf(stderr, "png2jpg: cannot read %s\n", sl); free(rgb); return 1; } free(r); }
+    if ((sl && nw > 0) || (sz && sscanf(sz, "%d,%d", &nw, &nh) == 2 && nw > 0 && nh > 0)) {
+        uint8_t *o = malloc((size_t)nw * nh * 3);
+        if (!o || pil_resize(rgb, w, h, 3, o, nw, nh, PIL_BILINEAR, 8)) { free(o); free(rgb); return 1; }
+        free(rgb); rgb = o; w = nw; h = nh;
+    }
     const int q = atoi(ropt(argc, argv, "--quality", "90"));
     const size_t ol = strlen(argv[3]);
     if (ol > 4 && !strcmp(argv[3] + ol - 4, ".tif")) {   /* <out>.tif: the first channel as a uint8 TIFF (gray PNGs for ink-compare); --crop x,y,w,h */
@@ -1012,7 +1019,8 @@ int ink_compare_mem(int argc, char **argv);
 int ink_compare_mem(int argc, char **argv) {   /* the in-memory version (inkcompare.c streams; same bytes) */
     const int ci = rarg(argc, argv, "--ct");
     if (argc < 5 || ci < 0 || ci + 1 >= argc || rarg(argc, argv, "--ink") < 0) {
-        fprintf(stderr, "usage: ufsm ink-compare <out.jpg> --ct CT.tif --ink LABEL=INK.tif [--ink LABEL=INK.tif ..] [--px-um 2.4] [--rs-um 25] [--rl-um 500] [--crop x,y,w,h | --crop-frac fx,fy,w,h | --best-crop N] [--stretch | --fixed LO,HI] [--stretch-ct] [--full] [--each PREFIX [--each-suffix S] [--each-ct]] [--rgb-agree RECTO,VERSO] [--diff-agree RECTO,VERSO [--diff-gain 1]] [--papyrus INK [--papyrus-gain 1] [--papyrus-floor median|V] [--papyrus-bg G|median]] [--cmap viridis] [--no-ct] [--rgb-ct-min 1] [--max-px N] [--quality 90] [--threads 16]\n"); return 2;
+        fprintf(stderr, "usage: ufsm ink-compare <out.jpg> --ct CT.tif --ink LABEL=INK.tif [--ink LABEL=INK.tif ..] [--px-um 2.4] [--rs-um 25] [--rl-um 500] [--crop x,y,w,h | --crop-frac fx,fy,w,h | --best-crop N] [--stretch | --fixed LO,HI] [--stretch-ct] [--full] [--each PREFIX [--each-suffix S] [--each-ct]] [--rgb-agree RECTO,VERSO] [--diff-agree RECTO,VERSO [--diff-gain 1]] [--papyrus INK [--papyrus-gain 1] [--papyrus-floor median|V] [--papyrus-bg G|median]] [--cmap viridis] [--no-ct] [--rgb-ct-min 1] [--max-px N] [--quality 90] [--threads 16] [--mask M.tif]\n"
+                        "  --mask M.tif (the renders' size before --crop): statistics and panels only where M > 0 (inks zeroed elsewhere; the in-memory path)\n"); return 2;
     }
     const double px = atof(ropt(argc, argv, "--px-um", "2.4")), rsu = atof(ropt(argc, argv, "--rs-um", "25")), rlu = atof(ropt(argc, argv, "--rl-um", "500"));
     const int nthreads = ufsm_threads(atoi(ropt(argc, argv, "--threads", "0")), 16);
@@ -1059,6 +1067,18 @@ int ink_compare_mem(int argc, char **argv) {   /* the in-memory version (inkcomp
     const size_t np = (size_t)W * H; uint8_t *mask = malloc(np);
     if (!mask) return 1;
     for (size_t i = 0; i < np; i++) mask[i] = ct[i] > 0;
+    const char *mp = ropt(argc, argv, "--mask", nullptr);
+    if (mp) {   /* --mask M.tif (the renders' size before --crop): statistics and panels only where M > 0 (inks zeroed elsewhere) */
+        int mw, mh; uint8_t *m = img_read_u8(mp, &mw, &mh);
+        if (!m) { fprintf(stderr, "ink-compare: cannot read %s\n", mp); return 1; }
+        int cx = 0, cy = 0, cw0, ch0; if (cr) sscanf(cr, "%d,%d,%d,%d", &cx, &cy, &cw0, &ch0);
+        for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
+            const int sx = x + cx, sy = y + cy; const size_t i = (size_t)y * W + x;
+            if (sx < mw && sy < mh && m[(size_t)sy * mw + sx]) continue;
+            mask[i] = 0; for (int k = 1; k < n; k++) ((uint8_t *)img[k])[i] = 0;
+        }
+        free(m);
+    }
     const int rs = (int)lround(rsu / px), rl = (int)lround(rlu / px);
     for (int k = 1; k < n; k++) {
         ink_stats_t st;

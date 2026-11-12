@@ -300,9 +300,11 @@ __attribute__((weak)) void gpudec_stats(uint64_t *subs, uint64_t *batches, uint6
 static pthread_mutex_t g_z3_cpu_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_z3_cpu_cv = PTHREAD_COND_INITIALIZER;
 static int g_z3_cpu_busy, g_z3_cpu_max;
+static _Thread_local int g_z3_cpu_only;   /* z3_thread_cpu_decode: this thread's reads decode on the CPU whatever UFSM_GPU_DECODE says */
+void z3_thread_cpu_decode(int on) { g_z3_cpu_only = on; }
 static volcomp_status z3_decode_subs(const vf_parsed *p, uint32_t need, uint8_t *dec, uint8_t *dsink, uint32_t *dev) {
     *dev = 0;
-    if (!gpudec_enabled()) return vfx_decode_subs(p, need, dec);
+    if (!gpudec_enabled() || g_z3_cpu_only) return vfx_decode_subs(p, need, dec);
     if (!p->strict) {
         gd_chunk g = {p->payload, p->tok_n, p->byp_n, p->off, p->step, {0}, VF_SCAN16};
         for (int m = 0; m < 10; m++) g.dt[m] = (const uint32_t *)p->models[m].dt;

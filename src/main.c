@@ -128,6 +128,7 @@ int cmd_phase_score(int argc, char **argv);
 int cmd_ink_splat(int argc, char **argv);   /* src/inksplat.c */
 int cmd_ink_score(int argc, char **argv);   /* src/inksplat.c */
 int cmd_ink_vscore(int argc, char **argv);   /* src/inksplat.c */
+int cmd_ink_onfly(int argc, char **argv);   /* src/inksplat.c */
 
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 static int arg_index(int argc, char **argv, const char *k) { for (int i = 2; i < argc; i++) if (!strcmp(argv[i], k)) return i; return -1; }
@@ -205,7 +206,7 @@ static int usage(void) {
         "  ufsm dino-train --sources S.json --out DIR   our dense embedding net from scratch (GT sheet identity + DINO-style SSL)\n"
         "  ufsm dino-embed CKPT ROOT KEY OUT --box ... --norm c,s   a dino-train net over a box (dinovol-eval format)\n"
         "  ufsm halves ROOT KEY-L0 OUT --box ...   two 4x-pooled views of a fine scan from disjoint sub-voxel halves\n"
-        "  ufsm png2jpg <in.png|in.jpg> <out.jpg> [--half] [--max-px N]   PNG / JPEG -> JPEG q90 (half: Pillow BOX halved; max-px: longest side)\n"
+        "  ufsm png2jpg <in.png|in.jpg> <out.jpg|out.tif> [--half] [--max-px N] [--size W,H]   PNG / JPEG -> JPEG q90 (half: Pillow BOX halved; max-px: longest side) or uint8 TIFF\n"
         "  ufsm phase-score <pc-dir> <ps-dir> [<sheets-dir>]   on-recto score of pc / ps renders on surfaces (per seam class with sheets)\n"
         "  ufsm stitch align|solve|field|sheets|info ...   overlapping box fits -> one gauge, a global winding field, stitched sheets\n"
         "  ufsm render <wraps-dir> <out-dir> --volume ROOT KEY [--ct ROOT KEY]  ink / CT along each wrap (tiled TIFF)\n"
@@ -4128,6 +4129,7 @@ typedef struct {   /* ufsm render: one output tile's pixel rows over threads */
     const float *X, *Y, *Z; int w, h; double gs;   /* the vertex grid; output pixels per grid step */
     const uint8_t *vol, *ct; int64_t o[3], n[3]; int depth;
     uint8_t *img, *cimg; int ow, px0, px1, py0, py1; _Atomic int next;
+    int known;   /* --known: nearest voxel, 255 (prob254 unknown) skipped: the max over the known values (0 when none) */
 } render_job;
 static void *render_rows(void *arg) {
     render_job *J = arg; const int w = J->w, h = J->h;
@@ -4147,7 +4149,15 @@ static void *render_rows(void *arg) {
         const double nl = sqrt(N[0] * N[0] + N[1] * N[1] + N[2] * N[2]); if (nl < 1e-12) continue;
         for (int d = 0; d < 3; d++) N[d] /= nl;
         float m = 0;
-        for (int t = -J->depth; t <= J->depth; t++) { const float v = trilin(J->vol, J->n, P[0] + t * N[0] - J->o[0], P[1] + t * N[1] - J->o[1], P[2] + t * N[2] - J->o[2]); if (v > m) m = v; }
+        for (int t = -J->depth; t <= J->depth; t++) {
+            if (J->known) {   /* nearest voxel; unknown (255) skipped */
+                const int64_t q0 = (int64_t)floor(P[0] + t * N[0] - J->o[0] + 0.5), q1 = (int64_t)floor(P[1] + t * N[1] - J->o[1] + 0.5), q2 = (int64_t)floor(P[2] + t * N[2] - J->o[2] + 0.5);
+                if (q0 < 0 || q1 < 0 || q2 < 0 || q0 >= J->n[0] || q1 >= J->n[1] || q2 >= J->n[2]) continue;
+                const uint8_t b = J->vol[((size_t)q0 * J->n[1] + q1) * J->n[2] + q2]; if (b != 255 && b > m) m = b;
+                continue;
+            }
+            const float v = trilin(J->vol, J->n, P[0] + t * N[0] - J->o[0], P[1] + t * N[1] - J->o[1], P[2] + t * N[2] - J->o[2]); if (v > m) m = v;
+        }
         J->img[(size_t)py * J->ow + px] = (uint8_t)lroundf(m);
         if (J->cimg) J->cimg[(size_t)py * J->ow + px] = (uint8_t)lroundf(trilin(J->ct, J->n, P[0] - J->o[0], P[1] - J->o[1], P[2] - J->o[2]));
     }
@@ -4255,7 +4265,7 @@ static void render_fill_report(const char *name, uint8_t *img, uint8_t *cimg, ui
 typedef struct { char path[1400]; const uint8_t *data; int w, h, rc; } rw_job;   /* ufsm render: one output TIFF */
 static void *rw_write(void *arg) { rw_job *J = arg; J->rc = tiffw_write(J->path, J->w, J->h, 1, J->data, 1); return nullptr; }
 static int cmd_render(int argc, char **argv) {
-    if (argc < 4) { fprintf(stderr, "usage: ufsm render <wraps-dir> <out-dir> --volume ROOT KEY [--ct ROOT KEY] [--cache DIR] [--scale 1] [--depth 8] [--tile 512] [--threads 16] [--crop x,y,w,h] [--joint 1] [--gpu 1]\n"
+    if (argc < 4) { fprintf(stderr, "usage: ufsm render <wraps-dir> <out-dir> --volume ROOT KEY [--ct ROOT KEY] [--cache DIR] [--scale 1] [--depth 8] [--tile 512] [--threads 16] [--crop x,y,w,h] [--joint 1] [--gpu 1] [--known]\n"
 "  --gpu 1 (default): sample on the GPU (decoded chunks kept on the device, decoded there by gpudec); same bytes as --gpu 0 (CPU),\n"
 "    the CPU path on any device error or a full device (UFSM_RENDER_GPU_MEM GB caps the device chunk pool)\n"
 "         [--fill N] [--fill-ct 1] [--fill-prefer 0] [--fill-inpaint L] [--fill-pm 1] [--fill-grid V]\n"
@@ -4268,21 +4278,24 @@ static int cmd_render(int argc, char **argv) {
 "    cosmetic, off by default; flag 250\n"
 "  --fill-grid V (with --fill): enclosed holes of the grid (invalid vertices, at most V per hole) bridged by interpolated vertices\n"
 "    (push-pull + Laplace), rendered like the rest; their pixels' flags + 100\n"
+"  --known: nearest voxel, 255 (prob254 unknown) skipped, the max over the known values within +-depth (label zarrs: ink-splat output);\n"
+"    on the CPU (the box read once when it fits UFSM_RENDER_MEM, else per tile); not with --fill / --joint\n"
                                      "  --crop: only that rectangle of each wrap's output pixels is rendered and written (e.g. a labelled region)\n"); return 2; }
     const int vi = arg_index(argc, argv, "--volume"), ci = arg_index(argc, argv, "--ct");
     int crop[4] = {0, 0, 0, 0}; const char *crs = opt(argc, argv, "--crop", nullptr);
     if (crs && (sscanf(crs, "%d,%d,%d,%d", &crop[0], &crop[1], &crop[2], &crop[3]) != 4 || crop[0] < 0 || crop[1] < 0 || crop[2] < 1 || crop[3] < 1)) { fprintf(stderr, "render: --crop x,y,w,h\n"); return 2; }
     if (vi < 0 || vi + 2 >= argc) { fprintf(stderr, "render: --volume ROOT KEY\n"); return 2; }
-    const double scale = atof(opt(argc, argv, "--scale", "1")); const int depth = atoi(opt(argc, argv, "--depth", "8"));
+    const double scale = atof(opt(argc, argv, "--scale", "1")); const int depth = atoi(opt(argc, argv, "--depth", "8")), known = flag(argc, argv, "--known");
     const int tile = atoi(opt(argc, argv, "--tile", "512")), nthreads = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 16);
     const char *cache = opt(argc, argv, "--cache", nullptr);
     const int fill_n = atoi(opt(argc, argv, "--fill", "-1")), fill_inp = atoi(opt(argc, argv, "--fill-inpaint", "0"));
     const int fill_thr = atoi(opt(argc, argv, "--fill-ct", "1")), fill_pref = atoi(opt(argc, argv, "--fill-prefer", "0")), fill_pm = atoi(opt(argc, argv, "--fill-pm", "1"));
     const long fill_grid = atol(opt(argc, argv, "--fill-grid", "0"));
-    const int rgpu_on = atoi(opt(argc, argv, "--gpu", "1")) && render_gpu_available() && !getenv("UFSM_RENDER_TILED");   /* default on: same bytes, CPU on any device trouble */
+    const int rgpu_on = atoi(opt(argc, argv, "--gpu", "1")) && render_gpu_available() && !getenv("UFSM_RENDER_TILED") && !known;   /* default on: same bytes, CPU on any device trouble */
     render_set_gpu(rgpu_on);
     if (fill_n > 49 || (fill_grid && fill_n < 0) || fill_inp < 0 || fill_inp > 8 || ((fill_n >= 0 || fill_inp) && (ci < 0 || ci + 2 >= argc)) || (fill_inp && fill_n < 0) || (fill_n >= 0 && getenv("UFSM_RENDER_TILED"))) {
         fprintf(stderr, "render: --fill N (0..49) needs --ct (and not UFSM_RENDER_TILED); --fill-inpaint L (1..8) needs --fill\n"); return 2; }
+    if (known && (fill_n >= 0 || atoi(opt(argc, argv, "--joint", "0")))) { fprintf(stderr, "render: --known is the CPU box / tile path: not with --fill or --joint\n"); return 2; }
     store *vs = store_open(argv[vi + 1]), *cs = ci > 0 && ci + 2 < argc ? store_open(argv[ci + 1]) : nullptr;
     const int remote = (vs && !store_is_local(vs)) || (cs && !store_is_local(cs));
     z3 *vz = vs ? z3_open(vs, argv[vi + 2], cache) : nullptr, *cz = cs ? z3_open(cs, argv[ci + 2], cache) : nullptr;
@@ -4299,7 +4312,7 @@ static int cmd_render(int argc, char **argv) {
     int chunked = 0; double cbudget = 0;
     {
         double lo[3] = {1e300, 1e300, 1e300}, hi[3] = {-1e300, -1e300, -1e300};
-        const int forced = !getenv("UFSM_RENDER_TILED") && (getenv("UFSM_RENDER_CHUNKED") || fill_n >= 0 || rgpu_on);   /* chunk-ordered anyway: no box scan (a grid read) */
+        const int forced = !getenv("UFSM_RENDER_TILED") && !known && (getenv("UFSM_RENDER_CHUNKED") || fill_n >= 0 || rgpu_on);   /* chunk-ordered anyway: no box scan (a grid read) */
         while (!forced && (de = readdir(dd))) {
             if (de->d_name[0] != 'w') continue;
             char p[1400]; int w, h; const char *ax[3] = {"z", "y", "x"};
@@ -4397,7 +4410,7 @@ static int cmd_render(int argc, char **argv) {
         uint8_t *img = calloc((size_t)ow * oh, 1), *cimg = cz ? calloc((size_t)ow * oh, 1) : nullptr, *flag = fill_n >= 0 ? malloc((size_t)ow * oh) : nullptr;
         if (!img || (cz && !cimg) || (fill_n >= 0 && !flag)) { fprintf(stderr, "render: out of memory\n"); return 1; }
         if (flag) memset(flag, RFILL_NONE, (size_t)ow * oh);
-        if (!rvol && !getenv("UFSM_RENDER_TILED")) {
+        if (!rvol && !known && !getenv("UFSM_RENDER_TILED")) {   /* (--known: render_rows below, the only nearest-voxel sampler) */
             z3 *zs[2] = {vz, cz}; const int dp[2] = {depth, 0}; uint8_t *const im[2] = {img, cimg};
             const size_t imgb = (size_t)ow * oh * (cz ? 2 : 1), cb = cbudget > imgb + ((size_t)1 << 30) ? (size_t)cbudget - imgb : (size_t)1 << 30;
             const int io = remote ? (nthreads > 32 ? nthreads : 32) : nthreads;
@@ -4420,7 +4433,7 @@ static int cmd_render(int argc, char **argv) {
                 const double v[3] = {Z[i], Y[i], X[i]}; for (int d = 0; d < 3; d++) { if (v[d] < lo[d]) lo[d] = v[d]; if (v[d] > hi[d]) hi[d] = v[d]; }
             }
             if (lo[0] > hi[0]) continue;
-            render_job J = {X, Y, Z, w, h, gs, nullptr, nullptr, {0, 0, 0}, {0, 0, 0}, depth, img, cimg, ow, tx, px1, ty, py1, 0};
+            render_job J = {X, Y, Z, w, h, gs, nullptr, nullptr, {0, 0, 0}, {0, 0, 0}, depth, img, cimg, ow, tx, px1, ty, py1, 0, known};
             if (rvol) {   /* the region read once */
                 J.vol = rvol; J.ct = rct; for (int d = 0; d < 3; d++) { J.o[d] = ro[d]; J.n[d] = rn[d]; }
                 pthread_t th[64]; const int nt = nthreads < 64 ? nthreads : 64;
@@ -4613,6 +4626,7 @@ int cmd_fiber_judge(int argc, char **argv);    /* src/fiberjudge.c */
 int cmd_fiber_trace(int argc, char **argv);    /* src/fibertrace.c */
 int cmd_fiber_raster(int argc, char **argv);   /* src/fiberraster.c */
 int cmd_fiber_onfly(int argc, char **argv);
+int cmd_codes_onfly(int argc, char **argv);
 int cmd_fiber_link(int argc, char **argv);     /* src/fiberlink.c */
 int cmd_count_field(int argc, char **argv);   /* src/countfield.c */
 int cmd_hires_phase(int argc, char **argv);   /* src/hiresphase.c */
@@ -4685,6 +4699,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "fiber-trace")) return cmd_fiber_trace(argc, argv);
     if (!strcmp(cmd, "fiber-raster")) return cmd_fiber_raster(argc, argv);
     if (!strcmp(cmd, "fiber-onfly")) return cmd_fiber_onfly(argc, argv);
+    if (!strcmp(cmd, "codes-onfly")) return cmd_codes_onfly(argc, argv);
     if (!strcmp(cmd, "count-field")) return cmd_count_field(argc, argv);
     if (!strcmp(cmd, "hires-phase")) return cmd_hires_phase(argc, argv);
     if (!strcmp(cmd, "phase-gate")) return cmd_phase_gate(argc, argv);
@@ -4724,6 +4739,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "ink-splat")) return cmd_ink_splat(argc, argv);
     if (!strcmp(cmd, "ink-score")) return cmd_ink_score(argc, argv);
     if (!strcmp(cmd, "ink-vscore")) return cmd_ink_vscore(argc, argv);
+    if (!strcmp(cmd, "ink-onfly")) return cmd_ink_onfly(argc, argv);
     if (!strcmp(cmd, "ink-cover")) return cmd_ink_cover(argc, argv);
     if (!strcmp(cmd, "ink-ensemble")) return cmd_ink_ensemble(argc, argv);
     if (!strcmp(cmd, "wl-dump")) return cmd_wl_dump(argc, argv);

@@ -5,6 +5,7 @@
 #      multi-head run equals its single-head run byte for byte; --heads with --fit-zarr writes the same fields as --fit-zarr alone
 #  (1b) the GPU pyramid of the heads == the CPU pyramid at q 0 (shard 128 and 256)
 #  (1c) the heads encoded from the GPU's levels (vcgpu.h) == the CPU encoder, q 8, every shard file of every level
+#  (1d) the CT windows decoded on the GPU (UFSM_PRED_DEVREAD) == the host reader
 #  (2) a plain latent net with the fibre head (--lat 4 --rv 2 --fib-head 1): --heads all writes rv, fib/H, fib/V, fib/dyad/c2..c7, fib/fam;
 #      fib/H equals the old single-channel path (the pool4 chain in fp32) within one code on 1 % (the heads path rounds the upsampled logit
 #      to fp16 as the slab path does: 0.64 % of the fixture's bytes land across a code boundary)
@@ -60,6 +61,14 @@ for sh in 128 256; do
   [ "$(cd ge${sh}1 && find . -path '*/c/*' -type f | sort | xargs cat | md5sum)" = "$(cd ge${sh}0 && find . -path '*/c/*' -type f | sort | xargs cat | md5sum)" ] || fail "shard $sh: the GPU encoder's shards differ from the CPU encoder's"
   [ "$(cd ge${sh}1 && find . -path '*/c/*' -type f | wc -l)" -ge 6 ] || fail "shard $sh: too few shard files"
 done
+# (1d) the CT windows decoded on the GPU into device memory (UFSM_PRED_DEVREAD): the same stores as the host reader's (windows over the
+#      array's edges: fill), and the chunks went through the GPU
+UFSM_PRED_DEVREAD=1 UFSM_PRED_PROF=1 "$U" predict s/last.ckpt fx ct dv "${P[@]}" --heads rv,ink > dv.log 2>&1 || fail "predict UFSM_PRED_DEVREAD ($D/dv.log)"
+grep -q 'CT windows decoded into device memory' dv.log && grep -Eq 'device CT windows: [1-9][0-9]* chunks all on the GPU' dv.log || fail "device read not used ($D/dv.log)"
+for n in rv ink; do cmpb h/$n dv/$n 0 || fail "$n: the device-read run differs from the host reader's"; done
+UFSM_GPU_DECODE_ITEMS=4 UFSM_PRED_DEVREAD=1 UFSM_PRED_PROF=1 "$U" predict s/last.ckpt fx ct dvh "${P[@]}" --heads rv > dvh.log 2>&1 || fail "predict UFSM_PRED_DEVREAD, CPU fallbacks ($D/dvh.log)"
+grep -Eq 'device CT windows: 0 chunks all on the GPU, [1-9][0-9]* with host substreams' dvh.log || fail "device read: the host fallback not taken ($D/dvh.log)"
+cmpb h/rv dvh/rv 0 || fail "rv: the device-read run with CPU-decoded chunks differs"
 # (2) plain latent net with the fibre head
 "$U" train fx/sources-fibhv.json --out fb "${C[@]}" --lat 4 --rv 2 --rv-iso 100 --fib-head 1 > fb.log 2>&1 || fail "train (2) ($D/fb.log)"
 "$U" predict fb/last.ckpt fx ct g "${P[@]}" --heads all > g.log 2>&1 || fail "predict --heads all, fibre ($D/g.log)"

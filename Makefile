@@ -63,7 +63,7 @@ CUDALIBS = -L$(CUDA)/lib64 -lcudart -lcublasLt -lstdc++
 SRC  = src/json.c src/checkpoint.c src/sheet.c src/store.c src/zarr3.c src/sources.c src/sample.c src/band.c src/ct_augment.c src/scan_augment.c src/spatial_augment.c src/crush.c src/scrollaug.c src/cover.c src/zarr2.c src/tiff.c src/z3w.c src/hf.c src/ingest.c src/zipr.c src/train.c src/restore.c src/restore_cli.c src/unet.c src/split.c src/predict.c src/sweep.c src/eval.c src/fit.c src/tiffw.c src/edt.c src/votes.c src/wind.c src/fuse.c src/phase_check.c src/band_onfly.c
 SRC += src/surf.c src/stitch.c src/coreline.c src/coreline_check.c src/fit_ct.c src/l1pot.c
 SRC += src/fblend.c src/sheetpbr.c src/regmap.c src/vcgpu.c
-SRC += src/deform.c src/vwt_aug.c src/zcache.c
+SRC += src/deform.c src/vwt_aug.c src/zcache.c src/dcache.c
 SRC += src/inkblend.c
 SRC += src/ftaxis.c
 SRC += src/inkseam.c
@@ -81,6 +81,7 @@ SRC += src/vwt_sample.c src/raycheck.c src/patchraster.c src/hiresphase.c src/fi
 SRC += src/view.c src/reg.c src/reg_cli.c src/reg_view.c src/reg_init.c src/reg_render.c src/reg_ink.c src/srpairs.c
 SRC += src/srpair.c
 SRC += src/storebench.c src/phasepack.c
+SRC += src/meshcodes.c
 SRC += src/afv.c src/fibercheck.c src/fitphase.c src/wrapdump.c src/fiberjudge.c src/fibertrace.c src/fiberraster.c src/fiberlink.c src/fibregscore.c
 SRC += src/countfield.c src/countanat.c
 SRC += src/flatten.c src/faces.c src/faces_cli.c
@@ -157,6 +158,8 @@ $(B)/test_latvol: tests/test_latvol.c src/latvol.h $(B)/latvol.o $(B)/nn_latvol.
 # the phase-raster pair rule on the GPU (src/nn_band.cu) is byte-identical to band.c: IEEE division / sqrt, no FMA contraction, no fast math
 $(B)/nn_band.o: NVFLAGS = -O3 $(NVARCH) -DUFSM_ARCH=$(ARCH) -fmad=false -Xcompiler -fno-threadsafe-statics -Isrc
 $(B)/nn_fibre.o: NVFLAGS = -O3 $(NVARCH) -DUFSM_ARCH=$(ARCH) -fmad=false -Xcompiler -fno-threadsafe-statics -Isrc
+# the on-the-fly ink chunk (src/nn_inkfly.cu) is byte-identical to inksplat.c inkfly_chunk: IEEE division / sqrt, no FMA contraction, no fast math
+$(B)/nn_inkfly.o: NVFLAGS = -O3 $(NVARCH) -DUFSM_ARCH=$(ARCH) -fmad=false -Xcompiler -fno-threadsafe-statics -Isrc
 # volcomp encoding's analysis on the GPU (src/nn_gpuenc.cu) gives the CPU encoder's levels exactly: no FMA contraction, no fast math
 $(B)/nn_gpuenc.o: NVFLAGS = -O3 $(NVARCH) -DUFSM_ARCH=$(ARCH) -fmad=false -Xcompiler -fno-threadsafe-statics -Isrc
 # FP8 / FP4 block-scaled mma (kind::mxf8f6f4 / kind::mxf4) needs the arch-specific sm_120a target
@@ -290,6 +293,9 @@ suite-bins: $(B)/test_wraps_core
 $(B)/test_predict_unwrap2: tests/test_predict_unwrap2.c $(B)/unet.o $(B)/fit.o $(B)/fit_emb.o $(B)/embz.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/coreline.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/z3w.o $(B)/nn.o $(B)/nn_fp8.o | $(B)/ufsm
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 suite-bins: $(B)/test_predict_unwrap2
+$(B)/test_predict_fitgrid: tests/test_predict_fitgrid.c $(B)/unet.o $(B)/fit.o $(B)/fit_emb.o $(B)/embz.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/coreline.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/z3w.o $(B)/nn.o $(B)/nn_fp8.o | $(B)/ufsm
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
+suite-bins: $(B)/test_predict_fitgrid
 $(B)/test_unwrap2_ink: tests/test_unwrap2_ink.c $(B)/unet.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/z3w.o $(B)/nn.o $(B)/nn_fp8.o | $(B)/ufsm $(B)/make_wind_fixture
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 suite-bins: $(B)/test_unwrap2_ink $(B)/make_wind_fixture
@@ -391,6 +397,12 @@ $(B)/test_distill: tests/test_distill.c $(B)/sample_emb.o $(B)/embz.o $(B)/z3w.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 suite-bins: $(B)/test_distill
 
+$(B)/test_ink_mil: tests/test_ink_mil.c $(OBJ) $(B)/nn.o $(B)/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
+suite-bins: $(B)/test_ink_mil
+$(B)/test_ink_mil_train: tests/test_ink_mil_train.c $(OBJ) $(B)/nn.o $(B)/nn_fp8.o | $(B)/ufsm $(B)/make_wind_fixture
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_ink_mil_train.c $(OBJ) $(B)/nn.o $(B)/nn_fp8.o -o $@ $(LDLIBS) $(CUDALIBS)
+suite-bins: $(B)/test_ink_mil_train $(B)/make_wind_fixture
 $(B)/test_ink_splat: tests/test_ink_splat.c $(OBJ) $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 suite-bins: $(B)/test_ink_splat
@@ -481,6 +493,9 @@ suite-bins: $(B)/test_render_stream
 $(B)/test_render_fill: tests/test_render_fill.c $(B)/render.o $(B)/inkcompare.o $(B)/imgops.o $(B)/jpegpar.o $(B)/tiff.o $(B)/tiffw.o $(B)/z3w.o $(B)/zarr3.o $(B)/store.o $(B)/json.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
 suite-bins: $(B)/test_render_fill
+$(B)/test_render_known: tests/test_render_known.c $(B)/render.o $(B)/inkcompare.o $(B)/imgops.o $(B)/jpegpar.o $(B)/tiff.o $(B)/tiffw.o $(B)/z3w.o $(B)/zarr3.o $(B)/store.o $(B)/json.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
+suite-bins: $(B)/test_render_known
 # the renders on the GPU (nn_render.cu, gpudec device decode): the same tests, every chunked render through the GPU path; byte-identical, so no
 # fast math and no fused multiply-adds in this object
 $(B)/nn_render.o: NVFLAGS := -O3 $(NVARCH) -DUFSM_ARCH=$(ARCH) -fmad=false -Xcompiler -fno-threadsafe-statics -Isrc
