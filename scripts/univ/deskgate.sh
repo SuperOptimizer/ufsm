@@ -41,8 +41,12 @@ case $PART in
 esac
 [ "${DRY:-0}" = 1 ] && { cat $Q; rm -f $Q; exit 0; }   # DRY=1: the job list only
 # the window: both cards free of the trainer (univA stops u1 for it)
-until ! pgrep -f 'ufsm[^ ]* train .*sources-u1' > /dev/null; do sleep 20; done
+TRP=${TRP:-ufsm[^ ]* train .*sources-(u1|unified)}   # the desk trainer whose stop opens the window (u1, then the unified run)
+until ! pgrep -f "$TRP" > /dev/null; do sleep 20; done
 T0=$(date +%s); STOPAT=$((T0 + (WINMIN - 3) * 60)); export STOPAT
+# GPU tests sharing the window's first minutes (the lead's merge batches, build-verify suite binaries): my predicts start when they are
+# done, at most TESTWAIT s (360) into the window
+while pgrep -f 'build-verify/test_|run_suite.sh' > /dev/null && [ $(( $(date +%s) - T0 )) -lt ${TESTWAIT:-360} ]; do sleep 10; done
 echo "$T $PART pid $$ from $(date '+%H:%M') to $(date -d @$STOPAT '+%H:%M')" > $LB/gate.busy
 log "window: $(wc -l < $Q) jobs on GPUs [$GPUS], no new box after $(date -d @$STOPAT '+%H:%M')"
 eqtest() {   # the two-phase equality test: the same boxes one-phase (eq1) and predict-then-fit (eq2), the same GPU, rows equal but timings
