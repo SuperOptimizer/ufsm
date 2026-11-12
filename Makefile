@@ -62,7 +62,7 @@ CUDALIBS = -L$(CUDA)/lib64 -lcudart -lcublasLt -lstdc++
 
 SRC  = src/json.c src/checkpoint.c src/sheet.c src/store.c src/zarr3.c src/sources.c src/sample.c src/band.c src/ct_augment.c src/scan_augment.c src/spatial_augment.c src/crush.c src/scrollaug.c src/cover.c src/zarr2.c src/tiff.c src/z3w.c src/hf.c src/ingest.c src/zipr.c src/train.c src/restore.c src/restore_cli.c src/unet.c src/split.c src/predict.c src/sweep.c src/eval.c src/fit.c src/tiffw.c src/edt.c src/votes.c src/wind.c src/fuse.c src/phase_check.c src/band_onfly.c
 SRC += src/surf.c src/stitch.c src/coreline.c src/coreline_check.c src/fit_ct.c src/l1pot.c
-SRC += src/fblend.c src/sheetpbr.c src/regmap.c
+SRC += src/fblend.c src/sheetpbr.c src/regmap.c src/vcgpu.c
 SRC += src/deform.c src/vwt_aug.c src/zcache.c
 SRC += src/inkblend.c
 SRC += src/ftaxis.c
@@ -151,6 +151,8 @@ $(B)/nn_ftrace.o: NVFLAGS = -O3 $(NVARCH) -DUFSM_ARCH=$(ARCH) -fmad=false -Xcomp
 # the phase-raster pair rule on the GPU (src/nn_band.cu) is byte-identical to band.c: IEEE division / sqrt, no FMA contraction, no fast math
 $(B)/nn_band.o: NVFLAGS = -O3 $(NVARCH) -DUFSM_ARCH=$(ARCH) -fmad=false -Xcompiler -fno-threadsafe-statics -Isrc
 $(B)/nn_fibre.o: NVFLAGS = -O3 $(NVARCH) -DUFSM_ARCH=$(ARCH) -fmad=false -Xcompiler -fno-threadsafe-statics -Isrc
+# volcomp encoding's analysis on the GPU (src/nn_gpuenc.cu) gives the CPU encoder's levels exactly: no FMA contraction, no fast math
+$(B)/nn_gpuenc.o: NVFLAGS = -O3 $(NVARCH) -DUFSM_ARCH=$(ARCH) -fmad=false -Xcompiler -fno-threadsafe-statics -Isrc
 # FP8 / FP4 block-scaled mma (kind::mxf8f6f4 / kind::mxf4) needs the arch-specific sm_120a target
 # The low-precision kernels are split into one translation unit per kernel family (src/lp_*.cu, shared helpers in
 # src/lp_common.cuh) so make -j compiles them in parallel; $(B)/nn_fp8.o is their relocatable link, so every target
@@ -496,6 +498,9 @@ $(B)/test_volcomp: tests/test_volcomp.c third_party/volcomp.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< -o $@ -lm
 $(B)/test_volcomp_fast: tests/test_volcomp_fast.c src/volcomp_fast.h src/zshm.h $(B)/zarr3.o $(B)/store.o $(B)/json.o $(B)/z3w.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(B)/zarr3.o $(B)/store.o $(B)/json.o $(B)/z3w.o -o $@ $(LDLIBS)
+$(B)/test_vcgpu: tests/test_vcgpu.c src/vcgpu.h $(B)/vcgpu.o $(B)/nn.o $(B)/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(CUDA)/include $< $(B)/vcgpu.o $(B)/nn.o $(B)/nn_fp8.o -o $@ $(LDLIBS) $(CUDALIBS)
+suite-bins: $(B)/test_vcgpu
 $(B)/test_gpudec: tests/test_gpudec.c src/gpudec.h src/volcomp_fast.h $(B)/zarr3.o $(B)/store.o $(B)/json.o $(B)/z3w.o $(B)/nn_gpudec.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(CUDA)/include $< $(B)/zarr3.o $(B)/store.o $(B)/json.o $(B)/z3w.o $(B)/nn_gpudec.o -o $@ $(LDLIBS) $(CUDALIBS)
 $(B)/test_edt: tests/test_edt.c $(B)/edt.o
