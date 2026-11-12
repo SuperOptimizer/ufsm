@@ -6,6 +6,41 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Holdouts masked instead of rejected; coarse rungs get a pooled phase (2026-11-11, branch univ-20261111)
+
+u1 after the fstem restart (5796) drew 0.0% of its windows at 19.2 um, PHerc1667-gt not at all, 1667-A48 / B48 and 0500P2 at 0.6-3.3%. A
+sampler-only run of sources-u1b (150 batches) with per source x level drop counters found two causes:
+
+- **Holdout rejection.** A training window touching any held-out box (any same-CT source's) was dropped and redrawn. 1667 is dense with
+  wbench boxes and coarse windows span 7168 level-0 voxels, so 1667-gt / A48 / B48 and 0500P2 produced 0 windows (15 + 11, 4 + 10 + 2,
+  4 + 1 + 3, 5 draws dropped on overlaps).
+  Now `--holdout-mode mask` (the default; per source `"holdout_mode": "mask" | "reject"`) keeps the window and makes every label unknown in
+  each box grown by `--holdout-guard` (16) voxels of the window's level. The mask is a property of the volume, so it also applies to windows
+  that touch only the guard. It is applied on the source grid before any symmetry or warp:
+  - the stored phase, so w4 / component / w4 runs as well;
+  - band, side and pap labels;
+  - the ignore plane, so the loss mask, ink, rv and aux / fibre planes.
+
+  Sheet-prior, cond and distill windows have no voxel mask and still reject. More than 64 overlapping boxes also reject.
+- **No phase on windows coarser than the stored phase.** phase_window only upsamples. A window at pshift < 0 had an all-unknown side plane
+  and was dropped as "empty targets": Paris 4 june / july at 19.2 um, 0139 at 18.7 um. So u1's coarse rungs never trained phase, before or
+  after the restart.
+  Now such a window reads `source_phase_at(s, l)`, a lazy pooled view: `phase_pool2_view`, a z3_open_derived_pool2 that borrows the
+  phase, with the downsample --mode phase rule (2^3 circular mean, unknown under half resultant). The "ignore" array pools as "any child
+  set"; "weight" is not applied there.
+  Only one level of pooling: a phase two or more levels finer (4.8 -> 19.2 um) would read 64x the window's voxels, so `--um-rungs` skips
+  those levels. The pooling runs in z slabs of <= 64 MB, because pooling a P 896 window whole read 1792^3 = 5.7 GB per worker and the first
+  sampler-only run was OOM-killed in the 64 GB slice.
+
+Tests (test_unwrap2_sampler):
+- the same 40 draws with and without a box: 0 of 177270 box + guard voxels carry a phase / w4 / comp / loss-mask label, and 0 phase bytes
+  differ outside;
+- reject mode draws no window over the box;
+- level-1 windows of a level-0 phase equal phase_pool2_box on their grid (154624 of 154624 pooled-known voxels known, 0 differ, w4 set).
+
+`sampler-only` now prints per source and level: windows, holdout-masked windows, and draws dropped on holdout overlaps, empty targets, the
+coarse probe and CT min_fg.
+
 ## Universal net inference: every head from one trunk pass (predict --heads), the fine stem in the latent fast paths (2026-11-11, branch univinf-20261111)
 
 **What fell back (u1, `--lat 4 --lat-guide 3 --rv 2 --film 2 --fstem 16`, cout 144 = 16 + 128 sub-cell outputs).** Every latent fast

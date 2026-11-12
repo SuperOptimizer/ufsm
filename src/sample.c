@@ -406,7 +406,10 @@ static int rung_level(sampler *sp, source *s, int si, int k, int region_ch) {
     for (int l = s->min_level < 0 ? 0 : s->min_level; l < MAXLEV; l++) {
         if ((s->max_level >= 0 && l > s->max_level) || (region_ch >= 0 && l > 1)) break;
         const double dl = fabs(log2(s->um * ldexp(1.0, l) / c->rung_um[k]));
-        if (dl <= tol + 1e-9 && dl < bd && level_ok(sp, s, si, l, region_ch) && (c->restore || !labels_coarse(sp, s, l, region_ch, 0))) { bd = dl; best = l; }   /* (labels coarser than the level: not this rung) */
+        /* (a stored phase two or more levels finer: no rung there. Its pooled view is made one level up only (draw_): 4.8 -> 19.2 um would
+           read 64x the window's voxels) */
+        const int ph_deep = !c->restore && !c->band && c->side == 2 && s->phase && !c->phase_dense && l - s->phase_level > 1;
+        if (dl <= tol + 1e-9 && dl < bd && !ph_deep && level_ok(sp, s, si, l, region_ch) && (c->restore || !labels_coarse(sp, s, l, region_ch, 0))) { bd = dl; best = l; }   /* (labels coarser than the level: not this rung) */
     }
     return best;
 }
@@ -2968,7 +2971,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
     const int pshift = s->phase ? s->phase_level - l : -1;   /* the stored phase: its grid relative to this level's (0 direct, 1 upsampled) */
     /* windows coarser than the stored phase (the scale rungs): its 2^k pooled view (source_phase_at, the downsample --mode phase rule) on
        the window's own grid. Before 2026-11-11 these windows had no phase at all (the side plane all unknown, dropped as empty targets) */
-    const int ph_pool = pshift < 0 && s->phase && !c->band && c->side == 2 && !c->phase_dense;
+    const int ph_pool = pshift == -1 && s->phase && !c->band && c->side == 2 && !c->phase_dense;   /* (one level: --um-rungs skips deeper ones) */
     z3 *const phz = ph_pool ? source_phase_at(s, l, 0) : s->phase, *const ignz = ph_pool && s->phase_ign ? source_phase_at(s, l, 1) : s->phase_ign;
     const int psh = ph_pool ? 0 : pshift;
     const int stored_phase = !c->band && c->side == 2 && phz && !c->phase_dense && (psh == 1 || ((psh == 0 || psh == 2) && (s->phase_direct || ph_pool)));   /* (2: a 9.6 um phase interpolated into 2.4 um windows) */
@@ -3575,7 +3578,7 @@ static int labels_coarse(sampler *sp, source *s, int l, int region_ch, int verbo
         return 1;
     }
     const int pshift = s->phase ? s->phase_level - l : 0;
-    const int stored = !c->band && c->side == 2 && s->phase && !c->phase_dense && ((pshift == 0 && s->phase_direct) || pshift < 0);   /* (< 0: its pooled view, draw_) */
+    const int stored = !c->band && c->side == 2 && s->phase && !c->phase_dense && ((pshift == 0 && s->phase_direct) || pshift == -1);   /* (-1: its pooled view, draw_) */
     if (s->phase && pshift > 0) {
         if (verbose) fprintf(stderr, "sampler: %s: target \"phase\"%s%s is stored at %g um, coarser than the training level %d (%g um): labels must be stored at the training level\n",
                              s->name, s->wind ? " (+ winding)" : "", s->phase_ign ? " (+ ignore mask)" : "", s->um * ldexp(1.0, s->phase_level), l, um);
