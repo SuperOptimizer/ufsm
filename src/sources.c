@@ -164,10 +164,15 @@ static z3 *onfly_codes_open(const source *s, const json *e, const json *of, int 
 static z3 *onfly_phase_of(z3 *cz, float rm, const char *key, const json *of) {
     z3 *z = phase_onfly_open(cz, rm);
     if (!z) { z3_close(cz); return nullptr; }
-    if (!key[0] || !z3_open_cached) return z;
-    char k2[1200]; snprintf(k2, sizeof k2, "phase-onfly-pair-v1 rmax %.9g codes %s", rm, key);
+    if (!key[0] || !z3_open_cached || json_num(json_get(of, "cache"), 1) == 0) return z;   /* ("cache": 0: computed per read, no cache) */
+
     const char *dcd = json_str(json_get(of, "cache_dir"), dcache_default_dir ? dcache_default_dir() : nullptr);
-    return z3_open_cached(z, dcd && *dcd ? dcd : nullptr, k2, 0, (size_t)json_num(json_get(of, "cache_mb"), 1024));
+    /* the cell: the pair rule reads its codes with a halo of rmax + 2, so a 128^3 cell at rmax 160 (the 2.4 um rung) computed 44x its voxels
+       (10 workers made no P 1280 batch in 8 minutes on the pod); cells of >= 3 rmax (up to 512: 4.3x at rmax 160) */
+    int cell = (int)json_num(json_get(of, "cache_cell"), 0);
+    if (cell <= 0) { cell = 128; while (cell < 3 * rm && cell < 512) cell *= 2; }
+    char k2[1200]; snprintf(k2, sizeof k2, "phase-onfly-pair-v1 rmax %.9g codes %s cell %d", rm, key, cell);   /* (the cell size: the disk files' layout) */
+    return z3_open_cached(z, dcd && *dcd ? dcd : nullptr, k2, cell, (size_t)json_num(json_get(of, "cache_mb"), 1024));
 }
 /* an "onfly" phase spec ({root, key, rmax[, pool2]}, {meshes, rmax}, or {"sets": [...], "tol"}) opened with `extra` more 2x levels of its
    codes at rmax / 2^extra (extra 1: the phase of the next coarser level). plev: the phase's level (the meshes' default codes level).
