@@ -3009,6 +3009,17 @@ int cmd_train(int argc, char **argv) {
                     if (need > dev) need = need - dev + slabs;
                     need += need / 14;   /* measured device peaks ran 3 - 5% over this count (rv 32-wide: 1.88 GB real / 1.82 at P 512, 6.15 / 5.83 at P 896; fp8 96-wide winding 8.84 / 8.27 at P 768; source not found): the 10 B per voxel dropped above was the margin before */
                 }
+                if (getenv("UFSM_MEM_REPORT") && atoi(getenv("UFSM_MEM_REPORT")) >= 2) {   /* the task term's parts (GB; the window's full-resolution planes, bytes per voxel) */
+                    const size_t v = (size_t)B * p3, aug = g_gpu_aug_want && gin ? nn_aug_device_bytes(P) + (g_gpu_aug_want == 2 ? nn_label_warp_device_bytes(P) : 0) : 0;
+                    const size_t uwp = g_unwrap ? (size_t)4 * v + (g_unwrap2 ? (size_t)4 * v : 0) + (size_t)2 * g_naux * v : 0;
+                    const size_t uws = g_unwrap && g_head_slab ? (size_t)g_hs_z * P * P * (2 * g_cout + 11) + (size_t)(3 * (g_rv != 0) + 2 * (g_ink2 || (g_fibn && !g_rv))) * g_hs_z * P * P : 0;
+                    const size_t latb = g_lat ? (xin_sep ? 0 : xinb) + (g_tm_unused ? 0 : batb) : 0;
+                    const size_t lath = g_lat && g_lat_hs ? ((size_t)LNC * (LGFC < LNC ? 6 : 4) + (size_t)LGFC * 4) * (size_t)(g_hs_z / 4 + 2) * (P / 4) * (P / 4) + (g_lat_fuse ? nn_lat_fuse_part(7, P / 4, P / 4, g_hs_z) : 0) : 0;
+                    fprintf(stderr, "memory plan parts (mode %d, %.0f Mvox): label planes %.2f GB (%.1f B/vox; uint8 codes: phase / side, w4, comp, ink, %d aux) + head slabs %.2f + gpu-aug staging %.2f (%.1f B/vox, uint8 CT / labels)"
+                            " + lat batch %.2f (input %s, targets / mask %s) + lat head slab %.2f; the label stream %s; +1/14 margin\n",
+                            c, v / 1e6, uwp / 1e9, (double)uwp / v, g_naux, uws / 1e9, aug / 1e9, (double)aug / v, latb / 1e9, xin_sep ? "separate" : "in gout[0]", g_tm_unused ? "unused" : "on device", lath / 1e9,
+                            g_lat && g_head_slab && B == 1 && (g_xs == 1 || g_gpu_want) && xbytes() == 2 && g_side ? "replaces the label planes by 2 slab sets" : "off");
+                }
                 if (ufsm_env_on("UFSM_MEM_REPORT"))   /* the planner's terms of this mode */
                     fprintf(stderr, "memory plan: mode %d (%s%s): network %.2f + workspace %.2f + gy records %.2f + trainer %.2f + task %.2f + fixed %.2f = %.2f GB\n", c, cand[c].what,
                             pass ? "" : ", no host offloads", tb / 1e9, tb / 14 / 1e9, grec / 1e9, trainer / 1e9, (need - grec - tb - tb / 14 - trainer - ((size_t)550 << 20)) / 1e9, (double)((size_t)550 << 20) / 1e9, need / 1e9);
