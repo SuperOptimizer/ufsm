@@ -16,6 +16,7 @@ n=0
 for vol in "$CTROOT"/PH*/*.zarr; do
   scroll=$(basename "$(dirname "$vol")"); key=$scroll/$(basename "$vol")
   case " $EXCL " in *" $scroll "*) continue;; esac
+  [ -e "$vol/zarr.json" ] || { echo "skip $key: no zarr.json (an incomplete local copy)" >&2; continue; }
   um=$(basename "$vol" | sed -n 's/^[0-9]*-\([0-9.]*\)um-.*/\1/p'); [ -n "$um" ] || { echo "skip $key: no voxel size in the name" >&2; continue; }
   if awk -v u="$um" 'BEGIN{exit !(u < 3)}'; then lo=2; hi=3; else lo=0; hi=1; fi
   base=$(basename "$vol")
