@@ -53,7 +53,10 @@ PY
   # 4. the scores: the anchor CT and the run's own codec
   own=$a; [ $a = q2 ] && own=vq2
   [ -e $SW/$own/$P4/.done ] || ENCONLY=1 BX="$BX" bash $L/ufsm/scripts/latvol/sweep.sh $own > $BB/log/encbox_$own.log 2>&1
-  ( CK=$o/last.ckpt TAG=B$r LATGRID=1 LVBASE=$SW THREADS=10 bash $L/ufsm/scripts/latvol/pod_wb.sh orig $BX > $BB/log/wb_${r}_orig.log 2>&1 ) &
-  ( CK=$o/last.ckpt TAG=B$r LATGRID=1 LVBASE=$SW THREADS=10 bash $L/ufsm/scripts/latvol/pod_wb.sh $own $BX > $BB/log/wb_${r}_own.log 2>&1 ) &
+  ( UPBIN=$U CK=$o/last.ckpt TAG=B$r LATGRID=1 LVBASE=$SW THREADS=10 bash $L/ufsm/scripts/latvol/pod_wb.sh orig $BX > $BB/log/wb_${r}_orig.log 2>&1 ) &
+  ( UPBIN=$U CK=$o/last.ckpt TAG=B$r LATGRID=1 LVBASE=$SW THREADS=10 bash $L/ufsm/scripts/latvol/pod_wb.sh $own $BX > $BB/log/wb_${r}_own.log 2>&1 ) &
   wait; echo "run $r done $(date +%T)"
+  # the arm's training CT goes once no later run of this call needs it (the pod's disk)
+  case " $* " in *" $a:"*) [ "$run" = "$a" ] && continue;; esac
+  [ $a != q2 ] && [ -n "$a" ] && [ "${KEEPCT:-0}" != 1 ] && rm -rf "$BB/ct/$a"
 done
