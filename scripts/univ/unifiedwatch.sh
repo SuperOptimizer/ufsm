@@ -14,9 +14,9 @@ H=${H:-$(cd "$(dirname "$0")/../.." && pwd)}; WB=/vesuvius/ufsm/wbench; RUN=${RU
 B=${B:-/vesuvius/ufsm/v2/lat/latres/bin/ufsm.unified1}; E=${E:-$WB/univ/unified}; GPU=${GPU:-0}; WEVERY=${WEVERY:-5000}
 TEACH=${TEACH:-$WB/univ/pod/ink3dext/vscores.tsv}; LG=$E/watch-$RUN.log; mkdir -p $E
 # the unroll's GPU 0 jobs go first (lead 2026-11-12): univI's Paris 4 face renders (until sched/p4rv.done) and anything of the unroll
-# schedule on GPU 0 (rvside / p1299 / unrollperf), then unrollperf2's window (until sched/perf2.done); checked after taking the lock
+# schedule on GPU 0 (rvside / p1299 / unrollperf), then unrollperf2's window (sched/perf2.done), then univI's P4 column predicts (sched/p4col.done); checked after taking the lock
 US=${US:-/vesuvius/ufsm/unroll/sched}
-gpu0free() { until [ -e $US/p4rv.done ] && [ -e $US/perf2.done ] && ! pgrep -f "$US/(rvside|p4rv|p1299|unrollperf)|unrollperf" > /dev/null; do sleep 60; done; }
+gpu0free() { until [ -e $US/p4rv.done ] && [ -e $US/perf2.done ] && [ -e $US/p4col.done ] && ! pgrep -f "$US/(rvside|p4rv|p1299|unrollperf)|unrollperf" > /dev/null; do sleep 60; done; }
 log() { echo "$(date '+%m-%d %H:%M:%S') $*" | tee -a $LG; }
 perscroll() {   # perscroll VSCORES LABEL: per-scroll mean AUC / best F1 (crop names: w.. = Paris 4, else SCROLL_w..)
   awk -F'\t' -v L="$2" '{ s = ($1 ~ /^w[0-9]/) ? "PHercParis4" : substr($1, 1, index($1, "_w") - 1); c[s]++; A[s] += $6; F[s] += $8 }
