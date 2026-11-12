@@ -229,8 +229,53 @@ static void alloc_log(size_t n, void *ra) {
     Dl_info di; const size_t off = dladdr(ra, &di) && di.dli_fbase ? (size_t)((char *)ra - (char *)di.dli_fbase) : (size_t)ra;
     fprintf(stderr, "alloc %9.1f MB, device used %8.1f MB, caller 0x%zx\n", n / 1e6, (tot - fr) / 1e6, off);
 }
+/* predict --boxes: the pool (nn.h nn_pool_on) */
+#include <mutex>
+extern int g_nreg;
+extern "C" void nn_storage_forget(const void *p);
+struct pool_ent { void *p; size_t n; int host, live; unsigned gen; };
+static std::mutex g_pmu; static pool_ent *g_pool; static int g_npool, g_cpool, g_pool_on; static unsigned g_pool_gen = 1;
+static void *pool_take(size_t n, int host) {
+    if (!g_pool_on) return nullptr;
+    std::lock_guard<std::mutex> l(g_pmu);
+    for (int i = 0; i < g_npool; i++) if (!g_pool[i].live && g_pool[i].host == host && g_pool[i].n == n) { g_pool[i].live = 1; g_pool[i].gen = g_pool_gen; return g_pool[i].p; }
+    return nullptr;
+}
+static void pool_add(void *p, size_t n, int host) {
+    if (!g_pool_on || !p) return;
+    std::lock_guard<std::mutex> l(g_pmu);
+    if (g_npool == g_cpool) { g_cpool = g_cpool ? 2 * g_cpool : 256; g_pool = (pool_ent *)realloc(g_pool, g_cpool * sizeof *g_pool); }
+    g_pool[g_npool++] = {p, n, host, 1, g_pool_gen};
+}
+static int pool_release(void *p) {   /* a pooled block freed: kept for reuse */
+    if (!g_pool_on) return 0;
+    std::lock_guard<std::mutex> l(g_pmu);
+    for (int i = 0; i < g_npool; i++) if (g_pool[i].p == p) { g_pool[i].live = 0; return 1; }
+    return 0;
+}
+static void host_untrack(void *p);
+static void pool_trim(int all) {   /* free the idle blocks (all: every idle one; else those the last box did not take) */
+    std::lock_guard<std::mutex> l(g_pmu);
+    for (int i = 0; i < g_npool;)
+        if (!g_pool[i].live && (all || g_pool[i].gen != g_pool_gen)) {
+            if (g_pool[i].host) { host_untrack(g_pool[i].p); cudaFreeHost(g_pool[i].p); } else cudaFree(g_pool[i].p);
+            g_pool[i] = g_pool[--g_npool];
+        } else i++;
+}
+extern "C" void nn_pool_on(void) { g_pool_on = 1; }
+extern "C" void nn_pool_box_end(void) {
+    if (!g_pool_on) return;
+    CK(cudaDeviceSynchronize());
+    { std::lock_guard<std::mutex> l(g_pmu); for (int i = 0; i < g_npool; i++) g_pool[i].live = 0; }
+    pool_trim(0);
+    std::lock_guard<std::mutex> l(g_pmu); g_pool_gen++;
+}
+static void *pool_dev(size_t n) { void *p = pool_take(n, 0); if (p) { if (g_nreg) nn_storage_forget(p); CK(cudaMemset(p, 0, n)); } return p; }
 extern "C" void *nn_malloc(size_t n) {
-    void *p = nullptr; const cudaError_t e = cudaMalloc(&p, n);
+    { void *q = pool_dev(n); if (q) return q; }
+    void *p = nullptr; cudaError_t e = cudaMalloc(&p, n);
+    if (e != cudaSuccess && g_pool_on) { cudaGetLastError(); pool_trim(1); e = cudaMalloc(&p, n); }   /* (the idle pool first) */
+    if (e == cudaSuccess) pool_add(p, n, 0);
     if (e != cudaSuccess) {   /* say so (the sticky g_err alone surfaced as a segfault in the next copy to the null pointer) */
         size_t fr = 0, tot = 0; cudaGetLastError(); cudaMemGetInfo(&fr, &tot);
         fprintf(stderr, "nn_malloc: cudaMalloc of %.2f GB failed (%s; %.2f of %.2f GB free on the device)\n", n / 1e9, cudaGetErrorString(e), fr / 1e9, tot / 1e9);
@@ -379,6 +424,7 @@ extern "C" void nn_free(void *p) {
     if (g_nreg) nn_storage_forget(p);
     const int i = ring_find(p);
     if (i >= 0) { CK(cudaDeviceSynchronize()); ring_drop(i); return; }
+    if (pool_release(p)) return;
     CK(cudaFree(p));
 }
 extern "C" void nn_zero(void *p, size_t n) { CKR(cudaMemset(p, 0, n)); }
@@ -424,11 +470,14 @@ extern "C" void nn_host_report(FILE *f) {   /* live pinned bytes by caller (reso
     for (int i = 0; i < g_nhb; i++) { int j = 0; while (j < k && ra[j] != g_hb[i].ra) j++; if (j == k) { if (k == 256) continue; ra[k] = g_hb[i].ra; by[k] = 0; nb[k] = 0; k++; } by[j] += g_hb[i].n; nb[j]++; }
     for (int j = 0; j < k; j++) fprintf(f, "hostmem: pinned %8.3f GB in %4zu blocks from %p\n", by[j] / 1e9, nb[j], ra[j]);
 }
-extern "C" void *nn_host_alloc(size_t n) { void *p = nullptr; CK(cudaMallocHost(&p, n)); host_track(p, n, __builtin_return_address(0)); return p; }
+extern "C" void *nn_host_alloc(size_t n) { void *p = pool_take(n, 1); if (p) return p; if (cudaMallocHost(&p, n) != cudaSuccess && g_pool_on) { cudaGetLastError(); pool_trim(1); p = nullptr; }
+    if (!p) CK(cudaMallocHost(&p, n)); host_track(p, n, __builtin_return_address(0)); pool_add(p, n, 1); return p; }
 extern "C" void *nn_managed_alloc(size_t n) { void *p = nullptr; if (cudaMallocManaged(&p, n ? n : 4) != cudaSuccess) { cudaGetLastError(); return nullptr; } return p; }
-extern "C" void *nn_malloc_try(size_t n) { void *p = nullptr; if (cudaMalloc(&p, n ? n : 4) != cudaSuccess) { cudaGetLastError(); return nullptr; } alloc_log(n, __builtin_return_address(0)); return p; }
-extern "C" void *nn_host_alloc_try(size_t n) { void *p = nullptr; if (cudaMallocHost(&p, n) != cudaSuccess) { cudaGetLastError(); return nullptr; } host_track(p, n, __builtin_return_address(0)); return p; }
-extern "C" void nn_host_free(void *p) { if (p) { host_untrack(p); CK(cudaFreeHost(p)); } }
+extern "C" void *nn_malloc_try(size_t n) { { void *q = pool_dev(n ? n : 4); if (q) return q; } void *p = nullptr; if (cudaMalloc(&p, n ? n : 4) != cudaSuccess) { cudaGetLastError(); if (!g_pool_on) return nullptr; pool_trim(1); if (cudaMalloc(&p, n ? n : 4) != cudaSuccess) { cudaGetLastError(); return nullptr; } }
+    alloc_log(n, __builtin_return_address(0)); pool_add(p, n ? n : 4, 0); return p; }
+extern "C" void *nn_host_alloc_try(size_t n) { void *p = pool_take(n, 1); if (p) return p; if (cudaMallocHost(&p, n) != cudaSuccess) { cudaGetLastError(); if (!g_pool_on) return nullptr; pool_trim(1); if (cudaMallocHost(&p, n) != cudaSuccess) { cudaGetLastError(); return nullptr; } }
+    host_track(p, n, __builtin_return_address(0)); pool_add(p, n, 1); return p; }
+extern "C" void nn_host_free(void *p) { if (p) { if (pool_release(p)) return; host_untrack(p); CK(cudaFreeHost(p)); } }
 cudaStream_t copy_stream(void) {
     static cudaStream_t st[8]; int d = 0; cudaGetDevice(&d); d &= 7;
     if (!st[d]) CK(cudaStreamCreateWithFlags(&st[d], cudaStreamNonBlocking));

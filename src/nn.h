@@ -41,6 +41,13 @@ void *nn_managed_alloc(size_t bytes);    /* CUDA managed memory (may exceed the 
 void *nn_malloc_try(size_t bytes);       /* device memory, nullptr (no sticky error) when it does not fit */
 void *nn_host_alloc_try(size_t bytes);   /* the same, nullptr when the host cannot pin that much */
 void nn_host_free(void *p);
+/* predict --boxes: the allocation pool. nn_pool_on(): from now on every nn_malloc* / nn_host_alloc* block is kept when freed and at
+   nn_pool_box_end(), which returns all of the box's blocks to the pool (after a device sync) and frees the blocks the box did not reuse; the
+   next box's requests of the same size take a pooled block (device blocks zeroed, as fresh cudaMalloc memory is): the CUDA context,
+   ~10 GB of pinned rings and the window's device buffers carry over instead of ~3 s of cudaMallocHost / cudaFreeHost a box. Callers must
+   not keep pointers across nn_pool_box_end (unet_reset_statics, predict's own). */
+void nn_pool_on(void);
+void nn_pool_box_end(void);
 size_t nn_host_bytes(void);            /* live pinned host bytes (nn_host_alloc*) */
 void nn_host_report(FILE *f);         /* the same by caller address */
 /* pipelined uploads: an async copy on a per-device copy stream (pinned source), events to order it against the compute stream */

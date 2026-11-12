@@ -6,6 +6,38 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## predict --boxes: many boxes in one process; the start-up of a predict run (2026-11-12, branch univdec-20261112)
+
+A predict run's start-up, timestamped on the pod box (5 heads + fit-zarr, 16.6 s elapsed, the window loop 10.5 s):
+
+| from (s) | to (s) | what |
+|---|---|---|
+| 0 | 0.07 | the checkpoint |
+| 0.07 | 0.5 | CUDA init, the store over HTTP, the window plan |
+| 0.5 | 1.5 | head stores + unet_build (device buffers) |
+| 1.6 | 3.65 | 9.7 GB of cudaMallocHost (shard rings 2.1, head rings 7.6) |
+| 14.2 | 15.6 | writer tails |
+| 15.6 | 16.6 | exit: cudaFreeHost + teardown |
+
+wbench (and the compression sweep, the snapshot matrices) ran a process per box.
+- `predict --boxes FILE` runs the single-box path once per line (`z,y,x,nz,ny,nx OUT [ARGS]`, where ARGS go ahead of the command's
+  options), so the outputs are those of a process per box.
+- What carries over is the CUDA context, the CT cache, and nn_pool. nn_pool keeps every nn_malloc* / nn_host_alloc* block of a box and
+  hands it to the next box's request of the same size; device blocks are zeroed, as fresh memory is. It frees the blocks a box did not take.
+- The run state that lived in function statics (lazily sized buffers sized by the first window, the attention memory, the fit writer /
+  prefetch / feather / pyramid structs, unet's g_vtok) is reset per box.
+- The shard rings are also capped at the box's shard count: a small eval box held 2 k^3 pinned buffers per head.
+- One process per checkpoint + CT root; wbench PBATCH=1 makes one per scroll.
+
+Numbers:
+- test_predict_boxes: 4 boxes (three sizes, a repeat, q 8 with the GPU encoder), 5 heads + fit-zarr each; every file is identical to a
+  process per box.
+- Fixture: 8 boxes 0.36 s then 0.10 s a box, max RSS 640 -> 649 MB.
+- Pod, 4 wbench-sized Paris4 boxes (512 x 768^2 at 9.6 um, fit fields as wbench predicts them):
+  - 4 processes: 17.2 s;
+  - --boxes: 5.3 s (2.04, 1.03, 0.86, 0.85 s a box);
+  - 267 files per box identical.
+
 ## The pooled on-the-fly ink level read in z-slabs (2026-11-12, branch sampmem-20261112)
 
 `inkfly_pool_derive` (the coarser level of an on-the-fly ink target: known-max 2x pooling of the level below) read the whole (2n)^3 fine
@@ -419,6 +451,22 @@ Numbers:
 
   The fit fields now cost +1.4 s of GPU over the 18 windows (75 ms a window, against 177) and +0.5 s of wall. The main loop still waits
   3.9 s on the fit writer's ring, behind the copies of the field slabs on the GPU's queue.
+
+Desk, one RTX 5060 Ti (u1 stopped), a 4.3 Gvox Paris4 level-2 box from local CT, window 544 (k 1), 32 tiles, ~/bin/lowcpu:
+
+| run | GPU | loop wall | Gvox/s | elapsed |
+|---|---|---|---|---|
+| 1 head, page cache cold | 3.98 s | 4.50 s | 0.93 | 9.9 s |
+| 1 head | 3.87 s | 4.41 s | 0.95 | 5.2 s |
+| 5 heads | 4.90 s | 6.38 s | 0.65 | 8.6 s |
+| 5 heads + fit-zarr (fused) | 6.78 s | 8.24 s | 0.50 | 14.0 s |
+
+On the desk the card is the limit:
+- the 4 extra heads cost +1.0 s of GPU (+27 %);
+- the fit fields +1.9 s (+38 %; the pod: +19 %);
+- the 5-head + fit loop waits 4.05 s on the fit writer's ring (the pod: 3.9 s), the first thing to remove next;
+- the reader waits 1.3 - 4.8 s for free slots (it is ahead).
+A whole Paris4 level 2 at 0.50 Gvox/s is ~17 min a card for 5 heads + fit.
 
 What would make it smaller:
 - the shifted regions: each block upsamples the winding pair and runs the stem on 3 more regions, 2/3 of the stem work. A window-wide
@@ -850,7 +898,6 @@ What we adopt, in this order (lead, 2026-11-11):
 Skipped for now: the scroll quotas and the self-training chains.
 
 Item 2 is in as `train --ink-smooth EPS` (nn_ink_targets_smooth; default 0 so running recipes do not change; test_ink_mil checks it).
-
 
 ## Holdouts masked instead of rejected; coarse rungs get a pooled phase (2026-11-11, branch univ-20261111)
 

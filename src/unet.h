@@ -117,6 +117,7 @@ void unet_set_film(unet *u, const float *codes, int k);
 size_t unet_fstem_off(const unet *u);
 int unet_fstem_reset(unet *u, uint64_t seed);   /* the fine stem as unet_init leaves it (W1 He from seed, b1 and the projection W2 0: neutral), its optimizer state and EMA zeroed / reset; 0 ok */   /* cfg.fstem: the stem's parameters (W1, b1, W2) in the flat parameters */
 void unet_free(unet *u);
+void unet_reset_statics(void);   /* predict --boxes: forget the module's cached device buffers (nn_pool_box_end reclaims them) */
 const unet_cfg *unet_cfg_of(const unet *u);
 size_t unet_nparams(const unet *u);
 void unet_head_offsets(const unet *u, size_t *w, size_t *b);   /* the 1^3 head's weights (cout x its input channels) and biases (cout) in the flat parameters */
