@@ -2872,7 +2872,7 @@ int cmd_train(int argc, char **argv) {
                         if (g_fibh && g_fib_ch + 9 > dc.cout) { fib_fresh = 1; for (int k = 0; k < 9; k++) rows[g_fib_ch + k] = -1; }   /* (fibre rows the donor lacks: fresh as in the fibre branch) */
                         w4map = dink >= 0 ? 5 : 4;   /* (4: the ink row fresh below: zero weights, the prior bias) */
                         if (g == 0) { fprintf(stderr, "init-from: unwrap2 donor by head: rows 0-10 kept"); if (g_rv == 2) fprintf(stderr, ", rv %d-%d <- donor %d-%d%s", g_rv_ch, g_rv_ch + 1, drv, drv + 1, drv < 0 ? " (none: fresh)" : "");
-                                      if (g_ink2) fprintf(stderr, ", ink %d <- %s", g_ink2_ch, dink >= 0 ? "the donor's ink row" : "fresh"); if (LBASE < cfg.cout) fprintf(stderr, ", rows %d-%d by position", LBASE, cfg.cout - 1); fprintf(stderr, "\n"); }
+                                      if (g_ink2) fprintf(stderr, ", ink %d <- %s", g_ink2_ch, dink >= 0 ? "the donor's ink row" : "fresh"); if (fib_fresh) fprintf(stderr, ", fibre %d-%d fresh", g_fib_ch, g_fib_ch + 8); if (LBASE < cfg.cout) fprintf(stderr, ", rows %d-%d by position", LBASE, cfg.cout - 1); fprintf(stderr, "\n"); }
                     } else if (g_fibh && checkpoint_unwrap_version(init_from) == 2 && dc.cout == g_fib_ch) {   /* --fib-head from the same layout without it (u1): rows kept, the fibre rows fresh */
                         for (int co = 0; co < cfg.cout; co++) rows[co] = co < dc.cout ? co : -1;
                         w4map = 3;
