@@ -98,11 +98,11 @@ __global__ void lat_input_x_k(const f16 *x, int d, int h, int w, const float *ba
     }
     for (int c = 0; c < 3; c++) y[(size_t)(C + c) * cv + i] = __float2half_rn(acc[c] * (1.f / 64.f));
 }
-__global__ void lat_input_q_k(const int8_t *q, const f16 *x, int d, int h, int w, const float *gain, int C, float sraw, float mean, float isd, f16 *y) {
+__global__ void lat_input_q_k(const int8_t *q, int qs, const f16 *x, int d, int h, int w, const float *gain, int C, float sraw, float mean, float isd, f16 *y) {
     const size_t cv = (size_t)d * h * w, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     if (i >= cv) return;
     const int z = (int)(i / ((size_t)h * w)), yy = (int)(i / w % h), xx = (int)(i % w), H = 4 * h, W = 4 * w; const size_t fv = (size_t)64 * cv;
-    const int8_t *qc = q + i * (C + 1);
+    const int8_t *qc = q + i * (size_t)qs;
     const float dc = (float)((int)(uint8_t)qc[0] + 256 * (int)qc[1]) * sraw;
     y[i] = __float2half_rn((dc - 8.f * mean) * isd * gain[0]);
     for (int c = 1; c < C; c++) y[(size_t)c * cv + i] = __float2half_rn((float)qc[c + 1] * sraw * isd * gain[c]);
@@ -113,9 +113,12 @@ __global__ void lat_input_q_k(const int8_t *q, const f16 *x, int d, int h, int w
     }
     for (int c = 0; c < 3; c++) y[(size_t)(C + c) * cv + i] = __float2half_rn(acc[c] * (1.f / 64.f));
 }
-extern "C" void nn_lat_input_q(const void *q, const void *x, int d, int h, int w, const float *gain, int C, float step_raw, float mean, float isd, void *y) {
+extern "C" void nn_lat_input_qs(const void *q, int stride, const void *x, int d, int h, int w, const float *gain, int C, float step_raw, float mean, float isd, void *y) {
     const size_t cv = (size_t)d * h * w;
-    lat_input_q_k<<<nblk(cv, 128), 128>>>((const int8_t *)q, (const f16 *)x, d, h, w, gain, C, step_raw, mean, isd, (f16 *)y); KCHECK();
+    lat_input_q_k<<<nblk(cv, 128), 128>>>((const int8_t *)q, stride, (const f16 *)x, d, h, w, gain, C, step_raw, mean, isd, (f16 *)y); KCHECK();
+}
+extern "C" void nn_lat_input_q(const void *q, const void *x, int d, int h, int w, const float *gain, int C, float step_raw, float mean, float isd, void *y) {
+    nn_lat_input_qs(q, C + 1, x, d, h, w, gain, C, step_raw, mean, isd, y);
 }
 /* The guided head of latent-grid nets (unet_cfg.lat_guide 5: the MX head's weight gradient takes <= 16 outputs, 11 + 5): the two side
    channels' fine logits are their upsampled coarse logits plus terms in the voxel's z-scored CT value x and its central differences
@@ -622,13 +625,13 @@ extern "C" void nn_lat_synth_ct(const void *q, int C, const float *bas, float st
 /* the network input of a --lat-basis checkpoint from the stored coefficients (nn_lat_pred_input_c's channels without the CT): channel c
    (q_c step_raw - [c = 0] 8 mean) isd gain_c (the window's z-score is linear; no second quantiser), then the cell means of the radial
    channels from the window's axis offsets alone, each voxel value rounded to fp16 as lat_pred_in_bas_k does */
-__global__ void lat_pred_in_q_k(const int8_t *q, int D, int W, float mean, float isd, const float *dyo, const float *dxo, int axis,
+__global__ void lat_pred_in_q_k(const int8_t *q, int qs, int D, int W, float mean, float isd, const float *dyo, const float *dxo, int axis,
                                 const float *gain, int C, float sraw, f16 *y) {
     const int d = D / 4, h = W / 4;
     const size_t cv = (size_t)d * h * h, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     if (i >= cv) return;
     const int z = (int)(i / ((size_t)h * h)), yy = (int)(i / h % h), xx = (int)(i % h);
-    const int8_t *qc = q + i * (C + 1);
+    const int8_t *qc = q + i * (size_t)qs;
     const float dc = (float)((int)(uint8_t)qc[0] + 256 * (int)qc[1]) * sraw;
     y[i] = __float2half_rn((dc - 8.f * mean) * isd * gain[0]);
     for (int c = 1; c < C; c++) y[(size_t)c * cv + i] = __float2half_rn((float)qc[c + 1] * sraw * isd * gain[c]);
@@ -641,10 +644,14 @@ __global__ void lat_pred_in_q_k(const int8_t *q, int D, int W, float mean, float
     y[(size_t)C * cv + i] = __float2half_rn(0.f);
     y[(size_t)(C + 1) * cv + i] = __float2half_rn(acc[0] * (1.f / 64.f)); y[(size_t)(C + 2) * cv + i] = __float2half_rn(acc[1] * (1.f / 64.f));
 }
+extern "C" void nn_lat_pred_input_qs(const void *q, int stride, int D, int W, float mean, float isd, const float *dyo, const float *dxo, int axis,
+                                     const float *gain, int C, float step_raw, void *y) {
+    const size_t cv = (size_t)(D / 4) * (W / 4) * (W / 4);
+    lat_pred_in_q_k<<<nblk(cv, 128), 128>>>((const int8_t *)q, stride, D, W, mean, isd, dyo, dxo, axis, gain, C, step_raw, (f16 *)y); KCHECK();
+}
 extern "C" void nn_lat_pred_input_q(const void *q, int D, int W, float mean, float isd, const float *dyo, const float *dxo, int axis,
                                     const float *gain, int C, float step_raw, void *y) {
-    const size_t cv = (size_t)(D / 4) * (W / 4) * (W / 4);
-    lat_pred_in_q_k<<<nblk(cv, 128), 128>>>((const int8_t *)q, D, W, mean, isd, dyo, dxo, axis, gain, C, step_raw, (f16 *)y); KCHECK();
+    nn_lat_pred_input_qs(q, C + 1, D, W, mean, isd, dyo, dxo, axis, gain, C, step_raw, y);
 }
 
 /* --- the head slabs' gradient pass fused (train --lat, streamed head): per coarse cell its 4^3 fine logits (lat_up4_k's arithmetic, each

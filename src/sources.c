@@ -286,8 +286,8 @@ sources *sources_load(const char *path) {
                     json_free(j); sources_free(S); return nullptr; }
                 z3 *ct = pyramid_open_level(s->s, s->ct_key, L, s->um, g_cache), *ct1 = pyramid_open_level(s->s, s->ct_key, L + 1, s->um, g_cache);
                 ic.ct_root = json_str(json_get(e, "root"), "."); ic.ct_key = s->ct_key;   /* (named in the derived cache's key) */
-                const char *dcd = json_str(json_get(of, "cache_dir"), dcache_default_dir ? dcache_default_dir() : nullptr);   /* the disk cache (dcache.h): "cache_dir", $UFSM_DERIVED_CACHE, ~/.cache/ufsm/derived */
-                z3 *z = ct ? inkfly_open(ct, sg, &ic, (size_t)json_num(json_get(of, "cache_mb"), 2048), dcd && *dcd ? dcd : nullptr, &s->ink_fly[c]) : nullptr;
+                const char *dcd = json_str(json_get(of, "cache_dir"), dcache_default_dir ? dcache_default_dir() : nullptr);   /* the disk cache (dcache.h): "cache_dir" ("off": none), $UFSM_DERIVED_CACHE, ~/.cache/ufsm/derived */
+                z3 *z = ct ? inkfly_open(ct, sg, &ic, (size_t)json_num(json_get(of, "cache_mb"), 2048), dcd && *dcd && strcmp(dcd, "off") && strcmp(dcd, "0") ? dcd : nullptr, &s->ink_fly[c]) : nullptr;
                 if (!z) { if (ct1) z3_close(ct1); fprintf(stderr, "sources: %s/%s: cannot open the onfly ink target %s\n", s->name, CHNAME[c], sg); json_free(j); sources_free(S); return nullptr; }
                 s->tgt_prob[c] = s->tgt_prob254[c] = 1; s->tgt_min_level[c] = L; s->tgt_key[c] = strdup("onfly");
                 for (int l = 0; l < MAXLEV; l++) s->tgt_present[c][l] = 0;
@@ -586,9 +586,22 @@ z3 *pyramid_open_level(store *st, const char *group, int level, double um0, cons
     z3_level lv[16];
     int nl = z3_group_levels(st, group, lv, 16);
     if (nl > 0 && um0 > 0 && lv[0].um > 0) {        /* OME group: match by voxel size (absolute um, or relative 2^l factors) */
-        double want = um0 * (1 << level), rel = (double)(1 << level);
+        /* relative form: every listed scale an exact power of two (1, 2, 4, ...) and none the source's um x 2^l. The old test needed level 0
+           listed (scale 1.0), so a relative group without a local level 0 (the mirror's json over PHerc1667's levels 1-5, 2026-11-12) was read
+           as absolute: 2.0 taken as um, every level off, the source silently excluded */
+        int relf = 1, absf = 0;
+        for (int i = 0; i < nl; i++) {
+            const double e = log2(lv[i].um); relf &= lv[i].um >= 1.0 && fabs(e - round(e)) < 1e-9;
+            for (int l = 0; l < 16; l++) absf |= fabs(lv[i].um - um0 * (1 << l)) < 0.02 * um0 * (1 << l);
+        }
+        const int rel_mode = relf && !absf;
+        double want = rel_mode ? (double)(1 << level) : um0 * (1 << level);
         for (int i = 0; i < nl; i++)
-            if (fabs(lv[i].um - want) < 0.02 * want || (lv[0].um == 1.0 && fabs(lv[i].um - rel) < 0.02 * rel)) { snprintf(k, sizeof k, "%s/%s", group, lv[i].path); return z3_open(st, k, cache); }
+            if (fabs(lv[i].um - want) < 0.02 * want) { snprintf(k, sizeof k, "%s/%s", group, lv[i].path); return z3_open(st, k, cache); }
+        if (!relf && !absf) {   /* neither form: a group whose scales are not the store's voxel size x 2^l (a wrong "um", or a broken json) */
+            static int warned; if (!warned++) { fprintf(stderr, "pyramid: %s: the group's scales (", group); for (int i = 0; i < nl; i++) fprintf(stderr, "%s%g", i ? " " : "", lv[i].um);
+                                                 fprintf(stderr, ") are neither %g um x 2^l nor relative 2^l factors\n", um0); }
+        }
         return nullptr;
     }
     snprintf(k, sizeof k, "%s/%d", group, level);   /* plain integer level names */

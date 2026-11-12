@@ -16,6 +16,9 @@ z3w *z3w_create_mask(const char *dir, const int64_t shape[3], int shard, const c
 /* Typed arrays (volcomp format revision 5, modes 7 / 8): dtype a volcomp_dtype (1 uint16, 2 int16, 3 uint32, 4 int32, 5 float32),
    q = 0 exact, q > 0 error-bounded (|error| <= q / 2 in value units), fill_value the element fill. */
 z3w *z3w_create_typed(const char *dir, const int64_t shape[3], int shard, int dtype, float q, double fill, const char *attrs_json);
+/* An array whose inner chunks the caller encodes itself (z3w_write_shard_enc only): codec_json is the inner codec object, e.g.
+   {"name":"latvol","configuration":{...}} (src/latvol.h). uint8, 128^3 inner chunks, absent chunks = fill. */
+z3w *z3w_create_codec(const char *dir, const int64_t shape[3], int shard, const char *codec_json, int fill, const char *attrs_json);
 /* data: shard^3 elements in C order (bytes for uint8; the array's element type otherwise; the part outside the array is ignored).
    Returns 0 on success. Thread-safe across different shards. */
 int z3w_write_shard(z3w *w, int64_t sz, int64_t sy, int64_t sx, const uint8_t *data, int nthreads);
