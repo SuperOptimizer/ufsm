@@ -456,32 +456,7 @@ typedef struct { z3 *codes; const int64_t *shape; const axis *ax; band_params bp
    all are empty, 255 (conflict) when any is or two lie more than a quarter turn apart, else their circular mean */
 static int praster_read(const praster_job *J, const int64_t ro[3], const int64_t rn[3], uint8_t *out) {
     if (J->pf == 1) return z3_read(J->codes, ro, rn, out, 1);
-    static float cs[BAND_PERIOD], sn[BAND_PERIOD]; static _Atomic int init;
-    if (!atomic_load(&init)) { for (int k = 0; k < BAND_PERIOD; k++) { cs[k] = (float)cos(2 * M_PI * k / BAND_PERIOD); sn[k] = (float)sin(2 * M_PI * k / BAND_PERIOD); } atomic_store(&init, 1); }
-    int64_t fo[3], fn[3];
-    for (int d = 0; d < 3; d++) { fo[d] = 2 * ro[d]; const int64_t e = 2 * (ro[d] + rn[d]) < J->fshape[d] ? 2 * (ro[d] + rn[d]) : J->fshape[d]; fn[d] = e - fo[d]; }
-    memset(out, 0, (size_t)rn[0] * rn[1] * rn[2]);
-    if (fn[0] <= 0 || fn[1] <= 0 || fn[2] <= 0) return 0;
-    uint8_t *f = malloc((size_t)fn[0] * fn[1] * fn[2]);
-    if (!f || z3_read(J->codes, fo, fn, f, 1)) { free(f); return -1; }
-    for (int64_t a = 0; a < rn[0]; a++) for (int64_t b = 0; b < rn[1]; b++) for (int64_t c = 0; c < rn[2]; c++) {
-        int first = -1, conflict = 0, k = 0; float x = 0, y = 0;
-        for (int q = 0; q < 8 && !conflict; q++) {
-            const int64_t z = 2 * a + (q >> 2 & 1), yy = 2 * b + (q >> 1 & 1), xx = 2 * c + (q & 1);
-            if (z >= fn[0] || yy >= fn[1] || xx >= fn[2]) continue;
-            const int v = f[((size_t)z * fn[1] + yy) * fn[2] + xx];
-            if (!v) continue;
-            if (v == 255 || (first >= 0 && 2 * abs(band_diff(v - 1, first)) > BAND_STEPS / 2)) { conflict = 1; break; }
-            if (first < 0) first = v - 1;
-            x += cs[v - 1]; y += sn[v - 1]; k++;
-        }
-        uint8_t o = 0;
-        if (conflict) o = 255;
-        else if (k) { double t = atan2(y, x) / (2 * M_PI); if (t < 0) t += 1; o = (uint8_t)(1 + (int)lround(t * BAND_PERIOD) % BAND_PERIOD); }
-        out[((size_t)a * rn[1] + b) * rn[2] + c] = o;
-    }
-    free(f);
-    return 0;
+    return codes_pool2_box(J->codes, ro, rn, out, 1);   /* (band_onfly.h: shared with the derived pooled codes) */
 }
 /* --pair 1: on the GPU when --gpu (src/nn_band.cu, byte-identical), the CPU on any GPU failure */
 static int praster_pair(const praster_job *J, const uint8_t *codes, const int ni[3], uint8_t *phase) {
@@ -709,15 +684,18 @@ static int cmd_codes_pool2(int argc, char **argv) {
    has (evenly over its chunk map; without --ref: the codes'), timed, and compared byte for byte with --ref (phase-raster's output for
    these codes). Prints per window ms, tiles, differing voxels; exit 1 on any difference. */
 static int cmd_phase_onfly(int argc, char **argv) {
-    if (argc < 4) { fprintf(stderr, "usage: ufsm phase-onfly <codes-root> <key> --rmax R [--fuse ROOT2 KEY2 [--fuse-rmax R2] [--tol 0.1]] [--ref ROOT KEY] [--windows 8] [--P 896] [--gpu D] [--slots 1] [--budget-mb 1024] [--threads 8]\n"); return 2; }
+    if (argc < 4) { fprintf(stderr, "usage: ufsm phase-onfly <codes-root> <key> --rmax R [--pool2 1] [--fuse ROOT2 KEY2 [--fuse-rmax R2] [--tol 0.1]] [--ref ROOT KEY] [--windows 8] [--P 896] [--gpu D] [--slots 1] [--budget-mb 1024] [--threads 8]\n"); return 2; }
     const float rmax = (float)atof(opt(argc, argv, "--rmax", "0")); const int nw = atoi(opt(argc, argv, "--windows", "8")), P = atoi(opt(argc, argv, "--P", "896"));
     const int gpu = atoi(opt(argc, argv, "--gpu", "-1")), nt = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 8);
     if (!(rmax > 0) || nw < 1 || P < 8) { fprintf(stderr, "phase-onfly: --rmax > 0, --windows >= 1, --P >= 8\n"); return 2; }
     if (phase_onfly_config(gpu, atoi(opt(argc, argv, "--slots", "1")), atoi(opt(argc, argv, "--budget-mb", "1024")), 1)) { fprintf(stderr, "phase-onfly: GPU %d unavailable\n", gpu); return 1; }
     z3 *c = z3_open(store_open(argv[2]), argv[3], nullptr); if (!c) { fprintf(stderr, "%s\n", z3_error()); return 1; }
+    const int pool2 = atoi(opt(argc, argv, "--pool2", "0"));   /* --pool2 1: the codes pooled 2x on read (codes_pool2_open; phase-raster --gs 4's codes) */
+    if (pool2) { z3 *p2 = codes_pool2_open(c); if (!p2) { fprintf(stderr, "phase-onfly: --pool2: cubic codes chunks only\n"); return 1; } c = p2; }
     z3 *ph = phase_onfly_open(c, rmax); z3 *ref = nullptr;
     const int fi = arg_index(argc, argv, "--fuse");   /* --fuse ROOT2 KEY2: the phase of these codes and ROOT2's fused (phase-fuse --tol, the onfly "sets") */
     if (fi > 0) { z3 *c2 = fi + 2 < argc ? z3_open(store_open(argv[fi + 1]), argv[fi + 2], nullptr) : nullptr; if (!c2) { fprintf(stderr, "phase-onfly: --fuse ROOT KEY: %s\n", z3_error()); return 1; }
+        if (pool2) c2 = codes_pool2_open(c2);
         z3 *sets[2] = {ph, phase_onfly_open(c2, (float)atof(opt(argc, argv, "--fuse-rmax", opt(argc, argv, "--rmax", "0"))))}; ph = phase_onfly_fuse_open(sets, 2, (float)atof(opt(argc, argv, "--tol", "0.1"))); if (!ph) return 1; }
     const int ri = arg_index(argc, argv, "--ref");
     if (ri > 0) { if (ri + 2 >= argc || !(ref = z3_open(store_open(argv[ri + 1]), argv[ri + 2], nullptr))) { fprintf(stderr, "phase-onfly: --ref ROOT KEY: %s\n", z3_error()); return 1; }

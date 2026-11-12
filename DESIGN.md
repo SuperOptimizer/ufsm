@@ -26,8 +26,13 @@ fibre labels when the draws took every papyrus cell. UFSM_FIBRE_EXTENT=0: the CT
 - rmax is phase-raster's --radius / --gs in codes voxels: 41 for 0139 (radius 82, --gs 2), not 82. The pod bench's onfly 0139 source
   (1.21 samp/s below) used 82: a 2x larger halo and a different (wider) phase than the stored set; to be re-measured at 41.
 - Cost (desk 5060 Ti, 384^3 windows, the two sets each one tile): 0139 0.29 s, 1667 9.6 0.8 s per window.
-- Still stored for 1667 9.6 / p4full: the 2x-pooled codes (codes-pool2, 1/8 of the 4.8 codes; 4 min of CPU per set). Pooling on the
-  device cannot be byte-exact (atan2 ties); a pooled-codes derived array (CPU) is the next step for those.
+- The 2x-pooled codes are derived too (`"pool2": 1` on an onfly phase or a set; band_onfly.h codes_pool2_open over
+  zarr3.h z3_open_derived_pool2, a derived array on the 2x coarser grid whose chunk map comes from the base's 2^3 chunks; the pooling
+  is phase-raster's praster_read, now shared as codes_pool2_box). PHerc1667 9.6 straight from codesA / B 4.798 (pool2, rmax 40,
+  fused): 2 windows of 256^3, 0 differing against PHerc1667-wind-20261016/phase; test_phase_onfly: --pool2 == phase-raster --gs 4.
+  Cost: the pooling reads and decodes 8x the voxels on the CPU (2 sets: ~2 s of a 256^3 window's 10 s on the CPU path); pooling on
+  the device cannot be byte-exact (glibc atan2 ties), so the next step there is the 4.8 decode on the device with the pooling on the
+  host. With it no 1667 / Paris 4 phase or pooled-codes artifact remains: only the 4.8 codes.
 
 `--fstem-reset-at S` (unet_fstem_reset): resuming from step S the fine stem starts again as unet_init leaves it (W1 He, b1 and the
 projection 0: neutral), its Adam / Muon state and EMA reset; one-shot by step (a resume from any other step keeps the stem). For u1

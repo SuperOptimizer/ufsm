@@ -181,6 +181,40 @@ z3 *phase_onfly_open(z3 *codes, float rmax) {
     return z;
 }
 
+/* the 2x pooling of winding_mod14 codes (phase-raster --gs 4 / codes-pool2): per 2^3 block empty when all are, 255 (conflict) when any
+   is or two lie more than a quarter turn apart, else their circular mean (glibc atan2: not on the device, ties) */
+int codes_pool2_box(z3 *codes, const int64_t ro[3], const int64_t rn[3], uint8_t *out, int nthreads) {
+    const int64_t *fs = z3_meta_of(codes)->shape;
+    static float cs[BAND_PERIOD], sn[BAND_PERIOD]; static _Atomic int init;
+    if (!atomic_load(&init)) { for (int k = 0; k < BAND_PERIOD; k++) { cs[k] = (float)cos(2 * M_PI * k / BAND_PERIOD); sn[k] = (float)sin(2 * M_PI * k / BAND_PERIOD); } atomic_store(&init, 1); }
+    int64_t fo[3], fn[3];
+    for (int d = 0; d < 3; d++) { fo[d] = 2 * ro[d]; const int64_t e = 2 * (ro[d] + rn[d]) < fs[d] ? 2 * (ro[d] + rn[d]) : fs[d]; fn[d] = e - fo[d]; }
+    memset(out, 0, (size_t)rn[0] * rn[1] * rn[2]);
+    if (fn[0] <= 0 || fn[1] <= 0 || fn[2] <= 0) return 0;
+    uint8_t *f = malloc((size_t)fn[0] * fn[1] * fn[2]);
+    if (!f || z3_read(codes, fo, fn, f, nthreads)) { free(f); return -1; }
+    for (int64_t a = 0; a < rn[0]; a++) for (int64_t b = 0; b < rn[1]; b++) for (int64_t c = 0; c < rn[2]; c++) {
+        int first = -1, conflict = 0, k = 0; float x = 0, y = 0;
+        for (int q = 0; q < 8 && !conflict; q++) {
+            const int64_t z = 2 * a + (q >> 2 & 1), yy = 2 * b + (q >> 1 & 1), xx = 2 * c + (q & 1);
+            if (z >= fn[0] || yy >= fn[1] || xx >= fn[2]) continue;
+            const int v = f[((size_t)z * fn[1] + yy) * fn[2] + xx];
+            if (!v) continue;
+            if (v == 255 || (first >= 0 && 2 * abs(band_diff(v - 1, first)) > BAND_STEPS / 2)) { conflict = 1; break; }
+            if (first < 0) first = v - 1;
+            x += cs[v - 1]; y += sn[v - 1]; k++;
+        }
+        uint8_t o = 0;
+        if (conflict) o = 255;
+        else if (k) { double t = atan2(y, x) / (2 * M_PI); if (t < 0) t += 1; o = (uint8_t)(1 + (int)lround(t * BAND_PERIOD) % BAND_PERIOD); }
+        out[((size_t)a * rn[1] + b) * rn[2] + c] = o;
+    }
+    free(f);
+    return 0;
+}
+static int pool2_read(void *ctx, z3 *base, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads) { (void)ctx; return codes_pool2_box(base, o, n, out, nthreads); }
+z3 *codes_pool2_open(z3 *codes) { return z3_open_derived_pool2(codes, 0, pool2_read, nullptr, nullptr); }
+
 /* the fusion of several onfly (or stored) phase sets (phase-fuse, src/fuse.h fuse_phase: the circular mean where they agree within tol
    turns, else unknown; one set alone kept), per voxel, so a read box needs no halo beyond each set's own */
 typedef struct { z3 *set[FUSE_MAX]; int n; float tol; } fuse_ctx;

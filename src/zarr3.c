@@ -190,6 +190,21 @@ static int x_box(z3 *z, const int64_t o[3], const int64_t n[3]) {   /* any marke
     for (int64_t a = lo[0]; a <= hi[0]; a++) for (int64_t b = lo[1]; b <= hi[1]; b++) for (int64_t c = lo[2]; c <= hi[2]; c++) if (z->xbits[(a * z->xgrid[1] + b) * z->xgrid[2] + c]) return 1;
     return 0;
 }
+/* a 2x coarser derived array: its known chunks are those whose 2^3 base chunks (the same chunk edge, in base voxels) hold any */
+static int pool2_xmap(void *vp, const int64_t grid[3], const int chunk[3], uint8_t *bits) {
+    z3 *z = vp; int64_t bg[3]; uint8_t *bb = nullptr;
+    if (z3_chunk_map(z->base, bg, &bb) < 0) return -1;
+    for (int64_t a = 0; a < bg[0]; a++) for (int64_t b = 0; b < bg[1]; b++) for (int64_t c = 0; c < bg[2]; c++) if (bb[(a * bg[1] + b) * bg[2] + c]) {
+        const int64_t q[3] = {a / 2, b / 2, c / 2}; if (q[0] < grid[0] && q[1] < grid[1] && q[2] < grid[2]) bits[(q[0] * grid[1] + q[1]) * grid[2] + q[2]] = 1; }
+    free(bb); (void)chunk; return 0;
+}
+z3 *z3_open_derived_pool2(z3 *base, int fill, z3_derive_fn derive, void *ctx, void (*ctx_free)(void *)) {
+    if (!base || base->m.chunk[0] != base->m.chunk[1] || base->m.chunk[0] != base->m.chunk[2]) return nullptr;
+    z3 *z = z3_open_derived(base, fill, derive, ctx, ctx_free); if (!z) return nullptr;
+    for (int d = 0; d < 3; d++) z->m.shape[d] = (base->m.shape[d] + 1) / 2;
+    z->xmap = pool2_xmap; z->xctx = z;
+    return z;
+}
 int z3_derived_cover(z3 *z, z3 *cover) {
     if (!z || !z->derive || !cover || z->ncover == 4) return -1;
     for (int d = 0; d < 3; d++) if (cover->m.shape[d] != z->m.shape[d]) return -1;
@@ -658,6 +673,7 @@ int z3_prefetch_chunk(z3 *z, int64_t cz, int64_t cy, int64_t cx) {
 /* the encoded bytes of inner chunk (cz, cy, cx) (after zstd when the chain has it): 1 with *buf (malloc) / *n, 0 absent, -1 error */
 int z3_chunk_raw(z3 *z, int64_t cz, int64_t cy, int64_t cx, uint8_t **buf, size_t *n) {
     *buf = nullptr; *n = 0;
+    if (z->derive) return FAIL("%s: a derived array has no stored chunks", z->key);
     int64_t sz = cz / z->cgrid[0], sy = cy / z->cgrid[1], sx = cx / z->cgrid[2];
     int ci = (int)(((cz % z->cgrid[0]) * z->cgrid[1] + (cy % z->cgrid[1])) * z->cgrid[2] + (cx % z->cgrid[2]));
     char skey[1200]; shard_key(z, sz, sy, sx, skey, sizeof skey);

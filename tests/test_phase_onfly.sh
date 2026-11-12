@@ -27,6 +27,11 @@ grep -qE 'fused [1-9]' fu.log || { echo "FAIL: no fused voxels ($D/fu.log)"; exi
 for g in -1 0; do [ $g = 0 ] && ! nvidia-smi -L > /dev/null 2>&1 && continue
   "$U" phase-onfly fx/band 1 --rmax 12 --fuse fx/band 1 --fuse-rmax 4 --tol 0.05 --ref fu 4.8 --windows 4 --P 100 --gpu $g --budget-mb 64 --threads 4 > fu$g.log 2>&1 || { echo "FAIL: fused onfly differs (GPU $g, $D/fu$g.log)"; tail -2 fu$g.log; exit 1; }
 done
+# the codes pooled 2x on read ("pool2": 1, codes_pool2_open) == phase-raster --gs 4 (the pair rule on the 2x-pooled codes), CPU and GPU
+"$U" phase-raster fx/band 1 pg4 --axis fx/axis.json --gs 4 --pair 1 --radius 48 --threads 4 --block 64 > pg4.log 2>&1 || { echo "FAIL: phase-raster --gs 4 ($D/pg4.log)"; exit 1; }
+for g in -1 0; do [ $g = 0 ] && ! nvidia-smi -L > /dev/null 2>&1 && continue
+  "$U" phase-onfly fx/band 1 --pool2 1 --rmax 12 --ref pg4 9.6 --windows 4 --P 48 --gpu $g --budget-mb 64 --threads 4 > p2$g.log 2>&1 || { echo "FAIL: pooled onfly differs from --gs 4 (GPU $g, $D/p2$g.log)"; tail -2 p2$g.log; exit 1; }
+done
 F=$(readlink -f fx); P=$(readlink -f ph)
 python3 - "$F" "$P" <<'PY'
 import json, sys

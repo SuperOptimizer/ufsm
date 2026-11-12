@@ -274,6 +274,7 @@ sources *sources_load(const char *path) {
                         for (size_t k = 0; !bad && k < sj->n; k++) {
                             const json *e2 = json_at(sj, k); const char *r2 = json_str(json_get(e2, "root"), nullptr), *k2 = json_str(json_get(e2, "key"), "");
                             const float rm2 = (float)json_num(json_get(e2, "rmax"), rm); store *s2 = r2 ? store_open(r2) : nullptr; z3 *c2 = s2 ? z3_open(s2, k2, nullptr) : nullptr;
+                            if (c2 && json_num(json_get(e2, "pool2"), json_num(json_get(of, "pool2"), 0))) { z3 *q = codes_pool2_open(c2); if (!q) { z3_close(c2); c2 = nullptr; } else c2 = q; }
                             z3 *p2 = c2 && rm2 > 0 ? phase_onfly_open(c2, rm2) : nullptr;
                             if (!p2) { z3_close(c2); fprintf(stderr, "sources: %s: phase onfly set %zu: cannot open the codes %s/%s or no \"rmax\" > 0\n", s->name, k, r2 ? r2 : "?", k2); bad = 1; break; }
                             ph[np++] = p2; if (rm2 > rmx) rmx = rm2;
@@ -284,6 +285,7 @@ sources *sources_load(const char *path) {
                         s->phase_onfly = rmx;
                     } else {
                     store *cs = cr ? store_open(cr) : nullptr; z3 *cz = cs ? z3_open(cs, ck, nullptr) : nullptr;
+                    if (cz && json_num(json_get(of, "pool2"), 0)) { z3 *q = codes_pool2_open(cz); if (!q) { z3_close(cz); cz = nullptr; } else cz = q; }   /* "pool2": 1: the codes pooled 2x on read (phase-raster --gs 4) */
                     s->phase = cz && rm > 0 ? phase_onfly_open(cz, rm) : nullptr;
                     if (!s->phase) { z3_close(cz); fprintf(stderr, "sources: %s: phase onfly: cannot open the codes %s/%s or no \"rmax\" > 0\n", s->name, cr ? cr : "?", ck); json_free(j); sources_free(S); return nullptr; }
                     s->phase_onfly = rm;
