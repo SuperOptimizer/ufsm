@@ -199,12 +199,12 @@ z3 *phase_onfly_open(z3 *codes, float rmax) {
    their own code (the sums' angle is theirs within 1e-6 steps), and a polynomial angle (error < 1e-4 rad = 0.004 codes) decides the
    rounding wherever it lands more than 0.03 codes from a half; the rest (the exact ties of mixed blocks) take the reference atan2.
    2026-11-12, pod, U2's sampler at P 1024: the loop held 2.6 of 12 workers and 1.5 more queued behind its buffer sets */
-int codes_pool2_ref = 0;   /* tests: 1 the reference loop over whole boxes */
+int codes_pool2_ref = 0;   /* tests, UFSM_POOL2_REF=1 (A/B timing): the reference loop over whole boxes */
 static float g_p2cs[BAND_PERIOD], g_p2sn[BAND_PERIOD]; static _Atomic int g_p2init;
 static void pool2_init(void) {
     if (atomic_load(&g_p2init)) return;
     static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER; pthread_mutex_lock(&mu);
-    if (!atomic_load(&g_p2init)) { for (int k = 0; k < BAND_PERIOD; k++) { g_p2cs[k] = (float)cos(2 * M_PI * k / BAND_PERIOD); g_p2sn[k] = (float)sin(2 * M_PI * k / BAND_PERIOD); } atomic_store(&g_p2init, 1); }
+    if (!atomic_load(&g_p2init)) { for (int k = 0; k < BAND_PERIOD; k++) { g_p2cs[k] = (float)cos(2 * M_PI * k / BAND_PERIOD); g_p2sn[k] = (float)sin(2 * M_PI * k / BAND_PERIOD); } if (getenv("UFSM_POOL2_REF")) codes_pool2_ref = 1; atomic_store(&g_p2init, 1); }
     pthread_mutex_unlock(&mu);
 }
 uint8_t codes_pool2_block(const uint8_t v8[8], int ref) {
