@@ -328,21 +328,22 @@ static int64_t local_size(const store *s, const char *key) {
 /* local read accounting (store_io_report): per store root the reads, bytes and wall time in open + pread (page-cache hits are fast;
    with /proc/self/io read_bytes vs rchar the share served from the disk) */
 #define IO_NR 64
-static struct { const store *s; _Atomic uint64_t n, bytes, ns; } g_io[IO_NR];
+static struct { char root[256]; _Atomic uint64_t n, bytes, ns; } g_io[IO_NR];   /* (keyed by the root's text: a closed store's slot stays readable,
+                                                                                      e.g. the pyramid builder's, which crashed the report) */
 static _Atomic int g_nio;
 static void io_note(const store *s, uint64_t bytes, uint64_t ns) {
     int k = -1, n = atomic_load(&g_nio);
-    for (int i = 0; i < n && i < IO_NR; i++) if (g_io[i].s == s) { k = i; break; }
+    for (int i = 0; i < n && i < IO_NR; i++) if (!strncmp(g_io[i].root, s->root, sizeof g_io[i].root - 1)) { k = i; break; }
     if (k < 0) { static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER; pthread_mutex_lock(&mu); n = atomic_load(&g_nio);
-                 for (int i = 0; i < n; i++) if (g_io[i].s == s) k = i;
-                 if (k < 0 && n < IO_NR) { g_io[n].s = s; k = n; atomic_store(&g_nio, n + 1); } pthread_mutex_unlock(&mu); }
+                 for (int i = 0; i < n; i++) if (!strncmp(g_io[i].root, s->root, sizeof g_io[i].root - 1)) k = i;
+                 if (k < 0 && n < IO_NR) { snprintf(g_io[n].root, sizeof g_io[n].root, "%s", s->root); k = n; atomic_store(&g_nio, n + 1); } pthread_mutex_unlock(&mu); }
     if (k < 0) return;
     atomic_fetch_add(&g_io[k].n, 1); atomic_fetch_add(&g_io[k].bytes, bytes); atomic_fetch_add(&g_io[k].ns, ns);
 }
 void store_io_report(FILE *f) {
     for (int i = 0; i < atomic_load(&g_nio); i++)
         fprintf(f, "store io: %8.1f MB in %8llu reads, %7.2f s in open + pread (%6.0f MB/s) %s\n", g_io[i].bytes / 1e6, (unsigned long long)g_io[i].n,
-                g_io[i].ns / 1e9, g_io[i].ns ? g_io[i].bytes / 1e6 / (g_io[i].ns / 1e9) : 0., g_io[i].s->root);
+                g_io[i].ns / 1e9, g_io[i].ns ? g_io[i].bytes / 1e6 / (g_io[i].ns / 1e9) : 0., g_io[i].root);
 }
 static int64_t local_read(const store *s, const char *key, int64_t off, int64_t len, uint8_t *out) {
     struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
