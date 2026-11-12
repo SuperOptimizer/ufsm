@@ -3,6 +3,7 @@
 #include "fuse.h"
 #include "band.h"
 #include "bandgpu.h"
+#include "codes_pool.h"
 #include "volcomp.h"
 #include <math.h>
 #include <pthread.h>
@@ -85,12 +86,25 @@ static size_t pk_put(onfly_pack *K, const void *src, size_t n, size_t align) {
     if (src) memcpy(K->b + o, src, n);
     K->n = o + n; return o;
 }
-static int tile_gpu(z3 *codes, const int64_t co[3], const int64_t cn[3], const int64_t ro[3], const int64_t rn[3], int h, const int64_t tn[3], float rmax, uint8_t *out) {
-    const z3_meta *m = z3_meta_of(codes);
+static int g_pool2_tag;   /* (the pooled codes views' ctx, codes_pool2_open: tile_gpu pools them on the device) */
+static int tile_gpu(z3 *codes, const int64_t co_[3], const int64_t cn_[3], const int64_t ro_[3], const int64_t rn_[3], int h, const int64_t tn[3], float rmax, uint8_t *out) {
+    /* pooled views (up to 3 deep) of stored codes: the base chunks of the 2^k box, decoded and pooled k times on the device (before:
+       decoded and pooled on the CPU, only the pair rule on the GPU; the pod's 9.6 / 19.2 um rungs, 2026-11-12) */
+    int k = 0; z3 *base = codes;
+    while (k < 3 && z3_derived_ctx(base) == &g_pool2_tag) { base = z3_base_of(base); k++; }
+    if (z3_derived_ctx(base) || (k && !band_pair_gpu_codes_pool)) return -2;
+    const z3_meta *m = z3_meta_of(base);
     if (m->chunk[0] != 128 || m->chunk[1] != 128 || m->chunk[2] != 128 || m->esize != 1 || m->q != 0) return -2;
+    int64_t co[3], cn[3], ro[3], rn[3];   /* in the base's voxels */
+    for (int d = 0; d < 3; d++) {
+        co[d] = co_[d] * (1 << k); cn[d] = cn_[d] * (1 << k); ro[d] = ro_[d] * (1 << k);
+        const int64_t e = (ro_[d] + rn_[d]) * (1 << k) < m->shape[d] ? (ro_[d] + rn_[d]) * (1 << k) : m->shape[d]; rn[d] = e - ro[d];
+        if (rn[d] <= 0) return 2;
+    }
+    if (k && (double)cn[0] * cn[1] * cn[2] > (double)g_budget_mb * (2 << 20)) return -2;   /* (the base box: 8^k the tile's voxels on the device) */
     onfly_pack *K = &t_pk; K->n = 0; K->nch = 0;
     for (int64_t cz = ro[0] / 128; cz * 128 < ro[0] + rn[0]; cz++) for (int64_t cy = ro[1] / 128; cy * 128 < ro[1] + rn[1]; cy++) for (int64_t cx = ro[2] / 128; cx * 128 < ro[2] + rn[2]; cx++) {
-        uint8_t *buf = nullptr; size_t len = 0; const int r = z3_chunk_raw(codes, cz, cy, cx, &buf, &len);
+        uint8_t *buf = nullptr; size_t len = 0; const int r = z3_chunk_raw(base, cz, cy, cx, &buf, &len);
         if (r < 0) return -1;
         if (!r) continue;
         uint32_t mode; bg_lchunk C; memset(&C, 0, sizeof C); C.o[0] = (int32_t)(cz * 128 - co[0]); C.o[1] = (int32_t)(cy * 128 - co[1]); C.o[2] = (int32_t)(cx * 128 - co[2]);
@@ -119,7 +133,7 @@ static int tile_gpu(z3 *codes, const int64_t co[3], const int64_t cn[3], const i
     if (!K->nch) return 2;
     const int n[3] = {(int)cn[0], (int)cn[1], (int)cn[2]}, lo[3] = {(int)(ro[0] - co[0]), (int)(ro[1] - co[1]), (int)(ro[2] - co[2])};
     const int hi[3] = {lo[0] + (int)rn[0], lo[1] + (int)rn[1], lo[2] + (int)rn[2]}, cro[3] = {h, h, h}, crn[3] = {(int)tn[0], (int)tn[1], (int)tn[2]};
-    return band_pair_gpu_codes(K->ch, K->nch, K->b, K->n, n, lo, hi, rmax, cro, crn, out);
+    return k ? band_pair_gpu_codes_pool(K->ch, K->nch, K->b, K->n, n, lo, hi, k, rmax, cro, crn, out) : band_pair_gpu_codes(K->ch, K->nch, K->b, K->n, n, lo, hi, rmax, cro, crn, out);
 }
 
 static thread_local struct { uint8_t *p; size_t cap; int pinned; } t_gpb;   /* the GPU path's tile interior (per reading thread) */
@@ -195,12 +209,12 @@ z3 *phase_onfly_open(z3 *codes, float rmax) {
     return z;
 }
 
-/* the 2x pooling of winding_mod14 codes (phase-raster --gs 4 / codes-pool2): per 2^3 block empty when all are, 255 (conflict) when any
-   is or two lie more than a quarter turn apart, else their circular mean (glibc atan2: not on the device, ties) */
+/* the 2x pooling of winding_mod14 codes (phase-raster --gs 4 / codes-pool2): codes_pool.h cp_pool8 per 2^3 block (the device twin:
+   nn_band.cu k_codes_pool2, used by tile_gpu for the pooled views) */
+static float g_cpT[4 * CP_P]; static _Atomic int g_cpT_init;
+static const float *cp_tables(void) { if (!atomic_load(&g_cpT_init)) { cp_tables_init(g_cpT); atomic_store(&g_cpT_init, 1); } return g_cpT; }
 int codes_pool2_box(z3 *codes, const int64_t ro[3], const int64_t rn[3], uint8_t *out, int nthreads) {
-    const int64_t *fs = z3_meta_of(codes)->shape;
-    static float cs[BAND_PERIOD], sn[BAND_PERIOD]; static _Atomic int init;
-    if (!atomic_load(&init)) { for (int k = 0; k < BAND_PERIOD; k++) { cs[k] = (float)cos(2 * M_PI * k / BAND_PERIOD); sn[k] = (float)sin(2 * M_PI * k / BAND_PERIOD); } atomic_store(&init, 1); }
+    const int64_t *fs = z3_meta_of(codes)->shape; const float *T = cp_tables();
     int64_t fo[3], fn[3];
     for (int d = 0; d < 3; d++) { fo[d] = 2 * ro[d]; const int64_t e = 2 * (ro[d] + rn[d]) < fs[d] ? 2 * (ro[d] + rn[d]) : fs[d]; fn[d] = e - fo[d]; }
     memset(out, 0, (size_t)rn[0] * rn[1] * rn[2]);
@@ -208,26 +222,18 @@ int codes_pool2_box(z3 *codes, const int64_t ro[3], const int64_t rn[3], uint8_t
     uint8_t *f = malloc((size_t)fn[0] * fn[1] * fn[2]);
     if (!f || z3_read(codes, fo, fn, f, nthreads)) { free(f); return -1; }
     for (int64_t a = 0; a < rn[0]; a++) for (int64_t b = 0; b < rn[1]; b++) for (int64_t c = 0; c < rn[2]; c++) {
-        int first = -1, conflict = 0, k = 0; float x = 0, y = 0;
-        for (int q = 0; q < 8 && !conflict; q++) {
+        uint8_t v[8];
+        for (int q = 0; q < 8; q++) {
             const int64_t z = 2 * a + (q >> 2 & 1), yy = 2 * b + (q >> 1 & 1), xx = 2 * c + (q & 1);
-            if (z >= fn[0] || yy >= fn[1] || xx >= fn[2]) continue;
-            const int v = f[((size_t)z * fn[1] + yy) * fn[2] + xx];
-            if (!v) continue;
-            if (v == 255 || (first >= 0 && 2 * abs(band_diff(v - 1, first)) > BAND_STEPS / 2)) { conflict = 1; break; }
-            if (first < 0) first = v - 1;
-            x += cs[v - 1]; y += sn[v - 1]; k++;
+            v[q] = z >= fn[0] || yy >= fn[1] || xx >= fn[2] ? 0 : f[((size_t)z * fn[1] + yy) * fn[2] + xx];
         }
-        uint8_t o = 0;
-        if (conflict) o = 255;
-        else if (k) { double t = atan2(y, x) / (2 * M_PI); if (t < 0) t += 1; o = (uint8_t)(1 + (int)lround(t * BAND_PERIOD) % BAND_PERIOD); }
-        out[((size_t)a * rn[1] + b) * rn[2] + c] = o;
+        out[((size_t)a * rn[1] + b) * rn[2] + c] = cp_pool8(v, T);
     }
     free(f);
     return 0;
 }
 static int pool2_read(void *ctx, z3 *base, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads) { (void)ctx; return codes_pool2_box(base, o, n, out, nthreads); }
-z3 *codes_pool2_open(z3 *codes) { return z3_open_derived_pool2(codes, 0, pool2_read, nullptr, nullptr); }
+z3 *codes_pool2_open(z3 *codes) { return z3_open_derived_pool2(codes, 0, pool2_read, &g_pool2_tag, nullptr); }
 
 /* the 2x pooling of a stored phase (sampler windows coarser than the phase's level): per 2^3 block the circular mean of the known codes,
    PHASE_UNKNOWN where none is known or their resultant is under half their count (ufsm downsample --mode phase, phase-raster --gs 4's

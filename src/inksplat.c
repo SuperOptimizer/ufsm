@@ -1338,16 +1338,26 @@ static int inkfly_derive(void *ctx, z3 *base, const int64_t o[3], const int64_t 
 }
 /* the coarser level: known-max 2x pooling of the level below (an onfly array), as the stored pyramid */
 typedef struct { z3 *fine; int own; } ifpool;
+/* in z-slabs of the fine level, cut at multiples of the fine array's cell (IFC) so no cell is derived for two slabs: the whole (2n)^3 box
+   at once was 8.6 GB of scratch per worker building a P 1024 window at the pooled level (2026-11-12; a slab of 128 planes is 0.54 GB).
+   The pooling is per 2^3 block, so the bytes are the same. UFSM_INKPOOL_SLAB=planes (even; tests) */
 static int inkfly_pool_derive(void *ctx, z3 *base, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads) {
-    (void)base; ifpool *p = ctx; const int64_t fo[3] = {2 * o[0], 2 * o[1], 2 * o[2]}, fn[3] = {2 * n[0], 2 * n[1], 2 * n[2]};
-    uint8_t *b = malloc((size_t)fn[0] * fn[1] * fn[2]); if (!b) return -1;
-    if (z3_read(p->fine, fo, fn, b, nthreads)) { free(b); return -1; }
-    const size_t pl = (size_t)fn[1] * fn[2];
-    for (int64_t z = 0; z < n[0]; z++) for (int64_t y = 0; y < n[1]; y++) for (int64_t x = 0; x < n[2]; x++) {
-        const uint8_t *q = b + ((size_t)(2 * z) * fn[1] + 2 * y) * fn[2] + 2 * x;
-        const uint8_t v[8] = {q[0], q[1], q[fn[2]], q[fn[2] + 1], q[pl], q[pl + 1], q[pl + fn[2]], q[pl + fn[2] + 1]};
-        int m = -1; for (int i = 0; i < 8; i++) if (v[i] != 255 && v[i] > m) m = v[i];
-        out[((size_t)z * n[1] + y) * n[2] + x] = m < 0 ? 255 : (uint8_t)m;
+    (void)base; ifpool *p = ctx; const int64_t f1 = 2 * n[1], f2 = 2 * n[2];
+    static _Atomic int slab; int S = atomic_load(&slab);
+    if (!S) { const char *e = getenv("UFSM_INKPOOL_SLAB"); S = e && atoi(e) >= 2 ? atoi(e) & ~1 : IFC; atomic_store(&slab, S); }
+    const size_t pl = (size_t)f1 * f2; const int64_t cap = 2 * n[0] < S ? 2 * n[0] : S;
+    uint8_t *b = malloc((size_t)cap * pl); if (!b) return -1;
+    for (int64_t z = 0; z < n[0];) {
+        const int64_t z0 = 2 * (o[0] + z), e0 = z0 + S - ((z0 % S) + S) % S, e = e0 < 2 * (o[0] + n[0]) ? e0 : 2 * (o[0] + n[0]), nf = e - z0;   /* (even: z0 and S are) */
+        const int64_t fo[3] = {z0, 2 * o[1], 2 * o[2]}, fn[3] = {nf, f1, f2};
+        if (z3_read(p->fine, fo, fn, b, nthreads)) { free(b); return -1; }
+        for (int64_t zz = 0; zz < nf / 2; zz++) for (int64_t y = 0; y < n[1]; y++) for (int64_t x = 0; x < n[2]; x++) {
+            const uint8_t *q = b + ((size_t)(2 * zz) * f1 + 2 * y) * f2 + 2 * x;
+            const uint8_t v[8] = {q[0], q[1], q[f2], q[f2 + 1], q[pl], q[pl + 1], q[pl + f2], q[pl + f2 + 1]};
+            int m = -1; for (int i = 0; i < 8; i++) if (v[i] != 255 && v[i] > m) m = v[i];
+            out[((size_t)(z + zz) * n[1] + y) * n[2] + x] = m < 0 ? 255 : (uint8_t)m;
+        }
+        z += nf / 2;
     }
     free(b); return 0;
 }
