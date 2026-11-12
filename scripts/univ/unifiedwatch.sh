@@ -16,7 +16,12 @@ TEACH=${TEACH:-$WB/univ/pod/ink3dext/vscores.tsv}; LG=$E/watch-$RUN.log; mkdir -
 # the unroll's GPU 0 jobs go first (lead 2026-11-12): univI's Paris 4 face renders (until sched/p4rv.done) and anything of the unroll
 # schedule on GPU 0 (rvside / p1299 / unrollperf), then unrollperf2's window (sched/perf2.done), then univI's P4 column predicts (sched/p4col.done); checked after taking the lock
 US=${US:-/vesuvius/ufsm/unroll/sched}
-gpu0free() { until [ -e $US/p4rv.done ] && [ -e $US/perf2.done ] && [ -e $US/p4col.done ] && ! pgrep -f "$US/(rvside|p4rv|p1299|unrollperf)|unrollperf" > /dev/null; do sleep 60; done; }
+# and GPU 0 itself: no other compute process above 200 MiB (a marker written early or a renamed job; 2026-11-12 perf2.done came at the
+# window's start) except allowed co-tenants (GPU0OK, a pgrep -f pattern: fibhvd's sampler check)
+gpu0busy() { local p m; while IFS=', ' read -r p m; do [ -n "$p" ] && [ "${m:-0}" -gt 200 ] || continue
+    ps -o args= -p $p | grep -qE "${GPU0OK:-ufsm-fibd/}" || return 0; done < <(nvidia-smi --id=${GPU:-0} --query-compute-apps=pid,used_memory --format=csv,noheader,nounits); return 1; }
+gpu0free() { until [ -e $US/p4rv.done ] && [ -e $US/perf2.done ] && [ -e $US/p4col.done ] && ! pgrep -f "$US/(rvside|p4rv|p1299|unrollperf)|unrollperf" > /dev/null \
+    && ! gpu0busy && sleep 30 && ! gpu0busy; do sleep 60; done; }
 log() { echo "$(date '+%m-%d %H:%M:%S') $*" | tee -a $LG; }
 perscroll() {   # perscroll VSCORES LABEL: per-scroll mean AUC / best F1 (crop names: w.. = Paris 4, else SCROLL_w..)
   awk -F'\t' -v L="$2" '{ s = ($1 ~ /^w[0-9]/) ? "PHercParis4" : substr($1, 1, index($1, "_w") - 1); c[s]++; A[s] += $6; F[s] += $8 }
