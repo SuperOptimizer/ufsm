@@ -1268,7 +1268,7 @@ static uint64_t mix64(uint64_t x) { x ^= x >> 30; x *= 0xbf58476d1ce4e5b9ull; x 
    so every sample paid ~14k page faults per buffer under the process-wide mmap lock that all workers share. Sizes of 1 MB and
    more are rounded up to whole MB (windows clipped at a volume edge reuse the same buffers); zero = calloc semantics over n. */
 #define TP_N 32
-typedef struct { void *b[TP_N]; size_t n[TP_N]; int k; } tp_pool;
+typedef struct { void *b[TP_N]; size_t n[TP_N]; uint64_t seq[TP_N], tick; size_t bytes; int k; } tp_pool;   /* seq: put order (the byte cap drops the oldest); bytes: pooled */
 static _Thread_local tp_pool tpool;
 /* UFSM_HOSTMEM=1 accounting (sampler_hostmem): each worker registers its fixed scratch and its pool; tp_get / tp_put keep the
    pool's allocated bytes (pooled or lent out) per worker; residency is read with mincore (anonymous pages count when touched) */
@@ -1304,7 +1304,7 @@ static void *tp_get_(size_t n, int zero, int line) {   /* the smallest pooled bu
     for (int i = 0; i < tpool.k; i++) if (tpool.n[i] >= c && tpool.n[i] <= cmax && (best < 0 || tpool.n[i] < tpool.n[best])) best = i;
     tp_live += c; if (tp_log()) fprintf(stderr, "tplog get L%d %.3f live %.3f%s\n", line, (double)n / (double)g_tp_p3, (double)tp_live / (double)g_tp_p3, best >= 0 ? "" : " NEW");
     if (best >= 0) {   /* (put back under n's class later: a pooled size never exceeds the block's) */
-        void *p = tpool.b[best]; tpool.k--; tpool.b[best] = tpool.b[tpool.k]; tpool.n[best] = tpool.n[tpool.k];
+        void *p = tpool.b[best]; tpool.bytes -= tpool.n[best]; tpool.k--; tpool.b[best] = tpool.b[tpool.k]; tpool.n[best] = tpool.n[tpool.k]; tpool.seq[best] = tpool.seq[tpool.k];
         if (zero) memset(p, 0, n);
         return p;
     }
@@ -1312,13 +1312,25 @@ static void *tp_get_(size_t n, int zero, int line) {   /* the smallest pooled bu
     if (p && tp_wid >= 0) { const size_t v = atomic_fetch_add(&g_wm[tp_wid].tpv, c) + c; if (v > g_wm[tp_wid].tppeak) g_wm[tp_wid].tppeak = v; }
     return p;
 }
+/* the pool's byte cap (UFSM_TP_POOL_MB, default 2048 per worker; 0: none): the pool held up to TP_N buffers of whatever sizes were asked
+   and never gave one back, so a worker that had seen 32 window-sized requests kept them all (32 x 1 GB at P 1024 in the worst case;
+   2026-11-12, U2 on the pod: 68 -> 116 GB of host memory in 19 minutes at 8 workers). Past the cap the oldest pooled buffers go */
+static size_t tp_cap(void) { static _Atomic long long c = -1; long long v = atomic_load(&c);
+    if (v < 0) { const char *e = getenv("UFSM_TP_POOL_MB"); v = e && *e ? atoll(e) << 20 : (long long)2048 << 20; if (v < 0) v = 0; atomic_store(&c, v); }
+    return (size_t)v; }
 static void tp_put_(void *p, size_t n, int line) {
     if (!p) return;
-    tp_live -= tp_class(n); if (tp_log()) fprintf(stderr, "tplog put L%d %.3f live %.3f\n", line, (double)n / (double)g_tp_p3, (double)tp_live / (double)g_tp_p3);
-    if (tpool.k < TP_N) { tpool.b[tpool.k] = p; tpool.n[tpool.k] = tp_class(n); tpool.k++; }
-    else { free(p); if (tp_wid >= 0) atomic_fetch_sub(&g_wm[tp_wid].tpv, tp_class(n)); }
+    const size_t c = tp_class(n), cap = tp_cap();
+    tp_live -= c; if (tp_log()) fprintf(stderr, "tplog put L%d %.3f live %.3f\n", line, (double)n / (double)g_tp_p3, (double)tp_live / (double)g_tp_p3);
+    if (tpool.k == TP_N || (cap && c > cap)) { free(p); if (tp_wid >= 0) atomic_fetch_sub(&g_wm[tp_wid].tpv, c); return; }
+    tpool.b[tpool.k] = p; tpool.n[tpool.k] = c; tpool.seq[tpool.k] = tpool.tick++; tpool.k++; tpool.bytes += c;
+    while (cap && tpool.bytes > cap) {   /* (the buffer just put is the newest: it stays unless it is the only one left, which c <= cap excludes) */
+        int o = 0; for (int i = 1; i < tpool.k; i++) if (tpool.seq[i] < tpool.seq[o]) o = i;
+        free(tpool.b[o]); tpool.bytes -= tpool.n[o]; if (tp_wid >= 0) atomic_fetch_sub(&g_wm[tp_wid].tpv, tpool.n[o]);
+        tpool.k--; tpool.b[o] = tpool.b[tpool.k]; tpool.n[o] = tpool.n[tpool.k]; tpool.seq[o] = tpool.seq[tpool.k];
+    }
 }
-static void tp_drain(void) { while (tpool.k) { tpool.k--; free(tpool.b[tpool.k]); if (tp_wid >= 0) atomic_fetch_sub(&g_wm[tp_wid].tpv, tpool.n[tpool.k]); } }
+static void tp_drain(void) { while (tpool.k) { tpool.k--; free(tpool.b[tpool.k]); if (tp_wid >= 0) atomic_fetch_sub(&g_wm[tp_wid].tpv, tpool.n[tpool.k]); } tpool.bytes = 0; }
 static int band_window(source *s, const int64_t o[3], int P, uint8_t *out, uint8_t *side, int phase, int dense, uint64_t seed) {
     band_params bp = {s->band_radius, s->band_span, 0};
     const int halo = (int)ceilf((bp.radius + bp.span) / 2.f) + 2;
