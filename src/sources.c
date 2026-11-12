@@ -134,6 +134,8 @@ sources *sources_load(const char *path) {
         s->name = sdup(json_str(json_get(e, "name"), "?"));
         s->s = store_open(json_str(json_get(e, "root"), "."));
         s->ct_key = sdup(json_str(json_get(e, "ct"), ""));
+        { const json *mj = json_get(e, "ct_mirror"); const char *mr = json_str(json_get(mj, "root"), nullptr);
+          if (mr) { s->ct_ms = store_open(mr); s->ct_mkey = sdup(json_str(json_get(mj, "ct"), s->ct_key)); } }
         s->um = json_num(json_get(e, "um"), 0);
         s->weight = json_num(json_get(e, "weight"), 1.0);
         s->ink_weight = json_num(json_get(e, "ink_weight"), 1.0);
@@ -463,7 +465,7 @@ void sources_free(sources *S) {
             store_close(s->tgt_store[c]);
         }
         free(s->ax.z); free(s->ax.y); free(s->ax.x);
-        free(s->name); free(s->ct_key); free(s->view_map);
+        free(s->name); free(s->ct_key); free(s->ct_mkey); free(s->view_map);
         for (int k = 0; k < s->nxs; k++) free(s->xs_map[k]);
         for (int k = 0; k < s->nemb; k++) free(s->emb_grp[k]);
         free(s->emb_name);
@@ -539,10 +541,16 @@ void sources_open_all(sources *S, int nthreads) {
 }
 /* the open (a remote metadata fetch) runs outside the lock; the lock only publishes the pointer. A racing duplicate open is
    closed. ct_present is cleared on failure so a missing level is not retried per draw. */
+/* a CT level: the source's store, else its "ct_mirror" */
+static z3 *open_ct_level(source *s, int level) {
+    z3 *z = open_level(s->s, s->ct_key, level, s->um);
+    if (!z && s->ct_ms) { z = open_level(s->ct_ms, s->ct_mkey, level, s->um); if (z) fprintf(stderr, "source %s: CT level %d from the mirror\n", s->name, level); }
+    return z;
+}
 z3 *source_ct(source *s, int level) {
     if (level < 0 || level >= MAXLEV || s->ct_present[level] == 0) return nullptr;
     if (!s->ct[level]) {
-        z3 *z = open_level(s->s, s->ct_key, level, s->um);
+        z3 *z = open_ct_level(s, level);
         pthread_mutex_lock(&g_open_mu);
         if (!s->ct[level]) { s->ct[level] = z; z = nullptr; if (!s->ct[level]) { s->ct_present[level] = 0; open_failed(s, "ct", level); } }
         pthread_mutex_unlock(&g_open_mu);
@@ -559,7 +567,7 @@ static int fib_same(const struct fib_spec *a, const struct fib_spec *b) {
 static z3 *source_tgt_fibre(source *s, int ch, int level) {
     if (s->tgt[ch][level]) return s->tgt[ch][level];
     const struct fib_spec *f = s->tgt_fib[ch]; z3 *pl[2];
-    z3 *c0 = open_level(s->s, s->ct_key, level, s->um), *c1 = c0 ? open_level(s->s, s->ct_key, level, s->um) : nullptr, *c2 = c1 ? open_level(s->s, s->ct_key, level, s->um) : nullptr;
+    z3 *c0 = open_ct_level(s, level), *c1 = c0 ? open_ct_level(s, level) : nullptr, *c2 = c1 ? open_ct_level(s, level) : nullptr;
     const int bad = fiber_onfly_open(f->afv, f->extra, f->map, f->tr, f->rad, f->guard, f->ring, f->iso, level, c0, c1, c2, pl);
     pthread_mutex_lock(&g_open_mu);
     if (bad) { if (!s->tgt[ch][level]) s->tgt_present[ch][level] = 0; pthread_mutex_unlock(&g_open_mu); return s->tgt[ch][level]; }

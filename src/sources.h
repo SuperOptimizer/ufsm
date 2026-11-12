@@ -55,6 +55,7 @@ typedef struct {
     char *name;
     store *s;
     char *ct_key;
+    store *ct_ms; char *ct_mkey;   /* "ct_mirror": {"root", "ct"}: the levels the source's own store lacks are read from this one (e.g. the HTTP mirror) */
     double um;              /* level-0 voxel size */
     double weight;
     double ink_weight;   /* "ink_weight" (default 1): train --ink-head, this source's ink loss x the factor (e.g. pseudo labels < human) */
