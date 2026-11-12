@@ -6,6 +6,60 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## --fit-zarr fields fused from the cell logits: nn_fit_accum_lat (2026-11-12, branch univdec-20261112)
+
+The z-slab fit path of a latent-grid net wrote and read full-resolution fp16 planes for each z chunk: upsample + shuffle (11 channels), the
+fine stem (nn_lat_ct_x + nn_fstem_fwd), fit_accum_k, then for the winding mod 4 a second upsample + stem over the chunk plus its +-d halo
+planes and fit_accum_w4_k. That was ~200 ms a window on the pod's RTX PRO 6000 box run (1056^3 windows), as much as the trunk.
+nn_fit_accum_lat does the same in one kernel, one block of 512 threads per 8^3 field cell. --fit-zarr's strides are multiples of
+--fit-h and its windows multiples of 16, so the halo is a multiple of 4 and the field cells are always on the latent grid: a cell is
+2^3 latent cells and 4^3 stem blocks. In the kernel:
+- the 4^3 coarse cells around the field cell are staged in shared memory;
+- the upsample is lat_up4_k's separable chain per (channel, latent cell, z offset), written to fp16 planes in shared memory;
+- the stem runs on the cell's 64 blocks in fstem_fwd_k's exact mma16816 sequence (A fragments, 4 k-steps from zero, + b1, silu, the W2
+  sums over c), with its outputs added and rounded per voxel after the sub-cell term, as the plane kernels do;
+- the cell sums use fit_accum_k's per-thread expressions and its shared-memory tree;
+- the winding's terms are fit_accum_w4_k's, summed in its voxel order by one thread per accumulator;
+- the partner voxels at +dd along z, y, x come from three shifted regions that each block computes itself (the stem and the winding
+  pair's upsample, recomputed).
+
+Byte-identical, with one catch. The first version spelled the upsample's `w0 a + w1 b + w2 c` as a plain expression. Inside the kernel
+the compiler contracted that differently from lat_up4_k's unrolled loops: 1 fp16 ulp in ~1e-5 of the voxels (small logits, where the
+cancellation shows). On the pod box that moved 0.012 % of pc cells (max 2 codes), 0.026 % of ps, and 45k dz / 73k dx cells by up to
+51 codes. dx is the atan2 of sums near zero, so it amplifies any difference. fl_lw now writes the contraction out:
+fma(w2, c, fma(w0, a, w1 b)).
+- test_fit_lat: the 12 + 9 accumulator planes against the plane path bit for bit (stem on / off, sub-cell on / off, three window
+  offsets); the logits per voxel through nn_fit_accum_lat_debug.
+- test_predict_heads: the 14 fields against UFSM_PRED_FIT_FUSED=0, on the fixture volume and on a box inside it.
+- On the pod box all 267 field files are byte-identical to the plane run.
+
+The heads kernel's stem features (nn_lat_heads_place) are not shared: that kernel sums the stem in fp32 in a different order than the
+tensor cores (its heads differ from the plane path in rare last bits), so sharing them would give up the identity. The stem costs little
+here; the shifted regions cost more (below).
+
+Numbers:
+- Kernel, 256^3 window (UFSM_TEST_BENCH=1 test_fit_lat, sub-cell + stem + winding):
+  - plane path: pod 2.4 ms (upsample + shuffle 0.4, stem 0.9, sums 0.7, winding 0.4); desk 5060 Ti beside u1 20 ms;
+  - first version (a thread's channels upsampled per voxel: 27 loads and 39 multiply-adds per channel and voxel): desk 21 ms;
+  - staged version: pod 1.2 ms, desk 9.5 ms;
+  - pod without the stem 0.7 ms, without the winding pass 0.8 ms.
+- The 19.3 Gvox Paris4 box, 5 heads, 4 levels, warm cache, RTX PRO 6000. Loop wall is the profile's wall, without the ~5.7 s of
+  start-up that elapsed includes:
+
+  | run | GPU (fwd + d2h) | loop wall | elapsed |
+  |---|---|---|---|
+  | 5 heads | 7.20 s | 9.35 s | 15.5 s |
+  | 5 heads + fit-zarr, plane path | 10.39 s | 11.82 s | 18.0 s |
+  | 5 heads + fit-zarr, fused | 8.56 s | 9.84 s | 15.2 s |
+
+  The fit fields now cost +1.4 s of GPU over the 18 windows (75 ms a window, against 177) and +0.5 s of wall. The main loop still waits
+  3.9 s on the fit writer's ring, behind the copies of the field slabs on the GPU's queue.
+
+What would make it smaller:
+- the shifted regions: each block upsamples the winding pair and runs the stem on 3 more regions, 2/3 of the stem work. A window-wide
+  pass that keeps the winding pair's fp16 logits (4 B a voxel) would remove that.
+- The fit_accum_w4_k order forces a 512-long serial chain per accumulator; the sums can't be split without changing the bytes.
+
 ## The sub-cell head over more than 16 task outputs (2026-11-12, branch subcell-20261112)
 
 `--lat-guide 3`, the sub-cell head, used to have exactly 144 outputs: 16 interpolated base outputs plus 128 sub-cell terms (the
