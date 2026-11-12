@@ -69,10 +69,21 @@ static double cf_axis(const fit_fields *f, size_t i, double v[3]) {
 }
 static double cf_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + 1e-9 * t.tv_nsec; }
 /* ---- chunk loads one ahead on a thread (the decode overlaps the pooling / the GPU; two chunks held) ---- */
-typedef struct { const char *in; int z0, z1, rc, th_on, busy; fit_fields_buf b; pthread_t th; double t; } cf_pre;
-static void *cf_pre_run(void *a) { cf_pre *p = a; p->rc = fit_fields_load(p->in, p->z0, p->z1, 1, &p->b); return nullptr; }
+/* (nxt: a used chunk handed back by cf_pre_give (main thread only); cf_pre_start moves it to use, owned by the load thread, whose
+   load takes its planes instead of fresh pages: fit_fields_recycle) */
+typedef struct { const char *in; int z0, z1, rc, th_on, busy, has_use, has_nxt; fit_fields_buf b, use, nxt; pthread_t th; double t; } cf_pre;
+static void *cf_pre_run(void *a) { cf_pre *p = a;
+    if (p->has_use) { fit_fields_recycle(1); p->rc = fit_fields_load_ex(p->in, p->z0, p->z1, 1, &p->b, 0, nullptr, 0, &p->use); fit_fields_recycle(0); p->has_use = 0; }
+    else p->rc = fit_fields_load(p->in, p->z0, p->z1, 1, &p->b);
+    return nullptr; }
+static void cf_pre_give(cf_pre *p, fit_fields_buf *b) {   /* a chunk done with: its planes for the next cf_pre_start's load */
+    if (p->has_nxt || getenv("UFSM_CF_NO_RECYCLE")) { fit_fields_free(b); return; }
+    p->nxt = *b; p->has_nxt = 1; memset(b, 0, sizeof *b);
+}
 static void cf_pre_start(cf_pre *p, const char *in, int z0, int z1, int async) {
-    p->in = in; p->z0 = z0; p->z1 = z1; p->rc = 0; p->busy = 1; p->th_on = async && pthread_create(&p->th, nullptr, cf_pre_run, p) == 0;
+    p->in = in; p->z0 = z0; p->z1 = z1; p->rc = 0; p->busy = 1;
+    if (p->has_nxt) { p->use = p->nxt; p->has_use = 1; p->has_nxt = 0; memset(&p->nxt, 0, sizeof p->nxt); }
+    p->th_on = async && pthread_create(&p->th, nullptr, cf_pre_run, p) == 0;
     if (!p->th_on) cf_pre_run(p);
 }
 static int cf_pre_take(cf_pre *p, fit_fields_buf *b) {   /* waits for the chunk started last; its buffer moves to b (time waited -> p->t) */
@@ -577,6 +588,10 @@ int cmd_count_field(int argc, char **argv) {
             if (pp.wb > 0) { pp.wd = atof(cf_opt(argc, argv, "--wide-dens", "0")); pp.wp = atof(cf_opt(argc, argv, "--wide-phase", "0")); }
         }
         const double tl1 = cf_now();
+        if (getenv("UFSM_CF_READ_ONLY")) {   /* (bench: the field reads only; FNV-1a of the chunk's planes for byte-identity checks) */
+            const uint8_t *pl[10] = {b.f.pc, b.f.ps, b.f.t[0], b.f.t[1], b.f.t[2], b.f.t[3], b.f.t[4], b.f.t[5], b.f.sp, b.f.w}; uint64_t hs = 1469598103934665603ull;
+            if (!strcmp(getenv("UFSM_CF_READ_ONLY"), "h")) for (int k = 0; k < 10; k++) if (pl[k]) for (size_t i = 0; i < (size_t)(z1 - z0) * HW; i += 7) hs = (hs ^ pl[k][i]) * 1099511628211ull;
+            fprintf(stderr, "count-field: read only: rows %d..%d hash %016llx\n", z0, z1, (unsigned long long)hs); cf_pre_give(&pre, &b); continue; }
         if (gpu) {   /* the chunk's solve rows on the GPU (the same sums in the same order) */
             const cf_gpu_poolcfg gc = {H, W, P, lv[0].hh, lv[0].w, na, h, g.cy, g.cx, pp.emin, pp.sheet0, pp.kph, pp.c0, pp.rs, pp.ra, pp.rb, pp.wa, pp.wb, pp.wd, pp.wp};
             const uint8_t *pl[10] = {b.f.pc, b.f.ps, b.f.t[0], b.f.t[1], b.f.t[2], b.f.t[3], b.f.t[4], b.f.t[5], b.f.sp, b.f.w};
@@ -598,9 +613,11 @@ int cmd_count_field(int argc, char **argv) {
                 free(pk); free(pm.pitch); free(pm.offset);
             }
         }
-        fit_fields_free(&b);
+        cf_pre_give(&pre, &b);
     }
+    if (pre.has_nxt) { fit_fields_free(&pre.nxt); pre.has_nxt = 0; }
     if (!dir) dir = 1;
+    if (getenv("UFSM_CF_READ_ONLY")) { fprintf(stderr, "count-field: read only: waited for field reads %.0f s, wall %.0f s\n", pre.t, cf_now() - tst0); return 0; }
     if (!cached) fprintf(stderr, "count-field: pass 1: waited for field reads %.0f s, pooling %.0f s (%s, %d of %d chunks on the CPU; %d rows per chunk), wall %.0f s\n", pre.t, t_pool, gpu ? "GPU" : "CPU", gpu ? npc : (D + CZ - 1) / CZ, (D + CZ - 1) / CZ, CZ, cf_now() - tst0);
     if (*pcache && !cached) { FILE *pf = fopen(pcache, "wb"); const int hd[6] = {lv[0].d, lv[0].hh, lv[0].w, P, dir, recto | w4d << 1};
         int bad = !pf || fwrite(hd, sizeof hd, 1, pf) != 1 || fwrite(&pitch, sizeof pitch, 1, pf) != 1 || fwrite(Sl[0], sizeof(float), lv[0].n, pf) != lv[0].n;

@@ -2352,6 +2352,11 @@ static int g_ct_planes = 3;   /* the CT planes fit_fields_load reads: bit 0 ct, 
 void fit_fields_ct_planes(int mask) { g_ct_planes = mask; }
 static int g_skip_planes;   /* optional planes fit_fields_load leaves out: bit 0 the recto plane, bit 1 the winding mod 4 planes */
 void fit_fields_skip_planes(int mask) { g_skip_planes = mask; }
+/* fit_fields_recycle(1): a fit_fields_load_ex with a prev that shares no rows takes prev's planes (when they hold at least the new
+   block) instead of fresh zeroed ones: every byte of a zarr block read is written (chunks copied, absent chunks filled), so the
+   result is the same, without faulting in fresh pages per block (count-field pass 1 on P4: 1.26 TB of page faults, 650 s system time) */
+static int g_recycle;
+void fit_fields_recycle(int on) { g_recycle = on; }
 int fit_fields_zchunk(const char *dir, long long *zoff) {   /* (src/fit.h) */
     char path[1400]; snprintf(path, sizeof path, "%s/fields.json", dir);
     json *j = read_json_file(path); if (!j) return -1;
@@ -2431,6 +2436,20 @@ void fit_core_mask(const coreline *C, int side, const long long org[3], double h
     mask_job J = {C, side, org, h, um, z0, H, W, 0, pc, ps, w, nullptr, nullptr};
     fit_zpar(nz, fit_nthreads(nz), mask_rows, &J);
 }
+/* one field plane's rows [z0, z0 + nz) of a fit_fields_load_ex block (zarr, box raw or cropped raw) into blk[k]; jobs = planes */
+typedef struct { z3 *const *za; FILE *const *fr; const int *boxraw; uint8_t *const *blk; const int *act; int nact, z0, nz, H, W; long long bs[3], rsh[3], zoff[3]; const char *const *nm; int nt; _Atomic int fail; } fit_plane_rd;
+static void fit_plane_read(void *a, int q0, int q1, int t_) {
+    fit_plane_rd *R = a;
+    for (int q = q0; q < q1; q++) {
+        const int k = R->act[q]; const int64_t n[3] = {R->nz, R->H, R->W};
+        if (R->za[k]) { const int64_t o[3] = {R->z0 + R->zoff[0], R->zoff[1], R->zoff[2]};
+            if (z3_read_sub(R->za[k], o, n, R->blk[k], R->nt, fit_submask(R->za[k], o[0], n[0]))) { fprintf(stderr, "fit: %s\n", z3_error()); R->fail = 1; } }
+        else if (R->boxraw[k]) { const long long o[3] = {R->z0, 0, 0};
+            if (raw_read_box(R->fr[k], R->bs, o, n, R->blk[k])) { fprintf(stderr, "fit: short read of %s\n", R->nm[k]); R->fail = 1; } }
+        else { const long long o[3] = {R->z0 + R->zoff[0], R->zoff[1], R->zoff[2]};
+            if (raw_read_box(R->fr[k], R->rsh, o, n, R->blk[k])) { fprintf(stderr, "fit: short read\n"); R->fail = 1; } }
+    }
+}
 int fit_fields_load(const char *dir, int fz0, int fz1, int pool, fit_fields_buf *b) { return fit_fields_load_ex(dir, fz0, fz1, pool, b, 0, nullptr, 0, nullptr); }
 int fit_fields_load_ex(const char *dir, int fz0, int fz1, int pool, fit_fields_buf *b, int noread, fit_fields_buf *also, int also_pool, fit_fields_buf *prev) {   /* (src/fit.h) */
     const char *const *nm = fit_plane_names;
@@ -2500,8 +2519,13 @@ int fit_fields_load_ex(const char *dir, int fz0, int fz1, int pool, fit_fields_b
             zr0 = pfz1;
         }
     }
+    if (prev && zr0 == fz0 && g_recycle && pool == 1 && !also && !noread && zarr) {   /* fit_fields_recycle: prev's planes reused (no fresh pages) */
+        const size_t pn = (size_t)prev->shape[0] * prev->shape[1] * prev->shape[2];
+        int ok = pn >= np; for (int q = 0; q < nact; q++) { int bad = 0; for (int k2 = 0; k2 < 17; k2++) if (k2 == act[q] && !prev->a[k2]) bad = 1; for (int k2 = 0; k2 < 17; k2++) if (k2 == act[q] && boxraw[k2]) bad = 1; ok &= !bad; }
+        if (ok) for (int q = 0; q < nact; q++) { b->a[act[q]] = prev->a[act[q]]; prev->a[act[q]] = nullptr; }
+    }
     if (prev) fit_fields_free(prev);
-    if (zr0 == fz0) for (int q = 0; q < nact; q++) b->a[act[q]] = calloc(np, 1);
+    if (zr0 == fz0) for (int q = 0; q < nact; q++) if (!b->a[act[q]]) b->a[act[q]] = calloc(np, 1);
     if (noread) fz1 = fz0;   /* (the loop below reads nothing) */
     /* read in z-blocks of `pool` rows, pooled into one output row each; unpooled (direct), decoded straight into the output rows (no
        block buffers: they were 64 rows x every plane, 8 GB on a full cross-section), in blocks that end on the zarr's chunk rows (each
@@ -2521,13 +2545,16 @@ int fit_fields_load_ex(const char *dir, int fz0, int fz1, int pool, fit_fields_b
         nz = z0 + zb <= fz1 ? zb : fz1 - z0;
         if (direct && !also) { const long long e = zarr ? ((z0 + zoff[0]) / cz + 1) * cz - zoff[0] : (long long)z0 + cz; nz = (int)((e < fz1 ? e : fz1) - z0); }
         if (direct) for (int q = 0; q < nact; q++) blk[act[q]] = b->a[act[q]] + (size_t)(z0 - fz0) * plane;
-        for (int q = 0; q < nact; q++) {
-            const int k = act[q];
-            if (za[k]) { const int64_t o[3] = {z0 + zoff[0], zoff[1], zoff[2]}, n[3] = {nz, H, W}; if (z3_read_sub(za[k], o, n, blk[k], fit_nthreads(16), fit_submask(za[k], o[0], n[0]))) { fprintf(stderr, "fit: %s\n", z3_error()); return -1; } }
-            else if (boxraw[k]) { const long long bs[3] = {shp[0], shp[1], shp[2]}, o[3] = {z0, 0, 0}; const int64_t n[3] = {nz, H, W};
-                   if (raw_read_box(fr[k], bs, o, n, blk[k])) { fprintf(stderr, "fit: short read of %s\n", nm[k]); return -1; } }
-            else { const long long o[3] = {z0 + zoff[0], zoff[1], zoff[2]}; const int64_t n[3] = {nz, H, W};
-                   if (raw_read_box(fr[k], rsh, o, n, blk[k])) { fprintf(stderr, "fit: short read\n"); return -1; } }
+        {   /* the planes' reads at once, a thread per zarr plane: z3_read_sub's own index loads, fill of absent chunks and page faults
+               run on its calling thread, so plane after plane left most cores idle (P4 whole-scroll ref, 128-row chunks of a 3575 x
+               3712 cross-section: 1.7 of 8 read cores busy). Same bytes: each plane's read is unchanged, only concurrent */
+            fit_plane_rd R = {za, fr, boxraw, blk, act, nact, z0, nz, H, W, {shp[0], shp[1], shp[2]}, {rsh[0], rsh[1], rsh[2]}, {zoff[0], zoff[1], zoff[2]}, nm, 0, 0};
+            int nz3 = 0; for (int q = 0; q < nact; q++) nz3 += za[act[q]] != nullptr;
+            const int ntot = fit_nthreads(16), serial = nz3 < 2 || getenv("UFSM_FIT_LOAD_SERIAL");
+            R.nt = serial ? ntot : (ntot + nz3 - 1) / nz3 + 1;   /* (the decode threads per plane: a little oversubscribed, the callers' serial parts interleave) */
+            if (serial) { for (int q = 0; q < nact; q++) fit_plane_read(&R, q, q + 1, 0); }
+            else fit_zpar(nact, nact, fit_plane_read, &R);
+            if (R.fail) return -1;
         }
         if (cside) core_mask(dir, &core, cside, org, h, b->um, shp[0], z0, nz, H, W, blk[0], blk[1], blk[9]);   /* the other side of the core: no data */
         if (pool == 1) {
