@@ -102,7 +102,13 @@ zcclean() { [ "$DRY" = 1 ] || [ "$ZCACHE_GB" = 0 ] || rm -f "$ZCPATH"; }
 log() { if [ "$DRY" = 1 ]; then echo "    log: $*"; else echo "$(date '+%F %T') $*" | tee -a $O/progress.log; fi; }
 stopped() { [ -e $O/STOP ]; }
 done_() { [ -e $O/state/$1.done ]; }
-memok() { [ "$DRY" = 1 ] && return 0; while [ $(availgb) -lt $MINMEM ]; do sleep 30; done; }
+# memok: availgb is the cgroup headroom under a memcap scope (sysinfo --avail-gb), so MINMEM is checked against the cap, not the host:
+# capped at a quarter of the smallest memory.max on this process's cgroup path (11-12: MINMEM 40 under memcap 40G deadlocked the slab
+# lanes in memok for 8 min until the scope was raised to 60G)
+capgb() { local cg d m best=; cg=$(awk -F: '$1 == "0" {print $3}' /proc/self/cgroup 2> /dev/null); d=/sys/fs/cgroup$cg
+          while [ -n "$cg" ] && [ "$d" != /sys/fs/cgroup ] && [ "$d" != / ]; do m=$(cat $d/memory.max 2> /dev/null); [ -n "$m" ] && [ "$m" != max ] && { m=$((m >> 30)); [ -z "$best" ] || [ $m -lt $best ] && best=$m; }; d=$(dirname $d); done
+          echo ${best:-}; }
+memok() { [ "$DRY" = 1 ] && return 0; local mm=$MINMEM c; c=$(capgb); [ -n "$c" ] && [ $mm -gt $((c / 4)) ] && mm=$((c / 4)); while [ $(availgb) -lt $mm ]; do sleep 30; done; }
 # X LOG CMD..: a command, nice 10, timed (/usr/bin/time -v appended to LOG); DRY: printed
 X() { local l=$1; shift; if [ "$DRY" = 1 ]; then echo "    $*  > $l"; return 0; fi
       /usr/bin/time -v nice -n 10 "$@" >> $l 2>&1; }
