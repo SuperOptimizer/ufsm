@@ -211,6 +211,12 @@ int main(int argc, char **argv) {
         CHECK(nfin >= 2 && nchk >= 2 && !nbad, "ssl: %d step lines with a finite ssl term, %d checks (%d with a targeted share outside 10..75%%)", nfin, nchk, nbad);
         free(lg);
         CHECK(!sh("head -1 %s/ssl/last.ckpt | grep -q '\"emb_lev\":1,\"emb_ch\":8'", d), "ssl: header names the side head");
+        /* (c) unlabelled windows skip the head slabs: the same losses as with the slabs run on zero masks (UFSM_SSL_SLABS=1) */
+        CHECK(!sh("UFSM_SSL_SLABS=1 UFSM_GRAD_MX8=1 %s train %s/fx/sources-ssl.json --out %s/sslb %s %s --ssl-share 0.5 --steps 8 > %s/sslb.log 2>&1", U, d, d, cm, sf, d), "ssl run with slabs (%s/sslb.log)", d);
+        snprintf(p, sizeof p, "%s/ssl.log", d); l0 = slurp(p); snprintf(p, sizeof p, "%s/sslb.log", d); l1 = slurp(p);
+        t0 = l0 ? loss_terms(l0) : nullptr; t1 = l1 ? loss_terms(l1) : nullptr;
+        CHECK(t0 && t1 && !strcmp(t0, t1), "ssl: skipping the head slabs changed the losses\n  skip   %s\n  slabs  %s", t0 ? t0 : "-", t1 ? t1 : "-");
+        free(t0); free(t1); free(l0); free(l1);
         CHECK(!sh("UFSM_GRAD_MX8=1 %s train %s/fx/sources-ssl.json --out %s/ssl --resume %s/ssl/last.ckpt %s %s --ssl-share 0.5 --steps 10 > %s/ssl2.log 2>&1 && grep -q 'step     10 ' %s/ssl2.log", U, d, d, d, cm, sf, d, d), "ssl resume (%s/ssl2.log)", d);
     }
     if (!fails) sh("rm -rf %s", d);

@@ -956,7 +956,17 @@ static void head_slab_pass(gpu_state *d, int pass) {
 #define FT(w) do { if (fine) nn_ptick(w); } while (0)
     const int si = d->srcb[d->cur];   /* the window's source (its "heads" weights) */
     if (!pass) { nn_zero(d->hs_ds, 128 * sizeof(double)); if (g_unwrap2) nn_zero(d->w4ds, nn_wind4_sums()); if (g_fibn) nn_zero(d->fibacc, 2 * sizeof(double)); }
-    for (int z0 = 0; z0 < D; z0 += Z) {
+    const int ssl_skip = g_lat && d->ssl_win && !getenv("UFSM_SSL_SLABS");   /* --ssl, an unlabelled window: no supervised term, so no slabs (the losses
+                                                                               finalise from zero sums; the coarse gradient stays zero; the streamed head's
+                                                                               backward gets zero planes). UFSM_SSL_SLABS=1: the slabs as on a labelled window */
+    if (ssl_skip && pass && g_lat_hs) {
+        const size_t pl = (size_t)(H / 4) * (W / 4); const int Dc = D / 4, step = Z / 4 > 0 ? Z / 4 : 1;
+        nn_zero(d->latgc, (size_t)LNC * step * pl * 2);
+        for (int f0 = 0; f0 < Dc; f0 += step) { const int f1 = f0 + step < Dc ? f0 + step : Dc;
+            if (unet_head_bwd_z(d->u, f0, f1, d->latgc, f0 == 0)) { fprintf(stderr, "ssl: the latent head backward is not covered per slab\n"); abort(); } }
+        nn_ptick("trunk backward");
+    }
+    for (int z0 = 0; z0 < D && !ssl_skip; z0 += Z) {
         const int z1 = z0 + Z < D ? z0 + Z : D, nz = z1 - z0;
         const size_t ns = (size_t)nz * hw, vb = (size_t)z0 * hw;
 #define LGC(c) ((char *)d->hs_lg + (size_t)(c) * ns * 2)
@@ -3095,6 +3105,8 @@ int cmd_train(int argc, char **argv) {
                                     ? (gdef ? (size_t)100 << 20 : (size_t)B * cfg.widths[0] * p3 * 136 / 256) : 0;
                 need = grec + tb + tb / 14 + trainer + (nn_get_loss_tol() ? (size_t)B * p3 : 0) + (g_aff ? (size_t)2 * B * p3 : 0) + (g_fibdir > 0 ? (size_t)8 * B * p3 : 0) + (g_unwrap ? (g_head_slab ? (size_t)4 * B * p3 + (size_t)g_hs_z * P * P * (2 * g_cout + 11) + 4096 : (size_t)15 * B * p3) + (g_unwrap2 ? (size_t)4 * B * p3 : 0) + ((size_t)2 * g_naux * B * p3 + (size_t)(3 * (g_rv != 0) + 2 * (g_ink2 || (g_fibn && !g_rv))) * g_hs_z * P * P) : 0) + (g_cond ? (size_t)7 * B * p3 : 0) + (g_pap_head ? (size_t)4 * B * p3 : 0) + (g_restore ? (size_t)B * p3 * (cand[c].lean ? 5 : 1) + restore_scratch_bytes(g_Pz, P, P, fminf(g_rr.sc_step[0], 4.f)) + 256 : 0) + ((size_t)550 << 20) + (split ? (size_t)4 * B * 32 * P * P * 2 : 0) + (g_gpu_aug_want && gin ? nn_aug_device_bytes(P) + (g_gpu_aug_want == 2 ? nn_label_warp_device_bytes(P) : 0) : 0);   /* split: two slots of halo send / receive planes */   /* kernel workspaces: measured device growth / tracked ~1.07 + 0.3 GB, + 0.2 GB margin for other processes */
                 if (g_lat) need += (xin_sep ? 0 : xinb) + (g_tm_unused ? 0 : batb) + (g_lat_hs ? ((size_t)LNC * (LGFC < LNC ? 6 : 4) + (size_t)LGFC * 4) * (size_t)(g_hs_z / 4 + 2) * (P / 4) * (P / 4) + (g_lat_fuse ? nn_lat_fuse_part(7, P / 4, P / 4, g_hs_z) : 0) : ((size_t)LNC * 2 + (size_t)LGFC * 4) * (p3 / 64));   /* --lat: the full-resolution batch beside the cell-grid network, the coarse logit gradient (fp32 + 16-bit) */
+                if (g_ssl) need += (size_t)g_ssl * g_ssl_S * 5 + (size_t)g_ssl_npts * (g_ssl * 8 + 8) + 4096;   /* --ssl: int8 targets + the side head's fp32 gradient, the hinge's
+                                                                                                         points (its fp32 outputs are the network's: in the dry build) */
                 /* the wide MX-fp4 stride-2 backward-data (lp_bwd_data_s2_mx, more than 64 channels: no direct tensor-core kernel) works
                    through MX-fp8 chunks of ~96 MB (gx, the dilated gy, the accumulate temp), at least 3 fine planes each; the lp_buf
                    slots keep them (measured 3 x 102 MB at a 96-wide P 512 latent net, outside tb / 14) */
