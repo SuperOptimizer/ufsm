@@ -200,6 +200,13 @@ extern "C" void nn_input_latc(const void *ct16, shape5 xs, const void *rec, cons
     lp_input_latc(ct16, g_h16 ? 2 : 1, rec, NN_RAD_REC(4 * xs.d), xs.n, xs.d, xs.h, bas, gain, C, step, y, ISMX4(y) ? 4 : 8);
     KCHECK();
 }
+extern "C" void nn_input_latq(const void *ct16, shape5 xs, const void *rec, int n, int cz0, int ncz, const void *cells, int stride, const float *gain, int C,
+                              float step_raw, float mean, float isd, void *y) {
+    if (!ISMX(y) || xs.c != C + 3 || (xs.c != 16 && xs.c != 32) || xs.h != xs.w || n < 0 || n >= xs.n || cz0 < 0 || cz0 + ncz > xs.d || stride < C + 1) {
+        fprintf(stderr, "nn_input_latq: an MX input of C + 3 = 16 or 32 channels, square planes, a slab inside window n, stride >= C + 1\n"); abort(); }
+    lp_input_latq(ct16, g_h16 ? 2 : 1, rec, NN_RAD_REC(4 * xs.d), xs.n, xs.d, xs.h, n, cz0, ncz, cells, stride, gain, C, step_raw, mean, isd, y, ISMX4(y) ? 4 : 8);
+    KCHECK();
+}
 extern "C" void nn_input_rad_pack(const void *ct16, shape5 xs, const void *rec, void *y) {
     if (!ISMX(y) || xs.c != 8 || xs.h != xs.w) { fprintf(stderr, "nn_input_rad_pack: an MX input of 8 channels, square planes\n"); abort(); }
     lp_input_rad_pack(ct16, g_h16 ? 2 : 1, rec, NN_RAD_REC(2 * xs.d), xs.n, xs.d, xs.h, y, ISMX4(y) ? 4 : 8);

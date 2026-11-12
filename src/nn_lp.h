@@ -101,6 +101,8 @@ size_t lp_mx4_bytes(int N, int C, size_t S);
 void lp_f32_to_mx4(const float *x, int N, int C, size_t S, void *y);
 void lp_h16_to_mx4(const void *x, int dt, int N, int C, size_t S, void *y);
 void lp_input_rad(const void *ct16, int dt, const void *rec, size_t rec_bytes, int N, int D, int P, void *y, int bits);   /* nn_input_rad */
+void lp_input_latq(const void *ct16, int dt, const void *rec, size_t rec_bytes, int N, int d, int p, int n, int cz0, int ncz, const void *cells, int stride,
+                   const float *gain, int C, float sraw, float mean, float isd, void *y, int bits);   /* nn_input_latq */
 void lp_input_latc(const void *ct16, int dt, const void *rec, size_t rec_bytes, int N, int d, int p, const float *bas, const float *gain, int C, float step, void *y, int bits);   /* nn_input_latc */
 void lp_input_lat(const void *ct16, int dt, const void *rec, size_t rec_bytes, int N, int d, int p, void *y, int bits);   /* nn_input_lat */
 void lp_fakeq_w4(float *w, int Co, int Ci, int T, int Bo, int Bi);   /* nn_fakeq_w4_2d / nn_fakeq_w4 */

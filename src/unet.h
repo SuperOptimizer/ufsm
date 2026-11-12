@@ -309,6 +309,11 @@ void unet_set_input_rad(unet *u, const void *rec);
 /* latent-grid nets (half_res 3) with the learned cell transform (latfit.h): bas [C][64], gain [C], the quantiser step (0: none); cfg.cin = C + 3.
    Saved in the checkpoint header and set again by unet_load. unet_lat_basis: C (0: plain cell means) and the device copies. */
 void unet_set_lat_basis(unet *u, const float *bas, const float *gain, int C, float step);
+/* train --lat-direct-p: called by the next forwards right after the latent-grid input (nn_input_latc) is built in xin (the MX input, xs its
+   shape), with the CT channel, the radial records and the device gain of the cell transform: rewrites the rows of direct windows */
+typedef void (*unet_input_hook)(void *ctx, void *xin, shape5 xs, const void *ct16, const void *rad, const float *gain_d, int C);
+const float *unet_lat_basis_host(const unet *u);   /* the cell transform rows [C][64] on the host (nullptr: none) */
+void unet_set_input_hook(unet *u, unet_input_hook fn, void *ctx);   /* fn nullptr: none */
 void unet_set_lat_step(unet *u, float step);   /* the next forwards' quantiser step (train --lat-step-jitter); 0: the transform's */
 int unet_lat_basis(const unet *u, const float **bas, const float **gain, float *step);
 int unet_logits_h16(const unet *u);   /* the logits unet_forward returns are fp16 (lean 2 training: the logit gradient fits after them) */

@@ -227,6 +227,34 @@ __global__ void input_latc_k(const TI *ct, const uint8_t *recs, size_t rec_bytes
     for (int c = 0; c < 3; c++) r[C + c] = rnd16<TI>(acc[c] * (1.f / 64.f));
     mx_store_row_b<B>(y, mx_sc<B>(y, N, C + 3, cv), i, mx_bw(C + 3), r);
 }
+/* train --lat-direct-p: input_latc_k's row for the cells [cz0, cz0 + ncz) of window n with its C coefficient channels from stored latvol
+   cells (int8 [ncz][p][p][stride]: bytes 0-1 the mean index, then the axes; nn_latvol_decode's layout) instead of the quantised transform of
+   the CT channel: the mean (index x sraw - 8 mean) x isd, the axes index x sraw x isd (predict's lat_input_q_k), times gain[c]; the 3 radial
+   channels exactly as input_latc_k (rad_full4 over the cell's 64 voxels, the same sum order). One thread per cell of the slab */
+template <int B, typename TI>
+__global__ void input_latq_k(const TI *ct, const uint8_t *recs, size_t rec_bytes, int N, int d, int p, int n, int cz0, int ncz, const int8_t *cells, int stride,
+                             const float *gain, int C, float sraw, float mean, float isd, uint8_t *y) {
+    const size_t sv = (size_t)ncz * p * p, k0 = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (k0 >= sv) return;
+    const size_t cv = (size_t)d * p * p, v = (size_t)cz0 * p * p + k0, i = (size_t)n * cv + v;
+    const int z = (int)(v / ((size_t)p * p)), yy = (int)((v / p) % p), xx = (int)(v % p), D = 4 * d, P = 4 * p;
+    float acc[3] = {0.f, 0.f, 0.f};
+    for (int k = 0; k < 64; k++) {
+        const int fz = 4 * z + (k >> 4), fy = 4 * yy + (k >> 2 & 3), fx = 4 * xx + (k & 3);
+        float r4[4] = {0.f, 0.f, 0.f, 0.f};
+        rad_full4<TI>(ct, recs, rec_bytes, N, D, P, n, fz, fy, fx, (((size_t)n * D + fz) * P + fy) * P + fx, r4);
+        for (int c = 0; c < 3; c++) acc[c] += r4[1 + c];
+    }
+    float r[32];
+#pragma unroll
+    for (int k = 0; k < 32; k++) r[k] = 0.f;
+    const int8_t *qc = cells + k0 * (size_t)stride;
+    const float dc = (float)((int)(uint8_t)qc[0] + 256 * (int)qc[1]) * sraw;
+    r[0] = rnd16<TI>((dc - 8.f * mean) * isd * gain[0]);
+    for (int c = 1; c < C; c++) r[c] = rnd16<TI>((float)qc[c + 1] * sraw * isd * gain[c]);
+    for (int c = 0; c < 3; c++) r[C + c] = rnd16<TI>(acc[c] * (1.f / 64.f));
+    mx_store_row_b<B>(y, mx_sc<B>(y, N, C + 3, cv), i, mx_bw(C + 3), r);
+}
 /* --half-res pack with --gpu-input: the network's 8 input channels on the 2x2x2 blocks of the window, straight from the full-resolution
    16-bit CT channel and the radial records: each sub-voxel's 4 channels as input_rad_k (rounded to the 16-bit type), then nn_half_input
    mode 2 (the block means of the 4 channels, the CT's Haar details along z, y, x and its mean absolute deviation, each rounded to the
@@ -304,6 +332,16 @@ extern "C" void lp_input_latc(const void *ct16, int dt, const void *rec, size_t 
     if (bits == 4) { if (dt == 2) ILC(4, __half); else ILC(4, bf16); }
     else { if (dt == 2) ILC(8, __half); else ILC(8, bf16); }
 #undef ILC
+    LPCK();
+}
+extern "C" void lp_input_latq(const void *ct16, int dt, const void *rec, size_t rec_bytes, int N, int d, int p, int n, int cz0, int ncz, const void *cells, int stride,
+                              const float *gain, int C, float sraw, float mean, float isd, void *y, int bits) {
+    const size_t sv = (size_t)ncz * p * p;
+    const uint8_t *rr = (const uint8_t *)rec; uint8_t *yy = (uint8_t *)y; const int8_t *q = (const int8_t *)cells;
+#define ILQ(B, T) input_latq_k<B, T><<<nblk_(sv, 128), 128>>>((const T *)ct16, rr, rec_bytes, N, d, p, n, cz0, ncz, q, stride, gain, C, sraw, mean, isd, yy)
+    if (bits == 4) { if (dt == 2) ILQ(4, __half); else ILQ(4, bf16); }
+    else { if (dt == 2) ILQ(8, __half); else ILQ(8, bf16); }
+#undef ILQ
     LPCK();
 }
 extern "C" void lp_input_lat(const void *ct16, int dt, const void *rec, size_t rec_bytes, int N, int d, int p, void *y, int bits) {
