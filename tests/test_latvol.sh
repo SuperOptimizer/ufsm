@@ -68,7 +68,7 @@ for b in "3 17 30 131 97 150" "130 100 60 200 180 250"; do
     cmp -s "$D/bh.raw" "$D/bg.raw" || fail "the GPU voxel reader differs from the host decoder (box $b)"
 done
 # a range-serving HTTP root over the store (suffix ranges for the shard indices)
-python3 -I - "$D/lv" "$D/port" <<'EOF' &
+python3 -I - "$D" "$D/port" <<'EOF' &
 import http.server, os, re, sys
 root, portf = sys.argv[1], sys.argv[2]
 class H(http.server.BaseHTTPRequestHandler):
@@ -99,10 +99,17 @@ EOF
 SRV=$!
 for _ in $(seq 100); do [ -s "$D/port" ] && break; sleep 0.1; done
 [ -s "$D/port" ] || fail "the HTTP server did not start"
-H="http://127.0.0.1:$(cat "$D/port")"
+H="http://127.0.0.1:$(cat "$D/port")/lv"; H2="http://127.0.0.1:$(cat "$D/port")/fx"
 "$U" read "$H" ct/9.6 0 0 0 256 256 256 "$D/lvh.raw" --cache "$D/cache" > "$D/lvh.log" 2>&1 || fail "read over HTTP ($D/lvh.log)"
 cmp -s "$D/lv.raw" "$D/lvh.raw" || fail "the latvol level over HTTP differs from the local read"
 [ -n "$(find "$D/cache" -type f | head -1)" ] || fail "no chunk cached"
+# two roots, the same array key, different bytes (the latvol copy and the CT it was made from), ONE cache directory: each reads back its
+# own voxels (cached items are named by key and chunk only: the directory belongs to the first root, .root; the other gets @<hash>)
+"$U" read "$H2" ct/9.6 0 0 0 256 256 256 "$D/cth.raw" --cache "$D/cache" > "$D/cth.log" 2>&1 || fail "read of the second root over HTTP ($D/cth.log)"
+cmp -s "$D/ct.raw" "$D/cth.raw" || fail "a second root sharing the cache directory was served the first root's chunks"
+"$U" read "$H" ct/9.6 0 0 0 256 256 256 "$D/lvh2.raw" --cache "$D/cache" > /dev/null 2>&1 && cmp -s "$D/lv.raw" "$D/lvh2.raw" || fail "the first root's cached read changed after the second root used the cache directory"
+"$U" read "$H2" ct/9.6 0 0 0 256 256 256 "$D/cth2.raw" --cache "$D/cache" > /dev/null 2>&1 && cmp -s "$D/ct.raw" "$D/cth2.raw" || fail "the second root's cached read differs"
+[ "$(cat "$D/cache/.root")" = "$H" ] && [ -n "$(find "$D/cache" -path '*/@*' -type f | head -1)" ] || fail "the cache directory has no .root for the first root / no @ subdirectory for the second"
 
 # ---- 2. predict ----
 P="--um 9.6 --axis $D/fx/axis.json --levels 1 --q 0"
