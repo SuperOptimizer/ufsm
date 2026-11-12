@@ -6,6 +6,23 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## The pooled on-the-fly ink level read in z-slabs (2026-11-12, branch sampmem-20261112)
+
+`inkfly_pool_derive` (the coarser level of an on-the-fly ink target: known-max 2x pooling of the level below) read the whole (2n)^3 fine
+box into one malloc before pooling: 8.6 GB of scratch in every worker building a P 1024 window of an ink source at its pooled level,
+on top of the slot. It now reads slabs of the fine level cut at multiples of the fine array's 128 cell (no cell derived twice) and
+pools each; the pooling is per 2^3 block, so the bytes are the same.
+
+- Desk, one P 1024 pooled read from a stored u8 pyramid (`test_ink_pool --bench`, PHerc0139 CT levels 0 / 1 standing in for the ink
+  array): peak RSS 9.18 GB with one whole read (`UFSM_INKPOOL_SLAB=1048576`), 1.68 GB with the 128-plane slabs (1.07 GB of it the
+  output window), the same output hash.
+- `test_ink_pool` (CPU): 5 boxes of a 300 x 200 x 260 random array with unknowns (odd starts, slab cuts every 32 coarse planes, the
+  whole array) equal the pooling of one fine read, 0 differ.
+- The sampler's host memory otherwise (desk, u1's recipe, P 1024, `UFSM_HOSTMEM=1`): a slot 2.28 GB (CT 1 B a voxel, phase 1, ink bits
+  1/8, runs), a worker's fixed scratch 1.6 GB resident of 15 GB reserved. An earlier "7 GB per slot, 4 GB per worker" for U2's list was a
+  two-point fit that included the process-wide caches (per on-the-fly ink source a 2 GB target LRU and a 1 GB decoded-CT cache) and this
+  scratch; it should not be used.
+
 ## Sources that silently drop out: --strict-sources and relative-scale groups (2026-11-12, branch strictsrc-20261112)
 
 The u1 P 1024 restart (step 10453) ran its first 315 steps with no PHerc1667 windows (14.9 + 7.5 + 7.5 = 29.9% of the weight): the local
