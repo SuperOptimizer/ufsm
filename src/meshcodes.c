@@ -244,7 +244,7 @@ static const char *mc_opt(int argc, char **argv, const char *k, const char *d) {
    (`ufsm raster --value` at that level). KEY is the CT array of the level (its meta gives the grid). Exit 1 when a byte differs. */
 int cmd_codes_onfly(int argc, char **argv) {
     int ci = 0, ri = 0; for (int i = 3; i < argc; i++) { if (!strcmp(argv[i], "--ct") && i + 2 < argc) ci = i; if (!strcmp(argv[i], "--ref") && i + 2 < argc) ri = i; }
-    if (argc < 3 || !ci) { fprintf(stderr, "usage: ufsm codes-onfly <meshes-dir> --ct ROOT KEY [--level 0] [--value q.tif] [--map reg.json] [--ref ROOT KEY] [--windows 8] [--P 256] [--threads 8]\n"); return 2; }
+    if (argc < 3 || !ci) { fprintf(stderr, "usage: ufsm codes-onfly <meshes-dir> --ct ROOT KEY [--level 0] [--value q.tif] [--map reg.json] [--ref ROOT KEY] [--windows 8] [--P 256] [--threads 8] [--back COARSE_ROOT KEY0 [--slice OUT.pgm]]\n"); return 2; }
     const int level = atoi(mc_opt(argc, argv, "--level", "0")), nw = atoi(mc_opt(argc, argv, "--windows", "8")), P = atoi(mc_opt(argc, argv, "--P", "256")), T = atoi(mc_opt(argc, argv, "--threads", "8"));
     uint64_t seed = (uint64_t)atoll(mc_opt(argc, argv, "--seed", "1"));
     store *cs = store_open(argv[ci + 1]); z3 *c0 = cs ? z3_open(cs, argv[ci + 2], nullptr) : nullptr;
@@ -256,6 +256,7 @@ int cmd_codes_onfly(int argc, char **argv) {
     { int64_t g[3]; uint8_t *bits = nullptr; const int64_t nk = z3_chunk_map(z, g, &bits); free(bits);
       printf("codes-onfly: the extent: %lld of %lld chunks (%.1f%%)\n", (long long)nk, (long long)(g[0] * g[1] * g[2]), 100.0 * nk / (double)(g[0] * g[1] * g[2])); }
     z3 *ref = nullptr; if (ri) { store *rs = store_open(argv[ri + 1]); ref = rs ? z3_open(rs, argv[ri + 2], nullptr) : nullptr; if (!ref) { fprintf(stderr, "codes-onfly: cannot open %s %s\n", argv[ri + 1], argv[ri + 2]); return 1; } }
+    long long ato[3] = {0, 0, 0}; const int at = sscanf(mc_opt(argc, argv, "--at", ""), "%lld,%lld,%lld", &ato[0], &ato[1], &ato[2]) == 3;   /* --at z,y,x: every window there */
     const size_t nv = (size_t)P * P * P; uint8_t *a = malloc(nv), *b = malloc(nv); long long bad = 0; double tsum = 0, tmax = 0;
     for (int w = 0; w < nw; w++) {
         seed = seed * 6364136223846793005ull + 1442695040888963407ull; const mc_tile *t = &X->t[(seed >> 33) % X->nt];
@@ -264,6 +265,7 @@ int cmd_codes_onfly(int argc, char **argv) {
             o[d] = (int64_t)(0.5 * (t->lo[d] + t->hi[d]) * X->scale) - P / 2 + (int64_t)((seed >> 33) % 33) - 16;   /* (not chunk aligned) */
             if (o[d] > sh[d] - P) o[d] = sh[d] - P;
             if (o[d] < 0) o[d] = 0; }
+        if (at) for (int d = 0; d < 3; d++) o[d] = ato[d];
         const double t1 = mc_now(); if (z3_read(z, o, n, a, T)) { fprintf(stderr, "codes-onfly: read failed\n"); return 1; } const double dt = mc_now() - t1;
         tsum += dt; if (dt > tmax) tmax = dt;
         long long lab = 0, cf = 0, d = 0; for (size_t i = 0; i < nv; i++) { lab += a[i] != 0; cf += a[i] == 255; }
@@ -272,6 +274,57 @@ int cmd_codes_onfly(int argc, char **argv) {
         printf("window %d (%lld,%lld,%lld): %.0f ms, %lld coded voxels (%lld conflict)", w, (long long)o[0], (long long)o[1], (long long)o[2], dt * 1e3, lab, cf);
         if (ref) printf(", %lld bytes differ", d);
         printf("\n"); fflush(stdout);
+    }
+    /* --back ROOT KEY (with --map): the map check. KEY = the coarse scan's level-0 CT array; every coded voxel of the last fine window
+       goes back through rmap_f2c and must meet the coarse scan's own (unmapped) codes: the share with the same code (within 1 step =
+       1/18 turn) at the nearest coarse voxel and within 1 / 2 voxels. --slice OUT.pgm: the window's middle z slice of the fine CT
+       with the coded voxels drawn white (eye check). */
+    int bi = 0; for (int i = 3; i + 2 < argc; i++) if (!strcmp(argv[i], "--back")) bi = i;
+    const char *mapp = mc_opt(argc, argv, "--map", nullptr);
+    if (bi && mapp && nw > 0) {
+        const rmap *map = reg_map_load(mapp); store *bs = store_open(argv[bi + 1]); z3 *bc = bs ? z3_open(bs, argv[bi + 2], nullptr) : nullptr;
+        z3 *zc = map && bc ? mesh_codes_open(argv[2], mc_opt(argc, argv, "--value", "q.tif"), nullptr, 0, bc, 0) : nullptr;
+        if (!zc) { fprintf(stderr, "codes-onfly: --back: cannot open the map / the coarse CT\n"); return 1; }
+        seed = (uint64_t)atoll(mc_opt(argc, argv, "--seed", "1"));   /* the first window again */
+        seed = seed * 6364136223846793005ull + 1442695040888963407ull; const mc_tile *t = &X->t[(seed >> 33) % X->nt]; int64_t o[3], n[3] = {P, P, P};
+        for (int d = 0; d < 3; d++) { seed = seed * 6364136223846793005ull + 1442695040888963407ull;
+            o[d] = (int64_t)(0.5 * (t->lo[d] + t->hi[d]) * X->scale) - P / 2 + (int64_t)((seed >> 33) % 33) - 16;
+            if (o[d] > sh[d] - P) o[d] = sh[d] - P;
+            if (o[d] < 0) o[d] = 0; }
+        if (at) for (int d = 0; d < 3; d++) o[d] = ato[d];
+        if (z3_read(z, o, n, a, T)) return 1;
+        /* the coarse box holding the window's image */
+        double clo[3] = {1e30, 1e30, 1e30}, chi[3] = {-1e30, -1e30, -1e30}; const double fs = 1.0 / X->scale;
+        for (int c8 = 0; c8 < 8; c8++) { const double f[3] = {(o[2] + (c8 & 1 ? P : 0)) * fs, (o[1] + (c8 & 2 ? P : 0)) * fs, (o[0] + (c8 & 4 ? P : 0)) * fs}; double c[3]; rmap_f2c(map, f, c);
+            for (int d = 0; d < 3; d++) { if (c[2 - d] < clo[d]) clo[d] = c[2 - d]; if (c[2 - d] > chi[d]) chi[d] = c[2 - d]; } }
+        const int64_t *csh = z3_meta_of(zc)->shape; int64_t co[3], cn[3];
+        for (int d = 0; d < 3; d++) { co[d] = (int64_t)floor(clo[d]) - 4; if (co[d] < 0) co[d] = 0; int64_t e = (int64_t)ceil(chi[d]) + 5; if (e > csh[d]) e = csh[d]; cn[d] = e > co[d] ? e - co[d] : 1; }
+        uint8_t *cb = malloc((size_t)cn[0] * cn[1] * cn[2]); if (!cb || z3_read(zc, co, cn, cb, T)) { fprintf(stderr, "codes-onfly: --back: coarse read failed\n"); return 1; }
+        long long tot = 0, hit[3] = {0, 0, 0}, none = 0;
+        for (int64_t zz = 0; zz < P; zz++) for (int64_t y = 0; y < P; y++) for (int64_t x = 0; x < P; x++) { const uint8_t v = a[((size_t)zz * P + y) * P + x]; if (!v || v == 255) continue;
+            const double f[3] = {(o[2] + x) * fs, (o[1] + y) * fs, (o[0] + zz) * fs}; double c[3]; rmap_f2c(map, f, c);
+            const int64_t g[3] = {(int64_t)floor(c[2] + 0.5) - co[0], (int64_t)floor(c[1] + 0.5) - co[1], (int64_t)floor(c[0] + 0.5) - co[2]};
+            tot++; int best = 9, any = 0;
+            for (int dz = -2; dz <= 2; dz++) for (int dy = -2; dy <= 2; dy++) for (int dx = -2; dx <= 2; dx++) { const int64_t q[3] = {g[0] + dz, g[1] + dy, g[2] + dx};
+                if (q[0] < 0 || q[1] < 0 || q[2] < 0 || q[0] >= cn[0] || q[1] >= cn[1] || q[2] >= cn[2]) continue;
+                const uint8_t w8 = cb[((size_t)q[0] * cn[1] + q[1]) * cn[2] + q[2]]; if (!w8 || w8 == 255) continue;
+                any = 1; if (abs(mc_diff(v, w8)) > 1) continue;
+                const int r = abs(dz) > abs(dy) ? (abs(dz) > abs(dx) ? abs(dz) : abs(dx)) : (abs(dy) > abs(dx) ? abs(dy) : abs(dx)); if (r < best) best = r; }
+            if (!any) none++;
+            for (int r = 0; r < 3; r++) hit[r] += best <= r; }
+        printf("codes-onfly: map check, fine window (%lld,%lld,%lld) %d^3 -> coarse box (%lld,%lld,%lld) %lldx%lldx%lld: %lld fine coded voxels; the same code back on the coarse scan at the nearest voxel %.4f, within 1 voxel %.4f, within 2 voxels %.4f; no coarse code within 2 voxels %.4f\n",
+               (long long)o[0], (long long)o[1], (long long)o[2], P, (long long)co[0], (long long)co[1], (long long)co[2], (long long)cn[0], (long long)cn[1], (long long)cn[2], tot,
+               tot ? (double)hit[0] / tot : 0, tot ? (double)hit[1] / tot : 0, tot ? (double)hit[2] / tot : 0, tot ? (double)none / tot : 0);
+        const char *sl = mc_opt(argc, argv, "--slice", nullptr);
+        if (sl) { store *fs2 = store_open(argv[ci + 1]); z3 *fc = fs2 ? z3_open(fs2, argv[ci + 2], nullptr) : nullptr; const int64_t so[3] = {o[0] + P / 2, o[1], o[2]}, sn[3] = {1, P, P};
+            uint8_t *ct = malloc((size_t)P * P);
+            if (fc && ct && !z3_read(fc, so, sn, ct, 8)) { FILE *f = fopen(sl, "wb"); if (f) { fprintf(f, "P5\n%d %d\n255\n", 2 * P, P);
+                    for (int y = 0; y < P; y++) { fwrite(ct + (size_t)y * P, 1, (size_t)P, f);
+                        for (int x = 0; x < P; x++) { const uint8_t v = a[((size_t)(P / 2) * P + y) * P + x]; fputc(v ? 255 : ct[(size_t)y * P + x] / 2, f); } }
+                    fclose(f); printf("codes-onfly: slice z %lld -> %s (left the fine CT, right the CT dimmed with the coded voxels white)\n", (long long)so[0], sl); } }
+            else fprintf(stderr, "codes-onfly: --slice: CT read failed\n");
+            free(ct); z3_close(fc); }
+        free(cb); z3_close(zc);
     }
     printf("codes-onfly: %d windows of %d^3: %.0f ms mean, %.0f ms max per window (CPU, %d threads)%s\n", nw, P, tsum / nw * 1e3, tmax * 1e3, T,
            ref ? (bad ? ": DIFFERS from the stored raster" : ": byte-identical to the stored raster") : "");
