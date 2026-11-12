@@ -46,8 +46,9 @@ the derive signature does not change.
   Cells that no label can reach cost nothing (612 of 847 on Paris 4).
 - Disk use is about 12 KB per labelled cell; constant cells take 16 bytes.
 - A whole scan is computed once: about the 40 CPU-min of the stored splats, spread over the first epoch's reads.
-- What remains per process is the index open (Paris 4 33 s, 1667 19 s, mostly mask reads). Paris 4 is opened by three sources
-  (june / july / june48), so 3 x 33 s at trainer start; sharing the handle by key, or caching the index, is the next small step.
+- What remains per process is the index open: Paris 4 33 s -> 10 s, 1667 19 s -> ~6 s, after a row memcpy in lsrc_read (the
+  per-byte copy was half of it) and the windows on 8 threads. Paris 4 is opened by three sources (june / july / june48). The rest
+  is the serial mesh TIFF loads.
 - test_ink_splat: on the fly == stored over two merged crops with a held-out box, on odd boxes, cold, from memory, and from disk
   through a reopened array (0 cells recomputed).
 
