@@ -6,6 +6,28 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Head slabs: the derived targets built once a step (2026-11-12, branch uperf-20261112)
+
+`head_slab_pass` runs twice a step (statistics, then gradients) and built every slab's derived targets and masks in both: phase 2 + 1,
+rv 2 + 1, normal / density 7 + 1 bytes a voxel. They are now kept from the statistics pass (`gpu_state.tc`, 14 B a voxel: 10 GB at P 896,
+15 GB at P 1024, 29 GB at P 1280) and the gradient pass points `sidet / sidem / rvt / rvm / nt / nm` at the kept slab instead of running
+`nn_phase_targets`, the rv block, `nn_phase_trunc`, `nn_packed_mask_z` and `nn_unwrap_targets2_z` again. Valid for one step only
+(`tc_ok`: set by a training statistics pass, cleared by the gradient pass and by any other statistics pass), so a replay of the window
+or a validation pass never reads another step's targets. The ink targets are not in it.
+
+- Taken at the first training statistics pass when at least 8 GB stay free after it (`UFSM_HS_TCACHE=0 / 1` forces); never on the
+  16 GB cards at P 1024. The free memory is read once, at that moment: on a card shared with other jobs the automatic choice can take
+  room a neighbour is about to need (pod, 2026-11-12: U2 beside another P 1024 training left 0.5 GB free), so a resident run should set
+  it explicitly. Not yet a term of the memory planner's report.
+- Numbers. Pod, P 896, the poddry recipe: the second target build is ~90 of 850 ms a step. U2's exact recipe at P 1024 (ink head, MIL,
+  fstem 16), profiled beside U2 and another training (2790 ms a step, contended): targets 249 ms in the statistics pass, 240 ms in the
+  gradient pass, so the cache is worth ~9% of that step; the cache-on timing itself was not obtained.
+- Equality. `UFSM_HS_TCACHE_CHECK=1` makes the gradient pass build every slab's targets as without the cache and compare all six
+  planes byte for byte, aborting at the first difference. `tests/test_tcache.sh` (wind fixture, `--lat 4 --lat-guide 3 --rv 2 --replay 3
+  --packed-weight 8`, with and without `--fstem 8`): 6 gradient passes, 22 MB of bytes equal, losses equal to `UFSM_HS_TCACHE=0`. U2's
+  exact flags at P 1024 on the pod: 8 gradient passes, 120 GB of bytes equal (no ink window among them as far as the log shows).
+  Parameter hashes are no evidence here: `--det 1` runs differ from each other after two updates (see "what --det 1 fixes").
+
 ## latvol: the CT stored as the trunk's latent cells (2026-11-12, branch latstore-20261112)
 
 The latent-grid nets (u1: `--lat 4 --lat-basis klt1.lcb --lat-c 29 --lat-step 0.25`) consume 4^3 cells of KLT indices, yet every read decodes
