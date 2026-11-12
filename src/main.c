@@ -26,6 +26,7 @@
 #include "z3w.h"
 #include "papyrus.h"
 #include <zlib.h>
+#include <sched.h>
 #include "tiff.h"
 #include "imgops.h"
 #include "scanprep.h"
@@ -2216,12 +2217,14 @@ typedef struct {   /* ufsm wraps: one wrap's rows over threads */
     double step, Z; int na; double th0, dth; int rows, cols, k; double rk;
     float *px, *py, *pz; _Atomic int next; _Atomic size_t valid; const wr_polar *P; double zlo;
     const double *thc;   /* --col-r arc: per column its theta (nullptr: th0 + c dth) */
+    _Atomic int helpers;   /* (threads of other wraps' workers on these rows: wraps_help) */
+    const fit_lip *lip;    /* (the root searches' step skips; nullptr: UFSM_WRAPS_NOSKIP) */
 } wraps_job;
 static void *wraps_rows(void *arg) {
     wraps_job *J = arg; const fit_model *m = J->m;
     for (int r; (r = atomic_fetch_add(&J->next, 1)) < J->rows;) {
         const double z = fmin(J->zlo + r * J->step, J->Z), cy = m->cy[(int)fmin(z, J->na - 1)], cx = m->cx[(int)fmin(z, J->na - 1)];
-        double rprev = J->rk; size_t valid = 0; fit_set_row *row = fit_set_row_new(J->fs, z);
+        double rprev = J->rk; size_t valid = 0; fit_set_row *row = fit_set_row_new_lip(J->fs, z, J->lip);
         const double kz = J->k - wr_zgauge(z + m->origin[0]);   /* --zgauge: the level set that stays on the sheets along z */
         for (int c = 0; c < J->cols; c++) {
             const size_t i = (size_t)r * J->cols + (J->cols - 1 - c);   /* column 0 = the largest theta side (upstream: outermost first) */
@@ -2247,6 +2250,8 @@ typedef struct {
     const wr_polar *P; _Atomic int next; _Atomic int nwr; _Atomic size_t nvalid; _Atomic int fail;
     double zlo, zhi, colr;   /* --zr: box-local native z of the first / last row; --col-r: < 0 centre, 0 p90, > 0 that radius */
     const int *ks; int nk; double min_cm2; _Atomic int nsmall;   /* the wrap ids to compute (largest first); --min-cm2; wraps dropped by it */
+    pthread_mutex_t mu; wraps_job *act[64]; int nact;   /* the wraps being computed (par mode): idle workers help with their rows */
+    const fit_lip *lip;
 } wraps_all;
 static int wr_cmp_d(const void *a, const void *b) { const double x = *(const double *)a, y = *(const double *)b; return (x > y) - (x < y); }
 static int wrap_one(wraps_all *A, int k, int nthreads) {   /* wrap k: its rows on nthreads threads, snapped, written */
@@ -2294,8 +2299,16 @@ static int wrap_one(wraps_all *A, int k, int nthreads) {   /* wrap k: its rows o
     }
     const size_t nv = (size_t)rows * cols;
     float *px = malloc(nv * 4), *py = malloc(nv * 4), *pz = malloc(nv * 4);
-    wraps_job J = {A->fs, m, A->wf, {A->wsh[0], A->wsh[1], A->wsh[2]}, A->wh, step, Z, na, A->th0, dth, rows, cols, k, rk, px, py, pz, 0, 0, A->P, A->zlo, thcol};
-    if (nthreads > 1) {
+    wraps_job J = {A->fs, m, A->wf, {A->wsh[0], A->wsh[1], A->wsh[2]}, A->wh, step, Z, na, A->th0, dth, rows, cols, k, rk, px, py, pz, 0, 0, A->P, A->zlo, thcol, 0, A->lip};
+    if (nthreads == 0) {   /* (par mode: this worker's wrap, open to the idle workers' help once the queue is empty: the tail's few large
+                               wraps ran on one thread each, Paris 4 wraps 1551% of 20 threads) */
+        pthread_mutex_lock(&A->mu); A->act[A->nact++] = &J; pthread_mutex_unlock(&A->mu);
+        wraps_rows(&J);   /* (returns once every row is taken) */
+        pthread_mutex_lock(&A->mu);
+        for (int q = 0; q < A->nact; q++) if (A->act[q] == &J) { A->act[q] = A->act[--A->nact]; break; }
+        pthread_mutex_unlock(&A->mu);
+        while (atomic_load(&J.helpers)) sched_yield();   /* (the helpers' last rows; none can join any more) */
+    } else if (nthreads > 1) {
         pthread_t th[64]; const int nt = nthreads < 64 ? nthreads : 64;
         for (int t = 0; t < nt; t++) pthread_create(&th[t], nullptr, wraps_rows, &J);
         for (int t = 0; t < nt; t++) pthread_join(th[t], nullptr);
@@ -2321,7 +2334,15 @@ static int wrap_one(wraps_all *A, int k, int nthreads) {   /* wrap k: its rows o
 }
 static void *wraps_worker(void *arg) {
     wraps_all *A = arg;
-    for (int i; (i = atomic_fetch_add(&A->next, 1)) < A->nk;) if (wrap_one(A, A->ks[i], 1)) atomic_store(&A->fail, 1);
+    for (int i; (i = atomic_fetch_add(&A->next, 1)) < A->nk;) if (wrap_one(A, A->ks[i], 0)) atomic_store(&A->fail, 1);
+    for (;;) {   /* the queue is empty: rows of the wraps still being computed, the one with the most rows left first */
+        pthread_mutex_lock(&A->mu); wraps_job *J = nullptr; int left = 0;
+        for (int q = 0; q < A->nact; q++) { const int l = A->act[q]->rows - atomic_load(&A->act[q]->next); if (l > left) { left = l; J = A->act[q]; } }
+        if (J) atomic_fetch_add(&J->helpers, 1);
+        pthread_mutex_unlock(&A->mu);
+        if (!J) break;
+        wraps_rows(J); atomic_fetch_sub(&J->helpers, 1);
+    }
     return nullptr;
 }
 /* the wrap ids near data: W at the centre of every data-weight cell (wf != 0) in the rows' z range; id k is kept when some cell has
@@ -2467,12 +2488,14 @@ static int cmd_wraps(int argc, char **argv) {
     A.ks = ks; A.nk = nk; A.min_cm2 = atof(opt(argc, argv, "--min-cm2", "0.5"));
     tfx_set_threads(nthreads);   /* (the .sfc encoders: shared out among the wraps being written at that moment) */
     const int par = !(snapz || sfa) && nthreads > 1;
+    pthread_mutex_init(&A.mu, nullptr);
+    fit_lip *lip = ufsm_env_on("UFSM_WRAPS_NOSKIP") ? nullptr : fit_lip_new(fs); A.lip = lip;
     if (par) {
         pthread_t th[64]; const int nt = nthreads < 64 ? nthreads : 64;
         for (int t = 0; t < nt; t++) pthread_create(&th[t], nullptr, wraps_worker, &A);
         for (int t = 0; t < nt; t++) pthread_join(th[t], nullptr);
     } else for (int i = 0; i < nk; i++) if (wrap_one(&A, ks[i], nthreads)) A.fail = 1;
-    free(P.rmin); free(P.rmax); free(ks); free(cnt);
+    free(P.rmin); free(P.rmax); free(ks); free(cnt); fit_lip_free(lip);
     if (A.fail) return 1;
     const int nwr = A.nwr; const size_t nvalid_all = A.nvalid;
     fprintf(stderr, "wraps: %d wraps (%d..%d) with %zu vertices written to %s", nwr, k0, k1, nvalid_all, argv[3]);
