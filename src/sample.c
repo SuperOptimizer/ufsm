@@ -268,13 +268,13 @@ static batch alloc_batch(const sample_cfg *c) {
     b.wcomp = c->wind4 && !c->w4_runs ? halloc((size_t)c->B * p3) : nullptr;
     b.w4r = c->w4_runs ? calloc((size_t)c->B, sizeof(w4runs)) : nullptr;
     b.ink = c->ink_plane && !c->ink_bits ? halloc((size_t)c->B * p3) : nullptr;
-    for (int j = 0; j < 2; j++) b.aux[j] = j < c->aux_n ? halloc((size_t)c->B * p3) : nullptr;
+    for (int j = 0; j < 4; j++) b.aux[j] = j < c->aux_n ? halloc((size_t)c->B * p3) : nullptr;
     b.inkb = c->ink_bits ? halloc((size_t)c->B * p3 / 8) : nullptr; b.ink_it = c->ink_bits ? calloc((size_t)c->B, sizeof *b.ink_it) : nullptr;
     b.emb = c->emb_ch ? halloc((size_t)c->B * c->emb_ch * (size_t)(PZ(c) / c->emb_div) * (c->P / c->emb_div) * (c->P / c->emb_div)) : nullptr;
     return b;
 }
 
-static void free_batch(batch *b, int B) { if (b->w4r) { for (int q = 0; q < B; q++) { w4runs *r = (w4runs *)b->w4r + q; free(r->off); free(r->ro); free(r->cb); } free(b->w4r); } if (b->ink) hfree(b->ink); for (int j = 0; j < 2; j++) if (b->aux[j]) hfree(b->aux[j]); if (b->inkb) hfree(b->inkb); free(b->ink_it); if (b->ct8) hfree(b->ct8); if (b->aug) hfree(b->aug); if (b->emb) hfree(b->emb); if (b->xv) hfree(b->xv); free(b->vok); free(b->chid); free(b->chidx); free(b->choff); if (b->w4) hfree(b->w4); if (b->wcomp) hfree(b->wcomp); if (b->tm) hfree(b->tm); if (b->rad) hfree(b->rad); if (b->axr) hfree(b->axr); if (b->pap) hfree(b->pap); if (b->wind) hfree(b->wind); if (b->band) hfree(b->band); if (b->side) hfree(b->side); if (b->pm) hfree(b->pm); if (b->x) hfree(b->x); if (b->x16) hfree(b->x16); if (b->t) hfree(b->t); if (b->m) hfree(b->m); hfree(b->w); free(b->src); free(b->level); free(b->um); free(b->corner); if (b->sheet) { sheet_batch_free(b->sheet[0]); free(b->sheet); } }
+static void free_batch(batch *b, int B) { if (b->w4r) { for (int q = 0; q < B; q++) { w4runs *r = (w4runs *)b->w4r + q; free(r->off); free(r->ro); free(r->cb); } free(b->w4r); } if (b->ink) hfree(b->ink); for (int j = 0; j < 4; j++) if (b->aux[j]) hfree(b->aux[j]); if (b->inkb) hfree(b->inkb); free(b->ink_it); if (b->ct8) hfree(b->ct8); if (b->aug) hfree(b->aug); if (b->emb) hfree(b->emb); if (b->xv) hfree(b->xv); free(b->vok); free(b->chid); free(b->chidx); free(b->choff); if (b->w4) hfree(b->w4); if (b->wcomp) hfree(b->wcomp); if (b->tm) hfree(b->tm); if (b->rad) hfree(b->rad); if (b->axr) hfree(b->axr); if (b->pap) hfree(b->pap); if (b->wind) hfree(b->wind); if (b->band) hfree(b->band); if (b->side) hfree(b->side); if (b->pm) hfree(b->pm); if (b->x) hfree(b->x); if (b->x16) hfree(b->x16); if (b->t) hfree(b->t); if (b->m) hfree(b->m); hfree(b->w); free(b->src); free(b->level); free(b->um); free(b->corner); if (b->sheet) { sheet_batch_free(b->sheet[0]); free(b->sheet); } }
 
 /* Level choice for a source: restrict cfg.level_p to levels the CT has and every target of the source
    can provide (pyramid: same level; regions: levels 0..1). Returns -1 if nothing is usable. */
@@ -2489,7 +2489,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
         !c->phase_dense && s->phase) {
         const int psh = s->phase_level - l;
         int ok = psh == 1 || (psh == 0 && s->phase_direct);
-        for (int ch = 0; ch < NTG; ch++) ok &= !s->tgt_key[ch] || (c->ink_plane && (ch == CH_SHEET || ch == CH_FIB));   /* (the ink / aux planes: unknown on these windows) */
+        for (int ch = 0; ch < NTG; ch++) ok &= !s->tgt_key[ch] || (c->ink_plane && (ch == CH_SHEET || ch >= CH_FIB));   /* (the ink / aux planes: unknown on these windows) */
         if (ok && c->crush.p > 0 && runif(r) < c->crush.p && (crushed = crush_draw(sp, s, l, o, P, psh, r, big + p3, 8 * p3, ctu)) < 0) return -1;
         if (ok && !crushed && c->tear_p > 0 && runif(r) < c->tear_p && (torn = tear_draw(sp, s, l, o, P, psh, r, ctu)) < 0) return -1;
         if (ok && !crushed && !torn && c->delam_p > 0 && runif(r) < c->delam_p && (delam = delam_draw(sp, s, l, o, P, psh, r, ctu)) < 0) return -1;
@@ -2540,7 +2540,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
     const int ink_it = (inkw || inkbits) && c->rv_iso > 0 && c->gpu_aug && (!c->augment || !scan_aug_enabled(&c->scan) || c->scan.p[SA_SEAM] <= 0 || c->sheet || c->band || c->side)
                        ? (s->iso > 0 ? s->iso : c->rv_iso) : 0;
     for (int j = 0; j < c->aux_n; j++) {   /* the registry's extra planes (source grid, like the ink plane) */
-        const int ch = !c->aux_fib[j] ? CH_SHEET : s->tgt_key[CH_FIB] || !c->fib_sheet ? CH_FIB : CH_SHEET;
+        const int ch = c->aux_ch[j] != CH_FIB ? c->aux_ch[j] : s->tgt_key[CH_FIB] || !c->fib_sheet ? CH_FIB : CH_SHEET;
         if (aux_read(s, ch, l, o, n, b->aux[j] + (size_t)i * p3, p3, crushed || torn || delam || curved)) return -1;
     }
     uint8_t w[NCH] = {0};
@@ -2559,7 +2559,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
                 if (!ink_it) for (size_t k = 0; k < p3; k++) inkw[k] = ctu[k] >= it ? 254 : 0;
                 continue;
             }
-            if (aux_read(s, c->ink_fib && s->tgt_key[CH_FIB] ? CH_FIB : CH_SHEET, l, o, n, inkw, p3, crushed || torn || delam || curved)) return -1;
+            if (aux_read(s, c->ink_ch > 0 ? c->ink_ch : c->ink_fib && s->tgt_key[CH_FIB] ? CH_FIB : CH_SHEET, l, o, n, inkw, p3, crushed || torn || delam || curved)) return -1;
             if (getenv("UFSM_INK_DEBUG")) { size_t kn = 0, ki = 0; for (size_t k = 0; k < p3; k++) { kn += inkw[k] != 255; ki += inkw[k] != 255 && inkw[k] > 127; } fprintf(stderr, "ink window: known %zu ink %zu\n", kn, ki); }
             continue;
         }
@@ -3359,13 +3359,15 @@ static occ_index label_occupancy(source *s) {
                     scan's level-5 CT that hold papyrus (>= the source's iso) and lie in a stored target chunk. Without an index the windows are
                     drawn uniformly over the whole scan and most fail the CT probe: 5 of 60 windows came from the 1447 / 0175A fibre sources at
                     25 % of the weight */
-        for (int ch = 0; ch < NCH && !o.n; ch++) {
-            const int l0 = s->min_level > 0 ? s->min_level : 0, lc = l0 + 5;
-            z3 *t0 = s->tgt_key[ch] && !s->band ? source_tgt(s, ch, l0) : nullptr, *cc = t0 && lc < MAXLEV ? source_ct(s, lc) : nullptr;
+        for (int ch = 0; ch < NTG && !o.n; ch++) {   /* (any target slot: the unwrap2 fibre head's fibre_h / fibre_v too) */
+            const int l0 = s->min_level > 0 ? s->min_level : 0;
+            z3 *t0 = s->tgt_key[ch] && !s->band ? source_tgt(s, ch, l0) : nullptr, *cc = nullptr; int lc = l0 + 5;
+            for (; t0 && lc >= l0 + 3 && !cc; lc--) cc = lc < MAXLEV ? source_ct(s, lc) : nullptr;   /* (level l0 + 5, else the coarsest of l0 + 3 .. 4: small scans, the test fixture) */
+            if (cc) lc++;
             if (!t0 || !cc) continue;
             const z3_meta *m0 = z3_meta_of(t0), *mc = z3_meta_of(cc); const int cs = m0->chunk[0];
-            if (cs < 32 || (cs & (cs - 1)) || m0->chunk[1] != cs || m0->chunk[2] != cs) continue;
-            const int sh = __builtin_ctz((unsigned)cs) - 5;   /* level-5 cells per target chunk edge: 2^sh */
+            if (cs < (1 << (lc - l0)) || (cs & (cs - 1)) || m0->chunk[1] != cs || m0->chunk[2] != cs) continue;
+            const int sh = __builtin_ctz((unsigned)cs) - (lc - l0);   /* level-lc cells per target chunk edge: 2^sh */
             int64_t g[3]; uint8_t *bits = nullptr; if (z3_chunk_map(t0, g, &bits) <= 0) { free(bits); continue; }
             const size_t pl = (size_t)mc->shape[1] * mc->shape[2], tot = pl * (size_t)mc->shape[0];
             uint8_t *cb = tot < 4.29e9 ? malloc(tot) : nullptr; const int64_t zo[3] = {0, 0, 0}, zn[3] = {mc->shape[0], mc->shape[1], mc->shape[2]};
@@ -3514,7 +3516,7 @@ int sources_prefetch(sources *S, int maxlev, int nthreads, double fraction, int 
    region arrays at level 0 and "emb" heads on their own pooled grid are not upsampled labels.) */
 /* the labels of source s are stored coarser than level l (verbose: say which); --um-rungs skips such levels, --levels refuses them */
 static int labels_coarse(sampler *sp, source *s, int l, int region_ch, int verbose) {
-    const sample_cfg *c = &sp->cfg; static const char *chn[NTG] = {"recto", "sheet", "fibre"};
+    const sample_cfg *c = &sp->cfg; static const char *chn[NTG] = {"recto", "sheet", "fibre", "fibre_h", "fibre_v"};
     const double um = s->um * ldexp(1.0, l);
     for (int ch = 0; ch < NTG; ch++) {
         int st = l;
@@ -3579,8 +3581,8 @@ static void replay_window(sampler *sp, batch *b, int i, int rep, uint8_t **scr) 
         if (!warped0 && !sym_identity(y0)) {   /* back to the source grid */
             if (!*scr && !(*scr = malloc(p3))) abort();
             const sym yi = sym_inverse(y0);
-            uint8_t *pl[7] = {c->w4_runs ? nullptr : b->side, b->w4, b->wcomp, b->ink, b->tm, b->aux[0], b->aux[1]};   /* (w4_runs: the side plane is on the source grid already) */
-            for (int q = 0; q < 7; q++) if (pl[q]) { uint8_t *v = pl[q] + (size_t)i * p3; memcpy(*scr, v, p3); sym_u8(*scr, v, Pz, P, yi); }
+            uint8_t *pl[9] = {c->w4_runs ? nullptr : b->side, b->w4, b->wcomp, b->ink, b->tm, b->aux[0], b->aux[1], b->aux[2], b->aux[3]};   /* (w4_runs: the side plane is on the source grid already) */
+            for (int q = 0; q < 9; q++) if (pl[q]) { uint8_t *v = pl[q] + (size_t)i * p3; memcpy(*scr, v, p3); sym_u8(*scr, v, Pz, P, yi); }
         }
         y = sym_of((int)rint_below(&r, 48));
         if (c->augment == 4) y = sym_of(0);
@@ -3833,7 +3835,7 @@ int sampler_batch_hash(const sampler *sp, const batch *b, const char **names, ui
         free(g);
     }
     const struct { const char *n; const void *p; size_t z; } f[] = {{"ct8", b->ct8, B * p3}, {"aug", b->aug, B * sizeof(scan_ct_rec)}, {"rad", b->rad, B * NN_RAD_REC(PZ(&sp->cfg))},
-        {"side", sdr ? sdr : b->side, B * p3}, {"w4", w4r ? w4r : b->w4, B * p3}, {"wcomp", wcr ? wcr : b->wcomp, B * p3}, {"ink", inkr ? inkr : b->ink, B * p3}, {"tm", b->tm, B * p3}, {"pm", b->pm, B * p3}, {"inkb", b->inkb, B * p3 / 8}, {"aux0", b->aux[0], B * p3}, {"aux1", b->aux[1], B * p3},
+        {"side", sdr ? sdr : b->side, B * p3}, {"w4", w4r ? w4r : b->w4, B * p3}, {"wcomp", wcr ? wcr : b->wcomp, B * p3}, {"ink", inkr ? inkr : b->ink, B * p3}, {"tm", b->tm, B * p3}, {"pm", b->pm, B * p3}, {"inkb", b->inkb, B * p3 / 8}, {"aux0", b->aux[0], B * p3}, {"aux1", b->aux[1], B * p3}, {"aux2", b->aux[2], B * p3}, {"aux3", b->aux[3], B * p3},
         {"x16", b->x16, B * (size_t)b->xch * p3 * 2}, {"um", b->um, B * sizeof(float)}, {"src", b->src, B * sizeof(int16_t)}, {"w", b->w, B * NCH}};
     int n = 0;
     for (size_t q = 0; q < sizeof f / sizeof f[0] && n < max; q++) if (f[q].p) {
