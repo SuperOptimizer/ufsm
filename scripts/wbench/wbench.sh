@@ -102,6 +102,7 @@ pbatch() {   # PBATCH=1 (default): the fields of every box still to run, one pre
              # paid once per scroll, not per box; the same bytes as a process per box); per box its seconds in $O/BOX/pred.s
   local B; for B in $BL; do [ -e $FD/$B/fields.json ] || rm -f $O/$B/pred.s; done   # (a pred.s is this run's only, or that of the PHASE=predict run whose fields these are)
   [ -n "$FIELDS" ] || [ "${PBATCH:-1}" != 1 ] && return 0
+  [ -n "${STOPAT:-}" ] && [ $(date +%s) -ge $STOPAT ] && return 0   # (the window is over: nothing new on the GPU)
   local s nm z y x nz ny nx lv_ note n bf lg lx
   for s in $(for B in $BL; do awk -F'\t' -v b=$B '$1 == b {print $2}' $BT; done | sort -u); do
     sc=$s; scroll $sc || continue
