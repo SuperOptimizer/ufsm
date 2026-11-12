@@ -43,9 +43,9 @@ grep -q 'too-coarse excluded' a.log || fail "no exclusion logged ($D/a.log)"
 if "$U" train two.json --out b --levels 1 --strict-sources 1 "${C[@]}" > b.log 2>&1; then fail "--strict-sources 1 did not stop ($D/b.log)"; fi
 grep -q 'too-coarse excluded.*fatal' b.log || fail "no fatal line ($D/b.log)"
 [ -d fx/phase/1 ] || fail "the fixture has no fx/phase/1"
-"$U" train rel.json --out c --strict-sources 1 --levels 0,1 "${C[@]}" > c.log 2>&1 || fail "relative-scale group ($D/c.log)"
+"$U" train rel.json --out c --det 1 --strict-sources 1 --levels 0,1 "${C[@]}" > c.log 2>&1 || fail "relative-scale group ($D/c.log)"
 grep -q '^step      2' c.log || fail "relative-scale group: no step 2 ($D/c.log)"
-"$U" train abs.json --out d --strict-sources 1 --levels 0,1 "${C[@]}" > d.log 2>&1 || fail "absolute-um group ($D/d.log)"
+"$U" train abs.json --out d --det 1 --strict-sources 1 --levels 0,1 "${C[@]}" > d.log 2>&1 || fail "absolute-um group ($D/d.log)"
 lc=$(grep '^step      1' c.log | grep -o 'loss [0-9.]*'); ld=$(grep '^step      1' d.log | grep -o 'loss [0-9.]*')
 [ -n "$lc" ] && [ "$lc" = "$ld" ] || fail "relative vs absolute group: step-1 $lc vs $ld"
 echo "relative-scale group (2 4 8 16, no level 0): level-1 step-1 $lc == the absolute-um group's"
