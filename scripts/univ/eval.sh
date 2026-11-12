@@ -20,10 +20,11 @@ H=$(cd "$(dirname "$0")/../.." && pwd); U=${U:-$H/build/ufsm}; WB=${WB:-/vesuviu
 M=https://dl.ash2txt.org/community-uploads/forrest/volcomp; P4K=PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr
 GPU=${GPU:-1}; THREADS=${THREADS:-8}; REFS=${REFS:-wind96 lat-wz896-12000}; DLVS=${DLVS:--1 1}; RVSC=${RVSC:-p1667 p139 p4}
 FIBCH=${FIBCH:-}; INKP=${INKP:-}; LKF=${LKF:-}; mkdir -p $E/$T
+MC=""; [ -x ~/bin/memcap ] && MC="$HOME/bin/memcap -m 40G"   # (pods have no memcap: the pod cgroup caps them)
 lk() { if [ -n "$LKF" ]; then flock $LKF "$@"; else "$@"; fi; }   # LKF=/tmp/gpu1-bench.lock: serialise with timing benches
 log() { echo "$(date '+%m-%d %H:%M:%S') $*" | tee -a $E/$T.log; }
 wb() {   # wb TAG [env...]: one wbench run (memcap, GPU lock)
-  local t=$1; shift; lk env SITE=$SITE WB=$WB GPU=$GPU SLABS=0 THREADS=$THREADS "$@" ~/bin/memcap -m 40G bash $H/scripts/wbench/wbench.sh $CK $t >> $E/$T/wbench_$t.out 2>&1; }
+  local t=$1; shift; lk env SITE=$SITE WB=$WB GPU=$GPU SLABS=0 THREADS=$THREADS "$@" $MC bash $H/scripts/wbench/wbench.sh $CK $t >> $E/$T/wbench_$t.out 2>&1; }
 has() { [[ " $TASKS " == *" $1 "* ]]; }
 log "univ eval $T ckpt $CK tasks [$TASKS]"
 
@@ -39,6 +40,13 @@ if has rv && [ "${RV:-1}" = 1 ]; then
     if [ -n "${WZARGS+x}" ] && [ -z "$WZARGS" ]; then E=$RVE GPU=$GPU U=${RVU:-/vesuvius/ufsm/v2/rv/bin/ufsm.ev} WZ= WINDOW=${WIN:-640} bash $H/scripts/rv/eval.sh $CK $T "$RVSC" >> $E/$T/rv.out 2>&1
     else E=$RVE GPU=$GPU U=${RVU:-/vesuvius/ufsm/v2/rv/bin/ufsm.ev} bash $H/scripts/rv/eval.sh $CK $T "$RVSC" >> $E/$T/rv.out 2>&1; fi; fi
 fi
+# latent-grid checkpoints (header "lat_step"): plain predict --channel N / ink skips the fine stem and the ch 0-1 sub-cell shuffle (univI, 2026-11-11),
+# so their ink / fibre heads are not scored via --channel until that fix is merged (LATCH=1 overrides). wind (fit fields) and rv (--channel rv) are fine.
+LATCK=0; head -c 4096 $CK | grep -aq '"lat_step"' && LATCK=1
+if [ $LATCK = 1 ] && [ "${LATCH:-0}" != 1 ]; then
+  has fib && { log "fib: skipped, latent checkpoint (plain --channel path not trained-equivalent until univI's fix; LATCH=1 overrides)"; FIB=0; }
+  case "$INKP" in ch:*) log "ink: skipped, latent checkpoint ($INKP via plain --channel; LATCH=1 overrides)"; INK=0;; esac
+fi
 if has fib && [ "${FIB:-1}" = 1 ] && [ -n "$FIBCH" ]; then   # FIBCH e.g. "H=0 V=1 dyad=2-7" (channel indices of CKPT)
   o=$E/$T/fib; mkdir -p $o; BOX=12288,4096,3584,512,576,768; J="--um 2.4 --level 2 --slab 12288,512 --region 4096,4608,3584,4352 --tile 256 --d-mm 0.3,0.6,1.2,2.4"
   for kv in $FIBCH; do n=${kv%%=*}; cs=${kv#*=}; a=${cs%-*}; b=${cs#*-}
@@ -51,13 +59,22 @@ if has fib && [ "${FIB:-1}" = 1 ] && [ -n "$FIBCH" ]; then   # FIBCH e.g. "H=0 V
   done; done
 fi
 if has ink && [ "${INK:-1}" = 1 ] && [ -n "$INKP" ]; then   # INKP = ink3dext | ch:N (channel N of CKPT, ink at 2.4 um level LV_INK (default 1 = 4.8 um))
-  o=$E/$T/ink; C=$WB/inkeval/crops; mkdir -p $o; [ -s $o/scores.tsv ] || : > $o/scores.tsv
-  grep -v '^#' $C/crops.tsv | while IFS=$'\t' read -r cr seg ns fi box; do
+  # crop sets: the 16 Paris 4 crops ($WB/inkeval/crops) + INKC (inkB's held-out 0139 / 1667 crops; crops.tsv cols 6-7 = scroll, CT key; um in crop.json).
+  # INKGT: 3-D ink-splat references <crop>.zarr (inkB, ink-splat --face): each crop is also scored voxelwise (ink-vscore -> vscores.tsv).
+  o=$E/$T/ink; mkdir -p $o; [ -s $o/scores.tsv ] || : > $o/scores.tsv; [ -s $o/vscores.tsv ] || : > $o/vscores.tsv
+  for C in $WB/inkeval/crops ${INKC:-}; do [ -s $C/crops.tsv ] || continue
+  grep -v '^#' $C/crops.tsv | while IFS=$'\t' read -r cr seg ns fi box scr ctk; do
+    ctk=${ctk:-$P4K}; um=$(python3 -I -c "import json; print(json.load(open('$C/$cr/crop.json')).get('um', 2.4))")
+    g=${INKGT:-/nonexistent}/$cr.zarr; vs=0; [ -d $g ] && ! grep -qP "^$cr\t" $o/vscores.tsv && vs=1
+    grep -qP "^$cr\t" $o/scores.tsv && [ $vs = 0 ] && continue
+    v=$o/vol_${scr:-PHercParis4}
+    if [ "$INKP" = ink3dext ]; then lvi=1; key=$(python3 -I -c "print(round($um * 2, 3))")
+      lk $U ink3d-ext --model dino3d --weights ${INKW:-/vesuvius/ufsm/teachers/dino3d/ckpt_78k_fullsup.pth} --ct $M $ctk/0 --ct-um $um --box $box --surface $C/$cr --out $v --out-um 4.8 --gpu $GPU --cache $WB/cache > $o/ink_$cr.log 2>&1 || { log "ink: $cr predict failed"; continue; }
+    else lvi=${LV_INK:-1}; ch=${INKP#ch:}; key=$(python3 -I -c "print(round($um * 2 ** $lvi, 3))")
+      lk ${UP:-$U} predict $CK $M $ctk $v --um $um --level $lvi --box $box --channel $ch --gpu $GPU --threads 6 --cache $WB/cache > $o/ink_$cr.log 2>&1 || { log "ink: $cr predict failed"; continue; }; fi
+    if [ $vs = 1 ]; then gk=$(ls $g | grep -vE '^(segments|zarr.json)$' | head -1)
+      $U ink-vscore --gt $g $gk --pred $v $key --box $box --level $lvi --row $cr --threads 8 2>> $o/vscore_$cr.log | grep -P "^$cr\t" >> $o/vscores.tsv; fi
     grep -qP "^$cr\t" $o/scores.tsv && continue
-    v=$o/vol; lvi=1
-    if [ "$INKP" = ink3dext ]; then lk $U ink3d-ext --weights ${INKW:-/vesuvius/ufsm/teachers/dino3d/ckpt_78k_fullsup.pth} --ct $M $P4K --box $box --out $v --out-um 4.8 --gpu $GPU --cache $WB/cache > $o/ink_$cr.log 2>&1 || { log "ink: $cr predict failed"; continue; }; key=4.8
-    else lvi=${LV_INK:-1}; ch=${INKP#ch:}; key=$(python3 -I -c "print(round(2.4 * 2 ** $lvi, 3))")
-      lk ${UP:-$U} predict $CK $M $P4K $v --um 2.4 --level $lvi --box $box --channel $ch --gpu $GPU --threads 6 --cache $WB/cache > $o/ink_$cr.log 2>&1 || { log "ink: $cr predict failed"; continue; }; fi
     s=$o/surf/$cr; mkdir -p $s/w; python3 -I - $C/$cr $s/w/$cr $lvi <<'PY'   # the crop surface in the ink volume's voxels (render samples volume voxels)
 import sys, os, shutil, numpy as np, tifffile
 src, dst, lv = sys.argv[1], sys.argv[2], int(sys.argv[3]); os.makedirs(dst, exist_ok=True); f = 2.0 ** lv
@@ -68,7 +85,7 @@ PY
     nice -n 5 $U render $s/w $s/r --volume $v $key --depth 4 --threads 8 --cache $WB/cache > $o/render_$cr.log 2>&1 || { log "ink: $cr render failed"; continue; }
     mp=$(ls $s/r/*.tif 2>/dev/null | grep -v _fill | head -1); [ -n "$mp" ] || { log "ink: $cr no render"; continue; }
     $U ink-score --surface $C/$cr --labels $C/$cr/labels.tif --mask $C/$cr/mask.tif --map ink=$mp --row $cr 2>> $o/score_$cr.log | grep -P "^$cr\t" >> $o/scores.tsv
-  done
+  done; done
 fi
 
 # ---- matrix ----
@@ -81,5 +98,6 @@ fi
   ls $E/$T/fib/*.judge > /dev/null 2>&1 && { echo "-- fib (HOLD; fibhv-c hold-12000: H tube median 0.57 mm, pairs .96)"; for j in $E/$T/fib/*.judge; do echo "$(basename $j .judge): $(tr '\n' ' ' < $j | cut -c1-260)"; done; }
   [ -s $E/$T/ink/scores.tsv ] && { echo "-- ink (ink-score vs human labels: crop map n inkfrac f1best thr f1_05 prec05 rec05 auc)"; cat $E/$T/ink/scores.tsv
     awk -F'\t' '{n++; f+=$5; a+=$10} END {if (n) printf "mean over %d crops: f1best %.4f auc %.4f\n", n, f / n, a / n}' $E/$T/ink/scores.tsv; }
+    [ -s $E/$T/ink/vscores.tsv ] && echo "-- ink voxelwise (ink-vscore vs 3-D ink-splat refs: crop P N known_frac ink_share auc thr f1best f1_05 prec05 rec05)" && cat $E/$T/ink/vscores.tsv && awk -F"\t" "{n++; a+=\$7; f+=\$9} END {if (n) printf \"voxelwise vs 3-D refs over %d crops: auc %.4f f1best %.4f\\n\", n, a / n, f / n}" $E/$T/ink/vscores.tsv;
 } > $E/$T.matrix.txt
 log "matrix -> $E/$T.matrix.txt"

@@ -317,6 +317,37 @@ static void fr_ctx_unref(fr_ctx *X) {
     fib_free(&X->F); fib_free(&X->XF); free(X->J.fbb); free(X->J.xbb); if (X->J.ct) z3_close(X->J.ct); free(X);   /* (ct: the context's own handle; each plane's base is closed with it) */
 }
 static void fr_plane_free(void *vp) { fr_plane *P = vp; fr_ctx *X = P->X; free(P); fr_ctx_unref(X); }
+/* the planes' known extent (z3_derived_extent, the sampler's draw cells): every chunk within the reach of a traced fibre's block bounds
+   (the AFV's rtree through the map / transform; UFIB: each run's bounds). Air negatives far from any tracing are not counted: windows
+   are drawn where fibres are */
+static void fr_mark(const double lo[3], const double hi[3], double R, const int64_t grid[3], const int chunk[3], uint8_t *bits) {
+    int64_t a[3], b[3];
+    for (int d = 0; d < 3; d++) { a[d] = (int64_t)floor((lo[d] - R) / chunk[d]); b[d] = (int64_t)floor((hi[d] + R) / chunk[d]);
+        if (a[d] < 0) a[d] = 0;
+        if (b[d] > grid[d] - 1) b[d] = grid[d] - 1;
+        if (b[d] < a[d]) return; }
+    for (int64_t z = a[0]; z <= b[0]; z++) for (int64_t y = a[1]; y <= b[1]; y++) for (int64_t x = a[2]; x <= b[2]; x++) bits[(z * grid[1] + y) * grid[2] + x] = 1;
+}
+static int fr_extent(void *vp, const int64_t grid[3], const int chunk[3], uint8_t *bits) {
+    fr_ctx *X = vp; fr_job *J = &X->J; const double R = J->rad + J->guard + J->ring + 1;
+    if (!J->A) {   /* UFIB: per segment (a run's bounds over-mark long diagonal runs: PHerc0139's human lines 35% -> below) */
+        for (int r = 0; r < J->F->n; r++) for (int i = J->F->off[r]; i < J->F->off[r + 1]; i++) { const int j = i + 1 < J->F->off[r + 1] ? i + 1 : i; double lo[3], hi[3];
+            for (int k = 0; k < 3; k++) { const double a = (J->F->pts[3 * (size_t)i + k] + 0.5) / J->sc - 0.5, b = (J->F->pts[3 * (size_t)j + k] + 0.5) / J->sc - 0.5; lo[k] = a < b ? a : b; hi[k] = a < b ? b : a; }
+            fr_mark(lo, hi, R, grid, chunk, bits); }
+        return 0;
+    }
+    double (*B)[6] = nullptr; pthread_mutex_lock(&J->mu); const int nb = afv_bounds(J->A, &B); pthread_mutex_unlock(&J->mu);
+    if (nb < 0) return -1;
+    for (int i = 0; i < nb; i++) {
+        double lo[3] = {1e30, 1e30, 1e30}, hi[3] = {-1e30, -1e30, -1e30};
+        for (int c8 = 0; c8 < 8; c8++) { double g[3] = {B[i][c8 & 1 ? 1 : 0], B[i][c8 & 2 ? 3 : 2], B[i][c8 & 4 ? 5 : 4]};   /* (x, y, z) */
+            if (J->map) { const double c[3] = {g[0], g[1], g[2]}; rmap_c2f(J->map, c, g); }
+            else if (J->has_tr) { const double u[3] = {g[0] - J->M[0][3], g[1] - J->M[1][3], g[2] - J->M[2][3]}; for (int k = 0; k < 3; k++) g[k] = J->Mi[k][0] * u[0] + J->Mi[k][1] * u[1] + J->Mi[k][2] * u[2]; }
+            for (int k = 0; k < 3; k++) { const double p = (g[2 - k] + 0.5) / J->sc - 0.5; if (p < lo[k]) lo[k] = p; if (p > hi[k]) hi[k] = p; } }
+        fr_mark(lo, hi, R, grid, chunk, bits);
+    }
+    free(B); return 0;
+}
 /* the fibre options of a sources "onfly" object: afv (an AFV or a UFIB file), extra ("a.afv,b.afv@map"), map / tr, radius (2), guard (3),
    ring (0), iso (64; < 0: no air test), level (the CT level; its voxel size is the planes' grid). ct: three handles on that CT level, all
    taken over (closed on failure too): ct0 / ct1 the planes' bases (shape, chunk map), ct2 the air test's reads.
@@ -359,6 +390,7 @@ int fiber_onfly_open(const char *afvp, const char *extra, const char *mapp, cons
     for (int k = 0; k < 2; k++) {
         fr_plane *P = malloc(sizeof *P); P->X = X; P->plane = k; X->refs++;
         out[k] = z3_open_derived(k ? ct1 : ct0, 255, fr_onfly_read, P, fr_plane_free);
+        if (out[k] && getenv("UFSM_FIBRE_EXTENT") && !atoi(getenv("UFSM_FIBRE_EXTENT"))) {} else if (out[k]) z3_derived_extent(out[k], fr_extent, X);   /* (UFSM_FIBRE_EXTENT=0: the CT's chunks) */
         if (!out[k]) { fr_plane_free(P); if (k) { z3_close(out[0]); out[0] = nullptr; } else z3_close(ct1); return -1; }
     }
     return 0;
@@ -381,6 +413,8 @@ int cmd_fiber_onfly(int argc, char **argv) {
     if (fiber_onfly_open(argv[2], FO("--extra", ""), FO("--map", nullptr), FO("--tr", nullptr), atof(FO("--radius", "2")), atof(FO("--guard", "3")), atof(FO("--ring", "0")), atoi(FO("--iso", "64")), level,
                          c0, z3_open(cs, argv[ci + 2], nullptr), z3_open(cs, argv[ci + 2], nullptr), pl)) return 1;
     printf("fiber-onfly: opened in %.0f ms (shape %lld %lld %lld)\n", (fr_now() - t0) * 1e3, (long long)shp[0], (long long)shp[1], (long long)shp[2]);
+    { const double t1 = fr_now(); int64_t g[3]; uint8_t *bits = nullptr; const int64_t nk = z3_chunk_map(pl[0], g, &bits); free(bits);
+      printf("fiber-onfly: the extent: %lld of %lld chunks (%.1f%%) within the reach of a traced fibre, %.0f ms\n", (long long)nk, (long long)(g[0] * g[1] * g[2]), 100.0 * nk / (g[0] * g[1] * g[2]), (fr_now() - t1) * 1e3); }
     z3 *ref[2] = {nullptr, nullptr};
     if (ri) for (int k = 0; k < 2; k++) { store *rs = store_open(argv[ri + 1 + k]); ref[k] = rs ? z3_open(rs, argv[ri + 3], nullptr) : nullptr; if (!ref[k]) { fprintf(stderr, "fiber-onfly: cannot open %s %s\n", argv[ri + 1 + k], argv[ri + 3]); return 1; } }
     long long zb[2] = {0, shp[0]}; if (*FO("--zband", "")) sscanf(FO("--zband", ""), "%lld,%lld", &zb[0], &zb[1]);

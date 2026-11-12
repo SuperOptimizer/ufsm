@@ -396,6 +396,20 @@ void nn_gram16(const void *x, int bf16, int K, size_t N, size_t ld, double *S);
    parameter gradients from fp16 gradient planes of that layout into gp. 1: a shape the kernels do not take (odd sizes, C or nout > 16) */
 int nn_fstem_fwd(const void *x, int D, int H, int W, int z0, int nz, const float *p, int C, int nout, const int *chs, void *lg, size_t ns);
 int nn_fstem_bwd(const void *x, int D, int H, int W, int z0, int nz, const float *p, int C, int nout, const int *chs, const void *g, size_t ns, float *gp);
+/* a latent-grid net's head straight from the cell logits lg [cout][d][h][w] into a device shard (src/nn_lathead.cu, predict --heads): the
+   window interior ([hz, 4d - hz) x [halo, 4w - halo)^2) inside the shard [0, e) at offset o; channel c0 (a probability) or the recto / verso
+   pair c0, c1 (nn_rv_fuse); sb0 / sb1 the sub-cell outputs' base of each (lat_guide 64: 16 + 64 j for the phase pair, else -1), s0 / s1 the
+   fine stem's output row of each (-1 none; stem null: no stem); ct the window's CT bytes (mask CT >= iso, stem taps) */
+void nn_lat_head_place(const void *lg, int lh16, int d, int h, int w, int c0, int c1, int sb0, int sb1, int s0, int s1,
+                       const float *stem, int C, int nout, const uint8_t *ct, float mean, float isd, int iso,
+                       int hz, int halo, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh);
+/* nh (<= 24) heads at once, head j (c0[j], c1[j], sb0[j], sb1[j], s0[j], s1[j]) into its shard dsh[j]: the stem's features computed once a cell;
+   byte-identical to one nn_lat_head_place per head */
+void nn_lat_heads_place(const void *lg, int lh16, int d, int h, int w, int nh, const int *c0, const int *c1, const int *sb0, const int *sb1, const int *s0, const int *s1,
+                        uint8_t *const *dsh, const float *stem, int C, int nout, const uint8_t *ct, float mean, float isd, int iso,
+                        int hz, int halo, int oz, int oy, int ox, int ez, int ey, int ex, int shard);
+/* one 2x mean pooling step of an n^3 uint8 volume into (n / 2)^3: (sum + 4) >> 3, as the CPU pyramid (ingest.c pool2_mean) */
+void nn_pool2_u8(const uint8_t *in, int n, uint8_t *out);
 void nn_scale(float *y, float a, size_t n);
 void nn_u8_to_f32(const uint8_t *x, size_t n, float scale, float *y);
 

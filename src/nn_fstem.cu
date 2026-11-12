@@ -59,7 +59,8 @@ __global__ void __launch_bounds__(FS_BT) fstem_fwd_k(const f16 *__restrict__ x, 
     __syncthreads();
     const float *b1 = sp, *W2 = sp + C;
     const size_t hw = (size_t)H * W;
-    for (int j0 = wp * 8; j0 < t.nj; j0 += FS_BT) {   /* (FS_BT / 32 warps x 8 blocks: one n-tile per warp and pass) */
+    for (int j0 = wp * 8; j0 < t.nj; j0 += FS_BT / 32 * 8) {   /* (FS_BT / 32 warps x 8 blocks: one n-tile per warp and pass; the step was FS_BT, which left blocks 32 .. 127 of
+                                                                   every row tile without the stem, x mod 256 >= 64: fixed 2026-11-11, test_lathead at W 160) */
         float c4[4] = {0.f, 0.f, 0.f, 0.f};
         const int jb = j0 + g < t.nj ? j0 + g : t.nj - 1;   /* (a tail tile repeats its last block: computed, not written) */
         for (int s_ = 0; s_ < 4; s_++) {

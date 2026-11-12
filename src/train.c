@@ -96,7 +96,7 @@ typedef struct {
     uint8_t *w4b[2], *wcb[2], *w4, *wc; double *w4ds; float *w4fin, w4h[8]; double w4_loss;   /* --task unwrap2: winding mod 4 and its component per voxel (double-buffered), loss sums, scratch, host parts */
     double *fibacc; void *fiblist; unsigned *fibnl; size_t fibcap; double fib_h[2];   /* --fib-normal-lambda: valid voxels / sum t^T N t (device), the slab list, the fetched sums */
     uint8_t *auxb[AUX_N][2], *aux[AUX_N], *inkt, *inkm, *inkw;   /* the aux planes (double-buffered; plane j = role g_aux_role[j]); --ink-head: its slab target / mask, weight byte (loss parts: iscratch / iout / ink_loss) */
-    uint8_t *rvt, *rvm; float *rvscratch, rvout[5]; double rv_loss;
+    uint8_t *rvt, *rvm; float *rvscratch, rvout[5]; double rv_loss; float rv_own;   /* rv_own: this GPU's window's rv bce (--mix-every) */
     uint8_t *fht, *fhm, *fdt, *fdm, *fhw; float *fhs[2], *fds, fhout[2][5], fdout[21]; double fib_loss, fib_raw[2];   /* --fib-head: the slab's H / V targets and masks, direction targets / mask, weight byte; loss scratch; fetched parts; loss at lambda, raw mask / direction bce */
     double *gcS; int gc_on, fs_drop; uint64_t lat_js; unsigned sr_ctr;   /* lat_js: --lat-step-jitter's generator; sr_ctr: the SR counter between the forward and backward phases */   /* fs_drop: this training step runs without the fine stem (--fstem-drop) */   /* --grad-cos: the step's logit-gradient Gram (device, K x K upper triangle), whether this step collects it */   /* --rv: the slab's recto / verso targets and mask; --rv 2 (own channels): its loss scratch and parts */
     uint8_t *wdb[2], *wd, *ct4, *cm4, *cw4; float *cscratch, cout4[9]; double cond_loss;   /* --cond: the gauge-shifted winding per voxel, its 4 targets, mask, weights; scratch and parts */
@@ -1734,7 +1734,7 @@ static double fetch_loss(gpu_state *d, int B, int P, float dice_w, float *out) {
         d->fib_loss = g_fibh_lambda * (d->fib_raw[0] + d->fib_raw[1]);
     }
     d->rv_loss = 0;
-    if (g_rv == 2) { nn_loss_fetch(d->rvscratch, (shape5){1, 2, 1, 1, 1}, d->rvout); d->rvout[0] = 0.5f * (d->rvout[0] + d->rvout[1]); d->rv_loss = g_rv_lambda * d->rvout[0]; }   /* --rv 2: mean bce of the pair */
+    if (g_rv == 2) { nn_loss_fetch(d->rvscratch, (shape5){1, 2, 1, 1, 1}, d->rvout); d->rvout[0] = 0.5f * (d->rvout[0] + d->rvout[1]); d->rv_own = d->rvout[0]; d->rv_loss = g_rv_lambda * d->rvout[0]; }   /* --rv 2: mean bce of the pair */
     d->verso_loss = 0;
     if (g_verso_on) {   /* the recto loss ran as a single-channel call: lay its parts out as the NCH-channel fetch does */
         float r[3]; nn_loss_fetch(d->scratch, (shape5){1, 1, 1, 1, 1}, r);
@@ -2413,6 +2413,12 @@ int cmd_train(int argc, char **argv) {
     sc.wind4 = g_unwrap2; sc.wind4_step = atoi(opt(argc, argv, "--wind4-step", "80")); sc.wind4_min = atoi(opt(argc, argv, "--wind4-min", "512"));   /* unwrap2: band_wind4's join limit (phase codes) and smallest component */
     sc.emb_ch = g_distill; sc.emb_div = g_distill_div; sc.emb_pap = g_distill_pap;   /* --distill: the feature targets per head cell */
     { const int t = atoi(opt(argc, argv, "--wind4-tile", "64")); sc.wind4_tile = t > 0 ? t : -1; }   /* unwrap2: one gauge per tile of T voxels (>= P / 6), 0 = per window */
+    {   /* --holdout-mode mask (default): a training window over a held-out box keeps its surroundings, every label unknown in the box +
+           --holdout-guard voxels of its level (16); reject: redrawn (before 2026-11-11: coarse windows and wbench-dense scrolls almost never drew) */
+        const char *hm = opt(argc, argv, "--holdout-mode", "mask");
+        if (strcmp(hm, "mask") && strcmp(hm, "reject")) { fprintf(stderr, "train: --holdout-mode is mask or reject\n"); return 1; }
+        sc.holdout_reject = !strcmp(hm, "reject"); sc.holdout_guard = atoi(opt(argc, argv, "--holdout-guard", "16"));
+    }
     sc.min_phase = atof(opt(argc, argv, "--min-phase", g_unwrap2 ? "0.001" : "0"));   /* side 2: windows with less known phase than this fraction are redrawn (unwrap2: 0.1%: band / phase-only sources draw anywhere) */
     if (!(sc.min_phase >= 0 && sc.min_phase < 1) || (sc.min_phase > 0 && g_side != 2)) { fprintf(stderr, "--min-phase: 0 .. 1, with the phase head (task unwrap / unwrap2)\n"); return 2; }
     if (g_unwrap2 && (sc.wind4_step < 1 || sc.wind4_step > 125 || sc.wind4_min < 1)) { fprintf(stderr, "--wind4-step 1..125 (phase codes, 252 per turn), --wind4-min >= 1\n"); return 2; }
@@ -2659,7 +2665,7 @@ int cmd_train(int argc, char **argv) {
             const int nb = atoi(so); const double t0 = now(); double tf = 0;
             /* per source: windows, and per window the shares of material (CT > 0), known phase and known winding mod 4 (w4 per voxel only
                without --w4 runs: UFSM_W4_RUNS=0) over the window's voxels (source grid) */
-            double (*cov)[5] = calloc((size_t)S->n, sizeof *cov);
+            double (*cov)[5] = calloc((size_t)S->n, sizeof *cov); int (*lvc)[MAXLEV] = calloc((size_t)S->n, sizeof *lvc); double (*lvm)[MAXLEV][2] = calloc((size_t)S->n, sizeof *lvm);
             for (int i = 0; i < nb; i++) {
                 batch *b = sampler_next(sq); if (!b) { fprintf(stderr, "sampler stopped after %d batches\n", i); break; }
                 if (i == 0) tf = now() - t0;
@@ -2668,6 +2674,7 @@ int cmd_train(int argc, char **argv) {
                     const size_t nv = (size_t)g_Pz * P * P; size_t mat = 0, ph = 0, w4 = 0, phm = 0;
                     const uint8_t *ct = b->ct8 ? b->ct8 + n * nv : nullptr, *sd = b->side ? b->side + n * nv : nullptr, *w = b->w4 ? b->w4 + n * nv : nullptr;
                     for (size_t v = 0; v < nv; v++) { const int m = ct ? ct[v] > 0 : 1; mat += m; if (sd && sd[v] != PHASE_UNKNOWN) { ph++; phm += m; } if (w && w[v] != 255) w4++; }
+                    if (b->level && b->level[n] >= 0 && b->level[n] < MAXLEV) { lvc[si][(int)b->level[n]]++; lvm[si][(int)b->level[n]][0] += mat; lvm[si][(int)b->level[n]][1] += phm; }
                     cov[si][0] += 1; cov[si][1] += (double)mat / nv; cov[si][2] += (double)ph / nv; cov[si][3] += mat ? (double)phm / mat : 0; cov[si][4] += (double)w4 / nv;
                 }
                 sampler_release(sq, b);
@@ -2676,7 +2683,17 @@ int cmd_train(int argc, char **argv) {
             }
             for (int s = 0; cov && s < S->n; s++) if (cov[s][0] > 0) { const double k = cov[s][0];
                 fprintf(stderr, "sampler-only: source %-34s windows %5.0f  material %.3f  phase known %.3f (of material %.3f)  w4 known %.3f\n", S->src[s].name, k,
-                        cov[s][1] / k, cov[s][2] / k, cov[s][3] / k, cov[s][4] / k); }
+                        cov[s][1] / k, cov[s][2] / k, cov[s][3] / k, cov[s][4] / k);
+            }
+            for (int s = 0; cov && s < S->n; s++) for (int l = 0; l < MAXLEV; l++) { uint32_t rs[SL_N]; sampler_level_stats(sq, s, l, rs); int any = lvc[s][l];
+                for (int k = 0; k < SL_N; k++) any |= rs[k] != 0;
+                char pl[160] = ""; uint64_t pa = 0, pk = 0;   /* (a pooled stored phase at this level: its coherent share) */
+                if (S->src[s].phase_pl[l] && !(S->src[s].phase_onfly > 0) && !phase_pool2_view_stats(S->src[s].phase_pl[l], &pa, &pk)) snprintf(pl, sizeof pl, "; pooled phase: %.3f of the coarse voxels with a known child left unknown", pa ? 1 - (double)pk / pa : 0.);
+                else if (S->src[s].phase_pl[l] && S->src[s].phase_onfly > 0) snprintf(pl, sizeof pl, "; phase from the codes pooled 2x (on the fly)");
+                if (any) fprintf(stderr, "sampler-only:   %-20s level %d (%.3g um): %d windows (%u holdout-masked), phase known of material %.3f; draws dropped: %u holdout overlaps, %u empty targets, %u coarse probe, %u CT min_fg%s\n",
+                                 S->src[s].name, l, S->src[s].um * ldexp(1.0, l), lvc[s][l], rs[SL_MASKED], lvm[s][l][0] > 0 ? lvm[s][l][1] / lvm[s][l][0] : 0., rs[SL_HOLD], rs[SL_EMPTY], rs[SL_PROBE], rs[SL_FG], pl); }
+            free(lvm);
+            free(lvc);
             free(cov);
             sampler_hostmem(sq, stderr, 0);
             uint64_t prod = 0, rej = 0; sampler_stats(sq, &prod, &rej); fprintf(stderr, "sampler-only: produced %llu rejected %llu\n", (unsigned long long)prod, (unsigned long long)rej);
@@ -2720,6 +2737,12 @@ int cmd_train(int argc, char **argv) {
             step0 = grow ? unet_load_grow(d->u, resume, 1, 1.f) : unet_load(d->u, resume);
             if (step0 < 0) { fprintf(stderr, "cannot load %s\n", resume); return 1; }
             if (atoi(opt(argc, argv, "--finetune", "0"))) step0 = 0;   /* loaded weights/state, fresh schedule */
+            {   /* --fstem-reset-at S (2026-11-11, the fstem forward fix): resuming from step S, the fine stem starts again neutral (unet_init's stem:
+                   its weights had learnt under a forward that covered only part of each row); one-shot by step, so later relaunches keep it */
+                const long fr = atol(opt(argc, argv, "--fstem-reset-at", "-1"));
+                if (fr >= 0 && step0 == fr) { if (unet_fstem_reset(d->u, seed + 7)) { fprintf(stderr, "--fstem-reset-at: the net has no fine stem\n"); return 2; }
+                    if (g == 0) fprintf(stderr, "--fstem-reset-at %ld: the fine stem re-initialised (W1 He, b1 / projection 0, optimizer state 0)\n", fr); }
+            }
             if (sheet_init && unet_start_sheet(d->u)) return 2;
             if (g == 0 && init_lr != 1.f) fprintf(stderr, "--init-lr-mult %g: %zu of %zu parameters inherited (from %s)\n", init_lr, unet_inherited(d->u), unet_nparams(d->u), resume);
         } else {
@@ -3505,6 +3528,7 @@ int cmd_train(int argc, char **argv) {
     double acc_rn = 0, acc_re = 0, acc_rb = 0;   /* restore: training voxels, error^2, input error^2 since the last log line */
     float parts[8][2 * TCMAX + 1];
     double acc_fib = 0, acc_fibv = 0, acc_fibn = 0;   /* --fib-normal-lambda: mean t^T N t over the windows with fibre voxels, their mean count */
+    const int mix_every = atoi(opt(argc, argv, "--mix-every", "0")); double *mixn = nullptr, *mixrv = nullptr, *mixrvn = nullptr;
     double acc_emb = 0, acc_embc = 0, acc_ds = 0, acc_vbce = 0, acc_vdice = 0, acc_side = 0, acc_ink = 0, acc_norm = 0, acc_cond = 0, acc_ck = 0, acc_cr = 0, acc_pap = 0, acc_cnt = 0, acc_cnr = 0, acc_cbin[18] = {0}, acc_w4 = 0, acc_w4w = 0, acc_w4a = 0, acc_pg = 0, acc_rv = 0;   /* (acc_pg: --pgrad-lambda loss; acc_cnt / acc_cnr: --count-lambda loss, Tp / Tg) verso channel, side channel; --cond (loss, known / right counts); --pap-head */
     double acc_fh[2] = {0}, acc_fhn = 0;   /* --fib-head: mask / direction bce sums, windows with known fibre labels */
     double acc_inkn = 0, vik[2] = {0};   /* --ink-head: training windows with known ink in the log interval; validation ink bce sum / windows */
@@ -3738,6 +3762,36 @@ int cmd_train(int argc, char **argv) {
         if (g_verso_on) { acc_vbce += G[0].vout[0]; acc_vdice += G[0].vout[1]; }
         if (g_side) acc_side += G[0].sout[0];
         if (g_rv == 2) acc_rv += G[0].rvout[0];
+        if (mix_every > 0) {   /* --mix-every N: the realised windows per source x level and (--rv 2) each source's rv bce, every N steps */
+            if (!mixn) { mixn = calloc((size_t)S->n * MAXLEV, sizeof *mixn); mixrv = calloc((size_t)S->n, sizeof *mixrv); mixrvn = calloc((size_t)S->n, sizeof *mixrvn); }
+            for (int g = 0; g < ng; g++) { const int bf = G[g].last & 1, si = G[g].srcb[bf], lv = G[g].lvlb[bf];
+                if (si < 0 || si >= S->n || lv < 0 || lv >= MAXLEV) continue;
+                mixn[(size_t)si * MAXLEV + lv]++; if (g_rv == 2) { mixrv[si] += G[g].rv_own; mixrvn[si]++; } }
+            if (step % mix_every == 0) {
+                double tot = 0; for (int k = 0; k < S->n * MAXLEV; k++) tot += mixn[k];
+                char ln[8192]; int o = snprintf(ln, sizeof ln, "mix steps %d-%d (%.0f windows):", step - mix_every + 1, step, tot);
+                double rung[3] = {0, 0, 0};
+                for (int si = 0; si < S->n; si++) for (int lv = 0; lv < MAXLEV; lv++) { const double c = mixn[(size_t)si * MAXLEV + lv]; if (!c) continue;
+                    const double um = S->src[si].um * ldexp(1.0, lv); rung[um < 6.8 ? 0 : um < 13.6 ? 1 : 2] += c;
+                    o += snprintf(ln + o, sizeof ln - o > 0 ? sizeof ln - o : 0, " %s@%.3g %.1f%%", S->src[si].name, um, 100 * c / tot); }
+                fprintf(stderr, "%s; rungs <6.8 / 6.8-13.6 / >13.6 um: %.1f / %.1f / %.1f%%\n", ln, 100 * rung[0] / tot, 100 * rung[1] / tot, 100 * rung[2] / tot);
+                {   /* the sampler's own counts since the last line: new windows (no replays) and dropped draws per source, against its weight */
+                    static uint32_t (*prev)[SL_N]; if (!prev) prev = calloc((size_t)S->n, sizeof *prev);
+                    uint32_t (*cur)[SL_N] = calloc((size_t)S->n, sizeof *cur); double newt = 0, wt = 0;
+                    for (int si = 0; si < S->n; si++) { for (int lv = 0; lv < MAXLEV; lv++) { uint32_t r[SL_N]; sampler_level_stats(sp, si, lv, r); for (int k = 0; k < SL_N; k++) cur[si][k] += r[k]; }
+                        newt += cur[si][SL_PROD] - prev[si][SL_PROD]; wt += S->src[si].weight; }
+                    o = snprintf(ln, sizeof ln, "draws steps %d-%d (%.0f new windows): new %% / weight %% (dropped hold/empty/probe/fg):", step - mix_every + 1, step, newt);
+                    for (int si = 0; si < S->n; si++) { uint32_t dd[SL_N]; for (int k = 0; k < SL_N; k++) dd[k] = cur[si][k] - prev[si][k];
+                        o += snprintf(ln + o, sizeof ln - o > 0 ? sizeof ln - o : 0, " %s %.1f/%.1f (%u/%u/%u/%u)", S->src[si].name, newt > 0 ? 100 * dd[SL_PROD] / newt : 0, wt > 0 ? 100 * S->src[si].weight / wt : 0,
+                                      dd[SL_HOLD], dd[SL_EMPTY], dd[SL_PROBE], dd[SL_FG]); }
+                    fprintf(stderr, "%s\n", ln); memcpy(prev, cur, (size_t)S->n * sizeof *cur); free(cur);
+                }
+                if (g_rv == 2) { o = snprintf(ln, sizeof ln, "rv bce by source steps %d-%d:", step - mix_every + 1, step);
+                    for (int si = 0; si < S->n; si++) if (mixrvn[si] > 0) o += snprintf(ln + o, sizeof ln - o > 0 ? sizeof ln - o : 0, " %s %.4f (%.0f)", S->src[si].name, mixrv[si] / mixrvn[si], mixrvn[si]);
+                    fprintf(stderr, "%s\n", ln); }
+                memset(mixn, 0, (size_t)S->n * MAXLEV * sizeof *mixn); memset(mixrv, 0, (size_t)S->n * sizeof *mixrv); memset(mixrvn, 0, (size_t)S->n * sizeof *mixrvn);
+            }
+        }
         if (g_unwrap) { acc_ink += G[0].iout[0]; acc_norm += G[0].norm_raw; }
         if (g_fibh && (G[0].fhout[0][2] > 0 || G[0].fhout[1][2] > 0)) { acc_fh[0] += G[0].fib_raw[0]; acc_fh[1] += G[0].fib_raw[1]; acc_fhn += 1; }
         if (g_fibdir > 0) acc_norm += G[0].norm_raw;
