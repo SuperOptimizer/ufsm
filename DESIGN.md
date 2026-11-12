@@ -99,6 +99,20 @@ On the Paris 4 gate box at 8 threads: GPU 8.7 s wall, CPU 15.9 s (the desk was l
 - **test_ink_mil:** the host reference matches central differences (max rel err 1.5e-7 soft, 2e-8 hard), and the GPU matches the host
   (loss to 1e-6, gradient error 5e-9 of 3e-3).
 
+**The teacher baseline on the 24 held-out crops** (latres, pod: ink3d-ext dino3d 78k, predicted with --surface at 4.8 um;
+/vesuvius/ufsm/wbench/univ/pod/ink3dext/{vscores,scores}.tsv). The 3-D score is ink-vscore against inkgt/evgt; the 2-D score is
+render + ink-score against the human labels.
+
+| scan (crops) | 3-D AUC | 3-D best F1 | 2-D AUC | 2-D best F1 |
+|---|---|---|---|---|
+| Paris 4 (16) | 0.727 | 0.572 | 0.735 | 0.576 |
+| PHerc0139 (4) | 0.651 | 0.498 | 0.632 | 0.487 |
+| PHerc1667 (4) | 0.561 | 0.508 | 0.566 | 0.496 |
+| CT floor (24) | 0.513 | 0.443 | | |
+
+The 3-D and 2-D numbers agree to about 0.02, so the face-placed voxel GT ranks a teacher the way the 2-D labels do. 1667 is barely
+above the floor, which is the scan where human-GT training has the most to add. These are the numbers the U4 ink head has to beat.
+
 **The villa ink recipe vs ours.** Read-only survey of ScrollPrize villa: vesuvius/ink_detection on main (the merged
 merge-ink-pipelines configs), plus the paris4-3d-gambiarra and distilled_3d_ink branches.
 
