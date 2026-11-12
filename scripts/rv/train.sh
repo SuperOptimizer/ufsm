@@ -28,7 +28,7 @@ AUG="--zfix 1 --symmetry-p 0.5 --geometry-aug 1 --rotate-deg 5 --rotate-p 0.2 --
 HEADS=${HEADS:-"--task unwrap2 --rv 1 --rv-iso ${ISO:-64} --wind4-lambda ${WIND4L:-0.25} --density-scale 4 --density-code 1 --packed-weight 8 --normal-step 1"}   # (HEADS: another task on the same recipe, e.g. the winding heads without --rv)
 ARGS=($SRCJ --out $o --gpus $GPUS --P $P --B 1 $ARCH $HEADS --steps $STEPS --sched wsd --cooldown 0.2 --opt muon \
   --fp4 2 --gpu-aug 2 --input-prec 8 --mem ${MEMMODE:-auto} --val-store disk --workers ${WORKERS:-12} --sampler-slots ${SLOTS:-16} \
-  --log-every ${LOGE:-50} --val-every ${VAL:-2000} --val-batches ${VALB:-16} --ckpt-every ${CKPT:-1000} --seed ${SEED:-3} --val-seed 1 \
+  --log-every ${LOGE:-50} --val-every ${VAL:-2000} --val-batches ${VALB:-16} --ckpt-every ${CKPT:-1000} --seed ${SEED:-3} --val-seed 1 --strict-sources ${STRICT:-1} \
   --warmup ${WARM:-2000} --muon-lr ${MLR:-0.02} --lr ${ALR:-0.001} $AUG ${EXTRA:-})
 echo $$ > $o.launcher.pid
 printf 'cd %q && R=%q U=%q SRCJ=%q GPU=%q LOCK=%q P=%q ARCH=%q WORKERS=%q SLOTS=%q MEMMODE=%q ALR=%q MLR=%q WIND4L=%q ISO=%q EXTRA=%q SNAP=%q nohup bash %q %q %q >> %q 2>&1 &\n' \
