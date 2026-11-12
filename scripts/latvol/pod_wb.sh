@@ -11,4 +11,6 @@ export SITE=podlv K WB=$L/wb GPU=0 SLABS=0 REP=${REP:-0} THREADS=${THREADS:-16} 
 [ "${LATGRID:-1}" = 1 ] && export WZARGS=
 [ "$ARM" != ct ] && export LVROOT=${LVBASE:-$L}/$ARM
 for b in $BL; do BOXES=$b bash $H/scripts/latvol/pod_shared.sh bash $H/scripts/wbench/wbench.sh $CK $TAG-$ARM 2>&1 | tail -2; done
+# the fields' checksums per box (an arm whose fields equal another arm's saw the same input: void), then the fields go
+for b in $BL; do [ -d $L/wb/fields/$TAG-$ARM/$b ] && echo "$TAG $ARM $b $(cd $L/wb/fields/$TAG-$ARM/$b && find . -type f ! -name '*.json' | sort | xargs cat | md5sum | cut -c1-16)"; done >> $L/wb/fields.md5
 [ "${KEEPF:-0}" = 1 ] || rm -rf $L/wb/fields/$TAG-$ARM
