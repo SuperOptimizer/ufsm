@@ -36,7 +36,7 @@ static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
 static const char *g_optseen[512]; static int g_noptseen;
 static void opt_note(const char *name) {
     for (int k = 0; k < g_noptseen; k++) if (!strcmp(g_optseen[k], name)) return;
-    if (g_noptseen < 512) g_optseen[g_noptseen++] = name;
+    if (g_noptseen < 512) g_optseen[g_noptseen++] = strdup(name);   /* (copied: some names are built in a stack buffer, --aug-%s-p) */
 }
 static const char *opt(int argc, char **argv, const char *name, const char *dflt) {
     opt_note(name);
