@@ -4612,6 +4612,7 @@ int cmd_fiber_judge(int argc, char **argv);    /* src/fiberjudge.c */
 int cmd_fiber_trace(int argc, char **argv);    /* src/fibertrace.c */
 int cmd_fiber_raster(int argc, char **argv);   /* src/fiberraster.c */
 int cmd_fiber_onfly(int argc, char **argv);
+int cmd_codes_onfly(int argc, char **argv);
 int cmd_fiber_link(int argc, char **argv);     /* src/fiberlink.c */
 int cmd_count_field(int argc, char **argv);   /* src/countfield.c */
 int cmd_hires_phase(int argc, char **argv);   /* src/hiresphase.c */
@@ -4684,6 +4685,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "fiber-trace")) return cmd_fiber_trace(argc, argv);
     if (!strcmp(cmd, "fiber-raster")) return cmd_fiber_raster(argc, argv);
     if (!strcmp(cmd, "fiber-onfly")) return cmd_fiber_onfly(argc, argv);
+    if (!strcmp(cmd, "codes-onfly")) return cmd_codes_onfly(argc, argv);
     if (!strcmp(cmd, "count-field")) return cmd_count_field(argc, argv);
     if (!strcmp(cmd, "hires-phase")) return cmd_hires_phase(argc, argv);
     if (!strcmp(cmd, "phase-gate")) return cmd_phase_gate(argc, argv);
