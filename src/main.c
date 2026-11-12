@@ -1430,15 +1430,17 @@ static int score_codes(z3 *z, double cf, const long long org[3], const int shp[3
     free(ah); free(hist); free(fine); free(blk);
     return 0;
 }
-typedef struct { fit_set_dev *gd; const fit_set *fs; } fit_fill_ctx;   /* gd null: the CPU */
+typedef struct { fit_set_dev *gd; const fit_set *fs; double off[3]; } fit_fill_ctx;   /* gd null: the CPU; off: the scored box's origin - the model's */
 static int fit_fill(void *c, const double og[3], const int64_t n3[3], double step, const uint8_t *codes, float *U) {
-    fit_fill_ctx *f = c; return f->gd ? fit_set_grid(f->gd, f->fs, og, n3, step, 1, U) : fit_set_grid_cpu(f->fs, og, n3, step, 1, codes, U);
+    fit_fill_ctx *f = c; const double o[3] = {og[0] + f->off[0], og[1] + f->off[1], og[2] + f->off[2]};
+    return f->gd ? fit_set_grid(f->gd, f->fs, o, n3, step, 1, U) : fit_set_grid_cpu(f->fs, o, n3, step, 1, codes, U);
 }
 static size_t fit_smask(void *c, const uint8_t *codes, const int64_t n3[3], int nst, const uint64_t *starts, uint64_t *ustart) {
     fit_fill_ctx *f = c; return fit_set_label_mask(f->gd, codes, n3, nst, starts, ustart);
 }
 static int fit_seval(void *c, const double og[3], const int64_t n3[3], double step, size_t nlab, float *Uc) {
-    fit_fill_ctx *f = c; return fit_set_grid_masked(f->gd, f->fs, og, n3, step, 1, nlab, Uc);
+    fit_fill_ctx *f = c; const double o[3] = {og[0] + f->off[0], og[1] + f->off[1], og[2] + f->off[2]};
+    return fit_set_grid_masked(f->gd, f->fs, o, n3, step, 1, nlab, Uc);
 }
 static const score_sparse fit_sparse = {fit_smask, fit_seval};
 
@@ -1991,12 +1993,15 @@ static int cmd_fit(int argc, char **argv) {
         const double cf = atof(argv[ci + 2]) > 0 ? atof(argv[ci + 2]) / fb.um : 2;   /* label voxel in native voxels (the codes' key is its um: 4.8) */
         FILE *dump = *opt(argc, argv, "--score-dump", "") ? fopen(opt(argc, argv, "--score-dump", ""), "wb") : nullptr;   /* box-local z y x, U - q mod 14 per voxel */
         fit_set_dev *gd = nullptr; if (!c.cpu && !(gd = fit_set_upload(fs))) return 1;
-        fit_fill_ctx fc = {gd, fs};
+        /* --model with fields that are a sub-box of the model's (a crop of a joined whole-scroll model): score the FIELDS' box (it was the
+           model's origin with the fields' shape: the wrong box), the model read at its own coordinates (fill offset fields - model origin) */
+        long long so_[3] = {org[0], org[1], org[2]}; fit_fill_ctx fc = {gd, fs, {0, 0, 0}};
+        if (min) for (int d = 0; d < 3; d++) { so_[d] = (long long)fb.origin[d]; fc.off[d] = (double)(so_[d] - org[d]); }
         g_score_pairs = atoi(opt(argc, argv, "--score-pairs", "0"));
         { const int bi = arg_index(argc, argv, "--score-boxes"); if (bi > 0 && bi + 2 < argc && sc_boxes_load(argv[bi + 1], argv[bi + 2])) return 2; }
         if (*opt(argc, argv, "--zgauge", "") && zg_load(opt(argc, argv, "--zgauge", ""), atof(opt(argc, argv, "--zgauge-scale", "1")), atof(opt(argc, argv, "--zgauge-f", "1")))) return 1;
         if (*opt(argc, argv, "--score-z", "") && sscanf(opt(argc, argv, "--score-z", ""), "%lf,%lf", &g_score_z0, &g_score_nz) != 2) { fprintf(stderr, "fit: --score-z Z0,NZ (box-local native z)\n"); return 2; }
-        const int rc = score_codes(z, cf, org, shp, h, fb.um, fb.cy, fb.cx, arg_index(argc, argv, "--score-detail") > 0, dump, fit_fill, gd && !getenv("UFSM_SCORE_DENSE") ? &fit_sparse : nullptr, &fc);
+        const int rc = score_codes(z, cf, so_, shp, h, fb.um, fb.cy, fb.cx, arg_index(argc, argv, "--score-detail") > 0, dump, fit_fill, gd && !getenv("UFSM_SCORE_DENSE") ? &fit_sparse : nullptr, &fc);
         fit_set_dev_free(gd); z3_close(z); if (dump) fclose(dump);
         if (rc) return rc;   /* (3: an empty GT level / nothing labelled in the box) */
     }
