@@ -40,6 +40,11 @@ rasterises them on read, byte-identical to `ufsm raster --value q.tif --binary 0
   rmax 160 (the 2.4 um rung) a 128^3 cell computed 44x its voxels. On the pod, 10 workers produced no P 1280 batch in 8 minutes.
   A 512 cell computes 4.3x its voxels.
 - `"cache": 0` turns the cache off: the phase is computed on every read.
+- **Pod bench** (2026-11-12): sampler-only, 1667 A24 / B24 from the meshes, rmax 160, P 1280, 10 workers.
+  - Uncached: first batch 37 s, then 396 Mvox/s (~5.3 s a 2.1 Gvox window). RSS 45-53 GB.
+  - Disk-cached (512 cells): first batch 312 s, then 214 Mvox/s, 6.7 GB written for 12 windows (0.55 GB a window, few revisits).
+  - Decision: U2 runs the 2.4 um sources with "cache": 0. A run's windows would need TBs of disk cache, and the cached path is slower
+    on first touch. The disk cache pays only where windows revisit a small labelled region.
 
 **The next rung** (phase_pl[L + 1], the scale rungs) rasterises the meshes at level L + 1 directly. That is the stored level-(L + 1)
 raster, and 8x fewer voxels than rasterising level L and pooling. When the CT has no level L + 1, the level-L codes are pooled
