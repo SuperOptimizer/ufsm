@@ -25,7 +25,8 @@ import json, sys
 S = json.load(open('/workspace/univA/sources-u2pod.json')); out = []
 for s in S['sources']:
     if s['name'] in ('PHercParis4-june', 'PHercParis4-july'): s['root'] = sys.argv[1]; s['min_level'] = s['max_level'] = 2; out.append(s)
-for s in json.load(open('/workspace/univ/sources-u1-pod.json'))['sources']:
+S1 = json.load(open('/workspace/univ/sources-u1-pod.json'))
+for s in (S1['sources'] if isinstance(S1, dict) else S1):
     if s['name'] == 'PHerc1667-gt': s['root'] = sys.argv[1]; out.append(s)
 S['sources'] = out; json.dump(S, open(sys.argv[2], 'w'), indent=1)
 PY
