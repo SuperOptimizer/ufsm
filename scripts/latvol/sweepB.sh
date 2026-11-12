@@ -11,7 +11,7 @@
 # whole (b/ct/ARM, removed after the run). Rows: wb/res/B<run>-{ct,ARM}.tsv; logs b/log.
 L=/workspace/latstore; H=$L/ufsmB; U=$H/build/ufsm; BB=$L/b; K=/workspace/ue; mkdir -p $BB/log $BB/ct $BB/box $BB/runs
 M=https://dl.ash2txt.org/community-uploads/forrest/volcomp; P4=PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr
-STEPS=${STEPS:-500}; RSSMAX=${RSSMAX:-35}; CTCACHE=${CTCACHE:-/workspace/univ/cache}
+STEPS=${STEPS:-300}; RSSMAX=${RSSMAX:-35}; CTCACHE=${CTCACHE:-/workspace/univ/cache}
 BX=${BX:-PH1 PH2 PH3 HOLD J1 J2 J3 J4 J5 J6 J7 J8 J9 J10 J11 J12 J13 J14 J15 J16 J17}
 for run in "$@"; do a=${run%%:*}; seed=3; [ "$run" != "$a" ] && seed=${run##*:}; r=$a-s$seed; o=$BB/runs/$r
   case $a in q2) args=;; vq*) args="--volcomp ${a#vq}";; lv*) c=${a#lv}; args="--c ${c%_*} --step ${c#*_} --gpu -1";; esac
@@ -39,12 +39,13 @@ PY
   if ! grep -q "^done" $o.state 2>/dev/null; then
     read -r -a A < /workspace/univA/u2.args; ARGS=($BB/src-$a.json); i=1
     while [ $i -lt ${#A[@]} ]; do k=${A[$i]}; v=${A[$((i + 1))]:-}
-      case $k in --out) v=$o;; --steps) v=$STEPS;; --seed) v=$seed;; --warmup) v=20;; --um-rungs) v=9.6;; --ckpt-every) v=100;; --val-every) v=100000;; --workers) v=2;; --sampler-slots) v=2;;
+      case $k in --out) v=$o;; --steps) v=$STEPS;; --seed) v=$seed;; --warmup) v=20;; --um-rungs) v=9.6;; --ckpt-every) v=50;; --val-every) v=100000;; --workers) v=2;; --sampler-slots) v=2;;
         --onfly-mb) v=4096;; --log-every) v=10;; --ink-head|--ink-mil|--ink-dice|--ink-smooth|--onfly-slots) i=$((i + 2)); continue;; esac
       ARGS+=($k $v); i=$((i + 2)); done
     ARGS+=(--onfly-slots 1); nf=0
     while :; do
-      while [ -e $K/gpu.pause ]; do sleep 5; done
+      # shared jobs own minutes :00-:20 of the hour: a segment starts before :12 and is stopped (SIGTERM: a save) at :19
+      while [ -e $K/gpu.pause ] || [ $((10#$(date +%M))) -ge ${SEGSTART:-12} ] || pgrep -f "[s]weep_ink.sh" > /dev/null; do sleep 5; done
       touch $L/b.busy; while [ -n "$(ls $K/gpu.shared 2>/dev/null | grep '^latstore-')" ]; do sleep 5; done   # my other units drain first
       # U2 needs its ~64 GB: start only with >= FREEGB (20) GB free on the card (this job plans 14 + one 4 GB on-the-fly slot)
       while [ "$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits | head -1)" -lt $((${FREEGB:-20} * 1024)) ]; do sleep 20; [ -e $K/gpu.pause ] && break; done
@@ -55,7 +56,8 @@ PY
       while kill -0 $pid 2>/dev/null; do
         rss=$(awk '/VmRSS/ {print int($2 / 1048576)}' /proc/$pid/status 2>/dev/null); echo "${rss:-0}" > $o.rss_gb
         [ "${rss:-0}" -gt $RSSMAX ] && { kill -KILL $pid; why="rss $rss GB > $RSSMAX"; break; }
-        [ -e $K/gpu.pause ] && { kill -TERM $pid; why="yield to $(cat $K/gpu.pause 2>/dev/null)"; break; }; sleep 3; done
+        [ -e $K/gpu.pause ] && { kill -TERM $pid; why="yield to $(cat $K/gpu.pause 2>/dev/null)"; break; }
+        [ $((10#$(date +%M))) -ge ${SEGEND:-19} ] && { kill -TERM $pid; why="yield: the window ends (step $(awk '/^step +[0-9]+ / {s=$2} END {print s + 0}' $o.log))"; break; }; sleep 3; done
       wait $pid; rc=$?; rm -f $K/gpu.shared/latstore-B $L/b.busy; [ -n "$why" ] && echo "$(date +%T) $why" >> $o.state
       last=$(awk '/^step +[0-9]+ / {s=$2} END {print s + 0}' $o.log)
       [ "$last" -ge "$STEPS" ] && { echo "done $last" >> $o.state; break; }
