@@ -36,6 +36,15 @@ int main(void) {
     CHECK(tot > 10000 && f > 0.99, "rising outward: %.4f of %zu", f, tot);
     CHECK(tot2 == tot && f2 < 0.01, "negated: %.4f of %zu", f2, tot2);
     CHECK(!(fabs(f3 - 0.5) > 0.1), "azimuth-only phase: outward %.4f of %zu (no radial direction expected)", f3, tot3);
+    {   /* the aligned-voxel share: 1 / 0 on the concentric phase and its negation; the azimuth-only phase (sheets along the radius) has
+           (almost) no aligned voxel, which is the point: its raw share near 0.5 says nothing about the direction */
+        size_t a = 0, at = 0, b = 0, bt = 0, c = 0, ct = 0;
+        phase_outward_aligned(p, n, y0, x0, cy, cx, 0.7, &a, &at); phase_outward_aligned(q, n, y0, x0, cy, cx, 0.7, &b, &bt); phase_outward_aligned(t, n, y0, x0, cy, cx, 0.7, &c, &ct);
+        printf("phase-check: aligned: %zu of %zu (rising outward), %zu of %zu (negated), %zu aligned voxels of the azimuth-only phase (%zu raw pairs)\n", a, at, b, bt, ct, tot3);
+        CHECK(at > 10000 && (double)a / at > 0.999, "aligned, rising outward: %zu of %zu", a, at);
+        CHECK(bt > 10000 && (double)b / bt < 0.001, "aligned, negated: %zu of %zu", b, bt);
+        CHECK(ct * 20 < tot3, "azimuth-only phase: %zu aligned voxels of %zu pairs", ct, tot3);
+    }
     /* phase_mask_ref */
     const size_t N = (size_t)D * H * W; uint8_t *o = malloc(N), *r = malloc(N);
     size_t exp_mask = 0, exp_both = 0;
