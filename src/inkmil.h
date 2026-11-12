@@ -21,7 +21,7 @@ __attribute__((weak)) int ink_mil_loss_hostmem(const float *logit, float *grad, 
 __attribute__((weak)) int ink_mil_samples(float R, float step);
 __attribute__((weak)) int ink_mil_fwd_slab(const void *lg, int bf16, int z0, int nz, int D, int H, int W, const inkray *rays, int nr, float R, float step, float *acc, void *stream);
 __attribute__((weak)) int ink_mil_fin(float *acc, const inkray *rays, int nr, int D, int H, int W, float R, float step, float tau, float eps, float scale, double *loss, void *stream);
-__attribute__((weak)) int ink_mil_bwd_slab(const float *dz, int z0, int nz, int D, int H, int W, const inkray *rays, int nr, float R, float step, void *gl, int bf16, void *stream);
+__attribute__((weak)) int ink_mil_bwd_slab(const float *dz, int z0, int nz, int D, int H, int W, const inkray *rays, int nr, float R, float step, void *gl, int bf16, float gs, void *stream);   /* gs: x every gradient (the source weight, the losses' fp16 gradient scale) */
 __attribute__((weak)) int ink_mil_slab_hostmem(const float *logit, int bf16, int D, int H, int W, const inkray *rays, int nr, float R, float step, float tau, float eps, float scale,
                                                int nslab, float *grad, double *loss);   /* (tests) */
 /* the host reference (tests): the same arithmetic in double */

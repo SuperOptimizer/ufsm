@@ -1,6 +1,7 @@
 #include "sample.h"
 #include "inksplat.h"
-[[gnu::weak]] int inkfly_cells(void *, int, const int64_t[3], uint8_t *);   /* (weak: test binaries without inksplat.o; only called for an onfly target) */
+[[gnu::weak]] int inkfly_cells(void *, int, const int64_t[3], uint8_t *);
+[[gnu::weak]] int inkfly_rays_lev(void *, int, const int64_t[3], const int64_t[3], int, int, float, inkray **, size_t *);   /* (weak: test binaries without inksplat.o; only called for an onfly target) */
 #include "band.h"
 #include "band_w4dev.h"
 #include "target_erode.h"
@@ -271,13 +272,14 @@ static batch alloc_batch(const sample_cfg *c) {
     b.wcomp = c->wind4 && !c->w4_runs ? halloc((size_t)c->B * p3) : nullptr;
     b.w4r = c->w4_runs ? calloc((size_t)c->B, sizeof(w4runs)) : nullptr;
     b.ink = c->ink_plane && !c->ink_bits ? halloc((size_t)c->B * p3) : nullptr;
+    b.ink_rays = c->ink_mil_cap > 0 ? malloc((size_t)c->B * c->ink_mil_cap * sizeof(inkray)) : nullptr; b.ink_nrays = c->ink_mil_cap > 0 ? calloc((size_t)c->B, sizeof(int)) : nullptr;
     for (int j = 0; j < 4; j++) b.aux[j] = j < c->aux_n ? halloc((size_t)c->B * p3) : nullptr;
     b.inkb = c->ink_bits ? halloc((size_t)c->B * p3 / 8) : nullptr; b.ink_it = c->ink_bits ? calloc((size_t)c->B, sizeof *b.ink_it) : nullptr;
     b.emb = c->emb_ch ? halloc((size_t)c->B * c->emb_ch * (size_t)(PZ(c) / c->emb_div) * (c->P / c->emb_div) * (c->P / c->emb_div)) : nullptr;
     return b;
 }
 
-static void free_batch(batch *b, int B) { if (b->w4r) { for (int q = 0; q < B; q++) { w4runs *r = (w4runs *)b->w4r + q; free(r->off); free(r->ro); free(r->cb); } free(b->w4r); } if (b->ink) hfree(b->ink); for (int j = 0; j < 4; j++) if (b->aux[j]) hfree(b->aux[j]); if (b->inkb) hfree(b->inkb); free(b->ink_it); if (b->ct8) hfree(b->ct8); if (b->aug) hfree(b->aug); if (b->emb) hfree(b->emb); if (b->xv) hfree(b->xv); free(b->vok); free(b->chid); free(b->chidx); free(b->choff); if (b->w4) hfree(b->w4); if (b->wcomp) hfree(b->wcomp); if (b->tm) hfree(b->tm); if (b->rad) hfree(b->rad); if (b->axr) hfree(b->axr); if (b->pap) hfree(b->pap); if (b->wind) hfree(b->wind); if (b->band) hfree(b->band); if (b->side) hfree(b->side); if (b->pm) hfree(b->pm); if (b->x) hfree(b->x); if (b->x16) hfree(b->x16); if (b->t) hfree(b->t); if (b->m) hfree(b->m); hfree(b->w); free(b->src); free(b->level); free(b->um); free(b->corner); if (b->sheet) { sheet_batch_free(b->sheet[0]); free(b->sheet); } }
+static void free_batch(batch *b, int B) { free(b->ink_rays); free(b->ink_nrays); if (b->w4r) { for (int q = 0; q < B; q++) { w4runs *r = (w4runs *)b->w4r + q; free(r->off); free(r->ro); free(r->cb); } free(b->w4r); } if (b->ink) hfree(b->ink); for (int j = 0; j < 4; j++) if (b->aux[j]) hfree(b->aux[j]); if (b->inkb) hfree(b->inkb); free(b->ink_it); if (b->ct8) hfree(b->ct8); if (b->aug) hfree(b->aug); if (b->emb) hfree(b->emb); if (b->xv) hfree(b->xv); free(b->vok); free(b->chid); free(b->chidx); free(b->choff); if (b->w4) hfree(b->w4); if (b->wcomp) hfree(b->wcomp); if (b->tm) hfree(b->tm); if (b->rad) hfree(b->rad); if (b->axr) hfree(b->axr); if (b->pap) hfree(b->pap); if (b->wind) hfree(b->wind); if (b->band) hfree(b->band); if (b->side) hfree(b->side); if (b->pm) hfree(b->pm); if (b->x) hfree(b->x); if (b->x16) hfree(b->x16); if (b->t) hfree(b->t); if (b->m) hfree(b->m); hfree(b->w); free(b->src); free(b->level); free(b->um); free(b->corner); if (b->sheet) { sheet_batch_free(b->sheet[0]); free(b->sheet); } }
 
 /* Level choice for a source: restrict cfg.level_p to levels the CT has and every target of the source
    can provide (pyramid: same level; regions: levels 0..1). Returns -1 if nothing is usable. */
@@ -2413,6 +2415,32 @@ static int density_draw(sampler *sp, source *s, const int64_t o[3], int Pz, int 
     tp_put(ph, p3 + 64);
     return ok;
 }
+/* train --ink-mil: the window's MIL rays (inksplat.h inkfly_rays_lev on the source's onfly ink target) mapped as axis_record maps points:
+   the symmetry (se = {D, P, P}), then the warp's forward map; the normal as the image of p + n, renormalised. Rays whose point leaves the
+   window are dropped; more than the cap: every k-th kept (deterministic). */
+static int mil_rays(const sample_cfg *c, source *s, int l, const int64_t o[3], int D, int P, sym y, const spatial_aug *a, inkray *out, int *nout) {
+    *nout = 0;
+    const int ch = c->ink_ch > 0 ? c->ink_ch : CH_SHEET; void *h = s->ink_fly[ch];
+    if (!h || !inkfly_rays_lev) return 0;
+    const int64_t n[3] = {D, P, P}; inkray *R = nullptr; size_t nr = 0;
+    if (inkfly_rays_lev(h, l, o, n, c->ink_mil_mode, c->ink_mil_stride, c->ink_mil_R, &R, &nr)) return -1;
+    const int warped = a && a->active, se[3] = {D, P, P};
+    const size_t step = nr > (size_t)c->ink_mil_cap ? (nr + c->ink_mil_cap - 1) / c->ink_mil_cap : 1; int k = 0;
+    for (size_t i = 0; i < nr; i += step) {
+        double q[2][3];
+        for (int e = 0; e < 2; e++) {
+            double v[3], u[3]; for (int d = 0; d < 3; d++) v[d] = R[i].p[d] + (e ? R[i].n[d] : 0.f);
+            for (int d = 0; d < 3; d++) u[d] = y.flip[d] ? se[y.perm[d]] - 1 - v[y.perm[d]] : v[y.perm[d]];
+            if (warped) spatial_aug_forward(a, u, q[e]); else memcpy(q[e], u, sizeof u);
+        }
+        int in = 1; for (int d = 0; d < 3; d++) in &= q[0][d] >= 0 && q[0][d] <= (d ? P : D) - 1;
+        double dn[3], ln = 0; for (int d = 0; d < 3; d++) { dn[d] = q[1][d] - q[0][d]; ln += dn[d] * dn[d]; }
+        if (!in || !(ln > 1e-12) || k >= c->ink_mil_cap) continue;
+        inkray *r = &out[k++]; *r = R[i]; ln = sqrt(ln);
+        for (int d = 0; d < 3; d++) { r->p[d] = (float)q[0][d]; r->n[d] = (float)(dn[d] / ln); }
+    }
+    free(R); *nout = k; return 0;
+}
 static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp, uint8_t *big, uint64_t tile_index, float *noise_state, chain_st *cs);
 static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp, uint8_t *big, uint64_t tile_index, float *noise_state, chain_st *cs) {
     const int rc = draw_(sp, b, i, r, xtmp, ttmp, big, tile_index, noise_state, cs);
@@ -3159,6 +3187,24 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
             if (spatial.active) sample_warp_ink(src, bi, P, y.perm, y.flip, &spatial); else sym_u8(src, bi, Pz, P, y);
         }
     }
+    if (b->ink_nrays) {   /* train --ink-mil: the window's rays (none on redrawn windows: their ink plane is unknown too) */
+        b->ink_nrays[i] = 0;
+        if (!(crushed || torn || delam || curved) && mil_rays(c, s, l, o, Pz, P, y, &spatial, b->ink_rays + (size_t)i * c->ink_mil_cap, &b->ink_nrays[i])) return -1;
+        static int rchk = -1; if (rchk < 0) rchk = getenv("UFSM_MIL_CHECK") && atoi(getenv("UFSM_MIL_CHECK")) > 0;
+        if (rchk && inkw && !lw && b->ink_nrays[i]) {   /* UFSM_MIL_CHECK: the rays against the window's own (warped) ink plane: a known voxel along the ray, and its label */
+            const inkray *R = b->ink_rays + (size_t)i * c->ink_mil_cap; int hit = 0, agree = 0; const int nr = b->ink_nrays[i];
+            for (int k = 0; k < nr; k++) {
+                int mx = -1;
+                for (float t = -c->ink_mil_R; t <= c->ink_mil_R + 1e-4f; t += 0.5f) {
+                    int v[3]; for (int d = 0; d < 3; d++) v[d] = (int)lrintf(R[k].p[d] + t * R[k].n[d]);
+                    if (v[0] < 0 || v[1] < 0 || v[2] < 0 || v[0] >= Pz || v[1] >= P || v[2] >= P) continue;
+                    const int q = b->ink[(size_t)i * p3 + ((size_t)v[0] * P + v[1]) * P + v[2]]; if (q != 255 && q > mx) mx = q;
+                }
+                if (mx >= 0) { hit++; agree += (mx > 127) == (R[k].y != 0); }
+            }
+            fprintf(stderr, "mil rays: %d of %d meet known ink along the ray, %d of those agree with its label (warped %d)\n", hit, nr, agree, spatial.active);
+        }
+    }
     if (c->emb_ch) {   /* train --distill: the feature targets through the same symmetry and warp (none on crushed / torn / re-bent windows) */
         const size_t ge = (size_t)(Pz / c->emb_div) * (P / c->emb_div) * (P / c->emb_div);
         int8_t *eo = b->emb + (size_t)i * c->emb_ch * ge;
@@ -3627,6 +3673,7 @@ int sampler_replay_ok(const sample_cfg *c) {
    (rotation forced when none came up); the scanner plan is drawn anew with the label-touching ops (seam, air, dropped slices,
    cutouts, chunk dropouts) carried over from the window's own plan, so its labels stay exact; new intensity jitter and noise seed */
 static void replay_window(sampler *sp, batch *b, int i, int rep, uint8_t **scr) {
+    if (b->ink_nrays) b->ink_nrays[i] = 0;   /* (--ink-mil: replays carry no rays; the planes are re-symmetrised below) */
     const sample_cfg *c = &sp->cfg; const int Pz = PZ(c), P = c->P; const size_t p3 = P3(sp);
     char *rec = (char *)b->rad + (size_t)i * NN_RAD_REC(Pz); int32_t h[8]; memcpy(h, rec, sizeof h);
     float *cyz = malloc(2 * (size_t)Pz * sizeof *cyz); if (!cyz) abort(); float *cxz = cyz + Pz;

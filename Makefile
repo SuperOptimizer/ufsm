@@ -295,6 +295,9 @@ suite-bins: $(B)/test_rv
 $(B)/test_heads: tests/test_heads.c | $(B)/ufsm $(B)/make_wind_fixture
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ -lm
 suite-bins: $(B)/test_heads
+$(B)/test_ink_mil_train: tests/test_ink_mil_train.c tests/make_wind_fixture.c $(B)/z3w.o $(B)/tiffw.o | $(B)/ufsm $(B)/make_wind_fixture
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_ink_mil_train.c $(B)/z3w.o $(B)/tiffw.o -o $@ $(LDLIBS)
+suite-bins: $(B)/test_ink_mil_train
 $(B)/test_score_par: tests/test_score_par.c $(B)/z3w.o $(B)/zarr3.o $(B)/store.o $(B)/json.o | $(B)/ufsm
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) -lm
 suite-bins: $(B)/test_score_par

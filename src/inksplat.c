@@ -1623,10 +1623,13 @@ int cmd_ink_onfly(int argc, char **argv) {
    mode 1: only the pixels without an open face (the ones the --face voxel target leaves unknown; the face search as inkfly_chunk's on
    the level's CT); mode 0: every pixel. Pixels within reach (R level voxels + 1) of a held-out box are left out. */
 int inkfly_rays(void *handle, const int64_t o[3], const int64_t n[3], int mode, int stride, float R, inkray **out, size_t *nout) {
+    const inkfly *f = handle; return inkfly_rays_lev(handle, f ? f->L : 0, o, n, mode, stride, R, out, nout);
+}
+int inkfly_rays_lev(void *handle, int lev, const int64_t o[3], const int64_t n[3], int mode, int stride, float R, inkray **out, size_t *nout) {
     inkfly *f = handle; *out = nullptr; *nout = 0; if (!f) return -1;
-    const inksplat_cfg *c = &f->c; const double V = f->V; if (stride < 1) stride = 1;
-    int64_t a0[3], b0[3]; for (int d = 0; d < 3; d++) { a0[d] = o[d] * (int64_t)V; b0[d] = (o[d] + n[d]) * (int64_t)V; }
-    const double ex_m = (R + 1) * V;
+    const inksplat_cfg *c = &f->c; const double V = f->V, Vw = (double)(1 << lev), offw = (Vw - 1) / 2; if (stride < 1) stride = 1;
+    int64_t a0[3], b0[3]; for (int d = 0; d < 3; d++) { a0[d] = o[d] * (int64_t)Vw; b0[d] = (o[d] + n[d]) * (int64_t)Vw; }
+    const double ex_m = (R + 1) * Vw;
     size_t cap = 256, nc = 0; uint32_t *cand = malloc(cap * sizeof *cand);
     int64_t g0[3], g1[3];
     for (int d = 0; d < 3; d++) { g0[d] = a0[d] / f->gcell; g1[d] = (b0[d] - 1) / f->gcell; if (g0[d] < 0) g0[d] = 0; if (g1[d] >= f->gdim[d]) g1[d] = f->gdim[d] - 1; }
@@ -1694,7 +1697,7 @@ int inkfly_rays(void *handle, const int64_t o[3], const int64_t n[3], int mode, 
             if (face_of(sm, ns, lo, c->iso, c->face_run, c->face_gap) != FACE_NONE) continue;
         }
         inkray *r = &Rr[nr++];
-        for (int d = 0; d < 3; d++) { r->p[d] = (float)((x->P[d] - f->off) / V - o[d]); r->n[d] = (float)(x->N[d] * sign); }
+        for (int d = 0; d < 3; d++) { r->p[d] = (float)((x->P[d] - offw) / Vw - o[d]); r->n[d] = (float)(x->N[d] * sign); }
         r->y = x->y; r->w = 1; memset(r->pad, 0, sizeof r->pad);
     }
     free(ctb); *out = Rr; *nout = nr; rc = 0;

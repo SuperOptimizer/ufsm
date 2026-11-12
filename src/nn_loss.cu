@@ -12,6 +12,7 @@ extern "C" void nn_set_loss_unit_ch7(int c) { g_unit_ch7 = c; }
 extern "C" void nn_loss_cfg_get(float *pw, float *rec_w, int *unit7);
 thread_local int g_logits_h16 = 0;   /* the logits the losses read are fp16 (unet_logits_h16: lean training with the logit gradient beside them) */
 extern "C" void nn_set_logits_h16(int on) { g_logits_h16 = on; }
+extern "C" void nn_loss_grad_fmt(int *g16, int *bf16, float *gs);
 thread_local int g_head_h16 = 0;
 extern "C" void nn_set_head_out_h16(int on) { g_head_h16 = on; }
 template <typename LT> __global__ void loss_stats_k(const LT *lg, const uint8_t *t, const uint8_t *m, const uint8_t *w, int C, size_t S, double *ds, float pw,
@@ -939,3 +940,6 @@ extern "C" void nn_fibn_apply(const void *list, const unsigned *nl, size_t cap, 
     else fibn_apply_k<bf16><<<nb, 256>>>((const fibn_ent *)list, nl, (unsigned)cap, acc, lambda, g_gscale, (bf16 *)gl, ns);
     KCHECK();
 }
+
+/* the logit gradient the losses write: 16-bit (else fp32), bf16 (else fp16), times gs (the fp16 gradient scale) */
+extern "C" void nn_loss_grad_fmt(int *g16, int *bf16, float *gs) { *g16 = g_loss_g16; *bf16 = !g_h16; *gs = g_loss_g16 ? g_gscale : 1.f; }

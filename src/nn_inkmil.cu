@@ -115,7 +115,7 @@ __global__ void k_sum_fixed(const double *v, int n, double *out) {   /* one bloc
     for (int w = 128; w; w >>= 1) { if ((int)threadIdx.x < w) sh[threadIdx.x] += sh[threadIdx.x + w]; __syncthreads(); }
     if (!threadIdx.x) *out += sh[0];
 }
-__global__ void k_pairs(const float *dz, int z0, int nz, int D, int H, int W, const inkray *rays, int nr, int K, float R, float step, unsigned long long *key, float *val, unsigned *cnt) {
+__global__ void k_pairs(const float *dz, int z0, int nz, int D, int H, int W, const inkray *rays, int nr, int K, float R, float step, float gs, unsigned long long *key, float *val, unsigned *cnt) {
     const long long id = (long long)blockIdx.x * blockDim.x + threadIdx.x; if (id >= (long long)nr * K) return;
     const float g = dz[id]; if (g == 0) return;
     const inkray r = rays[id / K]; int c[3]; float f[3];
@@ -123,7 +123,7 @@ __global__ void k_pairs(const float *dz, int z0, int nz, int D, int H, int W, co
     for (int q = 0; q < 8; q++) { const int a = c[0] + (q >> 2 & 1); if (a < z0 || a >= z0 + nz) continue;
         const float w = cw(f, q); if (w == 0) continue;
         const unsigned long long vox = ((unsigned long long)(a - z0) * H + c[1] + (q >> 1 & 1)) * W + c[2] + (q & 1);
-        const unsigned j = atomicAdd(cnt, 1u); key[j] = vox << 32 | (unsigned long long)(id * 8 + q); val[j] = g * w; }
+        const unsigned j = atomicAdd(cnt, 1u); key[j] = vox << 32 | (unsigned long long)(id * 8 + q); val[j] = g * w * gs; }
 }
 __global__ void k_runs(const unsigned long long *key, const float *val, unsigned n, void *gl, int bf) {   /* one thread per run start: the run summed in slot order */
     const unsigned i = blockIdx.x * blockDim.x + threadIdx.x; if (i >= n) return;
@@ -153,13 +153,13 @@ extern "C" int ink_mil_fin(float *acc, const inkray *rays, int nr, int D, int H,
     k_sum_fixed<<<1, 256, 0, (cudaStream_t)stream>>>((const double *)t_ms.p[0], nr, loss);
     return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }
-extern "C" int ink_mil_bwd_slab(const float *dz, int z0, int nz, int D, int H, int W, const inkray *rays, int nr, float R, float step, void *gl, int bf16, void *stream) {
+extern "C" int ink_mil_bwd_slab(const float *dz, int z0, int nz, int D, int H, int W, const inkray *rays, int nr, float R, float step, void *gl, int bf16, float gs, void *stream) {
     const int K = ink_mil_samples(R, step); if (K > KMAX || K < 1) return -2; if (nr <= 0) return 0;
     cudaStream_t st = (cudaStream_t)stream; const long long n = (long long)nr * K; const size_t cap = (size_t)n * 8;
     if (cap > 0xffffffffull || mgrow(1, cap * 8) || mgrow(2, cap * 4) || mgrow(3, cap * 8) || mgrow(4, cap * 4) || mgrow(5, 64)) return -1;
     unsigned *dc = (unsigned *)t_ms.p[5]; unsigned hc = 0;
     if (cudaMemsetAsync(dc, 0, 4, st)) return -1;
-    k_pairs<<<(unsigned)((n + 255) / 256), 256, 0, st>>>(dz, z0, nz, D, H, W, rays, nr, K, R, step, (unsigned long long *)t_ms.p[1], (float *)t_ms.p[2], dc);
+    k_pairs<<<(unsigned)((n + 255) / 256), 256, 0, st>>>(dz, z0, nz, D, H, W, rays, nr, K, R, step, gs, (unsigned long long *)t_ms.p[1], (float *)t_ms.p[2], dc);
     if (cudaMemcpyAsync(&hc, dc, 4, cudaMemcpyDeviceToHost, st) || cudaStreamSynchronize(st)) return -1;
     if (!hc) return 0;
     int bits = 32; while (bits < 64 && ((unsigned long long)nz * H * W) >> (bits - 32)) bits++;   /* key = voxel << 32 | slot */
@@ -183,7 +183,7 @@ extern "C" int ink_mil_slab_hostmem(const float *logit, int bf16, int D, int H, 
         if (ink_mil_fwd_slab((const char *)dl + (size_t)z0 * H * W * 2, bf16, z0, z1 - z0, D, H, W, dr, nr, R, step, acc, nullptr)) goto out; }
     if (ink_mil_fin(acc, dr, nr, D, H, W, R, step, tau, eps, scale, dL, nullptr)) goto out;
     for (int s = 0; s < nslab; s++) { const int z0 = (int)((long long)D * s / nslab), z1 = (int)((long long)D * (s + 1) / nslab);
-        if (ink_mil_bwd_slab(acc, z0, z1 - z0, D, H, W, dr, nr, R, step, (char *)dg + (size_t)z0 * H * W * 2, bf16, nullptr)) goto out; }
+        if (ink_mil_bwd_slab(acc, z0, z1 - z0, D, H, W, dr, nr, R, step, (char *)dg + (size_t)z0 * H * W * 2, bf16, 1.f, nullptr)) goto out; }
     if (cudaMemcpy(h, dg, nv * 2, cudaMemcpyDeviceToHost) || cudaMemcpy(loss, dL, 8, cudaMemcpyDeviceToHost)) goto out;
     for (size_t k = 0; k < nv; k++) { if (bf16) { __nv_bfloat16 b; memcpy(&b, &h[k], 2); grad[k] = __bfloat162float(b); } else { __half b; memcpy(&b, &h[k], 2); grad[k] = __half2float(b); } }
     rc = 0;
