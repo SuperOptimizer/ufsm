@@ -67,6 +67,55 @@ predicts and scores. The 2-D render score wrote 0 wraps for that crop (not inves
 Desk dry run (arm B, P 256, 24 steps beside u1): the u1 8000 snapshot loads with the ink row fresh. Ink bce 0.48 -> 0.36 and
 mil 0.48 -> 0.36 inside the warmup, 15-16 k rays a window. The 400-step arms are for the pod, at P 1024 (user 2026-11-12: "1024 cubes only now").
 
+## The sub-cell head over more than 16 task outputs (2026-11-12, branch subcell-20261112)
+
+`--lat-guide 3`, the sub-cell head, used to have exactly 144 outputs: 16 interpolated base outputs plus 128 sub-cell terms (the
+phase pair x 64 voxels of a 4^3 cell). That capped the task at 16 outputs, and the fibre head needs 13 + 9 = 22.
+- The base is now the task's outputs rounded up to 16 (LBASE). Up to 16 outputs that is 16, the old 144-output head, so old
+  checkpoints load and train unchanged.
+- The fibre head already pads g_cout to 32. That gives 32 + 128 = 160 head outputs.
+- train's shuffle / adjoint calls, the fp32-gradient output count (LGFC), and the zero-init of the sub-cell rows now use LBASE.
+  predict already read the base as cout - 128; its three literal 16s (the fit-field shuffle, the side-pair slab, nn_lat_place_rvs)
+  now use that too.
+- The MX 1x1 conv (lp_conv1_to_mx / _r) takes up to 192 inputs (a CI 192 instantiation for 145..192).
+- test_predict_heads (3): the fibre head on a sub-cell net (rv 2) trains, and its log reports "outputs 32-159 start at zero".
+  predict --heads all writes rv, fib/H, fib/V and fib/fam.
+- Not generalised: the sub-cell terms still refine only the phase pair. The rv / ink / fibre outputs are interpolated.
+
+## Phase on the fly from meshes: the sources key, behind the derived cache (2026-11-12, branch meshsrc-20261112)
+
+The 2.4 um rungs need level-0 codes. Stored, those run ~170 GB for Paris 4 June alone. fibhvd's mesh_codes_open (meshcodes.h)
+rasterises them on read, byte-identical to `ufsm raster --value q.tif --binary 0`. This section adds the sources key that opens it.
+
+**The key:** `"phase": {"level": L, "onfly": {"meshes": {"dir", "value": "q.tif", "map": reg.json, "level": L}, "rmax", "cache_dir",
+"cache_mb"}}`. The same key also works inside a `"sets"` entry. "level" is the codes' CT level and defaults to the phase's level.
+"map" sends the meshes through a reg map into this source's scan (the 1.129 um twins).
+
+**The derived cache:**
+- The pair-rule phase of mesh codes sits behind z3_open_cached.
+- The key is "phase-onfly-pair-v1 rmax R codes <mesh_codes_key>-pool<n>". mesh_codes_key hashes every mesh's TIFF sizes and mtimes,
+  the value name and the map.
+- Defaults: $UFSM_DERIVED_CACHE or ~/.cache/ufsm/derived, with a 1024 MB memory LRU.
+- Phases from stored codes stay uncached, as before.
+- The cell edge is at least 3 rmax, capped at 512, and it is part of the key. The pair rule reads codes with an rmax + 2 halo, so at
+  rmax 160 (the 2.4 um rung) a 128^3 cell computed 44x its voxels. On the pod, 10 workers produced no P 1280 batch in 8 minutes.
+  A 512 cell computes 4.3x its voxels.
+- `"cache": 0` turns the cache off: the phase is computed on every read.
+- **Pod bench** (2026-11-12): sampler-only, 1667 A24 / B24 from the meshes, rmax 160, P 1280, 10 workers.
+  - Uncached: first batch 37 s, then 396 Mvox/s (~5.3 s a 2.1 Gvox window). RSS 45-53 GB.
+  - Disk-cached (512 cells): first batch 312 s, then 214 Mvox/s, 6.7 GB written for 12 windows (0.55 GB a window, few revisits).
+  - Decision: U2 runs the 2.4 um sources with "cache": 0. A run's windows would need TBs of disk cache, and the cached path is slower
+    on first touch. The disk cache pays only where windows revisit a small labelled region.
+
+**The next rung** (phase_pl[L + 1], the scale rungs) rasterises the meshes at level L + 1 directly. That is the stored level-(L + 1)
+raster, and 8x fewer voxels than rasterising level L and pooling. When the CT has no level L + 1, the level-L codes are pooled
+instead.
+
+**test_mesh_phase** uses test_codes_onfly's four meshes (two nested sheets, a crossing plane, holes / NaN q):
+- At level 0, the meshes' phase equals the phase of `ufsm raster`'s stored codes: 0 of 147244 known voxels differ.
+- At level 1, it equals the phase of the level-1 raster: 0 of 59232 differ.
+- A second load computes nothing: 14 cells come from the disk cache, against 17 computed on the first load.
+
 ## Universal net eval harness: pod baselines, fed levels, the ink teacher, and the --fit-zarr off-grid bug (2026-11-12, branches univ-eval-20261111 + fitslab-20261111)
 
 `scripts/univ/eval.sh CKPT TAG` builds the task x resolution matrix (wbench core at the native level and fed one level finer / coarser

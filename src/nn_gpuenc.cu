@@ -200,3 +200,16 @@ extern "C" int nn_vcg_shard(const uint8_t *dsh, int n, const float *drstep, cons
     vcg_list_k<<<(unsigned)L.nb, 256>>>(dsh, n, drstep, dscan, fma, off, cnt, tot, cap_e, lv, pos);
     return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }
+
+/* the raw shard into pinned host memory (written over the bus by the kernel) only when its levels overflowed (*tot > cap): the writer then
+   encodes it from the bytes; otherwise nothing crosses the bus (the heads' shards were copied whole beside their levels: 92 GB of a 5-head
+   19 Gvox run, ahead of the --fit-zarr copies on the offload stream) */
+__global__ static void vcg_copy_over_k(const uint4 *__restrict__ src, uint4 *dst, size_t n16, const unsigned long long *__restrict__ tot, unsigned long long cap) {
+    if (*tot <= cap) return;
+    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n16; i += (size_t)gridDim.x * blockDim.x) dst[i] = src[i];
+}
+extern "C" int nn_vcg_copy_over(const uint8_t *dsh, uint8_t *host, size_t bytes, const uint8_t *hdr, size_t cap_e) {
+    if (bytes % 16 || ((uintptr_t)dsh | (uintptr_t)host) % 16) return -1;
+    vcg_copy_over_k<<<1024, 256>>>((const uint4 *)dsh, (uint4 *)host, bytes / 16, (const unsigned long long *)hdr, cap_e);
+    return cudaGetLastError() == cudaSuccess ? 0 : -1;
+}

@@ -117,9 +117,10 @@ static gpu_state *g_G0;   /* the trainer's per-GPU states (an index for per-GPU 
 /* task band_affinity: output channel 0 = recto (dense loss on target channel 0), channels 1..K = affinities for g_aff_off */
 static const char *g_lat_fit; static int g_lat_fit_n = 24, g_lat_fit_k;   /* --lat-fit FILE [--lat-fit-n N]: fit the cell transform (latfit.h) on N training windows, write it, exit */
 static int g_lat_guide;   /* --lat-guide 1: the guided head (5 coefficient planes for the 2 side-slot channels; nn_lat_guide) */
-#define LNC (g_lat_guide == 64 ? 144 : g_lat_guide == 8 ? 32 : g_cout + g_lat_guide)
+#define LBASE (g_cout <= 16 ? 16 : (g_cout + 15) / 16 * 16)   /* --lat-guide 3: the interpolated base outputs (the task's, rounded up to 16; 16 up to 16 outputs: the old 144-output head) */
+#define LNC (g_lat_guide == 64 ? LBASE + 128 : g_lat_guide == 8 ? 32 : g_cout + g_lat_guide)
 #define LUPC (g_lat_guide == 64 ? g_cout : LNC)
-#define LGFC (g_lat_guide == 64 ? 16 : LNC)   /* the outputs whose gradient is summed in fp32 (the sub-cell outputs' goes straight into the 16-bit copy: -4 B per output and cell) */   /* the interpolated outputs (the sub-cell head's 128 others are read per voxel) */
+#define LGFC (g_lat_guide == 64 ? LBASE : LNC)   /* the outputs whose gradient is summed in fp32 (the sub-cell outputs' goes straight into the 16-bit copy: -4 B per output and cell) */   /* the interpolated outputs (the sub-cell head's 128 others are read per voxel) */
 #define LGUIDE(dir) do { if (g_lat_guide == 8) nn_lat_guide4(d->x, D, H, W, z0, nz, d->hs_lg, 24, g_side_ch, 2, dir); else nn_lat_guide(d->x, D, H, W, z0, nz, d->hs_lg, g_cout, g_side_ch, dir); } while (0)   /* the latent-grid network's outputs */
 static float g_lat_jit;   /* --lat-step-jitter J: each training window quantised with step x 2^(J u), u uniform in [-1, 1] (a latent store's step in window-normalised units varies with the window's sd) */
 static int g_lat_c, g_lat_have; static float g_lat_step, g_lat_bas[29 * 64], g_lat_gain[29];   /* --lat-basis FILE [--lat-c 29 --lat-step 0.25]: the learned cell channels (latfit.h) */
@@ -1044,8 +1045,8 @@ static void head_slab_pass(gpu_state *d, int pass) {
             if (z1 == D) { fprintf(stderr, "lat check: upsampling: %zu of %zu fp16 logits differ (%zu by more than one code), max |difference| %.3g, rms difference / rms %.3g\n", nd, nt_, n1, mx, sqrt(sq / (sr > 0 ? sr : 1))); mx = sq = sr = 0; nd = nt_ = n1 = 0; }
         }
         if (g_lat_hs) FT("  u head fwd + upsample"); else PT("upsample");
-        if (g_lat_hs && g_lat_guide == 64) nn_lat_shuffle_c(d->lgc, 1, D / 4, H / 4, W / 4, 16, 2, z0, nz, (char *)d->hs_lg + (size_t)g_side_ch * ns * 2, qa, qb - qa);
-        else if (g_lat && g_lat_guide == 64) nn_lat_shuffle(d->lg, unet_logits_h16(d->u), D / 4, H / 4, W / 4, 16, 2, z0, nz, (char *)d->hs_lg + (size_t)g_side_ch * ns * 2);   /* the sub-cell head */
+        if (g_lat_hs && g_lat_guide == 64) nn_lat_shuffle_c(d->lgc, 1, D / 4, H / 4, W / 4, LBASE, 2, z0, nz, (char *)d->hs_lg + (size_t)g_side_ch * ns * 2, qa, qb - qa);
+        else if (g_lat && g_lat_guide == 64) nn_lat_shuffle(d->lg, unet_logits_h16(d->u), D / 4, H / 4, W / 4, LBASE, 2, z0, nz, (char *)d->hs_lg + (size_t)g_side_ch * ns * 2);   /* the sub-cell head */
         else if (g_lat && g_lat_guide && !fside) LGUIDE(0);   /* --lat-guide: the side channels' sub-cell terms from the CT */
         if (g_lat_hs) { FT("  u guide / shuffle"); PT("upsample"); }
         if (g_fstem && !d->fs_drop && nn_fstem_fwd(d->x, D, H, W, z0, nz, unet_live_params(d->u) + unet_fstem_off(d->u), g_fstem, g_fs_n, g_fs_ch, d->hs_lg, ns)) { fprintf(stderr, "--fstem: slab shape\n"); abort(); }
@@ -1165,7 +1166,7 @@ static void head_slab_pass(gpu_state *d, int pass) {
             const size_t pl = (size_t)(H / 4) * (W / 4); const int f0 = qa, f1 = z1 == D ? D / 4 : z1 / 4 - 1;
             if (z0 == 0) nn_zero(d->latg, (size_t)LGFC * qc * pl * 4);
             if (g_fstem && !d->fs_drop) nn_fstem_bwd(d->x, D, H, W, z0, nz, unet_live_params(d->u) + unet_fstem_off(d->u), g_fstem, g_fs_n, g_fs_ch, d->hs_lg, ns, unet_grad_ptr(d->u) + unet_fstem_off(d->u));   /* (before the adjoints reuse the planes) */
-            if (g_lat_guide == 64) nn_lat_shuffle_adj_c((char *)d->hs_lg + (size_t)g_side_ch * ns * 2, D / 4, H / 4, W / 4, 16, 2, z0, nz, d->latgl, q0, qc);
+            if (g_lat_guide == 64) nn_lat_shuffle_adj_c((char *)d->hs_lg + (size_t)g_side_ch * ns * 2, D / 4, H / 4, W / 4, LBASE, 2, z0, nz, d->latgl, q0, qc);
             else if (g_lat_guide && !fside) LGUIDE(1);
             FT("  a guide / shuffle adjoint");   /* the coefficient planes' gradients (the guided heads: every output is interpolated, all through the fp32 sums) */
             if (fuse) {   /* the fused groups straight from the cell logits (before the slab adjoint takes the normal targets as its scratch) */
@@ -1194,7 +1195,7 @@ static void head_slab_pass(gpu_state *d, int pass) {
             if (pipe) nn_event_record(d->evl_free[sj & 1], 0);
             continue;
         }
-        if (g_lat && g_lat_guide == 64) nn_lat_shuffle_adj((char *)d->hs_lg + (size_t)g_side_ch * ns * 2, D / 4, H / 4, W / 4, 16, 2, z0, nz, d->latgl);
+        if (g_lat && g_lat_guide == 64) nn_lat_shuffle_adj((char *)d->hs_lg + (size_t)g_side_ch * ns * 2, D / 4, H / 4, W / 4, LBASE, 2, z0, nz, d->latgl);
         else if (g_lat && g_lat_guide) LGUIDE(1);   /* the coefficient planes' gradients */
         if (g_lat) nn_lat_up_adj(d->hs_lg, LUPC, D / 4, H / 4, W / 4, z0, nz, d->latg, d->nt);   /* (scratch: the normal targets, 7 bytes a voxel, are done for this slab; any channel count: groups of 28) */   /* --lat: the slab's gradient onto the cell grid */
         else { if (d->gc_on) nn_gram16(d->hs_lg, !nn_get_f16(), g_cout, ns, ns, d->gcS);
@@ -1432,7 +1433,7 @@ static void gc_report(gpu_state *d, int step) {   /* the tasks' cosines at the h
     for (int c = 0; c < K; c++) {   /* channel -> task (-1 none): the interpolated outputs by their head, the guided / sub-cell outputs the side pair's */
         int t = -1;
         if (c < g_cout) t = c == g_side_ch || c == g_side_ch + 1 ? 0 : c >= g_norm_ch && c < g_norm_ch + 7 ? 1 : g_unwrap2 && (c == g_w4_ch || c == g_w4_ch + 1) ? 2 : g_rv == 2 && (c == g_rv_ch || c == g_rv_ch + 1) ? 3 : g_ink2 && c == g_ink2_ch ? 4 : -1;
-        else if (g_lat && g_lat_guide == 64 ? c >= 16 : g_lat && g_lat_guide && g_lat_guide != 8) t = 0;
+        else if (g_lat && g_lat_guide == 64 ? c >= LBASE : g_lat && g_lat_guide && g_lat_guide != 8) t = 0;
         ct[c] = (int8_t)t;
     }
     double dot[T][T] = {{0}};
@@ -2317,7 +2318,6 @@ int cmd_train(int argc, char **argv) {
             { const int lg_ = atoi(opt(argc, argv, "--lat-guide", "0")); g_lat_guide = lg_ == 1 ? 5 : lg_ == 2 ? 8 : lg_ == 3 ? 64 : 0; }   /* 3: the sub-cell head (144 outputs) */   /* 1: the side form (5 planes, 16 outputs), 2: the general form (8 planes, 32 outputs) */
             if (resume) { unet_cfg pc; int st; if (!unet_peek(resume, &pc, &st) && pc.half_res == 3) g_lat_guide = pc.lat_guide; }
             if (g_lat_guide == 5 && !g_rv) { fprintf(stderr, "--lat-guide 1: with --rv (the two side channels; --lat-guide 2 for the phase channels)\n"); return 2; }
-            if (g_lat_guide == 64 && g_cout > 16) { fprintf(stderr, "--lat-guide 3: at most 16 task outputs\n"); return 2; }
             if (g_lat_guide == 8 && g_cout > 24) { fprintf(stderr, "--lat-guide 2: at most 24 task outputs\n"); return 2; }
             g_half = 0; cfg.half_res = 3; cfg.cin = 4; cfg.cout = LNC; cfg.lat_guide = g_lat_guide;
             const char *lbp = opt(argc, argv, "--lat-basis", nullptr);
@@ -2868,8 +2868,8 @@ int cmd_train(int argc, char **argv) {
                 if (g == 0 && init_lr != 1.f) fprintf(stderr, "--init-lr-mult %g: %zu of %zu parameters inherited\n", init_lr, unet_inherited(d->u), unet_nparams(d->u));
             }
             if (g_lat_guide == 64) {   /* the sub-cell outputs start at zero: the net begins as the interpolated head (random rows gave a 4-voxel lattice wherever the labels do not reach) */
-                for (int co = 16; co < cfg.cout; co++) unet_head_row_reset(d->u, co, 0.f);
-                if (g == 0) fprintf(stderr, "sub-cell head: outputs 16-%d start at zero\n", cfg.cout - 1);
+                for (int co = LBASE; co < cfg.cout; co++) unet_head_row_reset(d->u, co, 0.f);
+                if (g == 0) fprintf(stderr, "sub-cell head: outputs %d-%d start at zero\n", LBASE, cfg.cout - 1);
             }
             if (g_sheet && unet_start_sheet(d->u)) return 2;
         }
