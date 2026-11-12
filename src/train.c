@@ -229,6 +229,15 @@ static int g_gc;
    level, as for scans with no finer data; validation and predict always use it) */
 static int g_fstem, g_fs_n, g_fs_ch[16]; static float g_fs_drop = 0.25f;
 static float src_head_w(int si, int h) { return (si >= 0 && g_S && si < g_S->n ? g_S->src[si].head_w[h] : 1.f) * g_hmul[h]; }   /* the source's "heads" multiplier x --uw */
+/* --init-from: does an unwrap2 donor keep its rv pair / ink row somewhere other than this net's channels (u1 rv 11-12 -> U2 ink 11, rv
+   12-13)? Then the head is mapped by name; same places (a donor that only lacks appended heads, e.g. the fibre head) keep the positional
+   branches */
+static int unwrap2_heads_moved(const char *init_from) {
+    char *hd = checkpoint_header_line(init_from); if (!hd) return 0;
+    const char *r2 = strstr(hd, "\"rv\":{\"version\":2,\"recto\":"), *uw = strstr(hd, "\"unwrap\":{\"version\":2"), *ik = uw ? strstr(uw, "\"ink\":") : nullptr;
+    const int drv = r2 ? atoi(r2 + strlen("\"rv\":{\"version\":2,\"recto\":")) : -1, dink = ik ? atoi(ik + strlen("\"ink\":")) : -1; free(hd);
+    return (g_rv == 2 && drv >= 0 && drv != g_rv_ch) || (g_ink2 && dink >= 0 && dink != g_ink2_ch) || (g_ink2 && dink < 0 && drv == g_ink2_ch);
+}
 static double g_reject_warn = 100;
 static int g_mil, g_mil_mode = 1, g_mil_stride = 2, g_mil_max = 65536; static float g_mil_R = 10.f, g_mil_step = 1.f, g_mil_tau = 0.f, g_mil_lambda = 1.f;   /* --ink-mil L
    (--ink-head): the normal-pooled MIL ink loss on each window's rays (inkmil.h): per supervised label pixel (mode 1: only those without an open face, the
@@ -2830,13 +2839,13 @@ int cmd_train(int argc, char **argv) {
             const char *init_from = opt(argc, argv, "--init-from", nullptr);   /* partial warm start from another architecture */
             if (init_from) {
                 unet_set_init_shift(atoi(opt(argc, argv, "--init-shift", "0")));   /* a latent-grid net from a voxel donor: --init-shift 2 */
-                int rows[64];   /* --verso: recto copied into the verso channel, the donor's other rows (affinities) shifted up */
+                int rows[512];   /* --verso: recto copied into the verso channel, the donor's other rows (affinities) shifted up */
                 if (g_verso) { unet_cfg dc; int ds; if (unet_peek(init_from, &dc, &ds)) { fprintf(stderr, "cannot read %s\n", init_from); return 1; }
                     rows[0] = 0; rows[1] = g_verso_zero ? -1 : 0;
                     for (int co = 2; co < cfg.cout; co++) rows[co] = dc.cout == cfg.cout ? co : co - 1 < dc.cout ? co - 1 : -1;
                     if (dc.cout == cfg.cout && g_aff) { fprintf(stderr, "--verso --init-from: %s already has %d outputs; use --resume\n", init_from, dc.cout); return 1; } }
                 const char *hm = opt(argc, argv, "--head-map", nullptr);   /* explicit donor row per output channel (-1 fresh), e.g. 0,2,3,4,5,6,7,-1 */
-                int w4map = 0;   /* unwrap2 from a task unwrap donor (recto, ink, phase 2-3, normal / density 4-10): its rows 2..10 into 0..8, the winding mod 4 fresh */
+                int w4map = 0, fib_fresh = 0;   /* unwrap2 from a task unwrap donor (recto, ink, phase 2-3, normal / density 4-10): its rows 2..10 into 0..8, the winding mod 4 fresh */
                 if (g_unwrap2 && !hm && !g_verso) {
                     unet_cfg dc; int ds;
                     if (unet_peek(init_from, &dc, &ds)) { fprintf(stderr, "cannot read %s\n", init_from); return 1; }
@@ -2849,6 +2858,21 @@ int cmd_train(int argc, char **argv) {
                         w4map = 2;
                         if (g == 0 && g_rv != 2) fprintf(stderr, "init-from: task unwrap2 donor: head rows 0-10 copied, row %d (ink) fresh: zero weights, bias %g\n", g_ink2_ch, atof(opt(argc, argv, "--ink-bias", "-2")));
                         else if (g == 0) fprintf(stderr, "init-from: task unwrap2 donor: head rows 0-10 copied, rows 11-%d (%s%s) fresh: zero weights, prior bias\n", cfg.cout - 1, g_ink2 ? "ink " : "", "rv");
+                    } else if (checkpoint_unwrap_version(init_from) == 2 && dc.cout > 11 && (g_rv == 2 || g_ink2) && unwrap2_heads_moved(init_from)) {
+                        /* an unwrap2 donor of the same width whose named heads sit elsewhere: rows by head, not by position. u1 (rv at 11-12, no
+                           ink) -> U2 (ink 11, rv 12-13): the positional copy gave U2's rv U1's verso row and an untrained pad row (rv bce 0.57 at
+                           step 50 against U1's 0.36), and the ink reset overwrote U1's recto row (2026-11-12). The donor's header names its rv
+                           pair ("rv":{"version":2,"recto":R}) and ink ("unwrap":{.."ink":C}); rows 0-10 and the sub-cell rows keep their place */
+                        char *hd = checkpoint_header_line(init_from);
+                        const char *r2 = hd ? strstr(hd, "\"rv\":{\"version\":2,\"recto\":") : nullptr, *uw = hd ? strstr(hd, "\"unwrap\":{\"version\":2") : nullptr, *ik = uw ? strstr(uw, "\"ink\":") : nullptr;
+                        const int drv = r2 ? atoi(r2 + strlen("\"rv\":{\"version\":2,\"recto\":")) : -1, dink = ik ? atoi(ik + strlen("\"ink\":")) : -1; free(hd);
+                        for (int co = 0; co < cfg.cout; co++) rows[co] = co < 11 || (co >= LBASE && dc.cout == cfg.cout) ? co : -1;
+                        if (g_rv == 2) for (int k = 0; k < 2; k++) rows[g_rv_ch + k] = drv >= 0 ? drv + k : -1;
+                        if (g_ink2) rows[g_ink2_ch] = dink;
+                        if (g_fibh && g_fib_ch + 9 > dc.cout) { fib_fresh = 1; for (int k = 0; k < 9; k++) rows[g_fib_ch + k] = -1; }   /* (fibre rows the donor lacks: fresh as in the fibre branch) */
+                        w4map = dink >= 0 ? 5 : 4;   /* (4: the ink row fresh below: zero weights, the prior bias) */
+                        if (g == 0) { fprintf(stderr, "init-from: unwrap2 donor by head: rows 0-10 kept"); if (g_rv == 2) fprintf(stderr, ", rv %d-%d <- donor %d-%d%s", g_rv_ch, g_rv_ch + 1, drv, drv + 1, drv < 0 ? " (none: fresh)" : "");
+                                      if (g_ink2) fprintf(stderr, ", ink %d <- %s", g_ink2_ch, dink >= 0 ? "the donor's ink row" : "fresh"); if (LBASE < cfg.cout) fprintf(stderr, ", rows %d-%d by position", LBASE, cfg.cout - 1); fprintf(stderr, "\n"); }
                     } else if (g_fibh && checkpoint_unwrap_version(init_from) == 2 && dc.cout == g_fib_ch) {   /* --fib-head from the same layout without it (u1): rows kept, the fibre rows fresh */
                         for (int co = 0; co < cfg.cout; co++) rows[co] = co < dc.cout ? co : -1;
                         w4map = 3;
@@ -2859,8 +2883,8 @@ int cmd_train(int argc, char **argv) {
                     if (k != cfg.cout) { fprintf(stderr, "--head-map has %d rows, the network %d outputs\n", k, cfg.cout); return 2; } }
                 const int nt = g_verso || hm || w4map ? unet_init_from_map(d->u, init_from, rows) : unet_init_from(d->u, init_from);
                 if (nt < 0) { fprintf(stderr, "cannot initialise from %s\n", init_from); return 1; }
-                if (w4map == 3) for (int k = 0; k < 9; k++) unet_head_row_reset(d->u, g_fib_ch + k, k < 2 ? (float)atof(opt(argc, argv, "--fib-bias", "-2")) : 0.f);
-                if (w4map && w4map != 3 && g_ink2) unet_head_row_reset(d->u, g_ink2_ch, (float)atof(opt(argc, argv, "--ink-bias", "-2")));   /* (a fresh ink row: zero weights, the prior bias; the donor's function elsewhere) */
+                if (w4map == 3 || fib_fresh) for (int k = 0; k < 9; k++) unet_head_row_reset(d->u, g_fib_ch + k, k < 2 ? (float)atof(opt(argc, argv, "--fib-bias", "-2")) : 0.f);
+                if (w4map && w4map != 3 && w4map != 5 && g_ink2) unet_head_row_reset(d->u, g_ink2_ch, (float)atof(opt(argc, argv, "--ink-bias", "-2")));   /* (a fresh ink row: zero weights, the prior bias; the donor's function elsewhere) */
                 {   /* --rv 2 from a donor without its pair (a plain unwrap2 net, or a latent net whose interpolated rows 11-15 never trained): fresh rv rows, bias --rv-bias */
                     char *hd = checkpoint_header_line(init_from); const int had = hd && strstr(hd, "\"rv\":{\"version\":2"); free(hd);
                     if (g_rv == 2 && !had && !hm) { for (int k = 0; k < 2; k++) unet_head_row_reset(d->u, g_rv_ch + k, (float)atof(opt(argc, argv, "--rv-bias", "0"))); if (g == 0) fprintf(stderr, "init-from: rv rows %d-%d fresh (zero weights, bias %s)\n", g_rv_ch, g_rv_ch + 1, opt(argc, argv, "--rv-bias", "0")); }
@@ -3902,18 +3926,18 @@ int cmd_train(int argc, char **argv) {
                     uint32_t (*cur)[SL_N] = calloc((size_t)S->n, sizeof *cur); double newt = 0, wt = 0;
                     for (int si = 0; si < S->n; si++) { for (int lv = 0; lv < MAXLEV; lv++) { uint32_t r[SL_N]; sampler_level_stats(sp, si, lv, r); for (int k = 0; k < SL_N; k++) cur[si][k] += r[k]; }
                         newt += cur[si][SL_PROD] - prev[si][SL_PROD]; wt += S->src[si].weight; }
-                    o = snprintf(ln, sizeof ln, "draws steps %d-%d (%.0f new windows): new %% / weight %% (dropped hold/empty/probe/fg):", step - mix_every + 1, step, newt);
+                    o = snprintf(ln, sizeof ln, "draws steps %d-%d (%.0f new windows): new %% / weight %% (dropped hold/empty/probe/fg/other):", step - mix_every + 1, step, newt);
                     for (int si = 0; si < S->n; si++) { uint32_t dd[SL_N]; for (int k = 0; k < SL_N; k++) dd[k] = cur[si][k] - prev[si][k];
-                        o += snprintf(ln + o, sizeof ln - o > 0 ? sizeof ln - o : 0, " %s %.1f/%.1f (%u/%u/%u/%u)", S->src[si].name, newt > 0 ? 100 * dd[SL_PROD] / newt : 0, wt > 0 ? 100 * S->src[si].weight / wt : 0,
-                                      dd[SL_HOLD], dd[SL_EMPTY], dd[SL_PROBE], dd[SL_FG]); }
+                        o += snprintf(ln + o, sizeof ln - o > 0 ? sizeof ln - o : 0, " %s %.1f/%.1f (%u/%u/%u/%u/%u)", S->src[si].name, newt > 0 ? 100 * dd[SL_PROD] / newt : 0, wt > 0 ? 100 * S->src[si].weight / wt : 0,
+                                      dd[SL_HOLD], dd[SL_EMPTY], dd[SL_PROBE], dd[SL_FG], dd[SL_OTHER]); }
                     fprintf(stderr, "%s\n", ln);
                     /* a source dropping far more draws than it delivers (a missing coarse CT level, a draw index that misses the labels):
                        its share can look normal while its workers spend 300x the reads (diskclean 2026-11-12); --reject-warn R (100; 0 off) */
                     for (int si = 0; si < S->n && g_reject_warn > 0; si++) { const uint32_t pr = cur[si][SL_PROD] - prev[si][SL_PROD];
-                        const uint32_t dr = cur[si][SL_HOLD] - prev[si][SL_HOLD] + cur[si][SL_EMPTY] - prev[si][SL_EMPTY] + cur[si][SL_PROBE] - prev[si][SL_PROBE] + cur[si][SL_FG] - prev[si][SL_FG];
-                        if (dr > g_reject_warn * (pr > 0 ? pr : 1)) fprintf(stderr, "WARNING draws: %s dropped %u draws for %u new windows (%.3g per window, > --reject-warn %g; hold/empty/probe/fg %u/%u/%u/%u)\n",
+                        const uint32_t dr = cur[si][SL_HOLD] - prev[si][SL_HOLD] + cur[si][SL_EMPTY] - prev[si][SL_EMPTY] + cur[si][SL_PROBE] - prev[si][SL_PROBE] + cur[si][SL_FG] - prev[si][SL_FG] + cur[si][SL_OTHER] - prev[si][SL_OTHER];
+                        if (dr > g_reject_warn * (pr > 0 ? pr : 1)) fprintf(stderr, "WARNING draws: %s dropped %u draws for %u new windows (%.3g per window, > --reject-warn %g; hold/empty/probe/fg/other %u/%u/%u/%u/%u)\n",
                             S->src[si].name, dr, pr, (double)dr / (pr > 0 ? pr : 1), g_reject_warn, cur[si][SL_HOLD] - prev[si][SL_HOLD], cur[si][SL_EMPTY] - prev[si][SL_EMPTY],
-                            cur[si][SL_PROBE] - prev[si][SL_PROBE], cur[si][SL_FG] - prev[si][SL_FG]); }
+                            cur[si][SL_PROBE] - prev[si][SL_PROBE], cur[si][SL_FG] - prev[si][SL_FG], cur[si][SL_OTHER] - prev[si][SL_OTHER]); }
                     memcpy(prev, cur, (size_t)S->n * sizeof *cur); free(cur);
                 }
                 if (g_rv == 2) { o = snprintf(ln, sizeof ln, "rv bce by source steps %d-%d:", step - mix_every + 1, step);
