@@ -45,6 +45,39 @@ int main(void) {
         }
         free(g);
     }
+    if (ink_mil_slab_hostmem && !getenv("UFSM_TEST_NO_GPU")) {   /* the slab form (train's two head passes) == the full-volume reference on the 16-bit logits */
+        float *l16 = malloc(nv * 4); for (size_t k = 0; k < nv; k++) l16[k] = (float)(_Float16)lg[k];
+        float *ga = malloc(nv * 4), *gb = malloc(nv * 4);
+        for (int mode = 0; mode < 2; mode++) {
+            const float tau = mode ? 0 : 0.5f;
+            double *g = calloc(nv, sizeof *g); const double L = ink_mil_loss_host(l16, g, D, H, W, R, NR, Rr, step, tau, eps, sc);
+            double gm = 0; for (size_t k = 0; k < nv; k++) if (fabs(g[k]) > gm) gm = fabs(g[k]);
+            static const int ns[3] = {1, 3, 7};
+            for (int s = 0; s < 3; s++) {
+                double Ls = 0; if (ink_mil_slab_hostmem(lg, 0, D, H, W, R, NR, Rr, step, tau, eps, sc, ns[s], ga, &Ls)) { fprintf(stderr, "mil slabs: no GPU (skipped)\n"); break; }
+                long off = 0; double em = 0; for (size_t k = 0; k < nv; k++) { const double e = fabs(ga[k] - g[k]); if (e > em) em = e; off += e > 2e-3 * fabs(g[k]) + 2e-3 * gm; }
+                fprintf(stderr, "mil %s, %d slab(s): loss %.6f (full %.6f), max |grad err| %.2e of %.2e, %ld voxels off\n", mode ? "hard" : "soft", ns[s], Ls, L, em, gm, off);
+                CHECK(fabs(Ls - L) < 1e-3 * fabs(L) && off <= (mode ? (long)(nv / 1000) : 0), "slab form (%s, %d slabs): loss %g vs %g, %ld off", mode ? "hard" : "soft", ns[s], Ls, L, off);
+                if (ns[s] == 7) {   /* --det: the same bytes on a rerun */
+                    double L2 = 0; ink_mil_slab_hostmem(lg, 0, D, H, W, R, NR, Rr, step, tau, eps, sc, 7, gb, &L2);
+                    CHECK(!memcmp(ga, gb, nv * 4) && L2 == Ls, "slab form not deterministic (%s)", mode ? "hard" : "soft");
+                }
+            }
+            free(g);
+        }
+        {   /* bf16 logits / gradients (the --bf16 recipes): 3 slabs against the reference on bf16-rounded logits */
+            for (size_t k = 0; k < nv; k++) l16[k] = (float)(__bf16)lg[k];
+            double *g = calloc(nv, sizeof *g); const double L = ink_mil_loss_host(l16, g, D, H, W, R, NR, Rr, step, 0.5f, eps, sc), Ls0 = 0; double Ls = Ls0;
+            double gm = 0; for (size_t k = 0; k < nv; k++) if (fabs(g[k]) > gm) gm = fabs(g[k]);
+            if (!ink_mil_slab_hostmem(lg, 1, D, H, W, R, NR, Rr, step, 0.5f, eps, sc, 3, ga, &Ls)) {
+                long off = 0; for (size_t k = 0; k < nv; k++) off += fabs(ga[k] - g[k]) > 1e-2 * fabs(g[k]) + 1e-2 * gm;
+                fprintf(stderr, "mil soft bf16, 3 slabs: loss %.6f (full %.6f), %ld voxels off\n", Ls, L, off);
+                CHECK(fabs(Ls - L) < 1e-3 * fabs(L) && !off, "slab form bf16: loss %g vs %g, %ld off", Ls, L, off);
+            }
+            free(g);
+        }
+        free(l16); free(ga); free(gb);
+    }
     free(lg); free(R);
     if (!getenv("UFSM_TEST_NO_GPU") && nn_init(0) == 0) {   /* train --ink-smooth: nn_ink_targets_smooth == t (1 - eps) + eps / 2 (x255, rounded), eps 0 == nn_ink_targets */
         uint8_t in[256], t0[256], t1[256], m0[256], m1[256]; for (int i = 0; i < 256; i++) in[i] = (uint8_t)i;

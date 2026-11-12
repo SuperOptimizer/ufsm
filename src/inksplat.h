@@ -50,6 +50,8 @@ typedef struct {
                                    level smoothed [1 2 1]; the first papyrus run (>= face_run samples >= iso) that ends at t >= -4 and starts
                                    at t <= 8, followed by >= face_gap samples < iso, ends at the face f; the label goes to t in [f + A, f + B].
                                    No such run: the pixel stays unknown. */
+    const char *val; int val_mode;   /* --val V --val-mode exclude|only: a validation raster (as the mask): exclude (1) drops its pixels (>= 128) from the
+                                       supervision (training), only (2) keeps nothing else (the validation GT); 0 ignores it. On the fly: per segment "validation" */
     int nexcl; int64_t excl[64][6];   /* --exclude z,y,x,nz,ny,nx (level-0 voxels, repeatable): output voxels touching a box are never written (held-out regions) */
 } inksplat_cfg;
 

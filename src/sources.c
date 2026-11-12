@@ -228,6 +228,7 @@ sources *sources_load(const char *path) {
                 if (!inkfly_open) { fprintf(stderr, "sources: %s/%s: an onfly ink target needs inksplat.o in this binary\n", s->name, CHNAME[c]); json_free(j); sources_free(S); return nullptr; }
                 const json *of = json_get(t, "onfly"); inksplat_cfg ic; inksplat_defaults(&ic); ic.face = 1;
                 ic.level = (int)json_num(json_get(of, "level"), 1); ic.iso = (int)json_num(json_get(of, "iso"), s->iso > 0 ? s->iso : 64); ic.ct_um = s->um; ic.cache = g_cache;
+                { const char *vm = json_str(json_get(of, "validation"), "exclude"); ic.val_mode = !strcmp(vm, "only") ? 2 : !strcmp(vm, "off") ? 0 : 1; }   /* the segments' "validation" rasters: held out per pixel */
                 const json *fa = json_get(of, "face"); if (fa && fa->n == 2) { ic.face_a = json_num(json_at(fa, 0), -6); ic.face_b = json_num(json_at(fa, 1), 0); }
                 const char *sg = json_str(json_get(of, "segments"), nullptr), *hf = json_str(json_get(of, "holdout_file"), json_str(json_get(e, "holdout_file"), nullptr));
                 const int L = ic.level;

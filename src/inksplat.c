@@ -561,6 +561,16 @@ int inksplat_run(const inksplat_cfg *c) {
             fprintf(stderr, "ink-splat: %s values (%d distinct):%s%s\n", k ? "mask" : "labels", nv, o ? hs : "", nv > 8 ? " .." : "");
             if (mx == 1) { for (size_t i = 0; i < np; i++) R[k][i] *= 255; fprintf(stderr, "ink-splat: %s is 0/1, read as 0/255\n", k ? "mask" : "labels"); } }
     }
+    if (c->val && c->val_mode) {   /* the validation pixels folded into the mask (exclude: out of the supervision; only: all that is left) */
+        lsrc LV; const size_t np = (size_t)G.lw * G.lh; uint8_t *V = malloc(np);
+        if (!V || lsrc_open(&LV, c->val, -1, c->cache)) { free(V); goto out1; }
+        const int e = lsrc_read(&LV, G.lr0, G.lc0, G.lh, G.lw, V, c->threads); lsrc_close(&LV); if (e) { free(V); goto out1; }
+        uint8_t mx = 0; for (size_t i = 0; i < np; i++) if (V[i] > mx) mx = V[i];
+        if (!G.msk) { G.msk = malloc(np); if (!G.msk) { free(V); goto out1; } memset(G.msk, 255, np); }
+        size_t nv = 0; for (size_t i = 0; i < np; i++) { const int v = (mx == 1 ? V[i] * 255 : V[i]) >= 128; nv += v; if (c->val_mode == 1 ? v : !v) G.msk[i] = 0; }
+        fprintf(stderr, "ink-splat: validation %s: %zu px (%s)\n", c->val, nv, c->val_mode == 1 ? "excluded from the supervision" : "the only supervision");
+        free(V);
+    }
     uint64_t nsup = 0, nink = 0;
     for (size_t k = 0; k < (size_t)G.lw * G.lh; k++) if (!G.msk || G.msk[k] >= 128) { nsup++; nink += G.lab[k] >= 128; }
     const double px_um = F * (S.vox_um > 0 ? S.vox_um : c->ct_um), cm2 = 1e-8 * px_um * px_um;
@@ -882,7 +892,7 @@ int cmd_ink_splat(int argc, char **argv) {
     inksplat_cfg c; inksplat_defaults(&c);
     const int ci = sidx(argc, argv, "--ct"), pi = sidx(argc, argv, "--pred");
     if (argc < 3 || ci < 0 || ci + 2 >= argc) {
-        fprintf(stderr, "usage: ufsm ink-splat <out-group|-> --surface TIFXYZ --labels L [--mask M] --ct ROOT KEY --ct-um U [--level 0] --iso I\n"
+        fprintf(stderr, "usage: ufsm ink-splat <out-group|-> --surface TIFXYZ --labels L [--mask M] [--val V --val-mode exclude|only] --ct ROOT KEY --ct-um U [--level 0] --iso I\n"
                         "         [--band A,B (layers, -4,4)] [--layer-vox 1] [--flip] [--thr 0.5] [--label-z Z] [--label-scale F] [--label-offset r,c] [--crop c0,r0,w,h]\n"
                         "         [--merge] [--coarse N] [--name NAME] [--summary JSON] [--preview JPG] [--pyramid-only] [--exclude z,y,x,nz,ny,nx (level-0, repeatable)]\n         ufsm ink-splat <out-group> --points VC3D.json --radius-um 5 --ct ROOT KEY --ct-um U [--level 0] --iso I [--merge]   (3D point labels) [--threads 6] [--cache DIR]\n"
                         "         [--pred ROOT KEY [--pred-level L] [--pred-thr 128] [--pred-skip V] [--profile T] [--stride 4]]\n"
@@ -892,6 +902,7 @@ int cmd_ink_splat(int argc, char **argv) {
     }
     c.out = strcmp(argv[2], "-") ? argv[2] : nullptr;
     c.surface = sopt(argc, argv, "--surface", nullptr); c.labels = sopt(argc, argv, "--labels", nullptr); c.mask = sopt(argc, argv, "--mask", nullptr);
+    c.val = sopt(argc, argv, "--val", nullptr); { const char *vm = sopt(argc, argv, "--val-mode", "exclude"); c.val_mode = !c.val ? 0 : !strcmp(vm, "only") ? 2 : !strcmp(vm, "off") ? 0 : 1; }
     c.ct_root = argv[ci + 1]; c.ct_key = argv[ci + 2]; c.ct_um = atof(sopt(argc, argv, "--ct-um", "0")); c.level = atoi(sopt(argc, argv, "--level", "0"));
     c.iso = atoi(sopt(argc, argv, "--iso", "1"));
     if (sscanf(sopt(argc, argv, "--band", "-4,4"), "%lf,%lf", &c.band_a, &c.band_b) != 2) { fprintf(stderr, "ink-splat: --band A,B\n"); return 2; }
@@ -1056,7 +1067,7 @@ int cmd_ink_vscore(int argc, char **argv) {
    max over units of the known values (the stored runs' --merge), so the array is byte-identical to the merged splat of the same
    units. Reads may come from any thread. */
 typedef struct { char tifxyz[1024], labels[1024], mask[1024]; int crop[4]; } inkfly_seg;
-typedef struct { int surf, lab, msk; int64_t lr0, lc0, lw, lh; int ntx, nty; double F; int lab01, msk01; } ifunit;
+typedef struct { int surf, lab, msk, val; int64_t lr0, lc0, lw, lh; int ntx, nty; double F; int lab01, msk01, val01; } ifunit;
 typedef struct { int32_t lo[3], hi[3]; uint32_t unit, tile; } iftile;
 typedef struct {
     inksplat_cfg c; int L; double V, off, reach; int64_t shape[3]; z3 *base_ct; zcache *zc;   /* zc: decoded CT chunks shared by neighbouring chunks' boxes */
@@ -1088,6 +1099,21 @@ static int box_hit(const int32_t lo[3], const int32_t hi[3], const int64_t a[3],
     for (int d = 0; d < 3; d++) if (hi[d] < a[d] || lo[d] >= b[d]) return 0;
     return 1;
 }
+/* a unit's supervision mask over a label rectangle: the mask (0/1 rule), the validation pixels folded in (cfg val_mode); nullptr *out
+   when neither applies (every pixel supervised). 0 ok. */
+static int ifu_mask(inkfly *f, const ifunit *u, int64_t r0, int64_t c0, int64_t h, int64_t w, uint8_t **out) {
+    const int vm = u->val >= 0 ? f->c.val_mode : 0; *out = nullptr;
+    if (u->msk < 0 && !vm) return 0;
+    const size_t np = (size_t)h * w; uint8_t *m = malloc(np); if (!m) return -1;
+    if (u->msk >= 0) { if (lsrc_read(&f->Ls[u->msk], u->lr0 + r0, u->lc0 + c0, h, w, m, 1)) { free(m); return -1; } if (u->msk01) for (size_t k = 0; k < np; k++) m[k] *= 255; }
+    else memset(m, 255, np);
+    if (vm) {
+        uint8_t *v = malloc(np); if (!v || lsrc_read(&f->Ls[u->val], u->lr0 + r0, u->lc0 + c0, h, w, v, 1)) { free(v); free(m); return -1; }
+        for (size_t k = 0; k < np; k++) { const int iv = (u->val01 ? v[k] * 255 : v[k]) >= 128; if (vm == 1 ? iv : !iv) m[k] = 0; }
+        free(v);
+    }
+    *out = m; return 0;
+}
 /* the GPU chunk: 0 done, 1 run the CPU code (a mesh patch fell short), -1 a read failed. A CUDA failure turns the GPU off (CPU from then on). */
 static int inkfly_chunk_gpu(inkfly *f, const int64_t o[3], const int64_t n[3], const uint32_t *cand, size_t nc, uint8_t *out, int *nonempty) {
     const inksplat_cfg *c = &f->c; const double V = f->V, slack = f->reach + 3;
@@ -1104,11 +1130,10 @@ static int inkfly_chunk_gpu(inkfly *f, const int64_t o[3], const int64_t n[3], c
             if (r0 < rr0) { rr0 = r0; } if (c0 < rc0) { rc0 = c0; } if (r1 > rr1) { rr1 = r1; } if (c1 > rc1) { rc1 = c1; }
             }
         h->rr0 = rr0; h->rc0 = rc0; h->rh = rr1 - rr0; h->rw = rc1 - rc0; h->lh = u->lh; h->lw = u->lw;
-        uint8_t *lab = malloc((size_t)h->rh * h->rw), *msk = u->msk >= 0 ? malloc((size_t)h->rh * h->rw) : nullptr; h->lab = lab; h->msk = msk;
-        if (!lab || (u->msk >= 0 && !msk) || lsrc_read(&f->Ls[u->lab], u->lr0 + rr0, u->lc0 + rc0, h->rh, h->rw, lab, 1) ||
-            (msk && lsrc_read(&f->Ls[u->msk], u->lr0 + rr0, u->lc0 + rc0, h->rh, h->rw, msk, 1))) goto done;
+        uint8_t *lab = malloc((size_t)h->rh * h->rw), *msk = nullptr; h->lab = lab;
+        if (!lab || lsrc_read(&f->Ls[u->lab], u->lr0 + rr0, u->lc0 + rc0, h->rh, h->rw, lab, 1) || ifu_mask(f, u, rr0, rc0, h->rh, h->rw, &msk)) goto done;
+        h->msk = msk;
         if (u->lab01) for (size_t k = 0; k < (size_t)h->rh * h->rw; k++) lab[k] *= 255;
-        if (msk && u->msk01) for (size_t k = 0; k < (size_t)h->rh * h->rw; k++) msk[k] *= 255;
         const ssurf *S = &f->S[u->surf];
         geo G = {0}; G.c = c; G.S = S; G.F = u->F; G.lw = h->rw; G.lh = h->rh; G.lr0 = u->lr0 + rr0; G.lc0 = u->lc0 + rc0; G.offr = c->label_off[0]; G.offc = c->label_off[1];
         double gu0, gv0, gu1, gv1; px_grid(&G, -1.0, -1.0, &gu0, &gv0); px_grid(&G, (double)h->rh, (double)h->rw, &gu1, &gv1);   /* the rectangle +- 1 px (sub-samples reach 0.5) */
@@ -1192,11 +1217,9 @@ static int inkfly_chunk(inkfly *f, const int64_t o[3], const int64_t n[3], uint8
             if (r0 < rr0) { rr0 = r0; } if (c0 < rc0) { rc0 = c0; } if (r1 > rr1) { rr1 = r1; } if (c1 > rc1) { rc1 = c1; } }
         if (ng == gcap) { gcap *= 2; UG = realloc(UG, gcap * sizeof *UG); }
         ugrp *g = &UG[ng++]; memset(g, 0, sizeof *g); g->u = u; g->rr0 = rr0; g->rc0 = rc0; g->rh = rr1 - rr0; g->rw = rc1 - rc0;
-        g->lab = malloc((size_t)g->rh * g->rw); g->msk = u->msk >= 0 ? malloc((size_t)g->rh * g->rw) : nullptr;
-        if (!g->lab || (u->msk >= 0 && !g->msk) || lsrc_read(&f->Ls[u->lab], u->lr0 + rr0, u->lc0 + rc0, g->rh, g->rw, g->lab, 1) ||
-            (g->msk && lsrc_read(&f->Ls[u->msk], u->lr0 + rr0, u->lc0 + rc0, g->rh, g->rw, g->msk, 1))) goto done;
+        g->lab = malloc((size_t)g->rh * g->rw);
+        if (!g->lab || lsrc_read(&f->Ls[u->lab], u->lr0 + rr0, u->lc0 + rc0, g->rh, g->rw, g->lab, 1) || ifu_mask(f, u, rr0, rc0, g->rh, g->rw, &g->msk)) goto done;
         if (u->lab01) for (size_t k = 0; k < (size_t)g->rh * g->rw; k++) g->lab[k] *= 255;
-        if (g->msk && u->msk01) for (size_t k = 0; k < (size_t)g->rh * g->rw; k++) g->msk[k] *= 255;
         geo G = {0}; G.c = c; G.S = &f->S[u->surf]; G.F = u->F; G.lab = g->lab; G.msk = g->msk; G.lw = g->rw; G.lh = g->rh;
         G.lr0 = u->lr0 + rr0; G.lc0 = u->lc0 + rc0; G.offr = c->label_off[0]; G.offc = c->label_off[1];
         size_t pcap = 1024; g->pk = malloc(pcap * sizeof *g->pk); g->PN = malloc(pcap * 6 * sizeof *g->PN);
@@ -1338,7 +1361,7 @@ z3 *inkfly_open_pooled(z3 *ct_coarse, z3 *fine, int own_fine) {
 
 /* the dcache key: everything a chunk's bytes depend on. Bump INKFLY_CODE when the arithmetic changes. Local inputs add their size and
    mtime (a tifxyz dir: its x / y / z.tif and meta.json; a zarr array dir: its zarr.json and the dir), so edited labels miss the cache. */
-#define INKFLY_CODE "inkfly 1 (ink-splat --face, 2026-11-11)"
+#define INKFLY_CODE "inkfly 2 (ink-splat --face, validation folding, 2026-11-12)"
 static void key_stat(char **b, size_t *n, size_t *cap, const char *path, const char *sub) {
     char p[2100]; snprintf(p, sizeof p, "%s%s%s", path, sub ? "/" : "", sub ? sub : ""); struct stat st;
     char l[2400]; const int k = stat(p, &st) ? snprintf(l, sizeof l, " [%s: -]", sub ? sub : ".") :
@@ -1355,8 +1378,8 @@ static char *inkfly_key(const inkfly *f, const inksplat_cfg *c, const char *segs
     size_t n = 0, cap = 4096; char *b = malloc(cap); b[0] = 0;
     key_add(&b, &n, &cap, "%s\nct %s %s level %d shape %lld,%lld,%lld um %.6g\n", INKFLY_CODE, c->ct_root ? c->ct_root : "?", c->ct_key ? c->ct_key : "?", f->L,
             (long long)f->shape[0], (long long)f->shape[1], (long long)f->shape[2], c->ct_um);
-    key_add(&b, &n, &cap, "cfg iso %d thr %.9g flip %d face %.9g,%.9g t %.9g,%.9g run %d gap %d label_scale %.9g off %.9g,%.9g\n", c->iso, c->thr, c->flip,
-            c->face_a, c->face_b, c->face_lo, c->face_hi, c->face_run, c->face_gap, c->label_scale, c->label_off[0], c->label_off[1]);
+    key_add(&b, &n, &cap, "cfg iso %d thr %.9g flip %d face %.9g,%.9g t %.9g,%.9g run %d gap %d label_scale %.9g off %.9g,%.9g val_mode %d\n", c->iso, c->thr, c->flip,
+            c->face_a, c->face_b, c->face_lo, c->face_hi, c->face_run, c->face_gap, c->label_scale, c->label_off[0], c->label_off[1], c->val_mode);
     for (int e = 0; e < c->nexcl; e++) key_add(&b, &n, &cap, "exclude %lld,%lld,%lld,%lld,%lld,%lld\n", (long long)c->excl[e][0], (long long)c->excl[e][1],
                                                (long long)c->excl[e][2], (long long)c->excl[e][3], (long long)c->excl[e][4], (long long)c->excl[e][5]);
     for (int i = 0; i < f->nS; i++) { key_add(&b, &n, &cap, "mesh %s", f->Spath[i]);
@@ -1378,6 +1401,16 @@ static void *ifidx_worker(void *p) {
         { uint8_t m = 0; for (size_t k = 0; k < (size_t)u->lw * u->lh; k++) if (lab[k] > m) m = lab[k]; u->lab01 = m == 1; }
         if (msk) { uint8_t m = 0; for (size_t k = 0; k < (size_t)u->lw * u->lh; k++) if (msk[k] > m) m = msk[k]; u->msk01 = m == 1; if (u->msk01) for (size_t k = 0; k < (size_t)u->lw * u->lh; k++) msk[k] *= 255; }
         free(lab);
+        if (u->val >= 0) {   /* the validation raster: its 0/1 rule over the window, then folded into the mask (ifu_mask's rule) */
+            const size_t np = (size_t)u->lw * u->lh; uint8_t *v = malloc(np);
+            if (!v || lsrc_read(&f->Ls[u->val], u->lr0, u->lc0, u->lh, u->lw, v, 1)) { free(v); free(msk); atomic_store(&J->failed, 1); break; }
+            uint8_t m = 0; for (size_t k = 0; k < np; k++) if (v[k] > m) m = v[k]; u->val01 = m == 1;
+            if (cfg->val_mode) {
+                if (!msk) { msk = malloc(np); memset(msk, 255, np); }
+                for (size_t k = 0; k < np; k++) { const int iv = (u->val01 ? v[k] * 255 : v[k]) >= 128; if (cfg->val_mode == 1 ? iv : !iv) msk[k] = 0; }
+            }
+            free(v);
+        }
         geo G = {0}; G.c = cfg; G.S = S; G.F = u->F; G.msk = msk; G.lw = u->lw; G.lh = u->lh; G.lr0 = u->lr0; G.lc0 = u->lc0; G.offr = cfg->label_off[0]; G.offc = cfg->label_off[1];
         G.ntiles_x = u->ntx; G.ntiles_y = u->nty;
         size_t cap = 1024, n = 0; iftile *T = malloc(cap * sizeof *T);
@@ -1401,7 +1434,7 @@ z3 *inkfly_open(z3 *ct, const char *segs_path, const inksplat_cfg *cfg, size_t c
     inkfly *f = calloc(1, sizeof *f); f->c = *cfg; f->L = cfg->level; f->V = (double)(1 << f->L); f->off = (f->V - 1) / 2; f->base_ct = ct;
     memcpy(f->shape, z3_meta_of(ct)->shape, sizeof f->shape);
     f->reach = fmax(fmax(fabs(cfg->face_lo), fabs(cfg->face_hi)) + 1, fmax(fabs(cfg->face_lo + cfg->face_a), fabs(cfg->face_hi + cfg->face_b)));
-    const int nseg = (int)sg->n; f->S = calloc(nseg, sizeof *f->S); f->Spath = calloc(nseg, sizeof *f->Spath); f->Ls = calloc(2 * nseg, sizeof *f->Ls); f->Lpath = calloc(2 * nseg, sizeof *f->Lpath); f->U = calloc(nseg, sizeof *f->U);
+    const int nseg = (int)sg->n; f->S = calloc(nseg, sizeof *f->S); f->Spath = calloc(nseg, sizeof *f->Spath); f->Ls = calloc(3 * nseg, sizeof *f->Ls); f->Lpath = calloc(3 * nseg, sizeof *f->Lpath); f->U = calloc(nseg, sizeof *f->U);
     f->T = nullptr;
     for (int i = 0; i < nseg; i++) {
         const json *e = json_at(sg, (size_t)i); const char *tx = json_str(json_get(e, "tifxyz"), nullptr), *lb = json_str(json_get(e, "labels"), nullptr), *mk = json_str(json_get(e, "mask"), nullptr);
@@ -1409,8 +1442,10 @@ z3 *inkfly_open(z3 *ct, const char *segs_path, const inksplat_cfg *cfg, size_t c
         ifunit *u = &f->U[f->nU];
         if ((u->surf = inkfly_find(f->Spath, f->nS, tx)) < 0) { if (ssurf_load(&f->S[f->nS], tx)) goto fail; snprintf(f->Spath[f->nS], 1024, "%s", tx); u->surf = f->nS++; }
         if ((u->lab = inkfly_find(f->Lpath, f->nL, lb)) < 0) { if (lsrc_open(&f->Ls[f->nL], lb, -1, cfg->cache)) goto fail; snprintf(f->Lpath[f->nL], 1024, "%s", lb); u->lab = f->nL++; }
-        u->msk = -1;
+        u->msk = -1; u->val = -1;
         if (mk && (u->msk = inkfly_find(f->Lpath, f->nL, mk)) < 0) { if (lsrc_open(&f->Ls[f->nL], mk, -1, cfg->cache)) goto fail; snprintf(f->Lpath[f->nL], 1024, "%s", mk); u->msk = f->nL++; }
+        const char *vl = cfg->val_mode ? json_str(json_get(e, "validation"), nullptr) : nullptr;
+        if (vl && (u->val = inkfly_find(f->Lpath, f->nL, vl)) < 0) { if (lsrc_open(&f->Ls[f->nL], vl, -1, cfg->cache)) goto fail; snprintf(f->Lpath[f->nL], 1024, "%s", vl); u->val = f->nL++; }
         const ssurf *S = &f->S[u->surf]; const lsrc *LL = &f->Ls[u->lab];
         /* the label scale exactly as inksplat_run */
         double F = cfg->label_scale; const double ew = S->w / S->scale, eh = S->h / S->scale;
@@ -1426,10 +1461,10 @@ z3 *inkfly_open(z3 *ct, const char *segs_path, const inksplat_cfg *cfg, size_t c
     if (dcache_dir && *dcache_dir && !dcache_key_dir(dcache_dir, key, kdir, sizeof kdir)) {   /* the index cached beside the chunks (same inputs key) */
         snprintf(ixp, sizeof ixp, "%s/index.bin", kdir); FILE *ix = fopen(ixp, "rb");
         if (ix) { char m[4]; uint32_t nu = 0; uint64_t nt = 0;
-            if (fread(m, 1, 4, ix) == 4 && !memcmp(m, "UIX1", 4) && fread(&nu, 4, 1, ix) == 1 && fread(&nt, 8, 1, ix) == 1 && nu == (uint32_t)f->nU) {
-                uint8_t *fl = malloc(2 * (size_t)nu + 1); f->T = malloc((nt ? nt : 1) * sizeof *f->T);
-                if (fread(fl, 1, 2 * (size_t)nu, ix) == 2 * (size_t)nu && fread(f->T, sizeof *f->T, nt, ix) == nt) {
-                    for (uint32_t i = 0; i < nu; i++) { f->U[i].lab01 = fl[2 * i]; f->U[i].msk01 = fl[2 * i + 1]; }
+            if (fread(m, 1, 4, ix) == 4 && !memcmp(m, "UIX2", 4) && fread(&nu, 4, 1, ix) == 1 && fread(&nt, 8, 1, ix) == 1 && nu == (uint32_t)f->nU) {
+                uint8_t *fl = malloc(3 * (size_t)nu + 1); f->T = malloc((nt ? nt : 1) * sizeof *f->T);
+                if (fread(fl, 1, 3 * (size_t)nu, ix) == 3 * (size_t)nu && fread(f->T, sizeof *f->T, nt, ix) == nt) {
+                    for (uint32_t i = 0; i < nu; i++) { f->U[i].lab01 = fl[3 * i]; f->U[i].msk01 = fl[3 * i + 1]; f->U[i].val01 = fl[3 * i + 2]; }
                     f->nT = nt; have_ix = 1; }
                 else { free(f->T); f->T = nullptr; }
                 free(fl); }
@@ -1450,9 +1485,9 @@ z3 *inkfly_open(z3 *ct, const char *segs_path, const inksplat_cfg *cfg, size_t c
     }
         if (*ixp) {   /* write it for the next process (atomic rename; a failure only costs the next open) */
             char tmp[1400]; snprintf(tmp, sizeof tmp, "%s.%d.tmp", ixp, (int)getpid()); FILE *ix = fopen(tmp, "wb");
-            if (ix) { const uint32_t nu = (uint32_t)f->nU; const uint64_t nt = f->nT; uint8_t *fl = malloc(2 * (size_t)nu + 1);
-                for (uint32_t i = 0; i < nu; i++) { fl[2 * i] = (uint8_t)f->U[i].lab01; fl[2 * i + 1] = (uint8_t)f->U[i].msk01; }
-                const int ok = fwrite("UIX1", 1, 4, ix) == 4 && fwrite(&nu, 4, 1, ix) == 1 && fwrite(&nt, 8, 1, ix) == 1 && fwrite(fl, 1, 2 * (size_t)nu, ix) == 2 * (size_t)nu &&
+            if (ix) { const uint32_t nu = (uint32_t)f->nU; const uint64_t nt = f->nT; uint8_t *fl = malloc(3 * (size_t)nu + 1);
+                for (uint32_t i = 0; i < nu; i++) { fl[3 * i] = (uint8_t)f->U[i].lab01; fl[3 * i + 1] = (uint8_t)f->U[i].msk01; fl[3 * i + 2] = (uint8_t)f->U[i].val01; }
+                const int ok = fwrite("UIX2", 1, 4, ix) == 4 && fwrite(&nu, 4, 1, ix) == 1 && fwrite(&nt, 8, 1, ix) == 1 && fwrite(fl, 1, 3 * (size_t)nu, ix) == 3 * (size_t)nu &&
                                fwrite(f->T, sizeof *f->T, nt, ix) == nt;
                 free(fl); if (fclose(ix) || !ok || rename(tmp, ixp)) unlink(tmp); }
         }
@@ -1524,6 +1559,7 @@ int cmd_ink_onfly(int argc, char **argv) {
     inksplat_cfg c; inksplat_defaults(&c); c.face = 1;
     c.ct_um = atof(sopt(argc, argv, "--ct-um", "0")); c.level = atoi(sopt(argc, argv, "--level", "1")); c.iso = atoi(sopt(argc, argv, "--iso", "64")); c.cache = sopt(argc, argv, "--cache", nullptr);
     if (sscanf(sopt(argc, argv, "--face", "-6,0"), "%lf,%lf", &c.face_a, &c.face_b) != 2) return 2;
+    { const char *vm = sopt(argc, argv, "--val-mode", "exclude"); c.val_mode = !strcmp(vm, "only") ? 2 : !strcmp(vm, "off") ? 0 : 1; }   /* the segments' "validation" rasters */
     const char *hf = sopt(argc, argv, "--holdout-file", nullptr);
     if (hf && inkfly_holdouts(hf, argv[ci + 2], &c)) return 1;
     const int nth = ufsm_threads(atoi(sopt(argc, argv, "--threads", "0")), 8);
@@ -1616,10 +1652,9 @@ int inkfly_rays(void *handle, const int64_t o[3], const int64_t n[3], int mode, 
             const int64_t r0 = (int64_t)ty * TS, c0 = (int64_t)tx * TS, r1 = r0 + TS < u->lh ? r0 + TS : u->lh, c1 = c0 + TS < u->lw ? c0 + TS : u->lw;
             if (r0 < rr0) { rr0 = r0; } if (c0 < rc0) { rc0 = c0; } if (r1 > rr1) { rr1 = r1; } if (c1 > rc1) { rc1 = c1; } }
         const int64_t rh = rr1 - rr0, rw = rc1 - rc0;
-        uint8_t *lab = malloc((size_t)rh * rw), *msk = u->msk >= 0 ? malloc((size_t)rh * rw) : nullptr;
-        if (!lab || (u->msk >= 0 && !msk) || lsrc_read(&f->Ls[u->lab], u->lr0 + rr0, u->lc0 + rc0, rh, rw, lab, 1) || (msk && lsrc_read(&f->Ls[u->msk], u->lr0 + rr0, u->lc0 + rc0, rh, rw, msk, 1))) { free(lab); free(msk); goto done; }
+        uint8_t *lab = malloc((size_t)rh * rw), *msk = nullptr;
+        if (!lab || lsrc_read(&f->Ls[u->lab], u->lr0 + rr0, u->lc0 + rc0, rh, rw, lab, 1) || ifu_mask(f, u, rr0, rc0, rh, rw, &msk)) { free(lab); goto done; }
         if (u->lab01) for (size_t k = 0; k < (size_t)rh * rw; k++) lab[k] *= 255;
-        if (msk && u->msk01) for (size_t k = 0; k < (size_t)rh * rw; k++) msk[k] *= 255;
         geo G = {0}; G.c = c; G.S = &f->S[u->surf]; G.F = u->F; G.lab = lab; G.msk = msk; G.lw = rw; G.lh = rh; G.lr0 = u->lr0 + rr0; G.lc0 = u->lc0 + rc0; G.offr = c->label_off[0]; G.offc = c->label_off[1];
         for (size_t q = q0; q < q1; q++) {
             const int t = (int)f->T[cand[q]].tile, tx = t % u->ntx, ty = t / u->ntx;
