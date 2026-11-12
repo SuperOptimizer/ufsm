@@ -12,6 +12,7 @@
 #include "cover.h"
 #include <limits.h>
 #include "sources.h"
+[[gnu::weak]] int inkfly_cache_budget(size_t);   /* (inksplat.o: the shared ink cache budget, --ink-cache-mb) */
 #include "inksplat.h"
 #include "inkmil.h"
 #include "dcache.h"
@@ -2396,6 +2397,8 @@ int cmd_train(int argc, char **argv) {
     if (g_sheet && nl!=1) { fprintf(stderr,"winding currently supports one whole or spatially split window\n"); return 2; }
     char cmd[1400]; snprintf(cmd, sizeof cmd, "mkdir -p '%s'", out); if (system(cmd)) return 1;
 
+    {   /* --ink-cache-mb: the one cache budget of every on-the-fly ink source (inksplat.h; default $UFSM_INK_CACHE_MB or 4096) */
+        const char *im = opt(argc, argv, "--ink-cache-mb", "0"); if (atol(im) > 0 && inkfly_cache_budget) inkfly_cache_budget((size_t)atol(im)); }
     sources *S = sources_load(src);
     g_Sdiag = S;
     if (!S) return 1;
@@ -2754,6 +2757,7 @@ int cmd_train(int argc, char **argv) {
             /* per source: windows, and per window the shares of material (CT > 0), known phase and known winding mod 4 (w4 per voxel only
                without --w4 runs: UFSM_W4_RUNS=0) over the window's voxels (source grid) */
             double (*cov)[5] = calloc((size_t)S->n, sizeof *cov); int (*lvc)[MAXLEV] = calloc((size_t)S->n, sizeof *lvc); double (*lvm)[MAXLEV][2] = calloc((size_t)S->n, sizeof *lvm);
+            double (*ikc)[4] = calloc((size_t)S->n, sizeof *ikc);   /* per source: windows with the ink plane, its known / ink voxel shares, MIL rays */
             for (int i = 0; i < nb; i++) {
                 batch *b = sampler_next(sq); if (!b) { fprintf(stderr, "sampler stopped after %d batches\n", i); break; }
                 if (i == 0) tf = now() - t0;
@@ -2772,6 +2776,13 @@ int cmd_train(int argc, char **argv) {
                         if (w) for (size_t v = v0; v < v1; v++) cw += w[v] != 255;
                         mat += cm; ph += cp; phm += cb; w4 += cw; }
                     if (b->level && b->level[n] >= 0 && b->level[n] < MAXLEV) { lvc[si][(int)b->level[n]]++; lvm[si][(int)b->level[n]][0] += mat; lvm[si][(int)b->level[n]][1] += phm; }
+                    {   /* the human ink target (the ink plane, or under --rv its aux plane): known and ink shares; the window's MIL rays */
+                        const uint8_t *ip = g_ink2 && g_aux_of[AUX_INK] >= 0 ? AUXH(b, g_aux_of[AUX_INK]) : nullptr;
+                        if (ip && !(g_rv && g_aux_of[AUX_INK] == 0)) { ip += n * nv; size_t kn = 0, kp = 0;
+                            for (size_t v0 = 0; v0 < nv; v0 += 65536) { const size_t v1 = v0 + 65536 < nv ? v0 + 65536 : nv; uint32_t a = 0, q = 0;
+                                for (size_t v = v0; v < v1; v++) { a += ip[v] != 255; q += ip[v] != 255 && ip[v] > 127; } kn += a; kp += q; }
+                            ikc[si][0] += 1; ikc[si][1] += (double)kn / nv; ikc[si][2] += (double)kp / nv; ikc[si][3] += b->nmil ? b->nmil[n] : 0; }
+                    }
                     cov[si][0] += 1; cov[si][1] += (double)mat / nv; cov[si][2] += (double)ph / nv; cov[si][3] += mat ? (double)phm / mat : 0; cov[si][4] += (double)w4 / nv;
                 }
                 sampler_release(sq, b);
@@ -2781,7 +2792,10 @@ int cmd_train(int argc, char **argv) {
             for (int s = 0; cov && s < S->n; s++) if (cov[s][0] > 0) { const double k = cov[s][0];
                 fprintf(stderr, "sampler-only: source %-34s windows %5.0f  material %.3f  phase known %.3f (of material %.3f)  w4 known %.3f\n", S->src[s].name, k,
                         cov[s][1] / k, cov[s][2] / k, cov[s][3] / k, cov[s][4] / k);
+                if (ikc && ikc[s][0] > 0) fprintf(stderr, "sampler-only: source %-34s ink: %.0f windows, known %.5f ink %.5f of the voxels, %.1f MIL rays a window\n", S->src[s].name,
+                                                  ikc[s][0], ikc[s][1] / ikc[s][0], ikc[s][2] / ikc[s][0], ikc[s][3] / ikc[s][0]);
             }
+            free(ikc);
             for (int s = 0; cov && s < S->n; s++) for (int l = 0; l < MAXLEV; l++) { uint32_t rs[SL_N]; sampler_level_stats(sq, s, l, rs); int any = lvc[s][l];
                 for (int k = 0; k < SL_N; k++) any |= rs[k] != 0;
                 char pl[160] = ""; uint64_t pa = 0, pk = 0;   /* (a pooled stored phase at this level: its coherent share) */

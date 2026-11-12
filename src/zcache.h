@@ -11,4 +11,7 @@ void zcache_close(zcache *c);
 /* the box [o, o + n) (z, y, x) of z into out (C order, esize bytes per voxel) through the cache; parts outside the array are the
    fill value (as z3_read). Arrays with esize != 1 are read directly (no caching). 0 ok, -1 on a decode / I/O failure. */
 int zcache_read(zcache *c, z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out);
+/* drop every entry of z (its reads must have finished): before z is closed when the cache outlives it, so a later array at the same
+   address never sees its chunks */
+void zcache_drop(zcache *c, const z3 *z);
 void zcache_stats(const zcache *c, uint64_t *hits, uint64_t *misses, size_t *bytes);

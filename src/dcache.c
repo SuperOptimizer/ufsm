@@ -12,10 +12,14 @@
 #include <unistd.h>
 #include <zstd.h>
 
-typedef struct dent { int64_t key; uint8_t *data; uint8_t cval; int busy, failed, refs; struct dent *prev, *next, *hnext; } dent;
-typedef struct {
+struct dc;
+typedef struct dent { int64_t key; uint8_t *data; uint8_t cval; int busy, failed, refs; struct dc *own; struct dent *prev, *next, *hnext; } dent;
+/* the memory LRU and its cap: one per cached array, or one shared by several (dcache_pool_shared: the on-the-fly ink targets of every
+   source under one budget); the pool's mutex guards the LRU and every member array's hash */
+struct dcache_pool { pthread_mutex_t mu; pthread_cond_t cv; dent *head, *tail; size_t bytes, cap; int shared; };
+typedef struct dc {
     z3 *in; int C, fill; int64_t shape[3], gc[3]; char *dir;   /* dir: ROOT/<hash> or nullptr (memory only) */
-    pthread_mutex_t mu; pthread_cond_t cv; dent **hash; size_t nhash; dent *head, *tail; size_t bytes, cap; _Atomic int disk_warned;
+    dcache_pool *P; dent **hash; size_t nhash; _Atomic int disk_warned;
 } dc;
 static struct { _Atomic uint64_t reads, mem, disk, comp, fill, wbytes, ns_comp, ns_disk; } g_dc;
 static double dnow(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + 1e-9 * t.tv_nsec; }
@@ -35,14 +39,14 @@ static int mkdirs(const char *p) {
     return mkdir(b, 0775) && errno != EEXIST ? -1 : 0;
 }
 static size_t cbytes(const dc *c) { return (size_t)c->C * c->C * c->C; }
-static void unlink_lru(dc *c, dent *e) { if (e->prev) e->prev->next = e->next; else c->head = e->next; if (e->next) e->next->prev = e->prev; else c->tail = e->prev; e->prev = e->next = nullptr; }
-static void push_lru(dc *c, dent *e) { e->next = c->head; e->prev = nullptr; if (c->head) c->head->prev = e; c->head = e; if (!c->tail) c->tail = e; }
+static void unlink_lru(dcache_pool *c, dent *e) { if (e->prev) e->prev->next = e->next; else c->head = e->next; if (e->next) e->next->prev = e->prev; else c->tail = e->prev; e->prev = e->next = nullptr; }
+static void push_lru(dcache_pool *c, dent *e) { e->next = c->head; e->prev = nullptr; if (c->head) c->head->prev = e; c->head = e; if (!c->tail) c->tail = e; }
 static size_t hb(const dc *c, int64_t k) { return (size_t)((uint64_t)k * 0x9E3779B97F4A7C15ull >> 32) % c->nhash; }
 static void unhash(dc *c, dent *e) { dent **pp = &c->hash[hb(c, e->key)]; while (*pp && *pp != e) pp = &(*pp)->hnext; if (*pp) *pp = e->hnext; }
-static void evict(dc *c) {   /* (mu held) drop unreferenced tail entries above the cap */
-    for (dent *v = c->tail; v && c->bytes > c->cap;) {
+static void evict(dcache_pool *P) {   /* (mu held) drop unreferenced tail entries above the cap, of any member array */
+    for (dent *v = P->tail; v && P->bytes > P->cap;) {
         dent *pv = v->prev;
-        if (!v->refs && !v->busy) { unlink_lru(c, v); unhash(c, v); c->bytes -= sizeof *v + (v->data ? cbytes(c) : 0); free(v->data); free(v); }
+        if (!v->refs && !v->busy) { unlink_lru(P, v); unhash(v->own, v); P->bytes -= sizeof *v + (v->data ? cbytes(v->own) : 0); free(v->data); free(v); }
         v = pv;
     }
 }
@@ -82,15 +86,16 @@ static int disk_put(dc *c, int64_t cz, const char *p, const uint8_t *data, uint8
 /* one cell: a referenced entry (ready), or nullptr on failure */
 static dent *cell_get(dc *c, int64_t cz, int64_t cy, int64_t cx, int nthreads) {
     const int64_t key = (cz * c->gc[1] + cy) * c->gc[2] + cx; const size_t h = hb(c, key);
-    pthread_mutex_lock(&c->mu);
+    dcache_pool *P = c->P;
+    pthread_mutex_lock(&P->mu);
     dent *e = c->hash[h]; while (e && e->key != key) e = e->hnext;
     if (e) {
-        e->refs++; while (e->busy) pthread_cond_wait(&c->cv, &c->mu);
-        if (e->failed) { if (!--e->refs) free(e); pthread_mutex_unlock(&c->mu); return nullptr; }
-        unlink_lru(c, e); push_lru(c, e); pthread_mutex_unlock(&c->mu); atomic_fetch_add(&g_dc.mem, 1); return e;
+        e->refs++; while (e->busy) pthread_cond_wait(&P->cv, &P->mu);
+        if (e->failed) { if (!--e->refs) free(e); pthread_mutex_unlock(&P->mu); return nullptr; }
+        unlink_lru(P, e); push_lru(P, e); pthread_mutex_unlock(&P->mu); atomic_fetch_add(&g_dc.mem, 1); return e;
     }
-    e = calloc(1, sizeof *e); e->key = key; e->busy = 1; e->refs = 1; e->hnext = c->hash[h]; c->hash[h] = e; push_lru(c, e);
-    pthread_mutex_unlock(&c->mu);
+    e = calloc(1, sizeof *e); e->key = key; e->own = c; e->busy = 1; e->refs = 1; e->hnext = c->hash[h]; c->hash[h] = e; push_lru(P, e);
+    pthread_mutex_unlock(&P->mu);
     char p[1300]; int ok = 0; uint8_t *data = nullptr, cval = 0;
     if (c->dir) { cell_path(c, cz, cy, cx, p, sizeof p); const double t = dnow(); ok = !disk_get(c, p, &data, &cval); if (ok) { atomic_fetch_add(&g_dc.disk, 1); atomic_fetch_add(&g_dc.ns_disk, (uint64_t)((dnow() - t) * 1e9)); } }
     if (!ok) {
@@ -103,14 +108,14 @@ static dent *cell_get(dc *c, int64_t cz, int64_t cy, int64_t cx, int nthreads) {
             if (c->dir && disk_put(c, cz, p, data, cval) && !atomic_exchange(&c->disk_warned, 1)) fprintf(stderr, "dcache: cannot write %s (%s): memory only from here\n", p, strerror(errno));
         } else { free(data); data = nullptr; }
     }
-    pthread_mutex_lock(&c->mu);
+    pthread_mutex_lock(&P->mu);
     e->busy = 0;
-    if (!ok) { e->failed = 1; unlink_lru(c, e); unhash(c, e); pthread_cond_broadcast(&c->cv); if (!--e->refs) free(e); pthread_mutex_unlock(&c->mu); return nullptr; }
-    e->data = data; e->cval = cval; c->bytes += sizeof *e + (data ? cbytes(c) : 0); evict(c);
-    pthread_cond_broadcast(&c->cv); pthread_mutex_unlock(&c->mu);
+    if (!ok) { e->failed = 1; unlink_lru(P, e); unhash(c, e); pthread_cond_broadcast(&P->cv); if (!--e->refs) free(e); pthread_mutex_unlock(&P->mu); return nullptr; }
+    e->data = data; e->cval = cval; P->bytes += sizeof *e + (data ? cbytes(c) : 0); evict(P);
+    pthread_cond_broadcast(&P->cv); pthread_mutex_unlock(&P->mu);
     return e;
 }
-static void cell_put(dc *c, dent *e) { pthread_mutex_lock(&c->mu); if (!--e->refs && e->failed) free(e); else evict(c); pthread_mutex_unlock(&c->mu); }
+static void cell_put(dc *c, dent *e) { dcache_pool *P = c->P; pthread_mutex_lock(&P->mu); if (!--e->refs && e->failed) free(e); else evict(P); pthread_mutex_unlock(&P->mu); }
 static int dc_read(void *ctx, z3 *base, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads) {
     (void)base; dc *c = ctx; atomic_fetch_add(&g_dc.reads, 1);
     memset(out, c->fill, (size_t)n[0] * n[1] * n[2]);
@@ -136,8 +141,28 @@ static int dc_read(void *ctx, z3 *base, const int64_t o[3], const int64_t n[3], 
 }
 static void dc_free(void *p) {
     dc *c = p; if (!c) return;
-    for (size_t i = 0; i < c->nhash; i++) for (dent *e = c->hash[i], *nx; e; e = nx) { nx = e->hnext; free(e->data); free(e); }
-    free(c->hash); free(c->dir); pthread_mutex_destroy(&c->mu); pthread_cond_destroy(&c->cv); free(c);
+    dcache_pool *P = c->P;
+    if (P) {   /* (a shared pool keeps the other arrays' entries: unlink this array's from its LRU) */
+        pthread_mutex_lock(&P->mu);
+        for (size_t i = 0; i < c->nhash; i++) for (dent *e = c->hash[i], *nx; e; e = nx) { nx = e->hnext; unlink_lru(P, e); P->bytes -= sizeof *e + (e->data ? cbytes(c) : 0); free(e->data); free(e); }
+        pthread_mutex_unlock(&P->mu);
+        if (!P->shared) { pthread_mutex_destroy(&P->mu); pthread_cond_destroy(&P->cv); free(P); }
+    }
+    free(c->hash); free(c->dir); free(c);
+}
+static dcache_pool *pool_new(size_t cap, int shared) {
+    dcache_pool *P = calloc(1, sizeof *P); if (!P) return nullptr;
+    pthread_mutex_init(&P->mu, nullptr); pthread_cond_init(&P->cv, nullptr); P->cap = cap; P->shared = shared; return P;
+}
+dcache_pool *dcache_pool_shared(const char *name, size_t mem_mb) {
+    static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER; static struct { char name[32]; dcache_pool *P; } tab[8]; static int n;
+    pthread_mutex_lock(&mu); dcache_pool *P = nullptr;
+    for (int i = 0; i < n && !P; i++) if (!strcmp(tab[i].name, name)) P = tab[i].P;
+    if (!P && n < 8 && (P = pool_new((mem_mb ? mem_mb : 1024) << 20, 1))) { snprintf(tab[n].name, sizeof tab[n].name, "%s", name); tab[n++].P = P; }
+    pthread_mutex_unlock(&mu); return P;   /* (never freed: process lifetime) */
+}
+size_t dcache_pool_bytes(dcache_pool *P, size_t *cap) {
+    if (!P) return 0; pthread_mutex_lock(&P->mu); const size_t b = P->bytes; if (cap) *cap = P->cap; pthread_mutex_unlock(&P->mu); return b;
 }
 int dcache_key_dir(const char *dir, const char *key, char *out, size_t nout) {
     unsigned char hsh[32]; unsigned nh = 0; char hex[65];
@@ -150,16 +175,20 @@ int dcache_key_dir(const char *dir, const char *key, char *out, size_t nout) {
         if (f) { fprintf(f, "%s\n", key); if (fclose(f) || rename(tmp, ip)) unlink(tmp); } }
     return 0;
 }
-z3 *z3_open_cached(z3 *inner, const char *dir, const char *key, int cell, size_t mem_mb) {
-    if (!inner) return nullptr;
+z3 *z3_open_cached_pool(z3 *inner, const char *dir, const char *key, int cell, dcache_pool *pool) {
+    if (!inner || !pool) { z3_close(inner); return nullptr; }
     const z3_meta *m = z3_meta_of(inner);
     dc *c = calloc(1, sizeof *c); c->in = inner; c->C = cell > 0 ? cell : 128; c->fill = m->fill;
     for (int d = 0; d < 3; d++) { c->shape[d] = m->shape[d]; c->gc[d] = (m->shape[d] + c->C - 1) / c->C; }
-    c->nhash = 1 << 16; c->hash = calloc(c->nhash, sizeof *c->hash); c->cap = (mem_mb ? mem_mb : 1024) << 20;
-    pthread_mutex_init(&c->mu, nullptr); pthread_cond_init(&c->cv, nullptr);
+    c->nhash = 1 << 16; c->hash = calloc(c->nhash, sizeof *c->hash); c->P = pool;
     char d[1200];
     if (dir && *dir && key && !dcache_key_dir(dir, key, d, sizeof d)) c->dir = strdup(d);
     z3 *z = z3_open_derived(inner, c->fill, dc_read, c, dc_free);
     if (!z) { dc_free(c); z3_close(inner); }
     return z;
+}
+z3 *z3_open_cached(z3 *inner, const char *dir, const char *key, int cell, size_t mem_mb) {
+    if (!inner) return nullptr;
+    dcache_pool *P = pool_new((mem_mb ? mem_mb : 1024) << 20, 0); if (!P) { z3_close(inner); return nullptr; }
+    return z3_open_cached_pool(inner, dir, key, cell, P);   /* (the private pool is freed with the array, or by dc_free on failure) */
 }

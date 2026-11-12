@@ -13,6 +13,13 @@
 /* inner (owned): any array, typically z3_open_derived. dir: the cache root (nullptr or "" = memory only); key: the inputs description;
    cell: the cell edge (0 = 128); mem_mb: the memory LRU cap (0 = 1024). Returns nullptr (inner closed) on failure. */
 z3 *z3_open_cached(z3 *inner, const char *dir, const char *key, int cell, size_t mem_mb);
+/* a memory LRU shared by several cached arrays under one cap (by name, created on first use with mem_mb; later calls return it, their
+   mem_mb ignored; never freed). The on-the-fly ink targets of all sources use "ink" (inkfly_cache_budget). */
+typedef struct dcache_pool dcache_pool;
+dcache_pool *dcache_pool_shared(const char *name, size_t mem_mb);
+size_t dcache_pool_bytes(dcache_pool *pool, size_t *cap);   /* the bytes held (and the cap) */
+/* z3_open_cached with its memory LRU in pool (shared: the cap covers every member array) */
+z3 *z3_open_cached_pool(z3 *inner, const char *dir, const char *key, int cell, dcache_pool *pool);
 /* DIR/<24 hex of sha256(key)> (created, inputs.txt written): where a cached array or a companion file (an index) of key lives. 0 ok */
 int dcache_key_dir(const char *dir, const char *key, char *out, size_t nout);
 /* the default cache root: $UFSM_DERIVED_CACHE ("off" / "0" = none), else $HOME/.cache/ufsm/derived */

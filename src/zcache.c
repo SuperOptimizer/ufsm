@@ -35,6 +35,15 @@ void zcache_stats(const zcache *c, uint64_t *hits, uint64_t *misses, size_t *byt
     if (misses) *misses = c->misses;
     if (bytes) *bytes = c->bytes;
 }
+void zcache_drop(zcache *c, const z3 *z) {
+    if (!c) return;
+    pthread_mutex_lock(&c->mu);
+    for (int i = 0; i < ZC_NB; i++) for (zc_ent **pp = &c->b[i]; *pp;) {
+        zc_ent *e = *pp; if (e->z != z || e->ref || e->state == 0) { pp = &e->next; continue; }
+        *pp = e->next; c->bytes -= e->bytes; free(e->buf); free(e);
+    }
+    pthread_mutex_unlock(&c->mu);
+}
 static unsigned zc_hash(const z3 *z, const int64_t c[3]) {
     uint64_t h = (uint64_t)(uintptr_t)z * 0x9e3779b97f4a7c15ull ^ (uint64_t)c[0] * 0xbf58476d1ce4e5b9ull ^ (uint64_t)c[1] * 0x94d049bb133111ebull ^ (uint64_t)c[2] * 0xd6e8feb86659fd93ull;
     return (unsigned)((h ^ (h >> 29)) & (ZC_NB - 1));
