@@ -279,7 +279,7 @@ static int usage(void) {
         "  ufsm fiber-trace <root> <key-prefix> <out.fib> --box Z,Y,X,NZ,NY,NX [--scaledown 3]   streamlines through a published fibre prediction (presence, nx, ny) -> UFIB\n"
         "  ufsm fiber-raster <fibres.afv|.fib> OUT --um U (--shape Z,Y,X | --ct ROOT KEY)   H / V fibre mask labels (prob254) on the CT grid\n"
         "  ufsm fiber-onfly <fibres.afv|.fib> --ct ROOT KEY [--ref H V KEY]   the fibre planes on the fly (sources \"fibre\" targets): ms / window, diffs\n"
-        "  ufsm field-blend <out> <fields1> <fields2> ... [--weights a,b,..] [--tile SZ,SY,SX --grids z,y,x:..] [--conf mean]  fit fields averaged (phase: confidence-weighted complex mean; --tile: overlapping predicts, centre-weighted)\n"
+        "  ufsm field-blend <out> <fields1> <fields2> ... [--weights a,b,..] [--tile SZ,SY,SX --grids z,y,x:..] [--conf mean] [--paste F [--box z,y,x,nz,ny,nx]]  fit fields averaged (phase: confidence-weighted complex mean; --tile: overlapping predicts, centre-weighted)\n"
         "  ufsm wind-score <sweep-dir> <codes-root> <codes-key>             the fit --codes score of a predict --cond-sweep winding raster\n"
         "  ufsm store-bench <root> <array-key> [--box 128,256,512] [--n 8] [--par 1] [--threads 16]   HTTP zarr fetch benchmark\n"
         "  ufsm phase-pack ROOT KEY OUT --row R [--level 19] [--threads 8] / phase-unpack IN DIR / phase-cmp RA KA RB KB --row R   6-bit phase-label transfer\n"
@@ -3469,15 +3469,19 @@ static int cmd_surfsnap(int argc, char **argv) {
    fit-field sets of several models on one grid blended into OUT (src/fblend.h: the phase as the confidence-weighted complex mean,
    its length the new confidence). --tile: the inputs are overlapping predicts of one model on tile interiors of SZ x SY x SX level
    voxels (predict --window - 2 --halo; z: --window-z - 2 --halo-z) anchored at each input's --grid-origin (--grids, in input order):
-   per-cell weights sin^2 of the cell's place in its interior (fb_tile_w). --conf mean: the mean input confidence as the length. */
+   per-cell weights sin^2 of the cell's place in its interior (fb_tile_w). --conf mean: the mean input confidence as the length.
+   --paste F [--box z,y,x,nz,ny,nx]: IN2.. are sub-box predicts pasted over IN1 with F-cell feathered faces (src/fblend.h); --box
+   writes only that part of IN1 (shard-aligned), for scripts/spiralqa/field_paste_link.sh to overlay on IN1's shards. */
 static int cmd_field_blend(int argc, char **argv) {
-    const char *in[32]; float w[32]; int n = 0; const char *ws = nullptr, *out = nullptr, *tile = nullptr, *grids = nullptr, *conf = "resultant"; int nt = ufsm_threads(0, 8);
+    const char *in[32]; float w[32]; int n = 0; const char *ws = nullptr, *out = nullptr, *tile = nullptr, *grids = nullptr, *conf = "resultant", *paste = nullptr, *box = nullptr; int nt = ufsm_threads(0, 8);
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--weights") && i + 1 < argc) { ws = argv[++i]; continue; }
         if (!strcmp(argv[i], "--threads") && i + 1 < argc) { nt = atoi(argv[++i]); continue; }
         if (!strcmp(argv[i], "--tile") && i + 1 < argc) { tile = argv[++i]; continue; }
         if (!strcmp(argv[i], "--grids") && i + 1 < argc) { grids = argv[++i]; continue; }
         if (!strcmp(argv[i], "--conf") && i + 1 < argc) { conf = argv[++i]; continue; }
+        if (!strcmp(argv[i], "--paste") && i + 1 < argc) { paste = argv[++i]; continue; }
+        if (!strcmp(argv[i], "--box") && i + 1 < argc) { box = argv[++i]; continue; }
         if (!strncmp(argv[i], "--", 2)) { fprintf(stderr, "field-blend: unknown option %s\n", argv[i]); return 2; }
         if (!out) out = argv[i]; else if (n < 32) in[n++] = argv[i]; else { fprintf(stderr, "field-blend: at most 32 inputs\n"); return 2; }
     }
@@ -3498,6 +3502,11 @@ static int cmd_field_blend(int argc, char **argv) {
         free(t);
         if (k != n) { fprintf(stderr, "field-blend: %d grids for %d inputs\n", k, n); return 2; }
         o.tile = 1;
+    }
+    if (paste) { o.paste = 1; o.feather = atof(paste); if (!(o.feather >= 1) || tile || ws) { fprintf(stderr, "field-blend: --paste F (cells >= 1), without --tile / --weights\n"); return 2; } }
+    if (box) {
+        if (sscanf(box, "%lld,%lld,%lld,%lld,%lld,%lld", &o.b0[0], &o.b0[1], &o.b0[2], &o.bn[0], &o.bn[1], &o.bn[2]) != 6) { fprintf(stderr, "field-blend: --box z,y,x,nz,ny,nx\n"); return 2; }
+        o.box = 1;
     }
     return fblend_run2(out, n, in, ws ? w : nullptr, &o, nt < 1 ? 1 : nt);
 }

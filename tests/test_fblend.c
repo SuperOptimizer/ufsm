@@ -189,10 +189,68 @@ static void test_sets(void) {
     char cmd[600]; snprintf(cmd, sizeof cmd, "rm -rf %s", tmp); if (system(cmd)) {}
 }
 
+/* --paste: a 4.8 um --fit-h 4 sub-box P (offset 1,1,2 cells, 3 x 3 x 4) over the 9.6 um --fit-h 2 set A, feather 2 cells: the
+   expected planes from the _cw rules with P's sin^2 face ramps and A's share 1 - P's; the winding mod 4 planes A's own (w4_d 16 x
+   4.8 um is not A's 16 x 9.6); --box writes A's geometry for the part, a box off the 128-cell shards is refused */
+static void test_paste(void) {
+    char tmp[] = "/tmp/test_fblend_paste_XXXXXX"; if (!mkdtemp(tmp)) { CHECK(0, "mkdtemp"); return; }
+    char ra[256], zb[256], rp[256], o1[256], o2[256], o3[256];
+    snprintf(ra, sizeof ra, "%s/a", tmp); snprintf(zb, sizeof zb, "%s/b", tmp); snprintf(rp, sizeof rp, "%s/p", tmp);
+    snprintf(o1, sizeof o1, "%s/pasted", tmp); snprintf(o2, sizeof o2, "%s/boxed", tmp); snprintf(o3, sizeof o3, "%s/bad", tmp);
+    mkfields(ra, zb);
+    enum { PD = 3, PH = 3, PW = 4 }; const int so[3] = {1, 1, 2};
+    static uint8_t P[15][PD * PH * PW];
+    for (int k = 0; k < 15; k++) for (int i = 0; i < PD * PH * PW; i++) P[k][i] = (uint8_t)(rand() % 256);
+    const long long porg[3] = {(100 + 2 * so[0]) * 2, (200 + 2 * so[1]) * 2, (300 + 2 * so[2]) * 2}; const int psh[3] = {PD, PH, PW};
+    float cy[2 * PD * 2 + 1], cx[2 * PD * 2 + 1]; for (int z = 0; z < 2 * PD * 2 + 1; z++) { cy[z] = 7; cx[z] = 0; }
+    uint8_t *p14[14]; for (int k = 0; k < 14; k++) p14[k] = P[k];
+    CHECK(fit_fields_save_ex(rp, porg, psh, 4, 4.8, p14, 16, P[14], cy, cx, 2 * PD * 2 + 1) == 0, "save P");
+    static fb_opts op; memset(&op, 0, sizeof op); op.paste = 1; op.feather = 2;
+    const char *in[2] = {ra, rp};
+    CHECK(fblend_run2(o1, 2, in, nullptr, &op, 2) == 0, "blend --paste");
+    const size_t n = D * H * W; const float w1[2] = {1, 1};
+    static uint8_t Pf[15][D * H * W]; static float q[2][D * H * W];   /* P on A's cells (neutral outside) and the weights */
+    for (int k = 0; k < 15; k++) memset(Pf[k], k < 2 ? 128 : 0, n);
+    for (int z = 0; z < D; z++) for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
+        const int c3[3] = {z, y, x}, s3[3] = {PD, PH, PW}; double v = 1; int in_ = 1;
+        for (int d = 0; d < 3; d++) {
+            const int a = c3[d] - so[d], e = s3[d] - 1 - a, dist = a < e ? a : e;
+            if (dist < 0) { v = 0; in_ = 0; break; }
+            const double sn = sin(M_PI / 2 * ((dist + 0.5) / 2)); v *= dist + 0.5 >= 2 ? 1 : sn * sn;
+        }
+        const size_t i = (size_t)(z * H + y) * W + x; q[1][i] = (float)v; q[0][i] = 1 - (float)v > 1e-6f ? 1 - (float)v : 1e-6f;
+        if (in_) for (int k = 0; k < 15; k++) Pf[k][i] = P[k][((z - so[0]) * PH + (y - so[1])) * PW + (x - so[2])];
+    }
+    const float *cw[2] = {q[0], q[1]}; uint8_t ex[15][D * H * W];
+    { const uint8_t *pc[2] = {A[0], Pf[0]}, *ps[2] = {A[1], Pf[1]}; fb_phase_cw(2, pc, ps, w1, cw, FB_CONF_RESULTANT, n, ex[0], ex[1]); }
+    for (int k = 2; k < 8; k++) { const uint8_t *s2[2] = {A[k], Pf[k]}; fb_mean_cw(2, s2, w1, cw, n, ex[k]); }
+    { const uint8_t *s2[2] = {A[8], Pf[8]}; fb_median_known_cw(2, s2, w1, cw, n, ex[8]); }
+    { const uint8_t *s2[2] = {A[9], Pf[9]}; fb_mean_cw(2, s2, w1, cw, n, ex[9]); }
+    { static float one[D * H * W]; for (size_t i = 0; i < n; i++) one[i] = 1; const float *c1[2] = {one, one};
+      const uint8_t *const d[2][4] = {{A[10], A[11], A[12], A[13]}, {nullptr, nullptr, nullptr, nullptr}}; uint8_t *const o[4] = {ex[10], ex[11], ex[12], ex[13]};
+      fb_wind4_cw(2, d, w1, c1, n, o); }
+    { const uint8_t *s2[2] = {A[14], Pf[14]}; fb_mean_cw(2, s2, w1, cw, n, ex[14]); }
+    fit_fields_buf g; CHECK(fit_fields_load(o1, 0, 0, 1, &g) == 0, "load pasted");
+    int inner = 0, outer = 0;
+    for (int k = 0; k < 15; k++) { int bad = 0; for (size_t i = 0; i < n; i++) if (!g.a[k] || g.a[k][i] != ex[k][i]) bad++; CHECK(!bad, "paste plane %d: %d cells differ", k, bad); }
+    for (size_t i = 0; i < n; i++) { if (q[1][i] == 1) inner += g.a[2][i] == Pf[2][i]; if (q[1][i] == 0) outer += g.a[2][i] == A[2][i]; }
+    CHECK(outer > 0, "paste: cells outside P"); (void)inner;
+    { int nin = 0, nout = 0, okin = 0, okout = 0; for (size_t i = 0; i < n; i++) { if (q[1][i] == 0) { nout++; okout += g.a[5][i] == A[5][i]; } if (q[1][i] > 0.99f) { nin++; okin += g.a[5][i] == Pf[5][i]; } }
+      CHECK(nout > 0 && okout == nout, "outside the box: A's cells (%d / %d)", okout, nout); CHECK(okin == nin, "deep in the box: P's cells (%d / %d)", okin, nin); }
+    CHECK(g.f.w4_d == 16 && fabs(g.um - 9.6) < 1e-9 && g.h == 2 && g.origin[2] == 300, "geometry of A");
+    fit_fields_free(&g);
+    op.box = 1; for (int d = 0; d < 3; d++) { op.b0[d] = 0; op.bn[d] = d == 0 ? D : d == 1 ? H : W; }
+    CHECK(fblend_run2(o2, 2, in, nullptr, &op, 2) == 0, "blend --paste --box (whole)");
+    CHECK(fit_fields_load(o2, 0, 0, 1, &g) == 0 && g.shape[0] == D && g.origin[1] == 200, "boxed geometry"); fit_fields_free(&g);
+    op.b0[0] = 1; op.bn[0] = D - 1; CHECK(fblend_run2(o3, 2, in, nullptr, &op, 2) == 2, "box off the shards refused");
+    char cmd[600]; snprintf(cmd, sizeof cmd, "rm -rf %s", tmp); if (system(cmd)) {}
+}
+
 int main(void) {
     test_cells();
     test_tiles();
     test_sets();
+    test_paste();
     if (fails) { fprintf(stderr, "test_fblend: %d FAILED\n", fails); return 1; }
     printf("test_fblend: ok\n");
     return 0;
