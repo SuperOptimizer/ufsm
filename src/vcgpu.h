@@ -35,3 +35,9 @@ static inline void vcg_layout_of(vcg_layout *L, int n, size_t cap_e) {
 extern "C"
 #endif
 int nn_vcg_shard(const uint8_t *dsh, int n, const float *drstep, const uint16_t *dscan, int fma, uint8_t *hdr, int32_t *lv, uint16_t *pos, size_t cap_e);
+/* the raw shard (bytes, device) into host (pinned) only if the levels at hdr overflowed cap_e; asynchronous on the default stream after
+   nn_vcg_shard. 0 ok */
+#ifdef __cplusplus
+extern "C"
+#endif
+int nn_vcg_copy_over(const uint8_t *dsh, uint8_t *host, size_t bytes, const uint8_t *hdr, size_t cap_e);

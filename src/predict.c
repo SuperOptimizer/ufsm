@@ -762,13 +762,14 @@ typedef struct { char name[40], content[160], attrs[1400], dir[1400]; int c0, c1
 /* the heads' device shards are double-buffered (dsh2[b], b toggling per shard): the copy of one shard to the host runs on the offload stream
    while the next shard is placed; gv[b] the copy that last read buffer b (the compute stream waits for it before reuse) */
 static void phead_d2h(phead_t *h, int b) {
-    size_t n = h->wr->bytes;
+    size_t n = h->wr->bytes, c0 = 0;   /* (copied: [c0, n) of the device buffer) */
     if (h->pya) { pyacc_t *P = h->pya; for (int l = 1; l < P->nlev; l++) nn_pool2_u8(h->dsh2[b] + P->poff[l - 1], P->shard >> (l - 1), h->dsh2[b] + P->poff[l]); n = P->poff[P->nlev]; }
     if (h->vrs) { writer_t *W = h->wr; vcg_layout L; vcg_layout_of(&L, W->vn, W->vcap); uint8_t *hb = W->buf[h->sb] + W->voff;
                   nn_vcg_shard(h->dsh2[b], W->vn, h->vrs, h->vsc, h->vfma, h->dsh2[b] + W->voff, (int32_t *)(hb + L.o_lv), (uint16_t *)(hb + L.o_pos), W->vcap);   /* (the levels straight into the pinned slot) */
-                  n = W->voff + h->vhdr; }
-    if (!h->wr->async) { nn_d2h(h->wr->buf[h->sb], h->dsh2[b], n); h->gv[b] = nullptr; return; }
-    nn_offload_copy(h->wr->buf[h->sb], h->dsh2[b], n, 1, h->wr->evs[h->sb], h->wr->evd[h->sb]); h->gv[b] = h->wr->evd[h->sb];
+                  nn_vcg_copy_over(h->dsh2[b], W->buf[h->sb], W->bytes, h->dsh2[b] + W->voff, W->vcap);   /* (the raw shard only if they overflowed) */
+                  n = W->voff + h->vhdr; c0 = W->bytes; }
+    if (!h->wr->async) { nn_d2h(h->wr->buf[h->sb] + c0, h->dsh2[b] + c0, n - c0); h->gv[b] = nullptr; return; }
+    nn_offload_copy(h->wr->buf[h->sb] + c0, h->dsh2[b] + c0, n - c0, 1, h->wr->evs[h->sb], h->wr->evd[h->sb]); h->gv[b] = h->wr->evd[h->sb];
 }
 /* a head's finished device shard (b) to its writer: the pyramid pieces, the copy, the submission; mark: no later shard below layer mark */
 static int phead_submit(phead_t *h, int b, int64_t sz, int64_t sy, int64_t sx, int64_t mark) {
@@ -1686,7 +1687,7 @@ int cmd_predict(int argc, char **argv) {
             if (gpyr) { h->pya = malloc(sizeof(pyacc_t)); if (!h->pya || pyacc_init(h->pya, h->dir, um_l, ash, shard, nlev, q, h->attrs)) { fprintf(stderr, "predict: head %s: the GPU pyramid's stores\n", h->name); return 1; } }
             if (h->pya) { const int nt = (nthreads > 0 ? nthreads : (int)ufsm_ncpu()) / nph; h->pya->nthreads = nt > 1 ? nt : 1; }   /* (the heads' writers run at once) */
             size_t ab = h->pya ? h->pya->poff[h->pya->nlev] : WR.bytes, db = ab; const size_t voff = (ab + 255) / 256 * 256;
-            vcg_layout VL; const size_t vcap = (size_t)shard * shard * shard / 8;   /* (levels: q 8 heads ~2 % of the coefficients; above 12.5 %: the bytes) */
+            vcg_layout VL; const size_t vcap = getenv("UFSM_PRED_VCAP") ? (size_t)atoll(getenv("UFSM_PRED_VCAP")) : (size_t)shard * shard * shard / 8;   /* (levels: q 8 heads ~2 % of the coefficients; above 12.5 %: the bytes. UFSM_PRED_VCAP: tests) */
             if (genc) { vcg_layout_of(&VL, shard, vcap); ab = voff + VL.bytes; db = voff + VL.o_lv; }
             hab = ab;
             h->wr = malloc(sizeof(writer_t)); h->dsh2[0] = nn_malloc(db); h->dsh2[1] = nn_malloc(db);
@@ -2580,8 +2581,9 @@ int cmd_predict(int argc, char **argv) {
       if (pprof && !lhm) fprintf(stderr, "predict profile (s): writer: %.2f thread-seconds compressing %ld shards (%.0f MB/s per writer thread), tail after the last window %.2f\n",
                          WR.t_write, WR.n_write, WR.t_write > 0 ? WR.n_write * (double)WR.bytes / WR.t_write / 1e6 : 0., now() - tf);
       if (pprof && lhm) { double tw = 0; long nw = 0; for (int j = 0; j < nph; j++) { tw += PH[j].wr->t_write; nw += PH[j].wr->n_write; }
-                          fprintf(stderr, "predict profile (s): %d head writers: %.2f s compressing %ld shards (%.0f MB/s per writer), tail after the last window %.2f\n",
-                                  nph, tw, nw, tw > 0 ? nw * (double)WR.bytes / tw / 1e6 : 0., now() - tf); } }
+                          long nf = 0; for (int j = 0; j < nph; j++) nf += atomic_load(&PH[j].wr->vfall);
+                          fprintf(stderr, "predict profile (s): %d head writers: %.2f s compressing %ld shards (%.0f MB/s per writer, %ld from their bytes: levels over capacity), tail after the last window %.2f\n",
+                                  nph, tw, nw, tw > 0 ? nw * (double)WR.bytes / tw / 1e6 : 0., nf, now() - tf); } }
     if (ffzm) {   /* the last field slabs, the axis table and fields.json (format zarr) */
         for (; ffslab * FZ < ffF[0]; ffslab++) ffw_push(&ffw, (ffw_job){.kind = 1, .slab = ffslab});
         const double tfin = now();
