@@ -572,14 +572,15 @@ int cmd_ink_ext(int argc, char **argv) {
                         "         [--reverse] [--stride S] [--px-um U] [--batch B] [--gpu 0] [--threads 16] [--ct-mem 3] [--cache DIR] [--native] [--suffix S] [--prefix P]\n"
                         "         [--ct-local ROOT --local-levels 1,2] [--ct-um 2.399] [--surf-um U] [--no-overlap] [--norm tile|sheet] [--blend official|norm] [--grid-crop c,r,w,h]\n"
                         "         [--ct-tif] [--jpeg PATH] [--jpeg-stretch] [--layers DIR [--px-crop x,y,w,h]] [--dump-layers DIR] [--render-only]\n"
-                        "         [--shift S] [--zwin a,b,..] [--calib]\n"
+                        "         [--shift S] [--zwin a,b,..] [--calib] [--native-only]\n"
                         "       ufsm ink-ext --model M --weights W --raw-in TILES.u8 --raw-out LOGITS.f32 [--batch 2]   (parity: native tiles -> logits)\n"
                         "  --weights W1,W2,..: an ensemble (mean probability) of checkpoints of the model (e.g. ink9um seed42 + seed43)\n"
                         "  --shift S: every layer S layers further along +N (fractional ok; --layers: rounded, the window moves in the stack)\n"
                         "  --zwin a,b,..: also average over these extra layer shifts (the ink_9um card's z-window ensemble, e.g. -1,0,1)\n"
                         "  --tta K: each tile's probability averaged over K (1..8) square symmetries (flips, transposes; exact, no resampling)\n"
                         "  --tta-depth 1: each view also with the layer order reversed (the read direction flipped inside the tile)\n"
-                        "  --calib: write (p - 0.25) / 0.5 clipped to [0, 1] (koine BCE label smoothing 0.5: reader3 / ink9um no-ink sits near 0.25)\n"); return 2;
+                        "  --calib: write (p - 0.25) / 0.5 clipped to [0, 1] (koine BCE label smoothing 0.5: reader3 / ink9um no-ink sits near 0.25)\n"
+                        "  --native-only: only <name>_<model>_native.tif/.jpg on the model grid (px (i, j) = tifxyz grid (i, j) x du; invalid cells 0), no canvas TIF\n"); return 2;
     }
     const int kind = ie_model_kind(mname); if (kind < 0) { fprintf(stderr, "ink-ext: unknown model %s\n", mname); return 2; }
     if (xnet_init(atoi(iopt(argc, argv, "--gpu", "0")))) return 1;
@@ -732,6 +733,22 @@ surfaces:;
             for (int i = 0; i < X.sp->D; i++) { snprintf(p, sizeof p, "%s/%02d.tif", dd, i); if (tiffw_write(p, Wm, Hm, 1, X.dump + (size_t)i * Wm * Hm, 1)) rc = 1; }
             free(X.dump); X.dump = nullptr;
         }
+        if (iflag(argc, argv, "--native-only") && !X.stk) {   /* only the model-grid map (pixel (i, j) = grid (i du, j du)), no canvas TIF: huge segments */
+            uint8_t *g = malloc((size_t)Wm * Hm); size_t nv = 0; double mean = 0;
+            for (int j = 0; j < Hm; j++) for (int i = 0; i < Wm; i++) {
+                const size_t k = (size_t)j * Wm + i; double P[3], N[3], a[3], b[3];
+                const int ok = !surf_pn(&S, i * du, j * du, P, N, a, b);
+                g[k] = ok ? (uint8_t)lroundf(pm[k] * 255) : 0; if (ok) { nv++; mean += g[k]; }
+            }
+            snprintf(p, sizeof p, "%s/%s_%s%s_native.tif", outdir, nm, mname, suffix);
+            if (tiffw_write(p, Wm, Hm, 1, g, 1)) { fprintf(stderr, "ink-ext: cannot write %s\n", p); rc = 1; }
+            snprintf(p, sizeof p, "%s/%s_%s%s_native.jpg", outdir, nm, mname, suffix);
+            if (write_gray_jpeg_half(p, g, Wm, Hm)) { fprintf(stderr, "ink-ext: cannot write %s\n", p); rc = 1; }
+            fprintf(stderr, "ink-ext: %s -> %s/%s_%s%s_native.tif (%d x %d at %g um, %.6g grid units per px, mean %.3f over %zu valid px = %.2f cm2), %.1fs\n", S.name, outdir, nm,
+                    mname, suffix, Wm, Hm, X.px_um, du, nv ? mean / nv / 255 : 0, nv, nv * X.px_um * X.px_um * 1e-8, inow() - t0);
+            free(g); free(pm); isurf_free(&S); ns++;
+            continue;
+        }
         int ow, oh; uint8_t *g;
         if (X.stk) {   /* --layers: the stack's pixel grid is the output grid */
             ow = Wm; oh = Hm; g = malloc((size_t)Wm * Hm); for (size_t i = 0; i < (size_t)Wm * Hm; i++) g[i] = (uint8_t)lroundf(pm[i] * 255);
@@ -755,7 +772,8 @@ surfaces:;
    model's median .. 99.5th percentile, Reader's 0.25 .. 0.75 compression and the models' different ink fractions removed),
    rank = the value's percentile; then the weighted mean (weights W, default 1) as uint8. */
 int cmd_ink_ensemble(int argc, char **argv) {
-    if (argc < 5) { fprintf(stderr, "usage: ufsm ink-ensemble <out.tif> --ink [W:]PATH.tif .. [--norm stretch|rank|none] [--lo-pct 50] [--hi-pct 99.5] [--jpeg OUT.jpg]\n"); return 2; }
+    if (argc < 5) { fprintf(stderr, "usage: ufsm ink-ensemble <out.tif> --ink [W:]PATH.tif .. [--norm stretch|rank|none] [--lo-pct 50] [--hi-pct 99.5] [--jpeg OUT.jpg] [--peaks N [--peak-win 1024] [--peak-cover 0.5]]\n"
+                              "  --peaks N: prints the N non-overlapping --peak-win windows of highest mean ensemble with at least --peak-cover of their pixels covered (peak x,y,w,h mean)\n"); return 2; }
     const char *norm = iopt(argc, argv, "--norm", "stretch"); const double plo = atof(iopt(argc, argv, "--lo-pct", "50")), phi = atof(iopt(argc, argv, "--hi-pct", "99.5"));
     enum { MAXI = 16 }; uint8_t *im[MAXI]; double wt[MAXI]; int n = 0, W = 0, H = 0;
     for (int a = 2; a + 1 < argc; a++) {
@@ -786,6 +804,7 @@ int cmd_ink_ensemble(int argc, char **argv) {
     }
     uint8_t *o = malloc(np); for (size_t i = 0; i < np; i++) o[i] = mask[i] ? (uint8_t)lroundf(acc[i] * 255) : 0;
     const int npk = atoi(iopt(argc, argv, "--peaks", "0")), pw = atoi(iopt(argc, argv, "--peak-win", "1024"));
+    const double pcov = atof(iopt(argc, argv, "--peak-cover", "0.5"));   /* least share of the window with data */
     if (npk > 0 && pw > 0 && pw <= W && pw <= H) {   /* the npk non-overlapping pw x pw windows of highest mean ensemble (>= half covered) */
         double *I = calloc((size_t)(W + 1) * (H + 1), sizeof *I), *C = calloc((size_t)(W + 1) * (H + 1), sizeof *C);
         for (int y = 0; y < H; y++) { double r = 0, c = 0; for (int x = 0; x < W; x++) { r += o[(size_t)y * W + x]; c += mask[(size_t)y * W + x];
@@ -797,7 +816,7 @@ int cmd_ink_ensemble(int argc, char **argv) {
                 int ov = 0; for (int q = 0; q < got && !ov; q++) ov = abs(x - px[q]) < pw && abs(y - py[q]) < pw;
                 if (ov) continue;
                 const size_t a = (size_t)y * (W + 1) + x, b = a + pw, c = a + (size_t)pw * (W + 1), d = c + pw;
-                const double cnt = C[d] - C[b] - C[c] + C[a]; if (cnt < 0.5 * pw * pw) continue;
+                const double cnt = C[d] - C[b] - C[c] + C[a]; if (cnt < pcov * pw * pw) continue;
                 const double m = (I[d] - I[b] - I[c] + I[a]) / cnt; if (m > best) { best = m; bx = x; by = y; }
             }
             if (bx < 0) break;

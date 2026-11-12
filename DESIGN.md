@@ -6,6 +6,31 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Old branches folded in (2026-11-12, branch oldmerge-20261112)
+
+Three stale branches whose features master lacked, re-applied onto the current code; the remote branches are deleted (names and shas in
+`/vesuvius/ufsm/deleted-branches-20261112.txt`).
+
+- **stripopt-20261030** (243d57d, merged as is): flatten prolongate: when relaxing more than doubled the stuck-triangle set, go back to
+  the relax state with the fewest stuck triangles and drop only those (P4 core chunks: 293 bad -> 4134 after 200 rounds, 2.4-3% of the
+  mesh dropped as flaps; chunks 189-194 aniso p50 / p95 1.139 / 1.751 -> 1.079 / 1.278).
+- **ink-teach** (2 of 5 commits; `ink-splat --exclude`, value_hist and the 65500 px JPEG skip were already in master through
+  inkgt-20261111, src/inksplat.c is untouched):
+  - `ink-ext --native-only` (8357e4b): only `<name>_<model>_native.tif / .jpg` on the model grid (invalid cells 0, valid-cell area in
+    the log), no canvas TIF (P4 whole-wrap segments: canvas > 10 G px).
+  - `render --known` (2adefad): nearest voxel, 255 (prob254 unknown) skipped, the max over the known values within +-depth; for eye
+    checks of ink-splat label zarrs. Master's render has since become chunk-ordered / GPU by default, and those samplers are
+    trilinear only, so `--known` takes the CPU `render_rows` path (the box read once when it fits UFSM_RENDER_MEM, else per tile)
+    and is refused with `--fill` / `--joint`. test_render_known: both paths against the dense reference on a label volume with an
+    unknown hole and invalid vertices, 0 of 18204 pixels differ; the plain render of the same volume differs (the 255s win).
+- **inkext** (4676177):
+  - `ink-compare --mask M.tif`: statistics and panels only where M > 0 (M on the renders' grid before `--crop`). Implemented in
+    `ink_compare_mem` only, so `--mask` routes there (not streamed: the renders are held in memory). test_render_stream: the
+    statistics equal those of the renders zeroed outside the mask, bit for bit, with and without `--crop`.
+  - `png2jpg --size W,H | --size-like REF.tif` (bilinear resize first); its JPEG input was already in master (magic-byte detection,
+    imgops' jpeg_read_rgb kept instead of the branch's copy).
+  - `ink-ensemble --peak-cover F` (default 0.5: the least covered share of a `--peaks` window).
+
 ## Holdouts masked instead of rejected; coarse rungs get a pooled phase (2026-11-11, branch univ-20261111)
 
 u1 after the fstem restart (5796) drew 0.0% of its windows at 19.2 um, PHerc1667-gt not at all, 1667-A48 / B48 and 0500P2 at 0.6-3.3%. A
