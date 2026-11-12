@@ -3,6 +3,7 @@
    order, same sampling density (0.5 voxel along both quad edges at the target level, capped at 256). tests/test_codes_onfly.sh holds the
    two byte-identical. */
 #include "meshcodes.h"
+#include "meshcodesgpu.h"
 #include "reg.h"
 #include "store.h"
 #include "tiff.h"
@@ -13,6 +14,7 @@
 #include <unistd.h>
 #include <math.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -168,8 +170,52 @@ static void *mc_stamp(void *vp) {
     }
     return nullptr;
 }
+/* the device stamp (src/nn_mcodes.cu, byte-identical): the host culls the tiles against the box and gathers their vertex blocks (a tile:
+   33 x 33 vertices, 17 bytes each), the device runs the samples. -1 undecided (the first read: $UFSM_MESHCODES_CPU=1 the CPU,
+   $UFSM_MESHCODES_GPU the device, default 0), 0 the CPU, 1 the GPU. */
+static _Atomic int g_mcgpu = -1;
+static struct { _Atomic uint64_t gpu_reads, cpu_reads, gpu_fail, us_gpu, us_cpu; } g_mcs;
+void mesh_codes_gpu_config(int dev) { if (dev < 0 || !mesh_codes_gpu_stamp) { g_mcgpu = 0; return; } mesh_codes_gpu_device(dev); g_mcgpu = 1; }
+static int mc_gpu_on(void) {
+    int g = atomic_load(&g_mcgpu); if (g >= 0) return g;
+    const char *e = getenv("UFSM_MESHCODES_CPU"), *d = getenv("UFSM_MESHCODES_GPU");
+    if ((e && atoi(e)) || !mesh_codes_gpu_stamp) g = 0; else { mesh_codes_gpu_device(d ? atoi(d) : 0); g = 1; }
+    atomic_store(&g_mcgpu, g); return g;
+}
+void mesh_codes_stats(uint64_t *gpu_reads, uint64_t *cpu_reads, uint64_t *gpu_fail, double *gpu_s, double *cpu_s) {
+    *gpu_reads = g_mcs.gpu_reads; *cpu_reads = g_mcs.cpu_reads; *gpu_fail = g_mcs.gpu_fail; *gpu_s = g_mcs.us_gpu * 1e-6; *cpu_s = g_mcs.us_cpu * 1e-6;
+}
+static thread_local struct { mcg_tile *t; size_t tc; float *xyz, *val; uint8_t *valid; size_t vc; } t_mg;
+static int mc_read_gpu(const mc_ctx *X, const int64_t o[3], const int64_t n[3], uint8_t *out) {
+    const double sc = X->scale, lo[3] = {(double)o[0] - 1, (double)o[1] - 1, (double)o[2] - 1}, hi[3] = {(double)(o[0] + n[0]), (double)(o[1] + n[1]), (double)(o[2] + n[2])};
+    size_t nt = 0, nv = 0;
+    for (size_t ti = 0; ti < X->nt; ti++) {   /* (mc_stamp's tile cull for the whole box; tiles keep their order) */
+        const mc_tile *t = &X->t[ti]; int hit = 1;
+        for (int d = 0; d < 3; d++) if (t->lo[d] * sc > hi[d] || t->hi[d] * sc < lo[d]) hit = 0;
+        if (!hit) continue;
+        const size_t k = (size_t)(t->r1 - t->r0 + 1) * (t->c1 - t->c0 + 1);
+        if (nt == t_mg.tc) { const size_t c = t_mg.tc ? 2 * t_mg.tc : 1024; mcg_tile *nb = realloc(t_mg.t, c * sizeof *nb); if (!nb) return -1; t_mg.t = nb; t_mg.tc = c; }
+        if (nv + k > t_mg.vc) { size_t c = t_mg.vc ? t_mg.vc : 1 << 16; while (c < nv + k) c *= 2;
+            float *a = realloc(t_mg.xyz, c * 12); if (a) t_mg.xyz = a;
+            float *b = realloc(t_mg.val, c * 4); if (b) t_mg.val = b;
+            uint8_t *v = realloc(t_mg.valid, c); if (v) t_mg.valid = v;
+            if (!a || !b || !v) return -1;
+            t_mg.vc = c; }
+        const mc_mesh *m = &X->m[t->mi]; const int nc = t->c1 - t->c0 + 1;
+        t_mg.t[nt++] = (mcg_tile){.voff = (uint32_t)nv, .nr = t->r1 - t->r0 + 1, .nc = nc, .zlo = t->lo[0], .zhi = t->hi[0]};
+        for (int r = t->r0; r <= t->r1; r++) { const size_t s = (size_t)r * m->w + t->c0;
+            memcpy(t_mg.xyz + 3 * nv, m->xyz + 3 * s, (size_t)nc * 12); memcpy(t_mg.val + nv, m->val + s, (size_t)nc * 4); memcpy(t_mg.valid + nv, m->valid + s, (size_t)nc); nv += (size_t)nc; }
+        if (nv > UINT32_MAX - 4096) return -1;
+    }
+    if (!nt) { memset(out, 0, (size_t)n[0] * n[1] * n[2]); return 0; }
+    return mesh_codes_gpu_stamp(t_mg.t, (int)nt, t_mg.xyz, t_mg.val, t_mg.valid, nv, sc, o, n, out);
+}
 static int mc_read(void *vp, z3 *base, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads) {
-    (void)base; const mc_ctx *X = vp;
+    (void)base; const mc_ctx *X = vp; const double t0 = mc_now();
+    if (mc_gpu_on()) {
+        if (!mc_read_gpu(X, o, n, out)) { atomic_fetch_add(&g_mcs.gpu_reads, 1); atomic_fetch_add(&g_mcs.us_gpu, (uint64_t)(1e6 * (mc_now() - t0))); return 0; }
+        if (!atomic_fetch_add(&g_mcs.gpu_fail, 1)) fprintf(stderr, "mesh codes: the device stamp failed; this read (and any later failing one) runs on the CPU\n");
+    }
     memset(out, 0, (size_t)n[0] * n[1] * n[2]);
     int T = nthreads < 1 ? 1 : nthreads > 64 ? 64 : nthreads; if (T > n[0]) T = (int)n[0];
     mc_part P[64]; pthread_t th[64];
@@ -177,6 +223,7 @@ static int mc_read(void *vp, z3 *base, const int64_t o[3], const int64_t n[3], u
     for (int i = 1; i < T; i++) if (pthread_create(&th[i], nullptr, mc_stamp, &P[i])) { mc_stamp(&P[i]); th[i] = 0; }
     mc_stamp(&P[0]);
     for (int i = 1; i < T; i++) if (th[i]) pthread_join(th[i], nullptr);
+    atomic_fetch_add(&g_mcs.cpu_reads, 1); atomic_fetch_add(&g_mcs.us_cpu, (uint64_t)(1e6 * (mc_now() - t0)));
     return 0;
 }
 static int mc_extent(void *vp, const int64_t grid[3], const int chunk[3], uint8_t *bits) {
@@ -191,7 +238,7 @@ static int mc_extent(void *vp, const int64_t grid[3], const int chunk[3], uint8_
 }
 
 z3 *mesh_codes_open(const char *dir, const char *value, const char *mapp, int level, z3 *ct_level, int gpu) {
-    (void)gpu;
+    if (gpu < 0) mesh_codes_gpu_config(-1); else if (gpu > 0) mesh_codes_gpu_config(gpu - 1);   /* (0: the process default) */
     if (!ct_level || !dir || !value || level < 0 || level > 8) { fprintf(stderr, "mesh codes: need a meshes dir, a value image name, level 0..8 and the CT level\n"); z3_close(ct_level); return nullptr; }
     const rmap *map = nullptr; if (mapp && *mapp && !(map = reg_map_load(mapp))) { fprintf(stderr, "mesh codes: cannot load the map %s\n", mapp); z3_close(ct_level); return nullptr; }
     char **names = nullptr; int nn = 0, cap = 0;
@@ -252,8 +299,8 @@ int cmd_codes_onfly(int argc, char **argv) {
     uint64_t seed = (uint64_t)atoll(mc_opt(argc, argv, "--seed", "1"));
     store *cs = store_open(argv[ci + 1]); z3 *c0 = cs ? z3_open(cs, argv[ci + 2], nullptr) : nullptr;
     if (!c0) { fprintf(stderr, "codes-onfly: cannot open the CT %s %s\n", argv[ci + 1], argv[ci + 2]); return 1; }
-    const double t0 = mc_now();
-    z3 *z = mesh_codes_open(argv[2], mc_opt(argc, argv, "--value", "q.tif"), mc_opt(argc, argv, "--map", nullptr), level, c0, 0); if (!z) return 1;
+    const double t0 = mc_now(); const int gd = atoi(mc_opt(argc, argv, "--gpu", "-1"));   /* --gpu D: the device stamp on GPU D (default -1: the CPU) */
+    z3 *z = mesh_codes_open(argv[2], mc_opt(argc, argv, "--value", "q.tif"), mc_opt(argc, argv, "--map", nullptr), level, c0, gd < 0 ? -1 : gd + 1); if (!z) return 1;
     const mc_ctx *X = z3_derived_ctx(z); const int64_t *sh = z3_meta_of(z)->shape;
     printf("codes-onfly: key %s\n", mesh_codes_key(z));
     printf("codes-onfly: %d meshes, %zu tiles, opened in %.1f s (grid %lld %lld %lld)\n", X->nm, X->nt, mc_now() - t0, (long long)sh[0], (long long)sh[1], (long long)sh[2]);
@@ -330,7 +377,8 @@ int cmd_codes_onfly(int argc, char **argv) {
             free(ct); z3_close(fc); }
         free(cb); z3_close(zc);
     }
-    printf("codes-onfly: %d windows of %d^3: %.0f ms mean, %.0f ms max per window (CPU, %d threads)%s\n", nw, P, tsum / nw * 1e3, tmax * 1e3, T,
+    { uint64_t gr, cr, gf; double gs, cs; mesh_codes_stats(&gr, &cr, &gf, &gs, &cs); printf("codes-onfly: reads on the GPU %llu (%.2f s), on the CPU %llu (%.2f s), device failures %llu\n", (unsigned long long)gr, gs, (unsigned long long)cr, cs, (unsigned long long)gf); }
+    printf("codes-onfly: %d windows of %d^3: %.0f ms mean, %.0f ms max per window (%s, %d threads)%s\n", nw, P, tsum / nw * 1e3, tmax * 1e3, gd >= 0 ? "GPU" : "CPU", T,
            ref ? (bad ? ": DIFFERS from the stored raster" : ": byte-identical to the stored raster") : "");
     free(a); free(b); z3_close(z); z3_close(ref);
     return bad ? 1 : 0;

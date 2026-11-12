@@ -8,11 +8,14 @@
    fine scan first (the 1.129 um twins); nullptr = the meshes' own scan.
    ct_level: an open array of the target level (meta only: shape, chunk / shard grid); taken over (closed on failure too).
    The known extent (z3_derived_extent: the sampler's draw cells) is the chunks the tiles' bounds reach.
-   gpu: reserved (the device stamp); the CPU reference runs for now. */
+   gpu: the stamp's device for the process: 0 keep the default (the GPU stamp on $UFSM_MESHCODES_GPU, default 0; $UFSM_MESHCODES_CPU=1 or
+   a binary without nn_mcodes.o: the CPU), D + 1 GPU D, -1 the CPU (mesh_codes_gpu_config). Both stamps are byte-identical (test_codes_onfly). */
 #pragma once
 #include "zarr3.h"
 z3 *mesh_codes_open(const char *dir, const char *value, const char *map, int level, z3 *ct_level, int gpu);
 /* a cache key for values derived from this array (dcache): "meshcodes-v1-<hash of every input: each mesh's TIFF sizes + mtimes, the value
    name, the map and its field>-L<level>"; the caller appends its own rule parameters (e.g. the pair radius). Lives as long as z. */
 const char *mesh_codes_key(const z3 *z);
+void mesh_codes_gpu_config(int dev);   /* the stamp on GPU dev (< 0: the CPU) for every mesh codes array of the process */
+void mesh_codes_stats(uint64_t *gpu_reads, uint64_t *cpu_reads, uint64_t *gpu_fail, double *gpu_s, double *cpu_s);
 int cmd_codes_onfly(int argc, char **argv);   /* ufsm codes-onfly: the derived codes over windows, ms and byte diffs vs a stored raster */
