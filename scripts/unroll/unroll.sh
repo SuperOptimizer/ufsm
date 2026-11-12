@@ -7,7 +7,10 @@
 # Stages and their order (critical path first; -> = waits for):
 #   prep    box (scrolls.tsv or the scanprep mask) + axis (scrolls.tsv file or ufsm axis)
 #   fields  wind96 fit fields (window 384 x 640^2 / 64; FWIN=auto: predict --window auto, opt-in): the box split in z at a 1024-voxel boundary, one predict per GPU (same global tile grid), joined by
-#           fields_cat.sh (shard files moved: the result is the single-GPU run's); FIELDGPUS="0" = one predict
+#           fields_cat.sh (shard files moved: the result is the single-GPU run's); FIELDGPUS="0" = one predict. A latent-grid CK (FKIND auto: the
+#           checkpoint header has "lat_c"; FKIND=lat / vox forces it): fields/lat from cube windows LWIN / LHALO (640 / 64, the gate's U1
+#           settings: stride 512, so the 1024-voxel z parts keep one tile grid), the latent heads' fit planes (winding mod 4 too); --fit-h 2 runs
+#           the slab plane path (the fused nn_fit_accum_lat kernel takes --fit-h 8 only)
 #   ink     -> prep only; GPU INKGPU (1) from when the fields are done: INKCMD (the ink agent's recipe; default: the feathered
 #           single pass of inklib.sh: ift3, frozen GN, --window auto --halo 32 --feather 32, resumable) -> ink/$INKNAME.zarr
 #   ctcal   -> fields (CTCAL=1 only, OFF by default): ufsm ct-cal --ct-um $LUM (the CT LEVEL's um) -> ct.cal; ref adds --ct-cal
@@ -31,6 +34,9 @@
 #   perwrap -> wraps + ink (PERWRAP=1): flatten (GPU) + render + ink-compare per wrap, largest first (p4full3.sh recipe)
 #   faces   -> perwrap (FACES=1): ufsm faces per flattened wrap
 #   upload  never automatic: UPLOAD=1 and the scroll not prize-eligible (feedback: ask first); prints the command otherwise
+# UPTO=STAGE: stop after that stage of the critical path (e.g. UPTO=slabs for a GPU window: fields, ink, slabs; then re-run without it, the
+# GPUs hidden: CUDA_VISIBLE_DEVICES= UFSM_RENDER_GPU=0 FLATX=); NOINK=1: no ink stage (a comparison run up to check; the GPU lane of
+# INKGPU does not wait for it)
 # Heavy CPU stages wait for MemAvailable >= MINMEM (40) GB. STOP: touch $O/STOP (checked between stages / slabs / wraps). A stage
 # whose done marker exists is skipped; partial stages resume (predict --resume parts, slab claims, per-wrap outputs).
 # DRY=1: print the plan (commands) without running anything. Runs from a copy of these scripts in $O/bin (edits never touch a run).
@@ -43,7 +49,7 @@ S=${1:?usage: unroll.sh SCROLL}
 H=$(cd "$(dirname "$0")" && pwd)
 UR=${UR:-/vesuvius/ufsm/unroll}; O=$UR/$S${TAG:-}   # (TAG: e.g. a test crop beside the full run)
 U=${U:-/vesuvius/ufsm/unroll/bin/ufsm}
-CK=${CK:-/vesuvius/ufsm/paris4/ckpt/wind96-wk1-best.ckpt}; INKCK=${INKCK:-/vesuvius/ufsm/ink-ft/runs/ift3/snap/ift3-24000.ckpt}
+CK=${CK:-/vesuvius/ufsm/podready/pod/ckpt/wind96-wk1-best.ckpt}; INKCK=${INKCK:-/vesuvius/ufsm/ink-ft/runs/ift3/snap/ift3-24000.ckpt}   # (CK: the gate's wind96 copy, sha1 dafb8233; /vesuvius/ufsm/paris4 is gone since the 11-12 cleanup)
 # host limits (cgroup-aware on pods): ufsm sysinfo --ncpu / --avail-gb when the binary has it, else nproc / /proc/meminfo
 ncpu() { local n; n=$($U sysinfo --ncpu 2> /dev/null) && [ "$n" -gt 0 ] 2> /dev/null && { echo $n; return; }; nproc; }
 availgb() { local g; g=$($U sysinfo --avail-gb 2> /dev/null) && [ "$g" -ge 0 ] 2> /dev/null && { echo $g; return; }
@@ -66,7 +72,9 @@ BOX=${BOX:-$TBOX}; ZR=${ZR:-$TZR}; [ "$TSTRIP" = - ] && TSTRIP=
 # a wrap id (--last N) is in ONE run's gauge only (P3 11-02: the prod run's --last 432 skipped the trim of a re-unroll numbered w025-w266):
 # a --last in scrolls.tsv / list.tsv is dropped here (the trim stage finds it per run); only a STRIPARGS env override keeps one (checked in trim)
 if [ -z "${STRIPARGS:-}" ]; then STRIPARGS=$(echo " $TSTRIP " | sed -E 's/ --last [0-9]+ / /; s/^ +//; s/ +$//'); else [ "$STRIPARGS" = - ] && STRIPARGS=; fi
-F=$O/fields/wind96; REF=$O/ref-cf; INK=$O/ink/$INKNAME.zarr
+FKIND=${FKIND:-auto}; [ "$FKIND" = auto ] && { head -c 8192 "$CK" 2> /dev/null | grep -q '"lat_c"' && FKIND=lat || FKIND=vox; }
+FNAME=$([ "$FKIND" = lat ] && echo lat || echo wind96)
+F=$O/fields/$FNAME; REF=$O/ref-cf; INK=$O/ink/$INKNAME.zarr
 
 # the run's own copy of the scripts (bash reads scripts incrementally: editing the repo must not change a running driver)
 if [ "$DRY" != 1 ] && [ "${UNROLL_COPY:-0}" != 1 ]; then
@@ -110,6 +118,8 @@ stage() {
   else log "$st FAILED rc $rc (logs/$st.log)"; fi
   return $rc
 }
+# upto STAGE: true when UPTO names STAGE (the schedule stops there: the background ink is waited for)
+upto() { [ "${UPTO:-}" = "$1" ] && { [ "$DRY" = 1 ] && echo "(UPTO=$1: stop here)" || log "unroll: UPTO=$1 reached: stopping (re-run without UPTO for the rest)"; wait; exit 0; }; return 0; }
 waitfor() { [ "$DRY" = 1 ] && { echo "    (waits for state/$1.done)"; return 0; }; while ! done_ $1; do stopped && return 1; [ -e $O/state/$1.failed ] && return 1; sleep 30; done; }
 
 prep() {
@@ -139,7 +149,9 @@ occlv() {   # --occupancy L for the fields: the first of levels LV+3, LV+2, LV+4
   done
 }
 fpred() {   # fpred GPU BOX OUT
-  X $O/logs/fields.log $U predict $CK $R $K $3.tmp --um $UM --level $LV --box $2 $([ "${FWIN:-prod}" = auto ] && echo "--window auto" || echo "--window-z 384 --halo-z 64 --window 640") --halo 64 --shard 512 \
+  local win; if [ "$FKIND" = lat ]; then win="--window ${LWIN:-640} --halo ${LHALO:-64}"
+  else win="$([ "${FWIN:-prod}" = auto ] && echo "--window auto" || echo "--window-z 384 --halo-z 64 --window 640") --halo 64"; fi
+  X $O/logs/fields.log $U predict $CK $R $K $3.tmp --um $UM --level $LV --box $2 $win --shard 512 \
     --grid-origin 0,0,0 --ema 1 --q 8 --threads ${PTH:-14} --gpu $1 --axis $O/axis.json --levels 1 --fit-zarr $3 --fit-h 2 --fit-q 8 --fit-q-phase 4 --no-out 1 $(occlv) &&
     { [ "$DRY" = 1 ] || { rm -rf $3.tmp; [ -e $3/fields.json ]; }; }
 }
@@ -271,7 +283,7 @@ slabs() {
   lanes=$(fitlanes); [ "$DRY" = 1 ] && echo "    slab lanes (GPU per lane): $lanes"
   ng=$(echo $lanes | wc -w); FTH_LANE=${FTHREADS:-$(( $(ncpu) / (ng > 0 ? ng : 1) ))}; [ $FTH_LANE -lt 2 ] && FTH_LANE=2
   for g in $lanes; do
-    if [ "$g" = "$INKGPU" ] && ! done_ ink; then { [ "$DRY" = 1 ] && echo "    (GPU $g lane starts once the ink is done or failed)" || while ! done_ ink && ! stopped && [ ! -e $O/state/ink.failed ]; do sleep 30; done; lane $g; } &
+    if [ "$g" = "$INKGPU" ] && [ "${NOINK:-0}" != 1 ] && ! done_ ink; then { [ "$DRY" = 1 ] && echo "    (GPU $g lane starts once the ink is done or failed)" || while ! done_ ink && ! stopped && [ ! -e $O/state/ink.failed ]; do sleep 30; done; lane $g; } &
     else lane $g & fi; pids+=($!)
   done
   for p in "${pids[@]}"; do wait $p; done
@@ -383,7 +395,7 @@ snap() {
       --fields $F --threads $TH ${SNAPX:-} || return 1
     [ "$DRY" = 1 ] || log "snap: $(grep '^wrap-snap: solve' $O/logs/snap.log | tail -1)"
   else log "snap: off (SNAP=0)"; fi
-  [ "$DRY" = 1 ] || { [ "${CLEAN:-1}" = 1 ] && { find $F -mindepth 1 -maxdepth 1 ! -name fields.json -exec rm -rf {} +; [ $F = $O/fields/wind96 ] || find $O/fields/wind96 -mindepth 1 -maxdepth 1 ! -name fields.json -exec rm -rf {} +; rm -rf $O/slabs/s???/fit; }; }
+  [ "$DRY" = 1 ] || { [ "${CLEAN:-1}" = 1 ] && { find $F -mindepth 1 -maxdepth 1 ! -name fields.json -exec rm -rf {} +; [ $F = $O/fields/$FNAME ] || find $O/fields/$FNAME -mindepth 1 -maxdepth 1 ! -name fields.json -exec rm -rf {} +; rm -rf $O/slabs/s???/fit; }; }
   return 0
 }
 strip() { local a=$STRIPARGS; [ -e $O/state/strip.args ] && a=$(cat $O/state/strip.args)
@@ -457,16 +469,15 @@ upload() {
 }
 
 # --- the schedule ---
-[ "$DRY" = 1 ] && echo "unroll $S: O=$O U=$U ($R $K level $LV, $LUM um; box ${BOX:--}, zr ${ZR:--}, strip args '${STRIPARGS}')"
-stage prep prep || exit 1
-stage fields fields || exit 1
+[ "$DRY" = 1 ] && echo "unroll $S: O=$O U=$U ($R $K level $LV, $LUM um; box ${BOX:--}, zr ${ZR:--}, strip args '${STRIPARGS}'; CK $CK: $FKIND fields $F)"
+stage prep prep || exit 1; upto prep
+stage fields fields || exit 1; upto fields
 # the ink (GPU $INKGPU) beside the CPU ref and the GPU-0 slab lane; the per-wrap renders beside the strip
-( stage ink ink || touch $O/state/ink.failed ) &
-INKP=$!
-[ "$DRY" = 1 ] && wait $INKP
+if [ "${NOINK:-0}" != 1 ]; then ( stage ink ink || touch $O/state/ink.failed ) & INKP=$!; [ "$DRY" = 1 ] && wait $INKP; fi
 { [ "${RECTOSP:-1}" = 0 ] || stage rectosp rectosp; } || { log "unroll: rectosp failed"; wait; exit 1; }
 [ "${RECTOSP:-1}" != 0 ] && { [ -e $O/fields/rsp/fields.json ] || { [ "$DRY" = 1 ] && [ -n "$(m7src)" ]; }; } && F=$O/fields/rsp   # (the ref and every later stage read the blended fields)
-{ [ "${CTCAL:-0}" != 1 ] || stage ctcal ctcal; } && stage ref ref && stage slabs slabs && stage join join && stage check check && stage wraps wraps && stage trim trim && stage snap snap ||
+{ [ "${CTCAL:-0}" != 1 ] || stage ctcal ctcal; } && stage ref ref && upto ref && stage slabs slabs && upto slabs && stage join join && upto join && stage check check && upto check &&
+  stage wraps wraps && upto wraps && stage trim trim && stage snap snap && upto snap ||
   { log "unroll: stopped before the strip"; wait; exit 1; }
 if [ "${PERWRAP:-0}" = 1 ]; then ( waitfor ink && stage perwrap perwrap && { [ "${FACES:-0}" = 1 ] && stage faces faces; true; } ) & PWP=$!; [ "$DRY" = 1 ] && wait $PWP; fi
 stage strip strip && stage stripflat stripflat && waitfor ink && stage stripimg stripimg || log "unroll: the strip stopped"
