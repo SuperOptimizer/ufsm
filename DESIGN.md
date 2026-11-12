@@ -99,6 +99,13 @@ fibre labels when the draws took every papyrus cell. UFSM_FIBRE_EXTENT=0: the CT
 projection 0: neutral), its Adam / Muon state and EMA reset; one-shot by step (a resume from any other step keeps the stem). For u1
 after univI's fstem forward fix (the forward covered only x mod 256 < 64 of each row; the backward every block): the trunk and heads
 are kept, the stem restarts. test_univ2 checks the reset and that a later resume does not repeat it.
+
+fstem fix: u1 resumed at step 5796 (2026-11-11 20:32) on master e3c997b (univI's fstem forward fix 051d230 + --fstem-reset-at 5796),
+with the scale-robust mix (sources-u1b.json: 0139 / 0500P2 max_level 1, 1667-gt / A48 / B48 max_level 3 with CT levels from the
+mirror (ct_mirror), PHercParis4-june48 onfly at 0.10, 1667 A48 / B48 phase onfly; --rung-shift-p 0.3; --mix-every 250) and the
+launcher outside the memcap scope (u1.train2.sh, ckpt every 250). U1 3000 (pre-fix): native p05x 0.644, but DLV -1 / +1 0.400 / 0.404:
+every source was trained at one rung (4.8 um only 1667 A48 / B48, 19.2 um only Paris 4). Pre-fix snapshots are trunk checks only;
+latres gates from snap 9000 (>= resume + 3000).
 ## B1 4.8 um phase rasters: what was built before the switch to on-the-fly phase (2026-11-11, branch fibd-20261111)
 
 Workstream B1 rasterised the band phase at 4.8 um (`phase-raster --gs 2 --pair 1 --radius 160`, GPU, byte-identical to the CPU path;
