@@ -4,6 +4,7 @@
 #      the old slab path (UFSM_PRED_HEADS=0: upsampling + nn_fstem_fwd + nn_rv_fuse) within one code on 0.1 % of the bytes; each head of the
 #      multi-head run equals its single-head run byte for byte; --heads with --fit-zarr writes the same fields as --fit-zarr alone
 #  (1b) the GPU pyramid of the heads == the CPU pyramid at q 0 (shard 128 and 256)
+#  (1c) the heads encoded from the GPU's levels (vcgpu.h) == the CPU encoder, q 8, every shard file of every level
 #  (2) a plain latent net with the fibre head (--lat 4 --rv 2 --fib-head 1): --heads all writes rv, fib/H, fib/V, fib/dyad/c2..c7, fib/fam;
 #      fib/H equals the old single-channel path (the pool4 chain in fp32) within one code on 1 % (the heads path rounds the upsampled logit
 #      to fp16 as the slab path does: 0.64 % of the fixture's bytes land across a code boundary)
@@ -51,6 +52,13 @@ for sh in 128 256; do
     [ "$(tr -d '\000' < a.raw | wc -c)" -gt $(($2 * $2 * $2 / 8)) ] || fail "$n level $1, shard $sh: (nearly) empty"; done; done
   grep -q 'pyramids pooled on the GPU' py${sh}1.log && ! grep -q 'pyramids pooled on the GPU' py${sh}0.log || fail "GPU pyramid switch (shard $sh)"
   grep -q '"path":"38.4"' py${sh}1/rv/zarr.json || fail "the GPU pyramid's group (shard $sh)"
+done
+# (1c) the GPU encoder's levels (vcgpu.h) at q 8: every shard file of every level the same bytes as the CPU encoder's
+for sh in 128 256; do
+  for g in 1 0; do UFSM_PRED_GPU_ENC=$g "$U" predict s/last.ckpt fx ct ge$sh$g --um 9.6 --level 0 --window 160 --halo 16 --threads 2 --q 8 --shard $sh --levels 3 --heads rv,ink > ge$sh$g.log 2>&1 || fail "predict --q 8 --shard $sh, GPU encoder $g ($D/ge$sh$g.log)"; done
+  grep -q 'levels for the encoder from the GPU' ge${sh}1.log && ! grep -q 'levels for the encoder from the GPU' ge${sh}0.log || fail "GPU encoder switch (shard $sh)"
+  [ "$(cd ge${sh}1 && find . -path '*/c/*' -type f | sort | xargs cat | md5sum)" = "$(cd ge${sh}0 && find . -path '*/c/*' -type f | sort | xargs cat | md5sum)" ] || fail "shard $sh: the GPU encoder's shards differ from the CPU encoder's"
+  [ "$(cd ge${sh}1 && find . -path '*/c/*' -type f | wc -l)" -ge 6 ] || fail "shard $sh: too few shard files"
 done
 # (2) plain latent net with the fibre head
 "$U" train fx/sources-fibhv.json --out fb "${C[@]}" --lat 4 --rv 2 --rv-iso 100 --fib-head 1 > fb.log 2>&1 || fail "train (2) ($D/fb.log)"
