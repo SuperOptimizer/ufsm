@@ -8,7 +8,7 @@ Env: ROOT (rewrites /vesuvius/ufsm/inkgt to ROOT in the sources, the holdout fil
 OUT, whose directory is then the staging copy of ROOT: for a pod, ROOT=/workspace/univ/inkgt OUT=STAGE/inkgt/sources-u2ink.json),
 CACHE_DIR (the onfly "cache_dir": the derived-chunk cache; default: the trainer's $UFSM_DERIVED_CACHE / ~/.cache/ufsm/derived),
 CACHE_MB (each source's onfly memory cache; 2048 by default), CACHE (the sources' CT cache), LEVEL (0), VAL (exclude)."""
-import json, os, sys
+import json, os, shutil, sys
 
 IN = sys.argv[1] if len(sys.argv) > 1 else "/vesuvius/ufsm/inkgt/sources-inkfly.json"
 OUT = sys.argv[2] if len(sys.argv) > 2 else "/vesuvius/ufsm/inkgt/sources-u2ink.json"
@@ -31,6 +31,9 @@ for s in S["sources"]:
     if os.environ.get("CACHE_MB"): of["cache_mb"] = int(os.environ["CACHE_MB"])   # (the per-source memory cache, 2048 MB by default: 8 sources)
     if "holdout_file" in of: of["holdout_file"] = rw(of["holdout_file"])
     if "holdout_file" in s: s["holdout_file"] = rw(s["holdout_file"])
+    if ROOT != D and isinstance(s.get("axis"), str) and not s["axis"].startswith(D):   # (desk axis files: copied next to OUT, axis/<source>.json)
+        os.makedirs(os.path.join(od, "axis"), exist_ok=True); an = s["name"].replace("-inkfly", "") + ".json"
+        shutil.copyfile(s["axis"], os.path.join(od, "axis", an)); s["axis"] = ROOT + "/axis/" + an
     ik["min_level"] = L; s["min_level"] = L; s["max_level"] = L + 1
     s["name"] = s["name"].replace("-inkfly", "-u2ink")
     s["heads"] = {k: (1 if k == "ink" else 0) for k in s.get("heads", {"ink": 1})}
