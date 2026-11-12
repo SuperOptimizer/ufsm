@@ -254,6 +254,6 @@ test_latvol_sh                                 | gpu          |    60 | bash tes
 test_lat_fuse                                  | gpu          |     2 | ./$B/test_lat_fuse
 test_phase_onfly                               | gpu          |    20 | tests/test_phase_onfly.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/onfly
 test_fibre_onfly                               | gpu          |    25 | tests/test_fibre_onfly.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/fibonfly
-test_codes_onfly                               |              |     8 | tests/test_codes_onfly.sh ./$B/ufsm $TMPDIR/codesonfly
+test_codes_onfly                               | gpu          |    10 | tests/test_codes_onfly.sh ./$B/ufsm $TMPDIR/codesonfly
 test_mesh_phase                                |              |     8 | tests/test_mesh_phase.sh ./$B/ufsm ./$B/test_mesh_phase $TMPDIR/meshphase
 test_lldec                                     | gpu          |     3 | ./$B/test_lldec $TMPDIR/lldec

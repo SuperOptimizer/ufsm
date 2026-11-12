@@ -163,6 +163,8 @@ $(B)/nn_fibre.o: NVFLAGS = -O3 $(NVARCH) -DUFSM_ARCH=$(ARCH) -fmad=false -Xcompi
 $(B)/nn_inkfly.o: NVFLAGS = -O3 $(NVARCH) -DUFSM_ARCH=$(ARCH) -fmad=false -Xcompiler -fno-threadsafe-statics -Isrc
 # volcomp encoding's analysis on the GPU (src/nn_gpuenc.cu) gives the CPU encoder's levels exactly: no FMA contraction, no fast math
 $(B)/nn_gpuenc.o: NVFLAGS = -O3 $(NVARCH) -DUFSM_ARCH=$(ARCH) -fmad=false -Xcompiler -fno-threadsafe-statics -Isrc
+# the mesh codes stamp on the GPU (src/nn_mcodes.cu) is byte-identical to meshcodes.c mc_stamp: double, IEEE sqrt / division, no FMA contraction
+$(B)/nn_mcodes.o: NVFLAGS = -O3 $(NVARCH) -DUFSM_ARCH=$(ARCH) -fmad=false -Xcompiler -fno-threadsafe-statics -Isrc
 # FP8 / FP4 block-scaled mma (kind::mxf8f6f4 / kind::mxf4) needs the arch-specific sm_120a target
 # The low-precision kernels are split into one translation unit per kernel family (src/lp_*.cu, shared helpers in
 # src/lp_common.cuh) so make -j compiles them in parallel; $(B)/nn_fp8.o is their relocatable link, so every target
