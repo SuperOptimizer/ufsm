@@ -257,11 +257,11 @@ extern "C" void band_pair_gpu_free(void) {   /* every idle context's buffers (ca
 static int bg_alloc(bg_ctx &G, long N, long Lmax, long lc) {
     if (!G.init) { BG_CK(cudaStreamCreateWithFlags(&G.st, cudaStreamNonBlocking)); G.init = 1; }
     if ((size_t)N > G.cap) {
-        cudaFree(G.codes); cudaFree(G.phase); cudaFree(G.ie); cudaFree(G.io); G.codes = G.phase = nullptr; G.ie = G.io = nullptr;
+        cudaFree(G.codes); cudaFree(G.phase); cudaFree(G.ie); cudaFree(G.io); G.codes = G.phase = nullptr; G.ie = G.io = nullptr; G.cap = 0;   /* (cap 0 until all four exist: a failed allocation is retried, never used) */
         BG_CK(cudaMalloc(&G.codes, N)); BG_CK(cudaMalloc(&G.phase, N)); BG_CK(cudaMalloc(&G.ie, N * 4)); BG_CK(cudaMalloc(&G.io, N * 4)); G.cap = N;
     }
     if ((size_t)((Lmax + 1) * lc) > G.lcap) {
-        cudaFree(G.F); cudaFree(G.Z); cudaFree(G.S); cudaFree(G.V); G.F = G.Z = nullptr; G.S = nullptr; G.V = nullptr;
+        cudaFree(G.F); cudaFree(G.Z); cudaFree(G.S); cudaFree(G.V); G.F = G.Z = nullptr; G.S = nullptr; G.V = nullptr; G.lcap = 0;
         const size_t e = (size_t)(Lmax + 1) * lc;
         BG_CK(cudaMalloc(&G.Z, e * 8)); BG_CK(cudaMalloc(&G.S, e * 4)); BG_CK(cudaMalloc(&G.V, 4)); G.lcap = e;
     }
@@ -365,11 +365,14 @@ static int bg_codes_run(bg_ctx &G, const bg_lchunk *ch, int nch, const uint8_t *
         float T[4 * CP_P]; cp_tables_init(T); BG_CK(cudaMemcpyToSymbol(c_cpT, T, sizeof T)); __atomic_store_n(&g_cpT_dev[dv], 1, __ATOMIC_RELEASE); } }
     uint8_t *dec = pool ? G.fine : G.codes;   /* the decode target: the base codes */
     const long DZ = nf[0], DY = nf[1], DX = nf[2], DN = NF;
-    long cbat = DN / (2L << 20); if (cbat < 8) cbat = 8; if (cbat > nch) cbat = nch > 0 ? nch : 1;
-    if (blob_n + 64 > G.bcap) { cudaFree(G.blob); G.blob = nullptr; BG_CK(cudaMalloc(&G.blob, blob_n + 64)); G.bcap = blob_n + 64; }
-    if ((size_t)nch > G.ccap) { cudaFree(G.ch); cudaFree(G.status); cudaFreeHost(G.hstatus); G.ch = nullptr; G.status = nullptr; G.hstatus = nullptr;
+    /* chunks decoded per batch: 2 MB of scratch each, at most $UFSM_BAND_DECODE_BATCH (64: 128 MB). Before (2026-11-12) every chunk of
+       the box at once (~1 B per base voxel): a pooled base box of 4 GB took 4 GB of scratch, OOM on u1's 16 GB cards beside the trainer */
+    static long bmax = 0; if (!bmax) { const char *e = getenv("UFSM_BAND_DECODE_BATCH"); bmax = e && atol(e) > 0 ? atol(e) : 64; }
+    long cbat = DN / (2L << 20); if (cbat < 8) cbat = 8; if (cbat > bmax) cbat = bmax; if (cbat > nch) cbat = nch > 0 ? nch : 1;
+    if (blob_n + 64 > G.bcap) { cudaFree(G.blob); G.blob = nullptr; G.bcap = 0; BG_CK(cudaMalloc(&G.blob, blob_n + 64)); G.bcap = blob_n + 64; }
+    if ((size_t)nch > G.ccap) { cudaFree(G.ch); cudaFree(G.status); cudaFreeHost(G.hstatus); G.ch = nullptr; G.status = nullptr; G.hstatus = nullptr; G.ccap = 0;
         BG_CK(cudaMalloc(&G.ch, (size_t)nch * sizeof(bg_lchunk))); BG_CK(cudaMalloc(&G.status, (size_t)nch * 32 * 4)); BG_CK(cudaHostAlloc(&G.hstatus, (size_t)nch * 32 * 4, cudaHostAllocPortable)); G.ccap = nch; }
-    if ((size_t)cbat > G.scap) { cudaFree(G.scr); cudaFree(G.tag); G.scr = G.tag = nullptr; BG_CK(cudaMalloc(&G.scr, (size_t)cbat * 512 * 4096)); BG_CK(cudaMalloc(&G.tag, (size_t)cbat * 512)); G.scap = cbat; }
+    if ((size_t)cbat > G.scap) { cudaFree(G.scr); cudaFree(G.tag); G.scr = G.tag = nullptr; G.scap = 0; BG_CK(cudaMalloc(&G.scr, (size_t)cbat * 512 * 4096)); BG_CK(cudaMalloc(&G.tag, (size_t)cbat * 512)); G.scap = cbat; }
     cudaEvent_t ev[6]; const int tim = g_timing; if (tim) for (int k = 0; k < 6; k++) cudaEventCreate(&ev[k]);
     if (tim) cudaEventRecord(ev[0], G.st);
     BG_CK(cudaMemsetAsync(dec, 0, DN, G.st));
