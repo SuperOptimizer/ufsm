@@ -24,6 +24,17 @@ per run went this way, at 7.5-11 s per read.
 - Change vs atan2: test_lldec's fixture (sheet codes with exact k / k+1 ties) differs in 31319 of 1818498 coded voxels (1.7%), every one
   by one step, at the ties. None differ by more than one step or in empty / conflict. The derived-phase cache key of pooled mesh codes
   gets a "b" ("<key>-pool1b"), so old disk entries are not mixed in.
+- The derived phase target (the label) is unchanged in both cases measured: phase-raster --gs 4 --pair 1 (the pair rule on the 2x-pooled
+  codes, what the 9.6 / 19.2 um rungs train on), master vs this branch, compared voxel by voxel:
+  - PHerc1667 codesA 4.798, a 512^3 box at 9.6 um (7424,896,2048), radius 160: 87,348,987 known voxels in both, 0 known-status changes,
+    0 phase changes;
+  - the make_wind_fixture codes (fx/band 1, the test_phase_onfly fixture), radius 48: 129,158 known, 0 status changes, 0 phase changes.
+  The tie moves fall where the pair rule reads only the codes' winding parity and sheet positions, which a one-step move does not change.
+  So the coarse-rung labels match u1's on these boxes; pooled codes differ only at exact ties.
+- Caches that derive from pooled codes: only the onfly phase dcache (sources.c onfly_phase_of, keyed "<mesh codes key>-pool<n>b"; stored
+  codes are not cached). Mesh packs (UFSM_MESHCODES_CACHE) hold the unpooled rasters, and inksplat's cache is keyed on the ink inputs,
+  so neither is affected. Stored arrays written by codes-pool2 / phase-raster --gs 4 before this change are data, not caches: they keep
+  the atan2 rounding at ties.
 - Tests: test_lldec adds pools 1 / 2 / 3 over the 5 boxes (device == codes_pool2_box, 0 differing voxels in every box) and the atan2
   comparison. test_phase_onfly's pooled GPU run (== phase-raster --gs 4) now also requires every tile decoded on the GPU. test_phase_pool,
   test_mesh_phase, test_band_pair and test_unwrap2_sampler pass.
