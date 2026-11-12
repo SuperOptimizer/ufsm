@@ -87,6 +87,7 @@ test_vwt_sample                                |              |     1 | ./$B/tes
 test_spiralfit                                 |              |    32 | ./$B/test_spiralfit
 test_tta                                       | gpu          |     1 | ./$B/test_tta
 test_predict_unwrap2                           | gpu          |     5 | ./$B/test_predict_unwrap2 ./$B/ufsm
+test_predict_fitgrid                           | gpu          |     5 | ./$B/test_predict_fitgrid ./$B/ufsm
 test_unwrap2_ink                               | gpu          |    40 | ./$B/test_unwrap2_ink ./$B/ufsm ./$B/make_wind_fixture
 test_cuda_abort                                | gpu          |    25 | bash tests/test_cuda_abort.sh ./$B/ufsm ./$B/make_wind_fixture
 test_rv                                        | gpu          |    30 | ./$B/test_rv ./$B/ufsm ./$B/make_wind_fixture
