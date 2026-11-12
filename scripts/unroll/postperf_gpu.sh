@@ -3,7 +3,8 @@
 #   1. stripimg's stretch renders: the Paris 4 u1 run's 3 middle stripes (ws010..ws012) rendered one after another (the old schedule)
 #      and at once (unroll.sh SJOBS=3), wall times of both; every output file of the two must be identical, and each fill map equal to
 #      the run's strip/fillmap/<s>_fill.tif; strip-mosaic --stretch-only on them must print the run's stretch (strip/stretch.txt)
-#   2. test_fit_join (tests/suite.txt, tag gpu: fit-join's recycled field blocks / sampling run there too)
+#   2. wrap-snap's chunk decode on the GPU (unroll.sh SNAPGPU) against the CPU's: wall times, the .sfc identical to the run's
+#   3. test_fit_join (tests/suite.txt, tag gpu: fit-join's recycled field blocks / sampling run there too)
 # Reads the run read-only (P), writes only under OUT. Env: U (ufsm of the branch), P (the run), GPU (CUDA device, 0), RMEM (UFSM_RENDER_MEM
 # GB per render, 12: three at once stay inside the 64 GB dev slice; the run used 16, a cache size: the same images).
 set -u
@@ -27,7 +28,16 @@ mkdir -p $O/fillmap; for s in "${S[@]}"; do cmp -s $O/par/${s}_fill.tif $P/strip
 st=$($U strip-mosaic $P/strip/strip/flat $O/par $O/img --stretch-only 1 --threads 3 2> $O/logs/stretch.log | awk '/^stretch/ {print $2}')
 echo "stretch $st (the run: $(cat $P/strip/stretch.txt))"; [ "$st" = "$(cat $P/strip/stretch.txt)" ] || nd=$((nd + 1))
 echo "renders: $nd differences"
-# 2. the gpu-tagged suite test touched by the branch
+# 2. wrap-snap with the volcomp decode on the GPU (unroll.sh SNAPGPU): the run's wraps 300..320 (their neighbours bound them) on 8 threads,
+#    CPU decode vs GPU decode; every .sfc equal to the run's wraps_snap (CPU-only on the branch: 124 s, evidence 97.5 s of which decode 43 s)
+F=/vesuvius/ufsm/tmp-postperf/p4in/fields/lat; [ -e $F/pc/zarr.json ] || F=$P/fields/lat
+for mode in cpu gpu; do
+  ts=$(date +%s); env $([ $mode = gpu ] && echo "UFSM_GPU_DECODE=1 UFSM_GPU_DECODE_DEV=$GPU CUDA_VISIBLE_DEVICES=$GPU" || echo "CUDA_VISIBLE_DEVICES=") ~/bin/memcap -m 12G $U wrap-snap $P/wraps $O/snap_$mode \
+    --target mix --axis $P/axis.json --axis-um 2.400 --ct $CTR $CTK --ct-um $LUM --fields $F --threads 8 --first 300 --last 320 > $O/logs/snap_$mode.log 2>&1 || { echo "snap $mode FAILED"; nd=$((nd + 1)); continue; }
+  d=0; for f in $O/snap_$mode/*.sfc; do cmp -s $f $P/wraps_snap/$(basename $f) || d=$((d + 1)); done
+  echo "snap ($mode decode): $(( $(date +%s) - ts )) s, $(grep -o 'evidence [0-9.]* s (volume decode [0-9.]* s' $O/logs/snap_$mode.log)), $d of $(ls $O/snap_$mode | wc -l) .sfc differ from the run"; nd=$((nd + d))
+done
+# 3. the gpu-tagged suite test touched by the branch
 ( cd $(dirname $U)/.. && ~/bin/memcap -m 16G make -j8 VERIFY=1 build-verify/test_fit_join > $O/logs/make_test_fit_join.log 2>&1 && CUDA_VISIBLE_DEVICES=$GPU ./build-verify/test_fit_join > $O/logs/test_fit_join.log 2>&1 ) \
   && echo "test_fit_join: pass" || { echo "test_fit_join: FAIL ($O/logs/test_fit_join.log)"; nd=$((nd + 1)); }
 exit $((nd > 0))

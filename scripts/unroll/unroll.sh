@@ -412,7 +412,10 @@ snap() {
     # only the wraps the strip keeps (trim's --first / --last in state/strip.args; wrap-snap still reads the ids just outside as the
     # neighbours that bound them, so the kept wraps snap byte-identically): Paris 4 dropped 41 outer wraps, 19% of the vertices
     local sel=; [ -e $O/state/strip.args ] && sel=$(grep -oE -- '--(first|last) +-?[0-9]+' $O/state/strip.args | tr '\n' ' ')
-    X $O/logs/snap.log $U wrap-snap $O/wraps $O/wraps_snap --target $t --axis $O/axis.json --axis-um $UM --ct $R $K/$LV --ct-um $LUM \
+    # SNAPGPU (default: the first GPU of FITGPUS that is not INKGPU, free after the slabs; empty: none): the CT / fields chunks decoded
+    # there (UFSM_GPU_DECODE, byte-identical to the CPU's; ~45% of wrap-snap's CPU time was the volcomp decode)
+    local sg=${SNAPGPU-$(for g in $FITGPUS; do [ "$g" != "$INKGPU" ] && { echo $g; break; }; done)}
+    X $O/logs/snap.log env ${sg:+UFSM_GPU_DECODE=1 UFSM_GPU_DECODE_DEV=$sg} $U wrap-snap $O/wraps $O/wraps_snap --target $t --axis $O/axis.json --axis-um $UM --ct $R $K/$LV --ct-um $LUM \
       --fields $F --threads $TH $sel ${SNAPX:-} || return 1
     [ "$DRY" = 1 ] || log "snap: $(grep '^wrap-snap: solve' $O/logs/snap.log | tail -1)"
   else log "snap: off (SNAP=0)"; fi

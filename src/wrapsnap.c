@@ -30,6 +30,7 @@
 #include "sysinfo.h"
 #include "tiffw.h"
 #include "zarr3.h"
+#include "gpudec.h"
 #include <dirent.h>
 #include <math.h>
 #include <pthread.h>
@@ -154,7 +155,8 @@ static int wsn_vol_fill(wsn_vol *v, int nt) {
         if (!v->ch[k]) v->nres++;
         want[n] = w ? w : 0xffffffffu; todo[n++] = (int64_t)k;
     }
-    wsn_dec J = {v, todo, want, n, 0, 0, 0}; pthread_t th[64]; const int m = nt < 64 ? nt : 64;
+    const int ntd = gpudec_threads(nt);   /* (UFSM_GPU_DECODE=1: more decode threads keep the GPU decoder busy; the same bytes) */
+    wsn_dec J = {v, todo, want, n, 0, 0, 0}; pthread_t th[64]; const int m = ntd < 64 ? ntd : 64;
     for (int q = 0; q < m; q++) pthread_create(&th[q], nullptr, wsn_dec_run, &J);
     for (int q = 0; q < m; q++) pthread_join(th[q], nullptr);
     free(todo); free(want); g_wsn_sub += J.nsub; g_wsn_chunks += (long)n;
