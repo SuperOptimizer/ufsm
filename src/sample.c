@@ -329,6 +329,7 @@ static int training_hits_holdout_(const sampler *sp, const source *s, const int6
     }
     return 0;
 }
+#define SL_OTHER_RET() do { const int si_ = (int)(s - sp->S->src), l_ = l < 0 ? 0 : l; if (si_ >= 0 && si_ < 64 && l_ < MAXLEV) atomic_fetch_add(&sp->rej_sl[si_][l_][SL_OTHER], 1); return 1; } while (0)
 #define SL_ADD(k) do { const int si_ = (int)(s - sp->S->src); if (si_ >= 0 && si_ < 64 && l >= 0 && l < MAXLEV) atomic_fetch_add(&sp->rej_sl[si_][l][(k)], 1); } while (0)
 /* holdout mask mode: the held-out boxes (every same-CT source's) a training window of n level-l voxels at o overlaps, each grown by
    guard level-l voxels and clipped to the window, as window-local [lo, hi) per axis (z y x, then the ends). A level-l voxel is masked
@@ -2467,7 +2468,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
     if (cont && !chained) return 1;
     PROF_MARK(PS_SRC);
     int l = c->cover ? 0 : cont ? cs->l : pick_level(sp, s, r, region_ch);
-    if (l < 0) return 1;
+    if (l < 0) SL_OTHER_RET();
     /* zoom-out: the next coarser level, of which the warp below shows the central 1/2 zoom_out (an effective voxel size of this level's
        times zoom_out, from 2x coarser data); the dense-target tasks only (no band / phase / sheet / papyrus / condition / aux rasters) */
     double zoom_out = 0;
@@ -2485,13 +2486,13 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
     else if (region_ch >= 0) {
         regions *R = s->reg[region_ch];
         ri = (int)rint_below(r, R->n);
-        int64_t lo[3], hi[3]; if (!patch_bounds(s, m, n, l, R, ri, c->holdout, lo, hi)) return 1;
+        int64_t lo[3], hi[3]; if (!patch_bounds(s, m, n, l, R, ri, c->holdout, lo, hi)) SL_OTHER_RET();
         for (int d = 0; d < 3; d++) o[d] = lo[d] + rint_below(r, hi[d] - lo[d] + 1);
     } else if (c->holdout) {
-        int64_t lo[3], hi[3]; if (!patch_bounds(s, m, n, l, nullptr, 0, 1, lo, hi)) return 1;
+        int64_t lo[3], hi[3]; if (!patch_bounds(s, m, n, l, nullptr, 0, 1, lo, hi)) SL_OTHER_RET();
         for (int d = 0; d < 3; d++) o[d] = lo[d] + rint_below(r, hi[d] - lo[d] + 1);
     } else if (s->nbox) {   /* "boxes": training windows inside them (e.g. the emb-only distillation boxes) */
-        int64_t *lo = blo, *hi = bhi; if (box_bounds(s, m, n, l, r, lo, hi)) return 1; inbox = 1;
+        int64_t *lo = blo, *hi = bhi; if (box_bounds(s, m, n, l, r, lo, hi)) SL_OTHER_RET(); inbox = 1;
         for (int d = 0; d < 3; d++) o[d] = lo[d] + rint_below(r, hi[d] - lo[d] + 1);
     } else if (sp->occ[si].n) {   /* draw around a random coarse cell that contains papyrus */
         size_t k = (size_t)(runif(r) * (double)sp->occ[si].n); if (k >= sp->occ[si].n) k = sp->occ[si].n - 1;
@@ -2500,13 +2501,13 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
         int64_t cc[3] = {cz, cy, cx};
         int dl = sp->occ[si].lev - l;    /* coarse cell -> level-l voxels */
         for (int d = 0; d < 3; d++) {
-            if (m->shape[d] < n[d]) return 1;
+            if (m->shape[d] < n[d]) SL_OTHER_RET();
             int64_t f = dl >= 0 ? (int64_t)1 << dl : 1;
             int64_t v = dl >= 0 ? cc[d] * f + rint_below(r, f) : cc[d] >> (-dl);
             o[d] = v - n[d] / 2; if (o[d] < 0) o[d] = 0; if (o[d] > m->shape[d] - n[d]) o[d] = m->shape[d] - n[d];
         }
     } else {
-        for (int d = 0; d < 3; d++) { if (m->shape[d] < n[d]) return 1; o[d] = rint_below(r, m->shape[d] - n[d] + 1); }
+        for (int d = 0; d < 3; d++) { if (m->shape[d] < n[d]) SL_OTHER_RET(); o[d] = rint_below(r, m->shape[d] - n[d] + 1); }
     }
     if (!c->cover && c->snap && !c->holdout && region_ch < 0 && !chained) {   /* training only: snapping a validation origin can leave its holdout */
         for (int d = 0; d < 3; d++) {
@@ -3914,8 +3915,11 @@ sampler *sampler_start(sources *S, const sample_cfg *cfg) {
             }
         }
         sp->occ[i].idx = o.idx; sp->occ[i].n = o.n; sp->occ[i].lev = o.lev; for (int d = 0; d < 3; d++) sp->occ[i].shape[d] = o.shape[d];
-        if (!o.n && S->src[i].weight > 0 && sp->cum[i] > (i ? sp->cum[i - 1] : 0) && !cfg->holdout)
-            fprintf(stderr, "sampler: %s: no draw index (no coarse label level, mask, or level l0 + 3 .. 5 CT): windows drawn uniformly over the whole scan\n", S->src[i].name);
+        if (!o.n && S->src[i].weight > 0 && sp->cum[i] > (i ? sp->cum[i - 1] : 0) && !cfg->holdout) {
+            fprintf(stderr, "sampler: %s: no draw index (no coarse label level, mask, or level l0 + 3 .. 5 CT; an onfly ink target without supervised tiles): windows drawn uniformly over the whole scan%s\n",
+                    S->src[i].name, cfg->strict_sources ? ": fatal (--strict-sources 1; weight 0 drops the source)" : "");
+            if (cfg->strict_sources) return nullptr;   /* (no workers started yet; the partial sampler is left to the exiting process) */
+        }
     }
     sp->th = calloc((size_t)cfg->nworkers, sizeof(pthread_t));
     for (int i = 0; i < cfg->nworkers; i++) {

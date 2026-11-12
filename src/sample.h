@@ -266,7 +266,7 @@ void sampler_stop(sampler *sp);
 void sampler_stats(const sampler *sp, uint64_t *produced, uint64_t *rejected);
 /* per source and level (SL_*): draws dropped on a holdout overlap (reject mode), on empty targets, on the coarse CT probe, on the CT read's
    min_fg; windows kept with a holdout mask; windows produced */
-enum { SL_HOLD, SL_EMPTY, SL_PROBE, SL_FG, SL_MASKED, SL_PROD, SL_N };
+enum { SL_HOLD, SL_EMPTY, SL_PROBE, SL_FG, SL_MASKED, SL_PROD, SL_OTHER, SL_N };   /* SL_OTHER: no level / no window position (pick_level, patch / box bounds, a shape smaller than the window; level 0's slot when no level) */
 void sampler_level_stats(sampler *sp, int si, int l, uint32_t out[SL_N]);
 uint64_t sampler_crushed(const sampler *sp);   /* --aug-crush windows drawn so far */
 enum { AUGN_XSCAN, AUGN_TEAR, AUGN_DELAM, AUGN_DENSITY, AUGN_CURV, AUGN_INCL, AUGN_N };

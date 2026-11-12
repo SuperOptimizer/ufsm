@@ -56,5 +56,5 @@ grep -q "nocoarse: training level 0's coarse probe reads CT level 3, which does 
 grep -q '^draws steps' e.log || fail "no draws line ($D/e.log)"
 if "$U" train nocoarse.json --out f --levels 1 --strict-sources 1 "${C[@]}" > f.log 2>&1; then fail "--strict-sources 1 did not stop on the missing probe level ($D/f.log)"; fi
 grep -q "coarse probe reads CT level 3.*fatal" f.log || fail "no fatal probe line ($D/f.log)"
-if grep -q 'WARNING draws: nocoarse' e.log; then echo "reject flag: $(grep -m1 'WARNING draws' e.log | cut -c1-160)"; else grep -q 'nocoarse [0-9.]*/[0-9.]* (0/0/0/0)' e.log || fail "drops but no reject warning ($D/e.log)"; echo "reject flag: no drops in this draw"; fi
+if grep -q 'WARNING draws: nocoarse' e.log; then echo "reject flag: $(grep -m1 'WARNING draws' e.log | cut -c1-160)"; else grep -q 'nocoarse [0-9.]*/[0-9.]* (0/0/0/0/0)' e.log || fail "drops but no reject warning ($D/e.log)"; echo "reject flag: no drops in this draw"; fi
 echo "test_strict_sources: ok"

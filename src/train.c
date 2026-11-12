@@ -3916,18 +3916,18 @@ int cmd_train(int argc, char **argv) {
                     uint32_t (*cur)[SL_N] = calloc((size_t)S->n, sizeof *cur); double newt = 0, wt = 0;
                     for (int si = 0; si < S->n; si++) { for (int lv = 0; lv < MAXLEV; lv++) { uint32_t r[SL_N]; sampler_level_stats(sp, si, lv, r); for (int k = 0; k < SL_N; k++) cur[si][k] += r[k]; }
                         newt += cur[si][SL_PROD] - prev[si][SL_PROD]; wt += S->src[si].weight; }
-                    o = snprintf(ln, sizeof ln, "draws steps %d-%d (%.0f new windows): new %% / weight %% (dropped hold/empty/probe/fg):", step - mix_every + 1, step, newt);
+                    o = snprintf(ln, sizeof ln, "draws steps %d-%d (%.0f new windows): new %% / weight %% (dropped hold/empty/probe/fg/other):", step - mix_every + 1, step, newt);
                     for (int si = 0; si < S->n; si++) { uint32_t dd[SL_N]; for (int k = 0; k < SL_N; k++) dd[k] = cur[si][k] - prev[si][k];
-                        o += snprintf(ln + o, sizeof ln - o > 0 ? sizeof ln - o : 0, " %s %.1f/%.1f (%u/%u/%u/%u)", S->src[si].name, newt > 0 ? 100 * dd[SL_PROD] / newt : 0, wt > 0 ? 100 * S->src[si].weight / wt : 0,
-                                      dd[SL_HOLD], dd[SL_EMPTY], dd[SL_PROBE], dd[SL_FG]); }
+                        o += snprintf(ln + o, sizeof ln - o > 0 ? sizeof ln - o : 0, " %s %.1f/%.1f (%u/%u/%u/%u/%u)", S->src[si].name, newt > 0 ? 100 * dd[SL_PROD] / newt : 0, wt > 0 ? 100 * S->src[si].weight / wt : 0,
+                                      dd[SL_HOLD], dd[SL_EMPTY], dd[SL_PROBE], dd[SL_FG], dd[SL_OTHER]); }
                     fprintf(stderr, "%s\n", ln);
                     /* a source dropping far more draws than it delivers (a missing coarse CT level, a draw index that misses the labels):
                        its share can look normal while its workers spend 300x the reads (diskclean 2026-11-12); --reject-warn R (100; 0 off) */
                     for (int si = 0; si < S->n && g_reject_warn > 0; si++) { const uint32_t pr = cur[si][SL_PROD] - prev[si][SL_PROD];
-                        const uint32_t dr = cur[si][SL_HOLD] - prev[si][SL_HOLD] + cur[si][SL_EMPTY] - prev[si][SL_EMPTY] + cur[si][SL_PROBE] - prev[si][SL_PROBE] + cur[si][SL_FG] - prev[si][SL_FG];
-                        if (dr > g_reject_warn * (pr > 0 ? pr : 1)) fprintf(stderr, "WARNING draws: %s dropped %u draws for %u new windows (%.3g per window, > --reject-warn %g; hold/empty/probe/fg %u/%u/%u/%u)\n",
+                        const uint32_t dr = cur[si][SL_HOLD] - prev[si][SL_HOLD] + cur[si][SL_EMPTY] - prev[si][SL_EMPTY] + cur[si][SL_PROBE] - prev[si][SL_PROBE] + cur[si][SL_FG] - prev[si][SL_FG] + cur[si][SL_OTHER] - prev[si][SL_OTHER];
+                        if (dr > g_reject_warn * (pr > 0 ? pr : 1)) fprintf(stderr, "WARNING draws: %s dropped %u draws for %u new windows (%.3g per window, > --reject-warn %g; hold/empty/probe/fg/other %u/%u/%u/%u/%u)\n",
                             S->src[si].name, dr, pr, (double)dr / (pr > 0 ? pr : 1), g_reject_warn, cur[si][SL_HOLD] - prev[si][SL_HOLD], cur[si][SL_EMPTY] - prev[si][SL_EMPTY],
-                            cur[si][SL_PROBE] - prev[si][SL_PROBE], cur[si][SL_FG] - prev[si][SL_FG]); }
+                            cur[si][SL_PROBE] - prev[si][SL_PROBE], cur[si][SL_FG] - prev[si][SL_FG], cur[si][SL_OTHER] - prev[si][SL_OTHER]); }
                     memcpy(prev, cur, (size_t)S->n * sizeof *cur); free(cur);
                 }
                 if (g_rv == 2) { o = snprintf(ln, sizeof ln, "rv bce by source steps %d-%d:", step - mix_every + 1, step);
