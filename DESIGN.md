@@ -52,6 +52,26 @@ down, so the numbers below come from commit messages only:
 - The full-resolution head slabs and label streams are skipped on these windows, and the task heads get no gradient from them.
 - The fine stem does not reach level 1, so the voxel path cannot leak masked cells.
 
+**Implemented (8fd3e66, 34e31e5; GPU tests not yet run).** Differences from the plan above:
+- Unlabelled sources are the existing `"ct_only": 1` kind (the 10-25 distill plumbing), not a new "ssl" key. A GPU-free sampler-only
+  run (unwrap2 --lat, P 256, 80 batches) drew windows from every one of the 37 generated volumes that had a local zarr.json, with phase
+  known 0.000. The generator is `scripts/latdino/ssl-sources.sh` (PHerc0490B and PHercParis3 skipped: incomplete local copies). 0841
+  has no held-out ink boxes in holdouts-ink.json yet (asked inkB).
+- The mask zeroes the student's CT channel in 16^3-voxel blocks (`nn_ssl_mask`), before the latent cell transform, so the latc
+  cells and the fine stem are hidden together. Each block is one 2^3 group of level-1 cells.
+- The views differ by the mask and the latc quantiser step: the teacher uses the transform's own step, the student that step x
+  2^(u --ssl-jit), u uniform in [-1, 1]. A second appearance augmentation is not yet in.
+- Teacher targets are centred per window (the channel mean over the window's cells is subtracted) before the unit normalisation.
+- The variance hinge runs on the unit rows of 64k cells through `dn_gather` / `dn_varreg` / `dn_scatter_grad` (nn_dino.cu), with
+  gamma 1 / sqrt(D).
+- Not yet done: unlabelled windows still run the full-resolution head slabs (with zero loss masks), and the planner does not count
+  the side head and the ssl buffers (~0.3 GB at P 1024, D 16).
+- Tests:
+  - test_ssl: the mask in fp16 and fp32 against the host byte for byte; targets byte-identical; distinct sample indices; the
+    whole loss and its gradient against double central differences.
+  - test_heads (8): --ssl without a ct_only source logs exactly lat_plain's losses; with a ct_only copy at share 0.5, finite ssl
+    terms and targeted shares of 10-75%; the header and a resume.
+
 **Code.**
 - Sources take `"ssl": 1` (CT only, no targets; `holdout_reject` for the wbench boxes).
 - New train flags: `--ssl D --ssl-level 1 --ssl-share S --ssl-mask r --ssl-weight w --ssl-var g`.
