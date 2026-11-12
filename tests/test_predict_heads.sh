@@ -3,6 +3,7 @@
 #  (1) a sub-cell net with a fine stem, rv 2 and ink (--lat 4 --lat-guide 3 --fstem 16): --heads all writes <out>/rv and <out>/ink; rv equals
 #      the old slab path (UFSM_PRED_HEADS=0: upsampling + nn_fstem_fwd + nn_rv_fuse) within one code on 0.1 % of the bytes; each head of the
 #      multi-head run equals its single-head run byte for byte; --heads with --fit-zarr writes the same fields as --fit-zarr alone
+#  (1b) the GPU pyramid of the heads == the CPU pyramid at q 0 (shard 128 and 256)
 #  (2) a plain latent net with the fibre head (--lat 4 --rv 2 --fib-head 1): --heads all writes rv, fib/H, fib/V, fib/dyad/c2..c7, fib/fam;
 #      fib/H equals the old single-channel path (the pool4 chain in fp32) within one code on 1 % (the heads path rounds the upsampled logit
 #      to fp16 as the slab path does: 0.64 % of the fixture's bytes land across a code boundary)
@@ -40,6 +41,17 @@ cmpb onei h/ink 0 || fail "ink: single head against the multi-head run"
 for a in pc ps sp t0 t3 w dz dq; do "$U" read f0z/$a "" 0 0 0 32 32 32 fa.raw > /dev/null 2>&1 && "$U" read f1z/$a "" 0 0 0 32 32 32 fb.raw > /dev/null 2>&1 || fail "read fit field $a"
                                    cmp -s fa.raw fb.raw || fail "fit field $a differs with --heads"; done
 cmpb one f1/rv 0 || fail "rv beside --fit-zarr"
+# (1b) the GPU pyramid (each level-0 shard pooled on the device, levels >= 1 encoded from the pieces) against the CPU pyramid (each level
+#      decoded back and pooled): at q 0 the same bytes, shard 128 (pieces below a chunk, gathered raw) and 256 (level 1 encoded at once)
+for sh in 128 256; do
+  for g in 1 0; do UFSM_PRED_GPU_PYR=$g "$U" predict s/last.ckpt fx ct py$sh$g --um 9.6 --level 0 --window 160 --halo 16 --threads 2 --q 0 --shard $sh --levels 3 --heads rv,ink > py$sh$g.log 2>&1 || fail "predict --levels 3 --shard $sh, GPU pyramid $g ($D/py$sh$g.log)"; done
+  for n in rv ink; do for lv in "19.2 128" "38.4 64"; do set -- $lv
+    "$U" read py${sh}1/$n $1 0 0 0 $2 $2 $2 a.raw > /dev/null 2>&1 && "$U" read py${sh}0/$n $1 0 0 0 $2 $2 $2 b.raw > /dev/null 2>&1 || fail "read the $n pyramid level $1 (shard $sh)"
+    cmp -s a.raw b.raw || fail "$n level $1, shard $sh: the GPU pyramid differs from the CPU pyramid"
+    [ "$(tr -d '\000' < a.raw | wc -c)" -gt $(($2 * $2 * $2 / 8)) ] || fail "$n level $1, shard $sh: (nearly) empty"; done; done
+  grep -q 'pyramids pooled on the GPU' py${sh}1.log && ! grep -q 'pyramids pooled on the GPU' py${sh}0.log || fail "GPU pyramid switch (shard $sh)"
+  grep -q '"path":"38.4"' py${sh}1/rv/zarr.json || fail "the GPU pyramid's group (shard $sh)"
+done
 # (2) plain latent net with the fibre head
 "$U" train fx/sources-fibhv.json --out fb "${C[@]}" --lat 4 --rv 2 --rv-iso 100 --fib-head 1 > fb.log 2>&1 || fail "train (2) ($D/fb.log)"
 "$U" predict fb/last.ckpt fx ct g "${P[@]}" --heads all > g.log 2>&1 || fail "predict --heads all, fibre ($D/g.log)"

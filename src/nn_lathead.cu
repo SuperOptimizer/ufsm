@@ -290,3 +290,19 @@ extern "C" void nn_lat_heads_place(const void *lg, int lh16, int d, int h, int w
     else lat_heads_k<float><<<nblk(n, LHS_BT), LHS_BT>>>((const float *)lg, ct, stem, A, HS);
     KCHECK();
 }
+
+/* predict's GPU pyramid: one 2x mean pooling step of an n^3 uint8 shard into (n / 2)^3, (sum of the 8 + 4) >> 3 as ingest.c's pool2_mean */
+__global__ static void pool2_u8_k(const uint8_t *__restrict__ in, int n, uint8_t *__restrict__ out) {
+    const int h = n / 2; const size_t N = (size_t)h * h * h, pl = (size_t)n * n;
+    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < N; i += (size_t)gridDim.x * blockDim.x) {
+        const int x = (int)(i % h), y = (int)(i / h % h), z = (int)(i / ((size_t)h * h));
+        const uint8_t *p = in + ((size_t)(2 * z) * n + 2 * y) * n + 2 * x;
+        const unsigned s = p[0] + p[1] + p[n] + p[n + 1] + p[pl] + p[pl + 1] + p[pl + n] + p[pl + n + 1];
+        out[i] = (uint8_t)((s + 4) >> 3);
+    }
+}
+extern "C" void nn_pool2_u8(const uint8_t *in, int n, uint8_t *out) {
+    const size_t N = (size_t)(n / 2) * (n / 2) * (n / 2); if (!N) return;
+    const int nb = (int)((N + 255) / 256 < 65536 ? (N + 255) / 256 : 65536);
+    pool2_u8_k<<<nb, 256>>>(in, n, out);
+}

@@ -408,6 +408,8 @@ void nn_lat_head_place(const void *lg, int lh16, int d, int h, int w, int c0, in
 void nn_lat_heads_place(const void *lg, int lh16, int d, int h, int w, int nh, const int *c0, const int *c1, const int *sb0, const int *sb1, const int *s0, const int *s1,
                         uint8_t *const *dsh, const float *stem, int C, int nout, const uint8_t *ct, float mean, float isd, int iso,
                         int hz, int halo, int oz, int oy, int ox, int ez, int ey, int ex, int shard);
+/* one 2x mean pooling step of an n^3 uint8 volume into (n / 2)^3: (sum + 4) >> 3, as the CPU pyramid (ingest.c pool2_mean) */
+void nn_pool2_u8(const uint8_t *in, int n, uint8_t *out);
 void nn_scale(float *y, float a, size_t n);
 void nn_u8_to_f32(const uint8_t *x, size_t n, float scale, float *y);
 
