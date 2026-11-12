@@ -50,6 +50,11 @@ sys.exit(1 if bad else 0)
 EOF
 "$U" read "$D/lv" ct/9.6 0 0 0 256 256 256 "$D/lv.raw" > /dev/null 2>&1 || fail "read of the latvol level"
 "$U" read "$D/fx" ct/9.6 0 0 0 256 256 256 "$D/ct.raw" > /dev/null 2>&1 || fail "read of the CT"
+# the host decoder over several threads (z3_read's chunk workers, each with its own kept scratch) = one thread, off the chunk grid too
+for b in "0 0 0 256 256 256" "37 5 91 200 170 150"; do
+  "$U" read "$D/lv" ct/9.6 $b "$D/t1.raw" --threads 1 > /dev/null 2>&1 && "$U" read "$D/lv" ct/9.6 $b "$D/t8.raw" --threads 8 > /dev/null 2>&1 || fail "threaded read $b"
+  cmp -s "$D/t1.raw" "$D/t8.raw" || fail "the latvol read with 8 threads differs from 1 thread ($b)"
+done
 # (the two reads above are also the proof that the ufsm binary itself carries the codec: zarr3.o reaches src/latvol.c through weak
 # references, and a ufsm linked without it would fail them.) A binary without the codec refuses the array with a clear error:
 if [ -n "${3:-}" ]; then "$3" "$D/lv" ct/9.6 > "$D/nolink.log" 2>&1 || fail "a binary without latvol.o: $(tail -1 "$D/nolink.log")"; fi
