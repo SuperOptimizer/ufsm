@@ -6,6 +6,30 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## --init-from by head, the "other" drop count, U2's start (2026-11-12, branch initmap-20261112)
+
+- **--init-from by head.** u1-10000 -> U2: both nets have 144 outputs (the latent head: 16 base + 128 sub-cell), so no mapping branch
+  applied and unet_init_from copied the head by position. U2's ink row 11 got u1's recto row, then the ink reset (fresh, prior bias). U2's
+  rv rows 12-13 got u1's verso row and an untrained pad row; the rv reset did not fire, because the donor declares rv v2. U2's step-50 rv
+  bce was 0.569, against u1's 0.36 at step 10450; phase / normal / wind4 were at u1's level. Now an unwrap2 donor with more than 11
+  outputs and --rv 2 / --ink-head maps by head:
+  - the rv pair from the donor header ("rv":{"version":2,"recto":R});
+  - ink from "unwrap":{.."ink":C}, else fresh;
+  - rows 0-10 and the sub-cell rows by position.
+  rows[] was 64 entries, now 512. test_init_heads (fixture, lr 0, step 1): rv bce 0.2225 for the donor layout and 0.2225 mapped by head;
+  the old loader gives 0.369 (untrained). u1's own init from wz896 was right: rv rows 11-12 fresh, since the donor had no rv.
+- **SL_OTHER.** The draws line's fifth drop count (hold/empty/probe/fg/other) covers draw_'s returns before a window position: no level,
+  patch / box bounds, a shape smaller than the window. Before this they were uncounted, so a source losing its share there looked
+  clean. --reject-warn counts them.
+- **No draw index is fatal under --strict-sources.** U2's ink-PHerc0500P2 / ink-PHerc0841 (0841: 0 supervised tiles) are at weight 0
+  until their index is fixed.
+- **U2's start on the pod:**
+  - GPU OOM at start three times (10:00, 10:05, 10:10 UTC): the planner sized itself to the card's free memory and other jobs then took
+    that space. The planner is now pinned (UFSM_MEM_FREE_GB 48, --onfly-mb 4096 x 4 slots: ~64 GB of the 96).
+  - Host OOM kill at 09:58: U2, frozen for an exclusive slot, kept its 106 GB, and the slot's job went over the 175 GB cgroup.
+  - Per-agent budgets and the two-phase claim (gpu.pause drains the shared jobs while U2 trains, gpu.go freezes U2) are in
+    /workspace/ue/GPU.md.
+
 ## The pooled codes views on the device: k_codes_pool2 (2026-11-12, branch gpupool-20261112)
 
 The coarser rungs read their codes through codes_pool2_open views (sources.c onfly_codes_open: the source's codes pooled 1-3 times for
