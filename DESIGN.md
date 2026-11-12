@@ -79,6 +79,13 @@ down, so the numbers below come from commit messages only:
     channel on every check (34-47 % at mask 0.4). The ssl cosine falls 0.330 -> 0.130, the hinge 0.048 -> 0.027, and the
     per-dimension std of the unit rows stays 0.31-0.34 (gamma 0.354): no collapse at fixture scale. Labelled steps log their usual
     terms.
+- Head-slab skip and planner (6a05337), checked on desk GPU 0 on 11-12:
+  - test_heads ok, including (8c): with the skip the --det fixture run logs exactly the losses of the run with the slabs
+    (UFSM_SSL_SLABS=1).
+  - Planner, UFSM_MEM_DRY at P 1024 with the unified run's flags (--ink-dice dropped: not on this branch's base), UFSM_MEM_FREE_GB 14:
+    without --ssl, mode 4 (lean 2) 11.43 GB; with --ssl 16 --ssl-share 0.25 (35 unlabelled sources = 25.0 % of the weight), the same
+    mode, 11.78 GB. The +0.35 GB is network +0.13 (the side head's outputs and parameters in the dry build) + task +0.20 (targets,
+    gradient, hinge points, margin) + workspace +0.01. 2.2 GB stay free on a 14 GB budget.
 - Holdouts: inkB added the 10 extra crops to holdouts-ink.json ("inkeval-ho", 98 boxes), on the 0500P2 2.215 um and 0841 2.403 um
   scans. Those two volumes reject 5 / 6 boxes. `EXCLVOL` leaves out 0841's 9.366 um scan (the boxes are not mapped into it) and
   0500P2's 9.362 um scan (a labelled source already), so 35 unlabelled volumes remain.
