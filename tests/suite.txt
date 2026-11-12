@@ -31,6 +31,7 @@ test_rungs                                     | gpu          |     3 | ./$B/tes
 test_gram                                      | gpu          |     2 | ./$B/test_gram
 test_fibhead                                   | gpu          |     2 | ./$B/test_fibhead
 test_fibhead_train                             | gpu          |    25 | tests/test_fibhead_train.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/fibhead
+test_predict_heads                             | gpu          |    40 | tests/test_predict_heads.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/predheads
 test_fstem                                     | gpu          |     3 | ./$B/test_fstem
 test_lathead                                     | gpu          |     3 | ./$B/test_lathead
 test_restore_task                              | gpu          |     7 | ./$B/test_restore_task
