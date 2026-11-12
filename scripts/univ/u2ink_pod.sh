@@ -11,7 +11,8 @@ export K=${K:-/workspace/univ}; IB=${IB:-/workspace/inkB}; export IK=$IB/inkgt R
 export STEPS=${STEPS:-400} EVERY=${EVERY:-200} GPU=${GPU:-0} P=${P:-1024} WORKERS=${WORKERS:-3} SLOTS=${SLOTS:-3}; UNIT=${UNIT:-100}; G=/workspace/ue; mkdir -p $R
 say() { echo "== $(date '+%F %T') u2ink_pod: $*"; }
 MEMMAX=${MEMMAX:-160}; MEMNEED=${MEMNEED:-25}   # (GB: the pod's cgroup is shared with the resident U2, up to ~120 GB: start no unit that could pass MEMMAX)
-cgmem() { echo $(( $(cat /sys/fs/cgroup/memory.current) / 1073741824 )); }
+cgmem() {   # (GB the cgroup cannot reclaim: anon + shmem + kernel; memory.current also counts the page cache, 56 of its 175 GB on 11-12)
+  awk '$1 == "anon" || $1 == "shmem" || $1 == "kernel" {s += $2} END {print int(s / 1073741824)}' /sys/fs/cgroup/memory.stat; }
 unit() {   # one GPU unit under the sharing protocol, with the host-memory guard; its peak RSS (the unit's ufsm processes) to R/units.tsv
   while [ -e $G/gpu.pause ] || [ $(( $(cgmem) + MEMNEED )) -gt $MEMMAX ]; do sleep 30; done
   touch $G/gpu.shared/inkB; local t0=$(date +%s) pk=$R/.peak.$$; echo 0 > $pk
