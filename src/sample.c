@@ -3191,17 +3191,24 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
         b->ink_nrays[i] = 0;
         if (!(crushed || torn || delam || curved) && mil_rays(c, s, l, o, Pz, P, y, &spatial, b->ink_rays + (size_t)i * c->ink_mil_cap, &b->ink_nrays[i])) return -1;
         static int rchk = -1; if (rchk < 0) rchk = getenv("UFSM_MIL_CHECK") && atoi(getenv("UFSM_MIL_CHECK")) > 0;
-        if (rchk && inkw && !lw && b->ink_nrays[i]) {   /* UFSM_MIL_CHECK: the rays against the window's own (warped) ink plane: a known voxel along the ray, and its label */
-            const inkray *R = b->ink_rays + (size_t)i * c->ink_mil_cap; int hit = 0, agree = 0; const int nr = b->ink_nrays[i];
+        /* (the plane holding the ink target: batch.ink, or under --rv (ink plane = papyrus) the aux plane of the "ink" slot) */
+        const uint8_t *ipl = c->rv_iso > 0 || c->ink_ch > 0 ? nullptr : inkw;
+        if (!ipl) for (int j = 0; j < c->aux_n; j++) if (c->aux_ch[j] == CH_SHEET) ipl = b->aux[j] + (size_t)i * p3;
+        if (rchk && ipl && !lw && b->ink_nrays[i]) {   /* UFSM_MIL_CHECK: the rays against the window's own (warped) ink plane: a known voxel along the ray, and its label */
+            const inkray *R = b->ink_rays + (size_t)i * c->ink_mil_cap; int hit = 0, agree = 0, ny = 0, nmx = 0, c0k = 0, c0a = 0; const int nr = b->ink_nrays[i];
             for (int k = 0; k < nr; k++) {
                 int mx = -1;
                 for (float t = -c->ink_mil_R; t <= c->ink_mil_R + 1e-4f; t += 0.5f) {
                     int v[3]; for (int d = 0; d < 3; d++) v[d] = (int)lrintf(R[k].p[d] + t * R[k].n[d]);
                     if (v[0] < 0 || v[1] < 0 || v[2] < 0 || v[0] >= Pz || v[1] >= P || v[2] >= P) continue;
-                    const int q = b->ink[(size_t)i * p3 + ((size_t)v[0] * P + v[1]) * P + v[2]]; if (q != 255 && q > mx) mx = q;
+                    const int q = ipl[((size_t)v[0] * P + v[1]) * P + v[2]]; if (q != 255 && q > mx) mx = q;
                 }
-                if (mx >= 0) { hit++; agree += (mx > 127) == (R[k].y != 0); }
+                if (mx >= 0) { hit++; agree += (mx > 127) == (R[k].y != 0); ny += R[k].y != 0; nmx += mx > 127; }
+                int v0[3]; for (int d = 0; d < 3; d++) v0[d] = (int)lrintf(R[k].p[d]);   /* (the voxel at the ray's point) */
+                if (v0[0] >= 0 && v0[1] >= 0 && v0[2] >= 0 && v0[0] < Pz && v0[1] < P && v0[2] < P) { const int q = ipl[((size_t)v0[0] * P + v0[1]) * P + v0[2]];
+                    if (q != 255) { c0k++; c0a += (q > 127) == (R[k].y != 0); } }
             }
+            if (getenv("UFSM_MIL_CHECK") && atoi(getenv("UFSM_MIL_CHECK")) > 1) fprintf(stderr, "mil rays detail: label ink %d, max along the ray ink %d (of %d met); at the point: %d known, %d agree\n", ny, nmx, hit, c0k, c0a);
             fprintf(stderr, "mil rays: %d of %d meet known ink along the ray, %d of those agree with its label (warped %d)\n", hit, nr, agree, spatial.active);
         }
     }
