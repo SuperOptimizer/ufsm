@@ -11,7 +11,8 @@
 #           checkpoint header has "lat_c"; FKIND=lat / vox forces it): fields/lat from cube windows LWIN / LHALO (640 / 64, the gate's U1
 #           settings: stride 512, so the 1024-voxel z parts keep one tile grid), the latent heads' fit planes (winding mod 4 too); --fit-h 2 runs
 #           the slab plane path (the fused nn_fit_accum_lat kernel takes --fit-h 8 only)
-#   ink     -> prep only; GPU INKGPU (1) from when the fields are done: INKCMD (the ink agent's recipe; default: the feathered
+#   ink     -> prep only; GPU INKGPU (1): INKAT=slabs (default) its GroupNorm calibration (inkcal) beside the ref, the main pass from
+#           the end of the slabs (beside join .. stripflat, all CPU); INKAT=fields: all of it from when the fields are done: INKCMD (the ink agent's recipe; default: the feathered
 #           single pass of inklib.sh: ift3, frozen GN, --window auto --halo 32 --feather 32, resumable) -> ink/$INKNAME.zarr
 #   ctcal   -> fields (CTCAL=1 only, OFF by default): ufsm ct-cal --ct-um $LUM (the CT LEVEL's um) -> ct.cal; ref adds --ct-cal
 #   rectosp -> fields (default ON when the scroll has m7 surface predictions on the mirror; RECTOSP=0 off): ufsm recto-sp $F
@@ -225,6 +226,17 @@ rectosp() {
 }
 
 # --- ink (another agent's recipe via INKCMD SCROLLDIR GPU OUT; default the feathered single pass of scripts/corpus/inklib.sh) ---
+# inkcal: the frozen GroupNorm statistics (gn.bin) from 640^3 windows of a 2048-row band at the box's middle; its own stage so it can
+# run on GPU INKGPU beside the ref (INKAT=slabs) while the main pass waits for the slabs. INKCMD: nothing (the recipe does its own)
+inkcal() {
+  [ -n "${INKCMD:-}" ] && return 0
+  [ "$DRY" = 1 ] || mkdir -p $O/ink
+  local box cal; box=$([ "$DRY" = 1 ] && echo ${BOX:-BOX} || cat $O/box.txt)
+  cal=$(echo $box | awk -F, '{ zc = $1 + int($4 / 2); z0 = zc - 1024; if (z0 < $1) z0 = $1; nz = 2048; if (nz > $4) nz = $4; printf "%d,%d,%d,%d,%d,%d", z0, $2, $3, nz, $5, $6 }')
+  local P="--um $UM --level $LV --shard 512 --ema 1 --q 32 --threads ${ITH:-12} --gpu $INKGPU $(occlv)"
+  [ -s $O/ink/gn.bin ] || { X $O/logs/inkcal.log $U predict $INKCK $R $K $O/ink/gncal.zarr $P ${INKPX:-} --window 640 --halo 64 --box $cal --full-grid 1 --levels 1 --no-out 1 --gn-save $O/ink/gn.tmp &&
+                             { [ "$DRY" = 1 ] || { mv $O/ink/gn.tmp $O/ink/gn.bin; rm -rf $O/ink/gncal.zarr; }; } || return 1; }
+}
 ink() {
   [ "$DRY" = 1 ] || mkdir -p $O/ink
   # INKCMD set but empty (a pod env with an unset path, "INKCMD=$X"): fail loudly instead of falling back to the default prediction;
@@ -236,8 +248,7 @@ ink() {
   local box cal; box=$([ "$DRY" = 1 ] && echo ${BOX:-BOX} || cat $O/box.txt)
   cal=$(echo $box | awk -F, '{ zc = $1 + int($4 / 2); z0 = zc - 1024; if (z0 < $1) z0 = $1; nz = 2048; if (nz > $4) nz = $4; printf "%d,%d,%d,%d,%d,%d", z0, $2, $3, nz, $5, $6 }')
   local P="--um $UM --level $LV --shard 512 --ema 1 --q 32 --threads ${ITH:-12} --gpu $INKGPU $(occlv)"
-  [ -s $O/ink/gn.bin ] || { X $O/logs/ink.log $U predict $INKCK $R $K $O/ink/gncal.zarr $P ${INKPX:-} --window 640 --halo 64 --box $cal --full-grid 1 --levels 1 --no-out 1 --gn-save $O/ink/gn.tmp &&
-                             { [ "$DRY" = 1 ] || { mv $O/ink/gn.tmp $O/ink/gn.bin; rm -rf $O/ink/gncal.zarr; }; } || return 1; }
+  inkcal || return 1
   # one feathered pass (inklib.sh): window auto (576/32 on 16 GB, 1088/32 from ~46 GB free), each border blended over 32 voxels; resumable
   X $O/logs/ink.log $U predict $INKCK $R $K $INK $P ${INKPX:-} --box $box --window ${INKW:-auto} --halo ${INKH:-32} --feather ${INKF:-32} --full-grid 1 --resume 1 --levels 4 \
     --gn-frozen $O/ink/gn.bin || return 1
@@ -289,7 +300,8 @@ slabs() {
   lanes=$(fitlanes); [ "$DRY" = 1 ] && echo "    slab lanes (GPU per lane): $lanes"
   ng=$(echo $lanes | wc -w); FTH_LANE=${FTHREADS:-$(( $(ncpu) / (ng > 0 ? ng : 1) ))}; [ $FTH_LANE -lt 2 ] && FTH_LANE=2
   for g in $lanes; do
-    if [ "$g" = "$INKGPU" ] && [ "${NOINK:-0}" != 1 ] && ! done_ ink; then { [ "$DRY" = 1 ] && echo "    (GPU $g lane starts once the ink is done or failed)" || while ! done_ ink && ! stopped && [ ! -e $O/state/ink.failed ]; do sleep 30; done; lane $g; } &
+    if [ "$g" = "$INKGPU" ] && [ "${NOINK:-0}" != 1 ] && [ "$INKAT" = fields ] && ! done_ ink; then { [ "$DRY" = 1 ] && echo "    (GPU $g lane starts once the ink is done or failed)" || while ! done_ ink && ! stopped && [ ! -e $O/state/ink.failed ]; do sleep 30; done; lane $g; } &
+    elif [ "$g" = "$INKGPU" ] && [ "${NOINK:-0}" != 1 ] && [ "$INKAT" != fields ] && ! done_ inkcal; then { [ "$DRY" = 1 ] && echo "    (GPU $g lane starts once the ink calibration is done or failed)" || while ! done_ inkcal && ! stopped && [ ! -e $O/state/inkcal.failed ]; do sleep 10; done; lane $g; } &
     else lane $g & fi; pids+=($!)
   done
   for p in "${pids[@]}"; do wait $p; done
@@ -478,11 +490,17 @@ upload() {
 [ "$DRY" = 1 ] && echo "unroll $S: O=$O U=$U ($R $K level $LV, $LUM um; box ${BOX:--}, zr ${ZR:--}, strip args '${STRIPARGS}'; CK $CK: $FKIND fields $F)"
 stage prep prep || exit 1; upto prep
 stage fields fields || exit 1; upto fields
-# the ink (GPU $INKGPU) beside the CPU ref and the GPU-0 slab lane; the per-wrap renders beside the strip
-if [ "${NOINK:-0}" != 1 ]; then ( stage ink ink || touch $O/state/ink.failed ) & INKP=$!; [ "$DRY" = 1 ] && wait $INKP; fi
+# the ink on GPU $INKGPU. INKAT=slabs (default): its GroupNorm calibration beside the ref, the main pass from the end of the slabs, beside
+# the CPU stages join .. stripflat (P4 11-12: ink 892 s; with the fast ref its GPU-1 slab lane would wait for it); INKAT=fields: the
+# whole ink from the end of the fields, the GPU-1 slab lane waiting for it (before 11-12). The per-wrap renders beside the strip
+INKAT=${INKAT:-slabs}; inkbg() { ( stage ink ink || touch $O/state/ink.failed ) & INKP=$!; [ "$DRY" = 1 ] && wait $INKP; return 0; }
+if [ "${NOINK:-0}" != 1 ]; then
+  if [ "$INKAT" = fields ]; then inkbg; else ( stage inkcal inkcal || touch $O/state/inkcal.failed ) & [ "$DRY" = 1 ] && wait; fi
+fi
+inkmain() { [ "${NOINK:-0}" != 1 ] && [ "$INKAT" != fields ] && ! done_ ink && inkbg; return 0; }
 { [ "${RECTOSP:-1}" = 0 ] || stage rectosp rectosp; } || { log "unroll: rectosp failed"; wait; exit 1; }
 [ "${RECTOSP:-1}" != 0 ] && { [ -e $O/fields/rsp/fields.json ] || { [ "$DRY" = 1 ] && [ -n "$(m7src)" ]; }; } && F=$O/fields/rsp   # (the ref and every later stage read the blended fields)
-{ [ "${CTCAL:-0}" != 1 ] || stage ctcal ctcal; } && stage ref ref && upto ref && stage slabs slabs && upto slabs && stage join join && upto join && stage check check && upto check &&
+{ [ "${CTCAL:-0}" != 1 ] || stage ctcal ctcal; } && stage ref ref && upto ref && stage slabs slabs && inkmain && upto slabs && stage join join && upto join && stage check check && upto check &&
   stage wraps wraps && upto wraps && stage trim trim && stage snap snap && upto snap ||
   { log "unroll: stopped before the strip"; wait; exit 1; }
 if [ "${PERWRAP:-0}" = 1 ]; then ( waitfor ink && stage perwrap perwrap && { [ "${FACES:-0}" = 1 ] && stage faces faces; true; } ) & PWP=$!; [ "$DRY" = 1 ] && wait $PWP; fi
