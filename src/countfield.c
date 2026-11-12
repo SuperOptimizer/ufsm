@@ -603,7 +603,9 @@ int cmd_count_field(int argc, char **argv) {
     for (int ci = 0; ci < nch && !cached; ci++) {
         const int z0 = ord[ci] * CZ, z1 = z0 + CZ < D ? z0 + CZ : D; fit_fields_buf b;
         if (cf_pre_take(&pre, &b)) return 1;
-        if (ci + 1 < nch) { const int n0 = ord[ci + 1] * CZ; cf_pre_start(&pre, in, n0, n0 + CZ < D ? n0 + CZ : D, pref); }
+        /* (without --prefetch the next chunk loads after this one is pooled and handed back: one chunk in RAM, not two; before, the
+           synchronous load of the next chunk ran here, next to this one: two chunks either way, 39 GB for a 1667 ref at 768 rows) */
+        if (pref && ci + 1 < nch) { const int n0 = ord[ci + 1] * CZ; cf_pre_start(&pre, in, n0, n0 + CZ < D ? n0 + CZ : D, pref); }
         if (!z0) { recto = b.f.recto != nullptr; w4d = b.f.wd[0] ? b.f.w4_d : 0; }
         cf_pool pp = {&b.f, z0, z1 - z0, H, W, P, lv[0].hh, lv[0].w, h, g.cy, g.cx, na, Sl[0], {Gl[0][0], Gl[0][1], Gl[0][2]}, atof(cf_opt(argc, argv, "--emin", "0.1")), atof(cf_opt(argc, argv, "--sheet0", "0.4")), atof(cf_opt(argc, argv, "--phase-w", "0")), atof(cf_opt(argc, argv, "--phase-c0", "0.4"))};
         pp.rs = atof(cf_opt(argc, argv, "--rho-scale", "1")); if (!(pp.rs > 0)) pp.rs = 1;
@@ -616,7 +618,9 @@ int cmd_count_field(int argc, char **argv) {
         if (getenv("UFSM_CF_READ_ONLY")) {   /* (bench: the field reads only; FNV-1a of the chunk's planes for byte-identity checks) */
             const uint8_t *pl[10] = {b.f.pc, b.f.ps, b.f.t[0], b.f.t[1], b.f.t[2], b.f.t[3], b.f.t[4], b.f.t[5], b.f.sp, b.f.w}; uint64_t hs = 1469598103934665603ull;
             if (!strcmp(getenv("UFSM_CF_READ_ONLY"), "h")) for (int k = 0; k < 10; k++) if (pl[k]) for (size_t i = 0; i < (size_t)(z1 - z0) * HW; i += 7) hs = (hs ^ pl[k][i]) * 1099511628211ull;
-            fprintf(stderr, "count-field: read only: rows %d..%d hash %016llx\n", z0, z1, (unsigned long long)hs); cf_pre_give(&pre, &b); continue; }
+            fprintf(stderr, "count-field: read only: rows %d..%d hash %016llx\n", z0, z1, (unsigned long long)hs); cf_pre_give(&pre, &b);
+            if (!pref && ci + 1 < nch) { const int n0 = ord[ci + 1] * CZ; cf_pre_start(&pre, in, n0, n0 + CZ < D ? n0 + CZ : D, 0); }
+            continue; }
         if (gpu) {   /* the chunk's solve rows on the GPU (the same sums in the same order) */
             const cf_gpu_poolcfg gc = {H, W, P, lv[0].hh, lv[0].w, na, h, g.cy, g.cx, pp.emin, pp.sheet0, pp.kph, pp.c0, pp.rs, pp.ra, pp.rb, pp.wa, pp.wb, pp.wd, pp.wp};
             const uint8_t *pl[10] = {b.f.pc, b.f.ps, b.f.t[0], b.f.t[1], b.f.t[2], b.f.t[3], b.f.t[4], b.f.t[5], b.f.sp, b.f.w};
@@ -639,6 +643,7 @@ int cmd_count_field(int argc, char **argv) {
             }
         }
         cf_pre_give(&pre, &b);
+        if (!pref && ci + 1 < nch) { const int n0 = ord[ci + 1] * CZ; cf_pre_start(&pre, in, n0, n0 + CZ < D ? n0 + CZ : D, 0); }
     }
     if (pre.has_nxt) { fit_fields_free(&pre.nxt); pre.has_nxt = 0; }
     if (!dir) dir = 1;
