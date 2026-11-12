@@ -87,6 +87,7 @@ SRC += src/flatten.c src/faces.c src/faces_cli.c
 SRC += src/sheetcut.c
 SRC += src/strip.c
 SRC += src/latfit.c src/lc_cli.c
+SRC += src/latvol.c
 OBJ  = $(patsubst src/%.c,$(B)/%.o,$(SRC)) $(B)/surfcomp.o
 
 all: $(B)/ufsm
@@ -148,6 +149,11 @@ $(B)/nn_gpudec.o: NVFLAGS = -O3 $(NVARCH) -DUFSM_ARCH=$(ARCH) -fmad=false -Xcomp
 $(B)/nn_cf.o: NVFLAGS = -O3 $(NVARCH) -DUFSM_ARCH=$(ARCH) -fmad=false -Xcompiler -fno-threadsafe-statics -Isrc
 # fiber-trace's axis on the GPU (src/nn_ftrace.cu) is byte-identical to src/ftaxis.c: IEEE division / sqrt, no FMA contraction, no fast math
 $(B)/nn_ftrace.o: NVFLAGS = -O3 $(NVARCH) -DUFSM_ARCH=$(ARCH) -fmad=false -Xcompiler -fno-threadsafe-statics -Isrc
+# latvol on the GPU (src/nn_latvol.cu) is byte-identical to src/latvol.c: integer sums, one float multiply and a rint; no FMA contraction, no fast math
+$(B)/nn_latvol.o: NVFLAGS = -O3 $(NVARCH) -DUFSM_ARCH=$(ARCH) -fmad=false -Xcompiler -fno-threadsafe-statics -Isrc
+$(B)/nn_latvol.o: src/latvol.h src/nn_latvol.h
+$(B)/test_latvol: tests/test_latvol.c src/latvol.h $(B)/latvol.o $(B)/nn_latvol.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(CUDA)/include $< $(B)/latvol.o $(B)/nn_latvol.o -o $@ $(LDLIBS) $(CUDALIBS)
 # the phase-raster pair rule on the GPU (src/nn_band.cu) is byte-identical to band.c: IEEE division / sqrt, no FMA contraction, no fast math
 $(B)/nn_band.o: NVFLAGS = -O3 $(NVARCH) -DUFSM_ARCH=$(ARCH) -fmad=false -Xcompiler -fno-threadsafe-statics -Isrc
 $(B)/nn_fibre.o: NVFLAGS = -O3 $(NVARCH) -DUFSM_ARCH=$(ARCH) -fmad=false -Xcompiler -fno-threadsafe-statics -Isrc
@@ -749,7 +755,7 @@ suite-bins: $(B)/test_sweep
 $(B)/test_restore_task: tests/test_restore_task.c $(OBJ) $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 suite-bins: $(B)/test_restore_task
-suite-bins: $(B)/test_gpu_input $(B)/test_lat $(B)/test_lat_fuse
+suite-bins: $(B)/test_gpu_input $(B)/test_lat $(B)/test_lat_fuse $(B)/test_latvol
 suite-bins: $(B)/test_pack_tm
 suite-bins: $(B)/test_wind4
 suite-bins: $(B)/test_fibn
