@@ -38,7 +38,7 @@ def lvl1(base, name, root, weight, note):
 # June / July: codes{A,B}48 at level 1 over the whole scroll (the stored June set covered only 316 of the 549 packed 9.6 shards; with
 # no storage cost the packed-region limit is gone); the July codes need the July segments + wind-assign rebuilt first. 0139 / 0500P2 /
 # 1667 9.6 / p4full stay stored (fused A / B phase, not on the fly).
-ONFLY = os.environ.get("ONFLY", "1") == "1"; C1667 = "/vesuvius/ufsm/gt/PHerc1667-wind-20261016"; CP4 = f"{B1}/gt/paris4"
+ONFLY = os.environ.get("ONFLY", "1") == "1"; C1667 = "/vesuvius/ufsm/gt/PHerc1667-wind-20261016"; CP4 = f"{B1}/gt/paris4"; CP4N = os.environ.get("CP4N", "/vesuvius/ufsm/univ/b1/gt/paris4")
 def onfly(base, name, root, key, weight, note):
     e = lvl1(base, name, None, weight, note); e["targets"]["band"]["phase"] = {"onfly": {"root": root, "key": key, "rmax": 80}, "level": 1}; return e
 for k in ("A", "B"):
@@ -49,8 +49,9 @@ for k in ("A", "B"):
         src.append(lvl1(g1667, f"PHerc1667-{k}48", r, 0.1, f"B1 4.8 um phase, 1667 codes{k} (phase-raster --gs 2 --pair 1 --radius 160)"))
 p4 = next(s for s in T["sources"] if s["name"] == "PHercParis4-june"); p4b = next(s for s in T["sources"] if s["name"] == "PHercParis4-july")
 for k, base, nm, w in (("A", p4, "PHercParis4-june48", 0.2), ("B", p4b, "PHercParis4-july48", 0.12)):
-    if ONFLY and os.path.exists(f"{CP4}/codes{k}48/done"):
-        src.append(onfly(base, nm, f"{CP4}/codes{k}48", "4.8", w, f"Paris 4 codes{k}48 at level 1, phase on the fly (pair rule, rmax 80), whole scroll"))
+    cr = next((d for d in (CP4, CP4N) if os.path.exists(f"{d}/codes{k}48/done")), None)   # July codes live on NVMe (b1_p4B48.sh, 2026-11-12)
+    if ONFLY and cr:
+        src.append(onfly(base, nm, f"{cr}/codes{k}48", "4.8", w, f"Paris 4 codes{k}48 at level 1, phase on the fly (pair rule, rmax 80), whole scroll"))
         continue
     r = f"{CP4}/phase{k}48"
     if k != "A" or not os.path.exists(f"{r}/4.8/zarr.json"): continue
