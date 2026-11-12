@@ -90,8 +90,23 @@ fi
 
 # ---- matrix ----
 { echo "== univ eval $T  $CK  $(date)"
-  for r in $T $(for d in $DLVS; do echo $T-dlv$d; done); do [ -s $WB/res/$r.tsv ] || continue
-    for B in $REFS; do echo "-- $r vs $B"; $U wbench-stats $WB/res/$r.tsv $WB/res/$B.tsv --metric p05x,ids 2>&1 | grep -v label-noise | grep -E '^(p05x|ids) '; done; done
+  ws() { $U wbench-stats $1 $2 --metric p05x,ids 2>&1 | grep -v label-noise | grep -E '^(p05x|ids) '; }
+  [ -s $WB/res/$T.tsv ] && for B in $REFS; do [ -s $WB/res/$B.tsv ] && { echo "-- $T vs $B (native level)"; ws $WB/res/$T.tsv $WB/res/$B.tsv; }; done
+  # fed levels (DLV): like with like (the reference fed the same level; a reference's native row is NOT the comparison: every net drops
+  # off its native level), then this net's own drop from its native row
+  for d in $DLVS; do r=$T-dlv$d; [ -s $WB/res/$r.tsv ] || continue
+    for B in $REFS; do [ -s $WB/res/$B-dlv$d.tsv ] && { echo "-- $r vs $B-dlv$d (both fed DLV $d)"; ws $WB/res/$r.tsv $WB/res/$B-dlv$d.tsv; }; done
+    [ -s $WB/res/$T.tsv ] && { echo "-- $r vs $T (this net: fed DLV $d - native)"; ws $WB/res/$r.tsv $WB/res/$T.tsv; }; done
+  # masked-holdout control (scripts/univ/holdsplit.py): A - B on the boxes U1 saw the CT of (labels masked) vs the reject boxes (CT unseen)
+  REJ=${REJ:-$H/scripts/univ/u1reject.txt}
+  [ -s $REJ ] && [ -s $WB/res/$T.tsv ] && for B in $REFS; do [ -s $WB/res/$B.tsv ] || continue; pr="$WB/res/$T.tsv:$WB/res/$B.tsv"
+    [ -s $WB/res/$T-n936.tsv ] && [ -s $WB/res/$B-n936.tsv ] && pr="$pr $WB/res/$T-n936.tsv:$WB/res/$B-n936.tsv"
+    echo "-- masked vs reject boxes, $T - $B (core + native 9.36 um rows; reject = $(grep -v '^#' $REJ | tr '\n' ' '))"; python3 -I $H/scripts/univ/holdsplit.py $REJ $pr
+    # the same split for a snapshot trained before any masking (REJREF, u1-3000-prefix: every holdout window rejected then). Its masked - reject
+    # is the box mix alone (0139 + HOLD vs Paris 4 / 1667: +0.018 p05x, +0.049 ids vs lat-wz896p), so the CT effect is this net's value minus that one.
+    R0=${REJREF:-u1-3000-prefix}; [ $R0 != $T ] && [ -s $WB/res/$R0.tsv ] && { pr="$WB/res/$R0.tsv:$WB/res/$B.tsv"
+      [ -s $WB/res/$R0-n936.tsv ] && [ -s $WB/res/$B-n936.tsv ] && pr="$pr $WB/res/$R0-n936.tsv:$WB/res/$B-n936.tsv"
+      echo "-- the same split before masking, $R0 - $B (the box-mix baseline to subtract)"; python3 -I $H/scripts/univ/holdsplit.py $REJ $pr | grep 'masked - reject'; }; done
   for d in 0 -1; do [ -s $WB/res/$T-xres$d.tsv ] || continue; echo "-- xres DLV $d (fine scan) vs native 9.36 um ($T-n936), same boxes"
     python3 -I $H/scripts/univ/xres_pair.py $WB/res/$T-xres$d.tsv $WB/res/$T-n936.tsv; done
   [ -s $RVE/$T.txt ] && { echo "-- rv (recto-ruler; each cell = turns per GT turn (1 = right, < 1 under-counts) / share of GT intervals off >= 0.5 turn (lower is better))"; echo "   columns: scroll all n | fit (the reference count fit, not the model) | density | CT | rv.pkw | rv.pk (the model; the compared column) | rv.run"; echo "   rv1d2-10000 rv.pk: p1667 0.926/0.377 p139 0.811/0.375 p4 0.738/0.421; rv.run: p1667 1.135/0.384 p139 1.002/0.398 p4 1.005/0.274"; grep ' all ' $RVE/$T.txt; }
