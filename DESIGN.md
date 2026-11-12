@@ -6,6 +6,67 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Universal net inference: every head from one trunk pass (predict --heads), the fine stem in the latent fast paths (2026-11-11, branch univinf-20261111)
+
+**What fell back (u1, `--lat 4 --lat-guide 3 --rv 2 --film 2 --fstem 16`, cout 144 = 16 + 128 sub-cell outputs).** Every latent fast
+path was gated off by `cfg.fstem` or `rv2c >= 0`: lat_lean, the CT-bytes trunk input (latin), the direct rv placement, the fit-field
+z-slabs. So predict built the 4-channel fp16 input window (8 B a voxel, the stem's input) and the whole window's logits (rv: 8 B; fit
+fields: 11 fp16 planes, 22 B), the planner budgeted 14 B a voxel and a 16 GB card never got windows of k >= 2 shards. Plain
+`--channel N` / `--channel ink` on a latent net skipped the stem and (channels 0-1) the sub-cell term. Every head was its own predict.
+
+**`nn_fstem_fwd` bug (training).** The forward's warp loop stepped by FS_BT (128) blocks instead of 32 (4 warps x 8): only blocks 0-31
+of every 128-block row tile got the stem, voxels with x mod 256 < 64, while the backward took gradients for all blocks. test_fstem
+(7 blocks a row) never reached block 32. Fixed (`j0 += FS_BT / 32 * 8`); test_lathead at W 160 (80 blocks a row) catches it (1.29 M of
+4.1 M bytes differed before the fix). u1 trained with the bug up to its fix on master (051d230).
+
+**`nn_lat_heads_place` (src/nn_lathead.cu).** One thread per cell of the window interior inside the shard: the stem's C features of the
+cell's 8 blocks (64 CT taps each, z-scored from the window's bytes and rounded to fp16 as the input stores them; W1 rounded to fp16 as
+the tensor-core kernel takes it; fp32 sums) once in shared memory, then per head its channel(s)' 3^3 neighbourhood upsampled with
+lat_up4_k's weights (fp16 rounding as stored), the sub-cell term (lat_guide 64, phase pair), the stem projection row, rv fusion in fp16,
+the byte, into that head's shard. No full-resolution tensor. Against the slab composition (nn_lat_up_slab + nn_lat_shuffle +
+nn_fstem_fwd + nn_rv_fuse + nn_pred_place), 160^3 window: <= 10 of 4.1 M bytes differ, by 1 (the stem's fp32 sums in another order
+than the MMA's), fp16 and fp32 cell logits; all heads at once == one head at a time byte for byte (test_lathead).
+
+**`predict --heads LIST`** (latent-grid checkpoints, one GPU's device path): rv (the --rv 2 pair or --rv 1's 0-1, fused), ink (the
+header's "ink"), fib (the header's "fib_dir" head: fib/H, fib/V, fib/dyad/c2 .. c7 as fiber-trace --mask / --dyad read them, fib/fam),
+cN, all. Each head is its own store <out>/<name> (level 0 + pyramid, attrs "head" / "channel" / content) with its own writer and
+pinned ring (8 GB over all heads, UFSM_PRED_HBUF_GB), device shards double-buffered (the copy to the host on the offload stream
+behind the next shard), pyramids built in parallel threads at the end; `--fit-zarr` in the same pass. The single output of a stem /
+--rv 2 / sub-cell net takes the same path (one head, the main store; UFSM_PRED_HEADS=0: the old paths). The fit-field z-slab path
+adds the stem per chunk (planes z0 - 1 .. z0 + nz of the CT channel by nn_lat_ct_x, the winding mod 4 pair too), and the trunk takes
+its cells straight from the CT bytes with a stem. The planner of the heads path budgets no full-resolution bytes and picks the k of
+the fewest computed voxels over the box (k 3 on a 2048-deep box computed 1.6x the voxels of k 2). `--um-target U` (instead of
+--level): the level nearest U um in octaves; the scale FiLM codes follow the level read (log2(um 2^level / 4.8)). An HTTP prefetcher
+(UFSM_PRED_PREFETCH=2 windows ahead, 16 threads, z3_prefetch_chunk) fetches the reader's next chunks into --cache.
+
+Checks on u1 (desk, Paris 4 9.6 um, 512^3 box): rv vs the old slab path (with the fixed stem) 497 of 134 M bytes differ by 1, both
+window layouts; fit fields (pc ps sp t0 t3 w dz dq) byte-identical between the old full-window path and the z-slabs with the stem,
+with three heads written in the same pass. test_predict_heads: the fixture's stem + rv 2 + ink net (--heads all vs the old path and
+vs single heads; fit fields with and without --heads) and its fibre-head net (fib/H vs the pool4 path: 0.64 % of the bytes differ by 1, the fp16 rounding of the upsampled logit; rv vs the slab path and every head vs its single-head run: 0 bytes).
+
+**Throughput, pod (RTX PRO 6000 96 GB, 40 CPUs; u1-architecture checkpoint; Paris 4 9.6 um from the HTTP mirror; 2048 x 3072^2 box =
+19.3 Gvox, window 1056 / halo 16 = one window per 2^3 shards, 18 windows, 21.2 Gvox computed):**
+
+| run | GPU (s) | reader (s) | writers (s) | wall (s) | Gvox/s (box) |
+|---|---|---|---|---|---|
+| old slab path, rv, 4 levels | 4.68 | 7.1 | 4.7 | 14.6 | 1.33 |
+| heads path, rv, 4 levels | 4.2-4.6 | 7.6-8.5 | 2.8 | 12.0-14.4 | 1.34-1.61 |
+| heads path, rv, --levels 1 | 4.79 | 6.2 | 3.3 | 8.65 | 2.23 |
+| heads path, rv, cold HTTP (--levels 1) | 4.2-4.5 | 14-19 | 3.4 | 16-21 | 0.93-1.20 |
+| 5 heads (rv c0 c1 c9 c10), 4 levels, unfused | 7.56 | 10.5 | - | 27.2 | 0.71 |
+| 5 heads, fused kernel + double buffers + parallel pyramids | 6.26 | 12.0 | - | 24.0 | 0.80 |
+| 5 heads + --fit-zarr | 12.0 (8.5 waiting on the fit writer) | 11.8 | - | 24.5 | 0.79 |
+
+Per 1056^3 window (ptick): trunk 175 ms, upsampling 28, shard copies 20, upload 24, input 17 of 359 (old path). Where the time goes:
+the GPU limit is ~4.5 Gvox/s for one head; the CPU volcomp decode of the reader is the cap on warm runs (2.8 Gvox/s on 40 threads;
+`ufsm read` alone 3.1 Gvox/s; the window halos add ~1.25x decoded substreams); cold runs are network-bound (~350 MB/s from the
+mirror, 0.11-0.15 GB a Gvox; prefetching ahead does not raise it); many heads are bound by the CPU compression of every head's
+volume (lossy q 8, ~7 GB/s a writer) and by the pyramids (each decodes its level 0 back). The GPU volcomp decoder (UFSM_GPU_DECODE=1,
+through the host batches) reads 1.06 Gvox/s on an idle GPU, slower than the CPU here.
+
+Whole scroll, Paris 4: the occupied k = 2 windows of the 9.6 um level hold 596 Gvox (of 1.27 Tvox; 34 % of the 512^3 shards hold
+material). Pod, one head: ~4.5 min warm, ~9 min cold; 4.8 um 8x, 2.4 um 64x.
+
 ## B1 4.8 um phase rasters: what was built before the switch to on-the-fly phase (2026-11-11, branch fibd-20261111)
 
 Workstream B1 rasterised the band phase at 4.8 um (`phase-raster --gs 2 --pair 1 --radius 160`, GPU, byte-identical to the CPU path;

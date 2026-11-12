@@ -403,6 +403,11 @@ int nn_fstem_bwd(const void *x, int D, int H, int W, int z0, int nz, const float
 void nn_lat_head_place(const void *lg, int lh16, int d, int h, int w, int c0, int c1, int sb0, int sb1, int s0, int s1,
                        const float *stem, int C, int nout, const uint8_t *ct, float mean, float isd, int iso,
                        int hz, int halo, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh);
+/* nh (<= 24) heads at once, head j (c0[j], c1[j], sb0[j], sb1[j], s0[j], s1[j]) into its shard dsh[j]: the stem's features computed once a cell;
+   byte-identical to one nn_lat_head_place per head */
+void nn_lat_heads_place(const void *lg, int lh16, int d, int h, int w, int nh, const int *c0, const int *c1, const int *sb0, const int *sb1, const int *s0, const int *s1,
+                        uint8_t *const *dsh, const float *stem, int C, int nout, const uint8_t *ct, float mean, float isd, int iso,
+                        int hz, int halo, int oz, int oy, int ox, int ez, int ey, int ex, int shard);
 void nn_scale(float *y, float a, size_t n);
 void nn_u8_to_f32(const uint8_t *x, size_t n, float scale, float *y);
 
