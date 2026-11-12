@@ -48,6 +48,19 @@ for k in ("A", "B"):
         src.append(onfly(g1667, f"PHerc1667-{k}48", f"{C1667}/codes{k}", "4.798", 0.1, f"1667 codes{k} 4.798, phase on the fly (pair rule, rmax 80)"))
     elif os.path.exists(f"{r}/done"):
         src.append(lvl1(g1667, f"PHerc1667-{k}48", r, 0.1, f"B1 4.8 um phase, 1667 codes{k} (phase-raster --gs 2 --pair 1 --radius 160)"))
+# B3 (the all-spirals labels, good.sh gate): PHerc1299 (2026-11-12), only with B3=1 until its sampler-only band line is checked. Phase on
+# the fly from the kept wraps' codes (rmax 20 = surf-labels --radius 20 on the 9.596 um grid) and ONE stored array, the phase weight
+# (ufsm phase-coh --coh 0 on the gated phase, scripts/univ/b3_1299_mask.py): 0 in the held-out band, the direction-masked cells, air
+# (CT < 64 with no CT >= 64 within 2 voxels), the gt-gate's removed cells and every voxel surf-labels ignored; 0.5 + 0.5 x the fibre
+# factor in the fibre tiles; 1 elsewhere. The band also rejects whole windows (holdout_reject).
+B3D = os.environ.get("B3D", "/vesuvius/ufsm/univ/b3")
+if os.environ.get("B3", "0") == "1" and os.path.exists(f"{B3D}/PHerc1299/mask/weight.zarr/9.596/zarr.json") and os.path.exists(f"{B3D}/PHerc1299/codes.zarr/9.596/zarr.json"):
+    src.append({"name": "PHerc1299-b3", "scope": "global", "root": "/vesuvius/ufsm/v2/ct", "ct": "PHerc1299/20260309130042-2.399um-0.2m-78keV-masked.zarr", "um": 2.399,
+                "min_level": 2, "max_level": 2, "axis": "/mnt/scratch/pods/PHerc1299/run/axis.json", "iso": 64, "weight": float(os.environ.get("W1299", "0.1")), "heads": HEADS,
+                "holdout_file": "/vesuvius/ufsm/univ/holdouts-1299.json", "holdout_reject": ["1299-zband"],
+                "note": "B3 PHerc1299: our snapped wraps (71 of 88 kept), phase on the fly from codes (rmax 20), weight = band / direction / fibre / papyrus / gate mask",
+                "targets": {"band": {"radius": 20, "span": 19, "phase": {"onfly": {"root": f"{B3D}/PHerc1299/codes.zarr", "key": "9.596", "rmax": 20}, "level": 2,
+                                                                         "weight": {"root": f"{B3D}/PHerc1299/mask/weight.zarr", "key": "9.596"}}}}})
 p4 = next(s for s in T["sources"] if s["name"] == "PHercParis4-june"); p4b = next(s for s in T["sources"] if s["name"] == "PHercParis4-july")
 for k, base, nm, w in (("A", p4, "PHercParis4-june48", 0.2), ("B", p4b, "PHercParis4-july48", 0.12)):
     cr = next((d for d in (CP4, CP4N) if os.path.exists(f"{d}/codes{k}48/done")), None)   # July codes live on NVMe (b1_p4B48.sh, 2026-11-12)

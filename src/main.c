@@ -700,6 +700,12 @@ static int cmd_phase_onfly(int argc, char **argv) {
     const int ri = arg_index(argc, argv, "--ref");
     if (ri > 0) { if (ri + 2 >= argc || !(ref = z3_open(store_open(argv[ri + 1]), argv[ri + 2], nullptr))) { fprintf(stderr, "phase-onfly: --ref ROOT KEY: %s\n", z3_error()); return 1; }
         if (memcmp(z3_meta_of(ref)->shape, z3_meta_of(ph)->shape, sizeof z3_meta_of(ph)->shape)) { fprintf(stderr, "phase-onfly: --ref shape differs from the codes'\n"); return 1; } }
+    /* --weight ROOT KEY (with --ref): a sampler phase weight on the same grid; the differences are also counted where it is non-zero (the
+       voxels training can draw: a stored phase with ignored voxels baked unknown differs from the rule there, under a zero weight) */
+    const int wgi = arg_index(argc, argv, "--weight"); z3 *wz = nullptr;
+    if (wgi > 0 && (!ref || wgi + 2 >= argc || !(wz = z3_open(store_open(argv[wgi + 1]), argv[wgi + 2], nullptr)) || memcmp(z3_meta_of(wz)->shape, z3_meta_of(ph)->shape, sizeof z3_meta_of(ph)->shape))) {
+        fprintf(stderr, "phase-onfly: --weight ROOT KEY needs --ref and the codes' shape\n"); return 1; }
+    size_t wbad = 0, wpos = 0, wunk[2] = {0, 0}; int wmax = 0;
     int64_t g[3]; uint8_t *bits = nullptr; const int64_t np = z3_chunk_map(ref ? ref : c, g, &bits);
     if (np <= 0) { fprintf(stderr, "phase-onfly: no chunks\n"); return 1; }
     const z3_meta *m = z3_meta_of(ph); const size_t N = (size_t)P * P * P;
@@ -719,13 +725,19 @@ static int cmd_phase_onfly(int argc, char **argv) {
         size_t d = 0, kn = 0; for (size_t i = 0; i < N; i++) kn += a[i] < PHASE_PERIOD;
         if (ref) { if (z3_read(ref, o, n, b, nt)) { fprintf(stderr, "phase-onfly: ref read failed: %s\n", z3_error()); return 1; } for (size_t i = 0; i < N; i++) d += a[i] != b[i]; }
         bad += d;
+        if (wz) { uint8_t *w = malloc(N); if (!w || z3_read(wz, o, n, w, nt)) { fprintf(stderr, "phase-onfly: weight read failed: %s\n", z3_error()); return 1; }
+            size_t dw = 0, pw = 0;
+            for (size_t i = 0; i < N; i++) { if (!w[i]) continue; pw++; if (a[i] == b[i]) continue; dw++;
+                if (a[i] >= PHASE_PERIOD) wunk[0]++; else if (b[i] >= PHASE_PERIOD) wunk[1]++; else { int e = abs((int)a[i] - (int)b[i]); if (e > PHASE_PERIOD / 2) e = PHASE_PERIOD - e; if (e > wmax) wmax = e; } }
+            wbad += dw; wpos += pw; free(w); printf("  weighted voxels %zu, differing among them %zu\n", pw, dw); }
         printf("window %lld at %lld,%lld,%lld: %.0f ms (pair %.0f, codes read %.0f), tiles %llu (+%llu empty), %.2f known, %s%zu differing\n", (long long)wi, (long long)o[0], (long long)o[1], (long long)o[2],
                1e3 * dt, 1e3 * (s1.s_pair - s0.s_pair), 1e3 * (s1.s_read - s0.s_read), (unsigned long long)(s1.tiles - s0.tiles), (unsigned long long)(s1.skipped - s0.skipped), (double)kn / N, ref ? "" : "(no ref) ", d);
         fflush(stdout); wi++; k++;
     }
     phase_onfly_stats st; phase_onfly_get_stats(&st);
     printf("phase-onfly: %lld windows, %.0f ms per window, tile voxels / output %.2f, %llu of %llu tiles decoded on the GPU, %zu differing voxels%s\n", (long long)wi, 1e3 * tsum / (wi ? wi : 1), (double)st.vox_tile / (st.vox_out ? st.vox_out : 1), (unsigned long long)st.gpu_tiles, (unsigned long long)st.tiles, bad, ref ? (bad ? ": FAIL" : ": byte-identical") : "");
-    free(a); free(b); free(bits); z3_close(ph); z3_close(ref);
+    if (wz) printf("phase-onfly: under a non-zero weight: %zu voxels, %zu differing (%zu unknown on the fly, %zu unknown in the reference, the rest by up to %d codes)\n", wpos, wbad, wunk[0], wunk[1], wmax);
+    free(a); free(b); free(bits); z3_close(ph); z3_close(ref); z3_close(wz);
     return bad ? 1 : 0;
 }
 

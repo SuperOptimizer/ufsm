@@ -6,6 +6,54 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## PHerc1299 B3 labels: the direction check, its mask, phase on the fly + one weight array (2026-11-12, branch fibd-20261111)
+
+PHerc1299's snapped wraps (71 of 88 kept, surf-labels kept share 0.9487) failed the stored-phase guard: `phase-check` outward 0.890 over
+23 558 chunks, box range 0.161..1.000. Per 128^3 cell outside the held-out band (17 383 cells): 0.36 of the voxel pairs sit in cells
+>= 0.95, 0.48 in 0.80-0.95, 0.16 below; 14 cells in the whole scroll under 0.4. Mixed, not flipped.
+
+**The raw outward share is confounded with sheet orientation.** On 500 sampled cells it correlates 0.83 with the mean |cos| between the
+phase gradient and the radius: cells under 0.6 have mean |cos| 0.15 (sheets running along the radius; the sign of the radial component
+is noise). Counting only voxels whose in-plane gradient lies within 45.6 degrees of the radius (|cos| > 0.7, >= 3 codes / voxel:
+`phase_outward_aligned`, `phase-check --cells` / `--aligned-cos`) gives 0.9957 outward over the scroll outside the band (0.33 of the
+pairs aligned), 1.000 / 0.996 in the cells whose raw score is >= 0.95 / 0.90-0.95. **Use the aligned share for future scrolls**; a 0.95
+raw threshold would have discarded 64% of correct labels here. (Without the 3-code floor an azimuth-only phase, whose quantised
+differences are 0 / 1 code, produced spurious aligned voxels: test_phase_check covers both.)
+
+**Fibre gate vs outward: independent.** spirals' fiber-judge tiles (Paris 4 ramp 189..378 persistent /m) against the raw cell score:
+correlation -0.09; median rate 411 / 373 / 401 /m in the < 0.8 / 0.8-0.95 / >= 0.95 bins, i.e. at or above the ramp's top everywhere
+(the same miscalibration latres measured on the 8.64 um 1218 / 1447 scans). Shares of pairs outside the band:
+
+| fibre tile | outward >= 0.95 | 0.80-0.95 | < 0.80 | total |
+|---|---|---|---|---|
+| factor 0 | 0.224 | 0.229 | 0.088 | 0.541 |
+| partial | 0.105 | 0.230 | 0.060 | 0.395 |
+| factor 1 | 0.022 | 0.009 | 0.001 | 0.033 |
+| unjudged | 0.011 | 0.014 | 0.006 | 0.031 |
+
+**The mask (coordinator's option B)**, `scripts/univ/b3_1299_mask.py` -> a `phase-coh --box-scale` file (first box wins), then
+`ufsm phase-coh --coh 0 --papyrus 64 --pap-dilate 2` on the gated phase:
+- the held-out band + guard (level-2 z < 4167): 0;
+- direction-masked 128^3 cells: 0. (a) fibre factor 0 AND raw outward < 0.8: 1922 cells, 0.088 of the pairs; (b) reversed by the aligned
+  test (>= 20 000 aligned pairs, ~1% of a cell, binomial sd < 0.004, of which < 0.5 outward): 314 cells, 0.021; both 0.008. Total 2113
+  cells, 0.101 of the pairs; kept 0.899;
+- fibre tiles: 0.5 + 0.5 x factor (floored: the ramp must not act as a mask through the weight), 1 elsewhere;
+- air (CT < 64 with no CT >= 64 within 2 voxels): 0.131 of the known voxels; the gt-gate's removed cells and every surf-labels ignore are
+  already unknown in the gated phase and get weight 0.
+Result `/vesuvius/ufsm/univ/b3/PHerc1299/mask/weight.zarr` (1.4 GB): 0.42 of the known voxels at 0, 0.39 at 0.5-0.6, mean 0.35.
+
+**Gate numbers with the band excluded**: the gated phase keeps 0.962 of the labelled phase's pairs outside the band (gt-gate + shard rule
+remove 0.038; 0.070 of all sheet voxels including the band), aligned outward 0.9961. The band cells held 0.258 / 0.257 of the pairs of
+the labelled / gated phase: the labels were built while holdouts-1299.json had the band in level-2 numbers (an empty corner, "holdout
+0"), so they hold phase there; the weight, the band's holdout_reject and the sampler keep training out. surf-labels now fails on a holdout
+box with no labelled voxel (test_surflabels).
+
+**Shipped form**: phase on the fly from the kept wraps' codes (2.0 GB, `codes.zarr`, rmax 20 = surf-labels --radius 20) plus the one
+weight array; no stored phase. `phase-onfly --ref (label phase) --weight (the array)` on 12 windows of 512^3: 30.4 M voxels differ from
+the stored label phase overall (the label phase has surf-labels' ignored voxels blanked; the rule fills them), **0 of 587 330 312 voxels
+differ under a non-zero weight**. CPU pair rule ~15 s per 512^3 window (u1 holds both GPUs). The entry `PHerc1299-b3` is in
+mksources_univ.py behind B3=1 until its sampler-only band line is read in a GPU window.
+
 ## Holdouts masked instead of rejected; coarse rungs get a pooled phase (2026-11-11, branch univ-20261111)
 
 u1 after the fstem restart (5796) drew 0.0% of its windows at 19.2 um, PHerc1667-gt not at all, 1667-A48 / B48 and 0500P2 at 0.6-3.3%. A
