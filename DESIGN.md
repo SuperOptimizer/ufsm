@@ -6,6 +6,98 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## How far the CT can be compressed: the inference half (2026-11-12, branch latstore-20261112)
+
+The user's question: how compressed can the data be before the nets are hopeless, and how much can we get away with. This is the
+inference half (fixed checkpoints, re-encoded CT); the training half (finetunes on re-encoded CT) follows in its own section.
+
+**Setup** (pod, scripts/latvol/sweep.sh, sweep_fib.sh, sweep_ink.sh, sweep_table.py, sweep_plot.py). Top anchor: the upstream
+uncompressed uint8 zarr v2 CT of the box regions from the public bucket, kept as lossless volcomp (0.620 B/vox; raw = 1). Every arm is
+encoded from it with `ufsm latvol --volcomp Q` (volcomp at quality Q) or as latent cells (`lvC_S`: C coefficients of klt1, step S x sd).
+Winding: 14 wbench boxes (PH1-3, HOLD, J1 J9 J19 J27; C9 C18 C30 C52; 139-5 139-2: level 2 of the 2.4 um scans, level 0 of 0139's
+9.36 um scan), three checkpoints (u1-8000, lat-wz896, wind96), production predict -> fit -> scores, paired per box against the anchor,
+95% bootstrap interval over boxes. Rate = stored bytes per voxel of the re-encoded regions, air included. The paired noise floor with 14
+boxes is +-0.01 to 0.02 p05x.
+Validity: the arms are local trees, which have no disk chunk cache (the cache path has no root in it: an HTTP arm sharing a cache dir
+would be served another arm's chunks; still to fix), and the shared decoded-chunk memory is keyed by a hash of the encoded bytes. Each
+arm's CT differs from the anchor's (docs/sweep/compression-psnr.tsv), the fit fields of every (checkpoint, box) were checksummed per arm
+(386 checksums, no two arms equal), reruns reproduce rows to 4 digits. A side check: the q2 arm reproduces the mirror's fibre baseline
+exactly, so the mirror's level 2 is byte-equivalent to original -> volcomp q2.
+
+**Winding** (d p05x vs the anchor [95% CI]; anchor means u1 0.730, wz896 0.701, wind96 0.747; full table with ids:
+docs/sweep/compression-winding.tsv, plot docs/sweep/compression-winding.png):
+
+| arm | B/vox | PSNR dB | u1-8000 | lat-wz896 | wind96 |
+|---|---|---|---|---|---|
+| volcomp q1 | 0.209 | 39.5 | -0.005 [-0.020, +0.006] | +0.002 [-0.009, +0.017] | +0.001 [-0.001, +0.004] |
+| volcomp q2 (mirror, 2.4 um scans) | 0.124 | 34.9 | -0.001 [-0.005, +0.003] | +0.004 [-0.006, +0.016] | -0.008 [-0.031, +0.006] |
+| volcomp q4 | 0.068 | 31.2 | -0.011 [-0.029, +0.002] | -0.006 [-0.015, +0.001] | -0.007 [-0.030, +0.006] |
+| volcomp q8 (mirror, 9.4 um scans) | 0.035 | 28.3 | -0.005 [-0.021, +0.008] | -0.002 [-0.005, -0.000] | +0.003 [-0.003, +0.009] |
+| volcomp q16 | 0.0172 | 25.9 | -0.016 [-0.045, +0.003] | +0.011 [-0.003, +0.034] | -0.002 [-0.011, +0.006] |
+| volcomp q32 | 0.0082 | 23.9 | -0.031 [-0.067, -0.007] | -0.011 [-0.035, +0.017] | -0.018 [-0.039, -0.002] |
+| volcomp q64 | 0.0039 | 22.1 | -0.058 [-0.098, -0.026] | -0.060 [-0.088, -0.033] | -0.106 [-0.155, -0.063] |
+| volcomp q128 | 0.0018 | 20.7 | -0.118 [-0.179, -0.068] | -0.083 [-0.115, -0.054] | -0.342 [-0.418, -0.268] |
+| latent C 64 step 0.125 | 0.336 | 45.5 | -0.005 [-0.016, +0.002] | +0.000 [-0.010, +0.012] | +0.004 [+0.001, +0.007] |
+| latent C 64 step 0.25 | 0.237 | 40.0 | +0.002 [-0.001, +0.007] | -0.001 [-0.005, +0.003] | -0.004 [-0.011, +0.001] |
+| latent C 29 step 0.25 (u1's quantiser) | 0.159 | 32.8 | -0.006 [-0.032, +0.013] | +0.001 [-0.003, +0.008] | -0.002 [-0.009, +0.004] |
+| latent C 29 step 0.5 | 0.113 | 31.8 | +0.001 [-0.001, +0.004] | -0.007 [-0.018, -0.000] | -0.011 [-0.033, +0.003] |
+| latent C 29 step 1.0 | 0.072 | 29.5 | -0.003 [-0.017, +0.007] | -0.000 [-0.007, +0.007] | -0.003 [-0.010, +0.001] |
+| latent C 13 step 0.5 | 0.071 | 28.3 | -0.001 [-0.008, +0.007] | -0.003 [-0.020, +0.013] | -0.013 [-0.036, +0.001] |
+| latent C 13 step 1.0 | 0.050 | 27.6 | -0.011 [-0.026, -0.001] | -0.008 [-0.019, -0.000] | +0.001 [-0.001, +0.003] |
+| latent C 29 step 2.0 | 0.038 | 26.4 | -0.018 [-0.039, -0.001] | +0.004 [-0.013, +0.029] | -0.004 [-0.012, +0.003] |
+| latent C 8 step 1.0 | 0.037 | 26.0 | -0.019 [-0.041, -0.002] | -0.003 [-0.027, +0.025] | -0.003 [-0.013, +0.005] |
+| latent C 4 step 2.0 | 0.017 | 23.5 | -0.049 [-0.088, -0.020] | -0.025 [-0.051, +0.003] | -0.021 [-0.037, -0.007] |
+| latent C 1 step 1.0 (the mean) | 0.009 | 21.0 | -0.196 [-0.258, -0.137] | -0.142 [-0.209, -0.088] | -0.422 [-0.502, -0.339] |
+
+- **No measurable loss down to volcomp q8, 0.035 B/vox**: 3.6x below the mirror's q2 for the 2.4 um scans, 29x below raw. q16
+  (0.017) is the edge (two nets unchanged, u1 -0.016 with the interval touching 0). **Knee at q32** (0.008 B/vox: -0.01 to -0.03 p05x,
+  ids -0.02 to -0.05). **Collapse from q64** (0.004: -0.06 to -0.11; q128: -0.08 to -0.34, ids to -0.46). The voxel net (wind96) falls
+  hardest at the bottom; the latent-grid nets degrade more gracefully.
+- **Latent cells**: C 29 at step 1.0 (0.072 B/vox, 4x u1's training step) is the coarsest setting clean on all three nets. Step 2.0, or
+  13 / 8 coefficients at step 1.0, cost u1 0.01-0.02 (u1 consumes exactly these coefficients; the other nets read the rebuilt CT and do
+  not notice). The mean alone is useless.
+- **Per byte volcomp wins below ~0.07 B/vox**: q8 at 0.035 is clean where the latent arms at 0.037-0.038 lose 0.02 on u1; q16 at 0.017
+  is clean on two nets where C 4 loses 0.02-0.05. latvol's case is the device decode (previous section), not size; but its inference
+  step can be 0.5-1.0, which makes a store 0.6-0.9x of the q2 mirror instead of 1.3x.
+
+**Fibres** (fibhv-c-12000 on HOLD, fiber-trace + fiber-judge; one box, no interval. H tube: fibres / metres / persistent sheet crossings
+per m / pair accuracy at 0.3 and 0.6 mm; V tube the same):
+
+| arm | B/vox (Paris 4) | H tube | V tube |
+|---|---|---|---|
+| anchor | 0.680 | 6410 / 4.04 / 55.1 / 0.971 0.964 | 7224 / 4.54 / 174.7 / 0.902 0.884 |
+| q1 | 0.232 | 6581 / 4.11 / 54.6 / 0.967 0.946 | 7115 / 4.49 / 175.3 / 0.907 0.899 |
+| q2 (= the mirror baseline) | 0.136 | 6988 / 4.40 / 47.6 / 0.970 0.955 | 7259 / 4.56 / 169.1 / 0.903 0.864 |
+| q4 | 0.073 | 6855 / 4.33 / 51.9 / 0.972 0.964 | 6980 / 4.38 / 165.4 / 0.901 0.884 |
+| q8 | 0.037 | 6900 / 4.32 / 39.8 / 0.972 0.957 | 7101 / 4.47 / 171.7 / 0.902 0.870 |
+| q16 | 0.018 | 7467 / 4.75 / 50.4 / 0.971 0.950 | 7361 / 4.60 / 166.1 / 0.904 0.874 |
+| q32 | 0.0085 | 7643 / 4.75 / 50.2 / 0.968 0.938 | 7926 / 4.98 / 179.3 / 0.904 0.901 |
+| q64 | 0.0039 | 8782 / 5.38 / 70.5 / 0.959 0.935 | 8574 / 5.20 / 256.3 / 0.877 0.837 |
+| q128 | 0.0018 | 11024 / 6.64 / 192.8 / 0.923 0.857 | 11003 / 6.65 / 374.7 / 0.852 0.799 |
+| latent C 29 step 0.25 | 0.176 | 6447 / 4.04 / 49.0 / 0.969 0.962 | 7152 / 4.47 / 175.8 / 0.904 0.877 |
+| latent C 29 step 0.5 | 0.125 | 6583 / 4.09 / 55.3 / 0.963 0.942 | 7092 / 4.43 / 183.8 / 0.901 0.886 |
+| latent C 29 step 1.0 | 0.079 | 6616 / 4.15 / 51.6 / 0.968 0.950 | 7249 / 4.56 / 176.9 / 0.898 0.871 |
+| latent C 29 step 2.0 | 0.041 | 6552 / 4.11 / 52.4 / 0.969 0.953 | 6957 / 4.38 / 177.3 / 0.906 0.877 |
+| latent C 4 step 2.0 | 0.019 | 8481 / 5.39 / 63.2 / 0.966 0.929 | 8318 / 5.25 / 185.7 / 0.895 0.887 |
+
+The same picture: nothing systematic down to q8 (the spread among the clean arms, 4.0-4.4 m and 40-55 crossings / m on H, is what one
+box gives); from q16 the tracer over-traces (+18% length at q16 / q32), q64 and q128 hallucinate fibres (crossings per metre x1.3 and
+x3.5, pair accuracy 0.96 -> 0.92 / 0.86). Uncompressed vs q2: different, not better. The net was trained on the q2 mirror; on the
+noisier original it traces 8% less H tube with 55 instead of 48 crossings per metre and the same pair accuracy; V is unchanged.
+
+**Ink** (the ink3d-ext teacher at level 0, where the mirror is q8; 4 held-out crops w07_1 / w05_1 / PHerc0139_w044_1 /
+PHerc1667_w029_0, voxelwise AUC; rate over the crop boxes): anchor (0.544 B/vox) 0.710 / 0.694 / 0.708 / 0.527; q8 (0.0147) 0.718 /
+0.689 / 0.708 / 0.528; q32 (0.0047) 0.736 / 0.628 / 0.707 / 0.510. q8 equals the anchor within 0.01; q32 moves single crops by up to
+0.07 either way. The remaining arms (q128, q2, latent) are appended when they finish.
+
+**Whole-level sizes** re-encoded from the q2 mirror (Paris 4 level 2, 1266 Gvox, 46.1 GB at q2): q8 13.8 GB, q32 2.79 GB, q128 0.58 GB,
+latent C 29 step 1.0 25.5 GB (0.080 B per material voxel); PHerc1667 level 2 (4.6 GB at q2): 1.42 / 0.29 / 0.07 / 2.43 GB. 4-6 minutes
+per arm for both scans on 20 pod threads (bound by reading the source).
+
+**Recommendation (inference evidence; the training half can still move it).** 2.4 um scans' working levels: q8 instead of q2 (3.6x
+smaller, a 2x margin in q to the edge, 4x to the knee). 9.4 um scans: stay at q8. latvol inference stores: C 29, step 0.5 (a 2x margin in
+step under the last clean point; fewer coefficients is the wrong lever). Nothing below q8 before a net has been shown to learn from it.
+
 ## latvol: the CT stored as the trunk's latent cells (2026-11-12, branch latstore-20261112)
 
 The latent-grid nets (u1: `--lat 4 --lat-basis klt1.lcb --lat-c 29 --lat-step 0.25`) consume 4^3 cells of KLT indices, yet every read decodes
