@@ -2751,6 +2751,14 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
     /* empty windows (no target value above 0) kept with p empty_keep; a source without target channels (band codes + stored phase only:
        the --task unwrap2 sources) has none to test, so its windows are all kept (they took the same coin flip, 4 of 5 draws wasted) */
     int tgt_any = region_ch >= 0; for (int ch = 0; ch < NCH; ch++) tgt_any |= s->tgt_key[ch] != nullptr;
+    /* the registry's extra planes (batch.aux) are targets too: under --rv the human ink target is one of them (the ink plane holds the
+       papyrus plane, CH_SHEET is skipped above), so an ink-only source had tmax 0 in every window and lost 4 of 5 draws as "empty"
+       (U2 2026-11-12: ink 3.5 % of the windows at ~25 % of the weight; Paris 4 10 of 14 picked windows dropped) */
+    for (int j = 0; j < c->aux_n && tmax == 0 && tgt_any && !c->cover; j++) {
+        const uint8_t *ap = b->aux[j] + (size_t)i * p3; uint8_t mx = 0;
+        for (size_t k = 0; k < p3; k++) { const uint8_t v = ap[k] == 255 ? 0 : ap[k]; mx = v > mx ? v : mx; }
+        tmax = mx;
+    }
     if (!c->cover && !c->papyrus && tgt_any && tmax == 0 && runif(r) > c->empty_keep) { tp_put(dpap, p3); atomic_fetch_add(&sp->rejected, 1); atomic_fetch_add(&sp->rej_why[2], 1); SL_ADD(SL_EMPTY); return 1; }
     PROF_MARK(PS_TARGETS);
     uint8_t *near = nullptr;   /* --phase-near-um: voxels within the distance of a labelled wrap voxel (raw labels, before softening) */

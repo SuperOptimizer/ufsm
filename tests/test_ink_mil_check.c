@@ -94,6 +94,27 @@ int main(int argc, char **argv) {
     CHECK(!sh("UFSM_MIL_CHECK=1 UFSM_GRAD_MX8=1 %s train %s/sources-mil.json --out %s/r4 --steps 6 %s %s --lat 4 --lat-guide 3 > %s/r4.log 2>&1", U, d, d, common, mil, d), "train run 4, latent (%s/r4.log)", d);
     /* run 5: --replay 3 with the warps (each window 3 steps, the replays with a new device-side symmetry / warp) */
     CHECK(!sh("UFSM_MIL_CHECK=1 UFSM_GRAD_MX8=1 %s train %s/sources-mil.json --out %s/r5 --steps 9 %s %s %s --gpu-aug 2 --replay 3 > %s/r5.log 2>&1", U, d, d, common, mil, warp, d), "train run 5, replays (%s/r5.log)", d);
+    /* run 6 (sampler only): an ink-only source (no band / phase) under --rv, where the ink target is an extra (aux) plane: its windows
+       must not all count as "empty targets" (until 2026-11-12 the empty test read the target channels only: every window had no target
+       value, kept with p empty_keep 0.2, ~4 draws dropped per window; 3.75 measured here, 1.75 after. The rest are real: the fixture's
+       128-voxel chunk snap moves some P 64 windows off the sheet, and windows between the ink discs know only "no ink") */
+    snprintf(p, sizeof p, "%s/sources-ink.json", d); f = fopen(p, "w"); if (!f) return 1;
+    fprintf(f, "{\"sources\": [{\"name\": \"wind-fixture-inkonly\", \"root\": \"%s/fx\", \"ct\": \"ct\", \"um\": 9.6, \"axis\": \"%s/fx/axis.json\", \"weight\": 1, \"ink_weight\": 1,\n"
+               "  \"heads\": {\"phase\": 0, \"normal\": 0, \"wind4\": 0, \"ink\": 1},\n"
+               "  \"targets\": {\"ink\": {\"onfly\": {\"segments\": \"%s/segs.json\", \"level\": 0, \"iso\": 100, \"cache_dir\": \"off\"}}}}]}\n", d, d, d);
+    fclose(f);
+    CHECK(!sh("CUDA_VISIBLE_DEVICES= UFSM_SAMPLER_ONLY=24 %s train %s/sources-ink.json --out %s/r6 %s --rv 2 --rv-iso 64 > %s/r6.log 2>&1", U, d, d, common, d), "sampler-only run 6 (%s/r6.log)", d);
+    {
+        snprintf(p, sizeof p, "%s/r6.log", d); char *l6 = slurp(p); long nwin = 0, nemp = 0;
+        for (const char *q = l6; q && (q = strstr(q, "sampler-only:   wind-fixture-inkonly")); q++) {
+            long w6 = -1, e6 = -1; const char *a = strstr(q, "): "), *b6 = strstr(q, "holdout overlaps, ");
+            if (a && sscanf(a, "): %ld windows", &w6) == 1) nwin += w6;
+            if (b6 && sscanf(b6, "holdout overlaps, %ld empty targets", &e6) == 1) nemp += e6;
+        }
+        fprintf(stderr, "run 6 (ink only, --rv): %ld windows, %ld draws dropped as empty targets\n", nwin, nemp);
+        CHECK(nwin >= 24 && nemp < 3 * nwin, "ink-only windows under --rv dropped as empty: %ld windows, %ld empty (%s/r6.log)", nwin, nemp, d);
+        free(l6);
+    }
     enum { NRUN = 6 };
     char *lg[NRUN]; for (int run = 0; run < NRUN; run++) { snprintf(p, sizeof p, "%s/r%d.log", d, run); lg[run] = slurp(p); if (!lg[run]) { fprintf(stderr, "FAIL: no log r%d in %s\n", run, d); return 1; } }
     /* (1) the device MIL loss / gradient against the host reference */

@@ -6,6 +6,30 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## U2's low ink share: ink-only windows counted as empty under --rv; held-out draw cells; 0841 / 0500P2 (2026-11-12, branch inkdraw-20261112)
+
+U2 (unwrap2 + `--rv 2` + `--ink-head 1`) drew 3.5 % of its windows from the 8 human-ink sources at ~25 % of the weight; Paris 4
+dropped 10 of 14 picked windows as "empty targets". Three causes:
+
+- **The empty test missed the ink plane.** Under `--rv` the ink plane holds the papyrus plane and the human ink target is an extra
+  (aux) plane; the sampler's empty-window test read only the target channels, so every ink-only window had no target value and
+  was kept with p `empty_keep` 0.2. That cost ~4 dropped draws per window. The test now reads the aux planes too (a known value
+  above 0). On the fixture (test_ink_mil_check run 6, ink-only source, P 64, 24 windows) the drops went from 90 to 42. The other
+  42 are real: the fixture's 128-voxel chunk snap moves P 64 windows off the sheet, and windows between the ink discs know only
+  "no ink". In the 2-D labels of the real scans, 87-100 % of the 1024-px squares around a supervised pixel hold ink (Paris 4 0.94,
+  1667 0.90, 0139 0.98, 0009B 0.87, 0814 1.00), so at P 1024 nearly every window now passes.
+- **Draw cells inside held-out boxes.** inkfly_cells marked every cell of a supervised tile's box. A window centred on a cell
+  inside an eval crop sees the target only as unknown there (`--exclude`). Cells wholly inside a held-out box are no longer
+  draw cells: Paris 4 lost 1.14 M of 8.54 M level-5 cells (13 %), 1667 0.35 of 2.83 M, 0139 0.11 of 1.55 M, 0814 88 of 48860.
+- **0841 and 0500P2 hold out every segment.** Their validation.zarr is 255 over the whole tifxyz footprint (99.6-99.7 % of the
+  mesh, 100 % of the supervised pixels). Elsewhere validation is a small subset of the supervision: 0.2-2.4 % of the area, 10-32 %
+  of the supervised pixels. So validation "exclude" leaves 0 supervised tiles there (15112 / 11687 with validation off) and no
+  draw index. The open data apparently marks these segments as validation whole. They should stay out of the ink weight; they
+  can serve as unseen-scroll ink evals. MAN5's hf labels hold no ink pixel in the supervised area (share 0.000).
+
+Footprint of one ink sampler at P 1024 (sampler only, 1 worker, 1 slot, 8 sources): 17.6 GB RSS. The pod arm A unit at 3 workers /
+3 slots peaked at 52 GB and OOM-killed itself and U2's run in the shared 175 GB cgroup (09:58 UTC).
+
 ## Sources that silently drop out: --strict-sources and relative-scale groups (2026-11-12, branch strictsrc-20261112)
 
 The u1 P 1024 restart (step 10453) ran its first 315 steps with no PHerc1667 windows (14.9 + 7.5 + 7.5 = 29.9% of the weight): the local

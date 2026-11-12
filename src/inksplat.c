@@ -1740,5 +1740,17 @@ int inkfly_cells(void *handle, int lev, const int64_t shape[3], uint8_t *bits) {
         int64_t a[3], b[3]; for (int d = 0; d < 3; d++) { a[d] = f->T[t].lo[d] / cs; b[d] = f->T[t].hi[d] / cs; if (a[d] < 0) a[d] = 0; if (b[d] >= shape[d]) b[d] = shape[d] - 1; }
         for (int64_t z = a[0]; z <= b[0]; z++) for (int64_t y = a[1]; y <= b[1]; y++) for (int64_t x = a[2]; x <= b[2]; x++) { uint8_t *q = &bits[((size_t)z * shape[1] + y) * shape[2] + x]; n += !*q; *q = 1; }
     }
+    /* cells wholly inside a held-out box are not draw cells: the target is unknown there (--exclude), so a window centred on one came
+       out with no known ink and was dropped as empty (Paris 4 under U2: 10 of 14 picked windows; its 16 eval crops sit where the labels
+       are densest). Cells straddling a box edge stay: their window reaches the known labels outside it */
+    size_t nx = 0;
+    for (int e = 0; e < f->c.nexcl; e++) {
+        const int64_t *bx = f->c.excl[e]; int64_t a[3], b[3]; int ok = 1;
+        for (int d = 0; d < 3; d++) { a[d] = (bx[d] + cs - 1) / cs; b[d] = (bx[d] + bx[3 + d]) / cs - 1; if (a[d] < 0) a[d] = 0; if (b[d] >= shape[d]) b[d] = shape[d] - 1; ok &= a[d] <= b[d]; }
+        if (!ok) continue;
+        for (int64_t z = a[0]; z <= b[0]; z++) for (int64_t y = a[1]; y <= b[1]; y++) for (int64_t x = a[2]; x <= b[2]; x++) { uint8_t *q = &bits[((size_t)z * shape[1] + y) * shape[2] + x]; nx += *q; *q = 0; }
+    }
+    if (f->c.nexcl) fprintf(stderr, "ink onfly: %zu of %zu level-%d draw cells lie inside the %d held-out boxes: dropped\n", nx, n, lev, f->c.nexcl);
+    n -= nx;
     return (int)(n > 2000000000 ? 2000000000 : n);
 }
