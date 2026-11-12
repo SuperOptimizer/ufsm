@@ -7,7 +7,7 @@ ARM=${1:?arm}; shift
 K=/workspace/ue; L=/workspace/latstore; H=$L/ufsm; CK=${CK:-/workspace/univI/u1b.ckpt}; TAG=${TAG:-u1}
 BL=${*:-PH1 PH2 PH3 HOLD J1 J5 J9 J13 J19 J23 J27 J32 C9 C18 C30 C52}
 mkdir -p $L/wb/bin; [ -e $L/wb/bin/ufsm ] || ln -s $(readlink -f $K/wb/bin/ufsm) $L/wb/bin/ufsm; [ -d $L/wb/ceil ] || cp -r $K/wb/ceil $L/wb/ceil
-export SITE=podlv K WB=$L/wb GPU=0 SLABS=0 REP=${REP:-0} THREADS=${THREADS:-16} UP=$H/build/ufsm CACHE=$K/cache NOLOCK=1 SHN=latstore-$TAG
+export SITE=podlv K WB=$L/wb GPU=0 SLABS=0 REP=${REP:-0} THREADS=${THREADS:-16} UP=${UPBIN:-$H/build/ufsm} CACHE=$K/cache NOLOCK=1 SHN=latstore-$TAG
 [ "${LATGRID:-1}" = 1 ] && export WZARGS=
 [ "$ARM" != ct ] && export LVROOT=${LVBASE:-$L}/$ARM
 for b in $BL; do BOXES=$b bash $H/scripts/latvol/pod_shared.sh bash $H/scripts/wbench/wbench.sh $CK $TAG-$ARM 2>&1 | tail -2; done

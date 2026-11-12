@@ -39,7 +39,7 @@ z2 *z2_open(store *s, const char *key, const char *cache_dir) {
     z2 *z = calloc(1, sizeof *z);
     z->s = s;
     z->key = strdup(key);
-    z->cache = cache_dir && !store_is_local(s) ? strdup(cache_dir) : nullptr;
+    z->cache = store_cache_dir(s, cache_dir);   /* (per root: a cache directory is never shared by two roots) */
     const json *shape = json_get(j, "shape"), *chunks = json_get(j, "chunks");
     const char *dt = json_str(json_get(j, "dtype"), "");
     if (!shape || shape->n != 3 || !chunks || chunks->n != 3 || strcmp(dt, "|u1")) { fail("%s: need 3-D |u1", key); json_free(j); z2_close(z); return nullptr; }

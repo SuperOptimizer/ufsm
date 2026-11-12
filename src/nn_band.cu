@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include "bandgpu.h"
 #include "band.h"
+#include "codes_pool.h"
 
 #define BG_CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { fprintf(stderr, "band gpu: %s (%s:%d)\n", cudaGetErrorString(e_), __FILE__, __LINE__); return -1; } } while (0)
 #define BINF 1e20f
@@ -234,7 +235,7 @@ __global__ void __launch_bounds__(256) k_ll_build(const bg_lchunk *__restrict__ 
 
 /* a pool of slot contexts (device buffers grown on demand, a stream each): a caller takes a free one and gives it back, so the
    block threads (new pthreads every shard) reuse the same few buffer sets */
-typedef struct { int init, busy; size_t cap, lcap; uint8_t *codes, *phase; int32_t *ie, *io; float *F, *Z; int32_t *S; int *V; cudaStream_t st;
+typedef struct { int init, busy; size_t cap, lcap, fcap; uint8_t *fine, *mid; uint8_t *codes, *phase; int32_t *ie, *io; float *F, *Z; int32_t *S; int *V; cudaStream_t st;
                  size_t bcap, ccap, scap; uint8_t *blob, *scr, *tag; bg_lchunk *ch; uint32_t *status, *hstatus; } bg_ctx;   /* (the codes decode: blob, chunk records, scratch) */
 enum { BG_MAXS = 16 };
 static bg_ctx g_ctx[BG_MAXS];
@@ -248,7 +249,7 @@ extern "C" void band_pair_gpu_free(void) {   /* every idle context's buffers (ca
     pthread_mutex_lock(&g_mu);
     for (int k = 0; k < BG_MAXS; k++) { bg_ctx &G = g_ctx[k]; if (!G.init || G.busy) continue;
         cudaFree(G.codes); cudaFree(G.phase); cudaFree(G.ie); cudaFree(G.io); cudaFree(G.F); cudaFree(G.Z); cudaFree(G.S); cudaFree(G.V);
-        cudaFree(G.blob); cudaFree(G.scr); cudaFree(G.tag); cudaFree(G.ch); cudaFree(G.status); cudaFreeHost(G.hstatus);
+        cudaFree(G.blob); cudaFree(G.scr); cudaFree(G.tag); cudaFree(G.ch); cudaFree(G.status); cudaFreeHost(G.hstatus); cudaFree(G.fine); cudaFree(G.mid);
         cudaStreamDestroy(G.st); memset(&G, 0, sizeof G); }
     cudaGetLastError(); pthread_mutex_unlock(&g_mu);
 }
@@ -336,21 +337,42 @@ extern "C" int band_pair_gpu(const uint8_t *codes, const int n[3], float rmax, u
 
 /* codes decoded on the device in batches of chunks (the scratch: 4 KB per 16^3 block, at most ~1 B per box voxel), the fields, the crop
    down into out */
-static int bg_codes_run(bg_ctx &G, const bg_lchunk *ch, int nch, const uint8_t *blob, size_t blob_n, const int n[3], const int lo[3], const int hi[3], float rmax,
-                        const int co[3], const int cn[3], uint8_t *out) {   /* rmax <= 0: the decoded codes of the crop instead (tests) */
-    const long nz = n[0], ny = n[1], nx = n[2], N = nz * ny * nx;
-    if (N >= (1L << 31)) return -1;
+/* the 2x codes pooling (codes_pool.h): one thread per coarse voxel of c (nz ny nx), its 2^3 children in f (2nz 2ny 2nx) */
+__constant__ float c_cpT[4 * CP_P];
+static int g_cpT_dev[64];
+__global__ void k_codes_pool2(const uint8_t *__restrict__ f, int nz, int ny, int nx, uint8_t *__restrict__ c) {
+    const long i = (long)blockIdx.x * blockDim.x + threadIdx.x; if (i >= (long)nz * ny * nx) return;
+    const int a = (int)(i / ((long)ny * nx)), b = (int)((i / nx) % ny), x = (int)(i % nx); const long fy = 2L * ny, fx = 2L * nx;
+    uint8_t v[8];
+    for (int q = 0; q < 8; q++) v[q] = f[((2L * a + (q >> 2 & 1)) * fy + 2L * b + (q >> 1 & 1)) * fx + 2L * x + (q & 1)];
+    c[i] = cp_pool8(v, c_cpT);
+}
+static int bg_codes_run(bg_ctx &G, const bg_lchunk *ch, int nch, const uint8_t *blob, size_t blob_n, const int nf[3], const int lo[3], const int hi[3], int pool,
+                        float rmax, const int co[3], const int cn[3], uint8_t *out) {   /* rmax <= 0: the (pooled) codes of the crop instead (tests) */
+    if (pool < 0 || pool > 3) return -1;
+    const int n[3] = {nf[0] >> pool, nf[1] >> pool, nf[2] >> pool};
+    if ((n[0] << pool) != nf[0] || (n[1] << pool) != nf[1] || (n[2] << pool) != nf[2]) return -1;
+    const long nz = n[0], ny = n[1], nx = n[2], N = nz * ny * nx, NF = N << (3 * pool);
+    if (NF >= (1L << 31)) return -1;
     BG_CK(cudaSetDevice(g_dev));
     const long Lmax = nz > ny ? nz : ny, nlines = (nz * nx > ny * nx ? nz * nx : ny * nx), lc = bg_lines(N, Lmax, nlines);
     if (bg_alloc(G, N, Lmax, lc)) return -1;
-    long cbat = N / (2L << 20); if (cbat < 8) cbat = 8; if (cbat > nch) cbat = nch > 0 ? nch : 1;
+    if (pool && (size_t)NF > G.fcap) {   /* the base codes (NF) and one pooling's ping-pong buffer (NF / 8) */
+        cudaFree(G.fine); cudaFree(G.mid); G.fine = G.mid = nullptr; G.fcap = 0;
+        BG_CK(cudaMalloc(&G.fine, NF)); BG_CK(cudaMalloc(&G.mid, NF / 8)); G.fcap = NF;
+    }
+    if (pool) { int dv = 0; cudaGetDevice(&dv); if (dv >= 0 && dv < 64 && !__atomic_load_n(&g_cpT_dev[dv], __ATOMIC_ACQUIRE)) {
+        float T[4 * CP_P]; cp_tables_init(T); BG_CK(cudaMemcpyToSymbol(c_cpT, T, sizeof T)); __atomic_store_n(&g_cpT_dev[dv], 1, __ATOMIC_RELEASE); } }
+    uint8_t *dec = pool ? G.fine : G.codes;   /* the decode target: the base codes */
+    const long DZ = nf[0], DY = nf[1], DX = nf[2], DN = NF;
+    long cbat = DN / (2L << 20); if (cbat < 8) cbat = 8; if (cbat > nch) cbat = nch > 0 ? nch : 1;
     if (blob_n + 64 > G.bcap) { cudaFree(G.blob); G.blob = nullptr; BG_CK(cudaMalloc(&G.blob, blob_n + 64)); G.bcap = blob_n + 64; }
     if ((size_t)nch > G.ccap) { cudaFree(G.ch); cudaFree(G.status); cudaFreeHost(G.hstatus); G.ch = nullptr; G.status = nullptr; G.hstatus = nullptr;
         BG_CK(cudaMalloc(&G.ch, (size_t)nch * sizeof(bg_lchunk))); BG_CK(cudaMalloc(&G.status, (size_t)nch * 32 * 4)); BG_CK(cudaHostAlloc(&G.hstatus, (size_t)nch * 32 * 4, cudaHostAllocPortable)); G.ccap = nch; }
     if ((size_t)cbat > G.scap) { cudaFree(G.scr); cudaFree(G.tag); G.scr = G.tag = nullptr; BG_CK(cudaMalloc(&G.scr, (size_t)cbat * 512 * 4096)); BG_CK(cudaMalloc(&G.tag, (size_t)cbat * 512)); G.scap = cbat; }
     cudaEvent_t ev[6]; const int tim = g_timing; if (tim) for (int k = 0; k < 6; k++) cudaEventCreate(&ev[k]);
     if (tim) cudaEventRecord(ev[0], G.st);
-    BG_CK(cudaMemsetAsync(G.codes, 0, N, G.st));
+    BG_CK(cudaMemsetAsync(dec, 0, DN, G.st));
     if (nch) {
         BG_CK(cudaMemcpyAsync(G.blob, blob, blob_n, cudaMemcpyHostToDevice, G.st)); BG_CK(cudaMemsetAsync(G.blob + blob_n, 0, 64, G.st));
         BG_CK(cudaMemcpyAsync(G.ch, ch, (size_t)nch * sizeof(bg_lchunk), cudaMemcpyHostToDevice, G.st));
@@ -358,11 +380,17 @@ static int bg_codes_run(bg_ctx &G, const bg_lchunk *ch, int nch, const uint8_t *
         for (long c0 = 0; c0 < nch; c0 += cbat) {
             const int m = (int)(nch - c0 < cbat ? nch - c0 : cbat);
             k_ll_sub<<<m, 32, 0, G.st>>>(G.ch + c0, G.blob, G.scr, G.tag, G.status + c0 * 32);
-            k_ll_build<<<(unsigned)m * 512u, 256, 0, G.st>>>(G.ch + c0, G.blob, G.scr, G.tag, (int)nz, (int)ny, (int)nx, l3, h3, G.codes);
+            k_ll_build<<<(unsigned)m * 512u, 256, 0, G.st>>>(G.ch + c0, G.blob, G.scr, G.tag, (int)DZ, (int)DY, (int)DX, l3, h3, dec);
         }
         BG_CK(cudaGetLastError());
         BG_CK(cudaMemcpyAsync(G.hstatus, G.status, (size_t)nch * 32 * 4, cudaMemcpyDeviceToHost, G.st));
     }
+    for (int p = pool; p > 0; p--) {   /* fine -> mid -> fine ... the last into G.codes */
+        const uint8_t *src = (pool - p) % 2 ? G.mid : G.fine; uint8_t *dst = p == 1 ? G.codes : (pool - p) % 2 ? G.fine : G.mid;
+        const long cz = nz << (p - 1), cy = ny << (p - 1), cx = nx << (p - 1), CN = cz * cy * cx;
+        k_codes_pool2<<<(unsigned)((CN + 255) / 256), 256, 0, G.st>>>(src, (int)cz, (int)cy, (int)cx, dst);
+    }
+    if (pool) BG_CK(cudaGetLastError());
     if (tim) cudaEventRecord(ev[1], G.st);
     if (rmax > 0 && bg_fields(G, n, rmax, tim ? ev : nullptr)) return -1;
     if (rmax <= 0 && tim) for (int k = 2; k < 5; k++) cudaEventRecord(ev[k], G.st);
@@ -373,19 +401,23 @@ static int bg_codes_run(bg_ctx &G, const bg_lchunk *ch, int nch, const uint8_t *
     if (tim) cudaEventRecord(ev[5], G.st);
     BG_CK(cudaStreamSynchronize(G.st));
     if (tim) { float t[5]; for (int k = 0; k < 5; k++) cudaEventElapsedTime(&t[k], ev[k], ev[k + 1]);
-        fprintf(stderr, "band gpu codes: %ldx%ldx%ld, %d chunks: decode %.1f ms, parity 0 %.1f, parity 1 %.1f, pair %.1f, crop D2H %.1f\n", nz, ny, nx, nch, t[0], t[1], t[2], t[3], t[4]);
+        fprintf(stderr, "band gpu codes: %ldx%ldx%ld (pool %d), %d chunks: decode %.1f ms, parity 0 %.1f, parity 1 %.1f, pair %.1f, crop D2H %.1f\n", nz, ny, nx, pool, nch, t[0], t[1], t[2], t[3], t[4]);
         for (int k = 0; k < 6; k++) cudaEventDestroy(ev[k]); }
     for (long q = 0; q < (long)nch * 32; q++) if (!G.hstatus[q]) return 1;
     return 0;
 }
-extern "C" int band_pair_gpu_codes(const bg_lchunk *ch, int nch, const uint8_t *blob, size_t blob_n, const int n[3], const int lo[3], const int hi[3],
-                                   float rmax, const int crop_o[3], const int crop_n[3], uint8_t *out) {
+extern "C" int band_pair_gpu_codes_pool(const bg_lchunk *ch, int nch, const uint8_t *blob, size_t blob_n, const int n[3], const int lo[3], const int hi[3],
+                                        int pool, float rmax, const int crop_o[3], const int crop_n[3], uint8_t *out) {
     int k = -1;
     pthread_mutex_lock(&g_mu);
     for (;;) { for (int q = 0; q < g_slots; q++) if (!g_ctx[q].busy) { k = q; break; } if (k >= 0) break; pthread_cond_wait(&g_cv, &g_mu); }
     g_ctx[k].busy = 1; pthread_mutex_unlock(&g_mu);
-    const int rc = bg_codes_run(g_ctx[k], ch, nch, blob, blob_n, n, lo, hi, rmax, crop_o, crop_n, out);
+    const int rc = bg_codes_run(g_ctx[k], ch, nch, blob, blob_n, n, lo, hi, pool, rmax, crop_o, crop_n, out);
     if (rc < 0) cudaGetLastError();
     pthread_mutex_lock(&g_mu); g_ctx[k].busy = 0; pthread_cond_signal(&g_cv); pthread_mutex_unlock(&g_mu);
     return rc;
+}
+extern "C" int band_pair_gpu_codes(const bg_lchunk *ch, int nch, const uint8_t *blob, size_t blob_n, const int n[3], const int lo[3], const int hi[3],
+                                   float rmax, const int crop_o[3], const int crop_n[3], uint8_t *out) {
+    return band_pair_gpu_codes_pool(ch, nch, blob, blob_n, n, lo, hi, 0, rmax, crop_o, crop_n, out);
 }

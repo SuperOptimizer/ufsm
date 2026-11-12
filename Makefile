@@ -416,6 +416,9 @@ suite-bins: $(B)/test_ink_mil_check
 $(B)/test_ink_splat: tests/test_ink_splat.c $(OBJ) $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 suite-bins: $(B)/test_ink_splat
+$(B)/test_ink_pool: tests/test_ink_pool.c $(OBJ) $(B)/nn.o $(B)/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
+suite-bins: $(B)/test_ink_pool
 
 $(B)/test_imgops: tests/test_imgops.c tests/test_imgops_expected.h $(B)/imgops.o $(B)/jpegpar.o $(B)/tiffw.o $(B)/tiff.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_imgops.c $(B)/imgops.o $(B)/jpegpar.o $(B)/tiffw.o $(B)/tiff.o -o $@ $(LDLIBS)

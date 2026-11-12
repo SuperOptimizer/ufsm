@@ -13,6 +13,9 @@ void store_close(store *s);
 int store_is_local(const store *s);
 void store_set_bearer(store *s, const char *token);   /* Authorization: Bearer <token> on every request */
 const char *store_root(const store *s);
+/* the chunk cache directory for this store under cache_dir: cache_dir itself for the root it belongs to (<cache_dir>/.root), a per-root
+   subdirectory for any other root, nullptr for local stores (store.c). malloc'd. */
+char *store_cache_dir(const store *s, const char *cache_dir);
 
 /* Size of an object in bytes; -2 if missing, -1 on error. Permission failures are errors. */
 int64_t store_size(store *s, const char *key);
