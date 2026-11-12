@@ -273,6 +273,20 @@ On the desk the card is the limit:
 - the reader waits 1.3 - 4.8 s for free slots (it is ahead).
 A whole Paris4 level 2 at 0.50 Gvox/s is ~17 min a card for 5 heads + fit.
 
+The fit writer's staging ring (UFSM_PRED_FIT_NBUF; same box, desk GPU 0 exclusive, two repeats each):
+
+| buffers | fit-writer wait | loop wall | GPU |
+|---|---|---|---|
+| 2 | 4.04 / 4.05 s | 8.33 / 8.30 s | 6.8 s |
+| 4 (the default now) | 0.00 / 0.00 s | 8.18 / 8.16 s | 6.8 s |
+| 8 | 0.00 s | 8.65 s | 6.8 s |
+
+- The wait is gone with 4 buffers, but it was the main thread queued ahead of a busy GPU, not an idle GPU: the loop gains 0.14 s.
+- The writer's copy waits stay at 4.7 s (the chunk copies behind the heads' shard copies on the offload stream; off the critical path now).
+- Elapsed varies by +-4 s between identical runs (start-up / exit), so loop wall is the measure.
+- The fields are identical for 2, 4 and 8 buffers (here, and in test_predict_heads with 1 MB planes).
+- On the desk the loop is the GPU: trunk ~3.9 s, 4 more heads +1.0 s, the fit fields +1.9 s. Loop wall minus GPU is 1.4 s.
+
 What would make it smaller:
 - the shifted regions: each block upsamples the winding pair and runs the stem on 3 more regions, 2/3 of the stem work. A window-wide
   pass that keeps the winding pair's fp16 logits (4 B a voxel) would remove that.

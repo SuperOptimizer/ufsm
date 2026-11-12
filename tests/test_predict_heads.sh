@@ -61,6 +61,9 @@ BX=(--box 8,16,24,240,232,224)
 "$U" predict s/last.ckpt fx ct f4 "${P[@]}" "${BX[@]}" --fit-zarr f4z --no-out 1 > f4.log 2>&1 || fail "predict --fit-zarr off-grid box ($D/f4.log)"
 UFSM_PRED_FIT_FUSED=0 "$U" predict s/last.ckpt fx ct f5 "${P[@]}" "${BX[@]}" --fit-zarr f5z --no-out 1 > f5.log 2>&1 || fail "predict --fit-zarr off-grid box, plane path ($D/f5.log)"
 cmpf f4z f5z
+# the fit writer's staging ring (UFSM_PRED_FIT_NBUF 2 / 8 against the default 4; 1 MB planes: many chunks a window) writes the same fields
+for nbf in 2 8; do UFSM_PRED_FIT_NBUF=$nbf UFSM_PRED_FIT_PLANES_MB=1 "$U" predict s/last.ckpt fx ct fn$nbf "${P[@]}" --fit-zarr fn${nbf}z --no-out 1 > fn$nbf.log 2>&1 || fail "predict --fit-zarr, ring $nbf ($D/fn$nbf.log)"
+                  cmpf f2z fn${nbf}z; done
 # (1b) the GPU pyramid (each level-0 shard pooled on the device, levels >= 1 encoded from the pieces) against the CPU pyramid (each level
 #      decoded back and pooled): at q 0 the same bytes, shard 128 (pieces below a chunk, gathered raw) and 256 (level 1 encoded at once)
 for sh in 128 256; do

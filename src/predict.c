@@ -524,13 +524,16 @@ static int ffz_flush(z3w *const zw[FFZ_MAXP], uint8_t *const sl[FFZ_MAXP], int64
 
 /* --fit-zarr host side off the main thread: per window chunk the device fields (11 B per cell, 1.5 GB for a 512^3 interior at
    --fit-h 1) go to pinned memory on the offload stream; one thread waits for each copy, scatters it into the slab buffers and
-   flushes slabs in queue order (both used to run on the main thread while the GPU idled). Two staging buffers. */
+   flushes slabs in queue order (both used to run on the main thread while the GPU idled). nb staging buffers (UFSM_PRED_FIT_NBUF, default
+   4, at most FFW_NB; 2 before 2026-11-12, when the main loop waited ~4 s a box for one: the chunk copies queue on the offload stream
+   behind the heads' shard copies, so the main thread stalled before enqueueing the next finalize). */
+enum { FFW_NB = 8 };
 typedef struct { int kind, b, c1, c2, nz, ny, nx; int64_t cz, slab; size_t nl; int q0, q1, y0, y1; } ffw_job;   /* kind 0: chunk copy, 1: slab flush (the rows
                                                                                                                    left, then reset), 2: rows q0..q1 x y0..y1 */
 #define FFW_Q 256
 typedef struct {
-    pthread_mutex_t mu; pthread_cond_t cv; ffw_job q[FFW_Q]; int qh, qn, stop, busy[2]; atomic_int fail;
-    void *evs[2], *evd[2]; uint8_t *h[2];
+    pthread_mutex_t mu; pthread_cond_t cv; ffw_job q[FFW_Q]; int qh, qn, stop, busy[FFW_NB], nb; atomic_int fail;
+    void *evs[FFW_NB], *evd[FFW_NB]; uint8_t *h[FFW_NB];
     z3w **zw; uint8_t **sl; const int *F; int FS, FZ, gpu;
     uint8_t *done;   /* the current slab's written field-shard rows [FZ / FS][ny] */
     ffring rg;       /* the slab's layout (a ring of rows with row flushes) */
@@ -607,7 +610,7 @@ static void ffw_push(ffw_t *W, ffw_job j) {
 static int ffw_acquire(ffw_t *W) {   /* a free staging buffer (its previous copy scattered) */
     pthread_mutex_lock(&W->mu);
     int b;
-    for (;;) { b = !W->busy[0] ? 0 : !W->busy[1] ? 1 : -1; if (b >= 0) break; pthread_cond_wait(&W->cv, &W->mu); }
+    for (;;) { b = -1; for (int k = 0; k < W->nb && b < 0; k++) if (!W->busy[k]) b = k; if (b >= 0) break; pthread_cond_wait(&W->cv, &W->mu); }
     W->busy[b] = 1;
     pthread_mutex_unlock(&W->mu);
     return b;
@@ -1995,14 +1998,15 @@ static int predict_one(int argc, char **argv) {
                   if ((size_t)ffzc > (czc ? czc : 1)) ffzc = (int)(czc ? czc : 1);
               }
               ffwn = (size_t)ffzc * pc; }
-            ffacc = nn_malloc(ffna * ffwn * 4); ff8d = nn_malloc(2 * (size_t)FFZ_MAXP * ffwn); ff8h = nn_host_alloc(2 * (size_t)FFZ_MAXP * ffwn);
+            ffacc = nn_malloc(ffna * ffwn * 4); ffw.nb = getenv("UFSM_PRED_FIT_NBUF") ? atoi(getenv("UFSM_PRED_FIT_NBUF")) : 4; if (ffw.nb < 2) ffw.nb = 2; if (ffw.nb > FFW_NB) ffw.nb = FFW_NB;
+            ff8d = nn_malloc((size_t)ffw.nb * FFZ_MAXP * ffwn); ff8h = nn_host_alloc((size_t)ffw.nb * FFZ_MAXP * ffwn);
             if (ffw4d && !(ffacc4 = nn_malloc(9 * ffwn * 4))) { fprintf(stderr, "predict: no memory for the fit-field window accumulator\n"); return 1; }   /* finalized on the device: 11 B per cell back,
                                                                                                                   two staging buffers (the fit writer thread) */
             if (!ffacc || !ff8d || !ff8h) { fprintf(stderr, "predict: no memory for the fit-field window accumulator\n"); return 1; }
             ffw.zw = ffzw; ffw.sl = ffsl; ffw.F = ffF; ffw.FS = FFS; ffw.FZ = FZ; ffw.gpu = gpu;
             ffw.done = calloc((size_t)(FZ / FFS) * ((ffF[1] + FFS - 1) / FFS), 1);
             if (!ffw.done) { fprintf(stderr, "predict: out of memory\n"); return 1; }
-            for (int b = 0; b < 2; b++) { ffw.h[b] = ff8h + (size_t)b * FFZ_MAXP * ffwn; ffw.evs[b] = nn_event_create(); ffw.evd[b] = nn_event_create(); }
+            for (int b = 0; b < ffw.nb; b++) { ffw.h[b] = ff8h + (size_t)b * FFZ_MAXP * ffwn; ffw.evs[b] = nn_event_create(); ffw.evd[b] = nn_event_create(); }
             pthread_mutex_init(&ffw.mu, nullptr); pthread_cond_init(&ffw.cv, nullptr); atomic_store(&ffw.fail, 0);
             { long nc = ufsm_ncpu(); ffw.rnt = nc > 2 ? (int)(nc / 2) : 1; }
             if (pthread_create(&ffw_th, nullptr, ffw_main, &ffw) || pthread_create(&ffw.rth, nullptr, ffw_rows, &ffw)) { fprintf(stderr, "predict: cannot start the fit writer\n"); return 1; }
