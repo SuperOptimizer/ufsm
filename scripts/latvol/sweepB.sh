@@ -22,13 +22,19 @@ for run in "$@"; do a=${run%%:*}; seed=3; [ "$run" != "$a" ] && seed=${run##*:};
       nice -n 10 $U latvol $L/klt1.lcb $M $P4 $root/$P4 --levels 2 --threads ${ETH:-16} --cache $CTCACHE $args > $BB/log/enc_$a.log 2>&1 || { echo "encode $a failed"; continue; }
       touch $root/$P4/.done; tr '\r' '\n' < $BB/log/enc_$a.log | grep -aE 'GB' | tail -1 | cut -c1-300; fi; fi
   # 2. the sources: Paris 4 June / July at level 2 from that root
-  python3 -I - $root $BB/src-$a.json <<'PY'
+  python3 -I - $root $BB/src-$a.json $BB/cache-$a <<'PY'
 import json, sys
 S = json.load(open('/workspace/univA/sources-u2pod.json')); out = []
 for s in S['sources']:
     if s['name'] in ('PHercParis4-june', 'PHercParis4-july'): s['root'] = sys.argv[1]; s['min_level'] = s['max_level'] = 2; out.append(s)
+# the chunk cache: its path has no root in it (zarr3.c cache_path), so a re-encoded arm must never share the kit's cache with the mirror.
+# An arm's root is a local tree (z3_open gives local stores no cache at all); on top of that its sources name a cache directory of
+# its own, so the kit's cache path is not in the arm's inputs. Only the q2 control (the mirror itself) keeps the kit's cache.
+if not sys.argv[1].startswith('http'): S['cache'] = sys.argv[3]
 S['sources'] = out; json.dump(S, open(sys.argv[2], 'w'), indent=1)
+print('sources %s: root %s, cache %s' % (sys.argv[2], sys.argv[1], S.get('cache')))
 PY
+  [ $a != q2 ] && { mkdir -p $BB/cache-$a; grep -c '/workspace/univ/cache' $BB/src-$a.json | sed "s|^|arm $a: references to the kit's chunk cache in its sources: |"; }
   # 3. the finetune
   if ! grep -q "^done" $o.state 2>/dev/null; then
     read -r -a A < /workspace/univA/u2.args; ARGS=($BB/src-$a.json); i=1
@@ -57,6 +63,7 @@ PY
       nf=$((nf + 1)); [ $nf -ge 2 ] && { echo "run $r failed rc $rc (see $o.log)"; break; }; sleep 20
     done
   fi
+  [ $a != q2 ] && echo "arm $a: files in its own cache dir after the run: $(find $BB/cache-$a -type f 2>/dev/null | wc -l) (a local root uses none)"
   [ $a != q2 ] && [ -n "$a" ] && [ "${KEEPCT:-0}" != 1 ] && rm -rf "$BB/ct/$a"
   grep -q "^done" $o.state 2>/dev/null || continue
   # 4. the scores: fed the q2 mirror, and fed the run's own codec (the boxes' regions re-encoded from the mirror)
