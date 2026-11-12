@@ -207,6 +207,11 @@ void nn_lat_input_q(const void *q, const void *x, int d, int h, int w, const flo
 /* predict --latents: the CT window rebuilt from a window of stored cells (nn_lat.cu lat_synth_k: 1..255 in material cells, 0 in air
    cells), and a --lat-basis net's input straight from the cells with the radial channels from the axis offsets (lat_pred_in_q_k) */
 void nn_lat_synth_ct(const void *q, int C, const float *bas, float step_raw, int D, int W, uint8_t *ct);
+/* the same two input kernels on cells of `stride` bytes whose first C + 1 are the checkpoint's channels (a latvol array's cells, src/latvol.h:
+   the store may keep more axes than the network reads) */
+void nn_lat_input_qs(const void *q, int stride, const void *x, int d, int h, int w, const float *gain, int C, float step_raw, float mean, float isd, void *y);
+void nn_lat_pred_input_qs(const void *q, int stride, int D, int W, float mean, float isd, const float *dyo, const float *dxo, int axis,
+                          const float *gain, int C, float step_raw, void *y);
 void nn_lat_pred_input_q(const void *q, int D, int W, float mean, float isd, const float *dyo, const float *dxo, int axis,
                          const float *gain, int C, float step_raw, void *y);
 /* the guided head (unet_cfg.lat_guide): see nn_lat.cu lat_guide_k */

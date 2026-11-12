@@ -275,11 +275,12 @@ static batch alloc_batch(const sample_cfg *c) {
     for (int j = 0; j < 4; j++) b.aux[j] = j < c->aux_n ? halloc((size_t)c->B * p3) : nullptr;
     b.inkb = c->ink_bits ? halloc((size_t)c->B * p3 / 8) : nullptr; b.ink_it = c->ink_bits ? calloc((size_t)c->B, sizeof *b.ink_it) : nullptr;
     b.mil = c->ink_mil ? calloc((size_t)c->B, sizeof *b.mil) : nullptr; b.nmil = c->ink_mil ? calloc((size_t)c->B, sizeof *b.nmil) : nullptr;
+    b.mil0 = c->ink_mil ? calloc((size_t)c->B, sizeof *b.mil0) : nullptr; b.nmil0 = c->ink_mil ? calloc((size_t)c->B, sizeof *b.nmil0) : nullptr;
     b.emb = c->emb_ch ? halloc((size_t)c->B * c->emb_ch * (size_t)(PZ(c) / c->emb_div) * (c->P / c->emb_div) * (c->P / c->emb_div)) : nullptr;
     return b;
 }
 
-static void free_batch(batch *b, int B) { if (b->mil) { for (int q = 0; q < B; q++) free(b->mil[q]); free(b->mil); free(b->nmil); } if (b->w4r) { for (int q = 0; q < B; q++) { w4runs *r = (w4runs *)b->w4r + q; free(r->off); free(r->ro); free(r->cb); } free(b->w4r); } if (b->ink) hfree(b->ink); for (int j = 0; j < 4; j++) if (b->aux[j]) hfree(b->aux[j]); if (b->inkb) hfree(b->inkb); free(b->ink_it); if (b->ct8) hfree(b->ct8); if (b->aug) hfree(b->aug); if (b->emb) hfree(b->emb); if (b->xv) hfree(b->xv); free(b->vok); free(b->chid); free(b->chidx); free(b->choff); if (b->w4) hfree(b->w4); if (b->wcomp) hfree(b->wcomp); if (b->tm) hfree(b->tm); if (b->rad) hfree(b->rad); if (b->axr) hfree(b->axr); if (b->pap) hfree(b->pap); if (b->wind) hfree(b->wind); if (b->band) hfree(b->band); if (b->side) hfree(b->side); if (b->pm) hfree(b->pm); if (b->x) hfree(b->x); if (b->x16) hfree(b->x16); if (b->t) hfree(b->t); if (b->m) hfree(b->m); hfree(b->w); free(b->src); free(b->level); free(b->um); free(b->corner); if (b->sheet) { sheet_batch_free(b->sheet[0]); free(b->sheet); } }
+static void free_batch(batch *b, int B) { if (b->mil) { for (int q = 0; q < B; q++) { free(b->mil[q]); free(b->mil0[q]); } free(b->mil); free(b->nmil); free(b->mil0); free(b->nmil0); } if (b->w4r) { for (int q = 0; q < B; q++) { w4runs *r = (w4runs *)b->w4r + q; free(r->off); free(r->ro); free(r->cb); } free(b->w4r); } if (b->ink) hfree(b->ink); for (int j = 0; j < 4; j++) if (b->aux[j]) hfree(b->aux[j]); if (b->inkb) hfree(b->inkb); free(b->ink_it); if (b->ct8) hfree(b->ct8); if (b->aug) hfree(b->aug); if (b->emb) hfree(b->emb); if (b->xv) hfree(b->xv); free(b->vok); free(b->chid); free(b->chidx); free(b->choff); if (b->w4) hfree(b->w4); if (b->wcomp) hfree(b->wcomp); if (b->tm) hfree(b->tm); if (b->rad) hfree(b->rad); if (b->axr) hfree(b->axr); if (b->pap) hfree(b->pap); if (b->wind) hfree(b->wind); if (b->band) hfree(b->band); if (b->side) hfree(b->side); if (b->pm) hfree(b->pm); if (b->x) hfree(b->x); if (b->x16) hfree(b->x16); if (b->t) hfree(b->t); if (b->m) hfree(b->m); hfree(b->w); free(b->src); free(b->level); free(b->um); free(b->corner); if (b->sheet) { sheet_batch_free(b->sheet[0]); free(b->sheet); } }
 
 /* Level choice for a source: restrict cfg.level_p to levels the CT has and every target of the source
    can provide (pyramid: same level; regions: levels 0..1). Returns -1 if nothing is usable. */
@@ -2609,7 +2610,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
         if (aux_read(s, ch, l, o, n, b->aux[j] + (size_t)i * p3, p3, crushed || torn || delam || curved)) return -1;
     }
     if (b->mil) {   /* --ink-mil: the window's rays from its onfly ink target (level L = the target's, or the next: scaled), outside every held-out box + guard */
-        b->nmil[i] = 0;
+        b->nmil[i] = b->nmil0[i] = 0;
         int ich = -1; for (int q = 0; q < NTG && ich < 0; q++) if (s->ink_fly[q]) ich = q;   /* (the source's onfly ink target, whichever channel holds it) */
         const int L = ich >= 0 ? s->tgt_min_level[ich] : 0;
         if (inkfly_rays && ich >= 0 && l >= L && l <= L + 1 && !crushed && !torn && !delam && !curved) {
@@ -3195,7 +3196,9 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
             if (spatial.active) sample_warp_ink(src, bi, P, y.perm, y.flip, &spatial); else sym_u8(src, bi, Pz, P, y);
         }
     }
-    if (b->mil && b->nmil[i]) {   /* --ink-mil: the rays through the window's symmetry and warp */
+    if (b->mil && b->nmil[i]) {   /* --ink-mil: the rays through the window's symmetry and warp (the source-grid list kept for --replay: its windows re-draw both) */
+        const size_t nb = (size_t)b->nmil[i] * sizeof(inkray); free(b->mil0[i]); b->mil0[i] = malloc(nb); if (!b->mil0[i]) abort();
+        memcpy(b->mil0[i], b->mil[i], nb); b->nmil0[i] = b->nmil[i];
         inkray *rs = b->mil[i]; size_t k2 = (size_t)sample_mil_map(rs, b->nmil[i], y.perm, y.flip, &spatial, Pz, P);
         if (c->mil_max > 0 && k2 > (size_t)c->mil_max) { for (int k = 0; k < c->mil_max; k++) rs[k] = rs[(size_t)k * k2 / c->mil_max]; k2 = c->mil_max; }   /* (an even subsample: the device buffers' cap) */
         b->nmil[i] = (int)k2;
@@ -3698,6 +3701,12 @@ static void replay_window(sampler *sp, batch *b, int i, int rep, uint8_t **scr) 
         if (c->affine_p > 0 && c->scan.strength > 0 && runif(&r) < c->affine_p) spatial_aug_affine(&sa, rnext(&r), c->affine_aniso * c->scan.strength, c->affine_shear * c->scan.strength);
     }
     const spatial_aug *ap = geom && sa.active ? &sa : nullptr;
+    if (geom && b->mil && b->nmil0[i]) {   /* --ink-mil: the rays from the source grid through the replay's symmetry and warp (the planes go the same way) */
+        inkray *rs = b->mil[i]; memcpy(rs, b->mil0[i], (size_t)b->nmil0[i] * sizeof(inkray));
+        size_t k2 = (size_t)sample_mil_map(rs, b->nmil0[i], y.perm, y.flip, ap, Pz, P);
+        if (c->mil_max > 0 && k2 > (size_t)c->mil_max) { for (int k = 0; k < c->mil_max; k++) rs[k] = rs[(size_t)k * k2 / c->mil_max]; k2 = c->mil_max; }
+        b->nmil[i] = (int)k2;
+    }
     rad_record(rec, o, Pz, P, hasax, y, cyz, cxz, ap);
     if (c->axis_rec > 0) axis_record(b->axr + (size_t)i * SAMPLE_AXR(Pz > P ? Pz : P), o, Pz, P, hasax, y, cyz, cxz, ap, c->axis_rec);
     b->um[i] = (float)(s->um * (double)(1 << l) * (ap ? sa.scale * cbrt(sa.det) : 1.0));
@@ -3844,6 +3853,11 @@ sampler *sampler_start(sources *S, const sample_cfg *cfg) {
         for (int l = s->min_level < 0 ? 0 : s->min_level; l < MAXLEV; l++) if (level_on(sp, s, i, l, region_ch) && (region_ch < 0 || l <= 1) && level_ok(sp, s, i, l, region_ch)) eligible = 1;
         if (eligible && s->weight > 0 && label_res_check(sp, s, i, region_ch)) { free(sp->cum); free(sp->lvl_ok); free(sp); return nullptr; }
         if (!isfinite(s->weight) || s->weight < 0) { fprintf(stderr, "sampler: invalid source weight: %s\n", s->name); free(sp->cum); free(sp->lvl_ok); free(sp); return nullptr; }
+        if (!eligible && s->weight > 0 && cfg->strict_sources && !cfg->holdout) {
+            fprintf(stderr, "sampler: %s excluded: no training patch fits %dx%dx%d and the enabled levels: fatal (--strict-sources 1; check its CT levels with `ufsm info`, min/max_level, the rungs, the holdout boxes)\n",
+                    s->name, PZ(cfg), cfg->P, cfg->P);
+            free(sp->cum); free(sp->lvl_ok); free(sp); return nullptr;
+        }
         if (!eligible && s->weight > 0) fprintf(stderr, "sampler: %s excluded: no %s patch fits %dx%dx%d and the enabled levels\n", s->name, cfg->holdout ? "validation" : "training", PZ(cfg), cfg->P, cfg->P);
         acc += eligible ? s->weight : 0; sp->cum[i] = acc;
     }
