@@ -21,6 +21,10 @@ US=${US:-/vesuvius/ufsm/unroll/sched}
 gpu0busy() { local p m; while IFS=', ' read -r p m; do [ -n "$p" ] && [ "${m:-0}" -gt 200 ] || continue
     ps -o args= -p $p | grep -qE "${GPU0OK:-ufsm-fibd/}" || return 0; done < <(nvidia-smi --id=${GPU:-0} --query-compute-apps=pid,used_memory --format=csv,noheader,nounits); return 1; }
 perfopen() { local f; for f in $US/perf*.go; do [ -e "$f" ] && [ ! -e "${f%.go}.done" ] && return 0; done; return 1; }   # unrollperf2's windows: perfN.go without perfN.done
+# bench lock (lead 2026-11-12): every GPU 0 job also holds /tmp/gpu0-bench.lock for its duration (inkB's unroll ink runs and others flock it),
+# taken after the checks pass, then the GPU re-checked (someone may have started in between): gpulock / gpuunlock around each job
+gpulock() { while :; do gpu0free; exec 8> ${BLK:-/tmp/gpu0-bench.lock}; flock 8; gpu0busy || return 0; flock -u 8; exec 8>&-; sleep 30; done; }
+gpuunlock() { flock -u 8 2>/dev/null; exec 8>&- 2>/dev/null; }
 gpu0free() { until [ -e $US/p4rv.done ] && [ -e $US/perf2.done ] && [ -e $US/p4col.done ] && ! pgrep -f "$US/(rvside|p4rv|p1299|unrollperf)|unrollperf" > /dev/null \
     && ! perfopen && ! gpu0busy && sleep 30 && ! gpu0busy; do sleep 60; done; }
 log() { echo "$(date '+%m-%d %H:%M:%S') $*" | tee -a $LG; }
@@ -52,10 +56,10 @@ wcore() {   # wcore CKPT TAG STEP: wbench core p05x rows every WEVERY steps (STE
     log "$t: wbench rows $(($(wc -l < $WB/res/$t.tsv) - 1))"; fi
 }
 S=${1:-1000}; STEP=${STEP:-1000}
-for kv in ${BASECK:-}; do exec 9> $E/gpu0.lock; flock 9; gpu0free; wcore ${kv%%=*} ${kv#*=} 0; flock -u 9; done
+for kv in ${BASECK:-}; do exec 9> $E/gpu0.lock; flock 9; gpulock; wcore ${kv%%=*} ${kv#*=} 0; gpuunlock; flock -u 9; done
 while [ ! -e $E/watch.stop ]; do
   # the first snapshot at or after S (a run that starts its count elsewhere, e.g. from its init's step, is picked up too)
   until n=$(ls $SN 2>/dev/null | sed -n 's/^\([0-9]*\)\.ckpt$/\1/p' | awk -v s=$S '$1 >= s' | sort -n | head -1); [ -n "$n" ]; do [ -e $E/watch.stop ] && exit 0; sleep 60; done
   S=$n; sleep 60
-  exec 9> $E/gpu0.lock; flock 9; gpu0free; score $S; flock -u 9; S=$((S + STEP))
+  exec 9> $E/gpu0.lock; flock 9; gpulock; score $S; gpuunlock; flock -u 9; S=$((S + STEP))
 done
