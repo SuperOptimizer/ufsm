@@ -90,9 +90,9 @@ if has ink && [ "${INK:-1}" = 1 ] && [ -n "$INKP" ]; then   # INKP = ink3dext | 
     elif [ "$INKP" = heads ]; then lvi=${LV_INK:-1}; key=$(python3 -I -c "print(round($um * 2 ** $lvi, 3))")   # predict --heads ink: the latent-grid
       # multi-head path (fine stem rows + sub-cell placement as trained; the ink channel from the header), written to $v.h/ink, read through $v
       [ -e $v ] || ln -sfn $(basename $v).h/ink $v
-      [ -e $o/pred_$cr.done ] || lkg ${UP:-$U} predict $CK $M $ctk $v.h --um $um --level $lvi --box $(lbox $box $lvi) --full-grid 1 --resume 1 --heads ink --gpu $GPU --threads 6 --cache $WB/cache > $o/ink_$cr.log 2>&1 || { log "ink: $cr predict failed"; continue; }
+      [ -e $o/pred_$cr.done ] || lkg ${UP:-$U} predict $CK $M $ctk $v.h --um $um --level $lvi --box $(lbox $box $lvi) --full-grid 1 --levels 1 --resume 1 --heads ink --gpu $GPU --threads 6 --cache $WB/cache > $o/ink_$cr.log 2>&1 || { log "ink: $cr predict failed"; continue; }
     else lvi=${LV_INK:-1}; ch=${INKP#ch:}; key=$(python3 -I -c "print(round($um * 2 ** $lvi, 3))")
-      [ -e $o/pred_$cr.done ] || lkg ${UP:-$U} predict $CK $M $ctk $v --um $um --level $lvi --box $(lbox $box $lvi) --full-grid 1 --resume 1 --channel $ch --gpu $GPU --threads 6 --cache $WB/cache > $o/ink_$cr.log 2>&1 || { log "ink: $cr predict failed"; continue; }; fi
+      [ -e $o/pred_$cr.done ] || lkg ${UP:-$U} predict $CK $M $ctk $v --um $um --level $lvi --box $(lbox $box $lvi) --full-grid 1 --levels 1 --resume 1 --channel $ch --gpu $GPU --threads 6 --cache $WB/cache > $o/ink_$cr.log 2>&1 || { log "ink: $cr predict failed"; continue; }; fi
     touch $o/pred_$cr.done; [ $PO = 1 ] && continue
     if [ $vs = 1 ]; then gk=$(ls $g | grep -vE '^(segments|zarr.json)$' | head -1)
       $U ink-vscore --gt $g $gk --pred $v $key --box $box --level $lvi --row $cr --threads 8 2>> $o/vscore_$cr.log | grep -P "^$cr\t" >> $o/vscores.tsv; fi
