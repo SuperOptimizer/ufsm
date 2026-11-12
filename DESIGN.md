@@ -30,6 +30,7 @@ Three stale branches whose features master lacked, re-applied onto the current c
   - `png2jpg --size W,H | --size-like REF.tif` (bilinear resize first); its JPEG input was already in master (magic-byte detection,
     imgops' jpeg_read_rgb kept instead of the branch's copy).
   - `ink-ensemble --peak-cover F` (default 0.5: the least covered share of a `--peaks` window).
+
 ## The human ink targets on the fly, the derived-array chunk cache, and the villa ink recipe (2026-11-11, branch inkfly-20261111)
 
 **On the fly.** The stored splats of the section below (inkgt/gt) are now only the reference. Training reads the same bytes from a
