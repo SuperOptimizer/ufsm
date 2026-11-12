@@ -2862,7 +2862,7 @@ int cmd_train(int argc, char **argv) {
                         if (g_ink2) rows[g_ink2_ch] = dink;
                         w4map = dink >= 0 ? 5 : 4;   /* (4: the ink row fresh below: zero weights, the prior bias) */
                         if (g == 0) { fprintf(stderr, "init-from: unwrap2 donor by head: rows 0-10 kept"); if (g_rv == 2) fprintf(stderr, ", rv %d-%d <- donor %d-%d%s", g_rv_ch, g_rv_ch + 1, drv, drv + 1, drv < 0 ? " (none: fresh)" : "");
-                                      if (g_ink2) fprintf(stderr, ", ink %d <- %s", g_ink2_ch, dink >= 0 ? "the donor's ink row" : "fresh"); fprintf(stderr, ", rows %d-%d by position\n", LBASE, cfg.cout - 1); }
+                                      if (g_ink2) fprintf(stderr, ", ink %d <- %s", g_ink2_ch, dink >= 0 ? "the donor's ink row" : "fresh"); if (LBASE < cfg.cout) fprintf(stderr, ", rows %d-%d by position", LBASE, cfg.cout - 1); fprintf(stderr, "\n"); }
                     } else if (g_fibh && checkpoint_unwrap_version(init_from) == 2 && dc.cout == g_fib_ch) {   /* --fib-head from the same layout without it (u1): rows kept, the fibre rows fresh */
                         for (int co = 0; co < cfg.cout; co++) rows[co] = co < dc.cout ? co : -1;
                         w4map = 3;
