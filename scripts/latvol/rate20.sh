@@ -7,7 +7,7 @@
 #   encode   CPU only (--gpu -1), resumable per arm and scan; rates -> $SW/rates.tsv (arm scroll bytes voxels)
 #   score    one GPU window: rows TAG-ARM for orig + each arm (GPUS, two queues), then the paired table vs TAG-orig
 set -u
-MODE=${1:?encode|score}; H=$(cd "$(dirname "$0")/../.." && pwd); U=${ENC:-/home/forrest/ufsm-lvm/build/ufsm}; BASIS=/vesuvius/ufsm/v2/lat/codec/klt1.lcb
+MODE=${1:?encode|score}; H=${H:-$(cd "$(dirname "$0")/../.." && pwd)}; U=${ENC:-/home/forrest/ufsm-lvm/build/ufsm}; BASIS=/vesuvius/ufsm/v2/lat/codec/klt1.lcb
 SW=${SW:-/mnt/scratch/latvol/rate20}; mkdir -p $SW/log; WB=/vesuvius/ufsm/wbench
 BK=https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com; M=https://dl.ash2txt.org/community-uploads/forrest/volcomp
 BX=${BX:-PH1 PH2 PH3 HOLD J1 J9 J19 J27 C9 C18 C30 C52 139-5 139-2}
