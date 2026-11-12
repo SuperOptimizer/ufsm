@@ -226,6 +226,7 @@ static int g_gc;
    level, as for scans with no finer data; validation and predict always use it) */
 static int g_fstem, g_fs_n, g_fs_ch[16]; static float g_fs_drop = 0.25f;
 static float src_head_w(int si, int h) { return (si >= 0 && g_S && si < g_S->n ? g_S->src[si].head_w[h] : 1.f) * g_hmul[h]; }   /* the source's "heads" multiplier x --uw */
+static float g_ink_smooth;   /* --ink-smooth EPS (--ink-head): label smoothing of the ink BCE target, t (1 - eps) + eps / 2 (villa: 0.1) */
 static int g_unwrap, g_norm_ch, g_norm_s = 4; static float g_ink_lambda = 1.f, g_ink_dice = 0.f, g_norm_lambda = 1.f, g_dens_lambda = 1.f, g_dens_scale = 32.f;   /* --density-lambda: the density channel's BCE weight (default --normal-lambda) */
 static int g_dens_code; static float g_packed_w, g_packed_um = 120.f;   /* --density-code, --packed-weight, --packed-um (task unwrap) */
 static float g_ptrunc_tau, g_ptrunc_kappa = 0.5f; static int g_ptrunc_from = 5000, g_ptrunc_on;   /* --phase-trunc TAU [--phase-trunc-conf K] [--phase-trunc-from STEP]: the robust phase loss (nn_phase_trunc), on from STEP */
@@ -1062,7 +1063,7 @@ static void head_slab_pass(gpu_state *d, int pass) {
                 nn_loss_stats_acc(LGC(1), d->t + l3 + vb, d->pm + vb, d->w + 1, one, d->hs_ds + 5);
             } else nn_wind4_stats(LGC(g_w4_ch), LGC(g_w4_ch + 1), w4 + vb, wc + vb, d->sidem, ns, d->w4ds);
             FT("  s wind4 stats");
-            if (g_ink2) { nn_ink_targets(ink + vb, ns, d->inkt, d->inkm); nn_loss_stats_acc(LGC(g_ink2_ch), d->inkt, d->inkm, d->inkw, one, d->hs_ds + 5); }   /* --ink-head (the recto / ink v1 slots are free) */
+            if (g_ink2) { nn_ink_targets_smooth(ink + vb, ns, d->inkt, d->inkm, g_ink_smooth); nn_loss_stats_acc(LGC(g_ink2_ch), d->inkt, d->inkm, d->inkw, one, d->hs_ds + 5); }   /* --ink-head (the recto / ink v1 slots are free) */
             if (g_fibh) { FIBH_TARGETS(); FIBH_LOSS(0); }   /* --fib-head: the H / V masks (sums 74, 79), the direction (84) */
             float pw0 = 1.f, rw0 = 0.f; int u70 = -1; if (fuse) nn_loss_cfg_get(&pw0, &rw0, &u70);
             if (fside) nn_lat_fuse_stats(d->lgc, 1, qa, qb - qa, D / 4, H / 4, W / 4, z0, nz, g_side_ch, 2, 1, g_cout, d->x, st, sm, d->sidew, pw0, -1, d->hs_ds + 10, light);
@@ -1085,7 +1086,7 @@ static void head_slab_pass(gpu_state *d, int pass) {
         } else nn_wind4_grad(LGC(g_w4_ch), LGC(g_w4_ch + 1), w4 + vb, wc + vb, d->sidem, ns, d->w4fin, g_w4_lambda * src_head_w(si, SH_WIND4), LGC(g_w4_ch), LGC(g_w4_ch + 1));
         FT("  g wind4 grad");
         if (g_ink2) {   /* --ink-head: soft BCE over the known ink voxels, times --ink-lambda x the source's "ink_weight" */
-            nn_ink_targets(ink + vb, ns, d->inkt, d->inkm);
+            nn_ink_targets_smooth(ink + vb, ns, d->inkt, d->inkm, g_ink_smooth);
             nn_loss_grad_only(LGC(g_ink2_ch), d->inkt, d->inkm, d->inkw, one, 0.f, LGC(g_ink2_ch), d->iscratch);
             const float iw = g_ink_lambda * (si >= 0 && g_S && si < g_S->n ? (float)g_S->src[si].ink_weight : 1.f) * src_head_w(si, SH_INK);
             if (iw != 1.f) nn_loss_grad_scale(LGC(g_ink2_ch), ns, iw);
@@ -1783,7 +1784,7 @@ int cmd_train(int argc, char **argv) {
                         "       [--cover PLAN.json] [--cover-extend-from OLD_PLAN.json] [--cover-next-pass 1] [--stop-at STEP] [--ct-aug 0|1] [--symmetry-p 1] [--axis-jitter 0] [--limit-seconds 0]\n"
                         "       [--lr-floor 0 (the schedule ends at this fraction of the peak; modded-nanogpt 0.3)] [--wd-nonconv 0 (decay multiplier for GroupNorm, biases, head under Muon / ANVIL)]\n"
                         "       [--muon-c 1 (Muon-C: conv kernels polarised per Fourier frequency)] [--hyperball 1 (fixed weight / update norms)] [--hb-lr-mult 0.707 (Hyperball lr / Muon lr)]\n"
-                        "       [--trunk-lr-mult 1 (lr x F outside the attention stage; no stage: all but the head)] [--trunk-lr-steps N (x F only until step N)] [--ink-head 0|1 (task unwrap2: + the ink logit, channel 11; sources targets.ink prob254, sources ink_weight) --ink-lambda 1 --ink-bias -2 (warm start: the new row)] [--attn-dcoarse 0|1 (deformable: + the 2x pooled level)] [--attn-deform-init grid|normal]\n"
+                        "       [--trunk-lr-mult 1 (lr x F outside the attention stage; no stage: all but the head)] [--trunk-lr-steps N (x F only until step N)] [--ink-head 0|1 (task unwrap2: + the ink logit, channel 11; sources targets.ink prob254, sources ink_weight) --ink-lambda 1 --ink-bias -2 (warm start: the new row) --ink-smooth 0 (label smoothing eps)] [--attn-dcoarse 0|1 (deformable: + the 2x pooled level)] [--attn-deform-init grid|normal]\n"
                         "       [--recall W (recto: + W (1 - soft recall), gradient only)]\n"
                         "       [--dec-convs 2 (convs per decoder level, one value or a list; 1 = one conv, nnU-Net style)]\n"
                         "       [--deep-sup K (1^3 heads on decoder levels 1..K)] [--ds-weight 0.5 (level j: w^j)] [--ds-anneal 1 (weights -> 0 over the run)]\n"
@@ -1878,7 +1879,7 @@ int cmd_train(int argc, char **argv) {
         g_cout = g_unwrap2 ? 0 : 2;
         if (g_unwrap2) {
             g_w4_lambda = (float)atof(opt(argc,argv,"--wind4-lambda","1"));
-            g_ink2 = atoi(opt(argc,argv,"--ink-head","0"));   /* --ink-head 1: the ink logit as output channel 11 (the universal model) */
+            g_ink2 = atoi(opt(argc,argv,"--ink-head","0")); g_ink_smooth = (float)atof(opt(argc,argv,"--ink-smooth","0"));   /* --ink-head 1: the ink logit as output channel 11 (the universal model) */
             g_fibh_lambda = (float)atof(opt(argc,argv,"--fib-head","0")); g_fibh = g_fibh_lambda > 0; g_fd_r = atoi(opt(argc,argv,"--fib-dir-r","4"));   /* --fib-head L: the H / V fibre masks + direction (9 channels) */
             if (!(g_fibh_lambda >= 0) || g_fd_r < 2 || g_fd_r > 8 || (g_fibh && !strcmp(opt(argc,argv,"--split","0"),"z"))) { fprintf(stderr, "--fib-head L >= 0 (no --split), --fib-dir-r 2..8\n"); return 2; }
             g_rv = atoi(opt(argc,argv,"--rv","0"));

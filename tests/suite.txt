@@ -140,6 +140,7 @@ test_dinor                                     | gpu          |    60 | UFSM_TES
 test_dinor~full                                | gpu,slow     |   104 | ./$B/test_dinor
 test_dino_pts                                  |              |     1 | ./$B/test_dino_pts
 test_ink_splat                                 | gpu          |    10 | ./$B/test_ink_splat
+test_ink_mil                                   | gpu          |     2 | ./$B/test_ink_mil
 test_pyports                                   |              |     1 | ./$B/test_pyports
 test_edt                                       |              |     2 | ./$B/test_edt
 test_volcomp                                   |              |     1 | ./$B/test_volcomp

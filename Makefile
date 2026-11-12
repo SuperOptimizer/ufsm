@@ -382,6 +382,9 @@ $(B)/test_distill: tests/test_distill.c $(B)/sample_emb.o $(B)/embz.o $(B)/z3w.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 suite-bins: $(B)/test_distill
 
+$(B)/test_ink_mil: tests/test_ink_mil.c $(OBJ) $(B)/nn.o $(B)/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
+suite-bins: $(B)/test_ink_mil
 $(B)/test_ink_splat: tests/test_ink_splat.c $(OBJ) $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 suite-bins: $(B)/test_ink_splat

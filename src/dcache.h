@@ -13,6 +13,8 @@
 /* inner (owned): any array, typically z3_open_derived. dir: the cache root (nullptr or "" = memory only); key: the inputs description;
    cell: the cell edge (0 = 128); mem_mb: the memory LRU cap (0 = 1024). Returns nullptr (inner closed) on failure. */
 z3 *z3_open_cached(z3 *inner, const char *dir, const char *key, int cell, size_t mem_mb);
+/* DIR/<24 hex of sha256(key)> (created, inputs.txt written): where a cached array or a companion file (an index) of key lives. 0 ok */
+int dcache_key_dir(const char *dir, const char *key, char *out, size_t nout);
 /* the default cache root: $UFSM_DERIVED_CACHE ("off" / "0" = none), else $HOME/.cache/ufsm/derived */
 const char *dcache_default_dir(void);
 typedef struct { uint64_t reads, cells_mem, cells_disk, cells_computed, cells_fill, disk_bytes_written; double s_compute, s_disk; } dcache_stats;

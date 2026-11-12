@@ -189,6 +189,15 @@ int main(void) {
             if (!open) CHECK(d1.cells_computed > d0.cells_computed && d1.cells_mem > d0.cells_mem && d1.cells_disk == d0.cells_disk, "dcache: cold computes, warm from memory");
             else if (open == 1) CHECK(d1.cells_computed == d0.cells_computed && d1.cells_disk > d0.cells_disk, "dcache: a reopened array reads its cells from disk");
             else fprintf(stderr, "onfly on the GPU: %llu chunks%s\n", (unsigned long long)(inkfly_gpu_chunks() - g0), inkfly_gpu_chunks() > g0 ? "" : " (no device: the CPU ran; not a failure)");
+            if (open == 0) {   /* the MIL rays (inkfly_rays) of the whole volume: every ray's point inside, mode 1 (no face) a subset of mode 0 */
+                void *hd = nullptr; z3 *f2 = inkfly_open(z3_open(cs, "ct.zarr/1", nullptr), sj, &c8, 64, nullptr, &hd);
+                const int64_t wo[3] = {0, 0, 0}, wn[3] = {NV, NV, NV}; inkray *r0 = nullptr, *r1 = nullptr; size_t n0 = 0, n1 = 0;
+                CHECK(f2 && !inkfly_rays(hd, wo, wn, 0, 1, 4, &r0, &n0) && !inkfly_rays(hd, wo, wn, 1, 1, 4, &r1, &n1), "inkfly_rays");
+                long inside = 0, ink = 0; for (size_t i = 0; i < n0; i++) { int in = 1; for (int d = 0; d < 3; d++) in &= r0[i].p[d] >= -0.5f && r0[i].p[d] < NV; inside += in; ink += r0[i].y; }
+                fprintf(stderr, "mil rays: %zu (all supervised pixels, %ld ink), %zu without a face\n", n0, ink, n1);
+                CHECK(n0 > 1000 && inside == (long)n0 && n1 < n0, "rays: %zu, %ld inside, %zu without a face", n0, inside, n1);
+                free(r0); free(r1); if (f2) z3_close(f2);
+            }
             z3_close(fly);
         }
         free(rb); if (ref) z3_close(ref); store_close(s7); store_close(cs);

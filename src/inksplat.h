@@ -68,6 +68,13 @@ typedef struct z3 z3;
 z3 *inkfly_open(z3 *ct, const char *segs, const inksplat_cfg *cfg, size_t cache_mb, const char *dcache_dir, void **handle);   /* cache_mb: the memory LRU; dcache_dir: the disk cache root (dcache.h; nullptr = memory only); handle (nullable): for inkfly_cells; cfg->ct_root / ct_key name the CT in the cache key */
 /* the level-lev cells (grid shape) a supervised label tile's box (reach included) touches -> bits[] = 1 (the sampler's draw cells) */
 int inkfly_cells(void *handle, int lev, const int64_t shape[3], uint8_t *bits);
+/* a normal-pooled MIL ray (train's ink MIL loss): p the label pixel's mesh point, n its unit normal (+ = the recto side), in the window's
+   level voxels (window origin 0); y the 2-D label (1 ink); w a weight */
+typedef struct { float p[3], n[3]; uint8_t y, pad[3]; float w; } inkray;
+/* the rays of the level-L window o / n (inkfly's level): mode 0 every supervised pixel, 1 only those without an open face (the voxel
+   target's unknowns); stride: every stride-th label row / col; pixels within R + 1 level voxels of a held-out box are left out.
+   *out malloc'd. 0 ok. */
+int inkfly_rays(void *handle, const int64_t o[3], const int64_t n[3], int mode, int stride, float R, inkray **out, size_t *nout);
 z3 *inkfly_open_pooled(z3 *ct_coarse, z3 *fine, int own_fine);   /* the next level: known-max 2x pooling of fine, on ct_coarse's grid (owned) */
 void inkfly_gpu_config(int dev);   /* the chunk compute on GPU dev (< 0: the CPU); default: $UFSM_INKFLY_GPU (0), $UFSM_INKFLY_CPU=1 the CPU */
 uint64_t inkfly_gpu_chunks(void);   /* chunks computed on the GPU so far (process) */

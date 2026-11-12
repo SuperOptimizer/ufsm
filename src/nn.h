@@ -537,6 +537,7 @@ void nn_rv_targets(const uint8_t *phase, const uint8_t *pap, size_t n, uint8_t *
 void nn_rv_verso_w(const uint8_t *t, uint8_t *m, size_t n, float w);   /* train --rv-verso-w: verso-side papyrus loss weight x w */
 void nn_rv_fuse(void *lg, size_t n, int h16);   /* predict --channel rv: [recto | verso] logits -> channel 0 = logit((1 + p_r - p_v) / 2) */
 void nn_ink_targets(const uint8_t *ink, size_t n, uint8_t *t, uint8_t *m);   /* train --ink-head: ink prob254 (255 unknown) -> target t (x255) and mask m (known) */
+void nn_ink_targets_smooth(const uint8_t *ink, size_t n, uint8_t *t, uint8_t *m, float eps);   /* the same, label-smoothed: t (1 - eps) + eps / 2 (train --ink-smooth) */
 void nn_phase_trunc(const void *lc, const void *ls, const uint8_t *t, uint8_t *m, size_t n, float tau, float kappa);   /* robust phase loss: confident (>= kappa) predictions off their label by > tau turns leave the mask (fp16 logits) */
 void nn_phase_trunc_counts(unsigned long long out[2]);   /* labelled voxels / dropped since the last call */
 void nn_unwrap_targets(const uint8_t *phase, int d, int h, int w, int s, float dscale, uint8_t *t, uint8_t *m);   /* task unwrap: sign-free normal n n^T (6) and density min(1, dscale rho) (x255, 7 planes) from the phase gradient over +-s voxels; mask */

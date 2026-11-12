@@ -139,6 +139,17 @@ static void dc_free(void *p) {
     for (size_t i = 0; i < c->nhash; i++) for (dent *e = c->hash[i], *nx; e; e = nx) { nx = e->hnext; free(e->data); free(e); }
     free(c->hash); free(c->dir); pthread_mutex_destroy(&c->mu); pthread_cond_destroy(&c->cv); free(c);
 }
+int dcache_key_dir(const char *dir, const char *key, char *out, size_t nout) {
+    unsigned char hsh[32]; unsigned nh = 0; char hex[65];
+    if (!dir || !*dir || !key || !EVP_Digest(key, strlen(key), hsh, &nh, EVP_sha256(), nullptr) || nh != 32) return -1;
+    for (int i = 0; i < 32; i++) snprintf(hex + 2 * i, 3, "%02x", hsh[i]);
+    snprintf(out, nout, "%s/%.24s", dir, hex);
+    if (mkdirs(out)) { fprintf(stderr, "dcache: cannot create %s (%s): memory only\n", out, strerror(errno)); return -1; }
+    char ip[1300]; snprintf(ip, sizeof ip, "%s/inputs.txt", out); struct stat st;
+    if (stat(ip, &st)) { char tmp[1400]; snprintf(tmp, sizeof tmp, "%s.%d.tmp", ip, (int)getpid()); FILE *f = fopen(tmp, "wb");
+        if (f) { fprintf(f, "%s\n", key); if (fclose(f) || rename(tmp, ip)) unlink(tmp); } }
+    return 0;
+}
 z3 *z3_open_cached(z3 *inner, const char *dir, const char *key, int cell, size_t mem_mb) {
     if (!inner) return nullptr;
     const z3_meta *m = z3_meta_of(inner);
@@ -146,19 +157,8 @@ z3 *z3_open_cached(z3 *inner, const char *dir, const char *key, int cell, size_t
     for (int d = 0; d < 3; d++) { c->shape[d] = m->shape[d]; c->gc[d] = (m->shape[d] + c->C - 1) / c->C; }
     c->nhash = 1 << 16; c->hash = calloc(c->nhash, sizeof *c->hash); c->cap = (mem_mb ? mem_mb : 1024) << 20;
     pthread_mutex_init(&c->mu, nullptr); pthread_cond_init(&c->cv, nullptr);
-    if (dir && *dir && key) {
-        unsigned char hsh[32]; unsigned nh = 0; char hex[65], d[1200];
-        if (EVP_Digest(key, strlen(key), hsh, &nh, EVP_sha256(), nullptr) && nh == 32) {
-            for (int i = 0; i < 32; i++) snprintf(hex + 2 * i, 3, "%02x", hsh[i]);
-            snprintf(d, sizeof d, "%s/%.24s", dir, hex);
-            if (!mkdirs(d)) {
-                c->dir = strdup(d);
-                char ip[1300]; snprintf(ip, sizeof ip, "%s/inputs.txt", d); struct stat st;
-                if (stat(ip, &st)) { char tmp[1400]; snprintf(tmp, sizeof tmp, "%s.%d.tmp", ip, (int)getpid()); FILE *f = fopen(tmp, "wb");
-                    if (f) { fprintf(f, "%s\n", key); if (fclose(f) || rename(tmp, ip)) unlink(tmp); } }
-            } else fprintf(stderr, "dcache: cannot create %s (%s): memory only\n", d, strerror(errno));
-        }
-    }
+    char d[1200];
+    if (dir && *dir && key && !dcache_key_dir(dir, key, d, sizeof d)) c->dir = strdup(d);
     z3 *z = z3_open_derived(inner, c->fill, dc_read, c, dc_free);
     if (!z) { dc_free(c); z3_close(inner); }
     return z;

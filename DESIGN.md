@@ -49,6 +49,7 @@ the derive signature does not change.
 - What remains per process is the index open: Paris 4 33 s -> 10 s, 1667 19 s -> ~6 s, after a row memcpy in lsrc_read (the
   per-byte copy was half of it) and the windows on 8 threads. Paris 4 is opened by three sources (june / july / june48). The rest
   is the serial mesh TIFF loads.
+- The index (tile boxes, 0/1 flags) is cached beside the chunks as DIR/<hash>/index.bin, under the same inputs key: Paris 4 opens in 0.7 s from it, against 10.8 s cold.
 - test_ink_splat: on the fly == stored over two merged crops with a held-out box, on odd boxes, cold, from memory, and from disk
   through a reopened array (0 cells recomputed).
 
@@ -81,6 +82,23 @@ On the Paris 4 gate box at 8 threads: GPU 8.7 s wall, CPU 15.9 s (the desk was l
   kernels. CT decode therefore stays on the CPU by default; the decoded CT feeds the device box through one H2D copy.
 - With the disk cache, each chunk is paid once per dataset in any case.
 
+**MIL building blocks (adopt item 1; the loss wiring is univA's head_slab_pass).**
+- **Rays:** `inkfly_rays(handle, o, n, mode, stride, R, ..)` gives the rays of a level-L window: per supervised label pixel whose mesh
+  point lies in the window, the point and unit normal in window voxels, the 2-D label and a weight. Mode 0 takes every pixel; mode 1
+  only those without an open face (the voxel target's unknowns, by the same face search). Pixels within R + 1 voxels of a held-out box
+  are left out.
+- **How many lack a face** (`ink-onfly --rays`, R 10):
+  - 1667 gate box: 1.34 M supervised pixels, 410 k without a face (31 %, 24.6 % ink vs 25.4 % overall);
+  - Paris 4 gate box: 6.53 M, 2.72 M without a face (42 %, 26.6 % ink).
+  The unfaced pixels carry the same ink share, so MIL on them adds unbiased supervision.
+- **Ray cost:** about 3 us of CPU per ray including the face search, so ~0.15 s for a 256^3 window's ~43 k rays; stride 2 gives a
+  quarter of that.
+- **Loss:** `ink_mil_loss_dev` (nn_inkmil.cu, inkmil.h). One thread per ray takes K = 2R / step + 1 trilinear samples of the
+  full-resolution ink logit along the normal and pools them: soft max tau log mean exp(z / tau), or the hard max at tau 0. Then BCE
+  with label smoothing eps, the gradient spread by atomics over the samples' trilinear corners.
+- **test_ink_mil:** the host reference matches central differences (max rel err 1.5e-7 soft, 2e-8 hard), and the GPU matches the host
+  (loss to 1e-6, gradient error 5e-9 of 3e-3).
+
 **The villa ink recipe vs ours.** Read-only survey of ScrollPrize villa: vesuvius/ink_detection on main (the merged
 merge-ink-pipelines configs), plus the paris4-3d-gambiarra and distilled_3d_ink branches.
 
@@ -105,6 +123,8 @@ What we adopt, in this order (lead, 2026-11-11):
 4. BCE + 0.25 dice as the starting ink loss.
 
 Skipped for now: the scroll quotas and the self-training chains.
+
+Item 2 is in as `train --ink-smooth EPS` (nn_ink_targets_smooth; default 0 so running recipes do not change; test_ink_mil checks it).
 
 ## The fibre H / V planes on the fly from the polylines (2026-11-11, branch univ-20261111)
 
