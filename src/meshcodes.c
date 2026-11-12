@@ -20,7 +20,7 @@
 
 typedef struct { int w, h; float *xyz; uint8_t *valid; float *val; } mc_mesh;   /* xyz: level-0 x, y, z per vertex (after the map) */
 typedef struct { int mi, r0, r1, c0, c1; float lo[3], hi[3]; } mc_tile;        /* bounds in level-0 z, y, x */
-typedef struct { mc_mesh *m; int nm; mc_tile *t; size_t nt; double scale; void *pk; size_t pkn; } mc_ctx;   /* pk: the mmap'd pack (meshes + tiles point into it) */
+typedef struct { mc_mesh *m; int nm; mc_tile *t; size_t nt; double scale; void *pk; size_t pkn; char id[48]; } mc_ctx;   /* pk: the mmap'd pack (meshes + tiles point into it) */
 
 static double mc_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 static inline uint8_t mc_code(double q) { long k = lround(q * 18.0) % 252; if (k < 0) k += 252; return (uint8_t)(1 + k); }
@@ -206,12 +206,13 @@ z3 *mesh_codes_open(const char *dir, const char *value, const char *mapp, int le
     const size_t nk = (size_t)nn * 400 + 9000; char *key = malloc(nk), pack[4300]; mc_key(key, nk, dir, names, nn, value, mapp);
     const int packed = !mc_pack_path(pack, sizeof pack, dir, key);
     mc_ctx *X = packed ? mc_pack_open(pack, key) : nullptr;
+    const uint64_t kh = mc_hash(key);
     if (X) { for (int i = 0; i < nn; i++) free(names[i]);
-        free(names); free(key); X->scale = 1.0 / (1 << level);
+        free(names); free(key); X->scale = 1.0 / (1 << level); snprintf(X->id, sizeof X->id, "meshcodes-v1-%016llx-L%d", (unsigned long long)kh, level);
         z3 *zp = z3_open_derived(ct_level, 0, mc_read, X, mc_free);
         if (!zp) { mc_free(X); z3_close(ct_level); return nullptr; }
         z3_derived_extent(zp, mc_extent, X); return zp; }
-    X = calloc(1, sizeof *X); X->m = calloc((size_t)nn, sizeof *X->m); X->scale = 1.0 / (1 << level);
+    X = calloc(1, sizeof *X); X->m = calloc((size_t)nn, sizeof *X->m); X->scale = 1.0 / (1 << level); snprintf(X->id, sizeof X->id, "meshcodes-v1-%016llx-L%d", (unsigned long long)kh, level);
     int bad = 0; size_t tcap = 0;
     for (int i = 0; i < nn && !bad; i++) { char p[2200]; snprintf(p, sizeof p, "%s/%s", dir, names[i]); bad = mc_load(&X->m[i], p, value, map); X->nm = i + 1; }
     for (int i = 0; i < nn; i++) free(names[i]);
@@ -238,6 +239,8 @@ z3 *mesh_codes_open(const char *dir, const char *value, const char *mapp, int le
     return z;
 }
 
+const char *mesh_codes_key(const z3 *z) { const mc_ctx *X = z3_derived_ctx(z); return X ? X->id : nullptr; }
+
 static const char *mc_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 3; i + 1 < argc; i++) if (!strcmp(argv[i], k)) return argv[i + 1]; return d; }
 /* ufsm codes-onfly <meshes-dir> --ct ROOT KEY [--level 0] [--value q.tif] [--map reg.json] [--ref ROOT KEY] [--windows 8] [--P 256] [--threads 8]:
    the derived codes over windows drawn on the meshes (random tiles), ms per window, and the byte differences from a stored codes raster
@@ -252,6 +255,7 @@ int cmd_codes_onfly(int argc, char **argv) {
     const double t0 = mc_now();
     z3 *z = mesh_codes_open(argv[2], mc_opt(argc, argv, "--value", "q.tif"), mc_opt(argc, argv, "--map", nullptr), level, c0, 0); if (!z) return 1;
     const mc_ctx *X = z3_derived_ctx(z); const int64_t *sh = z3_meta_of(z)->shape;
+    printf("codes-onfly: key %s\n", mesh_codes_key(z));
     printf("codes-onfly: %d meshes, %zu tiles, opened in %.1f s (grid %lld %lld %lld)\n", X->nm, X->nt, mc_now() - t0, (long long)sh[0], (long long)sh[1], (long long)sh[2]);
     { int64_t g[3]; uint8_t *bits = nullptr; const int64_t nk = z3_chunk_map(z, g, &bits); free(bits);
       printf("codes-onfly: the extent: %lld of %lld chunks (%.1f%%)\n", (long long)nk, (long long)(g[0] * g[1] * g[2]), 100.0 * nk / (double)(g[0] * g[1] * g[2])); }

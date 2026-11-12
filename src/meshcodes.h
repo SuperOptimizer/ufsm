@@ -12,4 +12,7 @@
 #pragma once
 #include "zarr3.h"
 z3 *mesh_codes_open(const char *dir, const char *value, const char *map, int level, z3 *ct_level, int gpu);
+/* a cache key for values derived from this array (dcache): "meshcodes-v1-<hash of every input: each mesh's TIFF sizes + mtimes, the value
+   name, the map and its field>-L<level>"; the caller appends its own rule parameters (e.g. the pair radius). Lives as long as z. */
+const char *mesh_codes_key(const z3 *z);
 int cmd_codes_onfly(int argc, char **argv);   /* ufsm codes-onfly: the derived codes over windows, ms and byte diffs vs a stored raster */
