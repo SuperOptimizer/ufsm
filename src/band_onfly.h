@@ -16,6 +16,8 @@ z3 *phase_onfly_open(z3 *codes, float rmax);
    grid, and as a derived array (shape ceil(codes / 2), fill 0; codes taken over; nullptr on failure, codes kept). The onfly phase over
    it equals phase-raster --gs 4 (the pair rule on the GPU, the codes pooled on the CPU) */
 int codes_pool2_box(z3 *codes, const int64_t ro[3], const int64_t rn[3], uint8_t *out, int nthreads);
+uint8_t codes_pool2_block(const uint8_t v8[8], int ref);   /* one 2^3 block (children in z, y, x bit order, 0 outside); ref 1: the reference loop */
+extern int codes_pool2_ref;                                /* tests: 1 the reference loop in codes_pool2_box */
 z3 *codes_pool2_open(z3 *codes);
 /* a stored phase pooled 2x (circular mean of the known codes, unknown under half resultant: downsample --mode phase); ign 1: an "ignore"
    array's pooling (1 where any child is set). phase_pool2_view: the lazy derived array on the 2x coarser grid, borrowing phase (closing

@@ -120,6 +120,59 @@ int main(int argc, char **argv) {
             diff += memcmp(one, all + (size_t)z * n2[1] * n2[2], (size_t)n2[1] * n2[2]) != 0; }
         CHECK(diff == 0, "%zu coarse planes differ between the whole box and plane by plane", diff);
         free(all); free(one); }
+    /* codes_pool2 (the 2x pooling of winding codes): the fast path == the reference loop (a double atan2 per block), per block and per box */
+    {   uint64_t rs = 0x9e3779b97f4a7c15ull; size_t bad = 0, nb = 0, nsame = 0;
+#define RND() (rs ^= rs << 13, rs ^= rs >> 7, rs ^= rs << 17, rs)
+        for (int v = 1; v <= BAND_PERIOD; v++) for (int m = 1; m < 256; m++) {   /* equal children, every code and child set */
+            uint8_t v8[8]; for (int q = 0; q < 8; q++) v8[q] = m >> q & 1 ? (uint8_t)v : 0;
+            const uint8_t r = codes_pool2_block(v8, 1); nsame++; bad += r != v || codes_pool2_block(v8, 0) != r;
+        }
+        CHECK(bad == 0, "codes_pool2_block: %zu of %zu equal-children blocks are not their code", bad, nsame);
+        const long NB = getenv("UFSM_TEST_QUICK") ? 3000000 : 30000000;
+        for (long i = 0; i < NB; i++) {   /* random blocks: children within a few steps of a base code (ties, wraps at 252), holes, conflicts */
+            uint8_t v8[8]; const int base = (int)(RND() % BAND_PERIOD), spread = 1 + (int)(RND() % 6), holes = (int)(RND() % 4);
+            for (int q = 0; q < 8; q++) { const uint64_t r = RND(); v8[q] = (r >> 8) % 4 < (uint64_t)holes ? 0 : r % 997 == 0 ? 255 : (uint8_t)(1 + ((base + (int)((r >> 20) % (uint64_t)spread) - spread / 2) % BAND_PERIOD + BAND_PERIOD) % BAND_PERIOD); }
+            nb++; bad += codes_pool2_block(v8, 0) != codes_pool2_block(v8, 1);
+        }
+        CHECK(bad == 0, "codes_pool2_block: %zu of %zu random blocks differ from the reference loop", bad, nb);
+        const int64_t cs3[3] = {150, 201, 333}; char pc[1500], pa[1600]; snprintf(pc, sizeof pc, "%s/codes", argv[1]); snprintf(pa, sizeof pa, "%s/8", pc);
+        z3w *w = z3w_create(pa, cs3, 128, 0, 0, nullptr); CHECK(w != nullptr, "z3w_create codes");
+        if (w) {
+            uint8_t *b = malloc((size_t)128 * 128 * 128);
+            for (int64_t sz = 0; sz * 128 < cs3[0]; sz++) for (int64_t sy = 0; sy * 128 < cs3[1]; sy++) for (int64_t sx = 0; sx * 128 < cs3[2]; sx++) {
+                for (int z = 0; z < 128; z++) for (int y = 0; y < 128; y++) for (int x = 0; x < 128; x++) {
+                    const int64_t gz = sz * 128 + z, gy = sy * 128 + y, gx = sx * 128 + x; uint8_t v = 0;
+                    if (gz < cs3[0] && gy < cs3[1] && gx < cs3[2]) {   /* a spiral's codes in sheets (empty between), a step every ~1.3 voxels, a few conflicts */
+                        const double r = hypot((double)gy - 90, (double)gx - 160) + 0.02 * gz, th = atan2((double)gy - 90, (double)gx - 160) / (2 * M_PI);
+                        const double wn = r / 23.0 - th; const uint64_t hsh = RND();
+                        if (fmod(wn + 100, 1.0) < 0.45 && r > 6) v = (uint8_t)(1 + (long)floor(wn * BAND_STEPS + 1000 * BAND_PERIOD) % BAND_PERIOD);
+                        if (v && hsh % 4001 == 0) v = 255;
+                        if (gx > 300 && gz > 20) v = 0;   /* (empty runs wider than the skip's 16 voxels) */
+                    }
+                    b[((size_t)z * 128 + y) * 128 + x] = v;
+                }
+                CHECK(!z3w_write_shard(w, sz, sy, sx, b, 2), "codes shard");
+            }
+            free(b); CHECK(!z3w_close(w), "codes close");
+            const double um = 8; CHECK(!z3w_write_group(pc, &um, 1, "codes", nullptr), "codes group");
+            store *sc = store_open(pc); z3 *cz = sc ? z3_open(sc, "8", nullptr) : nullptr; CHECK(cz != nullptr, "open codes");
+            if (cz) {
+                const int64_t bx[3][6] = {{0, 0, 0, 75, 101, 167}, {3, 7, 11, 60, 80, 150}, {40, 50, 100, 40, 60, 80}};   /* the whole array (odd edges: past the last child), inner boxes, past the shape */
+                for (int k = 0; k < 3; k++) {
+                    const int64_t o3[3] = {bx[k][0], bx[k][1], bx[k][2]}, n3[3] = {bx[k][3], bx[k][4], bx[k][5]}; const size_t nv = (size_t)n3[0] * n3[1] * n3[2];
+                    uint8_t *fa = malloc(nv), *re = malloc(nv); size_t df = 0, lab = 0, cf2 = 0;
+                    codes_pool2_ref = 0; CHECK(!codes_pool2_box(cz, o3, n3, fa, 1), "codes_pool2_box");
+                    codes_pool2_ref = 1; CHECK(!codes_pool2_box(cz, o3, n3, re, 1), "codes_pool2_box (reference)"); codes_pool2_ref = 0;
+                    for (size_t i = 0; i < nv; i++) { df += fa[i] != re[i]; lab += re[i] > 0 && re[i] < 255; cf2 += re[i] == 255; }
+                    printf("codes_pool2_box %d: %zu voxels, %zu labelled, %zu conflicts, %zu differ from the reference loop\n", k, nv, lab, cf2, df);
+                    CHECK(df == 0 && lab > nv / 20 && cf2 > 0, "codes_pool2_box %d: %zu differ (%zu labelled, %zu conflicts)", k, df, lab, cf2);
+                    free(fa); free(re);
+                }
+                z3_close(cz);
+            }
+        }
+        printf("codes_pool2_block: %zu equal-children and %zu random blocks equal the reference loop\n", nsame, nb);
+    }
     z3_close(ph);
     free(f); free(c); free(cv); free(coh); free(w4f); free(cf); free(w4c); free(cc);
     if (fails) { fprintf(stderr, "test_phase_pool: %d failure(s)\n", fails); return 1; }

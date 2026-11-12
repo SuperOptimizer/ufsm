@@ -193,34 +193,76 @@ z3 *phase_onfly_open(z3 *codes, float rmax) {
 }
 
 /* the 2x pooling of winding_mod14 codes (phase-raster --gs 4 / codes-pool2): per 2^3 block empty when all are, 255 (conflict) when any
-   is or two lie more than a quarter turn apart, else their circular mean (glibc atan2: not on the device, ties) */
+   is or two lie more than a quarter turn apart, else their circular mean (glibc atan2: not on the device, ties).
+   codes_pool2_block is one block (its 8 children in z, y, x bit order, 0 outside the array). ref: the plain loop (float sums in child
+   order, a double atan2 per block). Otherwise the same bytes without the atan2 in all but the near-tie blocks: equal children give
+   their own code (the sums' angle is theirs within 1e-6 steps), and a polynomial angle (error < 1e-4 rad = 0.004 codes) decides the
+   rounding wherever it lands more than 0.03 codes from a half; the rest (the exact ties of mixed blocks) take the reference atan2.
+   2026-11-12, pod, U2's sampler at P 1024: the loop held 2.6 of 12 workers and 1.5 more queued behind its buffer sets */
+int codes_pool2_ref = 0;   /* tests: 1 the reference loop over whole boxes */
+static float g_p2cs[BAND_PERIOD], g_p2sn[BAND_PERIOD]; static _Atomic int g_p2init;
+static void pool2_init(void) {
+    if (atomic_load(&g_p2init)) return;
+    static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER; pthread_mutex_lock(&mu);
+    if (!atomic_load(&g_p2init)) { for (int k = 0; k < BAND_PERIOD; k++) { g_p2cs[k] = (float)cos(2 * M_PI * k / BAND_PERIOD); g_p2sn[k] = (float)sin(2 * M_PI * k / BAND_PERIOD); } atomic_store(&g_p2init, 1); }
+    pthread_mutex_unlock(&mu);
+}
+uint8_t codes_pool2_block(const uint8_t v8[8], int ref) {
+    pool2_init();
+    int first = -1, k = 0, same = 1; float x = 0, y = 0;
+    for (int q = 0; q < 8; q++) {
+        const int v = v8[q];
+        if (!v) continue;
+        if (v == 255 || (first >= 0 && 2 * abs(band_diff(v - 1, first)) > BAND_STEPS / 2)) return 255;
+        if (first < 0) first = v - 1; else same &= v - 1 == first;
+        x += g_p2cs[v - 1]; y += g_p2sn[v - 1]; k++;
+    }
+    if (!k) return 0;
+    if (!ref) {
+        if (same) return (uint8_t)(first + 1);
+        const double ax = fabs((double)x), ay = fabs((double)y), hi = ax > ay ? ax : ay, lo = ax > ay ? ay : ax;
+        if (hi > 0) {
+            const double a = lo / hi, s2 = a * a; double r = ((-0.0464964749 * s2 + 0.15931422) * s2 - 0.327622764) * s2 * a + a;   /* atan on [0, 1], |error| < 1e-4 */
+            if (ay > ax) r = M_PI / 2 - r;
+            if (x < 0) r = M_PI - r;
+            if (y < 0) r = 2 * M_PI - r;
+            const double u = r / (2 * M_PI) * BAND_PERIOD, f = u - floor(u);   /* (u in [0, 252]; atan2's t < 0 wraps by + 1: the same turn) */
+            if (fabs(f - 0.5) > 0.03) return (uint8_t)(1 + (int)floor(u + 0.5) % BAND_PERIOD);
+        }
+    }
+    double t = atan2(y, x) / (2 * M_PI); if (t < 0) t += 1;
+    return (uint8_t)(1 + (int)lround(t * BAND_PERIOD) % BAND_PERIOD);
+}
 int codes_pool2_box(z3 *codes, const int64_t ro[3], const int64_t rn[3], uint8_t *out, int nthreads) {
     const int64_t *fs = z3_meta_of(codes)->shape;
-    static float cs[BAND_PERIOD], sn[BAND_PERIOD]; static _Atomic int init;
-    if (!atomic_load(&init)) { for (int k = 0; k < BAND_PERIOD; k++) { cs[k] = (float)cos(2 * M_PI * k / BAND_PERIOD); sn[k] = (float)sin(2 * M_PI * k / BAND_PERIOD); } atomic_store(&init, 1); }
+    pool2_init();
     int64_t fo[3], fn[3];
     for (int d = 0; d < 3; d++) { fo[d] = 2 * ro[d]; const int64_t e = 2 * (ro[d] + rn[d]) < fs[d] ? 2 * (ro[d] + rn[d]) : fs[d]; fn[d] = e - fo[d]; }
     memset(out, 0, (size_t)rn[0] * rn[1] * rn[2]);
     if (fn[0] <= 0 || fn[1] <= 0 || fn[2] <= 0) return 0;
-    uint8_t *f = malloc((size_t)fn[0] * fn[1] * fn[2]);
-    if (!f || z3_read(codes, fo, fn, f, nthreads)) { free(f); return -1; }
-    for (int64_t a = 0; a < rn[0]; a++) for (int64_t b = 0; b < rn[1]; b++) for (int64_t c = 0; c < rn[2]; c++) {
-        int first = -1, conflict = 0, k = 0; float x = 0, y = 0;
-        for (int q = 0; q < 8 && !conflict; q++) {
-            const int64_t z = 2 * a + (q >> 2 & 1), yy = 2 * b + (q >> 1 & 1), xx = 2 * c + (q & 1);
-            if (z >= fn[0] || yy >= fn[1] || xx >= fn[2]) continue;
-            const int v = f[((size_t)z * fn[1] + yy) * fn[2] + xx];
-            if (!v) continue;
-            if (v == 255 || (first >= 0 && 2 * abs(band_diff(v - 1, first)) > BAND_STEPS / 2)) { conflict = 1; break; }
-            if (first < 0) first = v - 1;
-            x += cs[v - 1]; y += sn[v - 1]; k++;
+    uint8_t *f = malloc((size_t)fn[0] * fn[1] * fn[2]), *zr = calloc((size_t)fn[2] + 16, 1);   /* (zr: the row of a child plane / line outside the array) */
+    if (!f || !zr || z3_read(codes, fo, fn, f, nthreads)) { free(f); free(zr); return -1; }
+    const int ref = codes_pool2_ref;
+    for (int64_t a = 0; a < rn[0]; a++) for (int64_t b = 0; b < rn[1]; b++) {
+        const uint8_t *r[4]; int live = 0;
+        for (int q = 0; q < 4; q++) { const int64_t z = 2 * a + (q >> 1), yy = 2 * b + (q & 1); r[q] = z < fn[0] && yy < fn[1] ? f + ((size_t)z * fn[1] + yy) * fn[2] : zr; live |= r[q] != zr; }
+        if (!live) continue;
+        uint8_t *o = out + ((size_t)a * rn[1] + b) * rn[2];
+        int64_t c = 0;
+        while (c < rn[2]) {
+            if (!ref && 2 * c + 16 <= fn[2]) {   /* 8 blocks without a code: nothing to do (the codes are sparse: most of a box) */
+                uint64_t w[8]; memcpy(w, r[0] + 2 * c, 16); memcpy(w + 2, r[1] + 2 * c, 16); memcpy(w + 4, r[2] + 2 * c, 16); memcpy(w + 6, r[3] + 2 * c, 16);
+                if (!(w[0] | w[1] | w[2] | w[3] | w[4] | w[5] | w[6] | w[7])) { c += 8; continue; }
+            }
+            const int64_t x0 = 2 * c, x1 = 2 * c + 1; const int in1 = x1 < fn[2];
+            if (x0 < fn[2]) {
+                const uint8_t v8[8] = {r[0][x0], in1 ? r[0][x1] : 0, r[1][x0], in1 ? r[1][x1] : 0, r[2][x0], in1 ? r[2][x1] : 0, r[3][x0], in1 ? r[3][x1] : 0};
+                o[c] = codes_pool2_block(v8, ref);
+            }
+            c++;
         }
-        uint8_t o = 0;
-        if (conflict) o = 255;
-        else if (k) { double t = atan2(y, x) / (2 * M_PI); if (t < 0) t += 1; o = (uint8_t)(1 + (int)lround(t * BAND_PERIOD) % BAND_PERIOD); }
-        out[((size_t)a * rn[1] + b) * rn[2] + c] = o;
     }
-    free(f);
+    free(f); free(zr);
     return 0;
 }
 static int pool2_read(void *ctx, z3 *base, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads) { (void)ctx; return codes_pool2_box(base, o, n, out, nthreads); }
