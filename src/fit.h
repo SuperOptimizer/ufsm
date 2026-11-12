@@ -25,7 +25,12 @@ typedef struct {
     const uint8_t *ct;              /* optional mean CT per field cell (plane ct, predict --fit-ct / ufsm ct-fields; 0 = no CT) */
     const uint8_t *cs;              /* optional CT sheet spacing (plane cs: papyrus peaks counted along the network normal), coded as sp
                                        (units of h / 8 native voxels, 0 = unknown) */
+    int oy, ox, H0, W0;             /* material crop (fit --crop-material; H0 = 0: none): the arrays (H x W per row) are the box's cells
+                                       y in [oy, oy + H), x in [ox, ox + W) of a box of H0 x W0 cells per row; every cell outside holds
+                                       no material (w = 0). Positions, the lattice, the model and the minibatch hash stay the box's */
 } fit_fields;
+static inline int fit_box_H(const fit_fields *f) { return f->H0 ? f->H0 : f->H; }   /* the box's cells per axis (crop or not) */
+static inline int fit_box_W(const fit_fields *f) { return f->W0 ? f->W0 : f->W; }
 
 /* loss parts (fit_model loss, the backends' parts arrays): total (data terms + smoothness), phase, normal, density, non-degeneracy,
    phase gradient, smoothness (lattice), winding mod 4, recto anchors, CT papyrus / void parity, CT sheet spacing */
@@ -206,6 +211,9 @@ typedef struct {
                                                (1 - conf)^ct_pow (>= ct_floor), papyrus phase; nullptr none; loss in parts[FIT_P_CT] */
     const uint8_t *cs; float w_cs, cs_tol;  /* CT sheet spacing (sp units), weight, log tolerance to sp; loss in parts[FIT_P_CSPACE] */
     float nd_floor;                         /* the nondegeneracy floor: |grad W| below nd_floor x the predicted density is penalised (0: 0.4) */
+    int oy, ox, H0, W0;                     /* nn_fit_loss2 / the CPU backend: the material crop (fit_fields oy ...; H0 = 0 none): voxel i of
+                                               the D x H x W arrays is box cell (z, y + oy, x + ox) of a D x H0 x W0 box, whose linear index
+                                               the minibatch hash reads */
 } fit_dev;
 /* the data terms over every field voxel: loss parts (double[FIT_NPARTS], FIT_P_*, accumulated; the smoothness slot untouched)
    and the gradients of delta and of the knots (accumulated: zero them first) */
@@ -277,6 +285,14 @@ typedef struct { fit_fields f; uint8_t *a[17]; float *cy, *cx; long long origin[
 int fit_fields_load(const char *dir, int fz0, int fz1, int pool, fit_fields_buf *b);
 void fit_fields_free(fit_fields_buf *b);
 void fit_fields_ct_planes(int mask);   /* which CT planes later fit_fields_load calls read (bit 0 ct, bit 1 cs; default both) */
+/* fit --crop-material M: the material box of a fit-field directory: the y / x bounds of its cells with w != 0 (every row of the box),
+   grown by M cells and rounded out to multiples of align (relative to the box origin; clamped to the box). crop = {oy, ox, H, W}; *wbox:
+   the whole box's w plane (D x H x W, malloc'd; fit_fields_crop lends it to the next load). 0: crop set (H = 0: no material); 1: no crop
+   (the directory has a core mask); -1: read error */
+int fit_fields_material_box(const char *dir, int margin, int align, int crop[4], uint8_t **wbox);
+/* later unpooled whole-box loads (fit_fields_load / _stream with pool 1) read only the cells y in [oy, oy + H), x in [ox, ox + W) of
+   each row (their fit_fields carry oy ox H0 W0: positions stay the box's), the w plane copied from wbox (or read when null); on = 0 off */
+void fit_fields_crop(int on, int oy, int ox, int H, int W, const uint8_t *wbox);
 void fit_fields_skip_planes(int mask);   /* optional planes later fit_fields_load calls leave out (bit 0 the recto plane r, bit 1 the winding mod 4 planes dz dy dx dq, bit 2 the normals, bit 3 sp (unpooled loads); default none): RAM and reads for fits whose terms do not read them */
 void fit_fields_recycle(int on);   /* 1: fit_fields_load_ex's prev without shared rows lends its planes to the new block (zarr fields: same bytes, no fresh pages) */
 int fit_fields_zchunk(const char *dir, long long *zoff);   /* the z rows per chunk of the fields' arrays (zarr; 128 for raw) and the box's z offset in them (*zoff; 0 raw): loads of chunk-aligned rows decode each chunk once */
@@ -402,4 +418,5 @@ double fit_ct_cal_k(const fit_ct_cal *c, double z, double dy, double dx);   /* k
 /* the phase gate's per-cell pass on device planes (src/nn_pgate.cu; fit --phase-gate in a streamed GPU fit): a block of nz rows, pc / ps
    rewritten in place, W_ref (host, nz x H x W) and the axis per row (host) uploaded; st as fit_phase_gate. 0 / -1. */
 int fit_phase_gate_gpu(uint8_t *pc, uint8_t *ps, const uint8_t *t1, const uint8_t *t2, const uint8_t *t5, const uint8_t *sp, const uint8_t *w,
-                       int nz, int H, int W, double h, const float *ay, const float *ax, const float *wref, int mode, int R, double lo, double hi, double rc, double st[4]);
+                       int nz, int H, int W, double h, const float *ay, const float *ax, const float *wref, int mode, int R, double lo, double hi, double rc, double st[4],
+                       int oy, int ox);   /* (oy, ox: a material crop's cell offset in the box, fit_fields oy ox; 0 0 none) */

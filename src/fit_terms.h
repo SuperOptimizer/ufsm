@@ -170,13 +170,28 @@ FIT_HD unsigned fit_hash(unsigned x) { x ^= x >> 16; x *= 0x7feb352dU; x ^= x >>
 /* fit_hash's inverse (each step is a bijection of 32-bit words: the xor-shifts undone, the multipliers' inverses mod 2^32), so
    fit_unhash(fit_hash(x)) == x for every x (tests/test_fit.c checks all 2^32) */
 FIT_HD unsigned fit_unhash(unsigned x) { x ^= x >> 16; x *= 0x43021123U; x ^= x >> 15 ^ x >> 30; x *= 0x1d69e2a5U; x ^= x >> 16; return x; }
+/* the material crop (fit_dev oy ox H0 W0): array voxel i -> its box cell's linear index (the minibatch hash reads that, so a cropped fit
+   draws the same voxels as the whole box); a box cell u -> its array voxel (*i; 0: outside the crop, i.e. no material) */
+FIT_HD size_t fit_box_index(const fit_dev *f, size_t i) {
+    if (!f->H0) return i;
+    const size_t HW = (size_t)f->H * f->W; const size_t z = i / HW, y = (i / f->W) % f->H + f->oy, x = i % f->W + f->ox;
+    return (z * f->H0 + y) * f->W0 + x;
+}
+FIT_HD int fit_crop_index(const fit_dev *f, size_t u, size_t *i) {
+    if (!f->H0) { *i = u; return u < (size_t)f->D * f->H * f->W; }
+    const size_t HW0 = (size_t)f->H0 * f->W0, z = u / HW0, r = u % HW0;
+    const long long y = (long long)(r / f->W0) - f->oy, x = (long long)(r % f->W0) - f->ox;
+    if (z >= (size_t)f->D || y < 0 || y >= f->H || x < 0 || x >= f->W) return 0;
+    *i = (z * f->H + (size_t)y) * f->W + (size_t)x; return 1;
+}
+FIT_HD size_t fit_box_cells(const fit_dev *f) { return (size_t)f->D * (f->H0 ? f->H0 : f->H) * (f->W0 ? f->W0 : f->W); }
 /* nn_fit_loss2's voxel i (weight wv, data terms x sc): W and grad W analytic at the voxel centre (trilinear delta, the knots' and
    theta's derivatives, the axis slope), the data terms into lp (FIT_P_*; lp[FIT_P_TOTAL] their sum) and dL/d delta at lattice
    corners (indices ic, values gv: the voxel's 8, then with the winding mod 4 term 8 more per axis for its second points); returns
    the number of corners (0 inside the core: no terms) */
 #define FIT_VOX2_MAXC 32
 FIT_HD int fit_vox2(const fit_dev *f, size_t i, float wv, float sc, double lp[FIT_NPARTS], size_t ic[FIT_VOX2_MAXC], float gv[FIT_VOX2_MAXC]) {
-    const int z = (int)(i / ((size_t)f->H * f->W)), y = (int)((i / f->W) % f->H), x = (int)(i % f->W);
+    const int z = (int)(i / ((size_t)f->H * f->W)), y = (int)((i / f->W) % f->H) + f->oy, x = (int)(i % f->W) + f->ox;   /* (box cell: the crop's offset) */
     const float pz = (z + 0.5f) * f->h, py = (y + 0.5f) * f->h, px = (x + 0.5f) * f->h;
     /* axis and its z slope */
     const float az = fminf(fmaxf(pz, 0.f), (float)(f->naxis - 1)); const int ai = FIT_IMIN((int)az, f->naxis - 2 < 0 ? 0 : f->naxis - 2); const float at = f->naxis > 1 ? az - ai : 0.f;

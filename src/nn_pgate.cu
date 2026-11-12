@@ -21,7 +21,7 @@ static int pg_tab(void) {
     return 0;
 }
 
-struct pg_dev { const uint8_t *pc, *ps, *t1, *t2, *t5, *sp, *w; int nz, H, W, R, mode; float h; const float *ay, *ax; const float *tab; };
+struct pg_dev { const uint8_t *pc, *ps, *t1, *t2, *t5, *sp, *w; int nz, H, W, R, mode; float h; const float *ay, *ax; const float *tab; int oy, ox; };   /* (oy, ox: a material crop's offset in the box) */
 
 __global__ void k_pg_rates(pg_dev P, float *pa, float *pb) {
     const size_t HW = (size_t)P.H * P.W, n = (size_t)P.nz * HW;
@@ -31,7 +31,7 @@ __global__ void k_pg_rates(pg_dev P, float *pa, float *pb) {
         if (P.mode || !P.w[i] || y == 0 || x == 0 || y + 1 >= P.H || x + 1 >= P.W || !P.sp[i]) continue;
         const float *A = P.tab, *L = P.tab + 65536;
         const double c0 = L[P.pc[i] << 8 | P.ps[i]] / 127.0; if (c0 < 0.125) continue;
-        double ry = (y + 0.5) * P.h - P.ay[z], rx = (x + 0.5) * P.h - P.ax[z]; const double rl = hypot(ry, rx); if (rl < 1) continue; ry /= rl; rx /= rl;
+        double ry = (y + P.oy + 0.5) * P.h - P.ay[z], rx = (x + P.ox + 0.5) * P.h - P.ax[z]; const double rl = hypot(ry, rx); if (rl < 1) continue; ry /= rl; rx /= rl;
         const double p0 = A[P.pc[i] << 8 | P.ps[i]];
         const size_t ny[2] = {i - P.W, i + P.W}, nx[2] = {i - 1, i + 1}; double gy = 0, gx = 0; int ok = 1;
         for (int s = 0; s < 2 && ok; s++) {
@@ -84,12 +84,13 @@ __global__ void k_pg_gate(pg_dev P, const float *a2, const float *b2, const floa
 /* one block of nz field rows: device planes (pc ps t1 t2 t5 sp w at the block's first row; pc / ps rewritten in place), host W_ref
    (nz x H x W), the axis per row (host, box-local native). st += {material, gated, sum q, n q}. Returns 0 / -1. */
 extern "C" int fit_phase_gate_gpu(uint8_t *pc, uint8_t *ps, const uint8_t *t1, const uint8_t *t2, const uint8_t *t5, const uint8_t *sp, const uint8_t *w,
-                                  int nz, int H, int W, double h, const float *ay, const float *ax, const float *wref, int mode, int R, double lo, double hi, double rconf, double st[4]) {
+                                  int nz, int H, int W, double h, const float *ay, const float *ax, const float *wref, int mode, int R, double lo, double hi, double rconf, double st[4],
+                                  int oy, int ox) {
     int rc = 0;
     const size_t n = (size_t)nz * H * W;
     float *b4 = nullptr, *dw = nullptr, *dax = nullptr; uint8_t *o2 = nullptr; unsigned long long *cnt = nullptr; double *qs = nullptr;
     unsigned long long hc[3] = {0, 0, 0}; double hq = 0;
-    pg_dev P = {pc, ps, t1, t2, t5, sp, w, nz, H, W, R, mode, (float)h, nullptr, nullptr, nullptr};
+    pg_dev P = {pc, ps, t1, t2, t5, sp, w, nz, H, W, R, mode, (float)h, nullptr, nullptr, nullptr, oy, ox};
     const int TB = 256; int nb = (int)((n + TB - 1) / TB); if (nb > 65535 * 8) nb = 65535 * 8;
     if (pg_tab()) return -1;
     P.tab = g_pgtab;

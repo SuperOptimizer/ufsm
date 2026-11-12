@@ -45,7 +45,7 @@ static void pg_rows(void *ctx, int z0, int z1, int t) {
             const size_t j = (size_t)y * W + x, i = (size_t)z * HW + j; pa[j] = pb[j] = 0;
             if (J->g->mode || !f->w[i] || y == 0 || x == 0 || y + 1 >= H || x + 1 >= W || !f->sp[i]) continue;
             const double c0 = pg_mag(pc[j], ps[j]) / 127.0; if (c0 < 0.125) continue;
-            double ry = (y + 0.5) * h - cy, rx = (x + 0.5) * h - cx; const double rl = hypot(ry, rx); if (rl < 1) continue; ry /= rl; rx /= rl;
+            double ry = (y + f->oy + 0.5) * h - cy, rx = (x + f->ox + 0.5) * h - cx;   /* (box positions: a material crop's offset) */ const double rl = hypot(ry, rx); if (rl < 1) continue; ry /= rl; rx /= rl;
             const double p0 = pg_ang(pc[j], ps[j]);
             const size_t ny[2] = {j - W, j + W}, nx[2] = {j - 1, j + 1}; double gy = 0, gx = 0; int ok = 1;
             for (int s = 0; s < 2 && ok; s++) {
@@ -103,7 +103,7 @@ int fit_phase_gate(const fit_fields *f, int zo, const float *cy, const float *cx
                    uint8_t *pc_out, uint8_t *ps_out, uint8_t *gate, double st[4]) {
     const size_t n = (size_t)f->D * f->H * f->W;
     float *wref = malloc(n * sizeof(float)); if (!wref) return -1;
-    const double o[3] = {zo * f->h + ro[0], ro[1], ro[2]};   /* (grid points o + (i + 0.5) h = the cell centres in the ref box) */
+    const double o[3] = {zo * f->h + ro[0], ro[1] + f->oy * f->h, ro[2] + f->ox * f->h};   /* (grid points o + (i + 0.5) h = the cell centres in the ref box; exact sums) */
     const int64_t n3[3] = {f->D, f->H, f->W};
     const double tq0 = pg_now();
     if (gd ? fit_set_grid(gd, ref, o, n3, f->h, 0, wref) : fit_set_grid_cpu(ref, o, n3, f->h, 0, nullptr, wref)) { free(wref); return -1; }

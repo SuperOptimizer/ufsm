@@ -718,7 +718,7 @@ __global__ void fit_loss2_k(fit_dev f, long long *pi, long long *gi) {   /* (fix
     __shared__ long long red[FIT_NPARTS][FIT_TPB];
     double lp[FIT_NPARTS] = {0}; long long lq[FIT_NPARTS] = {0};
     const size_t n = (size_t)f.D * f.H * f.W, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
-    const float wv = i < n && (f.stride <= 1 || fit_hash((unsigned)i ^ f.salt) % (unsigned)f.stride == 0) ? f.w[i] * (1.f / 255.f) : 0.f;
+    const float wv = i < n && (f.stride <= 1 || fit_hash((unsigned)fit_box_index(&f, i) ^ f.salt) % (unsigned)f.stride == 0) ? f.w[i] * (1.f / 255.f) : 0.f;
     if (wv > 0.f) {
         size_t ic[FIT_VOX2_MAXC]; float gv[FIT_VOX2_MAXC];
         const int nc = fit_vox2(&f, i, wv, (float)(f.stride > 1 ? f.stride : 1), lp, ic, gv);
@@ -753,7 +753,7 @@ __global__ void fit_loss2_list_k(fit_dev f, const unsigned *list, const unsigned
    n < 2^32 (nn_fit_loss2's guard). */
 __global__ void fit_select_k(fit_dev f, unsigned *list, unsigned *count, unsigned cap) {   /* the same list, one thread per voxel */
     const size_t n = (size_t)f.D * f.H * f.W, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
-    const bool sel = i < n && fit_hash((unsigned)i ^ f.salt) % (unsigned)f.stride == 0 && f.w[i] != 0;
+    const bool sel = i < n && fit_hash((unsigned)fit_box_index(&f, i) ^ f.salt) % (unsigned)f.stride == 0 && f.w[i] != 0;
     const unsigned m = __ballot_sync(0xffffffffu, sel);
     if (!m) return;
     const int lane = threadIdx.x & 31, leader = __ffs(m) - 1;
@@ -763,9 +763,10 @@ __global__ void fit_select_k(fit_dev f, unsigned *list, unsigned *count, unsigne
     if (sel) { const unsigned k = base + __popc(m & ((1u << lane) - 1u)); if (k < cap) list[k] = (unsigned)i; }
 }
 __global__ void fit_select_inv_k(fit_dev f, unsigned long long nk, unsigned *list, unsigned *count, unsigned cap) {
-    const size_t n = (size_t)f.D * f.H * f.W; const unsigned long long k = blockIdx.x * (unsigned long long)blockDim.x + threadIdx.x;
+    const size_t n = fit_box_cells(&f); const unsigned long long k = blockIdx.x * (unsigned long long)blockDim.x + threadIdx.x;
     unsigned i = 0; bool sel = false;
-    if (k < nk) { i = fit_unhash((unsigned)(k * (unsigned long long)(unsigned)f.stride)) ^ f.salt; sel = (size_t)i < n && f.w[i] != 0; }
+    if (k < nk) { const unsigned u = fit_unhash((unsigned)(k * (unsigned long long)(unsigned)f.stride)) ^ f.salt; size_t j = 0;   /* (u: a box cell; i: its array voxel) */
+                  sel = (size_t)u < n && fit_crop_index(&f, u, &j) && f.w[j] != 0; i = (unsigned)j; }
     const unsigned m = __ballot_sync(0xffffffffu, sel);
     if (!m) return;
     const int lane = threadIdx.x & 31, leader = __ffs(m) - 1;
@@ -776,10 +777,10 @@ __global__ void fit_select_inv_k(fit_dev f, unsigned long long nk, unsigned *lis
 }
 static unsigned *g_sel_list, *g_sel_count; static unsigned g_sel_cap;
 extern "C" void nn_fit_loss2(const fit_dev *f, double *parts, float *g_delta) {
-    const size_t n = (size_t)f->D * f->H * f->W, nl = (size_t)f->lz * f->ly * f->lx;
+    const size_t n = fit_box_cells(f), na = (size_t)f->D * f->H * f->W, nl = (size_t)f->lz * f->ly * f->lx;   /* (the box's cells; na: the arrays') */
     long long *gi = fit_fix_scratch(nl), *pi = g_fix_p;
     if (f->stride <= 1 || n >= 0xffffffffull) {
-        fit_loss2_k<<<nblk(n, FIT_TPB), FIT_TPB>>>(*f, pi, gi);
+        fit_loss2_k<<<nblk(na, FIT_TPB), FIT_TPB>>>(*f, pi, gi);
         fit_gconv_k<<<nblk(nl, 256) < 4096 ? nblk(nl, 256) : 4096, 256>>>(gi, nl, g_delta); fit_pconv_k<<<1, 32>>>(pi, parts); KCHECK(); return;
     }
     /* capacity: the expected n / stride plus a quarter (the count is binomial: sd ~ sqrt(n / stride), ~0.07% of it at 2 M) */
@@ -792,7 +793,7 @@ extern "C" void nn_fit_loss2(const fit_dev *f, double *parts, float *g_delta) {
     CK(cudaMemsetAsync(g_sel_count, 0, sizeof(unsigned)));
     const unsigned long long nk = ((1ull << 32) + (unsigned)f->stride - 1) / (unsigned)f->stride;   /* the multiples of the stride below 2^32 */
     if (nk < n) fit_select_inv_k<<<(unsigned)((nk + 255) / 256), 256>>>(*f, nk, g_sel_list, g_sel_count, g_sel_cap);
-    else fit_select_k<<<nblk(n, 256), 256>>>(*f, g_sel_list, g_sel_count, g_sel_cap);   /* (small boxes: fewer voxels than candidates) */
+    else fit_select_k<<<nblk(na, 256), 256>>>(*f, g_sel_list, g_sel_count, g_sel_cap);   /* (small boxes: fewer voxels than candidates) */
     const unsigned nb = nblk(want, FIT_TPB) < 1024 ? nblk(want, FIT_TPB) : 1024;
     fit_loss2_list_k<<<nb, FIT_TPB>>>(*f, g_sel_list, g_sel_count, g_sel_cap, pi, gi);
     fit_gconv_k<<<nblk(nl, 256) < 4096 ? nblk(nl, 256) : 4096, 256>>>(gi, nl, g_delta); fit_pconv_k<<<1, 32>>>(pi, parts);
