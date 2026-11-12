@@ -31,6 +31,8 @@ done
 "$U" phase-raster fx/band 1 pg4 --axis fx/axis.json --gs 4 --pair 1 --radius 48 --threads 4 --block 64 > pg4.log 2>&1 || { echo "FAIL: phase-raster --gs 4 ($D/pg4.log)"; exit 1; }
 for g in -1 0; do [ $g = 0 ] && ! nvidia-smi -L > /dev/null 2>&1 && continue
   "$U" phase-onfly fx/band 1 --pool2 1 --rmax 12 --ref pg4 9.6 --windows 4 --P 48 --gpu $g --budget-mb 64 --threads 4 > p2$g.log 2>&1 || { echo "FAIL: pooled onfly differs from --gs 4 (GPU $g, $D/p2$g.log)"; tail -2 p2$g.log; exit 1; }
+  # (GPU: the pooled view's tiles decoded and pooled on the device, codes_pool.h / k_codes_pool2; before 2026-11-12 on the CPU)
+  [ $g = 0 ] && ! grep -qE ' ([1-9][0-9]*) of \1 tiles decoded on the GPU' p2$g.log && { echo "FAIL: pooled onfly tiles not all decoded on the GPU ($D/p2$g.log)"; exit 1; }
 done
 F=$(readlink -f fx); P=$(readlink -f ph)
 python3 - "$F" "$P" <<'PY'

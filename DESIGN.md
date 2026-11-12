@@ -6,6 +6,47 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## The pooled on-the-fly ink level read in z-slabs (2026-11-12, branch sampmem-20261112)
+
+`inkfly_pool_derive` (the coarser level of an on-the-fly ink target: known-max 2x pooling of the level below) read the whole (2n)^3 fine
+box into one malloc before pooling: 8.6 GB of scratch in every worker building a P 1024 window of an ink source at its pooled level,
+on top of the slot. It now reads slabs of the fine level cut at multiples of the fine array's 128 cell (no cell derived twice) and
+pools each; the pooling is per 2^3 block, so the bytes are the same.
+
+- Desk, one P 1024 pooled read from a stored u8 pyramid (`test_ink_pool --bench`, PHerc0139 CT levels 0 / 1 standing in for the ink
+  array): peak RSS 9.18 GB with one whole read (`UFSM_INKPOOL_SLAB=1048576`), 1.68 GB with the 128-plane slabs (1.07 GB of it the
+  output window), the same output hash.
+- `test_ink_pool` (CPU): 5 boxes of a 300 x 200 x 260 random array with unknowns (odd starts, slab cuts every 32 coarse planes, the
+  whole array) equal the pooling of one fine read, 0 differ.
+- The sampler's host memory otherwise (desk, u1's recipe, P 1024, `UFSM_HOSTMEM=1`): a slot 2.28 GB (CT 1 B a voxel, phase 1, ink bits
+  1/8, runs), a worker's fixed scratch 1.6 GB resident of 15 GB reserved. An earlier "7 GB per slot, 4 GB per worker" for U2's list was a
+  two-point fit that included the process-wide caches (per on-the-fly ink source a 2 GB target LRU and a 1 GB decoded-CT cache) and this
+  scratch; it should not be used.
+
+## --init-from by head, the "other" drop count, U2's start (2026-11-12, branch initmap-20261112)
+
+- **--init-from by head.** u1-10000 -> U2: both nets have 144 outputs (the latent head: 16 base + 128 sub-cell), so no mapping branch
+  applied and unet_init_from copied the head by position. U2's ink row 11 got u1's recto row, then the ink reset (fresh, prior bias). U2's
+  rv rows 12-13 got u1's verso row and an untrained pad row; the rv reset did not fire, because the donor declares rv v2. U2's step-50 rv
+  bce was 0.569, against u1's 0.36 at step 10450; phase / normal / wind4 were at u1's level. Now an unwrap2 donor with more than 11
+  outputs and --rv 2 / --ink-head maps by head:
+  - the rv pair from the donor header ("rv":{"version":2,"recto":R});
+  - ink from "unwrap":{.."ink":C}, else fresh;
+  - rows 0-10 and the sub-cell rows by position.
+  rows[] was 64 entries, now 512. test_init_heads (fixture, lr 0, step 1): rv bce 0.2225 for the donor layout and 0.2225 mapped by head;
+  the old loader gives 0.369 (untrained). u1's own init from wz896 was right: rv rows 11-12 fresh, since the donor had no rv.
+- **SL_OTHER.** The draws line's fifth drop count (hold/empty/probe/fg/other) covers draw_'s returns before a window position: no level,
+  patch / box bounds, a shape smaller than the window. Before this they were uncounted, so a source losing its share there looked
+  clean. --reject-warn counts them.
+- **No draw index is fatal under --strict-sources.** U2's ink-PHerc0500P2 / ink-PHerc0841 (0841: 0 supervised tiles) are at weight 0
+  until their index is fixed.
+- **U2's start on the pod:**
+  - GPU OOM at start three times (10:00, 10:05, 10:10 UTC): the planner sized itself to the card's free memory and other jobs then took
+    that space. The planner is now pinned (UFSM_MEM_FREE_GB 48, --onfly-mb 4096 x 4 slots: ~64 GB of the 96).
+  - Host OOM kill at 09:58: U2, frozen for an exclusive slot, kept its 106 GB, and the slot's job went over the 175 GB cgroup.
+  - Per-agent budgets and the two-phase claim (gpu.pause drains the shared jobs while U2 trains, gpu.go freezes U2) are in
+    /workspace/ue/GPU.md.
+
 ## How far the CT can be compressed: the inference half (2026-11-12, branch latstore-20261112)
 
 The user's question: how compressed can the data be before the nets are hopeless, and how much can we get away with. This is the
@@ -100,6 +141,64 @@ per arm for both scans on 20 pod threads (bound by reading the source).
 **Recommendation (inference evidence; the training half can still move it).** 2.4 um scans' working levels: q8 instead of q2 (3.6x
 smaller, a 2x margin in q to the edge, 4x to the knee). 9.4 um scans: stay at q8. latvol inference stores: C 29, step 0.5 (a 2x margin in
 step under the last clean point; fewer coefficients is the wrong lever). Nothing below q8 before a net has been shown to learn from it.
+
+## Groups without their coarse levels: the probe guard and --reject-warn (2026-11-12, branch probeguard-20261112)
+
+diskclean's sampler-only check of a local 0139 2.399 um twin that listed levels 1-3 only: 24,793 dropped draws for 16 windows (18,265 as
+"CT min_fg"), against 72 drops over http. From the code:
+- draw_'s probe reads the window's occupancy at CT level l + 3. With that level missing, source_ct is null and the probe is skipped, not
+  failed. So every draw reads the full window and is then rejected on min_fg (the drops' label).
+- The ink-only sources (0139-hf, 0139-inkgt: no band, no coarse target) also get their draw cells from the CT at level l0 + 3 .. 5
+  (label_occupancy). None opened, so they had no draw index and drew uniformly over the whole scan. Most of the reject rate comes from
+  this.
+
+The guards:
+- sampler_start: for every enabled training level l of a weighted source with l + 3 <= 5, CT level l + 3 must open. If it doesn't: under
+  --strict-sources 1, fatal ("training level L's coarse probe reads CT level L+3, which does not open"); otherwise that line once with
+  "every draw reads the full window". Levels above 5 are not expected, so training at level 3+ still probes nothing, as before.
+- sampler_start: a weighted source without a draw index logs "no draw index ... drawn uniformly over the whole scan".
+- The draws line (--mix-every): a source whose drops (hold + empty + probe + fg) since the last line exceed --reject-warn R (default 100;
+  0 turns it off) per new window gets a "WARNING draws:" line with the counts. So a 300x reject rate shows even when the source's share
+  looks normal.
+
+test_strict_sources (3): the fixture's CT group cut to levels 0-2. Without the flag it warns about level 0's probe at level 3 and trains,
+and at --reject-warn 0.01 the draws line flags it ("3 draws for 6 new windows"). With --strict-sources 1 it stops with the fatal line.
+u1's recipe (sources-u1d.json, P 1024, all rungs) passes the startup checks under --strict-sources 1 in a sampler-only run.
+
+## The pooled codes views on the device: k_codes_pool2 (2026-11-12, branch gpupool-20261112)
+
+The coarser rungs read their codes through codes_pool2_open views (sources.c onfly_codes_open: the source's codes pooled 1-3 times for
+the 9.6 / 19.2 um rungs, or when a CT level has no raster). Those views could not give tile_gpu raw chunks. So every tile on such a rung
+was decoded and pooled on the CPU, and only the pair rule ran on the GPU. perf's pod profile (P 1024, replay 3): 17-31 of 50-88 tiles
+per run went this way, at 7.5-11 s per read.
+
+- tile_gpu follows the pooled views (codes_pool2_open now passes a tag ctx) down to the stored codes. It packs the base chunks of the
+  2^k box. nn_band.cu then decodes them on the device into a base buffer (8^k the tile's voxels, capped at 2x the --onfly-mb budget,
+  else the CPU path) and pools k times (k_codes_pool2, ping-pong buffers) before the pair rule or the crop.
+- codes_pool.h cp_pool8 is the one pooling for the host (codes_pool2_box, phase-raster --gs 4) and the device. The circular mean's
+  rounding was lround(atan2(y, x) / 2 pi x 252), and glibc's atan2 has no device twin. It is now a bin search on the sign of
+  cross(edge_m, v), where edge_m is the bin edge's unit vector as floats. Float x float products are exact in double, so each sign is
+  exact and the same with or without FMA. Codes 253 / 254 (not codes) now pool as a conflict; before, they read past the cos / sin of
+  the 252 codes.
+- Change vs atan2: test_lldec's fixture (sheet codes with exact k / k+1 ties) differs in 31319 of 1818498 coded voxels (1.7%), every one
+  by one step, at the ties. None differ by more than one step or in empty / conflict. The derived-phase cache key of pooled mesh codes
+  gets a "b" ("<key>-pool1b"), so old disk entries are not mixed in.
+- The derived phase target (the label) is unchanged in both cases measured: phase-raster --gs 4 --pair 1 (the pair rule on the 2x-pooled
+  codes, what the 9.6 / 19.2 um rungs train on), master vs this branch, compared voxel by voxel:
+  - PHerc1667 codesA 4.798, a 512^3 box at 9.6 um (7424,896,2048), radius 160: 87,348,987 known voxels in both, 0 known-status changes,
+    0 phase changes;
+  - the make_wind_fixture codes (fx/band 1, the test_phase_onfly fixture), radius 48: 129,158 known, 0 status changes, 0 phase changes.
+  The tie moves fall where the pair rule reads only the codes' winding parity and sheet positions, which a one-step move does not change.
+  So the coarse-rung labels match u1's on these boxes; pooled codes differ only at exact ties.
+- Caches that derive from pooled codes: only the onfly phase dcache (sources.c onfly_phase_of, keyed "<mesh codes key>-pool<n>b"; stored
+  codes are not cached). Mesh packs (UFSM_MESHCODES_CACHE) hold the unpooled rasters, and inksplat's cache is keyed on the ink inputs,
+  so neither is affected. Stored arrays written by codes-pool2 / phase-raster --gs 4 before this change are data, not caches: they keep
+  the atan2 rounding at ties.
+- Tests: test_lldec adds pools 1 / 2 / 3 over the 5 boxes (device == codes_pool2_box, 0 differing voxels in every box) and the atan2
+  comparison. test_phase_onfly's pooled GPU run (== phase-raster --gs 4) now also requires every tile decoded on the GPU. test_phase_pool,
+  test_mesh_phase, test_band_pair and test_unwrap2_sampler pass.
+- Desk bench (GPU 1, PHerc1667 codesA 4.798 pooled once, rmax 40, P 512, 3 windows, 1 slot, 1024 MB budget): master 4417 ms / window
+  (codes read 3930 ms on 8 CPU threads, 0 of 24 tiles on the GPU); this branch 777 ms / window (0 ms codes read, 24 of 24 on the GPU).
 
 ## Sources that silently drop out: --strict-sources and relative-scale groups (2026-11-12, branch strictsrc-20261112)
 
