@@ -1037,9 +1037,43 @@ static void *score_rows(void *arg) {
     J->dd[t] = ddt; J->ndet[t] = ndt; J->dcap[t] = dct; if (J->pa) J->pa[t] = pat;
     return nullptr;
 }
+/* fit --score-boxes FILE in|out: score only the label voxels inside (in) / outside (out) the listed boxes, "z y x nz ny nx" per line in
+   label (codes) voxels: e.g. a scroll's held-out boxes against the rest. Applied to each block of codes as it is read (code 0 = no label). */
+static int64_t (*g_sbox)[6]; static int g_nsbox, g_sbox_in;
+static int sc_boxes_load(const char *path, const char *mode) {
+    FILE *f = fopen(path, "r"); if (!f) { fprintf(stderr, "fit: --score-boxes: cannot open %s\n", path); return 1; }
+    long long v[6]; int cap = 0;
+    while (fscanf(f, "%lld %lld %lld %lld %lld %lld", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) == 6) {
+        if (g_nsbox == cap) { cap = cap ? 2 * cap : 64; g_sbox = realloc(g_sbox, (size_t)cap * sizeof *g_sbox); }
+        for (int d = 0; d < 6; d++) g_sbox[g_nsbox][d] = v[d];
+        g_nsbox++;
+    }
+    fclose(f);
+    if (strcmp(mode, "in") && strcmp(mode, "out")) { fprintf(stderr, "fit: --score-boxes FILE in|out\n"); return 2; }
+    g_sbox_in = !strcmp(mode, "in");
+    fprintf(stderr, "fit: --score-boxes: %d boxes from %s, scoring the label voxels %s them\n", g_nsbox, path, g_sbox_in ? "inside" : "outside");
+    return 0;
+}
+static void sc_boxes_apply(const int64_t o[3], const int64_t n[3], uint8_t *b) {
+    if (!g_sbox) return;
+    uint8_t *keep = malloc((size_t)n[2]);
+    for (int64_t z = 0; z < n[0]; z++) for (int64_t y = 0; y < n[1]; y++) {
+        memset(keep, g_sbox_in ? 0 : 1, (size_t)n[2]);
+        const int64_t gz = o[0] + z, gy = o[1] + y;
+        for (int k = 0; k < g_nsbox; k++) {
+            const int64_t *q = g_sbox[k];
+            if (gz < q[0] || gz >= q[0] + q[3] || gy < q[1] || gy >= q[1] + q[4]) continue;
+            int64_t x0 = q[2] - o[2], x1 = q[2] + q[5] - o[2]; if (x0 < 0) x0 = 0; if (x1 > n[2]) x1 = n[2];
+            if (x1 > x0) memset(keep + x0, g_sbox_in ? 1 : 0, (size_t)(x1 - x0));
+        }
+        uint8_t *row = b + ((size_t)z * n[1] + y) * n[2];
+        for (int64_t x = 0; x < n[2]; x++) if (!keep[x]) row[x] = 0;
+    }
+    free(keep);
+}
 typedef struct { z3 *z; int64_t o3[3], n3[3]; uint8_t *buf; int rc; size_t any; } sc_read;   /* one block's codes (a reader thread) */
 static void *sc_read_run(void *a) {
-    sc_read *r = a; r->any = 0; r->rc = z3_read(r->z, r->o3, r->n3, r->buf, 16);
+    sc_read *r = a; r->any = 0; r->rc = z3_read(r->z, r->o3, r->n3, r->buf, 16); if (!r->rc) sc_boxes_apply(r->o3, r->n3, r->buf);
     const size_t nb3 = (size_t)r->n3[0] * r->n3[1] * r->n3[2];
     if (!r->rc) for (size_t i = 0; i < nb3 && !r->any; i++) r->any = r->buf[i] >= 1 && r->buf[i] <= 252;
     return nullptr;
@@ -1081,7 +1115,7 @@ static void *sc_reader(void *a) {   /* reader k of SC_NRD: blocks k, k + SC_NRD,
         pthread_mutex_lock(&P->mu); while ((S->state || S->next != b) && !P->quit) pthread_cond_wait(&P->cv, &P->mu); const int q = P->quit; pthread_mutex_unlock(&P->mu);
         if (q) break;
         memcpy(S->o3, P->blk[b], 3 * sizeof(int64_t)); memcpy(S->n3, P->blk[b] + 3, 3 * sizeof(int64_t));
-        double t0 = now(); S->rc = z3_read(P->z, S->o3, S->n3, S->codes, nth); S->any = 0; const double t1 = now();
+        double t0 = now(); S->rc = z3_read(P->z, S->o3, S->n3, S->codes, nth); S->any = 0; if (!S->rc) sc_boxes_apply(S->o3, S->n3, S->codes); const double t1 = now();
         const size_t nb3 = (size_t)S->n3[0] * S->n3[1] * S->n3[2];
         if (!S->rc && P->sparse) S->any = 1;   /* (the GPU builds the label mask) */
         else if (!S->rc) { const uint8_t *c = S->codes; size_t i = 0;
@@ -1959,6 +1993,7 @@ static int cmd_fit(int argc, char **argv) {
         fit_set_dev *gd = nullptr; if (!c.cpu && !(gd = fit_set_upload(fs))) return 1;
         fit_fill_ctx fc = {gd, fs};
         g_score_pairs = atoi(opt(argc, argv, "--score-pairs", "0"));
+        { const int bi = arg_index(argc, argv, "--score-boxes"); if (bi > 0 && bi + 2 < argc && sc_boxes_load(argv[bi + 1], argv[bi + 2])) return 2; }
         if (*opt(argc, argv, "--zgauge", "") && zg_load(opt(argc, argv, "--zgauge", ""), atof(opt(argc, argv, "--zgauge-scale", "1")), atof(opt(argc, argv, "--zgauge-f", "1")))) return 1;
         if (*opt(argc, argv, "--score-z", "") && sscanf(opt(argc, argv, "--score-z", ""), "%lf,%lf", &g_score_z0, &g_score_nz) != 2) { fprintf(stderr, "fit: --score-z Z0,NZ (box-local native z)\n"); return 2; }
         const int rc = score_codes(z, cf, org, shp, h, fb.um, fb.cy, fb.cx, arg_index(argc, argv, "--score-detail") > 0, dump, fit_fill, gd && !getenv("UFSM_SCORE_DENSE") ? &fit_sparse : nullptr, &fc);
