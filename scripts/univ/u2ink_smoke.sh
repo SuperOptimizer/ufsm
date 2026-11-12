@@ -13,12 +13,12 @@
 # crops whose labels have many face-less pixels (Paris 4: 42%). Desk: GPU=1 (flock gpu1 bench lock, dev slice); pod: K set, LOCK= .
 # Env: K (pod root; unset: the desk paths), IK (the staged inkgt dir, K/inkgt; its sibling inkeval/crops: the eval crops),
 #      U (binary with --ink-mil and the replay remap: master after milfix-20261112), INIT (u1 snapshot), SRCJ, STEPS (400),
-#      P (896 pod; desk 384), GPU (0), MILR (3), MILMODE (1), SCORE (1: run baseline.sh after each arm),
+#      P (1024 pod: cubes only, user 2026-11-12; desk 384), GPU (0), MILR (3), MILMODE (1), SCORE (1: run baseline.sh after each arm),
 #      STOPAT (train only to this step: one GPU unit, scripts/univ/u2ink_pod.sh), EVERY (200: checkpoint and score every EVERY steps).
 set -uo pipefail; D=$(dirname "$(readlink -f "$0")"); ARMS=${*:-A B}
 if [ -n "${K:-}" ]; then   # pod: what pod_pack.sh / the u2ink staging put under K
   R=${R:-$K/runs}; U=${U:-$K/ufsm/build/ufsm}; INIT=${INIT:-$K/ckpt/u1-resume.ckpt}; IK=${IK:-$K/inkgt}; SRCJ=${SRCJ:-$IK/sources-u2ink.json}; BASIS=$K/small/klt1.lcb
-  SC_ENV="D=$IK CROPS=${CROPS:-$(dirname $IK)/inkeval/crops} CACHE=$K/cache"; P=${P:-896}; LOCK=${LOCK-}
+  SC_ENV="D=$IK CROPS=${CROPS:-$(dirname $IK)/inkeval/crops} CACHE=$K/cache"; P=${P:-1024}; LOCK=${LOCK-}
 else
   R=${R:-/vesuvius/ufsm/univ/u2ink/runs}; U=${U:-/vesuvius/ufsm/univ/u2ink/bin/ufsm}; INIT=${INIT:-/vesuvius/ufsm/v2/lat/runs/u1/snap/8000.ckpt}
   SRCJ=${SRCJ:-/vesuvius/ufsm/inkgt/sources-u2ink.json}; BASIS=/vesuvius/ufsm/v2/lat/codec/klt1.lcb; SC_ENV=""; P=${P:-384}; LOCK=${LOCK-/tmp/gpu1-bench.lock}

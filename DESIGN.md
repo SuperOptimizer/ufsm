@@ -65,7 +65,7 @@ which reads the box in level-1 voxels, so every shard was air. It now passes the
 predicts and scores. The 2-D render score wrote 0 wraps for that crop (not investigated; the 3-D score is the gate).
 
 Desk dry run (arm B, P 256, 24 steps beside u1): the u1 8000 snapshot loads with the ink row fresh. Ink bce 0.48 -> 0.36 and
-mil 0.48 -> 0.36 inside the warmup, 15-16 k rays a window. The 400-step arms at P 896 are for the pod.
+mil 0.48 -> 0.36 inside the warmup, 15-16 k rays a window. The 400-step arms are for the pod, at P 1024 (user 2026-11-12: "1024 cubes only now").
 
 ## Universal net eval harness: pod baselines, fed levels, the ink teacher, and the --fit-zarr off-grid bug (2026-11-12, branches univ-eval-20261111 + fitslab-20261111)
 

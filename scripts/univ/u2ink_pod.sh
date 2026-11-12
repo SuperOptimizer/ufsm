@@ -7,7 +7,7 @@
 #      U (IB/ufsm/build/ufsm), STEPS (400), UNIT (100), EVERY (200), GPU (0); the rest as u2ink_smoke.sh.
 set -uo pipefail; D=$(dirname "$(readlink -f "$0")"); ARMS=${*:-A B}
 export K=${K:-/workspace/univ}; IB=${IB:-/workspace/inkB}; export IK=$IB/inkgt R=$IB/runs U=${U:-$IB/ufsm/build/ufsm} INIT=${INIT:-$IB/ckpt/u1-9000.ckpt}
-export STEPS=${STEPS:-400} EVERY=${EVERY:-200} GPU=${GPU:-0}; UNIT=${UNIT:-100}; G=/workspace/ue; mkdir -p $R
+export STEPS=${STEPS:-400} EVERY=${EVERY:-200} GPU=${GPU:-0} P=${P:-1024}; UNIT=${UNIT:-100}; G=/workspace/ue; mkdir -p $R
 say() { echo "== $(date '+%F %T') u2ink_pod: $*"; }
 unit() {   # one GPU unit under the sharing protocol
   while [ -e $G/gpu.pause ]; do sleep 30; done
