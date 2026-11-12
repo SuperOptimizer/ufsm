@@ -100,6 +100,7 @@ typedef struct {
     double *fibacc; void *fiblist; unsigned *fibnl; size_t fibcap; double fib_h[2];   /* --fib-normal-lambda: valid voxels / sum t^T N t (device), the slab list, the fetched sums */
     uint8_t *auxb[AUX_N][2], *aux[AUX_N], *inkt, *inkm, *inkw;   /* the aux planes (double-buffered; plane j = role g_aux_role[j]); --ink-head: its slab target / mask, weight byte (loss parts: iscratch / iout / ink_loss) */
     inkray *milr[2]; int miln[2]; float *milacc; double *milloss, mil_loss, mil_raw; float mil_gs, mil_den; int mil_k, mil_n;   /* --ink-mil: the window's rays per buffer, the samples' accumulator, the loss (device); logged / raw */
+    uint8_t *tc; int tc_tried, tc_ok;   /* tc_ok: the cache holds this step's window (set by a training statistics pass, cleared by the gradient pass and by any other statistics pass) */   /* head_slab_pass: the window's derived targets / masks kept from the statistics pass for the gradient pass */
     uint8_t *rvt, *rvm; float *rvscratch, rvout[5]; double rv_loss; float rv_own;   /* rv_own: this GPU's window's rv bce (--mix-every) */
     uint8_t *fht, *fhm, *fdt, *fdm, *fhw; float *fhs[2], *fds, fhout[2][5], fdout[21]; double fib_loss, fib_raw[2];   /* --fib-head: the slab's H / V targets and masks, direction targets / mask, weight byte; loss scratch; fetched parts; loss at lambda, raw mask / direction bce */
     double *gcS; int gc_on, fs_drop; uint64_t lat_js; unsigned sr_ctr;   /* lat_js: --lat-step-jitter's generator; sr_ctr: the SR counter between the forward and backward phases */   /* fs_drop: this training step runs without the fine stem (--fstem-drop) */   /* --grad-cos: the step's logit-gradient Gram (device, K x K upper triangle), whether this step collects it */   /* --rv: the slab's recto / verso targets and mask; --rv 2 (own channels): its loss scratch and parts */
@@ -967,6 +968,23 @@ static void head_slab_pass(gpu_state *d, int pass) {
 #define FT(w) do { if (fine) nn_ptick(w); } while (0)
     const int si = d->srcb[d->cur];   /* the window's source (its "heads" weights) */
     const int nmil = g_mil ? d->miln[d->cur] : 0; const inkray *mrays = nmil ? d->milr[d->cur] : nullptr;
+    /* the derived targets and masks of every slab (phase 2 + 1, rv 2 + 1, normal / density 7 + 1 bytes a voxel) kept from the statistics
+       pass, so the gradient pass does not build them again (P 896: ~90 of 850 ms a step on the pod; the same bytes, so the same
+       gradients). 14 B a voxel = 10 GB at P 896, 29 GB at P 1280: taken only when at least 8 GB stay free after it, measured at the
+       first training pass, when the upload and augmentation buffers exist (the 16 GB cards at P 1024 never; UFSM_HS_TCACHE=0 / 1) */
+    uint8_t *const tsv[6] = {d->sidet, d->sidem, d->rvt, d->rvm, d->nt, d->nm};
+    const size_t tcS = (size_t)Z * hw, tcB = tcS * ((size_t)g_side_nc + 1 + (g_rv ? 3 : 0) + 8);
+    if (!d->tc_tried && !pass && d->hs_train && g_unwrap2 && g_side == 2) {
+        d->tc_tried = 1;
+        const size_t need = (size_t)((D + Z - 1) / Z) * tcB; const char *e = getenv("UFSM_HS_TCACHE");
+        nn_sync();
+        const size_t fr = nn_mem_free();
+        if (e ? atoi(e) != 0 : fr > need + ((size_t)8 << 30)) d->tc = nn_malloc_try(need);
+        fprintf(stderr, "head slabs (GPU %d): the slabs' derived targets %s (%.2f GB, %.2f GB free before; UFSM_HS_TCACHE=0 / 1)\n", d->dev,
+                d->tc ? "kept from the statistics pass for the gradient pass" : "built in both passes", need / 1e9, fr / 1e9);
+    }
+    const int tskip = pass && d->tc != nullptr && d->tc_ok;   /* (the gradient pass of a step: this window's slabs are in the cache) */
+    if (!pass) d->tc_ok = 0;   /* (valid for one step only: a replay of the window has other targets, a validation pass another window) */
     if (!pass) d->mil_n = 0;
     if (!pass && nmil) { nn_zero(d->milacc, (size_t)nmil * d->mil_k * sizeof(float)); nn_zero(d->milloss, sizeof(double)); }
     if (!pass) { nn_zero(d->hs_ds, 128 * sizeof(double)); if (g_unwrap2) nn_zero(d->w4ds, nn_wind4_sums()); if (g_fibn) nn_zero(d->fibacc, 2 * sizeof(double)); }
@@ -975,6 +993,12 @@ static void head_slab_pass(gpu_state *d, int pass) {
         const size_t ns = (size_t)nz * hw, vb = (size_t)z0 * hw;
 #define LGC(c) ((char *)d->hs_lg + (size_t)(c) * ns * 2)
         const uint8_t *sdb = d->sdb, *w4 = d->w4, *wc = d->wc, *apl[AUX_N]; for (int j = 0; j < AUX_N; j++) apl[j] = d->aux[j];
+        if (d->tc) {   /* this slab's block of the cache instead of the one-slab buffers */
+            uint8_t *b = d->tc + (size_t)(z0 / Z) * tcB;
+            d->sidet = b; b += (size_t)g_side_nc * tcS; d->sidem = b; b += tcS;
+            if (g_rv) { d->rvt = b; b += 2 * tcS; d->rvm = b; b += tcS; }
+            d->nt = b; b += 7 * tcS; d->nm = b;
+        }
         const int sj = z0 / Z, pipe = g_lstream && d->lbs2[0]; uint8_t *const *const lb = pipe && (sj & 1) ? d->lbs2 : d->lbs;
         if (g_lstream) {   /* this slab's label planes from the host (the phase with the gradient stencil's g_norm_s planes each side, the fibre H / V
                               planes with g_fd_r: lhalo); the kernels index window voxels */
@@ -1043,9 +1067,11 @@ static void head_slab_pass(gpu_state *d, int pass) {
         else if (g_lat && g_lat_guide && !fside) LGUIDE(0);   /* --lat-guide: the side channels' sub-cell terms from the CT */
         if (g_lat_hs) { FT("  u guide / shuffle"); PT("upsample"); }
         if (g_fstem && !d->fs_drop && nn_fstem_fwd(d->x, D, H, W, z0, nz, unet_live_params(d->u) + unet_fstem_off(d->u), g_fstem, g_fs_n, g_fs_ch, d->hs_lg, ns)) { fprintf(stderr, "--fstem: slab shape\n"); abort(); }
+        if (g_fstem) FT("  u fine stem fwd");
         const shape5 one = {1, 1, nz, H, W}, two = {1, 2, nz, H, W}, seven = {1, 7, nz, H, W};
-        nn_phase_targets(sdb + vb, ns, d->sidet, d->sidem); FT("  t phase targets");
-        if (g_rv) {   /* --rv: the side slot's targets (the phase targets above stay for the winding mod 4 / gradient terms) */
+        if (!tskip) nn_phase_targets(sdb + vb, ns, d->sidet, d->sidem);
+        FT("  t phase targets");
+        if (g_rv && !tskip) {   /* --rv: the side slot's targets (the phase targets above stay for the winding mod 4 / gradient terms) */
             nn_rv_targets(sdb + vb, pap + vb, ns, d->rvt, d->rvm); FT("  t rv targets");
             if (g_packed_w > 1) nn_packed_mask_z(sdb, D, H, W, g_norm_s, d->um, g_packed_um, g_packed_w, d->rvm, z0, z1);   /* packed sheets weigh more */
             FT("  t packed mask (rv)");
@@ -1061,10 +1087,10 @@ static void head_slab_pass(gpu_state *d, int pass) {
                     d->dev, ns, nr, nv, nvo, nm, 0, pk, pr, pap, pu);
             free(h); free(ph); free(pp);
         }
-        if (g_ptrunc_on) nn_phase_trunc(LGC(g_side_ch), LGC(g_side_ch + 1), d->sidet, d->sidem, ns, g_ptrunc_tau, g_ptrunc_kappa);   /* robust phase loss (both passes: the same mask) */
-        if (g_packed_w > 1) nn_packed_mask_z(sdb, D, H, W, g_norm_s, d->um, g_packed_um, g_packed_w, d->sidem, z0, z1);   /* packed sheets weigh more */
+        if (g_ptrunc_on && !tskip) nn_phase_trunc(LGC(g_side_ch), LGC(g_side_ch + 1), d->sidet, d->sidem, ns, g_ptrunc_tau, g_ptrunc_kappa);   /* robust phase loss (both passes: the same mask) */
+        if (g_packed_w > 1 && !tskip) nn_packed_mask_z(sdb, D, H, W, g_norm_s, d->um, g_packed_um, g_packed_w, d->sidem, z0, z1);   /* packed sheets weigh more */
         FT("  t packed mask (side)");
-        nn_unwrap_targets2_z(sdb, D, H, W, g_norm_s, g_dens_scale, g_dens_code, d->um, g_packed_um, g_packed_w, d->nt, d->nm, z0, z1); FT("  t normal targets");
+        if (!tskip) nn_unwrap_targets2_z(sdb, D, H, W, g_norm_s, g_dens_scale, g_dens_code, d->um, g_packed_um, g_packed_w, d->nt, d->nm, z0, z1); FT("  t normal targets");
         if (lchk && !pass) {   /* UFSM_LAT_CHECK=1: how dense the supervision is (slabs with every mask zero could skip their kernels: none in the rv recipe) */
             uint8_t *h = malloc(3 * ns); nn_sync(); nn_d2h(h, d->sidem, ns); nn_d2h(h + ns, sm, ns); nn_d2h(h + 2 * ns, d->nm, ns);
             static size_t nsl, nemp, nvox, nsup[3]; size_t c[3] = {0, 0, 0};
@@ -1144,6 +1170,7 @@ static void head_slab_pass(gpu_state *d, int pass) {
             const size_t pl = (size_t)(H / 4) * (W / 4); const int f0 = qa, f1 = z1 == D ? D / 4 : z1 / 4 - 1;
             if (z0 == 0) nn_zero(d->latg, (size_t)LGFC * qc * pl * 4);
             if (g_fstem && !d->fs_drop) nn_fstem_bwd(d->x, D, H, W, z0, nz, unet_live_params(d->u) + unet_fstem_off(d->u), g_fstem, g_fs_n, g_fs_ch, d->hs_lg, ns, unet_grad_ptr(d->u) + unet_fstem_off(d->u));   /* (before the adjoints reuse the planes) */
+            if (g_fstem) FT("  a fine stem bwd");
             if (g_lat_guide == 64) nn_lat_shuffle_adj_c((char *)d->hs_lg + (size_t)g_side_ch * ns * 2, D / 4, H / 4, W / 4, LBASE, 2, z0, nz, d->latgl, q0, qc);
             else if (g_lat_guide && !fside) LGUIDE(1);
             FT("  a guide / shuffle adjoint");   /* the coefficient planes' gradients (the guided heads: every output is interpolated, all through the fp32 sums) */
@@ -1169,7 +1196,7 @@ static void head_slab_pass(gpu_state *d, int pass) {
                 if (unet_head_bwd_z(d->u, f0, f1, d->latgc, z0 == 0)) { fprintf(stderr, "latent head stream: the head backward is not covered per slab (UFSM_LAT_HEAD_STREAM=0)\n"); abort(); }
             }
             if (z1 < D) nn_lat_grad_carry(d->latg, LGFC, d->latgl, LNC, pl, qc, Z / 4, 2);
-            nn_ptick("trunk backward");
+            nn_ptick("p1 head conv backward (slab)");
             if (pipe) nn_event_record(d->evl_free[sj & 1], 0);
             continue;
         }
@@ -1218,6 +1245,8 @@ static void head_slab_pass(gpu_state *d, int pass) {
         if (fside) nn_loss_stats_fin(d->hs_ds + 10, d->sidew, w2, d->sscratch);
         nn_loss_stats_fin(d->hs_ds + 20, d->nw, w7, d->nscratch);
     }
+    d->sidet = tsv[0]; d->sidem = tsv[1]; d->rvt = tsv[2]; d->rvm = tsv[3]; d->nt = tsv[4]; d->nm = tsv[5];
+    d->tc_ok = !pass && d->tc != nullptr && d->hs_train;
 }
 static void head_slab_cb(void *ctx) {
     gpu_state *d = ctx;
@@ -1455,7 +1484,7 @@ static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
         const float *l2 = unet_forward_x(d->u, d->x2, (shape5){B, unet_cfg_of(d->u)->cin, q, q, q}, train, g_xfmt != 0);
         nn_lowres_output(l2, unet_logits_h16(d->u), hs, g_hdiv, hm, (float *)d->lrt, d->lgf);
         lg = d->lgf;
-    } else if (g_lat) { nn_ptick("other"); lg = unet_forward_x(d->u, d->x, (shape5){B, unet_cfg_of(d->u)->cin, g_Pz / 4, P / 4, P / 4}, train, g_xfmt != 0); nn_ptick("trunk forward"); }   /* --lat: x the full-resolution CT channel */
+    } else if (g_lat) { nn_ptick("other: before the forward"); lg = unet_forward_x(d->u, d->x, (shape5){B, unet_cfg_of(d->u)->cin, g_Pz / 4, P / 4, P / 4}, train, g_xfmt != 0); nn_ptick("trunk forward"); }   /* --lat: x the full-resolution CT channel */
     else lg = unet_forward_x(d->u, d->x, xs, train, g_xfmt != 0);
     d->lg = lg;
     mem_post(d, B, train);
@@ -1491,7 +1520,7 @@ static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
             head_slab_pass(d, 1);
             if (d->hsplit) nn_event_record(d->ev_hs, 0);   /* (the callback's record: this mode runs the gradient pass here) */
             nn_f32_to_h16(d->latg, nc, d->latgl, 1.f);   /* (the slab gradients carry the gradient scale already) */
-            d->gl = d->latgl; nn_ptick("other");
+            d->gl = d->latgl; nn_ptick("other: gradient pass tail (f32 -> h16)");
         }
         if (prof) nn_prof_end();
         return;
@@ -3778,7 +3807,7 @@ int cmd_train(int argc, char **argv) {
             gpu_state *d = &G[g];
             nn_init(d->dev);
             if (prof) nn_prof_begin(7);
-            nn_ptick("other");
+            nn_ptick("other: loss fetch, gradient average");
             if (g == 0) gn = unet_grad_norm(d->u);          /* identical on every GPU after averaging */
             if (plan && (!isfinite(gn) || fwd_nan)) {
                 fprintf(stderr, "cover tile %llu has non-finite forward/gradients; aborting without advancing its cursor\n", (unsigned long long)coverage.cursor);
