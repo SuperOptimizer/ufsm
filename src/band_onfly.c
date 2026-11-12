@@ -77,6 +77,13 @@ static void ob_give(onfly_buf *B) { pthread_mutex_lock(&g_obmu); B->busy = 0; pt
    CPU path (a chunk the GPU did not decode, a CUDA failure, codes not in 128^3 volcomp lossless chunks). */
 typedef struct { uint8_t *b; size_t n, cap; bg_lchunk *ch; int nch, ccap; } onfly_pack;
 static thread_local onfly_pack t_pk;
+/* the pack buffer back to nothing after a tile that grew it past the floor (UFSM_ONFLY_PACK_MB, default 64): it doubled up to the largest
+   tile's encoded bytes and stayed, per reading thread (a pooled tile packs 8^k times the chunks; hard cap 4 GB by the 32-bit offsets) */
+static void pk_trim(void) {
+    static _Atomic long long fl = -1; long long v = atomic_load(&fl);
+    if (v < 0) { const char *e = getenv("UFSM_ONFLY_PACK_MB"); v = e && *e ? atoll(e) << 20 : (long long)64 << 20; if (v < 0) v = 0; atomic_store(&fl, v); }
+    if (t_pk.cap > (size_t)v) { free(t_pk.b); t_pk.b = nullptr; t_pk.cap = t_pk.n = 0; }
+}
 static size_t pk_put(onfly_pack *K, const void *src, size_t n, size_t align) {
     size_t o = (K->n + align - 1) & ~(align - 1);
     if (o + n + 64 > K->cap) { size_t c = K->cap ? K->cap : 1 << 20; while (c < o + n + 64) c *= 2; uint8_t *nb = realloc(K->b, c); if (!nb) return SIZE_MAX; K->b = nb; K->cap = c; }
@@ -168,7 +175,7 @@ static int onfly_read(void *vctx, z3 *codes, const int64_t o[3], const int64_t n
                 if (!t_gpb.p) { t_gpb.pinned = 0; t_gpb.p = malloc(tnn); }
                 t_gpb.cap = t_gpb.p ? tnn : 0; if (!t_gpb.p) { rc = -1; break; }
             }
-            const int g = tile_gpu(codes, co, cn, ro, rn, h, tn, C->rmax, t_gpb.p);
+            const int g = tile_gpu(codes, co, cn, ro, rn, h, tn, C->rmax, t_gpb.p); pk_trim();
             if (g == 2) { atomic_fetch_add(&g_skipped, 1); continue; }
             if (!g) {
                 atomic_fetch_add(&g_ns_pair, (uint64_t)(1e9 * (now_s() - t0))); atomic_fetch_add(&g_tiles, 1); atomic_fetch_add(&g_vtile, (uint64_t)cn[0] * cn[1] * cn[2]); atomic_fetch_add(&g_gputiles, 1);
@@ -325,7 +332,7 @@ int phase_onfly_decode_gpu(z3 *codes, const int64_t o[3], const int64_t n[3], ui
     const z3_meta *m = z3_meta_of(codes); int64_t ro[3], rn[3], tn[3];
     for (int d = 0; d < 3; d++) { ro[d] = o[d] < 0 ? 0 : o[d]; rn[d] = (o[d] + n[d] < m->shape[d] ? o[d] + n[d] : m->shape[d]) - ro[d]; if (rn[d] <= 0) return -2; tn[d] = n[d]; }
     if (!band_pair_gpu_codes) return -1;
-    const int r = tile_gpu(codes, o, n, ro, rn, 0, tn, 0, out);
+    const int r = tile_gpu(codes, o, n, ro, rn, 0, tn, 0, out); pk_trim();
     if (r == 2) { memset(out, 0, (size_t)n[0] * n[1] * n[2]); return 0; }
     return r;
 }

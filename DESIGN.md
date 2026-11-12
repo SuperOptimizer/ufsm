@@ -6,6 +6,42 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## U2's host memory: the inventory, and the two per-thread buffers that only grew (2026-11-12, branch poolcap-20261112)
+
+U2 on the pod (8 workers / 10 slots, a 175 GB cgroup shared with every other job) went from 68 to 116 GB of host memory in 19 minutes and
+tripped its watchdog. The host-side buffers of its recipe at P 1024 (one byte plane = 1.07 GB), from the code; "measured" where a run says so:
+
+| what | bound | set by | scope |
+|---|---|---|---|
+| sampler slots (pinned: shmem) | 3.4 GB each: CT 1 + phase 1 + papyrus / ink plane 1 + ink bits 1/8, run lists | `--sampler-slots` | per slot (10 slots: 34 GB; U2 measured 36 GB shmem) |
+| worker fixed scratch | 1.6 GB resident (measured, desk) of 15 GB reserved | `--workers` | per worker |
+| worker buffer pool (`tp_get` / `tp_put`) | was 32 buffers of any sizes, never trimmed; now also `UFSM_TP_POOL_MB` (2048) bytes | this branch | per worker |
+| on-the-fly phase pack buffer (`t_pk`) | was the largest tile's encoded bytes, kept (4 GB hard cap); now freed after a tile past `UFSM_ONFLY_PACK_MB` (64) | this branch | per reading thread |
+| on-the-fly phase interior buffer (pinned) | one tile interior, ~0.3 GB | `--onfly-mb` | per reading thread |
+| on-the-fly phase CPU buffer sets (pinned) | 3 x 0.57 GB each, only on a CPU fallback | `--onfly-slots` | global |
+| pooled ink level read | 8.6 GB transient; 0.54 GB with sampmem-20261112 | | per worker building an ink window at its pooled level |
+| ink target cache | 2 GB ("cache_mb") | sources json | per ink source (8: 16 GB) |
+| ink decoded-CT cache | 1 GB, hard-coded | inksplat.c | per ink source (8: 8 GB) |
+| ink segment index, mesh codes packs | the data's size | | per source, fixed after open |
+| cached on-the-fly phase arrays (meshes) | 1 GB each ("cache_mb") | sources json | per mesh source and level |
+| binary-mask chunk cache | 1 GB | `UFSM_Z3_MASK_CACHE_MB` | global |
+| shard index table | none; a few KB per shard touched | `UFSM_Z3_INDEX_MEM=0` | global |
+| shared decoded-CT cache (/dev/shm) | G GB | `UFSM_ZCACHE_GB` (off unless set) | global |
+| trainer (batch staging, the lean plan's host offloads, the CUDA runtime) | ~13 GB | `--mem` plan | fixed |
+| disk chunk cache, derived-array disk cache | page cache (reclaimable) | "cache" | not anon / shmem |
+
+Replays hold their slot and have no buffer of their own. The bounded rows give about 85 / 100 / 125 GB at 6 / 8, 8 / 10 and 12 / 14
+workers / slots once the per-source ink caches are full (estimates, not measured); the rows that are per source rather than global are
+the ink caches and the cached phase arrays.
+
+- The pool's byte cap: past it the oldest pooled buffers are freed on put (a buffer larger than the cap is never pooled). Fixture check
+  (CPU, `--det 1`, P 128, `--gpu-aug 0` with rotations / elastic warps so the pool is used: 8 classes, 10 P^3 a worker): the 48 batch
+  hashes (`UFSM_BATCH_HASH`) are identical with the cap at 0 (none), 1 MB, 6 MB, the default, and on a build without the change; the
+  pool's bytes 0.06 -> 0.02 GB at 6 MB. Peak RSS is unchanged at that size (0.36 GB): the cap bounds what is retained, not what is lent.
+- The pack buffer's trim is not exercised by any desk run (it needs the GPU tile path); it frees and zeroes the thread's buffer after
+  the tile's device call returns.
+- Which row climbed in U2 is not known yet (its `hostmem:` lines will say); u1's recipe on the desk never touched the pool (peak 0).
+
 ## predict --boxes: many boxes in one process; the start-up of a predict run (2026-11-12, branch univdec-20261112)
 
 A predict run's start-up, timestamped on the pod box (5 heads + fit-zarr, 16.6 s elapsed, the window loop 10.5 s):
