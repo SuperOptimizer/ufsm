@@ -2216,16 +2216,18 @@ typedef void (*ray_prep)(const void *ctx, double thw);   /* (optional: per-ray c
    interval and root is the one of the full scan: the same roots. Rays without a kept root (no crossing, or the first ring's crossings
    outside [ua, ub]) took ~70% of the evaluations at 130-190 each (Paris 4). */
 typedef double (*ray_lip)(const void *ctx, double y, double x, double asy, double asx, double q);
-static inline int ray_root_b(ray_ev evr, ray_prep prep, const void *ctx, const fit_model *m, double z, double theta, double k, double r_hint, double ua, double ub, ray_lip lipf, double *r);
-static int ray_root(ray_ev evr, ray_prep prep, const void *ctx, const fit_model *m, double z, double theta, double k, double r_hint, double *r) { return ray_root_b(evr, prep, ctx, m, z, theta, k, r_hint, -1e300, 1e300, nullptr, r); }
+/* rmax: an upper bound of every radius lipf returns per turn of q (1 / the bound's floor: the smallest pitch); a radius is asked for only
+   when it could reach the next step (most rays find their root in the first ring next to the hint: no lookups there) */
+static inline int ray_root_b(ray_ev evr, ray_prep prep, const void *ctx, const fit_model *m, double z, double theta, double k, double r_hint, double ua, double ub, ray_lip lipf, double rmax, double *r);
+static int ray_root(ray_ev evr, ray_prep prep, const void *ctx, const fit_model *m, double z, double theta, double k, double r_hint, double *r) { return ray_root_b(evr, prep, ctx, m, z, theta, k, r_hint, -1e300, 1e300, nullptr, 0, r); }
 static inline double rr_rad_out(double f) { const double q = f < 0 ? -f : f < 2 ? (f < 2 - f ? f : 2 - f) : 0; return q > 1e-7 ? q - 1e-7 : 0; }   /* (margin: W's rounding, ~1e-12) */
 static inline double rr_rad_in(double f) { const double q = f >= 0 ? f : f > -2 ? (-f < f + 2 ? -f : f + 2) : 0; return q > 1e-7 ? q - 1e-7 : 0; }
-static inline __attribute__((always_inline)) int ray_root_b(ray_ev evr, ray_prep prep, const void *ctx, const fit_model *m, double z, double theta, double k, double r_hint, double ua, double ub, ray_lip lipf, double *r) {   /* (inlined: a constant evaluator inlines too) */
+static inline __attribute__((always_inline)) int ray_root_b(ray_ev evr, ray_prep prep, const void *ctx, const fit_model *m, double z, double theta, double k, double r_hint, double ua, double ub, ray_lip lipf, double rmax, double *r) {   /* (inlined: a constant evaluator inlines too) */
     const int na = (int)(m->D * m->h) + 1;
     const double cy = axis_lerp(m->cy, na, z), cx = axis_lerp(m->cx, na, z), sy = sin(theta), sx = cos(theta), thw = atan2(sy, sx);
     if (prep) prep(ctx, thw);
     const double asy = fabs(sy), asx = fabs(sx);
-#define RAD(R_, Q_) (lipf ? lipf(ctx, cy + (R_) * sy, cx + (R_) * sx, asy, asx, (Q_)) : 0)   /* (0: every step evaluated) */
+#define RAD(R_, Q_, D_) (lipf && (Q_) * rmax > (D_) ? lipf(ctx, cy + (R_) * sy, cx + (R_) * sx, asy, asx, (Q_)) : 0)   /* (0: every step evaluated; D_: the step's distance) */
     const double Y = m->H * m->h, X = m->W * m->h;
     double rlo = 0, rhi = 1e9;   /* the part of the ray inside the box */
     const double c0[2] = {cy, cx}, dv[2] = {sy, sx}, ext[2] = {Y, X};
@@ -2245,26 +2247,28 @@ static inline __attribute__((always_inline)) int ray_root_b(ray_ev evr, ray_prep
     const double h0 = fmin(fmax(r_hint, rlo), rhi), f0 = EVR(h0) - k;
     double ro = h0, fo = f0, ri = h0, fi = f0, best = -1, bestd = 1e300;
     /* the skips: fo / fi exact (okn / ikn) or only their class (the anchor's value, at oa / ia, safe up to the radius ora / ira) */
-    int okn = 1, ikn = 1; double oa = h0, ia = h0, ora = RAD(h0, rr_rad_out(f0)), ira = RAD(h0, rr_rad_in(f0));
+    int okn = 1, ikn = 1; double oa = h0, ia = h0, ora = -1, ira = -1;   /* (radii < 0: not asked yet, asked at the next step) */
     while ((ro < rhi && fo < 2) || (ri > rlo && fi > -2)) {
         if ((!(ro < rhi && fo < 2) || ro > ub) && (!(ri > rlo && fi > -2) || ri < ua)) return -1;   /* only dropped roots are left */
         double seg[RR_SEG][4]; int ns = 0;   /* (a, b, f(a), f(b)) of this ring's crossing intervals */
         if (ro < rhi && fo < 2) {
             const double rn = ro + dr < rhi ? ro + dr : rhi;   /* (fmin's value: both finite; no libm call) */
+            if (ora < 0) ora = RAD(oa, rr_rad_out(fo), rn - oa);   /* (fo: the anchor's exact value) */
             if (rn - oa < ora) { ro = rn; okn = 0; }   /* (W - k keeps fo's class there) */
             else {
                 const double fn = EVR(rn) - k;
                 if ((fo < 0) != (fn < 0)) { if (!okn) fo = EVR(ro) - k; ns = rr_cross(evr, ctx, z, cy, cx, sy, sx, thw, k, ro, fo, rn, fn, 0, seg, ns); }
-                ro = rn; fo = fn; okn = 1; oa = rn; ora = RAD(rn, rr_rad_out(fn));
+                ro = rn; fo = fn; okn = 1; oa = rn; ora = -1;
             }
         }
         if (ri > rlo && fi > -2) {
             const double rn = ri - dr > rlo ? ri - dr : rlo;
+            if (ira < 0) ira = RAD(ia, rr_rad_in(fi), ia - rn);
             if (ia - rn < ira) { ri = rn; ikn = 0; }
             else {
                 const double fn = EVR(rn) - k;
                 if ((fi < 0) != (fn < 0)) { if (!ikn) fi = EVR(ri) - k; ns = rr_cross(evr, ctx, z, cy, cx, sy, sx, thw, k, rn, fn, ri, fi, 0, seg, ns); }
-                ri = rn; fi = fn; ikn = 1; ia = rn; ira = RAD(rn, rr_rad_in(fn));
+                ri = rn; fi = fn; ikn = 1; ia = rn; ira = -1;
             }
         }
         if (ns) { int out = 1; for (int q = 0; q < ns; q++) out &= seg[q][1] < ua || seg[q][0] > ub; if (out) return -1; }
@@ -2807,7 +2811,7 @@ int fit_set_ray_root(const fit_set *s, double z, double theta, double k, double 
 }
 int fit_set_ray_root_b(const fit_set *s, double z, double theta, double k, double r_hint, double ua, double ub, double *r) {
     ev_row R; ev_row_init(&R, s, z);
-    return ray_root_b(ev_row_Wt, ev_row_prep, &R, s->global, z, theta, k, r_hint, ua, ub, nullptr, r);
+    return ray_root_b(ev_row_Wt, ev_row_prep, &R, s->global, z, theta, k, r_hint, ua, ub, nullptr, 0, r);
 }
 /* W's local Lipschitz bounds (fit_lip): per model, lattice z cell (plane pair) and tile of LIP_T x LIP_T lattice cells, the largest
    |delta| difference of y (x) neighbour nodes over the tile and its 8 neighbours, per native voxel. Along a ray at angle th, at a
@@ -2877,7 +2881,7 @@ fit_lip *fit_lip_new(const fit_set *s) {
 void fit_lip_free(fit_lip *L) { if (!L) return; for (int k = 0; k <= L->n; k++) free(L->t[k].g); free(L->t); free(L); }
 /* the same for many rays of one z (ufsm wraps' rows): the slab choice and the z parts once per row */
 typedef struct { const float *g; int ny, nx; double ip, reach; } lip_row;   /* a part's plane pair of tiles; 1 / pitch; (LIP_T - 1) L */
-struct fit_set_row { ev_row R; const fit_set *s; double z; int nl; lip_row l[2]; };   /* (R first: the evaluator's context) */
+struct fit_set_row { ev_row R; const fit_set *s; double z; int nl; lip_row l[2]; double rmax; };   /* rmax: the parts' smallest pitch (L >= 1 / pitch) */   /* (R first: the evaluator's context) */
 static int lip_part(const fit_lip *L, const fit_set *s, const ev_part *p, lip_row *o) {
     int k = s->n; for (int q = 0; q < s->n; q++) if (s->slab[q] == p->m) { k = q; break; }
     const lip_tab *T = &L->t[k]; const int pz = p->c0z < T->np ? p->c0z : T->np - 1;
@@ -2907,11 +2911,12 @@ fit_set_row *fit_set_row_new_lip(const fit_set *s, double z, const fit_lip *L) {
     fit_set_row *w = malloc(sizeof *w); if (!w) return nullptr;
     w->s = s; w->z = z; ev_row_init(&w->R, s, z); w->nl = 0;
     if (L && L->n == s->n && !lip_part(L, s, &w->R.a, &w->l[0]) && (!w->R.mode || !lip_part(L, s, &w->R.b, &w->l[1]))) w->nl = w->R.mode ? 2 : 1;
+    w->rmax = w->nl ? (w->nl > 1 && w->R.b.pit < w->R.a.pit ? w->R.b.pit : w->R.a.pit) : 0;
     return w;
 }
 fit_set_row *fit_set_row_new(const fit_set *s, double z) { return fit_set_row_new_lip(s, z, nullptr); }
 int fit_set_row_root_b(fit_set_row *w, double theta, double k, double r_hint, double ua, double ub, double *r) {
-    return ray_root_b(ev_row_Wt, ev_row_prep, &w->R, w->s->global, w->z, theta, k, r_hint, ua, ub, w->nl ? ev_row_lip : nullptr, r);
+    return ray_root_b(ev_row_Wt, ev_row_prep, &w->R, w->s->global, w->z, theta, k, r_hint, ua, ub, w->nl ? ev_row_lip : nullptr, w->rmax, r);
 }
 void fit_set_row_free(fit_set_row *w) { free(w); }
 int fit_set_save(const fit_set *s, const char *dir) {
