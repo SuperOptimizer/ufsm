@@ -257,6 +257,22 @@ Numbers:
   The fit fields now cost +1.4 s of GPU over the 18 windows (75 ms a window, against 177) and +0.5 s of wall. The main loop still waits
   3.9 s on the fit writer's ring, behind the copies of the field slabs on the GPU's queue.
 
+Desk, one RTX 5060 Ti (u1 stopped), a 4.3 Gvox Paris4 level-2 box from local CT, window 544 (k 1), 32 tiles, ~/bin/lowcpu:
+
+| run | GPU | loop wall | Gvox/s | elapsed |
+|---|---|---|---|---|
+| 1 head, page cache cold | 3.98 s | 4.50 s | 0.93 | 9.9 s |
+| 1 head | 3.87 s | 4.41 s | 0.95 | 5.2 s |
+| 5 heads | 4.90 s | 6.38 s | 0.65 | 8.6 s |
+| 5 heads + fit-zarr (fused) | 6.78 s | 8.24 s | 0.50 | 14.0 s |
+
+On the desk the card is the limit:
+- the 4 extra heads cost +1.0 s of GPU (+27 %);
+- the fit fields +1.9 s (+38 %; the pod: +19 %);
+- the 5-head + fit loop waits 4.05 s on the fit writer's ring (the pod: 3.9 s), the first thing to remove next;
+- the reader waits 1.3 - 4.8 s for free slots (it is ahead).
+A whole Paris4 level 2 at 0.50 Gvox/s is ~17 min a card for 5 heads + fit.
+
 What would make it smaller:
 - the shifted regions: each block upsamples the winding pair and runs the stem on 3 more regions, 2/3 of the stem work. A window-wide
   pass that keeps the winding pair's fp16 logits (4 B a voxel) would remove that.
