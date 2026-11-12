@@ -10,6 +10,7 @@
 #include "scan_augment.h"
 #include "pyramid.h"
 #include "vcgpu.h"
+#include "gpudec.h"
 #include "sources.h"
 #include "split.h"
 #include "store.h"
@@ -53,7 +54,28 @@ typedef struct {
     double t_read, t_stats, t_wait;   /* UFSM_PRED_PROF: seconds in z3_read, the stats scan, waiting for a free slot */
     int nostats;                      /* the window statistics are computed on the device (default path) */
     zr *lz; const long long *lzo; int lzc, lzt;   /* (lzt handles of the store, one decoding thread each) */   /* --latents: the window's stored cells instead of its CT (nz[k]: 0 when every cell is air) */
+    uint8_t *dbuf[NSLOT]; void **ctw; int nctw; int64_t csh[3];   /* UFSM_PRED_DEVREAD: device windows, filled by nctw chunk workers (nn_ctw_*); csh the array shape */
+    _Atomic long cnext; long nch; int64_t c0[3], cn[3], tz_o[3]; int cslot; atomic_long ndev, nhost, nskip;   /* (the window being read: its chunk grid) */
 } reader_t;
+/* one device-read worker: chunks of the current window decoded (the GPU's substreams on the device) and gathered into its device slot */
+typedef struct { reader_t *r; int w; } ctw_arg;
+static void *ctw_work(void *a) {
+    ctw_arg *A = a; reader_t *r = A->r; void *w = r->ctw[A->w]; uint8_t *hc = nn_ctw_host(w), *dc = nn_ctw_dev(w);
+    const int64_t n128[3] = {128, 128, 128}, wn[3] = {r->Wz, r->W, r->W}; const int k = r->cslot;
+    for (long j; (j = atomic_fetch_add(&r->cnext, 1)) < r->nch && !atomic_load(&r->failed);) {
+        const int64_t co[3] = {(r->c0[0] + j / (r->cn[1] * r->cn[2])) * 128, (r->c0[1] + j / r->cn[2] % r->cn[1]) * 128, (r->c0[2] + j % r->cn[2]) * 128};
+        uint32_t dm = 0;
+        if (z3_read_sub_dev(r->ct, co, n128, hc, 1, 0, dc, &dm)) { atomic_store(&r->failed, 1); break; }
+        int host = dm != 0xffffffffu;
+        if (host && !dm) {   /* everything on the host: nothing to do when it is all fill (0; the window is zeroed) */
+            const uint64_t *q = (const uint64_t *)hc; uint64_t any = 0; for (size_t i = 0; i < ((size_t)1 << 21) / 8 && !any; i++) any |= q[i];
+            if (!any) { atomic_fetch_add(&r->nskip, 1); continue; }
+        }
+        atomic_fetch_add(host ? &r->nhost : &r->ndev, 1);
+        if (nn_ctw_put(w, dm, host, co, r->tz_o, wn, r->csh, r->dbuf[k])) { atomic_store(&r->failed, 1); break; }
+    }
+    return nullptr;
+}
 static void *reader_main(void *arg) {
     reader_t *r = arg;
     size_t w3 = (size_t)r->Wz * r->W * r->W;
@@ -75,6 +97,18 @@ static void *reader_main(void *arg) {
                 for (size_t j = nb / 8 * 8; j < nb && !any; j++) any |= r->buf[k][j];
                 r->nz[k] = any != 0; r->t_read += now() - t1;
             }
+        } else if (r->dbuf[0]) {   /* UFSM_PRED_DEVREAD: the window decoded into device slot k */
+            if (nn_ctw_zero(r->ctw[0], r->dbuf[k], w3)) atomic_store(&r->failed, 1);
+            int empty = 0;
+            for (int d = 0; d < 3; d++) { const int64_t lo = o[d] < 0 ? 0 : o[d], hi = o[d] + n[d] > r->csh[d] ? r->csh[d] : o[d] + n[d];
+                                          if (hi <= lo) empty = 1; else { r->c0[d] = lo / 128; r->cn[d] = (hi + 127) / 128 - r->c0[d]; } r->tz_o[d] = o[d]; }
+            if (!empty) {
+                r->nch = r->cn[0] * r->cn[1] * r->cn[2]; atomic_store(&r->cnext, 0); r->cslot = k;
+                pthread_t th[256]; ctw_arg A[256]; const int nt = r->nctw < 256 ? r->nctw : 256;
+                for (int t = 0; t < nt; t++) { A[t] = (ctw_arg){r, t}; pthread_create(&th[t], nullptr, ctw_work, &A[t]); }
+                for (int t = 0; t < nt; t++) pthread_join(th[t], nullptr);
+            }
+            r->t_read += now() - t1;
         } else
         if (z3_read(r->ct, o, n, r->buf[k], r->nthreads)) { atomic_store(&r->failed, 1); }
         else if (r->nostats) r->t_read += now() - t1;
@@ -1078,6 +1112,10 @@ static void cellq_apply(const void *ld, int lh16, int C, int d, int h, int w, in
 }
 
 int cmd_predict(int argc, char **argv) {
+    /* UFSM_PRED_DEVREAD=1: the CT windows decoded on the GPU into device memory (volcomp's GPU decoder, byte-identical): turned on here,
+       before the first z3 read opens the decoder, on the predict GPU */
+    const int devread = ufsm_env_on("UFSM_PRED_DEVREAD");
+    if (devread) { setenv("UFSM_GPU_DECODE", "1", 0); if (!getenv("UFSM_GPU_DECODE_DEV")) setenv("UFSM_GPU_DECODE_DEV", opt(argc, argv, "--gpu", "0"), 1); }
     if (argc < 6) {
         fprintf(stderr, "usage: ufsm predict <ckpt> <root> <ct-group-key> <out-dir> --um U [--level 0] [--box z,y,x,nz,ny,nx] [--window W] [--act-mx8 1]\n"
                         "       [--halo H] [--shard 512] [--gpu 0] [--cache DIR] [--axis umbilicus.json] [--levels 4] [--q 8] [--threads 16]\n"
@@ -2024,6 +2062,16 @@ int cmd_predict(int argc, char **argv) {
         }
     }
     for (int k = 0; k < NSLOT; k++) rd.buf[k] = gpath ? nn_host_alloc(w3) : malloc(w3);
+    if (devread && gpath && !degrade && !lat_store && !split) {   /* UFSM_PRED_DEVREAD: device windows (else the host path) */
+        const z3_meta *cm = z3_meta_of(ct); int ok = cm->chunk[0] == 128 && cm->chunk[1] == 128 && cm->chunk[2] == 128 && cm->esize == 1 && gpudec_enabled();
+        for (int k = 0; k < NSLOT && ok; k++) ok = (rd.dbuf[k] = nn_malloc_try(w3)) != nullptr;
+        const int nw = gpudec_threads(nthreads > 0 ? nthreads : (int)ufsm_ncpu());
+        if (ok) { rd.ctw = calloc((size_t)nw, sizeof(void *)); for (int t = 0; t < nw && ok; t++) ok = (rd.ctw[t] = nn_ctw_new(gpu)) != nullptr; rd.nctw = nw; }
+        for (int d = 0; d < 3; d++) rd.csh[d] = cm->shape[d];
+        if (!ok) { for (int k = 0; k < NSLOT; k++) { if (rd.dbuf[k]) nn_free(rd.dbuf[k]); rd.dbuf[k] = nullptr; }
+                   fprintf(stderr, "predict: UFSM_PRED_DEVREAD: no device windows (memory, chunking or no GPU decoder): the host path\n"); }
+        else fprintf(stderr, "predict: the CT windows decoded into device memory (%d chunk workers, %.1f GB)\n", nw, NSLOT * (double)w3 / 1e9);
+    }
     rd.nostats = gpath;
     atomic_store(&rd.filled, 0); atomic_store(&rd.consumed, 0); atomic_store(&rd.failed, 0);
     pthread_mutex_init(&rd.mu, nullptr); pthread_cond_init(&rd.cv, nullptr);
@@ -2062,7 +2110,7 @@ int cmd_predict(int argc, char **argv) {
        device copy into ctd): the synchronous upload left the GPU idle ~9 ms per 384 x 640^2 window. Not with --aug-* (degrade rewrites
        the host window first); UFSM_PRED_CTPRE=0 off. long pre_i: the window whose CT ctpre holds (or is receiving) */
     uint8_t *ctpre = nullptr; void *ev_pre = nullptr, *ev_preu = nullptr; long pre_i = -1;
-    if (gpath && !degrade && !split && !lat_store && (!getenv("UFSM_PRED_CTPRE") || ufsm_env_on("UFSM_PRED_CTPRE")) && (ctpre = nn_malloc_try(w3))) {
+    if (gpath && !degrade && !split && !lat_store && !rd.dbuf[0] && (!getenv("UFSM_PRED_CTPRE") || ufsm_env_on("UFSM_PRED_CTPRE")) && (ctpre = nn_malloc_try(w3))) {
         ev_pre = nn_event_create(); ev_preu = nn_event_create();
     }
     if (split) {   /* both GPUs on every window */
@@ -2135,7 +2183,7 @@ int cmd_predict(int argc, char **argv) {
                 } else {
                 if (pre_i == i) {   /* prefetched: the copy stream's upload, then one device copy (the prefetch buffer free again after it) */
                     nn_stream_wait(0, ev_pre); nn_d2d_async(ctd, ctpre, w3); nn_event_record(ev_preu, 0);
-                } else nn_h2d(ctd, ctu, w3);
+                } else if (rd.dbuf[0]) nn_d2d(ctd, rd.dbuf[k], w3); else nn_h2d(ctd, ctu, w3);
                 nn_pred_stats(ctd, w3, stsc, &nz, &sum, &sq);
                 }
                 pthread_mutex_lock(&rd.mu); atomic_store(&rd.consumed, i + 1); pthread_cond_broadcast(&rd.cv); pthread_mutex_unlock(&rd.mu);
@@ -2500,6 +2548,7 @@ int cmd_predict(int argc, char **argv) {
         if (pprof) p_copy += now() - tw;
     }
     if (nn_ptick_on()) { fprintf(stderr, "\n"); nn_ptick_report((int)(ntiles > 0 ? ntiles : 1)); }
+    if (pprof && rd.dbuf[0]) fprintf(stderr, "\npredict profile: device CT windows: %ld chunks all on the GPU, %ld with host substreams, %ld fill\n", (long)rd.ndev, (long)rd.nhost, (long)rd.nskip);
     if (pprof) fprintf(stderr, "\npredict profile (s): main: wait-reader %.2f h2d %.2f gpu(fwd+d2h) %.2f interior-copy %.2f writer-wait %.2f fit-writer-wait %.2f | reader: read %.2f stats %.2f slot-wait %.2f | wall %.2f, %ld tiles\n",
                        p_wait, p_h2d, p_gpu, p_copy, p_wr, p_ffw, rd.t_read, rd.t_stats, rd.t_wait, now() - t0, ntiles);
     if (!sup && cur_shard >= 0 && any && lhm) for (int j = 0; j < nph; j++) if (phead_submit(&PH[j], phd, sz, sy, sx, sz)) return 1;
@@ -2578,6 +2627,9 @@ int cmd_predict(int argc, char **argv) {
                  if (pprof) fprintf(stderr, "predict profile (s): prefetch: %ld chunks fetched ahead of the reader in %.2f s (%d windows ahead, %d threads)%s\n", PF.nfetch, PF.t_fetch, PF.ahead, PF.nt, atomic_load(&PF.bad) ? ", some failed (the reader fetched them)" : ""); }
     pthread_join(rth, nullptr);
     for (int k = 0; k < NSLOT; k++) { if (gpath) nn_host_free(rd.buf[k]); else free(rd.buf[k]); }
+    for (int k = 0; k < NSLOT; k++) if (rd.dbuf[k]) nn_free(rd.dbuf[k]);
+    for (int t = 0; t < rd.nctw; t++) nn_ctw_free(rd.ctw[t]);
+    free(rd.ctw);
     free(rd.tiles);
     fprintf(stderr, "\rshard %lld/%lld  %ld tiles (%ld air)  %.0fs   \n", (long long)(ns[0] * ns[1] * ns[2]), (long long)(ns[0] * ns[1] * ns[2]), ntiles, nskip, now() - t0);
     z3w_close(w);

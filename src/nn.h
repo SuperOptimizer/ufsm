@@ -408,6 +408,14 @@ void nn_lat_head_place(const void *lg, int lh16, int d, int h, int w, int c0, in
 void nn_lat_heads_place(const void *lg, int lh16, int d, int h, int w, int nh, const int *c0, const int *c1, const int *sb0, const int *sb1, const int *s0, const int *s1,
                         uint8_t *const *dsh, const float *stem, int C, int nout, const uint8_t *ct, float mean, float isd, int iso,
                         int hz, int halo, int oz, int oy, int ox, int ez, int ey, int ex, int shard);
+/* predict's device-resident CT window (src/nn_ctdev.cu): a reader worker's stream + device / host chunks; nn_ctw_put gathers one decoded
+   chunk (device substreams dm, the host chunk too when host) into the window [wo, wo + wn) clipped to the array shape sh, and waits */
+void *nn_ctw_new(int dev);
+void nn_ctw_free(void *w);
+uint8_t *nn_ctw_host(void *w);
+uint8_t *nn_ctw_dev(void *w);
+int nn_ctw_put(void *w, uint32_t dm, int host, const int64_t co[3], const int64_t wo[3], const int64_t wn[3], const int64_t sh[3], uint8_t *dwin);
+int nn_ctw_zero(void *w, uint8_t *d, size_t n);
 /* one 2x mean pooling step of an n^3 uint8 volume into (n / 2)^3: (sum + 4) >> 3, as the CPU pyramid (ingest.c pool2_mean) */
 void nn_pool2_u8(const uint8_t *in, int n, uint8_t *out);
 void nn_scale(float *y, float a, size_t n);
