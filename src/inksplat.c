@@ -1,6 +1,9 @@
 /* ufsm ink-splat (inksplat.h): published 2D ink labels -> sparse 3D label zarr on the CT grid, and the depth profile of a 3D ink
    prediction along the labelled surface. */
 #include "inksplat.h"
+#include "dcache.h"
+#include <stdarg.h>
+#include <sys/stat.h>
 #include "sysinfo.h"
 #include "imgops.h"
 #include "tiffw.h"
@@ -1050,7 +1053,6 @@ int cmd_ink_vscore(int argc, char **argv) {
 typedef struct { char tifxyz[1024], labels[1024], mask[1024]; int crop[4]; } inkfly_seg;
 typedef struct { int surf, lab, msk; int64_t lr0, lc0, lw, lh; int ntx, nty; double F; int lab01, msk01; } ifunit;
 typedef struct { int32_t lo[3], hi[3]; uint32_t unit, tile; } iftile;
-typedef struct ifent { int64_t key; uint8_t *data; int empty; struct ifent *prev, *next, *hnext; } ifent;
 typedef struct {
     inksplat_cfg c; int L; double V, off, reach; int64_t shape[3]; z3 *base_ct; zcache *zc;   /* zc: decoded CT chunks shared by neighbouring chunks' boxes */
     ssurf *S; int nS; char (*Spath)[1024];
@@ -1058,7 +1060,6 @@ typedef struct {
     ifunit *U; int nU;
     iftile *T; size_t nT;
     int64_t gcell, gdim[3]; uint32_t *gstart, *glist;   /* tile grid: cells of gcell level-0 voxels -> tile ids (CSR) */
-    pthread_mutex_t mu; ifent **hash; size_t nhash; ifent *head, *tail; size_t bytes, cap_bytes;
 } inkfly;
 static struct { _Atomic uint64_t reads, chunks, empty, hits, px, us, ct_us; } g_ifs;
 static int inkfly_find(char (*paths)[1024], int n, const char *p) { for (int i = 0; i < n; i++) if (!strcmp(paths[i], p)) return i; return -1; }
@@ -1067,8 +1068,7 @@ static void inkfly_free(void *p) {
     if (f->zc) zcache_close(f->zc);
     for (int i = 0; i < f->nS; i++) ssurf_free(&f->S[i]);
     for (int i = 0; i < f->nL; i++) lsrc_close(&f->Ls[i]);
-    for (size_t i = 0; i < f->nhash; i++) for (ifent *e = f->hash[i], *nx; e; e = nx) { nx = e->hnext; free(e->data); free(e); }
-    free(f->S); free(f->Spath); free(f->Ls); free(f->Lpath); free(f->U); free(f->T); free(f->gstart); free(f->glist); free(f->hash); free(f);
+    free(f->S); free(f->Spath); free(f->Ls); free(f->Lpath); free(f->U); free(f->T); free(f->gstart); free(f->glist); free(f);
 }
 static int box_hit(const int32_t lo[3], const int32_t hi[3], const int64_t a[3], const int64_t b[3]) {   /* [lo, hi] vs [a, b) */
     for (int d = 0; d < 3; d++) if (hi[d] < a[d] || lo[d] >= b[d]) return 0;
@@ -1203,52 +1203,29 @@ done:
     free(UG); free(cand); free(ctb); free(ni); free(nn); free(pi); free(pn);
     return rc;
 }
-enum { IFC = 128 };   /* cached chunk edge (level-L voxels) */
-static void lru_unlink(inkfly *f, ifent *e) { if (e->prev) e->prev->next = e->next; else f->head = e->next; if (e->next) e->next->prev = e->prev; else f->tail = e->prev; e->prev = e->next = nullptr; }
-static void lru_front(inkfly *f, ifent *e) { e->next = f->head; e->prev = nullptr; if (f->head) f->head->prev = e; f->head = e; if (!f->tail) f->tail = e; }
+enum { IFC = 128 };   /* computed chunk edge (level-L voxels): the dcache cell (dcache.h) */
 static int inkfly_derive(void *ctx, z3 *base, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads) {
     (void)base; (void)nthreads; inkfly *f = ctx; const double t0 = snow();
     atomic_fetch_add(&g_ifs.reads, 1);
+    int aligned = 1; for (int d = 0; d < 3; d++) aligned &= o[d] >= 0 && o[d] % IFC == 0 && n[d] == IFC;
+    if (aligned) {   /* (the cache's cell reads) */
+        int ne = 0; const int rc = inkfly_chunk(f, o, n, out, &ne);
+        atomic_fetch_add(&g_ifs.chunks, 1); if (!ne) atomic_fetch_add(&g_ifs.empty, 1);
+        atomic_fetch_add(&g_ifs.us, (uint64_t)((snow() - t0) * 1e6)); return rc;
+    }
     memset(out, 255, (size_t)n[0] * n[1] * n[2]);
     const int64_t gc[3] = {(f->shape[0] + IFC - 1) / IFC, (f->shape[1] + IFC - 1) / IFC, (f->shape[2] + IFC - 1) / IFC};
     int64_t c0[3], c1[3];
     for (int d = 0; d < 3; d++) { c0[d] = o[d] < 0 ? 0 : o[d] / IFC; c1[d] = (o[d] + n[d] - 1) / IFC; if (c1[d] >= gc[d]) c1[d] = gc[d] - 1; if (o[d] + n[d] <= 0 || o[d] >= f->shape[d]) return 0; }
-    uint8_t *tmp = nullptr;
+    uint8_t *tmp = malloc((size_t)IFC * IFC * IFC); if (!tmp) return -1;
     for (int64_t cz = c0[0]; cz <= c1[0]; cz++) for (int64_t cy = c0[1]; cy <= c1[1]; cy++) for (int64_t cx = c0[2]; cx <= c1[2]; cx++) {
-        const int64_t key = (cz * gc[1] + cy) * gc[2] + cx; const size_t hb = (size_t)(key * 0x9E3779B97F4A7C15ull >> 40) % f->nhash;
-        const uint8_t *src = nullptr; uint8_t *own = nullptr; int empty = 0;
-        pthread_mutex_lock(&f->mu);
-        ifent *e = f->hash[hb]; while (e && e->key != key) e = e->hnext;
-        if (e) { lru_unlink(f, e); lru_front(f, e); empty = e->empty; if (!empty) { own = malloc((size_t)IFC * IFC * IFC); memcpy(own, e->data, (size_t)IFC * IFC * IFC); } atomic_fetch_add(&g_ifs.hits, 1); }
-        pthread_mutex_unlock(&f->mu);
-        if (!e) {   /* compute (outside the lock; a racing duplicate is dropped) */
-            if (!tmp) tmp = malloc((size_t)IFC * IFC * IFC);
-            const int64_t co[3] = {cz * IFC, cy * IFC, cx * IFC}, cn[3] = {IFC, IFC, IFC}; int ne = 0;
-            if (!tmp || inkfly_chunk(f, co, cn, tmp, &ne)) { free(tmp); return -1; }
-            atomic_fetch_add(&g_ifs.chunks, 1); if (!ne) atomic_fetch_add(&g_ifs.empty, 1);
-            empty = !ne;
-            pthread_mutex_lock(&f->mu);
-            ifent *e2 = f->hash[hb]; while (e2 && e2->key != key) e2 = e2->hnext;
-            if (!e2) {
-                e2 = calloc(1, sizeof *e2); e2->key = key; e2->empty = empty;
-                if (!empty) { e2->data = malloc((size_t)IFC * IFC * IFC); memcpy(e2->data, tmp, (size_t)IFC * IFC * IFC); f->bytes += (size_t)IFC * IFC * IFC; }
-                e2->hnext = f->hash[hb]; f->hash[hb] = e2; lru_front(f, e2); f->bytes += sizeof *e2;
-                while (f->bytes > f->cap_bytes && f->tail && f->tail != e2) {   /* evict */
-                    ifent *v = f->tail; lru_unlink(f, v);
-                    const size_t vb = (size_t)(v->key * 0x9E3779B97F4A7C15ull >> 40) % f->nhash; ifent **pp = &f->hash[vb]; while (*pp != v) pp = &(*pp)->hnext; *pp = v->hnext;
-                    f->bytes -= sizeof *v + (v->data ? (size_t)IFC * IFC * IFC : 0); free(v->data); free(v);
-                }
-            }
-            pthread_mutex_unlock(&f->mu);
-            src = tmp;
-        } else src = own;
-        if (!empty && src) {
-            for (int64_t z = 0; z < IFC; z++) { const int64_t gz = cz * IFC + z - o[0]; if (gz < 0 || gz >= n[0]) continue;
-                for (int64_t y = 0; y < IFC; y++) { const int64_t gy = cy * IFC + y - o[1]; if (gy < 0 || gy >= n[1]) continue;
-                    const int64_t x0 = cx * IFC - o[2]; int64_t xa = x0 < 0 ? -x0 : 0, xb = x0 + IFC > n[2] ? n[2] - x0 : IFC;
-                    if (xb > xa) memcpy(out + ((size_t)gz * n[1] + gy) * n[2] + x0 + xa, src + ((size_t)z * IFC + y) * IFC + xa, (size_t)(xb - xa)); } }
-        }
-        free(own);
+        const int64_t co[3] = {cz * IFC, cy * IFC, cx * IFC}, cn[3] = {IFC, IFC, IFC}; int ne = 0;
+        if (inkfly_chunk(f, co, cn, tmp, &ne)) { free(tmp); return -1; }
+        atomic_fetch_add(&g_ifs.chunks, 1); if (!ne) { atomic_fetch_add(&g_ifs.empty, 1); continue; }
+        for (int64_t z = 0; z < IFC; z++) { const int64_t gz = cz * IFC + z - o[0]; if (gz < 0 || gz >= n[0]) continue;
+            for (int64_t y = 0; y < IFC; y++) { const int64_t gy = cy * IFC + y - o[1]; if (gy < 0 || gy >= n[1]) continue;
+                const int64_t x0 = cx * IFC - o[2]; int64_t xa = x0 < 0 ? -x0 : 0, xb = x0 + IFC > n[2] ? n[2] - x0 : IFC;
+                if (xb > xa) memcpy(out + ((size_t)gz * n[1] + gy) * n[2] + x0 + xa, tmp + ((size_t)z * IFC + y) * IFC + xa, (size_t)(xb - xa)); } }
     }
     free(tmp);
     atomic_fetch_add(&g_ifs.us, (uint64_t)((snow() - t0) * 1e6));
@@ -1277,19 +1254,49 @@ z3 *inkfly_open_pooled(z3 *ct_coarse, z3 *fine, int own_fine) {
     return z;
 }
 
+/* the dcache key: everything a chunk's bytes depend on. Bump INKFLY_CODE when the arithmetic changes. Local inputs add their size and
+   mtime (a tifxyz dir: its x / y / z.tif and meta.json; a zarr array dir: its zarr.json and the dir), so edited labels miss the cache. */
+#define INKFLY_CODE "inkfly 1 (ink-splat --face, 2026-11-11)"
+static void key_stat(char **b, size_t *n, size_t *cap, const char *path, const char *sub) {
+    char p[2100]; snprintf(p, sizeof p, "%s%s%s", path, sub ? "/" : "", sub ? sub : ""); struct stat st;
+    char l[2400]; const int k = stat(p, &st) ? snprintf(l, sizeof l, " [%s: -]", sub ? sub : ".") :
+        snprintf(l, sizeof l, " [%s: %lld %lld.%09ld]", sub ? sub : ".", (long long)st.st_size, (long long)st.st_mtim.tv_sec, st.st_mtim.tv_nsec);
+    while (*n + (size_t)k + 1 > *cap) { *cap *= 2; *b = realloc(*b, *cap); }
+    memcpy(*b + *n, l, (size_t)k + 1); *n += (size_t)k;
+}
+static void key_add(char **b, size_t *n, size_t *cap, const char *fmt, ...) {
+    va_list ap; va_start(ap, fmt); char l[4096]; int k = vsnprintf(l, sizeof l, fmt, ap); va_end(ap); if (k >= (int)sizeof l) k = (int)sizeof l - 1;
+    while (*n + (size_t)k + 1 > *cap) { *cap *= 2; *b = realloc(*b, *cap); }
+    memcpy(*b + *n, l, (size_t)k + 1); *n += (size_t)k;
+}
+static char *inkfly_key(const inkfly *f, const inksplat_cfg *c, const char *segs_txt) {
+    size_t n = 0, cap = 4096; char *b = malloc(cap); b[0] = 0;
+    key_add(&b, &n, &cap, "%s\nct %s %s level %d shape %lld,%lld,%lld um %.6g\n", INKFLY_CODE, c->ct_root ? c->ct_root : "?", c->ct_key ? c->ct_key : "?", f->L,
+            (long long)f->shape[0], (long long)f->shape[1], (long long)f->shape[2], c->ct_um);
+    key_add(&b, &n, &cap, "cfg iso %d thr %.9g flip %d face %.9g,%.9g t %.9g,%.9g run %d gap %d label_scale %.9g off %.9g,%.9g\n", c->iso, c->thr, c->flip,
+            c->face_a, c->face_b, c->face_lo, c->face_hi, c->face_run, c->face_gap, c->label_scale, c->label_off[0], c->label_off[1]);
+    for (int e = 0; e < c->nexcl; e++) key_add(&b, &n, &cap, "exclude %lld,%lld,%lld,%lld,%lld,%lld\n", (long long)c->excl[e][0], (long long)c->excl[e][1],
+                                               (long long)c->excl[e][2], (long long)c->excl[e][3], (long long)c->excl[e][4], (long long)c->excl[e][5]);
+    for (int i = 0; i < f->nS; i++) { key_add(&b, &n, &cap, "mesh %s", f->Spath[i]);
+        static const char *fs[] = {"x.tif", "y.tif", "z.tif", "meta.json"}; for (int k = 0; k < 4; k++) key_stat(&b, &n, &cap, f->Spath[i], fs[k]); key_add(&b, &n, &cap, "\n"); }
+    for (int i = 0; i < f->nL; i++) { key_add(&b, &n, &cap, "raster %s", f->Lpath[i]);
+        if (strncmp(f->Lpath[i], "http", 4)) { key_stat(&b, &n, &cap, f->Lpath[i], nullptr); key_stat(&b, &n, &cap, f->Lpath[i], "zarr.json"); } key_add(&b, &n, &cap, "\n"); }
+    const size_t ls = strlen(segs_txt); while (n + ls + 16 > cap) { cap *= 2; b = realloc(b, cap); }
+    memcpy(b + n, "segments ", 9); memcpy(b + n + 9, segs_txt, ls); n += 9 + ls; b[n++] = '\n'; b[n] = 0;
+    return b;
+}
 /* SEGS: {"segments": [{"tifxyz": DIR, "labels": L, "mask": M, "crop": [c0, r0, w, h]}, ..]}; ct: the CT at level cfg->level (owned) */
-z3 *inkfly_open(z3 *ct, const char *segs_path, const inksplat_cfg *cfg, size_t cache_mb, void **handle) {
+z3 *inkfly_open(z3 *ct, const char *segs_path, const inksplat_cfg *cfg, size_t cache_mb, const char *dcache_dir, void **handle) {
     const double t0 = snow();
     FILE *fp = fopen(segs_path, "rb"); if (!fp) { fprintf(stderr, "ink onfly: cannot open %s\n", segs_path); z3_close(ct); return nullptr; }
     fseek(fp, 0, SEEK_END); long sz = ftell(fp); fseek(fp, 0, SEEK_SET); char *txt = malloc((size_t)sz + 1); size_t rd = fread(txt, 1, (size_t)sz, fp); fclose(fp); txt[rd] = 0;
-    json *j = json_parse(txt, rd); free(txt); const json *sg = json_get(j, "segments");
-    if (!sg || sg->type != J_ARR || !sg->n) { fprintf(stderr, "ink onfly: %s: no \"segments\" array\n", segs_path); json_free(j); z3_close(ct); return nullptr; }
+    json *j = json_parse(txt, rd); const json *sg = json_get(j, "segments"); char *sg_txt = txt;   /* (the segments text goes into the cache key) */
+    if (!sg || sg->type != J_ARR || !sg->n) { fprintf(stderr, "ink onfly: %s: no \"segments\" array\n", segs_path); json_free(j); free(sg_txt); z3_close(ct); return nullptr; }
     inkfly *f = calloc(1, sizeof *f); f->c = *cfg; f->L = cfg->level; f->V = (double)(1 << f->L); f->off = (f->V - 1) / 2; f->base_ct = ct;
     memcpy(f->shape, z3_meta_of(ct)->shape, sizeof f->shape);
     f->reach = fmax(fmax(fabs(cfg->face_lo), fabs(cfg->face_hi)) + 1, fmax(fabs(cfg->face_lo + cfg->face_a), fabs(cfg->face_hi + cfg->face_b)));
     const int nseg = (int)sg->n; f->S = calloc(nseg, sizeof *f->S); f->Spath = calloc(nseg, sizeof *f->Spath); f->Ls = calloc(2 * nseg, sizeof *f->Ls); f->Lpath = calloc(2 * nseg, sizeof *f->Lpath); f->U = calloc(nseg, sizeof *f->U);
     size_t tcap = 1 << 16; f->T = malloc(tcap * sizeof *f->T);
-    pthread_mutex_init(&f->mu, nullptr);
     for (int i = 0; i < nseg; i++) {
         const json *e = json_at(sg, (size_t)i); const char *tx = json_str(json_get(e, "tifxyz"), nullptr), *lb = json_str(json_get(e, "labels"), nullptr), *mk = json_str(json_get(e, "mask"), nullptr);
         if (!tx || !lb) { fprintf(stderr, "ink onfly: segment %d: need tifxyz and labels\n", i); goto fail; }
@@ -1342,15 +1349,18 @@ z3 *inkfly_open(z3 *ct, const char *segs_path, const inksplat_cfg *cfg, size_t c
         }
     }
     f->zc = zcache_open((size_t)1 << 30);
-    f->nhash = 1 << 16; f->hash = calloc(f->nhash, sizeof *f->hash); f->cap_bytes = (cache_mb ? cache_mb : 2048) << 20;
+    char *key = inkfly_key(f, cfg, sg_txt);
     z3 *z = z3_open_derived(ct, 255, inkfly_derive, f, inkfly_free);
-    if (!z) { inkfly_free(f); z3_close(ct); return nullptr; }
+    if (!z) { free(key); free(sg_txt); inkfly_free(f); z3_close(ct); return nullptr; }
     if (handle) *handle = f;
-    fprintf(stderr, "ink onfly: %s: %d label windows, %d meshes, %zu supervised tiles indexed in %.1fs (level %d, face [%g, %g], iso %d, %d held-out boxes, cache %zu MB)\n",
-            segs_path, f->nU, f->nS, f->nT, snow() - t0, f->L, cfg->face_a, cfg->face_b, cfg->iso, cfg->nexcl, cache_mb ? cache_mb : 2048);
+    z = z3_open_cached(z, dcache_dir, key, IFC, cache_mb ? cache_mb : 2048); free(key);
+    free(sg_txt);
+    if (!z) return nullptr;
+    fprintf(stderr, "ink onfly: %s: %d label windows, %d meshes, %zu supervised tiles indexed in %.1fs (level %d, face [%g, %g], iso %d, %d held-out boxes, cache %zu MB, disk %s)\n",
+            segs_path, f->nU, f->nS, f->nT, snow() - t0, f->L, cfg->face_a, cfg->face_b, cfg->iso, cfg->nexcl, cache_mb ? cache_mb : 2048, dcache_dir && *dcache_dir ? dcache_dir : "none");
     return z;
 fail:
-    json_free(j); inkfly_free(f); z3_close(ct); return nullptr;
+    json_free(j); free(sg_txt); inkfly_free(f); z3_close(ct); return nullptr;
 }
 void inkfly_stats(uint64_t *reads, uint64_t *chunks, uint64_t *empty, uint64_t *hits, uint64_t *px, double *sec) {
     *reads = atomic_load(&g_ifs.reads); *chunks = atomic_load(&g_ifs.chunks); *empty = atomic_load(&g_ifs.empty); *hits = atomic_load(&g_ifs.hits);
@@ -1382,7 +1392,8 @@ int cmd_ink_onfly(int argc, char **argv) {
     long long b[6];
     if (argc < 3 || ci < 0 || ci + 2 >= argc || !bx || sscanf(bx, "%lld,%lld,%lld,%lld,%lld,%lld", b, b + 1, b + 2, b + 3, b + 4, b + 5) != 6) {
         fprintf(stderr, "usage: ufsm ink-onfly SEGS.json --ct ROOT KEY --ct-um U [--level 1] [--iso 64] [--face -6,0] [--holdout-file H] --box z,y,x,nz,ny,nx (level-0)\n"
-                        "         [--ref ROOT KEY (a stored ink-splat level)] [--threads 8] [--cache DIR] [--cache-mb 2048]   the on-the-fly ink target over a box\n"); return 2;
+                        "         [--ref ROOT KEY (a stored ink-splat level)] [--threads 8] [--cache DIR] [--cache-mb 2048] [--dcache DIR|off (default $UFSM_DERIVED_CACHE or ~/.cache/ufsm/derived)]\n"
+                        "         the on-the-fly ink target over a box\n"); return 2;
     }
     inksplat_cfg c; inksplat_defaults(&c); c.face = 1;
     c.ct_um = atof(sopt(argc, argv, "--ct-um", "0")); c.level = atoi(sopt(argc, argv, "--level", "1")); c.iso = atoi(sopt(argc, argv, "--iso", "64")); c.cache = sopt(argc, argv, "--cache", nullptr);
@@ -1392,7 +1403,10 @@ int cmd_ink_onfly(int argc, char **argv) {
     const int nth = ufsm_threads(atoi(sopt(argc, argv, "--threads", "0")), 8);
     store *cs = store_open(argv[ci + 1]); z3 *ct = cs ? pyramid_open_level(cs, argv[ci + 2], c.level, c.ct_um, c.cache) : nullptr;
     if (!ct) { fprintf(stderr, "ink-onfly: CT level %d: %s\n", c.level, z3_error()); return 1; }
-    z3 *z = inkfly_open(ct, argv[2], &c, (size_t)atol(sopt(argc, argv, "--cache-mb", "2048")), nullptr);
+    c.ct_root = argv[ci + 1]; c.ct_key = argv[ci + 2];
+    const char *dcd = sopt(argc, argv, "--dcache", dcache_default_dir());   /* --dcache DIR | off */
+    if (dcd && !strcmp(dcd, "off")) dcd = nullptr;
+    z3 *z = inkfly_open(ct, argv[2], &c, (size_t)atol(sopt(argc, argv, "--cache-mb", "2048")), dcd, nullptr);
     if (!z) return 1;
     const int L = c.level; int64_t o[3], n[3]; size_t nv = 1;
     for (int d = 0; d < 3; d++) { o[d] = b[d] >> L; n[d] = ((b[d] + b[d + 3] + (1 << L) - 1) >> L) - o[d]; nv *= (size_t)n[d]; }
@@ -1408,6 +1422,9 @@ int cmd_ink_onfly(int argc, char **argv) {
     uint64_t rd, ch, em, hi, px; double sec; inkfly_stats(&rd, &ch, &em, &hi, &px, &sec);
     uint64_t kn = 0, ink = 0; for (size_t k = 0; k < nv; k++) if (A[k] != 255) { kn++; ink += A[k] >= 127; }
     fprintf(stderr, "ink-onfly: CT reads %.1f s of the derive time (summed)\n", atomic_load(&g_ifs.ct_us) * 1e-6);
+    { dcache_stats ds; dcache_get_stats(&ds);
+      printf("dcache: %llu cells from memory, %llu from disk (%.2f s), %llu computed (%llu constant, %.1f s), %.1f MB written\n", (unsigned long long)ds.cells_mem,
+             (unsigned long long)ds.cells_disk, ds.s_disk, (unsigned long long)ds.cells_computed, (unsigned long long)ds.cells_fill, ds.s_compute, ds.disk_bytes_written / 1048576.0); }
     printf("onfly box %lld,%lld,%lld +%lld,%lld,%lld (level %d): %.1f s wall, %llu chunks computed (%llu empty), %llu label px faced, %.1f s derive (summed); %llu known voxels (%llu ink)\n",
            (long long)o[0], (long long)o[1], (long long)o[2], (long long)n[0], (long long)n[1], (long long)n[2], L, t1 - t0, (unsigned long long)ch, (unsigned long long)em,
            (unsigned long long)px, sec, (unsigned long long)kn, (unsigned long long)ink);

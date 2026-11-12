@@ -3,6 +3,7 @@
    the label: ink 254 / no ink 0 inside the band on papyrus, unknown (255) outside the band, in the hole, and at unsupervised pixels;
    --flip moves a one-sided band to the other side; the coarse level keeps the band (known-max); --merge combines by max. */
 #include "inksplat.h"
+#include "dcache.h"
 #include "store.h"
 #include "tiffw.h"
 #include "z3w.h"
@@ -163,18 +164,27 @@ int main(void) {
         CHECK(ref && !z3_read(ref, z0, nn, rb, 4), "read face2");
         store *cs = store_open(dir); z3 *ct0 = z3_open(cs, "ct.zarr/1", nullptr);
         inksplat_cfg c8 = c7; c8.crop[2] = 0; c8.merge = 0; c8.level = 0;
-        z3 *fly = ct0 ? inkfly_open(ct0, sj, &c8, 64, nullptr) : nullptr; CHECK(fly != nullptr, "inkfly_open");
-        if (fly) {
-            for (int pass = 0; pass < 2; pass++) {   /* cold, then from the cache; odd boxes */
+        char dcd[600]; snprintf(dcd, sizeof dcd, "%s/dcache", dir);
+        for (int open = 0; open < 2; open++) {   /* open 0: computed (cold), then from memory; open 1: a fresh array over the same disk cache */
+            z3 *ctx = open ? z3_open(cs, "ct.zarr/1", nullptr) : ct0;
+            dcache_stats d0; dcache_get_stats(&d0);
+            z3 *fly = ctx ? inkfly_open(ctx, sj, &c8, 64, dcd, nullptr) : nullptr; CHECK(fly != nullptr, "inkfly_open %d", open);
+            if (!fly) break;
+            for (int pass = 0; pass < 2; pass++) {   /* odd boxes */
                 const int64_t bo[3] = {37, 11, 5}, bn[3] = {NV - 60, NV - 20, NV - 9}; uint8_t *fb = malloc((size_t)bn[0] * bn[1] * bn[2]);
                 CHECK(!z3_read(fly, bo, bn, fb, 4), "read onfly");
                 long diff = 0, kn = 0;
                 for (int64_t z = 0; z < bn[0]; z++) for (int64_t y = 0; y < bn[1]; y++) for (int64_t x = 0; x < bn[2]; x++) {
                     const uint8_t a = fb[(z * bn[1] + y) * bn[2] + x], b = rb[((z + bo[0]) * NV + y + bo[1]) * NV + x + bo[2]]; diff += a != b; kn += b != 255; }
-                fprintf(stderr, "onfly pass %d: %ld of %ld voxels differ from the stored splat (%ld known)\n", pass, diff, (long)(bn[0] * bn[1] * bn[2]), kn);
-                CHECK(diff == 0 && kn > 10000, "onfly == stored, pass %d: %ld differ, %ld known", pass, diff, kn);
+                fprintf(stderr, "onfly open %d pass %d: %ld of %ld voxels differ from the stored splat (%ld known)\n", open, pass, diff, (long)(bn[0] * bn[1] * bn[2]), kn);
+                CHECK(diff == 0 && kn > 10000, "onfly == stored, open %d pass %d: %ld differ, %ld known", open, pass, diff, kn);
                 free(fb);
             }
+            dcache_stats d1; dcache_get_stats(&d1);
+            fprintf(stderr, "dcache open %d: %llu computed, %llu from disk, %llu from memory\n", open, (unsigned long long)(d1.cells_computed - d0.cells_computed),
+                    (unsigned long long)(d1.cells_disk - d0.cells_disk), (unsigned long long)(d1.cells_mem - d0.cells_mem));
+            if (!open) CHECK(d1.cells_computed > d0.cells_computed && d1.cells_mem > d0.cells_mem && d1.cells_disk == d0.cells_disk, "dcache: cold computes, warm from memory");
+            else CHECK(d1.cells_computed == d0.cells_computed && d1.cells_disk > d0.cells_disk, "dcache: a reopened array reads its cells from disk");
             z3_close(fly);
         }
         free(rb); if (ref) z3_close(ref); store_close(s7); store_close(cs);
