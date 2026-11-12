@@ -47,6 +47,39 @@ Re-run of sources-u1b with the fix: 150 windows, 8 workers, 42 GB RSS under memc
 Windows per source (from 0 for the 1667s before): 0139 51, Paris 4 june 27, july 24, 1667-gt 21, 1667-A48 12, june48 9, 0500P2 3,
 1667-B48 3.
 
+Live u1 after the resume at 6662 (ufsm.univ4), steps 6751-7000, 500 served windows:
+- rungs: 14.4 / 56.8 / 28.8%;
+- rate: 0.62-0.66 samp/s, 0% loader wait (0.44-0.63 before);
+- rv bce by scroll: Paris 4 june 0.47, july 0.38, june48 0.40, 0139 0.30, 1667 0.23-0.24, 0500P2 0.08.
+
+**The pooled labels agree with fine-derived ones** (test_phase_pool, a spiral phase). Coherent blocks are those with 8 known children and
+resultant >= 0.9:
+- phase: 0 of 170080 coherent blocks off the children's circular mean by more than 1.5 codes;
+- normals (phase gradient): 0 of 149730 with cos < 0.95;
+- w4: of 129096 voxels, 0 off an integer number of turns, and 100% share one gauge per (coarse, fine) component pair;
+- slabbed pooling equals plane-by-plane pooling (UFSM_PHASE_POOL_SLAB forces small slabs).
+
+**How much the pooling leaves unknown.** Of the coarse voxels with a known child, the share left unknown at 18.7 / 19.2 um is:
+
+| scroll | left unknown by pooling | phase known of material at 19.2 / 18.7 um |
+|---|---|---|
+| Paris 4 june | 0.001 | 0.86 (0.82 at 9.6) |
+| Paris 4 july | 0.000 | 0.56 |
+| 0139 | 0.003 | 0.31 (0.33 at 9.36) |
+| 0500P2 | 0.003 | |
+
+So packed Paris 4 is not mostly unknown at 19.2 um. A 2^3 block at 9.6 um spans well under half a turn there.
+
+**"holdout_reject"** (per source: holdout_file box names). These boxes reject windows even in mask mode. They are the unseen-CT control
+for latres's masked-vs-unseen split. Test: box A rejects (0 of 60 windows over it), box B masks (30 windows over it, 0 labelled voxels).
+- u1 (sources-u1c.json) rejects HOLD on Paris 4 june / july / june48 and 139-1..8 on 0139.
+- 500P2-1 stays masked. Rejecting it starved 0500P2 completely: 0 windows at 9.36 and 18.7 um, against 9 / 12 masked. 0139 with reject
+  keeps 51 windows at 18.7 um, against 55 masked.
+- The 1299 z-band, 0814 and the x* cross-res boxes are on scans u1 does not train.
+
+The mix line now has a "draws" companion: new windows per source (no replays) against the weight share, and drops by reason. With
+replay x3, 500 served windows are only ~125 new ones, so per-source shares carry ~3% sd per 250 steps.
+
 Tests (test_unwrap2_sampler):
 - the same 40 draws with and without a box: 0 of 177270 box + guard voxels carry a phase / w4 / comp / loss-mask label, and 0 phase bytes
   differ outside;
