@@ -10,7 +10,7 @@
 # Default list: every scroll with snapped wraps except PHercParis4 (own GT), PHerc1667 (eval only), PHerc0814 (skips sheets).
 # Lanes: several good.sh may run at once; each claims a scroll with mkdir $OUT/S.claim (remove stale claims by hand).
 # Env: U (ufsm with gt-gate --phase), TH (8), OUT (/mnt/scratch/rv/good), LAB (/mnt/scratch/rv/labels9), MINKEEP (0.3), SHFRAC (1),
-#      Q (log /vesuvius/ufsm/v2/rv/logs/good.log). Skips scrolls with $OUT/S/done; stop file /vesuvius/ufsm/v2/rv/good.stop.
+#      Q (log /vesuvius/ufsm/v2/rv/logs/good.log), JOBS (gt-gate jobs, 16: ~40 GB peak on PHerc1218 at level 0, 8 for less). Skips scrolls with $OUT/S/done; stop file /vesuvius/ufsm/v2/rv/good.stop.
 set -u
 H=$(cd "$(dirname "$0")/.." && pwd); V2=/vesuvius/ufsm/v2; TSV=$V2/scrolls.tsv
 U=${U:-/vesuvius/ufsm/v3/ps-src/build/ufsm}; OUT=${OUT:-/mnt/scratch/rv/good}; LAB=${LAB:-/mnt/scratch/rv/labels9}; Q=${Q:-$V2/rv/logs/good.log}
@@ -48,7 +48,7 @@ for S in $L; do
   echo "$(date) $S gate start (m7 $pz/$pk, axis scale $AXS)" >> $Q
   nice $U gt-gate --gt $LAB/$S --gt-key codes.zarr/$key --prob $PR --prob-key $pz/$pk --cache $C --axis $AX --axis-scale $AXS \
     --out $O/gate --min-support 0 --orient-deg ${ORIENT:-25} --phase $LAB/$S --phase-key phase.zarr/$key --ignore $LAB/$S --ignore-key ignore.zarr/$key \
-    --phase-out $O/phase.zarr --min-keep ${MINKEEP:-0.3} --shard-frac ${SHFRAC:-1} --jobs 16 > $O/gate.log 2>&1 || { echo "$(date) $S: gt-gate failed" >> $Q; continue; }
+    --phase-out $O/phase.zarr --min-keep ${MINKEEP:-0.3} --shard-frac ${SHFRAC:-1} --jobs ${JOBS:-16} > $O/gate.log 2>&1 || { echo "$(date) $S: gt-gate failed" >> $Q; continue; }
   cp $LAB/$S/surflabels.log $LAB/$S/phasecheck.txt $O/ 2>/dev/null
   echo "$S $key $(grep -o 'holding [0-9.]*' $O/gate.log) $(grep -o '[0-9]* shards written' $O/gate.log) $(du -sh $O/phase.zarr | cut -f1)" > $O/summary.txt
   touch $O/done; echo "$(date) $S done: $(cat $O/summary.txt)" >> $Q

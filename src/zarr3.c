@@ -16,10 +16,18 @@
 #define VOLCOMP_IMPLEMENTATION
 #include "volcomp.h"
 #include "volcomp_fast.h"
+#include "latvol.h"
 #include "zshm.h"
 #include "gpudec.h"
 #define XXH_INLINE_ALL
 #include <xxhash.h>
+/* latvol.c through weak references, so zarr3.o links without it (the test binaries): a latvol array then fails to open
+   (declared weak here, before any use: a check against a declaration that is not yet weak is folded away) */
+__attribute__((weak)) void lv_codec_free(lv_codec *lc);
+__attribute__((weak)) int lv_codec_parse(lv_codec *lc, const uint8_t *b, size_t n);
+__attribute__((weak)) int lv_decode_voxels(const lv_codec *lc, const uint8_t *enc, size_t len, uint8_t *ct, int16_t *scratch);
+typedef struct z3 z3;
+__attribute__((weak)) int lv_box_voxels_gpu(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads);   /* src/latvol_read.c (absent in binaries without it) */
 
 static _Thread_local char errbuf[256];
 const char *z3_error(void) { return errbuf; }
@@ -50,6 +58,9 @@ struct z3 {
     size_t icap, icount;
     /* z3_open_derived: values computed from base by derive (z3_read), the chunk map / box tests / shard presence from base */
     z3 *base; z3_derive_fn derive; void *dctx; void (*dfree)(void *);
+    z3 *cover[4]; int ncover; int bborrow;   /* z3_derived_borrow: z3_close leaves base open */
+    lv_codec *lv;   /* a latvol array's codec (latvol.bin beside zarr.json) */
+    int (*xmap)(void *ctx, const int64_t grid[3], const int chunk[3], uint8_t *bits); void *xctx; uint8_t *xbits; int64_t xgrid[3]; int xstate;   /* z3_derived_extent */   /* z3_derived_cover: more arrays whose chunks the derived values reach (owned) */
 };
 
 /* ---------- metadata ---------- */
@@ -60,12 +71,14 @@ static int parse_codecs(const json *codecs, z3_meta *m) {
         const json *c = json_at(codecs, i);
         const char *name = json_str(json_get(c, "name"), "");
         if (!strcmp(name, "volcomp")) m->q = (float)json_num(json_path(c, "configuration.q"), 8.0);
+        else if (!strcmp(name, "latvol")) m->latvol = 1;
         else if (!strcmp(name, "zstd")) m->zstd = 1;
         else if (!strcmp(name, "bytes")) m->raw = 1;
         else if (!strcmp(name, "transpose")) return FAIL("unsupported codec %s", name);
         else return FAIL("unsupported codec %s", name);
     }
     if (m->q >= 0) m->raw = 0;
+    if (m->latvol && (m->q >= 0 || m->zstd || m->raw)) return FAIL("latvol is the only inner codec of its chain");
     return 0;
 }
 
@@ -106,7 +119,7 @@ static z3 *z3_open_impl(store *s, const char *key, const char *cache_dir, int ty
     z->s = s;
     z->key = strdup(key);
     { static atomic_uint_fast64_t next_id = 1; z->id = atomic_fetch_add(&next_id, 1); }
-    z->cache = cache_dir && !store_is_local(s) ? strdup(cache_dir) : nullptr;
+    z->cache = store_cache_dir(s, cache_dir);   /* (per root: a cache directory is never shared by two roots) */
     pthread_mutex_init(&z->imu, nullptr);
     z3_meta *m = &z->m;
     m->sep = '/';
@@ -139,6 +152,14 @@ static z3 *z3_open_impl(store *s, const char *key, const char *cache_dir, int ty
     if (m->q >= 0 && (m->chunk[0] != 128 || m->chunk[1] != 128 || m->chunk[2] != 128)) {
         FAIL("%s: volcomp needs 128^3 inner chunks", key); goto bad;
     }
+    if (m->latvol) {   /* the codec's side file: the transform, the step, the entropy tables */
+        if (m->chunk[0] != 128 || m->chunk[1] != 128 || m->chunk[2] != 128 || m->esize != 1) { FAIL("%s: latvol needs uint8 128^3 inner chunks", key); goto bad; }
+        if (!lv_codec_parse || !lv_codec_free || !lv_decode_voxels) { FAIL("%s: a latvol array, and this binary is built without src/latvol.c", key); goto bad; }
+        char sk[1100]; snprintf(sk, sizeof sk, "%s/latvol.bin", key); size_t sn = 0; uint8_t *sb = store_read_all(s, sk, &sn);
+        z->lv = sb ? calloc(1, sizeof *z->lv) : nullptr;
+        if (!z->lv || lv_codec_parse(z->lv, sb, sn)) { free(sb); FAIL("%s: cannot read the latvol codec %s", key, sk); goto bad; }
+        free(sb);
+    }
     for (int i = 0; i < 3; i++) {
         if (m->chunk[i] <= 0 || m->shard[i] % m->chunk[i]) { FAIL("%s: shard not a multiple of chunk", key); goto bad; }
         z->cgrid[i] = m->shard[i] / m->chunk[i];
@@ -166,12 +187,57 @@ z3 *z3_open_derived(z3 *base, int fill, z3_derive_fn derive, void *ctx, void (*c
     return z;
 }
 z3 *z3_base_of(const z3 *z) { return z ? z->base : nullptr; }
+void *z3_derived_ctx(const z3 *z) { return z && z->derive ? z->dctx : nullptr; }
+void z3_derived_borrow(z3 *z) { if (z && z->derive) z->bborrow = 1; }
+int z3_derived_extent(z3 *z, int (*fn)(void *ctx, const int64_t grid[3], const int chunk[3], uint8_t *bits), void *ctx) {
+    if (!z || !z->derive || !fn) return -1;
+    z->xmap = fn; z->xctx = ctx; return 0;
+}
+/* the extent map (computed once, under the index lock): 0 ok */
+static int x_map(z3 *z) {
+    pthread_mutex_lock(&z->imu);
+    if (!z->xstate) {
+        int64_t n = 1; for (int d = 0; d < 3; d++) { z->xgrid[d] = (z->m.shape[d] + z->m.chunk[d] - 1) / z->m.chunk[d]; n *= z->xgrid[d]; }
+        z->xbits = calloc((size_t)n, 1);
+        z->xstate = z->xbits && !z->xmap(z->xctx, z->xgrid, z->m.chunk, z->xbits) ? 1 : -1;
+    }
+    const int st = z->xstate; pthread_mutex_unlock(&z->imu);
+    return st > 0 ? 0 : -1;
+}
+static int x_box(z3 *z, const int64_t o[3], const int64_t n[3]) {   /* any marked chunk meets the box: 1 / 0 / -1 */
+    if (x_map(z)) return FAIL("%s: the extent map failed", z->key);
+    int64_t lo[3], hi[3];
+    for (int d = 0; d < 3; d++) { int64_t a = o[d] < 0 ? 0 : o[d], b = o[d] + n[d] > z->m.shape[d] ? z->m.shape[d] : o[d] + n[d]; if (b <= a) return 0; lo[d] = a / z->m.chunk[d]; hi[d] = (b - 1) / z->m.chunk[d]; }
+    for (int64_t a = lo[0]; a <= hi[0]; a++) for (int64_t b = lo[1]; b <= hi[1]; b++) for (int64_t c = lo[2]; c <= hi[2]; c++) if (z->xbits[(a * z->xgrid[1] + b) * z->xgrid[2] + c]) return 1;
+    return 0;
+}
+/* a 2x coarser derived array: its known chunks are those whose 2^3 base chunks (the same chunk edge, in base voxels) hold any */
+static int pool2_xmap(void *vp, const int64_t grid[3], const int chunk[3], uint8_t *bits) {
+    z3 *z = vp; int64_t bg[3]; uint8_t *bb = nullptr;
+    if (z3_chunk_map(z->base, bg, &bb) < 0) return -1;
+    for (int64_t a = 0; a < bg[0]; a++) for (int64_t b = 0; b < bg[1]; b++) for (int64_t c = 0; c < bg[2]; c++) if (bb[(a * bg[1] + b) * bg[2] + c]) {
+        const int64_t q[3] = {a / 2, b / 2, c / 2}; if (q[0] < grid[0] && q[1] < grid[1] && q[2] < grid[2]) bits[(q[0] * grid[1] + q[1]) * grid[2] + q[2]] = 1; }
+    free(bb); (void)chunk; return 0;
+}
+z3 *z3_open_derived_pool2(z3 *base, int fill, z3_derive_fn derive, void *ctx, void (*ctx_free)(void *)) {
+    if (!base || base->m.chunk[0] != base->m.chunk[1] || base->m.chunk[0] != base->m.chunk[2]) return nullptr;
+    z3 *z = z3_open_derived(base, fill, derive, ctx, ctx_free); if (!z) return nullptr;
+    for (int d = 0; d < 3; d++) z->m.shape[d] = (base->m.shape[d] + 1) / 2;
+    z->xmap = pool2_xmap; z->xctx = z;
+    return z;
+}
+int z3_derived_cover(z3 *z, z3 *cover) {
+    if (!z || !z->derive || !cover || z->ncover == 4) return -1;
+    for (int d = 0; d < 3; d++) if (cover->m.shape[d] != z->m.shape[d]) return -1;
+    z->cover[z->ncover++] = cover; return 0;
+}
 
 void z3_close(z3 *z) {
     if (!z) return;
-    if (z->derive) { if (z->dfree) z->dfree(z->dctx); z3_close(z->base); free(z->key); pthread_mutex_destroy(&z->imu); free(z); return; }
+    if (z->derive) { if (z->dfree) z->dfree(z->dctx); if (!z->bborrow) z3_close(z->base); for (int k = 0; k < z->ncover; k++) z3_close(z->cover[k]); free(z->xbits); free(z->key); pthread_mutex_destroy(&z->imu); free(z); return; }
     free(z->key);
     free(z->cache);
+    if (z->lv) { lv_codec_free(z->lv); free(z->lv); }
     for (size_t i = 0; i < z->icap; i++) { free(z->itab[i].key); free(z->itab[i].idx); }
     free(z->itab);
     pthread_mutex_destroy(&z->imu);
@@ -179,6 +245,7 @@ void z3_close(z3 *z) {
 }
 
 const z3_meta *z3_meta_of(const z3 *z) { return &z->m; }
+const void *z3_latvol(const z3 *z) { return z && !z->derive ? z->lv : nullptr; }
 const char *z3_key(const z3 *z) { return z->key; }
 
 int z3_group_levels(store *s, const char *group_key, z3_level *out, int max) {
@@ -241,9 +308,11 @@ __attribute__((weak)) void gpudec_stats(uint64_t *subs, uint64_t *batches, uint6
 static pthread_mutex_t g_z3_cpu_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_z3_cpu_cv = PTHREAD_COND_INITIALIZER;
 static int g_z3_cpu_busy, g_z3_cpu_max;
+static _Thread_local int g_z3_cpu_only;   /* z3_thread_cpu_decode: this thread's reads decode on the CPU whatever UFSM_GPU_DECODE says */
+void z3_thread_cpu_decode(int on) { g_z3_cpu_only = on; }
 static volcomp_status z3_decode_subs(const vf_parsed *p, uint32_t need, uint8_t *dec, uint8_t *dsink, uint32_t *dev) {
     *dev = 0;
-    if (!gpudec_enabled()) return vfx_decode_subs(p, need, dec);
+    if (!gpudec_enabled() || g_z3_cpu_only) return vfx_decode_subs(p, need, dec);
     if (!p->strict) {
         gd_chunk g = {p->payload, p->tok_n, p->byp_n, p->off, p->step, {0}, VF_SCAN16};
         for (int m = 0; m < 10; m++) g.dt[m] = (const uint32_t *)p->models[m].dt;
@@ -534,6 +603,10 @@ static int decode_into(const z3 *z, const uint8_t *enc, size_t n, uint8_t *dec, 
         enc = scratch;
         n = r;
     }
+    if (m->latvol) {   /* latent cells: the rebuilt CT bytes (latvol.h; the cells themselves: z3_chunk_raw + the device decoder) */
+        if (lv_decode_voxels(z->lv, enc, n, dec, nullptr)) return FAIL("latvol: corrupt chunk in %s", z->key);
+        return 0;
+    }
     if (m->q >= 0 && m->esize > 1) {   /* typed chunk (volcomp modes 7 / 8) */
         volcomp_status st = volcomp_decode_typed(enc, n, dec, cv * m->esize, (volcomp_dtype)m->dtype);
         if (st != VOLCOMP_OK) return FAIL("volcomp typed: %s", volcomp_status_string(st));
@@ -629,6 +702,7 @@ int z3_prefetch_chunk(z3 *z, int64_t cz, int64_t cy, int64_t cx) {
 /* the encoded bytes of inner chunk (cz, cy, cx) (after zstd when the chain has it): 1 with *buf (malloc) / *n, 0 absent, -1 error */
 int z3_chunk_raw(z3 *z, int64_t cz, int64_t cy, int64_t cx, uint8_t **buf, size_t *n) {
     *buf = nullptr; *n = 0;
+    if (z->derive) return FAIL("%s: a derived array has no stored chunks", z->key);
     int64_t sz = cz / z->cgrid[0], sy = cy / z->cgrid[1], sx = cx / z->cgrid[2];
     int ci = (int)(((cz % z->cgrid[0]) * z->cgrid[1] + (cy % z->cgrid[1])) * z->cgrid[2] + (cx % z->cgrid[2]));
     char skey[1200]; shard_key(z, sz, sy, sx, skey, sizeof skey);
@@ -643,7 +717,13 @@ int z3_chunk_raw(z3 *z, int64_t cz, int64_t cy, int64_t cx, uint8_t **buf, size_
         ientry e = idx[ci]; free(idx);
         if ((e.off == UINT64_MAX && e.len == UINT64_MAX) || !e.len) return 0;
         len = (size_t)e.len;
-        if (!(b = malloc(len)) || store_read(z->s, skey, (int64_t)e.off, (int64_t)len, b) != (int64_t)len) { free(b); return FAIL("read chunk %d of %s", ci, skey); }
+        char item[16]; snprintf(item, sizeof item, "%d", ci); size_t cl = 0;
+        if ((b = cache_get(z, skey, item, &cl)) && cl == len) atomic_fetch_add(&g_z3_cache_hits, 1);   /* (the cache: z3_read's and the prefetcher's files) */
+        else {
+            free(b);
+            if (!(b = malloc(len)) || store_read(z->s, skey, (int64_t)e.off, (int64_t)len, b) != (int64_t)len) { free(b); return FAIL("read chunk %d of %s", ci, skey); }
+            atomic_fetch_add(&g_z3_store_reads, 1); cache_put(z, skey, item, b, len);
+        }
     }
     if (z->m.zstd) {
         const size_t cap = VOLCOMP_TYPED_ENCODE_BOUND; uint8_t *d = malloc(cap);
@@ -961,7 +1041,24 @@ static int work_cmp(const void *a, const void *b) {
 }
 
 int64_t z3_chunk_map(z3 *z, int64_t grid[3], uint8_t **bits) {
-    if (z->derive) return z3_chunk_map(z->base, grid, bits);
+    if (z->derive && z->xmap) {
+        if (x_map(z)) return FAIL("%s: the extent map failed", z->key);
+        const size_t nb = (size_t)(z->xgrid[0] * z->xgrid[1] * z->xgrid[2]); int64_t n = 0;
+        if (!(*bits = malloc(nb))) return FAIL("chunk map allocation");
+        memcpy(*bits, z->xbits, nb); for (int d = 0; d < 3; d++) grid[d] = z->xgrid[d];
+        for (size_t i = 0; i < nb; i++) n += z->xbits[i] != 0;
+        return n;
+    }
+    if (z->derive) {
+        int64_t n = z3_chunk_map(z->base, grid, bits); if (n < 0 || !z->ncover) return n;
+        const size_t nb = (size_t)(grid[0] * grid[1] * grid[2]);
+        for (int k = 0; k < z->ncover; k++) { int64_t g2[3]; uint8_t *b2 = nullptr; const int64_t n2 = z3_chunk_map(z->cover[k], g2, &b2);
+            if (n2 < 0 || g2[0] != grid[0] || g2[1] != grid[1] || g2[2] != grid[2]) { free(b2); free(*bits); *bits = nullptr; return n2 < 0 ? n2 : FAIL("chunk map: a cover array with another chunk grid"); }
+            for (size_t i = 0; i < nb; i++) (*bits)[i] |= b2[i];
+            free(b2); }
+        n = 0; for (size_t i = 0; i < nb; i++) n += (*bits)[i] != 0;
+        return n;
+    }
     const z3_meta *m = &z->m; *bits = nullptr;
     if (!m->sharded) return FAIL("chunk map: not a sharded array");
     int64_t ns[3];
@@ -986,7 +1083,8 @@ int64_t z3_chunk_map(z3 *z, int64_t grid[3], uint8_t **bits) {
     return n;
 }
 int z3_shard_present(z3 *z, int64_t sz, int64_t sy, int64_t sx) {
-    if (z->derive) return z3_shard_present(z->base, sz, sy, sx);
+    if (z->derive && z->xmap) { const int64_t o[3] = {sz * z->m.shard[0], sy * z->m.shard[1], sx * z->m.shard[2]}; const int64_t sn[3] = {z->m.shard[0], z->m.shard[1], z->m.shard[2]}; return x_box(z, o, sn); }
+    if (z->derive) { int r = z3_shard_present(z->base, sz, sy, sx); for (int k = 0; !r && k < z->ncover; k++) r = z3_shard_present(z->cover[k], sz, sy, sx); return r; }
     char skey[1200];
     shard_key(z, sz, sy, sx, skey, sizeof skey);
     if (z->m.sharded) {
@@ -1031,7 +1129,8 @@ static int z3_read_impl(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *
 /* whether any stored chunk intersects the box o + n (sharded arrays: from the shard indices, no chunk read): 1 yes, 0 none (a read
    would be all fill), -1 error; unsharded arrays: 1 */
 int z3_box_any(z3 *z, const int64_t o[3], const int64_t n[3]) {
-    if (z->derive) return z3_box_any(z->base, o, n);
+    if (z->derive && z->xmap) return x_box(z, o, n);
+    if (z->derive) { int r = z3_box_any(z->base, o, n); for (int k = 0; r == 0 && k < z->ncover; k++) r = z3_box_any(z->cover[k], o, n); return r; }
     const z3_meta *m = &z->m;
     if (!m->sharded) return 1;
     int64_t lo[3], hi[3], s0[3], s1[3];
@@ -1085,6 +1184,8 @@ static void fill_part(const z3_meta *m, uint8_t *out, const int64_t o[3], const 
 }
 static int z3_read_impl(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads, uint32_t submask, uint8_t *dsink, uint32_t *dmask, int lean) {
     if (z->derive) { if (submask || dsink || lean) return FAIL("%s: a derived array has no sub-chunk / device reads", z->key); return z->derive(z->dctx, z->base, o, n, out, nthreads); }
+    if (z->lv && !submask && !dsink && !lean && lv_box_voxels_gpu) {   /* a latvol array: the box decoded on the GPU when that is configured (latvol_read.h) */
+        const int g = lv_box_voxels_gpu(z, o, n, out, nthreads); if (g <= 0) return g ? FAIL("%s: latvol box read failed", z->key) : 0; }
     const z3_meta *m = &z->m;
     const size_t nv = (size_t)n[0] * n[1] * n[2];
     /* a box inside the array whose chunks are all present (sharded) is overwritten entirely by the chunk copies: no fill pass (the

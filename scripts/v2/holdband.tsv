@@ -1,0 +1,3 @@
+# scroll	band (z0,y0,x0,nz,ny,nx level-0 voxels: held out of training, the only region the v2 unroll eval scores)	guard (level-0 voxels added around the band for the training holdout)
+# PHerc1299 (2026-11-11, coordinator option b): the bottom third in z of its 12309 level-0 slices; guard 256 = 64 voxels at its training level 2 (9.596 um)
+PHerc1299	0,0,0,4103,5145,5145	256

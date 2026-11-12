@@ -41,6 +41,13 @@ void *nn_managed_alloc(size_t bytes);    /* CUDA managed memory (may exceed the 
 void *nn_malloc_try(size_t bytes);       /* device memory, nullptr (no sticky error) when it does not fit */
 void *nn_host_alloc_try(size_t bytes);   /* the same, nullptr when the host cannot pin that much */
 void nn_host_free(void *p);
+/* predict --boxes: the allocation pool. nn_pool_on(): from now on every nn_malloc* / nn_host_alloc* block is kept when freed and at
+   nn_pool_box_end(), which returns all of the box's blocks to the pool (after a device sync) and frees the blocks the box did not reuse; the
+   next box's requests of the same size take a pooled block (device blocks zeroed, as fresh cudaMalloc memory is): the CUDA context,
+   ~10 GB of pinned rings and the window's device buffers carry over instead of ~3 s of cudaMallocHost / cudaFreeHost a box. Callers must
+   not keep pointers across nn_pool_box_end (unet_reset_statics, predict's own). */
+void nn_pool_on(void);
+void nn_pool_box_end(void);
 size_t nn_host_bytes(void);            /* live pinned host bytes (nn_host_alloc*) */
 void nn_host_report(FILE *f);         /* the same by caller address */
 /* pipelined uploads: an async copy on a per-device copy stream (pinned source), events to order it against the compute stream */
@@ -200,6 +207,11 @@ void nn_lat_input_q(const void *q, const void *x, int d, int h, int w, const flo
 /* predict --latents: the CT window rebuilt from a window of stored cells (nn_lat.cu lat_synth_k: 1..255 in material cells, 0 in air
    cells), and a --lat-basis net's input straight from the cells with the radial channels from the axis offsets (lat_pred_in_q_k) */
 void nn_lat_synth_ct(const void *q, int C, const float *bas, float step_raw, int D, int W, uint8_t *ct);
+/* the same two input kernels on cells of `stride` bytes whose first C + 1 are the checkpoint's channels (a latvol array's cells, src/latvol.h:
+   the store may keep more axes than the network reads) */
+void nn_lat_input_qs(const void *q, int stride, const void *x, int d, int h, int w, const float *gain, int C, float step_raw, float mean, float isd, void *y);
+void nn_lat_pred_input_qs(const void *q, int stride, int D, int W, float mean, float isd, const float *dyo, const float *dxo, int axis,
+                          const float *gain, int C, float step_raw, void *y);
 void nn_lat_pred_input_q(const void *q, int D, int W, float mean, float isd, const float *dyo, const float *dxo, int axis,
                          const float *gain, int C, float step_raw, void *y);
 /* the guided head (unet_cfg.lat_guide): see nn_lat.cu lat_guide_k */
@@ -396,6 +408,29 @@ void nn_gram16(const void *x, int bf16, int K, size_t N, size_t ld, double *S);
    parameter gradients from fp16 gradient planes of that layout into gp. 1: a shape the kernels do not take (odd sizes, C or nout > 16) */
 int nn_fstem_fwd(const void *x, int D, int H, int W, int z0, int nz, const float *p, int C, int nout, const int *chs, void *lg, size_t ns);
 int nn_fstem_bwd(const void *x, int D, int H, int W, int z0, int nz, const float *p, int C, int nout, const int *chs, const void *g, size_t ns, float *gp);
+/* a latent-grid net's head straight from the cell logits lg [cout][d][h][w] into a device shard (src/nn_lathead.cu, predict --heads): the
+   window interior ([hz, 4d - hz) x [halo, 4w - halo)^2) inside the shard [0, e) at offset o; channel c0 (a probability) or the recto / verso
+   pair c0, c1 (nn_rv_fuse); sb0 / sb1 the sub-cell outputs' base of each (lat_guide 64: 16 + 64 j for the phase pair, else -1), s0 / s1 the
+   fine stem's output row of each (-1 none; stem null: no stem); ct the window's CT bytes (mask CT >= iso, stem taps) */
+void nn_lat_head_place(const void *lg, int lh16, int d, int h, int w, int c0, int c1, int sb0, int sb1, int s0, int s1,
+                       const float *stem, int C, int nout, const uint8_t *ct, float mean, float isd, int iso,
+                       int hz, int halo, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh);
+/* nh (<= 24) heads at once, head j (c0[j], c1[j], sb0[j], sb1[j], s0[j], s1[j]) into its shard dsh[j]: the stem's features computed once a cell;
+   byte-identical to one nn_lat_head_place per head */
+void nn_lat_heads_place(const void *lg, int lh16, int d, int h, int w, int nh, const int *c0, const int *c1, const int *sb0, const int *sb1, const int *s0, const int *s1,
+                        uint8_t *const *dsh, const float *stem, int C, int nout, const uint8_t *ct, float mean, float isd, int iso,
+                        int hz, int halo, int oz, int oy, int ox, int ez, int ey, int ex, int shard);
+/* predict's device-resident CT window (src/nn_ctdev.cu): a reader worker's stream + device / host chunks; nn_ctw_put gathers one decoded
+   chunk (device substreams dm, the host chunk too when host) into the window [wo, wo + wn) clipped to the array shape sh, and waits */
+void *nn_ctw_new(int dev);
+void nn_ctw_free(void *w);
+uint8_t *nn_ctw_host(void *w);
+uint8_t *nn_ctw_dev(void *w);
+int nn_ctw_put(void *w, uint32_t dm, int host, const int64_t co[3], const int64_t wo[3], const int64_t wn[3], const int64_t sh[3], uint8_t *dwin);
+int nn_ctw_zero(void *w, uint8_t *d, size_t n);
+int nn_dev_mem(size_t *free_bytes, size_t *total_bytes);   /* the current device's free / total memory (0 ok) */
+/* one 2x mean pooling step of an n^3 uint8 volume into (n / 2)^3: (sum + 4) >> 3, as the CPU pyramid (ingest.c pool2_mean) */
+void nn_pool2_u8(const uint8_t *in, int n, uint8_t *out);
 void nn_scale(float *y, float a, size_t n);
 void nn_u8_to_f32(const uint8_t *x, size_t n, float scale, float *y);
 
@@ -537,6 +572,7 @@ void nn_rv_targets(const uint8_t *phase, const uint8_t *pap, size_t n, uint8_t *
 void nn_rv_verso_w(const uint8_t *t, uint8_t *m, size_t n, float w);   /* train --rv-verso-w: verso-side papyrus loss weight x w */
 void nn_rv_fuse(void *lg, size_t n, int h16);   /* predict --channel rv: [recto | verso] logits -> channel 0 = logit((1 + p_r - p_v) / 2) */
 void nn_ink_targets(const uint8_t *ink, size_t n, uint8_t *t, uint8_t *m);   /* train --ink-head: ink prob254 (255 unknown) -> target t (x255) and mask m (known) */
+void nn_ink_targets_smooth(const uint8_t *ink, size_t n, uint8_t *t, uint8_t *m, float eps);   /* the same, label-smoothed: t (1 - eps) + eps / 2 (train --ink-smooth) */
 void nn_phase_trunc(const void *lc, const void *ls, const uint8_t *t, uint8_t *m, size_t n, float tau, float kappa);   /* robust phase loss: confident (>= kappa) predictions off their label by > tau turns leave the mask (fp16 logits) */
 void nn_phase_trunc_counts(unsigned long long out[2]);   /* labelled voxels / dropped since the last call */
 void nn_unwrap_targets(const uint8_t *phase, int d, int h, int w, int s, float dscale, uint8_t *t, uint8_t *m);   /* task unwrap: sign-free normal n n^T (6) and density min(1, dscale rho) (x255, 7 planes) from the phase gradient over +-s voxels; mask */

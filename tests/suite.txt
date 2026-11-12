@@ -27,11 +27,16 @@ test_lat_head~FP8                              | gpu          |        4 | TLH_F
 test_pgrad                                     | gpu          |     1 | ./$B/test_pgrad
 test_gyrec                                     | gpu2         |     1 | ./$B/test_gyrec
 test_unwrap2_sampler                           | gpu          |     9 | ./$B/test_unwrap2_sampler $TMPDIR/unwrap2_fixture
+test_phase_pool                                |              |     3 | UFSM_PHASE_POOL_SLAB=90000 ./$B/test_phase_pool $TMPDIR/phase_pool
 test_rungs                                     | gpu          |     3 | ./$B/test_rungs $TMPDIR/rungs_fixture
 test_gram                                      | gpu          |     2 | ./$B/test_gram
 test_fibhead                                   | gpu          |     2 | ./$B/test_fibhead
 test_fibhead_train                             | gpu          |    25 | tests/test_fibhead_train.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/fibhead
+test_predict_heads                             | gpu          |    70 | tests/test_predict_heads.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/predheads
+test_predict_boxes                             | gpu          |    40 | tests/test_predict_boxes.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/predboxes
 test_fstem                                     | gpu          |     3 | ./$B/test_fstem
+test_lathead                                     | gpu          |     3 | ./$B/test_lathead
+test_fit_lat                                     | gpu          |     3 | ./$B/test_fit_lat
 test_restore_task                              | gpu          |     7 | ./$B/test_restore_task
 test_phase_interp                              |              |    20 | ./$B/test_phase_interp
 test_spatial_augment                           |              |    60 | UFSM_TEST_QUICK=1 ./$B/test_spatial_augment
@@ -84,6 +89,7 @@ test_vwt_sample                                |              |     1 | ./$B/tes
 test_spiralfit                                 |              |    32 | ./$B/test_spiralfit
 test_tta                                       | gpu          |     1 | ./$B/test_tta
 test_predict_unwrap2                           | gpu          |     5 | ./$B/test_predict_unwrap2 ./$B/ufsm
+test_predict_fitgrid                           | gpu          |     5 | ./$B/test_predict_fitgrid ./$B/ufsm
 test_unwrap2_ink                               | gpu          |    40 | ./$B/test_unwrap2_ink ./$B/ufsm ./$B/make_wind_fixture
 test_cuda_abort                                | gpu          |    25 | bash tests/test_cuda_abort.sh ./$B/ufsm ./$B/make_wind_fixture
 test_rv                                        | gpu          |    30 | ./$B/test_rv ./$B/ufsm ./$B/make_wind_fixture
@@ -139,7 +145,14 @@ test_init_lr                                   | gpu          |     3 | ./$B/tes
 test_dinor                                     | gpu          |    60 | UFSM_TEST_QUICK=1 ./$B/test_dinor
 test_dinor~full                                | gpu,slow     |   104 | ./$B/test_dinor
 test_dino_pts                                  |              |     1 | ./$B/test_dino_pts
-test_ink_splat                                 |              |    10 | ./$B/test_ink_splat
+test_ink_splat                                 | gpu          |    10 | ./$B/test_ink_splat
+test_ink_pool                                  |              |     3 | ./$B/test_ink_pool $TMPDIR/ink_pool
+test_ink_mil                                   | gpu          |     2 | ./$B/test_ink_mil
+test_ink_mil_train                             | gpu          |    40 | ./$B/test_ink_mil_train ./$B/ufsm ./$B/make_wind_fixture
+test_accum                                     | gpu          |    20 | tests/test_accum.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/accum
+test_strict_sources                            | gpu          |    25 | tests/test_strict_sources.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/strictsrc
+test_init_heads                                | gpu          |    25 | tests/test_init_heads.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/initheads
+test_ink_mil_check                             | gpu          |    90 | ./$B/test_ink_mil_check ./$B/ufsm ./$B/make_wind_fixture
 test_pyports                                   |              |     1 | ./$B/test_pyports
 test_edt                                       |              |     2 | ./$B/test_edt
 test_volcomp                                   |              |     1 | ./$B/test_volcomp
@@ -223,6 +236,7 @@ test_predict_det                               | gpu          |    11 | ./$B/tes
 test_strip_gpu                                 | gpu          |    10 | ./$B/test_strip_gpu
 test_faces_gpu                                 | gpu          |    10 | ./$B/test_faces_gpu
 test_render_fill                               |              |    10 | ./$B/test_render_fill
+test_render_known                              |              |     5 | ./$B/test_render_known ./$B/ufsm
 test_render_stream_gpu                         | gpu          |    10 | ./$B/test_render_stream_gpu
 test_render_fill_gpu                           | gpu          |    12 | ./$B/test_render_fill_gpu
 test_jpegpar                                   |              |    10 | ./$B/test_jpegpar
@@ -232,9 +246,14 @@ test_z3_autosub                                |              |    10 | ./$B/tes
 test_z3_sink                                   |              |    10 | ./$B/test_z3_sink
 test_replay_lean                               |              |    15 | ./$B/test_replay_lean
 test_gpudec                                    | gpu          |    10 | ./$B/test_gpudec
+test_vcgpu                                     | gpu          |     5 | ./$B/test_vcgpu
 test_lat                                       | gpu          |     1 | ./$B/test_lat
 test_latents                                   | gpu          |    25 | bash tests/test_latents.sh ./$B/ufsm ./$B/make_wind_fixture
+test_latvol                                    | gpu          |     6 | ./$B/test_latvol
+test_latvol_sh                                 | gpu          |    60 | bash tests/test_latvol.sh ./$B/ufsm ./$B/make_wind_fixture ./$B/test_latvol_nolink
 test_lat_fuse                                  | gpu          |     2 | ./$B/test_lat_fuse
 test_phase_onfly                               | gpu          |    20 | tests/test_phase_onfly.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/onfly
 test_fibre_onfly                               | gpu          |    25 | tests/test_fibre_onfly.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/fibonfly
+test_codes_onfly                               | gpu          |    10 | tests/test_codes_onfly.sh ./$B/ufsm $TMPDIR/codesonfly
+test_mesh_phase                                |              |     8 | tests/test_mesh_phase.sh ./$B/ufsm ./$B/test_mesh_phase $TMPDIR/meshphase
 test_lldec                                     | gpu          |     3 | ./$B/test_lldec $TMPDIR/lldec

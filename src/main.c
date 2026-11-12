@@ -128,6 +128,7 @@ int cmd_phase_score(int argc, char **argv);
 int cmd_ink_splat(int argc, char **argv);   /* src/inksplat.c */
 int cmd_ink_score(int argc, char **argv);   /* src/inksplat.c */
 int cmd_ink_vscore(int argc, char **argv);   /* src/inksplat.c */
+int cmd_ink_onfly(int argc, char **argv);   /* src/inksplat.c */
 
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 static int arg_index(int argc, char **argv, const char *k) { for (int i = 2; i < argc; i++) if (!strcmp(argv[i], k)) return i; return -1; }
@@ -136,6 +137,7 @@ static int usage(void) {
     fprintf(stderr,
         "ufsm — ultra fast scroll model\n"
         "  ufsm sysinfo [--ncpu | --avail-gb | --limit-gb] [--disk PATH]   real cgroup CPU / RAM limits, GPUs (MIG), CUDA, free disk\n"
+        "  ufsm latvol  <basis.lcb> <root> <ct-group> <out-group> --levels L,.. [--c 29 --step 0.25 --gpu 0]   a CT group as latent cells: a drop-in CT source (latvol-check: against its source)\n"
         "  ufsm info    <root> <array-or-group-key> [--cache DIR]\n"
         "  ufsm read    <root> <array-key> z y x nz ny nx <out.raw> [--cache DIR] [--threads N]\n"
         "  ufsm slice   <root> <array-key> z <out.pgm> [--cache DIR] [--threads N]     (whole z slice)\n"
@@ -204,7 +206,7 @@ static int usage(void) {
         "  ufsm dino-train --sources S.json --out DIR   our dense embedding net from scratch (GT sheet identity + DINO-style SSL)\n"
         "  ufsm dino-embed CKPT ROOT KEY OUT --box ... --norm c,s   a dino-train net over a box (dinovol-eval format)\n"
         "  ufsm halves ROOT KEY-L0 OUT --box ...   two 4x-pooled views of a fine scan from disjoint sub-voxel halves\n"
-        "  ufsm png2jpg <in.png|in.jpg> <out.jpg> [--half] [--max-px N]   PNG / JPEG -> JPEG q90 (half: Pillow BOX halved; max-px: longest side)\n"
+        "  ufsm png2jpg <in.png|in.jpg> <out.jpg|out.tif> [--half] [--max-px N] [--size W,H]   PNG / JPEG -> JPEG q90 (half: Pillow BOX halved; max-px: longest side) or uint8 TIFF\n"
         "  ufsm phase-score <pc-dir> <ps-dir> [<sheets-dir>]   on-recto score of pc / ps renders on surfaces (per seam class with sheets)\n"
         "  ufsm stitch align|solve|field|sheets|info ...   overlapping box fits -> one gauge, a global winding field, stitched sheets\n"
         "  ufsm render <wraps-dir> <out-dir> --volume ROOT KEY [--ct ROOT KEY]  ink / CT along each wrap (tiled TIFF)\n"
@@ -456,32 +458,7 @@ typedef struct { z3 *codes; const int64_t *shape; const axis *ax; band_params bp
    all are empty, 255 (conflict) when any is or two lie more than a quarter turn apart, else their circular mean */
 static int praster_read(const praster_job *J, const int64_t ro[3], const int64_t rn[3], uint8_t *out) {
     if (J->pf == 1) return z3_read(J->codes, ro, rn, out, 1);
-    static float cs[BAND_PERIOD], sn[BAND_PERIOD]; static _Atomic int init;
-    if (!atomic_load(&init)) { for (int k = 0; k < BAND_PERIOD; k++) { cs[k] = (float)cos(2 * M_PI * k / BAND_PERIOD); sn[k] = (float)sin(2 * M_PI * k / BAND_PERIOD); } atomic_store(&init, 1); }
-    int64_t fo[3], fn[3];
-    for (int d = 0; d < 3; d++) { fo[d] = 2 * ro[d]; const int64_t e = 2 * (ro[d] + rn[d]) < J->fshape[d] ? 2 * (ro[d] + rn[d]) : J->fshape[d]; fn[d] = e - fo[d]; }
-    memset(out, 0, (size_t)rn[0] * rn[1] * rn[2]);
-    if (fn[0] <= 0 || fn[1] <= 0 || fn[2] <= 0) return 0;
-    uint8_t *f = malloc((size_t)fn[0] * fn[1] * fn[2]);
-    if (!f || z3_read(J->codes, fo, fn, f, 1)) { free(f); return -1; }
-    for (int64_t a = 0; a < rn[0]; a++) for (int64_t b = 0; b < rn[1]; b++) for (int64_t c = 0; c < rn[2]; c++) {
-        int first = -1, conflict = 0, k = 0; float x = 0, y = 0;
-        for (int q = 0; q < 8 && !conflict; q++) {
-            const int64_t z = 2 * a + (q >> 2 & 1), yy = 2 * b + (q >> 1 & 1), xx = 2 * c + (q & 1);
-            if (z >= fn[0] || yy >= fn[1] || xx >= fn[2]) continue;
-            const int v = f[((size_t)z * fn[1] + yy) * fn[2] + xx];
-            if (!v) continue;
-            if (v == 255 || (first >= 0 && 2 * abs(band_diff(v - 1, first)) > BAND_STEPS / 2)) { conflict = 1; break; }
-            if (first < 0) first = v - 1;
-            x += cs[v - 1]; y += sn[v - 1]; k++;
-        }
-        uint8_t o = 0;
-        if (conflict) o = 255;
-        else if (k) { double t = atan2(y, x) / (2 * M_PI); if (t < 0) t += 1; o = (uint8_t)(1 + (int)lround(t * BAND_PERIOD) % BAND_PERIOD); }
-        out[((size_t)a * rn[1] + b) * rn[2] + c] = o;
-    }
-    free(f);
-    return 0;
+    return codes_pool2_box(J->codes, ro, rn, out, 1);   /* (band_onfly.h: shared with the derived pooled codes) */
 }
 /* --pair 1: on the GPU when --gpu (src/nn_band.cu, byte-identical), the CPU on any GPU failure */
 static int praster_pair(const praster_job *J, const uint8_t *codes, const int ni[3], uint8_t *phase) {
@@ -709,13 +686,19 @@ static int cmd_codes_pool2(int argc, char **argv) {
    has (evenly over its chunk map; without --ref: the codes'), timed, and compared byte for byte with --ref (phase-raster's output for
    these codes). Prints per window ms, tiles, differing voxels; exit 1 on any difference. */
 static int cmd_phase_onfly(int argc, char **argv) {
-    if (argc < 4) { fprintf(stderr, "usage: ufsm phase-onfly <codes-root> <key> --rmax R [--ref ROOT KEY] [--windows 8] [--P 896] [--gpu D] [--slots 1] [--budget-mb 1024] [--threads 8]\n"); return 2; }
+    if (argc < 4) { fprintf(stderr, "usage: ufsm phase-onfly <codes-root> <key> --rmax R [--pool2 1] [--fuse ROOT2 KEY2 [--fuse-rmax R2] [--tol 0.1]] [--ref ROOT KEY] [--windows 8] [--P 896] [--gpu D] [--slots 1] [--budget-mb 1024] [--threads 8]\n"); return 2; }
     const float rmax = (float)atof(opt(argc, argv, "--rmax", "0")); const int nw = atoi(opt(argc, argv, "--windows", "8")), P = atoi(opt(argc, argv, "--P", "896"));
     const int gpu = atoi(opt(argc, argv, "--gpu", "-1")), nt = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 8);
     if (!(rmax > 0) || nw < 1 || P < 8) { fprintf(stderr, "phase-onfly: --rmax > 0, --windows >= 1, --P >= 8\n"); return 2; }
     if (phase_onfly_config(gpu, atoi(opt(argc, argv, "--slots", "1")), atoi(opt(argc, argv, "--budget-mb", "1024")), 1)) { fprintf(stderr, "phase-onfly: GPU %d unavailable\n", gpu); return 1; }
     z3 *c = z3_open(store_open(argv[2]), argv[3], nullptr); if (!c) { fprintf(stderr, "%s\n", z3_error()); return 1; }
+    const int pool2 = atoi(opt(argc, argv, "--pool2", "0"));   /* --pool2 1: the codes pooled 2x on read (codes_pool2_open; phase-raster --gs 4's codes) */
+    if (pool2) { z3 *p2 = codes_pool2_open(c); if (!p2) { fprintf(stderr, "phase-onfly: --pool2: cubic codes chunks only\n"); return 1; } c = p2; }
     z3 *ph = phase_onfly_open(c, rmax); z3 *ref = nullptr;
+    const int fi = arg_index(argc, argv, "--fuse");   /* --fuse ROOT2 KEY2: the phase of these codes and ROOT2's fused (phase-fuse --tol, the onfly "sets") */
+    if (fi > 0) { z3 *c2 = fi + 2 < argc ? z3_open(store_open(argv[fi + 1]), argv[fi + 2], nullptr) : nullptr; if (!c2) { fprintf(stderr, "phase-onfly: --fuse ROOT KEY: %s\n", z3_error()); return 1; }
+        if (pool2) c2 = codes_pool2_open(c2);
+        z3 *sets[2] = {ph, phase_onfly_open(c2, (float)atof(opt(argc, argv, "--fuse-rmax", opt(argc, argv, "--rmax", "0"))))}; ph = phase_onfly_fuse_open(sets, 2, (float)atof(opt(argc, argv, "--tol", "0.1"))); if (!ph) return 1; }
     const int ri = arg_index(argc, argv, "--ref");
     if (ri > 0) { if (ri + 2 >= argc || !(ref = z3_open(store_open(argv[ri + 1]), argv[ri + 2], nullptr))) { fprintf(stderr, "phase-onfly: --ref ROOT KEY: %s\n", z3_error()); return 1; }
         if (memcmp(z3_meta_of(ref)->shape, z3_meta_of(ph)->shape, sizeof z3_meta_of(ph)->shape)) { fprintf(stderr, "phase-onfly: --ref shape differs from the codes'\n"); return 1; } }
@@ -4146,6 +4129,7 @@ typedef struct {   /* ufsm render: one output tile's pixel rows over threads */
     const float *X, *Y, *Z; int w, h; double gs;   /* the vertex grid; output pixels per grid step */
     const uint8_t *vol, *ct; int64_t o[3], n[3]; int depth;
     uint8_t *img, *cimg; int ow, px0, px1, py0, py1; _Atomic int next;
+    int known;   /* --known: nearest voxel, 255 (prob254 unknown) skipped: the max over the known values (0 when none) */
 } render_job;
 static void *render_rows(void *arg) {
     render_job *J = arg; const int w = J->w, h = J->h;
@@ -4165,7 +4149,15 @@ static void *render_rows(void *arg) {
         const double nl = sqrt(N[0] * N[0] + N[1] * N[1] + N[2] * N[2]); if (nl < 1e-12) continue;
         for (int d = 0; d < 3; d++) N[d] /= nl;
         float m = 0;
-        for (int t = -J->depth; t <= J->depth; t++) { const float v = trilin(J->vol, J->n, P[0] + t * N[0] - J->o[0], P[1] + t * N[1] - J->o[1], P[2] + t * N[2] - J->o[2]); if (v > m) m = v; }
+        for (int t = -J->depth; t <= J->depth; t++) {
+            if (J->known) {   /* nearest voxel; unknown (255) skipped */
+                const int64_t q0 = (int64_t)floor(P[0] + t * N[0] - J->o[0] + 0.5), q1 = (int64_t)floor(P[1] + t * N[1] - J->o[1] + 0.5), q2 = (int64_t)floor(P[2] + t * N[2] - J->o[2] + 0.5);
+                if (q0 < 0 || q1 < 0 || q2 < 0 || q0 >= J->n[0] || q1 >= J->n[1] || q2 >= J->n[2]) continue;
+                const uint8_t b = J->vol[((size_t)q0 * J->n[1] + q1) * J->n[2] + q2]; if (b != 255 && b > m) m = b;
+                continue;
+            }
+            const float v = trilin(J->vol, J->n, P[0] + t * N[0] - J->o[0], P[1] + t * N[1] - J->o[1], P[2] + t * N[2] - J->o[2]); if (v > m) m = v;
+        }
         J->img[(size_t)py * J->ow + px] = (uint8_t)lroundf(m);
         if (J->cimg) J->cimg[(size_t)py * J->ow + px] = (uint8_t)lroundf(trilin(J->ct, J->n, P[0] - J->o[0], P[1] - J->o[1], P[2] - J->o[2]));
     }
@@ -4273,7 +4265,7 @@ static void render_fill_report(const char *name, uint8_t *img, uint8_t *cimg, ui
 typedef struct { char path[1400]; const uint8_t *data; int w, h, rc; } rw_job;   /* ufsm render: one output TIFF */
 static void *rw_write(void *arg) { rw_job *J = arg; J->rc = tiffw_write(J->path, J->w, J->h, 1, J->data, 1); return nullptr; }
 static int cmd_render(int argc, char **argv) {
-    if (argc < 4) { fprintf(stderr, "usage: ufsm render <wraps-dir> <out-dir> --volume ROOT KEY [--ct ROOT KEY] [--cache DIR] [--scale 1] [--depth 8] [--tile 512] [--threads 16] [--crop x,y,w,h] [--joint 1] [--gpu 1]\n"
+    if (argc < 4) { fprintf(stderr, "usage: ufsm render <wraps-dir> <out-dir> --volume ROOT KEY [--ct ROOT KEY] [--cache DIR] [--scale 1] [--depth 8] [--tile 512] [--threads 16] [--crop x,y,w,h] [--joint 1] [--gpu 1] [--known]\n"
 "  --gpu 1 (default): sample on the GPU (decoded chunks kept on the device, decoded there by gpudec); same bytes as --gpu 0 (CPU),\n"
 "    the CPU path on any device error or a full device (UFSM_RENDER_GPU_MEM GB caps the device chunk pool)\n"
 "         [--fill N] [--fill-ct 1] [--fill-prefer 0] [--fill-inpaint L] [--fill-pm 1] [--fill-grid V]\n"
@@ -4286,21 +4278,24 @@ static int cmd_render(int argc, char **argv) {
 "    cosmetic, off by default; flag 250\n"
 "  --fill-grid V (with --fill): enclosed holes of the grid (invalid vertices, at most V per hole) bridged by interpolated vertices\n"
 "    (push-pull + Laplace), rendered like the rest; their pixels' flags + 100\n"
+"  --known: nearest voxel, 255 (prob254 unknown) skipped, the max over the known values within +-depth (label zarrs: ink-splat output);\n"
+"    on the CPU (the box read once when it fits UFSM_RENDER_MEM, else per tile); not with --fill / --joint\n"
                                      "  --crop: only that rectangle of each wrap's output pixels is rendered and written (e.g. a labelled region)\n"); return 2; }
     const int vi = arg_index(argc, argv, "--volume"), ci = arg_index(argc, argv, "--ct");
     int crop[4] = {0, 0, 0, 0}; const char *crs = opt(argc, argv, "--crop", nullptr);
     if (crs && (sscanf(crs, "%d,%d,%d,%d", &crop[0], &crop[1], &crop[2], &crop[3]) != 4 || crop[0] < 0 || crop[1] < 0 || crop[2] < 1 || crop[3] < 1)) { fprintf(stderr, "render: --crop x,y,w,h\n"); return 2; }
     if (vi < 0 || vi + 2 >= argc) { fprintf(stderr, "render: --volume ROOT KEY\n"); return 2; }
-    const double scale = atof(opt(argc, argv, "--scale", "1")); const int depth = atoi(opt(argc, argv, "--depth", "8"));
+    const double scale = atof(opt(argc, argv, "--scale", "1")); const int depth = atoi(opt(argc, argv, "--depth", "8")), known = flag(argc, argv, "--known");
     const int tile = atoi(opt(argc, argv, "--tile", "512")), nthreads = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 16);
     const char *cache = opt(argc, argv, "--cache", nullptr);
     const int fill_n = atoi(opt(argc, argv, "--fill", "-1")), fill_inp = atoi(opt(argc, argv, "--fill-inpaint", "0"));
     const int fill_thr = atoi(opt(argc, argv, "--fill-ct", "1")), fill_pref = atoi(opt(argc, argv, "--fill-prefer", "0")), fill_pm = atoi(opt(argc, argv, "--fill-pm", "1"));
     const long fill_grid = atol(opt(argc, argv, "--fill-grid", "0"));
-    const int rgpu_on = atoi(opt(argc, argv, "--gpu", "1")) && render_gpu_available() && !getenv("UFSM_RENDER_TILED");   /* default on: same bytes, CPU on any device trouble */
+    const int rgpu_on = atoi(opt(argc, argv, "--gpu", "1")) && render_gpu_available() && !getenv("UFSM_RENDER_TILED") && !known;   /* default on: same bytes, CPU on any device trouble */
     render_set_gpu(rgpu_on);
     if (fill_n > 49 || (fill_grid && fill_n < 0) || fill_inp < 0 || fill_inp > 8 || ((fill_n >= 0 || fill_inp) && (ci < 0 || ci + 2 >= argc)) || (fill_inp && fill_n < 0) || (fill_n >= 0 && getenv("UFSM_RENDER_TILED"))) {
         fprintf(stderr, "render: --fill N (0..49) needs --ct (and not UFSM_RENDER_TILED); --fill-inpaint L (1..8) needs --fill\n"); return 2; }
+    if (known && (fill_n >= 0 || atoi(opt(argc, argv, "--joint", "0")))) { fprintf(stderr, "render: --known is the CPU box / tile path: not with --fill or --joint\n"); return 2; }
     store *vs = store_open(argv[vi + 1]), *cs = ci > 0 && ci + 2 < argc ? store_open(argv[ci + 1]) : nullptr;
     const int remote = (vs && !store_is_local(vs)) || (cs && !store_is_local(cs));
     z3 *vz = vs ? z3_open(vs, argv[vi + 2], cache) : nullptr, *cz = cs ? z3_open(cs, argv[ci + 2], cache) : nullptr;
@@ -4317,7 +4312,7 @@ static int cmd_render(int argc, char **argv) {
     int chunked = 0; double cbudget = 0;
     {
         double lo[3] = {1e300, 1e300, 1e300}, hi[3] = {-1e300, -1e300, -1e300};
-        const int forced = !getenv("UFSM_RENDER_TILED") && (getenv("UFSM_RENDER_CHUNKED") || fill_n >= 0 || rgpu_on);   /* chunk-ordered anyway: no box scan (a grid read) */
+        const int forced = !getenv("UFSM_RENDER_TILED") && !known && (getenv("UFSM_RENDER_CHUNKED") || fill_n >= 0 || rgpu_on);   /* chunk-ordered anyway: no box scan (a grid read) */
         while (!forced && (de = readdir(dd))) {
             if (de->d_name[0] != 'w') continue;
             char p[1400]; int w, h; const char *ax[3] = {"z", "y", "x"};
@@ -4415,7 +4410,7 @@ static int cmd_render(int argc, char **argv) {
         uint8_t *img = calloc((size_t)ow * oh, 1), *cimg = cz ? calloc((size_t)ow * oh, 1) : nullptr, *flag = fill_n >= 0 ? malloc((size_t)ow * oh) : nullptr;
         if (!img || (cz && !cimg) || (fill_n >= 0 && !flag)) { fprintf(stderr, "render: out of memory\n"); return 1; }
         if (flag) memset(flag, RFILL_NONE, (size_t)ow * oh);
-        if (!rvol && !getenv("UFSM_RENDER_TILED")) {
+        if (!rvol && !known && !getenv("UFSM_RENDER_TILED")) {   /* (--known: render_rows below, the only nearest-voxel sampler) */
             z3 *zs[2] = {vz, cz}; const int dp[2] = {depth, 0}; uint8_t *const im[2] = {img, cimg};
             const size_t imgb = (size_t)ow * oh * (cz ? 2 : 1), cb = cbudget > imgb + ((size_t)1 << 30) ? (size_t)cbudget - imgb : (size_t)1 << 30;
             const int io = remote ? (nthreads > 32 ? nthreads : 32) : nthreads;
@@ -4438,7 +4433,7 @@ static int cmd_render(int argc, char **argv) {
                 const double v[3] = {Z[i], Y[i], X[i]}; for (int d = 0; d < 3; d++) { if (v[d] < lo[d]) lo[d] = v[d]; if (v[d] > hi[d]) hi[d] = v[d]; }
             }
             if (lo[0] > hi[0]) continue;
-            render_job J = {X, Y, Z, w, h, gs, nullptr, nullptr, {0, 0, 0}, {0, 0, 0}, depth, img, cimg, ow, tx, px1, ty, py1, 0};
+            render_job J = {X, Y, Z, w, h, gs, nullptr, nullptr, {0, 0, 0}, {0, 0, 0}, depth, img, cimg, ow, tx, px1, ty, py1, 0, known};
             if (rvol) {   /* the region read once */
                 J.vol = rvol; J.ct = rct; for (int d = 0; d < 3; d++) { J.o[d] = ro[d]; J.n[d] = rn[d]; }
                 pthread_t th[64]; const int nt = nthreads < 64 ? nthreads : 64;
@@ -4631,6 +4626,7 @@ int cmd_fiber_judge(int argc, char **argv);    /* src/fiberjudge.c */
 int cmd_fiber_trace(int argc, char **argv);    /* src/fibertrace.c */
 int cmd_fiber_raster(int argc, char **argv);   /* src/fiberraster.c */
 int cmd_fiber_onfly(int argc, char **argv);
+int cmd_codes_onfly(int argc, char **argv);
 int cmd_fiber_link(int argc, char **argv);     /* src/fiberlink.c */
 int cmd_count_field(int argc, char **argv);   /* src/countfield.c */
 int cmd_hires_phase(int argc, char **argv);   /* src/hiresphase.c */
@@ -4703,6 +4699,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "fiber-trace")) return cmd_fiber_trace(argc, argv);
     if (!strcmp(cmd, "fiber-raster")) return cmd_fiber_raster(argc, argv);
     if (!strcmp(cmd, "fiber-onfly")) return cmd_fiber_onfly(argc, argv);
+    if (!strcmp(cmd, "codes-onfly")) return cmd_codes_onfly(argc, argv);
     if (!strcmp(cmd, "count-field")) return cmd_count_field(argc, argv);
     if (!strcmp(cmd, "hires-phase")) return cmd_hires_phase(argc, argv);
     if (!strcmp(cmd, "phase-gate")) return cmd_phase_gate(argc, argv);
@@ -4742,6 +4739,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "ink-splat")) return cmd_ink_splat(argc, argv);
     if (!strcmp(cmd, "ink-score")) return cmd_ink_score(argc, argv);
     if (!strcmp(cmd, "ink-vscore")) return cmd_ink_vscore(argc, argv);
+    if (!strcmp(cmd, "ink-onfly")) return cmd_ink_onfly(argc, argv);
     if (!strcmp(cmd, "ink-cover")) return cmd_ink_cover(argc, argv);
     if (!strcmp(cmd, "ink-ensemble")) return cmd_ink_ensemble(argc, argv);
     if (!strcmp(cmd, "wl-dump")) return cmd_wl_dump(argc, argv);
@@ -4829,6 +4827,8 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "papyrus-labels")) return cmd_papyrus_labels(argc, argv);
     if (!strcmp(cmd, "overlay")) return cmd_overlay(argc, argv);
     if (!strcmp(cmd, "wind-score")) return cmd_wind_score(argc, argv);
+    if (!strcmp(cmd, "latvol")) { int cmd_latvol(int, char **); return cmd_latvol(argc, argv); }   /* a CT group as latent cells, a drop-in CT source (src/latvol.h, latvol_cli.c) */
+    if (!strcmp(cmd, "latvol-check")) { int cmd_latvol_check(int, char **); return cmd_latvol_check(argc, argv); }
     if (!strcmp(cmd, "lc-encode")) { int cmd_lc_encode(int, char **); return cmd_lc_encode(argc, argv); }   /* latcomp v1 store of a CT volume (src/lc_cli.c) */
     if (!strcmp(cmd, "store-bench")) { int cmd_store_bench(int, char **); return cmd_store_bench(argc, argv); }
     if (!strcmp(cmd, "phase-pack") || !strcmp(cmd, "phase-unpack") || !strcmp(cmd, "phase-cmp") || !strcmp(cmd, "phase-drop")) { int cmd_phase_pack(int, char **); return cmd_phase_pack(argc, argv); }
@@ -4852,7 +4852,7 @@ int main(int argc, char **argv) {
                 const z3_meta *m = z3_meta_of(z);
                 printf("  %-10s %.4g um  shape %lld x %lld x %lld  shard %d chunk %d  %s q=%g%s\n", lv[i].path, lv[i].um,
                        (long long)m->shape[0], (long long)m->shape[1], (long long)m->shape[2], m->shard[0], m->chunk[0],
-                       m->q >= 0 ? "volcomp" : m->raw ? "raw" : "?", m->q, m->zstd ? "+zstd" : "");
+                       m->q >= 0 ? "volcomp" : m->latvol ? "latvol" : m->raw ? "raw" : "?", m->q, m->zstd ? "+zstd" : "");
                 z3_close(z);
             }
             return 0;
@@ -4862,7 +4862,7 @@ int main(int argc, char **argv) {
         const z3_meta *m = z3_meta_of(z);
         printf("array %s\n  shape %lld x %lld x %lld  shard %d x %d x %d  chunk %d x %d x %d  sep '%c'\n  codec %s q=%g%s  scale %.4g um\n",
                key, (long long)m->shape[0], (long long)m->shape[1], (long long)m->shape[2], m->shard[0], m->shard[1], m->shard[2],
-               m->chunk[0], m->chunk[1], m->chunk[2], m->sep, m->q >= 0 ? "volcomp" : m->raw ? "raw" : "?", m->q,
+               m->chunk[0], m->chunk[1], m->chunk[2], m->sep, m->q >= 0 ? "volcomp" : m->latvol ? "latvol" : m->raw ? "raw" : "?", m->q,
                m->zstd ? "+zstd" : "", m->scale_um);
         z3_close(z);
         return 0;

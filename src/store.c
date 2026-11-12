@@ -304,6 +304,36 @@ void store_set_bearer(store *s, const char *token) {
 }
 const char *store_root(const store *s) { return s->root; }
 
+/* The chunk cache directory of an HTTP root under the user's cache_dir. Cached items are named by array key and chunk only, so two roots
+   holding the same keys (a mirror and a re-encoded copy of it) must not share a directory: a cache_dir belongs to one root, recorded in
+   <cache_dir>/.root on first use; any other root gets the subdirectory <cache_dir>/@<hash of its URL>. A directory that already holds
+   chunks but has no .root (caches from before this rule) belongs to the project's mirror (UFSM_CACHE_LEGACY_ROOT overrides): they all
+   were filled from it. Returns a malloc'd path, or nullptr for a local root / no cache_dir (local stores are read directly). */
+#include <dirent.h>
+static void root_trim(char *o) { size_t l = strlen(o); while (l && (o[l - 1] == '/' || o[l - 1] == '\n' || o[l - 1] == ' ')) o[--l] = 0; }
+static void root_norm(const char *r, char *o, size_t n) { snprintf(o, n, "%s", r); root_trim(o); }
+char *store_cache_dir(const store *s, const char *cache_dir) {
+    if (!cache_dir || !*cache_dir || s->local) return nullptr;
+    char root[2048], own[2048] = "", mp[4200], cmd[4200]; root_norm(s->root, root, sizeof root);
+    snprintf(mp, sizeof mp, "%s/.root", cache_dir);
+    FILE *f = fopen(mp, "r");
+    if (!f) {   /* claim the directory: for this root when it is new or empty, for the legacy root when it already holds chunks */
+        int has = 0; DIR *d = opendir(cache_dir);
+        if (d) { for (struct dirent *e; (e = readdir(d));) if (e->d_name[0] != '.' && e->d_name[0] != '@') { has = 1; break; } closedir(d); }
+        else { snprintf(cmd, sizeof cmd, "%s", cache_dir); for (char *c = cmd + 1; *c; c++) if (*c == '/') { *c = 0; mkdir(cmd, 0777); *c = '/'; } mkdir(cmd, 0777); }
+        const char *lg = getenv("UFSM_CACHE_LEGACY_ROOT"); char claim[2048];
+        root_norm(has ? (lg && *lg ? lg : "https://dl.ash2txt.org/community-uploads/forrest/volcomp") : root, claim, sizeof claim);
+        int fd = open(mp, O_WRONLY | O_CREAT | O_EXCL, 0666);   /* (two first users at once: one creates it, the other reads it below) */
+        if (fd >= 0) { if (write(fd, claim, strlen(claim)) < 0) { /* an unwritable cache: every root but the claim's takes its subdirectory */ } close(fd); snprintf(own, sizeof own, "%s", claim); }
+        else f = fopen(mp, "r");
+    }
+    if (f) { for (int t = 0; t < 50 && !fgets(own, sizeof own, f); t++) { usleep(2000); rewind(f); } fclose(f); root_trim(own); }
+    if (!strcmp(own, root)) return strdup(cache_dir);
+    uint64_t h = 1469598103934665603ull; for (const char *c = root; *c; c++) { h ^= (unsigned char)*c; h *= 1099511628211ull; }   /* FNV-1a */
+    size_t n = strlen(cache_dir) + 24; char *o = malloc(n); snprintf(o, n, "%s/@%016llx", cache_dir, (unsigned long long)h);
+    return o;
+}
+
 static char *join(const store *s, const char *key) {
     size_t a = strlen(s->root), b = strlen(key);
     char *p = malloc(a + b + 2);
@@ -328,21 +358,22 @@ static int64_t local_size(const store *s, const char *key) {
 /* local read accounting (store_io_report): per store root the reads, bytes and wall time in open + pread (page-cache hits are fast;
    with /proc/self/io read_bytes vs rchar the share served from the disk) */
 #define IO_NR 64
-static struct { const store *s; _Atomic uint64_t n, bytes, ns; } g_io[IO_NR];
+static struct { char root[256]; _Atomic uint64_t n, bytes, ns; } g_io[IO_NR];   /* (keyed by the root's text: a closed store's slot stays readable,
+                                                                                      e.g. the pyramid builder's, which crashed the report) */
 static _Atomic int g_nio;
 static void io_note(const store *s, uint64_t bytes, uint64_t ns) {
     int k = -1, n = atomic_load(&g_nio);
-    for (int i = 0; i < n && i < IO_NR; i++) if (g_io[i].s == s) { k = i; break; }
+    for (int i = 0; i < n && i < IO_NR; i++) if (!strncmp(g_io[i].root, s->root, sizeof g_io[i].root - 1)) { k = i; break; }
     if (k < 0) { static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER; pthread_mutex_lock(&mu); n = atomic_load(&g_nio);
-                 for (int i = 0; i < n; i++) if (g_io[i].s == s) k = i;
-                 if (k < 0 && n < IO_NR) { g_io[n].s = s; k = n; atomic_store(&g_nio, n + 1); } pthread_mutex_unlock(&mu); }
+                 for (int i = 0; i < n; i++) if (!strncmp(g_io[i].root, s->root, sizeof g_io[i].root - 1)) k = i;
+                 if (k < 0 && n < IO_NR) { snprintf(g_io[n].root, sizeof g_io[n].root, "%s", s->root); k = n; atomic_store(&g_nio, n + 1); } pthread_mutex_unlock(&mu); }
     if (k < 0) return;
     atomic_fetch_add(&g_io[k].n, 1); atomic_fetch_add(&g_io[k].bytes, bytes); atomic_fetch_add(&g_io[k].ns, ns);
 }
 void store_io_report(FILE *f) {
     for (int i = 0; i < atomic_load(&g_nio); i++)
         fprintf(f, "store io: %8.1f MB in %8llu reads, %7.2f s in open + pread (%6.0f MB/s) %s\n", g_io[i].bytes / 1e6, (unsigned long long)g_io[i].n,
-                g_io[i].ns / 1e9, g_io[i].ns ? g_io[i].bytes / 1e6 / (g_io[i].ns / 1e9) : 0., g_io[i].s->root);
+                g_io[i].ns / 1e9, g_io[i].ns ? g_io[i].bytes / 1e6 / (g_io[i].ns / 1e9) : 0., g_io[i].root);
 }
 static int64_t local_read(const store *s, const char *key, int64_t off, int64_t len, uint8_t *out) {
     struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);

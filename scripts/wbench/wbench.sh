@@ -15,6 +15,8 @@
 #   WZARGS= (empty): cube windows, no --window-z (latent-grid checkpoints: train --lat 4), with WIN / HALO.
 #   LATENTS="SCROLL=STORE ..." (e.g. "paris4=/mnt/scratch/lat/p4-l2.lc 1667=/mnt/scratch/lat/p1667-l2b.lc"): those scrolls' fields predicted from
 #   the ufsm lc-encode store of their CT level (predict --latents: --lat-basis checkpoints; paris4j falls back to paris4's store).
+#   PBATCH (1): the boxes' fields predicted first, one predict --boxes process per scroll (needs a predict binary with --boxes, 2026-11-12:
+#   UP / U older than that: PBATCH=0); 0: a predict process per box inside the box loop, as before.
 set -u
 H=$(cd "$(dirname "$0")" && pwd)
 SITE=${SITE:-$([ -d $HOME/ufsm-data ] && echo laptop || echo desk)}; GPU=${GPU:-0}
@@ -74,19 +76,52 @@ predict() {   # predict OUTFIELDS z y x nz ny nx LOG [big]: fit fields of the bo
   lx=$(lat_for ${sc:-}); [ -n "${LATENTS:-}" ] && [ -z "$lx" ] && { echo "wbench: LATENTS has no store for scroll ${sc:-?}" > $lg; return 1; }
   # DLV (resolution test, 2026-11-11): predict at level LV+DLV (DLV -1: 4.8 um input for the 9.6 um boxes, -2: 2.4 um, +1: 19.2 um) with
   # the box in that level's voxels and --fit-h 2^(1-DLV), so the fit fields keep their 19.2 um cells and the fitter / codes are unchanged.
-  local dl=${DLV:-0} lv=$LV b0=$2 b1=$3 b2=$4 b3=$5 b4=$6 b5=$7 fh=2
-  if [ $dl != 0 ]; then lv=$((LV + dl)); [ $lv -ge 0 ] || { echo "wbench: DLV $dl below level 0 for scroll ${sc:-?}" > $lg; return 1; }
+  pbox $2 $3 $4 $5 $6 $7 $lg || return 1
+  local rr vv; ctpick $lv $b0,$b1,$b2,$b3,$b4,$b5; echo "ct: $rr $vv level $lv" > $lg.root
+  $run ${UP:-$U} predict $CK $rr $vv $f.tmp --box $b0,$b1,$b2,$b3,$b4,$b5 --fit-zarr $f $(pargs) ${lx:+--latents $lx} > $lg 2>&1; local rc=$?; rm -rf $f.tmp; return $rc
+}
+ctpick() {   # ctpick LV b0,..,b5 [box ...]: rr vv = the local CT copy (LOCALCT, the desk, 2026-11-12; keys without volumes/) when ctcover.py finds
+             # every shard the predict can touch there (or absent from the mirror too: air), else R V. Same bytes either way (one codec).
+  local l=$1; shift; rr=$R vv=$V; [ -n "${LOCALCT:-}" ] && [ "$R" != "$LOCALCT" ] || return 0
+  local lk_=${V/\/volumes\//\/} bx; for bx in "$@"; do python3 -I $H/ctcover.py $LOCALCT $lk_ $R $V $l $bx > /dev/null 2>> $O/ctcover.log || return 0; done
+  rr=$LOCALCT vv=$lk_; }
+pbox() {   # pbox z y x nz ny nx LOG: the box in the predict level's voxels (b0..b5), that level (lv) and --fit-h (fh)
+  # DLV (resolution test, 2026-11-11): predict at level LV+DLV (DLV -1: 4.8 um input for the 9.6 um boxes, -2: 2.4 um, +1: 19.2 um) with
+  # the box in that level's voxels and --fit-h 2^(1-DLV), so the fit fields keep their 19.2 um cells and the fitter / codes are unchanged.
+  local dl=${DLV:-0}; lv=$LV b0=$1 b1=$2 b2=$3 b3=$4 b4=$5 b5=$6 fh=2
+  if [ $dl != 0 ]; then lv=$((LV + dl)); [ $lv -ge 0 ] || { echo "wbench: DLV $dl below level 0 for scroll ${sc:-?}" > $7; return 1; }
     if [ $dl -lt 0 ]; then local m=$((1 << -dl)); b0=$((b0 * m)) b1=$((b1 * m)) b2=$((b2 * m)) b3=$((b3 * m)) b4=$((b4 * m)) b5=$((b5 * m)); fh=$((2 * m))
     else local m=$((1 << dl)); b0=$((b0 / m)) b1=$((b1 / m)) b2=$((b2 / m)) b3=$((b3 / m)) b4=$((b4 / m)) b5=$((b5 / m)); fh=$((2 / m)); fi
-    [ $fh -ge 1 ] || { echo "wbench: DLV $dl leaves no fit cell" > $lg; return 1; }; fi
-  # LOCALCT (the desk, 2026-11-12): read the box from the local CT copy (keys without volumes/) when ctcover.py finds every shard the
-  # predict can touch there (or absent from the mirror too: air); else from R. Same bytes either way (one codec), so rows do not change.
-  local rr=$R vv=$V; if [ -n "${LOCALCT:-}" ] && [ "$R" != "$LOCALCT" ]; then local lk_=${V/\/volumes\//\/}
-    if python3 -I $H/ctcover.py $LOCALCT $lk_ $R $V $lv $b0,$b1,$b2,$b3,$b4,$b5 > /dev/null 2> $lg.ct; then rr=$LOCALCT vv=$lk_; fi; fi
-  echo "ct: $rr $vv level $lv" > $lg.root
-  $run ${UP:-$U} predict $CK $rr $vv $f.tmp --um $UM --level $lv --box $b0,$b1,$b2,$b3,$b4,$b5 ${WZARGS---window-z ${WINZ:-384} --halo-z ${HALOZ:-64}} --window ${WIN:-640} --halo ${HALO:-64} --shard 512 \
-    --grid-origin ${GO:-0,0,0} --ema 1 --q 8 --threads $THREADS --gpu $GPU --axis $AX --levels 1 --fit-zarr $f --fit-h $fh --fit-q 8 --fit-q-phase 0 ${PX:-} \
-    --no-out 1 --cache $CACHE ${lx:+--latents $lx} > $lg 2>&1; local rc=$?; rm -rf $f.tmp; return $rc
+    [ $fh -ge 1 ] || { echo "wbench: DLV $dl leaves no fit cell" > $7; return 1; }; fi
+}
+pargs() {   # the predict options every box of a scroll shares (after pbox: lv, fh)
+  echo --um $UM --level $lv ${WZARGS---window-z ${WINZ:-384} --halo-z ${HALOZ:-64}} --window ${WIN:-640} --halo ${HALO:-64} --shard 512 \
+    --grid-origin ${GO:-0,0,0} --ema 1 --q 8 --threads $THREADS --gpu $GPU --axis $AX --levels 1 --fit-h $fh --fit-q 8 --fit-q-phase 0 ${PX:-} --no-out 1 --cache $CACHE
+}
+pbatch() {   # PBATCH=1 (default): the fields of every box still to run, one predict --boxes process per scroll (the ~5 s start-up of a predict run
+             # paid once per scroll, not per box; the same bytes as a process per box); per box its seconds in $O/BOX/pred.s
+  local B; for B in $BL; do [ -e $FD/$B/fields.json ] || rm -f $O/$B/pred.s; done   # (a pred.s is this run's only, or that of the PHASE=predict run whose fields these are)
+  [ -n "$FIELDS" ] || [ "${PBATCH:-1}" != 1 ] && return 0
+  local s nm z y x nz ny nx lv_ note n bf lg lx
+  for s in $(for B in $BL; do awk -F'\t' -v b=$B '$1 == b {print $2}' $BT; done | sort -u); do
+    sc=$s; scroll $sc || continue
+    lx=$(lat_for $sc); [ -n "${LATENTS:-}" ] && [ -z "$lx" ] && continue   # (predict() reports it per box)
+    bf=$O/boxes-$sc.txt; lg=$O/pred-$sc.log; : > $bf; n=0
+    for B in $BL; do
+      IFS=$'\t' read -r nm s2 z y x nz ny nx lv_ note <<< "$(awk -F'\t' -v b=$B '$1 == b' $BT)"
+      [ "${s2:-}" = $sc ] || continue
+      grep -qP "^$TAG\t$B\t" $RES && continue; [ -e $FD/$B/fields.json ] && continue
+      mkdir -p $O/$B; pbox $z $y $x $nz $ny $nx $O/$B/pred.log || continue
+      rm -rf $FD/$B $FD/$B.tmp; echo "$b0,$b1,$b2,$b3,$b4,$b5 $FD/$B.tmp --fit-zarr $FD/$B" >> $bf; echo $B >> $bf.names; n=$((n + 1))
+    done
+    [ $n = 0 ] && { rm -f $bf $bf.names; continue; }
+    local rr vv; ctpick $lv $(cut -d' ' -f1 $bf); log "$sc: $n boxes predicted in one process ($bf; ct $rr $vv)"; lk
+    RUN ${UP:-$U} predict $CK $rr $vv - --boxes $bf $(pargs) ${lx:+--latents $lx} > $lg 2>&1 || log "$sc: predict --boxes failed ($lg; the boxes left run one by one)"
+    ulk
+    local i=0; while read -r B; do i=$((i + 1)); rm -rf $FD/$B.tmp
+      grep -oE "predict --boxes: box $i done in [0-9.]+" $lg | awk '{print int($NF + 0.5)}' > $O/$B/pred.s; cp $lg $O/$B/pred.log; done < $bf.names
+    rm -f $bf.names
+  done
 }
 fitsc() {   # fitsc FIELDS OUT LOG [extra]: production fit + codes score + pair accuracy
   local f=$1 o=$2 lg=$3; shift 3
@@ -106,6 +141,7 @@ elif [ "$BOXES" = none ]; then BL=""
 elif [ "$BOXES" = clean ]; then BL=$(grep -v '^#' $BT | awk -F'\t' '$10 !~ /label-noise/' | cut -f1)
 elif [ "$BOXES" = core ]; then BL=$(grep -v '^#' $BT | awk -F'\t' '$10 !~ /label-noise/ && ($2 == "paris4" || $2 == "paris4j" || $10 ~ /core/)' | cut -f1)   # routine snapshot evals
 else BL=$BOXES; fi
+pbatch
 for B in $BL; do
   ulk
   [ -n "${STOPAT:-}" ] && [ $(date +%s) -ge $STOPAT ] && { log "stop: the GPU window ends (STOPAT); $B and later boxes left for the next window"; break; }
@@ -115,11 +151,10 @@ for B in $BL; do
   d=$O/$B; mkdir -p $d; f=$FD/$B
   lk; t0=$(date +%s)   # (pred_s without the GPU queue wait)
   if [ -n "$FIELDS" ]; then [ -e $f/fields.json ] || { log "$B: no fields $f"; continue; }
-  elif [ ! -e $f/fields.json ]; then predict $f $z $y $x $nz $ny $nx $d/pred.log || { log "$B predict failed"; continue; }; echo $(( $(date +%s) - t0 )) > $d/pred.s; fi
-  # PHASE=predict (2026-11-12, the pod's GPU window): only the predicts of the row, back to back; a later plain run fits and scores from the
-  # stored fields (pred_s then comes from $d/pred.s: the predict's own seconds, GPU queue wait included).
+  elif [ ! -e $f/fields.json ]; then rm -f $d/pred.s; predict $f $z $y $x $nz $ny $nx $d/pred.log || { log "$B predict failed"; continue; }; fi
+  # PHASE=predict (2026-11-12): only the predicts of the row (fields stay on disk); a later plain run fits and scores from them
   [ "${PHASE:-}" = predict ] && continue
-  t1=$(date +%s); [ -s $d/pred.s ] && t0=$((t1 - $(cat $d/pred.s)))
+  t1=$(date +%s); ps=$((t1 - t0)); [ -s $d/pred.s ] && ps=$(cat $d/pred.s)   # (pbatch: the box's own seconds in the --boxes run)
   fitsc $f $d/fit $d/fit.log; t2=$(date +%s)
   ids0=$(num $(g_ids $d/fit.log))
   # REP shifted sub-domains: drop the first / last 16 cells (32 level voxels) of every axis
@@ -147,8 +182,8 @@ for B in $BL; do
   fi
   read -r cl clp <<< "$(awk -F'\t' -v b=$B '$1 == b {print $2, $3}' $CEIL | tail -1)"
   fr=$(echo "$ids $cl" | awk '$1 != "na" && $2 != "na" && $2 > 0 {printf "%.4f", $1 / $2; exit} {print "na"}')
-  echo "$TAG	$B	$sc	$ids	$ids0	$ia	$ib	$sd	$e08$pp	$pe	$gr	$g1	$cf	$cl	$clp	$fr	$((t1 - t0))	$((t2 - t1))	$BIN	$FCFG	$cnb	$cno	$cnp	$dnb	$dno	$dnp" >> $RES
-  log "$B ids $ids (box $ids0 shifted $ia $ib) p1x $(g_pair $d/fit.log 1 1) gross100 $g1 cnt_bias $cnb cnt_off $cno ceil $cl pred $((t1 - t0))s fit $((t2 - t1))s"
+  echo "$TAG	$B	$sc	$ids	$ids0	$ia	$ib	$sd	$e08$pp	$pe	$gr	$g1	$cf	$cl	$clp	$fr	$ps	$((t2 - t1))	$BIN	$FCFG	$cnb	$cno	$cnp	$dnb	$dno	$dnp" >> $RES
+  log "$B ids $ids (box $ids0 shifted $ia $ib) p1x $(g_pair $d/fit.log 1 1) gross100 $g1 cnt_bias $cnb cnt_off $cno ceil $cl pred ${ps}s fit $((t2 - t1))s"
   # (the fit dir is kept: others read runs/TAG/BOX/fit)
   [ -z "$FIELDS" ] && [ "$KEEP" = 0 ] && rm -rf $f
 done

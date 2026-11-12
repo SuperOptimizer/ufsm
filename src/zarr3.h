@@ -14,6 +14,7 @@ typedef struct {
     float q;              /* volcomp q; -1 if the codec chain has no volcomp */
     int zstd;             /* 1 if zstd follows volcomp */
     int raw;              /* 1 if bytes codec only (uncompressed) */
+    int latvol;           /* 1: the latvol codec (latvol.h): chunks hold latent cells; z3_read gives the rebuilt CT bytes, z3_latvol the codec */
     char sep;             /* chunk key separator */
     double scale_um;      /* voxel size from the parent group's OME multiscales, 0 if unknown */
     int fill;             /* fill_value for missing chunks / shards */
@@ -35,6 +36,19 @@ void z3_close(z3 *z);
 typedef int (*z3_derive_fn)(void *ctx, z3 *base, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads);
 z3 *z3_open_derived(z3 *base, int fill, z3_derive_fn derive, void *ctx, void (*ctx_free)(void *));
 z3 *z3_base_of(const z3 *z);   /* a derived array's base, else nullptr */
+void *z3_derived_ctx(const z3 *z);   /* a derived array's ctx, else nullptr */
+void z3_derived_borrow(z3 *z);   /* z3_close(z) then leaves its base open (a derived view of an array its owner keeps) */
+/* more arrays (same shape, up to 4) whose chunks the derived values also reach (e.g. a fusion of several sets): z3_chunk_map / z3_box_any /
+   z3_shard_present answer for the union; taken over (closed with z). 0 or -1 */
+int z3_derived_cover(z3 *z, z3 *cover);
+/* a derived array on the 2x coarser grid of base (shape ceil(base / 2), the same chunk / shard edges; derive gets coarse boxes): its
+   chunk map / box_any / shard presence from the base's chunks (each coarse chunk = 2^3 base chunks). nullptr on failure (base kept) */
+z3 *z3_open_derived_pool2(z3 *base, int fill, z3_derive_fn derive, void *ctx, void (*ctx_free)(void *));
+/* the derived values' known extent (sparse targets: the sampler's draw cells, occupancy tests): fn marks bits[(cz grid[1] + cy) grid[2] + cx]
+   != 0 for every chunk (the base's chunk grid, chunk edge `chunk`) where derive can give a known value; called once, on the first query.
+   z3_chunk_map / z3_box_any / z3_shard_present then answer from it (instead of the base and covers). ctx stays the caller's (freed with the
+   derive ctx when it is the same). 0 or -1 */
+int z3_derived_extent(z3 *z, int (*fn)(void *ctx, const int64_t grid[3], const int chunk[3], uint8_t *bits), void *ctx);
 const z3_meta *z3_meta_of(const z3 *z);
 const char *z3_key(const z3 *z);
 
@@ -67,9 +81,13 @@ int z3_group_levels(store *s, const char *group_key, z3_level *out, int max);
 
 const char *z3_error(void);
 void z3_io_stats(uint64_t *cache_hits, uint64_t *store_reads);
+/* the calling thread's volcomp decodes on the CPU (1) even with the GPU decoder on (predict's device CT windows: CPU workers beside the GPU ones) */
+void z3_thread_cpu_decode(int on);
 /* the shared decoded-substream cache (UFSM_ZCACHE_GB, src/zshm.h) in this process: substream hits, misses, stored */
 void z3_shared_cache_stats(uint64_t *hits, uint64_t *misses, uint64_t *stored);   /* chunk reads served from the cache vs fetched from the store */
 int z3_prefetch_chunk(z3 *z, int64_t cz, int64_t cy, int64_t cx);   /* fetch one inner chunk into the cache (no decode): 1 fetched, 0 cached/absent, -1 error */
-int z3_chunk_raw(z3 *z, int64_t cz, int64_t cy, int64_t cx, uint8_t **buf, size_t *n);   /* encoded inner chunk bytes (after zstd): 1 with *buf (malloc), 0 absent, -1 error */
+int z3_chunk_raw(z3 *z, int64_t cz, int64_t cy, int64_t cx, uint8_t **buf, size_t *n);   /* encoded inner chunk bytes (after zstd): 1 with *buf (malloc), 0 absent, -1 error; an HTTP root's chunk through the chunk cache */
+/* a latvol array's codec (the transform, step, tables: src/latvol.h), else nullptr */
+const void *z3_latvol(const z3 *z);   /* (const lv_codec *) */
 uint64_t z3_sink_chunks(void);   /* chunks decoded straight into a request's output (the window sink), process-wide */
 

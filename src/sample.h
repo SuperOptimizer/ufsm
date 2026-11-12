@@ -26,6 +26,13 @@ typedef struct {
     double empty_keep;       /* probability of keeping a patch whose target is all zero */
     int augment;             /* 0 = none, 1 = all 48 cube symmetries + intensity, 2 = the 24 proper rotations + intensity */
     int holdout;             /* 0 = train: never draw patches touching a source's holdout box; 1 = validation: draw only inside holdout boxes */
+    int holdout_reject;      /* training windows that overlap a held-out box (any same-CT source's): 0 = keep the window, every label unknown
+                                inside the box grown by holdout_guard level-l voxels ("mask", the default); 1 = drop and redraw ("reject").
+                                A source's "holdout_mode" overrides it */
+    int ink_mil, mil_mode, mil_stride, mil_max; float mil_R;   /* --ink-mil: each window's normal-pooled MIL rays (inksplat.h inkfly_rays of the source's onfly ink target:
+                                mode, stride, reach R in window voxels; at most mil_max, evenly subsampled) into batch.mil / nmil, on the source grid (train maps them through the symmetry) */
+    int strict_sources;      /* train --strict-sources 1: a weighted source with no eligible level ("excluded: no ... patch fits") stops sampler_start (fatal) */
+    int holdout_guard;       /* the mask's margin around each held-out box, in voxels of the window's level (default 16) */
     int dilate;              /* > 0: dilate the surface band of pyramid targets by this many level-0 voxels (curriculum for thin targets) */
     int erode;               /* 0 or 1: native-grid face-neighbour erosion of binary targets before softening */
     float soft;              /* > 0: soft ridge target exp(-(d/soft)^2/2) around the surface (d = chamfer distance in level-0 voxels) */
@@ -169,6 +176,7 @@ typedef struct {
 int sample_gpu_input_ok(const sample_cfg *c);
 int sample_gpu_aug_ok(const sample_cfg *c);   /* train --gpu-aug possible with this configuration (needs gpu_input) */
 int sample_gpu_lwarp_ok(const sample_cfg *c);   /* train --gpu-aug 2 possible (sample_gpu_aug_ok, packed targets, no sheet / gap / distill / cond / band / aux labels; pmask: from the packed mask bit) */
+int sample_mil_map(void *rays, int n, const int perm[3], const int flip[3], const void *spatial, int Pz, int P);   /* cfg.ink_mil: inkray list (source grid) -> output window, in place; returns the kept count */
 void sample_warp_ink(const uint8_t *src, uint8_t *dst, int P, const int perm[3], const int flip[3], const void *spatial);   /* cfg.ink_plane: a warped window's ink plane (src: the source grid) */
 void sample_phase_cssn(const float **cs, const float **sn);   /* the phase codes' cos / sin (PHASE_PERIOD floats; the warps' tables) */
 
@@ -210,6 +218,8 @@ typedef struct {
     uint8_t *vok;            /* B: 1 where the window has a view crop */
     uint8_t *tm;             /* cfg.pack_tm: B x P^3 codes (bit 0: target 0 = 255, bit 1: target 1 = 255, bit 2: mask), t / m nullptr */
     int xch;                 /* input channels stored per sample in x / x16 (4, 5 with aux, 7 with cond, 1 with gpu_input) */
+    void **mil0; int *nmil0;   /* cfg.ink_mil: the same rays on the source grid (before the symmetry / warp), re-mapped by --replay's re-drawn geometry */
+    void **mil; int *nmil;   /* cfg.ink_mil: per window its inkray list (malloc'd, kept with the slot) and count; source-grid window voxels, held-out boxes + guard dropped */
     int8_t *emb;             /* cfg.emb_ch: B x emb_ch x (Pz / emb_div) x (P / emb_div)^2 feature targets (int8 x 127 unit vectors, channel planes; a cell
                                 with all channels 0 has none) */
 } batch;
@@ -254,6 +264,10 @@ void sampler_hostmem(const sampler *sp, FILE *f, size_t pinned);   /* UFSM_HOSTM
 void sampler_stop(sampler *sp);
 /* Stats: patches rejected / produced since start. */
 void sampler_stats(const sampler *sp, uint64_t *produced, uint64_t *rejected);
+/* per source and level (SL_*): draws dropped on a holdout overlap (reject mode), on empty targets, on the coarse CT probe, on the CT read's
+   min_fg; windows kept with a holdout mask; windows produced */
+enum { SL_HOLD, SL_EMPTY, SL_PROBE, SL_FG, SL_MASKED, SL_PROD, SL_OTHER, SL_N };   /* SL_OTHER: no level / no window position (pick_level, patch / box bounds, a shape smaller than the window; level 0's slot when no level) */
+void sampler_level_stats(sampler *sp, int si, int l, uint32_t out[SL_N]);
 uint64_t sampler_crushed(const sampler *sp);   /* --aug-crush windows drawn so far */
 enum { AUGN_XSCAN, AUGN_TEAR, AUGN_DELAM, AUGN_DENSITY, AUGN_CURV, AUGN_INCL, AUGN_N };
 uint64_t sampler_aug_count(const sampler *sp, int which);   /* windows that received a scroll augmentation (AUGN_*) so far */

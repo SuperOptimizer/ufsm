@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # the fibre planes on the fly (sources "fibre" targets, src/fiberraster.c fiber_onfly_open): fibre polylines (a UFIB of H / V fibres,
 # straight and curved, crossing) over the wind fixture's CT; fiber-raster --ct writes the stored H / V planes (radius 2, guard 2, ring 2,
-# iso 100); ufsm fiber-onfly over random windows is byte-identical to them (GPU and, UFSM_FIBRE_CPU=1, CPU); and --fib-head training
+# iso 100); the planes' extent (draw cells) only near the fibres; ufsm fiber-onfly over random windows is byte-identical to them (GPU and, UFSM_FIBRE_CPU=1, CPU); and --fib-head training
 # runs on the stored planes, the onfly planes (GPU) and the onfly planes (CPU) log the same losses (--det)
 # Usage: test_fibre_onfly.sh UFSM MAKE_WIND_FIXTURE DIR
 set -eu
@@ -25,6 +25,12 @@ O=(--ct fx ct/9.6 --level 0 --radius 2 --guard 2 --ring 2 --iso 100 --ref lab/H 
 "$U" fiber-onfly f.fib "${O[@]}" > gpu.log 2>&1 || { echo "FAIL: onfly (default) differs from fiber-raster ($D/gpu.log)"; tail -2 gpu.log; exit 1; }
 UFSM_FIBRE_CPU=1 "$U" fiber-onfly f.fib "${O[@]}" > cpu.log 2>&1 || { echo "FAIL: onfly (CPU) differs ($D/cpu.log)"; tail -2 cpu.log; exit 1; }
 grep -q 'byte-identical' gpu.log && grep -q 'byte-identical' cpu.log || { echo "FAIL: no byte-identical line"; exit 1; }
+# the extent (z3_derived_extent: the draw cells): one short fibre in a corner marks only the chunks within its reach
+python3 -c "
+import struct; p = [(20, 20, 20 + t) for t in range(10)]
+open('s.fib', 'wb').write(b'UFIB' + struct.pack('<3i', 1, 1, len(p)) + struct.pack('<2i', 0, len(p)) + b'H' + b''.join(struct.pack('<3f', *q) for q in p))"
+"$U" fiber-onfly s.fib --ct fx ct/9.6 --level 0 --windows 1 --P 32 > ext.log 2>&1 || { echo "FAIL: fiber-onfly extent ($D/ext.log)"; exit 1; }
+grep -qE 'the extent: 1 of ([2-9]|[1-9][0-9]+) chunks' ext.log || { echo "FAIL: the extent of one short fibre is not one chunk ($D/ext.log)"; grep extent ext.log; exit 1; }
 python3 - "$PWD" <<'PY'
 import json, sys
 d = sys.argv[1]; S = json.load(open('fx/sources-fibhv.json'))

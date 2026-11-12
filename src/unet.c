@@ -317,6 +317,15 @@ static void film_bwd(unet *u, float *g) {
     for (int j = 0; j < 2 * u->cfg.nlev - 1; j++) { const gnp *n = film_norm(u, j); nn_film_bwd(u->live, g, n->gamma, n->beta, fo, n->c, K, u->film_c); fo += (size_t)2 * K * n->c; }
 }
 size_t unet_fstem_off(const unet *u) { return u->fstem_off; }
+static double gauss(uint64_t *s);
+int unet_fstem_reset(unet *u, uint64_t seed) {
+    if (!u->cfg.fstem) return -1;
+    const size_t off = u->fstem_off, nf = u->np - off, nw = (size_t)u->cfg.fstem * 64; float *h = calloc(nf, sizeof *h); if (!h) return -1;
+    const double sd = sqrt(2.0 / 64); for (size_t i = 0; i < nw; i++) h[i] = (float)(sd * gauss(&seed));   /* (unet_init's: W1 He, b1 and W2 0) */
+    nn_h2d(u->p + off, h, nf * 4); nn_h2d(u->ema + off, h, nf * 4);
+    nn_zero(u->m + off, nf * 4); nn_zero(u->v + off, nf * 4); if (u->muon_mom) nn_zero(u->muon_mom + off, nf * 4);
+    free(h); return 0;
+}
 void unet_set_film(unet *u, const float *codes, int k) { for (int i = 0; i < 4; i++) u->film_c[i] = i < k && codes ? codes[i] : 0.f; }
 unet *unet_create(const unet_cfg *cfg) {
     unet *u = calloc(1, sizeof *u);
@@ -2837,6 +2846,7 @@ const float *unet_stage_out(unet *u, int k, shape5 *s) {
 /* UFSM_VIRTUAL_TOKENS=1 (dino-train with --attn-blocks 0): a net without the attention stage reports a zero token buffer of the bottleneck's
    shape (attn_reg + grid rows of its width), so the CLS paths run (on zeros) and their token gradients are dropped */
 static float *g_vtok; static size_t g_vtok_n;
+void unet_reset_statics(void) { g_vtok = nullptr; g_vtok_n = 0; }   /* (predict --boxes, between boxes: the buffer went back to nn_pool) */
 const float *unet_tokens(const unet *u, int *nseq, int *S, int *C, int *nreg) {
     if (!u->tbn && u->built && getenv("UFSM_VIRTUAL_TOKENS")) {
         const block *b = stage_out((unet *)u, u->cfg.nlev - 1); const size_t Sv = (size_t)b->ys.d * b->ys.h * b->ys.w + (size_t)u->cfg.attn_reg, n = Sv * b->ys.c;

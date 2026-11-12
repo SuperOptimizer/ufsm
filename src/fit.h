@@ -243,6 +243,16 @@ void nn_fit_accum_d(const float *lg, const uint8_t *ct, int D, int W, int hz, in
                     int ch_recto, int ch_phase, int ch_normal, int ch_density, float dscale, int dcode, float *acc);
 void nn_fit_accum_dm(const float *lg, const uint8_t *ct, const uint32_t *bits, int D, int W, int hz, int halo, int tz, int ty, int tx, const int box[3], int h, const int F[3],
                      int ch_recto, int ch_phase, int ch_normal, int ch_density, float dscale, int dcode, float *acc);   /* material from the bit plane bits (nn_pred_ctmask) when non-null */   /* dcode: train --density-code */
+/* predict --fit-zarr from a latent-grid net (h 8): nn_fit_accum_dm + nn_fit_accum_w4 straight from the coarse logits lg [C][d][h][w] of a
+   4d x 4h x 4w window, without the full-resolution planes: per voxel the head's channel upsampled as nn_lat_up_slab, the sub-cell term of
+   channels 0-1 (sbase >= 0: nn_lat_shuffle's channels sbase + 64 j + sub), the fine stem's output so[c] (nn_fstem_fwd on the tensor cores in
+   the same mma sequence; stem: W1 b1 W2 as train --fstem keeps them, null: none), each rounded to fp16 as those kernels store it. ctx: the
+   window's CT bytes (stem taps, z-scored with mean / isd); the material mask from bits, else ct, else ctx. ch_w4 < 0: no winding pass.
+   Byte-identical to the plane path; returns 1 (nothing done) outside its range (h != 8, stem C > 16, more than 4 stem channels). */
+int nn_fit_accum_lat(const void *lg, int lh16, int d, int h, int w, int sbase, const float *stem, int C, const int *so, const uint8_t *ctx, const uint8_t *ct,
+                     const uint32_t *bits, float mean, float isd, int hz, int halo, int tz, int ty, int tx, const int box[3], int fh, const int F[3],
+                     int ch_recto, int ch_phase, int ch_normal, int ch_density, float dscale, int dcode, float *acc, int ch_w4, int dd, float *acc4);
+void nn_fit_accum_lat_debug(float *planes);   /* (tests: the next calls also write their region-0 logits, [channels][D H W] fp32; null: off) */
 /* W (or U = W + dir theta / 2 pi when with_theta) on a grid: row a at box-local native z rows[a].z, voxel (b, c) at y0 + (b + 0.5)
    step, x0 + (c + 0.5) step; per row model a (z - za) blended with model b (z - zb) by t: (1 - t) W_a + t W_b. ms: device array of
    models (device pointers inside); out: device float nz x ny x nx */

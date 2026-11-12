@@ -80,6 +80,29 @@ z3w *z3w_create(const char *dir, const int64_t shape[3], int shard, float q, int
     return w;
 }
 
+z3w *z3w_create_codec(const char *dir, const int64_t shape[3], int shard, const char *codec_json, int fill, const char *attrs_json) {
+    if (shard % 128 || shard <= 0) { fail("shard must be a multiple of 128"); return nullptr; }
+    if (mkdirs(dir)) { fail("mkdir %s: %s", dir, strerror(errno)); return nullptr; }
+    char p[1400];
+    snprintf(p, sizeof p, "%s/zarr.json", dir);
+    FILE *f = fopen(p, "w");
+    if (!f) { fail("cannot write %s", p); return nullptr; }
+    fprintf(f,
+        "{\"zarr_format\":3,\"node_type\":\"array\",\"shape\":[%lld,%lld,%lld],\"data_type\":\"uint8\","
+        "\"chunk_grid\":{\"name\":\"regular\",\"configuration\":{\"chunk_shape\":[%d,%d,%d]}},"
+        "\"chunk_key_encoding\":{\"name\":\"default\",\"configuration\":{\"separator\":\"/\"}},\"fill_value\":%d,"
+        "\"codecs\":[{\"name\":\"sharding_indexed\",\"configuration\":{\"chunk_shape\":[128,128,128],"
+        "\"codecs\":[%s],"
+        "\"index_codecs\":[{\"name\":\"bytes\",\"configuration\":{\"endian\":\"little\"}},{\"name\":\"crc32c\"}],\"index_location\":\"end\"}}],"
+        "\"attributes\":%s,\"dimension_names\":[\"z\",\"y\",\"x\"]}\n",
+        (long long)shape[0], (long long)shape[1], (long long)shape[2], shard, shard, shard, fill, codec_json, attrs_json ? attrs_json : "{}");
+    fclose(f);
+    z3w *w = calloc(1, sizeof *w);
+    w->dir = strdup(dir); memcpy(w->shape, shape, sizeof w->shape);
+    w->shard = shard; w->cg = shard / 128; w->q = -1; w->fill = fill;
+    return w;
+}
+
 z3w *z3w_create_typed(const char *dir, const int64_t shape[3], int shard, int dtype, float q, double fill, const char *attrs_json) {
     if (dtype < 1 || dtype > 5) { fail("typed array: dtype %d", dtype); return nullptr; }
     if (shard % 128 || shard <= 0) { fail("shard must be a multiple of 128"); return nullptr; }
@@ -122,6 +145,16 @@ static int elem_is_fill(const uint8_t *e, int dtype, double fillv) {   /* one el
     }
     return 0;
 }
+static int encode_one(const z3w *w, const uint8_t *chunk, uint8_t *enc, size_t bound, uint8_t **out, size_t *len) {
+    size_t n;
+    volcomp_status st = w->dtype ? volcomp_encode_typed(chunk, (volcomp_dtype)w->dtype, w->q, enc, bound, &n)
+        : w->mask_lossless ? volcomp_mask_encode_lossless(chunk, enc, VOLCOMP_ENCODE_BOUND, &n)
+        : volcomp_encode(chunk, w->q, enc, VOLCOMP_ENCODE_BOUND, &n);
+    if (st != VOLCOMP_OK) return fail("volcomp encode: %s", volcomp_status_string(st));
+    if (!(*out = malloc(n))) return fail("encode allocation");
+    memcpy(*out, enc, n); *len = n;
+    return 0;
+}
 static void *worker(void *arg) {
     job *jb = arg;
     const z3w *w = jb->w;
@@ -141,19 +174,13 @@ static void *worker(void *arg) {
             if (!any) for (int x = 0; x < 128; x++) if (w->dtype ? !elem_is_fill(src + (size_t)x * es, w->dtype, w->fillv) : src[x] != (uint8_t)w->fill) { any = 1; break; }
         }
         if (!any) { jb->enc[i] = nullptr; jb->len[i] = 0; continue; }
-        size_t n;
-        volcomp_status st = w->dtype ? volcomp_encode_typed(chunk, (volcomp_dtype)w->dtype, w->q, enc, bound, &n)
-            : w->mask_lossless ? volcomp_mask_encode_lossless(chunk, enc, VOLCOMP_ENCODE_BOUND, &n)
-            : volcomp_encode(chunk, w->q, enc, VOLCOMP_ENCODE_BOUND, &n);
-        if (st != VOLCOMP_OK) { fail("volcomp encode: %s", volcomp_status_string(st)); atomic_store(&jb->failed, 1); break; }
-        jb->enc[i] = malloc(n);
-        memcpy(jb->enc[i], enc, n);
-        jb->len[i] = n;
+        if (encode_one(w, chunk, enc, bound, &jb->enc[i], &jb->len[i])) { atomic_store(&jb->failed, 1); break; }
     }
     free(chunk); free(enc);
     return nullptr;
 }
 
+static int write_file(const z3w *w, int64_t sz, int64_t sy, int64_t sx, uint8_t **enc, size_t *len, int nc);
 int z3w_write_shard(z3w *w, int64_t sz, int64_t sy, int64_t sx, const uint8_t *data, int nthreads) {
     int nc = w->cg * w->cg * w->cg;
     job jb = {w, data, calloc((size_t)nc, sizeof(uint8_t *)), calloc((size_t)nc, sizeof(size_t)), nc, 0, 0};
@@ -165,9 +192,35 @@ int z3w_write_shard(z3w *w, int64_t sz, int64_t sy, int64_t sx, const uint8_t *d
     worker(&jb);
     for (int i = 1; i < nthreads; i++) pthread_join(th[i], nullptr);
     int rc = atomic_load(&jb.failed) ? -1 : 0;
-    if (!rc) {
+    if (!rc) rc = write_file(w, sz, sy, sx, jb.enc, jb.len, nc);
+    for (int i = 0; i < nc; i++) free(jb.enc[i]);
+    free(jb.enc); free(jb.len);
+    return rc;
+}
+int z3w_shard_chunks(const z3w *w) { return w->cg * w->cg * w->cg; }
+int z3w_encode_chunk(const z3w *w, const uint8_t *chunk, uint8_t **enc, size_t *len) {
+    const int es = w->dtype ? w->esize : 1; const size_t nv = (size_t)VOLCOMP_CHUNK_VOXELS;
+    *enc = nullptr; *len = 0;
+    int any = 0;
+    for (size_t i = 0; i < nv && !any; i++) any = w->dtype ? !elem_is_fill(chunk + i * es, w->dtype, w->fillv) : chunk[i] != (uint8_t)w->fill;
+    if (!any) return 0;
+    const size_t bound = w->dtype ? VOLCOMP_TYPED_ENCODE_BOUND : VOLCOMP_ENCODE_BOUND;
+    uint8_t *e = malloc(bound); if (!e) return fail("encode allocation");
+    const int rc = encode_one(w, chunk, e, bound, enc, len);
+    free(e); return rc;
+}
+int z3w_write_shard_enc(z3w *w, int64_t sz, int64_t sy, int64_t sx, uint8_t **enc, size_t *len) {
+    const int nc = w->cg * w->cg * w->cg;
+    const int rc = write_file(w, sz, sy, sx, enc, len, nc);
+    for (int i = 0; i < nc; i++) { free(enc[i]); enc[i] = nullptr; len[i] = 0; }
+    return rc;
+}
+/* the shard object from its encoded chunks (none: no object) */
+static int write_file(const z3w *w, int64_t sz, int64_t sy, int64_t sx, uint8_t **enc, size_t *len, int nc) {
+    int rc = 0;
+    {
         int any = 0;
-        for (int i = 0; i < nc; i++) any |= jb.len[i] > 0;
+        for (int i = 0; i < nc; i++) any |= len[i] > 0;
         if (any) {
             char p[1400], tmp[1500];
             snprintf(p, sizeof p, "%s/c/%lld/%lld", w->dir, (long long)sz, (long long)sy);
@@ -180,10 +233,10 @@ int z3w_write_shard(z3w *w, int64_t sz, int64_t sy, int64_t sx, const uint8_t *d
                 uint8_t *idx = malloc((size_t)nc * 16 + 4);
                 uint64_t off = 0;
                 for (int i = 0; i < nc; i++) {
-                    uint64_t o = jb.len[i] ? off : UINT64_MAX, l = jb.len[i] ? jb.len[i] : UINT64_MAX;
+                    uint64_t o = len[i] ? off : UINT64_MAX, l = len[i] ? len[i] : UINT64_MAX;
                     memcpy(idx + (size_t)i * 16, &o, 8);
                     memcpy(idx + (size_t)i * 16 + 8, &l, 8);
-                    if (jb.len[i]) { if (fwrite(jb.enc[i], 1, jb.len[i], f) != jb.len[i]) rc = fail("write %s", tmp); off += jb.len[i]; }
+                    if (len[i]) { if (fwrite(enc[i], 1, len[i], f) != len[i]) rc = fail("write %s", tmp); off += len[i]; }
                 }
                 uint32_t crc = crc32c(0, idx, (size_t)nc * 16);
                 memcpy(idx + (size_t)nc * 16, &crc, 4);
@@ -194,8 +247,6 @@ int z3w_write_shard(z3w *w, int64_t sz, int64_t sy, int64_t sx, const uint8_t *d
             }
         }
     }
-    for (int i = 0; i < nc; i++) free(jb.enc[i]);
-    free(jb.enc); free(jb.len);
     return rc;
 }
 

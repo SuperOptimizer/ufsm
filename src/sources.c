@@ -1,6 +1,19 @@
 #include "sources.h"
 #include "fiberraster.h"
+#include "fuse.h"
 #include "band_onfly.h"
+#include "inksplat.h"
+#include "dcache.h"
+/* weak: the sampler test binaries link sources.o without inksplat.o / dcache.o (an onfly ink target then fails to open) */
+[[gnu::weak]] z3 *inkfly_open(z3 *, const char *, const inksplat_cfg *, size_t, const char *, void **);
+[[gnu::weak]] z3 *inkfly_open_pooled(z3 *, z3 *, int);
+[[gnu::weak]] int inkfly_holdouts(const char *, const char *, inksplat_cfg *);
+[[gnu::weak]] void inksplat_defaults(inksplat_cfg *);
+[[gnu::weak]] const char *dcache_default_dir(void);
+[[gnu::weak]] z3 *z3_open_cached(z3 *, const char *, const char *, int, size_t);
+#include "meshcodes.h"
+[[gnu::weak]] z3 *mesh_codes_open(const char *, const char *, const char *, int, z3 *, int);   /* (weak: binaries without meshcodes.o: "meshes" then fails to open) */
+[[gnu::weak]] const char *mesh_codes_key(const z3 *);
 #include "json.h"
 #include "votes.h"
 #include "srpair.h"
@@ -18,11 +31,12 @@ static const char *g_cache;   /* chunk cache dir for HTTPS stores; from the sour
 int rung_of_um(double um) { return (int)lround(log2(um / 0.6)); }
 
 /* ---- held-out boxes ---- */
-static void src_add_hold(source *s, const json *b) {   /* one [z, y, x, nz, ny, nx] (level 0); the first one is also hold_o / hold_n */
+static void src_add_hold(source *s, const json *b, int rej) {   /* one [z, y, x, nz, ny, nx] (level 0); the first one is also hold_o / hold_n */
     if (!b || b->type != J_ARR || b->n != 6) return;
     int64_t v[6]; for (int d = 0; d < 6; d++) v[d] = (int64_t)json_num(json_at(b, (size_t)d), 0);
     if (v[3] <= 0 || v[4] <= 0 || v[5] <= 0) return;
-    s->hold = realloc(s->hold, (size_t)(s->nhold + 1) * sizeof *s->hold); memcpy(s->hold[s->nhold++], v, sizeof v);
+    s->hold = realloc(s->hold, (size_t)(s->nhold + 1) * sizeof *s->hold); s->hold_rej = realloc(s->hold_rej, (size_t)(s->nhold + 1));
+    s->hold_rej[s->nhold] = (uint8_t)(rej != 0); memcpy(s->hold[s->nhold++], v, sizeof v);
     if (s->nhold == 1) for (int d = 0; d < 3; d++) { s->hold_o[d] = v[d]; s->hold_n[d] = v[3 + d]; }
 }
 static const char *src_base(const char *p) {   /* the last path component, ignoring trailing slashes and a trailing "/<level digits>" */
@@ -36,18 +50,22 @@ static const char *src_base(const char *p) {   /* the last path component, ignor
     }
 }
 /* "holdout_file": the boxes of a wbench holdouts.json ({"boxes": [{"ct": KEY, "l0": [6]}...]}) whose ct basename is this source's */
-static int src_hold_file(source *s, const char *path) {
+static int src_hold_file(source *s, const char *path, const json *rejn) {
     FILE *f = fopen(path, "rb"); if (!f) { fprintf(stderr, "sources: %s: cannot open holdout_file %s\n", s->name, path); return 1; }
     fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET); char *t = malloc((size_t)n + 1);
     const size_t got = t ? fread(t, 1, (size_t)n, f) : 0; fclose(f);
     json *j = got == (size_t)n ? json_parse(t, (size_t)n) : nullptr; free(t);
     const json *bx = j ? json_get(j, "boxes") : nullptr;
     if (!bx || bx->type != J_ARR) { fprintf(stderr, "sources: %s: holdout_file %s: no \"boxes\" array\n", s->name, path); json_free(j); return 1; }
-    char me[512]; snprintf(me, sizeof me, "%s", src_base(s->ct_key)); int added = 0;
+    char me[512]; snprintf(me, sizeof me, "%s", src_base(s->ct_key)); int added = 0, nrej = 0;
     for (size_t k = 0; k < bx->n; k++) { const json *e = json_at(bx, k);
-        if (!strcmp(src_base(json_str(json_get(e, "ct"), "")), me)) { src_add_hold(s, json_get(e, "l0")); added++; } }
+        if (!strcmp(src_base(json_str(json_get(e, "ct"), "")), me)) {
+            const char *nm = json_str(json_get(e, "name"), ""); int rej = 0;
+            for (size_t q = 0; rejn && rejn->type == J_ARR && q < rejn->n; q++) rej |= *nm && !strcmp(nm, json_str(json_at(rejn, q), ""));
+            src_add_hold(s, json_get(e, "l0"), rej); added++; nrej += rej;
+            if (rej) fprintf(stderr, "sources: %s: held-out box %s rejects training windows (holdout_reject)\n", s->name, nm); } }
     json_free(j);
-    if (added) fprintf(stderr, "sources: %s: %d held-out boxes from %s\n", s->name, added, path);
+    if (added) fprintf(stderr, "sources: %s: %d held-out boxes from %s (%d reject)\n", s->name, added, path, nrej);
     return 0;
 }
 
@@ -109,6 +127,83 @@ static const char *CHNAME[NTG] = {"recto", "sheet", "fibre", "fibre_h", "fibre_v
 
 static char *sdup(const char *s) { return s ? strdup(s) : nullptr; }
 
+/* an "onfly" phase spec ({root, key, rmax[, pool2]} or {"sets": [...], "tol"}) opened with `extra` more 2x poolings of its codes at rmax / 2^extra
+   (extra 1: the phase of the next coarser level). *rmx: the largest rmax used. nullptr (reported) on failure */
+/* the codes of an "onfly" phase spec (or one of its "sets"): a stored array {root, key[, pool2]} pooled pool2 + extra times, or
+   {"meshes": {"dir", "value" ("q.tif"), "map" (a reg.json: the meshes' scan -> this source's), "level" (the codes' CT level; default plev)}}:
+   the codes rasterised on read from the q-assigned meshes (meshcodes.h mesh_codes_open) at level + extra directly (a stored level-L+1
+   raster, not the pooled level L: 8x fewer voxels rasterised), then pool2 poolings. key: the dcache key of the phase derived from them
+   ("" without meshes: the stored codes' phase is not cached). nullptr (reported) on failure */
+static z3 *onfly_codes_open(const source *s, const json *e, const json *of, int extra, int plev, char *key, size_t nkey) {
+    key[0] = 0;
+    const json *mj = json_get(e, "meshes"); if (!mj && e != of) mj = json_get(of, "meshes");
+    const int npool = (int)json_num(json_get(e, "pool2"), json_num(json_get(of, "pool2"), 0));
+    z3 *cz = nullptr;
+    if (mj) {
+        const char *md = json_str(json_get(mj, "dir"), nullptr), *mv = json_str(json_get(mj, "value"), "q.tif"), *mm = json_str(json_get(mj, "map"), nullptr);
+        int lv = (int)json_num(json_get(mj, "level"), plev) + extra, pool = 0;
+        z3 *ct = md && lv >= 0 && lv < MAXLEV && s->s ? pyramid_open_level(s->s, s->ct_key, lv, s->um, g_cache) : nullptr;
+        if (!ct && extra > 0 && md && s->s && (ct = pyramid_open_level(s->s, s->ct_key, lv - extra, s->um, g_cache))) { lv -= extra; pool = extra; }   /* (no CT level there: the level's codes pooled) */
+        cz = ct && mesh_codes_open ? mesh_codes_open(md, mv, mm, lv, ct, 0) : nullptr;
+        if (ct && !mesh_codes_open) z3_close(ct);
+        if (!cz) { fprintf(stderr, "sources: %s: phase onfly \"meshes\": cannot open %s (value %s, level %d of the CT)\n", s->name, md ? md : "?", mv, lv); return nullptr; }
+        const char *mk = mesh_codes_key ? mesh_codes_key(cz) : nullptr; if (mk) snprintf(key, nkey, "%s-pool%d%s", mk, npool + pool, npool + pool ? "b" : "");   /* ("b": the bin-search pooling, codes_pool.h, 2026-11-12) */
+        for (int q2 = 0; cz && q2 < pool; q2++) { z3 *q = codes_pool2_open(cz); if (!q) { z3_close(cz); cz = nullptr; } else cz = q; }
+    } else {
+        const char *cr = json_str(json_get(e, "root"), nullptr), *ck = json_str(json_get(e, "key"), "");
+        store *cs = cr ? store_open(cr) : nullptr; cz = cs ? z3_open(cs, ck, nullptr) : nullptr;
+        if (!cz) { fprintf(stderr, "sources: %s: phase onfly: cannot open the codes %s/%s\n", s->name, cr ? cr : "?", ck); return nullptr; }
+        for (int q2 = 0; cz && q2 < extra; q2++) { z3 *q = codes_pool2_open(cz); if (!q) { z3_close(cz); cz = nullptr; } else cz = q; }
+    }
+    for (int q2 = 0; cz && q2 < npool; q2++) { z3 *q = codes_pool2_open(cz); if (!q) { z3_close(cz); cz = nullptr; } else cz = q; }
+    if (!cz) fprintf(stderr, "sources: %s: phase onfly: cannot pool the codes\n", s->name);
+    return cz;
+}
+/* the phase of codes cz at rmax rm (owned); behind the derived-array cache when key names the codes (meshes): "cache_dir" (default
+   $UFSM_DERIVED_CACHE / ~/.cache/ufsm/derived), "cache_mb" (1024) */
+static z3 *onfly_phase_of(z3 *cz, float rm, const char *key, const json *of) {
+    z3 *z = phase_onfly_open(cz, rm);
+    if (!z) { z3_close(cz); return nullptr; }
+    if (!key[0] || !z3_open_cached || json_num(json_get(of, "cache"), 1) == 0) return z;   /* ("cache": 0: computed per read, no cache) */
+
+    const char *dcd = json_str(json_get(of, "cache_dir"), dcache_default_dir ? dcache_default_dir() : nullptr);
+    /* the cell: the pair rule reads its codes with a halo of rmax + 2, so a 128^3 cell at rmax 160 (the 2.4 um rung) computed 44x its voxels
+       (10 workers made no P 1280 batch in 8 minutes on the pod); cells of >= 3 rmax (up to 512: 4.3x at rmax 160) */
+    int cell = (int)json_num(json_get(of, "cache_cell"), 0);
+    if (cell <= 0) { cell = 128; while (cell < 3 * rm && cell < 512) cell *= 2; }
+    char k2[1200]; snprintf(k2, sizeof k2, "phase-onfly-pair-v1 rmax %.9g codes %s cell %d", rm, key, cell);   /* (the cell size: the disk files' layout) */
+    return z3_open_cached(z, dcd && *dcd ? dcd : nullptr, k2, cell, (size_t)json_num(json_get(of, "cache_mb"), 1024));
+}
+/* an "onfly" phase spec ({root, key, rmax[, pool2]}, {meshes, rmax}, or {"sets": [...], "tol"}) opened with `extra` more 2x levels of its
+   codes at rmax / 2^extra (extra 1: the phase of the next coarser level). plev: the phase's level (the meshes' default codes level).
+   *rmx: the largest rmax used. nullptr (reported) on failure */
+static z3 *onfly_phase_open(const source *s, const json *of, int extra, int plev, float *rmx) {
+    const char *name = s->name;
+    const float rm = (float)json_num(json_get(of, "rmax"), 0), div = (float)(1 << extra);
+    const json *sj = json_get(of, "sets");   /* "sets": [{"root", "key", "rmax"} | {"meshes", "rmax"}, ...] + "tol" (0.1): the sets' phases fused per
+                                                voxel as phase-fuse (band_onfly.h phase_onfly_fuse_open); "root" / "key" then unused */
+    *rmx = 0; char key[1024];
+    if (sj && sj->type == J_ARR) {
+        z3 *ph[FUSE_MAX]; int np = 0, bad = !sj->n || sj->n > FUSE_MAX;
+        for (size_t k = 0; !bad && k < sj->n; k++) {
+            const json *e2 = json_at(sj, k);
+            const float rm2 = (float)json_num(json_get(e2, "rmax"), rm) / div;
+            z3 *c2 = onfly_codes_open(s, e2, of, extra, plev, key, sizeof key);
+            z3 *p2 = c2 && rm2 > 0 ? onfly_phase_of(c2, rm2, key, of) : nullptr;
+            if (!p2) { if (c2 && !(rm2 > 0)) z3_close(c2);   /* (onfly_phase_of closes its codes on failure) */ fprintf(stderr, "sources: %s: phase onfly set %zu: no codes or no \"rmax\" > 0\n", name, k); bad = 1; break; }
+            ph[np++] = p2; if (rm2 * div > *rmx) *rmx = rm2 * div;
+        }
+        z3 *z = bad ? nullptr : phase_onfly_fuse_open(ph, np, (float)json_num(json_get(of, "tol"), 0.1));
+        if (bad) for (int k = 0; k < np; k++) z3_close(ph[k]);
+        if (!z) fprintf(stderr, "sources: %s: phase onfly \"sets\": 1..%d sets of {root, key, rmax} / {meshes, rmax}, one shape\n", name, FUSE_MAX);
+        return z;
+    }
+    z3 *cz = onfly_codes_open(s, of, of, extra, plev, key, sizeof key);
+    z3 *z = cz && rm > 0 ? onfly_phase_of(cz, rm / div, key, of) : nullptr;
+    if (!z) { if (cz && !(rm > 0)) z3_close(cz); fprintf(stderr, "sources: %s: phase onfly: no codes or no \"rmax\" > 0\n", name); }
+    *rmx = rm;
+    return z;
+}
 sources *sources_load(const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "sources: cannot open %s\n", path); return nullptr; }
@@ -133,6 +228,8 @@ sources *sources_load(const char *path) {
         s->name = sdup(json_str(json_get(e, "name"), "?"));
         s->s = store_open(json_str(json_get(e, "root"), "."));
         s->ct_key = sdup(json_str(json_get(e, "ct"), ""));
+        { const json *mj = json_get(e, "ct_mirror"); const char *mr = json_str(json_get(mj, "root"), nullptr);
+          if (mr) { s->ct_ms = store_open(mr); s->ct_mkey = sdup(json_str(json_get(mj, "ct"), s->ct_key)); } }
         s->um = json_num(json_get(e, "um"), 0);
         s->weight = json_num(json_get(e, "weight"), 1.0);
         s->ink_weight = json_num(json_get(e, "ink_weight"), 1.0);
@@ -175,6 +272,29 @@ sources *sources_load(const char *path) {
             if (!t && c == CH_FIBV) t = json_get(tg, "fiber_v");
             for (int l = 0; l < MAXLEV; l++) s->tgt_present[c][l] = -1;
             if (!t) continue;
+            if (t->type == J_OBJ && json_get(t, "onfly")) {   /* {"onfly": {"segments", "level", "iso", "face", "holdout_file", "cache_mb"}}: the human-ink splat
+                                                                 computed per chunk on first read (inksplat.h inkfly_open; == ink-splat --face --merge) */
+                if (!inkfly_open) { fprintf(stderr, "sources: %s/%s: an onfly ink target needs inksplat.o in this binary\n", s->name, CHNAME[c]); json_free(j); sources_free(S); return nullptr; }
+                const json *of = json_get(t, "onfly"); inksplat_cfg ic; inksplat_defaults(&ic); ic.face = 1;
+                ic.level = (int)json_num(json_get(of, "level"), 1); ic.iso = (int)json_num(json_get(of, "iso"), s->iso > 0 ? s->iso : 64); ic.ct_um = s->um; ic.cache = g_cache;
+                { const char *vm = json_str(json_get(of, "validation"), "exclude"); ic.val_mode = !strcmp(vm, "only") ? 2 : !strcmp(vm, "off") ? 0 : 1; }   /* the segments' "validation" rasters: held out per pixel */
+                const json *fa = json_get(of, "face"); if (fa && fa->n == 2) { ic.face_a = json_num(json_at(fa, 0), -6); ic.face_b = json_num(json_at(fa, 1), 0); }
+                const char *sg = json_str(json_get(of, "segments"), nullptr), *hf = json_str(json_get(of, "holdout_file"), json_str(json_get(e, "holdout_file"), nullptr));
+                const int L = ic.level;
+                if (!sg || !(s->um > 0) || L < 0 || L + 1 >= MAXLEV || (hf && inkfly_holdouts(hf, s->ct_key, &ic))) {
+                    fprintf(stderr, "sources: %s/%s: onfly needs \"segments\", the source's \"um\", level 0..%d (and a readable holdout_file)\n", s->name, CHNAME[c], MAXLEV - 2);
+                    json_free(j); sources_free(S); return nullptr; }
+                z3 *ct = pyramid_open_level(s->s, s->ct_key, L, s->um, g_cache), *ct1 = pyramid_open_level(s->s, s->ct_key, L + 1, s->um, g_cache);
+                ic.ct_root = json_str(json_get(e, "root"), "."); ic.ct_key = s->ct_key;   /* (named in the derived cache's key) */
+                const char *dcd = json_str(json_get(of, "cache_dir"), dcache_default_dir ? dcache_default_dir() : nullptr);   /* the disk cache (dcache.h): "cache_dir" ("off": none), $UFSM_DERIVED_CACHE, ~/.cache/ufsm/derived */
+                z3 *z = ct ? inkfly_open(ct, sg, &ic, (size_t)json_num(json_get(of, "cache_mb"), 2048), dcd && *dcd && strcmp(dcd, "off") && strcmp(dcd, "0") ? dcd : nullptr, &s->ink_fly[c]) : nullptr;
+                if (!z) { if (ct1) z3_close(ct1); fprintf(stderr, "sources: %s/%s: cannot open the onfly ink target %s\n", s->name, CHNAME[c], sg); json_free(j); sources_free(S); return nullptr; }
+                s->tgt_prob[c] = s->tgt_prob254[c] = 1; s->tgt_min_level[c] = L; s->tgt_key[c] = strdup("onfly");
+                for (int l = 0; l < MAXLEV; l++) s->tgt_present[c][l] = 0;
+                s->tgt[c][L] = z; s->tgt_present[c][L] = 1;
+                if (ct1) { s->tgt[c][L + 1] = inkfly_open_pooled(ct1, z, 0); s->tgt_present[c][L + 1] = s->tgt[c][L + 1] != nullptr; }   /* (closed before level L: sources_free goes up the levels? see below) */
+                continue;
+            }
             if (t->type == J_STR) { s->tgt_key[c] = strdup(t->str); continue; }
             const json *fj = json_get(t, "fibre");
             if (fj) {   /* the fibre planes on the fly: no stored raster */
@@ -264,14 +384,16 @@ sources *sources_load(const char *path) {
                 const json *of = json_get(pt, "onfly");   /* {"root", "key", "rmax"}: the pair-rule phase computed from these codes on read
                                                              (band_onfly.h; byte-identical to phase-raster --pair 1 on the codes' grid) */
                 if (of && !s->phase) {
-                    const char *cr = json_str(json_get(of, "root"), nullptr), *ck = json_str(json_get(of, "key"), "");
-                    const float rm = (float)json_num(json_get(of, "rmax"), 0);
-                    store *cs = cr ? store_open(cr) : nullptr; z3 *cz = cs ? z3_open(cs, ck, nullptr) : nullptr;
-                    s->phase = cz && rm > 0 ? phase_onfly_open(cz, rm) : nullptr;
-                    if (!s->phase) { z3_close(cz); fprintf(stderr, "sources: %s: phase onfly: cannot open the codes %s/%s or no \"rmax\" > 0\n", s->name, cr ? cr : "?", ck); json_free(j); sources_free(S); return nullptr; }
-                    s->phase_onfly = rm;
+                    float rmx = 0;
+                    if (!(s->phase = onfly_phase_open(s, of, 0, (int)json_num(json_get(pt, "level"), 1), &rmx))) { json_free(j); sources_free(S); return nullptr; }
+                    s->phase_onfly = rmx;
                 }
                 s->phase_level = (int)json_num(json_get(pt, "level"), 1); s->phase_direct = json_get(pt, "level") != nullptr;
+                if (of && s->phase_onfly > 0 && s->phase_level + 1 < MAXLEV) {   /* the next coarser level (the scale rungs): the same rule on the codes
+                    pooled once more at half rmax (byte-identical to phase-raster --gs 4 of a 2x coarser raster), not the phase pooled */
+                    float r1 = 0; s->phase_pl[s->phase_level + 1] = onfly_phase_open(s, of, 1, s->phase_level, &r1);
+                    if (!s->phase_pl[s->phase_level + 1]) { json_free(j); sources_free(S); return nullptr; }
+                }
                 const double sg = json_num(json_get(pt, "phase_sign"), 1);
                 if (sg != 1 && sg != -1) { fprintf(stderr, "sources: %s: \"phase_sign\" must be 1 or -1\n", s->name); json_free(j); sources_free(S); return nullptr; }
                 s->phase_sign = (int)sg;
@@ -390,10 +512,13 @@ sources *sources_load(const char *path) {
             if (!s->nemb || s->emb_level < 0) { fprintf(stderr, "sources: %s: \"emb\" needs \"groups\": [DIR, ...] and \"level\" >= 0\n", s->name); json_free(j); sources_free(S); return nullptr; }
         }
         const json *ho = json_get(e, "holdout");
-        if (ho && ho->type == J_ARR && ho->n == 6 && json_at(ho, 0)->type != J_ARR) src_add_hold(s, ho);
-        else if (ho && ho->type == J_ARR) for (size_t k = 0; k < ho->n; k++) src_add_hold(s, json_at(ho, k));
+        if (ho && ho->type == J_ARR && ho->n == 6 && json_at(ho, 0)->type != J_ARR) src_add_hold(s, ho, 0);
+        else if (ho && ho->type == J_ARR) for (size_t k = 0; k < ho->n; k++) src_add_hold(s, json_at(ho, k), 0);
         const char *hf = json_str(json_get(e, "holdout_file"), nullptr);
-        if (hf && src_hold_file(s, hf)) { json_free(j); sources_free(S); return nullptr; }
+        if (hf && src_hold_file(s, hf, json_get(e, "holdout_reject"))) { json_free(j); sources_free(S); return nullptr; }
+        const char *hm = json_str(json_get(e, "holdout_mode"), nullptr);
+        if (hm) { s->hold_mode = !strcmp(hm, "mask") ? 1 : !strcmp(hm, "reject") ? 2 : -1;
+                  if (s->hold_mode < 0) { fprintf(stderr, "sources: %s: \"holdout_mode\" is \"mask\" or \"reject\", not \"%s\"\n", s->name, hm); json_free(j); sources_free(S); return nullptr; } }
         const json *bx = json_get(e, "boxes");   /* task restore: level-0 boxes [z, y, x, nz, ny, nx] that hold local CT (training windows lie inside one) */
         if (bx && bx->type == J_ARR && bx->n) {
             s->box = calloc(bx->n, sizeof *s->box);
@@ -425,7 +550,8 @@ void sources_free(sources *S) {
     for (int i = 0; i < S->n; i++) {
         source *s = &S->src[i];
         for (int l = 0; l < MAXLEV; l++) z3_close(s->ct[l]);
-        if (s->band != s->phase) z3_close(s->band); z3_close(s->phase); z3_close(s->wind); z3_close(s->aux); z3_close(s->phase_ign); z3_close(s->phase_wt); free(s->box); free(s->hold); free(s->focus); free(s->mask); srpair_free(s->srp);
+        for (int l = MAXLEV - 1; l >= 0; l--) { z3_close(s->phase_pl[l]); z3_close(s->phase_ign_pl[l]); }   /* (the pooled views borrow phase / ignore: closed first) */
+        if (s->band != s->phase) z3_close(s->band); z3_close(s->phase); z3_close(s->wind); z3_close(s->aux); z3_close(s->phase_ign); z3_close(s->phase_wt); free(s->box); free(s->hold); free(s->hold_rej); free(s->focus); free(s->mask); srpair_free(s->srp);
         for (int c = 0; c < NTG; c++) {
             for (int l = 0; l < MAXLEV; l++) z3_close(s->tgt[c][l]);
             if (s->reg[c]) {
@@ -443,7 +569,7 @@ void sources_free(sources *S) {
             store_close(s->tgt_store[c]);
         }
         free(s->ax.z); free(s->ax.y); free(s->ax.x);
-        free(s->name); free(s->ct_key); free(s->view_map);
+        free(s->name); free(s->ct_key); free(s->ct_mkey); free(s->view_map);
         for (int k = 0; k < s->nxs; k++) free(s->xs_map[k]);
         for (int k = 0; k < s->nemb; k++) free(s->emb_grp[k]);
         free(s->emb_name);
@@ -460,9 +586,22 @@ z3 *pyramid_open_level(store *st, const char *group, int level, double um0, cons
     z3_level lv[16];
     int nl = z3_group_levels(st, group, lv, 16);
     if (nl > 0 && um0 > 0 && lv[0].um > 0) {        /* OME group: match by voxel size (absolute um, or relative 2^l factors) */
-        double want = um0 * (1 << level), rel = (double)(1 << level);
+        /* relative form: every listed scale an exact power of two (1, 2, 4, ...) and none the source's um x 2^l. The old test needed level 0
+           listed (scale 1.0), so a relative group without a local level 0 (the mirror's json over PHerc1667's levels 1-5, 2026-11-12) was read
+           as absolute: 2.0 taken as um, every level off, the source silently excluded */
+        int relf = 1, absf = 0;
+        for (int i = 0; i < nl; i++) {
+            const double e = log2(lv[i].um); relf &= lv[i].um >= 1.0 && fabs(e - round(e)) < 1e-9;
+            for (int l = 0; l < 16; l++) absf |= fabs(lv[i].um - um0 * (1 << l)) < 0.02 * um0 * (1 << l);
+        }
+        const int rel_mode = relf && !absf;
+        double want = rel_mode ? (double)(1 << level) : um0 * (1 << level);
         for (int i = 0; i < nl; i++)
-            if (fabs(lv[i].um - want) < 0.02 * want || (lv[0].um == 1.0 && fabs(lv[i].um - rel) < 0.02 * rel)) { snprintf(k, sizeof k, "%s/%s", group, lv[i].path); return z3_open(st, k, cache); }
+            if (fabs(lv[i].um - want) < 0.02 * want) { snprintf(k, sizeof k, "%s/%s", group, lv[i].path); return z3_open(st, k, cache); }
+        if (!relf && !absf) {   /* neither form: a group whose scales are not the store's voxel size x 2^l (a wrong "um", or a broken json) */
+            static int warned; if (!warned++) { fprintf(stderr, "pyramid: %s: the group's scales (", group); for (int i = 0; i < nl; i++) fprintf(stderr, "%s%g", i ? " " : "", lv[i].um);
+                                                 fprintf(stderr, ") are neither %g um x 2^l nor relative 2^l factors\n", um0); }
+        }
         return nullptr;
     }
     snprintf(k, sizeof k, "%s/%d", group, level);   /* plain integer level names */
@@ -519,10 +658,16 @@ void sources_open_all(sources *S, int nthreads) {
 }
 /* the open (a remote metadata fetch) runs outside the lock; the lock only publishes the pointer. A racing duplicate open is
    closed. ct_present is cleared on failure so a missing level is not retried per draw. */
+/* a CT level: the source's store, else its "ct_mirror" */
+static z3 *open_ct_level(source *s, int level) {
+    z3 *z = open_level(s->s, s->ct_key, level, s->um);
+    if (!z && s->ct_ms) { z = open_level(s->ct_ms, s->ct_mkey, level, s->um); if (z) fprintf(stderr, "source %s: CT level %d from the mirror\n", s->name, level); }
+    return z;
+}
 z3 *source_ct(source *s, int level) {
     if (level < 0 || level >= MAXLEV || s->ct_present[level] == 0) return nullptr;
     if (!s->ct[level]) {
-        z3 *z = open_level(s->s, s->ct_key, level, s->um);
+        z3 *z = open_ct_level(s, level);
         pthread_mutex_lock(&g_open_mu);
         if (!s->ct[level]) { s->ct[level] = z; z = nullptr; if (!s->ct[level]) { s->ct_present[level] = 0; open_failed(s, "ct", level); } }
         pthread_mutex_unlock(&g_open_mu);
@@ -539,7 +684,7 @@ static int fib_same(const struct fib_spec *a, const struct fib_spec *b) {
 static z3 *source_tgt_fibre(source *s, int ch, int level) {
     if (s->tgt[ch][level]) return s->tgt[ch][level];
     const struct fib_spec *f = s->tgt_fib[ch]; z3 *pl[2];
-    z3 *c0 = open_level(s->s, s->ct_key, level, s->um), *c1 = c0 ? open_level(s->s, s->ct_key, level, s->um) : nullptr, *c2 = c1 ? open_level(s->s, s->ct_key, level, s->um) : nullptr;
+    z3 *c0 = open_ct_level(s, level), *c1 = c0 ? open_ct_level(s, level) : nullptr, *c2 = c1 ? open_ct_level(s, level) : nullptr;
     const int bad = fiber_onfly_open(f->afv, f->extra, f->map, f->tr, f->rad, f->guard, f->ring, f->iso, level, c0, c1, c2, pl);
     pthread_mutex_lock(&g_open_mu);
     if (bad) { if (!s->tgt[ch][level]) s->tgt_present[ch][level] = 0; pthread_mutex_unlock(&g_open_mu); return s->tgt[ch][level]; }
@@ -549,6 +694,21 @@ static z3 *source_tgt_fibre(source *s, int ch, int level) {
     pthread_mutex_unlock(&g_open_mu);
     z3_close(pl[0]); z3_close(pl[1]);
     return s->tgt[ch][level];
+}
+z3 *source_phase_at(source *s, int level, int ign) {
+    z3 *b = ign ? s->phase_ign : s->phase;
+    if (!b || level < s->phase_level || level >= MAXLEV) return nullptr;
+    if (level == s->phase_level) return b;
+    z3 **pl = ign ? s->phase_ign_pl : s->phase_pl;
+    if (!pl[level] && !ign && s->phase_onfly > 0) return nullptr;   /* (an on-the-fly phase: its next level is made from the pooled codes at
+                                                                       load, deeper none; pooling the derived phase would derive 8x the voxels) */
+    if (!pl[level]) {
+        z3 *under = source_phase_at(s, level - 1, ign); if (!under) return nullptr;
+        pthread_mutex_lock(&g_open_mu);
+        if (!pl[level]) pl[level] = phase_pool2_view(under, ign);   /* (cheap: no I/O; under the lock so one view per level) */
+        pthread_mutex_unlock(&g_open_mu);
+    }
+    return pl[level];
 }
 z3 *source_tgt(source *s, int ch, int level) {
     if (!s->tgt_key[ch] || level < s->tgt_min_level[ch] || level < 0 || level >= MAXLEV || s->tgt_present[ch][level] == 0) return nullptr;

@@ -1,7 +1,9 @@
 /* src/band_onfly.h: the pair-rule winding phase computed from the codes on read. */
 #include "band_onfly.h"
+#include "fuse.h"
 #include "band.h"
 #include "bandgpu.h"
+#include "codes_pool.h"
 #include "volcomp.h"
 #include <math.h>
 #include <pthread.h>
@@ -75,18 +77,38 @@ static void ob_give(onfly_buf *B) { pthread_mutex_lock(&g_obmu); B->busy = 0; pt
    CPU path (a chunk the GPU did not decode, a CUDA failure, codes not in 128^3 volcomp lossless chunks). */
 typedef struct { uint8_t *b; size_t n, cap; bg_lchunk *ch; int nch, ccap; } onfly_pack;
 static thread_local onfly_pack t_pk;
+/* the pack buffer back to nothing after a tile that grew it past the floor (UFSM_ONFLY_PACK_MB, default 64): it doubled up to the largest
+   tile's encoded bytes and stayed, per reading thread (a pooled tile packs 8^k times the chunks; hard cap 4 GB by the 32-bit offsets) */
+static void pk_trim(void) {
+    static _Atomic long long fl = -1; long long v = atomic_load(&fl);
+    if (v < 0) { const char *e = getenv("UFSM_ONFLY_PACK_MB"); v = e && *e ? atoll(e) << 20 : (long long)64 << 20; if (v < 0) v = 0; atomic_store(&fl, v); }
+    if (t_pk.cap > (size_t)v) { free(t_pk.b); t_pk.b = nullptr; t_pk.cap = t_pk.n = 0; }
+}
 static size_t pk_put(onfly_pack *K, const void *src, size_t n, size_t align) {
     size_t o = (K->n + align - 1) & ~(align - 1);
     if (o + n + 64 > K->cap) { size_t c = K->cap ? K->cap : 1 << 20; while (c < o + n + 64) c *= 2; uint8_t *nb = realloc(K->b, c); if (!nb) return SIZE_MAX; K->b = nb; K->cap = c; }
     if (src) memcpy(K->b + o, src, n);
     K->n = o + n; return o;
 }
-static int tile_gpu(z3 *codes, const int64_t co[3], const int64_t cn[3], const int64_t ro[3], const int64_t rn[3], int h, const int64_t tn[3], float rmax, uint8_t *out) {
-    const z3_meta *m = z3_meta_of(codes);
+static int g_pool2_tag;   /* (the pooled codes views' ctx, codes_pool2_open: tile_gpu pools them on the device) */
+static int tile_gpu(z3 *codes, const int64_t co_[3], const int64_t cn_[3], const int64_t ro_[3], const int64_t rn_[3], int h, const int64_t tn[3], float rmax, uint8_t *out) {
+    /* pooled views (up to 3 deep) of stored codes: the base chunks of the 2^k box, decoded and pooled k times on the device (before:
+       decoded and pooled on the CPU, only the pair rule on the GPU; the pod's 9.6 / 19.2 um rungs, 2026-11-12) */
+    int k = 0; z3 *base = codes;
+    while (k < 3 && z3_derived_ctx(base) == &g_pool2_tag) { base = z3_base_of(base); k++; }
+    if (z3_derived_ctx(base) || (k && !band_pair_gpu_codes_pool)) return -2;
+    const z3_meta *m = z3_meta_of(base);
     if (m->chunk[0] != 128 || m->chunk[1] != 128 || m->chunk[2] != 128 || m->esize != 1 || m->q != 0) return -2;
+    int64_t co[3], cn[3], ro[3], rn[3];   /* in the base's voxels */
+    for (int d = 0; d < 3; d++) {
+        co[d] = co_[d] * (1 << k); cn[d] = cn_[d] * (1 << k); ro[d] = ro_[d] * (1 << k);
+        const int64_t e = (ro_[d] + rn_[d]) * (1 << k) < m->shape[d] ? (ro_[d] + rn_[d]) * (1 << k) : m->shape[d]; rn[d] = e - ro[d];
+        if (rn[d] <= 0) return 2;
+    }
+    if (k && (double)cn[0] * cn[1] * cn[2] > (double)g_budget_mb * (2 << 20)) return -2;   /* (the base box: 8^k the tile's voxels on the device) */
     onfly_pack *K = &t_pk; K->n = 0; K->nch = 0;
     for (int64_t cz = ro[0] / 128; cz * 128 < ro[0] + rn[0]; cz++) for (int64_t cy = ro[1] / 128; cy * 128 < ro[1] + rn[1]; cy++) for (int64_t cx = ro[2] / 128; cx * 128 < ro[2] + rn[2]; cx++) {
-        uint8_t *buf = nullptr; size_t len = 0; const int r = z3_chunk_raw(codes, cz, cy, cx, &buf, &len);
+        uint8_t *buf = nullptr; size_t len = 0; const int r = z3_chunk_raw(base, cz, cy, cx, &buf, &len);
         if (r < 0) return -1;
         if (!r) continue;
         uint32_t mode; bg_lchunk C; memset(&C, 0, sizeof C); C.o[0] = (int32_t)(cz * 128 - co[0]); C.o[1] = (int32_t)(cy * 128 - co[1]); C.o[2] = (int32_t)(cx * 128 - co[2]);
@@ -115,9 +137,10 @@ static int tile_gpu(z3 *codes, const int64_t co[3], const int64_t cn[3], const i
     if (!K->nch) return 2;
     const int n[3] = {(int)cn[0], (int)cn[1], (int)cn[2]}, lo[3] = {(int)(ro[0] - co[0]), (int)(ro[1] - co[1]), (int)(ro[2] - co[2])};
     const int hi[3] = {lo[0] + (int)rn[0], lo[1] + (int)rn[1], lo[2] + (int)rn[2]}, cro[3] = {h, h, h}, crn[3] = {(int)tn[0], (int)tn[1], (int)tn[2]};
-    return band_pair_gpu_codes(K->ch, K->nch, K->b, K->n, n, lo, hi, rmax, cro, crn, out);
+    return k ? band_pair_gpu_codes_pool(K->ch, K->nch, K->b, K->n, n, lo, hi, k, rmax, cro, crn, out) : band_pair_gpu_codes(K->ch, K->nch, K->b, K->n, n, lo, hi, rmax, cro, crn, out);
 }
 
+static thread_local struct { uint8_t *p; size_t cap; int pinned; } t_gpb;   /* the GPU path's tile interior (per reading thread) */
 static int onfly_read(void *vctx, z3 *codes, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads) {
     const onfly_ctx *C = vctx; const z3_meta *m = z3_meta_of(codes); const int h = C->halo;
     atomic_fetch_add(&g_reads, 1);
@@ -128,8 +151,10 @@ static int onfly_read(void *vctx, z3 *codes, const int64_t o[3], const int64_t n
     int cnt[3], ts[3];
     for (int d = 0; d < 3; d++) { const int64_t L = hi[d] - lo[d]; cnt[d] = (int)((L + T - 1) / T); ts[d] = (int)((L + cnt[d] - 1) / cnt[d]); }
     const size_t cap = (size_t)(ts[0] + 2 * h) * (ts[1] + 2 * h) * (ts[2] + 2 * h);
-    onfly_buf *B = ob_take(cap); if (!B) return -1;
-    uint8_t *cb = B->cb, *pb = B->pb, *rb = B->rb;
+    /* the tile buffer set only for the CPU path, taken at its first tile: a window held one of the --onfly-slots sets for all its tiles,
+       GPU tiles included, so 2 sets served 10 workers and 8 queued (pod, P 1024: the phase 74% of the window time, 3.25 busy cores of
+       40). The GPU path's per-tile interior lands in a per-thread pinned buffer; the device contexts are taken per tile (band_pair_gpu_codes) */
+    onfly_buf *B = nullptr; uint8_t *cb = nullptr, *pb = nullptr, *rb = nullptr;
     int rc = 0;
     for (int a = 0; a < cnt[0] && !rc; a++) for (int b = 0; b < cnt[1] && !rc; b++) for (int c = 0; c < cnt[2] && !rc; c++) {
         const int ti[3] = {a, b, c}; int64_t to[3], tn[3], co[3], cn[3], ro[3], rn[3]; int ni[3];
@@ -143,15 +168,23 @@ static int onfly_read(void *vctx, z3 *codes, const int64_t o[3], const int64_t n
         if (!any) { atomic_fetch_add(&g_skipped, 1); continue; }
         const double t0 = now_s();
         if (g_gpu >= 0 && band_pair_gpu_codes && !g_cpu_decode) {   /* the codes decoded on the device, only the tile interior comes down */
-            const int g = tile_gpu(codes, co, cn, ro, rn, h, tn, C->rmax, pb);
+            const size_t tnn = (size_t)tn[0] * tn[1] * tn[2];
+            if (tnn > t_gpb.cap) {   /* (the thread's pinned interior buffer: grown once to the largest tile) */
+                if (t_gpb.p) { if (t_gpb.pinned) band_pair_gpu_host_free(t_gpb.p); else free(t_gpb.p); }
+                t_gpb.pinned = band_pair_gpu_host_alloc && band_pair_gpu_host_free; t_gpb.p = t_gpb.pinned ? band_pair_gpu_host_alloc(tnn) : nullptr;
+                if (!t_gpb.p) { t_gpb.pinned = 0; t_gpb.p = malloc(tnn); }
+                t_gpb.cap = t_gpb.p ? tnn : 0; if (!t_gpb.p) { rc = -1; break; }
+            }
+            const int g = tile_gpu(codes, co, cn, ro, rn, h, tn, C->rmax, t_gpb.p); pk_trim();
             if (g == 2) { atomic_fetch_add(&g_skipped, 1); continue; }
             if (!g) {
                 atomic_fetch_add(&g_ns_pair, (uint64_t)(1e9 * (now_s() - t0))); atomic_fetch_add(&g_tiles, 1); atomic_fetch_add(&g_vtile, (uint64_t)cn[0] * cn[1] * cn[2]); atomic_fetch_add(&g_gputiles, 1);
                 for (int64_t z = 0; z < tn[0]; z++) for (int64_t y = 0; y < tn[1]; y++)
-                    memcpy(out + ((size_t)(to[0] - o[0] + z) * n[1] + (to[1] - o[1] + y)) * n[2] + (to[2] - o[2]), pb + ((size_t)z * tn[1] + y) * tn[2], (size_t)tn[2]);
+                    memcpy(out + ((size_t)(to[0] - o[0] + z) * n[1] + (to[1] - o[1] + y)) * n[2] + (to[2] - o[2]), t_gpb.p + ((size_t)z * tn[1] + y) * tn[2], (size_t)tn[2]);
                 continue;
             }
         }
+        if (!B) { if (!(B = ob_take(cap))) { rc = -1; break; } cb = B->cb; pb = B->pb; rb = B->rb; }   /* (the CPU path: a buffer set) */
         const size_t rnn = (size_t)rn[0] * rn[1] * rn[2], cnn = (size_t)cn[0] * cn[1] * cn[2];
         if (z3_read(codes, ro, rn, rb, nthreads)) { rc = -1; break; }
         size_t lab = 0; for (size_t k = 0; k < rnn; k++) lab += rb[k] > 0 && rb[k] < 255;
@@ -167,7 +200,7 @@ static int onfly_read(void *vctx, z3 *codes, const int64_t o[3], const int64_t n
             memcpy(out + ((size_t)(to[0] - o[0] + z) * n[1] + (to[1] - o[1] + y)) * n[2] + (to[2] - o[2]), pb + ((size_t)(z + h) * cn[1] + (y + h)) * cn[2] + h, (size_t)tn[2]);
     }
     atomic_fetch_add(&g_vout, N);
-    ob_give(B);
+    if (B) ob_give(B);
     return rc;
 }
 
@@ -180,11 +213,126 @@ z3 *phase_onfly_open(z3 *codes, float rmax) {
     return z;
 }
 
+/* the 2x pooling of winding_mod14 codes (phase-raster --gs 4 / codes-pool2): codes_pool.h cp_pool8 per 2^3 block (the device twin:
+   nn_band.cu k_codes_pool2, used by tile_gpu for the pooled views) */
+static float g_cpT[4 * CP_P]; static _Atomic int g_cpT_init;
+static const float *cp_tables(void) { if (!atomic_load(&g_cpT_init)) { cp_tables_init(g_cpT); atomic_store(&g_cpT_init, 1); } return g_cpT; }
+int codes_pool2_box(z3 *codes, const int64_t ro[3], const int64_t rn[3], uint8_t *out, int nthreads) {
+    const int64_t *fs = z3_meta_of(codes)->shape; const float *T = cp_tables();
+    int64_t fo[3], fn[3];
+    for (int d = 0; d < 3; d++) { fo[d] = 2 * ro[d]; const int64_t e = 2 * (ro[d] + rn[d]) < fs[d] ? 2 * (ro[d] + rn[d]) : fs[d]; fn[d] = e - fo[d]; }
+    memset(out, 0, (size_t)rn[0] * rn[1] * rn[2]);
+    if (fn[0] <= 0 || fn[1] <= 0 || fn[2] <= 0) return 0;
+    uint8_t *f = malloc((size_t)fn[0] * fn[1] * fn[2]);
+    if (!f || z3_read(codes, fo, fn, f, nthreads)) { free(f); return -1; }
+    for (int64_t a = 0; a < rn[0]; a++) for (int64_t b = 0; b < rn[1]; b++) for (int64_t c = 0; c < rn[2]; c++) {
+        uint8_t v[8];
+        for (int q = 0; q < 8; q++) {
+            const int64_t z = 2 * a + (q >> 2 & 1), yy = 2 * b + (q >> 1 & 1), xx = 2 * c + (q & 1);
+            v[q] = z >= fn[0] || yy >= fn[1] || xx >= fn[2] ? 0 : f[((size_t)z * fn[1] + yy) * fn[2] + xx];
+        }
+        out[((size_t)a * rn[1] + b) * rn[2] + c] = cp_pool8(v, T);
+    }
+    free(f);
+    return 0;
+}
+static int pool2_read(void *ctx, z3 *base, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads) { (void)ctx; return codes_pool2_box(base, o, n, out, nthreads); }
+z3 *codes_pool2_open(z3 *codes) { return z3_open_derived_pool2(codes, 0, pool2_read, &g_pool2_tag, nullptr); }
+
+/* the 2x pooling of a stored phase (sampler windows coarser than the phase's level): per 2^3 block the circular mean of the known codes,
+   PHASE_UNKNOWN where none is known or their resultant is under half their count (ufsm downsample --mode phase, phase-raster --gs 4's
+   phase_pool2: the same float sums and rounding). ign: the "ignore" array's pooling instead, 1 where any child is set (1..254), else 0 */
+static int phase_pool2_box_(z3 *ph, const int64_t ro[3], const int64_t rn[3], uint8_t *out, int nthreads, int ign, uint64_t cnt[2]) {
+    const int64_t *fs = z3_meta_of(ph)->shape;
+    static float cs[PHASE_PERIOD], sn[PHASE_PERIOD]; static _Atomic int init;
+    if (!atomic_load(&init)) { for (int k = 0; k < PHASE_PERIOD; k++) { cs[k] = (float)cos(2 * M_PI * k / PHASE_PERIOD); sn[k] = (float)sin(2 * M_PI * k / PHASE_PERIOD); } atomic_store(&init, 1); }
+    memset(out, ign ? 0 : PHASE_UNKNOWN, (size_t)rn[0] * rn[1] * rn[2]);
+    int64_t fo[3], fn[3];
+    for (int d = 1; d < 3; d++) { fo[d] = 2 * ro[d]; const int64_t e = 2 * (ro[d] + rn[d]) < fs[d] ? 2 * (ro[d] + rn[d]) : fs[d]; fn[d] = e - fo[d]; }
+    if (fn[1] <= 0 || fn[2] <= 0) return 0;
+    /* in z slabs of the fine box (<= ~64 MB: a 896^3 window pooled whole read 1792^3 = 5.7 GB per worker) */
+    static _Atomic long slab_b; if (!atomic_load(&slab_b)) { const char *e = getenv("UFSM_PHASE_POOL_SLAB"); atomic_store(&slab_b, e && atol(e) > 0 ? atol(e) : 64L << 20); }   /* (tests: bytes) */
+    int64_t sz = (int64_t)((size_t)atomic_load(&slab_b) / ((size_t)2 * fn[1] * fn[2])); if (sz < 1) sz = 1; if (sz > rn[0]) sz = rn[0];
+    uint8_t *f = malloc((size_t)2 * sz * fn[1] * fn[2]);
+    if (!f) return -1;
+    for (int64_t a0 = 0; a0 < rn[0]; a0 += sz) {
+        const int64_t na = a0 + sz < rn[0] ? sz : rn[0] - a0;
+        fo[0] = 2 * (ro[0] + a0); { const int64_t e = 2 * (ro[0] + a0 + na) < fs[0] ? 2 * (ro[0] + a0 + na) : fs[0]; fn[0] = e - fo[0]; }
+        if (fn[0] <= 0) break;
+        if (z3_read(ph, fo, fn, f, nthreads)) { free(f); return -1; }
+        for (int64_t a = 0; a < na; a++) for (int64_t b = 0; b < rn[1]; b++) for (int64_t c = 0; c < rn[2]; c++) {
+            float x = 0, y = 0; int k = 0, any = 0;
+            for (int q = 0; q < 8; q++) {
+                const int64_t z = 2 * a + (q >> 2 & 1), yy = 2 * b + (q >> 1 & 1), xx = 2 * c + (q & 1);
+                if (z >= fn[0] || yy >= fn[1] || xx >= fn[2]) continue;
+                const int v = f[((size_t)z * fn[1] + yy) * fn[2] + xx];
+                any |= v && v != PHASE_UNKNOWN;
+                if (v < PHASE_PERIOD) { x += cs[v]; y += sn[v]; k++; }
+            }
+            uint8_t o = PHASE_UNKNOWN;
+            if (ign) o = (uint8_t)any;
+            else if (k && x * x + y * y >= 0.25f * k * k) { double t = atan2(y, x) / (2 * M_PI); if (t < 0) t += 1; o = (uint8_t)((int)lround(t * PHASE_PERIOD) % PHASE_PERIOD); }
+            out[((size_t)(a0 + a) * rn[1] + b) * rn[2] + c] = o;
+            if (cnt) { cnt[0] += k > 0; cnt[1] += o < PHASE_PERIOD; }
+        }
+    }
+    free(f);
+    return 0;
+}
+int phase_pool2_box(z3 *ph, const int64_t ro[3], const int64_t rn[3], uint8_t *out, int nthreads, int ign) { return phase_pool2_box_(ph, ro, rn, out, nthreads, ign, nullptr); }
+typedef struct { int ign; _Atomic uint64_t any, known; } phpool_ctx;   /* (the coarse voxels read with a known child / known after pooling) */
+static int phpool_read(void *ctx, z3 *base, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads) {
+    phpool_ctx *C = ctx; uint64_t cnt[2] = {0, 0};
+    const int rc = phase_pool2_box_(base, o, n, out, nthreads, C->ign, C->ign ? nullptr : cnt);
+    atomic_fetch_add(&C->any, cnt[0]); atomic_fetch_add(&C->known, cnt[1]);
+    return rc;
+}
+z3 *phase_pool2_view(z3 *phase, int ign) {
+    phpool_ctx *C = calloc(1, sizeof *C); if (!C) return nullptr; C->ign = ign;
+    z3 *z = z3_open_derived_pool2(phase, ign ? 0 : PHASE_UNKNOWN, phpool_read, C, free);
+    if (!z) { free(C); return nullptr; }
+    z3_derived_borrow(z);
+    return z;
+}
+int phase_pool2_view_stats(const z3 *view, uint64_t *any, uint64_t *known) {
+    const phpool_ctx *C = z3_derived_ctx(view); if (!C) return -1;
+    *any = atomic_load(&C->any); *known = atomic_load(&C->known); return 0;
+}
+
+/* the fusion of several onfly (or stored) phase sets (phase-fuse, src/fuse.h fuse_phase: the circular mean where they agree within tol
+   turns, else unknown; one set alone kept), per voxel, so a read box needs no halo beyond each set's own */
+typedef struct { z3 *set[FUSE_MAX]; int n; float tol; } fuse_ctx;
+static thread_local struct { uint8_t *b[FUSE_MAX]; size_t cap; } t_fu;
+static int fuse_read(void *vp, z3 *base, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads) {
+    fuse_ctx *F = vp; const size_t nv = (size_t)n[0] * n[1] * n[2];
+    if (nv > t_fu.cap) { for (int k = 0; k < FUSE_MAX; k++) { free(t_fu.b[k]); t_fu.b[k] = nullptr; } t_fu.cap = 0; }
+    const uint8_t *act[FUSE_MAX]; int na = 0;
+    for (int k = 0; k < F->n; k++) {
+        z3 *z = k ? F->set[k] : base;
+        if (z3_box_any(z, o, n) == 0) continue;   /* (no chunk of this set in the box: all unknown, as phase-fuse's absent shards) */
+        if (!t_fu.b[na] && !(t_fu.b[na] = malloc(nv))) return -1;
+        if (z3_read(z, o, n, t_fu.b[na], nthreads)) return -1;
+        act[na] = t_fu.b[na]; na++;
+    }
+    if (nv > t_fu.cap) t_fu.cap = nv;
+    if (!na) { memset(out, PHASE_UNKNOWN, nv); return 0; }
+    fuse_phase(act, na, nv, F->tol, out, nullptr, nullptr);
+    return 0;
+}
+z3 *phase_onfly_fuse_open(z3 **sets, int n, float tol) {
+    if (n < 1 || n > FUSE_MAX || !(tol >= 0)) { for (int k = 0; k < n; k++) z3_close(sets[k]); return nullptr; }
+    fuse_ctx *F = calloc(1, sizeof *F); F->n = n; F->tol = tol; for (int k = 0; k < n; k++) F->set[k] = sets[k];
+    z3 *z = z3_open_derived(sets[0], PHASE_UNKNOWN, fuse_read, F, free);
+    if (!z) { free(F); for (int k = 0; k < n; k++) z3_close(sets[k]); return nullptr; }
+    for (int k = 1; k < n; k++) if (z3_derived_cover(z, sets[k])) { fprintf(stderr, "phase fuse: set %d has another shape\n", k); for (int e = k; e < n; e++) z3_close(sets[e]); F->n = k; z3_close(z); return nullptr; }
+    return z;
+}
+
 int phase_onfly_decode_gpu(z3 *codes, const int64_t o[3], const int64_t n[3], uint8_t *out) {
     const z3_meta *m = z3_meta_of(codes); int64_t ro[3], rn[3], tn[3];
     for (int d = 0; d < 3; d++) { ro[d] = o[d] < 0 ? 0 : o[d]; rn[d] = (o[d] + n[d] < m->shape[d] ? o[d] + n[d] : m->shape[d]) - ro[d]; if (rn[d] <= 0) return -2; tn[d] = n[d]; }
     if (!band_pair_gpu_codes) return -1;
-    const int r = tile_gpu(codes, o, n, ro, rn, 0, tn, 0, out);
+    const int r = tile_gpu(codes, o, n, ro, rn, 0, tn, 0, out); pk_trim();
     if (r == 2) { memset(out, 0, (size_t)n[0] * n[1] * n[2]); return 0; }
     return r;
 }

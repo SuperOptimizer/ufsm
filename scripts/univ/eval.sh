@@ -14,10 +14,11 @@
 # Summary: $E/TAG.matrix.txt (wbench-stats paired CIs against REFS, default "wind96 lat-wz896-12000"; rv / fib / ink rows; xres vs native).
 # Env: GPU (1), LKF (a flock file, e.g. /tmp/gpu1-bench.lock, when sharing the GPU with timing runs), UP (predict binary for wbench), U (this tree's build/ufsm), WIN / HALO / WZARGS as
 # wbench (latent-grid checkpoints: WZARGS= ), THREADS (8); off the desk: SITE=pod WB=$K/wb K=<kit> (scripts/univ/podkit_eval.sh), INKW / FIBPH paths. Reruns skip finished pieces (wbench rows, rv txt, fib / ink outputs).
+# CTROOT: the CT root for every task but rv (default the volcomp mirror; a tree with the same keys, e.g. a re-encoded sweep arm). Use a fresh E / WB per root: finished pieces are skipped by tag.
 set -u
 CK=$(readlink -f "${1:?ckpt}"); T=${2:?tag}; TASKS=${TASKS:-wind dlv xres rv fib ink}
 H=$(cd "$(dirname "$0")/../.." && pwd); U=${U:-$H/build/ufsm}; WB=${WB:-/vesuvius/ufsm/wbench}; SITE=${SITE:-desk}; E=${E:-$WB/univ}; RVE=${RVE:-/mnt/scratch/rv/eval}
-M=https://dl.ash2txt.org/community-uploads/forrest/volcomp; P4K=PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr
+M=${CTROOT:-https://dl.ash2txt.org/community-uploads/forrest/volcomp}; P4K=PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr
 GPU=${GPU:-1}; THREADS=${THREADS:-8}; REFS=${REFS:-wind96 lat-wz896-12000}; DLVS=${DLVS:--1 1}; RVSC=${RVSC:-p1667 p139 p4}
 FIBCH=${FIBCH:-}; INKP=${INKP:-}; LKF=${LKF:-}; mkdir -p $E/$T
 MC=""; [ -x ~/bin/memcap ] && MC="$HOME/bin/memcap -m 40G"   # (pods have no memcap: the pod cgroup caps them)

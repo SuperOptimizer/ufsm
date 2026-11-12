@@ -52,7 +52,8 @@ CCBIN   := $(if $(filter gcc-%,$(HOSTCC)),$(if $(shell command -v $(subst gcc,g+
 ifeq ($(origin NVCC),undefined)
 NVCC := $(CCACHE) $(if $(shell command -v nvcc 2>/dev/null),nvcc,$(CUDA)/bin/nvcc) $(CCBIN)
 endif
-CFLAGS  ?= -std=c23 -O3 -march=native -g -Wall -Wextra -Wno-unused-parameter -Wno-format-truncation -pthread
+CFLAGS  ?= -std=c23 -O3 -march=native -g -Wall -Wextra -Werror=comment -Wno-unused-parameter -Wno-format-truncation -pthread
+# (-Werror=comment, 2026-11-12: an unclosed comment swallowed the next source line, the --fib-head statistics pass, with only a -Wcomment warning)
 CPPFLAGS = -D_GNU_SOURCE -Isrc -Ithird_party -Ithird_party/surfcomp $(shell pkg-config --cflags libcurl libzstd blosc zlib libcrypto)
 LDLIBS   = $(shell pkg-config --libs libcurl libzstd blosc zlib libcrypto) -ljpeg -lm -lpthread
 NVFLAGS ?= -O3 $(NVARCH) -DUFSM_ARCH=$(ARCH) -use_fast_math -Xcompiler -fno-threadsafe-statics -Isrc   # fast math: +4% step time, FD tests still pass
@@ -62,8 +63,8 @@ CUDALIBS = -L$(CUDA)/lib64 -lcudart -lcublasLt -lstdc++
 
 SRC  = src/json.c src/checkpoint.c src/sheet.c src/store.c src/zarr3.c src/sources.c src/sample.c src/band.c src/ct_augment.c src/scan_augment.c src/spatial_augment.c src/crush.c src/scrollaug.c src/cover.c src/zarr2.c src/tiff.c src/z3w.c src/hf.c src/ingest.c src/zipr.c src/train.c src/restore.c src/restore_cli.c src/unet.c src/split.c src/predict.c src/sweep.c src/eval.c src/fit.c src/tiffw.c src/edt.c src/votes.c src/wind.c src/fuse.c src/phase_check.c src/band_onfly.c
 SRC += src/surf.c src/stitch.c src/coreline.c src/coreline_check.c src/fit_ct.c src/l1pot.c
-SRC += src/fblend.c src/sheetpbr.c src/regmap.c
-SRC += src/deform.c src/vwt_aug.c src/zcache.c
+SRC += src/fblend.c src/sheetpbr.c src/regmap.c src/vcgpu.c
+SRC += src/deform.c src/vwt_aug.c src/zcache.c src/dcache.c
 SRC += src/inkblend.c
 SRC += src/ftaxis.c
 SRC += src/inkseam.c
@@ -81,12 +82,14 @@ SRC += src/vwt_sample.c src/raycheck.c src/patchraster.c src/hiresphase.c src/fi
 SRC += src/view.c src/reg.c src/reg_cli.c src/reg_view.c src/reg_init.c src/reg_render.c src/reg_ink.c src/srpairs.c
 SRC += src/srpair.c
 SRC += src/storebench.c src/phasepack.c
+SRC += src/meshcodes.c
 SRC += src/afv.c src/fibercheck.c src/fitphase.c src/wrapdump.c src/fiberjudge.c src/fibertrace.c src/fiberraster.c src/fiberlink.c src/fibregscore.c
 SRC += src/countfield.c src/countanat.c
 SRC += src/flatten.c src/faces.c src/faces_cli.c
 SRC += src/sheetcut.c
 SRC += src/strip.c
 SRC += src/latfit.c src/lc_cli.c
+SRC += src/latvol.c src/latvol_cli.c src/latvol_read.c
 OBJ  = $(patsubst src/%.c,$(B)/%.o,$(SRC)) $(B)/surfcomp.o
 
 all: $(B)/ufsm
@@ -148,9 +151,20 @@ $(B)/nn_gpudec.o: NVFLAGS = -O3 $(NVARCH) -DUFSM_ARCH=$(ARCH) -fmad=false -Xcomp
 $(B)/nn_cf.o: NVFLAGS = -O3 $(NVARCH) -DUFSM_ARCH=$(ARCH) -fmad=false -Xcompiler -fno-threadsafe-statics -Isrc
 # fiber-trace's axis on the GPU (src/nn_ftrace.cu) is byte-identical to src/ftaxis.c: IEEE division / sqrt, no FMA contraction, no fast math
 $(B)/nn_ftrace.o: NVFLAGS = -O3 $(NVARCH) -DUFSM_ARCH=$(ARCH) -fmad=false -Xcompiler -fno-threadsafe-statics -Isrc
+# latvol on the GPU (src/nn_latvol.cu) is byte-identical to src/latvol.c: integer sums, one float multiply and a rint; no FMA contraction, no fast math
+$(B)/nn_latvol.o: NVFLAGS = -O3 $(NVARCH) -DUFSM_ARCH=$(ARCH) -fmad=false -Xcompiler -fno-threadsafe-statics -Isrc
+$(B)/nn_latvol.o: src/latvol.h src/nn_latvol.h
+$(B)/test_latvol: tests/test_latvol.c src/latvol.h $(B)/latvol.o $(B)/nn_latvol.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(CUDA)/include $< $(B)/latvol.o $(B)/nn_latvol.o -o $@ $(LDLIBS) $(CUDALIBS)
 # the phase-raster pair rule on the GPU (src/nn_band.cu) is byte-identical to band.c: IEEE division / sqrt, no FMA contraction, no fast math
 $(B)/nn_band.o: NVFLAGS = -O3 $(NVARCH) -DUFSM_ARCH=$(ARCH) -fmad=false -Xcompiler -fno-threadsafe-statics -Isrc
 $(B)/nn_fibre.o: NVFLAGS = -O3 $(NVARCH) -DUFSM_ARCH=$(ARCH) -fmad=false -Xcompiler -fno-threadsafe-statics -Isrc
+# the on-the-fly ink chunk (src/nn_inkfly.cu) is byte-identical to inksplat.c inkfly_chunk: IEEE division / sqrt, no FMA contraction, no fast math
+$(B)/nn_inkfly.o: NVFLAGS = -O3 $(NVARCH) -DUFSM_ARCH=$(ARCH) -fmad=false -Xcompiler -fno-threadsafe-statics -Isrc
+# volcomp encoding's analysis on the GPU (src/nn_gpuenc.cu) gives the CPU encoder's levels exactly: no FMA contraction, no fast math
+$(B)/nn_gpuenc.o: NVFLAGS = -O3 $(NVARCH) -DUFSM_ARCH=$(ARCH) -fmad=false -Xcompiler -fno-threadsafe-statics -Isrc
+# the mesh codes stamp on the GPU (src/nn_mcodes.cu) is byte-identical to meshcodes.c mc_stamp: double, IEEE sqrt / division, no FMA contraction
+$(B)/nn_mcodes.o: NVFLAGS = -O3 $(NVARCH) -DUFSM_ARCH=$(ARCH) -fmad=false -Xcompiler -fno-threadsafe-statics -Isrc
 # FP8 / FP4 block-scaled mma (kind::mxf8f6f4 / kind::mxf4) needs the arch-specific sm_120a target
 # The low-precision kernels are split into one translation unit per kernel family (src/lp_*.cu, shared helpers in
 # src/lp_common.cuh) so make -j compiles them in parallel; $(B)/nn_fp8.o is their relocatable link, so every target
@@ -238,6 +252,12 @@ $(B)/test_l3_sched: tests/test_l3_sched.c $(B)/unet.o $(B)/nn.o $(B)/nn_fp8.o
 $(B)/test_fstem: tests/test_fstem.c $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 suite-bins: $(B)/test_fstem
+$(B)/test_lathead: tests/test_lathead.c $(B)/nn.o $(B)/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
+suite-bins: $(B)/test_lathead
+$(B)/test_fit_lat: tests/test_fit_lat.c $(B)/nn.o $(B)/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
+suite-bins: $(B)/test_fit_lat
 $(B)/test_gram: tests/test_gram.c $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 suite-bins: $(B)/test_gram
@@ -279,6 +299,9 @@ suite-bins: $(B)/test_wraps_core
 $(B)/test_predict_unwrap2: tests/test_predict_unwrap2.c $(B)/unet.o $(B)/fit.o $(B)/fit_emb.o $(B)/embz.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/coreline.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/z3w.o $(B)/nn.o $(B)/nn_fp8.o | $(B)/ufsm
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 suite-bins: $(B)/test_predict_unwrap2
+$(B)/test_predict_fitgrid: tests/test_predict_fitgrid.c $(B)/unet.o $(B)/fit.o $(B)/fit_emb.o $(B)/embz.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/coreline.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/z3w.o $(B)/nn.o $(B)/nn_fp8.o | $(B)/ufsm
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
+suite-bins: $(B)/test_predict_fitgrid
 $(B)/test_unwrap2_ink: tests/test_unwrap2_ink.c $(B)/unet.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/z3w.o $(B)/nn.o $(B)/nn_fp8.o | $(B)/ufsm $(B)/make_wind_fixture
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 suite-bins: $(B)/test_unwrap2_ink $(B)/make_wind_fixture
@@ -322,13 +345,13 @@ $(B)/test_sheetpbr: tests/test_sheetpbr.c $(B)/sheetpbr.o $(B)/reg.o $(B)/zarr2.
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
 suite-bins: $(B)/test_sheetpbr
 
-$(B)/test_geom_check: tests/test_geom_check.c $(B)/geomcheck.o $(B)/sources.o $(B)/band_onfly.o $(B)/fiberraster.o $(B)/afv.o $(B)/reg.o $(B)/regmap.o $(B)/zarr2.o $(B)/band.o $(B)/edt.o $(B)/srpair.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/z3w.o $(B)/tiffw.o $(B)/tiff.o $(B)/tfx.o $(B)/surfcomp.o
+$(B)/test_geom_check: tests/test_geom_check.c $(B)/geomcheck.o $(B)/sources.o $(B)/band_onfly.o $(B)/fuse.o $(B)/fiberraster.o $(B)/afv.o $(B)/reg.o $(B)/regmap.o $(B)/zarr2.o $(B)/band.o $(B)/edt.o $(B)/srpair.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/z3w.o $(B)/tiffw.o $(B)/tiff.o $(B)/tfx.o $(B)/surfcomp.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
 suite-bins: $(B)/test_geom_check
 $(B)/test_countfield: tests/test_countfield.c $(B)/countfield.o $(B)/ctcal.o $(B)/fit.o $(B)/fit_emb.o $(B)/embz.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/coreline.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/z3w.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 suite-bins: $(B)/test_countfield
-$(B)/test_vwt_sample: tests/test_vwt_sample.c $(B)/vwt_sample.o $(B)/imgops.o $(B)/jpegpar.o $(B)/tiffw.o $(B)/tfx.o $(B)/surfcomp.o $(B)/vwt_aug.o $(B)/zcache.o $(B)/deform.o $(B)/edt.o $(B)/band.o $(B)/sheet.o $(B)/ct_augment.o $(B)/scan_augment.o $(B)/spatial_augment.o $(B)/crush.o $(B)/scrollaug.o $(B)/cover.o $(B)/json.o $(B)/store.o $(B)/zarr3.o $(B)/sources.o $(B)/band_onfly.o $(B)/fiberraster.o $(B)/afv.o $(B)/reg.o $(B)/regmap.o $(B)/zarr2.o $(B)/srpair.o $(B)/zarr2.o $(B)/tiff.o $(B)/z3w.o $(B)/hf.o $(B)/zipr.o $(B)/view.o $(B)/reg.o $(B)/sample_emb.o $(B)/embz.o $(B)/nn.o $(B)/nn_fp8.o
+$(B)/test_vwt_sample: tests/test_vwt_sample.c $(B)/vwt_sample.o $(B)/imgops.o $(B)/jpegpar.o $(B)/tiffw.o $(B)/tfx.o $(B)/surfcomp.o $(B)/vwt_aug.o $(B)/zcache.o $(B)/deform.o $(B)/edt.o $(B)/band.o $(B)/sheet.o $(B)/ct_augment.o $(B)/scan_augment.o $(B)/spatial_augment.o $(B)/crush.o $(B)/scrollaug.o $(B)/cover.o $(B)/json.o $(B)/store.o $(B)/zarr3.o $(B)/sources.o $(B)/band_onfly.o $(B)/fuse.o $(B)/fiberraster.o $(B)/afv.o $(B)/reg.o $(B)/regmap.o $(B)/zarr2.o $(B)/srpair.o $(B)/zarr2.o $(B)/tiff.o $(B)/z3w.o $(B)/hf.o $(B)/zipr.o $(B)/view.o $(B)/reg.o $(B)/sample_emb.o $(B)/embz.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 suite-bins: $(B)/test_vwt_sample
 $(B)/test_spiralfit: tests/test_spiralfit.c $(B)/countfield.o $(B)/ctcal.o $(B)/fit.o $(B)/fit_emb.o $(B)/embz.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/coreline.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/z3w.o $(B)/nn.o $(B)/nn_fp8.o
@@ -380,9 +403,24 @@ $(B)/test_distill: tests/test_distill.c $(B)/sample_emb.o $(B)/embz.o $(B)/z3w.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 suite-bins: $(B)/test_distill
 
+$(B)/test_ink_mil: tests/test_ink_mil.c $(OBJ) $(B)/nn.o $(B)/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
+suite-bins: $(B)/test_ink_mil
+$(B)/test_mesh_phase: tests/test_mesh_phase.c $(OBJ) $(B)/nn.o $(B)/nn_fp8.o | $(B)/ufsm
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_mesh_phase.c $(OBJ) $(B)/nn.o $(B)/nn_fp8.o -o $@ $(LDLIBS) $(CUDALIBS)
+suite-bins: $(B)/test_mesh_phase
+$(B)/test_ink_mil_train: tests/test_ink_mil_train.c $(OBJ) $(B)/nn.o $(B)/nn_fp8.o | $(B)/ufsm $(B)/make_wind_fixture
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_ink_mil_train.c $(OBJ) $(B)/nn.o $(B)/nn_fp8.o -o $@ $(LDLIBS) $(CUDALIBS)
+suite-bins: $(B)/test_ink_mil_train $(B)/make_wind_fixture
+$(B)/test_ink_mil_check: tests/test_ink_mil_check.c tests/make_wind_fixture.c $(B)/z3w.o $(B)/tiffw.o | $(B)/ufsm $(B)/make_wind_fixture
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_ink_mil_check.c $(B)/z3w.o $(B)/tiffw.o -o $@ $(LDLIBS)
+suite-bins: $(B)/test_ink_mil_check
 $(B)/test_ink_splat: tests/test_ink_splat.c $(OBJ) $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 suite-bins: $(B)/test_ink_splat
+$(B)/test_ink_pool: tests/test_ink_pool.c $(OBJ) $(B)/nn.o $(B)/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
+suite-bins: $(B)/test_ink_pool
 
 $(B)/test_imgops: tests/test_imgops.c tests/test_imgops_expected.h $(B)/imgops.o $(B)/jpegpar.o $(B)/tiffw.o $(B)/tiff.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_imgops.c $(B)/imgops.o $(B)/jpegpar.o $(B)/tiffw.o $(B)/tiff.o -o $@ $(LDLIBS)
@@ -470,6 +508,9 @@ suite-bins: $(B)/test_render_stream
 $(B)/test_render_fill: tests/test_render_fill.c $(B)/render.o $(B)/inkcompare.o $(B)/imgops.o $(B)/jpegpar.o $(B)/tiff.o $(B)/tiffw.o $(B)/z3w.o $(B)/zarr3.o $(B)/store.o $(B)/json.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
 suite-bins: $(B)/test_render_fill
+$(B)/test_render_known: tests/test_render_known.c $(B)/render.o $(B)/inkcompare.o $(B)/imgops.o $(B)/jpegpar.o $(B)/tiff.o $(B)/tiffw.o $(B)/z3w.o $(B)/zarr3.o $(B)/store.o $(B)/json.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
+suite-bins: $(B)/test_render_known
 # the renders on the GPU (nn_render.cu, gpudec device decode): the same tests, every chunked render through the GPU path; byte-identical, so no
 # fast math and no fused multiply-adds in this object
 $(B)/nn_render.o: NVFLAGS := -O3 $(NVARCH) -DUFSM_ARCH=$(ARCH) -fmad=false -Xcompiler -fno-threadsafe-statics -Isrc
@@ -493,6 +534,9 @@ $(B)/test_volcomp: tests/test_volcomp.c third_party/volcomp.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< -o $@ -lm
 $(B)/test_volcomp_fast: tests/test_volcomp_fast.c src/volcomp_fast.h src/zshm.h $(B)/zarr3.o $(B)/store.o $(B)/json.o $(B)/z3w.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(B)/zarr3.o $(B)/store.o $(B)/json.o $(B)/z3w.o -o $@ $(LDLIBS)
+$(B)/test_vcgpu: tests/test_vcgpu.c src/vcgpu.h $(B)/vcgpu.o $(B)/nn.o $(B)/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(CUDA)/include $< $(B)/vcgpu.o $(B)/nn.o $(B)/nn_fp8.o -o $@ $(LDLIBS) $(CUDALIBS)
+suite-bins: $(B)/test_vcgpu
 $(B)/test_gpudec: tests/test_gpudec.c src/gpudec.h src/volcomp_fast.h $(B)/zarr3.o $(B)/store.o $(B)/json.o $(B)/z3w.o $(B)/nn_gpudec.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(CUDA)/include $< $(B)/zarr3.o $(B)/store.o $(B)/json.o $(B)/z3w.o $(B)/nn_gpudec.o -o $@ $(LDLIBS) $(CUDALIBS)
 $(B)/test_edt: tests/test_edt.c $(B)/edt.o
@@ -501,7 +545,7 @@ $(B)/test_infer_mem: tests/test_infer_mem.c $(B)/unet.o $(B)/split.o $(B)/nn.o $
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 $(B)/test_split: tests/test_split.c $(B)/unet.o $(B)/split.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
-SAMPLE_TEST_OBJ = $(B)/edt.o $(B)/band.o $(B)/sheet.o $(B)/ct_augment.o $(B)/scan_augment.o $(B)/spatial_augment.o $(B)/crush.o $(B)/scrollaug.o $(B)/cover.o $(B)/json.o $(B)/store.o $(B)/zarr3.o $(B)/sources.o $(B)/band_onfly.o $(B)/fiberraster.o $(B)/afv.o $(B)/regmap.o $(B)/srpair.o $(B)/zarr2.o $(B)/tiff.o $(B)/z3w.o $(B)/hf.o $(B)/zipr.o $(B)/view.o $(B)/reg.o $(B)/sample_emb.o $(B)/embz.o
+SAMPLE_TEST_OBJ = $(B)/edt.o $(B)/band.o $(B)/sheet.o $(B)/ct_augment.o $(B)/scan_augment.o $(B)/spatial_augment.o $(B)/crush.o $(B)/scrollaug.o $(B)/cover.o $(B)/json.o $(B)/store.o $(B)/zarr3.o $(B)/sources.o $(B)/band_onfly.o $(B)/fuse.o $(B)/fiberraster.o $(B)/afv.o $(B)/regmap.o $(B)/srpair.o $(B)/zarr2.o $(B)/tiff.o $(B)/z3w.o $(B)/hf.o $(B)/zipr.o $(B)/view.o $(B)/reg.o $(B)/sample_emb.o $(B)/embz.o
 $(B)/test_wrapsnap: tests/test_wrapsnap.c $(B)/wrapsnap.o $(B)/tfx.o $(B)/surfcomp.o $(B)/tiffw.o $(SAMPLE_TEST_OBJ) $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 suite-bins: $(B)/test_wrapsnap
@@ -576,11 +620,11 @@ $(B)/test_crush: tests/test_crush.c tests/make_wind_fixture.c src/sample.c src/*
 $(B)/test_raster: tests/test_raster.c src/ingest.c src/*.h $(SAMPLE_TEST_OBJ) $(B)/surfcomp.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_raster.c $(SAMPLE_TEST_OBJ) $(B)/surfcomp.o -o $@ $(LDLIBS)
 
-$(B)/bench_sampler: tests/bench_sampler.c $(B)/sample.o $(B)/sample_emb.o $(B)/embz.o $(B)/edt.o $(B)/band.o $(B)/sheet.o $(B)/ct_augment.o $(B)/scan_augment.o $(B)/spatial_augment.o $(B)/crush.o $(B)/scrollaug.o $(B)/cover.o $(B)/sources.o $(B)/band_onfly.o $(B)/fiberraster.o $(B)/afv.o $(B)/reg.o $(B)/regmap.o $(B)/zarr2.o $(B)/srpair.o $(B)/view.o $(B)/reg.o $(B)/zarr3.o $(B)/zarr2.o $(B)/store.o $(B)/json.o $(B)/z3w.o $(B)/tiff.o $(B)/zipr.o $(B)/hf.o $(B)/nn.o $(B)/nn_fp8.o
+$(B)/bench_sampler: tests/bench_sampler.c $(B)/sample.o $(B)/sample_emb.o $(B)/embz.o $(B)/edt.o $(B)/band.o $(B)/sheet.o $(B)/ct_augment.o $(B)/scan_augment.o $(B)/spatial_augment.o $(B)/crush.o $(B)/scrollaug.o $(B)/cover.o $(B)/sources.o $(B)/band_onfly.o $(B)/fuse.o $(B)/fiberraster.o $(B)/afv.o $(B)/reg.o $(B)/regmap.o $(B)/zarr2.o $(B)/srpair.o $(B)/view.o $(B)/reg.o $(B)/zarr3.o $(B)/zarr2.o $(B)/store.o $(B)/json.o $(B)/z3w.o $(B)/tiff.o $(B)/zipr.o $(B)/hf.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm -lcurl -lzstd -lblosc -lz -lcrypto
-$(B)/test_gpu_input: tests/test_gpu_input.c $(B)/sample.o $(B)/sample_emb.o $(B)/embz.o $(B)/edt.o $(B)/band.o $(B)/sheet.o $(B)/ct_augment.o $(B)/scan_augment.o $(B)/spatial_augment.o $(B)/crush.o $(B)/scrollaug.o $(B)/cover.o $(B)/sources.o $(B)/band_onfly.o $(B)/fiberraster.o $(B)/afv.o $(B)/reg.o $(B)/regmap.o $(B)/zarr2.o $(B)/srpair.o $(B)/view.o $(B)/reg.o $(B)/zarr3.o $(B)/zarr2.o $(B)/store.o $(B)/json.o $(B)/z3w.o $(B)/tiff.o $(B)/zipr.o $(B)/hf.o $(B)/nn.o $(B)/nn_fp8.o
+$(B)/test_gpu_input: tests/test_gpu_input.c $(B)/sample.o $(B)/sample_emb.o $(B)/embz.o $(B)/edt.o $(B)/band.o $(B)/sheet.o $(B)/ct_augment.o $(B)/scan_augment.o $(B)/spatial_augment.o $(B)/crush.o $(B)/scrollaug.o $(B)/cover.o $(B)/sources.o $(B)/band_onfly.o $(B)/fuse.o $(B)/fiberraster.o $(B)/afv.o $(B)/reg.o $(B)/regmap.o $(B)/zarr2.o $(B)/srpair.o $(B)/view.o $(B)/reg.o $(B)/zarr3.o $(B)/zarr2.o $(B)/store.o $(B)/json.o $(B)/z3w.o $(B)/tiff.o $(B)/zipr.o $(B)/hf.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm -lcurl -lzstd -lblosc -lz -lcrypto
-$(B)/test_pack_tm: tests/test_pack_tm.c $(B)/sample.o $(B)/sample_emb.o $(B)/embz.o $(B)/edt.o $(B)/band.o $(B)/sheet.o $(B)/ct_augment.o $(B)/scan_augment.o $(B)/spatial_augment.o $(B)/crush.o $(B)/scrollaug.o $(B)/cover.o $(B)/sources.o $(B)/band_onfly.o $(B)/fiberraster.o $(B)/afv.o $(B)/reg.o $(B)/regmap.o $(B)/zarr2.o $(B)/srpair.o $(B)/view.o $(B)/reg.o $(B)/zarr3.o $(B)/zarr2.o $(B)/store.o $(B)/json.o $(B)/z3w.o $(B)/tiff.o $(B)/zipr.o $(B)/hf.o $(B)/nn.o $(B)/nn_fp8.o
+$(B)/test_pack_tm: tests/test_pack_tm.c $(B)/sample.o $(B)/sample_emb.o $(B)/embz.o $(B)/edt.o $(B)/band.o $(B)/sheet.o $(B)/ct_augment.o $(B)/scan_augment.o $(B)/spatial_augment.o $(B)/crush.o $(B)/scrollaug.o $(B)/cover.o $(B)/sources.o $(B)/band_onfly.o $(B)/fuse.o $(B)/fiberraster.o $(B)/afv.o $(B)/reg.o $(B)/regmap.o $(B)/zarr2.o $(B)/srpair.o $(B)/view.o $(B)/reg.o $(B)/zarr3.o $(B)/zarr2.o $(B)/store.o $(B)/json.o $(B)/z3w.o $(B)/tiff.o $(B)/zipr.o $(B)/hf.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm -lcurl -lzstd -lblosc -lz -lcrypto
 $(B)/test_gyrec: tests/test_gyrec.c $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
@@ -594,14 +638,17 @@ $(B)/test_lat_conv0: tests/test_lat_conv0.c $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 $(B)/test_w4dev: tests/test_w4dev.c $(B)/band.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
-$(B)/test_rungs: tests/test_rungs.c $(B)/sample.o $(B)/sample_emb.o $(B)/embz.o $(B)/edt.o $(B)/band.o $(B)/sheet.o $(B)/ct_augment.o $(B)/scan_augment.o $(B)/spatial_augment.o $(B)/crush.o $(B)/scrollaug.o $(B)/cover.o $(B)/sources.o $(B)/band_onfly.o $(B)/fiberraster.o $(B)/afv.o $(B)/reg.o $(B)/regmap.o $(B)/zarr2.o $(B)/srpair.o $(B)/view.o $(B)/reg.o $(B)/zarr3.o $(B)/zarr2.o $(B)/store.o $(B)/json.o $(B)/z3w.o $(B)/tiff.o $(B)/zipr.o $(B)/hf.o $(B)/nn.o $(B)/nn_fp8.o
+$(B)/test_rungs: tests/test_rungs.c $(B)/sample.o $(B)/sample_emb.o $(B)/embz.o $(B)/edt.o $(B)/band.o $(B)/sheet.o $(B)/ct_augment.o $(B)/scan_augment.o $(B)/spatial_augment.o $(B)/crush.o $(B)/scrollaug.o $(B)/cover.o $(B)/sources.o $(B)/band_onfly.o $(B)/fuse.o $(B)/fiberraster.o $(B)/afv.o $(B)/reg.o $(B)/regmap.o $(B)/zarr2.o $(B)/srpair.o $(B)/view.o $(B)/reg.o $(B)/zarr3.o $(B)/zarr2.o $(B)/store.o $(B)/json.o $(B)/z3w.o $(B)/tiff.o $(B)/zipr.o $(B)/hf.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm -lcurl -lzstd -lblosc -lz -lcrypto
 suite-bins: $(B)/test_rungs
-$(B)/test_unwrap2_sampler: tests/test_unwrap2_sampler.c $(B)/sample.o $(B)/sample_emb.o $(B)/embz.o $(B)/edt.o $(B)/band.o $(B)/sheet.o $(B)/ct_augment.o $(B)/scan_augment.o $(B)/spatial_augment.o $(B)/crush.o $(B)/scrollaug.o $(B)/cover.o $(B)/sources.o $(B)/band_onfly.o $(B)/fiberraster.o $(B)/afv.o $(B)/reg.o $(B)/regmap.o $(B)/zarr2.o $(B)/srpair.o $(B)/view.o $(B)/reg.o $(B)/zarr3.o $(B)/zarr2.o $(B)/store.o $(B)/json.o $(B)/z3w.o $(B)/tiff.o $(B)/zipr.o $(B)/hf.o $(B)/nn.o $(B)/nn_fp8.o
+$(B)/test_phase_pool: tests/test_phase_pool.c $(B)/band_onfly.o $(B)/fuse.o $(B)/band.o $(B)/edt.o $(B)/zarr3.o $(B)/zarr2.o $(B)/store.o $(B)/json.o $(B)/z3w.o $(B)/hf.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm -lcurl -lzstd -lblosc -lz -lcrypto
-$(B)/test_phase_interp: tests/test_phase_interp.c $(B)/sample.o $(B)/sample_emb.o $(B)/embz.o $(B)/edt.o $(B)/band.o $(B)/sheet.o $(B)/ct_augment.o $(B)/scan_augment.o $(B)/spatial_augment.o $(B)/crush.o $(B)/scrollaug.o $(B)/cover.o $(B)/sources.o $(B)/band_onfly.o $(B)/fiberraster.o $(B)/afv.o $(B)/reg.o $(B)/regmap.o $(B)/zarr2.o $(B)/srpair.o $(B)/view.o $(B)/reg.o $(B)/zarr3.o $(B)/zarr2.o $(B)/store.o $(B)/json.o $(B)/z3w.o $(B)/tiff.o $(B)/zipr.o $(B)/hf.o $(B)/nn.o $(B)/nn_fp8.o
+suite-bins: $(B)/test_phase_pool
+$(B)/test_unwrap2_sampler: tests/test_unwrap2_sampler.c $(B)/sample.o $(B)/sample_emb.o $(B)/embz.o $(B)/edt.o $(B)/band.o $(B)/sheet.o $(B)/ct_augment.o $(B)/scan_augment.o $(B)/spatial_augment.o $(B)/crush.o $(B)/scrollaug.o $(B)/cover.o $(B)/sources.o $(B)/band_onfly.o $(B)/fuse.o $(B)/fiberraster.o $(B)/afv.o $(B)/reg.o $(B)/regmap.o $(B)/zarr2.o $(B)/srpair.o $(B)/view.o $(B)/reg.o $(B)/zarr3.o $(B)/zarr2.o $(B)/store.o $(B)/json.o $(B)/z3w.o $(B)/tiff.o $(B)/zipr.o $(B)/hf.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm -lcurl -lzstd -lblosc -lz -lcrypto
-$(B)/bench_read: tests/bench_read.c $(B)/sample.o $(B)/sample_emb.o $(B)/embz.o $(B)/edt.o $(B)/band.o $(B)/sheet.o $(B)/ct_augment.o $(B)/scan_augment.o $(B)/spatial_augment.o $(B)/crush.o $(B)/scrollaug.o $(B)/cover.o $(B)/sources.o $(B)/band_onfly.o $(B)/fiberraster.o $(B)/afv.o $(B)/reg.o $(B)/regmap.o $(B)/zarr2.o $(B)/srpair.o $(B)/view.o $(B)/reg.o $(B)/zarr3.o $(B)/zarr2.o $(B)/store.o $(B)/json.o $(B)/z3w.o $(B)/tiff.o $(B)/zipr.o $(B)/hf.o $(B)/nn.o $(B)/nn_fp8.o
+$(B)/test_phase_interp: tests/test_phase_interp.c $(B)/sample.o $(B)/sample_emb.o $(B)/embz.o $(B)/edt.o $(B)/band.o $(B)/sheet.o $(B)/ct_augment.o $(B)/scan_augment.o $(B)/spatial_augment.o $(B)/crush.o $(B)/scrollaug.o $(B)/cover.o $(B)/sources.o $(B)/band_onfly.o $(B)/fuse.o $(B)/fiberraster.o $(B)/afv.o $(B)/reg.o $(B)/regmap.o $(B)/zarr2.o $(B)/srpair.o $(B)/view.o $(B)/reg.o $(B)/zarr3.o $(B)/zarr2.o $(B)/store.o $(B)/json.o $(B)/z3w.o $(B)/tiff.o $(B)/zipr.o $(B)/hf.o $(B)/nn.o $(B)/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm -lcurl -lzstd -lblosc -lz -lcrypto
+$(B)/bench_read: tests/bench_read.c $(B)/sample.o $(B)/sample_emb.o $(B)/embz.o $(B)/edt.o $(B)/band.o $(B)/sheet.o $(B)/ct_augment.o $(B)/scan_augment.o $(B)/spatial_augment.o $(B)/crush.o $(B)/scrollaug.o $(B)/cover.o $(B)/sources.o $(B)/band_onfly.o $(B)/fuse.o $(B)/fiberraster.o $(B)/afv.o $(B)/reg.o $(B)/regmap.o $(B)/zarr2.o $(B)/srpair.o $(B)/view.o $(B)/reg.o $(B)/zarr3.o $(B)/zarr2.o $(B)/store.o $(B)/json.o $(B)/z3w.o $(B)/tiff.o $(B)/zipr.o $(B)/hf.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm -lcurl -lzstd -lblosc -lz -lcrypto
 $(B)/fwd_nan: tests/fwd_nan.c $(B)/unet.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
@@ -636,7 +683,7 @@ $(B)/test_band_pair: tests/test_band_pair.c src/band.h src/bandgpu.h $(B)/band.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(CUDA)/include $< $(B)/band.o $(B)/nn_band.o -o $@ $(LDLIBS) $(CUDALIBS)
 suite-bins: $(B)/test_band_pair
 # the volcomp lossless codes decode on the GPU (the onfly phase's codes) against z3_read, byte for byte
-$(B)/test_lldec: tests/test_lldec.c $(B)/band_onfly.o $(B)/band.o $(B)/edt.o $(B)/nn_band.o $(B)/z3w.o $(B)/zarr3.o $(B)/store.o $(B)/json.o
+$(B)/test_lldec: tests/test_lldec.c $(B)/band_onfly.o $(B)/fuse.o $(B)/band.o $(B)/edt.o $(B)/nn_band.o $(B)/z3w.o $(B)/zarr3.o $(B)/store.o $(B)/json.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 suite-bins: $(B)/test_lldec
 
@@ -694,6 +741,9 @@ $(B)/test_phasepack: tests/test_phasepack.c $(B)/phasepack.o $(B)/store.o $(B)/z
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
 $(B)/test_http_reader: tests/test_http_reader.c $(B)/store.o $(B)/zarr3.o $(B)/json.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
+# zarr3.o without latvol.o on purpose: a latvol array must fail to open with a clear error (tests/test_latvol.sh)
+$(B)/test_latvol_nolink: tests/test_latvol_nolink.c $(B)/store.o $(B)/zarr3.o $(B)/json.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
 
 $(B)/test_checkpoint_runtime: tests/test_checkpoint_runtime.c $(B)/checkpoint.o $(B)/json.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ -lm
@@ -709,7 +759,7 @@ suite-bins: $(B)/test_wgrad_grid
 $(B):
 	mkdir -p $(B)
 
-suite-bins: $(B)/test_gpu_aug $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover $(B)/test_ct_augment $(B)/test_scan_augment $(B)/test_side $(B)/test_votes $(B)/test_wind $(B)/test_phase_check $(B)/test_fuse $(B)/test_raster $(B)/test_http_reader $(B)/test_wide_up_grad $(B)/test_wgrad_staging $(B)/test_stem_precision $(B)/test_gn_contract $(B)/test_sampler_safety $(B)/test_optimizer_owners $(B)/test_infer_buffers $(B)/test_recompute_live $(B)/test_share_enc_a1 $(B)/test_checkpoint_runtime $(B)/make_pipeline_fixture $(B)/test_checkpoint $(B)/test_eval $(B)/test_sample_ops $(B)/test_json $(B)/test_nn $(B)/test_unet $(B)/test_fused $(B)/test_formats $(B)/ufsm $(B)/test_mx $(B)/test_mx4 $(B)/test_grad_mx4 $(B)/test_rc $(B)/test_split $(B)/test_muon $(B)/test_muonc $(B)/test_gn_frozen $(B)/test_infer_mem $(B)/test_half $(B)/test_unwrap_targets $(B)/test_fit $(B)/test_surf $(B)/test_tiffw $(B)/test_edt $(B)/test_volcomp $(B)/test_volcomp_fast $(B)/test_gpudec $(B)/test_typed_zarr $(B)/test_aug_preset $(B)/test_l0_norm $(B)/test_l0_slab $(B)/test_wind_sampler $(B)/test_crush $(B)/test_vwt_aug $(B)/test_zcache $(B)/test_scrollaug $(B)/test_zwin $(B)/test_l0_stream $(B)/test_phasepack
+suite-bins: $(B)/test_latvol_nolink $(B)/test_gpu_aug $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover $(B)/test_ct_augment $(B)/test_scan_augment $(B)/test_side $(B)/test_votes $(B)/test_wind $(B)/test_phase_check $(B)/test_fuse $(B)/test_raster $(B)/test_http_reader $(B)/test_wide_up_grad $(B)/test_wgrad_staging $(B)/test_stem_precision $(B)/test_gn_contract $(B)/test_sampler_safety $(B)/test_optimizer_owners $(B)/test_infer_buffers $(B)/test_recompute_live $(B)/test_share_enc_a1 $(B)/test_checkpoint_runtime $(B)/make_pipeline_fixture $(B)/test_checkpoint $(B)/test_eval $(B)/test_sample_ops $(B)/test_json $(B)/test_nn $(B)/test_unet $(B)/test_fused $(B)/test_formats $(B)/ufsm $(B)/test_mx $(B)/test_mx4 $(B)/test_grad_mx4 $(B)/test_rc $(B)/test_split $(B)/test_muon $(B)/test_muonc $(B)/test_gn_frozen $(B)/test_infer_mem $(B)/test_half $(B)/test_unwrap_targets $(B)/test_fit $(B)/test_surf $(B)/test_tiffw $(B)/test_edt $(B)/test_volcomp $(B)/test_volcomp_fast $(B)/test_gpudec $(B)/test_typed_zarr $(B)/test_aug_preset $(B)/test_l0_norm $(B)/test_l0_slab $(B)/test_wind_sampler $(B)/test_crush $(B)/test_vwt_aug $(B)/test_zcache $(B)/test_scrollaug $(B)/test_zwin $(B)/test_l0_stream $(B)/test_phasepack
 
 clean:
 	rm -rf build build-verify build86 build86-verify build86p build86p-verify
@@ -738,7 +788,7 @@ suite-bins: $(B)/test_sweep
 $(B)/test_restore_task: tests/test_restore_task.c $(OBJ) $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 suite-bins: $(B)/test_restore_task
-suite-bins: $(B)/test_gpu_input $(B)/test_lat $(B)/test_lat_fuse
+suite-bins: $(B)/test_gpu_input $(B)/test_lat $(B)/test_lat_fuse $(B)/test_latvol
 suite-bins: $(B)/test_pack_tm
 suite-bins: $(B)/test_wind4
 suite-bins: $(B)/test_fibn
