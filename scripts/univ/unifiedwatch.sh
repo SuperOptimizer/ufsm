@@ -13,6 +13,10 @@ set -u
 H=${H:-$(cd "$(dirname "$0")/../.." && pwd)}; WB=/vesuvius/ufsm/wbench; RUN=${RUN:-unified}; SN=${SN:-/vesuvius/ufsm/v2/lat/runs/$RUN/snap}
 B=${B:-/vesuvius/ufsm/v2/lat/latres/bin/ufsm.unified1}; E=${E:-$WB/univ/unified}; GPU=${GPU:-0}; WEVERY=${WEVERY:-5000}
 TEACH=${TEACH:-$WB/univ/pod/ink3dext/vscores.tsv}; LG=$E/watch-$RUN.log; mkdir -p $E
+# the unroll's GPU 0 jobs go first (lead 2026-11-12): univI's Paris 4 face renders (until sched/p4rv.done) and anything of the unroll
+# schedule on GPU 0 (rvside / p1299 / unrollperf); checked after taking the lock, before each snapshot or reference
+US=${US:-/vesuvius/ufsm/unroll/sched}
+gpu0free() { until [ -e $US/p4rv.done ] && ! pgrep -f "$US/(rvside|p4rv|p1299|unrollperf)|unrollperf" > /dev/null; do sleep 60; done; }
 log() { echo "$(date '+%m-%d %H:%M:%S') $*" | tee -a $LG; }
 perscroll() {   # perscroll VSCORES LABEL: per-scroll mean AUC / best F1 (crop names: w.. = Paris 4, else SCROLL_w..)
   awk -F'\t' -v L="$2" '{ s = ($1 ~ /^w[0-9]/) ? "PHercParis4" : substr($1, 1, index($1, "_w") - 1); c[s]++; A[s] += $6; F[s] += $8 }
@@ -42,10 +46,10 @@ wcore() {   # wcore CKPT TAG STEP: wbench core p05x rows every WEVERY steps (STE
     log "$t: wbench rows $(($(wc -l < $WB/res/$t.tsv) - 1))"; fi
 }
 S=${1:-1000}; STEP=${STEP:-1000}
-for kv in ${BASECK:-}; do exec 9> $E/gpu0.lock; flock 9; wcore ${kv%%=*} ${kv#*=} 0; flock -u 9; done
+for kv in ${BASECK:-}; do exec 9> $E/gpu0.lock; flock 9; gpu0free; wcore ${kv%%=*} ${kv#*=} 0; flock -u 9; done
 while [ ! -e $E/watch.stop ]; do
   # the first snapshot at or after S (a run that starts its count elsewhere, e.g. from its init's step, is picked up too)
   until n=$(ls $SN 2>/dev/null | sed -n 's/^\([0-9]*\)\.ckpt$/\1/p' | awk -v s=$S '$1 >= s' | sort -n | head -1); [ -n "$n" ]; do [ -e $E/watch.stop ] && exit 0; sleep 60; done
   S=$n; sleep 60
-  exec 9> $E/gpu0.lock; flock 9; score $S; flock -u 9; S=$((S + STEP))
+  exec 9> $E/gpu0.lock; flock 9; gpu0free; score $S; flock -u 9; S=$((S + STEP))
 done
