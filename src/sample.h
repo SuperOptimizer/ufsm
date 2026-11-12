@@ -31,6 +31,7 @@ typedef struct {
                                 A source's "holdout_mode" overrides it */
     int ink_mil, mil_mode, mil_stride, mil_max; float mil_R;   /* --ink-mil: each window's normal-pooled MIL rays (inksplat.h inkfly_rays of the source's onfly ink target:
                                 mode, stride, reach R in window voxels; at most mil_max, evenly subsampled) into batch.mil / nmil, on the source grid (train maps them through the symmetry) */
+    int strict_sources;      /* train --strict-sources 1: a weighted source with no eligible level ("excluded: no ... patch fits") stops sampler_start (fatal) */
     int holdout_guard;       /* the mask's margin around each held-out box, in voxels of the window's level (default 16) */
     int dilate;              /* > 0: dilate the surface band of pyramid targets by this many level-0 voxels (curriculum for thin targets) */
     int erode;               /* 0 or 1: native-grid face-neighbour erosion of binary targets before softening */

@@ -3853,6 +3853,11 @@ sampler *sampler_start(sources *S, const sample_cfg *cfg) {
         for (int l = s->min_level < 0 ? 0 : s->min_level; l < MAXLEV; l++) if (level_on(sp, s, i, l, region_ch) && (region_ch < 0 || l <= 1) && level_ok(sp, s, i, l, region_ch)) eligible = 1;
         if (eligible && s->weight > 0 && label_res_check(sp, s, i, region_ch)) { free(sp->cum); free(sp->lvl_ok); free(sp); return nullptr; }
         if (!isfinite(s->weight) || s->weight < 0) { fprintf(stderr, "sampler: invalid source weight: %s\n", s->name); free(sp->cum); free(sp->lvl_ok); free(sp); return nullptr; }
+        if (!eligible && s->weight > 0 && cfg->strict_sources && !cfg->holdout) {
+            fprintf(stderr, "sampler: %s excluded: no training patch fits %dx%dx%d and the enabled levels: fatal (--strict-sources 1; check its CT levels with `ufsm info`, min/max_level, the rungs, the holdout boxes)\n",
+                    s->name, PZ(cfg), cfg->P, cfg->P);
+            free(sp->cum); free(sp->lvl_ok); free(sp); return nullptr;
+        }
         if (!eligible && s->weight > 0) fprintf(stderr, "sampler: %s excluded: no %s patch fits %dx%dx%d and the enabled levels\n", s->name, cfg->holdout ? "validation" : "training", PZ(cfg), cfg->P, cfg->P);
         acc += eligible ? s->weight : 0; sp->cum[i] = acc;
     }
