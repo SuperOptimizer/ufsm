@@ -38,9 +38,30 @@
 #include "dino.h"
 
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
+/* every option name opt() was asked for: train_unread_flags() warns about command-line --flags none of them matched (2026-11-12: train
+   silently ignored a mistyped "--sampler-only 200", the env UFSM_SAMPLER_ONLY being the real switch, and trained on a GPU for an hour) */
+static const char *g_optseen[512]; static int g_noptseen;
+static void opt_note(const char *name) {
+    for (int k = 0; k < g_noptseen; k++) if (!strcmp(g_optseen[k], name)) return;
+    if (g_noptseen < 512) g_optseen[g_noptseen++] = name;
+}
 static const char *opt(int argc, char **argv, const char *name, const char *dflt) {
+    opt_note(name);
     for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], name)) return argv[i + 1];
     return dflt;
+}
+/* the --flags of argv that no opt() call has asked for so far (a value following a flag is skipped). Called once setup is done (the
+   options read only later in the loop are few; the warning names them, it does not stop the run) */
+static int train_unread_flags(int argc, char **argv) {
+    int n = 0;
+    for (int i = 2; i < argc; i++) {
+        if (strncmp(argv[i], "--", 2) || !argv[i][2]) continue;
+        int seen = !strcmp(argv[i], "--fp32");   /* (read by scanning argv) */
+        for (int k = 0; k < g_noptseen && !seen; k++) seen = !strcmp(g_optseen[k], argv[i]);
+        if (!seen) { fprintf(stderr, "train: WARNING: option %s is not one train reads (a typo, or an env-var switch such as UFSM_SAMPLER_ONLY?)\n", argv[i]); n++; }
+        else if (i + 1 < argc && strcmp(argv[i], "--fp32")) i++;
+    }
+    return n;
 }
 static double optd(int argc, char **argv, const char *name, double dflt) { const char *v = opt(argc, argv, name, nullptr); return v ? atof(v) : dflt; }
 static const char *g_aug_name = "none";   /* train --aug preset */
@@ -2852,6 +2873,7 @@ int cmd_train(int argc, char **argv) {
            skip (slot_skip) as a B 1 unwrap2 run would (UFSM_TM_KEEP=1 keeps them) */
         const char *so = getenv("UFSM_SAMPLER_ONLY");
         if (so && atoi(so) > 0) {
+            train_unread_flags(argc, argv);
             setenv("UFSM_SAMPLER_NOPIN", "1", 1); gpu_input_settle(&sc, 1);
             sc.slot_skip = g_unwrap2 && B == 1 && !g_ds && !ufsm_env_on("UFSM_TM_KEEP") ? 1 | (!pm_used() ? 2 : 0) : 0;
             sc.ink_bits = g_rv && (!getenv("UFSM_INK_BITS") || ufsm_env_on("UFSM_INK_BITS"));
@@ -3800,6 +3822,7 @@ int cmd_train(int argc, char **argv) {
     double acc_emb = 0, acc_embc = 0, acc_ds = 0, acc_vbce = 0, acc_vdice = 0, acc_side = 0, acc_ink = 0, acc_norm = 0, acc_cond = 0, acc_ck = 0, acc_cr = 0, acc_pap = 0, acc_cnt = 0, acc_cnr = 0, acc_cbin[18] = {0}, acc_w4 = 0, acc_w4w = 0, acc_w4a = 0, acc_pg = 0, acc_rv = 0;   /* (acc_pg: --pgrad-lambda loss; acc_cnt / acc_cnr: --count-lambda loss, Tp / Tg) verso channel, side channel; --cond (loss, known / right counts); --pap-head */
     double acc_fh[2] = {0}, acc_fhn = 0;   /* --fib-head: mask / direction bce sums, windows with known fibre labels */
     double acc_inkn = 0, vik[2] = {0}, acc_mil = 0, acc_miln = 0, acc_milr = 0;   /* --ink-mil: raw mean BCE sum / windows with rays / rays */   /* --ink-head: training windows with known ink in the log interval; validation ink bce sum / windows */
+    train_unread_flags(argc, argv);
     for (int step = step0 + 1; step <= steps && !g_stop; step++) {
         if (trunk_lr != 1.f && trunk_lr_steps > 0 && step == (step0 + 1 > trunk_lr_steps + 1 ? step0 + 1 : trunk_lr_steps + 1)) {   /* --trunk-lr-steps: the trunk back to the full rates */
             for (int g = 0; g < ng; g++) unet_set_trunk_lr(G[g].u, 1.f);
