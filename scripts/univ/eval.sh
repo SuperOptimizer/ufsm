@@ -59,7 +59,7 @@ if has fib && [ "${FIB:-1}" = 1 ] && [ -n "$FIBCH" ]; then   # FIBCH e.g. "H=0 V
     { python3 -I $H/scripts/univ/fiblen.py $o/$f-$m.fib; nice -n 10 $U fiber-judge $o/$f-$m.fib --phase ${FIBPH:-/vesuvius/ufsm/gt/paris4-wind-20261019} phaseA/9.6 $J 2>&1 | grep "$f:"; } > $o/$f-$m.judge
   done; done
 fi
-if has ink && [ "${INK:-1}" = 1 ] && [ -n "$INKP" ]; then   # INKP = ink3dext | ch:N (channel N of CKPT, ink at 2.4 um level LV_INK (default 1 = 4.8 um))
+if has ink && [ "${INK:-1}" = 1 ] && [ -n "$INKP" ]; then   # INKP = ink3dext | heads (predict --heads ink: latent nets) | ch:N (channel N of CKPT, ink at 2.4 um level LV_INK (default 1 = 4.8 um))
   # crop sets: the 16 Paris 4 crops ($WB/inkeval/crops) + INKC (inkB's held-out 0139 / 1667 crops; crops.tsv cols 6-7 = scroll, CT key; um in crop.json).
   # INKGT: 3-D ink-splat references <crop>.zarr (inkB, ink-splat --face): each crop is also scored voxelwise (ink-vscore -> vscores.tsv).
   o=$E/$T/ink; mkdir -p $o; [ -s $o/scores.tsv ] || : > $o/scores.tsv; [ -s $o/vscores.tsv ] || : > $o/vscores.tsv
@@ -71,6 +71,10 @@ if has ink && [ "${INK:-1}" = 1 ] && [ -n "$INKP" ]; then   # INKP = ink3dext | 
     v=$o/vol_${scr:-PHercParis4}
     if [ "$INKP" = ink3dext ]; then lvi=1; key=$(python3 -I -c "print(round($um * 2, 3))")
       lk $U ink3d-ext --model dino3d --weights ${INKW:-/vesuvius/ufsm/teachers/dino3d/ckpt_78k_fullsup.pth} --ct $M $ctk/0 --ct-um $um --box $box --surface $C/$cr --out $v --out-um 4.8 --gpu $GPU --cache $WB/cache > $o/ink_$cr.log 2>&1 || { log "ink: $cr predict failed"; continue; }
+    elif [ "$INKP" = heads ]; then lvi=${LV_INK:-1}; key=$(python3 -I -c "print(round($um * 2 ** $lvi, 3))")   # predict --heads ink: the latent-grid
+      # multi-head path (fine stem rows + sub-cell placement as trained; the ink channel from the header), written to $v.h/ink, read through $v
+      [ -e $v ] || ln -sfn $(basename $v).h/ink $v
+      lk ${UP:-$U} predict $CK $M $ctk $v.h --um $um --level $lvi --box $box --heads ink --gpu $GPU --threads 6 --cache $WB/cache > $o/ink_$cr.log 2>&1 || { log "ink: $cr predict failed"; continue; }
     else lvi=${LV_INK:-1}; ch=${INKP#ch:}; key=$(python3 -I -c "print(round($um * 2 ** $lvi, 3))")
       lk ${UP:-$U} predict $CK $M $ctk $v --um $um --level $lvi --box $box --channel $ch --gpu $GPU --threads 6 --cache $WB/cache > $o/ink_$cr.log 2>&1 || { log "ink: $cr predict failed"; continue; }; fi
     if [ $vs = 1 ]; then gk=$(ls $g | grep -vE '^(segments|zarr.json)$' | head -1)
