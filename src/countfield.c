@@ -560,10 +560,10 @@ int cmd_count_field(int argc, char **argv) {
     /* --chunk-rows N: the chunk height fixed (a multiple of the pool; the strided model pass and the prior's chunk depend on it, so a
        pass 1 run apart from the solve (--pool-only, --follow) and the solve run pass the same N; default: from --mem-gb as above) */
     if (atoi(cf_opt(argc, argv, "--chunk-rows", "0")) > 0) { CZ = atoi(cf_opt(argc, argv, "--chunk-rows", "0")) / P * P; if (CZ < P) CZ = P; if (CZ > D) CZ = (D + P - 1) / P * P; }
-    if (pref < 0) {   /* --prefetch default: two chunks of ~11 planes in half of MemAvailable */
-        unsigned long long kb = 0; char ln[256]; FILE *mf = fopen("/proc/meminfo", "r");
-        if (mf) { while (fgets(ln, sizeof ln, mf)) if (sscanf(ln, "MemAvailable: %llu kB", &kb) == 1) break; fclose(mf); }
-        pref = 2 * 11.0 * CZ * HW < 0.5 * kb * 1024.0;
+    if (pref < 0) {   /* --prefetch default: two chunks of ~11 planes in half of what this process may still allocate (cgroup aware: the
+                         host's MemAvailable let a 1667 ref inside a 40 GB memcap scope prefetch two 19.5 GB chunks and be OOM-killed, 11-12) */
+        const double av = (double)ufsm_mem_available();
+        pref = 2 * 11.0 * CZ * HW < 0.5 * av;
     }
     int nl = 1; while (nl < 6) { const int q = P << nl; if ((D + q - 1) / q < 8 || (H + q - 1) / q < 8 || (W + q - 1) / q < 8) break; nl++; }
     cf_lvl *lv = calloc(nl, sizeof *lv); float **Sl = calloc(nl, sizeof *Sl), *(*Gl)[3] = calloc(nl, sizeof *Gl);
