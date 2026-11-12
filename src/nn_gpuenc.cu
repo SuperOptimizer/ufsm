@@ -171,18 +171,24 @@ __global__ static void vcg_scan_k(const uint32_t *__restrict__ cnt, long nb, uin
     for (long i = a; i < b; i++) { off[i] = (uint32_t)run; run += cnt[i]; }
     if (t == 1023) *tot = s[1023];
 }
+/* the levels of a block staged in shared memory, then written as one contiguous run (lv / pos may be pinned host memory: the writes cross
+   the bus in whole lines; scattered ones took 4x longer at q 2) */
 __global__ static void vcg_list_k(const uint8_t *__restrict__ src, int n, const float *__restrict__ rstep, const uint16_t *__restrict__ scan, int fma,
-                                  const uint32_t *__restrict__ off, const unsigned long long *__restrict__ tot, unsigned long long cap, int32_t *lv, uint16_t *pos) {
-    __shared__ float blk[4096]; __shared__ int smm[2]; __shared__ int ss[256];
+                                  const uint32_t *__restrict__ off, const uint32_t *__restrict__ cnt, const unsigned long long *__restrict__ tot, unsigned long long cap, int32_t *lv, uint16_t *pos) {
+    __shared__ float blk[4096]; __shared__ int smm[2]; __shared__ int ss[256]; __shared__ int32_t sl[4096]; __shared__ uint16_t sp[4096];
     if (*tot > cap) return;   /* (the host encodes this shard from its bytes) */
     const long g = blockIdx.x; const int t = threadIdx.x;
+    if (!cnt[g]) return;   /* (constant blocks, and blocks with a DC only) */
     if (vcg_block(src, n, g, blk, smm) >= 0) return;
     int q[16], c = 0;   /* scan positions 16 t .. 16 t + 15 */
     for (int j = 0; j < 16; j++) { const int p = t * 16 + j, nat = scan[p]; q[j] = nat ? vcg_q(blk[nat], rstep[nat], fma) : 0; c += q[j] != 0; }
     ss[t] = c; __syncthreads();
     for (int d = 1; d < 256; d <<= 1) { const int v = t >= d ? ss[t - d] : 0; __syncthreads(); ss[t] += v; __syncthreads(); }
-    size_t o = off[g] + (size_t)(ss[t] - c);
-    for (int j = 0; j < 16; j++) if (q[j]) { lv[o] = q[j]; pos[o] = (uint16_t)(t * 16 + j); o++; }
+    int o = ss[t] - c;
+    for (int j = 0; j < 16; j++) if (q[j]) { sl[o] = q[j]; sp[o] = (uint16_t)(t * 16 + j); o++; }
+    __syncthreads();
+    const int m = ss[255]; const size_t b = off[g];
+    for (int i = t; i < m; i += 256) { lv[b + i] = sl[i]; pos[b + i] = sp[i]; }
 }
 extern "C" int nn_vcg_shard(const uint8_t *dsh, int n, const float *drstep, const uint16_t *dscan, int fma, uint8_t *hdr, int32_t *lv, uint16_t *pos, size_t cap_e) {
     if (n % 128) return -1;
@@ -191,6 +197,6 @@ extern "C" int nn_vcg_shard(const uint8_t *dsh, int n, const float *drstep, cons
     int16_t *cv = (int16_t *)(hdr + L.o_cv); unsigned long long *tot = (unsigned long long *)hdr;
     vcg_count_k<<<(unsigned)L.nb, 256>>>(dsh, n, drstep, fma, dc, cnt, cv);
     vcg_scan_k<<<1, 1024>>>(cnt, L.nb, off, tot);
-    vcg_list_k<<<(unsigned)L.nb, 256>>>(dsh, n, drstep, dscan, fma, off, tot, cap_e, lv, pos);
+    vcg_list_k<<<(unsigned)L.nb, 256>>>(dsh, n, drstep, dscan, fma, off, cnt, tot, cap_e, lv, pos);
     return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }
