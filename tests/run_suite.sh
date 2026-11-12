@@ -112,7 +112,9 @@ run_one() {
         done
         [ ${#got[@]} -ge $want ] && break
       done
-      [ ${#got[@]} -lt $want ] && sleep 0.3
+      # all or nothing: a gpu2 test that holds one slot while it polls for the second deadlocks once every slot is held that way (4 gpu2
+      # tests on 2 GPUs x 2 slots stalled the 2026-11-11 suite for 80 min), so a partial set is released before the retry
+      if [ ${#got[@]} -lt $want ]; then for fd in "${fds[@]}"; do exec {fd}>&-; done; got=(); fds=(); sleep 0.$((RANDOM % 5 + 2)); fi
     done
     g=$(IFS=,; echo "${got[*]}")
   fi

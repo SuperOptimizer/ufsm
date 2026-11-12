@@ -4,6 +4,10 @@
 # 2026-11-11 is byte-identical to the GT seed.jsonl), the segments removed once seeded (the seed keeps its own mesh copies + q.tif), codes
 # at level 1 (raster --level 1, ~43 GB), then the phase in PARTS of the box list. At most two finished parts wait on the disk: the desk
 # pulls each part (b1_pull_p4A.sh, rsync --remove-source-files) and touches $O.part-N.pulled here.
+# Retired 2026-11-11: pod 2 was terminated with 280 of 339 boxes done (ledger scripts/univ/p4A48.boxes.ok, all their shards on the
+# desk), and the user decided the sampler computes the winding phase on the fly from the codes (univA), so stored 4.8 um phase sets are
+# no longer built; the 59 missing boxes are not planned. A new pod needs only the codes: the steps here up to the codes raster (June
+# segments, seed, `raster --level 1`, ~43 GB). Resuming would still work: cp the ledger to $K/gt/paris4/phaseA48.boxes.ok and rerun.
 # Env: K (/workspace/b1), U (a binary with nn_band.o: master >= labelfast), NP (parts, default 8), T (threads).
 set -uo pipefail; SH=${1:?shard list}; K=${K:-/workspace/b1}; U=${U:-/workspace/ufsm-master/build/ufsm}; NP=${NP:-8}; T=${T:-12}
 D=$(dirname "$(readlink -f "$0")"); SEG=$K/seg/PHercParis4; G=$K/gt/paris4; AX=$K/axis-0.json; SHP=75784,32693,32693; UM=2.4; mkdir -p $G
