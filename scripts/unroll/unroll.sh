@@ -162,9 +162,45 @@ fpred() {   # fpred GPU BOX OUT
     --grid-origin 0,0,0 --ema 1 --q 8 --threads ${PTH:-14} --gpu $1 --axis $O/axis.json --levels 1 --fit-zarr $3 --fit-h 2 --fit-q 8 --fit-q-phase 4 --no-out 1 $(occlv) &&
     { [ "$DRY" = 1 ] || { rm -rf $3.tmp; [ -e $3/fields.json ]; }; }
 }
+# --- the ref's pass 1 streamed behind the fields predict (REFSTREAM; 6a, 11-12) ---
+# Each z part's predict appends "z0 z1" (part cells) to <part>/rows.done per flushed field slab. refstream links the finished shard rows
+# of every part into one view (OUT: zarr.json shapes and fields.json of the whole box, the parts' c/<z> rows linked at their box offsets,
+# the box rows in OUT/rows.ready) and runs count-field --pool-only --follow on it: the chunks in the parts' order, each once its rows are
+# written. The pooled sums equal a whole-box pass 1 (per chunk, disjoint solve rows; the prior from the middle row's chunk; the chunk
+# rows fixed by refcz in both runs), so the ref (--pool-cache) is byte-identical to the stage-barrier ref with those chunk rows.
+refstream_on() { [ "${REFSTREAM:-1}" = 1 ] && [ "$FKIND" = lat ] && [ "${RECTOSP:-1}" = 0 ] && [ "${CTCAL:-0}" != 1 ] && [ -z "${REFCMD:-}" ] && [ "$DRY" != 1 ]; }
+refstream() {   # refstream OUT PART..
+  local S=$1; shift; local parts=("$@") k p pl z a b n=0 starts=() fs cz cfp=
+  rm -rf $S $S.fin $O/ref.pool $O/ref.pool.ok; mkdir -p $S
+  for p in "${parts[@]}"; do while [ ! -s $p/fields.partial.json ] || [ ! -e $p/pc/zarr.json ]; do [ -e $S.fin ] && return 1; sleep 2; done; done
+  for p in "${parts[@]}"; do starts+=($n); n=$(( n + $(jq -r '.shape[0]' $p/fields.partial.json) )); done
+  fs=$(jq -r '.chunk_grid.configuration.chunk_shape[0]' ${parts[0]}/pc/zarr.json)
+  for k in $(seq 1 $((${#parts[@]} - 1))); do [ $(( ${starts[$k]} % fs )) = 0 ] || { log "refstream: part $k starts at cell ${starts[$k]}, not a multiple of the shard $fs"; return 1; }; done
+  for pl in $(ls ${parts[0]}); do [ -e ${parts[0]}/$pl/zarr.json ] || continue; mkdir -p $S/$pl/c; jq -c --argjson n $n '.shape[0] = $n' ${parts[0]}/$pl/zarr.json > $S/$pl/zarr.json; done
+  # fields.json: the first part's, shape and axis over all parts (fields_cat.sh's rule: part k's rows 0 .. Zk h - 1, the last part's all)
+  local h=$(jq -r .h ${parts[0]}/fields.partial.json) j=$(jq -c . ${parts[0]}/fields.partial.json)
+  for k in $(seq 1 $((${#parts[@]} - 1))); do j=$(echo "$j" | jq -c --argjson k $(( ${starts[$k]} * h )) --slurpfile b ${parts[$k]}/fields.partial.json '.axis = (.axis[0:$k] + $b[0].axis)'); done
+  echo "$j" | jq -c --argjson n $n '.shape[0] = $n' > $S/fields.json; : > $S/rows.ready
+  cz=$(refcz $S/fields.json)
+  ( nice -n 10 $U count-field $S $O/cf.unused $(refpool) --pool-cache $O/ref.pool --pool-only 1 --model $O/ref.pool.unused --chunk-rows $cz --follow $S/rows.ready \
+      --follow-split ${starts[1]:-0} --threads ${REFSTH:-6} --read-threads ${REFSTH:-6} --mem-gb ${CFMEM:-24} >> $O/logs/refstream.log 2>&1 && echo $cz > $O/ref.pool.ok ) & cfp=$!
+  local seen=() fin=0; for k in "${!parts[@]}"; do seen+=(0); done
+  while :; do
+    [ -e $S.fin ] && fin=1
+    for k in "${!parts[@]}"; do p=${parts[$k]}; local L; L=$(wc -l < $p/rows.done 2> /dev/null || echo 0)
+      while [ ${seen[$k]} -lt $L ]; do seen[$k]=$(( ${seen[$k]} + 1 )); read -r a b < <(sed -n "${seen[$k]}p" $p/rows.done)
+        for z in $(seq $((a / fs)) $(( (b - 1) / fs ))); do for pl in $(ls $S); do [ -d $p/$pl/c/$z ] && ln -sfn $p/$pl/c/$z $S/$pl/c/$(( z + ${starts[$k]} / fs )); done; done
+        echo "$(( a + ${starts[$k]} )) $(( b + ${starts[$k]} ))" >> $S/rows.ready; done; done
+    [ $fin = 1 ] && break; sleep 5
+  done
+  # (the predicts are done: every row is linked; the follower finishes its last chunks, or fails: no ref.pool.ok, the ref pools itself)
+  if ! wait $cfp; then rm -f $O/ref.pool $O/ref.pool.ok; return 1; fi
+  log "refstream: pass 1 pooled behind the predicts (chunk rows $cz): $(grep -E 'pass 1' $O/logs/refstream.log | tail -n 1)"
+}
 fields() {
   local box; box=$([ "$DRY" = 1 ] && echo ${BOX:-BOX} || cat $O/box.txt); local g=($FIELDGPUS) n=${#g[@]}
-  [ "$DRY" = 1 ] || { rm -rf $F; mkdir -p $O/fields; }
+  [ "$DRY" = 1 ] || { rm -rf $F; mkdir -p $O/fields; rm -f $O/ref.pool $O/ref.pool.ok; }
+  [ "$DRY" = 1 ] && [ "${REFSTREAM:-1}" = 1 ] && [ "$FKIND" = lat ] && [ "${RECTOSP:-1}" = 0 ] && echo "    (REFSTREAM: the ref's pass 1 behind the predicts: count-field --pool-only --follow on the parts' finished rows -> ref.pool)"
   local z0 dz y0 x0 dy dx k a b pids=() parts=(); IFS=, read -r z0 y0 x0 dz dy dx <<< "$box"
   [ $(( (dz / n) / 1024 )) -lt 1 ] && n=1   # (parts of >= 1024 voxels each)
   if [ $n = 1 ]; then fpred ${g[0]} $box $F; return; fi
@@ -174,7 +210,11 @@ fields() {
     parts+=($F.p$k); [ "$DRY" = 1 ] || rm -rf $F.p$k $F.p$k.tmp
     fpred ${g[$k]} $a,$y0,$x0,$((b - a)),$dy,$dx $F.p$k & pids+=($!)
   done
-  local rc=0; for p in "${pids[@]}"; do wait $p || rc=1; done; [ $rc = 0 ] || return 1
+  # REFSTREAM (default 1 for latent fields without rectosp / ctcal / REFCMD): the ref's pass 1 (pooling) runs behind the predicts
+  local sp=; if refstream_on; then refstream $F.stream "${parts[@]}" & sp=$!; fi
+  local rc=0; for p in "${pids[@]}"; do wait $p || rc=1; done
+  [ -n "$sp" ] && { touch $F.stream.fin; wait $sp || log "fields: the streamed ref pass 1 failed (the ref runs it itself)"; rm -rf $F.stream $F.stream.fin; }
+  [ $rc = 0 ] || return 1
   local acc=${parts[0]} j; for j in $(seq 1 $((n - 1))); do
     if [ "$DRY" = 1 ]; then echo "    fields_cat.sh $F.c$j $acc ${parts[$j]}"; acc=$F.c$j; continue; fi
     bash $H/fields_cat.sh $F.c$j $acc ${parts[$j]} >> $O/logs/fields.log 2>&1 || return 1; acc=$F.c$j; done
@@ -198,12 +238,19 @@ ctcal() {
 # 0.5 mm pairs all 6 up (mean .679 -> .695), 4 mm pairs mean .286 -> .293, GT
 # intervals off .099 -> .083; 1667 all 5 slabs up (ids +.06..+.13, 4 mm pairs +.06..+.08); 0139 flat; 0846A wraps / CT peaks per turn same.
 # REFPH="--phase-w 4" = the old ref.
+# refpool: the ref's pass-1 (pooling) flags; refcz FIELDSJSON: the chunk rows count-field picks from --mem-gb CFMEM when memory is not
+# short (12 B per cell of a cross-section, a multiple of the pool 8, then of 128): the streamed pass 1 and the solve run pass it explicitly
+refpool() { echo "--R 0 --pool 8 ${REFPH---phase-w 0.5 --wide 100,140 --wide-phase 15} --model-only 1 --model-stride ${MSTRIDE:-4} ${REFX:-}"; }
+refcz() { jq -r --argjson m ${CFMEM:-24} '(.shape[1] * .shape[2]) as $hw | (($m * 1e9 / (12 * $hw)) | floor) as $c | (($c / 8 | floor) * 8) as $c8 |
+                                         (if $c8 >= 128 then ($c8 / 128 | floor) * 128 else $c8 end) as $cz | if $cz < 8 then 8 else $cz end' $1; }
 ref() {
   [ "$DRY" = 1 ] || rm -rf $REF
   local cal=; [ "${CTCAL:-0}" = 1 ] && cal="--ct-cal $O/ct.cal"
+  # the pass-1 sums streamed behind the fields predict (fields(): REFSTREAM): the same sums, so only the solve and model pass run here
+  local pc=; [ "$DRY" != 1 ] && [ -e $O/ref.pool.ok ] && pc="--pool-cache $O/ref.pool --chunk-rows $(cat $O/ref.pool.ok)"
   if [ -n "${REFCMD:-}" ]; then X $O/logs/ref.log $REFCMD $F $REF $cal; else
-  X $O/logs/ref.log $U count-field $F $O/cf.unused --R 0 --pool 8 ${REFPH---phase-w 0.5 --wide 100,140 --wide-phase 15} --iters 1200 --model $REF --model-only 1 --model-stride ${MSTRIDE:-4} \
-    --threads $TH --mem-gb ${CFMEM:-24} $cal ${REFX:-}; fi && { [ "$DRY" = 1 ] || [ -e $REF/model.json ]; }
+  X $O/logs/ref.log $U count-field $F $O/cf.unused $(refpool) --iters 1200 --model $REF \
+    --threads $TH --mem-gb ${CFMEM:-24} $cal $pc; fi && { [ "$DRY" = 1 ] || [ -e $REF/model.json ]; }
 }
 
 # --- rectosp: m7 recto spacing into the count target (see the header); the source: RECTOSRC, else the mirror's
