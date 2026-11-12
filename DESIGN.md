@@ -6,6 +6,37 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Gradient accumulation: --accum K (2026-11-12, branch accum-20261112)
+
+The user wants a bigger batch ("increase batch size to fill ram"), but B > 1 isn't available for the latent recipe. Several parts
+require B == 1:
+- the unwrap tasks;
+- FiLM, which takes one voxel-size code per forward;
+- the fine stem;
+- head_slab_pass and the label stream;
+- the MIL rays.
+
+So the batch is accumulated instead. `--accum K` runs K windows per optimizer update. Every step is still one window: its forward and
+backward, loss, log and mix lines, and the lr schedule. So --warmup and --steps count windows, and warmup counts samples. Each
+window's fp32 parameter gradient (after the multi-GPU mean) is added into a params-sized buffer. At steps that are multiples of K:
+- the gradient becomes the mean of the accumulated windows, and gn is the mean's norm;
+- then clip, Muon / AdamW at optimizer step ceil(step / K) (Adam's bias correction), EMA.
+A non-finite window is left out of the mean. The step line adds "(update N: K windows each)". Keep --ckpt-every / SNAP at multiples of
+K: a checkpoint written between updates drops the partial sum. The uncertainty weights (--uw) still step per window.
+
+Memory: one params-sized fp32 buffer per GPU. Step time: ~K x per update. On one GPU this gives the larger batch, not throughput.
+
+**Replicas instead** (`--gpus 0,0,..`): every replica's kernels run on the legacy stream 0, so they serialise, and nn's per-device
+scratch would be shared between the replica threads. They are not used.
+
+**test_accum:**
+- --accum 2 --steps 1 makes no update: 0 of 313804 weights differ from an lr-0 run.
+- --accum 3 --steps 6 with UFSM_ACCUM_DUMP: each update's gradient equals the mean of its 3 windows' gradients (max rel err 5.1e-8 /
+  3.5e-8, fp32).
+- --accum 4 logs its update lines.
+
+U2-pod: K 4, lr unchanged, Muon as is.
+
 ## The sub-cell head over more than 16 task outputs (2026-11-12, branch subcell-20261112)
 
 `--lat-guide 3`, the sub-cell head, used to have exactly 144 outputs: 16 interpolated base outputs plus 128 sub-cell terms (the
