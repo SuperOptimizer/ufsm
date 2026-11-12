@@ -9,7 +9,7 @@
 #   3. labels (inkgt/segs-SCROLL.json): scripts/inkgt/wrapscore.py on those renders -> sched/inkscore-u1-TAG.tsv (inkscore.sh columns)
 #   4. strip-mosaic: stripe JPEGs + overview for viewing -> SCROLL-u1/inkr/TAG/img (the contrast stretch from these renders; renders kept)
 # GPU 0 only: steps 1-2 wait for flock /tmp/gpu0-bench.lock (the desk's GPU-0 queue), so they run behind other GPU-0 jobs.
-# Resumable: the predict resumes, rendered stripes are kept, the score reruns. Env: SCROLL, U (ufsm), LV (2), MEMR (render memcap, 48G), TH (12).
+# Resumable: a finished predict (ink.done) is kept (predict --heads takes no --resume), rendered stripes are kept, the score reruns. Env: SCROLL, U (ufsm), LV (2), MEMR (render memcap, 48G), TH (12).
 set -u
 CK=$(readlink -f "${1:?ckpt}"); TAG=${2:?tag}; SCROLL=${SCROLL:-PHerc1667}
 case $SCROLL in
@@ -52,7 +52,7 @@ log "ckpt $CK, level $LV ($key um), box $box, labels ${SEGS:-none (render only)}
 if [ ! -e $INK/ink.done ]; then
   log "predict (waiting for GPU 0)"; gpu0_wait
   flock /tmp/gpu0-bench.lock env CUDA_VISIBLE_DEVICES=0 ~/bin/memcap -m 40G nice -n 10 $U predict $CK $R $K $INK --um 2.399 --level $LV --box $box \
-    --full-grid 1 --resume 1 --occupancy 5 --heads ink --gpu 0 --threads $TH > $RD/logs/predict.log 2>&1 || { log "predict failed ($RD/logs/predict.log)"; exit 1; }
+    --full-grid 1 --occupancy 5 --heads ink --gpu 0 --threads $TH > $RD/logs/predict.log 2>&1 || { log "predict failed ($RD/logs/predict.log)"; exit 1; }
   [ -e $INK/ink/zarr.json ] || { log "no ink head output in $INK (logs/predict.log)"; exit 1; }
   touch $INK/ink.done; log "predict done"
 fi
