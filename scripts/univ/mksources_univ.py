@@ -20,6 +20,7 @@ Env: B1 (the B1 output root, /mnt/scratch/univ/b1), HEADS (JSON, default winding
 (FIB/teacher), FIBSHARE (0.2)."""
 import copy, json, os, sys
 out = sys.argv[1] if len(sys.argv) > 1 else "/vesuvius/ufsm/univ/sources-univ.json"
+if out.startswith("-"): sys.exit(__doc__)   # (no flags: the one argument is the output path)
 B1 = os.environ.get("B1", "/mnt/scratch/univ/b1"); P4SH = os.environ.get("P4SH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "p4A48_shards.tsv")); MIRROR = os.environ.get("MIRROR", "https://dl.ash2txt.org/community-uploads/forrest/volcomp")
 HEADS = json.loads(os.environ.get("HEADS", '{"phase": 1, "normal": 1, "density": 1, "wind4": 1, "rv": 1}'))
 T = json.load(open("/mnt/scratch/lat/sources/sources-wind-gt-nvme.json")); T1667 = json.load(open("/mnt/scratch/lat/sources/sources-wind-gt1667.json"))

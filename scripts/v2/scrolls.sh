@@ -7,7 +7,7 @@
 # and writes V2/scrolls.tsv (one row per scroll):
 #   scroll split nwraps wraps wrapcheck strip_json strip_log axis ct_root ct_key ct_um ct_level fields fields_packed
 #   ink_src ink_key ink_model ink_mode ink_seam (scripts/v2/inksrc.sh: the pseudo-ink source, its model and window-seam handling)
-#   hold_band (scripts/v2/holdband.tsv: a held-out band z0,y0,x0,nz,ny,nx in level-0 voxels; training windows stay out of it and its
+#   hold_band (scripts/v2/holdband.tsv: a held-out band z0,y0,x0,nz,ny,nx in ct_level voxels; training windows stay out of it and its
 #   guard, the v2 unroll eval scores the scroll only inside it; - = none)
 # strip_json = the strip's strip.json ("wraps": [first, last] = the trim), strip_log = its logs/strip.log; ct_root = V2/ct when the
 # fetched scan is complete there (fetch state done or a symlinked local scan), else "-" (pending). Rerun after the fetch to fill ct_root.
@@ -15,6 +15,10 @@
 set -u
 H=$(cd "$(dirname "$0")" && pwd); REPO=$(cd $H/../.. && pwd)
 CFG=${1:-$H/runs.cfg}; V2=${V2:-/vesuvius/ufsm/v2}; U=${U:-$V2/src/build/ufsm}
+# (2026-11-12: `scrolls.sh --help` took "--help" as CFG, parsed grep's usage text as scrolls, and replaced the live table with garbage rows;
+# a run without the read binary drops every fields column and unlinks the fields of unclaimed scrolls. Both now stop before touching anything.)
+[ -f "$CFG" ] || { echo "usage: scrolls.sh [CFG]   ($CFG is not a file)" >&2; exit 2; }
+[ -x "$U" ] || { echo "scrolls.sh: U=$U is not executable (it reads the fields; set U=.../build/ufsm)" >&2; exit 2; }
 OUT=$V2/scrolls.tsv; TMP=$OUT.tmp; PACKLOG=${PACKLOG:-/vesuvius/ufsm/clean/pack-result.tsv}
 printf 'scroll\tsplit\tnwraps\twraps\twrapcheck\tstrip_json\tstrip_log\taxis\tct_root\tct_key\tct_um\tct_level\tfields\tfields_packed\tink_src\tink_key\tink_model\tink_mode\tink_seam\thold_band\n' > $TMP
 newest() { local cut=$1; shift; find "$@" -maxdepth 0 -newermt "$cut" -size +0 -printf '%T@\t%p\n' 2>/dev/null | sort -gr | head -1 | cut -f2; }

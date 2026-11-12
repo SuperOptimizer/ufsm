@@ -1,3 +1,6 @@
-# scroll	band (z0,y0,x0,nz,ny,nx level-0 voxels: held out of training, the only region the v2 unroll eval scores)	guard (level-0 voxels added around the band for the training holdout)
-# PHerc1299 (2026-11-11, coordinator option b): the bottom third in z of its 12309 level-0 slices; guard 256 = 64 voxels at its training level 2 (9.596 um)
+# scroll	band (z0,y0,x0,nz,ny,nx in voxels of the scroll's working level, scrolls.tsv ct_level, the unit of the unroll BOX: held out of training, the only region the v2 unroll eval scores)	guard (level-0 voxels added around the band for the training holdout, whose boxes are level-0: band x 2^ct_level + guard)
+# PHerc1299 (2026-11-11, coordinator option b): the bottom third in z of its 12309 level-2 slices (9.596 um; level 0 is 49236); guard 256 = 64 voxels at level 2.
+# Training holdout /vesuvius/ufsm/univ/holdouts-1299.json "1299-zband" = 0,0,0,16668,20580,20580 level-0 (2026-11-12: it had been written as 0,0,0,4359,5145,5145,
+# the level-2 numbers, which cover only an empty corner: surf-labels logged "holdout 0". The B3 PHerc1299 labels of 2026-11-11 therefore
+# still have phase inside the band; the sampler holdout and the direction mask keep training out of it.)
 PHerc1299	0,0,0,4103,5145,5145	256
