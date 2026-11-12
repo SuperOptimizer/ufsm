@@ -6,6 +6,21 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## The sub-cell head over more than 16 task outputs (2026-11-12, branch subcell-20261112)
+
+`--lat-guide 3`, the sub-cell head, used to have exactly 144 outputs: 16 interpolated base outputs plus 128 sub-cell terms (the
+phase pair x 64 voxels of a 4^3 cell). That capped the task at 16 outputs, and the fibre head needs 13 + 9 = 22.
+- The base is now the task's outputs rounded up to 16 (LBASE). Up to 16 outputs that is 16, the old 144-output head, so old
+  checkpoints load and train unchanged.
+- The fibre head already pads g_cout to 32. That gives 32 + 128 = 160 head outputs.
+- train's shuffle / adjoint calls, the fp32-gradient output count (LGFC), and the zero-init of the sub-cell rows now use LBASE.
+  predict already read the base as cout - 128; its three literal 16s (the fit-field shuffle, the side-pair slab, nn_lat_place_rvs)
+  now use that too.
+- The MX 1x1 conv (lp_conv1_to_mx / _r) takes up to 192 inputs (a CI 192 instantiation for 145..192).
+- test_predict_heads (3): the fibre head on a sub-cell net (rv 2) trains, and its log reports "outputs 32-159 start at zero".
+  predict --heads all writes rv, fib/H, fib/V and fib/fam.
+- Not generalised: the sub-cell terms still refine only the phase pair. The rv / ink / fibre outputs are interpolated.
+
 ## Phase on the fly from meshes: the sources key, behind the derived cache (2026-11-12, branch meshsrc-20261112)
 
 The 2.4 um rungs need level-0 codes. Stored, those run ~170 GB for Paris 4 June alone. fibhvd's mesh_codes_open (meshcodes.h)
@@ -21,6 +36,10 @@ rasterises them on read, byte-identical to `ufsm raster --value q.tif --binary 0
   the value name and the map.
 - Defaults: $UFSM_DERIVED_CACHE or ~/.cache/ufsm/derived, with a 1024 MB memory LRU.
 - Phases from stored codes stay uncached, as before.
+- The cell edge is at least 3 rmax, capped at 512, and it is part of the key. The pair rule reads codes with an rmax + 2 halo, so at
+  rmax 160 (the 2.4 um rung) a 128^3 cell computed 44x its voxels. On the pod, 10 workers produced no P 1280 batch in 8 minutes.
+  A 512 cell computes 4.3x its voxels.
+- `"cache": 0` turns the cache off: the phase is computed on every read.
 
 **The next rung** (phase_pl[L + 1], the scale rungs) rasterises the meshes at level L + 1 directly. That is the stored level-(L + 1)
 raster, and 8x fewer voxels than rasterising level L and pooling. When the CT has no level L + 1, the level-L codes are pooled
