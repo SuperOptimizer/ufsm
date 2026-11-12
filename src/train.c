@@ -2757,11 +2757,20 @@ int cmd_train(int argc, char **argv) {
             for (int i = 0; i < nb; i++) {
                 batch *b = sampler_next(sq); if (!b) { fprintf(stderr, "sampler stopped after %d batches\n", i); break; }
                 if (i == 0) tf = now() - t0;
-                for (int n = 0; n < B && cov; n++) {
+                /* the shares once per window (not on its replays: the same source-grid planes), branch-free per 64k voxels: the loop with
+                   a branch per voxel took 1.3 s of every P 1024 batch on the one consuming thread, so the mode reported 0.7 batches/s at
+                   most whatever the workers built (2026-11-12, pod; 4.4 of 12 workers waited for a slot). UFSM_SAMPLER_COV=0: none */
+                static int cov_on = -1; if (cov_on < 0) cov_on = !getenv("UFSM_SAMPLER_COV") || ufsm_env_on("UFSM_SAMPLER_COV");
+                for (int n = 0; n < B && cov && cov_on && !b->use; n++) {
                     const int si = b->src ? b->src[n] : -1; if (si < 0 || si >= S->n) continue;
                     const size_t nv = (size_t)g_Pz * P * P; size_t mat = 0, ph = 0, w4 = 0, phm = 0;
                     const uint8_t *ct = b->ct8 ? b->ct8 + n * nv : nullptr, *sd = b->side ? b->side + n * nv : nullptr, *w = b->w4 ? b->w4 + n * nv : nullptr;
-                    for (size_t v = 0; v < nv; v++) { const int m = ct ? ct[v] > 0 : 1; mat += m; if (sd && sd[v] != PHASE_UNKNOWN) { ph++; phm += m; } if (w && w[v] != 255) w4++; }
+                    for (size_t v0 = 0; v0 < nv; v0 += 65536) { const size_t v1 = v0 + 65536 < nv ? v0 + 65536 : nv; uint32_t cm = 0, cp = 0, cb = 0, cw = 0;
+                        if (!ct) cm = (uint32_t)(v1 - v0); else for (size_t v = v0; v < v1; v++) cm += ct[v] > 0;
+                        if (sd && ct) for (size_t v = v0; v < v1; v++) { const uint32_t k = sd[v] != PHASE_UNKNOWN; cp += k; cb += k & (ct[v] > 0); }
+                        else if (sd) { for (size_t v = v0; v < v1; v++) cp += sd[v] != PHASE_UNKNOWN; cb = cp; }
+                        if (w) for (size_t v = v0; v < v1; v++) cw += w[v] != 255;
+                        mat += cm; ph += cp; phm += cb; w4 += cw; }
                     if (b->level && b->level[n] >= 0 && b->level[n] < MAXLEV) { lvc[si][(int)b->level[n]]++; lvm[si][(int)b->level[n]][0] += mat; lvm[si][(int)b->level[n]][1] += phm; }
                     cov[si][0] += 1; cov[si][1] += (double)mat / nv; cov[si][2] += (double)ph / nv; cov[si][3] += mat ? (double)phm / mat : 0; cov[si][4] += (double)w4 / nv;
                 }
