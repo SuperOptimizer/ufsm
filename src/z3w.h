@@ -19,6 +19,12 @@ z3w *z3w_create_typed(const char *dir, const int64_t shape[3], int shard, int dt
 /* data: shard^3 elements in C order (bytes for uint8; the array's element type otherwise; the part outside the array is ignored).
    Returns 0 on success. Thread-safe across different shards. */
 int z3w_write_shard(z3w *w, int64_t sz, int64_t sy, int64_t sx, const uint8_t *data, int nthreads);
+/* chunk-level writing (predict's pyramid from pooled pieces): z3w_encode_chunk encodes one 128^3 chunk (C order, the array's element type)
+   as z3w_write_shard would; *enc = malloc'd stream, *len its length, or nullptr / 0 for a chunk all equal to the fill (omitted). 0 ok.
+   z3w_write_shard_enc writes shard (sz, sy, sx) from (shard / 128)^3 such chunks (z-major; nullptr = fill) and frees them. */
+int z3w_encode_chunk(const z3w *w, const uint8_t *chunk, uint8_t **enc, size_t *len);
+int z3w_write_shard_enc(z3w *w, int64_t sz, int64_t sy, int64_t sx, uint8_t **enc, size_t *len);
+int z3w_shard_chunks(const z3w *w);   /* (shard / 128)^3 */
 int z3w_close(z3w *w);
 /* Write an OME group zarr.json at dir listing levels[i] with voxel sizes um[i]; names are "%g" of um. */
 int z3w_write_group(const char *dir, const double *um, int nlevels, const char *name, const char *attrs_json);
