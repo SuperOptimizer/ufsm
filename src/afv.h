@@ -23,6 +23,8 @@ void afv_close(afv *a);
    Returns the run count (*out malloc'd, free with afv_runs_free) or -1. */
 int afv_query(afv *a, const double lo[3], const double hi[3], afv_run **out);
 void afv_runs_free(afv_run *r, int n);
+/* every block's bounds (min_x, max_x, min_y, max_y, min_z, max_z; AFV coordinates) from the rtree: the count (*out malloc'd) or -1 */
+int afv_bounds(afv *a, double (**out)[6]);
 /* the metadata value of key (JSON text, malloc'd) or nullptr */
 char *afv_meta(afv *a, const char *key);
 

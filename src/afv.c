@@ -21,6 +21,7 @@ static struct {
     int (*finalize)(sqlite3_stmt *);
     int (*reset)(sqlite3_stmt *);
     long long (*column_int64)(sqlite3_stmt *, int);
+    double (*column_double)(sqlite3_stmt *, int);
     const void *(*column_blob)(sqlite3_stmt *, int);
     int (*column_bytes)(sqlite3_stmt *, int);
     const unsigned char *(*column_text)(sqlite3_stmt *, int);
@@ -36,7 +37,7 @@ static int afv_lib(void) {
     SYM(open_v2, "sqlite3_open_v2") SYM(close, "sqlite3_close") SYM(errmsg, "sqlite3_errmsg") SYM(prepare_v2, "sqlite3_prepare_v2")
     SYM(bind_double, "sqlite3_bind_double") SYM(bind_text, "sqlite3_bind_text") SYM(step, "sqlite3_step") SYM(finalize, "sqlite3_finalize") SYM(reset, "sqlite3_reset")
     SYM(column_int64, "sqlite3_column_int64") SYM(column_blob, "sqlite3_column_blob") SYM(column_bytes, "sqlite3_column_bytes")
-    SYM(column_text, "sqlite3_column_text")
+    SYM(column_text, "sqlite3_column_text") SYM(column_double, "sqlite3_column_double")
 #undef SYM
     L.h = h; return 0;
 }
@@ -92,6 +93,20 @@ int afv_query(afv *a, const double lo[3], const double hi[3], afv_run **out) {
     }
     if (rc != SQ_DONE) { fprintf(stderr, "afv: query failed: %s\n", L.errmsg(a->db)); afv_runs_free(R, nr); return -1; }
     *out = R; return nr;
+}
+
+int afv_bounds(afv *a, double (**out)[6]) {
+    *out = nullptr; sqlite3_stmt *s = nullptr;
+    if (L.prepare_v2(a->db, "SELECT min_x, max_x, min_y, max_y, min_z, max_z FROM block_bounds", -1, &s, nullptr)) { fprintf(stderr, "afv: bounds: %s\n", L.errmsg(a->db)); return -1; }
+    long n = 0, cap = 0; double (*B)[6] = nullptr; int rc;
+    while ((rc = L.step(s)) == SQ_ROW) {
+        if (n == cap) { cap = cap ? 2 * cap : 65536; double (*q)[6] = realloc(B, (size_t)cap * sizeof *B); if (!q) { free(B); L.finalize(s); return -1; } B = q; }
+        for (int k = 0; k < 6; k++) B[n][k] = L.column_double(s, k);
+        n++;
+    }
+    L.finalize(s);
+    if (rc != SQ_DONE) { free(B); return -1; }
+    *out = B; return (int)n;
 }
 
 int fib_save(const char *path, const fib_set *f) {

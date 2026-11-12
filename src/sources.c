@@ -1,5 +1,6 @@
 #include "sources.h"
 #include "fiberraster.h"
+#include "fuse.h"
 #include "band_onfly.h"
 #include "json.h"
 #include "votes.h"
@@ -133,6 +134,8 @@ sources *sources_load(const char *path) {
         s->name = sdup(json_str(json_get(e, "name"), "?"));
         s->s = store_open(json_str(json_get(e, "root"), "."));
         s->ct_key = sdup(json_str(json_get(e, "ct"), ""));
+        { const json *mj = json_get(e, "ct_mirror"); const char *mr = json_str(json_get(mj, "root"), nullptr);
+          if (mr) { s->ct_ms = store_open(mr); s->ct_mkey = sdup(json_str(json_get(mj, "ct"), s->ct_key)); } }
         s->um = json_num(json_get(e, "um"), 0);
         s->weight = json_num(json_get(e, "weight"), 1.0);
         s->ink_weight = json_num(json_get(e, "ink_weight"), 1.0);
@@ -266,10 +269,29 @@ sources *sources_load(const char *path) {
                 if (of && !s->phase) {
                     const char *cr = json_str(json_get(of, "root"), nullptr), *ck = json_str(json_get(of, "key"), "");
                     const float rm = (float)json_num(json_get(of, "rmax"), 0);
+                    const json *sj = json_get(of, "sets");   /* "sets": [{"root", "key", "rmax"}, ...] + "tol" (0.1): the sets' phases fused per
+                                                                    voxel as phase-fuse (band_onfly.h phase_onfly_fuse_open); "root" / "key" then unused */
+                    if (sj && sj->type == J_ARR) {
+                        z3 *ph[FUSE_MAX]; int np = 0, bad = !sj->n || sj->n > FUSE_MAX; float rmx = 0;
+                        for (size_t k = 0; !bad && k < sj->n; k++) {
+                            const json *e2 = json_at(sj, k); const char *r2 = json_str(json_get(e2, "root"), nullptr), *k2 = json_str(json_get(e2, "key"), "");
+                            const float rm2 = (float)json_num(json_get(e2, "rmax"), rm); store *s2 = r2 ? store_open(r2) : nullptr; z3 *c2 = s2 ? z3_open(s2, k2, nullptr) : nullptr;
+                            if (c2 && json_num(json_get(e2, "pool2"), json_num(json_get(of, "pool2"), 0))) { z3 *q = codes_pool2_open(c2); if (!q) { z3_close(c2); c2 = nullptr; } else c2 = q; }
+                            z3 *p2 = c2 && rm2 > 0 ? phase_onfly_open(c2, rm2) : nullptr;
+                            if (!p2) { z3_close(c2); fprintf(stderr, "sources: %s: phase onfly set %zu: cannot open the codes %s/%s or no \"rmax\" > 0\n", s->name, k, r2 ? r2 : "?", k2); bad = 1; break; }
+                            ph[np++] = p2; if (rm2 > rmx) rmx = rm2;
+                        }
+                        s->phase = bad ? nullptr : phase_onfly_fuse_open(ph, np, (float)json_num(json_get(of, "tol"), 0.1));
+                        if (bad) for (int k = 0; k < np; k++) z3_close(ph[k]);
+                        if (!s->phase) { fprintf(stderr, "sources: %s: phase onfly \"sets\": 1..%d sets of {root, key, rmax}, one shape\n", s->name, FUSE_MAX); json_free(j); sources_free(S); return nullptr; }
+                        s->phase_onfly = rmx;
+                    } else {
                     store *cs = cr ? store_open(cr) : nullptr; z3 *cz = cs ? z3_open(cs, ck, nullptr) : nullptr;
+                    if (cz && json_num(json_get(of, "pool2"), 0)) { z3 *q = codes_pool2_open(cz); if (!q) { z3_close(cz); cz = nullptr; } else cz = q; }   /* "pool2": 1: the codes pooled 2x on read (phase-raster --gs 4) */
                     s->phase = cz && rm > 0 ? phase_onfly_open(cz, rm) : nullptr;
                     if (!s->phase) { z3_close(cz); fprintf(stderr, "sources: %s: phase onfly: cannot open the codes %s/%s or no \"rmax\" > 0\n", s->name, cr ? cr : "?", ck); json_free(j); sources_free(S); return nullptr; }
                     s->phase_onfly = rm;
+                    }
                 }
                 s->phase_level = (int)json_num(json_get(pt, "level"), 1); s->phase_direct = json_get(pt, "level") != nullptr;
                 const double sg = json_num(json_get(pt, "phase_sign"), 1);
@@ -443,7 +465,7 @@ void sources_free(sources *S) {
             store_close(s->tgt_store[c]);
         }
         free(s->ax.z); free(s->ax.y); free(s->ax.x);
-        free(s->name); free(s->ct_key); free(s->view_map);
+        free(s->name); free(s->ct_key); free(s->ct_mkey); free(s->view_map);
         for (int k = 0; k < s->nxs; k++) free(s->xs_map[k]);
         for (int k = 0; k < s->nemb; k++) free(s->emb_grp[k]);
         free(s->emb_name);
@@ -519,10 +541,16 @@ void sources_open_all(sources *S, int nthreads) {
 }
 /* the open (a remote metadata fetch) runs outside the lock; the lock only publishes the pointer. A racing duplicate open is
    closed. ct_present is cleared on failure so a missing level is not retried per draw. */
+/* a CT level: the source's store, else its "ct_mirror" */
+static z3 *open_ct_level(source *s, int level) {
+    z3 *z = open_level(s->s, s->ct_key, level, s->um);
+    if (!z && s->ct_ms) { z = open_level(s->ct_ms, s->ct_mkey, level, s->um); if (z) fprintf(stderr, "source %s: CT level %d from the mirror\n", s->name, level); }
+    return z;
+}
 z3 *source_ct(source *s, int level) {
     if (level < 0 || level >= MAXLEV || s->ct_present[level] == 0) return nullptr;
     if (!s->ct[level]) {
-        z3 *z = open_level(s->s, s->ct_key, level, s->um);
+        z3 *z = open_ct_level(s, level);
         pthread_mutex_lock(&g_open_mu);
         if (!s->ct[level]) { s->ct[level] = z; z = nullptr; if (!s->ct[level]) { s->ct_present[level] = 0; open_failed(s, "ct", level); } }
         pthread_mutex_unlock(&g_open_mu);
@@ -539,7 +567,7 @@ static int fib_same(const struct fib_spec *a, const struct fib_spec *b) {
 static z3 *source_tgt_fibre(source *s, int ch, int level) {
     if (s->tgt[ch][level]) return s->tgt[ch][level];
     const struct fib_spec *f = s->tgt_fib[ch]; z3 *pl[2];
-    z3 *c0 = open_level(s->s, s->ct_key, level, s->um), *c1 = c0 ? open_level(s->s, s->ct_key, level, s->um) : nullptr, *c2 = c1 ? open_level(s->s, s->ct_key, level, s->um) : nullptr;
+    z3 *c0 = open_ct_level(s, level), *c1 = c0 ? open_ct_level(s, level) : nullptr, *c2 = c1 ? open_ct_level(s, level) : nullptr;
     const int bad = fiber_onfly_open(f->afv, f->extra, f->map, f->tr, f->rad, f->guard, f->ring, f->iso, level, c0, c1, c2, pl);
     pthread_mutex_lock(&g_open_mu);
     if (bad) { if (!s->tgt[ch][level]) s->tgt_present[ch][level] = 0; pthread_mutex_unlock(&g_open_mu); return s->tgt[ch][level]; }

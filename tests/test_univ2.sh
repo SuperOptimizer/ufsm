@@ -22,6 +22,12 @@ cd "$D"
 grep -q 'x 2 GPU(s)' run.log || { echo "FAIL: not two GPUs"; exit 1; }
 grep -q '^grad-cos step 6 (head input): phase/normal' run.log || { echo "FAIL: no grad-cos line"; exit 1; }
 grep -q '^step      6 .* uw phase' run.log || { echo "FAIL: step 6 / uw"; exit 1; }
+# --fstem-reset-at S: resuming from step S the fine stem restarts neutral (one-shot: a later resume from another step keeps it)
+cp -r run rsr
+"$U" train fx/sources-mix.json --out rsr --steps 8 "${C[@]}" --resume rsr/last.ckpt --fstem-reset-at 6 > rs.log 2>&1 || { echo "FAIL: --fstem-reset-at resume ($D/rs.log)"; exit 1; }
+grep -q -- '--fstem-reset-at 6: the fine stem re-initialised' rs.log && grep -q '^step      8 ' rs.log || { echo "FAIL: no stem reset / step 8 ($D/rs.log)"; exit 1; }
+"$U" train fx/sources-mix.json --out rsr --steps 9 "${C[@]}" --resume rsr/last.ckpt --fstem-reset-at 6 > rs2.log 2>&1 || { echo "FAIL: second resume ($D/rs2.log)"; exit 1; }
+! grep -q 'fine stem re-initialised' rs2.log || { echo "FAIL: the stem reset again on a resume from step 8"; exit 1; }
 head -1 run/last.ckpt | grep -q '"film":2' && head -1 run/last.ckpt | grep -q '"fstem":\[16,' || { echo "FAIL: header"; exit 1; }
 "$U" train fx/sources-mix.json --out run --steps 9 --resume run/last.ckpt "${C[@]}" > run2.log 2>&1 && grep -q '^step      9 ' run2.log || { echo "FAIL: resume ($D/run2.log)"; exit 1; }
 CD=("${C[@]}" --det 1 --val-every 4)

@@ -67,6 +67,38 @@ through the host batches) reads 1.06 Gvox/s on an idle GPU, slower than the CPU 
 Whole scroll, Paris 4: the occupied k = 2 windows of the 9.6 um level hold 596 Gvox (of 1.27 Tvox; 34 % of the 512^3 shards hold
 material). Pod, one head: ~4.5 min warm, ~9 min cold; 4.8 um 8x, 2.4 um 64x.
 
+## Fused phase sets on the fly; the fine stem reset; derived extents (2026-11-11, branch univ-20261111)
+
+Derived extents (`z3_derived_extent`, zarr3.h): a derived array can name the chunks where it gives known values; the chunk map,
+box_any and shard presence (the sampler's draw cells for target-only sources, occupancy tests) then come from it instead of the base.
+The fibre planes mark every chunk within the reach + 1 of a traced segment (AFV: the rtree's block bounds through the map /
+transform; UFIB: per segment). Measured: PHerc1447 27.0% of the CT chunks (249 ms from 1.26M block bounds), Paris4_1mm_v2 through the
+reg map 25.1% (1.4 s), PHerc0139's human lines 6.6% (per-run bounds gave 35%). fibhvd measured ~70% of Paris 4 fibre windows without
+fibre labels when the draws took every papyrus cell. UFSM_FIBRE_EXTENT=0: the CT's chunks. inkB's onfly ink plugs in the same way.
+
+- The 9.6 / 9.36 um universal sets carry the phase-fuse of two surface sets (A, B: the circular mean where they agree within 0.1 turn,
+  else unknown). Sources: `"phase": {"onfly": {"sets": [{"root", "key", "rmax"}, ...], "tol": 0.1}, "level": L}`; band_onfly.h
+  `phase_onfly_fuse_open` reads each set's onfly phase over the box and applies fuse_phase per voxel (a set with no chunk in the box
+  is skipped, as phase-fuse's absent shards). zarr3.h `z3_derived_cover`: the fused array's chunk map / box_any / shard presence are
+  the union of its sets'. `ufsm phase-onfly ... --fuse ROOT2 KEY2 [--fuse-rmax R2] [--tol]` compares against a stored fusion.
+- Byte identity: PHerc0139 (codesA / B at 9.362 um, rmax 41: 4 windows of 384^3, 0 differing against p0139full/phase, conflicts
+  included); PHerc1667 9.6 um (codes-pool2 of codesA / B 4.798, rmax 40: 4 windows of 384^3, 0 differing against
+  PHerc1667-wind-20261016/phase); test_phase_onfly (fixture, CPU and GPU). 0500P2: its codes are not on the desk (pod kit only).
+- rmax is phase-raster's --radius / --gs in codes voxels: 41 for 0139 (radius 82, --gs 2), not 82. The pod bench's onfly 0139 source
+  (1.21 samp/s below) used 82: a 2x larger halo and a different (wider) phase than the stored set; to be re-measured at 41.
+- Cost (desk 5060 Ti, 384^3 windows, the two sets each one tile): 0139 0.29 s, 1667 9.6 0.8 s per window.
+- The 2x-pooled codes are derived too (`"pool2": 1` on an onfly phase or a set; band_onfly.h codes_pool2_open over
+  zarr3.h z3_open_derived_pool2, a derived array on the 2x coarser grid whose chunk map comes from the base's 2^3 chunks; the pooling
+  is phase-raster's praster_read, now shared as codes_pool2_box). PHerc1667 9.6 straight from codesA / B 4.798 (pool2, rmax 40,
+  fused): 2 windows of 256^3, 0 differing against PHerc1667-wind-20261016/phase; test_phase_onfly: --pool2 == phase-raster --gs 4.
+  Cost: the pooling reads and decodes 8x the voxels on the CPU (2 sets: ~2 s of a 256^3 window's 10 s on the CPU path); pooling on
+  the device cannot be byte-exact (glibc atan2 ties), so the next step there is the 4.8 decode on the device with the pooling on the
+  host. With it no 1667 / Paris 4 phase or pooled-codes artifact remains: only the 4.8 codes.
+
+`--fstem-reset-at S` (unet_fstem_reset): resuming from step S the fine stem starts again as unet_init leaves it (W1 He, b1 and the
+projection 0: neutral), its Adam / Muon state and EMA reset; one-shot by step (a resume from any other step keeps the stem). For u1
+after univI's fstem forward fix (the forward covered only x mod 256 < 64 of each row; the backward every block): the trunk and heads
+are kept, the stem restarts. test_univ2 checks the reset and that a later resume does not repeat it.
 ## B1 4.8 um phase rasters: what was built before the switch to on-the-fly phase (2026-11-11, branch fibd-20261111)
 
 Workstream B1 rasterised the band phase at 4.8 um (`phase-raster --gs 2 --pair 1 --radius 160`, GPU, byte-identical to the CPU path;
