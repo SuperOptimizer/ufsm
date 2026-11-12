@@ -48,6 +48,165 @@ UFSM_PRED_DEVREAD.
 `ufsm latvol --zarr2 1` takes the upstream uncompressed zarr v2 CT, `--volcomp Q` writes the same boxes as plain volcomp at a quality
 (the rate ladder of the compression sweep, scripts/latvol/sweep.sh; its results get their own section).
 
+## The on-the-fly phase no longer holds a tile buffer per window (2026-11-12, branch onflyslots-20261112)
+
+perf's pod sampler profile (P 1024, 10 workers) found the on-the-fly phase read was 74% of the window time, with 3.25 busy cores of 40.
+onfly_read took one of the `--onfly-slots` host tile-buffer sets for the whole window and held it through every tile: the GPU tiles,
+and the CPU-side chunk packing too, though only the CPU fallback uses the set. So 2 sets served 10 workers.
+- Now each GPU tile's interior lands in a per-thread pinned buffer, grown once to the largest tile.
+- The buffer set is taken lazily, at the first tile that falls back to the CPU.
+- The device contexts were already taken per tile inside band_pair_gpu_codes. --onfly-slots now bounds only pair-rule work in
+  flight on the GPU, and packing overlaps across all workers.
+- Same bytes: test_phase_onfly (CPU / GPU / small tiles / fused / pooled), test_mesh_phase and test_unwrap2_sampler pass.
+- On the desk (u1, P 1024, --onfly-slots 1) the read is 23-25 s per window, about 6 reads per 50 steps.
+- The pod numbers before and after come from perf (slots 2 / 4 / 6).
+
+## MIL rays under --replay, the MIL checks, and the U2 ink smoke (2026-11-12, branch milfix-20261112)
+
+**Replays.** The MIL path from mil-20261112 below did not cover `--replay K`. A replay sends the window's planes back to the source
+grid and draws a new symmetry and warp, applied on the device. The rays kept the first draw's mapping. u1 runs `--replay 3`, so
+under that recipe two steps in three would have pooled along the wrong voxels. Each window now keeps its source-grid rays
+(`batch.mil0`), and `replay_window` maps them again with the replay's own geometry (`sample_mil_map`, the cap after it).
+
+**UFSM_MIL_CHECK=1** (head_slab_pass) checks three things on every window with rays:
+- loss: the device MIL loss against `ink_mil_loss_host`, on the window's own fp16 logits at the same scale;
+- gradient: the gradient pass 1 adds (bwd_slab, after minus before, 16-bit) against the host gradient, as the excess beyond one
+  16-bit ulp;
+- geometry: the rays against the ink target plane the loss reads (after every symmetry or warp, host or device, and replays): the
+  rays that meet a known voxel within +-R, and how many of those agree with the ray's label.
+
+**test_ink_mil_check** (new, gpu, ~90 s; beside test_ink_mil_train). Fixture: the spiral plus one tifxyz segment on a papyrus sheet
+(blob labels) as an onfly ink target. Six runs: plain twice under `--det 1`, rotation + elastic with host label warps, the same with
+device label warps (`--gpu-aug 2`), the latent head stream (`--lat 4 --lat-guide 3`), and `--replay 3` with the warps.
+
+| check | result |
+|---|---|
+| device loss vs host | worst relative 2.1e-8, 18 windows |
+| device gradient vs host | worst excess over one 16-bit ulp 3.0e-7 of the max |
+| rays meet known ink / agree, every run | >= 98% / 99.6% |
+| `--det 1` loss terms, two runs | identical |
+
+The host reference is central-difference tested in test_ink_mil, so the gradient row is the central-difference check through
+head_slab_pass at the logits. In the replay run 2454 of 2509 rays meet the plane with the remap; without it 940 of 2520 do, and
+the test fails.
+
+Flag off: test_heads 7 of 7 old layouts log the reference losses. test_ink_mil_train, test_wind_sampler and test_unwrap2_sampler pass.
+
+Real data, desk dry run of the U2 recipe below (the 8 scans at level 0 / 1, P 256, mode 0, replays on): 187536 of 345170 rays
+(54%) meet known ink within +-3 voxels, and 99.81% of those agree. The others sit off the face band [-6, 0] or have no face. In
+mode 1 (face-less pixels only) 5.8% meet any known voxel, as expected.
+
+An onfly `"cache_dir": "off"` used to create a directory named `off`; it now means no disk cache.
+
+**The U2 ink config.**
+- `scripts/inkgt/mksources_u2ink.py` writes the 8 scans' onfly human-ink sources:
+  - onfly level 0 (2.4 um), pooled level 1 (4.8 um), min / max level 0 / 1 (train `--um-rungs 2.4,4.8`);
+  - `"validation": "exclude"` (the validation rasters once addval.py has run on the live segment lists);
+  - the ink head only; the weights of sources-inkfly.json;
+  - `ROOT=` rewrites every path for a pod; the segment lists, the holdouts and the desk axis files are copied next to the output.
+- `CACHE_MB` sets each source's onfly memory cache. The default is 2048 MB, and 8 sources plus 10 P 512 slots broke the 40 GB dev
+  cap in a sampler-only run.
+- `scripts/univ/pod_pack.sh INK=1` stages the inputs: inkgt hf + od (2.7 GB), evgt, evcrops and the Paris 4 eval crops.
+
+**The smoke.** `scripts/univ/u2ink_smoke.sh [A B]`:
+- ink-only windows, `--init-from` a u1 snapshot (trunk and rv / winding rows; the ink row fresh, bias -1);
+- u1's recipe (u1.train.sh, its latent flags including `--replay 3`) with `--um-rungs 2.4,4.8`, STEPS 400, a checkpoint every 200;
+- arm A: BCE + `--ink-smooth 0.1 --ink-dice 0.25`; arm B: A + `--ink-mil 1 --ink-mil-r 3 --ink-mil-mode 1`;
+- each checkpoint is scored with `scripts/inkgt/baseline.sh ckpt:...:<ink channel>`: 3-D AUC per scan against the teacher
+  ink3dext's 0.727 (Paris 4) / 0.651 (0139) / 0.561 (1667), CT floor 0.513.
+
+baseline.sh's checkpoint path had never run (the teacher went through ink3d-ext). It passed the level-0 box to `predict --level 1`,
+which reads the box in level-1 voxels, so every shard was air. It now passes the level-1 box with `--full-grid 1`, and 1667 w013_0
+predicts and scores. The 2-D render score wrote 0 wraps for that crop (not investigated; the 3-D score is the gate).
+
+Desk dry run (arm B, P 256, 24 steps beside u1): the u1 8000 snapshot loads with the ink row fresh. Ink bce 0.48 -> 0.36 and
+mil 0.48 -> 0.36 inside the warmup, 15-16 k rays a window. The 400-step arms are for the pod, at P 1024 (user 2026-11-12: "1024 cubes only now").
+
+## Gradient accumulation: --accum K (2026-11-12, branch accum-20261112)
+
+The user wants a bigger batch ("increase batch size to fill ram"), but B > 1 isn't available for the latent recipe. Several parts
+require B == 1:
+- the unwrap tasks;
+- FiLM, which takes one voxel-size code per forward;
+- the fine stem;
+- head_slab_pass and the label stream;
+- the MIL rays.
+
+So the batch is accumulated instead. `--accum K` runs K windows per optimizer update. Every step is still one window: its forward and
+backward, loss, log and mix lines, and the lr schedule. So --warmup and --steps count windows, and warmup counts samples. Each
+window's fp32 parameter gradient (after the multi-GPU mean) is added into a params-sized buffer. At steps that are multiples of K:
+- the gradient becomes the mean of the accumulated windows, and gn is the mean's norm;
+- then clip, Muon / AdamW at optimizer step ceil(step / K) (Adam's bias correction), EMA.
+A non-finite window is left out of the mean. The step line adds "(update N: K windows each)". Keep --ckpt-every / SNAP at multiples of
+K: a checkpoint written between updates drops the partial sum. The uncertainty weights (--uw) still step per window.
+
+Memory: one params-sized fp32 buffer per GPU. Step time: ~K x per update. On one GPU this gives the larger batch, not throughput.
+
+**Replicas instead** (`--gpus 0,0,..`): every replica's kernels run on the legacy stream 0, so they serialise, and nn's per-device
+scratch would be shared between the replica threads. They are not used.
+
+**test_accum:**
+- --accum 2 --steps 1 makes no update: 0 of 313804 weights differ from an lr-0 run.
+- --accum 3 --steps 6 with UFSM_ACCUM_DUMP: each update's gradient equals the mean of its 3 windows' gradients (max rel err 5.1e-8 /
+  3.5e-8, fp32).
+- --accum 4 logs its update lines.
+
+U2-pod: K 4, lr unchanged, Muon as is.
+
+## --fit-zarr fields fused from the cell logits: nn_fit_accum_lat (2026-11-12, branch univdec-20261112)
+
+The z-slab fit path of a latent-grid net wrote and read full-resolution fp16 planes for each z chunk: upsample + shuffle (11 channels), the
+fine stem (nn_lat_ct_x + nn_fstem_fwd), fit_accum_k, then for the winding mod 4 a second upsample + stem over the chunk plus its +-d halo
+planes and fit_accum_w4_k. That was ~200 ms a window on the pod's RTX PRO 6000 box run (1056^3 windows), as much as the trunk.
+nn_fit_accum_lat does the same in one kernel, one block of 512 threads per 8^3 field cell. --fit-zarr's strides are multiples of
+--fit-h and its windows multiples of 16, so the halo is a multiple of 4 and the field cells are always on the latent grid: a cell is
+2^3 latent cells and 4^3 stem blocks. In the kernel:
+- the 4^3 coarse cells around the field cell are staged in shared memory;
+- the upsample is lat_up4_k's separable chain per (channel, latent cell, z offset), written to fp16 planes in shared memory;
+- the stem runs on the cell's 64 blocks in fstem_fwd_k's exact mma16816 sequence (A fragments, 4 k-steps from zero, + b1, silu, the W2
+  sums over c), with its outputs added and rounded per voxel after the sub-cell term, as the plane kernels do;
+- the cell sums use fit_accum_k's per-thread expressions and its shared-memory tree;
+- the winding's terms are fit_accum_w4_k's, summed in its voxel order by one thread per accumulator;
+- the partner voxels at +dd along z, y, x come from three shifted regions that each block computes itself (the stem and the winding
+  pair's upsample, recomputed).
+
+Byte-identical, with one catch. The first version spelled the upsample's `w0 a + w1 b + w2 c` as a plain expression. Inside the kernel
+the compiler contracted that differently from lat_up4_k's unrolled loops: 1 fp16 ulp in ~1e-5 of the voxels (small logits, where the
+cancellation shows). On the pod box that moved 0.012 % of pc cells (max 2 codes), 0.026 % of ps, and 45k dz / 73k dx cells by up to
+51 codes. dx is the atan2 of sums near zero, so it amplifies any difference. fl_lw now writes the contraction out:
+fma(w2, c, fma(w0, a, w1 b)).
+- test_fit_lat: the 12 + 9 accumulator planes against the plane path bit for bit (stem on / off, sub-cell on / off, three window
+  offsets); the logits per voxel through nn_fit_accum_lat_debug.
+- test_predict_heads: the 14 fields against UFSM_PRED_FIT_FUSED=0, on the fixture volume and on a box inside it.
+- On the pod box all 267 field files are byte-identical to the plane run.
+
+The heads kernel's stem features (nn_lat_heads_place) are not shared: that kernel sums the stem in fp32 in a different order than the
+tensor cores (its heads differ from the plane path in rare last bits), so sharing them would give up the identity. The stem costs little
+here; the shifted regions cost more (below).
+
+Numbers:
+- Kernel, 256^3 window (UFSM_TEST_BENCH=1 test_fit_lat, sub-cell + stem + winding):
+  - plane path: pod 2.4 ms (upsample + shuffle 0.4, stem 0.9, sums 0.7, winding 0.4); desk 5060 Ti beside u1 20 ms;
+  - first version (a thread's channels upsampled per voxel: 27 loads and 39 multiply-adds per channel and voxel): desk 21 ms;
+  - staged version: pod 1.2 ms, desk 9.5 ms;
+  - pod without the stem 0.7 ms, without the winding pass 0.8 ms.
+- The 19.3 Gvox Paris4 box, 5 heads, 4 levels, warm cache, RTX PRO 6000. Loop wall is the profile's wall, without the ~5.7 s of
+  start-up that elapsed includes:
+
+  | run | GPU (fwd + d2h) | loop wall | elapsed |
+  |---|---|---|---|
+  | 5 heads | 7.20 s | 9.35 s | 15.5 s |
+  | 5 heads + fit-zarr, plane path | 10.39 s | 11.82 s | 18.0 s |
+  | 5 heads + fit-zarr, fused | 8.56 s | 9.84 s | 15.2 s |
+
+  The fit fields now cost +1.4 s of GPU over the 18 windows (75 ms a window, against 177) and +0.5 s of wall. The main loop still waits
+  3.9 s on the fit writer's ring, behind the copies of the field slabs on the GPU's queue.
+
+What would make it smaller:
+- the shifted regions: each block upsamples the winding pair and runs the stem on 3 more regions, 2/3 of the stem work. A window-wide
+  pass that keeps the winding pair's fp16 logits (4 B a voxel) would remove that.
+- The fit_accum_w4_k order forces a 512-long serial chain per accumulator; the sums can't be split without changing the bytes.
+
 ## The sub-cell head over more than 16 task outputs (2026-11-12, branch subcell-20261112)
 
 `--lat-guide 3`, the sub-cell head, used to have exactly 144 outputs: 16 interpolated base outputs plus 128 sub-cell terms (the

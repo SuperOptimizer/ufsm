@@ -52,7 +52,8 @@ CCBIN   := $(if $(filter gcc-%,$(HOSTCC)),$(if $(shell command -v $(subst gcc,g+
 ifeq ($(origin NVCC),undefined)
 NVCC := $(CCACHE) $(if $(shell command -v nvcc 2>/dev/null),nvcc,$(CUDA)/bin/nvcc) $(CCBIN)
 endif
-CFLAGS  ?= -std=c23 -O3 -march=native -g -Wall -Wextra -Wno-unused-parameter -Wno-format-truncation -pthread
+CFLAGS  ?= -std=c23 -O3 -march=native -g -Wall -Wextra -Werror=comment -Wno-unused-parameter -Wno-format-truncation -pthread
+# (-Werror=comment, 2026-11-12: an unclosed comment swallowed the next source line, the --fib-head statistics pass, with only a -Wcomment warning)
 CPPFLAGS = -D_GNU_SOURCE -Isrc -Ithird_party -Ithird_party/surfcomp $(shell pkg-config --cflags libcurl libzstd blosc zlib libcrypto)
 LDLIBS   = $(shell pkg-config --libs libcurl libzstd blosc zlib libcrypto) -ljpeg -lm -lpthread
 NVFLAGS ?= -O3 $(NVARCH) -DUFSM_ARCH=$(ARCH) -use_fast_math -Xcompiler -fno-threadsafe-statics -Isrc   # fast math: +4% step time, FD tests still pass
@@ -252,6 +253,9 @@ suite-bins: $(B)/test_fstem
 $(B)/test_lathead: tests/test_lathead.c $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 suite-bins: $(B)/test_lathead
+$(B)/test_fit_lat: tests/test_fit_lat.c $(B)/nn.o $(B)/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
+suite-bins: $(B)/test_fit_lat
 $(B)/test_gram: tests/test_gram.c $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 suite-bins: $(B)/test_gram
@@ -406,6 +410,9 @@ suite-bins: $(B)/test_mesh_phase
 $(B)/test_ink_mil_train: tests/test_ink_mil_train.c $(OBJ) $(B)/nn.o $(B)/nn_fp8.o | $(B)/ufsm $(B)/make_wind_fixture
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_ink_mil_train.c $(OBJ) $(B)/nn.o $(B)/nn_fp8.o -o $@ $(LDLIBS) $(CUDALIBS)
 suite-bins: $(B)/test_ink_mil_train $(B)/make_wind_fixture
+$(B)/test_ink_mil_check: tests/test_ink_mil_check.c tests/make_wind_fixture.c $(B)/z3w.o $(B)/tiffw.o | $(B)/ufsm $(B)/make_wind_fixture
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_ink_mil_check.c $(B)/z3w.o $(B)/tiffw.o -o $@ $(LDLIBS)
+suite-bins: $(B)/test_ink_mil_check
 $(B)/test_ink_splat: tests/test_ink_splat.c $(OBJ) $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 suite-bins: $(B)/test_ink_splat
