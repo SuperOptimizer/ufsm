@@ -6,6 +6,88 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Fibre gate of our spiral labels: whole-scroll PHerc1299, PHerc1218 with our fibres, a papyrus voxel mask, fibre rows per scroll (2026-11-12, branches fibers-20261110 + latinf-20261109)
+
+The fibre judge (section "Fibre judge in C" below) turned into a per-tile training gate for our fitted spirals. Rate = persistent sheet
+changes (H + V) per m of labelled fibre in a 512^2 x slab tile; gate 1 at the reference rate, 0 at 2x, linear in between. Tiles with
+< 0.5 m of fibre are not judged and keep the coherence weight (box default 1). Tools: `tools/fj_boxscale.py` (judge rows -> phase-coh
+`--box-scale` file), `tools/fib_cat.py` (per-tile UFIB files -> one), `tools/fib_affine.py` (UFIB through a published transform.json;
+identity is byte-exact, a round trip is within 1e-3 voxel). `phase-coh --box-scale` is cdb87b7 (hostmem). Scratch:
+`/vesuvius/ufsm/fibers/work/{fjfull_1299,fjpap,fj1218,fj0139}`.
+
+**PHerc1299, whole scroll.** The official fibre prediction was traced at level 4 in 17 chunks of 192 slices (`work/trace_1299_full.sh`),
+judged against the snapped render `latcal/labels_snap/PHerc1299`: 426 tiles, 550 m of fibre, 286 tiles with >= 0.3 m. Tile rates are
+104 / 318 / 403 / 473 / 1483 /m (min / q25 / median / q75 / max); the whole scroll is H 561, V 332 /m. The one-slab figure (374) holds
+for the whole scroll. Gate 189 .. 378 /m (Paris 4's median against its wraps): `latcal/fib/PHerc1299-full.boxes`, 271 judged tiles:
+155 at 0, 14 at 1, 102 partial. Weight `latcal/coh_fibF/PHerc1299` (from labels_snap, 0..0.3 coherence ramp x fibre gate):
+
+| 1299 weight | mean weight | known voxels with w >= 0.1 | weight sum vs coherence only |
+|---|---|---|---|
+| coherence only (`coh_snap`) | 0.211 | 0.476 | 1 |
+| one-slab gate, default 1 (hostmem, `coh_fib1`) | 0.205 | | 0.972 |
+| whole-scroll gate (`coh_fibF`) | 0.048 | 0.126 | 0.228 |
+| whole-scroll gate on the papyrus-masked phase (`coh_fibFP`) | 0.045 | 0.121 | 0.217 |
+
+What goes: 96 % of the known voxels lie in judged tiles. The gate is lowest at the ends of the scroll (z < 20 mm: mean factor 0.07;
+z > 100 mm: 0.05) and near the core (radius < 5 mm: 0.04); it is best at z 60..80 mm (0.26) and radius 5..20 mm (about 0.2). The worst
+column of the one-slab judge, y 3584 x 2048, is 0 in every judged z tile (rates 407 .. 1057 /m). The 6 % of tiles that keep a full
+weight are scattered (e.g. z, y, x = 2304, 2048, 1536 at 104 /m). With a Paris 4-calibrated ramp, 1299 survives as about a fifth of its
+coherence weight. A softer ramp (e.g. relative to 1299's own distribution) would be a choice, not a measurement: nothing validates the
+fibres on 1299 itself.
+
+**Papyrus voxel mask (`phase-coh --papyrus T --pap-dilate R --phase-out 1`, latinf 72a2530).** The pair-rule fill labels everything
+between two wraps, and surf-labels ignores only CT 0 (outside the scan mask), so air inside the scroll carried labels. The new options
+take a known voxel with CT < T and no CT >= T within R voxels (cube) to weight 0 and, with `--phase-out`, to unknown in a masked copy of
+the phase (the sampler's weight works per 8^3 block, so a voxel mask has to be in the phase). The test runs it against a brute-force
+mask: 0 voxels off. With T 64 (the sources' iso), R 2:
+
+| render | known voxels masked as air | fibre judge before -> after (tile median /m; H / V persistent /m) |
+|---|---|---|
+| 1299 snapped, whole scroll | 4.91 G of 35.4 G = 13.9 % | 403 -> 397; H 561 -> 554, V 332 -> 330 |
+| Paris 4 band z 11328 + 512 (snapped, official fibres) | 2.21 G of 16.5 G = 13.4 % | 196 -> 195; 209 / 238 -> 207 / 236 |
+| Paris 4 band, our fibhv-a fibres | (same) | 128 -> 126 |
+
+The mask removes a seventh of the labels, the same share on both scrolls, and leaves the fibre rate where it was. Fibres run in papyrus,
+so they never see the air labels. The mask therefore cleans labels the judge cannot see, and it does not explain 1299's rate. On 1299's
+median tile, the excursions hostmem traced to the fill between wraps are inside papyrus. Masked phase:
+`latcal/papy/PHerc1299/phase.zarr`.
+
+**PHerc1218 with our own fibres** (fibhv-a step 10000, 6 bands of 512 slices, per-tile traces, the lead's pod run), calibrated on the same
+predictor over the Paris 4 slab. All rows are persistent /m, with pairs within half a turn at 0.3 / 0.6 mm:
+
+| fibres -> basis | tile median | H / V | H pairs | V pairs |
+|---|---|---|---|---|
+| fibhv-a Paris 4 -> GT phase | 72 | 94 / 108 | 0.954 / 0.929 | 0.949 / 0.923 |
+| fibhv-a Paris 4 -> our snapped band render | 128 | 157 / 166 | 0.924 / 0.883 | 0.922 / 0.885 |
+| fibhv-a Paris 4 -> our snapped wraps | 196 | 215 / 238 | 0.887 / 0.800 | 0.876 / 0.788 |
+| official Paris 4 -> GT | 111 | 111 / 149 | 0.952 / 0.925 | 0.934 / 0.908 |
+| official Paris 4 -> wraps | 189 | 206 / 199 | 0.871 / 0.775 | 0.837 / 0.728 |
+| **fibhv-a 1218 -> label render (5 bands with labels)** | **584** | 643 / 710 | 0.770 / 0.730 | 0.751 / 0.713 |
+| fibhv-a 1218 z 10240 -> render | 403 | 431 / 436 | 0.817 / 0.788 | 0.806 / 0.770 |
+| fibhv-a 1218 z 10240 -> snapped wraps | 502 | 509 / 535 | 0.760 / 0.673 | 0.742 / 0.641 |
+| fibhv-a 1218 z 10240, y and x swapped (control) | 2845 | | 0.233 / 0.389 | |
+
+On Paris 4 the layer-mask fibres judge like the official ones, and better, because their lines are short. By the same measure 1218's
+labels are 3 .. 5x worse than Paris 4's: band medians are 663 / 649 / 403 / 584 / 727 for z 2048 / 6144 / 10240 / 14336 / 18432 (z 21504
+is past the spiral). The swapped-axis control rules out a frame error. Against the wraps the rate is worse still (502 vs 403 on the
+render's band), as on Paris 4 (196 vs 128). The gate `latcal/fib/PHerc1218-fibhv.boxes` (ramp 128 .. 256) puts 210 of 223 judged tiles at
+0. That conflicts with the user's reading of 1218 and with the GT-free probes (wrapcheck 0 dups, outward 0.989). The open question is
+whether fibhv-a is trustworthy on 1218: it was trained on Paris 4 / 1447 / 0175A labels and is validated on Paris 4 only. The control
+that decides it is fibhv-a on 1447 or 0175A (same 8.64 um acquisition as 1218) against their wraps; with the published v2 fibres those
+scrolls rated like Paris 4. That control needs a GPU and has not run. Until it does, the 1218 gate is not applied.
+
+**Fibre rows per scroll, official prediction against our wraps** (tile median persistent /m; pairs at 0.6 mm H / V): Paris 4 189
+(0.775 / 0.728); PHerc0139 241 (0.775 / 0.668; prediction on scan 20260102150214 traced at level 4, one chunk L4 z 2208 + 192 = our z
+9728 + 768, through the published `20260102150214-to-20250728140407-r1` affine, so registration error is inside the figure); PHerc1299
+~375 (0.596 / 0.674 on one slab). PHerc1451 has a prediction (scan 20260319101107) but no published transform to our 8.64 um scan;
+PHerc0332 is not in our inventory. Against the GT-free table (hostmem's `latcal/probe/ranking.tsv`, plus a rank-average of wrapcheck,
+fit-join, probe outward, coherence and geom-check): the fibres agree with outward that 1299 is the weakest of these scrolls (outward
+0.884, the only FAIL), while 1299 ranks well on fit-join boundary agreement (0.882, 5th of 32) and flattening. 1218 ranks high on
+wrapcheck (0 non-real, 5th on two-plus) and outward (0.989, 2nd of 11), middle on fit-join (0.821, 17th), and low on CT coherence
+(probe coh >= 0.3 0.017, 18th of 24) and CT peaks per turn (0.862, 26th). Coherence ranks 0139 above Paris 4 against GT pair accuracy,
+so it is a within-scroll gate, not a between-scroll ranking (hostmem). Coherence and peaks per turn track the scan (the 8.64 um 1.2 m
+scans score low as a group), not only the labels.
+
 ## Fibre votes in fit-join (stitching): `--fibers --join-fib`, measured at the four Paris 4 slab sites (2026-11-11, branch fibers-20261110)
 
 `ufsm fit-join ... --fibers F.fib --join-fib W [--join-fib-arc 0.6] [--join-fib-gap 0]`: a fibre lies in one sheet, so over a short
