@@ -66,7 +66,7 @@ REPO=${UNROLL_REPO:-$(cd $H/../.. && pwd)}
 [ -n "$row" ] || row=$(awk -F'\t' -v s=$S '$1 == s { print $0 "\t-\t-\t-" }' $REPO/scripts/corpus/list.tsv)
 [ -n "$row" ] || { echo "unroll: $S is in neither scrolls.tsv nor corpus/list.tsv"; exit 2; }
 IFS=$'\t' read -r _ R K UM LV AXS TBOX TZR TSTRIP <<< "$row"
-R=${CTROOT:-$R}; K=${CTKEY:-$K}   # (pods: the CT mirrored to local disk)
+R=${CTROOT:-$R}; K=${CTKEY:-$K}; AXS=${AXIS:-$AXS}   # (pods: the CT mirrored to local disk; AXIS: an axis file other than the table's)
 LUM=$(awk -v u=$UM -v l=$LV 'BEGIN { printf "%.4g", u * 2 ^ l }')
 BOX=${BOX:-$TBOX}; ZR=${ZR:-$TZR}; [ "$TSTRIP" = - ] && TSTRIP=
 # a wrap id (--last N) is in ONE run's gauge only (P3 11-02: the prod run's --last 432 skipped the trim of a re-unroll numbered w025-w266):
