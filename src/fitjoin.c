@@ -31,6 +31,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <pthread.h>
+#if defined __AVX512BW__ || defined __BMI2__
+#include <immintrin.h>
+#endif
 #include "fit.h"
 #include "afv.h"
 
@@ -69,23 +73,44 @@ static void fj_rows(void *ctx, int c0, int c1, int t) {
     }
 }
 
-/* The field rows of the box through a cache of two chunk-aligned row blocks: the requests run in z order (cmd_fit_join's sweep), so
+/* The field rows of the box through a cache of chunk-aligned row blocks: the requests run in z order (cmd_fit_join's sweep), so
    each chunk row is decoded once for the whole join (the boundaries' and the ref's rows used to decode their chunk rows again per request,
-   ~7 times each). The rows equal fit_fields_load's of the same range (loads of chunk-aligned rows decode straight into the block). */
-typedef struct { const char *dir; int cz, D; long long zoff; long tick; struct { int b0, b1; long use; fit_fields_buf f; } s[2]; } fj_cache;
-static int fj_block(fj_cache *C, int j, int keep) {   /* the slot holding block j (loaded on a miss into the least recent slot other than keep) */
-    for (int q = 0; q < 2; q++) if (C->s[q].f.a[9] && C->s[q].b0 == (int)((long long)j * C->cz - C->zoff < 0 ? 0 : (long long)j * C->cz - C->zoff)) { C->s[q].use = ++C->tick; return q; }
-    int q = !C->s[0].f.a[9] ? 0 : !C->s[1].f.a[9] ? 1 : C->s[0].use <= C->s[1].use ? 0 : 1;
-    if (q == keep) q = !q;
+   ~7 times each). The rows equal fit_fields_load's of the same range (loads of chunk-aligned rows decode straight into the block).
+   The next block is loaded on a thread while the current one's tasks sample (a third slot: the decode and the sampling overlapped; the
+   loads themselves are unchanged and one at a time, so the bytes are the same). */
+enum { FJ_NS = 3 };
+typedef struct { int b0, b1; long use; fit_fields_buf f; } fj_slot;
+typedef struct { const char *dir; int cz, D; long long zoff; long tick; fj_slot s[FJ_NS]; int pf, pq, pj, prc; pthread_t pt; } fj_cache;
+static long long fj_b0(const fj_cache *C, int j) { const long long b0 = (long long)j * C->cz - C->zoff; return b0 < 0 ? 0 : b0; }
+static int fj_load(fj_cache *C, int q, int j) {   /* block j into slot q */
     long long b0 = (long long)j * C->cz - C->zoff, b1 = b0 + C->cz; if (b0 < 0) b0 = 0; if (b1 > C->D) b1 = C->D;
     /* the evicted block's planes take the new rows (fit_fields_recycle: the same bytes, no fresh pages: the page faults and zeroing of
        ~3 x 128 x 13 MB per block were 315 of 890 CPU s of a Paris 4 join) */
     fit_fields_buf nb; fit_fields_recycle(1); const int rc = fit_fields_load_ex(C->dir, (int)b0, (int)b1, 1, &nb, 0, nullptr, 0, C->s[q].f.a[9] ? &C->s[q].f : nullptr); fit_fields_recycle(0);
     if (!C->s[q].f.a[9]) fit_fields_free(&C->s[q].f);
-    if (rc) return -1;
-    C->s[q].f = nb;
-    C->s[q].b0 = (int)b0; C->s[q].b1 = (int)b1; C->s[q].use = ++C->tick;
+    if (rc) { memset(&C->s[q], 0, sizeof C->s[q]); return -1; }
+    C->s[q].f = nb; C->s[q].b0 = (int)b0; C->s[q].b1 = (int)b1;
+    return 0;
+}
+static void *fj_pf_run(void *a) { fj_cache *C = a; C->prc = fj_load(C, C->pq, C->pj); return nullptr; }
+static void fj_pf_wait(fj_cache *C) { if (C->pf) { pthread_join(C->pt, nullptr); C->pf = 0; } }
+static int fj_victim(const fj_cache *C, int k0, int k1) {   /* an empty slot, else the least recent one other than k0, k1 */
+    int v = -1; for (int q = 0; q < FJ_NS; q++) { if (q == k0 || q == k1) continue; if (!C->s[q].f.a[9]) return q; if (v < 0 || C->s[q].use < C->s[v].use) v = q; }
+    return v;
+}
+static int fj_block(fj_cache *C, int j, int keep) {   /* the slot holding block j (loaded on a miss into the least recent slot other than keep) */
+    if (C->pf && C->pj == j) { fj_pf_wait(C); if (C->prc) return -1; C->s[C->pq].use = ++C->tick; return C->pq; }
+    for (int q = 0; q < FJ_NS; q++) if (!(C->pf && q == C->pq) && C->s[q].f.a[9] && C->s[q].b0 == (int)fj_b0(C, j)) { C->s[q].use = ++C->tick; return q; }
+    fj_pf_wait(C);   /* (a miss: loads one at a time) */
+    const int q = fj_victim(C, keep, -1); if (q < 0 || fj_load(C, q, j)) return -1;
+    C->s[q].use = ++C->tick;
     return q;
+}
+static void fj_prefetch(fj_cache *C, int j, int k0, int k1) {   /* block j on a thread into a slot other than k0, k1 (the current task's) */
+    if (C->pf || (long long)j * C->cz - C->zoff >= C->D) return;
+    for (int q = 0; q < FJ_NS; q++) if (C->s[q].f.a[9] && C->s[q].b0 == (int)fj_b0(C, j)) return;
+    const int q = fj_victim(C, k0, k1); if (q < 0) return;
+    C->pq = q; C->pj = j; C->prc = 0; C->pf = pthread_create(&C->pt, nullptr, fj_pf_run, C) == 0;
 }
 /* rows [fz0, fz1) (at most two blocks): *v views the pc ps w planes (own[3]: buffers to free when the rows span two blocks) */
 static int fj_rows_get(fj_cache *C, int fz0, int fz1, fit_fields *v, uint8_t *own[3]) {
@@ -96,9 +121,11 @@ static int fj_rows_get(fj_cache *C, int fz0, int fz1, fit_fields *v, uint8_t *ow
     memset(v, 0, sizeof *v); v->D = fz1 - fz0; v->H = A->shape[1]; v->W = A->shape[2]; v->h = A->h;
     if (j1 == j0) {
         const size_t o = (size_t)(fz0 - C->s[q0].b0) * plane; v->pc = A->a[0] + o; v->ps = A->a[1] + o; v->w = A->a[9] + o;
+        fj_prefetch(C, j0 + 1, q0, -1);
         return 0;
     }
     const int q1 = fj_block(C, j1, q0); if (q1 < 0) return -1;
+    fj_prefetch(C, j1 + 1, q0, q1);
     const fit_fields_buf *B = &C->s[q1].f; const int na = C->s[q0].b1 - fz0, nb = fz1 - C->s[q1].b0;
     const int pk[3] = {0, 1, 9};
     for (int k = 0; k < 3; k++) {
@@ -114,11 +141,23 @@ static int fj_rows_get(fj_cache *C, int fz0, int fz1, fit_fields *v, uint8_t *ow
    their order equal the serial scan's */
 enum { FJ_CH = 1 << 20 };
 typedef struct { const fit_fields *f; size_t n, stride; double minc; size_t *cnt, *seen0, **iv, *ni; float **cw; } fj_cells_job;
+static inline uint64_t fj_nz64(const uint8_t *w) {   /* (the non-zero bytes of 64) */
+#ifdef __AVX512BW__
+    const __m512i v = _mm512_loadu_si512((const void *)w); return (uint64_t)_mm512_test_epi8_mask(v, v);
+#else
+    uint64_t m = 0; for (int k = 0; k < 64; k++) m |= (uint64_t)(w[k] != 0) << k; return m;
+#endif
+}
 static void fj_cells_count(void *a, int c0, int c1, int t) {
     const fj_cells_job *J = a; (void)t;
-    for (int c = c0; c < c1; c++) { size_t s = 0; const size_t e = ((size_t)c + 1) * FJ_CH < J->n ? ((size_t)c + 1) * FJ_CH : J->n; for (size_t i = (size_t)c * FJ_CH; i < e; i++) s += J->f->w[i] != 0; J->cnt[c] = s; }
+    for (int c = c0; c < c1; c++) {
+        size_t s = 0, i = (size_t)c * FJ_CH; const size_t e = ((size_t)c + 1) * FJ_CH < J->n ? ((size_t)c + 1) * FJ_CH : J->n;
+        for (; i + 64 <= e; i += 64) s += (size_t)__builtin_popcountll(fj_nz64(J->f->w + i));
+        for (; i < e; i++) s += J->f->w[i] != 0;
+        J->cnt[c] = s;
+    }
 }
-static inline uint64_t fj_nz64(const uint8_t *w) { uint64_t m = 0; for (int k = 0; k < 64; k++) m |= (uint64_t)(w[k] != 0) << k; return m; }   /* (the non-zero bytes of 64) */
+
 static void fj_cells_pick(void *a, int c0, int c1, int t) {
     const fj_cells_job *J = a; (void)t; const fit_fields *f = J->f;
     for (int c = c0; c < c1; c++) {
@@ -130,9 +169,15 @@ static void fj_cells_pick(void *a, int c0, int c1, int t) {
             if (i0 + 64 <= e) m = fj_nz64(f->w + i0); else { m = 0; for (size_t i = i0; i < e; i++) m |= (uint64_t)(f->w[i] != 0) << (i - i0); }
             const size_t nm = (size_t)__builtin_popcountll(m);
             if (nm <= skip) { skip -= nm; continue; }
-            for (; m; m &= m - 1) {   /* the material cells in order */
-                const size_t i = i0 + (size_t)__builtin_ctzll(m);
-                if (skip) { skip--; continue; }
+            while (m) {   /* the material cells in order: the (skip + 1)-th set bit of m is the next pick */
+                if ((size_t)__builtin_popcountll(m) <= skip) { skip -= (size_t)__builtin_popcountll(m); break; }
+#ifdef __BMI2__
+                const int b = __builtin_ctzll(_pdep_u64(1ull << skip, m));
+#else
+                uint64_t mm = m; for (size_t q = 0; q < skip; q++) mm &= mm - 1; const int b = __builtin_ctzll(mm);
+#endif
+                m = b == 63 ? 0 : m & ~((2ull << b) - 1);   /* (the bits up to the pick consumed) */
+                const size_t i = i0 + (size_t)b;
                 skip = J->stride - 1;
                 const double cc = (f->pc[i] - 128) / 127.0, sn = (f->ps[i] - 128) / 127.0;
                 if (cc * cc + sn * sn < J->minc * J->minc) continue;
@@ -451,7 +496,7 @@ int cmd_fit_join(int argc, char **argv) {
     for (int i = 1; i < nt; i++) for (int j = i; j > 0 && (tk[j - 1].fz0 > tk[j].fz0 || (tk[j - 1].fz0 == tk[j].fz0 && tk[j - 1].ord > tk[j].ord)); j--) { const fj_task t = tk[j]; tk[j] = tk[j - 1]; tk[j - 1] = t; }   /* (z order, stable) */
     long long czoff = 0; const int cz = fit_fields_zchunk(fdir, &czoff);
     fit_fields_skip_planes(1 | 2 | 4 | 8);   /* (the rows: pc ps w) */
-    fj_cache C = {fdir, cz > 0 ? cz : 128, g.shape[0], czoff, 0, {{0}}};
+    fj_cache C; memset(&C, 0, sizeof C); C.dir = fdir; C.cz = cz > 0 ? cz : 128; C.D = g.shape[0]; C.zoff = czoff;
     for (int q = 0; q < nt; q++) {
         const fj_task *t = &tk[q]; fit_fields v; uint8_t *own[3]; const double tl = fj_now();
         const int bad = fj_rows_get(&C, t->fz0, t->fz1, &v, own); fj_tload += fj_now() - tl;
@@ -468,7 +513,7 @@ int cmd_fit_join(int argc, char **argv) {
         }
         for (int k = 0; k < 3; k++) free(own[k]);
     }
-    for (int q = 0; q < 2; q++) fit_fields_free(&C.s[q].f);
+    fj_pf_wait(&C); for (int q = 0; q < FJ_NS; q++) fit_fields_free(&C.s[q].f);
     free(tk);
     if (tms) fprintf(stderr, "fit-join times: the sweep (%d tasks) at %.1fs: field blocks %.1fs, cell picks %.1fs, differences %.1fs, phasors + histograms %.1fs\n", nt, fj_now() - tj0, fj_tload, fj_tcells, fj_trows, fj_thist);
     if (glob) printf("fit-join: --global: %d overlap edges (%d between consecutive slabs, %d longer), cost cap %g nats, full weight from %g cells\n", ns - 1 + nx, ns - 1, nx, cap, mincells);
