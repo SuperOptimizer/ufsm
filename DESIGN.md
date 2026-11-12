@@ -6,6 +6,146 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Self-supervision for the latent net: what the 10-21..25 DINO work showed, the plan (2026-11-12, branch latdino-20261112)
+
+User (11-12): "revive the self supervised dino stuff for latent net". Plan only; no GPU run yet.
+
+**What the old work (dino-train, 10-21..25; branches dino / dino-wip / dino-wip2, all merged into master) showed.** Its run
+directories (/vesuvius/ufsm/dino, ~/ufsm-data/dino/runs) are gone, and no sheet-identity table (dinovol-eval, sslev.sh) was written
+down, so the numbers below come from commit messages only:
+- It was a separate network and trainer (a 6-level hybrid conv + attention U-Net, D 16-64 unit embeddings, `--recipe 1` = the
+  upstream dinovol multi-crop DINO + iBOT with 32768 prototypes). It was never connected to a winding net and never measured on
+  wbench. Its only downstream use, `fit --emb` (votes from the embedding in the slip repair), was measured on a synthetic spiral
+  only (0.9707 -> 1.0000 ids).
+- It was unstable. The iBOT token norm ran away (|mean| 60) and the student collapsed (fix: a parameter-free LayerNorm). Then came
+  a stack of anti-collapse terms: a token variance hinge (`--ssl-ibot-zvar 10`), mean-prototype removal, a learnable logit scale,
+  SIGReg, and an embedding spread hinge (`--var 30`). DESIGN notes that SupCon collapse is a stationary point.
+- It was slow on the desk: the 4-level gate net took 10.5 s/step at P384.
+- The pseudo-label SupCon contradicted itself. The wind96 pseudo codes are gauge-consistent per ~128^3 (0.83-0.94) but only 0.64
+  box-wide, so P512 windows got contradictory long-range pairs, and the desk full run's GT SupCon loss stayed flat at 8.1 (the fix
+  was a pair radius and a radial limit). On 10-24 full.sh turned DINO / iBOT / the SSL batch off by default ("DINO / SSL nixed"):
+  pseudo labels + GT SupCon only. On 10-25 the work moved on to selftrain (stored-phase pseudo labels) and `train --distill`
+  (dinovol PCA-64 targets). From 11-09 the latent net replaced all of it.
+- So SSL was never shown to help or to hurt a winding net. It stalled on collapse and speed in a separate network, before the
+  question was asked.
+
+**Recommendation: (b), an auxiliary masked self-distillation term inside the latent trainer on unlabelled windows.**
+- u1 learns from 5 scans (Paris 4, 0139, 0500P2, 1667; 8 sources). /vesuvius/ufsm/v2/ct holds 34. Under (b) the trunk sees every
+  scroll, at no cost to the production schedule, and the supervised heads anchor the trunk against collapse (the 10-23 failure was
+  SSL alone).
+- (a), SSL pretraining and then a finetune, needs a separate multi-day run of both desk GPUs, which we do not have. Literature and
+  our own history agree that SSL pretraining gains shrink once the supervised finetune is long (u1: 16k steps).
+- (c), SupCon on labelled voxels, uses no unlabelled CT. The wind4 head is already a gauge-free sheet-identity loss on the same
+  voxels, and SupCon is where the pseudo-pair contradictions came from.
+
+**Loss (data2vec / iBOT in the latent cell grid).**
+- Two views of one CT window, with the same geometry (cells align one to one, so no crop -> source mapping). They differ in the
+  GPU appearance augmentation (ct / scan augment seeds) and the latc quantisation step (the `--lat-step-jitter` range, i.e.
+  invariance to the 20x compression standard).
+- The teacher is the EMA weights (`unet_use_ema`) running a forward pass on view A.
+- The student sees view B with a share r of the latent input cells masked in 2^3-cell blocks (latc channels zeroed; the radial
+  channels kept).
+- The target is a 1^3 side head of D 16 channels on decoder level 1 (76.8 um cells, width 128), i.e. the existing distillation
+  head (`cfg.emb_lev / emb_ch`, `side_head_bwd`). The teacher's outputs are unit-normalised and quantised to int8 x 127.
+- The loss is `nn_distill_loss`'s cosine on the masked cells only (int8 zero = no target, already the convention), plus `dn_varreg`
+  (the variance hinge from nn_dino.cu) on a 64k-cell sample of the student's head outputs.
+- The full-resolution head slabs and label streams are skipped on these windows, and the task heads get no gradient from them.
+- The fine stem does not reach level 1, so the voxel path cannot leak masked cells.
+
+**Implemented (8fd3e66, 34e31e5).** Differences from the plan above:
+- Unlabelled sources are the existing `"ct_only": 1` kind (the 10-25 distill plumbing), not a new "ssl" key. A GPU-free sampler-only
+  run (unwrap2 --lat, P 256, 80 batches) drew windows from every one of the 37 generated volumes that had a local zarr.json, with phase
+  known 0.000. The generator is `scripts/latdino/ssl-sources.sh` (PHerc0490B and PHercParis3 skipped: incomplete local copies). 0841
+  has no held-out ink boxes in holdouts-ink.json yet (asked inkB).
+- The mask zeroes the student's CT channel in 16^3-voxel blocks (`nn_ssl_mask`), before the latent cell transform, so the latc
+  cells and the fine stem are hidden together. Each block is one 2^3 group of level-1 cells.
+- The views differ by the mask and the latc quantiser step: the teacher uses the transform's own step, the student that step x
+  2^(u --ssl-jit), u uniform in [-1, 1]. A second appearance augmentation is not yet in.
+- Teacher targets are centred per window (the channel mean over the window's cells is subtracted) before the unit normalisation.
+- The variance hinge runs on the unit rows of 64k cells through `dn_gather` / `dn_varreg` / `dn_scatter_grad` (nn_dino.cu), with
+  gamma 1 / sqrt(D).
+- Not yet done: unlabelled windows still run the full-resolution head slabs (with zero loss masks), and the planner does not count
+  the side head and the ssl buffers (~0.3 GB at P 1024, D 16).
+- Tests:
+  - test_ssl: the mask in fp16 and fp32 against the host byte for byte; targets byte-identical; distinct sample indices; the
+    whole loss and its gradient against double central differences.
+  - test_heads (8): --ssl without a ct_only source logs exactly lat_plain's losses; with a ct_only copy at share 0.5, finite ssl
+    terms and targeted shares of 10-75%; the header and a resume.
+- GPU results (11-12, desk GPU 0, 5060 Ti):
+  - test_ssl PASS: mask 0 bytes differ in fp16 and fp32 (24576 of 73728 voxels masked at ratio 0.4); targets 0 bytes differ (104
+    of 240 cells); loss 0.843316 vs host 0.843315; gradient worst error 3.6e-9 of max 7.3e-3.
+  - test_heads ok: the 7 old layouts log the reference losses, and (8) passes.
+  - Fixture run (P 64, --ssl 8, share 0.5, 12 steps): 8 unlabelled windows. The targeted share equals the masked share of the CT
+    channel on every check (34-47 % at mask 0.4). The ssl cosine falls 0.330 -> 0.130, the hinge 0.048 -> 0.027, and the
+    per-dimension std of the unit rows stays 0.31-0.34 (gamma 0.354): no collapse at fixture scale. Labelled steps log their usual
+    terms.
+- Head-slab skip and planner (6a05337), checked on desk GPU 0 on 11-12:
+  - test_heads ok, including (8c): with the skip the --det fixture run logs exactly the losses of the run with the slabs
+    (UFSM_SSL_SLABS=1).
+  - Planner, UFSM_MEM_DRY at P 1024 with the unified run's flags (--ink-dice dropped: not on this branch's base), UFSM_MEM_FREE_GB 14:
+    without --ssl, mode 4 (lean 2) 11.43 GB; with --ssl 16 --ssl-share 0.25 (35 unlabelled sources = 25.0 % of the weight), the same
+    mode, 11.78 GB. The +0.35 GB is network +0.13 (the side head's outputs and parameters in the dry build) + task +0.20 (targets,
+    gradient, hinge points, margin) + workspace +0.01. 2.2 GB stay free on a 14 GB budget.
+- Holdouts: inkB added the 10 extra crops to holdouts-ink.json ("inkeval-ho", 98 boxes), on the 0500P2 2.215 um and 0841 2.403 um
+  scans. Those two volumes reject 5 / 6 boxes. `EXCLVOL` leaves out 0841's 9.366 um scan (the boxes are not mapped into it) and
+  0500P2's 9.362 um scan (a labelled source already), so 35 unlabelled volumes remain.
+
+**Code.**
+- Sources take `"ssl": 1` (CT only, no targets; `holdout_reject` for the wbench boxes).
+- New train flags: `--ssl D --ssl-level 1 --ssl-share S --ssl-mask r --ssl-weight w --ssl-var g`.
+- One new kernel: the cell-block mask.
+- The distillation head's half-res refusal is lifted for --ssl, and --distill with --ssl is refused.
+- Header key "ssl" only when on, and the side head's parameters are appended last.
+- With --ssl 0 every path is the old one (test_heads reference losses).
+- Tests: test_ssl (mask kernel vs host; teacher target quantisation; cosine + varreg gradient vs double central differences;
+  fixture run with an ssl source: finite, header, resume).
+
+**Cost.**
+- Memory, P 1024: about 0.3 GB more (fp32 head outputs and gradient, int8 targets, 2.1 M level-1 cells). The head outputs are fp32
+  as in --distill: the variance hinge needs exact statistics, and the buffers are small.
+- Compute, one SSL window: a teacher forward plus a student forward and backward with no full-resolution head slabs. Estimate
+  ~0.5-0.7 of a labelled window on the GPU and ~1/3 on the loader (no phase / wind4 builds).
+- At share 0.25 the expected wall cost is within +-10% (to be measured; u1 runs 0.42 windows/s on both GPUs).
+
+**Experiment.**
+- Two finetunes from u1 snap/16000, P 1024, one GPU each, the same seed / sources / LR, matched on labelled windows (2000):
+  A control; B `--ssl 16 --ssl-share 0.25 --ssl-mask 0.4 --ssl-weight 0.5 --ssl-var 1`.
+- Unlabelled pool: every scan in v2/ct except the wbench boxes and PHerc0175A, which is held out of SSL as the strictly unseen
+  control. PHerc1299 is in the pool: transductive, as in a production unroll.
+- About 2.7 h of both desk GPUs.
+- Metrics:
+  - wbench core p05x / ids as a non-regression gate. Noise floor (fibnote 11-11): ~0.01 p05x, ~0.02-0.03 ids. Expected effect
+    there: 0 to +0.01, since those scrolls are the labelled ones.
+  - The fibre judge (persistent sheet changes per m) on PHerc1299 and PHerc0175A tiles, where an effect, if any, should show.
+  - Robustness: p05x on 20x-compressed input.
+- Base checkpoint (lead): u1 stopped at ~13750 (u1/last.ckpt); there is no snap/16000. The A/B branches off the unified run's
+  first snapshot (the production trunk) or u1/last.ckpt.
+
+**3-D ink across the corpus (user 11-12: "dino on improving 3d ink corpus wide").** Human ink labels exist on ~8 scrolls.
+- What the DINO-guided relabel rounds bought: we cannot say. They are villa's (ink_3d_dino_guided: ps256 bcedice dinoguided v1 ->
+  v2 -> v3_fullsup, config.json in /vesuvius/ufsm/teachers/dino3d); we hold only the final 78k EMA checkpoint and none of their
+  per-round validation. Our only number is the final teacher on our 24 held-out crops: 3-D AUC Paris 4 0.727, 0139 0.651,
+  1667 0.561 against a CT floor of 0.513. A teacher at 0.56 on 1667 is too weak to distill there.
+- Stage 1, the feature term above: the unified run's ink head reads the same trunk, so any invariance or context the term buys
+  reaches ink. It is indirect and costs nothing extra.
+- Stage 2, ink consistency on unlabelled windows (`--ssl-ink W --ssl-ink-conf c`), with the same two views and the same EMA
+  teacher forward:
+  - The latent ink output is interpolated from the cell-level coarse logits (only the phase pair has the sub-cell head), so the
+    target can be the teacher's coarse ink probability per cell. It needs no full-resolution slabs. The fine stem's ink
+    contribution is absent on both sides.
+  - Soft BCE on the student's masked view, only on papyrus cells (CT >= iso) where the teacher is confident (|p - 0.5| >= c),
+    i.e. FixMatch / mean teacher with a gate.
+  - Start only once the unified ink head beats dino3d on the crops: self-training from a near-floor head reinforces noise.
+- Not chosen:
+  - Offline relabel rounds (predict ink on every scroll, gate, use as sources): GPU hours of whole-scroll inference per round,
+    which the online EMA version avoids.
+  - Distilling dino3d on unlabelled scrolls: it needs 2.4 um level 0 (the desk's 2.4 um CTs have none), is out of distribution
+    at 7.9-9.4 um, and is weak where it matters.
+- Metric: inkB's 34 crops (24 + 10 held out from 0500P2 / 0841; latres scores them per snapshot), 3-D AUC / best F1. 0500P2 /
+  0841 are the corpus-wide signal; Paris 4 / 0139 / 1667 are non-regression. The 1667 unroll's rendered ink AUC
+  (scripts/inkgt/wrapscore.py: 0.646, CT floor 0.540) is an end-to-end check, not an A/B metric (one unroll per arm). The noise
+  floor on the crops is not measured yet (a seed repeat is needed).
+
 ## Spiral post-processing QA: wrap repair, fibre / GT judges, outlier slabs, flattening distortion (2026-11-12, branch spiralqa-20261112)
 
 On the two u1-13000 unrolls of the day (`/vesuvius/ufsm/unroll/PHerc1667-u1`, `PHercParis4-u1`), CPU only; outputs in `<run>/qa/*`,

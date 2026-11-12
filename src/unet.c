@@ -1664,6 +1664,7 @@ void unet_set_lat_basis(unet *u, const float *bas, const float *gain, int C, flo
     nn_h2d(u->lat_bas, u->lat_hb, (size_t)C * 64 * 4); nn_h2d(u->lat_gain, u->lat_hg, (size_t)C * 4);
 }
 void unet_set_lat_step(unet *u, float step) { u->lat_run_step = step; }   /* this forward's quantiser step (training jitter); 0: the transform's own */
+float unet_get_lat_step(const unet *u) { return u->lat_run_step; }
 int unet_lat_basis(const unet *u, const float **bas, const float **gain, float *step) { if (u->lat_C) { *bas = u->lat_bas; *gain = u->lat_gain; *step = u->lat_step; } return u->lat_C; }
 int unet_logits_h16(const unet *u) { return u->built && u->logits_h16; }
 void unet_set_fp16_logits(unet *u, int on) {   /* takes effect at the next build */
@@ -4491,19 +4492,33 @@ int unet_load(unet *u, const char *path) {
     if (!f) return -1;
     unet_cfg cfg; int step = 0; size_t np = 0;
     g_loaded_sparse = 0; g_loaded_wq = 0; g_loaded_muon = 0;
-    if (read_header(f, &cfg, &step, &np) || np != u->np) { fclose(f); return -1; }
-    float *h = malloc(u->np * 4);
+    if (read_header(f, &cfg, &step, &np)) { fclose(f); return -1; }
+    /* a checkpoint without the side head (cfg.emb_lev) this net has (train --ssl resumed from a run without it): the head's block
+       [eh.w, eh.b + emb_ch) is inserted -- weights and EMA take this net's fresh weights, its optimizer state starts at zero;
+       every other parameter (before and after the block: film, fstem, ...) and its state is the checkpoint's */
+    size_t i0 = 0, i1 = 0;
+    if (np != u->np) {
+        if (u->cfg.emb_lev && !cfg.emb_lev) { i0 = u->eh.w; i1 = u->eh.b + (size_t)u->cfg.emb_ch; }
+        if (!i1 || np + (i1 - i0) != u->np || i1 > u->np) { fclose(f); return -1; }
+        fprintf(stderr, "unet: %s has no side head: its %zu parameters inserted fresh (optimizer state 0)\n", path, i1 - i0);
+    }
+    float *h = malloc(u->np * 4), *hc = i1 ? malloc(u->np * 4) : nullptr;
     float *arrs[4] = {u->p, u->ema, u->m, u->v};
     for (int a = 0; a < 4; a++) {
-        if (fread(h, 4, u->np, f) != u->np) { if (a < 2) { fclose(f); free(h); return -1; } break; }
+        if (fread(h, 4, np, f) != np) { if (a < 2) { fclose(f); free(h); free(hc); return -1; } break; }
+        if (i1) {   /* old [0, i0) | the block (this net's init for p / ema, 0 for the moments) | old [i0, np) */
+            if (a < 2) nn_d2h(hc, u->p, u->np * 4); else memset(hc, 0, u->np * 4);   /* (the EMA of the block: its fresh weights too) */
+            memmove(h + i1, h + i0, (np - i0) * 4); memcpy(h + i0, hc + i0, (i1 - i0) * 4);
+        }
         nn_h2d(arrs[a], h, u->np * 4);
     }
     if (g_loaded_muon) {
-        if (fread(h, 4, u->np, f) != u->np) { fclose(f); free(h); return -1; }
+        if (fread(h, 4, np, f) != np) { fclose(f); free(h); free(hc); return -1; }
+        if (i1) { memmove(h + i1, h + i0, (np - i0) * 4); memset(h + i0, 0, (i1 - i0) * 4); }
         if (!u->muon_mom) u->muon_mom = nn_malloc(u->np * 4);
         nn_h2d(u->muon_mom, h, u->np * 4);
     } else if (u->muon_mom) nn_zero(u->muon_mom, u->np * 4);   /* old checkpoints have no Muon state */
-    free(h);
+    free(h); free(hc);
     fclose(f);
     u->mx_R_nload = g_loaded_hbR_n; memcpy(u->mx_R_load, g_loaded_hbR, (size_t)g_loaded_hbR_n * 4); u->mx_R_ok = 0;   /* none: from the weights */
     u->ninh = 0; for (int i = 0; i < g_loaded_ninh; i++) inh_add(u, g_loaded_inh[2 * i], g_loaded_inh[2 * i + 1]);   /* (none: all fresh) */

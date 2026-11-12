@@ -437,6 +437,9 @@ suite-bins: $(B)/test_head32
 $(B)/test_dino_loss: tests/test_dino_loss.c $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_dino_loss.c $(B)/nn.o $(B)/nn_fp8.o -o $@ $(LDLIBS) $(CUDALIBS)
 suite-bins: $(B)/test_dino_loss
+$(B)/test_ssl: tests/test_ssl.c src/ssl.h $(B)/nn.o $(B)/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_ssl.c $(B)/nn.o $(B)/nn_fp8.o -o $@ $(LDLIBS) $(CUDALIBS)
+suite-bins: $(B)/test_ssl
 $(B)/test_attn: tests/test_attn.c $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_attn.c $(B)/nn.o $(B)/nn_fp8.o -o $@ $(LDLIBS) $(CUDALIBS)
 suite-bins: $(B)/test_attn
