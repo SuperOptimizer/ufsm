@@ -983,7 +983,12 @@ static void head_slab_pass(gpu_state *d, int pass) {
         fprintf(stderr, "head slabs (GPU %d): the slabs' derived targets %s (%.2f GB, %.2f GB free before; UFSM_HS_TCACHE=0 / 1)\n", d->dev,
                 d->tc ? "kept from the statistics pass for the gradient pass" : "built in both passes", need / 1e9, fr / 1e9);
     }
-    const int tskip = pass && d->tc != nullptr && d->tc_ok;   /* (the gradient pass of a step: this window's slabs are in the cache) */
+    /* UFSM_HS_TCACHE_CHECK=1 (tests): the gradient pass builds every slab's targets as without the cache and compares them with the
+       cached ones, byte for byte, every plane; stops at the first difference */
+    static int tchk_on = -1; if (tchk_on < 0) tchk_on = ufsm_env_on("UFSM_HS_TCACHE_CHECK");
+    static size_t tchk_n;
+    const int tchk = tchk_on && pass && d->tc != nullptr && d->tc_ok;
+    const int tskip = pass && d->tc != nullptr && d->tc_ok && !tchk;   /* (the gradient pass of a step: this window's slabs are in the cache) */
     if (!pass) d->tc_ok = 0;   /* (valid for one step only: a replay of the window has other targets, a validation pass another window) */
     if (!pass) d->mil_n = 0;
     if (!pass && nmil) { nn_zero(d->milacc, (size_t)nmil * d->mil_k * sizeof(float)); nn_zero(d->milloss, sizeof(double)); }
@@ -993,12 +998,16 @@ static void head_slab_pass(gpu_state *d, int pass) {
         const size_t ns = (size_t)nz * hw, vb = (size_t)z0 * hw;
 #define LGC(c) ((char *)d->hs_lg + (size_t)(c) * ns * 2)
         const uint8_t *sdb = d->sdb, *w4 = d->w4, *wc = d->wc, *apl[AUX_N]; for (int j = 0; j < AUX_N; j++) apl[j] = d->aux[j];
-        if (d->tc) {   /* this slab's block of the cache instead of the one-slab buffers */
+        uint8_t *tcp[6] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};   /* this slab's block of the cache: sidet, sidem, rvt, rvm, nt, nm */
+        if (d->tc) {
             uint8_t *b = d->tc + (size_t)(z0 / Z) * tcB;
-            d->sidet = b; b += (size_t)g_side_nc * tcS; d->sidem = b; b += tcS;
-            if (g_rv) { d->rvt = b; b += 2 * tcS; d->rvm = b; b += tcS; }
-            d->nt = b; b += 7 * tcS; d->nm = b;
+            tcp[0] = b; b += (size_t)g_side_nc * tcS; tcp[1] = b; b += tcS;
+            if (g_rv) { tcp[2] = b; b += 2 * tcS; tcp[3] = b; b += tcS; }
+            tcp[4] = b; b += 7 * tcS; tcp[5] = b;
         }
+#define TC_POINT() do { d->sidet = tcp[0]; d->sidem = tcp[1]; if (g_rv) { d->rvt = tcp[2]; d->rvm = tcp[3]; } d->nt = tcp[4]; d->nm = tcp[5]; } while (0)
+        if (d->tc && !tchk) TC_POINT();   /* instead of the one-slab buffers (the check builds into those first) */
+        else if (tchk) { d->sidet = tsv[0]; d->sidem = tsv[1]; d->rvt = tsv[2]; d->rvm = tsv[3]; d->nt = tsv[4]; d->nm = tsv[5]; }
         const int sj = z0 / Z, pipe = g_lstream && d->lbs2[0]; uint8_t *const *const lb = pipe && (sj & 1) ? d->lbs2 : d->lbs;
         if (g_lstream) {   /* this slab's label planes from the host (the phase with the gradient stencil's g_norm_s planes each side, the fibre H / V
                               planes with g_fd_r: lhalo); the kernels index window voxels */
@@ -1091,6 +1100,17 @@ static void head_slab_pass(gpu_state *d, int pass) {
         if (g_packed_w > 1 && !tskip) nn_packed_mask_z(sdb, D, H, W, g_norm_s, d->um, g_packed_um, g_packed_w, d->sidem, z0, z1);   /* packed sheets weigh more */
         FT("  t packed mask (side)");
         if (!tskip) nn_unwrap_targets2_z(sdb, D, H, W, g_norm_s, g_dens_scale, g_dens_code, d->um, g_packed_um, g_packed_w, d->nt, d->nm, z0, z1); FT("  t normal targets");
+        if (tchk) {   /* the planes just built in the one-slab buffers against the cache's, then on with the cache as a training step would */
+            const size_t nb[6] = {(size_t)g_side_nc * ns, ns, g_rv ? 2 * ns : 0, g_rv ? ns : 0, 7 * ns, ns}; static const char *const nm6[6] = {"phase targets", "phase mask", "rv targets", "rv mask", "normal targets", "normal mask"};
+            nn_sync();
+            for (int k = 0; k < 6; k++) { if (!nb[k]) continue;
+                uint8_t *ha = malloc(nb[k]), *hb = malloc(nb[k]); nn_d2h(ha, tsv[k], nb[k]); nn_d2h(hb, tcp[k], nb[k]);
+                if (memcmp(ha, hb, nb[k])) { size_t q = 0; while (ha[q] == hb[q]) q++;
+                    fprintf(stderr, "target cache check: slab z %d..%d, %s: the cached plane differs from the rebuilt one at byte %zu of %zu (%d vs %d)\n", z0, z1, nm6[k], q, nb[k], hb[q], ha[q]); abort(); }
+                tchk_n += nb[k]; free(ha); free(hb); }
+            if (z1 == D) fprintf(stderr, "target cache check: %zu bytes of cached targets and masks equal the rebuilt ones so far\n", tchk_n);
+            TC_POINT();
+        }
         if (lchk && !pass) {   /* UFSM_LAT_CHECK=1: how dense the supervision is (slabs with every mask zero could skip their kernels: none in the rv recipe) */
             uint8_t *h = malloc(3 * ns); nn_sync(); nn_d2h(h, d->sidem, ns); nn_d2h(h + ns, sm, ns); nn_d2h(h + 2 * ns, d->nm, ns);
             static size_t nsl, nemp, nvox, nsup[3]; size_t c[3] = {0, 0, 0};
@@ -1219,6 +1239,7 @@ static void head_slab_pass(gpu_state *d, int pass) {
         }
         PT("adjoint");
         if (pipe) nn_event_record(d->evl_free[sj & 1], 0);
+#undef TC_POINT
 #undef LGC
 #undef PT
 #undef FT
