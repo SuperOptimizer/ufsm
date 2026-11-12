@@ -34,6 +34,8 @@
 #include <fcntl.h>
 #include "embz.h"
 #include "sample_emb.h"
+#include "ssl.h"
+#include "dino.h"
 
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 static const char *opt(int argc, char **argv, const char *name, const char *dflt) {
@@ -110,7 +112,8 @@ typedef struct {
     uint8_t *papb[2], *pap, *pt1, *pmk1, *pw1; float *pscr, pout3[3]; double pap_loss;   /* --pap-head: labels (double-buffered), target, mask, weight; scratch, parts */
     void *x2, *glh, *lrt; float *lgf;  /* --half-res: the network's input and logit gradient, the intermediate grid (div 4), the full-resolution fp32 logits */
     uint8_t *ds_t[UNET_MAXLEV], *ds_m[UNET_MAXLEV]; float *ds_gl[UNET_MAXLEV], *ds_scr[UNET_MAXLEV], ds_out[UNET_MAXLEV][2 * 8 + 2]; double ds_loss; int ds_fresh;   /* --deep-sup (fresh: the last batch computed them) */
-    int8_t *embb[2], *embt; float *embg; double *embds, embh[2], emb_loss, emb_cells; int emb_fresh;   /* --distill: feature targets (double-buffered), head gradient, loss sums (sum 1 - cos, cells) */
+    int8_t *embb[2], *embt; float *embg; double *embds, embh[2], emb_loss, emb_cells; int emb_fresh;
+    int8_t *sslt; float *sslg, *ssle, *sslnrm, *sslge, *sslvo, sslvh[2]; double *sslds, *sslmu, sslh[2], ssl_loss, ssl_cells; int *sslidx, ssl_win, ssl_fresh; uint64_t ssl_rs, ssl_seed;   /* --ssl: the teacher's int8 targets, the side head's fp32 gradient, the variance hinge's points (unit rows, norms, row gradient, out[0] loss / out[1] std), loss sums, channel means; whether this window is an unlabelled one, whether its terms ran; the mask generator */   /* --distill: feature targets (double-buffered), head gradient, loss sums (sum 1 - cos, cells) */
     uint8_t *rlow; void *rscr; size_t rscr_b; double *rst, rst_h[RP_NST]; float *rrd; restore_recipe rcp;   /* task restore: degraded input (uint8), degradation scratch,
                                                                                       loss sums (device / last fetched), the recipe of the next forward */
 } gpu_state;
@@ -257,6 +260,7 @@ static int g_hs_z;         /* its planes per slab */
 static int g_ds; static float g_ds_w = 0.5f, g_ds_frac = 1.f; static int g_ds_anneal = 1;   /* --deep-sup K: decoder levels 1..K, weight w^j x frac */
 static int g_distill, g_distill_lev = 3, g_distill_div; static float g_distill_w = 1.f; static float g_distill_pap;   /* --distill-papyrus F: targets only on head cells >= F papyrus */ static size_t g_distill_n;   /* --distill C: a C-channel 1^3 head on decoder level --distill-level
                                                                                                     (cells of g_distill_div^3 window voxels; g_distill_n int8 targets per batch), cosine loss x --distill-weight */
+static int g_ssl, g_ssl_lev = 1, g_ssl_bv = 16, g_ssl_npts = 65536; static float g_ssl_w = 0.5f, g_ssl_mask = 0.4f, g_ssl_var = 1.f, g_ssl_gamma, g_ssl_jit = 1.f; static size_t g_ssl_S;   /* --ssl D: masked self-distillation on "ct_only" windows (src/ssl.h): a D-channel side head on decoder level --ssl-level, cells of g_ssl_S per window */
 static float g_count_lambda; static int g_count_K = 1024, g_count_L = 64; static int g_cnt_ns; static float g_cnt_edges[8];   /* --count-strata */   /* --count-lambda / -segments / -length: the count loss (nn_count_loss) */
 static float g_pg_lambda, g_pg_dist[4] = {2.f}; static int g_pg_nd = 1, g_pg_angle, g_pg_mask;   /* --pgrad-lambda / --pgrad-dist (D[,D...], up to 4): the phase wavenumber loss (nn_pgrad_slab; head slabs only) */
 /* --task papyrus: papyrus vs void inside the scroll, labels made by the sampler from the clean CT at a random cutoff per patch
@@ -979,7 +983,7 @@ static void head_slab_pass(gpu_state *d, int pass) {
     static int fine = -1; if (fine < 0) fine = getenv("UFSM_PTICK") && atoi(getenv("UFSM_PTICK")) >= 2;   /* UFSM_PTICK=2: the target / loss kernels one by one (both passes summed) */
 #define FT(w) do { if (fine) nn_ptick(w); } while (0)
     const int si = d->srcb[d->cur];   /* the window's source (its "heads" weights) */
-    const int nmil = g_mil ? d->miln[d->cur] : 0; const inkray *mrays = nmil ? d->milr[d->cur] : nullptr;
+    const int nmil = g_mil && !(g_lat && d->ssl_win && !getenv("UFSM_SSL_SLABS")) ? d->miln[d->cur] : 0; const inkray *mrays = nmil ? d->milr[d->cur] : nullptr;   /* (--ssl: an unlabelled window runs no slabs, so no MIL rays) */
     /* UFSM_MIL_CHECK=1: the device MIL path against the host reference (inksplat.c ink_mil_loss_host, central-difference tested in test_ink_mil)
        on this window's own fp16 logits: the pass-0 loss, and the gradient pass 1 adds (after - before bwd_slab, 16-bit) */
     static int mchk = -1; if (mchk < 0) mchk = ufsm_env_on("UFSM_MIL_CHECK");
@@ -989,7 +993,17 @@ static void head_slab_pass(gpu_state *d, int pass) {
     if (!pass) d->mil_n = 0;
     if (!pass && nmil) { nn_zero(d->milacc, (size_t)nmil * d->mil_k * sizeof(float)); nn_zero(d->milloss, sizeof(double)); }
     if (!pass) { nn_zero(d->hs_ds, 128 * sizeof(double)); if (g_unwrap2) nn_zero(d->w4ds, nn_wind4_sums()); if (g_fibn) nn_zero(d->fibacc, 2 * sizeof(double)); }
-    for (int z0 = 0; z0 < D; z0 += Z) {
+    const int ssl_skip = g_lat && d->ssl_win && !getenv("UFSM_SSL_SLABS");   /* --ssl, an unlabelled window: no supervised term, so no slabs (the losses
+                                                                               finalise from zero sums; the coarse gradient stays zero; the streamed head's
+                                                                               backward gets zero planes). UFSM_SSL_SLABS=1: the slabs as on a labelled window */
+    if (ssl_skip && pass && g_lat_hs) {
+        const size_t pl = (size_t)(H / 4) * (W / 4); const int Dc = D / 4, step = Z / 4 > 0 ? Z / 4 : 1;
+        nn_zero(d->latgc, (size_t)LNC * step * pl * 2);
+        for (int f0 = 0; f0 < Dc; f0 += step) { const int f1 = f0 + step < Dc ? f0 + step : Dc;
+            if (unet_head_bwd_z(d->u, f0, f1, d->latgc, f0 == 0)) { fprintf(stderr, "ssl: the latent head backward is not covered per slab\n"); abort(); } }
+        nn_ptick("trunk backward");
+    }
+    for (int z0 = 0; z0 < D && !ssl_skip; z0 += Z) {
         const int z1 = z0 + Z < D ? z0 + Z : D, nz = z1 - z0;
         const size_t ns = (size_t)nz * hw, vb = (size_t)z0 * hw;
 #define LGC(c) ((char *)d->hs_lg + (size_t)(c) * ns * 2)
@@ -1461,8 +1475,35 @@ static void gc_report(gpu_state *d, int step) {   /* the tasks' cosines at the h
     fprintf(stderr, "%s\n", ln);
     free(S); free(W); free(ct);
 }
+/* --ssl: the EMA teacher's forward over the whole window (the step's own quantiser step), its side head into int8 targets at the masked
+   cells, then the student's input: the masked blocks of the CT channel zeroed, the latent cells quantised with a jittered step */
+static void ssl_teacher(gpu_state *d, shape5 ls, int P) {
+    const float *jb, *jg; float jst = 0.f; unet_lat_basis(d->u, &jb, &jg, &jst);
+    const float st_student = unet_get_lat_step(d->u);
+    d->ssl_rs = rmix(d->ssl_rs + 0x9E3779B97F4A7C15ull); d->ssl_seed = d->ssl_rs;
+    if (jst > 0.f) unet_set_lat_step(d->u, jst);
+    unet_use_ema(d->u, 1);
+    unet_forward_x(d->u, d->x, ls, 1, g_xfmt != 0); nn_ptick("ssl teacher forward");
+    shape5 se; const float *ye = unet_emb_logits(d->u, &se);
+    if (!ye || (size_t)se.d * se.h * se.w != g_ssl_S || se.c != g_ssl) { fprintf(stderr, "ssl: no side head outputs of %zu cells after the teacher forward\n", g_ssl_S); abort(); }
+    nn_ssl_targets(ye, se.c, se.d, se.h, se.w, 4 << g_ssl_lev, g_ssl_bv, g_ssl_mask, d->ssl_seed, d->sslmu, d->sslt);
+    unet_use_ema(d->u, 0);
+    if (jst > 0.f) {
+        const uint64_t r = rmix(d->ssl_seed ^ 0xA5A5A5A5A5A5A5A5ull); const double u = (double)(r >> 11) * (2.0 / 9007199254740992.0) - 1.0;
+        unet_set_lat_step(d->u, g_ssl_jit > 0.f ? jst * exp2f(g_ssl_jit * (float)u) : st_student);
+    }
+    nn_ssl_mask(d->x, (int)xbytes(), g_Pz, P, g_ssl_bv, g_ssl_mask, d->ssl_seed);
+    if (ufsm_env_on("UFSM_SSL_CHECK")) {   /* the targeted share of the cells and the masked share of the CT channel */
+        const size_t n = (size_t)g_ssl * g_ssl_S, p3 = (size_t)g_Pz * P * P; int8_t *ht = malloc(n); uint16_t *hx = malloc(p3 * xbytes()); nn_sync(); nn_d2h(ht, d->sslt, n); nn_d2h(hx, d->x, p3 * xbytes());
+        size_t nt = 0, nz = 0; for (size_t i = 0; i < g_ssl_S; i++) { int a = 0; for (int c = 0; c < g_ssl; c++) a |= ht[(size_t)c * g_ssl_S + i] != 0; nt += a; }
+        for (size_t i = 0; i < p3; i++) { int z = 1; for (size_t b = 0; b < xbytes() / 2; b++) z &= hx[i * (xbytes() / 2) + b] == 0; nz += z; }
+        fprintf(stderr, "ssl check (GPU %d): %.1f%% of the cells targeted, %.1f%% of the CT channel zero (mask %g)\n", d->dev, 100.0 * nt / g_ssl_S, 100.0 * nz / p3, g_ssl_mask);
+        free(ht); free(hx);
+    }
+}
 static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
     shape5 xs = {B, g_xc, d->side >= 0 ? g_Dl : g_Pz, P, P};
+    { const int si = d->srcb[d->cur]; d->ssl_win = g_ssl && train && g_S && si >= 0 && si < g_S->n && g_S->src[si].ct_only; d->ssl_fresh = 0; }
     if (unet_cfg_of(d->u)->film) { const float c[2] = {unet_scale_code(d->um), unet_scale_code(d->umd)}; unet_set_film(d->u, c, unet_cfg_of(d->u)->film); }   /* (B 1) */
     if (unet_cfg_of(d->u)->scale_cond) { if (g_papyrus) unet_set_cond(d->u, d->um); else unet_set_scale(d->u, d->um); }   /* B == 1 (checked at
                                                                                                     startup); papyrus: um is the cutoff code */
@@ -1501,7 +1542,11 @@ static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
         const float *l2 = unet_forward_x(d->u, d->x2, (shape5){B, unet_cfg_of(d->u)->cin, q, q, q}, train, g_xfmt != 0);
         nn_lowres_output(l2, unet_logits_h16(d->u), hs, g_hdiv, hm, (float *)d->lrt, d->lgf);
         lg = d->lgf;
-    } else if (g_lat) { nn_ptick("other"); lg = unet_forward_x(d->u, d->x, (shape5){B, unet_cfg_of(d->u)->cin, g_Pz / 4, P / 4, P / 4}, train, g_xfmt != 0); nn_ptick("trunk forward"); }   /* --lat: x the full-resolution CT channel */
+    } else if (g_lat) {   /* --lat: x the full-resolution CT channel */
+        nn_ptick("other"); const shape5 ls = {B, unet_cfg_of(d->u)->cin, g_Pz / 4, P / 4, P / 4};
+        if (d->ssl_win) ssl_teacher(d, ls, P);   /* --ssl, an unlabelled window: the teacher's targets, the student's masked input */
+        lg = unet_forward_x(d->u, d->x, ls, train, g_xfmt != 0); nn_ptick("trunk forward");
+    }   /* --lat: x the full-resolution CT channel */
     else lg = unet_forward_x(d->u, d->x, xs, train, g_xfmt != 0);
     d->lg = lg;
     mem_post(d, B, train);
@@ -1525,6 +1570,23 @@ static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
         if (!ye) { fprintf(stderr, "distill: no head outputs after the forward\n"); abort(); }
         nn_distill_loss(ye, d->embt, se.n, se.c, (size_t)se.d * se.h * se.w, g_distill_w, d->embg, d->embds);
         unet_set_emb_grad(d->u, d->embg);
+    }
+    if (g_ssl && train) {   /* --ssl: the side head's cosine loss at the masked cells + the variance hinge on unlabelled windows; none elsewhere */
+        if (d->ssl_win) {
+            shape5 se; const float *ye = unet_emb_logits(d->u, &se); const int C = se.c; const size_t S = g_ssl_S;
+            nn_distill_loss(ye, d->sslt, 1, C, S, g_ssl_w, d->sslg, d->sslds);
+            nn_zero(d->sslvo, 8 * 4);
+            if (g_ssl_var > 0.f) {
+                const uint64_t r = rmix(d->ssl_seed ^ 0x3C6EF372FE94F82Bull);
+                nn_ssl_idx(d->sslidx, g_ssl_npts, S, (size_t)(r % S), ssl_stride(S, r >> 32));
+                dn_gather(ye, 0, S, C, d->sslidx, g_ssl_npts, d->ssle, d->sslnrm);
+                nn_zero(d->sslge, (size_t)g_ssl_npts * C * 4);
+                dn_varreg(d->ssle, g_ssl_npts, C, g_ssl_gamma, g_ssl_var, d->sslge, d->sslvo);
+                dn_scatter_grad(d->ssle, d->sslge, d->sslnrm, d->sslidx, g_ssl_npts, C, S, 1.f, d->sslg);
+                dn_emb_std(d->ssle, g_ssl_npts, C, d->sslvo + 1);
+            }
+            unet_set_emb_grad(d->u, d->sslg); d->ssl_fresh = 1;
+        } else unet_set_emb_grad(d->u, nullptr);
     }
     if (g_head_slab) {   /* the head per z-slab: the loss statistics now, the gradients in the backward (head_slab_cb) */
         int prof = ufsm_env_on("UFSM_PROF");
@@ -1768,6 +1830,11 @@ static double fetch_loss(gpu_state *d, int B, int P, float dice_w, float *out) {
         nn_d2h(d->embh, d->embds, 2 * sizeof(double)); d->emb_cells = d->embh[1];
         d->emb_loss = d->embh[1] > 0 ? g_distill_w * d->embh[0] / d->embh[1] : 0;
     }
+    d->ssl_loss = d->ssl_cells = 0; d->sslvh[0] = d->sslvh[1] = 0;
+    if (g_ssl && d->ssl_fresh) {   /* --ssl: weight x mean 1 - cos over the targeted cells, the hinge's loss and the points' mean std */
+        nn_d2h(d->sslh, d->sslds, 2 * sizeof(double)); nn_d2h(d->sslvh, d->sslvo, 2 * sizeof(float)); d->ssl_cells = d->sslh[1];
+        d->ssl_loss = (d->sslh[1] > 0 ? g_ssl_w * d->sslh[0] / d->sslh[1] : 0) + d->sslvh[0];
+    }
     d->ds_loss = 0;
     if (g_ds && d->ds_fresh) for (int j = 1; j <= g_ds; j++) {   /* weight x mean over the active channels of bce + dice_w dice */
         shape5 sj; unet_ds_logits(d->u, j, &sj); float *o = d->ds_out[j]; nn_loss_fetch(d->ds_scr[j], sj, o);
@@ -1834,7 +1901,7 @@ static double fetch_loss(gpu_state *d, int B, int P, float dice_w, float *out) {
         const float sb = out[CH_SHEET], sd = out[cout + CH_SHEET], act = out[2 * cout];
         out[CH_RECTO] = na ? rb / na : 0; out[CH_SHEET] = sb; out[NCH + CH_RECTO] = na ? rd / na : 0; out[NCH + CH_SHEET] = sd; out[2 * NCH] = act;
     }
-    return (active ? loss / active : 0)+d->sheet_loss+d->aff_loss+d->verso_loss+d->side_loss+d->ink_loss+d->mil_loss+d->norm_loss+d->cond_loss+d->pap_loss+d->count_loss+d->pg_loss+d->ds_loss+d->w4_loss+d->emb_loss+d->rv_loss+d->fib_loss;
+    return (active ? loss / active : 0)+d->sheet_loss+d->aff_loss+d->verso_loss+d->side_loss+d->ink_loss+d->mil_loss+d->norm_loss+d->cond_loss+d->pap_loss+d->count_loss+d->pg_loss+d->ds_loss+d->w4_loss+d->emb_loss+d->ssl_loss+d->rv_loss+d->fib_loss;
 }
 
 /* --split z: forward, loss and backward of one window on both GPUs (src/split.h) */
@@ -2375,6 +2442,35 @@ int cmd_train(int argc, char **argv) {
             fprintf(stderr, "distill: %d channels on decoder level %d (%d^3 voxels per cell), cosine weight %g\n", g_distill, g_distill_lev, g_distill_div, g_distill_w);
         }
     }
+    {   /* --ssl D (src/ssl.h, DESIGN 2026-11-12): masked self-distillation on the sources' "ct_only" windows. The EMA teacher's D-channel
+           side head (the --distill head: cfg.emb_lev / emb_ch, appended last) on decoder level --ssl-level over the whole window, centred
+           and unit-normalised, is the cosine target of the student's at the cells of the --ssl-mask share of --ssl-block^3-voxel blocks
+           zeroed in its CT channel; a variance hinge (--ssl-var lambda, std >= --ssl-gamma, default 1 / sqrt(D)) on --ssl-points cells
+           against collapse. The student's latent cells are quantised with the transform's step x 2^(--ssl-jit u), the teacher's with the
+           step itself. Labelled windows train as before (no side-head gradient); a resumed net keeps its head */
+        g_ssl = atoi(opt(argc, argv, "--ssl", "0")); g_ssl_lev = atoi(opt(argc, argv, "--ssl-level", "1"));
+        g_ssl_w = (float)atof(opt(argc, argv, "--ssl-weight", "0.5")); g_ssl_mask = (float)atof(opt(argc, argv, "--ssl-mask", "0.4"));
+        g_ssl_bv = atoi(opt(argc, argv, "--ssl-block", "16")); g_ssl_var = (float)atof(opt(argc, argv, "--ssl-var", "1"));
+        g_ssl_npts = atoi(opt(argc, argv, "--ssl-points", "65536")); g_ssl_jit = (float)atof(opt(argc, argv, "--ssl-jit", "1"));
+        if (resume && g_ssl) { unet_cfg pc; int st; if (!unet_peek(resume, &pc, &st) && pc.emb_lev) { g_ssl = pc.emb_ch; g_ssl_lev = pc.emb_lev; } }
+        if (g_ssl) {
+            const int cv = 4 << g_ssl_lev;
+            if (g_distill) { fprintf(stderr, "--ssl and --distill share the side head: one of them\n"); return 2; }
+            if (!g_lat) { fprintf(stderr, "--ssl: the latent grid (--lat 4)\n"); return 2; }
+            if (B != 1 || split) { fprintf(stderr, "--ssl: B 1, whole windows (no --split)\n"); return 2; }
+            if (g_ssl < 2 || g_ssl > 128 || g_ssl_lev < 1 || g_ssl_lev > cfg.nlev - 2 || !(g_ssl_w > 0) || !(g_ssl_mask > 0 && g_ssl_mask < 1) || g_ssl_var < 0 || g_ssl_npts < 2) {
+                fprintf(stderr, "--ssl D (2..128), --ssl-level 1..%d, --ssl-weight > 0, --ssl-mask in (0, 1), --ssl-var >= 0, --ssl-points >= 2\n", cfg.nlev - 2); return 2;
+            }
+            if (g_ssl_bv % cv || P % g_ssl_bv || g_Pz % g_ssl_bv) { fprintf(stderr, "--ssl-block %d: a multiple of the level-%d cell (%d voxels) dividing P and Pz\n", g_ssl_bv, g_ssl_lev, cv); return 2; }
+            if (cfg.l0_norm == 2) { fprintf(stderr, "--ssl: not with --l0-norm ema (the teacher forward would update the running statistics)\n"); return 2; }
+            g_ssl_gamma = (float)atof(opt(argc, argv, "--ssl-gamma", "0")); if (!(g_ssl_gamma > 0)) g_ssl_gamma = 1.f / sqrtf((float)g_ssl);
+            cfg.emb_lev = g_ssl_lev; cfg.emb_ch = g_ssl;
+            g_ssl_S = (size_t)(g_Pz / cv) * (P / cv) * (P / cv);
+            if ((size_t)g_ssl_npts > g_ssl_S) g_ssl_npts = (int)g_ssl_S;
+            fprintf(stderr, "ssl: %d channels on decoder level %d (%d^3 voxels per cell, %zu cells), mask %g of %d^3 blocks, cosine weight %g, variance hinge %g (std >= %.3f, %d points), student step jitter %g octaves\n",
+                    g_ssl, g_ssl_lev, cv, g_ssl_S, g_ssl_mask, g_ssl_bv, g_ssl_w, g_ssl_var, g_ssl_gamma, g_ssl_npts, g_ssl_jit);
+        }
+    }
     {   /* --aux-input 1: a fifth input channel from each source's aux volume (src/sources.h; e.g. the papyrus void fraction pooled
            from 2.4 um, which keeps the packed gaps a 9.6 um CT averages away); the checkpoint's cin decides on resume */
         g_xc = atoi(opt(argc, argv, "--aux-input", "0")) ? 5 : g_cond ? 7 : 4;
@@ -2404,6 +2500,13 @@ int cmd_train(int argc, char **argv) {
     g_Sdiag = S;
     if (!S) return 1;
     g_S = S;
+    if (g_ssl) {   /* --ssl: the unlabelled sources; --ssl-share S: their weights rescaled to S of the total */
+        double wu = 0, wl = 0; int nu = 0; for (int i = 0; i < S->n; i++) { if (S->src[i].ct_only) { wu += S->src[i].weight; nu++; } else wl += S->src[i].weight; }
+        const double share = atof(opt(argc, argv, "--ssl-share", "-1"));
+        if (!nu) fprintf(stderr, "ssl: WARNING no \"ct_only\" source: the term never runs\n");
+        else if (share >= 0 && share < 1 && wu > 0 && wl > 0) { const double f = share / (1 - share) * wl / wu; for (int i = 0; i < S->n; i++) if (S->src[i].ct_only) S->src[i].weight *= f; wu *= f; }
+        if (nu) fprintf(stderr, "ssl: %d unlabelled sources, %.1f%% of the source weight\n", nu, 100 * wu / (wu + wl));
+    }
     {   /* sources with an on-the-fly phase (band_onfly.h): the pair rule on --onfly-gpu (default the run's first GPU; -1 the CPU), its
            --onfly-slots tile buffers of --onfly-mb each reserved now, before the memory planner reads the free device memory */
         float rmax = 0; for (int i = 0; i < S->n; i++) if (S->src[i].phase_onfly > rmax) rmax = S->src[i].phase_onfly;
@@ -3121,6 +3224,8 @@ int cmd_train(int argc, char **argv) {
                                     ? (gdef ? (size_t)100 << 20 : (size_t)B * cfg.widths[0] * p3 * 136 / 256) : 0;
                 need = grec + tb + tb / 14 + trainer + (nn_get_loss_tol() ? (size_t)B * p3 : 0) + (g_aff ? (size_t)2 * B * p3 : 0) + (g_fibdir > 0 ? (size_t)8 * B * p3 : 0) + (g_unwrap ? (g_head_slab ? (size_t)4 * B * p3 + (size_t)g_hs_z * P * P * (2 * g_cout + 11) + 4096 : (size_t)15 * B * p3) + (g_unwrap2 ? (size_t)4 * B * p3 : 0) + ((size_t)2 * g_naux * B * p3 + (size_t)(3 * (g_rv != 0) + 2 * (g_ink2 || (g_fibn && !g_rv))) * g_hs_z * P * P) : 0) + (g_cond ? (size_t)7 * B * p3 : 0) + (g_pap_head ? (size_t)4 * B * p3 : 0) + (g_restore ? (size_t)B * p3 * (cand[c].lean ? 5 : 1) + restore_scratch_bytes(g_Pz, P, P, fminf(g_rr.sc_step[0], 4.f)) + 256 : 0) + ((size_t)550 << 20) + (split ? (size_t)4 * B * 32 * P * P * 2 : 0) + (g_gpu_aug_want && gin ? nn_aug_device_bytes(P) + (g_gpu_aug_want == 2 ? nn_label_warp_device_bytes(P) : 0) : 0);   /* split: two slots of halo send / receive planes */   /* kernel workspaces: measured device growth / tracked ~1.07 + 0.3 GB, + 0.2 GB margin for other processes */
                 if (g_lat) need += (xin_sep ? 0 : xinb) + (g_tm_unused ? 0 : batb) + (g_lat_hs ? ((size_t)LNC * (LGFC < LNC ? 6 : 4) + (size_t)LGFC * 4) * (size_t)(g_hs_z / 4 + 2) * (P / 4) * (P / 4) + (g_lat_fuse ? nn_lat_fuse_part(7, P / 4, P / 4, g_hs_z) : 0) : ((size_t)LNC * 2 + (size_t)LGFC * 4) * (p3 / 64));   /* --lat: the full-resolution batch beside the cell-grid network, the coarse logit gradient (fp32 + 16-bit) */
+                if (g_ssl) need += (size_t)g_ssl * g_ssl_S * 5 + (size_t)g_ssl_npts * (g_ssl * 8 + 8) + 4096;   /* --ssl: int8 targets + the side head's fp32 gradient, the hinge's
+                                                                                                         points (its fp32 outputs are the network's: in the dry build) */
                 /* the wide MX-fp4 stride-2 backward-data (lp_bwd_data_s2_mx, more than 64 channels: no direct tensor-core kernel) works
                    through MX-fp8 chunks of ~96 MB (gx, the dilated gy, the accumulate temp), at least 3 fine planes each; the lp_buf
                    slots keep them (measured 3 x 102 MB at a 96-wide P 512 latent net, outside tb / 14) */
@@ -3247,6 +3352,13 @@ int cmd_train(int argc, char **argv) {
         for (int i = 0; i < 2; i++) { d->ev_done[i] = nn_event_create(); nn_event_record(d->ev_done[i], 0); }
         d->pending = nullptr; select_buf(d, 0);
         if (!d->gl && !d->gl_inplace) d->gl = nn_malloc((size_t)B * g_cout * p3 * (g_g16 ? 2 : 4));
+        if (g_ssl) {   /* --ssl: targets, the side head's gradient, the hinge's points, sums */
+            const size_t n = (size_t)g_ssl * g_ssl_S, np_ = (size_t)g_ssl_npts;
+            d->sslt = nn_malloc(n); d->sslg = nn_malloc(n * 4); d->sslds = nn_malloc(2 * sizeof(double)); d->sslmu = nn_malloc((size_t)g_ssl * sizeof(double));
+            d->sslidx = nn_malloc(np_ * sizeof(int)); d->ssle = nn_malloc(np_ * g_ssl * 4); d->sslge = nn_malloc(np_ * g_ssl * 4); d->sslnrm = nn_malloc(np_ * 4); d->sslvo = nn_malloc(8 * 4);
+            d->ssl_rs = 0x5D1C0FFEEull ^ (uint64_t)g * 0x9E3779B97F4A7C15ull ^ (uint64_t)atoll(opt(argc, argv, "--seed", "0")) * 0xD1B54A32D192ED03ull;
+            if (g == 0) fprintf(stderr, "ssl: %.0f MB of device buffers per GPU\n", (n * 5 + np_ * g_ssl * 8 + np_ * 8) / 1048576.0);
+        }
         if (g_distill) {   /* --distill: int8 targets (double-buffered unless lean), the head's fp32 gradient, the loss sums */
             d->embb[0] = nn_malloc(g_distill_n); d->embb[1] = lean ? d->embb[0] : nn_malloc(g_distill_n); d->embt = d->embb[d->cur];
             d->embg = nn_malloc(g_distill_n * 4); d->embds = nn_malloc(2 * sizeof(double));
@@ -3684,6 +3796,7 @@ int cmd_train(int argc, char **argv) {
     float parts[8][2 * TCMAX + 1];
     double acc_fib = 0, acc_fibv = 0, acc_fibn = 0;   /* --fib-normal-lambda: mean t^T N t over the windows with fibre voxels, their mean count */
     const int mix_every = atoi(opt(argc, argv, "--mix-every", "0")); double *mixn = nullptr, *mixrv = nullptr, *mixrvn = nullptr;
+    double acc_ssl = 0, acc_sslv = 0, acc_ssls = 0, acc_sslc = 0, acc_ssln = 0;   /* --ssl: cosine part, hinge, std, targeted cells, unlabelled windows (all GPUs) */
     double acc_emb = 0, acc_embc = 0, acc_ds = 0, acc_vbce = 0, acc_vdice = 0, acc_side = 0, acc_ink = 0, acc_norm = 0, acc_cond = 0, acc_ck = 0, acc_cr = 0, acc_pap = 0, acc_cnt = 0, acc_cnr = 0, acc_cbin[18] = {0}, acc_w4 = 0, acc_w4w = 0, acc_w4a = 0, acc_pg = 0, acc_rv = 0;   /* (acc_pg: --pgrad-lambda loss; acc_cnt / acc_cnr: --count-lambda loss, Tp / Tg) verso channel, side channel; --cond (loss, known / right counts); --pap-head */
     double acc_fh[2] = {0}, acc_fhn = 0;   /* --fib-head: mask / direction bce sums, windows with known fibre labels */
     double acc_inkn = 0, vik[2] = {0}, acc_mil = 0, acc_miln = 0, acc_milr = 0;   /* --ink-mil: raw mean BCE sum / windows with rays / rays */   /* --ink-head: training windows with known ink in the log interval; validation ink bce sum / windows */
@@ -3980,6 +4093,7 @@ int cmd_train(int argc, char **argv) {
         if (g_unwrap2) { acc_w4 += G[0].w4h[0]; acc_w4w += G[0].w4h[5]; acc_w4a += G[0].w4h[1]; } acc_pg += G[0].pg_loss;
         if (g_ds) acc_ds += G[0].ds_loss;
         if (g_distill) { acc_emb += G[0].emb_loss; acc_embc += G[0].emb_cells; }
+        if (g_ssl) for (int g = 0; g < ng; g++) if (G[g].ssl_fresh) { acc_ssl += G[g].ssl_loss - G[g].sslvh[0]; acc_sslv += G[g].sslvh[0]; acc_ssls += G[g].sslvh[1]; acc_sslc += G[g].ssl_cells; acc_ssln += 1; }
         if (g_cond) { acc_cond += G[0].cond_loss / (g_cond_lambda ? g_cond_lambda : 1.f); acc_ck += (double)G[0].cacc_h[0]; acc_cr += (double)G[0].cacc_h[1]; }
         if (g_pap_head) acc_pap += G[0].pout3[0];
         if (g_restore) { acc_rn += G[0].rst_h[0]; acc_re += G[0].rst_h[3]; acc_rb += G[0].rst_h[4]; }
@@ -4129,6 +4243,7 @@ int cmd_train(int argc, char **argv) {
             else if (g_unwrap && !g_unwrap2) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " ink bce %.4f normal bce %.4f", acc_ink / nacc, acc_norm / nacc); }
             if (g_fibdir > 0) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " dir bce %.4f", acc_norm / nacc); }
             if (g_ds) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " ds %.4f", acc_ds / nacc); }
+            if (g_ssl) { size_t na = strlen(affs); if (acc_ssln > 0) snprintf(affs + na, sizeof affs - na, " ssl %.4f var %.4f std %.3f (%.0f windows, %.1f%% cells)", acc_ssl / acc_ssln, acc_sslv / acc_ssln, acc_ssls / acc_ssln, acc_ssln, 100. * acc_sslc / acc_ssln / g_ssl_S); }   /* (nothing on lines without an unlabelled window: the labelled-only layout logs as before) */
             if (g_distill) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " distill %.4f (%.1f%% cells)", acc_emb / nacc, 100. * acc_embc / nacc / ((double)g_distill_n / g_distill));
                 if (g_distill_pap > 0) { static size_t pc0, pk0; const size_t pc = atomic_load(&g_emb_pap_cleared), pk = atomic_load(&g_emb_pap_kept); na = strlen(affs);
                     if (pc + pk > pc0 + pk0) snprintf(affs + na, sizeof affs - na, " (papyrus gate kept %.1f%% of the targeted)", 100. * (double)(pk - pk0) / (double)(pc + pk - pc0 - pk0)); pc0 = pc; pk0 = pk; } }
@@ -4157,7 +4272,7 @@ int cmd_train(int argc, char **argv) {
             if (log) { fprintf(log, "%d,%.3e,%.5f,%.5f,%.5f,%.0f,%.4f,%s,%.3f,%.3f\n", step, lr, acc_loss / nacc, acc_bce / nacc, acc_dice / nacc, active, acc_g / nacc, vstr, (double)nacc * B * nl / dt, wait); fflush(log); }
             if (prof) { fprintf(stderr, "per-op GPU ms over the last %d steps (all GPUs):\n", log_every); unet_prof_report(); }
             nn_ptick_report(log_every);
-            acc_fh[0] = acc_fh[1] = acc_fhn = 0; acc_inkn = 0; acc_fib = acc_fibv = acc_fibn = 0; acc_emb = acc_embc = 0; acc_ds = 0; acc_loss = acc_bce = acc_dice = acc_g = acc_vbce = acc_vdice = acc_side = acc_ink = acc_norm = acc_cond = acc_ck = acc_cr = acc_pap = acc_cnt = acc_cnr = acc_w4 = acc_w4w = acc_w4a = acc_pg = acc_rv = 0; nacc = 0; tlog = now(); wait = 0;
+            acc_fh[0] = acc_fh[1] = acc_fhn = 0; acc_inkn = 0; acc_fib = acc_fibv = acc_fibn = 0; acc_emb = acc_embc = 0; acc_ssl = acc_sslv = acc_ssls = acc_sslc = acc_ssln = 0; acc_ds = 0; acc_loss = acc_bce = acc_dice = acc_g = acc_vbce = acc_vdice = acc_side = acc_ink = acc_norm = acc_cond = acc_ck = acc_cr = acc_pap = acc_cnt = acc_cnr = acc_w4 = acc_w4w = acc_w4a = acc_pg = acc_rv = 0; nacc = 0; tlog = now(); wait = 0;
         }
         if (step % ckpt_every == 0 || step == steps || g_stop) {
             nn_init(G[0].dev);
