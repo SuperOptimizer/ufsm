@@ -107,6 +107,10 @@ done
 # the device decode + rebuilt CT alone (inputs from the rebuilt CT as the host way builds them): the host way's bytes
 UFSM_PRED_LATVOL=2 run n0chk n0 "$D/lv" --window 128 --halo 16 || fail "predict latvol, check mode ($D/p_n0chk.log)"
 cmp -s "$D/p_n0chk.raw" "$D/p_n0host.raw" || fail "the device-decoded rebuilt CT gives other bytes than the host-decoded one"
+# a window whose streams exceed the slot comes as host-decoded voxels (here: every window): the host way's bytes again
+UFSM_PRED_LATVOL_CAP=4096 run n0fb n0 "$D/lv" --window 128 --halo 16 || fail "predict latvol, voxel fallback ($D/p_n0fb.log)"
+cmp -s "$D/p_n0fb.raw" "$D/p_n0host.raw" || fail "the voxel fallback gives other bytes than the host-decoded CT"
+grep -q "[1-9][0-9]* windows as host-decoded voxels" "$D/p_n0fb.log" || fail "the voxel fallback did not run"
 UFSM_PRED_LATVOL=2 run n3chk n3 "$D/lv" --window 128 --halo 16 || fail "predict latvol stem net, check mode"
 cmp -s "$D/p_n3chk.raw" "$D/p_n3host.raw" || fail "stem net: the device-decoded rebuilt CT gives other bytes than the host-decoded one"
 run n0big n0 "$D/lv" --window 288 --halo 16 --shard 128 || fail "predict latvol, one window per 2^3 shards ($D/p_n0big.log)"

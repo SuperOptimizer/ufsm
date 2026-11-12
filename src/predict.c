@@ -102,8 +102,12 @@ static void *reader_main(void *arg) {
                 r->nz[k] = any != 0; r->t_read += now() - t1;
             }
         } else if (r->lv) {
-            const int nr = lv_read_box(r->ct, o, n, r->buf[k], w3, r->lvref[k], r->lvmax, &r->lvbytes[k], r->nthreads);
-            if (nr < 0) { fprintf(stderr, "\npredict: latvol window read failed (%s)\n", nr == -2 ? "the streams exceed the window buffer" : z3_error()); atomic_store(&r->failed, 1); }
+            const char *capv = getenv("UFSM_PRED_LATVOL_CAP");   /* (test: a smaller stream budget, so windows take the voxel fallback) */
+            const int nr = lv_read_box(r->ct, o, n, r->buf[k], capv ? (size_t)atoll(capv) : w3, r->lvref[k], r->lvmax, &r->lvbytes[k], r->nthreads);
+            if (nr == -2) {   /* the streams exceed the slot (more than a byte a voxel, or more chunks than lvmax): this window as rebuilt voxels from the host decoder */
+                if (z3_read(r->ct, o, n, r->buf[k], r->nthreads)) { fprintf(stderr, "\npredict: latvol window read failed (%s)\n", z3_error()); atomic_store(&r->failed, 1); }
+                r->lvn[k] = -1; r->nz[k] = 1; r->t_read += now() - t1;
+            } else if (nr < 0) { fprintf(stderr, "\npredict: latvol window read failed (%s)\n", z3_error()); atomic_store(&r->failed, 1); }
             else { r->lvn[k] = nr; r->nz[k] = nr != 0; r->t_read += now() - t1; }
         } else if (r->dbuf[0]) {   /* UFSM_PRED_DEVREAD: the window decoded into device slot k */
             if (nn_ctw_zero(r->ctw[0], r->dbuf[k], w3)) atomic_store(&r->failed, 1);
@@ -2143,7 +2147,7 @@ int cmd_predict(int argc, char **argv) {
     int64_t cur_shard = -1, so[3] = {0, 0, 0}, se[3] = {0, 0, 0}, sz = 0, sy = 0, sx = 0;
     int any = 0;
     const int pprof = ufsm_env_on("UFSM_PRED_PROF");
-    double p_wait = 0, p_h2d = 0, p_gpu = 0, p_copy = 0, p_wr = 0, p_ffw = 0, pt, lv_up = 0;
+    double p_wait = 0, p_h2d = 0, p_gpu = 0, p_copy = 0, p_wr = 0, p_ffw = 0, pt, lv_up = 0; int lv_fb = 0; long lv_nfb = 0;   /* lv_fb: this window came as voxels (the reader's fallback) */
     /* the next window's CT uploaded on the copy stream during this window's forward (into ctpre, w3 bytes; at the window's start one
        device copy into ctd): the synchronous upload left the GPU idle ~9 ms per 384 x 640^2 window. Not with --aug-* (degrade rewrites
        the host window first); UFSM_PRED_CTPRE=0 off. long pre_i: the window whose CT ctpre holds (or is receiving) */
@@ -2219,7 +2223,9 @@ int cmd_predict(int argc, char **argv) {
                                   sq += lz_drop * (double)nz; }   /* (the dropped axes' energy in the material voxels: the CT window's variance) */
                     else nz = 0;
                 } else if (lvm) {   /* the packed streams up (into the CT window's own buffer: dead once decoded), the cells, the CT rebuilt from them */
-                    if (rd.nz[k]) {
+                    lv_fb = rd.nz[k] && rd.lvn[k] < 0;
+                    if (lv_fb) { nn_h2d(ctd, ctu, w3); nn_pred_stats(ctd, w3, stsc, &nz, &sum, &sq); sq += (double)lvc->drop_ms * (double)nz; lv_nfb++; }
+                    else if (rd.nz[k]) {
                         nn_h2d(ctd, ctu, rd.lvbytes[k]);
                         if (nn_latvol_decode(lvL, ctd, rd.lvref[k], rd.lvn[k], Wz / 4, W / 4, W / 4, lv_stride, lz_d)) { fprintf(stderr, "\npredict: latvol: a corrupt chunk stream in window %lld,%lld,%lld\n", (long long)o[0], (long long)o[1], (long long)o[2]); return 1; }
                         nn_latvol_synth(lvL, lz_d, lv_stride, Wz / 4, W / 4, W / 4, ctd); nn_pred_stats(ctd, w3, stsc, &nz, &sum, &sq);
@@ -2302,7 +2308,7 @@ int cmd_predict(int argc, char **argv) {
                 if (!ldir && !fzs && !(lhm && !ffd) && hdiv > 2 && !lrt) lrt = nn_malloc(w3 / 8 * 16);
                 nn_ptick("other");
                 if (lat_store && (!latc || latc != lz_c)) { fprintf(stderr, "predict: --latents: the store has %d cell channels, the checkpoint %d\n", lz_c, latc); return 2; }
-                if (lvq) {   /* a latvol CT: the same from its cells (the first latc of the store's channels) */
+                if (lvq && !lv_fb) {   /* a latvol CT: the same from its cells (the first latc of the store's channels) */
                     if (latin) nn_lat_pred_input_qs(lz_d, lv_stride, Wz, W, (float)mean, (float)(1.0 / sd), dyd, dxd, ax.n > 0 ? (int)radial_sign : 0, lgain, latc, lvc->step_raw, x2);
                     else nn_lat_input_qs(lz_d, lv_stride, xd, Wz / 4, W / 4, W / 4, lgain, latc, lvc->step_raw, (float)mean, (float)(1.0 / sd), x2);
                 } else
@@ -2728,8 +2734,8 @@ int cmd_predict(int argc, char **argv) {
     }
     fprintf(stderr, "wrote %s (%ld tiles in %.0fs)\n", out, ntiles, now() - t0);
     if (lvm) { double ds = 0; long dn = 0; nn_latvol_stats(lvL, &ds, &dn);
-        fprintf(stderr, "predict: latvol CT: %.3f GB of chunk streams uploaded and decoded on the device (%.4f B per box voxel); the decode kernels %.3f s in %ld windows (%.1f Gvox/s of window voxels)\n",
-                lv_up / 1e9, lv_up / ((double)bn[0] * bn[1] * bn[2]), ds, dn, ds > 0 ? (double)dn * (double)w3 / 1e9 / ds : 0.); }
+        fprintf(stderr, "predict: latvol CT: %.3f GB of chunk streams uploaded and decoded on the device (%.4f B per box voxel); the decode kernels %.3f s in %ld windows (%.1f Gvox/s of window voxels); %ld windows as host-decoded voxels\n",
+                lv_up / 1e9, lv_up / ((double)bn[0] * bn[1] * bn[2]), ds, dn, ds > 0 ? (double)dn * (double)w3 / 1e9 / ds : 0., lv_nfb); }
     if (ufsm_env_on("UFSM_PRED_IO")) {   /* reads per store root and the process's read bytes per box voxel (--latents against the CT path) */
         store_io_report(stderr);
         long long rch = 0, rdb = 0; char ln[128]; FILE *io = fopen("/proc/self/io", "r");
