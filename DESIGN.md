@@ -6,6 +6,29 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Groups without their coarse levels: the probe guard and --reject-warn (2026-11-12, branch probeguard-20261112)
+
+diskclean's sampler-only check of a local 0139 2.399 um twin that listed levels 1-3 only: 24,793 dropped draws for 16 windows (18,265 as
+"CT min_fg"), against 72 drops over http. From the code:
+- draw_'s probe reads the window's occupancy at CT level l + 3. With that level missing, source_ct is null and the probe is skipped, not
+  failed. So every draw reads the full window and is then rejected on min_fg (the drops' label).
+- The ink-only sources (0139-hf, 0139-inkgt: no band, no coarse target) also get their draw cells from the CT at level l0 + 3 .. 5
+  (label_occupancy). None opened, so they had no draw index and drew uniformly over the whole scan. Most of the reject rate comes from
+  this.
+
+The guards:
+- sampler_start: for every enabled training level l of a weighted source with l + 3 <= 5, CT level l + 3 must open. If it doesn't: under
+  --strict-sources 1, fatal ("training level L's coarse probe reads CT level L+3, which does not open"); otherwise that line once with
+  "every draw reads the full window". Levels above 5 are not expected, so training at level 3+ still probes nothing, as before.
+- sampler_start: a weighted source without a draw index logs "no draw index ... drawn uniformly over the whole scan".
+- The draws line (--mix-every): a source whose drops (hold + empty + probe + fg) since the last line exceed --reject-warn R (default 100;
+  0 turns it off) per new window gets a "WARNING draws:" line with the counts. So a 300x reject rate shows even when the source's share
+  looks normal.
+
+test_strict_sources (3): the fixture's CT group cut to levels 0-2. Without the flag it warns about level 0's probe at level 3 and trains,
+and at --reject-warn 0.01 the draws line flags it ("3 draws for 6 new windows"). With --strict-sources 1 it stops with the fatal line.
+u1's recipe (sources-u1d.json, P 1024, all rungs) passes the startup checks under --strict-sources 1 in a sampler-only run.
+
 ## Sources that silently drop out: --strict-sources and relative-scale groups (2026-11-12, branch strictsrc-20261112)
 
 The u1 P 1024 restart (step 10453) ran its first 315 steps with no PHerc1667 windows (14.9 + 7.5 + 7.5 = 29.9% of the weight): the local

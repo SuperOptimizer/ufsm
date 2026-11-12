@@ -3858,6 +3858,19 @@ sampler *sampler_start(sources *S, const sample_cfg *cfg) {
                     s->name, PZ(cfg), cfg->P, cfg->P);
             free(sp->cum); free(sp->lvl_ok); free(sp); return nullptr;
         }
+        if (eligible && s->weight > 0 && !cfg->cover && cfg->restore != 2) {
+            /* the coarse probe (draw_: the window's occupancy at CT level l + 3 before the full read) and the draw cells of sources without a
+               coarse target (label_occupancy: the level l0 + 3 .. 5 CT) need the pyramid's coarse levels. A group without them (diskclean
+               2026-11-12: a local 0139 twin with levels 1-3 only) trained on, but drew uniformly over the scan and read every empty window in
+               full: 24,793 drops for 16 windows, against 72 over http. Levels up to 5 are expected (every pyramid here has them) */
+            for (int l = s->min_level < 0 ? 0 : s->min_level; l + 3 <= 5; l++) {
+                if (!level_on(sp, s, i, l, region_ch) || !level_ok(sp, s, i, l, region_ch) || !source_ct(s, l) || source_ct(s, l + 3)) continue;
+                fprintf(stderr, "sampler: %s: training level %d's coarse probe reads CT level %d, which does not open (`ufsm info` the group: levels up to 5 must be listed and on disk)%s\n",
+                        s->name, l, l + 3, cfg->strict_sources && !cfg->holdout ? ": fatal (--strict-sources 1)" : ": every draw reads the full window");
+                if (cfg->strict_sources && !cfg->holdout) { free(sp->cum); free(sp->lvl_ok); free(sp); return nullptr; }
+                break;
+            }
+        }
         if (!eligible && s->weight > 0) fprintf(stderr, "sampler: %s excluded: no %s patch fits %dx%dx%d and the enabled levels\n", s->name, cfg->holdout ? "validation" : "training", PZ(cfg), cfg->P, cfg->P);
         acc += eligible ? s->weight : 0; sp->cum[i] = acc;
     }
@@ -3901,6 +3914,8 @@ sampler *sampler_start(sources *S, const sample_cfg *cfg) {
             }
         }
         sp->occ[i].idx = o.idx; sp->occ[i].n = o.n; sp->occ[i].lev = o.lev; for (int d = 0; d < 3; d++) sp->occ[i].shape[d] = o.shape[d];
+        if (!o.n && S->src[i].weight > 0 && sp->cum[i] > (i ? sp->cum[i - 1] : 0) && !cfg->holdout)
+            fprintf(stderr, "sampler: %s: no draw index (no coarse label level, mask, or level l0 + 3 .. 5 CT): windows drawn uniformly over the whole scan\n", S->src[i].name);
     }
     sp->th = calloc((size_t)cfg->nworkers, sizeof(pthread_t));
     for (int i = 0; i < cfg->nworkers; i++) {
