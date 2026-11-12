@@ -23,6 +23,12 @@ FILLX=${FILLX:---fill 4 --fill-grid 50000 --fill-inpaint 4 --fill-pm 1}
 INK=$O/ink/$TAG.h; RD=$O/inkr/$TAG; mkdir -p $O/ink $RD/logs $RD/fillmap $RD/img
 ST=$SD/inkscore-u1-$TAG; [ $SCROLL = PHerc1667 ] || ST=$SD/inkscore-$SCROLL-u1-$TAG
 key=$(python3 -I -c "print(round(2.399 * 2 ** $LV, 3))")
+# before each GPU step: wait for the WAITF files (space-separated, e.g. another job's .done) and for no other GPU-0 process above 200 MiB
+WAITF=${WAITF:-}
+gpu0_wait() { local f u n=0; for f in $WAITF; do while [ ! -e $f ]; do [ $n = 0 ] && log "waiting for $f"; n=1; sleep 60; done; done
+  u=$(nvidia-smi --query-gpu=uuid --format=csv,noheader -i 0)
+  while nvidia-smi --query-compute-apps=gpu_uuid,used_memory --format=csv,noheader,nounits | awk -F', ' -v u=$u '$1 == u && $2 > 200 { b = 1 } END { exit !b }'; do
+    [ $n -lt 2 ] && log "waiting for GPU 0 (a process above 200 MiB)"; n=2; sleep 60; done; }
 log() { echo "$(date '+%F %T') u1667ink $SCROLL $TAG: $*" | tee -a $RD/logs/run.log; }
 [ -s $CK ] || { log "no checkpoint $CK"; exit 1; }
 # the box at level LV, zyx, + 64 voxels, clipped to the unroll box (level-2 voxels): the labelled segments' tifxyz bboxes (level-0 xyz),
@@ -44,7 +50,7 @@ PY
 ) || { log "box failed"; exit 1; }
 log "ckpt $CK, level $LV ($key um), box $box, labels ${SEGS:-none (render only)}"
 if [ ! -e $INK/ink.done ]; then
-  log "predict (waiting for GPU 0)"
+  log "predict (waiting for GPU 0)"; gpu0_wait
   flock /tmp/gpu0-bench.lock env CUDA_VISIBLE_DEVICES=0 ~/bin/memcap -m 40G nice -n 10 $U predict $CK $R $K $INK --um 2.399 --level $LV --box $box \
     --full-grid 1 --resume 1 --occupancy 5 --heads ink --gpu 0 --threads $TH > $RD/logs/predict.log 2>&1 || { log "predict failed ($RD/logs/predict.log)"; exit 1; }
   [ -e $INK/ink/zarr.json ] || { log "no ink head output in $INK (logs/predict.log)"; exit 1; }
@@ -52,7 +58,7 @@ if [ ! -e $INK/ink.done ]; then
 fi
 for st in $O/strip/strip/flat/stripes/*/; do s=$(basename $st); [ -e $RD/$s.done ] && continue
   rm -rf $RD/in_$s; mkdir -p $RD/in_$s; ln -sfn $st $RD/in_$s/$s
-  log "render $s (waiting for GPU 0)"
+  log "render $s (waiting for GPU 0)"; gpu0_wait
   flock /tmp/gpu0-bench.lock env CUDA_VISIBLE_DEVICES=0 UFSM_RENDER_MEM=16 UFSM_RENDER_GPU_MEM=4 ~/bin/memcap -m ${MEMR:-48G} nice -n 10 \
     $U render $RD/in_$s $RD --volume $INK/ink $key --ct $R $K/$LV --depth 1 --scale 1 --threads $TH $FILLX > $RD/logs/render_$s.log 2>&1 ||
     { log "render $s failed ($RD/logs/render_$s.log)"; exit 1; }
