@@ -89,6 +89,44 @@ Tests (test_unwrap2_sampler):
 `sampler-only` now prints per source and level: windows, holdout-masked windows, and draws dropped on holdout overlaps, empty targets, the
 coarse probe and CT min_fg.
 
+## The heads' outputs encoded and pyramided on the GPU (2026-11-12, branches univpyr-20261111 / univdec-20261112)
+
+**GPU pyramid (pyacc_t in predict.c, UFSM_PRED_GPU_PYR=0: off).** Each head's level-0 shard, complete on the device, is pooled 2x down the
+levels by nn_pool2_u8 ((sum + 4) >> 3, ingest.c's pool2_mean) into pieces after the shard's bytes (+14 %), copied with it. The head
+writer, after writing the level-0 shard, encodes the pieces into level chunks (>= 128^3 pieces at once on --threads / heads threads;
+smaller ones gathered raw per chunk) and writes a level-l shard as soon as every level-0 shard layer under it is final (the windows run
+in z order; the main thread marks the lowest layer a later window can submit). Only encoded chunks (and the raw chunks of one chunk
+layer for levels whose pieces are below a chunk) are held, so a whole scroll's pyramid stays bounded. z3w gained z3w_encode_chunk /
+z3w_write_shard_enc. The CPU pyramid read each level back from the store (a lossy decode at q > 0) and pooled that: at q 0 the GPU
+pyramid is the same bytes (test_predict_heads, shard 128 and 256); at q > 0 it pools the exact level-0 bytes, one lossy step closer to
+the exact pooling. --resume and --full-grid keep the CPU pyramid (earlier shards are not in memory).
+
+**GPU encoder analysis (vcgpu.h, nn_gpuenc.cu, UFSM_PRED_GPU_ENC=0: off).** On the CPU, gather + 16^3 DCT + dead-zone quantise + scan sort
+are 68 % of a q 8 head chunk's encode (1.3 of 1.9 ms). The GPU does them with the CPU encoder's arithmetic: gcc -std=c23 contracts no
+FMA, so the AVX2 and C transforms are the same sequence of rounded multiplies and adds (VF_DCT16_FWD_BODY, copied verbatim, built with
+-fmad=false); the DC rounds unfused; the AC quantiser is fused as the AVX2 kernel's _mm256_fmadd_ps (unfused if the CPU encoder uses its
+C kernel: vcg_tables says which). Count pass, a block scan of the counts, list pass (the block recomputed; its nonzero levels in
+ascending scan order by a prefix sum, no sort; staged in shared memory and written as one run straight into the writer's pinned slot:
+scattered writes over the bus took 174 ms a 512^3 shard, coalesced 13). vcg_encode_levels then runs vf_encode_lossy's tokenise / model /
+tANS phases on the levels: volcomp_encode's stream byte for byte (test_vcgpu: q 1, 2, 8, 30, 255 on 8 kinds of chunk; test_predict_heads:
+every shard file of a q 8 heads run). Levels above 1/8 of the voxels: the writer encodes that shard from its bytes. Desk, one 512^3 rv
+shard of u1: CPU tail 1.4 -> 0.4 ms a chunk at q 8 (3.3x), 3.2 -> 1.8 at q 2; the GPU levels 13 ms a shard (10 Gvox/s, beside u1 training).
+
+**Pod (RTX PRO 6000, 40 CPUs; Paris 4 9.6 um, the 19.3 Gvox box, warm cache, 4 levels, window 1056; one clean GPU slot, 03:01):**
+
+| run | GPU (s) | reader (s) | writers (thread-s) | wall (s) | Gvox/s |
+|---|---|---|---|---|---|
+| 5 heads, CPU encoder + CPU pyramid | 8.48 | 8.76 | 45.4 + the pyramids after | 20.96 | 0.92 |
+| 5 heads, CPU encoder + GPU pyramid | 9.71 | 9.75 | 51.7 + 13.0 pyramid | 13.10 | 1.48 |
+| 5 heads, GPU encoder + GPU pyramid | 8.04 | 6.71 | 36.2 + 11.6 pyramid | 10.59 | 1.83 |
+| 5 heads + --fit-zarr, both on the GPU | 11.50 (7.05 waiting on the fit writer) | 6.58 | 31.7 + 10.5 | 14.27 | 1.35 |
+| 1 head, CPU encoder + CPU pyramid | 3.86 | 6.44 | 3.6 | 11.12 | 1.74 |
+| 1 head, both on the GPU | 4.14 | 6.43 | 3.1 + 1.6 | 8.52 | 2.27 |
+
+5 heads went 24.0 s (11-11) -> 10.6 s, 0.80 -> 1.83 Gvox/s, within 20 % of one head (2.27); the remaining caps: the CPU volcomp decode
+of the reader (6.4-6.7 s of an 8.5-10.6 s run) and, with --fit-zarr, the fit-field writer (7 s waited). Desk: a gap in u1 at 21:15 gave
+no clean numbers (GPU 1 had 1.1 of 16.6 GB free when the run started, then 1.5 CPUs for the 5-head run); to be measured.
+
 ## Universal net inference: every head from one trunk pass (predict --heads), the fine stem in the latent fast paths (2026-11-11, branch univinf-20261111)
 
 **What fell back (u1, `--lat 4 --lat-guide 3 --rv 2 --film 2 --fstem 16`, cout 144 = 16 + 128 sub-cell outputs).** Every latent fast
