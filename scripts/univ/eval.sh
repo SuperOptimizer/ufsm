@@ -35,7 +35,9 @@ export PREDONLY=${PREDONLY:-0}; [ $PREDONLY = 1 ] && FIB=0
 # TWOPHASE=1 (the pod's GPU window, 2026-11-12): first every predict of the eval back to back (this script with PREDONLY=1: wbench
 # PHASE=predict, rv predicts, ink predicts; fields and volumes stay on disk), then the plain run, which finds them and only fits / scores.
 PO=${PREDONLY:-0}
-if [ "${TWOPHASE:-0}" = 1 ] && [ $PO = 0 ]; then tp=$(date +%s); log "gpu phase: all predicts"; PREDONLY=1 bash $0 "$@"; log "gpu phase done in $(( $(date +%s) - tp )) s (queue waits included); fits and scores"; fi
+if [ "${TWOPHASE:-0}" = 1 ] && [ $PO = 0 ]; then tp=$(date +%s); log "gpu phase: all predicts"; PREDONLY=1 bash $0 "$@"; log "gpu phase done in $(( $(date +%s) - tp )) s (queue waits included); fits and scores"
+  # the resident trainer's rate during the fits (lead's condition: fits beside U2 must cost it < 10% of 0.72 samp/s / 776 Mvox/s)
+  RL=${RESLOG:-/workspace/univA/u2.log}; [ -s $RL ] && wc -l < $RL > $E/$T/reslog.line; fi
 [ $PO = 1 ] || log "univ eval $T ckpt $CK tasks [$TASKS]"
 
 has wind && [ "${WIND:-1}" = 1 ] && { log "wind: wbench core"; wb $T BOXES=core; }
@@ -138,5 +140,8 @@ fi
       awk -F'\t' -v fc=$fc -v ac=$ac -v lab="${INKSEEN:-PHerc0500P2=unseen-ink-labels,seen-CT PHerc0841=unseen-scroll}" -v w=$fn 'BEGIN {n = split(lab, L, " "); for (i = 1; i <= n; i++) { split(L[i], kv, "="); D[kv[1]] = kv[2] } }
         { s = ($1 ~ /^w[0-9]/) ? "PHercParis4" : substr($1, 1, index($1, "_w") - 1); c[s]++; F[s] += $fc; A[s] += $ac }
         END { for (s in c) printf "%s per scroll %-12s %-28s n %2d auc %.4f f1best %.4f\n", w, s, (s in D) ? D[s] : "", c[s], A[s] / c[s], F[s] / c[s] }' $E/$T/ink/$fn.tsv | sort; done
+  if [ -s $E/$T/reslog.line ] && [ -s ${RESLOG:-/workspace/univA/u2.log} ]; then   # (step lines: '... X samp/s Y Mvox/s')
+    tail -n +$(( $(cat $E/$T/reslog.line) + 1 )) ${RESLOG:-/workspace/univA/u2.log} | grep -E '^ *step [0-9]+ .*samp/s' | awk '{ for (i = 2; i <= NF; i++) { if ($i == "samp/s") s = $(i - 1); if ($i == "Mvox/s") v = $(i - 1) } n++; S += s; V += v }
+      END { if (n) printf "-- resident trainer during the fits: %d step lines, %.3f samp/s (%.1f%% of 0.72), %.0f Mvox/s (%.1f%% of 776)\n", n, S / n, 100 * S / n / 0.72, V / n, 100 * V / n / 776 }'; fi
 } > $E/$T.matrix.txt
 log "matrix -> $E/$T.matrix.txt"
