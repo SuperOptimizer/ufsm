@@ -1034,12 +1034,13 @@ template <typename TG, int YB> static void conv1_to_mx_t(const TG *x, int N, int
                  else if (Ci <= 32) conv1_to_mx_t_k<TG, 32, YB><<<grid, 256>>>(x, w, yq, N, Co, S, sr, Ci, vb, vn);    /* 17..32 (embedding heads) */
                  else if (Ci <= 48) conv1_to_mx_t_k<TG, 48, YB><<<grid, 256>>>(x, w, yq, N, Co, S, sr, Ci, vb, vn);    /* 33..48 (embedding + dense heads: dino --unwrap2 / --ink-prob) */
                  else if (Ci <= 64) conv1_to_mx_t_k<TG, 64, YB><<<grid, 256>>>(x, w, yq, N, Co, S, sr, Ci, vb, vn);    /* 49..64 (the --ssl-distill 64-d embedding) */
-                 else conv1_to_mx_t_k<TG, 144, YB><<<grid, 256>>>(x, w, yq, N, Co, S, sr, Ci, vb, vn);    /* 65..144 (the sub-cell head of latent-grid nets: on the cell grid) */
+                 else if (Ci <= 144) conv1_to_mx_t_k<TG, 144, YB><<<grid, 256>>>(x, w, yq, N, Co, S, sr, Ci, vb, vn);    /* 65..144 (the sub-cell head of latent-grid nets: on the cell grid) */
+                 else conv1_to_mx_t_k<TG, 192, YB><<<grid, 256>>>(x, w, yq, N, Co, S, sr, Ci, vb, vn);    /* 145..192 (the sub-cell head over 32 / 48 / 64 base outputs: the fibre head) */
     }
 }
 /* the same over rows [vb, vb + vn) (x holding vn voxels per channel; the level-0 slab stream's head, stage S4): fp16 / bf16 / fp32 x */
 extern "C" void lp_conv1_to_mx_r(const void *x, int gdt, int N, int Ci, size_t S, const float *w, int Co, void *y, int ydt, unsigned sr, size_t vb, size_t vn) {
-    if (Ci > 144) { fprintf(stderr, "lp_conv1_to_mx_r: Ci %d > 144\n", Ci); abort(); }
+    if (Ci > 192) { fprintf(stderr, "lp_conv1_to_mx_r: Ci %d > 192\n", Ci); abort(); }
 #define C1M(YB) do { if (gdt == 2) conv1_to_mx_t<__half, YB>((const __half *)x, N, Ci, S, w, Co, y, sr, vb, vn); \
                      else if (gdt == 1) conv1_to_mx_t<bf16, YB>((const bf16 *)x, N, Ci, S, w, Co, y, sr, vb, vn); \
                      else conv1_to_mx_t<float, YB>((const float *)x, N, Ci, S, w, Co, y, sr, vb, vn); } while (0)
@@ -1048,7 +1049,7 @@ extern "C" void lp_conv1_to_mx_r(const void *x, int gdt, int N, int Ci, size_t S
     LPCK();
 }
 extern "C" void lp_conv1_to_mx(const void *x, int gdt, int N, int Ci, size_t S, const float *w, int Co, void *y, int ydt, unsigned sr) {
-    if (Ci > 144) { fprintf(stderr, "lp_conv1_to_mx: Ci %d > 144\n", Ci); abort(); }
+    if (Ci > 192) { fprintf(stderr, "lp_conv1_to_mx: Ci %d > 192\n", Ci); abort(); }
     static int old = -1; if (old < 0) old = getenv("UFSM_CONV1_OLD") ? atoi(getenv("UFSM_CONV1_OLD")) : 0;
     if (!old || ydt == 4 || Ci > 8) {
 #define C1M(YB) do { if (gdt == 2) conv1_to_mx_t<__half, YB>((const __half *)x, N, Ci, S, w, Co, y, sr); \
