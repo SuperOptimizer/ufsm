@@ -25,13 +25,18 @@ lk() { if [ -n "$LKF" ]; then flock $LKF "$@"; else "$@"; fi; }   # LKF=/tmp/gpu
 # lkg: one GPU call of this script (ink / fibre predicts). On the pod's shared GPU ($K/GPU.md) it is one shared unit inside the window;
 # wbench and rv wait per predict themselves (site-pod.env RUN, rv/eval.sh), so a whole wbench row is never one unit.
 lkg() { if [ -n "${K:-}" ] && [ -d $K/gpu.shared ]; then
-    while [ -e $K/gpu.pause ] || [ $((10#$(date +%M))) -ge $([ -e $K/gpu.gate-waiting ] && echo 25 || echo 15) ]; do sleep 5; done
+    while [ -e $K/gpu.pause ] || [ $((10#$(date +%M))) -ge $([ -e $K/gpu.gate-waiting ] && echo 35 || echo 15) ]; do sleep 5; done
     touch $K/gpu.shared/eval-$$; "$@"; local rc=$?; rm -f $K/gpu.shared/eval-$$; return $rc; else lk "$@"; fi; }
 log() { echo "$(date '+%m-%d %H:%M:%S') $*" | tee -a $E/$T.log; }
 wb() {   # wb TAG [env...]: one wbench run (memcap, GPU lock)
-  local t=$1; shift; lk env SITE=$SITE WB=$WB GPU=$GPU SLABS=0 THREADS=$THREADS "$@" $MC bash $H/scripts/wbench/wbench.sh $CK $t >> $E/$T/wbench_$t.out 2>&1; }
+  local t=$1; shift; lk env SITE=$SITE WB=$WB GPU=$GPU SLABS=0 THREADS=$THREADS $([ ${PREDONLY:-0} = 1 ] && echo PHASE=predict) "$@" $MC bash $H/scripts/wbench/wbench.sh $CK $t >> $E/$T/wbench_$t.out 2>&1; }
 has() { [[ " $TASKS " == *" $1 "* ]]; }
-log "univ eval $T ckpt $CK tasks [$TASKS]"
+export PREDONLY=${PREDONLY:-0}; [ $PREDONLY = 1 ] && FIB=0
+# TWOPHASE=1 (the pod's GPU window, 2026-11-12): first every predict of the eval back to back (this script with PREDONLY=1: wbench
+# PHASE=predict, rv predicts, ink predicts; fields and volumes stay on disk), then the plain run, which finds them and only fits / scores.
+PO=${PREDONLY:-0}
+if [ "${TWOPHASE:-0}" = 1 ] && [ $PO = 0 ]; then tp=$(date +%s); log "gpu phase: all predicts"; PREDONLY=1 bash $0 "$@"; log "gpu phase done in $(( $(date +%s) - tp )) s (queue waits included); fits and scores"; fi
+[ $PO = 1 ] || log "univ eval $T ckpt $CK tasks [$TASKS]"
 
 has wind && [ "${WIND:-1}" = 1 ] && { log "wind: wbench core"; wb $T BOXES=core; }
 if has dlv && [ "${WIND:-1}" = 1 ]; then for d in $DLVS; do log "dlv $d"; wb $T-dlv$d BOXES=core DLV=$d P4ROOT=$M P4V=$P4K; done; fi
@@ -77,13 +82,14 @@ if has ink && [ "${INK:-1}" = 1 ] && [ -n "$INKP" ]; then   # INKP = ink3dext | 
     grep -qP "^$cr\t" $o/scores.tsv && [ $vs = 0 ] && continue
     v=$o/vol_${scr:-PHercParis4}
     if [ "$INKP" = ink3dext ]; then lvi=1; key=$(python3 -I -c "print(round($um * 2, 3))")
-      lkg $U ink3d-ext --model dino3d --weights ${INKW:-/vesuvius/ufsm/teachers/dino3d/ckpt_78k_fullsup.pth} --ct $M $ctk/0 --ct-um $um --box $box --surface $C/$cr --out $v --out-um 4.8 --gpu $GPU --cache $WB/cache > $o/ink_$cr.log 2>&1 || { log "ink: $cr predict failed"; continue; }
+      [ -e $o/pred_$cr.done ] || lkg $U ink3d-ext --model dino3d --weights ${INKW:-/vesuvius/ufsm/teachers/dino3d/ckpt_78k_fullsup.pth} --ct $M $ctk/0 --ct-um $um --box $box --surface $C/$cr --out $v --out-um 4.8 --gpu $GPU --cache $WB/cache > $o/ink_$cr.log 2>&1 || { log "ink: $cr predict failed"; continue; }
     elif [ "$INKP" = heads ]; then lvi=${LV_INK:-1}; key=$(python3 -I -c "print(round($um * 2 ** $lvi, 3))")   # predict --heads ink: the latent-grid
       # multi-head path (fine stem rows + sub-cell placement as trained; the ink channel from the header), written to $v.h/ink, read through $v
       [ -e $v ] || ln -sfn $(basename $v).h/ink $v
-      lkg ${UP:-$U} predict $CK $M $ctk $v.h --um $um --level $lvi --box $(lbox $box $lvi) --full-grid 1 --heads ink --gpu $GPU --threads 6 --cache $WB/cache > $o/ink_$cr.log 2>&1 || { log "ink: $cr predict failed"; continue; }
+      [ -e $o/pred_$cr.done ] || lkg ${UP:-$U} predict $CK $M $ctk $v.h --um $um --level $lvi --box $(lbox $box $lvi) --full-grid 1 --resume 1 --heads ink --gpu $GPU --threads 6 --cache $WB/cache > $o/ink_$cr.log 2>&1 || { log "ink: $cr predict failed"; continue; }
     else lvi=${LV_INK:-1}; ch=${INKP#ch:}; key=$(python3 -I -c "print(round($um * 2 ** $lvi, 3))")
-      lkg ${UP:-$U} predict $CK $M $ctk $v --um $um --level $lvi --box $(lbox $box $lvi) --full-grid 1 --channel $ch --gpu $GPU --threads 6 --cache $WB/cache > $o/ink_$cr.log 2>&1 || { log "ink: $cr predict failed"; continue; }; fi
+      [ -e $o/pred_$cr.done ] || lkg ${UP:-$U} predict $CK $M $ctk $v --um $um --level $lvi --box $(lbox $box $lvi) --full-grid 1 --resume 1 --channel $ch --gpu $GPU --threads 6 --cache $WB/cache > $o/ink_$cr.log 2>&1 || { log "ink: $cr predict failed"; continue; }; fi
+    touch $o/pred_$cr.done; [ $PO = 1 ] && continue
     if [ $vs = 1 ]; then gk=$(ls $g | grep -vE '^(segments|zarr.json)$' | head -1)
       $U ink-vscore --gt $g $gk --pred $v $key --box $box --level $lvi --row $cr --threads 8 2>> $o/vscore_$cr.log | grep -P "^$cr\t" >> $o/vscores.tsv; fi
     grep -qP "^$cr\t" $o/scores.tsv && continue
@@ -94,12 +100,13 @@ for a in 'xyz':
     v = tifffile.imread(os.path.join(src, a + '.tif')).astype(np.float32); tifffile.imwrite(os.path.join(dst, a + '.tif'), np.where(v >= 0, (v + 0.5) / f - 0.5, -1).astype(np.float32))
 shutil.copy(os.path.join(src, 'meta.json'), dst)
 PY
-    nice -n 5 $U render $s/w $s/r --volume $v $key --depth 4 --threads 8 --cache $WB/cache > $o/render_$cr.log 2>&1 || { log "ink: $cr render failed"; continue; }
+    lkg nice -n 5 $U render $s/w $s/r --volume $v $key --depth 4 --threads 8 --cache $WB/cache > $o/render_$cr.log 2>&1 || { log "ink: $cr render failed"; continue; }
     mp=$(ls $s/r/*.tif 2>/dev/null | grep -v _fill | head -1); [ -n "$mp" ] || { log "ink: $cr no render"; continue; }
     $U ink-score --surface $C/$cr --labels $C/$cr/labels.tif --mask $C/$cr/mask.tif --map ink=$mp --row $cr 2>> $o/score_$cr.log | grep -P "^$cr\t" >> $o/scores.tsv
   done; done
 fi
 
+[ $PO = 1 ] && exit 0
 # ---- matrix ----
 { echo "== univ eval $T  $CK  $(date)"
   ws() { $U wbench-stats $1 $2 --metric p05x,ids 2>&1 | grep -v label-noise | grep -E '^(p05x|ids) '; }

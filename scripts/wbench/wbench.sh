@@ -109,8 +109,11 @@ for B in $BL; do
   d=$O/$B; mkdir -p $d; f=$FD/$B
   lk; t0=$(date +%s)   # (pred_s without the GPU queue wait)
   if [ -n "$FIELDS" ]; then [ -e $f/fields.json ] || { log "$B: no fields $f"; continue; }
-  elif [ ! -e $f/fields.json ]; then predict $f $z $y $x $nz $ny $nx $d/pred.log || { log "$B predict failed"; continue; }; fi
-  t1=$(date +%s)
+  elif [ ! -e $f/fields.json ]; then predict $f $z $y $x $nz $ny $nx $d/pred.log || { log "$B predict failed"; continue; }; echo $(( $(date +%s) - t0 )) > $d/pred.s; fi
+  # PHASE=predict (2026-11-12, the pod's GPU window): only the predicts of the row, back to back; a later plain run fits and scores from the
+  # stored fields (pred_s then comes from $d/pred.s: the predict's own seconds, GPU queue wait included).
+  [ "${PHASE:-}" = predict ] && continue
+  t1=$(date +%s); [ -s $d/pred.s ] && t0=$((t1 - $(cat $d/pred.s)))
   fitsc $f $d/fit $d/fit.log; t2=$(date +%s)
   ids0=$(num $(g_ids $d/fit.log))
   # REP shifted sub-domains: drop the first / last 16 cells (32 level voxels) of every axis
