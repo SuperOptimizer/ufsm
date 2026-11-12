@@ -320,6 +320,42 @@ int main(int argc, char **argv) {
         CHECK(rover == 0, "holdout_mode reject: %zu windows over the box", rover);
         free(rk[0]); free(rk[1]); free(co);
     }
+    {   /* "holdout_reject": named holdout_file boxes that reject windows in mask mode too (the unseen-CT control): box A rejects (no
+           window over it), box B masks (windows over it, labels unknown in B + guard) */
+        const int64_t A[6] = {40, 20, 100, 40, 30, 30}, Bx[6] = {100, 40, 150, 24, 24, 24}; const int G = 16;
+        snprintf(q, sizeof q, "%s/holdouts-named.json", dir); f = fopen(q, "w");
+        fprintf(f, "{\"boxes\": [{\"name\": \"A\", \"ct\": \"ct\", \"l0\": [%lld, %lld, %lld, %lld, %lld, %lld]}, {\"name\": \"B\", \"ct\": \"ct\", \"l0\": [%lld, %lld, %lld, %lld, %lld, %lld]}]}\n",
+                (long long)A[0], (long long)A[1], (long long)A[2], (long long)A[3], (long long)A[4], (long long)A[5],
+                (long long)Bx[0], (long long)Bx[1], (long long)Bx[2], (long long)Bx[3], (long long)Bx[4], (long long)Bx[5]);
+        fclose(f);
+        snprintf(p, sizeof p, "%s/sources-rejnamed.json", dir); f = fopen(p, "w");
+        fprintf(f, "{\"sources\": [{\"name\": \"noncubic\", \"root\": \"%s\", \"ct\": \"ct\", \"um\": 8, \"max_level\": 0, \"weight\": 1, \"holdout_file\": \"%s\", \"holdout_reject\": [\"A\"],\n"
+                   " \"targets\": {\"band\": {\"root\": \"%s/codes\", \"key\": \"16\", \"radius\": 80, \"span\": 75, \"phase\": {\"root\": \"%s/phase\", \"key\": \"8\", \"level\": 0}}},\n"
+                   " \"axis\": \"%s/axis.json\"}]}\n", dir, q, dir, dir, dir);
+        fclose(f);
+        sources *Sr = sources_load(p); if (!Sr) { fprintf(stderr, "FAIL: sources_load %s\n", p); return 1; }
+        CHECK(Sr->src[0].nhold == 2 && Sr->src[0].hold_rej && Sr->src[0].hold_rej[0] == 1 && Sr->src[0].hold_rej[1] == 0, "holdout_reject: box flags");
+        sample_cfg c = sample_cfg_default();
+        c.P = 64; c.B = 1; c.nworkers = 1; c.nbuf = 2; c.seed = 5; c.deterministic = 1; c.xfmt = 1; c.gpu_input = 1;
+        memset(c.level_p, 0, sizeof c.level_p); c.level_p[0] = 1;
+        c.side = 2; c.wind4 = 1; c.wind4_tile = 16; c.min_phase = 0; c.snap = 0;
+        c.augment = 0; c.symmetry_p = 0; c.geometry_augment = 0; c.rotate_p = 0; c.elastic_p = 0;
+        sampler *sp = sampler_start(Sr, &c); if (!sp) { fprintf(stderr, "FAIL: sampler_start (holdout_reject)\n"); return 1; }
+        size_t overA = 0, overB = 0, leakB = 0;
+        for (int i = 0; i < 60; i++) {
+            batch *b = sampler_next(sp); if (!b) { CHECK(0, "holdout_reject sampler stopped"); break; }
+            const int64_t *o = b->corner[0]; int oa = 1, ob = 1; int64_t lo[3], hi[3];
+            for (int d = 0; d < 3; d++) { oa &= o[d] + 64 > A[d] && o[d] < A[d] + A[3 + d];
+                lo[d] = Bx[d] - G - o[d]; hi[d] = Bx[d] + Bx[3 + d] + G - o[d]; if (lo[d] < 0) lo[d] = 0; if (hi[d] > 64) hi[d] = 64; ob &= lo[d] < hi[d]; }
+            overA += oa; overB += ob;
+            if (ob) for (int z = (int)lo[0]; z < hi[0]; z++) for (int y = (int)lo[1]; y < hi[1]; y++) for (int x = (int)lo[2]; x < hi[2]; x++) {
+                const size_t v = ((size_t)z * 64 + y) * 64 + x; leakB += b->side[v] != PHASE_UNKNOWN || b->w4[v] != 255; }
+            sampler_release(sp, b);
+        }
+        sampler_stop(sp); sources_free(Sr);
+        printf("holdout_reject: %zu of 60 windows over the rejecting box A, %zu over the masked box B + guard (%zu labelled voxels there)\n", overA, overB, leakB);
+        CHECK(overA == 0 && overB > 0 && leakB == 0, "holdout_reject: %zu over A, %zu over B, %zu labelled in B", overA, overB, leakB);
+    }
     {   /* windows coarser than the stored phase (2026-11-11, the scale rungs): level-1 windows of the level-0 phase carry its 2^3 pooled
            view (phase_pool2_box: circular mean, unknown under half resultant) on their own grid, not an all-unknown side plane */
         snprintf(q, sizeof q, "%s/sources-pool.json", dir); f = fopen(q, "w");

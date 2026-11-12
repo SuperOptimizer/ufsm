@@ -27,6 +27,7 @@ test_lat_head~FP8                              | gpu          |        4 | TLH_F
 test_pgrad                                     | gpu          |     1 | ./$B/test_pgrad
 test_gyrec                                     | gpu2         |     1 | ./$B/test_gyrec
 test_unwrap2_sampler                           | gpu          |     9 | ./$B/test_unwrap2_sampler $TMPDIR/unwrap2_fixture
+test_phase_pool                                |              |     3 | UFSM_PHASE_POOL_SLAB=90000 ./$B/test_phase_pool $TMPDIR/phase_pool
 test_rungs                                     | gpu          |     3 | ./$B/test_rungs $TMPDIR/rungs_fixture
 test_gram                                      | gpu          |     2 | ./$B/test_gram
 test_fibhead                                   | gpu          |     2 | ./$B/test_fibhead

@@ -11,6 +11,8 @@
          or [[z, y, x, nz, ny, nx], ...]: several boxes (the first is the validation box; training avoids all)
        "holdout_file": "holdouts.json"   (optional: ufsm wbench boxes {"boxes": [{"ct": KEY, "l0": [6 numbers]}...]}; the entries
          whose ct basename equals this source's ct basename are added to the holdout boxes)
+       "holdout_reject": ["HOLD", "139-1", ...]   (optional: holdout_file boxes by name that reject windows even in mask mode: the
+         regions whose CT must stay unseen, e.g. a control for the masked boxes)
        "holdout_mode": "mask" | "reject"   (optional: training windows of this source over a held-out box keep their surroundings with
          every label unknown in the box + a guard (mask), or are redrawn (reject); default train --holdout-mode, mask)
        "weight": 1.0},
@@ -105,6 +107,7 @@ typedef struct {
     axis ax;                /* n == 0 when unknown */
     int64_t hold_o[3], hold_n[3];   /* optional held-out box (level-0 voxels); hold_n[0] == 0 when absent (= hold[0]: the validation box) */
     int64_t (*hold)[6]; int nhold;  /* all held-out boxes (z y x nz ny nx, level 0): no training label inside them */
+    uint8_t *hold_rej;      /* per held-out box (parallel to hold): 1 = rejected even in mask mode ("holdout_reject": the box names) */
     int hold_mode;          /* "holdout_mode": 0 the sampler's (train --holdout-mode), 1 "mask", 2 "reject": this source's training windows
                                that overlap a held-out box */
     int64_t (*box)[6]; int nbox;    /* optional "boxes": level-0 boxes [z, y, x, nz, ny, nx]: training windows inside one (by volume; task restore: of local CT) */

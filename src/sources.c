@@ -19,11 +19,12 @@ static const char *g_cache;   /* chunk cache dir for HTTPS stores; from the sour
 int rung_of_um(double um) { return (int)lround(log2(um / 0.6)); }
 
 /* ---- held-out boxes ---- */
-static void src_add_hold(source *s, const json *b) {   /* one [z, y, x, nz, ny, nx] (level 0); the first one is also hold_o / hold_n */
+static void src_add_hold(source *s, const json *b, int rej) {   /* one [z, y, x, nz, ny, nx] (level 0); the first one is also hold_o / hold_n */
     if (!b || b->type != J_ARR || b->n != 6) return;
     int64_t v[6]; for (int d = 0; d < 6; d++) v[d] = (int64_t)json_num(json_at(b, (size_t)d), 0);
     if (v[3] <= 0 || v[4] <= 0 || v[5] <= 0) return;
-    s->hold = realloc(s->hold, (size_t)(s->nhold + 1) * sizeof *s->hold); memcpy(s->hold[s->nhold++], v, sizeof v);
+    s->hold = realloc(s->hold, (size_t)(s->nhold + 1) * sizeof *s->hold); s->hold_rej = realloc(s->hold_rej, (size_t)(s->nhold + 1));
+    s->hold_rej[s->nhold] = (uint8_t)(rej != 0); memcpy(s->hold[s->nhold++], v, sizeof v);
     if (s->nhold == 1) for (int d = 0; d < 3; d++) { s->hold_o[d] = v[d]; s->hold_n[d] = v[3 + d]; }
 }
 static const char *src_base(const char *p) {   /* the last path component, ignoring trailing slashes and a trailing "/<level digits>" */
@@ -37,18 +38,22 @@ static const char *src_base(const char *p) {   /* the last path component, ignor
     }
 }
 /* "holdout_file": the boxes of a wbench holdouts.json ({"boxes": [{"ct": KEY, "l0": [6]}...]}) whose ct basename is this source's */
-static int src_hold_file(source *s, const char *path) {
+static int src_hold_file(source *s, const char *path, const json *rejn) {
     FILE *f = fopen(path, "rb"); if (!f) { fprintf(stderr, "sources: %s: cannot open holdout_file %s\n", s->name, path); return 1; }
     fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET); char *t = malloc((size_t)n + 1);
     const size_t got = t ? fread(t, 1, (size_t)n, f) : 0; fclose(f);
     json *j = got == (size_t)n ? json_parse(t, (size_t)n) : nullptr; free(t);
     const json *bx = j ? json_get(j, "boxes") : nullptr;
     if (!bx || bx->type != J_ARR) { fprintf(stderr, "sources: %s: holdout_file %s: no \"boxes\" array\n", s->name, path); json_free(j); return 1; }
-    char me[512]; snprintf(me, sizeof me, "%s", src_base(s->ct_key)); int added = 0;
+    char me[512]; snprintf(me, sizeof me, "%s", src_base(s->ct_key)); int added = 0, nrej = 0;
     for (size_t k = 0; k < bx->n; k++) { const json *e = json_at(bx, k);
-        if (!strcmp(src_base(json_str(json_get(e, "ct"), "")), me)) { src_add_hold(s, json_get(e, "l0")); added++; } }
+        if (!strcmp(src_base(json_str(json_get(e, "ct"), "")), me)) {
+            const char *nm = json_str(json_get(e, "name"), ""); int rej = 0;
+            for (size_t q = 0; rejn && rejn->type == J_ARR && q < rejn->n; q++) rej |= *nm && !strcmp(nm, json_str(json_at(rejn, q), ""));
+            src_add_hold(s, json_get(e, "l0"), rej); added++; nrej += rej;
+            if (rej) fprintf(stderr, "sources: %s: held-out box %s rejects training windows (holdout_reject)\n", s->name, nm); } }
     json_free(j);
-    if (added) fprintf(stderr, "sources: %s: %d held-out boxes from %s\n", s->name, added, path);
+    if (added) fprintf(stderr, "sources: %s: %d held-out boxes from %s (%d reject)\n", s->name, added, path, nrej);
     return 0;
 }
 
@@ -427,10 +432,10 @@ sources *sources_load(const char *path) {
             if (!s->nemb || s->emb_level < 0) { fprintf(stderr, "sources: %s: \"emb\" needs \"groups\": [DIR, ...] and \"level\" >= 0\n", s->name); json_free(j); sources_free(S); return nullptr; }
         }
         const json *ho = json_get(e, "holdout");
-        if (ho && ho->type == J_ARR && ho->n == 6 && json_at(ho, 0)->type != J_ARR) src_add_hold(s, ho);
-        else if (ho && ho->type == J_ARR) for (size_t k = 0; k < ho->n; k++) src_add_hold(s, json_at(ho, k));
+        if (ho && ho->type == J_ARR && ho->n == 6 && json_at(ho, 0)->type != J_ARR) src_add_hold(s, ho, 0);
+        else if (ho && ho->type == J_ARR) for (size_t k = 0; k < ho->n; k++) src_add_hold(s, json_at(ho, k), 0);
         const char *hf = json_str(json_get(e, "holdout_file"), nullptr);
-        if (hf && src_hold_file(s, hf)) { json_free(j); sources_free(S); return nullptr; }
+        if (hf && src_hold_file(s, hf, json_get(e, "holdout_reject"))) { json_free(j); sources_free(S); return nullptr; }
         const char *hm = json_str(json_get(e, "holdout_mode"), nullptr);
         if (hm) { s->hold_mode = !strcmp(hm, "mask") ? 1 : !strcmp(hm, "reject") ? 2 : -1;
                   if (s->hold_mode < 0) { fprintf(stderr, "sources: %s: \"holdout_mode\" is \"mask\" or \"reject\", not \"%s\"\n", s->name, hm); json_free(j); sources_free(S); return nullptr; } }
@@ -466,7 +471,7 @@ void sources_free(sources *S) {
         source *s = &S->src[i];
         for (int l = 0; l < MAXLEV; l++) z3_close(s->ct[l]);
         for (int l = MAXLEV - 1; l >= 0; l--) { z3_close(s->phase_pl[l]); z3_close(s->phase_ign_pl[l]); }   /* (the pooled views borrow phase / ignore: closed first) */
-        if (s->band != s->phase) z3_close(s->band); z3_close(s->phase); z3_close(s->wind); z3_close(s->aux); z3_close(s->phase_ign); z3_close(s->phase_wt); free(s->box); free(s->hold); free(s->focus); free(s->mask); srpair_free(s->srp);
+        if (s->band != s->phase) z3_close(s->band); z3_close(s->phase); z3_close(s->wind); z3_close(s->aux); z3_close(s->phase_ign); z3_close(s->phase_wt); free(s->box); free(s->hold); free(s->hold_rej); free(s->focus); free(s->mask); srpair_free(s->srp);
         for (int c = 0; c < NTG; c++) {
             for (int l = 0; l < MAXLEV; l++) z3_close(s->tgt[c][l]);
             if (s->reg[c]) {
