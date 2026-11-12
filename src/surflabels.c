@@ -30,6 +30,7 @@
    averaged over +-2 wraps, outside [LO, HI]), --min-onpap (with --ct: the share of the wrap's vertices with CT >= --ct-level within
    +-ct-range um along the ray, every 2nd row / column: a separate pass over the wraps and CT before labelling).
    --exclude: boxes of a holdouts.json whose "ct" ends with --exclude-ct (l0 voxels of the CT, axis-um) grown by --exclude-mm -> 4.
+     A box holding no labelled voxel fails the run (exit 1 after writing; --exclude-empty-ok 1 allows it): the per-box counts are logged.
    --gt ROOT KEY (winding_mod14 codes on the same grid, e.g. Paris 4 q-9p6.zarr 9.6): validation. The GT phase (pair rule on the GT
    codes) against ours where both are known (raw and kept), the per-wrap counts (the wrap whose sheet is the voxel's lower winding),
    and the pair winding accuracy (src/pairacc.h, 0.5 / 1 / 2 / 4 mm) of our winding (q of the lower sheet + phase) at the GT-coded kept
@@ -92,6 +93,7 @@ typedef struct {
     int64_t shape[3]; int S, B, Hh; float rmax; int bake;
     z3w *wc, *wp, *wi; z3 *ct, *gt; double gum;
     double (*hold)[6]; int nhold;     /* holdout boxes, grid voxels (z, y, x, nz, ny, nx) */
+    _Atomic long long *holdn; char (*holdnm)[48];   /* per box: phase-known voxels inside it (a box that holds none is an error, see the end of cmd_surf_labels), its name */
     /* band */
     int64_t sz; sl_tile *tiles; size_t ntile; size_t *off; uint32_t *refs; int64_t ns[3];
     int *slist; int nsl; int nbs;     /* shards (sy * ns2 + sx) with tiles; blocks per shard */
@@ -375,6 +377,7 @@ static int sl_block(sl_job *J, sl_scratch *X, int si, int bk, int tid) {
     pthread_mutex_unlock(&J->mu);
     if (!oc || !op || !oi || (J->ww && !ow)) return -1;
     long long sdn = 0, sda = 0, ksdn = 0, ksda = 0, csn[COH_BINS + 1] = {0}, csa[COH_BINS + 1] = {0};
+    int hlast = -1; long long hrun = 0;   /* the holdout box of the current run of voxels and its count (flushed on a change: no atomic per voxel) */
     long long ncode = 0, nconf = 0, nknown = 0, nkept = 0, nig[IG_N] = {0}, gtk = 0, g10 = 0, g25 = 0, kgtk = 0, kg10 = 0, kg25 = 0, gb[PHASE_AGREE_BINS] = {0}, kb[PHASE_AGREE_BINS] = {0};
     sl_recs *R = &J->recs[tid]; const double mm = J->gum * 1e-3;
     /* local CT coherence of the label phase: per cell of coh_cell^3 voxels, the correlation of the CT with cos(2 pi phase) over the
@@ -427,9 +430,10 @@ static int sl_block(sl_job *J, sl_scratch *X, int si, int bk, int tid) {
             }
         }
         if (J->ct && !X->ct[((size_t)z * B + y) * B + x]) ig = IG_CT;
+        int hbx = -1;
         for (int h = 0; h < J->nhold; h++) {
             const double *hb = J->hold[h];
-            if (gz >= hb[0] && gz < hb[0] + hb[3] && gy >= hb[1] && gy < hb[1] + hb[4] && gx >= hb[2] && gx < hb[2] + hb[5]) { ig = IG_HOLD; break; }
+            if (gz >= hb[0] && gz < hb[0] + hb[3] && gy >= hb[1] && gy < hb[1] + hb[4] && gx >= hb[2] && gx < hb[2] + hb[5]) { ig = IG_HOLD; hbx = h; break; }
         }
         const float r = coh ? coh[((size_t)(z / Cc) * nc + y / Cc) * nc + x / Cc] : NAN;
         int rb = COH_BINS; if (coh && isfinite(r)) { rb = (int)floor((r + 1) * 0.5 * COH_BINS); if (rb < 0) rb = 0; if (rb > COH_BINS - 1) rb = COH_BINS - 1; }
@@ -442,6 +446,7 @@ static int sl_block(sl_job *J, sl_scratch *X, int si, int bk, int tid) {
         if (ow) { double wv = 0; if (!ig && ph != PHASE_UNKNOWN && isfinite(r)) { wv = (r - J->wc0) / (J->wc1 - J->wc0); wv = wv < 0 ? 0 : wv > 1 ? 1 : wv; } ow[oo] = (uint8_t)lround(255 * wv); }
         if (ph == PHASE_UNKNOWN) continue;
         nknown++; nig[ig]++; if (!ig) nkept++;
+        if (hbx >= 0) { if (hbx != hlast) { if (hlast >= 0) atomic_fetch_add(&J->holdn[hlast], hrun); hlast = hbx; hrun = 0; } hrun++; }
         const int wi = X->wid[X->lo[i]] - 1; sl_wrap *w = wi >= 0 ? &J->W[wi] : nullptr;
         if (w) { atomic_fetch_add_explicit(&w->kn, 1, memory_order_relaxed); if (!ig) atomic_fetch_add_explicit(&w->kk, 1, memory_order_relaxed); }
         if (!ig0) ckn[rb]++;
@@ -480,6 +485,7 @@ static int sl_block(sl_job *J, sl_scratch *X, int si, int bk, int tid) {
     }
     atomic_fetch_add(&J->ncode, ncode); atomic_fetch_add(&J->nconf, nconf); atomic_fetch_add(&J->nknown, nknown); atomic_fetch_add(&J->nkept, nkept);
     for (int k = 0; k < IG_N; k++) atomic_fetch_add(&J->nig[k], nig[k]);
+    if (hlast >= 0) atomic_fetch_add(&J->holdn[hlast], hrun);
     for (int k = 0; k < 34; k++) { atomic_fetch_add(&J->ag_kn[k], akn[k]); atomic_fetch_add(&J->ag_gk[k], agk[k]); atomic_fetch_add(&J->ag_g25[k], ag25[k]); }
     for (int k = 0; k <= COH_BINS; k++) { atomic_fetch_add(&J->ch_kn[k], ckn[k]); atomic_fetch_add(&J->ch_gk[k], cgk[k]); atomic_fetch_add(&J->ch_g10[k], cg10[k]); atomic_fetch_add(&J->ch_g25[k], cg25[k]); }
     atomic_fetch_add(&J->gtk, gtk); atomic_fetch_add(&J->g10, g10); atomic_fetch_add(&J->g25, g25);
@@ -781,11 +787,12 @@ int cmd_surf_labels(int argc, char **argv) {
         if (!hct) { fprintf(stderr, "surf-labels: --exclude needs --exclude-ct NAME (the CT path's tail in the holdouts' \"ct\")\n"); return 2; }
         char *buf = nullptr; const int n = sl_read_file(hp, &buf); json *j = n > 0 ? json_parse(buf, (size_t)n) : nullptr; free(buf);
         if (!j) { fprintf(stderr, "surf-labels: cannot parse %s\n", hp); return 1; }
-        const json *bx = json_get(j, "boxes"); J.hold = calloc(4096, sizeof *J.hold);
+        const json *bx = json_get(j, "boxes"); J.hold = calloc(4096, sizeof *J.hold); J.holdn = calloc(4096, sizeof *J.holdn); J.holdnm = calloc(4096, sizeof *J.holdnm);
         for (size_t k = 0; bx && json_at(bx, k) && J.nhold < 4096; k++) {
             const json *b = json_at(bx, k); const char *c = json_str(json_get(b, "ct"), ""); const size_t lc = strlen(c), lh = strlen(hct);
             if (lc < lh || strcmp(c + lc - lh, hct)) continue;
             const json *l0 = json_get(b, "l0"); const double m = hmm * 1000 / axum, fa = axum / gum;
+            snprintf(J.holdnm[J.nhold], sizeof J.holdnm[0], "%s", json_str(json_get(b, "name"), "?"));
             double *h = J.hold[J.nhold++];
             for (int d = 0; d < 3; d++) { h[d] = floor((json_num(json_at(l0, d), 0) - m) * fa); h[3 + d] = ceil((json_num(json_at(l0, d), 0) + json_num(json_at(l0, 3 + d), 0) + m) * fa) - h[d]; }
         }
@@ -970,6 +977,15 @@ int cmd_surf_labels(int argc, char **argv) {
     printf("surf-labels: %d of %d wraps kept, %lld coded voxels, %lld conflict; phase known %lld (%.1f mm3), kept %lld (%.1f mm3), kept share %.4f; ignored: dropped wrap %lld, conflict %lld, CT %lld, holdout %lld, CT coherence %lld, anchor inconsistent %lld, unanchored %lld; %.0fs\n",
            nkeep, nw, (long long)J.ncode, (long long)J.nconf, (long long)J.nknown, J.nknown * v3, (long long)J.nkept, J.nkept * v3, J.nknown ? (double)J.nkept / J.nknown : 0,
            (long long)J.nig[1], (long long)J.nig[2], (long long)J.nig[3], (long long)J.nig[4], (long long)J.nig[5], (long long)J.nig[6], (long long)J.nig[7], sl_now() - t0);
+    /* a named holdout box that holds no labelled voxel is almost always a box in the wrong units (2026-11-12: PHerc1299's band was written in
+       level-2 numbers, covered an empty corner, and the labels kept their held-out third with only "holdout 0" in the log): fail, loudly */
+    int hfail = 0;
+    for (int h = 0; h < J.nhold; h++) {
+        const long long nh = atomic_load(&J.holdn[h]);
+        fprintf(stderr, "surf-labels: holdout box %s (grid %.0f,%.0f,%.0f + %.0f,%.0f,%.0f): %lld labelled voxels ignored\n", J.holdnm[h], J.hold[h][0], J.hold[h][1], J.hold[h][2], J.hold[h][3], J.hold[h][4], J.hold[h][5], nh);
+        if (!nh && !atoi(sl_opt(argc, argv, "--exclude-empty-ok", "0"))) {
+            fprintf(stderr, "surf-labels: FAIL: holdout box %s covers no labelled voxel (wrong units? \"l0\" is level-0 voxels of the CT; --exclude-empty-ok 1 if it is meant)\n", J.holdnm[h]); hfail = 1; }
+    }
     if (J.gt) {
         printf("surf-labels: vs GT phase: raw %lld voxels known in both, |d| < 0.1 turn %.4f, < 0.25 %.4f (bins %.3f %.3f %.3f %.3f %.3f); kept %lld, < 0.1 %.4f, < 0.25 %.4f (bins %.3f %.3f %.3f %.3f %.3f)\n",
                (long long)J.gtk, J.gtk ? (double)J.g10 / J.gtk : 0, J.gtk ? (double)J.g25 / J.gtk : 0,
@@ -1048,5 +1064,6 @@ int cmd_surf_labels(int argc, char **argv) {
     if (J.ct) z3_close(J.ct);
     if (J.gt) z3_close(J.gt);
     if (J.ag_r) z3_close(J.ag_r);
-    return 0;
+    free(J.holdn); free(J.holdnm);
+    return hfail;
 }

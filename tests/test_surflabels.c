@@ -263,6 +263,11 @@ int main(void) {
     }
     snprintf(p, sizeof p, "%s/hold.json", root);
     CHECK(!run(root, "wp", "h", "1", "4", "--exclude", p, nullptr), "surf-labels --exclude failed");
+    {   /* a holdout box over an unlabelled corner (PHerc1299's band in the wrong units, 2026-11-12) must fail the run, not log "holdout 0" */
+        char pe[600]; snprintf(pe, sizeof pe, "%s/hold_empty.json", root); FILE *fe = fopen(pe, "w"); if (!fe) return 1;
+        fprintf(fe, "{\"boxes\": [{\"name\": \"h\", \"ct\": \"S/scan.zarr\", \"l0\": [10, 160, 160, 20, 30, 30]}, {\"name\": \"corner\", \"ct\": \"S/scan.zarr\", \"l0\": [0, 0, 0, 8, 8, 8]}]}\n"); fclose(fe);
+        CHECK(run(root, "wp", "he", "1", "4", "--exclude", pe, nullptr) == 1, "a holdout box without labelled voxels did not fail surf-labels");
+    }
     const int sense[2] = {1, -1}; const char *outs[2] = {"p1", "m"};
     for (int s = 0; s < 2; s++) {
         char r[600]; snprintf(r, sizeof r, "%s/%s/codes.zarr", root, outs[s]); uint8_t *cd = readall(r, "9.6");
