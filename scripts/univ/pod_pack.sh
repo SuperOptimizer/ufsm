@@ -7,7 +7,8 @@
 # sums of 8 sampled label shards per set, which pod_univ.sh `verify` checks against its rebuilt rasters. Everything else (CT, segments,
 # Paris 4 / 0139 / 0500P2 labels) the pod reads from the mirror or rebuilds (datakit.sh). Then from the desk:
 #   rsync -a --info=progress2 -e "ssh -p PORT -i ~/.ssh/id_ed25519" OUT/ root@HOST:/workspace/univ/      (~20 GB, ~75 min at 4.5 MB/s)
-# Hard links where possible (OUT on the same filesystem as the sources), so staging costs no disk.
+# Hard links where possible (OUT on the same filesystem as the sources), so staging costs no disk. INK=1: also the U2 ink smoke's inputs
+# (OUT/inkgt, OUT/inkeval; POD: the pod's K for the rewritten paths, /workspace/univ).
 set -euo pipefail; O=${1:?OUT}; SNAP=${2:-}
 mkdir -p $O/small/axis $O/small/gtaxis $O/gt/p0139-q $O/gt/1667 $O/md5 $O/ckpt
 cpl() { cp -al "$1" "$2" 2>/dev/null || cp -a "$1" "$2"; }   # (hard link, else copy)
@@ -33,5 +34,12 @@ if [ -n "$SNAP" ]; then   # the run to resume: its checkpoint, binary and the co
   cpl $SNAP $O/ckpt/u1-resume.ckpt; R=$(dirname $SNAP); [ -f $R/ufsm.bin ] || R=$(dirname $R)
   cpl $R/ufsm.bin $O/ckpt/u1-ufsm.bin; echo ${COMMIT:?COMMIT: the commit that built the run ufsm.bin, u1: 23c085b} > $O/ckpt/u1-commit.txt
   head -1 $SNAP | grep -oE '"step":[0-9]+' > $O/ckpt/u1-step.txt || true
+fi
+if [ "${INK:-0}" = 1 ]; then   # the U2 ink smoke (scripts/univ/u2ink_smoke.sh): the human ink GT inputs (segments, labels, masks, validation rasters:
+  # inkgt/hf + od, 2.7 GB), the eval GT / crops (evgt, evcrops, wbench/inkeval/crops: 0.2 GB) and sources-u2ink.json with the pod's paths
+  G=/vesuvius/ufsm/inkgt; mkdir -p $O/inkgt $O/inkeval
+  for d in hf od evgt evcrops; do [ -d $O/inkgt/$d ] || cp -al $G/$d $O/inkgt/ 2>/dev/null || cp -aL $G/$d $O/inkgt/; done
+  [ -d $O/inkeval/crops ] || cp -al /vesuvius/ufsm/wbench/inkeval/crops $O/inkeval/ 2>/dev/null || cp -aL /vesuvius/ufsm/wbench/inkeval/crops $O/inkeval/
+  ROOT=${POD:-/workspace/univ}/inkgt CACHE=${POD:-/workspace/univ}/cache CACHE_MB=${CACHE_MB:-768} python3 -I $(dirname "$(readlink -f "$0")")/../inkgt/mksources_u2ink.py $G/sources-inkfly.json $O/inkgt/sources-u2ink.json
 fi
 du -shL $O; echo "staged: rsync -a --info=progress2 -e 'ssh -p PORT -i ~/.ssh/id_ed25519' $O/ root@HOST:/workspace/univ/"

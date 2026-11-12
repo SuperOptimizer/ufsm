@@ -122,6 +122,7 @@ static int tile_gpu(z3 *codes, const int64_t co[3], const int64_t cn[3], const i
     return band_pair_gpu_codes(K->ch, K->nch, K->b, K->n, n, lo, hi, rmax, cro, crn, out);
 }
 
+static thread_local struct { uint8_t *p; size_t cap; int pinned; } t_gpb;   /* the GPU path's tile interior (per reading thread) */
 static int onfly_read(void *vctx, z3 *codes, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads) {
     const onfly_ctx *C = vctx; const z3_meta *m = z3_meta_of(codes); const int h = C->halo;
     atomic_fetch_add(&g_reads, 1);
@@ -132,8 +133,10 @@ static int onfly_read(void *vctx, z3 *codes, const int64_t o[3], const int64_t n
     int cnt[3], ts[3];
     for (int d = 0; d < 3; d++) { const int64_t L = hi[d] - lo[d]; cnt[d] = (int)((L + T - 1) / T); ts[d] = (int)((L + cnt[d] - 1) / cnt[d]); }
     const size_t cap = (size_t)(ts[0] + 2 * h) * (ts[1] + 2 * h) * (ts[2] + 2 * h);
-    onfly_buf *B = ob_take(cap); if (!B) return -1;
-    uint8_t *cb = B->cb, *pb = B->pb, *rb = B->rb;
+    /* the tile buffer set only for the CPU path, taken at its first tile: a window held one of the --onfly-slots sets for all its tiles,
+       GPU tiles included, so 2 sets served 10 workers and 8 queued (pod, P 1024: the phase 74% of the window time, 3.25 busy cores of
+       40). The GPU path's per-tile interior lands in a per-thread pinned buffer; the device contexts are taken per tile (band_pair_gpu_codes) */
+    onfly_buf *B = nullptr; uint8_t *cb = nullptr, *pb = nullptr, *rb = nullptr;
     int rc = 0;
     for (int a = 0; a < cnt[0] && !rc; a++) for (int b = 0; b < cnt[1] && !rc; b++) for (int c = 0; c < cnt[2] && !rc; c++) {
         const int ti[3] = {a, b, c}; int64_t to[3], tn[3], co[3], cn[3], ro[3], rn[3]; int ni[3];
@@ -147,15 +150,23 @@ static int onfly_read(void *vctx, z3 *codes, const int64_t o[3], const int64_t n
         if (!any) { atomic_fetch_add(&g_skipped, 1); continue; }
         const double t0 = now_s();
         if (g_gpu >= 0 && band_pair_gpu_codes && !g_cpu_decode) {   /* the codes decoded on the device, only the tile interior comes down */
-            const int g = tile_gpu(codes, co, cn, ro, rn, h, tn, C->rmax, pb);
+            const size_t tnn = (size_t)tn[0] * tn[1] * tn[2];
+            if (tnn > t_gpb.cap) {   /* (the thread's pinned interior buffer: grown once to the largest tile) */
+                if (t_gpb.p) { if (t_gpb.pinned) band_pair_gpu_host_free(t_gpb.p); else free(t_gpb.p); }
+                t_gpb.pinned = band_pair_gpu_host_alloc && band_pair_gpu_host_free; t_gpb.p = t_gpb.pinned ? band_pair_gpu_host_alloc(tnn) : nullptr;
+                if (!t_gpb.p) { t_gpb.pinned = 0; t_gpb.p = malloc(tnn); }
+                t_gpb.cap = t_gpb.p ? tnn : 0; if (!t_gpb.p) { rc = -1; break; }
+            }
+            const int g = tile_gpu(codes, co, cn, ro, rn, h, tn, C->rmax, t_gpb.p);
             if (g == 2) { atomic_fetch_add(&g_skipped, 1); continue; }
             if (!g) {
                 atomic_fetch_add(&g_ns_pair, (uint64_t)(1e9 * (now_s() - t0))); atomic_fetch_add(&g_tiles, 1); atomic_fetch_add(&g_vtile, (uint64_t)cn[0] * cn[1] * cn[2]); atomic_fetch_add(&g_gputiles, 1);
                 for (int64_t z = 0; z < tn[0]; z++) for (int64_t y = 0; y < tn[1]; y++)
-                    memcpy(out + ((size_t)(to[0] - o[0] + z) * n[1] + (to[1] - o[1] + y)) * n[2] + (to[2] - o[2]), pb + ((size_t)z * tn[1] + y) * tn[2], (size_t)tn[2]);
+                    memcpy(out + ((size_t)(to[0] - o[0] + z) * n[1] + (to[1] - o[1] + y)) * n[2] + (to[2] - o[2]), t_gpb.p + ((size_t)z * tn[1] + y) * tn[2], (size_t)tn[2]);
                 continue;
             }
         }
+        if (!B) { if (!(B = ob_take(cap))) { rc = -1; break; } cb = B->cb; pb = B->pb; rb = B->rb; }   /* (the CPU path: a buffer set) */
         const size_t rnn = (size_t)rn[0] * rn[1] * rn[2], cnn = (size_t)cn[0] * cn[1] * cn[2];
         if (z3_read(codes, ro, rn, rb, nthreads)) { rc = -1; break; }
         size_t lab = 0; for (size_t k = 0; k < rnn; k++) lab += rb[k] > 0 && rb[k] < 255;
@@ -171,7 +182,7 @@ static int onfly_read(void *vctx, z3 *codes, const int64_t o[3], const int64_t n
             memcpy(out + ((size_t)(to[0] - o[0] + z) * n[1] + (to[1] - o[1] + y)) * n[2] + (to[2] - o[2]), pb + ((size_t)(z + h) * cn[1] + (y + h)) * cn[2] + h, (size_t)tn[2]);
     }
     atomic_fetch_add(&g_vout, N);
-    ob_give(B);
+    if (B) ob_give(B);
     return rc;
 }
 
