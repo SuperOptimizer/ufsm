@@ -52,7 +52,8 @@ CCBIN   := $(if $(filter gcc-%,$(HOSTCC)),$(if $(shell command -v $(subst gcc,g+
 ifeq ($(origin NVCC),undefined)
 NVCC := $(CCACHE) $(if $(shell command -v nvcc 2>/dev/null),nvcc,$(CUDA)/bin/nvcc) $(CCBIN)
 endif
-CFLAGS  ?= -std=c23 -O3 -march=native -g -Wall -Wextra -Wno-unused-parameter -Wno-format-truncation -pthread
+CFLAGS  ?= -std=c23 -O3 -march=native -g -Wall -Wextra -Werror=comment -Wno-unused-parameter -Wno-format-truncation -pthread
+# (-Werror=comment, 2026-11-12: an unclosed comment swallowed the next source line, the --fib-head statistics pass, with only a -Wcomment warning)
 CPPFLAGS = -D_GNU_SOURCE -Isrc -Ithird_party -Ithird_party/surfcomp $(shell pkg-config --cflags libcurl libzstd blosc zlib libcrypto)
 LDLIBS   = $(shell pkg-config --libs libcurl libzstd blosc zlib libcrypto) -ljpeg -lm -lpthread
 NVFLAGS ?= -O3 $(NVARCH) -DUFSM_ARCH=$(ARCH) -use_fast_math -Xcompiler -fno-threadsafe-statics -Isrc   # fast math: +4% step time, FD tests still pass
