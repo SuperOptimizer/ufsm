@@ -213,7 +213,7 @@ int main(int argc, char **argv) {
         CHECK(!sh("head -1 %s/ssl/last.ckpt | grep -q '\"emb_lev\":1,\"emb_ch\":8'", d), "ssl: header names the side head");
         /* (d) a run without the side head resumes with --ssl (the head's block inserted fresh, the rest and the step the checkpoint's) */
         CHECK(!sh("cp -r %s/lat_plain %s/lp2 && UFSM_GRAD_MX8=1 %s train %s/fx/sources-ssl.json --out %s/lp2 --resume %s/lp2/last.ckpt %s %s --ssl-share 0.5 --steps 8 > %s/lp2.log 2>&1"
-                  " && grep -q 'has no side head' %s/lp2.log && grep -q 'step      8 ' %s/lp2.log && head -1 %s/lp2/last.ckpt | grep -q '\"emb_lev\":1,\"emb_ch\":8'", d, d, U, d, d, d, cm, sf, d, d, d, d), "ssl: resume of a run without the side head (%s/lp2.log)", d);
+                  " && grep -q 'has no side head' %s/lp2.log && grep -q 'step      8 ' %s/lp2.log && grep -Eq 'std 0[.](0[1-9]|[1-9])' %s/lp2.log && head -1 %s/lp2/last.ckpt | grep -q '\"emb_lev\":1,\"emb_ch\":8'", d, d, U, d, d, d, cm, sf, d, d, d, d, d), "ssl: resume of a run without the side head (%s/lp2.log)", d);
         /* (e) --ssl-ink (latent, ink head): the ink-ssl term on the unlabelled windows is finite and covers the unmasked cells (conf 0, no papyrus gate) */
         CHECK(!sh("sed 's|}}}}]}|}}}}, {\"name\": \"wind-fixture-u\", \"root\": \"%s/fx\", \"ct\": \"ct\", \"um\": 9.6, \"axis\": \"%s/fx/axis.json\", \"weight\": 1, \"ct_only\": 1}]}|' %s/fx/sources-ink.json > %s/fx/sources-ink-ssl.json"
                   " && grep -q ct_only %s/fx/sources-ink-ssl.json", d, d, d, d, d), "ink sources with an unlabelled copy (%s/fx/sources-ink.json's ending)", d);

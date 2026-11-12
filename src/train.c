@@ -2995,6 +2995,9 @@ int cmd_train(int argc, char **argv) {
         if (g_lat_have) unet_set_lat_basis(d->u, g_lat_bas, g_lat_gain, g_lat_c, g_lat_step);
         if (resume) {
             const int grow = atoi(opt(argc, argv, "--grow-head", "0"));   /* band_affinity warm start from a recto checkpoint */
+            if (cfg.emb_lev) unet_init(d->u, seed + 1);   /* (a checkpoint without the side head gets this init inserted for it: unet_load copies
+                                                              the block from u->p, which unet_create leaves unset -- zeros froze the 11-12 unissl
+                                                              run at ssl std 0 with no targets; every loaded parameter is overwritten) */
             step0 = grow ? unet_load_grow(d->u, resume, 1, 1.f) : unet_load(d->u, resume);
             if (step0 < 0) { fprintf(stderr, "cannot load %s\n", resume); return 1; }
             if (atoi(opt(argc, argv, "--finetune", "0"))) step0 = 0;   /* loaded weights/state, fresh schedule */
