@@ -51,6 +51,23 @@ int main(void) {
         printf("%s %-9s logits %s stem %d: %zu of %zu bytes differ (%zu by more than 1), %zu set%s\n", bad ? "FAIL" : "ok  ", T[t].name, l32 ? "fp32" : "fp16", st, nd, sh3, n2, nset, bad ? "  <--" : "");
         fails += bad;
     }
+    /* nn_lat_heads_place (the three heads at once, the stem shared) against one nn_lat_head_place per head: byte-identical */
+    for (int l32 = 0; l32 < 2; l32++) {
+        const void *L = l32 ? lgd32 : lgd; const int lh = !l32;
+        int c0[3], c1[3], sb0[3], sb1[3], s0[3], s1[3]; uint8_t *ds[3];
+        for (int t = 0; t < 3; t++) { c0[t] = T[t].c0; c1[t] = T[t].c1; sb0[t] = T[t].sb0; sb1[t] = T[t].sb1; s0[t] = T[t].s0; s1[t] = T[t].s1; ds[t] = nn_malloc(sh3); nn_zero(ds[t], sh3); }
+        nn_lat_heads_place(L, lh, CW, CW, CW, 3, c0, c1, sb0, sb1, s0, s1, ds, pd, C, NO, ctd, mean, isd, iso, HALO, HALO, oz, oy, ox, SH, SH, SH, SH);
+        size_t nd = 0;
+        for (int t = 0; t < 3; t++) {
+            nn_zero(d1, sh3);
+            nn_lat_head_place(L, lh, CW, CW, CW, T[t].c0, T[t].c1, T[t].sb0, T[t].sb1, T[t].s0, T[t].s1, pd, C, NO, ctd, mean, isd, iso, HALO, HALO, oz, oy, ox, SH, SH, SH, SH, d1);
+            nn_sync(); nn_d2h(h0, ds[t], sh3); nn_d2h(h1, d1, sh3);
+            for (size_t i = 0; i < sh3; i++) nd += h0[i] != h1[i];
+            nn_free(ds[t]);
+        }
+        printf("%s all three heads at once, logits %s: %zu bytes differ from one head at a time\n", nd ? "FAIL" : "ok  ", l32 ? "fp32" : "fp16", nd);
+        fails += nd != 0;
+    }
     printf("%s\n", fails ? "FAIL" : "test_lathead: ok");
     return fails != 0;
 }

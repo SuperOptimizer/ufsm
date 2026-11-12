@@ -12,6 +12,14 @@
 
 /* codes: a winding_mod14 raster (owned by the result); rmax: the pair radius in codes voxels (phase-raster --radius / --gs). */
 z3 *phase_onfly_open(z3 *codes, float rmax);
+/* the 2x circular-mean pooling of winding_mod14 codes (phase-raster --gs 4's praster_read, `ufsm codes-pool2`): of a box of the coarse
+   grid, and as a derived array (shape ceil(codes / 2), fill 0; codes taken over; nullptr on failure, codes kept). The onfly phase over
+   it equals phase-raster --gs 4 (the pair rule on the GPU, the codes pooled on the CPU) */
+int codes_pool2_box(z3 *codes, const int64_t ro[3], const int64_t rn[3], uint8_t *out, int nthreads);
+z3 *codes_pool2_open(z3 *codes);
+/* several phase sets of one scroll on one grid (each phase_onfly_open'd or stored; all taken over, closed on failure too) fused as
+   phase-fuse does (src/fuse.h fuse_phase, --tol turns): byte-identical to `ufsm phase-fuse` over the same sets' rasters */
+z3 *phase_onfly_fuse_open(z3 **sets, int n, float tol);
 /* process-wide: the pair rule on CUDA device gpu (-1: CPU) with `slots` concurrent tiles of at most budget_mb device bytes each
    (the tile edge follows from it); reserve 1 allocates the slots' device buffers now (before the trainer's memory planner looks). */
 int phase_onfly_config(int gpu, int slots, int budget_mb, int reserve);
