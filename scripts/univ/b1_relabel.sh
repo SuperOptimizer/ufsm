@@ -27,7 +27,7 @@ case $SET in
          step raster July 4.8; [ -f $G/codesB48/done ] || { nice -n 5 $U raster $G/codesB48 --shape $SH --um $UM --level 1 --binary 0 --levels 1 --threads $T --shard 512 --value q.tif $G/qB/*.tifxyz > $G/rasterB48.log 2>&1 && touch $G/codesB48/done; tail -1 $G/rasterB48.log; }
          C=$G/codesB48; O=$G/phaseB48
        fi; CK=4.8;;
-  1667*) G0=/vesuvius/ufsm/gt/PHerc1667-wind-20261016; G=$K/gt/1667; mkdir -p $G; AX=${AX:-/mnt/scratch/pods/PHerc1667/unroll/axis.json}; DBOX=""
+  1667*) G0=${G0:-/vesuvius/ufsm/gt/PHerc1667-wind-20261016}; G=$K/gt/1667; mkdir -p $G; AX=${AX:-/mnt/scratch/pods/PHerc1667/unroll/axis.json}; DBOX=""
        C=$G0/codes${SET#1667}; O=$G/phase${SET#1667}48; CK=4.798;;
 esac
 [ "${PHASE:-1}" = 0 ] && { step "codes only (PHASE=0)"; exit 0; }

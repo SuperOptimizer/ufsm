@@ -1,4 +1,6 @@
 #include "sources.h"
+#include "fiberraster.h"
+#include "band_onfly.h"
 #include "json.h"
 #include "votes.h"
 #include "srpair.h"
@@ -103,7 +105,7 @@ void axis_at(const axis *a, double z, double *y, double *x) {
 /* ---- sources ---- */
 
 const char *const SHNAME[SH_N] = {"phase", "normal", "density", "wind4", "rv", "ink", "fibre"};
-static const char *CHNAME[NTG] = {"recto", "sheet", "fibre"};
+static const char *CHNAME[NTG] = {"recto", "sheet", "fibre", "fibre_h", "fibre_v"};
 
 static char *sdup(const char *s) { return s ? strdup(s) : nullptr; }
 
@@ -169,9 +171,25 @@ sources *sources_load(const char *path) {
             const json *t = json_get(tg, CHNAME[c]);
             if (!t && c == CH_SHEET) t = json_get(tg, "ink");   /* task unwrap: the ink teacher (prob) in target slot 1 */
             if (!t && c == CH_FIB) t = json_get(tg, "fiber");
+            if (!t && c == CH_FIBH) t = json_get(tg, "fiber_h");
+            if (!t && c == CH_FIBV) t = json_get(tg, "fiber_v");
             for (int l = 0; l < MAXLEV; l++) s->tgt_present[c][l] = -1;
             if (!t) continue;
             if (t->type == J_STR) { s->tgt_key[c] = strdup(t->str); continue; }
+            const json *fj = json_get(t, "fibre");
+            if (fj) {   /* the fibre planes on the fly: no stored raster */
+                struct fib_spec *f = calloc(1, sizeof *f); const char *pl = json_str(json_get(fj, "plane"), "");
+                f->afv = sdup(json_str(json_get(fj, "afv"), nullptr)); f->extra = sdup(json_str(json_get(fj, "extra"), ""));
+                f->map = sdup(json_str(json_get(fj, "map"), nullptr)); f->tr = sdup(json_str(json_get(fj, "tr"), nullptr));
+                f->rad = json_num(json_get(fj, "radius"), 2); f->guard = json_num(json_get(fj, "guard"), 3); f->ring = json_num(json_get(fj, "ring"), 0);
+                f->iso = (int)json_num(json_get(fj, "iso"), 64); f->plane = !strcmp(pl, "V");
+                if (!f->afv || (strcmp(pl, "H") && strcmp(pl, "V")) || !(f->rad > 0) || f->guard < 0 || f->ring < 0 || f->rad + f->guard + f->ring > 15) {
+                    fprintf(stderr, "sources: %s/%s: \"fibre\": {\"afv\": PATH, \"plane\": \"H\" | \"V\", radius 2, guard 3, ring 0 (radius + guard + ring <= 15), iso 64, extra, map | tr}\n", s->name, CHNAME[c]);
+                    free(f); json_free(j); sources_free(S); return nullptr;
+                }
+                s->tgt_fib[c] = f; s->tgt_key[c] = strdup("#fibre"); s->tgt_prob[c] = s->tgt_prob254[c] = 1;
+                continue;
+            }
             s->tgt_binary[c] = !strcmp(json_str(json_get(t, "encoding"), ""), "binary");
             s->tgt_prob254[c] = !strcmp(json_str(json_get(t, "encoding"), ""), "prob254");   /* p * 254, 255 = unknown: read as stored */
             s->tgt_prob[c] = !strcmp(json_str(json_get(t, "encoding"), ""), "prob") || s->tgt_prob254[c];
@@ -231,7 +249,7 @@ sources *sources_load(const char *path) {
             const char *broot = json_str(json_get(bt, "root"), nullptr), *bkey = json_str(json_get(bt, "key"), "4.8");
             s->band_radius = (float)json_num(json_get(bt, "radius"), 80); s->band_span = (float)json_num(json_get(bt, "span"), 75);
             const json *pt0 = json_get(bt, "phase");
-            s->phase_only = !broot && pt0 && json_get(pt0, "level");   /* phase-only: the band handle aliases the stored phase (below) */
+            s->phase_only = !broot && pt0 && json_get(pt0, "level");   /* (also an "onfly" phase: the codes are read through it) */   /* phase-only: the band handle aliases the stored phase (below) */
             store *bs = broot ? store_open(broot) : nullptr;
             s->band = bs ? z3_open(bs, bkey, nullptr) : nullptr;
             if ((!s->band && !s->phase_only) || !(s->band_radius > 0) || !(s->band_span >= 0)) {
@@ -243,6 +261,16 @@ sources *sources_load(const char *path) {
                 const char *proot = json_str(json_get(pt, "root"), nullptr), *pkey = json_str(json_get(pt, "key"), "4.8");
                 store *ps = proot ? store_open(proot) : nullptr;
                 s->phase = ps ? z3_open(ps, pkey, nullptr) : nullptr;
+                const json *of = json_get(pt, "onfly");   /* {"root", "key", "rmax"}: the pair-rule phase computed from these codes on read
+                                                             (band_onfly.h; byte-identical to phase-raster --pair 1 on the codes' grid) */
+                if (of && !s->phase) {
+                    const char *cr = json_str(json_get(of, "root"), nullptr), *ck = json_str(json_get(of, "key"), "");
+                    const float rm = (float)json_num(json_get(of, "rmax"), 0);
+                    store *cs = cr ? store_open(cr) : nullptr; z3 *cz = cs ? z3_open(cs, ck, nullptr) : nullptr;
+                    s->phase = cz && rm > 0 ? phase_onfly_open(cz, rm) : nullptr;
+                    if (!s->phase) { z3_close(cz); fprintf(stderr, "sources: %s: phase onfly: cannot open the codes %s/%s or no \"rmax\" > 0\n", s->name, cr ? cr : "?", ck); json_free(j); sources_free(S); return nullptr; }
+                    s->phase_onfly = rm;
+                }
                 s->phase_level = (int)json_num(json_get(pt, "level"), 1); s->phase_direct = json_get(pt, "level") != nullptr;
                 const double sg = json_num(json_get(pt, "phase_sign"), 1);
                 if (sg != 1 && sg != -1) { fprintf(stderr, "sources: %s: \"phase_sign\" must be 1 or -1\n", s->name); json_free(j); sources_free(S); return nullptr; }
@@ -411,6 +439,7 @@ void sources_free(sources *S) {
                 free(s->reg[c]);
             }
             free(s->tgt_key[c]);
+            if (s->tgt_fib[c]) { free(s->tgt_fib[c]->afv); free(s->tgt_fib[c]->extra); free(s->tgt_fib[c]->map); free(s->tgt_fib[c]->tr); free(s->tgt_fib[c]); }
             store_close(s->tgt_store[c]);
         }
         free(s->ax.z); free(s->ax.y); free(s->ax.x);
@@ -502,8 +531,28 @@ z3 *source_ct(source *s, int level) {
     return s->ct[level];
 }
 
+static int fib_same(const struct fib_spec *a, const struct fib_spec *b) {
+    const int ss = !strcmp(a->afv, b->afv) && !strcmp(a->extra, b->extra) && !strcmp(a->map ? a->map : "", b->map ? b->map : "") && !strcmp(a->tr ? a->tr : "", b->tr ? b->tr : "");
+    return ss && a->rad == b->rad && a->guard == b->guard && a->ring == b->ring && a->iso == b->iso;
+}
+/* a "fibre" target: both planes from one computation; the other plane goes to a channel with the same options and the other plane */
+static z3 *source_tgt_fibre(source *s, int ch, int level) {
+    if (s->tgt[ch][level]) return s->tgt[ch][level];
+    const struct fib_spec *f = s->tgt_fib[ch]; z3 *pl[2];
+    z3 *c0 = open_level(s->s, s->ct_key, level, s->um), *c1 = c0 ? open_level(s->s, s->ct_key, level, s->um) : nullptr, *c2 = c1 ? open_level(s->s, s->ct_key, level, s->um) : nullptr;
+    const int bad = fiber_onfly_open(f->afv, f->extra, f->map, f->tr, f->rad, f->guard, f->ring, f->iso, level, c0, c1, c2, pl);
+    pthread_mutex_lock(&g_open_mu);
+    if (bad) { if (!s->tgt[ch][level]) s->tgt_present[ch][level] = 0; pthread_mutex_unlock(&g_open_mu); return s->tgt[ch][level]; }
+    if (!s->tgt[ch][level]) { s->tgt[ch][level] = pl[f->plane]; pl[f->plane] = nullptr; }
+    for (int c = 0; c < NTG; c++) if (c != ch && s->tgt_fib[c] && s->tgt_fib[c]->plane != f->plane && fib_same(s->tgt_fib[c], f) && !s->tgt[c][level] && pl[!f->plane]) {
+        s->tgt[c][level] = pl[!f->plane]; pl[!f->plane] = nullptr; }
+    pthread_mutex_unlock(&g_open_mu);
+    z3_close(pl[0]); z3_close(pl[1]);
+    return s->tgt[ch][level];
+}
 z3 *source_tgt(source *s, int ch, int level) {
     if (!s->tgt_key[ch] || level < s->tgt_min_level[ch] || level < 0 || level >= MAXLEV || s->tgt_present[ch][level] == 0) return nullptr;
+    if (s->tgt_fib[ch]) return source_tgt_fibre(s, ch, level);
     if (!s->tgt[ch][level]) {
         z3 *z = open_level(s->tgt_store[ch] ? s->tgt_store[ch] : s->s, s->tgt_key[ch], level, s->um);
         pthread_mutex_lock(&g_open_mu);

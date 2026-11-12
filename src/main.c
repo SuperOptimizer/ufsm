@@ -5,6 +5,7 @@
 #include "sources.h"
 #include "band.h"
 #include "bandgpu.h"
+#include "band_onfly.h"
 #include "pairacc.h"
 #include "votes.h"
 #include "wind.h"
@@ -156,6 +157,8 @@ static int usage(void) {
         "  ufsm sample  <sources.json> [--P 128] [--B 2] [--n 4] [--seed S] [--workers W] [--out DIR] [--noaug] [--bench N (loader throughput, train-like formats)]\n"
         "  ufsm prefetch <sources.json> [--levels 1] [--threads 32] [--fraction 1] [--P 128] [--dry 1]   warm the CT chunk cache for the labelled cells\n"
         "  ufsm phase-raster <codes-root> <key> <out-dir> [--box ...]          band phase precomputed for the sampler\n"
+        "  ufsm phase-onfly <codes-root> <key> --rmax R [--ref ROOT KEY] the pair-rule phase computed on read, timed and checked\n"
+        "  ufsm codes-pool2 <codes-root> <key> <out-dir>    4.8 um codes pooled 2x as phase-raster --gs 4 does (for on-the-fly phase)\n"
         "  ufsm phase-check <phase-root> <key> --axis A --scan-um U [--count 1] a stored phase: share rising outward, labelled volume\n"
         "  ufsm downsample <root> <key> <out-group> <out-um> --mode max|phase|votes|codes  one array halved per axis (labels, phase, side votes, winding codes)\n"
         "  ufsm side-votes <out-group> <out-um> <root> <key> [<root> <key> ...]   several surface sets' side labels added into one vote array\n"
@@ -269,6 +272,7 @@ static int usage(void) {
         "  ufsm fiber-link <in.fib> <out.fib> [--gap-mm 0.3]   join traced fibre pieces end to end (gap, tangent continuity, lateral offset)\n"
         "  ufsm fiber-trace <root> <key-prefix> <out.fib> --box Z,Y,X,NZ,NY,NX [--scaledown 3]   streamlines through a published fibre prediction (presence, nx, ny) -> UFIB\n"
         "  ufsm fiber-raster <fibres.afv|.fib> OUT --um U (--shape Z,Y,X | --ct ROOT KEY)   H / V fibre mask labels (prob254) on the CT grid\n"
+        "  ufsm fiber-onfly <fibres.afv|.fib> --ct ROOT KEY [--ref H V KEY]   the fibre planes on the fly (sources \"fibre\" targets): ms / window, diffs\n"
         "  ufsm field-blend <out> <fields1> <fields2> ... [--weights a,b,..] [--tile SZ,SY,SX --grids z,y,x:..] [--conf mean]  fit fields averaged (phase: confidence-weighted complex mean; --tile: overlapping predicts, centre-weighted)\n"
         "  ufsm wind-score <sweep-dir> <codes-root> <codes-key>             the fit --codes score of a predict --cond-sweep winding raster\n"
         "  ufsm store-bench <root> <array-key> [--box 128,256,512] [--n 8] [--par 1] [--threads 16]   HTTP zarr fetch benchmark\n"
@@ -647,6 +651,101 @@ static int cmd_phase_raster(int argc, char **argv) {
     }
     z3_close(z);
     return 0;
+}
+
+/* ufsm codes-pool2 <codes-root> <key> <out-dir> [--threads 8] [--resume 1]: the 2x pooling phase-raster --gs 4 applies to 4.8 um codes
+   (praster_read: per 2^3 block empty when all are, 255 when any is a conflict or two lie more than a quarter turn apart, else the
+   circular mean), written as <out-dir>/9.6 (the grid named as for a 2.4 um scan, like phase-raster's). A source's on-the-fly phase
+   (band_onfly.h) over these codes is byte-identical to the --gs 4 stored phase computed from the 4.8 um codes (Paris 4 p4full). */
+typedef struct { praster_job *J; int64_t o[3], n[3]; uint8_t *out; int nt, k; atomic_int fail; } cpool_part;
+static void *cpool_run(void *a) {
+    cpool_part *P = a; const int64_t z0 = P->n[0] * P->k / P->nt, z1 = P->n[0] * (P->k + 1) / P->nt;
+    if (z1 <= z0) return nullptr;
+    const int64_t o[3] = {P->o[0] + z0, P->o[1], P->o[2]}, n[3] = {z1 - z0, P->n[1], P->n[2]};
+    if (praster_read(P->J, o, n, P->out + (size_t)z0 * P->n[1] * P->n[2])) atomic_store(&P->fail, 1);
+    return nullptr;
+}
+static int cmd_codes_pool2(int argc, char **argv) {
+    if (argc < 5) { fprintf(stderr, "usage: ufsm codes-pool2 <codes-root> <key> <out-dir> [--threads 8] [--resume 1]\n"); return 2; }
+    z3 *z = z3_open(store_open(argv[2]), argv[3], nullptr); if (!z) { fprintf(stderr, "%s\n", z3_error()); return 1; }
+    const int nt = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 8), resume = atoi(opt(argc, argv, "--resume", "1"));
+    const z3_meta *m = z3_meta_of(z); const int64_t fshape[3] = {m->shape[0], m->shape[1], m->shape[2]};
+    const int64_t shape[3] = {(fshape[0] + 1) / 2, (fshape[1] + 1) / 2, (fshape[2] + 1) / 2};
+    const double um = 9.6; char lv[32]; z3w_level_name(um, lv, sizeof lv); char dir[1400]; snprintf(dir, sizeof dir, "%s/%s", argv[4], lv);
+    char attrs[900]; snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"content\":\"winding_mod14 codes pooled 2x (ufsm codes-pool2: phase-raster --gs 4's praster_read)\",\"codes\":\"%s/%s\"}}", argv[2], argv[3]);
+    z3w *w = z3w_create(dir, shape, 512, 0, 0, attrs); if (!w) { fprintf(stderr, "%s\n", z3w_error()); return 1; }
+    if (z3w_write_group(argv[4], &um, 1, "ufsm-codes", attrs)) { fprintf(stderr, "%s\n", z3w_error()); return 1; }
+    praster_job J = {.codes = z, .shape = shape, .pf = 2, .fshape = fshape};
+    uint8_t *buf = malloc((size_t)512 * 512 * 512); if (!buf) return 1;
+    size_t done = 0, empty = 0, skip = 0; const double t0 = now();
+    for (int64_t sz = 0; sz * 512 < shape[0]; sz++) for (int64_t sy = 0; sy * 512 < shape[1]; sy++) for (int64_t sx = 0; sx * 512 < shape[2]; sx++) {
+        if (resume) { char sp[1600]; snprintf(sp, sizeof sp, "%s/c/%lld/%lld/%lld", dir, (long long)sz, (long long)sy, (long long)sx); if (access(sp, F_OK) == 0) { skip++; continue; } }
+        const int64_t fo[3] = {sz * 1024, sy * 1024, sx * 1024}, fn[3] = {1024, 1024, 1024};
+        const int any = z3_box_any(z, fo, fn); if (any < 0) { fprintf(stderr, "%s\n", z3_error()); return 1; }
+        if (!any) { empty++; continue; }
+        cpool_part P = {.J = &J, .o = {sz * 512, sy * 512, sx * 512}, .n = {512, 512, 512}, .out = buf, .nt = nt};
+        int64_t e[3]; for (int d = 0; d < 3; d++) { e[d] = P.o[d] + 512 < shape[d] ? 512 : shape[d] - P.o[d]; }
+        memset(buf, 0, (size_t)512 * 512 * 512);
+        P.n[0] = e[0]; P.n[1] = e[1]; P.n[2] = e[2];
+        uint8_t *tmp = malloc((size_t)e[0] * e[1] * e[2]); if (!tmp) return 1; P.out = tmp;
+        pthread_t th[64]; cpool_part parts[64]; const int T = nt < 1 ? 1 : nt > 64 ? 64 : nt;
+        for (int k = 0; k < T; k++) { parts[k] = P; parts[k].k = k; parts[k].nt = T; pthread_create(&th[k], nullptr, cpool_run, &parts[k]); }
+        int fail = 0; for (int k = 0; k < T; k++) { pthread_join(th[k], nullptr); fail |= atomic_load(&parts[k].fail); }
+        if (fail) { fprintf(stderr, "codes-pool2: read failed: %s\n", z3_error()); return 1; }
+        for (int64_t a = 0; a < e[0]; a++) for (int64_t b = 0; b < e[1]; b++) memcpy(buf + ((size_t)a * 512 + b) * 512, tmp + ((size_t)a * e[1] + b) * e[2], (size_t)e[2]);
+        free(tmp);
+        size_t nz = 0; for (size_t k = 0; k < (size_t)512 * 512 * 512; k++) nz += buf[k] != 0;
+        if (nz && z3w_write_shard(w, sz, sy, sx, buf, nt)) { fprintf(stderr, "%s\n", z3w_error()); return 1; }
+        done++; fprintf(stderr, "\rcodes-pool2: %zu shards written, %zu empty, %zu already there, %.0fs   ", done, empty, skip, now() - t0);
+    }
+    free(buf);
+    if (z3w_close(w)) { fprintf(stderr, "%s\n", z3w_error()); return 1; }
+    fprintf(stderr, "\ncodes-pool2: -> %s (%lld x %lld x %lld), %.0fs\n", dir, (long long)shape[0], (long long)shape[1], (long long)shape[2], now() - t0);
+    z3_close(z); return 0;
+}
+
+/* ufsm phase-onfly <codes-root> <key> --rmax R [--ref ROOT KEY] [--windows 8] [--P 896] [--gpu D] [--slots 1] [--budget-mb 1024]
+   [--threads 8]: the on-the-fly pair-rule phase (band_onfly.h) over --windows P^3 boxes centred on chunks the reference stored phase
+   has (evenly over its chunk map; without --ref: the codes'), timed, and compared byte for byte with --ref (phase-raster's output for
+   these codes). Prints per window ms, tiles, differing voxels; exit 1 on any difference. */
+static int cmd_phase_onfly(int argc, char **argv) {
+    if (argc < 4) { fprintf(stderr, "usage: ufsm phase-onfly <codes-root> <key> --rmax R [--ref ROOT KEY] [--windows 8] [--P 896] [--gpu D] [--slots 1] [--budget-mb 1024] [--threads 8]\n"); return 2; }
+    const float rmax = (float)atof(opt(argc, argv, "--rmax", "0")); const int nw = atoi(opt(argc, argv, "--windows", "8")), P = atoi(opt(argc, argv, "--P", "896"));
+    const int gpu = atoi(opt(argc, argv, "--gpu", "-1")), nt = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 8);
+    if (!(rmax > 0) || nw < 1 || P < 8) { fprintf(stderr, "phase-onfly: --rmax > 0, --windows >= 1, --P >= 8\n"); return 2; }
+    if (phase_onfly_config(gpu, atoi(opt(argc, argv, "--slots", "1")), atoi(opt(argc, argv, "--budget-mb", "1024")), 1)) { fprintf(stderr, "phase-onfly: GPU %d unavailable\n", gpu); return 1; }
+    z3 *c = z3_open(store_open(argv[2]), argv[3], nullptr); if (!c) { fprintf(stderr, "%s\n", z3_error()); return 1; }
+    z3 *ph = phase_onfly_open(c, rmax); z3 *ref = nullptr;
+    const int ri = arg_index(argc, argv, "--ref");
+    if (ri > 0) { if (ri + 2 >= argc || !(ref = z3_open(store_open(argv[ri + 1]), argv[ri + 2], nullptr))) { fprintf(stderr, "phase-onfly: --ref ROOT KEY: %s\n", z3_error()); return 1; }
+        if (memcmp(z3_meta_of(ref)->shape, z3_meta_of(ph)->shape, sizeof z3_meta_of(ph)->shape)) { fprintf(stderr, "phase-onfly: --ref shape differs from the codes'\n"); return 1; } }
+    int64_t g[3]; uint8_t *bits = nullptr; const int64_t np = z3_chunk_map(ref ? ref : c, g, &bits);
+    if (np <= 0) { fprintf(stderr, "phase-onfly: no chunks\n"); return 1; }
+    const z3_meta *m = z3_meta_of(ph); const size_t N = (size_t)P * P * P;
+    uint8_t *a = malloc(N), *b = ref ? malloc(N) : nullptr; if (!a || (ref && !b)) return 1;
+    printf("phase-onfly: rmax %g, tile edge %d (budget %s MB), GPU %d, P %d\n", rmax, phase_onfly_tile_edge(rmax), opt(argc, argv, "--budget-mb", "1024"), gpu, P);
+    size_t bad = 0; double tsum = 0; int64_t seen = 0, k = 0, wi = 0; const int64_t stride = np / nw > 0 ? np / nw : 1;
+    for (int64_t q = 0; q < g[0] * g[1] * g[2] && wi < nw; q++) {
+        if (!bits[q]) continue;
+        if (seen++ % stride != stride / 2) continue;
+        const int64_t cz = q / (g[1] * g[2]), cy = (q / g[2]) % g[1], cx = q % g[2];
+        const int64_t o[3] = {cz * m->chunk[0] + m->chunk[0] / 2 - P / 2, cy * m->chunk[1] + m->chunk[1] / 2 - P / 2, cx * m->chunk[2] + m->chunk[2] / 2 - P / 2}, n[3] = {P, P, P};
+        phase_onfly_stats s0; phase_onfly_get_stats(&s0);
+        const double t0 = now();
+        if (z3_read(ph, o, n, a, nt)) { fprintf(stderr, "phase-onfly: read failed: %s\n", z3_error()); return 1; }
+        const double dt = now() - t0; tsum += dt;
+        phase_onfly_stats s1; phase_onfly_get_stats(&s1);
+        size_t d = 0, kn = 0; for (size_t i = 0; i < N; i++) kn += a[i] < PHASE_PERIOD;
+        if (ref) { if (z3_read(ref, o, n, b, nt)) { fprintf(stderr, "phase-onfly: ref read failed: %s\n", z3_error()); return 1; } for (size_t i = 0; i < N; i++) d += a[i] != b[i]; }
+        bad += d;
+        printf("window %lld at %lld,%lld,%lld: %.0f ms (pair %.0f, codes read %.0f), tiles %llu (+%llu empty), %.2f known, %s%zu differing\n", (long long)wi, (long long)o[0], (long long)o[1], (long long)o[2],
+               1e3 * dt, 1e3 * (s1.s_pair - s0.s_pair), 1e3 * (s1.s_read - s0.s_read), (unsigned long long)(s1.tiles - s0.tiles), (unsigned long long)(s1.skipped - s0.skipped), (double)kn / N, ref ? "" : "(no ref) ", d);
+        fflush(stdout); wi++; k++;
+    }
+    phase_onfly_stats st; phase_onfly_get_stats(&st);
+    printf("phase-onfly: %lld windows, %.0f ms per window, tile voxels / output %.2f, %llu of %llu tiles decoded on the GPU, %zu differing voxels%s\n", (long long)wi, 1e3 * tsum / (wi ? wi : 1), (double)st.vox_tile / (st.vox_out ? st.vox_out : 1), (unsigned long long)st.gpu_tiles, (unsigned long long)st.tiles, bad, ref ? (bad ? ": FAIL" : ": byte-identical") : "");
+    free(a); free(b); free(bits); z3_close(ph); z3_close(ref);
+    return bad ? 1 : 0;
 }
 
 /* ufsm phase-check <phase-root> <key> --axis A --scan-um U [--phase-um K] [--boxes 48] [--min 0.9] [--count 1] [--threads 8] [--sign 1]
@@ -4531,6 +4630,7 @@ int cmd_wrap_dump(int argc, char **argv);      /* src/wrapdump.c */
 int cmd_fiber_judge(int argc, char **argv);    /* src/fiberjudge.c */
 int cmd_fiber_trace(int argc, char **argv);    /* src/fibertrace.c */
 int cmd_fiber_raster(int argc, char **argv);   /* src/fiberraster.c */
+int cmd_fiber_onfly(int argc, char **argv);
 int cmd_fiber_link(int argc, char **argv);     /* src/fiberlink.c */
 int cmd_count_field(int argc, char **argv);   /* src/countfield.c */
 int cmd_hires_phase(int argc, char **argv);   /* src/hiresphase.c */
@@ -4602,6 +4702,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "fiber-judge")) return cmd_fiber_judge(argc, argv);
     if (!strcmp(cmd, "fiber-trace")) return cmd_fiber_trace(argc, argv);
     if (!strcmp(cmd, "fiber-raster")) return cmd_fiber_raster(argc, argv);
+    if (!strcmp(cmd, "fiber-onfly")) return cmd_fiber_onfly(argc, argv);
     if (!strcmp(cmd, "count-field")) return cmd_count_field(argc, argv);
     if (!strcmp(cmd, "hires-phase")) return cmd_hires_phase(argc, argv);
     if (!strcmp(cmd, "phase-gate")) return cmd_phase_gate(argc, argv);
@@ -4684,6 +4785,8 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "wind-assign")) return cmd_wind_assign(argc, argv);
     if (!strcmp(cmd, "wind-seed")) return cmd_wind_seed(argc, argv);
     if (!strcmp(cmd, "phase-check")) return cmd_phase_check(argc, argv);
+    if (!strcmp(cmd, "phase-onfly")) return cmd_phase_onfly(argc, argv);
+    if (!strcmp(cmd, "codes-pool2")) return cmd_codes_pool2(argc, argv);
     if (!strcmp(cmd, "phase-fuse") || !strcmp(cmd, "recto-fuse")) return cmd_fuse(argc, argv);
     if (!strcmp(cmd, "ct-hist")) return cmd_ct_hist(argc, argv);
     if (!strcmp(cmd, "restore-eval")) return cmd_restore_eval(argc, argv);

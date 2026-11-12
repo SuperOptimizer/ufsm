@@ -29,6 +29,8 @@ test_gyrec                                     | gpu2         |     1 | ./$B/tes
 test_unwrap2_sampler                           | gpu          |     9 | ./$B/test_unwrap2_sampler $TMPDIR/unwrap2_fixture
 test_rungs                                     | gpu          |     3 | ./$B/test_rungs $TMPDIR/rungs_fixture
 test_gram                                      | gpu          |     2 | ./$B/test_gram
+test_fibhead                                   | gpu          |     2 | ./$B/test_fibhead
+test_fibhead_train                             | gpu          |    25 | tests/test_fibhead_train.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/fibhead
 test_fstem                                     | gpu          |     3 | ./$B/test_fstem
 test_restore_task                              | gpu          |     7 | ./$B/test_restore_task
 test_phase_interp                              |              |    20 | ./$B/test_phase_interp
@@ -98,7 +100,7 @@ test_afv                                       |              |     1 | ./$B/tes
 test_fiberjudge                                |              |     2 | ./$B/test_fiberjudge
 test_fibertrace                                |              |     1 | ./$B/test_fibertrace
 test_fibertrace_dyad                           |              |     1 | ./$B/test_fibertrace_dyad
-test_fiberraster                               |              |     2 | ./$B/test_fiberraster
+test_fiberraster                               | gpu          |     2 | ./$B/test_fiberraster
 test_fiber_link                                |              |     1 | ./$B/test_fiber_link
 test_ftrace_gpu                                | gpu          |     2 | ./$B/test_ftrace_gpu
 test_flatten                                   |              |    11 | ./$B/test_flatten
@@ -233,3 +235,6 @@ test_gpudec                                    | gpu          |    10 | ./$B/tes
 test_lat                                       | gpu          |     1 | ./$B/test_lat
 test_latents                                   | gpu          |    25 | bash tests/test_latents.sh ./$B/ufsm ./$B/make_wind_fixture
 test_lat_fuse                                  | gpu          |     2 | ./$B/test_lat_fuse
+test_phase_onfly                               | gpu          |    20 | tests/test_phase_onfly.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/onfly
+test_fibre_onfly                               | gpu          |    25 | tests/test_fibre_onfly.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/fibonfly
+test_lldec                                     | gpu          |     3 | ./$B/test_lldec $TMPDIR/lldec
