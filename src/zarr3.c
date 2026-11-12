@@ -16,6 +16,7 @@
 #define VOLCOMP_IMPLEMENTATION
 #include "volcomp.h"
 #include "volcomp_fast.h"
+#include "latvol.h"
 #include "zshm.h"
 #include "gpudec.h"
 #define XXH_INLINE_ALL
@@ -51,6 +52,7 @@ struct z3 {
     /* z3_open_derived: values computed from base by derive (z3_read), the chunk map / box tests / shard presence from base */
     z3 *base; z3_derive_fn derive; void *dctx; void (*dfree)(void *);
     z3 *cover[4]; int ncover; int bborrow;   /* z3_derived_borrow: z3_close leaves base open */
+    lv_codec *lv;   /* a latvol array's codec (latvol.bin beside zarr.json) */
     int (*xmap)(void *ctx, const int64_t grid[3], const int chunk[3], uint8_t *bits); void *xctx; uint8_t *xbits; int64_t xgrid[3]; int xstate;   /* z3_derived_extent */   /* z3_derived_cover: more arrays whose chunks the derived values reach (owned) */
 };
 
@@ -62,12 +64,14 @@ static int parse_codecs(const json *codecs, z3_meta *m) {
         const json *c = json_at(codecs, i);
         const char *name = json_str(json_get(c, "name"), "");
         if (!strcmp(name, "volcomp")) m->q = (float)json_num(json_path(c, "configuration.q"), 8.0);
+        else if (!strcmp(name, "latvol")) m->latvol = 1;
         else if (!strcmp(name, "zstd")) m->zstd = 1;
         else if (!strcmp(name, "bytes")) m->raw = 1;
         else if (!strcmp(name, "transpose")) return FAIL("unsupported codec %s", name);
         else return FAIL("unsupported codec %s", name);
     }
     if (m->q >= 0) m->raw = 0;
+    if (m->latvol && (m->q >= 0 || m->zstd || m->raw)) return FAIL("latvol is the only inner codec of its chain");
     return 0;
 }
 
@@ -140,6 +144,13 @@ static z3 *z3_open_impl(store *s, const char *key, const char *cache_dir, int ty
     } else if (parse_codecs(codecs, m)) goto bad;
     if (m->q >= 0 && (m->chunk[0] != 128 || m->chunk[1] != 128 || m->chunk[2] != 128)) {
         FAIL("%s: volcomp needs 128^3 inner chunks", key); goto bad;
+    }
+    if (m->latvol) {   /* the codec's side file: the transform, the step, the entropy tables */
+        if (m->chunk[0] != 128 || m->chunk[1] != 128 || m->chunk[2] != 128 || m->esize != 1) { FAIL("%s: latvol needs uint8 128^3 inner chunks", key); goto bad; }
+        char sk[1100]; snprintf(sk, sizeof sk, "%s/latvol.bin", key); size_t sn = 0; uint8_t *sb = store_read_all(s, sk, &sn);
+        z->lv = sb ? calloc(1, sizeof *z->lv) : nullptr;
+        if (!z->lv || lv_codec_parse(z->lv, sb, sn)) { free(sb); FAIL("%s: cannot read the latvol codec %s", key, sk); goto bad; }
+        free(sb);
     }
     for (int i = 0; i < 3; i++) {
         if (m->chunk[i] <= 0 || m->shard[i] % m->chunk[i]) { FAIL("%s: shard not a multiple of chunk", key); goto bad; }
@@ -218,6 +229,7 @@ void z3_close(z3 *z) {
     if (z->derive) { if (z->dfree) z->dfree(z->dctx); if (!z->bborrow) z3_close(z->base); for (int k = 0; k < z->ncover; k++) z3_close(z->cover[k]); free(z->xbits); free(z->key); pthread_mutex_destroy(&z->imu); free(z); return; }
     free(z->key);
     free(z->cache);
+    if (z->lv) { lv_codec_free(z->lv); free(z->lv); }
     for (size_t i = 0; i < z->icap; i++) { free(z->itab[i].key); free(z->itab[i].idx); }
     free(z->itab);
     pthread_mutex_destroy(&z->imu);
@@ -225,6 +237,7 @@ void z3_close(z3 *z) {
 }
 
 const z3_meta *z3_meta_of(const z3 *z) { return &z->m; }
+const void *z3_latvol(const z3 *z) { return z && !z->derive ? z->lv : nullptr; }
 const char *z3_key(const z3 *z) { return z->key; }
 
 int z3_group_levels(store *s, const char *group_key, z3_level *out, int max) {
@@ -580,6 +593,10 @@ static int decode_into(const z3 *z, const uint8_t *enc, size_t n, uint8_t *dec, 
         enc = scratch;
         n = r;
     }
+    if (m->latvol) {   /* latent cells: the rebuilt CT bytes (latvol.h; the cells themselves: z3_chunk_raw + the device decoder) */
+        if (lv_decode_voxels(z->lv, enc, n, dec, nullptr)) return FAIL("latvol: corrupt chunk in %s", z->key);
+        return 0;
+    }
     if (m->q >= 0 && m->esize > 1) {   /* typed chunk (volcomp modes 7 / 8) */
         volcomp_status st = volcomp_decode_typed(enc, n, dec, cv * m->esize, (volcomp_dtype)m->dtype);
         if (st != VOLCOMP_OK) return FAIL("volcomp typed: %s", volcomp_status_string(st));
@@ -690,7 +707,13 @@ int z3_chunk_raw(z3 *z, int64_t cz, int64_t cy, int64_t cx, uint8_t **buf, size_
         ientry e = idx[ci]; free(idx);
         if ((e.off == UINT64_MAX && e.len == UINT64_MAX) || !e.len) return 0;
         len = (size_t)e.len;
-        if (!(b = malloc(len)) || store_read(z->s, skey, (int64_t)e.off, (int64_t)len, b) != (int64_t)len) { free(b); return FAIL("read chunk %d of %s", ci, skey); }
+        char item[16]; snprintf(item, sizeof item, "%d", ci); size_t cl = 0;
+        if ((b = cache_get(z, skey, item, &cl)) && cl == len) atomic_fetch_add(&g_z3_cache_hits, 1);   /* (the cache: z3_read's and the prefetcher's files) */
+        else {
+            free(b);
+            if (!(b = malloc(len)) || store_read(z->s, skey, (int64_t)e.off, (int64_t)len, b) != (int64_t)len) { free(b); return FAIL("read chunk %d of %s", ci, skey); }
+            atomic_fetch_add(&g_z3_store_reads, 1); cache_put(z, skey, item, b, len);
+        }
     }
     if (z->m.zstd) {
         const size_t cap = VOLCOMP_TYPED_ENCODE_BOUND; uint8_t *d = malloc(cap);

@@ -100,15 +100,18 @@ int main(void) {
         for (int i = 0; i < NC; i++) {
             const int z = i / 1024, y = i / 32 % 32, x = i % 32; float v[64]; int any = 0;
             for (int k = 0; k < 64; k++) { v[k] = ct[((size_t)(4 * z + (k >> 4)) * 128 + 4 * y + (k >> 2 & 3)) * 128 + 4 * x + (k & 3)]; any |= v[k] != 0; }
+            int wq[LV_MAXC], wt[LV_MAXC], nz = 0;
             for (int c = 0; c < C; c++) {
                 double s = 0; for (int k = 0; k < 64; k++) s += (double)bas[c * 64 + k] * v[k];
-                const double f = s / lc.step_raw; int want = any ? (int)lrint(f) : 0; if (c && want > 127) want = 127; if (c && want < -127) want = -127; if (!c && any && want < 1) want = 1;
-                if (want != q[(size_t)i * C + c]) { if (fabs(fabs(f - floor(f)) - 0.5) < 0.03) tie++; else diff++; }
+                const double f = s / lc.step_raw; int want = any ? (int)lrint(f) : 0; if (c && want > 127) want = 127; if (c && want < -127) want = -127;
+                wq[c] = want; wt[c] = fabs(fabs(f - floor(f)) - 0.5) < 0.03; nz |= c && q[(size_t)i * C + c];
             }
+            if (any && !wq[0] && nz) wq[0] = 1;   /* (the mean of a cell with axes: never the air mark) */
+            for (int c = 0; c < C; c++) if (wq[c] != q[(size_t)i * C + c]) { if (wt[c] || (!c && wt[0])) tie++; else diff++; }
         }
         lv_inverse(&lc, q, ct2);
         long air_bad = 0; for (size_t i = 0; i < 128 * 128 * 128; i++) { const int cz = (int)(i / 16384) / 4, cy = (int)(i / 128 % 128) / 4, cx = (int)(i % 128) / 4; const int mat = q[(size_t)((cz * 32 + cy) * 32 + cx) * C] != 0;
-            if (mat) { const double e = (double)ct2[i] - ct[i]; se += e * e; sn++; } else if (ct2[i] || ct[i]) air_bad++; }
+            if (mat) { const double e = (double)ct2[i] - ct[i]; se += e * e; sn++; } else if (ct2[i] || ct[i] > lc.step_raw) air_bad++; }
         const double rms = sqrt(se / sn), bound = C == 64 ? lc.step_raw / sqrt(12.0) + 0.6 : 40.0;
         lv_forward(&lc, ct2, q2);
         long refix = 0, clampv = 0; for (size_t i = 0; i < 128 * 128 * 128; i++) clampv += ct2[i] == 255 || ct2[i] == 1;

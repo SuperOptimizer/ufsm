@@ -4,7 +4,7 @@
    the first C rows of the orthonormal cell basis (latfit.h: row 0 the mean direction, then the principal axes; the basis and step of the
    checkpoint's lat_basis / lat_step x sd_ref), entropy-coded. Two readers:
      cells:  the indices themselves, int8 [d][h][w](C + 1) (bytes 0-1 the mean index, low byte uint8 / high byte int8; 2.. the axes; all
-             zero: an air cell), which is what the trunk's input kernel takes (nn_lat_pred_input_q): entropy decode, nothing else;
+             zero: an air cell: no CT, or nothing above the quantiser), which is what the trunk's input kernel takes (nn_lat_pred_input_q): entropy decode, nothing else;
      voxels: the inverse transform, 1..255 in material cells and 0 in air cells (z3_read of such an array: every other reader).
    Both are integer-exact: the basis rows are int16 (x 2^14), the sums int32, one float multiply and a rint each way, so the host code
    here and the device kernels (src/nn_latvol.cu, built without fast math) give the same bytes.
@@ -88,9 +88,12 @@ LV_FN int lv_dec_end(const lv_dec *d) { return d->bad || d->x != 0u || d->used !
 /* the transform, integer-exact. bi: the basis rows x 2^14 as int16 [C][64] (sub-voxel k = (z 4 + y) 4 + x). */
 LV_FN int lv_fwd_index(int32_t acc, float fs, int c) {   /* acc = sum_k bi[c][k] v[k]; fs = 1 / (2^14 step_raw) */
     const float f = (float)acc * fs; int q = (int)LV_RINT(f);
-    if (c) { if (q > 127) q = 127; if (q < -127) q = -127; } else { if (q > 32767) q = 32767; if (q < 1) q = 1; }
+    if (c) { if (q > 127) q = 127; if (q < -127) q = -127; } else { if (q > 32767) q = 32767; if (q < 0) q = 0; }
     return q;
 }
+/* a cell's indices after lv_fwd_index of every channel: a mean index of 0 is the air cell's mark, so a cell whose mean rounds to 0 keeps
+   its axes with the mean 1 (nz: any axis index nonzero), and a cell whose indices are all 0 is air (its few grey levels are below the step) */
+LV_FN int lv_fwd_mean(int q0, int nz) { return q0 ? q0 : nz ? 1 : 0; }
 LV_FN uint8_t lv_inv_byte(int32_t acc, float rs) {   /* acc = sum_c q_c bi[c][k]; rs = step_raw / 2^14: a material cell's byte */
     const float f = (float)acc * rs; int v = (int)LV_RINT(f);
     return (uint8_t)(v < 1 ? 1 : v > 255 ? 255 : v);
@@ -101,6 +104,7 @@ LV_FN uint8_t lv_inv_byte(int32_t acc, float rs) {   /* acc = sum_c q_c bi[c][k]
 typedef struct {
     int C, ntab;                       /* channels kept (1..64), tables */
     float step_raw, sd_ref, step;      /* the quantiser step in grey levels = step x sd_ref */
+    float drop_ms;                     /* the dropped axes' energy per material voxel (grey levels^2): a window's variance from the rebuilt CT is low by it */
     float basis[LV_MAXC][64];          /* the transform's float rows (what a checkpoint's lat_basis is compared with) */
     int16_t bi[LV_MAXC][64];           /* rint(basis x 2^14) */
     uint8_t map[LV_MAXC];              /* channel -> table */

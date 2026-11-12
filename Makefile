@@ -87,7 +87,7 @@ SRC += src/flatten.c src/faces.c src/faces_cli.c
 SRC += src/sheetcut.c
 SRC += src/strip.c
 SRC += src/latfit.c src/lc_cli.c
-SRC += src/latvol.c
+SRC += src/latvol.c src/latvol_cli.c src/latvol_read.c
 OBJ  = $(patsubst src/%.c,$(B)/%.o,$(SRC)) $(B)/surfcomp.o
 
 all: $(B)/ufsm

@@ -117,7 +117,9 @@ __global__ void k_fwd(const uint8_t *ct, int C, const int16_t *bi, float fs, int
     for (int k = 0; k < 64; k++) { v[k] = ct[((size_t)(4 * z + (k >> 4)) * H + 4 * y + (k >> 2 & 3)) * W + 4 * x + (k & 3)]; any |= v[k]; }
     int16_t *o = q + i * C;
     if (!any) { for (int c = 0; c < C; c++) o[c] = 0; return; }
-    for (int c = 0; c < C; c++) { int32_t acc = 0; for (int k = 0; k < 64; k++) acc += (int32_t)bi[c * 64 + k] * v[k]; o[c] = (int16_t)lv_fwd_index(acc, fs, c); }
+    int nz = 0;
+    for (int c = 0; c < C; c++) { int32_t acc = 0; for (int k = 0; k < 64; k++) acc += (int32_t)bi[c * 64 + k] * v[k]; o[c] = (int16_t)lv_fwd_index(acc, fs, c); nz |= c && o[c]; }
+    o[0] = (int16_t)lv_fwd_mean(o[0], nz);
 }
 extern "C" void nn_latvol_forward(nn_lv *L, const uint8_t *ct_d, int d, int h, int w, int16_t *q_d) {
     const size_t cv = (size_t)d * h * w;

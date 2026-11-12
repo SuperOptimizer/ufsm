@@ -238,6 +238,8 @@ test_gpudec                                    | gpu          |    10 | ./$B/tes
 test_vcgpu                                     | gpu          |     5 | ./$B/test_vcgpu
 test_lat                                       | gpu          |     1 | ./$B/test_lat
 test_latents                                   | gpu          |    25 | bash tests/test_latents.sh ./$B/ufsm ./$B/make_wind_fixture
+test_latvol                                    | gpu          |     6 | ./$B/test_latvol
+test_latvol_sh                                 | gpu          |    60 | bash tests/test_latvol.sh ./$B/ufsm ./$B/make_wind_fixture
 test_lat_fuse                                  | gpu          |     2 | ./$B/test_lat_fuse
 test_phase_onfly                               | gpu          |    20 | tests/test_phase_onfly.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/onfly
 test_fibre_onfly                               | gpu          |    25 | tests/test_fibre_onfly.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/fibonfly

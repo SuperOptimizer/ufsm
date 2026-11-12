@@ -65,21 +65,21 @@ int lv_codec_init(lv_codec *lc, int C, const float *basis, float step, float sd_
 }
 void lv_codec_free(lv_codec *lc) { free(lc->dt); free(lc->est); free(lc->edn); free(lc->edf); lc->dt = nullptr; lc->est = nullptr; lc->edn = nullptr; lc->edf = nullptr; }
 
-/* latvol.bin: u32 "LVT1", u32 C, u32 ntab, f32 step_raw, f32 sd_ref, f32 step, f32 basis[C][64], u8 map[64], u16 freq[ntab][LV_NSYM] */
+/* latvol.bin: u32 "LVT1", u32 C, u32 ntab, f32 step_raw, f32 sd_ref, f32 step, f32 drop_ms, f32 basis[C][64], u8 map[64], u16 freq[ntab][LV_NSYM] */
 int lv_codec_write(const lv_codec *lc, const char *path) {
     FILE *f = fopen(path, "wb"); if (!f) return -1;
-    const uint32_t hd[3] = {0x3154564cu, (uint32_t)lc->C, (uint32_t)lc->ntab}; const float fl[3] = {lc->step_raw, lc->sd_ref, lc->step};
+    const uint32_t hd[3] = {0x3154564cu, (uint32_t)lc->C, (uint32_t)lc->ntab}; const float fl[4] = {lc->step_raw, lc->sd_ref, lc->step, lc->drop_ms};
     int ok = fwrite(hd, sizeof hd, 1, f) == 1 && fwrite(fl, sizeof fl, 1, f) == 1 && fwrite(lc->basis, 64 * sizeof(float), (size_t)lc->C, f) == (size_t)lc->C
           && fwrite(lc->map, 1, LV_MAXC, f) == LV_MAXC && fwrite(lc->freq, sizeof lc->freq[0], (size_t)lc->ntab, f) == (size_t)lc->ntab;
     return fclose(f) || !ok ? -1 : 0;
 }
 int lv_codec_parse(lv_codec *lc, const uint8_t *b, size_t n) {
     memset(lc, 0, sizeof *lc);
-    uint32_t hd[3]; float fl[3];
+    uint32_t hd[3]; float fl[4];
     if (n < sizeof hd + sizeof fl) return -1;
     memcpy(hd, b, sizeof hd); memcpy(fl, b + sizeof hd, sizeof fl);
     if (hd[0] != 0x3154564cu || hd[1] < 1 || hd[1] > LV_MAXC || hd[2] < 1 || hd[2] > LV_MAXC) return -1;
-    lc->C = (int)hd[1]; lc->ntab = (int)hd[2]; lc->step_raw = fl[0]; lc->sd_ref = fl[1]; lc->step = fl[2];
+    lc->C = (int)hd[1]; lc->ntab = (int)hd[2]; lc->step_raw = fl[0]; lc->sd_ref = fl[1]; lc->step = fl[2]; lc->drop_ms = fl[3];
     const size_t need = sizeof hd + sizeof fl + (size_t)lc->C * 64 * sizeof(float) + LV_MAXC + (size_t)lc->ntab * sizeof lc->freq[0];
     if (n < need || !(lc->step_raw > 0)) return -1;
     const uint8_t *p = b + sizeof hd + sizeof fl;
@@ -99,7 +99,9 @@ int lv_forward(const lv_codec *lc, const uint8_t *ct, int16_t *q) {
         int16_t *o = q + ((size_t)(z * LV_CELLS + y) * LV_CELLS + x) * C;
         if (!any) { memset(o, 0, (size_t)C * sizeof *o); continue; }
         nmat++;
-        for (int c = 0; c < C; c++) { int32_t acc = 0; const int16_t *b = lc->bi[c]; for (int k = 0; k < 64; k++) acc += (int32_t)b[k] * v[k]; o[c] = (int16_t)lv_fwd_index(acc, fs, c); }
+        int nz = 0;
+        for (int c = 0; c < C; c++) { int32_t acc = 0; const int16_t *b = lc->bi[c]; for (int k = 0; k < 64; k++) acc += (int32_t)b[k] * v[k]; o[c] = (int16_t)lv_fwd_index(acc, fs, c); nz |= c && o[c]; }
+        o[0] = (int16_t)lv_fwd_mean(o[0], nz); nmat -= !o[0];
     }
     return nmat;
 }
