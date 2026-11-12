@@ -85,7 +85,7 @@ done
 # (1d) the CT windows decoded on the GPU into device memory (UFSM_PRED_DEVREAD): the same stores as the host reader's (windows over the
 #      array's edges: fill), and the chunks went through the GPU
 UFSM_PRED_DEVREAD=1 UFSM_PRED_PROF=1 "$U" predict s/last.ckpt fx ct dv "${P[@]}" --heads rv,ink > dv.log 2>&1 || fail "predict UFSM_PRED_DEVREAD ($D/dv.log)"
-if grep -q 'gpudec: out of memory' dv.log; then echo "  SKIP the device-read check: the GPU decoder had no memory (a shared GPU), the host path ran"
+if grep -q 'gpudec: out of memory' dv.log; then echo "SKIP devread: no device memory (gpudec out of memory on a shared GPU: the host path ran, the device-read check did not; the suite reports the test SKIP)"
 else grep -q 'CT windows decoded into device memory' dv.log && grep -Eq 'device CT windows: [1-9][0-9]* chunks all on the GPU' dv.log || fail "device read not used ($D/dv.log)"; fi
 for n in rv ink; do cmpb h/$n dv/$n 0 || fail "$n: the device-read run differs from the host reader's"; done
 UFSM_GPU_DECODE_ITEMS=4 UFSM_PRED_DEVREAD=1 UFSM_PRED_PROF=1 "$U" predict s/last.ckpt fx ct dvh "${P[@]}" --heads rv > dvh.log 2>&1 || fail "predict UFSM_PRED_DEVREAD, CPU fallbacks ($D/dvh.log)"
