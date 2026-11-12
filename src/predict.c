@@ -2295,10 +2295,20 @@ int cmd_predict(int argc, char **argv) {
             }
             if (ffzm && !(fea && t->noout)) {   /* (--feather: windows computed only for their spills write no fields) */ /* the window interior's whole cells, finalized into the field slab (flushed when the slab is left) */
                 int c0[3], c1[3], nc3[3], ok = 1; const int64_t tw[3] = {tz, ty, tx};
+                /* per-shard windows are anchored on the global grid while the shards (and with them the field slabs and rows) start at the
+                   box: with a box off the window grid (--grid-origin, (box - origin) % stride != 0) a window's interior covers two shards
+                   and the window is run once for each. Its cells are clipped to the tile's shard like its outputs, so each visit writes
+                   its shard's cells only: unclipped, the cells of a window across a slab boundary were written past the slab (segfault in
+                   ffw_main: wbench DLV -1, a 1024^3 box at z 768 with 640 / 64 windows and --fit-h 4, 2026-11-11). On the grid: no change. */
+                const int64_t sh3[3] = {t->shard / (ns[1] * ns[2]), t->shard / ns[2] % ns[1], t->shard % ns[2]};
                 for (int d = 0; d < 3; d++) {
                     int64_t lo = tw[d] + hal[d], hi = tw[d] + wn[d] - hal[d]; if (lo < 0) lo = 0; if (hi > bn[d]) hi = bn[d];
+                    if (!sup) { const int64_t s0 = sh3[d] * shard, s1 = s0 + shard; if (lo < s0) lo = s0; if (hi > s1) hi = s1; }
                     c0[d] = (int)((lo + ffh - 1) / ffh); c1[d] = (int)(hi / ffh); if (hi == bn[d]) c1[d] = ffF[d];   /* the box's last, possibly partial, cell */
                     nc3[d] = c1[d] - c0[d]; if (nc3[d] <= 0 || nc3[d] > (d ? ffwc : strd[0] / ffh + 1)) ok = 0;
+                }
+                if (ok && (c1[0] - 1) / FZ != c0[0] / FZ) {   /* (never with the clip above; a clean stop instead of a write past the slab) */
+                    fprintf(stderr, "predict: --fit-zarr: a window's cells %d .. %d in z span two field slabs of %d (a box off the window grid?)\n", c0[0], c1[0], FZ); return 1;
                 }
                 if (ok) {
                     const int64_t slab = c0[0] / FZ;
