@@ -27,6 +27,25 @@ dropped 10 of 14 picked windows as "empty targets". Three causes:
   draw index. The open data apparently marks these segments as validation whole. They should stay out of the ink weight; they
   can serve as unseen-scroll ink evals. MAN5's hf labels hold no ink pixel in the supervised area (share 0.000).
 
+**Before / after on the desk (2026-11-12, after the pod went away).** U2's recipe (`--task unwrap2 --rv 2 --ink-head 1 --ink-mil 1`,
+P 1024, B 1, rungs 4.8 / 9.6, `--strict-sources 1`), sampler only, 1 worker / 1 slot, 40 batches, the 6 desk ink sources
+(/vesuvius/ufsm/univ/u2ink/sources-u2desk-ink.json: local CT levels 1-5, onfly level 1 + 2 pooled):
+
+| | master cb8102d | inkcache-20261112 (inkdraw + shared cache) |
+|---|---|---|
+| draws dropped as empty targets | 192 for 40 windows (83 %) | 3 for 40 (7 %) |
+| wall for 40 windows | 4738 s | 1443 s |
+| host RSS (UFSM_HOSTMEM) | 27.27 GB | 19.78 GB (ink caches 3.22 GB targets + 1.07 GB CT, at the 4096 MB budget) |
+
+After the fix, per ink window: known ink target on 0.28-0.51 % of the voxels, ink on 0.07-0.14 %, and 65536 MIL rays (the
+`--ink-mil-max` cap) per window. Paris 4 26 windows, 1667 13, 0139 1.
+
+**One cache budget for every ink source** (branch inkcache-20261112). Each onfly ink source used to open a 2 GB target LRU and a
+1 GB decoded-CT zcache (24 GB for 8 sources). They now share a dcache pool ("ink", z3_open_cached_pool) and one zcache, with one
+budget, `train --ink-cache-mb` (default 4096 or $UFSM_INK_CACHE_MB): 3/4 targets, 1/4 CT. inkfly_free drops its CT's chunks from
+the shared zcache (zcache_drop: a later array at the same address must never see them). test_zcache covers the pool (two arrays,
+8 threads, evicting, one closed, empty after) and zcache_drop.
+
 Footprint of one ink sampler at P 1024 (sampler only, 1 worker, 1 slot, 8 sources): 17.6 GB RSS. The pod arm A unit at 3 workers /
 3 slots peaked at 52 GB and OOM-killed itself and U2's run in the shared 175 GB cgroup (09:58 UTC).
 
