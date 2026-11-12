@@ -30,7 +30,7 @@ for a in "$@"; do
     : > $WB/inkeval/crops/crops.tsv; : > $WB/evc/crops.tsv
     if grep -qP "^$c\t" $A/crops.tsv; then grep -P "^$c\t" $A/crops.tsv > $WB/inkeval/crops/crops.tsv; ln -sfn $A/$c $WB/inkeval/crops/$c
     else grep -P "^$c\t" $B/crops.tsv > $WB/evc/crops.tsv; ln -sfn $B/$c $WB/evc/$c; fi
-    SHN=latstore-ink bash $H/scripts/latvol/pod_shared.sh env SITE=pod K=/workspace/ue WB=$WB E=$E CACHE=$L/cache/ink-$a GPU=0 U=$U CTROOT=$SW/$a TASKS=ink INKP=ink3dext \
+    SHN=latstore-ink SHSTART=10 bash $H/scripts/latvol/pod_shared.sh env SITE=pod K=/workspace/ue WB=$WB E=$E CACHE=$L/cache/ink-$a GPU=0 U=$U CTROOT=$SW/$a TASKS=ink INKP=ink3dext \
       INKW=/workspace/ue/ckpt/ckpt_78k_fullsup.pth INKC=$WB/evc INKGT=/workspace/ue/inkgt/evgt bash $H/scripts/univ/eval.sh /workspace/ue/ckpt/ink3dext.ckpt ink3dext-$a >> $SW/log/ink_$a.log 2>&1
   done
   echo "arm $a done $(date +%T): $(cut -f1,6,8 $E/ink3dext-$a/ink/vscores.tsv 2>/dev/null | tr '\n\t' '  ')"; rm -rf $E/ink3dext-$a/ink/vol_* $E/ink3dext-$a/ink/surf

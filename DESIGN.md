@@ -215,6 +215,7 @@ per m / pair accuracy at 0.3 and 0.6 mm; V tube the same):
 | latent C 29 step 1.0 | 0.079 | 6616 / 4.15 / 51.6 / 0.968 0.950 | 7249 / 4.56 / 176.9 / 0.898 0.871 |
 | latent C 29 step 2.0 | 0.041 | 6552 / 4.11 / 52.4 / 0.969 0.953 | 6957 / 4.38 / 177.3 / 0.906 0.877 |
 | latent C 4 step 2.0 | 0.019 | 8481 / 5.39 / 63.2 / 0.966 0.929 | 8318 / 5.25 / 185.7 / 0.895 0.887 |
+| latent C 1 step 1.0 (the mean) | 0.010 | 8492 fibres / 5.29 m | 10339 fibres / 6.38 m |
 
 The same picture: nothing systematic down to q8 (the spread among the clean arms, 4.0-4.4 m and 40-55 crossings / m on H, is what one
 box gives); from q16 the tracer over-traces (+18% length at q16 / q32), q64 and q128 hallucinate fibres (crossings per metre x1.3 and
@@ -223,8 +224,10 @@ noisier original it traces 8% less H tube with 55 instead of 48 crossings per me
 
 **Ink** (the ink3d-ext teacher at level 0, where the mirror is q8; 4 held-out crops w07_1 / w05_1 / PHerc0139_w044_1 /
 PHerc1667_w029_0, voxelwise AUC; rate over the crop boxes): anchor (0.544 B/vox) 0.710 / 0.694 / 0.708 / 0.527; q8 (0.0147) 0.718 /
-0.689 / 0.708 / 0.528; q32 (0.0047) 0.736 / 0.628 / 0.707 / 0.510. q8 equals the anchor within 0.01; q32 moves single crops by up to
-0.07 either way. The remaining arms (q128, q2, latent) are appended when they finish.
+0.689 / 0.708 / 0.528; q32 (0.0047) 0.736 / 0.628 / 0.707 / 0.510; q128 (0.0015) 0.651 / 0.494 / 0.601 / 0.509. q8 equals the
+anchor within 0.01; q32 moves single crops by up to 0.07 either way; q128 is collapse (two crops at or near chance). Only three crops
+inform: the 1667 crop is near chance on the anchor already. The same knee as winding and fibres. q2 and latent C 29 step 1.0 are still
+to run (the pod's shared windows).
 
 **Whole-level sizes** re-encoded from the q2 mirror (Paris 4 level 2, 1266 Gvox, 46.1 GB at q2): q8 13.8 GB, q32 2.79 GB, q128 0.58 GB,
 latent C 29 step 1.0 25.5 GB (0.080 B per material voxel); PHerc1667 level 2 (4.6 GB at q2): 1.42 / 0.29 / 0.07 / 2.43 GB. 4-6 minutes
