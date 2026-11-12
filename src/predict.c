@@ -21,6 +21,8 @@
 #include "sweep.h"
 #include "z3w.h"
 #include "zarr3.h"
+#include "latvol.h"
+#include "latvol_read.h"
 #include "embz.h"
 #include "latfit.h"
 #include <errno.h>
@@ -53,6 +55,7 @@ typedef struct {
     pthread_mutex_t mu; pthread_cond_t cv;
     double t_read, t_stats, t_wait;   /* UFSM_PRED_PROF: seconds in z3_read, the stats scan, waiting for a free slot */
     int nostats;                      /* the window statistics are computed on the device (default path) */
+    int lv; lv_chunk_ref *lvref[NSLOT]; int lvn[NSLOT], lvmax; size_t lvbytes[NSLOT];   /* a latvol CT array read as cells: each slot holds the window's packed chunk streams (lv_read_box), no decode on the host */
     zr *lz; const long long *lzo; int lzc, lzt;   /* (lzt handles of the store, one decoding thread each) */   /* --latents: the window's stored cells instead of its CT (nz[k]: 0 when every cell is air) */
     uint8_t *dbuf[NSLOT]; void **ctw; int nctw, ngpuw; int64_t csh[3];   /* UFSM_PRED_DEVREAD: device windows, filled by nctw chunk workers (nn_ctw_*); csh the array shape */
     _Atomic long cnext; long nch; int64_t c0[3], cn[3], tz_o[3]; int cslot; atomic_long ndev, nhost, nskip;   /* (the window being read: its chunk grid) */
@@ -98,6 +101,14 @@ static void *reader_main(void *arg) {
                 for (size_t j = nb / 8 * 8; j < nb && !any; j++) any |= r->buf[k][j];
                 r->nz[k] = any != 0; r->t_read += now() - t1;
             }
+        } else if (r->lv) {
+            const char *capv = getenv("UFSM_PRED_LATVOL_CAP");   /* (test: a smaller stream budget, so windows take the voxel fallback) */
+            const int nr = lv_read_box(r->ct, o, n, r->buf[k], capv ? (size_t)atoll(capv) : w3, r->lvref[k], r->lvmax, &r->lvbytes[k], r->nthreads);
+            if (nr == -2) {   /* the streams exceed the slot (more than a byte a voxel, or more chunks than lvmax): this window as rebuilt voxels from the host decoder */
+                if (z3_read(r->ct, o, n, r->buf[k], r->nthreads)) { fprintf(stderr, "\npredict: latvol window read failed (%s)\n", z3_error()); atomic_store(&r->failed, 1); }
+                r->lvn[k] = -1; r->nz[k] = 1; r->t_read += now() - t1;
+            } else if (nr < 0) { fprintf(stderr, "\npredict: latvol window read failed (%s)\n", z3_error()); atomic_store(&r->failed, 1); }
+            else { r->lvn[k] = nr; r->nz[k] = nr != 0; r->t_read += now() - t1; }
         } else if (r->dbuf[0]) {   /* UFSM_PRED_DEVREAD: the window decoded into device slot k */
             if (nn_ctw_zero(r->ctw[0], r->dbuf[k], w3)) atomic_store(&r->failed, 1);
             int empty = 0;
@@ -1233,6 +1244,7 @@ int cmd_predict(int argc, char **argv) {
     const int rvfuse = !strcmp(chs, "rv");
     /* --latents STORE (ufsm lc-encode): a --lat-basis checkpoint's cell channels come from the stored quantised coefficients (the window's
        mean / sd from them too), not from the CT window, which is still read for the air mask and the radial channels */
+    const lv_codec *lvc = nullptr; int lvm = 0, lvq = 0, lv_stride = 0; nn_lv *lvL = nullptr;   /* the CT level is a latvol array: see lvm below */
     const char *lat_store = opt(argc, argv, "--latents", nullptr); zr lzr; const float *lz_bas = nullptr; double lz_sraw = 0, lz_drop = 0; long long lz_org[3] = {0, 0, 0}; int lz_c = 0; void *lz_d = nullptr;
     if (lat_store) {
         char zp[1200]; snprintf(zp, sizeof zp, "%s/zarr.json", lat_store); FILE *zf = fopen(zp, "r"); static char zt[65536]; size_t zn = zf ? fread(zt, 1, sizeof zt - 1, zf) : 0; if (zf) fclose(zf); zt[zn] = 0;
@@ -1512,6 +1524,7 @@ int cmd_predict(int argc, char **argv) {
     char ak[1200];
     snprintf(ak, sizeof ak, "%s/level%d", key, level);
     z3 *ct = pyramid_open_level(s, key, level, um, cache);
+    lvc = ct ? z3_latvol(ct) : nullptr;
     if (!ct) { fprintf(stderr, "cannot open level %d of %s: %s\n", level, key, z3_error()); return 1; }
     const z3_meta *m = z3_meta_of(ct);
     if (cfg.view_P && pred_view_open(&cfg, root, key, level, um, cache, opt(argc, argv, "--view-level", "0"), opt(argc, argv, "--view-map", nullptr), split)) return 1;
@@ -1760,6 +1773,13 @@ int cmd_predict(int argc, char **argv) {
         if (half) { x2 = nn_malloc(shape_numel(xn) * (h16 ? 2 : 4));   /* (lgf, and lrt with the direct latent input: at their first use; the direct latent rv path has none) */
             if (hdiv > 2 && !latin) lrt = nn_malloc(w3 / 8 * 16); }
         if (lat_store && gpath) lz_d = nn_malloc(w3 / 64 * (lz_c + 1));   /* (a voxel checkpoint too: its CT window rebuilt from the cells) */
+        /* a latvol CT array (src/latvol.h): the window's chunk streams go up as stored and the device decodes them into the cells, from
+           which the CT window is rebuilt (every reader of the CT bytes) and, when the checkpoint's transform is the store's, the trunk's
+           input is taken (no CT -> latent conversion, no host decode). Host-side CT readers (--aug-*, --aux, --split z, --tta, the host
+           path) and windows off the 4-voxel cell grid read the rebuilt CT through z3_read instead. UFSM_PRED_LATVOL=0: always z3_read */
+        if (!lat_store && lvc && gpath && !degrade && !auxz && !split && tta <= 1 && W % 4 == 0 && Wz % 4 == 0 && (!getenv("UFSM_PRED_LATVOL") || ufsm_env_on("UFSM_PRED_LATVOL"))) {
+            lvm = 1; lv_stride = lvc->C + 1; lz_d = nn_malloc(w3 / 64 * lv_stride);
+        }
         if (ct_stem) fprintf(stderr, "predict: in-place slab inference from the CT window (%.1f B per window voxel)\n", (double)unet_activation_bytes(u) / w3);
         if (tta > 1 && (!ct_stem || !ct_shared || degrade || auxz || cfg.cin != 4)) { fprintf(stderr, "predict: --tta needs the CT-stem device path (no --aug-*, --aux, extra inputs)\n"); return 2; }
     }
@@ -2081,8 +2101,26 @@ int cmd_predict(int argc, char **argv) {
             if (dm > 1e-5) { fprintf(stderr, "predict: --latents: the store's transform differs from the checkpoint's (max |db| %.3g)\n", dm); return 2; }
         }
     }
+    if (lvm) {
+        for (long i = 0; i < rd.ntiles && lvm; i++) if ((bo[0] + rd.tiles[i].tz) % 4 || (bo[1] + rd.tiles[i].ty) % 4 || (bo[2] + rd.tiles[i].tx) % 4) lvm = 0;
+        if (!lvm) fprintf(stderr, "predict: latvol CT: windows off the 4-voxel cell grid (box origin, halo, stride): the rebuilt CT is decoded on the host instead\n");
+    }
+    if (lvm) {
+        lvL = nn_latvol_create(lvc->dt, lvc->ntab, lvc->map, &lvc->bi[0][0], lvc->C, lvc->step_raw);
+        const float *lb_, *lg_; float ls_; const int lc_ = half == 3 ? unet_lat_basis(u, &lb_, &lg_, &ls_) : 0;
+        if (lc_ && lc_ <= lvc->C) {   /* the trunk's channels straight from the indices when the store's first rows are the checkpoint's transform */
+            float *hb = malloc((size_t)lc_ * 64 * 4); double dm = 0; nn_d2h(hb, lb_, (size_t)lc_ * 64 * 4);
+            for (int c = 0; c < lc_; c++) for (int k2 = 0; k2 < 64; k2++) dm = fmax(dm, fabs((double)hb[c * 64 + k2] - lvc->basis[c][k2]));
+            free(hb); lvq = dm <= 1e-5 && !(getenv("UFSM_PRED_LATVOL") && atoi(getenv("UFSM_PRED_LATVOL")) == 2);   /* (2: the check mode, every input from the device-rebuilt CT = UFSM_PRED_LATVOL=0's bytes) */
+            if (!lvq) fprintf(stderr, "predict: latvol CT: the store's transform differs from the checkpoint's (max |db| %.3g): the trunk's input from the rebuilt CT\n", dm);
+        }
+        rd.lv = 1; rd.lvmax = (int)((Wz / 128 + 2) * (W / 128 + 2) * (W / 128 + 2));
+        for (int k = 0; k < NSLOT; k++) rd.lvref[k] = malloc((size_t)rd.lvmax * sizeof(lv_chunk_ref));
+        fprintf(stderr, "predict: latvol CT (C %d, step %.2f grey levels): cells decoded on the device, %s\n", lvc->C, lvc->step_raw,
+                lvq ? "the trunk's input from the stored indices" : "every input from the rebuilt CT");
+    }
     for (int k = 0; k < NSLOT; k++) rd.buf[k] = gpath ? nn_host_alloc(w3) : malloc(w3);
-    if (devread && gpath && !degrade && !lat_store && !split) {   /* UFSM_PRED_DEVREAD: device windows (else the host path) */
+    if (devread && !lvm && gpath && !degrade && !lat_store && !split) {   /* UFSM_PRED_DEVREAD: device windows (else the host path) */
         const z3_meta *cm = z3_meta_of(ct); int ok = cm->chunk[0] == 128 && cm->chunk[1] == 128 && cm->chunk[2] == 128 && cm->esize == 1 && gpudec_enabled();
         for (int k = 0; k < NSLOT && ok; k++) ok = (rd.dbuf[k] = nn_malloc_try(w3)) != nullptr;
         /* UFSM_PRED_DEVREAD_GPU=G workers feed the GPU decoder (default 16), --threads more decode on the CPU (pod, 19 Gvox: all 40 on the GPU
@@ -2128,12 +2166,12 @@ int cmd_predict(int argc, char **argv) {
     int64_t cur_shard = -1, so[3] = {0, 0, 0}, se[3] = {0, 0, 0}, sz = 0, sy = 0, sx = 0;
     int any = 0;
     const int pprof = ufsm_env_on("UFSM_PRED_PROF");
-    double p_wait = 0, p_h2d = 0, p_gpu = 0, p_copy = 0, p_wr = 0, p_ffw = 0, pt;
+    double p_wait = 0, p_h2d = 0, p_gpu = 0, p_copy = 0, p_wr = 0, p_ffw = 0, pt, lv_up = 0; int lv_fb = 0; long lv_nfb = 0;   /* lv_fb: this window came as voxels (the reader's fallback) */
     /* the next window's CT uploaded on the copy stream during this window's forward (into ctpre, w3 bytes; at the window's start one
        device copy into ctd): the synchronous upload left the GPU idle ~9 ms per 384 x 640^2 window. Not with --aug-* (degrade rewrites
        the host window first); UFSM_PRED_CTPRE=0 off. long pre_i: the window whose CT ctpre holds (or is receiving) */
     uint8_t *ctpre = nullptr; void *ev_pre = nullptr, *ev_preu = nullptr; long pre_i = -1;
-    if (gpath && !degrade && !split && !lat_store && !rd.dbuf[0] && (!getenv("UFSM_PRED_CTPRE") || ufsm_env_on("UFSM_PRED_CTPRE")) && (ctpre = nn_malloc_try(w3))) {
+    if (gpath && !degrade && !split && !lat_store && !lvm && !rd.dbuf[0] && (!getenv("UFSM_PRED_CTPRE") || ufsm_env_on("UFSM_PRED_CTPRE")) && (ctpre = nn_malloc_try(w3))) {
         ev_pre = nn_event_create(); ev_preu = nn_event_create();
     }
     if (split) {   /* both GPUs on every window */
@@ -2203,11 +2241,21 @@ int cmd_predict(int argc, char **argv) {
                     if (rd.nz[k]) { nn_h2d(lz_d, ctu, w3 / 64 * (lz_c + 1)); nn_lat_synth_ct(lz_d, lz_c, lz_bas, (float)lz_sraw, Wz, W, ctd); nn_pred_stats(ctd, w3, stsc, &nz, &sum, &sq);
                                   sq += lz_drop * (double)nz; }   /* (the dropped axes' energy in the material voxels: the CT window's variance) */
                     else nz = 0;
+                } else if (lvm) {   /* the packed streams up (into the CT window's own buffer: dead once decoded), the cells, the CT rebuilt from them */
+                    lv_fb = rd.nz[k] && rd.lvn[k] < 0;
+                    if (lv_fb) { nn_h2d(ctd, ctu, w3); nn_pred_stats(ctd, w3, stsc, &nz, &sum, &sq); sq += (double)lvc->drop_ms * (double)nz; lv_nfb++; }
+                    else if (rd.nz[k]) {
+                        nn_h2d(ctd, ctu, rd.lvbytes[k]);
+                        if (nn_latvol_decode(lvL, ctd, rd.lvref[k], rd.lvn[k], Wz / 4, W / 4, W / 4, lv_stride, lz_d)) { fprintf(stderr, "\npredict: latvol: a corrupt chunk stream in window %lld,%lld,%lld\n", (long long)o[0], (long long)o[1], (long long)o[2]); return 1; }
+                        nn_latvol_synth(lvL, lz_d, lv_stride, Wz / 4, W / 4, W / 4, ctd); nn_pred_stats(ctd, w3, stsc, &nz, &sum, &sq);
+                        sq += (double)lvc->drop_ms * (double)nz; lv_up += (double)rd.lvbytes[k];
+                    } else nz = 0;
                 } else {
                 if (pre_i == i) {   /* prefetched: the copy stream's upload, then one device copy (the prefetch buffer free again after it) */
                     nn_stream_wait(0, ev_pre); nn_d2d_async(ctd, ctpre, w3); nn_event_record(ev_preu, 0);
                 } else if (rd.dbuf[0]) nn_d2d(ctd, rd.dbuf[k], w3); else nn_h2d(ctd, ctu, w3);
                 nn_pred_stats(ctd, w3, stsc, &nz, &sum, &sq);
+                if (lvc) sq += (double)lvc->drop_ms * (double)nz;   /* (a latvol CT decoded by z3_read: the rebuilt bytes' variance lacks the dropped axes, as below) */
                 }
                 pthread_mutex_lock(&rd.mu); atomic_store(&rd.consumed, i + 1); pthread_cond_broadcast(&rd.cv); pthread_mutex_unlock(&rd.mu);
                 p_h2d += now() - pt; nn_ptick("upload + CT stats");
@@ -2279,6 +2327,10 @@ int cmd_predict(int argc, char **argv) {
                 if (!ldir && !fzs && !(lhm && !ffd) && hdiv > 2 && !lrt) lrt = nn_malloc(w3 / 8 * 16);
                 nn_ptick("other");
                 if (lat_store && (!latc || latc != lz_c)) { fprintf(stderr, "predict: --latents: the store has %d cell channels, the checkpoint %d\n", lz_c, latc); return 2; }
+                if (lvq && !lv_fb) {   /* a latvol CT: the same from its cells (the first latc of the store's channels) */
+                    if (latin) nn_lat_pred_input_qs(lz_d, lv_stride, Wz, W, (float)mean, (float)(1.0 / sd), dyd, dxd, ax.n > 0 ? (int)radial_sign : 0, lgain, latc, lvc->step_raw, x2);
+                    else nn_lat_input_qs(lz_d, lv_stride, xd, Wz / 4, W / 4, W / 4, lgain, latc, lvc->step_raw, (float)mean, (float)(1.0 / sd), x2);
+                } else
                 if (lat_store) {   /* the cell channels from the stored coefficients, z-scored with the rebuilt window's statistics */
                     if (latin) nn_lat_pred_input_q(lz_d, Wz, W, (float)mean, (float)(1.0 / sd), dyd, dxd, ax.n > 0 ? (int)radial_sign : 0, lgain, latc, (float)lz_sraw, x2);
                     else nn_lat_input_q(lz_d, xd, Wz / 4, W / 4, W / 4, lgain, latc, (float)lz_sraw, (float)mean, (float)(1.0 / sd), x2);
@@ -2718,6 +2770,9 @@ int cmd_predict(int argc, char **argv) {
     if (pyramid_write_group(out, um_l, gpyr ? PH[0].pya->nlev : nlev, "ufsm-recto", attrs)) return 1;
     }
     fprintf(stderr, "wrote %s (%ld tiles in %.0fs)\n", out, ntiles, now() - t0);
+    if (lvm) { double ds = 0; long dn = 0; nn_latvol_stats(lvL, &ds, &dn);
+        fprintf(stderr, "predict: latvol CT: %.3f GB of chunk streams uploaded and decoded on the device (%.4f B per box voxel); the decode kernels %.3f s in %ld windows (%.1f Gvox/s of window voxels); %ld windows as host-decoded voxels\n",
+                lv_up / 1e9, lv_up / ((double)bn[0] * bn[1] * bn[2]), ds, dn, ds > 0 ? (double)dn * (double)w3 / 1e9 / ds : 0., lv_nfb); }
     if (ufsm_env_on("UFSM_PRED_IO")) {   /* reads per store root and the process's read bytes per box voxel (--latents against the CT path) */
         store_io_report(stderr);
         long long rch = 0, rdb = 0; char ln[128]; FILE *io = fopen("/proc/self/io", "r");

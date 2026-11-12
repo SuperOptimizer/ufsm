@@ -111,6 +111,61 @@ same source's on the absolute-um group. On master's binary, (2) logs "relative e
 Rule for downloaded groups (to diskclean): absolute-um scales only, each group checked with `ufsm info` and a sampler-only draw before
 a run points at it.
 
+## latvol: the CT stored as the trunk's latent cells (2026-11-12, branch latstore-20261112)
+
+The latent-grid nets (u1: `--lat 4 --lat-basis klt1.lcb --lat-c 29 --lat-step 0.25`) consume 4^3 cells of KLT indices, yet every read decodes
+volcomp to voxels first and transforms them again. Measured before (pod, the 19.3 Gvox Paris 4 9.6 um box, 1 head): the GPU needs 4.2-4.8 s,
+the reader 6.2-8.5 s of CPU volcomp decode; 40 CPU threads cap at ~2.8 Gvox/s, the GPU volcomp decoder at ~1 Gvox/s (32 long serial
+substreams a chunk). u1's loader spends 1.3 s of 4.4 s per new P 512 window in the CT read, but training is GPU-bound (9% wait).
+
+**Format.** `ufsm latvol BASIS.lcb ROOT CT-GROUP OUT-GROUP --levels L,..` writes a CT group in the source's own layout (level names, shapes,
+1024 shards, 128^3 chunks) whose arrays use the zarr3 inner codec `latvol` (src/latvol.h): a chunk is 32^3 cells = 512 independent
+substreams of 4^3 cells (a header of 512 uint16 word counts; 0 = all air). A cell: the mean index (DPCM against the previous material cell
+of the substream, 0 = air cell) and C - 1 axis indices, tokens tANS-coded (1024 states, one table per channel, tables per array in the side
+file `latvol.bin` with the basis, step and sd), magnitudes above the token range and signs as raw bits. The transform is integer exact
+(int16 basis x 2^14, int32 sums, one float multiply and a rint; built without fast math / fma), so host and device give the same bytes. The
+quantiser is per array: step x sd_ref (the level's sd over 24 sampled material boxes), not per window as in training (the nets are trained
+with --lat-step-jitter 0.3). A cell whose indices are all zero is air; material cells rebuild to 1..255.
+Readers: `z3_read` of a latvol array returns the rebuilt CT (host decoder), so train, the sampler, zcache, HTTP roots and the chunk cache
+take it unchanged. predict with a latvol CT level reads the packed substreams of each window (`lv_read_box`), decodes them on the device
+(`nn_latvol_decode`: one thread per (chunk, substream) meeting the window), feeds the trunk from the stored indices
+(`nn_lat_pred_input_qs`, when the store's basis is the checkpoint's) and rebuilds the CT bytes for the fine stem, the rv mask and the fit
+fields (`nn_latvol_synth`). `UFSM_PRED_LATVOL=0`: host decode + the CT path; `=2`: device decode but inputs from the rebuilt CT (the check
+mode: byte-identical to 0). Windows off the 4-voxel grid, TTA, --split, degrade fall back to the voxel reader. latvol excludes
+UFSM_PRED_DEVREAD.
+
+**Numbers.**
+- Coefficient statistics (dense material, klt1): Paris 4 9.6 um (volcomp q2 source) step 0.25: C 29 94 bits / cell = 0.184 B/vox (rebuilt
+  34.9 dB), C 64 130 bits (41.1 dB); step 0.354 / 0.5 / 0.707: 80 / 66.5 / 53 bits. PHerc0139 9.36 um: 74 bits (0.145 B/vox, 42.2 dB).
+  EOB / context models gain 1-2%, the mean's DPCM 0.3 bit: not worth serial contexts, which would cost the GPU decode.
+- Stored: a dense Paris 4 shard 204.3 MB (0.190 B/vox) vs the v1 `lc-encode` zstd int8 store 228.5 MB vs volcomp q2 155.8 MB (1.3x
+  volcomp). Whole wbench box regions of Paris 4: 0.183 B per material voxel, 1667: 0.175.
+- Host decode (z3_read): 147-184 Mvox/s per thread, about volcomp's speed: the host path is no faster, the win is the device decode.
+- Pod predict, the 19.3 Gvox box, 1 head, alternating runs (provisional: another job overlapped the slot): volcomp mirror, warm cache 2.53 /
+  2.74 Gvox/s (reader 5.2-5.6 s); latvol 3.17 / 3.21 Gvox/s (reader 0.25-0.30 s, then waiting on the GPU 3.2 s; GPU 3.97 s). 3.76 GB of
+  streams uploaded (0.194 B per box voxel) vs 5.49 GB of volcomp chunks read. Encode of the box's 64 shards on the pod: 27 s, 19 s of it
+  the volcomp read (GPU transform 3 s, entropy threads 4 s).
+- Accuracy, u1 snapshot (univI's u1b), 16 wbench boxes on the pod, latvol C 29 step 0.25 built from the mirror vs the mirror: p05x 0.6517
+  vs 0.6460 (A-B -0.006, CI [-0.031, +0.018]), ids 0.4717 vs 0.4645, p1x 0.5362 vs 0.5278: no measurable difference.
+- Tests: test_latvol (codec round trip, damage, side file, device forward / decode / synth = host), test_latvol.sh (GPU = CPU shards,
+  HTTP + cache, check mode = host decode byte for byte, device vs host vs CT bounds for an rv net, a stem + sub-cell net and fit fields).
+
+`ufsm latvol --zarr2 1` takes the upstream uncompressed zarr v2 CT, `--volcomp Q` writes the same boxes as plain volcomp at a quality
+(the rate ladder of the compression sweep, scripts/latvol/sweep.sh; its results get their own section).
+
+## The on-the-fly phase no longer holds a tile buffer per window (2026-11-12, branch onflyslots-20261112)
+
+perf's pod sampler profile (P 1024, 10 workers) found the on-the-fly phase read was 74% of the window time, with 3.25 busy cores of 40.
+onfly_read took one of the `--onfly-slots` host tile-buffer sets for the whole window and held it through every tile: the GPU tiles,
+and the CPU-side chunk packing too, though only the CPU fallback uses the set. So 2 sets served 10 workers.
+- Now each GPU tile's interior lands in a per-thread pinned buffer, grown once to the largest tile.
+- The buffer set is taken lazily, at the first tile that falls back to the CPU.
+- The device contexts were already taken per tile inside band_pair_gpu_codes. --onfly-slots now bounds only pair-rule work in
+  flight on the GPU, and packing overlaps across all workers.
+- Same bytes: test_phase_onfly (CPU / GPU / small tiles / fused / pooled), test_mesh_phase and test_unwrap2_sampler pass.
+- On the desk (u1, P 1024, --onfly-slots 1) the read is 23-25 s per window, about 6 reads per 50 steps.
+- The pod numbers before and after come from perf (slots 2 / 4 / 6).
+
 ## MIL rays under --replay, the MIL checks, and the U2 ink smoke (2026-11-12, branch milfix-20261112)
 
 **Replays.** The MIL path from mil-20261112 below did not cover `--replay K`. A replay sends the window's planes back to the source
