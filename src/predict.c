@@ -1916,7 +1916,13 @@ int cmd_predict(int argc, char **argv) {
               ffzc = (int)(nzc < (cap ? cap : 1) ? nzc : (cap ? cap : 1));
               if (tta > 1) ffzc = (int)nzc;   /* every pass pools into one accumulator of the whole interior */
               if (ffd && ffzm && half && hdiv == 4 && WR.skip && !ffct && tta <= 1) {   /* a latent-grid net's z-chunk slabs (fzs): <= ~768 MB of fp16 head planes a chunk */
-                  const size_t pls = ((size_t)768 << 20) / ((size_t)(cfg.lat_guide == 8 ? 19 : cfg.lat_guide == 64 ? 11 : cfg.cout) * W * W * 2), czc = pls / (size_t)ffh;
+                  /* (the planes' budget: 768 MB, or 1/12 of the free device memory up to 6 GB (UFSM_PRED_FIT_PLANES_MB): the winding mod 4 planes
+                     need +-16 planes around a chunk and the stem runs again on them, so 3-cell chunks of a 1056 window at --fit-h 8 computed
+                     2.3x their planes: 103 of the fit path's 262 ms a window on the pod) */
+                  size_t fr = 0, tot = 0; nn_mem_free(&fr, &tot);
+                  size_t bud = getenv("UFSM_PRED_FIT_PLANES_MB") ? (size_t)atoll(getenv("UFSM_PRED_FIT_PLANES_MB")) << 20 : fr / 12;
+                  if (!getenv("UFSM_PRED_FIT_PLANES_MB")) { if (bud < ((size_t)768 << 20)) bud = (size_t)768 << 20; if (bud > ((size_t)6 << 30)) bud = (size_t)6 << 30; }
+                  const size_t pls = bud / ((size_t)(cfg.lat_guide == 8 ? 19 : cfg.lat_guide == 64 ? 11 : cfg.cout) * W * W * 2), czc = pls / (size_t)ffh;
                   if ((size_t)ffzc > (czc ? czc : 1)) ffzc = (int)(czc ? czc : 1);
               }
               ffwn = (size_t)ffzc * pc; }

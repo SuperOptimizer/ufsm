@@ -416,6 +416,7 @@ uint8_t *nn_ctw_host(void *w);
 uint8_t *nn_ctw_dev(void *w);
 int nn_ctw_put(void *w, uint32_t dm, int host, const int64_t co[3], const int64_t wo[3], const int64_t wn[3], const int64_t sh[3], uint8_t *dwin);
 int nn_ctw_zero(void *w, uint8_t *d, size_t n);
+int nn_mem_free(size_t *free_bytes, size_t *total_bytes);   /* the current device's free / total memory (0 ok) */
 /* one 2x mean pooling step of an n^3 uint8 volume into (n / 2)^3: (sum + 4) >> 3, as the CPU pyramid (ingest.c pool2_mean) */
 void nn_pool2_u8(const uint8_t *in, int n, uint8_t *out);
 void nn_scale(float *y, float a, size_t n);

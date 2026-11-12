@@ -52,3 +52,7 @@ extern "C" int nn_ctw_zero(void *h, uint8_t *d, size_t n) {   /* (on the worker'
     ctw_t *w = (ctw_t *)h; cudaSetDevice(w->dev);
     return cudaMemsetAsync(d, 0, n, w->st) == cudaSuccess && cudaStreamSynchronize(w->st) == cudaSuccess ? 0 : -1;
 }
+extern "C" int nn_mem_free(size_t *fr, size_t *tot) {   /* the current device's free / total bytes */
+    if (cudaMemGetInfo(fr, tot) != cudaSuccess) { cudaGetLastError(); *fr = *tot = 0; return -1; }
+    return 0;
+}
