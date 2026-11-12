@@ -3,6 +3,7 @@
    the label: ink 254 / no ink 0 inside the band on papyrus, unknown (255) outside the band, in the hole, and at unsupervised pixels;
    --flip moves a one-sided band to the other side; the coarse level keeps the band (known-max); --merge combines by max. */
 #include "inksplat.h"
+#include "dcache.h"
 #include "store.h"
 #include "tiffw.h"
 #include "z3w.h"
@@ -148,6 +149,82 @@ int main(void) {
         CHECK(no > 1000 && oko >= 0.99 * no, "face: far side unknown %d: %ld/%ld", flip, oko, no);
         if (z) z3_close(z);
         store_close(s6);
+    }
+    /* on the fly: the derived array over the same window (two crops, merged) == the stored --face splat of those two crops */
+    {
+        char sj[512], js[2048], o7[512]; snprintf(sj, sizeof sj, "%s/segs.json", dir); snprintf(o7, sizeof o7, "%s/face2.zarr", dir);
+        snprintf(js, sizeof js, "{\"segments\": [{\"tifxyz\": \"%s\", \"labels\": \"%s\", \"mask\": \"%s\", \"crop\": [0, 0, %d, %d]},"
+                 " {\"tifxyz\": \"%s\", \"labels\": \"%s\", \"mask\": \"%s\", \"crop\": [0, %d, %d, %d]}]}", surf, lp, mp, CW, CHh / 2, surf, lp, mp, CHh / 2, CW, CHh - CHh / 2);
+        FILE *f = fopen(sj, "w"); fputs(js, f); fclose(f);
+        inksplat_cfg c7 = c; c7.out = o7; c7.coarse = 0; c7.face = 1; c7.face_a = -3; c7.face_b = 0; c7.nexcl = 1;
+        const int64_t bx[6] = {0, 0, 0, NV, NV, NV / 3}; memcpy(c7.excl[0], bx, sizeof bx);
+        c7.crop[0] = 0; c7.crop[1] = 0; c7.crop[2] = CW; c7.crop[3] = CHh / 2; CHECK(inksplat_run(&c7) == 0, "face crop 1");
+        c7.crop[1] = CHh / 2; c7.crop[3] = CHh - CHh / 2; c7.merge = 1; c7.name = "seg_b"; CHECK(inksplat_run(&c7) == 0, "face crop 2");
+        store *s7 = store_open(o7); z3 *ref = z3_open(s7, "1", nullptr); uint8_t *rb = malloc((size_t)NV * NV * NV);
+        CHECK(ref && !z3_read(ref, z0, nn, rb, 4), "read face2");
+        store *cs = store_open(dir); z3 *ct0 = z3_open(cs, "ct.zarr/1", nullptr);
+        inksplat_cfg c8 = c7; c8.crop[2] = 0; c8.merge = 0; c8.level = 0;
+        char dcd[600]; snprintf(dcd, sizeof dcd, "%s/dcache", dir);
+        inkfly_gpu_config(-1);   /* opens 0, 1: the CPU code; open 2: the GPU (nn_inkfly.cu), memory cache only, when a device answers */
+        for (int open = 0; open < 3; open++) {   /* open 0: computed (cold), then from memory; open 1: a fresh array over the same disk cache */
+            if (open == 2) { if (!getenv("UFSM_TEST_NO_GPU")) inkfly_gpu_config(0); else break; }
+            z3 *ctx = open ? z3_open(cs, "ct.zarr/1", nullptr) : ct0;
+            dcache_stats d0; dcache_get_stats(&d0);
+            const uint64_t g0 = inkfly_gpu_chunks();
+            z3 *fly = ctx ? inkfly_open(ctx, sj, &c8, 64, open == 2 ? nullptr : dcd, nullptr) : nullptr; CHECK(fly != nullptr, "inkfly_open %d", open);
+            if (!fly) break;
+            for (int pass = 0; pass < 2; pass++) {   /* odd boxes */
+                const int64_t bo[3] = {37, 11, 5}, bn[3] = {NV - 60, NV - 20, NV - 9}; uint8_t *fb = malloc((size_t)bn[0] * bn[1] * bn[2]);
+                CHECK(!z3_read(fly, bo, bn, fb, 4), "read onfly");
+                long diff = 0, kn = 0;
+                for (int64_t z = 0; z < bn[0]; z++) for (int64_t y = 0; y < bn[1]; y++) for (int64_t x = 0; x < bn[2]; x++) {
+                    const uint8_t a = fb[(z * bn[1] + y) * bn[2] + x], b = rb[((z + bo[0]) * NV + y + bo[1]) * NV + x + bo[2]]; diff += a != b; kn += b != 255; }
+                fprintf(stderr, "onfly open %d pass %d: %ld of %ld voxels differ from the stored splat (%ld known)\n", open, pass, diff, (long)(bn[0] * bn[1] * bn[2]), kn);
+                CHECK(diff == 0 && kn > 10000, "onfly == stored, open %d pass %d: %ld differ, %ld known", open, pass, diff, kn);
+                free(fb);
+            }
+            dcache_stats d1; dcache_get_stats(&d1);
+            fprintf(stderr, "dcache open %d: %llu computed, %llu from disk, %llu from memory\n", open, (unsigned long long)(d1.cells_computed - d0.cells_computed),
+                    (unsigned long long)(d1.cells_disk - d0.cells_disk), (unsigned long long)(d1.cells_mem - d0.cells_mem));
+            if (!open) CHECK(d1.cells_computed > d0.cells_computed && d1.cells_mem > d0.cells_mem && d1.cells_disk == d0.cells_disk, "dcache: cold computes, warm from memory");
+            else if (open == 1) CHECK(d1.cells_computed == d0.cells_computed && d1.cells_disk > d0.cells_disk, "dcache: a reopened array reads its cells from disk");
+            else fprintf(stderr, "onfly on the GPU: %llu chunks%s\n", (unsigned long long)(inkfly_gpu_chunks() - g0), inkfly_gpu_chunks() > g0 ? "" : " (no device: the CPU ran; not a failure)");
+            if (open == 0) {   /* the MIL rays (inkfly_rays) of the whole volume: every ray's point inside, mode 1 (no face) a subset of mode 0 */
+                void *hd = nullptr; z3 *f2 = inkfly_open(z3_open(cs, "ct.zarr/1", nullptr), sj, &c8, 64, nullptr, &hd);
+                const int64_t wo[3] = {0, 0, 0}, wn[3] = {NV, NV, NV}; inkray *r0 = nullptr, *r1 = nullptr; size_t n0 = 0, n1 = 0;
+                CHECK(f2 && !inkfly_rays(hd, wo, wn, 0, 1, 4, &r0, &n0) && !inkfly_rays(hd, wo, wn, 1, 1, 4, &r1, &n1), "inkfly_rays");
+                long inside = 0, ink = 0; for (size_t i = 0; i < n0; i++) { int in = 1; for (int d = 0; d < 3; d++) in &= r0[i].p[d] >= -0.5f && r0[i].p[d] < NV; inside += in; ink += r0[i].y; }
+                fprintf(stderr, "mil rays: %zu (all supervised pixels, %ld ink), %zu without a face\n", n0, ink, n1);
+                CHECK(n0 > 1000 && inside == (long)n0 && n1 < n0, "rays: %zu, %ld inside, %zu without a face", n0, inside, n1);
+                free(r0); free(r1); if (f2) z3_close(f2);
+            }
+            z3_close(fly);
+        }
+        free(rb); if (ref) z3_close(ref); store_close(s7); store_close(cs);
+    }
+    /* validation rasters (per-pixel holdouts): the stored splat with --val (exclude, then only) == the on-the-fly target with the segment's
+       "validation", and exclude + only together cover the plain splat's known voxels */
+    {
+        uint8_t *vr = calloc((size_t)CW * CHh, 1); for (int r = 0; r < CHh / 3; r++) memset(vr + (size_t)r * CW, 1, CW);   /* (0/1: the 0/1 rule) */
+        char vp[512], sj[512], js[2048]; snprintf(vp, sizeof vp, "%s/validation.tif", dir); tiffw_write(vp, CW, CHh, 1, vr, 1); free(vr);
+        snprintf(sj, sizeof sj, "%s/segs_val.json", dir);
+        snprintf(js, sizeof js, "{\"segments\": [{\"tifxyz\": \"%s\", \"labels\": \"%s\", \"mask\": \"%s\", \"validation\": \"%s\"}]}", surf, lp, mp, vp);
+        FILE *f = fopen(sj, "w"); fputs(js, f); fclose(f);
+        long kn[2] = {0, 0};
+        for (int mode = 1; mode <= 2; mode++) {
+            char ov[512]; snprintf(ov, sizeof ov, "%s/val%d.zarr", dir, mode);
+            inksplat_cfg cv = c; cv.out = ov; cv.coarse = 0; cv.face = 1; cv.face_a = -3; cv.face_b = 0; cv.val = vp; cv.val_mode = mode;
+            CHECK(inksplat_run(&cv) == 0, "val splat %d", mode);
+            store *sv = store_open(ov); z3 *ref = z3_open(sv, "1", nullptr); uint8_t *rb = malloc((size_t)NV * NV * NV), *fb = malloc((size_t)NV * NV * NV);
+            CHECK(ref && !z3_read(ref, z0, nn, rb, 4), "read val splat");
+            store *cs = store_open(dir); inksplat_cfg c9 = cv; c9.level = 0;
+            z3 *fly = inkfly_open(z3_open(cs, "ct.zarr/1", nullptr), sj, &c9, 64, nullptr, nullptr); CHECK(fly && !z3_read(fly, z0, nn, fb, 4), "val onfly %d", mode);
+            long diff = 0; for (size_t k = 0; k < (size_t)NV * NV * NV; k++) { diff += rb[k] != fb[k]; kn[mode - 1] += rb[k] != 255; }
+            fprintf(stderr, "validation %s: %ld known, onfly vs stored: %ld differ\n", mode == 1 ? "exclude" : "only", kn[mode - 1], diff);
+            CHECK(diff == 0 && kn[mode - 1] > 1000, "validation %d: %ld differ, %ld known", mode, diff, kn[mode - 1]);
+            if (fly) z3_close(fly);
+            free(rb); free(fb); if (ref) z3_close(ref); store_close(sv); store_close(cs);
+        }
     }
     /* --exclude: a held-out box over the low-x half: nothing written there, the rest as before */
     {

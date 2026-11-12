@@ -1,4 +1,6 @@
 #include "sample.h"
+#include "inksplat.h"
+[[gnu::weak]] int inkfly_cells(void *, int, const int64_t[3], uint8_t *);   /* (weak: test binaries without inksplat.o; only called for an onfly target) */
 #include "band.h"
 #include "band_w4dev.h"
 #include "target_erode.h"
@@ -3422,7 +3424,13 @@ static occ_index label_occupancy(source *s) {
             const z3_meta *m0 = z3_meta_of(t0), *mc = z3_meta_of(cc); const int cs = m0->chunk[0];
             if (cs < (1 << (lc - l0)) || (cs & (cs - 1)) || m0->chunk[1] != cs || m0->chunk[2] != cs) continue;
             const int sh = __builtin_ctz((unsigned)cs) - (lc - l0);   /* level-lc cells per target chunk edge: 2^sh */
-            int64_t g[3]; uint8_t *bits = nullptr; if (z3_chunk_map(t0, g, &bits) <= 0) { free(bits); continue; }
+            int64_t g[3]; uint8_t *bits = nullptr;
+            if (s->ink_fly[ch]) {   /* an onfly ink target: the label tiles' boxes on the level-lc CT grid (its chunk map is the CT's) */
+                for (int d = 0; d < 3; d++) g[d] = mc->shape[d];
+                bits = calloc((size_t)g[0] * g[1] * g[2], 1);
+                if (!bits || inkfly_cells(s->ink_fly[ch], lc, g, bits) <= 0) { free(bits); continue; }
+            } else if (z3_chunk_map(t0, g, &bits) <= 0) { free(bits); continue; }
+            const int fly = s->ink_fly[ch] != nullptr;
             const size_t pl = (size_t)mc->shape[1] * mc->shape[2], tot = pl * (size_t)mc->shape[0];
             uint8_t *cb = tot < 4.29e9 ? malloc(tot) : nullptr; const int64_t zo[3] = {0, 0, 0}, zn[3] = {mc->shape[0], mc->shape[1], mc->shape[2]};
             if (!cb || z3_read(cc, zo, zn, cb, 8)) { free(cb); free(bits); continue; }
@@ -3430,7 +3438,7 @@ static occ_index label_occupancy(source *s) {
             for (int pass = 0; pass < 2; pass++) {
                 for (int64_t z = 0; z < mc->shape[0]; z++) for (int64_t y = 0; y < mc->shape[1]; y++) for (int64_t x = 0; x < mc->shape[2]; x++) {
                     const size_t k = ((size_t)z * mc->shape[1] + (size_t)y) * mc->shape[2] + (size_t)x;
-                    const int64_t qz = z >> sh, qy = y >> sh, qx = x >> sh;
+                    const int64_t qz = fly ? z : z >> sh, qy = fly ? y : y >> sh, qx = fly ? x : x >> sh;
                     if (cb[k] < iso || qz >= g[0] || qy >= g[1] || qx >= g[2] || !bits[((size_t)qz * g[1] + (size_t)qy) * g[2] + (size_t)qx]) continue;
                     if (pass) o.idx[o.n++] = (uint32_t)k; else n++;
                 }

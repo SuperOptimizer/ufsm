@@ -520,6 +520,17 @@ __global__ void ink_tg_k(const uint8_t *ink, size_t n, uint8_t *t, uint8_t *m) {
     t[i] = v == 255u ? 0 : (uint8_t)(v + (v >= 127u)); m[i] = v != 255u;
 }
 extern "C" void nn_ink_targets(const uint8_t *ink, size_t n, uint8_t *t, uint8_t *m) { ink_tg_k<<<nblk(n, 256), 256>>>(ink, n, t, m); KCHECK(); }
+/* the same with label smoothing (villa's ink recipe): t' = t (1 - eps) + eps / 2 (x255, rounded) */
+__global__ void ink_tgs_k(const uint8_t *ink, size_t n, uint8_t *t, uint8_t *m, float a, float b) {
+    const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const unsigned v = ink[i];
+    t[i] = v == 255u ? 0 : (uint8_t)__float2int_rn((float)(v + (v >= 127u)) * a + b); m[i] = v != 255u;
+}
+extern "C" void nn_ink_targets_smooth(const uint8_t *ink, size_t n, uint8_t *t, uint8_t *m, float eps) {
+    if (!(eps > 0)) { nn_ink_targets(ink, n, t, m); return; }
+    ink_tgs_k<<<nblk(n, 256), 256>>>(ink, n, t, m, 1.f - eps, 127.5f * eps); KCHECK();
+}
 /* --cond: the winding mod 14 turns in 1/18-turn steps (band.h band_winding, 0..251, 255 unknown) -> 4 target planes, cos / sin of
    2 pi q / 14 and of 2 pi q / 2 (q = v / 18 turns), each 127.5 + 127.5 x; mask = known */
 __global__ void cond_tg_k(const uint8_t *wv, size_t n, uint8_t *t, uint8_t *m) {
