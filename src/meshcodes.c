@@ -7,6 +7,10 @@
 #include "store.h"
 #include "tiff.h"
 #include <dirent.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -16,7 +20,7 @@
 
 typedef struct { int w, h; float *xyz; uint8_t *valid; float *val; } mc_mesh;   /* xyz: level-0 x, y, z per vertex (after the map) */
 typedef struct { int mi, r0, r1, c0, c1; float lo[3], hi[3]; } mc_tile;        /* bounds in level-0 z, y, x */
-typedef struct { mc_mesh *m; int nm; mc_tile *t; size_t nt; double scale; } mc_ctx;
+typedef struct { mc_mesh *m; int nm; mc_tile *t; size_t nt; double scale; void *pk; size_t pkn; } mc_ctx;   /* pk: the mmap'd pack (meshes + tiles point into it) */
 
 static double mc_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 static inline uint8_t mc_code(double q) { long k = lround(q * 18.0) % 252; if (k < 0) k += 252; return (uint8_t)(1 + k); }
@@ -52,8 +56,71 @@ static int mc_load(mc_mesh *m, const char *dir, const char *value, const rmap *m
 static int mc_cmp(const void *a, const void *b) { return strcmp(*(char *const *)a, *(char *const *)b); }
 static void mc_free(void *vp) {
     mc_ctx *X = vp; if (!X) return;
-    for (int i = 0; i < X->nm; i++) { free(X->m[i].xyz); free(X->m[i].valid); free(X->m[i].val); }
-    free(X->m); free(X->t); free(X);
+    if (X->pk) munmap(X->pk, X->pkn);
+    else { for (int i = 0; i < X->nm; i++) { free(X->m[i].xyz); free(X->m[i].valid); free(X->m[i].val); } free(X->t); }
+    free(X->m); free(X);
+}
+
+/* The pack: the loaded meshes (vertices after the map, values, validity) and the tile index in one file, mmap'd read-only so an open
+   costs milliseconds and every process shares the pages (Paris 4 June: 28 meshes, 5.8 GB of deflated TIFFs on the HDD took 228 s to
+   load and ~7 GB of heap per process). <dir>/.meshcodes-<16 hex>.pack, or under $UFSM_MESHCODES_CACHE when set (a read-only meshes dir);
+   UFSM_MESHCODES_CACHE=off: none. The key names every input (each mesh's four TIFFs with size and mtime, the value name, the map file
+   with size and mtime, this layout's version); a pack whose stored key differs is rebuilt. Written to a temporary name and renamed.
+   Layout (8-byte aligned): "UFMC0001", u64 key length, u64 meshes, u64 tiles, key, {i32 w, i32 h} per mesh, tiles, then per mesh xyz
+   (12 n bytes), val (4 n), valid (n). */
+#define MC_AL(x) (((x) + 7) & ~(size_t)7)
+static void mc_key(char *k, size_t nk, const char *dir, char **names, int nn, const char *value, const char *mapp) {
+    size_t u = (size_t)snprintf(k, nk, "meshcodes pack v1|value %s|", value); struct stat st;
+    for (int i = 0; i < nn && u < nk; i++) { u += (size_t)snprintf(k + u, nk - u, "%s", names[i]);
+        const char *f[4] = {"x.tif", "y.tif", "z.tif", value};
+        for (int a = 0; a < 4 && u < nk; a++) { char p[2400]; snprintf(p, sizeof p, "%s/%s/%s", dir, names[i], f[a]);
+            if (stat(p, &st)) memset(&st, 0, sizeof st);
+            u += (size_t)snprintf(k + u, nk - u, ":%lld.%lld", (long long)st.st_size, (long long)st.st_mtime); }
+        if (u < nk) u += (size_t)snprintf(k + u, nk - u, "|"); }
+    if (mapp && *mapp && u < nk) { char rp[4200]; if (!realpath(mapp, rp)) snprintf(rp, sizeof rp, "%s", mapp);
+        if (stat(rp, &st)) memset(&st, 0, sizeof st);
+        char fp[4300]; snprintf(fp, sizeof fp, "%s", rp); char *sl = strrchr(fp, '/'); struct stat sf; long long fs = 0, fm = 0;   /* (the field beside reg.json) */
+        if (sl) { snprintf(sl + 1, sizeof fp - (size_t)(sl + 1 - fp), "field.f32"); if (!stat(fp, &sf)) { fs = sf.st_size; fm = sf.st_mtime; } }
+        snprintf(k + u, nk - u, "map %s:%lld.%lld:field %lld.%lld", rp, (long long)st.st_size, (long long)st.st_mtime, fs, fm); }
+}
+static uint64_t mc_hash(const char *s) { uint64_t h = 1469598103934665603ull; for (; *s; s++) { h ^= (uint8_t)*s; h *= 1099511628211ull; } return h; }
+static int mc_pack_path(char *out, size_t n, const char *dir, const char *key) {
+    const char *e = getenv("UFSM_MESHCODES_CACHE"); if (e && (!strcmp(e, "off") || !strcmp(e, "0"))) return -1;
+    snprintf(out, n, "%s/.meshcodes-%016llx.pack", e && *e ? e : dir, (unsigned long long)mc_hash(key)); return 0;
+}
+static int mc_pack_write(const mc_ctx *X, const char *path, const char *key) {
+    char tmp[4400]; snprintf(tmp, sizeof tmp, "%s.tmp.%d", path, (int)getpid());
+    FILE *f = fopen(tmp, "wb"); if (!f) return -1;
+    const uint64_t hd[3] = {strlen(key), (uint64_t)X->nm, X->nt}; const char z8[8] = {0}; int ok = 1;
+#define MC_W(p, n) do { const size_t n_ = (n); ok = ok && fwrite((p), 1, n_, f) == n_ && fwrite(z8, 1, MC_AL(n_) - n_, f) == MC_AL(n_) - n_; } while (0)
+    MC_W("UFMC0001", 8); MC_W(hd, sizeof hd); MC_W(key, hd[0]);
+    for (int i = 0; i < X->nm; i++) { const int32_t wh[2] = {X->m[i].w, X->m[i].h}; MC_W(wh, 8); }
+    MC_W(X->t, X->nt * sizeof *X->t);
+    for (int i = 0; i < X->nm; i++) { const size_t n = (size_t)X->m[i].w * X->m[i].h; MC_W(X->m[i].xyz, n * 12); MC_W(X->m[i].val, n * 4); MC_W(X->m[i].valid, n); }
+#undef MC_W
+    ok = !fclose(f) && ok;
+    if (!ok || rename(tmp, path)) { unlink(tmp); return -1; }
+    return 0;
+}
+static mc_ctx *mc_pack_open(const char *path, const char *key) {
+    const int fd = open(path, O_RDONLY); if (fd < 0) return nullptr;
+    struct stat st; if (fstat(fd, &st) || st.st_size < 40) { close(fd); return nullptr; }
+    uint8_t *b = mmap(nullptr, (size_t)st.st_size, PROT_READ, MAP_SHARED, fd, 0); close(fd); if (b == MAP_FAILED) return nullptr;
+    const size_t N = (size_t)st.st_size, kl = strlen(key); uint64_t hd[3]; memcpy(hd, b + 8, sizeof hd); size_t u = 32;
+    mc_ctx *X = nullptr;
+    if (!memcmp(b, "UFMC0001", 8) && hd[0] == kl && u + MC_AL(kl) <= N && !memcmp(b + u, key, kl) && hd[1] > 0 && hd[1] < (1u << 20)) {
+        u += MC_AL(kl); X = calloc(1, sizeof *X); X->nm = (int)hd[1]; X->nt = hd[2]; X->m = calloc(hd[1], sizeof *X->m); X->pk = b; X->pkn = N;
+        int ok = u + 8 * hd[1] <= N;
+        for (int i = 0; ok && i < X->nm; i++) { int32_t wh[2]; memcpy(wh, b + u + 8 * (size_t)i, 8); X->m[i].w = wh[0]; X->m[i].h = wh[1]; ok = wh[0] > 1 && wh[1] > 1; }
+        u += 8 * hd[1]; ok = ok && X->nt <= (N - u) / sizeof *X->t;
+        if (ok) { X->t = (mc_tile *)(b + u); u += MC_AL(X->nt * sizeof *X->t); }
+        for (int i = 0; ok && i < X->nm; i++) { const size_t n = (size_t)X->m[i].w * X->m[i].h;
+            if (u + MC_AL(n * 12) + MC_AL(n * 4) + MC_AL(n) > N) { ok = 0; break; }
+            X->m[i].xyz = (float *)(b + u); u += MC_AL(n * 12); X->m[i].val = (float *)(b + u); u += MC_AL(n * 4); X->m[i].valid = b + u; u += MC_AL(n); }
+        if (!ok) { free(X->m); free(X); X = nullptr; }
+    }
+    if (!X) munmap(b, N);
+    return X;
 }
 
 /* one z range [z0, z1) of the read box; every thread walks the tiles in order and writes only its own slices: deterministic */
@@ -136,7 +203,15 @@ z3 *mesh_codes_open(const char *dir, const char *value, const char *mapp, int le
     closedir(D);
     if (!nn) { fprintf(stderr, "mesh codes: no *.tifxyz in %s\n", dir); free(names); z3_close(ct_level); return nullptr; }
     qsort(names, (size_t)nn, sizeof *names, mc_cmp);   /* (the order of the shell glob ufsm raster was given) */
-    mc_ctx *X = calloc(1, sizeof *X); X->m = calloc((size_t)nn, sizeof *X->m); X->scale = 1.0 / (1 << level);
+    const size_t nk = (size_t)nn * 400 + 9000; char *key = malloc(nk), pack[4300]; mc_key(key, nk, dir, names, nn, value, mapp);
+    const int packed = !mc_pack_path(pack, sizeof pack, dir, key);
+    mc_ctx *X = packed ? mc_pack_open(pack, key) : nullptr;
+    if (X) { for (int i = 0; i < nn; i++) free(names[i]);
+        free(names); free(key); X->scale = 1.0 / (1 << level);
+        z3 *zp = z3_open_derived(ct_level, 0, mc_read, X, mc_free);
+        if (!zp) { mc_free(X); z3_close(ct_level); return nullptr; }
+        z3_derived_extent(zp, mc_extent, X); return zp; }
+    X = calloc(1, sizeof *X); X->m = calloc((size_t)nn, sizeof *X->m); X->scale = 1.0 / (1 << level);
     int bad = 0; size_t tcap = 0;
     for (int i = 0; i < nn && !bad; i++) { char p[2200]; snprintf(p, sizeof p, "%s/%s", dir, names[i]); bad = mc_load(&X->m[i], p, value, map); X->nm = i + 1; }
     for (int i = 0; i < nn; i++) free(names[i]);
@@ -154,7 +229,9 @@ z3 *mesh_codes_open(const char *dir, const char *value, const char *mapp, int le
             if (X->nt == tcap) { tcap = tcap ? tcap * 2 : 1024; X->t = realloc(X->t, tcap * sizeof *X->t); }
             X->t[X->nt++] = t;
         } }
-    if (bad) { mc_free(X); z3_close(ct_level); return nullptr; }
+    if (bad) { free(key); mc_free(X); z3_close(ct_level); return nullptr; }
+    if (packed && mc_pack_write(X, pack, key)) fprintf(stderr, "mesh codes: could not write the pack %s (set UFSM_MESHCODES_CACHE to a writable directory); loading without it\n", pack);
+    free(key);
     z3 *z = z3_open_derived(ct_level, 0, mc_read, X, mc_free);
     if (!z) { mc_free(X); z3_close(ct_level); return nullptr; }
     z3_derived_extent(z, mc_extent, X);

@@ -48,6 +48,13 @@ for L in 0 1; do
   # the whole volume in one read
   "$U" codes-onfly m --ct st$L $K --level $L --ref st$L $K --windows 1 --P $((256 >> L)) --threads 4 > all$L.log 2>&1 || { echo "FAIL: the whole-volume read differs at level $L ($D/all$L.log)"; exit 1; }
 done
+# the first open above loaded the TIFFs and wrote the pack (m/.meshcodes-*.pack), the later ones mmap'd it; without a pack, and with a
+# stale one (a mesh's q.tif touched -> another key), the result is the same
+ls m/.meshcodes-*.pack > /dev/null 2>&1 || { echo "FAIL: no mesh pack was written"; exit 1; }
+UFSM_MESHCODES_CACHE=off "$U" codes-onfly m --ct st0 $(ls st0 | grep -v zarr.json) --level 0 --ref st0 $(ls st0 | grep -v zarr.json) --windows 4 --P 96 > nopack.log 2>&1 || { echo "FAIL: without the pack ($D/nopack.log)"; exit 1; }
+touch -d '2001-01-01' m/a100.tifxyz/q.tif
+"$U" codes-onfly m --ct st0 $(ls st0 | grep -v zarr.json) --level 0 --ref st0 $(ls st0 | grep -v zarr.json) --windows 4 --P 96 > stale.log 2>&1 || { echo "FAIL: after a changed input ($D/stale.log)"; exit 1; }
+[ "$(ls m/.meshcodes-*.pack | wc -l)" = 2 ] || { echo "FAIL: a changed input did not make a new pack"; exit 1; }
 grep -qE '\([1-9][0-9]* conflict\)' all0.log || { echo "FAIL: the fixture made no conflict voxels ($D/all0.log)"; exit 1; }
 read -r a b <<< "$(grep -o 'the extent: [0-9]* of [0-9]*' on0.1.log | awk '{print $3, $5}')"
 [ "$a" -gt 0 ] && [ "$a" -lt "$b" ] || { echo "FAIL: the extent $a of $b chunks is not a strict part"; exit 1; }
