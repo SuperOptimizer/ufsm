@@ -30,6 +30,7 @@ dropped 10 of 14 picked windows as "empty targets". Three causes:
 Footprint of one ink sampler at P 1024 (sampler only, 1 worker, 1 slot, 8 sources): 17.6 GB RSS. The pod arm A unit at 3 workers /
 3 slots peaked at 52 GB and OOM-killed itself and U2's run in the shared 175 GB cgroup (09:58 UTC).
 
+
 ## U2's host memory: the inventory, and the two per-thread buffers that only grew (2026-11-12, branch poolcap-20261112)
 
 U2 on the pod (8 workers / 10 slots, a 175 GB cgroup shared with every other job) went from 68 to 116 GB of host memory in 19 minutes and

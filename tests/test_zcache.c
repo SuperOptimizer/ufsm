@@ -1,5 +1,8 @@
 /* zcache (src/zcache.h): reads through the shared decoded-chunk cache = z3_read, for random boxes (inside, straddling the edges,
-   fully outside) from several threads at once, with a budget small enough to evict constantly; hits counted on repeats. */
+   fully outside) from several threads at once, with a budget small enough to evict constantly; hits counted on repeats. zcache_drop
+   leaves none of an array's chunks. A dcache pool shared by two cached arrays (dcache_pool_shared, the on-the-fly ink sources' one
+   budget): reads through both = z3_read from 8 threads, the pool's bytes stay under its cap, closing one array keeps the other's. */
+#include "dcache.h"
 #include "zcache.h"
 #include "store.h"
 #include "z3w.h"
@@ -11,6 +14,19 @@
 
 static z3 *Z; static zcache *C; static int bad = 0;
 static uint64_t lcg(uint64_t *s) { *s = *s * 6364136223846793005ull + 1442695040888963407ull; return *s >> 17; }
+static z3 *DA[2];
+static void *run_pool(void *arg) {
+    uint64_t s = (uint64_t)(uintptr_t)arg * 104729 + 3; const int64_t *sh = z3_meta_of(Z)->shape;
+    for (int t = 0; t < 60; t++) {
+        int64_t o[3], n[3]; for (int d = 0; d < 3; d++) { n[d] = 1 + (int64_t)(lcg(&s) % 160); o[d] = (int64_t)(lcg(&s) % (uint64_t)(sh[d] + 100)) - 50; }
+        const size_t nv = (size_t)n[0] * n[1] * n[2]; uint8_t *a = malloc(nv), *b = malloc(nv); z3 *dz = DA[(t + (int)(uintptr_t)arg) & 1];
+        if (!dz) { free(a); free(b); continue; }
+        const int ra = z3_read(Z, o, n, a, 1), rb = z3_read(dz, o, n, b, 1);
+        if (ra || rb || memcmp(a, b, nv)) __atomic_add_fetch(&bad, 1, __ATOMIC_RELAXED);
+        free(a); free(b);
+    }
+    return nullptr;
+}
 static void *run(void *arg) {
     uint64_t s = (uint64_t)(uintptr_t)arg * 7919 + 1; const int64_t *sh = z3_meta_of(Z)->shape;
     for (int t = 0; t < 120; t++) {
@@ -44,6 +60,24 @@ int main(void) {
     int fails = 0;
     printf("zcache: %-90s %s\n", "reads = z3_read (inside / edge / outside boxes, 8 threads, evicting)", bad ? "FAIL" : "ok"); fails += bad != 0;
     printf("zcache: %-90s %s\n", "budget respected (no referenced chunk left over) and hits happen", by <= (size_t)6 * 128 * 128 * 128 && h > 0 ? "ok" : "FAIL"); fails += !(by <= (size_t)6 * 128 * 128 * 128 && h > 0);
+    zcache_drop(C, Z); zcache_stats(C, nullptr, nullptr, &by);
+    printf("zcache: %-90s %s\n", "zcache_drop: none of the array's chunks left", by == 0 ? "ok" : "FAIL"); fails += by != 0;
+    {   /* the shared dcache pool: two memory-only cached arrays over the same data (2 cells of 64^3 each of budget: evicting) */
+        dcache_pool *P = dcache_pool_shared("test", 1), *P2 = dcache_pool_shared("test", 999);
+        for (int k = 0; k < 2; k++) DA[k] = z3_open_cached_pool(z3_open(st, "a.zarr", nullptr), nullptr, "k", 64, P);
+        bad = 0; for (int i = 0; i < 8; i++) pthread_create(&th[i], nullptr, run_pool, (void *)(uintptr_t)i);
+        for (int i = 0; i < 8; i++) pthread_join(th[i], nullptr);
+        size_t cap = 0; const size_t pb = dcache_pool_bytes(P, &cap);
+        printf("zcache: %-90s %s\n", "dcache pool shared by name (one pool, the first cap)", P && P == P2 && cap == (size_t)1 << 20 ? "ok" : "FAIL"); fails += !(P && P == P2 && cap == (size_t)1 << 20);
+        printf("zcache: %-90s %s\n", "two arrays in one pool: reads = z3_read (8 threads, evicting)", DA[0] && DA[1] && !bad ? "ok" : "FAIL"); fails += !(DA[0] && DA[1] && !bad);
+        printf("zcache: %-90s %s (%.2f MB of %.2f)\n", "the pool's bytes under its cap", pb <= cap ? "ok" : "FAIL", pb / 1e6, cap / 1e6); fails += pb > cap;
+        z3_close(DA[0]); DA[0] = nullptr; const size_t pb1 = dcache_pool_bytes(P, nullptr);
+        bad = 0; for (int i = 0; i < 4; i++) pthread_create(&th[i], nullptr, run_pool, (void *)(uintptr_t)i);
+        for (int i = 0; i < 4; i++) pthread_join(th[i], nullptr);
+        printf("zcache: %-90s %s\n", "one array closed: the other reads on, its cells counted alone", !bad && pb1 <= pb + 1 && dcache_pool_bytes(P, nullptr) <= cap ? "ok" : "FAIL"); fails += !(!bad && dcache_pool_bytes(P, nullptr) <= cap);
+        z3_close(DA[1]); DA[1] = nullptr;
+        printf("zcache: %-90s %s\n", "both closed: the pool empty", dcache_pool_bytes(P, nullptr) == 0 ? "ok" : "FAIL"); fails += dcache_pool_bytes(P, nullptr) != 0;
+    }
     zcache_close(C); z3_close(Z);
     char cmd[600]; snprintf(cmd, sizeof cmd, "rm -rf -- '%s'", dir); if (system(cmd)) {}
     return fails != 0;

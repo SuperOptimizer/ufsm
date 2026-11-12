@@ -7,8 +7,11 @@ scripts/inkgt/addval.py), the ink head only (the winding heads 0: ink-only windo
 Env: ROOT (rewrites /vesuvius/ufsm/inkgt to ROOT in the sources, the holdout files and the segment lists, which are then written next to
 OUT, whose directory is then the staging copy of ROOT: for a pod, ROOT=/workspace/univ/inkgt OUT=STAGE/inkgt/sources-u2ink.json),
 CACHE_DIR (the onfly "cache_dir": the derived-chunk cache; default: the trainer's $UFSM_DERIVED_CACHE / ~/.cache/ufsm/derived),
-CACHE_MB (each source's onfly memory cache; 2048 by default), CACHE (the sources' CT cache), LEVEL (0), VAL (exclude)."""
+CACHE_MB (ignored by the trainer since 2026-11-12: every onfly ink source shares train --ink-cache-mb, 4096), CACHE (the sources' CT cache),
+LEVEL (0), VAL (exclude). A source left with no supervised pixel (VAL exclude: every segment's validation raster covers its supervision,
+PHerc0841 / PHerc0500P2) is dropped with a line naming it: it has no draw index (fatal under --strict-sources). KEEP_EMPTY=1 keeps it."""
 import json, os, shutil, sys
+import numpy as np
 
 IN = sys.argv[1] if len(sys.argv) > 1 else "/vesuvius/ufsm/inkgt/sources-inkfly.json"
 OUT = sys.argv[2] if len(sys.argv) > 2 else "/vesuvius/ufsm/inkgt/sources-u2ink.json"
@@ -22,10 +25,32 @@ def seglist(p):   # the segment list with rewritten paths (only when ROOT moves 
         for k in ("tifxyz", "labels", "mask", "validation"):
             if k in s: s[k] = rw(s[k])
     json.dump(j, open(os.path.join(od, os.path.basename(p)), "w"), indent=1); return ROOT + "/" + os.path.basename(p)
+def raster(p):   # a 2-D label / mask / validation raster at 1/16 (zarr array dir or tif), 0/1 or 0/255 -> bool
+    if p.endswith((".tif", ".tiff")):
+        import tifffile; a = tifffile.imread(p)[::16, ::16]
+    else:
+        import zarr; a = np.asarray(zarr.open(p, mode="r")[::16, ::16])
+    return a >= (1 if a.max() <= 1 else 128)
+def supervised(segs):   # supervised pixels left after the validation rule (at 1/16; None: a raster could not be read)
+    n = 0
+    for g in json.load(open(segs))["segments"]:
+        try:
+            m = raster(g["mask"])
+            if VAL == "exclude" and g.get("validation"):
+                v = raster(g["validation"]); h, w = min(m.shape[0], v.shape[0]), min(m.shape[1], v.shape[1]); m = m[:h, :w] & ~v[:h, :w]
+            elif VAL == "only" and g.get("validation"):
+                v = raster(g["validation"]); h, w = min(m.shape[0], v.shape[0]), min(m.shape[1], v.shape[1]); m = m[:h, :w] & v[:h, :w]
+            n += int(m.sum())
+        except Exception as e:
+            print(f"  (cannot read the rasters of {g.get('labels', '?')}: {str(e)[:80]}: kept)"); return None
+    return n
 S = json.load(open(IN)); out = []
 for s in S["sources"]:
     s = json.loads(json.dumps(s)); ik = s["targets"]["ink"]; of = ik["onfly"]
     nv = sum("validation" in g for g in json.load(open(of["segments"]))["segments"])
+    ns = supervised(of["segments"]) if VAL != "off" else None
+    if ns == 0 and os.environ.get("KEEP_EMPTY") != "1":
+        print(f"{s['name']}: dropped: no supervised pixel left with validation {VAL} ({nv} segments with a validation raster)"); continue
     of["segments"] = seglist(of["segments"]); of["level"] = L; of["validation"] = VAL
     if os.environ.get("CACHE_DIR"): of["cache_dir"] = os.environ["CACHE_DIR"]
     if os.environ.get("CACHE_MB"): of["cache_mb"] = int(os.environ["CACHE_MB"])   # (the per-source memory cache, 2048 MB by default: 8 sources)

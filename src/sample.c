@@ -1,6 +1,7 @@
 #include "sample.h"
 #include "inksplat.h"
 [[gnu::weak]] int inkfly_cells(void *, int, const int64_t[3], uint8_t *);
+[[gnu::weak]] size_t inkfly_cache_bytes(size_t *);
 [[gnu::weak]] int inkfly_rays(void *, const int64_t[3], const int64_t[3], int, int, float, inkray **, size_t *);   /* (weak: test binaries without inksplat.o; only called for an onfly target) */
 #include "band.h"
 #include "band_w4dev.h"
@@ -4083,13 +4084,14 @@ void sampler_hostmem(const sampler *sp, FILE *f, size_t pinned) {
         }
         if (cl == 0) for (int i = 0; i < k && i < TP_N && cl < sizeof cls - 16; i++) cl += (size_t)snprintf(cls + cl, sizeof cls - cl, " %.2f", tp->n[i] / p3);
     }
+    size_t ikc = 0; const size_t ikt = inkfly_cache_bytes ? inkfly_cache_bytes(&ikc) : 0;
     struct mallinfo2 mi = mallinfo2();
     long rss = 0; FILE *st = fopen("/proc/self/status", "r"); char line[256];
     if (st) { while (fgets(line, sizeof line, st)) if (!strncmp(line, "VmRSS:", 6)) rss = atol(line + 6); fclose(st); }
     fprintf(f, "hostmem: rss %.2f GB | pinned %.2f GB (slots %.2f) | workers %d: big %.2f/%.2f GB res/virt, ttmp %.2f/%.2f, pool %.2f virt (peak %.2f, pooled res %.2f)"
-               " | malloc arena %.2f GB in use %.2f free %.2f mmapped %.2f | p3 %.0f M; pool classes of a worker (x p3):%s\n",
+               " | malloc arena %.2f GB in use %.2f free %.2f mmapped %.2f | p3 %.0f M; pool classes of a worker (x p3):%s | ink caches %.2f GB targets + %.2f GB CT\n",
             rss / 1048576.0, pinned / G, g_slot_bytes / G, nw, bigr / G, bigv / G, ttr / G, ttv / G, tpv / G, tpk / G, tpr / G,
-            (mi.arena) / G, mi.uordblks / G, mi.fordblks / G, mi.hblkhd / G, p3 / 1e6, cls);
+            (mi.arena) / G, mi.uordblks / G, mi.fordblks / G, mi.hblkhd / G, p3 / 1e6, cls, ikt / G, ikc / G);
 }
 void sampler_stop(sampler *sp) {
     if (!sp) return;

@@ -610,7 +610,7 @@ $(B)/crush_anim: tests/crush_anim.c src/sample.c src/*.h $(SAMPLE_TEST_OBJ) $(B)
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/crush_anim.c $(SAMPLE_TEST_OBJ) $(B)/imgops.o $(B)/jpegpar.o $(B)/tiffw.o $(B)/tfx.o $(B)/surfcomp.o -o $@ $(LDLIBS)
 $(B)/test_scrollaug: tests/test_scrollaug.c tests/make_wind_fixture.c src/sample.c src/*.h $(SAMPLE_TEST_OBJ)
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_scrollaug.c $(SAMPLE_TEST_OBJ) -o $@ $(LDLIBS)
-$(B)/test_zcache: tests/test_zcache.c $(B)/zcache.o $(B)/zarr3.o $(B)/store.o $(B)/json.o $(B)/z3w.o $(B)/hf.o $(B)/zipr.o
+$(B)/test_zcache: tests/test_zcache.c $(B)/zcache.o $(B)/dcache.o $(B)/zarr3.o $(B)/store.o $(B)/json.o $(B)/z3w.o $(B)/hf.o $(B)/zipr.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
 $(B)/test_vwt_aug: tests/test_vwt_aug.c $(B)/vwt_aug.o $(B)/deform.o $(SAMPLE_TEST_OBJ)
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_vwt_aug.c $(B)/vwt_aug.o $(B)/deform.o $(SAMPLE_TEST_OBJ) -o $@ $(LDLIBS)

@@ -1090,7 +1090,7 @@ static int ifgpu_on(void) {
 static int inkfly_find(char (*paths)[1024], int n, const char *p) { for (int i = 0; i < n; i++) if (!strcmp(paths[i], p)) return i; return -1; }
 static void inkfly_free(void *p) {
     inkfly *f = p; if (!f) return;
-    if (f->zc) zcache_close(f->zc);
+    if (f->zc) zcache_drop(f->zc, f->base_ct);   /* (the shared ink CT cache outlives this source) */
     for (int i = 0; i < f->nS; i++) ssurf_free(&f->S[i]);
     for (int i = 0; i < f->nL; i++) lsrc_close(&f->Ls[i]);
     free(f->S); free(f->Spath); free(f->Ls); free(f->Lpath); free(f->U); free(f->T); free(f->gstart); free(f->glist); free(f);
@@ -1435,6 +1435,27 @@ static void *ifidx_worker(void *p) {
     return nullptr;
 }
 /* SEGS: {"segments": [{"tifxyz": DIR, "labels": L, "mask": M, "crop": [c0, r0, w, h]}, ..]}; ct: the CT at level cfg->level (owned) */
+/* the caches of every on-the-fly ink source, one budget for the process (2026-11-12: a 2 GB target LRU and a 1 GB decoded-CT cache per
+   source were up to 24 GB for U2's 8 ink sources): 3/4 the computed target cells (dcache pool "ink"), 1/4 the decoded CT chunks the
+   face search reads (one zcache, keyed by the CT array) */
+static size_t g_ink_mb; static zcache *g_ink_zc; static dcache_pool *g_ink_pool; static pthread_mutex_t g_ink_mu = PTHREAD_MUTEX_INITIALIZER;
+int inkfly_cache_budget(size_t mb) {
+    pthread_mutex_lock(&g_ink_mu); const int late = g_ink_zc || g_ink_pool; if (!late && mb) g_ink_mb = mb; pthread_mutex_unlock(&g_ink_mu);
+    if (late) fprintf(stderr, "ink onfly: the shared cache budget is set before the first source opens (%zu MB kept)\n", g_ink_mb);
+    return late ? -1 : 0;
+}
+static zcache *ink_caches(dcache_pool **pool) {
+    pthread_mutex_lock(&g_ink_mu);
+    if (!g_ink_mb) { const char *e = getenv("UFSM_INK_CACHE_MB"); g_ink_mb = e && atol(e) > 0 ? (size_t)atol(e) : 4096; }
+    if (!g_ink_zc) g_ink_zc = zcache_open((g_ink_mb / 4) << 20);
+    if (!g_ink_pool) g_ink_pool = dcache_pool_shared("ink", g_ink_mb - g_ink_mb / 4);
+    *pool = g_ink_pool; zcache *z = g_ink_zc; pthread_mutex_unlock(&g_ink_mu); return z;
+}
+size_t inkfly_cache_bytes(size_t *ct_bytes) {
+    pthread_mutex_lock(&g_ink_mu); size_t t = g_ink_pool ? dcache_pool_bytes(g_ink_pool, nullptr) : 0, cb = 0;
+    if (g_ink_zc) zcache_stats(g_ink_zc, nullptr, nullptr, &cb); pthread_mutex_unlock(&g_ink_mu);
+    if (ct_bytes) *ct_bytes = cb; return t;
+}
 z3 *inkfly_open(z3 *ct, const char *segs_path, const inksplat_cfg *cfg, size_t cache_mb, const char *dcache_dir, void **handle) {
     const double t0 = snow();
     FILE *fp = fopen(segs_path, "rb"); if (!fp) { fprintf(stderr, "ink onfly: cannot open %s\n", segs_path); z3_close(ct); return nullptr; }
@@ -1520,15 +1541,16 @@ z3 *inkfly_open(z3 *ct, const char *segs_path, const inksplat_cfg *cfg, size_t c
             free(fill);
         }
     }
-    f->zc = zcache_open((size_t)1 << 30);
+    (void)cache_mb;   /* (a per-source cap no longer: every source shares inkfly_cache_budget) */
+    dcache_pool *pool = nullptr; f->zc = ink_caches(&pool);
     z3 *z = z3_open_derived(ct, 255, inkfly_derive, f, inkfly_free);
     if (!z) { free(key); free(sg_txt); inkfly_free(f); z3_close(ct); return nullptr; }
     if (handle) *handle = f;
-    z = z3_open_cached(z, dcache_dir, key, IFC, cache_mb ? cache_mb : 2048); free(key);
+    z = pool ? z3_open_cached_pool(z, dcache_dir, key, IFC, pool) : nullptr; free(key);
     free(sg_txt);
     if (!z) return nullptr;
-    fprintf(stderr, "ink onfly: %s: %d label windows, %d meshes, %zu supervised tiles indexed in %.1fs%s (level %d, face [%g, %g], iso %d, %d held-out boxes, cache %zu MB, disk %s)\n",
-            segs_path, f->nU, f->nS, f->nT, snow() - t0, have_ix ? " (index from the cache)" : "", f->L, cfg->face_a, cfg->face_b, cfg->iso, cfg->nexcl, cache_mb ? cache_mb : 2048, dcache_dir && *dcache_dir ? dcache_dir : "none");
+    fprintf(stderr, "ink onfly: %s: %d label windows, %d meshes, %zu supervised tiles indexed in %.1fs%s (level %d, face [%g, %g], iso %d, %d held-out boxes, shared ink cache %zu MB, disk %s)\n",
+            segs_path, f->nU, f->nS, f->nT, snow() - t0, have_ix ? " (index from the cache)" : "", f->L, cfg->face_a, cfg->face_b, cfg->iso, cfg->nexcl, g_ink_mb, dcache_dir && *dcache_dir ? dcache_dir : "none");
     return z;
 fail:
     json_free(j); free(sg_txt); inkfly_free(f); z3_close(ct); return nullptr;
@@ -1578,7 +1600,7 @@ int cmd_ink_onfly(int argc, char **argv) {
     c.ct_root = argv[ci + 1]; c.ct_key = argv[ci + 2];
     const char *dcd = sopt(argc, argv, "--dcache", dcache_default_dir());   /* --dcache DIR | off */
     if (dcd && !strcmp(dcd, "off")) dcd = nullptr;
-    void *hd = nullptr; z3 *z = inkfly_open(ct, argv[2], &c, (size_t)atol(sopt(argc, argv, "--cache-mb", "2048")), dcd, &hd);
+    inkfly_cache_budget((size_t)atol(sopt(argc, argv, "--cache-mb", "4096"))); void *hd = nullptr; z3 *z = inkfly_open(ct, argv[2], &c, 0, dcd, &hd);
     if (!z) return 1;
     if (sflag(argc, argv, "--rays")) {   /* the MIL rays of the box: every supervised pixel vs those without an open face */
         const int L0 = c.level; int64_t ro[3], rn[3]; for (int d = 0; d < 3; d++) { ro[d] = b[d] >> L0; rn[d] = ((b[d] + b[d + 3] + (1 << L0) - 1) >> L0) - ro[d]; }

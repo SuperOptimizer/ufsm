@@ -69,6 +69,10 @@ uint8_t *inksplat_label_window(const char *path, int64_t r0, int64_t c0, int64_t
 typedef struct z3 z3;
 z3 *inkfly_open(z3 *ct, const char *segs, const inksplat_cfg *cfg, size_t cache_mb, const char *dcache_dir, void **handle);   /* cache_mb: the memory LRU; dcache_dir: the disk cache root (dcache.h; nullptr = memory only); handle (nullable): for inkfly_cells; cfg->ct_root / ct_key name the CT in the cache key */
 /* the level-lev cells (grid shape) a supervised label tile's box (reach included) touches -> bits[] = 1 (the sampler's draw cells) */
+/* every on-the-fly ink source shares one cache budget (MB, default $UFSM_INK_CACHE_MB or 4096: 3/4 computed target cells, 1/4 decoded CT);
+   set before the first inkfly_open (-1 after: kept). inkfly_cache_bytes: the target bytes held (ct_bytes: the CT cache's) */
+int inkfly_cache_budget(size_t mb);
+size_t inkfly_cache_bytes(size_t *ct_bytes);
 int inkfly_cells(void *handle, int lev, const int64_t shape[3], uint8_t *bits);
 /* a normal-pooled MIL ray (train's ink MIL loss): p the label pixel's mesh point, n its unit normal (+ = the recto side), in the window's
    level voxels (window origin 0); y the 2-D label (1 ink); w a weight */
