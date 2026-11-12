@@ -2266,8 +2266,11 @@ int cmd_predict(int argc, char **argv) {
       for (int j = 0; j < nph; j++) { if (writer_finish(PH[j].wr)) { fprintf(stderr, "predict: head %s: %s\n", PH[j].name, z3w_error()); return 1; }
                                       if (PH[j].wr->donefd >= 0) close(PH[j].wr->donefd); }
       if (writer_finish(&WR)) { fprintf(stderr, "%s\n", z3w_error()); return 1; }
-      if (pprof) fprintf(stderr, "predict profile (s): writer: %.2f thread-seconds compressing %ld shards (%.0f MB/s per writer thread), tail after the last window %.2f\n",
-                         WR.t_write, WR.n_write, WR.t_write > 0 ? WR.n_write * (double)WR.bytes / WR.t_write / 1e6 : 0., now() - tf); }
+      if (pprof && !lhm) fprintf(stderr, "predict profile (s): writer: %.2f thread-seconds compressing %ld shards (%.0f MB/s per writer thread), tail after the last window %.2f\n",
+                         WR.t_write, WR.n_write, WR.t_write > 0 ? WR.n_write * (double)WR.bytes / WR.t_write / 1e6 : 0., now() - tf);
+      if (pprof && lhm) { double tw = 0; long nw = 0; for (int j = 0; j < nph; j++) { tw += PH[j].wr->t_write; nw += PH[j].wr->n_write; }
+                          fprintf(stderr, "predict profile (s): %d head writers: %.2f s compressing %ld shards (%.0f MB/s per writer), tail after the last window %.2f\n",
+                                  nph, tw, nw, tw > 0 ? nw * (double)WR.bytes / tw / 1e6 : 0., now() - tf); } }
     if (ffzm) {   /* the last field slabs, the axis table and fields.json (format zarr) */
         for (; ffslab * FZ < ffF[0]; ffslab++) ffw_push(&ffw, (ffw_job){.kind = 1, .slab = ffslab});
         const double tfin = now();
