@@ -40,6 +40,9 @@ PY
     while :; do
       while [ -e $K/gpu.pause ]; do sleep 5; done
       touch $L/b.busy; while [ -n "$(ls $K/gpu.shared 2>/dev/null | grep '^latstore-')" ]; do sleep 5; done   # my other units drain first
+      # U2 needs its ~64 GB: start only with >= FREEGB (20) GB free on the card (this job plans 14 + one 4 GB on-the-fly slot)
+      while [ "$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits | head -1)" -lt $((${FREEGB:-20} * 1024)) ]; do sleep 20; [ -e $K/gpu.pause ] && break; done
+      [ -e $K/gpu.pause ] && { rm -f $L/b.busy; continue; }
       RS=(); [ -f $o/last.ckpt ] && RS=(--resume $o/last.ckpt)
       mkdir -p $K/gpu.shared; touch $K/gpu.shared/latstore-B
       UFSM_MEM_FREE_GB=14 UFSM_HEAD_SLAB_Z=16 nice -n 5 $U train "${ARGS[@]}" "${RS[@]}" >> $o.log 2>&1 & pid=$!; why=
