@@ -8,7 +8,7 @@
 #      vs NEW --crop-material 2 vs NEW crop + UFSM_PG_HOSTW=1 (W_ref through the host) vs NEW crop + UFSM_FIT_STREAM_VERIFY=1:
 #      delta.f32 + model.json byte-compared to BASE; the stage times of each                                               ~4 min
 #   3. lanes on P4 s066..s071 (one GPU): BASE 1 lane, NEW crop 1 lane, NEW crop 2 lanes + UFSM_FIT_GPU_LOCK (FITLANES=2 FITLOCK=1 in
-#      unroll.sh), wall per config, models against the 1-lane NEW ones                                                    ~4 min
+#      unroll.sh), the same + UFSM_FIT_LOCK_LATE=1 (FITLOCK=2), wall per config, models against the 1-lane NEW ones          ~5 min
 # Env: BASE, NEW (binaries; default the copies in /vesuvius/ufsm/tmp-slabperf/bin), SKIP_TESTS=1, PARTS ("1 2 3"), FTH (16: fit threads).
 # Verdict lines: "IDENTICAL a b" / "DIFFER a b"; the summary at the end ($OUT/summary.txt).
 set -u
@@ -58,7 +58,9 @@ for part in $PARTS; do case $part in
    for s in $L; do fit l1c-$s $NEW $P4 $O/v-PHercParis4-u1-$s --crop-material 2; done; t2=$(date +%s.%N)
    lane2() { local s; for s in "$@"; do UFSM_FIT_GPU_LOCK=$O/gpu.lock fit l2c-$s $NEW $P4 $O/v-PHercParis4-u1-$s --crop-material 2; done; }
    lane2 s066 s068 s070 & p1=$!; lane2 s067 s069 s071 & p2=$!; wait $p1 $p2; t3=$(date +%s.%N)
-   say "$(awk -v a=$t0 -v b=$t1 -v c=$t2 -v d=$t3 'BEGIN { printf "6 slabs: BASE 1 lane %.1f s, NEW crop 1 lane %.1f s, NEW crop 2 lanes + GPU lock %.1f s", b - a, c - b, d - c }')"
-   for s in $L; do same l1b-$s l1c-$s; same l1c-$s l2c-$s; done ;;
+   lane3() { local s; for s in "$@"; do UFSM_FIT_GPU_LOCK=$O/gpu.lock UFSM_FIT_LOCK_LATE=1 fit l3c-$s $NEW $P4 $O/v-PHercParis4-u1-$s --crop-material 2; done; }
+   lane3 s066 s068 s070 & p1=$!; lane3 s067 s069 s071 & p2=$!; wait $p1 $p2; t4=$(date +%s.%N)
+   say "$(awk -v a=$t0 -v b=$t1 -v c=$t2 -v d=$t3 -v e=$t4 'BEGIN { printf "6 slabs: BASE 1 lane %.1f s, NEW crop 1 lane %.1f s, 2 lanes + GPU lock (FITLOCK=1) %.1f s, + late lock (FITLOCK=2) %.1f s", b - a, c - b, d - c, e - d }')"
+   for s in $L; do same l1b-$s l1c-$s; same l1c-$s l2c-$s; same l1c-$s l3c-$s; done ;;
 esac; done
 say "slabperf_gpu: done $(date); $(grep -c '^DIFFER' $S) DIFFER, $(grep -c '^IDENTICAL' $S) IDENTICAL, test failures: $(grep -cE '^test_.* rc [1-9]' $S)"

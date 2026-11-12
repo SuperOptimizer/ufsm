@@ -2701,7 +2701,10 @@ int fit_stream_verify(const fit_stream *s, const fit_fields *f) {   /* (src/fit.
 int fit_fields_load_stream(const char *dir, fit_fields_buf *b, fit_stream *s, const int *fps, int nfp, void (*gpu_ready)(void)) {
     memset(s, 0, sizeof *s);
     if (nfp > 8) return -1;
-    const int sk = g_skip_planes; g_skip_planes |= 4;   /* the host buffer without the normal planes */
+    /* UFSM_FIT_LOCK_LATE=1 (with UFSM_FIT_GPU_LOCK): the normals decoded to the host with the other planes, before the lock, then uploaded
+       from there (+6 B per cell of host memory while loading): two lanes on one GPU overlap the whole decode with the other's device stages */
+    const int late = ufsm_env_on("UFSM_FIT_LOCK_LATE") && getenv("UFSM_FIT_GPU_LOCK") && *getenv("UFSM_FIT_GPU_LOCK");
+    const int sk = g_skip_planes; if (!late) g_skip_planes |= 4;   /* the host buffer without the normal planes */
     const int tms = getenv("UFSM_FIT_TIMES") != nullptr; double t0 = nn_wall_seconds(), td = 0, tu = 0;
     const int lr = fit_fields_load(dir, 0, 0, 1, b);
     if (tms) fprintf(stderr, "fit times: load host planes %.2fs\n", nn_wall_seconds() - t0);
@@ -2743,7 +2746,8 @@ int fit_fields_load_stream(const char *dir, fit_fields_buf *b, fit_stream *s, co
     nn_fit_up *up = nn_fit_up_open();
     const int hk[4] = {0, 1, 8, 9}; for (int q = 0; q < 4; q++) nn_fit_up_put(up, s->dfield + (size_t)hk[q] * n, b->a[hk[q]], n);
     int cz = 128, nb = 0; uint8_t *buf[2] = {nullptr, nullptr}; size_t bcap[2] = {0, 0}; long bid[2] = {-1, -1}; int rc = 0;
-    for (int k = 2; k < 8 && !rc; k++) {
+    if (late) for (int k = 2; k < 8; k++) { if (!b->a[k]) { rc = -1; break; } nn_fit_up_put(up, s->dfield + (size_t)k * n, b->a[k], n); }   /* (the host normals) */
+    for (int k = 2; k < 8 && !rc && !late; k++) {
         z3 *za = nullptr; FILE *fr = nullptr;
         if (zarr) { za = z3_open(store_open(dir), fit_plane_names[k], nullptr); if (za && z3_meta_of(za)->chunk[0] > 0) cz = z3_meta_of(za)->chunk[0]; }
         else { snprintf(path, sizeof path, "%s/%s.raw", dir, fit_plane_names[k]); fr = fopen(path, "rb"); }
@@ -2766,6 +2770,7 @@ int fit_fields_load_stream(const char *dir, fit_fields_buf *b, fit_stream *s, co
     }
     const double tc = nn_wall_seconds(); nn_fit_up_close(up); tu += nn_wall_seconds() - tc;
     free(buf[0]); free(buf[1]);
+    if (late) for (int k = 2; k < 8; k++) { free(b->a[k]); b->a[k] = nullptr; b->f.t[k - 2] = nullptr; }   /* (uploaded: the host buffer as without the late lock) */
     if (tms) fprintf(stderr, "fit times: normals decode %.2fs, upload waits %.2fs\n", td, tu);
     t0 = nn_wall_seconds();
     /* the gradient stages' pooled fields, pooled on the device (nn_fit_pool: fit_pool's sums and roundings; the normals stay there) */

@@ -263,7 +263,8 @@ SLABFIT=${SLABFIT---steps 300,300,300,300,200,200 --batch 1000000}
 # model byte-identical to the whole-box fit (positions, lattice, minibatch hash stay the box's; slabperf-20261112: CPU backend on P4 boxes,
 # test_fit). P4 slabs keep ~0.45-0.6 of the 3575 x 3712 cross-section, so their fields (12.7 GB) fit the 16 GB device instead of managed memory.
 # FITLOCK=1: UFSM_FIT_GPU_LOCK per GPU (one fit on the device at a time, from its host planes to its exit), for FITLANES=2 on one card: the
-# next slab's material box / host-plane decode overlaps the current one's device stages
+# next slab's material box / host-plane decode overlaps the current one's device stages; FITLOCK=2: also UFSM_FIT_LOCK_LATE=1 (the normals decoded
+# to the host before the lock too: +6 B per cell of host memory per lane while loading)
 CROPM=${CROPM-2}; FITLOCK=${FITLOCK:-0}
 lane() {   # lane GPU
   local g=$1 k s d c0 c1 a b t0 rc ze ny nx dir
@@ -279,7 +280,7 @@ lane() {   # lane GPU
     # FIT_MANAGED=1 (the last refit try of a failed slab) puts the fields in managed memory (fit picks it itself when they leave too little
     # device headroom since 6126e23; this is the fallback)
     local man=${FIT_MANAGED:-0}
-    env UFSM_FIT_THREADS=$FTH_LANE $([ "$man" = 1 ] && echo UFSM_FIT_MANAGED=1) $([ "$FITLOCK" = 1 ] && echo UFSM_FIT_GPU_LOCK=$O/state/fitgpu$g.lock) /usr/bin/time -v nice -n 5 \
+    env UFSM_FIT_THREADS=$FTH_LANE $([ "$man" = 1 ] && echo UFSM_FIT_MANAGED=1) $([ "$FITLOCK" != 0 ] && echo UFSM_FIT_GPU_LOCK=$O/state/fitgpu$g.lock) $([ "$FITLOCK" = 2 ] && echo UFSM_FIT_LOCK_LATE=1) /usr/bin/time -v nice -n 5 \
       $U fit $d/f --gpu $g --out $d/fit --dir $dir --ref-model $REF --ref-snap 1 --uw-repair 0 $([ "${CROPM:-0}" != 0 ] && echo --crop-material $CROPM) $SLABFIT ${FITX:-} > $d/fit.log 2>&1; rc=$?
     echo "$s $c0..$c1 rc $rc gpu $g $(( $(date +%s) - t0 ))s$([ "$man" = 1 ] && echo " managed")" >> $O/slabs.txt
     if [ $rc = 0 ]; then touch $d/done; elif grep -q "no data for the prior" $d/fit.log; then touch $d/empty $d/done; fi
