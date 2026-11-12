@@ -7,8 +7,8 @@
    values s1 >= s2 (sqrt of the metric tensor's eigenvalues), and
      dist = max(s1, 1 / s2) - 1   the worst linear stretch or compression in any direction (0.05: a letter 5 % off in some direction),
      area = s1 s2                 the area ratio flat -> scroll (1 = equal area),
-     fold = the surface normal du x dv points against the mean normal of its --div block (a flattening flip: the flat image is mirrored
-            there).
+     fold = the surface normal du x dv points against the summed normals of the 9 x 9 --div blocks around it (a flattening flip: the
+            flat image is mirrored there).
    Writes per stripe <s>_dist.jpg (the block mean of dist per --div x --div block: black none, green <= --trust, yellow 2 x --trust, red
    >= 4 x --trust; magenta: >= 10 % of the block folded) and <s>_area.jpg (block mean log2 area: blue compressed, grey 1, red stretched, +-0.5 full
    scale), at 1 / (div x render --scale 1 grid px) of the stripe render (img_fill/<s>_ct.jpg has ostep x px_scale px per grid step);
@@ -45,7 +45,7 @@ typedef struct {
     const float *x, *y, *z, *gu; int w, h; double step;
     float *dist, *la; uint8_t *fold; int16_t *wrap;
     const int *segc0, *segwrap; int nseg;
-    int div, bw, bh, span; _Atomic int next;
+    int div, bw, bh, span, pass; float *bn; _Atomic int next;
 } sd_job;
 static int sd_wrap_of(const sd_job *J, double g) {   /* the strip segment holding source column g (segments by col0 ascending) */
     if (!(g >= 0) || !J->nseg) return INT16_MIN;
@@ -81,17 +81,27 @@ static void *sd_rows(void *arg) {
     }
     return nullptr;
 }
-/* folds: per --div block the mean normal; a pixel whose normal opposes it is folded (pass over block rows) */
+/* folds: a pixel whose normal du x dv points against the summed unit normals of the 9 x 9 --div blocks around its block (a flattening
+   flip: the flat image is mirrored there; a fold narrower than ~4 blocks is outvoted by its unfolded surroundings). Pass 0: per block
+   the sum of its unit normals (bn), pass 1: the flags. */
+static inline int sd_normal(const sd_job *J, size_t i, int r, int c, double n[3]) {
+    const int w = J->w; if (!(J->dist[i] == J->dist[i]) || c + 1 >= w || r + 1 >= J->h || !sd_ok(J, i + 1) || !sd_ok(J, i + w)) return 0;
+    const double du[3] = {J->x[i + 1] - J->x[i], J->y[i + 1] - J->y[i], J->z[i + 1] - J->z[i]}, dv[3] = {J->x[i + w] - J->x[i], J->y[i + w] - J->y[i], J->z[i + w] - J->z[i]};
+    n[0] = du[1] * dv[2] - du[2] * dv[1]; n[1] = du[2] * dv[0] - du[0] * dv[2]; n[2] = du[0] * dv[1] - du[1] * dv[0]; return 1;
+}
 static void *sd_folds(void *arg) {
     sd_job *J = arg; const int w = J->w, D = J->div;
     for (int br; (br = atomic_fetch_add(&J->next, 1)) < J->bh;) for (int bc = 0; bc < J->bw; bc++) {
-        double nm[3] = {0, 0, 0}; const int r0 = br * D, c0 = bc * D, r1 = r0 + D < J->h ? r0 + D : J->h, c1 = c0 + D < w ? c0 + D : w;
-        for (int pass = 0; pass < 2; pass++) for (int r = r0; r < r1; r++) for (int c = c0; c < c1; c++) {
-            const size_t i = (size_t)r * w + c; if (!(J->dist[i] == J->dist[i]) || c + 1 >= w || r + 1 >= J->h || !sd_ok(J, i + 1) || !sd_ok(J, i + w)) continue;
-            const double du[3] = {J->x[i + 1] - J->x[i], J->y[i + 1] - J->y[i], J->z[i + 1] - J->z[i]}, dv[3] = {J->x[i + w] - J->x[i], J->y[i + w] - J->y[i], J->z[i + w] - J->z[i]};
-            const double n[3] = {du[1] * dv[2] - du[2] * dv[1], du[2] * dv[0] - du[0] * dv[2], du[0] * dv[1] - du[1] * dv[0]};
-            if (!pass) { const double l = sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]); if (l > 0) for (int d = 0; d < 3; d++) nm[d] += n[d] / l; }
-            else J->fold[i] = n[0] * nm[0] + n[1] * nm[1] + n[2] * nm[2] < 0;
+        const int r0 = br * D, c0 = bc * D, r1 = r0 + D < J->h ? r0 + D : J->h, c1 = c0 + D < w ? c0 + D : w;
+        if (J->pass == 0) {
+            double nm[3] = {0, 0, 0};
+            for (int r = r0; r < r1; r++) for (int c = c0; c < c1; c++) { double n[3]; if (!sd_normal(J, (size_t)r * w + c, r, c, n)) continue;
+                const double l = sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]); if (l > 0) for (int d = 0; d < 3; d++) nm[d] += n[d] / l; }
+            for (int d = 0; d < 3; d++) J->bn[((size_t)br * J->bw + bc) * 3 + d] = (float)nm[d];
+        } else {
+            double ref[3] = {0, 0, 0};
+            for (int a = br - 4; a <= br + 4; a++) for (int b = bc - 4; b <= bc + 4; b++) if (a >= 0 && b >= 0 && a < J->bh && b < J->bw) for (int d = 0; d < 3; d++) ref[d] += J->bn[((size_t)a * J->bw + b) * 3 + d];
+            for (int r = r0; r < r1; r++) for (int c = c0; c < c1; c++) { double n[3]; const size_t i = (size_t)r * w + c; if (sd_normal(J, i, r, c, n)) J->fold[i] = n[0] * ref[0] + n[1] * ref[1] + n[2] * ref[2] < 0; }
         }
     }
     return nullptr;
@@ -157,7 +167,8 @@ int cmd_strip_distort(int argc, char **argv) {
         const size_t n = (size_t)w * h;
         sd_job J = {.x = X, .y = Y, .z = Z, .gu = G, .w = w, .h = h, .step = ostep, .dist = malloc(n * 4), .la = malloc(n * 4), .fold = malloc(n), .wrap = malloc(n * 2), .segc0 = segc0, .segwrap = segw, .nseg = nseg, .div = div, .span = span};
         J.bw = (w + div - 1) / div; J.bh = (h + div - 1) / div;
-        sd_par(&J, sd_rows, nt); sd_par(&J, sd_folds, nt);
+        J.bn = calloc((size_t)J.bw * J.bh * 3, sizeof(float));
+        sd_par(&J, sd_rows, nt); J.pass = 0; sd_par(&J, sd_folds, nt); J.pass = 1; sd_par(&J, sd_folds, nt); free(J.bn);
         free(X); free(Y); free(Z); free(G);
         /* the block images */
         uint8_t *di = calloc((size_t)J.bw * J.bh * 3, 1), *ai = calloc((size_t)J.bw * J.bh * 3, 1);
