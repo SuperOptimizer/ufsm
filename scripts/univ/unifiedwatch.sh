@@ -21,7 +21,7 @@ US=${US:-/vesuvius/ufsm/unroll/sched}
 gpu0busy() { local p m; while IFS=', ' read -r p m; do [ -n "$p" ] && [ "${m:-0}" -gt 200 ] || continue
     ps -o args= -p $p | grep -qE "${GPU0OK:-ufsm-fibd/}" || return 0; done < <(nvidia-smi --id=${GPU:-0} --query-compute-apps=pid,used_memory --format=csv,noheader,nounits); return 1; }
 gpu0free() { until [ -e $US/p4rv.done ] && [ -e $US/perf2.done ] && [ -e $US/p4col.done ] && ! pgrep -f "$US/(rvside|p4rv|p1299|unrollperf)|unrollperf" > /dev/null \
-    && ! gpu0busy && sleep 30 && ! gpu0busy; do sleep 60; done; }
+    && ! { [ -e $US/perf3.go ] && [ ! -e $US/perf3.done ]; } && ! gpu0busy && sleep 30 && ! gpu0busy; do sleep 60; done; }   # (perf3.go: unrollperf2's re-run window)
 log() { echo "$(date '+%m-%d %H:%M:%S') $*" | tee -a $LG; }
 perscroll() {   # perscroll VSCORES LABEL: per-scroll mean AUC / best F1 (crop names: w.. = Paris 4, else SCROLL_w..)
   awk -F'\t' -v L="$2" '{ s = ($1 ~ /^w[0-9]/) ? "PHercParis4" : substr($1, 1, index($1, "_w") - 1); c[s]++; A[s] += $6; F[s] += $8 }
