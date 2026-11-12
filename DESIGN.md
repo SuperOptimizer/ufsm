@@ -80,6 +80,33 @@ down, so the numbers below come from commit messages only:
     there: 0 to +0.01, since those scrolls are the labelled ones.
   - The fibre judge (persistent sheet changes per m) on PHerc1299 and PHerc0175A tiles, where an effect, if any, should show.
   - Robustness: p05x on 20x-compressed input.
+- Base checkpoint (lead): u1 stopped at ~13750 (u1/last.ckpt); there is no snap/16000. The A/B branches off the unified run's
+  first snapshot (the production trunk) or u1/last.ckpt.
+
+**3-D ink across the corpus (user 11-12: "dino on improving 3d ink corpus wide").** Human ink labels exist on ~8 scrolls.
+- What the DINO-guided relabel rounds bought: we cannot say. They are villa's (ink_3d_dino_guided: ps256 bcedice dinoguided v1 ->
+  v2 -> v3_fullsup, config.json in /vesuvius/ufsm/teachers/dino3d); we hold only the final 78k EMA checkpoint and none of their
+  per-round validation. Our only number is the final teacher on our 24 held-out crops: 3-D AUC Paris 4 0.727, 0139 0.651,
+  1667 0.561 against a CT floor of 0.513. A teacher at 0.56 on 1667 is too weak to distill there.
+- Stage 1, the feature term above: the unified run's ink head reads the same trunk, so any invariance or context the term buys
+  reaches ink. It is indirect and costs nothing extra.
+- Stage 2, ink consistency on unlabelled windows (`--ssl-ink W --ssl-ink-conf c`), with the same two views and the same EMA
+  teacher forward:
+  - The latent ink output is interpolated from the cell-level coarse logits (only the phase pair has the sub-cell head), so the
+    target can be the teacher's coarse ink probability per cell. It needs no full-resolution slabs. The fine stem's ink
+    contribution is absent on both sides.
+  - Soft BCE on the student's masked view, only on papyrus cells (CT >= iso) where the teacher is confident (|p - 0.5| >= c),
+    i.e. FixMatch / mean teacher with a gate.
+  - Start only once the unified ink head beats dino3d on the crops: self-training from a near-floor head reinforces noise.
+- Not chosen:
+  - Offline relabel rounds (predict ink on every scroll, gate, use as sources): GPU hours of whole-scroll inference per round,
+    which the online EMA version avoids.
+  - Distilling dino3d on unlabelled scrolls: it needs 2.4 um level 0 (the desk's 2.4 um CTs have none), is out of distribution
+    at 7.9-9.4 um, and is weak where it matters.
+- Metric: inkB's 34 crops (24 + 10 held out from 0500P2 / 0841; latres scores them per snapshot), 3-D AUC / best F1. 0500P2 /
+  0841 are the corpus-wide signal; Paris 4 / 0139 / 1667 are non-regression. The 1667 unroll's rendered ink AUC
+  (scripts/inkgt/wrapscore.py: 0.646, CT floor 0.540) is an end-to-end check, not an A/B metric (one unroll per arm). The noise
+  floor on the crops is not measured yet (a seed repeat is needed).
 
 ## The human ink targets on the fly, the derived-array chunk cache, and the villa ink recipe (2026-11-11, branch inkfly-20261111)
 
