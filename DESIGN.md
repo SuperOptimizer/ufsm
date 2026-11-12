@@ -31,6 +31,21 @@ sampler-only run of sources-u1b (150 batches) with per source x level drop count
   Only one level of pooling: a phase two or more levels finer (4.8 -> 19.2 um) would read 64x the window's voxels, so `--um-rungs` skips
   those levels. The pooling runs in z slabs of <= 64 MB, because pooling a P 896 window whole read 1792^3 = 5.7 GB per worker and the first
   sampler-only run was OOM-killed in the 64 GB slice.
+  An on-the-fly phase (codes + rmax, or fused sets) does not pool the derived phase, which would derive 8x the voxels and also OOMed. Its
+  next coarser level is opened at load as the same rule on the codes pooled once more (codes_pool2_open) at half rmax. That is
+  byte-identical to phase-raster --gs 4 of the 2x coarser grid (the 1667 9.6 um check in the section below).
+
+Re-run of sources-u1b with the fix: 150 windows, 8 workers, 42 GB RSS under memcap -t.
+
+| | before | after |
+|---|---|---|
+| sources that produced windows | 4 of 8 | 8 of 8 |
+| holdout drops | 0 (none rejected now) | 0 |
+| windows by rung, < 6.8 / 6.8-13.6 / > 13.6 um | 0% at > 13.6 um | 14% / 54% / 32% |
+| holdout-masked windows | | 32 |
+
+Windows per source (from 0 for the 1667s before): 0139 51, Paris 4 june 27, july 24, 1667-gt 21, 1667-A48 12, june48 9, 0500P2 3,
+1667-B48 3.
 
 Tests (test_unwrap2_sampler):
 - the same 40 draws with and without a box: 0 of 177270 box + guard voxels carry a phase / w4 / comp / loss-mask label, and 0 phase bytes
