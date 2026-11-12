@@ -24,7 +24,7 @@ quarters() { echo "$1" | tr ' ' '\n' | grep . | awk -v k=${2:-4} '{q[(NR - 1) % 
 # a job line: NAME|ENV...|KIND   (KIND wb: wbench.sh CK TAGROW; rv: eval.sh TASKS=rv; eq: the equality test)
 WBE="SITE=desk WB=$WB SLABS=0 THREADS=12 PRIO=eval UP=$UP WZARGS= WIN=640 HALO=64 LOCALCT=/vesuvius/ufsm/v2/ct"
 : > $Q
-addrow() { local row=$1 boxes=$2 env=$3 k=${4:-4} i=0; while read -r b; do i=$((i + 1)); echo "$row.q$i|$env BOXES='$b'|wb $CK $row" >> $Q; done < <(quarters "$boxes" $k); }
+addrow() { local row=$1 boxes=$2 env=$3 k=${4:-4} i=0 bq; while read -r bq; do i=$((i + 1)); echo "$row.q$i|$env BOXES='$bq'|wb $CK $row" >> $Q; done < <(quarters "$boxes" $k); }
 case $PART in
   w1) echo "eq|EQ=1|eq" >> $Q; echo "rv|RVSC=p1667|rv" >> $Q
       addrow $T "$CORE" ""; addrow $T-dlv1 "$CORE" "DLV=1";;
