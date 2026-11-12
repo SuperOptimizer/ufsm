@@ -30,6 +30,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include "fit.h"
 #include "afv.h"
 
@@ -40,6 +41,8 @@ static double fj_knot(const float *v, int nk, int dz, double z) {   /* (fit.c kn
     return v[k0] + t * (v[nk > 1 ? k0 + 1 : k0] - v[k0]);
 }
 
+static double fj_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + 1e-9 * t.tv_nsec; }
+static double fj_tload, fj_tcells, fj_trows, fj_thist;   /* UFSM_JOIN_TIMES: wall s in the block loads, cell picks, differences, histograms */
 static int cmp_long(const void *a, const void *b) { const long x = *(const long *)a, y = *(const long *)b; return (x > y) - (x < y); }
 
 /* a histogram of rounded differences: distinct values v (ascending), their counts c and near counts cn (|d - v| < 0.25) */
@@ -182,12 +185,14 @@ static void fj_hist_of(const double *dv, size_t nd0, fj_hist *H) {
    histogram; ph / phw (optional): the confidence-weighted phasor sum and weight; raw / nraw (optional): the differences themselves */
 static void fj_sample(const fit_fields *f, int fz0, size_t n, double minc, long long nsamp, const fit_model *a, double za, const fit_model *b, double zb,
                       const fit_set *ref, const double *ro, double bias, double h, fj_hist *H, double complex *ph, double *phw, double **raw, size_t *nraw) {
-    size_t *iv; float *cw; const size_t ni = fj_cells(f, n, minc, nsamp, &iv, &cw);
-    double *dv = malloc(sizeof(double) * (ni + 1));
+    double t0 = fj_now(); size_t *iv; float *cw; const size_t ni = fj_cells(f, n, minc, nsamp, &iv, &cw);
+    double *dv = malloc(sizeof(double) * (ni + 1)), t1 = fj_now(); fj_tcells += t1 - t0;
     fj_job J = {a, b, za, zb, h, fz0, (size_t)f->H * f->W, f->H, f->W, iv, dv, ni, ref, ro, bias};
     fit_par((int)((ni + 4095) / 4096), fj_rows, &J);   /* (differences on threads, written by position) */
+    t0 = fj_now(); fj_trows += t0 - t1;
     if (ph) for (size_t q = 0; q < ni; q++) { const double d = dv[q]; if (!isfinite(d)) continue; *ph += cw[q] * cexp(2 * M_PI * I * d); *phw += cw[q]; }
     if (H) fj_hist_of(dv, ni, H);
+    fj_thist += fj_now() - t0;
     free(iv); free(cw);
     if (raw) { *raw = dv; *nraw = ni; } else free(dv);
 }
@@ -375,6 +380,7 @@ int cmd_fit_join(int argc, char **argv) {
     if (ns < 1 || (argc - ai) % 3 || !(blend >= 0) || nsamp < 1 || nref < 1 || !(refw >= 0) || !(chainw >= 0) || refrows < 0 || !(cap > 0) || !(mincells >= 1)) { fprintf(stderr, "fit-join: give <slab-model> <z0> <z1> triples (and --blend >= 0, weights >= 0)\n"); return 2; }
     if (fibp && (glob || !(fibw >= 0) || !(fibarc > 0))) { fprintf(stderr, "fit-join: --fibers: not with --global; --join-fib >= 0, --join-fib-arc > 0 (mm)\n"); return 2; }
     fit_fields_skip_planes(1 | 2 | 4); fit_fields_ct_planes(0);   /* (the overlaps read pc ps w only) */
+    const double tj0 = fj_now(); const int tms = getenv("UFSM_JOIN_TIMES") != nullptr;
     fit_fields_buf g; if (fit_fields_load(fdir, 0, 0, 0, &g)) { fprintf(stderr, "fit-join: cannot read the fields in %s\n", fdir); return 1; }
     const double h = g.h, Z = g.shape[0] * h;
     fit_set *s = calloc(1, sizeof *s); s->n = ns; s->blend = blend;
@@ -396,6 +402,7 @@ int cmd_fit_join(int argc, char **argv) {
             return 1;
         }
     }
+    if (tms) fprintf(stderr, "fit-join times: %d slab models loaded %.1fs\n", ns, fj_now() - tj0);
     const double iz0 = s->z0[0], iz1 = s->z1[ns - 1];   /* (the given interiors: the ref samples stay inside them) */
     s->z0[0] = 0; s->z1[ns - 1] = Z;   /* (the set covers the whole box: rows outside the first / last interior use those slabs) */
     printf("fit-join: %d slabs, box %dx%dx%d h %g, blend %g\n", ns, g.shape[0], g.shape[1], g.shape[2], h, blend);
@@ -446,8 +453,9 @@ int cmd_fit_join(int argc, char **argv) {
     fit_fields_skip_planes(1 | 2 | 4 | 8);   /* (the rows: pc ps w) */
     fj_cache C = {fdir, cz > 0 ? cz : 128, g.shape[0], czoff, 0, {{0}}};
     for (int q = 0; q < nt; q++) {
-        const fj_task *t = &tk[q]; fit_fields v; uint8_t *own[3];
-        if (fj_rows_get(&C, t->fz0, t->fz1, &v, own)) { fprintf(stderr, "fit-join: cannot load field rows %d..%d\n", t->fz0, t->fz1); return 1; }
+        const fj_task *t = &tk[q]; fit_fields v; uint8_t *own[3]; const double tl = fj_now();
+        const int bad = fj_rows_get(&C, t->fz0, t->fz1, &v, own); fj_tload += fj_now() - tl;
+        if (bad) { fprintf(stderr, "fit-join: cannot load field rows %d..%d\n", t->fz0, t->fz1); return 1; }
         const size_t n = (size_t)(t->fz1 - t->fz0) * v.H * v.W;
         if (t->kind == 0 || t->kind == 1) {
             const fit_model *a = s->slab[t->kind ? xa[t->k] : t->k - 1], *b = s->slab[t->kind ? xb[t->k] : t->k];
@@ -462,6 +470,7 @@ int cmd_fit_join(int argc, char **argv) {
     }
     for (int q = 0; q < 2; q++) fit_fields_free(&C.s[q].f);
     free(tk);
+    if (tms) fprintf(stderr, "fit-join times: the sweep (%d tasks) at %.1fs: field blocks %.1fs, cell picks %.1fs, differences %.1fs, phasors + histograms %.1fs\n", nt, fj_now() - tj0, fj_tload, fj_tcells, fj_trows, fj_thist);
     if (glob) printf("fit-join: --global: %d overlap edges (%d between consecutive slabs, %d longer), cost cap %g nats, full weight from %g cells\n", ns - 1 + nx, ns - 1, nx, cap, mincells);
     /* the gauges S_k (slab k minus S_k joins). Without --ref the chain of overlap modes; with --ref the dynamic programme */
     /* --fibers: per boundary the histogram of fibre votes (fj_fib_votes), a second cost term next to the overlap's */
@@ -570,7 +579,9 @@ int cmd_fit_join(int argc, char **argv) {
     const int na = (int)(G->D * h) + 1; G->cy = malloc(na * sizeof(float)); G->cx = malloc(na * sizeof(float));
     memcpy(G->cy, g.cy, na * sizeof(float)); memcpy(G->cx, g.cx, na * sizeof(float));
     s->global = G;
+    const double tsv = fj_now();
     if (fit_set_save(s, out)) { fprintf(stderr, "fit-join: cannot save %s\n", out); return 1; }
+    if (tms) fprintf(stderr, "fit-join times: saved %.1fs, total %.1fs\n", fj_now() - tsv, fj_now() - tj0);
     printf("fit-join: set written to %s\n", out);
     fit_set_free(s); fit_fields_free(&g);
     return 0;

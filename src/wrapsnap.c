@@ -55,6 +55,8 @@ typedef struct {
     double f, org[3]; uint8_t fill;   /* wrap voxel p -> array voxel (p + .5) f - .5 - org */
     int lg[3];   /* log2 of the chunk sides (all powers of two; else -1: the divisions) */
     _Atomic uint32_t *sub; uint32_t *held; int subok;   /* 128^3 chunks: the volcomp substreams (16 z x 32 y slabs) the band reads / holds */
+    uint32_t *nzm;   /* per held chunk: its decoded substreams without a 0 voxel (all bits: a whole chunk without; the CT mask test along a ray
+                        needs no voxel lookups there) */
 } wsn_vol;
 static int wsn_vol_open(wsn_vol *v, const char *root, const char *key, const char *cache, double f, const double org[3], uint8_t fill) {
     memset(v, 0, sizeof *v); v->z = z3_open(store_open(root), key, cache); if (!v->z) return -1;
@@ -65,14 +67,14 @@ static int wsn_vol_open(wsn_vol *v, const char *root, const char *key, const cha
     int p2 = 1; for (int d = 0; d < 3; d++) { v->lg[d] = 0; while ((1 << v->lg[d]) < v->cs[d]) v->lg[d]++; p2 &= (1 << v->lg[d]) == v->cs[d]; }
     if (!p2) v->lg[0] = v->lg[1] = v->lg[2] = -1;
     v->subok = v->cs[0] == 128 && v->cs[1] == 128 && v->cs[2] == 128 && !getenv("UFSM_WSN_FULLDECODE");
-    v->sub = calloc(ng, sizeof *v->sub); v->held = calloc(ng, sizeof *v->held);
-    return v->ch && v->need && v->sub && v->held ? 0 : -1;
+    v->sub = calloc(ng, sizeof *v->sub); v->held = calloc(ng, sizeof *v->held); v->nzm = calloc(ng, sizeof *v->nzm);
+    return v->ch && v->need && v->sub && v->held && v->nzm ? 0 : -1;
 }
 static void wsn_vol_close(wsn_vol *v) {
     if (!v->z) return;
     const size_t ng = (size_t)v->g[0] * v->g[1] * v->g[2];
     for (size_t k = 0; k < ng; k++) free(v->ch[k]);
-    free(v->ch); free((void *)v->need); free((void *)v->sub); free(v->held); z3_close(v->z); memset(v, 0, sizeof *v);
+    free(v->ch); free((void *)v->need); free((void *)v->sub); free(v->held); free(v->nzm); z3_close(v->z); memset(v, 0, sizeof *v);
 }
 static inline void wsn_a(const wsn_vol *v, const double p[3], double a[3]) { for (int d = 0; d < 3; d++) a[d] = (p[d] + 0.5) * v->f - 0.5 - v->org[d]; }
 /* mark the chunks of the box spanned by wrap-voxel points p and q (+-1 array voxel); with 128^3 chunks also the substreams of the box
@@ -100,6 +102,18 @@ static void wsn_mark(wsn_vol *v, const double p[3], const double q[3], const dou
         for (int64_t cx = el[2] >> 7; cx <= eh[2] >> 7; cx++) atomic_fetch_or_explicit(&v->sub[((size_t)cz * v->g[1] + cy) * v->g[2] + cx], m, memory_order_relaxed);
     }
 }
+static uint32_t wsn_nzmask(const wsn_vol *v, const uint8_t *b, uint32_t held) {   /* the held substreams of chunk buffer b without a 0 */
+    if (!v->subok || held == 0xffffffffu) {
+        if (!v->subok) return memchr(b, 0, (size_t)v->cs[0] * v->cs[1] * v->cs[2]) ? 0 : 0xffffffffu;
+    }
+    uint32_t m = 0;
+    for (int s = 0; s < 32; s++) {
+        if (!(held >> s & 1)) continue;
+        int ok = 1; for (int z = 16 * (s / 4); z < 16 * (s / 4) + 16 && ok; z++) ok = !memchr(b + ((size_t)z * 128 + 32 * (s % 4)) * 128, 0, 32 * 128);
+        m |= (uint32_t)ok << s;
+    }
+    return m;
+}
 typedef struct { wsn_vol *v; int64_t *todo; uint32_t *want; size_t n; _Atomic size_t next; _Atomic int err; _Atomic long nsub; } wsn_dec;
 static void *wsn_dec_run(void *arg) {
     wsn_dec *J = arg; wsn_vol *v = J->v;
@@ -115,11 +129,13 @@ static void *wsn_dec_run(void *arg) {
             if (!t || z3_read_sub(v->z, o, n, t, 1, miss == 0xffffffffu ? 0 : miss)) { free(t); atomic_store(&J->err, 1); continue; }
             for (int s = 0; s < 32; s++) if (miss >> s & 1) for (int z = 16 * (s / 4); z < 16 * (s / 4) + 16; z++) { const size_t off = ((size_t)z * 128 + 32 * (s % 4)) * 128; memcpy(v->ch[id] + off, t + off, 32 * 128); }
             free(t); v->held[id] |= miss; atomic_fetch_add(&J->nsub, __builtin_popcount(miss));
+            v->nzm[id] = wsn_nzmask(v, v->ch[id], v->held[id]);
             continue;
         }
         uint8_t *b = malloc((size_t)n[0] * n[1] * n[2]);
         if (!b || (w ? z3_read_sub(v->z, o, n, b, 1, w) : z3_read(v->z, o, n, b, 1))) { free(b); atomic_store(&J->err, 1); continue; }
         v->ch[id] = b; v->held[id] = w ? w : 0xffffffffu; atomic_fetch_add(&J->nsub, w ? __builtin_popcount(w) : 32);
+        v->nzm[id] = wsn_nzmask(v, b, v->held[id]);
     }
     return nullptr;
 }
@@ -131,7 +147,7 @@ static int wsn_vol_fill(wsn_vol *v, int nt) {
     const size_t ng = (size_t)v->g[0] * v->g[1] * v->g[2]; int64_t *todo = nullptr; uint32_t *want = nullptr; size_t n = 0, cap = 0;
     for (size_t k = 0; k < ng; k++) {
         const uint32_t w = v->subok ? v->sub[k] : 0xffffffffu; v->sub[k] = 0;
-        if (!v->need[k]) { if (v->ch[k]) { free(v->ch[k]); v->ch[k] = nullptr; v->held[k] = 0; v->nres--; } continue; }
+        if (!v->need[k]) { if (v->ch[k]) { free(v->ch[k]); v->ch[k] = nullptr; v->held[k] = 0; v->nzm[k] = 0; v->nres--; } continue; }
         v->need[k] = 0;
         if (v->ch[k] && (v->held[k] == 0xffffffffu || !(w & ~v->held[k]))) continue;
         if (n == cap) { cap = cap ? 2 * cap : 1024; todo = realloc(todo, cap * sizeof *todo); want = realloc(want, cap * sizeof *want); }
@@ -182,6 +198,29 @@ static double wsn_tri(const wsn_vol *v, const double p[3]) {   /* trilinear at w
 }
 static inline int64_t wsn_lround(double a) {   /* llround(a) for |a| < 2^52 without the libm call: trunc, then half away from zero (a - t exact) */
     const double t = trunc(a); return (int64_t)(t + (fabs(a - t) >= 0.5 ? (a < 0 ? -1.0 : 1.0) : 0.0));
+}
+/* 1 when every voxel the nearest-voxel lookups of the points p..q (wrap voxels, one ray) can hit is held and non-zero: their rounded
+   coordinates lie in the box of the end points' (the lookups' arithmetic is monotone along the ray), the box inside the array and its
+   chunks all free of zeros */
+static int wsn_nozero(const wsn_vol *v, const double p[3], const double q[3]) {
+    double a[3], b[3]; wsn_a(v, p, a); wsn_a(v, q, b); int64_t lo[3], hi[3];
+    for (int d = 0; d < 3; d++) {
+        if (!(fabs(a[d]) < 4e15 && fabs(b[d]) < 4e15)) return 0;
+        const int64_t x = llround(a[d]), y = llround(b[d]); lo[d] = x < y ? x : y; hi[d] = x < y ? y : x;
+        if (lo[d] < 0 || hi[d] >= v->sh[d]) return 0;
+    }
+    for (int64_t z = lo[0] / v->cs[0]; z <= hi[0] / v->cs[0]; z++) for (int64_t y = lo[1] / v->cs[1]; y <= hi[1] / v->cs[1]; y++) {
+        uint32_t want = 0xffffffffu;   /* (the substreams the box covers in this chunk row: 16 z x 32 y slabs) */
+        if (v->subok) {
+            const int64_t z0 = lo[0] > z * 128 ? lo[0] - z * 128 : 0, z1 = hi[0] < z * 128 + 127 ? hi[0] - z * 128 : 127;
+            const int64_t y0 = lo[1] > y * 128 ? lo[1] - y * 128 : 0, y1 = hi[1] < y * 128 + 127 ? hi[1] - y * 128 : 127;
+            want = 0; for (int64_t zs = z0 / 16; zs <= z1 / 16; zs++) for (int64_t ys = y0 / 32; ys <= y1 / 32; ys++) want |= 1u << (4 * zs + ys);
+        }
+        for (int64_t x = lo[2] / v->cs[2]; x <= hi[2] / v->cs[2]; x++) {
+            const size_t k = ((size_t)z * v->g[1] + y) * v->g[2] + x; if (!v->ch[k] || (v->nzm[k] & want) != want) return 0;
+        }
+    }
+    return 1;
 }
 static double wsn_near(const wsn_vol *v, const double p[3]) {
     double a[3]; wsn_a(v, p, a);
@@ -281,7 +320,11 @@ static void wsn_row(const wsn_job *J, int wi, int r) {
         double tlo = isfinite(gin) ? -f * gin : -R, thi = isfinite(gout) ? f * gout : R;
         tlo = fmax(tlo, -R); thi = fmin(thi, R);
         /* the unmasked CT run around the vertex (CT 0 = masked): never into or across it */
-        if (J->ct) {
+        int unmasked = 0;   /* (the scan's last points: the largest multiples of 0.5 the loops below reach; P itself between them) */
+        if (J->ct) { const double tf = floor((thi + 1e-9) * 2) / 2, tb = floor((-tlo + 1e-9) * 2) / 2, sf = tf >= 0.5 ? tf : 0, sb = tb >= 0.5 ? tb : 0;
+                     const double qf[3] = {P[0], P[1] + sf * u[1], P[2] + sf * u[2]}, qb[3] = {P[0], P[1] - sb * u[1], P[2] - sb * u[2]};
+                     unmasked = wsn_nozero(J->ct, qb, qf) && wsn_nozero(J->ct, P, P); }
+        if (J->ct && !unmasked) {
             double q[3] = {P[0], P[1], P[2]};
             if (wsn_near(J->ct, q) <= 0) { tlo = thi = 0; w->rs[r].nm++; }
             else {
