@@ -38,6 +38,18 @@ Pod 2 state (2026-11-11, after the disk filled to 100 % beside the 4.8 um relabe
 June, 0139 and 0500P2 only (mksources.sh adds July only when `gt/paris4/phaseB` exists). Rebuilding July needs `p4kit.sh` from the
 codes step (~14 min at T=4) and ~60 GB more disk.
 
+Pods 1 and 2 terminated (2026-11-11 evening; replaced by one RTX PRO 6000 96 GB pod, 500 GB disk). Saved on the desk: fibhv-b / c / d
+runs (all snapshots, logs, sources) under `/vesuvius/ufsm/fibers/runs`; pod 2's fibre work under `/vesuvius/ufsm/fibers/pod2`
+(fibp4 complete, fibd evals, the pod scripts and logs); the B1 Paris 4 4.8 phase, partial (below). **Lost, rebuild on the new pod:**
+- the kit itself (`datakit.sh`: segments, seeds, codes, phase), and all fibre label rasters (fibhv-d's 79 GB: `scripts/fibers/mklabels3.sh`
+  from the .afv files, which are public downloads);
+- the Paris 4 official-prediction trace `trp4` (`trp4b.sh`, 192-slice chunks): only 11 of its 50 chunks (z 0..2111) had been written
+  before pod 2's disk filled (c2304..c9408 failed with ENOSPC); those 11 are on the desk in `fibers/pod2/trp4`. Rerun the rest with
+  `fiber-trace --gpu` when the fibre teacher needs it;
+- the Paris 4 June 4.8 um codes (`codesA48`, 43 GB, `raster --level 1`; scripts/univ/b1_pod_p4A.sh up to the codes step).
+- Stored 4.8 um phase sets are retired (the sampler computes the phase from the codes on the fly, univA): the Paris 4 June set stays at
+  316 of its 549 packed 9.6 shards complete on the desk; mksources_univ.py holds out the other 233.
+
 ## Not covered
 
 - PHerc1667 GT (only the wbench 1667 boxes need it; its 10-16 codes at 4.798 um and phase came from a pre-10-19 pipeline). Copy the

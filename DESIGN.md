@@ -38,6 +38,22 @@ fibre labels when the draws took every papyrus cell. UFSM_FIBRE_EXTENT=0: the CT
 projection 0: neutral), its Adam / Muon state and EMA reset; one-shot by step (a resume from any other step keeps the stem). For u1
 after univI's fstem forward fix (the forward covered only x mod 256 < 64 of each row; the backward every block): the trunk and heads
 are kept, the stem restarts. test_univ2 checks the reset and that a later resume does not repeat it.
+## B1 4.8 um phase rasters: what was built before the switch to on-the-fly phase (2026-11-11, branch fibd-20261111)
+
+Workstream B1 rasterised the band phase at 4.8 um (`phase-raster --gs 2 --pair 1 --radius 160`, GPU, byte-identical to the CPU path;
+32 shards in 17 s, ~5x the 9.6 bytes). Done: PHerc1667 A / B over the whole scroll (77 / 64 min, 46 / 50 GB). Paris 4 June A was
+limited to the packed shards (spacing < 150 um share >= 0.625: 549 of the 9.6 phaseA shards, 339 boxes) and ran on pod 2's GPU:
+the first run outpaced the desk pull and filled the pod disk (130 boxes lost to ENOSPC); with a box ledger and a disk cap it reached
+280 / 339 boxes before the pod was terminated, ~500 shards still in flight. On the desk: 2998 4.8 shards, 107 GB; 316 of the 549
+packed 9.6 shards are complete. Then the user decided that the sampler computes the winding phase from the codes on the fly (univA),
+so no further stored phase sets are built and the missing boxes are not planned. `scripts/univ/mksources_univ.py` keeps the partial
+Paris 4 set as `PHercParis4-june48` with `"partial": true`, weight 0.2 x 316/549, and a holdout file (`p4A48.holdouts.json`: the wbench
+boxes first, then the 233 incomplete 9.6 shards as 2048^3 level-0 boxes) so no window touches a missing region; the ledger is
+`scripts/univ/p4A48.boxes.ok`. All stored 4.8 entries are replaced by the "onfly" source key when it lands.
+
+Update (same day): onfly is on master; 1667 A48 / B48 and Paris 4 June 48 (codesA48 rebuilt on the desk in 1352 s, 43 GB; phase on a
+check tile byte-identical to the pod's stored shards, 8 / 8) are onfly entries, Paris 4 over the whole scroll. The fibre-only entries
+use the onfly fibre planes (afv + the mklabels2 / mklabels3 recipes), so the fibhv-d rasters are not rebuilt.
 
 ## The fibre H / V planes on the fly from the polylines (2026-11-11, branch univ-20261111)
 
