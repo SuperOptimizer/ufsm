@@ -217,6 +217,7 @@ typedef struct {
     uint8_t *vok;            /* B: 1 where the window has a view crop */
     uint8_t *tm;             /* cfg.pack_tm: B x P^3 codes (bit 0: target 0 = 255, bit 1: target 1 = 255, bit 2: mask), t / m nullptr */
     int xch;                 /* input channels stored per sample in x / x16 (4, 5 with aux, 7 with cond, 1 with gpu_input) */
+    void **mil0; int *nmil0;   /* cfg.ink_mil: the same rays on the source grid (before the symmetry / warp), re-mapped by --replay's re-drawn geometry */
     void **mil; int *nmil;   /* cfg.ink_mil: per window its inkray list (malloc'd, kept with the slot) and count; source-grid window voxels, held-out boxes + guard dropped */
     int8_t *emb;             /* cfg.emb_ch: B x emb_ch x (Pz / emb_div) x (P / emb_div)^2 feature targets (int8 x 127 unit vectors, channel planes; a cell
                                 with all channels 0 has none) */
