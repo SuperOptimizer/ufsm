@@ -98,6 +98,33 @@ down, so the numbers below come from commit messages only:
   - Logged as `ink-ssl L (gated % of the cells, ink % of the gated)`.
   - test_ssl (5): targets and gradient against the host. test_heads (8e): a fixture run with the ink head.
   - Not with UFSM_SSL_SLABS=1 (the term rides on the skip path).
+- `--ssl-heads LIST` (11-12, user: "can we dino for all things the universal model supports"; c8eaa09) generalises `--ssl-ink` to
+  every head that a self-trained target can be checked for. `--ssl-ink W` is now `ink:W`, and its log marker is ` ssl-ink`.
+  - The same mechanism: the teacher's coarse head per chunk of cell planes, targets round(254 p) per enabled channel and cell
+    (255 = none) at the cells the student sees, the student's soft BCE on its own coarse logits in the skip path. One target
+    kernel and one gradient kernel over a per-head spec (`nn_sslh_targets` / `nn_sslh_grad`, ssl.h), replacing the ink pair.
+  - Gates per head (thresholds are flags):
+
+    | head (channels) | gate | papyrus |
+    |---|---|---|
+    | ink (11), dens (8), fib H / V (14-15) | each channel where \|p - 0.5\| >= `--ssl-conf` 0.3 (ink: `--ssl-ink-conf`) | yes |
+    | rv (12-13) | the same | no (papyrus vs void is what rv learns) |
+    | normal n n^T (2-7) | all six where \|N\|_F >= `--ssl-norm-conf` 0.8, N from the head's coding (1 for a clean unit dyad) | yes |
+    | phase cos / sin (0-1) | the pair where \|(2c - 1, 2s - 1)\| >= `--ssl-phase-conf` 0.7 | yes |
+
+    The papyrus gate is the teacher's (max of the rv pair >= 0.5, so --rv 2), `--ssl-pap 0` drops it (tests).
+  - Not self-trained: wind4 (its integer gauge is exactly what self-training cannot validate) and the fibre axis (rare, noisy
+    where wrong). No symmetry-agreement pass for the normals in v1: it would cost a second teacher forward per SSL window.
+  - Weights `name:W`, default `--ssl-heads-w` 0.25; per head W x the mean BCE over its targeted entries. Logged per head as
+    ` ssl-<head> L (g% gated)`.
+  - Default: none on. A head is self-trained only after it beats its reference teacher, else the term reinforces its errors.
+  - Memory: a byte per enabled channel and cell (16.8 MB per channel at P 1024), now counted by the planner (the old ink buffer
+    was not).
+  - Tests (GPU pending): test_ssl (5) every mode in one spec vs the host (targets, counts, gradient against the formula and central
+    differences, per-head sums) at two normal thresholds; test_heads (8e) the `--ssl-ink` alias, (8f) five heads at confidence 0
+    finite and covering 30-90 % of the cells, a missing head refused.
+  - Measurement: a paired short run with / without `--ssl-heads` from the same snapshot (wbench p05x, rv, the 34 ink crops, the
+    fibre judge), gated on unissl's 2000 / 4000 wbench rows showing the trunk term neutral or better.
 - Holdouts: inkB added the 10 extra crops to holdouts-ink.json ("inkeval-ho", 98 boxes), on the 0500P2 2.215 um and 0841 2.403 um
   scans. Those two volumes reject 5 / 6 boxes. `EXCLVOL` leaves out 0841's 9.366 um scan (the boxes are not mapped into it) and
   0500P2's 9.362 um scan (a labelled source already), so 35 unlabelled volumes remain.
