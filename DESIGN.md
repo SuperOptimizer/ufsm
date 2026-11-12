@@ -6,6 +6,41 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## The pooled codes views on the device: k_codes_pool2 (2026-11-12, branch gpupool-20261112)
+
+The coarser rungs read their codes through codes_pool2_open views (sources.c onfly_codes_open: the source's codes pooled 1-3 times for
+the 9.6 / 19.2 um rungs, or when a CT level has no raster). Those views could not give tile_gpu raw chunks. So every tile on such a rung
+was decoded and pooled on the CPU, and only the pair rule ran on the GPU. perf's pod profile (P 1024, replay 3): 17-31 of 50-88 tiles
+per run went this way, at 7.5-11 s per read.
+
+- tile_gpu follows the pooled views (codes_pool2_open now passes a tag ctx) down to the stored codes. It packs the base chunks of the
+  2^k box. nn_band.cu then decodes them on the device into a base buffer (8^k the tile's voxels, capped at 2x the --onfly-mb budget,
+  else the CPU path) and pools k times (k_codes_pool2, ping-pong buffers) before the pair rule or the crop.
+- codes_pool.h cp_pool8 is the one pooling for the host (codes_pool2_box, phase-raster --gs 4) and the device. The circular mean's
+  rounding was lround(atan2(y, x) / 2 pi x 252), and glibc's atan2 has no device twin. It is now a bin search on the sign of
+  cross(edge_m, v), where edge_m is the bin edge's unit vector as floats. Float x float products are exact in double, so each sign is
+  exact and the same with or without FMA. Codes 253 / 254 (not codes) now pool as a conflict; before, they read past the cos / sin of
+  the 252 codes.
+- Change vs atan2: test_lldec's fixture (sheet codes with exact k / k+1 ties) differs in 31319 of 1818498 coded voxels (1.7%), every one
+  by one step, at the ties. None differ by more than one step or in empty / conflict. The derived-phase cache key of pooled mesh codes
+  gets a "b" ("<key>-pool1b"), so old disk entries are not mixed in.
+- The derived phase target (the label) is unchanged in both cases measured: phase-raster --gs 4 --pair 1 (the pair rule on the 2x-pooled
+  codes, what the 9.6 / 19.2 um rungs train on), master vs this branch, compared voxel by voxel:
+  - PHerc1667 codesA 4.798, a 512^3 box at 9.6 um (7424,896,2048), radius 160: 87,348,987 known voxels in both, 0 known-status changes,
+    0 phase changes;
+  - the make_wind_fixture codes (fx/band 1, the test_phase_onfly fixture), radius 48: 129,158 known, 0 status changes, 0 phase changes.
+  The tie moves fall where the pair rule reads only the codes' winding parity and sheet positions, which a one-step move does not change.
+  So the coarse-rung labels match u1's on these boxes; pooled codes differ only at exact ties.
+- Caches that derive from pooled codes: only the onfly phase dcache (sources.c onfly_phase_of, keyed "<mesh codes key>-pool<n>b"; stored
+  codes are not cached). Mesh packs (UFSM_MESHCODES_CACHE) hold the unpooled rasters, and inksplat's cache is keyed on the ink inputs,
+  so neither is affected. Stored arrays written by codes-pool2 / phase-raster --gs 4 before this change are data, not caches: they keep
+  the atan2 rounding at ties.
+- Tests: test_lldec adds pools 1 / 2 / 3 over the 5 boxes (device == codes_pool2_box, 0 differing voxels in every box) and the atan2
+  comparison. test_phase_onfly's pooled GPU run (== phase-raster --gs 4) now also requires every tile decoded on the GPU. test_phase_pool,
+  test_mesh_phase, test_band_pair and test_unwrap2_sampler pass.
+- Desk bench (GPU 1, PHerc1667 codesA 4.798 pooled once, rmax 40, P 512, 3 windows, 1 slot, 1024 MB budget): master 4417 ms / window
+  (codes read 3930 ms on 8 CPU threads, 0 of 24 tiles on the GPU); this branch 777 ms / window (0 ms codes read, 24 of 24 on the GPU).
+
 ## Sources that silently drop out: --strict-sources and relative-scale groups (2026-11-12, branch strictsrc-20261112)
 
 The u1 P 1024 restart (step 10453) ran its first 315 steps with no PHerc1667 windows (14.9 + 7.5 + 7.5 = 29.9% of the weight): the local
