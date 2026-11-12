@@ -2,6 +2,7 @@
 # scripts/latdino/ssl-sources.sh IN.json OUT.json [SHARE]: IN's sources plus one unlabelled ("ct_only": 1) source per CT volume in
 # $CTROOT (default /vesuvius/ufsm/v2/ct) for train --ssl (DESIGN 2026-11-12 "Self-supervision for the latent net").
 # - EXCL (default PHerc0175A): scrolls left out entirely (the strict unseen control).
+# - EXCLVOL (below): single volumes left out.
 # - Every box of $HOLD (default /vesuvius/ufsm/inkgt/holdouts-ink.json: the wbench boxes + the ink eval crops) on that CT rejects
 #   training windows ("holdout_reject": all names): an unlabelled window has no labels to mask, so held-out CT is never drawn.
 # - Levels as the labelled sources: scans finer than 3 um at levels 2..3 (9.6 / 19.2 um), the 7.9-9.4 um scans at 0..1.
@@ -11,11 +12,15 @@
 set -euo pipefail
 IN=${1:?IN.json}; OUT=${2:?OUT.json}; SHARE=${3:-0.25}
 CTROOT=${CTROOT:-/vesuvius/ufsm/v2/ct}; HOLD=${HOLD:-/vesuvius/ufsm/inkgt/holdouts-ink.json}; EXCL=${EXCL:-PHerc0175A}
+# EXCLVOL: volumes left out because held-out boxes of their scroll are given on another scan of it and not mapped into this one
+# (0841: the 10 ink eval crops are on the 2.403 um scan; 0500P2's 9.362 um scan is a labelled training source already)
+EXCLVOL=${EXCLVOL:-PHerc0841/20250821151531-9.366um-1.2m-113keV-masked.zarr PHerc0500P2/20250820143440-9.362um-1.2m-113keV-masked.zarr}
 tmp=$(mktemp); trap 'rm -f $tmp' EXIT
 n=0
 for vol in "$CTROOT"/PH*/*.zarr; do
   scroll=$(basename "$(dirname "$vol")"); key=$scroll/$(basename "$vol")
   case " $EXCL " in *" $scroll "*) continue;; esac
+  case " $EXCLVOL " in *" $key "*) echo "skip $key: EXCLVOL" >&2; continue;; esac
   [ -e "$vol/zarr.json" ] || { echo "skip $key: no zarr.json (an incomplete local copy)" >&2; continue; }
   um=$(basename "$vol" | sed -n 's/^[0-9]*-\([0-9.]*\)um-.*/\1/p'); [ -n "$um" ] || { echo "skip $key: no voxel size in the name" >&2; continue; }
   if awk -v u="$um" 'BEGIN{exit !(u < 3)}'; then lo=2; hi=3; else lo=0; hi=1; fi

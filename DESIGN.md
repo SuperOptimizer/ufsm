@@ -52,7 +52,7 @@ down, so the numbers below come from commit messages only:
 - The full-resolution head slabs and label streams are skipped on these windows, and the task heads get no gradient from them.
 - The fine stem does not reach level 1, so the voxel path cannot leak masked cells.
 
-**Implemented (8fd3e66, 34e31e5; GPU tests not yet run).** Differences from the plan above:
+**Implemented (8fd3e66, 34e31e5).** Differences from the plan above:
 - Unlabelled sources are the existing `"ct_only": 1` kind (the 10-25 distill plumbing), not a new "ssl" key. A GPU-free sampler-only
   run (unwrap2 --lat, P 256, 80 batches) drew windows from every one of the 37 generated volumes that had a local zarr.json, with phase
   known 0.000. The generator is `scripts/latdino/ssl-sources.sh` (PHerc0490B and PHercParis3 skipped: incomplete local copies). 0841
@@ -71,6 +71,17 @@ down, so the numbers below come from commit messages only:
     whole loss and its gradient against double central differences.
   - test_heads (8): --ssl without a ct_only source logs exactly lat_plain's losses; with a ct_only copy at share 0.5, finite ssl
     terms and targeted shares of 10-75%; the header and a resume.
+- GPU results (11-12, desk GPU 0, 5060 Ti):
+  - test_ssl PASS: mask 0 bytes differ in fp16 and fp32 (24576 of 73728 voxels masked at ratio 0.4); targets 0 bytes differ (104
+    of 240 cells); loss 0.843316 vs host 0.843315; gradient worst error 3.6e-9 of max 7.3e-3.
+  - test_heads ok: the 7 old layouts log the reference losses, and (8) passes.
+  - Fixture run (P 64, --ssl 8, share 0.5, 12 steps): 8 unlabelled windows. The targeted share equals the masked share of the CT
+    channel on every check (34-47 % at mask 0.4). The ssl cosine falls 0.330 -> 0.130, the hinge 0.048 -> 0.027, and the
+    per-dimension std of the unit rows stays 0.31-0.34 (gamma 0.354): no collapse at fixture scale. Labelled steps log their usual
+    terms.
+- Holdouts: inkB added the 10 extra crops to holdouts-ink.json ("inkeval-ho", 98 boxes), on the 0500P2 2.215 um and 0841 2.403 um
+  scans. Those two volumes reject 5 / 6 boxes. `EXCLVOL` leaves out 0841's 9.366 um scan (the boxes are not mapped into it) and
+  0500P2's 9.362 um scan (a labelled source already), so 35 unlabelled volumes remain.
 
 **Code.**
 - Sources take `"ssl": 1` (CT only, no targets; `holdout_reject` for the wbench boxes).
