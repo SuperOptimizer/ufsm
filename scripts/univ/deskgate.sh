@@ -12,7 +12,7 @@
 # it is gone: both cards are in use).
 set -u
 CK=$(readlink -f "${1:?ckpt}"); T=${2:?tag}; PART=${3:?w1|w2|base}
-H=$(cd "$(dirname "$0")/../.." && pwd); WB=/vesuvius/ufsm/wbench; LB=${LB:-/vesuvius/ufsm/v2/lat/latres}
+H=${H:-$(cd "$(dirname "$0")/../.." && pwd)}; WB=/vesuvius/ufsm/wbench; LB=${LB:-/vesuvius/ufsm/v2/lat/latres}
 UP=${UP:-/home/forrest/ufsm-eval6b7/build/ufsm}; M=https://dl.ash2txt.org/community-uploads/forrest/volcomp
 P4K=PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr; WINMIN=${WINMIN:-45}; GPUS=${GPUS:-0 1}
 Q=$LB/gate-$T-$PART.q; MC=""; [ -x ~/bin/memcap ] && MC="$HOME/bin/memcap -m 24G"; LG=$LB/gate-$T.log; EQB=${EQB:-139-1 139-2 814-1 814-2}
