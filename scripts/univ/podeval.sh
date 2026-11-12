@@ -5,9 +5,11 @@
 # given here (TASKS, DLVS, WZARGS, WIN, HALO, INKP, FIBCH, ...: every eval.sh variable set in this environment is passed through), then copies
 # the wbench rows (K/wb/res/TAG*.tsv) and the matrix back next to the desk's (/vesuvius/ufsm/wbench/{res,univ}). POD="HOST PORT" (pod 2).
 set -u
-CK=$(readlink -f "${1:?ckpt}"); T=${2:?tag}; PB=${3:-}; read -r HOST PORT <<< "${POD:-root@213.173.107.10 27064}"; K=${K:-/workspace/ue}
+CK=${1:?ckpt}; T=${2:?tag}; PB=${3:-}; read -r HOST PORT <<< "${POD:-root@213.173.107.10 27064}"; K=${K:-/workspace/ue}
 E="ssh -p $PORT -i $HOME/.ssh/id_ed25519 -o BatchMode=yes"; WB=/vesuvius/ufsm/wbench
-rsync -aL -e "$E" $CK $HOST:$K/ckpt/$T.ckpt < /dev/null || exit 1
+# CKPT "pod:PATH": a checkpoint already on the pod (a pod-trained run's snapshot), copied there, nothing uploaded
+if [ "${CK#pod:}" != "$CK" ]; then $E $HOST "cp -p ${CK#pod:} $K/ckpt/$T.ckpt" < /dev/null || exit 1
+else CK=$(readlink -f "$CK"); rsync -aL -e "$E" $CK $HOST:$K/ckpt/$T.ckpt < /dev/null || exit 1; fi
 UPV="RVU=$K/ufsm/build/ufsm"; [ -n "${PODBIN:-}" ] && UPV="UP=$PODBIN RVU=$PODBIN"; [ -n "$PB" ] && { rsync -aL -e "$E" $PB $HOST:$K/ckpt/$T.bin < /dev/null || exit 1; UPV="UP=$K/ckpt/$T.bin RVU=$K/ckpt/$T.bin"; }
 PASS=""; for v in TASKS DLVS WZARGS WIN HALO INKP FIBCH LV_INK RVSC REFS THREADS INKC INKGT; do [ -n "${!v+x}" ] && PASS="$PASS $v='${!v}'"; done
 $E $HOST "cd $K/ufsm && git pull -q --ff-only; env SITE=pod K=$K WB=$K/wb GPU=${PODGPU:-0} INKW=$K/ckpt/ckpt_78k_fullsup.pth FIBPH=$K/wbgt/paris4-wind-20261019 CTR=https://dl.ash2txt.org/community-uploads/forrest/volcomp VOLP=volumes/ CNT=$K/count RVGT=$K/wbgt RU=$K/ufsm/build/ufsm RVE=$K/rv/eval LOCK= TH=8 $UPV $PASS \
