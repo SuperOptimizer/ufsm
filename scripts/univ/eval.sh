@@ -23,11 +23,23 @@ GPU=${GPU:-1}; THREADS=${THREADS:-8}; REFS=${REFS:-wind96 lat-wz896-12000}; DLVS
 FIBCH=${FIBCH:-}; INKP=${INKP:-}; LKF=${LKF:-}; mkdir -p $E/$T
 MC=""; [ -x ~/bin/memcap ] && MC="$HOME/bin/memcap -m 40G"   # (pods have no memcap: the pod cgroup caps them)
 lk() { if [ -n "$LKF" ]; then flock $LKF "$@"; else "$@"; fi; }   # LKF=/tmp/gpu1-bench.lock: serialise with timing benches
+# lkg: one GPU call of this script (ink / fibre predicts). On the pod's shared GPU ($K/GPU.md) it is one shared unit inside the window;
+# wbench and rv wait per predict themselves (site-pod.env RUN, rv/eval.sh), so a whole wbench row is never one unit.
+lkg() { if [ -n "${K:-}" ] && [ -d $K/gpu.shared ]; then
+    while [ -e $K/gpu.pause ] || [ $((10#$(date +%M))) -ge $([ -e $K/gpu.gate-waiting ] && echo 35 || echo 15) ]; do sleep 5; done
+    touch $K/gpu.shared/eval-$$; "$@"; local rc=$?; rm -f $K/gpu.shared/eval-$$; return $rc; else lk "$@"; fi; }
 log() { echo "$(date '+%m-%d %H:%M:%S') $*" | tee -a $E/$T.log; }
 wb() {   # wb TAG [env...]: one wbench run (memcap, GPU lock)
-  local t=$1; shift; lk env SITE=$SITE WB=$WB GPU=$GPU SLABS=0 THREADS=$THREADS "$@" $MC bash $H/scripts/wbench/wbench.sh $CK $t >> $E/$T/wbench_$t.out 2>&1; }
+  local t=$1; shift; lk env SITE=$SITE WB=$WB GPU=$GPU SLABS=0 THREADS=$THREADS $([ ${PREDONLY:-0} = 1 ] && echo PHASE=predict) "$@" $MC bash $H/scripts/wbench/wbench.sh $CK $t >> $E/$T/wbench_$t.out 2>&1; }
 has() { [[ " $TASKS " == *" $1 "* ]]; }
-log "univ eval $T ckpt $CK tasks [$TASKS]"
+export PREDONLY=${PREDONLY:-0}; [ $PREDONLY = 1 ] && FIB=0
+# TWOPHASE=1 (the pod's GPU window, 2026-11-12): first every predict of the eval back to back (this script with PREDONLY=1: wbench
+# PHASE=predict, rv predicts, ink predicts; fields and volumes stay on disk), then the plain run, which finds them and only fits / scores.
+PO=${PREDONLY:-0}
+if [ "${TWOPHASE:-0}" = 1 ] && [ $PO = 0 ]; then tp=$(date +%s); log "gpu phase: all predicts"; PREDONLY=1 bash $0 "$@"; log "gpu phase done in $(( $(date +%s) - tp )) s (queue waits included); fits and scores"
+  # the resident trainer's rate during the fits (lead's condition: fits beside U2 must cost it < 10% of 0.72 samp/s / 776 Mvox/s)
+  RL=${RESLOG:-/workspace/univA/u2.log}; [ -s $RL ] && wc -l < $RL > $E/$T/reslog.line; fi
+[ $PO = 1 ] || log "univ eval $T ckpt $CK tasks [$TASKS]"
 
 has wind && [ "${WIND:-1}" = 1 ] && { log "wind: wbench core"; wb $T BOXES=core; }
 if has dlv && [ "${WIND:-1}" = 1 ]; then for d in $DLVS; do log "dlv $d"; wb $T-dlv$d BOXES=core DLV=$d P4ROOT=$M P4V=$P4K; done; fi
@@ -52,7 +64,7 @@ if has fib && [ "${FIB:-1}" = 1 ] && [ -n "$FIBCH" ]; then   # FIBCH e.g. "H=0 V
   o=$E/$T/fib; mkdir -p $o; BOX=12288,4096,3584,512,576,768; J="--um 2.4 --level 2 --slab 12288,512 --region 4096,4608,3584,4352 --tile 256 --d-mm 0.3,0.6,1.2,2.4"
   for kv in $FIBCH; do n=${kv%%=*}; cs=${kv#*=}; a=${cs%-*}; b=${cs#*-}
     for ch in $(seq $a $b); do d=$o/$n; [ $n = dyad ] && d=$o/dyad/c$ch; [ -e $d/9.6/zarr.json ] && continue
-      lk ${UP:-$U} predict $CK $M $P4K $d --um 2.4 --level 2 --box $BOX --channel $ch --gpu $GPU --threads 6 --cache $WB/cache > $o/predict_c$ch.log 2>&1 || log "fib: predict c$ch failed"; done; done
+      lkg ${UP:-$U} predict $CK $M $P4K $d --um 2.4 --level 2 --box $BOX --channel $ch --gpu $GPU --threads 6 --cache $WB/cache > $o/predict_c$ch.log 2>&1 || log "fib: predict c$ch failed"; done; done
   for f in H V; do [ -e $o/$f/9.6/zarr.json ] || continue; for m in tube dyad; do x=""; [ $m = dyad ] && { [ -d $o/dyad ] || continue; x="--dyad $o/dyad"; }
     [ -s $o/$f-$m.judge ] && continue
     nice -n 10 $U fiber-trace - - $o/$f-$m.fib --mask $o/$f 9.6 --mask-origin 12288,4096,3584 --box $BOX --scaledown 2 --family $f --half 1024 --min-len 48 --threads 4 $x > $o/trace_$f-$m.log 2>&1
@@ -62,6 +74,9 @@ fi
 if has ink && [ "${INK:-1}" = 1 ] && [ -n "$INKP" ]; then   # INKP = ink3dext | heads (predict --heads ink: latent nets) | ch:N (channel N of CKPT, ink at 2.4 um level LV_INK (default 1 = 4.8 um))
   # crop sets: the 16 Paris 4 crops ($WB/inkeval/crops) + INKC (inkB's held-out 0139 / 1667 crops; crops.tsv cols 6-7 = scroll, CT key; um in crop.json).
   # INKGT: 3-D ink-splat references <crop>.zarr (inkB, ink-splat --face): each crop is also scored voxelwise (ink-vscore -> vscores.tsv).
+  # crop boxes are level-0 voxels; predict --box is in voxels of --level, and --full-grid 1 writes the store in whole-volume coordinates
+  # (what ink-vscore and the crop surfaces index). Without both, the 2026-11-12 smoke test read air and wrote a box-relative store.
+  lbox() { python3 -I -c "import sys; b = [int(v) for v in sys.argv[1].split(',')]; f = 1 << int(sys.argv[2]); print(','.join(str(v) for v in [b[0] // f, b[1] // f, b[2] // f, -(-(b[0] + b[3]) // f) - b[0] // f, -(-(b[1] + b[4]) // f) - b[1] // f, -(-(b[2] + b[5]) // f) - b[2] // f]))" $1 $2; }
   o=$E/$T/ink; mkdir -p $o; [ -s $o/scores.tsv ] || : > $o/scores.tsv; [ -s $o/vscores.tsv ] || : > $o/vscores.tsv
   for C in $WB/inkeval/crops ${INKC:-}; do [ -s $C/crops.tsv ] || continue
   grep -v '^#' $C/crops.tsv | while IFS=$'\t' read -r cr seg ns fi box scr ctk; do
@@ -70,13 +85,14 @@ if has ink && [ "${INK:-1}" = 1 ] && [ -n "$INKP" ]; then   # INKP = ink3dext | 
     grep -qP "^$cr\t" $o/scores.tsv && [ $vs = 0 ] && continue
     v=$o/vol_${scr:-PHercParis4}
     if [ "$INKP" = ink3dext ]; then lvi=1; key=$(python3 -I -c "print(round($um * 2, 3))")
-      lk $U ink3d-ext --model dino3d --weights ${INKW:-/vesuvius/ufsm/teachers/dino3d/ckpt_78k_fullsup.pth} --ct $M $ctk/0 --ct-um $um --box $box --surface $C/$cr --out $v --out-um 4.8 --gpu $GPU --cache $WB/cache > $o/ink_$cr.log 2>&1 || { log "ink: $cr predict failed"; continue; }
+      [ -e $o/pred_$cr.done ] || lkg $U ink3d-ext --model dino3d --weights ${INKW:-/vesuvius/ufsm/teachers/dino3d/ckpt_78k_fullsup.pth} --ct $M $ctk/0 --ct-um $um --box $box --surface $C/$cr --out $v --out-um 4.8 --gpu $GPU --cache $WB/cache > $o/ink_$cr.log 2>&1 || { log "ink: $cr predict failed"; continue; }
     elif [ "$INKP" = heads ]; then lvi=${LV_INK:-1}; key=$(python3 -I -c "print(round($um * 2 ** $lvi, 3))")   # predict --heads ink: the latent-grid
       # multi-head path (fine stem rows + sub-cell placement as trained; the ink channel from the header), written to $v.h/ink, read through $v
       [ -e $v ] || ln -sfn $(basename $v).h/ink $v
-      lk ${UP:-$U} predict $CK $M $ctk $v.h --um $um --level $lvi --box $box --heads ink --gpu $GPU --threads 6 --cache $WB/cache > $o/ink_$cr.log 2>&1 || { log "ink: $cr predict failed"; continue; }
+      [ -e $o/pred_$cr.done ] || lkg ${UP:-$U} predict $CK $M $ctk $v.h --um $um --level $lvi --box $(lbox $box $lvi) --full-grid 1 --resume 1 --heads ink --gpu $GPU --threads 6 --cache $WB/cache > $o/ink_$cr.log 2>&1 || { log "ink: $cr predict failed"; continue; }
     else lvi=${LV_INK:-1}; ch=${INKP#ch:}; key=$(python3 -I -c "print(round($um * 2 ** $lvi, 3))")
-      lk ${UP:-$U} predict $CK $M $ctk $v --um $um --level $lvi --box $box --channel $ch --gpu $GPU --threads 6 --cache $WB/cache > $o/ink_$cr.log 2>&1 || { log "ink: $cr predict failed"; continue; }; fi
+      [ -e $o/pred_$cr.done ] || lkg ${UP:-$U} predict $CK $M $ctk $v --um $um --level $lvi --box $(lbox $box $lvi) --full-grid 1 --resume 1 --channel $ch --gpu $GPU --threads 6 --cache $WB/cache > $o/ink_$cr.log 2>&1 || { log "ink: $cr predict failed"; continue; }; fi
+    touch $o/pred_$cr.done; [ $PO = 1 ] && continue
     if [ $vs = 1 ]; then gk=$(ls $g | grep -vE '^(segments|zarr.json)$' | head -1)
       $U ink-vscore --gt $g $gk --pred $v $key --box $box --level $lvi --row $cr --threads 8 2>> $o/vscore_$cr.log | grep -P "^$cr\t" >> $o/vscores.tsv; fi
     grep -qP "^$cr\t" $o/scores.tsv && continue
@@ -87,12 +103,13 @@ for a in 'xyz':
     v = tifffile.imread(os.path.join(src, a + '.tif')).astype(np.float32); tifffile.imwrite(os.path.join(dst, a + '.tif'), np.where(v >= 0, (v + 0.5) / f - 0.5, -1).astype(np.float32))
 shutil.copy(os.path.join(src, 'meta.json'), dst)
 PY
-    nice -n 5 $U render $s/w $s/r --volume $v $key --depth 4 --threads 8 --cache $WB/cache > $o/render_$cr.log 2>&1 || { log "ink: $cr render failed"; continue; }
+    lkg nice -n 5 $U render $s/w $s/r --volume $v $key --depth 4 --threads 8 --cache $WB/cache > $o/render_$cr.log 2>&1 || { log "ink: $cr render failed"; continue; }
     mp=$(ls $s/r/*.tif 2>/dev/null | grep -v _fill | head -1); [ -n "$mp" ] || { log "ink: $cr no render"; continue; }
     $U ink-score --surface $C/$cr --labels $C/$cr/labels.tif --mask $C/$cr/mask.tif --map ink=$mp --row $cr 2>> $o/score_$cr.log | grep -P "^$cr\t" >> $o/scores.tsv
   done; done
 fi
 
+[ $PO = 1 ] && exit 0
 # ---- matrix ----
 { echo "== univ eval $T  $CK  $(date)"
   ws() { $U wbench-stats $1 $2 --metric p05x,ids 2>&1 | grep -v label-noise | grep -E '^(p05x|ids) '; }
@@ -124,5 +141,8 @@ fi
       awk -F'\t' -v fc=$fc -v ac=$ac -v lab="${INKSEEN:-PHerc0500P2=unseen-ink-labels,seen-CT PHerc0841=unseen-scroll}" -v w=$fn 'BEGIN {n = split(lab, L, " "); for (i = 1; i <= n; i++) { split(L[i], kv, "="); D[kv[1]] = kv[2] } }
         { s = ($1 ~ /^w[0-9]/) ? "PHercParis4" : substr($1, 1, index($1, "_w") - 1); c[s]++; F[s] += $fc; A[s] += $ac }
         END { for (s in c) printf "%s per scroll %-12s %-28s n %2d auc %.4f f1best %.4f\n", w, s, (s in D) ? D[s] : "", c[s], A[s] / c[s], F[s] / c[s] }' $E/$T/ink/$fn.tsv | sort; done
+  if [ -s $E/$T/reslog.line ] && [ -s ${RESLOG:-/workspace/univA/u2.log} ]; then   # (step lines: '... X samp/s Y Mvox/s')
+    tail -n +$(( $(cat $E/$T/reslog.line) + 1 )) ${RESLOG:-/workspace/univA/u2.log} | grep -E '^ *step [0-9]+ .*samp/s' | awk '{ for (i = 2; i <= NF; i++) { if ($i == "samp/s") s = $(i - 1); if ($i == "Mvox/s") v = $(i - 1) } n++; S += s; V += v }
+      END { if (n) printf "-- resident trainer during the fits: %d step lines, %.3f samp/s (%.1f%% of 0.72), %.0f Mvox/s (%.1f%% of 776)\n", n, S / n, 100 * S / n / 0.72, V / n, 100 * V / n / 776 }'; fi
 } > $E/$T.matrix.txt
 log "matrix -> $E/$T.matrix.txt"

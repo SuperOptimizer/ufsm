@@ -77,8 +77,14 @@ predict() {   # predict OUTFIELDS z y x nz ny nx LOG [big]: fit fields of the bo
   # DLV (resolution test, 2026-11-11): predict at level LV+DLV (DLV -1: 4.8 um input for the 9.6 um boxes, -2: 2.4 um, +1: 19.2 um) with
   # the box in that level's voxels and --fit-h 2^(1-DLV), so the fit fields keep their 19.2 um cells and the fitter / codes are unchanged.
   pbox $2 $3 $4 $5 $6 $7 $lg || return 1
-  $run ${UP:-$U} predict $CK $R $V $f.tmp --box $b0,$b1,$b2,$b3,$b4,$b5 --fit-zarr $f $(pargs) ${lx:+--latents $lx} > $lg 2>&1; local rc=$?; rm -rf $f.tmp; return $rc
+  local rr vv; ctpick $lv $b0,$b1,$b2,$b3,$b4,$b5; echo "ct: $rr $vv level $lv" > $lg.root
+  $run ${UP:-$U} predict $CK $rr $vv $f.tmp --box $b0,$b1,$b2,$b3,$b4,$b5 --fit-zarr $f $(pargs) ${lx:+--latents $lx} > $lg 2>&1; local rc=$?; rm -rf $f.tmp; return $rc
 }
+ctpick() {   # ctpick LV b0,..,b5 [box ...]: rr vv = the local CT copy (LOCALCT, the desk, 2026-11-12; keys without volumes/) when ctcover.py finds
+             # every shard the predict can touch there (or absent from the mirror too: air), else R V. Same bytes either way (one codec).
+  local l=$1; shift; rr=$R vv=$V; [ -n "${LOCALCT:-}" ] && [ "$R" != "$LOCALCT" ] || return 0
+  local lk_=${V/\/volumes\//\/} bx; for bx in "$@"; do python3 -I $H/ctcover.py $LOCALCT $lk_ $R $V $l $bx > /dev/null 2>> $O/ctcover.log || return 0; done
+  rr=$LOCALCT vv=$lk_; }
 pbox() {   # pbox z y x nz ny nx LOG: the box in the predict level's voxels (b0..b5), that level (lv) and --fit-h (fh)
   # DLV (resolution test, 2026-11-11): predict at level LV+DLV (DLV -1: 4.8 um input for the 9.6 um boxes, -2: 2.4 um, +1: 19.2 um) with
   # the box in that level's voxels and --fit-h 2^(1-DLV), so the fit fields keep their 19.2 um cells and the fitter / codes are unchanged.
@@ -94,7 +100,7 @@ pargs() {   # the predict options every box of a scroll shares (after pbox: lv, 
 }
 pbatch() {   # PBATCH=1 (default): the fields of every box still to run, one predict --boxes process per scroll (the ~5 s start-up of a predict run
              # paid once per scroll, not per box; the same bytes as a process per box); per box its seconds in $O/BOX/pred.s
-  local B; for B in $BL; do rm -f $O/$B/pred.s; done   # (a pred.s is this run's only)
+  local B; for B in $BL; do [ -e $FD/$B/fields.json ] || rm -f $O/$B/pred.s; done   # (a pred.s is this run's only, or that of the PHASE=predict run whose fields these are)
   [ -n "$FIELDS" ] || [ "${PBATCH:-1}" != 1 ] && return 0
   local s nm z y x nz ny nx lv_ note n bf lg lx
   for s in $(for B in $BL; do awk -F'\t' -v b=$B '$1 == b {print $2}' $BT; done | sort -u); do
@@ -109,8 +115,8 @@ pbatch() {   # PBATCH=1 (default): the fields of every box still to run, one pre
       rm -rf $FD/$B $FD/$B.tmp; echo "$b0,$b1,$b2,$b3,$b4,$b5 $FD/$B.tmp --fit-zarr $FD/$B" >> $bf; echo $B >> $bf.names; n=$((n + 1))
     done
     [ $n = 0 ] && { rm -f $bf $bf.names; continue; }
-    log "$sc: $n boxes predicted in one process ($bf)"; lk
-    RUN ${UP:-$U} predict $CK $R $V - --boxes $bf $(pargs) ${lx:+--latents $lx} > $lg 2>&1 || log "$sc: predict --boxes failed ($lg; the boxes left run one by one)"
+    local rr vv; ctpick $lv $(cut -d' ' -f1 $bf); log "$sc: $n boxes predicted in one process ($bf; ct $rr $vv)"; lk
+    RUN ${UP:-$U} predict $CK $rr $vv - --boxes $bf $(pargs) ${lx:+--latents $lx} > $lg 2>&1 || log "$sc: predict --boxes failed ($lg; the boxes left run one by one)"
     ulk
     local i=0; while read -r B; do i=$((i + 1)); rm -rf $FD/$B.tmp
       grep -oE "predict --boxes: box $i done in [0-9.]+" $lg | awk '{print int($NF + 0.5)}' > $O/$B/pred.s; cp $lg $O/$B/pred.log; done < $bf.names
@@ -138,6 +144,7 @@ else BL=$BOXES; fi
 pbatch
 for B in $BL; do
   ulk
+  [ -n "${STOPAT:-}" ] && [ $(date +%s) -ge $STOPAT ] && { log "stop: the GPU window ends (STOPAT); $B and later boxes left for the next window"; break; }
   IFS=$'\t' read -r nm sc z y x nz ny nx lv note <<< "$(awk -F'\t' -v b=$B '$1 == b' $BT)"; [ -n "${nx:-}" ] || { log "no box $B"; continue; }
   grep -qP "^$TAG\t$B\t" $RES && { log "$B done"; continue; }
   scroll $sc || { log "$B: unknown scroll $sc"; continue; }
@@ -145,6 +152,8 @@ for B in $BL; do
   lk; t0=$(date +%s)   # (pred_s without the GPU queue wait)
   if [ -n "$FIELDS" ]; then [ -e $f/fields.json ] || { log "$B: no fields $f"; continue; }
   elif [ ! -e $f/fields.json ]; then rm -f $d/pred.s; predict $f $z $y $x $nz $ny $nx $d/pred.log || { log "$B predict failed"; continue; }; fi
+  # PHASE=predict (2026-11-12): only the predicts of the row (fields stay on disk); a later plain run fits and scores from them
+  [ "${PHASE:-}" = predict ] && continue
   t1=$(date +%s); ps=$((t1 - t0)); [ -s $d/pred.s ] && ps=$(cat $d/pred.s)   # (pbatch: the box's own seconds in the --boxes run)
   fitsc $f $d/fit $d/fit.log; t2=$(date +%s)
   ids0=$(num $(g_ids $d/fit.log))
