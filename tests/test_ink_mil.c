@@ -65,6 +65,17 @@ int main(void) {
             }
             free(g);
         }
+        {   /* bf16 logits / gradients (the --bf16 recipes): 3 slabs against the reference on bf16-rounded logits */
+            for (size_t k = 0; k < nv; k++) l16[k] = (float)(__bf16)lg[k];
+            double *g = calloc(nv, sizeof *g); const double L = ink_mil_loss_host(l16, g, D, H, W, R, NR, Rr, step, 0.5f, eps, sc), Ls0 = 0; double Ls = Ls0;
+            double gm = 0; for (size_t k = 0; k < nv; k++) if (fabs(g[k]) > gm) gm = fabs(g[k]);
+            if (!ink_mil_slab_hostmem(lg, 1, D, H, W, R, NR, Rr, step, 0.5f, eps, sc, 3, ga, &Ls)) {
+                long off = 0; for (size_t k = 0; k < nv; k++) off += fabs(ga[k] - g[k]) > 1e-2 * fabs(g[k]) + 1e-2 * gm;
+                fprintf(stderr, "mil soft bf16, 3 slabs: loss %.6f (full %.6f), %ld voxels off\n", Ls, L, off);
+                CHECK(fabs(Ls - L) < 1e-3 * fabs(L) && !off, "slab form bf16: loss %g vs %g, %ld off", Ls, L, off);
+            }
+            free(g);
+        }
         free(l16); free(ga); free(gb);
     }
     free(lg); free(R);

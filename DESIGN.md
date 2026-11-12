@@ -113,6 +113,17 @@ render + ink-score against the human labels.
 The 3-D and 2-D numbers agree to about 0.02, so the face-placed voxel GT ranks a teacher the way the 2-D labels do. 1667 is barely
 above the floor, which is the scan where human-GT training has the most to add. These are the numbers the U4 ink head has to beat.
 
+**The slab form (for head_slab_pass; option A).** The full-resolution logit of option B is 1.4-2.8 GB at P 896, so the loss runs on
+train's 32-plane fp16 / bf16 slabs instead, within the existing two passes:
+- fwd_slab (pass 0): each sample's corner terms inside the slab are added to its accumulator, so a sample is complete after the last
+  slab wherever the cuts fall.
+- fin (between the passes): pooling, BCE and smoothing turn the accumulators into dL/dz per sample. The per-ray losses are summed in
+  a fixed order.
+- bwd_slab (pass 1): the slab's (voxel, slot) corner terms are radix-sorted and each voxel's run is summed in slot order. There are
+  no float atomics into the gradient, so it is deterministic under --det.
+- test_ink_mil: 1, 3 and 7 slabs match the full-volume reference on the rounded logits (gradient error 9e-7 of 2.7e-3 soft, 3e-6 of
+  1.2e-2 hard; bf16 within 1 %), and a rerun gives identical bytes.
+
 **The villa ink recipe vs ours.** Read-only survey of ScrollPrize villa: vesuvius/ink_detection on main (the merged
 merge-ink-pipelines configs), plus the paris4-3d-gambiarra and distilled_3d_ink branches.
 
