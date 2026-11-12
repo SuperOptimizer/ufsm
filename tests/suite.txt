@@ -126,6 +126,7 @@ test_annot                                     |              |     2 | ./$B/tes
 test_sheetcut                                  |              |     1 | ./$B/test_sheetcut
 test_dino_loss                                 | gpu          |     1 | ./$B/test_dino_loss
 test_dino_loss~D=16                            | gpu          |     1 | UFSM_TEST_D=16 ./$B/test_dino_loss
+test_ssl                                       | gpu          |     1 | ./$B/test_ssl
 test_head32                                    | gpu          |     2 | ./$B/test_head32
 test_sslstat                                   |              |     1 | ./$B/test_sslstat
 test_attn                                      |              |   110 | ./$B/test_attn

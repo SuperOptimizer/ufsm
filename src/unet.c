@@ -1664,6 +1664,7 @@ void unet_set_lat_basis(unet *u, const float *bas, const float *gain, int C, flo
     nn_h2d(u->lat_bas, u->lat_hb, (size_t)C * 64 * 4); nn_h2d(u->lat_gain, u->lat_hg, (size_t)C * 4);
 }
 void unet_set_lat_step(unet *u, float step) { u->lat_run_step = step; }   /* this forward's quantiser step (training jitter); 0: the transform's own */
+float unet_get_lat_step(const unet *u) { return u->lat_run_step; }
 int unet_lat_basis(const unet *u, const float **bas, const float **gain, float *step) { if (u->lat_C) { *bas = u->lat_bas; *gain = u->lat_gain; *step = u->lat_step; } return u->lat_C; }
 int unet_logits_h16(const unet *u) { return u->built && u->logits_h16; }
 void unet_set_fp16_logits(unet *u, int on) {   /* takes effect at the next build */
