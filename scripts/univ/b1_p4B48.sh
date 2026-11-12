@@ -3,7 +3,7 @@
 # from the July meshes still on the desk (wbench/gtjuly/aws: 2026-11-11, no re-download needed): the 19.2 reference from the June 9.6 codes
 # (gtjuly/codesA, downsample --mode max), wind-assign of the July meshes in that gauge (the gtjuly build.sh flags; assign.jsonl checked
 # against gtjuly/qB and the 10-19 GT), then raster --level 1. Runs after B3's PHerc1299 chain (the dev memory slice). Out G/codesB48.
-set -u; H=$(cd "$(dirname "$0")/../.." && pwd); U=${U:-$H/build/ufsm}; T=${T:-12}
+set -u; H=$(cd "$(dirname "$0")/../.." && pwd); U=${U:-$H/build/ufsm}; T=${T:-8}
 J=/vesuvius/ufsm/wbench/gtjuly; G=/mnt/scratch/univ/b1/gt/paris4; SH=75784,32693,32693; UM=2.4; AX=/vesuvius/ufsm/teacher/axis-0.json
 step() { echo "== $(date +%T) $*"; }
 until ! pgrep -f "univ/b3_1299[.]sh" > /dev/null; do sleep 120; done
