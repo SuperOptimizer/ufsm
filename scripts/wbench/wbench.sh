@@ -79,7 +79,12 @@ predict() {   # predict OUTFIELDS z y x nz ny nx LOG [big]: fit fields of the bo
     if [ $dl -lt 0 ]; then local m=$((1 << -dl)); b0=$((b0 * m)) b1=$((b1 * m)) b2=$((b2 * m)) b3=$((b3 * m)) b4=$((b4 * m)) b5=$((b5 * m)); fh=$((2 * m))
     else local m=$((1 << dl)); b0=$((b0 / m)) b1=$((b1 / m)) b2=$((b2 / m)) b3=$((b3 / m)) b4=$((b4 / m)) b5=$((b5 / m)); fh=$((2 / m)); fi
     [ $fh -ge 1 ] || { echo "wbench: DLV $dl leaves no fit cell" > $lg; return 1; }; fi
-  $run ${UP:-$U} predict $CK $R $V $f.tmp --um $UM --level $lv --box $b0,$b1,$b2,$b3,$b4,$b5 ${WZARGS---window-z ${WINZ:-384} --halo-z ${HALOZ:-64}} --window ${WIN:-640} --halo ${HALO:-64} --shard 512 \
+  # LOCALCT (the desk, 2026-11-12): read the box from the local CT copy (keys without volumes/) when ctcover.py finds every shard the
+  # predict can touch there (or absent from the mirror too: air); else from R. Same bytes either way (one codec), so rows do not change.
+  local rr=$R vv=$V; if [ -n "${LOCALCT:-}" ] && [ "$R" != "$LOCALCT" ]; then local lk_=${V/\/volumes\//\/}
+    if python3 -I $H/ctcover.py $LOCALCT $lk_ $R $V $lv $b0,$b1,$b2,$b3,$b4,$b5 > /dev/null 2> $lg.ct; then rr=$LOCALCT vv=$lk_; fi; fi
+  echo "ct: $rr $vv level $lv" > $lg.root
+  $run ${UP:-$U} predict $CK $rr $vv $f.tmp --um $UM --level $lv --box $b0,$b1,$b2,$b3,$b4,$b5 ${WZARGS---window-z ${WINZ:-384} --halo-z ${HALOZ:-64}} --window ${WIN:-640} --halo ${HALO:-64} --shard 512 \
     --grid-origin ${GO:-0,0,0} --ema 1 --q 8 --threads $THREADS --gpu $GPU --axis $AX --levels 1 --fit-zarr $f --fit-h $fh --fit-q 8 --fit-q-phase 0 ${PX:-} \
     --no-out 1 --cache $CACHE ${lx:+--latents $lx} > $lg 2>&1; local rc=$?; rm -rf $f.tmp; return $rc
 }
@@ -103,6 +108,7 @@ elif [ "$BOXES" = core ]; then BL=$(grep -v '^#' $BT | awk -F'\t' '$10 !~ /label
 else BL=$BOXES; fi
 for B in $BL; do
   ulk
+  [ -n "${STOPAT:-}" ] && [ $(date +%s) -ge $STOPAT ] && { log "stop: the GPU window ends (STOPAT); $B and later boxes left for the next window"; break; }
   IFS=$'\t' read -r nm sc z y x nz ny nx lv note <<< "$(awk -F'\t' -v b=$B '$1 == b' $BT)"; [ -n "${nx:-}" ] || { log "no box $B"; continue; }
   grep -qP "^$TAG\t$B\t" $RES && { log "$B done"; continue; }
   scroll $sc || { log "$B: unknown scroll $sc"; continue; }
