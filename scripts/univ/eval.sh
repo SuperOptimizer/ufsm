@@ -82,7 +82,7 @@ if has ink && [ "${INK:-1}" = 1 ] && [ -n "$INKP" ]; then   # INKP = ink3dext | 
   grep -v '^#' $C/crops.tsv | while IFS=$'\t' read -r cr seg ns fi box scr ctk; do
     ctk=${ctk:-$P4K}; case $M in http*) ;; *) ctk=${ctk/\/volumes\//\/};; esac   # (a local CT tree, e.g. the desk's /vesuvius/ufsm/v2/ct: keys without volumes/)
     um=$(python3 -I -c "import json; print(json.load(open('$C/$cr/crop.json')).get('um', 2.4))")
-    g=/nonexistent; for gd in ${INKGT:-}; do [ -d $gd/$cr.zarr ] && { g=$gd/$cr.zarr; break; }; done; vs=0;   # INKGT: one or more dirs [ -d $g ] && ! grep -qP "^$cr\t" $o/vscores.tsv && vs=1
+    g=/nonexistent; for gd in ${INKGT:-}; do [ -d $gd/$cr.zarr ] && { g=$gd/$cr.zarr; break; }; done; vs=0; [ -d $g ] && ! grep -qP "^$cr\t" $o/vscores.tsv && vs=1   # INKGT: one or more dirs
     grep -qP "^$cr\t" $o/scores.tsv && [ $vs = 0 ] && continue
     v=$o/vol_${scr:-PHercParis4}; [ "$INKP" = heads ] && v=$o/vol_$cr   # (predict --heads has no --resume: a store per crop)
     if [ "$INKP" = ink3dext ]; then lvi=1; key=$(python3 -I -c "print(round($um * 2, 3))")
