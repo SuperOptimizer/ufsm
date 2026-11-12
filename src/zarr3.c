@@ -1118,6 +1118,7 @@ static void z3_fill(const z3_meta *m, uint8_t *out, size_t nv, int nthreads) {
     }
 }
 static int z3_read_impl(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads, uint32_t submask, uint8_t *dsink, uint32_t *dmask, int lean);
+__attribute__((weak)) int lv_box_voxels_gpu(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads);   /* src/latvol_read.c (absent in binaries without it) */
 /* whether any stored chunk intersects the box o + n (sharded arrays: from the shard indices, no chunk read): 1 yes, 0 none (a read
    would be all fill), -1 error; unsharded arrays: 1 */
 int z3_box_any(z3 *z, const int64_t o[3], const int64_t n[3]) {
@@ -1176,6 +1177,8 @@ static void fill_part(const z3_meta *m, uint8_t *out, const int64_t o[3], const 
 }
 static int z3_read_impl(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads, uint32_t submask, uint8_t *dsink, uint32_t *dmask, int lean) {
     if (z->derive) { if (submask || dsink || lean) return FAIL("%s: a derived array has no sub-chunk / device reads", z->key); return z->derive(z->dctx, z->base, o, n, out, nthreads); }
+    if (z->lv && !submask && !dsink && !lean && lv_box_voxels_gpu) {   /* a latvol array: the box decoded on the GPU when that is configured (latvol_read.h) */
+        const int g = lv_box_voxels_gpu(z, o, n, out, nthreads); if (g <= 0) return g ? FAIL("%s: latvol box read failed", z->key) : 0; }
     const z3_meta *m = &z->m;
     const size_t nv = (size_t)n[0] * n[1] * n[2];
     /* a box inside the array whose chunks are all present (sharded) is overwritten entirely by the chunk copies: no fill pass (the

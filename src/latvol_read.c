@@ -5,6 +5,7 @@
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 
 typedef struct {
     z3 *z; const int64_t *o, *n; uint8_t *buf; size_t cap; lv_chunk_ref *refs; int maxref;
@@ -75,4 +76,49 @@ int lv_cells_host(const void *codec, const uint8_t *buf, const lv_chunk_ref *ref
     }
     free(q);
     return 0;
+}
+
+/* ---- the voxel reader's GPU path (latvol_read.h) ---- */
+static _Atomic int g_lvgpu = -2;   /* -2 undecided, -1 off, >= 0 the device */
+static _Atomic uint64_t g_lvboxes;
+uint64_t latvol_gpu_boxes(void) { return atomic_load(&g_lvboxes); }
+void latvol_gpu_config(int dev, int slots) {
+    if (dev < 0 || !nn_latvol_box || !nn_latvol_box_config) { atomic_store(&g_lvgpu, -1); return; }
+    nn_latvol_box_config(dev, slots); atomic_store(&g_lvgpu, dev);
+}
+static int lvgpu_on(void) {
+    int g = atomic_load(&g_lvgpu); if (g != -2) return g >= 0;
+    const char *c = getenv("UFSM_LATVOL_CPU"), *d = getenv("UFSM_LATVOL_GPU"), *sl = getenv("UFSM_LATVOL_SLOTS");
+    if ((c && atoi(c)) || !d || !*d) latvol_gpu_config(-1, 0); else latvol_gpu_config(atoi(d), sl ? atoi(sl) : 2);
+    return atomic_load(&g_lvgpu) >= 0;
+}
+int lv_box_voxels_gpu(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads) {
+    const lv_codec *lc = z3_latvol(z); if (!lc || !lvgpu_on()) return 1;
+    const z3_meta *m = z3_meta_of(z);
+    int64_t lo[3], hi[3], a[3], an[3]; int inside = 1, whole = 1;
+    for (int d = 0; d < 3; d++) {
+        lo[d] = o[d] < 0 ? 0 : o[d]; hi[d] = o[d] + n[d] > m->shape[d] ? m->shape[d] : o[d] + n[d]; inside &= lo[d] < hi[d];
+        a[d] = lo[d] / 4 * 4; an[d] = (hi[d] + 3) / 4 * 4 - a[d]; whole &= a[d] == o[d] && an[d] == n[d];
+    }
+    if (!inside) return 1;
+    const size_t av = (size_t)an[0] * an[1] * an[2];
+    if (av < (size_t)64 * 64 * 64) return 1;   /* (a small box: the launch and the copies cost more than the host decode) */
+    const int maxref = (int)((an[0] / 128 + 2) * (an[1] / 128 + 2) * (an[2] / 128 + 2));
+    uint8_t *comp = malloc(av); lv_chunk_ref *refs = malloc((size_t)maxref * sizeof *refs); uint8_t *tmp = whole ? out : malloc(av); size_t bytes = 0; int rc = 1;
+    if (!comp || !refs || !tmp) { rc = -1; goto done; }
+    const int nr = lv_read_box(z, a, an, comp, av, refs, maxref, &bytes, nthreads);
+    if (nr == -2) goto done;
+    if (nr < 0) { rc = -1; goto done; }
+    if (!whole) memset(out, m->fill, (size_t)n[0] * n[1] * n[2]);
+    if (!nr) { if (whole) memset(out, 0, av); rc = 0; goto done; }
+    const int g = nn_latvol_box(lc, lc->dt, lc->ntab, lc->map, &lc->bi[0][0], lc->C, lc->step_raw, comp, bytes, refs, nr, (int)(an[0] / 4), (int)(an[1] / 4), (int)(an[2] / 4), tmp);
+    if (g) { rc = 1; goto done; }   /* (no device, or a corrupt stream: the host decoder reports it) */
+    if (!whole)
+        for (int64_t zz = lo[0]; zz < hi[0]; zz++) for (int64_t yy = lo[1]; yy < hi[1]; yy++)
+            memcpy(out + ((size_t)(zz - o[0]) * n[1] + (size_t)(yy - o[1])) * n[2] + (size_t)(lo[2] - o[2]), tmp + ((size_t)(zz - a[0]) * an[1] + (size_t)(yy - a[1])) * an[2] + (size_t)(lo[2] - a[2]), (size_t)(hi[2] - lo[2]));
+    if (!atomic_fetch_add(&g_lvboxes, 1)) fprintf(stderr, "latvol: voxel reads of latvol arrays are decoded on GPU %d\n", atomic_load(&g_lvgpu));
+    rc = 0;
+done:
+    free(comp); free(refs); if (!whole) free(tmp);
+    return rc;
 }

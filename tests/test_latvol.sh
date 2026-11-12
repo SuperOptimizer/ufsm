@@ -50,6 +50,19 @@ sys.exit(1 if bad else 0)
 EOF
 "$U" read "$D/lv" ct/9.6 0 0 0 256 256 256 "$D/lv.raw" > /dev/null 2>&1 || fail "read of the latvol level"
 "$U" read "$D/fx" ct/9.6 0 0 0 256 256 256 "$D/ct.raw" > /dev/null 2>&1 || fail "read of the CT"
+# the voxel reader's GPU path (UFSM_LATVOL_GPU: the box's streams decoded and rebuilt on the device below z3_read) = the host decoder,
+# for the whole level, a box off the cell grid and a box over the array's end
+UFSM_LATVOL_GPU=0 "$U" read "$D/lv" ct/9.6 0 0 0 256 256 256 "$D/lvg.raw" > "$D/lvg.log" 2>&1 || fail "GPU read of the latvol level"
+grep -q "decoded on GPU" "$D/lvg.log" || fail "the GPU voxel reader did not run ($D/lvg.log)"
+cmp -s "$D/lv.raw" "$D/lvg.raw" || fail "the GPU voxel reader differs from the host decoder"
+for b in "3 17 30 131 97 150" "130 100 60 200 180 250"; do
+    # shellcheck disable=SC2086
+    "$U" read "$D/lv" ct/9.6 $b "$D/bh.raw" > /dev/null 2>&1 || fail "read $b"
+    # shellcheck disable=SC2086
+    UFSM_LATVOL_GPU=0 "$U" read "$D/lv" ct/9.6 $b "$D/bg.raw" > "$D/bg.log" 2>&1 || fail "GPU read $b"
+    grep -q "decoded on GPU" "$D/bg.log" || fail "the GPU voxel reader did not run (box $b)"
+    cmp -s "$D/bh.raw" "$D/bg.raw" || fail "the GPU voxel reader differs from the host decoder (box $b)"
+done
 # a range-serving HTTP root over the store (suffix ranges for the shard indices)
 python3 -I - "$D/lv" "$D/port" <<'EOF' &
 import http.server, os, re, sys

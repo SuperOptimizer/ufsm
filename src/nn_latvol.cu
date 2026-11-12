@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <pthread.h>
 #include "latvol.h"
 #include "nn_latvol.h"
 
@@ -131,4 +132,58 @@ extern "C" void nn_latvol_forward(nn_lv *L, const uint8_t *ct_d, int d, int h, i
     const size_t cv = (size_t)d * h * w;
     k_fwd<<<(unsigned)((cv + 127) / 128), 128>>>(ct_d, L->C, L->bi, 1.0f / ((float)(1 << LV_BSHIFT) * L->step_raw), d, h, w, q_d);
     LVCK(cudaGetLastError());
+}
+
+/* ---- a box of a latvol array as CT bytes, from any thread (the voxel reader below z3_read: src/latvol_read.c lv_box_voxels_gpu) ----
+   A pool of `slots` contexts on one device, each with its own stream and buffers; a caller takes a free one (waits when all are busy).
+   Each context keeps the device tables of the codecs it has seen (keyed by the host codec's address). The bytes are nn_latvol_decode +
+   nn_latvol_synth's (the same kernels on the context's stream). */
+enum { LB_COMP, LB_CELLS, LB_CT, LB_OFFS, LB_REFS, LB_N, LB_TAB = 8 };
+typedef struct { const void *key; lv_dent *dt; uint8_t *map; int16_t *bi; } lb_tab;
+typedef struct { int busy, init; cudaStream_t st; struct { void *p; size_t cap; } b[LB_N]; int *flag; lb_tab tab[LB_TAB]; int ntab; } lb_ctx;
+static struct { pthread_mutex_t mu; pthread_cond_t cv; int dev, slots; lb_ctx c[16]; } g_lb = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, -1, 2, {}};
+extern "C" void nn_latvol_box_config(int dev, int slots) { pthread_mutex_lock(&g_lb.mu); g_lb.dev = dev; g_lb.slots = slots < 1 ? 1 : slots > 16 ? 16 : slots; pthread_mutex_unlock(&g_lb.mu); }
+#define LBCK(x) do { if ((x) != cudaSuccess) { rc = -1; goto out; } } while (0)
+static int lb_grow(lb_ctx *x, int i, size_t n) {
+    if (x->b[i].cap >= n) return 0;
+    if (x->b[i].p) cudaFree(x->b[i].p);
+    x->b[i].p = nullptr; x->b[i].cap = 0; const size_t c = n + n / 8 + 4096;
+    if (cudaMalloc(&x->b[i].p, c) != cudaSuccess) return -1;
+    x->b[i].cap = c; return 0;
+}
+extern "C" int nn_latvol_box(const void *key, const uint32_t *dt, int ntab, const uint8_t *map, const int16_t *bi, int C, float step_raw,
+                             const uint8_t *comp, size_t ncomp, const lv_chunk_ref *refs, int nref, int d, int h, int w, uint8_t *ct_out) {
+    pthread_mutex_lock(&g_lb.mu);
+    if (g_lb.dev < 0) { pthread_mutex_unlock(&g_lb.mu); return -1; }
+    lb_ctx *x = nullptr;
+    for (;;) { for (int i = 0; i < g_lb.slots && !x; i++) if (!g_lb.c[i].busy) x = &g_lb.c[i]; if (x) break; pthread_cond_wait(&g_lb.cv, &g_lb.mu); }
+    x->busy = 1; const int dev = g_lb.dev;
+    pthread_mutex_unlock(&g_lb.mu);
+    int rc = 0, f = 0; lb_tab *t = nullptr; const int stride = C + 1; const size_t cv = (size_t)d * h * w;
+    LBCK(cudaSetDevice(dev));
+    if (!x->init) { LBCK(cudaStreamCreateWithFlags(&x->st, cudaStreamNonBlocking)); LBCK(cudaMalloc(&x->flag, sizeof(int))); x->init = 1; }
+    for (int i = 0; i < x->ntab; i++) if (x->tab[i].key == key) t = &x->tab[i];
+    if (!t) {
+        if (x->ntab == LB_TAB) { for (int i = 0; i < LB_TAB; i++) { cudaFree(x->tab[i].dt); cudaFree(x->tab[i].map); cudaFree(x->tab[i].bi); } x->ntab = 0; }
+        t = &x->tab[x->ntab]; t->dt = nullptr; t->map = nullptr; t->bi = nullptr;
+        LBCK(cudaMalloc(&t->dt, (size_t)ntab * LV_L * sizeof(lv_dent))); LBCK(cudaMalloc(&t->map, LV_MAXC)); LBCK(cudaMalloc(&t->bi, (size_t)C * 64 * sizeof(int16_t)));
+        LBCK(cudaMemcpy(t->dt, dt, (size_t)ntab * LV_L * sizeof(lv_dent), cudaMemcpyHostToDevice)); LBCK(cudaMemset(t->map, 0, LV_MAXC)); LBCK(cudaMemcpy(t->map, map, (size_t)C, cudaMemcpyHostToDevice));
+        LBCK(cudaMemcpy(t->bi, bi, (size_t)C * 64 * sizeof(int16_t), cudaMemcpyHostToDevice));
+        t->key = key; x->ntab++;
+    }
+    if (lb_grow(x, LB_COMP, ncomp) || lb_grow(x, LB_CELLS, cv * stride) || lb_grow(x, LB_CT, cv * 64) || lb_grow(x, LB_OFFS, (size_t)nref * LV_NSUB * sizeof(uint32_t)) || lb_grow(x, LB_REFS, (size_t)nref * sizeof(lv_chunk_ref))) { rc = -1; goto out; }
+    LBCK(cudaMemcpyAsync(x->b[LB_COMP].p, comp, ncomp, cudaMemcpyHostToDevice, x->st));
+    LBCK(cudaMemcpyAsync(x->b[LB_REFS].p, refs, (size_t)nref * sizeof(lv_chunk_ref), cudaMemcpyHostToDevice, x->st));
+    LBCK(cudaMemsetAsync(x->b[LB_CELLS].p, 0, cv * stride, x->st)); LBCK(cudaMemsetAsync(x->flag, 0, sizeof(int), x->st));
+    k_offs<<<(nref + 63) / 64, 64, 0, x->st>>>((const uint8_t *)x->b[LB_COMP].p, (const lv_chunk_ref *)x->b[LB_REFS].p, nref, C, (uint32_t *)x->b[LB_OFFS].p, x->flag);
+    k_decode<<<(unsigned)(((size_t)nref * LV_NSUB + 127) / 128), 128, 0, x->st>>>((const uint8_t *)x->b[LB_COMP].p, (const lv_chunk_ref *)x->b[LB_REFS].p, nref, (const uint32_t *)x->b[LB_OFFS].p, t->dt, t->map, C, d, h, w, stride, (int8_t *)x->b[LB_CELLS].p, x->flag);
+    k_synth<<<(unsigned)((cv + 127) / 128), 128, 0, x->st>>>((const int8_t *)x->b[LB_CELLS].p, stride, C, t->bi, step_raw / (float)(1 << LV_BSHIFT), d, h, w, (uint8_t *)x->b[LB_CT].p);
+    LBCK(cudaGetLastError());
+    LBCK(cudaMemcpyAsync(ct_out, x->b[LB_CT].p, cv * 64, cudaMemcpyDeviceToHost, x->st));
+    LBCK(cudaMemcpyAsync(&f, x->flag, sizeof f, cudaMemcpyDeviceToHost, x->st));
+    LBCK(cudaStreamSynchronize(x->st));
+    if (f) rc = 1;
+out:
+    pthread_mutex_lock(&g_lb.mu); x->busy = 0; pthread_cond_signal(&g_lb.cv); pthread_mutex_unlock(&g_lb.mu);
+    return rc;
 }
