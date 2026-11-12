@@ -35,6 +35,7 @@ test_fibhead_train                             | gpu          |    25 | tests/te
 test_predict_heads                             | gpu          |    70 | tests/test_predict_heads.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/predheads
 test_fstem                                     | gpu          |     3 | ./$B/test_fstem
 test_lathead                                     | gpu          |     3 | ./$B/test_lathead
+test_fit_lat                                     | gpu          |     3 | ./$B/test_fit_lat
 test_restore_task                              | gpu          |     7 | ./$B/test_restore_task
 test_phase_interp                              |              |    20 | ./$B/test_phase_interp
 test_spatial_augment                           |              |    60 | UFSM_TEST_QUICK=1 ./$B/test_spatial_augment
