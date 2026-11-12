@@ -151,8 +151,9 @@ def auc_f1(v, y):
 rows = ["tol_um\tsplit\tlabelled\tcovered\tcoverage\tink_share\tink_auc\tink_f1best\tct_auc\tct_f1best\tmiss_med_um"]
 splits = {"all": np.ones(len(P), bool), "validation": VAL, "holdout": HOLD, "rest": ~VAL & ~HOLD}
 for t in tols:
-    cov = (miss_um <= t) & (INK >= 0)
+    cov = miss_um <= t   # (the surface coverage needs no map: a run without renders gets it alone; the scores take the samples with a map value)
     for nm, sp in splits.items():
-        s = sp & cov; ia, if1 = auc_f1(INK[s], LAB[s]); ca, cf1 = auc_f1(CT[s], LAB[s]) if (CT[s] >= 0).all() else (float("nan"),) * 2
+        s = sp & cov; si = s & (INK >= 0); sc_ = s & (CT >= 0)
+        ia, if1 = auc_f1(INK[si], LAB[si]); ca, cf1 = auc_f1(CT[sc_], LAB[sc_])
         rows.append(f"{t:g}\t{nm}\t{sp.sum()}\t{s.sum()}\t{s.sum() / max(sp.sum(), 1):.3f}\t{LAB[s].mean() if s.any() else float('nan'):.3f}\t{ia:.4f}\t{if1:.4f}\t{ca:.4f}\t{cf1:.4f}\t{np.median(miss_um[sp]) if sp.any() else float('nan'):.1f}")
 open(a.out, "w").write("\n".join(rows) + "\n"); print("\n".join(rows))
