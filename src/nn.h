@@ -562,6 +562,7 @@ void nn_add_into_act(void *y, const void *x, shape5 s, int h16);   /* the same f
 void nn_side_targets(const uint8_t *side, size_t n, uint8_t *t, uint8_t *m);   /* band.h SIDE_* labels -> loss target (recto 255, verso 0) and mask (known) */   /* where m == 0 and vm != 0: t = src, m = 1 */
 void nn_phase_targets(const uint8_t *phase, size_t n, uint8_t *t, uint8_t *m);   /* band.h PHASE_* -> targets t[0..n) = 0.5 + 0.5 cos(2 pi phase), t[n..2n) = 0.5 + 0.5 sin (x255), mask (known) */
 void nn_rv_targets(const uint8_t *phase, const uint8_t *pap, size_t n, uint8_t *t, uint8_t *m);   /* train --rv: recto / verso side papyrus targets t[0..2n) and mask from the phase + papyrus plane */
+void nn_rv_targets_p2(const uint8_t *phase, const uint8_t *pap2, size_t v0, size_t n, uint8_t *t, uint8_t *m);   /* the same from the 2-bit packed papyrus plane (nn_lab_pack bits 2), voxels [v0, v0 + n) of it */
 void nn_rv_verso_w(const uint8_t *t, uint8_t *m, size_t n, float w);   /* train --rv-verso-w: verso-side papyrus loss weight x w */
 void nn_rv_fuse(void *lg, size_t n, int h16);   /* predict --channel rv: [recto | verso] logits -> channel 0 = logit((1 + p_r - p_v) / 2) */
 void nn_ink_targets(const uint8_t *ink, size_t n, uint8_t *t, uint8_t *m);   /* train --ink-head: ink prob254 (255 unknown) -> target t (x255) and mask m (known) */

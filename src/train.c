@@ -1001,6 +1001,10 @@ static void head_slab_pass(gpu_state *d, int pass) {
     if (!pass) d->mil_n = 0;
     if (!pass && nmil) { nn_zero(d->milacc, (size_t)nmil * d->mil_k * sizeof(float)); nn_zero(d->milloss, sizeof(double)); }
     if (!pass) { nn_zero(d->hs_ds, 128 * sizeof(double)); if (g_unwrap2) nn_zero(d->w4ds, nn_wind4_sums()); if (g_fibn) nn_zero(d->fibacc, 2 * sizeof(double)); }
+    /* the --rv papyrus plane kept on the device in 2 bits: the rv targets read it packed (nn_rv_targets_p2), no unpack into a slab buffer per
+       slab and pass (its only other readers are the checks below; UFSM_RV_P2=0: the unpack path) */
+    static int rvp2 = -1; if (rvp2 < 0) rvp2 = (!getenv("UFSM_RV_P2") || ufsm_env_on("UFSM_RV_P2")) && !ufsm_env_on("UFSM_RV_CHECK");
+    const int pkk = g_rv && g_aux_of[AUX_PAP] >= 0 ? 3 + g_aux_of[AUX_PAP] : -1, pdir = rvp2 && g_lstream && !g_lcheck && pkk >= 0 && d->ldev[pkk] && d->ldbits[pkk] == 2;
     for (int z0 = 0; z0 < D; z0 += Z) {
         const int z1 = z0 + Z < D ? z0 + Z : D, nz = z1 - z0;
         const size_t ns = (size_t)nz * hw, vb = (size_t)z0 * hw;
@@ -1032,13 +1036,13 @@ static void head_slab_pass(gpu_state *d, int pass) {
                     nn_stream_wait(2, d->evl_free[st]);
                     /* (a plane kept on the device: its bytes are read in place; a packed one is expanded into the slab buffer) */
 #define LSLAB(st_, k, dst, v0, n) do { if (!d->ldev[k]) nn_h2d_stream(st_, (dst), d->lbh[k] + (v0), (n)); else if (d->ldbits[k] != 8) nn_lab_unpack(st_, d->ldev[k], (dst), (v0), (n), d->ldbits[k]); } while (0)
-                    for (int k = 0; k < NLPL; k++) if (lplane_on(k)) LSLAB(2, k, l2[k], (size_t)LZA(k, y0) * hw, (size_t)(LZB(k, y1) - LZA(k, y0)) * hw);
+                    for (int k = 0; k < NLPL; k++) if (lplane_on(k) && !(pdir && k == pkk)) LSLAB(2, k, l2[k], (size_t)LZA(k, y0) * hw, (size_t)(LZB(k, y1) - LZA(k, y0)) * hw);
                     nn_event_record(d->evl_up[st], 2);
                 }
                 nn_stream_wait(0, d->evl_up[sj & 1]);
             } else {
 #define LSLAB0(k, dst, v0, n) do { if (!d->ldev[k]) nn_h2d_async((dst), d->lbh[k] + (v0), (n)); else if (d->ldbits[k] != 8) nn_lab_unpack(0, d->ldev[k], (dst), (v0), (n), d->ldbits[k]); } while (0)
-                for (int k = 0; k < NLPL; k++) if (lplane_on(k)) LSLAB0(k, lb[k], (size_t)LZA(k, z0) * hw, (size_t)(LZB(k, z1) - LZA(k, z0)) * hw);
+                for (int k = 0; k < NLPL; k++) if (lplane_on(k) && !(pdir && k == pkk)) LSLAB0(k, lb[k], (size_t)LZA(k, z0) * hw, (size_t)(LZB(k, z1) - LZA(k, z0)) * hw);
             }
 #define LPTR(k, off) (d->ldev[k] && d->ldbits[k] == 8 ? d->ldev[k] : lb[k] - (off))   /* (indexed by window voxel) */
             if (g_side) sdb = LPTR(0, (size_t)za * hw);
@@ -1089,7 +1093,8 @@ static void head_slab_pass(gpu_state *d, int pass) {
         if (!tskip) nn_phase_targets(sdb + vb, ns, d->sidet, d->sidem);
         FT("  t phase targets");
         if (g_rv && !tskip) {   /* --rv: the side slot's targets (the phase targets above stay for the winding mod 4 / gradient terms) */
-            nn_rv_targets(sdb + vb, pap + vb, ns, d->rvt, d->rvm); FT("  t rv targets");
+            if (pdir) nn_rv_targets_p2(sdb + vb, d->ldev[pkk], vb, ns, d->rvt, d->rvm); else nn_rv_targets(sdb + vb, pap + vb, ns, d->rvt, d->rvm);
+            FT("  t rv targets");
             if (g_packed_w > 1) nn_packed_mask_z(sdb, D, H, W, g_norm_s, d->um, g_packed_um, g_packed_w, d->rvm, z0, z1);   /* packed sheets weigh more */
             FT("  t packed mask (rv)");
             if (g_rv_vw != 1.f) nn_rv_verso_w(d->rvt, d->rvm, ns, g_rv_vw);

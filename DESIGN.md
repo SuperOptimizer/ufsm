@@ -52,6 +52,14 @@ or a validation pass never reads another step's targets. The ink targets are not
   exact flags at P 1024 on the pod: 8 gradient passes, 120 GB of bytes equal (no ink window among them as far as the log shows).
   Parameter hashes are no evidence here: `--det 1` runs differ from each other after two updates (see "what --det 1 fixes").
 
+- The rv targets read the papyrus plane packed (2026-11-12, branch hsone-20261112). With the label planes kept on the device the head
+  slabs upload nothing, yet both passes ticked "label h2d" (94 + 72 ms of U2's contended 2790 ms step): the 2-bit papyrus plane was
+  unpacked into a slab buffer per slab and pass for `nn_rv_targets` alone. `nn_rv_targets_p2` reads the three classes from the packed
+  plane (`UFSM_RV_P2=0`: the unpack path). `test_rv` (1b): every (phase, papyrus) byte pair at four offsets, the packed read equal to
+  the unpacked and to the raw plane's targets. Not timed yet (the pod slot); written from the code reading, with the correction that
+  two other planned items already existed: the labels are uploaded once a step (kept on the device), and the statistics pass of the
+  fused latent head already takes mask-only statistics for the phase and normal groups ("light").
+
 ## latvol: the CT stored as the trunk's latent cells (2026-11-12, branch latstore-20261112)
 
 The latent-grid nets (u1: `--lat 4 --lat-basis klt1.lcb --lat-c 29 --lat-step 0.25`) consume 4^3 cells of KLT indices, yet every read decodes
