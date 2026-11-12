@@ -6,6 +6,71 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Universal net eval harness: pod baselines, fed levels, the ink teacher, and the --fit-zarr off-grid bug (2026-11-12, branches univ-eval-20261111 + fitslab-20261111)
+
+`scripts/univ/eval.sh CKPT TAG` builds the task x resolution matrix (wbench core at the native level and fed one level finer / coarser
+(`DLV`), cross-res on the fine scans, rv p1667, fibre HOLD, ink crops); `podeval.sh` runs it on a pod with the desk's labels. All rows
+below are from one pod (RTX PRO 6000, one fitter build 5761fc39): a pod row is never paired with a desk row (desk - pod on wind96:
+p05x -0.002 [-0.008, +0.004]).
+
+**Fed levels (39 clean core boxes, ceil >= 0.8; p05x / ids).** Every net loses about as much off its native level, so a fed row is
+compared with the reference fed the same level, not with the reference's native row (the matrix did the latter until 5b5862f).
+
+| net | native 9.6 um | fed 4.8 um (DLV -1) | fed 19.2 um (DLV +1) |
+|---|---|---|---|
+| wind96p (voxel net) | 0.675 / 0.521 | 0.431 / 0.291 | 0.346 / 0.171 |
+| lat-wz896p (latent, step 12000) | 0.624 / 0.447 | 0.308 / 0.194 (26 boxes) | 0.398 / 0.226 |
+| u1-3000-prefix (universal, 3000 steps, before the fine-stem fix) | 0.644 / 0.492 | 0.400 / 0.266 (26 boxes) | 0.404 / 0.234 |
+
+U1 at 3000 steps minus the reference, paired: native -0.031 [-0.046, -0.015] p05x vs wind96p, +0.020 [+0.004, +0.037] vs lat-wz896p;
+fed 4.8 um +0.021 [-0.002, +0.044] and +0.091 [+0.072, +0.113]; fed 19.2 um +0.058 [+0.034, +0.081] and +0.006 [-0.011, +0.023].
+predict gives each fed level its scale FiLM code (log2(um / 4.8): 0 / 1 / 2, the same `unet_scale_code` as train.c), and U1 trained
+on all three, so the drop is the net at that scale. These U1 rows are a trunk-progress check only (pre-fix stem); gated rows start at
+snapshot 10000 and are tagged `-mh` (masked holdout).
+
+**Masked-holdout control (`holdsplit.py`).** From step 7607 U1 draws windows over the wbench boxes with their labels masked (box +
+16-voxel guard); HOLD and 139-1..8 stay rejected (CT unseen; `u1reject.txt`). The control is U1 - reference on masked vs reject boxes.
+The two groups are different scrolls, so the split is not zero without any masking: u1-3000-prefix (every holdout window rejected) -
+lat-wz896p gives masked - reject +0.018 p05x, +0.049 ids. A gated snapshot's split is read against that.
+
+**rv p1667 (recto-ruler).** A cell is turns per GT turn (1 = right) / share of GT intervals off >= 0.5 turn (lower is better); the
+first column of a ruler row is the reference count fit, not the model. u1-3000-prefix rv.pk 0.391 / 0.724 (rv1d2-10000: 0.926 /
+0.377), rv.run 0.984 / 0.307 (1.135 / 0.384).
+
+**Ink teacher baseline** (ink3d-ext, dino3d 78k, `--surface`: only the 256^3 crops touching each crop's segment), 24 held-out crops,
+`ink-score` of the rendered map vs the human labels and inkB's voxelwise `ink-vscore` vs the 3-D ink-splat references:
+
+| crops | 2-D AUC / best F1 | voxelwise AUC / best F1 |
+|---|---|---|
+| Paris 4 (16) | 0.735 / 0.576 | 0.727 / 0.572 |
+| PHerc0139 (4) | 0.632 / 0.487 | 0.651 / 0.498 |
+| PHerc1667 (4) | 0.566 / 0.496 | 0.561 / 0.508 |
+
+The two scores agree within 0.02 per set. (`ufsm render` reads only wrap dirs named `w*`: the 0139 / 1667 crops rendered nothing until
+eval.sh named the wrap dir `w_<crop>`.)
+
+**predict --fit-zarr with a box off the window grid.** With `--grid-origin` the windows are anchored on the global grid while the
+shards, and with them the field slabs, start at the box. A window can then cover two shards and is run once for each; its image output
+was clipped to the tile's shard, its fit cells only to the box. Where such a window crossed a field-slab boundary (FZ cells in z) its
+cells were written past the slab: a segfault in `ffw_main` on 13 of the 39 clean core boxes at DLV -1 for the latent nets (cube 640 /
+64 windows, stride 512, --fit-h 4: two slabs of 128 cells, e.g. C19 at z 768). Fix (5a71359): the cells are clipped to the tile's
+shard, with an error if cells still span two slabs; `test_predict_fitgrid` (off-grid box over two slabs; fails on the old code).
+
+Did stored rows lose cells silently? No. A box is at risk only if a window interior crosses a slab boundary, which needs more than one
+slab in z; the wbench boxes at DLV 0 / +1 have one. Checked on the pod with the binary the rows were predicted with (a12c5b6) plus only
+the predict.c clip, every array chunk by sha1 against the stored fields (`latres/gridchk.sh`, `gridchk.tsv`): an on-grid control (PH3)
+with the old and the patched binary is identical to the stored fields for wind96p and lat-wz896p; every core box whose z origin at the
+fed level is off the net's z window grid (wind96p: window-z 384 / 64, stride 256; latent nets: stride 512):
+
+| row set | boxes off the grid in z | chunks | differ |
+|---|---|---|---|
+| wind96p DLV 0 / +1 | 15 / 21 | 2530 / 3278 | 0 / 0 |
+| lat-wz896p DLV 0 / +1 | 21 / 40 | 4172 / 6662 | 0 / 0 |
+| u1-3000-prefix DLV 0 / +1 | 21 / 40 | 4172 / 6662 | 0 / 0 |
+
+wind96p's DLV -1 / -2 boxes are on its grid (z origins double to multiples of 256). The latent nets' 13 crashed DLV -1 boxes had no
+rows; lat-wz896p's were predicted with the fix afterwards. No stored row changes.
+
 ## The human ink targets on the fly, the derived-array chunk cache, and the villa ink recipe (2026-11-11, branch inkfly-20261111)
 
 **On the fly.** The stored splats of the section below (inkgt/gt) are now only the reference. Training reads the same bytes from a
