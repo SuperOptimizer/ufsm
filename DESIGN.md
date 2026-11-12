@@ -6,6 +6,67 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## MIL rays under --replay, the MIL checks, and the U2 ink smoke (2026-11-12, branch milfix-20261112)
+
+**Replays.** The MIL path from mil-20261112 below did not cover `--replay K`. A replay sends the window's planes back to the source
+grid and draws a new symmetry and warp, applied on the device. The rays kept the first draw's mapping. u1 runs `--replay 3`, so
+under that recipe two steps in three would have pooled along the wrong voxels. Each window now keeps its source-grid rays
+(`batch.mil0`), and `replay_window` maps them again with the replay's own geometry (`sample_mil_map`, the cap after it).
+
+**UFSM_MIL_CHECK=1** (head_slab_pass) checks three things on every window with rays:
+- loss: the device MIL loss against `ink_mil_loss_host`, on the window's own fp16 logits at the same scale;
+- gradient: the gradient pass 1 adds (bwd_slab, after minus before, 16-bit) against the host gradient, as the excess beyond one
+  16-bit ulp;
+- geometry: the rays against the ink target plane the loss reads (after every symmetry or warp, host or device, and replays): the
+  rays that meet a known voxel within +-R, and how many of those agree with the ray's label.
+
+**test_ink_mil_check** (new, gpu, ~90 s; beside test_ink_mil_train). Fixture: the spiral plus one tifxyz segment on a papyrus sheet
+(blob labels) as an onfly ink target. Six runs: plain twice under `--det 1`, rotation + elastic with host label warps, the same with
+device label warps (`--gpu-aug 2`), the latent head stream (`--lat 4 --lat-guide 3`), and `--replay 3` with the warps.
+
+| check | result |
+|---|---|
+| device loss vs host | worst relative 2.1e-8, 18 windows |
+| device gradient vs host | worst excess over one 16-bit ulp 3.0e-7 of the max |
+| rays meet known ink / agree, every run | >= 98% / 99.6% |
+| `--det 1` loss terms, two runs | identical |
+
+The host reference is central-difference tested in test_ink_mil, so the gradient row is the central-difference check through
+head_slab_pass at the logits. In the replay run 2454 of 2509 rays meet the plane with the remap; without it 940 of 2520 do, and
+the test fails.
+
+Flag off: test_heads 7 of 7 old layouts log the reference losses. test_ink_mil_train, test_wind_sampler and test_unwrap2_sampler pass.
+
+Real data, desk dry run of the U2 recipe below (the 8 scans at level 0 / 1, P 256, mode 0, replays on): 187536 of 345170 rays
+(54%) meet known ink within +-3 voxels, and 99.81% of those agree. The others sit off the face band [-6, 0] or have no face. In
+mode 1 (face-less pixels only) 5.8% meet any known voxel, as expected.
+
+An onfly `"cache_dir": "off"` used to create a directory named `off`; it now means no disk cache.
+
+**The U2 ink config.**
+- `scripts/inkgt/mksources_u2ink.py` writes the 8 scans' onfly human-ink sources:
+  - onfly level 0 (2.4 um), pooled level 1 (4.8 um), min / max level 0 / 1 (train `--um-rungs 2.4,4.8`);
+  - `"validation": "exclude"` (the validation rasters once addval.py has run on the live segment lists);
+  - the ink head only; the weights of sources-inkfly.json;
+  - `ROOT=` rewrites every path for a pod; the segment lists, the holdouts and the desk axis files are copied next to the output.
+- `CACHE_MB` sets each source's onfly memory cache. The default is 2048 MB, and 8 sources plus 10 P 512 slots broke the 40 GB dev
+  cap in a sampler-only run.
+- `scripts/univ/pod_pack.sh INK=1` stages the inputs: inkgt hf + od (2.7 GB), evgt, evcrops and the Paris 4 eval crops.
+
+**The smoke.** `scripts/univ/u2ink_smoke.sh [A B]`:
+- ink-only windows, `--init-from` a u1 snapshot (trunk and rv / winding rows; the ink row fresh, bias -1);
+- u1's recipe (u1.train.sh, its latent flags including `--replay 3`) with `--um-rungs 2.4,4.8`, STEPS 400, a checkpoint every 200;
+- arm A: BCE + `--ink-smooth 0.1 --ink-dice 0.25`; arm B: A + `--ink-mil 1 --ink-mil-r 3 --ink-mil-mode 1`;
+- each checkpoint is scored with `scripts/inkgt/baseline.sh ckpt:...:<ink channel>`: 3-D AUC per scan against the teacher
+  ink3dext's 0.727 (Paris 4) / 0.651 (0139) / 0.561 (1667), CT floor 0.513.
+
+baseline.sh's checkpoint path had never run (the teacher went through ink3d-ext). It passed the level-0 box to `predict --level 1`,
+which reads the box in level-1 voxels, so every shard was air. It now passes the level-1 box with `--full-grid 1`, and 1667 w013_0
+predicts and scores. The 2-D render score wrote 0 wraps for that crop (not investigated; the 3-D score is the gate).
+
+Desk dry run (arm B, P 256, 24 steps beside u1): the u1 8000 snapshot loads with the ink row fresh. Ink bce 0.48 -> 0.36 and
+mil 0.48 -> 0.36 inside the warmup, 15-16 k rays a window. The 400-step arms at P 896 are for the pod.
+
 ## Universal net eval harness: pod baselines, fed levels, the ink teacher, and the --fit-zarr off-grid bug (2026-11-12, branches univ-eval-20261111 + fitslab-20261111)
 
 `scripts/univ/eval.sh CKPT TAG` builds the task x resolution matrix (wbench core at the native level and fed one level finer / coarser
