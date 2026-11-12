@@ -18,8 +18,11 @@ Winding: 14 wbench boxes (PH1-3, HOLD, J1 J9 J19 J27; C9 C18 C30 C52; 139-5 139-
 9.36 um scan), three checkpoints (u1-8000, lat-wz896, wind96), production predict -> fit -> scores, paired per box against the anchor,
 95% bootstrap interval over boxes. Rate = stored bytes per voxel of the re-encoded regions, air included. The paired noise floor with 14
 boxes is +-0.01 to 0.02 p05x.
-Validity: the arms are local trees, which have no disk chunk cache (the cache path has no root in it: an HTTP arm sharing a cache dir
-would be served another arm's chunks; still to fix), and the shared decoded-chunk memory is keyed by a hash of the encoded bytes. Each
+Validity: the arms are local trees, which have no disk chunk cache. (The cache path had no root in it: a second HTTP root sharing a
+--cache directory with the same array keys was served the first root's index and chunks. Fixed on this branch: a cache directory
+belongs to one root, written to `<cache>/.root` on first use; any other root reads and writes `<cache>/@<hash of its URL>`; a directory
+that already holds chunks without a `.root` is taken to be the mirror's, which filled all of them. test_latvol.sh reads two roots with
+the same key and different bytes through one cache directory; the binary from before the fix fails it.) Also and the shared decoded-chunk memory is keyed by a hash of the encoded bytes. Each
 arm's CT differs from the anchor's (docs/sweep/compression-psnr.tsv), the fit fields of every (checkpoint, box) were checksummed per arm
 (386 checksums, no two arms equal), reruns reproduce rows to 4 digits. A side check: the q2 arm reproduces the mirror's fibre baseline
 exactly, so the mirror's level 2 is byte-equivalent to original -> volcomp q2.
