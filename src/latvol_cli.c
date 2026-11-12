@@ -156,7 +156,19 @@ static int encode_level(store *st, const char *group, const char *lname, const c
         if (resume) { struct stat sb; snprintf(p, sizeof p, "%s/c/%lld/%lld/%lld", odir, (long long)sz, (long long)sy, (long long)sx); if (!stat(p, &sb)) { bytes += (double)sb.st_size; nskip++; continue; } }
         if (z3_shard_present(z, sz, sy, sx) != 1) continue;
         double t1 = now();
-        if (z3_read(z, o, nn3, ct, nth)) { fprintf(stderr, "latvol: read failed: %s\n", z3_error()); return 1; }
+        if (!nbox) { if (z3_read(z, o, nn3, ct, nth)) { fprintf(stderr, "latvol: read failed: %s\n", z3_error()); return 1; } }
+        else {   /* boxes: only the chunks under the boxes' bounding region in this shard are read and written (the rest of the shard: absent) */
+            int64_t a[3] = {INT64_MAX, INT64_MAX, INT64_MAX}, e[3] = {INT64_MIN, INT64_MIN, INT64_MIN};
+            for (int b = 0; b < nbox; b++) { int64_t ba[3], be[3]; int in = 1;
+                for (int d = 0; d < 3; d++) { ba[d] = boxv[b][d] > o[d] ? boxv[b][d] : o[d]; be[d] = boxv[b][d] + boxv[b][3 + d] < o[d] + SH ? boxv[b][d] + boxv[b][3 + d] : o[d] + SH; in &= be[d] > ba[d]; }
+                if (in) for (int d = 0; d < 3; d++) { if (ba[d] < a[d]) a[d] = ba[d]; if (be[d] > e[d]) e[d] = be[d]; } }
+            int64_t rn[3]; for (int d = 0; d < 3; d++) { a[d] = a[d] / 128 * 128; e[d] = (e[d] + 127) / 128 * 128; rn[d] = e[d] - a[d]; }
+            uint8_t *rb = malloc((size_t)(rn[0] * rn[1] * rn[2]));
+            if (!rb || z3_read(z, a, rn, rb, nth)) { fprintf(stderr, "latvol: read failed: %s\n", z3_error()); return 1; }
+            memset(ct, 0, sv3);
+            for (int64_t zz = 0; zz < rn[0]; zz++) for (int64_t yy = 0; yy < rn[1]; yy++) memcpy(ct + ((size_t)(a[0] - o[0] + zz) * SH + (size_t)(a[1] - o[1] + yy)) * SH + (size_t)(a[2] - o[2]), rb + ((size_t)zz * rn[1] + yy) * rn[2], (size_t)rn[2]);
+            free(rb);
+        }
         double t2 = now(); t_read += t2 - t1;
         if (L) { nn_h2d(d_ct, ct, sv3); nn_latvol_forward(L, d_ct, cd, cd, cd, d_q); nn_d2h(qh, d_q, ncell * C * sizeof *qh); }
         double t3 = now(); t_fwd += t3 - t2;
@@ -186,8 +198,9 @@ int cmd_latvol(int argc, char **argv) {
                                     "                   [--cache DIR] [--resume 1] [--box Z,Y,X,NZ,NY,NX] [--tables N]\n"
                                     "  the CT levels (group paths, e.g. 2,3) as latent cells of the BASIS (train --lat-fit; the first --c rows, quantiser step --step x the\n"
                                     "  level's sd, measured or --sd) in OUT-GROUP, a CT group in the same layout: train / predict read it as their CT (src/latvol.h).\n"
-                                    "  --gpu -1: the transform on the CPU. --box / --boxes FILE: only the shards those boxes touch (voxels of the first --levels entry; other\n"
-                                    "  levels: scaled). --resume 1: shards already written are kept, with the store's own codec.\n"); return 2; }
+                                    "  --gpu -1: the transform on the CPU. --box / --boxes FILE: only the chunks under those boxes (per shard their bounding region; voxels of\n"
+                                    "  the first --levels entry, other levels: scaled; give the boxes with the predict halo). --resume 1: shards already written are kept,\n"
+                                    "  with the store's own codec.\n"); return 2; }
     lat_basis *lb = malloc(sizeof *lb); if (lat_basis_load(argv[2], lb)) { fprintf(stderr, "latvol: cannot read the transform %s\n", argv[2]); return 1; }
     store *st = store_open(argv[3]); if (!st) { fprintf(stderr, "latvol: cannot open %s\n", argv[3]); return 1; }
     const char *group = argv[4], *outg = argv[5], *levels = opt(argc, argv, "--levels", nullptr), *cache = opt(argc, argv, "--cache", nullptr);
@@ -234,7 +247,7 @@ int cmd_latvol_check(int argc, char **argv) {
     const int nth = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 8), nb = atoi(opt(argc, argv, "--n", "8"));
     int64_t grid[3]; uint8_t *bits = nullptr; const int64_t npres = z3_chunk_map(za, grid, &bits); if (npres < 0) { fprintf(stderr, "latvol-check: no chunk map: %s\n", z3_error()); return 1; }
     printf("latvol-check: %s: C %d, step_raw %.3f (step %.3g x sd_ref %.2f), %d tables, %lld of %lld chunks stored\n", argv[3], lc->C, lc->step_raw, lc->step, lc->sd_ref, lc->ntab, (long long)npres, (long long)(grid[0] * grid[1] * grid[2]));
-    enum { E = 256 }; uint8_t *a = malloc((size_t)E * E * E), *b = malloc((size_t)E * E * E); uint64_t rs = 88172645463325252ull; double se = 0, sn = 0, ta = 0, tb = 0; long air = 0; int done = 0;
+    enum { E = 128 };   /* (one stored chunk: a partial store has no more) */ uint8_t *a = malloc((size_t)E * E * E), *b = malloc((size_t)E * E * E); uint64_t rs = 88172645463325252ull; double se = 0, sn = 0, ta = 0, tb = 0; long air = 0; int done = 0;
     for (int tries = 0; tries < 4000 && done < nb; tries++) {
         rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; const int64_t c = (int64_t)(rs % (uint64_t)(grid[0] * grid[1] * grid[2]));
         if (!bits[c]) continue;
