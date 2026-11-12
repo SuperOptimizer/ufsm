@@ -2303,7 +2303,7 @@ int cmd_predict(int argc, char **argv) {
                 }
                 else if (ffd && cfg.lat_guide == 64) {   /* the sub-cell head: the 11 task planes, the phase pair's per-voxel terms */
                     nn_lat_up_slab(l2, unet_logits_h16(u), 11, W / 4, W / 4, W / 4, 0, W, lgf);
-                    nn_lat_shuffle(l2, unet_logits_h16(u), W / 4, W / 4, W / 4, 16, 2, 0, W, lgf);
+                    nn_lat_shuffle(l2, unet_logits_h16(u), W / 4, W / 4, W / 4, cfg.cout - 128, 2, 0, W, lgf);
                     if (cfg.fstem) PRED_FSTEM(0, W, lgf, w3, c < 11 ? c : -1);   /* (the 11 task planes) */
                 }
                 else if (ffd) nn_lat_up_slab(l2, unet_logits_h16(u), cfg.cout, W / 4, W / 4, W / 4, 0, W, lgf);   /* [cout][W][W][W] fp16: the accumulators' layout */
@@ -2320,7 +2320,7 @@ int cmd_predict(int argc, char **argv) {
                         }
                         nn_lat_up_slab(l2, unet_logits_h16(u), 2, W / 4, W / 4, W / 4, z0, 32, gsl);
                         if (cfg.lat_guide == 64) {   /* the sub-cell head: the side pair's per-voxel terms */
-                            if (!ufsm_env_on("UFSM_PRED_NOSHUF")) nn_lat_shuffle(l2, unet_logits_h16(u), W / 4, W / 4, W / 4, 16, 2, z0, 32, gsl);   /* (diagnostic: the interpolated base alone) */
+                            if (!ufsm_env_on("UFSM_PRED_NOSHUF")) nn_lat_shuffle(l2, unet_logits_h16(u), W / 4, W / 4, W / 4, cfg.cout - 128, 2, z0, 32, gsl);   /* (diagnostic: the interpolated base alone) */
                             if (cfg.fstem) PRED_FSTEM(z0, 32, gsl, ns_, c < 2 ? c : -1);
                             for (int c = 0; c < 2; c++) nn_d2d_async((char *)lgf + ((size_t)c * w3 + (size_t)z0 * hw_) * 2, (char *)gsl + (size_t)c * ns_ * 2, ns_ * 2);
                             continue;
@@ -2511,7 +2511,7 @@ int cmd_predict(int argc, char **argv) {
                     }
                     if (WR.skip) { if (writer_submit(&WR, sb, qz, qy, qx)) { fprintf(stderr, "%s\n", z3w_error()); return 1; } sb = writer_next(&WR, sb); sbuf = WR.buf[sb]; continue; }   /* --no-out */
                     nn_zero(dsh, WR.bytes);
-                    if (ldir && cfg.lat_guide == 64) nn_lat_place_rvs(l2d, unet_logits_h16(u), 16, W / 4, W / 4, W / 4, ct_shared ? nullptr : ctd, ct_shared ? ctmi : nullptr, nn_get_pred_iso(), halo, halo,
+                    if (ldir && cfg.lat_guide == 64) nn_lat_place_rvs(l2d, unet_logits_h16(u), cfg.cout - 128, W / 4, W / 4, W / 4, ct_shared ? nullptr : ctd, ct_shared ? ctmi : nullptr, nn_get_pred_iso(), halo, halo,
                                               (int)(tz - qo[0]), (int)(ty - qo[1]), (int)(tx - qo[2]), (int)(qe[0] - qo[0]), (int)(qe[1] - qo[1]), (int)(qe[2] - qo[2]), shard, dsh);
                     else if (ldir && cfg.lat_guide) nn_lat_place_rvg(l2d, unet_logits_h16(u), cfg.cout - cfg.lat_guide, W / 4, W / 4, W / 4, ct_shared ? ctcp : ctd, (float)mean, (float)(1.0 / sd), ct_shared ? nullptr : ctd, ct_shared ? ctmi : nullptr, nn_get_pred_iso(), halo, halo,
                                               (int)(tz - qo[0]), (int)(ty - qo[1]), (int)(tx - qo[2]), (int)(qe[0] - qo[0]), (int)(qe[1] - qo[1]), (int)(qe[2] - qo[2]), shard, dsh);
