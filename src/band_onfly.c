@@ -14,7 +14,7 @@
 typedef struct { float rmax; int halo; } onfly_ctx;
 static int g_gpu = -1, g_slots = 2, g_budget_mb = 1024;
 static int g_cpu_decode;   /* UFSM_ONFLY_CPU_DECODE=1: the codes decoded on the CPU (A/B) */
-static _Atomic uint64_t g_gputiles, g_reads, g_tiles, g_skipped, g_vout, g_vtile, g_ns_pair, g_ns_read;
+static _Atomic uint64_t g_gputiles, g_reads, g_tiles, g_skipped, g_vout, g_vtile, g_ns_pair, g_ns_read, g_ns_wait;
 static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + 1e-9 * t.tv_nsec; }
 
 /* device bytes of one tile of edge E (nn_band.cu bg_run: codes + phase + two int32 feature arrays, the envelope scratch of 4 int32 /
@@ -37,6 +37,7 @@ int phase_onfly_config(int gpu, int slots, int budget_mb, int reserve) {
 void phase_onfly_get_stats(phase_onfly_stats *st) {
     st->reads = g_reads; st->tiles = g_tiles; st->skipped = g_skipped; st->vox_out = g_vout; st->vox_tile = g_vtile;
     st->gpu_tiles = g_gputiles; st->s_pair = 1e-9 * (double)g_ns_pair; st->s_read = 1e-9 * (double)g_ns_read;
+    st->s_wait = 1e-9 * (double)g_ns_wait;
 }
 
 static int pair_tile(const uint8_t *codes, const int n[3], float rmax, uint8_t *phase) {
@@ -53,9 +54,11 @@ static onfly_buf g_ob[OB_MAX]; static pthread_mutex_t g_obmu = PTHREAD_MUTEX_INI
 static void ob_release(onfly_buf *B) { if (B->pinned) { band_pair_gpu_host_free(B->cb); band_pair_gpu_host_free(B->pb); } else { free(B->cb); free(B->pb); } free(B->rb); B->cb = B->pb = B->rb = nullptr; B->cap = 0; }
 static onfly_buf *ob_take(size_t cap) {
     const int n = g_slots < OB_MAX ? g_slots : OB_MAX; onfly_buf *B = nullptr;
+    const double tw = now_s();
     pthread_mutex_lock(&g_obmu);
     for (;;) { for (int k = 0; k < n; k++) if (!g_ob[k].busy) { B = &g_ob[k]; break; } if (B) break; pthread_cond_wait(&g_obcv, &g_obmu); }
     B->busy = 1; pthread_mutex_unlock(&g_obmu);
+    atomic_fetch_add(&g_ns_wait, (uint64_t)(1e9 * (now_s() - tw)));   /* (the queue for a tile buffer: --onfly-slots against the workers) */
     if (cap > B->cap) {
         ob_release(B);
         B->pinned = g_gpu >= 0 && band_pair_gpu_host_alloc && band_pair_gpu_host_free;

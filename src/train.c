@@ -2768,6 +2768,10 @@ int cmd_train(int argc, char **argv) {
             free(cov);
             sampler_hostmem(sq, stderr, 0);
             uint64_t prod = 0, rej = 0; sampler_stats(sq, &prod, &rej); fprintf(stderr, "sampler-only: produced %llu rejected %llu\n", (unsigned long long)prod, (unsigned long long)rej);
+            { phase_onfly_stats os; phase_onfly_get_stats(&os);
+              if (os.reads) fprintf(stderr, "sampler-only: onfly phase: %llu reads, %llu tiles (%llu GPU-decoded, %llu skipped), %.1f M tile voxels; per read: %.0f ms queued for a tile buffer, %.0f ms in the pair rule (%.0f ms a tile, %.0f Mvox/s of tile), %.0f ms in CPU codes reads\n",
+                                    (unsigned long long)os.reads, (unsigned long long)os.tiles, (unsigned long long)os.gpu_tiles, (unsigned long long)os.skipped, os.vox_tile / 1e6, 1e3 * os.s_wait / os.reads, 1e3 * os.s_pair / os.reads,
+                                    os.tiles ? 1e3 * os.s_pair / os.tiles : 0., os.s_pair > 0 ? os.vox_tile / 1e6 / os.s_pair : 0., 1e3 * os.s_read / os.reads); }
             sampler_prof_print(sq);
             store_io_report(stderr); fprintf(stderr, "z3: %llu chunks decoded straight into the window\n", (unsigned long long)z3_sink_chunks());
             { FILE *io = fopen("/proc/self/io", "r"); char ln[128]; while (io && fgets(ln, sizeof ln, io)) if (!strncmp(ln, "rchar", 5) || !strncmp(ln, "read_bytes", 10)) fprintf(stderr, "proc io: %s", ln); if (io) fclose(io); }
