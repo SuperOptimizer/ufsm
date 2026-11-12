@@ -6,6 +6,30 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Sources that silently drop out: --strict-sources and relative-scale groups (2026-11-12, branch strictsrc-20261112)
+
+The u1 P 1024 restart (step 10453) ran its first 315 steps with no PHerc1667 windows (14.9 + 7.5 + 7.5 = 29.9% of the weight): the local
+mirror's group json over 1667's levels 1-5 kept the source's relative scales (2, 4, 8, 16, 32) and listed no level 0. The OME reader
+treated a group as relative only when its first scale was 1.0, so it took 2.0 as um, matched no level, and the sampler logged
+"excluded: no training patch fits" and trained on. The fix was to rewrite the jsons in absolute um. This branch adds two guards:
+
+- train --strict-sources 1 (default 0; the launchers scripts/univ/u1.train.sh, scripts/rv/train.sh and scripts/v2/train-common.sh pass
+  ${STRICT:-1}): when a source with weight > 0 has no training level, sampler_start fails and train exits 1 with "fatal" and what to
+  check. Holdout (validation) samplers keep the log line.
+- pyramid_open_level classifies the group from all its listed scales, not only the first. The group is absolute when a scale is
+  um0 x 2^l (2% tolerance). It is relative when every scale is an exact power of two >= 1 and none is absolute. A relative group without
+  level 0 now resolves (level l = scale 2^l). A group that is neither prints one warning naming its scales and um0, and its levels don't
+  open, so the source is excluded and --strict-sources stops the run. Ambiguity: a source with um0 = 1 (or 2, 4, ...) whose scales are
+  powers of two counts as absolute, which is the same level either way.
+
+tests/test_strict_sources.sh (fast tier, gpu, ~25 s): (1) a weighted source pinned to level 3 (32^3 < P 64) is excluded and the run
+trains without the flag, and the run stops with "fatal" with --strict-sources 1; (2) the fixture's CT group rewritten to relative scales
+2 4 8 16 with no level 0 (symlinked arrays): a level-1 source trains under --strict-sources 1, and its step-1 loss (3.5656) equals the
+same source's on the absolute-um group. On master's binary, (2) logs "relative excluded" (the bug reproduced).
+
+Rule for downloaded groups (to diskclean): absolute-um scales only, each group checked with `ufsm info` and a sampler-only draw before
+a run points at it.
+
 ## MIL rays under --replay, the MIL checks, and the U2 ink smoke (2026-11-12, branch milfix-20261112)
 
 **Replays.** The MIL path from mil-20261112 below did not cover `--replay K`. A replay sends the window's planes back to the source
