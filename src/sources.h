@@ -93,6 +93,9 @@ typedef struct {
                                  round(p * 254) and passed through without erode / dilate / soft / trust band */
     int tgt_prob254[NTG];     /* "encoding": "prob254" (tgt_prob set too): bytes already p * 254 with 255 = unknown (ufsm ink-splat), read as
                                  stored, so unknown stays ignored */
+    struct fib_spec { char *afv, *extra, *map, *tr; double rad, guard, ring; int iso, plane; } *tgt_fib[NTG];   /* {"fibre": {afv, extra, map | tr,
+                                 radius, guard, ring, iso, plane "H" | "V"}}: the fibre planes computed per read from the polylines on the CT level's
+                                 grid (src/fiberraster.c fiber_onfly_open; prob254; the stored fiber-raster output byte for byte, at every level) */
     regions *reg[NTG];
     z3 **reg_z[NTG];        /* lazily opened region arrays */
     z3 *reg_shared[NTG];    /* the shared array when reg[ch]->array is set */

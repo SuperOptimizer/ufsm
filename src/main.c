@@ -127,6 +127,7 @@ int cmd_sheet_cut(int argc, char **argv);   /* src/sheetcut.c */
 int cmd_phase_score(int argc, char **argv);
 int cmd_ink_splat(int argc, char **argv);   /* src/inksplat.c */
 int cmd_ink_score(int argc, char **argv);   /* src/inksplat.c */
+int cmd_ink_vscore(int argc, char **argv);   /* src/inksplat.c */
 
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 static int arg_index(int argc, char **argv, const char *k) { for (int i = 2; i < argc; i++) if (!strcmp(argv[i], k)) return i; return -1; }
@@ -187,6 +188,7 @@ static int usage(void) {
         "  ufsm ink-ext --model v8in|hecate24|hecate96|reader3|ink9um --weights W --surface TIFXYZ --ct ROOT KEY --out DIR   external ink networks on a surface\n"
         "  ufsm ink-ensemble <out.tif> --ink [W:]INK.tif ..   per-model percentile-stretched weighted mean of ink renders\n"
         "  ufsm ink-splat <out-group> --surface TIFXYZ --labels L [--mask M] --ct ROOT KEY --ct-um U --iso I [--band -4,4] ..   published 2D ink labels -> sparse 3D label zarr\n"
+        "  ufsm ink-vscore --gt ROOT KEY --pred ROOT KEY --box z,y,x,nz,ny,nx   voxelwise AUC / F1 of a 3-D ink prediction vs a 3-D reference (ink-splat)\n"
         "  ufsm ink-score --surface TIFXYZ --labels L [--mask M] --map NAME=MAP.tif ..   F1 / AUC of 2D ink maps vs a segment's published labels\n"
         "  ufsm wl-dump <weights> [key]   the tensors of a safetensors / torch zip weight file\n"
         "  ufsm dinovol-embed ROOT KEY OUT --ckpt PT --box z,y,x,nz,ny,nx   scrollprize dinovol tokens / dense / ink embeddings (zarr v3)\n"
@@ -270,6 +272,7 @@ static int usage(void) {
         "  ufsm fiber-link <in.fib> <out.fib> [--gap-mm 0.3]   join traced fibre pieces end to end (gap, tangent continuity, lateral offset)\n"
         "  ufsm fiber-trace <root> <key-prefix> <out.fib> --box Z,Y,X,NZ,NY,NX [--scaledown 3]   streamlines through a published fibre prediction (presence, nx, ny) -> UFIB\n"
         "  ufsm fiber-raster <fibres.afv|.fib> OUT --um U (--shape Z,Y,X | --ct ROOT KEY)   H / V fibre mask labels (prob254) on the CT grid\n"
+        "  ufsm fiber-onfly <fibres.afv|.fib> --ct ROOT KEY [--ref H V KEY]   the fibre planes on the fly (sources \"fibre\" targets): ms / window, diffs\n"
         "  ufsm field-blend <out> <fields1> <fields2> ... [--weights a,b,..] [--tile SZ,SY,SX --grids z,y,x:..] [--conf mean]  fit fields averaged (phase: confidence-weighted complex mean; --tile: overlapping predicts, centre-weighted)\n"
         "  ufsm wind-score <sweep-dir> <codes-root> <codes-key>             the fit --codes score of a predict --cond-sweep winding raster\n"
         "  ufsm store-bench <root> <array-key> [--box 128,256,512] [--n 8] [--par 1] [--threads 16]   HTTP zarr fetch benchmark\n"
@@ -4627,6 +4630,7 @@ int cmd_wrap_dump(int argc, char **argv);      /* src/wrapdump.c */
 int cmd_fiber_judge(int argc, char **argv);    /* src/fiberjudge.c */
 int cmd_fiber_trace(int argc, char **argv);    /* src/fibertrace.c */
 int cmd_fiber_raster(int argc, char **argv);   /* src/fiberraster.c */
+int cmd_fiber_onfly(int argc, char **argv);
 int cmd_fiber_link(int argc, char **argv);     /* src/fiberlink.c */
 int cmd_count_field(int argc, char **argv);   /* src/countfield.c */
 int cmd_hires_phase(int argc, char **argv);   /* src/hiresphase.c */
@@ -4698,6 +4702,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "fiber-judge")) return cmd_fiber_judge(argc, argv);
     if (!strcmp(cmd, "fiber-trace")) return cmd_fiber_trace(argc, argv);
     if (!strcmp(cmd, "fiber-raster")) return cmd_fiber_raster(argc, argv);
+    if (!strcmp(cmd, "fiber-onfly")) return cmd_fiber_onfly(argc, argv);
     if (!strcmp(cmd, "count-field")) return cmd_count_field(argc, argv);
     if (!strcmp(cmd, "hires-phase")) return cmd_hires_phase(argc, argv);
     if (!strcmp(cmd, "phase-gate")) return cmd_phase_gate(argc, argv);
@@ -4735,6 +4740,8 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "jpeg-fit")) return cmd_jpeg_fit(argc, argv);
     if (!strcmp(cmd, "ink-ext")) return cmd_ink_ext(argc, argv);
     if (!strcmp(cmd, "ink-splat")) return cmd_ink_splat(argc, argv);
+    if (!strcmp(cmd, "ink-score")) return cmd_ink_score(argc, argv);
+    if (!strcmp(cmd, "ink-vscore")) return cmd_ink_vscore(argc, argv);
     if (!strcmp(cmd, "ink-cover")) return cmd_ink_cover(argc, argv);
     if (!strcmp(cmd, "ink-ensemble")) return cmd_ink_ensemble(argc, argv);
     if (!strcmp(cmd, "wl-dump")) return cmd_wl_dump(argc, argv);

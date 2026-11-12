@@ -101,7 +101,7 @@ test_afv                                       |              |     1 | ./$B/tes
 test_fiberjudge                                |              |     2 | ./$B/test_fiberjudge
 test_fibertrace                                |              |     1 | ./$B/test_fibertrace
 test_fibertrace_dyad                           |              |     1 | ./$B/test_fibertrace_dyad
-test_fiberraster                               |              |     2 | ./$B/test_fiberraster
+test_fiberraster                               | gpu          |     2 | ./$B/test_fiberraster
 test_fiber_link                                |              |     1 | ./$B/test_fiber_link
 test_ftrace_gpu                                | gpu          |     2 | ./$B/test_ftrace_gpu
 test_flatten                                   |              |    11 | ./$B/test_flatten
@@ -237,4 +237,5 @@ test_lat                                       | gpu          |     1 | ./$B/tes
 test_latents                                   | gpu          |    25 | bash tests/test_latents.sh ./$B/ufsm ./$B/make_wind_fixture
 test_lat_fuse                                  | gpu          |     2 | ./$B/test_lat_fuse
 test_phase_onfly                               | gpu          |    20 | tests/test_phase_onfly.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/onfly
+test_fibre_onfly                               | gpu          |    25 | tests/test_fibre_onfly.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/fibonfly
 test_lldec                                     | gpu          |     3 | ./$B/test_lldec $TMPDIR/lldec

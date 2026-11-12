@@ -6,6 +6,103 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## The fibre H / V planes on the fly from the polylines (2026-11-11, branch univ-20261111)
+
+Item 5 of the on-the-fly list: fiber-raster's H / V prob254 planes (labels/ 55 GB + labels2/ 6 GB on the desk) computed per read box
+from the AFV / UFIB polylines, so a fibre source needs the CT and the tracing only.
+- fiber-raster's shard body is now `fr_box` (any box: the polyline query and steps over the box + the reach radius + guard + ring,
+  the stamp, the CT air test, the combine); a voxel depends only on the steps within the reach and its own CT byte, so any box gives
+  the shard raster's bytes. `fiber_onfly_open` (fiberraster.h) wraps it as two derived arrays (zarr3.h `z3_open_derived`) over a CT
+  level, H and V from one computation (a reading thread keeps its last box, so the V read after the H read is free).
+- Sources: a target `{"fibre": {"afv", "plane": "H" | "V", "radius", "guard", "ring", "iso", "extra", "map" | "tr"}}` on any channel
+  (fibre_h / fibre_v, or recto / sheet for the older fibre runs); computed on the CT level of the read, so every level has native
+  planes (radius etc. in that level's voxels, as fiber-raster --level). Channels with the same options share one context.
+- GPU (`nn_fibre.cu`, `--onfly-gpu`, buffers for (P + 64)^3 reserved before the planner): the steps (host: from the polylines,
+  compacted to those whose reach cube meets the box) are binned on the device to 4 x 4 x 8 voxel blocks (count, cub scan, fill), one
+  thread per voxel classes each step's code (<= radius, <= radius + guard, stamped) in float with a 1e-2 margin and falls back to
+  fr_stamp's double arithmetic (no FMA, IEEE sqrt) only near a class boundary; the planes depend on the codes only through these
+  classes. CPU fallback (UFSM_FIBRE_CPU=1 or no nn_fibre.o).
+- Byte identity: test_fiberraster (fixture: plain, --ring --extra, --ct; whole / partial / outside boxes; CPU and GPU), test_fibre_onfly
+  (fiber-onfly vs fiber-raster on curved crossing fibres over the wind fixture, GPU and CPU; three --det --fib-head runs, stored /
+  onfly GPU / onfly CPU: identical losses), and PHerc1447 (labels/, radius 2 guard 3 iso 64): 26 windows of 512^3 and 896^3, 0
+  differing bytes against the stored planes.
+
+Per 896^3 PHerc1447 window with fibres (1.6-1.9M steps), desk 5060 Ti (GPU 1):
+
+| stage | CPU fr_box (before) | GPU, 8^3 blocks, double | + int cubes, float classes | + 4x4x8 blocks, device bins |
+|---|---|---|---|---|
+| polylines (sqlite query + steps), CPU | 0.07-0.15 s | same | same | same |
+| stamp + combine | ~13 s (512^3: 2.4-3.9 s) | 0.8-0.9 s kernel | 0.45 s | 52-117 ms kernel |
+| bins / compaction (CPU) | | 0.13-0.2 s | 0.1-0.2 s (8^3), 0.8-1.0 s (4x4x8) | 0.06-0.12 s (compaction only) |
+| H2D + D2H (pinned planes) | | ~0.4 s | ~0.4 s | ~0.1-0.2 s |
+
+Empty windows (air / no tracing): ~0.1-0.15 s GPU (the planes' copies). The CT air test reads the window's CT again (the CLI: 0.7-1.3 s
+on one thread, no cache; in training through the shared decoded-CT cache the sampler's own read warmed). Still on the CPU, and why:
+the sqlite polyline query and the step generation (~0.1 s, irregular), the step compaction (~0.1 s), the CT read for the air test
+(the window's CT is on the device for the GPU input build, but the label planes are built on the host: the device-resident label
+plane step removes both copies).
+## 3-D ink targets from the human labels: inventory, the open face, held-out crops (2026-11-11, branch inkgt-20261111)
+
+Goal (universal net U4): train the ink head on human ink ground truth instead of only teacher rasters, and score it against the
+same labels on held-out regions.
+
+**Inventory.** Every published human ink label set is 2-D: per-segment `inklabels` + `supervision` (+ some `validation`) on the
+tifxyz canvas (label px = mesh px). Two copies exist: HF scrollprize/datasets `ink/<scroll>/<seg>` (TIFF + zarr) and open-data
+`<scroll>/segments/<id>/ink-labels/<um>-volume-<scan>/20260918/` (OME zarr), each next to a `tifxyz-transformed` mesh on the
+same scan. They are one label set (20260918). The open-data metadata.json names each set's target scan. Licence CC BY-NC 4.0
+(open-data LICENSE.txt). HF `ink_9um` holds the same labels pooled to 9.6 um; `ink/unused` holds model predictions only.
+
+| scroll | segs | scan (level 0) | supervised mm^2 | ink |
+|---|---|---|---|---|
+| PHerc Paris 4 | 8 | 20260411134726 2.400 um | 8230 | 26 % |
+| PHerc1667 | 6 | 20251217075048 2.399 um | 2868 | 24 % |
+| PHerc0139 | 8 + 2 HF-only (w016, w030_2026) | 20260102150214 2.399 um | 981 | 32 % |
+| PHerc0841 | 3 | 20260319124803 2.403 um | 340 | 25 % |
+| PHerc0009B | 1 | 20250820154339 2.401 um | 258 | 22 % |
+| PHerc0500P2 | 1 | 20250526151718 2.215 um | 220 | 21 % |
+| PHercMAN5 | 1 (HF only) | 20260311104824 2.399 um | 65 | 29 % |
+| PHerc0814 | 1 | 20260309142202 2.399 um | 54 | 31 % |
+
+All 8 scans are on the volcomp mirror. HF's 841 and 814 meshes are not on those scans: their CT depth profile is flat. The open-data
+copies are aligned and are the ones used (scripts/inkgt: segs.tsv rows = the 28 open-data sets plus the 3 HF-only ones, checked
+not to overlap the open-data meshes).
+
+**Where the label sits in depth.** CT depth profiles (`ink-splat --profile`, 2048^2 labelled window per segment, all 31) show the
+same two things everywhere. First, +N of ink-splat's normal (du x dv) points to the umbilicus: N . (axis - P) > 0 on 94-100 % of
+the vertices of every Paris 4 / 0139 / 1667 segment. Second, the open face is on +N (papyrus bulk on -N). The mesh's distance from
+that face is not fixed: the papyrus-fraction edge sits at t = +2 .. +16 voxels (2.4 um) depending on the segment. This is the
+sheet-pbr finding (labels 1-8 voxels outward of the tracked recto) seen from the label side. A fixed band around the mesh therefore
+labels a varying slice of sheet interior.
+
+`ink-splat --face A,B` places the band per label pixel relative to the open face instead of the mesh:
+- Along sign N, t = --face-search -6 .. 20 level-0 voxels, it samples the output level's CT (trilinear, [1 2 1] smoothed).
+- The face f is the end of the first papyrus run (>= 3 samples >= iso) that ends at t >= -4 and starts at t <= 8, provided >= 2
+  samples below iso follow.
+- The label goes to t in [f + A, f + B]. A pixel without such a face stays unknown.
+
+With A,B = -6,0 (the outermost ~14 um of papyrus at the recto face), iso 64 (the CT valley is 54-70 on these scans) and 4.8 um
+output, the face is found on 52-83 % of supervised pixels per scan (841 / 0009B / 0500P2 ~53 %: packed sheets; MAN5 83 %). Face
+offsets p10..p90 are -3 .. +17 voxels. Face-relative profiles have papyrus fraction 0.94-1.00 over t = -6 .. 0 and 0.00 at +2,
+for ink and no-ink pixels alike. The ink - no-ink CT difference in that band is small and of either sign (-8 .. +8), so the labels
+are not a density signal at this resolution (as in sheet-pbr).
+
+**Targets.** /vesuvius/ufsm/inkgt/gt/<scroll>.zarr: prob254 (254 ink, 0 no ink, 255 unknown) on the scan's level-1 grid (4.8 um)
++ known-max pyramid, 512^3 shards, 3-74 MB per scan. Each scan is the merge of every segment's 16384^2 label windows
+(scripts/inkgt/windows.py, splat_all.sh: --face -6,0 --iso 64 --level 1, about 40 CPU-min for 2.2 G supervised px). They are
+stored, not splatted in the sampler, because a per-window splat would need the meshes and 2-D labels inside the loader. Held out
+(--exclude, and the sources' holdout_file /vesuvius/ufsm/inkgt/holdouts-ink.json):
+- every wbench box, with the 9.362 um boxes of 0139 / 0814 / 0500P2 mapped into the fine scans by the xres reg maps
+  (`ufsm reg map --box`);
+- the 16 Paris 4 ink eval crops (wbench/inkeval/crops);
+- 8 new crops on PHerc0139 (w040, w044) and PHerc1667 (w029, w013) in the same layout (scripts/inkgt/mkcrops.py ->
+  /vesuvius/ufsm/inkgt/evcrops; box = the crop surface's bbox +- 32 voxels).
+The held-out crops are also splatted alone (splat_eval.sh -> inkgt/evgt/<crop>.zarr) as their 3-D references.
+
+**Scoring.** `ufsm ink-vscore --gt R K --pred R K --box ...`: at the voxels known in both, AUC (tie-aware), best F1, F1 / P / R at
+0.5. scripts/inkgt/baseline.sh PRED runs it on the 24 crops (3-D), plus render + ink-score (2-D, the latres column) for networks.
+Floor, the CT itself as the score: 3-D AUC 0.513, best F1 0.443 (= the all-ink F1 at ~30 % ink) over the 24 crops.
+(`ink-score` had lost its dispatch in main.c in 129afd3; restored.)
+
 ## The winding phase on the fly from the codes (2026-11-11, branch univ-20261111)
 
 User: the phase computed from the codes per window, "on the gpu", "so that we dont have so many artifacts". A 4.8 um phase set is ~10x
@@ -54,7 +151,9 @@ Stored artifacts the universal sources still need, and why (2026-11-11):
 - stored phase for the fused sets (PHerc0139, 0500P2, the 1667 9.6 um "phase"): their phase is the circular mean of two code sets
   where they agree; onfly computes one set. Paris 4 p4full: until its 2x-pooled codes are written (codes-pool2) or it is relabelled.
 - recto / verso, normal, density, wind4 targets: already derived per window in the sampler from the phase (no stored rasters).
-- fibre H / V rasters (79 GB), teacher rasters, registered-twin warps: stored; on-the-fly versions are the later items of the list.
+- fibre H / V rasters: on the fly from the AFV / UFIB tracings since the section above (sources "fibre" targets); the stored
+  labels/ and labels2/ can go once no sources file references them.
+- teacher rasters, registered-twin warps: stored; on-the-fly versions are the later items of the list.
 
 nsys on a 420^3 tile (desk): x pass 45 -> 1.8 ms, the y / z envelopes 99 -> 57 ms (90% of what remains), pair kernel 4-8 ms, copies
 13 ms. Rastering a whole set once is ~1.6T voxel-work (1667 A: 77 min on the desk GPU); one u1-length run at ~16% onfly windows
