@@ -229,6 +229,7 @@ static int g_gc;
    level, as for scans with no finer data; validation and predict always use it) */
 static int g_fstem, g_fs_n, g_fs_ch[16]; static float g_fs_drop = 0.25f;
 static float src_head_w(int si, int h) { return (si >= 0 && g_S && si < g_S->n ? g_S->src[si].head_w[h] : 1.f) * g_hmul[h]; }   /* the source's "heads" multiplier x --uw */
+static double g_reject_warn = 100;
 static int g_mil, g_mil_mode = 1, g_mil_stride = 2, g_mil_max = 65536; static float g_mil_R = 10.f, g_mil_step = 1.f, g_mil_tau = 0.f, g_mil_lambda = 1.f;   /* --ink-mil L
    (--ink-head): the normal-pooled MIL ink loss on each window's rays (inkmil.h): per supervised label pixel (mode 1: only those without an open face, the
    voxel target's unknowns), BCE of the pooled ink logit along the normal over +-R window voxels at step (tau 0: max; > 0: tau log mean exp), the mean
@@ -2479,7 +2480,8 @@ int cmd_train(int argc, char **argv) {
     if (atoi(opt(argc, argv, "--intonly", "0"))) sc.augment = 4;   /* diagnostic: intensity jitter, no symmetry */
     sc.aux = g_xc == 5; sc.cond = g_cond; sc.cond_outside = g_cond_outside; sc.pap_head = g_pap_head ? &g_paph : nullptr;
     sc.band = g_aff; sc.side = g_side; sc.pmask = g_unwrap;   /* unwrap: the phase only (band codes per window, or the stored phase) */ sc.side_air = atoi(opt(argc, argv, "--side-air", "0"));
-    sc.strict_sources = atoi(opt(argc, argv, "--strict-sources", "0"));   /* 1: a weighted source the sampler cannot draw is fatal (launchers: on) */
+    sc.strict_sources = atoi(opt(argc, argv, "--strict-sources", "0"));
+    g_reject_warn = atof(opt(argc, argv, "--reject-warn", "100"));   /* the draws line's per-source drops per new window above which it warns */   /* 1: a weighted source the sampler cannot draw is fatal (launchers: on) */
     sc.ink_mil = g_mil; sc.mil_mode = g_mil_mode; sc.mil_stride = g_mil_stride; sc.mil_max = g_mil_max; sc.mil_R = g_mil_R;   /* --ink-mil: the windows' rays (batch.mil) */
     sc.ink_plane = IPLANE;   /* --ink-head: the sources' "ink" targets on their own plane (batch.ink); --rv: the papyrus plane there */
     sc.ink_fib = g_aux_of[AUX_FIB] == 0; sc.fib_sheet = g_fibn && !g_ink2;   /* --fib-normal-lambda: the "fibre" target, else (no ink head) the "sheet" / "ink" one */
@@ -3904,7 +3906,15 @@ int cmd_train(int argc, char **argv) {
                     for (int si = 0; si < S->n; si++) { uint32_t dd[SL_N]; for (int k = 0; k < SL_N; k++) dd[k] = cur[si][k] - prev[si][k];
                         o += snprintf(ln + o, sizeof ln - o > 0 ? sizeof ln - o : 0, " %s %.1f/%.1f (%u/%u/%u/%u)", S->src[si].name, newt > 0 ? 100 * dd[SL_PROD] / newt : 0, wt > 0 ? 100 * S->src[si].weight / wt : 0,
                                       dd[SL_HOLD], dd[SL_EMPTY], dd[SL_PROBE], dd[SL_FG]); }
-                    fprintf(stderr, "%s\n", ln); memcpy(prev, cur, (size_t)S->n * sizeof *cur); free(cur);
+                    fprintf(stderr, "%s\n", ln);
+                    /* a source dropping far more draws than it delivers (a missing coarse CT level, a draw index that misses the labels):
+                       its share can look normal while its workers spend 300x the reads (diskclean 2026-11-12); --reject-warn R (100; 0 off) */
+                    for (int si = 0; si < S->n && g_reject_warn > 0; si++) { const uint32_t pr = cur[si][SL_PROD] - prev[si][SL_PROD];
+                        const uint32_t dr = cur[si][SL_HOLD] - prev[si][SL_HOLD] + cur[si][SL_EMPTY] - prev[si][SL_EMPTY] + cur[si][SL_PROBE] - prev[si][SL_PROBE] + cur[si][SL_FG] - prev[si][SL_FG];
+                        if (dr > g_reject_warn * (pr > 0 ? pr : 1)) fprintf(stderr, "WARNING draws: %s dropped %u draws for %u new windows (%.3g per window, > --reject-warn %g; hold/empty/probe/fg %u/%u/%u/%u)\n",
+                            S->src[si].name, dr, pr, (double)dr / (pr > 0 ? pr : 1), g_reject_warn, cur[si][SL_HOLD] - prev[si][SL_HOLD], cur[si][SL_EMPTY] - prev[si][SL_EMPTY],
+                            cur[si][SL_PROBE] - prev[si][SL_PROBE], cur[si][SL_FG] - prev[si][SL_FG]); }
+                    memcpy(prev, cur, (size_t)S->n * sizeof *cur); free(cur);
                 }
                 if (g_rv == 2) { o = snprintf(ln, sizeof ln, "rv bce by source steps %d-%d:", step - mix_every + 1, step);
                     for (int si = 0; si < S->n; si++) if (mixrvn[si] > 0) o += snprintf(ln + o, sizeof ln - o > 0 ? sizeof ln - o : 0, " %s %.4f (%.0f)", S->src[si].name, mixrv[si] / mixrvn[si], mixrvn[si]);
