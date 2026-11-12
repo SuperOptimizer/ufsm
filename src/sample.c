@@ -311,11 +311,12 @@ static inline int64_t hb_n(const source *h, int k, int d) { return k ? h->hold[k
 static int same_ct(const source *a, const source *b) {
     return a == b || (a->um == b->um && !strcmp(a->ct_key, b->ct_key) && !strcmp(store_root(a->s), store_root(b->s)));
 }
-static int training_hits_holdout(const sampler *sp, const source *s, const int64_t o[3], int l) {
+static int training_hits_holdout_(const sampler *sp, const source *s, const int64_t o[3], int l, int only_rej) {
     const int64_t span[3] = {(int64_t)PZ(&sp->cfg) << l, (int64_t)sp->cfg.P << l, (int64_t)sp->cfg.P << l};
     for (int i = 0; i < sp->S->n; i++) {
         const source *h = &sp->S->src[i]; if (!src_nhold(h) || !same_ct(s, h)) continue;
         for (int k = 0; k < src_nhold(h); k++) {
+            if (only_rej && !(h->hold_rej && h->hold_rej[k])) continue;
             int hit = 1;
             for (int d = 0; d < 3; d++) { int64_t a = o[d] << l; if (a + span[d] <= hb_o(h, k, d) || a >= hb_o(h, k, d) + hb_n(h, k, d)) hit = 0; }
             if (hit) return 1;
@@ -354,6 +355,7 @@ static void hold_fill(uint8_t *p, const int32_t (*hb)[6], int nb, int P, uint8_t
     for (int b = 0; b < nb; b++) for (int z = hb[b][0]; z < hb[b][3]; z++) for (int y = hb[b][1]; y < hb[b][4]; y++)
         memset(p + ((size_t)z * P + y) * P + hb[b][2], v, (size_t)(hb[b][5] - hb[b][2]));
 }
+static int training_hits_holdout(const sampler *sp, const source *s, const int64_t o[3], int l) { return training_hits_holdout_(sp, s, o, l, 0); }
 /* Any free cell of the origin grid begins at lo or just after a forbidden interval.
    Check these corners to reject a source covered by the union of same-CT holdouts. */
 static int training_corner_exists(const sampler *sp, const source *s, int l, const int64_t lo[3], const int64_t hi[3]) {
@@ -2508,7 +2510,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
     if (!c->holdout) {   /* (the mask is a property of the volume: the guard of a box masks windows that do not reach the box itself too) */
         const int mask_mode = (s->hold_mode ? s->hold_mode == 1 : !c->holdout_reject) && !c->sheet && !c->cond && !c->emb_ch;
         if (mask_mode) nhb = holdout_window_boxes(sp, s, o, n, l, c->holdout_guard, hb, HB_MAX);
-        if (mask_mode ? nhb < 0 : training_hits_holdout(sp, s, o, l)) { atomic_fetch_add(&sp->rej_why[3], 1); SL_ADD(SL_HOLD); return 1; }
+        if (mask_mode ? nhb < 0 || training_hits_holdout_(sp, s, o, l, 1) : training_hits_holdout(sp, s, o, l)) {   /* (mask mode: "holdout_reject" boxes still reject) */ atomic_fetch_add(&sp->rej_why[3], 1); SL_ADD(SL_HOLD); return 1; }
         if (nhb) SL_ADD(SL_MASKED);
     }
     PROF_MARK(PS_PICK);

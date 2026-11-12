@@ -22,6 +22,8 @@ z3 *codes_pool2_open(z3 *codes);
    the view leaves it open) */
 int phase_pool2_box(z3 *ph, const int64_t ro[3], const int64_t rn[3], uint8_t *out, int nthreads, int ign);
 z3 *phase_pool2_view(z3 *phase, int ign);
+/* a phase view's reads so far: coarse voxels with >= 1 known child, and of them known after the pooling (the rest: incoherent blocks) */
+int phase_pool2_view_stats(const z3 *view, uint64_t *any, uint64_t *known);
 /* several phase sets of one scroll on one grid (each phase_onfly_open'd or stored; all taken over, closed on failure too) fused as
    phase-fuse does (src/fuse.h fuse_phase, --tol turns): byte-identical to `ufsm phase-fuse` over the same sets' rasters */
 z3 *phase_onfly_fuse_open(z3 **sets, int n, float tol);
