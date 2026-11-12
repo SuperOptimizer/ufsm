@@ -6,6 +6,19 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## The on-the-fly phase no longer holds a tile buffer per window (2026-11-12, branch onflyslots-20261112)
+
+perf's pod sampler profile (P 1024, 10 workers) found the on-the-fly phase read was 74% of the window time, with 3.25 busy cores of 40.
+onfly_read took one of the `--onfly-slots` host tile-buffer sets for the whole window and held it through every tile: the GPU tiles,
+and the CPU-side chunk packing too, though only the CPU fallback uses the set. So 2 sets served 10 workers.
+- Now each GPU tile's interior lands in a per-thread pinned buffer, grown once to the largest tile.
+- The buffer set is taken lazily, at the first tile that falls back to the CPU.
+- The device contexts were already taken per tile inside band_pair_gpu_codes. --onfly-slots now bounds only pair-rule work in
+  flight on the GPU, and packing overlaps across all workers.
+- Same bytes: test_phase_onfly (CPU / GPU / small tiles / fused / pooled), test_mesh_phase and test_unwrap2_sampler pass.
+- On the desk (u1, P 1024, --onfly-slots 1) the read is 23-25 s per window, about 6 reads per 50 steps.
+- The pod numbers before and after come from perf (slots 2 / 4 / 6).
+
 ## MIL rays under --replay, the MIL checks, and the U2 ink smoke (2026-11-12, branch milfix-20261112)
 
 **Replays.** The MIL path from mil-20261112 below did not cover `--replay K`. A replay sends the window's planes back to the source
