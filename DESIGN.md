@@ -6,6 +6,51 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## The post-slab chain faster, same bytes: wraps, snap, join, stripimg (2026-11-12, branch postperf-20261112)
+
+The unroll's chain after the slab fits (scripts/unroll/unroll.sh: join, check, wraps, trim, snap, strip, stripflat, stripimg) on the
+Paris 4 u1 run took 2147 s: join 148, check 6, wraps 315, trim 19, snap 584, strip 58, stripflat 414 (GPU), stripimg 603 (GPU). All
+changes below give byte-identical outputs (checked file by file against the u1 runs of Paris 4 and 1667; deterministic stages only).
+CPU numbers at 8 threads on the loaded desk (the runs had 20).
+
+**wraps** (97% of its time in the root search along each ray, fp64 W evaluations). Counted on a 500-row band of Paris 4: 12.9e9
+evaluations, of which 69% for rays that keep no vertex: their first crossing ring lies outside the data bounds [ua, ub] (50 M rays, 129
+evaluations each) or there is no crossing at all (13 M rays, 189 each). The ring scan steps dr = pitch / 4 from the hint on both sides and
+only needs a side's value where its class (sign of W - k, and the side's stop at +-2) can change. A local Lipschitz bound of W along the ray
+(1 / pitch + |sin| gy + |cos| gx, gy / gx the largest lattice node differences per voxel over the 3 x 3 tiles of 8 x 8 cells around the
+point, per lattice z cell; fit_lip) gives a radius in which the class cannot change; those steps are not evaluated, and where a crossing
+interval starts at a skipped point its value is evaluated there (the same point: the same bits). Every ring, crossing interval and
+Illinois iteration is the full scan's: the same roots. A single per-plane bound was useless (outlier nodes: max 10 turns / voxel against a
+median of 0.01). Evaluations 12.9e9 -> 3.0e9 (no-vertex rays 129 / 189 -> 11 / 10 each, found roots 15 -> 9). Radii are only asked for when
+one could reach the next step. Idle workers now help with the rows of the tail's large wraps (each wrap's rows were on one thread).
+Paris 4 whole run: 695 -> 299 s wall, 5375 -> 2809 CPU s, 191 .sfc identical; 1667: 29.1 -> 24.1 s. test_wraps_core: the skipped scan vs
+the full one on 19200 random rays of a 3-slab set with outlier nodes, 0 differ (a bound 20x too tight: 1522 differ). What is left: the root
+search ~45%, the .sfc encoder ~26% (the same codec is most of strip's 58 s and of snap's write), the w plane decode ~9%.
+
+**snap** (wrap-snap: evidence along each vertex's ray, then per-wrap solves). Only the wraps the strip keeps are snapped now (trim's
+--first / --last into wrap-snap; the ids just outside are still read as the neighbours that bound them, so the kept wraps are unchanged:
+19% of Paris 4's vertices, 15% of 1667's not snapped). The evidence: trilinear lookups with one chunk lookup for the 8 corners and shifts
+for the power-of-two chunks (they did 3 int64 divisions + 3 modulos per corner), the phase of --target mix only at candidate maxima (it was
+every profile sample: half of all lookups), the per-vertex getenv out, box filters 8 lines at once (a column pass read 1 float of 16 per
+cache line), only the marked volcomp substreams (16 z x 32 y slabs) of each chunk decoded, and the CT mask scan along a ray skipped where
+its voxels lie in held substreams without a 0. Paris 4 wraps 300..320 (21 snapped, 237 M vertices, the run's .sfc identical): 148.5 ->
+85.3 s, 1169 -> 651 CPU s (evidence 130 -> 68 s, of which the volcomp decode 36 -> 30 s); 1667 all: 71.8 -> 40.8 s (with --last 39). The
+decode is now ~45% of the CPU: unroll.sh SNAPGPU (default: the first FITGPUS GPU that is not INKGPU, idle after the slabs) runs it on the
+GPU decoder (UFSM_GPU_DECODE, byte-identical), to be measured in a GPU window (scripts/unroll/postperf_gpu.sh).
+
+**join** (fit-join): the field blocks recycled their planes (the page faults and zeroing of a fresh 2.5 GB block per 128 rows were 257 of
+723 CPU s), the overlap / ref cell sampling without a 64-bit division per material cell (masks of 64 cells, AVX-512 + pdep), the next
+block loaded on a thread while the current block's tasks sample (3 slots, +1 block of RAM). Paris 4: 216 -> 131 s, 723 -> 513 CPU s (the
+recycling and the sampling; the prefetch measured on 1667 only: 20.5 -> 14.5 s); joined/ identical. UFSM_JOIN_TIMES prints the parts.
+
+**stripimg**: the stretch's 3 middle stripe renders ran one after another (Paris 4 3 x 28 s, 1667 26 + 15 + 10 s); now at once (SJOBS:
+3 with >= 72 GB available, 2 with >= 48; each ~21 GB RSS and a 4 GB device pool on Paris 4). Independent renders: the same images, to be
+confirmed in a GPU window (postperf_gpu.sh compares both schedules' files, the run's fill maps and stretch). The 19 other renders ran
+with RJOBS 1 on Paris 4 (RJOBS 2 needs 64 GB available); each is ~25 s, half of it CPU (grids 4.5, fill 3.6, writes 4.5 s).
+
+Not changed: stripflat (414 s, GPU SLIM per chunk, its job count tuned 2026-10 on 0490B), check (6 s), trim (19 s), strip (58 s: the .sfc
+encode of the whole strip at 19 cores; the codec is the next lever for wraps, snap and strip together, ~2000 CPU s on Paris 4).
+
 ## U2's host memory: the inventory, and the two per-thread buffers that only grew (2026-11-12, branch poolcap-20261112)
 
 U2 on the pod (8 workers / 10 slots, a 175 GB cgroup shared with every other job) went from 68 to 116 GB of host memory in 19 minutes and
