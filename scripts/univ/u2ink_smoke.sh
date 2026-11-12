@@ -13,7 +13,8 @@
 # crops whose labels have many face-less pixels (Paris 4: 42%). Desk: GPU=1 (flock gpu1 bench lock, dev slice); pod: K set, LOCK= .
 # Env: K (pod root; unset: the desk paths), IK (the staged inkgt dir, K/inkgt; its sibling inkeval/crops: the eval crops),
 #      U (binary with --ink-mil and the replay remap: master after milfix-20261112), INIT (u1 snapshot), SRCJ, STEPS (400),
-#      P (896 pod; desk 384), GPU (0), MILR (3), MILMODE (1), SCORE (1: run baseline.sh after each arm), EVERY (200: checkpoint and score every EVERY steps).
+#      P (896 pod; desk 384), GPU (0), MILR (3), MILMODE (1), SCORE (1: run baseline.sh after each arm),
+#      STOPAT (train only to this step: one GPU unit, scripts/univ/u2ink_pod.sh), EVERY (200: checkpoint and score every EVERY steps).
 set -uo pipefail; D=$(dirname "$(readlink -f "$0")"); ARMS=${*:-A B}
 if [ -n "${K:-}" ]; then   # pod: what pod_pack.sh / the u2ink staging put under K
   R=${R:-$K/runs}; U=${U:-$K/ufsm/build/ufsm}; INIT=${INIT:-$K/ckpt/u1-resume.ckpt}; IK=${IK:-$K/inkgt}; SRCJ=${SRCJ:-$IK/sources-u2ink.json}; BASIS=$K/small/klt1.lcb
@@ -31,11 +32,12 @@ INK="--ink-smooth 0.1 --ink-dice 0.25 --ink-bias -1"   # (the fresh ink row: log
 for arm in $ARMS; do
   case $arm in A) X="$INK";; B) X="$INK --ink-mil 1 --ink-mil-r $MILR --ink-mil-mode ${MILMODE:-1}";; *) echo "unknown arm $arm"; exit 2;; esac
   n=u2ink$arm; o=$R/$n
-  if [ ! -f $o/last.ckpt ] || [ "$(awk '/^step +[0-9]+ / {s=$2} END {print s + 0}' $o.log 2>/dev/null)" -lt $STEPS ]; then
+  TG=${STOPAT:-$STEPS}; SA=; [ -n "${STOPAT:-}" ] && [ "$STOPAT" -lt "$STEPS" ] && SA="--stop-at $STOPAT"   # (STOPAT: train to that step and save: a GPU unit; the schedule stays STEPS')
+  if [ ! -f $o/last.ckpt ] || [ "$(awk '/^step +[0-9]+ / {s=$2} END {print s + 0}' $o.log 2>/dev/null)" -lt $TG ]; then
     echo "== $(date '+%F %T') arm $arm: $o"
     (cd $R && R=$R U=$U SRCJ=$SRCJ GPU=$GPU LOCK=$LOCK P=$P ARCH="--widths 96,128,160,192" WORKERS=${WORKERS:-11} SLOTS=${SLOTS:-13} MEMMODE=auto \
        ALR=0.0001 MLR=0.002 WIND4L=0.25 ISO=64 MINMEM=${MINMEM:-16} SNAP=$EVERY CKPT=$EVERY WARM=50 LOGE=10 RELAUNCH=0 \
-       HEADS="$HEADS" EXTRA="$LAT $X --init-from $INIT" bash $D/u1.train.sh $n $STEPS)
+       HEADS="$HEADS" EXTRA="$LAT $X --init-from $INIT $SA" bash $D/u1.train.sh $n $STEPS)
   fi
   ch=$(head -c 200000 $o/last.ckpt | head -1 | grep -o '"ink":[0-9]*' | head -1 | cut -d: -f2)
   [ -n "$ch" ] || { echo "arm $arm: no ink channel in $o/last.ckpt"; continue; }

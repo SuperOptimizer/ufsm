@@ -5,7 +5,7 @@
 #   PRED = ct: the CT itself (level 1) as the score (a density-only floor);  PRED = ckpt:PATH:CH: channel CH of a ufsm checkpoint (predict, 4.8 um:
 #   the box in level-1 voxels, --full-grid 1 so the prediction sits on the CT grid like the GT).
 # Scores: 3-D  ink-vscore vs the crop's ink-splat --face reference (inkgt/evgt/<crop>.zarr)  -> $O/PRED/vscores.tsv
-# Env: U, O (outputs), D (the inkgt dir: evgt / evcrops), CROPS (the Paris 4 eval crops), CACHE (a pod: K/inkgt, K/inkeval/crops, K/cache).
+# Env: ONLY (one crop name: a GPU unit per crop), U, O (outputs), D (the inkgt dir: evgt / evcrops), CROPS (the Paris 4 eval crops), CACHE (a pod: K/inkgt, K/inkeval/crops, K/cache).
 #         2-D  render along the crop surface (--depth 4 at 4.8 um) + ink-score vs labels.tif  -> $O/PRED/scores.tsv   (not for ct)
 set -u
 P=${1:?ink3dext|ct|ckpt:PATH:CH}; GPU=${2:-1}; U=${U:-/home/forrest/ufsm-inkgt/build/ufsm}; M=https://dl.ash2txt.org/community-uploads/forrest/volcomp
@@ -14,7 +14,7 @@ mc() { if [ -x ~/bin/memcap ]; then ~/bin/memcap "$@"; else shift 2; "$@"; fi; }
 o=$O/$tag; mkdir -p $o; touch $o/vscores.tsv $o/scores.tsv; CACHE=${CACHE:-/vesuvius/ufsm/cache}
 P4K=PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr
 for c in $CR/w*_? $D/evcrops/PHerc*; do
-  n=$(basename $c); grep -qP "^$n\t" $o/vscores.tsv && continue
+  n=$(basename $c); [ -n "${ONLY:-}" ] && [ "$n" != "$ONLY" ] && continue; grep -qP "^$n\t" $o/vscores.tsv && continue
   read key um box gk box1 < <(python3 -I -c "import json,sys; j=json.load(open(sys.argv[1])); u = j.get('um', 2.4); b = j['box_l0']; print(j.get('ct','$P4K'), u, ','.join(map(str, b)), '%g' % round(2 * u, 3), ','.join(map(str, [v // 2 for v in b[:3]] + [(b[d] + b[3 + d] + 1) // 2 - b[d] // 2 for d in range(3)])))" $c/crop.json)
   if [ "$P" = ct ]; then pr=$M; pk=$key/1
   elif [ "$P" = ink3dext ]; then v=$o/vol/$n; pr=$v; pk=$gk
