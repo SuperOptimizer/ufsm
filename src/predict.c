@@ -526,6 +526,7 @@ typedef struct {
     /* row flushes on their own thread (half the CPUs), so the scatter of window chunks never waits for compression: a queue of
        kind-2 jobs; the slab flush (kind 1) waits for it to drain */
     pthread_t rth; ffw_job rq[FFW_Q]; int rqh, rqn, rbusy, rstop, rnt;
+    double t_slab, t_ring, t_copy, t_scat, t_rows; long n_slab, n_rows;   /* (UFSM_PRED_PROF: the writer's seconds in slab flushes, ring-slot waits, copy waits, scatters; the row thread's) */
 } ffw_t;
 static void *ffw_rows(void *arg) {
     ffw_t *W = arg;
@@ -535,7 +536,9 @@ static void *ffw_rows(void *arg) {
         if (!W->rqn) { pthread_mutex_unlock(&W->mu); break; }
         const ffw_job j = W->rq[W->rqh]; W->rqh = (W->rqh + 1) % FFW_Q; W->rqn--; W->rbusy = 1;
         pthread_mutex_unlock(&W->mu);
+        const double t0 = now();
         if (!atomic_load(&W->fail) && ffz_flush(W->zw, W->sl, j.slab, W->F, W->FS, W->FZ, j.q0, j.q1, j.y0, j.y1, W->done, 0, W->rnt, &W->rg)) atomic_store(&W->fail, 1);
+        W->t_rows += now() - t0; W->n_rows++;
         if (W->rg.NR > 1 && !atomic_load(&W->fail)) ffring_release(&W->rg, W->sl, j.slab, (int64_t)j.y0 * W->FS / W->rg.YR, W->F[2]);   /* (a whole ring row) */
         pthread_mutex_lock(&W->mu); W->rbusy = 0; pthread_cond_broadcast(&W->cv); pthread_mutex_unlock(&W->mu);
     }
@@ -552,8 +555,10 @@ static void *ffw_main(void *arg) {
         pthread_cond_broadcast(&W->cv);
         pthread_mutex_unlock(&W->mu);
         if (j.kind == 1) {   /* the slab is left: the row flusher drained, then the rows left (all CPUs) and the reset */
+            const double t0 = now();
             pthread_mutex_lock(&W->mu); while (W->rqn || W->rbusy) pthread_cond_wait(&W->cv, &W->mu); pthread_mutex_unlock(&W->mu);
             if (!atomic_load(&W->fail) && ffz_flush(W->zw, W->sl, j.slab, W->F, W->FS, W->FZ, 0, W->FZ / W->FS, 0, 1 << 30, W->done, 1, 0, &W->rg)) atomic_store(&W->fail, 1);
+            W->t_slab += now() - t0; W->n_slab++;
             continue;
         }
         if (j.kind == 2) {   /* to the row flusher (its chunks are scattered: FIFO) */
@@ -564,15 +569,20 @@ static void *ffw_main(void *arg) {
         if (W->rg.NR > 1) {   /* the chunk's ring slot: taken once its previous row is written (that row's flush is queued ahead: FIFO) */
             const int64_t rr = j.c1 / W->rg.YR, g = j.slab * W->rg.nRR + rr; const int s = (int)(rr % W->rg.NR);
             if ((j.c1 + j.ny - 1) / W->rg.YR != rr) { fprintf(stderr, "predict: --fit-zarr: a window's cells span two slab rows\n"); atomic_store(&W->fail, 1); }
+            const double t0 = now();
             pthread_mutex_lock(&W->mu);
             while (W->rg.own[s] != g && W->rg.own[s] != -1 && !atomic_load(&W->fail)) pthread_cond_wait(&W->cv, &W->mu);
+            W->t_ring += now() - t0;
             if (W->rg.own[s] == -1) W->rg.own[s] = g;
             pthread_mutex_unlock(&W->mu);
         }
+        const double tc = now();
         nn_event_sync(W->evd[j.b]);
+        const double ts = now(); W->t_copy += ts - tc;
         const uint8_t *hb = W->h[j.b];
         if (!atomic_load(&W->fail)) for (int a = 0; a < j.nz; a++) for (int b = 0; b < j.ny; b++) for (int k = 0; k < ffz_np; k++)
             memcpy(ffz_row(W->sl[k], &W->rg, W->F[2], (int)(j.cz + a - j.slab * W->FZ), (int64_t)j.c1 + b) + j.c2, hb + k * j.nl + ((size_t)a * j.ny + b) * j.nx, (size_t)j.nx);
+        W->t_scat += now() - ts;
         pthread_mutex_lock(&W->mu); W->busy[j.b] = 0; pthread_cond_broadcast(&W->cv); pthread_mutex_unlock(&W->mu);
     }
     return nullptr;
@@ -2576,6 +2586,8 @@ int cmd_predict(int argc, char **argv) {
         for (; ffslab * FZ < ffF[0]; ffslab++) ffw_push(&ffw, (ffw_job){.kind = 1, .slab = ffslab});
         const double tfin = now();
         if (ffw_on && ffw_finish(&ffw, ffw_th)) { fprintf(stderr, "predict: %s\n", z3w_error()); return 1; }
+        if (ffw_on && pprof) fprintf(stderr, "predict profile (s): fit writer: slab flushes %.2f (%ld), ring-slot waits %.2f, copy waits %.2f, scatters %.2f | row flushes %.2f (%ld, %d threads)\n",
+                                     ffw.t_slab, ffw.n_slab, ffw.t_ring, ffw.t_copy, ffw.t_scat, ffw.t_rows, ffw.n_rows, ffw.rnt);
         if (pprof) fprintf(stderr, "predict profile (s): fit writer tail (the last field slabs) %.2f\n", now() - tfin);
         for (int k = 0; k < ffz_np; k++) { z3w_close(ffzw[k]); free(ffsl[k]); }
         free(ffw.done); free(ffw.rg.own);
