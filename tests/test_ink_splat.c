@@ -202,6 +202,30 @@ int main(void) {
         }
         free(rb); if (ref) z3_close(ref); store_close(s7); store_close(cs);
     }
+    /* validation rasters (per-pixel holdouts): the stored splat with --val (exclude, then only) == the on-the-fly target with the segment's
+       "validation", and exclude + only together cover the plain splat's known voxels */
+    {
+        uint8_t *vr = calloc((size_t)CW * CHh, 1); for (int r = 0; r < CHh / 3; r++) memset(vr + (size_t)r * CW, 1, CW);   /* (0/1: the 0/1 rule) */
+        char vp[512], sj[512], js[2048]; snprintf(vp, sizeof vp, "%s/validation.tif", dir); tiffw_write(vp, CW, CHh, 1, vr, 1); free(vr);
+        snprintf(sj, sizeof sj, "%s/segs_val.json", dir);
+        snprintf(js, sizeof js, "{\"segments\": [{\"tifxyz\": \"%s\", \"labels\": \"%s\", \"mask\": \"%s\", \"validation\": \"%s\"}]}", surf, lp, mp, vp);
+        FILE *f = fopen(sj, "w"); fputs(js, f); fclose(f);
+        long kn[2] = {0, 0};
+        for (int mode = 1; mode <= 2; mode++) {
+            char ov[512]; snprintf(ov, sizeof ov, "%s/val%d.zarr", dir, mode);
+            inksplat_cfg cv = c; cv.out = ov; cv.coarse = 0; cv.face = 1; cv.face_a = -3; cv.face_b = 0; cv.val = vp; cv.val_mode = mode;
+            CHECK(inksplat_run(&cv) == 0, "val splat %d", mode);
+            store *sv = store_open(ov); z3 *ref = z3_open(sv, "1", nullptr); uint8_t *rb = malloc((size_t)NV * NV * NV), *fb = malloc((size_t)NV * NV * NV);
+            CHECK(ref && !z3_read(ref, z0, nn, rb, 4), "read val splat");
+            store *cs = store_open(dir); inksplat_cfg c9 = cv; c9.level = 0;
+            z3 *fly = inkfly_open(z3_open(cs, "ct.zarr/1", nullptr), sj, &c9, 64, nullptr, nullptr); CHECK(fly && !z3_read(fly, z0, nn, fb, 4), "val onfly %d", mode);
+            long diff = 0; for (size_t k = 0; k < (size_t)NV * NV * NV; k++) { diff += rb[k] != fb[k]; kn[mode - 1] += rb[k] != 255; }
+            fprintf(stderr, "validation %s: %ld known, onfly vs stored: %ld differ\n", mode == 1 ? "exclude" : "only", kn[mode - 1], diff);
+            CHECK(diff == 0 && kn[mode - 1] > 1000, "validation %d: %ld differ, %ld known", mode, diff, kn[mode - 1]);
+            if (fly) z3_close(fly);
+            free(rb); free(fb); if (ref) z3_close(ref); store_close(sv); store_close(cs);
+        }
+    }
     /* --exclude: a held-out box over the low-x half: nothing written there, the rest as before */
     {
         char o5[512]; snprintf(o5, sizeof o5, "%s/excl.zarr", dir);

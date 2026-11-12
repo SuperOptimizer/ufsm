@@ -124,6 +124,19 @@ train's 32-plane fp16 / bf16 slabs instead, within the existing two passes:
 - test_ink_mil: 1, 3 and 7 slabs match the full-volume reference on the rounded logits (gradient error 9e-7 of 2.7e-3 soft, 3e-6 of
   1.2e-2 hard; bf16 within 1 %), and a rerun gives identical bytes.
 
+**Validation masks as per-pixel holdouts (adopt item 3).** Segments may carry the published validation raster as "validation"
+(scripts/inkgt/addval.py: open-data validation.zarr/0, HF <seg>_validation_mask_v2.tif, kept only when the shape matches the labels).
+- Found for 54 of 149 label windows: 0009B 2/2, 0139 11/27, 0500P2 2/2, 0814 1/1, 0841 3/3, 1667 35/39. MAN5 and Paris 4 have none.
+- inkfly folds the raster into the supervision mask (0/1 rule as for the mask), with sources onfly `"validation"`:
+  - "exclude" (the default) leaves those pixels out of training;
+  - "only" keeps nothing else, which gives the eval GT;
+  - "off" ignores the raster.
+- ink-splat takes the same option as `--val V --val-mode`. The fold happens before the tile index, the chunks, the GPU upload and the
+  rays, so every path sees the same mask; the cache key gains val_mode, and INKFLY_CODE went to 2.
+- test_ink_splat: exclude and only, on the fly == stored (0 differ), each with known voxels.
+- Not yet applied: the live segs-*.json files on /vesuvius are unchanged until the merge, since old binaries ignore the key and new
+  ones would start excluding.
+
 **The villa ink recipe vs ours.** Read-only survey of ScrollPrize villa: vesuvius/ink_detection on main (the merged
 merge-ink-pipelines configs), plus the paris4-3d-gambiarra and distilled_3d_ink branches.
 
