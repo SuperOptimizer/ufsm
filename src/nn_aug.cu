@@ -815,7 +815,15 @@ extern "C" void nn_w4runs_label(const uint8_t *side_h, const void *runs, const v
     if (a->key != side_h) CK(cudaMemcpyAsync(a->stage, side_h, p3, cudaMemcpyHostToDevice, s));   /* (else: staged by the phase plane's call just before) */
     a->key = nullptr;
     nn_ptick_fine("      y label h2d");
-    if (nn_w4runs_apply(a->stage, P, P, P, r->tile, r->ms, r, a->stage, a->stage + p3, (void *)s)) { fprintf(stderr, "nn_w4runs_label: CUDA error\n"); abort(); }
+    if (nn_w4runs_apply(a->stage, P, P, P, r->tile, r->ms, r, a->stage, a->stage + p3, (void *)s)) {
+        /* no device memory for the rebuild's scratch beside the trainer (2026-11-12: it aborted unissl three times at P 1024 on a
+           16 GB card): this window's planes rebuilt on the host from the same phase (w4runs_apply_host: the same bytes), then uploaded */
+        static int nfb; const int k = __sync_add_and_fetch(&nfb, 1);
+        if (k <= 3 || !(k & (k - 1))) fprintf(stderr, "nn_w4runs_label: no device memory for the runs rebuild: the window rebuilt on the host (%d so far)\n", k);
+        uint8_t *h = (uint8_t *)malloc(2 * p3); if (!h) { fprintf(stderr, "nn_w4runs_label: no host memory for the fallback\n"); abort(); }
+        w4runs_apply_host(side_h, P, P, P, r->tile, r->ms, r, h, h + p3);
+        CK(cudaMemcpyAsync(a->stage, h, 2 * p3, cudaMemcpyHostToDevice, s)); CK(cudaStreamSynchronize(s)); free(h);
+    }
     nn_ptick_fine("      y w4 runs apply");
     if (warped && g_lw_ref) lw_w4_k<1><<<nb, 256, 0, s>>>(a->stage, a->stage + p3, da, db, P, (const float *)rad_d, a->cssn, a->cssn + 256);
     else if (warped) lw_w4_k<0><<<nb, 256, 0, s>>>(a->stage, a->stage + p3, da, db, P, (const float *)rad_d, a->cssn, a->cssn + 256);

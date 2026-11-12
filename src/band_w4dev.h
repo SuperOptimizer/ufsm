@@ -36,6 +36,9 @@ void w4runs_apply_host(const uint8_t *phase, int D, int H, int W, int tile, int 
 /* the same on the current device: phase_d (device, D x H x W) -> w4_d / comp_d (device; w4_d may be phase_d), on stream (a
    cudaStream_t; 0 the default stream); o's arrays are host memory (copied first). 0 ok, -1 a CUDA error */
 int nn_w4runs_apply(const uint8_t *phase_d, int D, int H, int W, int tile, int maxstep, const w4runs *o, uint8_t *w4_d, uint8_t *comp_d, void *stream);
+/* tests: the next n device runs (band_wind4_runs / band_wind4_dev, nn_w4runs_apply) fail as if out of memory (their fallbacks: the CPU
+   for the next calls / the caller's host rebuild) */
+void w4dev_fail_inject(int n);
 #ifdef __cplusplus
 }
 #endif

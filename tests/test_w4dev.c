@@ -89,6 +89,31 @@ int main(int argc, char **argv) {
         }
         free(ph); free(w0); free(c0); free(w1); free(c1);
     }
+    {   /* the out-of-memory paths (w4dev_fail_inject, 2026-11-12: a full 16 GB card aborted unissl in nn_w4runs_apply): a failed device
+           runs build answers from the CPU (the same runs), the following calls cool down on the CPU, then the device again; a failed
+           device rebuild returns -1 with its scratch freed, and the next call allocates it again and gives the same bytes */
+        const int D = 64, H = 70, W = 75, T = 32; const size_t n = (size_t)D * H * W;
+        uint8_t *ph = malloc(n), *w0 = malloc(n), *c0 = malloc(n), *w2 = malloc(n), *c2 = malloc(n); field(0, D, H, W, ph);
+        const int n0 = band_wind4_tiled(ph, D, H, W, T, 80, 64, 3, w0, c0, nullptr);
+        int okc = 1;
+        for (int k = 0; k < 300; k++) {   /* (1 injected failure + 256 cooldown calls on the CPU + calls on the device again) */
+            if (k == 0 || k == 290) w4dev_fail_inject(1);
+            w4runs ru = {0}; const int n2 = band_wind4_runs(ph, D, H, W, T, 80, 64, 3, &ru, nullptr);
+            memset(w2, 7, n); memset(c2, 7, n); w4runs_apply_host(ph, D, H, W, T, 80, &ru, w2, c2);
+            if (n2 != n0 || memcmp(w0, w2, n) || memcmp(c0, c2, n)) { if (okc) fprintf(stderr, "FAIL inject: band_wind4_runs call %d after an injected failure differs (components %d / %d)\n", k, n0, n2); okc = 0; }
+            if (k == 1 || k == 280) {   /* the device rebuild: injected failure, then the regrown scratch */
+                uint8_t *dp = nn_malloc(n), *dw4 = nn_malloc(n), *dcp = nn_malloc(n); nn_h2d(dp, ph, n);
+                w4dev_fail_inject(1); const int ra = nn_w4runs_apply(dp, D, H, W, T, 80, &ru, dw4, dcp, nullptr);
+                const int rb = nn_w4runs_apply(dp, D, H, W, T, 80, &ru, dw4, dcp, nullptr); nn_sync(); nn_d2h(w2, dw4, n); nn_d2h(c2, dcp, n);
+                if (ra != -1 || rb || memcmp(w0, w2, n) || memcmp(c0, c2, n)) { fprintf(stderr, "FAIL inject: nn_w4runs_apply rc %d (injected) then %d, bytes %s\n", ra, rb, memcmp(w0, w2, n) || memcmp(c0, c2, n) ? "differ" : "equal"); okc = 0; }
+                nn_free(dp); nn_free(dw4); nn_free(dcp);
+            }
+            free(ru.off); free(ru.ro); free(ru.cb);
+        }
+        w4dev_fail_inject(0); w4dev_init(&dev, 1);
+        fails += !okc; cases++;
+        free(ph); free(w0); free(c0); free(w2); free(c2);
+    }
     if (fails) { printf("test_w4dev: %d of %d cases FAIL\n", fails, cases); return 1; }
     printf("test_w4dev: ok (%d cases byte-identical to band_wind4_tiled: %zu runs, %zu voxels in components dropped for conflicts)\n", cases, runs, dropped);
     return 0;

@@ -170,7 +170,19 @@ struct w4ctx {
     w4d_run *d_runs, *h_runs; uint8_t *d_lut, *h_lut; size_t nruns;  /* lut: [ro | cb] */
     w4d_ev *d_ev, *h_ev; size_t nev;
 };
-w4ctx g_ctx[MAXDEV * NCTX]; int g_nctx; volatile int g_next; int g_bad;
+w4ctx g_ctx[MAXDEV * NCTX]; int g_nctx; volatile int g_next;
+/* g_bad: after a device failure (no memory beside the trainer: 2026-11-12 unissl, a full 16 GB card) the next W4_COOL calls take the
+   CPU, then the device is tried again -- before, one failure moved the rest of the run to the CPU (or, in nn_w4runs_label, aborted) */
+constexpr int W4_COOL = 256; volatile int g_bad;
+static bool w4_dev_ok(void) { if (g_bad <= 0) return true; __sync_fetch_and_sub(&g_bad, 1); return false; }
+static void w4_dev_failed(const char *what, int dev) {
+    g_bad = W4_COOL; static int n; const int k = __sync_add_and_fetch(&n, 1);
+    if (k <= 3 || !(k & (k - 1))) fprintf(stderr, "%s: CUDA error or no device memory on GPU %d (%s): the CPU for the next %d calls, then the device again (%d failures)\n", what, dev, cudaGetErrorString(cudaGetLastError()), W4_COOL, k);
+    else cudaGetLastError();
+}
+/* tests: the next n device runs (ctx_run, nn_w4runs_apply) fail as if out of memory (the fallbacks' paths) */
+static volatile int g_w4_inject;
+static bool w4_inj(void) { return g_w4_inject > 0 && __sync_sub_and_fetch(&g_w4_inject, 1) >= 0; }
 
 #define CK(x) do { if ((x) != cudaSuccess) return -2; } while (0)
 /* cudaStreamSynchronize spins a core while the stream waits behind the trainer's kernels: poll with short sleeps instead (the
@@ -254,6 +266,7 @@ int cpu_runs(const uint8_t *phase, int D, int H, int W, int tile, int ms, size_t
 }
 int ctx_run(w4ctx *c, const uint8_t *phase, int D, int H, int W, int tile, int ms, size_t minsize, int maxcomp, uint8_t *w4, uint8_t *comp, band_wind4_stats *st, w4runs *ro_out = nullptr) {
     uint32_t gbase = 0; if (ro_out) ro_out->noff = ro_out->nr = 0;
+    if (w4_inj()) return -2;
     CK(cudaSetDevice(c->dev));
     if (!c->ready) { CK(cudaStreamCreate(&c->st)); c->ready = 1; }
     const int one = tile <= 0 || (tile >= D && tile >= H && tile >= W), T = one ? (D > H ? (D > W ? D : W) : (H > W ? H : W)) : tile, ntx = (W + T - 1) / T;
@@ -332,11 +345,12 @@ struct w4app { uint8_t *d_ph, *d_c; uint16_t *d_R; uint32_t *d_cnt; size_t vox, 
 w4app g_app[MAXDEV]; pthread_mutex_t g_app_mu[MAXDEV] = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_MUTEX_INITIALIZER, PTHREAD_MUTEX_INITIALIZER, PTHREAD_MUTEX_INITIALIZER,
                                                            PTHREAD_MUTEX_INITIALIZER, PTHREAD_MUTEX_INITIALIZER, PTHREAD_MUTEX_INITIALIZER, PTHREAD_MUTEX_INITIALIZER};
 }   // namespace
+extern "C" void w4dev_fail_inject(int n) { g_w4_inject = n; }
 
 extern "C" int w4runs_available(void) { return 1; }
 extern "C" int band_wind4_runs(const uint8_t *phase, int D, int H, int W, int tile, int maxstep, size_t minsize, int maxcomp, w4runs *o, band_wind4_stats *st) {
     o->tile = tile; o->ms = maxstep;
-    if (g_nctx && !g_bad) {
+    if (g_nctx && w4_dev_ok()) {
         int one, T, ntx; w4_geom(D, H, W, tile, &one, &T, &ntx);
         if (T < 16384) {
             w4ctx *c = nullptr;
@@ -345,8 +359,7 @@ extern "C" int band_wind4_runs(const uint8_t *phase, int D, int H, int W, int ti
             const int rc = ctx_run(c, phase, D, H, W, tile, maxstep, minsize, maxcomp, nullptr, nullptr, st, o);
             pthread_mutex_unlock(&c->mu);
             if (rc != -2) return rc;
-            static int once; if (!once++) fprintf(stderr, "band_wind4_runs: CUDA error or no device memory on GPU %d (%s): the CPU from here on\n", c->dev, cudaGetErrorString(cudaPeekAtLastError()));
-            g_bad = 1;
+            w4_dev_failed("band_wind4_runs", c->dev);
         }
     }
     return cpu_runs(phase, D, H, W, tile, maxstep, minsize, maxcomp, o, st);
@@ -376,6 +389,7 @@ extern "C" int nn_w4runs_apply(const uint8_t *phase_d, int D, int H, int W, int 
     const size_t sv = (size_t)(T < D ? T : D) * (T < H ? T : H) * W;
     pthread_mutex_lock(&g_app_mu[dv]); w4app *a = &g_app[dv]; int rc = 0;
 #define AK(x) do { if ((x) != cudaSuccess) { rc = -1; goto out; } } while (0)
+    if (w4_inj()) { rc = -1; goto out; }
     if (sv > a->vox) { cudaFree(a->d_ph); cudaFree(a->d_c); cudaFree(a->d_R); a->vox = 0; AK(cudaMalloc(&a->d_ph, sv)); AK(cudaMalloc(&a->d_c, sv)); AK(cudaMalloc(&a->d_R, 2 * sv)); a->vox = sv; }
     { const size_t rmax = (size_t)(T < D ? T : D) * (T < H ? T : H) * ntx; if (rmax > a->rows) { cudaFree(a->d_cnt); a->rows = 0; AK(cudaMalloc(&a->d_cnt, rmax * 4)); a->rows = rmax; } }
     if (o->noff > a->noff) { cudaFree(a->d_off); a->noff = 0; AK(cudaMalloc(&a->d_off, (o->noff + o->noff / 4 + 1024) * 4)); a->noff = o->noff + o->noff / 4 + 1024; }
@@ -397,6 +411,11 @@ extern "C" int nn_w4runs_apply(const uint8_t *phase_d, int D, int H, int W, int 
     AK(cudaGetLastError());
 out:
 #undef AK
+    if (rc) {   /* (no memory beside the trainer: the scratch freed, the next call allocates it again; the caller takes the host) */
+        cudaStreamSynchronize(s); cudaFree(a->d_ph); cudaFree(a->d_c); cudaFree(a->d_R); cudaFree(a->d_cnt); cudaFree(a->d_off); cudaFree(a->d_lut);
+        a->d_ph = a->d_c = nullptr; a->d_R = nullptr; a->d_cnt = a->d_off = nullptr; a->d_lut = nullptr; a->vox = a->rows = a->noff = a->nlut = 0;
+        cudaGetLastError();
+    }
     pthread_mutex_unlock(&g_app_mu[dv]);
     return rc;
 }
@@ -407,13 +426,13 @@ extern "C" void w4dev_init(const int *devices, int n) {
     g_bad = 0;
 }
 extern "C" int band_wind4_dev(const uint8_t *phase, int D, int H, int W, int tile, int maxstep, size_t minsize, int maxcomp, uint8_t *w4, uint8_t *comp, band_wind4_stats *st) {
-    if (!g_nctx || g_bad) return -2;
+    if (!g_nctx || !w4_dev_ok()) return -2;
     { const int one = tile <= 0 || (tile >= D && tile >= H && tile >= W), T = one ? (D > H ? (D > W ? D : W) : (H > W ? H : W)) : tile; if (T >= 16384) return -2; }
     w4ctx *c = nullptr;
     for (int k = 0; k < g_nctx && !c; k++) { w4ctx *t = &g_ctx[(g_next + k) % g_nctx]; if (!pthread_mutex_trylock(&t->mu)) c = t; }
     if (!c) { c = &g_ctx[__sync_fetch_and_add(&g_next, 1) % g_nctx]; pthread_mutex_lock(&c->mu); } else __sync_fetch_and_add(&g_next, 1);
     const int rc = ctx_run(c, phase, D, H, W, tile, maxstep, minsize, maxcomp, w4, comp, st);
     pthread_mutex_unlock(&c->mu);
-    if (rc == -2) { static int once; if (!once++) fprintf(stderr, "band_wind4_dev: CUDA error or no device memory on GPU %d (%s): the CPU winding from here on\n", c->dev, cudaGetErrorString(cudaPeekAtLastError())); g_bad = 1; }
+    if (rc == -2) w4_dev_failed("band_wind4_dev", c->dev);
     return rc;
 }

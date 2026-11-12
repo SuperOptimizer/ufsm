@@ -227,6 +227,8 @@ int main(int argc, char **argv) {
                             if (wv) nn_label_warp(1, c82[i], nullptr, rd, PW, dl + 2 * q3, nullptr, cs, sn, 0); else nn_label_sym(c82[i], code, PW, dl + 2 * q3, 0);
                             nn_w4runs_label(c82[i], &ru, rd, wv, code, PW, dl, dl + q3, cs, sn, 0); nn_d2h(g1, dl, 2 * q3);
                             CHECK(!memcmp(g0, g1, 2 * q3), "window %d: nn_w4runs_label (%s) from the staged phase plane differs", i, wv ? "warp" : "symmetry");
+                            nn_aug_stage_reset(); w4dev_fail_inject(1); nn_w4runs_label(c82[i], &ru, rd, wv, code, PW, dl, dl + q3, cs, sn, 0); nn_d2h(g1, dl, 2 * q3);
+                            CHECK(!memcmp(g0, g1, 2 * q3), "window %d: nn_w4runs_label (%s) with no device memory (the host rebuild) differs", i, wv ? "warp" : "symmetry");
                             e2e_runs++;
                         }
                         nn_aug_stage_reset(); nn_label_warp(1, c82[i], nullptr, rd, PW, dl, nullptr, cs, sn, 0);   /* (dl's phase plane again, for the checks below) */
