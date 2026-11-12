@@ -13,5 +13,5 @@ for z in $(seq $Z0 $NZ $((Z1 - 1))); do
 done
 wait
 # per tile: H (cols 5-7) + V (cols 12-14) arc / persistent (layout of fiber-judge --out with 4 pair distances: per family arc, exc, pers, 4 pairs)
-awk -F'\t' 'FNR == 1 { next } { ah = $5; ph = $7; av = $12; pv = $14; a = ah + av; printf "%s\t%.4f\t%.0f\t%.1f\n", $1, a, ph + pv, a > 0 ? (ph + pv) / a : 0 }' $OD/s*.tsv | sort -t, -k1,1n -k2,2n > $OD/tiles.tsv
-awk -F'\t' '{ a += $2; p += $3; if ($2 >= 0.5) { n++; r[n] = $4 } } END { asort(r); printf "fj_scroll: %d tiles with >= 0.5 m of fibre, %.1f m, persistent %.0f = %.1f /m; tile rate median %.0f q75 %.0f q90 %.0f /m\n", n, a, p, p / a, r[int(n / 2) + 1], r[int(0.75 * n) + 1], r[int(0.9 * n) + 1] }' $OD/tiles.tsv
+awk -F'\t' 'FNR == 1 { next } { ah = $5; ph = $7; av = $12; pv = $14; a = ah + av; printf "%s\t%.4f\t%.0f\t%.1f\n", $1, a, ph + pv, (a > 0 ? (ph + pv) / a : 0) }' $OD/s*.tsv | sort -t, -k1,1n -k2,2n > $OD/tiles.tsv
+awk -F'\t' '{ a += $2; p += $3; if ($2 >= 0.5) { n++; r[n] = $4 } } END { if (!n || !(a > 0)) { print "fj_scroll: no tiles"; exit } asort(r); printf "fj_scroll: %d tiles with >= 0.5 m of fibre, %.1f m, persistent %.0f = %.1f /m; tile rate median %.0f q75 %.0f q90 %.0f /m\n", n, a, p, p / a, r[int(n / 2) + 1], r[int(0.75 * n) + 1], r[int(0.9 * n) + 1] }' $OD/tiles.tsv
