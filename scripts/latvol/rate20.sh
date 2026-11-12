@@ -33,13 +33,18 @@ case $MODE in
   encode)
     enc orig || exit 1; echo "orig: $(rate orig) B/vox"
     for a in $ARMS; do enc $a && echo "$a: $(rate $a) B/vox"; done;;
-  score)
+  scorearm|table|score)
     CK=$(readlink -f ${2:?ckpt}); T=${3:?tag}; UP=${UP:-/home/forrest/ufsm-eval6b7/build/ufsm}; GPUS=${GPUS:-0 1}
     # wbench on the arm's tree: LVROOT replaces the mirror and the Paris 4 root (keys with volumes/, the mirror's layout)
     run() { local a=$1 g=$2; env SITE=desk WB=$WB GPU=$g SLABS=0 REP=0 THREADS=12 PRIO=eval UP=$UP WZARGS= WIN=640 HALO=64 LVROOT=$SW/$a \
         P4V=PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr BOXES="$BX" $MC bash $H/scripts/wbench/wbench.sh $CK $T-$a > $SW/log/wb_${T}_$a.log 2>&1; }
+    tab() { { echo "== $T: the ~20x input setting (0.050 +- 0.005 B/vox), paired vs $T-orig (the uncompressed anchor, $(rate orig) B/vox), REP=0, 14 boxes"
+      for a in $ARMS; do echo "-- $a  $(rate $a) B/vox"; $U wbench-stats $WB/res/$T-$a.tsv $WB/res/$T-orig.tsv --metric p05x,ids 2>&1 | grep -E '^(p05x|ids) '; done; } | tee $SW/$T.table.txt; }
+    # scorearm CK TAG ARM (GPU): one arm's rows (a GPU-window job of deskgate.sh); table CK TAG: the paired table from the rows
+    if [ $MODE = scorearm ]; then a=${4:?arm}; [ -e $SW/$a/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr/.done ] || { echo "rate20: $a not encoded"; exit 1; }
+      run $a ${GPU:-0}; exit; fi
+    [ $MODE = table ] && { tab; exit; }
     set -- $GPUS; i=0; for a in orig $ARMS; do g=${@:$(( i % $# + 1 )):1}; i=$((i + 1)); echo "$a $g"; done > $SW/log/plan_$T
     for g in $GPUS; do ( awk -v g=$g '$2 == g {print $1}' $SW/log/plan_$T | while read -r a; do run $a $g; done ) & done; wait
-    { echo "== $T: the ~20x input setting (0.050 +- 0.005 B/vox), paired vs $T-orig (the uncompressed anchor, $(rate orig) B/vox), REP=0, 14 boxes"
-      for a in $ARMS; do echo "-- $a  $(rate $a) B/vox"; $U wbench-stats $WB/res/$T-$a.tsv $WB/res/$T-orig.tsv --metric p05x,ids 2>&1 | grep -E '^(p05x|ids) '; done; } | tee $SW/$T.table.txt;;
+    tab;;
 esac
