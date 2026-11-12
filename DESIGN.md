@@ -6,7 +6,14 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
-## Fused phase sets on the fly; the fine stem reset (2026-11-11, branch univ-20261111)
+## Fused phase sets on the fly; the fine stem reset; derived extents (2026-11-11, branch univ-20261111)
+
+Derived extents (`z3_derived_extent`, zarr3.h): a derived array can name the chunks where it gives known values; the chunk map,
+box_any and shard presence (the sampler's draw cells for target-only sources, occupancy tests) then come from it instead of the base.
+The fibre planes mark every chunk within the reach + 1 of a traced segment (AFV: the rtree's block bounds through the map /
+transform; UFIB: per segment). Measured: PHerc1447 27.0% of the CT chunks (249 ms from 1.26M block bounds), Paris4_1mm_v2 through the
+reg map 25.1% (1.4 s), PHerc0139's human lines 6.6% (per-run bounds gave 35%). fibhvd measured ~70% of Paris 4 fibre windows without
+fibre labels when the draws took every papyrus cell. UFSM_FIBRE_EXTENT=0: the CT's chunks. inkB's onfly ink plugs in the same way.
 
 - The 9.6 / 9.36 um universal sets carry the phase-fuse of two surface sets (A, B: the circular mean where they agree within 0.1 turn,
   else unknown). Sources: `"phase": {"onfly": {"sets": [{"root", "key", "rmax"}, ...], "tol": 0.1}, "level": L}`; band_onfly.h

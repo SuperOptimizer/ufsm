@@ -38,6 +38,11 @@ z3 *z3_base_of(const z3 *z);   /* a derived array's base, else nullptr */
 /* more arrays (same shape, up to 4) whose chunks the derived values also reach (e.g. a fusion of several sets): z3_chunk_map / z3_box_any /
    z3_shard_present answer for the union; taken over (closed with z). 0 or -1 */
 int z3_derived_cover(z3 *z, z3 *cover);
+/* the derived values' known extent (sparse targets: the sampler's draw cells, occupancy tests): fn marks bits[(cz grid[1] + cy) grid[2] + cx]
+   != 0 for every chunk (the base's chunk grid, chunk edge `chunk`) where derive can give a known value; called once, on the first query.
+   z3_chunk_map / z3_box_any / z3_shard_present then answer from it (instead of the base and covers). ctx stays the caller's (freed with the
+   derive ctx when it is the same). 0 or -1 */
+int z3_derived_extent(z3 *z, int (*fn)(void *ctx, const int64_t grid[3], const int chunk[3], uint8_t *bits), void *ctx);
 const z3_meta *z3_meta_of(const z3 *z);
 const char *z3_key(const z3 *z);
 
