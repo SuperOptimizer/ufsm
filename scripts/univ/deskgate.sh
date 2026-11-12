@@ -30,9 +30,10 @@ case $PART in
       addrow $T "$CORE" ""; addrow $T-dlv1 "$CORE" "DLV=1";;
   w2) addrow $T-dlv-1 "$CORE" "DLV=-1 P4ROOT=$M P4V=$P4K" 6; addrow $T-n936 "$N936" "" 2
       addrow $T-xres0 "$XRES" "BT=$WB/xres/boxes-xres.tsv DLV=0" 2; addrow $T-xres-1 "$XRES" "BT=$WB/xres/boxes-xres.tsv DLV=-1" 3;;
-  base) for kv in ${BASES:?BASES=\"CKPT=TAG[:vox] ...\"}; do c=${kv%%=*}; b=${kv#*=}; v=""   # :vox = a voxel net (z windows 384 / 64, not cubic)
+  base) for kv in ${BASES:?BASES=\"CKPT=TAG[:vox][@row,row] ...\"}; do c=${kv%%=*}; b=${kv#*=}; v=""   # :vox = a voxel net (z windows 384 / 64, not cubic)
+        br=${BROWS:-dlv1 dlv-1}; [ "${b#*@}" != "$b" ] && { br=$(echo ${b#*@} | tr , " "); b=${b%%@*}; }   # @rows: this entry's rows
         [ "${b%:vox}" != "$b" ] && { b=${b%:vox}; v="WZARGS='--window-z 384 --halo-z 64' "; }
-        for r in ${BROWS:-dlv1 dlv-1}; do case $r in
+        for r in $br; do case $r in
           dlv1) CK=$c addrow $b-dlv1 "$CORE" "${v}DLV=1";; dlv-1) CK=$c addrow $b-dlv-1 "$CORE" "${v}DLV=-1 P4ROOT=$M P4V=$P4K" 6;;
           native) CK=$c addrow $b "$CORE" "$v";; n936) CK=$c addrow $b-n936 "$N936" "$v" 2;;
           xres0) CK=$c addrow $b-xres0 "$XRES" "${v}BT=$WB/xres/boxes-xres.tsv DLV=0" 2;; xres-1) CK=$c addrow $b-xres-1 "$XRES" "${v}BT=$WB/xres/boxes-xres.tsv DLV=-1" 3;;
@@ -47,6 +48,8 @@ T0=$(date +%s); STOPAT=$((T0 + (WINMIN - 3) * 60)); export STOPAT
 # GPU tests sharing the window's first minutes (the lead's merge batches, build-verify suite binaries): my predicts start when they are
 # done, at most TESTWAIT s (360) into the window
 while pgrep -f 'build-verify/test_|run_suite.sh' > /dev/null && [ $(( $(date +%s) - T0 )) -lt ${TESTWAIT:-360} ]; do sleep 10; done
+# GO: a file the coordinator touches when the window's GPU tests are done (w1 at 16000); the gate starts on it (or the tests ending, or TESTWAIT)
+[ -n "${GO:-}" ] && while [ ! -e $GO ] && pgrep -f 'build-verify/test_|run_suite.sh' > /dev/null && [ $(( $(date +%s) - T0 )) -lt ${TESTWAIT:-360} ]; do sleep 10; done
 echo "$T $PART pid $$ from $(date '+%H:%M') to $(date -d @$STOPAT '+%H:%M')" > $LB/gate.busy
 log "window: $(wc -l < $Q) jobs on GPUs [$GPUS], no new box after $(date -d @$STOPAT '+%H:%M')"
 eqtest() {   # the two-phase equality test: the same boxes one-phase (eq1) and predict-then-fit (eq2), the same GPU, rows equal but timings
