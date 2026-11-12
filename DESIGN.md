@@ -6,6 +6,31 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Phase on the fly from meshes: the sources key, behind the derived cache (2026-11-12, branch meshsrc-20261112)
+
+The 2.4 um rungs need level-0 codes. Stored, those run ~170 GB for Paris 4 June alone. fibhvd's mesh_codes_open (meshcodes.h)
+rasterises them on read, byte-identical to `ufsm raster --value q.tif --binary 0`. This section adds the sources key that opens it.
+
+**The key:** `"phase": {"level": L, "onfly": {"meshes": {"dir", "value": "q.tif", "map": reg.json, "level": L}, "rmax", "cache_dir",
+"cache_mb"}}`. The same key also works inside a `"sets"` entry. "level" is the codes' CT level and defaults to the phase's level.
+"map" sends the meshes through a reg map into this source's scan (the 1.129 um twins).
+
+**The derived cache:**
+- The pair-rule phase of mesh codes sits behind z3_open_cached.
+- The key is "phase-onfly-pair-v1 rmax R codes <mesh_codes_key>-pool<n>". mesh_codes_key hashes every mesh's TIFF sizes and mtimes,
+  the value name and the map.
+- Defaults: $UFSM_DERIVED_CACHE or ~/.cache/ufsm/derived, with a 1024 MB memory LRU.
+- Phases from stored codes stay uncached, as before.
+
+**The next rung** (phase_pl[L + 1], the scale rungs) rasterises the meshes at level L + 1 directly. That is the stored level-(L + 1)
+raster, and 8x fewer voxels than rasterising level L and pooling. When the CT has no level L + 1, the level-L codes are pooled
+instead.
+
+**test_mesh_phase** uses test_codes_onfly's four meshes (two nested sheets, a crossing plane, holes / NaN q):
+- At level 0, the meshes' phase equals the phase of `ufsm raster`'s stored codes: 0 of 147244 known voxels differ.
+- At level 1, it equals the phase of the level-1 raster: 0 of 59232 differ.
+- A second load computes nothing: 14 cells come from the disk cache, against 17 computed on the first load.
+
 ## The MIL ink loss in the trainer, and ink dice on the universal head (2026-11-12, branch mil-20261112)
 
 Goal: U2 starts with the ink head trained on human GT. The voxel ink target (onfly `--face` splat) only covers label pixels where

@@ -10,6 +10,10 @@
 [[gnu::weak]] int inkfly_holdouts(const char *, const char *, inksplat_cfg *);
 [[gnu::weak]] void inksplat_defaults(inksplat_cfg *);
 [[gnu::weak]] const char *dcache_default_dir(void);
+[[gnu::weak]] z3 *z3_open_cached(z3 *, const char *, const char *, int, size_t);
+#include "meshcodes.h"
+[[gnu::weak]] z3 *mesh_codes_open(const char *, const char *, const char *, int, z3 *, int);   /* (weak: binaries without meshcodes.o: "meshes" then fails to open) */
+[[gnu::weak]] const char *mesh_codes_key(const z3 *);
 #include "json.h"
 #include "votes.h"
 #include "srpair.h"
@@ -125,33 +129,73 @@ static char *sdup(const char *s) { return s ? strdup(s) : nullptr; }
 
 /* an "onfly" phase spec ({root, key, rmax[, pool2]} or {"sets": [...], "tol"}) opened with `extra` more 2x poolings of its codes at rmax / 2^extra
    (extra 1: the phase of the next coarser level). *rmx: the largest rmax used. nullptr (reported) on failure */
-static z3 *onfly_phase_open(const char *name, const json *of, int extra, float *rmx) {
-    const char *cr = json_str(json_get(of, "root"), nullptr), *ck = json_str(json_get(of, "key"), "");
+/* the codes of an "onfly" phase spec (or one of its "sets"): a stored array {root, key[, pool2]} pooled pool2 + extra times, or
+   {"meshes": {"dir", "value" ("q.tif"), "map" (a reg.json: the meshes' scan -> this source's), "level" (the codes' CT level; default plev)}}:
+   the codes rasterised on read from the q-assigned meshes (meshcodes.h mesh_codes_open) at level + extra directly (a stored level-L+1
+   raster, not the pooled level L: 8x fewer voxels rasterised), then pool2 poolings. key: the dcache key of the phase derived from them
+   ("" without meshes: the stored codes' phase is not cached). nullptr (reported) on failure */
+static z3 *onfly_codes_open(const source *s, const json *e, const json *of, int extra, int plev, char *key, size_t nkey) {
+    key[0] = 0;
+    const json *mj = json_get(e, "meshes"); if (!mj && e != of) mj = json_get(of, "meshes");
+    const int npool = (int)json_num(json_get(e, "pool2"), json_num(json_get(of, "pool2"), 0));
+    z3 *cz = nullptr;
+    if (mj) {
+        const char *md = json_str(json_get(mj, "dir"), nullptr), *mv = json_str(json_get(mj, "value"), "q.tif"), *mm = json_str(json_get(mj, "map"), nullptr);
+        int lv = (int)json_num(json_get(mj, "level"), plev) + extra, pool = 0;
+        z3 *ct = md && lv >= 0 && lv < MAXLEV && s->s ? pyramid_open_level(s->s, s->ct_key, lv, s->um, g_cache) : nullptr;
+        if (!ct && extra > 0 && md && s->s && (ct = pyramid_open_level(s->s, s->ct_key, lv - extra, s->um, g_cache))) { lv -= extra; pool = extra; }   /* (no CT level there: the level's codes pooled) */
+        cz = ct && mesh_codes_open ? mesh_codes_open(md, mv, mm, lv, ct, 0) : nullptr;
+        if (ct && !mesh_codes_open) z3_close(ct);
+        if (!cz) { fprintf(stderr, "sources: %s: phase onfly \"meshes\": cannot open %s (value %s, level %d of the CT)\n", s->name, md ? md : "?", mv, lv); return nullptr; }
+        const char *mk = mesh_codes_key ? mesh_codes_key(cz) : nullptr; if (mk) snprintf(key, nkey, "%s-pool%d", mk, npool + pool);
+        for (int q2 = 0; cz && q2 < pool; q2++) { z3 *q = codes_pool2_open(cz); if (!q) { z3_close(cz); cz = nullptr; } else cz = q; }
+    } else {
+        const char *cr = json_str(json_get(e, "root"), nullptr), *ck = json_str(json_get(e, "key"), "");
+        store *cs = cr ? store_open(cr) : nullptr; cz = cs ? z3_open(cs, ck, nullptr) : nullptr;
+        if (!cz) { fprintf(stderr, "sources: %s: phase onfly: cannot open the codes %s/%s\n", s->name, cr ? cr : "?", ck); return nullptr; }
+        for (int q2 = 0; cz && q2 < extra; q2++) { z3 *q = codes_pool2_open(cz); if (!q) { z3_close(cz); cz = nullptr; } else cz = q; }
+    }
+    for (int q2 = 0; cz && q2 < npool; q2++) { z3 *q = codes_pool2_open(cz); if (!q) { z3_close(cz); cz = nullptr; } else cz = q; }
+    if (!cz) fprintf(stderr, "sources: %s: phase onfly: cannot pool the codes\n", s->name);
+    return cz;
+}
+/* the phase of codes cz at rmax rm (owned); behind the derived-array cache when key names the codes (meshes): "cache_dir" (default
+   $UFSM_DERIVED_CACHE / ~/.cache/ufsm/derived), "cache_mb" (1024) */
+static z3 *onfly_phase_of(z3 *cz, float rm, const char *key, const json *of) {
+    z3 *z = phase_onfly_open(cz, rm);
+    if (!z) { z3_close(cz); return nullptr; }
+    if (!key[0] || !z3_open_cached) return z;
+    char k2[1200]; snprintf(k2, sizeof k2, "phase-onfly-pair-v1 rmax %.9g codes %s", rm, key);
+    const char *dcd = json_str(json_get(of, "cache_dir"), dcache_default_dir ? dcache_default_dir() : nullptr);
+    return z3_open_cached(z, dcd && *dcd ? dcd : nullptr, k2, 0, (size_t)json_num(json_get(of, "cache_mb"), 1024));
+}
+/* an "onfly" phase spec ({root, key, rmax[, pool2]}, {meshes, rmax}, or {"sets": [...], "tol"}) opened with `extra` more 2x levels of its
+   codes at rmax / 2^extra (extra 1: the phase of the next coarser level). plev: the phase's level (the meshes' default codes level).
+   *rmx: the largest rmax used. nullptr (reported) on failure */
+static z3 *onfly_phase_open(const source *s, const json *of, int extra, int plev, float *rmx) {
+    const char *name = s->name;
     const float rm = (float)json_num(json_get(of, "rmax"), 0), div = (float)(1 << extra);
-    const json *sj = json_get(of, "sets");   /* "sets": [{"root", "key", "rmax"}, ...] + "tol" (0.1): the sets' phases fused per voxel as
-                                                phase-fuse (band_onfly.h phase_onfly_fuse_open); "root" / "key" then unused */
-    *rmx = 0;
+    const json *sj = json_get(of, "sets");   /* "sets": [{"root", "key", "rmax"} | {"meshes", "rmax"}, ...] + "tol" (0.1): the sets' phases fused per
+                                                voxel as phase-fuse (band_onfly.h phase_onfly_fuse_open); "root" / "key" then unused */
+    *rmx = 0; char key[1024];
     if (sj && sj->type == J_ARR) {
         z3 *ph[FUSE_MAX]; int np = 0, bad = !sj->n || sj->n > FUSE_MAX;
         for (size_t k = 0; !bad && k < sj->n; k++) {
-            const json *e2 = json_at(sj, k); const char *r2 = json_str(json_get(e2, "root"), nullptr), *k2 = json_str(json_get(e2, "key"), "");
-            const float rm2 = (float)json_num(json_get(e2, "rmax"), rm) / div; store *s2 = r2 ? store_open(r2) : nullptr; z3 *c2 = s2 ? z3_open(s2, k2, nullptr) : nullptr;
-            const int np2 = (int)json_num(json_get(e2, "pool2"), json_num(json_get(of, "pool2"), 0)) + extra;
-            for (int q2 = 0; c2 && q2 < np2; q2++) { z3 *q = codes_pool2_open(c2); if (!q) { z3_close(c2); c2 = nullptr; } else c2 = q; }
-            z3 *p2 = c2 && rm2 > 0 ? phase_onfly_open(c2, rm2) : nullptr;
-            if (!p2) { z3_close(c2); fprintf(stderr, "sources: %s: phase onfly set %zu: cannot open the codes %s/%s or no \"rmax\" > 0\n", name, k, r2 ? r2 : "?", k2); bad = 1; break; }
+            const json *e2 = json_at(sj, k);
+            const float rm2 = (float)json_num(json_get(e2, "rmax"), rm) / div;
+            z3 *c2 = onfly_codes_open(s, e2, of, extra, plev, key, sizeof key);
+            z3 *p2 = c2 && rm2 > 0 ? onfly_phase_of(c2, rm2, key, of) : nullptr;
+            if (!p2) { if (c2 && !(rm2 > 0)) z3_close(c2);   /* (onfly_phase_of closes its codes on failure) */ fprintf(stderr, "sources: %s: phase onfly set %zu: no codes or no \"rmax\" > 0\n", name, k); bad = 1; break; }
             ph[np++] = p2; if (rm2 * div > *rmx) *rmx = rm2 * div;
         }
         z3 *z = bad ? nullptr : phase_onfly_fuse_open(ph, np, (float)json_num(json_get(of, "tol"), 0.1));
         if (bad) for (int k = 0; k < np; k++) z3_close(ph[k]);
-        if (!z) fprintf(stderr, "sources: %s: phase onfly \"sets\": 1..%d sets of {root, key, rmax}, one shape\n", name, FUSE_MAX);
+        if (!z) fprintf(stderr, "sources: %s: phase onfly \"sets\": 1..%d sets of {root, key, rmax} / {meshes, rmax}, one shape\n", name, FUSE_MAX);
         return z;
     }
-    store *cs = cr ? store_open(cr) : nullptr; z3 *cz = cs ? z3_open(cs, ck, nullptr) : nullptr;
-    const int npool = (int)json_num(json_get(of, "pool2"), 0) + extra;   /* "pool2": 1: the codes pooled 2x on read (phase-raster --gs 4) */
-    for (int q2 = 0; cz && q2 < npool; q2++) { z3 *q = codes_pool2_open(cz); if (!q) { z3_close(cz); cz = nullptr; } else cz = q; }
-    z3 *z = cz && rm > 0 ? phase_onfly_open(cz, rm / div) : nullptr;
-    if (!z) { z3_close(cz); fprintf(stderr, "sources: %s: phase onfly: cannot open the codes %s/%s or no \"rmax\" > 0\n", name, cr ? cr : "?", ck); }
+    z3 *cz = onfly_codes_open(s, of, of, extra, plev, key, sizeof key);
+    z3 *z = cz && rm > 0 ? onfly_phase_of(cz, rm / div, key, of) : nullptr;
+    if (!z) { if (cz && !(rm > 0)) z3_close(cz); fprintf(stderr, "sources: %s: phase onfly: no codes or no \"rmax\" > 0\n", name); }
     *rmx = rm;
     return z;
 }
@@ -336,13 +380,13 @@ sources *sources_load(const char *path) {
                                                              (band_onfly.h; byte-identical to phase-raster --pair 1 on the codes' grid) */
                 if (of && !s->phase) {
                     float rmx = 0;
-                    if (!(s->phase = onfly_phase_open(s->name, of, 0, &rmx))) { json_free(j); sources_free(S); return nullptr; }
+                    if (!(s->phase = onfly_phase_open(s, of, 0, (int)json_num(json_get(pt, "level"), 1), &rmx))) { json_free(j); sources_free(S); return nullptr; }
                     s->phase_onfly = rmx;
                 }
                 s->phase_level = (int)json_num(json_get(pt, "level"), 1); s->phase_direct = json_get(pt, "level") != nullptr;
                 if (of && s->phase_onfly > 0 && s->phase_level + 1 < MAXLEV) {   /* the next coarser level (the scale rungs): the same rule on the codes
                     pooled once more at half rmax (byte-identical to phase-raster --gs 4 of a 2x coarser raster), not the phase pooled */
-                    float r1 = 0; s->phase_pl[s->phase_level + 1] = onfly_phase_open(s->name, of, 1, &r1);
+                    float r1 = 0; s->phase_pl[s->phase_level + 1] = onfly_phase_open(s, of, 1, s->phase_level, &r1);
                     if (!s->phase_pl[s->phase_level + 1]) { json_free(j); sources_free(S); return nullptr; }
                 }
                 const double sg = json_num(json_get(pt, "phase_sign"), 1);
