@@ -6,6 +6,35 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## The 1667 unroll's ink against the human labels on our surfaces (2026-11-12, scripts/inkgt/wrapscore.py)
+
+`ufsm ink-compare`, which the earlier unrolls ran, is label-free (CT | ink panels and statistics). wrapscore.py maps the published
+labels onto our flattened stripes:
+1. It samples every 8th label px of the 6 published PHerc1667 segments inside their supervision (7.79 M samples, ink 0.24) and takes
+   each sample's 3-D point on the published mesh.
+2. It finds the nearest vertex of our stripes (x 4 to level 0), then the foot point on that bilinear patch. The distance is the miss.
+3. Within a tolerance, it reads the stripe's ink and CT renders (strip-mosaic <s>_ink.jpg / <s>_ct.jpg) at the render pixel
+   (render px = grid / scale, render_core.h).
+
+Coverage scores the surfaces. AUC and best F1 are rank-based, so the mosaic stretch doesn't change them.
+
+Check: a published segment through a half-resolution re-grid of itself in 9.6 um voxels, with a half-size map, gives AUC 0.978 for a
+perfect map (miss median 0.2 um).
+
+u1 unroll (ift3-24000 ink, out of sample on 1667), 40 um, all samples:
+
+| render set | coverage | median miss | ink AUC (20 / 80 um) | ink best F1 | CT AUC |
+|---|---|---|---|---|---|
+| centre, depth 1 + fill | 0.860 | 15.1 um | 0.646 (0.645 / 0.648) | 0.435 | 0.540 |
+| centre, thin +-2 | 0.860 | 15.1 um | 0.646 | 0.434 | 0.540 |
+| recto face (-1.5 voxels) fill / thin | 0.848 | 16.6 um | 0.648 / 0.647 | 0.437 | 0.535 |
+| verso face (+1.5 voxels) fill / thin | 0.795 | 22.4 um | 0.643 / 0.643 | 0.431 | 0.526 |
+
+- Coverage at 20 / 80 um (centre): 0.615 / 0.971.
+- The validation split runs 0.01-0.035 higher, the ink holdout boxes about 0.01 lower.
+- The face shift and the thin band move the ink AUC by <= 0.005. The limit is the ink model, not the render. The published meshes lie
+  slightly to the recto side of our centre surface.
+
 ## U2's low ink share: ink-only windows counted as empty under --rv; held-out draw cells; 0841 / 0500P2 (2026-11-12, branch inkdraw-20261112)
 
 U2 (unwrap2 + `--rv 2` + `--ink-head 1`) drew 3.5 % of its windows from the 8 human-ink sources at ~25 % of the weight; Paris 4

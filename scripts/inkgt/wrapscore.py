@@ -25,6 +25,8 @@ ap.add_argument("--map", default=None, help="dir with the ink renders (default: 
 ap.add_argument("--um-label", type=float, default=None, help="the published meshes' voxel size (default: their meta, else 2.399)")
 ap.add_argument("--step", type=int, default=8); ap.add_argument("--tol", default="20,40,80", help="miss tolerances in um")
 ap.add_argument("--holdouts", default="/vesuvius/ufsm/inkgt/holdouts-ink.json"); ap.add_argument("--ct-key", default=None)
+ap.add_argument("--vertices", default=None, help="coverage only from a vertex dump (ufsm wrap-dump: float32 z, y, x, id, col records) instead of stripes")
+ap.add_argument("--vertex-um", type=float, default=9.596, help="the dump's voxel size")
 ap.add_argument("--self-test", action="store_true", help="map onto the published meshes themselves (the labels as the map): AUC 1, miss 0")
 a = ap.parse_args()
 tols = [float(t) for t in a.tol.split(",")]
@@ -81,6 +83,25 @@ for g in J["segments"]:
     print(f"labels: {g['name'][:44]:44s} {len(rr):8d} samples (ink {L[rr, cc].mean():.3f}, validation {V[rr, cc].mean():.3f}, holdout {hb.mean():.3f})", flush=True)
 P = np.concatenate(P); LAB = np.concatenate(LAB); VAL = np.concatenate(VAL); HOLD = np.concatenate(HOLD); umL = a.um_label or 2.399
 print(f"labels: {len(P)} samples, ink {LAB.mean():.3f}", flush=True)
+
+# ---- coverage only from a vertex dump (an unflattened strip / wraps: no grid, no renders) ----
+if a.vertices:
+    D = np.fromfile(a.vertices, np.float32).reshape(-1, 5)[:, :3].astype(np.float64) * (a.vertex_um / umL)
+    lo, hi = P.min(0) - 200, P.max(0) + 200; D = D[np.all((D >= lo) & (D <= hi), 1)]
+    T = cKDTree(D); dd, ii = T.query(P, k=10, workers=-1)
+    # the normal miss: the label point's distance to the plane of its 10 nearest vertices (PCA); the lateral vertex spacing (~33 um
+    # in a 9.6 um wrap-dump) does not count. Points whose nearest vertex is farther than 120 um are misses at any tolerance.
+    nb = D[ii]; c = nb.mean(1); X_ = nb - c[:, None, :]; C3 = np.einsum("nki,nkj->nij", X_, X_)
+    w_, v_ = np.linalg.eigh(C3); nrm = v_[:, :, 0]
+    miss_um = np.abs(np.einsum("ni,ni->n", P - c, nrm)) * umL; miss_um[dd[:, 0] * umL > 120] = np.inf
+    print(f"vertices: {len(D)} near the labels; nearest vertex median {np.median(dd[:, 0]) * umL:.1f} um; normal miss median {np.median(miss_um[np.isfinite(miss_um)]):.1f} um", flush=True)
+    rows = ["tol_um\tsplit\tlabelled\tcovered\tcoverage\tink_share\tmiss_med_um"]
+    splits = {"all": np.ones(len(P), bool), "validation": VAL, "holdout": HOLD, "rest": ~VAL & ~HOLD}
+    for t in tols:
+        for nm, sp in splits.items():
+            s_ = sp & (miss_um <= t); fm = miss_um[sp & np.isfinite(miss_um)]
+            rows.append(f"{t:g}\t{nm}\t{sp.sum()}\t{s_.sum()}\t{s_.sum() / max(sp.sum(), 1):.3f}\t{LAB[s_].mean() if s_.any() else float('nan'):.3f}\t{np.median(fm) if len(fm) else float('nan'):.1f}")
+    open(a.out, "w").write("\n".join(rows) + "\n"); print("\n".join(rows)); sys.exit(0)
 
 # ---- our surfaces ----
 lo, hi = P.min(0) - 200, P.max(0) + 200
