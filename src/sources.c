@@ -416,6 +416,9 @@ sources *sources_load(const char *path) {
         else if (ho && ho->type == J_ARR) for (size_t k = 0; k < ho->n; k++) src_add_hold(s, json_at(ho, k));
         const char *hf = json_str(json_get(e, "holdout_file"), nullptr);
         if (hf && src_hold_file(s, hf)) { json_free(j); sources_free(S); return nullptr; }
+        const char *hm = json_str(json_get(e, "holdout_mode"), nullptr);
+        if (hm) { s->hold_mode = !strcmp(hm, "mask") ? 1 : !strcmp(hm, "reject") ? 2 : -1;
+                  if (s->hold_mode < 0) { fprintf(stderr, "sources: %s: \"holdout_mode\" is \"mask\" or \"reject\", not \"%s\"\n", s->name, hm); json_free(j); sources_free(S); return nullptr; } }
         const json *bx = json_get(e, "boxes");   /* task restore: level-0 boxes [z, y, x, nz, ny, nx] that hold local CT (training windows lie inside one) */
         if (bx && bx->type == J_ARR && bx->n) {
             s->box = calloc(bx->n, sizeof *s->box);
@@ -447,6 +450,7 @@ void sources_free(sources *S) {
     for (int i = 0; i < S->n; i++) {
         source *s = &S->src[i];
         for (int l = 0; l < MAXLEV; l++) z3_close(s->ct[l]);
+        for (int l = MAXLEV - 1; l >= 0; l--) { z3_close(s->phase_pl[l]); z3_close(s->phase_ign_pl[l]); }   /* (the pooled views borrow phase / ignore: closed first) */
         if (s->band != s->phase) z3_close(s->band); z3_close(s->phase); z3_close(s->wind); z3_close(s->aux); z3_close(s->phase_ign); z3_close(s->phase_wt); free(s->box); free(s->hold); free(s->focus); free(s->mask); srpair_free(s->srp);
         for (int c = 0; c < NTG; c++) {
             for (int l = 0; l < MAXLEV; l++) z3_close(s->tgt[c][l]);
@@ -577,6 +581,19 @@ static z3 *source_tgt_fibre(source *s, int ch, int level) {
     pthread_mutex_unlock(&g_open_mu);
     z3_close(pl[0]); z3_close(pl[1]);
     return s->tgt[ch][level];
+}
+z3 *source_phase_at(source *s, int level, int ign) {
+    z3 *b = ign ? s->phase_ign : s->phase;
+    if (!b || level < s->phase_level || level >= MAXLEV) return nullptr;
+    if (level == s->phase_level) return b;
+    z3 **pl = ign ? s->phase_ign_pl : s->phase_pl;
+    if (!pl[level]) {
+        z3 *under = source_phase_at(s, level - 1, ign); if (!under) return nullptr;
+        pthread_mutex_lock(&g_open_mu);
+        if (!pl[level]) pl[level] = phase_pool2_view(under, ign);   /* (cheap: no I/O; under the lock so one view per level) */
+        pthread_mutex_unlock(&g_open_mu);
+    }
+    return pl[level];
 }
 z3 *source_tgt(source *s, int ch, int level) {
     if (!s->tgt_key[ch] || level < s->tgt_min_level[ch] || level < 0 || level >= MAXLEV || s->tgt_present[ch][level] == 0) return nullptr;

@@ -26,6 +26,10 @@ typedef struct {
     double empty_keep;       /* probability of keeping a patch whose target is all zero */
     int augment;             /* 0 = none, 1 = all 48 cube symmetries + intensity, 2 = the 24 proper rotations + intensity */
     int holdout;             /* 0 = train: never draw patches touching a source's holdout box; 1 = validation: draw only inside holdout boxes */
+    int holdout_reject;      /* training windows that overlap a held-out box (any same-CT source's): 0 = keep the window, every label unknown
+                                inside the box grown by holdout_guard level-l voxels ("mask", the default); 1 = drop and redraw ("reject").
+                                A source's "holdout_mode" overrides it */
+    int holdout_guard;       /* the mask's margin around each held-out box, in voxels of the window's level (default 16) */
     int dilate;              /* > 0: dilate the surface band of pyramid targets by this many level-0 voxels (curriculum for thin targets) */
     int erode;               /* 0 or 1: native-grid face-neighbour erosion of binary targets before softening */
     float soft;              /* > 0: soft ridge target exp(-(d/soft)^2/2) around the surface (d = chamfer distance in level-0 voxels) */
@@ -254,6 +258,10 @@ void sampler_hostmem(const sampler *sp, FILE *f, size_t pinned);   /* UFSM_HOSTM
 void sampler_stop(sampler *sp);
 /* Stats: patches rejected / produced since start. */
 void sampler_stats(const sampler *sp, uint64_t *produced, uint64_t *rejected);
+/* per source and level (SL_*): draws dropped on a holdout overlap (reject mode), on empty targets, on the coarse CT probe, on the CT read's
+   min_fg; windows kept with a holdout mask; windows produced */
+enum { SL_HOLD, SL_EMPTY, SL_PROBE, SL_FG, SL_MASKED, SL_PROD, SL_N };
+void sampler_level_stats(sampler *sp, int si, int l, uint32_t out[SL_N]);
 uint64_t sampler_crushed(const sampler *sp);   /* --aug-crush windows drawn so far */
 enum { AUGN_XSCAN, AUGN_TEAR, AUGN_DELAM, AUGN_DENSITY, AUGN_CURV, AUGN_INCL, AUGN_N };
 uint64_t sampler_aug_count(const sampler *sp, int which);   /* windows that received a scroll augmentation (AUGN_*) so far */
