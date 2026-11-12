@@ -31,6 +31,48 @@ Three stale branches whose features master lacked, re-applied onto the current c
     imgops' jpeg_read_rgb kept instead of the branch's copy).
   - `ink-ensemble --peak-cover F` (default 0.5: the least covered share of a `--peaks` window).
 
+## The MIL ink loss in the trainer, and ink dice on the universal head (2026-11-12, branch mil-20261112)
+
+Goal: U2 starts with the ink head trained on human GT. The voxel ink target (onfly `--face` splat) only covers label pixels where
+the face search finds an open papyrus face: 31 % (1667) to 42 % (Paris 4) of the supervised pixels have none. The normal-pooled
+MIL loss (villa's normal_pooled_3d; inkB's slab kernels, inkmil.h) supervises those pixels too.
+
+**Flags** (`--task unwrap2 --ink-head 1`):
+- `--ink-mil L` turns the MIL term on. It adds L x the source's ink weight x the mean over the window's rays of
+  BCE(pooled logit, label). The labels are smoothed with `--ink-smooth`, the same as the voxel BCE.
+- `--ink-mil-r 10` and `--ink-mil-step 1` set the reach and step along the normal: K = 2R / step + 1 = 21 samples.
+- `--ink-mil-tau 0` pools with the hard max (villa's choice); tau > 0 uses the soft max, tau log mean exp.
+- `--ink-mil-mode 1` takes only the pixels without an open face (the voxel target's unknowns); mode 0 takes every pixel.
+- `--ink-mil-stride 2` takes every 2nd label row and column (inkB: ~3 us of CPU per ray).
+- `--ink-mil-max 65536` caps the rays per window with an even subsample, because the device buffers are fixed.
+- `--ink-dice W` is now allowed with the ink head: BCE + W x the soft dice of the window's known voxels.
+
+**Rays in the sampler** (sample.c, batch.mil / nmil):
+- inkfly_rays runs on the source's onfly ink target, whichever channel holds it. The window is at the target's level L, or at
+  L + 1 with the points scaled by 1/2.
+- Rays inside the training-holdout mask boxes plus the guard are dropped. These are the same boxes that mask the labels.
+- The rays then go through the window's cube symmetry and warp (`sample_mil_map`). The point maps through the forward map,
+  which inverts sample_warp_ink's pull. The normal maps through a one-voxel step and is renormalised. Rays that leave the window
+  are dropped.
+- Crushed, torn, delaminated and re-bent windows carry no rays.
+
+**Trainer** (head_slab_pass):
+- Pass 0 runs ink_mil_fwd_slab on each slab's fp16 ink logits.
+- After the last slab, ink_mil_fin applies the scale (weights / rays x the 16-bit gradient's scale).
+- Pass 1 runs ink_mil_bwd_slab after the voxel BCE gradient, adding into the slab's gradient in place.
+- The rays go to the device per batch buffer, on the copy stream in the async path.
+- The planner adds mil_bytes: the rays, the accumulator, and inkmil's sort buffers, about 48 B per corner pair (8 per sample).
+  That is 0.55 GB at 65536 rays x 21 samples. Use a smaller `--ink-mil-max` on the 16 GB desk cards.
+- The step loss includes the MIL term. The log adds `ink mil BCE (N% of windows, rays per window)`.
+
+**test_ink_mil_train:**
+- sample_mil_map against sample_warp_ink, using a blob's centroid: 24 of 24 maps agree (8 symmetries x {identity, rotation +
+  elastic, + affine + zoom}). The worst point error is 0.042 voxels and the worst normal error 0.68 deg.
+- On the spiral fixture with one sheet as a tifxyz segment and its ink target on the fly, train --ink-mil 1 --ink-mil-mode 0
+  --ink-dice 0.25 ran 6 steps with symmetries and warps on. Every window drew rays: 506-2443 per window at P 64, stride 2.
+  ink mil fell from 1.036 to 0.72 and ink bce from 1.43 to 0.77.
+- At lr 0, the step-1 loss is 5.98210 with MIL and 4.94610 without; the difference is exactly the logged mil term, 1.03600.
+
 ## The human ink targets on the fly, the derived-array chunk cache, and the villa ink recipe (2026-11-11, branch inkfly-20261111)
 
 **On the fly.** The stored splats of the section below (inkgt/gt) are now only the reference. Training reads the same bytes from a

@@ -29,6 +29,8 @@ typedef struct {
     int holdout_reject;      /* training windows that overlap a held-out box (any same-CT source's): 0 = keep the window, every label unknown
                                 inside the box grown by holdout_guard level-l voxels ("mask", the default); 1 = drop and redraw ("reject").
                                 A source's "holdout_mode" overrides it */
+    int ink_mil, mil_mode, mil_stride, mil_max; float mil_R;   /* --ink-mil: each window's normal-pooled MIL rays (inksplat.h inkfly_rays of the source's onfly ink target:
+                                mode, stride, reach R in window voxels; at most mil_max, evenly subsampled) into batch.mil / nmil, on the source grid (train maps them through the symmetry) */
     int holdout_guard;       /* the mask's margin around each held-out box, in voxels of the window's level (default 16) */
     int dilate;              /* > 0: dilate the surface band of pyramid targets by this many level-0 voxels (curriculum for thin targets) */
     int erode;               /* 0 or 1: native-grid face-neighbour erosion of binary targets before softening */
@@ -173,6 +175,7 @@ typedef struct {
 int sample_gpu_input_ok(const sample_cfg *c);
 int sample_gpu_aug_ok(const sample_cfg *c);   /* train --gpu-aug possible with this configuration (needs gpu_input) */
 int sample_gpu_lwarp_ok(const sample_cfg *c);   /* train --gpu-aug 2 possible (sample_gpu_aug_ok, packed targets, no sheet / gap / distill / cond / band / aux labels; pmask: from the packed mask bit) */
+int sample_mil_map(void *rays, int n, const int perm[3], const int flip[3], const void *spatial, int Pz, int P);   /* cfg.ink_mil: inkray list (source grid) -> output window, in place; returns the kept count */
 void sample_warp_ink(const uint8_t *src, uint8_t *dst, int P, const int perm[3], const int flip[3], const void *spatial);   /* cfg.ink_plane: a warped window's ink plane (src: the source grid) */
 void sample_phase_cssn(const float **cs, const float **sn);   /* the phase codes' cos / sin (PHASE_PERIOD floats; the warps' tables) */
 
@@ -214,6 +217,7 @@ typedef struct {
     uint8_t *vok;            /* B: 1 where the window has a view crop */
     uint8_t *tm;             /* cfg.pack_tm: B x P^3 codes (bit 0: target 0 = 255, bit 1: target 1 = 255, bit 2: mask), t / m nullptr */
     int xch;                 /* input channels stored per sample in x / x16 (4, 5 with aux, 7 with cond, 1 with gpu_input) */
+    void **mil; int *nmil;   /* cfg.ink_mil: per window its inkray list (malloc'd, kept with the slot) and count; source-grid window voxels, held-out boxes + guard dropped */
     int8_t *emb;             /* cfg.emb_ch: B x emb_ch x (Pz / emb_div) x (P / emb_div)^2 feature targets (int8 x 127 unit vectors, channel planes; a cell
                                 with all channels 0 has none) */
 } batch;
