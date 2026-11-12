@@ -10,15 +10,16 @@ No teacher models, no distillation. All upstream data is re-exported once into t
 
 `head_slab_pass` runs twice a step (statistics, then gradients) and built every slab's derived targets and masks in both: phase 2 + 1,
 rv 2 + 1, normal / density 7 + 1 bytes a voxel. They are now kept from the statistics pass (`gpu_state.tc`, 14 B a voxel: 10 GB at P 896,
-15 GB at P 1024, 29 GB at P 1280) and the gradient pass points `sidet / sidem / rvt / rvm / nt / nm` at the kept slab instead of running
+15 GB at P 1024, 29 GB at P 1280; with `--hs-tcache 1` only) and the gradient pass points `sidet / sidem / rvt / rvm / nt / nm` at the kept slab instead of running
 `nn_phase_targets`, the rv block, `nn_phase_trunc`, `nn_packed_mask_z` and `nn_unwrap_targets2_z` again. Valid for one step only
 (`tc_ok`: set by a training statistics pass, cleared by the gradient pass and by any other statistics pass), so a replay of the window
 or a validation pass never reads another step's targets. The ink targets are not in it.
 
-- Taken at the first training statistics pass when at least 8 GB stay free after it (`UFSM_HS_TCACHE=0 / 1` forces); never on the
-  16 GB cards at P 1024. The free memory is read once, at that moment: on a card shared with other jobs the automatic choice can take
-  room a neighbour is about to need (pod, 2026-11-12: U2 beside another P 1024 training left 0.5 GB free), so a resident run should set
-  it explicitly. Not yet a term of the memory planner's report.
+- Opt-in: `--hs-tcache 1` (`UFSM_HS_TCACHE=0 / 1` overrides the flag, for tests). Never automatic: on a card shared with other jobs
+  a choice made from the free memory of one moment takes room a neighbour is about to need (pod, 2026-11-12: U2 beside another P 1024
+  training had 0.5 GB free at a restart). With the flag the memory planner keeps the cache out of its budget ("memory: --hs-tcache keeps
+  N GB free ..."): 14 B a voxel plus 128 planes of slab rounding, 16.9 GB at P 1024, allocated at the first training step; if that
+  allocation fails the run goes on building the targets in both passes and says so. On the 16 GB cards at P 1024 it does not fit.
 - Numbers. Pod, P 896, the poddry recipe: the second target build is ~90 of 850 ms a step. U2's exact recipe at P 1024 (ink head, MIL,
   fstem 16), profiled beside U2 and another training (2790 ms a step, contended): targets 249 ms in the statistics pass, 240 ms in the
   gradient pass, so the cache is worth ~9% of that step; the cache-on timing itself was not obtained.

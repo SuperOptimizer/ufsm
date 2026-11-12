@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# head_slab_pass's target cache (UFSM_HS_TCACHE: the slabs' derived targets and masks kept from the statistics pass for the gradient
+# head_slab_pass's target cache (--hs-tcache 1, UFSM_HS_TCACHE: the slabs' derived targets and masks kept from the statistics pass for the gradient
 # pass) on the wind fixture, --det, latent grid with the rv pair, the guided head and replays, two head slabs a window:
 #  (1) UFSM_HS_TCACHE_CHECK=1: every gradient pass rebuilds each slab's planes and compares them with the cached ones byte for byte
 #      (the trainer aborts on a difference); the check must have run on every step, over both slabs;
@@ -26,5 +26,14 @@ for v in "" "--fstem 8"; do
   [ "$(losses off$t)" = "$(losses on$t)" ] || fail "losses differ with the cache ($D/off$t.log, $D/on$t.log)"
   [ "$(grep -c '^step' on$t.log)" = 6 ] || fail "not 6 steps ($D/on$t.log)"
   echo "  cache on = rebuilt ($n gradient passes, $b bytes), losses equal to the run without${v:+ ($v)}"
+  if [ -z "$v" ]; then   # the flag itself (no UFSM_HS_TCACHE): taken, counted by the planner, same losses; without flag or env: not taken
+    EXTRA="--hs-tcache 1"; run flag UFSM_HS_TCACHE_CHECK=1; EXTRA=""; run none UFSM_HS_TCACHE_CHECK=1
+    grep -q "derived targets kept from the statistics pass" flag.log || fail "--hs-tcache 1: the cache was not taken ($D/flag.log)"
+    grep -q "^memory: --hs-tcache keeps" flag.log || fail "--hs-tcache 1: no planner line ($D/flag.log)"
+    [ "$(losses off)" = "$(losses flag)" ] || fail "losses differ with --hs-tcache 1 ($D/flag.log)"
+    ! grep -q "derived targets kept\|^memory: --hs-tcache\|^target cache check" none.log || fail "the cache was taken without the flag ($D/none.log)"
+    [ "$(losses off)" = "$(losses none)" ] || fail "losses differ without the flag ($D/none.log)"
+    echo "  --hs-tcache 1: taken and planned for; default: off"
+  fi
 done
 echo "test_tcache: ok"

@@ -338,6 +338,7 @@ static int g_bench_same;   /* UFSM_BENCH_SAME */
 static int g_Pz;   /* window depth: --Pz (a Pz x P x P slab), else P */
 static int g_valP;   /* --val-P N (!= P): validation windows of N^3 (the same voxels for every run with this N and --val-seed), scored by an
                         inference-only copy of the network on GPU 0 that reads the training weights; 0: windows of the training size */
+static int g_hs_tcache;   /* --hs-tcache 1 (UFSM_HS_TCACHE=0 / 1 overrides: tests): head_slab_pass keeps the slabs' derived targets for the gradient pass */
 static size_t g_val_reserve;   /* --val-P: device bytes the planner keeps free for that copy's inference build */
 static unet *g_val_u;          /* --val-P: that copy */
 
@@ -969,20 +970,20 @@ static void head_slab_pass(gpu_state *d, int pass) {
 #define FT(w) do { if (fine) nn_ptick(w); } while (0)
     const int si = d->srcb[d->cur];   /* the window's source (its "heads" weights) */
     const int nmil = g_mil ? d->miln[d->cur] : 0; const inkray *mrays = nmil ? d->milr[d->cur] : nullptr;
-    /* the derived targets and masks of every slab (phase 2 + 1, rv 2 + 1, normal / density 7 + 1 bytes a voxel) kept from the statistics
-       pass, so the gradient pass does not build them again (P 896: ~90 of 850 ms a step on the pod; the same bytes, so the same
-       gradients). 14 B a voxel = 10 GB at P 896, 29 GB at P 1280: taken only when at least 8 GB stay free after it, measured at the
-       first training pass, when the upload and augmentation buffers exist (the 16 GB cards at P 1024 never; UFSM_HS_TCACHE=0 / 1) */
+    /* --hs-tcache 1: the derived targets and masks of every slab (phase 2 + 1, rv 2 + 1, normal / density 7 + 1 bytes a voxel) kept from
+       the statistics pass, so the gradient pass does not build them again (P 896: ~90 of 850 ms a step on the pod; U2's recipe at P 1024:
+       240 of 2790 ms; the same bytes, so the same gradients). 14 B a voxel = 10 GB at P 896, 15 GB at P 1024, 29 GB at P 1280: opt-in
+       only, and the memory planner keeps it out of its budget (hs_tcache_bytes). The ink head's targets are not in it */
     uint8_t *const tsv[6] = {d->sidet, d->sidem, d->rvt, d->rvm, d->nt, d->nm};
     const size_t tcS = (size_t)Z * hw, tcB = tcS * ((size_t)g_side_nc + 1 + (g_rv ? 3 : 0) + 8);
     if (!d->tc_tried && !pass && d->hs_train && g_unwrap2 && g_side == 2) {
         d->tc_tried = 1;
-        const size_t need = (size_t)((D + Z - 1) / Z) * tcB; const char *e = getenv("UFSM_HS_TCACHE");
+        const size_t need = (size_t)((D + Z - 1) / Z) * tcB;
         nn_sync();
         const size_t fr = nn_mem_free();
-        if (e ? atoi(e) != 0 : fr > need + ((size_t)8 << 30)) d->tc = nn_malloc_try(need);
-        fprintf(stderr, "head slabs (GPU %d): the slabs' derived targets %s (%.2f GB, %.2f GB free before; UFSM_HS_TCACHE=0 / 1)\n", d->dev,
-                d->tc ? "kept from the statistics pass for the gradient pass" : "built in both passes", need / 1e9, fr / 1e9);
+        if (g_hs_tcache) d->tc = nn_malloc_try(need);
+        if (g_hs_tcache) fprintf(stderr, "head slabs (GPU %d): the slabs' derived targets %s (%.2f GB, %.2f GB free before; --hs-tcache 1)\n", d->dev,
+                d->tc ? "kept from the statistics pass for the gradient pass" : g_hs_tcache ? "built in both passes: no room for the cache" : "built in both passes", need / 1e9, fr / 1e9);
     }
     /* UFSM_HS_TCACHE_CHECK=1 (tests): the gradient pass builds every slab's targets as without the cache and compares them with the
        cached ones, byte for byte, every plane; stops at the first difference */
@@ -2836,6 +2837,7 @@ int cmd_train(int argc, char **argv) {
     size_t p3 = (size_t)g_Pz * P * P, p3l = split ? (size_t)P * P * g_Dl : p3;   /* per-GPU voxels of a window */
     gpu_state G[8]; memset(G, 0, sizeof G); g_G0 = G;   /* (zeroed: fields added later rely on it) */
     int step0 = 0;
+    g_hs_tcache = getenv("UFSM_HS_TCACHE") ? atoi(getenv("UFSM_HS_TCACHE")) != 0 : atoi(opt(argc, argv, "--hs-tcache", "0")) != 0;
     g_fstem = atoi(opt(argc, argv, "--fstem", "0")); g_fs_drop = (float)atof(opt(argc, argv, "--fstem-drop", "0.25"));
     if (g_fstem) {
         if (g_fstem < 1 || g_fstem > 16 || !(g_fs_drop >= 0 && g_fs_drop < 1) || !g_lat || g_lat_guide != 64 || !g_unwrap2 || B != 1) { fprintf(stderr, "--fstem 1..16 (--fstem-drop 0..1): task unwrap2, --lat 4 --lat-guide 3, --B 1\n"); return 2; }
@@ -3074,6 +3076,11 @@ int cmd_train(int argc, char **argv) {
                 g_val_reserve += g_val_reserve * 2 / 5 + ((size_t)256 << 20);   /* (the dry build counts ~3/4 of what it takes: 1.08 GB at 384^3) */
                 fmin = fmin > g_val_reserve ? fmin - g_val_reserve : 0;
                 fprintf(stderr, "memory: --val-P %d keeps %.2f GB free for the validation network\n", g_valP, g_val_reserve / 1e9);
+            }
+            if (g_hs_tcache && g_unwrap2 && g_side == 2 && B == 1) {   /* --hs-tcache: its bytes stay out of the plan's budget (allocated at the first training step) */
+                const size_t tcr = ((size_t)g_Pz + 128) * P * P * ((size_t)g_side_nc + 1 + (g_rv ? 3 : 0) + 8);   /* (+ 128 planes: the last slab's rounding at any slab depth in use) */
+                fmin = fmin > tcr ? fmin - tcr : 0;
+                fprintf(stderr, "memory: --hs-tcache keeps %.2f GB free for the head slabs' derived targets (%d B a voxel)\n", tcr / 1e9, g_side_nc + 1 + (g_rv ? 3 : 0) + 8);
             }
             const shape5 xs = g_lat ? (shape5){B, cfg.cin, g_Pz / 4, P / 4, P / 4} : g_half ? (shape5){B, cfg.cin, P / g_hdiv, P / g_hdiv, P / g_hdiv} : (shape5){B, cfg.cin, split ? g_Dl : g_Pz, P, P};   /* split: this GPU's slab of the window */
             const size_t p3 = p3l;
