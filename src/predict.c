@@ -557,10 +557,10 @@ static const char *opt(int argc, char **argv, const char *name, const char *dflt
    the same bytes, at q > 0 they are one lossy step closer to the exact pooling. */
 typedef struct { uint8_t **enc; size_t *len; uint8_t **raw; } pya_shard;
 typedef struct { z3w *w; int64_t shape[3], ns[3]; int pe; pya_shard **sh; int64_t next_layer, next_clayer; } pya_level;
-typedef struct { pya_level L[8]; int nlev, shard, nc; size_t poff[9]; pthread_mutex_t mu; int64_t nz0, mark, zdone; long *nsub, *nadd; atomic_int failed;
+typedef struct { pya_level L[8]; int nlev, shard, nc, nthreads; size_t poff[9]; pthread_mutex_t mu; int64_t nz0, mark, zdone; long *nsub, *nadd; atomic_int failed;
                  double t_enc; long n_enc; } pyacc_t;
 static int pyacc_init(pyacc_t *P, const char *dir, double um0, const int64_t shape0[3], int shard, int nlev, float q, const char *attrs) {
-    memset(P, 0, sizeof *P); P->shard = shard; pthread_mutex_init(&P->mu, nullptr);
+    memset(P, 0, sizeof *P); P->shard = shard; P->nthreads = 8; pthread_mutex_init(&P->mu, nullptr);
     if (nlev > 8) nlev = 8;
     while (nlev > 1 && shard >> (nlev - 1) < 1) nlev--;
     P->nlev = nlev; P->nz0 = (shape0[0] + shard - 1) / shard; P->mark = 0; P->zdone = 0;
@@ -620,29 +620,47 @@ static int pyacc_submitted(pyacc_t *P, int64_t gz, int64_t mark) {
     if (bad) { fprintf(stderr, "predict: pyramid: shard layer %lld after layer %lld was final (windows out of z order)\n", (long long)gz, (long long)P->zdone); atomic_store(&P->failed, 1); }
     return bad;
 }
+/* the chunks of the >= 128^3 pieces, encoded by several threads (one writer per head compresses a 512^3 shard with all --threads; the
+   pieces' 9 chunks one after another took 27 thread-seconds of 5 heads' 19 Gvox on the pod, on the writers' critical path) */
+typedef struct { pyacc_t *P; const uint8_t *buf; const int64_t *g; _Atomic int next; atomic_long ne; } pya_job;
+static void *pya_chunk_work(void *a) {
+    pya_job *J = a; pyacc_t *P = J->P; const int cg = P->shard / 128; uint8_t *chunk = malloc((size_t)128 * 128 * 128);
+    if (!chunk) { atomic_store(&P->failed, 1); return nullptr; }
+    for (;;) {   /* item k: level l, chunk c of its piece (levels with pe >= 128 in order) */
+        int k = atomic_fetch_add(&J->next, 1), l = 1, m = 0;
+        for (; l < P->nlev && P->L[l].pe >= 128; l++) { m = P->L[l].pe / 128; if (k < m * m * m) break; k -= m * m * m; }
+        if (l >= P->nlev || P->L[l].pe < 128) break;
+        pya_level *L = &P->L[l]; const int pe = L->pe; const uint8_t *pc = J->buf + P->poff[l];
+        int64_t S[3], o[3]; for (int d = 0; d < 3; d++) { const int64_t v = J->g[d] * pe; S[d] = v / P->shard; o[d] = v % P->shard; }
+        if (S[0] >= L->ns[0] || S[1] >= L->ns[1] || S[2] >= L->ns[2]) continue;
+        const int cz = k / (m * m), cy = k / m % m, cx = k % m;
+        for (int z = 0; z < 128; z++) for (int y = 0; y < 128; y++)
+            memcpy(chunk + ((size_t)z * 128 + y) * 128, pc + (((size_t)(cz * 128 + z) * pe + (cy * 128 + y)) * pe + cx * 128), 128);
+        uint8_t *e; size_t n;
+        if (z3w_encode_chunk(L->w, chunk, &e, &n)) { atomic_store(&P->failed, 1); continue; }
+        atomic_fetch_add(&J->ne, 1);
+        const int ci = (int)(((o[0] / 128 + cz) * cg + (o[1] / 128 + cy)) * cg + (o[2] / 128 + cx));
+        const int64_t si = (S[0] * L->ns[1] + S[1]) * L->ns[2] + S[2];
+        pthread_mutex_lock(&P->mu); pya_shard *x = pya_get(P, L, si); free(x->enc[ci]); x->enc[ci] = e; x->len[ci] = n; pthread_mutex_unlock(&P->mu);
+    }
+    free(chunk); return nullptr;
+}
 /* writer thread: the pieces of level-0 shard (gz, gy, gx) at buf + poff[l] */
 static void pyacc_post(void *ctx, const uint8_t *buf, int64_t gz, int64_t gy, int64_t gx) {
     pyacc_t *P = ctx; const int64_t g[3] = {gz, gy, gx}; const int cg = P->shard / 128;
-    uint8_t *chunk = nullptr; const double t0 = now(); long ne = 0;
+    const double t0 = now(); long ne = 0;
+    {   int nitem = 0; for (int l = 1; l < P->nlev && P->L[l].pe >= 128; l++) { const int m = P->L[l].pe / 128; nitem += m * m * m; }
+        if (nitem) { pya_job J = {.P = P, .buf = buf, .g = g}; pthread_t th[16]; int nt = nitem < P->nthreads ? nitem : P->nthreads; if (nt > 16) nt = 16; if (nt < 1) nt = 1;
+                     for (int i = 1; i < nt; i++) pthread_create(&th[i], nullptr, pya_chunk_work, &J);
+                     pya_chunk_work(&J); for (int i = 1; i < nt; i++) pthread_join(th[i], nullptr); ne = atomic_load(&J.ne); } }
     for (int l = 1; l < P->nlev; l++) {
+        if (P->L[l].pe >= 128) continue;   /* (encoded above) */
         pya_level *L = &P->L[l]; const int pe = L->pe; const uint8_t *pc = buf + P->poff[l];
         int64_t S[3], o[3];   /* the level-l shard and the piece's offset in it */
         for (int d = 0; d < 3; d++) { const int64_t v = g[d] * pe; S[d] = v / P->shard; o[d] = v % P->shard; }
         if (S[0] >= L->ns[0] || S[1] >= L->ns[1] || S[2] >= L->ns[2]) continue;
         const int64_t si = (S[0] * L->ns[1] + S[1]) * L->ns[2] + S[2];
-        if (pe >= 128) {
-            const int m = pe / 128;
-            if (!chunk && !(chunk = malloc(((size_t)128 * 128 * 128)))) { atomic_store(&P->failed, 1); return; }
-            for (int cz = 0; cz < m; cz++) for (int cy = 0; cy < m; cy++) for (int cx = 0; cx < m; cx++) {
-                for (int z = 0; z < 128; z++) for (int y = 0; y < 128; y++)
-                    memcpy(chunk + ((size_t)z * 128 + y) * 128, pc + (((size_t)(cz * 128 + z) * pe + (cy * 128 + y)) * pe + cx * 128), 128);
-                uint8_t *e; size_t n;
-                if (z3w_encode_chunk(L->w, chunk, &e, &n)) { atomic_store(&P->failed, 1); continue; }
-                ne++;
-                const int ci = (int)(((o[0] / 128 + cz) * cg + (o[1] / 128 + cy)) * cg + (o[2] / 128 + cx));
-                pthread_mutex_lock(&P->mu); pya_shard *x = pya_get(P, L, si); free(x->enc[ci]); x->enc[ci] = e; x->len[ci] = n; pthread_mutex_unlock(&P->mu);
-            }
-        } else {
+        {
             int any = 0; const size_t pv = (size_t)pe * pe * pe; for (size_t i = 0; i < pv && !any; i++) any = pc[i] != 0;
             if (!any) continue;   /* (a chunk never touched stays fill) */
             const int ci = (int)(((o[0] / 128) * cg + o[1] / 128) * cg + o[2] / 128); const int64_t r[3] = {o[0] % 128, o[1] % 128, o[2] % 128};
@@ -652,7 +670,6 @@ static void pyacc_post(void *ctx, const uint8_t *buf, int64_t gz, int64_t gy, in
             pthread_mutex_unlock(&P->mu);
         }
     }
-    free(chunk);
     pthread_mutex_lock(&P->mu); P->nadd[gz]++; P->t_enc += now() - t0; P->n_enc += ne; pya_advance(P); pthread_mutex_unlock(&P->mu);
 }
 static int pyacc_finish(pyacc_t *P) {   /* after the writers finished: everything left */
@@ -1574,6 +1591,7 @@ int cmd_predict(int argc, char **argv) {
             else { h->w = w; snprintf(h->dir, sizeof h->dir, "%s", out); }
             h->pya = nullptr;
             if (gpyr) { h->pya = malloc(sizeof(pyacc_t)); if (!h->pya || pyacc_init(h->pya, h->dir, um_l, ash, shard, nlev, q, h->attrs)) { fprintf(stderr, "predict: head %s: the GPU pyramid's stores\n", h->name); return 1; } }
+            if (h->pya) { const int nt = (nthreads > 0 ? nthreads : (int)ufsm_ncpu()) / nph; h->pya->nthreads = nt > 1 ? nt : 1; }   /* (the heads' writers run at once) */
             const size_t ab = h->pya ? h->pya->poff[h->pya->nlev] : WR.bytes; hab = ab;
             h->wr = malloc(sizeof(writer_t)); h->dsh2[0] = nn_malloc(ab); h->dsh2[1] = nn_malloc(ab);
             if (!h->wr || !h->dsh2[0] || !h->dsh2[1] || phead_writer(h->wr, h->w, WR.bytes, ab, nthreads, 2, gpu, WR.async)) { fprintf(stderr, "predict: out of memory for head %s\n", h->name); return 1; }
