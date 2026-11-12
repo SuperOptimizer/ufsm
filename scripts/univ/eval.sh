@@ -94,7 +94,7 @@ fi
     for B in $REFS; do echo "-- $r vs $B"; $U wbench-stats $WB/res/$r.tsv $WB/res/$B.tsv --metric p05x,ids 2>&1 | grep -v label-noise | grep -E '^(p05x|ids) '; done; done
   for d in 0 -1; do [ -s $WB/res/$T-xres$d.tsv ] || continue; echo "-- xres DLV $d (fine scan) vs native 9.36 um ($T-n936), same boxes"
     python3 -I $H/scripts/univ/xres_pair.py $WB/res/$T-xres$d.tsv $WB/res/$T-n936.tsv; done
-  [ -s $RVE/$T.txt ] && { echo "-- rv (recto-ruler, rv column turns / share off; rv1d2-10000: p1667 0.926/0.377 p139 0.811/0.375 p4 0.738/0.421)"; grep ' all ' $RVE/$T.txt; }
+  [ -s $RVE/$T.txt ] && { echo "-- rv (recto-ruler; each cell = turns per GT turn (1 = right, < 1 under-counts) / share of GT intervals off >= 0.5 turn (lower is better))"; echo "   columns: scroll all n | fit (the reference count fit, not the model) | density | CT | rv.pkw | rv.pk (the model; the compared column) | rv.run"; echo "   rv1d2-10000 rv.pk: p1667 0.926/0.377 p139 0.811/0.375 p4 0.738/0.421; rv.run: p1667 1.135/0.384 p139 1.002/0.398 p4 1.005/0.274"; grep ' all ' $RVE/$T.txt; }
   ls $E/$T/fib/*.judge > /dev/null 2>&1 && { echo "-- fib (HOLD; fibhv-c hold-12000: H tube median 0.57 mm, pairs .96)"; for j in $E/$T/fib/*.judge; do echo "$(basename $j .judge): $(tr '\n' ' ' < $j | cut -c1-260)"; done; }
   [ -s $E/$T/ink/scores.tsv ] && { echo "-- ink (ink-score vs human labels: crop map n inkfrac f1best thr f1_05 prec05 rec05 auc)"; cat $E/$T/ink/scores.tsv
     awk -F'\t' '{n++; f+=$5; a+=$10} END {if (n) printf "mean over %d crops: f1best %.4f auc %.4f\n", n, f / n, a / n}' $E/$T/ink/scores.tsv; }
