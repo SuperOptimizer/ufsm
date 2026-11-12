@@ -54,6 +54,7 @@ typedef struct {
     z3 *z; int64_t sh[3]; int cs[3]; int64_t g[3]; uint8_t **ch; _Atomic uint8_t *need; size_t nres;
     double f, org[3]; uint8_t fill;   /* wrap voxel p -> array voxel (p + .5) f - .5 - org */
     int lg[3];   /* log2 of the chunk sides (all powers of two; else -1: the divisions) */
+    _Atomic uint32_t *sub; uint32_t *held; int subok;   /* 128^3 chunks: the volcomp substreams (16 z x 32 y slabs) the band reads / holds */
 } wsn_vol;
 static int wsn_vol_open(wsn_vol *v, const char *root, const char *key, const char *cache, double f, const double org[3], uint8_t fill) {
     memset(v, 0, sizeof *v); v->z = z3_open(store_open(root), key, cache); if (!v->z) return -1;
@@ -63,17 +64,21 @@ static int wsn_vol_open(wsn_vol *v, const char *root, const char *key, const cha
     v->ch = calloc(ng, sizeof *v->ch); v->need = calloc(ng, 1); v->f = f; v->fill = fill;
     int p2 = 1; for (int d = 0; d < 3; d++) { v->lg[d] = 0; while ((1 << v->lg[d]) < v->cs[d]) v->lg[d]++; p2 &= (1 << v->lg[d]) == v->cs[d]; }
     if (!p2) v->lg[0] = v->lg[1] = v->lg[2] = -1;
-    return v->ch && v->need ? 0 : -1;
+    v->subok = v->cs[0] == 128 && v->cs[1] == 128 && v->cs[2] == 128 && !getenv("UFSM_WSN_FULLDECODE");
+    v->sub = calloc(ng, sizeof *v->sub); v->held = calloc(ng, sizeof *v->held);
+    return v->ch && v->need && v->sub && v->held ? 0 : -1;
 }
 static void wsn_vol_close(wsn_vol *v) {
     if (!v->z) return;
     const size_t ng = (size_t)v->g[0] * v->g[1] * v->g[2];
     for (size_t k = 0; k < ng; k++) free(v->ch[k]);
-    free(v->ch); free((void *)v->need); z3_close(v->z); memset(v, 0, sizeof *v);
+    free(v->ch); free((void *)v->need); free((void *)v->sub); free(v->held); z3_close(v->z); memset(v, 0, sizeof *v);
 }
 static inline void wsn_a(const wsn_vol *v, const double p[3], double a[3]) { for (int d = 0; d < 3; d++) a[d] = (p[d] + 0.5) * v->f - 0.5 - v->org[d]; }
-/* mark the chunks of the box spanned by wrap-voxel points p and q (+-1 array voxel) */
-static void wsn_mark(wsn_vol *v, const double p[3], const double q[3]) {
+/* mark the chunks of the box spanned by wrap-voxel points p and q (+-1 array voxel); with 128^3 chunks also the substreams of the box
+   spanned by pe and qe (the samples' whole reach: the profile's +-1 wrap voxel past p, q and the trilinear corners): a band decodes
+   only those of its chunks (a wrap shell crosses a chunk's 4 y slabs partly; the voxels read are the full decode's) */
+static void wsn_mark(wsn_vol *v, const double p[3], const double q[3], const double pe[3], const double qe[3]) {
     double a[3], b[3]; wsn_a(v, p, a); wsn_a(v, q, b); int64_t lo[3], hi[3];
     for (int d = 0; d < 3; d++) {
         double l = fmin(a[d], b[d]) - 1, h = fmax(a[d], b[d]) + 2;
@@ -82,34 +87,61 @@ static void wsn_mark(wsn_vol *v, const double p[3], const double q[3]) {
     }
     for (int64_t z = lo[0]; z <= hi[0]; z++) for (int64_t y = lo[1]; y <= hi[1]; y++) for (int64_t x = lo[2]; x <= hi[2]; x++)
         atomic_store_explicit(&v->need[((size_t)z * v->g[1] + y) * v->g[2] + x], 1, memory_order_relaxed);
+    if (!v->subok) return;
+    int64_t el[3], eh[3]; wsn_a(v, pe, a); wsn_a(v, qe, b);
+    for (int d = 0; d < 3; d++) {
+        const double l = fmin(a[d], b[d]) - 1, h = fmax(a[d], b[d]) + 2;
+        el[d] = (int64_t)fmax(0, floor(l)); eh[d] = (int64_t)fmin(v->sh[d] - 1, floor(h)); if (eh[d] < el[d]) return;
+    }
+    for (int64_t cz = el[0] >> 7; cz <= eh[0] >> 7; cz++) for (int64_t cy = el[1] >> 7; cy <= eh[1] >> 7; cy++) {
+        const int64_t z0 = cz * 128 > el[0] ? 0 : el[0] - cz * 128, z1 = cz * 128 + 127 < eh[0] ? 127 : eh[0] - cz * 128;
+        const int64_t y0 = cy * 128 > el[1] ? 0 : el[1] - cy * 128, y1 = cy * 128 + 127 < eh[1] ? 127 : eh[1] - cy * 128;
+        uint32_t m = 0; for (int64_t zs = z0 / 16; zs <= z1 / 16; zs++) for (int64_t ys = y0 / 32; ys <= y1 / 32; ys++) m |= 1u << (4 * zs + ys);
+        for (int64_t cx = el[2] >> 7; cx <= eh[2] >> 7; cx++) atomic_fetch_or_explicit(&v->sub[((size_t)cz * v->g[1] + cy) * v->g[2] + cx], m, memory_order_relaxed);
+    }
 }
-typedef struct { wsn_vol *v; int64_t *todo; size_t n; _Atomic size_t next; _Atomic int err; } wsn_dec;
+typedef struct { wsn_vol *v; int64_t *todo; uint32_t *want; size_t n; _Atomic size_t next; _Atomic int err; _Atomic long nsub; } wsn_dec;
 static void *wsn_dec_run(void *arg) {
     wsn_dec *J = arg; wsn_vol *v = J->v;
     for (size_t k; (k = atomic_fetch_add(&J->next, 1)) < J->n;) {
         const int64_t id = J->todo[k], cz = id / (v->g[1] * v->g[2]), cy = id / v->g[2] % v->g[1], cx = id % v->g[2];
         int64_t o[3] = {cz * v->cs[0], cy * v->cs[1], cx * v->cs[2]}, n[3];
         for (int d = 0; d < 3; d++) n[d] = v->cs[d];   /* (edge chunks: z3_read pads beyond the shape with the fill) */
+        int edge = 0; for (int d = 0; d < 3; d++) edge |= o[d] + n[d] > v->sh[d];
+        uint32_t w = J->want[k]; if (edge || w == 0xffffffffu) w = 0;   /* (0: the whole chunk; edge chunks whole, as before) */
+        if (v->ch[id]) {   /* held: the substreams still missing, decoded beside and copied in (16 z x 32 y x 128 x each) */
+            const uint32_t miss = w ? w & ~v->held[id] : ~v->held[id]; if (!miss) continue;
+            uint8_t *t = malloc((size_t)n[0] * n[1] * n[2]);
+            if (!t || z3_read_sub(v->z, o, n, t, 1, miss == 0xffffffffu ? 0 : miss)) { free(t); atomic_store(&J->err, 1); continue; }
+            for (int s = 0; s < 32; s++) if (miss >> s & 1) for (int z = 16 * (s / 4); z < 16 * (s / 4) + 16; z++) { const size_t off = ((size_t)z * 128 + 32 * (s % 4)) * 128; memcpy(v->ch[id] + off, t + off, 32 * 128); }
+            free(t); v->held[id] |= miss; atomic_fetch_add(&J->nsub, __builtin_popcount(miss));
+            continue;
+        }
         uint8_t *b = malloc((size_t)n[0] * n[1] * n[2]);
-        if (!b || z3_read(v->z, o, n, b, 1)) { free(b); atomic_store(&J->err, 1); continue; }
-        v->ch[id] = b;
+        if (!b || (w ? z3_read_sub(v->z, o, n, b, 1, w) : z3_read(v->z, o, n, b, 1))) { free(b); atomic_store(&J->err, 1); continue; }
+        v->ch[id] = b; v->held[id] = w ? w : 0xffffffffu; atomic_fetch_add(&J->nsub, w ? __builtin_popcount(w) : 32);
     }
     return nullptr;
 }
-/* the band's chunks: decode the marked ones not held, drop the held ones not marked; clears the marks */
+/* the band's chunks: decode the marked ones not held (their marked substreams), the missing substreams of the held ones, drop the
+   held ones not marked; clears the marks */
+static long g_wsn_sub, g_wsn_chunks;   /* (substreams decoded, chunks decoded or completed: the log's decode share) */
 static int wsn_vol_fill(wsn_vol *v, int nt) {
     if (!v->z) return 0;
-    const size_t ng = (size_t)v->g[0] * v->g[1] * v->g[2]; int64_t *todo = nullptr; size_t n = 0, cap = 0;
+    const size_t ng = (size_t)v->g[0] * v->g[1] * v->g[2]; int64_t *todo = nullptr; uint32_t *want = nullptr; size_t n = 0, cap = 0;
     for (size_t k = 0; k < ng; k++) {
-        if (!v->need[k]) { if (v->ch[k]) { free(v->ch[k]); v->ch[k] = nullptr; v->nres--; } continue; }
-        v->need[k] = 0; if (v->ch[k]) continue;
-        if (n == cap) { cap = cap ? 2 * cap : 1024; todo = realloc(todo, cap * sizeof *todo); }
-        todo[n++] = (int64_t)k;
+        const uint32_t w = v->subok ? v->sub[k] : 0xffffffffu; v->sub[k] = 0;
+        if (!v->need[k]) { if (v->ch[k]) { free(v->ch[k]); v->ch[k] = nullptr; v->held[k] = 0; v->nres--; } continue; }
+        v->need[k] = 0;
+        if (v->ch[k] && (v->held[k] == 0xffffffffu || !(w & ~v->held[k]))) continue;
+        if (n == cap) { cap = cap ? 2 * cap : 1024; todo = realloc(todo, cap * sizeof *todo); want = realloc(want, cap * sizeof *want); }
+        if (!v->ch[k]) v->nres++;
+        want[n] = w ? w : 0xffffffffu; todo[n++] = (int64_t)k;
     }
-    wsn_dec J = {v, todo, n, 0, 0}; pthread_t th[64]; const int m = nt < 64 ? nt : 64;
+    wsn_dec J = {v, todo, want, n, 0, 0, 0}; pthread_t th[64]; const int m = nt < 64 ? nt : 64;
     for (int q = 0; q < m; q++) pthread_create(&th[q], nullptr, wsn_dec_run, &J);
     for (int q = 0; q < m; q++) pthread_join(th[q], nullptr);
-    free(todo); v->nres += n;
+    free(todo); free(want); g_wsn_sub += J.nsub; g_wsn_chunks += (long)n;
     return atomic_load(&J.err) ? -1 : 0;
 }
 static inline double wsn_at(const wsn_vol *v, int64_t z, int64_t y, int64_t x) {
@@ -218,9 +250,10 @@ static void wsn_row(const wsn_job *J, int wi, int r) {
         const double u[3] = {0, dy / rad, dx / rad}, P[3] = {p[2], p[1], p[0]}, th = atan2(dy, dx);   /* (z, y, x) */
         if (J->mark) {
             const double a[3] = {P[0], P[1] - R * u[1], P[2] - R * u[2]}, b[3] = {P[0], P[1] + R * u[1], P[2] + R * u[2]};
-            if (J->ct) wsn_mark(J->ct, a, b);
-            if (J->pc) wsn_mark(J->pc, a, b);
-            if (J->rv) wsn_mark(J->rv, a, b);
+            const double ae[3] = {P[0], P[1] - (R + 1) * u[1], P[2] - (R + 1) * u[2]}, be[3] = {P[0], P[1] + (R + 1) * u[1], P[2] + (R + 1) * u[2]};
+            if (J->ct) wsn_mark(J->ct, a, b, ae, be);
+            if (J->pc) wsn_mark(J->pc, a, b, ae, be);
+            if (J->rv) wsn_mark(J->rv, a, b, ae, be);
             continue;
         }
         /* the normal (grid differences) and the obliquity |n . u| */
@@ -512,7 +545,8 @@ int cmd_wrap_snap(int argc, char **argv) {
     wsn_vol_close(&vct); wsn_vol_close(&vpc); wsn_vol_close(&vr);
     long nval = 0, ncand = 0, nmask = 0; for (int k = 0; k < nw; k++) { for (int r = 0; W[k].rs && r < W[k].h; r++) { nval += W[k].rs[r].nv; ncand += W[k].rs[r].nc; nmask += W[k].rs[r].nm; } free(W[k].band); free(W[k].bv); free(W[k].rt); W[k].band = nullptr; W[k].bv = nullptr; W[k].rt = nullptr; }
     const double t1 = wsn_now();
-    fprintf(stderr, "wrap-snap: evidence %.1f s (volume decode %.1f s): %ld vertices, %.3f with a candidate, %.4f on masked CT (not moved)\n", t1 - t0, tdec, nval, nval ? (double)ncand / nval : 0, nval ? (double)nmask / nval : 0);
+    fprintf(stderr, "wrap-snap: evidence %.1f s (volume decode %.1f s, %.3f of the %ld chunks' substreams): %ld vertices, %.3f with a candidate, %.4f on masked CT (not moved)\n", t1 - t0, tdec,
+            g_wsn_chunks ? g_wsn_sub / (32.0 * g_wsn_chunks) : 0, g_wsn_chunks, nval, nval ? (double)ncand / nval : 0, nval ? (double)nmask / nval : 0);
     S.s0 = wum / axum; S.ax = &ax; S.out = out; S.dry = dry; S.dmap = wsn_opt(argc, argv, "--dmap", nullptr); S.dmap_gs = atof(wsn_opt(argc, argv, "--dmap-gs", "0"));
     if (S.dmap) { char cmd[1500]; snprintf(cmd, sizeof cmd, "mkdir -p '%s'", S.dmap); if (system(cmd)) return 1; } S.W = W; S.nw = nw;
     for (int q = 0; q < m; q++) pthread_create(&th[q], nullptr, wsn_solve_run, &S);
