@@ -59,6 +59,8 @@ int cmd_eval(int argc, char **argv);
 int cmd_refine(int argc, char **argv);       /* src/surf.c */
 int cmd_surf_stats(int argc, char **argv);
 int cmd_wrap_snap(int argc, char **argv);   /* src/wrapsnap.c */
+int cmd_strip_distort(int argc, char **argv);   /* src/stripdistort.c */
+int cmd_wrap_repair(int argc, char **argv);   /* src/wraprepair.c */
 int cmd_surf_labels(int argc, char **argv);   /* src/surflabels.c */
 int cmd_sheet_score(int argc, char **argv);   /* src/sheetscore.c */
 int cmd_phase_coh(int argc, char **argv);   /* src/phasecoh.c */
@@ -216,6 +218,8 @@ static int usage(void) {
         "  ufsm strip <wraps-dir> <out-dir> [--first K] [--last K] [--every E]   the wraps joined at the theta cut: ONE continuous spiral surface (strip.sfc)\n"
         "  ufsm strip-flatten <strip-dir> [--decim D] [--stride S] [--stripe-px 60000] [--flip-rows 1]   the whole strip flattened (chunk SLIM + blend) -> render stripes\n"
         "  ufsm strip-mosaic <flat-dir> <render-dir> <out-dir> [--ct-level 80]   stripe JPEGs, overview, on-papyrus share along the strip\n"
+        "  ufsm strip-distort <flat-dir> <out-dir> [--div 8] [--trust 0.05]   flattening distortion per stripe: worst linear stretch, area ratio, folds (images + tsv)\n"
+        "  ufsm wrap-repair <wraps-in> <wraps-out|-> --axis F --axis-um U0 --ct ROOT KEY --ct-um U [--codes ROOT KEY]   per-ray wrap order / dup / merged check and repair of .sfc wraps\n"
         "  ufsm blend <out-group> <out-um> --shape Z,Y,X --interior S <root> <key> <oz,oy,ox>...   shifted predict runs -> one seamless sin^2-weighted logit average\n"
         "  ufsm wrap-match <wraps-A> <wraps-B> --axis AXIS.json   which B wrap each A wrap coincides with (radius per z x angle bin about the axis)\n"
         "  ufsm ink-cover <render-dir>   per rendered wrap on papyrus: ink share >= t, mean ink, stroke contrast\n"
@@ -4728,6 +4732,8 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "strip")) return cmd_strip(argc, argv);
     if (!strcmp(cmd, "strip-flatten")) return cmd_strip_flatten(argc, argv);
     if (!strcmp(cmd, "strip-mosaic")) return cmd_strip_mosaic(argc, argv);
+    if (!strcmp(cmd, "strip-distort")) return cmd_strip_distort(argc, argv);
+    if (!strcmp(cmd, "wrap-repair")) return cmd_wrap_repair(argc, argv);
     if (!strcmp(cmd, "strip-crop")) return cmd_strip_crop(argc, argv);
     if (!strcmp(cmd, "fiber-link")) return cmd_fiber_link(argc, argv);
     if (!strcmp(cmd, "fiber-check")) return cmd_fiber_check(argc, argv);
