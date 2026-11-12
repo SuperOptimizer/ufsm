@@ -53,6 +53,7 @@ static double wsn_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, 
 typedef struct {
     z3 *z; int64_t sh[3]; int cs[3]; int64_t g[3]; uint8_t **ch; _Atomic uint8_t *need; size_t nres;
     double f, org[3]; uint8_t fill;   /* wrap voxel p -> array voxel (p + .5) f - .5 - org */
+    int lg[3];   /* log2 of the chunk sides (all powers of two; else -1: the divisions) */
 } wsn_vol;
 static int wsn_vol_open(wsn_vol *v, const char *root, const char *key, const char *cache, double f, const double org[3], uint8_t fill) {
     memset(v, 0, sizeof *v); v->z = z3_open(store_open(root), key, cache); if (!v->z) return -1;
@@ -60,6 +61,8 @@ static int wsn_vol_open(wsn_vol *v, const char *root, const char *key, const cha
     for (int d = 0; d < 3; d++) { v->sh[d] = m->shape[d]; v->cs[d] = m->chunk[d] > 0 ? m->chunk[d] : 128; v->g[d] = (m->shape[d] + v->cs[d] - 1) / v->cs[d]; v->org[d] = org[d]; }
     const size_t ng = (size_t)v->g[0] * v->g[1] * v->g[2];
     v->ch = calloc(ng, sizeof *v->ch); v->need = calloc(ng, 1); v->f = f; v->fill = fill;
+    int p2 = 1; for (int d = 0; d < 3; d++) { v->lg[d] = 0; while ((1 << v->lg[d]) < v->cs[d]) v->lg[d]++; p2 &= (1 << v->lg[d]) == v->cs[d]; }
+    if (!p2) v->lg[0] = v->lg[1] = v->lg[2] = -1;
     return v->ch && v->need ? 0 : -1;
 }
 static void wsn_vol_close(wsn_vol *v) {
@@ -111,19 +114,48 @@ static int wsn_vol_fill(wsn_vol *v, int nt) {
 }
 static inline double wsn_at(const wsn_vol *v, int64_t z, int64_t y, int64_t x) {
     if (z < 0 || y < 0 || x < 0 || z >= v->sh[0] || y >= v->sh[1] || x >= v->sh[2]) return v->fill;
+    if (v->lg[0] >= 0) {   /* (power-of-two chunks: shifts and masks, the same voxel) */
+        const int lz = v->lg[0], ly = v->lg[1], lx = v->lg[2];
+        const uint8_t *b = v->ch[((size_t)(z >> lz) * v->g[1] + (size_t)(y >> ly)) * v->g[2] + (size_t)(x >> lx)];
+        return b ? b[((size_t)(z & (v->cs[0] - 1)) << (ly + lx)) + ((size_t)(y & (v->cs[1] - 1)) << lx) + (size_t)(x & (v->cs[2] - 1))] : v->fill;
+    }
     const uint8_t *b = v->ch[((size_t)(z / v->cs[0]) * v->g[1] + (size_t)(y / v->cs[1])) * v->g[2] + (size_t)(x / v->cs[2])];
     if (!b) return v->fill;
     return b[((size_t)(z % v->cs[0]) * v->cs[1] + (size_t)(y % v->cs[1])) * v->cs[2] + (size_t)(x % v->cs[2])];
+}
+static double wsn_tri_fill(const wsn_vol *v, double fz, double fy, double fx) {   /* wsn_tri's sum over 8 corners of the fill (an absent chunk) */
+    double s = 0; const double f = v->fill;
+    for (int c = 0; c < 8; c++) s += (c >> 2 & 1 ? fz : 1 - fz) * (c >> 1 & 1 ? fy : 1 - fy) * (c & 1 ? fx : 1 - fx) * f;
+    return s;
 }
 static double wsn_tri(const wsn_vol *v, const double p[3]) {   /* trilinear at wrap-voxel point p */
     double a[3]; wsn_a(v, p, a);
     const int64_t z0 = (int64_t)floor(a[0]), y0 = (int64_t)floor(a[1]), x0 = (int64_t)floor(a[2]);
     const double fz = a[0] - z0, fy = a[1] - y0, fx = a[2] - x0; double s = 0;
+    const int lz = v->lg[0], ly = v->lg[1], lx = v->lg[2];
+    /* the 8 corners inside the array and in one chunk (~95% of the samples): the chunk found once, the same values in the same sum
+       (an evidence profile sample is 2 of these on --target mix, ~40% of wrap-snap's time with the per-corner divisions) */
+    if (lz >= 0 && z0 >= 0 && y0 >= 0 && x0 >= 0 && z0 + 1 < v->sh[0] && y0 + 1 < v->sh[1] && x0 + 1 < v->sh[2] &&
+        z0 >> lz == (z0 + 1) >> lz && y0 >> ly == (y0 + 1) >> ly && x0 >> lx == (x0 + 1) >> lx) {
+        const uint8_t *b = v->ch[((size_t)(z0 >> lz) * v->g[1] + (size_t)(y0 >> ly)) * v->g[2] + (size_t)(x0 >> lx)];
+        if (!b) return wsn_tri_fill(v, fz, fy, fx);
+        const size_t sy = (size_t)1 << lx, sz = (size_t)1 << (ly + lx), o = ((size_t)(z0 & (v->cs[0] - 1)) << (ly + lx)) + ((size_t)(y0 & (v->cs[1] - 1)) << lx) + (size_t)(x0 & (v->cs[2] - 1));
+        const double val[8] = {b[o], b[o + 1], b[o + sy], b[o + sy + 1], b[o + sz], b[o + sz + 1], b[o + sz + sy], b[o + sz + sy + 1]};
+        for (int c = 0; c < 8; c++) s += (c >> 2 & 1 ? fz : 1 - fz) * (c >> 1 & 1 ? fy : 1 - fy) * (c & 1 ? fx : 1 - fx) * val[c];
+        return s;
+    }
     for (int c = 0; c < 8; c++)
         s += (c >> 2 & 1 ? fz : 1 - fz) * (c >> 1 & 1 ? fy : 1 - fy) * (c & 1 ? fx : 1 - fx) * wsn_at(v, z0 + (c >> 2 & 1), y0 + (c >> 1 & 1), x0 + (c & 1));
     return s;
 }
-static double wsn_near(const wsn_vol *v, const double p[3]) { double a[3]; wsn_a(v, p, a); return wsn_at(v, llround(a[0]), llround(a[1]), llround(a[2])); }
+static inline int64_t wsn_lround(double a) {   /* llround(a) for |a| < 2^52 without the libm call: trunc, then half away from zero (a - t exact) */
+    const double t = trunc(a); return (int64_t)(t + (fabs(a - t) >= 0.5 ? (a < 0 ? -1.0 : 1.0) : 0.0));
+}
+static double wsn_near(const wsn_vol *v, const double p[3]) {
+    double a[3]; wsn_a(v, p, a);
+    if (!(fabs(a[0]) < 4e15 && fabs(a[1]) < 4e15 && fabs(a[2]) < 4e15)) return wsn_at(v, llround(a[0]), llround(a[1]), llround(a[2]));
+    return wsn_at(v, wsn_lround(a[0]), wsn_lround(a[1]), wsn_lround(a[2]));
+}
 
 /* ---- the wraps ---- */
 typedef struct {
@@ -136,6 +168,7 @@ typedef struct {
 typedef struct {
     wsn_wrap *W; int nw; axis *ax; double s0;  /* wrap voxels -> axis (level-0) voxels */
     wsn_vol *ct, *pc, *rv; int target; double R, margin, minprom; int B0, BN; long njobs; _Atomic long next; int mark;
+    int dbg;   /* UFSM_WSN_DEBUG (read once: a getenv per vertex was 1.3% of wrap-snap) */
 } wsn_job;
 enum { T_CT, T_PHASE, T_RECTO, T_MIX };
 
@@ -176,7 +209,7 @@ static int cmp_cand(const void *a, const void *b) { const float *x = a, *y = b; 
 static void wsn_row(const wsn_job *J, int wi, int r) {
     wsn_wrap *w = &J->W[wi]; if (r >= w->h) return;
     const wsn_wrap *A = wi > 0 && J->W[wi - 1].id == w->id - 1 ? &J->W[wi - 1] : nullptr, *Bw = wi + 1 < J->nw && J->W[wi + 1].id == w->id + 1 ? &J->W[wi + 1] : nullptr;
-    const double R = J->R; const int ns = (int)ceil(2 * R / 0.5) + 8; double *prof = malloc(ns * sizeof(double)), *pcp = malloc(ns * sizeof(double));
+    const double R = J->R; const int ns = (int)ceil(2 * R / 0.5) + 8; double *prof = malloc(ns * sizeof(double));
     for (int c = 0; c < w->w; c++) {
         if (!wsn_bvalid(w, r, c)) continue;
         const size_t i = (size_t)r * w->w + c; const float *p = wsn_bp(w, r, c);
@@ -230,9 +263,9 @@ static void wsn_row(const wsn_job *J, int wi, int r) {
         const wsn_vol *ev = J->target == T_PHASE ? J->pc : J->target == T_RECTO ? J->rv : J->ct;
         for (int s = 0; s < n; s++) {
             const double t = t0 + 0.5 * s, q[3] = {P[0], P[1] + t * u[1], P[2] + t * u[2]};
-            prof[s] = wsn_tri(ev, q); if (J->target == T_MIX) pcp[s] = (wsn_tri(J->pc, q) - 128) / 127.0;
+            prof[s] = wsn_tri(ev, q);   /* (--target mix: the phase at a candidate only, below; it was every sample, half the lookups) */
         }
-        if (getenv("UFSM_WSN_DEBUG") && c % 997 == 0 && r % 61 == 0) {
+        if (J->dbg && c % 997 == 0 && r % 61 == 0) {
             fprintf(stderr, "dbg w%03d r%d c%d P %.1f %.1f %.1f [%.2f %.2f]:", w->id, r, c, P[0], P[1], P[2], tlo, thi);
             for (int s = 0; s < n; s++) fprintf(stderr, " %.0f", prof[s]);
             fputc('\n', stderr);
@@ -250,7 +283,7 @@ static void wsn_row(const wsn_job *J, int wi, int r) {
                 for (int k = s + 1; k < n && prof[k] <= prof[s]; k++) if (prof[k] < rm) rm = prof[k];
                 const double pr = prof[s] - fmax(lm, rm); if (pr < J->minprom) continue;
                 str = fmin(255, pr * 4);
-                if (J->target == T_MIX) str *= fmin(1, fmax(0.1, pcp[s]));
+                if (J->target == T_MIX) { const double qm[3] = {P[0], P[1] + t * u[1], P[2] + t * u[2]}; str *= fmin(1, fmax(0.1, (wsn_tri(J->pc, qm) - 128) / 127.0)); }
             }
             const double den = prof[s - 1] - 2 * prof[s] + prof[s + 1];
             double dt = den < 0 ? 0.5 * 0.5 * (prof[s - 1] - prof[s + 1]) / den : 0; if (dt > 0.25) dt = 0.25; if (dt < -0.25) dt = -0.25;
@@ -261,7 +294,7 @@ static void wsn_row(const wsn_job *J, int wi, int r) {
         for (int k = 0; k < WSN_K && k < nc; k++) { w->ct[i * WSN_K + k] = (int8_t)lround(fmax(-127, fmin(127, cand[k][0] * WSN_Q))); w->cs[i * WSN_K + k] = (uint8_t)fmax(1, fmin(255, lround(cand[k][1]))); }
         w->rs[r].nc++;
     }
-    free(prof); free(pcp);
+    free(prof);
 }
 static void *wsn_rows(void *arg) {
     wsn_job *J = arg;
@@ -292,30 +325,34 @@ static void *wsn_wrun(void *arg) {
 }
 
 /* ---- the per-wrap smooth offset field ---- */
-/* 3 passes of a normalised box of radius rad along rows (dir 0) or columns (dir 1) of a h x w grid, in place */
+/* 3 passes of a normalised box of radius rad along rows (dir 0) or columns (dir 1) of a h x w grid, in place. WSN_BK lines at once
+   (interleaved in buf / tmp: L x WSN_BK doubles each), each line's sums in its own order as one at a time: the same values; the
+   running sums' chains overlap and a column pass reads whole cache lines (one column at a time read 1 float of 16 per line) */
+enum { WSN_BK = 8 };
 static void wsn_box(float *a, int w, int h, int rad, int dir, double *buf, double *tmp) {
     if (rad < 1) return;
-    const int L = dir ? h : w, M = dir ? w : h;
-    for (int m = 0; m < M; m++) {
-        for (int l = 0; l < L; l++) buf[l] = a[dir ? (size_t)l * w + m : (size_t)m * w + l];
+    const int L = dir ? h : w, M = dir ? w : h, K = WSN_BK;
+    for (int m0 = 0; m0 < M; m0 += K) {
+        const int nk = M - m0 < K ? M - m0 : K;
+        for (int l = 0; l < L; l++) for (int j = 0; j < K; j++) buf[(size_t)l * K + j] = j < nk ? a[dir ? (size_t)l * w + m0 + j : (size_t)(m0 + j) * w + l] : 0;
         for (int pass = 0; pass < 3; pass++) {
-            double s = 0; int lo = 0, hi = -1;
+            double s[WSN_BK] = {0}; int lo = 0, hi = -1;
             for (int l = 0; l < L; l++) {
                 const int a0 = l - rad < 0 ? 0 : l - rad, a1 = l + rad > L - 1 ? L - 1 : l + rad;
-                while (hi < a1) s += buf[++hi];
-                while (lo < a0) s -= buf[lo++];
-                tmp[l] = s / (2 * rad + 1);
+                while (hi < a1) { ++hi; for (int j = 0; j < K; j++) s[j] += buf[(size_t)hi * K + j]; }
+                while (lo < a0) { for (int j = 0; j < K; j++) s[j] -= buf[(size_t)lo * K + j]; lo++; }
+                for (int j = 0; j < K; j++) tmp[(size_t)l * K + j] = s[j] / (2 * rad + 1);
             }
-            memcpy(buf, tmp, L * sizeof(double));
+            memcpy(buf, tmp, (size_t)L * K * sizeof(double));
         }
-        for (int l = 0; l < L; l++) a[dir ? (size_t)l * w + m : (size_t)m * w + l] = (float)buf[l];
+        for (int l = 0; l < L; l++) for (int j = 0; j < nk; j++) a[dir ? (size_t)l * w + m0 + j : (size_t)(m0 + j) * w + l] = (float)buf[(size_t)l * K + j];
     }
 }
 typedef struct { double sig[8], tau[8]; int nsig, iters; double lam, s0; axis *ax; const char *out, *dmap; double dmap_gs; int dry; _Atomic int next, fail; wsn_wrap *W; int nw;
                  _Atomic long long nmov, nclamp, nval; _Atomic long long sumabs_q; } wsn_solve;
 static void wsn_solve_one(wsn_solve *S, wsn_wrap *w) {
     const int W = w->w, H = w->h; const size_t nv = (size_t)W * H;
-    float *D = calloc(nv, 4), *num = malloc(nv * 4), *den = malloc(nv * 4); const int L = W > H ? W : H; double *buf = malloc(L * sizeof(double)), *tmp = malloc(L * sizeof(double));
+    float *D = calloc(nv, 4), *num = malloc(nv * 4), *den = malloc(nv * 4); const int L = W > H ? W : H; double *buf = malloc((size_t)L * WSN_BK * sizeof(double)), *tmp = malloc((size_t)L * WSN_BK * sizeof(double));
     double ps = 0; long pn = 0; for (int r = 0; r < H; r++) { ps += w->rs[r].ps; pn += w->rs[r].pn; }
     const double pitch = pn ? ps / pn : w->step, rowp = w->step;   /* wrap voxels */
     for (int s = 0; s < S->nsig; s++) {
@@ -452,7 +489,7 @@ int cmd_wrap_snap(int argc, char **argv) {
     tfx_set_threads(nt);
     double t0 = wsn_now(), tdec = 0; int nsel = 0; for (int k = 0; k < nw; k++) nsel += W[k].sel;
     fprintf(stderr, "wrap-snap: %d wraps (%d snapped), %d rows, %.4g um, target %s, range %.1f voxels, bands of %d rows, %d threads\n", nw, nsel, H, wum, tg, R, BR, nt);
-    wsn_job J = {W, nw, &ax, wum / axum, &vct, vpc.z ? &vpc : nullptr, vr.z ? &vr : nullptr, target, R, atof(wsn_opt(argc, argv, "--margin", "0.1")), atof(wsn_opt(argc, argv, "--min-prom", "6")), 0, 0, 0, 0, 0};
+    wsn_job J = {W, nw, &ax, wum / axum, &vct, vpc.z ? &vpc : nullptr, vr.z ? &vr : nullptr, target, R, atof(wsn_opt(argc, argv, "--margin", "0.1")), atof(wsn_opt(argc, argv, "--min-prom", "6")), 0, 0, 0, 0, 0, getenv("UFSM_WSN_DEBUG") != nullptr};
     pthread_t th[64]; const int m = nt < 64 ? nt : 64;
     for (int b0 = 0; b0 < H; b0 += BR) {
         J.B0 = b0; J.BN = b0 + BR <= H ? BR : H - b0; J.njobs = (long)nw * J.BN;

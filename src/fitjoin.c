@@ -74,9 +74,13 @@ static int fj_block(fj_cache *C, int j, int keep) {   /* the slot holding block 
     for (int q = 0; q < 2; q++) if (C->s[q].f.a[9] && C->s[q].b0 == (int)((long long)j * C->cz - C->zoff < 0 ? 0 : (long long)j * C->cz - C->zoff)) { C->s[q].use = ++C->tick; return q; }
     int q = !C->s[0].f.a[9] ? 0 : !C->s[1].f.a[9] ? 1 : C->s[0].use <= C->s[1].use ? 0 : 1;
     if (q == keep) q = !q;
-    fit_fields_free(&C->s[q].f);
     long long b0 = (long long)j * C->cz - C->zoff, b1 = b0 + C->cz; if (b0 < 0) b0 = 0; if (b1 > C->D) b1 = C->D;
-    if (fit_fields_load(C->dir, (int)b0, (int)b1, 1, &C->s[q].f)) return -1;
+    /* the evicted block's planes take the new rows (fit_fields_recycle: the same bytes, no fresh pages: the page faults and zeroing of
+       ~3 x 128 x 13 MB per block were 315 of 890 CPU s of a Paris 4 join) */
+    fit_fields_buf nb; fit_fields_recycle(1); const int rc = fit_fields_load_ex(C->dir, (int)b0, (int)b1, 1, &nb, 0, nullptr, 0, C->s[q].f.a[9] ? &C->s[q].f : nullptr); fit_fields_recycle(0);
+    if (!C->s[q].f.a[9]) fit_fields_free(&C->s[q].f);
+    if (rc) return -1;
+    C->s[q].f = nb;
     C->s[q].b0 = (int)b0; C->s[q].b1 = (int)b1; C->s[q].use = ++C->tick;
     return q;
 }
@@ -111,17 +115,26 @@ static void fj_cells_count(void *a, int c0, int c1, int t) {
     const fj_cells_job *J = a; (void)t;
     for (int c = c0; c < c1; c++) { size_t s = 0; const size_t e = ((size_t)c + 1) * FJ_CH < J->n ? ((size_t)c + 1) * FJ_CH : J->n; for (size_t i = (size_t)c * FJ_CH; i < e; i++) s += J->f->w[i] != 0; J->cnt[c] = s; }
 }
+static inline uint64_t fj_nz64(const uint8_t *w) { uint64_t m = 0; for (int k = 0; k < 64; k++) m |= (uint64_t)(w[k] != 0) << k; return m; }   /* (the non-zero bytes of 64) */
 static void fj_cells_pick(void *a, int c0, int c1, int t) {
     const fj_cells_job *J = a; (void)t; const fit_fields *f = J->f;
     for (int c = c0; c < c1; c++) {
-        const size_t e = ((size_t)c + 1) * FJ_CH < J->n ? ((size_t)c + 1) * FJ_CH : J->n, cap = J->cnt[c] / J->stride + 2; size_t seen = J->seen0[c], ni = 0;
+        const size_t e = ((size_t)c + 1) * FJ_CH < J->n ? ((size_t)c + 1) * FJ_CH : J->n, cap = J->cnt[c] / J->stride + 2; size_t ni = 0;
         size_t *iv = malloc(sizeof(size_t) * cap); float *cw = malloc(sizeof(float) * cap);
-        for (size_t i = (size_t)c * FJ_CH; i < e; i++) {
-            if (!f->w[i]) continue;
-            if (seen++ % J->stride) continue;
-            const double cc = (f->pc[i] - 128) / 127.0, sn = (f->ps[i] - 128) / 127.0;
-            if (cc * cc + sn * sn < J->minc * J->minc) continue;
-            cw[ni] = (float)sqrt(cc * cc + sn * sn); iv[ni++] = i;
+        size_t skip = (J->stride - J->seen0[c] % J->stride) % J->stride;   /* (material cells before the next pick: seen % stride == 0, no division per cell) */
+        for (size_t i0 = (size_t)c * FJ_CH; i0 < e; i0 += 64) {   /* (64 cells at a time: a block whose material cells are all skipped costs one mask) */
+            uint64_t m;
+            if (i0 + 64 <= e) m = fj_nz64(f->w + i0); else { m = 0; for (size_t i = i0; i < e; i++) m |= (uint64_t)(f->w[i] != 0) << (i - i0); }
+            const size_t nm = (size_t)__builtin_popcountll(m);
+            if (nm <= skip) { skip -= nm; continue; }
+            for (; m; m &= m - 1) {   /* the material cells in order */
+                const size_t i = i0 + (size_t)__builtin_ctzll(m);
+                if (skip) { skip--; continue; }
+                skip = J->stride - 1;
+                const double cc = (f->pc[i] - 128) / 127.0, sn = (f->ps[i] - 128) / 127.0;
+                if (cc * cc + sn * sn < J->minc * J->minc) continue;
+                cw[ni] = (float)sqrt(cc * cc + sn * sn); iv[ni++] = i;
+            }
         }
         J->iv[c] = iv; J->cw[c] = cw; J->ni[c] = ni;
     }
