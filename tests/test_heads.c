@@ -211,6 +211,9 @@ int main(int argc, char **argv) {
         CHECK(nfin >= 2 && nchk >= 2 && !nbad, "ssl: %d step lines with a finite ssl term, %d checks (%d with a targeted share outside 10..75%%)", nfin, nchk, nbad);
         free(lg);
         CHECK(!sh("head -1 %s/ssl/last.ckpt | grep -q '\"emb_lev\":1,\"emb_ch\":8'", d), "ssl: header names the side head");
+        /* (d) a run without the side head resumes with --ssl (the head's block inserted fresh, the rest and the step the checkpoint's) */
+        CHECK(!sh("cp -r %s/lat_plain %s/lp2 && UFSM_GRAD_MX8=1 %s train %s/fx/sources-ssl.json --out %s/lp2 --resume %s/lp2/last.ckpt %s %s --ssl-share 0.5 --steps 8 > %s/lp2.log 2>&1"
+                  " && grep -q 'has no side head' %s/lp2.log && grep -q 'step      8 ' %s/lp2.log && head -1 %s/lp2/last.ckpt | grep -q '\"emb_lev\":1,\"emb_ch\":8'", d, d, U, d, d, d, cm, sf, d, d, d, d), "ssl: resume of a run without the side head (%s/lp2.log)", d);
         /* (c) unlabelled windows skip the head slabs: the same losses as with the slabs run on zero masks (UFSM_SSL_SLABS=1) */
         CHECK(!sh("UFSM_SSL_SLABS=1 UFSM_GRAD_MX8=1 %s train %s/fx/sources-ssl.json --out %s/sslb %s %s --ssl-share 0.5 --steps 8 > %s/sslb.log 2>&1", U, d, d, cm, sf, d), "ssl run with slabs (%s/sslb.log)", d);
         snprintf(p, sizeof p, "%s/ssl.log", d); l0 = slurp(p); snprintf(p, sizeof p, "%s/sslb.log", d); l1 = slurp(p);
