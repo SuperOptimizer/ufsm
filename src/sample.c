@@ -3405,6 +3405,32 @@ static occ_index phase_occupancy(source *s) {
 static occ_index label_occupancy(source *s) {
     occ_index o = {nullptr, 0, -1, {0, 0, 0}};
     if (s->reg[0] && s->reg[0]->n) return o;
+    if (s->ct_only) {   /* an unlabelled scan (train --ssl): the cells of its level l0 + 5 CT (else the coarsest of l0 + 3 .. 4) that hold papyrus
+                           (>= the source's iso); without them its windows are drawn uniformly over the whole scan and mostly fail the probe */
+        const int l0 = s->min_level > 0 ? s->min_level : 0; z3 *cc = nullptr; int lc = l0 + 5;
+        for (; lc >= l0 + 3 && !cc; lc--) cc = lc < MAXLEV ? source_ct(s, lc) : nullptr;
+        if (!cc) return o;
+        lc++;
+        const z3_meta *mc = z3_meta_of(cc); const size_t pl = (size_t)mc->shape[1] * mc->shape[2], tot = pl * (size_t)mc->shape[0];
+        const int64_t SZ = mc->chunk[0] > 0 ? mc->chunk[0] : 64; uint8_t *cb = tot < 4.29e9 ? malloc(pl * (size_t)SZ) : nullptr;
+        if (!cb) return o;
+        /* in z slabs (a 2.4 um scan's level 5 is ~1.6e9 cells); at most 2^24 draw cells, every st-th papyrus cell (uniform in space) */
+        const int iso = s->iso > 0 ? s->iso : 1; size_t n = 0, st = 1, seen = 0; int bad = 0;
+        for (int pass = 0; pass < 2 && !bad; pass++) {
+            for (int64_t z0 = 0; z0 < mc->shape[0] && !bad; z0 += SZ) {
+                const int64_t nz = SZ < mc->shape[0] - z0 ? SZ : mc->shape[0] - z0, zo[3] = {z0, 0, 0}, zn[3] = {nz, mc->shape[1], mc->shape[2]};
+                if (z3_read(cc, zo, zn, cb, 8)) { bad = 1; break; }
+                for (size_t k = 0; k < (size_t)nz * pl; k++) if (cb[k] >= iso) { if (!pass) n++; else if (seen++ % st == 0 && o.n < n) o.idx[o.n++] = (uint32_t)((size_t)z0 * pl + k); }
+            }
+            if (!pass) { st = n > ((size_t)1 << 24) ? (n + ((size_t)1 << 24) - 1) >> 24 : 1; const size_t keep = (n + st - 1) / st;
+                         if (!n || !(o.idx = malloc(keep * sizeof *o.idx))) break; n = keep; }
+        }
+        if (bad) { free(o.idx); o.idx = nullptr; o.n = 0; }
+        if (o.n) { o.lev = lc; for (int d = 0; d < 3; d++) o.shape[d] = mc->shape[d];
+            fprintf(stderr, "sampler: %s: %zu level-%d CT cells of %zu (every %zu-th papyrus cell) are the draw cells of an unlabelled scan\n", s->name, o.n, lc, tot, st); }
+        free(cb);
+        return o;
+    }
     /* the coarsest label level that exists (level >= 3); large scans (Paris 4: 2.5e9 cells at level 5) are read in z slabs,
        so there is no size cap besides the 32-bit cell index (a 3e8 cap used to leave such sources without an index, i.e.
        sampled uniformly over the whole volume) */
