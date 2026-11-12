@@ -165,10 +165,13 @@ int main(void) {
         store *cs = store_open(dir); z3 *ct0 = z3_open(cs, "ct.zarr/1", nullptr);
         inksplat_cfg c8 = c7; c8.crop[2] = 0; c8.merge = 0; c8.level = 0;
         char dcd[600]; snprintf(dcd, sizeof dcd, "%s/dcache", dir);
-        for (int open = 0; open < 2; open++) {   /* open 0: computed (cold), then from memory; open 1: a fresh array over the same disk cache */
+        inkfly_gpu_config(-1);   /* opens 0, 1: the CPU code; open 2: the GPU (nn_inkfly.cu), memory cache only, when a device answers */
+        for (int open = 0; open < 3; open++) {   /* open 0: computed (cold), then from memory; open 1: a fresh array over the same disk cache */
+            if (open == 2) { if (!getenv("UFSM_TEST_NO_GPU")) inkfly_gpu_config(0); else break; }
             z3 *ctx = open ? z3_open(cs, "ct.zarr/1", nullptr) : ct0;
             dcache_stats d0; dcache_get_stats(&d0);
-            z3 *fly = ctx ? inkfly_open(ctx, sj, &c8, 64, dcd, nullptr) : nullptr; CHECK(fly != nullptr, "inkfly_open %d", open);
+            const uint64_t g0 = inkfly_gpu_chunks();
+            z3 *fly = ctx ? inkfly_open(ctx, sj, &c8, 64, open == 2 ? nullptr : dcd, nullptr) : nullptr; CHECK(fly != nullptr, "inkfly_open %d", open);
             if (!fly) break;
             for (int pass = 0; pass < 2; pass++) {   /* odd boxes */
                 const int64_t bo[3] = {37, 11, 5}, bn[3] = {NV - 60, NV - 20, NV - 9}; uint8_t *fb = malloc((size_t)bn[0] * bn[1] * bn[2]);
@@ -184,7 +187,8 @@ int main(void) {
             fprintf(stderr, "dcache open %d: %llu computed, %llu from disk, %llu from memory\n", open, (unsigned long long)(d1.cells_computed - d0.cells_computed),
                     (unsigned long long)(d1.cells_disk - d0.cells_disk), (unsigned long long)(d1.cells_mem - d0.cells_mem));
             if (!open) CHECK(d1.cells_computed > d0.cells_computed && d1.cells_mem > d0.cells_mem && d1.cells_disk == d0.cells_disk, "dcache: cold computes, warm from memory");
-            else CHECK(d1.cells_computed == d0.cells_computed && d1.cells_disk > d0.cells_disk, "dcache: a reopened array reads its cells from disk");
+            else if (open == 1) CHECK(d1.cells_computed == d0.cells_computed && d1.cells_disk > d0.cells_disk, "dcache: a reopened array reads its cells from disk");
+            else fprintf(stderr, "onfly on the GPU: %llu chunks%s\n", (unsigned long long)(inkfly_gpu_chunks() - g0), inkfly_gpu_chunks() > g0 ? "" : " (no device: the CPU ran; not a failure)");
             z3_close(fly);
         }
         free(rb); if (ref) z3_close(ref); store_close(s7); store_close(cs);

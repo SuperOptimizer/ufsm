@@ -69,6 +69,8 @@ z3 *inkfly_open(z3 *ct, const char *segs, const inksplat_cfg *cfg, size_t cache_
 /* the level-lev cells (grid shape) a supervised label tile's box (reach included) touches -> bits[] = 1 (the sampler's draw cells) */
 int inkfly_cells(void *handle, int lev, const int64_t shape[3], uint8_t *bits);
 z3 *inkfly_open_pooled(z3 *ct_coarse, z3 *fine, int own_fine);   /* the next level: known-max 2x pooling of fine, on ct_coarse's grid (owned) */
+void inkfly_gpu_config(int dev);   /* the chunk compute on GPU dev (< 0: the CPU); default: $UFSM_INKFLY_GPU (0), $UFSM_INKFLY_CPU=1 the CPU */
+uint64_t inkfly_gpu_chunks(void);   /* chunks computed on the GPU so far (process) */
 void inkfly_stats(uint64_t *reads, uint64_t *chunks, uint64_t *empty, uint64_t *hits, uint64_t *px, double *sec);
 int inkfly_holdouts(const char *holdout_file, const char *ct_key, inksplat_cfg *cfg);   /* boxes whose ct basename is ct_key's -> cfg->excl */
 int cmd_ink_onfly(int argc, char **argv);

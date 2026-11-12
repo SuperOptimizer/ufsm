@@ -1,5 +1,6 @@
 #include "sample.h"
 #include "inksplat.h"
+[[gnu::weak]] int inkfly_cells(void *, int, const int64_t[3], uint8_t *);   /* (weak: test binaries without inksplat.o; only called for an onfly target) */
 #include "band.h"
 #include "band_w4dev.h"
 #include "target_erode.h"

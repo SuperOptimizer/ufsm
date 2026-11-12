@@ -2,6 +2,7 @@
    prediction along the labelled surface. */
 #include "inksplat.h"
 #include "dcache.h"
+#include "inkflygpu.h"
 #include <stdarg.h>
 #include <sys/stat.h>
 #include "sysinfo.h"
@@ -172,9 +173,12 @@ static int lsrc_read(lsrc *L, int64_t r0, int64_t c0, int64_t h, int64_t w, uint
                 } else { src = sb; len = nb; }
                 if (z2_decode(L->comp, src, len, dec, (size_t)cv)) { fprintf(stderr, "ink-splat: label chunk %s (%lld, %lld): %s\n", k, (long long)a, (long long)b, z2_error()); rc = -1; continue; }
             copy:
-                for (int64_t r = 0; r < L->chunk[0]; r++) {
-                    const int64_t rr = g0 + r - r0; if (rr < 0 || rr >= h || g0 + r >= L->H) continue;
-                    for (int64_t c = 0; c < L->chunk[1]; c++) { const int64_t cc = g1 + c - c0; if (cc >= 0 && cc < w && g1 + c < L->W) out[(size_t)rr * w + cc] = dec[(size_t)r * L->chunk[1] + c]; }
+                {   /* the chunk's columns [ca, cb) that fall in the window and the raster (row memcpy: the per-byte loop was half of an index open) */
+                    int64_t ca = c0 - g1 > 0 ? c0 - g1 : 0, cb = L->chunk[1]; if (g1 + cb > c0 + w) cb = c0 + w - g1; if (g1 + cb > L->W) cb = L->W - g1;
+                    if (cb > ca) for (int64_t r = 0; r < L->chunk[0]; r++) {
+                        const int64_t rr = g0 + r - r0; if (rr < 0 || rr >= h || g0 + r >= L->H) continue;
+                        memcpy(out + (size_t)rr * w + (g1 + ca - c0), dec + (size_t)r * L->chunk[1] + ca, (size_t)(cb - ca));
+                    }
                 }
             }
             free(sb);
@@ -1061,7 +1065,16 @@ typedef struct {
     iftile *T; size_t nT;
     int64_t gcell, gdim[3]; uint32_t *gstart, *glist;   /* tile grid: cells of gcell level-0 voxels -> tile ids (CSR) */
 } inkfly;
-static struct { _Atomic uint64_t reads, chunks, empty, hits, px, us, ct_us; } g_ifs;
+static struct { _Atomic uint64_t reads, chunks, empty, hits, px, us, ct_us, gpu_chunks, gpu_us; } g_ifs;
+static _Atomic int g_ifgpu = -1;   /* -1 undecided (first chunk: $UFSM_INKFLY_CPU / $UFSM_INKFLY_GPU), 0 CPU, 1 GPU */
+uint64_t inkfly_gpu_chunks(void) { return atomic_load(&g_ifs.gpu_chunks); }
+void inkfly_gpu_config(int dev) { if (dev < 0 || !inkfly_gpu_near) { g_ifgpu = 0; return; } inkfly_gpu_device(dev); g_ifgpu = 1; }
+static int ifgpu_on(void) {
+    int g = atomic_load(&g_ifgpu); if (g >= 0) return g;
+    const char *e = getenv("UFSM_INKFLY_CPU"), *d = getenv("UFSM_INKFLY_GPU");
+    if ((e && atoi(e)) || !inkfly_gpu_near) g = 0; else { inkfly_gpu_device(d ? atoi(d) : 0); g = 1; }
+    atomic_store(&g_ifgpu, g); return g;
+}
 static int inkfly_find(char (*paths)[1024], int n, const char *p) { for (int i = 0; i < n; i++) if (!strcmp(paths[i], p)) return i; return -1; }
 static void inkfly_free(void *p) {
     inkfly *f = p; if (!f) return;
@@ -1073,6 +1086,69 @@ static void inkfly_free(void *p) {
 static int box_hit(const int32_t lo[3], const int32_t hi[3], const int64_t a[3], const int64_t b[3]) {   /* [lo, hi] vs [a, b) */
     for (int d = 0; d < 3; d++) if (hi[d] < a[d] || lo[d] >= b[d]) return 0;
     return 1;
+}
+/* the GPU chunk: 0 done, 1 run the CPU code (a mesh patch fell short), -1 a read failed. A CUDA failure turns the GPU off (CPU from then on). */
+static int inkfly_chunk_gpu(inkfly *f, const int64_t o[3], const int64_t n[3], const uint32_t *cand, size_t nc, uint8_t *out, int *nonempty) {
+    const inksplat_cfg *c = &f->c; const double V = f->V, slack = f->reach + 3;
+    int64_t a0[3], b0[3]; for (int d = 0; d < 3; d++) { a0[d] = o[d] * (int64_t)V; b0[d] = (o[d] + n[d]) * (int64_t)V; }
+    size_t nu = 0; for (size_t q = 0; q < nc; q++) nu += !q || f->T[cand[q]].unit != f->T[cand[q - 1]].unit;
+    ifg_unit *U = calloc(nu, sizeof *U); int rc = -1; size_t iu = 0;
+    uint8_t *ctb = nullptr;
+    for (size_t q0 = 0; q0 < nc; iu++) {
+        size_t q1 = q0; const ifunit *u = &f->U[f->T[cand[q0]].unit]; while (q1 < nc && f->T[cand[q1]].unit == f->T[cand[q0]].unit) q1++;
+        ifg_unit *h = &U[iu]; int64_t rr0 = INT64_MAX, rc0 = INT64_MAX, rr1 = 0, rc1 = 0;
+        int32_t *tl = malloc((q1 - q0) * sizeof *tl); h->tiles = tl; h->ntiles = (int)(q1 - q0); h->ntx = u->ntx;
+        for (size_t q = q0; q < q1; q++) { const iftile *T = &f->T[cand[q]]; const int t = (int)T->tile, tx = t % u->ntx, ty = t / u->ntx; tl[q - q0] = t;
+            const int64_t r0 = (int64_t)ty * TS, c0 = (int64_t)tx * TS, r1 = r0 + TS < u->lh ? r0 + TS : u->lh, c1 = c0 + TS < u->lw ? c0 + TS : u->lw;
+            if (r0 < rr0) { rr0 = r0; } if (c0 < rc0) { rc0 = c0; } if (r1 > rr1) { rr1 = r1; } if (c1 > rc1) { rc1 = c1; }
+            }
+        h->rr0 = rr0; h->rc0 = rc0; h->rh = rr1 - rr0; h->rw = rc1 - rc0; h->lh = u->lh; h->lw = u->lw;
+        uint8_t *lab = malloc((size_t)h->rh * h->rw), *msk = u->msk >= 0 ? malloc((size_t)h->rh * h->rw) : nullptr; h->lab = lab; h->msk = msk;
+        if (!lab || (u->msk >= 0 && !msk) || lsrc_read(&f->Ls[u->lab], u->lr0 + rr0, u->lc0 + rc0, h->rh, h->rw, lab, 1) ||
+            (msk && lsrc_read(&f->Ls[u->msk], u->lr0 + rr0, u->lc0 + rc0, h->rh, h->rw, msk, 1))) goto done;
+        if (u->lab01) for (size_t k = 0; k < (size_t)h->rh * h->rw; k++) lab[k] *= 255;
+        if (msk && u->msk01) for (size_t k = 0; k < (size_t)h->rh * h->rw; k++) msk[k] *= 255;
+        const ssurf *S = &f->S[u->surf];
+        geo G = {0}; G.c = c; G.S = S; G.F = u->F; G.lw = h->rw; G.lh = h->rh; G.lr0 = u->lr0 + rr0; G.lc0 = u->lc0 + rc0; G.offr = c->label_off[0]; G.offc = c->label_off[1];
+        double gu0, gv0, gu1, gv1; px_grid(&G, -1.0, -1.0, &gu0, &gv0); px_grid(&G, (double)h->rh, (double)h->rw, &gu1, &gv1);   /* the rectangle +- 1 px (sub-samples reach 0.5) */
+        int pu0 = (int)floor(gu0) - 1, pv0 = (int)floor(gv0) - 1, pu1 = (int)ceil(gu1) + 2, pv1 = (int)ceil(gv1) + 2;
+        if (pu0 < 0) pu0 = 0; if (pv0 < 0) pv0 = 0; if (pu1 > S->w - 1) pu1 = S->w - 1; if (pv1 > S->h - 1) pv1 = S->h - 1;
+        if (pu1 < pu0) pu1 = pu0; if (pv1 < pv0) pv1 = pv0;
+        h->pu0 = pu0; h->pv0 = pv0; h->pw = pu1 - pu0 + 1; h->ph = pv1 - pv0 + 1; h->mw = S->w; h->mh = S->h; h->scale = S->scale;
+        float *X = malloc((size_t)h->pw * h->ph * 4), *Y = malloc((size_t)h->pw * h->ph * 4), *Z = malloc((size_t)h->pw * h->ph * 4); h->X = X; h->Y = Y; h->Z = Z;
+        for (int v = 0; v < h->ph; v++) { const size_t so = (size_t)(pv0 + v) * S->w + pu0, dof = (size_t)v * h->pw;
+            memcpy(X + dof, S->X + so, (size_t)h->pw * 4); memcpy(Y + dof, S->Y + so, (size_t)h->pw * 4); memcpy(Z + dof, S->Z + so, (size_t)h->pw * 4); }
+        h->F = u->F; h->glr0 = G.lr0; h->glc0 = G.lc0;
+        double hpx = 0.45 * V / u->F; if (hpx > 1) hpx = 1; h->nsub = (int)ceil(1 / hpx);
+        const double span = c->face_b - c->face_a; h->nt = (int)ceil(span / (0.45 * V)) + 1; h->tstep = h->nt > 1 ? span / (h->nt - 1) : 0;
+        q0 = q1;
+    }
+    {
+        ifg_cfg C = {0}; C.offr = c->label_off[0]; C.offc = c->label_off[1]; C.sign = c->flip ? -1 : 1; C.face_a = c->face_a; C.thr = c->thr; C.V = V; C.off = f->off; C.slack = slack;
+        C.lo = (int)floor(c->face_lo); C.ns = (int)ceil(c->face_hi) - C.lo + 1; C.iso = c->iso; C.run = c->face_run; C.gap = c->face_gap;
+        for (int d = 0; d < 3; d++) { C.a0[d] = a0[d]; C.b0[d] = b0[d]; C.shape[d] = f->shape[d]; }
+        C.nexcl = c->nexcl; C.excl = (const int64_t (*)[6])c->excl;
+        uint64_t npx = 0; int64_t lo[3], hi[3]; double tg = snow();
+        int g = inkfly_gpu_near(U, (int)nu, &C, lo, hi, &npx);
+        atomic_fetch_add(&g_ifs.gpu_us, (uint64_t)((snow() - tg) * 1e6));
+        if (g) { if (g < 0) { fprintf(stderr, "ink onfly: the GPU near pass failed (%d): the CPU from here\n", g); atomic_store(&g_ifgpu, 0); } rc = 1; goto done; }
+        if (!npx) { memset(out, 255, (size_t)n[0] * n[1] * n[2]); *nonempty = 0; rc = 0; goto done; }   /* (no CT read: nothing reaches the chunk) */
+        /* the CT box: the near pixels' samples (the CPU's box, rounded out) */
+        int64_t co[3], cn[3]; size_t ncv = 1;
+        for (int d = 0; d < 3; d++) { co[d] = (int64_t)floor((lo[d] - f->off) / V) - 1; cn[d] = (int64_t)ceil((hi[d] - f->off) / V) + 2 - co[d]; ncv *= (size_t)cn[d]; }
+        ctb = malloc(ncv); if (!ctb) goto done;
+        const double tc = snow();
+        if (f->zc ? zcache_read(f->zc, f->base_ct, co, cn, ctb) : z3_read(f->base_ct, co, cn, ctb, 1)) { fprintf(stderr, "ink-splat onfly: CT read: %s\n", z3_error()); goto done; }
+        atomic_fetch_add(&g_ifs.ct_us, (uint64_t)((snow() - tc) * 1e6));
+        tg = snow(); g = inkfly_gpu_finish(&C, ctb, co, cn, o, n, out, nonempty);
+        atomic_fetch_add(&g_ifs.gpu_us, (uint64_t)((snow() - tg) * 1e6));
+        if (g < 0) { fprintf(stderr, "ink onfly: the GPU chunk failed (%d): the CPU from here\n", g); atomic_store(&g_ifgpu, 0); rc = 1; }
+        else { rc = g; if (!g) { atomic_fetch_add(&g_ifs.px, npx); atomic_fetch_add(&g_ifs.gpu_chunks, 1); } }
+    }
+done:
+    for (size_t i = 0; i < nu; i++) { free((void *)U[i].tiles); free((void *)U[i].lab); free((void *)U[i].msk); free((void *)U[i].X); free((void *)U[i].Y); free((void *)U[i].Z); }
+    free(U); free(ctb);
+    return rc;
 }
 /* one chunk [o, o + n) of the level-L grid: candidates -> CT box -> per unit: face + splat into accumulators -> finalize (max merge) */
 static int inkfly_chunk(inkfly *f, const int64_t o[3], const int64_t n[3], uint8_t *out, int *nonempty) {
@@ -1096,6 +1172,11 @@ static int inkfly_chunk(inkfly *f, const int64_t o[3], const int64_t n[3], uint8
     if (!nc) { free(cand); return 0; }
     /* sort candidates by unit */
     for (size_t i = 1; i < nc; i++) { uint32_t t = cand[i]; size_t j = i; while (j > 0 && (f->T[cand[j - 1]].unit > f->T[t].unit || (f->T[cand[j - 1]].unit == f->T[t].unit && f->T[cand[j - 1]].tile > f->T[t].tile))) { cand[j] = cand[j - 1]; j--; } cand[j] = t; }
+    if (ifgpu_on()) {   /* the GPU: label rectangles, mesh patches and the CT box from here; face, splat, finalize on the device (inkflygpu.h) */
+        const int r = inkfly_chunk_gpu(f, o, n, cand, nc, out, nonempty);
+        if (r <= 0) { free(cand); return r; }
+        memset(out, 255, cv); *nonempty = 0;   /* (1: a mesh patch fell short: the CPU below) */
+    }
     /* pass 1 per unit: the label rectangle of its candidate tiles, and the supervised pixels whose surface point is near the chunk */
     typedef struct { const ifunit *u; uint8_t *lab, *msk; int64_t rr0, rc0, rw, rh; size_t np; int64_t *pk; double *PN; } ugrp;
     size_t ng = 0, gcap = 8; ugrp *UG = calloc(gcap, sizeof *UG);
@@ -1285,6 +1366,30 @@ static char *inkfly_key(const inkfly *f, const inksplat_cfg *c, const char *segs
     memcpy(b + n, "segments ", 9); memcpy(b + n + 9, segs_txt, ls); n += 9 + ls; b[n++] = '\n'; b[n] = 0;
     return b;
 }
+typedef struct { inkfly *f; const inksplat_cfg *cfg; iftile **tl; size_t *ntl; _Atomic int next, failed; } ifidx;
+static void *ifidx_worker(void *p) {
+    ifidx *J = p; inkfly *f = J->f; const inksplat_cfg *cfg = J->cfg;
+    for (int i; (i = atomic_fetch_add(&J->next, 1)) < f->nU && !atomic_load(&J->failed);) {
+        ifunit *u = &f->U[i]; const ssurf *S = &f->S[u->surf];
+        uint8_t *lab = malloc((size_t)u->lw * u->lh), *msk = u->msk >= 0 ? malloc((size_t)u->lw * u->lh) : nullptr;
+        if (!lab || (u->msk >= 0 && !msk) || lsrc_read(&f->Ls[u->lab], u->lr0, u->lc0, u->lh, u->lw, lab, 1) || (msk && lsrc_read(&f->Ls[u->msk], u->lr0, u->lc0, u->lh, u->lw, msk, 1))) {
+            free(lab); free(msk); atomic_store(&J->failed, 1); break; }
+        { uint8_t m = 0; for (size_t k = 0; k < (size_t)u->lw * u->lh; k++) if (lab[k] > m) m = lab[k]; u->lab01 = m == 1; }
+        if (msk) { uint8_t m = 0; for (size_t k = 0; k < (size_t)u->lw * u->lh; k++) if (msk[k] > m) m = msk[k]; u->msk01 = m == 1; if (u->msk01) for (size_t k = 0; k < (size_t)u->lw * u->lh; k++) msk[k] *= 255; }
+        free(lab);
+        geo G = {0}; G.c = cfg; G.S = S; G.F = u->F; G.msk = msk; G.lw = u->lw; G.lh = u->lh; G.lr0 = u->lr0; G.lc0 = u->lc0; G.offr = cfg->label_off[0]; G.offc = cfg->label_off[1];
+        G.ntiles_x = u->ntx; G.ntiles_y = u->nty;
+        size_t cap = 1024, n = 0; iftile *T = malloc(cap * sizeof *T);
+        for (int t = 0; t < u->ntx * u->nty; t++) {
+            double lo[3], hi[3]; if (!tile_box(&G, t % u->ntx, t / u->ntx, f->reach, lo, hi)) continue;
+            if (n == cap) { cap *= 2; T = realloc(T, cap * sizeof *T); }
+            iftile *q = &T[n++]; q->unit = (uint32_t)i; q->tile = (uint32_t)t;
+            for (int d = 0; d < 3; d++) { q->lo[d] = (int32_t)floor(lo[d]); q->hi[d] = (int32_t)ceil(hi[d]); }
+        }
+        free(msk); J->tl[i] = T; J->ntl[i] = n;
+    }
+    return nullptr;
+}
 /* SEGS: {"segments": [{"tifxyz": DIR, "labels": L, "mask": M, "crop": [c0, r0, w, h]}, ..]}; ct: the CT at level cfg->level (owned) */
 z3 *inkfly_open(z3 *ct, const char *segs_path, const inksplat_cfg *cfg, size_t cache_mb, const char *dcache_dir, void **handle) {
     const double t0 = snow();
@@ -1296,7 +1401,7 @@ z3 *inkfly_open(z3 *ct, const char *segs_path, const inksplat_cfg *cfg, size_t c
     memcpy(f->shape, z3_meta_of(ct)->shape, sizeof f->shape);
     f->reach = fmax(fmax(fabs(cfg->face_lo), fabs(cfg->face_hi)) + 1, fmax(fabs(cfg->face_lo + cfg->face_a), fabs(cfg->face_hi + cfg->face_b)));
     const int nseg = (int)sg->n; f->S = calloc(nseg, sizeof *f->S); f->Spath = calloc(nseg, sizeof *f->Spath); f->Ls = calloc(2 * nseg, sizeof *f->Ls); f->Lpath = calloc(2 * nseg, sizeof *f->Lpath); f->U = calloc(nseg, sizeof *f->U);
-    size_t tcap = 1 << 16; f->T = malloc(tcap * sizeof *f->T);
+    f->T = nullptr;
     for (int i = 0; i < nseg; i++) {
         const json *e = json_at(sg, (size_t)i); const char *tx = json_str(json_get(e, "tifxyz"), nullptr), *lb = json_str(json_get(e, "labels"), nullptr), *mk = json_str(json_get(e, "mask"), nullptr);
         if (!tx || !lb) { fprintf(stderr, "ink onfly: segment %d: need tifxyz and labels\n", i); goto fail; }
@@ -1314,21 +1419,19 @@ z3 *inkfly_open(z3 *ct, const char *segs_path, const inksplat_cfg *cfg, size_t c
         const json *cr = json_get(e, "crop");
         if (cr && cr->n == 4 && json_num(json_at(cr, 2), 0) > 0) { u->lc0 = (int64_t)json_num(json_at(cr, 0), 0); u->lr0 = (int64_t)json_num(json_at(cr, 1), 0); u->lw = (int64_t)json_num(json_at(cr, 2), 0); u->lh = (int64_t)json_num(json_at(cr, 3), 0); }
         u->ntx = (int)((u->lw + TS - 1) / TS); u->nty = (int)((u->lh + TS - 1) / TS);
-        /* the window's rasters once: the 0/1 -> 0/255 rule over the whole window (inksplat_run's) and the supervised tiles' boxes */
-        uint8_t *lab = malloc((size_t)u->lw * u->lh), *msk = u->msk >= 0 ? malloc((size_t)u->lw * u->lh) : nullptr;
-        if (!lab || (u->msk >= 0 && !msk) || lsrc_read(&f->Ls[u->lab], u->lr0, u->lc0, u->lh, u->lw, lab, 8) || (msk && lsrc_read(&f->Ls[u->msk], u->lr0, u->lc0, u->lh, u->lw, msk, 8))) { free(lab); free(msk); goto fail; }
-        { uint8_t m = 0; for (size_t k = 0; k < (size_t)u->lw * u->lh; k++) if (lab[k] > m) m = lab[k]; u->lab01 = m == 1; }
-        if (msk) { uint8_t m = 0; for (size_t k = 0; k < (size_t)u->lw * u->lh; k++) if (msk[k] > m) m = msk[k]; u->msk01 = m == 1; if (u->msk01) for (size_t k = 0; k < (size_t)u->lw * u->lh; k++) msk[k] *= 255; }
-        free(lab);
-        geo G = {0}; G.c = cfg; G.S = S; G.F = F; G.msk = msk; G.lw = u->lw; G.lh = u->lh; G.lr0 = u->lr0; G.lc0 = u->lc0; G.offr = cfg->label_off[0]; G.offc = cfg->label_off[1];
-        G.ntiles_x = u->ntx; G.ntiles_y = u->nty;
-        for (int t = 0; t < u->ntx * u->nty; t++) {
-            double lo[3], hi[3]; if (!tile_box(&G, t % u->ntx, t / u->ntx, f->reach, lo, hi)) continue;
-            if (f->nT == tcap) { tcap *= 2; f->T = realloc(f->T, tcap * sizeof *f->T); }
-            iftile *T = &f->T[f->nT++]; T->unit = (uint32_t)f->nU; T->tile = (uint32_t)t;
-            for (int d = 0; d < 3; d++) { T->lo[d] = (int32_t)floor(lo[d]); T->hi[d] = (int32_t)ceil(hi[d]); }
-        }
-        free(msk); f->nU++;
+        f->nU++;
+    }
+    {   /* per window, on worker threads: its rasters once (the 0/1 -> 0/255 rule over the whole window, inksplat_run's) and the supervised
+           tiles' boxes; then the tiles concatenated in window order */
+        ifidx J = {f, cfg, calloc(f->nU, sizeof *J.tl), calloc(f->nU, sizeof *J.ntl), 0, 0};
+        pthread_t th[16]; const int nth = f->nU < 8 ? f->nU : 8;
+        for (int i = 0; i < nth; i++) pthread_create(&th[i], nullptr, ifidx_worker, &J);
+        for (int i = 0; i < nth; i++) pthread_join(th[i], nullptr);
+        size_t tot = 0; for (int i = 0; i < f->nU; i++) tot += J.ntl[i];
+        if (!atomic_load(&J.failed)) { free(f->T); f->T = malloc((tot ? tot : 1) * sizeof *f->T); for (int i = 0; i < f->nU; i++) { memcpy(f->T + f->nT, J.tl[i], J.ntl[i] * sizeof *f->T); f->nT += J.ntl[i]; } }
+        for (int i = 0; i < f->nU; i++) free(J.tl[i]);
+        free(J.tl); free(J.ntl);
+        if (atomic_load(&J.failed)) goto fail;
     }
     json_free(j); j = nullptr;
     {   /* tile grid: 1024-voxel cells */
@@ -1421,7 +1524,8 @@ int cmd_ink_onfly(int argc, char **argv) {
     if (failed) { fprintf(stderr, "ink-onfly: read failed\n"); return 1; }
     uint64_t rd, ch, em, hi, px; double sec; inkfly_stats(&rd, &ch, &em, &hi, &px, &sec);
     uint64_t kn = 0, ink = 0; for (size_t k = 0; k < nv; k++) if (A[k] != 255) { kn++; ink += A[k] >= 127; }
-    fprintf(stderr, "ink-onfly: CT reads %.1f s of the derive time (summed)\n", atomic_load(&g_ifs.ct_us) * 1e-6);
+    fprintf(stderr, "ink-onfly: CT reads %.1f s of the derive time (summed); %llu chunks on the GPU, %.1f s in the GPU call (summed, lock waits included)\n",
+            atomic_load(&g_ifs.ct_us) * 1e-6, (unsigned long long)atomic_load(&g_ifs.gpu_chunks), atomic_load(&g_ifs.gpu_us) * 1e-6);
     { dcache_stats ds; dcache_get_stats(&ds);
       printf("dcache: %llu cells from memory, %llu from disk (%.2f s), %llu computed (%llu constant, %.1f s), %.1f MB written\n", (unsigned long long)ds.cells_mem,
              (unsigned long long)ds.cells_disk, ds.s_disk, (unsigned long long)ds.cells_computed, (unsigned long long)ds.cells_fill, ds.s_compute, ds.disk_bytes_written / 1048576.0); }

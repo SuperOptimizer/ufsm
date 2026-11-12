@@ -6,6 +6,105 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## The human ink targets on the fly, the derived-array chunk cache, and the villa ink recipe (2026-11-11, branch inkfly-20261111)
+
+**On the fly.** The stored splats of the section below (inkgt/gt) are now only the reference. Training reads the same bytes from a
+derived array: `inkfly_open(ct, segs.json, cfg, ...)` (inksplat.c), a sources target `"ink": {"onfly": {"segments", "level",
+"iso", "face", "holdout_file", "cache_mb", "cache_dir"}}`.
+- **Open.** Every label window's mask is read once. The 0/1 -> 0/255 rule is decided per window (as inksplat_run does), and each
+  supervised 64^2 tile's 3-D box (reach 21 voxels) goes into a 1024^3 grid.
+- **Per 128^3 chunk:**
+  - the candidate tiles from the grid;
+  - per window, the label rectangle and the supervised pixels whose surface point can reach the chunk;
+  - the CT box around those points only, through a zcache;
+  - face search and splat with ink-splat's arithmetic (rect offsets split exactly);
+  - known-max merge over windows, with the held-out boxes and CT >= iso applied as in the stored splat.
+- **Level 2** is known-max 2x pooling of the level-1 array, as in the stored pyramid.
+- **Draw cells.** The sampler draws from the label tiles' boxes (inkfly_cells), not from the CT's chunk map. Ink-only sources therefore
+  draw only where labels reach; univA confirmed ink-only sources train with the winding losses at 0.
+
+**The chunk cache (dcache.h, shared).** `z3_open_cached(inner, dir, key, cell, mem_mb)` wraps any array, typically a derived one, so
+the derive signature does not change.
+- Reads are served in cell^3 cells. Each is looked up in a memory LRU, then in DIR/<sha256(key)>/<cz>/<cy>.<cx>; only then is inner
+  read, with an aligned cell box.
+- Concurrent readers of a cell wait for the first one's compute. Processes sharing DIR race only on atomic renames. Deleting DIR is
+  always safe.
+- DIR/<hash>/inputs.txt holds the key. For ink the key is a code-version string, the CT, the cfg, the held-out boxes, the size and
+  mtime of every mesh / label raster, and the segments json, so edited inputs miss the cache.
+- DIR is `"cache_dir"`, else $UFSM_DERIVED_CACHE ("off" = memory only), else ~/.cache/ufsm/derived.
+- Phase and fibre can wrap their derived arrays the same way.
+
+**Gate and cost** (`ufsm ink-onfly SEGS --box .. --ref <stored splat> --dcache DIR`, 8 threads, desk):
+
+| box (4.8 um voxels) | known / ink | cold: cells (labelled) | cold CPU | from disk | result |
+|---|---|---|---|---|---|
+| 1667 around crop w029_0, 863 x 905 x 663 | 0.98 M / 0.26 M | 392 (55) | 6.1 s (CT 3.3 s) | 0.07 s | 0 of 518 M voxels differ |
+| Paris 4 around crop w02_0 (a held-out box inside), 1280 x 1240 x 796 | 4.55 M / 0.90 M | 847 (234) | 25.6 s (CT 7.1 s) | 0.17 s | 0 of 1.26 G voxels differ |
+| MAN5 (before the cache) | 1.2 M / - | | | | 0 differ |
+
+- About 110 ms of CPU per labelled cell computed, against 0.2 ms per cell read from disk and 0.4-1.1 ms per warm 256^3 window.
+  Cells that no label can reach cost nothing (612 of 847 on Paris 4).
+- Disk use is about 12 KB per labelled cell; constant cells take 16 bytes.
+- A whole scan is computed once: about the 40 CPU-min of the stored splats, spread over the first epoch's reads.
+- What remains per process is the index open (Paris 4 33 s, 1667 19 s, mostly mask reads). Paris 4 is opened by three sources
+  (june / july / june48), so 3 x 33 s at trainer start; sharing the handle by key, or caching the index, is the next small step.
+- test_ink_splat: on the fly == stored over two merged crops with a held-out box, on odd boxes, cold, from memory, and from disk
+  through a reopened array (0 cells recomputed).
+
+**The GPU port (nn_inkfly.cu, inkflygpu.h).** A cold chunk's compute now runs on the device; the host keeps the I/O.
+- **Host:** the candidate tiles, the label rectangles (lsrc_read), a mesh patch per unit (the rectangle's grid cells +- 1 label px)
+  and the CT box.
+- **Device, two stages on the calling thread's own stream and buffers** (the sampler's workers run concurrently):
+  - near: one thread per label pixel of the candidate tiles computes ssurf_pn and the near test, and appends near pixels with
+    their P / N and the level-0 box their samples reach (atomic min / max). With no near pixel, the chunk is unknown and no CT is read.
+  - finish: per unit, the face (27 trilinear samples, [1 2 1] in float, face_of), then the splat (one thread per pixel x sub-sample,
+    atomic counts and max; the CPU's saturating uint8 counts are min(count, 255)), then the finalize merged by known max.
+- **Exactness:** -fmad=false, IEEE sqrt / division, the CPU's expression order. The bytes match the CPU's: 0 differing voxels on the
+  1667 and Paris 4 gate boxes and in test_ink_splat (open 2, now tagged gpu).
+- **Fallback:** a mesh patch that falls short returns 1 and the CPU code runs. A CUDA failure turns the GPU off for the process.
+- **Device choice:** train uses `--onfly-gpu` (as phase / fibre); ink-onfly uses $UFSM_INKFLY_GPU (default 0); $UFSM_INKFLY_CPU=1
+  forces the CPU.
+
+1667 gate box (55 labelled of 392 cells, 90 with near pixels; desk, both GPUs at 100 % with u1 training):
+
+| | 1 thread: wall / CT / device | 8 threads: wall |
+|---|---|---|
+| CPU | 4.7 s / 1.3 s / - | 1.5 s |
+| GPU | 3.5 s / 2.1 s / 0.9 s (10 ms per chunk) | 1.0 s |
+| GPU + UFSM_GPU_DECODE=1 | 4.3 s / 2.8 s / 1.0 s | 1.9 s |
+
+On the Paris 4 gate box at 8 threads: GPU 8.7 s wall, CPU 15.9 s (the desk was loaded by other suites).
+- The face + splat is now ~10 ms per chunk on a shared GPU, against ~90 ms of CPU.
+- The CT decode (~23 ms of CPU per chunk, decoded chunks shared through the zcache) is now the larger part.
+- nn_gpudec through z3_read (UFSM_GPU_DECODE=1) is byte-identical but slower while the GPUs train: small batches queue behind u1's
+  kernels. CT decode therefore stays on the CPU by default; the decoded CT feeds the device box through one H2D copy.
+- With the disk cache, each chunk is paid once per dataset in any case.
+
+**The villa ink recipe vs ours.** Read-only survey of ScrollPrize villa: vesuvius/ink_detection on main (the merged
+merge-ink-pipelines configs), plus the paris4-3d-gambiarra and distilled_3d_ink branches.
+
+| | villa | ufsm |
+|---|---|---|
+| labels | 2-D per segment (inklabels / supervision / validation masks); ignore = supervision 0; components cleaned to {0, 255}; several self-training relabel rounds (mean teacher, DINO-guided v1-v3) | the same 2-D human sets (20260918), unchanged; prob254 with 255 unknown |
+| 3-D placement | full_3d: label projected along the normal, ±1 voxel (±3 in the teacher), on the mesh; normal_pooled_3d: max of the 3-D logits over ±10 voxels along the normal, then the 2-D loss (MIL); no notion of which side is the recto | per pixel at the open recto face found in the CT (+N), band [f - 6, f]; no face = unknown (17-48 % of pixels) |
+| input | ~9.6 um isotropic, 17 of 21 surface-parallel slices (z jitter ±2), patch 17 x 128 x 128; or 3-D 256^3 at 2.4 um (DINO teacher) | the scan grid itself (4.8 / 9.6 um levels), 3-D windows; no flattening |
+| model | 3-D stem + depth attention/max pool -> 2-D nnU-Net (output 2-D); full 3-D U-Net; DINOv2 / dinovol encoders; gambiarra 24.5 M 3-D residual U-Net | ink3dext teacher (3-D); the universal net's 3-D ink head on the shared trunk |
+| loss | BCE (label smoothing 0.5 in hybrid, 0.1 in the teacher) + 0.25 dice; SGD 0.01 Nesterov, 78 k iterations, batch 64 with fixed scroll quotas | ink BCE per known voxel (nn_loss_stats over the ink mask), no smoothing, no dice |
+| augmentation | XY mirror, rot90 about z only, intensity (gamma, invert, illumination, noise / blur, cutout); no elastic / scale (normals) | full 3-D spatial + CT augmentation (ct_augment, scan_augment, spatial_augment, crush) |
+| split | validation_mask regions inside trained segments (interpolation), or a whole dataset held out | crop regions + 32-voxel margin held out (24 crops on 0139 / 1667 / Paris 4) plus every wbench box |
+| scoring | val balanced accuracy, val BCE unsmoothed (2-D) | 3-D AUC / F1 at known voxels (ink-vscore) + 2-D render + ink-score |
+
+What we adopt, in this order (lead, 2026-11-11):
+1. **The normal-pooled MIL mode as a second ink target.** Per label pixel, keep the mesh point and normal. In the loss, take the max
+   (or soft-max) of the 3-D ink logits over ±R voxels along the normal and apply BCE to the 2-D label. This recovers the pixels the
+   face search leaves unknown; face labels stay where a face is found. The rays come from the inkfly index; the loss sits in
+   head_slab_pass (univA). Measure both modes on the 24 held-out crops.
+2. Label smoothing 0.1 on the ink BCE.
+3. The published validation_mask_v2 regions as extra holdouts where they exist, so our numbers compare with theirs.
+4. BCE + 0.25 dice as the starting ink loss.
+
+Skipped for now: the scroll quotas and the self-training chains.
+
 ## The fibre H / V planes on the fly from the polylines (2026-11-11, branch univ-20261111)
 
 Item 5 of the on-the-fly list: fiber-raster's H / V prob254 planes (labels/ 55 GB + labels2/ 6 GB on the desk) computed per read box

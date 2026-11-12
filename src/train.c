@@ -12,6 +12,8 @@
 #include "cover.h"
 #include <limits.h>
 #include "sources.h"
+#include "inksplat.h"
+#include "dcache.h"
 #include "band_onfly.h"
 #include "fiberraster.h"
 #include "split.h"
@@ -2336,6 +2338,12 @@ int cmd_train(int argc, char **argv) {
             if (fg < 0) { fprintf(stderr, "train: --onfly-gpu %d: no GPU fibre planes (or the reserve failed)\n", og); return 1; }
             if (fg) fprintf(stderr, "train: on-the-fly fibre planes (%d targets) on GPU %d, buffers for %d^3 boxes\n", nfib, og, e);
             else fprintf(stderr, "train: on-the-fly fibre planes (%d targets) on the CPU\n", nfib);
+        }
+        int nink = 0; for (int i = 0; i < S->n; i++) for (int c = 0; c < NTG; c++) nink += S->src[i].ink_fly[c] != nullptr;
+        if (nink) {   /* "onfly" ink targets (inksplat.h inkfly_open): face + splat of a cold chunk on --onfly-gpu (per sampler thread a stream; -1 the CPU) */
+            const int og = atoi(opt(argc, argv, "--onfly-gpu", "0")); inkfly_gpu_config(og);
+            fprintf(stderr, "train: on-the-fly ink targets (%d) computed on %s %d (cached per 128^3 chunk: memory + %s)\n", nink, og >= 0 ? "GPU" : "CPU", og,
+                    dcache_default_dir() ? dcache_default_dir() : "no disk cache");
         }
     }
     for (int i = 0; g_restore && i < S->n; i++) if (!S->src[i].srp != !g_rpairs) { fprintf(stderr, "--task restore: %s: \"sr_pair\" sources need --sr-pairs 1 and --sr-pairs 1 needs them all\n", S->src[i].name); return 2; }
