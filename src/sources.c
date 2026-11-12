@@ -237,8 +237,8 @@ sources *sources_load(const char *path) {
                     json_free(j); sources_free(S); return nullptr; }
                 z3 *ct = pyramid_open_level(s->s, s->ct_key, L, s->um, g_cache), *ct1 = pyramid_open_level(s->s, s->ct_key, L + 1, s->um, g_cache);
                 ic.ct_root = json_str(json_get(e, "root"), "."); ic.ct_key = s->ct_key;   /* (named in the derived cache's key) */
-                const char *dcd = json_str(json_get(of, "cache_dir"), dcache_default_dir ? dcache_default_dir() : nullptr);   /* the disk cache (dcache.h): "cache_dir", $UFSM_DERIVED_CACHE, ~/.cache/ufsm/derived */
-                z3 *z = ct ? inkfly_open(ct, sg, &ic, (size_t)json_num(json_get(of, "cache_mb"), 2048), dcd && *dcd ? dcd : nullptr, &s->ink_fly[c]) : nullptr;
+                const char *dcd = json_str(json_get(of, "cache_dir"), dcache_default_dir ? dcache_default_dir() : nullptr);   /* the disk cache (dcache.h): "cache_dir" ("off": none), $UFSM_DERIVED_CACHE, ~/.cache/ufsm/derived */
+                z3 *z = ct ? inkfly_open(ct, sg, &ic, (size_t)json_num(json_get(of, "cache_mb"), 2048), dcd && *dcd && strcmp(dcd, "off") && strcmp(dcd, "0") ? dcd : nullptr, &s->ink_fly[c]) : nullptr;
                 if (!z) { if (ct1) z3_close(ct1); fprintf(stderr, "sources: %s/%s: cannot open the onfly ink target %s\n", s->name, CHNAME[c], sg); json_free(j); sources_free(S); return nullptr; }
                 s->tgt_prob[c] = s->tgt_prob254[c] = 1; s->tgt_min_level[c] = L; s->tgt_key[c] = strdup("onfly");
                 for (int l = 0; l < MAXLEV; l++) s->tgt_present[c][l] = 0;

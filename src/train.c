@@ -99,7 +99,7 @@ typedef struct {
     uint8_t *w4b[2], *wcb[2], *w4, *wc; double *w4ds; float *w4fin, w4h[8]; double w4_loss;   /* --task unwrap2: winding mod 4 and its component per voxel (double-buffered), loss sums, scratch, host parts */
     double *fibacc; void *fiblist; unsigned *fibnl; size_t fibcap; double fib_h[2];   /* --fib-normal-lambda: valid voxels / sum t^T N t (device), the slab list, the fetched sums */
     uint8_t *auxb[AUX_N][2], *aux[AUX_N], *inkt, *inkm, *inkw;   /* the aux planes (double-buffered; plane j = role g_aux_role[j]); --ink-head: its slab target / mask, weight byte (loss parts: iscratch / iout / ink_loss) */
-    inkray *milr[2]; int miln[2]; float *milacc; double *milloss, mil_loss, mil_raw; float mil_gs, mil_den; int mil_k, mil_n;   /* --ink-mil: the window's rays per buffer, the samples' accumulator, the loss (device); logged / raw */
+    inkray *milr[2], *milh[2]; int miln[2]; float *milacc; double *milloss, mil_loss, mil_raw; float mil_gs, mil_den; int mil_k, mil_n;   /* --ink-mil: the window's rays per buffer, the samples' accumulator, the loss (device); logged / raw */
     uint8_t *rvt, *rvm; float *rvscratch, rvout[5]; double rv_loss; float rv_own;   /* rv_own: this GPU's window's rv bce (--mix-every) */
     uint8_t *fht, *fhm, *fdt, *fdm, *fhw; float *fhs[2], *fds, fhout[2][5], fdout[21]; double fib_loss, fib_raw[2];   /* --fib-head: the slab's H / V targets and masks, direction targets / mask, weight byte; loss scratch; fetched parts; loss at lambda, raw mask / direction bce */
     double *gcS; int gc_on, fs_drop; uint64_t lat_js; unsigned sr_ctr;   /* lat_js: --lat-step-jitter's generator; sr_ctr: the SR counter between the forward and backward phases */   /* fs_drop: this training step runs without the fine stem (--fstem-drop) */   /* --grad-cos: the step's logit-gradient Gram (device, K x K upper triangle), whether this step collects it */   /* --rv: the slab's recto / verso targets and mask; --rv 2 (own channels): its loss scratch and parts */
@@ -653,6 +653,7 @@ static void mil_take(gpu_state *d, const batch *b, int i, int copy_stream) {   /
     if (!g_mil) return;
     const int n = b->mil && b->nmil && b->mil[0] ? (b->nmil[0] < g_mil_max ? b->nmil[0] : g_mil_max) : 0;
     d->miln[i] = n; if (n) nn_h2d_stream(copy_stream, d->milr[i], b->mil[0], (size_t)n * sizeof(inkray));
+    if (n && ufsm_env_on("UFSM_MIL_CHECK")) { free(d->milh[i]); d->milh[i] = malloc((size_t)n * sizeof(inkray)); if (d->milh[i]) memcpy(d->milh[i], b->mil[0], (size_t)n * sizeof(inkray)); }   /* (the check's host copy) */
 }
 static void upload(gpu_state *d, const batch *b, int B, int P) {
     dump_win(b, B, P);
@@ -966,6 +967,12 @@ static void head_slab_pass(gpu_state *d, int pass) {
 #define FT(w) do { if (fine) nn_ptick(w); } while (0)
     const int si = d->srcb[d->cur];   /* the window's source (its "heads" weights) */
     const int nmil = g_mil ? d->miln[d->cur] : 0; const inkray *mrays = nmil ? d->milr[d->cur] : nullptr;
+    /* UFSM_MIL_CHECK=1: the device MIL path against the host reference (inksplat.c ink_mil_loss_host, central-difference tested in test_ink_mil)
+       on this window's own fp16 logits: the pass-0 loss, and the gradient pass 1 adds (after - before bwd_slab, 16-bit) */
+    static int mchk = -1; if (mchk < 0) mchk = ufsm_env_on("UFSM_MIL_CHECK");
+    static float *mlg; static uint8_t *mink; static double *mref, merr, mmax, mref2, mmaxd, mulp;
+    const int mck = mchk && nmil && d->milh[d->cur];
+    if (mck && !pass) { free(mlg); mlg = calloc((size_t)D * hw, sizeof *mlg); free(mink); mink = calloc((size_t)D * hw, 1); }
     if (!pass) d->mil_n = 0;
     if (!pass && nmil) { nn_zero(d->milacc, (size_t)nmil * d->mil_k * sizeof(float)); nn_zero(d->milloss, sizeof(double)); }
     if (!pass) { nn_zero(d->hs_ds, 128 * sizeof(double)); if (g_unwrap2) nn_zero(d->w4ds, nn_wind4_sums()); if (g_fibn) nn_zero(d->fibacc, 2 * sizeof(double)); }
@@ -1082,6 +1089,7 @@ static void head_slab_pass(gpu_state *d, int pass) {
             FT("  s wind4 stats");
             if (g_ink2) { nn_ink_targets_smooth(ink + vb, ns, d->inkt, d->inkm, g_ink_smooth); nn_loss_stats_acc(LGC(g_ink2_ch), d->inkt, d->inkm, d->inkw, one, d->hs_ds + 5); }
             if (nmil && ink_mil_fwd_slab(LGC(g_ink2_ch), 0, z0, nz, D, H, W, mrays, nmil, g_mil_R, g_mil_step, d->milacc, nullptr)) { fprintf(stderr, "ink mil: fwd_slab failed\n"); exit(1); }   /* (the logits: fp16) */   /* --ink-head (the recto / ink v1 slots are free) */
+            if (mck) { _Float16 *h = malloc(ns * 2); nn_sync(); nn_d2h(h, LGC(g_ink2_ch), ns * 2); for (size_t q = 0; q < ns; q++) mlg[vb + q] = (float)h[q]; free(h); nn_d2h(mink + vb, ink + vb, ns); }   /* (+ the ink target plane the loss reads)
             if (g_fibh) { FIBH_TARGETS(); FIBH_LOSS(0); }   /* --fib-head: the H / V masks (sums 74, 79), the direction (84) */
             float pw0 = 1.f, rw0 = 0.f; int u70 = -1; if (fuse) nn_loss_cfg_get(&pw0, &rw0, &u70);
             if (fside) nn_lat_fuse_stats(d->lgc, 1, qa, qb - qa, D / 4, H / 4, W / 4, z0, nz, g_side_ch, 2, 1, g_cout, d->x, st, sm, d->sidew, pw0, -1, d->hs_ds + 10, light);
@@ -1108,7 +1116,21 @@ static void head_slab_pass(gpu_state *d, int pass) {
             nn_loss_grad_only(LGC(g_ink2_ch), d->inkt, d->inkm, d->inkw, one, g_ink_dice, LGC(g_ink2_ch), d->iscratch);   /* (--ink-dice: + w x the soft dice of the window's known voxels) */
             const float iw = g_ink_lambda * (si >= 0 && g_S && si < g_S->n ? (float)g_S->src[si].ink_weight : 1.f) * src_head_w(si, SH_INK);
             if (iw != 1.f) nn_loss_grad_scale(LGC(g_ink2_ch), ns, iw);
+            uint16_t *mgb = mck && nn_get_loss_grad_h16() ? malloc(ns * 2) : nullptr; if (mgb) { nn_sync(); nn_d2h(mgb, LGC(g_ink2_ch), ns * 2); }
             if (nmil && nn_get_loss_grad_h16() && ink_mil_bwd_slab(d->milacc, z0, nz, D, H, W, mrays, nmil, g_mil_R, g_mil_step, LGC(g_ink2_ch), !nn_get_f16(), nullptr)) { fprintf(stderr, "ink mil: bwd_slab failed\n"); exit(1); }   /* (adds the MIL gradient: fin scaled it to the storage's gradient scale) */
+            if (mgb) {   /* the slab's MIL gradient (after - before, 16-bit) against the host's */
+                const int gbf = !nn_get_f16(); uint16_t *ga = malloc(ns * 2); nn_sync(); nn_d2h(ga, LGC(g_ink2_ch), ns * 2);
+                if (!z0) merr = mmax = mref2 = mmaxd = mulp = 0;
+                for (size_t q = 0; q < ns; q++) {
+                    float a, bq; if (gbf) { uint32_t ua = (uint32_t)ga[q] << 16, ub = (uint32_t)mgb[q] << 16; memcpy(&a, &ua, 4); memcpy(&bq, &ub, 4); }
+                    else { _Float16 ha, hb; memcpy(&ha, &ga[q], 2); memcpy(&hb, &mgb[q], 2); a = (float)ha; bq = (float)hb; }
+                    const double r = mref[vb + q], er = fabs((double)(a - bq) - r), u = ldexp(fabs(a) > fabs(bq) ? fabs(a) : fabs(bq), gbf ? -7 : -10);
+                    merr += er * er; mref2 += r * r; if (er > mmaxd) mmaxd = er; if (fabs(r) > mmax) mmax = fabs(r); if (er > mulp + u) mulp = er - u;   /* (mulp: beyond one 16-bit ulp of the larger value) */
+                }
+                free(ga); free(mgb);
+                if (z1 == D) fprintf(stderr, "mil check: gradient rms difference / rms %.3g, max |difference| %.3g of max |gradient| %.3g, beyond one 16-bit ulp %.3g (%d rays)\n",
+                                     sqrt(merr / (mref2 > 0 ? mref2 : 1)), mmaxd, mmax, mulp, nmil);
+            }
         }
         if (g_fibh) {   /* --fib-head: the three BCE gradients, times lambda x the source's "fibre" head weight */
             FIBH_TARGETS(); FIBH_LOSS(1);
@@ -1207,6 +1229,18 @@ static void head_slab_pass(gpu_state *d, int pass) {
             const float gs = d->hs_train && nn_get_loss_grad_h16() ? nn_get_grad_scale() : 1.f;
             if (ink_mil_fin(d->milacc, mrays, nmil, D, H, W, g_mil_R, g_mil_step, g_mil_tau, g_ink_smooth, iw * gs, d->milloss, nullptr)) { fprintf(stderr, "ink mil: fin failed\n"); exit(1); }
             d->mil_gs = gs; d->mil_den = iw * gs * nmil; d->mil_n = nmil;   /* (the fetch: / gs the weighted loss, / den the raw mean BCE) */
+            if (mck) {   /* the host loss and gradient on the same logits, the same scale */
+                free(mref); mref = calloc((size_t)D * hw, sizeof *mref); double ld = 0; nn_sync(); nn_d2h(&ld, d->milloss, sizeof ld);
+                const double lh = ink_mil_loss_host(mlg, mref, D, H, W, d->milh[d->cur], nmil, g_mil_R, g_mil_step, g_mil_tau, g_ink_smooth, iw * gs);
+                fprintf(stderr, "mil check: loss device %.9g host %.9g (relative %.3g, %d rays)\n", ld, lh, fabs(ld - lh) / (fabs(lh) > 0 ? fabs(lh) : 1), nmil);
+                int hit = 0, agree = 0; const inkray *hr = d->milh[d->cur];   /* the rays against the ink target plane (after every symmetry / warp, host or device, and replays) */
+                for (int k = 0; k < nmil; k++) { int mx = -1;
+                    for (float t = -g_mil_R; t <= g_mil_R + 1e-4f; t += 0.5f) { int v[3]; for (int q = 0; q < 3; q++) v[q] = (int)lrintf(hr[k].p[q] + t * hr[k].n[q]);
+                        if (v[0] < 0 || v[1] < 0 || v[2] < 0 || v[0] >= D || v[1] >= H || v[2] >= W) continue;
+                        const int q = mink[((size_t)v[0] * H + v[1]) * W + v[2]]; if (q != 255 && q > mx) mx = q; }
+                    if (mx >= 0) { hit++; agree += (mx > 127) == (hr[k].y != 0); } }
+                fprintf(stderr, "mil check: rays %d, %d meet known ink within the reach, %d of those agree with the ray's label\n", nmil, hit, agree);
+            }
         }
         if (g_fibh) { nn_loss_stats_fin(d->hs_ds + 74, d->fhw, w1, d->fhs[0]); nn_loss_stats_fin(d->hs_ds + 79, d->fhw, w1, d->fhs[1]); nn_loss_stats_fin(d->hs_ds + 84, d->nw, w7, d->fds); }
         if (g_rv == 2) nn_loss_stats_fin(d->hs_ds + 64, d->sidew, w2, d->rvscratch);

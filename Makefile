@@ -397,6 +397,9 @@ suite-bins: $(B)/test_ink_mil
 $(B)/test_ink_mil_train: tests/test_ink_mil_train.c $(OBJ) $(B)/nn.o $(B)/nn_fp8.o | $(B)/ufsm $(B)/make_wind_fixture
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_ink_mil_train.c $(OBJ) $(B)/nn.o $(B)/nn_fp8.o -o $@ $(LDLIBS) $(CUDALIBS)
 suite-bins: $(B)/test_ink_mil_train $(B)/make_wind_fixture
+$(B)/test_ink_mil_check: tests/test_ink_mil_check.c tests/make_wind_fixture.c $(B)/z3w.o $(B)/tiffw.o | $(B)/ufsm $(B)/make_wind_fixture
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_ink_mil_check.c $(B)/z3w.o $(B)/tiffw.o -o $@ $(LDLIBS)
+suite-bins: $(B)/test_ink_mil_check
 $(B)/test_ink_splat: tests/test_ink_splat.c $(OBJ) $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 suite-bins: $(B)/test_ink_splat
