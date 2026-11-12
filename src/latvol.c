@@ -210,10 +210,15 @@ int lv_decode_chunk(const lv_codec *lc, const uint8_t *enc, size_t len, int16_t 
     return bad || off != len ? -1 : 0;
 }
 int lv_decode_voxels(const lv_codec *lc, const uint8_t *enc, size_t len, uint8_t *ct, int16_t *scratch) {
-    int16_t *q = scratch ? scratch : malloc((size_t)LV_CELLS * LV_CELLS * LV_CELLS * lc->C * sizeof *q); if (!q) return -1;
+    /* scratch == nullptr: the calling thread's own buffer, kept (z3_read's chunk workers: a fresh 1.9 MB malloc per chunk is an mmap /
+       munmap pair, page faults and TLB shootdowns that serialised the workers: 8 threads read a P 512 box no faster than 1, 2026-11-12) */
+    static thread_local int16_t *tq; static thread_local size_t tqn;
+    const size_t need = (size_t)LV_CELLS * LV_CELLS * LV_CELLS * lc->C;
+    int16_t *q = scratch;
+    if (!q) { if (tqn < need) { free(tq); tq = malloc(need * sizeof *tq); tqn = tq ? need : 0; } q = tq; }
+    if (!q) return -1;
     const int r = lv_decode_chunk(lc, enc, len, q, nullptr);
     if (!r) lv_inverse(lc, q, ct);
-    if (!scratch) free(q);
     return r;
 }
 void lv_pack_cells(const int16_t *q, size_t n, int C, int8_t *out, int stride) {
