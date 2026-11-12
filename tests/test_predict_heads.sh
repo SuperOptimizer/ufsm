@@ -43,6 +43,10 @@ cmpb onei h/ink 0 || fail "ink: single head against the multi-head run"
 for a in pc ps sp t0 t3 w dz dq; do "$U" read f0z/$a "" 0 0 0 32 32 32 fa.raw > /dev/null 2>&1 && "$U" read f1z/$a "" 0 0 0 32 32 32 fb.raw > /dev/null 2>&1 || fail "read fit field $a"
                                    cmp -s fa.raw fb.raw || fail "fit field $a differs with --heads"; done
 cmpb one f1/rv 0 || fail "rv beside --fit-zarr"
+# the fit fields do not depend on the z-chunking of the slab path (a 1 MB planes' budget: 1-cell chunks with their winding halo planes)
+UFSM_PRED_FIT_PLANES_MB=1 "$U" predict s/last.ckpt fx ct f2 "${P[@]}" --fit-zarr f2z --no-out 1 > f2.log 2>&1 || fail "predict --fit-zarr, small chunks ($D/f2.log)"
+for a in pc ps sp t0 t3 w dz dq; do "$U" read f0z/$a "" 0 0 0 32 32 32 fa.raw > /dev/null 2>&1 && "$U" read f2z/$a "" 0 0 0 32 32 32 fb.raw > /dev/null 2>&1 || fail "read fit field $a"
+                                   cmp -s fa.raw fb.raw || fail "fit field $a depends on the chunking"; done
 # (1b) the GPU pyramid (each level-0 shard pooled on the device, levels >= 1 encoded from the pieces) against the CPU pyramid (each level
 #      decoded back and pooled): at q 0 the same bytes, shard 128 (pieces below a chunk, gathered raw) and 256 (level 1 encoded at once)
 for sh in 128 256; do
@@ -60,6 +64,9 @@ for sh in 128 256; do
   grep -q 'levels for the encoder from the GPU' ge${sh}1.log && ! grep -q 'levels for the encoder from the GPU' ge${sh}0.log || fail "GPU encoder switch (shard $sh)"
   [ "$(cd ge${sh}1 && find . -path '*/c/*' -type f | sort | xargs cat | md5sum)" = "$(cd ge${sh}0 && find . -path '*/c/*' -type f | sort | xargs cat | md5sum)" ] || fail "shard $sh: the GPU encoder's shards differ from the CPU encoder's"
   [ "$(cd ge${sh}1 && find . -path '*/c/*' -type f | wc -l)" -ge 6 ] || fail "shard $sh: too few shard files"
+  UFSM_PRED_VCAP=10 UFSM_PRED_PROF=1 "$U" predict s/last.ckpt fx ct gv$sh --um 9.6 --level 0 --window 160 --halo 16 --threads 2 --q 8 --shard $sh --levels 3 --heads rv,ink > gv$sh.log 2>&1 || fail "predict, levels over capacity ($D/gv$sh.log)"
+  grep -Eq 'head writers: .*, [1-9][0-9]* from their bytes' gv$sh.log || fail "shard $sh: the over-capacity fallback not taken ($D/gv$sh.log)"
+  [ "$(cd gv$sh && find . -path '*/c/*' -type f | sort | xargs cat | md5sum)" = "$(cd ge${sh}0 && find . -path '*/c/*' -type f | sort | xargs cat | md5sum)" ] || fail "shard $sh: the over-capacity shards differ from the CPU encoder's"
 done
 # (1d) the CT windows decoded on the GPU into device memory (UFSM_PRED_DEVREAD): the same stores as the host reader's (windows over the
 #      array's edges: fill), and the chunks went through the GPU
