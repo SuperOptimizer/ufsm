@@ -2530,6 +2530,7 @@ int cmd_train(int argc, char **argv) {
     if (atoi(opt(argc, argv, "--intonly", "0"))) sc.augment = 4;   /* diagnostic: intensity jitter, no symmetry */
     sc.aux = g_xc == 5; sc.cond = g_cond; sc.cond_outside = g_cond_outside; sc.pap_head = g_pap_head ? &g_paph : nullptr;
     sc.band = g_aff; sc.side = g_side; sc.pmask = g_unwrap;   /* unwrap: the phase only (band codes per window, or the stored phase) */ sc.side_air = atoi(opt(argc, argv, "--side-air", "0"));
+    sc.strict_sources = atoi(opt(argc, argv, "--strict-sources", "0"));   /* 1: a weighted source the sampler cannot draw is fatal (launchers: on) */
     sc.ink_mil = g_mil; sc.mil_mode = g_mil_mode; sc.mil_stride = g_mil_stride; sc.mil_max = g_mil_max; sc.mil_R = g_mil_R;   /* --ink-mil: the windows' rays (batch.mil) */
     sc.ink_plane = IPLANE;   /* --ink-head: the sources' "ink" targets on their own plane (batch.ink); --rv: the papyrus plane there */
     sc.ink_fib = g_aux_of[AUX_FIB] == 0; sc.fib_sheet = g_fibn && !g_ink2;   /* --fib-normal-lambda: the "fibre" target, else (no ink head) the "sheet" / "ink" one */

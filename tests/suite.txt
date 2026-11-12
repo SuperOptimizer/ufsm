@@ -149,6 +149,7 @@ test_ink_mil                                   | gpu          |     2 | ./$B/tes
 test_ink_mil_train                             | gpu          |    40 | ./$B/test_ink_mil_train ./$B/ufsm ./$B/make_wind_fixture
 test_accum                                     | gpu          |    20 | tests/test_accum.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/accum
 test_tcache                                    | gpu          |       40 | tests/test_tcache.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/tcache
+test_strict_sources                            | gpu          |    25 | tests/test_strict_sources.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/strictsrc
 test_ink_mil_check                             | gpu          |    90 | ./$B/test_ink_mil_check ./$B/ufsm ./$B/make_wind_fixture
 test_pyports                                   |              |     1 | ./$B/test_pyports
 test_edt                                       |              |     2 | ./$B/test_edt
