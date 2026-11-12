@@ -6,6 +6,27 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Fused phase sets on the fly; the fine stem reset (2026-11-11, branch univ-20261111)
+
+- The 9.6 / 9.36 um universal sets carry the phase-fuse of two surface sets (A, B: the circular mean where they agree within 0.1 turn,
+  else unknown). Sources: `"phase": {"onfly": {"sets": [{"root", "key", "rmax"}, ...], "tol": 0.1}, "level": L}`; band_onfly.h
+  `phase_onfly_fuse_open` reads each set's onfly phase over the box and applies fuse_phase per voxel (a set with no chunk in the box
+  is skipped, as phase-fuse's absent shards). zarr3.h `z3_derived_cover`: the fused array's chunk map / box_any / shard presence are
+  the union of its sets'. `ufsm phase-onfly ... --fuse ROOT2 KEY2 [--fuse-rmax R2] [--tol]` compares against a stored fusion.
+- Byte identity: PHerc0139 (codesA / B at 9.362 um, rmax 41: 4 windows of 384^3, 0 differing against p0139full/phase, conflicts
+  included); PHerc1667 9.6 um (codes-pool2 of codesA / B 4.798, rmax 40: 4 windows of 384^3, 0 differing against
+  PHerc1667-wind-20261016/phase); test_phase_onfly (fixture, CPU and GPU). 0500P2: its codes are not on the desk (pod kit only).
+- rmax is phase-raster's --radius / --gs in codes voxels: 41 for 0139 (radius 82, --gs 2), not 82. The pod bench's onfly 0139 source
+  (1.21 samp/s below) used 82: a 2x larger halo and a different (wider) phase than the stored set; to be re-measured at 41.
+- Cost (desk 5060 Ti, 384^3 windows, the two sets each one tile): 0139 0.29 s, 1667 9.6 0.8 s per window.
+- Still stored for 1667 9.6 / p4full: the 2x-pooled codes (codes-pool2, 1/8 of the 4.8 codes; 4 min of CPU per set). Pooling on the
+  device cannot be byte-exact (atan2 ties); a pooled-codes derived array (CPU) is the next step for those.
+
+`--fstem-reset-at S` (unet_fstem_reset): resuming from step S the fine stem starts again as unet_init leaves it (W1 He, b1 and the
+projection 0: neutral), its Adam / Muon state and EMA reset; one-shot by step (a resume from any other step keeps the stem). For u1
+after univI's fstem forward fix (the forward covered only x mod 256 < 64 of each row; the backward every block): the trunk and heads
+are kept, the stem restarts. test_univ2 checks the reset and that a later resume does not repeat it.
+
 ## The fibre H / V planes on the fly from the polylines (2026-11-11, branch univ-20261111)
 
 Item 5 of the on-the-fly list: fiber-raster's H / V prob254 planes (labels/ 55 GB + labels2/ 6 GB on the desk) computed per read box

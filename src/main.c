@@ -709,13 +709,16 @@ static int cmd_codes_pool2(int argc, char **argv) {
    has (evenly over its chunk map; without --ref: the codes'), timed, and compared byte for byte with --ref (phase-raster's output for
    these codes). Prints per window ms, tiles, differing voxels; exit 1 on any difference. */
 static int cmd_phase_onfly(int argc, char **argv) {
-    if (argc < 4) { fprintf(stderr, "usage: ufsm phase-onfly <codes-root> <key> --rmax R [--ref ROOT KEY] [--windows 8] [--P 896] [--gpu D] [--slots 1] [--budget-mb 1024] [--threads 8]\n"); return 2; }
+    if (argc < 4) { fprintf(stderr, "usage: ufsm phase-onfly <codes-root> <key> --rmax R [--fuse ROOT2 KEY2 [--fuse-rmax R2] [--tol 0.1]] [--ref ROOT KEY] [--windows 8] [--P 896] [--gpu D] [--slots 1] [--budget-mb 1024] [--threads 8]\n"); return 2; }
     const float rmax = (float)atof(opt(argc, argv, "--rmax", "0")); const int nw = atoi(opt(argc, argv, "--windows", "8")), P = atoi(opt(argc, argv, "--P", "896"));
     const int gpu = atoi(opt(argc, argv, "--gpu", "-1")), nt = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 8);
     if (!(rmax > 0) || nw < 1 || P < 8) { fprintf(stderr, "phase-onfly: --rmax > 0, --windows >= 1, --P >= 8\n"); return 2; }
     if (phase_onfly_config(gpu, atoi(opt(argc, argv, "--slots", "1")), atoi(opt(argc, argv, "--budget-mb", "1024")), 1)) { fprintf(stderr, "phase-onfly: GPU %d unavailable\n", gpu); return 1; }
     z3 *c = z3_open(store_open(argv[2]), argv[3], nullptr); if (!c) { fprintf(stderr, "%s\n", z3_error()); return 1; }
     z3 *ph = phase_onfly_open(c, rmax); z3 *ref = nullptr;
+    const int fi = arg_index(argc, argv, "--fuse");   /* --fuse ROOT2 KEY2: the phase of these codes and ROOT2's fused (phase-fuse --tol, the onfly "sets") */
+    if (fi > 0) { z3 *c2 = fi + 2 < argc ? z3_open(store_open(argv[fi + 1]), argv[fi + 2], nullptr) : nullptr; if (!c2) { fprintf(stderr, "phase-onfly: --fuse ROOT KEY: %s\n", z3_error()); return 1; }
+        z3 *sets[2] = {ph, phase_onfly_open(c2, (float)atof(opt(argc, argv, "--fuse-rmax", opt(argc, argv, "--rmax", "0"))))}; ph = phase_onfly_fuse_open(sets, 2, (float)atof(opt(argc, argv, "--tol", "0.1"))); if (!ph) return 1; }
     const int ri = arg_index(argc, argv, "--ref");
     if (ri > 0) { if (ri + 2 >= argc || !(ref = z3_open(store_open(argv[ri + 1]), argv[ri + 2], nullptr))) { fprintf(stderr, "phase-onfly: --ref ROOT KEY: %s\n", z3_error()); return 1; }
         if (memcmp(z3_meta_of(ref)->shape, z3_meta_of(ph)->shape, sizeof z3_meta_of(ph)->shape)) { fprintf(stderr, "phase-onfly: --ref shape differs from the codes'\n"); return 1; } }

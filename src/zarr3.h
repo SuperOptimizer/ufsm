@@ -35,6 +35,9 @@ void z3_close(z3 *z);
 typedef int (*z3_derive_fn)(void *ctx, z3 *base, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads);
 z3 *z3_open_derived(z3 *base, int fill, z3_derive_fn derive, void *ctx, void (*ctx_free)(void *));
 z3 *z3_base_of(const z3 *z);   /* a derived array's base, else nullptr */
+/* more arrays (same shape, up to 4) whose chunks the derived values also reach (e.g. a fusion of several sets): z3_chunk_map / z3_box_any /
+   z3_shard_present answer for the union; taken over (closed with z). 0 or -1 */
+int z3_derived_cover(z3 *z, z3 *cover);
 const z3_meta *z3_meta_of(const z3 *z);
 const char *z3_key(const z3 *z);
 

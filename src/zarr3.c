@@ -50,6 +50,7 @@ struct z3 {
     size_t icap, icount;
     /* z3_open_derived: values computed from base by derive (z3_read), the chunk map / box tests / shard presence from base */
     z3 *base; z3_derive_fn derive; void *dctx; void (*dfree)(void *);
+    z3 *cover[4]; int ncover;   /* z3_derived_cover: more arrays whose chunks the derived values reach (owned) */
 };
 
 /* ---------- metadata ---------- */
@@ -166,10 +167,15 @@ z3 *z3_open_derived(z3 *base, int fill, z3_derive_fn derive, void *ctx, void (*c
     return z;
 }
 z3 *z3_base_of(const z3 *z) { return z ? z->base : nullptr; }
+int z3_derived_cover(z3 *z, z3 *cover) {
+    if (!z || !z->derive || !cover || z->ncover == 4) return -1;
+    for (int d = 0; d < 3; d++) if (cover->m.shape[d] != z->m.shape[d]) return -1;
+    z->cover[z->ncover++] = cover; return 0;
+}
 
 void z3_close(z3 *z) {
     if (!z) return;
-    if (z->derive) { if (z->dfree) z->dfree(z->dctx); z3_close(z->base); free(z->key); pthread_mutex_destroy(&z->imu); free(z); return; }
+    if (z->derive) { if (z->dfree) z->dfree(z->dctx); z3_close(z->base); for (int k = 0; k < z->ncover; k++) z3_close(z->cover[k]); free(z->key); pthread_mutex_destroy(&z->imu); free(z); return; }
     free(z->key);
     free(z->cache);
     for (size_t i = 0; i < z->icap; i++) { free(z->itab[i].key); free(z->itab[i].idx); }
@@ -961,7 +967,16 @@ static int work_cmp(const void *a, const void *b) {
 }
 
 int64_t z3_chunk_map(z3 *z, int64_t grid[3], uint8_t **bits) {
-    if (z->derive) return z3_chunk_map(z->base, grid, bits);
+    if (z->derive) {
+        int64_t n = z3_chunk_map(z->base, grid, bits); if (n < 0 || !z->ncover) return n;
+        const size_t nb = (size_t)(grid[0] * grid[1] * grid[2]);
+        for (int k = 0; k < z->ncover; k++) { int64_t g2[3]; uint8_t *b2 = nullptr; const int64_t n2 = z3_chunk_map(z->cover[k], g2, &b2);
+            if (n2 < 0 || g2[0] != grid[0] || g2[1] != grid[1] || g2[2] != grid[2]) { free(b2); free(*bits); *bits = nullptr; return n2 < 0 ? n2 : FAIL("chunk map: a cover array with another chunk grid"); }
+            for (size_t i = 0; i < nb; i++) (*bits)[i] |= b2[i];
+            free(b2); }
+        n = 0; for (size_t i = 0; i < nb; i++) n += (*bits)[i] != 0;
+        return n;
+    }
     const z3_meta *m = &z->m; *bits = nullptr;
     if (!m->sharded) return FAIL("chunk map: not a sharded array");
     int64_t ns[3];
@@ -986,7 +1001,7 @@ int64_t z3_chunk_map(z3 *z, int64_t grid[3], uint8_t **bits) {
     return n;
 }
 int z3_shard_present(z3 *z, int64_t sz, int64_t sy, int64_t sx) {
-    if (z->derive) return z3_shard_present(z->base, sz, sy, sx);
+    if (z->derive) { int r = z3_shard_present(z->base, sz, sy, sx); for (int k = 0; !r && k < z->ncover; k++) r = z3_shard_present(z->cover[k], sz, sy, sx); return r; }
     char skey[1200];
     shard_key(z, sz, sy, sx, skey, sizeof skey);
     if (z->m.sharded) {
@@ -1031,7 +1046,7 @@ static int z3_read_impl(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *
 /* whether any stored chunk intersects the box o + n (sharded arrays: from the shard indices, no chunk read): 1 yes, 0 none (a read
    would be all fill), -1 error; unsharded arrays: 1 */
 int z3_box_any(z3 *z, const int64_t o[3], const int64_t n[3]) {
-    if (z->derive) return z3_box_any(z->base, o, n);
+    if (z->derive) { int r = z3_box_any(z->base, o, n); for (int k = 0; r == 0 && k < z->ncover; k++) r = z3_box_any(z->cover[k], o, n); return r; }
     const z3_meta *m = &z->m;
     if (!m->sharded) return 1;
     int64_t lo[3], hi[3], s0[3], s1[3];

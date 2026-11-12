@@ -1,5 +1,6 @@
 #include "sources.h"
 #include "fiberraster.h"
+#include "fuse.h"
 #include "band_onfly.h"
 #include "json.h"
 #include "votes.h"
@@ -266,10 +267,27 @@ sources *sources_load(const char *path) {
                 if (of && !s->phase) {
                     const char *cr = json_str(json_get(of, "root"), nullptr), *ck = json_str(json_get(of, "key"), "");
                     const float rm = (float)json_num(json_get(of, "rmax"), 0);
+                    const json *sj = json_get(of, "sets");   /* "sets": [{"root", "key", "rmax"}, ...] + "tol" (0.1): the sets' phases fused per
+                                                                    voxel as phase-fuse (band_onfly.h phase_onfly_fuse_open); "root" / "key" then unused */
+                    if (sj && sj->type == J_ARR) {
+                        z3 *ph[FUSE_MAX]; int np = 0, bad = !sj->n || sj->n > FUSE_MAX; float rmx = 0;
+                        for (size_t k = 0; !bad && k < sj->n; k++) {
+                            const json *e2 = json_at(sj, k); const char *r2 = json_str(json_get(e2, "root"), nullptr), *k2 = json_str(json_get(e2, "key"), "");
+                            const float rm2 = (float)json_num(json_get(e2, "rmax"), rm); store *s2 = r2 ? store_open(r2) : nullptr; z3 *c2 = s2 ? z3_open(s2, k2, nullptr) : nullptr;
+                            z3 *p2 = c2 && rm2 > 0 ? phase_onfly_open(c2, rm2) : nullptr;
+                            if (!p2) { z3_close(c2); fprintf(stderr, "sources: %s: phase onfly set %zu: cannot open the codes %s/%s or no \"rmax\" > 0\n", s->name, k, r2 ? r2 : "?", k2); bad = 1; break; }
+                            ph[np++] = p2; if (rm2 > rmx) rmx = rm2;
+                        }
+                        s->phase = bad ? nullptr : phase_onfly_fuse_open(ph, np, (float)json_num(json_get(of, "tol"), 0.1));
+                        if (bad) for (int k = 0; k < np; k++) z3_close(ph[k]);
+                        if (!s->phase) { fprintf(stderr, "sources: %s: phase onfly \"sets\": 1..%d sets of {root, key, rmax}, one shape\n", s->name, FUSE_MAX); json_free(j); sources_free(S); return nullptr; }
+                        s->phase_onfly = rmx;
+                    } else {
                     store *cs = cr ? store_open(cr) : nullptr; z3 *cz = cs ? z3_open(cs, ck, nullptr) : nullptr;
                     s->phase = cz && rm > 0 ? phase_onfly_open(cz, rm) : nullptr;
                     if (!s->phase) { z3_close(cz); fprintf(stderr, "sources: %s: phase onfly: cannot open the codes %s/%s or no \"rmax\" > 0\n", s->name, cr ? cr : "?", ck); json_free(j); sources_free(S); return nullptr; }
                     s->phase_onfly = rm;
+                    }
                 }
                 s->phase_level = (int)json_num(json_get(pt, "level"), 1); s->phase_direct = json_get(pt, "level") != nullptr;
                 const double sg = json_num(json_get(pt, "phase_sign"), 1);

@@ -114,7 +114,8 @@ void unet_set_scale(unet *u, double um);
 void unet_set_cond(unet *u, float c);
 /* cfg.film nets: the K codes of the following forward passes (and their backward) */
 void unet_set_film(unet *u, const float *codes, int k);
-size_t unet_fstem_off(const unet *u);   /* cfg.fstem: the stem's parameters (W1, b1, W2) in the flat parameters */
+size_t unet_fstem_off(const unet *u);
+int unet_fstem_reset(unet *u, uint64_t seed);   /* the fine stem as unet_init leaves it (W1 He from seed, b1 and the projection W2 0: neutral), its optimizer state and EMA zeroed / reset; 0 ok */   /* cfg.fstem: the stem's parameters (W1, b1, W2) in the flat parameters */
 void unet_free(unet *u);
 const unet_cfg *unet_cfg_of(const unet *u);
 size_t unet_nparams(const unet *u);

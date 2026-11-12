@@ -2720,6 +2720,12 @@ int cmd_train(int argc, char **argv) {
             step0 = grow ? unet_load_grow(d->u, resume, 1, 1.f) : unet_load(d->u, resume);
             if (step0 < 0) { fprintf(stderr, "cannot load %s\n", resume); return 1; }
             if (atoi(opt(argc, argv, "--finetune", "0"))) step0 = 0;   /* loaded weights/state, fresh schedule */
+            {   /* --fstem-reset-at S (2026-11-11, the fstem forward fix): resuming from step S, the fine stem starts again neutral (unet_init's stem:
+                   its weights had learnt under a forward that covered only part of each row); one-shot by step, so later relaunches keep it */
+                const long fr = atol(opt(argc, argv, "--fstem-reset-at", "-1"));
+                if (fr >= 0 && step0 == fr) { if (unet_fstem_reset(d->u, seed + 7)) { fprintf(stderr, "--fstem-reset-at: the net has no fine stem\n"); return 2; }
+                    if (g == 0) fprintf(stderr, "--fstem-reset-at %ld: the fine stem re-initialised (W1 He, b1 / projection 0, optimizer state 0)\n", fr); }
+            }
             if (sheet_init && unet_start_sheet(d->u)) return 2;
             if (g == 0 && init_lr != 1.f) fprintf(stderr, "--init-lr-mult %g: %zu of %zu parameters inherited (from %s)\n", init_lr, unet_inherited(d->u), unet_nparams(d->u), resume);
         } else {

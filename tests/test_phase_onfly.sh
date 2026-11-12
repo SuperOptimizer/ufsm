@@ -19,6 +19,14 @@ if nvidia-smi -L > /dev/null 2>&1; then
   grep -qE ' ([1-9][0-9]*) of \1 tiles decoded on the GPU' gpu.log || { echo "FAIL: not every tile's codes decoded on the GPU ($D/gpu.log)"; tail -1 gpu.log; exit 1; }
   UFSM_ONFLY_CPU_DECODE=1 "$U" phase-onfly fx/band 1 --rmax 12 --ref ph 4.8 --windows 4 --P 100 --gpu 0 --budget-mb 64 --threads 4 > gpuc.log 2>&1 || { echo "FAIL: GPU pair rule on CPU-decoded codes differs ($D/gpuc.log)"; exit 1; }
 fi
+# fused sets (sources "onfly": {"sets": [...], "tol"}): two phases of the codes (radius 24 and 8: on this fixture they agree, so every
+# voxel takes the circular-mean path) fused by phase-fuse vs on the fly, CPU and GPU (the conflicts: PHerc0139 A + B in DESIGN.md)
+"$U" phase-raster fx/band 1 ph8 --axis fx/axis.json --gs 2 --pair 1 --radius 8 --threads 4 --block 64 > pr8.log 2>&1 || { echo "FAIL: phase-raster r8 ($D/pr8.log)"; exit 1; }
+"$U" phase-fuse fu 4.8 ph 4.8 ph8 4.8 --tol 0.05 --shard 128 > fu.log 2>&1 || { echo "FAIL: phase-fuse ($D/fu.log)"; exit 1; }
+grep -qE 'fused [1-9]' fu.log || { echo "FAIL: no fused voxels ($D/fu.log)"; exit 1; }
+for g in -1 0; do [ $g = 0 ] && ! nvidia-smi -L > /dev/null 2>&1 && continue
+  "$U" phase-onfly fx/band 1 --rmax 12 --fuse fx/band 1 --fuse-rmax 4 --tol 0.05 --ref fu 4.8 --windows 4 --P 100 --gpu $g --budget-mb 64 --threads 4 > fu$g.log 2>&1 || { echo "FAIL: fused onfly differs (GPU $g, $D/fu$g.log)"; tail -2 fu$g.log; exit 1; }
+done
 F=$(readlink -f fx); P=$(readlink -f ph)
 python3 - "$F" "$P" <<'PY'
 import json, sys
