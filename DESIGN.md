@@ -23,7 +23,7 @@ interval starts at a skipped point its value is evaluated there (the same point:
 Illinois iteration is the full scan's: the same roots. A single per-plane bound was useless (outlier nodes: max 10 turns / voxel against a
 median of 0.01). Evaluations 12.9e9 -> 3.0e9 (no-vertex rays 129 / 189 -> 11 / 10 each, found roots 15 -> 9). Radii are only asked for when
 one could reach the next step. Idle workers now help with the rows of the tail's large wraps (each wrap's rows were on one thread).
-Paris 4 whole run: 695 -> 299 s wall, 5375 -> 2809 CPU s, 191 .sfc identical; 1667: 29.1 -> 24.1 s. test_wraps_core: the skipped scan vs
+Paris 4 whole run: 695 -> 228 s wall, 5375 -> 2177 CPU s, 191 .sfc identical; 1667: 29.1 -> 24.1 s. test_wraps_core: the skipped scan vs
 the full one on 19200 random rays of a 3-slab set with outlier nodes, 0 differ (a bound 20x too tight: 1522 differ). What is left: the root
 search ~45%, the .sfc encoder ~26% (the same codec is most of strip's 58 s and of snap's write), the w plane decode ~9%.
 
