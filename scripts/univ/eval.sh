@@ -66,7 +66,7 @@ if has ink && [ "${INK:-1}" = 1 ] && [ -n "$INKP" ]; then   # INKP = ink3dext | 
   for C in $WB/inkeval/crops ${INKC:-}; do [ -s $C/crops.tsv ] || continue
   grep -v '^#' $C/crops.tsv | while IFS=$'\t' read -r cr seg ns fi box scr ctk; do
     ctk=${ctk:-$P4K}; um=$(python3 -I -c "import json; print(json.load(open('$C/$cr/crop.json')).get('um', 2.4))")
-    g=${INKGT:-/nonexistent}/$cr.zarr; vs=0; [ -d $g ] && ! grep -qP "^$cr\t" $o/vscores.tsv && vs=1
+    g=/nonexistent; for gd in ${INKGT:-}; do [ -d $gd/$cr.zarr ] && { g=$gd/$cr.zarr; break; }; done; vs=0;   # INKGT: one or more dirs [ -d $g ] && ! grep -qP "^$cr\t" $o/vscores.tsv && vs=1
     grep -qP "^$cr\t" $o/scores.tsv && [ $vs = 0 ] && continue
     v=$o/vol_${scr:-PHercParis4}
     if [ "$INKP" = ink3dext ]; then lvi=1; key=$(python3 -I -c "print(round($um * 2, 3))")
@@ -119,5 +119,10 @@ fi
   [ -s $E/$T/ink/scores.tsv ] && { echo "-- ink (ink-score vs human labels: crop map n inkfrac f1best thr f1_05 prec05 rec05 auc)"; cat $E/$T/ink/scores.tsv
     awk -F'\t' '{n++; f+=$5; a+=$10} END {if (n) printf "mean over %d crops: f1best %.4f auc %.4f\n", n, f / n, a / n}' $E/$T/ink/scores.tsv; }
     [ -s $E/$T/ink/vscores.tsv ] && echo "-- ink voxelwise (ink-vscore vs 3-D ink-splat refs: crop P N known_frac ink_share auc thr f1best f1_05 prec05 rec05)" && cat $E/$T/ink/vscores.tsv && awk -F"\t" "{n++; a+=\$6; f+=\$8} END {if (n) printf \"voxelwise vs 3-D refs over %d crops: auc %.4f f1best %.4f\\n\", n, a / n, f / n}" $E/$T/ink/vscores.tsv;
+    # per scroll (crop names: w.. = Paris 4, else SCROLL_w..): held-out rows named for what the trunk saw (INKSEEN "SCROLL=label ...")
+    for f in scores:5:10 vscores:8:6; do IFS=: read -r fn fc ac <<< "$f"; [ -s $E/$T/ink/$fn.tsv ] || continue
+      awk -F'\t' -v fc=$fc -v ac=$ac -v lab="${INKSEEN:-PHerc0500P2=unseen-ink-labels,seen-CT PHerc0841=unseen-scroll}" -v w=$fn 'BEGIN {n = split(lab, L, " "); for (i = 1; i <= n; i++) { split(L[i], kv, "="); D[kv[1]] = kv[2] } }
+        { s = ($1 ~ /^w[0-9]/) ? "PHercParis4" : substr($1, 1, index($1, "_w") - 1); c[s]++; F[s] += $fc; A[s] += $ac }
+        END { for (s in c) printf "%s per scroll %-12s %-28s n %2d auc %.4f f1best %.4f\n", w, s, (s in D) ? D[s] : "", c[s], A[s] / c[s], F[s] / c[s] }' $E/$T/ink/$fn.tsv | sort; done
 } > $E/$T.matrix.txt
 log "matrix -> $E/$T.matrix.txt"
