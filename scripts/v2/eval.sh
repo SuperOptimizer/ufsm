@@ -9,7 +9,7 @@
 #     1. whole Paris 4 through the c2f pipeline (scripts/unroll/unroll.sh) with the candidate as fields AND ink checkpoint
 #        (INKPX="--channel ink"), TAG suffix -v2TAG; GT score fit --model joined --codes q-9p6 9.6 --score-pairs 1 vs .1626 / .681 / .303;
 #        ray-check (human relative windings) on the candidate's and wind96's whole fields, paired.
-#     2. held-out whole scrolls (HOLD, default "PHerc1667 PHerc0139 PHerc1299 PHerc0846A"): the same unroll, then join / wrap-check /
+#     2. held-out whole scrolls (HOLD, default "PHerc1667 PHerc0139 PHerc1299 PHerc0846A"; PHerc1299 only its held-out band, holdband.tsv): the same unroll, then join / wrap-check /
 #        on-papyrus (surf-stats --ct-only) / ink-cover vs the current unroll of that scroll (CUR_<scroll> or $CURROOT/<scroll>), wraps
 #        matched by wrap-match. Renders under <run>/strip/img_fill: LOOK at them before reporting.
 #   MODE p4 / hold: only that half of milestone.
@@ -49,7 +49,15 @@ p4() {
 hold() {
   for S in ${HOLD:-PHerc1667 PHerc0139 PHerc1299 PHerc0846A}; do
     local O=$UR/$S-v2$TAG CV=CUR_$S; local C=${!CV:-${CURROOT:-$REFUR}/$S}
-    unroll $S || { log "$S unroll failed ($O/progress.log)"; continue; }
+    # a scroll held out only in a band (scripts/v2/holdband.tsv, scrolls.tsv hold_band; e.g. PHerc1299's bottom third, 2026-11-11: the
+    # rest is training data): the unroll runs on the band (intersected with the current unroll's box) and only the band is scored
+    local hb=$(awk -F'\t' -v s=$S '$1 == s {print $2}' $H/holdband.tsv 2>/dev/null) bx=
+    if [ -n "$hb" ]; then
+      bx=$(python3 -I -c "import sys; b=list(map(int,sys.argv[1].split(','))); c=list(map(int,(open(sys.argv[2]).read().split() or ['0,0,0,1e9,1e9,1e9'])[0].split(','))) if len(sys.argv)>2 else [0,0,0,10**9,10**9,10**9]
+lo=[max(b[i],c[i]) for i in range(3)]; hi=[min(b[i]+b[i+3],c[i]+c[i+3]) for i in range(3)]; print(','.join(map(str,lo+[hi[i]-lo[i] for i in range(3)])))" $hb $( [ -s $C/box.txt ] && echo $C/box.txt ))
+      log "$S: held-out band $hb -> unroll box $bx (the current unroll is compared inside the same band only by wrap-match over shared z)"
+    fi
+    BOX=$bx unroll $S || { log "$S unroll failed ($O/progress.log)"; continue; }
     [ -d $C/wraps ] || { log "$S: no current unroll at $C (CUR_$S=DIR): candidate numbers only"; }
     for d in $O $C; do
       [ -d $d/wraps ] || continue
