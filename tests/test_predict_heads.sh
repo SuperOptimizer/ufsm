@@ -43,6 +43,10 @@ cmpb onei h/ink 0 || fail "ink: single head against the multi-head run"
 for a in pc ps sp t0 t3 w dz dq; do "$U" read f0z/$a "" 0 0 0 32 32 32 fa.raw > /dev/null 2>&1 && "$U" read f1z/$a "" 0 0 0 32 32 32 fb.raw > /dev/null 2>&1 || fail "read fit field $a"
                                    cmp -s fa.raw fb.raw || fail "fit field $a differs with --heads"; done
 cmpb one f1/rv 0 || fail "rv beside --fit-zarr"
+# the fit fields do not depend on the z-chunking of the slab path (a 1 MB planes' budget: 1-cell chunks with their winding halo planes)
+UFSM_PRED_FIT_PLANES_MB=1 "$U" predict s/last.ckpt fx ct f2 "${P[@]}" --fit-zarr f2z --no-out 1 > f2.log 2>&1 || fail "predict --fit-zarr, small chunks ($D/f2.log)"
+for a in pc ps sp t0 t3 w dz dq; do "$U" read f0z/$a "" 0 0 0 32 32 32 fa.raw > /dev/null 2>&1 && "$U" read f2z/$a "" 0 0 0 32 32 32 fb.raw > /dev/null 2>&1 || fail "read fit field $a"
+                                   cmp -s fa.raw fb.raw || fail "fit field $a depends on the chunking"; done
 # (1b) the GPU pyramid (each level-0 shard pooled on the device, levels >= 1 encoded from the pieces) against the CPU pyramid (each level
 #      decoded back and pooled): at q 0 the same bytes, shard 128 (pieces below a chunk, gathered raw) and 256 (level 1 encoded at once)
 for sh in 128 256; do

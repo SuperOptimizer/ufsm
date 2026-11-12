@@ -1919,7 +1919,7 @@ int cmd_predict(int argc, char **argv) {
                   /* (the planes' budget: 768 MB, or 1/12 of the free device memory up to 6 GB (UFSM_PRED_FIT_PLANES_MB): the winding mod 4 planes
                      need +-16 planes around a chunk and the stem runs again on them, so 3-cell chunks of a 1056 window at --fit-h 8 computed
                      2.3x their planes: 103 of the fit path's 262 ms a window on the pod) */
-                  size_t fr = 0, tot = 0; nn_mem_free(&fr, &tot);
+                  size_t fr = 0, tot = 0; nn_dev_mem(&fr, &tot);
                   size_t bud = getenv("UFSM_PRED_FIT_PLANES_MB") ? (size_t)atoll(getenv("UFSM_PRED_FIT_PLANES_MB")) << 20 : fr / 12;
                   if (!getenv("UFSM_PRED_FIT_PLANES_MB")) { if (bud < ((size_t)768 << 20)) bud = (size_t)768 << 20; if (bud > ((size_t)6 << 30)) bud = (size_t)6 << 30; }
                   const size_t pls = bud / ((size_t)(cfg.lat_guide == 8 ? 19 : cfg.lat_guide == 64 ? 11 : cfg.cout) * W * W * 2), czc = pls / (size_t)ffh;
