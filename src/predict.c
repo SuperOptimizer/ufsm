@@ -89,6 +89,38 @@ static void *reader_main(void *arg) {
     pthread_mutex_lock(&r->mu); pthread_cond_broadcast(&r->cv); pthread_mutex_unlock(&r->mu);
     return nullptr;
 }
+/* the CT prefetcher (an HTTP root with --cache): the inner chunks of the windows ahead of the reader fetched into the local cache by nt
+   threads (z3_prefetch_chunk, no decode), so the reader's z3_read decodes from the cache instead of fetching and decoding in turn:
+   a cold 19 Gvox pod run read 14 s against 7.7 s warm. UFSM_PRED_PREFETCH=N windows ahead (2; 0 off) */
+typedef struct { reader_t *rd; int ahead, nt; atomic_int stop; long nfetch; double t_fetch; int64_t c0[3], c1[3]; _Atomic long next; atomic_int bad; } prefetch_t;
+static void *prefetch_work(void *a) {
+    prefetch_t *P = a; const int64_t ny = P->c1[1] - P->c0[1], nx = P->c1[2] - P->c0[2], n = (P->c1[0] - P->c0[0]) * ny * nx; long nf = 0;
+    for (long k; (k = atomic_fetch_add(&P->next, 1)) < n && !atomic_load(&P->stop);) {
+        const int r = z3_prefetch_chunk(P->rd->ct, P->c0[0] + k / (ny * nx), P->c0[1] + k / nx % ny, P->c0[2] + k % nx);
+        if (r < 0) atomic_store(&P->bad, 1); else nf += r;
+    }
+    return (void *)(intptr_t)nf;
+}
+static void *prefetch_main(void *a) {
+    prefetch_t *P = a; reader_t *r = P->rd; const z3_meta *m = z3_meta_of(r->ct);
+    for (long i = 0; i < r->ntiles && !atomic_load(&P->stop); i++) {
+        pthread_mutex_lock(&r->mu);
+        while (i >= atomic_load(&r->filled) + P->ahead && !atomic_load(&P->stop) && !atomic_load(&r->failed)) pthread_cond_wait(&r->cv, &r->mu);
+        pthread_mutex_unlock(&r->mu);
+        if (atomic_load(&P->stop) || atomic_load(&r->failed)) break;
+        if (i < atomic_load(&r->filled)) continue;   /* (the reader got there first) */
+        const tile_t *t = &r->tiles[i]; const int64_t o[3] = {r->bo[0] + t->tz, r->bo[1] + t->ty, r->bo[2] + t->tx}, n[3] = {r->Wz, r->W, r->W};
+        int empty = 0;
+        for (int d = 0; d < 3; d++) { int64_t lo = o[d] < 0 ? 0 : o[d], hi = o[d] + n[d] > m->shape[d] ? m->shape[d] : o[d] + n[d]; if (hi <= lo) empty = 1;
+                                      P->c0[d] = lo / m->chunk[d]; P->c1[d] = (hi + m->chunk[d] - 1) / m->chunk[d]; }
+        if (empty) continue;
+        const double t0 = now(); atomic_store(&P->next, 0); pthread_t th[64]; const int nt = P->nt < 64 ? P->nt : 64;
+        for (int k = 0; k < nt; k++) pthread_create(&th[k], nullptr, prefetch_work, P);
+        for (int k = 0; k < nt; k++) { void *rv; pthread_join(th[k], &rv); P->nfetch += (long)(intptr_t)rv; }
+        P->t_fetch += now() - t0;
+    }
+    return nullptr;
+}
 /* shard writer: the main thread hands a filled shard buffer to a writer thread and continues into the next buffer of a ring of nb
    (2 by default; one window per k^3 shards: up to 2 k^3, UFSM_PRED_WBUF, so the shards of a window are compressed while the next window
    runs instead of the main thread waiting on each shard's predecessor); buffers are written in submission (ring) order */
@@ -1797,6 +1829,12 @@ int cmd_predict(int argc, char **argv) {
     atomic_store(&rd.filled, 0); atomic_store(&rd.consumed, 0); atomic_store(&rd.failed, 0);
     pthread_mutex_init(&rd.mu, nullptr); pthread_cond_init(&rd.cv, nullptr);
     pthread_t rth; pthread_create(&rth, nullptr, reader_main, &rd);
+    static prefetch_t PF; pthread_t pfth; int pf_on = 0;
+    {   const char *pe = getenv("UFSM_PRED_PREFETCH"); const int ahead = pe ? atoi(pe) : 2;
+        if (ahead > 0 && cache && !strncmp(root, "http", 4) && !lat_store && rd.ntiles > 1) {
+            PF = (prefetch_t){.rd = &rd, .ahead = ahead, .nt = getenv("UFSM_PRED_PREFETCH_THREADS") ? atoi(getenv("UFSM_PRED_PREFETCH_THREADS")) : 16};
+            if (!pthread_create(&pfth, nullptr, prefetch_main, &PF)) pf_on = 1;
+        } }
     feather_t FE = {0}; const int FEN = stride + fea; uint8_t *fext = nullptr, *fhost = nullptr;   /* --feather: E on the device and pinned on the host */
     static fe_worker FW; long fe_n = 0;
     if (fea) {
@@ -2326,6 +2364,8 @@ int cmd_predict(int argc, char **argv) {
     }
     if (gpath) { for (int k = 0; k < WR.nb; k++) nn_host_free(WR.buf[k]); nn_free(dsh); } else for (int k = 0; k < WR.nb; k++) free(WR.buf[k]);
     nn_free(stsc); nn_free(x2); nn_free(lgf); nn_free(lrt);
+    if (pf_on) { atomic_store(&PF.stop, 1); pthread_mutex_lock(&rd.mu); pthread_cond_broadcast(&rd.cv); pthread_mutex_unlock(&rd.mu); pthread_join(pfth, nullptr);
+                 if (pprof) fprintf(stderr, "predict profile (s): prefetch: %ld chunks fetched ahead of the reader in %.2f s (%d windows ahead, %d threads)%s\n", PF.nfetch, PF.t_fetch, PF.ahead, PF.nt, atomic_load(&PF.bad) ? ", some failed (the reader fetched them)" : ""); }
     pthread_join(rth, nullptr);
     for (int k = 0; k < NSLOT; k++) { if (gpath) nn_host_free(rd.buf[k]); else free(rd.buf[k]); }
     free(rd.tiles);
