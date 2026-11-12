@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include "latvol.h"
 #include "nn_latvol.h"
 
@@ -22,7 +23,10 @@ struct nn_lv {
     lv_dent *dt; uint8_t *map; int16_t *bi;      /* device copies */
     uint32_t *offs; lv_chunk_ref *refs; int cap; /* per-chunk scratch: [cap][LV_NSUB] word offsets, [cap] refs */
     int *flag;
+    double t_dec; long n_dec;                    /* nn_latvol_stats */
 };
+static double lv_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (double)t.tv_sec + 1e-9 * (double)t.tv_nsec; }
+extern "C" void nn_latvol_stats(const nn_lv *L, double *seconds, long *calls) { *seconds = L->t_dec; *calls = L->n_dec; }
 
 extern "C" nn_lv *nn_latvol_create(const uint32_t *dt, int ntab, const uint8_t *map, const int16_t *bi, int C, float step_raw) {
     nn_lv *L = (nn_lv *)calloc(1, sizeof *L); if (!L) return nullptr;
@@ -76,6 +80,7 @@ __global__ void k_decode(const uint8_t *comp, const lv_chunk_ref *refs, int nchu
     if (lv_dec_end(&dc)) *flag = 1;
 }
 extern "C" int nn_latvol_decode(nn_lv *L, const void *comp_d, const lv_chunk_ref *refs_h, int nchunk, int d, int h, int w, int stride, void *cells_d) {
+    const double t0 = lv_now();
     LVCK(cudaMemsetAsync(cells_d, 0, (size_t)d * h * w * stride));
     if (nchunk <= 0) return 0;
     if (nchunk > L->cap) {
@@ -88,6 +93,7 @@ extern "C" int nn_latvol_decode(nn_lv *L, const void *comp_d, const lv_chunk_ref
     k_decode<<<(unsigned)(((size_t)nchunk * LV_NSUB + 127) / 128), 128>>>((const uint8_t *)comp_d, L->refs, nchunk, L->offs, L->dt, L->map, L->C, d, h, w, stride, (int8_t *)cells_d, L->flag);
     LVCK(cudaGetLastError());
     int f = 0; LVCK(cudaMemcpy(&f, L->flag, sizeof f, cudaMemcpyDeviceToHost));
+    L->t_dec += lv_now() - t0; L->n_dec++;
     return f;
 }
 

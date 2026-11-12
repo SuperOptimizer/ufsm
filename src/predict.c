@@ -2661,7 +2661,9 @@ int cmd_predict(int argc, char **argv) {
     if (pyramid_write_group(out, um_l, gpyr ? PH[0].pya->nlev : nlev, "ufsm-recto", attrs)) return 1;
     }
     fprintf(stderr, "wrote %s (%ld tiles in %.0fs)\n", out, ntiles, now() - t0);
-    if (lvm) fprintf(stderr, "predict: latvol CT: %.3f GB of chunk streams uploaded and decoded on the device (%.4f B per box voxel)\n", lv_up / 1e9, lv_up / ((double)bn[0] * bn[1] * bn[2]));
+    if (lvm) { double ds = 0; long dn = 0; nn_latvol_stats(lvL, &ds, &dn);
+        fprintf(stderr, "predict: latvol CT: %.3f GB of chunk streams uploaded and decoded on the device (%.4f B per box voxel); the decode kernels %.3f s in %ld windows (%.1f Gvox/s of window voxels)\n",
+                lv_up / 1e9, lv_up / ((double)bn[0] * bn[1] * bn[2]), ds, dn, ds > 0 ? (double)dn * (double)w3 / 1e9 / ds : 0.); }
     if (ufsm_env_on("UFSM_PRED_IO")) {   /* reads per store root and the process's read bytes per box voxel (--latents against the CT path) */
         store_io_report(stderr);
         long long rch = 0, rdb = 0; char ln[128]; FILE *io = fopen("/proc/self/io", "r");

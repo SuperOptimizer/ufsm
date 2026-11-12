@@ -17,6 +17,7 @@ void nn_latvol_free(nn_lv *L);
    nchunk chunk streams in the device buffer comp_d (refs_h: host). Returns 0, or 1 when a stream was corrupt (the cells are then
    undefined: decode on the host for the error). Waits for the kernels. */
 int nn_latvol_decode(nn_lv *L, const void *comp_d, const lv_chunk_ref *refs_h, int nchunk, int d, int h, int w, int stride, void *cells_d);
+void nn_latvol_stats(const nn_lv *L, double *seconds, long *calls);   /* wall time in nn_latvol_decode (zeroing, both kernels, the flag read) and its calls */
 /* the cells' CT bytes [4 d][4 h][4 w] (1..255 in material cells, 0 in air cells): lv_inverse's bytes. stride >= C + 1 */
 void nn_latvol_synth(nn_lv *L, const void *cells_d, int stride, int d, int h, int w, uint8_t *ct_d);
 /* CT bytes [4 d][4 h][4 w] -> indices int16 [d h w][C] (lv_forward's) */
