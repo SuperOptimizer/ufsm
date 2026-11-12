@@ -1,0 +1,61 @@
+/* tests/test_ink_mil.c: the normal-pooled MIL ink loss (inkmil.h). The host reference against central differences (soft max and hard
+   max, label smoothing), then the GPU against the host (loss and gradient, float tolerance). */
+#include "inkmil.h"
+#include "nn.h"
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+static int fails;
+#define CHECK(c, ...) do { if (!(c)) { fprintf(stderr, "FAIL: " __VA_ARGS__); fprintf(stderr, "\n"); fails++; } } while (0)
+static double urand(unsigned *s) { *s = *s * 1664525u + 1013904223u; return (*s >> 8) / 16777216.0; }
+int main(void) {
+    enum { D = 20, H = 22, W = 24, NR = 64 }; const size_t nv = (size_t)D * H * W; unsigned sd = 7;
+    float *lg = malloc(nv * 4); for (size_t k = 0; k < nv; k++) lg[k] = (float)(3 * urand(&sd) - 1.5);
+    inkray *R = calloc(NR, sizeof *R);
+    for (int i = 0; i < NR; i++) {
+        R[i].p[0] = (float)(2 + (D - 4) * urand(&sd)); R[i].p[1] = (float)(2 + (H - 4) * urand(&sd)); R[i].p[2] = (float)(2 + (W - 4) * urand(&sd));
+        double n[3] = {urand(&sd) - .5, urand(&sd) - .5, urand(&sd) - .5}, l = sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+        for (int d = 0; d < 3; d++) R[i].n[d] = (float)(n[d] / l);
+        R[i].y = urand(&sd) < 0.4; R[i].w = (float)(0.5 + urand(&sd));
+    }
+    const float Rr = 5, step = 0.5f, eps = 0.1f, sc = 1.0f / NR;
+    for (int mode = 0; mode < 2; mode++) {
+        const float tau = mode ? 0 : 0.5f;
+        double *g = calloc(nv, sizeof *g); const double L = ink_mil_loss_host(lg, g, D, H, W, R, NR, Rr, step, tau, eps, sc);
+        int nchk = 0, bad = 0; double emax = 0;
+        for (int t = 0; t < 20000 && nchk < 60; t++) {
+            const size_t k = (size_t)(urand(&sd) * nv); if (fabs(g[k]) < 1e-6) continue;
+            const float o = lg[k], h = 1e-3f; lg[k] = o + h; const double Lp = ink_mil_loss_host(lg, nullptr, D, H, W, R, NR, Rr, step, tau, eps, sc);
+            lg[k] = o - h; const double Lm = ink_mil_loss_host(lg, nullptr, D, H, W, R, NR, Rr, step, tau, eps, sc); lg[k] = o;
+            const double fd = (Lp - Lm) / (2.0 * ((double)(o + h) - (double)o));   /* (h as float rounding) */
+            const double e = fabs(fd - g[k]) / (fabs(g[k]) + 1e-4); if (e > emax) emax = e; bad += e > 2e-2; nchk++;
+        }
+        fprintf(stderr, "mil %s: loss %.6f, %d gradient voxels vs central differences, max rel err %.2e (%d off)\n", mode ? "hard max" : "soft max", L, nchk, emax, bad);
+        CHECK(nchk >= 30 && bad <= (mode ? 2 : 0), "host gradient vs central differences (%s): %d of %d off", mode ? "hard" : "soft", bad, nchk);
+        if (ink_mil_loss_hostmem) {
+            float *gg = calloc(nv, 4); double Lg = 0;
+            if (ink_mil_loss_hostmem(lg, gg, D, H, W, R, NR, Rr, step, tau, eps, sc, &Lg)) fprintf(stderr, "mil: no GPU (skipped the device comparison)\n");
+            else {
+                double em = 0, gm = 0; for (size_t k = 0; k < nv; k++) { const double e = fabs(gg[k] - g[k]); if (e > em) em = e; if (fabs(g[k]) > gm) gm = fabs(g[k]); }
+                fprintf(stderr, "mil %s GPU: loss %.6f (host %.6f), max |grad err| %.2e of max |grad| %.2e\n", mode ? "hard max" : "soft max", Lg, L, em, gm);
+                CHECK(fabs(Lg - L) < 1e-4 * fabs(L) + 1e-6 && em < 1e-3 * gm, "GPU vs host (%s)", mode ? "hard" : "soft");
+            }
+            free(gg);
+        }
+        free(g);
+    }
+    free(lg); free(R);
+    if (!getenv("UFSM_TEST_NO_GPU") && nn_init(0) == 0) {   /* train --ink-smooth: nn_ink_targets_smooth == t (1 - eps) + eps / 2 (x255, rounded), eps 0 == nn_ink_targets */
+        uint8_t in[256], t0[256], t1[256], m0[256], m1[256]; for (int i = 0; i < 256; i++) in[i] = (uint8_t)i;
+        uint8_t *di = nn_malloc(256), *dt = nn_malloc(256), *dm = nn_malloc(256); nn_h2d(di, in, 256);
+        nn_ink_targets(di, 256, dt, dm); nn_d2h(t0, dt, 256); nn_d2h(m0, dm, 256);
+        nn_ink_targets_smooth(di, 256, dt, dm, 0.1f); nn_d2h(t1, dt, 256); nn_d2h(m1, dm, 256);
+        int bad = 0; for (int i = 0; i < 256; i++) { const int e = i == 255 ? 0 : (int)lrintf((float)t0[i] * 0.9f + 12.75f); bad += t1[i] != e || m1[i] != m0[i]; }
+        fprintf(stderr, "ink targets smoothed (eps 0.1): 0 -> %d, 254 -> %d, %d of 256 off\n", t1[0], t1[254], bad);
+        CHECK(!bad && t0[254] == 255 && t1[0] == 13 && t1[254] == 242, "nn_ink_targets_smooth: %d off", bad);
+        nn_free(di); nn_free(dt); nn_free(dm);
+    }
+    if (fails) { fprintf(stderr, "test_ink_mil: %d failures\n", fails); return 1; }
+    fprintf(stderr, "test_ink_mil: ok\n"); return 0;
+}

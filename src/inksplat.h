@@ -22,6 +22,7 @@
    prediction >= --pred-thr over papyrus (CT >= iso) samples. With --pred and a written splat, the written voxels are also compared
    with the prediction voxelwise (agreement, IoU). */
 #pragma once
+#include <stddef.h>
 #include <stdint.h>
 
 typedef struct {
@@ -57,3 +58,26 @@ int inksplat_run(const inksplat_cfg *c);
 int cmd_ink_splat(int argc, char **argv);
 int cmd_ink_vscore(int argc, char **argv);
 uint8_t *inksplat_label_window(const char *path, int64_t r0, int64_t c0, int64_t h, int64_t w, int64_t *H, int64_t *W);   /* a 2-D label window (0 outside) */
+
+/* On the fly (2026-11-11): the --face splat of a list of label windows as a derived z3 array (zarr3.h z3_open_derived) on the grid of
+   ct (the CT at cfg->level, owned by the result): each 128^3 chunk is computed on first read (candidate tiles by a mesh-box grid, face
+   search on that chunk's CT neighbourhood, splat, known-max merge over windows) and kept in an LRU of cache_mb (0: 2048) MB;
+   byte-identical to `ink-splat --face --merge` over the same windows with the same options. segs: {"segments": [{"tifxyz", "labels",
+   "mask", "crop": [c0, r0, w, h]}, ..]}. cfg: level, ct_um, iso, face_*, thr, flip, nexcl / excl, label_scale, label_off, cache. */
+typedef struct z3 z3;
+z3 *inkfly_open(z3 *ct, const char *segs, const inksplat_cfg *cfg, size_t cache_mb, const char *dcache_dir, void **handle);   /* cache_mb: the memory LRU; dcache_dir: the disk cache root (dcache.h; nullptr = memory only); handle (nullable): for inkfly_cells; cfg->ct_root / ct_key name the CT in the cache key */
+/* the level-lev cells (grid shape) a supervised label tile's box (reach included) touches -> bits[] = 1 (the sampler's draw cells) */
+int inkfly_cells(void *handle, int lev, const int64_t shape[3], uint8_t *bits);
+/* a normal-pooled MIL ray (train's ink MIL loss): p the label pixel's mesh point, n its unit normal (+ = the recto side), in the window's
+   level voxels (window origin 0); y the 2-D label (1 ink); w a weight */
+typedef struct { float p[3], n[3]; uint8_t y, pad[3]; float w; } inkray;
+/* the rays of the level-L window o / n (inkfly's level): mode 0 every supervised pixel, 1 only those without an open face (the voxel
+   target's unknowns); stride: every stride-th label row / col; pixels within R + 1 level voxels of a held-out box are left out.
+   *out malloc'd. 0 ok. */
+int inkfly_rays(void *handle, const int64_t o[3], const int64_t n[3], int mode, int stride, float R, inkray **out, size_t *nout);
+z3 *inkfly_open_pooled(z3 *ct_coarse, z3 *fine, int own_fine);   /* the next level: known-max 2x pooling of fine, on ct_coarse's grid (owned) */
+void inkfly_gpu_config(int dev);   /* the chunk compute on GPU dev (< 0: the CPU); default: $UFSM_INKFLY_GPU (0), $UFSM_INKFLY_CPU=1 the CPU */
+uint64_t inkfly_gpu_chunks(void);   /* chunks computed on the GPU so far (process) */
+void inkfly_stats(uint64_t *reads, uint64_t *chunks, uint64_t *empty, uint64_t *hits, uint64_t *px, double *sec);
+int inkfly_holdouts(const char *holdout_file, const char *ct_key, inksplat_cfg *cfg);   /* boxes whose ct basename is ct_key's -> cfg->excl */
+int cmd_ink_onfly(int argc, char **argv);

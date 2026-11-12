@@ -2,6 +2,14 @@
 #include "fiberraster.h"
 #include "fuse.h"
 #include "band_onfly.h"
+#include "inksplat.h"
+#include "dcache.h"
+/* weak: the sampler test binaries link sources.o without inksplat.o / dcache.o (an onfly ink target then fails to open) */
+[[gnu::weak]] z3 *inkfly_open(z3 *, const char *, const inksplat_cfg *, size_t, const char *, void **);
+[[gnu::weak]] z3 *inkfly_open_pooled(z3 *, z3 *, int);
+[[gnu::weak]] int inkfly_holdouts(const char *, const char *, inksplat_cfg *);
+[[gnu::weak]] void inksplat_defaults(inksplat_cfg *);
+[[gnu::weak]] const char *dcache_default_dir(void);
 #include "json.h"
 #include "votes.h"
 #include "srpair.h"
@@ -215,6 +223,28 @@ sources *sources_load(const char *path) {
             if (!t && c == CH_FIBV) t = json_get(tg, "fiber_v");
             for (int l = 0; l < MAXLEV; l++) s->tgt_present[c][l] = -1;
             if (!t) continue;
+            if (t->type == J_OBJ && json_get(t, "onfly")) {   /* {"onfly": {"segments", "level", "iso", "face", "holdout_file", "cache_mb"}}: the human-ink splat
+                                                                 computed per chunk on first read (inksplat.h inkfly_open; == ink-splat --face --merge) */
+                if (!inkfly_open) { fprintf(stderr, "sources: %s/%s: an onfly ink target needs inksplat.o in this binary\n", s->name, CHNAME[c]); json_free(j); sources_free(S); return nullptr; }
+                const json *of = json_get(t, "onfly"); inksplat_cfg ic; inksplat_defaults(&ic); ic.face = 1;
+                ic.level = (int)json_num(json_get(of, "level"), 1); ic.iso = (int)json_num(json_get(of, "iso"), s->iso > 0 ? s->iso : 64); ic.ct_um = s->um; ic.cache = g_cache;
+                const json *fa = json_get(of, "face"); if (fa && fa->n == 2) { ic.face_a = json_num(json_at(fa, 0), -6); ic.face_b = json_num(json_at(fa, 1), 0); }
+                const char *sg = json_str(json_get(of, "segments"), nullptr), *hf = json_str(json_get(of, "holdout_file"), json_str(json_get(e, "holdout_file"), nullptr));
+                const int L = ic.level;
+                if (!sg || !(s->um > 0) || L < 0 || L + 1 >= MAXLEV || (hf && inkfly_holdouts(hf, s->ct_key, &ic))) {
+                    fprintf(stderr, "sources: %s/%s: onfly needs \"segments\", the source's \"um\", level 0..%d (and a readable holdout_file)\n", s->name, CHNAME[c], MAXLEV - 2);
+                    json_free(j); sources_free(S); return nullptr; }
+                z3 *ct = pyramid_open_level(s->s, s->ct_key, L, s->um, g_cache), *ct1 = pyramid_open_level(s->s, s->ct_key, L + 1, s->um, g_cache);
+                ic.ct_root = json_str(json_get(e, "root"), "."); ic.ct_key = s->ct_key;   /* (named in the derived cache's key) */
+                const char *dcd = json_str(json_get(of, "cache_dir"), dcache_default_dir ? dcache_default_dir() : nullptr);   /* the disk cache (dcache.h): "cache_dir", $UFSM_DERIVED_CACHE, ~/.cache/ufsm/derived */
+                z3 *z = ct ? inkfly_open(ct, sg, &ic, (size_t)json_num(json_get(of, "cache_mb"), 2048), dcd && *dcd ? dcd : nullptr, &s->ink_fly[c]) : nullptr;
+                if (!z) { if (ct1) z3_close(ct1); fprintf(stderr, "sources: %s/%s: cannot open the onfly ink target %s\n", s->name, CHNAME[c], sg); json_free(j); sources_free(S); return nullptr; }
+                s->tgt_prob[c] = s->tgt_prob254[c] = 1; s->tgt_min_level[c] = L; s->tgt_key[c] = strdup("onfly");
+                for (int l = 0; l < MAXLEV; l++) s->tgt_present[c][l] = 0;
+                s->tgt[c][L] = z; s->tgt_present[c][L] = 1;
+                if (ct1) { s->tgt[c][L + 1] = inkfly_open_pooled(ct1, z, 0); s->tgt_present[c][L + 1] = s->tgt[c][L + 1] != nullptr; }   /* (closed before level L: sources_free goes up the levels? see below) */
+                continue;
+            }
             if (t->type == J_STR) { s->tgt_key[c] = strdup(t->str); continue; }
             const json *fj = json_get(t, "fibre");
             if (fj) {   /* the fibre planes on the fly: no stored raster */
