@@ -12,7 +12,7 @@ SW=${SW:-/mnt/scratch/latvol/rate20}; mkdir -p $SW/log; WB=/vesuvius/ufsm/wbench
 BK=https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com; M=https://dl.ash2txt.org/community-uploads/forrest/volcomp
 BX=${BX:-PH1 PH2 PH3 HOLD J1 J9 J19 J27 C9 C18 C30 C52 139-5 139-2}
 SCANS="PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr:paris4:2 PHerc1667/volumes/20251217075048-2.399um-0.2m-78keV-masked.zarr:1667:2 PHerc0139/volumes/20250728140407-9.362um-1.2m-113keV-masked.zarr:PHerc0139:0"
-ARMS=${ARMS:-lv29_1.5 lv20_1.0 lv13_1.0}
+ARMS=${ARMS:-lv29_1.5 lv20_1.25 lv13_1.0}
 MC=""; [ -x ~/bin/memcap ] && MC="$HOME/bin/memcap -m ${ENCMEM:-24G}"
 enc() {   # ARM
   local a=$1 s key sc lv args src c
