@@ -27,11 +27,12 @@ static const char *g_cache;   /* chunk cache dir for HTTPS stores; from the sour
 int rung_of_um(double um) { return (int)lround(log2(um / 0.6)); }
 
 /* ---- held-out boxes ---- */
-static void src_add_hold(source *s, const json *b) {   /* one [z, y, x, nz, ny, nx] (level 0); the first one is also hold_o / hold_n */
+static void src_add_hold(source *s, const json *b, int rej) {   /* one [z, y, x, nz, ny, nx] (level 0); the first one is also hold_o / hold_n */
     if (!b || b->type != J_ARR || b->n != 6) return;
     int64_t v[6]; for (int d = 0; d < 6; d++) v[d] = (int64_t)json_num(json_at(b, (size_t)d), 0);
     if (v[3] <= 0 || v[4] <= 0 || v[5] <= 0) return;
-    s->hold = realloc(s->hold, (size_t)(s->nhold + 1) * sizeof *s->hold); memcpy(s->hold[s->nhold++], v, sizeof v);
+    s->hold = realloc(s->hold, (size_t)(s->nhold + 1) * sizeof *s->hold); s->hold_rej = realloc(s->hold_rej, (size_t)(s->nhold + 1));
+    s->hold_rej[s->nhold] = (uint8_t)(rej != 0); memcpy(s->hold[s->nhold++], v, sizeof v);
     if (s->nhold == 1) for (int d = 0; d < 3; d++) { s->hold_o[d] = v[d]; s->hold_n[d] = v[3 + d]; }
 }
 static const char *src_base(const char *p) {   /* the last path component, ignoring trailing slashes and a trailing "/<level digits>" */
@@ -45,18 +46,22 @@ static const char *src_base(const char *p) {   /* the last path component, ignor
     }
 }
 /* "holdout_file": the boxes of a wbench holdouts.json ({"boxes": [{"ct": KEY, "l0": [6]}...]}) whose ct basename is this source's */
-static int src_hold_file(source *s, const char *path) {
+static int src_hold_file(source *s, const char *path, const json *rejn) {
     FILE *f = fopen(path, "rb"); if (!f) { fprintf(stderr, "sources: %s: cannot open holdout_file %s\n", s->name, path); return 1; }
     fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET); char *t = malloc((size_t)n + 1);
     const size_t got = t ? fread(t, 1, (size_t)n, f) : 0; fclose(f);
     json *j = got == (size_t)n ? json_parse(t, (size_t)n) : nullptr; free(t);
     const json *bx = j ? json_get(j, "boxes") : nullptr;
     if (!bx || bx->type != J_ARR) { fprintf(stderr, "sources: %s: holdout_file %s: no \"boxes\" array\n", s->name, path); json_free(j); return 1; }
-    char me[512]; snprintf(me, sizeof me, "%s", src_base(s->ct_key)); int added = 0;
+    char me[512]; snprintf(me, sizeof me, "%s", src_base(s->ct_key)); int added = 0, nrej = 0;
     for (size_t k = 0; k < bx->n; k++) { const json *e = json_at(bx, k);
-        if (!strcmp(src_base(json_str(json_get(e, "ct"), "")), me)) { src_add_hold(s, json_get(e, "l0")); added++; } }
+        if (!strcmp(src_base(json_str(json_get(e, "ct"), "")), me)) {
+            const char *nm = json_str(json_get(e, "name"), ""); int rej = 0;
+            for (size_t q = 0; rejn && rejn->type == J_ARR && q < rejn->n; q++) rej |= *nm && !strcmp(nm, json_str(json_at(rejn, q), ""));
+            src_add_hold(s, json_get(e, "l0"), rej); added++; nrej += rej;
+            if (rej) fprintf(stderr, "sources: %s: held-out box %s rejects training windows (holdout_reject)\n", s->name, nm); } }
     json_free(j);
-    if (added) fprintf(stderr, "sources: %s: %d held-out boxes from %s\n", s->name, added, path);
+    if (added) fprintf(stderr, "sources: %s: %d held-out boxes from %s (%d reject)\n", s->name, added, path, nrej);
     return 0;
 }
 
@@ -118,6 +123,38 @@ static const char *CHNAME[NTG] = {"recto", "sheet", "fibre", "fibre_h", "fibre_v
 
 static char *sdup(const char *s) { return s ? strdup(s) : nullptr; }
 
+/* an "onfly" phase spec ({root, key, rmax[, pool2]} or {"sets": [...], "tol"}) opened with `extra` more 2x poolings of its codes at rmax / 2^extra
+   (extra 1: the phase of the next coarser level). *rmx: the largest rmax used. nullptr (reported) on failure */
+static z3 *onfly_phase_open(const char *name, const json *of, int extra, float *rmx) {
+    const char *cr = json_str(json_get(of, "root"), nullptr), *ck = json_str(json_get(of, "key"), "");
+    const float rm = (float)json_num(json_get(of, "rmax"), 0), div = (float)(1 << extra);
+    const json *sj = json_get(of, "sets");   /* "sets": [{"root", "key", "rmax"}, ...] + "tol" (0.1): the sets' phases fused per voxel as
+                                                phase-fuse (band_onfly.h phase_onfly_fuse_open); "root" / "key" then unused */
+    *rmx = 0;
+    if (sj && sj->type == J_ARR) {
+        z3 *ph[FUSE_MAX]; int np = 0, bad = !sj->n || sj->n > FUSE_MAX;
+        for (size_t k = 0; !bad && k < sj->n; k++) {
+            const json *e2 = json_at(sj, k); const char *r2 = json_str(json_get(e2, "root"), nullptr), *k2 = json_str(json_get(e2, "key"), "");
+            const float rm2 = (float)json_num(json_get(e2, "rmax"), rm) / div; store *s2 = r2 ? store_open(r2) : nullptr; z3 *c2 = s2 ? z3_open(s2, k2, nullptr) : nullptr;
+            const int np2 = (int)json_num(json_get(e2, "pool2"), json_num(json_get(of, "pool2"), 0)) + extra;
+            for (int q2 = 0; c2 && q2 < np2; q2++) { z3 *q = codes_pool2_open(c2); if (!q) { z3_close(c2); c2 = nullptr; } else c2 = q; }
+            z3 *p2 = c2 && rm2 > 0 ? phase_onfly_open(c2, rm2) : nullptr;
+            if (!p2) { z3_close(c2); fprintf(stderr, "sources: %s: phase onfly set %zu: cannot open the codes %s/%s or no \"rmax\" > 0\n", name, k, r2 ? r2 : "?", k2); bad = 1; break; }
+            ph[np++] = p2; if (rm2 * div > *rmx) *rmx = rm2 * div;
+        }
+        z3 *z = bad ? nullptr : phase_onfly_fuse_open(ph, np, (float)json_num(json_get(of, "tol"), 0.1));
+        if (bad) for (int k = 0; k < np; k++) z3_close(ph[k]);
+        if (!z) fprintf(stderr, "sources: %s: phase onfly \"sets\": 1..%d sets of {root, key, rmax}, one shape\n", name, FUSE_MAX);
+        return z;
+    }
+    store *cs = cr ? store_open(cr) : nullptr; z3 *cz = cs ? z3_open(cs, ck, nullptr) : nullptr;
+    const int npool = (int)json_num(json_get(of, "pool2"), 0) + extra;   /* "pool2": 1: the codes pooled 2x on read (phase-raster --gs 4) */
+    for (int q2 = 0; cz && q2 < npool; q2++) { z3 *q = codes_pool2_open(cz); if (!q) { z3_close(cz); cz = nullptr; } else cz = q; }
+    z3 *z = cz && rm > 0 ? phase_onfly_open(cz, rm / div) : nullptr;
+    if (!z) { z3_close(cz); fprintf(stderr, "sources: %s: phase onfly: cannot open the codes %s/%s or no \"rmax\" > 0\n", name, cr ? cr : "?", ck); }
+    *rmx = rm;
+    return z;
+}
 sources *sources_load(const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "sources: cannot open %s\n", path); return nullptr; }
@@ -297,33 +334,16 @@ sources *sources_load(const char *path) {
                 const json *of = json_get(pt, "onfly");   /* {"root", "key", "rmax"}: the pair-rule phase computed from these codes on read
                                                              (band_onfly.h; byte-identical to phase-raster --pair 1 on the codes' grid) */
                 if (of && !s->phase) {
-                    const char *cr = json_str(json_get(of, "root"), nullptr), *ck = json_str(json_get(of, "key"), "");
-                    const float rm = (float)json_num(json_get(of, "rmax"), 0);
-                    const json *sj = json_get(of, "sets");   /* "sets": [{"root", "key", "rmax"}, ...] + "tol" (0.1): the sets' phases fused per
-                                                                    voxel as phase-fuse (band_onfly.h phase_onfly_fuse_open); "root" / "key" then unused */
-                    if (sj && sj->type == J_ARR) {
-                        z3 *ph[FUSE_MAX]; int np = 0, bad = !sj->n || sj->n > FUSE_MAX; float rmx = 0;
-                        for (size_t k = 0; !bad && k < sj->n; k++) {
-                            const json *e2 = json_at(sj, k); const char *r2 = json_str(json_get(e2, "root"), nullptr), *k2 = json_str(json_get(e2, "key"), "");
-                            const float rm2 = (float)json_num(json_get(e2, "rmax"), rm); store *s2 = r2 ? store_open(r2) : nullptr; z3 *c2 = s2 ? z3_open(s2, k2, nullptr) : nullptr;
-                            if (c2 && json_num(json_get(e2, "pool2"), json_num(json_get(of, "pool2"), 0))) { z3 *q = codes_pool2_open(c2); if (!q) { z3_close(c2); c2 = nullptr; } else c2 = q; }
-                            z3 *p2 = c2 && rm2 > 0 ? phase_onfly_open(c2, rm2) : nullptr;
-                            if (!p2) { z3_close(c2); fprintf(stderr, "sources: %s: phase onfly set %zu: cannot open the codes %s/%s or no \"rmax\" > 0\n", s->name, k, r2 ? r2 : "?", k2); bad = 1; break; }
-                            ph[np++] = p2; if (rm2 > rmx) rmx = rm2;
-                        }
-                        s->phase = bad ? nullptr : phase_onfly_fuse_open(ph, np, (float)json_num(json_get(of, "tol"), 0.1));
-                        if (bad) for (int k = 0; k < np; k++) z3_close(ph[k]);
-                        if (!s->phase) { fprintf(stderr, "sources: %s: phase onfly \"sets\": 1..%d sets of {root, key, rmax}, one shape\n", s->name, FUSE_MAX); json_free(j); sources_free(S); return nullptr; }
-                        s->phase_onfly = rmx;
-                    } else {
-                    store *cs = cr ? store_open(cr) : nullptr; z3 *cz = cs ? z3_open(cs, ck, nullptr) : nullptr;
-                    if (cz && json_num(json_get(of, "pool2"), 0)) { z3 *q = codes_pool2_open(cz); if (!q) { z3_close(cz); cz = nullptr; } else cz = q; }   /* "pool2": 1: the codes pooled 2x on read (phase-raster --gs 4) */
-                    s->phase = cz && rm > 0 ? phase_onfly_open(cz, rm) : nullptr;
-                    if (!s->phase) { z3_close(cz); fprintf(stderr, "sources: %s: phase onfly: cannot open the codes %s/%s or no \"rmax\" > 0\n", s->name, cr ? cr : "?", ck); json_free(j); sources_free(S); return nullptr; }
-                    s->phase_onfly = rm;
-                    }
+                    float rmx = 0;
+                    if (!(s->phase = onfly_phase_open(s->name, of, 0, &rmx))) { json_free(j); sources_free(S); return nullptr; }
+                    s->phase_onfly = rmx;
                 }
                 s->phase_level = (int)json_num(json_get(pt, "level"), 1); s->phase_direct = json_get(pt, "level") != nullptr;
+                if (of && s->phase_onfly > 0 && s->phase_level + 1 < MAXLEV) {   /* the next coarser level (the scale rungs): the same rule on the codes
+                    pooled once more at half rmax (byte-identical to phase-raster --gs 4 of a 2x coarser raster), not the phase pooled */
+                    float r1 = 0; s->phase_pl[s->phase_level + 1] = onfly_phase_open(s->name, of, 1, &r1);
+                    if (!s->phase_pl[s->phase_level + 1]) { json_free(j); sources_free(S); return nullptr; }
+                }
                 const double sg = json_num(json_get(pt, "phase_sign"), 1);
                 if (sg != 1 && sg != -1) { fprintf(stderr, "sources: %s: \"phase_sign\" must be 1 or -1\n", s->name); json_free(j); sources_free(S); return nullptr; }
                 s->phase_sign = (int)sg;
@@ -442,10 +462,13 @@ sources *sources_load(const char *path) {
             if (!s->nemb || s->emb_level < 0) { fprintf(stderr, "sources: %s: \"emb\" needs \"groups\": [DIR, ...] and \"level\" >= 0\n", s->name); json_free(j); sources_free(S); return nullptr; }
         }
         const json *ho = json_get(e, "holdout");
-        if (ho && ho->type == J_ARR && ho->n == 6 && json_at(ho, 0)->type != J_ARR) src_add_hold(s, ho);
-        else if (ho && ho->type == J_ARR) for (size_t k = 0; k < ho->n; k++) src_add_hold(s, json_at(ho, k));
+        if (ho && ho->type == J_ARR && ho->n == 6 && json_at(ho, 0)->type != J_ARR) src_add_hold(s, ho, 0);
+        else if (ho && ho->type == J_ARR) for (size_t k = 0; k < ho->n; k++) src_add_hold(s, json_at(ho, k), 0);
         const char *hf = json_str(json_get(e, "holdout_file"), nullptr);
-        if (hf && src_hold_file(s, hf)) { json_free(j); sources_free(S); return nullptr; }
+        if (hf && src_hold_file(s, hf, json_get(e, "holdout_reject"))) { json_free(j); sources_free(S); return nullptr; }
+        const char *hm = json_str(json_get(e, "holdout_mode"), nullptr);
+        if (hm) { s->hold_mode = !strcmp(hm, "mask") ? 1 : !strcmp(hm, "reject") ? 2 : -1;
+                  if (s->hold_mode < 0) { fprintf(stderr, "sources: %s: \"holdout_mode\" is \"mask\" or \"reject\", not \"%s\"\n", s->name, hm); json_free(j); sources_free(S); return nullptr; } }
         const json *bx = json_get(e, "boxes");   /* task restore: level-0 boxes [z, y, x, nz, ny, nx] that hold local CT (training windows lie inside one) */
         if (bx && bx->type == J_ARR && bx->n) {
             s->box = calloc(bx->n, sizeof *s->box);
@@ -477,7 +500,8 @@ void sources_free(sources *S) {
     for (int i = 0; i < S->n; i++) {
         source *s = &S->src[i];
         for (int l = 0; l < MAXLEV; l++) z3_close(s->ct[l]);
-        if (s->band != s->phase) z3_close(s->band); z3_close(s->phase); z3_close(s->wind); z3_close(s->aux); z3_close(s->phase_ign); z3_close(s->phase_wt); free(s->box); free(s->hold); free(s->focus); free(s->mask); srpair_free(s->srp);
+        for (int l = MAXLEV - 1; l >= 0; l--) { z3_close(s->phase_pl[l]); z3_close(s->phase_ign_pl[l]); }   /* (the pooled views borrow phase / ignore: closed first) */
+        if (s->band != s->phase) z3_close(s->band); z3_close(s->phase); z3_close(s->wind); z3_close(s->aux); z3_close(s->phase_ign); z3_close(s->phase_wt); free(s->box); free(s->hold); free(s->hold_rej); free(s->focus); free(s->mask); srpair_free(s->srp);
         for (int c = 0; c < NTG; c++) {
             for (int l = 0; l < MAXLEV; l++) z3_close(s->tgt[c][l]);
             if (s->reg[c]) {
@@ -607,6 +631,21 @@ static z3 *source_tgt_fibre(source *s, int ch, int level) {
     pthread_mutex_unlock(&g_open_mu);
     z3_close(pl[0]); z3_close(pl[1]);
     return s->tgt[ch][level];
+}
+z3 *source_phase_at(source *s, int level, int ign) {
+    z3 *b = ign ? s->phase_ign : s->phase;
+    if (!b || level < s->phase_level || level >= MAXLEV) return nullptr;
+    if (level == s->phase_level) return b;
+    z3 **pl = ign ? s->phase_ign_pl : s->phase_pl;
+    if (!pl[level] && !ign && s->phase_onfly > 0) return nullptr;   /* (an on-the-fly phase: its next level is made from the pooled codes at
+                                                                       load, deeper none; pooling the derived phase would derive 8x the voxels) */
+    if (!pl[level]) {
+        z3 *under = source_phase_at(s, level - 1, ign); if (!under) return nullptr;
+        pthread_mutex_lock(&g_open_mu);
+        if (!pl[level]) pl[level] = phase_pool2_view(under, ign);   /* (cheap: no I/O; under the lock so one view per level) */
+        pthread_mutex_unlock(&g_open_mu);
+    }
+    return pl[level];
 }
 z3 *source_tgt(source *s, int ch, int level) {
     if (!s->tgt_key[ch] || level < s->tgt_min_level[ch] || level < 0 || level >= MAXLEV || s->tgt_present[ch][level] == 0) return nullptr;

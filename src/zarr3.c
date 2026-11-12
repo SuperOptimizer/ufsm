@@ -50,7 +50,7 @@ struct z3 {
     size_t icap, icount;
     /* z3_open_derived: values computed from base by derive (z3_read), the chunk map / box tests / shard presence from base */
     z3 *base; z3_derive_fn derive; void *dctx; void (*dfree)(void *);
-    z3 *cover[4]; int ncover;
+    z3 *cover[4]; int ncover; int bborrow;   /* z3_derived_borrow: z3_close leaves base open */
     int (*xmap)(void *ctx, const int64_t grid[3], const int chunk[3], uint8_t *bits); void *xctx; uint8_t *xbits; int64_t xgrid[3]; int xstate;   /* z3_derived_extent */   /* z3_derived_cover: more arrays whose chunks the derived values reach (owned) */
 };
 
@@ -168,6 +168,8 @@ z3 *z3_open_derived(z3 *base, int fill, z3_derive_fn derive, void *ctx, void (*c
     return z;
 }
 z3 *z3_base_of(const z3 *z) { return z ? z->base : nullptr; }
+void *z3_derived_ctx(const z3 *z) { return z && z->derive ? z->dctx : nullptr; }
+void z3_derived_borrow(z3 *z) { if (z && z->derive) z->bborrow = 1; }
 int z3_derived_extent(z3 *z, int (*fn)(void *ctx, const int64_t grid[3], const int chunk[3], uint8_t *bits), void *ctx) {
     if (!z || !z->derive || !fn) return -1;
     z->xmap = fn; z->xctx = ctx; return 0;
@@ -213,7 +215,7 @@ int z3_derived_cover(z3 *z, z3 *cover) {
 
 void z3_close(z3 *z) {
     if (!z) return;
-    if (z->derive) { if (z->dfree) z->dfree(z->dctx); z3_close(z->base); for (int k = 0; k < z->ncover; k++) z3_close(z->cover[k]); free(z->xbits); free(z->key); pthread_mutex_destroy(&z->imu); free(z); return; }
+    if (z->derive) { if (z->dfree) z->dfree(z->dctx); if (!z->bborrow) z3_close(z->base); for (int k = 0; k < z->ncover; k++) z3_close(z->cover[k]); free(z->xbits); free(z->key); pthread_mutex_destroy(&z->imu); free(z); return; }
     free(z->key);
     free(z->cache);
     for (size_t i = 0; i < z->icap; i++) { free(z->itab[i].key); free(z->itab[i].idx); }
