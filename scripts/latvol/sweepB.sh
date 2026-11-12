@@ -45,7 +45,7 @@ PY
     ARGS+=(--onfly-slots 1); nf=0
     while :; do
       # shared jobs own minutes :00-:20 of the hour: a segment starts before :12 and is stopped (SIGTERM: a save) at :19
-      while [ -e $K/gpu.pause ] || [ $((10#$(date +%M))) -ge ${SEGSTART:-12} ] || pgrep -f "[s]weep_ink.sh" > /dev/null; do sleep 5; done
+      while [ -e $K/gpu.pause ] || [ -e $K/gpu.gate-waiting ] || [ -e $K/gpu.merge-waiting ] || [ $((10#$(date +%M))) -ge ${SEGSTART:-12} ] || pgrep -f "[s]weep_ink.sh" > /dev/null; do sleep 5; done
       touch $L/b.busy; while [ -n "$(ls $K/gpu.shared 2>/dev/null | grep '^latstore-')" ]; do sleep 5; done   # my other units drain first
       # U2 needs its ~64 GB: start only with >= FREEGB (20) GB free on the card (this job plans 14 + one 4 GB on-the-fly slot)
       while [ "$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits | head -1)" -lt $((${FREEGB:-20} * 1024)) ]; do sleep 20; [ -e $K/gpu.pause ] && break; done
