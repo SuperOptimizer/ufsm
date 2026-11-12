@@ -61,6 +61,17 @@ if os.environ.get("B3", "0") == "1" and os.path.exists(f"{B3D}/PHerc1299/mask/we
                 "note": "B3 PHerc1299: our snapped wraps (71 of 88 kept), phase on the fly from codes (rmax 20), weight = band / direction / fibre / papyrus / gate mask",
                 "targets": {"band": {"radius": 20, "span": 19, "phase": {"onfly": {"root": f"{B3D}/PHerc1299/codes.zarr", "key": "9.596", "rmax": 20}, "level": 2,
                                                                          "weight": {"root": f"{B3D}/PHerc1299/mask/weight.zarr", "key": "9.596"}}}}})
+# PHerc1218 (2026-11-12): same form, no direction mask (aligned outward 0.9998, 27 reversed cells = 0.0002 of the pairs) and no fibre
+# gate (the Paris 4 ramp is miscalibrated on the 8.64 um scans: latres's 1447 control). The weight = the gated phase's papyrus mask only
+# (phase-coh --coh 0 --papyrus 64: 0 on air, gt-gate-removed and ignored voxels, 1 elsewhere). Codes and weight on /mnt/scratch
+# (/vesuvius was down to 28 GB). Level 0 = 8.64 um, rmax 20 (surf-labels --radius 20 on that grid).
+B3S = os.environ.get("B3S", "/mnt/scratch/univ/b3")
+if os.environ.get("B3", "0") == "1" and os.path.exists(f"{B3S}/w1218/weight.zarr/8.64/zarr.json") and os.path.exists(f"{B3S}/labels/PHerc1218/codes.zarr/8.64/zarr.json"):
+    src.append({"name": "PHerc1218-b3", "scope": "global", "root": "/vesuvius/ufsm/v2/ct", "ct": "PHerc1218/20250521120456-8.640um-1.2m-116keV-masked.zarr", "um": 8.64,
+                "min_level": 0, "max_level": 0, "axis": "/mnt/scratch/pods/PHerc1218/unroll/axis.json", "iso": 64, "weight": float(os.environ.get("W1218", "0.1")), "heads": HEADS,
+                "note": "B3 PHerc1218: our snapped wraps, gt-gate (0.179 removed), phase on the fly from codes (rmax 20), weight = gate / papyrus mask",
+                "targets": {"band": {"radius": 20, "span": 19, "phase": {"onfly": {"root": f"{B3S}/labels/PHerc1218/codes.zarr", "key": "8.64", "rmax": 20}, "level": 0,
+                                                                         "weight": {"root": f"{B3S}/w1218/weight.zarr", "key": "8.64"}}}}})
 p4 = next(s for s in T["sources"] if s["name"] == "PHercParis4-june"); p4b = next(s for s in T["sources"] if s["name"] == "PHercParis4-july")
 for k, base, nm, w in (("A", p4, "PHercParis4-june48", 0.2), ("B", p4b, "PHercParis4-july48", 0.12)):
     cr = next((d for d in (CP4, CP4N) if os.path.exists(f"{d}/codes{k}48/done")), None)   # July codes live on NVMe (b1_p4B48.sh, 2026-11-12)
