@@ -137,6 +137,7 @@ static int usage(void) {
     fprintf(stderr,
         "ufsm — ultra fast scroll model\n"
         "  ufsm sysinfo [--ncpu | --avail-gb | --limit-gb] [--disk PATH]   real cgroup CPU / RAM limits, GPUs (MIG), CUDA, free disk\n"
+        "  ufsm latvol  <basis.lcb> <root> <ct-group> <out-group> --levels L,.. [--c 29 --step 0.25 --gpu 0]   a CT group as latent cells: a drop-in CT source (latvol-check: against its source)\n"
         "  ufsm info    <root> <array-or-group-key> [--cache DIR]\n"
         "  ufsm read    <root> <array-key> z y x nz ny nx <out.raw> [--cache DIR] [--threads N]\n"
         "  ufsm slice   <root> <array-key> z <out.pgm> [--cache DIR] [--threads N]     (whole z slice)\n"
@@ -4826,6 +4827,8 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "papyrus-labels")) return cmd_papyrus_labels(argc, argv);
     if (!strcmp(cmd, "overlay")) return cmd_overlay(argc, argv);
     if (!strcmp(cmd, "wind-score")) return cmd_wind_score(argc, argv);
+    if (!strcmp(cmd, "latvol")) { int cmd_latvol(int, char **); return cmd_latvol(argc, argv); }   /* a CT group as latent cells, a drop-in CT source (src/latvol.h, latvol_cli.c) */
+    if (!strcmp(cmd, "latvol-check")) { int cmd_latvol_check(int, char **); return cmd_latvol_check(argc, argv); }
     if (!strcmp(cmd, "lc-encode")) { int cmd_lc_encode(int, char **); return cmd_lc_encode(argc, argv); }   /* latcomp v1 store of a CT volume (src/lc_cli.c) */
     if (!strcmp(cmd, "store-bench")) { int cmd_store_bench(int, char **); return cmd_store_bench(argc, argv); }
     if (!strcmp(cmd, "phase-pack") || !strcmp(cmd, "phase-unpack") || !strcmp(cmd, "phase-cmp") || !strcmp(cmd, "phase-drop")) { int cmd_phase_pack(int, char **); return cmd_phase_pack(argc, argv); }
@@ -4849,7 +4852,7 @@ int main(int argc, char **argv) {
                 const z3_meta *m = z3_meta_of(z);
                 printf("  %-10s %.4g um  shape %lld x %lld x %lld  shard %d chunk %d  %s q=%g%s\n", lv[i].path, lv[i].um,
                        (long long)m->shape[0], (long long)m->shape[1], (long long)m->shape[2], m->shard[0], m->chunk[0],
-                       m->q >= 0 ? "volcomp" : m->raw ? "raw" : "?", m->q, m->zstd ? "+zstd" : "");
+                       m->q >= 0 ? "volcomp" : m->latvol ? "latvol" : m->raw ? "raw" : "?", m->q, m->zstd ? "+zstd" : "");
                 z3_close(z);
             }
             return 0;
@@ -4859,7 +4862,7 @@ int main(int argc, char **argv) {
         const z3_meta *m = z3_meta_of(z);
         printf("array %s\n  shape %lld x %lld x %lld  shard %d x %d x %d  chunk %d x %d x %d  sep '%c'\n  codec %s q=%g%s  scale %.4g um\n",
                key, (long long)m->shape[0], (long long)m->shape[1], (long long)m->shape[2], m->shard[0], m->shard[1], m->shard[2],
-               m->chunk[0], m->chunk[1], m->chunk[2], m->sep, m->q >= 0 ? "volcomp" : m->raw ? "raw" : "?", m->q,
+               m->chunk[0], m->chunk[1], m->chunk[2], m->sep, m->q >= 0 ? "volcomp" : m->latvol ? "latvol" : m->raw ? "raw" : "?", m->q,
                m->zstd ? "+zstd" : "", m->scale_um);
         z3_close(z);
         return 0;

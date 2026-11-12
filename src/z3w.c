@@ -80,6 +80,29 @@ z3w *z3w_create(const char *dir, const int64_t shape[3], int shard, float q, int
     return w;
 }
 
+z3w *z3w_create_codec(const char *dir, const int64_t shape[3], int shard, const char *codec_json, int fill, const char *attrs_json) {
+    if (shard % 128 || shard <= 0) { fail("shard must be a multiple of 128"); return nullptr; }
+    if (mkdirs(dir)) { fail("mkdir %s: %s", dir, strerror(errno)); return nullptr; }
+    char p[1400];
+    snprintf(p, sizeof p, "%s/zarr.json", dir);
+    FILE *f = fopen(p, "w");
+    if (!f) { fail("cannot write %s", p); return nullptr; }
+    fprintf(f,
+        "{\"zarr_format\":3,\"node_type\":\"array\",\"shape\":[%lld,%lld,%lld],\"data_type\":\"uint8\","
+        "\"chunk_grid\":{\"name\":\"regular\",\"configuration\":{\"chunk_shape\":[%d,%d,%d]}},"
+        "\"chunk_key_encoding\":{\"name\":\"default\",\"configuration\":{\"separator\":\"/\"}},\"fill_value\":%d,"
+        "\"codecs\":[{\"name\":\"sharding_indexed\",\"configuration\":{\"chunk_shape\":[128,128,128],"
+        "\"codecs\":[%s],"
+        "\"index_codecs\":[{\"name\":\"bytes\",\"configuration\":{\"endian\":\"little\"}},{\"name\":\"crc32c\"}],\"index_location\":\"end\"}}],"
+        "\"attributes\":%s,\"dimension_names\":[\"z\",\"y\",\"x\"]}\n",
+        (long long)shape[0], (long long)shape[1], (long long)shape[2], shard, shard, shard, fill, codec_json, attrs_json ? attrs_json : "{}");
+    fclose(f);
+    z3w *w = calloc(1, sizeof *w);
+    w->dir = strdup(dir); memcpy(w->shape, shape, sizeof w->shape);
+    w->shard = shard; w->cg = shard / 128; w->q = -1; w->fill = fill;
+    return w;
+}
+
 z3w *z3w_create_typed(const char *dir, const int64_t shape[3], int shard, int dtype, float q, double fill, const char *attrs_json) {
     if (dtype < 1 || dtype > 5) { fail("typed array: dtype %d", dtype); return nullptr; }
     if (shard % 128 || shard <= 0) { fail("shard must be a multiple of 128"); return nullptr; }

@@ -89,6 +89,7 @@ SRC += src/flatten.c src/faces.c src/faces_cli.c
 SRC += src/sheetcut.c
 SRC += src/strip.c
 SRC += src/latfit.c src/lc_cli.c
+SRC += src/latvol.c src/latvol_cli.c src/latvol_read.c
 OBJ  = $(patsubst src/%.c,$(B)/%.o,$(SRC)) $(B)/surfcomp.o
 
 all: $(B)/ufsm
@@ -150,6 +151,11 @@ $(B)/nn_gpudec.o: NVFLAGS = -O3 $(NVARCH) -DUFSM_ARCH=$(ARCH) -fmad=false -Xcomp
 $(B)/nn_cf.o: NVFLAGS = -O3 $(NVARCH) -DUFSM_ARCH=$(ARCH) -fmad=false -Xcompiler -fno-threadsafe-statics -Isrc
 # fiber-trace's axis on the GPU (src/nn_ftrace.cu) is byte-identical to src/ftaxis.c: IEEE division / sqrt, no FMA contraction, no fast math
 $(B)/nn_ftrace.o: NVFLAGS = -O3 $(NVARCH) -DUFSM_ARCH=$(ARCH) -fmad=false -Xcompiler -fno-threadsafe-statics -Isrc
+# latvol on the GPU (src/nn_latvol.cu) is byte-identical to src/latvol.c: integer sums, one float multiply and a rint; no FMA contraction, no fast math
+$(B)/nn_latvol.o: NVFLAGS = -O3 $(NVARCH) -DUFSM_ARCH=$(ARCH) -fmad=false -Xcompiler -fno-threadsafe-statics -Isrc
+$(B)/nn_latvol.o: src/latvol.h src/nn_latvol.h
+$(B)/test_latvol: tests/test_latvol.c src/latvol.h $(B)/latvol.o $(B)/nn_latvol.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(CUDA)/include $< $(B)/latvol.o $(B)/nn_latvol.o -o $@ $(LDLIBS) $(CUDALIBS)
 # the phase-raster pair rule on the GPU (src/nn_band.cu) is byte-identical to band.c: IEEE division / sqrt, no FMA contraction, no fast math
 $(B)/nn_band.o: NVFLAGS = -O3 $(NVARCH) -DUFSM_ARCH=$(ARCH) -fmad=false -Xcompiler -fno-threadsafe-statics -Isrc
 $(B)/nn_fibre.o: NVFLAGS = -O3 $(NVARCH) -DUFSM_ARCH=$(ARCH) -fmad=false -Xcompiler -fno-threadsafe-statics -Isrc
@@ -730,6 +736,9 @@ $(B)/test_phasepack: tests/test_phasepack.c $(B)/phasepack.o $(B)/store.o $(B)/z
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
 $(B)/test_http_reader: tests/test_http_reader.c $(B)/store.o $(B)/zarr3.o $(B)/json.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
+# zarr3.o without latvol.o on purpose: a latvol array must fail to open with a clear error (tests/test_latvol.sh)
+$(B)/test_latvol_nolink: tests/test_latvol_nolink.c $(B)/store.o $(B)/zarr3.o $(B)/json.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
 
 $(B)/test_checkpoint_runtime: tests/test_checkpoint_runtime.c $(B)/checkpoint.o $(B)/json.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ -lm
@@ -745,7 +754,7 @@ suite-bins: $(B)/test_wgrad_grid
 $(B):
 	mkdir -p $(B)
 
-suite-bins: $(B)/test_gpu_aug $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover $(B)/test_ct_augment $(B)/test_scan_augment $(B)/test_side $(B)/test_votes $(B)/test_wind $(B)/test_phase_check $(B)/test_fuse $(B)/test_raster $(B)/test_http_reader $(B)/test_wide_up_grad $(B)/test_wgrad_staging $(B)/test_stem_precision $(B)/test_gn_contract $(B)/test_sampler_safety $(B)/test_optimizer_owners $(B)/test_infer_buffers $(B)/test_recompute_live $(B)/test_share_enc_a1 $(B)/test_checkpoint_runtime $(B)/make_pipeline_fixture $(B)/test_checkpoint $(B)/test_eval $(B)/test_sample_ops $(B)/test_json $(B)/test_nn $(B)/test_unet $(B)/test_fused $(B)/test_formats $(B)/ufsm $(B)/test_mx $(B)/test_mx4 $(B)/test_grad_mx4 $(B)/test_rc $(B)/test_split $(B)/test_muon $(B)/test_muonc $(B)/test_gn_frozen $(B)/test_infer_mem $(B)/test_half $(B)/test_unwrap_targets $(B)/test_fit $(B)/test_surf $(B)/test_tiffw $(B)/test_edt $(B)/test_volcomp $(B)/test_volcomp_fast $(B)/test_gpudec $(B)/test_typed_zarr $(B)/test_aug_preset $(B)/test_l0_norm $(B)/test_l0_slab $(B)/test_wind_sampler $(B)/test_crush $(B)/test_vwt_aug $(B)/test_zcache $(B)/test_scrollaug $(B)/test_zwin $(B)/test_l0_stream $(B)/test_phasepack
+suite-bins: $(B)/test_latvol_nolink $(B)/test_gpu_aug $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover $(B)/test_ct_augment $(B)/test_scan_augment $(B)/test_side $(B)/test_votes $(B)/test_wind $(B)/test_phase_check $(B)/test_fuse $(B)/test_raster $(B)/test_http_reader $(B)/test_wide_up_grad $(B)/test_wgrad_staging $(B)/test_stem_precision $(B)/test_gn_contract $(B)/test_sampler_safety $(B)/test_optimizer_owners $(B)/test_infer_buffers $(B)/test_recompute_live $(B)/test_share_enc_a1 $(B)/test_checkpoint_runtime $(B)/make_pipeline_fixture $(B)/test_checkpoint $(B)/test_eval $(B)/test_sample_ops $(B)/test_json $(B)/test_nn $(B)/test_unet $(B)/test_fused $(B)/test_formats $(B)/ufsm $(B)/test_mx $(B)/test_mx4 $(B)/test_grad_mx4 $(B)/test_rc $(B)/test_split $(B)/test_muon $(B)/test_muonc $(B)/test_gn_frozen $(B)/test_infer_mem $(B)/test_half $(B)/test_unwrap_targets $(B)/test_fit $(B)/test_surf $(B)/test_tiffw $(B)/test_edt $(B)/test_volcomp $(B)/test_volcomp_fast $(B)/test_gpudec $(B)/test_typed_zarr $(B)/test_aug_preset $(B)/test_l0_norm $(B)/test_l0_slab $(B)/test_wind_sampler $(B)/test_crush $(B)/test_vwt_aug $(B)/test_zcache $(B)/test_scrollaug $(B)/test_zwin $(B)/test_l0_stream $(B)/test_phasepack
 
 clean:
 	rm -rf build build-verify build86 build86-verify build86p build86p-verify
@@ -774,7 +783,7 @@ suite-bins: $(B)/test_sweep
 $(B)/test_restore_task: tests/test_restore_task.c $(OBJ) $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 suite-bins: $(B)/test_restore_task
-suite-bins: $(B)/test_gpu_input $(B)/test_lat $(B)/test_lat_fuse
+suite-bins: $(B)/test_gpu_input $(B)/test_lat $(B)/test_lat_fuse $(B)/test_latvol
 suite-bins: $(B)/test_pack_tm
 suite-bins: $(B)/test_wind4
 suite-bins: $(B)/test_fibn
