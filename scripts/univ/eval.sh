@@ -75,7 +75,7 @@ if has ink && [ "${INK:-1}" = 1 ] && [ -n "$INKP" ]; then   # INKP = ink3dext | 
     if [ $vs = 1 ]; then gk=$(ls $g | grep -vE '^(segments|zarr.json)$' | head -1)
       $U ink-vscore --gt $g $gk --pred $v $key --box $box --level $lvi --row $cr --threads 8 2>> $o/vscore_$cr.log | grep -P "^$cr\t" >> $o/vscores.tsv; fi
     grep -qP "^$cr\t" $o/scores.tsv && continue
-    s=$o/surf/$cr; mkdir -p $s/w; python3 -I - $C/$cr $s/w/$cr $lvi <<'PY'   # the crop surface in the ink volume's voxels (render samples volume voxels)
+    s=$o/surf/$cr; mkdir -p $s/w; python3 -I - $C/$cr $s/w/w_$cr $lvi <<'PY'   # the crop surface in the ink volume's voxels (render samples volume voxels; render only reads wrap dirs named w*)
 import sys, os, shutil, numpy as np, tifffile
 src, dst, lv = sys.argv[1], sys.argv[2], int(sys.argv[3]); os.makedirs(dst, exist_ok=True); f = 2.0 ** lv
 for a in 'xyz':
