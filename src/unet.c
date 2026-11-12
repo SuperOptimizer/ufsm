@@ -2846,6 +2846,7 @@ const float *unet_stage_out(unet *u, int k, shape5 *s) {
 /* UFSM_VIRTUAL_TOKENS=1 (dino-train with --attn-blocks 0): a net without the attention stage reports a zero token buffer of the bottleneck's
    shape (attn_reg + grid rows of its width), so the CLS paths run (on zeros) and their token gradients are dropped */
 static float *g_vtok; static size_t g_vtok_n;
+void unet_reset_statics(void) { g_vtok = nullptr; g_vtok_n = 0; }   /* (predict --boxes, between boxes: the buffer went back to nn_pool) */
 const float *unet_tokens(const unet *u, int *nseq, int *S, int *C, int *nreg) {
     if (!u->tbn && u->built && getenv("UFSM_VIRTUAL_TOKENS")) {
         const block *b = stage_out((unet *)u, u->cfg.nlev - 1); const size_t Sv = (size_t)b->ys.d * b->ys.h * b->ys.w + (size_t)u->cfg.attn_reg, n = Sv * b->ys.c;
