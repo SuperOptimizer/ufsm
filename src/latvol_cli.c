@@ -8,6 +8,7 @@
 #include "store.h"
 #include "sysinfo.h"
 #include "z3w.h"
+#include "zarr2.h"
 #include "zarr3.h"
 #include <math.h>
 #include <pthread.h>
@@ -24,8 +25,13 @@ static const char *opt(int argc, char **argv, const char *name, const char *dflt
 }
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (double)t.tv_sec + 1e-9 * (double)t.tv_nsec; }
 
+/* the source level: a zarr3 array of ours, or (--zarr2 1) the raw upstream zarr v2 array (unsharded: SH from --shard) */
+typedef struct { z3 *z; z2 *v2; int64_t shape[3]; int SH; } csrc;
+static int src_read(csrc *s, const int64_t o[3], const int64_t n[3], uint8_t *buf, int nth) { return s->z ? z3_read(s->z, o, n, buf, nth) : z2_read(s->v2, o, n, buf, nth); }
+static const char *src_error(const csrc *s) { return s->z ? z3_error() : z2_error(); }
+
 /* up to nmax mostly-material boxes of edge E on a 5^3 lattice over [lo, hi), nearest the centre first (a masked scan's corners are air) */
-static int sample_boxes(z3 *z, const int64_t lo[3], const int64_t hi[3], int E, int nmax, uint8_t **out, int nth) {
+static int sample_boxes(csrc *z, const int64_t lo[3], const int64_t hi[3], int E, int nmax, uint8_t **out, int nth) {
     int ord[125]; double dist[125]; int used = 0;
     for (int k = 0; k < 125; k++) { const int a = k / 25 - 2, b = k / 5 % 5 - 2, c = k % 5 - 2; ord[k] = k; dist[k] = a * a + b * b + c * c + 1e-3 * k; }
     for (int a = 1; a < 125; a++) for (int b = a; b > 0 && dist[ord[b]] < dist[ord[b - 1]]; b--) { const int t = ord[b]; ord[b] = ord[b - 1]; ord[b - 1] = t; }
@@ -36,8 +42,8 @@ static int sample_boxes(z3 *z, const int64_t lo[3], const int64_t hi[3], int E, 
         if (!ok) continue;
         int dup = 0; for (int p = 0; p < q; p++) { const int kp = ord[p]; int same = 1; for (int d = 0; d < 3; d++) { const int lp = d == 0 ? kp / 25 : d == 1 ? kp / 5 % 5 : kp % 5; int64_t op = lo[d] + (int64_t)((lp + 0.5) * (double)(hi[d] - lo[d]) / 5) / 128 * 128; if (op + E > hi[d]) op = (hi[d] - E) / 128 * 128; same &= op == o[d]; } dup |= same; }
         if (dup) continue;
-        if (z3_box_any(z, o, nn) != 1) continue;
-        if (z3_read(z, o, nn, ct, nth)) { free(ct); return -1; }
+        if (z->z && z3_box_any(z->z, o, nn) != 1) continue;
+        if (src_read(z, o, nn, ct, nth)) { free(ct); return -1; }
         size_t nzv = 0; for (size_t v = 0; v < ev; v += 7) nzv += ct[v] != 0;
         if (nzv * 7 < ev / 2) continue;
         out[used] = malloc(ev); if (!out[used]) break;
@@ -74,11 +80,18 @@ static void *enc_run(void *arg) {
 }
 
 static int encode_level(store *st, const char *group, const char *lname, const char *outg, const lat_basis *lb, int C, float step, double sd_opt, int nth, int gpu,
-                        const char *cache, int resume, const long long (*boxv)[6], int nbox, const char *tables, double *tot_bytes, double *tot_vox) {
+                        const char *cache, int resume, const long long (*boxv)[6], int nbox, const char *tables, double *tot_bytes, double *tot_vox, int v2, int shard_opt, double vq) {
     char key[1100], odir[1200], p[1400]; snprintf(key, sizeof key, "%s/%s", group, lname); snprintf(odir, sizeof odir, "%s/%s", outg, lname);
-    z3 *z = z3_open(st, key, cache); if (!z) { fprintf(stderr, "latvol: cannot open %s: %s\n", key, z3_error()); return 1; }
-    const z3_meta *m = z3_meta_of(z); const int SH = m->shard[0];
-    if (!m->sharded || m->shard[1] != SH || m->shard[2] != SH || SH % 128 || m->esize != 1) { fprintf(stderr, "latvol: %s: need a uint8 array in cubic shards of 128^3 chunks\n", key); return 1; }
+    csrc S = {0}, *z = &S; struct { int64_t shape[3]; } M, *m = &M;
+    if (v2) {
+        S.v2 = z2_open(st, key, cache); if (!S.v2) { fprintf(stderr, "latvol: cannot open %s: %s\n", key, z2_error()); return 1; }
+        z2_assume_present(S.v2, 1); for (int d = 0; d < 3; d++) M.shape[d] = z2_meta_of(S.v2)->shape[d]; S.SH = shard_opt;
+    } else {
+        S.z = z3_open(st, key, cache); if (!S.z) { fprintf(stderr, "latvol: cannot open %s: %s\n", key, z3_error()); return 1; }
+        const z3_meta *zm = z3_meta_of(S.z); S.SH = zm->shard[0]; for (int d = 0; d < 3; d++) M.shape[d] = zm->shape[d];
+        if (!zm->sharded || zm->shard[1] != S.SH || zm->shard[2] != S.SH || S.SH % 128 || zm->esize != 1) { fprintf(stderr, "latvol: %s: need a uint8 array in cubic shards of 128^3 chunks\n", key); return 1; }
+    }
+    const int SH = S.SH;
     /* the shards to write: all, or those the boxes touch (the array keeps the level's shape: a partial store is a partial mirror) */
     const int64_t gs[3] = {(m->shape[0] + SH - 1) / SH, (m->shape[1] + SH - 1) / SH, (m->shape[2] + SH - 1) / SH};
     uint8_t *want = malloc((size_t)(gs[0] * gs[1] * gs[2])); memset(want, nbox ? 0 : 1, (size_t)(gs[0] * gs[1] * gs[2]));
@@ -89,9 +102,10 @@ static int encode_level(store *st, const char *group, const char *lname, const c
     }
     const int64_t lo[3] = {0, 0, 0}, hi[3] = {m->shape[0], m->shape[1], m->shape[2]};   /* (the codec's sample: the whole level, whatever is written) */
     /* the step's sd_ref, the entropy tables and the rebuilt-CT error from sampled material boxes */
-    lv_codec lc; int have = 0;
+    lv_codec lc; int have = 0; const int vc = vq >= 0;   /* vc: plain volcomp at quality vq instead of latent cells (the rate ladder's other codec) */
     snprintf(p, sizeof p, "%s/latvol.bin", odir);
-    if (resume) {   /* an existing store's codec is kept as it is: its shards were written with it */
+    if (vc) have = 1;
+    else if (resume) {   /* an existing store's codec is kept as it is: its shards were written with it */
         FILE *f = fopen(p, "rb"); static uint8_t sb[1 << 17]; const size_t sn = f ? fread(sb, 1, sizeof sb, f) : 0; if (f) fclose(f);
         if (sn && !lv_codec_parse(&lc, sb, sn)) {
             if (lc.C != C || fabsf(lc.step - step) > 1e-6f * step) { fprintf(stderr, "latvol: --resume: %s has C %d step %g, asked C %d step %g\n", odir, lc.C, lc.step, C, step); return 2; }
@@ -101,7 +115,11 @@ static int encode_level(store *st, const char *group, const char *lname, const c
     }
     enum { E = 256, NS = 24 }; uint8_t *smp[NS]; const double t0 = now(); double hbits = 0;
     if (!have) {
-    const int ns = sample_boxes(z, lo, hi, E, NS, smp, nth);
+    int ns = 0;
+    if (nbox && atoi(getenv("UFSM_LATVOL_SAMPLE_BOXES") ? getenv("UFSM_LATVOL_SAMPLE_BOXES") : "0")) {   /* a partial source (only the boxes stored): the sample from the boxes themselves */
+        for (int b = 0; b < nbox && ns < NS; b++) { int64_t bl[3], bh[3]; for (int d = 0; d < 3; d++) { bl[d] = (boxv[b][d] < 0 ? 0 : boxv[b][d] + 127) / 128 * 128; bh[d] = boxv[b][d] + boxv[b][3 + d]; if (bh[d] > hi[d]) bh[d] = hi[d]; }
+            const int want_n = (NS - ns) < 1 + (NS + nbox - 1) / nbox ? NS - ns : 1 + (NS + nbox - 1) / nbox; const int got = sample_boxes(z, bl, bh, E, want_n, smp + ns, nth); if (got > 0) ns += got; }
+    } else ns = sample_boxes(z, lo, hi, E, NS, smp, nth);
     if (ns < 1) { fprintf(stderr, "latvol: %s: no mostly-material %d^3 box on the 5^3 lattice%s\n", key, E, ns < 0 ? " (read failed)" : ""); return 2; }
     double s1 = 0, s2 = 0, n = 0;
     for (int k = 0; k < ns; k++) for (size_t v = 0; v < (size_t)E * E * E; v += 3) { s1 += smp[k][v]; s2 += (double)smp[k][v] * smp[k][v]; n++; }
@@ -134,18 +152,19 @@ static int encode_level(store *st, const char *group, const char *lname, const c
     char codec[512], attrs[1024];
     snprintf(codec, sizeof codec, "{\"name\":\"latvol\",\"configuration\":{\"c\":%d,\"step_raw\":%.9g,\"side\":\"latvol.bin\"}}", C, lc.step_raw);
     snprintf(attrs, sizeof attrs, "{\"latvol\":{\"version\":1,\"c\":%d,\"step\":%.9g,\"sd_ref\":%.9g,\"step_raw\":%.9g,\"drop_ms\":%.6g,\"cell\":4,\"source\":\"%s\"}}", C, step, (double)lc.sd_ref, lc.step_raw, lc.drop_ms, key);
-    z3w *w = z3w_create_codec(odir, m->shape, SH, codec, 0, attrs); if (!w) { fprintf(stderr, "latvol: cannot create %s: %s\n", odir, z3w_error()); return 1; }
-    snprintf(p, sizeof p, "%s/latvol.bin", odir); if (!have && lv_codec_write(&lc, p)) { fprintf(stderr, "latvol: cannot write %s\n", p); return 1; }
+    if (vc) snprintf(attrs, sizeof attrs, "{\"recode\":{\"q\":%g,\"source\":\"%s\"}}", vq, key);
+    z3w *w = vc ? z3w_create(odir, m->shape, SH, (float)vq, 0, attrs) : z3w_create_codec(odir, m->shape, SH, codec, 0, attrs); if (!w) { fprintf(stderr, "latvol: cannot create %s: %s\n", odir, z3w_error()); return 1; }
+    snprintf(p, sizeof p, "%s/latvol.bin", odir); if (!vc && !have && lv_codec_write(&lc, p)) { fprintf(stderr, "latvol: cannot write %s\n", p); return 1; }
     /* shards */
     const int cg = SH / 128, nc = cg * cg * cg, cd = SH / 4; const size_t sv3 = (size_t)SH * SH * SH, ncell = (size_t)cd * cd * cd;
     uint8_t *ct = nullptr; int16_t *qh = nullptr; void *d_ct = nullptr, *d_q = nullptr; nn_lv *L = nullptr;
-    if (gpu >= 0) {
+    if (gpu >= 0 && !vc) {
         ct = nn_host_alloc(sv3); qh = nn_host_alloc(ncell * C * sizeof *qh); d_ct = nn_malloc(sv3); d_q = nn_malloc(ncell * C * sizeof *qh);
         L = nn_latvol_create(lc.dt, lc.ntab, lc.map, &lc.bi[0][0], C, lc.step_raw);
     } else ct = malloc(sv3);
-    if (!ct || (gpu >= 0 && (!qh || !L))) { fprintf(stderr, "latvol: allocation failed\n"); return 1; }
+    if (!ct || (gpu >= 0 && !vc && (!qh || !L))) { fprintf(stderr, "latvol: allocation failed\n"); return 1; }
     uint8_t **enc = calloc((size_t)nc, sizeof *enc); size_t *len = calloc((size_t)nc, sizeof *len); pthread_t *T = malloc((size_t)nth * sizeof *T);
-    double t_read = 0, t_fwd = 0, t_enc = 0, t_wr = 0, bytes = 0, vox = 0, nmat = 0; long nsh = 0, nskip = 0, ndone = 0;
+    double t_read = 0, t_fwd = 0, t_enc = 0, t_wr = 0, bytes = 0, vox = 0, nmat = 0, rvox = 0; long nsh = 0, nskip = 0, ndone = 0;
     const double tl = now();
     for (int64_t sz = 0; sz < gs[0]; sz++) for (int64_t sy = 0; sy < gs[1]; sy++) for (int64_t sx = 0; sx < gs[2]; sx++) {
         if (!want[(sz * gs[1] + sy) * gs[2] + sx]) continue;
@@ -154,17 +173,18 @@ static int encode_level(store *st, const char *group, const char *lname, const c
         double ev = 1; for (int d = 0; d < 3; d++) ev *= (double)((o[d] + SH > m->shape[d] ? m->shape[d] : o[d] + SH) - o[d]);
         vox += ev;
         if (resume) { struct stat sb; snprintf(p, sizeof p, "%s/c/%lld/%lld/%lld", odir, (long long)sz, (long long)sy, (long long)sx); if (!stat(p, &sb)) { bytes += (double)sb.st_size; nskip++; continue; } }
-        if (z3_shard_present(z, sz, sy, sx) != 1) continue;
+        if (S.z && z3_shard_present(S.z, sz, sy, sx) != 1) continue;
         double t1 = now();
-        if (!nbox) { if (z3_read(z, o, nn3, ct, nth)) { fprintf(stderr, "latvol: read failed: %s\n", z3_error()); return 1; } }
+        if (!nbox) { if (src_read(z, o, nn3, ct, nth)) { fprintf(stderr, "latvol: read failed: %s\n", src_error(z)); return 1; } rvox += ev; }
         else {   /* boxes: only the chunks under the boxes' bounding region in this shard are read and written (the rest of the shard: absent) */
             int64_t a[3] = {INT64_MAX, INT64_MAX, INT64_MAX}, e[3] = {INT64_MIN, INT64_MIN, INT64_MIN};
             for (int b = 0; b < nbox; b++) { int64_t ba[3], be[3]; int in = 1;
                 for (int d = 0; d < 3; d++) { ba[d] = boxv[b][d] > o[d] ? boxv[b][d] : o[d]; be[d] = boxv[b][d] + boxv[b][3 + d] < o[d] + SH ? boxv[b][d] + boxv[b][3 + d] : o[d] + SH; in &= be[d] > ba[d]; }
                 if (in) for (int d = 0; d < 3; d++) { if (ba[d] < a[d]) a[d] = ba[d]; if (be[d] > e[d]) e[d] = be[d]; } }
-            int64_t rn[3]; for (int d = 0; d < 3; d++) { a[d] = a[d] / 128 * 128; e[d] = (e[d] + 127) / 128 * 128; rn[d] = e[d] - a[d]; }
+            int64_t rn[3]; for (int d = 0; d < 3; d++) { a[d] = a[d] / 128 * 128; e[d] = (e[d] + 127) / 128 * 128; if (e[d] > (m->shape[d] + 127) / 128 * 128) e[d] = (m->shape[d] + 127) / 128 * 128; rn[d] = e[d] - a[d]; }
             uint8_t *rb = malloc((size_t)(rn[0] * rn[1] * rn[2]));
-            if (!rb || z3_read(z, a, rn, rb, nth)) { fprintf(stderr, "latvol: read failed: %s\n", z3_error()); return 1; }
+            if (!rb || src_read(z, a, rn, rb, nth)) { fprintf(stderr, "latvol: read failed: %s\n", src_error(z)); return 1; }
+            rvox += (double)rn[0] * (double)rn[1] * (double)rn[2];
             memset(ct, 0, sv3);
             for (int64_t zz = 0; zz < rn[0]; zz++) for (int64_t yy = 0; yy < rn[1]; yy++) memcpy(ct + ((size_t)(a[0] - o[0] + zz) * SH + (size_t)(a[1] - o[1] + yy)) * SH + (size_t)(a[2] - o[2]), rb + ((size_t)zz * rn[1] + yy) * rn[2], (size_t)rn[2]);
             free(rb);
@@ -172,6 +192,13 @@ static int encode_level(store *st, const char *group, const char *lname, const c
         double t2 = now(); t_read += t2 - t1;
         if (L) { nn_h2d(d_ct, ct, sv3); nn_latvol_forward(L, d_ct, cd, cd, cd, d_q); nn_d2h(qh, d_q, ncell * C * sizeof *qh); }
         double t3 = now(); t_fwd += t3 - t2;
+        if (vc) {
+            if (z3w_write_shard(w, sz, sy, sx, ct, nth)) { fprintf(stderr, "latvol: write failed: %s\n", z3w_error()); return 1; }
+            struct stat sb; snprintf(p, sizeof p, "%s/c/%lld/%lld/%lld", odir, (long long)sz, (long long)sy, (long long)sx); if (!stat(p, &sb)) bytes += (double)sb.st_size;
+            t_enc += now() - t3; ndone++;
+            fprintf(stderr, "\rvolcomp q %g: %s shard %ld (%ld written), %.2f GB, %.0f s", vq, lname, nsh, ndone, bytes / 1e9, now() - tl);
+            continue;
+        }
         enc_job J = {.lc = &lc, .ct = ct, .q = L ? qh : nullptr, .SH = SH, .enc = enc, .len = len};
         for (int t = 0; t < nth; t++) pthread_create(&T[t], nullptr, enc_run, &J);
         for (int t = 0; t < nth; t++) pthread_join(T[t], nullptr);
@@ -184,12 +211,14 @@ static int encode_level(store *st, const char *group, const char *lname, const c
     }
     const double wall = now() - tl;
     fprintf(stderr, "\n");
+    printf("rate: %s %s: %.0f bytes for %.0f source voxels read = %.6f bytes per voxel\n", vc ? "volcomp" : "latvol", odir, bytes, rvox, rvox > 0 ? bytes / rvox : 0);
+    if (vc) { printf("volcomp q %g: %s: %.3f GB, %.0f s: read %.0f, encode + write %.0f\n", vq, odir, bytes / 1e9, wall, t_read, t_enc); *tot_bytes += bytes; *tot_vox += vox; free(ct); free(enc); free(len); free(T); free(want); z3w_close(w); if (S.z) z3_close(S.z); else z2_close(S.v2); return 0; }
     printf("latvol: %s: %.3f GB for %.1f Gvox (%.4f bytes per voxel; %.1f%% material cells, %.4f B per material voxel of the %ld shards written); %.0f s: read %.0f, transform %.0f%s, entropy %.0f, write %.0f (%.2f Gvox/s of written shards)\n",
            odir, bytes / 1e9, vox / 1e9, vox > 0 ? bytes / vox : 0, ndone ? 100 * nmat * 64 / ((double)ndone * (double)sv3) : 0, nmat > 0 ? bytes / (nmat * 64) : 0, ndone, wall, t_read, t_fwd, L ? " (GPU)" : " (in the entropy threads)", t_enc, t_wr,
            wall > 0 ? (double)ndone * (double)sv3 / 1e9 / wall : 0);
     (void)hbits; *tot_bytes += bytes; *tot_vox += vox;
     if (L) { nn_latvol_free(L); nn_free(d_ct); nn_free(d_q); nn_host_free(ct); nn_host_free(qh); } else free(ct);
-    free(enc); free(len); free(T); free(want); lv_codec_free(&lc); z3w_close(w); z3_close(z);
+    free(enc); free(len); free(T); free(want); lv_codec_free(&lc); z3w_close(w); if (S.z) z3_close(S.z); else z2_close(S.v2);
     return 0;
 }
 
@@ -200,7 +229,10 @@ int cmd_latvol(int argc, char **argv) {
                                     "  level's sd, measured or --sd) in OUT-GROUP, a CT group in the same layout: train / predict read it as their CT (src/latvol.h).\n"
                                     "  --gpu -1: the transform on the CPU. --box / --boxes FILE: only the chunks under those boxes (per shard their bounding region; voxels of\n"
                                     "  the first --levels entry, other levels: scaled; give the boxes with the predict halo). --resume 1: shards already written are kept,\n"
-                                    "  with the store's own codec.\n"); return 2; }
+                                    "  with the store's own codec.\n"
+                                    "  --zarr2 1: ROOT / CT-GROUP is the raw upstream zarr v2 pyramid (written in shards of --shard 1024; the group's zarr.json from\n"
+                                    "  --group-from ROOT2, one of our roots holding the same group). --volcomp Q: plain volcomp at quality Q (0 lossless) instead of\n"
+                                    "  latent cells: the same boxes re-encoded for a rate ladder. Prints 'rate:' = bytes per source voxel read.\n"); return 2; }
     lat_basis *lb = malloc(sizeof *lb); if (lat_basis_load(argv[2], lb)) { fprintf(stderr, "latvol: cannot read the transform %s\n", argv[2]); return 1; }
     store *st = store_open(argv[3]); if (!st) { fprintf(stderr, "latvol: cannot open %s\n", argv[3]); return 1; }
     const char *group = argv[4], *outg = argv[5], *levels = opt(argc, argv, "--levels", nullptr), *cache = opt(argc, argv, "--cache", nullptr);
@@ -216,20 +248,23 @@ int cmd_latvol(int argc, char **argv) {
             if (sscanf(ln, "%lld %lld %lld %lld %lld %lld", bx[nbox], bx[nbox] + 1, bx[nbox] + 2, bx[nbox] + 3, bx[nbox] + 4, bx[nbox] + 5) == 6) nbox++; }
         fclose(bf); if (!nbox) { fprintf(stderr, "latvol: --boxes: no box read\n"); return 2; }
     }
+    const int v2 = atoi(opt(argc, argv, "--zarr2", "0")), shard_opt = atoi(opt(argc, argv, "--shard", "1024")); const double vq = atof(opt(argc, argv, "--volcomp", "-1"));
+    if (shard_opt < 128 || shard_opt % 128) { fprintf(stderr, "latvol: --shard: a multiple of 128\n"); return 2; }
     {   /* the group's metadata as it is (level names, voxel sizes) */
-        char gk[1100], cmd[1300], gp[1300]; snprintf(gk, sizeof gk, "%s/zarr.json", group); size_t gn = 0; uint8_t *gt = store_read_all(st, gk, &gn);
+        const char *gf = opt(argc, argv, "--group-from", nullptr); store *gs_ = gf ? store_open(gf) : st; if (!gs_) { fprintf(stderr, "latvol: cannot open %s\n", gf); return 1; }
+        char gk[1100], cmd[1300], gp[1300]; snprintf(gk, sizeof gk, "%s/zarr.json", group); size_t gn = 0; uint8_t *gt = store_read_all(gs_, gk, &gn);
         if (!gt) { fprintf(stderr, "latvol: cannot read %s\n", gk); return 1; }
         snprintf(cmd, sizeof cmd, "mkdir -p '%s'", outg); if (system(cmd)) return 1;
         snprintf(gp, sizeof gp, "%s/zarr.json", outg); FILE *f = fopen(gp, "wb"); if (!f || fwrite(gt, 1, gn, f) != gn || fclose(f)) { fprintf(stderr, "latvol: cannot write %s\n", gp); return 1; }
         free(gt);
     }
-    if (gpu >= 0) nn_init(gpu);
+    if (gpu >= 0 && vq < 0) nn_init(gpu);
     double tb = 0, tv = 0; int first = -1;
     char lv[256]; snprintf(lv, sizeof lv, "%s", levels);
     for (char *tok = strtok(lv, ","); tok; tok = strtok(nullptr, ",")) {
         const int L = atoi(tok); if (first < 0) first = L;
         for (int b = 0; b < nbox; b++) { const int sh = L - first; for (int i = 0; i < 6; i++) b2[b][i] = sh >= 0 ? (bx[b][i] + (i >= 3 ? (1ll << sh) - 1 : 0)) >> sh : bx[b][i] << -sh; }
-        const int rc = encode_level(st, group, tok, outg, lb, C, step, sd, nth, gpu, cache, resume, b2, nbox, opt(argc, argv, "--tables", nullptr), &tb, &tv);
+        const int rc = encode_level(st, group, tok, outg, lb, C, step, sd, nth, gpu, cache, resume, b2, nbox, opt(argc, argv, "--tables", nullptr), &tb, &tv, v2, shard_opt, vq);
         if (rc) return rc;
     }
     printf("latvol: %s: %.3f GB in all (%.4f bytes per voxel)\n", outg, tb / 1e9, tv > 0 ? tb / tv : 0);
