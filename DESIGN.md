@@ -6,6 +6,81 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Self-supervision for the latent net: what the 10-21..25 DINO work showed, the plan (2026-11-12, branch latdino-20261112)
+
+User (11-12): "revive the self supervised dino stuff for latent net". Plan only; no GPU run yet.
+
+**What the old work (dino-train, 10-21..25; branches dino / dino-wip / dino-wip2, all merged into master) showed.** Its run
+directories (/vesuvius/ufsm/dino, ~/ufsm-data/dino/runs) are gone, and no sheet-identity table (dinovol-eval, sslev.sh) was written
+down, so the numbers below come from commit messages only:
+- It was a separate network and trainer (a 6-level hybrid conv + attention U-Net, D 16-64 unit embeddings, `--recipe 1` = the
+  upstream dinovol multi-crop DINO + iBOT with 32768 prototypes). It was never connected to a winding net and never measured on
+  wbench. Its only downstream use, `fit --emb` (votes from the embedding in the slip repair), was measured on a synthetic spiral
+  only (0.9707 -> 1.0000 ids).
+- It was unstable. The iBOT token norm ran away (|mean| 60) and the student collapsed (fix: a parameter-free LayerNorm). Then came
+  a stack of anti-collapse terms: a token variance hinge (`--ssl-ibot-zvar 10`), mean-prototype removal, a learnable logit scale,
+  SIGReg, and an embedding spread hinge (`--var 30`). DESIGN notes that SupCon collapse is a stationary point.
+- It was slow on the desk: the 4-level gate net took 10.5 s/step at P384.
+- The pseudo-label SupCon contradicted itself. The wind96 pseudo codes are gauge-consistent per ~128^3 (0.83-0.94) but only 0.64
+  box-wide, so P512 windows got contradictory long-range pairs, and the desk full run's GT SupCon loss stayed flat at 8.1 (the fix
+  was a pair radius and a radial limit). On 10-24 full.sh turned DINO / iBOT / the SSL batch off by default ("DINO / SSL nixed"):
+  pseudo labels + GT SupCon only. On 10-25 the work moved on to selftrain (stored-phase pseudo labels) and `train --distill`
+  (dinovol PCA-64 targets). From 11-09 the latent net replaced all of it.
+- So SSL was never shown to help or to hurt a winding net. It stalled on collapse and speed in a separate network, before the
+  question was asked.
+
+**Recommendation: (b), an auxiliary masked self-distillation term inside the latent trainer on unlabelled windows.**
+- u1 learns from 5 scans (Paris 4, 0139, 0500P2, 1667; 8 sources). /vesuvius/ufsm/v2/ct holds 34. Under (b) the trunk sees every
+  scroll, at no cost to the production schedule, and the supervised heads anchor the trunk against collapse (the 10-23 failure was
+  SSL alone).
+- (a), SSL pretraining and then a finetune, needs a separate multi-day run of both desk GPUs, which we do not have. Literature and
+  our own history agree that SSL pretraining gains shrink once the supervised finetune is long (u1: 16k steps).
+- (c), SupCon on labelled voxels, uses no unlabelled CT. The wind4 head is already a gauge-free sheet-identity loss on the same
+  voxels, and SupCon is where the pseudo-pair contradictions came from.
+
+**Loss (data2vec / iBOT in the latent cell grid).**
+- Two views of one CT window, with the same geometry (cells align one to one, so no crop -> source mapping). They differ in the
+  GPU appearance augmentation (ct / scan augment seeds) and the latc quantisation step (the `--lat-step-jitter` range, i.e.
+  invariance to the 20x compression standard).
+- The teacher is the EMA weights (`unet_use_ema`) running a forward pass on view A.
+- The student sees view B with a share r of the latent input cells masked in 2^3-cell blocks (latc channels zeroed; the radial
+  channels kept).
+- The target is a 1^3 side head of D 16 channels on decoder level 1 (76.8 um cells, width 128), i.e. the existing distillation
+  head (`cfg.emb_lev / emb_ch`, `side_head_bwd`). The teacher's outputs are unit-normalised and quantised to int8 x 127.
+- The loss is `nn_distill_loss`'s cosine on the masked cells only (int8 zero = no target, already the convention), plus `dn_varreg`
+  (the variance hinge from nn_dino.cu) on a 64k-cell sample of the student's head outputs.
+- The full-resolution head slabs and label streams are skipped on these windows, and the task heads get no gradient from them.
+- The fine stem does not reach level 1, so the voxel path cannot leak masked cells.
+
+**Code.**
+- Sources take `"ssl": 1` (CT only, no targets; `holdout_reject` for the wbench boxes).
+- New train flags: `--ssl D --ssl-level 1 --ssl-share S --ssl-mask r --ssl-weight w --ssl-var g`.
+- One new kernel: the cell-block mask.
+- The distillation head's half-res refusal is lifted for --ssl, and --distill with --ssl is refused.
+- Header key "ssl" only when on, and the side head's parameters are appended last.
+- With --ssl 0 every path is the old one (test_heads reference losses).
+- Tests: test_ssl (mask kernel vs host; teacher target quantisation; cosine + varreg gradient vs double central differences;
+  fixture run with an ssl source: finite, header, resume).
+
+**Cost.**
+- Memory, P 1024: about 0.3 GB more (fp32 head outputs and gradient, int8 targets, 2.1 M level-1 cells). The head outputs are fp32
+  as in --distill: the variance hinge needs exact statistics, and the buffers are small.
+- Compute, one SSL window: a teacher forward plus a student forward and backward with no full-resolution head slabs. Estimate
+  ~0.5-0.7 of a labelled window on the GPU and ~1/3 on the loader (no phase / wind4 builds).
+- At share 0.25 the expected wall cost is within +-10% (to be measured; u1 runs 0.42 windows/s on both GPUs).
+
+**Experiment.**
+- Two finetunes from u1 snap/16000, P 1024, one GPU each, the same seed / sources / LR, matched on labelled windows (2000):
+  A control; B `--ssl 16 --ssl-share 0.25 --ssl-mask 0.4 --ssl-weight 0.5 --ssl-var 1`.
+- Unlabelled pool: every scan in v2/ct except the wbench boxes and PHerc0175A, which is held out of SSL as the strictly unseen
+  control. PHerc1299 is in the pool: transductive, as in a production unroll.
+- About 2.7 h of both desk GPUs.
+- Metrics:
+  - wbench core p05x / ids as a non-regression gate. Noise floor (fibnote 11-11): ~0.01 p05x, ~0.02-0.03 ids. Expected effect
+    there: 0 to +0.01, since those scrolls are the labelled ones.
+  - The fibre judge (persistent sheet changes per m) on PHerc1299 and PHerc0175A tiles, where an effect, if any, should show.
+  - Robustness: p05x on 20x-compressed input.
+
 ## The human ink targets on the fly, the derived-array chunk cache, and the villa ink recipe (2026-11-11, branch inkfly-20261111)
 
 **On the fly.** The stored splats of the section below (inkgt/gt) are now only the reference. Training reads the same bytes from a
