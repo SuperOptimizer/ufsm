@@ -6,6 +6,70 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## The MIL ink loss in training, and the U2 ink smoke (2026-11-12, branch inkwire-20261112)
+
+`train --ink-mil R` (with `--ink-head 1`; default off) adds the normal-pooled MIL ink loss (villa's recipe, kernels: the slab form
+below, `nn_inkmil.cu`) to the ink head. It covers the labelled pixels the splatted plane cannot: with `--ink-mil-mode 1` (the
+default) the pixels whose open face the face search misses (31% of 1667's, 42% of Paris 4's). Mode 0 uses every supervised pixel.
+
+- **Sampler.** `inkfly_rays_lev` (the window's level; the target may be finer) gives the window's rays from the source's onfly ink
+  handle. `sample.c mil_rays` then maps each point through the symmetry and the warp's forward map (`spatial_aug_forward`, as the
+  axis records do). The normal becomes the image of p + n, renormalised. Rays leaving the window are dropped; above
+  `--ink-mil-cap` (32768) every k-th ray is kept. Redrawn windows (crushed / torn / delaminated / re-bent) and replays get no rays,
+  because their ink plane is unknown or re-symmetrised.
+- **The head slabs** (`head_slab_pass`, window 0 of the batch):
+  - pass 0: H2D of the rays, then `ink_mil_fwd_slab` per slab on the fp16 slab logits;
+  - after the slabs: `ink_mil_fin` with `--ink-smooth` as eps, scale `--ink-mil-lambda / rays`, tau `--ink-mil-tau` (0 = hard max);
+  - pass 1: `ink_mil_bwd_slab` adds into the slab gradient after the ink BCE gradient, times the source's ink weight x head weight
+    and the losses' fp16 gradient scale (new `gs` argument; `nn_loss_grad_fmt` reports the gradient format);
+  - the latent head stream (`--lat`) takes it through its slab adjoint unchanged.
+- **Logging and dice.** The step line shows `ink mil L (x% of windows, n rays)`. The pass records its ray count (`mil_used`)
+  because `select_buf` has moved `d->cur` on by the time `fetch_loss` runs (the first version logged the next batch's count).
+  `--ink-dice` now works with the ink head of `--task unwrap2`; both the gradient and the logged loss take it.
+- **The old path is unchanged with the flag off.** test_heads: 7 of 7 old layouts log the reference losses (RTX 5060 Ti).
+  test_unwrap2_ink, test_ink_splat, test_ink_mil, test_wind_sampler and test_unwrap2_sampler pass.
+- **test_ink_mil_train** (new, gpu, ~70 s): the spiral fixture plus one tifxyz segment on a papyrus sheet (blob labels), as an onfly
+  ink target. Five 6-step runs: plain twice under `--det 1`, warped with host label warps, warped with device label warps
+  (`--gpu-aug 2`), and latent (`--lat 4 --lat-guide 3`). `UFSM_MIL_CHECK=1` checks:
+  - loss: the device loss equals `ink_mil_loss_host` on the same fp16 logits, worst relative 2e-8 over 12 windows;
+  - gradient: the slab gradient bwd_slab adds (after minus before, 16-bit) equals the host gradient within one 16-bit ulp
+    (excess 9e-8 of the max). The host reference is central-difference tested in test_ink_mil, so this is the
+    central-difference check through head_slab_pass at the logits;
+  - determinism: the two `--det 1` runs log identical loss terms;
+  - geometry: the rays read against the window's own (warped) ink plane: 3594 of 3639 meet known ink, and 3583 of those agree
+    with the ray's label (4 of 8 windows warped).
+- **Real data, sampler only** (`UFSM_SAMPLER_ONLY`, the 8 scans at level 0, P 384, mode 0, rotation + elastic): 138283 of 270555
+  rays meet known ink along +-3 voxels, and 99.8% of those agree with the label. About half meet none because the face band
+  [-6, 0] sits off the mesh, or there is no face. Under `--rv` the batch's ink plane is papyrus and the ink target is an aux
+  plane. The first check read the papyrus plane and showed 36% agreement; the check now reads the ink target's plane.
+- **Fix.** An onfly `"cache_dir": "off"` used to create a directory named `off`; it now means no disk cache.
+
+**The U2 ink config.**
+- `scripts/inkgt/mksources_u2ink.py` writes the 8 scans' onfly human-ink sources:
+  - onfly level 0 (2.4 um), pooled level 1 (4.8 um), min / max level 0 / 1;
+  - `"validation": "exclude"` (the segments' validation rasters once addval.py has run on the live lists);
+  - the ink head only; the weights of sources-inkfly.json;
+  - `ROOT=` rewrites every path for a pod; the segment lists, holdouts and desk axis files are copied next to the output.
+- `scripts/univ/pod_pack.sh INK=1` stages the inputs: inkgt hf + od (2.7 GB), evgt, evcrops and the Paris 4 eval crops.
+- The 8 sources' onfly memory caches default to 2048 MB each. Together with 10 P 512 slots that broke the 40 GB dev cap;
+  `CACHE_MB` sets the per-source cache (768 MB for the pod).
+
+**The smoke.** `scripts/univ/u2ink_smoke.sh [A B]`:
+- ink-only windows, `--init-from` a u1 snapshot (the trunk and the rv / winding rows; the ink row fresh at bias -1);
+- u1's recipe (u1.train.sh, its latent flags) with `--um-rungs 2.4,4.8`, STEPS 400, a checkpoint every 200 steps;
+- arm A: BCE + `--ink-smooth 0.1 --ink-dice 0.25`; arm B: A + `--ink-mil 3` (mode 1);
+- each snapshot is scored by `scripts/inkgt/baseline.sh ckpt:...:<ink channel>`: 3-D AUC per scan against the teacher ink3dext's
+  0.727 (Paris 4) / 0.651 (0139) / 0.561 (1667), CT floor 0.513.
+
+baseline.sh's checkpoint path had never run (the teacher went through ink3d-ext). It passed the level-0 box to `predict --level 1`,
+which reads the box in level-1 voxels, so every shard was air. It now passes the level-1 box with `--full-grid 1`. On 1667 w013_0
+it writes 18 tiles in 64 s and scores AUC 0.500 after 30 warmup steps. The 2-D render score of that crop wrote 0 wraps (not
+investigated; the 3-D score is the gate).
+
+Desk dry run (arm B, P 256, 30 steps, GPU 1 beside u1): the u1 8000 snapshot loads with the ink row fresh. Ink bce goes
+0.80 -> 0.55 and mil 0.92 -> 0.25 inside the warmup, with 30-40% of windows carrying 15-23 k rays. The real smoke (P 896, 400
+steps per arm) is for the pod.
+
 ## The human ink targets on the fly, the derived-array chunk cache, and the villa ink recipe (2026-11-11, branch inkfly-20261111)
 
 **On the fly.** The stored splats of the section below (inkgt/gt) are now only the reference. Training reads the same bytes from a
