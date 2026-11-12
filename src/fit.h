@@ -353,6 +353,8 @@ void fit_set_dev_free(fit_set_dev *g);
 /* W (with_theta: U) of the set on the grid of n[0] x n[1] x n[2] points at box-local native (o + (i + 0.5) step) per axis, into the
    host float array out (row-major); evaluated on the GPU in z-row batches. Matches fit_set_W up to float rounding. */
 int fit_set_grid(fit_set_dev *g, const fit_set *s, const double o[3], const int64_t n[3], double step, int with_theta, float *out);
+/* the same grid left on the device: g's own buffer (valid until g's next grid call; the same values; null: no device memory) */
+const float *fit_set_grid_dev(fit_set_dev *g, const fit_set *s, const double o[3], const int64_t n[3], double step, int with_theta);
 /* the same with the mask built on the GPU from the codes: fit_set_label_mask uploads n[0] x n[1] x n[2] codes (best pinned), builds the
    mask (nn_fit_label_mask) and returns the labelled count (ustart: the counts before the voxel indices starts[0..nst), nst <= 64),
    or (size_t)-1 without device memory; fit_set_grid_masked then evaluates the set at those nlab points into out (host, packed in
@@ -420,3 +422,9 @@ double fit_ct_cal_k(const fit_ct_cal *c, double z, double dy, double dx);   /* k
 int fit_phase_gate_gpu(uint8_t *pc, uint8_t *ps, const uint8_t *t1, const uint8_t *t2, const uint8_t *t5, const uint8_t *sp, const uint8_t *w,
                        int nz, int H, int W, double h, const float *ay, const float *ax, const float *wref, int mode, int R, double lo, double hi, double rc, double st[4],
                        int oy, int ox);   /* (oy, ox: a material crop's cell offset in the box, fit_fields oy ox; 0 0 none) */
+/* the same with W_ref already on the device (fit_set_grid_dev; nz x H x W) and the scratch kept for the next block (fit_phase_gate_gpu_done
+   frees it) */
+int fit_phase_gate_gpu_dw(uint8_t *pc, uint8_t *ps, const uint8_t *t1, const uint8_t *t2, const uint8_t *t5, const uint8_t *sp, const uint8_t *w,
+                          int nz, int H, int W, double h, const float *ay, const float *ax, const float *dwref, int mode, int R, double lo, double hi, double rc, double st[4],
+                          int oy, int ox);
+void fit_phase_gate_gpu_done(void);

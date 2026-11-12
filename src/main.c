@@ -1789,15 +1789,19 @@ static int cmd_fit(int argc, char **argv) {
             for (int z0 = 0; z0 < D && !bad; z0 += GZ) {
                 const int nz = z0 + GZ <= D ? GZ : D - z0; const size_t off = (size_t)z0 * plane;
                 const double o3[3] = {z0 * fb.h + c.ref_off[0], c.ref_off[1] + fb.f.oy * fb.h, c.ref_off[2] + fb.f.ox * fb.h}; const int64_t n3[3] = {nz, H, W};   /* (a crop: its cells' box positions) */
-                if (gd ? fit_set_grid(gd, refm, o3, n3, fb.h, 0, wr) : fit_set_grid_cpu(refm, o3, n3, fb.h, 0, nullptr, wr)) {   /* (no device room for the ref: its grid on the CPU) */ fprintf(stderr, "fit: phase gate: no device memory for the W_ref grid: the CPU pass from row %d\n", z0); gpug = 0; zc = z0; zcpu = 1; break; }
+                /* W_ref left on the device (fit_set_grid_dev: no round trip through the host; UFSM_PG_HOSTW=1 or no room: via the host as before) */
+                const float *dwr = gd && !ufsm_env_on("UFSM_PG_HOSTW") ? fit_set_grid_dev(gd, refm, o3, n3, fb.h, 0) : nullptr;
+                if (!dwr && (gd ? fit_set_grid(gd, refm, o3, n3, fb.h, 0, wr) : fit_set_grid_cpu(refm, o3, n3, fb.h, 0, nullptr, wr))) {   /* (no device room for the ref: its grid on the CPU) */ fprintf(stderr, "fit: phase gate: no device memory for the W_ref grid: the CPU pass from row %d\n", z0); gpug = 0; zc = z0; zcpu = 1; break; }
                 for (int z = 0; z < nz; z++) { const double pz = (z0 + z + 0.5) * fb.h; const int i0 = (int)fmin(fmax(floor(pz), 0), na - 1), i1 = i0 + 1 < na ? i0 + 1 : i0; const double t = fmin(fmax(pz - i0, 0), 1);
                     ay[z] = (float)(fb.f.cy[i0] + t * (fb.f.cy[i1] - fb.f.cy[i0])); ax[z] = (float)(fb.f.cx[i0] + t * (fb.f.cx[i1] - fb.f.cx[i0])); }
                 uint8_t *dp = fst.dfield;
-                if (fit_phase_gate_gpu(dp + off, dp + n + off, dp + 3 * n + off, dp + 4 * n + off, dp + 7 * n + off, dp + 8 * n + off, dp + 9 * n + off, nz, H, W, fb.h, ay, ax, wr,
-                                       pg.mode, pg.R, pg.lo, pg.hi, pg.rc, st, fb.f.oy, fb.f.ox)) { fprintf(stderr, "fit: phase gate: no device memory for a block: the CPU pass from row %d\n", z0); gpug = 0; zc = z0; zcpu = 1; break; }
+                if ((dwr ? fit_phase_gate_gpu_dw(dp + off, dp + n + off, dp + 3 * n + off, dp + 4 * n + off, dp + 7 * n + off, dp + 8 * n + off, dp + 9 * n + off, nz, H, W, fb.h, ay, ax, dwr,
+                                                 pg.mode, pg.R, pg.lo, pg.hi, pg.rc, st, fb.f.oy, fb.f.ox)
+                         : fit_phase_gate_gpu(dp + off, dp + n + off, dp + 3 * n + off, dp + 4 * n + off, dp + 7 * n + off, dp + 8 * n + off, dp + 9 * n + off, nz, H, W, fb.h, ay, ax, wr,
+                                              pg.mode, pg.R, pg.lo, pg.hi, pg.rc, st, fb.f.oy, fb.f.ox))) { fprintf(stderr, "fit: phase gate: no device memory for a block: the CPU pass from row %d\n", z0); gpug = 0; zc = z0; zcpu = 1; break; }
                 nn_d2h(fb.a[0] + off, dp + off, (size_t)nz * plane); nn_d2h(fb.a[1] + off, dp + n + off, (size_t)nz * plane);
             }
-            free(wr); free(ay); free(ax);
+            free(wr); free(ay); free(ax); fit_phase_gate_gpu_done();   /* (the blocks' kept scratch) */
         }
         for (int z0 = zc; z0 < D && !bad && !gpug; z0 += BZ) {
             const int nz = z0 + BZ <= D ? BZ : D - z0; const size_t off = (size_t)z0 * plane;

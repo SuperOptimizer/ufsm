@@ -81,34 +81,60 @@ __global__ void k_pg_gate(pg_dev P, const float *a2, const float *b2, const floa
     if (lm) atomicAdd(&cnt[0], lm); if (lg) atomicAdd(&cnt[1], lg); if (lq) { atomicAdd(&cnt[2], lq); atomicAdd(qs, lqs); }
 }
 
-/* one block of nz field rows: device planes (pc ps t1 t2 t5 sp w at the block's first row; pc / ps rewritten in place), host W_ref
-   (nz x H x W), the axis per row (host, box-local native). st += {material, gated, sum q, n q}. Returns 0 / -1. */
-extern "C" int fit_phase_gate_gpu(uint8_t *pc, uint8_t *ps, const uint8_t *t1, const uint8_t *t2, const uint8_t *t5, const uint8_t *sp, const uint8_t *w,
-                                  int nz, int H, int W, double h, const float *ay, const float *ax, const float *wref, int mode, int R, double lo, double hi, double rconf, double st[4],
-                                  int oy, int ox) {
+/* one block of nz field rows: device planes (pc ps t1 t2 t5 sp w at the block's first row; pc / ps rewritten in place), W_ref (nz x H x W:
+   host, or the device with wdev: fit_phase_gate_gpu_dw), the axis per row (host, box-local native). st += {material, gated, sum q, n q}.
+   keep: the scratch stays for the next block (fit_phase_gate_gpu_done). Returns 0 / -1. */
+static float *g_pg_b4, *g_pg_dw, *g_pg_dax; static uint8_t *g_pg_o2; static unsigned long long *g_pg_cnt; static double *g_pg_qs; static size_t g_pg_n; static int g_pg_nz;
+extern "C" void fit_phase_gate_gpu_done(void) {
+    cudaFree(g_pg_b4); cudaFree(g_pg_dw); cudaFree(g_pg_o2); cudaFree(g_pg_dax); cudaFree(g_pg_cnt); cudaFree(g_pg_qs);
+    g_pg_b4 = g_pg_dw = g_pg_dax = nullptr; g_pg_o2 = nullptr; g_pg_cnt = nullptr; g_pg_qs = nullptr; g_pg_n = 0; g_pg_nz = 0;
+}
+static int pg_run(uint8_t *pc, uint8_t *ps, const uint8_t *t1, const uint8_t *t2, const uint8_t *t5, const uint8_t *sp, const uint8_t *w,
+                  int nz, int H, int W, double h, const float *ay, const float *ax, const float *wref, int wdev, int mode, int R, double lo, double hi, double rconf, double st[4],
+                  int oy, int ox, int keep) {
     int rc = 0;
     const size_t n = (size_t)nz * H * W;
-    float *b4 = nullptr, *dw = nullptr, *dax = nullptr; uint8_t *o2 = nullptr; unsigned long long *cnt = nullptr; double *qs = nullptr;
     unsigned long long hc[3] = {0, 0, 0}; double hq = 0;
     pg_dev P = {pc, ps, t1, t2, t5, sp, w, nz, H, W, R, mode, (float)h, nullptr, nullptr, nullptr, oy, ox};
     const int TB = 256; int nb = (int)((n + TB - 1) / TB); if (nb > 65535 * 8) nb = 65535 * 8;
     if (pg_tab()) return -1;
     P.tab = g_pgtab;
-    PG_CK(cudaMalloc(&b4, 4 * n * sizeof(float))); PG_CK(cudaMalloc(&dw, n * sizeof(float))); PG_CK(cudaMalloc(&o2, 2 * n));
-    PG_CK(cudaMalloc(&dax, 2 * nz * sizeof(float))); PG_CK(cudaMalloc(&cnt, 3 * sizeof(unsigned long long))); PG_CK(cudaMalloc(&qs, sizeof(double)));
-    PG_CK(cudaMemcpy(dw, wref, n * sizeof(float), cudaMemcpyHostToDevice));
-    PG_CK(cudaMemcpy(dax, ay, nz * sizeof(float), cudaMemcpyHostToDevice)); PG_CK(cudaMemcpy(dax + nz, ax, nz * sizeof(float), cudaMemcpyHostToDevice));
-    PG_CK(cudaMemset(cnt, 0, 3 * sizeof(unsigned long long))); PG_CK(cudaMemset(qs, 0, sizeof(double)));
-    P.ay = dax; P.ax = dax + nz;
-    k_pg_rates<<<nb, TB>>>(P, b4, b4 + n);
-    k_pg_boxx<<<nb, TB>>>(P, b4, b4 + n, b4 + 2 * n, b4 + 3 * n);
-    k_pg_gate<<<nb, TB>>>(P, b4 + 2 * n, b4 + 3 * n, dw, o2, o2 + n, (float)lo, (float)hi, (float)rconf, cnt, qs);
-    PG_CK(cudaGetLastError());
-    PG_CK(cudaMemcpy(pc, o2, n, cudaMemcpyDeviceToDevice)); PG_CK(cudaMemcpy(ps, o2 + n, n, cudaMemcpyDeviceToDevice));
-    PG_CK(cudaMemcpy(hc, cnt, sizeof hc, cudaMemcpyDeviceToHost)); PG_CK(cudaMemcpy(&hq, qs, sizeof hq, cudaMemcpyDeviceToHost));
-    st[0] += (double)hc[0]; st[1] += (double)hc[1]; st[2] += hq; st[3] += (double)hc[2];
+    if (g_pg_n < n || (!wdev && !g_pg_dw)) {   /* (grow-only scratch) */
+        const size_t m = n > g_pg_n ? n : g_pg_n;
+        cudaFree(g_pg_b4); cudaFree(g_pg_dw); cudaFree(g_pg_o2); g_pg_b4 = g_pg_dw = nullptr; g_pg_o2 = nullptr; g_pg_n = 0;
+        PG_CK(cudaMalloc(&g_pg_b4, 4 * m * sizeof(float))); PG_CK(cudaMalloc(&g_pg_o2, 2 * m)); if (!wdev) PG_CK(cudaMalloc(&g_pg_dw, m * sizeof(float)));
+        g_pg_n = m;
+    }
+    if (g_pg_nz < nz) { cudaFree(g_pg_dax); g_pg_dax = nullptr; g_pg_nz = 0; PG_CK(cudaMalloc(&g_pg_dax, 2 * nz * sizeof(float))); g_pg_nz = nz; }
+    if (!g_pg_cnt) PG_CK(cudaMalloc(&g_pg_cnt, 3 * sizeof(unsigned long long)));
+    if (!g_pg_qs) PG_CK(cudaMalloc(&g_pg_qs, sizeof(double)));
+    {
+        float *b4 = g_pg_b4, *dax = g_pg_dax; uint8_t *o2 = g_pg_o2; unsigned long long *cnt = g_pg_cnt; double *qs = g_pg_qs;
+        const float *dw = wdev ? wref : g_pg_dw;
+        if (!wdev) PG_CK(cudaMemcpy(g_pg_dw, wref, n * sizeof(float), cudaMemcpyHostToDevice));
+        PG_CK(cudaMemcpy(dax, ay, nz * sizeof(float), cudaMemcpyHostToDevice)); PG_CK(cudaMemcpy(dax + nz, ax, nz * sizeof(float), cudaMemcpyHostToDevice));
+        PG_CK(cudaMemset(cnt, 0, 3 * sizeof(unsigned long long))); PG_CK(cudaMemset(qs, 0, sizeof(double)));
+        P.ay = dax; P.ax = dax + nz;
+        k_pg_rates<<<nb, TB>>>(P, b4, b4 + n);
+        k_pg_boxx<<<nb, TB>>>(P, b4, b4 + n, b4 + 2 * n, b4 + 3 * n);
+        k_pg_gate<<<nb, TB>>>(P, b4 + 2 * n, b4 + 3 * n, dw, o2, o2 + n, (float)lo, (float)hi, (float)rconf, cnt, qs);
+        PG_CK(cudaGetLastError());
+        PG_CK(cudaMemcpy(pc, o2, n, cudaMemcpyDeviceToDevice)); PG_CK(cudaMemcpy(ps, o2 + n, n, cudaMemcpyDeviceToDevice));
+        PG_CK(cudaMemcpy(hc, cnt, sizeof hc, cudaMemcpyDeviceToHost)); PG_CK(cudaMemcpy(&hq, qs, sizeof hq, cudaMemcpyDeviceToHost));
+        st[0] += (double)hc[0]; st[1] += (double)hc[1]; st[2] += hq; st[3] += (double)hc[2];
+    }
 done:
-    cudaFree(b4); cudaFree(dw); cudaFree(o2); cudaFree(dax); cudaFree(cnt); cudaFree(qs);
     if (rc) cudaGetLastError();
+    if (rc || !keep) fit_phase_gate_gpu_done();
     return rc;
+}
+extern "C" int fit_phase_gate_gpu(uint8_t *pc, uint8_t *ps, const uint8_t *t1, const uint8_t *t2, const uint8_t *t5, const uint8_t *sp, const uint8_t *w,
+                                  int nz, int H, int W, double h, const float *ay, const float *ax, const float *wref, int mode, int R, double lo, double hi, double rconf, double st[4],
+                                  int oy, int ox) {
+    return pg_run(pc, ps, t1, t2, t5, sp, w, nz, H, W, h, ay, ax, wref, 0, mode, R, lo, hi, rconf, st, oy, ox, 0);
+}
+extern "C" int fit_phase_gate_gpu_dw(uint8_t *pc, uint8_t *ps, const uint8_t *t1, const uint8_t *t2, const uint8_t *t5, const uint8_t *sp, const uint8_t *w,
+                                     int nz, int H, int W, double h, const float *ay, const float *ax, const float *dwref, int mode, int R, double lo, double hi, double rconf, double st[4],
+                                     int oy, int ox) {
+    return pg_run(pc, ps, t1, t2, t5, sp, w, nz, H, W, h, ay, ax, dwref, 1, mode, R, lo, hi, rconf, st, oy, ox, 1);
 }

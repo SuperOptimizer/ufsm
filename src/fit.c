@@ -3085,6 +3085,16 @@ int fit_set_grid(fit_set_dev *g, const fit_set *s, const double o[3], const int6
     return 0;
 }
 
+const float *fit_set_grid_dev(fit_set_dev *g, const fit_set *s, const double o[3], const int64_t n[3], double step, int with_theta) {   /* (src/fit.h) */
+    const size_t per = (size_t)n[1] * n[2], tot = per * (size_t)(n[0] > 0 ? n[0] : 0); if (!tot) return nullptr;
+    if (g->outn < tot) { if (g->out) nn_free(g->out); g->out = nullptr; g->outn = 0; if (!(g->out = nn_malloc_try(tot * 4))) return nullptr; g->outn = tot; }
+    if (g->nrows < n[0]) { if (g->rows) nn_free(g->rows); g->nrows = 0; if (!(g->rows = nn_malloc_try(n[0] * sizeof(fit_grid_row)))) return nullptr; g->nrows = (int)n[0]; }
+    fit_grid_row *hr = malloc(n[0] * sizeof *hr); if (!hr) return nullptr;
+    for (int64_t a = 0; a < n[0]; a++) hr[a] = set_row(s, o[0] + ((double)a + 0.5) * step);   /* (fit_set_grid's rows: z0 + a there) */
+    nn_h2d(g->rows, hr, n[0] * sizeof *hr); free(hr);
+    nn_fit_grid(g->dm, g->rows, (int)n[0], (int)n[1], (int)n[2], (float)(o[1]), (float)(o[2]), (float)step, with_theta, g->out);
+    return g->out;
+}
 static int sparse_bufs(fit_set_dev *g, size_t nw) {
     if (g->snw >= nw) return 0;
     if (g->smask) nn_free(g->smask);
