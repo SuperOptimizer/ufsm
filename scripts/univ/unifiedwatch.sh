@@ -25,6 +25,10 @@ perfopen() { local f; for f in $US/perf*.go; do [ -e "$f" ] && [ ! -e "${f%.go}.
 # taken after the checks pass, then the GPU re-checked (someone may have started in between): gpulock / gpuunlock around each job
 gpulock() { while :; do gpu0free; exec 8> ${BLK:-/tmp/gpu0-bench.lock}; flock 8; gpu0busy || return 0; flock -u 8; exec 8>&-; sleep 30; done; }
 gpuunlock() { flock -u 8 2>/dev/null; exec 8>&- 2>/dev/null; }
+# inkB first (lead 2026-11-12, run5): the locks are taken per ink crop / per wbench box and released in between; a piece starts only
+# while no other process holds or waits for the bench lock (inkB's runner: flock /tmp/gpu0-bench.lock CMD)
+yieldgpu() { while pgrep -f '^flock /tmp/gpu0-bench.lock' > /dev/null; do sleep 60; done; exec 9> $E/gpu0.lock; flock 9; gpulock; }
+release() { gpuunlock; flock -u 9 2>/dev/null; exec 9>&- 2>/dev/null; }
 gpu0free() { until [ -e $US/p4rv.done ] && [ -e $US/perf2.done ] && [ -e $US/p4col.done ] && ! pgrep -f "$US/(rvside|p4rv|p1299|unrollperf)|unrollperf" > /dev/null \
     && ! perfopen && ! gpu0busy && sleep 30 && ! gpu0busy; do sleep 60; done; }
 log() { echo "$(date '+%m-%d %H:%M:%S') $*" | tee -a $LG; }
@@ -35,9 +39,11 @@ score() {   # score SNAPSHOT-STEP
   local s=$1 ck=$SN/$1.ckpt t=$RUN-$1
   if [ "${INK:-1}" = 1 ]; then
   log "$t: ink"
-  env E=$E U=$B UP=$B GPU=$GPU THREADS=8 TASKS=ink INKP=heads LV_INK=1 CTROOT=/vesuvius/ufsm/v2/ct REFS= \
-    INKC="/vesuvius/ufsm/inkgt/evcrops /vesuvius/ufsm/inkgt/evcrops-ho" INKGT="/vesuvius/ufsm/inkgt/evgt /vesuvius/ufsm/inkgt/evgt-ho" \
-    bash $H/scripts/univ/eval.sh $ck $t > $E/$t.eval.out 2>&1
+  local EV=(env E=$E U=$B UP=$B GPU=$GPU THREADS=8 TASKS=ink INKP=heads LV_INK=1 CTROOT=/vesuvius/ufsm/v2/ct REFS=
+    INKC="/vesuvius/ufsm/inkgt/evcrops /vesuvius/ufsm/inkgt/evcrops-ho" INKGT="/vesuvius/ufsm/inkgt/evgt /vesuvius/ufsm/inkgt/evgt-ho") cr
+  for cr in $(cut -f1 ${CROPLIST:-$E/inkpod-9000/ink/vscores.tsv}); do grep -qP "^$cr\t" $E/$t/ink/scores.tsv 2>/dev/null && continue
+    yieldgpu; "${EV[@]}" INKONLY=$cr bash $H/scripts/univ/eval.sh $ck $t >> $E/$t.eval.out 2>&1; release; done
+  yieldgpu; "${EV[@]}" bash $H/scripts/univ/eval.sh $ck $t >> $E/$t.eval.out 2>&1; release   # (the summary; locked in case a crop is retried)
   { echo "== $t ink (3-D: ink-vscore vs inkB's ink-splat refs, 4.8 um; held-out: PHerc0500P2 unseen ink labels / seen CT, PHerc0841 unseen scroll)"
     [ -s $E/$t/ink/vscores.tsv ] && perscroll $E/$t/ink/vscores.tsv $t
     [ -s $TEACH ] && perscroll $TEACH dino3d
@@ -51,15 +57,17 @@ score() {   # score SNAPSHOT-STEP
 wcore() {   # wcore CKPT TAG STEP: wbench core p05x rows every WEVERY steps (STEP 0: always)
   local ck=$1 t=$2 s=$3
   if [ $s = 0 ] || { [ $WEVERY -gt 0 ] && [ $((s % WEVERY)) = 0 ]; }; then log "$t: wbench core"
-    env SITE=desk WB=$WB GPU=$GPU SLABS=0 REP=0 THREADS=12 PRIO=eval UP=$B WZARGS= WIN=640 HALO=64 LOCALCT=/vesuvius/ufsm/v2/ct BOXES=core \
-      bash $H/scripts/wbench/wbench.sh $ck $t > $E/$t.wbench.out 2>&1
+    local b; for b in $(grep -v '^#' $H/scripts/wbench/boxes.tsv | awk -F'\t' '$10 !~ /label-noise/ && ($2 == "paris4" || $2 == "paris4j" || $10 ~ /core/)' | cut -f1); do
+      grep -qP "^$t\t$b\t" $WB/res/$t.tsv 2>/dev/null && continue; yieldgpu
+      env SITE=desk WB=$WB GPU=$GPU SLABS=0 REP=0 THREADS=12 PRIO=eval UP=$B WZARGS= WIN=640 HALO=64 LOCALCT=/vesuvius/ufsm/v2/ct BOXES=$b \
+        bash $H/scripts/wbench/wbench.sh $ck $t >> $E/$t.wbench.out 2>&1; release; done
     log "$t: wbench rows $(($(wc -l < $WB/res/$t.tsv) - 1))"; fi
 }
 S=${1:-1000}; STEP=${STEP:-1000}
-for kv in ${BASECK:-}; do exec 9> $E/gpu0.lock; flock 9; gpulock; wcore ${kv%%=*} ${kv#*=} 0; gpuunlock; flock -u 9; done
+for kv in ${BASECK:-}; do wcore ${kv%%=*} ${kv#*=} 0; done
 while [ ! -e $E/watch.stop ]; do
   # the first snapshot at or after S (a run that starts its count elsewhere, e.g. from its init's step, is picked up too)
   until n=$(ls $SN 2>/dev/null | sed -n 's/^\([0-9]*\)\.ckpt$/\1/p' | awk -v s=$S '$1 >= s' | sort -n | head -1); [ -n "$n" ]; do [ -e $E/watch.stop ] && exit 0; sleep 60; done
   S=$n; sleep 60
-  exec 9> $E/gpu0.lock; flock 9; gpulock; score $S; gpuunlock; flock -u 9; S=$((S + STEP))
+  score $S; S=$((S + STEP))
 done
