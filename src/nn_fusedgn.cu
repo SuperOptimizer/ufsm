@@ -259,20 +259,25 @@ extern "C" void nn_silu_bwd_gn(const float *x, shape5 s, int G, const float *gam
     else silu_bwd_gn_k<float><<<nblk(n, 256), 256>>>(x, gamma, beta, mean, rstd, gy, gx, s.n, s.c, G, shape_spatial(s));
     KCHECK();
 }
-__global__ void gn_group_sums_k(const float *st, const float *gamma, int N, int C, int G, float *AB, float f) {   /* AB[2*ng] = f sum st*gamma, AB[2*ng+1] = f sum st2*gamma */
+/* AB[2*ng] = f sum st*gamma / len, AB[2*ng+1] = f sum st2*gamma / len, len = cpg S: the apply kernels' coefficients. S is the whole
+   window's voxel count per channel (gn_bwd_reduce): under --split z each half divides by the same count, so its coefficients are the
+   bits of the one-GPU run (2026-11-13: the halves divided f-rescaled sums by their local count, a last-bit difference that MX
+   rounding flipped and the encoder amplified, 0.29 relative at enc0.c1). f: 1, or 0 for constant statistics. */
+__global__ void gn_group_sums_k(const float *st, const float *gamma, int N, int C, int G, float *AB, float f, size_t S) {
     int ng = blockIdx.x * blockDim.x + threadIdx.x;
     if (ng >= N * G) return;
     int n = ng / G, g = ng % G, cpg = C / G;
     float A = 0.f, B = 0.f;
     for (int cc = g * cpg; cc < (g + 1) * cpg; cc++) { A += st[2 * (n * C + cc)] * gamma[cc]; B += st[2 * (n * C + cc) + 1] * gamma[cc]; }
-    AB[2 * ng] = A * f; AB[2 * ng + 1] = B * f;
+    const float len = (float)cpg * (float)S;
+    AB[2 * ng] = A * f / len; AB[2 * ng + 1] = B * f / len;
 }
-float gn_bwd_reduce(double *ds, float *st, int NC, int D, float *ggamma, float *gbeta, int N, int C) {
-    if (!zs_on()) return 1.f;
+size_t gn_bwd_reduce(double *ds, float *st, int NC, int D, size_t S, float *ggamma, float *gbeta, int N, int C) {
+    if (!zs_on()) return S;
     gn_param_grad_k2<<<nblk(C, 128), 128>>>(st, ggamma, gbeta, N, C);
     zs_reduce(ds, 2 * NC);
     d2f_k<<<nblk(2 * NC, 128), 128>>>(ds, st, 2 * NC);
-    return (float)D / (float)zs_len((size_t)D, D);
+    return zs_len(S, D);   /* (the whole window's voxels per channel) */
 }
 extern "C" void nn_gn_silu_bwd(const float *x, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd, const float *gy,
                                float *gx, float *ggamma, float *gbeta, float *scratch) {
@@ -286,16 +291,33 @@ extern "C" void nn_gn_silu_bwd(const float *x, shape5 s, int G, const float *gam
         lp_gn_silu_bwd_mx(x, xdt, s, G, gamma, beta, mean, rstd, gy, gx, gdt, ds, scratch, AB);
         d2f_k<<<nblk(2 * NC, 128), 128>>>(ds, scratch, 2 * NC);
         const int zsp = zs_on();
-        const float f = gn_bwd_reduce(ds, scratch, NC, s.d, ggamma, gbeta, s.n, s.c);
-        gn_group_sums_k<<<nblk(s.n * G, 128), 128>>>(scratch, gamma, s.n, s.c, G, AB, g_gn_const ? 0.f : f);   /* (constant statistics: no group terms) */
+        const size_t Sw = gn_bwd_reduce(ds, scratch, NC, s.d, shape_spatial(s), ggamma, gbeta, s.n, s.c);
+        if (getenv("UFSM_GNB_DUMP")) {   /* diagnostic: the finished per-channel backward sums (fp32, 2 per channel) of every MX GroupNorm backward, appended per split half (split A/Bs) */
+            const int sl = zsp ? zs_slot() : -1; char fn[1100]; snprintf(fn, sizeof fn, "%s.%d", getenv("UFSM_GNB_DUMP"), sl);
+            static int opened[16]; FILE *fo = fopen(fn, opened[sl + 1]++ ? "ab" : "wb");
+            float *h = (float *)malloc((size_t)8 * NC); cudaDeviceSynchronize(); cudaMemcpy(h, scratch, (size_t)8 * NC, cudaMemcpyDeviceToHost);
+            if (fo) { const int hd[2] = {NC, s.d}; fwrite(hd, 4, 2, fo); fwrite(h, 4, 2 * NC, fo); fclose(fo); } free(h);
+            if (getenv("UFSM_GNB_TDUMP")) {   /* + x and gy as fp32 [c][d][h][w] (MX storage only) */
+                char fn2[1100]; snprintf(fn2, sizeof fn2, "%s.t%d", getenv("UFSM_GNB_DUMP"), sl); FILE *ft = fopen(fn2, opened[sl + 1] > 1 ? "ab" : "wb");
+                const size_t ne = shape_numel(s), S = shape_spatial(s); float *df, *hf = (float *)malloc(ne * 4); cudaMalloc(&df, ne * 4);
+                const void *src[2] = {x, gy};
+                for (int k = 0; k < 2; k++) { const int dt = nn_storage(src[k]); if (dt == 8) lp_mx8_to_f32(src[k], s.n, s.c, S, df); else if (dt == 4) lp_mx4_to_f32(src[k], s.n, s.c, S, df); else cudaMemset(df, 0, ne * 4);
+                    cudaDeviceSynchronize(); cudaMemcpy(hf, df, ne * 4, cudaMemcpyDeviceToHost); const int hd[6] = {dt, s.n, s.c, s.d, s.h, s.w}; if (ft) { fwrite(hd, 4, 6, ft); fwrite(hf, 4, ne, ft); } }
+                if (ft) fclose(ft); cudaFree(df); free(hf);
+            }
+        }
+        gn_group_sums_k<<<nblk(s.n * G, 128), 128>>>(scratch, gamma, s.n, s.c, G, AB, g_gn_const ? 0.f : 1.f, Sw);   /* (constant statistics: no group terms) */
         const unsigned gsr = gdt == 4 ? sr_seed() : 0u;   /* MX-fp4 gradients: unbiased SR (always, whatever nn_set_sr) */
         /* MX-fp4: the apply also writes the fp4 weight gradient's gy records (its pre-pass skipped); record SR from a seed derived
            from gsr, so the global seed sequence is unchanged */
         int za, zb; const int zwin = zw_win(s.n * s.d, &za, &zb);   /* (z-window: the plain apply, same gx bits; no whole-layer records) */
-        if (zwin) g_gyrec.valid = 0;
+        if (zwin || zsp) g_gyrec.valid = 0;
         if (gdt == 4 && !zwin && lp_gnpend_want() && lp_gn_silu_bwd_apply_defer(x, xdt, s, G, gamma, beta, mean, rstd, gy, gx, AB, gsr, gsr * 0x9e3779b9u + 0x7f4a7c15u)) {}   /* (the
                                                                                                      weight gradient that follows applies it with its records, slab by slab) */
-        else if (gdt != 4 || zwin || !lp_gn_silu_bwd_apply_rec(x, xdt, s, G, gamma, beta, mean, rstd, gy, gx, AB, gsr, gsr * 0x9e3779b9u + 0x7f4a7c15u))
+        /* --split z: no whole-layer gy records (2026-11-13): they hold the halo planes' gx, which the caller zeroes only after this apply
+           (nn_split_zero), so the fp4 weight gradient and the bias sums read the halo voxels twice (dec0.c2.b 0.13 relative off). The
+           weight gradient's own pre-pass reads the zeroed gy; the records' 136 B per channel x 256 voxels stay unallocated */
+        else if (gdt != 4 || zwin || zsp || !lp_gn_silu_bwd_apply_rec(x, xdt, s, G, gamma, beta, mean, rstd, gy, gx, AB, gsr, gsr * 0x9e3779b9u + 0x7f4a7c15u))
             lp_gn_silu_bwd_apply_mx(x, xdt, s, G, gamma, beta, mean, rstd, gy, gx, gdt, AB, gsr);
         if (!zsp) gn_param_grad_k2<<<nblk(s.c, 128), 128>>>(scratch, ggamma, gbeta, s.n, s.c);
         KCHECK();
@@ -325,8 +347,8 @@ extern "C" int nn_gn_silu_bwd_head_ns(float *x, shape5 s, int G, const float *ga
     lp_gn_silu_bwd_head_stats(x, s, G, gamma, beta, mean, rstd, gl, cout, wh, hs, ds, ns);
     d2f_k<<<nblk(2 * NC, 128), 128>>>(ds, scratch, 2 * NC);
     const int zsp = zs_on();
-    const float f = gn_bwd_reduce(ds, scratch, NC, s.d, ggamma, gbeta, s.n, s.c);
-    gn_group_sums_k<<<nblk(s.n * G, 128), 128>>>(scratch, gamma, s.n, s.c, G, AB, g_gn_const ? 0.f : f);   /* (constant statistics: no group terms) */
+    const size_t Sw = gn_bwd_reduce(ds, scratch, NC, s.d, shape_spatial(s), ggamma, gbeta, s.n, s.c);
+    gn_group_sums_k<<<nblk(s.n * G, 128), 128>>>(scratch, gamma, s.n, s.c, G, AB, g_gn_const ? 0.f : 1.f, Sw);   /* (constant statistics: no group terms) */
     const unsigned gsr = sr_seed();   /* (nn_gn_silu_bwd's draw) */
     lp_gn_silu_bwd_head_apply(x, s, G, gamma, beta, mean, rstd, gl, cout, wh, hs, AB, gsr, ns);
     if (!zsp) gn_param_grad_k2<<<nblk(s.c, 128), 128>>>(scratch, ggamma, gbeta, s.n, s.c);

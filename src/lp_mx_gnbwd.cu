@@ -208,9 +208,8 @@ __global__ void __launch_bounds__(256) gn_silu_bwd_apply_mx_k(const uint8_t *x, 
         const int k = threadIdx.x, c = blk * bw + k;
         const bool ok = k < bw && c < C;
         const int ng = n * G + (ok ? c / cpg : 0);
-        const float len = (float)cpg * (float)S;
         cm[k] = ok ? mean[ng] : 0.f; cr[k] = ok ? rstd[ng] : 0.f; cg[k] = ok ? gamma[c] : 0.f; cb[k] = ok ? beta[c] : 0.f;
-        ca[k] = ok ? AB[2 * ng] / len : 0.f; cc[k] = ok ? AB[2 * ng + 1] / len : 0.f;
+        ca[k] = ok ? AB[2 * ng] : 0.f; cc[k] = ok ? AB[2 * ng + 1] : 0.f;   /* (AB: the group sums / len, gn_group_sums_k) */
     }
     __syncthreads();
     const size_t v = (size_t)blockIdx.x * 256 + threadIdx.x;
@@ -260,9 +259,8 @@ __global__ void __launch_bounds__(256, 5) gn_silu_bwd_apply_mx2_k(const uint8_t 
         const int k = threadIdx.x, c = blk * bw + k;
         const bool ok = k < bw && c < C;
         const int ng = n * G + (ok ? c / cpg : 0);
-        const float len = (float)cpg * (float)S;
         const float rs = ok ? rstd[ng] : 0.f, mu = ok ? mean[ng] : 0.f, ga = ok ? gamma[c] : 0.f, be = ok ? beta[c] : 0.f;
-        const float ca = ok ? AB[2 * ng] / len : 0.f, cc = ok ? AB[2 * ng + 1] / len : 0.f, A = rs * ga;
+        const float ca = ok ? AB[2 * ng] : 0.f, cc = ok ? AB[2 * ng + 1] : 0.f, A = rs * ga;
         cf[k] = make_float4(0.5f * A, 0.5f * (be - mu * A), -rs * rs * cc, rs * (mu * rs * cc - ca));
     }
     __syncthreads();
@@ -471,9 +469,8 @@ __global__ void __launch_bounds__(256) gn_silu_bwd_apply_mx2_hg_k(uint8_t *x, co
         const int k = threadIdx.x, c = blk * bw + k;
         const bool ok = k < bw && c < C;
         const int ng = n * G + (ok ? c / cpg : 0);
-        const float len = (float)cpg * (float)S;
         const float rs = ok ? rstd[ng] : 0.f, mu = ok ? mean[ng] : 0.f, ga = ok ? gamma[c] : 0.f, be = ok ? beta[c] : 0.f;
-        const float ca = ok ? AB[2 * ng] / len : 0.f, cc = ok ? AB[2 * ng + 1] / len : 0.f, A = rs * ga;
+        const float ca = ok ? AB[2 * ng] : 0.f, cc = ok ? AB[2 * ng + 1] : 0.f, A = rs * ga;
         cf[k] = make_float4(0.5f * A, 0.5f * (be - mu * A), -rs * rs * cc, rs * (mu * rs * cc - ca));
     }
     head_sw<CI>(sw, wh, C, bw);
@@ -548,9 +545,8 @@ __global__ void __launch_bounds__(256, 3) gn_silu_bwd_apply_rec_k(const uint8_t 
     const unsigned ngrp = (unsigned)ZTs * TY * Wb;
     if (threadIdx.x < BW) {
         const int k = threadIdx.x, c = cb * BW + k, ng = n * G + c / cpg;
-        const float len = (float)cpg * (float)S;
         const float rs = rstd[ng], mu = mean[ng], ga = gamma[c], be = beta[c];
-        const float ca = AB[2 * ng] / len, cc = AB[2 * ng + 1] / len, A = rs * ga;
+        const float ca = AB[2 * ng], cc = AB[2 * ng + 1], A = rs * ga;
         cf[k] = make_float4(0.5f * A, 0.5f * (be - mu * A), -rs * rs * cc, rs * (mu * rs * cc - ca));
         bred[k] = 0.f;
     }
@@ -777,9 +773,8 @@ __global__ void gnpend_cf_k(const float *gamma, const float *beta, const float *
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= C) return;
     const int cpg = C / G, ng = c / cpg;
-    const float len = (float)cpg * (float)S;
     const float rs = rstd[ng], mu = mean[ng], ga = gamma[c], be = beta[c];
-    const float ca = AB[2 * ng] / len, cc = AB[2 * ng + 1] / len, A = rs * ga;
+    const float ca = AB[2 * ng], cc = AB[2 * ng + 1], A = rs * ga;
     cf[c] = make_float4(0.5f * A, 0.5f * (be - mu * A), -rs * rs * cc, rs * (mu * rs * cc - ca));
 }
 extern "C" const void *lp_gnpend_take(const void *gx, const void **gy, const float **cf) {
