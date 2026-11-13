@@ -3515,6 +3515,20 @@ int sample_pack_tm(const uint8_t *t0, const uint8_t *t1, const uint8_t *m, size_
     for (size_t k = 0; k < n; k++) if ((t0[k] != 0 && t0[k] != 255) || (t1[k] != 0 && t1[k] != 255) || m[k] > 1) { if (bad) *bad = k; break; }
     return -1;
 }
+/* a worker that finds no free slot gives its scratch pages back before it sleeps (2026-11-13): only nslots workers fill at a time, so with
+   --workers W > --sampler-slots S the other W - S held ~4.7 GB each at P 1024 (big's CT + mask slices, ttmp's two planes, the pooled
+   buffers) for nothing: scratch2 at W 6 S 2 started at 86 GB. Every draw writes before it reads its scratch (the released pages come
+   back zero), so the batches do not change; the cost is the refault, ~1 s per P 1024 window, paid only by a worker that was idle.
+   UFSM_IDLE_RELEASE=0: off. */
+static void worker_idle_release(uint8_t *big, size_t bign, uint8_t *ttmp, size_t ttn) {
+    static int on = -1; if (on < 0) on = !getenv("UFSM_IDLE_RELEASE") || ufsm_env_on("UFSM_IDLE_RELEASE");
+    if (!on) return;
+    const size_t pg = 4096;
+    if (big && bign >= ((size_t)4 << 20)) madvise(big, bign & ~(pg - 1), MADV_DONTNEED);   /* (wbig_alloc: page-aligned blocks of their own) */
+    if (ttmp && ttn >= ((size_t)4 << 20)) madvise(ttmp, ttn & ~(pg - 1), MADV_DONTNEED);
+    tp_drain();
+    static atomic_int said; if (!atomic_exchange(&said, 1)) fprintf(stderr, "sampler: a worker without a free slot released its scratch (UFSM_IDLE_RELEASE=0: keep it)\n");
+}
 static void *worker(void *arg) {
     warg *wa = arg;
     sampler *sp = wa->sp;
@@ -3535,6 +3549,7 @@ static void *worker(void *arg) {
         atomic_store(&sp->failed, 1); atomic_store(&sp->stop, 1);
         pthread_mutex_lock(&sp->mu); pthread_cond_broadcast(&sp->cv_ready); pthread_cond_broadcast(&sp->cv_free); pthread_mutex_unlock(&sp->mu);
     }
+    int idle = 0;   /* (this worker's scratch released since its last window: worker_idle_release) */
     while (!atomic_load(&sp->stop)) {
         pthread_mutex_lock(&sp->mu);
         int k = -1;
@@ -3545,15 +3560,20 @@ static void *worker(void *arg) {
             }
             jb = sp->next_claim++;
             k = (int)(jb % sp->nslots);
-            while ((sp->state[k] != FREE || jb - sp->next_take >= sp->nslots) && !atomic_load(&sp->stop)) pthread_cond_wait(&sp->cv_free, &sp->mu);
+            while ((sp->state[k] != FREE || jb - sp->next_take >= sp->nslots) && !atomic_load(&sp->stop)) {
+                if (!idle) { pthread_mutex_unlock(&sp->mu); worker_idle_release(big, 10 * p3, ttmp, NCH * p3 + 4096); idle = 1; pthread_mutex_lock(&sp->mu); continue; }
+                pthread_cond_wait(&sp->cv_free, &sp->mu);
+            }
             if (atomic_load(&sp->stop)) k = -1;
             else sp->slot_j[k] = jb;
         } else
         while (k < 0 && !atomic_load(&sp->stop)) {
             for (int j = 0; j < sp->nslots; j++) if (sp->state[j] == FREE) { k = j; break; }
+            if (k < 0 && !idle) { pthread_mutex_unlock(&sp->mu); worker_idle_release(big, 10 * p3, ttmp, NCH * p3 + 4096); idle = 1; pthread_mutex_lock(&sp->mu); continue; }
             if (k < 0) pthread_cond_wait(&sp->cv_free, &sp->mu);
         }
         if (k >= 0) sp->state[k] = FILLING;
+        idle = 0;
         pthread_mutex_unlock(&sp->mu);
         if (k < 0) break;
         batch *b = &sp->slots[k];
