@@ -36,8 +36,13 @@ the kernels in a window, the host threads' CUDA API time).
 - **UFSM_PROF under --split** crashed (one global event set made on GPU 0, recorded on GPU 1): per-device event sets now.
 - **NaN gradients (blocker, mega and swap1):** with these flags every step skips (non-finite gradient norm; the scale falls to 1). The step-1
   gradient (UFSM_GRAD_DUMP) is NaN on exactly enc3.c2 (18918336..24338687 = 448 x 448 x 27 + 3 x 448) and 1792 film parameters (film +3840),
-  i.e. level 3, the first --split-top level; all lower levels finite. The 12:13 scratch2 binary (7ee48e2) is clean on the same flags; bisect
-  over 7ee48e2..bc6c4c7 (590b56b cherry-picked where missing) in progress.
+  i.e. level 3, the first --split-top level; all lower levels finite. The 12:13 scratch2 binary (7ee48e2) is clean on the same flags.
+  Bisect over 7ee48e2..bc6c4c7 (590b56b cherry-picked where missing; perf2/bisect_step.sh): **a054edf first bad**, the s2b fp4
+  weight-streaming kernel widened to 256..448 channels (NCH 8 / 9 / 10 / 12 / 14), so down3's bwd_data (448 ch) runs it. In isolation each
+  width matches the reference (test_mx4 rel err 0.167-0.170 vs dilated 0.155, 32^3), but 384 / 448 / 288 run after 256 / 320 leave the later
+  "fp4 conv SR operand (32 ch)" check NaN: something outside gx is overwritten (open). The wide path is off by default now
+  (UFSM_S2B_WIDE=1 / lp_set_s2b_wide on; test_mx4 keeps 256 / 320, TMX4_WIDE_ALL=1 the whole sequence): mega + this, step-1 gradient
+  0 non-finite (max |g| 0.329, loss 2.77253056).
 
 **Profile before** (the archived one-card P 512 92 M run, runs/scratch-archive-20261113/prof92: nsys + UFSM_PROF=layers, 37 steady
 steps): 1.61 s/step, kernel-busy 99 % (GPU-bound, no loader wait). Per step:
