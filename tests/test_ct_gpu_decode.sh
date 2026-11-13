@@ -19,7 +19,7 @@ for k in $(ls "$D/fx/ct" | grep -v json); do
   echo "ct/$k ($nz x $ny x $nx): GPU = CPU byte for byte, ${subs:-?} substreams on the GPU"
 done
 grep -qE '[1-9][0-9]* substreams' "$D/gpu.log" || { cat "$D/gpu.log"; fail "no substream decoded on the GPU (gpudec statistics)"; }
-T="--det 1 --task unwrap2 --B 1 --gpus 0 --workers 2 --sampler-slots 4 --val-batches 0 --log-every 1 --ckpt-every 1000 --fp4 2 --warmup 0 --seed 5 --wind4-tile 0 --P 64 --widths 32,64,128 --steps 4"
+T="--det 1 --task unwrap2 --B 1 --gpus 0 --workers 2 --sampler-slots 4 --val-batches 0 --log-every 1 --ckpt-every 1000 --fp4 2 --warmup 0 --seed 5 --wind4-tile 0 --levels 1 --P 64 --widths 32,64,128 --steps 4"
 # shellcheck disable=SC2086
 "$U" train "$D/fx/sources.json" --out "$D/cpu" $T > "$D/cpu.tlog" 2>&1 || fail "train, CPU decode ($D/cpu.tlog)"
 # shellcheck disable=SC2086
