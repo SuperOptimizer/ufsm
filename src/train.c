@@ -256,7 +256,7 @@ static int g_gc;
    the 38.4 um cells' missing resolution, DESIGN latbeat), its projection added to every head output the slabs hold as voxel logits (all but
    the fused normal / density group); --fstem-drop P: a training window without it (level dropout: the net keeps working without the fine
    level, as for scans with no finer data; validation and predict always use it) */
-static int g_fstem, g_fs_n, g_fs_ch[16]; static float g_fs_drop = 0.25f;
+static int g_fstem, g_fs_n, g_fs_ch[32]; static float g_fs_drop = 0.25f;
 static float src_head_w(int si, int h) { return (si >= 0 && g_S && si < g_S->n ? g_S->src[si].head_w[h] : 1.f) * g_hmul[h]; }   /* the source's "heads" multiplier x --uw */
 /* --init-from: does an unwrap2 donor keep its rv pair / ink row somewhere other than this net's channels (u1 rv 11-12 -> U2 ink 11, rv
    12-13)? Then the head is mapped by name; same places (a donor that only lacks appended heads, e.g. the fibre head) keep the positional

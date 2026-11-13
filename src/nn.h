@@ -270,6 +270,21 @@ void nn_lat_place_rv(const void *lg, int lh16, int d, int h, int w, const uint8_
    before on the same stream) with the jitter into ct16. Device scratch: nn_aug_device_bytes(P) (one P^3 byte staging buffer). */
 void nn_aug_ct(const uint8_t *ct8_h, const void *rec_h, const void *rad_d, int P, void *ct16, int on_copy_stream);
 size_t nn_aug_device_bytes(int P);
+/* split windows (one window's z halves on two GPUs): the collectives nn_aug_ct_z calls, both ranks at the same points (the shared plan
+   decides them). xchg: with rank peer, send ns bytes from send_d and receive nr bytes into recv_d (device pointers; either size may be
+   0: a one-way carry), complete on stream when it returns. sum: n device values (type 0 u64, 1 f64, 2 u32) summed in place across the
+   ranks on stream. slot: the staging slot (two ranks on one device: 0 / 1; else 0); stream: a cudaStream_t (nullptr: as on_copy_stream).
+   peer_z0 / peer_nz: the other rank's output planes (its warp's bound: the scanned bytes it needs from this rank) */
+typedef struct nn_zcomm {
+    void *ctx; int rank, nrank, slot, peer_z0, peer_nz; void *stream;
+    void (*xchg)(void *ctx, int peer, const void *send_d, size_t ns, void *recv_d, size_t nr, void *stream);
+    void (*sum)(void *ctx, void *d, int n, int type, void *stream);
+} nn_zcomm;
+/* the CT channel's output planes [z0, z0 + nz) into ct16 (nz planes). zc nullptr: the whole source window staged (one GPU); with zc
+   (nrank 2, P % 4 == 0) rank r scans its source half [r P/2, (r+1) P/2) and stages its warp's bound (nn_aug_src_range of [z0, z0 + nz),
+   rad_h: the host copy of the record); the bytes are the one-GPU call's. nn_aug_ct = nn_aug_ct_z(.., 0, P, .., nullptr, ..) */
+void nn_aug_ct_z(const uint8_t *ct8_h, const void *rec_h, const void *rad_h, const void *rad_d, int P, int z0, int nz, void *ct16, const nn_zcomm *zc, int on_copy_stream);
+size_t nn_aug_device_bytes_z(int P, int ns, int nz, int halo);   /* ns: the most staged planes (s1 - s0 with the rank's half), halo: the plan's */
 void nn_aug_bop_line(int on);   /* tests: 0 = the separable operators through the first kernels (z / y in shared memory, x one row a block) */
 void nn_aug_bop_bench(int P, int taps, double *out);   /* tuning: ms per pass, out[6] = z shared / z line / y shared / y line / x one row a block / x rows + weight table */
 void nn_aug_cnoise_chunk(int nz);   /* tests: the correlated noise in chunks of nz planes (0: the per-plane kernels, -1: the default chunk) */
@@ -285,6 +300,22 @@ void nn_label_sym(const uint8_t *a_h, int symcode, int P, uint8_t *da, int on_co
 /* --gpu-aug 3 runs slots: w4 / comp from the source-grid phase and the window's runs (band_w4dev.h w4runs), warped or through the symmetry */
 void nn_w4runs_label(const uint8_t *side_h, const void *runs, const void *rad_d, int warped, int symcode, int P, uint8_t *da, uint8_t *db, const float *cs_h, const float *sn_h, int on_copy_stream);
 void nn_ink_bits(const uint8_t *ct8_h, const uint8_t *bits_h, int it, const void *rad_d, int warped, int symcode, int P, uint8_t *da, int on_copy_stream);
+/* z ranges (one window split in z across GPUs): the same builders writing only output planes [z0, z0 + nz) of the global P^3 window
+   (da / db hold nz planes; the same record, draws and global coordinates, so the bytes are the whole-window call's planes) from the
+   source planes [s0, s1) of the host planes (uploaded from offset s0 P^2; s0 P^2 a multiple of 8). [s0, s1) from nn_aug_src_range.
+   The whole-window calls above are z0 0, nz P, s0 0, s1 P. Staging: nn_label_warp_device_bytes_z(P, the most s1 - s0) */
+void nn_label_warp_z(int kind, const uint8_t *a_h, const uint8_t *b_h, const void *rad_d, int P, int z0, int nz, int s0, int s1, uint8_t *da, uint8_t *db,
+                     const float *cs_h, const float *sn_h, int on_copy_stream);
+void nn_label_sym_z(const uint8_t *a_h, int symcode, int P, int z0, int nz, int s0, int s1, uint8_t *da, int on_copy_stream);
+void nn_w4runs_label_z(const uint8_t *side_h, const void *runs, const void *rad_d, int warped, int symcode, int P, int z0, int nz, int s0, int s1,
+                       uint8_t *da, uint8_t *db, const float *cs_h, const float *sn_h, int on_copy_stream);
+void nn_ink_bits_z(const uint8_t *ct8_h, const uint8_t *bits_h, int it, const void *rad_d, int warped, int symcode, int P, int z0, int nz, int s0, int s1,
+                   uint8_t *da, int on_copy_stream);
+size_t nn_label_warp_device_bytes_z(int P, int ns);
+/* the source planes [*s0, *s1) the label builders read for output planes [z0, z0 + nz) of a window with radial record rad_h (host
+   copy; NN_RAD_REC): warped (h[6] bit 0) the bound of the warp over its per-axis tables (exact up to a plane of float margin, +1 for
+   the trilinear corner), else the cube symmetry's (the planes themselves, flipped, or all P when z comes from y or x). Clamped to P */
+void nn_aug_src_range(const void *rad_h, int P, int z0, int nz, int *s0, int *s1);
 /* packed targets (sample.h SAMPLE_TM_*: bit 0 target 0 = 255, bit 1 target 1 = 255, bit 2 mask) of nb samples of p3 voxels in m ->
    t (nb x 2 x p3: 0 / 255) and the 0 / 1 mask in m, in place; on the copy stream (after an nn_h2d_copy_stream of the codes) or the
    compute stream */
