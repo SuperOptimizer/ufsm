@@ -16,6 +16,7 @@ option(UFSM_VERIFY "bf16 / fp32 tensor-core instantiations as well (-DUFSM_ALL_T
 set(UFSM_ARCH 120 CACHE STRING "GPU target: 120 (GeForce / RTX PRO Blackwell, lp_* on sm_120a) or 86 (Ampere, software MX)")
 option(UFSM_LLVM_RUNTIME "compiler-rt builtins and crt files instead of libgcc.a / gcc crtbegin" ON)
 option(UFSM_CCACHE "compile through ccache when it is installed" ON)
+set(UFSM_CUDA_COMPILER clang CACHE STRING "device compiler: clang (clang -x cuda, the default) or nvcc (nvcc -ccbin clang++; comparison / fallback)")
 set(UFSM_CUDA "" CACHE PATH "CUDA toolkit root (default: /usr/local/cuda, else the newest /usr/local/cuda-*, else nvcc's prefix)")
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -91,30 +92,39 @@ add_link_options(${UFSM_RT_LINK})
 
 # CUDA units: clang -x cuda (device: LLVM NVPTX -> ptxas from UFSM_CUDA). nn_* for sm_120 (SASS + compute_120 PTX, as nvcc
 # -arch=sm_120), lp_* for sm_120a (the block-scaled mma; SASS only, as nvcc -gencode code=sm_120a).
+# (clang embeds no PTX unless asked: --cuda-include-ptx)
 if(UFSM_ARCH STREQUAL "120")
-  set(UFSM_NN_ARCH --cuda-gpu-arch=sm_120)
-  set(UFSM_LP_ARCH --cuda-gpu-arch=sm_120a --no-cuda-include-ptx=sm_120a)
+  set(UFSM_NN_ARCH --cuda-gpu-arch=sm_120 --cuda-include-ptx=sm_120)
+  set(UFSM_LP_ARCH --cuda-gpu-arch=sm_120a)
 else()
   # Ampere: SASS + PTX for sm_${UFSM_ARCH}; a newer GPU JIT-compiles the PTX, so the sm_86 paths run on Blackwell too (the old PTX=1)
-  set(UFSM_NN_ARCH --cuda-gpu-arch=sm_${UFSM_ARCH})
-  set(UFSM_LP_ARCH --cuda-gpu-arch=sm_${UFSM_ARCH})
+  set(UFSM_NN_ARCH --cuda-gpu-arch=sm_${UFSM_ARCH} --cuda-include-ptx=sm_${UFSM_ARCH})
+  set(UFSM_LP_ARCH --cuda-gpu-arch=sm_${UFSM_ARCH} --cuda-include-ptx=sm_${UFSM_ARCH})
 endif()
 # The CUDA 13 headers clang does not find itself: CCCL (cub / thrust / cuda::std) moved to include/cccl (nvcc adds it).
-# clang_cuda_compat.cuh: nvcc's host min / max overloads. --ptxas-path: the PTX ISA version bump (cmake/ptxas.sh.in).
+# clang_cuda_compat.cuh: nvcc's host min / max overloads. --ptxas-path: the PTX ISA version bump (cmake/ptxas.sh.in), generated
+# into each build directory and named relative to it (ninja runs the compiles there), so the command line is the same in build/ and
+# build-verify/ and across worktrees: ccache shares the objects whose preprocessed source does not depend on UFSM_ALL_TYPES.
 # -D_GNU_SOURCE: g++ (nvcc's host compiler) always defines it (CLOCK_MONOTONIC in nn_aug.cu). UFSM_CUDA_VERSION keys ccache on
-# the toolkit (ptxas is not hashed).
+# the toolkit and UFSM_PTX_ISA on the PTX version (ptxas is not hashed).
 set(UFSM_PTX_ISA 9.1 CACHE STRING "PTX ISA version the CUDA units are assembled as (cmake/ptxas.sh.in)")
 configure_file(cmake/ptxas.sh.in ${CMAKE_BINARY_DIR}/ptxas @ONLY FILE_PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ
                GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
-set(UFSM_CU_FLAGS -x cuda --cuda-path=${UFSM_CUDA} --ptxas-path=${CMAKE_BINARY_DIR}/ptxas -Wno-unknown-cuda-version -O3 -std=c++17
-    -fno-threadsafe-statics ${UFSM_CXX_STDLIB} -Xcuda-fatbinary -compress-all -isystem ${UFSM_CUDA}/include/cccl
-    -include ${CMAKE_SOURCE_DIR}/src/clang_cuda_compat.cuh -D_GNU_SOURCE -DUFSM_CUDA_VERSION=${UFSM_CUDA_VERSION})
+set(UFSM_CU_FLAGS -x cuda --cuda-path=${UFSM_CUDA} --ptxas-path=./ptxas -Wno-unknown-cuda-version -Wno-cuda-compat -O3 -std=c++17
+    -fno-threadsafe-statics ${UFSM_CXX_STDLIB} "SHELL:-Xcuda-fatbinary -compress-all" "SHELL:-isystem ${UFSM_CUDA}/include/cccl"
+    "SHELL:-include ${CMAKE_SOURCE_DIR}/src/clang_cuda_compat.cuh" -D_GNU_SOURCE -DUFSM_CUDA_VERSION=${UFSM_CUDA_VERSION}
+    -DUFSM_PTX_ISA=${UFSM_PTX_ISA})
 # nvcc -use_fast_math on the device side only: flush denormals, approximate division / sqrt / transcendentals, FMA contraction.
-# NaN / inf stay honoured (no -ffinite-math-only: the NaN guards in the loss and fwd_nan paths must survive).
-set(UFSM_CU_FAST -fgpu-flush-denormals-to-zero -fgpu-approx-transcendentals -Xarch_device -fapprox-func
-    -Xarch_device -ffp-contract=fast)
-# byte-identical to their CPU versions: IEEE division / sqrt, no FMA contraction, no flush (nvcc -fmad=false, no fast math)
-set(UFSM_CU_STRICT -Xarch_device -ffp-contract=off)
+# NaN / inf stay honoured (no -ffinite-math-only: the NaN guards in the loss and fwd_nan paths must survive). Checked 2026-11-13:
+# the float instruction kinds in the PTX match nvcc -use_fast_math (div.approx.ftz, sqrt.approx.ftz, ex2.approx.ftz, fma.rn.ftz).
+# ("SHELL:" groups: CMake de-duplicates repeated options, which would drop the second -Xarch_device)
+set(UFSM_CU_FAST -fgpu-flush-denormals-to-zero -fgpu-approx-transcendentals "SHELL:-Xarch_device -fapprox-func"
+    "SHELL:-Xarch_device -ffp-contract=fast")
+# byte-identical to their CPU versions: IEEE division / sqrt, no FMA contraction, no flush (nvcc -fmad=false, no fast math).
+# clang leaves libdevice's __CUDA_PREC_SQRT reflection at 0, so sqrtf would be sqrt.approx.f32 even without fast math (nvcc:
+# sqrt.rn.f32); the reflection is set explicitly (-mllvm reaches the host pass too, where it does nothing). Checked 2026-11-13: the
+# PTX of every strict unit uses the same float instruction kinds as nvcc -fmad=false (div.rn, sqrt.rn, no fma / approx / ftz).
+set(UFSM_CU_STRICT "SHELL:-Xarch_device -ffp-contract=off" "SHELL:-mllvm -nvvm-reflect-add=__CUDA_PREC_SQRT=1")
 set(UFSM_STRICT_UNITS nn_gpudec nn_cf nn_ftrace nn_latvol nn_band nn_fibre nn_inkfly nn_gpuenc nn_mcodes nn_faces nn_render)
 set(UFSM_TYPEDEFS UFSM_ARCH=${UFSM_ARCH})
 if(UFSM_VERIFY)
@@ -149,9 +159,34 @@ endforeach()
 ufsm_host_obj(surfcomp ${CMAKE_SOURCE_DIR}/third_party/surfcomp/surfcomp.c -w)
 list(APPEND UFSM_CORE_OBJS obj_surfcomp)
 
+if(UFSM_CUDA_COMPILER STREQUAL "nvcc")
+  # nvcc for the device code with clang++ as its host compiler (still no gcc): the old Makefile's flags. nvcc 13.x accepts clang
+  # < 22 only, hence -allow-unsupported-compiler for clang 22 (the host side of the .cu files is plain C++ glue).
+  set(CMAKE_CUDA_COMPILER ${UFSM_CUDA}/bin/nvcc)
+  set(CMAKE_CUDA_HOST_COMPILER ${CMAKE_CXX_COMPILER})
+  set(CMAKE_CUDA_FLAGS_INIT "-allow-unsupported-compiler")
+  set(CMAKE_CUDA_ARCHITECTURES OFF)
+  if(UFSM_CCACHE_EXE)
+    set(CMAKE_CUDA_COMPILER_LAUNCHER ${_launch})
+  endif()
+  enable_language(CUDA)
+  set(CMAKE_CUDA_FLAGS_RELEASE "")
+  if(UFSM_ARCH STREQUAL "120")
+    set(UFSM_NN_ARCH -arch=sm_120)
+    set(UFSM_LP_ARCH "SHELL:-gencode arch=compute_120a,code=sm_120a")
+  else()
+    set(UFSM_NN_ARCH "SHELL:-gencode arch=compute_${UFSM_ARCH},code=[sm_${UFSM_ARCH},compute_${UFSM_ARCH}]")
+    set(UFSM_LP_ARCH ${UFSM_NN_ARCH})
+  endif()
+  set(UFSM_CU_FLAGS -O3 -Xcompiler=-fno-threadsafe-statics -Xfatbin=-compress-all)
+  set(UFSM_CU_FAST -use_fast_math)
+  set(UFSM_CU_STRICT -fmad=false)
+endif()
 function(ufsm_cuda_obj name src arch)
   add_library(obj_${name} OBJECT ${src})
-  set_source_files_properties(${src} PROPERTIES LANGUAGE CXX)
+  if(NOT UFSM_CUDA_COMPILER STREQUAL "nvcc")
+    set_source_files_properties(${src} PROPERTIES LANGUAGE CXX)
+  endif()
   if(name IN_LIST UFSM_STRICT_UNITS)
     set(fp ${UFSM_CU_STRICT})
   else()
@@ -176,7 +211,11 @@ foreach(f ${UFSM_LP_SRC})
   list(APPEND UFSM_LP_OBJS obj_${n})
 endforeach()
 # concurrent strip-flatten chunks on one device (nvcc --default-stream per-thread)
-target_compile_definitions(obj_nn_flat PRIVATE CUDA_API_PER_THREAD_DEFAULT_STREAM=1)
+if(UFSM_CUDA_COMPILER STREQUAL "nvcc")
+  target_compile_options(obj_nn_flat PRIVATE "SHELL:--default-stream per-thread")
+else()
+  target_compile_definitions(obj_nn_flat PRIVATE CUDA_API_PER_THREAD_DEFAULT_STREAM=1)
+endif()
 
 # --- executables -----------------------------------------------------------------------------------------------------------
 # ufsm_exe(NAME [SUITE] SOURCES... [OBJS obj... | NN | LP] [LIBS LDLIBS | CUDA | lib...] [DEFS d...] [INC CUDA | BUILD]

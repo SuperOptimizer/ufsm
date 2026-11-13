@@ -10,35 +10,52 @@ Production models: `wind96` (task unwrap, 9.6 um: phase, normals, density, recto
 ## Build and test
 
 ```sh
-make -j && make test     # gcc -std=c23 + nvcc; needs libcurl, libzstd, libblosc, zlib, libjpeg, xxhash (header), OpenSSL libcrypto, CUDA 13 (sm_120)
-make ARCH=86             # Ampere (RTX 3090) into build86/: software MX-fp4 / fp8 (bit-exact conversions, emulated block-scaled MMAs)
-                         # (on by default there; UFSM_MX_EMU=0: fp8 / fp4 as bf16, 16-bit storage); PTX=1: compute_86 PTX
-                         # only (build86p/), so a newer GPU runs the sm_86 code (tests); BDIR=build puts it in build/
-make -j test             # fast tier (the merge gate); make test-slow: the slow tier; make test-all: both
+cmake --preset release && cmake --build build -j 8      # build/ufsm. LLVM 22 (clang C23 + clang -x cuda, lld, compiler-rt), CMake >= 3.28,
+                                                        # Ninja; needs libcurl, libzstd, libblosc, zlib, libjpeg, xxhash (header),
+                                                        # OpenSSL libcrypto, CUDA 13.1+ (ptxas, cudart, cuBLASLt; sm_120 / sm_120a)
+cmake --preset verify && cmake --build build-verify --target test     # suite binaries + the fast tier (the merge gate)
+cmake --build build-verify --target test-slow           # the slow tier; test-all: both
+SUITE_FLAGS="-j 4 test_fit" cmake --build build-verify --target test # runner options (names matching a regex)
+cmake --build build-verify --target test_strip && build-verify/test_strip   # one test by hand
+cmake --preset arch86 && cmake --build build86          # Ampere (RTX 3090): software MX-fp4 / fp8 (bit-exact conversions, emulated
+                                                        # block-scaled MMAs; UFSM_MX_EMU=0: fp8 / fp4 as bf16, 16-bit storage). The
+                                                        # binary carries sm_86 SASS + PTX, so a newer GPU runs the sm_86 code (tests)
 scripts/test/desk_suite.sh BRANCH   # the same on the desk (push over ssh, build, run, failing logs), one suite at a time
-make doctor              # the toolchain the Makefile picked + `ufsm sysinfo` (real cgroup CPUs / RAM, GPUs / MIG, CUDA, disk)
+cmake --build build --target doctor # the toolchain CMake picked + `ufsm sysinfo` (real cgroup CPUs / RAM, GPUs / MIG, CUDA, disk)
 ```
 
-The Makefile finds its toolchain itself: the first of gcc / gcc-15 / gcc-14 that accepts `-std=c23` (HOSTCC=, CC= override),
-CUDA in /usr/local/cuda, else the newest /usr/local/cuda-*, else nvcc's prefix on PATH (CUDA= overrides), nvcc `-ccbin g++-N`
-for gcc-N, and `-lstdc++` in CUDALIBS (gcc-14 + CUDA 13.2 failed to link without it). Default thread counts follow the cgroup
-(`cpu.max` quota, affinity; `UFSM_NCPU` overrides), not nproc, and memory budgets (count-field `--mem-gb`, `UFSM_RENDER_MEM`)
-are lowered to what the cgroup still allows (src/sysinfo.h). ccache is shared across worktrees (`CCACHE_BASEDIR` = the tree,
-`CCACHE_NOHASHDIR`), so a fresh worktree or desk suite dir rebuilds from the cache.
+Configurations are build directories (`CMakePresets.json`): `build/` (release: the fp16 / MX kernels training and inference use),
+`build-verify/` (`UFSM_VERIFY=ON`: also the bf16 / fp32 tensor-core instantiations; the suite runs from it), `build86/`,
+`build86-verify/` (`UFSM_ARCH=86`); they never invalidate each other. Build presets `desk` / `desk-verify` / `desk-test` (8 jobs)
+and `pod` / `pod-verify` / `pod-test` (6 jobs): `cmake --build --preset desk`. Binaries land in the build directory itself
+(`build/ufsm`, `build-verify/test_lat`). `ninja` alone in a build directory builds `ufsm`; `suite-bins` every suite binary.
 
-The tests are listed in `tests/suite.txt` (`NAME | TAGS | EST_SECONDS | COMMAND`) and run by `tests/run_suite.sh`. `make test`
-builds `build/ufsm`, the fixtures the Python CLI tests use and every suite binary on the VERIFY=1 build (`build-verify/`), then runs
-the fast tier in parallel: the runner sets the job count from the CPUs this process may use (cgroup-aware, `-j`, `SUITE_J`), caps the
-threads of each test (`UFSM_NCPU` / `UFSM_FIT_THREADS` / `UFSM_TIFF_THREADS` / `OMP_NUM_THREADS`, `-T`), gives each `gpu` test
-one of 2 slots per GPU (`-G`; machine-wide locks in `/tmp/ufsm-suite-locks`, shared by concurrent suites), the GPU with the most free memory first, runs the
-longest first, retries `flaky` tests once and prints each failing test's log tail plus a summary (`results.tsv` holds wall / CPU /
-max RSS per test). Runner options go through `SUITE_FLAGS`, e.g. `make test SUITE_FLAGS="-j 4 test_fit"` (names matching a regex),
-`-l` lists the tests, `-P` profiles (marks the tests that open the GPU, samples their GPU memory). One test by hand:
-`make VERIFY=1 build-verify/test_strip && build-verify/test_strip`. A new test: its binary as a prerequisite of `suite-bins` in the
-Makefile and a line in `tests/suite.txt` (tag `gpu` if it touches the GPU, `slow` if it takes more than ~30 s). The pipeline
-stages below have their own tests: `test_countfield`, `test_fit_join`, `test_wraps_core`, `test_flatten`, `test_flatten_gpu`,
-`test_faces`, `test_faces_gpu`, `test_strip`, `test_render_stream` (render / ink-compare / jpeg-fit, byte-identical streamed vs in-memory),
-`test_sheetcut`, `test_ink_blend.py`. On the laptop run builds and tests through `~/ufsm-data/capped.sh` (with nice).
+The toolchain is LLVM only (`cmake/llvm.cmake`): the newest `clang` / `clang-N` on PATH (`UFSM_LLVM_ROOT=/usr/lib/llvm-N` pins one),
+lld, llvm-ar / ranlib, compiler-rt builtins and crt files; the C++ library of the CUDA units' host side stays libstdc++ (CUDA's headers
+refuse libc++ on x86). CUDA: `UFSM_CUDA` (default /usr/local/cuda, else the newest /usr/local/cuda-*, else nvcc's prefix); only its
+ptxas, fatbinary, headers and libraries are used, the device code is compiled by clang. Host C is `-std=c23 -O3 -march=native
+-ffp-contract=off -fno-math-errno` (contract off: what gcc's ISO mode did; the byte-exact CPU references depend on it). The CUDA units
+get nvcc's `-use_fast_math` on the device side (flush denormals, approximate division / sqrt / transcendentals, FMA contraction),
+except the byte-identical ones (`UFSM_STRICT_UNITS` in CMakeLists.txt: contraction off, IEEE). Sources are globbed: a new `src/*.c`,
+`src/nn_*.cu` or `src/lp_*.cu` is picked up at the next build. ccache (when installed, `UFSM_CCACHE=OFF` disables it) is shared across
+worktrees (`CCACHE_BASEDIR` = the tree, `CCACHE_NOHASHDIR`), so a fresh worktree or desk suite dir rebuilds from the cache. Default
+thread counts follow the cgroup (`cpu.max` quota, affinity; `UFSM_NCPU` overrides), not nproc, and memory budgets (count-field
+`--mem-gb`, `UFSM_RENDER_MEM`) are lowered to what the cgroup still allows (src/sysinfo.h).
+
+The tests are listed in `tests/suite.txt` (`NAME | TAGS | EST_SECONDS | COMMAND`) and run by `tests/run_suite.sh`. The `test` target
+builds `build/ufsm`, the fixtures the Python CLI tests use (in the release directory next to the verify one, configured on first
+use) and every suite binary in `build-verify/`, then runs the fast tier in parallel: the runner sets the job count from the CPUs this
+process may use (cgroup-aware, `-j`, `SUITE_J`), caps the threads of each test (`UFSM_NCPU` / `UFSM_FIT_THREADS` /
+`UFSM_TIFF_THREADS` / `OMP_NUM_THREADS`, `-T`), gives each `gpu` test one of 2 slots per GPU (`-G`; machine-wide locks in
+`/tmp/ufsm-suite-locks`, shared by concurrent suites), the GPU with the most free memory first, runs the longest first, retries
+`flaky` tests once and prints each failing test's log tail plus a summary (`results.tsv` holds wall / CPU / max RSS per test). Runner
+options go through the `SUITE_FLAGS` environment variable; `-l` lists the tests, `-P` profiles (marks the tests that open the GPU,
+samples their GPU memory). A new test: one `ufsm_exe(test_x SUITE tests/test_x.c OBJS ... LIBS ...)` line in `tests/targets.cmake`
+and a line in `tests/suite.txt` (tag `gpu` if it touches the GPU, `slow` if it takes more than ~30 s); the `suite-check` target (run by
+`test`) fails when one of the two is missing. The pipeline stages below have their own tests: `test_countfield`, `test_fit_join`,
+`test_wraps_core`, `test_flatten`, `test_flatten_gpu`, `test_faces`, `test_faces_gpu`, `test_strip`, `test_render_stream`
+(render / ink-compare / jpeg-fit, byte-identical streamed vs in-memory), `test_sheetcut`, `test_ink_blend.py`. On the laptop run
+builds and tests through `~/ufsm-data/capped.sh` (with nice).
 
 `scripts/test/desk_suite.sh [-t fast|slow|all] REF [REGEX...]` pushes the commit into `/vesuvius/ufsm/suite/repo.git` on the desk,
 exports it to `/vesuvius/ufsm/suite/<sha>`, builds it (ccache shared across the sha dirs) and runs the suite at nice 10 under a lock
