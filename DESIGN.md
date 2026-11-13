@@ -242,6 +242,38 @@ same verdicts as the 4-level net:
 | MX-fp8 rn | bit-identical | identical | 7e-3 (perturbed CT: 0.49) | 5e-3 |
 | fp4 sr | bit-identical | identical | at the seed-to-seed spread | at the seed-to-seed spread |
 
+## The U2 sampler at P 1024: where the workers wait, the codes pooling without its atan2 (2026-11-12, branch pool2fast-20261112)
+
+(Merged 2026-11-13 into integ19 as numbers only: the code of this branch is superseded. Its pooling loop gave way to the exact host /
+device bin-search pooling in codes_pool.h with the pooled tiles on the GPU (26528b9, below), and the branch-free coverage shares landed as
+064fc4d. The slot / memory findings stand.)
+
+Pod (one RTX PRO 6000, 40 CPUs, a 175 GB cgroup shared by every job), `UFSM_SAMPLER_ONLY` with U2's args (`sources-u2pod.json`: 9 band,
+2 mesh, 8 ink sources; replay 3), the GPU exclusive but the CPUs not (load average ~30). What limited the sampler, in the order found:
+
+- **`--sampler-slots` caps the builders, not `--workers`.** 24 workers on 10 slots built 9 windows at once (589 Mvox/s, 6.3 busy cores);
+  the log line "N workers but M slots" says so. Slots must be workers + 2.
+- **Host memory then caps the slots**: with the ink sources a slot is ~7 GB and a worker's scratch ~4 GB (12 workers / 14 slots: 135-147 GB
+  RSS; 24 / 26 and 32 / 34 passed 166 GB and were stopped). On this pod no more than ~12 workers fit beside nothing else, 8 / 10 beside
+  the trainer's own memory under a 130 GB cap (U2's launch).
+- **The pooled-codes tiles** (levels whose phase comes "from the codes pooled 2x (on the fly)") never reach the device: the pooled codes
+  are a derived array without stored chunks, so `z3_chunk_raw` fails and `codes_pool2_box` runs on the reading thread, one double atan2
+  per labelled 2^3 block. Stack samples (the run as gdb's child, 10 interrupts in steady state, 12 workers / 14 slots / 4 onfly slots):
+  2.6 workers inside the pooling loop, 1.5 queued in `ob_take` for a buffer set behind them. The loop now gives the same bytes without
+  the atan2 in all but the near-tie blocks: runs of 8 empty blocks are skipped on two 64-bit tests per row, equal children return their
+  own code (the float sums' angle is theirs within 1e-6 codes), and for mixed blocks a polynomial angle (error < 1e-4 rad = 0.004
+  codes) decides the rounding wherever it lands more than 0.03 codes from a half; only the remaining near ties call the reference
+  atan2. After: 0.1 workers in the pooling, 0.6 in `ob_take`. `test_phase_pool` compares it with the reference loop (`codes_pool2_ref`,
+  `UFSM_POOL2_REF=1`): 64260 equal-children blocks, 30 M random blocks (spreads of 1-6 steps around a base code, wraps at 252, holes,
+  conflicts) and three boxes of a synthetic 150 x 201 x 333 codes array with odd edges, 0 bytes differ.
+- **The sampler-only mode capped itself**: its consuming thread computed the material / phase-known shares with a branch per voxel,
+  ~1.3 s per P 1024 batch, so the mode could not report much over 0.7 batches/s (4.4 of 12 workers waited for a slot behind it once the
+  pooling was fixed). Every rate measured before this commit (522-787 Mvox/s) is a floor for that reason; the shares are now taken once
+  per window, branch-free per 64 k voxels (`UFSM_SAMPLER_COV=0`: none), and the per-source "windows" count new windows, not batches.
+  Not re-measured: with U2 resident on the pod a full-list sampler-only run no longer fits the cgroup.
+- U2 itself (8 workers / 10 slots / 4 onfly slots) logs "wait 0%" from step 200 at 0.35-0.38 samp/s beside another P 1024 training on the
+  card: the step, not the sampler, is its limit.
+
 ## One P 1024 window across both 5060 Tis: the z split for the latent net (design, 2026-11-12, branch splitwin-20261112)
 
 User: "if we can split one window across both gpus rather than just doing 2 separate inferences that would also be preferred" and
