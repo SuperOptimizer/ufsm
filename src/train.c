@@ -605,9 +605,29 @@ static int pm_used(void) { return g_unwrap && (!g_unwrap2 || g_pap_head); }
 /* one label kind of a batch (nn_label_warp's: 0 packed targets / mask, 1 phase, 2 winding mod 4 + component) into da (db): --gpu-aug 2
    batches (batch.ct8) carry source-grid labels for windows with a warped radial record, warped on the device (rad: the records' device
    copy, uploaded first by ct_upload); the rest are copies */
+static int lz_range(int P, int *z0, int *nz) { const int s = split_side(); if (!g_lsplit || s < 0) return 0; *z0 = split_z0(s, P); *nz = g_Pz; return 1; }
 static void lab_upload(int kind, const batch *b, uint8_t *da, uint8_t *db, const uint8_t *ha, const uint8_t *hb, const void *rad, int B, int P, int async) {
     void (*cp)(void *, const void *, size_t) = async ? nn_h2d_copy_stream : nn_h2d;
     const size_t p3 = (size_t)g_Pz * P * P;
+    int z0, nz;
+    if (b->ct8 && lz_range(P, &z0, &nz)) {   /* --split z, --gpu-aug batches (B 1, inside a split_run job): this half's planes [z0, z0 + nz) of the window,
+                                               from the source planes [s0, s1) its warp / symmetry reads; the bytes are the whole-window builders' planes */
+        const size_t P2 = (size_t)P * P; int32_t h[8]; memcpy(h, b->rad, sizeof h);
+        const int warped = h[6] & 1, ident = (h[5] & 0x73f) == (0 | 1 << 2 | 2 << 4); int s0, s1; nn_aug_src_range(b->rad, P, z0, nz, &s0, &s1);
+        const float *cs, *sn; sample_phase_cssn(&cs, &sn);
+        if (kind == 0) { fprintf(stderr, "split: packed targets (--pack-targets) under --gpu-aug are not split\n"); abort(); }
+        if (b->w4r && (kind == 1 || kind == 2)) {
+            if (kind == 2) nn_w4runs_label_z(b->side, (const w4runs *)b->w4r, rad, warped, h[5], P, z0, nz, s0, s1, da, db, cs, sn, async);
+            else if (warped) nn_label_warp_z(1, b->side, nullptr, rad, P, z0, nz, s0, s1, da, nullptr, cs, sn, async);
+            else if (ident) cp(da, b->side + (size_t)z0 * P2, (size_t)nz * P2);
+            else nn_label_sym_z(b->side, h[5], P, z0, nz, s0, s1, da, async);
+            return;
+        }
+        if (kind == 3 && b->inkb && ha == b->ink) { nn_ink_bits_z(b->ct8, b->inkb, b->ink_it[0], rad, warped, h[5], P, z0, nz, s0, s1, da, async); return; }
+        if (g_gpu_aug == 2 && warped) { nn_label_warp_z(kind, ha, hb, rad, P, z0, nz, s0, s1, da, db, cs, sn, async); return; }
+        cp(da, ha + (size_t)z0 * P2, (size_t)nz * P2); if (db) cp(db, hb + (size_t)z0 * P2, (size_t)nz * P2);
+        return;
+    }
     if (b->w4r && (kind == 1 || kind == 2)) {   /* --gpu-aug 3 runs slots: the phase on the source grid, the winding rebuilt from it on the device */
         const float *cs, *sn; sample_phase_cssn(&cs, &sn);
         for (int s = 0; s < B; s++) {
@@ -657,10 +677,20 @@ static void lab_stream(gpu_state *d, const batch *b, int i, const void *rad, int
 }
 /* the input channel(s) and radial records of a batch into the device buffers x / rad (async: on the copy stream). --gpu-aug batches
    (batch.ct8): the records first, then each window's CT channel built on the device from its bytes (nn_aug_ct) */
+static int g_split_same;   /* --split z on one device (--gpus d,d: tests) */
+static void zc_xchg(void *ctx, int peer, const void *send_d, size_t ns, void *recv_d, size_t nr, void *stream) { (void)ctx; (void)peer; split_xchg(send_d, ns, recv_d, nr, stream); }
+static void zc_sum(void *ctx, void *d, int n, int type, void *stream) { (void)ctx; split_sum(d, n, type, stream); }
 static void ct_upload(const batch *b, void *x, void *rad, int B, int P, int async) {
     const size_t p3 = (size_t)g_Pz * P * P;
     if (b->ct8) {
         if (async) nn_h2d_copy_stream(rad, b->rad, rad_bytes(B)); else nn_h2d(rad, b->rad, rad_bytes(B));
+        int z0, nz;
+        if (lz_range(P, &z0, &nz)) {   /* --split z: this half's planes; the scanner ops exchange halos / carries / statistics through split.c */
+            const int r = split_side();
+            const nn_zcomm zc = {nullptr, r, 2, g_split_same ? r : 0, split_z0(1 - r, P), g_Pz, nullptr, zc_xchg, zc_sum};
+            nn_aug_ct_z(b->ct8, (const scan_ct_rec *)b->aug, b->rad, rad, P, z0, nz, x, &zc, async);
+            return;
+        }
         for (int s = 0; s < B; s++) nn_aug_ct(b->ct8 + (size_t)s * p3, (const scan_ct_rec *)b->aug + s, (const char *)rad + (size_t)s * NN_RAD_REC(g_Pw), P, (char *)x + (size_t)s * p3 * xbytes(), async);
         return;
     }
@@ -718,8 +748,10 @@ static const batch *batch_view(batch *v, const batch *b, gpu_state *d, int i, in
 #define BV(f) do { if (b->f) v->f = b->f + o; } while (0)
     if (b->x16) v->x16 = b->x16 + o;   /* (the device-built input: one channel per sample) */
     if (b->x) v->x = b->x + o;
-    BV(t); BV(m); BV(band); BV(side); BV(pm); BV(wind); BV(pap); BV(w4); BV(wcomp); BV(ink); BV(tm);
-    for (int j = 0; j < 4; j++) if (b->aux[j]) v->aux[j] = b->aux[j] + o;
+    if (!b->ct8) {   /* (--gpu-aug batches: the label planes stay the whole window's, source grid or not; lab_upload builds this half's range) */
+        BV(t); BV(m); BV(band); BV(side); BV(pm); BV(wind); BV(pap); BV(w4); BV(wcomp); BV(ink); BV(tm);
+        for (int j = 0; j < 4; j++) if (b->aux[j]) v->aux[j] = b->aux[j] + o;
+    }
 #undef BV
     if (b->rad) {
         if (!d->radv[i]) d->radv[i] = nn_host_alloc(NN_RAD_REC(g_Pw));
@@ -2100,6 +2132,18 @@ static double fetch_loss(gpu_state *d, int B, int P, float dice_w, float *out) {
 
 /* --split z: forward, loss and backward of one window on both GPUs (src/split.h) */
 typedef struct { gpu_state *G; int B, P, train; float dice_w; } split_arg;
+/* --split z: both halves' uploads of one batch in a split_run job (the --gpu-aug builders exchange planes / carries / statistics through
+   split.c's collectives, which need both sides' threads): op 0 upload_async into buffer idx[side], 2 upload (synchronous) */
+typedef struct { gpu_state *G; int op; const batch *b; int idx[2], B, P; } upj_arg;
+static void upload_job(int side, void *a) {
+    upj_arg *u = a; gpu_state *d = &u->G[side];
+    if (u->op == 0) upload_async(d, u->b, u->idx[side], u->B, u->P); else upload(d, u->b, u->B, u->P);
+}
+static void split_upload(split_ctx *c, gpu_state *G, int op, const batch *b, int i0, int i1, int B, int P) {
+    upj_arg a = {G, op, b, {i0, i1}, B, P};
+    split_run(c, upload_job, &a);
+    nn_init(G[0].dev);
+}
 static void split_job(int side, void *a) {
     split_arg *s = a;
     gpu_state *d = &s->G[side];
@@ -3022,7 +3066,7 @@ int cmd_train(int argc, char **argv) {
         g_gpu_aug_want = atoi(opt(argc, argv, "--gpu-aug", newdef ? "2" : "0"));   /* --gpu-aug 1: the CT channel built on the device (nn_aug_ct); 2: also the warped windows' labels (nn_label_warp) */
         if (g_gpu_aug_want < 0 || g_gpu_aug_want > 3) { fprintf(stderr, "--gpu-aug: 0, 1, 2 or 3\n"); return 2; }
         if (g_gpu_aug_want == 3) { g_w4dev_want = 1; g_gpu_aug_want = 2; }   /* 3: 2 and the winding mod 4's per-voxel work on the device (band_wind4_dev: the same label bytes) */
-        if (atoi(opt(argc, argv, "--overfit", "0")) || split) g_gpu_aug_want = 0;
+        if (atoi(opt(argc, argv, "--overfit", "0")) || (split && !g_lsplit)) g_gpu_aug_want = 0;   /* (--lat --split z: each half builds its planes, lab_upload / ct_upload) */
         /* the MX input conversion it needs depends on the memory mode (MX gradients): settled after the planner (gpu_input_settle) */
     }
     {   /* --pack-targets 1 (default where it applies): hard two-class targets (every source's recto target side-encoded: 0 / 255 in both
@@ -3202,8 +3246,8 @@ int cmd_train(int argc, char **argv) {
     }
     if (g_lsplit) {   /* from here on the device side sees its half as the window (the sampler's config above keeps P^3 windows) */
         g_Pz = g_Dl;
-        if (!g_gpu_want || g_gpu_aug_want || g_fibn || g_pg_lambda > 0 || g_count_lambda > 0 || g_pap_head || g_distill || g_lat_fit || (g_lat_guide && g_lat_guide != 64)) {
-            fprintf(stderr, "--lat 4 --split z: the device-built input (--gpu-input 1) with host-built windows (--gpu-aug 0 for now), no "
+        if (!g_gpu_want || g_fibn || g_pg_lambda > 0 || g_count_lambda > 0 || g_pap_head || g_distill || g_lat_fit || (g_lat_guide && g_lat_guide != 64)) {
+            fprintf(stderr, "--lat 4 --split z: the device-built input (--gpu-input 1), no packed targets under --gpu-aug, no "
                             "--fib-normal-lambda, --pgrad-lambda, --count-lambda, --pap-head, --distill, --lat-fit; --lat-guide 0 or 3\n"); return 2; }
         fprintf(stderr, "split: one %d^3 window on 2 GPUs, each %d planes (%d owned + %d halo voxels = %d trunk cells)\n", P, g_Dl, P / 2, g_h0, g_h0 / 4);
     }
@@ -3523,8 +3567,8 @@ int cmd_train(int argc, char **argv) {
                    pre-pass slab at a time instead of a whole layer's (-17 B per level-0 voxel at 32 channels) */
                 const int gdef = (getenv("UFSM_GN_DEFER") ? atoi(getenv("UFSM_GN_DEFER")) : 1) && !split && !cand[c].l3 && cfg.widths[0] % 32 == 0;
                 const size_t grec = unet_grad_mx4() && (cfg.widths[0] % 32 == 0 || lp_gyrec_narrow()) && (getenv("UFSM_GYREC") ? atoi(getenv("UFSM_GYREC")) : 1)
-                                    ? (gdef ? (size_t)100 << 20 : (size_t)B * cfg.widths[0] * p3 * 136 / 256) : 0;
-                need = grec + tb + tb / 14 + trainer + (nn_get_loss_tol() ? (size_t)B * p3 : 0) + (g_aff ? (size_t)2 * B * p3 : 0) + (g_fibdir > 0 ? (size_t)8 * B * p3 : 0) + (g_unwrap ? (g_head_slab ? (size_t)4 * B * p3 + (size_t)g_hs_z * P * P * (2 * g_cout + 11) + 4096 : (size_t)15 * B * p3) + (g_unwrap2 ? (size_t)4 * B * p3 : 0) + ((size_t)2 * g_naux * B * p3 + (size_t)(3 * (g_rv != 0) + 2 * (g_ink2 || (g_fibn && !g_rv))) * g_hs_z * P * P) : 0) + (g_cond ? (size_t)7 * B * p3 : 0) + (g_pap_head ? (size_t)4 * B * p3 : 0) + (g_restore ? (size_t)B * p3 * (cand[c].lean ? 5 : 1) + restore_scratch_bytes(g_Pz, P, P, fminf(g_rr.sc_step[0], 4.f)) + 256 : 0) + ((size_t)550 << 20) + (split ? (size_t)4 * B * 32 * P * P * 2 : 0) + (g_gpu_aug_want && gin ? nn_aug_device_bytes(P) + (g_gpu_aug_want == 2 ? nn_label_warp_device_bytes(P) : 0) : 0);   /* split: two slots of halo send / receive planes */   /* kernel workspaces: measured device growth / tracked ~1.07 + 0.3 GB, + 0.2 GB margin for other processes */
+                                    ? (gdef ? (size_t)100 << 20 : (size_t)B * cfg.widths[0] * (g_lat ? p3 / 64 : p3) * 136 / 256) : 0;   /* (--lat: level 0 is the 4^3-cell grid; the split's whole layer was counted per voxel: 77 GB at P 1024) */
+                need = grec + tb + tb / 14 + trainer + (nn_get_loss_tol() ? (size_t)B * p3 : 0) + (g_aff ? (size_t)2 * B * p3 : 0) + (g_fibdir > 0 ? (size_t)8 * B * p3 : 0) + (g_unwrap ? (g_head_slab ? (size_t)4 * B * p3 + (size_t)g_hs_z * P * P * (2 * g_cout + 11) + 4096 : (size_t)15 * B * p3) + (g_unwrap2 ? (size_t)4 * B * p3 : 0) + ((size_t)2 * g_naux * B * p3 + (size_t)(3 * (g_rv != 0) + 2 * (g_ink2 || (g_fibn && !g_rv))) * g_hs_z * P * P) : 0) + (g_cond ? (size_t)7 * B * p3 : 0) + (g_pap_head ? (size_t)4 * B * p3 : 0) + (g_restore ? (size_t)B * p3 * (cand[c].lean ? 5 : 1) + restore_scratch_bytes(g_Pz, P, P, fminf(g_rr.sc_step[0], 4.f)) + 256 : 0) + ((size_t)550 << 20) + (split ? (size_t)4 * B * 32 * P * P * 2 : 0) + (g_gpu_aug_want && (gin || g_lat) ? (g_lsplit ? nn_aug_device_bytes_z(P, g_gpu_aug_want >= 2 && !g_w4dev_want ? 2 * P : P, g_Pz, 16) : nn_aug_device_bytes(P) + (g_gpu_aug_want == 2 ? nn_label_warp_device_bytes(P) : 0)) : 0);   /* split: two slots of halo send / receive planes */   /* kernel workspaces: measured device growth / tracked ~1.07 + 0.3 GB, + 0.2 GB margin for other processes */
                 if (g_lat) need += (xin_sep ? 0 : xinb) + (g_tm_unused ? 0 : batb) + (g_lat_hs ? ((size_t)LNC * (LGFC < LNC ? 6 : 4) + (size_t)LGFC * 4) * (size_t)(g_hs_z / 4 + 2) * (P / 4) * (P / 4) + (g_lat_fuse ? nn_lat_fuse_part(7, P / 4, P / 4, g_hs_z) : 0) : ((size_t)LNC * 2 + (size_t)LGFC * 4) * (p3 / 64));   /* --lat: the full-resolution batch beside the cell-grid network, the coarse logit gradient (fp32 + 16-bit) */
                 if (g_ssl) need += (size_t)g_ssl * g_ssl_S * 5 + (size_t)g_ssl_npts * (g_ssl * 8 + 8) + 4096 + (size_t)g_sslh.nslot * (g_Pz / 4) * (P / 4) * (P / 4);   /* (+ --ssl-heads: a byte per head channel and cell) */
                   /* --ssl: int8 targets + the side head's fp32 gradient, the hinge's
@@ -3547,7 +3591,7 @@ int cmd_train(int argc, char **argv) {
                 }
                 if (g_mil) need += mil_bytes();
                 if (getenv("UFSM_MEM_REPORT") && atoi(getenv("UFSM_MEM_REPORT")) >= 2) {   /* the task term's parts (GB; the window's full-resolution planes, bytes per voxel) */
-                    const size_t v = (size_t)B * p3, aug = g_gpu_aug_want && gin ? nn_aug_device_bytes(P) + (g_gpu_aug_want == 2 ? nn_label_warp_device_bytes(P) : 0) : 0;
+                    const size_t v = (size_t)B * p3, aug = g_gpu_aug_want && (gin || g_lat) ? (g_lsplit ? nn_aug_device_bytes_z(P, g_gpu_aug_want >= 2 && !g_w4dev_want ? 2 * P : P, g_Pz, 16) : nn_aug_device_bytes(P) + (g_gpu_aug_want == 2 ? nn_label_warp_device_bytes(P) : 0)) : 0;
                     const size_t uwp = g_unwrap ? (size_t)4 * v + (g_unwrap2 ? (size_t)4 * v : 0) + (size_t)2 * g_naux * v : 0;
                     const size_t uws = g_unwrap && g_head_slab ? (size_t)g_hs_z * P * P * (2 * g_cout + 11) + (size_t)(3 * (g_rv != 0) + 2 * (g_ink2 || (g_fibn && !g_rv))) * g_hs_z * P * P : 0;
                     const size_t latb = g_lat ? (xin_sep ? 0 : xinb) + (g_tm_unused ? 0 : batb) : 0;
@@ -3967,6 +4011,7 @@ int cmd_train(int argc, char **argv) {
     if (cfg.gn_ema) fprintf(stderr, " (GroupNorm: running statistics, %ld updates so far)", unet_gn_ema_updates(G[0].u));
     if (g_Pz != P) fprintf(stderr, ": %zu params; window %dx%dx%d (slab) B=%d x %d GPU(s) [", np, g_Pz, P, P, B, ng); else fprintf(stderr, ": %zu params; P=%d B=%d x %d GPU(s) [", np, P, B, ng); for (int g = 0; g < ng; g++) fprintf(stderr, "%s%d", g ? "," : "", devs[g]); fprintf(stderr, "] %s%s\n", nn_get_tf32() ? "tensor cores (see precision.txt for compute and storage)" : "fp32", split ? ", each window split along z" : "");
     split_ctx *sctx = split ? split_create(devs[0], devs[1]) : nullptr;
+    g_split_same = split && devs[0] == devs[1];
     nn_init(G[0].dev);
     float *gpeer = ng > 1 ? nn_malloc(np * 4) : nullptr;   /* on GPU 0: incoming gradients of the other GPUs */
     /* --accum K: gradient accumulation, K windows (steps) per optimizer update. Every step is still one window: its forward / backward, loss,
@@ -4129,7 +4174,7 @@ int cmd_train(int argc, char **argv) {
             if (!G[0].pending) {
                 double tw = now(); batch *b = sampler_next(sp); wait += now() - tw;
                 if (!b) { fprintf(stderr, "sampler stopped\n"); g_stop = 1; break; }
-                for (int g = 0; g < 2; g++) { nn_init(G[g].dev); upload_async(&G[g], b, G[g].cur, B, P); }
+                split_upload(sctx, G, 0, b, G[0].cur, G[1].cur, B, P);
                 G[0].pending = b;
             }
             for (int g = 0; g < 2; g++) {
@@ -4149,7 +4194,8 @@ int cmd_train(int argc, char **argv) {
             if (step < steps && !g_stop) {
                 double tw = now(); batch *nb = sampler_next(sp); wait += now() - tw;
                 if (!nb) { fprintf(stderr, "sampler stopped before final step\n"); training_failed = 1; break; }
-                for (int g = 0; g < 2; g++) { nn_init(G[g].dev); int nxt = G[g].cur ^ 1; upload_async(&G[g], nb, nxt, B, P); select_buf(&G[g], nxt); }
+                split_upload(sctx, G, 0, nb, G[0].cur ^ 1, G[1].cur ^ 1, B, P);
+                for (int g = 0; g < 2; g++) { nn_init(G[g].dev); select_buf(&G[g], G[g].cur ^ 1); }
                 G[0].pending = nb;
             }
         } else {
@@ -4446,7 +4492,7 @@ int cmd_train(int argc, char **argv) {
                         for (int i = 0; i < l0_recal; i++) {
                             batch *rb = sampler_next(rq);
                             if (!rb) break;
-                            for (int g = 0; g < nv; g++) { nn_init(G[g].dev); upload(&G[g], rb, B, P); }
+                            if (split) split_upload(sctx, G, 2, rb, 0, 0, B, P); else for (int g = 0; g < nv; g++) { nn_init(G[g].dev); upload(&G[g], rb, B, P); }
                             if (split) { split_arg sa = {G, B, P, 0, dice_w}; split_run(sctx, split_job, &sa); nn_init(G[0].dev); }
                             else run_batch(&G[0], B, P, dice_w, 0);
                             sampler_release(rq, rb);
@@ -4481,7 +4527,7 @@ int cmd_train(int argc, char **argv) {
                             if (!reported++) fprintf(stderr, "memory: the --val-P validation network's build took %.2f GB (%.2f reserved)\n",
                                                      f0 > nn_mem_free() ? (f0 - nn_mem_free()) / 1e9 : 0.0, g_val_reserve / 1e9);
                         } else {
-                            for (int g = 0; g < nv; g++) { nn_init(G[g].dev); upload(&G[g], vbt, B, P); }
+                            if (split) split_upload(sctx, G, 2, vbt, 0, 0, B, P); else for (int g = 0; g < nv; g++) { nn_init(G[g].dev); upload(&G[g], vbt, B, P); }
                             if (split) { split_arg sa = {G, B, P, 0, dice_w}; split_run(sctx, split_job, &sa); nn_init(G[0].dev); }
                             else if (g_restore && g_rpairs) {   /* real pairs: per source sums */
                                 run_batch(&G[0], B, P, dice_w, 0); rv_l = restore_fetch(&G[0], vp);
@@ -4515,9 +4561,10 @@ int cmd_train(int argc, char **argv) {
                     for (int g = 0; g < nv; g++) {
                         select_buf(&G[g], keep);
                         batch *pb = split ? G[0].pending : G[g].pending;
-                        if (G[g].lean && pb) { nn_init(G[g].dev); upload(&G[g], pb, B, P); }   /* one buffer: the prefetched batch was overwritten */
+                        if (G[g].lean && pb && !split) { nn_init(G[g].dev); upload(&G[g], pb, B, P); }   /* one buffer: the prefetched batch was overwritten */
                         G[g].sheet=pb && pb->sheet?pb->sheet[0]:nullptr;
                     }
+                    if (split && G[0].lean && G[0].pending) split_upload(sctx, G, 2, G[0].pending, 0, 0, B, P);   /* (split: both halves in one job) */
                 }
                 for (int g = 0; g < nv; g++) { nn_init(G[g].dev); unet_use_ema(G[g].u, 0); }
                 nn_init(G[0].dev);

@@ -7,7 +7,7 @@ O=$1; P=${2:-256}; mkdir -p $O
 HEADS=(--task unwrap2 --rv 2 --rv-iso 64 --wind4-lambda 0.25 --density-scale 4 --density-code 1 --packed-weight 8 --normal-step 1)
 EXTRA=(--lat 4 --lat-basis /vesuvius/ufsm/v2/lat/codec/klt1.lcb --lat-c 29 --lat-step 0.25 --lat-guide 3 --um-rungs 4.8,9.6:2,19.2
   --film 2 --fstem 16 --fstem-drop 0 --uw 1 --ink-head 1 --onfly-slots 1 --strict-sources 1 --det 1)
-COMMON=($SRCJ --P $P --B 1 --widths ${WIDTHS:-32,32,64,64} "${HEADS[@]}" --steps 5 --opt muon --fp4 2 --gpu-aug 0 --gpu-input 1 --mem ${MEM:-auto}
+COMMON=($SRCJ --P $P --B 1 --widths ${WIDTHS:-32,32,64,64} ${ARCH} "${HEADS[@]}" --steps 5 --opt muon --fp4 2 --gpu-aug ${GAUG:-0} --gpu-input 1 --mem ${MEM:-auto}
   --val-batches 0 --workers 2 --sampler-slots 6 --warmup 0 --seed 3 --log-every 1 "${EXTRA[@]}")
 run() { local tag=$1; shift; mkdir -p $O/$tag
   UFSM_GRAD_MX4=${GMX4:-0} UFSM_TEST_SR_OFF=${SROFF:-1} UFSM_GRAD_DUMP=$O/$tag.grad CUDA_VISIBLE_DEVICES=0 /home/forrest/bin/memcap $U train "${COMMON[@]}" --out $O/$tag "$@" > $O/$tag.log 2>&1
