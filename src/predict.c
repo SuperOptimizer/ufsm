@@ -1,5 +1,6 @@
 /* ufsm predict: sliding-window inference of a checkpoint over a CT box, written as a volcomp zarr v3
    probability pyramid (uint8 p*255, q=8) in the published layout. */
+#include "scannorm.h"
 #include "nn.h"
 #include "sysinfo.h"
 #include "checkpoint.h"
@@ -1166,6 +1167,14 @@ static size_t winauto_need(int k, int d, void *vc) {   /* the device bytes of au
            (size_t)c->shard * c->shard * c->shard + ((size_t)3 << 29);
 }
 
+/* scan_norm_stats' level opener over the predict store (the working level: the open handle) */
+typedef struct { store *s; const char *key; double um; const char *cache; int level; z3 *ct; z3 *z[16]; } pn_ctx;
+static z3 *pn_open(void *ctx, int l) {
+    pn_ctx *c = ctx; if (l < 0 || l >= 16) return nullptr;
+    if (l == c->level) return c->ct;
+    if (!c->z[l]) c->z[l] = pyramid_open_level(c->s, c->key, l, c->um, c->cache);
+    return c->z[l];
+}
 int cmd_predict(int argc, char **argv) {
     const char *bf = opt(argc, argv, "--boxes", nullptr);
     if (!bf) return predict_one(argc, argv);
@@ -1600,6 +1609,13 @@ static int predict_one(int argc, char **argv) {
     z3 *ct = pyramid_open_level(s, key, level, um, cache);
     lvc = ct ? z3_latvol(ct) : nullptr;
     if (!ct) { fprintf(stderr, "cannot open level %d of %s: %s\n", level, key, z3_error()); return 1; }
+    if (cfg.scan_norm && !(norm_sd > 0) && !lvc) {   /* a net trained with --scan-norm: this scan's per-level statistics (scannorm.h), as the sampler's */
+        pn_ctx pc = {s, key, um, cache, level, ct}; float c0, s0;
+        if (scan_norm_stats(pn_open, &pc, level, &c0, &s0, 8)) { fprintf(stderr, "predict: the net was trained with --scan-norm, but no statistics at level %d (give --norm MEAN,SD)\n", level); return 1; }
+        norm_mean = c0; norm_sd = s0;
+        fprintf(stderr, "predict: --scan-norm net: level %d center %.1f scale %.2f (the input (v - center) / scale)\n", level, c0, s0);
+        for (int l = 0; l < 16; l++) if (pc.z[l] && pc.z[l] != ct) z3_close(pc.z[l]);
+    }
     const z3_meta *m = z3_meta_of(ct);
     if (cfg.view_P && pred_view_open(&cfg, root, key, level, um, cache, opt(argc, argv, "--view-level", "0"), opt(argc, argv, "--view-map", nullptr), split)) return 1;
     int64_t bo[3] = {0, 0, 0}, bn[3] = {m->shape[0], m->shape[1], m->shape[2]};

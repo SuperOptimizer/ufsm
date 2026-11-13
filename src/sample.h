@@ -38,6 +38,8 @@ typedef struct {
     float soft;              /* > 0: soft ridge target exp(-(d/soft)^2/2) around the surface (d = chamfer distance in level-0 voxels) */
     int soft_um;             /* 1: soft (and its annealed values) is in um, the same physical width for every source and level */
     int snap;                /* align training windows to the CT chunk grid (3x fewer chunks decoded per window) */
+    int scan_norm;           /* train --scan-norm 1: the CT input (v - center) / scale per scan and level (scannorm.h) instead of each window's
+                                own z-score (a source's "norm" wins) */
     int deterministic;       /* 1: batch j holds samples j*B .. j*B+B-1, each drawn with its own rng seeded by (seed, index), and
                                 batches come out in order: runs with the same seed see the same data regardless of thread timing */
     int xfmt;                /* also fill batch.x16: 0 = no (x only), 1 = fp16, 2 = bf16 (the trainer uploads x16 straight into the network input) */
