@@ -154,6 +154,36 @@ P 1024 is 32^3 cells, so the redundant deep compute is negligible.
 
 **Attention:** the stage sees the whole window, so `--attn-pe scroll` keeps the sampler's whole-window axis record under the split.
 
+**Trainer A/B** (scripts/test/split_lat_ab.sh, P 256, both halves on GPU 0, round to nearest, the first step's loss and summed gradient,
+split vs one GPU, the scratch1 smoke sources):
+
+| net | input | loss | gradient rel (rerun noise) |
+|---|---|---|---|
+| 4 levels | --gpu-aug 2 (CT channel per half via nn_aug_ct_z) | identical | 2.2e-7 (1.9e-7) |
+| 6 levels + scroll attention, --gn-ema, --scan-norm | host-built | identical | 1.2e-7 (1.0e-7) |
+| the same | --gpu-aug 2 | identical | 1.4e-7 (1.2e-7) |
+
+The scratch1 smoke sources carry aux labels, so --gpu-aug 2 falls back to 1 there: the CT channel on the device, labels warped on the
+host. The labels' _z builders are covered by test_aug_z, but not by a trainer A/B yet.
+
+**Found while wiring this in:**
+- train set `--gpu-aug 0` under any --split, silently. A latent split now keeps it: each half builds its planes, lab_upload / ct_upload
+  inside a split_run job.
+- The planner counted the latent split's gy records per voxel instead of per cell (77 GB at P 1024).
+- The planner never counted the --gpu-aug staging for --lat. It now counts the shared staging buffer: one P^3 with --gpu-aug 3 runs
+  slots, 2 P^3 otherwise.
+
+**92 M, P 1024, --split z --split-top 3, the scratch2.launch flags** (without --ink-mil / --ink-air / --fib-head, still refused under the
+split), planned for 13.3 GB per card: 12.57 of 12.80 GB.
+
+| part | GB |
+|---|---|
+| network (lean 2, MX-fp4 gradients, shared encoder a1) | 5.38 |
+| workspace | 0.38 |
+| gy records (the deferred GN apply is off under the split) | 1.21 |
+| task (label stream, head slabs at UFSM_HEAD_SLAB_Z=16, the latent batch, the aug staging) | 5.02 |
+| fixed | 0.58 |
+
 **test_split_lat:** a 6-level net (32,32,64,64,96,96) with an attention block at P 256 (local 40 cells), against one GPU. It gives the
 same verdicts as the 4-level net:
 
