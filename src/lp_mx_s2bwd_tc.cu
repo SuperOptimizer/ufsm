@@ -550,7 +550,7 @@ static int s2b_f4(const void *gy, shape5 ys, const float *w, shape5 xs, void *gx
     if (g_s2b_f4 && C == 16 && ys.c == 16 && gdt == 4 && xdt == 4 && xs.d == 2 * ys.d && xs.h == 2 * ys.h && xs.w == 2 * ys.w) return s2b_f4q(gy, ys, w, xs, gx, accum, osr);
     /* the wide STREAM path (256..448 channels; UFSM_S2B_WIDE=0 / lp_set_s2b_wide(0) off): off for a while on 11-13 after the scratch2
        level-3 NaN, which was this kernel reading a gy that shares memory with its gx (the copy below); on again, +5.8 % at P 1024 split */
-    if (g_s2b_wide < 0) g_s2b_wide = !getenv("UFSM_S2B_WIDE") || atoi(getenv("UFSM_S2B_WIDE")) > 0;   /* (on again since the overlapping-gy copy below)
+    if (g_s2b_wide < 0) g_s2b_wide = !getenv("UFSM_S2B_WIDE") || atoi(getenv("UFSM_S2B_WIDE")) > 0;   /* (on again since the overlapping-gy copy below) */
     const bool wideC = g_s2b_wide > 0 && C >= 256 && C <= 448 && C % 32 == 0 && NCH != 11 && NCH != 13;   /* (STREAM instantiations: 8, 9, 10, 12, 14 blocks) */
     if (!g_s2b_f4 || (C != 32 && C != 64 && C != 96 && C != 128 && !wideC) || ys.c != C || gdt != 4 || (xdt != 4 && xdt != 8) || xs.d != 2 * ys.d || xs.h != 2 * ys.h || xs.w != 2 * ys.w || ys.w % 16 || ys.h % 4) return 0;
     if (C >= 64 && (g_s2b_f4 & 2) == 0) return 0;   /* UFSM_S2B_F4=1: 32 channels only (3, the default: also 64 / 96 / 128) */
