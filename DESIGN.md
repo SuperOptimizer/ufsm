@@ -6,6 +6,35 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## inkpod: the ink training run on a rented RTX PRO 6000; --ink-dice 0 from step 10036 (2026-11-12 / 13, branch inkpod2-20261113)
+
+The unified run's ink head moved off the desk (user, 11-12: "do ink detection training on the rtx6000"). inkpod = the unified run's
+flags (`--lat 4`, P 1024, B 1, `--ink-head 1 --ink-mil 1 --ink-smooth 0.1`, um-rungs 4.8,9.6:2,19.2, ...), init by head from the desk
+unified run's step 1504, master a0eecbb, then a5520d5 from pod step ~1050. Pod: 96 GB card, 27 CPUs, cgroup memory 94 GB (`free` shows 755),
+500 GB disk, glibc 2.39 (desk binaries need 2.43: built on the pod).
+
+- Data. The desk uplink is 4.2 MB/s (2 GB in 480 s over 4 streams), so the ~220 GB label set was rebuilt on the pod where public:
+  Paris 4 codes A / B / A48 and phase A (scripts/pod/p4kit.sh from the published June / July meshes; codesB 4 min and codesA48 9 min
+  at full memory), PHerc0139 phase (k0139.sh: 17,035,432,659 known voxels, the desk's count exactly). Shipped: the ink GT (1.6 GB), 1667
+  GT (20 GB, 1.5 h), 0500P2 phase, axes / holdouts. Paris 4 phase B (57 GB) did not fit beside the local CT: july is out of the pod sources.
+- CT over HTTP from the volcomp mirror: 90-113 Mvox/s at 91-92 % loader wait (latency-bound reads). `ufsm mirror` copies at 250-400 MB/s
+  (Paris 4 level 3, 12 GB, in 30 s): levels 1-5 of Paris 4 / 1667 / 0009B / MAN5 and 0139 / 0500P2 9.362 local (~235 GB), 0139 2.399 and
+  0814 on HTTP + cache. Mirror CT groups need the desk's zarr.json (absolute-um scales).
+- Host memory. The trainer alone peaks at ~83 GB at W6 / S6 (pinned slots 3.36 GB each, a worker ~2.2 GB); five cgroup OOM kills while
+  settling. Fix: the container's cgroup root split into `main` (the trainer) and `kit` (memory.max 6G) so a label build can never make the
+  OOM killer pick the trainer; rasters that need more run in a stopped-trainer window.
+- The loader bottleneck was the slot count, not the workers: W5 and W8 at S4 both ran 310-430 Mvox/s at 64-73 % wait (per-thread /proc
+  samples: 3 of 8 workers idle on a futex for 40 / 40 s, the others ~0.6 core), because each window holds its slot through its 3 replays.
+  W5 / S7: 650-850 Mvox/s at 17-38 % wait (2.5-3.8x the desk's 226 Mvox/s), anon + shmem ~67 GB.
+- Stage 2 (pod step 2010): the winding / rv sources back at 50 % of the source weight, ink 50 % (mix lines 52-54 % ink windows).
+- The window-level dice. inkB found per-window ink level steps in inkpod-9000 whole-scroll predicts (5-30 / 255 across seams, 10-14 even
+  at halo 256; GN frozen stats do not remove them; ift3 has none; ~60 / 255 in air). From the training side: `--ink-dice 0.25` adds a soft
+  dice per window over its known voxels, normalised by the window's own ink sum (a per-window gain prior); MIL is local (per ray, +/- 10
+  voxels along the face normal); ink trains at 4.8 and 9.6 (so 9.6 inference is in distribution); the ink targets label only papyrus on a
+  labelled face band, so air is never supervised. inkpod restarted at step 10036 with `--ink-dice 0` (the dice version kept as
+  inkpod-pre-nodice.ckpt). To measure: inkB's seam steps on the same 1299 box at +1000 / +2000, latres's 34-crop ink AUC for the cost.
+  Next candidate: `--ink-air W` (air voxels of ink windows -> ink 0 at a small subsampled weight).
+
 ## predict --window auto on a shared card: UFSM_MEM_FREE_GB budget, interior cap 1024 (2026-11-12, branch winauto-20261112)
 
 Pod 3 (one RTX PRO 6000, 98 GB), two unroll lanes: PHerc0814's ink pass (`--window auto`, feathered, halo 32) started on a nearly
