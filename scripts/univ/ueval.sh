@@ -5,7 +5,8 @@
 #   rv    recto / verso (scripts/rv/eval.sh: --channel rv on the ruler rows + recto-ruler), one piece per scroll of RVSC (p1667 p139 p4)
 #   ink   the 34 ink crops (16 Paris 4 + inkB's 0139 / 1667 + held-out 0500P2 / 0841), predict --heads ink at 4.8 um with the 2-pass grid
 #         blend (BLEND=1: --grid-origin 0 / 256, ink-blend --tile 512; the latent ink head's level steps at window seams, inkB), one piece
-#         per crop; 3-D ink-vscore (AUC / best F1) + 2-D render / ink-score -> $E/TAG/ink, one row in $E/ink-rows.txt
+#         per crop; 3-D ink-vscore (AUC / best F1) + 2-D render / ink-score -> $E/TAG/ink; rows in $E/ink-rows.txt: UNSEEN (PHerc0841, the
+#         headline: the universal net trains on every other ink label) and a training-fit row for the other crops
 #   fib   the Paris 4 HOLD box: predict --heads fib (FIBP=heads), fiber-trace tube / dyad, fiber-judge vs the phase GT -> $E/TAG/fib
 # GPUS: "0" (one GPU), "0 1" (a worker per GPU, pieces in parallel), or SPLIT=1: one worker holding both GPUs, every plain predict (wbench
 # fields, rv) with PX (default "--split z --gpus 0,1") and the --heads predicts with PXH (empty = GPU 0 alone: predict --heads takes no
@@ -77,9 +78,16 @@ left=$(while read -r p; do [ -e $Q/$p.done ] || echo $p; done < $Q/pieces | wc -
     [ -z "$REFS" ] && $B wbench-stats $WB/res/$T.tsv --metric p05x,ids 2>&1 | grep -E '^(p05x|ids) '; fi
   has rv && { echo "-- rv (turns per GT turn / share of intervals off >= 0.5 turn)"; for s in $RVSC; do echo "   $s $(grep -E '^ +all' $RVE/$T/$s/ruler.log 2>/dev/null | tail -1)"; done; }
   if has ink && [ -s $E/$T/ink/vscores.tsv ]; then echo "-- ink (3-D AUC / best F1, $([ ${BLEND:-1} = 1 ] && echo 2-pass blend || echo single pass))"
-    awk -F'\t' -v t=$T '{ s = ($1 ~ /^w[0-9]/) ? "PHercParis4" : substr($1, 1, index($1, "_w") - 1); c[s]++; A[s] += $6; F[s] += $8; n++; AA += $6; FF += $8 }
-      END { printf "%-16s", t; split("PHercParis4 PHerc0139 PHerc1667 PHerc0500P2 PHerc0841", o, " "); for (i = 1; i <= 5; i++) if (c[o[i]]) printf "  %s %.3f/%.3f", o[i], A[o[i]] / c[o[i]], F[o[i]] / c[o[i]]; printf "  all%d %.3f/%.3f\n", n, AA / n, FF / n }' $E/$T/ink/vscores.tsv | tee $E/$T/ink-row.txt; fi
+    # the from-scratch universal net trains on every ink label but UNSEEN's (lead 2026-11-12: the 34 crops' and 1667's holdout labels are in
+    # training; PHerc0841 is the only unseen ink): the UNSEEN crops are the headline number, the rest a training-fit row, labelled as such
+    awk -F'\t' -v t=$T -v un="${UNSEEN:-PHerc0841}" '{ s = ($1 ~ /^w[0-9]/) ? "PHercParis4" : substr($1, 1, index($1, "_w") - 1); u = (" " un " ") ~ (" " s " ")
+        if (u) { nu++; AU += $6; FU += $8 } else { c[s]++; A[s] += $6; F[s] += $8; n++; AA += $6; FF += $8 } }
+      END { if (nu) printf "%-16s  UNSEEN ink (%s, labels never trained on): n %d  auc %.3f  f1best %.3f\n", t, un, nu, AU / nu, FU / nu
+        else printf "%-16s  UNSEEN ink (%s): no crops scored\n", t, un
+        if (n) { printf "%-16s  training-fit ink (labels in training; not a generalisation number):", t; split("PHercParis4 PHerc0139 PHerc1667 PHerc0500P2", o, " ")
+          for (i = 1; i <= 4; i++) if (c[o[i]]) printf "  %s %.3f/%.3f", o[i], A[o[i]] / c[o[i]], F[o[i]] / c[o[i]]; printf "  all%d %.3f/%.3f\n", n, AA / n, FF / n } }' \
+      $E/$T/ink/vscores.tsv | tee $E/$T/ink-row.txt; fi
   has fib && { echo "-- fib (fiber-judge vs the phase GT)"; for f in $E/$T/fib/*.judge; do [ -s $f ] && sed "s|^|   $(basename $f .judge) |" $f; done; }
 } > $E/$T.ueval.txt
-[ -s $E/$T/ink-row.txt ] && { grep -qF "$(cat $E/$T/ink-row.txt)" $E/ink-rows.txt 2>/dev/null || cat $E/$T/ink-row.txt >> $E/ink-rows.txt; }
+[ -s $E/$T/ink-row.txt ] && while IFS= read -r l; do grep -qxF "$l" $E/ink-rows.txt 2>/dev/null || echo "$l" >> $E/ink-rows.txt; done < $E/$T/ink-row.txt
 cat $E/$T.ueval.txt | tee -a $LG
