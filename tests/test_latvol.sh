@@ -18,7 +18,9 @@ D=$(mktemp -d /tmp/test_latvol_XXXXXX)
 SRV=
 fail() { echo "FAIL: $*"; echo "kept $D"; [ -n "$SRV" ] && kill "$SRV" 2> /dev/null; exit 1; }
 "$F" "$D/fx" 256 2 1 > "$D/fx.log" 2>&1 || fail "fixture"
-T="--task unwrap2 --B 1 --gpus 0 --workers 2 --sampler-slots 4 --val-batches 0 --log-every 1 --ckpt-every 1000 --fp4 2 --input-prec 8 --warmup 0 --seed ${LT_SEED:-5} --wind4-tile 0 --levels 1 --lat 4"
+# --det 1: batches in batch order, not in the order the 2 workers finish them -- under --det 0 a shared GPU reordered the 6-step
+# nets' windows and moved the n3 agreement (2026-11-12 merge batch 15: 0.885 under load, 0.9265 alone)
+T="--det 1 --task unwrap2 --B 1 --gpus 0 --workers 2 --sampler-slots 4 --val-batches 0 --log-every 1 --ckpt-every 1000 --fp4 2 --input-prec 8 --warmup 0 --seed ${LT_SEED:-5} --wind4-tile 0 --levels 1 --lat 4"
 # shellcheck disable=SC2086
 "$U" train "$D/fx/sources.json" --out "$D/fit" --P 128 --widths 32,64,128 --steps 20 $T --lat-fit "$D/basis.lcb" --lat-fit-n 8 > "$D/fit.log" 2>&1 || fail "lat-fit ($D/fit.log)"
 L="--lat-basis $D/basis.lcb --lat-c 29 --lat-step 0.25 --lat-step-jitter 0.3"
