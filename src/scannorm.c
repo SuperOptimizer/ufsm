@@ -67,3 +67,84 @@ int scan_norm_stats(z3 *(*open)(void *ctx, int level), void *ctx, int L, float *
     *center = (float)mean; *scale = (float)(sd > 0 ? sd : 1.0);
     return 0;
 }
+
+/* ---- scan_norm_stats_cached: per process (one entry per key, computed once, waiters block on it) and on disk ---- */
+#include <errno.h>
+#include <openssl/evp.h>
+#include <pthread.h>
+#include <sys/stat.h>
+#include <unistd.h>
+typedef struct sn_ent { char *key; int state, rc; float c, s; struct sn_ent *next; } sn_ent;   /* state 0 computing, 1 done */
+static pthread_mutex_t sn_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t sn_cv = PTHREAD_COND_INITIALIZER; static sn_ent *sn_tab;
+static int sn_key(z3 *(*open)(void *, int), void *ctx, int L, char *out, size_t n) {   /* the identity of what scan_norm_stats reads */
+    size_t o = (size_t)snprintf(out, n, "scannorm v1 L %d", L);
+    for (int l = L; l < L + 10 && l < 16; l++) {
+        if (l == L + 1) continue;
+        z3 *z = open(ctx, l); if (!z) { if (l == L) return -1; continue; }
+        if (z3_base_of(z)) return -1;   /* (a derived array: its values are not the store's; no sharing, no disk) */
+        const z3_meta *m = z3_meta_of(z);
+        o += (size_t)snprintf(out + o, o < n ? n - o : 0, "|%d %s/%s %lld %lld %lld", l, z3_root(z), z3_key(z) ? z3_key(z) : "",
+                              (long long)m->shape[0], (long long)m->shape[1], (long long)m->shape[2]);
+        if (l == L && z3_root(z)[0] == '/') {   /* (a local level L: its zarr.json's size / mtime, so a rewritten scan misses) */
+            char p[2400]; struct stat st; snprintf(p, sizeof p, "%s/%s/zarr.json", z3_root(z), z3_key(z) ? z3_key(z) : "");
+            if (!stat(p, &st)) o += (size_t)snprintf(out + o, o < n ? n - o : 0, " %lld %lld", (long long)st.st_size, (long long)st.st_mtime);
+        }
+    }
+    return o < n ? 0 : -1;
+}
+static int sn_path(const char *key, char *out, size_t n) {
+    if (getenv("UFSM_SCANNORM_CACHE") && !atoi(getenv("UFSM_SCANNORM_CACHE"))) return -1;
+    const char *d = getenv("UFSM_SCANNORM_DIR"); char dd[1024];
+    if (!d || !*d) { const char *h = getenv("HOME"); if (!h) return -1; snprintf(dd, sizeof dd, "%s/.cache/ufsm/scannorm", h); d = dd; }
+    char tmp[1024]; snprintf(tmp, sizeof tmp, "%s", d);   /* mkdir -p */
+    for (char *q = tmp + 1; *q; q++) if (*q == '/') { *q = 0; mkdir(tmp, 0755); *q = '/'; }
+    if (mkdir(tmp, 0755) && errno != EEXIST) return -1;
+    unsigned char h[32]; unsigned nh = 0;
+    if (!EVP_Digest(key, strlen(key), h, &nh, EVP_sha256(), nullptr) || nh != 32) return -1;
+    size_t o = (size_t)snprintf(out, n, "%s/", d); for (int i = 0; i < 12 && o + 3 < n; i++) o += (size_t)snprintf(out + o, n - o, "%02x", h[i]);
+    if (o + 5 < n) snprintf(out + o, n - o, ".txt"); else return -1;
+    return 0;
+}
+static int sn_disk_get(const char *key, int *rc, float *c, float *s) {   /* the file: key line, then "rc cbits sbits" */
+    char p[1200]; if (sn_path(key, p, sizeof p)) return -1;
+    FILE *f = fopen(p, "rb"); if (!f) return -1;
+    size_t kl = strlen(key); char *ln = malloc(kl + 2); int ok = ln && fgets(ln, (int)kl + 2, f) && !strncmp(ln, key, kl) && ln[kl] == '\n';
+    unsigned cb = 0, sb = 0; ok = ok && fscanf(f, "%d %x %x", rc, &cb, &sb) == 3;
+    free(ln); fclose(f);
+    if (!ok) return -1;
+    memcpy(c, &cb, 4); memcpy(s, &sb, 4); return 0;
+}
+static void sn_disk_put(const char *key, int rc, float c, float s) {
+    if (rc == -4 || rc == -6) return;   /* (read failures are not facts about the scan) */
+    char p[1200], t[1300]; if (sn_path(key, p, sizeof p)) return;
+    snprintf(t, sizeof t, "%s.%d.tmp", p, (int)getpid());
+    FILE *f = fopen(t, "wb"); if (!f) return;
+    unsigned cb, sb; memcpy(&cb, &c, 4); memcpy(&sb, &s, 4);
+    fprintf(f, "%s\n%d %08x %08x\n", key, rc, cb, sb);
+    if (fclose(f) || rename(t, p)) unlink(t);
+}
+int scan_norm_stats_cached(z3 *(*open)(void *ctx, int level), void *ctx, int L, float *center, float *scale, int nthreads, int *cached) {
+    char key[4096];
+    if (cached) *cached = 0;
+    if (sn_key(open, ctx, L, key, sizeof key)) return scan_norm_stats(open, ctx, L, center, scale, nthreads);
+    pthread_mutex_lock(&sn_mu);
+    sn_ent *e = sn_tab; while (e && strcmp(e->key, key)) e = e->next;
+    if (e) {
+        while (!e->state) pthread_cond_wait(&sn_cv, &sn_mu);
+        const int rc = e->rc; if (!rc) { *center = e->c; *scale = e->s; }
+        pthread_mutex_unlock(&sn_mu); if (cached) *cached = 1; return rc;
+    }
+    e = calloc(1, sizeof *e); e->key = strdup(key); e->next = sn_tab; sn_tab = e;
+    pthread_mutex_unlock(&sn_mu);
+    int rc; float c = 0, s = 0; int hit = !sn_disk_get(key, &rc, &c, &s);
+    if (!hit) { rc = scan_norm_stats(open, ctx, L, &c, &s, nthreads); sn_disk_put(key, rc, c, s); }
+    pthread_mutex_lock(&sn_mu); e->rc = rc; e->c = c; e->s = s; e->state = 1; pthread_cond_broadcast(&sn_cv); pthread_mutex_unlock(&sn_mu);
+    if (hit && getenv("UFSM_SCANNORM_VERIFY") && atoi(getenv("UFSM_SCANNORM_VERIFY"))) {   /* tests: the cached bits = a fresh computation */
+        float c2 = 0, s2 = 0; const int r2 = scan_norm_stats(open, ctx, L, &c2, &s2, nthreads);
+        if (r2 != rc || (!rc && (memcmp(&c2, &c, 4) || memcmp(&s2, &s, 4)))) { fprintf(stderr, "scannorm: the cached statistics differ from a fresh computation (%s)\n", key); abort(); }
+        fprintf(stderr, "scannorm: verified %s\n", key);
+    }
+    if (!rc) { *center = c; *scale = s; }
+    if (cached) *cached = hit;
+    return rc;
+}
