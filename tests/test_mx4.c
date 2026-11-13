@@ -467,6 +467,27 @@ int main(void) {
                 check("s2 bwd_data 64 ch fp4 kernel taken", e6[1] != e6[0]);
                 nn_free(w64); nn_free(gy6); nn_free(old6); nn_free(gr6); nn_free(scr6); nn_free(gy6m); nn_free(old6m); nn_free(gy6d); nn_free(old6d);
             }
+            for (int wc = 0; wc < 2; wc++) {   /* 256 / 320 channels (the 92 M net's down0 / down1, 2026-11-13): the weight-streaming fp4 kernel
+                                                  (NCH 8 / 10) and the dilated path it replaces, against the reference, accumulating */
+                const int CW = wc ? 320 : 256;
+                shape5 xw = {N, CW, 32, 32, 32}, yw = {N, CW, 16, 16, 16};
+                const size_t nxw = shape_numel(xw), nyw = shape_numel(yw);
+                float *ww = dev_rand((size_t)CW * CW * 27, 0.07f * sqrtf(64.f / CW)), *gyw = dev_rand(nyw, 1e-2f), *oldw = dev_rand(nxw, 1e-2f), *grw = dev_zero(nxw);
+                float *scrw = nn_malloc(nn_conv3d_scratch(xw, CW, 3) * 2 + nxw * 4);
+                void *gywm = mx4_from(gyw, yw), *oldwm = mx4_from(oldw, xw); float *gywd = deq4(gywm, yw), *oldwd = deq4(oldwm, xw);
+                mode_ref(); nn_conv3d_bwd_data(gywd, yw, ww, xw, 3, 2, grw, scrw); nn_axpy(grw, 1.f, oldwd, nxw);
+                double ew[2];
+                for (int f4 = 0; f4 < 2; f4++) {
+                    void *gw = mx4_from(oldw, xw); lp_set_s2b_f4(f4 ? 3 : 0);
+                    mode_mx(); nn_conv3d_bwd_data_acc(gywm, yw, ww, xw, 3, 2, (float *)gw, scrw);
+                    char nm[96]; snprintf(nm, sizeof nm, "s2 bwd_data %d ch mx4 (acc), %s", CW, f4 ? "fp4 streaming kernel" : "dilated path");
+                    ew[f4] = cmp(nm, deq4(gw, xw), grw, nxw, TOL4);
+                    nn_free(gw);
+                }
+                lp_set_s2b_f4(-1);
+                char nm[96]; snprintf(nm, sizeof nm, "s2 bwd_data %d ch fp4 kernel taken", CW); check(nm, ew[1] != ew[0]);
+                nn_free(ww); nn_free(gyw); nn_free(oldw); nn_free(grw); nn_free(scrw); nn_free(gywm); nn_free(oldwm); nn_free(gywd); nn_free(oldwd);
+            }
             nn_free(gyb); nn_free(old); nn_free(gxr); nn_free(scr); nn_free(gym); nn_free(oldm); nn_free(gyd); nn_free(oldd);
             nn_free(xx); nn_free(tb); nn_free(yrb); nn_free(xxm); nn_free(xxd);
         }
