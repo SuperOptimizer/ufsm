@@ -1,0 +1,9 @@
+# name	scroll	root	key	um	level	z	y	x	nz	ny	nx	axis	papyrus_share	r_frac   (scripts/univ/unseen_boxes.py)
+U0800	PHerc0800	/vesuvius/ufsm/v2/ct	PHerc0800/20250521135224-8.640um-1.2m-116keV-masked.zarr	8.64	0	10672	4320	5488	512	512	512	/vesuvius/ufsm/corpus/PHerc0800/axis.json	0.518	0.50
+U0826	PHerc0826	/vesuvius/ufsm/v2/ct	PHerc0826/20250821151701-9.362um-1.2m-113keV-masked.zarr	9.362	0	7088	5120	2320	512	512	512	/vesuvius/ufsm/corpus/PHerc0826/axis.json	0.444	0.65
+U0175B	PHerc0175B	/vesuvius/ufsm/v2/ct	PHerc0175B/20250521125822-8.640um-1.2m-116keV-masked.zarr	8.64	0	7472	3392	3760	512	512	512	/vesuvius/ufsm/corpus/PHerc0175B/axis.json	0.735	0.50
+U0306B	PHerc0306B	/vesuvius/ufsm/v2/ct	PHerc0306B/20250521133212-8.640um-1.2m-116keV-masked.zarr	8.64	0	7744	4048	3312	512	512	512	/vesuvius/ufsm/corpus/PHerc0306B/axis.json	0.686	0.35
+U0483A	PHerc0483A	/vesuvius/ufsm/v2/ct	PHerc0483A/20250521140913-8.640um-1.2m-116keV-masked.zarr	8.64	0	7536	2752	4080	512	512	512	/vesuvius/ufsm/corpus/PHerc0483A/axis.json	0.443	0.50
+U0490A	PHerc0490A	/vesuvius/ufsm/v2/ct	PHerc0490A/20250521151210-8.640um-1.2m-116keV-masked.zarr	8.64	0	4992	5184	5424	512	512	512	/vesuvius/ufsm/corpus/PHerc0490A/axis.json	0.635	0.65
+U0846A	PHerc0846A	/vesuvius/ufsm/v2/ct	PHerc0846A/20250728152254-9.362um-1.2m-113keV-masked.zarr	9.362	0	5440	2752	2256	512	512	512	/vesuvius/ufsm/corpus/PHerc0846A/axis.json	0.498	0.65
+U0343	PHerc0343	/vesuvius/ufsm/v2/ct	PHerc0343/20250521140437-8.640um-1.2m-116keV-masked.zarr	8.64	0	7824	2976	3744	512	512	512	/vesuvius/ufsm/corpus/PHerc0343/axis.json	0.600	0.65
