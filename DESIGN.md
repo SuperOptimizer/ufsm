@@ -46,7 +46,26 @@ path's output SR, a split input); GN + SiLU inputs (prenorm path) and random wei
 the host's, mode 3 keeps whole 2 x 2 blocks two per row and column, SR-STE touches exactly the pruned weights; mode-3 flipped
 weights pass the prep without truncation; conv_fwd_tc routes registered weights to the sparse kernel and others to the dense one.
 
-**Numbers:** pending GPU time (the scratch2 launch holds the GPUs and the suite locks).
+**Numbers.** MMA only (tests/test_sp24_mma, dense-equivalent TFLOP/s): 5060 Ti dense mxf4 432, sparse mxf4 865, sparse mxf4nvf4 4X
+851, e4m3 dense 212 / sparse 424 (RTX PRO 6000 MIG 1g slice: 401 / 802): the sparse tensor core is a true 2x. Measured layout: the
+metadata lane (g, t) holds row g + 8 (t & 1), groups 8 (t >> 1) .. + 7; scales as the dense MMA (4X: one byte per 32 K). The first
+kernel used the other lane candidate (row g + 8 (t >> 1)) and failed test_sp24_conv; with the measured one every case is byte-identical
+to the dense kernel, including GN inputs and random weights (the fp32 sums happen to round the same).
+
+Conv time (tests/bench_sp24, 5060 Ti, one 32-plane slab of the P 1024 half window per level, GN + SiLU input and output statistics
+for fwd, MX-fp4 gy with output SR for bdata, min of 3, prepared-weight memo on):
+
+| level | shape | fwd dense / sparse ms | bdata dense / sparse ms |
+|---|---|---|---|
+| 0 | 32 x 256^2 x 256 ch | 34.5 / 27.4 (1.26x) | 34.4 / 27.9 (1.23x) |
+| 1 | 32 x 128^2 x 320 | 12.8 / 10.4 (1.24x) | 12.4 / 10.0 (1.24x) |
+| 2 | 32 x 64^2 x 384 | 4.57 / 3.67 (1.25x) | 4.44 / 3.55 (1.25x) |
+| 3 | 16 x 32^2 x 448 | 0.81 / 0.63 (1.27x) | 0.79 / 0.62 (1.29x) |
+
+The sparse kernel reaches 270-290 TFLOP/s dense-equivalent against the dense one's ~215 (of the 432 MMA peak): halving the MMAs
+gives 1.25x, because staging and the B ldmatrix (unchanged) now dominate. With conv_fwd_f4_k at 27 % of the 92 M step (perf2:
+442 of 1610 ms at P 512) that is ~5 % of the step for mode 3 and ~3.5 % for mode 2, before any quality cost. More needs the staging
+cost per MMA cut (a wider output tile per staged input), which the dense kernel would profit from as much.
 
 ## Split-window input builders: every --gpu-aug builder by z range, the scanner split exactly across two GPUs (2026-11-13, branch augz-20261112)
 
