@@ -88,9 +88,17 @@ static pid_t spawn_pass(int argc, char **argv, const char *pout, int W, int H, i
     if (e) { fprintf(stderr, "predict --seamless: cannot start a pass: %s\n", strerror(e)); return -1; }
     return pid;
 }
-static int wait_pass(pid_t pid, const char *name) {
+static void log_tail(const char *logp) {   /* a failed pass's last lines (its log may be removed with the output later) */
+    FILE *f = logp ? fopen(logp, "rb") : nullptr; if (!f) return;
+    fseek(f, 0, SEEK_END); long n = ftell(f), k = n > 2000 ? 2000 : n; fseek(f, n - k, SEEK_SET);
+    char b[2001]; size_t r = fread(b, 1, (size_t)k, f); b[r] = 0; fclose(f);
+    for (char *c = b; *c; c++) if (*c == '\r') *c = '\n';
+    fprintf(stderr, "---- %s (tail)\n%s\n----\n", logp, b);
+}
+static int wait_pass(pid_t pid, const char *name, const char *logp) {
     int st = 0; if (waitpid(pid, &st, 0) < 0) { fprintf(stderr, "predict --seamless: wait pass %s: %s\n", name, strerror(errno)); return 1; }
     if (WIFEXITED(st) && !WEXITSTATUS(st)) return 0;
+    log_tail(logp);
     if (WIFSIGNALED(st)) fprintf(stderr, "predict --seamless: pass %s killed by signal %d\n", name, WTERMSIG(st));
     else fprintf(stderr, "predict --seamless: pass %s failed (exit %d)\n", name, WEXITSTATUS(st));
     return WIFEXITED(st) && WEXITSTATUS(st) ? WEXITSTATUS(st) : 1;
@@ -146,12 +154,12 @@ int predict_seamless(int argc, char **argv) {
     if (par) {
         const pid_t a = need_a ? spawn_pass(argc, argv, pa, W, H, S2, 0, ga, la) : 0, b = need_b ? spawn_pass(argc, argv, pb, W, H, S2, S2, gb, lb) : 0;
         if (a < 0 || b < 0) return 1;
-        const int ra = a ? wait_pass(a, "a") : 0, rb = b ? wait_pass(b, "b") : 0; rc = ra ? ra : rb;
+        const int ra = a ? wait_pass(a, "a", la) : 0, rb = b ? wait_pass(b, "b", lb) : 0; rc = ra ? ra : rb;
         if (!ra && a) fclose(fopen(da, "w"));
         if (!rb && b) fclose(fopen(db, "w"));
     } else {
-        if (need_a) { const pid_t a = spawn_pass(argc, argv, pa, W, H, S2, 0, ga, la); if (a < 0) return 1; if ((rc = wait_pass(a, "a"))) goto fail; fclose(fopen(da, "w")); }
-        if (need_b) { const pid_t b = spawn_pass(argc, argv, pb, W, H, S2, S2, gb, lb); if (b < 0) return 1; if ((rc = wait_pass(b, "b"))) goto fail; fclose(fopen(db, "w")); }
+        if (need_a) { const pid_t a = spawn_pass(argc, argv, pa, W, H, S2, 0, ga, la); if (a < 0) return 1; if ((rc = wait_pass(a, "a", la))) goto fail; fclose(fopen(da, "w")); }
+        if (need_b) { const pid_t b = spawn_pass(argc, argv, pb, W, H, S2, S2, gb, lb); if (b < 0) return 1; if ((rc = wait_pass(b, "b", lb))) goto fail; fclose(fopen(db, "w")); }
     }
     if (rc) goto fail;
     seam_store st[64]; const int ns = find_stores(pa, "", 0, st, 0, 64);
