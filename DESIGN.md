@@ -132,6 +132,46 @@ halo exchange buffers (~0.25 GB of traffic, a few planes resident) are not in it
 - Compute: level 0 dominates and grows with w0^2. 192-384 is ~4x u1's FLOPs per window: ~2x u1's per-card step time per window,
   ~4x fewer windows a second than u1 data parallel. The target is 192,256,320,384, with 160-320 as the fallback.
 
+**Planner for the target net (2026-11-12 23:00).** Setup:
+- every head of the run: --ink-head 1 --ink-mil 1 --ink-air 8, --fib-head 1, --rv 2, --fstem 16, --film 2;
+- binary: rfwide 1f881bf (latdino);
+- Pz 512 single-card proxy (nlev 6 needs Pz % 128), 13.3 GB budget, lean 2 + shared a1 chosen.
+
+Mode-4 totals with 32-plane head slabs (default):
+
+| net | params | GB |
+|---|---|---|
+| 192-384 | 40M | 13.49 |
+| 256-448 | 60M | 14.92 |
+| 256,320,384,448,288,288 + 4 attention | ~92M | 14.93 |
+| 256,320,448,512 | — | 14.94 |
+
+- The head slabs (2.68 GB with 32 outputs) and the gpu-aug staging (2.23) dominate the task term (8.86).
+- The network term is ~linear in w0 (3.79 at 192, 5.02 at 256). The deep levels and the attention add 0.01.
+- Recompute 2 is bigger than lean 2 here (16.65).
+
+UFSM_HEAD_SLAB_Z=16 halves the head slabs (2.68 -> 1.34, lat head slab 0.71 -> 0.43). Mode-4 totals with it:
+
+| net | GB |
+|---|---|
+| 92M | 13.04 |
+| 288-480 + deep | 13.75 |
+| 320-512 + deep | 14.47 |
+
+Split estimate per card:
+- start from the proxy;
+- + 6.25 % of the level 0-3 network + workspace (the 32-voxel halo; the level-4 all-gather keeps levels 4-5 whole);
+- + the planner's split halo term (0.27);
+- - univA's split scanner: staging 2.23 -> ~1.0 GB, x 1 + 1/14 margin = -1.32.
+
+| net | GB per card | headroom |
+|---|---|---|
+| 92M | 13.04 + 0.34 + 0.27 - 1.32 = **12.33** | 0.97 |
+| 288-480 | 13.08 | 0.22 |
+| 320-512 | 13.84 | refused |
+
+So the 92M target fits with HEAD_SLAB_Z 16 and the split scanner, and w0 256 is the widest with >= 0.8 GB headroom.
+
 **S1 / S2 order changed.** An inference forward of the 40M net at 1024 fits one card (no stored activations), so predict gains only
 latency from the split. Training goes first.
 
