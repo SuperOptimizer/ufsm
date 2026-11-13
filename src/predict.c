@@ -1187,8 +1187,12 @@ static void skip_ab(unet *u, const void *x2, shape5 xn, int h16, uint8_t *ctd, i
     uint8_t *A = malloc(nb), *Bm = malloc(nb); double t[2];
     const int lay = getenv("UFSM_SKIP_AB") && atoi(getenv("UFSM_SKIP_AB")) >= 2;   /* UFSM_SKIP_AB=2: per-conv forward ms (UFSM_PROF layers) */
     static double (*pl)[UNET_NSLOT][3]; static double pc[2][8]; if (lay && !pl) pl = calloc(2, sizeof *pl);
+    /* UFSM_SKIP_AB_FREEZE=1: the masked pass normalises with the dense pass's GroupNorm statistics (unet_gn_freeze): a live-GroupNorm net
+       measured as a gn_ema net would be (fixed statistics: the fill cannot move them) */
+    const int frz = ufsm_env_on("UFSM_SKIP_AB_FREEZE"); float *gst = nullptr;
     for (int k = 0; k < 2; k++) {
         nn_skip_pause(k == 0); if (k) nn_h2d(ctd, hct, w3);
+        if (k && frz) { gst = malloc(unet_gn_nstats(u) * sizeof *gst); if (gst && !unet_gn_stats_get(u, gst)) unet_gn_freeze(u, gst); }
         if (lay) { unet_prof_layers_on(1); double junk[UNET_NSLOT][3]; nn_sync(); unet_prof_layers(junk); }
         nn_sync(); const double t0 = now(); const float *l = unet_forward_x(u, x2, xn, 0, h16); nn_sync(); t[k] = now() - t0;
         if (lay) { unet_prof_layers(pl[k]); unet_prof_cats(pc[k]); unet_prof_layers_on(0); }
@@ -1198,6 +1202,7 @@ static void skip_ab(unet *u, const void *x2, shape5 xn, int h16, uint8_t *ctd, i
         fprintf(stderr, "skip A/B layers: categories dense / masked ms:"); for (int i = 0; i < 8; i++) if (pc[0][i] + pc[1][i] > 0) fprintf(stderr, " [%d] %.2f / %.2f", i, pc[0][i], pc[1][i]); fprintf(stderr, "\n");
         for (int i = 0; i < UNET_NSLOT; i++) if (pl[0][i][0] + pl[1][i][0] > 0.05) { char nm[16]; nn_layer_name(i / 2, nm); fprintf(stderr, "skip A/B layers:   %-8s%s fwd %.2f / %.2f ms\n", nm, i % 2 ? ".c2" : ".c1", pl[0][i][0], pl[1][i][0]); }
     }
+    if (gst) { unet_gn_freeze(u, nullptr); free(gst); }
     nn_skip_pause(0); nn_h2d(ctd, hct, w3);
     double e[2] = {0, 0}, m[2] = {0, 0}, mx[2] = {0, 0}; size_t n[2] = {0, 0}, same[2] = {0, 0}, nm = 0;
     for (size_t i = 0; i < (size_t)C * cv; i++) {
