@@ -128,9 +128,17 @@ struct unet {
     float *cat[UNET_MAXLEV];                 /* decoder input: [upsampled w[i+1] | skip w[i]] */
     float *xin;                              /* bf16 copy of the network input (act-bf16 mode) */
     float *muon_mom, *muon_work; size_t muon_work_n;   /* Muon momentum (np) and Newton-Schulz scratch */
-    void *muon_descs; int muon_nconv, muon_maxco, muon_maxk;   /* batched Muon descriptor table (device) */
+    void *muon_descs; int muon_nconv, muon_nconv3, muon_maxco, muon_maxk;   /* batched Muon descriptor table (device) */
     int muon_ninh, muon_part;                /* --init-lr-mult: inherited convs at the table's front (muon_part: the table was built so) */
     int mx_c, mx_hb; float mx_hb_mult;       /* Muon variants: Muon-C, Hyperball (eta = mx_hb_mult x the Muon lr) */
+    int mx_ns, mx_nm; float mx_nm_b2;         /* --muon-ns polar (Polar Express maps), --normuon 1 (row normalisation, EMA beta2) */
+    float *mx_nmrows; int *mx_nmoff, mx_nmtot;   /* NorMuon's row EMA + scratch, per-conv row offsets (device) */
+    float mx_vr, *mx_vrbuf, **mx_vrp;           /* --muon-vr G (MARS): the previous gradient of every Muon matrix, its per-matrix pointers (device) */
+    int rest_sign; float rest_sign_mult;           /* --opt-rest sign: the non-Muon parameters on sign momentum (lr x mult) */
+    int mx_caut, mx_qkv;                         /* --muon-cautious 1, --muon-qkv-split 1 */
+    float *qk_lmax, *qk_last;                    /* QK-clip: per attention block and head the step's max logit (device), and the max since unet_qk_lmax */
+    float mx_mix_a, mx_mix_b3, *mx_mixbuf, **mx_mixp; int mx_mix_T, mx_mix_t;   /* --muon-ademamix A: the slow EMA per matrix, alpha 0 -> A over T steps */
+    int mx_kr, mx_kr_every; float mx_kr_b2, mx_kr_eps; struct nn_kron *mx_kron;   /* --muon-kron 1: the Kronecker conv preconditioner (nn_kron.cu) */
     void *mx_mcd, *mx_nsd; float *mx_pool; int mx_ns_maxm, mx_ns_maxn;   /* Muon-C tables and one frequency's scratch */
     int *mx_hbf; float *mx_R; double *mx_part; int mx_R_ok;   /* Hyperball flags, radii (device), sums; R valid */
     float mx_R_load[UNET_MAXCONV]; int mx_R_nload;           /* radii read from a checkpoint, uploaded at the next step */
@@ -466,7 +474,7 @@ void unet_free(unet *u) {
     nn_free(u->p); nn_free(u->g); nn_free(u->m); nn_free(u->v); nn_free(u->ema); nn_free(u->hf_w); nn_free(u->l0fg_mx); free(u->inh);
     nn_free(u->gn_scratch); nn_free(u->red_scratch); nn_free(u->wg_tmp);
     nn_free(u->wm); nn_free(u->muon_mom); nn_free(u->muon_work); nn_free(u->muon_descs); nn_free(u->stem_b);
-    nn_free(u->mx_mcd); nn_free(u->mx_nsd); nn_free(u->mx_pool); nn_free(u->mx_hbf); nn_free(u->mx_R); nn_free(u->mx_part); free(u->gn_frz); nn_free(u->gn_frz_d); nn_free(u->ge_run); nn_free(u->ge_tw); free(u->gn_acc); nn_free(u->l0run); nn_free(u->l0live); nn_free(u->wsp); nn_free(u->l0s_st); nn_free(u->l0s_tmp); nn_free(u->l0st_g2); nn_free(u->l0st_up); nn_free(u->l0st_poison); nn_free(u->l0h_lg); for (int i = 0; i < UNET_MAXLEV; i++) free(u->rb[i]);
+    nn_free(u->mx_mcd); nn_free(u->mx_nsd); nn_free(u->mx_pool); nn_free(u->mx_hbf); nn_free(u->mx_R); nn_free(u->mx_part); nn_free(u->mx_nmrows); nn_free(u->mx_nmoff); nn_free(u->mx_vrbuf); nn_free(u->mx_vrp); nn_kron_free(u->mx_kron); nn_free(u->qk_lmax); nn_free(u->mx_mixbuf); nn_free(u->mx_mixp); free(u->gn_frz); nn_free(u->gn_frz_d); free(u->gn_acc); nn_free(u->l0run); nn_free(u->l0live); nn_free(u->wsp); nn_free(u->l0s_st); nn_free(u->l0s_tmp); nn_free(u->l0st_g2); nn_free(u->l0st_up); nn_free(u->l0st_poison); nn_free(u->l0h_lg); for (int i = 0; i < UNET_MAXLEV; i++) free(u->rb[i]); free(u->gn_frz); nn_free(u->gn_frz_d); nn_free(u->ge_run); nn_free(u->ge_tw); free(u->gn_acc); nn_free(u->l0run); nn_free(u->l0live); nn_free(u->wsp); nn_free(u->l0s_st); nn_free(u->l0s_tmp); nn_free(u->l0st_g2); nn_free(u->l0st_up); nn_free(u->l0st_poison); nn_free(u->l0h_lg); for (int i = 0; i < UNET_MAXLEV; i++) free(u->rb[i]);
     nn_free(u->anvil_v1); nn_free(u->anvil_pool); nn_free(u->anvil_descs); nn_free(u->ds_g16); nn_free(u->ds_tmp);
     nn_free(u->wq_q); nn_free(u->wq_sc); nn_free(u->wq_qe); nn_free(u->wq_sce);
     nn_free(u->wq_r); nn_free(u->wq_rsc); nn_free(u->wq_re); nn_free(u->wq_rsce);
@@ -2592,7 +2600,12 @@ static void tb_fwd(unet *u) {
     for (int k = 0; k < u->tba; k++) {   /* (application k runs block k % tbn: --attn-repeat) */
         at_ws *ws = u->tb_keep && u->fwd_train ? &u->tbk[k] : &u->tbw;   /* (keep: a training forward fills the application's own set) */
         tb_vr_set(u, ws, k);
+        if (u->fwd_train && !u->tbd.dK && !g_dry) {   /* record the logit max per head (QK-clip / the log's "qk"; the tensor-core core) */
+            if (!u->qk_lmax) { u->qk_lmax = nn_malloc((size_t)(u->tbn * u->tbd.H + 1) * 4); nn_zero(u->qk_lmax, (size_t)(u->tbn * u->tbd.H + 1) * 4); u->qk_last = u->qk_lmax + u->tbn * u->tbd.H; }
+            at_set_lmax(u->qk_lmax + (size_t)(k % u->tbn) * u->tbd.H);
+        }
         int r; PROF(0, r = at_block_fwd(&u->tbd, u->fw, &u->tbp[k % u->tbn], TB_TOK(u, k + 1), TB_TOK(u, k + 2), &u->tbg, ws));
+        at_set_lmax(nullptr);
         ws->kept = ws != &u->tbw;
         if (r) { fprintf(stderr, "unet: attention block forward failed\n"); abort(); }
     }
@@ -4014,6 +4027,7 @@ typedef struct { float lr, b1, b2, eps, wd; int step; } adam_arg;
 static int trunk_lr_on(const unet *u) { return u->tbn && u->trunk_lr > 0.f && u->trunk_lr != 1.f; }
 static void plain_adamw(unet *u, size_t off, size_t n, void *arg) {
     adam_arg *a = arg;
+    if (u->rest_sign) { nn_signm(u->p + off, u->g + off, u->m + off, n, a->lr * u->rest_sign_mult, a->b1, a->wd); return; }   /* --opt-rest sign */
     if (inh_on(u)) { inh_split_adamw(u, off, n, a->lr, a->b1, a->b2, a->eps, a->wd, a->step); return; }
     if (head_lr_mode(u)) { head_split_adamw(u, off, n, a->lr, a->b1, a->b2, a->eps, a->wd, a->step); return; }
     if (trunk_lr_on(u) && off < u->tb_p0) {   /* the trunk part at trunk_lr x lr, the stage's part (if the range reaches it) at lr */
@@ -4040,9 +4054,16 @@ static void muon_conv(unet *u, const convp *c, void *arg) {
     nn_muon(u->p + c->w, u->g + c->w, u->muon_mom + c->w, c->cout, K, lr, a->beta, a->wd, u->muon_work);
 }
 typedef struct { float *p; const float *g; float *mom, *X, *Y, *A, *B; int Co, K; } muon_desc_t;   /* mirrors nn.cu */
-typedef struct { muon_desc_t h[UNET_MAXCONV]; int n; size_t pool; int maxco, maxk; } muon_build_t;
+typedef struct { muon_desc_t h[UNET_MAXCONV]; int n, n3; size_t pool; int maxco, maxk; } muon_build_t;
+static int is_qkv(const unet *u, const convp *c) { for (int k = 0; k < u->tbn; k++) if (c == &u->tbm[k][0]) return !u->tbd.dK; return 0; }
 static void muon_collect(unet *u, const convp *c, void *arg) {
+    if (u->mx_qkv && is_qkv(u, c) && u->tbd.H > 0 && c->cout % (3 * u->tbd.H) == 0) {   /* --muon-qkv-split 1: Q, K, V of every head separately */
+        const int R = c->cout / (3 * u->tbd.H);   /* (rows of [3 C][C]: q heads, k heads, v heads; each head dh = C / H rows) */
+        for (int h = 0; h < 3 * u->tbd.H; h++) { convp s = *c; s.cout = R; s.w = c->w + (size_t)h * R * c->cin; u->mx_qkv = 0; muon_collect(u, &s, arg); u->mx_qkv = 1; }
+        return;
+    }
     muon_build_t *b = arg; int K = c->cin * c->k * c->k * c->k; size_t n = (size_t)c->cout * K;
+    if (c->k == 3) b->n3++;
     muon_desc_t *d = &b->h[b->n++]; d->p = u->p + c->w; d->g = u->g + c->w; d->mom = u->muon_mom + c->w; d->Co = c->cout; d->K = K;
     d->X = (float *)(uintptr_t)b->pool; b->pool += n; d->Y = (float *)(uintptr_t)b->pool; b->pool += n;
     d->A = (float *)(uintptr_t)b->pool; b->pool += (size_t)c->cout * c->cout; d->B = (float *)(uintptr_t)b->pool; b->pool += (size_t)c->cout * c->cout;
@@ -4065,7 +4086,7 @@ static void muon_table(unet *u, muon_build_t *b) {   /* the descriptor table and
     float *pool = nn_malloc(b->pool * 4);
     for (int i = 0; i < b->n; i++) { muon_desc_t *d = &b->h[i]; d->X = pool + (uintptr_t)d->X; d->Y = pool + (uintptr_t)d->Y; d->A = pool + (uintptr_t)d->A; d->B = pool + (uintptr_t)d->B; }
     u->muon_descs = nn_malloc(sizeof(muon_desc_t) * (size_t)b->n); nn_h2d(u->muon_descs, b->h, sizeof(muon_desc_t) * (size_t)b->n);
-    u->muon_nconv = b->n; u->muon_maxco = b->maxco; u->muon_maxk = b->maxk; u->muon_work = pool;
+    u->muon_nconv = b->n; u->muon_nconv3 = b->n3; u->muon_maxco = b->maxco; u->muon_maxk = b->maxk; u->muon_work = pool;
 }
 /* ---- Muon variants (train --muon-c 1 / --hyperball 1; see nn_muon_ext_batch in nn_opt.cu) ----
    Muon-C covers every Muon conv (all are 3^3; the paper routes every kernel larger than 1x1 through it, strided ones
@@ -4076,6 +4097,28 @@ static void muon_table(unet *u, muon_build_t *b) {   /* the descriptor table and
    initialised [Co][K] weights have |W|_F = sqrt(2 Co) and a Muon step lr sqrt(Co) (Co <= K for every conv here). */
 typedef struct { const float *U; float *O; float *EX, *EY; int Co, Ci, k, m, n, tr; } muonc_desc_t;   /* mirrors nn_opt.cu */
 void unet_set_muon_ext(unet *u, int muonc, int hyperball, float hb_mult) { u->mx_c = muonc; u->mx_hb = hyperball; u->mx_hb_mult = hb_mult; }
+/* --muon-ns polar / --normuon 1 (2026-11-13, DESIGN.md): over every Muon matrix, the attention blocks' linears included. NorMuon's
+   row EMA is not checkpointed (a resumed run re-estimates it; its first step is exactly row-normalised, the EMA's scale cancels). */
+void unet_set_muon_variant(unet *u, int ns_mode, int normuon, float b2) { u->mx_ns = ns_mode; u->mx_nm = normuon; u->mx_nm_b2 = b2; }
+void unet_set_muon_vr(unet *u, float gamma) { u->mx_vr = gamma; }
+void unet_set_muon_kron(unet *u, int on, float b2, float eps, int every) { u->mx_kr = on; u->mx_kr_b2 = b2; u->mx_kr_eps = eps; u->mx_kr_every = every; }
+typedef struct { int n; float *g[UNET_MAXCONV]; int Co[UNET_MAXCONV], Ci[UNET_MAXCONV]; } kron_build_t;
+static void kron_collect(unet *u, const convp *c, void *arg) {
+    kron_build_t *b = arg; if (c->k != 3) return;
+    b->g[b->n] = u->g + c->w; b->Co[b->n] = c->cout; b->Ci[b->n] = c->cin; b->n++;
+}   /* (the previous gradients are not checkpointed: a resumed run's first step uses g_prev = 0) */
+void unet_set_muon_cautious(unet *u, int on) { u->mx_caut = on; }
+void unet_set_muon_qkv_split(unet *u, int on) { u->mx_qkv = on; }
+void unet_qk_clip(unet *u, float tau) {   /* after the optimizer step: the live gains (u->p; a FiLM copy u->fw is rebuilt from them) */
+    if (!u->qk_lmax) return;
+    for (int k = 0; k < u->tbn; k++) at_qk_clip(u->p + u->tbp[k].qg, u->p + u->tbp[k].kg, u->qk_lmax + (size_t)k * u->tbd.H, u->tbd.H, tau, u->qk_last);
+}
+int unet_qk_get(const unet *u, float *h) { if (!u->qk_lmax) return 0; const int n = u->tbn * u->tbd.H; nn_d2h(h, u->qk_lmax, (size_t)n * 4); return n; }
+void unet_qk_put(unet *u, const float *h) { if (u->qk_lmax) nn_h2d(u->qk_lmax, h, (size_t)u->tbn * u->tbd.H * 4); }
+float unet_qk_lmax(unet *u) { float v = -1.f; if (u->qk_last) { nn_d2h(&v, u->qk_last, 4); nn_zero(u->qk_last, 4); } return v; }
+void unet_set_rest_sign(unet *u, int on, float mult) { u->rest_sign = on; u->rest_sign_mult = mult; }
+void unet_set_muon_ademamix(unet *u, float alpha, float b3, int T) { u->mx_mix_a = alpha; u->mx_mix_b3 = b3; u->mx_mix_T = T > 0 ? T : 1; }
+static int mx_any(const unet *u) { return u->mx_c || u->mx_hb || u->mx_ns || u->mx_nm || u->mx_vr != 0.f || u->mx_caut || u->mx_mix_a != 0.f; }
 typedef struct { int i; int hb[UNET_MAXCONV]; int on; } hb_build_t;
 static void hb_collect(unet *u, const convp *c, void *arg) {
     hb_build_t *b = arg; int is_down = 0;
@@ -4083,7 +4126,12 @@ static void hb_collect(unet *u, const convp *c, void *arg) {
     b->hb[b->i++] = b->on && !(is_down && !u->cfg.down_norm);
 }
 static void muon_ext(unet *u, const muon_build_t *b, float lr, float beta, float wd) {
-    const int n = b->n;
+    const int n = b->n, nconv3 = u->muon_nconv3, nlin = n - nconv3;   /* (Muon-C covers the 3^3 convs; the linears get its plain direction) */
+    if (u->mx_nm && !u->mx_nmrows) {   /* NorMuon: per matrix Co rows of EMA, then the same of scratch */
+        int off[UNET_MAXCONV + 1], t = 0; for (int i = 0; i < n; i++) { off[i] = t; t += b->h[i].Co; } off[n] = t;
+        u->mx_nmtot = t; u->mx_nmrows = nn_malloc((size_t)2 * t * 4); nn_zero(u->mx_nmrows, (size_t)2 * t * 4);
+        u->mx_nmoff = nn_malloc((size_t)(n + 1) * sizeof(int)); nn_h2d(u->mx_nmoff, off, (size_t)(n + 1) * sizeof(int));
+    }
     if (!u->mx_part) {
         u->mx_part = nn_malloc((size_t)32 * n * (2 + 14) * sizeof(double));
         hb_build_t h = {.on = u->mx_hb}; for_each_conv3(u, hb_collect, &h);
@@ -4093,7 +4141,7 @@ static void muon_ext(unet *u, const muon_build_t *b, float lr, float beta, float
     if (u->mx_c && !u->mx_mcd) {   /* Muon-C: per conv its 14 complex frequency blocks, per conv and frequency a Newton-Schulz entry */
         enum { NF = 14 };
         muonc_desc_t mc[UNET_MAXCONV]; muon_desc_t *ns = calloc((size_t)n * NF, sizeof *ns); size_t pool = 0;
-        for (int i = 0; i < n; i++) {
+        for (int i = 0; i < nconv3; i++) {
             const muon_desc_t *d = &b->h[i]; const int Ci = d->K / 27, m = d->Co < Ci ? d->Co : Ci, nx = d->Co < Ci ? Ci : d->Co;
             if (Ci * 27 != d->K) { fprintf(stderr, "muon-c: conv %d is not 3^3\n", i); abort(); }
             mc[i] = (muonc_desc_t){.U = nullptr, .O = nullptr, .Co = d->Co, .Ci = Ci, .k = 3, .m = m, .n = nx, .tr = d->Co > Ci};
@@ -4109,15 +4157,15 @@ static void muon_ext(unet *u, const muon_build_t *b, float lr, float beta, float
         }
         u->mx_pool = nn_malloc(pool * 4);
         const muon_desc_t *dev = u->muon_descs; muon_desc_t host[UNET_MAXCONV]; nn_d2h(host, dev, sizeof(muon_desc_t) * (size_t)n);
-        for (int i = 0; i < n; i++) {
+        for (int i = 0; i < nconv3; i++) {
             mc[i].EX = u->mx_pool + (uintptr_t)mc[i].EX; mc[i].EY = u->mx_pool + (uintptr_t)mc[i].EY; mc[i].U = host[i].X; mc[i].O = host[i].Y;
             for (int f = 0; f < NF; f++) {
                 muon_desc_t *e = &ns[(size_t)i * NF + f];
                 e->X = u->mx_pool + (uintptr_t)e->X; e->Y = u->mx_pool + (uintptr_t)e->Y; e->A = u->mx_pool + (uintptr_t)e->A; e->B = u->mx_pool + (uintptr_t)e->B;
             }
         }
-        u->mx_mcd = nn_malloc(sizeof(muonc_desc_t) * (size_t)n); nn_h2d(u->mx_mcd, mc, sizeof(muonc_desc_t) * (size_t)n);
-        u->mx_nsd = nn_malloc(sizeof(muon_desc_t) * (size_t)n * NF); nn_h2d(u->mx_nsd, ns, sizeof(muon_desc_t) * (size_t)n * NF);
+        u->mx_mcd = nn_malloc(sizeof(muonc_desc_t) * (size_t)nconv3); nn_h2d(u->mx_mcd, mc, sizeof(muonc_desc_t) * (size_t)nconv3);
+        u->mx_nsd = nn_malloc(sizeof(muon_desc_t) * (size_t)nconv3 * NF); nn_h2d(u->mx_nsd, ns, sizeof(muon_desc_t) * (size_t)nconv3 * NF);
         free(ns);
     }
     int r_init = 0;
@@ -4129,15 +4177,45 @@ static void muon_ext(unet *u, const muon_build_t *b, float lr, float beta, float
         }
         if (!u->mx_R_ok) { nn_zero(u->mx_R, (size_t)n * 4); r_init = 1; u->mx_R_ok = 1; }
     }
+    if (u->mx_vr != 0.f && !u->mx_vrbuf) {   /* MARS: g_prev per matrix (Co K floats each), zero before the first step */
+        size_t t = 0; for (int i = 0; i < n; i++) t += (size_t)b->h[i].Co * b->h[i].K;
+        u->mx_vrbuf = nn_malloc(t * 4); nn_zero(u->mx_vrbuf, t * 4); float *ptr[UNET_MAXCONV]; t = 0;
+        for (int i = 0; i < n; i++) { ptr[i] = u->mx_vrbuf + t; t += (size_t)b->h[i].Co * b->h[i].K; }
+        u->mx_vrp = nn_malloc((size_t)n * sizeof(float *)); nn_h2d(u->mx_vrp, ptr, (size_t)n * sizeof(float *));
+    }
+    float *const *vp = u->mx_vr != 0.f ? u->mx_vrp : nullptr; const float vg = u->mx_vr;
+    nn_muon_ext_opts(u->mx_caut);
+    if (u->mx_mix_a != 0.f && !u->mx_mixbuf) {   /* AdEMAMix: m2 per matrix, zero at the start (not checkpointed) */
+        size_t t = 0; for (int i = 0; i < n; i++) t += (size_t)b->h[i].Co * b->h[i].K;
+        u->mx_mixbuf = nn_malloc(t * 4); nn_zero(u->mx_mixbuf, t * 4); float *ptr[UNET_MAXCONV]; t = 0;
+        for (int i = 0; i < n; i++) { ptr[i] = u->mx_mixbuf + t; t += (size_t)b->h[i].Co * b->h[i].K; }
+        u->mx_mixp = nn_malloc((size_t)n * sizeof(float *)); nn_h2d(u->mx_mixp, ptr, (size_t)n * sizeof(float *));
+    }
+    const float mixa = u->mx_mix_a != 0.f ? u->mx_mix_a * fminf(1.f, (float)++u->mx_mix_t / (float)u->mx_mix_T) : 0.f;
+    nn_muon_ext_mix(u->mx_mix_a != 0.f ? u->mx_mixp : nullptr, u->mx_mix_b3, mixa);
+    float *nr = u->mx_nm ? u->mx_nmrows : nullptr; const float b2 = u->mx_nm_b2;
+    if (u->mx_c && nlin) {   /* Muon-C on the convs, the linears (Co x Ci, no kernel) on the plain direction; one row state, offsets sliced */
+        nn_muon_ext_batch(u->muon_descs, nconv3, u->muon_maxco, u->muon_maxk, u->mx_mcd, u->mx_nsd, 3, u->mx_ns_maxm, u->mx_ns_maxn,
+                          u->mx_hb ? u->mx_hbf : nullptr, u->mx_R, r_init, u->mx_part, lr, beta, wd, u->mx_hb_mult * lr, u->mx_ns, nr, u->mx_nmoff, u->mx_nmtot, b2, vp, vg);
+        if (u->mx_mix_a != 0.f) nn_muon_ext_mix(u->mx_mixp + nconv3, u->mx_mix_b3, mixa);
+        nn_muon_ext_batch((const char *)u->muon_descs + sizeof(muon_desc_t) * (size_t)nconv3, nlin, u->muon_maxco, u->muon_maxk, nullptr, nullptr, 3, 0, 0,
+                          nullptr, u->mx_R, 0, u->mx_part, lr, beta, wd, 0.f, u->mx_ns, nr, nr ? u->mx_nmoff + nconv3 : nullptr, u->mx_nmtot, b2, vp ? vp + nconv3 : nullptr, vg);
+        return;
+    }
     nn_muon_ext_batch(u->muon_descs, n, u->muon_maxco, u->muon_maxk, u->mx_c ? u->mx_mcd : nullptr, u->mx_nsd, 3, u->mx_ns_maxm, u->mx_ns_maxn,
-                      u->mx_hb ? u->mx_hbf : nullptr, u->mx_R, r_init, u->mx_part, lr, beta, wd, u->mx_hb_mult * lr);
+                      u->mx_hb ? u->mx_hbf : nullptr, u->mx_R, r_init, u->mx_part, lr, beta, wd, u->mx_hb_mult * lr, u->mx_ns, nr, u->mx_nmoff, u->mx_nmtot, b2, vp, vg);
 }
 void unet_muon(unet *u, float lr_muon, float beta, float lr_adam, float b1, float b2, float eps, float wd, int step) {
     if (head_lr_mode(u)) lr_muon *= u->trunk_lr;   /* (the 3^3 convs: all trunk; the head is on AdamW) */
     if (u->wq) { unet_adamw(u, lr_adam, b1, b2, eps, wd, step); return; }   /* packed weights: AdamW only */
     if (!u->muon_mom) { u->muon_mom = nn_malloc(u->np * 4); nn_zero(u->muon_mom, u->np * 4); }
-    if (u->tbn && (u->mx_c || u->mx_hb)) { fprintf(stderr, "unet: Muon-C / Hyperball do not cover the attention blocks' linear layers\n"); abort(); }
-    if (u->mx_c || u->mx_hb) {
+    if (u->mx_kr) {   /* the 3^3 convs' gradients preconditioned in place (Kronecker factors), then Muon on them as on any gradient */
+        if (!u->mx_kron) { kron_build_t k = {0}; for_each_conv3(u, kron_collect, &k); u->mx_kron = nn_kron_create(k.n, k.g, k.Co, k.Ci);
+            fprintf(stderr, "muon-kron: %d convs, %.1f MB of factors, roots and scratch\n", k.n, nn_kron_bytes(u->mx_kron) / 1048576.0); }
+        nn_kron_step(u->mx_kron, u->mx_kr_b2, u->mx_kr_eps, u->mx_kr_every);
+    }
+    /* (Hyperball with attention blocks: the linears' hb flags are 0 (hb_collect walks the 3^3 convs only), so they keep Muon's step) */
+    if (mx_any(u)) {
         muon_build_t b = {0}; muon_table(u, &b);
         muon_ext(u, &b, lr_muon, beta, wd);
     } else if (ufsm_env_on("UFSM_MUON_UNBATCHED")) {   /* reference path: one conv at a time */
@@ -4173,6 +4251,11 @@ static void anvil_collect(unet *u, const convp *c, void *arg) {
 void unet_anvil(unet *u, float lr, float wd, int step, int steps, float lr_adam, float b1, float b2, float eps, float wd_adam) {
     if (u->wq) { unet_adamw(u, lr_adam, b1, b2, eps, wd_adam, step); return; }
     if (!u->muon_mom) { u->muon_mom = nn_malloc(u->np * 4); nn_zero(u->muon_mom, u->np * 4); }
+    if (u->mx_kr) {   /* the 3^3 convs' gradients preconditioned in place (Kronecker factors), then Muon on them as on any gradient */
+        if (!u->mx_kron) { kron_build_t k = {0}; for_each_conv3(u, kron_collect, &k); u->mx_kron = nn_kron_create(k.n, k.g, k.Co, k.Ci);
+            fprintf(stderr, "muon-kron: %d convs, %.1f MB of factors, roots and scratch\n", k.n, nn_kron_bytes(u->mx_kron) / 1048576.0); }
+        nn_kron_step(u->mx_kron, u->mx_kr_b2, u->mx_kr_eps, u->mx_kr_every);
+    }
     if (!u->anvil_v1) { u->anvil_v1 = nn_malloc(u->np * 4); nn_zero(u->anvil_v1, u->np * 4); }
     if (!u->anvil_descs) {
         anvil_build_t b = {0};

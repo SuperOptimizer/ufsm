@@ -154,6 +154,7 @@ test_dino_pts                                  |              |     1 | ./$B/tes
 test_ink_splat                                 | gpu          |    10 | ./$B/test_ink_splat
 test_ink_pool                                  |              |     3 | ./$B/test_ink_pool $TMPDIR/ink_pool
 test_ink_mil                                   | gpu          |     2 | ./$B/test_ink_mil
+test_ink_air                                   | gpu          |     2 | ./$B/test_ink_air
 test_ink_mil_train                             | gpu          |    40 | ./$B/test_ink_mil_train ./$B/ufsm ./$B/make_wind_fixture
 test_accum                                     | gpu          |    20 | tests/test_accum.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/accum
 test_strict_sources                            | gpu          |    25 | tests/test_strict_sources.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/strictsrc
@@ -210,6 +211,8 @@ test_mx4~F4W_LAYOUT=1                          | gpu          |     4 | UFSM_F4W
 test_rc                                        | gpu          |     1 | ./$B/test_rc
 test_muon                                      | gpu          |     1 | ./$B/test_muon
 test_muonc                                     | gpu          |     3 | ./$B/test_muonc
+test_muonx                                     | gpu          |     2 | ./$B/test_muonx
+test_qkclip                                    | gpu          |     1 | ./$B/test_qkclip
 test_unet~FUSED_UP=0,F16=1                     | gpu          |     3 | UFSM_FUSED_UP=0 UFSM_F16=1 ./$B/test_unet
 test_unet~RECOMPUTE=2,F16=1                    | gpu          |     3 | UFSM_RECOMPUTE=2 UFSM_F16=1 ./$B/test_unet
 test_json                                      |              |     1 | ./$B/test_json
@@ -255,6 +258,7 @@ test_z3_autosub                                |              |    10 | ./$B/tes
 test_z3_sink                                   |              |    10 | ./$B/test_z3_sink
 test_replay_lean                               |              |    15 | ./$B/test_replay_lean
 test_gpudec                                    | gpu          |    10 | ./$B/test_gpudec
+test_ct_gpu_decode                             | gpu          |    30 | bash tests/test_ct_gpu_decode.sh ./$B/ufsm ./$B/make_wind_fixture
 test_vcgpu                                     | gpu          |     5 | ./$B/test_vcgpu
 test_lat                                       | gpu          |     1 | ./$B/test_lat
 test_latents                                   | gpu          |    25 | bash tests/test_latents.sh ./$B/ufsm ./$B/make_wind_fixture

@@ -8,9 +8,58 @@ No teacher models, no distillation. All upstream data is re-exported once into t
 
 ## Split-window input builders: every --gpu-aug builder by z range, the scanner split exactly across two GPUs (2026-11-13, branch augz-20261112)
 
-For the 40 M net (widths 192..384), one P 1024 window is split in z across both 5060 Tis (univI's splitwin-20261112). Each GPU then
-builds only its own output planes of the window's input and labels. The window stays the global P^3: the same record, draws and
-global coordinates, so a rank's planes are byte for byte the whole-window call's planes.
+## Muon variants for the from-scratch universal net: ten arms on the 92 M net (2026-11-13, branch muonx-20261113)
+
+The regime: B = 1, P 512..1024 windows. Gradients are very noisy and runs are short (tens of thousands of steps). ANVIL II already tied
+Muon here (section below). The user asked for fundamental algorithmic gains, so every variant below is a flag on `--opt muon`, and each
+one off is Muon bit for bit (tests/test_muonx). A/B harness: `runs/muonx/abq.sh GPU`. Each arm is 1500 steps of the approved 92 M net
+(widths 256,320,384,448,288,288, 4 attention blocks, scroll RoPE). Recipe: P 512 B 1, `--det 1 --seed 7`, so every arm sees the same
+windows; scratch1 sources, latdino's LR probe recipe plus `--gn-ema 1 --scan-norm 1 --fib-head 1` (rfwide merged); Muon 0.01 /
+AdamW 1e-3, warmup 150, WSD cooldown 0.2. Compared: training loss and per-head losses over the last 300 steps, paired step for step
+against plain Muon, with a block-bootstrap CI (`absum.py`).
+
+| flag | what | source | state |
+|---|---|---|---|
+| `--muon-ns polar` | Polar Express: per-iteration minimax quintics instead of the fixed (3.4445, -4.7750, 2.0315). Derived here by greedy LP from [1e-3, 1]; the published schedule matches to ~3%. Output singular values for sigma in [1e-3, 1]: [0.887, 1.113] (fixed: [0.471, 1.202]) | Amsel, Persson, Musco & Gower 2025, arXiv 2505.16932 | built, tested |
+| `--normuon 1 [--normuon-beta2 0.95]` | per-row second-moment EMA of the orthogonalised direction; rows normalised, then Frobenius-rescaled to Muon's RMS | Li et al. 2025, arXiv 2510.05491 | built, tested |
+| `--muon-vr G` | MARS variance reduction: c = g + G beta/(1-beta) (g - g_prev), clipped to unit norm per matrix, then Nesterov + NS. One g_prev buffer | Yuan et al. 2024, arXiv 2411.10438 | built, tested |
+| `--muon-kron 1` | order-3 Shampoo on each 3^3 conv gradient [Co][Ci][27]: factors Co x Co, Ci x Ci, 27 x 27 (EMA b2 0.99), exponent -1/6, damping 1e-3 x \|L\|_F. Roots by coupled Newton (Guo & Higham 2006), refreshed round robin every 10 steps; the preconditioned gradient feeds Muon's momentum + NS. Memory 2 (Co^2 + Ci^2 + 729) per conv | Gupta, Koren & Singer 2018 | built, tested vs dense double reference |
+| `--muon-c 1` | Muon-C on attention nets: the convs per frequency, the linears on the plain direction | (existing) | attention path built |
+| `--muon-cautious 1` | zero the direction's elements whose sign disagrees with g, keep the norm | Liang et al. 2024, arXiv 2411.16085 | built, tested |
+| `--muon-scale spectral`, `--opt-rest sign` | Scion geometry: per-matrix sqrt(fan_out / fan_in) instead of sqrt(max(1, Co/K)); biases / norms / head on sign momentum (ell-inf LMO) instead of AdamW | Pethick et al. 2025, arXiv 2502.07529 | built |
+| `--muon-ademamix A [--ademamix-b3 0.999]` | slow EMA m2 added to the Nesterov momentum, alpha ramped 0 -> A | Pagliardini et al. 2024, arXiv 2409.03137 | built |
+| `--muon-qkv-split 1` | Q / K / V of every head orthogonalised separately (not the fused [3C][C]) | Kimi K2 / MuonClip practice | built; QK-clip needs a logit-max hook in the attention kernels (not yet) |
+| `--muon-tc 1` | the NS products on fp16 tensor cores (wmma, fp32 accumulate) | | built; accuracy test vs fp32 |
+| `--muon-tc 2` | the NS products on cuBLASLt TF32 tensor cores (one GEMM per product and matrix, fp32 buffers) | | built, tested (2.4e-3 vs fp32) |
+
+**Evaluation.** Matched step: training loss over the last 300 steps (the WSD cooldown), paired step for step against Muon (the same
+windows), block-bootstrap 95% CI (`absum.py`). Held-out: each finished arm resumed from its last.ckpt for one lr-0 step with
+`--val-batches 32 --val-live 1` (`evsum.py`; the same 32 windows for every arm, hash 4221f46d; scratch1 has no holdout boxes, so they come from
+the training distribution at val seed + 777). Matched wall time: the wall clock of the arm (`done in`). Converting a loss gap into steps by the
+reference's loss-vs-ln(step) slope does not work here: after step ~300 the per-window training loss is dominated by window difficulty
+(fitted slope over steps 200-1200: +0.017 per ln step, the wrong sign), so a variant that is slower must win at matched steps by more than
+the noise, or run a wall-matched arm.
+
+| arm | wall (x Muon) | train loss vs Muon, last 300 [CI] | val | phase | normal | wind4 | turn acc | ink | verdict |
+|---|---|---|---|---|---|---|---|---|---|
+| muon | 2805 s | 1.6002 | 1.2325 | 0.3618 | 0.2736 | 0.3581 | 0.346 | 0.5800 | reference |
+| kron | 3267 s (1.16x) | -0.0013 [-0.0021, -0.0006] | -0.0016 | +0.0000 | -0.0010 | +0.0006 | -0.003 | -0.0006 | tie at matched steps (-0.1%), 16% slower: no |
+
+(The interim kron gap at steps 411-580, -0.0056, shrank to -0.0013 by the end of the cooldown.)
+
+**Optimizer speed** (bench_muonx, 92 M net, ms per unet_muon call on one 5060 Ti; the P 512 training step is 1.81 s): Muon fp32 NS 121
+(6.7% of the step), `--muon-tc 1` (hand-written wmma fp16) 213, `--muon-tc 2` (cuBLASLt TF32) 57 (3.2%); polar 122, NorMuon 126,
+MARS-VR 127, cautious 128, AdEMAMix 128, Muon-C 263, Kronecker 465 (+344 ms: the whole of kron's 16% slowdown in training, 0.472 vs 0.553
+samp/s). The TF32 update differs from the fp32 one by 2.4e-3 relative over 3 steps (test_muonx), as the fp16 path's; arm `muontc2` checks
+loss parity in training. CUBLAS_COMPUTE_32F_FAST_16BF failed on the net's shapes (dropped).
+
+**QK-clip** (`--qk-clip TAU`, built 2026-11-13): MuonClip rescales W_q, W_k when a head's max logit exceeds tau; with our QK-norm the
+projections' scale cancels, so the clip scales the head's QK-norm gains qg, kg by sqrt(tau / max). The max logit q.k / sqrt(48) per head
+comes from the fp16 tensor-core flash forward (`at_set_lmax`: the row maxima it already keeps, one atomicMax per warp); multi-GPU replicas
+clip by the max over all GPUs. tests/test_qkclip: the hook against a double reference (2 sequences, partial tiles, masked keys) to
+2e-3 relative, the clip exact. Every training log line now carries `qk` (the max logit since the last line). Muon at step 1500 of the
+92 M net: qk 7.0, far below the tau ~100 of the Kimi recipe: QK-norm already bounds the logits, so QK-clip is expected to be inactive
+here unless long runs grow them.
 
 - **Labels** (nn_label_warp_z / nn_label_sym_z / nn_w4runs_label_z / nn_ink_bits_z) write output planes [z0, z0 + nz) from source
   planes [s0, s1) only.
@@ -371,6 +420,289 @@ latency from the split. Training goes first.
   - the parameter gradient rel is 8.0e-8, the one-GPU rerun level (5.7e-8).
 - Not yet under the split (refused): --gpu-aug (univA's z-range builders), --ssl, --ink-mil, --fib-head, --fib-normal-lambda,
   --pgrad, --count, --pap-head, --distill, --lat-guide 1 / 2, the unstreamed latent head.
+
+## The from-scratch net's whole-window field: measured ERF, seams, LR probe (2026-11-13, branch rfwide-20261113)
+
+The next universal latent net (from scratch, all heads, one 1024^3 window split across both desk cards) is nlev 6, widths
+256,320,384,448 + deep levels 288,288, 4 full-attention blocks with scroll RoPE on the 8^3-cell bottleneck (~92 M params): flags
+`--widths 256,320,384,448,288,288 --attn-blocks 4 --attn-pe scroll`. Planner (13.3 GB per card, the scratch1 heads): 12.35 GB at
+P 1024 x Pz 512 (the split proxy) vs 12.32 GB without the deep levels / attention; 4.09 GB at P 512 on one card. Theoretical RF:
+nlev 4 103 cells, nlev 5 215, nlev 6 439 (> the 256-cell window; the attention is global on the bottleneck anyway).
+
+**Seams** (inkpod-12000 ink, 1299 box 1024^3 at level 2, windows 512 + 2 halo; y / x seam steps, interior medians 0.05-0.3):
+
+| halo | per-window GN + z-score | GN frozen (pooled) | fixed --norm | both |
+|---|---|---|---|---|
+| 16 | 15.4 / 26.6 | 13.8 / 11.0 | 15.3 / 24.9 | 6.2 / 6.9 |
+| 64 | 28.3 / 11.7 | 5.0 / 10.6 | 28.0 / 10.1 | - |
+| 256 | 5.8 / 6.7 | 0.3 / 2.2 | - | 0.0 / 0.1 |
+
+Three causes: the halo below the RF radius, GroupNorm's whole-window statistics and the per-window input z-score. Pooled frozen
+statistics at inference shift the outputs (ink mean 42 -> 33): the fix belongs in training (EMA GroupNorm at all levels, a
+per-scan input z-score), next on this branch.
+
+**Measured ERF** (`UFSM_ERF=DELTA` in train, `--lat` with the streamed head: the first training window forwarded, DELTA = 1 added to
+the central 4^3 cells (16^3 voxels) of the z-scored CT, forwarded again; per cell the largest |logit change| of the first 16 head
+channels, by Chebyshev distance r to the block. `UFSM_ERF_GNFROZEN=1` normalises the perturbed forward with the base forward's
+GroupNorm statistics (`unet_gn_freeze_train`, diagnostics only): convolution reach alone. `UFSM_ERF_REPEAT=1`: 0 change everywhere,
+the forward is deterministic.) unissl sources, P 1024 (256^3 cells) unless noted:
+
+| net | GN | centre | r 32 | r 48 | r 56 | r >= 64 | far floor / centre | r50 / r90 |
+|---|---|---|---|---|---|---|---|---|
+| u1 random | live | 0.744 | 0.498 | 0.500 | 0.225 | 0.12-0.15 | 0.18 | 94 / 120 |
+| u1 trained (last.ckpt) | live | 0.448 | 0.282 | 0.268 | 0.269 | 0.25-0.27 | **0.58** | 100 / 122 |
+| u1 trained | frozen | 0.446 | 0.267 | 0.156 | 0.043 | **0** | 0 | 39 / 51 |
+| 92 M random, P 768 | frozen | 0.872 | 0.660 | 0.743 | 0.737 | 0.45-0.69 (to r 94) | 0.47 | 70 / 89 |
+| 92 M random, P 768 | live | 0.914 | 0.666 | 0.751 | 0.745 | 0.45-0.70 | 0.45 | 70 / 89 |
+
+- u1's convolution reach ends at r ~ 56-60 cells (the theoretical 51.5 + the block), +-230 voxels of a 1024 window: the outer
+  ~40% of each axis never sees the window's centre and vice versa.
+- In trained u1 the whole-window GroupNorm coupling is larger than the convolution signal: a 16^3-voxel change moves every logit of
+  the window by 58% of the change at the block itself, flat to the corners. This is the window dependence behind the seams
+  (and why a window's outputs change with its extent); EMA GroupNorm removes it by construction.
+- The 92 M net covers the whole window by convolution + attention alone (frozen: 47% of the centre change at the corners, r 94
+  at P 768); random-init ERFs are wider than trained ones, the trained number comes with the first snapshot.
+
+**LR probe** (the 92 M net at P 512 B 1 on one card, from scratch on sources-scratch1.json, --det 1 seed 7 so every arm sees the
+same windows, 300 steps, warmup 50, WSD cooldown 0.2, AdamW 1e-3, 0.60 samp/s): mean logged loss over steps 200-300 Muon 0.005
+1.710, 0.01 1.719, 0.02 1.721 (per-head at 300 within 0.01 of each other); none unstable. 300 steps at B 1 do not separate the
+arms (differences ~0.01, 5 logged points); the earlier voxel-net sweep (F1 0.307 / 0.296 / 0.290 at 0.01 / 0.02 / 0.05) stays the
+basis: Muon 0.01, AdamW 1e-3, warmup 1000, WSD cooldown 0.2.
+
+**fib-head + fstem** (1f881bf): `--fstem` refused `--fib-head` ("25 outputs (16 at most)"): the head pads past 16 outputs to 32
+and the fine stem counted the 9 unsupervised pad channels. It now maps into the supervised voxel outputs only (phase 2, wind4 2,
+ink 1, rv 2, fibre 9 = 16, the stem kernel's limit); test_fibhead_train covers --lat 4 --fstem 16 --ink-head 1 --fib-head 1.
+
+**EMA GroupNorm at every site** (`--gn-ema 1`, unet_cfg.gn_ema; `--gn-ema-mom 0.01 --gn-ema-warm 500`): all GroupNorms (every level's
+blocks, the down norms, the attention stage, the head's input) normalise with running statistics (BatchNorm-style, [mean | var] per
+group in the gn_sites layout; the first warm training forwards use their own statistics, after that training forwards are constants
+in forward and backward, the backward without the statistics' terms, nn_set_gn_const; inference uses the running statistics as soon
+as there are any). The sites hold the constants before the convs run (ge_begin), the convs write their live statistics to twins
+(ge_dst) that ge_after pools into the running set after dec[0]; the EMA weights keep their own set (unet_ema), forwards with the
+EMA weights (the SSL teacher) do not update. Checkpoints: header keys `gn_ema`, `ge_n`, `ge_warm`, `ge_mom`, `ge_run` only when on
+(no new parameters: an old checkpoint loads into a gn_ema net as a fresh warm-up; u1-size net 448 floats, 31 KB header). Needs
+`--l0-norm gn`. Multi-GPU data parallel: each card keeps its own statistics (card 0's are saved); with --split z the cards share one
+window, so their statistics agree. Tests: test_gn_ema (both a down-norm net and an attention net: the warm-up then the running blend
+at every site to 1e-4; a far-corner input change leaves the logits bit-identical, live GN moves them; momentum 1 reproduces live GN,
+statistics 1e-7, logits 5e-3 of 6.2; EMA-weight set; checkpoint round trip bit-identical; old checkpoint = fresh warm-up; finite
+backward), test_unet~GN_EMA=1 (fp32 finite differences with down norms: worst 7.5e-5 over 60 params; tensor cores vs fp32 logits
+0.061 of 6.6). Train smoke (u1 widths, P 256, warm-up 10): losses continuous across the switch to constants.
+
+**Per-scan input normalisation** (`--scan-norm 1`, unet_cfg.scan_norm, src/scannorm.c): the CT input is (v - center) / scale with one
+(center, scale) per scan and level instead of each window's mean / sd: the mean and sd of the nonzero voxels in 48 boxes of 32^3 at
+the working level, centred on nonzero voxels of a coarse level (the first of L + 2 .. L + 9 with <= 2^26 voxels read whole, else the
+smallest subsampled every st-th voxel) at fixed ranks: a deterministic function of the volume. The sampler computes it on the first
+window per (source, level) (a source's "norm" key wins; a failure keeps the window z-score, reported once); the checkpoint keeps
+`"scan_norm":1`, and predict computes the same numbers for its scan and level (`--norm MEAN,SD` overrides). Mean / sd rather than
+median / MAD: inside the mask the nonzero voxels are bimodal and the MAD follows the dominant mode only (1667 level 2: median 45,
+1.4826 MAD 10.4, papyrus at ~+7; mean / sd 62.9 / 37.6). On the unissl sources all 22 (source, level) pairs get statistics (center
+62.9-126, scale 28-56); predict on 1667 level 2 prints 62.9 / 37.59, the sampler's. test_scan_norm (wind fixture: deterministic
+across runs, in the checkpoint, predict = sampler, --norm overrides, the losses change).
+
+Found on the way (not fixed here): with the scratch1 sources at P 1024 on one card an early `inkfly gpu: out of device memory`
+falls back to the CPU and then segfaults in nn_ink_bits (cudaMemcpyAsync of an invalid host pointer, lab_upload kind 3); and
+the scratch1 data path holds ~7 GB of device memory outside the planner at P 512.
+
+## The universal net's eval: label-free quality on unseen scrolls, validated against GT (2026-11-12, branch univ-eval-20261111)
+
+The from-scratch universal net trains on every label we have (user: "train on literally everything we have labels for ... then working
+on unseen scrolls from the corpus"), so its main eval cannot use labels. `scripts/univ/ueval.sh` has two blocks: **unseen** (24 boxes of
+512^3 level-0 voxels, 3 per scan on 9 corpus scans with no labels and no fits of ours: 0268, 0800, 0826, 0175B, 0306B, 0483A, 0490A,
+0846A, 0343 at 8.64 / 9.36 um, placed CPU-side by `unseen_boxes.py` from the level-4 CT and the corpus axis) scored label-free by
+`uqa.py` + the fibre judge; and **training-fit** (wbench core, rv eval, the 34 ink crops, the P4 fibre box: all in training now, so they
+track convergence and head interference, not generalisation). `upair.py` pairs two checkpoints over the boxes.
+
+The winding metrics come from the box's fit (fit-phase-box: frac(W) on a step-2 grid) and the CT. The wraps (W = integer) sit ~0.1-0.15
+turn off the CT sheet centre on the wbench fits (C18: CT mean peaks at frac W 0.10-0.15, 85 vs 57 at 0.6), so each box's sheet phase
+phi is measured (first harmonic of CT along frac W) and the band / gap / rv sides are taken relative to it; h1 = that harmonic's
+amplitude / CT sd.
+
+Validation (`uqa_validate.py`, CPU only): the metrics on the kept wbench fits of 6 checkpoints (unified-1504-a0e, inkpod-5000 / 10000,
+unissl-6000, u1-13790-ssl, lat-vc384-4000-384) x 44 core boxes against the boxes' GT. "pooled" = Spearman over all 264 (tag, box)
+pairs (mostly box difficulty); "within" = mean per-box Spearman across the 6 tags; "pairs" = share of same-box tag pairs (|d GT| >=
+0.02) whose metric difference has the GT difference's sign, oriented by the metric's better side (0.5 = no information).
+
+| metric | pooled vs p05x | within vs p05x | pairs vs p05x | pairs vs ids |
+|---|---|---|---|---|
+| jumps (W steps > 0.25 turn, lower) | +0.79 | +0.41 | **0.77** | 0.60 |
+| gap_void (mid-gap voxels off papyrus) | +0.78 | +0.20 | 0.64 | 0.50 |
+| on_pap (band voxels on papyrus) | -0.47 | +0.22 | 0.63 | 0.50 |
+| h1 | +0.84 | +0.17 | 0.61 | 0.49 |
+| contrast | +0.85 | +0.16 | 0.61 | 0.49 |
+| nrm30 | -0.02 | +0.16 | 0.59 | 0.46 |
+| sp_cv | -0.72 | -0.07 | 0.49 | 0.45 |
+| nrm_deg (lower assumed better) | -0.87 | -0.38 | 0.25 | 0.38 |
+
+Winding jumps are the one metric that ranks checkpoints on the same box like the GT does (0.77 of pairs vs p05x); the CT-alignment
+metrics (h1, gap_void, on_pap, contrast) carry a weak signal (0.61-0.64) and none vs ids; nrm_deg is inverted (smoother normals go with
+worse fits: over-smoothing), sp_cv carries nothing. Tiers in `upair.py`: primary jumps, secondary h1 / gap_void / on_pap / contrast,
+info nrm_deg / sp_cv / nrm30 (no win count). Check on a known pair: inkpod-10000 vs unified-1504-a0e (GT p05x -0.048 [-0.068, -0.028]):
+jumps +0.0039 [+0.0014, +0.0066] (worse on 30 / 44 boxes, agrees); h1 / gap_void / contrast slightly better (disagree), so a checkpoint
+call rests on jumps first. Not validated yet: rv_agree, ink_air / ink_band, the fibre judge and the fit residuals (the kept fits have no
+head predictions); the first GPU run of ueval on two checkpoints with wbench rows will validate them the same way.
+
+## Latent ink head: window seams at inference, the 2-pass grid blend, 1667 scores (2026-11-12, scripts/inkgt/u1667ink.sh)
+
+The inkpod snapshots' ink head (`predict --heads ink`, latent trunk, 4 levels) gives every predict window its own level: the 1299
+inkpod-9000 renders showed a square tile grid. Measured in the raw store on a fixed 1299 corner (level 2, box 5632,2048,2048 + 1024^3,
+the plane-mean step across the window seam / the median plane step, z / y / x; sched/seam/seam.tsv):
+
+| run | halo 16 | halo 64 | halo 96 |
+|---|---|---|---|
+| inkpod-9000 (--ink-dice 0.25) | 2.6 / 7.2 / 30.2 | 2.0 / 27.1 / 4.9 | 1.6 / 27.5 / 13.6 |
+| inkpod-11000 (dice off) | 1.4 / 15.3 / 29.5 | 2.4 / 30.3 / 12.1 | 2.6 / 23.8 / 16.1 |
+| inkpod-12000 (dice off, --ink-air 8, ink share 40%) | 0.4 / 15.4 / 26.6 | | |
+
+(median plane steps 0.07-0.5; ift3 on the same box: no step.) Window 1024 / halo 256 still 10-14; `--gn-frozen` (fresh pooled
+statistics) moves the levels, not the steps; level 1 (4.8 um, the crop eval's level) 5.2 / 13.2 / 3.8. No attention stage, constant
+FiLM code. Turning the per-window dice off did NOT remove the steps (11000 / 12000 as large as 9000), so the head's level depends on
+context wider than 256 voxels for another reason (receptive field of the stride-4 trunk; ink never supervised in air, ~60 / 255 there).
+
+Fix at inference: two passes, the second on a tile grid shifted by half a tile (`--grid-origin 256,256,256`), blended with sin^2 tile
+weights (`ufsm ink-blend --tile 512 --grids 0,0,0:256,256,256`): on a 512^3 read across the corner the largest plane step drops from
+16.9 to 1.3 (median 0.1). The shifted pass must use `--shard 256`: with 512 shards every shard needs 8 windows (P4 inner 17405 windows
+vs 2311, 7.5x); with 256 shards the output is byte-identical (1299 test box) in 5 s instead of 63 s. Papyrus gate for renders only:
+the same `--heads ink,c12,c13` run gives the recto / verso probabilities, gated = ink x max(c12, c13) on the rendered stripes; the
+store and the scores stay ungated.
+
+1667 u1 centre surface, inkpod-9000 blended, vs the published human labels (wrapscore, 40 um; ift3-24000 beside):
+
+| split | coverage | inkpod-9000 ink AUC | ift3-24000 |
+|---|---|---|---|
+| all | 0.860 | 0.774 | 0.646 |
+| validation | 0.827 | 0.528 | 0.670 |
+| holdout | 0.864 | 0.560 | 0.639 |
+| rest (in the ink training labels) | 0.864 | 0.832 | 0.643 |
+
+The "all" gain is the training labels: on the unseen splits the latent head is below ift3 (-0.14 / -0.08). 20 / 80 um all: 0.776 /
+0.776 (coverage 0.615 / 0.971). wrapscore: the foot-point refine's 2x2 solve is closed-form (np.linalg.solve raised on P4's grid holes).
+
+## The 1667 unroll's ink against the human labels on our surfaces (2026-11-12, scripts/inkgt/wrapscore.py)
+
+`ufsm ink-compare`, which the earlier unrolls ran, is label-free (CT | ink panels and statistics). wrapscore.py maps the published
+labels onto our flattened stripes:
+1. It samples every 8th label px of the 6 published PHerc1667 segments inside their supervision (7.79 M samples, ink 0.24) and takes
+   each sample's 3-D point on the published mesh.
+2. It finds the nearest vertex of our stripes (x 4 to level 0), then the foot point on that bilinear patch. The distance is the miss.
+3. Within a tolerance, it reads the stripe's ink and CT renders (strip-mosaic <s>_ink.jpg / <s>_ct.jpg) at the render pixel
+   (render px = grid / scale, render_core.h).
+
+Coverage scores the surfaces. AUC and best F1 are rank-based, so the mosaic stretch doesn't change them.
+
+Check: a published segment through a half-resolution re-grid of itself in 9.6 um voxels, with a half-size map, gives AUC 0.978 for a
+perfect map (miss median 0.2 um).
+
+u1 unroll (ift3-24000 ink, out of sample on 1667), 40 um, all samples:
+
+| render set | coverage | median miss | ink AUC (20 / 80 um) | ink best F1 | CT AUC |
+|---|---|---|---|---|---|
+| centre, depth 1 + fill | 0.860 | 15.1 um | 0.646 (0.645 / 0.648) | 0.435 | 0.540 |
+| centre, thin +-2 | 0.860 | 15.1 um | 0.646 | 0.434 | 0.540 |
+| recto face (-1.5 voxels) fill / thin | 0.848 | 16.6 um | 0.648 / 0.647 | 0.437 | 0.535 |
+| verso face (+1.5 voxels) fill / thin | 0.795 | 22.4 um | 0.643 / 0.643 | 0.431 | 0.526 |
+
+- Coverage at 20 / 80 um (centre): 0.615 / 0.971.
+- The validation split runs 0.01-0.035 higher, the ink holdout boxes about 0.01 lower.
+- The face shift and the thin band move the ink AUC by <= 0.005. The limit is the ink model, not the render. The published meshes lie
+  slightly to the recto side of our centre surface.
+
+## Pod whole-scroll unroll queue: two lanes per card, axis check, latent ink stage (2026-11-12/13, branch podunroll-20261112)
+
+Pod 3 (one RTX PRO 6000, 98 GB; cgroup 94 GB / 27.2 CPUs), u1-13750, RECTOSP=0, the user's smallest-first list. 13 scrolls landed
+on the desk before the user cancelled the queue (01:xx 11-13): 0332, MAN5, 0009B, MANB, 0814, 1203, 0358, 1451, 0813, 0846B, 0257,
+0490B, 0483B (renders in /vesuvius/ufsm/unroll/<S>-u1; logs in /vesuvius/ufsm/v2/lat/runs/podsave-20261112/pod3).
+On papyrus 0.60-0.85, wrap-check dup 0-17 % (MAN5 27 %). The fields took 36-586 s and the slabs 118-1979 s per scroll.
+
+- `scripts/pod/q.sh LANE`: 2 lanes share the card (FITLANES 2, TH 13 each); a lane claims the next scroll (flock), fetches its CT from
+  the mirror (setup.sh step 6), uses the corpus box / axis (kit/S/{box.txt,axis.json}), runs pod/unroll.sh. After the 00:24 disk-full
+  (500 / 500 GB, a lane spun on a failed setup because its claim file could not be written): a claim counts only when written, a failed
+  setup marks the scroll failed and backs off 60 s, lanes wait below 60 GB free, rc 0 without stripimg.done is a failure.
+- `scripts/pod/podpull.sh` (desk): each scroll's overview / strip_long / one ct+ink stripe / logs as soon as stripimg lands
+  (temp name + rename), a sanity FLAG (on-papyrus < 0.5 or dup share > 30 %), then trims the pod (strip mesh, ink, ref-cf, CT copy).
+- pod/unroll.sh: per-scroll helper dir (drv/S: two lanes' starts swapped scrolls.tsv otherwise); `INKW=576` (an auto ink window took
+  1600^3 / 90 GB of a free card and spilled the other lane's fits to managed memory, ink 2 -> 260 s per window; see the winauto section).
+- Axis check (`scripts/pod/axcheck.{sh,py}`, hooked into pod/unroll.sh before the run starts): the corpus axis vs the papyrus centroid
+  (Otsu on level LV+3, per-z centroid, running median +-2048 L0 voxels) at 10/30/50/70/90 % of the papyrus height; off = the median of
+  the 30/50/70 % offsets > 2 mm, or no papyrus within 1 mm at 50 % -> axis_centroid.json. "Any level > 2 mm" was too strict: the ends
+  are tapered caps and the umbilicus is not the mass centroid (0009B 5.9 / 1.1 / 3.4 / 0.7 / 7.8 mm and 0814 3.6 / 1.3 / 0.3 / 0.6 /
+  1.9 mm unrolled well on their corpus axes). PHercMANB (crushed, lens-shaped; corpus axis 3-10 mm off, median 4.1 mm): on papyrus
+  0.369 -> 0.628 and dup 30 % -> 17 % with the centroid axis.
+- Latent ink stage (`scripts/pod/latink.sh` as INKCMD; user 11-13 "forget about ift3"): inkB's recipe, predict --heads ink,c12,c13
+  (inkpod-9000) at the run's level, window 544 halo 16, grids 0 and 256 (the 256 pass on --shard 256: on 512 shards each shard
+  overlapped 8 shifted windows, ~7x the windows), ink-blend per head. strip_refill.sh (INKGATE) gates every stripe's ink render by
+  max(p_recto, p_verso) and takes the contrast stretch from the gated middle stripes (ink percentiles over papyrus pixels, CT >= 80).
+  Only 0841 / 0846A ran it before the cancel (0846A ink 1621 s incl. the rerun of its grid 256); no landed scroll has latent ink.
+
+## Split-window input builders: every --gpu-aug builder by z range, the scanner split exactly across two GPUs (2026-11-13, branch augz-20261112)
+
+For the 40 M net (widths 192..384), one P 1024 window is split in z across both 5060 Tis (univI's splitwin-20261112). Each GPU then
+builds only its own output planes of the window's input and labels. The window stays the global P^3: the same record, draws and
+global coordinates, so a rank's planes are byte for byte the whole-window call's planes.
+
+- **Labels** (nn_label_warp_z / nn_label_sym_z / nn_w4runs_label_z / nn_ink_bits_z) write output planes [z0, z0 + nz) from source
+  planes [s0, s1) only.
+  - nn_aug_src_range(rad, P, z0, nz) bounds [s0, s1). The warp's source z is linear in the per-axis displaced coordinates (rotation,
+    zoom, affine, symmetry; elastic is per-axis tables), so its extremes are at the corners of the box of their ranges. Measured: the
+    bound is at most 4 planes wider than the corners actually read, over 12 cases.
+  - Under rotation the source range is ~nz cos + P sin. At P 256 the 40 / 72 range at 30 degrees staged 3.56 nz. So the staging does
+    not halve under rotation: budget ~P planes of 8-bit staging per GPU (1 GB at P 1024).
+  - nn_w4runs_apply_z: the runs are per x row, so a z range needs no plane outside it (strip offsets into the run table).
+- **CT channel** (nn_aug_ct_z): the scanner ops need the whole source window. Paganin's two-sided exponential and the correlated
+  noise recurse along z, GIN / histogram / z-score use whole-window statistics, and the z blur reads taps. With a zcomm (two ranks),
+  rank r scans its source half and exchanges:
+  - the halo planes, as they are before each stencil (the z blur's reach from the plan, GIN's 1, a dropped slice's source);
+  - the correlated noise's carried plane (rank 0 -> 1);
+  - paganin's carried y per line: forward 0 -> 1, then rank 1's backward from P - 2, then 1 -> 0;
+  - the statistics: integer sums exact, GIN's two doubles as two partial atomic sums, which are order-free anyway;
+  - finally, the scanned 8-bit planes each rank's warp reads from the other.
+  The fp16 work volume aliases the rank's CT channel planes, as the one-GPU path does, when P/2 + 2 halo <= nz.
+  Per GPU at P 1024: CT channel 544 planes (1.14 GB) + staging <= 1 GB, against 2 + 2.23 GB for the whole window.
+- **Tests** (tests/test_aug_z.c, gpu, 14 s at P 256):
+  - every label builder over 4 ranges x 12 warp / symmetry cases, with poisoned host planes outside [s0, s1) and a poisoned staging
+    buffer;
+  - the CT channel for the 22 scanner ops alone at two strengths, a mixture and none (44 cases) x 2 range pairs: the one-GPU range
+    and both split ranks, through a loopback zcomm (two host threads, one GPU, a staging slot each);
+  - all byte-identical to the whole-window call. A negative control (the exchanges dropped) differs on every voxel.
+  - test_gpu_aug is unchanged and passes.
+- **Stored onfly codes are now dcached.** The key is the array path, zarr.json size / mtime and the poolings. Without it every read
+  recomputed the pair rule (16-50 s per 512^3 window on the CPU). sources-scratch1 v3 reads june / 0139 / 0500P2 / 1667-gt phase on
+  the fly from their codes; phase-onfly against the stored rasters:
+  - P4 june codesA 9.6 rmax 40: 0 differing voxels;
+  - 0139 A+B fused rmax 41: 0 differing voxels;
+  - 0500P2: native codes rebuilt, 0 differing voxels;
+  - 1667 A+B 4.8 pooled: 10384 of 805 M voxels differ;
+  - P4 july: the gtjuly codesB rebuild differs on 29%, because the 10-19 codes it came from are gone, so it keeps phaseB.
+- Left to the split itself (univI): the zcomm over split.c's staged peer copies, the latent input from the CT channel, the
+  label-stream slabs, MIL rays.
+
+## inkpod: the ink training run on a rented RTX PRO 6000; --ink-dice 0 from step 10036 (2026-11-12 / 13, branch inkpod2-20261113)
+
+The unified run's ink head moved off the desk (user, 11-12: "do ink detection training on the rtx6000"). inkpod = the unified run's
+flags (`--lat 4`, P 1024, B 1, `--ink-head 1 --ink-mil 1 --ink-smooth 0.1`, um-rungs 4.8,9.6:2,19.2, ...), init by head from the desk
+unified run's step 1504, master a0eecbb, then a5520d5 from pod step ~1050. Pod: 96 GB card, 27 CPUs, cgroup memory 94 GB (`free` shows 755),
+500 GB disk, glibc 2.39 (desk binaries need 2.43: built on the pod).
+
+- Data. The desk uplink is 4.2 MB/s (2 GB in 480 s over 4 streams), so the ~220 GB label set was rebuilt on the pod where public:
+  Paris 4 codes A / B / A48 and phase A (scripts/pod/p4kit.sh from the published June / July meshes; codesB 4 min and codesA48 9 min
+  at full memory), PHerc0139 phase (k0139.sh: 17,035,432,659 known voxels, the desk's count exactly). Shipped: the ink GT (1.6 GB), 1667
+  GT (20 GB, 1.5 h), 0500P2 phase, axes / holdouts. Paris 4 phase B (57 GB) did not fit beside the local CT: july is out of the pod sources.
+- CT over HTTP from the volcomp mirror: 90-113 Mvox/s at 91-92 % loader wait (latency-bound reads). `ufsm mirror` copies at 250-400 MB/s
+  (Paris 4 level 3, 12 GB, in 30 s): levels 1-5 of Paris 4 / 1667 / 0009B / MAN5 and 0139 / 0500P2 9.362 local (~235 GB), 0139 2.399 and
+  0814 on HTTP + cache. Mirror CT groups need the desk's zarr.json (absolute-um scales).
+- Host memory. The trainer alone peaks at ~83 GB at W6 / S6 (pinned slots 3.36 GB each, a worker ~2.2 GB); five cgroup OOM kills while
+  settling. Fix: the container's cgroup root split into `main` (the trainer) and `kit` (memory.max 6G) so a label build can never make the
+  OOM killer pick the trainer; rasters that need more run in a stopped-trainer window.
+- The loader bottleneck was the slot count, not the workers: W5 and W8 at S4 both ran 310-430 Mvox/s at 64-73 % wait (per-thread /proc
+  samples: 3 of 8 workers idle on a futex for 40 / 40 s, the others ~0.6 core), because each window holds its slot through its 3 replays.
+  W5 / S7: 650-850 Mvox/s at 17-38 % wait (2.5-3.8x the desk's 226 Mvox/s), anon + shmem ~67 GB.
+- Stage 2 (pod step 2010): the winding / rv sources back at 50 % of the source weight, ink 50 % (mix lines 52-54 % ink windows).
+- The window-level dice. inkB found per-window ink level steps in inkpod-9000 whole-scroll predicts (5-30 / 255 across seams, 10-14 even
+  at halo 256; GN frozen stats do not remove them; ift3 has none; ~60 / 255 in air). From the training side: `--ink-dice 0.25` adds a soft
+  dice per window over its known voxels, normalised by the window's own ink sum (a per-window gain prior); MIL is local (per ray, +/- 10
+  voxels along the face normal); ink trains at 4.8 and 9.6 (so 9.6 inference is in distribution); the ink targets label only papyrus on a
+  labelled face band, so air is never supervised. inkpod restarted at step 10036 with `--ink-dice 0` (the dice version kept as
+  inkpod-pre-nodice.ckpt). To measure: inkB's seam steps on the same 1299 box at +1000 / +2000, latres's 34-crop ink AUC for the cost.
+  Next candidate: `--ink-air W` (air voxels of ink windows -> ink 0 at a small subsampled weight).
 
 ## predict --window auto on a shared card: UFSM_MEM_FREE_GB budget, interior cap 1024 (2026-11-12, branch winauto-20261112)
 
@@ -759,6 +1091,25 @@ dropped 10 of 14 picked windows as "empty targets". Three causes:
   of the supervised pixels. So validation "exclude" leaves 0 supervised tiles there (15112 / 11687 with validation off) and no
   draw index. The open data apparently marks these segments as validation whole. They should stay out of the ink weight; they
   can serve as unseen-scroll ink evals. MAN5's hf labels hold no ink pixel in the supervised area (share 0.000).
+
+**Before / after on the desk (2026-11-12, after the pod went away).** U2's recipe (`--task unwrap2 --rv 2 --ink-head 1 --ink-mil 1`,
+P 1024, B 1, rungs 4.8 / 9.6, `--strict-sources 1`), sampler only, 1 worker / 1 slot, 40 batches, the 6 desk ink sources
+(/vesuvius/ufsm/univ/u2ink/sources-u2desk-ink.json: local CT levels 1-5, onfly level 1 + 2 pooled):
+
+| | master cb8102d | inkcache-20261112 (inkdraw + shared cache) |
+|---|---|---|
+| draws dropped as empty targets | 192 for 40 windows (83 %) | 3 for 40 (7 %) |
+| wall for 40 windows | 4738 s | 1443 s |
+| host RSS (UFSM_HOSTMEM) | 27.27 GB | 19.78 GB (ink caches 3.22 GB targets + 1.07 GB CT, at the 4096 MB budget) |
+
+After the fix, per ink window: known ink target on 0.28-0.51 % of the voxels, ink on 0.07-0.14 %, and 65536 MIL rays (the
+`--ink-mil-max` cap) per window. Paris 4 26 windows, 1667 13, 0139 1.
+
+**One cache budget for every ink source** (branch inkcache-20261112). Each onfly ink source used to open a 2 GB target LRU and a
+1 GB decoded-CT zcache (24 GB for 8 sources). They now share a dcache pool ("ink", z3_open_cached_pool) and one zcache, with one
+budget, `train --ink-cache-mb` (default 4096 or $UFSM_INK_CACHE_MB): 3/4 targets, 1/4 CT. inkfly_free drops its CT's chunks from
+the shared zcache (zcache_drop: a later array at the same address must never see them). test_zcache covers the pool (two arrays,
+8 threads, evicting, one closed, empty after) and zcache_drop.
 
 Footprint of one ink sampler at P 1024 (sampler only, 1 worker, 1 slot, 8 sources): 17.6 GB RSS. The pod arm A unit at 3 workers /
 3 slots peaked at 52 GB and OOM-killed itself and U2's run in the shared 175 GB cgroup (09:58 UTC).

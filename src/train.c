@@ -273,6 +273,7 @@ static int g_mil, g_mil_mode = 1, g_mil_stride = 2, g_mil_max = 65536; static fl
    (--ink-head): the normal-pooled MIL ink loss on each window's rays (inkmil.h): per supervised label pixel (mode 1: only those without an open face, the
    voxel target's unknowns), BCE of the pooled ink logit along the normal over +-R window voxels at step (tau 0: max; > 0: tau log mean exp), the mean
    over the window's rays x L x the source's ink weight; at most --ink-mil-max rays a window (the device buffers; the backward's sort ~300 B per sample) */
+static int g_ink_air;   /* --ink-air S (--ink-head, needs the --rv papyrus plane): unlabelled air voxels on the S-voxel window lattice -> ink 0 targets (nn_ink_air) */
 static float g_ink_smooth;   /* --ink-smooth EPS (--ink-head): label smoothing of the ink BCE target, t (1 - eps) + eps / 2 (villa: 0.1) */
 static int g_unwrap, g_norm_ch, g_norm_s = 4; static float g_ink_lambda = 1.f, g_ink_dice = 0.f, g_norm_lambda = 1.f, g_dens_lambda = 1.f, g_dens_scale = 32.f;   /* --density-lambda: the density channel's BCE weight (default --normal-lambda) */
 static int g_dens_code; static float g_packed_w, g_packed_um = 120.f;   /* --density-code, --packed-weight, --packed-um (task unwrap) */
@@ -1048,6 +1049,7 @@ static void hs_zero_halo_cells(const gpu_state *d, void *g, int ch, int f0, int 
 /* g_lsplit --ink-mil: the rays stay in the whole window's coordinates (depth g_Pw); each half's slab [z0, z0 + nz) is clipped to hs_keep
    (pass 0: the owned planes, so every sample's corner terms are added on exactly one GPU and the accumulators' sum over the GPUs is the
    one-GPU accumulator; pass 1: + the band cell, as the other losses) and shifted to the whole window's planes. 1: a part remains */
+/* (also --ink-air: its S-lattice in the whole window's planes) */
 static int mil_zoff(const gpu_state *d) { return g_lsplit && d->side == 1 ? g_Pw / 2 - g_h0 : 0; }
 static int mil_clip(const gpu_state *d, int pass, int z0, int nz, size_t hw, int *gz0, int *gnz, size_t *boff) {
     int a = 0, b = g_Pz; hs_keep(d, pass, &a, &b);
@@ -1214,7 +1216,7 @@ static void head_slab_pass(gpu_state *d, int pass) {
                 nn_loss_stats_acc(LGC(1), d->t + l3 + vb, d->pm + vb, d->w + 1, one, d->hs_ds + 5);
             } else nn_wind4_stats(LGC(g_w4_ch), LGC(g_w4_ch + 1), w4 + vb, wc + vb, d->sidem, ns, d->w4ds);
             FT("  s wind4 stats");
-            if (g_ink2) { nn_ink_targets_smooth(ink + vb, ns, d->inkt, d->inkm, g_ink_smooth); hs_clip(d, pass, d->inkm, z0, z1, hw); nn_loss_stats_acc(LGC(g_ink2_ch), d->inkt, d->inkm, d->inkw, one, d->hs_ds + 5); }
+            if (g_ink2) { nn_ink_targets_smooth(ink + vb, ns, d->inkt, d->inkm, g_ink_smooth); if (g_ink_air && pap) nn_ink_air(pap + vb, ns, z0 + mil_zoff(d), H, W, g_ink_air, g_ink_smooth, d->inkt, d->inkm); hs_clip(d, pass, d->inkm, z0, z1, hw); nn_loss_stats_acc(LGC(g_ink2_ch), d->inkt, d->inkm, d->inkw, one, d->hs_ds + 5); }
             int mz0, mnz; size_t mbo;
             if (nmil && mil_clip(d, 0, z0, nz, hw, &mz0, &mnz, &mbo) && ink_mil_fwd_slab(LGC(g_ink2_ch) + mbo, 0, mz0, mnz, MD, H, W, mrays, nmil, g_mil_R, g_mil_step, d->milacc, nullptr)) { fprintf(stderr, "ink mil: fwd_slab failed\n"); exit(1); }   /* (the logits: fp16) */   /* --ink-head (the recto / ink v1 slots are free) */
             if (mck) { _Float16 *h = malloc(ns * 2); nn_sync(); nn_d2h(h, LGC(g_ink2_ch), ns * 2); for (size_t q = 0; q < ns; q++) mlg[vb + q] = (float)h[q]; free(h); nn_d2h(mink + vb, ink + vb, ns); }   /* (+ the ink target plane the loss reads) */
@@ -1240,7 +1242,9 @@ static void head_slab_pass(gpu_state *d, int pass) {
         } else nn_wind4_grad(LGC(g_w4_ch), LGC(g_w4_ch + 1), w4 + vb, wc + vb, d->sidem, ns, d->w4fin, g_w4_lambda * src_head_w(si, SH_WIND4), LGC(g_w4_ch), LGC(g_w4_ch + 1));
         FT("  g wind4 grad");
         if (g_ink2) {   /* --ink-head: soft BCE over the known ink voxels, times --ink-lambda x the source's "ink_weight" */
-            nn_ink_targets_smooth(ink + vb, ns, d->inkt, d->inkm, g_ink_smooth); hs_clip(d, pass, d->inkm, z0, z1, hw);
+            nn_ink_targets_smooth(ink + vb, ns, d->inkt, d->inkm, g_ink_smooth);
+            if (g_ink_air && pap) nn_ink_air(pap + vb, ns, z0 + mil_zoff(d), H, W, g_ink_air, g_ink_smooth, d->inkt, d->inkm);   /* --ink-air: + the air lattice as ink 0 */
+            hs_clip(d, pass, d->inkm, z0, z1, hw);
             nn_loss_grad_only(LGC(g_ink2_ch), d->inkt, d->inkm, d->inkw, one, g_ink_dice, LGC(g_ink2_ch), d->iscratch);   /* (--ink-dice: + w x the soft dice of the window's known voxels) */
             const float iw = g_ink_lambda * (si >= 0 && g_S && si < g_S->n ? (float)g_S->src[si].ink_weight : 1.f) * src_head_w(si, SH_INK);
             if (iw != 1.f) nn_loss_grad_scale(LGC(g_ink2_ch), ns, iw);
@@ -1509,6 +1513,10 @@ static void gstep_fwd(gstep_arg *a) {
                 if (g_lstream) for (int k = 0; k < 4; k++) if (d->lbh[k]) { uint64_t h = 1469598103934665603ull; for (size_t q = 0; q < p3t; q++) h = (h ^ d->lbh[k][q]) * 1099511628211ull; hl[k] = h; }
                 fprintf(stderr, "dettrace step %d: x %016llx labels %016llx %016llx %016llx %016llx params %016llx\n", step, (unsigned long long)hx, (unsigned long long)hl[0], (unsigned long long)hl[1], (unsigned long long)hl[2], (unsigned long long)hl[3], (unsigned long long)unet_param_hash(d->u));
                 free(hb);
+                const char *dd = getenv("UFSM_DET_DUMP");   /* dir: the parameters and the last step's gradient (before zeroing), fp32, per step */
+                if (dd && g == 0) { const size_t np = unet_nparams(d->u); float *h = malloc(np * 4); char fn[1100];
+                    unet_params_d2h(d->u, h); snprintf(fn, sizeof fn, "%s/p%d.f32", dd, step); FILE *f = fopen(fn, "wb"); if (f) { fwrite(h, 4, np, f); fclose(f); }
+                    nn_d2h(h, unet_grad_ptr(d->u), np * 4); snprintf(fn, sizeof fn, "%s/g%d.f32", dd, step); f = fopen(fn, "wb"); if (f) { fwrite(h, 4, np, f); fclose(f); } free(h); }
             }
             if (sparse_at && step >= sparse_at && !unet_get_sparse24(d->u)) { unet_set_sparse24(d->u, 1); if (g == 0) fprintf(stderr, "step %d: 2:4 sparsity on (SR-STE lambda %g)\n", step, srste); }
             unet_zero_grad(d->u);
@@ -2101,6 +2109,14 @@ static void split_job(int side, void *a) {
 
 int cmd_train(int argc, char **argv) {
     if (ufsm_env_on("UFSM_UW_SELFTEST")) return uw_selftest();
+    {   /* --ct-gpu-decode D (DESIGN 2026-11-13): the sampler's volcomp CT decode on GPU D (src/nn_gpudec.cu, byte-identical to the CPU decode;
+           test_gpudec), i.e. UFSM_GPU_DECODE=1 UFSM_GPU_DECODE_DEV=D, set before the first z3 decode (the sources' draw-index reads) because the
+           decoder reads its env once; -1 (default) keeps the CPU decode. Its statistics print at exit. */
+        const int gd = atoi(opt(argc, argv, "--ct-gpu-decode", "-1"));
+        if (gd >= 0) { char b[16]; snprintf(b, sizeof b, "%d", gd); setenv("UFSM_GPU_DECODE", "1", 1); setenv("UFSM_GPU_DECODE_DEV", b, 1);
+                       if (!getenv("UFSM_GPU_DECODE_STATS")) setenv("UFSM_GPU_DECODE_STATS", "1", 1);
+                       fprintf(stderr, "train: the CT decode (volcomp substreams) on GPU %d (gpudec, byte-identical to the CPU decode)\n", gd); }
+    }
     if (argc < 3) {
         fprintf(stderr, "usage: ufsm train <sources.json> --out DIR [--P 512] [--B 1] [--steps 20000] [--lr 1e-3] [--warmup 500] [--wd 0.01]\n"
                         "       [--dice 0.5] [--ema 0.999] [--widths 16,32,64,80] [--down-norm 1] [--gpus 0,1] [--workers 12 (new runs with --gpu-aug 2: 3)] [--gpu-aug 0|1|2 (new runs: 2)] [--sampler-slots N] [--seed 0] [--det 1] [--resume CKPT] [--finetune 1] [--fp4 0|1|2 (default 2)] [--mem auto|auto16|default|wide] [--opt adamw|muon|anvil] [--muon-lr 0.02] [--muon-beta 0.95] [--anvil-lr 0.023] [--anvil-wd 2.25] [--sched cos|wsd] [--cooldown 0.2]\n"
@@ -2110,7 +2126,7 @@ int cmd_train(int argc, char **argv) {
                         "       [--schedule-seconds S --schedule-elapsed S]   wall-time LR horizon across finite-cover evaluation pauses\n"
                         "       [--cover PLAN.json] [--cover-extend-from OLD_PLAN.json] [--cover-next-pass 1] [--stop-at STEP] [--ct-aug 0|1] [--symmetry-p 1] [--axis-jitter 0] [--limit-seconds 0]\n"
                         "       [--lr-floor 0 (the schedule ends at this fraction of the peak; modded-nanogpt 0.3)] [--wd-nonconv 0 (decay multiplier for GroupNorm, biases, head under Muon / ANVIL)]\n"
-                        "       [--muon-c 1 (Muon-C: conv kernels polarised per Fourier frequency)] [--hyperball 1 (fixed weight / update norms)] [--hb-lr-mult 0.707 (Hyperball lr / Muon lr)]\n"
+                        "       [--muon-c 1 (Muon-C: conv kernels polarised per Fourier frequency)] [--muon-ns fixed|polar (Newton-Schulz maps: fixed quintic | Polar Express)] [--normuon 1 (NorMuon row normalisation)] [--normuon-beta2 0.95] [--muon-vr G (MARS variance reduction, 0.025)] [--muon-scale kj|spectral] [--opt-rest adamw|sign --sign-lr-mult 1] [--muon-tc 2 (Newton-Schulz on cuBLASLt TF32: 2.1x faster step; 1: hand-written fp16 wmma, slower)] [--muon-qkv-split 1] [--qk-clip TAU (attention: max logit per head held at TAU via the QK-norm gains)] [--muon-cautious 1] [--muon-ademamix A --ademamix-b3 0.999 --ademamix-t T] [--muon-kron 1 (Kronecker Co/Ci/taps preconditioner) --muon-kron-b2 0.99 --muon-kron-eps 1e-3 --muon-kron-every 10] [--hyperball 1 (fixed weight / update norms)] [--hb-lr-mult 0.707 (Hyperball lr / Muon lr)]\n"
                         "       [--trunk-lr-mult 1 (lr x F outside the attention stage; no stage: all but the head)] [--trunk-lr-steps N (x F only until step N)] [--ink-head 0|1 (task unwrap2: + the ink logit, channel 11; sources targets.ink prob254, sources ink_weight) --ink-lambda 1 --ink-bias -2 (warm start: the new row) --ink-smooth 0 (label smoothing eps)] [--attn-dcoarse 0|1 (deformable: + the 2x pooled level)] [--attn-deform-init grid|normal]\n"
                         "       [--recall W (recto: + W (1 - soft recall), gradient only)]\n"
                         "       [--dec-convs 2 (convs per decoder level, one value or a list; 1 = one conv, nnU-Net style)]\n"
@@ -2228,6 +2244,9 @@ int cmd_train(int argc, char **argv) {
             }
         }
         g_ink_lambda = (float)atof(opt(argc,argv,"--ink-lambda","1")); g_ink_dice = (float)atof(opt(argc,argv,"--ink-dice","0"));
+        g_ink_air = atoi(opt(argc,argv,"--ink-air","0"));   /* (DESIGN 2026-11-13: the face-band ink labels never reach air, so the head's level there was free) */
+        if (g_ink_air < 0 || (g_ink_air && (!g_unwrap2 || !g_ink2 || !g_rv))) { fprintf(stderr,"--ink-air S: S >= 1 voxels, with --task unwrap2 --ink-head 1 and --rv (the papyrus plane)\n"); return 2; }
+        if (g_ink_air) fprintf(stderr, "ink air: unlabelled air voxels (papyrus plane known, < 127) on the %d^3-voxel lattice are ink-0 targets\n", g_ink_air);
         g_norm_lambda = (float)atof(opt(argc,argv,"--normal-lambda","1")); g_dens_lambda = (float)atof(opt(argc,argv,"--density-lambda",opt(argc,argv,"--normal-lambda","1")));
         if (!(g_norm_lambda >= 0) || !(g_dens_lambda >= 0)) { fprintf(stderr,"--normal-lambda / --density-lambda >= 0\n"); return 2; }
         g_norm_s = atoi(opt(argc,argv,"--normal-step","4"));
@@ -2391,7 +2410,32 @@ int cmd_train(int argc, char **argv) {
     const float hb_mult = (float)atof(opt(argc, argv, "--hb-lr-mult", "0.70710678"));
     if ((muon_c || hyperball) && !use_muon) { fprintf(stderr, "--muon-c / --hyperball need --opt muon\n"); return 2; }
     if (muon_c < 0 || muon_c > 1 || hyperball < 0 || hyperball > 1 || !(hb_mult > 0.f)) { fprintf(stderr, "--muon-c / --hyperball: 0 or 1; --hb-lr-mult > 0\n"); return 2; }
-    if (muon_c || hyperball) optname = muon_c && hyperball ? "muon-c-hb" : muon_c ? "muon-c" : "muon-hb";   /* the manifest / checkpoint label */
+    /* --muon-ns fixed | polar (Newton-Schulz maps: Keller Jordan's fixed quintic, or the Polar Express schedule), --normuon 1 (NorMuon's
+       per-row second-moment normalisation after the orthogonalisation, row EMA --normuon-beta2, default 0.95; Muon's update RMS kept) */
+    const char *muon_ns = opt(argc, argv, "--muon-ns", "fixed"); const int normuon = atoi(opt(argc, argv, "--normuon", "0"));
+    const float normuon_b2 = (float)atof(opt(argc, argv, "--normuon-beta2", "0.95"));
+    const float muon_vr = (float)atof(opt(argc, argv, "--muon-vr", "0"));   /* MARS variance reduction gamma (0 = off; MARS uses 0.025) */
+    /* --muon-kron 1: Kronecker (Co / Ci / 27 taps) Shampoo preconditioning of the 3^3 conv gradients, then Muon */
+    const char *muon_scale_s = opt(argc, argv, "--muon-scale", "kj"), *rest_s = opt(argc, argv, "--opt-rest", "adamw");
+    const float rest_mult = (float)atof(opt(argc, argv, "--sign-lr-mult", "1"));
+    if ((strcmp(muon_scale_s, "kj") && strcmp(muon_scale_s, "spectral")) || (strcmp(rest_s, "adamw") && strcmp(rest_s, "sign"))) { fprintf(stderr, "--muon-scale kj | spectral, --opt-rest adamw | sign\n"); return 2; }
+    const int muon_spec = !strcmp(muon_scale_s, "spectral"), rest_sign = !strcmp(rest_s, "sign");
+    const int muon_qkv = atoi(opt(argc, argv, "--muon-qkv-split", "0"));   /* per-head Q / K / V orthogonalisation */
+    const float qk_tau = (float)atof(opt(argc, argv, "--qk-clip", "0"));   /* QK-clip: the max attention logit per head held at tau (0: off; the log's "qk" always) */
+    const int muon_tc = atoi(opt(argc, argv, "--muon-tc", "0"));   /* Newton-Schulz on tensor cores: 1 wmma fp16, 2 cuBLASLt TF32 */
+    const int muon_caut = atoi(opt(argc, argv, "--muon-cautious", "0"));   /* cautious masking of Muon's direction */
+    const float mix_a = (float)atof(opt(argc, argv, "--muon-ademamix", "0")), mix_b3 = (float)atof(opt(argc, argv, "--ademamix-b3", "0.999"));
+    const int mix_T = atoi(opt(argc, argv, "--ademamix-t", "0"));   /* the alpha ramp (optimizer steps; 0 = the run's) */
+    const int muon_kron = atoi(opt(argc, argv, "--muon-kron", "0")), kron_every = atoi(opt(argc, argv, "--muon-kron-every", "10"));
+    const float kron_b2 = (float)atof(opt(argc, argv, "--muon-kron-b2", "0.99")), kron_eps = (float)atof(opt(argc, argv, "--muon-kron-eps", "1e-3"));
+    const int ns_mode = !strcmp(muon_ns, "polar") ? 1 : !strcmp(muon_ns, "fixed") ? 0 : -1;
+    if (ns_mode < 0 || normuon < 0 || normuon > 1 || !(normuon_b2 >= 0.f && normuon_b2 < 1.f)) { fprintf(stderr, "--muon-ns fixed | polar, --normuon 0 | 1, --normuon-beta2 in [0, 1)\n"); return 2; }
+    if ((ns_mode || normuon || muon_vr != 0.f || muon_kron || muon_caut || mix_a != 0.f) && !use_muon) { fprintf(stderr, "--muon-ns polar / --normuon / --muon-vr / --muon-kron / --muon-cautious / --muon-ademamix need --opt muon\n"); return 2; }
+    if (muon_kron < 0 || muon_kron > 1 || kron_every < 1 || !(kron_b2 >= 0.f && kron_b2 < 1.f) || !(kron_eps > 0.f)) { fprintf(stderr, "--muon-kron 0 | 1, --muon-kron-every >= 1, --muon-kron-b2 in [0, 1), --muon-kron-eps > 0\n"); return 2; }
+    if (!(muon_vr >= 0.f && muon_vr <= 1.f)) { fprintf(stderr, "--muon-vr: 0 .. 1\n"); return 2; }
+    static char optlabel[16];   /* the manifest / checkpoint label (16 bytes, truncated): muon[-c][-hb][+pe][+nm][+vr][+kr][+ca] */
+    if (muon_c || hyperball || ns_mode || normuon || muon_vr != 0.f || muon_kron || muon_caut || mix_a != 0.f) {
+        snprintf(optlabel, sizeof optlabel, "muon%s%s%s%s%s%s%s%s", muon_c ? "-c" : "", hyperball ? "-hb" : "", ns_mode ? "+pe" : "", normuon ? "+nm" : "", muon_vr != 0.f ? "+vr" : "", muon_kron ? "+kr" : "", muon_caut ? "+ca" : "", mix_a != 0.f ? "+mx" : ""); optname = optlabel; }
     /* --trunk-lr-mult F: every parameter outside the attention stage (the conv trunk, heads, norms; Muon and AdamW) at F x the scheduled
        rates, the stage at the full rates (unet_set_trunk_lr; default 1) */
     const float trunk_lr = (float)atof(opt(argc, argv, "--trunk-lr-mult", "1"));
@@ -2404,7 +2448,7 @@ int cmd_train(int argc, char **argv) {
     const float init_lr = (float)atof(opt(argc, argv, "--init-lr-mult", "1"));
     const int init_lr_steps = atoi(opt(argc, argv, "--init-lr-steps", "0"));
     if (!(init_lr >= 0.f) || init_lr_steps < 0) { fprintf(stderr, "--init-lr-mult >= 0, --init-lr-steps >= 0\n"); return 2; }
-    if (init_lr != 1.f && (trunk_lr != 1.f || use_anvil || muon_c || hyperball)) { fprintf(stderr, "--init-lr-mult: not with --trunk-lr-mult, --opt anvil, --muon-c or --hyperball\n"); return 2; }
+    if (init_lr != 1.f && (trunk_lr != 1.f || use_anvil || muon_c || hyperball || ns_mode || normuon || muon_vr != 0.f || muon_caut || muon_kron || mix_a != 0.f)) { fprintf(stderr, "--init-lr-mult: not with --trunk-lr-mult, --opt anvil, --muon-c, --hyperball, --muon-ns polar, --normuon or --muon-vr\n"); return 2; }
     float anvil_lr = (float)atof(opt(argc, argv, "--anvil-lr", "0.023")), anvil_wd = (float)atof(opt(argc, argv, "--anvil-wd", "2.25"));
     const char *sched = opt(argc, argv, "--sched", "cos");   /* cos | wsd (warmup, constant, linear cooldown over the last --cooldown fraction; extendable runs) */
     int schedule_start = atoi(opt(argc, argv, "--schedule-start", "0"));
@@ -2737,28 +2781,32 @@ int cmd_train(int argc, char **argv) {
         else if (share >= 0 && share < 1 && wu > 0 && wl > 0) { const double f = share / (1 - share) * wl / wu; for (int i = 0; i < S->n; i++) if (S->src[i].ct_only) S->src[i].weight *= f; wu *= f; }
         if (nu) fprintf(stderr, "ssl: %d unlabelled sources, %.1f%% of the source weight\n", nu, 100 * wu / (wu + wl));
     }
+    /* the device memory the data path reserves before the memory planner reads the free memory (2026-11-13: ~7 GB of a 16 GB card on the
+       scratch sources), one line per owner */
+#define ONFLY_MEM(what) do { size_t fr_, to_; if (!nn_dev_mem(&fr_, &to_) && to_) fprintf(stderr, "memory: %.2f GB free on the device after %s\n", fr_ / 1e9, what); } while (0)
+    ONFLY_MEM("start-up");
     {   /* sources with an on-the-fly phase (band_onfly.h): the pair rule on --onfly-gpu (default the run's first GPU; -1 the CPU), its
            --onfly-slots tile buffers of --onfly-mb each reserved now, before the memory planner reads the free device memory */
         float rmax = 0; for (int i = 0; i < S->n; i++) if (S->src[i].phase_onfly > rmax) rmax = S->src[i].phase_onfly;
         if (rmax > 0) {
             const int og = atoi(opt(argc, argv, "--onfly-gpu", "0")), os = atoi(opt(argc, argv, "--onfly-slots", "2")), om = atoi(opt(argc, argv, "--onfly-mb", "2048"));
             if (phase_onfly_config(og, os, om, 1)) { fprintf(stderr, "train: --onfly-gpu %d: no GPU pair rule (or the reserve failed)\n", og); return 1; }
-            fprintf(stderr, "train: on-the-fly phase on %s %d, %d slots of %d MB (tile edge %d voxels at rmax %g)\n", og >= 0 ? "GPU" : "CPU", og, os, om, phase_onfly_tile_edge(rmax), rmax);
+            fprintf(stderr, "train: on-the-fly phase on %s %d, %d slots of %d MB (tile edge %d voxels at rmax %g)\n", og >= 0 ? "GPU" : "CPU", og, os, om, phase_onfly_tile_edge(rmax), rmax); ONFLY_MEM("the on-the-fly phase slots");
         }
         int nfib = 0; for (int i = 0; i < S->n; i++) for (int c = 0; c < NTG; c++) nfib += S->src[i].tgt_fib[c] != nullptr;
         if (nfib) {   /* "fibre" targets (fiberraster.h): the planes' stamp and combine on --onfly-gpu, buffers for the window's box reserved now */
-            const int og = atoi(opt(argc, argv, "--onfly-gpu", "0")), P0 = atoi(opt(argc, argv, "--P", "64")), e = P0 + 64;
+            const int og = atoi(opt(argc, argv, "--fibre-gpu", opt(argc, argv, "--onfly-gpu", "0"))), P0 = atoi(opt(argc, argv, "--P", "64")), e = P0 + 64;   /* (--fibre-gpu: another card than the phase's, e.g. the split's second) */
             const int fg = fiber_onfly_config(og, e);
             if (fg < 0) { fprintf(stderr, "train: --onfly-gpu %d: no GPU fibre planes (or the reserve failed)\n", og); return 1; }
             if (fg) fprintf(stderr, "train: on-the-fly fibre planes (%d targets) on GPU %d, buffers for %d^3 boxes\n", nfib, og, e);
-            else fprintf(stderr, "train: on-the-fly fibre planes (%d targets) on the CPU\n", nfib);
+            else fprintf(stderr, "train: on-the-fly fibre planes (%d targets) on the CPU\n", nfib); ONFLY_MEM("the fibre planes");
         }
         mesh_codes_gpu_config(atoi(opt(argc, argv, "--onfly-gpu", "0")));   /* the mesh codes stamp ("onfly": {"meshes"}) on the same device (-1 the CPU) */
         int nink = 0; for (int i = 0; i < S->n; i++) for (int c = 0; c < NTG; c++) nink += S->src[i].ink_fly[c] != nullptr;
         if (nink) {   /* "onfly" ink targets (inksplat.h inkfly_open): face + splat of a cold chunk on --onfly-gpu (per sampler thread a stream; -1 the CPU) */
-            const int og = atoi(opt(argc, argv, "--onfly-gpu", "0")); inkfly_gpu_config(og);
+            const int og = atoi(opt(argc, argv, "--ink-gpu", opt(argc, argv, "--onfly-gpu", "0"))); inkfly_gpu_config(og);   /* (--ink-gpu: as --fibre-gpu) */
             fprintf(stderr, "train: on-the-fly ink targets (%d) computed on %s %d (cached per 128^3 chunk: memory + %s)\n", nink, og >= 0 ? "GPU" : "CPU", og,
-                    dcache_default_dir() ? dcache_default_dir() : "no disk cache");
+                    dcache_default_dir() ? dcache_default_dir() : "no disk cache"); ONFLY_MEM("the ink targets");
         }
     }
     for (int i = 0; g_restore && i < S->n; i++) if (!S->src[i].srp != !g_rpairs) { fprintf(stderr, "--task restore: %s: \"sr_pair\" sources need --sr-pairs 1 and --sr-pairs 1 needs them all\n", S->src[i].name); return 2; }
@@ -3164,8 +3212,7 @@ int cmd_train(int argc, char **argv) {
     g_fstem = atoi(opt(argc, argv, "--fstem", "0")); g_fs_drop = (float)atof(opt(argc, argv, "--fstem-drop", "0.25"));
     if (g_fstem) {
         if (g_fstem < 1 || g_fstem > 16 || !(g_fs_drop >= 0 && g_fs_drop < 1) || !g_lat || g_lat_guide != 64 || !g_unwrap2 || B != 1) { fprintf(stderr, "--fstem 1..16 (--fstem-drop 0..1): task unwrap2, --lat 4 --lat-guide 3, --B 1\n"); return 2; }
-        g_fs_n = 0; for (int c = 0; c < g_cout; c++) if ((c < g_norm_ch || c >= g_norm_ch + 7) && (g_pad_ch < 0 || c < g_pad_ch)) g_fs_ch[g_fs_n++] = c;   /* (every voxel-logit output: not the fused
-                                                         normal / density, not the unsupervised pad channels of a head past 16 outputs: with --fib-head the 16 of phase, wind4, ink, rv, fibre) */
+        g_fs_n = 0; for (int c = 0; c < (g_pad_ch >= 0 ? g_pad_ch : g_cout); c++) if ((c < g_norm_ch || c >= g_norm_ch + 7) && g_fs_n < 32) g_fs_ch[g_fs_n++] = c;   /* (every voxel-logit output: not the fused normal / density, nor the --fib-head pads (2026-11-13: 25 > 16 with the pads, 16 without)) */
         if (g_fs_n > 16) { fprintf(stderr, "--fstem: %d outputs (16 at most)\n", g_fs_n); return 2; }
         cfg.fstem = g_fstem; cfg.fstem_out = g_fs_n;
         fprintf(stderr, "fine stem: %d silu features of 4^3 voxels at stride 2 into %d head outputs, dropped on %.0f%% of the training windows\n", g_fstem, g_fs_n, 100 * g_fs_drop);
@@ -3183,6 +3230,14 @@ int cmd_train(int argc, char **argv) {
         unet_set_gn_ema(d->u, (float)atof(opt(argc, argv, "--gn-ema-mom", "0.01")), atoi(opt(argc, argv, "--gn-ema-warm", "500")));   /* --gn-ema 1 (a resume: the checkpoint's) */
         unet_set_wd_nonconv(d->u, (float)atof(opt(argc, argv, "--wd-nonconv", "0")));   /* Muon / ANVIL: no decay on GroupNorm, biases, head */
         unet_set_muon_ext(d->u, muon_c, hyperball, hb_mult);
+        unet_set_muon_variant(d->u, ns_mode, normuon, normuon_b2);
+        unet_set_muon_vr(d->u, muon_vr);
+        unet_set_muon_cautious(d->u, muon_caut);
+        nn_muon_tc(muon_tc);
+        unet_set_muon_qkv_split(d->u, muon_qkv);
+        nn_muon_scale_mode(muon_spec); unet_set_rest_sign(d->u, rest_sign, rest_mult);
+        unet_set_muon_ademamix(d->u, mix_a, mix_b3, mix_T > 0 ? mix_T : steps / (atoi(opt(argc, argv, "--accum", "1")) > 0 ? atoi(opt(argc, argv, "--accum", "1")) : 1));
+        unet_set_muon_kron(d->u, muon_kron, kron_b2, kron_eps, kron_every);
         if (trunk_lr != 1.f) unet_set_trunk_lr(d->u, trunk_lr);
         if (init_lr != 1.f) unet_set_init_lr(d->u, init_lr);
         /* fp16 logits in their own buffer (MX activations; the losses read them as unet_logits_h16 says): 11 unwrap heads at P 384
@@ -3521,7 +3576,8 @@ int cmd_train(int argc, char **argv) {
                         pick_need / 1e9, fmin / 1e9, (double)pick_need / (double)vox, upb / 1e9, pick_off / 1e9, (double)pick_off / (double)vox,
                         fastest || !pick_off ? "" : "; --mem fast skips them where the window fits without");
             }
-            g_plan_spare = pick >= 0 && fmin > pick_need ? fmin - pick_need : 0;
+            g_plan_spare = pick >= 0 && pick_need > 0 && fmin > pick_need ? fmin - pick_need : 0;   /* (no mode fit, "trying" the smallest: no spare. 2026-11-13: pick_need 0 there
+                                                                                                    made the whole free memory "spare", the label planes then took 6.7 GB of it and the trainer OOMed) */
             unet_set_host_offloads(pick_hoff);
             unet_set_chunk_up(cand[pick].chunk); unet_set_recompute(cand[pick].rc); unet_set_grad_mx8(cand[pick].gmx); unet_set_lean(cand[pick].lean); unet_set_share_enc_a1(cand[pick].sea || (pick_hoff && sea_force));
             unet_set_l0_3buf(cand[pick].l3);
@@ -4282,6 +4338,16 @@ int cmd_train(int argc, char **argv) {
             if (use_anvil) unet_anvil(d->u, anvil_lr * lrr, anvil_wd, ostep, steps / accum, lr, 0.9f, 0.999f, 1e-8f, wd);
             else if (use_muon) unet_muon(d->u, muon_lr * lrr, muon_beta, lr, 0.9f, 0.999f, 1e-8f, wd, ostep);   /* Muon lr follows the same schedule shape */
             else unet_adamw(d->u, lr, 0.9f, 0.999f, 1e-8f, wd, ostep);
+            if (cfg.attn_blocks > 0) {   /* QK-clip on the step's logit maxima: replicas first agree on the max over all GPUs (identical clips) */
+                if (ng > 1 && qk_tau > 0.f && g == 0) {
+                    float mh[UNET_MAXTB * 64], th[UNET_MAXTB * 64];   /* (H = C / 48 <= 64) */
+                     int n = unet_qk_get(d->u, mh);
+                    for (int q = 1; q < ng && n; q++) { nn_init(G[q].dev); unet_qk_get(G[q].u, th); for (int i = 0; i < n; i++) mh[i] = fmaxf(mh[i], th[i]); }
+                    for (int q = 1; q < ng && n; q++) { nn_init(G[q].dev); unet_qk_put(G[q].u, mh); }
+                    nn_init(d->dev); if (n) unet_qk_put(d->u, mh);
+                }
+                unet_qk_clip(d->u, qk_tau);
+            }
             unet_ema(d->u, ostep < 100 ? 0.9f : ema);
             unet_wquant(d->u, (unsigned)step);              /* no-op unless --wq */
             if (prof) nn_prof_end();
@@ -4515,6 +4581,10 @@ int cmd_train(int argc, char **argv) {
                 memset(acc_cbin, 0, sizeof acc_cbin); }
             if (g_aff) { const float *a = G[0].aff_out; size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " aff %.4f (d1 bce %.3f dice %.3f | d8 bce %.3f dice %.3f)", G[0].aff_loss,
                                     (a[0] + a[6] + a[12]) / 3, (a[1] + a[7] + a[13]) / 3, (a[18] + a[24] + a[30]) / 3, (a[19] + a[25] + a[31]) / 3); }
+            if (cfg.attn_blocks > 0) {   /* the largest attention logit since the last line (QK-clip's quantity; held at --qk-clip when set) */
+                if (ng > 1) nn_init(G[0].dev);
+                const float q = unet_qk_lmax(G[0].u); if (q >= 0.f) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " qk %.1f", q); }
+            }
             if (accum > 1) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " (update %d: %d windows each)", step / accum, accum); }   /* --accum: steps are windows */
             fprintf(stderr, "step %6d lr %.2e loss %.4f bce %.4f dice %.4f%s gn %.2f %.2f samp/s %.1f Mvox/s (wait %.0f%%)%s%s\n", step, lr, acc_loss / nacc, acc_bce / nacc, acc_dice / nacc, affs, acc_g / nacc,
                     (double)nacc * B * nl / dt, (double)nacc * B * nl * g_Pz * P * P / 1e6 / dt, 100 * wait / dt, vl >= 0 ? " val " : "", vl >= 0 ? vstr : "");
