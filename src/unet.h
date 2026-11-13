@@ -54,6 +54,11 @@ typedef struct {
                               the convs reading SiLU outputs with the NF-net gain 1 / std(silu(z))), 4 slab (GroupNorm statistics per
                               z-slab of l0_slab planes: no whole-window reduction). Tensor-core and fp32 paths (slab: MX or fp32 storage) */
     int l0_slab;           /* l0_norm 4: planes per slab (0: 64; the level-0 depth a multiple of it) */
+    int gfilm;             /* 1: global-context FiLM: g = the attention stage's output averaged over the window's tokens (one cfg.widths[L-1]-
+                              vector per forward); every decoder block's output GroupNorm affine becomes gamma (1 + A_l g), beta + B_l g (after
+                              cfg.film's, composed), A_l / B_l zero-initialised, the gradient into the tokens too: the whole window's context at
+                              every decoder level, not only through the deep levels' up-path. Needs attn_blocks, B 1. Params last (header key
+                              "gfilm" only when on) */
     int scan_norm;         /* 1: trained on the per-scan CT normalisation (train --scan-norm, scannorm.h): predict computes the same for its
                               scan and level unless --norm is given (header key "scan_norm" only when on; no parameters) */
     int gn_ema;            /* 1: every GroupNorm (all levels, down norms, the attention stage's) normalises with running statistics
@@ -127,6 +132,12 @@ void unet_free(unet *u);
 void unet_reset_statics(void);   /* predict --boxes: forget the module's cached device buffers (nn_pool_box_end reclaims them) */
 const unet_cfg *unet_cfg_of(const unet *u);
 size_t unet_nparams(const unet *u);
+size_t unet_gfilm_off(const unet *u);
+/* cfg.gfilm under --split: fn(ctx, dg, K) sums the device vector dg (K floats) across the cards, in the attention stage's backward before
+   the tokens read it. dg there holds the share of the decoder levels < top (split: each card's half); the levels >= top (unet_set_split_top:
+   the whole window on every card) are added once after the sum, and with dedup (one card, e.g. side 1) their A / B gradients are zeroed
+   there (the other card's count). top 0: every level split */
+void unet_set_gfilm_reduce(unet *u, void (*fn)(void *ctx, float *dg, int K), void *ctx, int top, int dedup);
 void unet_head_offsets(const unet *u, size_t *w, size_t *b);   /* the 1^3 head's weights (cout x its input channels) and biases (cout) in the flat parameters */
 const float *unet_live_params(const unet *u);   /* device weights the optimiser trains (p) */
 const float *unet_ema_params(const unet *u);    /* the EMA weights (a shared-weights net reads them through unet_use_params: the teacher) */

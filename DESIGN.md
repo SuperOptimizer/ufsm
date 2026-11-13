@@ -499,6 +499,20 @@ median / MAD: inside the mask the nonzero voxels are bimodal and the MAD follows
 62.9-126, scale 28-56); predict on 1667 level 2 prints 62.9 / 37.59, the sampler's. test_scan_norm (wind fixture: deterministic
 across runs, in the checkpoint, predict = sampler, --norm overrides, the losses change).
 
+**Global-context FiLM** (`--gfilm 1`, unet_cfg.gfilm, branch gfilm-20261113): the user asked for an effective field of the whole 1024^3
+window by construction. The 4 full-attention blocks on the 8^3 bottleneck give every token all 512; to carry that context to every decoder
+level (not only up through the 288-channel deep levels), the attention stage's output tokens are averaged into g (K = the bottleneck width)
+and every decoder block's output GroupNorm affine becomes gamma (1 + A_l g), beta + B_l g, composed after --film's (the forward weight
+copy). A / B zero-initialised (logits bit-identical to the net without it), appended last (old checkpoints load), B 1. Cost for the
+target net: 2 x 288 x (448 + 384 + 320 + 256 + 288) = 0.98 M params (+1.1%), < 1 MB activations, a few small kernels. Backward: in
+the attention stage's backward (the decoders' norm gradients complete) dA / dB, the pre-gfilm affine's gradient, and dg; under --split
+unet_set_gfilm_reduce sums the split decoder levels' dg share across the cards (the whole-window levels >= split_top counted once, their
+A / B gradients de-duplicated on side 1). The token path (dg / S into every token's gradient) is OFF by default (UFSM_GFILM_TOKGRAD=1):
+its directional check is 9% off (analytic -415 vs central differences -455 with the code frozen vs recomputed; the plain net's own
+16-bit FD noise is ~6%, and attention needs the tensor-core path, so no fp32 check yet). Without it A / B still learn; the attention
+is trained by the decoder path. test_gfilm: zero-init bit-identical, A / B directional derivative 0.17% (step 0.05), checkpoint round
+trip bit-identical; the token check reported (GF_TOKCHECK enforces it).
+
 Found on the way (not fixed here): with the scratch1 sources at P 1024 on one card an early `inkfly gpu: out of device memory`
 falls back to the CPU and then segfaults in nn_ink_bits (cudaMemcpyAsync of an invalid host pointer, lab_upload kind 3); and
 the scratch1 data path holds ~7 GB of device memory outside the planner at P 512.

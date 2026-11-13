@@ -432,6 +432,14 @@ void nn_axpy(float *y, float a, const float *x, size_t n);               /* y +=
    K host codes, written into fw; the backward turns the effective pair's gradient in g into gamma's, A's and D's */
 void nn_film_fwd(const float *p, float *fw, size_t gam, size_t bet, size_t fo, int C, int K, const float *codes);
 void nn_film_bwd(const float *p, float *g, size_t gam, size_t bet, size_t fo, int C, int K, const float *codes);
+/* unet cfg.gfilm (device codes): nn_gfilm_pool: g[c] = mean over S of x[c S + s] (C channels). nn_gfilm_fwd: per channel s = sum_k g_k A[k C + c],
+   t = sum_k g_k B[k C + c] (A at p + fo, B after it), g1[c] = fw[gam + c] (the affine before: live or cfg.film's), fw[gam + c] = g1 (1 + s),
+   fw[bet + c] += t. nn_gfilm_bwd: from the effective affines' gradients (g[gam], g[bet]): A / B gradients += g_k ge g1 / g_k be, dg[k] +=
+   sum_c A ge g1 + B be, then g[gam] = ge (1 + s) (the gradient of the affine before). nn_gfilm_tok: x[c S + s] += dg[c] / S */
+void nn_gfilm_pool(const float *x, int C, long S, float *g);
+void nn_gfilm_fwd(const float *p, float *fw, size_t gam, size_t bet, size_t fo, int C, int K, const float *gv, float *g1);
+void nn_gfilm_bwd(const float *p, float *g, size_t gam, size_t bet, size_t fo, int C, int K, const float *gv, const float *g1, float *dg);
+void nn_gfilm_tok(float *x, int C, long S, const float *dg);
 /* the Gram of K planes of 16-bit values (bf16 1, else fp16) with row stride ld over N entries: S[i K + j] += sum_n x_i x_j for j >= i (src/nn_gram.cu; train --grad-cos) */
 void nn_gram16(const void *x, int bf16, int K, size_t N, size_t ld, double *S);
 /* the fine voxel stem (src/nn_fstem.cu, train --fstem): params W1 [C][64] (4^3 taps at stride 2), b1 [C], W2 [nout][C]; fwd adds W2 silu(W1 x + b1)
