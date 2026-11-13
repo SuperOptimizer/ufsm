@@ -136,6 +136,7 @@ struct unet {
     float mx_vr, *mx_vrbuf, **mx_vrp;           /* --muon-vr G (MARS): the previous gradient of every Muon matrix, its per-matrix pointers (device) */
     int rest_sign; float rest_sign_mult;           /* --opt-rest sign: the non-Muon parameters on sign momentum (lr x mult) */
     int mx_caut, mx_qkv;                         /* --muon-cautious 1, --muon-qkv-split 1 */
+    float *qk_lmax, *qk_last;                    /* QK-clip: per attention block and head the step's max logit (device), and the max since unet_qk_lmax */
     float mx_mix_a, mx_mix_b3, *mx_mixbuf, **mx_mixp; int mx_mix_T, mx_mix_t;   /* --muon-ademamix A: the slow EMA per matrix, alpha 0 -> A over T steps */
     int mx_kr, mx_kr_every; float mx_kr_b2, mx_kr_eps; struct nn_kron *mx_kron;   /* --muon-kron 1: the Kronecker conv preconditioner (nn_kron.cu) */
     void *mx_mcd, *mx_nsd; float *mx_pool; int mx_ns_maxm, mx_ns_maxn;   /* Muon-C tables and one frequency's scratch */
@@ -449,7 +450,7 @@ void unet_free(unet *u) {
     nn_free(u->p); nn_free(u->g); nn_free(u->m); nn_free(u->v); nn_free(u->ema); nn_free(u->hf_w); nn_free(u->l0fg_mx); free(u->inh);
     nn_free(u->gn_scratch); nn_free(u->red_scratch); nn_free(u->wg_tmp);
     nn_free(u->wm); nn_free(u->muon_mom); nn_free(u->muon_work); nn_free(u->muon_descs); nn_free(u->stem_b);
-    nn_free(u->mx_mcd); nn_free(u->mx_nsd); nn_free(u->mx_pool); nn_free(u->mx_hbf); nn_free(u->mx_R); nn_free(u->mx_part); nn_free(u->mx_nmrows); nn_free(u->mx_nmoff); nn_free(u->mx_vrbuf); nn_free(u->mx_vrp); nn_kron_free(u->mx_kron); nn_free(u->mx_mixbuf); nn_free(u->mx_mixp); free(u->gn_frz); nn_free(u->gn_frz_d); free(u->gn_acc); nn_free(u->l0run); nn_free(u->l0live); nn_free(u->wsp); nn_free(u->l0s_st); nn_free(u->l0s_tmp); nn_free(u->l0st_g2); nn_free(u->l0st_up); nn_free(u->l0st_poison); nn_free(u->l0h_lg); for (int i = 0; i < UNET_MAXLEV; i++) free(u->rb[i]); free(u->gn_frz); nn_free(u->gn_frz_d); nn_free(u->ge_run); nn_free(u->ge_tw); free(u->gn_acc); nn_free(u->l0run); nn_free(u->l0live); nn_free(u->wsp); nn_free(u->l0s_st); nn_free(u->l0s_tmp); nn_free(u->l0st_g2); nn_free(u->l0st_up); nn_free(u->l0st_poison); nn_free(u->l0h_lg); for (int i = 0; i < UNET_MAXLEV; i++) free(u->rb[i]);
+    nn_free(u->mx_mcd); nn_free(u->mx_nsd); nn_free(u->mx_pool); nn_free(u->mx_hbf); nn_free(u->mx_R); nn_free(u->mx_part); nn_free(u->mx_nmrows); nn_free(u->mx_nmoff); nn_free(u->mx_vrbuf); nn_free(u->mx_vrp); nn_kron_free(u->mx_kron); nn_free(u->qk_lmax); nn_free(u->mx_mixbuf); nn_free(u->mx_mixp); free(u->gn_frz); nn_free(u->gn_frz_d); free(u->gn_acc); nn_free(u->l0run); nn_free(u->l0live); nn_free(u->wsp); nn_free(u->l0s_st); nn_free(u->l0s_tmp); nn_free(u->l0st_g2); nn_free(u->l0st_up); nn_free(u->l0st_poison); nn_free(u->l0h_lg); for (int i = 0; i < UNET_MAXLEV; i++) free(u->rb[i]); free(u->gn_frz); nn_free(u->gn_frz_d); nn_free(u->ge_run); nn_free(u->ge_tw); free(u->gn_acc); nn_free(u->l0run); nn_free(u->l0live); nn_free(u->wsp); nn_free(u->l0s_st); nn_free(u->l0s_tmp); nn_free(u->l0st_g2); nn_free(u->l0st_up); nn_free(u->l0st_poison); nn_free(u->l0h_lg); for (int i = 0; i < UNET_MAXLEV; i++) free(u->rb[i]);
     nn_free(u->anvil_v1); nn_free(u->anvil_pool); nn_free(u->anvil_descs); nn_free(u->ds_g16); nn_free(u->ds_tmp);
     nn_free(u->wq_q); nn_free(u->wq_sc); nn_free(u->wq_qe); nn_free(u->wq_sce);
     nn_free(u->wq_r); nn_free(u->wq_rsc); nn_free(u->wq_re); nn_free(u->wq_rsce);
@@ -2560,7 +2561,12 @@ static void tb_fwd(unet *u) {
     for (int k = 0; k < u->tba; k++) {   /* (application k runs block k % tbn: --attn-repeat) */
         at_ws *ws = u->tb_keep && u->fwd_train ? &u->tbk[k] : &u->tbw;   /* (keep: a training forward fills the application's own set) */
         tb_vr_set(u, ws, k);
+        if (u->fwd_train && !u->tbd.dK && !g_dry) {   /* record the logit max per head (QK-clip / the log's "qk"; the tensor-core core) */
+            if (!u->qk_lmax) { u->qk_lmax = nn_malloc((size_t)(u->tbn * u->tbd.H + 1) * 4); nn_zero(u->qk_lmax, (size_t)(u->tbn * u->tbd.H + 1) * 4); u->qk_last = u->qk_lmax + u->tbn * u->tbd.H; }
+            at_set_lmax(u->qk_lmax + (size_t)(k % u->tbn) * u->tbd.H);
+        }
         int r; PROF(0, r = at_block_fwd(&u->tbd, u->fw, &u->tbp[k % u->tbn], TB_TOK(u, k + 1), TB_TOK(u, k + 2), &u->tbg, ws));
+        at_set_lmax(nullptr);
         ws->kept = ws != &u->tbw;
         if (r) { fprintf(stderr, "unet: attention block forward failed\n"); abort(); }
     }
@@ -4029,6 +4035,13 @@ static void kron_collect(unet *u, const convp *c, void *arg) {
 }   /* (the previous gradients are not checkpointed: a resumed run's first step uses g_prev = 0) */
 void unet_set_muon_cautious(unet *u, int on) { u->mx_caut = on; }
 void unet_set_muon_qkv_split(unet *u, int on) { u->mx_qkv = on; }
+void unet_qk_clip(unet *u, float tau) {   /* after the optimizer step: the live gains (u->p; a FiLM copy u->fw is rebuilt from them) */
+    if (!u->qk_lmax) return;
+    for (int k = 0; k < u->tbn; k++) at_qk_clip(u->p + u->tbp[k].qg, u->p + u->tbp[k].kg, u->qk_lmax + (size_t)k * u->tbd.H, u->tbd.H, tau, u->qk_last);
+}
+int unet_qk_get(const unet *u, float *h) { if (!u->qk_lmax) return 0; const int n = u->tbn * u->tbd.H; nn_d2h(h, u->qk_lmax, (size_t)n * 4); return n; }
+void unet_qk_put(unet *u, const float *h) { if (u->qk_lmax) nn_h2d(u->qk_lmax, h, (size_t)u->tbn * u->tbd.H * 4); }
+float unet_qk_lmax(unet *u) { float v = -1.f; if (u->qk_last) { nn_d2h(&v, u->qk_last, 4); nn_zero(u->qk_last, 4); } return v; }
 void unet_set_rest_sign(unet *u, int on, float mult) { u->rest_sign = on; u->rest_sign_mult = mult; }
 void unet_set_muon_ademamix(unet *u, float alpha, float b3, int T) { u->mx_mix_a = alpha; u->mx_mix_b3 = b3; u->mx_mix_T = T > 0 ? T : 1; }
 static int mx_any(const unet *u) { return u->mx_c || u->mx_hb || u->mx_ns || u->mx_nm || u->mx_vr != 0.f || u->mx_caut || u->mx_mix_a != 0.f; }

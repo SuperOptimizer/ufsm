@@ -204,6 +204,13 @@ int at_get_core(void);
    amx scratch) */
 void at_fa_pack(const float *qkv, const float *qg, const float *kg, void *qkvh, float *rq, float *rk, float *amx, const at_geom *g, int nreg, int C, int rope, float base);
 void at_fa_fwd(const void *qkvh, float *o, float *lse, const at_geom *g, int H, int C);
+/* QK-clip hook: while set, every fp16 tensor-core attention forward (at_fa_fwd / _bf, at_set_core 1) atomically raises lmax[h] (device,
+   H floats, the caller zeroes them) to the largest logit q.k / sqrt(48) of head h over its valid queries and keys (clamped at 0). Cores 0 / 2
+   and the ray / deformable paths do not record. nullptr: off (the default) */
+void at_set_lmax(float *lmax);
+/* QK-clip step (after the optimizer): heads with lmax[h] > tau (tau > 0) get their QK-norm gains qg / kg (device, H x 48 each) scaled by
+   sqrt(tau / lmax[h]); last[0] = max(last[0], all lmax); lmax zeroed. tau 0: record and zero only */
+void at_qk_clip(float *qg, float *kg, float *lmax, int H, float tau, float *last);
 void at_fa_bwd(const void *qkvh, void *doh, const float *o, const float *lse, const float *dO, float *Dv, float *amx, float *dqkn, const at_geom *g, int H, int C);
 /* bf16 operand variants (src/nn_attn_h16.cu): qkv [T][3C] and the attention output o [T][C] in bf16 */
 void at_fa_pack_bf(const void *qkv, const float *qg, const float *kg, void *qkvh, float *rq, float *rk, float *amx, const at_geom *g, int nreg, int C, int rope, float base);

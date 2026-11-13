@@ -135,7 +135,7 @@ __global__ void k_fa_pack(const TI *__restrict__ qkv, const float *__restrict__ 
 /* ---- forward: grid (ceil(S / 64), H, nseq) ---- */
 template <typename TO>
 __global__ void __launch_bounds__(128) k_fa_fwd(const __half *__restrict__ Qh, const __half *__restrict__ Kh, const __half *__restrict__ Vh, TO *__restrict__ o,
-                                                float *__restrict__ lse, int S, int H, int C, long long Tp, float sl2, const int *lens) {
+                                                float *__restrict__ lse, int S, int H, int C, long long Tp, float sl2, const int *lens, float *lmax) {
     const int seq = blockIdx.z, h = blockIdx.y, q0 = blockIdx.x * FT, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
     __shared__ __align__(16) __half Ks[2][FT * FS], Vs[2][FT * FS];
     const size_t base = (size_t)h * Tp + (size_t)seq * S;
@@ -186,6 +186,13 @@ __global__ void __launch_bounds__(128) k_fa_fwd(const __half *__restrict__ Qh, c
 #pragma unroll
         for (int j = 0; j < 6; j++) st2(orow + 8 * j + 2 * t, acc[j][2 * r] * il, acc[j][2 * r + 1] * il);
         if (!t) lse[((size_t)seq * H + h) * S + i] = l[r] > 0.f ? m[r] + log2f(l[r]) : 0.f;   /* (a length-0 sequence: zero output) */
+    }
+    if (lmax) {   /* at_set_lmax: the head's largest logit q.k / sqrt(48) over the valid queries (clamped at 0), for QK-clip */
+        float mm = 0.f;
+#pragma unroll
+        for (int r = 0; r < 2; r++) if (q0 + warp * 16 + g + 8 * r < S && m[r] > mm) mm = m[r];
+        for (int o2 = 4; o2 < 32; o2 <<= 1) mm = fmaxf(mm, __shfl_xor_sync(0xffffffffu, mm, o2));
+        if (!lane) atomicMax((unsigned *)lmax + h, __float_as_uint(mm * 0.6931471805599453f));   /* (log2 units -> natural; >= 0: uint order) */
     }
 }
 
@@ -348,11 +355,13 @@ extern "C" void at_fa_pack(const float *qkv, const float *qg, const float *kg, v
 extern "C" void at_fa_pack_bf(const void *qkv, const float *qg, const float *kg, void *qkvh, float *rq, float *rk, float *amx, const at_geom *g, int nreg, int C, int rope, float base) {
     fa_pack((const __nv_bfloat16 *)qkv, qg, kg, qkvh, rq, rk, amx, g, nreg, C, rope, base);
 }
+static float *g_lmax;   /* at_set_lmax: device [H] running max logit per head (nullptr: off) */
+extern "C" void at_set_lmax(float *lmax) { g_lmax = lmax; }
 template <typename TO> static void fa_fwd(const void *qkvh, TO *o, float *lse, const at_geom *g, int H, int C) {
     const long long Tp = (long long)g->nseq * g->S + FT;
     const __half *Qh = (const __half *)qkvh, *Kh = Qh + (size_t)H * Tp * HD, *Vh = Kh + (size_t)H * Tp * HD;
     dim3 gr(nbk(g->S, FT), H, g->nseq);
-    k_fa_fwd<TO><<<gr, 128>>>(Qh, Kh, Vh, o, lse, g->S, H, C, Tp, 1.4426950408889634f / sqrtf((float)HD), g->lens);
+    k_fa_fwd<TO><<<gr, 128>>>(Qh, Kh, Vh, o, lse, g->S, H, C, Tp, 1.4426950408889634f / sqrtf((float)HD), g->lens, g_lmax);
 }
 extern "C" void at_fa_fwd(const void *qkvh, float *o, float *lse, const at_geom *g, int H, int C) { fa_fwd(qkvh, o, lse, g, H, C); }
 extern "C" void at_fa_fwd_bf(const void *qkvh, void *o, float *lse, const at_geom *g, int H, int C) { fa_fwd(qkvh, (__nv_bfloat16 *)o, lse, g, H, C); }

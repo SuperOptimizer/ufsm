@@ -2031,7 +2031,7 @@ int cmd_train(int argc, char **argv) {
                         "       [--schedule-seconds S --schedule-elapsed S]   wall-time LR horizon across finite-cover evaluation pauses\n"
                         "       [--cover PLAN.json] [--cover-extend-from OLD_PLAN.json] [--cover-next-pass 1] [--stop-at STEP] [--ct-aug 0|1] [--symmetry-p 1] [--axis-jitter 0] [--limit-seconds 0]\n"
                         "       [--lr-floor 0 (the schedule ends at this fraction of the peak; modded-nanogpt 0.3)] [--wd-nonconv 0 (decay multiplier for GroupNorm, biases, head under Muon / ANVIL)]\n"
-                        "       [--muon-c 1 (Muon-C: conv kernels polarised per Fourier frequency)] [--muon-ns fixed|polar (Newton-Schulz maps: fixed quintic | Polar Express)] [--normuon 1 (NorMuon row normalisation)] [--normuon-beta2 0.95] [--muon-vr G (MARS variance reduction, 0.025)] [--muon-scale kj|spectral] [--opt-rest adamw|sign --sign-lr-mult 1] [--muon-tc 1] [--muon-qkv-split 1] [--muon-cautious 1] [--muon-ademamix A --ademamix-b3 0.999 --ademamix-t T] [--muon-kron 1 (Kronecker Co/Ci/taps preconditioner) --muon-kron-b2 0.99 --muon-kron-eps 1e-3 --muon-kron-every 10] [--hyperball 1 (fixed weight / update norms)] [--hb-lr-mult 0.707 (Hyperball lr / Muon lr)]\n"
+                        "       [--muon-c 1 (Muon-C: conv kernels polarised per Fourier frequency)] [--muon-ns fixed|polar (Newton-Schulz maps: fixed quintic | Polar Express)] [--normuon 1 (NorMuon row normalisation)] [--normuon-beta2 0.95] [--muon-vr G (MARS variance reduction, 0.025)] [--muon-scale kj|spectral] [--opt-rest adamw|sign --sign-lr-mult 1] [--muon-tc 1] [--muon-qkv-split 1] [--qk-clip TAU (attention: max logit per head held at TAU via the QK-norm gains)] [--muon-cautious 1] [--muon-ademamix A --ademamix-b3 0.999 --ademamix-t T] [--muon-kron 1 (Kronecker Co/Ci/taps preconditioner) --muon-kron-b2 0.99 --muon-kron-eps 1e-3 --muon-kron-every 10] [--hyperball 1 (fixed weight / update norms)] [--hb-lr-mult 0.707 (Hyperball lr / Muon lr)]\n"
                         "       [--trunk-lr-mult 1 (lr x F outside the attention stage; no stage: all but the head)] [--trunk-lr-steps N (x F only until step N)] [--ink-head 0|1 (task unwrap2: + the ink logit, channel 11; sources targets.ink prob254, sources ink_weight) --ink-lambda 1 --ink-bias -2 (warm start: the new row) --ink-smooth 0 (label smoothing eps)] [--attn-dcoarse 0|1 (deformable: + the 2x pooled level)] [--attn-deform-init grid|normal]\n"
                         "       [--recall W (recto: + W (1 - soft recall), gradient only)]\n"
                         "       [--dec-convs 2 (convs per decoder level, one value or a list; 1 = one conv, nnU-Net style)]\n"
@@ -2323,6 +2323,7 @@ int cmd_train(int argc, char **argv) {
     if ((strcmp(muon_scale_s, "kj") && strcmp(muon_scale_s, "spectral")) || (strcmp(rest_s, "adamw") && strcmp(rest_s, "sign"))) { fprintf(stderr, "--muon-scale kj | spectral, --opt-rest adamw | sign\n"); return 2; }
     const int muon_spec = !strcmp(muon_scale_s, "spectral"), rest_sign = !strcmp(rest_s, "sign");
     const int muon_qkv = atoi(opt(argc, argv, "--muon-qkv-split", "0"));   /* per-head Q / K / V orthogonalisation */
+    const float qk_tau = (float)atof(opt(argc, argv, "--qk-clip", "0"));   /* QK-clip: the max attention logit per head held at tau (0: off; the log's "qk" always) */
     const int muon_tc = atoi(opt(argc, argv, "--muon-tc", "0"));   /* Newton-Schulz on fp16 tensor cores */
     const int muon_caut = atoi(opt(argc, argv, "--muon-cautious", "0"));   /* cautious masking of Muon's direction */
     const float mix_a = (float)atof(opt(argc, argv, "--muon-ademamix", "0")), mix_b3 = (float)atof(opt(argc, argv, "--ademamix-b3", "0.999"));
@@ -4210,6 +4211,16 @@ int cmd_train(int argc, char **argv) {
             if (use_anvil) unet_anvil(d->u, anvil_lr * lrr, anvil_wd, ostep, steps / accum, lr, 0.9f, 0.999f, 1e-8f, wd);
             else if (use_muon) unet_muon(d->u, muon_lr * lrr, muon_beta, lr, 0.9f, 0.999f, 1e-8f, wd, ostep);   /* Muon lr follows the same schedule shape */
             else unet_adamw(d->u, lr, 0.9f, 0.999f, 1e-8f, wd, ostep);
+            if (cfg.attn_blocks > 0) {   /* QK-clip on the step's logit maxima: replicas first agree on the max over all GPUs (identical clips) */
+                if (ng > 1 && qk_tau > 0.f && g == 0) {
+                    float mh[UNET_MAXTB * 64], th[UNET_MAXTB * 64];   /* (H = C / 48 <= 64) */
+                     int n = unet_qk_get(d->u, mh);
+                    for (int q = 1; q < ng && n; q++) { nn_init(G[q].dev); unet_qk_get(G[q].u, th); for (int i = 0; i < n; i++) mh[i] = fmaxf(mh[i], th[i]); }
+                    for (int q = 1; q < ng && n; q++) { nn_init(G[q].dev); unet_qk_put(G[q].u, mh); }
+                    nn_init(d->dev); if (n) unet_qk_put(d->u, mh);
+                }
+                unet_qk_clip(d->u, qk_tau);
+            }
             unet_ema(d->u, ostep < 100 ? 0.9f : ema);
             unet_wquant(d->u, (unsigned)step);              /* no-op unless --wq */
             if (prof) nn_prof_end();
@@ -4443,6 +4454,10 @@ int cmd_train(int argc, char **argv) {
                 memset(acc_cbin, 0, sizeof acc_cbin); }
             if (g_aff) { const float *a = G[0].aff_out; size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " aff %.4f (d1 bce %.3f dice %.3f | d8 bce %.3f dice %.3f)", G[0].aff_loss,
                                     (a[0] + a[6] + a[12]) / 3, (a[1] + a[7] + a[13]) / 3, (a[18] + a[24] + a[30]) / 3, (a[19] + a[25] + a[31]) / 3); }
+            if (cfg.attn_blocks > 0) {   /* the largest attention logit since the last line (QK-clip's quantity; held at --qk-clip when set) */
+                if (ng > 1) nn_init(G[0].dev);
+                const float q = unet_qk_lmax(G[0].u); if (q >= 0.f) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " qk %.1f", q); }
+            }
             if (accum > 1) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " (update %d: %d windows each)", step / accum, accum); }   /* --accum: steps are windows */
             fprintf(stderr, "step %6d lr %.2e loss %.4f bce %.4f dice %.4f%s gn %.2f %.2f samp/s %.1f Mvox/s (wait %.0f%%)%s%s\n", step, lr, acc_loss / nacc, acc_bce / nacc, acc_dice / nacc, affs, acc_g / nacc,
                     (double)nacc * B * nl / dt, (double)nacc * B * nl * g_Pz * P * P / 1e6 / dt, 100 * wait / dt, vl >= 0 ? " val " : "", vl >= 0 ? vstr : "");
