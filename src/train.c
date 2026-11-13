@@ -490,11 +490,14 @@ static uint8_t *zeros_alloc(size_t n) {
     memset(p, 0, n); return p;
 }
 static void zeros_free(void *p) { if (g_zeros_plain) free(p); else nn_host_free(p); }
-static void gpu_input_settle(sample_cfg *sc, int assume_mx) {   /* (assume_mx: UFSM_SAMPLER_ONLY, no network: as with an MX input) */
+static void gpu_input_settle(sample_cfg *sc, int assume_mx, int slot_skip) {   /* (assume_mx: UFSM_SAMPLER_ONLY, no network: as with an MX input; slot_skip: the
+                                                                                    training sampler's, set later: with 4 the unpacked targets are unused, which --gpu-aug 2 needs
+                                                                                    under --split instead of packed ones) */
     g_gpu_in = g_gpu_want && (assume_mx || unet_input_converted());
     g_xs = g_gpu_in ? 1 : g_xc; sc->gpu_input = g_gpu_in;
     g_gpu_aug = g_gpu_aug_want && g_gpu_in && sample_gpu_aug_ok(sc) ? 1 : 0;
-    if (g_gpu_aug && g_gpu_aug_want == 2) { if (sample_gpu_lwarp_ok(sc)) g_gpu_aug = 2; else fprintf(stderr, "--gpu-aug 2: the labels' warp needs packed targets and no sheet / pmask / gap / distill / cond / band / aux labels; --gpu-aug 1 (here: pack_tm %d sheet %d pap_head %d emb %d cond %d band %d aux %d)\n",
+    if (g_gpu_aug && g_gpu_aug_want == 2) { sample_cfg tc = *sc; tc.slot_skip = g_lsplit && (!getenv("UFSM_SPLIT_LWARP") || ufsm_env_on("UFSM_SPLIT_LWARP")) ? slot_skip : slot_skip & ~4; tc.gpu_aug = 2;   /* (unpacked: the latent split only; UFSM_SPLIT_LWARP=0 keeps its host warps) */
+        if (sample_gpu_lwarp_ok(&tc)) { g_gpu_aug = 2; if (!sc->pack_tm) fprintf(stderr, "--gpu-aug 2 without packed targets: the unpacked targets are never read (slot_skip 4)\n"); } else fprintf(stderr, "--gpu-aug 2: the labels' warp needs packed targets and no sheet / pmask / gap / distill / cond / band / aux labels; --gpu-aug 1 (here: pack_tm %d sheet %d pap_head %d emb %d cond %d band %d aux %d)\n",
                                                                    sc->pack_tm, sc->sheet != nullptr, sc->pap_head != nullptr, sc->emb_ch, sc->cond, sc->band, sc->aux); }
     sc->gpu_aug = g_gpu_aug;
     sc->w4_dev = g_w4dev_want && g_gpu_aug == 2 && sc->wind4 && g_w4n > 0;
@@ -3194,10 +3197,11 @@ int cmd_train(int argc, char **argv) {
         const char *so = getenv("UFSM_SAMPLER_ONLY");
         if (so && atoi(so) > 0) {
             train_unread_flags(argc, argv);
-            setenv("UFSM_SAMPLER_NOPIN", "1", 1); gpu_input_settle(&sc, 1);
-            sc.slot_skip = g_unwrap2 && B == 1 && !g_ds && !ufsm_env_on("UFSM_TM_KEEP") ? 1 | (!pm_used() ? 2 : 0) | (tm_slot_skip4(split) ? 4 : 0) : 0;
+            const int ss = g_unwrap2 && B == 1 && !g_ds && !ufsm_env_on("UFSM_TM_KEEP") ? 1 | (!pm_used() ? 2 : 0) | (tm_slot_skip4(split) ? 4 : 0) : 0;
+            setenv("UFSM_SAMPLER_NOPIN", "1", 1); gpu_input_settle(&sc, 1, ss);
+            sc.slot_skip = ss;
             sc.plane_bank = plane_bank_want();
-            sc.ink_bits = g_rv && !g_lsplit && (!getenv("UFSM_INK_BITS") || ufsm_env_on("UFSM_INK_BITS"));
+            sc.ink_bits = g_rv && (!getenv("UFSM_INK_BITS") || ufsm_env_on("UFSM_INK_BITS"));
             sc.w4_runs = sc.w4_dev && (!getenv("UFSM_W4_RUNS") || ufsm_env_on("UFSM_W4_RUNS"));
             sc.replay = atoi(opt(argc, argv, "--replay", "1")); sc.replay_gap = atoi(opt(argc, argv, "--replay-gap", "0"));
             sampler *sq = sampler_start(S, &sc); if (!sq) { fprintf(stderr, "cannot start the sampler\n"); return 1; }
@@ -3652,7 +3656,7 @@ int cmd_train(int argc, char **argv) {
         }
     }
     if (g_half && !g_pkf && lean) { fprintf(stderr, "--half-res: not with the lean memory modes\n"); return 2; }
-    gpu_input_settle(&sc, 0);   /* (the memory mode is set: the input layout of the batches) */
+    gpu_input_settle(&sc, 0, g_tm_unused ? 1 | (!pm_used() ? 2 : 0) | (tm_slot_skip4(split) ? 4 : 0) : 0);   /* (the memory mode is set: the input layout of the batches) */
     if (newdef && !workers_asked && g_gpu_aug == 2) { workers = 3; sc.nworkers = workers; fprintf(stderr, "sampler: 3 workers (the new-run default with --gpu-aug 2; --workers N sets it)\n"); }
     for (int g = 0; g < ng; g++) {   /* per-GPU batch buffers. lean: one, shared by both slots, inside the model's gradient buffers when
                                         they are large enough: [targets | mask | input if the forward copies it] in B (lean 1: after the
@@ -4139,7 +4143,7 @@ int cmd_train(int argc, char **argv) {
     sc.slot_skip = g_tm_unused ? 1 | (!pm_used() ? 2 : 0) | (tm_slot_skip4(split) ? 4 : 0) : 0;   /* (after the validation config's copy: its stored batches keep every plane) */
     sc.plane_bank = plane_bank_want();   /* (after the validation config's copy too) */
     sc.w4_runs = sc.w4_dev && (!getenv("UFSM_W4_RUNS") || ufsm_env_on("UFSM_W4_RUNS"));   /* --gpu-aug 3: the winding as runs, no w4 / wcomp slot planes (sampler_start may drop it) */
-    sc.ink_bits = g_rv && !g_lsplit && (!getenv("UFSM_INK_BITS") || ufsm_env_on("UFSM_INK_BITS"));   /* --rv: the papyrus plane as 1 known bit per voxel + ct8, built on the device (lab_upload); sampler_start may drop it */
+    sc.ink_bits = g_rv && (!getenv("UFSM_INK_BITS") || ufsm_env_on("UFSM_INK_BITS"));   /* --rv: the papyrus plane as 1 known bit per voxel + ct8, built on the device (lab_upload); sampler_start may drop it */
     sc.replay_gap = atoi(opt(argc, argv, "--replay-gap", "0"));   /* (0: the slot count) */
     sc.replay = atoi(opt(argc, argv, "--replay", "1"));   /* --replay K: each window trained K times, replays with a new device-side augmentation (sample.h) */
     sampler *sp = sampler_start(S, &sc);
