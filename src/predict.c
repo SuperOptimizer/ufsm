@@ -1204,15 +1204,15 @@ static void skip_ab(unet *u, const void *x2, shape5 xn, int h16, uint8_t *ctd, i
     }
     if (gst) { unet_gn_freeze(u, nullptr); free(gst); }
     nn_skip_pause(0); nn_h2d(ctd, hct, w3);
-    double e[2] = {0, 0}, m[2] = {0, 0}, mx[2] = {0, 0}; size_t n[2] = {0, 0}, same[2] = {0, 0}, nm = 0;
+    double e[2] = {0, 0}, m[2] = {0, 0}, mx[2] = {0, 0}; size_t n[2] = {0, 0}, same[2] = {0, 0}, flip[2] = {0, 0}, nm = 0;
     for (size_t i = 0; i < (size_t)C * cv; i++) {
         const double a = lh ? (double)((const _Float16 *)A)[i] : (double)((const float *)A)[i], b = lh ? (double)((const _Float16 *)Bm)[i] : (double)((const float *)Bm)[i];
-        const int k = mat[i % cv] ? 0 : 1; const double d = fabs(a - b); e[k] += d; m[k] += fabs(a); if (d > mx[k]) mx[k] = d; n[k]++; same[k] += a == b;
+        const int k = mat[i % cv] ? 0 : 1; const double d = fabs(a - b); e[k] += d; m[k] += fabs(a); if (d > mx[k]) mx[k] = d; n[k]++; same[k] += a == b; flip[k] += (a > 0) != (b > 0);
     }
     for (size_t c = 0; c < cv; c++) nm += mat[c];
     fprintf(stderr, "skip A/B: trunk %.3f s dense, %.3f s masked (%.1f%% faster); L0 active %.3f, material cells %.3f; material: mean |d| / mean |logit| %.5f, max |d| %.4g, "
-            "identical %.4f; other cells: %.5f, max %.4g, identical %.4f\n", t[0], t[1], 100 * (1 - t[1] / t[0]), nn_skip_share(0), (double)nm / cv,
-            m[0] > 0 ? e[0] / m[0] : 0, mx[0], n[0] ? (double)same[0] / n[0] : 0, m[1] > 0 ? e[1] / m[1] : 0, mx[1], n[1] ? (double)same[1] / n[1] : 0);
+            "identical %.4f, sign flips %.4f; other cells: %.5f, max %.4g, identical %.4f, sign flips %.4f\n", t[0], t[1], 100 * (1 - t[1] / t[0]), nn_skip_share(0), (double)nm / cv,
+            m[0] > 0 ? e[0] / m[0] : 0, mx[0], n[0] ? (double)same[0] / n[0] : 0, n[0] ? (double)flip[0] / n[0] : 0, m[1] > 0 ? e[1] / m[1] : 0, mx[1], n[1] ? (double)same[1] / n[1] : 0, n[1] ? (double)flip[1] / n[1] : 0);
     free(hct); free(mat); free(A); free(Bm);
 }
 int cmd_predict(int argc, char **argv) {
