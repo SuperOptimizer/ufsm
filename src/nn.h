@@ -476,6 +476,7 @@ int nn_ctw_zero(void *w, uint8_t *d, size_t n);
 int nn_dev_mem(size_t *free_bytes, size_t *total_bytes);   /* the current device's free / total memory (0 ok) */
 /* one 2x mean pooling step of an n^3 uint8 volume into (n / 2)^3: (sum + 4) >> 3, as the CPU pyramid (ingest.c pool2_mean) */
 void nn_pool2_u8(const uint8_t *in, int n, uint8_t *out);
+void nn_seam_blend_u8(const uint8_t *a, const uint8_t *b, uint8_t *o, int n, const float *w);   /* predict --seamless: ink_blend_run on the GPU (b nullptr: a alone) */
 void nn_scale(float *y, float a, size_t n);
 void nn_u8_to_f32(const uint8_t *x, size_t n, float scale, float *y);
 

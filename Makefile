@@ -66,6 +66,7 @@ SRC += src/surf.c src/stitch.c src/coreline.c src/coreline_check.c src/fit_ct.c 
 SRC += src/fblend.c src/sheetpbr.c src/regmap.c src/vcgpu.c
 SRC += src/deform.c src/vwt_aug.c src/zcache.c src/dcache.c
 SRC += src/inkblend.c
+SRC += src/seamless.c
 SRC += src/ftaxis.c
 SRC += src/inkseam.c
 SRC += src/render.c src/imgops.c src/jpegpar.c src/inkcompare.c

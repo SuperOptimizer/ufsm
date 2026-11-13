@@ -301,6 +301,27 @@ __global__ static void pool2_u8_k(const uint8_t *__restrict__ in, int n, uint8_t
         out[i] = (uint8_t)((s + 4) >> 3);
     }
 }
+/* predict --seamless (in-process): one n^3 uint8 shard of two tile grids blended as src/inkblend.c ink_blend_run does on the CPU, with
+   its arithmetic (double, every operation rounded: the explicit _rn intrinsics keep nvcc from contracting into FMAs; gcc -std=c23 does
+   not contract either): wi = ((double)wz wy) wx, s = wa a (+ wb b), w = wa (+ wb), out = min(255, s / w + 0.5) truncated. w: the per-axis
+   float weights [wz | wy | wx] of grid a, then of grid b (b == nullptr: grid a alone, as an absent input). o may alias a or b */
+__global__ static void seam_blend_k(const uint8_t *a, const uint8_t *b, uint8_t *o, int n, const float *__restrict__ w) {
+    const size_t N = (size_t)n * n * n;
+    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < N; i += (size_t)gridDim.x * blockDim.x) {
+        const int x = (int)(i % n), y = (int)(i / n % n), z = (int)(i / ((size_t)n * n));
+        const double wa = __dmul_rn(__dmul_rn((double)w[z], (double)w[n + y]), (double)w[2 * n + x]);
+        double s = __dmul_rn(wa, (double)a[i]), t = wa;
+        if (b) { const float *v = w + 3 * n; const double wb = __dmul_rn(__dmul_rn((double)v[z], (double)v[n + y]), (double)v[2 * n + x]);
+                 s = __dadd_rn(s, __dmul_rn(wb, (double)b[i])); t = __dadd_rn(t, wb); }
+        const double r = __dadd_rn(__ddiv_rn(s, t), 0.5);
+        o[i] = (uint8_t)(r < 255.0 ? r : 255.0);
+    }
+}
+extern "C" void nn_seam_blend_u8(const uint8_t *a, const uint8_t *b, uint8_t *o, int n, const float *w) {
+    const size_t N = (size_t)n * n * n; if (!N) return;
+    const int nb = (int)((N + 255) / 256 < 65536 ? (N + 255) / 256 : 65536);
+    seam_blend_k<<<nb, 256>>>(a, b, o, n, w);
+}
 extern "C" void nn_pool2_u8(const uint8_t *in, int n, uint8_t *out) {
     const size_t N = (size_t)(n / 2) * (n / 2) * (n / 2); if (!N) return;
     const int nb = (int)((N + 255) / 256 < 65536 ? (N + 255) / 256 : 65536);

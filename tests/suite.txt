@@ -177,6 +177,7 @@ test_share_enc_a1                              | gpu          |     5 | ./$B/tes
 test_pipeline_cli                              | gpu          |    85 | python3 tests/test_pipeline_cli.py
 test_ingest_lut                                |              |     3 | python3 tests/test_ingest_lut.py
 test_ink_blend                                 |              |     4 | python3 tests/test_ink_blend.py
+test_seamless                                  |              |     6 | python3 tests/test_seamless.py
 test_cover_training                            | gpu2         |    16 | python3 tests/test_cover_training.py
 test_univ2                                     | gpu2         |    40 | tests/test_univ2.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/univ2
 test_checkpoint                                | gpu          |     2 | ./$B/test_checkpoint

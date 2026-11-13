@@ -260,6 +260,50 @@ together. tests/bench_fstem (P 512, a 32-plane slab, 11 outputs): 3.68 -> 1.26 m
 unchanged (byte-identical). test_fstem, test_lathead, test_heads, test_predict_heads and test_fibhead_train pass on the pod. That is
 about 110 ms per step at P 512 on this card, and about 4x that per card at the P 1024 split half.
 
+## predict --seamless 2: the two-pass grid blend built in (2026-11-12, branch seamless-20261112, src/seamless.c)
+
+The latent nets' heads carry a per-window level. inkpod ink on a 1299 corner: plane steps of 10-30 / 255 at the window seams, at halo 16
+.. 256, with --gn-frozen, at levels 1 and 2, and still with the per-window dice off (inkpod-11000 / 12000). The numbers are in
+branch inkcache-20261112's DESIGN section "Latent ink head: window seams". A halo or a --feather ramp (B <= halo) cannot hide a step
+whose source is wider than the window, so seam-free output needs every voxel averaged over windows whose borders lie elsewhere.
+
+Options, per output voxel at tile S:
+
+| scheme | windows per voxel | quality |
+|---|---|---|
+| one pass (today) | 1 | hard steps |
+| --feather B | 1 (+ the halo spill) | a B-voxel ramp, B <= halo; a 30-level step stays a visible band |
+| one pass at stride S / 2 (overlap-weighted) | 8 | smooth |
+| two passes, grids 0 and S / 2, sin^2 tile weights | 2 | smooth (16.9 -> 1.3 on the 1299 corner; median plane step 0.1) |
+
+The two-pass blend is the cheapest seam-free scheme: 2x the windows against 8x for half-stride overlap. --feather at that quality
+needs B ~ S / 2, i.e. windows ~2x as wide (8x the voxels).
+
+`predict ... --seamless 2` (window - 2 halo a multiple of 256; default 544 / 16):
+- the process runs the two passes as children of the same binary (UFSM_SEAM_CHILD=1, no CUDA in the parent) into `<out>/.seam/{a,b}`,
+  with `--full-grid 1 --q 0 --levels 1 --shard S/2` and `--grid-origin 0,0,0` / `S/2,S/2,S/2`. Shard S / 2 keeps the shifted tiles
+  aligned with the store's shards: with S-sized shards each shifted tile spans 8 shards and the planner runs 7.5x the windows (P4 inner
+  17405 vs 2311); the output is byte-identical, 5 s vs 63 s on the 1299 test box;
+- `--gpus A,B` runs the two passes at once, one per GPU (both desk 5060 Tis); otherwise both on `--gpu`, one after the other;
+- every store of pass a (the single output, or each `--heads` store `<out>/<name>`, nested names like `fib/H` included) is blended with
+  its pass-b twin by ink-blend's core (`ink_blend_run`, factored out of src/inkblend.c) into `<out>[/<name>]` with the run's --q,
+  --levels and --shard; the store's attributes record `"seamless": {mode, window, halo, tile, grids}`;
+- each pass's --box is moved down onto its tile grid (origin = shift mod S): predict's planner places one window per tile only when
+  the box origin (rounded to shards) lies on the --grid-origin lattice, else one per shard (1667 labelled box at shard 256: 3305
+  windows instead of 578; the sequential --seamless run 774 s -> 256 s: pass a 516 windows 64 s, pass b 545 windows 77 s, the rest the
+  lossless writes, blend and pyramid). A pass-b origin below 0 starts at S / 2; the blend gives absent shards (that edge, occupancy
+  air skipped by one pass only) weight 0 instead of averaging in zeros;
+- a pass with `.seam/<p>/.done` is not rerun (resume after a blend failure); `.seam` is removed at the end (UFSM_SEAM_KEEP=1 keeps it).
+  The pass logs are `.seam/{a,b}.log`.
+
+Not with --boxes, --fit-zarr, --split or --feather. The output is always full-grid. tests/test_seamless.py runs without a GPU: a
+stand-in pass (UFSM_SEAM_EXE) checks each pass's arguments and writes constant stores (100 / 200, two heads); the blend matches
+(100 wa + 200 wb) / (wa + wb) within 1 at five voxels; the bad-tile error and the removal of .seam are checked too.
+test_ink_blend still passes after the refactor.
+
+Open (GPU, on the lead's say): the same 1299 corner through `--seamless 2` against u1667ink.sh's scripted blend (that one
+blends q-8 passes into q 32; here lossless passes into the run's q, so close but not byte-identical); and the wall time of `--gpus 0,1` against sequential passes.
+
 ## Split-window input builders: every --gpu-aug builder by z range, the scanner split exactly across two GPUs (2026-11-13, branch augz-20261112)
 
 **The light statistics pass under the split (UFSM_LAT_LIGHT_SPLIT=1, untested).** For the fused head groups (the normal 7 and the
