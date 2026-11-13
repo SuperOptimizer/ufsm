@@ -214,6 +214,7 @@ latency from the split. Training goes first.
   - the parameter gradient rel is 8.0e-8, the one-GPU rerun level (5.7e-8).
 - Not yet under the split (refused): --gpu-aug (univA's z-range builders), --ssl, --ink-mil, --fib-head, --fib-normal-lambda,
   --pgrad, --count, --pap-head, --distill, --lat-guide 1 / 2, the unstreamed latent head.
+
 ## Split-window input builders: every --gpu-aug builder by z range, the scanner split exactly across two GPUs (2026-11-13, branch augz-20261112)
 
 For the 40 M net (widths 192..384), one P 1024 window is split in z across both 5060 Tis (univI's splitwin-20261112). Each GPU then
