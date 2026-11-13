@@ -2666,28 +2666,32 @@ int cmd_train(int argc, char **argv) {
         else if (share >= 0 && share < 1 && wu > 0 && wl > 0) { const double f = share / (1 - share) * wl / wu; for (int i = 0; i < S->n; i++) if (S->src[i].ct_only) S->src[i].weight *= f; wu *= f; }
         if (nu) fprintf(stderr, "ssl: %d unlabelled sources, %.1f%% of the source weight\n", nu, 100 * wu / (wu + wl));
     }
+    /* the device memory the data path reserves before the memory planner reads the free memory (2026-11-13: ~7 GB of a 16 GB card on the
+       scratch sources), one line per owner */
+#define ONFLY_MEM(what) do { size_t fr_, to_; if (!nn_dev_mem(&fr_, &to_) && to_) fprintf(stderr, "memory: %.2f GB free on the device after %s\n", fr_ / 1e9, what); } while (0)
+    ONFLY_MEM("start-up");
     {   /* sources with an on-the-fly phase (band_onfly.h): the pair rule on --onfly-gpu (default the run's first GPU; -1 the CPU), its
            --onfly-slots tile buffers of --onfly-mb each reserved now, before the memory planner reads the free device memory */
         float rmax = 0; for (int i = 0; i < S->n; i++) if (S->src[i].phase_onfly > rmax) rmax = S->src[i].phase_onfly;
         if (rmax > 0) {
             const int og = atoi(opt(argc, argv, "--onfly-gpu", "0")), os = atoi(opt(argc, argv, "--onfly-slots", "2")), om = atoi(opt(argc, argv, "--onfly-mb", "2048"));
             if (phase_onfly_config(og, os, om, 1)) { fprintf(stderr, "train: --onfly-gpu %d: no GPU pair rule (or the reserve failed)\n", og); return 1; }
-            fprintf(stderr, "train: on-the-fly phase on %s %d, %d slots of %d MB (tile edge %d voxels at rmax %g)\n", og >= 0 ? "GPU" : "CPU", og, os, om, phase_onfly_tile_edge(rmax), rmax);
+            fprintf(stderr, "train: on-the-fly phase on %s %d, %d slots of %d MB (tile edge %d voxels at rmax %g)\n", og >= 0 ? "GPU" : "CPU", og, os, om, phase_onfly_tile_edge(rmax), rmax); ONFLY_MEM("the on-the-fly phase slots");
         }
         int nfib = 0; for (int i = 0; i < S->n; i++) for (int c = 0; c < NTG; c++) nfib += S->src[i].tgt_fib[c] != nullptr;
         if (nfib) {   /* "fibre" targets (fiberraster.h): the planes' stamp and combine on --onfly-gpu, buffers for the window's box reserved now */
-            const int og = atoi(opt(argc, argv, "--onfly-gpu", "0")), P0 = atoi(opt(argc, argv, "--P", "64")), e = P0 + 64;
+            const int og = atoi(opt(argc, argv, "--fibre-gpu", opt(argc, argv, "--onfly-gpu", "0"))), P0 = atoi(opt(argc, argv, "--P", "64")), e = P0 + 64;   /* (--fibre-gpu: another card than the phase's, e.g. the split's second) */
             const int fg = fiber_onfly_config(og, e);
             if (fg < 0) { fprintf(stderr, "train: --onfly-gpu %d: no GPU fibre planes (or the reserve failed)\n", og); return 1; }
             if (fg) fprintf(stderr, "train: on-the-fly fibre planes (%d targets) on GPU %d, buffers for %d^3 boxes\n", nfib, og, e);
-            else fprintf(stderr, "train: on-the-fly fibre planes (%d targets) on the CPU\n", nfib);
+            else fprintf(stderr, "train: on-the-fly fibre planes (%d targets) on the CPU\n", nfib); ONFLY_MEM("the fibre planes");
         }
         mesh_codes_gpu_config(atoi(opt(argc, argv, "--onfly-gpu", "0")));   /* the mesh codes stamp ("onfly": {"meshes"}) on the same device (-1 the CPU) */
         int nink = 0; for (int i = 0; i < S->n; i++) for (int c = 0; c < NTG; c++) nink += S->src[i].ink_fly[c] != nullptr;
         if (nink) {   /* "onfly" ink targets (inksplat.h inkfly_open): face + splat of a cold chunk on --onfly-gpu (per sampler thread a stream; -1 the CPU) */
-            const int og = atoi(opt(argc, argv, "--onfly-gpu", "0")); inkfly_gpu_config(og);
+            const int og = atoi(opt(argc, argv, "--ink-gpu", opt(argc, argv, "--onfly-gpu", "0"))); inkfly_gpu_config(og);   /* (--ink-gpu: as --fibre-gpu) */
             fprintf(stderr, "train: on-the-fly ink targets (%d) computed on %s %d (cached per 128^3 chunk: memory + %s)\n", nink, og >= 0 ? "GPU" : "CPU", og,
-                    dcache_default_dir() ? dcache_default_dir() : "no disk cache");
+                    dcache_default_dir() ? dcache_default_dir() : "no disk cache"); ONFLY_MEM("the ink targets");
         }
     }
     for (int i = 0; g_restore && i < S->n; i++) if (!S->src[i].srp != !g_rpairs) { fprintf(stderr, "--task restore: %s: \"sr_pair\" sources need --sr-pairs 1 and --sr-pairs 1 needs them all\n", S->src[i].name); return 2; }
@@ -3440,7 +3444,8 @@ int cmd_train(int argc, char **argv) {
                         pick_need / 1e9, fmin / 1e9, (double)pick_need / (double)vox, upb / 1e9, pick_off / 1e9, (double)pick_off / (double)vox,
                         fastest || !pick_off ? "" : "; --mem fast skips them where the window fits without");
             }
-            g_plan_spare = pick >= 0 && fmin > pick_need ? fmin - pick_need : 0;
+            g_plan_spare = pick >= 0 && pick_need > 0 && fmin > pick_need ? fmin - pick_need : 0;   /* (no mode fit, "trying" the smallest: no spare. 2026-11-13: pick_need 0 there
+                                                                                                    made the whole free memory "spare", the label planes then took 6.7 GB of it and the trainer OOMed) */
             unet_set_host_offloads(pick_hoff);
             unet_set_chunk_up(cand[pick].chunk); unet_set_recompute(cand[pick].rc); unet_set_grad_mx8(cand[pick].gmx); unet_set_lean(cand[pick].lean); unet_set_share_enc_a1(cand[pick].sea || (pick_hoff && sea_force));
             unet_set_l0_3buf(cand[pick].l3);
