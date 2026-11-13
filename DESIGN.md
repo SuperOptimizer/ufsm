@@ -65,6 +65,17 @@ with the unused tail filled by a key that sorts last, and k_runs reads the true 
 the ones of the readback path. A bound exceeded on the device (not expected) is reported by the next step's first slab. tests/test_ink_mil
 checks both paths byte for byte at 1 / 3 / 7 slabs, soft and hard. Default off (UFSM_MIL_ASYNC=1) until that test has run on a GPU;
 ink_mil_set_async() for tests.
+
+**The gradient sum in halves, both directions at once.** After each step train.c summed the two GPUs' fp32 gradients by copying
+all of GPU 1's gradient to GPU 0 with cudaMemcpyPeer (no P2P on the desk, so it is staged through the host and the host blocks),
+adding them, and copying the sum back: 2 x 368 MB for the 92 M net, one direction at a time, nothing overlapped. The old path also
+holds a 368 MB receive buffer on GPU 0. nn_grad_allreduce2 (nn_loss.cu) instead does a reduce-scatter and then an all-gather.
+GPU 0 sums [0, n/2) and GPU 1 sums [n/2, n); each then sends its summed half to the other. The data goes through double-buffered
+32 MB pinned chunks, both directions in flight, with a chunk's D2H overlapping the previous chunk's H2D. It is stream-ordered
+behind each device's legacy stream and the host only enqueues. Each half is y + x on one card (a + b == b + a), so the bytes are
+those of the old path. Buffers: 128 MB pinned host, 64 MB of receive chunks per card. The old path's 368 MB on GPU 0 is not
+allocated. tests/test_grad_ar checks both cards against the host sum byte for byte over three calls (quick: 9 M floats in 1 M
+chunks; full: 92.4 M floats, timed against the old path). Default off (UFSM_GRAD_AR2=1) until that test has run on the GPUs.
 ## Split-window input builders: every --gpu-aug builder by z range, the scanner split exactly across two GPUs (2026-11-13, branch augz-20261112)
 
 ## Muon variants for the from-scratch universal net: ten arms on the 92 M net (2026-11-13, branch muonx-20261113)

@@ -423,6 +423,9 @@ suite-bins: $(B)/test_distill
 $(B)/test_ink_mil: tests/test_ink_mil.c $(OBJ) $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 suite-bins: $(B)/test_ink_mil
+$(B)/test_grad_ar: tests/test_grad_ar.c $(OBJ) $(B)/nn.o $(B)/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
+suite-bins: $(B)/test_grad_ar
 $(B)/test_ink_air: tests/test_ink_air.c $(OBJ) $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 suite-bins: $(B)/test_ink_air

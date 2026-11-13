@@ -585,6 +585,7 @@ void nn_split_slice(const void *src, shape5 sf, void *dst, shape5 s, int esz, in
 void nn_split_allreduce(double *const *b, const int *dev, int n, double *const *r);
 /* Device-to-device copy across GPUs (peer access when possible). */
 void nn_peer_copy(void *dst, int dst_dev, const void *src, int src_dev, size_t bytes);
+int nn_grad_allreduce2(float *const *g, const int *dev, size_t n);   /* two GPUs' fp32 gradients summed on both (halves, both directions, host-staged, stream-ordered); -1: no buffers */
 
 /* ---- optimizer ---- */
 void nn_adamw(float *p, const float *g, float *m, float *v, size_t n, float lr, float b1, float b2, float eps, float wd, int step);

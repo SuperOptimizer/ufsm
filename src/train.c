@@ -4015,7 +4015,8 @@ int cmd_train(int argc, char **argv) {
     split_ctx *sctx = split ? split_create(devs[0], devs[1]) : nullptr;
     g_split_same = split && devs[0] == devs[1];
     nn_init(G[0].dev);
-    float *gpeer = ng > 1 ? nn_malloc(np * 4) : nullptr;   /* on GPU 0: incoming gradients of the other GPUs */
+    const int ar2 = ng == 2 && ufsm_env_on("UFSM_GRAD_AR2");   /* UFSM_GRAD_AR2=1: nn_grad_allreduce2 (halves, both directions at once, no 368 MB receive buffer on GPU 0) */
+    float *gpeer = ng > 1 && !ar2 ? nn_malloc(np * 4) : nullptr;   /* on GPU 0: incoming gradients of the other GPUs */
     /* --accum K: gradient accumulation, K windows (steps) per optimizer update. Every step is still one window: its forward / backward, loss,
        log and mix lines, the lr schedule (so --warmup and --steps count windows); its gradient is added into gacc and the update (clip,
        Muon / AdamW at optimizer step step / K, EMA) runs on the mean of the accumulated windows at steps that are multiples of K. A
@@ -4308,7 +4309,11 @@ int cmd_train(int argc, char **argv) {
         }
         if (g_stop || training_failed) break;
         /* average gradients across GPUs: sum on GPU 0 (peer copies), scale, broadcast */
-        if (ng > 1) {
+        if (ar2) {   /* the same bytes as the path below: each half summed as y + x on one card, then copied to the other */
+            float *gg[2] = {unet_grad_ptr(G[0].u), unet_grad_ptr(G[1].u)}; const int dv[2] = {G[0].dev, G[1].dev};
+            if (nn_grad_allreduce2(gg, dv, np)) { fprintf(stderr, "UFSM_GRAD_AR2: no staging buffers\n"); training_failed = 1; break; }
+            if (!split) for (int g = 0; g < 2; g++) { nn_init(G[g].dev); nn_scale(unet_grad_ptr(G[g].u), 0.5f, np); }
+        } else if (ng > 1) {
             nn_init(G[0].dev);
             for (int g = 1; g < ng; g++) { nn_peer_copy(gpeer, G[0].dev, unet_grad_ptr(G[g].u), G[g].dev, np * 4); nn_axpy(unet_grad_ptr(G[0].u), 1.f, gpeer, np); }
             if (!split) nn_scale(unet_grad_ptr(G[0].u), 1.f / ng, np);   /* split: the halves' gradients add up to the window's */
