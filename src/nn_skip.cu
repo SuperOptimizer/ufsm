@@ -79,7 +79,12 @@ extern "C" skipm_t lp_skip_get(shape5 xs, split_t sp, int fwd) {
     skipm_t r = {nullptr, 0, 0};
     skreg_t *s = &g_sk[skdev()]; if (!s->on) return r;
     s->calls++;
-    if (!fwd || xs.n != 1 || sp.zw1 || sp.Di || sp.yD || sp.accum || sp.sr || sp.osr) return r;
+    static int dbg = -1; if (dbg < 0) dbg = getenv("UFSM_SKIP_DEBUG") ? atoi(getenv("UFSM_SKIP_DEBUG")) : 0;   /* UFSM_SKIP_DEBUG=N: the first N dense lookups and why */
+    if (!fwd || xs.n != 1 || sp.zw1 || sp.Di || sp.yD || sp.accum || sp.sr || sp.osr) {
+        if (dbg > 0) { dbg--; fprintf(stderr, "skip: dense %dx%dx%dx%d: fwd %d n %d zw %d-%d zi0 %d Di %d yD %d accum %d sr %u osr %u\n", xs.c, xs.d, xs.h, xs.w, fwd, xs.n, sp.zw0, sp.zw1, sp.zi0, sp.Di, sp.yD, sp.accum, sp.sr, sp.osr); }
+        return r;
+    }
     for (int l = 0; l < s->nl; l++) if (s->D[l] == xs.d && s->H[l] == xs.h && s->W[l] == xs.w) { r.m = s->m[l]; r.my = s->my[l]; r.mx = s->mx[l]; s->used++; return r; }
+    if (dbg > 0) { dbg--; fprintf(stderr, "skip: dense %dx%dx%dx%d: no level grid of these dims (level 0 %dx%dx%d)\n", xs.c, xs.d, xs.h, xs.w, s->D[0], s->H[0], s->W[0]); }
     return r;
 }

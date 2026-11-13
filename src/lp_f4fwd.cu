@@ -30,6 +30,8 @@ extern "C" int lp_conv_fwd_f4(const void *x, int xbf, shape5 xs, const float *w,
        backward-data (fp4 gy, output SR, no staging SR) takes the packed fp4 kernel instead (rows copied): small_f8 re-encodes gy with one e4m3
        scale per tile, flushing values more than ~2^14 below the tile's largest (UFSM_G4_NARROW_F8=1: keep small_f8, A/B) */
     static int nf8 = -1; if (nf8 < 0) nf8 = getenv("UFSM_G4_NARROW_F8") ? atoi(getenv("UFSM_G4_NARROW_F8")) : 0;
+    { static int dbg = -1; if (dbg < 0) dbg = getenv("UFSM_SKIP_DEBUG") ? atoi(getenv("UFSM_SKIP_DEBUG")) : 0;   /* (--skip-empty diagnostics: the calls' shapes) */
+      if (dbg > 0) { dbg--; fprintf(stderr, "lp_conv_fwd_f4: x %dx%dx%dx%d (bf %d -> %d) cout %d up %d x2 %d zw %d-%d Di %d osr %u\n", xs.c, xs.d, xs.h, xs.w, xbf, ybf, cout, sp.up, sp.x2 != nullptr, sp.zw0, sp.zw1, sp.Di, sp.osr); } }
     if (xs.c <= 8 && !(xbf == 4 && ybf == 4 && sp.osr && !sp.sr && !nf8)) return lp_conv_fwd_f8(x, xbf, xs, w, b, cout, y, ybf, gp, osum, Go, sp);
     if (sp.accum && (xbf >= 3 || ybf >= 3)) { fprintf(stderr, "lp_conv_fwd_f4: MX storage with accumulate is not supported\n"); abort(); }
     if (xbf == ybf) {
