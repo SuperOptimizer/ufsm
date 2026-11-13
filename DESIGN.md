@@ -120,9 +120,11 @@ down, so the numbers below come from commit messages only:
   - Default: none on. A head is self-trained only after it beats its reference teacher, else the term reinforces its errors.
   - Memory: a byte per enabled channel and cell (16.8 MB per channel at P 1024), now counted by the planner (the old ink buffer
     was not).
-  - Tests (GPU pending): test_ssl (5) every mode in one spec vs the host (targets, counts, gradient against the formula and central
+  - Tests (desk GPU 0, 11-12 15:20, both pass): test_ssl (5) every mode in one spec vs the host (targets, counts, gradient against the formula and central
     differences, per-head sums) at two normal thresholds; test_heads (8e) the `--ssl-ink` alias, (8f) five heads at confidence 0
     finite and covering 30-90 % of the cells, a missing head refused.
+    test_ssl numbers: 512 cells, gated ink 165, rv 215 + 207, normal 236 (conf 0.8) / 185 (conf 1.2), phase 208, dens 152; 0 target
+    bytes differ; gradient worst 5.0e-7 against the formula and 5.0e-7 against central differences, of a largest 1.8e-3.
   - Measurement: a paired short run with / without `--ssl-heads` from the same snapshot (wbench p05x, rv, the 34 ink crops, the
     fibre judge), gated on unissl's 2000 / 4000 wbench rows showing the trunk term neutral or better.
 - Holdouts: inkB added the 10 extra crops to holdouts-ink.json ("inkeval-ho", 98 boxes), on the 0500P2 2.215 um and 0841 2.403 um
