@@ -196,6 +196,12 @@ int main(void) {
                 long inside = 0, ink = 0; for (size_t i = 0; i < n0; i++) { int in = 1; for (int d = 0; d < 3; d++) in &= r0[i].p[d] >= -0.5f && r0[i].p[d] < NV; inside += in; ink += r0[i].y; }
                 fprintf(stderr, "mil rays: %zu (all supervised pixels, %ld ink), %zu without a face\n", n0, ink, n1);
                 CHECK(n0 > 1000 && inside == (long)n0 && n1 < n0, "rays: %zu, %ld inside, %zu without a face", n0, inside, n1);
+                {   /* the face search in z slabs (16-row slabs: the box in many reads) == the whole box in one: the same rays, byte for byte */
+                    setenv("UFSM_INKRAY_SLAB_MB", "0.001", 1); inkray *r2 = nullptr; size_t n2 = 0;
+                    CHECK(!inkfly_rays(hd, wo, wn, 1, 1, 4, &r2, &n2), "inkfly_rays slabbed");
+                    CHECK(n2 == n1 && (!n1 || !memcmp(r1, r2, n1 * sizeof *r1)), "rays in z slabs: %zu vs %zu whole-box, %s", n2, n1, n2 == n1 && (!n1 || !memcmp(r1, r2, n1 * sizeof *r1)) ? "identical" : "DIFFER");
+                    unsetenv("UFSM_INKRAY_SLAB_MB"); free(r2);
+                }
                 free(r0); free(r1); if (f2) z3_close(f2);
             }
             z3_close(fly);

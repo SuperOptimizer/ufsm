@@ -433,6 +433,20 @@ static inline float tri_box(const uint8_t *b, const int64_t n[3], double z, doub
     }
     return (float)s;
 }
+/* tri_box on rows [z0, z1) of a box of n[0] rows (the slab b holds those rows only): the same value as tri_box on the whole box, -2 when
+   a corner row is outside the slab (a caller's slab margin bug, never a data condition) */
+static inline float tri_box_z(const uint8_t *b, const int64_t n[3], int64_t s0, int64_t s1, double z, double y, double x) {
+    if (z < 0 || y < 0 || x < 0 || z > n[0] - 1 || y > n[1] - 1 || x > n[2] - 1) return -1.f;
+    int64_t z0 = (int64_t)z, y0 = (int64_t)y, x0 = (int64_t)x; if (z0 >= n[0] - 1) z0 = n[0] - 2; if (y0 >= n[1] - 1) y0 = n[1] - 2; if (x0 >= n[2] - 1) x0 = n[2] - 2;
+    if (z0 < 0 || y0 < 0 || x0 < 0) return -1.f;
+    if (z0 < s0 || z0 + 1 >= s1) return -2.f;
+    const double fz = z - z0, fy = y - y0, fx = x - x0; double s = 0;
+    for (int c = 0; c < 8; c++) {
+        const int64_t a = z0 + (c >> 2 & 1) - s0, bb = y0 + (c >> 1 & 1), e = x0 + (c & 1);
+        s += (c >> 2 & 1 ? fz : 1 - fz) * (c >> 1 & 1 ? fy : 1 - fy) * (c & 1 ? fx : 1 - fx) * b[((size_t)a * n[1] + bb) * n[2] + e];
+    }
+    return (float)s;
+}
 static void *prof_worker(void *arg) {
     pjob *J = arg; const geo *G = J->G; const inksplat_cfg *c = G->c; const int T = c->profile, st = c->stride > 0 ? c->stride : 1;
     prof *P = calloc(1, sizeof *P);
@@ -1710,29 +1724,50 @@ int inkfly_rays(void *handle, const int64_t o[3], const int64_t n[3], int mode, 
         }
         free(lab); free(msk); q0 = q1;
     }
-    uint8_t *ctb = nullptr; int64_t co[3] = {0, 0, 0}, cn[3] = {0, 0, 0};
-    if (mode == 1 && np) {   /* the face search on the level's CT, as inkfly_chunk */
-        size_t ncv = 1; for (int d = 0; d < 3; d++) { co[d] = (int64_t)floor((lo3[d] - f->off) / V) - 1; cn[d] = (int64_t)ceil((hi3[d] - f->off) / V) + 2 - co[d]; ncv *= (size_t)cn[d]; }
-        ctb = malloc(ncv);
-        if (!ctb || (f->zc ? zcache_read(f->zc, f->base_ct, co, cn, ctb) : z3_read(f->base_ct, co, cn, ctb, 1))) { free(ctb); goto done; }
+    const int lo = (int)floor(c->face_lo), hi = (int)ceil(c->face_hi), ns = hi - lo + 1; const double sign = c->flip ? -1 : 1;
+    uint8_t *drop = nullptr;
+    if (mode == 1 && np) {   /* the face search on the level's CT, as inkfly_chunk. In z slabs of the CT box (2026-11-13): the whole box of a
+                                level-(L+1) window read at level L is (2 x 1040)^3 = 8.9 GB at P 1024 (a 30 GB sampler-only run OOM'd on it); a
+                                slab holds the rows its points' samples reach, the samples' coordinates are the whole box's, so byte-identical */
+        int64_t co[3], cn[3]; for (int d = 0; d < 3; d++) { co[d] = (int64_t)floor((lo3[d] - f->off) / V) - 1; cn[d] = (int64_t)ceil((hi3[d] - f->off) / V) + 2 - co[d]; }
+        const int64_t rz = (int64_t)ceil(reach / V) + 2, plane = cn[1] * cn[2];
+        const char *e = getenv("UFSM_INKRAY_SLAB_MB"); const double mb = e ? atof(e) : 256;
+        int64_t T = (int64_t)(mb * 1048576 / (double)plane) - 2 * rz; if (T < 16) T = 16; if (T > cn[0]) T = cn[0];
+        const int64_t nsl = (cn[0] + T - 1) / T;
+        uint32_t *cnt = calloc((size_t)nsl + 1, sizeof *cnt), *ord = malloc(np * sizeof *ord), *sl = malloc(np * sizeof *sl);
+        drop = calloc(np, 1); uint8_t *ctb = malloc((size_t)(T + 2 * rz + 2) * (size_t)plane);
+        if (!cnt || !ord || !sl || !drop || !ctb) { free(cnt); free(ord); free(sl); free(ctb); free(drop); goto done; }
+        for (size_t i = 0; i < np; i++) { int64_t q = (int64_t)floor((X[i].P[0] - f->off) / V - co[0]) / T; if (q < 0) q = 0; if (q >= nsl) q = nsl - 1; sl[i] = (uint32_t)q; cnt[q + 1]++; }
+        for (int64_t q = 0; q < nsl; q++) cnt[q + 1] += cnt[q];
+        for (size_t i = 0; i < np; i++) ord[cnt[sl[i]]++] = (uint32_t)i;   /* (cnt[q] is now slab q's end = slab q+1's start) */
+        float raw[256], sm[256]; int bad = 0;
+        for (int64_t q = 0, b0 = 0; q < nsl && !bad; b0 = cnt[q], q++) {
+            if ((int64_t)cnt[q] == b0) continue;
+            int64_t z0 = q * T - rz, z1 = (q + 1) * T + rz + 1; if (z0 < 0) z0 = 0; if (z1 > cn[0]) z1 = cn[0];
+            const int64_t so[3] = {co[0] + z0, co[1], co[2]}, sn[3] = {z1 - z0, cn[1], cn[2]};
+            if (f->zc ? zcache_read(f->zc, f->base_ct, so, sn, ctb) : z3_read(f->base_ct, so, sn, ctb, 1)) { bad = 1; break; }
+            for (int64_t j = b0; j < (int64_t)cnt[q]; j++) {
+                const cpx *x = &X[ord[j]];
+                for (int k = 0; k < ns; k++) { const double tt = (lo + k) * sign; double qq[3];
+                    for (int d = 0; d < 3; d++) qq[d] = (x->P[d] + tt * x->N[d] - f->off) / V - co[d];
+                    const float v = tri_box_z(ctb, cn, z0, z1, qq[0], qq[1], qq[2]); if (v < -1.5f) { bad = 1; break; } raw[k] = v < 0 ? 0 : v; }
+                if (bad) break;
+                for (int k = 0; k < ns; k++) sm[k] = 0.25f * (raw[k > 0 ? k - 1 : 0] + 2 * raw[k] + raw[k < ns - 1 ? k + 1 : ns - 1]);
+                drop[ord[j]] = face_of(sm, ns, lo, c->iso, c->face_run, c->face_gap) != FACE_NONE;
+            }
+        }
+        free(cnt); free(ord); free(sl); free(ctb);
+        if (bad) { fprintf(stderr, "ink-onfly: rays: a CT slab read failed or a sample left its slab\n"); free(drop); goto done; }
     }
     inkray *Rr = malloc((np ? np : 1) * sizeof *Rr); size_t nr = 0;
-    const int lo = (int)floor(c->face_lo), hi = (int)ceil(c->face_hi), ns = hi - lo + 1; const double sign = c->flip ? -1 : 1;
-    float raw[256], sm[256];
     for (size_t i = 0; i < np; i++) {
         const cpx *x = &X[i];
-        if (mode == 1) {
-            for (int k = 0; k < ns; k++) { const double tt = (lo + k) * sign; double qq[3];
-                for (int d = 0; d < 3; d++) qq[d] = (x->P[d] + tt * x->N[d] - f->off) / V - co[d];
-                const float v = tri_box(ctb, cn, qq[0], qq[1], qq[2]); raw[k] = v < 0 ? 0 : v; }
-            for (int k = 0; k < ns; k++) sm[k] = 0.25f * (raw[k > 0 ? k - 1 : 0] + 2 * raw[k] + raw[k < ns - 1 ? k + 1 : ns - 1]);
-            if (face_of(sm, ns, lo, c->iso, c->face_run, c->face_gap) != FACE_NONE) continue;
-        }
+        if (drop && drop[i]) continue;
         inkray *r = &Rr[nr++];
         for (int d = 0; d < 3; d++) { r->p[d] = (float)((x->P[d] - f->off) / V - o[d]); r->n[d] = (float)(x->N[d] * sign); }
         r->y = x->y; r->w = 1; memset(r->pad, 0, sizeof r->pad);
     }
-    free(ctb); *out = Rr; *nout = nr; rc = 0;
+    free(drop); *out = Rr; *nout = nr; rc = 0;
 done:
     free(X); free(cand); return rc;
 }
