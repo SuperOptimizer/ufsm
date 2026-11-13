@@ -2771,7 +2771,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
     int tmax = 0;
     /* a channel without a target (w 0) is read again only by the packing / the host warp / the sheet prior / papyrus labels: with the
        packed plane skipped (slot_skip 1), the labels warped on the device and none of the others, it needs no zeroing */
-    const int tdead = c->pack_tm && (c->slot_skip & 1) && c->gpu_aug == 2 && !c->sheet && !c->papyrus && !c->pap_head && region_ch < 0;
+    const int tdead = ((c->pack_tm && (c->slot_skip & 1)) || (sample_tm_unused(c) && (!getenv("UFSM_TDEAD_TMU") || ufsm_env_on("UFSM_TDEAD_TMU")))) && c->gpu_aug == 2 && !c->sheet && !c->papyrus && !c->pap_head && region_ch < 0;
     for (int ch = 0; ch < NCH; ch++) {
         uint8_t *dst = ttmp + (size_t)ch * p3;
         if (c->papyrus) { memset(dst, 0, p3); continue; }   /* task papyrus: labels from the CT below */
@@ -3528,6 +3528,13 @@ static void worker_idle_release(uint8_t *big, size_t bign, uint8_t *ttmp, size_t
     tp_drain();
     static atomic_int said; if (!atomic_exchange(&said, 1)) fprintf(stderr, "sampler: a worker without a free slot released its scratch (UFSM_IDLE_RELEASE=0: keep it)\n");
 }
+/* after each filled slot: the malloc arenas' free pages back to the system (2026-11-13: merger2's P 1024 split bench at 6 workers / 6 slots
+   held 7 GB free inside 16 GB of arenas: windows' transient buffers of varying sizes from six threads fragment them). malloc_trim walks
+   the free chunks (a few ms against a ~40 s window); the batches do not change. UFSM_SAMPLER_TRIM=0: off */
+static void worker_trim(void) {
+    static int on = -1; if (on < 0) on = !getenv("UFSM_SAMPLER_TRIM") || ufsm_env_on("UFSM_SAMPLER_TRIM");
+    if (on) malloc_trim(0);
+}
 static void *worker(void *arg) {
     warg *wa = arg;
     sampler *sp = wa->sp;
@@ -3585,6 +3592,7 @@ static void *worker(void *arg) {
             else if (rc > 0 && ++spin == (1u << 22)) { fprintf(stderr, "sampler: %u consecutive draws rejected or impossible (P=%d), stopping\n", spin, sp->cfg.P); atomic_store(&sp->failed, 1); atomic_store(&sp->stop, 1); }
             else if (rc < 0) { fprintf(stderr, "sampler: %s\n", z3_error()); if (++fail > 20) { fprintf(stderr, "sampler: 20 consecutive read failures, stopping\n"); atomic_store(&sp->failed, 1); atomic_store(&sp->stop, 1); } }
         }
+        worker_trim();
         pthread_mutex_lock(&sp->mu);
         sp->state[k] = filled == sp->cfg.B && !atomic_load(&sp->stop) ? READY : FREE;
         if (sp->rleft) sp->rleft[k] = sp->cfg.replay - 1;
