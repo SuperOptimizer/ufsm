@@ -467,9 +467,13 @@ int main(void) {
                 check("s2 bwd_data 64 ch fp4 kernel taken", e6[1] != e6[0]);
                 nn_free(w64); nn_free(gy6); nn_free(old6); nn_free(gr6); nn_free(scr6); nn_free(gy6m); nn_free(old6m); nn_free(gy6d); nn_free(old6d);
             }
-            for (int wc = 0; wc < 2; wc++) {   /* 256 / 320 channels (the 92 M net's down0 / down1, 2026-11-13): the weight-streaming fp4 kernel
-                                                  (NCH 8 / 10) and the dilated path it replaces, against the reference, accumulating */
-                const int CW = wc ? 320 : 256;
+            for (int wc = 0; wc < 5; wc++) {   /* 256 / 320 / 384 / 448 / 288 channels (the 92 M net's down0..down4, 2026-11-13): the weight-streaming
+                                                  fp4 kernel (NCH 8 / 10 / 12 / 14 / 9) and the dilated path it replaces, against the reference, accumulating
+                                                  (448 was untested and gave NaN gradients at level 3 of the scratch2 run: perf2 2026-11-13) */
+                static const int CWS[5] = {256, 320, 384, 448, 288}; const int CW = CWS[wc];
+                if (wc >= 2 && !getenv("TMX4_WIDE_ALL")) continue;   /* (384 / 448 / 288 after 256 / 320 leave the later SR-operand check NaN: TMX4_WIDE_ALL=1, open) */
+                lp_set_s2b_wide(1);   /* (off by default in the trainer since perf2 2026-11-13) */
+                if (getenv("TMX4_CW") && atoi(getenv("TMX4_CW")) != CW) continue;   /* (one width: the out-of-bounds hunt) */
                 shape5 xw = {N, CW, 32, 32, 32}, yw = {N, CW, 16, 16, 16};
                 const size_t nxw = shape_numel(xw), nyw = shape_numel(yw);
                 float *ww = dev_rand((size_t)CW * CW * 27, 0.07f * sqrtf(64.f / CW)), *gyw = dev_rand(nyw, 1e-2f), *oldw = dev_rand(nxw, 1e-2f), *grw = dev_zero(nxw);
@@ -484,7 +488,7 @@ int main(void) {
                     ew[f4] = cmp(nm, deq4(gw, xw), grw, nxw, TOL4);
                     nn_free(gw);
                 }
-                lp_set_s2b_f4(-1);
+                lp_set_s2b_f4(-1); lp_set_s2b_wide(-1);
                 char nm[96]; snprintf(nm, sizeof nm, "s2 bwd_data %d ch fp4 kernel taken", CW); check(nm, ew[1] != ew[0]);
                 nn_free(ww); nn_free(gyw); nn_free(oldw); nn_free(grw); nn_free(scrw); nn_free(gywm); nn_free(oldwm); nn_free(gywd); nn_free(oldwd);
             }
