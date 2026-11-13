@@ -1124,7 +1124,10 @@ static void head_slab_pass(gpu_state *d, int pass) {
     const int fr[2][2] = {{0, fside ? 0 : g_norm_ch}, {g_norm_ch + 7, fside ? g_cout : LUPC}};
     /* a training step's statistics pass only counts the fused groups' mask weights (all the gradient reads); their loss sums come from the gradient pass, finalised after it (UFSM_LAT_LIGHT0=0: both in the statistics pass) */
     static int light_on = -1; if (light_on < 0) light_on = !getenv("UFSM_LAT_LIGHT0") || ufsm_env_on("UFSM_LAT_LIGHT0");
-    const int light = g_lat_fuse && d->fpart && d->hs_train && nn_get_loss_grad_h16() && light_on && !g_lsplit;   /* (g_lsplit: the gradient pass sees the halo band) */
+    static int light_split = -1; if (light_split < 0) light_split = ufsm_env_on("UFSM_LAT_LIGHT_SPLIT");   /* (default off until a split run compared it with the full statistics pass) */
+    const int light = g_lat_fuse && d->fpart && d->hs_train && nn_get_loss_grad_h16() && light_on && (!g_lsplit || light_split);   /* (g_lsplit: the gradient pass sees a 4-plane halo
+                                                                                                    band more, so its loss sums are clipped to the statistics pass's planes: nn_lat_fuse_sum_zwin; perf2 2026-11-13) */
+    if (light && g_lsplit && d->side >= 0) { int a, b; hs_keep(d, 0, &a, &b); nn_lat_fuse_sum_zwin(a, b); } else nn_lat_fuse_sum_zwin(-(1 << 30), 1 << 30);
     static int fine = -1; if (fine < 0) fine = getenv("UFSM_PTICK") && atoi(getenv("UFSM_PTICK")) >= 2;   /* UFSM_PTICK=2: the target / loss kernels one by one (both passes summed) */
 #define FT(w) do { if (fine) nn_ptick(w); } while (0)
     const int si = d->srcb[d->cur];   /* the window's source (its "heads" weights) */
@@ -1445,8 +1448,8 @@ static void head_slab_pass(gpu_state *d, int pass) {
         nn_loss_stats_fin(d->hs_ds + 20, d->nw, w7, d->nscratch);
     } else if (fuse && light) {   /* the logged losses: the same finalisation with the gradient pass's sums (the mask sums and the active count are unchanged) */
         const shape5 w2 = {1, 2, D, H, W}, w7 = {1, 7, D, H, W};
-        if (fside) nn_loss_stats_fin(d->hs_ds + 10, d->sidew, w2, d->sscratch);
-        nn_loss_stats_fin(d->hs_ds + 20, d->nw, w7, d->nscratch);
+        if (fside) nn_loss_stats_fin_light(d->hs_ds + 10, d->sidew, w2, d->sscratch, d->hs_ds + 100);   /* (hs_ds + 100 .. 106: the held mask weights) */
+        nn_loss_stats_fin_light(d->hs_ds + 20, d->nw, w7, d->nscratch, d->hs_ds + 100);
     }
 }
 static void head_slab_cb(void *ctx) {

@@ -227,6 +227,19 @@ extern "C" void nn_loss_stats_fin(double *ds, const uint8_t *w, shape5 s, float 
     loss_fin_k<<<1, 32>>>(scratch, w, s.n, s.c, scratch + (size_t)5 * NC);
     KCHECK();
 }
+/* the light statistics pass's finalisation after the gradient pass (perf2 2026-11-13): ds's mask weights (entry 0 of each channel's 5)
+   were summed across the split halves by the statistics pass's finalisation already, the loss sums 1 .. 4 come from this half's gradient
+   pass: only those are summed across the halves (entry 0 held out of zs_reduce), then finalised as nn_loss_stats_fin does */
+__global__ void ds_hold0_k(double *ds, double *keep, int NC, int restore) { const int i = blockIdx.x * blockDim.x + threadIdx.x; if (i >= NC) return; if (restore) ds[5 * i] = keep[i]; else { keep[i] = ds[5 * i]; ds[5 * i] = 0.; } }
+extern "C" void nn_loss_stats_fin_light(double *ds, const uint8_t *w, shape5 s, float *scratch, double *keep) {
+    const int NC = s.n * s.c;
+    ds_hold0_k<<<nblk(NC, 64), 64>>>(ds, keep, NC, 0);
+    zs_reduce(ds, 5 * NC);
+    ds_hold0_k<<<nblk(NC, 64), 64>>>(ds, keep, NC, 1);
+    loss_d2f_k<<<nblk(5 * NC, 128), 128>>>(ds, scratch, 5 * NC);
+    loss_fin_k<<<1, 32>>>(scratch, w, s.n, s.c, scratch + (size_t)5 * NC);
+    KCHECK();
+}
 /* nn_loss_grad_only_s: the same gradient times mul in the kernel's final product (perf2 2026-11-13: the head slabs' lambda x source-weight
    scales were a separate read-modify-write pass, gscale_k, ~90 ms a step per card at the P 1024 split half). The 16-bit value is rounded
    once from (g fin gscale) mul instead of twice (round, scale, round): at most one fp16 ulp apart */

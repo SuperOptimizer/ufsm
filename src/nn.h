@@ -238,6 +238,7 @@ size_t nn_lat_fuse_part(int n, int h, int w, int nz);
 void nn_lat_fuse_grad(const void *lg, int lh16, int lq0, int lqd, int d, int h, int w, int z0, int nz, int c0, int n, int guide, int gb, const void *x,
                       const uint8_t *t, const uint8_t *m, const uint8_t *wch, const float *st, float pw, float rec_w, int unit_c, const float *lam,
                       float *part, float *gc, int gq0, int gqd, double *ds);   /* ds: also the group's loss sums 1 .. 4 (after a mask_only statistics pass) */
+void nn_lat_fuse_sum_zwin(int lo, int hi);   /* nn_lat_fuse_grad's loss sums only from fine planes [lo, hi) (the split's statistics-pass planes) */
 void nn_lat_fuse_stats(const void *lg, int lh16, int lq0, int lqd, int d, int h, int w, int z0, int nz, int c0, int n, int guide, int gb, const void *x,
                        const uint8_t *t, const uint8_t *m, const uint8_t *wch, float pw, int unit_c, double *ds, int mask_only);   /* nn_loss_stats_acc of the group, fused */
 void nn_loss_cfg_get(float *pw, float *rec_w, int *unit7);   /* the BCE's positive weight, --recall weight, 7-channel unit-mask channel */
@@ -518,6 +519,7 @@ void nn_loss_pack(const void *logits, const uint8_t *t, const uint8_t *m, const 
 /* the same loss in parts (head slabs): statistics added to ds (5 doubles per (n, c), caller-zeroed) per slab, finished into scratch
    (s: the whole window), then each slab's gradient (gl may be the logits: in place) */
 void nn_loss_stats_acc(const void *logits, const uint8_t *t, const uint8_t *m, const uint8_t *w, shape5 s, double *ds);
+void nn_loss_stats_fin_light(double *ds, const uint8_t *w, shape5 s, float *scratch, double *keep);   /* after a light statistics pass: only the loss sums 1 .. 4 summed across split halves (keep: s.n s.c doubles) */
 void nn_loss_stats_fin(double *ds, const uint8_t *w, shape5 s, float *scratch);
 void nn_loss_grad_only(const void *logits, const uint8_t *t, const uint8_t *m, const uint8_t *w, shape5 s, float dice_w, void *gl, const float *scratch);
 void nn_loss_grad_only_s(const void *logits, const uint8_t *t, const uint8_t *m, const uint8_t *w, shape5 s, float dice_w, void *gl, const float *scratch, float mul);   /* x mul in the kernel (no gscale pass) */

@@ -179,7 +179,15 @@ the MX4 epilogue through per-warp shared tiles) on the pod: rel L2 7.7e-3 agains
 elements differ), bytes repeat; the P 1024 half slab 160 -> 256: 7.61 -> 1.12 ms (2.8 -> 19.2 TFLOP/s), 34 slabs a step: ~220 ms per
 card. Default OFF (UFSM_HEAD_BTC=1 on): with it on, test_lat_head's "a second equal net" check (the same parameters and
 inputs on a second unet) differs by rel 0.4 in the trunk gradients, which test_head_tc's kernel-level checks (C 32 / 96 / 256, two
-samples, whole and ranges) do not reproduce. Open. The whole-call form (lp_conv1_to_mx) now takes the same kernel as the range form,
+samples, whole and ranges) do not reproduce. The difference is deterministic: CUDA_LAUNCH_BLOCKING changes nothing, and it shows only in
+the narrow {96,64,96} config. A trace of the calls (UFSM_C1B_TRACE, not kept) shows both nets taking the same fp16 TC path (gdt 2,
+whole and per range). The head's gx is therefore the same kind on both nets, and the 0.42 / 0.17 matches test_lat_head's known
+narrow-level fault: "TLH_NARROW_ALL ... 0.17 on every trunk tensor, 11-09, open". BTC's slightly different gx bits seem to expose that
+fault rather than cause it. The paragraph below was the first reading. One of the two nets reaches the head's backward-data with fp16
+logit gradients (the TC kernel), the other with MX or bf16 ones (gdt 3 / 1: the FFMA kernel). With BTC off both use FFMA, whose fp32
+sums agree whenever the values do. The TC kernel would need a gdt 3 / 1 staging to keep that equality. The 8-output comparisons
+(trunk rel 0.3) are the same effect: the wide head's TC gx against the 8-output FFMA gx, where one SR flip in fp4 spreads through the
+small test net. The whole-call form (lp_conv1_to_mx) now takes the same kernel as the range form,
 so whole == per range holds with it on.
 
 
@@ -253,6 +261,16 @@ unchanged (byte-identical). test_fstem, test_lathead, test_heads, test_predict_h
 about 110 ms per step at P 512 on this card, and about 4x that per card at the P 1024 split half.
 
 ## Split-window input builders: every --gpu-aug builder by z range, the scanner split exactly across two GPUs (2026-11-13, branch augz-20261112)
+
+**The light statistics pass under the split (UFSM_LAT_LIGHT_SPLIT=1, untested).** For the fused head groups (the normal 7 and the
+side pair), the single-card trainer counts only mask weights in the statistics pass and takes the loss sums from the gradient pass
+("light"). The split turned light off because its gradient pass also covers a 4-plane halo band. On the pod, light off cost 22 ms a
+step at P 512 one card (1.518 -> 1.540 s), so at the P 1024 split half it should be roughly 90 ms per card. Now:
+- nn_lat_fuse_grad's loss sums take only fine planes [lo, hi) (nn_lat_fuse_sum_zwin, set from hs_keep's statistics-pass range);
+- the light finalisation (nn_loss_stats_fin_light) sums only entries 1 .. 4 across the halves, because the statistics pass's
+  finalisation already summed the mask weights in entry 0.
+It is off by default. The pods were shut down before the same-GPU split comparison (--gpus 0,0 --split z, --det, light on vs off,
+logged losses) ran.
 
 ## Muon variants for the from-scratch universal net: ten arms on the 92 M net (2026-11-13, branch muonx-20261113)
 
