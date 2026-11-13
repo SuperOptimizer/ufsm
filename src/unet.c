@@ -4442,6 +4442,7 @@ int unet_save(const unet *u, const char *path, int step, const char *extra) {
         for (int i = 0; i < n; i++) fprintf(f, "%s%.9g", i ? "," : "", r[i]);
         fputc(']', f); free(r);
     }
+    if (u->cfg.scan_norm) fputs(",\"scan_norm\":1", f);
     if (u->cfg.gn_ema) {   /* the running statistics of every site (live weights, EMA weights; gn_sites layout) and their state */
         ge_alloc(u); const size_t n = 2 * u->ge_ns; float *r = malloc(n * 4); nn_d2h(r, u->ge_run, n * 4);
         fprintf(f, ",\"gn_ema\":1,\"ge_n\":%ld,\"ge_warm\":%d,\"ge_mom\":%.9g,\"ge_run\":[", u->ge_n, u->ge_warm, u->ge_mom);
@@ -4543,6 +4544,7 @@ static int read_header(FILE *f, unet_cfg *cfg, int *step, size_t *np) {
     if ((p = strstr(line, "\"l0_warm\":"))) g_loaded_l0_warm = atoi(p + 10);
     if ((p = strstr(line, "\"l0_mom\":"))) g_loaded_l0_mom = strtof(p + 9, nullptr);
     if ((p = strstr(line, "\"gn_ema\":"))) cfg->gn_ema = atoi(p + 9);
+    if ((p = strstr(line, "\"scan_norm\":"))) cfg->scan_norm = atoi(p + 12);
     g_loaded_ge_cnt = 0;
     if (cfg->gn_ema) {
         if ((p = strstr(line, "\"ge_n\":"))) g_loaded_ge_n = atol(p + 7);

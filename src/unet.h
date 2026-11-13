@@ -54,6 +54,8 @@ typedef struct {
                               the convs reading SiLU outputs with the NF-net gain 1 / std(silu(z))), 4 slab (GroupNorm statistics per
                               z-slab of l0_slab planes: no whole-window reduction). Tensor-core and fp32 paths (slab: MX or fp32 storage) */
     int l0_slab;           /* l0_norm 4: planes per slab (0: 64; the level-0 depth a multiple of it) */
+    int scan_norm;         /* 1: trained on the per-scan CT normalisation (train --scan-norm, scannorm.h): predict computes the same for its
+                              scan and level unless --norm is given (header key "scan_norm" only when on; no parameters) */
     int gn_ema;            /* 1: every GroupNorm (all levels, down norms, the attention stage's) normalises with running statistics
                               (BatchNorm-style, per group: unet_set_gn_ema's momentum toward each training forward's window statistics,
                               live statistics during its warm-up), constants in forward and backward, the same in inference: a cell's

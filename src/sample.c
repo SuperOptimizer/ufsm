@@ -1,3 +1,4 @@
+#include "scannorm.h"
 #include "sample.h"
 #include "inksplat.h"
 [[gnu::weak]] int inkfly_cells(void *, int, const int64_t[3], uint8_t *);
@@ -2447,6 +2448,22 @@ static int density_draw(sampler *sp, source *s, const int64_t o[3], int Pz, int 
     return ok;
 }
 static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp, uint8_t *big, uint64_t tile_index, float *noise_state, chain_st *cs);
+/* --scan-norm: source s's (center, scale) at CT level l (scannorm.h), computed once (a failure: the window z-score, reported once) */
+static pthread_mutex_t g_sn_mu = PTHREAD_MUTEX_INITIALIZER;
+static z3 *sn_open(void *ctx, int level) { return source_ct((source *)ctx, level); }
+static int scan_norm_of(source *s, int l, float *c, float *sc) {
+    if (l < 0 || l >= MAXLEV) return -1;
+    pthread_mutex_lock(&g_sn_mu);
+    if (!s->sn_st[l]) {
+        const int rc = scan_norm_stats(sn_open, s, l, &s->sn_c[l], &s->sn_s[l], 4);
+        s->sn_st[l] = rc ? -1 : 1;
+        if (rc) fprintf(stderr, "sampler: %s: --scan-norm: no statistics at level %d (scan_norm_stats %d: %s): the window z-score\n", s->name, l, rc, rc == -3 ? "no coarse level" : rc == -2 ? "no level" : rc == -4 || rc == -6 ? "a read failure" : "too little material");
+        else fprintf(stderr, "sampler: %s: --scan-norm: level %d center %.1f scale %.2f\n", s->name, l, s->sn_c[l], s->sn_s[l]);
+    }
+    const int ok = s->sn_st[l] > 0; if (ok) { *c = s->sn_c[l]; *sc = s->sn_s[l]; }
+    pthread_mutex_unlock(&g_sn_mu);
+    return ok ? 0 : -1;
+}
 static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp, uint8_t *big, uint64_t tile_index, float *noise_state, chain_st *cs) {
     const int rc = draw_(sp, b, i, r, xtmp, ttmp, big, tile_index, noise_state, cs);
     if (g_crush.ph || g_crush.ig || g_crush.w4 || g_crush.wc || g_crush.cax) crush_release();
@@ -2957,7 +2974,9 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
         PROF_MARK(PS_SCAN);
     }
     if (grec && !grec->scan) memcpy(b->ct8 + (size_t)i * p3, ctu, p3);   /* (the bytes as read) */
+    int fixed_norm = s->norm_s > 0;
     if (s->norm_s > 0) { mean = s->norm_c; sd = s->norm_s; }   /* "norm": the scan's fixed normalisation (ufsm scanprep median / scale) instead of the window z-score */
+    else if (c->scan_norm) { float cc, ss; if (!scan_norm_of(s, l, &cc, &ss)) { mean = cc; sd = ss; fixed_norm = 1; } }   /* --scan-norm: the scan's per-level statistics */
     if (nhb) { IGN_REAL(); hold_fill(ign, (const int32_t (*)[6])hb, nhb, P, 1); }   /* (holdout mask: the targets, ink, rv and extra planes unknown there) */
     uint8_t *mask = big + 9 * p3;   /* ign lives here: fold CT > 0 into it */
     /* (MK: the loss mask at k; ign_zero: nothing ignored, the mask is the CT test alone and ign is not read) */
@@ -3242,7 +3261,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
     if (grec) {   /* the device's z-score and jitter (its noise from its own stream, seeded without a draw: the CPU path's draws follow unchanged) */
         grec->jitter = c->augment != 0; grec->ia = ia; grec->ib = ib; grec->isg = isg;
         grec->nseed = r->s[0] ^ rotl(r->s[2], 23) ^ ((uint64_t)i << 48);
-        grec->fixed = s->norm_s > 0; grec->fmean = (float)mean; grec->fisd = (float)(1.0 / sd); grec->xfmt = c->xfmt;
+        grec->fixed = fixed_norm; grec->fmean = (float)mean; grec->fisd = (float)(1.0 / sd); grec->xfmt = c->xfmt;
     }
     double (*params)[4]=nullptr;
     if (c->sheet) {

@@ -73,6 +73,17 @@ statistics 1e-7, logits 5e-3 of 6.2; EMA-weight set; checkpoint round trip bit-i
 backward), test_unet~GN_EMA=1 (fp32 finite differences with down norms: worst 7.5e-5 over 60 params; tensor cores vs fp32 logits
 0.061 of 6.6). Train smoke (u1 widths, P 256, warm-up 10): losses continuous across the switch to constants.
 
+**Per-scan input normalisation** (`--scan-norm 1`, unet_cfg.scan_norm, src/scannorm.c): the CT input is (v - center) / scale with one
+(center, scale) per scan and level instead of each window's mean / sd: the mean and sd of the nonzero voxels in 48 boxes of 32^3 at
+the working level, centred on nonzero voxels of a coarse level (the first of L + 2 .. L + 9 with <= 2^26 voxels read whole, else the
+smallest subsampled every st-th voxel) at fixed ranks: a deterministic function of the volume. The sampler computes it on the first
+window per (source, level) (a source's "norm" key wins; a failure keeps the window z-score, reported once); the checkpoint keeps
+`"scan_norm":1`, and predict computes the same numbers for its scan and level (`--norm MEAN,SD` overrides). Mean / sd rather than
+median / MAD: inside the mask the nonzero voxels are bimodal and the MAD follows the dominant mode only (1667 level 2: median 45,
+1.4826 MAD 10.4, papyrus at ~+7; mean / sd 62.9 / 37.6). On the unissl sources all 22 (source, level) pairs get statistics (center
+62.9-126, scale 28-56); predict on 1667 level 2 prints 62.9 / 37.59, the sampler's. test_scan_norm (wind fixture: deterministic
+across runs, in the checkpoint, predict = sampler, --norm overrides, the losses change).
+
 Found on the way (not fixed here): with the scratch1 sources at P 1024 on one card an early `inkfly gpu: out of device memory`
 falls back to the CPU and then segfaults in nn_ink_bits (cudaMemcpyAsync of an invalid host pointer, lab_upload kind 3); and
 the scratch1 data path holds ~7 GB of device memory outside the planner at P 512.

@@ -2420,6 +2420,7 @@ int cmd_train(int argc, char **argv) {
     { const char *ln = opt(argc, argv, "--l0-norm", "gn");   /* level-0 normalisation (unet_cfg.l0_norm): gn, none (affine + SiLU), ema (running statistics), ws (none + weight standardisation), slab (GroupNorm per z-slab) */
       cfg.l0_norm = !strcmp(ln, "none") ? 1 : !strcmp(ln, "ema") ? 2 : !strcmp(ln, "ws") ? 3 : !strcmp(ln, "slab") ? 4 : 0;
       if (!cfg.l0_norm && strcmp(ln, "gn")) { fprintf(stderr, "--l0-norm gn|none|ema|ws|slab\n"); return 2; }
+      cfg.scan_norm = atoi(opt(argc, argv, "--scan-norm", "0"));   /* 1: per-scan CT normalisation (scannorm.h; the net remembers it for predict) */
       cfg.gn_ema = atoi(opt(argc, argv, "--gn-ema", "0"));   /* 1: running GroupNorm statistics at every site (unet_cfg.gn_ema; --gn-ema-mom, --gn-ema-warm) */
       if (cfg.gn_ema && cfg.l0_norm) { fprintf(stderr, "--gn-ema 1: with --l0-norm gn only\n"); return 2; }
       cfg.l0_slab = atoi(opt(argc, argv, "--l0-slab", "64")); }   /* slab: planes per GroupNorm slab */
@@ -2458,7 +2459,7 @@ int cmd_train(int argc, char **argv) {
         if (!cfg.attn_deform && (cfg.attn_dco || cfg.attn_dinit)) { fprintf(stderr, "--attn-dcoarse / --attn-deform-init: need --attn-deform\n"); return 2; }
     }
     cfg.w4_2d = atoi(opt(argc, argv, "--w4-2d", "0"));   /* consistent fp4 weights (unet_cfg.w4_2d): one scale per 32 x 32 block and tap */
-    if (resume) { unet_cfg pc; int st; if (!unet_peek(resume, &pc, &st)) { cfg.w4_2d = pc.w4_2d; cfg.down_norm = pc.down_norm; cfg.l0_norm = pc.l0_norm; cfg.l0_slab = pc.l0_slab; cfg.gn_ema |= pc.gn_ema; cfg.scale_cond = pc.scale_cond; cfg.film = g_film = pc.film; memcpy(cfg.dec_widths, pc.dec_widths, sizeof cfg.dec_widths); cfg.ds_levels = pc.ds_levels; memcpy(cfg.dec_convs, pc.dec_convs, sizeof cfg.dec_convs); memcpy(cfg.enc_blocks, pc.enc_blocks, sizeof cfg.enc_blocks);
+    if (resume) { unet_cfg pc; int st; if (!unet_peek(resume, &pc, &st)) { cfg.w4_2d = pc.w4_2d; cfg.down_norm = pc.down_norm; cfg.l0_norm = pc.l0_norm; cfg.l0_slab = pc.l0_slab; cfg.gn_ema |= pc.gn_ema; cfg.scan_norm |= pc.scan_norm; cfg.scale_cond = pc.scale_cond; cfg.film = g_film = pc.film; memcpy(cfg.dec_widths, pc.dec_widths, sizeof cfg.dec_widths); cfg.ds_levels = pc.ds_levels; memcpy(cfg.dec_convs, pc.dec_convs, sizeof cfg.dec_convs); memcpy(cfg.enc_blocks, pc.enc_blocks, sizeof cfg.enc_blocks);
                   cfg.attn_blocks = pc.attn_blocks; cfg.attn_pe = pc.attn_pe; cfg.attn_reg = pc.attn_reg; cfg.attn_mlp = pc.attn_mlp; cfg.attn_vres = pc.attn_vres; cfg.attn_axis = pc.attn_axis; cfg.attn_repeat = pc.attn_repeat; cfg.attn_mem = pc.attn_mem; cfg.view_P = pc.view_P; cfg.view_patch = pc.view_patch;
                   cfg.attn_deform = pc.attn_deform; cfg.attn_dlev = pc.attn_dlev; cfg.attn_dco = pc.attn_dco; cfg.attn_dinit = pc.attn_dinit; } }   /* the checkpoint decides */
     if (cfg.w4_2d) fprintf(stderr, "weights: consistent MX-fp4 (--w4-2d 1): one scale per 32 x 32 block and tap, the same values in the forward and backward-data\n");
@@ -2713,6 +2714,7 @@ int cmd_train(int argc, char **argv) {
     if (g_axr && split) { fprintf(stderr, "--attn-axis radial / --attn-pe scroll / --attn-deform-init normal: not with --split z\n"); return 2; }
     if (g_axr && !cfg.attn_deform) fprintf(stderr, "attention: %s, %s positions around each window's scroll axis\n", cfg.attn_axis ? "radial (along the rays from the axis)" : "full", cfg.attn_pe == 3 ? "scroll RoPE" : "grid");
     if (g_axr && cfg.attn_deform) fprintf(stderr, "attention: deformable offsets in each token's normal / tangent / axis frame around the window's scroll axis\n");
+    sc.scan_norm = cfg.scan_norm;   /* --scan-norm (a resume: the checkpoint's) */
     sc.deterministic = atoi(opt(argc, argv, "--det", "0"));   /* same batches for the same seed regardless of thread timing (paired comparisons; off: a slow worker can stall the ring) */
     /* (--det 1 fixes the batches and the seeds, not the last float bit: the bias and weight gradients are summed across blocks with
        atomicAdd (lp_f4wgrad.cuh, lp_f8wgrad.cuh, lp_s2.cu, lp_mx_conv1.cu, lp_mx_gnbwd.cu), so ~300 of 12.6 M parameters differ by one
