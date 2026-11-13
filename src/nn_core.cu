@@ -574,19 +574,35 @@ extern "C" void nn_offload_copy(void *dst, const void *src, size_t n, int to_hos
     static int sy = -1; if (sy < 0) sy = getenv("UFSM_OFFLOAD_SYNC") != nullptr;   /* debug: every offload copy completes before the call returns (a missing event wait shows as a changed result) */
     if (sy) CK(cudaDeviceSynchronize());
 }
-cudaEvent_t g_ev[NPROF][2];
-int g_evk[NPROF], g_nev, g_ev_init;
-extern "C" void nn_prof_begin(int k) {
-    if (!g_ev_init) { for (int i = 0; i < NPROF; i++) { cudaEventCreate(&g_ev[i][0]); cudaEventCreate(&g_ev[i][1]); } g_ev_init = 1; }
-    if (g_nev >= NPROF) return;
-    g_evk[g_nev] = k; cudaEventRecord(g_ev[g_nev][0], 0);
+/* UFSM_PROF event pairs per device (created on that device on first use): under --split the two GPUs' ops record on their own
+   devices (one global set made on GPU 0 failed on GPU 1 with "invalid resource handle"); collect sums both GPUs' times */
+struct prof_dev_t { cudaEvent_t ev[NPROF][2]; int k[NPROF], n, init; };
+static prof_dev_t *g_profd[8];
+static prof_dev_t *prof_dev(void) {
+    int d = 0; cudaGetDevice(&d); d &= 7;
+    if (!g_profd[d]) {
+        prof_dev_t *p = (prof_dev_t *)calloc(1, sizeof *p);
+        for (int i = 0; i < NPROF; i++) { cudaEventCreate(&p->ev[i][0]); cudaEventCreate(&p->ev[i][1]); }
+        g_profd[d] = p;
+    }
+    return g_profd[d];
 }
-extern "C" void nn_prof_end(void) { if (g_nev < NPROF) { cudaEventRecord(g_ev[g_nev][1], 0); g_nev++; } }
+extern "C" void nn_prof_begin(int k) {
+    prof_dev_t *p = prof_dev();
+    if (p->n >= NPROF) return;
+    p->k[p->n] = k; cudaEventRecord(p->ev[p->n][0], 0);
+}
+extern "C" void nn_prof_end(void) { prof_dev_t *p = prof_dev(); if (p->n < NPROF) { cudaEventRecord(p->ev[p->n][1], 0); p->n++; } }
 extern "C" void nn_prof_collect(double *out, int nk) {
-    cudaDeviceSynchronize();
+    int cur = 0; cudaGetDevice(&cur);
     for (int i = 0; i < nk; i++) out[i] = 0;
-    for (int i = 0; i < g_nev; i++) { float ms = 0; cudaEventElapsedTime(&ms, g_ev[i][0], g_ev[i][1]); if (g_evk[i] < nk) out[g_evk[i]] += ms; }
-    g_nev = 0;
+    for (int d = 0; d < 8; d++) {
+        prof_dev_t *p = g_profd[d]; if (!p) continue;
+        cudaSetDevice(d); cudaDeviceSynchronize();
+        for (int i = 0; i < p->n; i++) { float ms = 0; cudaEventElapsedTime(&ms, p->ev[i][0], p->ev[i][1]); if (p->k[i] < nk) out[p->k[i]] += ms; }
+        p->n = 0;
+    }
+    cudaSetDevice(cur);
 }
 /* UFSM_PTICK=1: phase timer. nn_ptick(name) synchronises the device and adds the wall time since the previous tick to the bucket name
    (the phase that just ended); nn_ptick(nullptr) only restarts the clock; nn_ptick_report prints and resets. Off: a load and a branch. */

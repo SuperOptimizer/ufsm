@@ -618,13 +618,14 @@ static void ar_phase(float *const *g, const size_t *o, const size_t *m, int add)
             if (k >= nk[i]) continue;
             const int s = 1 - i, b = (int)(k & 1); const size_t off = o[i] + k * ch, len = (k + 1) * ch <= m[i] ? ch : m[i] - k * ch;
             cudaSetDevice(g_ar.dev[s]);
-            CK(cudaStreamWaitEvent(g_ar.sd[s], g_ar.ev[s][b][1], 0));   /* the pinned buffer's previous H2D is done (this phase, the last phase or step; never recorded: no wait) */
+            CK(cudaStreamWaitEvent(g_ar.sd[s], g_ar.ev[i][b][1], 0));   /* the pinned buffer's previous H2D is done (this phase, the last phase or step; never recorded: no wait).
+                                                                           ev[i][b][1]: made on the destination i, recorded on its su[i] (an event made on s failed there: invalid resource handle) */
             CK(cudaMemcpyAsync(g_ar.pin[s][b], g[s] + off, len * 4, cudaMemcpyDeviceToHost, g_ar.sd[s]));
             CK(cudaEventRecord(g_ar.ev[s][b][0], g_ar.sd[s]));
             cudaSetDevice(g_ar.dev[i]);
             CK(cudaStreamWaitEvent(g_ar.su[i], g_ar.ev[s][b][0], 0));
             CK(cudaMemcpyAsync(add ? (void *)g_ar.rb[i][b] : (void *)(g[i] + off), g_ar.pin[s][b], len * 4, cudaMemcpyHostToDevice, g_ar.su[i]));
-            CK(cudaEventRecord(g_ar.ev[s][b][1], g_ar.su[i]));
+            CK(cudaEventRecord(g_ar.ev[i][b][1], g_ar.su[i]));
             if (add) ar_add_k<<<nblk(len, 256), 256, 0, g_ar.su[i]>>>(g[i] + off, g_ar.rb[i][b], len);   /* (rb[i][b] is next written on this stream: ordered) */
         }
     for (int i = 0; i < 2; i++) {   /* the phase's end: each device's D2H stream and H2D stream joined */

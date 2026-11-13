@@ -139,8 +139,6 @@ extern "C" void nn_stream_wait(int copy_stream_waits, void *e);
 extern "C" void nn_event_sync(void *e);
 /* ---- event profiler: GPU timestamps around ops, no host syncs ---- */
 #define NPROF 8192
-extern cudaEvent_t g_ev[NPROF][2];
-extern int g_evk[NPROF], g_nev, g_ev_init;
 extern "C" void nn_prof_begin(int k);
 extern "C" void nn_prof_end(void);
 /* sums elapsed ms per category into out[nk], resets */
