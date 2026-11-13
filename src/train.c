@@ -3236,6 +3236,10 @@ int cmd_train(int argc, char **argv) {
             free(cov);
             sampler_hostmem(sq, stderr, 0);
             uint64_t prod = 0, rej = 0; sampler_stats(sq, &prod, &rej); fprintf(stderr, "sampler-only: produced %llu rejected %llu\n", (unsigned long long)prod, (unsigned long long)rej);
+            { dcache_stats dc; dcache_get_stats(&dc); phase_onfly_stats po; phase_onfly_get_stats(&po);   /* (perf2: how much of the on-the-fly labels the derived cache served) */
+              fprintf(stderr, "sampler-only: derived cache %llu cells from memory, %llu from disk, %llu computed (%.1f s); onfly phase %llu reads, %llu tiles, %.1f s in the pair rule\n",
+                      (unsigned long long)dc.cells_mem, (unsigned long long)dc.cells_disk, (unsigned long long)dc.cells_computed, dc.s_compute,
+                      (unsigned long long)po.reads, (unsigned long long)po.tiles, po.s_pair); }
             sampler_prof_print(sq);
             store_io_report(stderr); fprintf(stderr, "z3: %llu chunks decoded straight into the window\n", (unsigned long long)z3_sink_chunks());
             { FILE *io = fopen("/proc/self/io", "r"); char ln[128]; while (io && fgets(ln, sizeof ln, io)) if (!strncmp(ln, "rchar", 5) || !strncmp(ln, "read_bytes", 10)) fprintf(stderr, "proc io: %s", ln); if (io) fclose(io); }
