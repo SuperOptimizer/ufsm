@@ -6,6 +6,88 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## The from-scratch net's whole-window field: measured ERF, seams, LR probe (2026-11-13, branch rfwide-20261113)
+
+The next universal latent net (from scratch, all heads, one 1024^3 window split across both desk cards) is nlev 6, widths
+256,320,384,448 + deep levels 288,288, 4 full-attention blocks with scroll RoPE on the 8^3-cell bottleneck (~92 M params): flags
+`--widths 256,320,384,448,288,288 --attn-blocks 4 --attn-pe scroll`. Planner (13.3 GB per card, the scratch1 heads): 12.35 GB at
+P 1024 x Pz 512 (the split proxy) vs 12.32 GB without the deep levels / attention; 4.09 GB at P 512 on one card. Theoretical RF:
+nlev 4 103 cells, nlev 5 215, nlev 6 439 (> the 256-cell window; the attention is global on the bottleneck anyway).
+
+**Seams** (inkpod-12000 ink, 1299 box 1024^3 at level 2, windows 512 + 2 halo; y / x seam steps, interior medians 0.05-0.3):
+
+| halo | per-window GN + z-score | GN frozen (pooled) | fixed --norm | both |
+|---|---|---|---|---|
+| 16 | 15.4 / 26.6 | 13.8 / 11.0 | 15.3 / 24.9 | 6.2 / 6.9 |
+| 64 | 28.3 / 11.7 | 5.0 / 10.6 | 28.0 / 10.1 | - |
+| 256 | 5.8 / 6.7 | 0.3 / 2.2 | - | 0.0 / 0.1 |
+
+Three causes: the halo below the RF radius, GroupNorm's whole-window statistics and the per-window input z-score. Pooled frozen
+statistics at inference shift the outputs (ink mean 42 -> 33): the fix belongs in training (EMA GroupNorm at all levels, a
+per-scan input z-score), next on this branch.
+
+**Measured ERF** (`UFSM_ERF=DELTA` in train, `--lat` with the streamed head: the first training window forwarded, DELTA = 1 added to
+the central 4^3 cells (16^3 voxels) of the z-scored CT, forwarded again; per cell the largest |logit change| of the first 16 head
+channels, by Chebyshev distance r to the block. `UFSM_ERF_GNFROZEN=1` normalises the perturbed forward with the base forward's
+GroupNorm statistics (`unet_gn_freeze_train`, diagnostics only): convolution reach alone. `UFSM_ERF_REPEAT=1`: 0 change everywhere,
+the forward is deterministic.) unissl sources, P 1024 (256^3 cells) unless noted:
+
+| net | GN | centre | r 32 | r 48 | r 56 | r >= 64 | far floor / centre | r50 / r90 |
+|---|---|---|---|---|---|---|---|---|
+| u1 random | live | 0.744 | 0.498 | 0.500 | 0.225 | 0.12-0.15 | 0.18 | 94 / 120 |
+| u1 trained (last.ckpt) | live | 0.448 | 0.282 | 0.268 | 0.269 | 0.25-0.27 | **0.58** | 100 / 122 |
+| u1 trained | frozen | 0.446 | 0.267 | 0.156 | 0.043 | **0** | 0 | 39 / 51 |
+| 92 M random, P 768 | frozen | 0.872 | 0.660 | 0.743 | 0.737 | 0.45-0.69 (to r 94) | 0.47 | 70 / 89 |
+| 92 M random, P 768 | live | 0.914 | 0.666 | 0.751 | 0.745 | 0.45-0.70 | 0.45 | 70 / 89 |
+
+- u1's convolution reach ends at r ~ 56-60 cells (the theoretical 51.5 + the block), +-230 voxels of a 1024 window: the outer
+  ~40% of each axis never sees the window's centre and vice versa.
+- In trained u1 the whole-window GroupNorm coupling is larger than the convolution signal: a 16^3-voxel change moves every logit of
+  the window by 58% of the change at the block itself, flat to the corners. This is the window dependence behind the seams
+  (and why a window's outputs change with its extent); EMA GroupNorm removes it by construction.
+- The 92 M net covers the whole window by convolution + attention alone (frozen: 47% of the centre change at the corners, r 94
+  at P 768); random-init ERFs are wider than trained ones, the trained number comes with the first snapshot.
+
+**LR probe** (the 92 M net at P 512 B 1 on one card, from scratch on sources-scratch1.json, --det 1 seed 7 so every arm sees the
+same windows, 300 steps, warmup 50, WSD cooldown 0.2, AdamW 1e-3, 0.60 samp/s): mean logged loss over steps 200-300 Muon 0.005
+1.710, 0.01 1.719, 0.02 1.721 (per-head at 300 within 0.01 of each other); none unstable. 300 steps at B 1 do not separate the
+arms (differences ~0.01, 5 logged points); the earlier voxel-net sweep (F1 0.307 / 0.296 / 0.290 at 0.01 / 0.02 / 0.05) stays the
+basis: Muon 0.01, AdamW 1e-3, warmup 1000, WSD cooldown 0.2.
+
+**fib-head + fstem** (1f881bf): `--fstem` refused `--fib-head` ("25 outputs (16 at most)"): the head pads past 16 outputs to 32
+and the fine stem counted the 9 unsupervised pad channels. It now maps into the supervised voxel outputs only (phase 2, wind4 2,
+ink 1, rv 2, fibre 9 = 16, the stem kernel's limit); test_fibhead_train covers --lat 4 --fstem 16 --ink-head 1 --fib-head 1.
+
+**EMA GroupNorm at every site** (`--gn-ema 1`, unet_cfg.gn_ema; `--gn-ema-mom 0.01 --gn-ema-warm 500`): all GroupNorms (every level's
+blocks, the down norms, the attention stage, the head's input) normalise with running statistics (BatchNorm-style, [mean | var] per
+group in the gn_sites layout; the first warm training forwards use their own statistics, after that training forwards are constants
+in forward and backward, the backward without the statistics' terms, nn_set_gn_const; inference uses the running statistics as soon
+as there are any). The sites hold the constants before the convs run (ge_begin), the convs write their live statistics to twins
+(ge_dst) that ge_after pools into the running set after dec[0]; the EMA weights keep their own set (unet_ema), forwards with the
+EMA weights (the SSL teacher) do not update. Checkpoints: header keys `gn_ema`, `ge_n`, `ge_warm`, `ge_mom`, `ge_run` only when on
+(no new parameters: an old checkpoint loads into a gn_ema net as a fresh warm-up; u1-size net 448 floats, 31 KB header). Needs
+`--l0-norm gn`. Multi-GPU data parallel: each card keeps its own statistics (card 0's are saved); with --split z the cards share one
+window, so their statistics agree. Tests: test_gn_ema (both a down-norm net and an attention net: the warm-up then the running blend
+at every site to 1e-4; a far-corner input change leaves the logits bit-identical, live GN moves them; momentum 1 reproduces live GN,
+statistics 1e-7, logits 5e-3 of 6.2; EMA-weight set; checkpoint round trip bit-identical; old checkpoint = fresh warm-up; finite
+backward), test_unet~GN_EMA=1 (fp32 finite differences with down norms: worst 7.5e-5 over 60 params; tensor cores vs fp32 logits
+0.061 of 6.6). Train smoke (u1 widths, P 256, warm-up 10): losses continuous across the switch to constants.
+
+**Per-scan input normalisation** (`--scan-norm 1`, unet_cfg.scan_norm, src/scannorm.c): the CT input is (v - center) / scale with one
+(center, scale) per scan and level instead of each window's mean / sd: the mean and sd of the nonzero voxels in 48 boxes of 32^3 at
+the working level, centred on nonzero voxels of a coarse level (the first of L + 2 .. L + 9 with <= 2^26 voxels read whole, else the
+smallest subsampled every st-th voxel) at fixed ranks: a deterministic function of the volume. The sampler computes it on the first
+window per (source, level) (a source's "norm" key wins; a failure keeps the window z-score, reported once); the checkpoint keeps
+`"scan_norm":1`, and predict computes the same numbers for its scan and level (`--norm MEAN,SD` overrides). Mean / sd rather than
+median / MAD: inside the mask the nonzero voxels are bimodal and the MAD follows the dominant mode only (1667 level 2: median 45,
+1.4826 MAD 10.4, papyrus at ~+7; mean / sd 62.9 / 37.6). On the unissl sources all 22 (source, level) pairs get statistics (center
+62.9-126, scale 28-56); predict on 1667 level 2 prints 62.9 / 37.59, the sampler's. test_scan_norm (wind fixture: deterministic
+across runs, in the checkpoint, predict = sampler, --norm overrides, the losses change).
+
+Found on the way (not fixed here): with the scratch1 sources at P 1024 on one card an early `inkfly gpu: out of device memory`
+falls back to the CPU and then segfaults in nn_ink_bits (cudaMemcpyAsync of an invalid host pointer, lab_upload kind 3); and
+the scratch1 data path holds ~7 GB of device memory outside the planner at P 512.
+
 ## predict --window auto on a shared card: UFSM_MEM_FREE_GB budget, interior cap 1024 (2026-11-12, branch winauto-20261112)
 
 Pod 3 (one RTX PRO 6000, 98 GB), two unroll lanes: PHerc0814's ink pass (`--window auto`, feathered, halo 32) started on a nearly
@@ -188,9 +270,59 @@ down, so the numbers below come from commit messages only:
   - Logged as `ink-ssl L (gated % of the cells, ink % of the gated)`.
   - test_ssl (5): targets and gradient against the host. test_heads (8e): a fixture run with the ink head.
   - Not with UFSM_SSL_SLABS=1 (the term rides on the skip path).
+- `--ssl-heads LIST` (11-12, user: "can we dino for all things the universal model supports"; c8eaa09) generalises `--ssl-ink` to
+  every head that a self-trained target can be checked for. `--ssl-ink W` is now `ink:W`, and its log marker is ` ssl-ink`.
+  - The same mechanism: the teacher's coarse head per chunk of cell planes, targets round(254 p) per enabled channel and cell
+    (255 = none) at the cells the student sees, the student's soft BCE on its own coarse logits in the skip path. One target
+    kernel and one gradient kernel over a per-head spec (`nn_sslh_targets` / `nn_sslh_grad`, ssl.h), replacing the ink pair.
+  - Gates per head (thresholds are flags):
+
+    | head (channels) | gate | papyrus |
+    |---|---|---|
+    | ink (11), dens (8), fib H / V (14-15) | each channel where \|p - 0.5\| >= `--ssl-conf` 0.3 (ink: `--ssl-ink-conf`) | yes |
+    | rv (12-13) | the same | no (papyrus vs void is what rv learns) |
+    | normal n n^T (2-7) | all six where \|N\|_F >= `--ssl-norm-conf` 0.8, N from the head's coding (1 for a clean unit dyad) | yes |
+    | phase cos / sin (0-1) | the pair where \|(2c - 1, 2s - 1)\| >= `--ssl-phase-conf` 0.7 | yes |
+
+    The papyrus gate is the teacher's (max of the rv pair >= 0.5, so --rv 2), `--ssl-pap 0` drops it (tests).
+  - Not self-trained: wind4 (its integer gauge is exactly what self-training cannot validate) and the fibre axis (rare, noisy
+    where wrong). No symmetry-agreement pass for the normals in v1: it would cost a second teacher forward per SSL window.
+  - Weights `name:W`, default `--ssl-heads-w` 0.25; per head W x the mean BCE over its targeted entries. Logged per head as
+    ` ssl-<head> L (g% gated)`.
+  - Default: none on. A head is self-trained only after it beats its reference teacher, else the term reinforces its errors.
+  - Memory: a byte per enabled channel and cell (16.8 MB per channel at P 1024), now counted by the planner (the old ink buffer
+    was not).
+  - Tests (desk GPU 0, 11-12 15:20, both pass): test_ssl (5) every mode in one spec vs the host (targets, counts, gradient against the formula and central
+    differences, per-head sums) at two normal thresholds; test_heads (8e) the `--ssl-ink` alias, (8f) five heads at confidence 0
+    finite and covering 30-90 % of the cells, a missing head refused.
+    test_ssl numbers: 512 cells, gated ink 165, rv 215 + 207, normal 236 (conf 0.8) / 185 (conf 1.2), phase 208, dens 152; 0 target
+    bytes differ; gradient worst 5.0e-7 against the formula and 5.0e-7 against central differences, of a largest 1.8e-3.
+  - Measurement: a paired short run with / without `--ssl-heads` from the same snapshot (wbench p05x, rv, the 34 ink crops, the
+    fibre judge), gated on unissl's 2000 / 4000 wbench rows showing the trunk term neutral or better.
 - Holdouts: inkB added the 10 extra crops to holdouts-ink.json ("inkeval-ho", 98 boxes), on the 0500P2 2.215 um and 0841 2.403 um
   scans. Those two volumes reject 5 / 6 boxes. `EXCLVOL` leaves out 0841's 9.366 um scan (the boxes are not mapped into it) and
   0500P2's 9.362 um scan (a labelled source already), so 35 unlabelled volumes remain.
+
+- unissl, the trunk term on desk GPU 1 (11-12 12:50 - 19:42, from unified/last.ckpt step 1504; ink off, --ssl 16 --ssl-share 0.25,
+  35 unlabelled scans): no collapse (std 0.234-0.243 against the 0.25 floor, cosine 0.19 -> 0.11, 40 % of the cells targeted), the
+  unlabelled share settles at 25 % after a startup skew (48 %: cheap windows fill the replay slots first). Two run faults, both fixed:
+  the inserted side head was never initialised on a resume (c46d58f) and nn_w4runs_label aborted on a full card (a5520d5).
+  wbench core p05x against unified-1504, all 44 rows, paired bootstrap: 2000 +0.001 [-0.013, +0.013], 4000 -0.007 [-0.018, +0.002],
+  6000 -0.017 [-0.036, -0.000] (latres, 39 clean boxes: -0.018, P(better) 0.04). A monotone slide, but unissl has no control: since
+  1504 the SSL term, the dropped ink sources / loss and 4500 more steps all changed.
+- Attribution, sslpair (11-12 19:45-): three arms from unissl snap/4000 back to back on GPU 1, --det 1 (identical windows), 1500
+  steps cooled to 5500 (wsd): ctrl (--ssl 16, no unlabelled source: the term never runs), ssl (unissl as is), heads (ssl +
+  --ssl-heads rv,dens,normal,phase). ctrl vs ssl attributes the slide; ssl vs heads is the heads term. --det costs ~15 % (212 vs 250
+  Mvox/s). Caveat: 1500 steps against a 0.017 effect (MDE ~0.02): a null is not evidence of no effect.
+
+- Closed 11-12 ~22:00 (user: "cancel the dino and the standalone ink training"; the pods went away). Where it stands:
+  - sslpair: ctrl reached 5300 (snap 4000 / 4500 / 5000 kept; one OOM kill at 21:19), ssl and heads never ran. unissl's slide after
+    2000 stays unattributed (SSL term vs dropped ink vs more steps).
+  - pod3dino (pod 3, RTX PRO 6000, from unissl 6773, trunk + --ssl-heads rv,dens,normal,phase, 6 labelled + 27 unlabelled sources): ran
+    ~480 steps before the pod went, no snapshot saved. 1040 Mvox/s (1.0 s/step, 4x the desk), loader wait 5 %, SM 100 % busy at B 1
+    (dmon; memory bandwidth 33-53 %, 20.7 of 97 GB), so B > 1 under --ssl was not needed. ssl 0.069, std 0.246; heads gated rv 24.5 %,
+    normal 19.2 %, dens 2.3 %, phase 2.7 % (the papyrus and magnitude gates leave dens / phase sparse at default thresholds).
+  - Code kept, off by default: --ssl, --ssl-heads (tests pass), the CT draw index for ct_only scans, side-head insertion on resume.
 
 **Code.**
 - Sources take `"ssl": 1` (CT only, no targets; `holdout_reject` for the wbench boxes).
