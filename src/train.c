@@ -4655,6 +4655,17 @@ int cmd_train(int argc, char **argv) {
                                                  (unsigned long long)(o1.reads - o0.reads), (unsigned long long)(o1.tiles - o0.tiles), (unsigned long long)(o1.gpu_tiles - o0.gpu_tiles),
                                                  1e3 * (o1.s_pair - o0.s_pair) / (double)(o1.reads - o0.reads), 1e3 * (o1.s_read - o0.s_read) / (double)(o1.reads - o0.reads));
                 o0 = o1; }
+            {   /* device memory growth after step 2: all buffers should be allocated by then (2026-11-13: a per-step thread-local leak in split_run's
+                   threads took 0.3 GB / step / GPU at P 1024 until the ink MIL backward's cudaMalloc failed, ~20 steps in). Each GPU's free memory
+                   at a log line against the reference: a drop of more than 64 MB is reported (any allocator, cudaMalloc included) */
+                static size_t lowfree[16]; static int nwarn;
+                if (step >= 2 && nwarn < 20) for (int g = 0; g < ng && g < 16; g++) {
+                    nn_init(G[g].dev); const size_t f = nn_mem_free();
+                    if (!lowfree[g]) lowfree[g] = f;   /* (the reference moves only on a report: a slow leak adds up to one) */
+                    else if (f + ((size_t)64 << 20) < lowfree[g]) { fprintf(stderr, "  warning: GPU %d device memory free fell %.0f MB since an earlier log line (now %.0f MB free): an allocation after the first steps\n", G[g].dev, (lowfree[g] - f) / 1e6, f / 1e6); nwarn++; lowfree[g] = f; }
+                }
+                if (ng > 1) nn_init(G[0].dev);
+            }
             { static int memlog = -1; if (memlog < 0) memlog = ufsm_env_on("UFSM_SYNC_CHECK");   /* device memory free per GPU at each log line (a leak) */
               if (memlog) { fprintf(stderr, "  device memory free:"); for (int g = 0; g < ng; g++) { nn_init(G[g].dev); fprintf(stderr, " GPU %d %.1f MB", G[g].dev, nn_mem_free() / 1e6); } fprintf(stderr, "\n"); nn_init(G[0].dev); } }
             { static int hm = -1, hmn = 0; if (hm < 0) hm = ufsm_env_on("UFSM_HOSTMEM");   /* host memory by owner at each log line (sampler_hostmem) */
