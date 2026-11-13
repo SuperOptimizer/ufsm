@@ -25,6 +25,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#include <ftw.h>
+#include <sys/stat.h>
 
 static const char *g_cache;   /* chunk cache dir for HTTPS stores; from the sources file or sources_set_cache */
 
@@ -133,7 +135,31 @@ static char *sdup(const char *s) { return s ? strdup(s) : nullptr; }
    {"meshes": {"dir", "value" ("q.tif"), "map" (a reg.json: the meshes' scan -> this source's), "level" (the codes' CT level; default plev)}}:
    the codes rasterised on read from the q-assigned meshes (meshcodes.h mesh_codes_open) at level + extra directly (a stored level-L+1
    raster, not the pooled level L: 8x fewer voxels rasterised), then pool2 poolings. key: the dcache key of the phase derived from them
-   ("" without meshes: the stored codes' phase is not cached). nullptr (reported) on failure */
+   (stored codes: stored_codes_key; "" for remote roots: not cached). nullptr (reported) on failure */
+/* the dcache key of the phase of stored codes root/ck (local directories only; "" otherwise: no cache): the array's real path, its
+   zarr.json's mtime and size, and the newest mtime, count and total size of the files under it (a rewritten codes array changes them),
+   plus the 2x poolings applied. 2026-11-13: only the meshes path had a key, so the stored-codes phase (sources-scratch1: P4 june / july
+   4.8, 1667 A / B, 0139, 0500P2, 1218, 1299, 0172) ran the pair rule on every read, on the training GPU: ~14 % of the 92 M net's GPU
+   time at P 512 (nsys: k_bg_env 7.2 %, k_ll_sub 5.7 %). UFSM_ONFLY_STORED_NOCACHE=1: the old behaviour */
+static _Thread_local struct { int64_t newest, size; long n; } t_sk;
+static int sk_visit(const char *p, const struct stat *st, int fl, struct FTW *fw) {
+    (void)p; (void)fw;
+    if (fl == FTW_F) { const int64_t t = (int64_t)st->st_mtim.tv_sec * 1000000000 + st->st_mtim.tv_nsec; if (t > t_sk.newest) t_sk.newest = t; t_sk.size += st->st_size; t_sk.n++; }
+    return 0;
+}
+static void stored_codes_key(const char *root, const char *ck, int npool, char *key, size_t nkey) {
+    key[0] = 0;
+    if (!root || strstr(root, "://") || (getenv("UFSM_ONFLY_STORED_NOCACHE") && strcmp(getenv("UFSM_ONFLY_STORED_NOCACHE"), "0"))) return;
+    char dir[4096], rp[4096], zj[4200]; struct stat st;
+    snprintf(dir, sizeof dir, "%s%s%s", root, ck && *ck ? "/" : "", ck ? ck : "");
+    if (!realpath(dir, rp)) return;
+    snprintf(zj, sizeof zj, "%s/zarr.json", rp);
+    if (stat(zj, &st)) return;
+    t_sk.newest = 0; t_sk.size = 0; t_sk.n = 0;
+    if (nftw(rp, sk_visit, 16, FTW_PHYS)) return;
+    snprintf(key, nkey, "stored-codes %s zj %lld.%09ld %lld files %ld %lld newest %lld -pool%d%s", rp, (long long)st.st_mtim.tv_sec, st.st_mtim.tv_nsec,
+             (long long)st.st_size, t_sk.n, (long long)t_sk.size, (long long)t_sk.newest, npool, npool ? "b" : "");
+}
 static z3 *onfly_codes_open(const source *s, const json *e, const json *of, int extra, int plev, char *key, size_t nkey) {
     key[0] = 0;
     const json *mj = json_get(e, "meshes"); if (!mj && e != of) mj = json_get(of, "meshes");
@@ -153,6 +179,7 @@ static z3 *onfly_codes_open(const source *s, const json *e, const json *of, int 
         const char *cr = json_str(json_get(e, "root"), nullptr), *ck = json_str(json_get(e, "key"), "");
         store *cs = cr ? store_open(cr) : nullptr; cz = cs ? z3_open(cs, ck, nullptr) : nullptr;
         if (!cz) { fprintf(stderr, "sources: %s: phase onfly: cannot open the codes %s/%s\n", s->name, cr ? cr : "?", ck); return nullptr; }
+        stored_codes_key(cr, ck, extra + npool, key, nkey);   /* (2026-11-13: the stored codes' phase is cached too; "" for remote roots) */
         for (int q2 = 0; cz && q2 < extra; q2++) { z3 *q = codes_pool2_open(cz); if (!q) { z3_close(cz); cz = nullptr; } else cz = q; }
     }
     for (int q2 = 0; cz && q2 < npool; q2++) { z3 *q = codes_pool2_open(cz); if (!q) { z3_close(cz); cz = nullptr; } else cz = q; }

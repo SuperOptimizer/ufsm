@@ -47,8 +47,17 @@ PY
 C=(--task unwrap2 --levels 0,1 --P 64 --B 1 --gpus 0 --workers 2 --sampler-slots 4 --val-batches 0 --val-every 1000 --log-every 1 --ckpt-every 1000 --fp4 2
    --input-prec 8 --warmup 0 --seed 5 --wind4-tile 0 --widths 16,32,64 --det 1 --steps 4 --onfly-mb 64)
 "$U" train stored.json --out st "${C[@]}" > st.log 2>&1 || { echo "FAIL: stored-phase run ($D/st.log)"; exit 1; }
+# the onfly phase of stored codes goes through the derived-array cache (2026-11-13, sources.c stored_codes_key): the first run computes
+# the cells, a second run reads them back from disk; both log the stored run's losses, as does the uncached path
+export UFSM_DERIVED_CACHE=$PWD/dc; rm -rf dc
 "$U" train onfly.json --out of "${C[@]}" > of.log 2>&1 || { echo "FAIL: onfly run ($D/of.log)"; exit 1; }
 grep -q 'on-the-fly phase on GPU 0' of.log || { echo "FAIL: no onfly config line ($D/of.log)"; exit 1; }
-for f in st of; do grep '^step' $f.log | sed -E 's/ [0-9.]+ samp\/s.*//' > $f.txt; done
-[ -s st.txt ] && cmp -s st.txt of.txt || { echo "FAIL: stored vs onfly losses differ"; diff st.txt of.txt | head -4; exit 1; }
+grep -qE 'derived cache: .* [1-9][0-9]* computed' of.log || { echo "FAIL: the stored codes' onfly phase did not go through the cache ($D/of.log)"; exit 1; }
+"$U" train onfly.json --out of2 "${C[@]}" > of2.log 2>&1 || { echo "FAIL: onfly run, warm cache ($D/of2.log)"; exit 1; }
+grep -qE 'derived cache: .* [1-9][0-9]* from disk, 0 computed' of2.log || { echo "FAIL: the warm run did not read its phase cells from the disk cache ($D/of2.log)"; grep 'derived cache' of2.log | head -2; exit 1; }
+UFSM_ONFLY_STORED_NOCACHE=1 "$U" train onfly.json --out of3 "${C[@]}" > of3.log 2>&1 || { echo "FAIL: onfly run, no cache ($D/of3.log)"; exit 1; }
+! grep -q 'derived cache' of3.log || { echo "FAIL: UFSM_ONFLY_STORED_NOCACHE=1 still cached ($D/of3.log)"; exit 1; }
+unset UFSM_DERIVED_CACHE
+for f in st of of2 of3; do grep '^step' $f.log | sed -E 's/ [0-9.]+ samp\/s.*//' > $f.txt; done
+for f in of of2 of3; do [ -s st.txt ] && cmp -s st.txt $f.txt || { echo "FAIL: stored vs onfly ($f) losses differ"; diff st.txt $f.txt | head -4; exit 1; }; done
 echo "PASS: onfly phase byte-identical to phase-raster (CPU$( [ -f gpu.log ] && echo ', GPU')), training on it identical ($(wc -l < st.txt) steps)"
