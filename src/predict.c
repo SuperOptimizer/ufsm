@@ -2028,8 +2028,8 @@ static int predict_one(int argc, char **argv) {
        does (nn_seam_blend_u8) before the writer. sgo[g]: grid g's first tile in shards from the box origin (0 or 1 per axis) */
     int64_t sgo[2][3] = {{0}};
     if (seam2) {
-        if (!lhm || !gpath || stride != 2 * shard || !fullg || fea || nwork > 1 || resume || slab || sheet_task || ffd || atoi(opt(argc, argv, "--no-out", "0"))) {   /* (WR.skip is set by every --heads run: the main writer writes nothing) */
-            fprintf(stderr, "predict --seam-inproc: the --heads device path, window - 2 halo = 2 shards, --full-grid 1 (no --resume, --feather, --gpus workers, fit fields)\n"); return 2; }
+        if (!lhm || !gpath || stride != 2 * shard || !fullg || fea || nwork > 1 || resume || slab || sheet_task || (ffd && (!ffzm || tta > 1)) || atoi(opt(argc, argv, "--no-out", "0"))) {   /* (WR.skip is set by every --heads run: the main writer writes nothing) */
+            fprintf(stderr, "predict --seam-inproc: the --heads device path, window - 2 halo = 2 shards, --full-grid 1 (no --resume, --feather, --gpus workers, --fit-fields; --fit-zarr from grid 0's windows)\n"); return 2; }
         kss = 2;
         for (int g = 0; g < 2; g++) for (int d = 0; d < 3; d++) { int64_t r = (g * shard - bo[d]) % stride; if (r < 0) r += stride; sgo[g][d] = r / shard; }
     }
@@ -2616,7 +2616,7 @@ static int predict_one(int argc, char **argv) {
                 nn_fit_accum_dm(lg, ctd, ctm, Wz, W, hz, halo, (int)tz, (int)ty, (int)tx, ffbox, ffh, ffF, ff_rec, ff_ph, ff_nrm, ff_den, ffds, ffdc, ffacc);
                 if (ffw4d) nn_fit_accum_w4(lg, ctd, ctm, Wz, W, hz, halo, (int)tz, (int)ty, (int)tx, ffbox, ffh, ffF, ff_w4, ffw4d, ffacc4);
             }
-            if (ffzm && !(fea && t->noout)) {   /* (--feather: windows computed only for their spills write no fields) */ /* the window interior's whole cells, finalized into the field slab (flushed when the slab is left) */
+            if (ffzm && !(fea && t->noout) && !(seam2 && t->g)) {   /* (--seam-inproc: the fit fields from grid 0's windows alone, one pass) */   /* (--feather: windows computed only for their spills write no fields) */ /* the window interior's whole cells, finalized into the field slab (flushed when the slab is left) */
                 int c0[3], c1[3], nc3[3], ok = 1; const int64_t tw[3] = {tz, ty, tx};
                 /* per-shard windows are anchored on the global grid while the shards (and with them the field slabs and rows) start at the
                    box: with a box off the window grid (--grid-origin, (box - origin) % stride != 0) a window's interior covers two shards

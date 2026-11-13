@@ -137,14 +137,17 @@ void seam_clear_store(const char *dir) {
 /* in one process (UFSM_SEAM_INPROC=1): predict --seam-inproc 1 over the union of the two passes' boxes, shards S / 2, the run's --q,
    --levels; both tile grids in one window loop, each shard's two versions blended on the GPU before the writer (src/predict.c seam_t):
    no pass stores, no second start-up, no CPU blend */
+static int g_fitz;   /* --fit-zarr given (in-process only) */
 static int seamless_inproc(int argc, char **argv, int W, int H, int S2, int gpu) {
+    g_fitz = *sopt(argc, argv, "--fit-zarr", "") != 0;
     char **v = calloc((size_t)argc + 32, sizeof *v); int n = 0;
     char sb[160], sw[16], sh[16], ss[16], sg[16]; long long o[3], e[3];
     for (int d = 0; d < 3; d++) {
         long long la = g_lo[d] - 0, lb = g_lo[d] - S2, S = 2LL * S2;
         la = (la >= 0 ? la / S : -((-la + S - 1) / S)) * S; if (la < 0) la = 0;
         lb = (lb >= 0 ? lb / S : -((-lb + S - 1) / S)) * S + S2; if (lb < 0) lb = S2;
-        o[d] = la < lb ? la : lb; e[d] = g_hi[d] > o[d] ? g_hi[d] - o[d] : 1;
+        o[d] = g_fitz || la < lb ? la : lb;   /* (--fit-zarr: the box on grid 0, whose windows alone feed the fields: field slabs on its tiles) */
+        e[d] = g_hi[d] > o[d] ? g_hi[d] - o[d] : 1;
     }
     snprintf(sb, sizeof sb, "%lld,%lld,%lld,%lld,%lld,%lld", o[0], o[1], o[2], e[0], e[1], e[2]);
     snprintf(sw, sizeof sw, "%d", W); snprintf(sh, sizeof sh, "%d", H); snprintf(ss, sizeof ss, "%d", S2); snprintf(sg, sizeof sg, "%d", gpu);
@@ -167,8 +170,9 @@ int predict_seamless(int argc, char **argv) {
     const int mode = atoi(sopt(argc, argv, "--seamless", "0"));
     if (mode != 2) { fprintf(stderr, "predict --seamless: 2 (two passes on half-tile-shifted grids, sin^2 blend) is the one mode\n"); return 2; }
     if (argc < 6) { fprintf(stderr, "predict --seamless: needs the positional arguments (ufsm predict CKPT ROOT KEY OUT ...)\n"); return 2; }
-    if (*sopt(argc, argv, "--boxes", "") || *sopt(argc, argv, "--fit-zarr", "") || *sopt(argc, argv, "--feather", "")) {
-        fprintf(stderr, "predict --seamless: not with --boxes, --fit-zarr or --feather\n"); return 2; }
+    const int inproc = getenv("UFSM_SEAM_INPROC") && atoi(getenv("UFSM_SEAM_INPROC"));
+    if (*sopt(argc, argv, "--boxes", "") || (*sopt(argc, argv, "--fit-zarr", "") && !inproc) || *sopt(argc, argv, "--feather", "")) {
+        fprintf(stderr, "predict --seamless: not with --boxes or --feather; --fit-zarr only in-process (UFSM_SEAM_INPROC=1)\n"); return 2; }
     g_split = *sopt(argc, argv, "--split", "") != 0;
     { const char *b = sopt(argc, argv, "--box", nullptr); long long v[6];
       if (b && sscanf(b, "%lld,%lld,%lld,%lld,%lld,%lld", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) == 6) for (int d = 0; d < 3; d++) { g_lo[d] = v[d]; g_hi[d] = v[d] + v[3 + d]; }
@@ -180,7 +184,7 @@ int predict_seamless(int argc, char **argv) {
     int ga = atoi(sopt(argc, argv, "--gpu", "0")), gb = ga, par = 0;
     const char *gl = sopt(argc, argv, "--gpus", nullptr);
     if (gl && !g_split) { if (sscanf(gl, "%d,%d", &ga, &gb) == 2 && ga != gb) par = 1; else if (sscanf(gl, "%d", &ga) == 1) gb = ga; }
-    if (getenv("UFSM_SEAM_INPROC") && atoi(getenv("UFSM_SEAM_INPROC"))) return seamless_inproc(argc, argv, W, H, S2, ga);
+    if (inproc) return seamless_inproc(argc, argv, W, H, S2, ga);
     const char *out = argv[5]; const double q = atof(sopt(argc, argv, "--q", "8")); const int nlev = atoi(sopt(argc, argv, "--levels", "4"));
     const int shard = atoi(sopt(argc, argv, "--shard", "512")), nt = atoi(sopt(argc, argv, "--threads", "8"));
     if (shard < 128 || shard % 128 || nlev < 1 || q < 0) { fprintf(stderr, "predict --seamless: --shard a multiple of 128, --levels >= 1, --q >= 0\n"); return 2; }
