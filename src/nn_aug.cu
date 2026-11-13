@@ -9,6 +9,7 @@
 #include "scan_augment.h"
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
+#include <time.h>   /* (clock_gettime: nvcc + g++ got it through other headers, clang does not) */
 
 #define AUG_CN_BYTES ((size_t)64 << 20)   /* the correlated noise's chunk of planes */
 typedef struct {

@@ -39,7 +39,7 @@ int main(void) {
         total += cols - 1; free(X); free(Y); free(Z);
     }
     { char a1[300], a2[300]; snprintf(a1, sizeof a1, "%s/wraps", root); snprintf(a2, sizeof a2, "%s/strip", root);
-      char *av[] = {"ufsm", "strip", a1, a2, "--threads", "4", "--err", "0.05"}; CHECK(!cmd_strip(8, av), "ufsm strip failed"); }
+      char *av[] = {"ufsm", "strip", a1, a2, "--threads", "4", "--err", "0.05"}; CHECK(!cmd_strip((int)(sizeof av / sizeof *av), av), "ufsm strip failed"); }
     snprintf(p, sizeof p, "%s/strip/strip.json", root); FILE *f = fopen(p, "r"); char b[4096] = {0};
     if (f) { size_t nr = fread(b, 1, sizeof b - 1, f); (void)nr; fclose(f); }
     CHECK(strstr(b, "\"walk\": \"descending\""), "walk not outermost first: %s", b);
@@ -53,7 +53,7 @@ int main(void) {
     /* flatten: the exact development */
     { char a1[300]; snprintf(a1, sizeof a1, "%s/strip", root);
       char *av[] = {"ufsm", "strip-flatten", a1, "--stride", "96", "--threads", "4", "--stripe-px", "1500", "--iters", "60", "--cg", "300", "--tol", "1e-9"};
-      CHECK(!cmd_strip_flatten(16, av), "ufsm strip-flatten failed"); }
+      CHECK(!cmd_strip_flatten((int)(sizeof av / sizeof *av), av), "ufsm strip-flatten failed"); }
     snprintf(p, sizeof p, "%s/strip/flat/flat.json", root); f = fopen(p, "r"); memset(b, 0, sizeof b);
     if (f) { size_t nr = fread(b, 1, sizeof b - 1, f); (void)nr; fclose(f); }
     /* the analytic arc length from wrap k1's theta = pi to wrap k0's theta = -pi (the spiral's U from k1 + 1/2 down to k0 - 1/2) */
@@ -78,7 +78,7 @@ int main(void) {
         for (int k = 0; k < 2; k++) {
             char a1[300], a2[300]; snprintf(a1, sizeof a1, "%s/strip", root); snprintf(a2, sizeof a2, "%s/fj%s", root, jv[k]);
             char *av[] = {"ufsm", "strip-flatten", a1, "--out", a2, "--stride", "96", "--threads", (char *)jv[k], "--jobs", (char *)jv[k], "--stripe-jobs", (char *)jv[k], "--stripe-px", "1500", "--iters", "60", "--cg", "300", "--tol", "1e-9"};
-            CHECK(!cmd_strip_flatten(22, av), "strip-flatten --jobs %s failed", jv[k]);
+            CHECK(!cmd_strip_flatten((int)(sizeof av / sizeof *av), av), "strip-flatten --jobs %s failed", jv[k]);
         }
         char cmd[2048];
         snprintf(cmd, sizeof cmd, "cd %s/fj1 && test -e flat.json && for x in $(find . -type f ! -name chunks.tsv); do cmp -s $x ../fj3/$x || { echo $x differs; exit 1; }; done && "
@@ -88,7 +88,7 @@ int main(void) {
         {   /* GPU vs CPU: the same flattening within the solvers' summation-order noise */
             char a1[300], a2[300]; snprintf(a1, sizeof a1, "%s/strip", root); snprintf(a2, sizeof a2, "%s/fcpu", root);
             char *av[] = {"ufsm", "strip-flatten", a1, "--out", a2, "--stride", "96", "--threads", "4", "--gpu", "0", "--stripe-px", "1500", "--iters", "60", "--cg", "300", "--tol", "1e-9"};
-            CHECK(!cmd_strip_flatten(20, av), "strip-flatten --gpu 0 failed");
+            CHECK(!cmd_strip_flatten((int)(sizeof av / sizeof *av), av), "strip-flatten --gpu 0 failed");
             char q[400], c[4096] = {0}; snprintf(q, sizeof q, "%s/fcpu/flat.json", root); FILE *g = fopen(q, "r");
             if (g) { size_t nr = fread(c, 1, sizeof c - 1, g); (void)nr; fclose(g); }
             const double l2 = num(c, "\"length_cm\": "), b50 = num(c, "\"aniso_p50\": "), b95 = num(c, "\"aniso_p95\": ");
@@ -100,7 +100,7 @@ int main(void) {
             for (int k = 0; k < 2; k++) {
                 char a1[300], a2[300]; snprintf(a1, sizeof a1, "%s/strip", root); snprintf(a2, sizeof a2, "%s/fgt%s", root, tv[k]);
                 char *av[] = {"ufsm", "strip-flatten", a1, "--out", a2, "--stride", "96", "--threads", (char *)tv[k], "--gpu", "1", "--stripe-px", "1500", "--iters", "60", "--cg", "300", "--tol", "1e-9"};
-                CHECK(!cmd_strip_flatten(20, av), "strip-flatten --gpu 1 --threads %s failed", tv[k]);
+                CHECK(!cmd_strip_flatten((int)(sizeof av / sizeof *av), av), "strip-flatten --gpu 1 --threads %s failed", tv[k]);
             }
             snprintf(cmd, sizeof cmd, "cd %s/fgt1/stripes && for x in */*; do cmp -s $x ../../fgt7/stripes/$x || exit 1; done", root);
             CHECK(!system(cmd), "GPU strip-flatten stripes differ between --threads 1 and 7");
@@ -123,7 +123,7 @@ int main(void) {
         for (int k = 0; k < 2; k++) {
             char a1[400], a3[400]; snprintf(a1, sizeof a1, "%s/strip/flat", root); snprintf(a3, sizeof a3, "%s/%s", root, outs[k]);
             char *av[] = {"ufsm", "strip-mosaic", a1, rdir, a3, "--threads", (char *)thr[k], "--rows", "2", "--overview-px", "600"};
-            CHECK(!cmd_strip_mosaic(11, av), "strip-mosaic --threads %s failed", thr[k]);
+            CHECK(!cmd_strip_mosaic((int)(sizeof av / sizeof *av), av), "strip-mosaic --threads %s failed", thr[k]);
         }
         snprintf(cmd, sizeof cmd, "cd %s/m1 && for x in *; do cmp -s $x ../m4/$x || exit 1; done; test $(ls | wc -l) -ge 6", root);
         CHECK(!system(cmd), "strip-mosaic --threads 4 output differs from --threads 1 (or files missing)");
@@ -136,13 +136,13 @@ int main(void) {
         snprintf(cmd, sizeof cmd, "cd %s && for x in *_ct.tif; do touch ${x%%_ct.tif}.done; done", rdir); CHECK(!system(cmd), "touch .done");
         { char a1[400], a3[400]; snprintf(a1, sizeof a1, "%s/strip/flat", root); snprintf(a3, sizeof a3, "%s/m5", root);
           char *av[] = {"ufsm", "strip-mosaic", a1, rdir, a3, "--threads", "3", "--rows", "2", "--overview-px", "600", "--stretch", sv, "--wait-renders", "1"};
-          CHECK(!cmd_strip_mosaic(15, av), "strip-mosaic --stretch --wait-renders failed"); }
+          CHECK(!cmd_strip_mosaic((int)(sizeof av / sizeof *av), av), "strip-mosaic --stretch --wait-renders failed"); }
         snprintf(cmd, sizeof cmd, "cd %s/m1 && for x in *; do cmp -s $x ../m5/$x || exit 1; done", root);
         CHECK(!system(cmd), "strip-mosaic --stretch --wait-renders output differs from the two-pass run");
         /* --papyrus: papyrus-look stripe JPEGs, a one-band overview / long strip; the same tables as the grey mosaic */
         { char a1[400], a3[400]; snprintf(a1, sizeof a1, "%s/strip/flat", root); snprintf(a3, sizeof a3, "%s/m6", root);
           char *av[] = {"ufsm", "strip-mosaic", a1, rdir, a3, "--threads", "2", "--rows", "2", "--overview-px", "600", "--stretch", sv, "--papyrus", "1", "--papyrus-bg", "128"};
-          CHECK(!cmd_strip_mosaic(17, av), "strip-mosaic --papyrus failed"); }
+          CHECK(!cmd_strip_mosaic((int)(sizeof av / sizeof *av), av), "strip-mosaic --papyrus failed"); }
         snprintf(cmd, sizeof cmd, "cd %s && ls m6/*_papyrus.jpg > /dev/null && test -s m6/overview.jpg && test -s m6/strip_long.jpg && cmp -s m1/strip_papyrus.tsv m6/strip_papyrus.tsv && cmp -s m1/papyrus_wraps.tsv m6/papyrus_wraps.tsv", root);
         CHECK(!system(cmd), "strip-mosaic --papyrus outputs missing or its tables differ");
         /* --fill-maps: fill maps marking every pixel rendered (flag 100: a bridged grid hole) widen the mask: valid area grows */
@@ -159,10 +159,10 @@ int main(void) {
           if (ls) pclose(ls);
           char a1[400], a3[400]; snprintf(a1, sizeof a1, "%s/flat2", root);
           snprintf(a3, sizeof a3, "%s/m8", root); char *av0[] = {"ufsm", "strip-mosaic", a1, rdir, a3, "--threads", "2", "--rows", "2", "--overview-px", "600", "--stretch", sv};
-          CHECK(!cmd_strip_mosaic(13, av0), "strip-mosaic on the holed grids failed");
+          CHECK(!cmd_strip_mosaic((int)(sizeof av0 / sizeof *av0), av0), "strip-mosaic on the holed grids failed");
           snprintf(a3, sizeof a3, "%s/m7", root);
           char *av[] = {"ufsm", "strip-mosaic", a1, rdir, a3, "--threads", "2", "--rows", "2", "--overview-px", "600", "--stretch", sv, "--fill-maps", fm};
-          CHECK(!cmd_strip_mosaic(15, av), "strip-mosaic --fill-maps failed");
+          CHECK(!cmd_strip_mosaic((int)(sizeof av / sizeof *av), av), "strip-mosaic --fill-maps failed");
           double v1 = 0, v7 = 0; for (int k = 0; k < 2; k++) { snprintf(p, sizeof p, "%s/%s/strip_papyrus.tsv", root, k ? "m7" : "m8"); FILE *t = fopen(p, "r"); char ln[256];
               if (t) { if (fgets(ln, sizeof ln, t)) {} while (fgets(ln, sizeof ln, t)) { double u, v; if (sscanf(ln, "%lf %lf", &u, &v) == 2) *(k ? &v7 : &v1) += v; } fclose(t); } }
           CHECK(v7 > v1 && v1 > 0, "--fill-maps valid area %g vs %g", v7, v1);
@@ -170,11 +170,11 @@ int main(void) {
           snprintf(a3, sizeof a3, "%s/m9", root); char a4[400]; snprintf(a4, sizeof a4, "%s/m9p", root);
           char *av9[] = {"ufsm", "strip-mosaic", a1, rdir, a3, "--threads", "3", "--stripe-jobs", "2", "--rows", "2", "--overview-px", "600", "--stretch", sv, "--fill-maps", fm,
                          "--papyrus-dir", a4, "--papyrus-gain", "2.5", "--papyrus-bg", "300", "--papyrus-overview-px", "350"};
-          CHECK(!cmd_strip_mosaic(25, av9), "strip-mosaic --papyrus-dir failed");
+          CHECK(!cmd_strip_mosaic((int)(sizeof av9 / sizeof *av9), av9), "strip-mosaic --papyrus-dir failed");
           snprintf(a3, sizeof a3, "%s/m10", root);
           char *av10[] = {"ufsm", "strip-mosaic", a1, rdir, a3, "--threads", "1", "--stripe-jobs", "1", "--rows", "2", "--overview-px", "350", "--stretch", sv, "--fill-maps", fm,
                           "--papyrus", "2.5", "--papyrus-bg", "300"};
-          CHECK(!cmd_strip_mosaic(21, av10), "strip-mosaic --papyrus --fill-maps failed");
+          CHECK(!cmd_strip_mosaic((int)(sizeof av10 / sizeof *av10), av10), "strip-mosaic --papyrus --fill-maps failed");
           snprintf(cmd, sizeof cmd, "cd %s && for x in $(ls m7); do cmp -s m7/$x m9/$x || { echo $x; exit 1; }; done && for x in $(ls m10); do cmp -s m10/$x m9p/$x || { echo $x; exit 1; }; done && "
                    "test $(ls m9 | wc -l) = $(ls m7 | wc -l) && test $(ls m9p | wc -l) = $(ls m10 | wc -l)", root);
           CHECK(!system(cmd), "strip-mosaic --papyrus-dir output differs from the separate grey / --papyrus runs"); }
@@ -182,7 +182,7 @@ int main(void) {
         { static const char *o2[2] = {"m11", "m12"}, *t2[2] = {"1", "5"}, *j2[2] = {"1", "3"};
           for (int k = 0; k < 2; k++) { char a1[400], a3[400], a4[400]; snprintf(a1, sizeof a1, "%s/strip/flat", root); snprintf(a3, sizeof a3, "%s/%s", root, o2[k]); snprintf(a4, sizeof a4, "%s/%sp", root, o2[k]);
               char *av[] = {"ufsm", "strip-mosaic", a1, rdir, a3, "--threads", (char *)t2[k], "--stripe-jobs", (char *)j2[k], "--rows", "1", "--overview-px", "100000", "--stretch", sv, "--papyrus-dir", a4};
-              CHECK(!cmd_strip_mosaic(19, av), "strip-mosaic 1:1 overview --threads %s failed", t2[k]); }
+              CHECK(!cmd_strip_mosaic((int)(sizeof av / sizeof *av), av), "strip-mosaic 1:1 overview --threads %s failed", t2[k]); }   /* (was 19 for 17 arguments: read past av, survived gcc's stack layout, not clang's) */
           snprintf(cmd, sizeof cmd, "cd %s && for x in $(ls m11); do cmp -s m11/$x m12/$x || { echo $x; exit 1; }; done && for x in $(ls m11p); do cmp -s m11p/$x m12p/$x || { echo $x; exit 1; }; done", root);
           CHECK(!system(cmd), "strip-mosaic 1:1 overview: --threads 5 --stripe-jobs 3 differs from 1 / 1"); }
     }
@@ -209,7 +209,7 @@ int main(void) {
             char a1[300], a2[300]; snprintf(a1, sizeof a1, "%s/swraps", root); snprintf(a2, sizeof a2, "%s/ss_e%s_t%s_%d", root, ev[e], tv[t], full);
             if (full) setenv("UFSM_STRIP_FULL", "1", 1); else unsetenv("UFSM_STRIP_FULL");
             char *av[] = {"ufsm", "strip", a1, a2, "--threads", (char *)tv[t], "--err", "0.05", "--every", (char *)ev[e]};
-            CHECK(!cmd_strip(10, av), "strip --every %s --threads %s (full %d) failed", ev[e], tv[t], full);
+            CHECK(!cmd_strip((int)(sizeof av / sizeof *av), av), "strip --every %s --threads %s (full %d) failed", ev[e], tv[t], full);
         }
         unsetenv("UFSM_STRIP_FULL");
         snprintf(cmd, sizeof cmd, "cd %s && for e in 1 2; do for t in 1 5; do for x in strip.sfc strip.tsv strip.json; do cmp ss_e${e}_t${t}_0/$x ss_e${e}_t${t}_1/$x && cmp ss_e${e}_t1_1/$x ss_e${e}_t${t}_0/$x || exit 1; done; done; done", root);

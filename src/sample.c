@@ -644,7 +644,6 @@ static inline uint64_t pack8_u32(__m256i v) {
 /* write_x_aug without an appearance plan or sheet prior, one output row at a time in vectorisable loops (no math errno, so
    sqrtf vectorises); bit-identical to it: the same expressions, rng draws and signed zeros. D x P x P windows (D != P: slabs,
    z-keeping symmetries only). */
-[[gnu::optimize("no-math-errno")]]
 /* write_x's CT channel alone (--gpu-input, no appearance plan), cache-blocked: when the output row runs along a strided source axis
    (2 of 3 symmetries) the row-by-row gather touched one cache line (and often one page) per voxel, ~2/3 of a P768 window's 7.3 cpu-s.
    Rows whose source rows are adjacent are gathered together: XB output rows at once when output y runs along source x, XB output
