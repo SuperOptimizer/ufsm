@@ -128,6 +128,50 @@ static int run_case(int dir) {
         fit_stream_free(&st); fit_fields_free(&sb); fit_fields_free(&hb);
         char cmd[200]; snprintf(cmd, sizeof cmd, "rm -rf %s", td); CHECK(system(cmd) == 0, "rm");
     }
+    if (plain) {   /* the material crop (fit --crop-material, fit_fields oy ox H0 W0): material only in y (16, 79), x (32, 96); fits over arrays cropped to
+                      y [16, 80) x [32, 96) of the box equal the whole box's bit for bit (host fields; on the GPU the streamed loads with fit_fields_crop too) */
+        uint8_t *wz = malloc(n);
+        for (size_t i = 0; i < n; i++) { const int y = (int)((i / W) % H), x = (int)(i % W); wz[i] = y > 16 && y < 79 && x > 32 ? w[i] : 0; }
+        fit_fields fz = f; fz.w = wz;
+        fit_cfg c3 = c; c3.verbose = 0; c3.dir = dir;
+        fit_model *mf = fit_run(&fz, &c3);
+        const int oy = 16, ox = 32, Hc = 64, Wc = 64; const size_t nc = (size_t)D * Hc * Wc;
+        const uint8_t *src[10] = {pc, ps, t[0], t[1], t[2], t[3], t[4], t[5], sp, wz}; uint8_t *cp[10];
+        for (int k = 0; k < 10; k++) { cp[k] = malloc(nc); for (int z = 0; z < D; z++) for (int y = 0; y < Hc; y++) memcpy(cp[k] + ((size_t)z * Hc + y) * Wc, src[k] + ((size_t)z * H + oy + y) * W + ox, Wc); }
+        fit_fields fc = {D, Hc, Wc, H8, cp[0], cp[1], {cp[2], cp[3], cp[4], cp[5], cp[6], cp[7]}, cp[8], cp[9], cy, cx, {0}, 0, nullptr, nullptr, nullptr, oy, ox, H, W};
+        fit_model *mc = fit_run(&fc, &c3);
+        const int same = mf && mc && mf->L == mc->L && mf->lz == mc->lz && mf->ly == mc->ly && mf->lx == mc->lx && mf->nk == mc->nk && mf->H == mc->H && mf->W == mc->W &&
+                         !memcmp(mf->delta, mc->delta, (size_t)mf->lz * mf->ly * mf->lx * 4) && !memcmp(mf->pitch, mc->pitch, mf->nk * 4) && !memcmp(mf->offset, mc->offset, mf->nk * 4) &&
+                         !memcmp(mf->loss, mc->loss, sizeof mf->loss);
+        printf("crop%s: arrays %dx%d of %dx%d at (%d, %d): model %s the whole box's (loss %.6f / %.6f)\n", g_cpu ? " cpu" : "", Hc, Wc, H, W, oy, ox, same ? "identical to" : "DIFFERS from",
+               mf ? mf->loss[0] : -1, mc ? mc->loss[0] : -1);
+        CHECK(same, "crop%s: the cropped fit differs from the whole box's", g_cpu ? " cpu" : "");
+        if (!g_cpu && mf) {   /* streamed: the material box of the saved fields, the crop's loads, the fit */
+            char td[] = "/tmp/test_fit_crop_XXXXXX"; CHECK(mkdtemp(td) != nullptr, "mkdtemp");
+            const long long org[3] = {0, 0, 0}; const int shp[3] = {D, H, W}; uint8_t *a10[10] = {pc, ps, t[0], t[1], t[2], t[3], t[4], t[5], sp, wz};
+            CHECK(fit_fields_save(td, org, shp, (int)H8, 2.4, a10, cy, cx, na) == 0, "fit_fields_save");
+            int fps[8]; const int nfp = fit_stream_fps(&c, (int)H8, fps), A = 16;
+            int crop[4]; uint8_t *wb = nullptr; CHECK(fit_fields_material_box(td, 1, A, crop, &wb) == 0 && wb, "material box");
+            printf("crop: material box y [%d, %d) x [%d, %d)\n", crop[0], crop[0] + crop[2], crop[1], crop[1] + crop[3]);
+            CHECK(crop[0] % A == 0 && crop[1] % A == 0 && crop[0] >= 0 && crop[2] > 0 && crop[2] < H && crop[0] + crop[2] <= H && crop[1] + crop[3] <= W, "material box %d %d %d %d", crop[0], crop[1], crop[2], crop[3]);
+            fit_fields_buf ub, sb, hb; fit_stream us, st;
+            CHECK(fit_fields_load_stream(td, &ub, &us, fps, nfp, nullptr) == 0, "uncropped stream load");
+            fit_fields_crop(1, crop[0], crop[1], crop[2], crop[3], wb);
+            CHECK(fit_fields_load_stream(td, &sb, &st, fps, nfp, nullptr) == 0 && fit_fields_load(td, 0, 0, 1, &hb) == 0, "cropped stream / host loads");
+            fit_fields_crop(0, 0, 0, 0, 0, nullptr); free(wb);
+            CHECK(sb.f.H == crop[2] && sb.f.W == crop[3] && sb.f.oy == crop[0] && sb.f.H0 == H && hb.f.H == crop[2], "cropped load geometry");
+            CHECK(fit_stream_verify(&st, &hb.f) == 0, "cropped stream: device / pooled planes differ from the cropped host load");
+            fit_cfg cs = c3; cs.stream = &us; us.drop_pooled = 1; fit_model *mu = fit_run(&ub.f, &cs);
+            cs.stream = &st; st.drop_pooled = 1; fit_model *ms = fit_run(&sb.f, &cs);
+            const int s2 = mu && ms && mu->lz == ms->lz && mu->ly == ms->ly && mu->lx == ms->lx && !memcmp(mu->delta, ms->delta, (size_t)mu->lz * mu->ly * mu->lx * 4) &&
+                           !memcmp(mu->pitch, ms->pitch, mu->nk * 4) && !memcmp(mu->offset, ms->offset, mu->nk * 4);
+            printf("crop stream: model %s the uncropped stream's\n", s2 ? "identical to" : "DIFFERS from");
+            CHECK(s2, "crop stream: the cropped streamed fit differs");
+            fit_free(mu); fit_free(ms); fit_stream_free(&us); fit_stream_free(&st); fit_fields_free(&ub); fit_fields_free(&sb); fit_fields_free(&hb);
+            char cmd[200]; snprintf(cmd, sizeof cmd, "rm -rf %s", td); CHECK(system(cmd) == 0, "rm");
+        }
+        fit_free(mf); fit_free(mc); for (int k = 0; k < 10; k++) free(cp[k]); free(wz);
+    }
     if (plain && g_cpu) {   /* the voxel unwrapping's records on 4 KB pages (UFSM_UW_HUGE_GB=0) and on huge pages: the same model bit for bit */
         fit_cfg c2 = c; c2.verbose = 0; c2.dir = dir;
         setenv("UFSM_UW_HUGE_GB", "0", 1); fit_model *m4 = fit_run(&f, &c2);
@@ -430,8 +474,13 @@ static void zarr_substream_case(void) {
     char cmd[1500]; snprintf(cmd, sizeof cmd, "rm -rf -- '%s'", td); if (system(cmd)) {}
 }
 int main(void) {
-    nn_init(0);
     g_quick = getenv("UFSM_TEST_QUICK") && atoi(getenv("UFSM_TEST_QUICK"));
+    if (getenv("FIT_CPU_ONLY")) {   /* (no GPU: the CPU backend's plain case alone, with its crop and huge-page checks) */
+        g_cpu = 1; run_case(+1);
+        if (fails) { fprintf(stderr, "test_fit: %d failure(s)\n", fails); return 1; }
+        printf("test_fit (CPU only): OK\n"); return 0;
+    }
+    nn_init(0);
     zarr_substream_case();
     {   /* fit_unhash inverts fit_hash on every 32-bit word (the GPU minibatch selection enumerates the hashes) */
         const unsigned long long dx = g_quick ? 61 : 1;   /* (make test: every 61st word) */

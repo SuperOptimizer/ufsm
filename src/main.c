@@ -1650,6 +1650,34 @@ static int cmd_fit(int argc, char **argv) {
     const int use_stream = cpool <= 1 && !c.cpu && !min && slab <= 0 && !ufsm_env_on("UFSM_FIT_NOSTREAM") && !(c.w_pgrad > 0) && !(c.w_cspacing > 0) && !(c.bend > 0) &&
                            !(c.phase_stretch > 0) && !(c.w_ct > 0 && c.ct_flood) && !*opt(argc, argv, "--axis-normal", "");
     struct timespec tl0, tl1; clock_gettime(CLOCK_MONOTONIC, &tl0);
+    /* --crop-material M (0: off): the arrays only over the box's material (its y / x bounds of w != 0 over every row, grown by M >= 1 cells,
+       rounded out to 16 cells and the pooling factors), so the fields of a slab through a scroll's cross-section fit the device (no managed
+       memory) and the CPU passes run over fewer cells. Everything else stays the box's: positions, the lattice, the model, the minibatch
+       hash (fit_dev oy ox H0 W0), so the model is byte-identical to the uncropped fit (cells outside hold no material: no term reads them;
+       the phase gate reads +-1 neighbours, hence M >= 1). Options whose code reads the box's arrays otherwise turn it off (logged). */
+    const int cropm = atoi(opt(argc, argv, "--crop-material", "0")); uint8_t *cropw = nullptr;
+    if (cropm > 0) {
+        const char *ao[] = {"--seed-model", "--init-model", "--emb", "--axis-normal", "--fibers", "--winding", "--codes", "--zgauge", "--score-boxes", "--uw-rep-dump"}; const char *why = nullptr;
+        for (size_t k = 0; k < sizeof ao / sizeof *ao && !why; k++) if (*opt(argc, argv, ao[k], "")) why = ao[k];
+        if (!why) why = min ? "--model" : slab > 0 ? "--slab" : cpool > 1 ? "--coarse-pool" : g_fit_sweep ? "--sweep" : !c.analytic ? "--analytic 0" : c.uw_repair > 0 ? "--uw-repair" :
+                        c.uw_split > 0 ? "--uw-split" : c.uw_msf ? "--uw-flood msf" : c.uw_pdv > 0 ? "--uw-pdv" : c.phase_stretch > 0 ? "--phase-stretch" : c.bend > 0 ? "--bend" :
+                        c.w_pgrad > 0 ? "--w-pgrad" : c.w_ct > 0 ? "--w-ct" : c.w_cspacing > 0 ? "--w-cspacing" : nullptr;
+        int fps[8], A = 16; const int nfp = fit_stream_fps(&c, fb.h, fps); for (int q = 0; q < nfp; q++) if (fps[q] > A) A = fps[q];   /* (powers of two: a multiple of each) */
+        int crop[4] = {0}, rc = why ? 1 : fit_fields_material_box(dir, cropm, A, crop, &cropw);
+        if (rc < 0) { fprintf(stderr, "fit: cannot read the material box of %s\n", dir); return 1; }
+        {
+            fit_fields_buf g0; if (fit_fields_load(dir, 0, 0, 0, &g0)) { free(cropw); return 1; }
+            const int H0 = g0.shape[1], W0 = g0.shape[2]; fit_fields_free(&g0);
+            if (rc == 0 && crop[2] > 0 && (crop[2] < H0 || crop[3] < W0)) {
+                fit_fields_crop(1, crop[0], crop[1], crop[2], crop[3], cropw);
+                if (c.verbose) fprintf(stderr, "fit: material crop y [%d, %d) x [%d, %d) of %dx%d cells (%.3f of the box)\n", crop[0], crop[0] + crop[2], crop[1], crop[1] + crop[3], H0, W0,
+                                       (double)crop[2] * crop[3] / ((double)H0 * W0));
+            } else {
+                if (c.verbose) fprintf(stderr, "fit: no material crop (%s)\n", why ? why : rc ? "a core mask" : crop[2] > 0 ? "the material spans the box" : "no material");
+                free(cropw); cropw = nullptr;
+            }
+        }
+    }
     int cached = 0;   /* fit --sweep: the streamed fields of an earlier run of this process (same directory, planes and pooling factors) */
     if (use_stream) {
         int fps[8]; const int nfp = fit_stream_fps(&c, fb.h, fps);
@@ -1676,6 +1704,7 @@ static int cmd_fit(int argc, char **argv) {
         }
         c.stream = &fst;
     } else if (fit_fields_load(dir, 0, 0, min || slab > 0 ? 0 : cpool > 1 ? cpool : 1, &fb)) { fprintf(stderr, "fit: cannot load the fields in %s\n", dir); return 1; }
+    fit_fields_crop(0, 0, 0, 0, 0, nullptr); free(cropw); cropw = nullptr;   /* (later loads: the whole box) */
     clock_gettime(CLOCK_MONOTONIC, &tl1);
     fit_gpu_join();
     if (c.verbose) fprintf(stderr, "fit: fields %dx%dx%d loaded in %.1fs\n", fb.shape[0], fb.shape[1], fb.shape[2], (double)(tl1.tv_sec - tl0.tv_sec) + (tl1.tv_nsec - tl0.tv_nsec) * 1e-9);   /* (slab runs load per slab; a given model needs the geometry only) */
@@ -1764,16 +1793,20 @@ static int cmd_fit(int argc, char **argv) {
             float *wr = malloc((size_t)GZ * plane * sizeof(float)), *ay = malloc(GZ * sizeof(float)), *ax = malloc(GZ * sizeof(float)); if (!wr || !ay || !ax) bad = 1;
             for (int z0 = 0; z0 < D && !bad; z0 += GZ) {
                 const int nz = z0 + GZ <= D ? GZ : D - z0; const size_t off = (size_t)z0 * plane;
-                const double o3[3] = {z0 * fb.h + c.ref_off[0], c.ref_off[1], c.ref_off[2]}; const int64_t n3[3] = {nz, H, W};
-                if (gd ? fit_set_grid(gd, refm, o3, n3, fb.h, 0, wr) : fit_set_grid_cpu(refm, o3, n3, fb.h, 0, nullptr, wr)) {   /* (no device room for the ref: its grid on the CPU) */ fprintf(stderr, "fit: phase gate: no device memory for the W_ref grid: the CPU pass from row %d\n", z0); gpug = 0; zc = z0; zcpu = 1; break; }
+                const double o3[3] = {z0 * fb.h + c.ref_off[0], c.ref_off[1] + fb.f.oy * fb.h, c.ref_off[2] + fb.f.ox * fb.h}; const int64_t n3[3] = {nz, H, W};   /* (a crop: its cells' box positions) */
+                /* W_ref left on the device (fit_set_grid_dev: no round trip through the host; UFSM_PG_HOSTW=1 or no room: via the host as before) */
+                const float *dwr = gd && !ufsm_env_on("UFSM_PG_HOSTW") ? fit_set_grid_dev(gd, refm, o3, n3, fb.h, 0) : nullptr;
+                if (!dwr && (gd ? fit_set_grid(gd, refm, o3, n3, fb.h, 0, wr) : fit_set_grid_cpu(refm, o3, n3, fb.h, 0, nullptr, wr))) {   /* (no device room for the ref: its grid on the CPU) */ fprintf(stderr, "fit: phase gate: no device memory for the W_ref grid: the CPU pass from row %d\n", z0); gpug = 0; zc = z0; zcpu = 1; break; }
                 for (int z = 0; z < nz; z++) { const double pz = (z0 + z + 0.5) * fb.h; const int i0 = (int)fmin(fmax(floor(pz), 0), na - 1), i1 = i0 + 1 < na ? i0 + 1 : i0; const double t = fmin(fmax(pz - i0, 0), 1);
                     ay[z] = (float)(fb.f.cy[i0] + t * (fb.f.cy[i1] - fb.f.cy[i0])); ax[z] = (float)(fb.f.cx[i0] + t * (fb.f.cx[i1] - fb.f.cx[i0])); }
                 uint8_t *dp = fst.dfield;
-                if (fit_phase_gate_gpu(dp + off, dp + n + off, dp + 3 * n + off, dp + 4 * n + off, dp + 7 * n + off, dp + 8 * n + off, dp + 9 * n + off, nz, H, W, fb.h, ay, ax, wr,
-                                       pg.mode, pg.R, pg.lo, pg.hi, pg.rc, st)) { fprintf(stderr, "fit: phase gate: no device memory for a block: the CPU pass from row %d\n", z0); gpug = 0; zc = z0; zcpu = 1; break; }
+                if ((dwr ? fit_phase_gate_gpu_dw(dp + off, dp + n + off, dp + 3 * n + off, dp + 4 * n + off, dp + 7 * n + off, dp + 8 * n + off, dp + 9 * n + off, nz, H, W, fb.h, ay, ax, dwr,
+                                                 pg.mode, pg.R, pg.lo, pg.hi, pg.rc, st, fb.f.oy, fb.f.ox)
+                         : fit_phase_gate_gpu(dp + off, dp + n + off, dp + 3 * n + off, dp + 4 * n + off, dp + 7 * n + off, dp + 8 * n + off, dp + 9 * n + off, nz, H, W, fb.h, ay, ax, wr,
+                                              pg.mode, pg.R, pg.lo, pg.hi, pg.rc, st, fb.f.oy, fb.f.ox))) { fprintf(stderr, "fit: phase gate: no device memory for a block: the CPU pass from row %d\n", z0); gpug = 0; zc = z0; zcpu = 1; break; }
                 nn_d2h(fb.a[0] + off, dp + off, (size_t)nz * plane); nn_d2h(fb.a[1] + off, dp + n + off, (size_t)nz * plane);
             }
-            free(wr); free(ay); free(ax);
+            free(wr); free(ay); free(ax); fit_phase_gate_gpu_done();   /* (the blocks' kept scratch) */
         }
         for (int z0 = zc; z0 < D && !bad && !gpug; z0 += BZ) {
             const int nz = z0 + BZ <= D ? BZ : D - z0; const size_t off = (size_t)z0 * plane;

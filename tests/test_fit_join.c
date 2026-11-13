@@ -216,7 +216,7 @@ int main(void) {
                     for (int z = 0; z < sb.f.D; z++) { const double pz = (z + 0.5) * H8; const int i0 = (int)floor(pz); const double t = pz - i0; ay[z] = (float)(sb.f.cy[i0] + t * (sb.f.cy[i0 + 1] - sb.f.cy[i0])); ax[z] = (float)(sb.f.cx[i0] + t * (sb.f.cx[i0 + 1] - sb.f.cx[i0])); }
                     uint8_t *d = nn_malloc(7 * sn); const uint8_t *src[7] = {hpc, hps, sb.f.t[1], sb.f.t[2], sb.f.t[5], sb.f.sp, sb.f.w};
                     for (int k = 0; k < 7; k++) nn_h2d(d + k * sn, src[k], sn);
-                    CHECK(!fit_phase_gate_gpu(d, d + sn, d + 2 * sn, d + 3 * sn, d + 4 * sn, d + 5 * sn, d + 6 * sn, sb.f.D, H, W, H8, ay, ax, wr, 0, 6, 0.3, 0.6, 0.5, sg), "phase gate (gpu)");
+                    CHECK(!fit_phase_gate_gpu(d, d + sn, d + 2 * sn, d + 3 * sn, d + 4 * sn, d + 5 * sn, d + 6 * sn, sb.f.D, H, W, H8, ay, ax, wr, 0, 6, 0.3, 0.6, 0.5, sg, 0, 0), "phase gate (gpu)");
                     nn_d2h(gpc, d, sn); nn_d2h(gps, d + sn, sn); nn_free(d);
                     size_t same = 0, near1 = 0, nmx = 0; for (size_t i = 0; i < sn; i++) { if (!sb.f.w[i]) continue; nmx++; same += gpc[i] == cpc[i] && gps[i] == cps[i]; near1 += abs(gpc[i] - cpc[i]) <= 1 && abs(gps[i] - cps[i]) <= 1; }
                     printf("phase gate gpu vs cpu: identical on %.4f, within 1 on %.4f of %zu material cells; gated %.0f / %.0f, mean q %.4f / %.4f\n", nmx ? (double)same / nmx : 0,

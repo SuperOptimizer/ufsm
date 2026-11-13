@@ -6,6 +6,34 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Slab fits over the material only: fit --crop-material (2026-11-12, branch slabperf-20261112)
+
+A P4 slab fit (unroll.sh lane: 96 x 3575 x 3712 cells, 12.7 GB of fields) did not fit the 16 GB card and ran from managed memory: 17-19 s
+per slab, 149 slabs on 2 lanes = 1365 s (s070: load 4.5 s, phase gate 4.1, stages 0-3 1.0, unwrap 1.0 + 1.7 + 1.2, stage 4 4.6, stage 5
+1.6). Most of the cross-section holds no papyrus: the y / x bounds of w != 0 over a slab's rows cover 0.52 of it (s070: y [128, 2544) x [672,
+3520), 6.6 GB of fields; the chunk-level bounds over all 74 z chunk rows: 0.52 on average, 0.1 near the ends).
+
+`fit --crop-material M` reads the box's w plane (once; the loader reuses it), takes those bounds grown by M cells, rounded out to 16 cells
+(a multiple of every pooling factor and of uw_refbias's 4-cell sampling), and loads only those cells of every plane (`fit_fields_crop`;
+zarr / raw). Nothing else changes: `fit_fields` / `fit_dev` carry the crop (oy ox H0 W0) and every position is the box cell's, the lattice,
+knots and model are the box's, and the minibatch hash reads the box cell's linear index (`fit_box_index`; the GPU's inverse-hash
+selection maps candidate box cells into the crop, `fit_crop_index`), the prior samples the box's index sequence, the pooled stages see
+the same pooled cells (crop edges on pool multiples or the box edge), the counts are equal (outside cells hold no material), the phase
+gate's W_ref grid starts at the crop's box position (exact sums: integer cells x integer h). The phase gate reads +-1 neighbours and its
+box sums are 0 outside material, so M >= 1 keeps it exact (default 2). The model is byte-identical to the uncropped fit.
+
+Verified on the CPU backend (the same terms: src/fit_terms.h) with the slab lane's options: P4 boxes 48x900x900 (crop 0.583, offsets in y
+and x, ends at the box), 40x1875x1012 (0.406, interior ends), 96x1800x1900 (0.600): delta.f32 / model.json identical to the uncropped fit and
+to the base binary; the CPU fit of the last 33.0 -> 18.4 s (gate 14.4 -> 9.1, unwrap 3.7 -> 1.7, stages 0-3 5.4 -> 1.9, 4-5 11.4 -> 5.8).
+test_fit's crop case: host fields on both backends, streamed loads + stream verify on the GPU. Options whose code reads the box's arrays
+otherwise (repair, two-level / msf floods, pdv, phase stretch, bend, pgrad, CT terms, fibres, emb, seed / init models, --winding / --codes
+exports) turn the crop off (logged). The GPU parts (stream loader, nn_fit_loss2's selection, the GPU gate) await a GPU window:
+scripts/unroll/slabperf_gpu.sh (tests, BASE / nocrop / crop / hostw / stream-verify identity on P4 s010 s070 s140 + 1667 s030, lanes).
+
+Also: the GPU phase gate keeps W_ref on the device (`fit_set_grid_dev`: no device -> host -> device trip of 4 B per cell per block,
+the scratch kept across the 16M-cell blocks; UFSM_PG_HOSTW=1 the old path), and unroll.sh's FITLOCK=1 / 2 (UFSM_FIT_GPU_LOCK, + LOCK_LATE:
+the normals decoded to the host before the lock) for FITLANES=2 on one card. unroll.sh passes --crop-material $CROPM (2; 0 off).
+
 ## Self-supervision for the latent net: what the 10-21..25 DINO work showed, the plan (2026-11-12, branch latdino-20261112)
 
 User (11-12): "revive the self supervised dino stuff for latent net". Plan only; no GPU run yet.
