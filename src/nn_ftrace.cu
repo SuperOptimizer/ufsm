@@ -1,7 +1,7 @@
 /* ufsm fiber-trace on the GPU (src/ftgpu.h): the per-voxel fibre axis of src/ftaxis.c ft_ridge_axis, which is ~97 % of a --mask trace
    on the CPU (512 x 576 x 768 box: 128 s, the streamline integration ~3 s). Byte-identical to the CPU: the gradient products and their
    (2R+1)^3 sums are exact integers in both (R <= 6: every partial float sum of the CPU stays below 2^24), and the eigenvector power
-   iterations run the CPU's double operations in its order; this object is built with -fmad=false and without fast math (Makefile), so
+   iterations run the CPU's double operations in its order; this object is built with FMA contraction off and without fast math (CMakeLists.txt UFSM_STRICT_UNITS), so
    division / sqrt are IEEE and nothing is contracted (gcc -std=c23 does not contract either).
    One thread per (y, x) column marches in z: the in-plane (2R+1)^2 sums of the six products of plane k are formed once per plane and kept
    in a ring of 2R+1 planes; the z sum slides (T(z+1) = T(z) + S(z+1+R) - S(z-R), planes clamped at the ends as the CPU's ring). */

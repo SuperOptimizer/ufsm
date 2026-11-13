@@ -1,7 +1,7 @@
 /* the fibre planes of a box on the GPU (src/fibregpu.h): fr_box's stamp (the min distance code per family over every step within its
    reach) and the per-voxel combine with the CT air test, fused, one thread per voxel, one CUDA block per 8^3 voxel block. The steps
    are binned to the 8^3 blocks their reach cube meets (host: a counting sort, ~steps x 8..27 entries); a block reads its list through
-   shared memory. A block without steps writes the empty-voxel value (air 0, else 255) directly. Built with -fmad=false (Makefile):
+   shared memory. A block without steps writes the empty-voxel value (air 0, else 255) directly. Built with FMA contraction off (CMakeLists.txt UFSM_STRICT_UNITS):
    dz^2 + dy^2 + dx^2 rounds as gcc -std=c23's (no contraction), sqrt is IEEE, so the codes are the CPU's. One context (device buffers
    grown on demand) behind a mutex: the sampler's workers take turns. */
 #include <cuda_runtime.h>

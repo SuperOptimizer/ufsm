@@ -193,7 +193,7 @@ extern "C" int lp_mxsw_hw(void) {
     cudaMalloc(&d, 4); mxsw_hw_k<<<1, 1>>>(d); cudaMemcpy(&h, d, 4, cudaMemcpyDeviceToHost); cudaFree(d);
     return h;
 }
-/* 1 when this build's lp kernels are the software MX paths (the Makefile's ARCH < 120, -DUFSM_ARCH; an ARCH=86 PTX build JIT-run
+/* 1 when this build's lp kernels are the software MX paths (UFSM_ARCH < 120, -DUFSM_ARCH; the arch86 build's PTX JIT-run
    on a newer GPU too). Host-side defaults that suit only the hardware MMAs check it. A compile-time answer: no CUDA call, so it
    is safe before predict's fork (a CUDA context in the parent breaks the forked GPU workers). */
 #ifndef UFSM_ARCH

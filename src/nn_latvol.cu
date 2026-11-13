@@ -1,7 +1,7 @@
 /* latvol on the GPU (latvol.h, nn_latvol.h): the chunk streams of a window decoded straight into the device cell tensor the trunk's
  * input kernel reads, the cells' CT bytes, and the forward transform of an encoder. Byte-identical to src/latvol.c: the entropy decode
  * is the same integer code (latvol.h's lv_dec_*), the transforms are int32 sums with one float multiply and a rint (built without fast
- * math and with -fmad=false, Makefile).
+ * math and with FMA contraction off, CMakeLists.txt UFSM_STRICT_UNITS).
  *   k_offs:   one thread per chunk: the header check and the 512 substreams' word offsets (a prefix sum of the header's lengths).
  *   k_decode: one thread per (chunk, substream) whose 4^3 cells meet the window: the serial tANS / raw-bit decode of its 64 cells
  *             (<= C symbols each), every cell written to the window's int8 cells as it is decoded. Substreams outside the window, air

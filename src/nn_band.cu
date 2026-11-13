@@ -1,5 +1,5 @@
 /* band_field_phase_pair on the GPU (src/bandgpu.h). Mirrors src/band.c (edt_feature_cap with d2 nullptr, band_field_phase_pair_ex
-   without spacing / lo / hi) operation by operation; built with -fmad=false and without fast math (Makefile), so the float rounding is
+   without spacing / lo / hi) operation by operation; built with FMA contraction off and without fast math (CMakeLists.txt UFSM_STRICT_UNITS), so the float rounding is
    band.c's and the output bytes are identical (tests/test_band_pair.c).
    x pass: one thread per x line, the two nearest-seed sweeps. y / z passes: one thread per line (consecutive threads = consecutive x,
    so every q step is one coalesced row), the lower envelope in global scratch laid out [q][line], in chunks of lines. Pair kernel:

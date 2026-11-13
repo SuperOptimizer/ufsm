@@ -8,5 +8,6 @@ declare -A used
 while IFS= read -r b; do used[$b]=1; done < <(grep -v '^\s*#' tests/suite.txt | grep -oE '\$B/[A-Za-z0-9_]+' | sed 's|\$B/||' | sort -u)
 rc=0
 for b in "${!used[@]}"; do [ -z "${have[$b]:-}" ] && { echo "suite-check: tests/suite.txt runs \$B/$b, but no ufsm_exe($b SUITE ...) in tests/targets.cmake"; rc=1; }; done
-for b in "${bins[@]}"; do [ -z "${used[$b]:-}" ] && echo "suite-check: note: suite binary $b is run by no tests/suite.txt line (a helper?)"; done
+ind=(); for b in "${bins[@]}"; do [ -z "${used[$b]:-}" ] && ind+=("$b"); done
+[ $rc = 0 ] && echo "suite-check: ok (${#bins[@]} suite binaries; ${#ind[@]} not named as \$B/x in tests/suite.txt: helpers / Python-run)"
 exit $rc

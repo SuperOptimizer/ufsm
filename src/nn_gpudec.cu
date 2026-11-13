@@ -1,6 +1,6 @@
 /* volcomp lossy substream decoding on the GPU (src/gpudec.h), byte-identical to vf_decode_sub / volcomp_fast.h.
  *
- * Built without fast math and with -fmad=false (Makefile): the dequantisation and the inverse DCT round every float operation as
+ * Built without fast math and with FMA contraction off (CMakeLists.txt UFSM_STRICT_UNITS): the dequantisation and the inverse DCT round every float operation as
  * the CPU does (gcc -std=c23 contracts nothing), in the reference's order. Two kernels per batch:
  *   k_entropy: one thread per substream. The two tANS lanes (DC and level tokens lane 0, run tokens and the EOB lane 1, as
  *     volcomp_fast.h) and the bypass bit stream, with every check of the reference; it writes per block the DC and the AC

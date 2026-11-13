@@ -5,3 +5,5 @@ runs/
 __pycache__/
 build-verify/
 build-dev*/
+build86*/
+build-cm*/
