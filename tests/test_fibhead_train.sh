@@ -6,6 +6,7 @@
 # with a winding source
 # Usage: test_fibhead_train.sh UFSM MAKE_WIND_FIXTURE DIR
 set -eu
+. "$(dirname "$(readlink -f "$0")")/det_cmp.sh"
 U=$(readlink -f "$1"); MF=$(readlink -f "$2"); D=$3
 rm -rf "$D"; mkdir -p "$D"; cd "$D"
 "$MF" fx 256 2 1 > fx.log 2>&1
@@ -15,11 +16,11 @@ L=(--rv 2 --rv-iso 100 --lat 4)
 ok() { grep -q "$2" "$1" || { echo "FAIL: $3 ($D/$1)"; exit 1; }; }
 "$U" train fx/sources-fibhv.json --out v "${C[@]}" --steps 4 --fib-head 1 > v.log 2>&1 || { echo "FAIL: voxel run ($D/v.log)"; exit 1; }
 ok v.log '^step      4 .* fib bce 0\.[0-9]* dir 0\.[0-9]* (100% of windows)' "voxel run: fibre losses"
-UFSM_LAT_STREAM=check "$U" train fx/sources-fibhv.json --out ls "${C[@]}" "${L[@]}" --steps 4 --fib-head 1 > ls.log 2>&1 || { echo "FAIL: latent run ($D/ls.log)"; exit 1; }
+UFSM_BATCH_HASH=1 UFSM_DET_TRACE=1 UFSM_LAT_STREAM=check "$U" train fx/sources-fibhv.json --out ls "${C[@]}" "${L[@]}" --steps 4 --fib-head 1 > ls.log 2>&1 || { echo "FAIL: latent run ($D/ls.log)"; exit 1; }
 [ "$(grep -c 'lat stream check: .* 0 of [0-9]* slab bytes differ' ls.log)" -gt 0 ] && ! grep 'lat stream check' ls.log | grep -vq ' 0 of ' || { echo "FAIL: stream check"; grep 'lat stream check' ls.log | tail -2; exit 1; }
-UFSM_LAT_LDEV=0 "$U" train fx/sources-fibhv.json --out ld "${C[@]}" "${L[@]}" --steps 4 --fib-head 1 > ld.log 2>&1 || { echo "FAIL: latent run, streamed ($D/ld.log)"; exit 1; }
+UFSM_BATCH_HASH=1 UFSM_DET_TRACE=1 UFSM_LAT_LDEV=0 "$U" train fx/sources-fibhv.json --out ld "${C[@]}" "${L[@]}" --steps 4 --fib-head 1 > ld.log 2>&1 || { echo "FAIL: latent run, streamed ($D/ld.log)"; exit 1; }
 for f in ls ld; do grep '^step' $f.log | sed -E 's/ [0-9.]+ samp\/s.*//' > $f.txt; done
-cmp -s ls.txt ld.txt || { echo "FAIL: device-kept planes differ from streamed"; diff ls.txt ld.txt | head -4; exit 1; }
+det_cmp ls.log ld.log "device-kept planes vs streamed" || exit 1
 # the fine stem with the fibre head (the head padded past 16 outputs: the stem maps into the 16 supervised voxel outputs, not the pad)
 "$U" train fx/sources-fibhv.json --out fs "${C[@]}" "${L[@]}" --lat-guide 3 --fstem 16 --ink-head 1 --steps 4 --fib-head 1 > fs.log 2>&1 || { echo "FAIL: latent run with --fstem ($D/fs.log)"; exit 1; }
 ok fs.log 'fine stem: 16 silu features of 4^3 voxels at stride 2 into 16 head outputs' "fstem + fib-head: 16 stem outputs"
