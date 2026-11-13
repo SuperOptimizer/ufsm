@@ -122,6 +122,18 @@ static int find_stores(const char *base, const char *rel, int depth, seam_store 
 }
 
 int predict_one_entry(int argc, char **argv);   /* src/predict.c */
+/* predict --seam-inproc: a store's level arrays <dir>/<um> (numeric names with a zarr.json) removed before it is written, so the run
+   replaces the store as the two-process blend does (and the GPU pyramid, which writes each level shard once, sees no older shards) */
+void seam_clear_store(const char *dir) {
+    DIR *dp = opendir(dir); if (!dp) return; struct dirent *e; char p[64][2400]; int n = 0;
+    while ((e = readdir(dp)) && n < 64) {
+        char *end; const double u = strtod(e->d_name, &end); char z[2500];
+        snprintf(p[n], sizeof p[n], "%s/%s", dir, e->d_name); snprintf(z, sizeof z, "%s/zarr.json", p[n]);
+        if (e->d_name[0] != '.' && *end == 0 && u > 0 && is_file(z)) n++;
+    }
+    closedir(dp);
+    for (int i = 0; i < n; i++) rm_rf(p[i]);
+}
 /* in one process (UFSM_SEAM_INPROC=1): predict --seam-inproc 1 over the union of the two passes' boxes, shards S / 2, the run's --q,
    --levels; both tile grids in one window loop, each shard's two versions blended on the GPU before the writer (src/predict.c seam_t):
    no pass stores, no second start-up, no CPU blend */

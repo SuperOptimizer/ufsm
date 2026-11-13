@@ -807,15 +807,19 @@ static void phead_fresh(phead_t *h, int b) { if (h->gv[b]) nn_stream_wait(0, h->
    window skipped at run time: CT all zero) are written alone at the end (seam_flush), as the two-process blend would see them */
 typedef struct {
     int n, nph; int64_t ns[3], bo[3]; double S; size_t nsh, bytes;
-    uint8_t *need; uint8_t **pend; int8_t *pg; uint8_t *scr; float *wd, *wh; size_t npend, maxpend; long nblend, nsingle;
+    uint8_t *need; uint8_t **pend; int8_t *pg; uint8_t *scr; float *wd, *wh; size_t npend, maxpend; long nblend, nsingle; long *pz;
 } seam_t;
+/* the GPU pyramid's mark (--full-grid: allowed with --seam-inproc, whose stores are fresh): no later submission below the current
+   window's first shard layer q0z (the windows come in rising q0z) nor below a held version's layer (submitted with its partner, or at
+   the end) */
+static int64_t seam_mark(const seam_t *M, int64_t q0z) { for (int64_t z = 0; z < q0z && z < M->ns[0]; z++) if (M->pz[z]) return z; return q0z; }
 static int seam_init(seam_t *M, int nph, int shard, const int64_t ns[3], const int64_t bo[3], const tile_t *T, long nt) {
     memset(M, 0, sizeof *M); M->n = shard; M->nph = nph; M->S = 2.0 * shard; M->bytes = (size_t)shard * shard * shard;
     for (int d = 0; d < 3; d++) { M->ns[d] = ns[d]; M->bo[d] = bo[d]; }
     M->nsh = (size_t)(ns[0] * ns[1] * ns[2]);
-    M->need = calloc(M->nsh, 1); M->pend = calloc(M->nsh * nph, sizeof *M->pend); M->pg = calloc(M->nsh * nph, 1);
+    M->need = calloc(M->nsh, 1); M->pz = calloc((size_t)ns[0] + 1, sizeof *M->pz); M->pend = calloc(M->nsh * nph, sizeof *M->pend); M->pg = calloc(M->nsh * nph, 1);
     M->wh = malloc(6 * (size_t)shard * sizeof(float)); M->wd = nn_malloc_try(6 * (size_t)shard * sizeof(float)); M->scr = nn_malloc_try(M->bytes);
-    if (!M->need || !M->pend || !M->pg || !M->wh || !M->wd || !M->scr) return 1;
+    if (!M->need || !M->pz || !M->pend || !M->pg || !M->wh || !M->wd || !M->scr) return 1;
     for (long i = 0; i < nt; i++) {
         const int64_t q0[3] = {T[i].shard / (ns[1] * ns[2]), T[i].shard / ns[2] % ns[1], T[i].shard % ns[2]};
         for (int64_t a = q0[0]; a < q0[0] + 2 && a < ns[0]; a++) for (int64_t b = q0[1]; b < q0[1] + 2 && b < ns[1]; b++)
@@ -832,22 +836,22 @@ static void seam_weights(seam_t *M, int64_t qz, int64_t qy, int64_t qx, int only
     }
     nn_h2d(M->wd, M->wh, (only >= 0 ? 3 : 6) * (size_t)n * sizeof(float));
 }
-static int seam_submit(seam_t *M, phead_t *h, int j, int b, int g, int64_t qz, int64_t qy, int64_t qx) {
+static int seam_submit(seam_t *M, phead_t *h, int j, int b, int g, int64_t qz, int64_t qy, int64_t qx, int64_t mark) {
     const size_t q = (size_t)((qz * M->ns[1] + qy) * M->ns[2] + qx), k = (size_t)j * M->nsh + q;
     if (M->need[q] >= 2 && !M->pend[k]) {   /* the first version: held */
         if (!(M->pend[k] = malloc(M->bytes))) { fprintf(stderr, "predict --seam-inproc: out of host memory (%zu shards pending)\n", M->npend); return 1; }
-        nn_d2h(M->pend[k], h->dsh2[b], M->bytes); M->pg[k] = (int8_t)g;
+        nn_d2h(M->pend[k], h->dsh2[b], M->bytes); M->pg[k] = (int8_t)g; M->pz[qz]++;
         if (++M->npend > M->maxpend) M->maxpend = M->npend;
         return 0;
     }
     if (M->pend[k]) {   /* the second: grid 0 is ink_blend_run's input a */
-        nn_h2d(M->scr, M->pend[k], M->bytes); free(M->pend[k]); M->pend[k] = nullptr; M->npend--;
+        nn_h2d(M->scr, M->pend[k], M->bytes); free(M->pend[k]); M->pend[k] = nullptr; M->npend--; M->pz[qz]--;
         seam_weights(M, qz, qy, qx, -1);
         if (M->pg[k] == 0) nn_seam_blend_u8(M->scr, h->dsh2[b], h->dsh2[b], M->n, M->wd);
         else nn_seam_blend_u8(h->dsh2[b], M->scr, h->dsh2[b], M->n, M->wd);
         M->nblend++;
     } else { seam_weights(M, qz, qy, qx, g); nn_seam_blend_u8(h->dsh2[b], nullptr, h->dsh2[b], M->n, M->wd); M->nsingle++; }
-    return phead_submit(h, b, qz, qy, qx, qz);
+    return phead_submit(h, b, qz, qy, qx, mark);
 }
 static int seam_flush(seam_t *M, phead_t *PH, int *phd) {   /* versions whose partner never came: alone */
     long nf = 0;
@@ -855,7 +859,7 @@ static int seam_flush(seam_t *M, phead_t *PH, int *phd) {   /* versions whose pa
         const size_t k = (size_t)j * M->nsh + q; if (!M->pend[k]) continue;
         const int64_t qz = (int64_t)q / (M->ns[1] * M->ns[2]), qy = (int64_t)q / M->ns[2] % M->ns[1], qx = (int64_t)q % M->ns[2];
         phead_t *h = &PH[j]; phead_fresh(h, *phd);
-        nn_h2d(h->dsh2[*phd], M->pend[k], M->bytes); free(M->pend[k]); M->pend[k] = nullptr; M->npend--;
+        nn_h2d(h->dsh2[*phd], M->pend[k], M->bytes); free(M->pend[k]); M->pend[k] = nullptr; M->npend--;   /* (per head in rising z: mark qz) */
         seam_weights(M, qz, qy, qx, M->pg[k]); nn_seam_blend_u8(h->dsh2[*phd], nullptr, h->dsh2[*phd], M->n, M->wd);
         if (phead_submit(h, *phd, qz, qy, qx, qz)) return 1;
         *phd ^= 1; nf++;
@@ -1283,6 +1287,7 @@ static int ffz_json(const char *p, const int64_t bo[3], const int64_t bn[3], con
     fprintf(f, "]}\n"); return fclose(f) ? 1 : 0;
 }
 int predict_seamless(int argc, char **argv);   /* src/seamless.c */
+void seam_clear_store(const char *dir);         /* src/seamless.c: the level arrays <dir>/<um> removed */
 static int predict_one(int argc, char **argv);
 int predict_one_entry(int argc, char **argv) { return predict_one(argc, argv); }   /* (predict --seamless 2, in-process: src/seamless.c) */
 static int predict_one(int argc, char **argv) {
@@ -1794,6 +1799,8 @@ static int predict_one(int argc, char **argv) {
     snprintf(ldir, sizeof ldir, "%s/%s", out, lv);
     snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"content\":\"%s (uint8 = round(p*255))\",\"checkpoint\":\"%s\",\"step\":%d,\"source\":\"%s/%s\",\"origin_zyx\":[%lld,%lld,%lld],\"window\":%d,\"halo\":%d,\"window_z\":%d,\"halo_z\":%d,\"ema\":%d%s%s}}",
              content, ckpt, step, root, ak, (long long)(fullg ? 0 : bo[0]), (long long)(fullg ? 0 : bo[1]), (long long)(fullg ? 0 : bo[2]), W, halo, Wz, hz, use_ema, grid_attrs, input_attrs);
+    const int seam2 = atoi(opt(argc, argv, "--seam-inproc", "0")) != 0;   /* (predict --seamless 2 in-process: the stores are replaced, as the two-process blend does) */
+    if (seam2) seam_clear_store(out);
     z3w *w = z3w_create(ldir, ash, shard, q, 0, attrs);
     if (!w) { fprintf(stderr, "%s\n", z3w_error()); return 1; }
     int stride = W - 2 * halo;
@@ -1838,7 +1845,7 @@ static int predict_one(int argc, char **argv) {
     float *genc_rs = nullptr; uint16_t *genc_sc = nullptr; int genc_fma = 0;
     if (genc) { float rs[4096]; uint16_t sc[4096]; genc_fma = vcg_tables(q, rs, sc); genc_rs = nn_malloc(sizeof rs); genc_sc = nn_malloc(sizeof sc);
                 nn_h2d(genc_rs, rs, sizeof rs); nn_h2d(genc_sc, sc, sizeof sc); }
-    const int gpyr = lhm && nlev > 1 && !resume && !fullg && gpath && (!getenv("UFSM_PRED_GPU_PYR") || ufsm_env_on("UFSM_PRED_GPU_PYR")); size_t hab = WR.bytes;
+    const int gpyr = lhm && nlev > 1 && !resume && (!fullg || seam2) && gpath && (!getenv("UFSM_PRED_GPU_PYR") || ufsm_env_on("UFSM_PRED_GPU_PYR")); size_t hab = WR.bytes;
     if (lhm) {   /* the heads' stores (--heads: <out>/<name>; one head: the main store), writers and device shards; the main writer writes nothing */
         if (hspec && resume) { fprintf(stderr, "predict --heads: no --resume (each head's store has its own shards)\n"); return 2; }
         WR.skip = 1;
@@ -1846,7 +1853,7 @@ static int predict_one(int argc, char **argv) {
             phead_t *h = &PH[k];
             snprintf(h->attrs, sizeof h->attrs, "{\"ufsm\":{\"content\":\"%s (uint8 = round(p*255))\",\"head\":\"%s\",\"channel\":%d,\"checkpoint\":\"%s\",\"step\":%d,\"source\":\"%s/%s\",\"origin_zyx\":[%lld,%lld,%lld],\"window\":%d,\"halo\":%d,\"ema\":%d%s%s}}",
                      h->content, h->name, h->c0, ckpt, step, root, ak, (long long)(fullg ? 0 : bo[0]), (long long)(fullg ? 0 : bo[1]), (long long)(fullg ? 0 : bo[2]), W, halo, use_ema, grid_attrs, input_attrs);
-            if (hspec) { char d[1600]; snprintf(h->dir, sizeof h->dir, "%s/%s", out, h->name); snprintf(d, sizeof d, "%s/%s", h->dir, lv);
+            if (hspec) { char d[1600]; snprintf(h->dir, sizeof h->dir, "%s/%s", out, h->name); snprintf(d, sizeof d, "%s/%s", h->dir, lv); if (seam2) seam_clear_store(h->dir);
                          if (!(h->w = z3w_create(d, ash, shard, q, 0, h->attrs))) { fprintf(stderr, "%s\n", z3w_error()); return 1; } }
             else { h->w = w; snprintf(h->dir, sizeof h->dir, "%s", out); }
             h->pya = nullptr;
@@ -2019,9 +2026,9 @@ static int predict_one(int argc, char **argv) {
     /* --seam-inproc 1 (predict --seamless 2 in one process, src/seamless.c): two tile grids, interiors anchored at 0 and stride / 2 = the
        shard, both one window per 2^3 shards on the same shard lattice; each shard's two versions blended on the GPU as ink_blend_run
        does (nn_seam_blend_u8) before the writer. sgo[g]: grid g's first tile in shards from the box origin (0 or 1 per axis) */
-    const int seam2 = atoi(opt(argc, argv, "--seam-inproc", "0")) != 0; int64_t sgo[2][3] = {{0}};
+    int64_t sgo[2][3] = {{0}};
     if (seam2) {
-        if (!lhm || !gpath || stride != 2 * shard || !fullg || fea || nwork > 1 || resume || slab || sheet_task || ffd || WR.skip) {
+        if (!lhm || !gpath || stride != 2 * shard || !fullg || fea || nwork > 1 || resume || slab || sheet_task || ffd || atoi(opt(argc, argv, "--no-out", "0"))) {   /* (WR.skip is set by every --heads run: the main writer writes nothing) */
             fprintf(stderr, "predict --seam-inproc: the --heads device path, window - 2 halo = 2 shards, --full-grid 1 (no --resume, --feather, --gpus workers, fit fields)\n"); return 2; }
         kss = 2;
         for (int g = 0; g < 2; g++) for (int d = 0; d < 3; d++) { int64_t r = (g * shard - bo[d]) % stride; if (r < 0) r += stride; sgo[g][d] = r / shard; }
@@ -2191,7 +2198,7 @@ static int predict_one(int argc, char **argv) {
             const uint8_t e = fneed[(sz * nss[1] + sy) * nss[2] + sx];
             if (!e) continue;
             if (rd.ntiles == cap) { cap = cap ? 2 * cap : 1024; rd.tiles = realloc(rd.tiles, (size_t)cap * sizeof *rd.tiles); }
-            rd.tiles[rd.ntiles++] = (tile_t){sz * stride - halo, sy * stride - halo, sx * stride - halo, (sz * nss[1] + sy) * nss[2] + sx, e == 2};
+            rd.tiles[rd.ntiles++] = (tile_t){sz * stride - halo, sy * stride - halo, sx * stride - halo, (sz * nss[1] + sy) * nss[2] + sx, e == 2, 0};
         }
     } else
     if (seam2) {   /* both grids, z layer by layer (the grid whose layer starts lower first), so a shard's two versions arrive close together */
@@ -2221,7 +2228,7 @@ static int predict_one(int argc, char **argv) {
         if (nwork > 1 && (nwq++ % ngpu) != part) continue;
         if (all) continue;
         if (rd.ntiles == cap) { cap = cap ? 2 * cap : 1024; rd.tiles = realloc(rd.tiles, (size_t)cap * sizeof *rd.tiles); }
-        rd.tiles[rd.ntiles++] = (tile_t){sz * stride - halo, sy * stride - halo, sx * stride - halo, (sz * nss[1] + sy) * nss[2] + sx, 0};
+        rd.tiles[rd.ntiles++] = (tile_t){sz * stride - halo, sy * stride - halo, sx * stride - halo, (sz * nss[1] + sy) * nss[2] + sx, 0, 0};
     }
     /* (tile tests: not with --gn-save, whose statistics count every non-air window, nor --feather, whose neighbours need a skipped window's spill;
        UFSM_OCC_TILES=0 off) */
@@ -2253,7 +2260,7 @@ static int predict_one(int argc, char **argv) {
                 if (!occ_any(occb, occo, occn, occf, g0, g1)) { nocct++; continue; }
             }
             if (rd.ntiles == cap) { cap = cap ? 2 * cap : 1024; rd.tiles = realloc(rd.tiles, (size_t)cap * sizeof *rd.tiles); }
-            rd.tiles[rd.ntiles++] = (tile_t){tz, ty, tx, (sz * ns[1] + sy) * ns[2] + sx, 0};
+            rd.tiles[rd.ntiles++] = (tile_t){tz, ty, tx, (sz * ns[1] + sy) * ns[2] + sx, 0, 0};
         }
     }
     if (occt) fprintf(stderr, "predict: %ld windows to run, %ld more skipped (interior air on CT level %d, --occupancy)\n", rd.ntiles, nocct, occl);
@@ -2763,7 +2770,7 @@ static int predict_one(int argc, char **argv) {
                     if (lhm) {   /* every head into its own shard of this super-shard */
                         for (int j = 0; j < nph; j++) phead_fresh(&PH[j], phd);
                         PHEADS_PLACE((int)(tz - qo[0]), (int)(ty - qo[1]), (int)(tx - qo[2]), (int)(qe[0] - qo[0]), (int)(qe[1] - qo[1]), (int)(qe[2] - qo[2]));
-                        if (seam2) { for (int j = 0; j < nph; j++) if (seam_submit(&SM, &PH[j], j, phd, t->g, qz, qy, qx)) return 1; }
+                        if (seam2) { for (int j = 0; j < nph; j++) if (seam_submit(&SM, &PH[j], j, phd, t->g, qz, qy, qx, seam_mark(&SM, Q0[0]))) return 1; }
                         else for (int j = 0; j < nph; j++) if (phead_submit(&PH[j], phd, qz, qy, qx, SZ * kss)) return 1;
                         phd ^= 1;
                         nn_ptick("heads place + d2h");
