@@ -504,6 +504,20 @@ extern "C" void nn_split_halo_end(void *t, int side, shape5 s, int esz, int h, v
     CK(cudaEventRecord(zs_hev(dev, side, slot, 2), 0));
     KCHECK();
 }
+extern "C" void nn_split_halo_k(void *const *t, const int *dev, shape5 s, int esz, int h, int k, void *const *sb, void *const *rb) {
+    int cur; cudaGetDevice(&cur);
+    g_zs_same = dev[0] == dev[1];
+    zseg_t sg[2][2]; int ns = 0;
+    for (int i = 0; i < 2; i++) { cudaSetDevice(dev[i]); ns = zsegs(t[i], s, esz, sg[i]); }
+    const size_t nbytes = (size_t)k * zsegs_plane_bytes(sg[0], ns);
+    const int D = s.d, zsend[2] = {D - h - k, h}, zrecv[2] = {D - h, h - k};
+    for (int i = 0; i < 2; i++) { cudaSetDevice(dev[i]); zsegs_copy(t[i], sg[i], ns, zsend[i], k, sb[i], 0); }
+    zs_xbar(dev, 2);   /* (both send buffers packed) */
+    for (int i = 0; i < 2; i++) { cudaSetDevice(dev[i]); CK(cudaMemcpyPeerAsync(rb[i], dev[i], sb[1 - i], dev[1 - i], nbytes, 0)); zsegs_copy(t[i], sg[i], ns, zrecv[i], k, rb[i], 1); }
+    zs_xbar(dev, 3);   /* (both copies done before either send buffer is reused) */
+    cudaSetDevice(cur);
+    KCHECK();
+}
 __global__ void zs_add_k(double *a, const double *b, int n) { int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) a[i] += b[i]; }
 extern "C" void nn_split_allreduce(double *const *b, const int *dev, int n, double *const *r) {
     int cur; cudaGetDevice(&cur);

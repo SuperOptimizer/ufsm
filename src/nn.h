@@ -528,6 +528,9 @@ size_t nn_split_halo_bytes(shape5 s, int esz);
    may be in flight, each with its own buffers */
 void nn_split_halo_begin(void *const *t, const int *dev, shape5 s, int esz, int h, void *const *sb, void *const *rb, int slot);
 void nn_split_halo_end(void *t, int side, shape5 s, int esz, int h, void *rb, int slot);
+/* the k innermost halo planes at once (k <= h; synchronous on both devices' stream 0, no zeroing): side 0 sends its own planes
+   [D - h - k, D - h) into side 1's [h - k, h), side 1 its [h, h + k) into side 0's [D - h, D - h + k). sb / rb: k planes each */
+void nn_split_halo_k(void *const *t, const int *dev, shape5 s, int esz, int h, int k, void *const *sb, void *const *rb);
 void nn_split_allreduce(double *const *b, const int *dev, int n, double *const *r);
 /* Device-to-device copy across GPUs (peer access when possible). */
 void nn_peer_copy(void *dst, int dst_dev, const void *src, int src_dev, size_t bytes);

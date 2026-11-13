@@ -46,24 +46,24 @@ static void logits_d2h(side_t *d, const float *lg, int cout, int dcells, int z0,
     }
 }
 /* the streamed head (unet_head_fwd_z) on cell plane z: fp16 [cout][plane] to the host (0: not covered) */
-static int head_plane(side_t *d, int cout, int z, _Float16 *out) {
-    const size_t pl = (size_t)Pc * Pc; void *y = nn_malloc((size_t)cout * pl * 2);
-    const int r = unet_head_fwd_z(d->u, z, z + 1, y); nn_sync();
-    if (!r) nn_d2h(out, y, (size_t)cout * pl * 2);
+static int head_plane(side_t *d, int cout, int z, _Float16 *out) {   /* cells [z, z + 2) */
+    const size_t pl = (size_t)Pc * Pc; void *y = nn_malloc((size_t)cout * 2 * pl * 2);
+    const int r = unet_head_fwd_z(d->u, z, z + 2, y); nn_sync();
+    if (!r) nn_d2h(out, y, (size_t)cout * 2 * pl * 2);
     nn_free(y); return !r;
 }
-/* forward (the owned cells' logits to lo right away: lean layouts reuse the logit buffer in the backward), the halo cell next to the cut
-   through the streamed head after unet_split_head_halo (side >= 0; the single run: both cells next to the cut), then the backward */
+/* forward (the owned cells' logits to lo right away: lean layouts reuse the logit buffer in the backward), the 2 halo cells next to the cut
+   through the streamed head after unet_split_head_halo k 2 (side >= 0; the single run: the 2 cells each side of the cut), then the backward */
 static float *g_lo; static _Float16 *g_hh[2]; static int g_hok[2];
 static void step(side_t *d, int cin, int cout, int dcells, int side) {
     const shape5 xs = {1, cin, dcells, Pc, Pc};
     const float *lg = unet_forward_x(d->u, d->ct, xs, 1, 1); nn_sync();
     const size_t pl = (size_t)Pc * Pc;
-    if (side < 0) { logits_d2h(d, lg, cout, dcells, 0, Pc, g_lo, 0); for (int k = 0; k < 2; k++) g_hok[k] = head_plane(d, cout, Pc / 2 - 1 + k, g_hh[k]); }
+    if (side < 0) { logits_d2h(d, lg, cout, dcells, 0, Pc, g_lo, 0); g_hok[0] = head_plane(d, cout, Pc / 2, g_hh[0]); g_hok[1] = head_plane(d, cout, Pc / 2 - 2, g_hh[1]); }
     else {
         logits_d2h(d, lg, cout, dcells, side ? H0 : 0, Pc / 2, g_lo, side ? Pc / 2 : 0);
-        unet_split_head_halo(d->u);   /* (a collective) */
-        g_hok[side] = head_plane(d, cout, side ? H0 - 1 : dcells - H0, g_hh[side]);   /* side 0's halo cell Pc / 2, side 1's Pc / 2 - 1 */
+        unet_split_head_halo(d->u, split_halo_k, 2);   /* (a collective) */
+        g_hok[side] = head_plane(d, cout, side ? H0 - 2 : dcells - H0, g_hh[side]);   /* side 0's halo cells Pc / 2 .. + 1, side 1's Pc / 2 - 2 .. - 1 */
     }
     (void)pl;
     unet_zero_grad(d->u); unet_backward_x(d->u, d->gl, 1);
@@ -76,9 +76,9 @@ static void single(const unet_cfg *cfg, unsigned sr, float *g, float *lo, _Float
 }
 static side_t S2[2]; static const unet_cfg *g_cfg;
 static void job(int side, void *a) { (void)a; step(&S2[side], g_cfg->cin, g_cfg->cout, Dl, side); }
-/* hh0 / hh1: the head logits of cells Pc / 2 - 1 (side 1's halo) and Pc / 2 (side 0's halo) */
+/* hh0: cells Pc / 2 .. + 1 (side 0's halo), hh1: Pc / 2 - 2 .. - 1 (side 1's) */
 static void split2(split_ctx *ctx, const unet_cfg *cfg, unsigned sr, float *g, float *lo, _Float16 *hh0, _Float16 *hh1, int *hok, size_t np) {
-    g_cfg = cfg; g_lo = lo; g_hh[1] = hh0; g_hh[0] = hh1;
+    g_cfg = cfg; g_lo = lo; g_hh[0] = hh0; g_hh[1] = hh1;
     for (int s = 0; s < 2; s++) { nn_init(DEV[s]); nn_set_sr_step(sr); side_alloc(&S2[s], cfg, Dl, s); unet_set_split(S2[s].u, s, H0, split_halo);
                                   if (!getenv("UFSM_SPLIT_SYNC")) unet_set_split_async(S2[s].u, split_halo_begin, split_halo_end); }
     split_run(ctx, job, nullptr);
@@ -127,7 +127,7 @@ int main(void) {
     size_t np; { unet *pr = unet_create(&cfg); np = unet_nparams(pr); unet_free(pr); }
     float *g0 = malloc(np * 4), *g1 = malloc(np * 4), *g2 = malloc(np * 4);
     const size_t nl = (size_t)cfg.cout * c3; float *l0 = malloc(nl * 4), *l1 = malloc(nl * 4), *l2 = malloc(nl * 4);
-    const size_t hn = (size_t)cfg.cout * Pc * Pc; _Float16 *h0a = malloc(hn * 2), *h0b = malloc(hn * 2), *h1a = malloc(hn * 2), *h1b = malloc(hn * 2), *h2a = malloc(hn * 2), *h2b = malloc(hn * 2);
+    const size_t hn = (size_t)cfg.cout * 2 * Pc * Pc; _Float16 *h0a = malloc(hn * 2), *h0b = malloc(hn * 2), *h1a = malloc(hn * 2), *h1b = malloc(hn * 2), *h2a = malloc(hn * 2), *h2b = malloc(hn * 2);
     printf("test_split_lat: P %d voxels (%d cells), level-0 halo %d cells, local depth %d cells%s, %zu params\n", P, Pc, H0, Dl, DEV[0] == DEV[1] ? ", both halves on one GPU" : "", np);
     int fails = 0, ci = 0;
     static const int syms[3] = {0 | 1 << 2 | 2 << 4, 0 | 1 << 2 | 2 << 4 | 1 << 8, 1 | 0 << 2 | 2 << 4};   /* identity, z flip, z <-> y */

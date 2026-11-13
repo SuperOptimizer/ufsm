@@ -155,12 +155,23 @@ latency from the split. Training goes first.
     The existing upload, label stream, planner and head-slab code then run unchanged on the half.
   - The head slabs mask the halo voxels (hs_clip). The statistics pass counts the owned voxels; the loss finalisations already
     sum across the GPUs (zs_reduce in nn_loss_stats_fin / nn_wind4_fin).
-  - The gradient pass also takes the 2 halo voxels next to the cut. Their trilinear upsample reads the owned boundary cell and
-    the exchanged halo cell, so the owned cells' gradient is complete without a reverse halo add. The halo cells' gradient is
-    dropped (hs_zero_halo_cells, before the streamed head backward).
+  - The gradient pass also takes the halo cell next to the cut (4 voxels). The latent upsampling is the pool4 chain: every voxel of
+    cell c reads cells c-1 .. c+1 (nn_lat.cu LW), so those voxels reach the owned boundary cell, and they read the 2 innermost
+    halo cells. Hence unet_split_head_halo exchanges 2 planes (split_halo_k / nn_split_halo_k, a new k-plane collective). The owned
+    cells' gradient is then complete without a reverse halo add, and the halo cells' gradient is dropped (hs_zero_halo_cells,
+    before the streamed head backward).
+  - The first version used a 2-voxel band and a 1-plane exchange (assuming plain trilinear). The trainer A/B caught it: every cell
+    plane was bit-identical except the 2 at the cut (7 % of values, rel 1.6e-2), which the backward amplified to 0.2 rel in
+    enc0.c1 (3e-2 overall).
   - The fine stem's weight gradient takes the owned planes only.
   - One fstem-dropout and lat-step-jitter draw per window.
   - The light statistics pass is off: it would double-count the band in the logged loss.
+- Trainer A/B (scripts/test/split_lat_ab.sh: P 256, 32-64 net, every u1 head but ssl, --fstem 16, --film 2, --uw 1, --det 1,
+  round to nearest + MX-fp8 gradients via UFSM_TEST_SR_OFF / UFSM_GRAD_MX4=0; UFSM_GRAD_DUMP: the first step's loss and summed
+  gradient). One GPU vs the split, both halves on GPU 0:
+  - the loss is identical (2.96193621);
+  - every streamed cell-gradient plane is bit-identical (UFSM_LATG_DUMP, per half .s0 / .s1);
+  - the parameter gradient rel is 8.0e-8, the one-GPU rerun level (5.7e-8).
 - Not yet under the split (refused): --gpu-aug (univA's z-range builders), --ssl, --ink-mil, --fib-head, --fib-normal-lambda,
   --pgrad, --count, --pap-head, --distill, --lat-guide 1 / 2, the unstreamed latent head.
 

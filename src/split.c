@@ -4,7 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-typedef struct { int kind; const void *p; shape5 s; int esz, h; double *b; int n; int slot; } coll_t;   /* kind 1 halo, 2 reduce */
+typedef struct { int kind; const void *p; shape5 s; int esz, h; double *b; int n; int slot; } coll_t;   /* kind 1 halo, 2 reduce, 3 k halo planes (n = k) */
 
 struct split_ctx {
     int dev[2];
@@ -59,7 +59,7 @@ static void grow(split_ctx *c, size_t bytes, int nd) {
 
 static void execute(split_ctx *c) {
     coll_t *a = &c->slot[0], *b = &c->slot[1];
-    if (a->kind != b->kind || (a->kind == 1 && (memcmp(&a->s, &b->s, sizeof a->s) || a->esz != b->esz || a->h != b->h || a->slot != b->slot)) || (a->kind == 2 && a->n != b->n)) {
+    if (a->kind != b->kind || ((a->kind == 1 || a->kind == 3) && (memcmp(&a->s, &b->s, sizeof a->s) || a->esz != b->esz || a->h != b->h || a->slot != b->slot)) || (a->kind == 2 && a->n != b->n)) {
         fprintf(stderr, "split: the two halves diverged (collective %u: kind %d / %d)\n", c->seq, a->kind, b->kind);
         abort();
     }
@@ -68,6 +68,11 @@ static void execute(split_ctx *c) {
         if (nb > c->cap) grow(c, nb, 0);
         void *t[2] = {(void *)a->p, (void *)b->p};
         nn_split_halo_begin(t, c->dev, a->s, a->esz, a->h, c->sb[a->slot], c->rb[a->slot], a->slot);
+    } else if (a->kind == 3) {   /* k halo planes (coll_t.n = k), the synchronous buffers */
+        size_t nb = (size_t)a->n * nn_split_halo_bytes(a->s, a->esz);
+        if (nb > c->cap) grow(c, nb, 0);
+        void *t[2] = {(void *)a->p, (void *)b->p};
+        nn_split_halo_k(t, c->dev, a->s, a->esz, a->h, a->n, c->sb[1], c->rb[1]);
     } else {
         if (a->n > c->rcap) grow(c, 0, a->n);
         double *bb[2] = {a->b, b->b};
@@ -99,6 +104,7 @@ static void halo_begin(const void *p, shape5 s, int esz, int h, int slot) { coll
 void split_halo_begin(const void *p, shape5 s, int esz, int h) { halo_begin(p, s, esz, h, 0); }
 void split_halo_end(const void *p, shape5 s, int esz, int h) { nn_split_halo_end((void *)p, t_side, s, esz, h, t_ctx->rb[0][t_side], 0); }
 void split_halo(const void *p, shape5 s, int esz, int h) { halo_begin(p, s, esz, h, 1); nn_split_halo_end((void *)p, t_side, s, esz, h, t_ctx->rb[1][t_side], 1); }
+void split_halo_k(const void *p, shape5 s, int esz, int h, int k) { coll_t x = {3, p, s, esz, h, nullptr, k, 1}; collective(&x); }
 void split_reduce(double *b, int n) { coll_t x = {2, nullptr, {0}, 0, 0, b, n, 0}; collective(&x); }
 
 typedef struct { split_ctx *c; int side; } warg_t;

@@ -376,7 +376,7 @@ static int g_Dl, g_h0; static uint8_t *g_zeros;
 /* --split z with --lat 4 (g_lsplit): each GPU runs its half as a window of its own, depth g_Pz = g_Dl = P / 2 + g_h0 voxels (g_h0 = 4 x the
    trunk's 2^(L-1) halo cells): the batch arrives as a view of the sampler's P^3 window at plane split_z0 (batch_view: plane pointers offset,
    the radial record with the global depth and the first plane, nn.h NN_RAD_REC word 7), the head slabs mask the halo voxels (hs_clip: the loss
-   counts owned voxels; the gradient pass also takes the 2 halo voxels next to the cut, whose upsampled logits read the owned cell beside it, and
+   counts owned voxels; the gradient pass also takes the halo cell next to the cut, whose upsampled logits read the owned cell beside it, and
    the halo cells' gradient is dropped), the loss sums add across the GPUs in their finalisation (zs_reduce). g_Pw: the sampler's window depth */
 static int g_lsplit, g_Pw;
 static int g_bench_same;   /* UFSM_BENCH_SAME */
@@ -1020,12 +1020,12 @@ static int lhalo(int k) { return k == 0 ? g_norm_s : k >= 3 && k - 3 < g_naux &&
         else nn_loss_stats_acc(LGC(g_fib_ch + 2), d->fdt, d->fdm, d->nw, sev_, d->hs_ds + 84); \
         nn_set_pos_weight(pw_); } while (0)
 /* g_lsplit: the window planes [a, b) whose voxels this half's head slabs supervise. The statistics pass: the owned voxels, so every voxel counts
-   once across the GPUs (the loss sums add in their finalisation). The gradient pass also the 2 halo voxels next to the cut: their upsampled
-   logits (trilinear from the cell centres) read the owned cell beside the cut and the innermost halo cell (exchanged: unet_split_head_halo),
-   so the owned cells' gradient is complete on this GPU; the gradient they leave on the halo cells is dropped (hs_zero_halo_cells: the other
+   once across the GPUs (the loss sums add in their finalisation). The gradient pass also the halo cell next to the cut (4 voxels): the
+   upsampling (the pool4 chain: every voxel of cell c reads cells c - 1 .. c + 1, nn_lat.cu LW) reaches the owned cell beside the cut from
+   them, and they read the 2 innermost halo cells (exchanged: unet_split_head_halo k 2), so the owned cells' gradient is complete on this GPU; the gradient they leave on the halo cells is dropped (hs_zero_halo_cells: the other
    GPU computes it for its own cells) */
 static void hs_keep(const gpu_state *d, int pass, int *a, int *b) {
-    const int bd = pass ? 2 : 0;
+    const int bd = pass ? 4 : 0;
     *a = g_lsplit && d->side == 1 ? g_h0 - bd : 0; *b = g_lsplit && d->side == 0 ? g_Pz - g_h0 + bd : g_Pz;
 }
 static void hs_clip(const gpu_state *d, int pass, uint8_t *m, int z0, int z1, size_t hw) {   /* a slab mask (planes [z0, z1)) zeroed outside hs_keep */
@@ -1293,10 +1293,10 @@ static void head_slab_pass(gpu_state *d, int pass) {
                 hs_zero_halo_cells(d, d->latgc, LNC, f0, f1, pl);   /* (g_lsplit: the other GPU's cells) */
                 if (d->gc_on) nn_gram16(d->latgc, 0, LNC, (size_t)(f1 - f0) * pl, (size_t)(f1 - f0) * pl, d->gcS);   /* --grad-cos: the head input's task dots */
                 if (getenv("UFSM_LATG_DUMP")) {   /* the finished coarse gradient planes of every slab of the first step, appended (fp16; fused against chain) */
-                    static int done, nth = -1; if (nth < 0) nth = getenv("UFSM_LATG_STEP") ? atoi(getenv("UFSM_LATG_STEP")) - 1 : 0;   /* (UFSM_LATG_STEP=n: the nth gradient pass instead) */
+                    static int done_[3], nth = -1; int *const dp_ = &done_[d->side + 1]; int done = *dp_; if (nth < 0) nth = getenv("UFSM_LATG_STEP") ? atoi(getenv("UFSM_LATG_STEP")) - 1 : 0;   /* (UFSM_LATG_STEP=n: the nth gradient pass instead) */
                     if (done == nth) { const size_t nb = (size_t)LNC * (f1 - f0) * pl * 2; void *hb = malloc(nb); nn_sync(); nn_d2h(hb, d->latgc, nb);
-                        FILE *f = fopen(getenv("UFSM_LATG_DUMP"), z0 ? "ab" : "wb"); if (f) { fwrite(hb, 1, nb, f); fclose(f); } free(hb); }
-                    if (z1 == D && done <= nth) done++;
+                        char fn_[1100]; snprintf(fn_, sizeof fn_, "%s%s", getenv("UFSM_LATG_DUMP"), d->side == 0 ? ".s0" : d->side == 1 ? ".s1" : ""); FILE *f = fopen(fn_, z0 ? "ab" : "wb");   /* (a split half: its own file) */ if (f) { fwrite(hb, 1, nb, f); fclose(f); } free(hb); }
+                    if (z1 == D && done <= nth) *dp_ = done + 1;
                 }
                 if (unet_head_bwd_z(d->u, f0, f1, d->latgc, z0 == 0)) { fprintf(stderr, "latent head stream: the head backward is not covered per slab (UFSM_LAT_HEAD_STREAM=0)\n"); abort(); }
             }
@@ -1642,7 +1642,7 @@ static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
         nn_ptick("other"); const shape5 ls = {B, unet_cfg_of(d->u)->cin, g_Pz / 4, P / 4, P / 4};
         if (d->ssl_win) ssl_teacher(d, ls, P);   /* --ssl, an unlabelled window: the teacher's targets, the student's masked input */
         lg = unet_forward_x(d->u, d->x, ls, train, g_xfmt != 0); nn_ptick("trunk forward");
-        if (g_lsplit) unet_split_head_halo(d->u);   /* (the halo cell next to the cut: the head slabs' band reads it) */
+        if (g_lsplit) unet_split_head_halo(d->u, split_halo_k, 2);   /* (the 2 halo cells next to the cut: the head slabs' band reads them) */
     }   /* --lat: x the full-resolution CT channel */
     else lg = unet_forward_x(d->u, d->x, xs, train, g_xfmt != 0);
     d->lg = lg;
@@ -2135,8 +2135,8 @@ int cmd_train(int argc, char **argv) {
                 fprintf(stderr,"--rv 1 (recto / verso in the phase slots: no --phase-trunc / --pgrad-lambda) | 2 (own channels beside the phase, --rv-lambda >= 0); --rv-iso 1..255\n"); return 2;
             }
             if (!(g_w4_lambda >= 0) || g_ink2 < 0 || g_ink2 > 1 || (!g_ink2 && (opt(argc,argv,"--ink-lambda",nullptr) || opt(argc,argv,"--ink-dice",nullptr) || opt(argc,argv,"--ink-mil",nullptr))) || atoi(opt(argc,argv,"--cond","0")) ||
-                atoi(opt(argc,argv,"--pap-head","0")) || (g_ink2 && !strcmp(opt(argc,argv,"--split","0"),"z"))) {
-                fprintf(stderr,"--task unwrap2: --ink-head 0|1 (--ink-lambda / --ink-dice / --ink-mil only with --ink-head 1; no --split with the ink head), no --cond or --pap-head; --wind4-lambda >= 0\n"); return 2;
+                atoi(opt(argc,argv,"--pap-head","0")) || (g_ink2 && !strcmp(opt(argc,argv,"--split","0"),"z") && atoi(opt(argc,argv,"--lat","0")) != 4)) {
+                fprintf(stderr,"--task unwrap2: --ink-head 0|1 (--ink-lambda / --ink-dice / --ink-mil only with --ink-head 1; no --split with the ink head but under --lat 4), no --cond or --pap-head; --wind4-lambda >= 0\n"); return 2;
             }
         }
         g_ink_lambda = (float)atof(opt(argc,argv,"--ink-lambda","1")); g_ink_dice = (float)atof(opt(argc,argv,"--ink-dice","0"));
