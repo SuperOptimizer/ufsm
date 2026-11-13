@@ -481,11 +481,21 @@ static void view_set(gpu_state *d, int B) {
 static void axr_set(gpu_state *d, int i) { if (g_axr) unet_set_attn_axis(d->u, d->axv[i] ? d->axh[i] : nullptr, d->axn[i], d->axs[i]); }
 /* once the memory mode is set: the GPU-built input needs the 16-bit -> MX input conversion (unet_input_converted: MX activations with
    MX gradients or an input policy) */
+/* the split's zero planes: pinned, or under UFSM_SAMPLER_ONLY with no GPU plain zeroed memory (that mode returns before any free) */
+static int g_zeros_plain;
+static uint8_t *zeros_alloc(size_t n) {
+    uint8_t *p = nn_host_alloc(n); g_zeros_plain = 0;
+    if (!p && getenv("UFSM_SAMPLER_ONLY")) { p = calloc(n, 1); g_zeros_plain = 1; }
+    if (!p) { fprintf(stderr, "cannot allocate the %zu B split zero planes\n", n); exit(1); }
+    memset(p, 0, n); return p;
+}
+static void zeros_free(void *p) { if (g_zeros_plain) free(p); else nn_host_free(p); }
 static void gpu_input_settle(sample_cfg *sc, int assume_mx) {   /* (assume_mx: UFSM_SAMPLER_ONLY, no network: as with an MX input) */
     g_gpu_in = g_gpu_want && (assume_mx || unet_input_converted());
     g_xs = g_gpu_in ? 1 : g_xc; sc->gpu_input = g_gpu_in;
     g_gpu_aug = g_gpu_aug_want && g_gpu_in && sample_gpu_aug_ok(sc) ? 1 : 0;
-    if (g_gpu_aug && g_gpu_aug_want == 2) { if (sample_gpu_lwarp_ok(sc)) g_gpu_aug = 2; else fprintf(stderr, "--gpu-aug 2: the labels' warp needs packed targets and no sheet / pmask / gap / distill / cond / band / aux labels; --gpu-aug 1\n"); }
+    if (g_gpu_aug && g_gpu_aug_want == 2) { if (sample_gpu_lwarp_ok(sc)) g_gpu_aug = 2; else fprintf(stderr, "--gpu-aug 2: the labels' warp needs packed targets and no sheet / pmask / gap / distill / cond / band / aux labels; --gpu-aug 1 (here: pack_tm %d sheet %d pap_head %d emb %d cond %d band %d aux %d)\n",
+                                                                   sc->pack_tm, sc->sheet, sc->pap_head, sc->emb_ch, sc->cond, sc->band, sc->aux); }
     sc->gpu_aug = g_gpu_aug;
     sc->w4_dev = g_w4dev_want && g_gpu_aug == 2 && sc->wind4 && g_w4n > 0;
     if (sc->w4_dev) { w4dev_init(g_w4devs, g_w4n); fprintf(stderr, "input: the winding mod 4 labels' runs and codes on the GPU, its union-find on the host (--gpu-aug 3; the same bytes as --gpu-aug 2)\n"); }
@@ -2660,7 +2670,7 @@ int cmd_train(int argc, char **argv) {
         if (ng != 2) { fprintf(stderr, "--split z needs --gpus with two devices\n"); return 2; }
         if (P % (2 * g_h0)) { fprintf(stderr, "--split z: P must be divisible by %d\n", 2 * g_h0); return 2; }
         if (overfit || getenv("UFSM_SYNC_UPLOAD") || !nn_get_tf32()) { fprintf(stderr, "--split z: not with --overfit, UFSM_SYNC_UPLOAD or --fp32\n"); return 2; }
-        g_zeros = nn_host_alloc((size_t)g_h0 * P * P); memset(g_zeros, 0, (size_t)g_h0 * P * P);
+        g_zeros = zeros_alloc((size_t)g_h0 * P * P);
     }
     {   /* --half-res pool|pack: the network runs on 2x2x2 blocks of the window (nn.h nn_half_*); the checkpoint decides on resume */
         const char *hr = opt(argc, argv, "--half-res", "none");
@@ -2677,7 +2687,7 @@ int cmd_train(int argc, char **argv) {
             if (split) {   /* the halo in voxels: 4 per trunk cell (g_lsplit above) */
                 g_lsplit = 1; g_h0 = 4 << (g_split_top ? g_split_top : cfg.nlev - 1); g_Dl = P / 2 + g_h0;
                 if (P % (2 * g_h0) || B != 1) { fprintf(stderr, "--lat 4 --split z: B 1, P divisible by %d\n", 2 * g_h0); return 2; }
-                nn_host_free(g_zeros); g_zeros = nn_host_alloc((size_t)g_h0 * P * P); memset(g_zeros, 0, (size_t)g_h0 * P * P);
+                zeros_free(g_zeros); g_zeros = zeros_alloc((size_t)g_h0 * P * P);
             }
             if (!nn_get_f16()) { fprintf(stderr, "--lat 4: fp16 training (--f16 1)\n"); return 2; }
             if (P % (4 << (cfg.nlev - 1)) || (!g_lsplit && g_Pz % (4 << (cfg.nlev - 1)))) { fprintf(stderr, "--lat 4: P must be divisible by %d\n", 4 << (cfg.nlev - 1)); return 2; }
