@@ -64,6 +64,7 @@ test_half                                      | gpu          |     1 | ./$B/tes
 test_unwrap_targets                            | gpu          |     1 | ./$B/test_unwrap_targets
 test_fib_dir                                   | gpu          |     1 | ./$B/test_fib_dir
 test_gpu_aug                                   | gpu          |     6 | ./$B/test_gpu_aug
+test_aug_z                                     | gpu          |    10 | ./$B/test_aug_z
 test_fit                                       | gpu          |   320 | UFSM_TEST_QUICK=1 ./$B/test_fit
 test_fit~full                                  | slow,gpu     |  1281 | ./$B/test_fit
 test_fit_join                                  | gpu          |     9 | ./$B/test_fit_join

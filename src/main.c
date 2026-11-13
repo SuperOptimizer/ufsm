@@ -233,7 +233,7 @@ static int usage(void) {
         "  ufsm surf-snap <wraps-in> <wraps-out> --volume ROOT KEY --vol-um U   tifxyz vertices onto the nearest papyrus ridge\n"
         "  ufsm wrap-snap <wraps-in> <wraps-out> --axis F --axis-um U0 --ct ROOT KEY --ct-um U   .sfc wraps moved along their rays onto the sheets (smooth, order-kept)\n"
         "  ufsm trace-prep --prob P --box Z0,Y0,X0,NZ,NY,NX --axis A --out DIR [--field ridge|prob] [--seeds 64]   tracer box input: radial ridge as an OME zarr v2 pyramid + seeds\n"
-        "  ufsm gt-gate --gt ROOT --gt-key K --prob ROOT --prob-key K --axis A --out DIR [--min-support 0.75] [--sup-r 2] [--skip-check 0] [--dir auto|radial|par] [--orient-deg A] [--interval 1]\n"
+        "  ufsm gt-gate --gt ROOT --gt-key K --prob ROOT --prob-key K --axis A --out DIR [--min-support 0.75] [--sup-r 2] [--skip-check 0] [--dir auto|radial|par] [--orient-deg A] [--interval 1] [--phase-rmax R: --phase-key names codes]\n"
         "      [--phase R --phase-key K [--ignore R --ignore-key K] --phase-out DIR [--min-keep 0.3] [--shard-frac 1]]   label ignore mask: GT cells whose sheets are off the CT; --phase: that phase with gated cells unknown (lossless)\n"
         "  ufsm gt-support --gt G --prob P --box Z0,Y0,X0,NZ,NY,NX --axis A   share of GT sheet voxels on CT-visible (prob ridge) sheets, by GT spacing\n"
         "  ufsm raw2jpg IN.raw W H OUT.jpg [--rgb] [--mark Y,X]..   a uint8 raw slice as a grey JPEG (QA)\n"

@@ -255,7 +255,7 @@ static int g_gc;
    the 38.4 um cells' missing resolution, DESIGN latbeat), its projection added to every head output the slabs hold as voxel logits (all but
    the fused normal / density group); --fstem-drop P: a training window without it (level dropout: the net keeps working without the fine
    level, as for scans with no finer data; validation and predict always use it) */
-static int g_fstem, g_fs_n, g_fs_ch[16]; static float g_fs_drop = 0.25f;
+static int g_fstem, g_fs_n, g_fs_ch[32]; static float g_fs_drop = 0.25f;
 static float src_head_w(int si, int h) { return (si >= 0 && g_S && si < g_S->n ? g_S->src[si].head_w[h] : 1.f) * g_hmul[h]; }   /* the source's "heads" multiplier x --uw */
 /* --init-from: does an unwrap2 donor keep its rv pair / ink row somewhere other than this net's channels (u1 rv 11-12 -> U2 ink 11, rv
    12-13)? Then the head is mapped by name; same places (a donor that only lacks appended heads, e.g. the fibre head) keep the positional
@@ -2615,28 +2615,32 @@ int cmd_train(int argc, char **argv) {
         else if (share >= 0 && share < 1 && wu > 0 && wl > 0) { const double f = share / (1 - share) * wl / wu; for (int i = 0; i < S->n; i++) if (S->src[i].ct_only) S->src[i].weight *= f; wu *= f; }
         if (nu) fprintf(stderr, "ssl: %d unlabelled sources, %.1f%% of the source weight\n", nu, 100 * wu / (wu + wl));
     }
+    /* the device memory the data path reserves before the memory planner reads the free memory (2026-11-13: ~7 GB of a 16 GB card on the
+       scratch sources), one line per owner */
+#define ONFLY_MEM(what) do { size_t fr_, to_; if (!nn_dev_mem(&fr_, &to_) && to_) fprintf(stderr, "memory: %.2f GB free on the device after %s\n", fr_ / 1e9, what); } while (0)
+    ONFLY_MEM("start-up");
     {   /* sources with an on-the-fly phase (band_onfly.h): the pair rule on --onfly-gpu (default the run's first GPU; -1 the CPU), its
            --onfly-slots tile buffers of --onfly-mb each reserved now, before the memory planner reads the free device memory */
         float rmax = 0; for (int i = 0; i < S->n; i++) if (S->src[i].phase_onfly > rmax) rmax = S->src[i].phase_onfly;
         if (rmax > 0) {
             const int og = atoi(opt(argc, argv, "--onfly-gpu", "0")), os = atoi(opt(argc, argv, "--onfly-slots", "2")), om = atoi(opt(argc, argv, "--onfly-mb", "2048"));
             if (phase_onfly_config(og, os, om, 1)) { fprintf(stderr, "train: --onfly-gpu %d: no GPU pair rule (or the reserve failed)\n", og); return 1; }
-            fprintf(stderr, "train: on-the-fly phase on %s %d, %d slots of %d MB (tile edge %d voxels at rmax %g)\n", og >= 0 ? "GPU" : "CPU", og, os, om, phase_onfly_tile_edge(rmax), rmax);
+            fprintf(stderr, "train: on-the-fly phase on %s %d, %d slots of %d MB (tile edge %d voxels at rmax %g)\n", og >= 0 ? "GPU" : "CPU", og, os, om, phase_onfly_tile_edge(rmax), rmax); ONFLY_MEM("the on-the-fly phase slots");
         }
         int nfib = 0; for (int i = 0; i < S->n; i++) for (int c = 0; c < NTG; c++) nfib += S->src[i].tgt_fib[c] != nullptr;
         if (nfib) {   /* "fibre" targets (fiberraster.h): the planes' stamp and combine on --onfly-gpu, buffers for the window's box reserved now */
-            const int og = atoi(opt(argc, argv, "--onfly-gpu", "0")), P0 = atoi(opt(argc, argv, "--P", "64")), e = P0 + 64;
+            const int og = atoi(opt(argc, argv, "--fibre-gpu", opt(argc, argv, "--onfly-gpu", "0"))), P0 = atoi(opt(argc, argv, "--P", "64")), e = P0 + 64;   /* (--fibre-gpu: another card than the phase's, e.g. the split's second) */
             const int fg = fiber_onfly_config(og, e);
             if (fg < 0) { fprintf(stderr, "train: --onfly-gpu %d: no GPU fibre planes (or the reserve failed)\n", og); return 1; }
             if (fg) fprintf(stderr, "train: on-the-fly fibre planes (%d targets) on GPU %d, buffers for %d^3 boxes\n", nfib, og, e);
-            else fprintf(stderr, "train: on-the-fly fibre planes (%d targets) on the CPU\n", nfib);
+            else fprintf(stderr, "train: on-the-fly fibre planes (%d targets) on the CPU\n", nfib); ONFLY_MEM("the fibre planes");
         }
         mesh_codes_gpu_config(atoi(opt(argc, argv, "--onfly-gpu", "0")));   /* the mesh codes stamp ("onfly": {"meshes"}) on the same device (-1 the CPU) */
         int nink = 0; for (int i = 0; i < S->n; i++) for (int c = 0; c < NTG; c++) nink += S->src[i].ink_fly[c] != nullptr;
         if (nink) {   /* "onfly" ink targets (inksplat.h inkfly_open): face + splat of a cold chunk on --onfly-gpu (per sampler thread a stream; -1 the CPU) */
-            const int og = atoi(opt(argc, argv, "--onfly-gpu", "0")); inkfly_gpu_config(og);
+            const int og = atoi(opt(argc, argv, "--ink-gpu", opt(argc, argv, "--onfly-gpu", "0"))); inkfly_gpu_config(og);   /* (--ink-gpu: as --fibre-gpu) */
             fprintf(stderr, "train: on-the-fly ink targets (%d) computed on %s %d (cached per 128^3 chunk: memory + %s)\n", nink, og >= 0 ? "GPU" : "CPU", og,
-                    dcache_default_dir() ? dcache_default_dir() : "no disk cache");
+                    dcache_default_dir() ? dcache_default_dir() : "no disk cache"); ONFLY_MEM("the ink targets");
         }
     }
     for (int i = 0; g_restore && i < S->n; i++) if (!S->src[i].srp != !g_rpairs) { fprintf(stderr, "--task restore: %s: \"sr_pair\" sources need --sr-pairs 1 and --sr-pairs 1 needs them all\n", S->src[i].name); return 2; }
@@ -3041,7 +3045,7 @@ int cmd_train(int argc, char **argv) {
     g_fstem = atoi(opt(argc, argv, "--fstem", "0")); g_fs_drop = (float)atof(opt(argc, argv, "--fstem-drop", "0.25"));
     if (g_fstem) {
         if (g_fstem < 1 || g_fstem > 16 || !(g_fs_drop >= 0 && g_fs_drop < 1) || !g_lat || g_lat_guide != 64 || !g_unwrap2 || B != 1) { fprintf(stderr, "--fstem 1..16 (--fstem-drop 0..1): task unwrap2, --lat 4 --lat-guide 3, --B 1\n"); return 2; }
-        g_fs_n = 0; for (int c = 0; c < g_cout; c++) if (c < g_norm_ch || c >= g_norm_ch + 7) g_fs_ch[g_fs_n++] = c;   /* (every voxel-logit output: not the fused normal / density) */
+        g_fs_n = 0; for (int c = 0; c < (g_pad_ch >= 0 ? g_pad_ch : g_cout); c++) if ((c < g_norm_ch || c >= g_norm_ch + 7) && g_fs_n < 32) g_fs_ch[g_fs_n++] = c;   /* (every voxel-logit output: not the fused normal / density, nor the --fib-head pads (2026-11-13: 25 > 16 with the pads, 16 without)) */
         if (g_fs_n > 16) { fprintf(stderr, "--fstem: %d outputs (16 at most)\n", g_fs_n); return 2; }
         cfg.fstem = g_fstem; cfg.fstem_out = g_fs_n;
         fprintf(stderr, "fine stem: %d silu features of 4^3 voxels at stride 2 into %d head outputs, dropped on %.0f%% of the training windows\n", g_fstem, g_fs_n, 100 * g_fs_drop);
@@ -3394,7 +3398,8 @@ int cmd_train(int argc, char **argv) {
                         pick_need / 1e9, fmin / 1e9, (double)pick_need / (double)vox, upb / 1e9, pick_off / 1e9, (double)pick_off / (double)vox,
                         fastest || !pick_off ? "" : "; --mem fast skips them where the window fits without");
             }
-            g_plan_spare = pick >= 0 && fmin > pick_need ? fmin - pick_need : 0;
+            g_plan_spare = pick >= 0 && pick_need > 0 && fmin > pick_need ? fmin - pick_need : 0;   /* (no mode fit, "trying" the smallest: no spare. 2026-11-13: pick_need 0 there
+                                                                                                    made the whole free memory "spare", the label planes then took 6.7 GB of it and the trainer OOMed) */
             unet_set_host_offloads(pick_hoff);
             unet_set_chunk_up(cand[pick].chunk); unet_set_recompute(cand[pick].rc); unet_set_grad_mx8(cand[pick].gmx); unet_set_lean(cand[pick].lean); unet_set_share_enc_a1(cand[pick].sea || (pick_hoff && sea_force));
             unet_set_l0_3buf(cand[pick].l3);

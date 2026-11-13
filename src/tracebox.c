@@ -17,6 +17,7 @@
                   unwrapped about the patch's circular mean), matched-weighted over patches
      --tsv: patch, voxels, near (L1 <= 8), matched, purity, dominant sheet. */
 #include "patchsolve.h"
+#include "band_onfly.h"
 #include <errno.h>
 #include <math.h>
 #include <stdint.h>
@@ -551,7 +552,9 @@ int cmd_gt_gate(int argc, char **argv) {
     mkdir(out, 0755); J.w = z3w_create(dir, J.shape, 512, 0, 0, nullptr); if (!J.w) { fprintf(stderr, "gt-gate: cannot create %s: %s\n", dir, z3w_error()); return 1; }
     const char *phr = tb_opt(argc, argv, "--phase", nullptr), *phk = tb_opt(argc, argv, "--phase-key", nullptr), *pho = tb_opt(argc, argv, "--phase-out", nullptr);
     J.shfrac = atof(tb_opt(argc, argv, "--shard-frac", "1")); J.minkeep = atof(tb_opt(argc, argv, "--min-keep", "0.3"));
-    if (phr && phk) { store *qs = store_open(phr); J.ph = qs ? z3_open(qs, phk, nullptr) : nullptr;
+    const double prm = atof(tb_opt(argc, argv, "--phase-rmax", "0"));   /* > 0: --phase / --phase-key name winding_mod14 codes, the phase their pair rule at this radius
+                                                                           (surf-labels --radius, 20; label sets kept as codes only, 2026-11-13) */
+    if (phr && phk) { store *qs = store_open(phr); J.ph = qs ? z3_open(qs, phk, nullptr) : nullptr; if (J.ph && prm > 0) J.ph = phase_onfly_open(J.ph, (float)prm);
         if (!J.ph || memcmp(z3_meta_of(J.ph)->shape, J.shape, sizeof J.shape)) { fprintf(stderr, "gt-gate: cannot open %s/%s or its shape differs\n", phr, phk); return 1; } }
     if (J.odeg > 0 && !J.ph) { fprintf(stderr, "gt-gate: --orient-deg needs --phase / --phase-key (our sheet directions)\n"); return 2; }
     if (phr && phk && pho) {   /* the gated phase (PHASE_* codes, unknown 255), lossless */
