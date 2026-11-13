@@ -30,6 +30,14 @@ gradients were 0.22 / 0.13 off. From step 2 on, select_buf set them, so only ste
 | 4 levels 32,32,64,64, axis | 4.7e-2 | 1.35e-7 | 1.3e-7 |
 | 6 levels 32,32,64,64,96,96 + attention (scroll), gfilm, gn-ema, split-top 3 | 1.4e-2 (wo 0.22, gfilm 0.13) | 1.2e-7 | - |
 
+Third bug, in the production gradient format (MX-fp4 gradients; the A/Bs above run MX-fp8 because fp4 gradients always round
+stochastically by element index, so split and whole are not comparable bit for bit). Under the split, the GroupNorm backward apply
+wrote the whole layer's gy records (lp_gn_silu_bwd_apply_rec) before the caller zeroed the halo planes. The fp4 weight gradient and
+its bias sums therefore read the halo voxels' gx: those planes were counted on both GPUs. Measured on enc0 / dec0 conv2 bias
+gradients, split with records vs split without was 0.13 relative off; one GPU with vs without records was 0.006 (SR noise). Fix:
+no gy records under the split (the weight gradient's own pre-pass reads the zeroed gy). Split with the fix vs split UFSM_GYREC=0:
+8e-8. This also frees the records' 1.21 GB per GPU at P 1024 (the planner no longer counts them under the split).
+
 Regression test `test_split_gnbwd` (fast tier): the MX GroupNorm backward of a 16-plane window in two halves (+2 halo planes) vs whole,
 for C 32 / 64, MX-fp4 / fp8 x, fp32 / MX-fp8 gradients. It has one gradient voxel per channel and half, so the statistics are exact sums
 on both runs (sums of many terms differ in the last bit by partition, by design). The owned gx must be bit-identical. Before the fix
