@@ -110,7 +110,7 @@ fetch() {   # fetch URL OUT: resumable, complete when the size matches Content-L
   [ "$want" -gt 0 ] && [ "$have" = "$want" ] && return 0
   curl -sfL --retry 5 -C - -o "$2" "$1" || curl -sfL --retry 5 -o "$2" "$1" || return 1
   have=$(stat -c %s "$2"); [ "$want" = 0 ] || [ "$have" = "$want" ] || { echo "fetch: $2 has $have of $want bytes"; return 1; }; }
-for c in wind96-wk1-best ift3-24000; do fetch $BASE/ufsm/checkpoints/$c/$c.ckpt $POD/ckpt/$c.ckpt || die "checkpoint $c"; done
+for c in wind96-wk1-best; do fetch $BASE/ufsm/checkpoints/$c/$c.ckpt $POD/ckpt/$c.ckpt || die "checkpoint $c"; done   # (ift3 dropped 11-13: the latent ink head, /root/pod/latink.sh)
 say "checkpoints: $(ls -l $POD/ckpt | awk 'NR > 1 {printf "%s %.0f MB  ", $9, $5 / 1e6}')"
 
 # --- 6. the scroll ---
