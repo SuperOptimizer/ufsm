@@ -6,6 +6,31 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Muon variants for the from-scratch universal net: ten arms on the 92 M net (2026-11-13, branch muonx-20261113)
+
+The regime: B = 1, P 512..1024 windows. Gradients are very noisy and runs are short (tens of thousands of steps). ANVIL II already tied
+Muon here (section below). The user asked for fundamental algorithmic gains, so every variant below is a flag on `--opt muon`, and each
+one off is Muon bit for bit (tests/test_muonx). A/B harness: `runs/muonx/abq.sh GPU`. Each arm is 1500 steps of the approved 92 M net
+(widths 256,320,384,448,288,288, 4 attention blocks, scroll RoPE). Recipe: P 512 B 1, `--det 1 --seed 7`, so every arm sees the same
+windows; scratch1 sources, latdino's LR probe recipe plus `--gn-ema 1 --scan-norm 1 --fib-head 1` (rfwide merged); Muon 0.01 /
+AdamW 1e-3, warmup 150, WSD cooldown 0.2. Compared: training loss and per-head losses over the last 300 steps, paired step for step
+against plain Muon, with a block-bootstrap CI (`absum.py`).
+
+| flag | what | source | state |
+|---|---|---|---|
+| `--muon-ns polar` | Polar Express: per-iteration minimax quintics instead of the fixed (3.4445, -4.7750, 2.0315). Derived here by greedy LP from [1e-3, 1]; the published schedule matches to ~3%. Output singular values for sigma in [1e-3, 1]: [0.887, 1.113] (fixed: [0.471, 1.202]) | Amsel, Persson, Musco & Gower 2025, arXiv 2505.16932 | built, tested |
+| `--normuon 1 [--normuon-beta2 0.95]` | per-row second-moment EMA of the orthogonalised direction; rows normalised, then Frobenius-rescaled to Muon's RMS | Li et al. 2025, arXiv 2510.05491 | built, tested |
+| `--muon-vr G` | MARS variance reduction: c = g + G beta/(1-beta) (g - g_prev), clipped to unit norm per matrix, then Nesterov + NS. One g_prev buffer | Yuan et al. 2024, arXiv 2411.10438 | built, tested |
+| `--muon-kron 1` | order-3 Shampoo on each 3^3 conv gradient [Co][Ci][27]: factors Co x Co, Ci x Ci, 27 x 27 (EMA b2 0.99), exponent -1/6, damping 1e-3 x \|L\|_F. Roots by coupled Newton (Guo & Higham 2006), refreshed round robin every 10 steps; the preconditioned gradient feeds Muon's momentum + NS. Memory 2 (Co^2 + Ci^2 + 729) per conv | Gupta, Koren & Singer 2018 | built, tested vs dense double reference |
+| `--muon-c 1` | Muon-C on attention nets: the convs per frequency, the linears on the plain direction | (existing) | attention path built |
+| `--muon-cautious 1` | zero the direction's elements whose sign disagrees with g, keep the norm | Liang et al. 2024, arXiv 2411.16085 | built, tested |
+| `--muon-scale spectral`, `--opt-rest sign` | Scion geometry: per-matrix sqrt(fan_out / fan_in) instead of sqrt(max(1, Co/K)); biases / norms / head on sign momentum (ell-inf LMO) instead of AdamW | Pethick et al. 2025, arXiv 2502.07529 | built |
+| `--muon-ademamix A [--ademamix-b3 0.999]` | slow EMA m2 added to the Nesterov momentum, alpha ramped 0 -> A | Pagliardini et al. 2024, arXiv 2409.03137 | built |
+| `--muon-qkv-split 1` | Q / K / V of every head orthogonalised separately (not the fused [3C][C]) | Kimi K2 / MuonClip practice | built; QK-clip needs a logit-max hook in the attention kernels (not yet) |
+| `--muon-tc 1` | the NS products on fp16 tensor cores (wmma, fp32 accumulate) | | built; accuracy test vs fp32 |
+
+Results: pending (the arms land in runs/muonx/runs; table below as they do).
+
 ## The from-scratch net's whole-window field: measured ERF, seams, LR probe (2026-11-13, branch rfwide-20261113)
 
 The next universal latent net (from scratch, all heads, one 1024^3 window split across both desk cards) is nlev 6, widths
