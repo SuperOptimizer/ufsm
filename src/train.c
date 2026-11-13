@@ -2813,6 +2813,7 @@ int cmd_train(int argc, char **argv) {
 
     {   /* --ink-cache-mb: the one cache budget of every on-the-fly ink source (inksplat.h; default $UFSM_INK_CACHE_MB or 4096) */
         const char *im = opt(argc, argv, "--ink-cache-mb", "0"); if (atol(im) > 0 && inkfly_cache_budget) inkfly_cache_budget((size_t)atol(im)); }
+    { const char *pm = opt(argc, argv, "--onfly-cache-mb", "0"); if (atol(pm) > 0) sources_set_onfly_cache_mb((size_t)atol(pm)); }   /* the onfly phase cells' shared LRU (default 2048) */
     sources *S = sources_load(src);
     g_Sdiag = S;
     if (!S) return 1;

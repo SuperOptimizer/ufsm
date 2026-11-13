@@ -95,6 +95,12 @@ keep G = 1 at the default. This is only enabled for the onfly phase, whose value
   (1.01 M known voxels, CPU), and a reopen reads all 64 cells from disk.
 - tests/test_dcache_batch (CPU, fast tier): batched == cell by cell == direct values on ragged boxes, 4 threads on one cold array, and
   disk reopen. A cold whole read takes 8 inner reads instead of 64.
+
+**One memory LRU for every onfly phase array.** Each onfly phase spec opened its own dcache LRU (`"cache_mb"`, default 1024). With
+scratch1's 19 specs that allows 19 GB of host RAM. The sampler-only warm reached the 30 GB memory cap within 2 minutes, twice. All onfly
+phase arrays now share dcache_pool_shared("phase"), sized by --onfly-cache-mb or UFSM_ONFLY_CACHE_MB (default 2048). A spec that sets
+its own "cache_mb" keeps a private LRU, as before. The size only changes hit rates: a cell's bytes are the same from memory, from disk
+or computed (test_dcache_batch, test_mesh_phase).
 ## Split-window input builders: every --gpu-aug builder by z range, the scanner split exactly across two GPUs (2026-11-13, branch augz-20261112)
 
 ## Muon variants for the from-scratch universal net: ten arms on the 92 M net (2026-11-13, branch muonx-20261113)
