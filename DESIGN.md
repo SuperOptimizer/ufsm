@@ -58,7 +58,12 @@ the MX4 epilogue through per-warp shared tiles) on the pod: rel L2 7.7e-3 agains
 elements differ), bytes repeat; the P 1024 half slab 160 -> 256: 7.61 -> 1.12 ms (2.8 -> 19.2 TFLOP/s), 34 slabs a step: ~220 ms per
 card. Default OFF (UFSM_HEAD_BTC=1 on): with it on, test_lat_head's "a second equal net" check (the same parameters and
 inputs on a second unet) differs by rel 0.4 in the trunk gradients, which test_head_tc's kernel-level checks (C 32 / 96 / 256, two
-samples, whole and ranges) do not reproduce. Open. The whole-call form (lp_conv1_to_mx) now takes the same kernel as the range form,
+samples, whole and ranges) do not reproduce. The difference is deterministic: CUDA_LAUNCH_BLOCKING changes nothing, and it shows only in
+the narrow {96,64,96} config. So it is a path difference, not a race. One of the two nets reaches the head's backward-data with fp16
+logit gradients (the TC kernel), the other with MX or bf16 ones (gdt 3 / 1: the FFMA kernel). With BTC off both use FFMA, whose fp32
+sums agree whenever the values do. The TC kernel would need a gdt 3 / 1 staging to keep that equality. The 8-output comparisons
+(trunk rel 0.3) are the same effect: the wide head's TC gx against the 8-output FFMA gx, where one SR flip in fp4 spreads through the
+small test net. The whole-call form (lp_conv1_to_mx) now takes the same kernel as the range form,
 so whole == per range holds with it on.
 
 
