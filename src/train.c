@@ -495,7 +495,7 @@ static void gpu_input_settle(sample_cfg *sc, int assume_mx) {   /* (assume_mx: U
     g_xs = g_gpu_in ? 1 : g_xc; sc->gpu_input = g_gpu_in;
     g_gpu_aug = g_gpu_aug_want && g_gpu_in && sample_gpu_aug_ok(sc) ? 1 : 0;
     if (g_gpu_aug && g_gpu_aug_want == 2) { if (sample_gpu_lwarp_ok(sc)) g_gpu_aug = 2; else fprintf(stderr, "--gpu-aug 2: the labels' warp needs packed targets and no sheet / pmask / gap / distill / cond / band / aux labels; --gpu-aug 1 (here: pack_tm %d sheet %d pap_head %d emb %d cond %d band %d aux %d)\n",
-                                                                   sc->pack_tm, sc->sheet, sc->pap_head, sc->emb_ch, sc->cond, sc->band, sc->aux); }
+                                                                   sc->pack_tm, sc->sheet != nullptr, sc->pap_head != nullptr, sc->emb_ch, sc->cond, sc->band, sc->aux); }
     sc->gpu_aug = g_gpu_aug;
     sc->w4_dev = g_w4dev_want && g_gpu_aug == 2 && sc->wind4 && g_w4n > 0;
     if (sc->w4_dev) { w4dev_init(g_w4devs, g_w4n); fprintf(stderr, "input: the winding mod 4 labels' runs and codes on the GPU, its union-find on the host (--gpu-aug 3; the same bytes as --gpu-aug 2)\n"); }
@@ -614,6 +614,9 @@ static int lw_pm(const batch *b) { return g_unwrap && g_pack && g_gpu_aug == 2 &
 /* slot_skip 4 (sample.c sample_tm_unused): the unpacked targets / mask t, m dropped from the slots where the trainer never reads them, g_tm_unused
    without --pack-targets: --split turns the packing off, and the --lat split never uploads them (upload_slab, the non-latent split, does);
    UFSM_TM_SKIP4=0 keeps them (3 B per voxel per slot, 3.2 GB at P 1024) */
+/* --plane-bank 1 (default; sample.h plane_bank): a slot's label planes shared by role, the all-unknown roles of a window on one 255 plane;
+   B 1 without replays (sampler_start decides) */
+static int plane_bank_want(void) { return !getenv("UFSM_PLANE_BANK") || ufsm_env_on("UFSM_PLANE_BANK"); }
 static int tm_slot_skip4(int split) { return !g_pack && (!split || g_lsplit) && (!getenv("UFSM_TM_SKIP4") || ufsm_env_on("UFSM_TM_SKIP4")); }
 static int pm_used(void) { return g_unwrap && (!g_unwrap2 || g_pap_head); }
 /* one label kind of a batch (nn_label_warp's: 0 packed targets / mask, 1 phase, 2 winding mod 4 + component) into da (db): --gpu-aug 2
@@ -3193,6 +3196,7 @@ int cmd_train(int argc, char **argv) {
             train_unread_flags(argc, argv);
             setenv("UFSM_SAMPLER_NOPIN", "1", 1); gpu_input_settle(&sc, 1);
             sc.slot_skip = g_unwrap2 && B == 1 && !g_ds && !ufsm_env_on("UFSM_TM_KEEP") ? 1 | (!pm_used() ? 2 : 0) | (tm_slot_skip4(split) ? 4 : 0) : 0;
+            sc.plane_bank = plane_bank_want();
             sc.ink_bits = g_rv && !g_lsplit && (!getenv("UFSM_INK_BITS") || ufsm_env_on("UFSM_INK_BITS"));
             sc.w4_runs = sc.w4_dev && (!getenv("UFSM_W4_RUNS") || ufsm_env_on("UFSM_W4_RUNS"));
             sc.replay = atoi(opt(argc, argv, "--replay", "1")); sc.replay_gap = atoi(opt(argc, argv, "--replay-gap", "0"));
@@ -4133,6 +4137,7 @@ int cmd_train(int argc, char **argv) {
                 "beat more workers: each idle worker holds ~16 P^3 bytes of scratch, a slot %.2f GB)\n", sc.nbuf, workers, 2 * ng + 2,
                 (double)B * g_Pz * P * P * ((size_t)g_xs * xbytes() + (g_pack ? 1 : NCH + 1) + (g_side != 0) + 2 * (g_unwrap2 != 0) + g_naux) / 1e9);
     sc.slot_skip = g_tm_unused ? 1 | (!pm_used() ? 2 : 0) | (tm_slot_skip4(split) ? 4 : 0) : 0;   /* (after the validation config's copy: its stored batches keep every plane) */
+    sc.plane_bank = plane_bank_want();   /* (after the validation config's copy too) */
     sc.w4_runs = sc.w4_dev && (!getenv("UFSM_W4_RUNS") || ufsm_env_on("UFSM_W4_RUNS"));   /* --gpu-aug 3: the winding as runs, no w4 / wcomp slot planes (sampler_start may drop it) */
     sc.ink_bits = g_rv && !g_lsplit && (!getenv("UFSM_INK_BITS") || ufsm_env_on("UFSM_INK_BITS"));   /* --rv: the papyrus plane as 1 known bit per voxel + ct8, built on the device (lab_upload); sampler_start may drop it */
     sc.replay_gap = atoi(opt(argc, argv, "--replay-gap", "0"));   /* (0: the slot count) */

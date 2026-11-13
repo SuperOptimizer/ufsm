@@ -232,6 +232,7 @@ struct sampler {
     int prof;
     double *cum;   /* cumulative source weights */
     struct { uint32_t *idx; size_t n; int lev; int64_t shape[3]; } *occ;   /* per source: coarse label cells containing papyrus (guides the position draw) */
+    uint8_t *c255;   /* --plane bank (cfg.plane_bank): one window plane of 255 (pinned like the slots) that every all-unknown label role of every slot points at */
 };
 
 static int PZ(const sample_cfg *c) { return c->Pz > 0 ? c->Pz : c->P; }   /* window depth (z) */
@@ -248,7 +249,36 @@ static void hfree(void *p) { if (nopin()) free(p); else nn_host_free(p); }
 static int sample_tm_unused(const sample_cfg *c) {
     return (c->slot_skip & 4) && !c->pack_tm && !c->restore && !c->sheet && !c->papyrus && !(c->pmask && !(c->slot_skip & 2)) && c->gpu_input;
 }
-static batch alloc_batch(const sample_cfg *c) {
+/* --plane bank (cfg.plane_bank, B 1): a slot holds plane_bank label planes, not one per role; per window each label role (side, w4,
+   wcomp, ink, aux j) either takes a bank plane or, where its source makes it all unknown (255) by construction, points at the
+   sampler's one 255 plane, which nothing writes (the draw skips its writes there). The trainer reads the same bytes through the
+   same batch pointers. The scratch1 mix at P 1024: 7 role planes (7.5 GB) -> 4 per slot (a phase source: side / w4 / wcomp / the
+   rv papyrus plane; ink sources the papyrus + ink planes, fibre sources the papyrus + H + V) */
+enum { ROLE_SIDE, ROLE_W4, ROLE_WCOMP, ROLE_INK, ROLE_AUX0, ROLE_N = ROLE_AUX0 + 4 };
+static int batch_roles(batch *b, uint8_t **rl[ROLE_N]) {   /* the allocated role planes (non-null pointers), in role order */
+    uint8_t **all[ROLE_N] = {&b->side, &b->w4, &b->wcomp, &b->ink, &b->aux[0], &b->aux[1], &b->aux[2], &b->aux[3]}; int n = 0;
+    for (int q = 0; q < ROLE_N; q++) if (*all[q]) rl[n++] = all[q];
+    return n;
+}
+/* role q of a window of source s takes a bank plane (1), or is all 255 by construction (0): the side / winding planes without any phase
+   (no stored / onfly phase, no band: the memsets below), an aux plane whose channel has no prob254 target (aux_read's memset) */
+static int role_real(const sample_cfg *c, const source *s, int q) {
+    if (q <= ROLE_WCOMP) return s->phase || s->band;
+    if (q == ROLE_INK) return 1;
+    const int j = q - ROLE_AUX0, ch = c->aux_ch[j] != CH_FIB ? c->aux_ch[j] : s->tgt_key[CH_FIB] || !c->fib_sheet ? CH_FIB : CH_SHEET;
+    return s->tgt_key[ch] && s->tgt_prob[ch];
+}
+static int bank_need(const sample_cfg *c, const source *s, const batch *b) {   /* bank planes a window of s takes */
+    const uint8_t *all[ROLE_N] = {b->side, b->w4, b->wcomp, b->ink, b->aux[0], b->aux[1], b->aux[2], b->aux[3]}; int n = 0;
+    for (int q = 0; q < ROLE_N; q++) n += all[q] && role_real(c, s, q);
+    return n;
+}
+static void bank_assign(const sampler *sp, const source *s, batch *b) {
+    uint8_t **all[ROLE_N] = {&b->side, &b->w4, &b->wcomp, &b->ink, &b->aux[0], &b->aux[1], &b->aux[2], &b->aux[3]}; int k = 0;
+    for (int q = 0; q < ROLE_N; q++) if (*all[q]) *all[q] = role_real(&sp->cfg, s, q) && k < b->nbank ? b->bank[k++] : sp->c255;
+}
+static batch alloc_batch(const sample_cfg *c, uint8_t *c255) {
+#define RHALLOC(n_) (c->plane_bank > 0 ? c255 : halloc(n_))   /* (a label role: under the bank only marked, pointing at c255) */
     size_t p3 = (size_t)PZ(c) * c->P * c->P;
     batch b;
     const size_t xc = c->gpu_input ? 1 : 4 + (c->aux != 0) + (c->cond ? 3 : 0);   /* input channels per sample (--gpu-input: the CT alone) */
@@ -273,23 +303,30 @@ static batch alloc_batch(const sample_cfg *c) {
     b.corner = malloc((size_t)c->B * sizeof *b.corner);
     b.sheet = calloc((size_t)c->B, sizeof *b.sheet);
     b.band = c->band ? halloc((size_t)c->B * p3) : nullptr;
-    b.side = c->side ? halloc((size_t)c->B * p3) : nullptr;
+    b.side = c->side ? RHALLOC((size_t)c->B * p3) : nullptr;
     b.pm = c->pmask && !(c->slot_skip & 2) ? halloc((size_t)c->B * p3) : nullptr;
     b.wind = c->cond ? halloc((size_t)c->B * p3) : nullptr;
     b.pap = c->pap_head ? halloc((size_t)c->B * p3) : nullptr;
-    b.w4 = c->wind4 && !c->w4_runs ? halloc((size_t)c->B * p3) : nullptr;
-    b.wcomp = c->wind4 && !c->w4_runs ? halloc((size_t)c->B * p3) : nullptr;
+    b.w4 = c->wind4 && !c->w4_runs ? RHALLOC((size_t)c->B * p3) : nullptr;
+    b.wcomp = c->wind4 && !c->w4_runs ? RHALLOC((size_t)c->B * p3) : nullptr;
     b.w4r = c->w4_runs ? calloc((size_t)c->B, sizeof(w4runs)) : nullptr;
-    b.ink = c->ink_plane && !c->ink_bits ? halloc((size_t)c->B * p3) : nullptr;
-    for (int j = 0; j < 4; j++) b.aux[j] = j < c->aux_n ? halloc((size_t)c->B * p3) : nullptr;
+    b.ink = c->ink_plane && !c->ink_bits ? RHALLOC((size_t)c->B * p3) : nullptr;
+    for (int j = 0; j < 4; j++) b.aux[j] = j < c->aux_n ? RHALLOC((size_t)c->B * p3) : nullptr;
+    b.nbank = 0;
+    if (c->plane_bank > 0) {   /* the label roles (side, w4, wcomp, ink, aux) point at c255 until a draw assigns them (bank_assign); plane_bank planes behind them */
+        uint8_t **rl[ROLE_N]; const int nr = batch_roles(&b, rl);
+        for (int q = 0; q < nr; q++) *rl[q] = c255;
+        for (int q = 0; q < c->plane_bank && q < 8; q++) b.bank[b.nbank++] = halloc((size_t)c->B * p3);
+    }
     b.inkb = c->ink_bits ? halloc((size_t)c->B * p3 / 8) : nullptr; b.ink_it = c->ink_bits ? calloc((size_t)c->B, sizeof *b.ink_it) : nullptr;
     b.mil = c->ink_mil ? calloc((size_t)c->B, sizeof *b.mil) : nullptr; b.nmil = c->ink_mil ? calloc((size_t)c->B, sizeof *b.nmil) : nullptr;
     b.mil0 = c->ink_mil ? calloc((size_t)c->B, sizeof *b.mil0) : nullptr; b.nmil0 = c->ink_mil ? calloc((size_t)c->B, sizeof *b.nmil0) : nullptr;
+#undef RHALLOC
     b.emb = c->emb_ch ? halloc((size_t)c->B * c->emb_ch * (size_t)(PZ(c) / c->emb_div) * (c->P / c->emb_div) * (c->P / c->emb_div)) : nullptr;
     return b;
 }
 
-static void free_batch(batch *b, int B) { if (b->mil) { for (int q = 0; q < B; q++) { free(b->mil[q]); free(b->mil0[q]); } free(b->mil); free(b->nmil); free(b->mil0); free(b->nmil0); } if (b->w4r) { for (int q = 0; q < B; q++) { w4runs *r = (w4runs *)b->w4r + q; free(r->off); free(r->ro); free(r->cb); } free(b->w4r); } if (b->ink) hfree(b->ink); for (int j = 0; j < 4; j++) if (b->aux[j]) hfree(b->aux[j]); if (b->inkb) hfree(b->inkb); free(b->ink_it); if (b->ct8) hfree(b->ct8); if (b->aug) hfree(b->aug); if (b->emb) hfree(b->emb); if (b->xv) hfree(b->xv); free(b->vok); free(b->chid); free(b->chidx); free(b->choff); if (b->w4) hfree(b->w4); if (b->wcomp) hfree(b->wcomp); if (b->tm) hfree(b->tm); if (b->rad) hfree(b->rad); if (b->axr) hfree(b->axr); if (b->pap) hfree(b->pap); if (b->wind) hfree(b->wind); if (b->band) hfree(b->band); if (b->side) hfree(b->side); if (b->pm) hfree(b->pm); if (b->x) hfree(b->x); if (b->x16) hfree(b->x16); if (b->t) hfree(b->t); if (b->m) hfree(b->m); hfree(b->w); free(b->src); free(b->level); free(b->um); free(b->corner); if (b->sheet) { sheet_batch_free(b->sheet[0]); free(b->sheet); } }
+static void free_batch(batch *b, int B) { if (b->nbank) { b->side = b->w4 = b->wcomp = b->ink = nullptr; for (int j = 0; j < 4; j++) b->aux[j] = nullptr; for (int q = 0; q < b->nbank; q++) hfree(b->bank[q]); b->nbank = 0; } if (b->mil) { for (int q = 0; q < B; q++) { free(b->mil[q]); free(b->mil0[q]); } free(b->mil); free(b->nmil); free(b->mil0); free(b->nmil0); } if (b->w4r) { for (int q = 0; q < B; q++) { w4runs *r = (w4runs *)b->w4r + q; free(r->off); free(r->ro); free(r->cb); } free(b->w4r); } if (b->ink) hfree(b->ink); for (int j = 0; j < 4; j++) if (b->aux[j]) hfree(b->aux[j]); if (b->inkb) hfree(b->inkb); free(b->ink_it); if (b->ct8) hfree(b->ct8); if (b->aug) hfree(b->aug); if (b->emb) hfree(b->emb); if (b->xv) hfree(b->xv); free(b->vok); free(b->chid); free(b->chidx); free(b->choff); if (b->w4) hfree(b->w4); if (b->wcomp) hfree(b->wcomp); if (b->tm) hfree(b->tm); if (b->rad) hfree(b->rad); if (b->axr) hfree(b->axr); if (b->pap) hfree(b->pap); if (b->wind) hfree(b->wind); if (b->band) hfree(b->band); if (b->side) hfree(b->side); if (b->pm) hfree(b->pm); if (b->x) hfree(b->x); if (b->x16) hfree(b->x16); if (b->t) hfree(b->t); if (b->m) hfree(b->m); hfree(b->w); free(b->src); free(b->level); free(b->um); free(b->corner); if (b->sheet) { sheet_batch_free(b->sheet[0]); free(b->sheet); } }
 
 /* Level choice for a source: restrict cfg.level_p to levels the CT has and every target of the source
    can provide (pyramid: same level; regions: levels 0..1). Returns -1 if nothing is usable. */
@@ -2473,6 +2510,9 @@ static int scan_norm_of(source *s, int l, float *c, float *sc) {
 }
 static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp, uint8_t *big, uint64_t tile_index, float *noise_state, chain_st *cs) {
     const int rc = draw_(sp, b, i, r, xtmp, ttmp, big, tile_index, noise_state, cs);
+    if (sp->c255 && ufsm_env_on("UFSM_BANK_CHECK")) {   /* tests: the shared 255 plane is never written */
+        const size_t p3 = P3(sp); for (size_t k = 0; k < p3; k++) if (sp->c255[k] != 255) { fprintf(stderr, "sampler: the plane bank's 255 plane was written (voxel %zu = %d)\n", k, sp->c255[k]); abort(); }
+    }
     if (g_crush.ph || g_crush.ig || g_crush.w4 || g_crush.wc || g_crush.cax) crush_release();
     if (rc == 0 && b->chid && (!cs || cs->id < 0)) { b->chid[i] = -1; b->chidx[i] = 0; b->choff[3 * i] = b->choff[3 * i + 1] = b->choff[3 * i + 2] = 0.f; }
     return rc;
@@ -2498,6 +2538,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
     else while (si < sp->S->n - 1 && sp->cum[si] < u) si++;
     source *s = &sp->S->src[si];
     if (c->holdout && !s->hold_n[0]) return 1;
+    if (b->nbank) bank_assign(sp, s, b);   /* (--plane bank, B 1: this window's label roles) */
     /* regions target? pick one region, then a level in {0,1} */
     int region_ch = -1, ri = -1;
     for (int ch = 0; ch < NCH; ch++) if (s->reg[ch] && s->reg[ch]->n) region_ch = ch;
@@ -2645,6 +2686,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
                        ? (s->iso > 0 ? s->iso : c->rv_iso) : 0;
     for (int j = 0; j < c->aux_n; j++) {   /* the registry's extra planes (source grid, like the ink plane) */
         const int ch = c->aux_ch[j] != CH_FIB ? c->aux_ch[j] : s->tgt_key[CH_FIB] || !c->fib_sheet ? CH_FIB : CH_SHEET;
+        if (b->aux[j] == sp->c255) continue;   /* (the bank's 255 plane: no target, aux_read's memset) */
         if (aux_read(s, ch, l, o, n, b->aux[j] + (size_t)i * p3, p3, crushed || torn || delam || curved)) return -1;
     }
     if (b->mil) {   /* --ink-mil: the window's rays from its onfly ink target (level L = the target's, or the next: scaled), outside every held-out box + guard */
@@ -2990,7 +3032,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
 #define MK(k) (ign_zero ? (uint8_t)(ctu[k] != 0) : (uint8_t)((ctu[k] != 0) & (mask[k] == 0)))
     /* tdead: the loss mask itself is read by nobody below (no packed plane, no sheet prior, the labels warped on the device): only the
        ink plane is written (one write stream fewer; the pass is DRAM-bound) */
-    for (int j = 0; j < c->aux_n; j++) { uint8_t *a = b->aux[j] + (size_t)i * p3; for (size_t k = 0; k < p3; k++) if (!MK(k)) a[k] = 255; }   /* (the extra planes: unknown as the ink plane) */
+    for (int j = 0; j < c->aux_n; j++) { uint8_t *a = b->aux[j] + (size_t)i * p3; if (b->aux[j] == sp->c255) continue; for (size_t k = 0; k < p3; k++) if (!MK(k)) a[k] = 255; }   /* (the extra planes: unknown as the ink plane) */
     if (inkbits) {   /* (ink_bits: the known bit of each voxel; the plane itself on the device) */
         if (!ink_it) { fprintf(stderr, "sampler: ink bits without the rv cutoff\n"); return -1; }
         b->ink_it[i] = (int16_t)(ink_it > 256 ? 256 : ink_it);
@@ -3128,7 +3170,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
     if (c->band || c->side) {   /* band labels: computed on the source grid, unknown on CT air, then the same symmetry as CT and targets */
         if (!band_sample || (spatial.active && !stored_phase)) {   /* no band labels: affinities (and sides) unsupervised */
             if (c->band) memset(b->band + (size_t)i * p3, BAND_UNKNOWN, p3);
-            if (c->side) memset(b->side + (size_t)i * p3, SIDE_UNKNOWN, p3);
+            if (c->side && b->side != sp->c255) memset(b->side + (size_t)i * p3, SIDE_UNKNOWN, p3);
         } else if (stored_phase) {   /* the stored phase (ufsm phase-raster, ufsm downsample --mode phase) */
             /* unwarped or device-warped windows (and no sheet prior): the block's planes in worker scratch that is dead here instead of the
                pool (4 window planes less per worker: 4 B per voxel, 3.5 GB at P 960): the targets (ttmp, last read by the packing above,
@@ -3235,10 +3277,11 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
     }
     if (c->wind4 && !w4_set) {
         if (c->w4_runs) { w4runs *wr = (w4runs *)b->w4r + i; wr->noff = wr->nr = 0; }   /* (no winding: the device writes unknown) */
-        else { memset(b->w4 + (size_t)i * p3, 255, p3); memset(b->wcomp + (size_t)i * p3, 255, p3); }
+        else { if (b->w4 != sp->c255) memset(b->w4 + (size_t)i * p3, 255, p3); if (b->wcomp != sp->c255) memset(b->wcomp + (size_t)i * p3, 255, p3); }
     }
     for (int j = -1; j < c->aux_n; j++) {   /* --ink-head: the ink plane (j -1) and the extra planes through the symmetry / warp (--gpu-aug 2 warped windows: the source grid, warped on the device) */
         if (j < 0 && !inkw) continue;
+        if (j >= 0 && b->aux[j] == sp->c255) continue;   /* (all 255: its symmetry / warp is 255 too) */
         uint8_t *bi = (j < 0 ? b->ink : b->aux[j]) + (size_t)i * p3, *src = scr_own ? ttmp + p3 + 64 : big + p3;   /* (lw, or unwarped with the identity: already in place) */
         if (!lw && !(sym_id && !spatial.active)) {
             memcpy(src, bi, p3);
@@ -3964,7 +4007,20 @@ sampler *sampler_start(sources *S, const sample_cfg *cfg) {
     sp->slot_j = calloc((size_t)sp->nslots, sizeof *sp->slot_j);
     sp->slots = calloc((size_t)sp->nslots, sizeof *sp->slots);
     sp->state = calloc((size_t)sp->nslots, sizeof *sp->state);
-    for (int i = 0; i < sp->nslots; i++) sp->slots[i] = alloc_batch(&sp->cfg);
+    if (sp->cfg.plane_bank) {   /* --plane bank: as many planes per slot as the neediest eligible source fills (bank_need), when that is fewer than the roles */
+        sample_cfg *c = &sp->cfg; batch roles = {0}; uint8_t one = 1;
+        roles.side = c->side ? &one : nullptr; roles.w4 = roles.wcomp = c->wind4 && !c->w4_runs ? &one : nullptr; roles.ink = c->ink_plane && !c->ink_bits ? &one : nullptr;
+        for (int j = 0; j < 4; j++) roles.aux[j] = j < c->aux_n ? &one : nullptr;
+        int k = 0, nr = (roles.side != nullptr) + (roles.w4 != nullptr) + (roles.wcomp != nullptr) + (roles.ink != nullptr); for (int j = 0; j < 4; j++) nr += roles.aux[j] != nullptr;
+        for (int i = 0; i < S->n; i++) if (sp->cum[i] > (i ? sp->cum[i - 1] : 0)) { const int q = bank_need(c, &S->src[i], &roles); if (q > k) k = q; }
+        const int ok = c->B == 1 && c->replay <= 1 && !c->cover && c->chain_p <= 0 && !c->holdout && !c->sheet && !c->band && !c->papyrus && !c->restore && k < nr && k <= 8;
+        c->plane_bank = ok ? (k > 0 ? k : 1) : 0;
+        if (ok) {
+            const size_t p3 = P3(sp); sp->c255 = halloc(p3); memset(sp->c255, 255, p3);
+            fprintf(stderr, "sampler: %d label planes per slot for %d label roles (the rest of a window's roles all unknown: one shared 255 plane), -%.2f GB per slot\n", c->plane_bank, nr, (double)(nr - c->plane_bank) * p3 / 1e9);
+        }
+    }
+    for (int i = 0; i < sp->nslots; i++) sp->slots[i] = alloc_batch(&sp->cfg, sp->c255);
     pthread_mutex_init(&sp->mu, nullptr);
     pthread_cond_init(&sp->cv_free, nullptr);
     pthread_cond_init(&sp->cv_ready, nullptr);
@@ -4156,6 +4212,7 @@ void sampler_stop(sampler *sp) {
     for (int i = 0; i < sp->cfg.nworkers; i++) pthread_join(sp->th[i], nullptr);
     if (sp->rth_on) pthread_join(sp->rth, nullptr);
     for (int i = 0; i < sp->nslots; i++) free_batch(&sp->slots[i], sp->cfg.B);
+    if (sp->c255) hfree(sp->c255);
     free(sp->rleft); free(sp->rq); free(sp->rdue); free(sp->rseq);
     for (int i = 0; i < sp->S->n; i++) free(sp->occ[i].idx);
     free(sp->occ); free(sp->slot_j); free(sp->slots); free(sp->state); free(sp->th); free(sp->cum); free(sp->lvl_ok);
