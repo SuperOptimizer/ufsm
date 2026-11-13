@@ -174,6 +174,7 @@ const float *unet_fwd_params(const unet *u);   /* the device weights the forward
 size_t unet_gn_nstats(unet *u);
 int unet_gn_stats_get(unet *u, float *h);
 void unet_gn_freeze(unet *u, const float *h);
+void unet_gn_freeze_train(unet *u, int on);   /* diagnostics (train UFSM_ERF_GNFROZEN): training forwards use the frozen statistics too; no backward may follow */
 void unet_gn_accumulate(unet *u);           /* add the last forward's statistics (sample 0) to a running pool */
 long unet_gn_pooled(unet *u, float *h);     /* pooled statistics (unet_gn_nstats floats) of the accumulated forwards; returns their count */
 /* cfg.l0_norm 2 (ema): the running statistics move by mom toward each training forward's (the first one replaces them); the first

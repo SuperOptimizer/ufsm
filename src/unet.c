@@ -83,6 +83,7 @@ struct unet {
     int using_ema;
     block *rb[UNET_MAXLEV]; int nrb_any; float *gres[UNET_MAXLEV]; size_t gres_cap[UNET_MAXLEV];   /* cfg.enc_blocks: residual blocks, the identity gradient per level */
     float *gn_frz; size_t gn_frz_n;   /* unet_gn_freeze: per-sample GroupNorm statistics used by inference forwards instead of the window's */
+    int gn_frz_train;                 /* unet_gn_freeze_train: training forwards use them too (diagnostics: no backward after such a forward) */
     float *gn_frz_d;                  /* their device copy (uploaded once; each forward replays it into the sites with async device copies) */
     double *gn_acc; long gn_acc_n;     /* unet_gn_accumulate: sums of the window statistics (mean, mean^2 per mean slot, variance per rstd slot) */
     float *l0run, *l0live; size_t l0live_n;   /* cfg.l0_norm ema: [mean G | var G] per level-0 site (l0_site order), three sets of 8 G: the
@@ -1997,7 +1998,7 @@ static nn_gn_t gn_in(const unet *u, const block *b) {
     if (b->ing) { g.gamma = P(u, b->ing->gamma); g.beta = P(u, b->ing->beta); g.mean = b->inm; g.rstd = b->inr; g.G = G_of(u, b->ing->c); }
     return g;
 }
-static int gn_frozen(const unet *u) { return u->gn_frz && !u->fwd_train && nn_get_tf32(); }
+static int gn_frozen(const unet *u) { return u->gn_frz && (!u->fwd_train || u->gn_frz_train) && nn_get_tf32(); }
 static void gn_frozen_load(unet *u);
 /* cfg.l0_norm: the level-0 GroupNorm sites, l0_site = 2 * (dec[0]) + conv - 1 (conv 1: m1 / r1, 2: m2 / r2; a one-conv dec[0] has only
    2). While a forward's level-0 statistics are constants (u->l0_c: none, or ema after its warm-up; latched by l0_begin for the
@@ -4142,6 +4143,7 @@ void unet_gn_freeze(unet *u, const float *h) {
     u->gn_frz = malloc(u->gn_frz_n * 4);
     memcpy(u->gn_frz, h, u->gn_frz_n * 4);
 }
+void unet_gn_freeze_train(unet *u, int on) { u->gn_frz_train = on; }
 void unet_blend_ema(unet *u, float a) { nn_scale(u->ema, 1.f - a, u->np); nn_axpy(u->ema, a, u->p, u->np); nn_wmemo_clear(); }
 const float *unet_ema_params(const unet *u) { return u->ema; }
 void unet_use_ema(unet *u, int on) { nn_wmemo_clear(); u->live = on ? u->ema : u->p; u->using_ema = on; if (!u->sparse24) u->fw = u->live; }

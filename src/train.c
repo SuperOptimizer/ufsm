@@ -1510,6 +1510,63 @@ static void gc_report(gpu_state *d, int step) {   /* the tasks' cosines at the h
 }
 /* --ssl: the EMA teacher's forward over the whole window (the step's own quantiser step), its side head into int8 targets at the masked
    cells, then the student's input: the masked blocks of the CT channel zeroed, the latent cells quantised with a jittered step */
+/* UFSM_ERF=DELTA (--lat, streamed head): the measured effective receptive field on the first training window. Forward, the cell-grid head
+   logits of every cell; DELTA (in input units, the z-scored CT) added to the central 4^3 cells (16^3 voxels); forward again; per cell the
+   largest |logit change| over the first 16 head channels, binned by the Chebyshev distance r (cells) to the perturbed block. Prints the shell means,
+   the radii holding 50 / 90 / 99% of the summed change and the far-field floor (the outer shells: whole-window GroupNorm coupling,
+   not convolution reach), then exits. UFSM_ERF_REPEAT=1 forwards the unperturbed window twice instead (the noise floor: 0 if the forward
+   is deterministic); UFSM_ERF_GNFROZEN=1 normalises the perturbed forward with the base forward's GroupNorm statistics (the convolution
+   reach alone, no window-statistics coupling) */
+static void erf_probe(gpu_state *d, shape5 ls, int P) {
+    if (!g_lat_hs || !d->lgc || ls.n != 1) { fprintf(stderr, "UFSM_ERF: --lat with the streamed head, --B 1\n"); exit(2); }
+    const float delta = (float)atof(getenv("UFSM_ERF")); const int rep = ufsm_env_on("UFSM_ERF_REPEAT"), gnf = ufsm_env_on("UFSM_ERF_GNFROZEN"); float *gns = nullptr;
+    const int Dc = g_Pz / 4, Hc = P / 4, st = g_hs_z / 4 > 0 ? g_hs_z / 4 : 1, CH = unet_cfg_of(d->u)->cout, C = CH < 16 ? CH : 16; const size_t pl = (size_t)Hc * Hc, nc = (size_t)Dc * pl;
+    _Float16 *base = malloc(nc * C * 2), *ch = malloc((size_t)st * pl * CH * 2);   /* (the first 16 head channels: the task outputs, not the guide coefficients) */ float *m = calloc(nc, sizeof(float));
+    if (!base || !ch || !m) { fprintf(stderr, "UFSM_ERF: host memory\n"); exit(2); }
+    for (int pass = 0; pass < 2; pass++) {
+        if (pass == 1 && !rep) {   /* the central 4^3 cells of the CT channel (B 1: [Pz][P][P] in the upload's format) */
+            const int z0 = 2 * Dc - 8, y0 = 2 * Hc - 8; const size_t xb = xbytes(); uint8_t row[16 * 4];
+            for (int z = z0; z < z0 + 16; z++) for (int y = y0; y < y0 + 16; y++) {
+                const size_t o = (((size_t)z * P + y) * P + y0) * xb; nn_sync(); nn_d2h(row, (char *)d->x + o, 16 * xb);
+                for (int k = 0; k < 16; k++) {
+                    if (g_xfmt == 1) { _Float16 h; memcpy(&h, row + 2 * k, 2); h = (_Float16)((float)h + delta); memcpy(row + 2 * k, &h, 2); }
+                    else if (g_xfmt == 2) { uint16_t b; memcpy(&b, row + 2 * k, 2); uint32_t u = (uint32_t)b << 16; float v; memcpy(&v, &u, 4); v += delta; memcpy(&u, &v, 4); b = (uint16_t)((u + 0x7fff + ((u >> 16) & 1)) >> 16); memcpy(row + 2 * k, &b, 2); }
+                    else { float v; memcpy(&v, row + 4 * k, 4); v += delta; memcpy(row + 4 * k, &v, 4); }
+                }
+                nn_h2d((char *)d->x + o, row, 16 * xb);
+            }
+        }
+        if (pass == 1 && gnf) { unet_gn_freeze(d->u, gns); unet_gn_freeze_train(d->u, 1); }   /* the perturbed forward normalised with the base window's statistics */
+        unet_forward_x(d->u, d->x, ls, 1, g_xfmt != 0);
+        if (pass == 0 && gnf) { gns = malloc(unet_gn_nstats(d->u) * sizeof(float)); if (!gns || unet_gn_stats_get(d->u, gns)) { fprintf(stderr, "UFSM_ERF_GNFROZEN: no GroupNorm statistics\n"); exit(2); } }
+        for (int f0 = 0; f0 < Dc; f0 += st) { const int f1 = f0 + st < Dc ? f0 + st : Dc; const size_t n = (size_t)(f1 - f0) * pl;
+            if (unet_head_fwd_z(d->u, f0, f1, d->lgc)) { fprintf(stderr, "UFSM_ERF: the head is not covered per chunk\n"); exit(2); }
+            nn_sync(); nn_d2h(ch, d->lgc, n * CH * 2);
+            for (int c = 0; c < C; c++) for (size_t i = 0; i < n; i++) {
+                const size_t cell = (size_t)f0 * pl + i;
+                if (pass == 0) base[(size_t)c * nc + cell] = ch[(size_t)c * n + i];
+                else { const float a = fabsf((float)ch[(size_t)c * n + i] - (float)base[(size_t)c * nc + cell]); if (a > m[cell]) m[cell] = a; }
+            }
+        }
+    }
+    const int R = (Dc > Hc ? Dc : Hc) / 2 + 2; double *sh = calloc(R, sizeof(double)), *sx = calloc(R, sizeof(double)), tot = 0; size_t *cn = calloc(R, sizeof(size_t));
+    const double cz = Dc / 2 - 0.5, cy = Hc / 2 - 0.5;
+    for (int z = 0; z < Dc; z++) for (int y = 0; y < Hc; y++) for (int x = 0; x < Hc; x++) {
+        const double dz = fabs(z - cz) - 1.5, dy = fabs(y - cy) - 1.5, dx = fabs(x - cy) - 1.5;
+        double r = dz > dy ? dz : dy; r = r > dx ? r : dx; const int ri = r < 0 ? 0 : (int)lround(r);
+        const float v = m[((size_t)z * Hc + y) * Hc + x]; sh[ri] += v; cn[ri]++; if (v > sx[ri]) sx[ri] = v; tot += v;
+    }
+    fprintf(stderr, "erf: delta %g%s%s, %d x %d x %d cells, %d of the head channels; shells (r cells: mean max of max-over-channels |dlogit|)\n", delta, rep ? " (repeat: noise floor)" : "", gnf ? " (GroupNorm frozen at the base window's statistics)" : "", Dc, Hc, Hc, C);
+    double acc = 0; int r50 = -1, r90 = -1, r99 = -1, rlast = 0;
+    for (int r = 0; r < R; r++) { if (!cn[r]) continue; rlast = r; acc += sh[r];
+        if (r50 < 0 && acc >= 0.5 * tot) r50 = r; if (r90 < 0 && acc >= 0.9 * tot) r90 = r; if (r99 < 0 && acc >= 0.99 * tot) r99 = r;
+        if (r < 8 || r % 8 == 0 || r == R - 1) fprintf(stderr, "erf: r %3d  %.3e  %.3e  (%zu cells)\n", r, sh[r] / cn[r], sx[r], cn[r]); }
+    double fl = 0; size_t fn = 0; for (int r = rlast - rlast / 8; r <= rlast; r++) { fl += sh[r]; fn += cn[r]; }
+    double s0 = cn[0] ? sh[0] / cn[0] : 0; int r1 = -1, r01 = -1; for (int r = 0; r <= rlast; r++) if (cn[r]) { const double mu = sh[r] / cn[r]; if (r1 < 0 && mu < 0.01 * s0) r1 = r; if (r01 < 0 && mu < 0.001 * s0) r01 = r; }
+    fprintf(stderr, "erf: summary: centre %.3e, mass radii r50 %d r90 %d r99 %d cells, shell mean < 1%% of centre at r %d, < 0.1%% at r %d, far floor (r >= %d) %.3e (%.2e of centre)\n",
+            s0, r50, r90, r99, r1, r01, rlast - rlast / 8, fn ? fl / fn : 0, fn && s0 > 0 ? fl / fn / s0 : 0);
+    exit(0);
+}
 static void ssl_teacher(gpu_state *d, shape5 ls, int P) {
     const float *jb, *jg; float jst = 0.f; unet_lat_basis(d->u, &jb, &jg, &jst);
     const float st_student = unet_get_lat_step(d->u);
@@ -1589,6 +1646,7 @@ static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
         lg = d->lgf;
     } else if (g_lat) {   /* --lat: x the full-resolution CT channel */
         nn_ptick("other"); const shape5 ls = {B, unet_cfg_of(d->u)->cin, g_Pz / 4, P / 4, P / 4};
+        if (train && getenv("UFSM_ERF")) erf_probe(d, ls, P);   /* (exits) */
         if (d->ssl_win) ssl_teacher(d, ls, P);   /* --ssl, an unlabelled window: the teacher's targets, the student's masked input */
         lg = unet_forward_x(d->u, d->x, ls, train, g_xfmt != 0); nn_ptick("trunk forward");
     }   /* --lat: x the full-resolution CT channel */
