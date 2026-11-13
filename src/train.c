@@ -3243,7 +3243,8 @@ int cmd_train(int argc, char **argv) {
                 }
                 sampler_release(sq, b);
                 if ((i + 1) % 10 == 0 || i + 1 == nb) { const double dt = now() - t0 - tf;
-                    fprintf(stderr, "sampler-only: %d batches, %.1f s (first %.1f s), %.1f Mvox/s after the first\n", i + 1, now() - t0, tf, i > 0 ? (double)i * B * g_Pz * P * P / 1e6 / dt : 0.); }
+                    fprintf(stderr, "sampler-only: %d batches, %.1f s (first %.1f s), %.1f Mvox/s after the first\n", i + 1, now() - t0, tf, i > 0 ? (double)i * B * g_Pz * P * P / 1e6 / dt : 0.);
+                    sampler_hostmem(sq, stderr, 0); }   /* (the host memory by owner every 10 batches: slow growth shows where) */
             }
             for (int s = 0; cov && s < S->n; s++) if (cov[s][0] > 0) { const double k = cov[s][0];
                 fprintf(stderr, "sampler-only: source %-34s windows %5.0f  material %.3f  phase known %.3f (of material %.3f)  w4 known %.3f\n", S->src[s].name, k,
