@@ -4201,6 +4201,12 @@ void sampler_hostmem(const sampler *sp, FILE *f, size_t pinned) {
                " | malloc arena %.2f GB in use %.2f free %.2f mmapped %.2f | p3 %.0f M; pool classes of a worker (x p3):%s | ink caches %.2f GB targets + %.2f GB CT\n",
             rss / 1048576.0, pinned / G, g_slot_bytes / G, nw, bigr / G, bigv / G, ttr / G, ttv / G, tpv / G, tpk / G, tpr / G,
             (mi.arena) / G, mi.uordblks / G, mi.fordblks / G, mi.hblkhd / G, p3 / 1e6, cls, ikt / G, ikc / G);
+    for (int w = 0; w < WM_MAX; w++) {   /* per worker: big's resident share of each P^3 slice (which code paths touched it: [0] CT, [1..8] region / warp scratch, [9] mask), ttmp's */
+        if (!g_wm[w].big) continue;
+        fprintf(f, "hostmem: worker %d big slices (x p3 resident):", w);
+        for (int q = 0; q < 10; q++) fprintf(f, " %.2f", resident_bytes(g_wm[w].big + (size_t)q * (size_t)p3, (size_t)p3) / p3);
+        fprintf(f, " | ttmp %.2f\n", resident_bytes(g_wm[w].ttmp, g_wm[w].ttn) / p3);
+    }
 }
 void sampler_stop(sampler *sp) {
     if (!sp) return;
