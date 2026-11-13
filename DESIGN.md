@@ -6,6 +6,19 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## The next batch's label warp under the forward (2026-11-13, branch lwarp-20261113)
+
+The P 1024 split profile (perf2, below) left ~350 ms per card a step exposed at the step boundary: upload_tail warped the next --gpu-aug
+batch's label planes on the device (6 x 634 MB H2D, lw_phase / lw_ink / w4 kernels, 6 x 570 MB D2H into the pinned lbh) before its CT,
+because the warp's scratch was the input buffer xb (inside gout[0] in lean 2, busy until the stem's weight gradient), and the forward
+waited for all of it (ev_up). The labels are first read by head pass 0, after the whole trunk forward.
+**lab_early:** the tail uploads the radial records and the CT, records ev_up (the forward's wait), then runs the label warp on the copy
+stream with scratch hs_lg (35 x 8 planes x P^2 x 2 B = 587 MB >= one 570 MB plane; idle from the gradient pass to the next statistics
+pass, split3's planner read) + lsc (one more plane for the winding pair, allocated at the first tail when > p3 + 768 MB is free), and
+records ev_lab; head pass 0 (stream 0 and the slab-upload aux stream), the synchronous upload and the end-of-backward pinned-batch
+release wait for ev_lab. Same bytes in a different order: --det losses must be identical. UFSM_LAB_EARLY=0: the old order. Startup line
+"label warp: ...". **Status: built, not yet run** (desk GPUs are scratch2-only; swap-window check: /vesuvius/ufsm/perf2/lwarp_swap.sh).
+
 ## scratch2 at P 1024 --split z: device memory outside the planner, and a per-step leak (2026-11-13, branch s2fix-20261113)
 
 The full scratch2 flag set (widths 256,320,384,448,288,288, attention 4 blocks with scroll PE, gn-ema, scan-norm, gfilm, ink head + MIL +

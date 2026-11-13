@@ -90,6 +90,9 @@ typedef struct {
     float *axh[2]; int axv[2], axn[2], axs[2];   /* --attn-axis radial / --attn-pe scroll: per buffer the batch's scroll-axis records (host copies, sample.h
                                     SAMPLE_AXR) and whether it has them (restore / slab batches: none) */
     void *ev_up[2], *ev_done[2]; /* upload into buffer i finished; the compute that last used buffer i finished */
+    void *ev_lab[2];             /* lab_early: buffer i's label planes built (the head slabs wait for it; the forward only for ev_up) */
+    size_t hs_lg_bytes; int lsc_tried;
+    uint8_t *lsc;                /* lab_early: the second label-warp scratch plane (the first: hs_lg, idle from the gradient pass to the next statistics pass) */
     batch *pending;              /* host batch whose upload into buffer (cur ^ 1) is in flight */
     batch *tail_due;             /* upsplit: the host batch whose tail (targets, mask, weights) goes up after the loss fetch */
     int upsplit;                 /* lean, three level-0 buffers: the next batch's head goes up in the stem's weight gradient (X2 free), its tail
@@ -726,8 +729,10 @@ static void lab_upload(int kind, const batch *b, uint8_t *da, uint8_t *db, const
 /* g_lstream: a batch's label planes through the device (warped there as usual, scratch = the batch's input buffer xb[i], 2 p3 bytes,
    written before its CT channel) into the pinned host planes d->hl; head_slab_pass uploads each slab's planes. Same stream order as
    the device planes they replace. */
+static int lab_early(const gpu_state *d) { return d->lsc != nullptr; }
 static void lab_stream(gpu_state *d, const batch *b, int i, const void *rad, int B, int P, int async) {
-    const size_t p3 = (size_t)g_Pz * P * P; uint8_t *s = (uint8_t *)d->xb[i];
+    const size_t p3 = (size_t)g_Pz * P * P; uint8_t *s = (uint8_t *)d->xb[i], *s2 = s + p3;
+    if (lab_early(d) && async) { s = (uint8_t *)d->hs_lg; s2 = d->lsc; }   /* (lab_early: out of the input buffer, so the CT can go first) */
     void (*dh)(void *, const void *, size_t) = async ? nn_d2h_copy_stream : nn_d2h;
     nn_aug_stage_reset();
     /* experiment UFSM_LAB_QBITS=n (4 / 6): the training batches' phase and winding planes at 2^n levels (asynchronous uploads only: validation
@@ -737,7 +742,7 @@ static void lab_stream(gpu_state *d, const batch *b, int i, const void *rad, int
     /* a plane kept on the device as bytes is built in place (no scratch copy); LDIR: its destination */
 #define LDIR(k, src) (d->ldev[k] && d->ldbits[k] == 8 && B == 1 && !(qb > 0 && qb < 8 && async && (k) < 2 && (qp >> (k) & 1)) ? d->ldev[k] : (src))
     if (g_side) { uint8_t *t0 = LDIR(0, s); lab_upload(1, b, t0, nullptr, b->side, nullptr, rad, B, P, async); nn_ptick_fine("    x side build"); if (t0 == s) LKEEP(0, s); nn_ptick_fine("    x side d2h"); }
-    if (g_unwrap2) { uint8_t *t1 = LDIR(1, s), *t2 = LDIR(2, s + p3); lab_upload(2, b, t1, t2, b->w4, b->wcomp, rad, B, P, async); nn_ptick_fine("    x w4 build"); if (t1 == s) LKEEP(1, s); if (t2 == s + p3) LKEEP(2, s + p3); nn_ptick_fine("    x w4 d2h (2 planes)"); }
+    if (g_unwrap2) { uint8_t *t1 = LDIR(1, s), *t2 = LDIR(2, s2); lab_upload(2, b, t1, t2, b->w4, b->wcomp, rad, B, P, async); nn_ptick_fine("    x w4 build"); if (t1 == s) LKEEP(1, s); if (t2 == s2) LKEEP(2, s2); nn_ptick_fine("    x w4 d2h (2 planes)"); }
 #undef LDIR
     for (int j = 0; j < g_naux; j++) { lab_upload(3, b, s, nullptr, AUXH(b, j), nullptr, rad, B, P, async); nn_ptick_fine("    x ink build"); LKEEP(3 + j, s); nn_ptick_fine("    x ink d2h"); }
 #undef LKEEP
@@ -878,7 +883,7 @@ static void upload(gpu_state *d, const batch *b, int B, int P) {
     batch bview_; b = batch_view(&bview_, b, d, d->cur, P);
     dump_win(b, B, P);
     nn_aug_stage_reset();   /* (the label / CT staging buffer holds nothing of this batch yet; the sampler reuses its host planes) */
-    if (d->upsplit || d->hsplit) nn_event_sync(d->ev_up[d->cur]);   /* (an asynchronous head / tail into the same buffer may still be in flight) */
+    if (d->upsplit || d->hsplit) { nn_event_sync(d->ev_up[d->cur]); nn_event_sync(d->ev_lab[d->cur]); }   /* (an asynchronous head / tail into the same buffer may still be in flight; lab_early: its label warp in hs_lg) */
     d->sheet=b->sheet?b->sheet[0]:nullptr;
     d->um = d->umb[d->cur] = b->um ? b->um[0] : 0.f; d->umd = d->umdb[d->cur] = batch_umd(b, d->um);
     if (b->corner && b->level) { memcpy(d->cornb[d->cur], b->corner[0], sizeof d->cornb[0]); d->lvlb[d->cur] = b->level[0]; }   /* validation copies carry none */
@@ -968,7 +973,7 @@ static void upload_async(gpu_state *d, const batch *b, int i, int B, int P) {
         if (g_distill) nn_h2d_copy_stream(d->embb[i], b->emb, g_distill_n);
         if (g_pap_head) nn_h2d_copy_stream(d->papb[i], b->pap, (size_t)B * p3);
     }
-    nn_event_record(d->ev_up[i], 1);
+    nn_event_record(d->ev_up[i], 1); nn_event_record(d->ev_lab[i], 1);
 }
 /* upsplit: the tail of the batch upload_async left (the step's end: the stem's gradient in X3 read; issued with the optimiser, after the
    loss and gradient-norm fetches, whose small copies would otherwise wait behind it where copies run one at a time); ev_up then covers
@@ -979,10 +984,18 @@ static void upload_tail(gpu_state *d, int B, int P) {
     nn_aug_stage_reset();
     const int i = d->cur;   /* (lean: both buffer indices alias) */
     const size_t p3 = (size_t)g_Pz * P * P;
+    if (!d->lsc_tried) {   /* lab_early: decided once, at the first tail (the planner's allocations done): hs_lg holds a label plane, one more plane fits */
+        d->lsc_tried = 1;
+        const int want = (!getenv("UFSM_LAB_EARLY") || ufsm_env_on("UFSM_LAB_EARLY")) && d->hsplit && g_lstream && B == 1 && d->hs_lg && d->hs_lg_bytes >= p3;
+        const size_t fr = want ? nn_mem_free() : 0, margin = (size_t)768 << 20;
+        if (want && fr > p3 + margin) d->lsc = nn_malloc(p3);
+        if (d->side <= 0) fprintf(stderr, "label warp: %s (%.0f MB free; UFSM_LAB_EARLY=0 off)\n", d->lsc ? "after the input, under the forward (hs_lg + one more plane)" :
+                                             want ? "at the step boundary: too little device memory for its second plane" : "at the step boundary", fr / 1e6);
+    }
     nn_stream_wait(1, d->ev_done[i]); nn_stream_wait(1, d->ev_done[i ^ 1]);
     if (d->hsplit) {   /* the input (inside gout[0]: the stem's weight gradient read it until the step's end); --gpu-aug batches: then their
                           label planes, warped on the device with the radial records just uploaded (upload_async left them) */
-        if (g_lstream && b->ct8) { nn_h2d_copy_stream(d->radb[i], b->rad, rad_bytes(B)); lab_stream(d, b, i, d->radb[i], B, P, 1); }
+        if (g_lstream && b->ct8) { nn_h2d_copy_stream(d->radb[i], b->rad, rad_bytes(B)); if (!lab_early(d)) lab_stream(d, b, i, d->radb[i], B, P, 1); }
         ct_upload(b, d->xb[i], d->radb[i], B, P, 1); if (g_lat_dp > 0) lat_take(d, b, i, B, 1);
         if (b->ct8 && (!g_lstream || g_lcheck)) {
             if (g_side) lab_upload(1, b, d->sideb[i], nullptr, b->side, nullptr, d->radb[i], B, P, 1);
@@ -1001,6 +1014,10 @@ static void upload_tail(gpu_state *d, int B, int P) {
     nn_h2d_copy_stream(d->wb[i], trow_w(b, B, d->hwh[i]), (size_t)B * g_tc);
     if (g_distill) nn_h2d_copy_stream(d->embb[i], b->emb, g_distill_n);
     nn_event_record(d->ev_up[i], 1);
+    /* lab_early (perf2 2026-11-13): the label warp after the input, into hs_lg + lsc instead of the input buffer, so the next forward starts
+       on ev_up while the warp runs on the copy stream; the head slabs wait for ev_lab (P 1024 split: ~350 ms per card a step exposed before) */
+    if (d->hsplit && g_lstream && b->ct8 && lab_early(d)) lab_stream(d, b, i, d->radb[i], B, P, 1);
+    nn_event_record(d->ev_lab[i], 1);
     d->tail_due = nullptr;
 }
 
@@ -1208,6 +1225,7 @@ static int mil_clip(const gpu_state *d, int pass, int z0, int nz, size_t hw, int
 static void head_slab_pass(gpu_state *d, int pass) {
     const int D = g_Pz, H = d->hs_P, W = d->hs_P, Z = d->hs_z;
     const size_t hw = (size_t)H * W, l3 = (size_t)D * hw;
+    if (!pass && d->ev_lab[d->cur]) nn_stream_wait(0, d->ev_lab[d->cur]);   /* (lab_early: the label warp in hs_lg / lsc, the device-kept planes) */
     nn_set_logits_h16(1);
     static int lchk = -1; if (lchk < 0) lchk = g_lat && ufsm_env_on("UFSM_LAT_CHECK");
     /* UFSM_PTICK: the slab phases by pass */
@@ -1312,7 +1330,7 @@ static void head_slab_pass(gpu_state *d, int pass) {
                 for (int q = sj ? sj + 1 : 0; q <= sj + 1 && q * Z < D; q++) {
                     const int y0 = q * Z, y1 = y0 + Z < D ? y0 + Z : D, st = q & 1;
                     uint8_t *const *const l2 = st ? d->lbs2 : d->lbs;
-                    if (!q) nn_stream_wait(2, d->ev_up[d->cur]);   /* (the host planes: this batch's upload wrote them) */
+                    if (!q) nn_stream_wait(2, d->ev_lab[d->cur]);   /* (the host planes: this batch's label warp wrote them; ev_lab follows ev_up) */
                     nn_stream_wait(2, d->evl_free[st]);
                     /* (a plane kept on the device: its bytes are read in place; a packed one is expanded into the slab buffer) */
 #define LSLAB(st_, k, dst, v0, n) do { if (!d->ldev[k]) nn_h2d_stream(st_, (dst), d->lbh[k] + (v0), (n)); else if (d->ldbits[k] != 8) nn_lab_unpack(st_, d->ldev[k], (dst), (v0), (n), d->ldbits[k]); } while (0)
@@ -1718,7 +1736,7 @@ static void gstep_fwd(gstep_arg *a) {
     nn_sr_set_ctr((unsigned)g << 24);
             nn_stream_wait(0, d->ev_up[d->cur]);           /* compute waits for the upload */
             if (getenv("UFSM_DET_TRACE")) {   /* debugging (--det 1): hashes of what this step starts from: the input channel, the streamed label planes, the parameters */
-                nn_event_sync(d->ev_up[d->cur]); nn_sync();
+                nn_event_sync(d->ev_up[d->cur]); nn_event_sync(d->ev_lab[d->cur]); nn_sync();   /* (lab_early: the label planes come after the input) */
                 const size_t p3t = (size_t)g_Pz * P * P, nx = (size_t)B * g_xs * p3t * xbytes(); uint8_t *hb = malloc(nx > p3t ? nx : p3t);
                 uint64_t hx = 1469598103934665603ull, hl[4] = {0, 0, 0, 0};
                 nn_d2h(hb, d->x, nx); for (size_t q = 0; q < nx; q++) hx = (hx ^ hb[q]) * 1099511628211ull;
@@ -1752,7 +1770,7 @@ static void gstep_bwd(gstep_arg *a) {
             diag_nonfinite(d, "parameter gradients", unet_grad_ptr(d->u), unet_nparams(d->u), 0);
             d->fs_drop = 0;   /* (validation: with the stem) */
             nn_event_record(d->ev_done[d->cur], 0);
-            nn_event_sync(d->ev_up[d->cur]);                 /* host buffer of this batch is free again */
+            nn_event_sync(d->ev_up[d->cur]); nn_event_sync(d->ev_lab[d->cur]);   /* host buffer of this batch is free again (lab_early: its label warp read it) */
 }
 static void gstep_job(void *p) { gstep_arg *a = p; gstep_fwd(a); if (!a->rc) gstep_bwd(a); nn_tls_capture(&a->out); }
 /* the per-GPU host threads (persistent: thread-local device scratch lives as long as they do), started on first use */
@@ -3897,7 +3915,7 @@ int cmd_train(int argc, char **argv) {
             else { d->xb[i] = nn_malloc((size_t)B * g_xs * p3 * xbytes()); d->tb[i] = nn_malloc(g_pkf && g_pack ? 256 : g_lat && g_tm_unused ? 256 : (size_t)B * g_tc * p3);   /* (the direct pack
                                                                                                        loss reads the packed codes in mb) */ d->mb[i] = nn_malloc(g_lat && g_tm_unused ? 256 : (size_t)B * p3); d->wb[i] = nn_malloc((size_t)B * g_tc); d->radb[i] = g_gpu_in ? nn_malloc(rad_bytes(B)) : nullptr; }
             d->hwh[i] = g_heads ? nn_host_alloc((size_t)B * g_tc) : nullptr;
-            d->ev_up[i] = nn_event_create();
+            d->ev_up[i] = nn_event_create(); d->ev_lab[i] = nn_event_create();
         }
         if (g_head_slab && bs) {   /* head slabs read the targets and mask in the backward (head_slab_cb), after the head's backward has
                                       started writing the gradient buffers: their own buffers (+3 B per voxel), the input stays inside */
@@ -3989,7 +4007,7 @@ int cmd_train(int argc, char **argv) {
             d->nt = nn_malloc((size_t)7 * tp3); d->nm = nn_malloc(tp3);
             if (g_head_slab) {
                 d->hs_z = g_hs_z; d->hs_P = P;
-                d->hs_lg = nn_malloc((size_t)(g_lat ? LUPC : g_cout) * tp3 * 2); d->hs_ds = nn_malloc(128 * sizeof(double)); if (g_gc) d->gcS = nn_malloc((size_t)cfg.cout * cfg.cout * sizeof(double));
+                d->hs_lg = nn_malloc(d->hs_lg_bytes = (size_t)(g_lat ? LUPC : g_cout) * tp3 * 2); d->hs_ds = nn_malloc(128 * sizeof(double)); if (g_gc) d->gcS = nn_malloc((size_t)cfg.cout * cfg.cout * sizeof(double));
                 if (g_lat_hs) {   /* (the streamed head: hs_z / 4 + 2 cell planes of logits, fp32 sums, sub-cell gradient and the head's 16-bit gradient) */
                     const size_t nq = (size_t)(g_hs_z / 4 + 2) * (P / 4) * (P / 4);
                     d->lgc = nn_malloc(nq * LNC * 2); d->latg = nn_malloc(nq * LGFC * 4); d->latgl = LGFC < LNC ? nn_malloc(nq * LNC * 2) : nullptr; d->latgc = nn_malloc(nq * LNC * 2);
