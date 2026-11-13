@@ -11,6 +11,7 @@
 [[gnu::weak]] void inksplat_defaults(inksplat_cfg *);
 [[gnu::weak]] const char *dcache_default_dir(void);
 [[gnu::weak]] z3 *z3_open_cached(z3 *, const char *, const char *, int, size_t);
+[[gnu::weak]] int dcache_set_batch(z3 *, int);
 #include "meshcodes.h"
 [[gnu::weak]] z3 *mesh_codes_open(const char *, const char *, const char *, int, z3 *, int);   /* (weak: binaries without meshcodes.o: "meshes" then fails to open) */
 [[gnu::weak]] const char *mesh_codes_key(const z3 *);
@@ -177,7 +178,13 @@ static z3 *onfly_phase_of(z3 *cz, float rm, const char *key, const json *of) {
     int cell = (int)json_num(json_get(of, "cache_cell"), 0);
     if (cell <= 0) { cell = 128; while (cell < 3 * rm && cell < 512) cell *= 2; }
     char k2[1200]; snprintf(k2, sizeof k2, "phase-onfly-pair-v1 rmax %.9g codes %s cell %d", rm, key, cell);   /* (the cell size: the disk files' layout) */
-    return z3_open_cached(z, dcd && *dcd ? dcd : nullptr, k2, cell, (size_t)json_num(json_get(of, "cache_mb"), 1024));
+    z3 *zc = z3_open_cached(z, dcd && *dcd ? dcd : nullptr, k2, cell, (size_t)json_num(json_get(of, "cache_mb"), 1024));
+    /* a read's missed cells computed together in boxes of up to "cache_batch" voxels (UFSM_DC_BATCH; default 384: 3^3 cells of 128, the halo
+       share 4.5x -> 1.8x at rmax 40; 0 = cell by cell). The onfly phase does not depend on the box read (byte-identical across tilings) */
+    const char *eb = getenv("UFSM_DC_BATCH");
+    const int be = (int)json_num(json_get(of, "cache_batch"), eb && *eb ? atof(eb) : 384);
+    if (zc && be > 0 && dcache_set_batch) dcache_set_batch(zc, be);
+    return zc;
 }
 /* an "onfly" phase spec ({root, key, rmax[, pool2]}, {meshes, rmax}, or {"sets": [...], "tol"}) opened with `extra` more 2x levels of its
    codes at rmax / 2^extra (extra 1: the phase of the next coarser level). plev: the phase's level (the meshes' default codes level).

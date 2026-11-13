@@ -18,6 +18,7 @@ typedef struct dent { int64_t key; uint8_t *data; uint8_t cval; int busy, failed
    source under one budget); the pool's mutex guards the LRU and every member array's hash */
 struct dcache_pool { pthread_mutex_t mu; pthread_cond_t cv; dent *head, *tail; size_t bytes, cap; int shared; };
 typedef struct dc {
+    unsigned magic; int batch;   /* batch: the edge (voxels) up to which a read's missed cells are computed as one box (dcache_set_batch) */
     z3 *in; int C, fill; int64_t shape[3], gc[3]; char *dir;   /* dir: ROOT/<hash> or nullptr (memory only) */
     dcache_pool *P; dent **hash; size_t nhash; _Atomic int disk_warned;
 } dc;
@@ -83,39 +84,134 @@ static int disk_put(dc *c, int64_t cz, const char *p, const uint8_t *data, uint8
     atomic_fetch_add(&g_dc.wbytes, 16 + nz);
     return 0;
 }
-/* one cell: a referenced entry (ready), or nullptr on failure */
-static dent *cell_get(dc *c, int64_t cz, int64_t cy, int64_t cx, int nthreads) {
-    const int64_t key = (cz * c->gc[1] + cy) * c->gc[2] + cx; const size_t h = hb(c, key);
-    dcache_pool *P = c->P;
+/* a cell's entry: found (referenced; *mine 0, maybe still busy with another reader) or created busy for the caller (*mine 1) */
+static dent *cell_claim(dc *c, int64_t key, int *mine) {
+    const size_t h = hb(c, key); dcache_pool *P = c->P;
     pthread_mutex_lock(&P->mu);
     dent *e = c->hash[h]; while (e && e->key != key) e = e->hnext;
-    if (e) {
-        e->refs++; while (e->busy) pthread_cond_wait(&P->cv, &P->mu);
-        if (e->failed) { if (!--e->refs) free(e); pthread_mutex_unlock(&P->mu); return nullptr; }
-        unlink_lru(P, e); push_lru(P, e); pthread_mutex_unlock(&P->mu); atomic_fetch_add(&g_dc.mem, 1); return e;
-    }
-    e = calloc(1, sizeof *e); e->key = key; e->own = c; e->busy = 1; e->refs = 1; e->hnext = c->hash[h]; c->hash[h] = e; push_lru(P, e);
+    if (e) { e->refs++; *mine = 0; pthread_mutex_unlock(&P->mu); return e; }
+    e = calloc(1, sizeof *e); if (!e) { pthread_mutex_unlock(&P->mu); return nullptr; }
+    e->key = key; e->own = c; e->busy = 1; e->refs = 1; e->hnext = c->hash[h]; c->hash[h] = e; push_lru(P, e); *mine = 1;
     pthread_mutex_unlock(&P->mu);
-    char p[1300]; int ok = 0; uint8_t *data = nullptr, cval = 0;
-    if (c->dir) { cell_path(c, cz, cy, cx, p, sizeof p); const double t = dnow(); ok = !disk_get(c, p, &data, &cval); if (ok) { atomic_fetch_add(&g_dc.disk, 1); atomic_fetch_add(&g_dc.ns_disk, (uint64_t)((dnow() - t) * 1e9)); } }
-    if (!ok) {
-        const double t = dnow(); const int64_t o[3] = {cz * c->C, cy * c->C, cx * c->C}, n[3] = {c->C, c->C, c->C};
-        data = malloc(cbytes(c));
-        if (data && !z3_read(c->in, o, n, data, nthreads)) {
-            ok = 1; size_t k = 1; const size_t nb = cbytes(c); while (k < nb && data[k] == data[0]) k++;
-            if (k == nb) { cval = data[0]; free(data); data = nullptr; atomic_fetch_add(&g_dc.fill, 1); }   /* constant cells (most: no labels in reach) */
-            atomic_fetch_add(&g_dc.comp, 1); atomic_fetch_add(&g_dc.ns_comp, (uint64_t)((dnow() - t) * 1e9));
-            if (c->dir && disk_put(c, cz, p, data, cval) && !atomic_exchange(&c->disk_warned, 1)) fprintf(stderr, "dcache: cannot write %s (%s): memory only from here\n", p, strerror(errno));
-        } else { free(data); data = nullptr; }
-    }
-    pthread_mutex_lock(&P->mu);
+    return e;
+}
+/* another reader's entry ready (the referenced entry, or nullptr: it failed) */
+static dent *cell_wait(dc *c, dent *e) {
+    dcache_pool *P = c->P; pthread_mutex_lock(&P->mu);
+    while (e->busy) pthread_cond_wait(&P->cv, &P->mu);
+    if (e->failed) { if (!--e->refs) free(e); pthread_mutex_unlock(&P->mu); return nullptr; }
+    unlink_lru(P, e); push_lru(P, e); pthread_mutex_unlock(&P->mu); atomic_fetch_add(&g_dc.mem, 1); return e;
+}
+static void cell_path_k(const dc *c, int64_t key, char *p, size_t np, int64_t *cz) {
+    const int64_t z = key / (c->gc[1] * c->gc[2]), y = key / c->gc[2] % c->gc[1], x = key % c->gc[2]; *cz = z; cell_path(c, z, y, x, p, np);
+}
+static int cell_disk(dc *c, dent *e) {   /* a claimed cell from disk: 1 found (data / cval set), 0 not */
+    if (!c->dir) return 0;
+    char p[1300]; int64_t cz; cell_path_k(c, e->key, p, sizeof p, &cz);
+    const double t = dnow(); uint8_t *data = nullptr, cval = 0;
+    if (disk_get(c, p, &data, &cval)) return 0;
+    atomic_fetch_add(&g_dc.disk, 1); atomic_fetch_add(&g_dc.ns_disk, (uint64_t)((dnow() - t) * 1e9));
+    e->data = data; e->cval = cval; return 1;
+}
+/* a computed cell's C^3 values (data owned by the call: kept, or freed when constant) into the entry and onto disk */
+static void cell_computed(dc *c, dent *e, uint8_t *data) {
+    size_t k = 1; const size_t nb = cbytes(c); uint8_t cval = 0;
+    while (k < nb && data[k] == data[0]) k++;
+    if (k == nb) { cval = data[0]; free(data); data = nullptr; atomic_fetch_add(&g_dc.fill, 1); }   /* constant cells (most: no labels in reach) */
+    atomic_fetch_add(&g_dc.comp, 1);
+    char p[1300]; int64_t cz;
+    if (c->dir) { cell_path_k(c, e->key, p, sizeof p, &cz);
+        if (disk_put(c, cz, p, data, cval) && !atomic_exchange(&c->disk_warned, 1)) fprintf(stderr, "dcache: cannot write %s (%s): memory only from here\n", p, strerror(errno)); }
+    e->data = data; e->cval = cval;
+}
+/* a claimed cell done: ok -> ready (referenced), else failed (nullptr) */
+static dent *cell_finish(dc *c, dent *e, int ok) {
+    dcache_pool *P = c->P; pthread_mutex_lock(&P->mu);
     e->busy = 0;
-    if (!ok) { e->failed = 1; unlink_lru(P, e); unhash(c, e); pthread_cond_broadcast(&P->cv); if (!--e->refs) free(e); pthread_mutex_unlock(&P->mu); return nullptr; }
-    e->data = data; e->cval = cval; P->bytes += sizeof *e + (data ? cbytes(c) : 0); evict(P);
+    if (!ok) { free(e->data); e->data = nullptr; e->failed = 1; unlink_lru(P, e); unhash(c, e); pthread_cond_broadcast(&P->cv); if (!--e->refs) free(e); pthread_mutex_unlock(&P->mu); return nullptr; }
+    P->bytes += sizeof *e + (e->data ? cbytes(c) : 0); evict(P);
     pthread_cond_broadcast(&P->cv); pthread_mutex_unlock(&P->mu);
     return e;
 }
+/* one cell: a referenced entry (ready), or nullptr on failure */
+static dent *cell_get(dc *c, int64_t cz, int64_t cy, int64_t cx, int nthreads) {
+    const int64_t key = (cz * c->gc[1] + cy) * c->gc[2] + cx; int mine = 0;
+    dent *e = cell_claim(c, key, &mine); if (!e) return nullptr;
+    if (!mine) return cell_wait(c, e);
+    if (cell_disk(c, e)) return cell_finish(c, e, 1);
+    const double t = dnow(); const int64_t o[3] = {cz * c->C, cy * c->C, cx * c->C}, n[3] = {c->C, c->C, c->C};
+    uint8_t *data = malloc(cbytes(c)); int ok = 0;
+    if (data && !z3_read(c->in, o, n, data, nthreads)) { ok = 1; cell_computed(c, e, data); atomic_fetch_add(&g_dc.ns_comp, (uint64_t)((dnow() - t) * 1e9)); }
+    else free(data);
+    return cell_finish(c, e, ok);
+}
 static void cell_put(dc *c, dent *e) { dcache_pool *P = c->P; pthread_mutex_lock(&P->mu); if (!--e->refs && e->failed) free(e); else evict(P); pthread_mutex_unlock(&P->mu); }
+static void cell_copy(const dc *c, const dent *e, int64_t cz, int64_t cy, int64_t cx, const int64_t o[3], const int64_t n[3], uint8_t *out) {
+    int64_t a[3], b[3]; const int64_t C = c->C, co[3] = {cz * C, cy * C, cx * C};   /* the overlap [a, b) in array coordinates */
+    for (int d = 0; d < 3; d++) { a[d] = co[d] > o[d] ? co[d] : o[d]; b[d] = co[d] + C < o[d] + n[d] ? co[d] + C : o[d] + n[d]; if (b[d] > c->shape[d]) b[d] = c->shape[d]; }
+    if (e->data || e->cval != (uint8_t)c->fill)
+        for (int64_t z = a[0]; z < b[0]; z++) for (int64_t y = a[1]; y < b[1]; y++) {
+            uint8_t *dst = out + ((size_t)(z - o[0]) * n[1] + (y - o[1])) * n[2] + (a[2] - o[2]);
+            if (e->data) memcpy(dst, e->data + ((size_t)(z - co[0]) * C + (y - co[1])) * C + (a[2] - co[2]), (size_t)(b[2] - a[2]));
+            else memset(dst, e->cval, (size_t)(b[2] - a[2]));
+        }
+}
+/* the batched read (2026-11-13, perf2): per block of G^3 cells (G C <= batch), every cell claimed first; the claimed cells not on disk are
+   computed as one box (their bounding box, when they fill at least half of it) with one z3_read, then split into cells. The pair rule reads
+   its codes with a halo of rmax + 2 around every box it computes: a 128^3 cell at rmax 40 computed 4.5x its voxels, a 3^3-cell box 1.8x
+   (and one tile's launches instead of 27). Only for inner arrays whose values do not depend on the box read (the onfly phase: byte-identical
+   across tilings, tests/test_phase_onfly.sh). A reader waits for another reader's cells only after finishing all its own claims (no
+   wait cycles); a block's references are held until it is copied (at most G^3 cells above the LRU cap). */
+static int dc_block(dc *c, const int64_t b0[3], const int64_t b1[3], const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads) {
+    enum { MAXB = 512 };
+    dent *E[MAXB]; int mine[MAXB], need[MAXB]; int64_t cc[MAXB][3]; int ne = 0, nneed = 0, rc = 0;
+    int64_t m0[3] = {INT64_MAX, INT64_MAX, INT64_MAX}, m1[3] = {-1, -1, -1};
+    for (int64_t cz = b0[0]; cz <= b1[0]; cz++) for (int64_t cy = b0[1]; cy <= b1[1]; cy++) for (int64_t cx = b0[2]; cx <= b1[2]; cx++) {
+        const int64_t key = (cz * c->gc[1] + cy) * c->gc[2] + cx;
+        dent *e = cell_claim(c, key, &mine[ne]); if (!e) { rc = -1; break; }
+        E[ne] = e; cc[ne][0] = cz; cc[ne][1] = cy; cc[ne][2] = cx; need[ne] = 0;
+        if (mine[ne] && !cell_disk(c, e)) { need[ne] = 1; nneed++; const int64_t q[3] = {cz, cy, cx}; for (int d = 0; d < 3; d++) { if (q[d] < m0[d]) m0[d] = q[d]; if (q[d] > m1[d]) m1[d] = q[d]; } }
+        ne++;
+    }
+    if (!rc && nneed) {
+        const int64_t C = c->C, bv = (m1[0] - m0[0] + 1) * (m1[1] - m0[1] + 1) * (m1[2] - m0[2] + 1);
+        int done = 0;
+        if (nneed > 1 && 2 * nneed >= bv) {   /* one box over the missed cells (cells in it already held are recomputed and dropped) */
+            const double t = dnow(); int64_t bo[3], bn[3];
+            for (int d = 0; d < 3; d++) { bo[d] = m0[d] * C; bn[d] = (m1[d] - m0[d] + 1) * C; }
+            uint8_t *box = malloc((size_t)bn[0] * bn[1] * bn[2]);
+            if (box && !z3_read(c->in, bo, bn, box, nthreads)) {
+                done = 1;
+                for (int i = 0; i < ne && done; i++) {
+                    if (!need[i]) continue;
+                    uint8_t *data = malloc(cbytes(c)); if (!data) { done = 0; break; }
+                    const int64_t z0 = (cc[i][0] - m0[0]) * C, y0 = (cc[i][1] - m0[1]) * C, x0 = (cc[i][2] - m0[2]) * C;
+                    for (int64_t z = 0; z < C; z++) for (int64_t y = 0; y < C; y++)
+                        memcpy(data + ((size_t)z * C + y) * C, box + ((size_t)(z0 + z) * bn[1] + (y0 + y)) * bn[2] + x0, (size_t)C);
+                    cell_computed(c, E[i], data); need[i] = 2;
+                }
+                atomic_fetch_add(&g_dc.ns_comp, (uint64_t)((dnow() - t) * 1e9));
+            }
+            free(box);
+        }
+        if (!done)   /* cell by cell (sparse misses, a failed box) */
+            for (int i = 0; i < ne; i++) {
+                if (need[i] != 1) continue;
+                const double t = dnow(); const int64_t co[3] = {cc[i][0] * C, cc[i][1] * C, cc[i][2] * C}, cn[3] = {C, C, C};
+                uint8_t *data = malloc(cbytes(c));
+                if (data && !z3_read(c->in, co, cn, data, nthreads)) { cell_computed(c, E[i], data); need[i] = 2; atomic_fetch_add(&g_dc.ns_comp, (uint64_t)((dnow() - t) * 1e9)); }
+                else { free(data); need[i] = -1; }
+            }
+    }
+    for (int i = 0; i < ne; i++) if (mine[i]) E[i] = cell_finish(c, E[i], need[i] >= 0 && !rc);   /* (all own claims settled before any wait) */
+    for (int i = 0; i < ne; i++) if (!mine[i]) E[i] = cell_wait(c, E[i]);
+    for (int i = 0; i < ne; i++) {
+        if (!E[i]) { rc = -1; continue; }
+        if (!rc) cell_copy(c, E[i], cc[i][0], cc[i][1], cc[i][2], o, n, out);
+        cell_put(c, E[i]);
+    }
+    return rc;
+}
 static int dc_read(void *ctx, z3 *base, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads) {
     (void)base; dc *c = ctx; atomic_fetch_add(&g_dc.reads, 1);
     memset(out, c->fill, (size_t)n[0] * n[1] * n[2]);
@@ -124,20 +220,26 @@ static int dc_read(void *ctx, z3 *base, const int64_t o[3], const int64_t n[3], 
         if (o[d] + n[d] <= 0 || o[d] >= c->shape[d]) return 0;
         c0[d] = o[d] < 0 ? 0 : o[d] / c->C; c1[d] = (o[d] + n[d] - 1) / c->C; if (c1[d] >= c->gc[d]) c1[d] = c->gc[d] - 1;
     }
-    const int64_t C = c->C;
+    const int G = c->batch > c->C ? (c->batch / c->C < 8 ? c->batch / c->C : 8) : 1;
+    if (G > 1) {
+        for (int64_t bz = c0[0]; bz <= c1[0]; bz += G) for (int64_t by = c0[1]; by <= c1[1]; by += G) for (int64_t bx = c0[2]; bx <= c1[2]; bx += G) {
+            const int64_t b0[3] = {bz, by, bx}, b1[3] = {bz + G - 1 < c1[0] ? bz + G - 1 : c1[0], by + G - 1 < c1[1] ? by + G - 1 : c1[1], bx + G - 1 < c1[2] ? bx + G - 1 : c1[2]};
+            if (dc_block(c, b0, b1, o, n, out, nthreads)) return -1;
+        }
+        return 0;
+    }
     for (int64_t cz = c0[0]; cz <= c1[0]; cz++) for (int64_t cy = c0[1]; cy <= c1[1]; cy++) for (int64_t cx = c0[2]; cx <= c1[2]; cx++) {
         dent *e = cell_get(c, cz, cy, cx, nthreads); if (!e) return -1;
-        int64_t a[3], b[3]; const int64_t co[3] = {cz * C, cy * C, cx * C};   /* the overlap [a, b) in array coordinates */
-        for (int d = 0; d < 3; d++) { a[d] = co[d] > o[d] ? co[d] : o[d]; b[d] = co[d] + C < o[d] + n[d] ? co[d] + C : o[d] + n[d]; if (b[d] > c->shape[d]) b[d] = c->shape[d]; }
-        if (e->data || e->cval != (uint8_t)c->fill)
-            for (int64_t z = a[0]; z < b[0]; z++) for (int64_t y = a[1]; y < b[1]; y++) {
-                uint8_t *dst = out + ((size_t)(z - o[0]) * n[1] + (y - o[1])) * n[2] + (a[2] - o[2]);
-                if (e->data) memcpy(dst, e->data + ((size_t)(z - co[0]) * C + (y - co[1])) * C + (a[2] - co[2]), (size_t)(b[2] - a[2]));
-                else memset(dst, e->cval, (size_t)(b[2] - a[2]));
-            }
+        cell_copy(c, e, cz, cy, cx, o, n, out);
         cell_put(c, e);
     }
     return 0;
+}
+#define DC_MAGIC 0x44434331u
+int dcache_set_batch(z3 *z, int edge) {
+    dc *c = z ? (dc *)z3_derived_ctx(z) : nullptr;
+    if (!c || c->magic != DC_MAGIC) return -1;
+    c->batch = edge > 0 ? edge : 0; return 0;
 }
 static void dc_free(void *p) {
     dc *c = p; if (!c) return;
@@ -178,7 +280,7 @@ int dcache_key_dir(const char *dir, const char *key, char *out, size_t nout) {
 z3 *z3_open_cached_pool(z3 *inner, const char *dir, const char *key, int cell, dcache_pool *pool) {
     if (!inner || !pool) { z3_close(inner); return nullptr; }
     const z3_meta *m = z3_meta_of(inner);
-    dc *c = calloc(1, sizeof *c); c->in = inner; c->C = cell > 0 ? cell : 128; c->fill = m->fill;
+    dc *c = calloc(1, sizeof *c); c->magic = 0x44434331u; c->in = inner; c->C = cell > 0 ? cell : 128; c->fill = m->fill;
     for (int d = 0; d < 3; d++) { c->shape[d] = m->shape[d]; c->gc[d] = (m->shape[d] + c->C - 1) / c->C; }
     c->nhash = 1 << 16; c->hash = calloc(c->nhash, sizeof *c->hash); c->P = pool;
     char d[1200];

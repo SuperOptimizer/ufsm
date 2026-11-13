@@ -20,6 +20,10 @@ dcache_pool *dcache_pool_shared(const char *name, size_t mem_mb);
 size_t dcache_pool_bytes(dcache_pool *pool, size_t *cap);   /* the bytes held (and the cap) */
 /* z3_open_cached with its memory LRU in pool (shared: the cap covers every member array) */
 z3 *z3_open_cached_pool(z3 *inner, const char *dir, const char *key, int cell, dcache_pool *pool);
+/* reads of a cached array computed in boxes of up to edge voxels (whole cells, G = edge / C per axis, at most 8): the missed cells of a
+   block computed with one inner read. Only for inners whose values do not depend on the box read (the onfly phase). 0 ok, -1 not a cached
+   array. edge 0: cell by cell (the default) */
+int dcache_set_batch(z3 *z, int edge);
 /* DIR/<24 hex of sha256(key)> (created, inputs.txt written): where a cached array or a companion file (an index) of key lives. 0 ok */
 int dcache_key_dir(const char *dir, const char *key, char *out, size_t nout);
 /* the default cache root: $UFSM_DERIVED_CACHE ("off" / "0" = none), else $HOME/.cache/ufsm/derived */

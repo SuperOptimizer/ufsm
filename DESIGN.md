@@ -76,6 +76,22 @@ behind each device's legacy stream and the host only enqueues. Each half is y + 
 those of the old path. Buffers: 128 MB pinned host, 64 MB of receive chunks per card. The old path's 368 MB on GPU 0 is not
 allocated. tests/test_grad_ar checks both cards against the host sum byte for byte over three calls (quick: 9 M floats in 1 M
 chunks; full: 92.4 M floats, timed against the old path). Default off (UFSM_GRAD_AR2=1) until that test has run on the GPUs.
+
+**Missed derived-cache cells computed together.** On a cold cache the split benches are loader-bound at 16-23 s/step. Most of that
+is the onfly pair rule: about 425 tiles per step on GPU 0, and 576 cells computed in a 6-window sampler-only check. Each missed cell
+was computed on its own, with a halo of rmax + 2 codes voxels around it. That is 4.5x the cell's voxels for a 128^3 cell at rmax 40
+(the scratch1 sources use rmax 20 / 40 / 41 / 48.5 / 80, so cells of 128 and 256), plus one tile's packing and launches per cell.
+dc_read now claims a block of G^3 cells (G = UFSM_DC_BATCH or "cache_batch" / C, default 384 voxels: 3^3 cells of 128). The claimed
+cells that are not on disk are computed as one box with one inner read (their bounding box, when they fill at least half of it), then
+cut into cells. At rmax 40 the halo share drops from 4.5x to 1.8x (the onfly read tiles the box itself within its --onfly-mb budget).
+A reader waits for another reader's cells only after all its own claims are settled, so there are no wait cycles. A block's
+references are held until it has been copied: at most 27 cells (57 MB) plus the box (57 MB) per reading thread at C 128. Cells of 256
+keep G = 1 at the default. This is only enabled for the onfly phase, whose values do not depend on the box read
+(tests/test_phase_onfly.sh: byte-identical across tilings). Checks:
+- On the wind fixture (cache_cell 32), the onfly phase through the cache at batch 0 / 96 / 384 is byte-identical to phase-raster
+  (1.01 M known voxels, CPU), and a reopen reads all 64 cells from disk.
+- tests/test_dcache_batch (CPU, fast tier): batched == cell by cell == direct values on ragged boxes, 4 threads on one cold array, and
+  disk reopen. A cold whole read takes 8 inner reads instead of 64.
 ## Split-window input builders: every --gpu-aug builder by z range, the scanner split exactly across two GPUs (2026-11-13, branch augz-20261112)
 
 ## Muon variants for the from-scratch universal net: ten arms on the 92 M net (2026-11-13, branch muonx-20261113)
