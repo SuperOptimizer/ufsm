@@ -27,6 +27,7 @@
 #include "embz.h"
 #include "latfit.h"
 #include "winauto.h"
+#include "fblend.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <math.h>
@@ -46,7 +47,7 @@ static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
 /* tile read-ahead: a reader thread fills a ring of CT windows (with their nonzero count and intensity sums) in tile
    order while the main thread runs the network on the previous one */
 #define NSLOT 3
-typedef struct { int64_t tz, ty, tx; int64_t shard; int noout; } tile_t;   /* noout: --feather, computed for its spills only (written already / another worker's) */
+typedef struct { int64_t tz, ty, tx; int64_t shard; int noout; int g; } tile_t;   /* noout: --feather, computed for its spills only (written already / another worker's); g: --seam-inproc grid */
 typedef struct {
     z3 *ct; const int64_t *bo; int W, Wz, nthreads;   /* windows Wz x W x W */
     tile_t *tiles; long ntiles;
@@ -799,6 +800,70 @@ static int phead_submit(phead_t *h, int b, int64_t sz, int64_t sy, int64_t sx, i
     return 0;
 }
 static void phead_fresh(phead_t *h, int b) { if (h->gv[b]) nn_stream_wait(0, h->gv[b]); h->gv[b] = nullptr; nn_zero(h->dsh2[b], h->wr->bytes); }
+
+/* --seam-inproc (predict --seamless 2 in one process): per head, the first of a shard's two versions (grids 0 and 1) waits on the host;
+   the second blends with it on the GPU (nn_seam_blend_u8: ink_blend_run's weights and arithmetic) and goes to the writer. A shard one
+   grid alone covers is written at once (weight of the absent grid 0, as ink_blend_run's mask); versions whose partner never came (a
+   window skipped at run time: CT all zero) are written alone at the end (seam_flush), as the two-process blend would see them */
+typedef struct {
+    int n, nph; int64_t ns[3], bo[3]; double S; size_t nsh, bytes;
+    uint8_t *need; uint8_t **pend; int8_t *pg; uint8_t *scr; float *wd, *wh; size_t npend, maxpend; long nblend, nsingle;
+} seam_t;
+static int seam_init(seam_t *M, int nph, int shard, const int64_t ns[3], const int64_t bo[3], const tile_t *T, long nt) {
+    memset(M, 0, sizeof *M); M->n = shard; M->nph = nph; M->S = 2.0 * shard; M->bytes = (size_t)shard * shard * shard;
+    for (int d = 0; d < 3; d++) { M->ns[d] = ns[d]; M->bo[d] = bo[d]; }
+    M->nsh = (size_t)(ns[0] * ns[1] * ns[2]);
+    M->need = calloc(M->nsh, 1); M->pend = calloc(M->nsh * nph, sizeof *M->pend); M->pg = calloc(M->nsh * nph, 1);
+    M->wh = malloc(6 * (size_t)shard * sizeof(float)); M->wd = nn_malloc_try(6 * (size_t)shard * sizeof(float)); M->scr = nn_malloc_try(M->bytes);
+    if (!M->need || !M->pend || !M->pg || !M->wh || !M->wd || !M->scr) return 1;
+    for (long i = 0; i < nt; i++) {
+        const int64_t q0[3] = {T[i].shard / (ns[1] * ns[2]), T[i].shard / ns[2] % ns[1], T[i].shard % ns[2]};
+        for (int64_t a = q0[0]; a < q0[0] + 2 && a < ns[0]; a++) for (int64_t b = q0[1]; b < q0[1] + 2 && b < ns[1]; b++)
+            for (int64_t c = q0[2]; c < q0[2] + 2 && c < ns[2]; c++) M->need[(a * ns[1] + b) * ns[2] + c]++;
+    }
+    return 0;
+}
+static void seam_weights(seam_t *M, int64_t qz, int64_t qy, int64_t qx, int only) {   /* [grid 0 | grid 1] (only >= 0: that grid into slot 0) */
+    const int n = M->n; const int64_t q[3] = {qz, qy, qx};
+    for (int g = 0; g < 2; g++) {
+        if (only >= 0 && g != only) continue;
+        float *w = M->wh + (only >= 0 ? 0 : 3 * (size_t)n * g);
+        for (int d = 0; d < 3; d++) for (int k = 0; k < n; k++) w[d * n + k] = (float)fb_tile_w(M->bo[d] + q[d] * n, 1, k, M->S, g * (double)n);
+    }
+    nn_h2d(M->wd, M->wh, (only >= 0 ? 3 : 6) * (size_t)n * sizeof(float));
+}
+static int seam_submit(seam_t *M, phead_t *h, int j, int b, int g, int64_t qz, int64_t qy, int64_t qx) {
+    const size_t q = (size_t)((qz * M->ns[1] + qy) * M->ns[2] + qx), k = (size_t)j * M->nsh + q;
+    if (M->need[q] >= 2 && !M->pend[k]) {   /* the first version: held */
+        if (!(M->pend[k] = malloc(M->bytes))) { fprintf(stderr, "predict --seam-inproc: out of host memory (%zu shards pending)\n", M->npend); return 1; }
+        nn_d2h(M->pend[k], h->dsh2[b], M->bytes); M->pg[k] = (int8_t)g;
+        if (++M->npend > M->maxpend) M->maxpend = M->npend;
+        return 0;
+    }
+    if (M->pend[k]) {   /* the second: grid 0 is ink_blend_run's input a */
+        nn_h2d(M->scr, M->pend[k], M->bytes); free(M->pend[k]); M->pend[k] = nullptr; M->npend--;
+        seam_weights(M, qz, qy, qx, -1);
+        if (M->pg[k] == 0) nn_seam_blend_u8(M->scr, h->dsh2[b], h->dsh2[b], M->n, M->wd);
+        else nn_seam_blend_u8(h->dsh2[b], M->scr, h->dsh2[b], M->n, M->wd);
+        M->nblend++;
+    } else { seam_weights(M, qz, qy, qx, g); nn_seam_blend_u8(h->dsh2[b], nullptr, h->dsh2[b], M->n, M->wd); M->nsingle++; }
+    return phead_submit(h, b, qz, qy, qx, qz);
+}
+static int seam_flush(seam_t *M, phead_t *PH, int *phd) {   /* versions whose partner never came: alone */
+    long nf = 0;
+    for (int j = 0; j < M->nph; j++) for (size_t q = 0; q < M->nsh; q++) {
+        const size_t k = (size_t)j * M->nsh + q; if (!M->pend[k]) continue;
+        const int64_t qz = (int64_t)q / (M->ns[1] * M->ns[2]), qy = (int64_t)q / M->ns[2] % M->ns[1], qx = (int64_t)q % M->ns[2];
+        phead_t *h = &PH[j]; phead_fresh(h, *phd);
+        nn_h2d(h->dsh2[*phd], M->pend[k], M->bytes); free(M->pend[k]); M->pend[k] = nullptr; M->npend--;
+        seam_weights(M, qz, qy, qx, M->pg[k]); nn_seam_blend_u8(h->dsh2[*phd], nullptr, h->dsh2[*phd], M->n, M->wd);
+        if (phead_submit(h, *phd, qz, qy, qx, qz)) return 1;
+        *phd ^= 1; nf++;
+    }
+    fprintf(stderr, "predict --seam-inproc: %ld shards blended, %ld from one grid, %ld whose partner window was skipped; at most %zu versions waited (%.1f GB)\n",
+            M->nblend, M->nsingle, nf, M->maxpend, M->maxpend * (double)M->bytes / 1e9);
+    return 0;
+}
 /* the fine stem's output row of channel c (train: the voxel-logit outputs c < 2 or c >= 9 below cout, the first fstem_out of them; -1 none) */
 static int phead_stem_row(const unet_cfg *cfg, int c) {
     if (!cfg->fstem) return -1;
@@ -1218,6 +1283,8 @@ static int ffz_json(const char *p, const int64_t bo[3], const int64_t bn[3], con
     fprintf(f, "]}\n"); return fclose(f) ? 1 : 0;
 }
 int predict_seamless(int argc, char **argv);   /* src/seamless.c */
+static int predict_one(int argc, char **argv);
+int predict_one_entry(int argc, char **argv) { return predict_one(argc, argv); }   /* (predict --seamless 2, in-process: src/seamless.c) */
 static int predict_one(int argc, char **argv) {
     if (*opt(argc, argv, "--seamless", "") && strcmp(opt(argc, argv, "--seamless", ""), "0") && !getenv("UFSM_SEAM_CHILD")) return predict_seamless(argc, argv);
     /* UFSM_PRED_DEVREAD=1: the CT windows decoded on the GPU into device memory (volcomp's GPU decoder, byte-identical): turned on here,
@@ -1949,6 +2016,16 @@ static int predict_one(int argc, char **argv) {
        written (INFERENCE_MEMORY_PLAN.md, memory into speed); otherwise one or more windows per shard, clipped to it */
     int kss = !slab && !sheet_task && gpath && stride % shard == 0 && stride / shard >= 2 ? stride / shard : 1;
     for (int d = 0; d < 3 && kss > 1; d++) { int64_t ph = grid ? (bo[d] - grid_origin[d]) % stride : 0; if (ph < 0) ph += stride; if (ph) kss = 1; }
+    /* --seam-inproc 1 (predict --seamless 2 in one process, src/seamless.c): two tile grids, interiors anchored at 0 and stride / 2 = the
+       shard, both one window per 2^3 shards on the same shard lattice; each shard's two versions blended on the GPU as ink_blend_run
+       does (nn_seam_blend_u8) before the writer. sgo[g]: grid g's first tile in shards from the box origin (0 or 1 per axis) */
+    const int seam2 = atoi(opt(argc, argv, "--seam-inproc", "0")) != 0; int64_t sgo[2][3] = {{0}};
+    if (seam2) {
+        if (!lhm || !gpath || stride != 2 * shard || !fullg || fea || nwork > 1 || resume || slab || sheet_task || ffd || WR.skip) {
+            fprintf(stderr, "predict --seam-inproc: the --heads device path, window - 2 halo = 2 shards, --full-grid 1 (no --resume, --feather, --gpus workers, fit fields)\n"); return 2; }
+        kss = 2;
+        for (int g = 0; g < 2; g++) for (int d = 0; d < 3; d++) { int64_t r = (g * shard - bo[d]) % stride; if (r < 0) r += stride; sgo[g][d] = r / shard; }
+    }
     if (fea) {   /* --feather: the window grid on the shard grid, interior k shards (k >= 1), one GPU path */
         int bad = fea < 0 || fea > halo || fea > hz || fea > 1024 || slab || sheet_task || !gpath || split || (ffd && (!ffzm || tta > 1)) || half || stride % shard || sweep_out;
         for (int d = 0; d < 3 && !bad; d++) { int64_t ph = grid ? (bo[d] - grid_origin[d]) % stride : 0; if (ph < 0) ph += stride; if (ph) bad = 1; }
@@ -2117,6 +2194,23 @@ static int predict_one(int argc, char **argv) {
             rd.tiles[rd.ntiles++] = (tile_t){sz * stride - halo, sy * stride - halo, sx * stride - halo, (sz * nss[1] + sy) * nss[2] + sx, e == 2};
         }
     } else
+    if (seam2) {   /* both grids, z layer by layer (the grid whose layer starts lower first), so a shard's two versions arrive close together */
+        int64_t gn[2][3]; for (int g = 0; g < 2; g++) for (int d = 0; d < 3; d++) gn[g][d] = ns[d] > sgo[g][d] ? (ns[d] - sgo[g][d] + 1) / 2 : 0;
+        const int64_t nl = gn[0][0] > gn[1][0] ? gn[0][0] : gn[1][0];
+        for (int64_t L = 0; L < nl; L++) for (int gi = 0; gi < 2; gi++) {
+            const int g = sgo[0][0] <= sgo[1][0] ? gi : 1 - gi; if (L >= gn[g][0]) continue;
+            for (int64_t sy = 0; sy < gn[g][1]; sy++) for (int64_t sx = 0; sx < gn[g][2]; sx++) {
+                const int64_t q0[3] = {sgo[g][0] + 2 * L, sgo[g][1] + 2 * sy, sgo[g][2] + 2 * sx};
+                int air = 1;
+                if (sskip) { for (int64_t a = q0[0]; a < q0[0] + 2 && a < ns[0]; a++) for (int64_t b = q0[1]; b < q0[1] + 2 && b < ns[1]; b++)
+                                 for (int64_t c = q0[2]; c < q0[2] + 2 && c < ns[2]; c++) air &= sskip[(a * ns[1] + b) * ns[2] + c] == 2; }
+                else air = 0;
+                if (air) continue;
+                if (rd.ntiles == cap) { cap = cap ? 2 * cap : 1024; rd.tiles = realloc(rd.tiles, (size_t)cap * sizeof *rd.tiles); }
+                rd.tiles[rd.ntiles++] = (tile_t){q0[0] * shard - halo, q0[1] * shard - halo, q0[2] * shard - halo, (q0[0] * ns[1] + q0[1]) * ns[2] + q0[2], 0, g};
+            }
+        }
+    } else
     if (kss > 1) for (int64_t sz = 0; sz < nss[0]; sz++) for (int64_t sy = 0; sy < nss[1]; sy++) for (int64_t sx = 0; sx < nss[2]; sx++) {   /* super-shards */
         int all = 1, air = 1;   /* skipped when every shard of it is; dealt unless every shard is air */
         if (sskip) {
@@ -2163,6 +2257,12 @@ static int predict_one(int argc, char **argv) {
         }
     }
     if (occt) fprintf(stderr, "predict: %ld windows to run, %ld more skipped (interior air on CT level %d, --occupancy)\n", rd.ntiles, nocct, occl);
+    static seam_t SM;
+    if (seam2) {
+        if (seam_init(&SM, nph, shard, ns, bo, rd.tiles, rd.ntiles)) { fprintf(stderr, "predict --seam-inproc: out of memory\n"); return 1; }
+        long ng[2] = {0, 0}; for (long i = 0; i < rd.ntiles; i++) ng[rd.tiles[i].g]++;
+        fprintf(stderr, "predict --seam-inproc: %ld + %ld windows on the grids 0 and %d (interior %d, shards %d), blended per shard on the GPU\n", ng[0], ng[1], shard, stride, shard);
+    }
     free(occb); occb = nullptr;
     if (lat_store) {   /* every window on the store's cell grid */
         if (W % 4 || Wz % 4) { fprintf(stderr, "predict: --latents: --window (and --window-z) must be multiples of 4\n"); return 2; }
@@ -2655,14 +2755,16 @@ static int predict_one(int argc, char **argv) {
                 continue;
             }
             if (gpath && sup) {   /* every shard of this super-shard from the one window, written as it is placed */
-                const int64_t SZ = t->shard / (nss[1] * nss[2]), SY = (t->shard / nss[2]) % nss[1], SX = t->shard % nss[2];
-                for (int64_t qz = SZ * kss; qz < SZ * kss + kss && qz < ns[0]; qz++) for (int64_t qy = SY * kss; qy < SY * kss + kss && qy < ns[1]; qy++)
-                for (int64_t qx = SX * kss; qx < SX * kss + kss && qx < ns[2]; qx++) {
+                int64_t SZ = t->shard / (nss[1] * nss[2]), SY = (t->shard / nss[2]) % nss[1], SX = t->shard % nss[2], Q0[3] = {SZ * kss, SY * kss, SX * kss};
+                if (seam2) { Q0[0] = t->shard / (ns[1] * ns[2]); Q0[1] = t->shard / ns[2] % ns[1]; Q0[2] = t->shard % ns[2]; SZ = Q0[0] / kss; }   /* (the first shard) */
+                for (int64_t qz = Q0[0]; qz < Q0[0] + kss && qz < ns[0]; qz++) for (int64_t qy = Q0[1]; qy < Q0[1] + kss && qy < ns[1]; qy++)
+                for (int64_t qx = Q0[2]; qx < Q0[2] + kss && qx < ns[2]; qx++) {
                     const int64_t qo[3] = {qz * shard, qy * shard, qx * shard}, qe[3] = {qo[0] + shard < bn[0] ? qo[0] + shard : bn[0], qo[1] + shard < bn[1] ? qo[1] + shard : bn[1], qo[2] + shard < bn[2] ? qo[2] + shard : bn[2]};
                     if (lhm) {   /* every head into its own shard of this super-shard */
                         for (int j = 0; j < nph; j++) phead_fresh(&PH[j], phd);
                         PHEADS_PLACE((int)(tz - qo[0]), (int)(ty - qo[1]), (int)(tx - qo[2]), (int)(qe[0] - qo[0]), (int)(qe[1] - qo[1]), (int)(qe[2] - qo[2]));
-                        for (int j = 0; j < nph; j++) if (phead_submit(&PH[j], phd, qz, qy, qx, SZ * kss)) return 1;
+                        if (seam2) { for (int j = 0; j < nph; j++) if (seam_submit(&SM, &PH[j], j, phd, t->g, qz, qy, qx)) return 1; }
+                        else for (int j = 0; j < nph; j++) if (phead_submit(&PH[j], phd, qz, qy, qx, SZ * kss)) return 1;
                         phd ^= 1;
                         nn_ptick("heads place + d2h");
                     }
@@ -2734,6 +2836,7 @@ static int predict_one(int argc, char **argv) {
     if (pprof && rd.dbuf[0]) fprintf(stderr, "\npredict profile: device CT windows: %ld chunks all on the GPU, %ld with host substreams, %ld fill\n", (long)rd.ndev, (long)rd.nhost, (long)rd.nskip);
     if (pprof) fprintf(stderr, "\npredict profile (s): main: wait-reader %.2f h2d %.2f gpu(fwd+d2h) %.2f interior-copy %.2f writer-wait %.2f fit-writer-wait %.2f | reader: read %.2f stats %.2f slot-wait %.2f | wall %.2f, %ld tiles\n",
                        p_wait, p_h2d, p_gpu, p_copy, p_wr, p_ffw, rd.t_read, rd.t_stats, rd.t_wait, now() - t0, ntiles);
+    if (seam2 && seam_flush(&SM, PH, &phd)) return 1;
     if (!sup && cur_shard >= 0 && any && lhm) for (int j = 0; j < nph; j++) if (phead_submit(&PH[j], phd, sz, sy, sx, sz)) return 1;
     if (!sup && cur_shard >= 0 && any) { if (gpath && !WR.skip) writer_d2h(&WR, sb, dsh); if (writer_submit(&WR, sb, sz, sy, sx)) { fprintf(stderr, "%s\n", z3w_error()); return 1; } }
     else if (!sup && cur_shard >= 0 && WR.donefd >= 0) dprintf(WR.donefd, "%lld %lld %lld\n", (long long)(sz + soff[0]), (long long)(sy + soff[1]), (long long)(sx + soff[2]));

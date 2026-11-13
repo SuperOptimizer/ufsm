@@ -121,6 +121,36 @@ static int find_stores(const char *base, const char *rel, int depth, seam_store 
     closedir(dp); return no;
 }
 
+int predict_one_entry(int argc, char **argv);   /* src/predict.c */
+/* in one process (UFSM_SEAM_INPROC=1): predict --seam-inproc 1 over the union of the two passes' boxes, shards S / 2, the run's --q,
+   --levels; both tile grids in one window loop, each shard's two versions blended on the GPU before the writer (src/predict.c seam_t):
+   no pass stores, no second start-up, no CPU blend */
+static int seamless_inproc(int argc, char **argv, int W, int H, int S2, int gpu) {
+    char **v = calloc((size_t)argc + 32, sizeof *v); int n = 0;
+    char sb[160], sw[16], sh[16], ss[16], sg[16]; long long o[3], e[3];
+    for (int d = 0; d < 3; d++) {
+        long long la = g_lo[d] - 0, lb = g_lo[d] - S2, S = 2LL * S2;
+        la = (la >= 0 ? la / S : -((-la + S - 1) / S)) * S; if (la < 0) la = 0;
+        lb = (lb >= 0 ? lb / S : -((-lb + S - 1) / S)) * S + S2; if (lb < 0) lb = S2;
+        o[d] = la < lb ? la : lb; e[d] = g_hi[d] > o[d] ? g_hi[d] - o[d] : 1;
+    }
+    snprintf(sb, sizeof sb, "%lld,%lld,%lld,%lld,%lld,%lld", o[0], o[1], o[2], e[0], e[1], e[2]);
+    snprintf(sw, sizeof sw, "%d", W); snprintf(sh, sizeof sh, "%d", H); snprintf(ss, sizeof ss, "%d", S2); snprintf(sg, sizeof sg, "%d", gpu);
+    for (int i = 0; i < 6 && i < argc; i++) v[n++] = argv[i];
+    for (int i = 6; i < argc; i++) {
+        if (!strcmp(argv[i], "--q") || !strcmp(argv[i], "--levels")) { v[n++] = argv[i]; if (i + 1 < argc) v[n++] = argv[++i]; continue; }
+        if (owned(argv[i]) && i + 1 < argc) { i++; continue; }
+        v[n++] = argv[i];
+    }
+    const char *add[] = {"--box", sb, "--window", sw, "--halo", sh, "--shard", ss, "--full-grid", "1", "--seam-inproc", "1", "--gpu", sg};
+    for (size_t k = 0; k < sizeof add / sizeof *add - (g_split ? 2 : 0); k++) v[n++] = (char *)add[k];
+    v[n] = nullptr;
+    setenv("UFSM_SEAM_CHILD", "1", 1);
+    fprintf(stderr, "predict --seamless 2 (in-process): window %d halo %d, tile %d, grids 0 and %d, shards %d\n", W, H, 2 * S2, S2, S2);
+    const int rc = predict_one_entry(n, v);
+    free(v); return rc;
+}
+
 int predict_seamless(int argc, char **argv) {
     const int mode = atoi(sopt(argc, argv, "--seamless", "0"));
     if (mode != 2) { fprintf(stderr, "predict --seamless: 2 (two passes on half-tile-shifted grids, sin^2 blend) is the one mode\n"); return 2; }
@@ -138,6 +168,7 @@ int predict_seamless(int argc, char **argv) {
     int ga = atoi(sopt(argc, argv, "--gpu", "0")), gb = ga, par = 0;
     const char *gl = sopt(argc, argv, "--gpus", nullptr);
     if (gl && !g_split) { if (sscanf(gl, "%d,%d", &ga, &gb) == 2 && ga != gb) par = 1; else if (sscanf(gl, "%d", &ga) == 1) gb = ga; }
+    if (getenv("UFSM_SEAM_INPROC") && atoi(getenv("UFSM_SEAM_INPROC"))) return seamless_inproc(argc, argv, W, H, S2, ga);
     const char *out = argv[5]; const double q = atof(sopt(argc, argv, "--q", "8")); const int nlev = atoi(sopt(argc, argv, "--levels", "4"));
     const int shard = atoi(sopt(argc, argv, "--shard", "512")), nt = atoi(sopt(argc, argv, "--threads", "8"));
     if (shard < 128 || shard % 128 || nlev < 1 || q < 0) { fprintf(stderr, "predict --seamless: --shard a multiple of 128, --levels >= 1, --q >= 0\n"); return 2; }
