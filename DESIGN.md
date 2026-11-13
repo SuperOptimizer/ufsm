@@ -6,6 +6,44 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## The universal net's eval: label-free quality on unseen scrolls, validated against GT (2026-11-12, branch univ-eval-20261111)
+
+The from-scratch universal net trains on every label we have (user: "train on literally everything we have labels for ... then working
+on unseen scrolls from the corpus"), so its main eval cannot use labels. `scripts/univ/ueval.sh` has two blocks: **unseen** (24 boxes of
+512^3 level-0 voxels, 3 per scan on 9 corpus scans with no labels and no fits of ours: 0268, 0800, 0826, 0175B, 0306B, 0483A, 0490A,
+0846A, 0343 at 8.64 / 9.36 um, placed CPU-side by `unseen_boxes.py` from the level-4 CT and the corpus axis) scored label-free by
+`uqa.py` + the fibre judge; and **training-fit** (wbench core, rv eval, the 34 ink crops, the P4 fibre box: all in training now, so they
+track convergence and head interference, not generalisation). `upair.py` pairs two checkpoints over the boxes.
+
+The winding metrics come from the box's fit (fit-phase-box: frac(W) on a step-2 grid) and the CT. The wraps (W = integer) sit ~0.1-0.15
+turn off the CT sheet centre on the wbench fits (C18: CT mean peaks at frac W 0.10-0.15, 85 vs 57 at 0.6), so each box's sheet phase
+phi is measured (first harmonic of CT along frac W) and the band / gap / rv sides are taken relative to it; h1 = that harmonic's
+amplitude / CT sd.
+
+Validation (`uqa_validate.py`, CPU only): the metrics on the kept wbench fits of 6 checkpoints (unified-1504-a0e, inkpod-5000 / 10000,
+unissl-6000, u1-13790-ssl, lat-vc384-4000-384) x 44 core boxes against the boxes' GT. "pooled" = Spearman over all 264 (tag, box)
+pairs (mostly box difficulty); "within" = mean per-box Spearman across the 6 tags; "pairs" = share of same-box tag pairs (|d GT| >=
+0.02) whose metric difference has the GT difference's sign, oriented by the metric's better side (0.5 = no information).
+
+| metric | pooled vs p05x | within vs p05x | pairs vs p05x | pairs vs ids |
+|---|---|---|---|---|
+| jumps (W steps > 0.25 turn, lower) | +0.79 | +0.41 | **0.77** | 0.60 |
+| gap_void (mid-gap voxels off papyrus) | +0.78 | +0.20 | 0.64 | 0.50 |
+| on_pap (band voxels on papyrus) | -0.47 | +0.22 | 0.63 | 0.50 |
+| h1 | +0.84 | +0.17 | 0.61 | 0.49 |
+| contrast | +0.85 | +0.16 | 0.61 | 0.49 |
+| nrm30 | -0.02 | +0.16 | 0.59 | 0.46 |
+| sp_cv | -0.72 | -0.07 | 0.49 | 0.45 |
+| nrm_deg (lower assumed better) | -0.87 | -0.38 | 0.25 | 0.38 |
+
+Winding jumps are the one metric that ranks checkpoints on the same box like the GT does (0.77 of pairs vs p05x); the CT-alignment
+metrics (h1, gap_void, on_pap, contrast) carry a weak signal (0.61-0.64) and none vs ids; nrm_deg is inverted (smoother normals go with
+worse fits: over-smoothing), sp_cv carries nothing. Tiers in `upair.py`: primary jumps, secondary h1 / gap_void / on_pap / contrast,
+info nrm_deg / sp_cv / nrm30 (no win count). Check on a known pair: inkpod-10000 vs unified-1504-a0e (GT p05x -0.048 [-0.068, -0.028]):
+jumps +0.0039 [+0.0014, +0.0066] (worse on 30 / 44 boxes, agrees); h1 / gap_void / contrast slightly better (disagree), so a checkpoint
+call rests on jumps first. Not validated yet: rv_agree, ink_air / ink_band, the fibre judge and the fit residuals (the kept fits have no
+head predictions); the first GPU run of ueval on two checkpoints with wbench rows will validate them the same way.
+
 ## Latent ink head: window seams at inference, the 2-pass grid blend, 1667 scores (2026-11-12, scripts/inkgt/u1667ink.sh)
 
 The inkpod snapshots' ink head (`predict --heads ink`, latent trunk, 4 levels) gives every predict window its own level: the 1299
