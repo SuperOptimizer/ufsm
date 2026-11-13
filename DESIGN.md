@@ -56,7 +56,10 @@ activations and weights, below the fp16 logits' own), bytes repeat. P 1024 half 
 (7.5 -> 24.6 TFLOP/s), 68 calls a step (two passes x 34 slabs): ~135 ms per card. UFSM_HEAD_TC=0: the FFMA passes. The backward-data (c1b_wh_k + conv1_to_mx_tc_k: 64 cells x 256 outputs a block, K in 32-chunks,
 the MX4 epilogue through per-warp shared tiles) on the pod: rel L2 7.7e-3 against the FFMA kernel after the MX-fp4 SR (0.02 % of the
 elements differ), bytes repeat; the P 1024 half slab 160 -> 256: 7.61 -> 1.12 ms (2.8 -> 19.2 TFLOP/s), 34 slabs a step: ~220 ms per
-card. Default on (UFSM_HEAD_BTC=0: the FFMA kernel).
+card. Default OFF (UFSM_HEAD_BTC=1 on): with it on, test_lat_head's "a second equal net" check (the same parameters and
+inputs on a second unet) differs by rel 0.4 in the trunk gradients, which test_head_tc's kernel-level checks (C 32 / 96 / 256, two
+samples, whole and ranges) do not reproduce. Open. The whole-call form (lp_conv1_to_mx) now takes the same kernel as the range form,
+so whole == per range holds with it on.
 
 
 **The MIL backward without a sync per slab.** ink_mil_bwd_slab read its slab's (voxel, sample) pair count back with a

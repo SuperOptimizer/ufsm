@@ -52,22 +52,24 @@ int main(void) {
         if (ns) lp_gn_slab_reg(mean, 0, 0, 0, 0);
         nn_free(x); nn_free(w); nn_free(b); nn_free(gam); nn_free(bet); nn_free(mean); nn_free(rstd);
     }
-    for (int oc = 0; oc < 3; oc++) {   /* the backward-data: K fp16 logit gradients -> 256 MX-fp4 channels (SR), a slab range, against the FFMA kernel */
-        const int K = oc == 0 ? 160 : oc == 1 ? 35 : 17, D = 12, H = 40, W = 40; const size_t hw = (size_t)H * W, S = D * hw, vb = 3 * hw, nv = 5 * hw + 77;
-        shape5 xs = {1, C, D, H, W};
-        void *gy = nn_malloc((size_t)K * nv * 2); { float *f = dev_vals((size_t)K * nv, 2e-3f, 0.f); nn_f32_to_h16(f, (size_t)K * nv, gy, 1.f); nn_free(f); }
+    for (int oc = 0; oc < 6; oc++) {   /* the backward-data: K fp16 logit gradients -> C MX-fp4 channels (SR), a slab range or whole, against the FFMA kernel
+                                          (oc 3..5: test_lat_head's 32 / 96 channel trunks, 144 outputs, two samples) */
+        const int K = oc == 0 ? 160 : oc == 1 ? 35 : oc == 2 ? 17 : 144, C = oc < 3 ? 256 : oc == 3 ? 32 : 96, NS = oc < 3 ? 1 : 2, D = 12, H = 40, W = 40;
+        const size_t hw = (size_t)H * W, S = D * hw, vb = oc == 5 ? 0 : 3 * hw, nv = oc == 5 ? 0 : 5 * hw + 77, nvv = nv ? nv : S;
+        shape5 xs = {NS, C, D, H, W};
+        void *gy = nn_malloc((size_t)NS * K * nvv * 2); { float *f = dev_vals((size_t)NS * K * nvv, 2e-3f, 0.f); nn_f32_to_h16(f, (size_t)NS * K * nvv, gy, 1.f); nn_free(f); }
         float *wt = dev_vals((size_t)K * C, 0.1f, 0.f);
         void *g0 = nn_malloc(nn_mx4_bytes(xs)), *g1 = nn_malloc(nn_mx4_bytes(xs)), *g2 = nn_malloc(nn_mx4_bytes(xs));
         for (int q = 0; q < 3; q++) { void *gq = q == 0 ? g0 : q == 1 ? g1 : g2; nn_zero(gq, nn_mx4_bytes(xs)); nn_set_storage(gq, nn_mx4_bytes(xs), 4); }
-        lp_set_head_btc(0); lp_conv1_to_mx_r(gy, 2, 1, K, S, wt, C, g0, 4, 1234u, vb, nv);
-        lp_set_head_btc(1); lp_conv1_to_mx_r(gy, 2, 1, K, S, wt, C, g1, 4, 1234u, vb, nv); lp_conv1_to_mx_r(gy, 2, 1, K, S, wt, C, g2, 4, 1234u, vb, nv);
+        lp_set_head_btc(0); lp_conv1_to_mx_r(gy, 2, NS, K, S, wt, C, g0, 4, 1234u, vb, nv);
+        lp_set_head_btc(1); lp_conv1_to_mx_r(gy, 2, NS, K, S, wt, C, g1, 4, 1234u, vb, nv); lp_conv1_to_mx_r(gy, 2, NS, K, S, wt, C, g2, 4, 1234u, vb, nv);
         float *d0 = nn_malloc(shape_numel(xs) * 4), *d1 = nn_malloc(shape_numel(xs) * 4);
-        lp_mx4_to_f32(g0, 1, C, S, d0); lp_mx4_to_f32(g1, 1, C, S, d1); nn_sync();
+        lp_mx4_to_f32(g0, NS, C, S, d0); lp_mx4_to_f32(g1, NS, C, S, d1); nn_sync();
         float *h0 = malloc(shape_numel(xs) * 4), *h1 = malloc(shape_numel(xs) * 4); nn_d2h(h0, d0, shape_numel(xs) * 4); nn_d2h(h1, d1, shape_numel(xs) * 4);
         double dd = 0, rr = 0; size_t neq = 0, nn_ = 0;
         for (size_t i = 0; i < shape_numel(xs); i++) { const double a = h1[i], r = h0[i]; dd += (a - r) * (a - r); rr += r * r; neq += a != r; nn_++; }
         const double rel = sqrt(dd / (rr > 0 ? rr : 1)); const int ok = rel < 0.05 && rr > 0;   /* (MX-fp4 with SR: an element whose sum moved across a rounding step differs by a step) */
-        printf("  head bwd-data tc %3d -> %d, MX-fp4 SR: rel L2 vs the FFMA kernel %.3e, %.4f of the elements differ  %s\n", K, C, rel, (double)neq / nn_, ok ? "ok" : "FAIL"); fails += !ok;
+        printf("  head bwd-data tc %3d -> %d x %d%s, MX-fp4 SR: rel L2 vs the FFMA kernel %.3e, %.4f of the elements differ  %s\n", K, C, NS, nv ? "" : " whole", rel, (double)neq / nn_, ok ? "ok" : "FAIL"); fails += !ok;
         { const size_t nb = nn_mx4_bytes(xs); uint8_t *a = malloc(nb), *c = malloc(nb); nn_d2h(a, g1, nb); nn_d2h(c, g2, nb); const int same = !memcmp(a, c, nb);
           printf("  %-58s %s\n", "  tensor-core bytes repeat", same ? "ok" : "FAIL"); fails += !same; free(a); free(c); }
         lp_set_head_btc(-1);

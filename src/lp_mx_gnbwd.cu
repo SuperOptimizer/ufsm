@@ -1043,7 +1043,7 @@ template <typename TG, int YB> static void conv1_to_mx_t(const TG *x, int N, int
    split-half slab of 4 x 256^2 cells: ~3 ms). Here a block takes 64 cells x 256 outputs (a warp per 32-channel MX block), K in chunks of
    32 through shared memory (fp16 weights from a converted copy, the gradients transposed to [cell][k]), m16n8k16 MMAs with fp32
    accumulation, and each cell's 32 sums leave through mx_store_row_b (the same SR draw per element as the FFMA kernel; the sums differ by
-   the weights' fp16 rounding and the order). UFSM_HEAD_BTC=0: the FFMA kernel (default on since test_head_tc passed on the pod, 2026-11-13). */
+   the weights' fp16 rounding and the order). UFSM_HEAD_BTC=1: on (default off: test_head_tc passes, but test_lat_head's "second equal net" differs with it on, rel 0.4; open). */
 enum { C1B_N = 64 };
 __global__ void c1b_wh_k(const float *w, __half *wh, int Co, int Ci, int Kp) {   /* [Co][Ci] fp32 -> [Co][Kp] fp16, zero padded */
     const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; if (i >= (size_t)Co * Kp) return;
@@ -1123,7 +1123,7 @@ __global__ void __launch_bounds__(256) conv1_to_mx_tc_k(const __half *__restrict
 }
 static int g_head_btc = -1;
 template <int YB> static bool conv1_to_mx_tc(const __half *x, int N, int Ci, size_t S, const float *w, int Co, void *y, unsigned sr, size_t vb, size_t vn) {
-    if (g_head_btc < 0) g_head_btc = getenv("UFSM_HEAD_BTC") ? atoi(getenv("UFSM_HEAD_BTC")) : 1;
+    if (g_head_btc < 0) g_head_btc = getenv("UFSM_HEAD_BTC") ? atoi(getenv("UFSM_HEAD_BTC")) : 0;   /* (default off again: test_lat_head's second equal net differs, open) */
     if (!g_head_btc || Ci <= 16 || Ci > 192 || Co % 32) return false;
     const int Kp = (Ci + 31) / 32 * 32;
     __half *wh = lp_buf<__half>(0, (size_t)Co * Kp);   /* (the only fp16 lp_buf: per element type, slots 0..5) */
@@ -1148,7 +1148,8 @@ extern "C" void lp_conv1_to_mx(const void *x, int gdt, int N, int Ci, size_t S, 
     if (Ci > 192) { fprintf(stderr, "lp_conv1_to_mx: Ci %d > 192\n", Ci); abort(); }
     static int old = -1; if (old < 0) old = getenv("UFSM_CONV1_OLD") ? atoi(getenv("UFSM_CONV1_OLD")) : 0;
     if (!old || ydt == 4 || Ci > 8) {
-#define C1M(YB) do { if (gdt == 2) conv1_to_mx_t<__half, YB>((const __half *)x, N, Ci, S, w, Co, y, sr); \
+#define C1M(YB) do { if (gdt == 2 && conv1_to_mx_tc<YB>((const __half *)x, N, Ci, S, w, Co, y, sr, 0, 0)) break;   /* (the range form's kernel: whole == per range, bit for bit) */ \
+                     if (gdt == 2) conv1_to_mx_t<__half, YB>((const __half *)x, N, Ci, S, w, Co, y, sr); \
                      else if (gdt == 1) conv1_to_mx_t<bf16, YB>((const bf16 *)x, N, Ci, S, w, Co, y, sr); \
                      else conv1_to_mx_t<float, YB>((const float *)x, N, Ci, S, w, Co, y, sr); } while (0)
         if (ydt == 4) C1M(4); else C1M(8);
