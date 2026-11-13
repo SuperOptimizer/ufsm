@@ -2453,7 +2453,7 @@ int cmd_train(int argc, char **argv) {
             g_ink2 = atoi(opt(argc,argv,"--ink-head","0")); g_ink_smooth = (float)atof(opt(argc,argv,"--ink-smooth","0"));
             g_mil_lambda = (float)atof(opt(argc,argv,"--ink-mil","0")); g_mil = g_mil_lambda > 0;
             g_mil_R = (float)atof(opt(argc,argv,"--ink-mil-r","10")); g_mil_step = (float)atof(opt(argc,argv,"--ink-mil-step","1")); g_mil_tau = (float)atof(opt(argc,argv,"--ink-mil-tau","0"));
-            g_mil_mode = atoi(opt(argc,argv,"--ink-mil-mode","1")); g_mil_stride = atoi(opt(argc,argv,"--ink-mil-stride","2")); g_mil_max = atoi(opt(argc,argv,"--ink-mil-max","65536"));
+            g_mil_mode = atoi(opt(argc,argv,"--ink-mil-mode","1")); g_mil_stride = atoi(opt(argc,argv,"--ink-mil-stride","2")); g_mil_max = atoi(opt(argc,argv,"--ink-mil-max","65536")); if (ink_mil_set_max) ink_mil_set_max(g_mil_max);
             if (!(g_mil_lambda >= 0) || (g_mil && (!ink_mil_fwd_slab || !(g_mil_R > 0) || !(g_mil_step > 0) || !(g_mil_tau >= 0) || ink_mil_samples(g_mil_R, g_mil_step) > 256 || g_mil_mode < 0 || g_mil_mode > 1 || g_mil_stride < 1 || g_mil_max < 1))) {
                 fprintf(stderr, "--ink-mil L >= 0 (needs nn_inkmil in the binary), --ink-mil-r R > 0, --ink-mil-step > 0 (2R / step + 1 <= 256 samples), --ink-mil-tau >= 0, --ink-mil-mode 0|1, --ink-mil-stride >= 1, --ink-mil-max >= 1\n"); return 2; }   /* --ink-head 1: the ink logit as output channel 11 (the universal model) */
             g_fibh_lambda = (float)atof(opt(argc,argv,"--fib-head","0")); g_fibh = g_fibh_lambda > 0; g_fd_r = atoi(opt(argc,argv,"--fib-dir-r","4"));   /* --fib-head L: the H / V fibre masks + direction (9 channels) */

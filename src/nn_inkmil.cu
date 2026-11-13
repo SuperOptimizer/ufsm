@@ -145,6 +145,10 @@ __global__ void k_runs(const unsigned long long *key, const float *val, unsigned
     st16(gl, (size_t)v, bf, ld16(gl, (size_t)v, bf) + s);
 }
 static __thread struct { void *p[8]; size_t cap[8]; } t_ms;
+/* the trainer's ray cap (ink_mil_set_max): the backward's buffers are sized for it on first use, so they never grow during training
+   (2026-11-13: growing them with the window's ray count took GPU 1 down 92 MB at steps 32 and 45 of a P 1024 split bench, read as a leak) */
+static int g_nrmax;
+extern "C" void ink_mil_set_max(int nr) { g_nrmax = nr; }
 /* the per-plane pair counts ink_mil_fin leaves for the backward slabs (2026-11-13): ink_mil_bwd_slab used to read its slab's pair count back
    with a stream sync per slab (34 per ink window), which under --split drains the GPU while its thread holds the turn and serialises the two
    cards. fin now queues one histogram + its async copy; the first slab waits for it once, every slab sorts an upper bound (its planes'
@@ -192,7 +196,7 @@ extern "C" int ink_mil_fin(float *acc, const inkray *rays, int nr, int D, int H,
 }
 extern "C" int ink_mil_bwd_slab(const float *dz, int z0, int nz, int D, int H, int W, const inkray *rays, int nr, float R, float step, void *gl, int bf16, void *stream) {
     const int K = ink_mil_samples(R, step); if (K > KMAX || K < 1) return -2; if (nr <= 0) return 0;
-    cudaStream_t st = (cudaStream_t)stream; const long long n = (long long)nr * K; const size_t cap = (size_t)n * 8;
+    cudaStream_t st = (cudaStream_t)stream; const long long n = (long long)nr * K; const size_t cap = (size_t)(g_nrmax > nr ? (long long)g_nrmax * K : n) * 8;
     if (cap > 0xffffffffull || mgrow(1, cap * 8) || mgrow(2, cap * 4) || mgrow(3, cap * 8) || mgrow(4, cap * 4) || mgrow(5, 64)) return -1;
     unsigned *dc = (unsigned *)t_ms.p[5]; unsigned hc = 0;
     const int ph = t_ph.dz == dz && t_ph.rays == rays && t_ph.D == D && t_ph.nr == nr && t_ph.K == K && t_ph.R == R && t_ph.step == step;
@@ -214,6 +218,10 @@ extern "C" int ink_mil_bwd_slab(const float *dz, int z0, int nz, int D, int H, i
         if (!hc) return 0;
     }
     size_t tb = 0; cub::DeviceRadixSort::SortPairs(nullptr, tb, (unsigned long long *)nullptr, (unsigned long long *)nullptr, (float *)nullptr, (float *)nullptr, (int)hc, 0, bits, st);
+    if (g_nrmax > nr && !t_ms.p[6]) {   /* (the sort's temp for the cap's pair count, 64-bit keys) */
+        size_t tm = 0; cub::DeviceRadixSort::SortPairs(nullptr, tm, (unsigned long long *)nullptr, (unsigned long long *)nullptr, (float *)nullptr, (float *)nullptr, (int)(cap < 0x7fffffffull ? cap : 0x7fffffffull), 0, 64, st);
+        if (tm > tb) tb = tm;
+    }
     if (mgrow(6, tb + 16)) return -1; void *tmp = t_ms.p[6];
     cub::DeviceRadixSort::SortPairs(tmp, tb, (unsigned long long *)t_ms.p[1], (unsigned long long *)t_ms.p[3], (float *)t_ms.p[2], (float *)t_ms.p[4], (int)hc, 0, bits, st);
     k_runs<<<(hc + 255) / 256, 256, 0, st>>>((const unsigned long long *)t_ms.p[3], (const float *)t_ms.p[4], hc, gl, bf16, ph ? dc : nullptr);
