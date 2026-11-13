@@ -62,11 +62,15 @@ static double fr_t(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t)
 static int g_fr_timing = -1;
 static thread_local int t_fr_nth = 1;   /* the CT read's threads (the onfly read's caller's) */   /* the fibre planes on the GPU: -1 not yet decided (UFSM_FIBRE_CPU=1: never), 0 no, 1 yes */
 int fiber_onfly_gpu(int on);
+/* the device box of the GPU planes: UFSM_FIBRE_GPU_MVOX million voxels (default 64: 3 bytes a voxel of buffers, 0.2 GB) */
+size_t fiber_gpu_slab_vox(void) { static size_t v; if (!v) { const char *e = getenv("UFSM_FIBRE_GPU_MVOX"); const double m = e ? atof(e) : 64; v = (size_t)((m >= 1 ? m : 1) * 1e6); } return v; }
 int fiber_onfly_config(int gpu, int edge) {
     const char *e = getenv("UFSM_FIBRE_CPU");
     if (gpu < 0 || (e && atoi(e))) { fiber_onfly_gpu(0); return 0; }
     if (!fibre_gpu_box || !fibre_gpu_device || !fibre_gpu_reserve) return -1;
-    fibre_gpu_device(gpu); g_fr_gpu = 1; return fibre_gpu_reserve(edge) ? -1 : 1;
+    fibre_gpu_device(gpu); g_fr_gpu = 1;
+    { const size_t nv = (size_t)edge * edge * edge, cap = fiber_gpu_slab_vox(); if (nv > cap) edge = (int)cbrt((double)cap) + 1; }   /* (the slab, not the box: fr_box's GPU path works in slabs) */
+    return fibre_gpu_reserve(edge) ? -1 : 1;
 }
 int fiber_onfly_gpu(int on) { g_fr_gpu = on && fibre_gpu_box ? 1 : 0; return g_fr_gpu; }
 static int fr_box(fr_job *J, const int64_t so[3], const int64_t n[3], uint8_t *d[4], uint8_t *ct, uint8_t *o0, uint8_t *o1, long long *c) {
@@ -156,7 +160,17 @@ static int fr_box(fr_job *J, const int64_t so[3], const int64_t n[3], uint8_t *d
     if (!stamped && !have_ct) return 0;   /* all unknown */
     const int cr = (int)(16 * J->rad), cg = (int)(16 * (J->rad + J->guard)); long long cc4[4] = {0, 0, 0, 0};
     if (g_fr_gpu < 0) { const char *e = getenv("UFSM_FIBRE_CPU"); g_fr_gpu = fibre_gpu_box && !(e && atoi(e)); }
-    if (g_fr_gpu && !c && !fibre_gpu_box(t_st.s, t_st.n, so, n, R, J->rad + J->guard, cr, cg, J->ring > 0, have_ct ? ct : nullptr, J->iso, o0, o1)) {
+    int gok = 0;
+    if (g_fr_gpu && !c) {   /* in z slabs of at most fiber_gpu_slab_vox() voxels (box-local planes: any slab gives the box's bytes; 2026-11-13: one box
+                               of a P 1024 window took 3.9 GB of device memory beside the trainer, a slab of 64 M voxels 0.2 GB) */
+        const size_t pl = (size_t)n[1] * n[2]; int64_t zs = (int64_t)(fiber_gpu_slab_vox() / (pl ? pl : 1)); if (zs < 1) zs = 1;
+        gok = 1;
+        for (int64_t z0 = 0; z0 < n[0] && gok; z0 += zs) {
+            const int64_t so2[3] = {so[0] + z0, so[1], so[2]}, n2[3] = {z0 + zs < n[0] ? zs : n[0] - z0, n[1], n[2]}; const size_t off = (size_t)z0 * pl;
+            if (fibre_gpu_box(t_st.s, t_st.n, so2, n2, R, J->rad + J->guard, cr, cg, J->ring > 0, have_ct ? ct + off : nullptr, J->iso, o0 + off, o1 + off)) gok = 0;
+        }
+    }
+    if (gok) {
         if (g_fr_timing) fprintf(stderr, "fibre box %lldx%lldx%lld: %ld steps, %.0f ms polylines, %.0f ms CT, %.0f ms GPU\n", (long long)n[0], (long long)n[1], (long long)n[2], t_st.n, (ft1 - ft0) * 1e3, (ft2 - ft1) * 1e3, (fr_t() - ft2) * 1e3);
         return 1; }   /* (the counts: the CPU raster) */
     uint8_t *dl[4] = {nullptr, nullptr, nullptr, nullptr};   /* d nullptr (the onfly reads): scratch planes only on the CPU path */
