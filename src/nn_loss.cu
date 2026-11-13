@@ -518,6 +518,35 @@ extern "C" void nn_split_halo_k(void *const *t, const int *dev, shape5 s, int es
     cudaSetDevice(cur);
     KCHECK();
 }
+/* split_top (unet_set_split_top): both sides' owned planes into the whole-window layout of depth D, in place. Side i owns the D / 2 planes
+   from i ? h : 0 of its depth-s.d tensor; the buffers hold the depth-D tensor's bytes (its MX registration covering them). Every read of the
+   local layout (the packing) is ordered before any write of the whole one. sb / rb: D / 2 planes each */
+extern "C" void nn_split_gather(void *const *t, const int *dev, shape5 s, int esz, int h, int D, void *const *sb, void *const *rb) {
+    int cur; cudaGetDevice(&cur);
+    g_zs_same = dev[0] == dev[1];
+    shape5 sf = s; sf.d = D; const int no = D / 2;
+    zseg_t sg[2][2], sgf[2][2]; int ns = 0;
+    for (int i = 0; i < 2; i++) { cudaSetDevice(dev[i]); ns = zsegs(t[i], s, esz, sg[i]); zsegs(t[i], sf, esz, sgf[i]); }
+    const size_t nbytes = (size_t)no * zsegs_plane_bytes(sg[0], ns);
+    for (int i = 0; i < 2; i++) { cudaSetDevice(dev[i]); zsegs_copy(t[i], sg[i], ns, i ? h : 0, no, sb[i], 0); }
+    zs_xbar(dev, 2);   /* (both packed) */
+    for (int i = 0; i < 2; i++) {
+        cudaSetDevice(dev[i]);
+        CK(cudaMemcpyPeerAsync(rb[i], dev[i], sb[1 - i], dev[1 - i], nbytes, 0));
+        zsegs_copy(t[i], sgf[i], ns, i ? no : 0, no, sb[i], 1); zsegs_copy(t[i], sgf[i], ns, i ? 0 : no, no, rb[i], 1);
+    }
+    zs_xbar(dev, 3);   /* (both copies done before either send buffer is reused) */
+    cudaSetDevice(cur);
+    KCHECK();
+}
+/* planes [z0, z0 + s.d) of the whole-window tensor src (shape sf) into dst (shape s; MX: both registered with the same format), stream 0 */
+extern "C" void nn_split_slice(const void *src, shape5 sf, void *dst, shape5 s, int esz, int z0) {
+    zseg_t a[2], b[2]; const int ns = zsegs(src, sf, esz, a); zsegs(dst, s, esz, b);
+    for (int i = 0; i < ns; i++)
+        CK(cudaMemcpy2DAsync((char *)dst + b[i].base, b[i].pitch, (const char *)src + a[i].base + (size_t)z0 * a[i].pb, a[i].pitch, (size_t)s.d * b[i].pb, b[i].rows,
+                             cudaMemcpyDeviceToDevice, 0));
+    KCHECK();
+}
 static cudaEvent_t zs_gev(int dev, int side, int k) {   /* the generic collectives' events (per device and side: one-GPU emulation) */
     static cudaEvent_t ev[10][4]; static int init[10]; const int q = zs_key(dev, side);
     if (!init[q]) { int cur; cudaGetDevice(&cur); cudaSetDevice(dev); for (int i = 0; i < 4; i++) cudaEventCreateWithFlags(&ev[q][i], cudaEventDisableTiming); cudaSetDevice(cur); init[q] = 1; }

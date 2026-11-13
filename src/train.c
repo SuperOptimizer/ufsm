@@ -380,6 +380,7 @@ static int g_Dl, g_h0; static uint8_t *g_zeros;
    the radial record with the global depth and the first plane, nn.h NN_RAD_REC word 7), the head slabs mask the halo voxels (hs_clip: the loss
    counts owned voxels; the gradient pass also takes the halo cell next to the cut, whose upsampled logits read the owned cell beside it, and
    the halo cells' gradient is dropped), the loss sums add across the GPUs in their finalisation (zs_reduce). g_Pw: the sampler's window depth */
+static int g_split_top;   /* --split-top (unet_set_split_top) */
 static int g_lsplit, g_Pw;
 static int g_bench_same;   /* UFSM_BENCH_SAME */
 static int g_Pz;   /* window depth: --Pz (a Pz x P x P slab), else P; g_lsplit: this GPU's part of the window */
@@ -734,7 +735,7 @@ static void upload(gpu_state *d, const batch *b, int B, int P) {
     d->um = d->umb[d->cur] = b->um ? b->um[0] : 0.f; d->umd = d->umdb[d->cur] = batch_umd(b, d->um);
     if (b->corner && b->level) { memcpy(d->cornb[d->cur], b->corner[0], sizeof d->cornb[0]); d->lvlb[d->cur] = b->level[0]; }   /* validation copies carry none */
     d->srcb[d->cur] = b->src ? b->src[0] : -1; mil_take(d, b, d->cur, 0);
-    axr_take(d, b, d->cur, B, P); if (g_restore || d->side >= 0) d->axv[d->cur] = 0; axr_set(d, d->cur); chain_take(d, b, d->cur, B); view_take(d, b, d->cur, B, 0);
+    axr_take(d, b, d->cur, B, P); if (g_restore || (d->side >= 0 && !g_split_top)) d->axv[d->cur] = 0; axr_set(d, d->cur); chain_take(d, b, d->cur, B); view_take(d, b, d->cur, B, 0);
     if (g_restore) { restore_upload(d, b, d->cur, B, P, 0); return; }
     if (d->side >= 0 && !g_lsplit) { upload_slab(d, b, d->cur, B, P, 0); return; }
     size_t p3 = (size_t)g_Pz * P * P;
@@ -771,7 +772,7 @@ static void upload_async(gpu_state *d, const batch *b, int i, int B, int P) {
     d->umb[i] = b->um ? b->um[0] : 0.f; d->umdb[i] = batch_umd(b, d->umb[i]);
     if (b->corner && b->level) { memcpy(d->cornb[i], b->corner[0], sizeof d->cornb[0]); d->lvlb[i] = b->level[0]; }
     d->srcb[i] = b->src ? b->src[0] : -1; mil_take(d, b, i, 1);
-    axr_take(d, b, i, B, P); if (g_restore || d->side >= 0) d->axv[i] = 0; chain_take(d, b, i, B); view_take(d, b, i, B, 1);
+    axr_take(d, b, i, B, P); if (g_restore || (d->side >= 0 && !g_split_top)) d->axv[i] = 0; chain_take(d, b, i, B); view_take(d, b, i, B, 1);
     size_t p3 = (size_t)g_Pz * P * P;
     if (d->upsplit) {   /* the head now, after the backward's last read of X2 and the records; the tail with upload_tail */
         nn_stream_wait(1, unet_l0_3buf_head_free(d->u));
@@ -2542,8 +2543,10 @@ int cmd_train(int argc, char **argv) {
         }
         if (g_ds) fprintf(stderr, "deep supervision: decoder levels 1..%d, weights %g^j%s\n", g_ds, g_ds_w, g_ds_anneal ? ", annealed to 0 over the run" : "");
     }
-    if (split) {
-        g_h0 = 1 << (cfg.nlev - 1); g_Dl = P / 2 + g_h0;
+    if (split) {   /* --split-top T (default 3 above 4 levels): levels T.. whole on both GPUs (unet_set_split_top), the halo 2^T planes instead of 2^(nlev-1) */
+        g_split_top = atoi(opt(argc, argv, "--split-top", cfg.nlev > 4 ? "3" : "0"));
+        if (g_split_top && (g_split_top < 2 || g_split_top > cfg.nlev - 1)) { fprintf(stderr, "--split-top: 2..%d (0 off)\n", cfg.nlev - 1); return 2; }
+        g_h0 = 1 << (g_split_top ? g_split_top : cfg.nlev - 1); g_Dl = P / 2 + g_h0;
         if (ng != 2) { fprintf(stderr, "--split z needs --gpus with two devices\n"); return 2; }
         if (P % (2 * g_h0)) { fprintf(stderr, "--split z: P must be divisible by %d\n", 2 * g_h0); return 2; }
         if (overfit || getenv("UFSM_SYNC_UPLOAD") || !nn_get_tf32()) { fprintf(stderr, "--split z: not with --overfit, UFSM_SYNC_UPLOAD or --fp32\n"); return 2; }
@@ -2562,12 +2565,12 @@ int cmd_train(int argc, char **argv) {
         if (g_lat) {
             if (!g_unwrap2 || overfit || g_verso || g_aff) { fprintf(stderr, "--lat 4: task unwrap2 only (no --overfit, verso, affinities)\n"); return 2; }
             if (split) {   /* the halo in voxels: 4 per trunk cell (g_lsplit above) */
-                g_lsplit = 1; g_h0 = 4 << (cfg.nlev - 1); g_Dl = P / 2 + g_h0;
+                g_lsplit = 1; g_h0 = 4 << (g_split_top ? g_split_top : cfg.nlev - 1); g_Dl = P / 2 + g_h0;
                 if (P % (2 * g_h0) || B != 1) { fprintf(stderr, "--lat 4 --split z: B 1, P divisible by %d\n", 2 * g_h0); return 2; }
                 nn_host_free(g_zeros); g_zeros = nn_host_alloc((size_t)g_h0 * P * P); memset(g_zeros, 0, (size_t)g_h0 * P * P);
             }
             if (!nn_get_f16()) { fprintf(stderr, "--lat 4: fp16 training (--f16 1)\n"); return 2; }
-            if (P % (4 << (cfg.nlev - 1)) || g_Pz % (4 << (cfg.nlev - 1))) { fprintf(stderr, "--lat 4: P must be divisible by %d\n", 4 << (cfg.nlev - 1)); return 2; }
+            if (P % (4 << (cfg.nlev - 1)) || (!g_lsplit && g_Pz % (4 << (cfg.nlev - 1)))) { fprintf(stderr, "--lat 4: P must be divisible by %d\n", 4 << (cfg.nlev - 1)); return 2; }
             { const int lg_ = atoi(opt(argc, argv, "--lat-guide", "0")); g_lat_guide = lg_ == 1 ? 5 : lg_ == 2 ? 8 : lg_ == 3 ? 64 : 0; }   /* 3: the sub-cell head (144 outputs) */   /* 1: the side form (5 planes, 16 outputs), 2: the general form (8 planes, 32 outputs) */
             if (resume) { unet_cfg pc; int st; if (!unet_peek(resume, &pc, &st) && pc.half_res == 3) g_lat_guide = pc.lat_guide; }
             if (g_lat_guide == 5 && !g_rv) { fprintf(stderr, "--lat-guide 1: with --rv (the two side channels; --lat-guide 2 for the phase channels)\n"); return 2; }
@@ -2775,7 +2778,7 @@ int cmd_train(int argc, char **argv) {
                                      holds its window scratch (5 bytes per voxel; P 640, 2026-11-09: 4 workers 3 slots 46% wait, 8 workers 3 slots 38%, 4 workers 5 slots 0%) */
         fprintf(stderr, "sampler: %d workers but %d slots: at most %d windows are built at once (--sampler-slots %d to use every worker)\n", workers, sc.nbuf, sc.nbuf - ng > 1 ? sc.nbuf - ng : 1, workers + 2 * ng);
     g_axr = unet_cfg_axis(&cfg); sc.axis_rec = g_axr ? g_hdiv : 0;   /* the scroll axis per window */
-    if (g_axr && split) { fprintf(stderr, "--attn-axis radial / --attn-pe scroll / --attn-deform-init normal: not with --split z\n"); return 2; }
+    if (g_axr && split && !g_split_top) { fprintf(stderr, "--attn-axis radial / --attn-pe scroll / --attn-deform-init normal: not with --split z (but --split-top: the attention stage sees the whole window)\n"); return 2; }
     if (g_axr && !cfg.attn_deform) fprintf(stderr, "attention: %s, %s positions around each window's scroll axis\n", cfg.attn_axis ? "radial (along the rays from the axis)" : "full", cfg.attn_pe == 3 ? "scroll RoPE" : "grid");
     if (g_axr && cfg.attn_deform) fprintf(stderr, "attention: deformable offsets in each token's normal / tangent / axis frame around the window's scroll axis\n");
     sc.scan_norm = cfg.scan_norm;   /* --scan-norm (a resume: the checkpoint's) */
@@ -3264,7 +3267,8 @@ int cmd_train(int argc, char **argv) {
                 if (g == 0) fprintf(stderr, "verso: frozen teacher from %s\n", tp);
             } else nn_d2d(d->teacher, unet_live_params(d->u), np * 4);
         }
-        if (split) { unet_set_split(d->u, g, g_lsplit ? g_h0 / 4 : g_h0, split_halo);   /* (--lat: the trunk's halo in cells) */ if (!getenv("UFSM_SPLIT_SYNC")) unet_set_split_async(d->u, split_halo_begin, split_halo_end); }
+        if (split) { unet_set_split(d->u, g, g_lsplit ? g_h0 / 4 : g_h0, split_halo);   /* (--lat: the trunk's halo in cells) */ if (!getenv("UFSM_SPLIT_SYNC")) unet_set_split_async(d->u, split_halo_begin, split_halo_end);
+                    if (g_split_top) unet_set_split_top(d->u, g_split_top, split_gather); }
         const char *e = nn_check(); if (e) { fprintf(stderr, "GPU %d: %s\n", d->dev, e); return 1; }
     }
     int lean = getenv("UFSM_LEAN") ? atoi(getenv("UFSM_LEAN")) : 0;   /* lean: one device batch buffer (no upload overlap), the logit

@@ -128,6 +128,41 @@ across runs, in the checkpoint, predict = sampler, --norm overrides, the losses 
 Found on the way (not fixed here): with the scratch1 sources at P 1024 on one card an early `inkfly gpu: out of device memory`
 falls back to the CPU and then segfaults in nn_ink_bits (cudaMemcpyAsync of an invalid host pointer, lab_upload kind 3); and
 the scratch1 data path holds ~7 GB of device memory outside the planner at P 512.
+## Deep levels whole on both cards: --split-top (2026-11-13, branch splitwin-20261112)
+
+Under `--split z` the halo is 2^(nlev-1) cells. For the 6-level scratch2 net that would be 32 cells (128 voxels): halves of 640 instead
+of 544 at P 1024, +18 % level-0 memory and compute. `unet_set_split_top(u, T, split_gather)` / `train --split-top T` (default 3 above 4
+levels) splits only levels 0..T-1.
+
+**Forward:**
+- down[T-1]'s output is all-gathered in place (split_gather / nn_split_gather: each half's owned planes, peer copy, unpacked into the
+  whole window's layout).
+- Levels T.. (the attention stage included) and their decoders run on the whole window on both GPUs, with nn's split statistics off
+  (sp_deep).
+- dec[T]'s a2 is sliced back to the half (sp_slice) behind a stand-in block for dec[T-1]'s staged upsample. Its GN statistics are the
+  window's.
+
+**Backward:**
+- The coarse up-part gradient is computed on the half and gathered.
+- enc[T]'s input gradient is sliced back for the split down[T-1].
+- Both cards compute identical deep parameter gradients, so side 1 zeroes its copy (sp_dedup, before film_bwd). The existing two-card
+  gradient sum then stays the window's.
+
+**Parity:** the halo is 2^T cells, so 2 planes at level T-1 and 1 at level T, which keeps the stride-2 grid. A gather at level 4 with
+an 8-cell halo would break that parity, so T = 3 with 8 cells (32 voxels) is the setting that keeps today's 544-deep halves. Level 3 at
+P 1024 is 32^3 cells, so the redundant deep compute is negligible.
+
+**Attention:** the stage sees the whole window, so `--attn-pe scroll` keeps the sampler's whole-window axis record under the split.
+
+**test_split_lat:** a 6-level net (32,32,64,64,96,96) with an attention block at P 256 (local 40 cells), against one GPU. It gives the
+same verdicts as the 4-level net:
+
+| mode | owned logits | cut halo cells | gradient rel | 4-level net |
+|---|---|---|---|---|
+| fp4 rn | bit-identical | identical | 6e-8 | 2e-8 |
+| MX-fp8 rn | bit-identical | identical | 7e-3 (perturbed CT: 0.49) | 5e-3 |
+| fp4 sr | bit-identical | identical | at the seed-to-seed spread | at the seed-to-seed spread |
+
 ## One P 1024 window across both 5060 Tis: the z split for the latent net (design, 2026-11-12, branch splitwin-20261112)
 
 User: "if we can split one window across both gpus rather than just doing 2 separate inferences that would also be preferred" and

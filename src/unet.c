@@ -225,6 +225,11 @@ struct unet {
     int head_c0, head_nc;                    /* inference builds: only logit channels [c0, c0 + nc) (nc 0: all) */
     int split_side, split_h0;                /* spatial split (unet_set_split): side 0 / 1, level-0 halo planes; h0 0 = off */
     unet_halo_fn split_halo, split_begin, split_end;
+    int sp_top, sp_off;                      /* unet_set_split_top: levels >= sp_top whole on both GPUs; sp_off: running them now */
+    unet_gather_fn split_gather;
+    shape5 sp_ls;                            /* level sp_top's local shape (down[sp_top - 1]'s output on this half) */
+    block sp_xb; float *sp_xa, *sp_gl;       /* dec[sp_top - 1]'s coarse input: dec[sp_top]'s a2 sliced to this half; down[sp_top - 1]'s output gradient, sliced */
+    size_t tb_p1;                            /* the attention stage's parameters [tb_p0, tb_p1) */
     /* cfg.attn_blocks: the bottleneck transformer stage (src/attn.h). tb is the stage's output block (a2 = the new raw output, m2 / r2 its
        GroupNorm statistics, n2 = the bottleneck's n2 parameters; no convs of its own); the token rows: tok slot 0 the converted input,
        slot 1 after the PE (block 0's input), slot k + 1 block k's input, slot tbn + 1 the output */
@@ -269,7 +274,9 @@ static block *stage_out(unet *u, int i) { return u->tbn && i == u->cfg.nlev - 1 
    and the loss sums are restricted and summed across the GPUs inside nn (nn_split_cfg). */
 void unet_set_split_async(unet *u, unet_halo_fn begin, unet_halo_fn end) { u->split_begin = end ? begin : nullptr; u->split_end = end; }
 void unet_set_split(unet *u, int side, int h0, unet_halo_fn fn) { u->split_side = side; u->split_h0 = fn ? h0 : 0; u->split_halo = fn; }
-static int sp_on(const unet *u) { return u->split_h0 > 0; }
+static int sp_on(const unet *u) { return u->split_h0 > 0 && !u->sp_off; }
+static int sp_top_on(const unet *u) { return u->split_h0 > 0 && u->sp_top > 0; }
+void unet_set_split_top(unet *u, int top, unet_gather_fn fn) { u->sp_top = fn ? top : 0; u->split_gather = fn; }
 static int sp_h(const unet *u, shape5 s) { return (int)((long)u->split_h0 * s.d / u->xs.d); }
 static int sp_esz(const void *p, int grad);
 static void sp_halo(const unet *u, const void *p, shape5 s, int grad) { if (sp_on(u)) u->split_halo(p, s, sp_esz(p, grad), sp_h(u, s)); }
@@ -282,6 +289,22 @@ static void sp_cfg(const unet *u) {   /* the device's nn split state follows the
     if (!sp_on(u)) { nn_split_cfg(0, 0, 0, 0); return; }
     const int h = u->split_h0;
     nn_split_cfg(u->split_side ? h : 0, u->split_side ? 0 : h, u->xs.d, 2 * (u->xs.d - h));
+}
+static void sp_deep(unet *u, int on) { if (sp_top_on(u) && u->sp_off != on) { u->sp_off = on; sp_cfg(u); } }   /* (split_top: entering / leaving the whole levels) */
+static int sp_z0(const unet *u, int D) { return u->split_side ? D / 2 - (u->sp_ls.d - D / 2) : 0; }   /* this half's first plane in the whole level-sp_top tensor of depth D */
+static int sp_esz(const void *p, int grad);
+/* split_top: tensor p at level top from this half's layout (shape sp_ls, c channels) into the whole window's (both sides: a collective) */
+static void sp_gather(unet *u, const void *p, int c, int grad) {
+    shape5 sl = u->sp_ls; sl.c = c; const int D = u->ls[u->sp_top].d;
+    u->split_gather(p, sl, sp_esz(p, grad), sl.d - D / 2, D);
+}
+/* split_top: whole-window tensor src (shape sf) to this half's planes in dst (shape sp_ls, sf.c channels), dst registered as src */
+static shape5 sp_slice(unet *u, const void *src, shape5 sf, void *dst, int grad) {
+    shape5 sl = u->sp_ls; sl.c = sf.c;
+    const int dt = nn_storage(src);
+    if (dt) nn_set_storage(dst, nn_mx_bytes(sl, dt), dt); else if (nn_storage(dst)) nn_storage_forget(dst);
+    nn_split_slice(src, sf, dst, sl, sp_esz(src, grad), sp_z0(u, sf.d));
+    return sl;
 }
 
 /* ---- parameter layout ---- */
@@ -394,6 +417,7 @@ unet *unet_create(const unet_cfg *cfg) {
         u->tbn = cfg->attn_blocks;
         if (cfg->attn_vres && cfg->attn_deform) { fprintf(stderr, "unet: --attn-vres needs query-key attention (not --attn-deform)\n"); abort(); }
         if (cfg->attn_vres) { u->vr_off = off; off += (size_t)cfg->attn_blocks * (C / AT_HD); }
+        u->tb_p1 = off;
         block *so = stage_out0(u, L - 1);
         u->tb.c1 = u->tb.c2 = (convp){C, C, 3, 1, 0, 0};   /* (shapes only: no convs) */
         u->tb.n1 = u->tb.n2 = so->n2;                      /* the level's output normalisation moves after the stage */
@@ -770,6 +794,7 @@ static int interior(const unet *u, const void *p) {
 }
 static void free_acts(unet *u) {
     float *pp[UNET_MAXLEV * 30 + 8]; int np = 0;
+    { float *q[2] = {u->sp_xa, u->sp_gl}; free_once(q, 2); u->sp_xa = u->sp_gl = nullptr; }
     if (u->l3b) {   /* the level-0 tensors and the coarse homes back where they were allocated / placed first */
         if (u->a2_out || u->a1_out[0] || u->xin_out) nn_sync();
         u->enc[0].a1 = u->l3x[1]; u->enc[0].a2 = u->l3x[2];
@@ -1001,6 +1026,15 @@ static void build_acts(unet *u, shape5 xs, int train) {
     {
         shape5 s = xs; for (int i = 0; i < L; i++) { u->ls[i] = s; if (i < L - 1) s = nn_conv3d_out_shape(s, w[i], 3, 2); }
     }
+    if (sp_top_on(u)) {   /* (split_top) the whole window from level top on */
+        const int S = u->sp_top, h = u->split_h0 >> (S - 1);
+        if (S < 2 || S > L - 1 || u->split_h0 != 1 << S || u->ls[S - 1].d % 2 || !recompute() || !nn_get_tf32()) {
+            fprintf(stderr, "unet: split_top %d needs 2 <= top < nlev (%d), level-0 halo 2^top (%d), recompute mode, the tensor-core path\n", S, L, u->split_h0); abort(); }
+        u->sp_ls = u->ls[S];
+        shape5 s = u->ls[S - 1]; s.d = 2 * (s.d - h);
+        for (int i = S; i < L; i++) { s = nn_conv3d_out_shape(s, w[i - 1], 3, 2); u->ls[i] = s; }
+        if (u->sp_ls.d - u->ls[S].d / 2 != 1 || u->ls[S].d % 2 || u->ls[S].d % (1 << (L - 1 - S))) { fprintf(stderr, "unet: split_top: level %d is %d planes here, %d whole\n", S, u->sp_ls.d, u->ls[S].d); abort(); }
+    }
     g_mlab = "T1 (shared a1, recompute 2)";
     if (train && recompute_a1()) {
         shape5 m1 = u->ls[0]; m1.c = 0;
@@ -1192,7 +1226,7 @@ static void build_acts(unet *u, shape5 xs, int train) {
     }
     if (u->tbn) {   /* attention stage: its output block, fp32 token rows (one set per block input), one block's scratch, gradients */
         g_mlab = "attention stage";
-        if (!nn_get_tf32() || sp_on(u)) { fprintf(stderr, "unet: attention blocks need the tensor-core path and no spatial split\n"); abort(); }
+        if (!nn_get_tf32() || (sp_on(u) && !sp_top_on(u))) { fprintf(stderr, "unet: attention blocks need the tensor-core path and no spatial split (but split_top)\n"); abort(); }
         shape5 y = u->ls[L - 1]; y.c = w[L - 1];
         build_block_acts(u, &u->tb, y, train, 1, nullptr, nullptr, nullptr);
         const long Sg = (long)shape_spatial(y), T = (long)y.n * (Sg + u->nrg); const int C = w[L - 1];
@@ -1547,6 +1581,11 @@ static void build_acts(unet *u, shape5 xs, int train) {
     }
     g_mlab = "encoder a1 / a2 / GN stats + down outputs";
     for (int i = 0; i < L - 1; i++) if (!u->downo[i]) { shape5 ds = u->ls[i + 1]; ds.c = w[i]; u->downo[i] = dalloc_act_s(u, ds); }   /* (deferred, not placed) */
+    if (sp_top_on(u)) {   /* (split_top) the sliced coarse input of dec[top - 1], the sliced gradient of down[top - 1]'s output */
+        g_mlab = "split_top slices";
+        shape5 a = u->sp_ls; a.c = UPW(u->sp_top); u->sp_xa = dalloc_act_s(u, a);
+        if (train) { shape5 g = u->sp_ls; g.c = w[u->sp_top - 1]; u->sp_gl = dalloc_grad(u, shape_numel(g)); }
+    }
     for (int i = 0; i < L; i++) { block *so = stage_out(u, i); if (so->a2 == SKO_DEFER) so->a2 = dalloc_act_s(u, so->ys); }
     g_mlab = "logits (fp32 / fp16) / network input";
     if (!train && u->head_nc) os.c = u->head_nc;   /* inference: the requested logit channels only */
@@ -2584,8 +2623,10 @@ const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x
     const float *x = (const float *)xv;
     nn_set_nlev(u->cfg.nlev);   /* layer ids / names of the precision policy, manifests and profiles (a no-op unless the depth changed) */
     int div = 1 << (u->cfg.nlev - 1);
-    if (xs.d % div || xs.h % div || xs.w % div) { fprintf(stderr, "unet: spatial size %dx%dx%d must be divisible by %d\n", xs.d, xs.h, xs.w, div); abort(); }
+    const int divd = sp_top_on(u) ? 1 << u->sp_top : div;   /* (split_top: this half's depth down to level top; the whole window's is checked in build_acts) */
+    if (xs.d % divd || xs.h % div || xs.w % div) { fprintf(stderr, "unet: spatial size %dx%dx%d must be divisible by %d\n", xs.d, xs.h, xs.w, div); abort(); }
     if (!u->built || memcmp(&u->xs, &xs, sizeof xs) || (train && !u->train) || u->mode != UMODE()) build_acts(u, xs, train);
+    u->sp_off = 0;
     if (sp_on(u) && (!nn_get_tf32() || !ABF)) { fprintf(stderr, "unet: the spatial split needs the tensor-core path with 16-bit or MX storage\n"); abort(); }
     sp_cfg(u);
     unet_apply_sparse24(u);
@@ -2674,7 +2715,8 @@ const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x
             if (i == 0 && u->l3b && u->xin_out) nn_stream_wait(0, u->ev_xin[1]);   /* (l3b: down0's output over the input in X3: its copy out done) */
             if (recompute()) { nn_gn_t g = gn_out(u, so); int r; PROF(0, r = nn_conv3d_fwd_x(so->a2, &g, nullptr, nullptr, 0, 0, so->ys, P(u, u->down[i].w), P(u, u->down[i].b), w[i], 3, 2, u->downo[i], 0, 0.f, nullptr, nullptr)); if (r) rc_fail("down conv"); }
             else PROF(0, nn_conv3d_fwd(cur, so->ys, P(u, u->down[i].w), P(u, u->down[i].b), w[i], 3, 2, u->downo[i]));
-            { shape5 ds = u->ls[i + 1]; ds.c = w[i]; sp_halo(u, u->downo[i], ds, 0); }
+            if (sp_top_on(u) && i == u->sp_top - 1) { sp_gather(u, u->downo[i], w[i], 0); sp_deep(u, 1); }   /* (split_top: the whole window from here) */
+            else { shape5 ds = u->ls[i + 1]; ds.c = w[i]; sp_halo(u, u->downo[i], ds, 0); }
             if (u->cfg.down_norm) {   /* GroupNorm + SiLU after the down conv: stats now, the transform in the next conv1's staging */
                 shape5 ds = u->ls[i + 1]; ds.c = w[i];
                 const int G = G_of(u, w[i]);
@@ -2714,6 +2756,13 @@ const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x
         if (recompute()) {   /* nothing materialised: dec conv1 stages up2(silu(gn(a2))) of the coarse block and silu(gn(a2)) of the skip */
             u->dec[i].xb = i == L - 2 ? (const void *)stage_out(u, L - 1) : (const void *)&u->dec[i + 1];
             u->dec[i].x2b = stage_out(u, i); u->dec[i].in2 = nullptr; u->dec[i].c_split = uw;
+            if (sp_top_on(u) && i == u->sp_top - 1) {   /* (split_top) the coarse block's a2 sliced to this half: a stand-in block (its GN statistics are the window's) */
+                const block *xo = (const block *)u->dec[i].xb;
+                if (xo->s2) { fprintf(stderr, "unet: split_top: a kept coarse s2\n"); abort(); }
+                u->sp_xb = *xo; u->sp_xb.ys = sp_slice(u, xo->a2, xo->ys, u->sp_xa, 0); u->sp_xb.a2 = u->sp_xa;
+                u->dec[i].xb = &u->sp_xb;
+                sp_deep(u, 0);
+            }
         } else if (nn_get_tf32()) {   /* cat holds only the upsampled part; the skip is read in place by the split conv */
             PROF(5, nn_up2_fwd_into(cur, src, u->cat[i], uw, 0));
             { shape5 us = li; us.c = uw; sp_halo(u, u->cat[i], us, 0); }
@@ -3614,6 +3663,18 @@ const float *unet_ds_logits(const unet *u, int j, shape5 *s) {
     return u->ds_lg[j];
 }
 void unet_set_ds_grad(unet *u, int j, const float *gl) { if (j >= 1 && j <= u->cfg.ds_levels) u->ds_gl[j] = gl; }
+/* split_top: both GPUs computed the same whole-window gradients of the deep levels (top .. nlev - 1, their decoders, down[top - 1]'s GroupNorm
+   on, the attention stage): side 1 drops its copy so the sum across the GPUs is the window's */
+static void sp_zconv(float *g, const convp *c) { nn_zero(g + c->w, (size_t)c->cout * c->cin * c->k * c->k * c->k * 4); nn_zero(g + c->b, (size_t)c->cout * 4); }
+static void sp_zgn(float *g, const gnp *n) { nn_zero(g + n->gamma, (size_t)n->c * 4); nn_zero(g + n->beta, (size_t)n->c * 4); }
+static void sp_zblock(float *g, const block *b) { sp_zconv(g, &b->c1); sp_zgn(g, &b->n1); if (!b->single) { sp_zconv(g, &b->c2); sp_zgn(g, &b->n2); } }
+static void sp_dedup(unet *u, float *g) {
+    const int L = u->cfg.nlev, S = u->sp_top;
+    for (int i = S; i < L; i++) { sp_zblock(g, &u->enc[i]); for (int k = 0; k < u->cfg.enc_blocks[i]; k++) sp_zblock(g, &u->rb[i][k]); }
+    for (int i = S; i < L - 1; i++) { sp_zconv(g, &u->down[i]); sp_zblock(g, &u->dec[i]); }
+    if (u->cfg.down_norm) for (int i = S - 1; i < L - 1; i++) sp_zgn(g, &u->dn[i]);
+    if (u->tbn) nn_zero(g + u->tb_p0, (u->tb_p1 - u->tb_p0) * 4);
+}
 void unet_backward_x(unet *u, const void *gv, int g_h16) {
     const float *glogits = (const float *)gv;
     int L = u->cfg.nlev;
@@ -3621,7 +3682,7 @@ void unet_backward_x(unet *u, const void *gv, int g_h16) {
     g_in_bwd = 1;
     nn_set_gn_const(u->ge_c);   /* gn_ema: the whole backward's GroupNorms without the statistics' terms (block_bwd keeps it) */
     const float gscale = GBF ? nn_get_grad_scale() : 1.f;
-    sp_cfg(u);
+    u->sp_off = 0; sp_cfg(u);
     if (g_h16 && !GBF) { fprintf(stderr, "unet_backward_x: a 16-bit logit gradient needs the 16-bit gradient storage\n"); abort(); }
     if (GBF && !g_h16 && !u->head_ext && !l0h_on(u)) { shape5 os = u->ls[0]; os.c = u->cfg.cout; if (!u->glb) u->glb = dalloc_grad(u, shape_numel(os)); nn_f32_to_h16(glogits, shape_numel(os), u->glb, gscale); glogits = u->glb; }
     const int *w = u->cfg.widths;
@@ -3643,6 +3704,7 @@ void unet_backward_x(unet *u, const void *gv, int g_h16) {
         for (int i = u->a0_share ? L - 2 : 0; i >= 0; i--) {
             block *b = &u->dec[i];
             const int G = G_of(u, b->c1.cout);
+            sp_deep(u, sp_top_on(u) && i >= u->sp_top);
             nn_set_layer(3 * L - 3 - i);
             if (b->a1_lent && u->sea_stale) { nn_set_conv(0); if (dec_conv1(u, b, i, b->a1, G, nullptr, nullptr, nullptr, nullptr, nullptr)) rc_fail("decoder conv1 recompute"); sp_halo(u, b->a1, b->ys, 0); }
             nn_set_storage(b->a2, act_bytes_of(b->ys), act_dt());
@@ -3708,10 +3770,13 @@ void unet_backward_x(unet *u, const void *gv, int g_h16) {
     if (u->gco && !u->l3b) { u->gout[1] = u->gB[1] = u->gout_x1; if (L > 2) u->gskip[1] = u->gout_x1; }   /* dec[0]'s backward: gout[1] in dec[0].a1's buffer */
     /* decoder, bottom-up in the graph = i from 0 to L-2 */
     for (int i = 0; i < L - 1; i++) {
+        sp_deep(u, sp_top_on(u) && i >= u->sp_top);   /* (split_top: the whole levels) */
         if (i >= 1 && i <= u->cfg.ds_levels && u->ds_gl[i]) ds_bwd(u, i, g);   /* deep supervision: gout[i] += the level head's input gradient */
         if (i == u->cfg.emb_lev && u->eh_gl) side_head_bwd(u, i, &u->eh, u->eh_gl, g);   /* the distillation head: the same */
         shape5 li = u->ls[i];
         shape5 src = u->ls[i + 1]; src.c = UPW(i + 1);
+        const int sp_up = sp_top_on(u) && i == u->sp_top - 1;   /* (split_top: the up-part gradient on this half's planes, then gathered) */
+        if (sp_up) { src = u->sp_ls; src.c = UPW(i + 1); }
         if (i == 0 && u->l0st) {   /* (level-0 slab stream: B1) */
             l0st_bwd_dec(u); l0st_dump(0, u->gout[1], src);
             shape5 g0 = li; g0.c = w[0];   /* (the whole 16-channel tensor: ls[0] carries the input's channels) */
@@ -3761,6 +3826,7 @@ void unet_backward_x(unet *u, const void *gv, int g_h16) {
             if (gup) { shape5 us = li; us.c = UPW(i + 1); sp_halo(u, gup, us, 1); }
             if (gup) PROF(5, nn_up2_bwd(gup, src, u->gout[i + 1]));   /* nullptr: chunk mode wrote gout[i + 1] */
             FQG(u->gout[i + 1], src);
+            if (sp_up) sp_gather(u, u->gout[i + 1], src.c, 1);
             if (i == 0) { shape5 g0 = li; g0.c = w[0]; l0st_dump(0, u->gout[1], src); l0st_dump(3, u->gskip[0], g0); }
         } else {
             nn_set_layer(3 * L - 3 - i); float *gcat = block_bwd(u, &u->dec[i], i, u->gout[i], nullptr, 0, nullptr, nullptr);       /* gB[i]: grad wrt concat */
@@ -3778,6 +3844,7 @@ void unet_backward_x(unet *u, const void *gv, int g_h16) {
     }
     /* encoder, from the bottom */
     for (int i = L - 1; i >= 0; i--) {
+        sp_deep(u, sp_top_on(u) && i >= u->sp_top);
         float *gy = i < L - 1 ? u->gskip[i] : u->gout[i];   /* enc[i].s2 receives skip + down-conv grads; the bottom gets the up-path grad */
         if (i == 0 && u->xin_shared && !u->a0_share) nn_stream_wait(0, u->ev_xin[3]);
         if (i > 0 && u->dno) nn_stream_wait(0, u->ev_dn[i - 1][3]);   /* its input back from the host */
@@ -3799,6 +3866,7 @@ void unet_backward_x(unet *u, const void *gv, int g_h16) {
             /* enc[i] input = downo[i-1] = down[i-1](level i-1's output): propagate to it, accumulate into gskip[i-1] */
             block *so = stage_out(u, i - 1);
             shape5 ds = u->enc[i].xs;                                     /* == down output shape */
+            if (sp_top_on(u) && i == u->sp_top) { sp_deep(u, 0); ds = sp_slice(u, gin, ds, u->sp_gl, 1); gin = u->sp_gl; }   /* (split_top: down[top - 1] runs split) */
             nn_set_layer(L + i - 1);
             sp_zero(u, gin, ds, 1);
             sp_begin(u, gin, ds, 1);
@@ -3832,6 +3900,7 @@ void unet_backward_x(unet *u, const void *gv, int g_h16) {
     if (share_enc_a1()) u->sea_stale = 1;   /* the decoders' a1 buffers now hold the encoders' */
     /* d/dv of the stem bias b + c v is c d/db (exact when the gradient was zeroed before this backward: one backward per step) */
     if (u->cfg.scale_cond) nn_axpy(g + u->sc_w, u->sc_c, g + u->enc[0].c1.b, (size_t)u->enc[0].c1.cout);
+    if (sp_top_on(u) && u->split_side == 1) sp_dedup(u, g);   /* (split_top: the whole levels' gradients once, side 0's; before film_bwd reads the GN ones) */
     film_bwd(u, g);   /* (exact as the scale_cond term: the gradient was zeroed before this backward) */
     if (u->cfg.l0_norm == 3) ws_backward(u);
     g_in_bwd = 0;

@@ -5,7 +5,7 @@
 #include <string.h>
 
 typedef struct { int kind; const void *p; shape5 s; int esz, h; double *b; int n; int slot; void *q; size_t ns, nr; void *st; } coll_t;   /* kind 1 halo, 2 reduce, 3 k halo planes (n = k),
-                                                    4 xchg (p send of ns bytes, q receive of nr), 5 typed sum (q values, n of them, slot = type) */
+                                                    4 xchg (p send of ns bytes, q receive of nr), 5 typed sum (q values, n of them, slot = type), 6 split_top gather (n = the whole depth) */
 
 struct split_ctx {
     int dev[2];
@@ -61,7 +61,7 @@ static void grow(split_ctx *c, size_t bytes, int nd) {
 
 static void execute(split_ctx *c) {
     coll_t *a = &c->slot[0], *b = &c->slot[1];
-    if (a->kind != b->kind || ((a->kind == 1 || a->kind == 3) && (memcmp(&a->s, &b->s, sizeof a->s) || a->esz != b->esz || a->h != b->h || a->slot != b->slot)) || ((a->kind == 2 || a->kind == 5) && (a->n != b->n || a->slot != b->slot))) {
+    if (a->kind != b->kind || ((a->kind == 1 || a->kind == 3 || a->kind == 6) && (memcmp(&a->s, &b->s, sizeof a->s) || a->esz != b->esz || a->h != b->h || a->slot != b->slot)) || ((a->kind == 2 || a->kind == 5 || a->kind == 6) && (a->n != b->n || a->slot != b->slot))) {
         fprintf(stderr, "split: the two halves diverged (collective %u: kind %d / %d)\n", c->seq, a->kind, b->kind);
         abort();
     }
@@ -79,6 +79,11 @@ static void execute(split_ctx *c) {
                                c->rtcap = a->n; nn_init(c->dev[t_side]); }
         void *bb[2] = {a->q, b->q}, *st[2] = {a->st, b->st};
         nn_split_sum_t(bb, c->dev, a->n, a->slot, c->rt, st);
+    } else if (a->kind == 6) {   /* split_top gather (coll_t.n = the whole depth), the synchronous buffers */
+        size_t nb = (size_t)(a->n / 2) * nn_split_halo_bytes(a->s, a->esz);
+        if (nb > c->cap) grow(c, nb, 0);
+        void *t[2] = {(void *)a->p, (void *)b->p};
+        nn_split_gather(t, c->dev, a->s, a->esz, a->h, a->n, c->sb[1], c->rb[1]);
     } else if (a->kind == 3) {   /* k halo planes (coll_t.n = k), the synchronous buffers */
         size_t nb = (size_t)a->n * nn_split_halo_bytes(a->s, a->esz);
         if (nb > c->cap) grow(c, nb, 0);
@@ -118,6 +123,7 @@ void split_halo(const void *p, shape5 s, int esz, int h) { halo_begin(p, s, esz,
 void split_halo_k(const void *p, shape5 s, int esz, int h, int k) { coll_t x = {3, p, s, esz, h, nullptr, k, 1}; collective(&x); }
 void split_xchg(const void *send_d, size_t ns, void *recv_d, size_t nr, void *stream) { coll_t x = {4, send_d, {0}, 0, 0, nullptr, 0, 0, recv_d, ns, nr, stream}; collective(&x); }
 void split_sum(void *d, int n, int type, void *stream) { coll_t x = {5, nullptr, {0}, 0, 0, nullptr, n, type, d, 0, 0, stream}; collective(&x); }
+void split_gather(const void *p, shape5 s, int esz, int h, int D) { coll_t x = {6, p, s, esz, h, nullptr, D, 1}; collective(&x); }
 int split_side(void) { return t_side; }
 void split_reduce(double *b, int n) { coll_t x = {2, nullptr, {0}, 0, 0, b, n, 0}; collective(&x); }
 
