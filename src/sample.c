@@ -330,8 +330,8 @@ static inline int64_t hb_n(const source *h, int k, int d) { return k ? h->hold[k
 static int same_ct(const source *a, const source *b) {
     return a == b || (a->um == b->um && !strcmp(a->ct_key, b->ct_key) && !strcmp(store_root(a->s), store_root(b->s)));
 }
-static int training_hits_holdout_(const sampler *sp, const source *s, const int64_t o[3], int l, int only_rej) {
-    const int64_t span[3] = {(int64_t)PZ(&sp->cfg) << l, (int64_t)sp->cfg.P << l, (int64_t)sp->cfg.P << l};
+static int hits_holdout_span(const sampler *sp, const source *s, const int64_t o[3], int l, int only_rej, int unit) {   /* unit: a 1-voxel span, not the window */
+    const int64_t span[3] = {(int64_t)(unit ? 1 : PZ(&sp->cfg)) << l, (int64_t)(unit ? 1 : sp->cfg.P) << l, (int64_t)(unit ? 1 : sp->cfg.P) << l};
     for (int i = 0; i < sp->S->n; i++) {
         const source *h = &sp->S->src[i]; if (!src_nhold(h) || !same_ct(s, h)) continue;
         for (int k = 0; k < src_nhold(h); k++) {
@@ -343,6 +343,7 @@ static int training_hits_holdout_(const sampler *sp, const source *s, const int6
     }
     return 0;
 }
+static int training_hits_holdout_(const sampler *sp, const source *s, const int64_t o[3], int l, int only_rej) { return hits_holdout_span(sp, s, o, l, only_rej, 0); }
 #define SL_OTHER_RET() do { const int si_ = (int)(s - sp->S->src), l_ = l < 0 ? 0 : l; if (si_ >= 0 && si_ < 64 && l_ < MAXLEV) atomic_fetch_add(&sp->rej_sl[si_][l_][SL_OTHER], 1); return 1; } while (0)
 #define SL_ADD(k) do { const int si_ = (int)(s - sp->S->src); if (si_ >= 0 && si_ < 64 && l >= 0 && l < MAXLEV) atomic_fetch_add(&sp->rej_sl[si_][l][(k)], 1); } while (0)
 /* holdout mask mode: the held-out boxes (every same-CT source's) a training window of n level-l voxels at o overlaps, each grown by
@@ -382,23 +383,31 @@ static int hold_mask_mode(const sampler *sp, const source *s) {   /* the draw's 
     const sample_cfg *c = &sp->cfg;
     return (s->hold_mode ? s->hold_mode == 1 : !c->holdout_reject) && !c->sheet && !c->cond && !c->emb_ch;
 }
-static int training_corner_exists(const sampler *sp, const source *s, int l, const int64_t lo[3], const int64_t hi[3]) {
-    /* mask mode: a window may overlap holdout boxes (they are masked), only the reject boxes forbid it: the eligibility check had kept the
-       reject rule, so at P 1024 every corner of PHerc1667 at 4.8 um touched one of its 2048^3 boxes and the source was excluded */
-    const int rej = hold_mask_mode(sp, s);   /* (mask mode: only the reject boxes count) */
+static int corner_search(const sampler *sp, const source *s, int l, const int64_t lo[3], const int64_t hi[3], int rej, int unit) {
     int nh = 0; for (int i = 0; i < sp->S->n; i++) nh += src_nhold(&sp->S->src[i]);
     int n[3] = {1, 1, 1}; int64_t v[3][nh + 1], f = (int64_t)1 << l;
     for (int d = 0; d < 3; d++) v[d][0] = lo[d];
-    if (!training_hits_holdout_(sp, s, lo, l, rej)) return 1;
+    if (!hits_holdout_span(sp, s, lo, l, rej, unit)) return 1;
     for (int i = 0; i < sp->S->n; i++) {
         const source *h = &sp->S->src[i]; if (!src_nhold(h) || !same_ct(s, h)) continue;
         for (int k = 0; k < src_nhold(h); k++)
             for (int d = 0; d < 3; d++) { int64_t end = (hb_o(h, k, d) + hb_n(h, k, d) + f - 1) / f; if (end > lo[d] && end <= hi[d]) v[d][n[d]++] = end; }
     }
     for (int z = 0; z < n[0]; z++) for (int y = 0; y < n[1]; y++) for (int x = 0; x < n[2]; x++) {
-        int64_t o[3] = {v[0][z], v[1][y], v[2][x]}; if (!training_hits_holdout_(sp, s, o, l, rej)) return 1;
+        int64_t o[3] = {v[0][z], v[1][y], v[2][x]}; if (!hits_holdout_span(sp, s, o, l, rej, unit)) return 1;
     }
     return 0;
+}
+static int training_corner_exists(const sampler *sp, const source *s, int l, const int64_t lo[3], const int64_t hi[3]) {
+    /* mask mode: a window may overlap holdout boxes (they are masked), only the reject boxes forbid it: the eligibility check had kept the
+       reject rule, so at P 1024 every corner of PHerc1667 at 4.8 um touched one of its 2048^3 boxes and the source was excluded (holdfit
+       f1424a2). Mask mode still refuses a source whose holdout boxes cover every voxel the windows can reach (the union of same-CT holdouts
+       over the whole scan: every window would be fully masked): a free voxel in [lo, hi + window - 1] (the boxes without their guard) */
+    const int rej = hold_mask_mode(sp, s);   /* (mask mode: only the reject boxes count) */
+    if (!corner_search(sp, s, l, lo, hi, rej, 0)) return 0;
+    if (!rej) return 1;
+    const int64_t vhi[3] = {hi[0] + PZ(&sp->cfg) - 1, hi[1] + sp->cfg.P - 1, hi[2] + sp->cfg.P - 1};
+    return corner_search(sp, s, l, lo, vhi, 0, 1);
 }
 static int level_ok(sampler *sp, source *s, int si, int l, int region_ch) {
     int key = region_ch >= 0 ? 1 : 0;
