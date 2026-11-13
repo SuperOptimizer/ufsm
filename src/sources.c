@@ -17,6 +17,7 @@
 #include "json.h"
 #include "votes.h"
 #include "srpair.h"
+#include <sys/stat.h>
 #include <math.h>
 #include <stdio.h>
 #include <unistd.h>
@@ -133,7 +134,7 @@ static char *sdup(const char *s) { return s ? strdup(s) : nullptr; }
    {"meshes": {"dir", "value" ("q.tif"), "map" (a reg.json: the meshes' scan -> this source's), "level" (the codes' CT level; default plev)}}:
    the codes rasterised on read from the q-assigned meshes (meshcodes.h mesh_codes_open) at level + extra directly (a stored level-L+1
    raster, not the pooled level L: 8x fewer voxels rasterised), then pool2 poolings. key: the dcache key of the phase derived from them
-   ("" without meshes: the stored codes' phase is not cached). nullptr (reported) on failure */
+   (stored codes: their path, zarr.json size / mtime and poolings; "" over http: not cached). nullptr (reported) on failure */
 static z3 *onfly_codes_open(const source *s, const json *e, const json *of, int extra, int plev, char *key, size_t nkey) {
     key[0] = 0;
     const json *mj = json_get(e, "meshes"); if (!mj && e != of) mj = json_get(of, "meshes");
@@ -153,6 +154,10 @@ static z3 *onfly_codes_open(const source *s, const json *e, const json *of, int 
         const char *cr = json_str(json_get(e, "root"), nullptr), *ck = json_str(json_get(e, "key"), "");
         store *cs = cr ? store_open(cr) : nullptr; cz = cs ? z3_open(cs, ck, nullptr) : nullptr;
         if (!cz) { fprintf(stderr, "sources: %s: phase onfly: cannot open the codes %s/%s\n", s->name, cr ? cr : "?", ck); return nullptr; }
+        /* the dcache key of stored codes (2026-11-13, scratch1: the stored phase rasters replaced by their codes): the array's path, its
+           zarr.json's size and mtime (a rewritten array: a new key), the poolings */
+        { char zp[1100]; struct stat st; snprintf(zp, sizeof zp, "%s/%s/zarr.json", cr, ck);
+          if (!strstr(cr, "://") && !stat(zp, &st)) snprintf(key, nkey, "codes %s/%s size %lld mtime %lld pool%db", cr, ck, (long long)st.st_size, (long long)st.st_mtime, extra + npool); }
         for (int q2 = 0; cz && q2 < extra; q2++) { z3 *q = codes_pool2_open(cz); if (!q) { z3_close(cz); cz = nullptr; } else cz = q; }
     }
     for (int q2 = 0; cz && q2 < npool; q2++) { z3 *q = codes_pool2_open(cz); if (!q) { z3_close(cz); cz = nullptr; } else cz = q; }

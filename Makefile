@@ -593,6 +593,9 @@ $(B)/test_patchid: tests/test_patchid.c $(B)/patchid.o $(B)/pairacc.o $(B)/tfx.o
 suite-bins: $(B)/test_patchid
 $(B)/test_gpu_aug: tests/test_gpu_aug.c src/sample.c src/*.h $(SAMPLE_TEST_OBJ) $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_gpu_aug.c $(SAMPLE_TEST_OBJ) $(B)/nn.o $(B)/nn_fp8.o -o $@ $(LDLIBS) $(CUDALIBS)
+$(B)/test_aug_z: tests/test_aug_z.c src/sample.c src/*.h $(SAMPLE_TEST_OBJ) $(B)/nn.o $(B)/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_aug_z.c $(SAMPLE_TEST_OBJ) $(B)/nn.o $(B)/nn_fp8.o -o $@ $(LDLIBS) $(CUDALIBS)
+suite-bins: $(B)/test_aug_z
 $(B)/test_votes: tests/test_votes.c src/votes.h $(B)/votes.o $(SAMPLE_TEST_OBJ)
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_votes.c $(B)/votes.o $(SAMPLE_TEST_OBJ) -o $@ $(LDLIBS)
 $(B)/test_sample_ops: tests/test_sample_ops.c src/sample.c src/*.h $(SAMPLE_TEST_OBJ)
