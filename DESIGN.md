@@ -49,9 +49,38 @@ dense. It is a well-defined net whose backward would be exact. Its deviation fro
   `lp_skip_get` decides per launch.
 - `predict --skip-empty 1 [--skip-thr 40] [--skip-margin 1]` on latent-grid nets: masks from `ctd` before the trunk forward, off
   after it.
-- `tests/test_skip_empty` checks three things: all tiles active gives bit-identical logits, CT-built masks give a material deviation
-  within tolerance, and `nn_skip_off` restores the dense bits.
-- Status: not yet run on a GPU (launch HOLD). Training forward / backward waits on the lead's go.
+- `tests/test_skip_empty` checks three things: all tiles active gives bit-identical logits, margins 2 / 3 stay within 2% / bit-identical
+  on the toy net's material, and `nn_skip_off` restores the dense bits.
+- Predict runs levels 0 / 1 as z-range halves (planes of a depth-yD output, read from a depth-Di input). `lp_skip_get` places
+  them on their level by that depth and first plane; before that fix, only levels 1-2 were masked and the trunk was 1% faster.
+
+**GPU results (pod B, RTX PRO 6000 MIG 1g.24gb, 2026-11-13).**
+- `test_skip_empty` passes. With every tile active, the logits are bit-identical to the dense forward. On the toy net (3 levels,
+  gn_ema, no attention), the material-voxel error is 4.4% at margin 1, 0.2% at margin 2, and 0 (bit-identical) at margin 3.
+- Real-CT A/B (`UFSM_SKIP_AB=1`): u1 `last.ckpt` (10 M, widths 96-192, 4 levels), PHerc0343 masked scan at level 1 (17.28 um),
+  box 4000,0,1536 + 512 x 1024 x 1024 (the scroll edge), windows 512^3 (128^3 cells), threshold 40.
+- Speed: the trunk is 0.064 s dense vs 0.034-0.048 s masked (25-47% faster) at level-0 active shares of 0.27-0.60. The masked
+  convs scale with the active share (enc0.c2 9.5 -> 4.6 ms, dec0.c1 16.9 -> 7.9 ms). down0 (6.6 ms) and the head (7.9 ms) stay dense.
+- Accuracy: u1 has live GroupNorm, so the bias fill moves every window statistic. Material logits then differ by 48% (mean |d| over
+  mean |logit|), so live-GN nets must not use it. `UFSM_SKIP_AB_FREEZE=1` normalises the masked pass with the dense pass's
+  statistics, which is how a gn_ema net behaves; the control with every tile active under the freeze is bit-identical.
+- Under the freeze, on material cells (a voxel >= 64):
+
+| margin | trunk faster | material mean \|d\| / mean \|logit\| | material logit sign flips | bit-identical material values |
+|---|---|---|---|---|
+| 1 | 37-47% | 0.108-0.143 | 6.4-6.9% | 0-0.04% |
+| 2 | 31-44% | 0.092-0.126 | - | 0-3% |
+| 3 | 25-34% | 0.062-0.103 | 3.9-4.9% | 2-26% |
+
+- Unlike the toy net, the error reaches deep into material. u1's reach is ~60 level-0 cells through its 4 levels, while the fill sits
+  only 8 x margin cells from the material. The fill's error enters the coarse levels and comes back up, and a 128^3-cell window
+  near the scroll edge has almost no material farther than that from the fill.
+- scratch2 couples further (6 levels, attention over the whole bottleneck, gfilm), so its error would be at least this large.
+
+**Verdict.** The masked conv runs 25-47% faster on scroll-edge windows, but changes 4-7% of the papyrus logit signs at margins 1-3.
+That is not acceptable as a silent default. It stays opt-in (`predict --skip-empty 1`, default off) for previews where boundary
+windows dominate. No training path: it would change what the net learns there, for at most ~6-9% of a step. Most of the skippable
+space is the zero-filled outside of the scan. Keeping training windows inside the scan would recover that compute exactly.
 
 ## Split-window input builders: every --gpu-aug builder by z range, the scanner split exactly across two GPUs (2026-11-13, branch augz-20261112)
 
