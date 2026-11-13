@@ -242,8 +242,12 @@ long unet_l0_updates(const unet *u);
 /* 2:4 structured sparsity of the 3^3 conv weights (groups of 4 input channels keep 2): the forward reads a masked copy
    of the weights (unet_apply_sparse24 runs inside unet_forward); unet_srste24 adds the SR-STE term lambda * w to the
    gradient of the pruned weights so they keep decaying but can be revisited. The flag is saved in checkpoints. */
-void unet_set_sparse24(unet *u, int on);
+/* mode (nn_mask24m): 1 element-wise 2:4 (dense kernels), 2 pair-wise 4:8 (the sparse fp4 forward, src/lp_sp24conv.cu), 3 transposable
+   2 x 2 blocks (sparse forward and backward-data); modes 2 / 3 mask the stride-1 convs of the levels in unet_set_sparse24_levels (0 = all) */
+void unet_set_sparse24(unet *u, int mode);
+void unet_set_sparse24_levels(unet *u, int mask);
 int unet_get_sparse24(const unet *u);
+int unet_get_sparse24_levels(const unet *u);
 void unet_apply_sparse24(unet *u);
 void unet_srste24(unet *u, float lambda);
 /* true fp8 / fp4 weights: the 3^3 conv weights live in packed e4m3 / e2m1 storage with MX block scales; AdamW and the EMA update

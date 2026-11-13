@@ -265,27 +265,37 @@ template <int MT, int TZ> static void launch_sp24(dim3 grid, const void *x, shap
 #endif
 static int g_sp24_force = -1;   /* test hook: 1 the sparse kernel for every eligible call, 0 never, -1 by the registered weights */
 extern "C" void lp_sp24_force(int on) { g_sp24_force = on; }
-/* the weights the forward reads that carry the pattern (unet_apply_sparse24 mode 2): [lo, hi) per device, and the flipped copies made
-   for a backward-data from such weights when the mask is transposable (lp_sp24_note_flip) */
-static const float *g_sp24_lo[8], *g_sp24_hi[8], *g_sp24_flip[8]; static int g_sp24_tr[8];
-extern "C" void lp_sp24_set_range(const float *lo, size_t n, int transposable) { const int d = cur_dev_(); g_sp24_lo[d] = lo; g_sp24_hi[d] = lo ? lo + n : nullptr; g_sp24_tr[d] = transposable; }
-extern "C" void lp_sp24_note_flip(const float *w, const float *flipped) {
-    const int d = cur_dev_();
-    g_sp24_flip[d] = g_sp24_tr[d] && g_sp24_lo[d] && w >= g_sp24_lo[d] && w < g_sp24_hi[d] ? flipped : nullptr;
+/* the convs whose forward weights carry the pattern (unet_apply_sparse24: per host thread, i.e. per GPU trainer), and the flipped copies a
+   backward-data made from such weights when the mask transposes (mode 3, lp_sp24_note_flip) */
+#define SP24_NREG 512
+struct sp24reg_s { const float *w; size_t n; int mode; };
+static thread_local sp24reg_s g_sp24_reg[SP24_NREG];
+static thread_local int g_sp24_nreg;
+static thread_local const float *g_sp24_flo, *g_sp24_fhi;
+extern "C" void lp_sp24_reg_clear(void) { g_sp24_nreg = 0; g_sp24_flo = g_sp24_fhi = nullptr; }
+extern "C" void lp_sp24_reg(const float *w, size_t n, int mode) { if (g_sp24_nreg < SP24_NREG) g_sp24_reg[g_sp24_nreg++] = sp24reg_s{w, n, mode}; }
+static int sp24_mode_of(const float *w) {   /* the registered conv whose weights contain w (a backward-data range call reads an offset) */
+    for (int i = 0; i < g_sp24_nreg; i++) if (w >= g_sp24_reg[i].w && w < g_sp24_reg[i].w + g_sp24_reg[i].n) return g_sp24_reg[i].mode;
+    return 0;
+}
+extern "C" void lp_sp24_note_flip(const float *w, const float *flipped, size_t n) {
+    if (sp24_mode_of(w) == 3) { g_sp24_flo = flipped; g_sp24_fhi = flipped + n; } else g_sp24_flo = g_sp24_fhi = nullptr;
 }
 extern "C" unsigned lp_sp24_err(void) { unsigned h = 0; cudaMemcpyFromSymbol(&h, g_sp24_err, 4); return h; }
 extern "C" void lp_sp24_err_clear(void) { const unsigned z = 0; cudaMemcpyToSymbol(g_sp24_err, &z, 4); }
-static int sp24_eligible(const float *w) {
+static int sp24_eligible(const float *w) {   /* (the flip note is one-shot: the conv_fwd_tc call right after the flip consumes it) */
     if (g_sp24_force >= 0) return g_sp24_force;
-    const int d = cur_dev_();
-    if (g_sp24_lo[d] && w >= g_sp24_lo[d] && w < g_sp24_hi[d]) return 1;
-    return g_sp24_flip[d] && w == g_sp24_flip[d];
+    const bool fl = g_sp24_flo && w >= g_sp24_flo && w < g_sp24_fhi;
+    g_sp24_flo = g_sp24_fhi = nullptr;
+    if (fl) return 1;
+    const int m = sp24_mode_of(w);
+    return m == 2 || m == 3;
 }
 extern "C" int lp_sp24_conv_fwd(const void *x, int xbf, shape5 xs, const float *w, const float *b, int cout, void *y, int ybf, gnp_t gp, double *osum, int Go, split_t sp) {
 #ifdef LP_SW
     return 0;
 #else
-    if (lp_sw_build() || xbf != 4 || ybf != 4 || xs.c <= 64 || sp.accum || !sp24_eligible(w)) return 0;
+    if (!sp24_eligible(w) || lp_sw_build() || xbf != 4 || ybf != 4 || xs.c <= 64 || sp.accum) return 0;
     if (g_w2d < 0) g_w2d = getenv("UFSM_W4_2D") ? atoi(getenv("UFSM_W4_2D")) : 0;
     if (g_w2d) return 0;   /* (2D weight scales: not in the sparse prep) */
     if (sp.up) sp.up = 2;  /* (fwd_f4_t: UFSM_UP_H2 default) */

@@ -125,6 +125,11 @@ void nn_wq_ema(void *qe, void *sce, void *re, void *rsce, const void *qp, const 
 /* optional fp8 error-feedback residual (r: e4m3 per weight, rsc: ue8m0 per block) used for fp4 weights: w = q4 s + r8 sr */
 void nn_wq_residual(const float *w, const void *q, const void *sc, void *r, void *rsc, int co, int ci, int taps, int bits);
 void nn_srste24(float *g, const float *w, int co, int ci, int taps, float lambda);
+/* sparse24 modes (src/nn_elem.cu mask_sp_k): 1 element-wise 2:4 along ci (dense kernels only), 2 pair-wise 4:8 along ci (the sparse fp4
+   MMA's pattern: forward sparse), 3 transposable 2 x 2 blocks (forward and backward-data sparse); a conv the mode does not fit stays dense */
+int nn_sp24_eligible(int co, int ci, int mode);
+void nn_mask24m(const float *w, float *out, int co, int ci, int taps, int mode);
+void nn_srste24m(float *g, const float *w, int co, int ci, int taps, float lambda, int mode);
 void nn_set_layer_prec(int id, int p);
 int nn_set_prec_policy(const char *policy);   /* see nn.cu: block names, enc1.c2-style single convs, "all", fwd:bwd_data:wgrad values */
 /* finer precision control (prec 4 = fp16 operands with fp16 group accumulation folded into fp32, needs bf16 storage):

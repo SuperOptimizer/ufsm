@@ -2,6 +2,7 @@
 #include "attn.h"
 #include "checkpoint.h"
 #include "nn_lp.h"
+#include "lp_sp24.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -76,7 +77,7 @@ struct unet {
     float *p, *g, *m, *v, *ema;   /* device, flat */
     float *live;                  /* p while training; swapped with ema in unet_use_ema */
     float *fw, *wm;               /* weights the forward/backward read: live, or wm = 2:4-masked copy of live when sparse24 */
-    int sparse24, wq;             /* wq: 0, 8 or 4 = the 3^3 conv weights live in packed fp8 / fp4 storage; p/ema hold dequantized shadows */
+    int sparse24, sp24_lv, wq;    /* sparse24: mode (nn_mask24m; 0 dense); sp24_lv: level bitmask of the masked convs (modes 2 / 3; 0 = all); wq: 0, 8 or 4 = the 3^3 conv weights live in packed fp8 / fp4 storage; p/ema hold dequantized shadows */
     unsigned char *wq_q, *wq_sc, *wq_qe, *wq_sce;   /* packed weights + block scales for live params and for the EMA (byte offsets below) */
     unsigned char *wq_r, *wq_rsc, *wq_re, *wq_rsce;  /* fp4: fp8 error-feedback residuals (live, EMA) */
     size_t wq_qoff[UNET_MAXCONV], wq_soff[UNET_MAXCONV]; int wq_n; unsigned ema_step;   /* per 3^3 conv (for_each_conv3 order): offsets into the packed arrays */
@@ -485,7 +486,7 @@ unet *unet_create(const unet_cfg *cfg) {
     }
     u->p = nn_malloc(off * 4); u->g = nn_malloc(off * 4); u->m = nn_malloc(off * 4); u->v = nn_malloc(off * 4); u->ema = nn_malloc(off * 4);
     nn_zero(u->g, off * 4); nn_zero(u->m, off * 4); nn_zero(u->v, off * 4);
-    u->live = u->p; u->fw = u->p; u->wm = nullptr; u->sparse24 = 0; u->wq = 0; u->wq_q = u->wq_sc = u->wq_qe = u->wq_sce = nullptr; u->wq_r = u->wq_rsc = u->wq_re = u->wq_rsce = nullptr; u->wq_n = 0;
+    u->live = u->p; u->fw = u->p; u->wm = nullptr; u->sparse24 = 0; u->sp24_lv = 0; u->wq = 0; u->wq_q = u->wq_sc = u->wq_qe = u->wq_sce = nullptr; u->wq_r = u->wq_rsc = u->wq_re = u->wq_rsce = nullptr; u->wq_n = 0;
     u->gn_scratch = nn_malloc(1 << 20);
     u->red_scratch = nn_malloc(4096 * 4);
     if (cfg->l0_norm < 0 || cfg->l0_norm > 4) { fprintf(stderr, "unet: l0_norm %d (0 gn, 1 none, 2 ema, 3 ws, 4 slab)\n", cfg->l0_norm); abort(); }
@@ -4419,14 +4420,40 @@ static void for_each_mat(unet *u, void (*fn)(unet *, const convp *, void *), voi
     for_each_conv3(u, fn, arg);
     for (int k = 0; k < u->tbn; k++) for (int j = 0; j < 4; j++) fn(u, &u->tbm[k][j], arg);
 }
-static void mask_conv(unet *u, const convp *c, void *arg) { (void)arg; nn_mask24(u->wm + c->w, u->wm + c->w, c->cout, c->cin, c->k * c->k * c->k); }
-static void srste_conv(unet *u, const convp *c, void *arg) { nn_srste24(u->g + c->w, u->live + c->w, c->cout, c->cin, c->k * c->k * c->k, *(float *)arg); }
-void unet_set_sparse24(unet *u, int on) {
-    u->sparse24 = on;
-    if (on && !u->wm) u->wm = nn_malloc(u->np * 4);
-    u->fw = on ? u->wm : u->live;
+static int conv_level(const unet *u, const convp *c) {   /* the U-Net level a 3^3 conv runs at (a down conv: its input's level) */
+    for (int i = 0; i < u->cfg.nlev; i++) {
+        if (c == &u->enc[i].c1 || c == &u->enc[i].c2 || c == &u->dec[i].c1 || c == &u->dec[i].c2 || c == &u->down[i]) return i;
+        for (int k = 0; k < u->cfg.enc_blocks[i]; k++) if (c == &u->rb[i][k].c1 || c == &u->rb[i][k].c2) return i;
+    }
+    return -1;
 }
+/* the convs a sparse24 mode masks: mode 1 every 3^3 conv (element-wise 2:4, dense kernels); modes 2 / 3 the stride-1 3^3 convs of the
+   selected levels whose shape fits the pattern (the stride-2 downs and the stem run dense kernels: masking them costs accuracy for no speed) */
+static int sp24_masked(const unet *u, const convp *c) {
+    if (u->sparse24 <= 1) return u->sparse24 == 1;
+    if (c->stride != 1 || c->k != 3 || c == &u->enc[0].c1 || !nn_sp24_eligible(c->cout, c->cin, u->sparse24)) return 0;
+    const int l = conv_level(u, c);
+    return !u->sp24_lv || (l >= 0 && ((u->sp24_lv >> l) & 1));
+}
+static void mask_conv(unet *u, const convp *c, void *arg) {
+    (void)arg;
+    if (!sp24_masked(u, c)) return;
+    const size_t n = (size_t)c->cout * c->cin * c->k * c->k * c->k;
+    nn_mask24m(u->wm + c->w, u->wm + c->w, c->cout, c->cin, c->k * c->k * c->k, u->sparse24);
+    if (u->sparse24 >= 2) lp_sp24_reg(u->wm + c->w, n, u->sparse24);   /* the sparse fp4 kernel for this conv (lp_sp24conv.cu) */
+}
+static void srste_conv(unet *u, const convp *c, void *arg) {
+    if (sp24_masked(u, c)) nn_srste24m(u->g + c->w, u->live + c->w, c->cout, c->cin, c->k * c->k * c->k, *(float *)arg, u->sparse24);
+}
+void unet_set_sparse24(unet *u, int mode) {
+    u->sparse24 = mode;
+    if (mode && !u->wm) u->wm = nn_malloc(u->np * 4);
+    u->fw = mode ? u->wm : u->live;
+    nn_wmemo_clear();
+}
+void unet_set_sparse24_levels(unet *u, int mask) { u->sp24_lv = mask; nn_wmemo_clear(); }
 int unet_get_sparse24(const unet *u) { return u->sparse24; }
+int unet_get_sparse24_levels(const unet *u) { return u->sp24_lv; }
 static void fq2d_conv(unet *u, const convp *c, void *arg) {   /* cfg.w4_2d: the fp4 stride-1 convs (not the stem, not the downs) of the
                                                                   forward copy arg (u->wm, or u->wsp after the ws standardisation) */
     if (c == &u->enc[0].c1 || c->stride != 1) return;
@@ -4455,6 +4482,7 @@ void unet_apply_sparse24(unet *u) {   /* (and cfg.w4_2d / cfg.l0_norm ws: the fo
         u->fw = u->wsp;
         return;
     }
+    lp_sp24_reg_clear();
     if (!u->sparse24 && !u->cfg.w4_2d) { u->fw = u->live; return; }
     if (!u->wm) u->wm = nn_malloc(u->np * 4);
     nn_d2d(u->wm, u->live, u->np * 4);
@@ -4521,7 +4549,7 @@ static void wq_ema(unet *u, float decay) {
 void unet_wquant(unet *u, unsigned seed) { (void)u; (void)seed; }   /* kept for API compatibility: packed storage makes it unnecessary */
 
 /* ---- checkpoints ---- */
-static int g_loaded_sparse = 0, g_loaded_wq = 0, g_loaded_muon = 0;   /* set by the header parser, applied by unet_load */
+static int g_loaded_sparse = 0, g_loaded_sp24_lv = 0, g_loaded_wq = 0, g_loaded_muon = 0;   /* set by the header parser, applied by unet_load */
 static float g_loaded_hbR[UNET_MAXCONV]; static int g_loaded_hbR_n = 0;   /* Hyperball radii of the header */
 static size_t *g_loaded_inh; static int g_loaded_ninh;   /* init_inh of the header (pairs) */
 static void inh_add(unet *u, size_t off, size_t n);
@@ -4653,6 +4681,7 @@ int unet_save(const unet *u, const char *path, int step, const char *extra) {
     { int any = 0; for (int i = 0; i < u->cfg.nlev; i++) any |= u->cfg.dec_convs[i] == 1;
       if (any) { fputs(",\"dec_convs\":[", f); for (int i = 0; i < u->cfg.nlev; i++) fprintf(f, "%s%d", i ? "," : "", u->cfg.dec_convs[i]); fputc(']', f); } }
     fprintf(f, ",\"cin\":%d,\"cout\":%d,\"G\":%d,\"down_norm\":%d,\"scale_cond\":%d,\"nparams\":%zu,\"step\":%d,\"sparse24\":%d,\"wq\":%d,\"muon_mom\":%d", u->cfg.cin, u->cfg.cout, u->cfg.G, u->cfg.down_norm, u->cfg.scale_cond, u->np, step, u->sparse24, u->wq, u->muon_mom != nullptr);
+    if (u->sp24_lv) fprintf(f, ",\"sparse24_lv\":%d", u->sp24_lv);   /* (written only when not all levels: old readers unchanged) */
     if (u->mx_hb && (u->mx_R_nload || (u->mx_R && u->mx_R_ok))) {   /* Hyperball radii (Muon table order): a resumed run keeps its spheres */
         float r[UNET_MAXCONV]; const int nr = u->mx_R_nload ? u->mx_R_nload : u->muon_nconv;
         if (u->mx_R_nload) memcpy(r, u->mx_R_load, (size_t)nr * 4); else nn_d2h(r, u->mx_R, (size_t)nr * 4);
@@ -4717,6 +4746,7 @@ static int read_header(FILE *f, unet_cfg *cfg, int *step, size_t *np) {
     if ((p = strstr(line, "\"nparams\":"))) *np = (size_t)atoll(p + 10);
     if ((p = strstr(line, "\"step\":"))) *step = atoi(p + 7);
     if ((p = strstr(line, "\"sparse24\":"))) g_loaded_sparse = atoi(p + 11);
+    g_loaded_sp24_lv = (p = strstr(line, "\"sparse24_lv\":")) ? atoi(p + 14) : 0;
     if ((p = strstr(line, "\"wq\":"))) g_loaded_wq = atoi(p + 5);
     if ((p = strstr(line, "\"muon_mom\":"))) g_loaded_muon = atoi(p + 11);
     g_loaded_hbR_n = 0;
@@ -4774,7 +4804,7 @@ int unet_load(unet *u, const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) return -1;
     unet_cfg cfg; int step = 0; size_t np = 0;
-    g_loaded_sparse = 0; g_loaded_wq = 0; g_loaded_muon = 0;
+    g_loaded_sparse = 0; g_loaded_sp24_lv = 0; g_loaded_wq = 0; g_loaded_muon = 0;
     if (read_header(f, &cfg, &step, &np)) { fclose(f); return -1; }
     /* a checkpoint without the side head (cfg.emb_lev) this net has (train --ssl resumed from a run without it): the head's block
        [eh.w, eh.b + emb_ch) is inserted -- weights and EMA take this net's fresh weights, its optimizer state starts at zero;
@@ -4806,7 +4836,7 @@ int unet_load(unet *u, const char *path) {
     u->mx_R_nload = g_loaded_hbR_n; memcpy(u->mx_R_load, g_loaded_hbR, (size_t)g_loaded_hbR_n * 4); u->mx_R_ok = 0;   /* none: from the weights */
     u->ninh = 0; for (int i = 0; i < g_loaded_ninh; i++) inh_add(u, g_loaded_inh[2 * i], g_loaded_inh[2 * i + 1]);   /* (none: all fresh) */
     if (g_loaded_lat_c && u->cfg.cin == g_loaded_lat_c + 3) unet_set_lat_basis(u, g_loaded_lat_bas, g_loaded_lat_gain, g_loaded_lat_c, g_loaded_lat_step);
-    if (g_loaded_sparse) unet_set_sparse24(u, 1);
+    if (g_loaded_sparse) { unet_set_sparse24_levels(u, g_loaded_sp24_lv); unet_set_sparse24(u, g_loaded_sparse); }   /* (the mode: 1 = the element-wise 2:4 of older checkpoints) */
     if (g_loaded_wq) unet_set_wq(u, g_loaded_wq);
     if (u->cfg.l0_norm == 2) {   /* the running statistics (a checkpoint without them: a fresh warm-up) */
         const int n = 16 * G_of(u, u->cfg.widths[0]);

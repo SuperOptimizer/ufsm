@@ -1,5 +1,6 @@
 /* CUDA ops: bwd section of the former nn.cu */
 #include "nn_common.cuh"
+#include "lp_sp24.h"
 /* instantiated in nn_fwdi*.cu */
 extern template int conv_fwd_tc_h<f16>(const void *x, int xbf, shape5 xs, const float *w, const float *b, int cout, void *y, int ybf, gnp_t gp, double *osum, int Go, split_t sp, const tapset_t *ts);
 #ifdef UFSM_ALL_TYPES
@@ -103,6 +104,7 @@ int conv_fwd_tc(const void *x, int xbf, shape5 xs, const float *w, const float *
         sp.wkey = conv_wkey();
         if ((mdt == 4 || pr == 3) && g_pass == 1 && sr_on()) sp.sr = sr_seed();   /* fp4 backward-data: stochastic rounding of the (MX-fp8) gy operand */
         if (mdt == 4 && g_pass == 1) { sp.sr = 0; sp.osr = sr_seed(); }   /* MX-fp4 gradients: gy already on the e2m1 grid (copy staging), gx stored with exact SR */
+        if (mdt == 4 && lp_sp24_conv_fwd(x, mdt, xs, w, b, cout, y, mdt, gp, osum, Go, sp)) return 0;   /* sparse24 mode 2 / 3 weights (lp_sp24conv.cu) */
         if (mdt == 4 || pr == 3) return lp_conv_fwd_f4(x, mdt, xs, w, b, cout, y, mdt, gp, osum, Go, sp);
         return lp_conv_fwd_f8(x, mdt, xs, w, b, cout, y, mdt, gp, osum, Go, sp);
     }
@@ -182,6 +184,7 @@ void bwd_data_impl_(const float *gy, shape5 ys, const float *w, shape5 xs, int k
     if (stride == 1) {
         size_t nw = (size_t)ys.c * xs.c * T;
         flip_w_k<<<nblk(nw, 256), 256>>>(w, scratch, ys.c, xs.c, T);
+        lp_sp24_note_flip(w, scratch, nw);   /* (sparse24 mode 3: the flipped weights keep the pattern) */
         /* gy has shape ys; treat it as input with ys.c channels, "cout" = xs.c. Spatial sizes equal for stride 1 / pad k/2. */
         if (k == 3 && g_tf32) { gnp_t none = {nullptr, nullptr, nullptr, nullptr, 0}; split_t ns = {nullptr, 0, nullptr, 0, accum}; conv_fwd_tc(gy, GBF, ys, scratch, nullptr, xs.c, gx, GBF, none, nullptr, 0, ns); }
         else if (k == 1 && g_tf32 && ISMX(gx)) lp_conv1_to_mx(gy, ISMX(gy) ? 3 : LPDT(GBF), xs.n, ys.c, shape_spatial(xs), scratch, xs.c, gx, MXDT(gx), MXDT(gx) == 4 ? sr_seed() : 0u);   /* head: logit gradient -> MX gout */
