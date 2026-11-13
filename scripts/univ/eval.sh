@@ -57,11 +57,15 @@ fi
 # so their ink / fibre heads are not scored via --channel until that fix is merged (LATCH=1 overrides). wind (fit fields) and rv (--channel rv) are fine.
 LATCK=0; head -c 4096 $CK | grep -aq '"lat_step"' && LATCK=1
 if [ $LATCK = 1 ] && [ "${LATCH:-0}" != 1 ]; then
-  has fib && { log "fib: skipped, latent checkpoint (plain --channel path not trained-equivalent until univI's fix; LATCH=1 overrides)"; FIB=0; }
+  has fib && [ "${FIBP:-}" != heads ] && { log "fib: skipped, latent checkpoint (plain --channel path not trained-equivalent; FIBP=heads or LATCH=1)"; FIB=0; }
   case "$INKP" in ch:*) log "ink: skipped, latent checkpoint ($INKP via plain --channel; LATCH=1 overrides)"; INK=0;; esac
 fi
-if has fib && [ "${FIB:-1}" = 1 ] && [ -n "$FIBCH" ]; then   # FIBCH e.g. "H=0 V=1 dyad=2-7" (channel indices of CKPT)
+if has fib && [ "${FIB:-1}" = 1 ] && { [ -n "$FIBCH" ] || [ "${FIBP:-}" = heads ]; }; then   # FIBCH e.g. "H=0 V=1 dyad=2-7" (channel indices of CKPT)
   o=$E/$T/fib; mkdir -p $o; BOX=12288,4096,3584,512,576,768; J="--um 2.4 --level 2 --slab 12288,512 --region 4096,4608,3584,4352 --tile 256 --d-mm 0.3,0.6,1.2,2.4"
+  if [ "${FIBP:-}" = heads ]; then   # FIBP=heads (latent-grid checkpoints, 2026-11-12): predict --heads fib writes fib/H, fib/V, fib/dyad/c2..c7
+    # from one trunk pass (the trained path: fine stem + sub-cell placement), linked where the --channel path puts them; FIBCH is unused
+    [ -e $o/fh/fib/H ] || lkg ${UP:-$U} predict $CK $M $P4K $o/fh --um 2.4 --level 2 --box $BOX --levels 1 --heads fib ${PXH:-} --gpu $GPU --threads 6 --cache $WB/cache > $o/predict_heads.log 2>&1 || log "fib: predict --heads fib failed"
+    for n in H V dyad; do [ -e $o/fh/fib/$n ] && ln -sfn fh/fib/$n $o/$n; done; FIBCH=; fi
   for kv in $FIBCH; do n=${kv%%=*}; cs=${kv#*=}; a=${cs%-*}; b=${cs#*-}
     for ch in $(seq $a $b); do d=$o/$n; [ $n = dyad ] && d=$o/dyad/c$ch; [ -e $d/9.6/zarr.json ] && continue
       lkg ${UP:-$U} predict $CK $M $P4K $d --um 2.4 --level 2 --box $BOX --channel $ch --gpu $GPU --threads 6 --cache $WB/cache > $o/predict_c$ch.log 2>&1 || log "fib: predict c$ch failed"; done; done
@@ -94,10 +98,10 @@ if has ink && [ "${INK:-1}" = 1 ] && [ -n "$INKP" ]; then   # INKP = ink3dext | 
       if [ "${BLEND:-0}" = 1 ]; then   # BLEND=1 (lead 2026-11-12): the latent ink head's level steps at window seams (inkB: 10-30 / 255, halo 16..256
         # alike), so two passes on tile grids offset by half the 512 core (--grid-origin, in level-LV voxels) blended with sin^2 weights, as
         # inkB's sched/inkwatch/u1667ink-v2.sh (ink-blend: seam step 16.9 -> 1.3 on a 1299 box); the passes are kept in $v.g0 / $v.g256
-        [ -e $o/pred_$cr.done ] || { for gg in 0 256; do [ -e $v.g$gg/ink/zarr.json ] || lkg ${UP:-$U} predict $CK $M $ctk $v.g$gg --um $um --level $lvi --box $(lbox $box $lvi) --full-grid 1 --levels 1 --heads ink --window 544 --halo 16 --grid-origin $gg,$gg,$gg --gpu $GPU --threads 6 --cache $WB/cache > $o/ink_${cr}_g$gg.log 2>&1 || break; done
+        [ -e $o/pred_$cr.done ] || { for gg in 0 256; do [ -e $v.g$gg/ink/zarr.json ] || lkg ${UP:-$U} predict $CK $M $ctk $v.g$gg --um $um --level $lvi --box $(lbox $box $lvi) --full-grid 1 --levels 1 --heads ink --window 544 --halo 16 --grid-origin $gg,$gg,$gg ${PXH:-} --gpu $GPU --threads 6 --cache $WB/cache > $o/ink_${cr}_g$gg.log 2>&1 || break; done
           [ -e $v.g0/ink/zarr.json ] && [ -e $v.g256/ink/zarr.json ] && mkdir -p $v.h && ${UP:-$U} ink-blend $v.h/ink --um $key --tile 512,512,512 --grids 0,0,0:256,256,256 $v.g0/ink $v.g256/ink --threads 8 > $o/blend_$cr.log 2>&1 && [ -e $v.h/ink/zarr.json ]; } || { log "ink: $cr blended predict failed"; continue; }
       else
-      [ -e $o/pred_$cr.done ] || lkg ${UP:-$U} predict $CK $M $ctk $v.h --um $um --level $lvi --box $(lbox $box $lvi) --full-grid 1 --levels 1 --heads ink --gpu $GPU --threads 6 --cache $WB/cache > $o/ink_$cr.log 2>&1 || { log "ink: $cr predict failed"; continue; }; fi
+      [ -e $o/pred_$cr.done ] || lkg ${UP:-$U} predict $CK $M $ctk $v.h --um $um --level $lvi --box $(lbox $box $lvi) --full-grid 1 --levels 1 --heads ink ${PXH:-} --gpu $GPU --threads 6 --cache $WB/cache > $o/ink_$cr.log 2>&1 || { log "ink: $cr predict failed"; continue; }; fi
     else lvi=${LV_INK:-1}; ch=${INKP#ch:}; key=$(python3 -I -c "print(round($um * 2 ** $lvi, 3))")
       [ -e $o/pred_$cr.done ] || lkg ${UP:-$U} predict $CK $M $ctk $v --um $um --level $lvi --box $(lbox $box $lvi) --full-grid 1 --levels 1 --resume 1 --channel $ch --gpu $GPU --threads 6 --cache $WB/cache > $o/ink_$cr.log 2>&1 || { log "ink: $cr predict failed"; continue; }; fi
     touch $o/pred_$cr.done; [ $PO = 1 ] && continue
