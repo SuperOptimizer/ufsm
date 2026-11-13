@@ -202,6 +202,7 @@ test_ink3d_gambiarra                           | gpu,slow     |   102 | python3 
 test_mx_sw                                     | gpu          |     2 | ./$B/test_mx_sw
 test_mx                                        | gpu          |     3 | ./$B/test_mx
 test_mx4                                       | gpu          |     5 | ./$B/test_mx4
+test_head_tc                                   | gpu          |     3 | UFSM_TEST_QUICK=1 ./$B/test_head_tc
 test_grad_mx4                                  | gpu          |    12 | ./$B/test_grad_mx4
 test_l3_sched                                  | gpu          |     9 | ./$B/test_l3_sched
 test_grad_mx4~L0_NORM=1                        | gpu          |    10 | UFSM_L0_NORM=1 ./$B/test_grad_mx4
