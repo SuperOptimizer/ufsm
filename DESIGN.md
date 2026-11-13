@@ -6,6 +6,24 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Sampler host RAM spikes: the MIL rays' CT box in z slabs, idle workers release their scratch (2026-11-13, branch hostmem-20261113)
+
+perf2's sampler-only runs (P 1024, 2 workers, 1 slot, --ink-mil, 30 GB cap) died after ~50 batches; it looked like slow growth. With the
+hostmem breakdown every 10 batches (b6558dd) and the bigalloc logger it is not: RSS sat flat at 22.8 GB, then rose to 29.7 GB in 15 s on
+one 8.92 GB malloc in inkfly_rays (the face search's CT box). A window drawn at level L+1 gets its rays at level L with o and n doubled, so
+the box is (2 x 1040)^3; every worker can hold one at once. Between spikes: worker big 1.07 -> 2.15 GB (the mask slice touched once),
+arena in use 3.1 -> 4.0 GB, ink caches flat.
+
+- inkfly_rays reads the box in z slabs (UFSM_INKRAY_SLAB_MB, default 256 MB a read: rows of the slab's points + the samples' reach). The
+  samples keep the whole box's coordinates (tri_box_z indexes the slab rows), so the rays are byte-identical; test_ink_splat compares
+  16-row slabs with the whole box.
+- A worker that finds no free slot madvises its scratch (big, ttmp) away and drains its buffer pool before it sleeps (UFSM_IDLE_RELEASE=0
+  off): with W > S only S workers fill at a time. test_idle_release: 3 workers on 1 slot, --det 1, the batchhash lines equal. Measured at
+  P 512, W 4, S 1, 16 batches: worker scratch resident 1.08 -> 0 GB, peak RSS 14.3 vs 14.4 GB (the peak is set by the arena / onfly
+  caches, not the workers, once the warps run on the device), throughput 24 vs 33 Mvox/s (noise of cold caches; no slowdown).
+- Budget at P 1024 with the device warps: sampler-only W 2 S 1 flat at ~23 GB (slot 4.4 GB unsplit, ~3.5 split); the trainer adds
+  ~14.5 GB pinned. S 6 W 6 ~ 37 + 5 x 3.5 + 4 x 2 = 63 GB, inside 85 GB, now that no worker holds an 8.9 GB rays box.
+
 ## Sampler host RAM at P 1024 under --lat --split z: unread targets dropped, a plane bank per slot (2026-11-13, branch hostmem-20261113)
 
 scratch2 (92 M latent net, P 1024 split over both cards, all heads) was OOM-killed in the 104 GB train slice at WORKERS 6 SLOTS 6 (~76 GB
