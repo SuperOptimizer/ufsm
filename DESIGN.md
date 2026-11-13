@@ -41,6 +41,20 @@ Accuracy: test_mx4 256 / 320 ch against the fp32 reference, rel err 0.167 / 0.16
 P 256, --det 1 seed 7, step-1 summed gradient; UFSM_S2B_F4=1 is the old path): the same batch hashes, --det rerun 0, new vs old
 rel 0.037 (cos 0.99932), against the SR noise floor 0.133 (`UFSM_SR_SALT=1`, new: every step's SR seed shifted, the same batches).
 
+**The head slabs' lambda scales inside the gradient kernels** (nn_loss_grad_only_s). Under --uw every head's lambda x source weight differs
+from 1, so each slab ran gscale_k over 21 logit channels after the BCE gradient (22 ms a step at P 512, ~90 per card at the P 1024 half).
+The scale now multiplies the kernel's final product (one fp16 rounding instead of two). 92 M P 256 step-1 gradient vs the separate pass:
+rel < 1e-5, max |d| 3e-8, the same batches.
+
+**The latent cell head on the tensor cores.** --lat-guide 3 makes the head 160 outputs (32 task + 128 sub-cell) from dec0's 256 MX-fp4
+channels; lp_conv1_fwd_mx_h16_r ran conv1_mx_t_k in 10 passes of 16 outputs, each re-reading x with 256 x 16 FFMAs a cell (P 512: 66 ms a
+step at ~5 TFLOP/s). conv1_mx_tc_k does one pass: persistent blocks (one per SM) keep the fp16 weights of all outputs in shared memory
+(160 x 264 halves, 84 KB), walk 128-cell tiles, decode each 32-channel MX block with its GN+SiLU in fp32 (act_ab, as before), round it to
+fp16 and run m16n8k16 MMAs; the next block's x words load during the current block's MMAs. tests/test_head_tc (GN per sample and per
+slab, ranges with tails, 160 / 35 / 17 outputs) against the FFMA path: rel L2 3.9e-4, max 8.6e-4 of max |logit| (the fp16 rounding of
+activations and weights, below the fp16 logits' own), bytes repeat. P 1024 half slab (4 x 256^2 cells, 256 -> 160): 2.87 -> 0.87 ms
+(7.5 -> 24.6 TFLOP/s), 68 calls a step (two passes x 34 slabs): ~135 ms per card. UFSM_HEAD_TC=0: the FFMA passes.
+
 ## Split-window input builders: every --gpu-aug builder by z range, the scanner split exactly across two GPUs (2026-11-13, branch augz-20261112)
 
 ## Muon variants for the from-scratch universal net: ten arms on the 92 M net (2026-11-13, branch muonx-20261113)

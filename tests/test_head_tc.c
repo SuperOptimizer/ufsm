@@ -52,6 +52,27 @@ int main(void) {
         if (ns) lp_gn_slab_reg(mean, 0, 0, 0, 0);
         nn_free(x); nn_free(w); nn_free(b); nn_free(gam); nn_free(bet); nn_free(mean); nn_free(rstd);
     }
+    for (int oc = 0; oc < 3; oc++) {   /* the backward-data: K fp16 logit gradients -> 256 MX-fp4 channels (SR), a slab range, against the FFMA kernel */
+        const int K = oc == 0 ? 160 : oc == 1 ? 35 : 17, D = 12, H = 40, W = 40; const size_t hw = (size_t)H * W, S = D * hw, vb = 3 * hw, nv = 5 * hw + 77;
+        shape5 xs = {1, C, D, H, W};
+        void *gy = nn_malloc((size_t)K * nv * 2); { float *f = dev_vals((size_t)K * nv, 2e-3f, 0.f); nn_f32_to_h16(f, (size_t)K * nv, gy, 1.f); nn_free(f); }
+        float *wt = dev_vals((size_t)K * C, 0.1f, 0.f);
+        void *g0 = nn_malloc(nn_mx4_bytes(xs)), *g1 = nn_malloc(nn_mx4_bytes(xs)), *g2 = nn_malloc(nn_mx4_bytes(xs));
+        for (int q = 0; q < 3; q++) { void *gq = q == 0 ? g0 : q == 1 ? g1 : g2; nn_zero(gq, nn_mx4_bytes(xs)); nn_set_storage(gq, nn_mx4_bytes(xs), 4); }
+        lp_set_head_btc(0); lp_conv1_to_mx_r(gy, 2, 1, K, S, wt, C, g0, 4, 1234u, vb, nv);
+        lp_set_head_btc(1); lp_conv1_to_mx_r(gy, 2, 1, K, S, wt, C, g1, 4, 1234u, vb, nv); lp_conv1_to_mx_r(gy, 2, 1, K, S, wt, C, g2, 4, 1234u, vb, nv);
+        float *d0 = nn_malloc(shape_numel(xs) * 4), *d1 = nn_malloc(shape_numel(xs) * 4);
+        lp_mx4_to_f32(g0, 1, C, S, d0); lp_mx4_to_f32(g1, 1, C, S, d1); nn_sync();
+        float *h0 = malloc(shape_numel(xs) * 4), *h1 = malloc(shape_numel(xs) * 4); nn_d2h(h0, d0, shape_numel(xs) * 4); nn_d2h(h1, d1, shape_numel(xs) * 4);
+        double dd = 0, rr = 0; size_t neq = 0, nn_ = 0;
+        for (size_t i = 0; i < shape_numel(xs); i++) { const double a = h1[i], r = h0[i]; dd += (a - r) * (a - r); rr += r * r; neq += a != r; nn_++; }
+        const double rel = sqrt(dd / (rr > 0 ? rr : 1)); const int ok = rel < 0.05 && rr > 0;   /* (MX-fp4 with SR: an element whose sum moved across a rounding step differs by a step) */
+        printf("  head bwd-data tc %3d -> %d, MX-fp4 SR: rel L2 vs the FFMA kernel %.3e, %.4f of the elements differ  %s\n", K, C, rel, (double)neq / nn_, ok ? "ok" : "FAIL"); fails += !ok;
+        { const size_t nb = nn_mx4_bytes(xs); uint8_t *a = malloc(nb), *c = malloc(nb); nn_d2h(a, g1, nb); nn_d2h(c, g2, nb); const int same = !memcmp(a, c, nb);
+          printf("  %-58s %s\n", "  tensor-core bytes repeat", same ? "ok" : "FAIL"); fails += !same; free(a); free(c); }
+        lp_set_head_btc(-1);
+        free(h0); free(h1); nn_free(d0); nn_free(d1); nn_free(g0); nn_free(g1); nn_free(g2); nn_free(gy); nn_free(wt);
+    }
     if (getenv("UFSM_TEST_QUICK") == nullptr) {   /* timing: one P 1024 split-half head slab (4 cell planes of 256^2), 160 outputs */
         shape5 xs = {1, C, 8, 256, 256}; const size_t hw = 256 * 256, nv = 4 * hw;
         void *x = mx4_of(xs, 3.f); float *w = dev_vals((size_t)160 * C, 0.1f, 0.f), *b = dev_vals(160, 0.2f, 0.f), *gam = dev_vals(C, 0.5f, 1.f), *bet = dev_vals(C, 0.4f, 0.f);
@@ -63,6 +84,18 @@ int main(void) {
             printf("  timing: 4 x 256^2 cells, 256 -> 160, %-14s %7.3f ms (%.1f TFLOP/s)\n", tc ? "tensor cores" : "FFMA passes", best * 1e3, 2.0 * nv * C * 160 / best / 1e12);
         }
         lp_set_head_tc(-1);
+        {   /* the head's backward-data at the same slab: 160 fp16 logit gradients -> 256 MX-fp4 channels (SR) */
+            void *gy = nn_malloc((size_t)160 * nv * 2); { float *f = dev_vals((size_t)160 * nv, 1e-3f, 0.f); nn_f32_to_h16(f, (size_t)160 * nv, gy, 1.f); nn_free(f); }
+            float *wt = dev_vals((size_t)160 * C, 0.1f, 0.f);
+            void *gx = nn_malloc(nn_mx4_bytes(xs)); nn_set_storage(gx, nn_mx4_bytes(xs), 4);
+            for (int tc = 0; tc < 2; tc++) {
+                lp_set_head_btc(tc); double best = 1e9;
+                for (int r = 0; r < 5; r++) { nn_sync(); const double t = now(); lp_conv1_to_mx_r(gy, 2, 1, 160, shape_spatial(xs), wt, C, gx, 4, 77u, 2 * hw, nv); nn_sync(); if (now() - t < best) best = now() - t; }
+                printf("  timing: head backward-data 160 -> 256, %-14s %7.3f ms (%.1f TFLOP/s)\n", tc ? "tensor cores" : "FFMA kernel", best * 1e3, 2.0 * nv * C * 160 / best / 1e12);
+            }
+            lp_set_head_btc(-1);
+            nn_free(gy); nn_free(wt); nn_free(gx);
+        }
     }
     printf(fails ? "FAIL: %d checks\n" : "PASS\n", fails);
     return fails != 0;
