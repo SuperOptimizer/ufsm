@@ -22,9 +22,9 @@ __device__ __forceinline__ void sp_mma4(float *c, const unsigned *a, const unsig
                    "r"(e), "r"(sa), "r"(sb));
 }
 #endif
-/* metadata lane layout (tests/test_sp24_mma.c candidate 0): lane (g, t) holds row g + 8 (t >> 1), groups 8 (t & 1) .. + 7 (nibble q = group) */
-#define SP_MROW(t) (((t) >> 1) * 8)
-#define SP_MHALF(t) ((t) & 1)
+/* metadata lane layout (tests/test_sp24_mma.c: candidate 1 matches on sm_120a): lane (g, t) holds row g + 8 (t & 1), groups 8 (t >> 1) .. + 7 (nibble q = group) */
+#define SP_MROW(t) (((t) & 1) * 8)
+#define SP_MHALF(t) ((t) >> 1)
 
 /* prep: thread per (quad, padded output row, 32-channel chunk). Per tap: the dense prep_w4_k scale and nibbles (the same bits), then
    per 4-byte group the 2 bytes of largest |w0| + |w1| (ties: lower index), in index order */
