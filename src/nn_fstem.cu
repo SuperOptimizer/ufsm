@@ -40,12 +40,14 @@ __device__ inline float fs_pre(const float *W1, const float *b1, int c, const fl
 }
 
 /* the forward on the tensor cores (mma m16n8k16, fp16 x fp16 -> fp32): pre [16 c][8 blocks] = W1 (fp16) x taps per n-tile of a warp, B fragments
-   straight from the staged rows (taps 16 s + 2 t, + 1 of block g: row 4 s + t / 2, a 4-byte pair at 2 (j0 + g) + 2 (t % 2)); h through a
-   per-warp shared tile into the scalar projection and the logits' read-modify-write (lane: block l % 8, outputs l / 8, + 4, ..) */
+   straight from the staged rows (taps 16 s + 2 t, + 1 of block g: row 4 s + t / 2, a 4-byte pair at 2 (j0 + g) + 2 (t % 2)); h of all the
+   tile's blocks into shared memory, then thread j projects block j (W2 . h, the same sums in the same order) and does its 4 logit pairs'
+   read-modify-write per output: a warp's rows are 128 contiguous bytes (perf2 2026-11-13: lanes l % 8 x outputs l / 8 wrote 32-byte pieces
+   from 4 planes at a time, 100 GB/s, 3.7 ms per P 512 32-plane slab with 11 outputs; the loads of an output's 4 rows now go out together) */
 __global__ void __launch_bounds__(FS_BT) fstem_fwd_k(const f16 *__restrict__ x, int D, int H, int W, int z0, int nz, const float *__restrict__ p, int C, int nout, fs_chs chs, f16 *__restrict__ lg, size_t ns) {
     __shared__ __align__(16) float sp[FS_MAXC + FS_MAXO * FS_MAXC];   /* b1, W2 */
     __shared__ __align__(16) __half sr[16][FS_RW];
-    __shared__ float shw[FS_BT / 32][8][FS_FS];
+    __shared__ float hs[FS_BT][FS_FS];
     const int tid = threadIdx.x, lane = tid & 31, wp = tid >> 5, g = lane >> 2, tq = lane & 3;
     for (int k = tid; k < C + nout * C; k += blockDim.x) sp[k] = p[C * FS_T + k];
     const fs_tile t = fs_tile_of(blockIdx.x, z0, H / 2, W / 2);
@@ -58,9 +60,7 @@ __global__ void __launch_bounds__(FS_BT) fstem_fwd_k(const f16 *__restrict__ x, 
     }
     __syncthreads();
     const float *b1 = sp, *W2 = sp + C;
-    const size_t hw = (size_t)H * W;
-    for (int j0 = wp * 8; j0 < t.nj; j0 += FS_BT / 32 * 8) {   /* (FS_BT / 32 warps x 8 blocks: one n-tile per warp and pass; the step was FS_BT, which left blocks 32 .. 127 of
-                                                                   every row tile without the stem, x mod 256 >= 64: fixed 2026-11-11, test_lathead at W 160) */
+    for (int j0 = wp * 8; j0 < t.nj; j0 += FS_BT / 32 * 8) {   /* (FS_BT / 32 warps x 8 blocks: one n-tile per warp and pass) */
         float c4[4] = {0.f, 0.f, 0.f, 0.f};
         const int jb = j0 + g < t.nj ? j0 + g : t.nj - 1;   /* (a tail tile repeats its last block: computed, not written) */
         for (int s_ = 0; s_ < 4; s_++) {
@@ -70,22 +70,24 @@ __global__ void __launch_bounds__(FS_BT) fstem_fwd_k(const f16 *__restrict__ x, 
             mma16816<f16>(c4, af[s_], bf);
         }
         /* c4: pre[c g, g + 8][blocks 2 tq, 2 tq + 1] */
-        for (int r = 0; r < 4; r++) { const int c = g + (r >> 1) * 8, b = 2 * tq + (r & 1); if (c < C) shw[wp][b][c] = fs_silu(c4[r] + b1[c]); }
-        __syncwarp();
-        const int b = lane & 7, j = j0 + b;
-        if (j < t.nj) {
-            const int bx = t.bx0 + j;
-            for (int o = lane >> 3; o < nout; o += 4) {
-                if (chs.c[o] < 0) continue;   /* (an output the caller's planes do not hold) */
-                float v = 0.f; for (int c = 0; c < C; c++) v += W2[o * C + c] * shw[wp][b][c];
-                f16 *pl = lg + (size_t)chs.c[o] * ns;
-                for (int a = 0; a < 2; a++) for (int bb = 0; bb < 2; bb++) {   /* (x pairs: 4-byte aligned, W even) */
-                    __half2 *q = (__half2 *)(pl + (size_t)(2 * t.bz + a - z0) * hw + (size_t)(2 * t.by + bb) * W + 2 * bx); const __half2 o2 = *q;
-                    *q = __floats2half2_rn(__low2float(o2) + v, __high2float(o2) + v);
-                }
-            }
+        for (int r = 0; r < 4; r++) { const int c = g + (r >> 1) * 8, b = 2 * tq + (r & 1); if (c < C && j0 + b < FS_BT) hs[j0 + b][c] = fs_silu(c4[r] + b1[c]); }
+    }
+    __syncthreads();
+    const int j = tid;
+    if (j < t.nj) {
+        const size_t hw = (size_t)H * W; const int bx = t.bx0 + j;
+        float h[FS_MAXC];
+#pragma unroll
+        for (int c = 0; c < FS_MAXC; c++) h[c] = c < C ? hs[j][c] : 0.f;
+        const size_t r0 = (size_t)(2 * t.bz - z0) * hw + (size_t)(2 * t.by) * W + 2 * bx;
+        for (int o = 0; o < nout; o++) {
+            if (chs.c[o] < 0) continue;   /* (an output the caller's planes do not hold) */
+            float v = 0.f; for (int c = 0; c < C; c++) v += W2[o * C + c] * h[c];
+            __half2 *q0 = (__half2 *)(lg + (size_t)chs.c[o] * ns + r0), *q1 = (__half2 *)((f16 *)q0 + W), *q2 = (__half2 *)((f16 *)q0 + hw), *q3 = (__half2 *)((f16 *)q2 + W);
+            const __half2 o0 = *q0, o1 = *q1, o2 = *q2, o3 = *q3;   /* (x pairs: 4-byte aligned, W even) */
+            *q0 = __floats2half2_rn(__low2float(o0) + v, __high2float(o0) + v); *q1 = __floats2half2_rn(__low2float(o1) + v, __high2float(o1) + v);
+            *q2 = __floats2half2_rn(__low2float(o2) + v, __high2float(o2) + v); *q3 = __floats2half2_rn(__low2float(o3) + v, __high2float(o3) + v);
         }
-        __syncwarp();
     }
 }
 /* the backward: per row tile the forward recompute (h, the pre-activation gradient; rows padded against bank conflicts), then the

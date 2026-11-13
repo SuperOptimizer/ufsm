@@ -104,6 +104,32 @@ scratch1's 19 specs that allows 19 GB of host RAM. The sampler-only warm reached
 phase arrays now share dcache_pool_shared("phase"), sized by --onfly-cache-mb or UFSM_ONFLY_CACHE_MB (default 2048). A spec that sets
 its own "cache_mb" keeps a private LRU, as before. The size only changes hit rates: a cell's bytes are the same from memory, from disk
 or computed (test_dcache_batch, test_mesh_phase).
+
+**Single-card profile on pod A, and the fine stem's forward.** Pod A is an RTX PRO 6000 Blackwell MIG 1g.24gb slice, about 1.3-1.5x
+one 5060 Ti. The run is the scratch2 92 M net and heads on the 640^3 wind fixture with ink and fibre, P 512, one card. The labels are
+stored phase sets, so the onfly pair rule is not in this profile. nsys over steps 10-12 shows 1561 ms of kernels per step:
+
+| kernel | ms/step |
+|---|---|
+| conv_fwd_f4_k (3^3 fp4 forward) | 399 |
+| conv_bwd_w_f4ws_k (3^3 weight gradients) | 262 |
+| fstem_fwd_k (the fine stem forward) | 163 |
+| conv1_to_mx_t_k<192> (head backward-data; the TC path is still off) | 62 |
+| lat_up4_k / lat_adj_xy_k | 53 / 39 |
+| fib_head_dir_k | 52 |
+| w4_events_k + w4_runs_k | 52 |
+| loss_grad_k / loss_stats_k | 41 / 23 |
+| conv_fwd_s2_f8_k / conv_bwd_w_s2_f8_k (stride 2) | 35 / 34 |
+| conv_bwd_w1_tc_k (head weight gradients) | 33 |
+
+Same run, 20 steady steps: 1.650 s/step; UFSM_HEAD_TC=0 1.713; UFSM_S2B_F4=1 1.695.
+
+fstem_fwd_k ran at 100 GB/s. Lanes (l % 8, l / 8) wrote 32-byte pieces of 4 output planes at a time, with each read-modify-write
+waiting on its load. Now the warps leave h of all 128 blocks of the row tile in shared memory. Thread j then projects block j (the same
+sums in the same order) and updates its 4 logit pairs per output, so a warp's row is 128 contiguous bytes and the 4 loads go out
+together. tests/bench_fstem (P 512, a 32-plane slab, 11 outputs): 3.68 -> 1.26 ms (306 GB/s). The output hash on random inputs is
+unchanged (byte-identical). test_fstem, test_lathead, test_heads, test_predict_heads and test_fibhead_train pass on the pod. That is
+about 110 ms per step at P 512 on this card, and about 4x that per card at the P 1024 split half.
 ## Split-window input builders: every --gpu-aug builder by z range, the scanner split exactly across two GPUs (2026-11-13, branch augz-20261112)
 
 ## Muon variants for the from-scratch universal net: ten arms on the 92 M net (2026-11-13, branch muonx-20261113)
