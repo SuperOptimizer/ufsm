@@ -29,7 +29,28 @@ against plain Muon, with a block-bootstrap CI (`absum.py`).
 | `--muon-qkv-split 1` | Q / K / V of every head orthogonalised separately (not the fused [3C][C]) | Kimi K2 / MuonClip practice | built; QK-clip needs a logit-max hook in the attention kernels (not yet) |
 | `--muon-tc 1` | the NS products on fp16 tensor cores (wmma, fp32 accumulate) | | built; accuracy test vs fp32 |
 
-Results: pending (the arms land in runs/muonx/runs; table below as they do).
+**Evaluation.** Matched step: training loss over the last 300 steps (the WSD cooldown), paired step for step against Muon (the same
+windows), block-bootstrap 95% CI (`absum.py`). Held-out: each finished arm resumed from its last.ckpt for one lr-0 step with
+`--val-batches 32 --val-live 1` (`evsum.py`; the same 32 windows for every arm, hash 4221f46d; scratch1 has no holdout boxes, so they come from
+the training distribution at val seed + 777). Matched wall time: the wall clock of the arm (`done in`). Converting a loss gap into steps by the
+reference's loss-vs-ln(step) slope does not work here: after step ~300 the per-window training loss is dominated by window difficulty
+(fitted slope over steps 200-1200: +0.017 per ln step, the wrong sign), so a variant that is slower must win at matched steps by more than
+the noise, or run a wall-matched arm.
+
+| arm | wall (x Muon) | train loss vs Muon, last 300 [CI] | val | phase | normal | wind4 | turn acc | ink | verdict |
+|---|---|---|---|---|---|---|---|---|---|
+| muon | 2805 s | 1.6002 | 1.2325 | 0.3618 | 0.2736 | 0.3581 | 0.346 | 0.5800 | reference |
+| kron | 3267 s (1.16x) | -0.0013 [-0.0021, -0.0006] | -0.0016 | +0.0000 | -0.0010 | +0.0006 | -0.003 | -0.0006 | tie at matched steps (-0.1%), 16% slower: no |
+
+(The interim kron gap at steps 411-580, -0.0056, shrank to -0.0013 by the end of the cooldown.)
+
+**QK-clip** (`--qk-clip TAU`, built 2026-11-13): MuonClip rescales W_q, W_k when a head's max logit exceeds tau; with our QK-norm the
+projections' scale cancels, so the clip scales the head's QK-norm gains qg, kg by sqrt(tau / max). The max logit q.k / sqrt(48) per head
+comes from the fp16 tensor-core flash forward (`at_set_lmax`: the row maxima it already keeps, one atomicMax per warp); multi-GPU replicas
+clip by the max over all GPUs. tests/test_qkclip: the hook against a double reference (2 sequences, partial tiles, masked keys) to
+2e-3 relative, the clip exact. Every training log line now carries `qk` (the max logit since the last line). Muon at step 1500 of the
+92 M net: qk 7.0, far below the tau ~100 of the Kimi recipe: QK-norm already bounds the logits, so QK-clip is expected to be inactive
+here unless long runs grow them.
 
 ## The from-scratch net's whole-window field: measured ERF, seams, LR probe (2026-11-13, branch rfwide-20261113)
 

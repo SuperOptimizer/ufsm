@@ -1,0 +1,45 @@
+# batch 1 (1500 steps, paired: --det 1 --seed 7): Muon | each variant alone (muon + kron first: they span the range)
+muon 1500
+kron 1500 --muon-kron 1
+# held-out val of the finished arms (resume last.ckpt, one lr-0 step, 32 val windows, live weights); kronw: kron at muon's wall time (1500 x 0.470 / 0.553)
+evmuon 1501 --resume /vesuvius/ufsm/v2/lat/runs/muonx/runs/muon/last.ckpt --lr 0 --muon-lr 0 --val-batches 32 --val-live 1 --val-every 100000
+evkron 1501 --resume /vesuvius/ufsm/v2/lat/runs/muonx/runs/kron/last.ckpt --muon-kron 1 --lr 0 --muon-lr 0 --val-batches 32 --val-live 1 --val-every 100000
+kronw 1275 --muon-kron 1
+evkronw 1276 --resume /vesuvius/ufsm/v2/lat/runs/muonx/runs/kronw/last.ckpt --muon-kron 1 --lr 0 --muon-lr 0 --val-batches 32 --val-live 1 --val-every 100000
+polar 1500 --muon-ns polar
+evpolar 1501 --resume /vesuvius/ufsm/v2/lat/runs/muonx/runs/polar/last.ckpt --muon-ns polar --lr 0 --muon-lr 0 --val-batches 32 --val-live 1 --val-every 100000
+normuon 1500 --normuon 1
+evnormuon 1501 --resume /vesuvius/ufsm/v2/lat/runs/muonx/runs/normuon/last.ckpt --normuon 1 --lr 0 --muon-lr 0 --val-batches 32 --val-live 1 --val-every 100000
+vr 1500 --muon-vr 0.025
+evvr 1501 --resume /vesuvius/ufsm/v2/lat/runs/muonx/runs/vr/last.ckpt --muon-vr 0.025 --lr 0 --muon-lr 0 --val-batches 32 --val-live 1 --val-every 100000
+muonc 1500 --muon-c 1
+evmuonc 1501 --resume /vesuvius/ufsm/v2/lat/runs/muonx/runs/muonc/last.ckpt --muon-c 1 --lr 0 --muon-lr 0 --val-batches 32 --val-live 1 --val-every 100000
+muon005 1500 --muon-lr 0.005
+evmuon005 1501 --resume /vesuvius/ufsm/v2/lat/runs/muonx/runs/muon005/last.ckpt --lr 0 --muon-lr 0 --val-batches 32 --val-live 1 --val-every 100000
+# batch 2 (1500 steps): each alone
+cautious 1500 --muon-cautious 1
+evcautious 1501 --resume /vesuvius/ufsm/v2/lat/runs/muonx/runs/cautious/last.ckpt --muon-cautious 1 --lr 0 --muon-lr 0 --val-batches 32 --val-live 1 --val-every 100000
+ademamix 1500 --muon-ademamix 5 --ademamix-b3 0.999
+evademamix 1501 --resume /vesuvius/ufsm/v2/lat/runs/muonx/runs/ademamix/last.ckpt --muon-ademamix 5 --ademamix-b3 0.999 --lr 0 --muon-lr 0 --val-batches 32 --val-live 1 --val-every 100000
+qkv 1500 --muon-qkv-split 1
+evqkv 1501 --resume /vesuvius/ufsm/v2/lat/runs/muonx/runs/qkv/last.ckpt --muon-qkv-split 1 --lr 0 --muon-lr 0 --val-batches 32 --val-live 1 --val-every 100000
+scion05 1500 --muon-scale spectral --opt-rest sign --muon-lr 0.05
+evscion05 1501 --resume /vesuvius/ufsm/v2/lat/runs/muonx/runs/scion05/last.ckpt --muon-scale spectral --opt-rest sign --lr 0 --muon-lr 0 --val-batches 32 --val-live 1 --val-every 100000
+# Scion LR transfer: the same lrs at 92 M and at u1 width (16,16,32,64,128,192,256, 7 levels; no attention), Muon at u1 width for the baseline
+scion025 1500 --muon-scale spectral --opt-rest sign --muon-lr 0.025
+evscion025 1501 --resume /vesuvius/ufsm/v2/lat/runs/muonx/runs/scion025/last.ckpt --muon-scale spectral --opt-rest sign --lr 0 --muon-lr 0 --val-batches 32 --val-live 1 --val-every 100000
+scion10 1500 --muon-scale spectral --opt-rest sign --muon-lr 0.1
+evscion10 1501 --resume /vesuvius/ufsm/v2/lat/runs/muonx/runs/scion10/last.ckpt --muon-scale spectral --opt-rest sign --lr 0 --muon-lr 0 --val-batches 32 --val-live 1 --val-every 100000
+u1muon 1500 --widths 16,16,32,64,128,192,256 --attn-blocks 0
+evu1muon 1501 --resume /vesuvius/ufsm/v2/lat/runs/muonx/runs/u1muon/last.ckpt --widths 16,16,32,64,128,192,256 --attn-blocks 0 --lr 0 --muon-lr 0 --val-batches 32 --val-live 1 --val-every 100000
+u1scion025 1500 --widths 16,16,32,64,128,192,256 --attn-blocks 0 --muon-scale spectral --opt-rest sign --muon-lr 0.025
+evu1scion025 1501 --resume /vesuvius/ufsm/v2/lat/runs/muonx/runs/u1scion025/last.ckpt --widths 16,16,32,64,128,192,256 --attn-blocks 0 --muon-scale spectral --opt-rest sign --lr 0 --muon-lr 0 --val-batches 32 --val-live 1 --val-every 100000
+u1scion05 1500 --widths 16,16,32,64,128,192,256 --attn-blocks 0 --muon-scale spectral --opt-rest sign --muon-lr 0.05
+evu1scion05 1501 --resume /vesuvius/ufsm/v2/lat/runs/muonx/runs/u1scion05/last.ckpt --widths 16,16,32,64,128,192,256 --attn-blocks 0 --muon-scale spectral --opt-rest sign --lr 0 --muon-lr 0 --val-batches 32 --val-live 1 --val-every 100000
+u1scion10 1500 --widths 16,16,32,64,128,192,256 --attn-blocks 0 --muon-scale spectral --opt-rest sign --muon-lr 0.1
+evu1scion10 1501 --resume /vesuvius/ufsm/v2/lat/runs/muonx/runs/u1scion10/last.ckpt --widths 16,16,32,64,128,192,256 --attn-blocks 0 --muon-scale spectral --opt-rest sign --lr 0 --muon-lr 0 --val-batches 32 --val-live 1 --val-every 100000
+# long arms (4000 steps)
+muon4k 4000
+evmuon4k 4001 --resume /vesuvius/ufsm/v2/lat/runs/muonx/runs/muon4k/last.ckpt --lr 0 --muon-lr 0 --val-batches 32 --val-live 1 --val-every 100000
+hb4k 4000 --hyperball 1
+evhb4k 4001 --resume /vesuvius/ufsm/v2/lat/runs/muonx/runs/hb4k/last.ckpt --hyperball 1 --lr 0 --muon-lr 0 --val-batches 32 --val-live 1 --val-every 100000
