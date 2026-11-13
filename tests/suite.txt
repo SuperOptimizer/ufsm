@@ -230,6 +230,7 @@ test_json                                      |              |     1 | ./$B/tes
 test_phasepack                                 |              |     3 | ./$B/test_phasepack
 test_nn                                        | gpu          |    15 | ./$B/test_nn
 test_unet                                      | gpu          |     3 | ./$B/test_unet
+test_unet~narrow                               | gpu          |     5 | UFSM_P=32 UFSM_ACT_MX8=1 UFSM_GRAD_MX8=1 UFSM_LEAN=2 UFSM_CHUNK_UP=2 UFSM_BIG_WIDTHS=32,64,96,64 UFSM_GRAD_TOL=0.5 ./$B/test_unet
 test_unet~SCALE_COND=1                         | gpu          |     3 | UFSM_SCALE_COND=1 ./$B/test_unet
 test_unet~FILM=2                               | gpu          |     3 | UFSM_FILM=2 ./$B/test_unet
 test_unet~DS=1                                 | gpu          |     4 | UFSM_DS=1 ./$B/test_unet

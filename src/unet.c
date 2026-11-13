@@ -1456,6 +1456,13 @@ static void build_acts(unet *u, shape5 xs, int train) {
                     shape5 up = u->ls[i]; up.c = UPW(i + 1);
                     size_t ub = nn_mx_bytes(up, grad_dt()); if (ub > gob) gob = ub;
                 }   /* optional full finest-level up gradient; the chunk loop still defers the aliased skip write */
+                if (u->nob && i > 0) {   /* block_bwd writes enc[i]'s input gradient (the down conv's output: w[i - 1] channels) in place over gy, this
+                                            level's gout: a level narrower than the one above (scratch2 widths ..,448,288,..: level 4) overran it
+                                            into the next buffer (2026-11-13, perf2: gout[4] 626,688 B, the 448-channel gradient 974,848 B, its
+                                            tail over gout[3] = gskip[3], the down3 backward-data's accumulate target, in the coarse-gradient share) */
+                    shape5 si = u->ls[i]; si.c = w[i - 1];
+                    const size_t ib = gmx ? nn_mx_bytes(si, grad_dt()) : shape_numel(si) * (GBF ? 2 : 4); if (ib > gob) gob = ib;
+                }
                 if (lg_gout && i == 0) gob += 4096;   /* alignment slack: [fp16 logits | ... | batch] (unet_batch_scratch) */
                 gobs[i] = gob;
             }
@@ -1616,6 +1623,7 @@ static void build_acts(unet *u, shape5 xs, int train) {
             shape5 li = u->ls[i];
             size_t S = shape_spatial(li);
             int wmax = i < L - 1 ? w[i] + UPW(i + 1) : w[i];
+            if (i > 0 && w[i - 1] > wmax) wmax = w[i - 1];   /* (B: enc[i]'s input gradient, w[i - 1] channels) */
             if (i == 0 && u->cfg.cin > wmax) wmax = u->cfg.cin;
             size_t nb = (size_t)li.n * wmax * S, nw = (size_t)li.n * w[i] * S;
             u->gA[i] = dalloc_grad(u, nb); u->gB[i] = dalloc_grad(u, nb);
@@ -3271,6 +3279,10 @@ static float *block_bwd_(unet *u, block *b, int level, const float *gy, float *g
     else PROF(2, nn_conv3d_bwd_weight(b->in, b->xs, A, b->ys, 3, 1, g + b->c1.w, g + b->c1.b));
     if (b != &u->enc[0] || !nn_get_tf32())   /* the network-input gradient of enc0 is never used */
     { sp_end(u, A, b->ys, 1);
+      if (u->nob && nn_get_tf32() && nn_storage(B) && level < UNET_MAXLEV && B == u->gout[level] && u->gout_cap[level]) {   /* (in place over this level's gout: it must hold the input gradient) */
+          const size_t xb = nn_mx_bytes(b->xs, nn_storage(B));
+          if (xb > u->gout_cap[level]) { fprintf(stderr, "unet: level %d's input gradient (%zu B, %d channels) overruns its gradient buffer (%zu B)\n", level, xb, b->xs.c, u->gout_cap[level]); abort(); }
+      }
       PROF(1, nn_conv3d_bwd_data(A, b->ys, P(u, b->c1.w), b->xs, 3, 1, B, u->conv_scratch));            /* B = d/d in */
         FQG(B, b->xs); }
     if (gi.G) {   /* down_norm: back through silu(gn(.)) of the down-conv output -> B = d/d inx */
