@@ -46,10 +46,19 @@ whole windows with `--gpu-aug 3` (det_cmp: batch hashes and device inputs; 2 pla
 (batch hashes, losses within 2%; 4 planes for 6 roles), 8 batches each, identical.
 
 Budget (model, not run): RSS ~ 15 + T + 5.4 S + 5.4 W GB (T: the trainer's pinned label-stream / a1 offload buffers, ~11 GB est.),
-W = S - 2 useful workers on two GPUs: S 6 W 4 ~ 80 GB, where the old layout fitted S 3.
+W = S - 2 useful workers on two GPUs: S 6 W 4 ~ 80 GB, where the old layout fitted S 3; with the device warps below (slot ~3.5 GB)
+S 8 W 6 ~ 86 GB, S 7 W 5 ~ 77 GB.
 
-Not done (not bit-identical): `--gpu-aug 2/3` under the split when the targets are unused (the z-range builders exist since augz):
-w4 runs and ink bits (-2.9 GB/slot more) and no host label warps; the device warp equals the host warp to <= 1e-4 of the voxels.
+**Device label warps under the split** (ec7a98b, lead-approved: not byte-identical). `--gpu-aug 2/3` now holds under `--lat --split z`
+when the unpacked targets are unused (`sample_gpu_lwarp_ok`: packed targets or slot_skip 4; UFSM_SPLIT_LWARP=0 keeps the host warps).
+Warped windows keep source-grid labels in the slot, which the augz z-range builders warp on the device (nn_label_warp_z,
+nn_w4runs_label_z, nn_ink_bits_z) on the copy stream inside the uploads. Tolerance: the device warp equals the CPU warp
+to <= 1e-4 of the voxels per plane (test_gpu_aug), as on every non-split `--gpu-aug 2` run; the z-range builders equal the whole-window
+ones byte for byte (test_aug_z). CT bytes, scanner records and radial records are unchanged (same RNG stream).
+- Slot: w4 runs (-2 planes), ink bits (the papyrus plane at 1 bit), bank 4 -> 2 planes: P 256 sampler-only 3.2 B/vox, ~3.5 GB at P 1024.
+- Worker: the host label warps are gone (augment stage 1063 -> 11 ms CPU per P 256 window).
+- The planner already counted the split's aug staging for `--gpu-aug 2`.
+- test_slot_planes: a split run with the device warps; CT bytes exact, losses within 2% of the host-warp run.
 
 ## Split-window input builders: every --gpu-aug builder by z range, the scanner split exactly across two GPUs (2026-11-13, branch augz-20261112)
 
