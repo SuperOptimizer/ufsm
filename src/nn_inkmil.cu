@@ -173,7 +173,7 @@ extern "C" int ink_mil_fin(float *acc, const inkray *rays, int nr, int D, int H,
     if (mgrow(0, (size_t)nr * sizeof(double))) return -1;
     k_fin<<<(nr + 127) / 128, 128, 0, (cudaStream_t)stream>>>(acc, rays, nr, K, D, H, W, R, step, tau, eps, scale, (double *)t_ms.p[0]);
     k_sum_fixed<<<1, 256, 0, (cudaStream_t)stream>>>((const double *)t_ms.p[0], nr, loss);
-    if (g_mil_async < 0) g_mil_async = getenv("UFSM_MIL_ASYNC") && atoi(getenv("UFSM_MIL_ASYNC")) > 0;   /* UFSM_MIL_ASYNC=1: the plane bound (default off until test_ink_mil has run it on a GPU) */
+    if (g_mil_async < 0) g_mil_async = !(getenv("UFSM_MIL_ASYNC") && !atoi(getenv("UFSM_MIL_ASYNC")));   /* UFSM_MIL_ASYNC=0: the per-slab readback (the plane bound is the default since test_ink_mil passed byte for byte on the pod) */
     t_ph.dz = nullptr;
     if (g_mil_async) {
         if (t_ph.cap < D + 1) {   /* hist[D + 1] (the last corner plane) + the overflow word */

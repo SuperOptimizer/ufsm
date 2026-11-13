@@ -53,7 +53,10 @@ step at ~5 TFLOP/s). conv1_mx_tc_k does one pass: persistent blocks (one per SM)
 fp16 and run m16n8k16 MMAs; the next block's x words load during the current block's MMAs. tests/test_head_tc (GN per sample and per
 slab, ranges with tails, 160 / 35 / 17 outputs) against the FFMA path: rel L2 3.9e-4, max 8.6e-4 of max |logit| (the fp16 rounding of
 activations and weights, below the fp16 logits' own), bytes repeat. P 1024 half slab (4 x 256^2 cells, 256 -> 160): 2.87 -> 0.87 ms
-(7.5 -> 24.6 TFLOP/s), 68 calls a step (two passes x 34 slabs): ~135 ms per card. UFSM_HEAD_TC=0: the FFMA passes.
+(7.5 -> 24.6 TFLOP/s), 68 calls a step (two passes x 34 slabs): ~135 ms per card. UFSM_HEAD_TC=0: the FFMA passes. The backward-data (c1b_wh_k + conv1_to_mx_tc_k: 64 cells x 256 outputs a block, K in 32-chunks,
+the MX4 epilogue through per-warp shared tiles) on the pod: rel L2 7.7e-3 against the FFMA kernel after the MX-fp4 SR (0.02 % of the
+elements differ), bytes repeat; the P 1024 half slab 160 -> 256: 7.61 -> 1.12 ms (2.8 -> 19.2 TFLOP/s), 34 slabs a step: ~220 ms per
+card. Default on (UFSM_HEAD_BTC=0: the FFMA kernel).
 
 
 **The MIL backward without a sync per slab.** ink_mil_bwd_slab read its slab's (voxel, sample) pair count back with a
@@ -63,8 +66,8 @@ ink_mil_fin also queues one histogram of pairs per corner plane (no w == 0 test,
 the first backward slab waits for that event once per step, each slab sorts the bound of its planes (one plane of margin on each side)
 with the unused tail filled by a key that sorts last, and k_runs reads the true count on the device: the sorted prefix and the sums are
 the ones of the readback path. A bound exceeded on the device (not expected) is reported by the next step's first slab. tests/test_ink_mil
-checks both paths byte for byte at 1 / 3 / 7 slabs, soft and hard. Default off (UFSM_MIL_ASYNC=1) until that test has run on a GPU;
-ink_mil_set_async() for tests.
+checks both paths byte for byte at 1 / 3 / 7 slabs, soft and hard: ok on the pod (RTX PRO 6000 MIG slice), so the plane bound is the
+default (UFSM_MIL_ASYNC=0: the readback); ink_mil_set_async() for tests.
 
 **The gradient sum in halves, both directions at once.** After each step train.c summed the two GPUs' fp32 gradients by copying
 all of GPU 1's gradient to GPU 0 with cudaMemcpyPeer (no P2P on the desk, so it is staged through the host and the host blocks),
