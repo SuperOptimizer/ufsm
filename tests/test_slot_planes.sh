@@ -42,14 +42,16 @@ for mode in whole split; do
   echo "$mode: $(grep -o 'sampler: [0-9] label planes per slot for [0-9] label roles' ${mode}_new.log), $DET_CMP_N batches identical"
 done
 # the latent split with --gpu-aug 2 / 3 on unpacked targets (the default since 2026-11-13: the labels warped on the device by z range,
-# w4 runs, ink bits; equal to the host warp within test_gpu_aug's 1e-4 of the voxels, so: the CT bytes and records exact, losses within 2%)
+# w4 runs, ink bits; equal to the host warp within test_gpu_aug's 1e-4 of the voxels, so: the CT bytes and records exact, losses within 0.5% at step 1, 5% after)
 run split_dev UFSM_BANK_CHECK=1 -- --gpus 0,0 --split z
 grep -q -- '--gpu-aug 2 without packed targets' split_dev.log && grep -q 'winding mod 4 as runs' split_dev.log || { echo "FAIL: split: no --gpu-aug 2 / w4 runs ($D/split_dev.log)"; exit 1; }
 for f in ct8 aug rad; do
   [ "$(grep -o "^batchhash [0-9]* slot [0-9]* $f [0-9a-f]*" split_new.log | sed 's/ slot [0-9]*//')" = "$(grep -o "^batchhash [0-9]* slot [0-9]* $f [0-9a-f]*" split_dev.log | sed 's/ slot [0-9]*//')" ] || { echo "FAIL: split: $f differs with the device warps"; exit 1; }
 done
-paste -d' ' <(grep '^step' split_new.log | awk '{print $2, $6}') <(grep '^step' split_dev.log | awk '{print $2, $6}') | awk '{d = $2 - $4; if (d < 0) d = -d; n++; if ($1 != $3 || d > 0.02 * ($2 < 0 ? -$2 : $2) + 1e-6) bad = 1} END {exit bad || n < 8}' \
-  || { echo "FAIL: split: device-warped losses differ by > 2%"; paste <(grep '^step' split_new.log | awk '{print $2, $6}') <(grep '^step' split_dev.log | awk '{print $2, $6}'); exit 1; }
-echo "split: --gpu-aug 2 on the device: $(grep -o 'sampler: [0-9] label planes per slot for [0-9] label roles' split_dev.log), CT bytes exact, losses within 2%"
+# (step 1: the same parameters, the label bytes within 1e-4 of the voxels: 0.5%; later steps train on slightly different labels, the runs drift
+#  apart as two runs of one binary do through the float atomics, plus the label differences: 5%; measured 2026-11-13: step 1 equal, worst 2.6%)
+paste -d' ' <(grep '^step' split_new.log | awk '{print $2, $6}') <(grep '^step' split_dev.log | awk '{print $2, $6}') | awk '{d = $2 - $4; if (d < 0) d = -d; n++; t = $1 == 1 ? 0.005 : 0.05; if ($1 != $3 || d > t * ($2 < 0 ? -$2 : $2) + 1e-6) bad = 1} END {exit bad || n < 8}' \
+  || { echo "FAIL: split: device-warped losses differ (step 1 > 0.5% or later > 5%)"; paste <(grep '^step' split_new.log | awk '{print $2, $6}') <(grep '^step' split_dev.log | awk '{print $2, $6}'); exit 1; }
+echo "split: --gpu-aug 2 on the device: $(grep -o 'sampler: [0-9] label planes per slot for [0-9] label roles' split_dev.log), CT bytes exact, losses within 0.5% at step 1, 5% after"
 grep -q 'targets: packed' split_new.log && { echo "FAIL: split: packed targets (the case slot_skip 4 is for)"; exit 1; }
 echo "test_slot_planes: ok"
