@@ -1217,7 +1217,9 @@ static int ffz_json(const char *p, const int64_t bo[3], const int64_t bn[3], con
     for (int64_t z = 0; z <= bn[0]; z++) { double cy = 0, cx = 0; if (ax->n) axis_at(ax, (double)(bo[0] + z) * (1 << level), &cy, &cx); fprintf(f, "%s[%.3f, %.3f]", z ? ", " : "", cy / (1 << level) - bo[1], cx / (1 << level) - bo[2]); }
     fprintf(f, "]}\n"); return fclose(f) ? 1 : 0;
 }
+int predict_seamless(int argc, char **argv);   /* src/seamless.c */
 static int predict_one(int argc, char **argv) {
+    if (*opt(argc, argv, "--seamless", "") && strcmp(opt(argc, argv, "--seamless", ""), "0") && !getenv("UFSM_SEAM_CHILD")) return predict_seamless(argc, argv);
     /* UFSM_PRED_DEVREAD=1: the CT windows decoded on the GPU into device memory (volcomp's GPU decoder, byte-identical): turned on here,
        before the first z3 read opens the decoder, on the predict GPU */
     const int devread = ufsm_env_on("UFSM_PRED_DEVREAD");
@@ -1234,6 +1236,8 @@ static int predict_one(int argc, char **argv) {
                         "       [--input-gain G] [--input-bias B]   CT = G * zscore(CT) + B; radial inputs and material mask unchanged\n"
                         "       [--gpus 0,1]   one worker per GPU over the shards of the same output (needs --box)\n"
                         "       [--split z --gpus 0,1]   both GPUs on every window, one z half each (window a multiple of 2^levels; default window shard + 128, halo 64)\n"
+                        "       [--seamless 2]   seam-free: two passes on tile grids offset by half a tile, sin^2-blended (latent nets' per-window level;\n"
+                        "                       window - 2 halo a multiple of 256, default 544 / 16; --gpus A,B runs the passes at once; src/seamless.c)\n"
                         "       [--feather B]   seam-free single pass: each window border blended over B voxels (sin^2 ramp, B <= halo) from the earlier\n"
                         "                       windows' halo predictions; window - 2 halo = k * shard on the shard grid; --gpus deal contiguous z layers\n"
                         "       [--channel 0]   output channel written (band_affinity checkpoints: 1..6 = affinities z1 y1 x1 z8 y8 x8; ink: a task unwrap2 --ink-head\n"

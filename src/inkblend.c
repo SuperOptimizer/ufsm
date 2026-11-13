@@ -2,6 +2,7 @@
 #include "sysinfo.h"
 #include "fblend.h"
 #include "fit.h"
+#include "inkblend.h"
 #include "pyramid.h"
 #include "store.h"
 #include "z3w.h"
@@ -58,6 +59,13 @@ int cmd_ink_blend(int argc, char **argv) {
     if (origins) { int k = 0; char *t = strdup(origins);
       for (char *q = strtok(t, ":"); q; q = strtok(nullptr, ":")) { long long a, b, c; if (k < 32 && sscanf(q, "%lld,%lld,%lld", &a, &b, &c) != 3) { free(t); fprintf(stderr, "ink-blend: --origins z,y,x:...\n"); return 2; } if (k < 32) { org[k][0] = a; org[k][1] = b; org[k][2] = c; } k++; }
       free(t); if (k != n) { fprintf(stderr, "ink-blend: %d origins for %d inputs\n", k, n); return 2; } }
+    return ink_blend_run(out, um, st, n, in, g, org, nlev, S, q, nt, "{\"ufsm\":{\"content\":\"ink probability (ink-blend of overlapping predicts)\"}}");
+}
+
+/* the blend itself (ink-blend; predict --seamless): n uint8 probability groups (level named by um) on overlapping tile grids (tile st,
+   grid offsets g, level voxels; input voxel + org = output voxel) -> out/<um> + nlev - 1 mean-pooled levels, shards of S, volcomp q */
+int ink_blend_run(const char *out, double um, const double st[3], int n, const char *const *in, const double (*g)[3], const int64_t (*org)[3],
+                  int nlev, int S, double q, int nt, const char *attrs) {
     char lv[32]; z3w_level_name(um, lv, sizeof lv);
     store *ss[32]; z3 *zz[32]; int64_t shape[3] = {0, 0, 0}, ish[32][3];
     for (int i = 0; i < n; i++) {
@@ -66,7 +74,6 @@ int cmd_ink_blend(int argc, char **argv) {
         const z3_meta *m = z3_meta_of(zz[i]);
         for (int d = 0; d < 3; d++) { ish[i][d] = m->shape[d]; if (org[i][d] + m->shape[d] > shape[d]) shape[d] = org[i][d] + m->shape[d]; }   /* the output covers every input */
     }
-    const char *attrs = "{\"ufsm\":{\"content\":\"ink probability (ink-blend of overlapping predicts)\"}}";
     char odir[1400]; snprintf(odir, sizeof odir, "%s/%s", out, lv);
     z3w *w = z3w_create(odir, shape, S, (float)q, 0, attrs);
     if (!w) { fprintf(stderr, "%s\n", z3w_error()); return 1; }
