@@ -129,7 +129,8 @@ endif()
 # NaN / inf stay honoured (no -ffinite-math-only: the NaN guards in the loss and fwd_nan paths must survive). Checked 2026-11-13:
 # the float instruction kinds in the PTX match nvcc -use_fast_math (div.approx.ftz, sqrt.approx.ftz, ex2.approx.ftz, fma.rn.ftz).
 # ("SHELL:" groups: CMake de-duplicates repeated options, which would drop the second -Xarch_device)
-set(UFSM_CU_FAST -fgpu-flush-denormals-to-zero -fgpu-approx-transcendentals "SHELL:-Xarch_device -fapprox-func"
+# UFSM_DEVICE_FAST_MATH: the rest of nvcc's fast-math intrinsic mapping (expf -> __expf ..., src/clang_cuda_compat.cuh)
+set(UFSM_CU_FAST -DUFSM_DEVICE_FAST_MATH -fgpu-flush-denormals-to-zero -fgpu-approx-transcendentals "SHELL:-Xarch_device -fapprox-func"
     "SHELL:-Xarch_device -ffp-contract=fast")
 # byte-identical to their CPU versions: IEEE division / sqrt, no FMA contraction, no flush (nvcc -fmad=false, no fast math).
 # clang leaves libdevice's __CUDA_PREC_SQRT reflection at 0, so sqrtf would be sqrt.approx.f32 even without fast math (nvcc:
