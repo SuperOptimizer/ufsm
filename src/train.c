@@ -3326,7 +3326,8 @@ int cmd_train(int argc, char **argv) {
                         pick_need / 1e9, fmin / 1e9, (double)pick_need / (double)vox, upb / 1e9, pick_off / 1e9, (double)pick_off / (double)vox,
                         fastest || !pick_off ? "" : "; --mem fast skips them where the window fits without");
             }
-            g_plan_spare = pick >= 0 && fmin > pick_need ? fmin - pick_need : 0;
+            g_plan_spare = pick >= 0 && pick_need > 0 && fmin > pick_need ? fmin - pick_need : 0;   /* (no mode fit, "trying" the smallest: no spare. 2026-11-13: pick_need 0 there
+                                                                                                    made the whole free memory "spare", the label planes then took 6.7 GB of it and the trainer OOMed) */
             unet_set_host_offloads(pick_hoff);
             unet_set_chunk_up(cand[pick].chunk); unet_set_recompute(cand[pick].rc); unet_set_grad_mx8(cand[pick].gmx); unet_set_lean(cand[pick].lean); unet_set_share_enc_a1(cand[pick].sea || (pick_hoff && sea_force));
             unet_set_l0_3buf(cand[pick].l3);
