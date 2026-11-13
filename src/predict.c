@@ -1244,6 +1244,46 @@ static z3 *pn_open(void *ctx, int l) {
     if (!c->z[l]) c->z[l] = pyramid_open_level(c->s, c->key, l, c->um, c->cache);
     return c->z[l];
 }
+/* UFSM_SKIP_AB=1 with --skip-empty 1 (DESIGN 2026-11-13 "empty-space skipping"): per window the trunk forward dense (masks paused) and
+   masked, timed (synchronised), their cell-grid logits compared on the material cells (a CT voxel >= 64, the papyrus iso) and the
+   others: mean |d| over mean |logit|, max |d|, the share of bit-identical values. The CT window (ctd: the forward's scratch) restored */
+static void skip_ab(unet *u, const void *x2, shape5 xn, int h16, uint8_t *ctd, int Wz, int W, int cout) {
+    const size_t w3 = (size_t)Wz * W * W, cv = w3 / 64; const int C = cout < 16 ? cout : 16, Hc = W / 4;
+    uint8_t *hct = malloc(w3); uint8_t *mat = malloc(cv); nn_sync(); nn_d2h(hct, ctd, w3);
+    for (size_t c = 0; c < cv; c++) mat[c] = 0;
+    for (int z = 0; z < Wz; z++) for (int y = 0; y < W; y++) for (int x = 0; x < W; x++) if (hct[((size_t)z * W + y) * W + x] >= 64) mat[((size_t)(z / 4) * Hc + y / 4) * Hc + x / 4] = 1;
+    const int lh = unet_logits_h16(u) != 0; const size_t es = lh ? 2 : 4, nb = (size_t)C * cv * es;
+    uint8_t *A = malloc(nb), *Bm = malloc(nb); double t[2];
+    const int lay = getenv("UFSM_SKIP_AB") && atoi(getenv("UFSM_SKIP_AB")) >= 2;   /* UFSM_SKIP_AB=2: per-conv forward ms (UFSM_PROF layers) */
+    static double (*pl)[UNET_NSLOT][3]; static double pc[2][8]; if (lay && !pl) pl = calloc(2, sizeof *pl);
+    /* UFSM_SKIP_AB_FREEZE=1: the masked pass normalises with the dense pass's GroupNorm statistics (unet_gn_freeze): a live-GroupNorm net
+       measured as a gn_ema net would be (fixed statistics: the fill cannot move them) */
+    const int frz = ufsm_env_on("UFSM_SKIP_AB_FREEZE"); float *gst = nullptr;
+    for (int k = 0; k < 2; k++) {
+        nn_skip_pause(k == 0); if (k) nn_h2d(ctd, hct, w3);
+        if (k && frz) { gst = malloc(unet_gn_nstats(u) * sizeof *gst); if (gst && !unet_gn_stats_get(u, gst)) unet_gn_freeze(u, gst); }
+        if (lay) { unet_prof_layers_on(1); double junk[UNET_NSLOT][3]; nn_sync(); unet_prof_layers(junk); }
+        nn_sync(); const double t0 = now(); const float *l = unet_forward_x(u, x2, xn, 0, h16); nn_sync(); t[k] = now() - t0;
+        if (lay) { unet_prof_layers(pl[k]); unet_prof_cats(pc[k]); unet_prof_layers_on(0); }
+        nn_d2h(k ? Bm : A, l, nb);
+    }
+    if (lay) {
+        fprintf(stderr, "skip A/B layers: categories dense / masked ms:"); for (int i = 0; i < 8; i++) if (pc[0][i] + pc[1][i] > 0) fprintf(stderr, " [%d] %.2f / %.2f", i, pc[0][i], pc[1][i]); fprintf(stderr, "\n");
+        for (int i = 0; i < UNET_NSLOT; i++) if (pl[0][i][0] + pl[1][i][0] > 0.05) { char nm[16]; nn_layer_name(i / 2, nm); fprintf(stderr, "skip A/B layers:   %-8s%s fwd %.2f / %.2f ms\n", nm, i % 2 ? ".c2" : ".c1", pl[0][i][0], pl[1][i][0]); }
+    }
+    if (gst) { unet_gn_freeze(u, nullptr); free(gst); }
+    nn_skip_pause(0); nn_h2d(ctd, hct, w3);
+    double e[2] = {0, 0}, m[2] = {0, 0}, mx[2] = {0, 0}; size_t n[2] = {0, 0}, same[2] = {0, 0}, flip[2] = {0, 0}, nm = 0;
+    for (size_t i = 0; i < (size_t)C * cv; i++) {
+        const double a = lh ? (double)((const _Float16 *)A)[i] : (double)((const float *)A)[i], b = lh ? (double)((const _Float16 *)Bm)[i] : (double)((const float *)Bm)[i];
+        const int k = mat[i % cv] ? 0 : 1; const double d = fabs(a - b); e[k] += d; m[k] += fabs(a); if (d > mx[k]) mx[k] = d; n[k]++; same[k] += a == b; flip[k] += (a > 0) != (b > 0);
+    }
+    for (size_t c = 0; c < cv; c++) nm += mat[c];
+    fprintf(stderr, "skip A/B: trunk %.3f s dense, %.3f s masked (%.1f%% faster); L0 active %.3f, material cells %.3f; material: mean |d| / mean |logit| %.5f, max |d| %.4g, "
+            "identical %.4f, sign flips %.4f; other cells: %.5f, max %.4g, identical %.4f, sign flips %.4f\n", t[0], t[1], 100 * (1 - t[1] / t[0]), nn_skip_share(0), (double)nm / cv,
+            m[0] > 0 ? e[0] / m[0] : 0, mx[0], n[0] ? (double)same[0] / n[0] : 0, n[0] ? (double)flip[0] / n[0] : 0, m[1] > 0 ? e[1] / m[1] : 0, mx[1], n[1] ? (double)same[1] / n[1] : 0, n[1] ? (double)flip[1] / n[1] : 0);
+    free(hct); free(mat); free(A); free(Bm);
+}
 int cmd_predict(int argc, char **argv) {
     const char *bf = opt(argc, argv, "--boxes", nullptr);
     if (!bf) return predict_one(argc, argv);
@@ -1447,6 +1487,11 @@ static int predict_one(int argc, char **argv) {
     /* --tta K: the fit fields averaged over K window symmetries (src/tta.h; identity first; the probability output is then the last pass);
        without --fit-*: the probability output itself is the mean of the K passes' probabilities (fp16 accumulator, 2 B per window voxel) */
     const int tta = atoi(opt(argc, argv, "--tta", "1"));
+    /* --skip-empty 1 (DESIGN 2026-11-13 "empty-space skipping", nn.h nn_skip_build): a latent-grid net's wide convs leave the 8^3-cell tiles
+       with no CT voxel above --skip-thr (default 40, under the papyrus iso 64; air noise stays below it), dilated by --skip-margin tiles per
+       level (default 1), at their bias. An approximation (the net's air outputs are not constant): measured against the dense path there */
+    const int skip_empty = atoi(opt(argc, argv, "--skip-empty", "0")), skip_thr = atoi(opt(argc, argv, "--skip-thr", "40")), skip_margin = atoi(opt(argc, argv, "--skip-margin", "1"));
+    long skip_wins = 0, skip_masked = 0, skip_calls = 0; double skip_share0 = 0;
     const int fea = atoi(opt(argc, argv, "--feather", "0"));   /* --feather B (above) */
     if (tta < 1 || tta > TTA_MAX) { fprintf(stderr, "predict: --tta 1..%d\n", TTA_MAX); return 2; }
     if (tta > 1 && ffct) { fprintf(stderr, "predict: --tta with --fit-ct is not supported (the CT planes pool one pass); add them later with ufsm ct-fields\n"); return 2; }
@@ -2540,7 +2585,11 @@ static int predict_one(int argc, char **argv) {
                 else if (latin) nn_lat_pred_input(ctd, Wz, W, (float)mean, (float)(1.0 / sd), dyd, dxd, ax.n > 0 ? (int)radial_sign : 0, x2);
                 else nn_lowres_input(xd, xs, hdiv, hmode, lrt, x2, h16);
                 nn_ptick("input pool");
+                const int skw = skip_empty && half == 3 && ctd && gpath && !lat_store && !lvq;   /* (the CT window in ctd until the forward) */
+                if (skw && !nn_skip_build(ctd, Wz, W, W, 4, cfg.nlev, skip_thr, skip_margin)) { skip_wins++; if (ufsm_env_on("UFSM_SKIP_REPORT")) skip_share0 += nn_skip_share(0); }
+                if (skw && ufsm_env_on("UFSM_SKIP_AB")) skip_ab(u, x2, xn, h16, ctd, Wz, W, cfg.cout);   /* the dense / masked A/B of this window */
                 const float *l2 = unet_forward_x(u, x2, xn, 0, h16); nn_ptick("trunk forward");
+                if (skw) { long m_, c_; nn_skip_counts(&m_, &c_); skip_masked += m_; skip_calls += c_; nn_skip_off(); }
                 /* train --fstem: the fine voxel stem on the CT channel (xd channel 0) into the planes the path holds: output o of the stem's list
                    (every non-normal / density head output, in channel order) to plane MAP(c) of its channel c (-1: not held) */
 #define PRED_FSTEM(z0_, nz_, planes, ns__, MAP) do { if (fstem_off) break; int fm_[16], k_ = 0; for (int c = 0; c < cfg.cout && k_ < cfg.fstem_out; c++) if (c < 2 || c >= 9) { fm_[k_++] = (MAP); } \
@@ -2968,6 +3017,8 @@ static int predict_one(int argc, char **argv) {
     if (pyramid_write_group(out, um_l, gpyr ? PH[0].pya->nlev : nlev, "ufsm-recto", attrs)) return 1;
     }
     fprintf(stderr, "wrote %s (%ld tiles in %.0fs)\n", out, ntiles, now() - t0);
+    if (skip_empty) fprintf(stderr, "predict: --skip-empty: %ld windows masked (thr %d, margin %d), %ld of %ld conv launches masked%s%.3f\n", skip_wins, skip_thr, skip_margin, skip_masked, skip_calls,
+                            ufsm_env_on("UFSM_SKIP_REPORT") ? ", mean level-0 active tile share " : "", ufsm_env_on("UFSM_SKIP_REPORT") && skip_wins ? skip_share0 / skip_wins : -1.);
     if (lvm) { double ds = 0; long dn = 0; nn_latvol_stats(lvL, &ds, &dn);
         fprintf(stderr, "predict: latvol CT: %.3f GB of chunk streams uploaded and decoded on the device (%.4f B per box voxel); the decode kernels %.3f s in %ld windows (%.1f Gvox/s of window voxels); %ld windows as host-decoded voxels\n",
                 lv_up / 1e9, lv_up / ((double)bn[0] * bn[1] * bn[2]), ds, dn, ds > 0 ? (double)dn * (double)w3 / 1e9 / ds : 0., lv_nfb); }

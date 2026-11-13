@@ -57,6 +57,7 @@ test_fuse                                      |              |     1 | ./$B/tes
 test_gn_frozen                                 | gpu          |     2 | ./$B/test_gn_frozen
 test_l0_norm                                   | gpu          |     3 | ./$B/test_l0_norm
 test_gn_ema                                    | gpu          |     4 | ./$B/test_gn_ema
+test_skip_empty                                | gpu          |     4 | ./$B/test_skip_empty
 test_gfilm                                     | gpu          |     4 | ./$B/test_gfilm
 test_l0_slab                                   | gpu          |     2 | ./$B/test_l0_slab
 test_zwin                                      | gpu          |     2 | ./$B/test_zwin

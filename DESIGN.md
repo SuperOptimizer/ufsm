@@ -304,6 +304,82 @@ test_ink_blend still passes after the refactor.
 Open (GPU, on the lead's say): the same 1299 corner through `--seamless 2` against u1667ink.sh's scripted blend (that one
 blends q-8 passes into q 32; here lossless passes into the run's q, so close but not byte-identical); and the wall time of `--gpus 0,1` against sequential passes.
 
+## Empty-space skipping: the opportunity on scratch2 windows, and why it cannot be exact (2026-11-13, branch skipair-20261113)
+
+The goal was to stop computing convs in air and outside the scan. Keep a tile mask per level and fill inactive tiles with the
+constant the dense net would compute there. **That constant does not exist for scratch2:**
+- The input is never spatially constant. `nn_input_latc` appends 3 radial-direction channels (the unit vector to the scroll axis,
+  `rad_voxel`) to the 29 latent codes. They vary everywhere, including in air and in the zero-filled outside of the scan.
+- Scroll-RoPE attention at the 8^3 bottleneck and `--gfilm 1` couple every decoder voxel to the whole window.
+- Air CT is noisy, not constant: per 4^3 cell, max <= 40 holds for only ~21% of cells, and max <= 64 for 39%.
+
+So any skip changes the function. The version built here is a **masked conv**: an inactive output tile of a wide 3^3 conv holds the
+conv's bias (the CTA skips its main loop; the epilogue, MX store and GroupNorm sums run as usual). GN, SiLU, attention and heads stay
+dense. It is a well-defined net whose backward would be exact. Its deviation from the dense net has to be measured on papyrus voxels.
+
+**Opportunity.** Method: `UFSM_SAMPLER_EMPTY=1` with `UFSM_SAMPLER_ONLY` on scratch2's recipe, no GPU, dev slice
+(`/vesuvius/ufsm/skipair/empty_measure*.sh`).
+- Data: source-grid CT bytes before the device augmentation, 24 windows. The first 7 use the full recipe, until the CPU ink / fibre
+  label build hit the 40 GB memcap. The other 17 drop the ink / fibre heads so the run fits.
+- Tiles: 8^3 cells (32^3 voxels at level 0). A tile is active when any voxel is > t. Margin r means dilation by r tiles of the
+  same level.
+- Level weights of conv FLOPs at widths 256,320,384,448,288,288: L0 75.5%, L1 20.2%, L2 3.6%, L3 0.6%.
+
+| t | empty cells | L0 active r0 / r1 / r2 | L1 (r1) | L2 (r1) | L3 (r1) | conv FLOPs saved (r1) |
+|---|---|---|---|---|---|---|
+| 0 (outside the scan) | 0.205 | 0.803 / 0.833 / 0.860 | 0.873 | 0.932 | 0.993 | 15.4% |
+| 40 | 0.213 | 0.803 / 0.833 / 0.860 | 0.873 | 0.932 | 0.993 | 15.5% |
+| 64 (papyrus iso) | 0.386 | 0.773 / 0.819 / 0.849 | 0.863 | 0.926 | 0.984 | 16.7% |
+
+- t 0 and t 40 are nearly the same, so the skippable space is almost all the zero-filled outside of the scan. Air inside the scroll
+  gives few whole 32^3-voxel tiles.
+- By source and level: level-0 / 1 windows are 0.93-1.00 active. Coarse windows are where the empty space is: PHerc1667 lev 2
+  0.68, PHercParis4-july lev 3 0.59, PHerc1218-b3 lev 0 0.64.
+- `--split z`: the busier card's half averages 0.849 active vs 0.867 for its whole windows (17 windows), so the split costs little.
+- Expected: 15-17% of conv FLOPs. Convs are ~60% of a step, so at most ~9% of a step. Skipped CTAs still run their epilogue and
+  stores, and the memory-bound ops stay dense, so ~6-7% is more realistic.
+- Inference: `predict` already skips whole air shards and windows (`--occupancy`, air tiles), so only boundary windows gain.
+
+**Built (predict side).**
+- `src/nn_skip.cu`: `nn_skip_build` makes the per-level masks from the device CT window. `conv_fwd_f4_k` checks the mask (an output
+  tile is one z / y tile and at most two x tiles) and skips the main loop.
+- Scope: MX forwards only, N 1, whole-tensor outputs on a registered level grid. z-windows, z-ranges and slab outputs stay dense.
+  `lp_skip_get` decides per launch.
+- `predict --skip-empty 1 [--skip-thr 40] [--skip-margin 1]` on latent-grid nets: masks from `ctd` before the trunk forward, off
+  after it.
+- `tests/test_skip_empty` checks three things: all tiles active gives bit-identical logits, margins 2 / 3 stay within 2% / bit-identical
+  on the toy net's material, and `nn_skip_off` restores the dense bits.
+- Predict runs levels 0 / 1 as z-range halves (planes of a depth-yD output, read from a depth-Di input). `lp_skip_get` places
+  them on their level by that depth and first plane; before that fix, only levels 1-2 were masked and the trunk was 1% faster.
+
+**GPU results (pod B, RTX PRO 6000 MIG 1g.24gb, 2026-11-13).**
+- `test_skip_empty` passes. With every tile active, the logits are bit-identical to the dense forward. On the toy net (3 levels,
+  gn_ema, no attention), the material-voxel error is 4.4% at margin 1, 0.2% at margin 2, and 0 (bit-identical) at margin 3.
+- Real-CT A/B (`UFSM_SKIP_AB=1`): u1 `last.ckpt` (10 M, widths 96-192, 4 levels), PHerc0343 masked scan at level 1 (17.28 um),
+  box 4000,0,1536 + 512 x 1024 x 1024 (the scroll edge), windows 512^3 (128^3 cells), threshold 40.
+- Speed: the trunk is 0.064 s dense vs 0.034-0.048 s masked (25-47% faster) at level-0 active shares of 0.27-0.60. The masked
+  convs scale with the active share (enc0.c2 9.5 -> 4.6 ms, dec0.c1 16.9 -> 7.9 ms). down0 (6.6 ms) and the head (7.9 ms) stay dense.
+- Accuracy: u1 has live GroupNorm, so the bias fill moves every window statistic. Material logits then differ by 48% (mean |d| over
+  mean |logit|), so live-GN nets must not use it. `UFSM_SKIP_AB_FREEZE=1` normalises the masked pass with the dense pass's
+  statistics, which is how a gn_ema net behaves; the control with every tile active under the freeze is bit-identical.
+- Under the freeze, on material cells (a voxel >= 64):
+
+| margin | trunk faster | material mean \|d\| / mean \|logit\| | material logit sign flips | bit-identical material values |
+|---|---|---|---|---|
+| 1 | 37-47% | 0.108-0.143 | 6.4-6.9% | 0-0.04% |
+| 2 | 31-44% | 0.092-0.126 | - | 0-3% |
+| 3 | 25-34% | 0.062-0.103 | 3.9-4.9% | 2-26% |
+
+- Unlike the toy net, the error reaches deep into material. u1's reach is ~60 level-0 cells through its 4 levels, while the fill sits
+  only 8 x margin cells from the material. The fill's error enters the coarse levels and comes back up, and a 128^3-cell window
+  near the scroll edge has almost no material farther than that from the fill.
+- scratch2 couples further (6 levels, attention over the whole bottleneck, gfilm), so its error would be at least this large.
+
+**Verdict.** The masked conv runs 25-47% faster on scroll-edge windows, but changes 4-7% of the papyrus logit signs at margins 1-3.
+That is not acceptable as a silent default. It stays opt-in (`predict --skip-empty 1`, default off) for previews where boundary
+windows dominate. No training path: it would change what the net learns there, for at most ~6-9% of a step. Most of the skippable
+space is the zero-filled outside of the scan. Keeping training windows inside the scan would recover that compute exactly.
+
 ## Split-window input builders: every --gpu-aug builder by z range, the scanner split exactly across two GPUs (2026-11-13, branch augz-20261112)
 
 **The light statistics pass under the split (UFSM_LAT_LIGHT_SPLIT=1, untested).** For the fused head groups (the normal 7 and the
