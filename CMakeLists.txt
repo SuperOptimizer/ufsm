@@ -77,6 +77,9 @@ pkg_check_modules(UFSM_DEPS REQUIRED IMPORTED_TARGET libcurl libzstd blosc zlib 
 # gcc-only optimize("no-math-errno") attribute for that).
 set(UFSM_CFLAGS -std=c23 -O3 -march=native -g -Wall -Wextra -Werror=comment -Wno-unused-parameter -pthread
     -ffp-contract=off -fno-math-errno)
+set(UFSM_EXTRA_CFLAGS "" CACHE STRING "extra host C flags, appended last (experiments: -O0, -fsanitize=...)")
+separate_arguments(_extra UNIX_COMMAND "${UFSM_EXTRA_CFLAGS}")
+list(APPEND UFSM_CFLAGS ${_extra})
 set(UFSM_DEFS _GNU_SOURCE)
 set(UFSM_INC ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/third_party ${CMAKE_SOURCE_DIR}/third_party/surfcomp)
 # Runtime: compiler-rt (builtins, crtbegin / crtend) instead of libgcc.a and gcc's crt files. The C++ library stays libstdc++ (with
