@@ -55,6 +55,16 @@ slab, ranges with tails, 160 / 35 / 17 outputs) against the FFMA path: rel L2 3.
 activations and weights, below the fp16 logits' own), bytes repeat. P 1024 half slab (4 x 256^2 cells, 256 -> 160): 2.87 -> 0.87 ms
 (7.5 -> 24.6 TFLOP/s), 68 calls a step (two passes x 34 slabs): ~135 ms per card. UFSM_HEAD_TC=0: the FFMA passes.
 
+
+**The MIL backward without a sync per slab.** ink_mil_bwd_slab read its slab's (voxel, sample) pair count back with a
+cudaStreamSynchronize before sizing the radix sort: 34 host syncs per ink window. Under `--split` the call runs while the GPU's thread
+holds the split turn, so each sync drains that card while the other waits for the turn: the two cards serialise on every slab. Now
+ink_mil_fin also queues one histogram of pairs per corner plane (no w == 0 test, so an upper bound) and its async copy to pinned memory;
+the first backward slab waits for that event once per step, each slab sorts the bound of its planes (one plane of margin on each side)
+with the unused tail filled by a key that sorts last, and k_runs reads the true count on the device: the sorted prefix and the sums are
+the ones of the readback path. A bound exceeded on the device (not expected) is reported by the next step's first slab. tests/test_ink_mil
+checks both paths byte for byte at 1 / 3 / 7 slabs, soft and hard. Default off (UFSM_MIL_ASYNC=1) until that test has run on a GPU;
+ink_mil_set_async() for tests.
 ## Split-window input builders: every --gpu-aug builder by z range, the scanner split exactly across two GPUs (2026-11-13, branch augz-20261112)
 
 ## Muon variants for the from-scratch universal net: ten arms on the 92 M net (2026-11-13, branch muonx-20261113)

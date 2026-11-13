@@ -4,6 +4,7 @@
 #include <cuda_bf16.h>
 #include <cub/device/device_radix_sort.cuh>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -125,13 +126,34 @@ __global__ void k_pairs(const float *dz, int z0, int nz, int D, int H, int W, co
         const unsigned long long vox = ((unsigned long long)(a - z0) * H + c[1] + (q >> 1 & 1)) * W + c[2] + (q & 1);
         const unsigned j = atomicAdd(cnt, 1u); key[j] = vox << 32 | (unsigned long long)(id * 8 + q); val[j] = g * w; }
 }
-__global__ void k_runs(const unsigned long long *key, const float *val, unsigned n, void *gl, int bf) {   /* one thread per run start: the run summed in slot order */
-    const unsigned i = blockIdx.x * blockDim.x + threadIdx.x; if (i >= n) return;
+__global__ void k_plane_hist(const float *dz, int D, int H, int W, const inkray *rays, int nr, int K, float R, float step, unsigned *hist) {   /* pairs per corner plane (no w == 0 test: an upper bound) */
+    const long long id = (long long)blockIdx.x * blockDim.x + threadIdx.x; if (id >= (long long)nr * K) return;
+    if (dz[id] == 0) return;
+    const inkray r = rays[id / K]; int c[3]; float f[3];
+    if (!samp(r, (int)(id % K), R, step, D, H, W, c, f)) return;
+    atomicAdd(&hist[c[0]], 4u); atomicAdd(&hist[c[0] + 1], 4u);
+}
+__global__ void k_fill_tail(unsigned long long *key, float *val, const unsigned *cnt, unsigned bound, unsigned long long sent, unsigned *ovf) {   /* [count, bound): keys that sort last */
+    const unsigned c = *cnt, i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (!i && c > bound) atomicMax(ovf, c - bound);
+    if (i >= c && i < bound) { key[i] = sent; val[i] = 0; }
+}
+__global__ void k_runs(const unsigned long long *key, const float *val, unsigned n, void *gl, int bf, const unsigned *cnt) {   /* one thread per run start: the run summed in slot order */
+    const unsigned i = blockIdx.x * blockDim.x + threadIdx.x; if (cnt && *cnt < n) n = *cnt; if (i >= n) return;
     const unsigned long long v = key[i] >> 32; if (i && key[i - 1] >> 32 == v) return;
     float s = 0; for (unsigned j = i; j < n && key[j] >> 32 == v; j++) s += val[j];
     st16(gl, (size_t)v, bf, ld16(gl, (size_t)v, bf) + s);
 }
 static __thread struct { void *p[8]; size_t cap[8]; } t_ms;
+/* the per-plane pair counts ink_mil_fin leaves for the backward slabs (2026-11-13): ink_mil_bwd_slab used to read its slab's pair count back
+   with a stream sync per slab (34 per ink window), which under --split drains the GPU while its thread holds the turn and serialises the two
+   cards. fin now queues one histogram + its async copy; the first slab waits for it once, every slab sorts an upper bound (its planes'
+   counts, one plane of margin each side) with the unused tail filled by keys that sort last, and k_runs reads the true count on the device:
+   the same sorted prefix, the same sums. An exceeded bound (never expected) is reported by the next step's first slab. Layout: device
+   d[0, cap) the plane counts, d[cap] the overflow word; pinned h[0, cap) the counts, h[cap + 1] the previous step's overflow word. */
+static int g_mil_async = -1;
+extern "C" void ink_mil_set_async(int on) { g_mil_async = on; }
+static __thread struct { unsigned *h, *d; cudaEvent_t ev; const float *dz; const inkray *rays; int D, nr, K, pend, cap; float R, step; } t_ph;
 static int mgrow(int i, size_t n) {
     if (t_ms.cap[i] >= n) return 0;
     if (t_ms.p[i]) cudaFree(t_ms.p[i]);
@@ -151,6 +173,21 @@ extern "C" int ink_mil_fin(float *acc, const inkray *rays, int nr, int D, int H,
     if (mgrow(0, (size_t)nr * sizeof(double))) return -1;
     k_fin<<<(nr + 127) / 128, 128, 0, (cudaStream_t)stream>>>(acc, rays, nr, K, D, H, W, R, step, tau, eps, scale, (double *)t_ms.p[0]);
     k_sum_fixed<<<1, 256, 0, (cudaStream_t)stream>>>((const double *)t_ms.p[0], nr, loss);
+    if (g_mil_async < 0) g_mil_async = getenv("UFSM_MIL_ASYNC") && atoi(getenv("UFSM_MIL_ASYNC")) > 0;   /* UFSM_MIL_ASYNC=1: the plane bound (default off until test_ink_mil has run it on a GPU) */
+    t_ph.dz = nullptr;
+    if (g_mil_async) {
+        if (t_ph.cap < D + 1) {   /* hist[D + 1] (the last corner plane) + the overflow word */
+            if (t_ph.h) cudaFreeHost(t_ph.h); if (t_ph.d) cudaFree(t_ph.d); t_ph.h = nullptr; t_ph.d = nullptr; t_ph.cap = 0;
+            if (cudaMallocHost((void **)&t_ph.h, (size_t)(D + 3) * 4) || cudaMalloc((void **)&t_ph.d, (size_t)(D + 3) * 4) || cudaMemset(t_ph.d, 0, (size_t)(D + 3) * 4)) return -1;
+            if (!t_ph.ev && cudaEventCreateWithFlags(&t_ph.ev, cudaEventDisableTiming)) return -1;
+            t_ph.cap = D + 1;
+        }
+        cudaStream_t st = (cudaStream_t)stream; const long long n = (long long)nr * K;
+        if (cudaMemcpyAsync(t_ph.h + t_ph.cap + 1, t_ph.d + t_ph.cap, 4, cudaMemcpyDeviceToHost, st) || cudaMemsetAsync(t_ph.d, 0, (size_t)(t_ph.cap + 1) * 4, st)) return -1;
+        k_plane_hist<<<(unsigned)((n + 255) / 256), 256, 0, st>>>(acc, D, H, W, rays, nr, K, R, step, t_ph.d);
+        if (cudaMemcpyAsync(t_ph.h, t_ph.d, (size_t)t_ph.cap * 4, cudaMemcpyDeviceToHost, st) || cudaEventRecord(t_ph.ev, st)) return -1;
+        t_ph.pend = 1; t_ph.dz = acc; t_ph.rays = rays; t_ph.D = D; t_ph.nr = nr; t_ph.K = K; t_ph.R = R; t_ph.step = step;
+    }
     return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }
 extern "C" int ink_mil_bwd_slab(const float *dz, int z0, int nz, int D, int H, int W, const inkray *rays, int nr, float R, float step, void *gl, int bf16, void *stream) {
@@ -158,15 +195,28 @@ extern "C" int ink_mil_bwd_slab(const float *dz, int z0, int nz, int D, int H, i
     cudaStream_t st = (cudaStream_t)stream; const long long n = (long long)nr * K; const size_t cap = (size_t)n * 8;
     if (cap > 0xffffffffull || mgrow(1, cap * 8) || mgrow(2, cap * 4) || mgrow(3, cap * 8) || mgrow(4, cap * 4) || mgrow(5, 64)) return -1;
     unsigned *dc = (unsigned *)t_ms.p[5]; unsigned hc = 0;
+    const int ph = t_ph.dz == dz && t_ph.rays == rays && t_ph.D == D && t_ph.nr == nr && t_ph.K == K && t_ph.R == R && t_ph.step == step;
+    if (ph) {   /* the bound from fin's plane counts (waits for them once per step) */
+        if (t_ph.pend) { if (cudaEventSynchronize(t_ph.ev)) return -1; t_ph.pend = 0;
+            if (t_ph.h[t_ph.cap + 1]) { fprintf(stderr, "ink mil: a slab's pairs exceeded its plane bound by %u (gradient incomplete)\n", t_ph.h[t_ph.cap + 1]); return -1; } }
+        unsigned long long b = 0; for (int a = z0 - 1; a <= z0 + nz; a++) if (a >= 0 && a <= t_ph.cap - 1) b += t_ph.h[a];
+        if (!b) return 0;
+        hc = (unsigned)(b < cap ? b : cap);
+    }
     if (cudaMemsetAsync(dc, 0, 4, st)) return -1;
     k_pairs<<<(unsigned)((n + 255) / 256), 256, 0, st>>>(dz, z0, nz, D, H, W, rays, nr, K, R, step, (unsigned long long *)t_ms.p[1], (float *)t_ms.p[2], dc);
-    if (cudaMemcpyAsync(&hc, dc, 4, cudaMemcpyDeviceToHost, st) || cudaStreamSynchronize(st)) return -1;
-    if (!hc) return 0;
     int bits = 32; while (bits < 64 && ((unsigned long long)nz * H * W) >> (bits - 32)) bits++;   /* key = voxel << 32 | slot */
+    if (ph) {   /* slots [count, bound): the largest key in the sorted bits (real keys are below it: slot < cap < 2^32 - 1) */
+        const unsigned long long sent = bits >= 64 ? ~0ull : (1ull << bits) - 1;
+        k_fill_tail<<<(hc + 255) / 256, 256, 0, st>>>((unsigned long long *)t_ms.p[1], (float *)t_ms.p[2], dc, hc, sent, t_ph.d + t_ph.cap);
+    } else {
+        if (cudaMemcpyAsync(&hc, dc, 4, cudaMemcpyDeviceToHost, st) || cudaStreamSynchronize(st)) return -1;
+        if (!hc) return 0;
+    }
     size_t tb = 0; cub::DeviceRadixSort::SortPairs(nullptr, tb, (unsigned long long *)nullptr, (unsigned long long *)nullptr, (float *)nullptr, (float *)nullptr, (int)hc, 0, bits, st);
     if (mgrow(6, tb + 16)) return -1; void *tmp = t_ms.p[6];
     cub::DeviceRadixSort::SortPairs(tmp, tb, (unsigned long long *)t_ms.p[1], (unsigned long long *)t_ms.p[3], (float *)t_ms.p[2], (float *)t_ms.p[4], (int)hc, 0, bits, st);
-    k_runs<<<(hc + 255) / 256, 256, 0, st>>>((const unsigned long long *)t_ms.p[3], (const float *)t_ms.p[4], hc, gl, bf16);
+    k_runs<<<(hc + 255) / 256, 256, 0, st>>>((const unsigned long long *)t_ms.p[3], (const float *)t_ms.p[4], hc, gl, bf16, ph ? dc : nullptr);
     return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }
 /* tests: the slab pipeline over host arrays (the logit rounded to fp16 / bf16, nslab equal z slabs; grad: the 16-bit gradient as float,
