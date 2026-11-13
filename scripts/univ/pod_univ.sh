@@ -28,7 +28,9 @@ u1run() { (cd $K/runs && R=$K/runs U=$4 SRCJ=${SRCJ:-$K/sources-u1-pod.json} GPU
 for s in $ST; do say $s; case $s in
   setup) POD=$K BRANCH=${BRANCH:-master} bash $D/../pod/setup.sh || exit 1
     if [ -f $K/ckpt/u1-commit.txt ] && [ ! -x $UR ]; then c=$(cat $K/ckpt/u1-commit.txt)
-      git -C $K/ufsm worktree add -f $K/ufsm-u1 $c && make -C $K/ufsm-u1 -j $T build/ufsm > $K/ufsm-u1.build.log 2>&1 || { tail -5 $K/ufsm-u1.build.log; exit 1; }
+      git -C $K/ufsm worktree add -f $K/ufsm-u1 $c || exit 1   # (a commit from before buildsys-20261113 has only the Makefile: gcc)
+      if [ -f $K/ufsm-u1/CMakeLists.txt ]; then ( cd $K/ufsm-u1 && cmake --preset release && cmake --build build -j $T --target ufsm ) > $K/ufsm-u1.build.log 2>&1
+      else make -C $K/ufsm-u1 -j $T build/ufsm > $K/ufsm-u1.build.log 2>&1; fi || { tail -5 $K/ufsm-u1.build.log; exit 1; }
       say "u1 binary from $c: $UR"; fi;;
   kit) U=$U T=$T bash $D/../pod/datakit.sh $K segs p4 0500 0139 || exit 1;;
   1667) for S in 1667A 1667B; do K=$K G0=$K/gt/1667 AX=$K/small/axis/PHerc1667-unroll-axis.json U=$U GPU=${GPUS%%,*} T=$T bash $D/b1_relabel.sh $S || exit 1; done;;

@@ -13,7 +13,7 @@ set -u
 U=${U:-$HOME/ufsm-postperf/build/ufsm}; P=${P:-/vesuvius/ufsm/unroll/PHercParis4-u1}; O=${1:-/vesuvius/ufsm/tmp-postperf/gpu}; GPU=${GPU:-0}; RMEM=${RMEM:-7}; RCAP=${RCAP:-13G}
 INK=$P/ink/ift3-24000.zarr; CTR=/vesuvius/ufsm/v2/ct; CTK=PHercParis4/20260411134726-2.400um-0.2m-78keV-masked.zarr/2; LUM=9.6
 FILLX="--fill 4 --fill-grid 50000 --fill-inpaint 4 --fill-pm 1"; S=(ws010 ws011 ws012)
-[ -x "$U" ] || { echo "no $U (make -j8 build/ufsm in the branch)"; exit 1; }
+[ -x "$U" ] || { echo "no $U (cmake --preset release && cmake --build build -j 8 in the branch)"; exit 1; }
 mkdir -p $O/seq $O/par $O/logs || exit 1
 rend() {   # rend STRIPE OUTDIR
   local s=$1 d=$2; mkdir -p $d/in_$s; ln -sfn $P/strip/strip/flat/stripes/$s $d/in_$s/$s
@@ -40,6 +40,6 @@ for mode in cpu gpu; do
   echo "snap ($mode decode): $(( $(date +%s) - ts )) s, $(grep -o 'evidence [0-9.]* s (volume decode [0-9.]* s' $O/logs/snap_$mode.log)), $d of $(ls $O/snap_$mode | wc -l) .sfc differ from the run"; nd=$((nd + d))
 done
 # 3. the gpu-tagged suite test touched by the branch
-( cd $(dirname $U)/.. && ~/bin/memcap -m 16G make -j8 VERIFY=1 build-verify/test_fit_join > $O/logs/make_test_fit_join.log 2>&1 && CUDA_VISIBLE_DEVICES=$GPU ./build-verify/test_fit_join > $O/logs/test_fit_join.log 2>&1 ) \
+( cd $(dirname $U)/.. && { cmake --preset verify && ~/bin/memcap -m 16G cmake --build build-verify -j 8 --target test_fit_join; } > $O/logs/make_test_fit_join.log 2>&1 && CUDA_VISIBLE_DEVICES=$GPU ./build-verify/test_fit_join > $O/logs/test_fit_join.log 2>&1 ) \
   && echo "test_fit_join: pass" || { echo "test_fit_join: FAIL ($O/logs/test_fit_join.log)"; nd=$((nd + 1)); }
 exit $((nd > 0))

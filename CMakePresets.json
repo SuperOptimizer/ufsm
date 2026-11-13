@@ -1,0 +1,48 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {"major": 3, "minor": 28, "patch": 0},
+  "configurePresets": [
+    {
+      "name": "release",
+      "displayName": "release: build/ (fp16 / MX kernels; sm_120 + sm_120a)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build",
+      "toolchainFile": "${sourceDir}/cmake/llvm.cmake",
+      "cacheVariables": {"UFSM_VERIFY": "OFF", "UFSM_ARCH": "120"}
+    },
+    {
+      "name": "verify",
+      "displayName": "verify: build-verify/ (+ bf16 / fp32 instantiations; the suite binaries)",
+      "inherits": "release",
+      "binaryDir": "${sourceDir}/build-verify",
+      "cacheVariables": {"UFSM_VERIFY": "ON"}
+    },
+    {
+      "name": "arch86",
+      "displayName": "arch86: build86/ (Ampere, software MX; SASS + PTX, so newer GPUs run the sm_86 paths)",
+      "inherits": "release",
+      "binaryDir": "${sourceDir}/build86",
+      "cacheVariables": {"UFSM_ARCH": "86"}
+    },
+    {
+      "name": "arch86-verify",
+      "displayName": "arch86-verify: build86-verify/",
+      "inherits": "arch86",
+      "binaryDir": "${sourceDir}/build86-verify",
+      "cacheVariables": {"UFSM_VERIFY": "ON"}
+    }
+  ],
+  "buildPresets": [
+    {"name": "desk", "displayName": "desk: release, 8 jobs (desk rule; run under ~/bin/lowprio)", "configurePreset": "release", "jobs": 8},
+    {"name": "desk-verify", "displayName": "desk: the suite binaries, 8 jobs", "configurePreset": "verify", "jobs": 8,
+     "targets": ["suite-bins"]},
+    {"name": "desk-test", "displayName": "desk: build + fast suite tier (SUITE_FLAGS env for runner options)", "configurePreset": "verify",
+     "jobs": 8, "targets": ["test"]},
+    {"name": "pod", "displayName": "pod: release, 6 jobs (cgroup cpu.max)", "configurePreset": "release", "jobs": 6},
+    {"name": "pod-verify", "displayName": "pod: the suite binaries, 6 jobs", "configurePreset": "verify", "jobs": 6,
+     "targets": ["suite-bins"]},
+    {"name": "pod-test", "displayName": "pod: build + fast suite tier", "configurePreset": "verify", "jobs": 6, "targets": ["test"]},
+    {"name": "arch86", "configurePreset": "arch86"},
+    {"name": "arch86-verify", "configurePreset": "arch86-verify", "targets": ["suite-bins"]}
+  ]
+}

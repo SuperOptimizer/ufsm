@@ -389,7 +389,7 @@ extern "C" void nn_sheet_input(void *input,int W,const float *rows,float center,
 __global__ void sheet_gate_k(float *r,const float *surface,const uint8_t *ct,int W,const float *rows) {
     size_t i=blockIdx.x*(size_t)blockDim.x+threadIdx.x;
     if (i>=(size_t)W*W*W) return;
-    if (!ct[i] || surface[i]<-2.19722458f) r[i]=nanf("");
+    if (!ct[i] || surface[i]<-2.19722458f) r[i]=__int_as_float(0x7fc00000);   /* nanf(""): nvcc gives 0x7fc00000; clang 22 declares the device nanf without defining it */
     else {
         int z=i/((size_t)W*W),y=(i/W)%W,x=i%W;
         const float *a=rows+4*z;

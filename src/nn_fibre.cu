@@ -12,12 +12,57 @@
 #include <string.h>
 #include <math.h>
 #include "fibregpu.h"
-#include <cub/device/device_scan.cuh>
 #include <time.h>
 static double fg_t(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 
 #define FG_CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { fprintf(stderr, "fibre gpu: %s (%s:%d)\n", cudaGetErrorString(e_), __FILE__, __LINE__); rc = -1; goto out; } } while (0)
 enum { FBX = 8, FBY = 4, FBZ = 4, FCH = 128 };   /* voxel block 4 x 4 x 8 (z y x): 2026-11-11, 8^3 blocks tested 3x more out-of-cube pairs */
+/* exclusive sum of n int32 counts (the bin offsets; off[n - 1] = the total when cnt[n - 1] = 0): three passes over 4096-count tiles,
+   tile sums, their scan in one block, each tile's scan plus its base. Integer, so identical to the cub::DeviceScan::ExclusiveSum it
+   replaces (2026-11-13: CCCL 13.x's cuda/std/string_view does not compile under clang 22, the CUDA compiler since buildsys-20261113). */
+enum { FSC_T = 256, FSC_I = 16, FSC_TILE = FSC_T * FSC_I };
+__device__ static int fsc_block_excl(int v, int *sw, int *tot) {   /* exclusive scan of v over the 256 threads, the block total in *tot */
+    const int t = threadIdx.x, l = t & 31, w = t >> 5; int x = v;
+    for (int d = 1; d < 32; d <<= 1) { const int y = __shfl_up_sync(0xffffffffu, x, d); if (l >= d) x += y; }
+    if (l == 31) sw[w] = x;
+    __syncthreads();
+    if (w == 0) { int s = l < FSC_T / 32 ? sw[l] : 0; for (int d = 1; d < 32; d <<= 1) { const int y = __shfl_up_sync(0xffffffffu, s, d); if (l >= d) s += y; } if (l < FSC_T / 32) sw[l] = s; }
+    __syncthreads();
+    const int r = x - v + (w ? sw[w - 1] : 0); *tot = sw[FSC_T / 32 - 1];
+    __syncthreads();
+    return r;
+}
+__global__ static void fsc_sums_k(const int32_t *__restrict__ cnt, long n, int32_t *part) {
+    __shared__ int sw[FSC_T / 32]; const long b = (long)blockIdx.x * FSC_TILE; int s = 0, tot;
+    for (int k = 0; k < FSC_I; k++) { const long i = b + k * FSC_T + threadIdx.x; if (i < n) s += cnt[i]; }
+    fsc_block_excl(s, sw, &tot);
+    if (threadIdx.x == 0) part[blockIdx.x] = tot;
+}
+__global__ static void fsc_parts_k(int32_t *part, long np) {   /* one block: part[] -> its exclusive scan, in 256-part rounds */
+    __shared__ int sw[FSC_T / 32]; int carry = 0, tot;
+    for (long r = 0; r < np; r += FSC_T) {
+        const long i = r + threadIdx.x; const int v = i < np ? part[i] : 0; const int e = fsc_block_excl(v, sw, &tot);
+        if (i < np) part[i] = carry + e;
+        carry += tot;
+    }
+}
+__global__ static void fsc_tiles_k(const int32_t *__restrict__ cnt, long n, const int32_t *__restrict__ part, int32_t *off) {
+    __shared__ int sw[FSC_T / 32]; const long b = (long)blockIdx.x * FSC_TILE; int carry = part[blockIdx.x], tot;
+    for (int k = 0; k < FSC_I; k++) {
+        const long i = b + k * FSC_T + threadIdx.x; const int v = i < n ? cnt[i] : 0; const int e = fsc_block_excl(v, sw, &tot);
+        if (i < n) off[i] = carry + e;
+        carry += tot;
+    }
+}
+static size_t fsc_tmp_bytes(long n) { return (size_t)((n + FSC_TILE - 1) / FSC_TILE) * sizeof(int32_t); }
+static cudaError_t fsc_exclusive_sum(void *tmp, const int32_t *cnt, int32_t *off, long n, cudaStream_t st) {
+    const long np = (n + FSC_TILE - 1) / FSC_TILE; int32_t *part = (int32_t *)tmp;
+    if (np <= 0) return cudaSuccess;
+    fsc_sums_k<<<(unsigned)np, FSC_T, 0, st>>>(cnt, n, part);
+    fsc_parts_k<<<1, FSC_T, 0, st>>>(part, np);
+    fsc_tiles_k<<<(unsigned)np, FSC_T, 0, st>>>(cnt, n, part, off);
+    return cudaGetLastError();
+}
 typedef struct { double p[3]; float q[3]; int16_t lo[3], hi[3]; int32_t fam; } fg_step;   /* q: p - the box origin in float (the fast class test) */   /* the device's step: the reach cube box-relative, as fr_stamp's ceil / floor */   /* voxel block edge; steps per shared-memory chunk */
 
 __global__ void k_fibre(const fg_step *st, const int32_t *boff, const int32_t *bidx, int3 nb, long long so0, long long so1, long long so2, int n0, int n1, int n2,
@@ -126,9 +171,9 @@ extern "C" int fibre_gpu_box(const fr_step *st, long nst, const int64_t so[3], c
         FG_CK(cudaMemsetAsync(cnt, 0, (size_t)(NB + 1) * 4, g_st));
         const int3 nb3 = make_int3(nb[2], nb[1], nb[0]);
         if (ns) { k_fbin<<<(unsigned)((ns + 255) / 256), 256, 0, g_st>>>((const fg_step *)g_buf[0], ns, nb3, cnt, nullptr, nullptr); FG_CK(cudaGetLastError()); }
-        size_t tmpb = 0; cub::DeviceScan::ExclusiveSum(nullptr, tmpb, cnt, off, (int)(NB + 1), g_st);
+        const size_t tmpb = fsc_tmp_bytes(NB + 1);
         if (grow(5, tmpb)) { rc = -1; goto out; }
-        FG_CK(cub::DeviceScan::ExclusiveSum(g_buf[5], tmpb, cnt, off, (int)(NB + 1), g_st));
+        FG_CK(fsc_exclusive_sum(g_buf[5], cnt, off, NB + 1, g_st));
         int32_t tot32 = 0; FG_CK(cudaMemcpyAsync(&tot32, off + NB, 4, cudaMemcpyDeviceToHost, g_st)); FG_CK(cudaStreamSynchronize(g_st)); tot = tot32;
         if (tot32 < 0) { rc = -1; goto out; }
         if (grow(2, (size_t)(tot ? tot : 1) * 4)) { rc = -1; goto out; }

@@ -1,7 +1,7 @@
 /* band_field_phase_pair on the GPU (src/nn_band.cu): the two parity EDTs (feature transform, the same Felzenszwalb-Huttenlocher
    envelopes as src/band.c edt_feature_cap, lean: indices only, squared distances rebuilt from them) and the pair rule's phase per
-   voxel. Built without fast math and with -fmad=false (Makefile), so every float operation rounds as band.c's (gcc -std=c23 does
-   not contract either): the output is byte-identical to band_field_phase_pair (tests/test_band_pair.c). Declared weak: a binary
+   voxel. Built without fast math and with FMA contraction off (CMakeLists.txt UFSM_STRICT_UNITS), so every float operation rounds as
+   band.c's (built with -ffp-contract=off): the output is byte-identical to band_field_phase_pair (tests/test_band_pair.c). Declared weak: a binary
    without nn_band.o has a null band_pair_gpu and runs the CPU code. Device buffers and a stream per slot
    (a pool of --gpu-slots contexts, grown on demand; callers wait for a free one), so N slots hold ~10 bytes a block voxel
    each on the device. Returns 0 on success, nonzero on any CUDA failure (the caller falls back to the CPU). */

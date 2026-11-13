@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tests/run_suite.sh: the ufsm test suite runner (make test / test-slow / test-all call it). Pure bash + flock.
+# tests/run_suite.sh: the ufsm test suite runner (the CMake targets test / test-slow / test-all call it). Pure bash + flock.
 #
 #   tests/run_suite.sh [options] [REGEX...]     run the tests of the manifest tests/suite.txt (REGEX: only names matching one)
 #     -t TIER   fast (default: everything not tagged slow) | slow (only the slow tag) | all
