@@ -32,6 +32,7 @@ test_rungs                                     | gpu          |     3 | ./$B/tes
 test_gram                                      | gpu          |     2 | ./$B/test_gram
 test_fibhead                                   | gpu          |     2 | ./$B/test_fibhead
 test_fibhead_train                             | gpu          |    25 | tests/test_fibhead_train.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/fibhead
+test_slot_planes                               | gpu          |    30 | tests/test_slot_planes.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/slotplanes
 test_scan_norm                                 | gpu          |     8 | tests/test_scan_norm.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/scannorm
 test_predict_heads                             | gpu          |    70 | tests/test_predict_heads.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/predheads
 test_predict_boxes                             | gpu          |    40 | tests/test_predict_boxes.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/predboxes

@@ -73,6 +73,60 @@ for C 32 / 64, MX-fp4 / fp8 x, fp32 / MX-fp8 gradients. It has one gradient voxe
 on both runs (sums of many terms differ in the last bit by partition, by design). The owned gx must be bit-identical. Before the fix
 6-19k of 18-37k values differed in the fp32 cases; after, 0.
 
+## Sampler host RAM at P 1024 under --lat --split z: unread targets dropped, a plane bank per slot (2026-11-13, branch hostmem-20261113)
+
+scratch2 (92 M latent net, P 1024 split over both cards, all heads) was OOM-killed in the 104 GB train slice at WORKERS 6 SLOTS 6 (~76 GB
+after 20 s, ~100 GB with the trainer's pinned buffers). Measured with `UFSM_SAMPLER_ONLY` (no GPU; `--split z` segfaulted there before:
+the zero planes now come from calloc) and an LD_PRELOAD allocation logger with pagemap residency (/vesuvius/ufsm/hostmem/tools), on
+scratch1 minus the on-the-fly phase sources (the CPU pair rule takes ~15 min per P 1024 window; the slot layout does not depend on it).
+
+Why the slots were big: `--split` turns `--pack-targets` off, `sample_gpu_lwarp_ok` needs packed targets, so `--gpu-aug 3` ran as
+`--gpu-aug 1` (host label warps) and each slot held every unpacked byte plane. One slot at P 1024 (1.07 GB per plane, pinned):
+
+| plane | GB | read by the trainer |
+|---|---|---|
+| ct8 | 1.07 | yes |
+| t (recto / sheet targets) + m (mask) | 3.22 | **no** (g_tm_unused: the unwrap2 head slabs) |
+| side, w4, wcomp | 3.22 | yes; all 255 for ink / fibre windows |
+| ink (the rv papyrus plane; ink bits need gpu-aug 2) | 1.07 | yes |
+| aux ink, fibre H, fibre V | 3.22 | yes; at most 2 of them non-255 in any window |
+| **total** | **11.8** | |
+
+Per worker: big 3 B/vox resident (CT, warp source scratch, mask) + ttmp 2 = 5.4 GB at P 1024; the window pool ~0 once the targets'
+warp is gone. Fixed: label_occupancy 2.7 GB, ink-onfly label images 5.0, ink cache <= 4 (--ink-cache-mb), ~1 other. The targets' host
+warp (write_spatial_tm) took 74% of a P 1024 worker's CPU, for planes nobody reads.
+
+Changes (both bit-identical: the batch planes the trainer reads, by hash):
+- **slot_skip 4** (`sample_tm_unused`): t / m neither allocated nor written when the trainer never reads them (g_tm_unused without
+  `--pack-targets`, and not the non-latent split, whose upload_slab copies t). The warped windows keep write_spatial_tm's noise draws
+  (rskip, as `--gpu-aug 2` does). -3 B/vox per slot; x16 stage 515 -> 37 ms per P 512 window. UFSM_TM_SKIP4=0 off.
+- **plane bank** (`sample_cfg.plane_bank`, B 1, no replays / chains / cover / validation): a slot holds K label planes, K = the most
+  any eligible source fills (role_real: side / w4 / wcomp need a phase or band, aux j its prob target, the papyrus plane always);
+  per window the roles point at bank planes or at one shared pinned 255 plane, whose writes the draw skips (UFSM_BANK_CHECK=1
+  aborts if it changes). The trainer reads the same pointers. scratch1: 7 roles -> 4 planes, -3.2 GB per slot. UFSM_PLANE_BANK=0 off.
+
+Slot 11.8 -> 5.4 GB (11 -> 5 B/vox; P 512 sampler-only: slots 4.43 -> 2.15 GB for 3, the 255 plane included).
+
+Checks: sampler-only P 256 scratch2 recipe `--det 1`, base vs new: 24 + 40 batches, 520 plane hashes, 0 differ (the CPU fibre path
+fails without a GPU, so no fibre windows there). tests/test_slot_planes.sh (GPU, suite): winding + fibre-only mix, old layout vs bank,
+whole windows with `--gpu-aug 3` (det_cmp: batch hashes and device inputs; 2 planes for 3 roles) and the latent split on one device
+(batch hashes, losses within 2%; 4 planes for 6 roles), 8 batches each, identical.
+
+Budget (model, not run): RSS ~ 15 + T + 5.4 S + 5.4 W GB (T: the trainer's pinned label-stream / a1 offload buffers, ~11 GB est.),
+W = S - 2 useful workers on two GPUs: S 6 W 4 ~ 80 GB, where the old layout fitted S 3; with the device warps below (slot ~3.5 GB)
+S 8 W 6 ~ 86 GB, S 7 W 5 ~ 77 GB.
+
+**Device label warps under the split** (ec7a98b, lead-approved: not byte-identical). `--gpu-aug 2/3` now holds under `--lat --split z`
+when the unpacked targets are unused (`sample_gpu_lwarp_ok`: packed targets or slot_skip 4; UFSM_SPLIT_LWARP=0 keeps the host warps).
+Warped windows keep source-grid labels in the slot, which the augz z-range builders warp on the device (nn_label_warp_z,
+nn_w4runs_label_z, nn_ink_bits_z) on the copy stream inside the uploads. Tolerance: the device warp equals the CPU warp
+to <= 1e-4 of the voxels per plane (test_gpu_aug), as on every non-split `--gpu-aug 2` run; the z-range builders equal the whole-window
+ones byte for byte (test_aug_z). CT bytes, scanner records and radial records are unchanged (same RNG stream).
+- Slot: w4 runs (-2 planes), ink bits (the papyrus plane at 1 bit), bank 4 -> 2 planes: P 256 sampler-only 3.2 B/vox, ~3.5 GB at P 1024.
+- Worker: the host label warps are gone (augment stage 1063 -> 11 ms CPU per P 256 window).
+- The planner already counted the split's aug staging for `--gpu-aug 2`.
+- test_slot_planes: a split run with the device warps; CT bytes exact, losses within 2% of the host-warp run.
+
 ## Split-window input builders: every --gpu-aug builder by z range, the scanner split exactly across two GPUs (2026-11-13, branch augz-20261112)
 
 ## Muon variants for the from-scratch universal net: ten arms on the 92 M net (2026-11-13, branch muonx-20261113)

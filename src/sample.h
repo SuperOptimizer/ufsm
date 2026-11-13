@@ -145,8 +145,12 @@ typedef struct {
                                 the released windows; earlier only when no new window is ready, never under --det 1); 0: (slots - workers) K / (K - 1), at least 2, at most the slot count */
     int ink_bits;            /* --rv ink plane as batch.inkb (1 bit per voxel) + ct8 instead of batch.ink (host RAM: 7/8 B per voxel per slot);
                                 sampler_start drops it (0) unless --gpu-aug 2 cubes with the rv cutoff and no seam op / packed plane / sheet */
+    int plane_bank;          /* train (B 1, no replays / chains / cover): 1 = a slot holds as many label planes as the neediest source fills, the label
+                                roles (side, w4, wcomp, ink, aux) of a window whose source leaves them all unknown point at one shared 255 plane
+                                (sampler_start sets the plane count, or 0 where it does not apply; identical bytes to the trainer) */
     int slot_skip;           /* batch planes the trainer never reads, not allocated nor filled (host RAM: 1 byte per window voxel per slot each):
-                                1 batch.tm (train: g_tm_unused, the unwrap2 head slabs), 2 batch.pm (unwrap2 without --pap-head) */
+                                1 batch.tm (train: g_tm_unused, the unwrap2 head slabs), 2 batch.pm (unwrap2 without --pap-head),
+                                4 batch.t / batch.m (the unpacked targets, g_tm_unused without --pack-targets: --split; sample.c sample_tm_unused) */
     int wind4;               /* train --task unwrap2 (side 2, stored phase): batch.w4 / wcomp, the relative winding mod 4 of each window
                                 (src/band.h band_wind4: the stored phase unwrapped over the window before the air test, its components
                                 kept as separate gauges); warped samples pull it through the warp within one component */
@@ -204,6 +208,7 @@ typedef struct {
                                 holds every window's phase on the source grid (the device applies the symmetry, nn_label_sym / nn_w4runs_label) */
     uint8_t *ink;            /* B x P^3 when cfg.ink_plane: ink prob254 (0..254, 255 unknown) */
     uint8_t *aux[4];         /* B x P^3 each for j < cfg.aux_n: the extra prob254 planes (ink / fibre), as batch.ink */
+    uint8_t *bank[8]; int nbank;   /* cfg.plane_bank: the slot's label planes; side / w4 / wcomp / ink / aux point into them or at the sampler's 255 plane */
     uint8_t *inkb;           /* cfg.ink_bits: B x P^3 / 8, the --rv papyrus plane's known bit per voxel (bit j of byte k: voxel 8 k + j,
                                 source grid) instead of batch.ink; the plane is known ? (ct8 >= ink_it ? 254 : 0) : 255, built on the device
                                 (nn_ink_bits: the window's symmetry / warp after) */
