@@ -52,7 +52,13 @@ unsigned sr_seed(void) {
     return h | 1u;
 }
 extern "C" void nn_set_sr(int on) { g_sr = on; }
-extern "C" void nn_set_sr_step(unsigned step) { g_sr_step = step; g_sr_ctr = 0; lp_wmemo_step(step); }
+/* UFSM_SR_SALT=K (A/B noise floors, perf2 2026-11-13): every step's stochastic-rounding seed shifted by K << 20, a run with other SR draws on
+   the same batches (the rounding noise of a kernel change is judged against it) */
+extern "C" void nn_set_sr_step(unsigned step) {
+    static int salt = -1; if (salt < 0) { const char *e = getenv("UFSM_SR_SALT"); salt = e ? atoi(e) : 0; }
+    step += (unsigned)salt << 20;
+    g_sr_step = step; g_sr_ctr = 0; lp_wmemo_step(step);
+}
 /* the seed sequence of a step, for callers that reorder the ops drawing from it (unet's three level-0 buffers): the draw counter,
    set back to replay a draw, one draw, and whether the SR of the fp8 / fp4 operands is on */
 extern "C" unsigned nn_sr_ctr(void) { return g_sr_ctr; }
