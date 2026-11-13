@@ -200,6 +200,11 @@ void nn_input_rad_pack(const void *ct16, shape5 xs, const void *rec, void *y);
 void nn_input_lat(const void *ct16, shape5 xs, const void *rec, void *y);
 /* the same with the learned cell transform (latfit.h): xs.c = C + 3 (16 or 32): C quantised coefficients x gain, then the radial means */
 void nn_input_latc(const void *ct16, shape5 xs, const void *rec, const float *bas, const float *gain, int C, float step, void *y);
+/* train --lat-direct-p: rows of window n's cells [cz0, cz0 + ncz) of nn_input_latc's input with the C coefficient channels from stored latvol
+   cells (int8 [ncz][h][w][stride], nn_latvol_decode's layout, raw-domain step step_raw) z-scored with the window's mean / isd (predict's
+   nn_lat_input_qs), the radial channels as nn_input_latc's */
+void nn_input_latq(const void *ct16, shape5 xs, const void *rec, int n, int cz0, int ncz, const void *cells, int stride, const float *gain, int C,
+                   float step_raw, float mean, float isd, void *y);
 /* predict: the same channels from the full-resolution 4-channel fp16 window x ([4][4d][4h][4w]: CT, radial) into y (fp16 [C + 3][d][h][w]) */
 /* predict --latents: the cell channels from a latcomp store's indices q (int8 [d][h][w](C + 1), lc_cli.c layout; raw-domain step) with the window's
    mean / 1 / sd; the radial means from x's channels 1-3 */
@@ -646,6 +651,7 @@ void nn_add_into_act(void *y, const void *x, shape5 s, int h16);   /* the same f
 void nn_side_targets(const uint8_t *side, size_t n, uint8_t *t, uint8_t *m);   /* band.h SIDE_* labels -> loss target (recto 255, verso 0) and mask (known) */   /* where m == 0 and vm != 0: t = src, m = 1 */
 void nn_phase_targets(const uint8_t *phase, size_t n, uint8_t *t, uint8_t *m);   /* band.h PHASE_* -> targets t[0..n) = 0.5 + 0.5 cos(2 pi phase), t[n..2n) = 0.5 + 0.5 sin (x255), mask (known) */
 void nn_rv_targets(const uint8_t *phase, const uint8_t *pap, size_t n, uint8_t *t, uint8_t *m);   /* train --rv: recto / verso side papyrus targets t[0..2n) and mask from the phase + papyrus plane */
+void nn_rv_targets_p2(const uint8_t *phase, const uint8_t *pap2, size_t v0, size_t n, uint8_t *t, uint8_t *m);   /* the same from the 2-bit packed papyrus plane (nn_lab_pack bits 2), voxels [v0, v0 + n) of it */
 void nn_rv_verso_w(const uint8_t *t, uint8_t *m, size_t n, float w);   /* train --rv-verso-w: verso-side papyrus loss weight x w */
 void nn_rv_fuse(void *lg, size_t n, int h16);   /* predict --channel rv: [recto | verso] logits -> channel 0 = logit((1 + p_r - p_v) / 2) */
 void nn_ink_targets(const uint8_t *ink, size_t n, uint8_t *t, uint8_t *m);   /* train --ink-head: ink prob254 (255 unknown) -> target t (x255) and mask m (known) */

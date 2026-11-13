@@ -138,6 +138,10 @@ typedef struct {
     int pack_tm;             /* targets and mask as one code byte per voxel (batch.tm: SAMPLE_TM_* bits; t, m nullptr): every target value
                                 0 or 255 and the mask 0 / 1 (hard two-class targets, e.g. the side encoding; a soft value aborts). The
                                 trainer unpacks on the device (nn_unpack_tm): host batches 3 -> 1 byte per voxel */
+    float lat_direct_p;      /* train --lat-direct-p: a training window of a source with a "latvol" twin at its level is a direct window with this
+                                probability (0: never, no draw): cell-aligned, no augmentation at all (cfg.augment 0 for it), its CT from the latvol array
+                                (the rebuilt bytes: labels, statistics, the fine stem) and its packed cell streams in batch.lvc for the device (the
+                                trunk's input from the stored cells, predict's path); its replays are voxel windows of the same bytes */
     int replay;              /* train --replay K (>= 1): each built window is delivered K times, replays 2..K with a new device-side augmentation drawn
                                 on the CPU from the same source-grid planes (a new symmetry + warp record, scanner plan without new label-touching ops,
                                 intensity jitter): sampler_replay_ok lists the configurations (--gpu-aug 2 batches) */
@@ -227,12 +231,18 @@ typedef struct {
     int xch;                 /* input channels stored per sample in x / x16 (4, 5 with aux, 7 with cond, 1 with gpu_input) */
     void **mil0; int *nmil0;   /* cfg.ink_mil: the same rays on the source grid (before the symmetry / warp), re-mapped by --replay's re-drawn geometry */
     void **mil; int *nmil;   /* cfg.ink_mil: per window its inkray list (malloc'd, kept with the slot) and count; source-grid window voxels, held-out boxes + guard dropped */
+    uint8_t *latd;           /* cfg.lat_direct_p: B, 1 where the window is a direct window (its streams below), else 0 */
+    uint8_t *lvc; size_t lvcap;   /* B x lvcap: each direct window's packed latvol streams (latvol_read.h lv_read_box) */
+    void *lvr; int lvmax;    /* B x lvmax lv_chunk_ref (nn_latvol.h): the streams' offsets in its lvc part and first cells */
+    int *nlvr; size_t *lvn;  /* B: the streams and bytes of each direct window */
+    const void **lvz;        /* B: the latvol array (z3 *) of each direct window (its codec: z3_latvol) */
     int8_t *emb;             /* cfg.emb_ch: B x emb_ch x (Pz / emb_div) x (P / emb_div)^2 feature targets (int8 x 127 unit vectors, channel planes; a cell
                                 with all channels 0 has none) */
 } batch;
 #define SAMPLE_AXR(P) (4 + 2 * (P))   /* = unet.h UNET_AXR(P) */
 /* a window chain's next corner on (sample_cfg.chain_p; level-l voxels of a scan of shape `shape`): mode 0 along the axis, 1 around it,
    dir +-1, step_frac x P. 0: on is inside the scan */
+void sample_lat_direct_stats(uint64_t *n, uint64_t *over);   /* --lat-direct-p: direct windows built, draws over the stream buffer */
 int sample_chain_next(const axis *ax, int l, const int64_t shape[3], int Pz, int P, int mode, int dir, float step_frac, const int64_t o[3], int64_t on[3]);
 /* the scroll-axis record (SAMPLE_AXR(max(D, P)) floats, unet.h UNET_AXR) of a window of D x P x P source voxels at corner o (level
    voxels), the axis centres cyz / cxz per source z, seen through the cube symmetry (perm, flip as sample.c sym); unwarped. Exposed for

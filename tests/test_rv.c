@@ -44,6 +44,23 @@ int main(int argc, char **argv) {
                                           "voxel %d (phase %d, papyrus %d): targets %d / %d mask %d, want %d / %d mask %d", i, ph[i], pap[i], t[i], t[N + i], m[i], wt0[i], wt1[i], wm[i]);
         nn_free(dp); nn_free(dq); nn_free(dt); nn_free(dm);
     }
+    {   /* (1b) nn_rv_targets_p2 on the plane packed to 2 bits (nn_lab_pack) == nn_rv_targets on its unpacked bytes and on the raw bytes: every
+           (phase, papyrus) byte pair, read at offsets that start inside a packed byte */
+        enum { M = 65536 + 37 }; uint8_t *ph = malloc(M), *pap = malloc(M), *t0 = malloc(2 * M), *t1 = malloc(2 * M), *t2 = malloc(2 * M), *m0 = malloc(M), *m1 = malloc(M), *m2 = malloc(M);
+        for (int i = 0; i < M; i++) { ph[i] = (uint8_t)(i & 255); pap[i] = (uint8_t)((i >> 8) * 7 + (i >> 8) / 37); }   /* (papyrus: every byte value over the 256 rows) */
+        for (int i = 0; i < 65536; i++) pap[i] = (uint8_t)(i >> 8);
+        uint8_t *dp = nn_malloc(M), *dq = nn_malloc(M), *d2 = nn_malloc(M / 4 + 8), *du = nn_malloc(M), *dt = nn_malloc(2 * M), *dm = nn_malloc(M);
+        nn_h2d(dp, ph, M); nn_h2d(dq, pap, M); nn_lab_pack(0, dq, d2, M, 2);
+        static const size_t v0s[4] = {0, 1, 2, 4099}; size_t bad = 0, tot = 0;
+        for (int q = 0; q < 4; q++) { const size_t v0 = v0s[q], n = M - v0 - (size_t)q;
+            nn_rv_targets(dp + v0, dq + v0, n, dt, dm); nn_sync(); nn_d2h(t0, dt, 2 * n); nn_d2h(m0, dm, n);
+            nn_lab_unpack(0, d2, du, v0, n, 2); nn_rv_targets(dp + v0, du, n, dt, dm); nn_sync(); nn_d2h(t1, dt, 2 * n); nn_d2h(m1, dm, n);
+            nn_rv_targets_p2(dp + v0, d2, v0, n, dt, dm); nn_sync(); nn_d2h(t2, dt, 2 * n); nn_d2h(m2, dm, n);
+            bad += memcmp(t0, t1, 2 * n) != 0 || memcmp(m0, m1, n) != 0 || memcmp(t1, t2, 2 * n) != 0 || memcmp(m1, m2, n) != 0; tot += n; }
+        CHECK(bad == 0, "nn_rv_targets_p2: %zu of 4 reads differ from nn_rv_targets on the unpacked / raw plane", bad);
+        if (!bad) printf("rv targets from the 2-bit papyrus plane: %zu voxels (every phase x papyrus byte pair, 4 offsets) equal the unpacked and the raw paths\n", tot);
+        nn_free(dp); nn_free(dq); nn_free(d2); nn_free(du); nn_free(dt); nn_free(dm); free(ph); free(pap); free(t0); free(t1); free(t2); free(m0); free(m1); free(m2);
+    }
     char d[] = "/tmp/test_rv_XXXXXX"; if (!mkdtemp(d)) return 1;
     CHECK(!sh("%s %s/fx 256 2 > %s/fx.log 2>&1", argv[2], d, d), "fixture");
     const char *common = "--task unwrap2 --rv 1 --rv-iso 100 --levels 1 --P 64 --B 1 --gpus 0 --workers 2 --sampler-slots 4 --val-batches 2 --val-every 1000 --log-every 1 "

@@ -16,6 +16,11 @@
 #include "view.h"
 #include "scrollaug.h"
 #include "sample_emb.h"
+#include "nn_latvol.h"
+/* (latvol_read.c: weak, so binaries without it link; --lat-direct-p then draws no direct window) */
+[[gnu::weak]] int lv_read_box(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *buf, size_t cap, lv_chunk_ref *refs, int maxref, size_t *bytes, int nthreads);
+static _Atomic uint64_t g_latd_n, g_latd_over;   /* --lat-direct-p: direct windows built; draws whose streams were over batch.lvcap (kept as plain unaugmented windows) */
+void sample_lat_direct_stats(uint64_t *n, uint64_t *over) { *n = g_latd_n; *over = g_latd_over; }
 #include <malloc.h>
 #include <math.h>
 #include <stddef.h>
@@ -322,12 +327,19 @@ static batch alloc_batch(const sample_cfg *c, uint8_t *c255) {
     b.inkb = c->ink_bits ? halloc((size_t)c->B * p3 / 8) : nullptr; b.ink_it = c->ink_bits ? calloc((size_t)c->B, sizeof *b.ink_it) : nullptr;
     b.mil = c->ink_mil ? calloc((size_t)c->B, sizeof *b.mil) : nullptr; b.nmil = c->ink_mil ? calloc((size_t)c->B, sizeof *b.nmil) : nullptr;
     b.mil0 = c->ink_mil ? calloc((size_t)c->B, sizeof *b.mil0) : nullptr; b.nmil0 = c->ink_mil ? calloc((size_t)c->B, sizeof *b.nmil0) : nullptr;
+    b.latd = nullptr; b.lvc = nullptr; b.lvcap = 0; b.lvr = nullptr; b.lvmax = 0; b.nlvr = nullptr; b.lvn = nullptr; b.lvz = nullptr;   /* (b is not zeroed) */
+    if (c->lat_direct_p > 0) {   /* (lvcap: 1/4 B per voxel; latvol at C 29 step 0.25 is ~0.19 B per material voxel; a larger window is not direct) */
+        b.lvcap = (p3 / 4 + 63) & ~(size_t)63; b.lvmax = (int)((PZ(c) / 128 + 2) * (c->P / 128 + 2) * (c->P / 128 + 2));
+        b.latd = calloc((size_t)c->B, 1); b.lvc = malloc((size_t)c->B * b.lvcap); b.lvr = malloc((size_t)c->B * b.lvmax * sizeof(lv_chunk_ref));
+        b.nlvr = calloc((size_t)c->B, sizeof *b.nlvr); b.lvn = calloc((size_t)c->B, sizeof *b.lvn); b.lvz = calloc((size_t)c->B, sizeof *b.lvz);
+        if (!b.latd || !b.lvc || !b.lvr || !b.nlvr || !b.lvn || !b.lvz) { fprintf(stderr, "sampler: --lat-direct-p buffers\n"); abort(); }
+    }
 #undef RHALLOC
     b.emb = c->emb_ch ? halloc((size_t)c->B * c->emb_ch * (size_t)(PZ(c) / c->emb_div) * (c->P / c->emb_div) * (c->P / c->emb_div)) : nullptr;
     return b;
 }
 
-static void free_batch(batch *b, int B) { if (b->nbank) { b->side = b->w4 = b->wcomp = b->ink = nullptr; for (int j = 0; j < 4; j++) b->aux[j] = nullptr; for (int q = 0; q < b->nbank; q++) hfree(b->bank[q]); b->nbank = 0; } if (b->mil) { for (int q = 0; q < B; q++) { free(b->mil[q]); free(b->mil0[q]); } free(b->mil); free(b->nmil); free(b->mil0); free(b->nmil0); } if (b->w4r) { for (int q = 0; q < B; q++) { w4runs *r = (w4runs *)b->w4r + q; free(r->off); free(r->ro); free(r->cb); } free(b->w4r); } if (b->ink) hfree(b->ink); for (int j = 0; j < 4; j++) if (b->aux[j]) hfree(b->aux[j]); if (b->inkb) hfree(b->inkb); free(b->ink_it); if (b->ct8) hfree(b->ct8); if (b->aug) hfree(b->aug); if (b->emb) hfree(b->emb); if (b->xv) hfree(b->xv); free(b->vok); free(b->chid); free(b->chidx); free(b->choff); if (b->w4) hfree(b->w4); if (b->wcomp) hfree(b->wcomp); if (b->tm) hfree(b->tm); if (b->rad) hfree(b->rad); if (b->axr) hfree(b->axr); if (b->pap) hfree(b->pap); if (b->wind) hfree(b->wind); if (b->band) hfree(b->band); if (b->side) hfree(b->side); if (b->pm) hfree(b->pm); if (b->x) hfree(b->x); if (b->x16) hfree(b->x16); if (b->t) hfree(b->t); if (b->m) hfree(b->m); hfree(b->w); free(b->src); free(b->level); free(b->um); free(b->corner); if (b->sheet) { sheet_batch_free(b->sheet[0]); free(b->sheet); } }
+static void free_batch(batch *b, int B) { free(b->latd); free(b->lvc); free(b->lvr); free(b->nlvr); free(b->lvn); free(b->lvz); if (b->nbank) { b->side = b->w4 = b->wcomp = b->ink = nullptr; for (int j = 0; j < 4; j++) b->aux[j] = nullptr; for (int q = 0; q < b->nbank; q++) hfree(b->bank[q]); b->nbank = 0; } if (b->mil) { for (int q = 0; q < B; q++) { free(b->mil[q]); free(b->mil0[q]); } free(b->mil); free(b->nmil); free(b->mil0); free(b->nmil0); } if (b->w4r) { for (int q = 0; q < B; q++) { w4runs *r = (w4runs *)b->w4r + q; free(r->off); free(r->ro); free(r->cb); } free(b->w4r); } if (b->ink) hfree(b->ink); for (int j = 0; j < 4; j++) if (b->aux[j]) hfree(b->aux[j]); if (b->inkb) hfree(b->inkb); free(b->ink_it); if (b->ct8) hfree(b->ct8); if (b->aug) hfree(b->aug); if (b->emb) hfree(b->emb); if (b->xv) hfree(b->xv); free(b->vok); free(b->chid); free(b->chidx); free(b->choff); if (b->w4) hfree(b->w4); if (b->wcomp) hfree(b->wcomp); if (b->tm) hfree(b->tm); if (b->rad) hfree(b->rad); if (b->axr) hfree(b->axr); if (b->pap) hfree(b->pap); if (b->wind) hfree(b->wind); if (b->band) hfree(b->band); if (b->side) hfree(b->side); if (b->pm) hfree(b->pm); if (b->x) hfree(b->x); if (b->x16) hfree(b->x16); if (b->t) hfree(b->t); if (b->m) hfree(b->m); hfree(b->w); free(b->src); free(b->level); free(b->um); free(b->corner); if (b->sheet) { sheet_batch_free(b->sheet[0]); free(b->sheet); } }
 
 /* Level choice for a source: restrict cfg.level_p to levels the CT has and every target of the source
    can provide (pyramid: same level; regions: levels 0..1). Returns -1 if nothing is usable. */
@@ -363,8 +375,8 @@ static inline int64_t hb_n(const source *h, int k, int d) { return k ? h->hold[k
 static int same_ct(const source *a, const source *b) {
     return a == b || (a->um == b->um && !strcmp(a->ct_key, b->ct_key) && !strcmp(store_root(a->s), store_root(b->s)));
 }
-static int training_hits_holdout_(const sampler *sp, const source *s, const int64_t o[3], int l, int only_rej) {
-    const int64_t span[3] = {(int64_t)PZ(&sp->cfg) << l, (int64_t)sp->cfg.P << l, (int64_t)sp->cfg.P << l};
+static int hits_holdout_span(const sampler *sp, const source *s, const int64_t o[3], int l, int only_rej, int unit) {   /* unit: a 1-voxel span, not the window */
+    const int64_t span[3] = {(int64_t)(unit ? 1 : PZ(&sp->cfg)) << l, (int64_t)(unit ? 1 : sp->cfg.P) << l, (int64_t)(unit ? 1 : sp->cfg.P) << l};
     for (int i = 0; i < sp->S->n; i++) {
         const source *h = &sp->S->src[i]; if (!src_nhold(h) || !same_ct(s, h)) continue;
         for (int k = 0; k < src_nhold(h); k++) {
@@ -376,6 +388,7 @@ static int training_hits_holdout_(const sampler *sp, const source *s, const int6
     }
     return 0;
 }
+static int training_hits_holdout_(const sampler *sp, const source *s, const int64_t o[3], int l, int only_rej) { return hits_holdout_span(sp, s, o, l, only_rej, 0); }
 #define SL_OTHER_RET() do { const int si_ = (int)(s - sp->S->src), l_ = l < 0 ? 0 : l; if (si_ >= 0 && si_ < 64 && l_ < MAXLEV) atomic_fetch_add(&sp->rej_sl[si_][l_][SL_OTHER], 1); return 1; } while (0)
 #define SL_ADD(k) do { const int si_ = (int)(s - sp->S->src); if (si_ >= 0 && si_ < 64 && l >= 0 && l < MAXLEV) atomic_fetch_add(&sp->rej_sl[si_][l][(k)], 1); } while (0)
 /* holdout mask mode: the held-out boxes (every same-CT source's) a training window of n level-l voxels at o overlaps, each grown by
@@ -415,23 +428,31 @@ static int hold_mask_mode(const sampler *sp, const source *s) {   /* the draw's 
     const sample_cfg *c = &sp->cfg;
     return (s->hold_mode ? s->hold_mode == 1 : !c->holdout_reject) && !c->sheet && !c->cond && !c->emb_ch;
 }
-static int training_corner_exists(const sampler *sp, const source *s, int l, const int64_t lo[3], const int64_t hi[3]) {
-    /* mask mode: a window may overlap holdout boxes (they are masked), only the reject boxes forbid it: the eligibility check had kept the
-       reject rule, so at P 1024 every corner of PHerc1667 at 4.8 um touched one of its 2048^3 boxes and the source was excluded */
-    const int rej = hold_mask_mode(sp, s);   /* (mask mode: only the reject boxes count) */
+static int corner_search(const sampler *sp, const source *s, int l, const int64_t lo[3], const int64_t hi[3], int rej, int unit) {
     int nh = 0; for (int i = 0; i < sp->S->n; i++) nh += src_nhold(&sp->S->src[i]);
     int n[3] = {1, 1, 1}; int64_t v[3][nh + 1], f = (int64_t)1 << l;
     for (int d = 0; d < 3; d++) v[d][0] = lo[d];
-    if (!training_hits_holdout_(sp, s, lo, l, rej)) return 1;
+    if (!hits_holdout_span(sp, s, lo, l, rej, unit)) return 1;
     for (int i = 0; i < sp->S->n; i++) {
         const source *h = &sp->S->src[i]; if (!src_nhold(h) || !same_ct(s, h)) continue;
         for (int k = 0; k < src_nhold(h); k++)
             for (int d = 0; d < 3; d++) { int64_t end = (hb_o(h, k, d) + hb_n(h, k, d) + f - 1) / f; if (end > lo[d] && end <= hi[d]) v[d][n[d]++] = end; }
     }
     for (int z = 0; z < n[0]; z++) for (int y = 0; y < n[1]; y++) for (int x = 0; x < n[2]; x++) {
-        int64_t o[3] = {v[0][z], v[1][y], v[2][x]}; if (!training_hits_holdout_(sp, s, o, l, rej)) return 1;
+        int64_t o[3] = {v[0][z], v[1][y], v[2][x]}; if (!hits_holdout_span(sp, s, o, l, rej, unit)) return 1;
     }
     return 0;
+}
+static int training_corner_exists(const sampler *sp, const source *s, int l, const int64_t lo[3], const int64_t hi[3]) {
+    /* mask mode: a window may overlap holdout boxes (they are masked), only the reject boxes forbid it: the eligibility check had kept the
+       reject rule, so at P 1024 every corner of PHerc1667 at 4.8 um touched one of its 2048^3 boxes and the source was excluded (holdfit
+       f1424a2). Mask mode still refuses a source whose holdout boxes cover every voxel the windows can reach (the union of same-CT holdouts
+       over the whole scan: every window would be fully masked): a free voxel in [lo, hi + window - 1] (the boxes without their guard) */
+    const int rej = hold_mask_mode(sp, s);   /* (mask mode: only the reject boxes count) */
+    if (!corner_search(sp, s, l, lo, hi, rej, 0)) return 0;
+    if (!rej) return 1;
+    const int64_t vhi[3] = {hi[0] + PZ(&sp->cfg) - 1, hi[1] + sp->cfg.P - 1, hi[2] + sp->cfg.P - 1};
+    return corner_search(sp, s, l, lo, vhi, 0, 1);
 }
 static int level_ok(sampler *sp, source *s, int si, int l, int region_ch) {
     int key = region_ch >= 0 ? 1 : 0;
@@ -2545,6 +2566,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
     if (sp->cfg.restore) return draw_restore(sp, b, i, r, big);
     double pt = sp->prof ? tnow() : 0;
     const sample_cfg *c = &sp->cfg;
+    if (b->latd) b->latd[i] = 0;
     const int P = c->P, Pz = PZ(c);   /* window Pz x P x P (Pz < P: a slab) */
     const size_t p3 = P3(sp);
     /* a window chain: continue (cont: the chain's next window; any rejection ends it) or start one (the decision drawn only with chains on) */
@@ -2627,6 +2649,16 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
         if (nc > 0) { const unsigned k = atomic_fetch_add(&nat, 1) % (unsigned)nc;
                       for (int d = 0; d < 3; d++) { o[d] = ac[k][d]; if (o[d] > m->shape[d] - n[d]) o[d] = m->shape[d] - n[d]; if (o[d] < 0) o[d] = 0; } }
     }
+    /* --lat-direct-p: a direct window (sample.h): drawn only for a source with a "latvol" twin at this level (no draw otherwise, so 0 and
+       sources without one keep the stream unchanged); cell-aligned; from here on the window is built with augment 0 from the latvol array */
+    sample_cfg dcfg; int direct = 0;
+    if (c->lat_direct_p > 0 && b->latd && lv_read_box && c->augment && !chained && !c->cover && !c->holdout && region_ch < 0 && zoom_out == 0) {
+        z3 *lz = source_lat(s, l);
+        if (lz && runif(r) < c->lat_direct_p) {
+            int al = 1; for (int d = 0; d < 3; d++) al &= !(o[d] & 3) && !(n[d] & 3);
+            if (al) { direct = 1; dcfg = *c; dcfg.augment = 0; c = &dcfg; ct = lz; }
+        }
+    }
     /* a training window over a held-out box: masked (the default: kept, every label unknown in the box + guard, on the source grid before
        any symmetry / warp) or rejected; the sheet prior, the conditioning planes and the distillation targets have no voxel mask: reject */
     int32_t hb[HB_MAX][6]; int nhb = 0;
@@ -2664,6 +2696,12 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
         if (ok && !crushed && !torn && !delam && c->curv_p > 0 && runif(r) < c->curv_p && (curved = curv_draw(sp, s, l, o, P, psh, r, big + p3, 8 * p3, ctu)) < 0) return -1;
     }
     if (!crushed && !torn && !delam && !curved && z3_read(ct, o, n, ctu, g_rt)) return -1;
+    if (direct) {   /* the window's cell streams for the device (the trunk's input); over the buffer: a plain unaugmented window of the same bytes */
+        size_t nb = 0; const int nr = lv_read_box(ct, o, n, b->lvc + (size_t)i * b->lvcap, b->lvcap, (lv_chunk_ref *)b->lvr + (size_t)i * b->lvmax, b->lvmax, &nb, g_rt);
+        if (nr == -1) return -1;
+        if (nr >= 0) { b->latd[i] = 1; b->nlvr[i] = nr; b->lvn[i] = nb; b->lvz[i] = ct; atomic_fetch_add(&g_latd_n, 1); }
+        else atomic_fetch_add(&g_latd_over, 1);
+    }
     PROF_MARK(PS_READ);
     size_t nz = 0;
     double sum = 0, sq = 0;
@@ -3812,6 +3850,7 @@ int sampler_replay_ok(const sample_cfg *c) {
    (rotation forced when none came up); the scanner plan is drawn anew with the label-touching ops (seam, air, dropped slices,
    cutouts, chunk dropouts) carried over from the window's own plan, so its labels stay exact; new intensity jitter and noise seed */
 static void replay_window(sampler *sp, batch *b, int i, int rep, uint8_t **scr) {
+    if (b->latd) b->latd[i] = 0;   /* (a direct window's replays: voxel windows of the same bytes, augmented as any other) */
     const sample_cfg *c = &sp->cfg; const int Pz = PZ(c), P = c->P; const size_t p3 = P3(sp);
     char *rec = (char *)b->rad + (size_t)i * NN_RAD_REC(Pz); int32_t h[8]; memcpy(h, rec, sizeof h);
     float *cyz = malloc(2 * (size_t)Pz * sizeof *cyz); if (!cyz) abort(); float *cxz = cyz + Pz;

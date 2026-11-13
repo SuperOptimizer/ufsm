@@ -34,7 +34,7 @@ int phase_onfly_config(int gpu, int slots, int budget_mb, int reserve);
 int phase_onfly_tile_edge(float rmax);
 /* counters since the start: derived reads, tiles computed / skipped (no codes), output voxels, tile voxels, seconds in the pair rule
    and in the codes reads (summed over threads) */
-typedef struct { uint64_t reads, tiles, skipped, vox_out, vox_tile, gpu_tiles; double s_pair, s_read; } phase_onfly_stats;   /* gpu_tiles: codes decoded on the device */
+typedef struct { uint64_t reads, tiles, skipped, vox_out, vox_tile, gpu_tiles; double s_pair, s_read, s_wait; } phase_onfly_stats;   /* s_wait: seconds queued for a tile buffer */     /* gpu_tiles: codes decoded on the device */
 void phase_onfly_get_stats(phase_onfly_stats *st);
 /* tests: the codes of the box o / n decoded on the device (band_pair_gpu_codes with rmax 0) into out; 0 ok, else the GPU path's code */
 int phase_onfly_decode_gpu(z3 *codes, const int64_t o[3], const int64_t n[3], uint8_t *out);

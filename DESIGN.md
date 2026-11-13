@@ -506,6 +506,93 @@ same verdicts as the 4-level net:
 | MX-fp8 rn | bit-identical | identical | 7e-3 (perturbed CT: 0.49) | 5e-3 |
 | fp4 sr | bit-identical | identical | at the seed-to-seed spread | at the seed-to-seed spread |
 
+## The U2 sampler at P 1024: where the workers wait, the codes pooling without its atan2 (2026-11-12, branch pool2fast-20261112)
+
+(Merged 2026-11-13 into integ19 as numbers only: the code of this branch is superseded. Its pooling loop gave way to the exact host /
+device bin-search pooling in codes_pool.h with the pooled tiles on the GPU (26528b9, below), and the branch-free coverage shares landed as
+064fc4d. The slot / memory findings stand.)
+
+Pod (one RTX PRO 6000, 40 CPUs, a 175 GB cgroup shared by every job), `UFSM_SAMPLER_ONLY` with U2's args (`sources-u2pod.json`: 9 band,
+2 mesh, 8 ink sources; replay 3), the GPU exclusive but the CPUs not (load average ~30). What limited the sampler, in the order found:
+
+- **`--sampler-slots` caps the builders, not `--workers`.** 24 workers on 10 slots built 9 windows at once (589 Mvox/s, 6.3 busy cores);
+  the log line "N workers but M slots" says so. Slots must be workers + 2.
+- **Host memory then caps the slots**: with the ink sources a slot is ~7 GB and a worker's scratch ~4 GB (12 workers / 14 slots: 135-147 GB
+  RSS; 24 / 26 and 32 / 34 passed 166 GB and were stopped). On this pod no more than ~12 workers fit beside nothing else, 8 / 10 beside
+  the trainer's own memory under a 130 GB cap (U2's launch).
+- **The pooled-codes tiles** (levels whose phase comes "from the codes pooled 2x (on the fly)") never reach the device: the pooled codes
+  are a derived array without stored chunks, so `z3_chunk_raw` fails and `codes_pool2_box` runs on the reading thread, one double atan2
+  per labelled 2^3 block. Stack samples (the run as gdb's child, 10 interrupts in steady state, 12 workers / 14 slots / 4 onfly slots):
+  2.6 workers inside the pooling loop, 1.5 queued in `ob_take` for a buffer set behind them. The loop now gives the same bytes without
+  the atan2 in all but the near-tie blocks: runs of 8 empty blocks are skipped on two 64-bit tests per row, equal children return their
+  own code (the float sums' angle is theirs within 1e-6 codes), and for mixed blocks a polynomial angle (error < 1e-4 rad = 0.004
+  codes) decides the rounding wherever it lands more than 0.03 codes from a half; only the remaining near ties call the reference
+  atan2. After: 0.1 workers in the pooling, 0.6 in `ob_take`. `test_phase_pool` compares it with the reference loop (`codes_pool2_ref`,
+  `UFSM_POOL2_REF=1`): 64260 equal-children blocks, 30 M random blocks (spreads of 1-6 steps around a base code, wraps at 252, holes,
+  conflicts) and three boxes of a synthetic 150 x 201 x 333 codes array with odd edges, 0 bytes differ.
+- **The sampler-only mode capped itself**: its consuming thread computed the material / phase-known shares with a branch per voxel,
+  ~1.3 s per P 1024 batch, so the mode could not report much over 0.7 batches/s (4.4 of 12 workers waited for a slot behind it once the
+  pooling was fixed). Every rate measured before this commit (522-787 Mvox/s) is a floor for that reason; the shares are now taken once
+  per window, branch-free per 64 k voxels (`UFSM_SAMPLER_COV=0`: none), and the per-source "windows" count new windows, not batches.
+  Not re-measured: with U2 resident on the pod a full-list sampler-only run no longer fits the cgroup.
+- U2 itself (8 workers / 10 slots / 4 onfly slots) logs "wait 0%" from step 200 at 0.35-0.38 samp/s beside another P 1024 training on the
+  card: the step, not the sampler, is its limit.
+
+## PHerc1299 B3 labels: the direction check, its mask, phase on the fly + one weight array (2026-11-12, branch fibd-20261111)
+
+PHerc1299's snapped wraps (71 of 88 kept, surf-labels kept share 0.9487) failed the stored-phase guard: `phase-check` outward 0.890 over
+23 558 chunks, box range 0.161..1.000. Per 128^3 cell outside the held-out band (17 383 cells): 0.36 of the voxel pairs sit in cells
+>= 0.95, 0.48 in 0.80-0.95, 0.16 below; 14 cells in the whole scroll under 0.4. Mixed, not flipped.
+
+**The raw outward share is confounded with sheet orientation.** On 500 sampled cells it correlates 0.83 with the mean |cos| between the
+phase gradient and the radius: cells under 0.6 have mean |cos| 0.15 (sheets running along the radius; the sign of the radial component
+is noise). Counting only voxels whose in-plane gradient lies within 45.6 degrees of the radius (|cos| > 0.7, >= 3 codes / voxel:
+`phase_outward_aligned`, `phase-check --cells` / `--aligned-cos`) gives 0.9957 outward over the scroll outside the band (0.33 of the
+pairs aligned), 1.000 / 0.996 in the cells whose raw score is >= 0.95 / 0.90-0.95. **Use the aligned share for future scrolls**; a 0.95
+raw threshold would have discarded 64% of correct labels here. (Without the 3-code floor an azimuth-only phase, whose quantised
+differences are 0 / 1 code, produced spurious aligned voxels: test_phase_check covers both.)
+
+**Fibre gate vs outward: independent.** spirals' fiber-judge tiles (Paris 4 ramp 189..378 persistent /m) against the raw cell score:
+correlation -0.09; median rate 411 / 373 / 401 /m in the < 0.8 / 0.8-0.95 / >= 0.95 bins, i.e. at or above the ramp's top everywhere
+(the same miscalibration latres measured on the 8.64 um 1218 / 1447 scans). Shares of pairs outside the band:
+
+| fibre tile | outward >= 0.95 | 0.80-0.95 | < 0.80 | total |
+|---|---|---|---|---|
+| factor 0 | 0.224 | 0.229 | 0.088 | 0.541 |
+| partial | 0.105 | 0.230 | 0.060 | 0.395 |
+| factor 1 | 0.022 | 0.009 | 0.001 | 0.033 |
+| unjudged | 0.011 | 0.014 | 0.006 | 0.031 |
+
+**The mask (coordinator's option B)**, `scripts/univ/b3_1299_mask.py` -> a `phase-coh --box-scale` file (first box wins), then
+`ufsm phase-coh --coh 0 --papyrus 64 --pap-dilate 2` on the gated phase:
+- the held-out band + guard (level-2 z < 4167): 0;
+- direction-masked 128^3 cells: 0. (a) fibre factor 0 AND raw outward < 0.8: 1922 cells, 0.088 of the pairs; (b) reversed by the aligned
+  test (>= 20 000 aligned pairs, ~1% of a cell, binomial sd < 0.004, of which < 0.5 outward): 314 cells, 0.021; both 0.008. Total 2113
+  cells, 0.101 of the pairs; kept 0.899;
+- fibre tiles: 0.5 + 0.5 x factor (floored: the ramp must not act as a mask through the weight), 1 elsewhere;
+- air (CT < 64 with no CT >= 64 within 2 voxels): 0.131 of the known voxels; the gt-gate's removed cells and every surf-labels ignore are
+  already unknown in the gated phase and get weight 0.
+Result `/vesuvius/ufsm/univ/b3/PHerc1299/mask/weight.zarr` (1.4 GB): 0.42 of the known voxels at 0, 0.39 at 0.5-0.6, mean 0.35.
+
+**Gate numbers with the band excluded**: the gated phase keeps 0.962 of the labelled phase's pairs outside the band (gt-gate + shard rule
+remove 0.038; 0.070 of all sheet voxels including the band), aligned outward 0.9961. The band cells held 0.258 / 0.257 of the pairs of
+the labelled / gated phase: the labels were built while holdouts-1299.json had the band in level-2 numbers (an empty corner, "holdout
+0"), so they hold phase there; the weight, the band's holdout_reject and the sampler keep training out. surf-labels now fails on a holdout
+box with no labelled voxel (test_surflabels).
+
+**PHerc1218 rescored the same way** (its B3 gate rerun, 2026-11-12 04:16: gt-gate removed 0.179 of the sheet voxels, every gated cell for
+sheet direction vs m7, 2319 shards): over the gated phase's 103 696 cells, raw outward 0.9852 (pass), 0.659 of the pairs aligned (vs
+0.33 on 1299: 1218's sheets face its axis), aligned outward **0.9998**. By raw bin, the pair shares are 0.007 / 0.010 / 0.016 / 0.035 /
+0.933 for < 0.6 / 0.6-0.8 / 0.8-0.9 / 0.9-0.95 / >= 0.95, with aligned outward 0.865 / 0.965 / 0.990 / 0.998 / 0.9999. By the 1299 rule
+27 cells read reversed (0.0002 of the pairs): no direction mask for 1218. On the aligned share the two scrolls are comparable: 1218
+0.9998, 1299 0.9961 gated (0.9957 labelled) outside its band.
+
+**Shipped form**: phase on the fly from the kept wraps' codes (2.0 GB, `codes.zarr`, rmax 20 = surf-labels --radius 20) plus the one
+weight array; no stored phase. `phase-onfly --ref (label phase) --weight (the array)` on 12 windows of 512^3: 30.4 M voxels differ from
+the stored label phase overall (the label phase has surf-labels' ignored voxels blanked; the rule fills them), **0 of 587 330 312 voxels
+differ under a non-zero weight**. CPU pair rule ~15 s per 512^3 window (u1 holds both GPUs). The entry `PHerc1299-b3` is in
+mksources_univ.py behind B3=1 until its sampler-only band line is read in a GPU window.
+
 ## One P 1024 window across both 5060 Tis: the z split for the latent net (design, 2026-11-12, branch splitwin-20261112)
 
 User: "if we can split one window across both gpus rather than just doing 2 separate inferences that would also be preferred" and
@@ -1711,6 +1798,36 @@ same source's on the absolute-um group. On master's binary, (2) logs "relative e
 
 Rule for downloaded groups (to diskclean): absolute-um scales only, each group checked with `ufsm info` and a sampler-only draw before
 a run points at it.
+## Head slabs: the derived targets built once a step (2026-11-12, branch uperf-20261112)
+
+`head_slab_pass` runs twice a step (statistics, then gradients) and built every slab's derived targets and masks in both: phase 2 + 1,
+rv 2 + 1, normal / density 7 + 1 bytes a voxel. They are now kept from the statistics pass (`gpu_state.tc`, 14 B a voxel: 10 GB at P 896,
+15 GB at P 1024, 29 GB at P 1280; with `--hs-tcache 1` only) and the gradient pass points `sidet / sidem / rvt / rvm / nt / nm` at the kept slab instead of running
+`nn_phase_targets`, the rv block, `nn_phase_trunc`, `nn_packed_mask_z` and `nn_unwrap_targets2_z` again. Valid for one step only
+(`tc_ok`: set by a training statistics pass, cleared by the gradient pass and by any other statistics pass), so a replay of the window
+or a validation pass never reads another step's targets. The ink targets are not in it.
+
+- Opt-in: `--hs-tcache 1` (`UFSM_HS_TCACHE=0 / 1` overrides the flag, for tests). Never automatic: on a card shared with other jobs
+  a choice made from the free memory of one moment takes room a neighbour is about to need (pod, 2026-11-12: U2 beside another P 1024
+  training had 0.5 GB free at a restart). With the flag the memory planner keeps the cache out of its budget ("memory: --hs-tcache keeps
+  N GB free ..."): 14 B a voxel plus 128 planes of slab rounding, 16.9 GB at P 1024, allocated at the first training step; if that
+  allocation fails the run goes on building the targets in both passes and says so. On the 16 GB cards at P 1024 it does not fit.
+- Numbers. Pod, P 896, the poddry recipe: the second target build is ~90 of 850 ms a step. U2's exact recipe at P 1024 (ink head, MIL,
+  fstem 16), profiled beside U2 and another training (2790 ms a step, contended): targets 249 ms in the statistics pass, 240 ms in the
+  gradient pass, so the cache is worth ~9% of that step; the cache-on timing itself was not obtained.
+- Equality. `UFSM_HS_TCACHE_CHECK=1` makes the gradient pass build every slab's targets as without the cache and compare all six
+  planes byte for byte, aborting at the first difference. `tests/test_tcache.sh` (wind fixture, `--lat 4 --lat-guide 3 --rv 2 --replay 3
+  --packed-weight 8`, with and without `--fstem 8`): 6 gradient passes, 22 MB of bytes equal, losses equal to `UFSM_HS_TCACHE=0`. U2's
+  exact flags at P 1024 on the pod: 8 gradient passes, 120 GB of bytes equal (no ink window among them as far as the log shows).
+  Parameter hashes are no evidence here: `--det 1` runs differ from each other after two updates (see "what --det 1 fixes").
+
+- The rv targets read the papyrus plane packed (2026-11-12, branch hsone-20261112). With the label planes kept on the device the head
+  slabs upload nothing, yet both passes ticked "label h2d" (94 + 72 ms of U2's contended 2790 ms step): the 2-bit papyrus plane was
+  unpacked into a slab buffer per slab and pass for `nn_rv_targets` alone. `nn_rv_targets_p2` reads the three classes from the packed
+  plane (`UFSM_RV_P2=0`: the unpack path). `test_rv` (1b): every (phase, papyrus) byte pair at four offsets, the packed read equal to
+  the unpacked and to the raw plane's targets. Not timed yet (the pod slot); written from the code reading, with the correction that
+  two other planned items already existed: the labels are uploaded once a step (kept on the device), and the statistics pass of the
+  fused latent head already takes mask-only statistics for the phase and normal groups ("light").
 
 ## latvol: the CT stored as the trunk's latent cells (2026-11-12, branch latstore-20261112)
 

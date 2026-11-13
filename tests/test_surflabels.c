@@ -187,6 +187,16 @@ int main(void) {
                 printf("test_surflabels: phase-coh --box-scale: %ld voxels off the scaled weight, %ld weighted\n", bad, pos);
                 CHECK(wb && !bad && pos > 1000, "phase-coh --box-scale is not the weight x the box factor");
                 free(wb);
+                /* --coh 0: the box factor alone on every known voxel (128 inside the box, 0 outside), no coherence factor */
+                char pn[600]; snprintf(pn, sizeof pn, "%s/pcn", od);
+                char *cn[] = {"ufsm", "phase-coh", pr, "9.6", ct, "0", pn, "--weight", "0.3,0.6", "--cell", "16", "--box-scale", bf, "--box-default", "0", "--coh", "0", "--threads", "3"};
+                CHECK(!cmd_phase_coh((int)(sizeof cn / sizeof *cn), cn), "phase-coh --coh 0 failed");
+                snprintf(r, sizeof r, "%s/pcn/weight.zarr", od); uint8_t *wn = readall(r, "9.6"); long badn = 0, posn = 0;
+                for (size_t i = 0; wn && ph && i < (size_t)NZ * NY * NX; i++) {
+                    const int want = ph[i] != PHASE_UNKNOWN && i / ((size_t)NY * NX) < (size_t)(NZ / 2) ? 128 : 0; badn += wn[i] != want; posn += wn[i] > 0; }
+                printf("test_surflabels: phase-coh --coh 0: %ld voxels off the box factor, %ld weighted\n", badn, posn);
+                CHECK(wn && !badn && posn > 1000, "phase-coh --coh 0 is not the box factor on the known voxels");
+                free(wn);
             }
             {   /* --papyrus T --pap-dilate 1 --phase-out 1: against a brute-force mask (CT < T with no CT >= T in the 3^3 cube about it) */
                 char pp[600]; snprintf(pp, sizeof pp, "%s/pcp", od); const int T = 140;
@@ -263,6 +273,11 @@ int main(void) {
     }
     snprintf(p, sizeof p, "%s/hold.json", root);
     CHECK(!run(root, "wp", "h", "1", "4", "--exclude", p, nullptr), "surf-labels --exclude failed");
+    {   /* a holdout box over an unlabelled corner (PHerc1299's band in the wrong units, 2026-11-12) must fail the run, not log "holdout 0" */
+        char pe[600]; snprintf(pe, sizeof pe, "%s/hold_empty.json", root); FILE *fe = fopen(pe, "w"); if (!fe) return 1;
+        fprintf(fe, "{\"boxes\": [{\"name\": \"h\", \"ct\": \"S/scan.zarr\", \"l0\": [10, 160, 160, 20, 30, 30]}, {\"name\": \"corner\", \"ct\": \"S/scan.zarr\", \"l0\": [0, 0, 0, 8, 8, 8]}]}\n"); fclose(fe);
+        CHECK(run(root, "wp", "he", "1", "4", "--exclude", pe, nullptr) == 1, "a holdout box without labelled voxels did not fail surf-labels");
+    }
     const int sense[2] = {1, -1}; const char *outs[2] = {"p1", "m"};
     for (int s = 0; s < 2; s++) {
         char r[600]; snprintf(r, sizeof r, "%s/%s/codes.zarr", root, outs[s]); uint8_t *cd = readall(r, "9.6");

@@ -37,7 +37,12 @@ double fb_tile_w(long long o, int h, int c, double S, double g);
 
 /* blend options (fblend_run2): tile weights (overlapping predicts: input i was predicted on tile interiors of stride[] anchored
    at grid[i][], level voxels; weight w[i] x the product of the three axes' fb_tile_w) and the phase confidence rule */
-typedef struct { int tile; double stride[3], grid[32][3]; int conf; } fb_opts;
+/* --paste F: inputs 1.. are sub-box predicts (any level, the same physical cells as in[0], e.g. a 4.8 um --fit-h 4 box into a 9.6 um
+   --fit-h 2 set) pasted over in[0]: input i's weight per axis rises as sin^2 over F cells from its box faces (0 outside), in[0]'s is
+   1 - their sum (floor 1e-6); w is then a weighted mean, and the winding mod 4 planes come from in[0] unless w4_d x um agrees.
+   --box z,y,x,nz,ny,nx (in[0]'s cells; starts on its 128-cell shards): only that part of in[0] is written (field-paste-link
+   overlays it on in[0]'s shards) */
+typedef struct { int tile; double stride[3], grid[32][3]; int conf; int paste; double feather; int box; long long b0[3], bn[3]; } fb_opts;
 
 /* blend the field directories in[0..n) (same cells: shape, h x um and origin x um equal; raw or zarr, with zarr_offset / raw_offset
    crops) into out (zarr arrays when in[0] is zarr, else raw), with fields.json from in[0] (format, recto, w4_d and a "blend" record

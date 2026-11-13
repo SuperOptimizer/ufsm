@@ -200,6 +200,13 @@ extern "C" void nn_input_latc(const void *ct16, shape5 xs, const void *rec, cons
     lp_input_latc(ct16, g_h16 ? 2 : 1, rec, NN_RAD_REC(4 * xs.d), xs.n, xs.d, xs.h, bas, gain, C, step, y, ISMX4(y) ? 4 : 8);
     KCHECK();
 }
+extern "C" void nn_input_latq(const void *ct16, shape5 xs, const void *rec, int n, int cz0, int ncz, const void *cells, int stride, const float *gain, int C,
+                              float step_raw, float mean, float isd, void *y) {
+    if (!ISMX(y) || xs.c != C + 3 || (xs.c != 16 && xs.c != 32) || xs.h != xs.w || n < 0 || n >= xs.n || cz0 < 0 || cz0 + ncz > xs.d || stride < C + 1) {
+        fprintf(stderr, "nn_input_latq: an MX input of C + 3 = 16 or 32 channels, square planes, a slab inside window n, stride >= C + 1\n"); abort(); }
+    lp_input_latq(ct16, g_h16 ? 2 : 1, rec, NN_RAD_REC(4 * xs.d), xs.n, xs.d, xs.h, n, cz0, ncz, cells, stride, gain, C, step_raw, mean, isd, y, ISMX4(y) ? 4 : 8);
+    KCHECK();
+}
 extern "C" void nn_input_rad_pack(const void *ct16, shape5 xs, const void *rec, void *y) {
     if (!ISMX(y) || xs.c != 8 || xs.h != xs.w) { fprintf(stderr, "nn_input_rad_pack: an MX input of 8 channels, square planes\n"); abort(); }
     lp_input_rad_pack(ct16, g_h16 ? 2 : 1, rec, NN_RAD_REC(2 * xs.d), xs.n, xs.d, xs.h, y, ISMX4(y) ? 4 : 8);
@@ -490,6 +497,21 @@ __global__ void rv_tg_k(const uint8_t *ph, const uint8_t *pap, size_t n, uint8_t
     m[i] = 1;
 }
 extern "C" void nn_rv_targets(const uint8_t *phase, const uint8_t *pap, size_t n, uint8_t *t, uint8_t *m) { rv_tg_k<<<nblk(n, 256), 256>>>(phase, pap, n, t, m); KCHECK(); }
+/* the same targets from the papyrus plane as train --lat keeps it on the device, packed to its three classes in 2 bits (nn_lab_pack bits 2:
+   3 unknown, 1 papyrus, 0 void): voxels [v0, v0 + n) of pap2, the phase already at the slab. The head slabs unpacked the plane into a slab
+   buffer first, twice a step, for this kernel alone (U2's recipe, P 1024, contended: the "label h2d" ticks, 94 + 72 ms of 2790) */
+__global__ void rv_tg2_k(const uint8_t *ph, const uint8_t *pap2, size_t v0, size_t n, uint8_t *t, uint8_t *m) {
+    const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const size_t q = v0 + i; const unsigned c = pap2[q >> 2] >> (2 * (q & 3)) & 3u; const uint8_t v = ph[i];
+    t[i] = t[n + i] = 0;
+    if (c == 3) { m[i] = 0; return; }
+    if (c == 0) { m[i] = 1; return; }
+    if (v >= 252) { m[i] = 0; return; }
+    if (v < 126) t[i] = 255; else t[n + i] = 255;
+    m[i] = 1;
+}
+extern "C" void nn_rv_targets_p2(const uint8_t *phase, const uint8_t *pap2, size_t v0, size_t n, uint8_t *t, uint8_t *m) { rv_tg2_k<<<nblk(n, 256), 256>>>(phase, pap2, v0, n, t, m); KCHECK(); }
 /* --rv-verso-w W: the loss weight of verso-side papyrus voxels times W (after the packed weights; capped at 255): the side classes are
    imbalanced (~60% of labelled papyrus is recto side) and the model under-calls verso */
 __global__ void rv_verso_w_k(const uint8_t *t, uint8_t *m, size_t n, float w) {

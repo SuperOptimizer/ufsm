@@ -20,6 +20,7 @@ Env: B1 (the B1 output root, /mnt/scratch/univ/b1), HEADS (JSON, default winding
 (FIB/teacher), FIBSHARE (0.2)."""
 import copy, json, os, sys
 out = sys.argv[1] if len(sys.argv) > 1 else "/vesuvius/ufsm/univ/sources-univ.json"
+if out.startswith("-"): sys.exit(__doc__)   # (no flags: the one argument is the output path)
 B1 = os.environ.get("B1", "/mnt/scratch/univ/b1"); P4SH = os.environ.get("P4SH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "p4A48_shards.tsv")); MIRROR = os.environ.get("MIRROR", "https://dl.ash2txt.org/community-uploads/forrest/volcomp")
 HEADS = json.loads(os.environ.get("HEADS", '{"phase": 1, "normal": 1, "density": 1, "wind4": 1, "rv": 1}'))
 T = json.load(open("/mnt/scratch/lat/sources/sources-wind-gt-nvme.json")); T1667 = json.load(open("/mnt/scratch/lat/sources/sources-wind-gt1667.json"))
@@ -38,7 +39,7 @@ def lvl1(base, name, root, weight, note):
 # June / July: codes{A,B}48 at level 1 over the whole scroll (the stored June set covered only 316 of the 549 packed 9.6 shards; with
 # no storage cost the packed-region limit is gone); the July codes need the July segments + wind-assign rebuilt first. 0139 / 0500P2 /
 # 1667 9.6 / p4full stay stored (fused A / B phase, not on the fly).
-ONFLY = os.environ.get("ONFLY", "1") == "1"; C1667 = "/vesuvius/ufsm/gt/PHerc1667-wind-20261016"; CP4 = f"{B1}/gt/paris4"
+ONFLY = os.environ.get("ONFLY", "1") == "1"; C1667 = "/vesuvius/ufsm/gt/PHerc1667-wind-20261016"; CP4 = f"{B1}/gt/paris4"; CP4N = os.environ.get("CP4N", "/vesuvius/ufsm/univ/b1/gt/paris4")
 def onfly(base, name, root, key, weight, note):
     e = lvl1(base, name, None, weight, note); e["targets"]["band"]["phase"] = {"onfly": {"root": root, "key": key, "rmax": 80}, "level": 1}; return e
 for k in ("A", "B"):
@@ -47,10 +48,35 @@ for k in ("A", "B"):
         src.append(onfly(g1667, f"PHerc1667-{k}48", f"{C1667}/codes{k}", "4.798", 0.1, f"1667 codes{k} 4.798, phase on the fly (pair rule, rmax 80)"))
     elif os.path.exists(f"{r}/done"):
         src.append(lvl1(g1667, f"PHerc1667-{k}48", r, 0.1, f"B1 4.8 um phase, 1667 codes{k} (phase-raster --gs 2 --pair 1 --radius 160)"))
+# B3 (the all-spirals labels, good.sh gate): PHerc1299 (2026-11-12), only with B3=1 until its sampler-only band line is checked. Phase on
+# the fly from the kept wraps' codes (rmax 20 = surf-labels --radius 20 on the 9.596 um grid) and ONE stored array, the phase weight
+# (ufsm phase-coh --coh 0 on the gated phase, scripts/univ/b3_1299_mask.py): 0 in the held-out band, the direction-masked cells, air
+# (CT < 64 with no CT >= 64 within 2 voxels), the gt-gate's removed cells and every voxel surf-labels ignored; 0.5 + 0.5 x the fibre
+# factor in the fibre tiles; 1 elsewhere. The band also rejects whole windows (holdout_reject).
+B3D = os.environ.get("B3D", "/vesuvius/ufsm/univ/b3")
+if os.environ.get("B3", "0") == "1" and os.path.exists(f"{B3D}/PHerc1299/mask/weight.zarr/9.596/zarr.json") and os.path.exists(f"{B3D}/PHerc1299/codes.zarr/9.596/zarr.json"):
+    src.append({"name": "PHerc1299-b3", "scope": "global", "root": "/vesuvius/ufsm/v2/ct", "ct": "PHerc1299/20260309130042-2.399um-0.2m-78keV-masked.zarr", "um": 2.399,
+                "min_level": 2, "max_level": 2, "axis": "/mnt/scratch/pods/PHerc1299/run/axis.json", "iso": 64, "weight": float(os.environ.get("W1299", "0.1")), "heads": HEADS,
+                "holdout_file": "/vesuvius/ufsm/univ/holdouts-1299.json", "holdout_reject": ["1299-zband"],
+                "note": "B3 PHerc1299: our snapped wraps (71 of 88 kept), phase on the fly from codes (rmax 20), weight = band / direction / fibre / papyrus / gate mask",
+                "targets": {"band": {"radius": 20, "span": 19, "phase": {"onfly": {"root": f"{B3D}/PHerc1299/codes.zarr", "key": "9.596", "rmax": 20}, "level": 2,
+                                                                         "weight": {"root": f"{B3D}/PHerc1299/mask/weight.zarr", "key": "9.596"}}}}})
+# PHerc1218 (2026-11-12): same form, no direction mask (aligned outward 0.9998, 27 reversed cells = 0.0002 of the pairs) and no fibre
+# gate (the Paris 4 ramp is miscalibrated on the 8.64 um scans: latres's 1447 control). The weight = the gated phase's papyrus mask only
+# (phase-coh --coh 0 --papyrus 64: 0 on air, gt-gate-removed and ignored voxels, 1 elsewhere). Codes and weight on /mnt/scratch
+# (/vesuvius was down to 28 GB). Level 0 = 8.64 um, rmax 20 (surf-labels --radius 20 on that grid).
+B3S = os.environ.get("B3S", "/mnt/scratch/univ/b3")
+if os.environ.get("B3", "0") == "1" and os.path.exists(f"{B3S}/w1218/weight.zarr/8.64/zarr.json") and os.path.exists(f"{B3S}/labels/PHerc1218/codes.zarr/8.64/zarr.json"):
+    src.append({"name": "PHerc1218-b3", "scope": "global", "root": "/vesuvius/ufsm/v2/ct", "ct": "PHerc1218/20250521120456-8.640um-1.2m-116keV-masked.zarr", "um": 8.64,
+                "min_level": 0, "max_level": 0, "axis": "/mnt/scratch/pods/PHerc1218/unroll/axis.json", "iso": 64, "weight": float(os.environ.get("W1218", "0.1")), "heads": HEADS,
+                "note": "B3 PHerc1218: our snapped wraps, gt-gate (0.179 removed), phase on the fly from codes (rmax 20), weight = gate / papyrus mask",
+                "targets": {"band": {"radius": 20, "span": 19, "phase": {"onfly": {"root": f"{B3S}/labels/PHerc1218/codes.zarr", "key": "8.64", "rmax": 20}, "level": 0,
+                                                                         "weight": {"root": f"{B3S}/w1218/weight.zarr", "key": "8.64"}}}}})
 p4 = next(s for s in T["sources"] if s["name"] == "PHercParis4-june"); p4b = next(s for s in T["sources"] if s["name"] == "PHercParis4-july")
 for k, base, nm, w in (("A", p4, "PHercParis4-june48", 0.2), ("B", p4b, "PHercParis4-july48", 0.12)):
-    if ONFLY and os.path.exists(f"{CP4}/codes{k}48/done"):
-        src.append(onfly(base, nm, f"{CP4}/codes{k}48", "4.8", w, f"Paris 4 codes{k}48 at level 1, phase on the fly (pair rule, rmax 80), whole scroll"))
+    cr = next((d for d in (CP4, CP4N) if os.path.exists(f"{d}/codes{k}48/done")), None)   # July codes live on NVMe (b1_p4B48.sh, 2026-11-12)
+    if ONFLY and cr:
+        src.append(onfly(base, nm, f"{cr}/codes{k}48", "4.8", w, f"Paris 4 codes{k}48 at level 1, phase on the fly (pair rule, rmax 80), whole scroll"))
         continue
     r = f"{CP4}/phase{k}48"
     if k != "A" or not os.path.exists(f"{r}/4.8/zarr.json"): continue

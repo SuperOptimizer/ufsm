@@ -13,7 +13,9 @@
    them, air gaps and the case included (surf-labels ignores only CT 0 = outside the scan mask); a known voxel whose CT is < T and that
    has no CT >= T within R voxels (a (2R+1)^3 cube, default R 2) gets weight 0 in both weights; with --phase-out 1 the phase itself is
    written with those voxels unknown -> OUT/phase.zarr/<PHASE_KEY> (for the sampler, which keeps or drops whole 8^3 blocks by the weight,
-   and for fiber-judge --phase). Air-masked known voxels are counted. */
+   and for fiber-judge --phase). Air-masked known voxels are counted.
+   --coh 0: no coherence factor (weight 1 on every known voxel before the boxes and the papyrus mask; cells without a coherence are
+   not zeroed): the output is the box scale and the papyrus mask alone (the PHerc1299 direction / fibre mask, 2026-11-12). */
 #include "band.h"
 #include "store.h"
 #include "sysinfo.h"
@@ -31,7 +33,7 @@ static const char *pc_opt(int argc, char **argv, const char *k, const char *d) {
 
 enum { PC_S = 512, PC_WB = 10 };
 typedef struct {
-    z3 *ph, *ct; z3w *w, *w2; int64_t shape[3], ns[3]; int cell; double t0, t1, u0, u1; long long zb0, zb1;
+    z3 *ph, *ct; z3w *w, *w2; int64_t shape[3], ns[3]; int cell, nocoh; double t0, t1, u0, u1; long long zb0, zb1;
     _Atomic long next; long nitems; _Atomic int fail; float cs[PHASE_PERIOD];
     int nbox; double bdef; int64_t (*box)[6]; double *bs; _Atomic long long inbox, wpre;   /* --box-scale; wpre: the weight sum before it */
     int pap_t, pap_r; z3w *po; _Atomic long long air;   /* --papyrus T, --pap-dilate R, --phase-out; air: known voxels masked */
@@ -92,6 +94,7 @@ static int pc_shard(pc_job *J, long it, uint8_t *ph, uint8_t *ct, uint8_t *w, ui
         const float rr = r[((size_t)(z / C) * nc[1] + y / C) * nc[2] + x / C];
         if (isfinite(rr)) { if (rr >= 0.2f) ge[0]++; if (rr >= 0.3f) ge[1]++; if (rr >= 0.4f) ge[2]++; }
         double wv = 0; if (isfinite(rr)) { wv = (rr - J->t0) / (J->t1 - J->t0); wv = wv < 0 ? 0 : wv > 1 ? 1 : wv; }
+        if (J->nocoh) wv = 1;   /* (--coh 0: the boxes and the papyrus mask alone) */
         double bsc = 1;
         if (J->nbox) { bsc = J->bdef; const int64_t g[3] = {o[0] + z, o[1] + y, o[2] + x};
                        for (int j = 0; j < nbl; j++) { const int64_t *B = J->box[bl[j]]; if (g[0] >= B[0] && g[0] < B[0] + B[3] && g[1] >= B[1] && g[1] < B[1] + B[4] && g[2] >= B[2] && g[2] < B[2] + B[5]) { bsc = J->bs[bl[j]]; inb++; break; } }
@@ -133,7 +136,7 @@ int cmd_phase_coh(int argc, char **argv) {
     if (sscanf(pc_opt(argc, argv, "--weight", ""), "%lf,%lf", &J.t0, &J.t1) != 2 || !(J.t1 > J.t0)) { fprintf(stderr, "phase-coh: --weight T0,T1 with T1 > T0\n"); return 2; }
     J.cell = atoi(pc_opt(argc, argv, "--cell", "32")); if (J.cell < 4 || PC_S % J.cell) { fprintf(stderr, "phase-coh: --cell must divide %d\n", PC_S); return 2; }
     if (sscanf(pc_opt(argc, argv, "--zband", ""), "%lld,%lld", &J.zb0, &J.zb1) != 2) { J.zb0 = 0; J.zb1 = -1; }
-    J.bdef = atof(pc_opt(argc, argv, "--box-default", "1"));
+    J.bdef = atof(pc_opt(argc, argv, "--box-default", "1")); J.nocoh = !atoi(pc_opt(argc, argv, "--coh", "1"));
     J.pap_t = atoi(pc_opt(argc, argv, "--papyrus", "0")); J.pap_r = atoi(pc_opt(argc, argv, "--pap-dilate", "2"));
     if (J.pap_t < 0 || J.pap_t > 255 || J.pap_r < 0 || J.pap_r > 16) { fprintf(stderr, "phase-coh: --papyrus 1..255, --pap-dilate 0..16\n"); return 2; }
     const int phase_out = atoi(pc_opt(argc, argv, "--phase-out", "0"));

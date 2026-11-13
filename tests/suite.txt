@@ -161,6 +161,7 @@ test_dcache_batch                              |              |     2 | ./$B/tes
 test_ink_air                                   | gpu          |     2 | ./$B/test_ink_air
 test_ink_mil_train                             | gpu          |    40 | ./$B/test_ink_mil_train ./$B/ufsm ./$B/make_wind_fixture
 test_accum                                     | gpu          |    20 | tests/test_accum.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/accum
+test_tcache                                    | gpu          |       40 | tests/test_tcache.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/tcache
 test_strict_sources                            | gpu          |    25 | tests/test_strict_sources.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/strictsrc
 test_init_heads                                | gpu          |    25 | tests/test_init_heads.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/initheads
 test_ink_mil_check                             | gpu          |    90 | ./$B/test_ink_mil_check ./$B/ufsm ./$B/make_wind_fixture
@@ -270,6 +271,7 @@ test_lat                                       | gpu          |     1 | ./$B/tes
 test_latents                                   | gpu          |    25 | bash tests/test_latents.sh ./$B/ufsm ./$B/make_wind_fixture
 test_latvol                                    | gpu          |     6 | ./$B/test_latvol
 test_latvol_sh                                 | gpu          |    60 | bash tests/test_latvol.sh ./$B/ufsm ./$B/make_wind_fixture ./$B/test_latvol_nolink
+test_lat_direct                                | gpu          |    60 | bash tests/test_lat_direct.sh ./$B/ufsm ./$B/make_wind_fixture
 test_lat_fuse                                  | gpu          |     2 | ./$B/test_lat_fuse
 test_phase_onfly                               | gpu          |    20 | tests/test_phase_onfly.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/onfly
 test_fibre_onfly                               | gpu          |    25 | tests/test_fibre_onfly.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/fibonfly
