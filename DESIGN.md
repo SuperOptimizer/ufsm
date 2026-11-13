@@ -6,6 +6,53 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Empty-space skipping: the opportunity on scratch2 windows, and why it cannot be exact (2026-11-13, branch skipair-20261113)
+
+The goal was to stop computing convs in air and outside the scan. Keep a tile mask per level and fill inactive tiles with the
+constant the dense net would compute there. **That constant does not exist for scratch2:**
+- The input is never spatially constant. `nn_input_latc` appends 3 radial-direction channels (the unit vector to the scroll axis,
+  `rad_voxel`) to the 29 latent codes. They vary everywhere, including in air and in the zero-filled outside of the scan.
+- Scroll-RoPE attention at the 8^3 bottleneck and `--gfilm 1` couple every decoder voxel to the whole window.
+- Air CT is noisy, not constant: per 4^3 cell, max <= 40 holds for only ~21% of cells, and max <= 64 for 39%.
+
+So any skip changes the function. The version built here is a **masked conv**: an inactive output tile of a wide 3^3 conv holds the
+conv's bias (the CTA skips its main loop; the epilogue, MX store and GroupNorm sums run as usual). GN, SiLU, attention and heads stay
+dense. It is a well-defined net whose backward would be exact. Its deviation from the dense net has to be measured on papyrus voxels.
+
+**Opportunity.** Method: `UFSM_SAMPLER_EMPTY=1` with `UFSM_SAMPLER_ONLY` on scratch2's recipe, no GPU, dev slice
+(`/vesuvius/ufsm/skipair/empty_measure*.sh`).
+- Data: source-grid CT bytes before the device augmentation, 24 windows. The first 7 use the full recipe, until the CPU ink / fibre
+  label build hit the 40 GB memcap. The other 17 drop the ink / fibre heads so the run fits.
+- Tiles: 8^3 cells (32^3 voxels at level 0). A tile is active when any voxel is > t. Margin r means dilation by r tiles of the
+  same level.
+- Level weights of conv FLOPs at widths 256,320,384,448,288,288: L0 75.5%, L1 20.2%, L2 3.6%, L3 0.6%.
+
+| t | empty cells | L0 active r0 / r1 / r2 | L1 (r1) | L2 (r1) | L3 (r1) | conv FLOPs saved (r1) |
+|---|---|---|---|---|---|---|
+| 0 (outside the scan) | 0.205 | 0.803 / 0.833 / 0.860 | 0.873 | 0.932 | 0.993 | 15.4% |
+| 40 | 0.213 | 0.803 / 0.833 / 0.860 | 0.873 | 0.932 | 0.993 | 15.5% |
+| 64 (papyrus iso) | 0.386 | 0.773 / 0.819 / 0.849 | 0.863 | 0.926 | 0.984 | 16.7% |
+
+- t 0 and t 40 are nearly the same, so the skippable space is almost all the zero-filled outside of the scan. Air inside the scroll
+  gives few whole 32^3-voxel tiles.
+- By source and level: level-0 / 1 windows are 0.93-1.00 active. Coarse windows are where the empty space is: PHerc1667 lev 2
+  0.68, PHercParis4-july lev 3 0.59, PHerc1218-b3 lev 0 0.64.
+- `--split z`: the busier card's half averages 0.849 active vs 0.867 for its whole windows (17 windows), so the split costs little.
+- Expected: 15-17% of conv FLOPs. Convs are ~60% of a step, so at most ~9% of a step. Skipped CTAs still run their epilogue and
+  stores, and the memory-bound ops stay dense, so ~6-7% is more realistic.
+- Inference: `predict` already skips whole air shards and windows (`--occupancy`, air tiles), so only boundary windows gain.
+
+**Built (predict side).**
+- `src/nn_skip.cu`: `nn_skip_build` makes the per-level masks from the device CT window. `conv_fwd_f4_k` checks the mask (an output
+  tile is one z / y tile and at most two x tiles) and skips the main loop.
+- Scope: MX forwards only, N 1, whole-tensor outputs on a registered level grid. z-windows, z-ranges and slab outputs stay dense.
+  `lp_skip_get` decides per launch.
+- `predict --skip-empty 1 [--skip-thr 40] [--skip-margin 1]` on latent-grid nets: masks from `ctd` before the trunk forward, off
+  after it.
+- `tests/test_skip_empty` checks three things: all tiles active gives bit-identical logits, CT-built masks give a material deviation
+  within tolerance, and `nn_skip_off` restores the dense bits.
+- Status: not yet run on a GPU (launch HOLD). Training forward / backward waits on the lead's go.
+
 ## Split-window input builders: every --gpu-aug builder by z range, the scanner split exactly across two GPUs (2026-11-13, branch augz-20261112)
 
 ## Muon variants for the from-scratch universal net: ten arms on the 92 M net (2026-11-13, branch muonx-20261113)
