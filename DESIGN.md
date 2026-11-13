@@ -6,6 +6,48 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Split-window input builders: every --gpu-aug builder by z range, the scanner split exactly across two GPUs (2026-11-13, branch augz-20261112)
+
+For the 40 M net (widths 192..384), one P 1024 window is split in z across both 5060 Tis (univI's splitwin-20261112). Each GPU then
+builds only its own output planes of the window's input and labels. The window stays the global P^3: the same record, draws and
+global coordinates, so a rank's planes are byte for byte the whole-window call's planes.
+
+- **Labels** (nn_label_warp_z / nn_label_sym_z / nn_w4runs_label_z / nn_ink_bits_z) write output planes [z0, z0 + nz) from source
+  planes [s0, s1) only.
+  - nn_aug_src_range(rad, P, z0, nz) bounds [s0, s1). The warp's source z is linear in the per-axis displaced coordinates (rotation,
+    zoom, affine, symmetry; elastic is per-axis tables), so its extremes are at the corners of the box of their ranges. Measured: the
+    bound is at most 4 planes wider than the corners actually read, over 12 cases.
+  - Under rotation the source range is ~nz cos + P sin. At P 256 the 40 / 72 range at 30 degrees staged 3.56 nz. So the staging does
+    not halve under rotation: budget ~P planes of 8-bit staging per GPU (1 GB at P 1024).
+  - nn_w4runs_apply_z: the runs are per x row, so a z range needs no plane outside it (strip offsets into the run table).
+- **CT channel** (nn_aug_ct_z): the scanner ops need the whole source window. Paganin's two-sided exponential and the correlated
+  noise recurse along z, GIN / histogram / z-score use whole-window statistics, and the z blur reads taps. With a zcomm (two ranks),
+  rank r scans its source half and exchanges:
+  - the halo planes, as they are before each stencil (the z blur's reach from the plan, GIN's 1, a dropped slice's source);
+  - the correlated noise's carried plane (rank 0 -> 1);
+  - paganin's carried y per line: forward 0 -> 1, then rank 1's backward from P - 2, then 1 -> 0;
+  - the statistics: integer sums exact, GIN's two doubles as two partial atomic sums, which are order-free anyway;
+  - finally, the scanned 8-bit planes each rank's warp reads from the other.
+  The fp16 work volume aliases the rank's CT channel planes, as the one-GPU path does, when P/2 + 2 halo <= nz.
+  Per GPU at P 1024: CT channel 544 planes (1.14 GB) + staging <= 1 GB, against 2 + 2.23 GB for the whole window.
+- **Tests** (tests/test_aug_z.c, gpu, 14 s at P 256):
+  - every label builder over 4 ranges x 12 warp / symmetry cases, with poisoned host planes outside [s0, s1) and a poisoned staging
+    buffer;
+  - the CT channel for the 22 scanner ops alone at two strengths, a mixture and none (44 cases) x 2 range pairs: the one-GPU range
+    and both split ranks, through a loopback zcomm (two host threads, one GPU, a staging slot each);
+  - all byte-identical to the whole-window call. A negative control (the exchanges dropped) differs on every voxel.
+  - test_gpu_aug is unchanged and passes.
+- **Stored onfly codes are now dcached.** The key is the array path, zarr.json size / mtime and the poolings. Without it every read
+  recomputed the pair rule (16-50 s per 512^3 window on the CPU). sources-scratch1 v3 reads june / 0139 / 0500P2 / 1667-gt phase on
+  the fly from their codes; phase-onfly against the stored rasters:
+  - P4 june codesA 9.6 rmax 40: 0 differing voxels;
+  - 0139 A+B fused rmax 41: 0 differing voxels;
+  - 0500P2: native codes rebuilt, 0 differing voxels;
+  - 1667 A+B 4.8 pooled: 10384 of 805 M voxels differ;
+  - P4 july: the gtjuly codesB rebuild differs on 29%, because the 10-19 codes it came from are gone, so it keeps phaseB.
+- Left to the split itself (univI): the zcomm over split.c's staged peer copies, the latent input from the CT channel, the
+  label-stream slabs, MIL rays.
+
 ## inkpod: the ink training run on a rented RTX PRO 6000; --ink-dice 0 from step 10036 (2026-11-12 / 13, branch inkpod2-20261113)
 
 The unified run's ink head moved off the desk (user, 11-12: "do ink detection training on the rtx6000"). inkpod = the unified run's

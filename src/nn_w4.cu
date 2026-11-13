@@ -383,7 +383,9 @@ extern "C" void w4runs_apply_host(const uint8_t *phase, int D, int H, int W, int
     }
     free(ph); free(cp); free(R); free(cnt);
 }
-extern "C" int nn_w4runs_apply(const uint8_t *phase_d, int D, int H, int W, int tile, int ms, const w4runs *o, uint8_t *w4_d, uint8_t *comp_d, void *stream) {
+/* the planes [s0, s1) only: phase_d, w4_d and comp_d hold those planes (the runs are per x row, so a strip's rows in the range need
+   no other plane: the bytes are the whole-window call's planes [s0, s1)) */
+extern "C" int nn_w4runs_apply_z(const uint8_t *phase_d, int D, int H, int W, int s0, int s1, int tile, int ms, const w4runs *o, uint8_t *w4_d, uint8_t *comp_d, void *stream) {
     int dv = 0; if (cudaGetDevice(&dv) != cudaSuccess) return -1; dv &= MAXDEV - 1;
     cudaStream_t s = (cudaStream_t)stream; int one, T, ntx; w4_geom(D, H, W, tile, &one, &T, &ntx); (void)one;
     const size_t sv = (size_t)(T < D ? T : D) * (T < H ? T : H) * W;
@@ -399,10 +401,13 @@ extern "C" int nn_w4runs_apply(const uint8_t *phase_d, int D, int H, int W, int 
     {
         size_t ob = 0;
         for (int z0 = 0; z0 < D; z0 += T) for (int y0 = 0; y0 < H; y0 += T) {
-            const int nz = D - z0 < T ? D - z0 : T, ny = H - y0 < T ? H - y0 : T; const size_t rows = (size_t)nz * ny * ntx, vox = (size_t)nz * ny * W, off0 = ((size_t)z0 * H + y0) * W;
+            const int nzs = D - z0 < T ? D - z0 : T, ny = H - y0 < T ? H - y0 : T; const size_t rows = (size_t)nzs * ny * ntx;
+            const int za = z0 > s0 ? z0 : s0, zb = z0 + nzs < s1 ? z0 + nzs : s1, nz = zb - za;
+            if (nz <= 0) { ob += rows; continue; }
+            const size_t vox = (size_t)nz * ny * W, off0 = ((size_t)(za - s0) * H + y0) * W, rb = ob + (size_t)(za - z0) * ny * ntx, rr = (size_t)nz * ny * ntx;
             AK(cudaMemcpy2DAsync(a->d_ph, (size_t)ny * W, phase_d + off0, (size_t)H * W, (size_t)ny * W, nz, cudaMemcpyDeviceToDevice, s));
-            w4_runs_k<<<(unsigned)((rows + 127) / 128), 128, 0, s>>>(a->d_ph, nz, ny, W, T, ntx, ms, a->d_R, a->d_cnt);   /* (the run counts: unused here) */
-            w4_out_k<<<(unsigned)((vox + 255) / 256), 256, 0, s>>>(a->d_ph, a->d_R, nz, ny, W, T, ntx, a->d_off + ob, a->d_lut, a->d_lut + o->nr, a->d_c);
+            w4_runs_k<<<(unsigned)((rr + 127) / 128), 128, 0, s>>>(a->d_ph, nz, ny, W, T, ntx, ms, a->d_R, a->d_cnt);   /* (the run counts: unused here) */
+            w4_out_k<<<(unsigned)((vox + 255) / 256), 256, 0, s>>>(a->d_ph, a->d_R, nz, ny, W, T, ntx, a->d_off + rb, a->d_lut, a->d_lut + o->nr, a->d_c);
             AK(cudaMemcpy2DAsync(w4_d + off0, (size_t)H * W, a->d_ph, (size_t)ny * W, (size_t)ny * W, nz, cudaMemcpyDeviceToDevice, s));
             AK(cudaMemcpy2DAsync(comp_d + off0, (size_t)H * W, a->d_c, (size_t)ny * W, (size_t)ny * W, nz, cudaMemcpyDeviceToDevice, s));
             ob += rows;
@@ -435,4 +440,7 @@ extern "C" int band_wind4_dev(const uint8_t *phase, int D, int H, int W, int til
     pthread_mutex_unlock(&c->mu);
     if (rc == -2) w4_dev_failed("band_wind4_dev", c->dev);
     return rc;
+}
+extern "C" int nn_w4runs_apply(const uint8_t *phase_d, int D, int H, int W, int tile, int ms, const w4runs *o, uint8_t *w4_d, uint8_t *comp_d, void *stream) {
+    return nn_w4runs_apply_z(phase_d, D, H, W, 0, D, tile, ms, o, w4_d, comp_d, stream);
 }
