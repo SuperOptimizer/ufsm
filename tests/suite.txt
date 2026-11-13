@@ -32,6 +32,7 @@ test_rungs                                     | gpu          |     3 | ./$B/tes
 test_gram                                      | gpu          |     2 | ./$B/test_gram
 test_fibhead                                   | gpu          |     2 | ./$B/test_fibhead
 test_fibhead_train                             | gpu          |    25 | tests/test_fibhead_train.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/fibhead
+test_scan_norm                                 | gpu          |     8 | tests/test_scan_norm.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/scannorm
 test_predict_heads                             | gpu          |    70 | tests/test_predict_heads.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/predheads
 test_predict_boxes                             | gpu          |    40 | tests/test_predict_boxes.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/predboxes
 test_fstem                                     | gpu          |     3 | ./$B/test_fstem
@@ -54,6 +55,7 @@ test_phase_check                               |              |     1 | ./$B/tes
 test_fuse                                      |              |     1 | ./$B/test_fuse
 test_gn_frozen                                 | gpu          |     2 | ./$B/test_gn_frozen
 test_l0_norm                                   | gpu          |     3 | ./$B/test_l0_norm
+test_gn_ema                                    | gpu          |     4 | ./$B/test_gn_ema
 test_l0_slab                                   | gpu          |     2 | ./$B/test_l0_slab
 test_zwin                                      | gpu          |     2 | ./$B/test_zwin
 test_l0_stream                                 | gpu          |    15 | ./$B/test_l0_stream
@@ -221,6 +223,7 @@ test_unet~EMB=3,DS=1,RECOMPUTE=2               | gpu          |     5 | UFSM_EMB
 test_unet~enc_blocks                           | gpu          |     4 | UFSM_ENC_BLOCKS=0,1,2 UFSM_RB_NONZERO=1 UFSM_BIG_ENC_BLOCKS=0,1,2,2 UFSM_F16=1 ./$B/test_unet
 test_unet~L0_NORM=1                            | gpu          |     3 | UFSM_L0_NORM=1 ./$B/test_unet
 test_unet~L0_NORM=2                            | gpu          |     3 | UFSM_L0_NORM=2 ./$B/test_unet
+test_unet~GN_EMA=1                             | gpu          |     3 | UFSM_GN_EMA=1 UFSM_DOWN_NORM=1 ./$B/test_unet
 test_unet~L0_NORM=3                            | gpu          |     3 | UFSM_L0_NORM=3 ./$B/test_unet
 test_unet~L0_NORM=4                            | gpu          |     3 | UFSM_L0_NORM=4 ./$B/test_unet
 test_unet~P=48,B=1                             | gpu          |     3 | UFSM_P=48 UFSM_B=1 ./$B/test_unet

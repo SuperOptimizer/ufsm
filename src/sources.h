@@ -157,6 +157,8 @@ typedef struct {
     int nxs; char *xs_map[4];   /* optional "xscan": [{"map": REG.json}, ...] (<= 4): registered partner scans of this scan (it is each map's coarse
                                    scan) for --aug-xscan: the window's CT swapped for a partner warped onto it, labels kept; opened by the sampler */
     struct sview *xs_h[4];
+    float sn_c[MAXLEV], sn_s[MAXLEV]; signed char sn_st[MAXLEV];   /* train --scan-norm: the per-level (center, scale) of scannorm.h, computed on the
+                                                                       first window at the level (sn_st 1 done, -1 failed: the window z-score) */
     float norm_c, norm_s;   /* optional "norm": {"center": c, "scale": s} (scanprep stats: median, scale): the CT input is (v - c) / s for this
                                source instead of the window's own z-score (norm_s 0: off, the default) */
     int nemb, emb_level; char *emb_grp[8], *emb_name;   /* optional "emb": {"groups": [DIR, ...] (<= 8), "name": "pca64", "level": L}: unit-vector feature
