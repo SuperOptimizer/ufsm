@@ -4109,7 +4109,7 @@ static void muon_ext(unet *u, const muon_build_t *b, float lr, float beta, float
     float *nr = u->mx_nm ? u->mx_nmrows : nullptr; const float b2 = u->mx_nm_b2;
     if (u->mx_c && nlin) {   /* Muon-C on the convs, the linears (Co x Ci, no kernel) on the plain direction; one row state, offsets sliced */
         nn_muon_ext_batch(u->muon_descs, nconv3, u->muon_maxco, u->muon_maxk, u->mx_mcd, u->mx_nsd, 3, u->mx_ns_maxm, u->mx_ns_maxn,
-                          nullptr, u->mx_R, 0, u->mx_part, lr, beta, wd, 0.f, u->mx_ns, nr, u->mx_nmoff, u->mx_nmtot, b2, vp, vg);
+                          u->mx_hb ? u->mx_hbf : nullptr, u->mx_R, r_init, u->mx_part, lr, beta, wd, u->mx_hb_mult * lr, u->mx_ns, nr, u->mx_nmoff, u->mx_nmtot, b2, vp, vg);
         if (u->mx_mix_a != 0.f) nn_muon_ext_mix(u->mx_mixp + nconv3, u->mx_mix_b3, mixa);
         nn_muon_ext_batch((const char *)u->muon_descs + sizeof(muon_desc_t) * (size_t)nconv3, nlin, u->muon_maxco, u->muon_maxk, nullptr, nullptr, 3, 0, 0,
                           nullptr, u->mx_R, 0, u->mx_part, lr, beta, wd, 0.f, u->mx_ns, nr, nr ? u->mx_nmoff + nconv3 : nullptr, u->mx_nmtot, b2, vp ? vp + nconv3 : nullptr, vg);
@@ -4127,7 +4127,7 @@ void unet_muon(unet *u, float lr_muon, float beta, float lr_adam, float b1, floa
             fprintf(stderr, "muon-kron: %d convs, %.1f MB of factors, roots and scratch\n", k.n, nn_kron_bytes(u->mx_kron) / 1048576.0); }
         nn_kron_step(u->mx_kron, u->mx_kr_b2, u->mx_kr_eps, u->mx_kr_every);
     }
-    if (u->tbn && u->mx_hb) { fprintf(stderr, "unet: Hyperball does not cover the attention blocks' linear layers\n"); abort(); }
+    /* (Hyperball with attention blocks: the linears' hb flags are 0 (hb_collect walks the 3^3 convs only), so they keep Muon's step) */
     if (mx_any(u)) {
         muon_build_t b = {0}; muon_table(u, &b);
         muon_ext(u, &b, lr_muon, beta, wd);
