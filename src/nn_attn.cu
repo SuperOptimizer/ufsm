@@ -42,11 +42,23 @@ static void pr_add(const char *nm, double ms, double fl, double by) {
    cuBLASLt is column-major: C^T (N x M) = op(B)^T op(A)^T, so B is its first operand and A its second ---- */
 typedef struct { int M, N, K, ta, tb; cublasLtMatmulDesc_t op; cublasLtMatrixLayout_t a, b, c; cublasLtMatmulAlgo_t algo; int ok; } atplan;
 static atplan g_ap[256]; static int g_nap = 0;
-static cublasLtHandle_t g_alt = nullptr; static void *g_altws = nullptr; static const size_t ALTWS = 32u << 20;
+/* the cuBLASLt handle and workspace per device (2026-11-13: one global pair, the workspace on the first GPU that ran an attention GEMM;
+   --split-top runs the attention stage on both GPUs and GPU 1's matmuls failed with status 14). The plans (descriptors, the heuristic's
+   algorithm) are shared: both cards are one model */
+static cublasLtHandle_t g_altd[16]; static void *g_altwsd[16]; static const size_t ALTWS = 32u << 20;
+static int alt_dev(void) { int d = 0; cudaGetDevice(&d); return d >= 0 && d < 16 ? d : 0; }
+static int alt_ready(void) {
+    const int d = alt_dev();
+    if (!g_altd[d]) { if (cublasLtCreate(&g_altd[d]) != CUBLAS_STATUS_SUCCESS) { g_altd[d] = nullptr; return -1; } }
+    if (!g_altwsd[d] && cudaMalloc(&g_altwsd[d], ALTWS) != cudaSuccess) { g_altwsd[d] = nullptr; return -1; }
+    return d;
+}
+#define g_alt g_altd[alt_dev()]
+#define g_altws g_altwsd[alt_dev()]
 static int tf32_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("UFSM_ATTN_TF32"); v = e && atoi(e); } return v; }
 static atplan *at_plan(int M, int N, int K, int ta, int tb) {
     for (int i = 0; i < g_nap; i++) { atplan *p = &g_ap[i]; if (p->M == M && p->N == N && p->K == K && p->ta == ta && p->tb == tb) return p; }
-    if (!g_alt) { if (cublasLtCreate(&g_alt) != CUBLAS_STATUS_SUCCESS) return nullptr; if (cudaMalloc(&g_altws, ALTWS) != cudaSuccess) return nullptr; }
+    if (alt_ready() < 0) return nullptr;
     static int next = 0; atplan *p;
     if (g_nap < 256) p = &g_ap[g_nap++];
     else {   /* full (row counts vary per step): recycle the slots round-robin */
@@ -91,7 +103,7 @@ extern "C" int at_gemm_f32(int ta, int tb, int M, int N, int K, const float *A, 
     if (M <= 0 || N <= 0) return 0;
     if (K <= 0) { if (beta == 0.f) cudaMemsetAsync(Cm, 0, (size_t)M * N * 4, 0); return 0; }
     atplan *p = at_plan(M, N, K, ta, tb);
-    if (!p || !p->ok) return -1;
+    if (!p || !p->ok || alt_ready() < 0) return -1;
     const float one = 1.f;
     const cublasStatus_t s = cublasLtMatmul(g_alt, p->op, &one, B, p->a, A, p->b, &beta, Cm, p->c, Cm, p->c, &p->algo, g_altws, ALTWS, 0);
     if (s != CUBLAS_STATUS_SUCCESS) { fprintf(stderr, "at_gemm: cublasLtMatmul failed (%d)\n", (int)s); return -1; }

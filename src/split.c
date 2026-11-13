@@ -20,6 +20,9 @@ struct split_ctx {
     void *rt[2]; int rtcap;              /* typed-sum scratch per device (8-byte values) */
     nn_tls tls;                          /* the op state (layer ids, formats, SR counter: thread-local in nn) handed on with the turn, so both sides
                                             and the caller see one sequence of it as when the globals were shared */
+    /* the two side threads persist across split_run calls (2026-11-13: a pair of new threads per step leaked the nn modules' thread-local
+       device buffers every step -- the ink MIL scratch, GroupNorm partials --, ~0.3 GB per step per GPU at P 1024 until a cudaMalloc failed) */
+    pthread_t th[2]; int nth, quit; unsigned gen;
 };
 
 static _Thread_local split_ctx *t_ctx;
@@ -34,6 +37,7 @@ split_ctx *split_create(int dev0, int dev1) {
 }
 void split_free(split_ctx *c) {
     if (!c) return;
+    if (c->nth) { pthread_mutex_lock(&c->mu); c->quit = 1; pthread_cond_broadcast(&c->cv); pthread_mutex_unlock(&c->mu); for (int i = 0; i < 2; i++) pthread_join(c->th[i], nullptr); c->nth = 0; }
     for (int i = 0; i < 2; i++) { nn_init(c->dev[i]); for (int k = 0; k < 2; k++) { nn_free(c->sb[k][i]); nn_free(c->rb[k][i]); } nn_free(c->rd[i]); nn_free(c->rt[i]); }
     pthread_mutex_destroy(&c->mu); pthread_cond_destroy(&c->cv);
     free(c);
@@ -128,23 +132,31 @@ int split_side(void) { return t_side; }
 void split_reduce(double *b, int n) { coll_t x = {2, nullptr, {0}, 0, 0, b, n, 0}; collective(&x); }
 
 typedef struct { split_ctx *c; int side; } warg_t;
+static warg_t g_wa[64][2]; static int g_nwa; static pthread_mutex_t g_wamu = PTHREAD_MUTEX_INITIALIZER;   /* (the workers' arguments: live as long as they run) */
 static void *worker(void *p) {
     warg_t *w = p;
     split_ctx *c = w->c;
     const int me = w->side;
     t_ctx = c; t_side = me;
-    nn_init(c->dev[me]);
-    if (c->dev[0] == c->dev[1]) nn_split_thread_slot(me);
+    unsigned seen = 0;
     pthread_mutex_lock(&c->mu);
-    while (c->turn != me) pthread_cond_wait(&c->cv, &c->mu);
-    nn_tls_install(&c->tls);
-    pthread_mutex_unlock(&c->mu);
-    c->job(me, c->arg);
-    pthread_mutex_lock(&c->mu);
-    nn_tls_capture(&c->tls);
-    c->done[me] = 1;
-    if (c->narrived) { fprintf(stderr, "split: side %d finished while side %d waits at a collective\n", me, 1 - me); abort(); }
-    if (!c->done[1 - me]) { c->turn = 1 - me; pthread_cond_broadcast(&c->cv); }
+    for (;;) {
+        while (c->gen == seen && !c->quit) pthread_cond_wait(&c->cv, &c->mu);
+        if (c->quit) break;
+        seen = c->gen;
+        while (c->turn != me) pthread_cond_wait(&c->cv, &c->mu);
+        nn_init(c->dev[me]);
+        if (c->dev[0] == c->dev[1]) nn_split_thread_slot(me);
+        nn_tls_install(&c->tls);
+        pthread_mutex_unlock(&c->mu);
+        c->job(me, c->arg);
+        pthread_mutex_lock(&c->mu);
+        nn_tls_capture(&c->tls);
+        c->done[me] = 1;
+        if (c->narrived) { fprintf(stderr, "split: side %d finished while side %d waits at a collective\n", me, 1 - me); abort(); }
+        if (!c->done[1 - me]) c->turn = 1 - me;
+        pthread_cond_broadcast(&c->cv);   /* (the other side's turn, or split_run: both done) */
+    }
     pthread_mutex_unlock(&c->mu);
     t_ctx = nullptr; t_side = -1;
     nn_split_thread_slot(-1);
@@ -152,9 +164,17 @@ static void *worker(void *p) {
 }
 
 void split_run(split_ctx *c, void (*job)(int, void *), void *arg) {
+    pthread_mutex_lock(&c->mu);
     c->job = job; c->arg = arg; c->turn = 0; c->done[0] = c->done[1] = 0; c->narrived = 0;
-    pthread_t th[2]; warg_t wa[2]; nn_tls_capture(&c->tls);
-    for (int i = 0; i < 2; i++) { wa[i] = (warg_t){c, i}; pthread_create(&th[i], nullptr, worker, &wa[i]); }
-    for (int i = 0; i < 2; i++) pthread_join(th[i], nullptr);
+    nn_tls_capture(&c->tls);
+    if (!c->nth) {
+        pthread_mutex_lock(&g_wamu); const int k = g_nwa++ % 64; pthread_mutex_unlock(&g_wamu);
+        for (int i = 0; i < 2; i++) { g_wa[k][i] = (warg_t){c, i}; pthread_create(&c->th[i], nullptr, worker, &g_wa[k][i]); }
+        c->nth = 2;
+    }
+    c->gen++;
+    pthread_cond_broadcast(&c->cv);
+    while (!(c->done[0] && c->done[1])) pthread_cond_wait(&c->cv, &c->mu);
+    pthread_mutex_unlock(&c->mu);
     nn_tls_install(&c->tls);
 }

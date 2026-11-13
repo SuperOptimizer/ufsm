@@ -6,6 +6,73 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## scratch2 at P 1024 --split z: device memory outside the planner, and a per-step leak (2026-11-13, branch s2fix-20261113)
+
+The full scratch2 flag set (widths 256,320,384,448,288,288, attention 4 blocks with scroll PE, gn-ema, scan-norm, gfilm, ink head + MIL +
+air, fibre head, rv 2, unwrap2, on-the-fly phase, fibre / ink on the GPU) planned at 11.59 GB per card but died within ~20 steps. The
+fixes, by what each freed or stopped per card:
+
+| item | per card | fix |
+|---|---|---|
+| fp4 gy records under the split (also wrong, see the section below) | 1.21 GB planned | no records under the split |
+| head slab z 16 -> 8 (UFSM_HEAD_SLAB_Z; 4 is refused by the streamed latent head) | ~0.95 GB planned | launch env 8 |
+| Muon Newton-Schulz scratch pool (one batch for all matrices) | 953 MB -> 128 MB | batched in groups, UFSM_MUON_POOL_MB (128) |
+| Muon momentum beside the unused AdamW v of the matrices | 416 MB | the momentum lives in v (UFSM_MUON_MOM_ALIAS, default on); checkpoints mask both |
+| peer gradient buffer (whole parameter vector) | 416 MB -> 64 MB | chunked copy + axpy |
+| cuBLASLt workspace allocated on GPU 0, used from GPU 1 | crash ("cublasLtMatmul failed (14)") | per-device handle and workspace |
+| split_run created two new threads per call: thread-local device caches (ink MIL backward slabs ~330 MB, GroupNorm partials, gnbwd scratch) reallocated every step | ~0.3 GB / step, OOM at step ~20 | persistent side threads |
+| on-the-fly phase cache (--onfly-mb, default 2 GB on GPU 0) | 1.3 GB | --onfly-mb 768 |
+
+Not yet moved: the EMA weights and the film ffw buffers (416 MB each). train now warns when a card's free memory falls by more
+than 64 MB between log lines after step 2 (any allocator), so the next such leak shows in the log instead of as an OOM.
+
+Bench g1 (two 5060 Ti, only the trainer on the cards, suite locks held; UFSM_HEAD_SLAB_Z=8, --onfly-mb 768, 1 slot, 6 workers, 60
+steps): whole-card peaks 15.05 / 14.45 GB (gate 15.3), the trainer's own 14.93 / 14.37 GB, flat from step 14 to 60. Planner: mode MX
+gradients, chunked, lean 2, shared encoder a1 offloaded, 11.59 of 13.15 GB. Step time 33 s median, sampler-bound (wait 45-93%; the
+GPU part ~10 s); 18-20 s/step until a second P 1024 sampler started beside it.
+
+Host memory: each sampler slot pins 11.8 GB at P 1024, and the trainer pins ~13.3 GB more (host offloads 3.21 GB each way per card,
+label planes). 2 slots reached rss 90 GB + ~40 GB shmem and were memcg-killed at 104 GB at step 23. 1 slot: rss 50-58 GB. The
+sampler is the bound: one worker thread spends its time in sym_u8 (the per-channel symmetry copies of the full-resolution label
+planes in the --gpu-aug 1 CPU label path that the auxiliary heads force), 18-20 s per window against ~10 s of GPU step.
+
+## --split z: the encoder gradient bug was the GroupNorm backward's count, plus the first step's scroll axis records (2026-11-13, branch s2fix-20261113)
+
+Symptom: under `--split z`, encoder weight gradients differed from the one-GPU run (relative 4e-3 at enc3, 0.29 at enc0.c1). It showed
+only with a scroll axis and a level width >= 64. Loss, logits, decoded inputs and decoder gradients were identical. Repro: the trainer
+A/B `runs/s2fix/ab2.sh` (P 256, 32,32,64,64, `--fp4 2`, fibre sources with axis, both halves on GPU 0, UFSM_GRAD_DUMP step 1).
+
+Bisected with the GroupNorm backward dumps (UFSM_GNB_DUMP + UFSM_GNB_TDUMP: per call the summed statistics and the x / gy tensors).
+dec2's GroupNorm backward had identical x, gy and summed statistics, yet its output dy differed (3e-4) on both halves; enc3's gy
+followed, then every level above it. Cause: the halves scaled the summed group sums by f = D_local / D_whole (10 / 16 at level 2),
+and the apply kernels divided by the local count cpg * S_local. In exact arithmetic that equals the one-GPU AB / (cpg * S_whole), but
+in fp32 it is off in the last bit. MX-fp8 rounding of the gradient flipped some of those values, and the fp4 encoder amplified the
+flips. The width / axis dependence was only which values happened to flip; no halo, skip, all-gather or channel-block path was
+involved. Fix: gn_group_sums_k divides by the whole window's count (gn_bwd_reduce returns its voxels per channel), and the six apply
+kernels (lp_mx_gnbwd.cu, nn_common.cuh) read AB as is. Without the split, the operations and their order are unchanged.
+
+Second bug, found on the 6-level `--split-top 3` + `--attn-pe scroll` A/B: the split path's first upload never called axr_set. The
+first step's scroll RoPE therefore ran without the window's axis records ("rays along the grid rows"), and attention wo and gfilm
+gradients were 0.22 / 0.13 off. From step 2 on, select_buf set them, so only step 1 was affected. Fixed.
+
+| A/B (split vs one GPU, grad rel) | before | after | one vs rerun |
+|---|---|---|---|
+| 4 levels 32,32,64,64, axis | 4.7e-2 | 1.35e-7 | 1.3e-7 |
+| 6 levels 32,32,64,64,96,96 + attention (scroll), gfilm, gn-ema, split-top 3 | 1.4e-2 (wo 0.22, gfilm 0.13) | 1.2e-7 | - |
+
+Third bug, in the production gradient format (MX-fp4 gradients; the A/Bs above run MX-fp8 because fp4 gradients always round
+stochastically by element index, so split and whole are not comparable bit for bit). Under the split, the GroupNorm backward apply
+wrote the whole layer's gy records (lp_gn_silu_bwd_apply_rec) before the caller zeroed the halo planes. The fp4 weight gradient and
+its bias sums therefore read the halo voxels' gx: those planes were counted on both GPUs. Measured on enc0 / dec0 conv2 bias
+gradients, split with records vs split without was 0.13 relative off; one GPU with vs without records was 0.006 (SR noise). Fix:
+no gy records under the split (the weight gradient's own pre-pass reads the zeroed gy). Split with the fix vs split UFSM_GYREC=0:
+8e-8. This also frees the records' 1.21 GB per GPU at P 1024 (the planner no longer counts them under the split).
+
+Regression test `test_split_gnbwd` (fast tier): the MX GroupNorm backward of a 16-plane window in two halves (+2 halo planes) vs whole,
+for C 32 / 64, MX-fp4 / fp8 x, fp32 / MX-fp8 gradients. It has one gradient voxel per channel and half, so the statistics are exact sums
+on both runs (sums of many terms differ in the last bit by partition, by design). The owned gx must be bit-identical. Before the fix
+6-19k of 18-37k values differed in the fp32 cases; after, 0.
+
 ## Split-window input builders: every --gpu-aug builder by z range, the scanner split exactly across two GPUs (2026-11-13, branch augz-20261112)
 
 ## Muon variants for the from-scratch universal net: ten arms on the 92 M net (2026-11-13, branch muonx-20261113)
