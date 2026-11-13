@@ -10,7 +10,7 @@
 #           fields_cat.sh (shard files moved: the result is the single-GPU run's); FIELDGPUS="0" = one predict. A latent-grid CK (FKIND auto: the
 #           checkpoint header has "lat_c"; FKIND=lat / vox forces it): fields/lat from cube windows LWIN / LHALO (640 / 64, the gate's U1
 #           settings: stride 512, so the 1024-voxel z parts keep one tile grid), the latent heads' fit planes (winding mod 4 too); --fit-h 2 runs
-#           the slab plane path (the fused nn_fit_accum_lat kernel takes --fit-h 8 only)
+#           the fused nn_fit_accum_lat kernel (field cells of 2, 4 or 8; UFSM_PRED_FIT_FUSED=0: the slab plane path)
 #   ink     -> prep only; GPU INKGPU (1): INKAT=slabs (default) its GroupNorm calibration (inkcal) beside the ref, the main pass from
 #           the end of the slabs (beside join .. stripflat, all CPU); INKAT=fields: all of it from when the fields are done: INKCMD (the ink agent's recipe; default: the feathered
 #           single pass of inklib.sh: ift3, frozen GN, --window auto --halo 32 --feather 32, resumable) -> ink/$INKNAME.zarr

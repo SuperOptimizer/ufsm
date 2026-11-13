@@ -2,7 +2,8 @@
    sub-cell pair 0-1) + nn_fstem_fwd on the z-scored CT (nn_lat_ct_x) into [11][W^3] fp16 planes, then nn_fit_accum_dm and nn_fit_accum_w4
    (task unwrap2: phase 0-1, normal 2-7, density 8, winding mod 4 9-10, d 16), field cells of 8. A 96^3 window (24^3 cells, cout 144 =
    16 + 128 sub-cell outputs), halo 16, the box at window offsets on and off the cell grid; with and without the stem and the sub-cell
-   term. Pass: the 12 + 9 accumulator planes bit for bit. Usage: test_fit_lat */
+   term; field cells of 8 (fit_accum_k's tree), 2 and 4 (fit_accum_cell_k's serial sums: the unroll's --fit-h 2). Pass: the 12 + 9
+   accumulator planes bit for bit. Usage: test_fit_lat (UFSM_TEST_BENCH=1: timings at --fit-h 8 and 2) */
 #include "nn.h"
 #include "fit.h"
 #include <math.h>
@@ -12,7 +13,7 @@
 #include <string.h>
 #include <time.h>
 static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + 1e-9 * t.tv_nsec; }
-enum { WW = 96, CW = 24, NB = 16, COUT = 144, HALO = 16, C = 16, NO = 6, FH = 8, DD = 16 };
+enum { WW = 96, CW = 24, NB = 16, COUT = 144, HALO = 16, C = 16, NO = 6, DD = 16 };
 static double rnd(uint64_t *s) { *s = *s * 6364136223846793005ull + 1442695040888963407ull; return (double)(*s >> 11) * 0x1p-53 - 0.5; }
 static uint16_t f2h(float v) { _Float16 f = (_Float16)v; uint16_t h; memcpy(&h, &f, 2); return h; }
 int main(void) {
@@ -30,7 +31,9 @@ int main(void) {
     int so[16]; for (int c = 0; c < 16; c++) so[c] = -1;
     so[0] = 0; so[1] = 1; so[9] = 2; so[10] = 3; so[11] = 4; so[12] = 5;
     static const int OFF[3][3] = {{0, 0, 0}, {-8, 8, 0}, {16, -24, 8}};   /* the window's origin in box coordinates (tz ty tx), box multiples of 8 */
-    for (int st = 0; st < 2; st++) for (int sb = 0; sb < 2; sb++) for (int o = 0; o < 3; o++) {
+    static const int FHS[3] = {8, 2, 4};
+    for (int fi = 0; fi < 3; fi++) for (int st = 0; st < 2; st++) for (int sb = 0; sb < 2; sb++) for (int o = 0; o < 3; o++) {
+        const int FH = FHS[fi];
         const int tz = OFF[o][0], ty = OFF[o][1], tx = OFF[o][2], box[3] = {WW + 8, WW - 8, WW}, F[3] = {(box[0] + FH - 1) / FH, (box[1] + FH - 1) / FH, (box[2] + FH - 1) / FH};
         const size_t nf = (size_t)F[0] * F[1] * F[2];
         float *a0 = nn_malloc(12 * nf * 4), *a1 = nn_malloc(12 * nf * 4), *b0 = nn_malloc(9 * nf * 4), *b1 = nn_malloc(9 * nf * 4);
@@ -43,7 +46,7 @@ int main(void) {
         if (nn_fit_accum_lat(lgd, 1, CW, CW, CW, sb ? NB : -1, st ? pd : nullptr, C, so, ctd, ctd, nullptr, mean, isd, HALO, HALO, tz, ty, tx, box, FH, F,
                              -1, 0, 2, 8, dscale, 0, a1, 9, DD, b1)) { fprintf(stderr, "nn_fit_accum_lat refused the configuration\n"); return 1; }
         nn_sync();
-        if (o == 0 && sb == 0) {   /* (diagnosis: the per-voxel logits of the fused kernel against the planes) */
+        if (o == 0 && sb == 0 && fi == 0) {   /* (diagnosis: the per-voxel logits of the fused kernel against the planes) */
             float *dg = nn_malloc(11 * w3 * 4); nn_zero(dg, 11 * w3 * 4); nn_fit_accum_lat_debug(dg);
             float *sa = nn_malloc(12 * nf * 4), *sb4 = nn_malloc(9 * nf * 4); nn_zero(sa, 12 * nf * 4); nn_zero(sb4, 9 * nf * 4);   /* (scratch sums) */
             nn_fit_accum_lat(lgd, 1, CW, CW, CW, -1, st ? pd : nullptr, C, so, ctd, ctd, nullptr, mean, isd, HALO, HALO, tz, ty, tx, box, FH, F, -1, 0, 2, 8, dscale, 0, sa, 9, DD, sb4);
@@ -68,7 +71,7 @@ int main(void) {
         for (size_t i = 0; i < nf; i++) nset += h0[nf + i] != 0;
         size_t tot = 0; for (int k = 0; k < 21; k++) tot += nd[k];
         const int bad = tot != 0 || nset < nf / 4;
-        printf("%s stem %d sub-cell %d window at %3d %3d %3d: %zu of %zu cells with material, %zu accumulator values differ", bad ? "FAIL" : "ok  ", st, sb, tz, ty, tx, nset, nf, tot);
+        printf("%s cells %d stem %d sub-cell %d window at %3d %3d %3d: %zu of %zu cells with material, %zu accumulator values differ", bad ? "FAIL" : "ok  ", FH, st, sb, tz, ty, tx, nset, nf, tot);
         if (tot) { printf(" (planes:"); for (int k = 0; k < 21; k++) if (nd[k]) printf(" %d:%zu", k, nd[k]); printf(")"); }
         printf("%s\n", bad ? "  <--" : "");
         fails += bad;
@@ -81,6 +84,7 @@ int main(void) {
         for (size_t i = 0; i < COUT * bcv; i++) blg[i] = f2h((float)(3 * rnd(&s)));
         uint8_t *bctd = nn_malloc(b3); void *blgd = nn_malloc(COUT * bcv * 2), *bxd = nn_malloc(b3 * 2), *bpl = nn_malloc(11 * b3 * 2);
         nn_h2d(bctd, bct, b3); nn_h2d(blgd, blg, COUT * bcv * 2);
+        for (int FH = 8; FH >= 2; FH -= 6) {
         const int box[3] = {BW, BW, BW}, F[3] = {BW / FH, BW / FH, BW / FH}; const size_t nf = (size_t)F[0] * F[1] * F[2];
         float *a = nn_malloc(12 * nf * 4), *b = nn_malloc(9 * nf * 4);
         double tp = 1e9, tf = 1e9, tu = 1e9, tst = 1e9, tdm = 1e9;
@@ -100,9 +104,10 @@ int main(void) {
             nn_fit_accum_lat(blgd, 1, BC, BC, BC, NB, pd, C, so, bctd, bctd, nullptr, mean, isd, HALO, HALO, 0, 0, 0, box, FH, F, -1, 0, 2, 8, dscale, 0, a, -1, DD, b); nn_sync(); double t2 = now_s();
             tn = fmin(tn, t1 - t0); tw = fmin(tw, t2 - t1);
         }
-        printf("bench: fused without the stem %.1f ms, without the winding pass %.1f ms\n", 1e3 * tn, 1e3 * tw);
-        printf("bench %d^3 window: plane path %.1f ms (upsample + shuffle %.1f, stem %.1f, sums %.1f, winding %.1f), fused %.1f ms\n", BW, 1e3 * tp, 1e3 * tu, 1e3 * tst, 1e3 * tdm,
+        printf("bench cells %d: fused without the stem %.1f ms, without the winding pass %.1f ms\n", FH, 1e3 * tn, 1e3 * tw);
+        printf("bench cells %d, %d^3 window: plane path %.1f ms (upsample + shuffle %.1f, stem %.1f, sums %.1f, winding %.1f), fused %.1f ms\n", FH, BW, 1e3 * tp, 1e3 * tu, 1e3 * tst, 1e3 * tdm,
                1e3 * (tp - tu - tst - tdm), 1e3 * tf);
+        nn_free(a); nn_free(b); }
     }
     printf("%s\n", fails ? "FAIL" : "PASS");
     return fails != 0;

@@ -52,7 +52,7 @@ for a in pc ps sp t0 t3 w dz dq; do "$U" read f0z/$a "" 0 0 0 32 32 32 fa.raw > 
 # sub-cell head and the fine stem); also on a box inside the volume (the box clip at both ends). (--fit-zarr's strides, multiples
 # of --fit-h, and windows, of 16, keep the field cells on the latent cells: a halo is a multiple of 4)
 FF="pc ps t0 t1 t2 t3 t4 t5 sp w dz dy dx dq"
-cmpf() { for a in $FF; do "$U" read $1/$a "" 0 0 0 32 32 32 fa.raw > /dev/null 2>&1 && "$U" read $2/$a "" 0 0 0 32 32 32 fb.raw > /dev/null 2>&1 || fail "read fit field $a ($1 $2)"
+cmpf() { local n=${3:-32}; for a in $FF; do "$U" read $1/$a "" 0 0 0 $n $n $n fa.raw > /dev/null 2>&1 && "$U" read $2/$a "" 0 0 0 $n $n $n fb.raw > /dev/null 2>&1 || fail "read fit field $a ($1 $2)"
                           cmp -s fa.raw fb.raw || fail "fit field $a: the fused kernel against the plane path ($1 $2)"; done; }
 grep -q "fit fields fused from the cell logits" f0.log || fail "the fused fit kernel did not run ($D/f0.log)"
 UFSM_PRED_FIT_FUSED=0 "$U" predict s/last.ckpt fx ct f3 "${P[@]}" --fit-zarr f3z --no-out 1 > f3.log 2>&1 || fail "predict --fit-zarr, plane path ($D/f3.log)"
@@ -61,6 +61,15 @@ BX=(--box 8,16,24,240,232,224)
 "$U" predict s/last.ckpt fx ct f4 "${P[@]}" "${BX[@]}" --fit-zarr f4z --no-out 1 > f4.log 2>&1 || fail "predict --fit-zarr off-grid box ($D/f4.log)"
 UFSM_PRED_FIT_FUSED=0 "$U" predict s/last.ckpt fx ct f5 "${P[@]}" "${BX[@]}" --fit-zarr f5z --no-out 1 > f5.log 2>&1 || fail "predict --fit-zarr off-grid box, plane path ($D/f5.log)"
 cmpf f4z f5z
+# the same at --fit-h 2 (the unroll's field cells: fit_accum_cell_k's per-cell sums), the whole volume and the box
+"$U" predict s/last.ckpt fx ct f6 "${P[@]}" --fit-h 2 --fit-zarr f6z --no-out 1 > f6.log 2>&1 || fail "predict --fit-zarr --fit-h 2 ($D/f6.log)"
+grep -q "fit fields fused from the cell logits" f6.log || fail "the fused fit kernel did not run at --fit-h 2 ($D/f6.log)"
+UFSM_PRED_FIT_FUSED=0 "$U" predict s/last.ckpt fx ct f7 "${P[@]}" --fit-h 2 --fit-zarr f7z --no-out 1 > f7.log 2>&1 || fail "predict --fit-zarr --fit-h 2, plane path ($D/f7.log)"
+cmpf f6z f7z 96
+"$U" predict s/last.ckpt fx ct f8 "${P[@]}" "${BX[@]}" --fit-h 2 --fit-zarr f8z --no-out 1 > f8.log 2>&1 || fail "predict --fit-zarr --fit-h 2 off-grid box ($D/f8.log)"
+UFSM_PRED_FIT_FUSED=0 "$U" predict s/last.ckpt fx ct f9 "${P[@]}" "${BX[@]}" --fit-h 2 --fit-zarr f9z --no-out 1 > f9.log 2>&1 || fail "predict --fit-zarr --fit-h 2 off-grid box, plane path ($D/f9.log)"
+cmpf f8z f9z 96
+! grep -q "fused fit kernel does not take" f6.log f8.log || fail "the fused fit kernel fell back to the plane path at --fit-h 2 ($D/f6.log f8.log)"
 # (1b) the GPU pyramid (each level-0 shard pooled on the device, levels >= 1 encoded from the pieces) against the CPU pyramid (each level
 #      decoded back and pooled): at q 0 the same bytes, shard 128 (pieces below a chunk, gathered raw) and 256 (level 1 encoded at once)
 for sh in 128 256; do

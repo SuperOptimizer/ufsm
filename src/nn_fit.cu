@@ -469,8 +469,9 @@ __global__ void fit_finalize_w4_k(const float *acc, size_t nf, uint8_t *a) {
 }
 extern "C" void nn_fit_finalize_w4(const float *acc, size_t nf, uint8_t *a) { fit_finalize_w4_k<<<nblk(nf, 256), 256>>>(acc, nf, a); KCHECK(); }
 
-/* nn_fit_accum_lat (fit.h): one block of 512 threads per field cell of 8^3 voxels (2^3 latent cells: --fit-zarr's windows keep the field
-   cells on the cell grid), a voxel per thread in the sums as fit_accum_k. The plane path (predict's z-slab fzs: nn_lat_up_slab +
+/* nn_fit_accum_lat (fit.h): one block of 512 threads per 8^3 voxels (2^3 latent cells: --fit-zarr's windows keep the field cells on the
+   cell grid), a voxel per thread; field cells of 8 (one per block) summed as fit_accum_k, of 2 or 4 (8^3 / 4^3 a block: the unroll's
+   --fit-h 2) as fit_accum_cell_k, a thread per cell and accumulator. The plane path (predict's z-slab fzs: nn_lat_up_slab +
    nn_lat_shuffle + nn_fstem_fwd into [11][nz][W][W] fp16 planes, fit_accum_k, then the winding's own planes over +-d and fit_accum_w4_k)
    wrote and read ~30 B of planes per voxel and ran the stem twice; here the values stay in shared memory, with the same operations in
    the same order:
@@ -488,7 +489,7 @@ __device__ __forceinline__ float fl_h(float v) { return __half2float(__float2hal
 struct fl_args {
     int d, h, w, D, H, W, hz, halo, tz, ty, tx, bz, by, bx, fz0, fy0, fx0, nfy, nfx, F1, F2;
     size_t nf;
-    int ch_recto, dcode, ch_w4, dd, sbase, C;
+    int ch_recto, dcode, ch_w4, dd, sbase, C, fh;                 /* (fh: the field cell, 2, 4 or 8 voxels; blocks: 8^3 voxels, fz fy fx in units of 8) */
     float dscale, mean, isd;
     int nch, ndm, ch[FL_MAXCH], slot[FL_MAXCH];   /* region 0's channels (ndm of the cell sums, then the winding pair) and their stem slots (-1 none) */
     int nsl, so[FL_MAXS], wso[2];                 /* region 0's slots -> stem outputs; regions 1-3: slot u = the winding channel u's output wso[u] (-1 none) */
@@ -622,6 +623,35 @@ __global__ void __launch_bounds__(FL_T) fit_accum_lat_k(const T *__restrict__ lg
     for (int k = 0; k < 11; k++) U.red[k][tid] = v[k];
     U.red[11][tid] = rmax;
     __syncthreads();
+    if (A.fh < 8) {   /* field cells of 2^3 / 4^3 (the unroll's --fit-h 2): the block's 8^3 voxels hold q^3 cells, each summed as fit_accum_cell_k does */
+        __shared__ float csum[12][64];
+        const int fh = A.fh, q = 8 / fh, nc = q * q * q, h3 = fh * fh * fh;
+        auto vox = [&](int c, int t) { return (c / (q * q) * fh + t / (fh * fh)) * 64 + (c / q % q * fh + t / fh % fh) * 8 + c % q * fh + t % fh; };
+        auto cell = [&](int c) { return ((size_t)(fz * q + c / (q * q)) * A.F1 + fy * q + c / q % q) * A.F2 + fx * q + c % q; };
+        for (int it = tid; it < 12 * nc; it += FL_T) {   /* a cell's voxels in fit_accum_cell_k's order (z, y, x); the ones it skips add +0 here (the sums start at +0, never -0) */
+            const int k = it / nc, c = it % nc;
+            float s = 0.f;
+            for (int t = 0; t < h3; t++) { const float e = U.red[k][vox(c, t)]; s = k < 11 ? s + e : fmaxf(s, e); }
+            csum[k][c] = s;
+        }
+        __syncthreads();
+        if (tid < nc && csum[0][tid] > 0.f) {
+            const size_t bc = cell(tid);
+            for (int k = 0; k < 11; k++) if (csum[k][tid] != 0.f) atomicAdd(&acc[k * A.nf + bc], csum[k][tid]);
+            atomicMax((int *)&acc[11 * A.nf + bc], __float_as_int(csum[11][tid]));
+        }
+        if (A.ch_w4 < 0) return;
+        __syncthreads();
+        for (int k = 0; k < 9; k++) U.red[k][tid] = t9[k];
+        __syncthreads();
+        for (int it = tid; it < 9 * nc; it += FL_T) {   /* fit_accum_w4_k's per-cell serial sums */
+            const int k = it / nc, c = it % nc;
+            float s = 0.f;
+            for (int t = 0; t < h3; t++) s += U.red[k][vox(c, t)];
+            if (s != 0.f) atomicAdd(&acc4[k * A.nf + cell(c)], s);
+        }
+        return;
+    }
     for (int o = 256; o > 0; o >>= 1) {   /* fit_accum_k's tree */
         if (tid < o) { for (int k = 0; k < 11; k++) U.red[k][tid] += U.red[k][tid + o]; U.red[11][tid] = fmaxf(U.red[11][tid], U.red[11][tid + o]); }
         __syncthreads();
@@ -645,11 +675,11 @@ __global__ void __launch_bounds__(FL_T) fit_accum_lat_k(const T *__restrict__ lg
 extern "C" int nn_fit_accum_lat(const void *lg, int lh16, int d, int h, int w, int sbase, const float *stem, int C, const int *so, const uint8_t *ctx, const uint8_t *ct,
                                 const uint32_t *bits, float mean, float isd, int hz, int halo, int tz, int ty, int tx, const int box[3], int fh, const int F[3],
                                 int ch_recto, int ch_phase, int ch_normal, int ch_density, float dscale, int dcode, float *acc, int ch_w4, int dd, float *acc4) {
-    if (fh != 8 || h != w || (stem && (C < 1 || C > FL_C || !ctx)) || (!bits && !ct && !ctx)) return 1;
+    if ((fh != 2 && fh != 4 && fh != 8) || h != w || (stem && (C < 1 || C > FL_C || !ctx)) || (!bits && !ct && !ctx)) return 1;
     if ((tz & 3) || (ty & 3) || (tx & 3) || (ch_w4 >= 0 && (dd & 3))) return 1;   /* (field cells and the partner regions on the cell grid) */
     fl_args A = {};
     A.d = d; A.h = h; A.w = w; A.D = 4 * d; A.H = 4 * h; A.W = 4 * w; A.hz = hz; A.halo = halo; A.tz = tz; A.ty = ty; A.tx = tx; A.bz = box[0]; A.by = box[1]; A.bx = box[2];
-    A.ch_recto = ch_recto; A.dcode = dcode; A.dscale = dscale; A.ch_w4 = ch_w4; A.dd = dd; A.sbase = sbase; A.C = stem ? C : 0; A.mean = mean; A.isd = isd; A.dbg = g_fl_dbg;
+    A.ch_recto = ch_recto; A.dcode = dcode; A.dscale = dscale; A.ch_w4 = ch_w4; A.dd = dd; A.sbase = sbase; A.fh = fh; A.C = stem ? C : 0; A.mean = mean; A.isd = isd; A.dbg = g_fl_dbg;
     if (ch_w4 >= 0 && (dd > halo || dd > hz || dd < 1)) { fprintf(stderr, "nn_fit_accum_lat: offset %d outside the halo (%d, z %d)\n", dd, halo, hz); abort(); }
     int n = 0;
     A.ch[n++] = ch_phase; A.ch[n++] = ch_phase + 1; for (int k = 0; k < 6; k++) A.ch[n++] = ch_normal + k; A.ch[n++] = ch_density; if (ch_recto >= 0) A.ch[n++] = ch_recto;
@@ -670,6 +700,8 @@ extern "C" int nn_fit_accum_lat(const void *lg, int lh16, int d, int h, int w, i
         f0[k] = lo / fh; f1[k] = (hi + fh - 1) / fh; if (f1[k] > F[k]) f1[k] = F[k];
         if (f1[k] <= f0[k]) return 0;
     }
+    const int q = 8 / fh;   /* the blocks' 8^3 voxels: q^3 field cells (the box's cells and blocks both from its origin) */
+    for (int k = 0; k < 3; k++) { f0[k] /= q; f1[k] = (f1[k] + q - 1) / q; }
     A.fz0 = f0[0]; A.fy0 = f0[1]; A.fx0 = f0[2]; A.nfy = f1[1] - f0[1]; A.nfx = f1[2] - f0[2]; A.F1 = F[1]; A.F2 = F[2];
     A.nf = (size_t)F[0] * F[1] * F[2];
     const size_t nb = (size_t)(f1[0] - f0[0]) * A.nfy * A.nfx;
