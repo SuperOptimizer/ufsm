@@ -75,16 +75,20 @@ extern "C" double nn_skip_share(int lev) {   /* the active share of level lev's 
 }
 extern "C" void nn_skip_counts(long *masked, long *calls) { skreg_t *s = &g_sk[skdev()]; *masked = s->used; *calls = s->calls; s->used = s->calls = 0; }
 /* the conv launches' lookup: the mask of the level whose grid the output is (MX forward, N 1, whole-tensor output), else none */
+/* the conv launches' lookup: the mask of the level whose grid the output is (MX forward, N 1), else none. A z-range output (nn_set_zrange /
+   _out: planes of a depth-yD output, or reading planes z + zi0 of a depth-Di input: predict's level-0 / 1 halves) is located on its
+   level by that depth and its first plane (zoff, a multiple of 8: whole tiles); a z-window (zw0 / zw1) has whole-tensor plane numbers */
 extern "C" skipm_t lp_skip_get(shape5 xs, split_t sp, int fwd) {
-    skipm_t r = {nullptr, 0, 0};
+    skipm_t r = {nullptr, 0, 0, 0};
     skreg_t *s = &g_sk[skdev()]; if (!s->on) return r;
     s->calls++;
     static int dbg = -1; if (dbg < 0) dbg = getenv("UFSM_SKIP_DEBUG") ? atoi(getenv("UFSM_SKIP_DEBUG")) : 0;   /* UFSM_SKIP_DEBUG=N: the first N dense lookups and why */
-    if (!fwd || xs.n != 1 || sp.zw1 || sp.Di || sp.yD || sp.accum || sp.sr || sp.osr) {
-        if (dbg > 0) { dbg--; fprintf(stderr, "skip: dense %dx%dx%dx%d: fwd %d n %d zw %d-%d zi0 %d Di %d yD %d accum %d sr %u osr %u\n", xs.c, xs.d, xs.h, xs.w, fwd, xs.n, sp.zw0, sp.zw1, sp.zi0, sp.Di, sp.yD, sp.accum, sp.sr, sp.osr); }
+    const int D = sp.yD ? sp.yD : sp.Di ? sp.Di : xs.d, zoff = sp.yD ? sp.yzo : sp.Di ? sp.zi0 : 0;
+    if (!fwd || xs.n != 1 || sp.accum || sp.sr || sp.osr || zoff % 8 || (sp.yD && sp.Di && sp.yzo != sp.zi0) || (sp.zw1 && zoff)) {
+        if (dbg > 0) { dbg--; fprintf(stderr, "skip: dense %dx%dx%dx%d: fwd %d n %d zw %d-%d zi0 %d Di %d yD %d yzo %d accum %d sr %u osr %u\n", xs.c, xs.d, xs.h, xs.w, fwd, xs.n, sp.zw0, sp.zw1, sp.zi0, sp.Di, sp.yD, sp.yzo, sp.accum, sp.sr, sp.osr); }
         return r;
     }
-    for (int l = 0; l < s->nl; l++) if (s->D[l] == xs.d && s->H[l] == xs.h && s->W[l] == xs.w) { r.m = s->m[l]; r.my = s->my[l]; r.mx = s->mx[l]; s->used++; return r; }
-    if (dbg > 0) { dbg--; fprintf(stderr, "skip: dense %dx%dx%dx%d: no level grid of these dims (level 0 %dx%dx%d)\n", xs.c, xs.d, xs.h, xs.w, s->D[0], s->H[0], s->W[0]); }
+    for (int l = 0; l < s->nl; l++) if (s->D[l] == D && s->H[l] == xs.h && s->W[l] == xs.w) { r.m = s->m[l]; r.my = s->my[l]; r.mx = s->mx[l]; r.zoff = zoff; s->used++; return r; }
+    if (dbg > 0) { dbg--; fprintf(stderr, "skip: dense %dx%dx%dx%d (depth %d): no level grid of these dims (level 0 %dx%dx%d)\n", xs.c, xs.d, xs.h, xs.w, D, s->D[0], s->H[0], s->W[0]); }
     return r;
 }

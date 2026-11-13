@@ -333,7 +333,7 @@ __global__ void prep_w4_2d_k(const float *__restrict__ w, uint8_t *__restrict__ 
    and at most two x tiles */
 __device__ __forceinline__ bool sk_active(const skipm_t &sk, int oz0, int oy0, int ox0) {
     if (!sk.m) return true;
-    const size_t r = ((size_t)(oz0 >> 3) * sk.my + (oy0 >> 3)) * sk.mx; const int a = ox0 >> 3, b = min((ox0 + 15) >> 3, sk.mx - 1);
+    const size_t r = ((size_t)((oz0 + sk.zoff) >> 3) * sk.my + (oy0 >> 3)) * sk.mx; const int a = ox0 >> 3, b = min((ox0 + 15) >> 3, sk.mx - 1);
     return (sk.m[r + a] | sk.m[r + b]) != 0;
 }
 template <int MT, int TZ, typename T, typename TO>
@@ -470,7 +470,7 @@ template <int MT, int TZ, typename T, typename TO> void launch_f4(dim3 grid, con
     if (smem < 8 * 256 * sizeof(float)) smem = 8 * 256 * sizeof(float);
     static int attr[8];
     if (!attr[cur_dev_()]) { attr[cur_dev_()] = 1; cudaFuncSetAttribute((const void *)conv_fwd_f4_k<MT, TZ, T, TO>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
-    const skipm_t sk = IS_MX(TO) ? lp_skip_get(xs, sp, 1) : skipm_t{nullptr, 0, 0};   /* (--skip-empty: MX forwards only) */
+    const skipm_t sk = IS_MX(TO) ? lp_skip_get(xs, sp, 1) : skipm_t{nullptr, 0, 0, 0};   /* (--skip-empty: MX forwards only) */
     conv_fwd_f4_k<MT, TZ, T, TO><<<grid, 256, smem>>>((const T *)x, wq, ws, b, (TO *)y, xs.n, xs.c, xs.d, xs.h, xs.w, cout, Cop, Cip, gp, osum, Go, sp, sk);
 }
 /* ---- one or two 32-channel input chunks (Cip == 32 NCH, no fused upsample): conv_fwd_f4_k with the input staged once per z
