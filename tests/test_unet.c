@@ -176,6 +176,8 @@ int main(void) {
     if (getenv("UFSM_PREC_POLICY") && nn_set_prec_policy(getenv("UFSM_PREC_POLICY"))) return 1;
     nn_set_tf32(getenv("UFSM_FP32") ? 0 : 1);
     unet_cfg big = {4, {16, 32, 64, 80}, 4, 1, 8};
+    if (getenv("UFSM_BIG_WIDTHS")) { char *t = strdup(getenv("UFSM_BIG_WIDTHS")); int l = 0; for (char *q = strtok(t, ","); q && l < UNET_MAXLEV; q = strtok(nullptr, ",")) big.widths[l++] = atoi(q); big.nlev = l; free(t); }   /* (a level narrower than
+                                                                     the one above: test_unet~narrow, the lean-2 gout overrun of 11-13) */
     big.down_norm = cfg.down_norm;
     big.l0_norm = cfg.l0_norm == 4 ? 0 : cfg.l0_norm;   /* (slab on tensor cores: MX storage only, test_l0_norm) */
     big.gn_ema = cfg.gn_ema;
@@ -230,9 +232,10 @@ int main(void) {
             }
             double d2 = 0, n2 = 0; for (size_t i = 0; i < np; i++) { d2 += (double)(g1[i] - g2[i]) * (g1[i] - g2[i]); n2 += (double)g1[i] * g1[i]; }
             double rel = sqrt(d2 / (n2 > 0 ? n2 : 1));
-            printf("grads tensor-core vs fp32: rel L2 diff %.3g%s\n", rel, rel < 0.05 ? "" : "  FAIL");
+            const double tol = getenv("UFSM_GRAD_TOL") ? atof(getenv("UFSM_GRAD_TOL")) : 0.05;   /* (MX-fp8 gradients of this small net: ~0.3 vs fp32) */
+            printf("grads tensor-core vs fp32: rel L2 diff %.3g%s\n", rel, rel < tol ? "" : "  FAIL");
             if (getenv("UFSM_SEGS")) seg_report(big.widths, big.nlev, big.cin, big.cout, g1, g2);
-            if (rel >= 0.05) bad++;
+            if (rel >= tol) bad++;
             free(g1); free(g2);
             nn_zero(bg, bl * 4);
         }
