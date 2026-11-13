@@ -6,6 +6,71 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Latent ink head: window seams at inference, the 2-pass grid blend, 1667 scores (2026-11-12, scripts/inkgt/u1667ink.sh)
+
+The inkpod snapshots' ink head (`predict --heads ink`, latent trunk, 4 levels) gives every predict window its own level: the 1299
+inkpod-9000 renders showed a square tile grid. Measured in the raw store on a fixed 1299 corner (level 2, box 5632,2048,2048 + 1024^3,
+the plane-mean step across the window seam / the median plane step, z / y / x; sched/seam/seam.tsv):
+
+| run | halo 16 | halo 64 | halo 96 |
+|---|---|---|---|
+| inkpod-9000 (--ink-dice 0.25) | 2.6 / 7.2 / 30.2 | 2.0 / 27.1 / 4.9 | 1.6 / 27.5 / 13.6 |
+| inkpod-11000 (dice off) | 1.4 / 15.3 / 29.5 | 2.4 / 30.3 / 12.1 | 2.6 / 23.8 / 16.1 |
+| inkpod-12000 (dice off, --ink-air 8, ink share 40%) | 0.4 / 15.4 / 26.6 | | |
+
+(median plane steps 0.07-0.5; ift3 on the same box: no step.) Window 1024 / halo 256 still 10-14; `--gn-frozen` (fresh pooled
+statistics) moves the levels, not the steps; level 1 (4.8 um, the crop eval's level) 5.2 / 13.2 / 3.8. No attention stage, constant
+FiLM code. Turning the per-window dice off did NOT remove the steps (11000 / 12000 as large as 9000), so the head's level depends on
+context wider than 256 voxels for another reason (receptive field of the stride-4 trunk; ink never supervised in air, ~60 / 255 there).
+
+Fix at inference: two passes, the second on a tile grid shifted by half a tile (`--grid-origin 256,256,256`), blended with sin^2 tile
+weights (`ufsm ink-blend --tile 512 --grids 0,0,0:256,256,256`): on a 512^3 read across the corner the largest plane step drops from
+16.9 to 1.3 (median 0.1). The shifted pass must use `--shard 256`: with 512 shards every shard needs 8 windows (P4 inner 17405 windows
+vs 2311, 7.5x); with 256 shards the output is byte-identical (1299 test box) in 5 s instead of 63 s. Papyrus gate for renders only:
+the same `--heads ink,c12,c13` run gives the recto / verso probabilities, gated = ink x max(c12, c13) on the rendered stripes; the
+store and the scores stay ungated.
+
+1667 u1 centre surface, inkpod-9000 blended, vs the published human labels (wrapscore, 40 um; ift3-24000 beside):
+
+| split | coverage | inkpod-9000 ink AUC | ift3-24000 |
+|---|---|---|---|
+| all | 0.860 | 0.774 | 0.646 |
+| validation | 0.827 | 0.528 | 0.670 |
+| holdout | 0.864 | 0.560 | 0.639 |
+| rest (in the ink training labels) | 0.864 | 0.832 | 0.643 |
+
+The "all" gain is the training labels: on the unseen splits the latent head is below ift3 (-0.14 / -0.08). 20 / 80 um all: 0.776 /
+0.776 (coverage 0.615 / 0.971). wrapscore: the foot-point refine's 2x2 solve is closed-form (np.linalg.solve raised on P4's grid holes).
+
+## The 1667 unroll's ink against the human labels on our surfaces (2026-11-12, scripts/inkgt/wrapscore.py)
+
+`ufsm ink-compare`, which the earlier unrolls ran, is label-free (CT | ink panels and statistics). wrapscore.py maps the published
+labels onto our flattened stripes:
+1. It samples every 8th label px of the 6 published PHerc1667 segments inside their supervision (7.79 M samples, ink 0.24) and takes
+   each sample's 3-D point on the published mesh.
+2. It finds the nearest vertex of our stripes (x 4 to level 0), then the foot point on that bilinear patch. The distance is the miss.
+3. Within a tolerance, it reads the stripe's ink and CT renders (strip-mosaic <s>_ink.jpg / <s>_ct.jpg) at the render pixel
+   (render px = grid / scale, render_core.h).
+
+Coverage scores the surfaces. AUC and best F1 are rank-based, so the mosaic stretch doesn't change them.
+
+Check: a published segment through a half-resolution re-grid of itself in 9.6 um voxels, with a half-size map, gives AUC 0.978 for a
+perfect map (miss median 0.2 um).
+
+u1 unroll (ift3-24000 ink, out of sample on 1667), 40 um, all samples:
+
+| render set | coverage | median miss | ink AUC (20 / 80 um) | ink best F1 | CT AUC |
+|---|---|---|---|---|---|
+| centre, depth 1 + fill | 0.860 | 15.1 um | 0.646 (0.645 / 0.648) | 0.435 | 0.540 |
+| centre, thin +-2 | 0.860 | 15.1 um | 0.646 | 0.434 | 0.540 |
+| recto face (-1.5 voxels) fill / thin | 0.848 | 16.6 um | 0.648 / 0.647 | 0.437 | 0.535 |
+| verso face (+1.5 voxels) fill / thin | 0.795 | 22.4 um | 0.643 / 0.643 | 0.431 | 0.526 |
+
+- Coverage at 20 / 80 um (centre): 0.615 / 0.971.
+- The validation split runs 0.01-0.035 higher, the ink holdout boxes about 0.01 lower.
+- The face shift and the thin band move the ink AUC by <= 0.005. The limit is the ink model, not the render. The published meshes lie
+  slightly to the recto side of our centre surface.
+
 ## Pod whole-scroll unroll queue: two lanes per card, axis check, latent ink stage (2026-11-12/13, branch podunroll-20261112)
 
 Pod 3 (one RTX PRO 6000, 98 GB; cgroup 94 GB / 27.2 CPUs), u1-13750, RECTOSP=0, the user's smallest-first list. 13 scrolls landed
@@ -491,6 +556,25 @@ dropped 10 of 14 picked windows as "empty targets". Three causes:
   of the supervised pixels. So validation "exclude" leaves 0 supervised tiles there (15112 / 11687 with validation off) and no
   draw index. The open data apparently marks these segments as validation whole. They should stay out of the ink weight; they
   can serve as unseen-scroll ink evals. MAN5's hf labels hold no ink pixel in the supervised area (share 0.000).
+
+**Before / after on the desk (2026-11-12, after the pod went away).** U2's recipe (`--task unwrap2 --rv 2 --ink-head 1 --ink-mil 1`,
+P 1024, B 1, rungs 4.8 / 9.6, `--strict-sources 1`), sampler only, 1 worker / 1 slot, 40 batches, the 6 desk ink sources
+(/vesuvius/ufsm/univ/u2ink/sources-u2desk-ink.json: local CT levels 1-5, onfly level 1 + 2 pooled):
+
+| | master cb8102d | inkcache-20261112 (inkdraw + shared cache) |
+|---|---|---|
+| draws dropped as empty targets | 192 for 40 windows (83 %) | 3 for 40 (7 %) |
+| wall for 40 windows | 4738 s | 1443 s |
+| host RSS (UFSM_HOSTMEM) | 27.27 GB | 19.78 GB (ink caches 3.22 GB targets + 1.07 GB CT, at the 4096 MB budget) |
+
+After the fix, per ink window: known ink target on 0.28-0.51 % of the voxels, ink on 0.07-0.14 %, and 65536 MIL rays (the
+`--ink-mil-max` cap) per window. Paris 4 26 windows, 1667 13, 0139 1.
+
+**One cache budget for every ink source** (branch inkcache-20261112). Each onfly ink source used to open a 2 GB target LRU and a
+1 GB decoded-CT zcache (24 GB for 8 sources). They now share a dcache pool ("ink", z3_open_cached_pool) and one zcache, with one
+budget, `train --ink-cache-mb` (default 4096 or $UFSM_INK_CACHE_MB): 3/4 targets, 1/4 CT. inkfly_free drops its CT's chunks from
+the shared zcache (zcache_drop: a later array at the same address must never see them). test_zcache covers the pool (two arrays,
+8 threads, evicting, one closed, empty after) and zcache_drop.
 
 Footprint of one ink sampler at P 1024 (sampler only, 1 worker, 1 slot, 8 sources): 17.6 GB RSS. The pod arm A unit at 3 workers /
 3 slots peaked at 52 GB and OOM-killed itself and U2's run in the shared 175 GB cgroup (09:58 UTC).
