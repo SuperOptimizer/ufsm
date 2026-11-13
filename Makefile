@@ -429,6 +429,8 @@ suite-bins: $(B)/test_grad_ar
 $(B)/test_dcache_batch: tests/test_dcache_batch.c $(B)/dcache.o $(B)/zarr3.o $(B)/store.o $(B)/z3w.o $(B)/json.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
 suite-bins: $(B)/test_dcache_batch
+$(B)/bench_fstem: tests/bench_fstem.c $(OBJ) $(B)/nn.o $(B)/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 $(B)/test_ink_air: tests/test_ink_air.c $(OBJ) $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 suite-bins: $(B)/test_ink_air
