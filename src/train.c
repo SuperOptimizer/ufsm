@@ -1383,6 +1383,11 @@ static void head_slab_pass(gpu_state *d, int pass) {
         }
         PT("adjoint");
         if (pipe) nn_event_record(d->evl_free[sj & 1], 0);
+        /* --split: hand the turn to the other half after every slab (a no-op collective; both halves run the same slab count). A pass has no
+           other collective, and its ~1300 launches fill the launch queue, so the half holding the turn blocked in it at its own GPU's pace while
+           the other half could not enqueue: the two head passes ran one card at a time (P 1024 nsys: 1.1 s idle per card per step, perf2 2026-11-13).
+           The shared op state (SR counter) passes with the turn, so the SR draws differ from UFSM_SPLIT_YIELD=0 but stay deterministic. */
+        { static int yon = -1; if (yon < 0) yon = !getenv("UFSM_SPLIT_YIELD") || ufsm_env_on("UFSM_SPLIT_YIELD"); if (yon && split_side() >= 0) split_yield(); }
 #undef LGC
 #undef PT
 #undef FT
