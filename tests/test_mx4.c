@@ -471,8 +471,12 @@ int main(void) {
                                                   fp4 kernel (NCH 8 / 10 / 12 / 14 / 9) and the dilated path it replaces, against the reference, accumulating
                                                   (448 was untested and gave NaN gradients at level 3 of the scratch2 run: perf2 2026-11-13) */
                 static const int CWS[5] = {256, 320, 384, 448, 288}; const int CW = CWS[wc];
-                if (wc >= 2 && !getenv("TMX4_WIDE_ALL")) continue;   /* (384 / 448 / 288 after 256 / 320 leave the later SR-operand check NaN: TMX4_WIDE_ALL=1, open) */
-                lp_set_s2b_wide(1);   /* (off by default in the trainer since perf2 2026-11-13) */
+                /* TMX4_WIDE_ALL=1: all five widths in sequence; 384 / 448 / 288 after 256 / 320 with the wide path on leave the later SR-operand
+                   check NaN (the a054edf regression: the scratch2 level-3 NaN). TMX4_WIDE_ENV=1: the wide path as the trainer has it
+                   (UFSM_S2B_WIDE, default off) instead of forced on: the suite's regression entry, which fails with UFSM_S2B_WIDE=1 */
+                const int wenv = getenv("TMX4_WIDE_ENV") != nullptr;
+                if (wc >= 2 && !getenv("TMX4_WIDE_ALL")) continue;
+                lp_set_s2b_wide(wenv ? -1 : 1);   /* (off by default in the trainer since perf2 2026-11-13) */
                 if (getenv("TMX4_CW") && atoi(getenv("TMX4_CW")) != CW) continue;   /* (one width: the out-of-bounds hunt) */
                 shape5 xw = {N, CW, 32, 32, 32}, yw = {N, CW, 16, 16, 16};
                 const size_t nxw = shape_numel(xw), nyw = shape_numel(yw);
@@ -489,7 +493,7 @@ int main(void) {
                     nn_free(gw);
                 }
                 lp_set_s2b_f4(-1); lp_set_s2b_wide(-1);
-                char nm[96]; snprintf(nm, sizeof nm, "s2 bwd_data %d ch fp4 kernel taken", CW); check(nm, ew[1] != ew[0]);
+                char nm[96]; snprintf(nm, sizeof nm, "s2 bwd_data %d ch fp4 kernel taken", CW); if (!wenv) check(nm, ew[1] != ew[0]);
                 nn_free(ww); nn_free(gyw); nn_free(oldw); nn_free(grw); nn_free(scrw); nn_free(gywm); nn_free(oldwm); nn_free(gywd); nn_free(oldwd);
             }
             nn_free(gyb); nn_free(old); nn_free(gxr); nn_free(scr); nn_free(gym); nn_free(oldm); nn_free(gyd); nn_free(oldd);
