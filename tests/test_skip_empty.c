@@ -1,8 +1,9 @@
 /* --skip-empty (src/nn_skip.cu, DESIGN 2026-11-13 "empty-space skipping"): masked 3^3 convs on the MX-fp4 inference path.
    (1) every tile active: the logits bit-identical to the dense forward, and the masked kernel did run (masked launches > 0);
-   (2) a window with material in its lower z third only, masks from the CT (threshold 0, margin 1): the deviation from the dense logits
-       on the material voxels, the voxels near it and the far air, and the active tile shares; the material voxels within the
-       tolerance (the masked net is not the dense one: no input of scratch2's is spatially constant, so this is an approximation);
+   (2) a window with material in its lower z third only, masks from the CT (threshold 0, margins 1-3): the deviation from the dense
+       logits by z band. With fixed GroupNorm statistics (gn_ema) it stays within the convs' reach of the bias-filled tiles: material
+       logits bit-identical at margin 3, within 2% at margin 2 (this net: 3 levels, no attention; scratch2's attention / gfilm couple
+       further, measured separately);
    (3) nn_skip_off: dense again, bit-identical. */
 #include "unet.h"
 #include <math.h>
@@ -62,13 +63,20 @@ int main(void) {
                "boundary band %.4g, far air %.4g\n", ZM, s0, s1, s2, nm, nc, em, mag, eb, ea);
         CHECK(s0 > 0.3 && s0 < 0.7, "level-0 active share %.3f (material + 1 tile of margin: 3 of 8 tile planes)", s0);
         CHECK(nm > 0, "masked launches");
-        CHECK(em <= 0.05 * mag + 1e-3, "material logits within 5%% of the mean |logit| of the dense ones (%.4g vs %.4g)", em, mag);
     }
     {   /* the deviation profile by margin: mean |dlogit| per 4-plane band (z from the material top), over the mean |logit| */
         for (int mg = 1; mg <= 3; mg++) {
             nn_skip_off(); nn_skip_build(dct, P, P, P, 1, 3, 0, mg);
             const double a0 = nn_skip_share(0);
             nn_d2h(lm, unet_forward(u, dx, xs, 0), no * 4);
+            {   /* the material voxels (z < ZM): margin 3 bit-identical (fixed GroupNorm statistics: the error stays within the convs' reach of
+                   the fill), margin 2 within 2% (mean |dlogit| over mean |logit|; measured 0.2% on the pod, 2026-11-13) */
+                double e = 0, m = 0; int same = 1;
+                for (int c = 0; c < os.c; c++) for (size_t k = (size_t)c * p3; k < (size_t)c * p3 + (size_t)ZM * P * P; k++) { e += fabs((double)ld[k] - lm[k]); m += fabs(ld[k]); same &= ld[k] == lm[k]; }
+                printf("  margin %d: material mean |dlogit| / mean |logit| %.5f%s\n", mg, e / m, same ? " (bit-identical)" : "");
+                if (mg == 2) CHECK(e / m < 0.02, "margin 2: material logits within 2%% (%.4f)", e / m);
+                if (mg == 3) CHECK(same, "margin 3: material logits bit-identical to the dense forward");
+            }
             printf("  margin %d (L0 active %.3f): z band: mean |dlogit| / mean |logit|:", mg, a0);
             for (int z0 = 0; z0 < P; z0 += 4) { double e = 0, m = 0; for (int c = 0; c < os.c; c++) for (int z = z0; z < z0 + 4; z++) for (int i = 0; i < P * P; i++) {
                     const size_t k = ((size_t)c * P + z) * P * P + i; e += fabs((double)ld[k] - lm[k]); m += fabs(ld[k]); }
