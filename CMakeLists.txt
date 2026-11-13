@@ -126,12 +126,15 @@ if(UFSM_PTXAS_SPLIT GREATER 1)
   list(APPEND UFSM_CU_FLAGS "SHELL:-Xcuda-ptxas --split-compile=${UFSM_PTXAS_SPLIT}")
 endif()
 # nvcc -use_fast_math on the device side only: flush denormals, approximate division / sqrt / transcendentals, FMA contraction.
+# Contraction "on" (a*b+c fused within one expression), not "fast" (across statements): with fast, LLVM fused differently in kernels
+# that must agree bit for bit (nn_loss_pack vs nn_loss_async_tol + nn_half_grad, tests/test_half.c: 546 of 6144 gradients 1 ulp
+# apart, the BCE sum too); with on they agree, as they did under nvcc (forlindesk sm_86, 2026-11-13).
 # NaN / inf stay honoured (no -ffinite-math-only: the NaN guards in the loss and fwd_nan paths must survive). Checked 2026-11-13:
 # the float instruction kinds in the PTX match nvcc -use_fast_math (div.approx.ftz, sqrt.approx.ftz, ex2.approx.ftz, fma.rn.ftz).
 # ("SHELL:" groups: CMake de-duplicates repeated options, which would drop the second -Xarch_device)
 # UFSM_DEVICE_FAST_MATH: the rest of nvcc's fast-math intrinsic mapping (expf -> __expf ..., src/clang_cuda_compat.cuh)
 set(UFSM_CU_FAST -DUFSM_DEVICE_FAST_MATH -fgpu-flush-denormals-to-zero -fgpu-approx-transcendentals "SHELL:-Xarch_device -fapprox-func"
-    "SHELL:-Xarch_device -ffp-contract=fast")
+    "SHELL:-Xarch_device -ffp-contract=on")
 # byte-identical to their CPU versions: IEEE division / sqrt, no FMA contraction, no flush (nvcc -fmad=false, no fast math).
 # clang leaves libdevice's __CUDA_PREC_SQRT reflection at 0, so sqrtf would be sqrt.approx.f32 even without fast math (nvcc:
 # sqrt.rn.f32); the reflection is set explicitly (-mllvm reaches the host pass too, where it does nothing). Checked 2026-11-13: the
