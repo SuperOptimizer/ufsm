@@ -51,6 +51,7 @@ z3 *z3_open_derived_pool2(z3 *base, int fill, z3_derive_fn derive, void *ctx, vo
 int z3_derived_extent(z3 *z, int (*fn)(void *ctx, const int64_t grid[3], const int chunk[3], uint8_t *bits), void *ctx);
 const z3_meta *z3_meta_of(const z3 *z);
 const char *z3_key(const z3 *z);
+const char *z3_root(const z3 *z);   /* the store root of z (a derived array: its base's), "" if none */
 
 /* Read the box [o, o+n) (z,y,x) into out (C order, n[0]*n[1]*n[2] bytes). Out-of-range parts use fill_value.
    nthreads <= 0 picks the CPU count. Returns 0 on success, -1 on I/O or decode failure. */

@@ -247,6 +247,7 @@ void z3_close(z3 *z) {
 const z3_meta *z3_meta_of(const z3 *z) { return &z->m; }
 const void *z3_latvol(const z3 *z) { return z && !z->derive ? z->lv : nullptr; }
 const char *z3_key(const z3 *z) { return z->key; }
+const char *z3_root(const z3 *z) { while (z && !z->s && z3_base_of(z)) z = z3_base_of(z); return z && z->s ? store_root(z->s) : ""; }
 
 int z3_group_levels(store *s, const char *group_key, z3_level *out, int max) {
     char gk[1024];

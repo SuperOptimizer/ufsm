@@ -10,3 +10,8 @@
 /* open(ctx, level): the scan's CT level (nullptr: none); the handles are not closed here. 0 ok; < 0: -2 no level L, -3 no coarse
    level, -4 / -6 a read failure, -5 / -7 too little material */
 int scan_norm_stats(z3 *(*open)(void *ctx, int level), void *ctx, int L, float *center, float *scale, int nthreads);
+/* scan_norm_stats once per process and scan level, and on disk: keyed by the arrays the statistics read (the level-L array and the
+   L + 2 .. L + 9 candidates: store root, array key, shape; a local level L's zarr.json size / mtime), so sources that share a scan
+   share it and a restart reads it back (UFSM_SCANNORM_CACHE=0: no disk; dir UFSM_SCANNORM_DIR, default ~/.cache/ufsm/scannorm).
+   The values are the float bits scan_norm_stats returned: identical. *cached (if given): 1 from memory or disk, 0 computed */
+int scan_norm_stats_cached(z3 *(*open)(void *ctx, int level), void *ctx, int L, float *center, float *scale, int nthreads, int *cached);

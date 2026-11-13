@@ -232,6 +232,7 @@ struct sampler {
     int prof;
     double *cum;   /* cumulative source weights */
     struct { uint32_t *idx; size_t n; int lev; int64_t shape[3]; } *occ;   /* per source: coarse label cells containing papyrus (guides the position draw) */
+    pthread_t sn_th[16]; int sn_nth; void *sn_q;   /* --scan-norm: the statistics' prefetch threads (sn_pre) */
 };
 
 static int PZ(const sample_cfg *c) { return c->Pz > 0 ? c->Pz : c->P; }   /* window depth (z) */
@@ -2460,16 +2461,31 @@ static pthread_mutex_t g_sn_mu = PTHREAD_MUTEX_INITIALIZER;
 static z3 *sn_open(void *ctx, int level) { return source_ct((source *)ctx, level); }
 static int scan_norm_of(source *s, int l, float *c, float *sc) {
     if (l < 0 || l >= MAXLEV) return -1;
-    pthread_mutex_lock(&g_sn_mu);
-    if (!s->sn_st[l]) {
-        const int rc = scan_norm_stats(sn_open, s, l, &s->sn_c[l], &s->sn_s[l], 4);
-        s->sn_st[l] = rc ? -1 : 1;
-        if (rc) fprintf(stderr, "sampler: %s: --scan-norm: no statistics at level %d (scan_norm_stats %d: %s): the window z-score\n", s->name, l, rc, rc == -3 ? "no coarse level" : rc == -2 ? "no level" : rc == -4 || rc == -6 ? "a read failure" : "too little material");
-        else fprintf(stderr, "sampler: %s: --scan-norm: level %d center %.1f scale %.2f\n", s->name, l, s->sn_c[l], s->sn_s[l]);
+    pthread_mutex_lock(&g_sn_mu); int st = s->sn_st[l]; pthread_mutex_unlock(&g_sn_mu);
+    if (!st) {   /* (outside the lock: one (scan, level) computed once per process and kept on disk, scannorm.h scan_norm_stats_cached;
+                    other scans' statistics go on in parallel. Before: one global lock around the computation, 11+ min of scratch2's start) */
+        float cc = 0, ss = 0; int hit = 0; struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
+        const int rc = scan_norm_stats_cached(sn_open, s, l, &cc, &ss, 4, &hit);
+        pthread_mutex_lock(&g_sn_mu);
+        if (!s->sn_st[l]) {
+            s->sn_st[l] = rc ? -1 : 1; s->sn_c[l] = cc; s->sn_s[l] = ss;
+            if (rc) fprintf(stderr, "sampler: %s: --scan-norm: no statistics at level %d (scan_norm_stats %d: %s): the window z-score\n", s->name, l, rc, rc == -3 ? "no coarse level" : rc == -2 ? "no level" : rc == -4 || rc == -6 ? "a read failure" : "too little material");
+            else fprintf(stderr, "sampler: %s: --scan-norm: level %d center %.1f scale %.2f (%s, %.1f s)\n", s->name, l, s->sn_c[l], s->sn_s[l], hit ? "cached" : "computed", (clock_gettime(CLOCK_MONOTONIC, &t1), (double)(t1.tv_sec - t0.tv_sec) + 1e-9 * (double)(t1.tv_nsec - t0.tv_nsec)));
+        }
+        pthread_mutex_unlock(&g_sn_mu);
     }
+    pthread_mutex_lock(&g_sn_mu);
     const int ok = s->sn_st[l] > 0; if (ok) { *c = s->sn_c[l]; *sc = s->sn_s[l]; }
     pthread_mutex_unlock(&g_sn_mu);
     return ok ? 0 : -1;
+}
+/* --scan-norm: every eligible (source, level)'s statistics at sampler_start, UFSM_SCANNORM_THREADS (8) at a time, in the background:
+   the workers' first draws wait only for their own scan's entry */
+typedef struct { sampler *sp; int (*jobs)[2]; int nj; _Atomic int next; } sn_pre;
+static void *sn_pre_thread(void *a) {
+    sn_pre *q = a; float c, s;
+    for (int k; (k = atomic_fetch_add(&q->next, 1)) < q->nj;) scan_norm_of(&q->sp->S->src[q->jobs[k][0]], q->jobs[k][1], &c, &s);
+    return nullptr;
 }
 static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp, uint8_t *big, uint64_t tile_index, float *noise_state, chain_st *cs) {
     const int rc = draw_(sp, b, i, r, xtmp, ttmp, big, tile_index, noise_state, cs);
@@ -3963,6 +3979,18 @@ sampler *sampler_start(sources *S, const sample_cfg *cfg) {
     sp->slot_j = calloc((size_t)sp->nslots, sizeof *sp->slot_j);
     sp->slots = calloc((size_t)sp->nslots, sizeof *sp->slots);
     sp->state = calloc((size_t)sp->nslots, sizeof *sp->state);
+    if (sp->cfg.scan_norm && !(getenv("UFSM_SCANNORM_PREFETCH") && !atoi(getenv("UFSM_SCANNORM_PREFETCH")))) {   /* (sn_pre_thread) */
+        sn_pre *q = calloc(1, sizeof *q); q->sp = sp; q->jobs = malloc((size_t)S->n * MAXLEV * sizeof *q->jobs);
+        for (int i = 0; q->jobs && i < S->n; i++) {
+            if (!(sp->cum[i] > (i ? sp->cum[i - 1] : 0))) continue;
+            source *s = &S->src[i]; int region_ch = -1; for (int c = 0; c < NCH; c++) if (s->reg[c] && s->reg[c]->n) region_ch = c;
+            for (int l = s->min_level < 0 ? 0 : s->min_level; l < MAXLEV; l++) if (level_on(sp, s, i, l, region_ch) && level_ok(sp, s, i, l, region_ch)) { q->jobs[q->nj][0] = i; q->jobs[q->nj][1] = l; q->nj++; }
+        }
+        const char *e = getenv("UFSM_SCANNORM_THREADS"); int nt = e && atoi(e) > 0 ? atoi(e) : 8; if (nt > 16) nt = 16; if (nt > q->nj) nt = q->nj;
+        sp->sn_q = q;
+        for (int t = 0; t < nt; t++) if (!pthread_create(&sp->sn_th[sp->sn_nth], nullptr, sn_pre_thread, q)) sp->sn_nth++;
+        if (q->nj) fprintf(stderr, "sampler: --scan-norm: %d (source, level) statistics on %d threads (each scan level once, cached in ~/.cache/ufsm/scannorm)\n", q->nj, sp->sn_nth);
+    }
     for (int i = 0; i < sp->nslots; i++) sp->slots[i] = alloc_batch(&sp->cfg);
     pthread_mutex_init(&sp->mu, nullptr);
     pthread_cond_init(&sp->cv_free, nullptr);
@@ -4155,6 +4183,8 @@ void sampler_stop(sampler *sp) {
     for (int i = 0; i < sp->cfg.nworkers; i++) pthread_join(sp->th[i], nullptr);
     if (sp->rth_on) pthread_join(sp->rth, nullptr);
     for (int i = 0; i < sp->nslots; i++) free_batch(&sp->slots[i], sp->cfg.B);
+    for (int t = 0; t < sp->sn_nth; t++) pthread_join(sp->sn_th[t], nullptr);
+    if (sp->sn_q) { free(((sn_pre *)sp->sn_q)->jobs); free(sp->sn_q); }
     free(sp->rleft); free(sp->rq); free(sp->rdue); free(sp->rseq);
     for (int i = 0; i < sp->S->n; i++) free(sp->occ[i].idx);
     free(sp->occ); free(sp->slot_j); free(sp->slots); free(sp->state); free(sp->th); free(sp->cum); free(sp->lvl_ok);
