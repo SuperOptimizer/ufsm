@@ -177,11 +177,12 @@ int main(int argc, char **argv) {
     source *s = &S->src[1]; s->name = strdup("other teacher"); s->s = store_open(argv[1]); s->ct_key = strdup("ct"); s->um = 1; s->weight = 0;
     s->hold_o[0] = 64; s->hold_n[0] = 64; s->hold_n[1] = s->hold_n[2] = 128;
     for (int l = 0; l < MAXLEV; l++) { s->ct_present[l] = -1; for (int ch = 0; ch < NCH; ch++) s->tgt_present[ch][l] = -1; }
-    c = config(); sp = sampler_start(S, &c); check("union of same-CT holdouts blocks training", !sp); sampler_stop(sp);
+    c = config(); c.holdout_reject = 1; sp = sampler_start(S, &c); check("union of same-CT holdouts blocks training", !sp); sampler_stop(sp);
     {   /* one source, a "holdout" list / a holdout_file: all boxes leave training, the first is the validation box */
         sources *L = fixture(argv[1], ",\"holdout\":[[0,0,0,64,128,128],[64,0,0,64,128,128]]");
         check("holdout list parsed", L->src[0].nhold == 2 && L->src[0].hold_o[0] == 0 && L->src[0].hold_n[0] == 64);
-        sample_cfg lc = config(); sampler *lp = sampler_start(L, &lc); check("holdout list blocks training", !lp); sampler_stop(lp); sources_free(L);
+        /* reject mode: in mask mode (the default) a source covered by holdout boxes stays eligible (holdfit f1424a2: only reject boxes forbid) */
+        sample_cfg lc = config(); lc.holdout_reject = 1; sampler *lp = sampler_start(L, &lc); check("holdout list blocks training", !lp); sampler_stop(lp); sources_free(L);
         char hp[1400]; snprintf(hp, sizeof hp, "%s/holdouts.json", argv[1]); FILE *hf = fopen(hp, "w"); assert(hf);
         fprintf(hf, "{\"boxes\":[{\"ct\":\"scan/ct\",\"l0\":[64,0,0,64,128,128]},{\"ct\":\"other/zz\",\"l0\":[0,0,0,64,128,128]}]}\n"); assert(!fclose(hf));
         char extra[1600]; snprintf(extra, sizeof extra, ",\"holdout\":[0,0,0,64,128,128],\"holdout_file\":\"%s\"", hp);
