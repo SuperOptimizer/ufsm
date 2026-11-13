@@ -578,9 +578,29 @@ void nn_muon_batch(const void *descs, int nconv, int maxco, int maxk, float lr, 
    with nsd the matching Newton-Schulz table of nconv nf entries, conv-major {.., X = EX + f 2mn, Y = EY + f 2mn, A, B (2 m^2
    floats each), Co = m, K = n}, k the kernel size of every entry (3 or 1), ns_maxm / ns_maxn the largest m / n. hb: nullptr or
    nconv device flags (1: the Hyperball step with radius R[i], eta = hb_lr, no decay); r_init: first set R[i] = |W_i|_F where
-   R[i] <= 0. part: >= 32 nconv (2 + nf) doubles of scratch. */
+   R[i] <= 0. part: >= 32 nconv (2 + nf) doubles of scratch. ns_mode: the Newton-Schulz maps (0 Keller Jordan's fixed, 1 Polar Express,
+   train --muon-ns polar). nm_rows: nullptr or NorMuon's row state (train --normuon 1): 2 nm_tot floats (the row EMA, then scratch),
+   conv c's rows at nm_off[c] (device ints, nconv entries), beta2 nm_b2. vr_prev: nullptr or a device array of nconv float pointers
+   (each matrix's previous gradient, Co K floats) for MARS variance reduction with gamma vr_g (train --muon-vr G; 0 = off). */
 void nn_muon_ext_batch(const void *descs, int nconv, int maxco, int maxk, const void *mcd, const void *nsd, int k, int ns_maxm, int ns_maxn,
-                       const int *hb, float *R, int r_init, double *part, float lr, float beta, float wd, float hb_lr);
+                       const int *hb, float *R, int r_init, double *part, float lr, float beta, float wd, float hb_lr,
+                       int ns_mode, float *nm_rows, const int *nm_off, int nm_tot, float nm_b2, float *const *vr_prev, float vr_g);
+/* Kronecker-factored conv preconditioner (train --muon-kron, src/nn_kron.cu): n 3^3 convs, g[i] their device gradients [Co][Ci][27];
+   nn_kron_step preconditions them in place (G x1 P1 x2 P2 x3 P3, Pk = (Lk + eps |Lk| I)^(-1/6), Lk the EMA b2 of the mode Grams),
+   refreshing the roots of conv i when i % every == step % every (all at the first step). */
+struct nn_kron;
+void nn_muon_scale_mode(int m);   /* 0: sqrt(max(1, Co / K)); 1: spectral sqrt(Co / K) (train --muon-scale spectral) */
+void nn_signm(float *p, const float *g, float *m, size_t n, float lr, float b, float wd);   /* sign-momentum (Scion ell-inf) step */
+void nn_muon_tc(int on);   /* Muon / Muon-ext Newton-Schulz products on fp16 tensor cores (fp32 accumulation; train --muon-tc 1) */
+void nn_muon_ext_opts(int cautious);
+void nn_muon_ext_mix(float *const *m2, float b3, float alpha);   /* AdEMAMix slow EMA (device array of per-matrix buffers; nullptr = off) */   /* nn_muon_ext_batch extras (process-wide): cautious masking (train --muon-cautious 1) */
+struct nn_kron *nn_kron_create(int n, float *const *g, const int *Co, const int *Ci);
+size_t nn_kron_bytes(const struct nn_kron *k);
+void nn_kron_free(struct nn_kron *k);
+void nn_kron_step(struct nn_kron *k, float b2, float eps, int every);
+void nn_kron_inv_root(const float *L, float *P, int n, float eps, float *work);   /* (test hooks) work >= 6 n^2 + 1 floats */
+void nn_kron_grams(const float *G, int Co, int Ci, float *L1, float *L2, float *L3);
+void nn_kron_precond(float *G, int Co, int Ci, const float *P1, const float *P2, const float *P3, float *S);
 /* ANVIL II over nconv weights: descs {float *p; const float *g; float *v0, *X, *Y, *A, *B, *v1, *E, *R; int Co, K;} (E, R: Co floats) */
 void nn_anvil_batch(const void *descs, int nconv, int maxco, int maxk, float lr, float beta_fast, float beta_slow, float w_fast, float mu, float beta2, float wd);
 void nn_ema(float *ema, const float *p, size_t n, float decay);

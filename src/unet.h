@@ -7,7 +7,7 @@
 #include <stdint.h>
 
 #define UNET_MAXLEV 8
-#define UNET_MAXCONV 160   /* 3^3 convs (encoder, down, decoder, residual blocks) + the attention stage's linear layers */
+#define UNET_MAXCONV 384   /* 3^3 convs (encoder, down, decoder, residual blocks) + the attention stage's linear layers */
 #define UNET_MAXTB 16      /* cfg.attn_blocks */
 #define UNET_MAXTA 64      /* cfg.attn_blocks x cfg.attn_repeat (block applications) */
 /* unet_set_attn_axis records: per sample UNET_AXR(np) floats: ad (the window dim of the scroll axis: 0 z, 1 y, 2 x), valid (0: no axis),
@@ -162,6 +162,18 @@ void unet_muon(unet *u, float lr_muon, float beta, float lr_adam, float b1, floa
 /* Muon variants for unet_muon: muonc = Muon-C (per-frequency polarisation of the conv kernels), hyperball = fixed weight and
    update norms (eta = hb_mult x the Muon lr, replaces the decay); both 0 = Muon. The radii go into checkpoints (hb_R). */
 void unet_set_muon_ext(unet *u, int muonc, int hyperball, float hb_mult);
+/* --muon-ns polar (ns_mode 1: Polar Express Newton-Schulz maps) and --normuon 1 (per-row second-moment normalisation, EMA b2); 0 = Muon */
+void unet_set_muon_variant(unet *u, int ns_mode, int normuon, float b2);
+/* --muon-vr G: MARS variance-reduced momentum input g + G beta / (1 - beta) (g - g_prev), clipped to unit norm per matrix (0 = Muon) */
+void unet_set_muon_vr(unet *u, float gamma);
+void unet_set_muon_cautious(unet *u, int on);
+void unet_set_muon_qkv_split(unet *u, int on);
+void unet_set_rest_sign(unet *u, int on, float mult);   /* --opt-rest sign: biases / norms / head on sign momentum (Scion ell-inf) instead of AdamW */   /* --muon-qkv-split 1: the attention q / k / v projections orthogonalised per head (before the first step) */
+/* --muon-ademamix A: AdEMAMix slow EMA (b3) added to Muon's Nesterov momentum, alpha ramped 0 -> A over T optimizer steps */
+void unet_set_muon_ademamix(unet *u, float alpha, float b3, int T);   /* --muon-cautious 1: sign-agreement mask on Muon's direction, norm kept */
+/* --muon-kron 1: Kronecker-factored (Co, Ci, 27 taps) Shampoo preconditioning of the 3^3 conv gradients before Muon (src/nn_kron.cu):
+   factor EMA b2, damping eps x |L|_F, roots refreshed round robin every `every` steps (factors not checkpointed: a resume rebuilds them) */
+void unet_set_muon_kron(unet *u, int on, float b2, float eps, int every);
 /* learning-rate multiplier of every parameter outside the attention stage (the conv trunk: Muon matrices and AdamW parameters alike;
    default 1); the attention stage keeps the scheduled rates. unet_muon / unet_adamw */
 void unet_set_trunk_lr(unet *u, float mult);

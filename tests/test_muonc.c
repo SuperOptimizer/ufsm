@@ -62,7 +62,7 @@ static void batch_free(batch *b) {
 }
 static void run(batch *b, int mc, const int *hb, int r_init, float lr, float beta, float wd, float hb_lr) {
     if (hb) nn_h2d(b->hbf, hb, 4 * b->n);
-    nn_muon_ext_batch(b->dd, b->n, b->maxco, b->maxk, mc ? b->dmc : nullptr, b->dns, b->k, b->nsm, b->nsn, hb ? b->hbf : nullptr, b->R, r_init, b->part, lr, beta, wd, hb_lr);
+    nn_muon_ext_batch(b->dd, b->n, b->maxco, b->maxk, mc ? b->dmc : nullptr, b->dns, b->k, b->nsm, b->nsn, hb ? b->hbf : nullptr, b->R, r_init, b->part, lr, beta, wd, hb_lr, 0, nullptr, nullptr, 0, 0.f, nullptr, 0.f);
 }
 
 /* ---- double-precision reference ---- */
