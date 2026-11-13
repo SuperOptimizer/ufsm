@@ -243,6 +243,20 @@ void bwd_data_impl_(const float *gy, shape5 ys, const float *w, shape5 xs, int k
 extern "C" void nn_conv3d_bwd_data(const float *gy, shape5 ys, const float *w, shape5 xs, int k, int stride, float *gx, float *scratch) { bwd_data_impl(gy, ys, w, xs, k, stride, gx, scratch, 0); }
 extern "C" int nn_conv3d_bwd_data_acc(const float *gy, shape5 ys, const float *w, shape5 xs, int k, int stride, float *gx, float *scratch) {
     if (!(g_tf32 && k == 3 && (stride == 1 || (stride == 2 && !(xs.d & 1) && !(xs.h & 1) && !(xs.w & 1))))) return -1;
+    {   /* UFSM_ALIAS_CHECK=1: gy and the accumulated gx must not share memory (gx's old content and gy cannot both be live). The P 1024 split-top 3
+           planner put down3's gy 626688 B below gx (perf2 2026-11-13): the dilated path then added gy's bytes as old gx, the weight-streaming
+           s2b read its own output (the level-3 NaN). Sizes as stored (MX-fp4 / fp8 when registered, else 2 bytes an element: a lower bound) */
+        static int ac = -1; if (ac < 0) ac = getenv("UFSM_ALIAS_CHECK") && atoi(getenv("UFSM_ALIAS_CHECK")) > 0;
+        if (ac) {
+            auto nb = [](const void *p, shape5 s) { const int d = mxdt_of(p); return d == 4 ? nn_mx4_bytes(s) : d == 3 ? nn_mx8_bytes(s) : shape_numel(s) * 2; };
+            const uintptr_t a = (uintptr_t)gy, b = (uintptr_t)gx; const size_t na = nb(gy, ys), nbx = nb(gx, xs);
+            if (a < b + nbx && b < a + na) {
+                fprintf(stderr, "nn_conv3d_bwd_data_acc: gy [%p, +%zu) and the accumulated gx [%p, +%zu) overlap (layer %d, %d -> %d channels, gy %dx%dx%d)\n",
+                        (const void *)gy, na, (const void *)gx, nbx, nn_get_layer(), ys.c, xs.c, ys.d, ys.h, ys.w);
+                abort();
+            }
+        }
+    }
     bwd_data_impl(gy, ys, w, xs, k, stride, gx, scratch, 1);
     return 0;
 }

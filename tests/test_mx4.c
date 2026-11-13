@@ -496,6 +496,28 @@ int main(void) {
                 char nm[96]; snprintf(nm, sizeof nm, "s2 bwd_data %d ch fp4 kernel taken", CW); if (!wenv) check(nm, ew[1] != ew[0]);
                 nn_free(ww); nn_free(gyw); nn_free(oldw); nn_free(grw); nn_free(scrw); nn_free(gywm); nn_free(oldwm); nn_free(gywd); nn_free(oldwd);
             }
+            {   /* gy and the accumulated gx sharing memory, the trainer's layout (P 1024 split-top 3, down3, 448 channels: gx 626688 B into gy's
+                   974848; perf2 2026-11-13): the weight-streaming kernel read the gy tiles its own writes had overwritten (garbage from the 4th z
+                   tile, the scratch2 level-3 NaN). s2b_f4 copies an overlapping gy first: the kernel == the dilated path on the same starting bytes */
+                const int CW = 448; const shape5 yo = {1, CW, 16, 16, 16}, xo = {1, CW, 32, 32, 32};
+                const size_t nby = nn_mx4_bytes(yo), nbx = nn_mx4_bytes(xo), off = 626688, tot = off + nbx;
+                float *wo = dev_rand((size_t)CW * CW * 27, 0.07f * sqrtf(64.f / CW)), *gyo = dev_rand(shape_numel(yo), 1e-2f), *oldo = dev_rand(shape_numel(xo), 1e-2f);
+                float *scro = nn_malloc(nn_conv3d_scratch(xo, CW, 3) * 2 + shape_numel(xo) * 4);
+                void *ym = mx4_from(gyo, yo), *xm = mx4_from(oldo, xo);
+                uint8_t *init = malloc(tot);   /* the shared buffer's starting bytes: gx's old content, then gy written over its head (as in the trainer) */
+                nn_d2h(init + off, xm, nbx); nn_d2h(init, ym, nby);
+                float *res[2];
+                for (int f4 = 0; f4 < 2; f4++) {
+                    uint8_t *buf = nn_malloc(tot); nn_h2d(buf, init, tot);
+                    nn_set_storage(buf, off, 4); nn_set_storage(buf + off, nbx, 4);
+                    lp_set_s2b_f4(f4 ? 3 : 0); lp_set_s2b_wide(f4);
+                    mode_mx(); nn_conv3d_bwd_data_acc((const float *)buf, yo, wo, xo, 3, 2, (float *)(buf + off), scro);
+                    res[f4] = deq4(buf + off, xo); nn_storage_forget(buf); nn_storage_forget(buf + off); nn_free(buf);
+                }
+                lp_set_s2b_f4(-1); lp_set_s2b_wide(-1);
+                cmp("s2b 448 ch, gy overlapping gx: streaming vs dilated", res[1], res[0], shape_numel(xo), 0.4);
+                free(init); nn_free(res[0]); nn_free(res[1]); nn_free(wo); nn_free(gyo); nn_free(oldo); nn_free(scro); nn_free(ym); nn_free(xm);
+            }
             nn_free(gyb); nn_free(old); nn_free(gxr); nn_free(scr); nn_free(gym); nn_free(oldm); nn_free(gyd); nn_free(oldd);
             nn_free(xx); nn_free(tb); nn_free(yrb); nn_free(xxm); nn_free(xxd);
         }
