@@ -4153,6 +4153,12 @@ int cmd_train(int argc, char **argv) {
     double acc_inkn = 0, vik[2] = {0}, acc_mil = 0, acc_miln = 0, acc_milr = 0;   /* --ink-mil: raw mean BCE sum / windows with rays / rays */   /* --ink-head: training windows with known ink in the log interval; validation ink bce sum / windows */
     train_unread_flags(argc, argv);
     for (int step = step0 + 1; step <= steps && !g_stop; step++) {
+        {   /* UFSM_CUPROF=A,B: cudaProfilerStart before step A, Stop after step B (nsys --capture-range=cudaProfilerApi: a steady-state window of a P 1024 run) */
+            static int pa = -2, pb; if (pa == -2) { const char *e = getenv("UFSM_CUPROF"); pa = -1; if (e && sscanf(e, "%d,%d", &pa, &pb) != 2) pa = -1; }
+            extern int cudaProfilerStart(void), cudaProfilerStop(void), cudaDeviceSynchronize(void);
+            if (pa > 0 && step == pa) { cudaDeviceSynchronize(); cudaProfilerStart(); fprintf(stderr, "UFSM_CUPROF: capture from step %d\n", step); }
+            if (pa > 0 && step == pb + 1) { cudaDeviceSynchronize(); cudaProfilerStop(); fprintf(stderr, "UFSM_CUPROF: capture stopped before step %d\n", step); }
+        }
         if (trunk_lr != 1.f && trunk_lr_steps > 0 && step == (step0 + 1 > trunk_lr_steps + 1 ? step0 + 1 : trunk_lr_steps + 1)) {   /* --trunk-lr-steps: the trunk back to the full rates */
             for (int g = 0; g < ng; g++) unet_set_trunk_lr(G[g].u, 1.f);
             fprintf(stderr, "step %d: trunk learning rate x1 (--trunk-lr-steps %d)\n", step, trunk_lr_steps);
