@@ -11,7 +11,8 @@
 #           checkpoint header has "lat_c"; FKIND=lat / vox forces it): fields/lat from cube windows LWIN / LHALO (640 / 64, the gate's U1
 #           settings: stride 512, so the 1024-voxel z parts keep one tile grid), the latent heads' fit planes (winding mod 4 too); --fit-h 2 runs
 #           the slab plane path (the fused nn_fit_accum_lat kernel takes --fit-h 8 only)
-#   ink     -> prep only; GPU INKGPU (1) from when the fields are done: INKCMD (the ink agent's recipe; default: the feathered
+#   ink     -> prep only; GPU INKGPU (1): INKAT=slabs (default) its GroupNorm calibration (inkcal) beside the ref, the main pass from
+#           the end of the slabs (beside join .. stripflat, all CPU); INKAT=fields: all of it from when the fields are done: INKCMD (the ink agent's recipe; default: the feathered
 #           single pass of inklib.sh: ift3, frozen GN, --window auto --halo 32 --feather 32, resumable) -> ink/$INKNAME.zarr
 #   ctcal   -> fields (CTCAL=1 only, OFF by default): ufsm ct-cal --ct-um $LUM (the CT LEVEL's um) -> ct.cal; ref adds --ct-cal
 #   rectosp -> fields (default ON when the scroll has m7 surface predictions on the mirror; RECTOSP=0 off): ufsm recto-sp $F
@@ -161,9 +162,45 @@ fpred() {   # fpred GPU BOX OUT
     --grid-origin 0,0,0 --ema 1 --q 8 --threads ${PTH:-14} --gpu $1 --axis $O/axis.json --levels 1 --fit-zarr $3 --fit-h 2 --fit-q 8 --fit-q-phase 4 --no-out 1 $(occlv) &&
     { [ "$DRY" = 1 ] || { rm -rf $3.tmp; [ -e $3/fields.json ]; }; }
 }
+# --- the ref's pass 1 streamed behind the fields predict (REFSTREAM; 6a, 11-12) ---
+# Each z part's predict appends "z0 z1" (part cells) to <part>/rows.done per flushed field slab. refstream links the finished shard rows
+# of every part into one view (OUT: zarr.json shapes and fields.json of the whole box, the parts' c/<z> rows linked at their box offsets,
+# the box rows in OUT/rows.ready) and runs count-field --pool-only --follow on it: the chunks in the parts' order, each once its rows are
+# written. The pooled sums equal a whole-box pass 1 (per chunk, disjoint solve rows; the prior from the middle row's chunk; the chunk
+# rows fixed by refcz in both runs), so the ref (--pool-cache) is byte-identical to the stage-barrier ref with those chunk rows.
+refstream_on() { [ "${REFSTREAM:-1}" = 1 ] && [ "$FKIND" = lat ] && [ "${RECTOSP:-1}" = 0 ] && [ "${CTCAL:-0}" != 1 ] && [ -z "${REFCMD:-}" ] && [ "$DRY" != 1 ]; }
+refstream() {   # refstream OUT PART..
+  local S=$1; shift; local parts=("$@") k p pl z a b n=0 starts=() fs cz cfp=
+  rm -rf $S $S.fin $O/ref.pool $O/ref.pool.ok; mkdir -p $S
+  for p in "${parts[@]}"; do while [ ! -s $p/fields.partial.json ] || [ ! -e $p/pc/zarr.json ]; do [ -e $S.fin ] && return 1; sleep 2; done; done
+  for p in "${parts[@]}"; do starts+=($n); n=$(( n + $(jq -r '.shape[0]' $p/fields.partial.json) )); done
+  fs=$(jq -r '.chunk_grid.configuration.chunk_shape[0]' ${parts[0]}/pc/zarr.json)
+  for k in $(seq 1 $((${#parts[@]} - 1))); do [ $(( ${starts[$k]} % fs )) = 0 ] || { log "refstream: part $k starts at cell ${starts[$k]}, not a multiple of the shard $fs"; return 1; }; done
+  for pl in $(ls ${parts[0]}); do [ -e ${parts[0]}/$pl/zarr.json ] || continue; mkdir -p $S/$pl/c; jq -c --argjson n $n '.shape[0] = $n' ${parts[0]}/$pl/zarr.json > $S/$pl/zarr.json; done
+  # fields.json: the first part's, shape and axis over all parts (fields_cat.sh's rule: part k's rows 0 .. Zk h - 1, the last part's all)
+  local h=$(jq -r .h ${parts[0]}/fields.partial.json) j=$(jq -c . ${parts[0]}/fields.partial.json)
+  for k in $(seq 1 $((${#parts[@]} - 1))); do j=$(echo "$j" | jq -c --argjson k $(( ${starts[$k]} * h )) --slurpfile b ${parts[$k]}/fields.partial.json '.axis = (.axis[0:$k] + $b[0].axis)'); done
+  echo "$j" | jq -c --argjson n $n '.shape[0] = $n' > $S/fields.json; : > $S/rows.ready
+  cz=$(refcz $S/fields.json)
+  ( nice -n 10 $U count-field $S $O/cf.unused $(refpool) --pool-cache $O/ref.pool --pool-only 1 --model $O/ref.pool.unused --chunk-rows $cz --follow $S/rows.ready \
+      --follow-split ${starts[1]:-0} --threads ${REFSTH:-6} --read-threads ${REFSTH:-6} --mem-gb ${CFMEM:-24} >> $O/logs/refstream.log 2>&1 && echo $cz > $O/ref.pool.ok ) & cfp=$!
+  local seen=() fin=0; for k in "${!parts[@]}"; do seen+=(0); done
+  while :; do
+    [ -e $S.fin ] && fin=1
+    for k in "${!parts[@]}"; do p=${parts[$k]}; local L; L=$(wc -l < $p/rows.done 2> /dev/null || echo 0)
+      while [ ${seen[$k]} -lt $L ]; do seen[$k]=$(( ${seen[$k]} + 1 )); read -r a b < <(sed -n "${seen[$k]}p" $p/rows.done)
+        for z in $(seq $((a / fs)) $(( (b - 1) / fs ))); do for pl in $(ls $S); do [ -d $p/$pl/c/$z ] && ln -sfn $p/$pl/c/$z $S/$pl/c/$(( z + ${starts[$k]} / fs )); done; done
+        echo "$(( a + ${starts[$k]} )) $(( b + ${starts[$k]} ))" >> $S/rows.ready; done; done
+    [ $fin = 1 ] && break; sleep 5
+  done
+  # (the predicts are done: every row is linked; the follower finishes its last chunks, or fails: no ref.pool.ok, the ref pools itself)
+  if ! wait $cfp; then rm -f $O/ref.pool $O/ref.pool.ok; return 1; fi
+  log "refstream: pass 1 pooled behind the predicts (chunk rows $cz): $(grep -E 'pass 1' $O/logs/refstream.log | tail -n 1)"
+}
 fields() {
   local box; box=$([ "$DRY" = 1 ] && echo ${BOX:-BOX} || cat $O/box.txt); local g=($FIELDGPUS) n=${#g[@]}
-  [ "$DRY" = 1 ] || { rm -rf $F; mkdir -p $O/fields; }
+  [ "$DRY" = 1 ] || { rm -rf $F; mkdir -p $O/fields; rm -f $O/ref.pool $O/ref.pool.ok; }
+  [ "$DRY" = 1 ] && [ "${REFSTREAM:-1}" = 1 ] && [ "$FKIND" = lat ] && [ "${RECTOSP:-1}" = 0 ] && echo "    (REFSTREAM: the ref's pass 1 behind the predicts: count-field --pool-only --follow on the parts' finished rows -> ref.pool)"
   local z0 dz y0 x0 dy dx k a b pids=() parts=(); IFS=, read -r z0 y0 x0 dz dy dx <<< "$box"
   [ $(( (dz / n) / 1024 )) -lt 1 ] && n=1   # (parts of >= 1024 voxels each)
   if [ $n = 1 ]; then fpred ${g[0]} $box $F; return; fi
@@ -173,7 +210,11 @@ fields() {
     parts+=($F.p$k); [ "$DRY" = 1 ] || rm -rf $F.p$k $F.p$k.tmp
     fpred ${g[$k]} $a,$y0,$x0,$((b - a)),$dy,$dx $F.p$k & pids+=($!)
   done
-  local rc=0; for p in "${pids[@]}"; do wait $p || rc=1; done; [ $rc = 0 ] || return 1
+  # REFSTREAM (default 1 for latent fields without rectosp / ctcal / REFCMD): the ref's pass 1 (pooling) runs behind the predicts
+  local sp=; if refstream_on; then refstream $F.stream "${parts[@]}" & sp=$!; fi
+  local rc=0; for p in "${pids[@]}"; do wait $p || rc=1; done
+  [ -n "$sp" ] && { touch $F.stream.fin; wait $sp || log "fields: the streamed ref pass 1 failed (the ref runs it itself)"; rm -rf $F.stream $F.stream.fin; }
+  [ $rc = 0 ] || return 1
   local acc=${parts[0]} j; for j in $(seq 1 $((n - 1))); do
     if [ "$DRY" = 1 ]; then echo "    fields_cat.sh $F.c$j $acc ${parts[$j]}"; acc=$F.c$j; continue; fi
     bash $H/fields_cat.sh $F.c$j $acc ${parts[$j]} >> $O/logs/fields.log 2>&1 || return 1; acc=$F.c$j; done
@@ -197,12 +238,19 @@ ctcal() {
 # 0.5 mm pairs all 6 up (mean .679 -> .695), 4 mm pairs mean .286 -> .293, GT
 # intervals off .099 -> .083; 1667 all 5 slabs up (ids +.06..+.13, 4 mm pairs +.06..+.08); 0139 flat; 0846A wraps / CT peaks per turn same.
 # REFPH="--phase-w 4" = the old ref.
+# refpool: the ref's pass-1 (pooling) flags; refcz FIELDSJSON: the chunk rows count-field picks from --mem-gb CFMEM when memory is not
+# short (12 B per cell of a cross-section, a multiple of the pool 8, then of 128): the streamed pass 1 and the solve run pass it explicitly
+refpool() { echo "--R 0 --pool 8 ${REFPH---phase-w 0.5 --wide 100,140 --wide-phase 15} --model-only 1 --model-stride ${MSTRIDE:-4} ${REFX:-}"; }
+refcz() { jq -r --argjson m ${CFMEM:-24} '(.shape[1] * .shape[2]) as $hw | (($m * 1e9 / (12 * $hw)) | floor) as $c | (($c / 8 | floor) * 8) as $c8 |
+                                         (if $c8 >= 128 then ($c8 / 128 | floor) * 128 else $c8 end) as $cz | if $cz < 8 then 8 else $cz end' $1; }
 ref() {
   [ "$DRY" = 1 ] || rm -rf $REF
   local cal=; [ "${CTCAL:-0}" = 1 ] && cal="--ct-cal $O/ct.cal"
+  # the pass-1 sums streamed behind the fields predict (fields(): REFSTREAM): the same sums, so only the solve and model pass run here
+  local pc=; [ "$DRY" != 1 ] && [ -e $O/ref.pool.ok ] && pc="--pool-cache $O/ref.pool --chunk-rows $(cat $O/ref.pool.ok)"
   if [ -n "${REFCMD:-}" ]; then X $O/logs/ref.log $REFCMD $F $REF $cal; else
-  X $O/logs/ref.log $U count-field $F $O/cf.unused --R 0 --pool 8 ${REFPH---phase-w 0.5 --wide 100,140 --wide-phase 15} --iters 1200 --model $REF --model-only 1 --model-stride ${MSTRIDE:-4} \
-    --threads $TH --mem-gb ${CFMEM:-24} $cal ${REFX:-}; fi && { [ "$DRY" = 1 ] || [ -e $REF/model.json ]; }
+  X $O/logs/ref.log $U count-field $F $O/cf.unused $(refpool) --iters 1200 --model $REF \
+    --threads $TH --mem-gb ${CFMEM:-24} $cal $pc; fi && { [ "$DRY" = 1 ] || [ -e $REF/model.json ]; }
 }
 
 # --- rectosp: m7 recto spacing into the count target (see the header); the source: RECTOSRC, else the mirror's
@@ -225,6 +273,18 @@ rectosp() {
 }
 
 # --- ink (another agent's recipe via INKCMD SCROLLDIR GPU OUT; default the feathered single pass of scripts/corpus/inklib.sh) ---
+# inkcal: the frozen GroupNorm statistics (gn.bin) from 640^3 windows of a 2048-row band at the box's middle; its own stage so it can
+# run on GPU INKGPU beside the ref (INKAT=slabs) while the main pass waits for the slabs. INKCMD: nothing (the recipe does its own).
+# INKCALZ: the band's rows (2048; P4: 505 windows, 148 s)
+inkcal() {
+  [ -n "${INKCMD:-}" ] && return 0
+  [ "$DRY" = 1 ] || mkdir -p $O/ink
+  local box cal; box=$([ "$DRY" = 1 ] && echo ${BOX:-BOX} || cat $O/box.txt)
+  cal=$(echo $box | awk -F, -v cz=${INKCALZ:-2048} '{ zc = $1 + int($4 / 2); z0 = zc - int(cz / 2); if (z0 < $1) z0 = $1; nz = cz; if (nz > $4) nz = $4; printf "%d,%d,%d,%d,%d,%d", z0, $2, $3, nz, $5, $6 }')
+  local P="--um $UM --level $LV --shard 512 --ema 1 --q 32 --threads ${ITH:-12} --gpu $INKGPU $(occlv)"
+  [ -s $O/ink/gn.bin ] || { X $O/logs/inkcal.log $U predict $INKCK $R $K $O/ink/gncal.zarr $P ${INKPX:-} --window 640 --halo 64 --box $cal --full-grid 1 --levels 1 --no-out 1 --gn-save $O/ink/gn.tmp &&
+                             { [ "$DRY" = 1 ] || { mv $O/ink/gn.tmp $O/ink/gn.bin; rm -rf $O/ink/gncal.zarr; }; } || return 1; }
+}
 ink() {
   [ "$DRY" = 1 ] || mkdir -p $O/ink
   # INKCMD set but empty (a pod env with an unset path, "INKCMD=$X"): fail loudly instead of falling back to the default prediction;
@@ -236,8 +296,7 @@ ink() {
   local box cal; box=$([ "$DRY" = 1 ] && echo ${BOX:-BOX} || cat $O/box.txt)
   cal=$(echo $box | awk -F, '{ zc = $1 + int($4 / 2); z0 = zc - 1024; if (z0 < $1) z0 = $1; nz = 2048; if (nz > $4) nz = $4; printf "%d,%d,%d,%d,%d,%d", z0, $2, $3, nz, $5, $6 }')
   local P="--um $UM --level $LV --shard 512 --ema 1 --q 32 --threads ${ITH:-12} --gpu $INKGPU $(occlv)"
-  [ -s $O/ink/gn.bin ] || { X $O/logs/ink.log $U predict $INKCK $R $K $O/ink/gncal.zarr $P ${INKPX:-} --window 640 --halo 64 --box $cal --full-grid 1 --levels 1 --no-out 1 --gn-save $O/ink/gn.tmp &&
-                             { [ "$DRY" = 1 ] || { mv $O/ink/gn.tmp $O/ink/gn.bin; rm -rf $O/ink/gncal.zarr; }; } || return 1; }
+  inkcal || return 1
   # one feathered pass (inklib.sh): window auto (576/32 on 16 GB, 1088/32 from ~46 GB free), each border blended over 32 voxels; resumable
   X $O/logs/ink.log $U predict $INKCK $R $K $INK $P ${INKPX:-} --box $box --window ${INKW:-auto} --halo ${INKH:-32} --feather ${INKF:-32} --full-grid 1 --resume 1 --levels 4 \
     --gn-frozen $O/ink/gn.bin || return 1
@@ -289,7 +348,8 @@ slabs() {
   lanes=$(fitlanes); [ "$DRY" = 1 ] && echo "    slab lanes (GPU per lane): $lanes"
   ng=$(echo $lanes | wc -w); FTH_LANE=${FTHREADS:-$(( $(ncpu) / (ng > 0 ? ng : 1) ))}; [ $FTH_LANE -lt 2 ] && FTH_LANE=2
   for g in $lanes; do
-    if [ "$g" = "$INKGPU" ] && [ "${NOINK:-0}" != 1 ] && ! done_ ink; then { [ "$DRY" = 1 ] && echo "    (GPU $g lane starts once the ink is done or failed)" || while ! done_ ink && ! stopped && [ ! -e $O/state/ink.failed ]; do sleep 30; done; lane $g; } &
+    if [ "$g" = "$INKGPU" ] && [ "${NOINK:-0}" != 1 ] && [ "$INKAT" = fields ] && ! done_ ink; then { [ "$DRY" = 1 ] && echo "    (GPU $g lane starts once the ink is done or failed)" || while ! done_ ink && ! stopped && [ ! -e $O/state/ink.failed ]; do sleep 30; done; lane $g; } &
+    elif [ "$g" = "$INKGPU" ] && [ "${NOINK:-0}" != 1 ] && [ "$INKAT" != fields ] && ! done_ inkcal; then { [ "$DRY" = 1 ] && echo "    (GPU $g lane starts once the ink calibration is done or failed)" || while ! done_ inkcal && ! stopped && [ ! -e $O/state/inkcal.failed ]; do sleep 10; done; lane $g; } &
     else lane $g & fi; pids+=($!)
   done
   for p in "${pids[@]}"; do wait $p; done
@@ -478,11 +538,17 @@ upload() {
 [ "$DRY" = 1 ] && echo "unroll $S: O=$O U=$U ($R $K level $LV, $LUM um; box ${BOX:--}, zr ${ZR:--}, strip args '${STRIPARGS}'; CK $CK: $FKIND fields $F)"
 stage prep prep || exit 1; upto prep
 stage fields fields || exit 1; upto fields
-# the ink (GPU $INKGPU) beside the CPU ref and the GPU-0 slab lane; the per-wrap renders beside the strip
-if [ "${NOINK:-0}" != 1 ]; then ( stage ink ink || touch $O/state/ink.failed ) & INKP=$!; [ "$DRY" = 1 ] && wait $INKP; fi
+# the ink on GPU $INKGPU. INKAT=slabs (default): its GroupNorm calibration beside the ref, the main pass from the end of the slabs, beside
+# the CPU stages join .. stripflat (P4 11-12: ink 892 s; with the fast ref its GPU-1 slab lane would wait for it); INKAT=fields: the
+# whole ink from the end of the fields, the GPU-1 slab lane waiting for it (before 11-12). The per-wrap renders beside the strip
+INKAT=${INKAT:-slabs}; inkbg() { ( stage ink ink || touch $O/state/ink.failed ) & INKP=$!; [ "$DRY" = 1 ] && wait $INKP; return 0; }
+if [ "${NOINK:-0}" != 1 ]; then
+  if [ "$INKAT" = fields ]; then inkbg; else ( stage inkcal inkcal || touch $O/state/inkcal.failed ) & [ "$DRY" = 1 ] && wait; fi
+fi
+inkmain() { [ "${NOINK:-0}" != 1 ] && [ "$INKAT" != fields ] && ! done_ ink && inkbg; return 0; }
 { [ "${RECTOSP:-1}" = 0 ] || stage rectosp rectosp; } || { log "unroll: rectosp failed"; wait; exit 1; }
 [ "${RECTOSP:-1}" != 0 ] && { [ -e $O/fields/rsp/fields.json ] || { [ "$DRY" = 1 ] && [ -n "$(m7src)" ]; }; } && F=$O/fields/rsp   # (the ref and every later stage read the blended fields)
-{ [ "${CTCAL:-0}" != 1 ] || stage ctcal ctcal; } && stage ref ref && upto ref && stage slabs slabs && upto slabs && stage join join && upto join && stage check check && upto check &&
+{ [ "${CTCAL:-0}" != 1 ] || stage ctcal ctcal; } && stage ref ref && upto ref && stage slabs slabs && inkmain && upto slabs && stage join join && upto join && stage check check && upto check &&
   stage wraps wraps && upto wraps && stage trim trim && stage snap snap && upto snap ||
   { log "unroll: stopped before the strip"; wait; exit 1; }
 if [ "${PERWRAP:-0}" = 1 ]; then ( waitfor ink && stage perwrap perwrap && { [ "${FACES:-0}" = 1 ] && stage faces faces; true; } ) & PWP=$!; [ "$DRY" = 1 ] && wait $PWP; fi

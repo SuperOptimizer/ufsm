@@ -282,6 +282,7 @@ static int usage(void) {
         "  ufsm field-blend <out> <fields1> <fields2> ... [--weights a,b,..] [--tile SZ,SY,SX --grids z,y,x:..] [--conf mean]  fit fields averaged (phase: confidence-weighted complex mean; --tile: overlapping predicts, centre-weighted)\n"
         "  ufsm wind-score <sweep-dir> <codes-root> <codes-key>             the fit --codes score of a predict --cond-sweep winding raster\n"
         "  ufsm store-bench <root> <array-key> [--box 128,256,512] [--n 8] [--par 1] [--threads 16]   HTTP zarr fetch benchmark\n"
+        "  ufsm z3-diff <root-a> <key-a> <root-b> <key-b> [--box ..]   two uint8 arrays: differing voxels, |a-b| histogram, flips across 128\n"
         "  ufsm phase-pack ROOT KEY OUT --row R [--level 19] [--threads 8] / phase-unpack IN DIR / phase-cmp RA KA RB KB --row R   6-bit phase-label transfer\n"
         "  ufsm papyrus-labels <ct-root> <ct-key> <out-group> --box z,y,x,nz,ny,nx   papyrus / void training labels of a CT box (gap labels, no cutoff)\n"
         "  ufsm side-face <phase-root> <phase-key> <ct-root> <ct-key> <out-group> <out-um> [--iso 64]   face-anchored phase: each wrap moved onto its sheet's recto face (train --rv labels)\n"
@@ -4877,6 +4878,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "latvol-check")) { int cmd_latvol_check(int, char **); return cmd_latvol_check(argc, argv); }
     if (!strcmp(cmd, "lc-encode")) { int cmd_lc_encode(int, char **); return cmd_lc_encode(argc, argv); }   /* latcomp v1 store of a CT volume (src/lc_cli.c) */
     if (!strcmp(cmd, "store-bench")) { int cmd_store_bench(int, char **); return cmd_store_bench(argc, argv); }
+    if (!strcmp(cmd, "z3-diff")) { int cmd_z3_diff(int, char **); return cmd_z3_diff(argc, argv); }
     if (!strcmp(cmd, "phase-pack") || !strcmp(cmd, "phase-unpack") || !strcmp(cmd, "phase-cmp") || !strcmp(cmd, "phase-drop")) { int cmd_phase_pack(int, char **); return cmd_phase_pack(argc, argv); }
     if (argc < 4) return usage();
     const char *root = argv[2], *key = argv[3];

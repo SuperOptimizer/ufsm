@@ -4,6 +4,7 @@
    last bit; the sheet normal (d_axis) is fp32 (see there). Each solve cell's sums run in one thread in the CPU's voxel order (z, y, x); the CG's dot products over a fixed grid of
    blocks (deterministic; the CPU threads sum in another order, so CG iterates differ in the last bits). */
 #include <cuda_runtime.h>
+#include <pthread.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -100,6 +101,27 @@ __global__ void k_pool(pool_k a) {
     const size_t o = (size_t)(Z - a.Za) * a.hh * a.w + (size_t)Y * a.w + X; a.S[o] = S; for (int k = 0; k < 3; k++) a.G[k][o] = G[k];
 }
 
+/* the uploads of pass 1 through pinned staging: a pageable cudaMemcpyAsync is one host thread copying through the driver's small
+   bounce buffer (P4 whole scroll: 1.26 TB of field planes in 329 s, 3.8 GB/s, most of the pooling time). Each plane's rows are copied
+   into a pinned buffer by UFSM_CF_UP_THREADS (4) host threads, and its DMA overlaps the next plane's host copy. Same bytes on the
+   device. Two staging buffers (one per device buffer), kept across calls; UFSM_CF_PINNED=0: the pageable copies */
+struct pc_job { uint8_t *d; const uint8_t *s; size_t n; };
+static void *pc_run(void *a) { const pc_job *j = (const pc_job *)a; memcpy(j->d, j->s, j->n); return nullptr; }
+static void par_copy(uint8_t *d, const uint8_t *s, size_t n, int nt) {
+    if (nt < 2 || n < ((size_t)8 << 20)) { memcpy(d, s, n); return; }
+    if (nt > 16) nt = 16; pthread_t th[16]; pc_job jb[16]; int up[16] = {0};
+    for (int t = 0; t < nt; t++) { const size_t a = n * t / nt, b = n * (t + 1) / nt; jb[t] = (pc_job){d + a, s + a, b - a}; }
+    for (int t = 1; t < nt; t++) up[t] = pthread_create(&th[t], nullptr, pc_run, &jb[t]) == 0;
+    pc_run(&jb[0]);
+    for (int t = 1; t < nt; t++) { if (up[t]) pthread_join(th[t], nullptr); else pc_run(&jb[t]); }
+}
+static uint8_t *g_pin[2]; static size_t g_pin_n[2];
+static uint8_t *pin_get(int q, size_t n) {
+    if (g_pin_n[q] >= n) return g_pin[q];
+    if (g_pin[q]) { cudaFreeHost(g_pin[q]); g_pin[q] = nullptr; g_pin_n[q] = 0; }
+    if (cudaHostAlloc((void **)&g_pin[q], n, cudaHostAllocDefault) != cudaSuccess) { cudaGetLastError(); g_pin[q] = nullptr; return nullptr; }
+    g_pin_n[q] = n; return g_pin[q];
+}
 extern "C" int cf_gpu_pool(const cf_gpu_poolcfg *c, const uint8_t *const pl[10], int zoff, int nzl, float *S, float *const G[3]) {
     const size_t HW = (size_t)c->H * c->W, cells = (size_t)c->hh * c->w; const int P = c->P;
     uint8_t *dpl[2] = {nullptr, nullptr}; float *dax = nullptr, *dsg[2] = {nullptr, nullptr}; int rc = 1; cudaStream_t sk = nullptr, sc = nullptr; ph_tab T;
@@ -111,6 +133,7 @@ extern "C" int cf_gpu_pool(const cf_gpu_poolcfg *c, const uint8_t *const pl[10],
     const int Z0 = zoff / P, Z1 = (zoff + nzl + P - 1) / P; if (gZ > Z1 - Z0) gZ = Z1 - Z0;
     const int maxr = gZ * P + 2, ng = (Z1 - Z0 + gZ - 1) / gZ; const size_t pb = (size_t)maxr * HW;
     if (tab_get(&T)) return 1;
+    const int pinned = !getenv("UFSM_CF_PINNED") || atoi(getenv("UFSM_CF_PINNED")) != 0, upt = getenv("UFSM_CF_UP_THREADS") ? atoi(getenv("UFSM_CF_UP_THREADS")) : 4;
     CF_CK(cudaStreamCreateWithFlags(&sk, cudaStreamNonBlocking)); CF_CK(cudaStreamCreateWithFlags(&sc, cudaStreamNonBlocking));
     for (int q = 0; q < 2 && q < ng; q++) { CF_CK(cudaMalloc(&dpl[q], 10 * pb)); CF_CK(cudaMalloc(&dsg[q], 4 * (size_t)gZ * cells * sizeof(float))); }
     CF_CK(cudaMalloc(&dax, 2 * (size_t)c->na * sizeof(float)));
@@ -128,7 +151,11 @@ extern "C" int cf_gpu_pool(const cf_gpu_poolcfg *c, const uint8_t *const pl[10],
         if (g < ng) {   /* upload g (its buffer's last kernel, g - 2, finished at step g - 1) */
             const int Za = Z0 + g * gZ, nZ = Za + gZ <= Z1 ? gZ : Z1 - Za, q = g & 1;
             int ra = Za * P - 1, rb = (Za + nZ) * P + 1; if (ra < zoff) ra = zoff; if (rb > zoff + nzl) rb = zoff + nzl;
-            for (int k = 0; k < 10; k++) CF_CK(cudaMemcpyAsync(dpl[q] + k * pb, pl[k] + (size_t)(ra - zoff) * HW, (size_t)(rb - ra) * HW, cudaMemcpyHostToDevice, sc));
+            const size_t nb = (size_t)(rb - ra) * HW; uint8_t *hp = pinned ? pin_get(q, 10 * pb) : nullptr;
+            for (int k = 0; k < 10; k++) {
+                if (hp) { par_copy(hp + k * pb, pl[k] + (size_t)(ra - zoff) * HW, nb, upt); CF_CK(cudaMemcpyAsync(dpl[q] + k * pb, hp + k * pb, nb, cudaMemcpyHostToDevice, sc)); }
+                else CF_CK(cudaMemcpyAsync(dpl[q] + k * pb, pl[k] + (size_t)(ra - zoff) * HW, nb, cudaMemcpyHostToDevice, sc));
+            }
             CF_CK(cudaStreamSynchronize(sc));
         }
         if (g >= 1) {   /* the sums of g - 1 */

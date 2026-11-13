@@ -278,6 +278,7 @@ int fit_fields_load(const char *dir, int fz0, int fz1, int pool, fit_fields_buf 
 void fit_fields_free(fit_fields_buf *b);
 void fit_fields_ct_planes(int mask);   /* which CT planes later fit_fields_load calls read (bit 0 ct, bit 1 cs; default both) */
 void fit_fields_skip_planes(int mask);   /* optional planes later fit_fields_load calls leave out (bit 0 the recto plane r, bit 1 the winding mod 4 planes dz dy dx dq, bit 2 the normals, bit 3 sp (unpooled loads); default none): RAM and reads for fits whose terms do not read them */
+void fit_fields_recycle(int on);   /* 1: fit_fields_load_ex's prev without shared rows lends its planes to the new block (zarr fields: same bytes, no fresh pages) */
 int fit_fields_zchunk(const char *dir, long long *zoff);   /* the z rows per chunk of the fields' arrays (zarr; 128 for raw) and the box's z offset in them (*zoff; 0 raw): loads of chunk-aligned rows decode each chunk once */
 /* Streamed fields for a GPU fit (fit_cfg stream): the whole box (unpooled) with the six normal planes read plane by plane (chunk rows)
    straight to the device field array (the fit's 10 B per cell: pc ps t0..t5 sp w), the host buffer b holding the planes the CPU reads

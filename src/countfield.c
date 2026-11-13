@@ -69,10 +69,33 @@ static double cf_axis(const fit_fields *f, size_t i, double v[3]) {
 }
 static double cf_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + 1e-9 * t.tv_nsec; }
 /* ---- chunk loads one ahead on a thread (the decode overlaps the pooling / the GPU; two chunks held) ---- */
-typedef struct { const char *in; int z0, z1, rc, th_on, busy; fit_fields_buf b; pthread_t th; double t; } cf_pre;
-static void *cf_pre_run(void *a) { cf_pre *p = a; p->rc = fit_fields_load(p->in, p->z0, p->z1, 1, &p->b); return nullptr; }
+/* (nxt: a used chunk handed back by cf_pre_give (main thread only); cf_pre_start moves it to use, owned by the load thread, whose
+   load takes its planes instead of fresh pages: fit_fields_recycle) */
+typedef struct { const char *in; int z0, z1, rc, th_on, busy, has_use, has_nxt; fit_fields_buf b, use, nxt; pthread_t th; double t; } cf_pre;
+/* --follow FILE (pass 1 behind a running fields predict): lines "z0 z1" of field rows already written (box cells, any order, appended
+   as the predict's field slabs are flushed; the driver's streamer writes them). A chunk is loaded once its rows are covered (polled) */
+static const char *g_follow;
+static int cf_follow_ready(int z0, int z1) {
+    FILE *f = fopen(g_follow, "r"); if (!f) return 0;
+    enum { NR = 4096 }; static int a[NR], b[NR]; int n = 0, x, y;
+    while (n < NR && fscanf(f, "%d %d", &x, &y) == 2) { a[n] = x; b[n] = y; n++; }
+    fclose(f);
+    for (int z = z0; z < z1;) { int adv = 0; for (int i = 0; i < n; i++) if (a[i] <= z && z < b[i]) { z = b[i]; adv = 1; } if (!adv) return 0; }
+    return 1;
+}
+static void *cf_pre_run(void *a) { cf_pre *p = a;
+    if (g_follow) { const double t0 = cf_now(); int said = 0; while (!cf_follow_ready(p->z0, p->z1)) { if (!said && cf_now() - t0 > 600) { fprintf(stderr, "count-field: --follow: rows %d..%d not written after 10 min, still waiting\n", p->z0, p->z1); said = 1; } usleep(500000); } }
+    if (p->has_use) { fit_fields_recycle(1); p->rc = fit_fields_load_ex(p->in, p->z0, p->z1, 1, &p->b, 0, nullptr, 0, &p->use); fit_fields_recycle(0); p->has_use = 0; }
+    else p->rc = fit_fields_load(p->in, p->z0, p->z1, 1, &p->b);
+    return nullptr; }
+static void cf_pre_give(cf_pre *p, fit_fields_buf *b) {   /* a chunk done with: its planes for the next cf_pre_start's load */
+    if (p->has_nxt || getenv("UFSM_CF_NO_RECYCLE")) { fit_fields_free(b); return; }
+    p->nxt = *b; p->has_nxt = 1; memset(b, 0, sizeof *b);
+}
 static void cf_pre_start(cf_pre *p, const char *in, int z0, int z1, int async) {
-    p->in = in; p->z0 = z0; p->z1 = z1; p->rc = 0; p->busy = 1; p->th_on = async && pthread_create(&p->th, nullptr, cf_pre_run, p) == 0;
+    p->in = in; p->z0 = z0; p->z1 = z1; p->rc = 0; p->busy = 1;
+    if (p->has_nxt) { p->use = p->nxt; p->has_use = 1; p->has_nxt = 0; memset(&p->nxt, 0, sizeof p->nxt); }
+    p->th_on = async && pthread_create(&p->th, nullptr, cf_pre_run, p) == 0;
     if (!p->th_on) cf_pre_run(p);
 }
 static int cf_pre_take(cf_pre *p, fit_fields_buf *b) {   /* waits for the chunk started last; its buffer moves to b (time waited -> p->t) */
@@ -495,7 +518,8 @@ int cmd_count_field(int argc, char **argv) {
     if (argc < 4) {
         fprintf(stderr, "usage: ufsm count-field <in-fields> <out-fields> [--method ls|ray] [--pool P (solve cell in field cells, 0 auto)] [--R 10 (phase demod radius, field cells; 0: W only)] [--Rz R]\n"
                         "       [--phase-w 0 (confident network phase gradients in the targets, weight)] [--phase-c0 0.4] [--gauge demod|ls (ls: a smooth LS-unwrapped gauge instead of the +-R demodulation; with --R 0)] [--gauge-R 5 (solve cells)] [--conf w|phase|mix|pmax] [--trust C0,C1 (phase confidence ramp: the network phase kept)] [--conf-w 1 (scale of the count confidence)] [--keep 0 (p: + A^p wrap(phi - W_out), A the local agreement)] [--sp-w 0 (1: sp from |grad W|)] [--dir 0] [--iters 400] [--lambda 1e-7] [--eps 1e-3] [--loop 8 (closing loop edge, field cells)] [--model DIR] [--model-R 8] [--rmin-um 500] [--emin 0.1] [--sheet0 0.4]\n"
-                        "       [--wc 1 (0: no wc.f32)] [--mem-gb 6 (field chunk budget)] [--threads 8] [--cf-gpu 1 (pooling, CG, model pass on the GPU)] [--prefetch auto|0|1] [--read-threads N]\n");
+                        "       [--wc 1 (0: no wc.f32)] [--mem-gb 6 (field chunk budget)] [--threads 8] [--cf-gpu 1 (pooling, CG, model pass on the GPU)] [--prefetch auto|0|1] [--read-threads N]\n"
+                        "       [--pool-cache FILE] [--pool-only 1 (pass 1 into the cache, then exit)] [--follow ROWSFILE (pass 1 behind a running predict)] [--follow-split S] [--chunk-rows N]\n");
         return 2;
     }
     const char *in = argv[2], *out = argv[3], *meth = cf_opt(argc, argv, "--method", "ls"), *cmode = cf_opt(argc, argv, "--conf", "mix"), *mdir = cf_opt(argc, argv, "--model", "");
@@ -533,10 +557,13 @@ int cmd_count_field(int argc, char **argv) {
     /* field rows per chunk: ~22 B per cell held (input planes, output buffers) incl. the Rz halo rows */
     int CZ = (int)(memgb * 1e9 / ((mo ? 12.0 : 22.0) * HW)) - 2 * Rz; CZ = CZ / P * P; if (CZ < P) CZ = P; if (CZ > D) CZ = (D + P - 1) / P * P;   /* (--model-only: no output buffers) */
     if (CZ >= 128 && 128 % P == 0) CZ = CZ / 128 * 128;   /* whole 128-row zarr shards per chunk (a shard straddling two chunks is decoded twice) */
-    if (pref < 0) {   /* --prefetch default: two chunks of ~11 planes in half of MemAvailable */
-        unsigned long long kb = 0; char ln[256]; FILE *mf = fopen("/proc/meminfo", "r");
-        if (mf) { while (fgets(ln, sizeof ln, mf)) if (sscanf(ln, "MemAvailable: %llu kB", &kb) == 1) break; fclose(mf); }
-        pref = 2 * 11.0 * CZ * HW < 0.5 * kb * 1024.0;
+    /* --chunk-rows N: the chunk height fixed (a multiple of the pool; the strided model pass and the prior's chunk depend on it, so a
+       pass 1 run apart from the solve (--pool-only, --follow) and the solve run pass the same N; default: from --mem-gb as above) */
+    if (atoi(cf_opt(argc, argv, "--chunk-rows", "0")) > 0) { CZ = atoi(cf_opt(argc, argv, "--chunk-rows", "0")) / P * P; if (CZ < P) CZ = P; if (CZ > D) CZ = (D + P - 1) / P * P; }
+    if (pref < 0) {   /* --prefetch default: two chunks of ~11 planes in half of what this process may still allocate (cgroup aware: the
+                         host's MemAvailable let a 1667 ref inside a 40 GB memcap scope prefetch two 19.5 GB chunks and be OOM-killed, 11-12) */
+        const double av = (double)ufsm_mem_available();
+        pref = 2 * 11.0 * CZ * HW < 0.5 * av;
     }
     int nl = 1; while (nl < 6) { const int q = P << nl; if ((D + q - 1) / q < 8 || (H + q - 1) / q < 8 || (W + q - 1) / q < 8) break; nl++; }
     cf_lvl *lv = calloc(nl, sizeof *lv); float **Sl = calloc(nl, sizeof *Sl), *(*Gl)[3] = calloc(nl, sizeof *Gl);
@@ -562,12 +589,23 @@ int cmd_count_field(int argc, char **argv) {
         if (pf) fclose(pf); }
     double t_pool = 0; const double tst0 = cf_now();
     if (mo) fit_fields_skip_planes(1 | 2);   /* (--model-only: no output planes, the recto / winding mod 4 planes unread) */
-    cf_pre pre = {0}; if (!cached) cf_pre_start(&pre, in, 0, CZ < D ? CZ : D, pref);
+    /* the chunks' order: in z; --follow-split S (the second fields part's first row, a multiple of CZ): the two parts' chunks
+       alternately (each part's predict writes its rows bottom-up at about the same pace). The pooled sums are per chunk (disjoint solve
+       rows) and the prior comes from the chunk holding the middle row, so the order changes nothing */
+    const int nch = (D + CZ - 1) / CZ; int *ord = malloc(nch * sizeof(int));
+    {   const int fs = atoi(cf_opt(argc, argv, "--follow-split", "0")), ks = fs > 0 && fs % CZ == 0 && fs < D ? fs / CZ : 0; int n = 0;
+        if (*cf_opt(argc, argv, "--follow-split", "") && !ks) fprintf(stderr, "count-field: --follow-split %d is not a multiple of the %d-row chunks inside the box: chunks in z order\n", fs, CZ);
+        if (ks) for (int i = 0; n < nch; i++) { if (i < ks) ord[n++] = i; if (ks + i < nch) ord[n++] = ks + i; }
+        else for (int i = 0; i < nch; i++) ord[i] = i; }
+    g_follow = *cf_opt(argc, argv, "--follow", "") ? cf_opt(argc, argv, "--follow", "") : nullptr;
+    cf_pre pre = {0}; if (!cached) cf_pre_start(&pre, in, ord[0] * CZ, ord[0] * CZ + CZ < D ? ord[0] * CZ + CZ : D, pref);
     const int gpu0 = gpu; int npc = 0;   /* (a chunk the GPU fails, e.g. short of memory on a shared device: the CPU; the next one tries again) */
-    for (int z0 = 0; z0 < D && !cached; z0 += CZ) {
-        const int z1 = z0 + CZ < D ? z0 + CZ : D; fit_fields_buf b;
+    for (int ci = 0; ci < nch && !cached; ci++) {
+        const int z0 = ord[ci] * CZ, z1 = z0 + CZ < D ? z0 + CZ : D; fit_fields_buf b;
         if (cf_pre_take(&pre, &b)) return 1;
-        if (z1 < D) cf_pre_start(&pre, in, z1, z1 + CZ < D ? z1 + CZ : D, pref);
+        /* (without --prefetch the next chunk loads after this one is pooled and handed back: one chunk in RAM, not two; before, the
+           synchronous load of the next chunk ran here, next to this one: two chunks either way, 39 GB for a 1667 ref at 768 rows) */
+        if (pref && ci + 1 < nch) { const int n0 = ord[ci + 1] * CZ; cf_pre_start(&pre, in, n0, n0 + CZ < D ? n0 + CZ : D, pref); }
         if (!z0) { recto = b.f.recto != nullptr; w4d = b.f.wd[0] ? b.f.w4_d : 0; }
         cf_pool pp = {&b.f, z0, z1 - z0, H, W, P, lv[0].hh, lv[0].w, h, g.cy, g.cx, na, Sl[0], {Gl[0][0], Gl[0][1], Gl[0][2]}, atof(cf_opt(argc, argv, "--emin", "0.1")), atof(cf_opt(argc, argv, "--sheet0", "0.4")), atof(cf_opt(argc, argv, "--phase-w", "0")), atof(cf_opt(argc, argv, "--phase-c0", "0.4"))};
         pp.rs = atof(cf_opt(argc, argv, "--rho-scale", "1")); if (!(pp.rs > 0)) pp.rs = 1;
@@ -577,6 +615,12 @@ int cmd_count_field(int argc, char **argv) {
             if (pp.wb > 0) { pp.wd = atof(cf_opt(argc, argv, "--wide-dens", "0")); pp.wp = atof(cf_opt(argc, argv, "--wide-phase", "0")); }
         }
         const double tl1 = cf_now();
+        if (getenv("UFSM_CF_READ_ONLY")) {   /* (bench: the field reads only; FNV-1a of the chunk's planes for byte-identity checks) */
+            const uint8_t *pl[10] = {b.f.pc, b.f.ps, b.f.t[0], b.f.t[1], b.f.t[2], b.f.t[3], b.f.t[4], b.f.t[5], b.f.sp, b.f.w}; uint64_t hs = 1469598103934665603ull;
+            if (!strcmp(getenv("UFSM_CF_READ_ONLY"), "h")) for (int k = 0; k < 10; k++) if (pl[k]) for (size_t i = 0; i < (size_t)(z1 - z0) * HW; i += 7) hs = (hs ^ pl[k][i]) * 1099511628211ull;
+            fprintf(stderr, "count-field: read only: rows %d..%d hash %016llx\n", z0, z1, (unsigned long long)hs); cf_pre_give(&pre, &b);
+            if (!pref && ci + 1 < nch) { const int n0 = ord[ci + 1] * CZ; cf_pre_start(&pre, in, n0, n0 + CZ < D ? n0 + CZ : D, 0); }
+            continue; }
         if (gpu) {   /* the chunk's solve rows on the GPU (the same sums in the same order) */
             const cf_gpu_poolcfg gc = {H, W, P, lv[0].hh, lv[0].w, na, h, g.cy, g.cx, pp.emin, pp.sheet0, pp.kph, pp.c0, pp.rs, pp.ra, pp.rb, pp.wa, pp.wb, pp.wd, pp.wp};
             const uint8_t *pl[10] = {b.f.pc, b.f.ps, b.f.t[0], b.f.t[1], b.f.t[2], b.f.t[3], b.f.t[4], b.f.t[5], b.f.sp, b.f.w};
@@ -598,15 +642,20 @@ int cmd_count_field(int argc, char **argv) {
                 free(pk); free(pm.pitch); free(pm.offset);
             }
         }
-        fit_fields_free(&b);
+        cf_pre_give(&pre, &b);
+        if (!pref && ci + 1 < nch) { const int n0 = ord[ci + 1] * CZ; cf_pre_start(&pre, in, n0, n0 + CZ < D ? n0 + CZ : D, 0); }
     }
+    if (pre.has_nxt) { fit_fields_free(&pre.nxt); pre.has_nxt = 0; }
     if (!dir) dir = 1;
+    if (getenv("UFSM_CF_READ_ONLY")) { fprintf(stderr, "count-field: read only: waited for field reads %.0f s, wall %.0f s\n", pre.t, cf_now() - tst0); return 0; }
     if (!cached) fprintf(stderr, "count-field: pass 1: waited for field reads %.0f s, pooling %.0f s (%s, %d of %d chunks on the CPU; %d rows per chunk), wall %.0f s\n", pre.t, t_pool, gpu ? "GPU" : "CPU", gpu ? npc : (D + CZ - 1) / CZ, (D + CZ - 1) / CZ, CZ, cf_now() - tst0);
     if (*pcache && !cached) { FILE *pf = fopen(pcache, "wb"); const int hd[6] = {lv[0].d, lv[0].hh, lv[0].w, P, dir, recto | w4d << 1};
         int bad = !pf || fwrite(hd, sizeof hd, 1, pf) != 1 || fwrite(&pitch, sizeof pitch, 1, pf) != 1 || fwrite(Sl[0], sizeof(float), lv[0].n, pf) != lv[0].n;
         for (int k = 0; k < 3 && !bad; k++) bad = fwrite(Gl[0][k], sizeof(float), lv[0].n, pf) != lv[0].n;
         if (pf && fclose(pf)) bad = 1;
-        fprintf(stderr, bad ? "count-field: cannot write the pool cache %s\n" : "count-field: pooled sums -> %s\n", pcache); }
+        fprintf(stderr, bad ? "count-field: cannot write the pool cache %s\n" : "count-field: pooled sums -> %s\n", pcache);
+        if (atoi(cf_opt(argc, argv, "--pool-only", "0"))) return bad; }   /* (--pool-only 1: pass 1 into --pool-cache, nothing else) */
+    free(ord); g_follow = nullptr;
     if (getenv("UFSM_CF_ZTILT")) {   /* per solve row: the share of data cells whose target normal tilts >= 30 deg out of the y-x plane (z crush) */
         for (int z = 0; z < lv[0].d; z++) { double nc = 0, nt = 0, sz = 0;
             for (size_t i = (size_t)z * lv[0].hh * lv[0].w; i < (size_t)(z + 1) * lv[0].hh * lv[0].w; i++) { if (!(Sl[0][i] > 0)) continue;

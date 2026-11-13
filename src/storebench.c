@@ -106,3 +106,35 @@ int main(int argc, char **argv) {   /* build/store_bench <root> <key> ...: same 
     return cmd_store_bench(argc + 1, a);
 }
 #endif
+
+/* ufsm z3-diff <root-a> <key-a> <root-b> <key-b> [--box z,y,x,nz,ny,nx] [--slab 128] [--threads 8]: two uint8 arrays of one shape
+   compared slab by slab: voxels that differ, mean / max |a - b|, a histogram of |a - b| (1, 2-3, 4-7, 8-15, 16+), and the share of
+   voxels >= 128 in each (e.g. ink above 0.5) with how many flip across 128 (an output check of a recipe change) */
+int cmd_z3_diff(int argc, char **argv) {
+    if (argc < 6) { fprintf(stderr, "usage: ufsm z3-diff <root-a> <key-a> <root-b> <key-b> [--box z,y,x,nz,ny,nx] [--slab 128] [--threads 8]\n"); return 2; }
+    z3 *a = z3_open(store_open(argv[2]), argv[3], nullptr), *b = z3_open(store_open(argv[4]), argv[5], nullptr);
+    if (!a || !b) { fprintf(stderr, "z3-diff: cannot open: %s\n", z3_error()); return 1; }
+    const z3_meta *ma = z3_meta_of(a), *mb = z3_meta_of(b);
+    for (int d = 0; d < 3; d++) if (ma->shape[d] != mb->shape[d]) { fprintf(stderr, "z3-diff: shapes differ\n"); return 1; }
+    int64_t o[3] = {0, 0, 0}, n[3] = {ma->shape[0], ma->shape[1], ma->shape[2]};
+    const char *bx = bopt(argc, argv, "--box", nullptr);
+    if (bx && sscanf(bx, "%ld,%ld,%ld,%ld,%ld,%ld", &o[0], &o[1], &o[2], &n[0], &n[1], &n[2]) != 6) { fprintf(stderr, "z3-diff: --box z,y,x,nz,ny,nx\n"); return 2; }
+    const int S = atoi(bopt(argc, argv, "--slab", "128")), nt = atoi(bopt(argc, argv, "--threads", "8"));
+    const size_t plane = (size_t)n[1] * n[2]; uint8_t *pa = malloc(plane * S), *pb = malloc(plane * S);
+    if (!pa || !pb) { fprintf(stderr, "z3-diff: out of memory\n"); return 1; }
+    unsigned long long nv = 0, nd = 0, sum = 0, mx = 0, hist[5] = {0}, ha = 0, hb = 0, flip = 0;
+    for (int64_t z = 0; z < n[0]; z += S) {
+        const int64_t oz[3] = {o[0] + z, o[1], o[2]}, nz[3] = {z + S <= n[0] ? S : n[0] - z, n[1], n[2]};
+        if (z3_read(a, oz, nz, pa, nt) || z3_read(b, oz, nz, pb, nt)) { fprintf(stderr, "z3-diff: read: %s\n", z3_error()); return 1; }
+        const size_t m = (size_t)nz[0] * plane;
+        for (size_t i = 0; i < m; i++) {
+            const int x = pa[i], y = pb[i], d = x > y ? x - y : y - x; nv++; ha += x >= 128; hb += y >= 128; flip += (x >= 128) != (y >= 128);
+            if (!d) continue;
+            nd++; sum += d; if ((unsigned)d > mx) mx = d; hist[d >= 16 ? 4 : d >= 8 ? 3 : d >= 4 ? 2 : d >= 2 ? 1 : 0]++;
+        }
+    }
+    printf("z3-diff: %llu voxels, %llu differ (%.4f), mean |a-b| %.4f, max %llu; |a-b| 1: %llu, 2-3: %llu, 4-7: %llu, 8-15: %llu, 16+: %llu; >= 128: a %.5f b %.5f, flips %llu (%.2e)\n",
+           nv, nd, nv ? (double)nd / nv : 0, nv ? (double)sum / nv : 0, mx, hist[0], hist[1], hist[2], hist[3], hist[4], nv ? (double)ha / nv : 0, nv ? (double)hb / nv : 0, flip, nv ? (double)flip / nv : 0);
+    free(pa); free(pb); z3_close(a); z3_close(b);
+    return 0;
+}

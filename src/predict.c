@@ -536,6 +536,7 @@ typedef struct {
     void *evs[FFW_NB], *evd[FFW_NB]; uint8_t *h[FFW_NB];
     z3w **zw; uint8_t **sl; const int *F; int FS, FZ, gpu;
     uint8_t *done;   /* the current slab's written field-shard rows [FZ / FS][ny] */
+    char rowsf[1400];   /* <fit-zarr>/rows.done: "z0 z1" (field cells) appended per flushed slab: count-field --follow reads behind the predict */
     ffring rg;       /* the slab's layout (a ring of rows with row flushes) */
     /* row flushes on their own thread (half the CPUs), so the scatter of window chunks never waits for compression: a queue of
        kind-2 jobs; the slab flush (kind 1) waits for it to drain */
@@ -572,6 +573,8 @@ static void *ffw_main(void *arg) {
             const double t0 = now();
             pthread_mutex_lock(&W->mu); while (W->rqn || W->rbusy) pthread_cond_wait(&W->cv, &W->mu); pthread_mutex_unlock(&W->mu);
             if (!atomic_load(&W->fail) && ffz_flush(W->zw, W->sl, j.slab, W->F, W->FS, W->FZ, 0, W->FZ / W->FS, 0, 1 << 30, W->done, 1, 0, &W->rg)) atomic_store(&W->fail, 1);
+            if (!atomic_load(&W->fail) && W->rowsf[0]) { FILE *rf = fopen(W->rowsf, "a");   /* (the slab's shards are written: its rows are final) */
+                if (rf) { const int64_t a = j.slab * W->FZ, b = a + W->FZ < W->F[0] ? a + W->FZ : W->F[0]; fprintf(rf, "%lld %lld\n", (long long)a, (long long)b); fclose(rf); } }
             W->t_slab += now() - t0; W->n_slab++;
             continue;
         }
@@ -1183,6 +1186,15 @@ int cmd_predict(int argc, char **argv) {
     fclose(f);
     fprintf(stderr, "predict --boxes: %d boxes in %.1f s\n", nbox, now() - t0);
     return rc;
+}
+/* the fit-field set's fields.json (format zarr): box origin / shape in cells, h, um, the box-local axis per native z row of the box */
+static int ffz_json(const char *p, const int64_t bo[3], const int64_t bn[3], const int F[3], int h, double um, int u2, int w4d, const axis *ax, int level) {
+    FILE *f = fopen(p, "w"); if (!f) { fprintf(stderr, "predict: cannot write %s\n", p); return 1; }
+    fprintf(f, "{\"format\": \"zarr\", \"origin\": [%lld, %lld, %lld], \"shape\": [%d, %d, %d], \"h\": %d, \"um\": %.9g, ", (long long)bo[0], (long long)bo[1], (long long)bo[2], F[0], F[1], F[2], h, um);
+    if (u2) { if (w4d) fprintf(f, "\"w4_d\": %d, ", w4d); } else fprintf(f, "\"recto\": true, ");
+    fprintf(f, "\"axis\": [");
+    for (int64_t z = 0; z <= bn[0]; z++) { double cy = 0, cx = 0; if (ax->n) axis_at(ax, (double)(bo[0] + z) * (1 << level), &cy, &cx); fprintf(f, "%s[%.3f, %.3f]", z ? ", " : "", cy / (1 << level) - bo[1], cx / (1 << level) - bo[2]); }
+    fprintf(f, "]}\n"); return fclose(f) ? 1 : 0;
 }
 static int predict_one(int argc, char **argv) {
     /* UFSM_PRED_DEVREAD=1: the CT windows decoded on the GPU into device memory (volcomp's GPU decoder, byte-identical): turned on here,
@@ -2004,6 +2016,8 @@ static int predict_one(int argc, char **argv) {
                                                                                                                   two staging buffers (the fit writer thread) */
             if (!ffacc || !ff8d || !ff8h) { fprintf(stderr, "predict: no memory for the fit-field window accumulator\n"); return 1; }
             ffw.zw = ffzw; ffw.sl = ffsl; ffw.F = ffF; ffw.FS = FFS; ffw.FZ = FZ; ffw.gpu = gpu;
+            if (ffzm) { snprintf(ffw.rowsf, sizeof ffw.rowsf, "%s/rows.done", ffz); FILE *rf = fopen(ffw.rowsf, "w"); if (rf) fclose(rf);   /* (a resumed run starts over: no rows yet) */
+                        char p[1400]; snprintf(p, sizeof p, "%s/fields.partial.json", ffz); if (ffz_json(p, bo, bn, ffF, ffh, um * (1 << level), ffu2, ffw4d, &ax, level)) return 1; }
             ffw.done = calloc((size_t)(FZ / FFS) * ((ffF[1] + FFS - 1) / FFS), 1);
             if (!ffw.done) { fprintf(stderr, "predict: out of memory\n"); return 1; }
             for (int b = 0; b < ffw.nb; b++) { ffw.h[b] = ff8h + (size_t)b * FFZ_MAXP * ffwn; ffw.evs[b] = nn_event_create(); ffw.evd[b] = nn_event_create(); }
@@ -2724,13 +2738,8 @@ static int predict_one(int argc, char **argv) {
         for (int k = 0; k < ffz_np; k++) { z3w_close(ffzw[k]); free(ffsl[k]); }
         free(ffw.done); free(ffw.rg.own);
         nn_free(ffacc); nn_free(ffacc4); nn_free(ff8d); nn_host_free(ff8h);
-        char p[1400]; snprintf(p, sizeof p, "%s/fields.json", ffz); FILE *f = fopen(p, "w");
-        if (!f) { fprintf(stderr, "predict: cannot write %s\n", p); return 1; }
-        fprintf(f, "{\"format\": \"zarr\", \"origin\": [%lld, %lld, %lld], \"shape\": [%d, %d, %d], \"h\": %d, \"um\": %.9g, ", (long long)bo[0], (long long)bo[1], (long long)bo[2], ffF[0], ffF[1], ffF[2], ffh, um * (1 << level));
-        if (ffu2) { if (ffw4d) fprintf(f, "\"w4_d\": %d, ", ffw4d); } else fprintf(f, "\"recto\": true, ");
-        fprintf(f, "\"axis\": [");
-        for (int64_t z = 0; z <= bn[0]; z++) { double cy = 0, cx = 0; if (ax.n) axis_at(&ax, (double)(bo[0] + z) * (1 << level), &cy, &cx); fprintf(f, "%s[%.3f, %.3f]", z ? ", " : "", cy / (1 << level) - bo[1], cx / (1 << level) - bo[2]); }
-        fprintf(f, "]}\n"); fclose(f);
+        char p[1400]; snprintf(p, sizeof p, "%s/fields.json", ffz); if (ffz_json(p, bo, bn, ffF, ffh, um * (1 << level), ffu2, ffw4d, &ax, level)) return 1;
+        snprintf(p, sizeof p, "%s/fields.partial.json", ffz); remove(p);
         fprintf(stderr, "predict: fit fields %dx%dx%d (h %d) written to %s (zarr)\n", ffF[0], ffF[1], ffF[2], ffh, ffz);
     } else if (ffd) {   /* the fit fields: means over material (CT > 0) of the pooled heads, material fraction, max recto */
         float *acc = malloc(ffna * ffn * 4); nn_sync(); nn_d2h(acc, ffacc, ffna * ffn * 4); nn_free(ffacc);
