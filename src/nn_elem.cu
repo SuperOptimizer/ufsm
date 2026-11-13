@@ -531,6 +531,22 @@ extern "C" void nn_ink_targets_smooth(const uint8_t *ink, size_t n, uint8_t *t, 
     if (!(eps > 0)) { nn_ink_targets(ink, n, t, m); return; }
     ink_tgs_k<<<nblk(n, 256), 256>>>(ink, n, t, m, 1.f - eps, 127.5f * eps); KCHECK();
 }
+/* train --ink-air S: air voxels of the slab (the papyrus plane: known and < 127) that no ink label covers become ink-0 targets on the
+   S-voxel lattice of the window (z0 + z, y, x all multiples of S); the target is the smoothed 0 (127.5 eps rounded), the mask 1. Anchors
+   the ink head's level per voxel in air, which the face-band labels never reach (DESIGN 2026-11-13). */
+__global__ void ink_air_k(const uint8_t *pap, size_t n, int z0, int H, int W, int S, uint8_t t0, uint8_t *t, uint8_t *m) {
+    const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= n || m[i]) return;
+    const uint8_t p = pap[i]; if (p == 255 || p >= 127) return;
+    const size_t hw = (size_t)H * W; const int z = z0 + (int)(i / hw), y = (int)(i % hw / W), x = (int)(i % W);
+    if (z % S || y % S || x % S) return;
+    t[i] = t0; m[i] = 1;
+}
+extern "C" void nn_ink_air(const uint8_t *pap, size_t n, int z0, int H, int W, int S, float eps, uint8_t *t, uint8_t *m) {
+    if (S < 1 || !n) return;
+    const uint8_t t0 = eps > 0 ? (uint8_t)lrintf(127.5f * eps) : 0;   /* (= ink_tgs_k on v = 0: rn(0 x a + 127.5 eps)) */
+    ink_air_k<<<nblk(n, 256), 256>>>(pap, n, z0, H, W, S, t0, t, m); KCHECK();
+}
 /* --cond: the winding mod 14 turns in 1/18-turn steps (band.h band_winding, 0..251, 255 unknown) -> 4 target planes, cos / sin of
    2 pi q / 14 and of 2 pi q / 2 (q = v / 18 turns), each 127.5 + 127.5 x; mask = known */
 __global__ void cond_tg_k(const uint8_t *wv, size_t n, uint8_t *t, uint8_t *m) {

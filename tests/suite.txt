@@ -151,6 +151,7 @@ test_dino_pts                                  |              |     1 | ./$B/tes
 test_ink_splat                                 | gpu          |    10 | ./$B/test_ink_splat
 test_ink_pool                                  |              |     3 | ./$B/test_ink_pool $TMPDIR/ink_pool
 test_ink_mil                                   | gpu          |     2 | ./$B/test_ink_mil
+test_ink_air                                   | gpu          |     2 | ./$B/test_ink_air
 test_ink_mil_train                             | gpu          |    40 | ./$B/test_ink_mil_train ./$B/ufsm ./$B/make_wind_fixture
 test_accum                                     | gpu          |    20 | tests/test_accum.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/accum
 test_strict_sources                            | gpu          |    25 | tests/test_strict_sources.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/strictsrc
