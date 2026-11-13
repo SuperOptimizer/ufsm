@@ -209,6 +209,8 @@ test_grad_mx4~L0_NORM=2                        | gpu          |    10 | UFSM_L0_
 test_grad_mx4~L0_NORM=3                        | gpu          |    11 | UFSM_L0_NORM=3 ./$B/test_grad_mx4
 test_grad_mx4~L0_NORM=4,L0_SLAB=8,L0_SLAB_KERN=1 | gpu          |    11 | UFSM_L0_NORM=4 UFSM_L0_SLAB=8 UFSM_L0_SLAB_KERN=1 ./$B/test_grad_mx4
 test_mx4~F4W_LAYOUT=1                          | gpu          |     4 | UFSM_F4W_LAYOUT=1 ./$B/test_mx4
+test_sp24_mma                                  | gpu          |     4 | ./$B/test_sp24_mma
+test_sp24_conv                                 | gpu          |     6 | ./$B/test_sp24_conv
 test_rc                                        | gpu          |     1 | ./$B/test_rc
 test_muon                                      | gpu          |     1 | ./$B/test_muon
 test_muonc                                     | gpu          |     3 | ./$B/test_muonc
