@@ -43,6 +43,12 @@ the kernels in a window, the host threads' CUDA API time).
   "fp4 conv SR operand (32 ch)" check NaN: something outside gx is overwritten (open). The wide path is off by default now
   (UFSM_S2B_WIDE=1 / lp_set_s2b_wide on; test_mx4 keeps 256 / 320, TMX4_WIDE_ALL=1 the whole sequence): mega + this, step-1 gradient
   0 non-finite (max |g| 0.329, loss 2.77253056).
+  Narrowed (UFSM_S2B_WIDE=1 with one block count excluded at a time): only the **NCH 14 (448-channel) instantiation** gives the NaN (448 skipped:
+  0 non-finite; 288 or 384 skipped: still 5422144). The trainer's call is the test's shape (gy 1x448x16^3 MX-fp4 -> gx 1x448x32^3 MX-fp4,
+  accumulate), which matches its reference in test_mx4 alone, so the trigger lies in the trainer's data / state, not the shape; no suite-sized
+  repro. (test_mx4's five-width sequence NaN also appears with the wide path off: a test artefact, not this bug.) Gate:
+  scripts/test/split_finite.sh BIN CMDFILE (desk, both cards, ~3 min): step 1 of the scratch2 command line with UFSM_GRAD_DUMP, all
+  gradients finite; ok by default, FAIL (5422144) with UFSM_S2B_WIDE=1.
 
 **Profile before** (the archived one-card P 512 92 M run, runs/scratch-archive-20261113/prof92: nsys + UFSM_PROF=layers, 37 steady
 steps): 1.61 s/step, kernel-busy 99 % (GPU-bound, no loader wait). Per step:
