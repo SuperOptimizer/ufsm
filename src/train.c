@@ -1958,6 +1958,14 @@ static void split_job(int side, void *a) {
 
 int cmd_train(int argc, char **argv) {
     if (ufsm_env_on("UFSM_UW_SELFTEST")) return uw_selftest();
+    {   /* --ct-gpu-decode D (DESIGN 2026-11-13): the sampler's volcomp CT decode on GPU D (src/nn_gpudec.cu, byte-identical to the CPU decode;
+           test_gpudec), i.e. UFSM_GPU_DECODE=1 UFSM_GPU_DECODE_DEV=D, set before the first z3 decode (the sources' draw-index reads) because the
+           decoder reads its env once; -1 (default) keeps the CPU decode. Its statistics print at exit. */
+        const int gd = atoi(opt(argc, argv, "--ct-gpu-decode", "-1"));
+        if (gd >= 0) { char b[16]; snprintf(b, sizeof b, "%d", gd); setenv("UFSM_GPU_DECODE", "1", 1); setenv("UFSM_GPU_DECODE_DEV", b, 1);
+                       if (!getenv("UFSM_GPU_DECODE_STATS")) setenv("UFSM_GPU_DECODE_STATS", "1", 1);
+                       fprintf(stderr, "train: the CT decode (volcomp substreams) on GPU %d (gpudec, byte-identical to the CPU decode)\n", gd); }
+    }
     if (argc < 3) {
         fprintf(stderr, "usage: ufsm train <sources.json> --out DIR [--P 512] [--B 1] [--steps 20000] [--lr 1e-3] [--warmup 500] [--wd 0.01]\n"
                         "       [--dice 0.5] [--ema 0.999] [--widths 16,32,64,80] [--down-norm 1] [--gpus 0,1] [--workers 12 (new runs with --gpu-aug 2: 3)] [--gpu-aug 0|1|2 (new runs: 2)] [--sampler-slots N] [--seed 0] [--det 1] [--resume CKPT] [--finetune 1] [--fp4 0|1|2 (default 2)] [--mem auto|auto16|default|wide] [--opt adamw|muon|anvil] [--muon-lr 0.02] [--muon-beta 0.95] [--anvil-lr 0.023] [--anvil-wd 2.25] [--sched cos|wsd] [--cooldown 0.2]\n"
