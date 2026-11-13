@@ -1433,6 +1433,10 @@ static void gstep_fwd(gstep_arg *a) {
                 if (g_lstream) for (int k = 0; k < 4; k++) if (d->lbh[k]) { uint64_t h = 1469598103934665603ull; for (size_t q = 0; q < p3t; q++) h = (h ^ d->lbh[k][q]) * 1099511628211ull; hl[k] = h; }
                 fprintf(stderr, "dettrace step %d: x %016llx labels %016llx %016llx %016llx %016llx params %016llx\n", step, (unsigned long long)hx, (unsigned long long)hl[0], (unsigned long long)hl[1], (unsigned long long)hl[2], (unsigned long long)hl[3], (unsigned long long)unet_param_hash(d->u));
                 free(hb);
+                const char *dd = getenv("UFSM_DET_DUMP");   /* dir: the parameters and the last step's gradient (before zeroing), fp32, per step */
+                if (dd && g == 0) { const size_t np = unet_nparams(d->u); float *h = malloc(np * 4); char fn[1100];
+                    unet_params_d2h(d->u, h); snprintf(fn, sizeof fn, "%s/p%d.f32", dd, step); FILE *f = fopen(fn, "wb"); if (f) { fwrite(h, 4, np, f); fclose(f); }
+                    nn_d2h(h, unet_grad_ptr(d->u), np * 4); snprintf(fn, sizeof fn, "%s/g%d.f32", dd, step); f = fopen(fn, "wb"); if (f) { fwrite(h, 4, np, f); fclose(f); } free(h); }
             }
             if (sparse_at && step >= sparse_at && !unet_get_sparse24(d->u)) { unet_set_sparse24(d->u, 1); if (g == 0) fprintf(stderr, "step %d: 2:4 sparsity on (SR-STE lambda %g)\n", step, srste); }
             unet_zero_grad(d->u);
