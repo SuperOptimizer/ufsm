@@ -27,7 +27,8 @@ gpulock() { while :; do gpu0free; exec 8> ${BLK:-/tmp/gpu0-bench.lock}; flock 8;
 gpuunlock() { flock -u 8 2>/dev/null; exec 8>&- 2>/dev/null; }
 # inkB first (lead 2026-11-12, run5): the locks are taken per ink crop / per wbench box and released in between; a piece starts only
 # while no other process holds or waits for the bench lock (inkB's runner: flock /tmp/gpu0-bench.lock CMD)
-yieldgpu() { while pgrep -f '^flock /tmp/gpu0-bench.lock' > /dev/null; do sleep 60; done; exec 9> $E/gpu0.lock; flock 9; gpulock; }
+inkbwait() { local p; for p in $(pgrep -f '^flock /tmp/gpu0-bench.lock'); do [ "$(ps -o state= -p $p)" != T ] && return 0; done; return 1; }   # (a stopped waiter, state T, is paused by its owner)
+yieldgpu() { while inkbwait; do sleep 60; done; exec 9> $E/gpu0.lock; flock 9; gpulock; }
 release() { gpuunlock; flock -u 9 2>/dev/null; exec 9>&- 2>/dev/null; }
 gpu0free() { until [ -e $US/p4rv.done ] && [ -e $US/perf2.done ] && [ -e $US/p4col.done ] && ! pgrep -f "$US/(rvside|p4rv|p1299|unrollperf)|unrollperf" > /dev/null \
     && ! perfopen && ! gpu0busy && sleep 30 && ! gpu0busy; do sleep 60; done; }
