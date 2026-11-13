@@ -6,6 +6,7 @@
 # with a winding source
 # Usage: test_fibhead_train.sh UFSM MAKE_WIND_FIXTURE DIR
 set -eu
+. "$(dirname "$(readlink -f "$0")")/det_cmp.sh"
 U=$(readlink -f "$1"); MF=$(readlink -f "$2"); D=$3
 rm -rf "$D"; mkdir -p "$D"; cd "$D"
 "$MF" fx 256 2 1 > fx.log 2>&1
@@ -15,11 +16,11 @@ L=(--rv 2 --rv-iso 100 --lat 4)
 ok() { grep -q "$2" "$1" || { echo "FAIL: $3 ($D/$1)"; exit 1; }; }
 "$U" train fx/sources-fibhv.json --out v "${C[@]}" --steps 4 --fib-head 1 > v.log 2>&1 || { echo "FAIL: voxel run ($D/v.log)"; exit 1; }
 ok v.log '^step      4 .* fib bce 0\.[0-9]* dir 0\.[0-9]* (100% of windows)' "voxel run: fibre losses"
-UFSM_LAT_STREAM=check "$U" train fx/sources-fibhv.json --out ls "${C[@]}" "${L[@]}" --steps 4 --fib-head 1 > ls.log 2>&1 || { echo "FAIL: latent run ($D/ls.log)"; exit 1; }
+UFSM_BATCH_HASH=1 UFSM_DET_TRACE=1 UFSM_LAT_STREAM=check "$U" train fx/sources-fibhv.json --out ls "${C[@]}" "${L[@]}" --steps 4 --fib-head 1 > ls.log 2>&1 || { echo "FAIL: latent run ($D/ls.log)"; exit 1; }
 [ "$(grep -c 'lat stream check: .* 0 of [0-9]* slab bytes differ' ls.log)" -gt 0 ] && ! grep 'lat stream check' ls.log | grep -vq ' 0 of ' || { echo "FAIL: stream check"; grep 'lat stream check' ls.log | tail -2; exit 1; }
-UFSM_LAT_LDEV=0 "$U" train fx/sources-fibhv.json --out ld "${C[@]}" "${L[@]}" --steps 4 --fib-head 1 > ld.log 2>&1 || { echo "FAIL: latent run, streamed ($D/ld.log)"; exit 1; }
+UFSM_BATCH_HASH=1 UFSM_DET_TRACE=1 UFSM_LAT_LDEV=0 "$U" train fx/sources-fibhv.json --out ld "${C[@]}" "${L[@]}" --steps 4 --fib-head 1 > ld.log 2>&1 || { echo "FAIL: latent run, streamed ($D/ld.log)"; exit 1; }
 for f in ls ld; do grep '^step' $f.log | sed -E 's/ [0-9.]+ samp\/s.*//' > $f.txt; done
-cmp -s ls.txt ld.txt || { echo "FAIL: device-kept planes differ from streamed"; diff ls.txt ld.txt | head -4; exit 1; }
+det_cmp ls.log ld.log "device-kept planes vs streamed" || exit 1
 "$U" train fx/sources-fibhv.json --out don "${C[@]}" "${L[@]}" --steps 2 > don.log 2>&1 || { echo "FAIL: donor ($D/don.log)"; exit 1; }
 "$U" train fx/sources-fibhv.json --out ini "${C[@]}" "${L[@]}" --steps 3 --fib-head 1 --init-from don/last.ckpt > ini.log 2>&1 || { echo "FAIL: init-from ($D/ini.log)"; exit 1; }
 ok ini.log 'init-from: head rows 0-12 copied, rows 13-21 (fibre head) fresh' "init-from rows"

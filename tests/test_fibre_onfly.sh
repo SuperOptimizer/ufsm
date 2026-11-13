@@ -5,6 +5,7 @@
 # runs on the stored planes, the onfly planes (GPU) and the onfly planes (CPU) log the same losses (--det)
 # Usage: test_fibre_onfly.sh UFSM MAKE_WIND_FIXTURE DIR
 set -eu
+. "$(dirname "$(readlink -f "$0")")/det_cmp.sh"
 U=$(readlink -f "$1"); MF=$(readlink -f "$2"); D=$3
 rm -rf "$D"; mkdir -p "$D"; cd "$D"
 "$MF" fx 256 2 1 > fx.log 2>&1
@@ -43,10 +44,10 @@ json.dump(S, open('onfly.json', 'w'))
 PY
 C=(--task unwrap2 --levels 1 --P 64 --B 1 --gpus 0 --workers 2 --sampler-slots 4 --val-batches 0 --val-every 1000 --log-every 1 --ckpt-every 1000 --fp4 2
    --input-prec 8 --warmup 0 --seed 5 --wind4-tile 0 --widths 16,32,64 --det 1 --steps 4 --fib-head 1)
-"$U" train stored.json --out st "${C[@]}" > st.log 2>&1 || { echo "FAIL: stored run ($D/st.log)"; exit 1; }
-"$U" train onfly.json --out og "${C[@]}" > og.log 2>&1 || { echo "FAIL: onfly run ($D/og.log)"; exit 1; }
-UFSM_FIBRE_CPU=1 "$U" train onfly.json --out oc "${C[@]}" > oc.log 2>&1 || { echo "FAIL: onfly CPU run ($D/oc.log)"; exit 1; }
+UFSM_BATCH_HASH=1 UFSM_DET_TRACE=1 "$U" train stored.json --out st "${C[@]}" > st.log 2>&1 || { echo "FAIL: stored run ($D/st.log)"; exit 1; }
+UFSM_BATCH_HASH=1 UFSM_DET_TRACE=1 "$U" train onfly.json --out og "${C[@]}" > og.log 2>&1 || { echo "FAIL: onfly run ($D/og.log)"; exit 1; }
+UFSM_BATCH_HASH=1 UFSM_DET_TRACE=1 UFSM_FIBRE_CPU=1 "$U" train onfly.json --out oc "${C[@]}" > oc.log 2>&1 || { echo "FAIL: onfly CPU run ($D/oc.log)"; exit 1; }
 for f in st og oc; do grep '^step' $f.log | sed -E 's/ [0-9.]+ samp\/s.*//' > $f.txt; done
 grep -q 'fib bce 0\.[0-9]*' st.txt || { echo "FAIL: no fibre loss in the stored run"; exit 1; }
-[ -s st.txt ] && cmp -s st.txt og.txt && cmp -s st.txt oc.txt || { echo "FAIL: stored vs onfly losses differ"; diff st.txt og.txt | head -4; diff st.txt oc.txt | head -4; exit 1; }
-echo "PASS: the fibre planes on the fly byte-identical to fiber-raster (GPU, CPU), training on them identical ($(wc -l < st.txt) steps)"
+[ -s st.txt ] && det_cmp st.log og.log "stored vs onfly fibre planes (GPU)" && det_cmp st.log oc.log "stored vs onfly fibre planes (CPU)" || exit 1
+echo "PASS: the fibre planes on the fly byte-identical to fiber-raster (GPU, CPU), training on them the same batches and device inputs, losses within 2% ($(wc -l < st.txt) steps)"

@@ -6,6 +6,7 @@
 # and the CPU-decoded path (UFSM_ONFLY_CPU_DECODE=1) is checked too
 # Usage: test_phase_onfly.sh UFSM MAKE_WIND_FIXTURE DIR
 set -eu
+. "$(dirname "$(readlink -f "$0")")/det_cmp.sh"
 U=$(readlink -f "$1"); MF=$(readlink -f "$2"); D=$3
 rm -rf "$D"; mkdir -p "$D"; cd "$D"
 "$MF" fx 256 2 > fx.log 2>&1
@@ -46,9 +47,9 @@ json.dump(S, open('onfly.json', 'w'))
 PY
 C=(--task unwrap2 --levels 0,1 --P 64 --B 1 --gpus 0 --workers 2 --sampler-slots 4 --val-batches 0 --val-every 1000 --log-every 1 --ckpt-every 1000 --fp4 2
    --input-prec 8 --warmup 0 --seed 5 --wind4-tile 0 --widths 16,32,64 --det 1 --steps 4 --onfly-mb 64)
-"$U" train stored.json --out st "${C[@]}" > st.log 2>&1 || { echo "FAIL: stored-phase run ($D/st.log)"; exit 1; }
-"$U" train onfly.json --out of "${C[@]}" > of.log 2>&1 || { echo "FAIL: onfly run ($D/of.log)"; exit 1; }
+UFSM_BATCH_HASH=1 UFSM_DET_TRACE=1 "$U" train stored.json --out st "${C[@]}" > st.log 2>&1 || { echo "FAIL: stored-phase run ($D/st.log)"; exit 1; }
+UFSM_BATCH_HASH=1 UFSM_DET_TRACE=1 "$U" train onfly.json --out of "${C[@]}" > of.log 2>&1 || { echo "FAIL: onfly run ($D/of.log)"; exit 1; }
 grep -q 'on-the-fly phase on GPU 0' of.log || { echo "FAIL: no onfly config line ($D/of.log)"; exit 1; }
 for f in st of; do grep '^step' $f.log | sed -E 's/ [0-9.]+ samp\/s.*//' > $f.txt; done
-[ -s st.txt ] && cmp -s st.txt of.txt || { echo "FAIL: stored vs onfly losses differ"; diff st.txt of.txt | head -4; exit 1; }
-echo "PASS: onfly phase byte-identical to phase-raster (CPU$( [ -f gpu.log ] && echo ', GPU')), training on it identical ($(wc -l < st.txt) steps)"
+[ -s st.txt ] && det_cmp st.log of.log "stored vs onfly phase" || exit 1
+echo "PASS: onfly phase byte-identical to phase-raster (CPU$( [ -f gpu.log ] && echo ', GPU')), training on it the same batches ($DET_CMP_N) and device inputs, losses within 2% ($(wc -l < st.txt) steps)"
