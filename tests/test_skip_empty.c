@@ -64,6 +64,18 @@ int main(void) {
         CHECK(nm > 0, "masked launches");
         CHECK(em <= 0.05 * mag + 1e-3, "material logits within 5%% of the mean |logit| of the dense ones (%.4g vs %.4g)", em, mag);
     }
+    {   /* the deviation profile by margin: mean |dlogit| per 4-plane band (z from the material top), over the mean |logit| */
+        for (int mg = 1; mg <= 3; mg++) {
+            nn_skip_off(); nn_skip_build(dct, P, P, P, 1, 3, 0, mg);
+            const double a0 = nn_skip_share(0);
+            nn_d2h(lm, unet_forward(u, dx, xs, 0), no * 4);
+            printf("  margin %d (L0 active %.3f): z band: mean |dlogit| / mean |logit|:", mg, a0);
+            for (int z0 = 0; z0 < P; z0 += 4) { double e = 0, m = 0; for (int c = 0; c < os.c; c++) for (int z = z0; z < z0 + 4; z++) for (int i = 0; i < P * P; i++) {
+                    const size_t k = ((size_t)c * P + z) * P * P + i; e += fabs((double)ld[k] - lm[k]); m += fabs(ld[k]); }
+                printf(" %d:%.3f", z0, m > 0 ? e / m : 0); }
+            printf("\n");
+        }
+    }
     {   /* (3) off */
         nn_skip_off();
         nn_d2h(lm, unet_forward(u, dx, xs, 0), no * 4);
