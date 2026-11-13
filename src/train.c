@@ -377,6 +377,13 @@ static int g_sheet_variant=2;
 /* --split z: both GPUs work on the same window, each on its z half plus g_h0 halo planes (depth g_Dl); the mask is zeroed on
    the halo planes (from a pinned zero buffer) so each voxel counts once */
 static int g_Dl, g_h0; static uint8_t *g_zeros;
+static void zeros_realloc(size_t n) {   /* the split halves' zero halo: pinned, or (no GPU: UFSM_SAMPLER_ONLY with CUDA_VISIBLE_DEVICES=, which
+                                           segfaulted on the null pinned buffer, 2026-11-13) plain host memory */
+    static int heap; if (g_zeros) { if (heap) free(g_zeros); else nn_host_free(g_zeros); }
+    g_zeros = nn_host_alloc(n); heap = !g_zeros; if (heap) g_zeros = malloc(n);
+    if (!g_zeros) { fprintf(stderr, "split: cannot allocate the %zu-byte zero halo\n", n); exit(1); }
+    memset(g_zeros, 0, n);
+}
 /* --split z with --lat 4 (g_lsplit): each GPU runs its half as a window of its own, depth g_Pz = g_Dl = P / 2 + g_h0 voxels (g_h0 = 4 x the
    trunk's 2^(L-1) halo cells): the batch arrives as a view of the sampler's P^3 window at plane split_z0 (batch_view: plane pointers offset,
    the radial record with the global depth and the first plane, nn.h NN_RAD_REC word 7), the head slabs mask the halo voxels (hs_clip: the loss
@@ -481,6 +488,44 @@ static void view_set(gpu_state *d, int B) {
 static void axr_set(gpu_state *d, int i) { if (g_axr) unet_set_attn_axis(d->u, d->axv[i] ? d->axh[i] : nullptr, d->axn[i], d->axs[i]); }
 /* once the memory mode is set: the GPU-built input needs the 16-bit -> MX input conversion (unet_input_converted: MX activations with
    MX gradients or an input policy) */
+/* UFSM_SAMPLER_EMPTY=1 (with UFSM_SAMPLER_ONLY): the empty-space opportunity of a skip-empty conv path (DESIGN 2026-11-13 "empty-space
+   skipping"). Per window: each 4^3-voxel cell's CT maximum (the source-grid bytes, before the device augmentation); a cell is empty at
+   threshold t when that maximum is <= t (t 0: all zero, the outside of the scan). Tiles of T^3 cells at level l (T 2^l level-0 cells a
+   side) are active when any of their cells is not empty, dilated by r tiles (Chebyshev); one line a threshold with the active shares */
+static int et_frac(const uint8_t *t8, int nz, int ny, int nx, int f, int r, double *out) {   /* t8: the 8^3-cell level-0 tiles; f: tiles of f x f x f of them */
+    const int mz = (nz + f - 1) / f, my = (ny + f - 1) / f, mx = (nx + f - 1) / f; uint8_t *a = calloc((size_t)mz * my * mx, 1); size_t act = 0;
+    for (int z = 0; z < nz; z++) for (int y = 0; y < ny; y++) for (int x = 0; x < nx; x++) if (t8[((size_t)z * ny + y) * nx + x]) a[((size_t)(z / f) * my + y / f) * mx + x / f] = 1;
+    for (int z = 0; z < mz; z++) for (int y = 0; y < my; y++) for (int x = 0; x < mx; x++) { int on = 0;
+        for (int dz = -r; dz <= r && !on; dz++) for (int dy = -r; dy <= r && !on; dy++) for (int dx = -r; dx <= r && !on; dx++) {
+            const int zz = z + dz, yy = y + dy, xx = x + dx; if (zz < 0 || yy < 0 || xx < 0 || zz >= mz || yy >= my || xx >= mx) continue; on = a[((size_t)zz * my + yy) * mx + xx]; }
+        act += on; }
+    free(a); *out = (double)act / ((double)mz * my * mx); return 0;
+}
+static void empty_tiles_report(const batch *b, int B, int Pz, int P, const sources *S) {
+    const int Dc = Pz / 4, Hc = P / 4; const size_t nc = (size_t)Dc * Hc * Hc, nv = (size_t)Pz * P * P;
+    uint8_t *cm = malloc(nc); if (!cm) return;
+    static const int thr[4] = {0, 16, 40, 64};
+    for (int n = 0; n < B; n++) {
+        const uint8_t *ct = b->ct8 + n * nv; memset(cm, 0, nc);
+        for (int z = 0; z < Pz; z++) for (int y = 0; y < P; y++) { const uint8_t *row = ct + ((size_t)z * P + y) * P; uint8_t *c = cm + ((size_t)(z / 4) * Hc + y / 4) * Hc;
+            for (int x = 0; x < Hc; x++) { uint8_t m = c[x]; for (int k = 0; k < 4; k++) m = row[4 * x + k] > m ? row[4 * x + k] : m; c[x] = m; } }
+        const int si = b->src ? b->src[n] : -1, lv = b->level ? b->level[n] : -1;
+        const int tz = (Dc + 7) / 8, ty = (Hc + 7) / 8; uint8_t *t8 = malloc((size_t)tz * ty * ty);
+        for (int k = 0; k < 4; k++) {
+            size_t ne = 0; memset(t8, 0, (size_t)tz * ty * ty);
+            for (int z = 0; z < Dc; z++) for (int y = 0; y < Hc; y++) for (int x = 0; x < Hc; x++) { const int e = cm[((size_t)z * Hc + y) * Hc + x] <= thr[k]; ne += e; if (!e) t8[((size_t)(z / 8) * ty + y / 8) * ty + x / 8] = 1; }
+            double f[12]; int j = 0;
+            for (int r = 0; r <= 2; r++) et_frac(t8, tz, ty, ty, 1, r, &f[j++]);   /* level 0, 8^3-cell tiles */
+            for (int l = 1; l <= 3; l++) et_frac(t8, tz, ty, ty, 1 << l, 1, &f[j++]);   /* level l, 8^3 level-l cells, r 1 */
+            et_frac(t8, tz, ty, ty, 2, 0, &f[j++]); et_frac(t8, tz, ty, ty, 2, 1, &f[j++]);   /* level 0, 16^3-cell tiles */
+            et_frac(t8, tz / 2, ty, ty, 1, 1, &f[j++]); et_frac(t8 + (size_t)(tz / 2) * ty * ty, tz - tz / 2, ty, ty, 1, 1, &f[j++]);   /* --split z: each card's half (r 1) */
+            fprintf(stderr, "empty: %-32s lev %d t %2d cells %.3f | T8 L0 r0 %.3f r1 %.3f r2 %.3f L1 %.3f L2 %.3f L3 %.3f | T16 L0 r0 %.3f r1 %.3f | halves %.3f %.3f\n",
+                    si >= 0 && si < S->n ? S->src[si].name : "?", lv, thr[k], (double)ne / nc, f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8], f[9]);
+        }
+        free(t8);
+    }
+    free(cm);
+}
 static void gpu_input_settle(sample_cfg *sc, int assume_mx) {   /* (assume_mx: UFSM_SAMPLER_ONLY, no network: as with an MX input) */
     g_gpu_in = g_gpu_want && (assume_mx || unet_input_converted());
     g_xs = g_gpu_in ? 1 : g_xc; sc->gpu_input = g_gpu_in;
@@ -2660,7 +2705,7 @@ int cmd_train(int argc, char **argv) {
         if (ng != 2) { fprintf(stderr, "--split z needs --gpus with two devices\n"); return 2; }
         if (P % (2 * g_h0)) { fprintf(stderr, "--split z: P must be divisible by %d\n", 2 * g_h0); return 2; }
         if (overfit || getenv("UFSM_SYNC_UPLOAD") || !nn_get_tf32()) { fprintf(stderr, "--split z: not with --overfit, UFSM_SYNC_UPLOAD or --fp32\n"); return 2; }
-        g_zeros = nn_host_alloc((size_t)g_h0 * P * P); memset(g_zeros, 0, (size_t)g_h0 * P * P);
+        zeros_realloc((size_t)g_h0 * P * P);
     }
     {   /* --half-res pool|pack: the network runs on 2x2x2 blocks of the window (nn.h nn_half_*); the checkpoint decides on resume */
         const char *hr = opt(argc, argv, "--half-res", "none");
@@ -2677,7 +2722,7 @@ int cmd_train(int argc, char **argv) {
             if (split) {   /* the halo in voxels: 4 per trunk cell (g_lsplit above) */
                 g_lsplit = 1; g_h0 = 4 << (g_split_top ? g_split_top : cfg.nlev - 1); g_Dl = P / 2 + g_h0;
                 if (P % (2 * g_h0) || B != 1) { fprintf(stderr, "--lat 4 --split z: B 1, P divisible by %d\n", 2 * g_h0); return 2; }
-                nn_host_free(g_zeros); g_zeros = nn_host_alloc((size_t)g_h0 * P * P); memset(g_zeros, 0, (size_t)g_h0 * P * P);
+                zeros_realloc((size_t)g_h0 * P * P);
             }
             if (!nn_get_f16()) { fprintf(stderr, "--lat 4: fp16 training (--f16 1)\n"); return 2; }
             if (P % (4 << (cfg.nlev - 1)) || (!g_lsplit && g_Pz % (4 << (cfg.nlev - 1)))) { fprintf(stderr, "--lat 4: P must be divisible by %d\n", 4 << (cfg.nlev - 1)); return 2; }
@@ -3215,6 +3260,7 @@ int cmd_train(int argc, char **argv) {
                     }
                     cov[si][0] += 1; cov[si][1] += (double)mat / nv; cov[si][2] += (double)ph / nv; cov[si][3] += mat ? (double)phm / mat : 0; cov[si][4] += (double)w4 / nv;
                 }
+                if (ufsm_env_on("UFSM_SAMPLER_EMPTY") && b->ct8 && !b->use) empty_tiles_report(b, B, g_Pz, P, S);
                 sampler_release(sq, b);
                 if ((i + 1) % 10 == 0 || i + 1 == nb) { const double dt = now() - t0 - tf;
                     fprintf(stderr, "sampler-only: %d batches, %.1f s (first %.1f s), %.1f Mvox/s after the first\n", i + 1, now() - t0, tf, i > 0 ? (double)i * B * g_Pz * P * P / 1e6 / dt : 0.); }
