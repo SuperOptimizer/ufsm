@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # scripts/univ/b3_queue.sh: after b3_1299.sh, redo the PHerc1218 gate (its 2026-11-11 run was killed by systemd-oomd when the dev slice
 # filled; the labels are kept, so good.sh goes straight to the gate) with JOBS=8, then the Paris 4 July codes (b1_p4B48.sh).
+# Desk rule (2026-11-12): run through ~/bin/lowprio (nice 19, idle I/O), threads / gate jobs <= 8, so the live trainer's loader is not starved.
 set -u; H=$(cd "$(dirname "$0")/../.." && pwd); B3=/mnt/scratch/univ/b3
 until ! pgrep -f "univ/b3_1299[.]sh" > /dev/null; do sleep 120; done
 rmdir $B3/good/PHerc1218.claim 2> /dev/null   # (the dead run's claim; good.sh re-creates its own output dir)

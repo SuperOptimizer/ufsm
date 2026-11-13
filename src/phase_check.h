@@ -11,6 +11,12 @@
    by under 60 codes (mod 252: a sheet's wrap 251 -> 0 is +1), their radial projection |g_r| > 0.5 counted, *up the ones rising
    outward of *tot. The same rule as phcmp/signcheck.py (2026-10-19). */
 void phase_outward_count(const uint8_t *p, const int n[3], int64_t y0, int64_t x0, const double *cy, const double *cx, size_t *up, size_t *tot);
+/* The check to use on a deformed scroll (2026-11-12, PHerc1299): phase_outward_count's share is confounded with the sheets' orientation
+   (per 128^3 cell it correlates 0.83 with the mean |cos| between the phase gradient and the radius; where the sheets run along the
+   radius the sign of the radial component is noise, and a 0.95 threshold threw out 64% of correct labels). Here only voxels whose
+   in-plane gradient (both forward differences known, under 60 codes, at least 3 codes / voxel together) lies within acos(min_cos) of the radius are
+   counted: *up of *tot rise outward. On PHerc1299 the share is 1.000 / 0.996 in the cells whose raw score is >= 0.95 / 0.90-0.95. */
+void phase_outward_aligned(const uint8_t *p, const int n[3], int64_t y0, int64_t x0, const double *cy, const double *cx, double min_cos, size_t *up, size_t *tot);
 
 /* agreement of two phases on one grid, in turns |d| (circular): bins < 0.05, 0.05..0.1, 0.1..0.2, 0.2..0.4, >= 0.4 */
 enum { PHASE_AGREE_BINS = 5 };

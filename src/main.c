@@ -708,6 +708,12 @@ static int cmd_phase_onfly(int argc, char **argv) {
     const int ri = arg_index(argc, argv, "--ref");
     if (ri > 0) { if (ri + 2 >= argc || !(ref = z3_open(store_open(argv[ri + 1]), argv[ri + 2], nullptr))) { fprintf(stderr, "phase-onfly: --ref ROOT KEY: %s\n", z3_error()); return 1; }
         if (memcmp(z3_meta_of(ref)->shape, z3_meta_of(ph)->shape, sizeof z3_meta_of(ph)->shape)) { fprintf(stderr, "phase-onfly: --ref shape differs from the codes'\n"); return 1; } }
+    /* --weight ROOT KEY (with --ref): a sampler phase weight on the same grid; the differences are also counted where it is non-zero (the
+       voxels training can draw: a stored phase with ignored voxels baked unknown differs from the rule there, under a zero weight) */
+    const int wgi = arg_index(argc, argv, "--weight"); z3 *wz = nullptr;
+    if (wgi > 0 && (!ref || wgi + 2 >= argc || !(wz = z3_open(store_open(argv[wgi + 1]), argv[wgi + 2], nullptr)) || memcmp(z3_meta_of(wz)->shape, z3_meta_of(ph)->shape, sizeof z3_meta_of(ph)->shape))) {
+        fprintf(stderr, "phase-onfly: --weight ROOT KEY needs --ref and the codes' shape\n"); return 1; }
+    size_t wbad = 0, wpos = 0, wunk[2] = {0, 0}; int wmax = 0;
     int64_t g[3]; uint8_t *bits = nullptr; const int64_t np = z3_chunk_map(ref ? ref : c, g, &bits);
     if (np <= 0) { fprintf(stderr, "phase-onfly: no chunks\n"); return 1; }
     const z3_meta *m = z3_meta_of(ph); const size_t N = (size_t)P * P * P;
@@ -727,13 +733,19 @@ static int cmd_phase_onfly(int argc, char **argv) {
         size_t d = 0, kn = 0; for (size_t i = 0; i < N; i++) kn += a[i] < PHASE_PERIOD;
         if (ref) { if (z3_read(ref, o, n, b, nt)) { fprintf(stderr, "phase-onfly: ref read failed: %s\n", z3_error()); return 1; } for (size_t i = 0; i < N; i++) d += a[i] != b[i]; }
         bad += d;
+        if (wz) { uint8_t *w = malloc(N); if (!w || z3_read(wz, o, n, w, nt)) { fprintf(stderr, "phase-onfly: weight read failed: %s\n", z3_error()); return 1; }
+            size_t dw = 0, pw = 0;
+            for (size_t i = 0; i < N; i++) { if (!w[i]) continue; pw++; if (a[i] == b[i]) continue; dw++;
+                if (a[i] >= PHASE_PERIOD) wunk[0]++; else if (b[i] >= PHASE_PERIOD) wunk[1]++; else { int e = abs((int)a[i] - (int)b[i]); if (e > PHASE_PERIOD / 2) e = PHASE_PERIOD - e; if (e > wmax) wmax = e; } }
+            wbad += dw; wpos += pw; free(w); printf("  weighted voxels %zu, differing among them %zu\n", pw, dw); }
         printf("window %lld at %lld,%lld,%lld: %.0f ms (pair %.0f, codes read %.0f), tiles %llu (+%llu empty), %.2f known, %s%zu differing\n", (long long)wi, (long long)o[0], (long long)o[1], (long long)o[2],
                1e3 * dt, 1e3 * (s1.s_pair - s0.s_pair), 1e3 * (s1.s_read - s0.s_read), (unsigned long long)(s1.tiles - s0.tiles), (unsigned long long)(s1.skipped - s0.skipped), (double)kn / N, ref ? "" : "(no ref) ", d);
         fflush(stdout); wi++; k++;
     }
     phase_onfly_stats st; phase_onfly_get_stats(&st);
     printf("phase-onfly: %lld windows, %.0f ms per window, tile voxels / output %.2f, %llu of %llu tiles decoded on the GPU, %zu differing voxels%s\n", (long long)wi, 1e3 * tsum / (wi ? wi : 1), (double)st.vox_tile / (st.vox_out ? st.vox_out : 1), (unsigned long long)st.gpu_tiles, (unsigned long long)st.tiles, bad, ref ? (bad ? ": FAIL" : ": byte-identical") : "");
-    free(a); free(b); free(bits); z3_close(ph); z3_close(ref);
+    if (wz) printf("phase-onfly: under a non-zero weight: %zu voxels, %zu differing (%zu unknown on the fly, %zu unknown in the reference, the rest by up to %d codes)\n", wpos, wbad, wunk[0], wunk[1], wmax);
+    free(a); free(b); free(bits); z3_close(ph); z3_close(ref); z3_close(wz);
     return bad ? 1 : 0;
 }
 
@@ -746,6 +758,8 @@ static int cmd_phase_onfly(int argc, char **argv) {
    phase grid --phase-um (default: the key). --sign -1 reads it negated (a sources "phase_sign": -1). --box: only chunks meeting a box
    of scan voxels. One line on stdout: "phase-check <root>/<key> outward F boxes B pairs N ... known V voxels M mm3 chunks C densest
    z,y,x pass|FAIL" (densest: the centre of the chunk with the most known voxels, scan voxels, with --count).
+   --cells OUT.tsv: one row per scored chunk (cz cy cx, pairs, rising outward, aligned pairs, aligned rising outward); the aligned
+   counts (phase_outward_aligned, --aligned-cos 0.7) are the direction check to trust where sheets do not face the axis (stderr line).
    Exit 0 when F >= --min, 3 below it, 4 without gradient data. */
 typedef struct { z3 *z; const int64_t *list; size_t n; atomic_size_t next; uint32_t *cnt; atomic_int fail; } pcheck_job;
 static void *pcheck_count(void *arg) {
@@ -798,7 +812,10 @@ static int cmd_phase_check(int argc, char **argv) {
     for (size_t i = 0; i < nl; i++) if (!count || cnt[i] >= mink * (double)c3) cand[nc++] = list[i];
     if (count && nc < (size_t)nbox) { nc = 0; for (size_t i = 0; i < nl; i++) if (cnt[i] >= 2000) cand[nc++] = list[i]; }   /* sparse labels: any chunk with some phase */
     uint8_t *b = malloc(c3); double *cy = malloc(m->chunk[0] * sizeof *cy), *cx = malloc(m->chunk[0] * sizeof *cx);
-    size_t up = 0, tot = 0; int used = 0; double fmin = 1, fmax = 0;
+    size_t up = 0, tot = 0, aup = 0, atot = 0; int used = 0; double fmin = 1, fmax = 0;
+    const double acos_min = atof(opt(argc, argv, "--aligned-cos", "0.7")); const char *cellp = opt(argc, argv, "--cells", nullptr);
+    FILE *cells = cellp ? fopen(cellp, "w") : nullptr; if (cellp && !cells) { fprintf(stderr, "phase-check: cannot write %s\n", cellp); return 1; }
+    if (cells) fprintf(cells, "# chunk cz cy cx (x %d phase voxels), pairs, rising outward, aligned pairs (|cos| to the radius > %g), aligned rising outward\n", (int)m->chunk[0], acos_min);
     const size_t want = (size_t)nbox, stride = nc > want ? nc / want : 1;
     for (size_t i = stride / 2; i < nc && used < nbox; i += stride) {
         const int64_t k = cand[i], c[3] = {k / (g[1] * g[2]), (k / g[2]) % g[1], k % g[2]};
@@ -809,6 +826,8 @@ static int cmd_phase_check(int argc, char **argv) {
         size_t u = 0, t = 0; const int ni[3] = {m->chunk[0], m->chunk[1], m->chunk[2]};
         phase_outward_count(b, ni, o[1], o[2], cy, cx, &u, &t);
         if (t < 200) continue;
+        size_t au = 0, at = 0; phase_outward_aligned(b, ni, o[1], o[2], cy, cx, acos_min, &au, &at); aup += au; atot += at;
+        if (cells) fprintf(cells, "%lld\t%lld\t%lld\t%zu\t%zu\t%zu\t%zu\n", (long long)c[0], (long long)c[1], (long long)c[2], t, u, at, au);
         up += u; tot += t; used++; const double fr = (double)u / (double)t; if (fr < fmin) fmin = fr; if (fr > fmax) fmax = fr;
         if (atoi(opt(argc, argv, "--verbose", "0"))) fprintf(stderr, "phase-check: chunk %lld,%lld,%lld (scan z %.0f, r %.0f): outward %.3f of %zu\n", (long long)c[0], (long long)c[1], (long long)c[2],
                                                               (o[0] + m->chunk[0] / 2) * f, hypot((double)(o[1] + m->chunk[1] / 2) - cy[m->chunk[0] / 2], (double)(o[2] + m->chunk[2] / 2) - cx[m->chunk[0] / 2]) * f, fr, t);
@@ -819,6 +838,8 @@ static int cmd_phase_check(int argc, char **argv) {
         for (int d = 0; d < 3; d++) dc[d] = llround(((double)c[d] + 0.5) * m->chunk[d] * f); }
     const double F = tot ? (double)up / (double)tot : NAN, mm3 = (double)known * pow(phase_um * 1e-3, 3);
     const char *verdict = !tot ? "NODATA" : F >= minf ? "pass" : "FAIL";
+    if (cells) fclose(cells);
+    fprintf(stderr, "phase-check: aligned voxels (|cos| to the radius > %g): %.4f of %zu rise outward (%.3f of the pairs are aligned)\n", acos_min, atot ? (double)aup / (double)atot : NAN, atot, tot ? (double)atot / (double)tot : 0.);
     printf("phase-check %s/%s outward %.4f boxes %d pairs %zu box-range %.3f..%.3f known %s%zu voxels %.1f mm3 chunks %zu densest %lld,%lld,%lld %s\n", argv[2], argv[3], F, used, tot, used ? fmin : NAN, used ? fmax : NAN,
            count ? "" : "(not counted) ", known, mm3, nl, dc[0], dc[1], dc[2], verdict);
     free(b); free(cy); free(cx); free(cand); free(cnt); free(list); z3_close(z);
