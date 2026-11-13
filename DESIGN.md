@@ -6,6 +6,35 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## --split z: the encoder gradient bug was the GroupNorm backward's count, plus the first step's scroll axis records (2026-11-13, branch s2fix-20261113)
+
+Symptom: under `--split z`, encoder weight gradients differed from the one-GPU run (relative 4e-3 at enc3, 0.29 at enc0.c1). It showed
+only with a scroll axis and a level width >= 64. Loss, logits, decoded inputs and decoder gradients were identical. Repro: the trainer
+A/B `runs/s2fix/ab2.sh` (P 256, 32,32,64,64, `--fp4 2`, fibre sources with axis, both halves on GPU 0, UFSM_GRAD_DUMP step 1).
+
+Bisected with the GroupNorm backward dumps (UFSM_GNB_DUMP + UFSM_GNB_TDUMP: per call the summed statistics and the x / gy tensors).
+dec2's GroupNorm backward had identical x, gy and summed statistics, yet its output dy differed (3e-4) on both halves; enc3's gy
+followed, then every level above it. Cause: the halves scaled the summed group sums by f = D_local / D_whole (10 / 16 at level 2),
+and the apply kernels divided by the local count cpg * S_local. In exact arithmetic that equals the one-GPU AB / (cpg * S_whole), but
+in fp32 it is off in the last bit. MX-fp8 rounding of the gradient flipped some of those values, and the fp4 encoder amplified the
+flips. The width / axis dependence was only which values happened to flip; no halo, skip, all-gather or channel-block path was
+involved. Fix: gn_group_sums_k divides by the whole window's count (gn_bwd_reduce returns its voxels per channel), and the six apply
+kernels (lp_mx_gnbwd.cu, nn_common.cuh) read AB as is. Without the split, the operations and their order are unchanged.
+
+Second bug, found on the 6-level `--split-top 3` + `--attn-pe scroll` A/B: the split path's first upload never called axr_set. The
+first step's scroll RoPE therefore ran without the window's axis records ("rays along the grid rows"), and attention wo and gfilm
+gradients were 0.22 / 0.13 off. From step 2 on, select_buf set them, so only step 1 was affected. Fixed.
+
+| A/B (split vs one GPU, grad rel) | before | after | one vs rerun |
+|---|---|---|---|
+| 4 levels 32,32,64,64, axis | 4.7e-2 | 1.35e-7 | 1.3e-7 |
+| 6 levels 32,32,64,64,96,96 + attention (scroll), gfilm, gn-ema, split-top 3 | 1.4e-2 (wo 0.22, gfilm 0.13) | 1.2e-7 | - |
+
+Regression test `test_split_gnbwd` (fast tier): the MX GroupNorm backward of a 16-plane window in two halves (+2 halo planes) vs whole,
+for C 32 / 64, MX-fp4 / fp8 x, fp32 / MX-fp8 gradients. It has one gradient voxel per channel and half, so the statistics are exact sums
+on both runs (sums of many terms differ in the last bit by partition, by design). The owned gx must be bit-identical. Before the fix
+6-19k of 18-37k values differed in the fp32 cases; after, 0.
+
 ## Split-window input builders: every --gpu-aug builder by z range, the scanner split exactly across two GPUs (2026-11-13, branch augz-20261112)
 
 ## Muon variants for the from-scratch universal net: ten arms on the 92 M net (2026-11-13, branch muonx-20261113)

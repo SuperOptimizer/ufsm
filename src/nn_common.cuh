@@ -1739,19 +1739,19 @@ __global__ void gn_silu_bwd_stats_k(const TI *x, const TG *gy, const float *gamm
     for (int o = 128; o > 0; o >>= 1) { if (threadIdx.x < o) { r1[threadIdx.x] += r1[threadIdx.x + o]; r2[threadIdx.x] += r2[threadIdx.x + o]; } __syncthreads(); }
     if (threadIdx.x == 0) { atomicAdd(&ds[2 * nc], r1[0]); atomicAdd(&ds[2 * nc + 1], r2[0]); }
 }
-__global__ void gn_group_sums_k(const float *st, const float *gamma, int N, int C, int G, float *AB, float f = 1.f);
+__global__ void gn_group_sums_k(const float *st, const float *gamma, int N, int C, int G, float *AB, float f, size_t S);
 /* spatial split: the per-(n, c) backward sums ds (2 NC doubles) of this GPU give its share of the GroupNorm parameter
-   gradients (summed across GPUs with the weight gradients), then are summed across the GPUs for the group sums AB, which the
-   apply kernels divide by their local element count: f rescales them to the whole window's count */
+   gradients (summed across GPUs with the weight gradients), then are summed across the GPUs for the group sums AB, divided by the
+   whole window's element count in gn_group_sums_k (gn_bwd_reduce returns its voxels per channel): the apply kernels read AB as is */
 __global__ void gn_param_grad_k2(const float *st, float *ggamma, float *gbeta, int N, int C);
-float gn_bwd_reduce(double *ds, float *st, int NC, int D, float *ggamma, float *gbeta, int N, int C);
+size_t gn_bwd_reduce(double *ds, float *st, int NC, int D, size_t S, float *ggamma, float *gbeta, int N, int C);
 template <typename TI, typename TG, typename TO>
 __global__ void gn_silu_bwd_apply_k(const TI *x, const TG *gy, const float *gamma, const float *beta, const float *mean, const float *rstd, const float *AB,
                                     TO *gx, int C, int G, size_t S) {
     int nc = blockIdx.x, slab = blockIdx.y, n = nc / C, c = nc % C, cpg = C / G, ng = n * G + c / cpg;
     float A = AB[2 * ng], B = AB[2 * ng + 1];
-    float len = (float)cpg * (float)S, m = mean[ng], r = rstd[ng], ga = gamma[c], be = beta[c];
-    float ka = A / len, kb = B / len;
+    float m = mean[ng], r = rstd[ng], ga = gamma[c], be = beta[c];
+    float ka = A, kb = B;   /* (gn_group_sums_k: already / len) */
     const TI *xp = x + (size_t)nc * S; const TG *gp = gy + (size_t)nc * S; TO *op = gx + (size_t)nc * S;
     size_t lo, hi; slab_range(S, slab, &lo, &hi);
     if (!(S & 3)) {
@@ -1786,8 +1786,8 @@ static void gn_silu_bwd_t(const TI *x, shape5 s, int G, const float *gamma, cons
     d2f_k<<<nblk(2 * NC, 128), 128>>>(ds, scratch, 2 * NC);
     float *AB = scratch + 2 * NC;   /* scratch holds 2*NC stats followed by 2*N*G group sums (nn_gn_scratch sized accordingly) */
     const int zsp = zs_on();
-    const float f = gn_bwd_reduce(ds, scratch, NC, s.d, ggamma, gbeta, s.n, s.c);   /* spatial split: local param grads, global sums */
-    gn_group_sums_k<<<nblk(s.n * G, 128), 128>>>(scratch, gamma, s.n, s.c, G, AB, g_gn_const ? 0.f : f);
+    const size_t Sw = gn_bwd_reduce(ds, scratch, NC, s.d, shape_spatial(s), ggamma, gbeta, s.n, s.c);   /* spatial split: local param grads, global sums */
+    gn_group_sums_k<<<nblk(s.n * G, 128), 128>>>(scratch, gamma, s.n, s.c, G, AB, g_gn_const ? 0.f : 1.f, Sw);
     gn_silu_bwd_apply_k<<<dim3(NC, nsl), 256>>>(x, gy, gamma, beta, mean, rstd, AB, gx, s.c, G, S);
     if (!zsp) gn_param_grad_k2<<<nblk(s.c, 128), 128>>>(scratch, ggamma, gbeta, s.n, s.c);
     KCHECK();

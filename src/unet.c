@@ -482,6 +482,8 @@ unet *unet_create(const unet_cfg *cfg) {
         for (int i = 0; i < L - 1; i++) fprintf(stderr, "down%d w %zu b %zu\n", i, u->down[i].w, u->down[i].b);
         for (int i = L - 2; i >= 0; i--) fprintf(stderr, "dec%d c1.w %zu c1.b %zu n1 %zu c2.w %zu c2.b %zu n2 %zu\n", i, u->dec[i].c1.w, u->dec[i].c1.b, u->dec[i].n1.gamma, u->dec[i].c2.w, u->dec[i].c2.b, u->dec[i].n2.gamma);
         fprintf(stderr, "head w %zu b %zu total %zu\n", u->head.w, u->head.b, off);
+        if (u->tba) { fprintf(stderr, "attn %zu..%zu", u->tb_p0, u->tb_p1); for (int k = 0; k < cfg->attn_blocks; k++) fprintf(stderr, " | blk%d qkv %zu o %zu w1 %zu w2 %zu", k, u->tbp[k].wqkv, u->tbp[k].wo, u->tbp[k].w1, u->tbp[k].w2); fprintf(stderr, "\n"); }
+        fprintf(stderr, "film %zu fstem %zu gfilm %zu\n", u->film_off, u->fstem_off, u->gf_off);
     }
     u->p = nn_malloc(off * 4); u->g = nn_malloc(off * 4); u->m = nn_malloc(off * 4); u->v = nn_malloc(off * 4); u->ema = nn_malloc(off * 4);
     nn_zero(u->g, off * 4); nn_zero(u->m, off * 4); nn_zero(u->v, off * 4);
@@ -2727,6 +2729,11 @@ const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x
             const size_t nb = nn_mx_bytes(xs, unet_input_prec()); uint8_t *h = malloc(nb); nn_sync(); nn_d2h(h, u->xin, nb);
             uint64_t f = 1469598103934665603ull; for (size_t k = 0; k < nb; k++) f = (f ^ h[k]) * 1099511628211ull;
             fprintf(stderr, "xin hash %016llx (%zu bytes)\n", (unsigned long long)f, nb); free(h);
+        }
+        if (getenv("UFSM_XIN_DUMP")) {   /* diagnostic: the converted input as fp32 [n][c][d][h][w], one file per call (PREFIX.k; split A/Bs) */
+            static int k_; const size_t ne = shape_numel(xs); float *df = nn_malloc(ne * 4), *hf = malloc(ne * 4); tb_to_f32(u->xin, xs, 0, df); nn_sync(); nn_d2h(hf, df, ne * 4);
+            char fn_[1100]; snprintf(fn_, sizeof fn_, "%s.%d", getenv("UFSM_XIN_DUMP"), k_++); FILE *f = fopen(fn_, "wb"); if (f) { fwrite(hf, 4, ne, f); fclose(f); }
+            fprintf(stderr, "xin dump %s: %d x %d x %d x %d x %d\n", fn_, xs.n, xs.c, xs.d, xs.h, xs.w); nn_free(df); free(hf);
         }
     }
     if (u->rad && !(x_h16 && act_mx8() && xin_mx && !u->ctin.on)) { fprintf(stderr, "unet_forward_x: radial input records need the 16-bit -> MX input conversion\n"); abort(); }

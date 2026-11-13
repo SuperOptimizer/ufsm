@@ -1190,6 +1190,11 @@ static void head_slab_pass(gpu_state *d, int pass) {
         const int q0 = z0 / 4 - 1, qc = Z / 4 + 2, qa = q0 > 0 ? q0 : 0, qb = z1 / 4 + 1 < D / 4 ? z1 / 4 + 1 : D / 4;   /* g_lat_hs: the cell planes [qa, qb) this slab reads / adds to; the rolling buffers start at plane q0 */
         if (g_lat_hs) {
             if (unet_head_fwd_z(d->u, qa, qb, d->lgc)) { fprintf(stderr, "latent head stream: the head is not covered per slab (UFSM_LAT_HEAD_STREAM=0)\n"); abort(); }
+            if (!pass && getenv("UFSM_LGC_DUMP")) {   /* diagnostic: the first statistics pass's cell logits per slab, appended: int32 qa, qb (local cells), fp16 [LNC][qb - qa][plane] */
+                static int dn_[3]; if (dn_[d->side + 1] < 1) { const size_t nb = (size_t)LNC * (qb - qa) * (H / 4) * (W / 4) * 2; void *hb = malloc(nb); nn_sync(); nn_d2h(hb, d->lgc, nb);
+                    char fn_[1100]; snprintf(fn_, sizeof fn_, "%s%s", getenv("UFSM_LGC_DUMP"), d->side == 0 ? ".s0" : d->side == 1 ? ".s1" : ""); FILE *f = fopen(fn_, z0 ? "ab" : "wb");
+                    if (f) { const int32_t q2[2] = {qa, qb}; fwrite(q2, 4, 2, f); fwrite(hb, 1, nb, f); fclose(f); } free(hb); if (z1 == D) dn_[d->side + 1]++; }
+            }
             if (fuse) for (int r = 0; r < 2; r++) { if (fr[r][1] > fr[r][0]) nn_lat_up_slab_c((const char *)d->lgc + (size_t)fr[r][0] * (qb - qa) * (H / 4) * (W / 4) * 2, 1, fr[r][1] - fr[r][0], D / 4, H / 4, W / 4, z0, nz, LGC(fr[r][0]), qa, qb - qa); }
             else nn_lat_up_slab_c(d->lgc, 1, LUPC, D / 4, H / 4, W / 4, z0, nz, d->hs_lg, qa, qb - qa);
         } else if (g_lat) nn_lat_up_slab(d->lg, unet_logits_h16(d->u), LUPC, D / 4, H / 4, W / 4, z0, nz, d->hs_lg);   /* --lat: the cell grid's logits on this slab */
@@ -4175,6 +4180,8 @@ int cmd_train(int argc, char **argv) {
                 double tw = now(); batch *b = sampler_next(sp); wait += now() - tw;
                 if (!b) { fprintf(stderr, "sampler stopped\n"); g_stop = 1; break; }
                 split_upload(sctx, G, 0, b, G[0].cur, G[1].cur, B, P);
+                for (int g = 0; g < 2; g++) { nn_init(G[g].dev); axr_set(&G[g], G[g].cur); }   /* (as the one-GPU path: this batch's scroll axis records; the
+                                                                                               first step ran the scroll RoPE without them, 2026-11-13) */
                 G[0].pending = b;
             }
             for (int g = 0; g < 2; g++) {
