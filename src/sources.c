@@ -235,6 +235,8 @@ sources *sources_load(const char *path) {
         s->ct_key = sdup(json_str(json_get(e, "ct"), ""));
         { const json *mj = json_get(e, "ct_mirror"); const char *mr = json_str(json_get(mj, "root"), nullptr);
           if (mr) { s->ct_ms = store_open(mr); s->ct_mkey = sdup(json_str(json_get(mj, "ct"), s->ct_key)); } }
+        { const json *lj = json_get(e, "latvol"); const char *lr = json_str(json_get(lj, "root"), nullptr);
+          if (lr) { s->lv_s = store_open(lr); s->lv_key = sdup(json_str(json_get(lj, "ct"), s->ct_key)); } }
         s->um = json_num(json_get(e, "um"), 0);
         s->weight = json_num(json_get(e, "weight"), 1.0);
         s->ink_weight = json_num(json_get(e, "ink_weight"), 1.0);
@@ -555,6 +557,7 @@ void sources_free(sources *S) {
     for (int i = 0; i < S->n; i++) {
         source *s = &S->src[i];
         for (int l = 0; l < MAXLEV; l++) z3_close(s->ct[l]);
+        for (int l = 0; l < MAXLEV; l++) z3_close(s->lv[l]);
         for (int l = MAXLEV - 1; l >= 0; l--) { z3_close(s->phase_pl[l]); z3_close(s->phase_ign_pl[l]); }   /* (the pooled views borrow phase / ignore: closed first) */
         if (s->band != s->phase) z3_close(s->band); z3_close(s->phase); z3_close(s->wind); z3_close(s->aux); z3_close(s->phase_ign); z3_close(s->phase_wt); free(s->box); free(s->hold); free(s->hold_rej); free(s->focus); free(s->mask); srpair_free(s->srp);
         for (int c = 0; c < NTG; c++) {
@@ -575,6 +578,7 @@ void sources_free(sources *S) {
         }
         free(s->ax.z); free(s->ax.y); free(s->ax.x);
         free(s->name); free(s->ct_key); free(s->ct_mkey); free(s->view_map);
+        free(s->lv_key); if (s->lv_s) store_close(s->lv_s);
         for (int k = 0; k < s->nxs; k++) free(s->xs_map[k]);
         for (int k = 0; k < s->nemb; k++) free(s->emb_grp[k]);
         free(s->emb_name);
@@ -679,6 +683,20 @@ z3 *source_ct(source *s, int level) {
         if (z) z3_close(z);
     }
     return s->ct[level];
+}
+
+z3 *source_lat(source *s, int level) {
+    if (!s->lv_s || level < 0 || level >= MAXLEV) return nullptr;
+    if (!__atomic_load_n(&s->lv_tried[level], __ATOMIC_ACQUIRE)) {
+        z3 *ct = source_ct(s, level), *z = ct ? open_level(s->lv_s, s->lv_key, level, s->um) : nullptr;
+        if (z && (!z3_latvol(z) || memcmp(z3_meta_of(z)->shape, z3_meta_of(ct)->shape, sizeof z3_meta_of(ct)->shape))) {
+            fprintf(stderr, "source %s: latvol level %d is not a latvol array of the CT's shape: not used\n", s->name, level); z3_close(z); z = nullptr; }
+        pthread_mutex_lock(&g_open_mu);
+        if (!s->lv_tried[level]) { s->lv[level] = z; z = nullptr; __atomic_store_n(&s->lv_tried[level], 1, __ATOMIC_RELEASE); }
+        pthread_mutex_unlock(&g_open_mu);
+        if (z) z3_close(z);
+    }
+    return s->lv[level];
 }
 
 static int fib_same(const struct fib_spec *a, const struct fib_spec *b) {

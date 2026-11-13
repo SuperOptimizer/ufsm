@@ -59,6 +59,8 @@ typedef struct {
     char *name;
     store *s;
     char *ct_key;
+    store *lv_s; char *lv_key; z3 *lv[MAXLEV]; int lv_tried[MAXLEV];   /* "latvol": {"root", "ct"}: the same CT as latent cells (latvol.h), train --lat-direct-p's
+                                                                          direct windows (source_lat: lazily opened, nullptr when absent / not latvol / another shape) */
     store *ct_ms; char *ct_mkey;   /* "ct_mirror": {"root", "ct"}: the levels the source's own store lacks are read from this one (e.g. the HTTP mirror) */
     double um;              /* level-0 voxel size */
     double weight;
@@ -178,6 +180,7 @@ void sources_free(sources *S);
 
 /* Lazily open CT / target arrays. Return nullptr if that level does not exist. */
 z3 *source_ct(source *s, int level);
+z3 *source_lat(source *s, int level);   /* the "latvol" twin of CT level `level` (nullptr: none) */
 z3 *source_tgt(source *s, int ch, int level);          /* pyramid target only */
 /* the stored phase on level `level`'s grid: s->phase at phase_level, a lazily made 2^k pooled view of it at coarser levels (ign 1: the
    "ignore" array the same way); nullptr finer or without one */

@@ -200,6 +200,11 @@ void nn_input_rad_pack(const void *ct16, shape5 xs, const void *rec, void *y);
 void nn_input_lat(const void *ct16, shape5 xs, const void *rec, void *y);
 /* the same with the learned cell transform (latfit.h): xs.c = C + 3 (16 or 32): C quantised coefficients x gain, then the radial means */
 void nn_input_latc(const void *ct16, shape5 xs, const void *rec, const float *bas, const float *gain, int C, float step, void *y);
+/* train --lat-direct-p: rows of window n's cells [cz0, cz0 + ncz) of nn_input_latc's input with the C coefficient channels from stored latvol
+   cells (int8 [ncz][h][w][stride], nn_latvol_decode's layout, raw-domain step step_raw) z-scored with the window's mean / isd (predict's
+   nn_lat_input_qs), the radial channels as nn_input_latc's */
+void nn_input_latq(const void *ct16, shape5 xs, const void *rec, int n, int cz0, int ncz, const void *cells, int stride, const float *gain, int C,
+                   float step_raw, float mean, float isd, void *y);
 /* predict: the same channels from the full-resolution 4-channel fp16 window x ([4][4d][4h][4w]: CT, radial) into y (fp16 [C + 3][d][h][w]) */
 /* predict --latents: the cell channels from a latcomp store's indices q (int8 [d][h][w](C + 1), lc_cli.c layout; raw-domain step) with the window's
    mean / 1 / sd; the radial means from x's channels 1-3 */
