@@ -85,7 +85,7 @@ double fb_tile_w(long long o, int h, int c, double S, double g) {
 
 /* ---- field directories ---- */
 typedef struct {
-    const char *dir; json *j; int zarr, shape[3], h; double um; long long origin[3], off[3], rsh[3];
+    const char *dir; json *j; int zarr, shape[3], h, w4_d; double um; long long origin[3], off[3], rsh[3];
     int np; char *pn[FB_MAXP];   /* the planes present */
 } fb_in;
 static json *read_json(const char *path) {
@@ -99,7 +99,7 @@ static int fb_open(fb_in *I, const char *dir) {
     char p[2048]; snprintf(p, sizeof p, "%s/fields.json", dir);
     if (!(I->j = read_json(p))) { fprintf(stderr, "field-blend: cannot read %s\n", p); return -1; }
     I->zarr = !strcmp(json_str(json_get(I->j, "format"), "raw"), "zarr");
-    I->h = (int)json_num(json_get(I->j, "h"), 8); I->um = json_num(json_get(I->j, "um"), 2.4);
+    I->h = (int)json_num(json_get(I->j, "h"), 8); I->um = json_num(json_get(I->j, "um"), 2.4); I->w4_d = (int)json_num(json_get(I->j, "w4_d"), 32);
     for (int d = 0; d < 3; d++) {
         I->origin[d] = (long long)json_num(json_at(json_get(I->j, "origin"), d), 0); I->shape[d] = (int)json_num(json_at(json_get(I->j, "shape"), d), 0);
         I->off[d] = (long long)json_num(json_at(json_get(I->j, I->zarr ? "zarr_offset" : "raw_offset"), d), 0);
@@ -154,6 +154,18 @@ static void jw(FILE *f, const json *j) {
     }
 }
 
+/* the volcomp q of a plane of a zarr input (sharding_indexed > volcomp; 0: none found): --box output shards are overlaid on the
+   input's own, so they must be coded as its zarr.json says */
+static float fb_plane_q(const fb_in *I, const char *name) {
+    char p[2048]; snprintf(p, sizeof p, "%s/%s/zarr.json", I->dir, name); json *j = read_json(p); if (!j) return 0;
+    float q = 0; const json *c = json_get(j, "codecs");
+    for (size_t a = 0; c && a < c->n; a++) {
+        const json *in = json_get(json_get(c->items[a], "configuration"), "codecs");
+        for (size_t b = 0; in && b < in->n; b++) if (!strcmp(json_str(json_get(in->items[b], "name"), ""), "volcomp")) q = (float)json_num(json_get(json_get(in->items[b], "configuration"), "q"), 0);
+    }
+    json_free(j); return q;
+}
+
 static int is_t(const char *s) { return s[0] == 't' && s[1] >= '0' && s[1] <= '5' && !s[2]; }
 static int is_w4(const char *s) { return !strcmp(s, "dz") || !strcmp(s, "dy") || !strcmp(s, "dx") || !strcmp(s, "dq"); }
 
@@ -163,6 +175,7 @@ typedef struct {
     int n, np, H, W, z0, nz, y0, nchunk, nx, kps, kw4[4];   /* H: the band's rows (of 128 at y0) */ const char **pl; const float *w;
     fb_rd (*R)[FB_MAXIN]; int (*use)[FB_MAXIN]; uint8_t *(*buf)[FB_MAXIN]; uint8_t **obuf; z3w **ZW; atomic_int next, fail;
     const float *aw[3][FB_MAXIN]; int conf;   /* tile weights per input along z, y, x (aw[0][0] nullptr: none); the phase confidence rule */
+    int paste, sub[FB_MAXIN][3], subsh[FB_MAXIN][3];   /* --paste: input i's box in in[0]'s cells (offset, shape) */
 } fb_slab;
 typedef void (*fb_fn)(fb_slab *, int);
 typedef struct { fb_slab *S; fb_fn fn; int njob; } fb_pool;
@@ -181,7 +194,20 @@ static void fb_par(int njob, int nthreads, fb_fn fn, fb_slab *S) {
 }
 static void fb_job_read(fb_slab *S, int j) {
     const int k = j / S->n, i = j % S->n;
-    if (S->use[k][i] && rd_rows(&S->R[k][i], S->z0, S->nz, S->y0, S->H, S->buf[k][i], 1)) atomic_store(&S->fail, 1);
+    if (!S->use[k][i]) return;
+    if (!S->paste || i == 0) { if (rd_rows(&S->R[k][i], S->z0, S->nz, S->y0, S->H, S->buf[k][i], 1)) atomic_store(&S->fail, 1); return; }
+    /* a pasted box: its part inside the band, the rest neutral (its weight is 0 there) */
+    uint8_t *b = S->buf[k][i]; const int *o = S->sub[i], *sh = S->subsh[i];
+    memset(b, !strcmp(S->pl[k], "pc") || !strcmp(S->pl[k], "ps") ? 128 : 0, (size_t)S->nz * S->H * S->W);
+    const int za = S->z0 > o[0] ? S->z0 : o[0], zb = S->z0 + S->nz < o[0] + sh[0] ? S->z0 + S->nz : o[0] + sh[0];
+    const int ya = S->y0 > o[1] ? S->y0 : o[1], yb = S->y0 + S->H < o[1] + sh[1] ? S->y0 + S->H : o[1] + sh[1];
+    const int xa = o[2] > 0 ? o[2] : 0, xb = S->W < o[2] + sh[2] ? S->W : o[2] + sh[2];
+    if (za >= zb || ya >= yb || xa >= xb) return;
+    const int ny = yb - ya, iw = sh[2]; uint8_t *t = malloc((size_t)(zb - za) * ny * iw);
+    if (!t || rd_rows(&S->R[k][i], za - o[0], zb - za, ya - o[1], ny, t, 1)) { free(t); atomic_store(&S->fail, 1); return; }
+    for (int z = za; z < zb; z++) for (int y = ya; y < yb; y++)
+        memcpy(b + ((size_t)(z - S->z0) * S->H + (y - S->y0)) * S->W + xa, t + ((size_t)(z - za) * ny + (y - ya)) * iw + (xa - o[2]), (size_t)(xb - xa));
+    free(t);
 }
 static void fb_job_combine(fb_slab *S, int j) {
     const int k = j / S->nchunk, c = j % S->nchunk, n = S->n; const char *nm = S->pl[k];
@@ -190,7 +216,7 @@ static void fb_job_combine(fb_slab *S, int j) {
     uint8_t *o = S->obuf[k] + c0;
     if (!strcmp(nm, "ps") || (is_w4(nm) && strcmp(nm, "dz"))) return;   /* (done with pc / dz) */
     float *cwb = nullptr; const float *cw[FB_MAXIN] = {0};   /* tile weights of this chunk's cells: wz x wy x wx per input */
-    if (S->aw[0][0] && (!strcmp(nm, "pc") || !strcmp(nm, "dz") || is_t(nm) || !strcmp(nm, "r") || !strcmp(nm, "sp"))) {
+    if (S->aw[0][0] && (!strcmp(nm, "pc") || !strcmp(nm, "dz") || is_t(nm) || !strcmp(nm, "r") || !strcmp(nm, "sp") || (S->paste && !strcmp(nm, "w")))) {
         if (!(cwb = malloc((size_t)n * m * sizeof *cwb))) { atomic_store(&S->fail, 1); return; }
         for (int i = 0; i < n; i++) {
             float *q = cwb + (size_t)i * m; cw[i] = q;
@@ -198,6 +224,10 @@ static void fb_job_combine(fb_slab *S, int j) {
                 const size_t jj = c0 + t; const int x = (int)(jj % S->W), y = (int)(jj / S->W % S->H), z = (int)(jj / ((size_t)S->W * S->H));
                 q[t] = S->aw[0][i][S->z0 + z] * S->aw[1][i][S->y0 + y] * S->aw[2][i][x];
             }
+        }
+        if (S->paste) for (size_t t = 0; t < m; t++) {   /* in[0] takes what the pasted boxes leave */
+            float r = 1; for (int i = 1; i < n; i++) if (src[i]) r -= cwb[(size_t)i * m + t];
+            cwb[t] = r > 1e-6f ? r : 1e-6f;
         }
     }
     const float *const *cwp = cwb ? cw : nullptr;
@@ -211,7 +241,7 @@ static void fb_job_combine(fb_slab *S, int j) {
     }
     else if (is_t(nm) || !strcmp(nm, "r")) fb_mean_cw(n, src, S->w, cwp, m, o);
     else if (!strcmp(nm, "sp")) fb_median_known_cw(n, src, S->w, cwp, m, o);
-    else if (!strcmp(nm, "w")) fb_max(n, src, m, o);
+    else if (!strcmp(nm, "w")) { if (S->paste) fb_mean_cw(n, src, S->w, cwp, m, o); else fb_max(n, src, m, o); }
     else { for (int i = 0; i < n; i++) if (src[i]) { memcpy(o, src[i], m); break; } }   /* passed through */
     free(cwb);
 }
@@ -233,7 +263,26 @@ int fblend_run2(const char *out, int n, const char *const *in, const float *wt, 
     float w[FB_MAXIN]; for (int i = 0; i < n; i++) { w[i] = wt ? wt[i] : 1.f; if (!(w[i] >= 0)) { fprintf(stderr, "field-blend: weights must be >= 0\n"); return 2; } }
     fb_in I[FB_MAXIN]; int rc = 1, nin = 0;
     for (; nin < n; nin++) if (fb_open(&I[nin], in[nin])) { nin++; goto done; }
-    for (int i = 1; i < n; i++) for (int d = 0; d < 3; d++)
+    const int paste = opt && opt->paste;
+    if (opt && opt->box) {   /* only a part of in[0] is written */
+        for (int d = 0; d < 3; d++) {
+            if (opt->b0[d] < 0 || opt->bn[d] < 1 || opt->b0[d] + opt->bn[d] > I[0].shape[d] || opt->b0[d] % FB_ROWS ||
+                (opt->b0[d] + opt->bn[d] < I[0].shape[d] && opt->bn[d] % FB_ROWS)) {
+                fprintf(stderr, "field-blend: --box must lie in %s on its %d-cell shards (axis %d)\n", in[0], FB_ROWS, d); rc = 2; goto done;
+            }
+            I[0].off[d] += opt->b0[d]; I[0].origin[d] += opt->b0[d] * I[0].h; I[0].shape[d] = (int)opt->bn[d];
+        }
+    }
+    int sub[FB_MAXIN][3] = {0};
+    if (paste) for (int i = 1; i < n; i++) {
+        if (fabs(I[i].h * I[i].um - I[0].h * I[0].um) > 1e-6 * I[0].h * I[0].um) { fprintf(stderr, "field-blend: --paste: %s has %.3f um cells, %s %.3f\n", in[i], I[i].h * I[i].um, in[0], I[0].h * I[0].um); rc = 2; goto done; }
+        for (int d = 0; d < 3; d++) {
+            const double c = (I[i].origin[d] * I[i].um - I[0].origin[d] * I[0].um) / (I[0].h * I[0].um);
+            if (fabs(c - round(c)) > 1e-3) { fprintf(stderr, "field-blend: --paste: %s is off %s's cell grid on axis %d (%.3f cells)\n", in[i], in[0], d, c); rc = 2; goto done; }
+            sub[i][d] = (int)lround(c);
+        }
+    }
+    if (!paste) for (int i = 1; i < n; i++) for (int d = 0; d < 3; d++)
         if (I[i].shape[d] != I[0].shape[d] || fabs(I[i].h * I[i].um - I[0].h * I[0].um) > 1e-6 * I[0].h * I[0].um ||
             fabs(I[i].origin[d] * I[i].um - I[0].origin[d] * I[0].um) > 1e-6 * (1 + fabs(I[0].origin[d] * I[0].um))) {
             fprintf(stderr, "field-blend: %s and %s cover different cells (axis %d: shape %d / %d, origin %.1f / %.1f um, cell %.2f / %.2f um)\n", in[0], in[i], d,
@@ -263,9 +312,10 @@ int fblend_run2(const char *out, int n, const char *const *in, const float *wt, 
         int known_ = 0; for (int q = 0; q < 15; q++) if (!strcmp(pl[k], known[q])) known_ = 1;
         int pass = -1; if (!known_) for (int i = 0; i < n && pass < 0; i++) if (fb_has(&I[i], pl[k])) pass = i;   /* (in[0] has it) */
         for (int i = 0; i < n; i++) {
-            const int on = known_ ? (is_w4(pl[k]) ? fb_has(&I[i], "dz") && fb_has(&I[i], "dy") && fb_has(&I[i], "dx") && fb_has(&I[i], "dq")
+            int on = known_ ? (is_w4(pl[k]) ? fb_has(&I[i], "dz") && fb_has(&I[i], "dy") && fb_has(&I[i], "dx") && fb_has(&I[i], "dq")
                                                   : !strcmp(pl[k], "pc") || !strcmp(pl[k], "ps") ? fb_has(&I[i], "pc") && fb_has(&I[i], "ps") : fb_has(&I[i], pl[k]))
                                   : i == pass;
+            if (on && paste && i > 0 && is_w4(pl[k]) && fabs(I[i].w4_d * I[i].um - I[0].w4_d * I[0].um) > 1e-3) on = 0;   /* another offset */
             if (!on) continue;
             use[k][i] = 1;
             if (rd_open(&R[k][i], &I[i], pl[k])) goto done2;
@@ -277,7 +327,8 @@ int fblend_run2(const char *out, int n, const char *const *in, const float *wt, 
             snprintf(p, sizeof p, "%s/%s", out, pl[k]);
             char at[512]; snprintf(at, sizeof at, "{\"ufsm\":{\"content\":\"winding fitter fields (src/fit.h), ufsm field-blend of %d sets\",\"h\":%d,\"origin_zyx\":[%lld,%lld,%lld]}}", n, I[0].h, I[0].origin[0], I[0].origin[1], I[0].origin[2]);
             const int64_t sh[3] = {D, H, W};
-            if (!(ZW[k] = z3w_create(p, sh, FB_ROWS, 0, !strcmp(pl[k], "pc") || !strcmp(pl[k], "ps") ? 128 : 0, at))) { fprintf(stderr, "field-blend: %s\n", z3w_error()); goto done2; }
+            const float zq = opt && opt->box ? fb_plane_q(&I[0], pl[k]) : 0;
+            if (!(ZW[k] = z3w_create(p, sh, FB_ROWS, zq, !strcmp(pl[k], "pc") || !strcmp(pl[k], "ps") ? 128 : 0, at))) { fprintf(stderr, "field-blend: %s\n", z3w_error()); goto done2; }
         } else {
             snprintf(p, sizeof p, "%s/%s.raw", out, pl[k]);
             if (!(FW[k] = fopen(p, "wb"))) { fprintf(stderr, "field-blend: cannot write %s\n", p); goto done2; }
@@ -285,6 +336,20 @@ int fblend_run2(const char *out, int n, const char *const *in, const float *wt, 
     }
     fb_slab S = {.n = n, .np = np, .W = W, .pl = pl, .w = w, .R = R, .use = use, .buf = buf, .obuf = obuf, .ZW = ZW};
     S.conf = opt ? opt->conf : FB_CONF_RESULTANT;
+    if (paste) {   /* per-axis feathered box weights (in[0]: 1; its share is set per cell in the combine) */
+        S.paste = 1; const int sh[3] = {D, H, W}; const double F = opt->feather > 0 ? opt->feather : 1;
+        if (!(awb = malloc((size_t)n * (D + H + W) * sizeof *awb))) goto done2;
+        float *q = awb;
+        for (int i = 0; i < n; i++) for (int d = 0; d < 3; d++) {
+            if (i) { S.sub[i][d] = sub[i][d]; S.subsh[i][d] = I[i].shape[d]; }
+            for (int c = 0; c < sh[d]; c++) {
+                const int a = c - sub[i][d], e = I[i].shape[d] - 1 - a, dist = a < e ? a : e;
+                const double s = sin(M_PI / 2 * ((dist + 0.5) / F));
+                q[c] = !i ? 1.f : dist < 0 ? 0.f : dist + 0.5 >= F ? 1.f : (float)(s * s);
+            }
+            S.aw[d][i] = q; q += sh[d];
+        }
+    } else
     if (opt && opt->tile) {   /* the tile weights of every input along each axis (fb_tile_w) */
         const int sh[3] = {D, H, W}; if (!(awb = malloc((size_t)n * (D + H + W) * sizeof *awb))) goto done2;
         float *q = awb;
@@ -326,6 +391,11 @@ int fblend_run2(const char *out, int n, const char *const *in, const float *wt, 
             const char *key = j->keys[i];
             if (!strcmp(key, "format") || !strcmp(key, "zarr_offset") || !strcmp(key, "raw_offset") || !strcmp(key, "raw_shape") || !strcmp(key, "recto") ||
                 !strcmp(key, "w4_d") || !strcmp(key, "blend")) continue;
+            if (opt && opt->box && (!strcmp(key, "origin") || !strcmp(key, "shape"))) {
+                if (!strcmp(key, "origin")) fprintf(f, ", \"origin\": [%lld, %lld, %lld]", I[0].origin[0], I[0].origin[1], I[0].origin[2]);
+                else fprintf(f, ", \"shape\": [%d, %d, %d]", D, H, W);
+                continue;
+            }
             fprintf(f, ", \"%s\": ", key); jw(f, j->items[i]);
         }
         fprintf(f, ", \"recto\": %s", has_r ? "true" : "false");
@@ -341,6 +411,8 @@ int fblend_run2(const char *out, int n, const char *const *in, const float *wt, 
             fprintf(f, "]");
         }
         if (opt && opt->conf == FB_CONF_MEAN) fprintf(f, ", \"conf\": \"mean\"");
+        if (paste) fprintf(f, ", \"paste_feather\": %g", opt->feather);
+        if (opt && opt->box) fprintf(f, ", \"box\": [%lld, %lld, %lld, %lld, %lld, %lld]", opt->b0[0], opt->b0[1], opt->b0[2], opt->bn[0], opt->bn[1], opt->bn[2]);
         fprintf(f, "}}\n");
         if (fclose(f)) goto done2;
     }
