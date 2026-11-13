@@ -196,6 +196,7 @@ with tempfile.TemporaryDirectory(prefix="ufsm-pipeline-") as tmp:
         run(*pred, t / "invalid", *args, *geometry, ok=2)
     impossible = json.loads(cfg.read_text())
     impossible['sources'][0]['holdout'] = [0, 0, 0, 128, 128, 128]
+    impossible['sources'][0]['holdout_mode'] = 'reject'   # mask mode (default) keeps a fully held-out source eligible (holdfit f1424a2: only reject boxes forbid a window)
     cfg.write_text(json.dumps(impossible))
     msg = run('train', cfg, '--out', t / 'impossible', '--steps', '1', *opts, ok=1)
     assert 'no eligible sources' in msg, msg

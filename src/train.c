@@ -1190,6 +1190,11 @@ static void head_slab_pass(gpu_state *d, int pass) {
         const int q0 = z0 / 4 - 1, qc = Z / 4 + 2, qa = q0 > 0 ? q0 : 0, qb = z1 / 4 + 1 < D / 4 ? z1 / 4 + 1 : D / 4;   /* g_lat_hs: the cell planes [qa, qb) this slab reads / adds to; the rolling buffers start at plane q0 */
         if (g_lat_hs) {
             if (unet_head_fwd_z(d->u, qa, qb, d->lgc)) { fprintf(stderr, "latent head stream: the head is not covered per slab (UFSM_LAT_HEAD_STREAM=0)\n"); abort(); }
+            if (!pass && getenv("UFSM_LGC_DUMP")) {   /* diagnostic: the first statistics pass's cell logits per slab, appended: int32 qa, qb (local cells), fp16 [LNC][qb - qa][plane] */
+                static int dn_[3]; if (dn_[d->side + 1] < 1) { const size_t nb = (size_t)LNC * (qb - qa) * (H / 4) * (W / 4) * 2; void *hb = malloc(nb); nn_sync(); nn_d2h(hb, d->lgc, nb);
+                    char fn_[1100]; snprintf(fn_, sizeof fn_, "%s%s", getenv("UFSM_LGC_DUMP"), d->side == 0 ? ".s0" : d->side == 1 ? ".s1" : ""); FILE *f = fopen(fn_, z0 ? "ab" : "wb");
+                    if (f) { const int32_t q2[2] = {qa, qb}; fwrite(q2, 4, 2, f); fwrite(hb, 1, nb, f); fclose(f); } free(hb); if (z1 == D) dn_[d->side + 1]++; }
+            }
             if (fuse) for (int r = 0; r < 2; r++) { if (fr[r][1] > fr[r][0]) nn_lat_up_slab_c((const char *)d->lgc + (size_t)fr[r][0] * (qb - qa) * (H / 4) * (W / 4) * 2, 1, fr[r][1] - fr[r][0], D / 4, H / 4, W / 4, z0, nz, LGC(fr[r][0]), qa, qb - qa); }
             else nn_lat_up_slab_c(d->lgc, 1, LUPC, D / 4, H / 4, W / 4, z0, nz, d->hs_lg, qa, qb - qa);
         } else if (g_lat) nn_lat_up_slab(d->lg, unet_logits_h16(d->u), LUPC, D / 4, H / 4, W / 4, z0, nz, d->hs_lg);   /* --lat: the cell grid's logits on this slab */
@@ -3571,10 +3576,10 @@ int cmd_train(int argc, char **argv) {
                 /* the fp4 weight gradient's gy records of a whole level-0 layer (lp_gn_silu_bwd_apply_rec, MX-fp4 gradients): 136 B per
                    channel x 256 voxels (~0.5 B per voxel and channel), outside the dry build. 8 / 16-channel levels only with UFSM_GYREC=2
                    (8.5 B per level-0 voxel at 16 channels for ~0 step time there; 8 channels: -2%) */
-                /* deferred GroupNorm applies (UFSM_GN_DEFER, default; not with split / three level-0 buffers): the records of one ~96 MB
+                /* --split z: none (nn_gn_silu_bwd: the records would hold the halo planes). Deferred GroupNorm applies (UFSM_GN_DEFER, default; not with split / three level-0 buffers): the records of one ~96 MB
                    pre-pass slab at a time instead of a whole layer's (-17 B per level-0 voxel at 32 channels) */
                 const int gdef = (getenv("UFSM_GN_DEFER") ? atoi(getenv("UFSM_GN_DEFER")) : 1) && !split && !cand[c].l3 && cfg.widths[0] % 32 == 0;
-                const size_t grec = unet_grad_mx4() && (cfg.widths[0] % 32 == 0 || lp_gyrec_narrow()) && (getenv("UFSM_GYREC") ? atoi(getenv("UFSM_GYREC")) : 1)
+                const size_t grec = !split && unet_grad_mx4() && (cfg.widths[0] % 32 == 0 || lp_gyrec_narrow()) && (getenv("UFSM_GYREC") ? atoi(getenv("UFSM_GYREC")) : 1)
                                     ? (gdef ? (size_t)100 << 20 : (size_t)B * cfg.widths[0] * (g_lat ? p3 / 64 : p3) * 136 / 256) : 0;   /* (--lat: level 0 is the 4^3-cell grid; the split's whole layer was counted per voxel: 77 GB at P 1024) */
                 need = grec + tb + tb / 14 + trainer + (nn_get_loss_tol() ? (size_t)B * p3 : 0) + (g_aff ? (size_t)2 * B * p3 : 0) + (g_fibdir > 0 ? (size_t)8 * B * p3 : 0) + (g_unwrap ? (g_head_slab ? (size_t)4 * B * p3 + (size_t)g_hs_z * P * P * (2 * g_cout + 11) + 4096 : (size_t)15 * B * p3) + (g_unwrap2 ? (size_t)4 * B * p3 : 0) + ((size_t)2 * g_naux * B * p3 + (size_t)(3 * (g_rv != 0) + 2 * (g_ink2 || (g_fibn && !g_rv))) * g_hs_z * P * P) : 0) + (g_cond ? (size_t)7 * B * p3 : 0) + (g_pap_head ? (size_t)4 * B * p3 : 0) + (g_restore ? (size_t)B * p3 * (cand[c].lean ? 5 : 1) + restore_scratch_bytes(g_Pz, P, P, fminf(g_rr.sc_step[0], 4.f)) + 256 : 0) + ((size_t)550 << 20) + (split ? (size_t)4 * B * 32 * P * P * 2 : 0) + (g_gpu_aug_want && (gin || g_lat) ? (g_lsplit ? nn_aug_device_bytes_z(P, g_gpu_aug_want >= 2 && !g_w4dev_want ? 2 * P : P, g_Pz, 16) : nn_aug_device_bytes(P) + (g_gpu_aug_want == 2 ? nn_label_warp_device_bytes(P) : 0)) : 0);   /* split: two slots of halo send / receive planes */   /* kernel workspaces: measured device growth / tracked ~1.07 + 0.3 GB, + 0.2 GB margin for other processes */
                 if (g_lat) need += (xin_sep ? 0 : xinb) + (g_tm_unused ? 0 : batb) + (g_lat_hs ? ((size_t)LNC * (LGFC < LNC ? 6 : 4) + (size_t)LGFC * 4) * (size_t)(g_hs_z / 4 + 2) * (P / 4) * (P / 4) + (g_lat_fuse ? nn_lat_fuse_part(7, P / 4, P / 4, g_hs_z) : 0) : ((size_t)LNC * 2 + (size_t)LGFC * 4) * (p3 / 64));   /* --lat: the full-resolution batch beside the cell-grid network, the coarse logit gradient (fp32 + 16-bit) */
@@ -4021,7 +4026,10 @@ int cmd_train(int argc, char **argv) {
     split_ctx *sctx = split ? split_create(devs[0], devs[1]) : nullptr;
     g_split_same = split && devs[0] == devs[1];
     nn_init(G[0].dev);
-    float *gpeer = ng > 1 ? nn_malloc(np * 4) : nullptr;   /* on GPU 0: incoming gradients of the other GPUs */
+    /* on GPU 0: incoming gradients of the other GPUs, in chunks of GPEER floats (2026-11-13: a whole np copy was 416 MB of GPU 0 outside the
+       memory plan at the 104 M scratch2 net; a 64 MB chunk costs one more copy + axpy launch per chunk, ~7 per step) */
+    const size_t GPEER = np < ((size_t)16 << 20) ? np : (size_t)16 << 20;
+    float *gpeer = ng > 1 ? nn_malloc(GPEER * 4) : nullptr;
     /* --accum K: gradient accumulation, K windows (steps) per optimizer update. Every step is still one window: its forward / backward, loss,
        log and mix lines, the lr schedule (so --warmup and --steps count windows); its gradient is added into gacc and the update (clip,
        Muon / AdamW at optimizer step step / K, EMA) runs on the mean of the accumulated windows at steps that are multiples of K. A
@@ -4183,6 +4191,8 @@ int cmd_train(int argc, char **argv) {
                 double tw = now(); batch *b = sampler_next(sp); wait += now() - tw;
                 if (!b) { fprintf(stderr, "sampler stopped\n"); g_stop = 1; break; }
                 split_upload(sctx, G, 0, b, G[0].cur, G[1].cur, B, P);
+                for (int g = 0; g < 2; g++) { nn_init(G[g].dev); axr_set(&G[g], G[g].cur); }   /* (as the one-GPU path: this batch's scroll axis records; the
+                                                                                               first step ran the scroll RoPE without them, 2026-11-13) */
                 G[0].pending = b;
             }
             for (int g = 0; g < 2; g++) {
@@ -4310,7 +4320,10 @@ int cmd_train(int argc, char **argv) {
         /* average gradients across GPUs: sum on GPU 0 (peer copies), scale, broadcast */
         if (ng > 1) {
             nn_init(G[0].dev);
-            for (int g = 1; g < ng; g++) { nn_peer_copy(gpeer, G[0].dev, unet_grad_ptr(G[g].u), G[g].dev, np * 4); nn_axpy(unet_grad_ptr(G[0].u), 1.f, gpeer, np); }
+            for (int g = 1; g < ng; g++) for (size_t o = 0; o < np; o += GPEER) {
+                const size_t k = np - o < GPEER ? np - o : GPEER;
+                nn_peer_copy(gpeer, G[0].dev, unet_grad_ptr(G[g].u) + o, G[g].dev, k * 4); nn_axpy(unet_grad_ptr(G[0].u) + o, 1.f, gpeer, k);
+            }
             if (!split) nn_scale(unet_grad_ptr(G[0].u), 1.f / ng, np);   /* split: the halves' gradients add up to the window's */
             for (int g = 1; g < ng; g++) nn_peer_copy(unet_grad_ptr(G[g].u), G[g].dev, unet_grad_ptr(G[0].u), G[0].dev, np * 4);
         }
@@ -4650,6 +4663,17 @@ int cmd_train(int argc, char **argv) {
                                                  (unsigned long long)(o1.reads - o0.reads), (unsigned long long)(o1.tiles - o0.tiles), (unsigned long long)(o1.gpu_tiles - o0.gpu_tiles),
                                                  1e3 * (o1.s_pair - o0.s_pair) / (double)(o1.reads - o0.reads), 1e3 * (o1.s_read - o0.s_read) / (double)(o1.reads - o0.reads));
                 o0 = o1; }
+            {   /* device memory growth after step 2: all buffers should be allocated by then (2026-11-13: a per-step thread-local leak in split_run's
+                   threads took 0.3 GB / step / GPU at P 1024 until the ink MIL backward's cudaMalloc failed, ~20 steps in). Each GPU's free memory
+                   at a log line against the reference: a drop of more than 64 MB is reported (any allocator, cudaMalloc included) */
+                static size_t lowfree[16]; static int nwarn;
+                if (step >= 2 && nwarn < 20) for (int g = 0; g < ng && g < 16; g++) {
+                    nn_init(G[g].dev); const size_t f = nn_mem_free();
+                    if (!lowfree[g]) lowfree[g] = f;   /* (the reference moves only on a report: a slow leak adds up to one) */
+                    else if (f + ((size_t)64 << 20) < lowfree[g]) { fprintf(stderr, "  warning: GPU %d device memory free fell %.0f MB since an earlier log line (now %.0f MB free): an allocation after the first steps\n", G[g].dev, (lowfree[g] - f) / 1e6, f / 1e6); nwarn++; lowfree[g] = f; }
+                }
+                if (ng > 1) nn_init(G[0].dev);
+            }
             { static int memlog = -1; if (memlog < 0) memlog = ufsm_env_on("UFSM_SYNC_CHECK");   /* device memory free per GPU at each log line (a leak) */
               if (memlog) { fprintf(stderr, "  device memory free:"); for (int g = 0; g < ng; g++) { nn_init(G[g].dev); fprintf(stderr, " GPU %d %.1f MB", G[g].dev, nn_mem_free() / 1e6); } fprintf(stderr, "\n"); nn_init(G[0].dev); } }
             { static int hm = -1, hmn = 0; if (hm < 0) hm = ufsm_env_on("UFSM_HOSTMEM");   /* host memory by owner at each log line (sampler_hostmem) */
