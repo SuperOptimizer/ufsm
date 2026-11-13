@@ -6,6 +6,41 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## The scratch2 step faster: profile and the first fixes (2026-11-13, branch perf2-20261113)
+
+Goal: the 92 M net's P 1024 two-card split step (scratch2.launch) as fast as possible with equivalent training.
+
+**Profile before** (the archived one-card P 512 92 M run, runs/scratch-archive-20261113/prof92: nsys + UFSM_PROF=layers, 37 steady
+steps): 1.61 s/step, kernel-busy 99 % (GPU-bound, no loader wait). Per step:
+
+| part | ms |
+|---|---|
+| 3^3 convs (fwd fp4 150-195 TFLOP/s on enc0.c2 / dec0.c1; dec0.c1 alone 304) | ~950 |
+| onfly-phase pair rule + codes decode on the training GPU (k_bg_env 151, k_ll_sub 121, k_bg_pair / xw / ll_build 25) | ~295 |
+| loss / target kernels (loss_grad 26, gscale 22, lat_up4 22, lat_adj_xy 21, loss_stats 16, packed_mask 13, ...) | ~200 |
+| the head's 1^3 convs (conv1_mx_t 66, conv1_to_mx_t 36, bwd_w1 57 in 2300 launches) | ~160 |
+| Muon fp32 Newton-Schulz (gemm_ns_k; scratch2 runs --muon-tc 2, ~57) | 120 |
+| fine stem fwd / bwd | 84 |
+| down0 backward-data (the dilated fp8 path: 8x the MACs) vs its forward 26 | 69 |
+
+The P 1024 split half is 4.25x the P 512 volume, so ~5.2 s/step per card if the split cost nothing.
+
+**down0..down3 backward-data: the weight-streaming fp4 kernel** (trainperf WIP 417a0a4, finished here). The 256-448 channel stride-2
+backward-data ran the dilated fp8 convolution on MX-fp8 copies. bwd_data_s2_f4_k with STREAM (NCH > 4) keeps one tap's weight units in
+shared memory, loaded per (z tile, class, tap) from L2; the MMAs and their order are the resident kernel's. tests/bench_s2b, one 5060 Ti,
+min of 4, per 32-plane slab of the P 1024 half:
+
+| conv | gx shape | dilated path | fp4 kernel | P 1024 half, saved |
+|---|---|---|---|---|
+| down0 | 32 x 256^2 x 256 ch | 82.5 ms (11 TFLOP/s) | 10.1 ms (92) | 308 ms (136 planes) |
+| down1 | 32 x 128^2 x 320 | 23.6 | 4.3 | 41 ms (68) |
+| down2 | 32 x 64^2 x 384 | 8.0 | 1.6 | 7 ms (34) |
+| down3 | 16 x 32^2 x 448 | 1.55 | 0.48 | 1 ms (18) |
+
+Accuracy: test_mx4 256 / 320 ch against the fp32 reference, rel err 0.167 / 0.169 (dilated 0.155 / 0.155, TOL4). Trainer A/B (92 M,
+P 256, --det 1 seed 7, step-1 summed gradient; UFSM_S2B_F4=1 is the old path): the same batch hashes, --det rerun 0, new vs old
+rel 0.037 (cos 0.99932), against the SR noise floor 0.133 (`UFSM_SR_SALT=1`, new: every step's SR seed shifted, the same batches).
+
 ## Split-window input builders: every --gpu-aug builder by z range, the scanner split exactly across two GPUs (2026-11-13, branch augz-20261112)
 
 ## Muon variants for the from-scratch universal net: ten arms on the 92 M net (2026-11-13, branch muonx-20261113)
