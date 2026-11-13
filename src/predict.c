@@ -1371,6 +1371,11 @@ static int predict_one(int argc, char **argv) {
     /* --tta K: the fit fields averaged over K window symmetries (src/tta.h; identity first; the probability output is then the last pass);
        without --fit-*: the probability output itself is the mean of the K passes' probabilities (fp16 accumulator, 2 B per window voxel) */
     const int tta = atoi(opt(argc, argv, "--tta", "1"));
+    /* --skip-empty 1 (DESIGN 2026-11-13 "empty-space skipping", nn.h nn_skip_build): a latent-grid net's wide convs leave the 8^3-cell tiles
+       with no CT voxel above --skip-thr (default 40, under the papyrus iso 64; air noise stays below it), dilated by --skip-margin tiles per
+       level (default 1), at their bias. An approximation (the net's air outputs are not constant): measured against the dense path there */
+    const int skip_empty = atoi(opt(argc, argv, "--skip-empty", "0")), skip_thr = atoi(opt(argc, argv, "--skip-thr", "40")), skip_margin = atoi(opt(argc, argv, "--skip-margin", "1"));
+    long skip_wins = 0, skip_masked = 0, skip_calls = 0; double skip_share0 = 0;
     const int fea = atoi(opt(argc, argv, "--feather", "0"));   /* --feather B (above) */
     if (tta < 1 || tta > TTA_MAX) { fprintf(stderr, "predict: --tta 1..%d\n", TTA_MAX); return 2; }
     if (tta > 1 && ffct) { fprintf(stderr, "predict: --tta with --fit-ct is not supported (the CT planes pool one pass); add them later with ufsm ct-fields\n"); return 2; }
@@ -2429,7 +2434,10 @@ static int predict_one(int argc, char **argv) {
                 else if (latin) nn_lat_pred_input(ctd, Wz, W, (float)mean, (float)(1.0 / sd), dyd, dxd, ax.n > 0 ? (int)radial_sign : 0, x2);
                 else nn_lowres_input(xd, xs, hdiv, hmode, lrt, x2, h16);
                 nn_ptick("input pool");
+                const int skw = skip_empty && half == 3 && ctd && gpath && !lat_store && !lvq;   /* (the CT window in ctd until the forward) */
+                if (skw && !nn_skip_build(ctd, Wz, W, W, 4, cfg.nlev, skip_thr, skip_margin)) { skip_wins++; if (ufsm_env_on("UFSM_SKIP_REPORT")) skip_share0 += nn_skip_share(0); }
                 const float *l2 = unet_forward_x(u, x2, xn, 0, h16); nn_ptick("trunk forward");
+                if (skw) { long m_, c_; nn_skip_counts(&m_, &c_); skip_masked += m_; skip_calls += c_; nn_skip_off(); }
                 /* train --fstem: the fine voxel stem on the CT channel (xd channel 0) into the planes the path holds: output o of the stem's list
                    (every non-normal / density head output, in channel order) to plane MAP(c) of its channel c (-1: not held) */
 #define PRED_FSTEM(z0_, nz_, planes, ns__, MAP) do { if (fstem_off) break; int fm_[16], k_ = 0; for (int c = 0; c < cfg.cout && k_ < cfg.fstem_out; c++) if (c < 2 || c >= 9) { fm_[k_++] = (MAP); } \
@@ -2854,6 +2862,8 @@ static int predict_one(int argc, char **argv) {
     if (pyramid_write_group(out, um_l, gpyr ? PH[0].pya->nlev : nlev, "ufsm-recto", attrs)) return 1;
     }
     fprintf(stderr, "wrote %s (%ld tiles in %.0fs)\n", out, ntiles, now() - t0);
+    if (skip_empty) fprintf(stderr, "predict: --skip-empty: %ld windows masked (thr %d, margin %d), %ld of %ld conv launches masked%s%.3f\n", skip_wins, skip_thr, skip_margin, skip_masked, skip_calls,
+                            ufsm_env_on("UFSM_SKIP_REPORT") ? ", mean level-0 active tile share " : "", ufsm_env_on("UFSM_SKIP_REPORT") && skip_wins ? skip_share0 / skip_wins : -1.);
     if (lvm) { double ds = 0; long dn = 0; nn_latvol_stats(lvL, &ds, &dn);
         fprintf(stderr, "predict: latvol CT: %.3f GB of chunk streams uploaded and decoded on the device (%.4f B per box voxel); the decode kernels %.3f s in %ld windows (%.1f Gvox/s of window voxels); %ld windows as host-decoded voxels\n",
                 lv_up / 1e9, lv_up / ((double)bn[0] * bn[1] * bn[2]), ds, dn, ds > 0 ? (double)dn * (double)w3 / 1e9 / ds : 0., lv_nfb); }

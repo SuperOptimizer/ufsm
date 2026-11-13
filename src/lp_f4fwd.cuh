@@ -329,10 +329,17 @@ __global__ void prep_w4_k(const float *__restrict__ w, uint8_t *__restrict__ wq,
    alignment: plane-major / 16-bit on both, or MX segments on both). Warp per tile, lane = row; same layout as prep_w4_k. */
 extern int g_w2d;
 __global__ void prep_w4_2d_k(const float *__restrict__ w, uint8_t *__restrict__ wq, uint8_t *__restrict__ ws, int Co, int Ci, int Cop, int Cip, int Cx = -1, int CxP = 0, int Ox = -1, int OxP = 0);   /* defined in lp_f4fwd.cu */
+/* --skip-empty: the output tile [oz0, oz0 + TZ) x [oy0, oy0 + 8) x [ox0, ox0 + 16) lies in one z / y tile of 8 cells (TZ <= 4 divides 8)
+   and at most two x tiles */
+__device__ __forceinline__ bool sk_active(const skipm_t &sk, int oz0, int oy0, int ox0) {
+    if (!sk.m) return true;
+    const size_t r = ((size_t)(oz0 >> 3) * sk.my + (oy0 >> 3)) * sk.mx; const int a = ox0 >> 3, b = min((ox0 + 15) >> 3, sk.mx - 1);
+    return (sk.m[r + a] | sk.m[r + b]) != 0;
+}
 template <int MT, int TZ, typename T, typename TO>
 __global__ void __launch_bounds__(256, LP_MINB(2)) conv_fwd_f4_k(const T *__restrict__ x, const uint8_t *__restrict__ wq, const uint8_t *__restrict__ wsc,
                                                      const float *__restrict__ b, TO *__restrict__ y,
-                                                     int N, int Ci, int D, int H, int W, int Co, int Cop, int Cip, gnp_t gp, double *__restrict__ osum, int Go, split_t sp) {
+                                                     int N, int Ci, int D, int H, int W, int Co, int Cop, int Cip, gnp_t gp, double *__restrict__ osum, int Go, split_t sp, skipm_t sk) {
     constexpr int BM = MT * 16, PG = 7, RZ = TZ / 2, NR = 2 * RZ, TT = (TZ + 2) * 180, NRX = NR;   /* PG: tap pairs per weight stage */
     extern __shared__ __align__(128) unsigned char smem_raw[];
     uint8_t *sx = smem_raw;                         /* [TT pos][16 B] (LP_SW: [TT][32 B] int8, lp_st_row4) */
@@ -362,7 +369,8 @@ __global__ void __launch_bounds__(256, LP_MINB(2)) conv_fwd_f4_k(const T *__rest
     const size_t plane = (size_t)Di * H * W;
     const int Cx = sp.x2 ? sp.c_split : Ci;
     const bool G = gp.G != 0 || sp.gp2.G != 0;
-    for (int ci0 = 0; ci0 < Cip; ci0 += 32) {
+    const bool act = sk_active(sk, oz0, oy0, ox0);   /* --skip-empty: an inactive tile skips the main loop (outputs = the bias) */
+    for (int ci0 = 0; act && ci0 < Cip; ci0 += 32) {
         __syncthreads();
         const bool upc = IS_MX(T) && sp.up && ci0 < (Cx + 31) / 32 * 32;   /* this chunk is the half-resolution x segment (decoder up part) */
         if (threadIdx.x < 32) {
@@ -462,7 +470,8 @@ template <int MT, int TZ, typename T, typename TO> void launch_f4(dim3 grid, con
     if (smem < 8 * 256 * sizeof(float)) smem = 8 * 256 * sizeof(float);
     static int attr[8];
     if (!attr[cur_dev_()]) { attr[cur_dev_()] = 1; cudaFuncSetAttribute((const void *)conv_fwd_f4_k<MT, TZ, T, TO>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
-    conv_fwd_f4_k<MT, TZ, T, TO><<<grid, 256, smem>>>((const T *)x, wq, ws, b, (TO *)y, xs.n, xs.c, xs.d, xs.h, xs.w, cout, Cop, Cip, gp, osum, Go, sp);
+    const skipm_t sk = IS_MX(TO) ? lp_skip_get(xs, sp, 1) : skipm_t{nullptr, 0, 0};   /* (--skip-empty: MX forwards only) */
+    conv_fwd_f4_k<MT, TZ, T, TO><<<grid, 256, smem>>>((const T *)x, wq, ws, b, (TO *)y, xs.n, xs.c, xs.d, xs.h, xs.w, cout, Cop, Cip, gp, osum, Go, sp, sk);
 }
 /* ---- one or two 32-channel input chunks (Cip == 32 NCH, no fused upsample): conv_fwd_f4_k with the input staged once per z
    tile for all output tiles, and z tiles walked by the block with each chunk's input planes in a ring (TZ + 2 slots, plane gz in
