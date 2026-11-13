@@ -109,6 +109,61 @@ So this is mostly porting the latent path onto that machinery. The latent path r
   alone gains nothing from the split (an inference window already fits one GPU, and two windows on two GPUs are faster). It
   matters only once a wider net no longer fits one GPU's forward.
 
+**S0 (measured 2026-11-12 22:00): the planner per GPU at P 1024.** UFSM_MEM_DRY=1 UFSM_MEM_FREE_GB=13.3 with the sslpair-ctrl arguments
+exactly (u1 recipe + --ssl 16, --ink-head 1, --rv 2, --fstem 16, --film 2; latdino4 binary; lean 2 + shared encoder a1 picked
+everywhere). The split half is proxied by a single-card --Pz 544 window (512 owned + 32 halo voxels = 136 trunk cells); the
+halo exchange buffers (~0.25 GB of traffic, a few planes resident) are not in it. GB of the 13.30 budget:
+
+| level widths | params | whole window (one card) | split half (per GPU) |
+|---|---|---|---|
+| 96,128,160,192 (u1) | 10.1M | 12.97 | 9.71 |
+| 128,160,192,256 | 15.8M | 14.39 refused | 10.47 |
+| 160,192,256,320 | 25.5M | 15.82 refused | 11.24 |
+| 192,256,320,384 | 40.0M | 17.34 refused | 12.05 |
+| 192 x 4 | 19.1M | 17.09 refused | 11.91 |
+| 256 x 4 | 33.9M | 19.92 refused | 13.42 (just over) |
+| 256,320,384,448 | 60.1M | 20.17 refused | 13.57 (just over) |
+
+- One card tops out at u1's width; the split fits 2x u1's width at every level (40M params, 4x u1).
+- The per-GPU task term barely shrinks (8.11 -> 6.81 GB). The head slabs (1.48), the gpu-aug staging (2.23) and the lat head
+  slab (0.61) are sized per window, not per depth. Staging per z range (the gpu-aug builders' global z range: spec sent to univA)
+  would halve the staging and fit 256 x 4 / 256-448 (~12.3-12.5 GB).
+- (This binary plans the whole window at 12.97 GB; the sslpair-ctrl log's earlier start line said 11.78, from before --ssl.)
+- Compute: level 0 dominates and grows with w0^2. 192-384 is ~4x u1's FLOPs per window: ~2x u1's per-card step time per window,
+  ~4x fewer windows a second than u1 data parallel. The target is 192,256,320,384, with 160-320 as the fallback.
+
+**S1 / S2 order changed.** An inference forward of the 40M net at 1024 fits one card (no stored activations), so predict gains only
+latency from the split. Training goes first.
+
+**S2 implementation (branch splitwin-20261112).**
+- The trunk under the split needs one change. The latent input pool (nn_input_latc / nn_input_lat, rad_full4) computes the radial
+  channels of the global voxel. The record keeps the window's depth (h[2]); the spare word 7 holds this half's first plane, so
+  the cube symmetries (z flip, z <-> y) and warps read the global axis centres. Whole windows: word 7 is 0, so the bytes are
+  unchanged.
+- unet_split_head_halo: dec[0]'s output (the head input) gets its innermost halo plane from the other GPU. The head logits of the
+  halo cell next to the cut are then the window's, which the head slabs' band reads (below).
+- tests/test_split_lat (gpu, 9 cases, ~1 s; both halves on one GPU when only one is free): a cin-32 latent net (32 cells, halo 8)
+  vs one GPU, with a fixed smooth cell-logit gradient:
+  - MX-fp8 round to nearest: the owned cells' logits are bit-identical (rel 0) under identity / z flip / z<->y, and so are the
+    exchanged cut halo cells. The gradient rel is 4.9e-3, against 0.25 for a last-bit-perturbed input.
+  - The fp4 preset rounding to nearest (MX-fp8 gradients): logits and cut cells identical; gradient rel 2.3e-8 (perturbed 0.82).
+  - The fp4 preset with SR and MX-fp4 gradients: logits identical; gradient rel 0.68-0.72, at the seed-to-seed spread
+    (0.66-0.72).
+- The trainer (`train --lat 4 --split z --gpus a,b`) runs each half as a window of its own: g_Pz = g_Dl = P / 2 + 32 voxels,
+  set after the sampler config, which keeps P^3 windows.
+  - batch_view: the upload sees the sampler window's planes from split_z0, plus a per-buffer pinned copy of the record with word 7.
+    The existing upload, label stream, planner and head-slab code then run unchanged on the half.
+  - The head slabs mask the halo voxels (hs_clip). The statistics pass counts the owned voxels; the loss finalisations already
+    sum across the GPUs (zs_reduce in nn_loss_stats_fin / nn_wind4_fin).
+  - The gradient pass also takes the 2 halo voxels next to the cut. Their trilinear upsample reads the owned boundary cell and
+    the exchanged halo cell, so the owned cells' gradient is complete without a reverse halo add. The halo cells' gradient is
+    dropped (hs_zero_halo_cells, before the streamed head backward).
+  - The fine stem's weight gradient takes the owned planes only.
+  - One fstem-dropout and lat-step-jitter draw per window.
+  - The light statistics pass is off: it would double-count the band in the logged loss.
+- Not yet under the split (refused): --gpu-aug (univA's z-range builders), --ssl, --ink-mil, --fib-head, --fib-normal-lambda,
+  --pgrad, --count, --pap-head, --distill, --lat-guide 1 / 2, the unstreamed latent head.
+
 ## predict --window auto on a shared card: UFSM_MEM_FREE_GB budget, interior cap 1024 (2026-11-12, branch winauto-20261112)
 
 Pod 3 (one RTX PRO 6000, 98 GB), two unroll lanes: PHerc0814's ink pass (`--window auto`, feathered, halo 32) started on a nearly

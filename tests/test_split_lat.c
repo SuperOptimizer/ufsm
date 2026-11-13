@@ -38,12 +38,6 @@ static void side_alloc(side_t *d, const unet_cfg *cfg, int dcells, int side) {
     nn_h2d(d->gl, g, (size_t)cfg->cout * nc * 2); free(g);
 }
 static void side_free(side_t *d) { unet_free(d->u); nn_free(d->ct); nn_free(d->rec); nn_free(d->gl); }
-static const float *step(side_t *d, int cin, int dcells) {
-    const shape5 xs = {1, cin, dcells, Pc, Pc};
-    const float *lg = unet_forward_x(d->u, d->ct, xs, 1, 1);
-    unet_zero_grad(d->u); unet_backward_x(d->u, d->gl, 1);
-    return lg;
-}
 static void logits_d2h(side_t *d, const float *lg, int cout, int dcells, int z0, int nz, float *out, int oz) {   /* cells [z0, z0 + nz) -> out planes from oz */
     const size_t pl = (size_t)Pc * Pc, nc = pl * dcells; const int h16 = unet_logits_h16(d->u);
     for (int c = 0; c < cout; c++) {
@@ -51,26 +45,46 @@ static void logits_d2h(side_t *d, const float *lg, int cout, int dcells, int z0,
         else nn_d2h(out + ((size_t)c * Pc + oz) * pl, lg + (size_t)c * nc + z0 * pl, nz * pl * 4);
     }
 }
-static void single(const unet_cfg *cfg, unsigned sr, float *g, float *lo) {
+/* the streamed head (unet_head_fwd_z) on cell plane z: fp16 [cout][plane] to the host (0: not covered) */
+static int head_plane(side_t *d, int cout, int z, _Float16 *out) {
+    const size_t pl = (size_t)Pc * Pc; void *y = nn_malloc((size_t)cout * pl * 2);
+    const int r = unet_head_fwd_z(d->u, z, z + 1, y); nn_sync();
+    if (!r) nn_d2h(out, y, (size_t)cout * pl * 2);
+    nn_free(y); return !r;
+}
+/* forward (the owned cells' logits to lo right away: lean layouts reuse the logit buffer in the backward), the halo cell next to the cut
+   through the streamed head after unet_split_head_halo (side >= 0; the single run: both cells next to the cut), then the backward */
+static float *g_lo; static _Float16 *g_hh[2]; static int g_hok[2];
+static void step(side_t *d, int cin, int cout, int dcells, int side) {
+    const shape5 xs = {1, cin, dcells, Pc, Pc};
+    const float *lg = unet_forward_x(d->u, d->ct, xs, 1, 1); nn_sync();
+    const size_t pl = (size_t)Pc * Pc;
+    if (side < 0) { logits_d2h(d, lg, cout, dcells, 0, Pc, g_lo, 0); for (int k = 0; k < 2; k++) g_hok[k] = head_plane(d, cout, Pc / 2 - 1 + k, g_hh[k]); }
+    else {
+        logits_d2h(d, lg, cout, dcells, side ? H0 : 0, Pc / 2, g_lo, side ? Pc / 2 : 0);
+        unet_split_head_halo(d->u);   /* (a collective) */
+        g_hok[side] = head_plane(d, cout, side ? H0 - 1 : dcells - H0, g_hh[side]);   /* side 0's halo cell Pc / 2, side 1's Pc / 2 - 1 */
+    }
+    (void)pl;
+    unet_zero_grad(d->u); unet_backward_x(d->u, d->gl, 1);
+}
+static void single(const unet_cfg *cfg, unsigned sr, float *g, float *lo, _Float16 *hh0, _Float16 *hh1, int *hok) {
     nn_init(DEV[0]); nn_set_sr_step(sr);
     side_t d; side_alloc(&d, cfg, Pc, -1);
-    const float *lg = step(&d, cfg->cin, Pc); nn_sync();
-    logits_d2h(&d, lg, cfg->cout, Pc, 0, Pc, lo, 0);
+    g_lo = lo; g_hh[0] = hh0; g_hh[1] = hh1; step(&d, cfg->cin, cfg->cout, Pc, -1); *hok = g_hok[0] && g_hok[1]; nn_sync();
     unet_grad_d2h(d.u, g); side_free(&d);
 }
-static side_t S2[2]; static const unet_cfg *g_cfg; static const float *g_lg[2];
-static void job(int side, void *a) { (void)a; g_lg[side] = step(&S2[side], g_cfg->cin, Dl); }
-static void split2(split_ctx *ctx, const unet_cfg *cfg, unsigned sr, float *g, float *lo, size_t np) {
-    g_cfg = cfg;
+static side_t S2[2]; static const unet_cfg *g_cfg;
+static void job(int side, void *a) { (void)a; step(&S2[side], g_cfg->cin, g_cfg->cout, Dl, side); }
+/* hh0 / hh1: the head logits of cells Pc / 2 - 1 (side 1's halo) and Pc / 2 (side 0's halo) */
+static void split2(split_ctx *ctx, const unet_cfg *cfg, unsigned sr, float *g, float *lo, _Float16 *hh0, _Float16 *hh1, int *hok, size_t np) {
+    g_cfg = cfg; g_lo = lo; g_hh[1] = hh0; g_hh[0] = hh1;
     for (int s = 0; s < 2; s++) { nn_init(DEV[s]); nn_set_sr_step(sr); side_alloc(&S2[s], cfg, Dl, s); unet_set_split(S2[s].u, s, H0, split_halo);
                                   if (!getenv("UFSM_SPLIT_SYNC")) unet_set_split_async(S2[s].u, split_halo_begin, split_halo_end); }
     split_run(ctx, job, nullptr);
+    *hok = g_hok[0] && g_hok[1];
     float *g1 = malloc(np * 4);
-    for (int s = 0; s < 2; s++) {   /* owned cells: side 0 [0, Pc / 2), side 1 its planes [H0, Dl) */
-        nn_init(DEV[s]); nn_sync();
-        logits_d2h(&S2[s], g_lg[s], cfg->cout, Dl, s ? H0 : 0, Pc / 2, lo, s ? Pc / 2 : 0);
-        unet_grad_d2h(S2[s].u, s ? g1 : g);
-    }
+    for (int s = 0; s < 2; s++) { nn_init(DEV[s]); nn_sync(); unet_grad_d2h(S2[s].u, s ? g1 : g); }
     for (size_t i = 0; i < np; i++) g[i] += g1[i];
     for (int s = 0; s < 2; s++) { nn_init(DEV[s]); side_free(&S2[s]); }
     free(g1);
@@ -113,6 +127,7 @@ int main(void) {
     size_t np; { unet *pr = unet_create(&cfg); np = unet_nparams(pr); unet_free(pr); }
     float *g0 = malloc(np * 4), *g1 = malloc(np * 4), *g2 = malloc(np * 4);
     const size_t nl = (size_t)cfg.cout * c3; float *l0 = malloc(nl * 4), *l1 = malloc(nl * 4), *l2 = malloc(nl * 4);
+    const size_t hn = (size_t)cfg.cout * Pc * Pc; _Float16 *h0a = malloc(hn * 2), *h0b = malloc(hn * 2), *h1a = malloc(hn * 2), *h1b = malloc(hn * 2), *h2a = malloc(hn * 2), *h2b = malloc(hn * 2);
     printf("test_split_lat: P %d voxels (%d cells), level-0 halo %d cells, local depth %d cells%s, %zu params\n", P, Pc, H0, Dl, DEV[0] == DEV[1] ? ", both halves on one GPU" : "", np);
     int fails = 0, ci = 0;
     static const int syms[3] = {0 | 1 << 2 | 2 << 4, 0 | 1 << 2 | 2 << 4 | 1 << 8, 1 | 0 << 2 | 2 << 4};   /* identity, z flip, z <-> y */
@@ -127,19 +142,24 @@ int main(void) {
         if (mode == 0) { unet_set_act_mx4(0); unet_set_act_mx8(1); nn_set_sr(0); nn_set_prec_policy(""); unet_set_chunk_up(1); unet_set_grad_mx8(0); unet_set_lean(0);
                          unet_set_grad_mx4(0); unet_set_share_enc_a1(0); unet_set_recompute(1); }
         else { unet_set_act_mx4(1); nn_set_sr(mode == 2); if (nn_set_prec_policy("all=fp4:fp4:fp4")) return 2; unet_set_chunk_up(2); unet_set_grad_mx8(1); unet_set_lean(2);
-               unet_set_grad_mx4(1); unet_set_share_enc_a1(1); unet_set_recompute(1); }
+               unet_set_grad_mx4(mode == 2); unet_set_share_enc_a1(1); unet_set_recompute(1); }   /* (MX-fp4 gradients need SR: the rn mode keeps MX-fp8 ones) */
         unet_set_input_mx(1); unet_set_input_prec(mode ? 4 : 0); nn_set_gn_stored(mode);   /* (the lat recipe's precision.txt: input_prec 4, gn_stored 1) */
-        single(&cfg, 1, g0, l0); split2(ctx, &cfg, 1, g1, l1, np);
+        int ok0, ok1, ok2; single(&cfg, 1, g0, l0, h0a, h0b, &ok0); split2(ctx, &cfg, 1, g1, l1, h1a, h1b, &ok1, np);
         const double dl = rel(l1, l0, nl), dg = rel(g1, g0, np);
+        double dh = -1;   /* the halo cells next to the cut after the exchange, against the single run's (the streamed head, fp16) */
+        if (ok0 && ok1) { size_t nd = 0; for (size_t k = 0; k < hn; k++) nd += memcmp(&h0a[k], &h1a[k], 2) != 0 || memcmp(&h0b[k], &h1b[k], 2) != 0; dh = (double)nd / (2.0 * hn); }
         double rl, rg; const char *what;
         if (mode < 2) {   /* reference: a last-bit-perturbed CT on one GPU */
             _Float16 *keep = malloc(p3 * 2); memcpy(keep, hct, p3 * 2);
             for (size_t i = 0; i < p3; i++) { const float v = (float)hct[i]; if (i % 7 == 0) hct[i] = (_Float16)(v * (1.f + 1e-3f)); }
-            single(&cfg, 1, g2, l2); memcpy(hct, keep, p3 * 2); free(keep); what = "perturbed";
-        } else { single(&cfg, 2, g2, l2); what = "seeds"; }
+            single(&cfg, 1, g2, l2, h2a, h2b, &ok2); memcpy(hct, keep, p3 * 2); free(keep); what = "perturbed";
+        } else { single(&cfg, 2, g2, l2, h2a, h2b, &ok2); what = "seeds"; }
         rl = rel(l2, l0, nl); rg = rel(g2, g0, np);
         const int ok = mode < 2 ? dl < 2 * rl + 1e-4 && dg < 2 * rg + 1e-3 : dl < 1.5 * rl + 1e-3 && dg < 1.5 * rg + 1e-3;
-        printf("  %d %s %-8s: owned logits rel %.2e (%s %.2e), grad rel %.2e (%s %.2e)  %s\n", ci, mode == 2 ? "fp4 sr lean 2" : mode ? "fp4 rn lean 2" : "MX-fp8 rn    ", sname[sy], dl, what, rl, dg, what, rg, ok ? "ok" : "FAIL");
+        const int okh = dh == 0.0 || (dh < 0 && mode);   /* (bit-identical; not covered only where the streamed head is not: fp4 modes may lack it) */
+        printf("  %d %s %-8s: owned logits rel %.2e (%s %.2e), cut halo cells %s, grad rel %.2e (%s %.2e)  %s\n", ci, mode == 2 ? "fp4 sr lean 2" : mode ? "fp4 rn lean 2" : "MX-fp8 rn    ",
+               sname[sy], dl, what, rl, dh < 0 ? "not covered" : dh == 0 ? "identical" : "DIFFER", dg, what, rg, ok && okh ? "ok" : "FAIL");
+        fails += !okh;
         fails += !ok;
     }
     split_free(ctx);

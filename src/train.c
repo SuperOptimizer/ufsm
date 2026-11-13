@@ -376,8 +376,8 @@ static int g_Dl, g_h0; static uint8_t *g_zeros;
 /* --split z with --lat 4 (g_lsplit): each GPU runs its half as a window of its own, depth g_Pz = g_Dl = P / 2 + g_h0 voxels (g_h0 = 4 x the
    trunk's 2^(L-1) halo cells): the batch arrives as a view of the sampler's P^3 window at plane split_z0 (batch_view: plane pointers offset,
    the radial record with the global depth and the first plane, nn.h NN_RAD_REC word 7), the head slabs mask the halo voxels (hs_clip: the loss
-   counts owned voxels; the gradient pass also takes the 4 halo voxels next to the cut, whose upsampled logits read owned cells, and the halo
-   cells' gradient is dropped), the loss sums add across the GPUs in their finalisation (zs_reduce). g_Pw: the sampler's window depth */
+   counts owned voxels; the gradient pass also takes the 2 halo voxels next to the cut, whose upsampled logits read the owned cell beside it, and
+   the halo cells' gradient is dropped), the loss sums add across the GPUs in their finalisation (zs_reduce). g_Pw: the sampler's window depth */
 static int g_lsplit, g_Pw;
 static int g_bench_same;   /* UFSM_BENCH_SAME */
 static int g_Pz;   /* window depth: --Pz (a Pz x P x P slab), else P; g_lsplit: this GPU's part of the window */
@@ -1020,11 +1020,12 @@ static int lhalo(int k) { return k == 0 ? g_norm_s : k >= 3 && k - 3 < g_naux &&
         else nn_loss_stats_acc(LGC(g_fib_ch + 2), d->fdt, d->fdm, d->nw, sev_, d->hs_ds + 84); \
         nn_set_pos_weight(pw_); } while (0)
 /* g_lsplit: the window planes [a, b) whose voxels this half's head slabs supervise. The statistics pass: the owned voxels, so every voxel counts
-   once across the GPUs (the loss sums add in their finalisation). The gradient pass also the 4 halo voxels next to the cut: their upsampled
-   logits read the owned cell beside it (trilinear from the cell centres: 2 voxels each side), so the owned cells' gradient is complete on this
-   GPU; the gradient they leave on the halo cells is dropped (hs_zero_halo_cells: the other GPU computes it for its own cells) */
+   once across the GPUs (the loss sums add in their finalisation). The gradient pass also the 2 halo voxels next to the cut: their upsampled
+   logits (trilinear from the cell centres) read the owned cell beside the cut and the innermost halo cell (exchanged: unet_split_head_halo),
+   so the owned cells' gradient is complete on this GPU; the gradient they leave on the halo cells is dropped (hs_zero_halo_cells: the other
+   GPU computes it for its own cells) */
 static void hs_keep(const gpu_state *d, int pass, int *a, int *b) {
-    const int bd = pass ? 4 : 0;
+    const int bd = pass ? 2 : 0;
     *a = g_lsplit && d->side == 1 ? g_h0 - bd : 0; *b = g_lsplit && d->side == 0 ? g_Pz - g_h0 + bd : g_Pz;
 }
 static void hs_clip(const gpu_state *d, int pass, uint8_t *m, int z0, int z1, size_t hw) {   /* a slab mask (planes [z0, z1)) zeroed outside hs_keep */
@@ -1641,6 +1642,7 @@ static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
         nn_ptick("other"); const shape5 ls = {B, unet_cfg_of(d->u)->cin, g_Pz / 4, P / 4, P / 4};
         if (d->ssl_win) ssl_teacher(d, ls, P);   /* --ssl, an unlabelled window: the teacher's targets, the student's masked input */
         lg = unet_forward_x(d->u, d->x, ls, train, g_xfmt != 0); nn_ptick("trunk forward");
+        if (g_lsplit) unet_split_head_halo(d->u);   /* (the halo cell next to the cut: the head slabs' band reads it) */
     }   /* --lat: x the full-resolution CT channel */
     else lg = unet_forward_x(d->u, d->x, xs, train, g_xfmt != 0);
     d->lg = lg;
@@ -2364,6 +2366,7 @@ int cmd_train(int argc, char **argv) {
         if (nn_set_prec_policy(fp4 >= 2 ? latb ? "all=fp4:fp4:fp4" : "all=fp4:fp4:fp4,enc0.c1=fp16" : latb ? "all=fp4:fp4:fp8" : "all=fp4:fp4:fp8,enc0.c1=fp16")) return 2;
         if (fp4 >= 2) setenv("UFSM_F4_WGRAD", "1", 0);
     }
+    if (ufsm_env_on("UFSM_TEST_SR_OFF")) nn_set_sr(0);   /* tests: round to nearest (the --split z A/B against one GPU: the same arithmetic up to sum orders) */
     if (fp8) { unet_set_act_mx8(1); nn_set_sr(1); if (nn_set_prec_policy("all=fp8:fp8:fp8,enc0.c1=fp16")) return 2; }
     if (*opt(argc, argv, "--policy", "") && nn_set_prec_policy(opt(argc, argv, "--policy", ""))) return 2;
     { char mf[4096]; nn_prec_manifest(mf, sizeof mf); fprintf(stderr, "%s\n", mf); char mp[1400]; snprintf(mp, sizeof mp, "mkdir -p '%s'", out); if (system(mp)) {} if (!resume) { char rp[1400]; snprintf(rp, sizeof rp, "%s/run-defaults.txt", out); FILE *rf = fopen(rp, "w"); if (rf) { fprintf(rf, "gpu_aug_default 2 workers_default 3\n"); fclose(rf); } } snprintf(mp, sizeof mp, "%s/precision.txt", out); WRITE_MANIFEST(mp); }   /* per-layer: "enc0=1,enc1=2,..." */
@@ -4073,6 +4076,11 @@ int cmd_train(int argc, char **argv) {
             for (int g = 1; g < ng; g++) nn_peer_copy(unet_grad_ptr(G[g].u), G[g].dev, unet_grad_ptr(G[0].u), G[0].dev, np * 4);
         }
         for (int g = 0; g < nl; g++) { nn_init(G[g].dev); loss += fetch_loss(&G[g], B, P, dice_w, parts[g]); active += parts[g][2 * NCH]; }   /* split: both sides hold the window's loss */
+        if (getenv("UFSM_GRAD_DUMP") && step == 1) {   /* tests: the first step's summed parameter gradient (fp32) and loss to a file, then exit (split vs one GPU A/B) */
+            nn_init(G[0].dev); float *hg = malloc(np * 4); nn_sync(); unet_grad_d2h(G[0].u, hg); FILE *f = fopen(getenv("UFSM_GRAD_DUMP"), "wb");
+            if (f) { fwrite(&loss, sizeof loss, 1, f); fwrite(hg, 4, np, f); fclose(f); } free(hg);
+            fprintf(stderr, "UFSM_GRAD_DUMP: step 1 loss %.9g, %zu gradients to %s\n", loss, np, getenv("UFSM_GRAD_DUMP")); exit(0);
+        }
         if (G[0].gc_on) { nn_init(G[0].dev); gc_report(&G[0], step); G[0].gc_on = 0; }
         if (g_uw) { double L[SH_N]; uw_mean(G, nl, L); uw_step(L); }   /* the s_h step: the GPUs' mean unscaled head losses */
         if (sheet_log) { fprintf(sheet_log,"%d",step); for (int k=0;k<5;k++) fprintf(sheet_log,",%.8g",G[0].sheet_parts[k]); fprintf(sheet_log,",%.8g,%.8g\n",G[0].sheet_loss,g_sheet_ramp); fflush(sheet_log); }
