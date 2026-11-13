@@ -115,6 +115,7 @@ struct unet {
     int l0rx; const void *l0x_ct; int l0x_held[16];   /* the network input in a ring (--gpu-input: rebuilt per slab from the CT channel); slot -> slab */
     void *l0r_hsk; size_t l0r_hskn;    /* the skip gradient's pinned host copy (stage S4's host mode: the device holds a ring) */
     size_t sc_w; float sc_c; float *stem_b;   /* scale_cond: offset of the conditioning vector, current scale code, effective stem bias */
+    size_t gf_off; float *gf_g, *gf_g1, *gf_dg; int gf_K, gf_top, gf_dedup; void (*gf_red)(void *, float *, int); void *gf_redc;   /* cfg.gfilm: its A / B block (last), the pooled code vector, the affines before it, dg */
     size_t film_off, fstem_off; float film_c[4]; float *ffw;   /* cfg.film: the first A / D pair, the current codes, the forward copy of the weights (when nothing else copies them) */
     block enc[UNET_MAXLEV], dec[UNET_MAXLEV];
     convp down[UNET_MAXLEV], head;
@@ -322,11 +323,45 @@ static void film_bwd(unet *u, float *g) {
     size_t fo = u->film_off; const int K = u->cfg.film;
     for (int j = 0; j < 2 * u->cfg.nlev - 1; j++) { const gnp *n = film_norm(u, j); nn_film_bwd(u->live, g, n->gamma, n->beta, fo, n->c, K, u->film_c); fo += (size_t)2 * K * n->c; }
 }
+/* cfg.gfilm: after the attention stage (its output tokens in tb_cs, [C][S] fp32, B 1): g = their mean, then each decoder block's output
+   norm affine in the forward weights (a copy of the live ones: film_fwd's, else made here) times (1 + A g), plus B g */
+static void gfilm_fwd(unet *u, long S) {
+    if (!u->cfg.gfilm) return;
+    if (u->xs.n != 1) { fprintf(stderr, "unet: gfilm: B 1 (one code vector per forward)\n"); abort(); }
+    if (u->wq) { fprintf(stderr, "unet: gfilm needs dense fp32 master weights (no packed weights)\n"); abort(); }
+    const int K = u->gf_K, L = u->cfg.nlev;
+    if (!u->gf_g) { size_t nc = 0; for (int i = L - 2; i >= 0; i--) nc += u->dec[i].n2.c; u->gf_g = nn_malloc((3 * (size_t)K + nc) * 4); u->gf_dg = u->gf_g + K; u->gf_g1 = u->gf_dg + 2 * K; }   /* (gf_dg: 2 K, the split part and the whole-window part) */
+    if (u->fw == u->live) { if (!u->ffw) u->ffw = nn_malloc(u->np * 4); nn_d2d(u->ffw, u->live, u->np * 4); u->fw = u->ffw; }
+    if (!ufsm_env_on("UFSM_GFILM_FREEZE")) nn_gfilm_pool(u->tb_cs, K, S, u->gf_g);   /* (the env: tests, the last forward's code kept) */
+    size_t fo = u->gf_off, co = 0;
+    for (int i = L - 2; i >= 0; i--) { const gnp *n = &u->dec[i].n2; nn_gfilm_fwd(u->live, u->fw, n->gamma, n->beta, fo, n->c, K, u->gf_g, u->gf_g1 + co); fo += (size_t)2 * K * n->c; co += n->c; }
+}
+/* in the attention stage's backward (the decoders' norm gradients are complete): A / B gradients, the affines' before gfilm, and
+   dg / S into every token's gradient (tb_cs) */
+static void gfilm_bwd(unet *u, long S) {
+    if (!u->cfg.gfilm) return;
+    const int K = u->gf_K, L = u->cfg.nlev; float *dgw = u->gf_dg + K;   /* (dgw: the decoder levels >= gf_top, whole-window on every card) */
+    nn_zero(u->gf_dg, (size_t)2 * K * 4);
+    size_t fo = u->gf_off, co = 0;
+    for (int i = L - 2; i >= 0; i--) {
+        const gnp *n = &u->dec[i].n2; const int whole = u->gf_red && u->gf_top > 0 && i >= u->gf_top;
+        nn_gfilm_bwd(u->live, u->g, n->gamma, n->beta, fo, n->c, K, u->gf_g, u->gf_g1 + co, whole ? dgw : u->gf_dg);
+        if (whole && u->gf_dedup) nn_zero(u->g + fo, (size_t)2 * K * n->c * 4);   /* (the other card's identical A / B gradient counts) */
+        fo += (size_t)2 * K * n->c; co += n->c;
+    }
+    if (u->gf_red) { u->gf_red(u->gf_redc, u->gf_dg, K); nn_axpy(u->gf_dg, 1.f, dgw, (size_t)K); }   /* (--split: the split levels' shares summed, the whole-window levels' once) */
+    /* the token path (dg into the attention tokens) is off by default until its check passes (2026-11-13: analytic vs central
+       differences 9% apart at the 16-bit noise floor, attention needs the tensor-core path): UFSM_GFILM_TOKGRAD=1 turns it on (no
+       parameters change: a run can turn it on later) */
+    if (ufsm_env_on("UFSM_GFILM_TOKGRAD") && !ufsm_env_on("UFSM_GFILM_NO_TOKGRAD")) nn_gfilm_tok(u->tb_cs, K, S, u->gf_dg);
+}
 size_t unet_fstem_off(const unet *u) { return u->fstem_off; }
+size_t unet_gfilm_off(const unet *u) { return u->gf_off; }
+void unet_set_gfilm_reduce(unet *u, void (*fn)(void *ctx, float *dg, int K), void *ctx, int top, int dedup) { u->gf_red = fn; u->gf_redc = ctx; u->gf_top = top; u->gf_dedup = dedup; }
 static double gauss(uint64_t *s);
 int unet_fstem_reset(unet *u, uint64_t seed) {
     if (!u->cfg.fstem) return -1;
-    const size_t off = u->fstem_off, nf = u->np - off, nw = (size_t)u->cfg.fstem * 64; float *h = calloc(nf, sizeof *h); if (!h) return -1;
+    const size_t off = u->fstem_off, nf = (u->gf_off ? u->gf_off : u->np) - off, nw = (size_t)u->cfg.fstem * 64; float *h = calloc(nf, sizeof *h); if (!h) return -1;
     const double sd = sqrt(2.0 / 64); for (size_t i = 0; i < nw; i++) h[i] = (float)(sd * gauss(&seed));   /* (unet_init's: W1 He, b1 and W2 0) */
     nn_h2d(u->p + off, h, nf * 4); nn_h2d(u->ema + off, h, nf * 4);
     nn_zero(u->m + off, nf * 4); nn_zero(u->v + off, nf * 4); if (u->muon_mom) nn_zero(u->muon_mom + off, nf * 4);
@@ -404,6 +439,11 @@ unet *unet_create(const unet_cfg *cfg) {
     if (cfg->film) { u->film_off = off; for (int j = 0; j < 2 * L - 1; j++) off += (size_t)2 * cfg->film * film_norm(u, j)->c; }   /* (params last: older layouts unchanged) */
     if (cfg->fstem < 0 || cfg->fstem > 16 || (cfg->fstem && (cfg->fstem_out < 1 || cfg->fstem_out > 16))) { fprintf(stderr, "unet: fstem takes 1..16 channels and 1..16 outputs\n"); abort(); }
     if (cfg->fstem) { u->fstem_off = off; off += (size_t)cfg->fstem * 64 + cfg->fstem + (size_t)cfg->fstem_out * cfg->fstem; }   /* (after film: last) */
+    if (cfg->gfilm) {   /* (after the stem: last) one A / B pair per decoder block's output norm, dec[L-2] .. dec[0] */
+        if (!cfg->attn_blocks || L < 2) { fprintf(stderr, "unet: gfilm needs the bottleneck attention stage (attn_blocks) and >= 2 levels\n"); abort(); }
+        u->gf_K = cfg->widths[L - 1]; u->gf_off = off;
+        for (int i = L - 2; i >= 0; i--) off += (size_t)2 * u->gf_K * u->dec[i].n2.c;
+    }
     u->np = off;
     if (ufsm_env_on("UFSM_DEBUG")) {
         for (int i = 0; i < L; i++) fprintf(stderr, "enc%d c1.w %zu c1.b %zu n1 %zu c2.w %zu c2.b %zu n2 %zu\n", i, u->enc[i].c1.w, u->enc[i].c1.b, u->enc[i].n1.gamma, u->enc[i].c2.w, u->enc[i].c2.b, u->enc[i].n2.gamma);
@@ -442,7 +482,7 @@ void unet_free(unet *u) {
     nn_free(u->p); nn_free(u->g); nn_free(u->m); nn_free(u->v); nn_free(u->ema); nn_free(u->hf_w); nn_free(u->l0fg_mx); free(u->inh);
     nn_free(u->gn_scratch); nn_free(u->red_scratch); nn_free(u->wg_tmp);
     nn_free(u->wm); nn_free(u->muon_mom); nn_free(u->muon_work); nn_free(u->muon_descs); nn_free(u->stem_b);
-    nn_free(u->mx_mcd); nn_free(u->mx_nsd); nn_free(u->mx_pool); nn_free(u->mx_hbf); nn_free(u->mx_R); nn_free(u->mx_part); free(u->gn_frz); nn_free(u->gn_frz_d); nn_free(u->ge_run); nn_free(u->ge_tw); free(u->gn_acc); nn_free(u->l0run); nn_free(u->l0live); nn_free(u->wsp); nn_free(u->l0s_st); nn_free(u->l0s_tmp); nn_free(u->l0st_g2); nn_free(u->l0st_up); nn_free(u->l0st_poison); nn_free(u->l0h_lg); for (int i = 0; i < UNET_MAXLEV; i++) free(u->rb[i]);
+    nn_free(u->mx_mcd); nn_free(u->mx_nsd); nn_free(u->mx_pool); nn_free(u->mx_hbf); nn_free(u->mx_R); nn_free(u->mx_part); free(u->gn_frz); nn_free(u->gn_frz_d); nn_free(u->ge_run); nn_free(u->ge_tw); nn_free(u->gf_g); free(u->gn_acc); nn_free(u->l0run); nn_free(u->l0live); nn_free(u->wsp); nn_free(u->l0s_st); nn_free(u->l0s_tmp); nn_free(u->l0st_g2); nn_free(u->l0st_up); nn_free(u->l0st_poison); nn_free(u->l0h_lg); for (int i = 0; i < UNET_MAXLEV; i++) free(u->rb[i]);
     nn_free(u->anvil_v1); nn_free(u->anvil_pool); nn_free(u->anvil_descs); nn_free(u->ds_g16); nn_free(u->ds_tmp);
     nn_free(u->wq_q); nn_free(u->wq_sc); nn_free(u->wq_qe); nn_free(u->wq_sce);
     nn_free(u->wq_r); nn_free(u->wq_rsc); nn_free(u->wq_re); nn_free(u->wq_rsce);
@@ -2559,6 +2599,7 @@ static void tb_fwd(unet *u) {
     }
     if (u->cfg.attn_mem) at_mem_out(TB_TOK(u, u->tba + 1), ys.n, (int)(Sg + nr), u->cfg.attn_reg, u->cfg.attn_mem, C, u->tb_memout);
     at_tok_to_cs(TB_TOK(u, u->tba + 1), u->tb_cs, ys.n, C, Sg, nr);
+    gfilm_fwd(u, Sg);   /* (cfg.gfilm: the pooled tokens -> the decoders' norm affines) */
     PROF(4, tb_from_f32(u->tb_cs, ys, 0, b->a2));
     const int G = G_of(u, C);
     if (!gn_frozen(u) && ge_dst(u, b->m2) && nn_gn_stats(b->a2, ys, G, 1e-5f, ge_dst(u, b->m2), ge_dst(u, b->r2))) { fprintf(stderr, "unet: attention stage GroupNorm statistics unsupported for this storage\n"); abort(); }
@@ -2932,6 +2973,7 @@ static float *tb_bwd(unet *u, const float *gy) {
     const shape5 ys = b->ys; const long Sg = (long)shape_spatial(ys);
     PROF(3, gn_silu_bwd_b(u, b, 2, b->a2, ys, G, P(u, b->n2.gamma), P(u, b->n2.beta), b->m2, b->r2, gy, u->tb_g, g + b->n2.gamma, g + b->n2.beta, u->gn_scratch));
     PROF(4, tb_to_f32(u->tb_g, ys, 1, u->tb_cs));
+    gfilm_bwd(u, Sg);
     at_cs_to_tok(u->tb_cs, u->tb_dt, u->tb_zero, ys.n, C, Sg, nr);
     if (u->tb_xg) nn_axpy(u->tb_dt, 1.f, u->tb_xg, (size_t)ys.n * (Sg + nr) * C);   /* (unet_set_token_grad: e.g. a pooled CLS loss) */
     if (u->tb_vr) nn_zero(u->tb_vr + (size_t)u->tbg.nseq * u->tbg.S * C, (size_t)u->tbg.nseq * u->tbg.S * C * 4);   /* (dv1) */
@@ -4443,6 +4485,7 @@ int unet_save(const unet *u, const char *path, int step, const char *extra) {
         fputc(']', f); free(r);
     }
     if (u->cfg.scan_norm) fputs(",\"scan_norm\":1", f);
+    if (u->cfg.gfilm) fputs(",\"gfilm\":1", f);
     if (u->cfg.gn_ema) {   /* the running statistics of every site (live weights, EMA weights; gn_sites layout) and their state */
         ge_alloc(u); const size_t n = 2 * u->ge_ns; float *r = malloc(n * 4); nn_d2h(r, u->ge_run, n * 4);
         fprintf(f, ",\"gn_ema\":1,\"ge_n\":%ld,\"ge_warm\":%d,\"ge_mom\":%.9g,\"ge_run\":[", u->ge_n, u->ge_warm, u->ge_mom);
@@ -4545,6 +4588,7 @@ static int read_header(FILE *f, unet_cfg *cfg, int *step, size_t *np) {
     if ((p = strstr(line, "\"l0_mom\":"))) g_loaded_l0_mom = strtof(p + 9, nullptr);
     if ((p = strstr(line, "\"gn_ema\":"))) cfg->gn_ema = atoi(p + 9);
     if ((p = strstr(line, "\"scan_norm\":"))) cfg->scan_norm = atoi(p + 12);
+    if ((p = strstr(line, "\"gfilm\":"))) cfg->gfilm = atoi(p + 8);
     g_loaded_ge_cnt = 0;
     if (cfg->gn_ema) {
         if ((p = strstr(line, "\"ge_n\":"))) g_loaded_ge_n = atol(p + 7);
@@ -4757,7 +4801,7 @@ int unet_init_from_map(unet *u, const char *path, const int *head_rows) {
         if (same) { nn_d2d(u->p + u->film_off, o->p + o->film_off, nf * 4); nn_d2d(u->ema + u->film_off, o->ema + o->film_off, nf * 4); inh_add(u, u->film_off, nf); n++; }
     }
     if (!S && u->cfg.fstem && oc.fstem == u->cfg.fstem && oc.fstem_out == u->cfg.fstem_out) {   /* the donor's stem */
-        const size_t nf = u->np - u->fstem_off; nn_d2d(u->p + u->fstem_off, o->p + o->fstem_off, nf * 4); nn_d2d(u->ema + u->fstem_off, o->ema + o->fstem_off, nf * 4); inh_add(u, u->fstem_off, nf); n++;
+        const size_t nf = (u->gf_off ? u->gf_off : u->np) - u->fstem_off; nn_d2d(u->p + u->fstem_off, o->p + o->fstem_off, nf * 4); nn_d2d(u->ema + u->fstem_off, o->ema + o->fstem_off, nf * 4); inh_add(u, u->fstem_off, nf); n++;
     }
     if (!S && u->cfg.scale_cond && oc.scale_cond && u->enc[0].c1.cout == o->enc[0].c1.cout) {
         nn_d2d(u->p + u->sc_w, o->p + o->sc_w, (size_t)u->enc[0].c1.cout * 4); nn_d2d(u->ema + u->sc_w, o->ema + o->sc_w, (size_t)u->enc[0].c1.cout * 4); n++;
