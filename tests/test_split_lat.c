@@ -17,7 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-static int P, Pc, Dl, H0, LC = 29, DEV[2] = {0, 1};   /* P voxels (Pc = P / 4 cells); Dl, H0: this side's cells, the halo cells */
+static int P, Pc, Dl, H0, TOP, LC = 29, DEV[2] = {0, 1};   /* P voxels (Pc = P / 4 cells); Dl, H0: this side's cells, the halo cells */
 static _Float16 *hct; static uint8_t *hrec; static _Float16 *hg; static float hbas[29 * 64], hgain[29];
 static size_t RB;   /* record bytes (global depth P) */
 
@@ -80,7 +80,8 @@ static void job(int side, void *a) { (void)a; step(&S2[side], g_cfg->cin, g_cfg-
 static void split2(split_ctx *ctx, const unet_cfg *cfg, unsigned sr, float *g, float *lo, _Float16 *hh0, _Float16 *hh1, int *hok, size_t np) {
     g_cfg = cfg; g_lo = lo; g_hh[0] = hh0; g_hh[1] = hh1;
     for (int s = 0; s < 2; s++) { nn_init(DEV[s]); nn_set_sr_step(sr); side_alloc(&S2[s], cfg, Dl, s); unet_set_split(S2[s].u, s, H0, split_halo);
-                                  if (!getenv("UFSM_SPLIT_SYNC")) unet_set_split_async(S2[s].u, split_halo_begin, split_halo_end); }
+                                  if (!getenv("UFSM_SPLIT_SYNC")) unet_set_split_async(S2[s].u, split_halo_begin, split_halo_end);
+                                  if (TOP) unet_set_split_top(S2[s].u, TOP, split_gather); }
     split_run(ctx, job, nullptr);
     *hok = g_hok[0] && g_hok[1];
     float *g1 = malloc(np * 4);
@@ -89,6 +90,22 @@ static void split2(split_ctx *ctx, const unet_cfg *cfg, unsigned sr, float *g, f
     for (int s = 0; s < 2; s++) { nn_init(DEV[s]); side_free(&S2[s]); }
     free(g1);
 }
+/* the generic collectives (split_xchg / split_sum, the input builders' nn_zcomm): side s sends 1000 + s, receives the other's; sums of
+   u64 / f64 / u32 values */
+static int g_cfail;
+static void coll_job(int side, void *a) {
+    (void)a; const int n = 1000;
+    uint32_t *hs = malloc(n * 4), *hr = malloc(n * 4); for (int i = 0; i < n; i++) hs[i] = (uint32_t)(i * 7 + 1000 * (side + 1));
+    void *ds = nn_malloc(n * 4), *dr = nn_malloc(n * 4); nn_h2d(ds, hs, n * 4);
+    split_xchg(ds, (size_t)n * 4, dr, (size_t)n * 4, nullptr); nn_sync(); nn_d2h(hr, dr, n * 4);
+    for (int i = 0; i < n; i++) if (hr[i] != (uint32_t)(i * 7 + 1000 * (2 - side))) { g_cfail++; break; }
+    uint64_t u[3] = {(uint64_t)side + 1, 1ull << 40, 5}; double f[2] = {0.25 * (side + 1), -1.0}; uint32_t w[2] = {(uint32_t)side, 7};
+    void *du = nn_malloc(24), *df = nn_malloc(16), *dw = nn_malloc(8); nn_h2d(du, u, 24); nn_h2d(df, f, 16); nn_h2d(dw, w, 8);
+    split_sum(du, 3, 0, nullptr); split_sum(df, 2, 1, nullptr); split_sum(dw, 2, 2, nullptr); nn_sync();
+    nn_d2h(u, du, 24); nn_d2h(f, df, 16); nn_d2h(w, dw, 8);
+    if (u[0] != 3 || u[1] != 2ull << 40 || u[2] != 10 || f[0] != 0.75 || f[1] != -2.0 || w[0] != 1 || w[1] != 14) g_cfail++;
+    nn_free(ds); nn_free(dr); nn_free(du); nn_free(df); nn_free(dw); free(hs); free(hr);
+}
 static double rel(const float *a, const float *b, size_t n) {
     double d2 = 0, r2 = 0; for (size_t i = 0; i < n; i++) { const double d = (double)a[i] - b[i]; d2 += d * d; r2 += (double)b[i] * b[i]; }
     return sqrt(d2 / (r2 + 1e-300));
@@ -96,14 +113,11 @@ static double rel(const float *a, const float *b, size_t n) {
 static uint64_t rs = 0x9e3779b97f4a7c15ull;
 static double ru(void) { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return (double)(rs >> 11) * (1.0 / 9007199254740992.0); }
 
-int main(void) {
-    setvbuf(stdout, nullptr, _IONBF, 0);
-    if (nn_init(0)) { printf("test_split_lat: no GPU, skipped\n"); return 0; }
-    if (ufsm_env_on("UFSM_SPLIT_ONE_GPU") || nn_init(1)) { DEV[1] = 0; nn_init(0); nn_check(); }
-    P = getenv("UFSM_P") ? atoi(getenv("UFSM_P")) : 128;
-    unet_cfg cfg = {4, {32, 32, 64, 64}, LC + 3, 16, 8, 1}; cfg.half_res = 3;
-    H0 = 1 << (cfg.nlev - 1); Pc = P / 4; Dl = Pc / 2 + H0;
-    if (P % (8 * H0)) { fprintf(stderr, "P must be a multiple of %d voxels\n", 8 * H0); return 2; }
+static int ci = 0;
+static int run(unet_cfg cfg, int top, int Pv, split_ctx *ctx) {
+    P = Pv; TOP = top;
+    H0 = 1 << (top ? top : cfg.nlev - 1); Pc = P / 4; Dl = Pc / 2 + H0;
+    if (P % (8 << (cfg.nlev - 1))) { fprintf(stderr, "P must be a multiple of %d voxels\n", 8 << (cfg.nlev - 1)); return 2; }
     const size_t p3 = (size_t)P * P * P, c3 = (size_t)Pc * Pc * Pc;
     RB = NN_RAD_REC(P);
     hct = malloc(p3 * 2); hrec = calloc(1, RB); hg = malloc((size_t)cfg.cout * c3 * 2);
@@ -121,15 +135,13 @@ int main(void) {
         for (int z = 0; z < Pc; z++) for (int y = 0; y < Pc; y++) for (int x = 0; x < Pc; x++)
             hg[(((size_t)c * Pc + z) * Pc + y) * Pc + x] = (_Float16)(sin(k[0] * z + k[1] * y + k[2] * x + ph) + 0.2 * (2 * ru() - 1));
     }
-    nn_set_f16(1); nn_set_grad_scale(1024.f); nn_set_loss_grad_h16(1);
-    setenv("UFSM_F4_WGRAD", "1", 0);
-    split_ctx *ctx = split_create(DEV[0], DEV[1]);
     size_t np; { unet *pr = unet_create(&cfg); np = unet_nparams(pr); unet_free(pr); }
     float *g0 = malloc(np * 4), *g1 = malloc(np * 4), *g2 = malloc(np * 4);
     const size_t nl = (size_t)cfg.cout * c3; float *l0 = malloc(nl * 4), *l1 = malloc(nl * 4), *l2 = malloc(nl * 4);
     const size_t hn = (size_t)cfg.cout * 2 * Pc * Pc; _Float16 *h0a = malloc(hn * 2), *h0b = malloc(hn * 2), *h1a = malloc(hn * 2), *h1b = malloc(hn * 2), *h2a = malloc(hn * 2), *h2b = malloc(hn * 2);
-    printf("test_split_lat: P %d voxels (%d cells), level-0 halo %d cells, local depth %d cells%s, %zu params\n", P, Pc, H0, Dl, DEV[0] == DEV[1] ? ", both halves on one GPU" : "", np);
-    int fails = 0, ci = 0;
+    printf("test_split_lat: %d levels%s%s, P %d voxels (%d cells), level-0 halo %d cells, local depth %d cells%s, %zu params\n", cfg.nlev, cfg.attn_blocks ? " + attention" : "",
+           top ? ", whole from level 3 (split_top)" : "", P, Pc, H0, Dl, DEV[0] == DEV[1] ? ", both halves on one GPU" : "", np);
+    int fails = 0;
     static const int syms[3] = {0 | 1 << 2 | 2 << 4, 0 | 1 << 2 | 2 << 4 | 1 << 8, 1 | 0 << 2 | 2 << 4};   /* identity, z flip, z <-> y */
     static const char *const sname[3] = {"identity", "z flip", "z<->y"};
     for (int mode = 0; mode < 3; mode++) for (int sy = 0; sy < 3; sy++, ci++) {   /* 0 MX-fp8 round to nearest, 1 the fp4 preset round to nearest, 2 the fp4 preset (stochastic) */
@@ -161,6 +173,28 @@ int main(void) {
                sname[sy], dl, what, rl, dh < 0 ? "not covered" : dh == 0 ? "identical" : "DIFFER", dg, what, rg, ok && okh ? "ok" : "FAIL");
         fails += !okh;
         fails += !ok;
+    }
+    free(hct); free(hrec); free(hg); free(g0); free(g1); free(g2); free(l0); free(l1); free(l2); free(h0a); free(h0b); free(h1a); free(h1b); free(h2a); free(h2b);
+    return fails;
+}
+int main(void) {
+    setvbuf(stdout, nullptr, _IONBF, 0);
+    if (nn_init(0)) { printf("test_split_lat: no GPU, skipped\n"); return 0; }
+    if (ufsm_env_on("UFSM_SPLIT_ONE_GPU") || nn_init(1)) { DEV[1] = 0; nn_init(0); nn_check(); }
+    nn_set_f16(1); nn_set_grad_scale(1024.f); nn_set_loss_grad_h16(1);
+    setenv("UFSM_F4_WGRAD", "1", 0);
+    split_ctx *ctx = split_create(DEV[0], DEV[1]);
+    int fails = 0;
+    split_run(ctx, coll_job, nullptr);
+    printf("test_split_lat: collectives (xchg, u64 / f64 / u32 sums): %s\n", g_cfail ? "FAIL" : "ok"); fails += g_cfail != 0;
+    const char *only = getenv("UFSM_ONLY_NET");   /* 0: the 4-level net, 1: the 6-level one with attention and split_top */
+    if (!only || atoi(only) == 0) {
+        unet_cfg cfg = {4, {32, 32, 64, 64}, LC + 3, 16, 8, 1}; cfg.half_res = 3;
+        fails += run(cfg, 0, getenv("UFSM_P") ? atoi(getenv("UFSM_P")) : 128, ctx);
+    }
+    if (!only || atoi(only) == 1) {   /* the scratch2 shape in small: 6 levels, attention on the bottleneck, levels 3.. whole */
+        unet_cfg cfg = {6, {32, 32, 64, 64, 96, 96}, LC + 3, 16, 8, 1}; cfg.half_res = 3; cfg.attn_blocks = 1;
+        ci = 9; fails += run(cfg, 3, getenv("UFSM_P6") ? atoi(getenv("UFSM_P6")) : 256, ctx);
     }
     split_free(ctx);
     printf("test_split_lat: %s\n", fails ? "FAIL" : "ok");

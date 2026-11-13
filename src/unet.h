@@ -399,5 +399,12 @@ size_t unet_grad_bytes(const unet *u);   /* the activation-gradient part of unet
    off. Parameter gradients are this half's share: sum them across the two GPUs. */
 typedef void (*unet_halo_fn)(const void *p, shape5 s, int esz, int h);
 void unet_set_split(unet *u, int side, int h0, unet_halo_fn fn);
+/* the whole-window deep levels (before the first forward): levels 0 .. top - 1 run split, down[top - 1]'s output is gathered (fn: both
+   sides' owned planes into the whole-window layout, split_gather) and levels top .. nlev - 1 (with the attention stage) and their decoders
+   run on the whole window on both GPUs; dec[top]'s output is sliced back to this half for dec[top - 1]. Needs h0 = 2^top (halo 2 planes at
+   level top - 1, 1 at top), recompute mode, the tensor-core path. The deep levels' parameter gradients are kept on side 0 only (zero
+   on side 1), so the two halves' gradients still add up to the window's. top 0: off */
+typedef void (*unet_gather_fn)(const void *p, shape5 s, int esz, int h, int D);
+void unet_set_split_top(unet *u, int top, unet_gather_fn fn);
 /* optional: the exchange in two parts (split_halo_begin / split_halo_end) so a weight gradient overlaps it */
 void unet_set_split_async(unet *u, unet_halo_fn begin, unet_halo_fn end);

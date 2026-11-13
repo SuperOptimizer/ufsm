@@ -6,6 +6,8 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Split-window input builders: every --gpu-aug builder by z range, the scanner split exactly across two GPUs (2026-11-13, branch augz-20261112)
+
 ## Muon variants for the from-scratch universal net: ten arms on the 92 M net (2026-11-13, branch muonx-20261113)
 
 The regime: B = 1, P 512..1024 windows. Gradients are very noisy and runs are short (tens of thousands of steps). ANVIL II already tied
@@ -30,6 +32,157 @@ against plain Muon, with a block-bootstrap CI (`absum.py`).
 | `--muon-tc 1` | the NS products on fp16 tensor cores (wmma, fp32 accumulate) | | built; accuracy test vs fp32 |
 
 Results: pending (the arms land in runs/muonx/runs; table below as they do).
+
+- **Labels** (nn_label_warp_z / nn_label_sym_z / nn_w4runs_label_z / nn_ink_bits_z) write output planes [z0, z0 + nz) from source
+  planes [s0, s1) only.
+  - nn_aug_src_range(rad, P, z0, nz) bounds [s0, s1). The warp's source z is linear in the per-axis displaced coordinates (rotation,
+    zoom, affine, symmetry; elastic is per-axis tables), so its extremes are at the corners of the box of their ranges. Measured: the
+    bound is at most 4 planes wider than the corners actually read, over 12 cases.
+  - Under rotation the source range is ~nz cos + P sin. At P 256 the 40 / 72 range at 30 degrees staged 3.56 nz. So the staging does
+    not halve under rotation: budget ~P planes of 8-bit staging per GPU (1 GB at P 1024).
+  - nn_w4runs_apply_z: the runs are per x row, so a z range needs no plane outside it (strip offsets into the run table).
+- **CT channel** (nn_aug_ct_z): the scanner ops need the whole source window. Paganin's two-sided exponential and the correlated
+  noise recurse along z, GIN / histogram / z-score use whole-window statistics, and the z blur reads taps. With a zcomm (two ranks),
+  rank r scans its source half and exchanges:
+  - the halo planes, as they are before each stencil (the z blur's reach from the plan, GIN's 1, a dropped slice's source);
+  - the correlated noise's carried plane (rank 0 -> 1);
+  - paganin's carried y per line: forward 0 -> 1, then rank 1's backward from P - 2, then 1 -> 0;
+  - the statistics: integer sums exact, GIN's two doubles as two partial atomic sums, which are order-free anyway;
+  - finally, the scanned 8-bit planes each rank's warp reads from the other.
+  The fp16 work volume aliases the rank's CT channel planes, as the one-GPU path does, when P/2 + 2 halo <= nz.
+  Per GPU at P 1024: CT channel 544 planes (1.14 GB) + staging <= 1 GB, against 2 + 2.23 GB for the whole window.
+- **Tests** (tests/test_aug_z.c, gpu, 14 s at P 256):
+  - every label builder over 4 ranges x 12 warp / symmetry cases, with poisoned host planes outside [s0, s1) and a poisoned staging
+    buffer;
+  - the CT channel for the 22 scanner ops alone at two strengths, a mixture and none (44 cases) x 2 range pairs: the one-GPU range
+    and both split ranks, through a loopback zcomm (two host threads, one GPU, a staging slot each);
+  - all byte-identical to the whole-window call. A negative control (the exchanges dropped) differs on every voxel.
+  - test_gpu_aug is unchanged and passes.
+- **Stored onfly codes are now dcached.** The key is the array path, zarr.json size / mtime and the poolings. Without it every read
+  recomputed the pair rule (16-50 s per 512^3 window on the CPU). sources-scratch1 v3 reads june / 0139 / 0500P2 / 1667-gt phase on
+  the fly from their codes; phase-onfly against the stored rasters:
+  - P4 june codesA 9.6 rmax 40: 0 differing voxels;
+  - 0139 A+B fused rmax 41: 0 differing voxels;
+  - 0500P2: native codes rebuilt, 0 differing voxels;
+  - 1667 A+B 4.8 pooled: 10384 of 805 M voxels differ;
+  - P4 july: the gtjuly codesB rebuild differs on 29%, because the 10-19 codes it came from are gone, so it keeps phaseB.
+- Left to the split itself (univI): the zcomm over split.c's staged peer copies, the latent input from the CT channel, the
+  label-stream slabs, MIL rays.
+## The from-scratch net's whole-window field: measured ERF, seams, LR probe (2026-11-13, branch rfwide-20261113)
+
+The next universal latent net (from scratch, all heads, one 1024^3 window split across both desk cards) is nlev 6, widths
+256,320,384,448 + deep levels 288,288, 4 full-attention blocks with scroll RoPE on the 8^3-cell bottleneck (~92 M params): flags
+`--widths 256,320,384,448,288,288 --attn-blocks 4 --attn-pe scroll`. Planner (13.3 GB per card, the scratch1 heads): 12.35 GB at
+P 1024 x Pz 512 (the split proxy) vs 12.32 GB without the deep levels / attention; 4.09 GB at P 512 on one card. Theoretical RF:
+nlev 4 103 cells, nlev 5 215, nlev 6 439 (> the 256-cell window; the attention is global on the bottleneck anyway).
+
+**Seams** (inkpod-12000 ink, 1299 box 1024^3 at level 2, windows 512 + 2 halo; y / x seam steps, interior medians 0.05-0.3):
+
+| halo | per-window GN + z-score | GN frozen (pooled) | fixed --norm | both |
+|---|---|---|---|---|
+| 16 | 15.4 / 26.6 | 13.8 / 11.0 | 15.3 / 24.9 | 6.2 / 6.9 |
+| 64 | 28.3 / 11.7 | 5.0 / 10.6 | 28.0 / 10.1 | - |
+| 256 | 5.8 / 6.7 | 0.3 / 2.2 | - | 0.0 / 0.1 |
+
+Three causes: the halo below the RF radius, GroupNorm's whole-window statistics and the per-window input z-score. Pooled frozen
+statistics at inference shift the outputs (ink mean 42 -> 33): the fix belongs in training (EMA GroupNorm at all levels, a
+per-scan input z-score), next on this branch.
+
+**Measured ERF** (`UFSM_ERF=DELTA` in train, `--lat` with the streamed head: the first training window forwarded, DELTA = 1 added to
+the central 4^3 cells (16^3 voxels) of the z-scored CT, forwarded again; per cell the largest |logit change| of the first 16 head
+channels, by Chebyshev distance r to the block. `UFSM_ERF_GNFROZEN=1` normalises the perturbed forward with the base forward's
+GroupNorm statistics (`unet_gn_freeze_train`, diagnostics only): convolution reach alone. `UFSM_ERF_REPEAT=1`: 0 change everywhere,
+the forward is deterministic.) unissl sources, P 1024 (256^3 cells) unless noted:
+
+| net | GN | centre | r 32 | r 48 | r 56 | r >= 64 | far floor / centre | r50 / r90 |
+|---|---|---|---|---|---|---|---|---|
+| u1 random | live | 0.744 | 0.498 | 0.500 | 0.225 | 0.12-0.15 | 0.18 | 94 / 120 |
+| u1 trained (last.ckpt) | live | 0.448 | 0.282 | 0.268 | 0.269 | 0.25-0.27 | **0.58** | 100 / 122 |
+| u1 trained | frozen | 0.446 | 0.267 | 0.156 | 0.043 | **0** | 0 | 39 / 51 |
+| 92 M random, P 768 | frozen | 0.872 | 0.660 | 0.743 | 0.737 | 0.45-0.69 (to r 94) | 0.47 | 70 / 89 |
+| 92 M random, P 768 | live | 0.914 | 0.666 | 0.751 | 0.745 | 0.45-0.70 | 0.45 | 70 / 89 |
+
+- u1's convolution reach ends at r ~ 56-60 cells (the theoretical 51.5 + the block), +-230 voxels of a 1024 window: the outer
+  ~40% of each axis never sees the window's centre and vice versa.
+- In trained u1 the whole-window GroupNorm coupling is larger than the convolution signal: a 16^3-voxel change moves every logit of
+  the window by 58% of the change at the block itself, flat to the corners. This is the window dependence behind the seams
+  (and why a window's outputs change with its extent); EMA GroupNorm removes it by construction.
+- The 92 M net covers the whole window by convolution + attention alone (frozen: 47% of the centre change at the corners, r 94
+  at P 768); random-init ERFs are wider than trained ones, the trained number comes with the first snapshot.
+
+**LR probe** (the 92 M net at P 512 B 1 on one card, from scratch on sources-scratch1.json, --det 1 seed 7 so every arm sees the
+same windows, 300 steps, warmup 50, WSD cooldown 0.2, AdamW 1e-3, 0.60 samp/s): mean logged loss over steps 200-300 Muon 0.005
+1.710, 0.01 1.719, 0.02 1.721 (per-head at 300 within 0.01 of each other); none unstable. 300 steps at B 1 do not separate the
+arms (differences ~0.01, 5 logged points); the earlier voxel-net sweep (F1 0.307 / 0.296 / 0.290 at 0.01 / 0.02 / 0.05) stays the
+basis: Muon 0.01, AdamW 1e-3, warmup 1000, WSD cooldown 0.2.
+
+**fib-head + fstem** (1f881bf): `--fstem` refused `--fib-head` ("25 outputs (16 at most)"): the head pads past 16 outputs to 32
+and the fine stem counted the 9 unsupervised pad channels. It now maps into the supervised voxel outputs only (phase 2, wind4 2,
+ink 1, rv 2, fibre 9 = 16, the stem kernel's limit); test_fibhead_train covers --lat 4 --fstem 16 --ink-head 1 --fib-head 1.
+
+**EMA GroupNorm at every site** (`--gn-ema 1`, unet_cfg.gn_ema; `--gn-ema-mom 0.01 --gn-ema-warm 500`): all GroupNorms (every level's
+blocks, the down norms, the attention stage, the head's input) normalise with running statistics (BatchNorm-style, [mean | var] per
+group in the gn_sites layout; the first warm training forwards use their own statistics, after that training forwards are constants
+in forward and backward, the backward without the statistics' terms, nn_set_gn_const; inference uses the running statistics as soon
+as there are any). The sites hold the constants before the convs run (ge_begin), the convs write their live statistics to twins
+(ge_dst) that ge_after pools into the running set after dec[0]; the EMA weights keep their own set (unet_ema), forwards with the
+EMA weights (the SSL teacher) do not update. Checkpoints: header keys `gn_ema`, `ge_n`, `ge_warm`, `ge_mom`, `ge_run` only when on
+(no new parameters: an old checkpoint loads into a gn_ema net as a fresh warm-up; u1-size net 448 floats, 31 KB header). Needs
+`--l0-norm gn`. Multi-GPU data parallel: each card keeps its own statistics (card 0's are saved); with --split z the cards share one
+window, so their statistics agree. Tests: test_gn_ema (both a down-norm net and an attention net: the warm-up then the running blend
+at every site to 1e-4; a far-corner input change leaves the logits bit-identical, live GN moves them; momentum 1 reproduces live GN,
+statistics 1e-7, logits 5e-3 of 6.2; EMA-weight set; checkpoint round trip bit-identical; old checkpoint = fresh warm-up; finite
+backward), test_unet~GN_EMA=1 (fp32 finite differences with down norms: worst 7.5e-5 over 60 params; tensor cores vs fp32 logits
+0.061 of 6.6). Train smoke (u1 widths, P 256, warm-up 10): losses continuous across the switch to constants.
+
+**Per-scan input normalisation** (`--scan-norm 1`, unet_cfg.scan_norm, src/scannorm.c): the CT input is (v - center) / scale with one
+(center, scale) per scan and level instead of each window's mean / sd: the mean and sd of the nonzero voxels in 48 boxes of 32^3 at
+the working level, centred on nonzero voxels of a coarse level (the first of L + 2 .. L + 9 with <= 2^26 voxels read whole, else the
+smallest subsampled every st-th voxel) at fixed ranks: a deterministic function of the volume. The sampler computes it on the first
+window per (source, level) (a source's "norm" key wins; a failure keeps the window z-score, reported once); the checkpoint keeps
+`"scan_norm":1`, and predict computes the same numbers for its scan and level (`--norm MEAN,SD` overrides). Mean / sd rather than
+median / MAD: inside the mask the nonzero voxels are bimodal and the MAD follows the dominant mode only (1667 level 2: median 45,
+1.4826 MAD 10.4, papyrus at ~+7; mean / sd 62.9 / 37.6). On the unissl sources all 22 (source, level) pairs get statistics (center
+62.9-126, scale 28-56); predict on 1667 level 2 prints 62.9 / 37.59, the sampler's. test_scan_norm (wind fixture: deterministic
+across runs, in the checkpoint, predict = sampler, --norm overrides, the losses change).
+
+Found on the way (not fixed here): with the scratch1 sources at P 1024 on one card an early `inkfly gpu: out of device memory`
+falls back to the CPU and then segfaults in nn_ink_bits (cudaMemcpyAsync of an invalid host pointer, lab_upload kind 3); and
+the scratch1 data path holds ~7 GB of device memory outside the planner at P 512.
+## Deep levels whole on both cards: --split-top (2026-11-13, branch splitwin-20261112)
+
+Under `--split z` the halo is 2^(nlev-1) cells. For the 6-level scratch2 net that would be 32 cells (128 voxels): halves of 640 instead
+of 544 at P 1024, +18 % level-0 memory and compute. `unet_set_split_top(u, T, split_gather)` / `train --split-top T` (default 3 above 4
+levels) splits only levels 0..T-1.
+
+**Forward:**
+- down[T-1]'s output is all-gathered in place (split_gather / nn_split_gather: each half's owned planes, peer copy, unpacked into the
+  whole window's layout).
+- Levels T.. (the attention stage included) and their decoders run on the whole window on both GPUs, with nn's split statistics off
+  (sp_deep).
+- dec[T]'s a2 is sliced back to the half (sp_slice) behind a stand-in block for dec[T-1]'s staged upsample. Its GN statistics are the
+  window's.
+
+**Backward:**
+- The coarse up-part gradient is computed on the half and gathered.
+- enc[T]'s input gradient is sliced back for the split down[T-1].
+- Both cards compute identical deep parameter gradients, so side 1 zeroes its copy (sp_dedup, before film_bwd). The existing two-card
+  gradient sum then stays the window's.
+
+**Parity:** the halo is 2^T cells, so 2 planes at level T-1 and 1 at level T, which keeps the stride-2 grid. A gather at level 4 with
+an 8-cell halo would break that parity, so T = 3 with 8 cells (32 voxels) is the setting that keeps today's 544-deep halves. Level 3 at
+P 1024 is 32^3 cells, so the redundant deep compute is negligible.
+
+**Attention:** the stage sees the whole window, so `--attn-pe scroll` keeps the sampler's whole-window axis record under the split.
+
+**test_split_lat:** a 6-level net (32,32,64,64,96,96) with an attention block at P 256 (local 40 cells), against one GPU. It gives the
+same verdicts as the 4-level net:
+
+| mode | owned logits | cut halo cells | gradient rel | 4-level net |
+|---|---|---|---|---|
+| fp4 rn | bit-identical | identical | 6e-8 | 2e-8 |
+| MX-fp8 rn | bit-identical | identical | 7e-3 (perturbed CT: 0.49) | 5e-3 |
+| fp4 sr | bit-identical | identical | at the seed-to-seed spread | at the seed-to-seed spread |
 
 ## One P 1024 window across both 5060 Tis: the z split for the latent net (design, 2026-11-12, branch splitwin-20261112)
 

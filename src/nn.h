@@ -562,6 +562,17 @@ void nn_split_halo_end(void *t, int side, shape5 s, int esz, int h, void *rb, in
 /* the k innermost halo planes at once (k <= h; synchronous on both devices' stream 0, no zeroing): side 0 sends its own planes
    [D - h - k, D - h) into side 1's [h - k, h), side 1 its [h, h + k) into side 0's [D - h, D - h + k). sb / rb: k planes each */
 void nn_split_halo_k(void *const *t, const int *dev, shape5 s, int esz, int h, int k, void *const *sb, void *const *rb);
+/* generic pairwise collectives on caller streams (st: cudaStream_t per side, nullptr = the default stream): recv[i] <- send[1 - i]
+   (nr[i] bytes; the peer copy runs on side i's stream after side 1 - i's stream reached the call, and side 1 - i's stream waits for it,
+   so either buffer may be reused in stream order after); the typed in-place sum of n values (type 0 u64, 1 f64, 2 u32) through the
+   scratch r[i] (n values of 8 bytes) */
+void nn_split_xchg(const int *dev, const void *const *send, void *const *recv, const size_t *nr, void *const *st);
+void nn_split_sum_t(void *const *b, const int *dev, int n, int type, void *const *r, void *const *st);
+/* split_top: side i's owned planes [i ? h : 0, + D / 2) of its depth-s.d tensor t[i] (both sides) into the whole-window layout of depth D
+   in place (synchronous on both devices' stream 0; sb / rb: D / 2 planes each); and planes [z0, z0 + s.d) of a whole-window tensor
+   (shape sf) into a local one (shape s), stream 0 */
+void nn_split_gather(void *const *t, const int *dev, shape5 s, int esz, int h, int D, void *const *sb, void *const *rb);
+void nn_split_slice(const void *src, shape5 sf, void *dst, shape5 s, int esz, int z0);
 void nn_split_allreduce(double *const *b, const int *dev, int n, double *const *r);
 /* Device-to-device copy across GPUs (peer access when possible). */
 void nn_peer_copy(void *dst, int dst_dev, const void *src, int src_dev, size_t bytes);
