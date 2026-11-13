@@ -1033,10 +1033,106 @@ template <typename TG, int YB> static void conv1_to_mx_t(const TG *x, int N, int
                  else conv1_to_mx_t_k<TG, 192, YB><<<grid, 256>>>(x, w, yq, N, Co, S, sr, Ci, vb, vn);    /* 145..192 (the sub-cell head over 32 / 48 / 64 base outputs: the fibre head) */
     }
 }
+/* the wide head's backward-data on the tensor cores (perf2 2026-11-13): 17..192 fp16 logit gradients -> Co MX channels. conv1_to_mx_t_k
+   with CI 192 held the 160 inputs of the latent cell head in registers (spilled) and re-read them for each of the 8 output blocks (P 1024
+   split-half slab of 4 x 256^2 cells: ~3 ms). Here a block takes 64 cells x 256 outputs (a warp per 32-channel MX block), K in chunks of
+   32 through shared memory (fp16 weights from a converted copy, the gradients transposed to [cell][k]), m16n8k16 MMAs with fp32
+   accumulation, and each cell's 32 sums leave through mx_store_row_b (the same SR draw per element as the FFMA kernel; the sums differ by
+   the weights' fp16 rounding and the order). UFSM_HEAD_BTC=1: on (default off: test_head_tc passes, but test_lat_head's "second equal net" differs with it on, rel 0.4; open). */
+enum { C1B_N = 64 };
+__global__ void c1b_wh_k(const float *w, __half *wh, int Co, int Ci, int Kp) {   /* [Co][Ci] fp32 -> [Co][Kp] fp16, zero padded */
+    const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; if (i >= (size_t)Co * Kp) return;
+    const int co = (int)(i / Kp), k = (int)(i % Kp);
+    wh[i] = __float2half(k < Ci ? w[(size_t)co * Ci + k] : 0.f);
+}
+template <int YB>
+__global__ void __launch_bounds__(256) conv1_to_mx_tc_k(const __half *__restrict__ gy, const __half *__restrict__ wh, uint8_t *__restrict__ y, int N, int Co, size_t S,
+                                                        unsigned sr, int Ci, int Kp, size_t vbase, size_t vn) {
+    __shared__ __align__(16) unsigned char c1b_sm[8 * 32 * 33 * 4];   /* the staging (sA 256 x 40, sB 64 x 40 halves) or the epilogue patches */
+    __half (*sA)[40] = (__half (*)[40])c1b_sm, (*sB)[40] = (__half (*)[40])(c1b_sm + 256 * 40 * 2);
+    float (*pt)[32][33] = (float (*)[32][33])c1b_sm;
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t4 = lane & 3;
+    const int n = blockIdx.y, co0 = blockIdx.z * 256, nb = Co / 32;
+    const size_t c0 = (size_t)blockIdx.x * C1B_N;
+    float acc[2][8][4];
+#pragma unroll
+    for (int m = 0; m < 2; m++) for (int j = 0; j < 8; j++) for (int q = 0; q < 4; q++) acc[m][j][q] = 0.f;
+    const int sc_cell = tid & (C1B_N - 1), skq = tid >> 6;   /* staging of the gradients: cell, k quarter (8 k) */
+    for (int kc = 0; kc < Kp; kc += 32) {
+        {   /* weights: row tid (output co0 + tid), 32 k = 4 x 16 B */
+            const int co = co0 + tid;
+            uint4 *dst = (uint4 *)&sA[tid][0];
+            if (co < Co) { const uint4 *src = (const uint4 *)(wh + (size_t)co * Kp + kc); for (int q = 0; q < 4; q++) dst[q] = __ldg(src + q); }
+            else for (int q = 0; q < 4; q++) dst[q] = make_uint4(0u, 0u, 0u, 0u);
+        }
+        {   /* gradients: cell sc_cell, k = kc + 8 skq .. + 7 -> one 16-byte row piece of sB */
+            __align__(16) __half hv[8];
+            const size_t cl = c0 + sc_cell;
+#pragma unroll
+            for (int q = 0; q < 8; q++) { const int k = kc + 8 * skq + q; hv[q] = cl < vn && k < Ci ? gy[((size_t)n * Ci + k) * vn + cl] : __float2half(0.f); }
+            *(uint4 *)&sB[sc_cell][8 * skq] = *(const uint4 *)hv;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int ks = 0; ks < 2; ks++) {
+            unsigned af[2][4];
+#pragma unroll
+            for (int m = 0; m < 2; m++) {
+                const int r = warp * 32 + 16 * m + g, k = 16 * ks + 2 * t4;
+                af[m][0] = *(const unsigned *)&sA[r][k]; af[m][1] = *(const unsigned *)&sA[r + 8][k];
+                af[m][2] = *(const unsigned *)&sA[r][k + 8]; af[m][3] = *(const unsigned *)&sA[r + 8][k + 8];
+            }
+#pragma unroll
+            for (int j = 0; j < 8; j++) {
+                unsigned bf[2];
+                bf[0] = *(const unsigned *)&sB[8 * j + g][16 * ks + 2 * t4]; bf[1] = *(const unsigned *)&sB[8 * j + g][16 * ks + 2 * t4 + 8];
+#pragma unroll
+                for (int m = 0; m < 2; m++)
+                    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                                 : "+f"(acc[m][j][0]), "+f"(acc[m][j][1]), "+f"(acc[m][j][2]), "+f"(acc[m][j][3])
+                                 : "r"(af[m][0]), "r"(af[m][1]), "r"(af[m][2]), "r"(af[m][3]), "r"(bf[0]), "r"(bf[1]));
+            }
+        }
+        __syncthreads();
+    }
+    const int blk = co0 / 32 + warp;
+    uint8_t *ysc = mx_sc<YB>(y, N, Co, S);
+#pragma unroll
+    for (int h = 0; h < 2; h++) {   /* cells 32 h .. + 31: the warp's 32 x 32 sums transposed through its patch, a cell's row per lane */
+#pragma unroll
+        for (int m = 0; m < 2; m++)
+#pragma unroll
+            for (int jj = 0; jj < 4; jj++)
+#pragma unroll
+                for (int q = 0; q < 4; q++) pt[warp][16 * m + g + 8 * (q >> 1)][8 * jj + 2 * t4 + (q & 1)] = acc[m][4 * h + jj][q];
+        __syncwarp();
+        const size_t cl = c0 + 32 * h + lane;
+        if (blk < nb && cl < vn) {
+            float r[32];
+#pragma unroll
+            for (int k = 0; k < 32; k++) r[k] = pt[warp][k][lane];
+            mx_store_row_b<YB>(y, ysc, ((size_t)n * nb + blk) * S + vbase + cl, 32, r, sr);
+        }
+        __syncwarp();
+    }
+}
+static int g_head_btc = -1;
+template <int YB> static bool conv1_to_mx_tc(const __half *x, int N, int Ci, size_t S, const float *w, int Co, void *y, unsigned sr, size_t vb, size_t vn) {
+    if (g_head_btc < 0) g_head_btc = getenv("UFSM_HEAD_BTC") ? atoi(getenv("UFSM_HEAD_BTC")) : 0;   /* (default off again: test_lat_head's second equal net differs, open) */
+    if (!g_head_btc || Ci <= 16 || Ci > 192 || Co % 32) return false;
+    const int Kp = (Ci + 31) / 32 * 32;
+    __half *wh = lp_buf<__half>(0, (size_t)Co * Kp);   /* (the only fp16 lp_buf: per element type, slots 0..5) */
+    c1b_wh_k<<<nblk_((size_t)Co * Kp, 256), 256>>>(w, wh, Co, Ci, Kp);
+    const size_t nv = vn ? vn : S;
+    conv1_to_mx_tc_k<YB><<<dim3((unsigned)((nv + C1B_N - 1) / C1B_N), N, (unsigned)((Co + 255) / 256)), 256>>>(x, wh, (uint8_t *)y, N, Co, S, sr, Ci, Kp, vb, nv);
+    return true;
+}
+extern "C" void lp_set_head_btc(int on) { g_head_btc = on; }   /* tests: the tensor-core head backward-data on / off (-1: env UFSM_HEAD_TC) */
 /* the same over rows [vb, vb + vn) (x holding vn voxels per channel; the level-0 slab stream's head, stage S4): fp16 / bf16 / fp32 x */
 extern "C" void lp_conv1_to_mx_r(const void *x, int gdt, int N, int Ci, size_t S, const float *w, int Co, void *y, int ydt, unsigned sr, size_t vb, size_t vn) {
     if (Ci > 192) { fprintf(stderr, "lp_conv1_to_mx_r: Ci %d > 192\n", Ci); abort(); }
-#define C1M(YB) do { if (gdt == 2) conv1_to_mx_t<__half, YB>((const __half *)x, N, Ci, S, w, Co, y, sr, vb, vn); \
+#define C1M(YB) do { if (gdt == 2 && conv1_to_mx_tc<YB>((const __half *)x, N, Ci, S, w, Co, y, sr, vb, vn)) break; \
+                     if (gdt == 2) conv1_to_mx_t<__half, YB>((const __half *)x, N, Ci, S, w, Co, y, sr, vb, vn); \
                      else if (gdt == 1) conv1_to_mx_t<bf16, YB>((const bf16 *)x, N, Ci, S, w, Co, y, sr, vb, vn); \
                      else conv1_to_mx_t<float, YB>((const float *)x, N, Ci, S, w, Co, y, sr, vb, vn); } while (0)
     if (ydt == 4) C1M(4); else C1M(8);
@@ -1047,7 +1143,8 @@ extern "C" void lp_conv1_to_mx(const void *x, int gdt, int N, int Ci, size_t S, 
     if (Ci > 192) { fprintf(stderr, "lp_conv1_to_mx: Ci %d > 192\n", Ci); abort(); }
     static int old = -1; if (old < 0) old = getenv("UFSM_CONV1_OLD") ? atoi(getenv("UFSM_CONV1_OLD")) : 0;
     if (!old || ydt == 4 || Ci > 8) {
-#define C1M(YB) do { if (gdt == 2) conv1_to_mx_t<__half, YB>((const __half *)x, N, Ci, S, w, Co, y, sr); \
+#define C1M(YB) do { if (gdt == 2 && conv1_to_mx_tc<YB>((const __half *)x, N, Ci, S, w, Co, y, sr, 0, 0)) break;   /* (the range form's kernel: whole == per range, bit for bit) */ \
+                     if (gdt == 2) conv1_to_mx_t<__half, YB>((const __half *)x, N, Ci, S, w, Co, y, sr); \
                      else if (gdt == 1) conv1_to_mx_t<bf16, YB>((const bf16 *)x, N, Ci, S, w, Co, y, sr); \
                      else conv1_to_mx_t<float, YB>((const float *)x, N, Ci, S, w, Co, y, sr); } while (0)
         if (ydt == 4) C1M(4); else C1M(8);

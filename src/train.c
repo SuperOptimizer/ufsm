@@ -1070,11 +1070,12 @@ static int lhalo(int k) { return k == 0 ? g_norm_s : k >= 3 && k - 3 < g_naux &&
         nn_ink_targets(fh_ + vb, ns, d->fht, d->fhm); nn_ink_targets(fv_ + vb, ns, d->fht + ns, d->fhm + ns); \
         nn_fib_head_dir(fh_, fv_, D, H, W, z0, nz, g_fd_r, 0.6f, d->fdt, d->fdm); \
         hs_clip(d, pass, d->fhm, z0, z1, hw); hs_clip(d, pass, d->fhm + ns, z0, z1, hw); hs_clip(d, pass, d->fdm, z0, z1, hw); } while (0)   /* (g_lsplit: this half's voxels) */
-#define FIBH_LOSS(grad) do { const shape5 one_ = {1, 1, nz, H, W}, sev_ = {1, 7, nz, H, W}; \
-        for (int k_ = 0; k_ < 2; k_++) { if (grad) nn_loss_grad_only(LGC(g_fib_ch + k_), d->fht + k_ * ns, d->fhm + k_ * ns, d->fhw, one_, 0.f, LGC(g_fib_ch + k_), d->fhs[k_]); \
+#define FIBH_LOSS(grad) FIBH_LOSS_S(grad, 1.f)
+#define FIBH_LOSS_S(grad, mul_) do { const shape5 one_ = {1, 1, nz, H, W}, sev_ = {1, 7, nz, H, W}; \
+        for (int k_ = 0; k_ < 2; k_++) { if (grad) nn_loss_grad_only_s(LGC(g_fib_ch + k_), d->fht + k_ * ns, d->fhm + k_ * ns, d->fhw, one_, 0.f, LGC(g_fib_ch + k_), d->fhs[k_], (mul_)); \
                                          else nn_loss_stats_acc(LGC(g_fib_ch + k_), d->fht + k_ * ns, d->fhm + k_ * ns, d->fhw, one_, d->hs_ds + 74 + 5 * k_); } \
         float pw_, rw_; int u7_; nn_loss_cfg_get(&pw_, &rw_, &u7_); nn_set_pos_weight(1.f); \
-        if (grad) nn_loss_grad_only(LGC(g_fib_ch + 2), d->fdt, d->fdm, d->nw, sev_, 0.f, LGC(g_fib_ch + 2), d->fds); \
+        if (grad) nn_loss_grad_only_s(LGC(g_fib_ch + 2), d->fdt, d->fdm, d->nw, sev_, 0.f, LGC(g_fib_ch + 2), d->fds, (mul_)); \
         else nn_loss_stats_acc(LGC(g_fib_ch + 2), d->fdt, d->fdm, d->nw, sev_, d->hs_ds + 84); \
         nn_set_pos_weight(pw_); } while (0)
 /* g_lsplit: the window planes [a, b) whose voxels this half's head slabs supervise. The statistics pass: the owned voxels, so every voxel counts
@@ -1302,9 +1303,8 @@ static void head_slab_pass(gpu_state *d, int pass) {
             nn_ink_targets_smooth(ink + vb, ns, d->inkt, d->inkm, g_ink_smooth);
             if (g_ink_air && pap) nn_ink_air(pap + vb, ns, z0 + mil_zoff(d), H, W, g_ink_air, g_ink_smooth, d->inkt, d->inkm);   /* --ink-air: + the air lattice as ink 0 */
             hs_clip(d, pass, d->inkm, z0, z1, hw);
-            nn_loss_grad_only(LGC(g_ink2_ch), d->inkt, d->inkm, d->inkw, one, g_ink_dice, LGC(g_ink2_ch), d->iscratch);   /* (--ink-dice: + w x the soft dice of the window's known voxels) */
             const float iw = g_ink_lambda * (si >= 0 && g_S && si < g_S->n ? (float)g_S->src[si].ink_weight : 1.f) * src_head_w(si, SH_INK);
-            if (iw != 1.f) nn_loss_grad_scale(LGC(g_ink2_ch), ns, iw);
+            nn_loss_grad_only_s(LGC(g_ink2_ch), d->inkt, d->inkm, d->inkw, one, g_ink_dice, LGC(g_ink2_ch), d->iscratch, iw);   /* (--ink-dice: + w x the soft dice of the window's known voxels; x iw in the kernel) */
             uint16_t *mgb = mck && nn_get_loss_grad_h16() ? malloc(ns * 2) : nullptr; if (mgb) { nn_sync(); nn_d2h(mgb, LGC(g_ink2_ch), ns * 2); }
             int mz0, mnz; size_t mbo;
             if (nmil && nn_get_loss_grad_h16() && mil_clip(d, 1, z0, nz, hw, &mz0, &mnz, &mbo) && ink_mil_bwd_slab(d->milacc, mz0, mnz, MD, H, W, mrays, nmil, g_mil_R, g_mil_step, LGC(g_ink2_ch) + mbo, !nn_get_f16(), nullptr)) { fprintf(stderr, "ink mil: bwd_slab failed\n"); exit(1); }   /* (adds the MIL gradient: fin scaled it to the storage's gradient scale) */
@@ -1323,26 +1323,24 @@ static void head_slab_pass(gpu_state *d, int pass) {
             }
         }
         if (g_fibh) {   /* --fib-head: the three BCE gradients, times lambda x the source's "fibre" head weight */
-            FIBH_TARGETS(); FIBH_LOSS(1);
-            const float fw = g_fibh_lambda * src_head_w(si, SH_FIBRE); if (fw != 1.f) nn_loss_grad_scale(LGC(g_fib_ch), 9 * ns, fw);
+            const float fw = g_fibh_lambda * src_head_w(si, SH_FIBRE);
+            FIBH_TARGETS(); FIBH_LOSS_S(1, fw);   /* (x fw in the gradient kernels: no separate scale pass over the 9 channels) */
         }
         if (g_pad_ch >= 0) nn_zero(LGC(g_pad_ch), (size_t)(g_cout - g_pad_ch) * ns * 2);   /* (the pad outputs: no gradient) */
         if (g_pg_lambda > 0) nn_pgrad_slab(LGC(g_side_ch), LGC(g_side_ch + 1), sdb, d->sidem, D, H, W, z0, z1, g_norm_s, g_pg_dist, g_pg_nd, g_pg_angle, g_pg_mask, d->hs_ds + 58, d->pg_acc);   /* (before the BCE gradient overwrites the logits; its sums go to + 58: the logged loss of a training step) */
-        if (!fside) nn_loss_grad_only(LGC(g_side_ch), st, sm, d->sidew, two, 0.f, LGC(g_side_ch), d->sscratch);
-        FT("  g side grad");
         const float lside = g_side_lambda * src_head_w(si, g_rv == 1 ? SH_RV : SH_PHASE);   /* (x 1: the same floats) */
-        if (lside != 1.f && !fside) nn_loss_grad_scale(LGC(g_side_ch), 2 * ns, lside);
+        if (!fside) nn_loss_grad_only_s(LGC(g_side_ch), st, sm, d->sidew, two, 0.f, LGC(g_side_ch), d->sscratch, lside);   /* (x lside in the kernel) */
+        FT("  g side grad");
         if (g_rv == 2) {   /* --rv 2: the recto / verso pair's BCE gradient, times --rv-lambda x the source's weight */
-            nn_loss_grad_only(LGC(g_rv_ch), d->rvt, d->rvm, d->sidew, two, 0.f, LGC(g_rv_ch), d->rvscratch);
-            const float lrv = g_rv_lambda * src_head_w(si, SH_RV); if (lrv != 1.f) nn_loss_grad_scale(LGC(g_rv_ch), 2 * ns, lrv);
+            const float lrv = g_rv_lambda * src_head_w(si, SH_RV);
+            nn_loss_grad_only_s(LGC(g_rv_ch), d->rvt, d->rvm, d->sidew, two, 0.f, LGC(g_rv_ch), d->rvscratch, lrv);
         }
         if (g_pg_lambda > 0) nn_pgrad_apply(LGC(g_side_ch), LGC(g_side_ch + 1), d->pg_acc, ns, d->hs_ds + 56, g_pg_lambda);
         if (g_fibn) { nn_zero(d->fibnl, sizeof(unsigned)); nn_fibn(LGC(g_norm_ch), ns, fib, D, H, W, z0, z1, g_fibn_r, g_fibn_thr, g_fibn_unsup ? d->nm : nullptr, d->fibacc, d->fiblist, d->fibnl, d->fibcap, 1); }   /* (reads the logits: before the in-place gradient) */
-        if (!fuse) nn_loss_grad_only(LGC(g_norm_ch), d->nt, d->nm, d->nw, seven, 0.f, LGC(g_norm_ch), d->nscratch);
-        FT("  g normal grad");
         const float lnorm = g_norm_lambda * src_head_w(si, SH_NORMAL), ldens = g_dens_lambda * src_head_w(si, SH_DENSITY);
-        if (fuse) ;
-        else if (ldens == lnorm) { if (lnorm != 1.f) nn_loss_grad_scale(LGC(g_norm_ch), 7 * ns, lnorm); }
+        if (!fuse) nn_loss_grad_only_s(LGC(g_norm_ch), d->nt, d->nm, d->nw, seven, 0.f, LGC(g_norm_ch), d->nscratch, ldens == lnorm ? lnorm : 1.f);   /* (one weight: x lnorm in the kernel) */
+        FT("  g normal grad");
+        if (fuse || ldens == lnorm) ;
         else {   /* --density-lambda: the 6 normal channels at --normal-lambda, the density channel (+ 6) at its own weight */
             if (lnorm != 1.f) nn_loss_grad_scale(LGC(g_norm_ch), 6 * ns, lnorm);
             if (ldens != 1.f) nn_loss_grad_scale(LGC(g_norm_ch + 6), ns, ldens);
@@ -2840,6 +2838,7 @@ int cmd_train(int argc, char **argv) {
 
     {   /* --ink-cache-mb: the one cache budget of every on-the-fly ink source (inksplat.h; default $UFSM_INK_CACHE_MB or 4096) */
         const char *im = opt(argc, argv, "--ink-cache-mb", "0"); if (atol(im) > 0 && inkfly_cache_budget) inkfly_cache_budget((size_t)atol(im)); }
+    { const char *pm = opt(argc, argv, "--onfly-cache-mb", "0"); if (atol(pm) > 0) sources_set_onfly_cache_mb((size_t)atol(pm)); }   /* the onfly phase cells' shared LRU (default 2048) */
     sources *S = sources_load(src);
     g_Sdiag = S;
     if (!S) return 1;
@@ -3265,6 +3264,10 @@ int cmd_train(int argc, char **argv) {
             free(cov);
             sampler_hostmem(sq, stderr, 0);
             uint64_t prod = 0, rej = 0; sampler_stats(sq, &prod, &rej); fprintf(stderr, "sampler-only: produced %llu rejected %llu\n", (unsigned long long)prod, (unsigned long long)rej);
+            { dcache_stats dc; dcache_get_stats(&dc); phase_onfly_stats po; phase_onfly_get_stats(&po);   /* (perf2: how much of the on-the-fly labels the derived cache served) */
+              fprintf(stderr, "sampler-only: derived cache %llu cells from memory, %llu from disk, %llu computed (%.1f s); onfly phase %llu reads, %llu tiles, %.1f s in the pair rule\n",
+                      (unsigned long long)dc.cells_mem, (unsigned long long)dc.cells_disk, (unsigned long long)dc.cells_computed, dc.s_compute,
+                      (unsigned long long)po.reads, (unsigned long long)po.tiles, po.s_pair); }
             sampler_prof_print(sq);
             store_io_report(stderr); fprintf(stderr, "z3: %llu chunks decoded straight into the window\n", (unsigned long long)z3_sink_chunks());
             { FILE *io = fopen("/proc/self/io", "r"); char ln[128]; while (io && fgets(ln, sizeof ln, io)) if (!strncmp(ln, "rchar", 5) || !strncmp(ln, "read_bytes", 10)) fprintf(stderr, "proc io: %s", ln); if (io) fclose(io); }
@@ -4040,10 +4043,11 @@ int cmd_train(int argc, char **argv) {
     split_ctx *sctx = split ? split_create(devs[0], devs[1]) : nullptr;
     g_split_same = split && devs[0] == devs[1];
     nn_init(G[0].dev);
+    const int ar2 = ng == 2 && ufsm_env_on("UFSM_GRAD_AR2");   /* UFSM_GRAD_AR2=1: nn_grad_allreduce2 (halves, both directions at once, no receive buffer on GPU 0) */
     /* on GPU 0: incoming gradients of the other GPUs, in chunks of GPEER floats (2026-11-13: a whole np copy was 416 MB of GPU 0 outside the
        memory plan at the 104 M scratch2 net; a 64 MB chunk costs one more copy + axpy launch per chunk, ~7 per step) */
     const size_t GPEER = np < ((size_t)16 << 20) ? np : (size_t)16 << 20;
-    float *gpeer = ng > 1 ? nn_malloc(GPEER * 4) : nullptr;
+    float *gpeer = ng > 1 && !ar2 ? nn_malloc(GPEER * 4) : nullptr;
     /* --accum K: gradient accumulation, K windows (steps) per optimizer update. Every step is still one window: its forward / backward, loss,
        log and mix lines, the lr schedule (so --warmup and --steps count windows); its gradient is added into gacc and the update (clip,
        Muon / AdamW at optimizer step step / K, EMA) runs on the mean of the accumulated windows at steps that are multiples of K. A
@@ -4184,6 +4188,12 @@ int cmd_train(int argc, char **argv) {
     double acc_inkn = 0, vik[2] = {0}, acc_mil = 0, acc_miln = 0, acc_milr = 0;   /* --ink-mil: raw mean BCE sum / windows with rays / rays */   /* --ink-head: training windows with known ink in the log interval; validation ink bce sum / windows */
     train_unread_flags(argc, argv);
     for (int step = step0 + 1; step <= steps && !g_stop; step++) {
+        {   /* UFSM_CUPROF=A,B: cudaProfilerStart before step A, Stop after step B (nsys --capture-range=cudaProfilerApi: a steady-state window of a P 1024 run) */
+            static int pa = -2, pb; if (pa == -2) { const char *e = getenv("UFSM_CUPROF"); pa = -1; if (e && sscanf(e, "%d,%d", &pa, &pb) != 2) pa = -1; }
+            extern int cudaProfilerStart(void), cudaProfilerStop(void), cudaDeviceSynchronize(void);
+            if (pa > 0 && step == pa) { cudaDeviceSynchronize(); cudaProfilerStart(); fprintf(stderr, "UFSM_CUPROF: capture from step %d\n", step); }
+            if (pa > 0 && step == pb + 1) { cudaDeviceSynchronize(); cudaProfilerStop(); fprintf(stderr, "UFSM_CUPROF: capture stopped before step %d\n", step); }
+        }
         if (trunk_lr != 1.f && trunk_lr_steps > 0 && step == (step0 + 1 > trunk_lr_steps + 1 ? step0 + 1 : trunk_lr_steps + 1)) {   /* --trunk-lr-steps: the trunk back to the full rates */
             for (int g = 0; g < ng; g++) unet_set_trunk_lr(G[g].u, 1.f);
             fprintf(stderr, "step %d: trunk learning rate x1 (--trunk-lr-steps %d)\n", step, trunk_lr_steps);
@@ -4333,7 +4343,11 @@ int cmd_train(int argc, char **argv) {
         }
         if (g_stop || training_failed) break;
         /* average gradients across GPUs: sum on GPU 0 (peer copies), scale, broadcast */
-        if (ng > 1) {
+        if (ar2) {   /* the same bytes as the path below: each half summed as y + x on one card, then copied to the other */
+            float *gg[2] = {unet_grad_ptr(G[0].u), unet_grad_ptr(G[1].u)}; const int dv[2] = {G[0].dev, G[1].dev};
+            if (nn_grad_allreduce2(gg, dv, np)) { fprintf(stderr, "UFSM_GRAD_AR2: no staging buffers\n"); training_failed = 1; break; }
+            if (!split) for (int g = 0; g < 2; g++) { nn_init(G[g].dev); nn_scale(unet_grad_ptr(G[g].u), 0.5f, np); }
+        } else if (ng > 1) {
             nn_init(G[0].dev);
             for (int g = 1; g < ng; g++) for (size_t o = 0; o < np; o += GPEER) {
                 const size_t k = np - o < GPEER ? np - o : GPEER;
@@ -4689,6 +4703,11 @@ int cmd_train(int argc, char **argv) {
                 }
                 if (ng > 1) nn_init(G[0].dev);
             }
+            {   /* the derived-array caches (dcache.h: the onfly phase of meshes and, since 2026-11-13, of stored codes; the onfly ink) since the last line */
+                static dcache_stats d0; dcache_stats d1; dcache_get_stats(&d1);
+                const unsigned long long cm = d1.cells_mem - d0.cells_mem, cd = d1.cells_disk - d0.cells_disk, cc = d1.cells_computed - d0.cells_computed;
+                if (cm + cd + cc) fprintf(stderr, "  derived cache: %llu cells from memory, %llu from disk, %llu computed (%.1f s)\n", cm, cd, cc, d1.s_compute - d0.s_compute);
+                d0 = d1; }
             { static int memlog = -1; if (memlog < 0) memlog = ufsm_env_on("UFSM_SYNC_CHECK");   /* device memory free per GPU at each log line (a leak) */
               if (memlog) { fprintf(stderr, "  device memory free:"); for (int g = 0; g < ng; g++) { nn_init(G[g].dev); fprintf(stderr, " GPU %d %.1f MB", G[g].dev, nn_mem_free() / 1e6); } fprintf(stderr, "\n"); nn_init(G[0].dev); } }
             { static int hm = -1, hmn = 0; if (hm < 0) hm = ufsm_env_on("UFSM_HOSTMEM");   /* host memory by owner at each log line (sampler_hostmem) */

@@ -127,6 +127,105 @@ ones byte for byte (test_aug_z). CT bytes, scanner records and radial records ar
 - The planner already counted the split's aug staging for `--gpu-aug 2`.
 - test_slot_planes: a split run with the device warps; CT bytes exact, losses within 2% of the host-warp run.
 
+## The scratch2 step faster: profile and the first fixes (2026-11-13, branch perf2-20261113)
+
+Goal: the 92 M net's P 1024 two-card split step (scratch2.launch) as fast as possible with equivalent training.
+
+**Profile before** (the archived one-card P 512 92 M run, runs/scratch-archive-20261113/prof92: nsys + UFSM_PROF=layers, 37 steady
+steps): 1.61 s/step, kernel-busy 99 % (GPU-bound, no loader wait). Per step:
+
+| part | ms |
+|---|---|
+| 3^3 convs (fwd fp4 150-195 TFLOP/s on enc0.c2 / dec0.c1; dec0.c1 alone 304) | ~950 |
+| onfly-phase pair rule + codes decode on the training GPU (k_bg_env 151, k_ll_sub 121, k_bg_pair / xw / ll_build 25) | ~295 |
+| loss / target kernels (loss_grad 26, gscale 22, lat_up4 22, lat_adj_xy 21, loss_stats 16, packed_mask 13, ...) | ~200 |
+| the head's 1^3 convs (conv1_mx_t 66, conv1_to_mx_t 36, bwd_w1 57 in 2300 launches) | ~160 |
+| Muon fp32 Newton-Schulz (gemm_ns_k; scratch2 runs --muon-tc 2, ~57) | 120 |
+| fine stem fwd / bwd | 84 |
+| down0 backward-data (the dilated fp8 path: 8x the MACs) vs its forward 26 | 69 |
+
+The P 1024 split half is 4.25x the P 512 volume, so ~5.2 s/step per card if the split cost nothing.
+
+**down0..down3 backward-data: the weight-streaming fp4 kernel** (trainperf WIP 417a0a4, finished here). The 256-448 channel stride-2
+backward-data ran the dilated fp8 convolution on MX-fp8 copies. bwd_data_s2_f4_k with STREAM (NCH > 4) keeps one tap's weight units in
+shared memory, loaded per (z tile, class, tap) from L2; the MMAs and their order are the resident kernel's. tests/bench_s2b, one 5060 Ti,
+min of 4, per 32-plane slab of the P 1024 half:
+
+| conv | gx shape | dilated path | fp4 kernel | P 1024 half, saved |
+|---|---|---|---|---|
+| down0 | 32 x 256^2 x 256 ch | 82.5 ms (11 TFLOP/s) | 10.1 ms (92) | 308 ms (136 planes) |
+| down1 | 32 x 128^2 x 320 | 23.6 | 4.3 | 41 ms (68) |
+| down2 | 32 x 64^2 x 384 | 8.0 | 1.6 | 7 ms (34) |
+| down3 | 16 x 32^2 x 448 | 1.55 | 0.48 | 1 ms (18) |
+
+Accuracy: test_mx4 256 / 320 ch against the fp32 reference, rel err 0.167 / 0.169 (dilated 0.155 / 0.155, TOL4). Trainer A/B (92 M,
+P 256, --det 1 seed 7, step-1 summed gradient; UFSM_S2B_F4=1 is the old path): the same batch hashes, --det rerun 0, new vs old
+rel 0.037 (cos 0.99932), against the SR noise floor 0.133 (`UFSM_SR_SALT=1`, new: every step's SR seed shifted, the same batches).
+
+**The head slabs' lambda scales inside the gradient kernels** (nn_loss_grad_only_s). Under --uw every head's lambda x source weight differs
+from 1, so each slab ran gscale_k over 21 logit channels after the BCE gradient (22 ms a step at P 512, ~90 per card at the P 1024 half).
+The scale now multiplies the kernel's final product (one fp16 rounding instead of two). 92 M P 256 step-1 gradient vs the separate pass:
+rel < 1e-5, max |d| 3e-8, the same batches.
+
+**The latent cell head on the tensor cores.** --lat-guide 3 makes the head 160 outputs (32 task + 128 sub-cell) from dec0's 256 MX-fp4
+channels; lp_conv1_fwd_mx_h16_r ran conv1_mx_t_k in 10 passes of 16 outputs, each re-reading x with 256 x 16 FFMAs a cell (P 512: 66 ms a
+step at ~5 TFLOP/s). conv1_mx_tc_k does one pass: persistent blocks (one per SM) keep the fp16 weights of all outputs in shared memory
+(160 x 264 halves, 84 KB), walk 128-cell tiles, decode each 32-channel MX block with its GN+SiLU in fp32 (act_ab, as before), round it to
+fp16 and run m16n8k16 MMAs; the next block's x words load during the current block's MMAs. tests/test_head_tc (GN per sample and per
+slab, ranges with tails, 160 / 35 / 17 outputs) against the FFMA path: rel L2 3.9e-4, max 8.6e-4 of max |logit| (the fp16 rounding of
+activations and weights, below the fp16 logits' own), bytes repeat. P 1024 half slab (4 x 256^2 cells, 256 -> 160): 2.87 -> 0.87 ms
+(7.5 -> 24.6 TFLOP/s), 68 calls a step (two passes x 34 slabs): ~135 ms per card. UFSM_HEAD_TC=0: the FFMA passes. The backward-data (c1b_wh_k + conv1_to_mx_tc_k: 64 cells x 256 outputs a block, K in 32-chunks,
+the MX4 epilogue through per-warp shared tiles) on the pod: rel L2 7.7e-3 against the FFMA kernel after the MX-fp4 SR (0.02 % of the
+elements differ), bytes repeat; the P 1024 half slab 160 -> 256: 7.61 -> 1.12 ms (2.8 -> 19.2 TFLOP/s), 34 slabs a step: ~220 ms per
+card. Default OFF (UFSM_HEAD_BTC=1 on): with it on, test_lat_head's "a second equal net" check (the same parameters and
+inputs on a second unet) differs by rel 0.4 in the trunk gradients, which test_head_tc's kernel-level checks (C 32 / 96 / 256, two
+samples, whole and ranges) do not reproduce. Open. The whole-call form (lp_conv1_to_mx) now takes the same kernel as the range form,
+so whole == per range holds with it on.
+
+
+**The MIL backward without a sync per slab.** ink_mil_bwd_slab read its slab's (voxel, sample) pair count back with a
+cudaStreamSynchronize before sizing the radix sort: 34 host syncs per ink window. Under `--split` the call runs while the GPU's thread
+holds the split turn, so each sync drains that card while the other waits for the turn: the two cards serialise on every slab. Now
+ink_mil_fin also queues one histogram of pairs per corner plane (no w == 0 test, so an upper bound) and its async copy to pinned memory;
+the first backward slab waits for that event once per step, each slab sorts the bound of its planes (one plane of margin on each side)
+with the unused tail filled by a key that sorts last, and k_runs reads the true count on the device: the sorted prefix and the sums are
+the ones of the readback path. A bound exceeded on the device (not expected) is reported by the next step's first slab. tests/test_ink_mil
+checks both paths byte for byte at 1 / 3 / 7 slabs, soft and hard: ok on the pod (RTX PRO 6000 MIG slice), so the plane bound is the
+default (UFSM_MIL_ASYNC=0: the readback); ink_mil_set_async() for tests.
+
+**The gradient sum in halves, both directions at once.** After each step train.c summed the two GPUs' fp32 gradients by copying
+all of GPU 1's gradient to GPU 0 with cudaMemcpyPeer (no P2P on the desk, so it is staged through the host and the host blocks),
+adding them, and copying the sum back: 2 x 368 MB for the 92 M net, one direction at a time, nothing overlapped. The old path also
+holds a 368 MB receive buffer on GPU 0. nn_grad_allreduce2 (nn_loss.cu) instead does a reduce-scatter and then an all-gather.
+GPU 0 sums [0, n/2) and GPU 1 sums [n/2, n); each then sends its summed half to the other. The data goes through double-buffered
+32 MB pinned chunks, both directions in flight, with a chunk's D2H overlapping the previous chunk's H2D. It is stream-ordered
+behind each device's legacy stream and the host only enqueues. Each half is y + x on one card (a + b == b + a), so the bytes are
+those of the old path. Buffers: 128 MB pinned host, 64 MB of receive chunks per card. The old path's 368 MB on GPU 0 is not
+allocated. tests/test_grad_ar checks both cards against the host sum byte for byte over three calls (quick: 9 M floats in 1 M
+chunks; full: 92.4 M floats, timed against the old path). Default off (UFSM_GRAD_AR2=1) until that test has run on the GPUs.
+
+**Missed derived-cache cells computed together.** On a cold cache the split benches are loader-bound at 16-23 s/step. Most of that
+is the onfly pair rule: about 425 tiles per step on GPU 0, and 576 cells computed in a 6-window sampler-only check. Each missed cell
+was computed on its own, with a halo of rmax + 2 codes voxels around it. That is 4.5x the cell's voxels for a 128^3 cell at rmax 40
+(the scratch1 sources use rmax 20 / 40 / 41 / 48.5 / 80, so cells of 128 and 256), plus one tile's packing and launches per cell.
+dc_read now claims a block of G^3 cells (G = UFSM_DC_BATCH or "cache_batch" / C, default 384 voxels: 3^3 cells of 128). The claimed
+cells that are not on disk are computed as one box with one inner read (their bounding box, when they fill at least half of it), then
+cut into cells. At rmax 40 the halo share drops from 4.5x to 1.8x (the onfly read tiles the box itself within its --onfly-mb budget).
+A reader waits for another reader's cells only after all its own claims are settled, so there are no wait cycles. A block's
+references are held until it has been copied: at most 27 cells (57 MB) plus the box (57 MB) per reading thread at C 128. Cells of 256
+keep G = 1 at the default. This is only enabled for the onfly phase, whose values do not depend on the box read
+(tests/test_phase_onfly.sh: byte-identical across tilings). Checks:
+- On the wind fixture (cache_cell 32), the onfly phase through the cache at batch 0 / 96 / 384 is byte-identical to phase-raster
+  (1.01 M known voxels, CPU), and a reopen reads all 64 cells from disk.
+- tests/test_dcache_batch (CPU, fast tier): batched == cell by cell == direct values on ragged boxes, 4 threads on one cold array, and
+  disk reopen. A cold whole read takes 8 inner reads instead of 64.
+
+**One memory LRU for every onfly phase array.** Each onfly phase spec opened its own dcache LRU (`"cache_mb"`, default 1024). With
+scratch1's 19 specs that allows 19 GB of host RAM. The sampler-only warm reached the 30 GB memory cap within 2 minutes, twice. All onfly
+phase arrays now share dcache_pool_shared("phase"), sized by --onfly-cache-mb or UFSM_ONFLY_CACHE_MB (default 2048). A spec that sets
+its own "cache_mb" keeps a private LRU, as before. The size only changes hit rates: a cell's bytes are the same from memory, from disk
+or computed (test_dcache_batch, test_mesh_phase).
+
 ## Split-window input builders: every --gpu-aug builder by z range, the scanner split exactly across two GPUs (2026-11-13, branch augz-20261112)
 
 ## Muon variants for the from-scratch universal net: ten arms on the 92 M net (2026-11-13, branch muonx-20261113)

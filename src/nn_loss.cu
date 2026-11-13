@@ -227,18 +227,24 @@ extern "C" void nn_loss_stats_fin(double *ds, const uint8_t *w, shape5 s, float 
     loss_fin_k<<<1, 32>>>(scratch, w, s.n, s.c, scratch + (size_t)5 * NC);
     KCHECK();
 }
-extern "C" void nn_loss_grad_only(const void *logits, const uint8_t *t, const uint8_t *m, const uint8_t *w, shape5 s, float dice_w, void *gl, const float *scratch) {
-    const size_t S = shape_spatial(s), n = shape_numel(s);
+/* nn_loss_grad_only_s: the same gradient times mul in the kernel's final product (perf2 2026-11-13: the head slabs' lambda x source-weight
+   scales were a separate read-modify-write pass, gscale_k, ~90 ms a step per card at the P 1024 split half). The 16-bit value is rounded
+   once from (g fin gscale) mul instead of twice (round, scale, round): at most one fp16 ulp apart */
+extern "C" void nn_loss_grad_only_s(const void *logits, const uint8_t *t, const uint8_t *m, const uint8_t *w, shape5 s, float dice_w, void *gl, const float *scratch, float mul) {
+    const size_t S = shape_spatial(s); const float gs1 = mul, gsh = g_gscale * mul;
     const float *fin = scratch + (size_t)5 * s.n * s.c;
     if (g_logits_h16) {
         const f16 *l16 = (const f16 *)logits;
-        if (!g_loss_g16) loss_grad_k<float, f16><<<lg_grid(S, s.n * s.c), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (float *)gl, g_posw, 1.f, 0, nullptr, s.d, s.h, s.w, g_recall, UNITC(s.c));
-        else if (g_h16) loss_grad_k<f16, f16><<<lg_grid(S, s.n * s.c), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (f16 *)gl, g_posw, g_gscale, 0, nullptr, s.d, s.h, s.w, g_recall, UNITC(s.c));
-        else loss_grad_k<bf16, f16><<<lg_grid(S, s.n * s.c), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (bf16 *)gl, g_posw, g_gscale, 0, nullptr, s.d, s.h, s.w, g_recall, UNITC(s.c));
-    } else if (!g_loss_g16) loss_grad_k<float><<<lg_grid(S, s.n * s.c), 256>>>((const float *)logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (float *)gl, g_posw, 1.f, 0, nullptr, s.d, s.h, s.w, g_recall, UNITC(s.c));
-    else if (g_h16) loss_grad_k<f16><<<lg_grid(S, s.n * s.c), 256>>>((const float *)logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (f16 *)gl, g_posw, g_gscale, 0, nullptr, s.d, s.h, s.w, g_recall, UNITC(s.c));
-    else loss_grad_k<bf16><<<lg_grid(S, s.n * s.c), 256>>>((const float *)logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (bf16 *)gl, g_posw, g_gscale, 0, nullptr, s.d, s.h, s.w, g_recall, UNITC(s.c));
+        if (!g_loss_g16) loss_grad_k<float, f16><<<lg_grid(S, s.n * s.c), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (float *)gl, g_posw, gs1, 0, nullptr, s.d, s.h, s.w, g_recall, UNITC(s.c));
+        else if (g_h16) loss_grad_k<f16, f16><<<lg_grid(S, s.n * s.c), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (f16 *)gl, g_posw, gsh, 0, nullptr, s.d, s.h, s.w, g_recall, UNITC(s.c));
+        else loss_grad_k<bf16, f16><<<lg_grid(S, s.n * s.c), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (bf16 *)gl, g_posw, gsh, 0, nullptr, s.d, s.h, s.w, g_recall, UNITC(s.c));
+    } else if (!g_loss_g16) loss_grad_k<float><<<lg_grid(S, s.n * s.c), 256>>>((const float *)logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (float *)gl, g_posw, gs1, 0, nullptr, s.d, s.h, s.w, g_recall, UNITC(s.c));
+    else if (g_h16) loss_grad_k<f16><<<lg_grid(S, s.n * s.c), 256>>>((const float *)logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (f16 *)gl, g_posw, gsh, 0, nullptr, s.d, s.h, s.w, g_recall, UNITC(s.c));
+    else loss_grad_k<bf16><<<lg_grid(S, s.n * s.c), 256>>>((const float *)logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (bf16 *)gl, g_posw, gsh, 0, nullptr, s.d, s.h, s.w, g_recall, UNITC(s.c));
     KCHECK();
+}
+extern "C" void nn_loss_grad_only(const void *logits, const uint8_t *t, const uint8_t *m, const uint8_t *w, shape5 s, float dice_w, void *gl, const float *scratch) {
+    nn_loss_grad_only_s(logits, t, m, w, s, dice_w, gl, scratch, 1.f);
 }
 /* ---- count loss (train --count-lambda): turns along sheet-normal segments ----
    K segments per window, each from a random voxel whose ground-truth phase gradient (over +-s voxels) is known, L unit steps along
@@ -563,6 +569,68 @@ extern "C" void nn_split_xchg(const int *dev, const void *const *send, void *con
     }
     for (int i = 0; i < 2; i++) { cudaSetDevice(dev[i]); CK(cudaStreamWaitEvent(s[i], zs_gev(dev[1 - i], 1 - i, 1), 0)); }   /* the peer has read my send buffer */
     cudaSetDevice(cur); KCHECK();
+}
+/* nn_grad_allreduce2 (2026-11-13): the two GPUs' fp32 gradients summed on both, in halves and both directions at once. The old path
+   (train.c) copied all of GPU 1's gradient to GPU 0 (cudaMemcpyPeer: host-staged, synchronous), added, and copied the sum back: 2 x 368 MB
+   one way at a time for the 92 M net, the host blocked throughout. Here GPU 0 sums [0, h) and GPU 1 sums [h, n) (each receives the other's
+   half: a reduce-scatter), then each sends its summed half to the other (an all-gather). The transfers go through pinned host chunks in
+   both directions at once (each card one D2H + one H2D in flight), double-buffered so a chunk's D2H overlaps the previous chunk's H2D;
+   the host only enqueues. Sums: y + x in fp32 on whichever card owns the half (a + b == b + a): the bytes of the old path. Streams wait
+   for each device's legacy stream at entry and the legacy streams wait for the end, so callers see a stream-ordered allreduce. */
+__global__ void ar_add_k(float *y, const float *x, size_t n) { size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; if (i < n) y[i] += x[i]; }
+static struct { int init, dev[2]; size_t ch; void *pin[2][2]; float *rb[2][2]; cudaStream_t sd[2], su[2]; cudaEvent_t ev[2][2][2], evd[2][2], evs[2], ein[2], eout[2][2]; } g_ar;
+static int ar_init(const int *dev, size_t ch) {
+    if (g_ar.init && g_ar.dev[0] == dev[0] && g_ar.dev[1] == dev[1] && g_ar.ch == ch) return 0;
+    if (g_ar.init) return -1;   /* one pair per process */
+    int cur; cudaGetDevice(&cur);
+    for (int i = 0; i < 2; i++) {
+        cudaSetDevice(dev[i]);
+        for (int b = 0; b < 2; b++) {
+            if (cudaHostAlloc(&g_ar.pin[i][b], ch * 4, cudaHostAllocPortable) || cudaMalloc(&g_ar.rb[i][b], ch * 4)) { cudaSetDevice(cur); return -1; }
+            for (int k = 0; k < 2; k++) if (cudaEventCreateWithFlags(&g_ar.ev[i][b][k], cudaEventDisableTiming)) { cudaSetDevice(cur); return -1; }
+            if (cudaEventCreateWithFlags(&g_ar.evd[i][b], cudaEventDisableTiming) || cudaEventCreateWithFlags(&g_ar.eout[i][b], cudaEventDisableTiming)) { cudaSetDevice(cur); return -1; }
+        }
+        if (cudaStreamCreateWithFlags(&g_ar.sd[i], cudaStreamNonBlocking) || cudaStreamCreateWithFlags(&g_ar.su[i], cudaStreamNonBlocking) ||
+            cudaEventCreateWithFlags(&g_ar.evs[i], cudaEventDisableTiming) || cudaEventCreateWithFlags(&g_ar.ein[i], cudaEventDisableTiming)) { cudaSetDevice(cur); return -1; }
+    }
+    cudaSetDevice(cur); g_ar.dev[0] = dev[0]; g_ar.dev[1] = dev[1]; g_ar.ch = ch; g_ar.init = 1; return 0;
+}
+/* one phase: for each direction i (source 1 - i -> destination i), the range [o[i], o[i] + m[i]) of g[1 - i] lands at the same offset in
+   g[i] (add = 0) or is added to it (add = 1, through rb). pin[s][b] / rb[d][b]: source s's staging buffer b, destination d's receive b. */
+static void ar_phase(float *const *g, const size_t *o, const size_t *m, int add) {
+    const size_t ch = g_ar.ch; size_t nk[2], mk = 0;
+    for (int i = 0; i < 2; i++) { nk[i] = (m[i] + ch - 1) / ch; if (nk[i] > mk) mk = nk[i]; }
+    for (size_t k = 0; k < mk; k++)
+        for (int i = 0; i < 2; i++) {
+            if (k >= nk[i]) continue;
+            const int s = 1 - i, b = (int)(k & 1); const size_t off = o[i] + k * ch, len = (k + 1) * ch <= m[i] ? ch : m[i] - k * ch;
+            cudaSetDevice(g_ar.dev[s]);
+            CK(cudaStreamWaitEvent(g_ar.sd[s], g_ar.ev[s][b][1], 0));   /* the pinned buffer's previous H2D is done (this phase, the last phase or step; never recorded: no wait) */
+            CK(cudaMemcpyAsync(g_ar.pin[s][b], g[s] + off, len * 4, cudaMemcpyDeviceToHost, g_ar.sd[s]));
+            CK(cudaEventRecord(g_ar.ev[s][b][0], g_ar.sd[s]));
+            cudaSetDevice(g_ar.dev[i]);
+            CK(cudaStreamWaitEvent(g_ar.su[i], g_ar.ev[s][b][0], 0));
+            CK(cudaMemcpyAsync(add ? (void *)g_ar.rb[i][b] : (void *)(g[i] + off), g_ar.pin[s][b], len * 4, cudaMemcpyHostToDevice, g_ar.su[i]));
+            CK(cudaEventRecord(g_ar.ev[s][b][1], g_ar.su[i]));
+            if (add) ar_add_k<<<nblk(len, 256), 256, 0, g_ar.su[i]>>>(g[i] + off, g_ar.rb[i][b], len);   /* (rb[i][b] is next written on this stream: ordered) */
+        }
+    for (int i = 0; i < 2; i++) {   /* the phase's end: each device's D2H stream and H2D stream joined */
+        cudaSetDevice(g_ar.dev[i]); CK(cudaEventRecord(g_ar.evs[i], g_ar.su[i])); CK(cudaStreamWaitEvent(g_ar.sd[i], g_ar.evs[i], 0));
+        CK(cudaEventRecord(g_ar.evs[i], g_ar.sd[i])); CK(cudaStreamWaitEvent(g_ar.su[i], g_ar.evs[i], 0));
+    }
+}
+extern "C" int nn_grad_allreduce2(float *const *g, const int *dev, size_t n) {
+    int cur; cudaGetDevice(&cur);
+    size_t ch = 8u << 20; if (getenv("UFSM_AR_CHUNK")) { const long v = atol(getenv("UFSM_AR_CHUNK")); if (v >= 1024) ch = (size_t)v; }   /* floats per chunk (32 MB) */
+    if (ar_init(dev, ch)) { cudaSetDevice(cur); return -1; }
+    for (int i = 0; i < 2; i++) {   /* the gradients are complete on each device's legacy stream */
+        cudaSetDevice(dev[i]); CK(cudaEventRecord(g_ar.ein[i], 0)); CK(cudaStreamWaitEvent(g_ar.sd[i], g_ar.ein[i], 0)); CK(cudaStreamWaitEvent(g_ar.su[i], g_ar.ein[i], 0));
+    }
+    const size_t h = (n / 2 + 63) & ~(size_t)63, hh = h < n ? h : n;
+    { const size_t o[2] = {0, hh}, m[2] = {hh, n - hh}; ar_phase(g, o, m, 1); }   /* GPU 0 sums [0, h) from GPU 1; GPU 1 sums [h, n) from GPU 0 */
+    { const size_t o[2] = {hh, 0}, m[2] = {n - hh, hh}; ar_phase(g, o, m, 0); }   /* GPU 0 takes [h, n) from GPU 1; GPU 1 takes [0, h) */
+    for (int i = 0; i < 2; i++) { cudaSetDevice(dev[i]); CK(cudaEventRecord(g_ar.eout[i][0], g_ar.su[i])); CK(cudaStreamWaitEvent(0, g_ar.eout[i][0], 0)); }
+    cudaSetDevice(cur); KCHECK(); return 0;
 }
 __global__ void zs_add_t_k(void *a, const void *b, int n, int type) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x; if (i >= n) return;

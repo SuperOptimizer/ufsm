@@ -156,6 +156,8 @@ test_dino_pts                                  |              |     1 | ./$B/tes
 test_ink_splat                                 | gpu          |    10 | ./$B/test_ink_splat
 test_ink_pool                                  |              |     3 | ./$B/test_ink_pool $TMPDIR/ink_pool
 test_ink_mil                                   | gpu          |     2 | ./$B/test_ink_mil
+test_grad_ar                                   | gpu          |     3 | UFSM_TEST_QUICK=1 ./$B/test_grad_ar
+test_dcache_batch                              |              |     2 | ./$B/test_dcache_batch
 test_ink_air                                   | gpu          |     2 | ./$B/test_ink_air
 test_ink_mil_train                             | gpu          |    40 | ./$B/test_ink_mil_train ./$B/ufsm ./$B/make_wind_fixture
 test_accum                                     | gpu          |    20 | tests/test_accum.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/accum
@@ -203,6 +205,7 @@ test_ink3d_gambiarra                           | gpu,slow     |   102 | python3 
 test_mx_sw                                     | gpu          |     2 | ./$B/test_mx_sw
 test_mx                                        | gpu          |     3 | ./$B/test_mx
 test_mx4                                       | gpu          |     5 | ./$B/test_mx4
+test_head_tc                                   | gpu          |     3 | UFSM_TEST_QUICK=1 ./$B/test_head_tc
 test_grad_mx4                                  | gpu          |    12 | ./$B/test_grad_mx4
 test_l3_sched                                  | gpu          |     9 | ./$B/test_l3_sched
 test_grad_mx4~L0_NORM=1                        | gpu          |    10 | UFSM_L0_NORM=1 ./$B/test_grad_mx4

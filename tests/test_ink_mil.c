@@ -61,6 +61,14 @@ int main(void) {
                 if (ns[s] == 7) {   /* --det: the same bytes on a rerun */
                     double L2 = 0; ink_mil_slab_hostmem(lg, 0, D, H, W, R, NR, Rr, step, tau, eps, sc, 7, gb, &L2);
                     CHECK(!memcmp(ga, gb, nv * 4) && L2 == Ls, "slab form not deterministic (%s)", mode ? "hard" : "soft");
+                    if (ink_mil_set_async) {   /* the plane-bound path (no per-slab sync) == the per-slab readback, byte for byte, at 1 / 3 / 7 slabs */
+                        for (int a = 0; a < 3; a++) { const int nsl = a == 0 ? 1 : a == 1 ? 3 : 7; float *gc = malloc(nv * 4); double L3 = 0, L4 = 0;
+                            ink_mil_set_async(0); ink_mil_slab_hostmem(lg, 0, D, H, W, R, NR, Rr, step, tau, eps, sc, nsl, gb, &L3);
+                            ink_mil_set_async(1); const int rc = ink_mil_slab_hostmem(lg, 0, D, H, W, R, NR, Rr, step, tau, eps, sc, nsl, gc, &L4);
+                            CHECK(!rc && !memcmp(gb, gc, nv * 4) && L3 == L4, "mil async plane bound != per-slab readback (%s, %d slabs)", mode ? "hard" : "soft", nsl);
+                            free(gc); }
+                        ink_mil_set_async(-1);
+                    }
                 }
             }
             free(g);

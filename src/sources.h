@@ -173,6 +173,7 @@ typedef struct {
 } sources;
 
 sources *sources_load(const char *json_path);
+void sources_set_onfly_cache_mb(size_t mb);   /* the shared memory LRU of every onfly phase array (--onfly-cache-mb); call before sources_load */
 void sources_set_cache(const char *dir);   /* overrides the file's "cache"; call before sources_load */
 void sources_free(sources *S);
 

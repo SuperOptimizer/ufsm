@@ -224,6 +224,10 @@ $(B)/test_share_enc_a1: tests/test_share_enc_a1.c $(B)/unet.o $(B)/nn.o $(B)/nn_
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 $(B)/bench_f4conv: tests/bench_f4conv.c $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
+$(B)/bench_s2b: tests/bench_s2b.c $(B)/nn.o $(B)/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
+$(B)/bench_s2f: tests/bench_s2f.c $(B)/nn.o $(B)/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 $(B)/bench_l0misc: tests/bench_l0misc.c $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 $(B)/bench_head: tests/bench_head.c $(B)/nn.o $(B)/nn_fp8.o
@@ -248,6 +252,8 @@ $(B)/test_mx_sw: tests/test_mx_sw.c $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 suite-bins: $(B)/test_mx_sw
 $(B)/test_mx4: tests/test_mx4.c $(B)/nn.o $(B)/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
+$(B)/test_head_tc: tests/test_head_tc.c $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 $(B)/test_grad_mx4: tests/test_grad_mx4.c $(B)/unet.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
@@ -417,6 +423,12 @@ suite-bins: $(B)/test_distill
 $(B)/test_ink_mil: tests/test_ink_mil.c $(OBJ) $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 suite-bins: $(B)/test_ink_mil
+$(B)/test_grad_ar: tests/test_grad_ar.c $(OBJ) $(B)/nn.o $(B)/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
+suite-bins: $(B)/test_grad_ar
+$(B)/test_dcache_batch: tests/test_dcache_batch.c $(B)/dcache.o $(B)/zarr3.o $(B)/store.o $(B)/z3w.o $(B)/json.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
+suite-bins: $(B)/test_dcache_batch
 $(B)/test_ink_air: tests/test_ink_air.c $(OBJ) $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 suite-bins: $(B)/test_ink_air
@@ -793,6 +805,7 @@ $(B):
 	mkdir -p $(B)
 
 suite-bins: $(B)/test_gn_ema $(B)/test_gfilm
+suite-bins: $(B)/test_head_tc
 suite-bins: $(B)/test_muonx
 suite-bins: $(B)/test_latvol_nolink $(B)/test_gpu_aug $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover $(B)/test_ct_augment $(B)/test_scan_augment $(B)/test_side $(B)/test_votes $(B)/test_wind $(B)/test_phase_check $(B)/test_fuse $(B)/test_raster $(B)/test_http_reader $(B)/test_wide_up_grad $(B)/test_wgrad_staging $(B)/test_stem_precision $(B)/test_gn_contract $(B)/test_sampler_safety $(B)/test_optimizer_owners $(B)/test_infer_buffers $(B)/test_recompute_live $(B)/test_share_enc_a1 $(B)/test_checkpoint_runtime $(B)/make_pipeline_fixture $(B)/test_checkpoint $(B)/test_eval $(B)/test_sample_ops $(B)/test_json $(B)/test_nn $(B)/test_unet $(B)/test_fused $(B)/test_formats $(B)/ufsm $(B)/test_mx $(B)/test_mx4 $(B)/test_grad_mx4 $(B)/test_rc $(B)/test_split $(B)/test_split_lat $(B)/test_split_gnbwd $(B)/test_muon $(B)/test_muonc $(B)/test_gn_frozen $(B)/test_infer_mem $(B)/test_half $(B)/test_unwrap_targets $(B)/test_fit $(B)/test_surf $(B)/test_tiffw $(B)/test_edt $(B)/test_volcomp $(B)/test_volcomp_fast $(B)/test_gpudec $(B)/test_typed_zarr $(B)/test_aug_preset $(B)/test_l0_norm $(B)/test_l0_slab $(B)/test_wind_sampler $(B)/test_crush $(B)/test_vwt_aug $(B)/test_zcache $(B)/test_scrollaug $(B)/test_zwin $(B)/test_l0_stream $(B)/test_phasepack
 
