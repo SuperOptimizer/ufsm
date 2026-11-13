@@ -1175,6 +1175,33 @@ static z3 *pn_open(void *ctx, int l) {
     if (!c->z[l]) c->z[l] = pyramid_open_level(c->s, c->key, l, c->um, c->cache);
     return c->z[l];
 }
+/* UFSM_SKIP_AB=1 with --skip-empty 1 (DESIGN 2026-11-13 "empty-space skipping"): per window the trunk forward dense (masks paused) and
+   masked, timed (synchronised), their cell-grid logits compared on the material cells (a CT voxel >= 64, the papyrus iso) and the
+   others: mean |d| over mean |logit|, max |d|, the share of bit-identical values. The CT window (ctd: the forward's scratch) restored */
+static void skip_ab(unet *u, const void *x2, shape5 xn, int h16, uint8_t *ctd, int Wz, int W, int cout) {
+    const size_t w3 = (size_t)Wz * W * W, cv = w3 / 64; const int C = cout < 16 ? cout : 16, Hc = W / 4;
+    uint8_t *hct = malloc(w3); uint8_t *mat = malloc(cv); nn_sync(); nn_d2h(hct, ctd, w3);
+    for (size_t c = 0; c < cv; c++) mat[c] = 0;
+    for (int z = 0; z < Wz; z++) for (int y = 0; y < W; y++) for (int x = 0; x < W; x++) if (hct[((size_t)z * W + y) * W + x] >= 64) mat[((size_t)(z / 4) * Hc + y / 4) * Hc + x / 4] = 1;
+    const int lh = unet_logits_h16(u) != 0; const size_t es = lh ? 2 : 4, nb = (size_t)C * cv * es;
+    uint8_t *A = malloc(nb), *Bm = malloc(nb); double t[2];
+    for (int k = 0; k < 2; k++) {
+        nn_skip_pause(k == 0); if (k) nn_h2d(ctd, hct, w3);
+        nn_sync(); const double t0 = now(); const float *l = unet_forward_x(u, x2, xn, 0, h16); nn_sync(); t[k] = now() - t0;
+        nn_d2h(k ? Bm : A, l, nb);
+    }
+    nn_skip_pause(0); nn_h2d(ctd, hct, w3);
+    double e[2] = {0, 0}, m[2] = {0, 0}, mx[2] = {0, 0}; size_t n[2] = {0, 0}, same[2] = {0, 0}, nm = 0;
+    for (size_t i = 0; i < (size_t)C * cv; i++) {
+        const double a = lh ? (double)((const _Float16 *)A)[i] : (double)((const float *)A)[i], b = lh ? (double)((const _Float16 *)Bm)[i] : (double)((const float *)Bm)[i];
+        const int k = mat[i % cv] ? 0 : 1; const double d = fabs(a - b); e[k] += d; m[k] += fabs(a); if (d > mx[k]) mx[k] = d; n[k]++; same[k] += a == b;
+    }
+    for (size_t c = 0; c < cv; c++) nm += mat[c];
+    fprintf(stderr, "skip A/B: trunk %.3f s dense, %.3f s masked (%.1f%% faster); L0 active %.3f, material cells %.3f; material: mean |d| / mean |logit| %.5f, max |d| %.4g, "
+            "identical %.4f; other cells: %.5f, max %.4g, identical %.4f\n", t[0], t[1], 100 * (1 - t[1] / t[0]), nn_skip_share(0), (double)nm / cv,
+            m[0] > 0 ? e[0] / m[0] : 0, mx[0], n[0] ? (double)same[0] / n[0] : 0, m[1] > 0 ? e[1] / m[1] : 0, mx[1], n[1] ? (double)same[1] / n[1] : 0);
+    free(hct); free(mat); free(A); free(Bm);
+}
 int cmd_predict(int argc, char **argv) {
     const char *bf = opt(argc, argv, "--boxes", nullptr);
     if (!bf) return predict_one(argc, argv);
@@ -2436,6 +2463,7 @@ static int predict_one(int argc, char **argv) {
                 nn_ptick("input pool");
                 const int skw = skip_empty && half == 3 && ctd && gpath && !lat_store && !lvq;   /* (the CT window in ctd until the forward) */
                 if (skw && !nn_skip_build(ctd, Wz, W, W, 4, cfg.nlev, skip_thr, skip_margin)) { skip_wins++; if (ufsm_env_on("UFSM_SKIP_REPORT")) skip_share0 += nn_skip_share(0); }
+                if (skw && ufsm_env_on("UFSM_SKIP_AB")) skip_ab(u, x2, xn, h16, ctd, Wz, W, cfg.cout);   /* the dense / masked A/B of this window */
                 const float *l2 = unet_forward_x(u, x2, xn, 0, h16); nn_ptick("trunk forward");
                 if (skw) { long m_, c_; nn_skip_counts(&m_, &c_); skip_masked += m_; skip_calls += c_; nn_skip_off(); }
                 /* train --fstem: the fine voxel stem on the CT channel (xd channel 0) into the planes the path holds: output o of the stem's list
