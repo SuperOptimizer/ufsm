@@ -689,13 +689,14 @@ __device__ __forceinline__ float fuse_grad_v(float x, unsigned tb, unsigned mb, 
 }
 template <typename T>
 __global__ void lat_fuse_k(const T *lg, int qd, int q0, int d, int h, int w, int z0, int nz, int c0, int n, int guide, int gb, const f16 *x, const uint8_t *t,
-                           const uint8_t *m, const uint8_t *wch, const float *st, float pw, float gscale, float rec_w, int unit_c, fuse_lam lam, float *part, double *ds) {
+                           const uint8_t *m, const uint8_t *wch, const float *st, float pw, float gscale, float rec_w, int unit_c, fuse_lam lam, float *part, double *ds,
+                           int szlo, int szhi) {   /* szlo / szhi: the fine planes whose voxels add to the loss sums (the split's owned planes) */
     const int H = 4 * h, W = 4 * w, D = 4 * d, C = guide ? 2 : n, nk = guide ? 7 : n;
     const size_t pl = (size_t)h * w, ncs = (size_t)(nz / 4) * pl, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     /* ds: also the loss sums 1 .. 4 of nn_loss_stats_acc (the statistics pass then only counts the mask weights: nn_lat_fuse_stats mask_only) */
     float acc[7][4];
     if (ds) for (int k = 0; k < 7; k++) for (int j = 0; j < 4; j++) acc[k][j] = 0.f;
-#define FUSE_LSUM(k, xv, tbv, mbv, sg_) do { if (ds) { const float mw_ = (float)(mbv), x_ = (xv), p_ = (tbv) * (1.f / 255.f); \
+#define FUSE_LSUM(k, xv, tbv, mbv, sg_) do { if (ds && fzs_ >= szlo && fzs_ < szhi) { const float mw_ = (float)(mbv), x_ = (xv), p_ = (tbv) * (1.f / 255.f); \
         const float spp_ = fmaxf(x_, 0.f) + log1pf(__expf(-fabsf(x_))); const float bce_ = pw * p_ * (spp_ - x_) + (1.f - p_) * spp_; \
         acc[k][0] += mw_ * bce_; acc[k][1] += (sg_) * p_; acc[k][2] += (sg_); acc[k][3] += p_; } } while (0)
     const bool slow = rec_w > 0.f;   /* --recall: loss_grad_v as it stands */
@@ -726,6 +727,7 @@ __global__ void lat_fuse_k(const T *lg, int qd, int q0, int d, int h, int w, int
                     for (int b = 0; b < 3; b++)
 #pragma unroll
                         for (int e = 0; e < 3; e++) { p[b][e] = LW[rz][0] * v[0][b][e] + LW[rz][1] * v[1][b][e] + LW[rz][2] * v[2][b][e]; gp[b][e] = 0.f; }
+                    const int fzs_ = z0 + 4 * sz + rz;
 #pragma unroll
                     for (int ry = 0; ry < 4; ry++) {
                         float q[3], gq[3] = {0.f, 0.f, 0.f};
@@ -787,7 +789,7 @@ __global__ void lat_fuse_k(const T *lg, int qd, int q0, int d, int h, int w, int
         float p[7][9], gp[7][9];
         for (int k = 0; k < 7; k++)
             for (int j = 0; j < 9; j++) { p[k][j] = LW[rz][0] * v[k][j] + LW[rz][1] * v[k][9 + j] + LW[rz][2] * v[k][18 + j]; gp[k][j] = 0.f; }
-        const int z = z0 + 4 * sz + rz;
+        const int z = z0 + 4 * sz + rz, fzs_ = z;
         for (int ry = 0; ry < 4; ry++) {
             float q[7][3], gq[7][3];
             for (int k = 0; k < 7; k++)
@@ -1005,14 +1007,19 @@ __global__ void lat_fuse_fin_k(const float *part, int nk, int d, int h, int w, i
 /* lg: the cell logits [.][lqd][h][w] from plane lq0 (fp16 if lh16); st: the group's loss scratch (nn_loss_stats_fin); part: 27 n
    floats per coarse cell of the slab (n = 7 for a guided group); gc: the rolling gradient planes [.][gqd][h][w] from plane gq0 */
 extern "C" size_t nn_lat_fuse_part(int n, int h, int w, int nz) { return (size_t)n * 27 * (nz / 4) * h * w * sizeof(float); }
+/* the fine planes [lo, hi) whose voxels add to nn_lat_fuse_grad's loss sums (default all): under --split z the gradient pass also covers
+   a 4-plane halo band the statistics pass leaves out, so the "light" statistics pass (loss sums from the gradient pass) clips them to
+   the statistics pass's planes (perf2 2026-11-13) */
+static thread_local int g_fsum_lo = -(1 << 30), g_fsum_hi = 1 << 30;
+extern "C" void nn_lat_fuse_sum_zwin(int lo, int hi) { g_fsum_lo = lo; g_fsum_hi = hi; }
 extern "C" void nn_lat_fuse_grad(const void *lg, int lh16, int lq0, int lqd, int d, int h, int w, int z0, int nz, int c0, int n, int guide, int gb, const void *x,
                                  const uint8_t *t, const uint8_t *m, const uint8_t *wch, const float *st, float pw, float rec_w, int unit_c, const float *lam,
                                  float *part, float *gc, int gq0, int gqd, double *ds) {
     if (z0 % 4 || nz % 4 || n > 7 || (guide && n != 2)) { fprintf(stderr, "nn_lat_fuse_grad: whole coarse planes, at most 7 channels (a guided pair: 2)\n"); abort(); }
     fuse_lam L; for (int k = 0; k < 7; k++) L.v[k] = k < n ? lam[k] : 1.f;
     const int nk = guide ? 7 : n; const size_t ncs = (size_t)(nz / 4) * h * w;
-    if (lh16) lat_fuse_k<f16><<<nblk(ncs, 128), 128>>>((const f16 *)lg, lqd, lq0, d, h, w, z0, nz, c0, n, guide, gb, (const f16 *)x, t, m, wch, st, pw, g_gscale, rec_w, unit_c, L, part, ds);
-    else lat_fuse_k<float><<<nblk(ncs, 128), 128>>>((const float *)lg, lqd, lq0, d, h, w, z0, nz, c0, n, guide, gb, (const f16 *)x, t, m, wch, st, pw, g_gscale, rec_w, unit_c, L, part, ds);
+    if (lh16) lat_fuse_k<f16><<<nblk(ncs, 128), 128>>>((const f16 *)lg, lqd, lq0, d, h, w, z0, nz, c0, n, guide, gb, (const f16 *)x, t, m, wch, st, pw, g_gscale, rec_w, unit_c, L, part, ds, g_fsum_lo, g_fsum_hi);
+    else lat_fuse_k<float><<<nblk(ncs, 128), 128>>>((const float *)lg, lqd, lq0, d, h, w, z0, nz, c0, n, guide, gb, (const f16 *)x, t, m, wch, st, pw, g_gscale, rec_w, unit_c, L, part, ds, g_fsum_lo, g_fsum_hi);
     const int a0 = max(z0 / 4 - 1, 0), a1 = min((z0 + nz) / 4 + 1, d);
     lat_fuse_fin_k<<<nblk((size_t)(a1 - a0) * h * w * nk, 256), 256>>>(part, nk, d, h, w, z0, nz, a0, a1, gc, gq0, gqd, c0, guide ? gb : -1);
     KCHECK();

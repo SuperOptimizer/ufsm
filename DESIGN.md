@@ -140,6 +140,16 @@ unchanged (byte-identical). test_fstem, test_lathead, test_heads, test_predict_h
 about 110 ms per step at P 512 on this card, and about 4x that per card at the P 1024 split half.
 ## Split-window input builders: every --gpu-aug builder by z range, the scanner split exactly across two GPUs (2026-11-13, branch augz-20261112)
 
+**The light statistics pass under the split (UFSM_LAT_LIGHT_SPLIT=1, untested).** For the fused head groups (the normal 7 and the
+side pair), the single-card trainer counts only mask weights in the statistics pass and takes the loss sums from the gradient pass
+("light"). The split turned light off because its gradient pass also covers a 4-plane halo band. On the pod, light off cost 22 ms a
+step at P 512 one card (1.518 -> 1.540 s), so at the P 1024 split half it should be roughly 90 ms per card. Now:
+- nn_lat_fuse_grad's loss sums take only fine planes [lo, hi) (nn_lat_fuse_sum_zwin, set from hs_keep's statistics-pass range);
+- the light finalisation (nn_loss_stats_fin_light) sums only entries 1 .. 4 across the halves, because the statistics pass's
+  finalisation already summed the mask weights in entry 0.
+It is off by default. The pods were shut down before the same-GPU split comparison (--gpus 0,0 --split z, --det, light on vs off,
+logged losses) ran.
+
 ## Muon variants for the from-scratch universal net: ten arms on the 92 M net (2026-11-13, branch muonx-20261113)
 
 The regime: B = 1, P 512..1024 windows. Gradients are very noisy and runs are short (tens of thousands of steps). ANVIL II already tied
