@@ -131,6 +131,18 @@ down, so the numbers below come from commit messages only:
   scans. Those two volumes reject 5 / 6 boxes. `EXCLVOL` leaves out 0841's 9.366 um scan (the boxes are not mapped into it) and
   0500P2's 9.362 um scan (a labelled source already), so 35 unlabelled volumes remain.
 
+- unissl, the trunk term on desk GPU 1 (11-12 12:50 - 19:42, from unified/last.ckpt step 1504; ink off, --ssl 16 --ssl-share 0.25,
+  35 unlabelled scans): no collapse (std 0.234-0.243 against the 0.25 floor, cosine 0.19 -> 0.11, 40 % of the cells targeted), the
+  unlabelled share settles at 25 % after a startup skew (48 %: cheap windows fill the replay slots first). Two run faults, both fixed:
+  the inserted side head was never initialised on a resume (c46d58f) and nn_w4runs_label aborted on a full card (a5520d5).
+  wbench core p05x against unified-1504, all 44 rows, paired bootstrap: 2000 +0.001 [-0.013, +0.013], 4000 -0.007 [-0.018, +0.002],
+  6000 -0.017 [-0.036, -0.000] (latres, 39 clean boxes: -0.018, P(better) 0.04). A monotone slide, but unissl has no control: since
+  1504 the SSL term, the dropped ink sources / loss and 4500 more steps all changed.
+- Attribution, sslpair (11-12 19:45-): three arms from unissl snap/4000 back to back on GPU 1, --det 1 (identical windows), 1500
+  steps cooled to 5500 (wsd): ctrl (--ssl 16, no unlabelled source: the term never runs), ssl (unissl as is), heads (ssl +
+  --ssl-heads rv,dens,normal,phase). ctrl vs ssl attributes the slide; ssl vs heads is the heads term. --det costs ~15 % (212 vs 250
+  Mvox/s). Caveat: 1500 steps against a 0.017 effect (MDE ~0.02): a null is not evidence of no effect.
+
 **Code.**
 - Sources take `"ssl": 1` (CT only, no targets; `holdout_reject` for the wbench boxes).
 - New train flags: `--ssl D --ssl-level 1 --ssl-share S --ssl-mask r --ssl-weight w --ssl-var g`.
