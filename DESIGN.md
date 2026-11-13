@@ -143,6 +143,15 @@ down, so the numbers below come from commit messages only:
   --ssl-heads rv,dens,normal,phase). ctrl vs ssl attributes the slide; ssl vs heads is the heads term. --det costs ~15 % (212 vs 250
   Mvox/s). Caveat: 1500 steps against a 0.017 effect (MDE ~0.02): a null is not evidence of no effect.
 
+- Closed 11-12 ~22:00 (user: "cancel the dino and the standalone ink training"; the pods went away). Where it stands:
+  - sslpair: ctrl reached 5300 (snap 4000 / 4500 / 5000 kept; one OOM kill at 21:19), ssl and heads never ran. unissl's slide after
+    2000 stays unattributed (SSL term vs dropped ink vs more steps).
+  - pod3dino (pod 3, RTX PRO 6000, from unissl 6773, trunk + --ssl-heads rv,dens,normal,phase, 6 labelled + 27 unlabelled sources): ran
+    ~480 steps before the pod went, no snapshot saved. 1040 Mvox/s (1.0 s/step, 4x the desk), loader wait 5 %, SM 100 % busy at B 1
+    (dmon; memory bandwidth 33-53 %, 20.7 of 97 GB), so B > 1 under --ssl was not needed. ssl 0.069, std 0.246; heads gated rv 24.5 %,
+    normal 19.2 %, dens 2.3 %, phase 2.7 % (the papyrus and magnitude gates leave dens / phase sparse at default thresholds).
+  - Code kept, off by default: --ssl, --ssl-heads (tests pass), the CT draw index for ct_only scans, side-head insertion on resume.
+
 **Code.**
 - Sources take `"ssl": 1` (CT only, no targets; `holdout_reject` for the wbench boxes).
 - New train flags: `--ssl D --ssl-level 1 --ssl-share S --ssl-mask r --ssl-weight w --ssl-var g`.
