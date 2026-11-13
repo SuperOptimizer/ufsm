@@ -188,6 +188,18 @@ the kernels in a window, the host threads' CUDA API time).
   repro. (test_mx4's five-width sequence NaN also appears with the wide path off: a test artefact, not this bug.) Gate:
   scripts/test/split_finite.sh BIN CMDFILE (desk, both cards, ~3 min): step 1 of the scratch2 command line with UFSM_GRAD_DUMP, all
   gradients finite; ok by default, FAIL (5422144) with UFSM_S2B_WIDE=1.
+- **Root cause (17:00-18:00): the planner aliases gy and gx at down3.** UFSM_S2B_DUMP (the 448 call's gy, gx before / after, w per card) +
+  tests/s2b_replay (the same bytes in separate buffers through nn_conv3d_bwd_data_acc): the kernel is correct on the trainer's exact inputs
+  (rel 0.256 vs the dilated path, finite), yet in the trainer its output was garbage from the 4th z tile on (mean scale per 4-plane tile 115
+  .. 116, then 155, 216 ...), and a second in-trainer run on a fresh gx copy was garbage everywhere: the kernel destroys its own input. The
+  logged pointers: gx starts 626688 B into gy's 974848 B (both cards; the 348160 shared bytes identical in the dumps), i.e. gy's channel
+  blocks ~10-13 and all its scales are gx block 0's old content. The streaming kernel reads gy tiles while writing gx; the dilated path
+  converts gy first, so it never NaN'd, but with accumulate it adds gy's bytes as old gx: master's level-3 gradients (ch 0-31 of enc3's input
+  gradient, z < ~21) are silently wrong on the dilated path too. UFSM_ALIAS_CHECK=1 (nn_conv3d_bwd_data_acc: abort on an overlapping gy /
+  accumulated gx) fires there on master (layer 9, 448 -> 448, gy 16^3); the planner fix (the split-top whole-level gradient buffers) is open,
+  with split3. Kernel side: s2b_f4 copies an overlapping gy first (1 MB at 448 ch; UFSM_S2B_NOCOPY=1 the old behaviour); test_mx4 "s2b 448 ch,
+  gy overlapping gx" (the trainer's offset): streaming vs dilated rel 0.227 with the copy, 1.6e37 FAIL without. The wide path is on again:
+  split_finite ok with it (max |g| 0.284); --det replay 8 steps: 82.4 vs 77.9 Mvox/s (+5.8 %), step-1 loss identical, gn 22-25 both.
 
 **Profile before** (the archived one-card P 512 92 M run, runs/scratch-archive-20261113/prof92: nsys + UFSM_PROF=layers, 37 steady
 steps): 1.61 s/step, kernel-busy 99 % (GPU-bound, no loader wait). Per step:
