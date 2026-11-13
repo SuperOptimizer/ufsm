@@ -338,6 +338,12 @@ typedef struct fit_set_row fit_set_row;
 fit_set_row *fit_set_row_new(const fit_set *s, double z);
 int fit_set_row_root_b(fit_set_row *w, double theta, double k, double r_hint, double ua, double ub, double *r);
 void fit_set_row_free(fit_set_row *w);
+/* W's Lipschitz bounds per model and lattice z plane (fit_set_row_new_lip: the row's root searches skip the steps whose class cannot
+   change; the same roots, fewer evaluations) */
+typedef struct fit_lip fit_lip;
+fit_lip *fit_lip_new(const fit_set *s);
+void fit_lip_free(fit_lip *L);
+fit_set_row *fit_set_row_new_lip(const fit_set *s, double z, const fit_lip *L);
 /* grad W of the set at a box-local native point by central differences over +-e (theta continued across its cut, so the gradient
    is that of the smooth U - dir theta / 2 pi); returns |grad W| (turns per native voxel) */
 double fit_set_gradW(const fit_set *s, double z, double y, double x, double e, double g[3]);

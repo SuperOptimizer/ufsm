@@ -465,8 +465,14 @@ snap() {
     [ "$DRY" = 1 ] || rm -rf $O/wraps_snap
     # (a run whose fields were already cleaned: the CT target)
     [ "$DRY" != 1 ] && [ "$t" != ct ] && [ ! -e $F/pc/zarr.json ] && { log "snap: no field planes in $F (cleaned): --target ct"; t=ct; }
-    X $O/logs/snap.log $U wrap-snap $O/wraps $O/wraps_snap --target $t --axis $O/axis.json --axis-um $UM --ct $R $K/$LV --ct-um $LUM \
-      --fields $F --threads $TH ${SNAPX:-} || return 1
+    # only the wraps the strip keeps (trim's --first / --last in state/strip.args; wrap-snap still reads the ids just outside as the
+    # neighbours that bound them, so the kept wraps snap byte-identically): Paris 4 dropped 41 outer wraps, 19% of the vertices
+    local sel=; [ -e $O/state/strip.args ] && sel=$(grep -oE -- '--(first|last) +-?[0-9]+' $O/state/strip.args | tr '\n' ' ')
+    # SNAPGPU (default: the first GPU of FITGPUS that is not INKGPU, free after the slabs; empty: none): the CT / fields chunks decoded
+    # there (UFSM_GPU_DECODE, byte-identical to the CPU's; ~45% of wrap-snap's CPU time was the volcomp decode)
+    local sg=${SNAPGPU-$(for g in $FITGPUS; do [ "$g" != "$INKGPU" ] && { echo $g; break; }; done)}
+    X $O/logs/snap.log env ${sg:+UFSM_GPU_DECODE=1 UFSM_GPU_DECODE_DEV=$sg} $U wrap-snap $O/wraps $O/wraps_snap --target $t --axis $O/axis.json --axis-um $UM --ct $R $K/$LV --ct-um $LUM \
+      --fields $F --threads $TH $sel ${SNAPX:-} || return 1
     [ "$DRY" = 1 ] || log "snap: $(grep '^wrap-snap: solve' $O/logs/snap.log | tail -1)"
   else log "snap: off (SNAP=0)"; fi
   [ "$DRY" = 1 ] || { [ "${CLEAN:-1}" = 1 ] && { find $F -mindepth 1 -maxdepth 1 ! -name fields.json -exec rm -rf {} +; [ $F = $O/fields/$FNAME ] || find $O/fields/$FNAME -mindepth 1 -maxdepth 1 ! -name fields.json -exec rm -rf {} +; rm -rf $O/slabs/s???/fit; }; }
@@ -486,11 +492,18 @@ stripimg() {
   if [ "$DRY" = 1 ]; then echo "    $E: stretch from the 3 middle stripes (render $FILLX + strip-mosaic --stretch-only), then U=$U CTR=$R CTK=$K/$LV INK=$INK INKK=$LUM PAPMOS=$ST/img_pap bash scripts/strip/strip_refill.sh $ST"; return 0; fi
   mkdir -p $RF $ST/fillmap $ST/logs; S=($(ls $ST/strip/flat/stripes)); N=${#S[@]}; [ $N -gt 0 ] || return 1
   if [ ! -s $ST/stretch.txt ]; then
-    for k in $((N / 2 - 1)) $((N / 2)) $((N / 2 + 1)); do [ $k -ge 0 ] && [ $k -lt $N ] || continue; s=${S[$k]}; [ -e $RF/$s.done ] && continue
-      mkdir -p $RF/in_$s; ln -sfn $ST/strip/flat/stripes/$s $RF/in_$s/$s
+    # the 3 middle stripes' renders at once (SJOBS, default by memory: a Paris 4 stripe render peaks at ~21 GB RSS and 4 GB of device
+    # pool; one after another they were 3 x 28 s of 84 s, on 1667 26 + 15 + 10 s; each render is independent: the same images)
+    local sj=${SJOBS:-$(a=$(availgb); [ $a -ge 72 ] && echo 3 || { [ $a -ge 48 ] && echo 2 || echo 1; })} pids=() rc=0 p
+    srend() { local s=$1; mkdir -p $RF/in_$s; ln -sfn $ST/strip/flat/stripes/$s $RF/in_$s/$s
       env $E /usr/bin/time -v nice -n 10 $U render $RF/in_$s $RF --volume $INK $LUM --ct $R $K/$LV --depth 1 --scale 1 --threads ${RENDER_NT:-$TH} $FILLX > $ST/logs/refill_$s.log 2>&1 || return 1
-      [ -e $RF/${s}_fill.tif ] && mv $RF/${s}_fill.tif $ST/fillmap/; rm -r $RF/in_$s; touch $RF/$s.done
+      [ -e $RF/${s}_fill.tif ] && mv $RF/${s}_fill.tif $ST/fillmap/; rm -r $RF/in_$s; touch $RF/$s.done; }
+    for k in $((N / 2 - 1)) $((N / 2)) $((N / 2 + 1)); do [ $k -ge 0 ] && [ $k -lt $N ] || continue; s=${S[$k]}; [ -e $RF/$s.done ] && continue
+      while [ ${#pids[@]} -ge $sj ]; do wait ${pids[0]} || rc=1; pids=("${pids[@]:1}"); done
+      srend $s & pids+=($!)
     done
+    for p in "${pids[@]}"; do wait $p || rc=1; done
+    [ $rc = 0 ] || return 1
     nice -n 10 $U strip-mosaic $ST/strip/flat $RF $ST/img_fill --stretch-only 1 --threads 3 2> $ST/logs/stretch.log | awk '/^stretch/ {print $2}' > $ST/stretch.txt
     [ -s $ST/stretch.txt ] || { log "stripimg: no stretch (logs in $ST/logs)"; return 1; }; log "stripimg: stretch $(cat $ST/stretch.txt)"
   fi

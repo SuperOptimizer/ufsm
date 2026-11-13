@@ -26,6 +26,7 @@
 #include <sys/file.h>
 #include <fcntl.h>
 #include <stdatomic.h>
+#include <float.h>
 static double nn_wall_seconds(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 
 int fit_scale_L(int L, double f) { const int v = (int)lround(L * f); return v < 2 ? 2 : v; }
@@ -2216,12 +2217,25 @@ static int rr_cross(ray_ev evr, const void *ctx, double z, double cy, double cx,
    dropped by the caller, so the search returns -1 as soon as every root it can still find is outside: the ring's crossing intervals
    all outside (no refinement), or each side's front past its bound (or stopped). The same roots where they are kept. */
 typedef void (*ray_prep)(const void *ctx, double thw);   /* (optional: per-ray constants of the evaluator, given the ray angle) */
-static inline int ray_root_b(ray_ev evr, ray_prep prep, const void *ctx, const fit_model *m, double z, double theta, double k, double r_hint, double ua, double ub, double *r);
-static int ray_root(ray_ev evr, ray_prep prep, const void *ctx, const fit_model *m, double z, double theta, double k, double r_hint, double *r) { return ray_root_b(evr, prep, ctx, m, z, theta, k, r_hint, -1e300, 1e300, r); }
-static inline __attribute__((always_inline)) int ray_root_b(ray_ev evr, ray_prep prep, const void *ctx, const fit_model *m, double z, double theta, double k, double r_hint, double ua, double ub, double *r) {   /* (inlined: a constant evaluator inlines too) */
+/* lipf (optional, ufsm wraps): the safe radius around the ray point (y, x): how far along the ray (|sin|, |cos| of its direction given)
+   W cannot move by q turns (q / a local Lipschitz bound of W, at most the reach of that bound; fit_lip). Where W - k at an evaluated
+   point keeps its class (its sign, and short of the side's stop at +-2) for the next steps, those steps are not evaluated: a side's
+   value is needed only where its class can change, and is evaluated there (the same point, the same bits). Every ring, crossing
+   interval and root is the one of the full scan: the same roots. Rays without a kept root (no crossing, or the first ring's crossings
+   outside [ua, ub]) took ~70% of the evaluations at 130-190 each (Paris 4). */
+typedef double (*ray_lip)(const void *ctx, double y, double x, double asy, double asx, double q);
+/* rmax: an upper bound of every radius lipf returns per turn of q (1 / the bound's floor: the smallest pitch); a radius is asked for only
+   when it could reach the next step (most rays find their root in the first ring next to the hint: no lookups there) */
+static inline int ray_root_b(ray_ev evr, ray_prep prep, const void *ctx, const fit_model *m, double z, double theta, double k, double r_hint, double ua, double ub, ray_lip lipf, double rmax, double *r);
+static int ray_root(ray_ev evr, ray_prep prep, const void *ctx, const fit_model *m, double z, double theta, double k, double r_hint, double *r) { return ray_root_b(evr, prep, ctx, m, z, theta, k, r_hint, -1e300, 1e300, nullptr, 0, r); }
+static inline double rr_rad_out(double f) { const double q = f < 0 ? -f : f < 2 ? (f < 2 - f ? f : 2 - f) : 0; return q > 1e-7 ? q - 1e-7 : 0; }   /* (margin: W's rounding, ~1e-12) */
+static inline double rr_rad_in(double f) { const double q = f >= 0 ? f : f > -2 ? (-f < f + 2 ? -f : f + 2) : 0; return q > 1e-7 ? q - 1e-7 : 0; }
+static inline __attribute__((always_inline)) int ray_root_b(ray_ev evr, ray_prep prep, const void *ctx, const fit_model *m, double z, double theta, double k, double r_hint, double ua, double ub, ray_lip lipf, double rmax, double *r) {   /* (inlined: a constant evaluator inlines too) */
     const int na = (int)(m->D * m->h) + 1;
     const double cy = axis_lerp(m->cy, na, z), cx = axis_lerp(m->cx, na, z), sy = sin(theta), sx = cos(theta), thw = atan2(sy, sx);
     if (prep) prep(ctx, thw);
+    const double asy = fabs(sy), asx = fabs(sx);
+#define RAD(R_, Q_, D_) (lipf && (Q_) * rmax > (D_) ? lipf(ctx, cy + (R_) * sy, cx + (R_) * sx, asy, asx, (Q_)) : 0)   /* (0: every step evaluated; D_: the step's distance) */
     const double Y = m->H * m->h, X = m->W * m->h;
     double rlo = 0, rhi = 1e9;   /* the part of the ray inside the box */
     const double c0[2] = {cy, cx}, dv[2] = {sy, sx}, ext[2] = {Y, X};
@@ -2240,18 +2254,30 @@ static inline __attribute__((always_inline)) int ray_root_b(ray_ev evr, ray_prep
 #define EVR(R_) evr(ctx, z, cy + (R_) * sy, cx + (R_) * sx, (R_), thw)
     const double h0 = fmin(fmax(r_hint, rlo), rhi), f0 = EVR(h0) - k;
     double ro = h0, fo = f0, ri = h0, fi = f0, best = -1, bestd = 1e300;
+    /* the skips: fo / fi exact (okn / ikn) or only their class (the anchor's value, at oa / ia, safe up to the radius ora / ira) */
+    int okn = 1, ikn = 1; double oa = h0, ia = h0, ora = -1, ira = -1;   /* (radii < 0: not asked yet, asked at the next step) */
     while ((ro < rhi && fo < 2) || (ri > rlo && fi > -2)) {
         if ((!(ro < rhi && fo < 2) || ro > ub) && (!(ri > rlo && fi > -2) || ri < ua)) return -1;   /* only dropped roots are left */
         double seg[RR_SEG][4]; int ns = 0;   /* (a, b, f(a), f(b)) of this ring's crossing intervals */
         if (ro < rhi && fo < 2) {
-            const double rn = fmin(ro + dr, rhi), fn = EVR(rn) - k;
-            if ((fo < 0) != (fn < 0)) ns = rr_cross(evr, ctx, z, cy, cx, sy, sx, thw, k, ro, fo, rn, fn, 0, seg, ns);
-            ro = rn; fo = fn;
+            const double rn = ro + dr < rhi ? ro + dr : rhi;   /* (fmin's value: both finite; no libm call) */
+            if (ora < 0) ora = RAD(oa, rr_rad_out(fo), rn - oa);   /* (fo: the anchor's exact value) */
+            if (rn - oa < ora) { ro = rn; okn = 0; }   /* (W - k keeps fo's class there) */
+            else {
+                const double fn = EVR(rn) - k;
+                if ((fo < 0) != (fn < 0)) { if (!okn) fo = EVR(ro) - k; ns = rr_cross(evr, ctx, z, cy, cx, sy, sx, thw, k, ro, fo, rn, fn, 0, seg, ns); }
+                ro = rn; fo = fn; okn = 1; oa = rn; ora = -1;
+            }
         }
         if (ri > rlo && fi > -2) {
-            const double rn = fmax(ri - dr, rlo), fn = EVR(rn) - k;
-            if ((fi < 0) != (fn < 0)) ns = rr_cross(evr, ctx, z, cy, cx, sy, sx, thw, k, rn, fn, ri, fi, 0, seg, ns);
-            ri = rn; fi = fn;
+            const double rn = ri - dr > rlo ? ri - dr : rlo;
+            if (ira < 0) ira = RAD(ia, rr_rad_in(fi), ia - rn);
+            if (ia - rn < ira) { ri = rn; ikn = 0; }
+            else {
+                const double fn = EVR(rn) - k;
+                if ((fi < 0) != (fn < 0)) { if (!ikn) fi = EVR(ri) - k; ns = rr_cross(evr, ctx, z, cy, cx, sy, sx, thw, k, rn, fn, ri, fi, 0, seg, ns); }
+                ri = rn; fi = fn; ikn = 1; ia = rn; ira = -1;
+            }
         }
         if (ns) { int out = 1; for (int q = 0; q < ns; q++) out &= seg[q][1] < ua || seg[q][0] > ub; if (out) return -1; }
         for (int q = 0; q < ns; q++) {
@@ -2273,6 +2299,7 @@ static inline __attribute__((always_inline)) int ray_root_b(ray_ev evr, ray_prep
     *r = best;
     return 0;
 #undef EVR
+#undef RAD
 }
 static double ev_model(const void *m, double z, double y, double x, double r, double th) { return fit_W_rt(m, z, y, x, r, th); }
 int fit_ray_root(const fit_model *m, double z, double theta, double k, double r_hint, double *r) { return ray_root(ev_model, nullptr, m, m, z, theta, k, r_hint, r); }
@@ -2863,13 +2890,112 @@ int fit_set_ray_root(const fit_set *s, double z, double theta, double k, double 
 }
 int fit_set_ray_root_b(const fit_set *s, double z, double theta, double k, double r_hint, double ua, double ub, double *r) {
     ev_row R; ev_row_init(&R, s, z);
-    return ray_root_b(ev_row_Wt, ev_row_prep, &R, s->global, z, theta, k, r_hint, ua, ub, r);
+    return ray_root_b(ev_row_Wt, ev_row_prep, &R, s->global, z, theta, k, r_hint, ua, ub, nullptr, 0, r);
 }
+/* W's local Lipschitz bounds (fit_lip): per model, lattice z cell (plane pair) and tile of LIP_T x LIP_T lattice cells, the largest
+   |delta| difference of y (x) neighbour nodes over the tile and its 8 neighbours, per native voxel. Along a ray at angle th, at a
+   point of a tile, |dW / dr| <= 1 / pitch + |sin th| gy + |cos th| gx for (LIP_T - 1) L native voxels in any direction (the 3 x 3 tiles
+   hold every cell that near, each node difference counted in the tile of its lower cell; the
+   trilinear weights are convex, the clamped parts flat); a blend of two models <= the larger bound. (A per-plane maximum was ~10 turns
+   per voxel on Paris 4, outlier nodes, against a median of 0.01: no skips.) */
+enum { LIP_T = 8 };
+typedef struct { int ny, nx, np; float *g; } lip_tab;   /* g: np x ny x nx x (gy, gx) */
+struct fit_lip { int n; lip_tab *t; };   /* t[k]: slab k; t[n]: the global model */
+typedef struct { const fit_set *s; fit_lip *L; } lip_job;
+static void lip_plane(const fit_model *m, int pl, int ny, int nx, float *raw) {   /* plane pl's per-tile maxima (gy, gx) into raw */
+    const int ly = m->ly, lx = m->lx; const float *d = m->delta + (size_t)pl * ly * lx; const double iL = 1.0 / m->L;
+    for (size_t i = 0; i < 2 * (size_t)ny * nx; i++) raw[i] = 0;
+    float *ex = malloc(sizeof(float) * 2 * (size_t)(lx > 0 ? lx : 1));   /* (a node row's differences, then max-folded into tiles) */
+    for (int y = 0; y < ly; y++) {
+        const float *a = d + (size_t)y * lx, *b = y + 1 < ly ? a + lx : nullptr; int bad = 0;
+        for (int x = 0; x < lx; x++) {
+            bad |= !isfinite(a[x]);
+            const float ey = b ? (float)(fabs((double)b[x] - a[x]) * iL * (1 + 1e-6)) : 0.f, ex1 = x + 1 < lx ? (float)(fabs((double)a[x + 1] - a[x]) * iL * (1 + 1e-6)) : 0.f;
+            ex[2 * x] = ey <= FLT_MAX ? ey : INFINITY; ex[2 * x + 1] = ex1 <= FLT_MAX ? ex1 : INFINITY;   /* (NaN: no bound) */
+        }
+        float *r = raw + 2 * (size_t)((y < ly - 1 ? y : ly - 2 < 0 ? 0 : ly - 2) / LIP_T) * nx;
+        if (bad) { for (int t = 0; t < nx; t++) r[2 * t] = r[2 * t + 1] = INFINITY; continue; }   /* (a non-finite lattice value: no skips there) */
+        for (int x = 0; x < lx; x++) {
+            float *q = r + 2 * ((x < lx - 1 ? x : lx - 2 < 0 ? 0 : lx - 2) / LIP_T);
+            if (ex[2 * x] > q[0]) { q[0] = ex[2 * x]; }
+            if (ex[2 * x + 1] > q[1]) { q[1] = ex[2 * x + 1]; }
+        }
+    }
+    free(ex);
+}
+static void lip_rows(void *a, int k0, int k1, int t) {
+    const lip_job *J = a; (void)t;
+    for (int k = k0; k < k1; k++) {
+        const fit_model *m = k < J->s->n ? J->s->slab[k] : J->s->global; lip_tab *T = &J->L->t[k];
+        const int ny = T->ny, nx = T->nx; const size_t nt = 2 * (size_t)ny * nx; float *raw[2] = {malloc(sizeof(float) * nt), malloc(sizeof(float) * nt)};
+        lip_plane(m, 0, ny, nx, raw[0]);
+        for (int p = 0; p < T->np; p++) {
+            const int p1 = p + 1 < m->lz ? p + 1 : m->lz - 1; float *A = raw[p & 1], *B = raw[!(p & 1)];
+            if (p1 != p) lip_plane(m, p1, ny, nx, B); else memcpy(B, A, sizeof(float) * nt);
+            float *g = T->g + 2 * (size_t)p * ny * nx;   /* the 3 x 3 tile maxima of both planes */
+            for (int ty = 0; ty < ny; ty++) for (int tx = 0; tx < nx; tx++) {
+                float a0 = 0, a1 = 0;
+                for (int dy = -1; dy <= 1; dy++) for (int dx = -1; dx <= 1; dx++) {
+                    const int yy = ty + dy, xx = tx + dx; if (yy < 0 || xx < 0 || yy >= ny || xx >= nx) continue;
+                    const size_t i = 2 * ((size_t)yy * nx + xx);
+                    a0 = A[i] > a0 ? A[i] : a0; a1 = A[i + 1] > a1 ? A[i + 1] : a1; a0 = B[i] > a0 ? B[i] : a0; a1 = B[i + 1] > a1 ? B[i + 1] : a1;
+                }
+                g[2 * ((size_t)ty * nx + tx)] = a0; g[2 * ((size_t)ty * nx + tx) + 1] = a1;
+            }
+        }
+        free(raw[0]); free(raw[1]);
+    }
+}
+fit_lip *fit_lip_new(const fit_set *s) {
+    fit_lip *L = calloc(1, sizeof *L); L->n = s->n; L->t = calloc(s->n + 1, sizeof *L->t);
+    for (int k = 0; k <= s->n; k++) {
+        const fit_model *m = k < s->n ? s->slab[k] : s->global; lip_tab *T = &L->t[k];
+        T->ny = (m->ly > 1 ? m->ly - 2 : 0) / LIP_T + 1; T->nx = (m->lx > 1 ? m->lx - 2 : 0) / LIP_T + 1; T->np = m->lz > 1 ? m->lz - 1 : 1;
+        T->g = malloc(sizeof(float) * 2 * (size_t)T->np * T->ny * T->nx);
+        if (!T->g) { fit_lip_free(L); return nullptr; }
+    }
+    lip_job J = {s, L}; fit_par(s->n + 1, lip_rows, &J);
+    return L;
+}
+void fit_lip_free(fit_lip *L) { if (!L) return; for (int k = 0; k <= L->n; k++) free(L->t[k].g); free(L->t); free(L); }
 /* the same for many rays of one z (ufsm wraps' rows): the slab choice and the z parts once per row */
-struct fit_set_row { const fit_set *s; double z; ev_row R; };
-fit_set_row *fit_set_row_new(const fit_set *s, double z) { fit_set_row *w = malloc(sizeof *w); if (w) { w->s = s; w->z = z; ev_row_init(&w->R, s, z); } return w; }
+typedef struct { const float *g; int ny, nx; double ip, reach; } lip_row;   /* a part's plane pair of tiles; 1 / pitch; (LIP_T - 1) L */
+struct fit_set_row { ev_row R; const fit_set *s; double z; int nl; lip_row l[2]; double rmax; };   /* rmax: the parts' smallest pitch (L >= 1 / pitch) */   /* (R first: the evaluator's context) */
+static int lip_part(const fit_lip *L, const fit_set *s, const ev_part *p, lip_row *o) {
+    int k = s->n; for (int q = 0; q < s->n; q++) if (s->slab[q] == p->m) { k = q; break; }
+    const lip_tab *T = &L->t[k]; const int pz = p->c0z < T->np ? p->c0z : T->np - 1;
+    if (!(p->pit > 0)) return -1;
+    o->g = T->g + 2 * (size_t)pz * T->ny * T->nx; o->ny = T->ny; o->nx = T->nx; o->ip = 1 / p->pit; o->reach = (double)(LIP_T - 1) * p->m->L;
+    return 0;
+}
+static inline double lip_at(const ev_part *p, const lip_row *l, double y, double x, double asy, double asx, double *reach) {   /* the bound at (y, x) */
+    const fit_model *m = p->m; const int L = m->L, ly = m->ly, lx = m->lx;
+    const double qy = p->iL > 0 ? y * p->iL : y / L, qx = p->iL > 0 ? x * p->iL : x / L;
+    const double ay = qy < 0 ? 0 : qy > ly - 1 ? ly - 1 : qy, ax = qx < 0 ? 0 : qx > lx - 1 ? lx - 1 : qx;
+    int c0y = (int)ay; if (c0y > ly - 2) c0y = ly - 2 < 0 ? 0 : ly - 2;
+    int c0x = (int)ax; if (c0x > lx - 2) c0x = lx - 2 < 0 ? 0 : lx - 2;
+    int ty = c0y / LIP_T, tx = c0x / LIP_T; if (ty >= l->ny) ty = l->ny - 1; if (tx >= l->nx) tx = l->nx - 1;
+    const float *g = l->g + 2 * ((size_t)ty * l->nx + tx);
+    *reach = l->reach;
+    return (l->ip + asy * g[0] + asx * g[1]) * (1 + 1e-6);
+}
+static double ev_row_lip(const void *rv, double y, double x, double asy, double asx, double q) {   /* ray_lip of a row */
+    const struct fit_set_row *w = rv; double ra, rb = 1e300;
+    double L = lip_at(&w->R.a, &w->l[0], y, x, asy, asx, &ra);
+    if (w->nl > 1) { const double Lb = lip_at(&w->R.b, &w->l[1], y, x, asy, asx, &rb); if (!(Lb <= L)) L = Lb; }
+    if (!(L > 0) || !isfinite(L)) return 0;
+    const double rr = ra < rb ? ra : rb, v = q / L; return v < rr ? v : rr;
+}
+fit_set_row *fit_set_row_new_lip(const fit_set *s, double z, const fit_lip *L) {
+    fit_set_row *w = malloc(sizeof *w); if (!w) return nullptr;
+    w->s = s; w->z = z; ev_row_init(&w->R, s, z); w->nl = 0;
+    if (L && L->n == s->n && !lip_part(L, s, &w->R.a, &w->l[0]) && (!w->R.mode || !lip_part(L, s, &w->R.b, &w->l[1]))) w->nl = w->R.mode ? 2 : 1;
+    w->rmax = w->nl ? (w->nl > 1 && w->R.b.pit < w->R.a.pit ? w->R.b.pit : w->R.a.pit) : 0;
+    return w;
+}
+fit_set_row *fit_set_row_new(const fit_set *s, double z) { return fit_set_row_new_lip(s, z, nullptr); }
 int fit_set_row_root_b(fit_set_row *w, double theta, double k, double r_hint, double ua, double ub, double *r) {
-    return ray_root_b(ev_row_Wt, ev_row_prep, &w->R, w->s->global, w->z, theta, k, r_hint, ua, ub, r);
+    return ray_root_b(ev_row_Wt, ev_row_prep, &w->R, w->s->global, w->z, theta, k, r_hint, ua, ub, w->nl ? ev_row_lip : nullptr, w->rmax, r);
 }
 void fit_set_row_free(fit_set_row *w) { free(w); }
 int fit_set_save(const fit_set *s, const char *dir) {

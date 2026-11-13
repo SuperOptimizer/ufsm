@@ -98,8 +98,54 @@ static int field_array_case(const char *base) {
     return 0;
 }
 
+/* fit_set_row_new_lip (ufsm wraps' step skips over a local Lipschitz bound of W) must give every root bit for bit as the full scan
+   (fit_set_row_new): a 3-slab set with blends, lattices of smooth sheets plus noise and outlier nodes (the bound's tiles), rays with
+   near and far hints, bounded and unbounded [ua, ub], many wrap ids (rays without a crossing, crossings outside the bounds) */
+static uint32_t lcg(uint32_t *s) { return *s = *s * 1664525u + 1013904223u; }
+static double urand(uint32_t *s) { return (lcg(s) >> 8) / 16777216.0; }
+static int skip_case(void) {
+    enum { SD = 96, SH = 160, SW = 150, SL = 8 };
+    fit_set *s = calloc(1, sizeof *s); s->n = 3; s->blend = 16; s->slab = calloc(3, sizeof *s->slab); s->z0 = calloc(3, sizeof(double)); s->z1 = calloc(3, sizeof(double));
+    uint32_t rs = 12345; const int na = SD * 2 + 1;
+    for (int k = 0; k <= 3; k++) {
+        fit_model *m = calloc(1, sizeof *m); m->dir = 1; m->nk = 2; m->knot_dz = 256; m->pitch = malloc(8); m->offset = malloc(8);
+        m->pitch[0] = (float)(7 + k * 0.5); m->pitch[1] = (float)(8 - k * 0.3); m->offset[0] = (float)(0.2 * k); m->offset[1] = (float)(-0.1 * k);
+        m->D = k < 3 ? 48 : SD; m->H = SH; m->W = SW; m->h = 2; m->origin[0] = k < 3 ? 1000 + k * 64 - 16 : 1000; m->origin[1] = 50; m->origin[2] = 70; m->um = 9.6;
+        m->L = k < 3 ? SL : 1 << 20; m->lz = k < 3 ? m->D * 2 / SL + 2 : 2; m->ly = k < 3 ? SH * 2 / SL + 2 : 2; m->lx = k < 3 ? SW * 2 / SL + 2 : 2;
+        m->delta = calloc((size_t)m->lz * m->ly * m->lx, 4);
+        if (k < 3) for (int a = 0; a < m->lz; a++) for (int b = 0; b < m->ly; b++) for (int c = 0; c < m->lx; c++) {
+            const double y = b * SL, x = c * SL; double v = 0.8 * sin(y * 0.02 + a * 0.3) * cos(x * 0.015) + 0.05 * (urand(&rs) - 0.5);
+            if (lcg(&rs) % 211 == 0) v += 40 * (urand(&rs) - 0.5);   /* (outlier nodes: a large local bound) */
+            m->delta[((size_t)a * m->ly + b) * m->lx + c] = (float)v;
+        }
+        const int nak = (int)(m->D * m->h) + 1; m->cy = malloc(nak * 4); m->cx = malloc(nak * 4);
+        for (int z = 0; z < nak; z++) { m->cy[z] = (float)(160 + 10 * sin(z * 0.01)); m->cx[z] = (float)(150 + 8 * cos(z * 0.013)); }
+        if (k < 3) { s->slab[k] = m; s->z0[k] = k * 64; s->z1[k] = k == 2 ? SD * 2 : (k + 1) * 64; } else s->global = m;
+    }
+    (void)na;
+    fit_lip *L = fit_lip_new(s); CHECK(L != nullptr, "fit_lip_new"); if (!L) return 1;
+    long nray = 0, nroot = 0, ndiff = 0;
+    for (int zi = 0; zi < 48; zi++) {
+        const double z = 1 + zi * (SD * 2 - 2) / 47.0;
+        fit_set_row *a = fit_set_row_new(s, z), *b = fit_set_row_new_lip(s, z, L);
+        for (int q = 0; q < 400; q++) {
+            const double th = -M_PI + 2 * M_PI * urand(&rs), k = 2 + (int)(urand(&rs) * 30), hint = urand(&rs) * 200;
+            double ua = -1e300, ub = 1e300; if (q % 3 == 1) { ua = urand(&rs) * 150; ub = ua + urand(&rs) * 80; } else if (q % 3 == 2) { ua = 0; ub = urand(&rs) * 60; }
+            double ra = -7, rb = -7; const int ea = fit_set_row_root_b(a, th, k, hint, ua, ub, &ra), eb = fit_set_row_root_b(b, th, k, hint, ua, ub, &rb);
+            nray++; nroot += !ea; if (ea != eb || (!ea && memcmp(&ra, &rb, sizeof ra))) ndiff++;
+        }
+        fit_set_row_free(a); fit_set_row_free(b);
+    }
+    printf("step skips: %ld rays, %ld roots, %ld differ from the full scan\n", nray, nroot, ndiff);
+    CHECK(ndiff == 0, "%ld of %ld rays: the skipped scan's root differs", ndiff, nray);
+    CHECK(nroot > nray / 10, "only %ld roots of %ld rays (the case lost its point)", nroot, nray);
+    fit_lip_free(L); fit_set_free(s);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     (void)argc;
+    CHECK(!skip_case(), "the step-skip case");
     char exe[600]; snprintf(exe, sizeof exe, "%s", argv[0]); char bin[700]; snprintf(bin, sizeof bin, "%s/ufsm", dirname(exe));
     if (access(bin, X_OK)) { fprintf(stderr, "FAIL: no %s\n", bin); return 1; }
     char base[] = "/tmp/test_wraps_core_XXXXXX"; if (!mkdtemp(base)) return 1;
