@@ -25,6 +25,7 @@
 #include "latvol_read.h"
 #include "embz.h"
 #include "latfit.h"
+#include "winauto.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <math.h>
@@ -1154,6 +1155,17 @@ static int predict_one(int argc, char **argv);
    whole single-box path, so the outputs are those of one process per box; what carries over is the CUDA context and the memory
    (nn_pool: the pinned rings and device buffers of the same sizes, device buffers zeroed), and the shared CT cache. A box that fails
    stops the run (exit status of that box). */
+typedef struct { unet *u; const int *cz, *cw; int ha, fea, ffz, ffh, tta, shard; } winauto_ctx;
+static size_t winauto_need(int k, int d, void *vc) {   /* the device bytes of auto-window candidate k (d: direct slabs): the inference
+    forward's dry run + the CT window, the feather accumulator E, the field accumulators, --tta buffers, one shard, 1.5 GB slack */
+    const winauto_ctx *c = vc; const int iz = c->cz[k] - 2 * c->ha, ix = c->cw[k] - 2 * c->ha;
+    unet_set_slab_direct(d);
+    const size_t w3 = (size_t)c->cz[k] * c->cw[k] * c->cw[k], e3 = c->fea ? (size_t)(ix + c->fea) * (ix + c->fea) * (ix + c->fea) : 0,
+                 acc = c->ffz ? (size_t)iz * ix * ix / ((size_t)c->ffh * c->ffh * c->ffh) * 64 : 0;
+    return unet_infer_bytes(c->u, (shape5){1, 4, c->cz[k], c->cw[k], c->cw[k]}) + w3 / 8 + e3 + acc + (c->tta > 1 ? 3 * w3 : 0) +
+           (size_t)c->shard * c->shard * c->shard + ((size_t)3 << 29);
+}
+
 int cmd_predict(int argc, char **argv) {
     const char *bf = opt(argc, argv, "--boxes", nullptr);
     if (!bf) return predict_one(argc, argv);
@@ -1622,22 +1634,14 @@ static int predict_one(int argc, char **argv) {
         if (fea) { for (int k = 1; k <= 3; k++) { cz[nc] = cw[nc] = k * shard + 2 * ha; nc++; } }
         else { static const int fz[3] = {384, 640, 1152}, fx[3] = {640, 640, 1152}; for (int k = 0; k < 3; k++) { cz[nc] = fz[k]; cw[nc] = fx[k]; nc++; } }
         const int dir_ok = !getenv("UFSM_SLAB_DIRECT") || ufsm_env_on("UFSM_SLAB_DIRECT");
-        const size_t fr = getenv("UFSM_PRED_WINDOW_FREE") ? (size_t)(atof(getenv("UFSM_PRED_WINDOW_FREE")) * 1e9) : nn_mem_free();   /* (planning: a GB figure, with UFSM_PRED_WINDOW_DRY=1) */
-        int bk = 0, bd = dir_ok; double bc = 1e30;
-        for (int k = 0; k < (wprod ? 1 : nc); k++) for (int d = dir_ok; d >= 0; d--) {
-            const int iz = cz[k] - 2 * ha, ix = cw[k] - 2 * ha;
-            if (iz <= 0 || ix <= 0) continue;
-            const double cost = (double)cz[k] * cw[k] * cw[k] / ((double)iz * ix * ix) * (d ? 1.0 : fea ? 1.22 : 1.25);
-            unet_set_slab_direct(d);
-            const size_t w3 = (size_t)cz[k] * cw[k] * cw[k], e3 = fea ? (size_t)(ix + fea) * (ix + fea) * (ix + fea) : 0,
-                         acc = ffz ? (size_t)iz * ix * ix / ((size_t)ffh * ffh * ffh) * 64 : 0,
-                         need = unet_infer_bytes(u, (shape5){1, 4, cz[k], cw[k], cw[k]}) + w3 / 8 + e3 + acc + (tta > 1 ? 3 * w3 : 0) + (size_t)shard * shard * shard + ((size_t)3 << 29);   /* (--tta: the saved CT + the probability accumulator) */
-            if ((need <= fr || (k == 0 && d == 0)) && cost < bc - 1e-9) { bc = cost; bk = k; bd = d; }
-        }
+        const size_t fr = winauto_budget(nn_mem_free());   /* (UFSM_MEM_FREE_GB caps it; UFSM_PRED_WINDOW_FREE plans for another card) */
+        winauto_ctx wc = {u, cz, cw, ha, fea, ffz != nullptr, ffh, tta, shard};
+        int bd = 0; double bc = 0;
+        const int bk = winauto_pick(nc, cz, cw, ha, dir_ok, wprod, fea ? 1.22 : 1.25, winauto_max_interior(), fr, winauto_need, &wc, &bd, &bc);
         unet_set_slab_direct(bd ? 2 : 0);
         Wz = cz[bk]; W = cw[bk]; halo = hz = ha; slab = Wz != W;
-        fprintf(stderr, "predict: --window auto%s: %d x %d^2, halo %d, %s slabs (%.1f GB free; %.2f computed voxels per interior voxel)\n", wprod ? " (prod)" : "",
-                Wz, W, halo, bd ? "direct" : "copy", fr / 1e9, bc);
+        fprintf(stderr, "predict: --window auto%s: %d x %d^2, halo %d, %s slabs (%.1f GB budget, interior <= %d; %.2f computed voxels per interior voxel)\n",
+                wprod ? " (prod)" : "", Wz, W, halo, bd ? "direct" : "copy", fr / 1e9, winauto_max_interior(), bc);
         if (ufsm_env_on("UFSM_PRED_WINDOW_DRY")) return 0;
     }
     if (split && !win_given && !wauto) { W = shard + 128; halo = 64; fprintf(stderr, "predict: window %d, halo %d (split default; --window / --halo set them; window - 2 halo = k * shard computes one window per k^3 shards)\n", W, halo); }

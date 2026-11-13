@@ -237,6 +237,9 @@ $(B)/test_mx: tests/test_mx.c $(B)/nn.o $(B)/nn_fp8.o
 $(B)/test_sysinfo: tests/test_sysinfo.c src/sysinfo.h | $(B)
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_sysinfo.c -o $@
 suite-bins: $(B)/test_sysinfo
+$(B)/test_winauto: tests/test_winauto.c src/winauto.h | $(B)
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_winauto.c -o $@
+suite-bins: $(B)/test_winauto
 $(B)/test_mx_sw: tests/test_mx_sw.c $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 suite-bins: $(B)/test_mx_sw
