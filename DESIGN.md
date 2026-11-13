@@ -59,7 +59,10 @@ elements differ), bytes repeat; the P 1024 half slab 160 -> 256: 7.61 -> 1.12 ms
 card. Default OFF (UFSM_HEAD_BTC=1 on): with it on, test_lat_head's "a second equal net" check (the same parameters and
 inputs on a second unet) differs by rel 0.4 in the trunk gradients, which test_head_tc's kernel-level checks (C 32 / 96 / 256, two
 samples, whole and ranges) do not reproduce. The difference is deterministic: CUDA_LAUNCH_BLOCKING changes nothing, and it shows only in
-the narrow {96,64,96} config. So it is a path difference, not a race. One of the two nets reaches the head's backward-data with fp16
+the narrow {96,64,96} config. A trace of the calls (UFSM_C1B_TRACE, not kept) shows both nets taking the same fp16 TC path (gdt 2,
+whole and per range). The head's gx is therefore the same kind on both nets, and the 0.42 / 0.17 matches test_lat_head's known
+narrow-level fault: "TLH_NARROW_ALL ... 0.17 on every trunk tensor, 11-09, open". BTC's slightly different gx bits seem to expose that
+fault rather than cause it. The paragraph below was the first reading. One of the two nets reaches the head's backward-data with fp16
 logit gradients (the TC kernel), the other with MX or bf16 ones (gdt 3 / 1: the FFMA kernel). With BTC off both use FFMA, whose fp32
 sums agree whenever the values do. The TC kernel would need a gdt 3 / 1 staging to keep that equality. The 8-output comparisons
 (trunk rel 0.3) are the same effect: the wide head's TC gx against the 8-output FFMA gx, where one SR flip in fp4 spreads through the
