@@ -345,6 +345,8 @@ else()
     COMMAND ${CMAKE_COMMAND} --build ${UFSM_VERIFY_DIR} -j ${UFSM_JOBS} --target suite-bins
     DEPENDS suite-check ${UFSM_TEST_PREP_REL} USES_TERMINAL VERBATIM)
 endif()
+# the manifest runs ./$B/test_x from the repo root: $B relative to it (a build dir outside the tree must be given as a relative path too)
+cmake_path(RELATIVE_PATH UFSM_VERIFY_DIR BASE_DIRECTORY ${CMAKE_SOURCE_DIR} OUTPUT_VARIABLE _suite_b)
 # test / test-slow / test-all: the tiers of tests/suite.txt, runner options from the environment: SUITE_FLAGS="-j 4 test_fit"
 foreach(t fast slow all)
   if(t STREQUAL "fast")
@@ -353,7 +355,7 @@ foreach(t fast slow all)
     set(tn test-${t})
   endif()
   add_custom_target(${tn}
-    COMMAND bash -c "exec tests/run_suite.sh -B '${UFSM_VERIFY_DIR}' -t ${t} $SUITE_FLAGS"
+    COMMAND bash -c "exec tests/run_suite.sh -B '${_suite_b}' -t ${t} $SUITE_FLAGS"
     DEPENDS test-prep WORKING_DIRECTORY ${CMAKE_SOURCE_DIR} USES_TERMINAL VERBATIM)
 endforeach()
 # every suite binary needs a line in tests/suite.txt and every tests/suite.txt binary a target (a merge that added only one half)
