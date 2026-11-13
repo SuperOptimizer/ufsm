@@ -6,6 +6,33 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Pod whole-scroll unroll queue: two lanes per card, axis check, latent ink stage (2026-11-12/13, branch podunroll-20261112)
+
+Pod 3 (one RTX PRO 6000, 98 GB; cgroup 94 GB / 27.2 CPUs), u1-13750, RECTOSP=0, the user's smallest-first list. 13 scrolls landed
+on the desk before the user cancelled the queue (01:xx 11-13): 0332, MAN5, 0009B, MANB, 0814, 1203, 0358, 1451, 0813, 0846B, 0257,
+0490B, 0483B (renders in /vesuvius/ufsm/unroll/<S>-u1; logs in /vesuvius/ufsm/v2/lat/runs/podsave-20261112/pod3).
+On papyrus 0.60-0.85, wrap-check dup 0-17 % (MAN5 27 %). The fields took 36-586 s and the slabs 118-1979 s per scroll.
+
+- `scripts/pod/q.sh LANE`: 2 lanes share the card (FITLANES 2, TH 13 each); a lane claims the next scroll (flock), fetches its CT from
+  the mirror (setup.sh step 6), uses the corpus box / axis (kit/S/{box.txt,axis.json}), runs pod/unroll.sh. After the 00:24 disk-full
+  (500 / 500 GB, a lane spun on a failed setup because its claim file could not be written): a claim counts only when written, a failed
+  setup marks the scroll failed and backs off 60 s, lanes wait below 60 GB free, rc 0 without stripimg.done is a failure.
+- `scripts/pod/podpull.sh` (desk): each scroll's overview / strip_long / one ct+ink stripe / logs as soon as stripimg lands
+  (temp name + rename), a sanity FLAG (on-papyrus < 0.5 or dup share > 30 %), then trims the pod (strip mesh, ink, ref-cf, CT copy).
+- pod/unroll.sh: per-scroll helper dir (drv/S: two lanes' starts swapped scrolls.tsv otherwise); `INKW=576` (an auto ink window took
+  1600^3 / 90 GB of a free card and spilled the other lane's fits to managed memory, ink 2 -> 260 s per window; see the winauto section).
+- Axis check (`scripts/pod/axcheck.{sh,py}`, hooked into pod/unroll.sh before the run starts): the corpus axis vs the papyrus centroid
+  (Otsu on level LV+3, per-z centroid, running median +-2048 L0 voxels) at 10/30/50/70/90 % of the papyrus height; off = the median of
+  the 30/50/70 % offsets > 2 mm, or no papyrus within 1 mm at 50 % -> axis_centroid.json. "Any level > 2 mm" was too strict: the ends
+  are tapered caps and the umbilicus is not the mass centroid (0009B 5.9 / 1.1 / 3.4 / 0.7 / 7.8 mm and 0814 3.6 / 1.3 / 0.3 / 0.6 /
+  1.9 mm unrolled well on their corpus axes). PHercMANB (crushed, lens-shaped; corpus axis 3-10 mm off, median 4.1 mm): on papyrus
+  0.369 -> 0.628 and dup 30 % -> 17 % with the centroid axis.
+- Latent ink stage (`scripts/pod/latink.sh` as INKCMD; user 11-13 "forget about ift3"): inkB's recipe, predict --heads ink,c12,c13
+  (inkpod-9000) at the run's level, window 544 halo 16, grids 0 and 256 (the 256 pass on --shard 256: on 512 shards each shard
+  overlapped 8 shifted windows, ~7x the windows), ink-blend per head. strip_refill.sh (INKGATE) gates every stripe's ink render by
+  max(p_recto, p_verso) and takes the contrast stretch from the gated middle stripes (ink percentiles over papyrus pixels, CT >= 80).
+  Only 0841 / 0846A ran it before the cancel (0846A ink 1621 s incl. the rerun of its grid 256); no landed scroll has latent ink.
+
 ## Split-window input builders: every --gpu-aug builder by z range, the scanner split exactly across two GPUs (2026-11-13, branch augz-20261112)
 
 For the 40 M net (widths 192..384), one P 1024 window is split in z across both 5060 Tis (univI's splitwin-20261112). Each GPU then
