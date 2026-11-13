@@ -2565,7 +2565,7 @@ int cmd_train(int argc, char **argv) {
         }
         int nfib = 0; for (int i = 0; i < S->n; i++) for (int c = 0; c < NTG; c++) nfib += S->src[i].tgt_fib[c] != nullptr;
         if (nfib) {   /* "fibre" targets (fiberraster.h): the planes' stamp and combine on --onfly-gpu, buffers for the window's box reserved now */
-            const int og = atoi(opt(argc, argv, "--onfly-gpu", "0")), P0 = atoi(opt(argc, argv, "--P", "64")), e = P0 + 64;
+            const int og = atoi(opt(argc, argv, "--fibre-gpu", opt(argc, argv, "--onfly-gpu", "0"))), P0 = atoi(opt(argc, argv, "--P", "64")), e = P0 + 64;   /* (--fibre-gpu: another card than the phase's, e.g. the split's second) */
             const int fg = fiber_onfly_config(og, e);
             if (fg < 0) { fprintf(stderr, "train: --onfly-gpu %d: no GPU fibre planes (or the reserve failed)\n", og); return 1; }
             if (fg) fprintf(stderr, "train: on-the-fly fibre planes (%d targets) on GPU %d, buffers for %d^3 boxes\n", nfib, og, e);
@@ -2574,7 +2574,7 @@ int cmd_train(int argc, char **argv) {
         mesh_codes_gpu_config(atoi(opt(argc, argv, "--onfly-gpu", "0")));   /* the mesh codes stamp ("onfly": {"meshes"}) on the same device (-1 the CPU) */
         int nink = 0; for (int i = 0; i < S->n; i++) for (int c = 0; c < NTG; c++) nink += S->src[i].ink_fly[c] != nullptr;
         if (nink) {   /* "onfly" ink targets (inksplat.h inkfly_open): face + splat of a cold chunk on --onfly-gpu (per sampler thread a stream; -1 the CPU) */
-            const int og = atoi(opt(argc, argv, "--onfly-gpu", "0")); inkfly_gpu_config(og);
+            const int og = atoi(opt(argc, argv, "--ink-gpu", opt(argc, argv, "--onfly-gpu", "0"))); inkfly_gpu_config(og);   /* (--ink-gpu: as --fibre-gpu) */
             fprintf(stderr, "train: on-the-fly ink targets (%d) computed on %s %d (cached per 128^3 chunk: memory + %s)\n", nink, og >= 0 ? "GPU" : "CPU", og,
                     dcache_default_dir() ? dcache_default_dir() : "no disk cache"); ONFLY_MEM("the ink targets");
         }

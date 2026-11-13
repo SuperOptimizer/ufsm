@@ -62,8 +62,8 @@ static double fr_t(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t)
 static int g_fr_timing = -1;
 static thread_local int t_fr_nth = 1;   /* the CT read's threads (the onfly read's caller's) */   /* the fibre planes on the GPU: -1 not yet decided (UFSM_FIBRE_CPU=1: never), 0 no, 1 yes */
 int fiber_onfly_gpu(int on);
-/* the device box of the GPU planes: UFSM_FIBRE_GPU_MVOX million voxels (default 64: 3 bytes a voxel of buffers, 0.2 GB) */
-size_t fiber_gpu_slab_vox(void) { static size_t v; if (!v) { const char *e = getenv("UFSM_FIBRE_GPU_MVOX"); const double m = e ? atof(e) : 64; v = (size_t)((m >= 1 ? m : 1) * 1e6); } return v; }
+/* the device box of the GPU planes: UFSM_FIBRE_GPU_MVOX million voxels (default 64: 3 bytes a voxel of buffers, 0.2 GB; tests: 0.01 for many slabs) */
+size_t fiber_gpu_slab_vox(void) { static size_t v; if (!v) { const char *e = getenv("UFSM_FIBRE_GPU_MVOX"); const double m = e && atof(e) > 0 ? atof(e) : 64; v = (size_t)(m * 1e6); if (v < 4096) v = 4096; } return v; }
 int fiber_onfly_config(int gpu, int edge) {
     const char *e = getenv("UFSM_FIBRE_CPU");
     if (gpu < 0 || (e && atoi(e))) { fiber_onfly_gpu(0); return 0; }

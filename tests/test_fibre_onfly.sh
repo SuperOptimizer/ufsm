@@ -24,6 +24,8 @@ PY
 O=(--ct fx ct/9.6 --level 0 --radius 2 --guard 2 --ring 2 --iso 100 --ref lab/H lab/V 9.6 --windows 6 --P 96)
 "$U" fiber-onfly f.fib "${O[@]}" > gpu.log 2>&1 || { echo "FAIL: onfly (default) differs from fiber-raster ($D/gpu.log)"; tail -2 gpu.log; exit 1; }
 UFSM_FIBRE_CPU=1 "$U" fiber-onfly f.fib "${O[@]}" > cpu.log 2>&1 || { echo "FAIL: onfly (CPU) differs ($D/cpu.log)"; tail -2 cpu.log; exit 1; }
+UFSM_FIBRE_GPU_MVOX=0.05 "$U" fiber-onfly f.fib "${O[@]}" > slab.log 2>&1 || { echo "FAIL: onfly (GPU, 50k-voxel z slabs) differs ($D/slab.log)"; tail -2 slab.log; exit 1; }
+grep -q 'byte-identical' slab.log || { echo "FAIL: no byte-identical line (slabs)"; exit 1; }
 grep -q 'byte-identical' gpu.log && grep -q 'byte-identical' cpu.log || { echo "FAIL: no byte-identical line"; exit 1; }
 # the extent (z3_derived_extent: the draw cells): one short fibre in a corner marks only the chunks within its reach
 python3 -c "
