@@ -6,6 +6,42 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Latent ink head: window seams at inference, the 2-pass grid blend, 1667 scores (2026-11-12, scripts/inkgt/u1667ink.sh)
+
+The inkpod snapshots' ink head (`predict --heads ink`, latent trunk, 4 levels) gives every predict window its own level: the 1299
+inkpod-9000 renders showed a square tile grid. Measured in the raw store on a fixed 1299 corner (level 2, box 5632,2048,2048 + 1024^3,
+the plane-mean step across the window seam / the median plane step, z / y / x; sched/seam/seam.tsv):
+
+| run | halo 16 | halo 64 | halo 96 |
+|---|---|---|---|
+| inkpod-9000 (--ink-dice 0.25) | 2.6 / 7.2 / 30.2 | 2.0 / 27.1 / 4.9 | 1.6 / 27.5 / 13.6 |
+| inkpod-11000 (dice off) | 1.4 / 15.3 / 29.5 | 2.4 / 30.3 / 12.1 | 2.6 / 23.8 / 16.1 |
+| inkpod-12000 (dice off, --ink-air 8, ink share 40%) | 0.4 / 15.4 / 26.6 | | |
+
+(median plane steps 0.07-0.5; ift3 on the same box: no step.) Window 1024 / halo 256 still 10-14; `--gn-frozen` (fresh pooled
+statistics) moves the levels, not the steps; level 1 (4.8 um, the crop eval's level) 5.2 / 13.2 / 3.8. No attention stage, constant
+FiLM code. Turning the per-window dice off did NOT remove the steps (11000 / 12000 as large as 9000), so the head's level depends on
+context wider than 256 voxels for another reason (receptive field of the stride-4 trunk; ink never supervised in air, ~60 / 255 there).
+
+Fix at inference: two passes, the second on a tile grid shifted by half a tile (`--grid-origin 256,256,256`), blended with sin^2 tile
+weights (`ufsm ink-blend --tile 512 --grids 0,0,0:256,256,256`): on a 512^3 read across the corner the largest plane step drops from
+16.9 to 1.3 (median 0.1). The shifted pass must use `--shard 256`: with 512 shards every shard needs 8 windows (P4 inner 17405 windows
+vs 2311, 7.5x); with 256 shards the output is byte-identical (1299 test box) in 5 s instead of 63 s. Papyrus gate for renders only:
+the same `--heads ink,c12,c13` run gives the recto / verso probabilities, gated = ink x max(c12, c13) on the rendered stripes; the
+store and the scores stay ungated.
+
+1667 u1 centre surface, inkpod-9000 blended, vs the published human labels (wrapscore, 40 um; ift3-24000 beside):
+
+| split | coverage | inkpod-9000 ink AUC | ift3-24000 |
+|---|---|---|---|
+| all | 0.860 | 0.774 | 0.646 |
+| validation | 0.827 | 0.528 | 0.670 |
+| holdout | 0.864 | 0.560 | 0.639 |
+| rest (in the ink training labels) | 0.864 | 0.832 | 0.643 |
+
+The "all" gain is the training labels: on the unseen splits the latent head is below ift3 (-0.14 / -0.08). 20 / 80 um all: 0.776 /
+0.776 (coverage 0.615 / 0.971). wrapscore: the foot-point refine's 2x2 solve is closed-form (np.linalg.solve raised on P4's grid holes).
+
 ## The 1667 unroll's ink against the human labels on our surfaces (2026-11-12, scripts/inkgt/wrapscore.py)
 
 `ufsm ink-compare`, which the earlier unrolls ran, is label-free (CT | ink panels and statistics). wrapscore.py maps the published

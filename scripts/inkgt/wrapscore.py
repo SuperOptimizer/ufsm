@@ -126,7 +126,10 @@ for k in np.unique(k_):
         f0 = np.stack([bil(A, r, c) for A in G], 1); fr = np.stack([bil(A, r + .5, c) for A in G], 1) - f0; fc = np.stack([bil(A, r, c + .5) for A in G], 1) - f0
         Jm = np.stack([fr, fc], 2) * 2; e = q - f0
         JtJ = np.einsum("nki,nkj->nij", Jm, Jm) + 1e-6 * np.eye(2); Jte = np.einsum("nki,nk->ni", Jm, e)
-        dlt = np.linalg.solve(JtJ, Jte[..., None])[..., 0]; dlt = np.clip(dlt, -1, 1)
+        # closed-form 2x2 solve (np.linalg.solve raised "Singular matrix" on P4 ws020 / ws021: inf / nan Jacobians at grid holes); bad rows step 0
+        a_, b_, d_ = JtJ[:, 0, 0], JtJ[:, 0, 1], JtJ[:, 1, 1]; det = a_ * d_ - b_ * b_
+        with np.errstate(all="ignore"): dlt = np.stack([d_ * Jte[:, 0] - b_ * Jte[:, 1], a_ * Jte[:, 1] - b_ * Jte[:, 0]], 1) / det[:, None]
+        dlt = np.clip(np.nan_to_num(dlt, nan=0.0, posinf=0.0, neginf=0.0), -1, 1)
         r = np.clip(r + dlt[:, 0], 0, Z.shape[0] - 1.001); c = np.clip(c + dlt[:, 1], 0, Z.shape[1] - 1.001)
     f0 = np.stack([bil(A, r, c) for A in G], 1); r0 = np.floor(r).astype(int).clip(0, Z.shape[0] - 2); c0 = np.floor(c).astype(int).clip(0, Z.shape[1] - 2)
     okc = (Z[r0, c0] > 0) & (Z[r0 + 1, c0] > 0) & (Z[r0, c0 + 1] > 0) & (Z[r0 + 1, c0 + 1] > 0)
