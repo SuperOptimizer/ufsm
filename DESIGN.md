@@ -6,6 +6,13 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## The fused fit kernel at --fit-h 2: tested, not merged (2026-11-12, branch unrollperf-20261112, commit 8854121)
+
+nn_fit_accum_lat extended to field cells of 2 and 4 (q^3 cells per 8^3 block, fit_accum_cell_k's per-cell sum order): test_fit_lat
+36 / 36 bit for bit (cells 8 / 2 / 4), test_predict_heads fused == plane at --fit-h 2. Kernel bench, 256^3 window, desk 5060 Ti: cells 2
+plane path 6.0 ms vs fused 5.6 ms (cells 8: 7.8 vs 5.5; at cells 2 the plane sums cost 0.9 ms, not 2.6), so ~3 % of a fields predict;
+on the P4 fields crop it refused the chunk alignment and ran the plane path (61 s, 0 of 14 planes differ). Kept on the branch only.
+
 ## U2's host memory: the inventory, and the two per-thread buffers that only grew (2026-11-12, branch poolcap-20261112)
 
 U2 on the pod (8 workers / 10 slots, a 175 GB cgroup shared with every other job) went from 68 to 116 GB of host memory in 19 minutes and
