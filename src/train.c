@@ -271,6 +271,7 @@ static int g_mil, g_mil_mode = 1, g_mil_stride = 2, g_mil_max = 65536; static fl
    (--ink-head): the normal-pooled MIL ink loss on each window's rays (inkmil.h): per supervised label pixel (mode 1: only those without an open face, the
    voxel target's unknowns), BCE of the pooled ink logit along the normal over +-R window voxels at step (tau 0: max; > 0: tau log mean exp), the mean
    over the window's rays x L x the source's ink weight; at most --ink-mil-max rays a window (the device buffers; the backward's sort ~300 B per sample) */
+static int g_ink_air;   /* --ink-air S (--ink-head, needs the --rv papyrus plane): unlabelled air voxels on the S-voxel window lattice -> ink 0 targets (nn_ink_air) */
 static float g_ink_smooth;   /* --ink-smooth EPS (--ink-head): label smoothing of the ink BCE target, t (1 - eps) + eps / 2 (villa: 0.1) */
 static int g_unwrap, g_norm_ch, g_norm_s = 4; static float g_ink_lambda = 1.f, g_ink_dice = 0.f, g_norm_lambda = 1.f, g_dens_lambda = 1.f, g_dens_scale = 32.f;   /* --density-lambda: the density channel's BCE weight (default --normal-lambda) */
 static int g_dens_code; static float g_packed_w, g_packed_um = 120.f;   /* --density-code, --packed-weight, --packed-um (task unwrap) */
@@ -1147,7 +1148,7 @@ static void head_slab_pass(gpu_state *d, int pass) {
                 nn_loss_stats_acc(LGC(1), d->t + l3 + vb, d->pm + vb, d->w + 1, one, d->hs_ds + 5);
             } else nn_wind4_stats(LGC(g_w4_ch), LGC(g_w4_ch + 1), w4 + vb, wc + vb, d->sidem, ns, d->w4ds);
             FT("  s wind4 stats");
-            if (g_ink2) { nn_ink_targets_smooth(ink + vb, ns, d->inkt, d->inkm, g_ink_smooth); nn_loss_stats_acc(LGC(g_ink2_ch), d->inkt, d->inkm, d->inkw, one, d->hs_ds + 5); }
+            if (g_ink2) { nn_ink_targets_smooth(ink + vb, ns, d->inkt, d->inkm, g_ink_smooth); if (g_ink_air && pap) nn_ink_air(pap + vb, ns, z0, H, W, g_ink_air, g_ink_smooth, d->inkt, d->inkm); nn_loss_stats_acc(LGC(g_ink2_ch), d->inkt, d->inkm, d->inkw, one, d->hs_ds + 5); }
             if (nmil && ink_mil_fwd_slab(LGC(g_ink2_ch), 0, z0, nz, D, H, W, mrays, nmil, g_mil_R, g_mil_step, d->milacc, nullptr)) { fprintf(stderr, "ink mil: fwd_slab failed\n"); exit(1); }   /* (the logits: fp16) */   /* --ink-head (the recto / ink v1 slots are free) */
             if (mck) { _Float16 *h = malloc(ns * 2); nn_sync(); nn_d2h(h, LGC(g_ink2_ch), ns * 2); for (size_t q = 0; q < ns; q++) mlg[vb + q] = (float)h[q]; free(h); nn_d2h(mink + vb, ink + vb, ns); }   /* (+ the ink target plane the loss reads) */
             if (g_fibh) { FIBH_TARGETS(); FIBH_LOSS(0); }   /* --fib-head: the H / V masks (sums 74, 79), the direction (84) */
@@ -1173,6 +1174,7 @@ static void head_slab_pass(gpu_state *d, int pass) {
         FT("  g wind4 grad");
         if (g_ink2) {   /* --ink-head: soft BCE over the known ink voxels, times --ink-lambda x the source's "ink_weight" */
             nn_ink_targets_smooth(ink + vb, ns, d->inkt, d->inkm, g_ink_smooth);
+            if (g_ink_air && pap) nn_ink_air(pap + vb, ns, z0, H, W, g_ink_air, g_ink_smooth, d->inkt, d->inkm);   /* --ink-air: + the air lattice as ink 0 */
             nn_loss_grad_only(LGC(g_ink2_ch), d->inkt, d->inkm, d->inkw, one, g_ink_dice, LGC(g_ink2_ch), d->iscratch);   /* (--ink-dice: + w x the soft dice of the window's known voxels) */
             const float iw = g_ink_lambda * (si >= 0 && g_S && si < g_S->n ? (float)g_S->src[si].ink_weight : 1.f) * src_head_w(si, SH_INK);
             if (iw != 1.f) nn_loss_grad_scale(LGC(g_ink2_ch), ns, iw);
@@ -1964,6 +1966,14 @@ static void split_job(int side, void *a) {
 
 int cmd_train(int argc, char **argv) {
     if (ufsm_env_on("UFSM_UW_SELFTEST")) return uw_selftest();
+    {   /* --ct-gpu-decode D (DESIGN 2026-11-13): the sampler's volcomp CT decode on GPU D (src/nn_gpudec.cu, byte-identical to the CPU decode;
+           test_gpudec), i.e. UFSM_GPU_DECODE=1 UFSM_GPU_DECODE_DEV=D, set before the first z3 decode (the sources' draw-index reads) because the
+           decoder reads its env once; -1 (default) keeps the CPU decode. Its statistics print at exit. */
+        const int gd = atoi(opt(argc, argv, "--ct-gpu-decode", "-1"));
+        if (gd >= 0) { char b[16]; snprintf(b, sizeof b, "%d", gd); setenv("UFSM_GPU_DECODE", "1", 1); setenv("UFSM_GPU_DECODE_DEV", b, 1);
+                       if (!getenv("UFSM_GPU_DECODE_STATS")) setenv("UFSM_GPU_DECODE_STATS", "1", 1);
+                       fprintf(stderr, "train: the CT decode (volcomp substreams) on GPU %d (gpudec, byte-identical to the CPU decode)\n", gd); }
+    }
     if (argc < 3) {
         fprintf(stderr, "usage: ufsm train <sources.json> --out DIR [--P 512] [--B 1] [--steps 20000] [--lr 1e-3] [--warmup 500] [--wd 0.01]\n"
                         "       [--dice 0.5] [--ema 0.999] [--widths 16,32,64,80] [--down-norm 1] [--gpus 0,1] [--workers 12 (new runs with --gpu-aug 2: 3)] [--gpu-aug 0|1|2 (new runs: 2)] [--sampler-slots N] [--seed 0] [--det 1] [--resume CKPT] [--finetune 1] [--fp4 0|1|2 (default 2)] [--mem auto|auto16|default|wide] [--opt adamw|muon|anvil] [--muon-lr 0.02] [--muon-beta 0.95] [--anvil-lr 0.023] [--anvil-wd 2.25] [--sched cos|wsd] [--cooldown 0.2]\n"
@@ -2091,6 +2101,9 @@ int cmd_train(int argc, char **argv) {
             }
         }
         g_ink_lambda = (float)atof(opt(argc,argv,"--ink-lambda","1")); g_ink_dice = (float)atof(opt(argc,argv,"--ink-dice","0"));
+        g_ink_air = atoi(opt(argc,argv,"--ink-air","0"));   /* (DESIGN 2026-11-13: the face-band ink labels never reach air, so the head's level there was free) */
+        if (g_ink_air < 0 || (g_ink_air && (!g_unwrap2 || !g_ink2 || !g_rv))) { fprintf(stderr,"--ink-air S: S >= 1 voxels, with --task unwrap2 --ink-head 1 and --rv (the papyrus plane)\n"); return 2; }
+        if (g_ink_air) fprintf(stderr, "ink air: unlabelled air voxels (papyrus plane known, < 127) on the %d^3-voxel lattice are ink-0 targets\n", g_ink_air);
         g_norm_lambda = (float)atof(opt(argc,argv,"--normal-lambda","1")); g_dens_lambda = (float)atof(opt(argc,argv,"--density-lambda",opt(argc,argv,"--normal-lambda","1")));
         if (!(g_norm_lambda >= 0) || !(g_dens_lambda >= 0)) { fprintf(stderr,"--normal-lambda / --density-lambda >= 0\n"); return 2; }
         g_norm_s = atoi(opt(argc,argv,"--normal-step","4"));
