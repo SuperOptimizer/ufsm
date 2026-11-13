@@ -117,6 +117,14 @@ set(UFSM_CU_FLAGS -x cuda --cuda-path=${UFSM_CUDA} --ptxas-path=./ptxas -Wno-unk
     -fno-threadsafe-statics ${UFSM_CXX_STDLIB} "SHELL:-Xcuda-fatbinary -compress-all" "SHELL:-isystem ${UFSM_CUDA}/include/cccl"
     "SHELL:-include ${CMAKE_SOURCE_DIR}/src/clang_cuda_compat.cuh" -D_GNU_SOURCE -DUFSM_CUDA_VERSION=${UFSM_CUDA_VERSION}
     -DUFSM_PTX_ISA=${UFSM_PTX_ISA})
+# ptxas --split-compile=N: ptxas optimises the kernels of one unit on N threads. The big lp_* units hold up to 9 kernel
+# instantiations; lp_f4fwd_i0p.cu 41 s -> 22 s with 0 (all cores), 25 s with 4 (desk, 2026-11-13). It only shortens the tail of a
+# build (the rest is -j bound), but adds threads beyond -j, hence off by default (the desk's 8-job rule); 4 on dedicated machines.
+# The SASS is identical with and without it (lp_f4fwd_i0g, cuobjdump -sass).
+set(UFSM_PTXAS_SPLIT 0 CACHE STRING "ptxas --split-compile threads per CUDA unit (0 / 1: off)")
+if(UFSM_PTXAS_SPLIT GREATER 1)
+  list(APPEND UFSM_CU_FLAGS "SHELL:-Xcuda-ptxas --split-compile=${UFSM_PTXAS_SPLIT}")
+endif()
 # nvcc -use_fast_math on the device side only: flush denormals, approximate division / sqrt / transcendentals, FMA contraction.
 # NaN / inf stay honoured (no -ffinite-math-only: the NaN guards in the loss and fwd_nan paths must survive). Checked 2026-11-13:
 # the float instruction kinds in the PTX match nvcc -use_fast_math (div.approx.ftz, sqrt.approx.ftz, ex2.approx.ftz, fma.rn.ftz).
