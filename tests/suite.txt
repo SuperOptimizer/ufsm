@@ -232,6 +232,7 @@ test_split~policy                              | gpu2,slow    |    35 | UFSM_TES
 test_split~gn_stored                           | gpu2,slow    |    78 | UFSM_TEST_GN_STORED=1 UFSM_TEST_INPUT_PREC=8 ./$B/test_split
 test_split~gn_stored,keep_coarse               | gpu2,slow    |    79 | UFSM_TEST_GN_STORED=1 UFSM_TEST_INPUT_PREC=8 UFSM_RC_KEEP_COARSE=1 ./$B/test_split
 test_split~gn_stored,policy                    | gpu          |    47 | UFSM_TEST_GN_STORED=1 UFSM_TEST_INPUT_PREC=8 UFSM_TEST_POLICY=all=fp4:fp4:fp8,enc0.c1=fp16 ./$B/test_split
+test_split_lat                                 | gpu          |    20 | ./$B/test_split_lat
 test_formats                                   |              |     1 | ./tests/test_formats.sh
 test_zarr                                      |              |     1 | ./tests/test_zarr.sh
 test_predict_feather                           | gpu          |    10 | ./$B/test_predict_feather ./$B/ufsm

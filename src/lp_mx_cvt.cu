@@ -91,7 +91,10 @@ __device__ __forceinline__ void rad_full4(const TI *ct, const uint8_t *recs, siz
     const int *h = (const int *)(recs + (size_t)n * rec_bytes);
     const float *cyz = (const float *)(h + 8), *cxz = cyz + h[2];
     const int o1 = h[0], o2 = h[1], hasax = h[4], pf = h[5];
-    const int io[3] = {iz, iy, ix}, nd[3] = {D, P, P};
+    /* train --split z: this GPU's planes are planes [h[7], h[7] + D) of the record's h[2]-plane window (the radial vector of the global
+       voxel; the CT index i stays local). Whole windows: h[7] 0, h[2] D */
+    const int zo = h[7], io[3] = {iz + zo, iy, ix}, nd[3] = {h[2], P, P};
+    D = h[2];
     int s[3] = {0, 0, 0};
 #pragma unroll
     for (int d = 0; d < 3; d++) { const int pd = (pf >> (2 * d)) & 3; s[pd] = (pf >> (8 + d)) & 1 ? nd[d] - 1 - io[d] : io[d]; }   /* output axis d reads source axis perm[d] */
