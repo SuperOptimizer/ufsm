@@ -16,4 +16,8 @@ void split_halo(const void *p, shape5 s, int esz, int h);
 void split_halo_begin(const void *p, shape5 s, int esz, int h);
 void split_halo_end(const void *p, shape5 s, int esz, int h);
 void split_halo_k(const void *p, shape5 s, int esz, int h, int k);   /* nn_split_halo_k inside a job (a collective) */
+/* generic collectives for the device-side input builders (augz nn_zcomm): stream = a cudaStream_t of this side (nullptr: default) */
+void split_xchg(const void *send_d, size_t ns, void *recv_d, size_t nr, void *stream);   /* recv_d (nr bytes) <- the peer's send (its ns = my nr) */
+void split_sum(void *d, int n, int type, void *stream);   /* in-place sum over both sides of n values: type 0 u64, 1 f64, 2 u32 */
+int split_side(void);   /* this job's side (0 / 1), -1 outside split_run */
 void split_reduce(double *b, int n);   /* registered as the nn reduce callback by split_create */

@@ -4,7 +4,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-typedef struct { int kind; const void *p; shape5 s; int esz, h; double *b; int n; int slot; } coll_t;   /* kind 1 halo, 2 reduce, 3 k halo planes (n = k) */
+typedef struct { int kind; const void *p; shape5 s; int esz, h; double *b; int n; int slot; void *q; size_t ns, nr; void *st; } coll_t;   /* kind 1 halo, 2 reduce, 3 k halo planes (n = k),
+                                                    4 xchg (p send of ns bytes, q receive of nr), 5 typed sum (q values, n of them, slot = type) */
 
 struct split_ctx {
     int dev[2];
@@ -16,6 +17,7 @@ struct split_ctx {
     void (*job)(int, void *); void *arg;
     void *sb[2][2], *rb[2][2]; size_t cap;   /* halo send / receive buffers per slot (0 asynchronous, 1 synchronous) and device */
     double *rd[2]; int rcap;             /* reduce receive buffers per device */
+    void *rt[2]; int rtcap;              /* typed-sum scratch per device (8-byte values) */
     nn_tls tls;                          /* the op state (layer ids, formats, SR counter: thread-local in nn) handed on with the turn, so both sides
                                             and the caller see one sequence of it as when the globals were shared */
 };
@@ -32,7 +34,7 @@ split_ctx *split_create(int dev0, int dev1) {
 }
 void split_free(split_ctx *c) {
     if (!c) return;
-    for (int i = 0; i < 2; i++) { nn_init(c->dev[i]); for (int k = 0; k < 2; k++) { nn_free(c->sb[k][i]); nn_free(c->rb[k][i]); } nn_free(c->rd[i]); }
+    for (int i = 0; i < 2; i++) { nn_init(c->dev[i]); for (int k = 0; k < 2; k++) { nn_free(c->sb[k][i]); nn_free(c->rb[k][i]); } nn_free(c->rd[i]); nn_free(c->rt[i]); }
     pthread_mutex_destroy(&c->mu); pthread_cond_destroy(&c->cv);
     free(c);
 }
@@ -59,7 +61,7 @@ static void grow(split_ctx *c, size_t bytes, int nd) {
 
 static void execute(split_ctx *c) {
     coll_t *a = &c->slot[0], *b = &c->slot[1];
-    if (a->kind != b->kind || ((a->kind == 1 || a->kind == 3) && (memcmp(&a->s, &b->s, sizeof a->s) || a->esz != b->esz || a->h != b->h || a->slot != b->slot)) || (a->kind == 2 && a->n != b->n)) {
+    if (a->kind != b->kind || ((a->kind == 1 || a->kind == 3) && (memcmp(&a->s, &b->s, sizeof a->s) || a->esz != b->esz || a->h != b->h || a->slot != b->slot)) || ((a->kind == 2 || a->kind == 5) && (a->n != b->n || a->slot != b->slot))) {
         fprintf(stderr, "split: the two halves diverged (collective %u: kind %d / %d)\n", c->seq, a->kind, b->kind);
         abort();
     }
@@ -68,6 +70,15 @@ static void execute(split_ctx *c) {
         if (nb > c->cap) grow(c, nb, 0);
         void *t[2] = {(void *)a->p, (void *)b->p};
         nn_split_halo_begin(t, c->dev, a->s, a->esz, a->h, c->sb[a->slot], c->rb[a->slot], a->slot);
+    } else if (a->kind == 4) {   /* a pairwise exchange: each side's receive takes the other's send */
+        if (a->ns != b->nr || b->ns != a->nr) { fprintf(stderr, "split: xchg sizes differ (collective %u: %zu -> %zu, %zu -> %zu)\n", c->seq, a->ns, b->nr, b->ns, a->nr); abort(); }
+        const void *snd[2] = {a->p, b->p}; void *rcv[2] = {a->q, b->q}; const size_t nr[2] = {a->nr, b->nr}; void *st[2] = {a->st, b->st};
+        nn_split_xchg(c->dev, snd, rcv, nr, st);
+    } else if (a->kind == 5) {
+        if (a->n > c->rtcap) { for (int i = 0; i < 2; i++) { nn_init(c->dev[i]); nn_free(c->rt[i]); c->rt[i] = nn_malloc((size_t)a->n * 8); if (!c->rt[i]) { fprintf(stderr, "split: out of device memory on GPU %d\n", c->dev[i]); abort(); } }
+                               c->rtcap = a->n; nn_init(c->dev[t_side]); }
+        void *bb[2] = {a->q, b->q}, *st[2] = {a->st, b->st};
+        nn_split_sum_t(bb, c->dev, a->n, a->slot, c->rt, st);
     } else if (a->kind == 3) {   /* k halo planes (coll_t.n = k), the synchronous buffers */
         size_t nb = (size_t)a->n * nn_split_halo_bytes(a->s, a->esz);
         if (nb > c->cap) grow(c, nb, 0);
@@ -105,6 +116,9 @@ void split_halo_begin(const void *p, shape5 s, int esz, int h) { halo_begin(p, s
 void split_halo_end(const void *p, shape5 s, int esz, int h) { nn_split_halo_end((void *)p, t_side, s, esz, h, t_ctx->rb[0][t_side], 0); }
 void split_halo(const void *p, shape5 s, int esz, int h) { halo_begin(p, s, esz, h, 1); nn_split_halo_end((void *)p, t_side, s, esz, h, t_ctx->rb[1][t_side], 1); }
 void split_halo_k(const void *p, shape5 s, int esz, int h, int k) { coll_t x = {3, p, s, esz, h, nullptr, k, 1}; collective(&x); }
+void split_xchg(const void *send_d, size_t ns, void *recv_d, size_t nr, void *stream) { coll_t x = {4, send_d, {0}, 0, 0, nullptr, 0, 0, recv_d, ns, nr, stream}; collective(&x); }
+void split_sum(void *d, int n, int type, void *stream) { coll_t x = {5, nullptr, {0}, 0, 0, nullptr, n, type, d, 0, 0, stream}; collective(&x); }
+int split_side(void) { return t_side; }
 void split_reduce(double *b, int n) { coll_t x = {2, nullptr, {0}, 0, 0, b, n, 0}; collective(&x); }
 
 typedef struct { split_ctx *c; int side; } warg_t;

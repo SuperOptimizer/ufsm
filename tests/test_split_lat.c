@@ -89,6 +89,22 @@ static void split2(split_ctx *ctx, const unet_cfg *cfg, unsigned sr, float *g, f
     for (int s = 0; s < 2; s++) { nn_init(DEV[s]); side_free(&S2[s]); }
     free(g1);
 }
+/* the generic collectives (split_xchg / split_sum, the input builders' nn_zcomm): side s sends 1000 + s, receives the other's; sums of
+   u64 / f64 / u32 values */
+static int g_cfail;
+static void coll_job(int side, void *a) {
+    (void)a; const int n = 1000;
+    uint32_t *hs = malloc(n * 4), *hr = malloc(n * 4); for (int i = 0; i < n; i++) hs[i] = (uint32_t)(i * 7 + 1000 * (side + 1));
+    void *ds = nn_malloc(n * 4), *dr = nn_malloc(n * 4); nn_h2d(ds, hs, n * 4);
+    split_xchg(ds, (size_t)n * 4, dr, (size_t)n * 4, nullptr); nn_sync(); nn_d2h(hr, dr, n * 4);
+    for (int i = 0; i < n; i++) if (hr[i] != (uint32_t)(i * 7 + 1000 * (2 - side))) { g_cfail++; break; }
+    uint64_t u[3] = {(uint64_t)side + 1, 1ull << 40, 5}; double f[2] = {0.25 * (side + 1), -1.0}; uint32_t w[2] = {(uint32_t)side, 7};
+    void *du = nn_malloc(24), *df = nn_malloc(16), *dw = nn_malloc(8); nn_h2d(du, u, 24); nn_h2d(df, f, 16); nn_h2d(dw, w, 8);
+    split_sum(du, 3, 0, nullptr); split_sum(df, 2, 1, nullptr); split_sum(dw, 2, 2, nullptr); nn_sync();
+    nn_d2h(u, du, 24); nn_d2h(f, df, 16); nn_d2h(w, dw, 8);
+    if (u[0] != 3 || u[1] != 2ull << 40 || u[2] != 10 || f[0] != 0.75 || f[1] != -2.0 || w[0] != 1 || w[1] != 14) g_cfail++;
+    nn_free(ds); nn_free(dr); nn_free(du); nn_free(df); nn_free(dw); free(hs); free(hr);
+}
 static double rel(const float *a, const float *b, size_t n) {
     double d2 = 0, r2 = 0; for (size_t i = 0; i < n; i++) { const double d = (double)a[i] - b[i]; d2 += d * d; r2 += (double)b[i] * b[i]; }
     return sqrt(d2 / (r2 + 1e-300));
@@ -130,6 +146,8 @@ int main(void) {
     const size_t hn = (size_t)cfg.cout * 2 * Pc * Pc; _Float16 *h0a = malloc(hn * 2), *h0b = malloc(hn * 2), *h1a = malloc(hn * 2), *h1b = malloc(hn * 2), *h2a = malloc(hn * 2), *h2b = malloc(hn * 2);
     printf("test_split_lat: P %d voxels (%d cells), level-0 halo %d cells, local depth %d cells%s, %zu params\n", P, Pc, H0, Dl, DEV[0] == DEV[1] ? ", both halves on one GPU" : "", np);
     int fails = 0, ci = 0;
+    split_run(ctx, coll_job, nullptr);
+    printf("  collectives (xchg, u64 / f64 / u32 sums): %s\n", g_cfail ? "FAIL" : "ok"); fails += g_cfail != 0;
     static const int syms[3] = {0 | 1 << 2 | 2 << 4, 0 | 1 << 2 | 2 << 4 | 1 << 8, 1 | 0 << 2 | 2 << 4};   /* identity, z flip, z <-> y */
     static const char *const sname[3] = {"identity", "z flip", "z<->y"};
     for (int mode = 0; mode < 3; mode++) for (int sy = 0; sy < 3; sy++, ci++) {   /* 0 MX-fp8 round to nearest, 1 the fp4 preset round to nearest, 2 the fp4 preset (stochastic) */

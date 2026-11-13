@@ -518,6 +518,37 @@ extern "C" void nn_split_halo_k(void *const *t, const int *dev, shape5 s, int es
     cudaSetDevice(cur);
     KCHECK();
 }
+static cudaEvent_t zs_gev(int dev, int side, int k) {   /* the generic collectives' events (per device and side: one-GPU emulation) */
+    static cudaEvent_t ev[10][4]; static int init[10]; const int q = zs_key(dev, side);
+    if (!init[q]) { int cur; cudaGetDevice(&cur); cudaSetDevice(dev); for (int i = 0; i < 4; i++) cudaEventCreateWithFlags(&ev[q][i], cudaEventDisableTiming); cudaSetDevice(cur); init[q] = 1; }
+    return ev[q][k];
+}
+extern "C" void nn_split_xchg(const int *dev, const void *const *send, void *const *recv, const size_t *nr, void *const *st) {
+    int cur; cudaGetDevice(&cur); g_zs_same = dev[0] == dev[1];
+    cudaStream_t s[2] = {(cudaStream_t)st[0], (cudaStream_t)st[1]};
+    for (int i = 0; i < 2; i++) { cudaSetDevice(dev[i]); CK(cudaEventRecord(zs_gev(dev[i], i, 0), s[i])); }   /* each side's sends are ready */
+    for (int i = 0; i < 2; i++) {
+        cudaSetDevice(dev[i]); CK(cudaStreamWaitEvent(s[i], zs_gev(dev[1 - i], 1 - i, 0), 0));
+        if (nr[i]) CK(cudaMemcpyPeerAsync(recv[i], dev[i], send[1 - i], dev[1 - i], nr[i], s[i]));
+        CK(cudaEventRecord(zs_gev(dev[i], i, 1), s[i]));
+    }
+    for (int i = 0; i < 2; i++) { cudaSetDevice(dev[i]); CK(cudaStreamWaitEvent(s[i], zs_gev(dev[1 - i], 1 - i, 1), 0)); }   /* the peer has read my send buffer */
+    cudaSetDevice(cur); KCHECK();
+}
+__global__ void zs_add_t_k(void *a, const void *b, int n, int type) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x; if (i >= n) return;
+    if (type == 0) ((unsigned long long *)a)[i] += ((const unsigned long long *)b)[i];
+    else if (type == 1) ((double *)a)[i] += ((const double *)b)[i];
+    else ((unsigned *)a)[i] += ((const unsigned *)b)[i];
+}
+extern "C" void nn_split_sum_t(void *const *b, const int *dev, int n, int type, void *const *r, void *const *st) {
+    const size_t es = type == 2 ? 4 : 8, nr[2] = {(size_t)n * es, (size_t)n * es};
+    const void *snd[2] = {b[0], b[1]};
+    nn_split_xchg(dev, snd, r, nr, st);
+    int cur; cudaGetDevice(&cur);
+    for (int i = 0; i < 2; i++) { cudaSetDevice(dev[i]); zs_add_t_k<<<nblk(n, 128), 128, 0, (cudaStream_t)st[i]>>>(b[i], r[i], n, type); }
+    cudaSetDevice(cur); KCHECK();
+}
 __global__ void zs_add_k(double *a, const double *b, int n) { int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) a[i] += b[i]; }
 extern "C" void nn_split_allreduce(double *const *b, const int *dev, int n, double *const *r) {
     int cur; cudaGetDevice(&cur);
