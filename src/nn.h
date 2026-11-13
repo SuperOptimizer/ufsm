@@ -520,6 +520,7 @@ void nn_loss_pack(const void *logits, const uint8_t *t, const uint8_t *m, const 
 void nn_loss_stats_acc(const void *logits, const uint8_t *t, const uint8_t *m, const uint8_t *w, shape5 s, double *ds);
 void nn_loss_stats_fin(double *ds, const uint8_t *w, shape5 s, float *scratch);
 void nn_loss_grad_only(const void *logits, const uint8_t *t, const uint8_t *m, const uint8_t *w, shape5 s, float dice_w, void *gl, const float *scratch);
+void nn_loss_grad_only_s(const void *logits, const uint8_t *t, const uint8_t *m, const uint8_t *w, shape5 s, float dice_w, void *gl, const float *scratch, float mul);   /* x mul in the kernel (no gscale pass) */
 /* Affinity loss on band labels (task band_affinity, src/nn_loss.cu): output channels c0 .. c0 + K - 1 are affinities for
    the offsets off (axis 0 z / 1 y / 2 x, distance d); band [n][S] holds band values in 1/18-turn steps mod 252, 255 =
    unknown. Writes those channels of gl (scaled by lambda / K); fin: nn_aff_scratch(K) bytes of per-channel results

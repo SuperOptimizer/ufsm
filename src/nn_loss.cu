@@ -227,18 +227,24 @@ extern "C" void nn_loss_stats_fin(double *ds, const uint8_t *w, shape5 s, float 
     loss_fin_k<<<1, 32>>>(scratch, w, s.n, s.c, scratch + (size_t)5 * NC);
     KCHECK();
 }
-extern "C" void nn_loss_grad_only(const void *logits, const uint8_t *t, const uint8_t *m, const uint8_t *w, shape5 s, float dice_w, void *gl, const float *scratch) {
-    const size_t S = shape_spatial(s), n = shape_numel(s);
+/* nn_loss_grad_only_s: the same gradient times mul in the kernel's final product (perf2 2026-11-13: the head slabs' lambda x source-weight
+   scales were a separate read-modify-write pass, gscale_k, ~90 ms a step per card at the P 1024 split half). The 16-bit value is rounded
+   once from (g fin gscale) mul instead of twice (round, scale, round): at most one fp16 ulp apart */
+extern "C" void nn_loss_grad_only_s(const void *logits, const uint8_t *t, const uint8_t *m, const uint8_t *w, shape5 s, float dice_w, void *gl, const float *scratch, float mul) {
+    const size_t S = shape_spatial(s); const float gs1 = mul, gsh = g_gscale * mul;
     const float *fin = scratch + (size_t)5 * s.n * s.c;
     if (g_logits_h16) {
         const f16 *l16 = (const f16 *)logits;
-        if (!g_loss_g16) loss_grad_k<float, f16><<<lg_grid(S, s.n * s.c), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (float *)gl, g_posw, 1.f, 0, nullptr, s.d, s.h, s.w, g_recall, UNITC(s.c));
-        else if (g_h16) loss_grad_k<f16, f16><<<lg_grid(S, s.n * s.c), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (f16 *)gl, g_posw, g_gscale, 0, nullptr, s.d, s.h, s.w, g_recall, UNITC(s.c));
-        else loss_grad_k<bf16, f16><<<lg_grid(S, s.n * s.c), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (bf16 *)gl, g_posw, g_gscale, 0, nullptr, s.d, s.h, s.w, g_recall, UNITC(s.c));
-    } else if (!g_loss_g16) loss_grad_k<float><<<lg_grid(S, s.n * s.c), 256>>>((const float *)logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (float *)gl, g_posw, 1.f, 0, nullptr, s.d, s.h, s.w, g_recall, UNITC(s.c));
-    else if (g_h16) loss_grad_k<f16><<<lg_grid(S, s.n * s.c), 256>>>((const float *)logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (f16 *)gl, g_posw, g_gscale, 0, nullptr, s.d, s.h, s.w, g_recall, UNITC(s.c));
-    else loss_grad_k<bf16><<<lg_grid(S, s.n * s.c), 256>>>((const float *)logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (bf16 *)gl, g_posw, g_gscale, 0, nullptr, s.d, s.h, s.w, g_recall, UNITC(s.c));
+        if (!g_loss_g16) loss_grad_k<float, f16><<<lg_grid(S, s.n * s.c), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (float *)gl, g_posw, gs1, 0, nullptr, s.d, s.h, s.w, g_recall, UNITC(s.c));
+        else if (g_h16) loss_grad_k<f16, f16><<<lg_grid(S, s.n * s.c), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (f16 *)gl, g_posw, gsh, 0, nullptr, s.d, s.h, s.w, g_recall, UNITC(s.c));
+        else loss_grad_k<bf16, f16><<<lg_grid(S, s.n * s.c), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (bf16 *)gl, g_posw, gsh, 0, nullptr, s.d, s.h, s.w, g_recall, UNITC(s.c));
+    } else if (!g_loss_g16) loss_grad_k<float><<<lg_grid(S, s.n * s.c), 256>>>((const float *)logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (float *)gl, g_posw, gs1, 0, nullptr, s.d, s.h, s.w, g_recall, UNITC(s.c));
+    else if (g_h16) loss_grad_k<f16><<<lg_grid(S, s.n * s.c), 256>>>((const float *)logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (f16 *)gl, g_posw, gsh, 0, nullptr, s.d, s.h, s.w, g_recall, UNITC(s.c));
+    else loss_grad_k<bf16><<<lg_grid(S, s.n * s.c), 256>>>((const float *)logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (bf16 *)gl, g_posw, gsh, 0, nullptr, s.d, s.h, s.w, g_recall, UNITC(s.c));
     KCHECK();
+}
+extern "C" void nn_loss_grad_only(const void *logits, const uint8_t *t, const uint8_t *m, const uint8_t *w, shape5 s, float dice_w, void *gl, const float *scratch) {
+    nn_loss_grad_only_s(logits, t, m, w, s, dice_w, gl, scratch, 1.f);
 }
 /* ---- count loss (train --count-lambda): turns along sheet-normal segments ----
    K segments per window, each from a random voxel whose ground-truth phase gradient (over +-s voxels) is known, L unit steps along

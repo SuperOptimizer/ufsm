@@ -1050,11 +1050,12 @@ static int lhalo(int k) { return k == 0 ? g_norm_s : k >= 3 && k - 3 < g_naux &&
         nn_ink_targets(fh_ + vb, ns, d->fht, d->fhm); nn_ink_targets(fv_ + vb, ns, d->fht + ns, d->fhm + ns); \
         nn_fib_head_dir(fh_, fv_, D, H, W, z0, nz, g_fd_r, 0.6f, d->fdt, d->fdm); \
         hs_clip(d, pass, d->fhm, z0, z1, hw); hs_clip(d, pass, d->fhm + ns, z0, z1, hw); hs_clip(d, pass, d->fdm, z0, z1, hw); } while (0)   /* (g_lsplit: this half's voxels) */
-#define FIBH_LOSS(grad) do { const shape5 one_ = {1, 1, nz, H, W}, sev_ = {1, 7, nz, H, W}; \
-        for (int k_ = 0; k_ < 2; k_++) { if (grad) nn_loss_grad_only(LGC(g_fib_ch + k_), d->fht + k_ * ns, d->fhm + k_ * ns, d->fhw, one_, 0.f, LGC(g_fib_ch + k_), d->fhs[k_]); \
+#define FIBH_LOSS(grad) FIBH_LOSS_S(grad, 1.f)
+#define FIBH_LOSS_S(grad, mul_) do { const shape5 one_ = {1, 1, nz, H, W}, sev_ = {1, 7, nz, H, W}; \
+        for (int k_ = 0; k_ < 2; k_++) { if (grad) nn_loss_grad_only_s(LGC(g_fib_ch + k_), d->fht + k_ * ns, d->fhm + k_ * ns, d->fhw, one_, 0.f, LGC(g_fib_ch + k_), d->fhs[k_], (mul_)); \
                                          else nn_loss_stats_acc(LGC(g_fib_ch + k_), d->fht + k_ * ns, d->fhm + k_ * ns, d->fhw, one_, d->hs_ds + 74 + 5 * k_); } \
         float pw_, rw_; int u7_; nn_loss_cfg_get(&pw_, &rw_, &u7_); nn_set_pos_weight(1.f); \
-        if (grad) nn_loss_grad_only(LGC(g_fib_ch + 2), d->fdt, d->fdm, d->nw, sev_, 0.f, LGC(g_fib_ch + 2), d->fds); \
+        if (grad) nn_loss_grad_only_s(LGC(g_fib_ch + 2), d->fdt, d->fdm, d->nw, sev_, 0.f, LGC(g_fib_ch + 2), d->fds, (mul_)); \
         else nn_loss_stats_acc(LGC(g_fib_ch + 2), d->fdt, d->fdm, d->nw, sev_, d->hs_ds + 84); \
         nn_set_pos_weight(pw_); } while (0)
 /* g_lsplit: the window planes [a, b) whose voxels this half's head slabs supervise. The statistics pass: the owned voxels, so every voxel counts
@@ -1277,9 +1278,8 @@ static void head_slab_pass(gpu_state *d, int pass) {
             nn_ink_targets_smooth(ink + vb, ns, d->inkt, d->inkm, g_ink_smooth);
             if (g_ink_air && pap) nn_ink_air(pap + vb, ns, z0 + mil_zoff(d), H, W, g_ink_air, g_ink_smooth, d->inkt, d->inkm);   /* --ink-air: + the air lattice as ink 0 */
             hs_clip(d, pass, d->inkm, z0, z1, hw);
-            nn_loss_grad_only(LGC(g_ink2_ch), d->inkt, d->inkm, d->inkw, one, g_ink_dice, LGC(g_ink2_ch), d->iscratch);   /* (--ink-dice: + w x the soft dice of the window's known voxels) */
             const float iw = g_ink_lambda * (si >= 0 && g_S && si < g_S->n ? (float)g_S->src[si].ink_weight : 1.f) * src_head_w(si, SH_INK);
-            if (iw != 1.f) nn_loss_grad_scale(LGC(g_ink2_ch), ns, iw);
+            nn_loss_grad_only_s(LGC(g_ink2_ch), d->inkt, d->inkm, d->inkw, one, g_ink_dice, LGC(g_ink2_ch), d->iscratch, iw);   /* (--ink-dice: + w x the soft dice of the window's known voxels; x iw in the kernel) */
             uint16_t *mgb = mck && nn_get_loss_grad_h16() ? malloc(ns * 2) : nullptr; if (mgb) { nn_sync(); nn_d2h(mgb, LGC(g_ink2_ch), ns * 2); }
             int mz0, mnz; size_t mbo;
             if (nmil && nn_get_loss_grad_h16() && mil_clip(d, 1, z0, nz, hw, &mz0, &mnz, &mbo) && ink_mil_bwd_slab(d->milacc, mz0, mnz, MD, H, W, mrays, nmil, g_mil_R, g_mil_step, LGC(g_ink2_ch) + mbo, !nn_get_f16(), nullptr)) { fprintf(stderr, "ink mil: bwd_slab failed\n"); exit(1); }   /* (adds the MIL gradient: fin scaled it to the storage's gradient scale) */
@@ -1298,26 +1298,24 @@ static void head_slab_pass(gpu_state *d, int pass) {
             }
         }
         if (g_fibh) {   /* --fib-head: the three BCE gradients, times lambda x the source's "fibre" head weight */
-            FIBH_TARGETS(); FIBH_LOSS(1);
-            const float fw = g_fibh_lambda * src_head_w(si, SH_FIBRE); if (fw != 1.f) nn_loss_grad_scale(LGC(g_fib_ch), 9 * ns, fw);
+            const float fw = g_fibh_lambda * src_head_w(si, SH_FIBRE);
+            FIBH_TARGETS(); FIBH_LOSS_S(1, fw);   /* (x fw in the gradient kernels: no separate scale pass over the 9 channels) */
         }
         if (g_pad_ch >= 0) nn_zero(LGC(g_pad_ch), (size_t)(g_cout - g_pad_ch) * ns * 2);   /* (the pad outputs: no gradient) */
         if (g_pg_lambda > 0) nn_pgrad_slab(LGC(g_side_ch), LGC(g_side_ch + 1), sdb, d->sidem, D, H, W, z0, z1, g_norm_s, g_pg_dist, g_pg_nd, g_pg_angle, g_pg_mask, d->hs_ds + 58, d->pg_acc);   /* (before the BCE gradient overwrites the logits; its sums go to + 58: the logged loss of a training step) */
-        if (!fside) nn_loss_grad_only(LGC(g_side_ch), st, sm, d->sidew, two, 0.f, LGC(g_side_ch), d->sscratch);
-        FT("  g side grad");
         const float lside = g_side_lambda * src_head_w(si, g_rv == 1 ? SH_RV : SH_PHASE);   /* (x 1: the same floats) */
-        if (lside != 1.f && !fside) nn_loss_grad_scale(LGC(g_side_ch), 2 * ns, lside);
+        if (!fside) nn_loss_grad_only_s(LGC(g_side_ch), st, sm, d->sidew, two, 0.f, LGC(g_side_ch), d->sscratch, lside);   /* (x lside in the kernel) */
+        FT("  g side grad");
         if (g_rv == 2) {   /* --rv 2: the recto / verso pair's BCE gradient, times --rv-lambda x the source's weight */
-            nn_loss_grad_only(LGC(g_rv_ch), d->rvt, d->rvm, d->sidew, two, 0.f, LGC(g_rv_ch), d->rvscratch);
-            const float lrv = g_rv_lambda * src_head_w(si, SH_RV); if (lrv != 1.f) nn_loss_grad_scale(LGC(g_rv_ch), 2 * ns, lrv);
+            const float lrv = g_rv_lambda * src_head_w(si, SH_RV);
+            nn_loss_grad_only_s(LGC(g_rv_ch), d->rvt, d->rvm, d->sidew, two, 0.f, LGC(g_rv_ch), d->rvscratch, lrv);
         }
         if (g_pg_lambda > 0) nn_pgrad_apply(LGC(g_side_ch), LGC(g_side_ch + 1), d->pg_acc, ns, d->hs_ds + 56, g_pg_lambda);
         if (g_fibn) { nn_zero(d->fibnl, sizeof(unsigned)); nn_fibn(LGC(g_norm_ch), ns, fib, D, H, W, z0, z1, g_fibn_r, g_fibn_thr, g_fibn_unsup ? d->nm : nullptr, d->fibacc, d->fiblist, d->fibnl, d->fibcap, 1); }   /* (reads the logits: before the in-place gradient) */
-        if (!fuse) nn_loss_grad_only(LGC(g_norm_ch), d->nt, d->nm, d->nw, seven, 0.f, LGC(g_norm_ch), d->nscratch);
-        FT("  g normal grad");
         const float lnorm = g_norm_lambda * src_head_w(si, SH_NORMAL), ldens = g_dens_lambda * src_head_w(si, SH_DENSITY);
-        if (fuse) ;
-        else if (ldens == lnorm) { if (lnorm != 1.f) nn_loss_grad_scale(LGC(g_norm_ch), 7 * ns, lnorm); }
+        if (!fuse) nn_loss_grad_only_s(LGC(g_norm_ch), d->nt, d->nm, d->nw, seven, 0.f, LGC(g_norm_ch), d->nscratch, ldens == lnorm ? lnorm : 1.f);   /* (one weight: x lnorm in the kernel) */
+        FT("  g normal grad");
+        if (fuse || ldens == lnorm) ;
         else {   /* --density-lambda: the 6 normal channels at --normal-lambda, the density channel (+ 6) at its own weight */
             if (lnorm != 1.f) nn_loss_grad_scale(LGC(g_norm_ch), 6 * ns, lnorm);
             if (ldens != 1.f) nn_loss_grad_scale(LGC(g_norm_ch + 6), ns, ldens);
