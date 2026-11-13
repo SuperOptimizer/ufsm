@@ -1698,6 +1698,7 @@ static int uw_selftest(void) {
 /* one GPU's training step (the batch is on the device or uploading): the forward + losses, then the backward. The SR counter is per GPU
    (base g << 24; GPU 0 as one GPU always had), carried from the forward to the backward, so every schedule (one host thread per GPU,
    phased, in turn) draws the same numbers */
+static int g_sp24_mode = 2, g_sp24_lv;   /* --sparse24-mode / --sparse24-levels (bitmask, 0 = all) */
 typedef struct { gpu_state *d; int g, step, B, P; float dice_w; int cout; float srste; int sparse_at, rc; nn_tls out; } gstep_arg;   /* out: the op state after the backward */
 static void test_nan_inject(gpu_state *d, int step, int where, int P);
 static int sync_check(gpu_state *d, int step, const char *what);
@@ -1724,7 +1725,7 @@ static void gstep_fwd(gstep_arg *a) {
                     unet_params_d2h(d->u, h); snprintf(fn, sizeof fn, "%s/p%d.f32", dd, step); FILE *f = fopen(fn, "wb"); if (f) { fwrite(h, 4, np, f); fclose(f); }
                     nn_d2h(h, unet_grad_ptr(d->u), np * 4); snprintf(fn, sizeof fn, "%s/g%d.f32", dd, step); f = fopen(fn, "wb"); if (f) { fwrite(h, 4, np, f); fclose(f); } free(h); }
             }
-            if (sparse_at && step >= sparse_at && !unet_get_sparse24(d->u)) { unet_set_sparse24(d->u, 1); if (g == 0) fprintf(stderr, "step %d: 2:4 sparsity on (SR-STE lambda %g)\n", step, srste); }
+            if (sparse_at && step >= sparse_at && (unet_get_sparse24(d->u) != g_sp24_mode || unet_get_sparse24_levels(d->u) != g_sp24_lv)) { unet_set_sparse24_levels(d->u, g_sp24_lv); unet_set_sparse24(d->u, g_sp24_mode); if (g == 0) fprintf(stderr, "step %d: 2:4 sparsity on (mode %d, levels %s, SR-STE lambda %g)\n", step, g_sp24_mode, g_sp24_lv ? "masked" : "all", srste); }
             unet_zero_grad(d->u);
             d->last = d->cur;
             if (g_fstem) { uint64_t h = (uint64_t)step * 0xD1B54A32D192ED03ull + (uint64_t)seed * 31 + (uint64_t)g; h ^= h >> 31; h *= 0xBF58476D1CE4E5B9ull; h ^= h >> 29;
@@ -2343,7 +2344,7 @@ int cmd_train(int argc, char **argv) {
         fprintf(stderr, "usage: ufsm train <sources.json> --out DIR [--P 512] [--B 1] [--steps 20000] [--lr 1e-3] [--warmup 500] [--wd 0.01]\n"
                         "       [--dice 0.5] [--ema 0.999] [--widths 16,32,64,80] [--down-norm 1] [--gpus 0,1] [--workers 12 (new runs with --gpu-aug 2: 3)] [--gpu-aug 0|1|2 (new runs: 2)] [--sampler-slots N] [--seed 0] [--det 1] [--resume CKPT] [--finetune 1] [--fp4 0|1|2 (default 2)] [--mem auto|auto16|default|wide] [--opt adamw|muon|anvil] [--muon-lr 0.02] [--muon-beta 0.95] [--anvil-lr 0.023] [--anvil-wd 2.25] [--sched cos|wsd] [--cooldown 0.2]\n"
                         "       [--rv 1 [--rv-iso 64] [--rv-verso-w 1]]\n"
-                        "       [--val-batches 8] [--val-P N (validation windows of N^3 whatever P: the same voxels across window sizes)] [--log-every 20] [--val-every 500] [--ckpt-every 1000] [--clip 5] [--levels 0.5,0.25,0.15,0.1] [--fp32] [--f16 1] [--gscale 1024] [--prec 1|2|3|4] [--input-prec 0|4|8] [--policy enc0=1,dec0.c1=fp16:fp16:fp8,...] [--qat 2|3] [--wq 8|4] [--sparse24 STEP] [--srste 2e-4] [--pos-weight 1] [--tol 0..2] [--sr 1]\n"
+                        "       [--val-batches 8] [--val-P N (validation windows of N^3 whatever P: the same voxels across window sizes)] [--log-every 20] [--val-every 500] [--ckpt-every 1000] [--clip 5] [--levels 0.5,0.25,0.15,0.1] [--fp32] [--f16 1] [--gscale 1024] [--prec 1|2|3|4] [--input-prec 0|4|8] [--policy enc0=1,dec0.c1=fp16:fp16:fp8,...] [--qat 2|3] [--wq 8|4] [--sparse24 STEP] [--sparse24-mode 1|2|3] [--sparse24-levels 0,1,...] [--srste 2e-4] [--pos-weight 1] [--tol 0..2] [--sr 1]\n"
                         "       [--seconds S] [--warmup-seconds S (default 5%% of time budget)] (time-based schedule and final checkpoint)\n"
                         "       [--schedule-seconds S --schedule-elapsed S]   wall-time LR horizon across finite-cover evaluation pauses\n"
                         "       [--cover PLAN.json] [--cover-extend-from OLD_PLAN.json] [--cover-next-pass 1] [--stop-at STEP] [--ct-aug 0|1] [--symmetry-p 1] [--axis-jitter 0] [--limit-seconds 0]\n"
@@ -2698,6 +2699,13 @@ int cmd_train(int argc, char **argv) {
     int wq = atoi(opt(argc, argv, "--wq", "0"));            /* 8 or 4: true fp8 / fp4 weights (stochastic rounding after each update) */
     if (wq && init_lr != 1.f) { fprintf(stderr, "--init-lr-mult: not with --wq\n"); return 2; }
     int sparse_at = atoi(opt(argc, argv, "--sparse24", "0"));   /* step from which the 3^3 conv weights are 2:4 sparse (0 = dense) */
+    g_sp24_mode = atoi(opt(argc, argv, "--sparse24-mode", "2"));   /* 1 element-wise 2:4 (dense kernels), 2 pair-wise 4:8 (sparse fp4 forward), 3 transposable (+ backward-data) */
+    {   /* --sparse24-levels 0,1,2: the levels whose convs are masked (modes 2 / 3; default all) */
+        const char *lv = opt(argc, argv, "--sparse24-levels", "");
+        g_sp24_lv = 0;
+        for (const char *q = lv; *q;) { char *e; const long l = strtol(q, &e, 10); if (e == q) break; if (l >= 0 && l < 31) g_sp24_lv |= 1 << l; q = *e == ',' ? e + 1 : e; }
+    }
+    if (g_sp24_mode < 1 || g_sp24_mode > 3) { fprintf(stderr, "--sparse24-mode: 1, 2 or 3\n"); return 2; }
     float srste = (float)atof(opt(argc, argv, "--srste", "2e-4"));
     nn_set_pos_weight((float)atof(opt(argc, argv, "--pos-weight", "1")));   /* BCE weight of surface voxels */
     int overfit = atoi(opt(argc, argv, "--overfit", "0"));   /* diagnostic: train on the first batch forever */
@@ -4399,7 +4407,7 @@ int cmd_train(int argc, char **argv) {
                 gpu_state *d = &G[g];
                 nn_init(d->dev);
                 nn_stream_wait(0, d->ev_up[d->cur]);
-                if (sparse_at && step >= sparse_at && !unet_get_sparse24(d->u)) { unet_set_sparse24(d->u, 1); if (g == 0) fprintf(stderr, "step %d: 2:4 sparsity on (SR-STE lambda %g)\n", step, srste); }
+                if (sparse_at && step >= sparse_at && (unet_get_sparse24(d->u) != g_sp24_mode || unet_get_sparse24_levels(d->u) != g_sp24_lv)) { unet_set_sparse24_levels(d->u, g_sp24_lv); unet_set_sparse24(d->u, g_sp24_mode); if (g == 0) fprintf(stderr, "step %d: 2:4 sparsity on (mode %d, levels %s, SR-STE lambda %g)\n", step, g_sp24_mode, g_sp24_lv ? "masked" : "all", srste); }
                 unet_zero_grad(d->u);
                 if (g_fstem) { uint64_t h = (uint64_t)step * 0xD1B54A32D192ED03ull + (uint64_t)seed * 31; h ^= h >> 31; h *= 0xBF58476D1CE4E5B9ull; h ^= h >> 29;
                                d->fs_drop = (double)(h >> 11) * 0x1p-53 < g_fs_drop; }   /* (--fstem-drop: one draw for the window, both halves) */

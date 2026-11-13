@@ -380,6 +380,67 @@ That is not acceptable as a silent default. It stays opt-in (`predict --skip-emp
 windows dominate. No training path: it would change what the net learns there, for at most ~6-9% of a step. Most of the skippable
 space is the zero-filled outside of the scan. Keeping training windows inside the scan would recover that compute exactly.
 
+## 2:4 sparse fp4 convs: the hardware pattern, the kernel, the ceiling (2026-11-13, branch sparse24-20261113)
+
+Goal: halve the 3^3 conv MMAs of the 92 M scratch2 net with the sparse block-scaled tensor cores of the RTX 5060 Ti (sm_120a).
+
+**Hardware.** ptxas (CUDA 13.3) lowers `mma.sp::ordered_metadata.sync.aligned.m16n8k128.row.col.kind::mxf4.block_scale.scale_vec::2X`
+and `kind::mxf4nvf4 ... scale_vec::4X` (ue8m0) to `OMMA.SF.SP.168128`, and the e4m3 `m16n8k64 kind::mxf8f6f4` to `QMMA.SF.SP.16864`:
+consumer Blackwell has sparse MX-fp4. For e2m1 the sparse element is the byte (two adjacent K values): the metadata (one 32-bit register
+per lane, 64 bits per row for 128 K) indexes 2 of 4 bytes per 8 K, so the pattern is **pair-wise 4:8**, not element-wise 2:4. The
+existing `--sparse24` (2026-10-01: element-wise 2:4, dense kernels on a masked copy) cannot use it. tests/test_sp24_mma checks the
+operand / metadata / scale layout of every lane against an fp64 host reference and measures the MMA-only throughput (numbers below).
+
+**Where the gain can come from.** Only conv_fwd_f4_k (forward, recompute, backward-data via flipped weights) can use it; the weight
+gradient reduces over voxels and stays dense. The backward-data reduces over the forward's output channels, so a mask along ci is
+not sparse there: only a transposable mask (mode 3) makes it sparse too. The archived prof92 trace (92 M, P 512, one card, kernel busy
+time) bounds the step gain: conv_fwd_f4_k 22 % (25.6 of 115 s), the dense weight gradient conv_bwd_w_f4ws_k 15 %, k_bg_env + k_ll_sub
+14 %, Muon NS 6 %. A perfect 2x on conv_fwd_f4_k saves <= 11 % of the step (mode 3) or ~7 % (mode 2, forward + recompute).
+
+**Modes** (`--sparse24 STEP --sparse24-mode 1|2|3 --sparse24-levels 0,1,...`; SR-STE `--srste` on the dense master, the forward reads the
+masked copy u->wm; prune-by-magnitude at STEP, so a dense checkpoint continues sparse; checkpoint key `sparse24` = the mode, old
+checkpoints are mode 1, `sparse24_lv` written only when set):
+- 1: element-wise 2:4 along ci (the old behaviour; dense kernels only);
+- 2 (default): pair-wise 4:8 along ci, every stride-1 3^3 conv but the stem; the forward runs the sparse kernel, backward-data dense;
+- 3: transposable 2 x 2 blocks: per (tap, 8 co x 8 ci) a 4 x 4 grid of 2 x 2 blocks keeps exactly 2 per grid row and column (max
+  summed |w| over the 90 patterns), so the flipped weights are pair-wise 4:8 along co and the backward-data runs sparse as well.
+
+**Kernel** (src/lp_sp24conv.cu): conv_fwd_f4_k's code with the tap-pair dense MMA (m16n8k64: 2 taps x 32 ci) replaced by a tap-quad
+sparse MMA (m16n8k128 kind::mxf4nvf4 scale_vec::4X: 4 taps x 32 ci, A compressed to 32 B per row, the 4 taps' ue8m0 scales in one
+register, one metadata register per lane): per 32-channel chunk 7 quads instead of 14 pairs, half the MMAs and the weight ldmatrix,
+the same B ldmatrix (the quad's B is the two pairs' dense fragments). Staging and epilogue are conv_fwd_f4_k's, so the inputs are
+staged with the same bits. The prep (prep_sp24_k) quantises each tap's 32 channels with prep_w4_k's scale and nibbles and keeps the 2
+largest pairs per 8 channels, counting groups with more non-zero pairs (lp_sp24_err). Routing: unet_apply_sparse24 registers the
+masked convs (per host thread), conv_fwd_tc sends MX-fp4 calls on registered weights (> 64 input channels) to the sparse kernel, and a
+flip of registered mode-3 weights marks the flipped copy for the next call.
+
+**Tests.** tests/test_sp24_conv: on exact operands (every MX block holds a +-6, so every sum is exact in any order) the sparse
+kernel's MX-fp4 output bytes equal the dense kernel's on the same masked weights (MT 4 / TZ 2, MT 2 / TZ 4 and TZ 2, the gradient
+path's output SR, a split input); GN + SiLU inputs (prenorm path) and random weights agree to fp32 rounding; the mode 2 mask equals
+the host's, mode 3 keeps whole 2 x 2 blocks two per row and column, SR-STE touches exactly the pruned weights; mode-3 flipped
+weights pass the prep without truncation; conv_fwd_tc routes registered weights to the sparse kernel and others to the dense one.
+
+**Numbers.** MMA only (tests/test_sp24_mma, dense-equivalent TFLOP/s): 5060 Ti dense mxf4 432, sparse mxf4 865, sparse mxf4nvf4 4X
+851, e4m3 dense 212 / sparse 424 (RTX PRO 6000 MIG 1g slice: 401 / 802): the sparse tensor core is a true 2x. Measured layout: the
+metadata lane (g, t) holds row g + 8 (t & 1), groups 8 (t >> 1) .. + 7; scales as the dense MMA (4X: one byte per 32 K). The first
+kernel used the other lane candidate (row g + 8 (t >> 1)) and failed test_sp24_conv; with the measured one every case is byte-identical
+to the dense kernel, including GN inputs and random weights (the fp32 sums happen to round the same).
+
+Conv time (tests/bench_sp24, 5060 Ti, one 32-plane slab of the P 1024 half window per level, GN + SiLU input and output statistics
+for fwd, MX-fp4 gy with output SR for bdata, min of 3, prepared-weight memo on):
+
+| level | shape | fwd dense / sparse ms | bdata dense / sparse ms |
+|---|---|---|---|
+| 0 | 32 x 256^2 x 256 ch | 34.5 / 27.4 (1.26x) | 34.4 / 27.9 (1.23x) |
+| 1 | 32 x 128^2 x 320 | 12.8 / 10.4 (1.24x) | 12.4 / 10.0 (1.24x) |
+| 2 | 32 x 64^2 x 384 | 4.57 / 3.67 (1.25x) | 4.44 / 3.55 (1.25x) |
+| 3 | 16 x 32^2 x 448 | 0.81 / 0.63 (1.27x) | 0.79 / 0.62 (1.29x) |
+
+The sparse kernel reaches 270-290 TFLOP/s dense-equivalent against the dense one's ~215 (of the 432 MMA peak): halving the MMAs
+gives 1.25x, because staging and the B ldmatrix (unchanged) now dominate. With conv_fwd_f4_k at 27 % of the 92 M step (perf2:
+442 of 1610 ms at P 512) that is ~5 % of the step for mode 3 and ~3.5 % for mode 2, before any quality cost. More needs the staging
+cost per MMA cut (a wider output tile per staged input), which the dense kernel would profit from as much.
+
 ## Split-window input builders: every --gpu-aug builder by z range, the scanner split exactly across two GPUs (2026-11-13, branch augz-20261112)
 
 **The light statistics pass under the split (UFSM_LAT_LIGHT_SPLIT=1, untested).** For the fused head groups (the normal 7 and the

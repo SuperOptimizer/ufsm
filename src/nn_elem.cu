@@ -259,6 +259,60 @@ __global__ void srste24_k(float *g, const float *w, int Co, int Ci, int T, float
 #pragma unroll
     for (int j = 0; j < 4; j++) if (j != i0 && j != i1) g[base + (size_t)j * T] += lambda * w[base + (size_t)j * T];
 }
+/* the hardware sparse fp4 patterns (src/lp_sp24conv.cu). mode 2, pair-wise 4:8: per (co, tap, 8 input channels) the 2 channel pairs of
+   largest |w0| + |w1| (ties: lower index; the sparse prep's rule). mode 3, transposable 2 x 2 blocks: per (8 co, 8 ci, tap) a 4 x 4 grid of
+   2 x 2 blocks (co pair a, ci pair b) keeps exactly 2 blocks in every grid row and column (max summed |w|, the first of equal sums), so
+   the forward (rows co, pairs along ci) and the backward-data's flipped weights (rows ci, pairs along co) both carry mode 2's pattern.
+   keep: bit 4 a + b. */
+__device__ __forceinline__ unsigned keep48_(const float m[4]) {
+    int i0 = m[1] > m[0] ? 1 : 0, i1 = 1 - i0;
+    for (int b = 2; b < 4; b++) { if (m[b] > m[i0]) { i1 = i0; i0 = b; } else if (m[b] > m[i1]) i1 = b; }
+    return (1u << i0) | (1u << i1);
+}
+__device__ unsigned keep22t_(const float M[4][4]) {
+    const unsigned char rows[6] = {3, 5, 6, 9, 10, 12};   /* 2-of-4 column sets */
+    float best = -1.f; unsigned bk = 0x5a5au;
+    for (int p = 0; p < 1296; p++) {
+        int q = p; unsigned k = 0; int cc[4] = {0, 0, 0, 0}; float s = 0.f; bool ok = true;
+        for (int a = 0; a < 4 && ok; a++) {
+            const unsigned r = rows[q % 6]; q /= 6;
+            for (int b = 0; b < 4; b++) if ((r >> b) & 1u) { if (++cc[b] > 2) ok = false; s += M[a][b]; }
+            k |= r << (4 * a);
+        }
+        if (ok && s > best) { best = s; bk = k; }
+    }
+    return bk;
+}
+/* one thread per group: mode 2 (co, ci / 8, tap), mode 3 (co / 8, ci / 8, tap). out = w masked (in place allowed); g != nullptr: the SR-STE
+   term g += lambda w on the pruned weights instead (out unused) */
+__global__ void mask_sp_k(const float *w, float *out, float *g, float lambda, int Co, int Ci, int T, int mode) {
+    const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    const int nci = Ci / 8, nco = mode == 3 ? Co / 8 : Co;
+    if (i >= (size_t)nco * nci * T) return;
+    const int t = (int)(i % T), cb = (int)((i / T) % nci), ob = (int)(i / ((size_t)T * nci));
+    const int nr = mode == 3 ? 8 : 1, co0 = mode == 3 ? 8 * ob : ob, ci0 = 8 * cb;
+    unsigned keep[8];
+    if (mode == 3) {
+        float M[4][4];
+        for (int a = 0; a < 4; a++) for (int b = 0; b < 4; b++) {
+            float s = 0.f;
+            for (int x = 0; x < 2; x++) for (int y = 0; y < 2; y++) s += fabsf(w[((size_t)(co0 + 2 * a + x) * Ci + ci0 + 2 * b + y) * T + t]);
+            M[a][b] = s;
+        }
+        const unsigned k = keep22t_(M);
+        for (int r = 0; r < 8; r++) keep[r] = (k >> (4 * (r >> 1))) & 15u;
+    } else {
+        float m[4];
+        for (int b = 0; b < 4; b++) m[b] = fabsf(w[((size_t)co0 * Ci + ci0 + 2 * b) * T + t]) + fabsf(w[((size_t)co0 * Ci + ci0 + 2 * b + 1) * T + t]);
+        keep[0] = keep48_(m);
+    }
+    for (int r = 0; r < nr; r++) for (int c = 0; c < 8; c++) {
+        const size_t j = ((size_t)(co0 + r) * Ci + ci0 + c) * T + t;
+        const bool kp = (keep[r] >> (c >> 1)) & 1u;
+        if (g) { if (!kp) g[j] += lambda * w[j]; }
+        else out[j] = kp ? w[j] : 0.f;
+    }
+}
 __global__ void wquant_k(float *w, int Co, int Ci, int T, int bits, unsigned seed) {
     size_t nb = (size_t)Co * ((Ci + 31) / 32) * T, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     if (i >= nb) return;
@@ -383,6 +437,19 @@ extern "C" void nn_wquant(float *w, int co, int ci, int taps, int bits, unsigned
 extern "C" void nn_mask24(const float *w, float *out, int co, int ci, int taps) {
     if (ci % 4) { if (out != w) cudaMemcpyAsync(out, w, (size_t)co * ci * taps * 4, cudaMemcpyDeviceToDevice); return; }
     size_t ng = (size_t)co * (ci / 4) * taps; mask24_k<<<nblk(ng, 256), 256>>>(w, out, co, ci, taps); KCHECK();
+}
+extern "C" int nn_sp24_eligible(int co, int ci, int mode) { return mode == 2 ? ci % 8 == 0 : mode == 3 ? ci % 8 == 0 && co % 8 == 0 : ci % 4 == 0; }
+extern "C" void nn_mask24m(const float *w, float *out, int co, int ci, int taps, int mode) {
+    if (mode <= 1) { nn_mask24(w, out, co, ci, taps); return; }
+    if (!nn_sp24_eligible(co, ci, mode)) { if (out != w) cudaMemcpyAsync(out, w, (size_t)co * ci * taps * 4, cudaMemcpyDeviceToDevice); return; }
+    const size_t ng = (size_t)(mode == 3 ? co / 8 : co) * (ci / 8) * taps;
+    mask_sp_k<<<nblk(ng, 128), 128>>>(w, out, nullptr, 0.f, co, ci, taps, mode); KCHECK();
+}
+extern "C" void nn_srste24m(float *g, const float *w, int co, int ci, int taps, float lambda, int mode) {
+    if (mode <= 1) { nn_srste24(g, w, co, ci, taps, lambda); return; }
+    if (!nn_sp24_eligible(co, ci, mode)) return;
+    const size_t ng = (size_t)(mode == 3 ? co / 8 : co) * (ci / 8) * taps;
+    mask_sp_k<<<nblk(ng, 128), 128>>>(w, nullptr, g, lambda, co, ci, taps, mode); KCHECK();
 }
 extern "C" void nn_srste24(float *g, const float *w, int co, int ci, int taps, float lambda) {
     if (ci % 4) return;

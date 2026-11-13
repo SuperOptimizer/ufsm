@@ -1,5 +1,6 @@
 /* CUDA ops: wgrad section of the former nn.cu */
 #include "nn_common.cuh"
+#include "lp_sp24.h"
 
 int f4_wgrad(void) { static int v = -1; if (v < 0) v = getenv("UFSM_F4_WGRAD") ? atoi(getenv("UFSM_F4_WGRAD")) : 0; return v; }
 int f4_had_w(void) {   /* bit 0: Hadamard (UFSM_F4_HAD_W), bit 1: stochastic rounding of x as well (UFSM_F4_SRX), bit 2: H16 variant */
@@ -144,6 +145,7 @@ extern "C" int nn_conv3d_bwd_data_split(const float *gy, shape5 ys, const float 
     int T = 27;
     size_t nw = (size_t)ys.c * xs.c * T;
     flip_w_k<<<nblk(nw, 256), 256>>>(w, scratch, ys.c, xs.c, T);
+    lp_sp24_note_flip(w, scratch, nw);
     gnp_t none = {nullptr, nullptr, nullptr, nullptr, 0};
     split_t sp = {nullptr, 0, gx2, o_split};
     int save = g_pass; g_pass = 1;
@@ -157,6 +159,7 @@ extern "C" int nn_conv3d_bwd_data_range(const float *gy, shape5 ys, const float 
     const int T = 27;
     size_t nw = (size_t)ys.c * xs.c * T;
     flip_w_k<<<nblk(nw, 256), 256>>>(w, scratch, ys.c, xs.c, T);   /* scratch[ci][co][t]: rows ci = output channels of this conv */
+    lp_sp24_note_flip(w, scratch, nw);
     gnp_t none = {}; split_t ns = {};
     shape5 gs = xs; gs.c = nc;
     int save = g_pass; g_pass = 1;
