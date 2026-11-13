@@ -28,6 +28,7 @@ against plain Muon, with a block-bootstrap CI (`absum.py`).
 | `--muon-ademamix A [--ademamix-b3 0.999]` | slow EMA m2 added to the Nesterov momentum, alpha ramped 0 -> A | Pagliardini et al. 2024, arXiv 2409.03137 | built |
 | `--muon-qkv-split 1` | Q / K / V of every head orthogonalised separately (not the fused [3C][C]) | Kimi K2 / MuonClip practice | built; QK-clip needs a logit-max hook in the attention kernels (not yet) |
 | `--muon-tc 1` | the NS products on fp16 tensor cores (wmma, fp32 accumulate) | | built; accuracy test vs fp32 |
+| `--muon-tc 2` | the NS products on cuBLASLt TF32 tensor cores (one GEMM per product and matrix, fp32 buffers) | | built, tested (2.4e-3 vs fp32) |
 
 **Evaluation.** Matched step: training loss over the last 300 steps (the WSD cooldown), paired step for step against Muon (the same
 windows), block-bootstrap 95% CI (`absum.py`). Held-out: each finished arm resumed from its last.ckpt for one lr-0 step with
@@ -43,6 +44,12 @@ the noise, or run a wall-matched arm.
 | kron | 3267 s (1.16x) | -0.0013 [-0.0021, -0.0006] | -0.0016 | +0.0000 | -0.0010 | +0.0006 | -0.003 | -0.0006 | tie at matched steps (-0.1%), 16% slower: no |
 
 (The interim kron gap at steps 411-580, -0.0056, shrank to -0.0013 by the end of the cooldown.)
+
+**Optimizer speed** (bench_muonx, 92 M net, ms per unet_muon call on one 5060 Ti; the P 512 training step is 1.81 s): Muon fp32 NS 121
+(6.7% of the step), `--muon-tc 1` (hand-written wmma fp16) 213, `--muon-tc 2` (cuBLASLt TF32) 57 (3.2%); polar 122, NorMuon 126,
+MARS-VR 127, cautious 128, AdEMAMix 128, Muon-C 263, Kronecker 465 (+344 ms: the whole of kron's 16% slowdown in training, 0.472 vs 0.553
+samp/s). The TF32 update differs from the fp32 one by 2.4e-3 relative over 3 steps (test_muonx), as the fp16 path's; arm `muontc2` checks
+loss parity in training. CUBLAS_COMPUTE_32F_FAST_16BF failed on the net's shapes (dropped).
 
 **QK-clip** (`--qk-clip TAU`, built 2026-11-13): MuonClip rescales W_q, W_k when a head's max logit exceeds tau; with our QK-norm the
 projections' scale cancels, so the clip scales the head's QK-norm gains qg, kg by sqrt(tau / max). The max logit q.k / sqrt(48) per head
