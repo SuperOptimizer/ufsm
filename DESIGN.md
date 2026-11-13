@@ -6,6 +6,36 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## scratch2 at P 1024 --split z: device memory outside the planner, and a per-step leak (2026-11-13, branch s2fix-20261113)
+
+The full scratch2 flag set (widths 256,320,384,448,288,288, attention 4 blocks with scroll PE, gn-ema, scan-norm, gfilm, ink head + MIL +
+air, fibre head, rv 2, unwrap2, on-the-fly phase, fibre / ink on the GPU) planned at 11.59 GB per card but died within ~20 steps. The
+fixes, by what each freed or stopped per card:
+
+| item | per card | fix |
+|---|---|---|
+| fp4 gy records under the split (also wrong, see the section below) | 1.21 GB planned | no records under the split |
+| head slab z 16 -> 8 (UFSM_HEAD_SLAB_Z; 4 is refused by the streamed latent head) | ~0.95 GB planned | launch env 8 |
+| Muon Newton-Schulz scratch pool (one batch for all matrices) | 953 MB -> 128 MB | batched in groups, UFSM_MUON_POOL_MB (128) |
+| Muon momentum beside the unused AdamW v of the matrices | 416 MB | the momentum lives in v (UFSM_MUON_MOM_ALIAS, default on); checkpoints mask both |
+| peer gradient buffer (whole parameter vector) | 416 MB -> 64 MB | chunked copy + axpy |
+| cuBLASLt workspace allocated on GPU 0, used from GPU 1 | crash ("cublasLtMatmul failed (14)") | per-device handle and workspace |
+| split_run created two new threads per call: thread-local device caches (ink MIL backward slabs ~330 MB, GroupNorm partials, gnbwd scratch) reallocated every step | ~0.3 GB / step, OOM at step ~20 | persistent side threads |
+| on-the-fly phase cache (--onfly-mb, default 2 GB on GPU 0) | 1.3 GB | --onfly-mb 768 |
+
+Not yet moved: the EMA weights and the film ffw buffers (416 MB each). train now warns when a card's free memory falls by more
+than 64 MB between log lines after step 2 (any allocator), so the next such leak shows in the log instead of as an OOM.
+
+Bench g1 (two 5060 Ti, only the trainer on the cards, suite locks held; UFSM_HEAD_SLAB_Z=8, --onfly-mb 768, 1 slot, 6 workers, 60
+steps): whole-card peaks 15.05 / 14.45 GB (gate 15.3), the trainer's own 14.93 / 14.37 GB, flat from step 14 to 60. Planner: mode MX
+gradients, chunked, lean 2, shared encoder a1 offloaded, 11.59 of 13.15 GB. Step time 33 s median, sampler-bound (wait 45-93%; the
+GPU part ~10 s); 18-20 s/step until a second P 1024 sampler started beside it.
+
+Host memory: each sampler slot pins 11.8 GB at P 1024, and the trainer pins ~13.3 GB more (host offloads 3.21 GB each way per card,
+label planes). 2 slots reached rss 90 GB + ~40 GB shmem and were memcg-killed at 104 GB at step 23. 1 slot: rss 50-58 GB. The
+sampler is the bound: one worker thread spends its time in sym_u8 (the per-channel symmetry copies of the full-resolution label
+planes in the --gpu-aug 1 CPU label path that the auxiliary heads force), 18-20 s per window against ~10 s of GPU step.
+
 ## --split z: the encoder gradient bug was the GroupNorm backward's count, plus the first step's scroll axis records (2026-11-13, branch s2fix-20261113)
 
 Symptom: under `--split z`, encoder weight gradients differed from the one-GPU run (relative 4e-3 at enc3, 0.29 at enc0.c1). It showed
