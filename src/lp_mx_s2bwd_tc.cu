@@ -542,11 +542,17 @@ static int s2b_f4q(const void *gy, shape5 ys, const float *w, shape5 xs, void *g
 }
 static int g_s2b_f4 = -1;
 extern "C" void lp_set_s2b_f4(int on) { g_s2b_f4 = on; }
+static int g_s2b_wide = -1;
+extern "C" void lp_set_s2b_wide(int on) { g_s2b_wide = on; }   /* tests; -1: UFSM_S2B_WIDE */
 static int s2b_f4(const void *gy, shape5 ys, const float *w, shape5 xs, void *gx, int accum, int gdt, int xdt, unsigned osr) {
     if (g_s2b_f4 < 0) g_s2b_f4 = getenv("UFSM_S2B_F4") ? atoi(getenv("UFSM_S2B_F4")) : 3;
     const int C = xs.c, NCH = C / 32;
     if (g_s2b_f4 && C == 16 && ys.c == 16 && gdt == 4 && xdt == 4 && xs.d == 2 * ys.d && xs.h == 2 * ys.h && xs.w == 2 * ys.w) return s2b_f4q(gy, ys, w, xs, gx, accum, osr);
-    const bool wideC = C >= 256 && C <= 448 && C % 32 == 0 && NCH != 11 && NCH != 13;   /* (STREAM instantiations: 8, 9, 10, 12, 14 blocks) */
+    /* the wide STREAM path (256..448 channels) is off by default (UFSM_S2B_WIDE=1 on): with it the scratch2 P 1024 split step's gradient was NaN
+       on exactly enc3.c2 + level 3's film (bisect: a054edf first bad), and in test_mx4 the 256 / 320 / 384 / 448 / 288 cases in sequence
+       leave the later fp4 SR-operand check NaN while each width alone passes: something outside gx is overwritten (perf2 2026-11-13, open) */
+    if (g_s2b_wide < 0) g_s2b_wide = getenv("UFSM_S2B_WIDE") && atoi(getenv("UFSM_S2B_WIDE")) > 0;
+    const bool wideC = g_s2b_wide > 0 && C >= 256 && C <= 448 && C % 32 == 0 && NCH != 11 && NCH != 13;   /* (STREAM instantiations: 8, 9, 10, 12, 14 blocks) */
     if (!g_s2b_f4 || (C != 32 && C != 64 && C != 96 && C != 128 && !wideC) || ys.c != C || gdt != 4 || (xdt != 4 && xdt != 8) || xs.d != 2 * ys.d || xs.h != 2 * ys.h || xs.w != 2 * ys.w || ys.w % 16 || ys.h % 4) return 0;
     if (C >= 64 && (g_s2b_f4 & 2) == 0) return 0;   /* UFSM_S2B_F4=1: 32 channels only (3, the default: also 64 / 96 / 128) */
     static s2f4_pairs PT, PT2; static int built = 0, built2 = 0;

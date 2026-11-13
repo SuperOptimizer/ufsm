@@ -149,6 +149,40 @@ ones byte for byte (test_aug_z). CT bytes, scanner records and radial records ar
 
 Goal: the 92 M net's P 1024 two-card split step (scratch2.launch) as fast as possible with equivalent training.
 
+### The two-card P 1024 split profile (desk, 14:10-15:20, mega f16a996 + perf2)
+
+The scratch2 command line (perf2/scratch2.cmd: 92 M, --split z --split-top 3, MX-fp4, UFSM_HEAD_SLAB_Z=8) on both 5060 Tis under the six
+locks, /vesuvius/ufsm/perf2/prof2.sh (nsys over steps 4-5, UFSM_PROF, plain), tools nsplit.py / nwin.py / napi.py (per-card busy / idle,
+the kernels in a window, the host threads' CUDA API time).
+
+- **The run is sampler-bound.** Without replay the step boundary holds two idle gaps of 4.9 / 5.4 s (trainer wait 43-77 %); scratch2 try1
+  logged 0.02 samples/s, wait 85 % (~50 s/step against a ~6.5 s GPU step): --sampler-slots 1 builds one window at a time. The GPU numbers
+  below use --replay 8 (each window again with new device-side augmentation), which takes the sampler out.
+- **GPU step, replay:** 8.1 s (2-step capture 16.26 s). Per card: kernels 6.17 s, copies not under kernels 0.57 s, idle 1.39 s.
+  UFSM_PROF (both cards summed, ms per step): wgrad 3060, conv fwd 2510, loss 2270, bwd_data 1770, gn 1430.
+- **The head passes ran one card at a time (1.1 s idle per card per step).** split_run hands the turn over at collectives only; a head
+  slab pass has none, and its ~1300 launches (+ ~700 memsets) fill the launch queue, so the side holding the turn blocked in
+  cudaLaunchKernel / cudaMemset (9.5 ms once per 20 ms slab) at its own GPU's pace while the other side, unable to enqueue, idled
+  (napi.py: side 0 728 ms in launches, side 1 0.2 ms in the window). Fix: split_yield, a no-op collective at the top of every slab but the
+  first (both halves run the same slab count; both passes leave the body early, so the end of the body never ran it). The op state passes
+  with the turn as at any collective. **8.1 -> 6.35 s/step (-22 %)**, idle per card 1.39 -> 0.08 s; --det 1 losses identical over 5 steps
+  (1.8622 1.8835 1.9184 1.7865 1.8743, yield on and off); 79-92 vs 65-74 Mvox/s. UFSM_SPLIT_YIELD=0 off.
+- **Next exposed copies (per card per step):** the next batch's device label warp at the step boundary (stream 23: 6 x 634 MB H2D + 6 x
+  570 MB D2H through the 2.28 GB pinned label planes, interleaved with lw_phase / lw_ink: ~350 ms with no kernel running) and the
+  activation offloads (stream 27, ~180 ms not under kernels).
+- **UFSM_GRAD_AR2 + UFSM_LAT_LIGHT_SPLIT:** no measurable gain at P 1024 (0.13 vs 0.13 samples/s), losses identical; AR2's H2D-done event was
+  made on the source device and failed on two cards (the one-device test could not see it), fixed.
+- **UFSM_PROF under --split** crashed (one global event set made on GPU 0, recorded on GPU 1): per-device event sets now.
+- **NaN gradients (blocker, mega and swap1):** with these flags every step skips (non-finite gradient norm; the scale falls to 1). The step-1
+  gradient (UFSM_GRAD_DUMP) is NaN on exactly enc3.c2 (18918336..24338687 = 448 x 448 x 27 + 3 x 448) and 1792 film parameters (film +3840),
+  i.e. level 3, the first --split-top level; all lower levels finite. The 12:13 scratch2 binary (7ee48e2) is clean on the same flags.
+  Bisect over 7ee48e2..bc6c4c7 (590b56b cherry-picked where missing; perf2/bisect_step.sh): **a054edf first bad**, the s2b fp4
+  weight-streaming kernel widened to 256..448 channels (NCH 8 / 9 / 10 / 12 / 14), so down3's bwd_data (448 ch) runs it. In isolation each
+  width matches the reference (test_mx4 rel err 0.167-0.170 vs dilated 0.155, 32^3), but 384 / 448 / 288 run after 256 / 320 leave the later
+  "fp4 conv SR operand (32 ch)" check NaN: something outside gx is overwritten (open). The wide path is off by default now
+  (UFSM_S2B_WIDE=1 / lp_set_s2b_wide on; test_mx4 keeps 256 / 320, TMX4_WIDE_ALL=1 the whole sequence): mega + this, step-1 gradient
+  0 non-finite (max |g| 0.329, loss 2.77253056).
+
 **Profile before** (the archived one-card P 512 92 M run, runs/scratch-archive-20261113/prof92: nsys + UFSM_PROF=layers, 37 steady
 steps): 1.61 s/step, kernel-busy 99 % (GPU-bound, no loader wait). Per step:
 

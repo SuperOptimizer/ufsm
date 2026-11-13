@@ -5,7 +5,8 @@
 #include <string.h>
 
 typedef struct { int kind; const void *p; shape5 s; int esz, h; double *b; int n; int slot; void *q; size_t ns, nr; void *st; } coll_t;   /* kind 1 halo, 2 reduce, 3 k halo planes (n = k),
-                                                    4 xchg (p send of ns bytes, q receive of nr), 5 typed sum (q values, n of them, slot = type), 6 split_top gather (n = the whole depth) */
+                                                    4 xchg (p send of ns bytes, q receive of nr), 5 typed sum (q values, n of them, slot = type), 6 split_top gather (n = the whole depth),
+                                                    7 yield (nothing exchanged: the turn changes hands) */
 
 struct split_ctx {
     int dev[2];
@@ -69,7 +70,8 @@ static void execute(split_ctx *c) {
         fprintf(stderr, "split: the two halves diverged (collective %u: kind %d / %d)\n", c->seq, a->kind, b->kind);
         abort();
     }
-    if (a->kind == 1) {
+    if (a->kind == 7) {   /* split_yield */
+    } else if (a->kind == 1) {
         size_t nb = nn_split_halo_bytes(a->s, a->esz);
         if (nb > c->cap) grow(c, nb, 0);
         void *t[2] = {(void *)a->p, (void *)b->p};
@@ -128,6 +130,7 @@ void split_halo_k(const void *p, shape5 s, int esz, int h, int k) { coll_t x = {
 void split_xchg(const void *send_d, size_t ns, void *recv_d, size_t nr, void *stream) { coll_t x = {4, send_d, {0}, 0, 0, nullptr, 0, 0, recv_d, ns, nr, stream}; collective(&x); }
 void split_sum(void *d, int n, int type, void *stream) { coll_t x = {5, nullptr, {0}, 0, 0, nullptr, n, type, d, 0, 0, stream}; collective(&x); }
 void split_gather(const void *p, shape5 s, int esz, int h, int D) { coll_t x = {6, p, s, esz, h, nullptr, D, 1}; collective(&x); }
+void split_yield(void) { coll_t x = {7}; collective(&x); }
 int split_side(void) { return t_side; }
 void split_reduce(double *b, int n) { coll_t x = {2, nullptr, {0}, 0, 0, b, n, 0}; collective(&x); }
 
