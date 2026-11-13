@@ -2420,6 +2420,8 @@ int cmd_train(int argc, char **argv) {
     { const char *ln = opt(argc, argv, "--l0-norm", "gn");   /* level-0 normalisation (unet_cfg.l0_norm): gn, none (affine + SiLU), ema (running statistics), ws (none + weight standardisation), slab (GroupNorm per z-slab) */
       cfg.l0_norm = !strcmp(ln, "none") ? 1 : !strcmp(ln, "ema") ? 2 : !strcmp(ln, "ws") ? 3 : !strcmp(ln, "slab") ? 4 : 0;
       if (!cfg.l0_norm && strcmp(ln, "gn")) { fprintf(stderr, "--l0-norm gn|none|ema|ws|slab\n"); return 2; }
+      cfg.gn_ema = atoi(opt(argc, argv, "--gn-ema", "0"));   /* 1: running GroupNorm statistics at every site (unet_cfg.gn_ema; --gn-ema-mom, --gn-ema-warm) */
+      if (cfg.gn_ema && cfg.l0_norm) { fprintf(stderr, "--gn-ema 1: with --l0-norm gn only\n"); return 2; }
       cfg.l0_slab = atoi(opt(argc, argv, "--l0-slab", "64")); }   /* slab: planes per GroupNorm slab */
     cfg.scale_cond = atoi(opt(argc, argv, "--scale-cond", "0"));   /* voxel-size conditioning of the stem (unet_set_scale per batch) */
     if (g_papyrus) cfg.scale_cond = g_pap.cond == 1;   /* task papyrus: the stem-bias conditioning carries the cutoff instead */
@@ -2456,7 +2458,7 @@ int cmd_train(int argc, char **argv) {
         if (!cfg.attn_deform && (cfg.attn_dco || cfg.attn_dinit)) { fprintf(stderr, "--attn-dcoarse / --attn-deform-init: need --attn-deform\n"); return 2; }
     }
     cfg.w4_2d = atoi(opt(argc, argv, "--w4-2d", "0"));   /* consistent fp4 weights (unet_cfg.w4_2d): one scale per 32 x 32 block and tap */
-    if (resume) { unet_cfg pc; int st; if (!unet_peek(resume, &pc, &st)) { cfg.w4_2d = pc.w4_2d; cfg.down_norm = pc.down_norm; cfg.l0_norm = pc.l0_norm; cfg.l0_slab = pc.l0_slab; cfg.scale_cond = pc.scale_cond; cfg.film = g_film = pc.film; memcpy(cfg.dec_widths, pc.dec_widths, sizeof cfg.dec_widths); cfg.ds_levels = pc.ds_levels; memcpy(cfg.dec_convs, pc.dec_convs, sizeof cfg.dec_convs); memcpy(cfg.enc_blocks, pc.enc_blocks, sizeof cfg.enc_blocks);
+    if (resume) { unet_cfg pc; int st; if (!unet_peek(resume, &pc, &st)) { cfg.w4_2d = pc.w4_2d; cfg.down_norm = pc.down_norm; cfg.l0_norm = pc.l0_norm; cfg.l0_slab = pc.l0_slab; cfg.gn_ema |= pc.gn_ema; cfg.scale_cond = pc.scale_cond; cfg.film = g_film = pc.film; memcpy(cfg.dec_widths, pc.dec_widths, sizeof cfg.dec_widths); cfg.ds_levels = pc.ds_levels; memcpy(cfg.dec_convs, pc.dec_convs, sizeof cfg.dec_convs); memcpy(cfg.enc_blocks, pc.enc_blocks, sizeof cfg.enc_blocks);
                   cfg.attn_blocks = pc.attn_blocks; cfg.attn_pe = pc.attn_pe; cfg.attn_reg = pc.attn_reg; cfg.attn_mlp = pc.attn_mlp; cfg.attn_vres = pc.attn_vres; cfg.attn_axis = pc.attn_axis; cfg.attn_repeat = pc.attn_repeat; cfg.attn_mem = pc.attn_mem; cfg.view_P = pc.view_P; cfg.view_patch = pc.view_patch;
                   cfg.attn_deform = pc.attn_deform; cfg.attn_dlev = pc.attn_dlev; cfg.attn_dco = pc.attn_dco; cfg.attn_dinit = pc.attn_dinit; } }   /* the checkpoint decides */
     if (cfg.w4_2d) fprintf(stderr, "weights: consistent MX-fp4 (--w4-2d 1): one scale per 32 x 32 block and tap, the same values in the forward and backward-data\n");
@@ -3081,6 +3083,7 @@ int cmd_train(int argc, char **argv) {
         if (nn_init(d->dev)) { fprintf(stderr, "cannot select GPU %d\n", d->dev); return 1; }
         d->u = unet_create(&cfg);
         unet_set_l0_ema(d->u, (float)atof(opt(argc, argv, "--l0-mom", "0.01")), atoi(opt(argc, argv, "--l0-warm", "100")));   /* --l0-norm ema */
+        unet_set_gn_ema(d->u, (float)atof(opt(argc, argv, "--gn-ema-mom", "0.01")), atoi(opt(argc, argv, "--gn-ema-warm", "500")));   /* --gn-ema 1 (a resume: the checkpoint's) */
         unet_set_wd_nonconv(d->u, (float)atof(opt(argc, argv, "--wd-nonconv", "0")));   /* Muon / ANVIL: no decay on GroupNorm, biases, head */
         unet_set_muon_ext(d->u, muon_c, hyperball, hb_mult);
         if (trunk_lr != 1.f) unet_set_trunk_lr(d->u, trunk_lr);
@@ -3805,6 +3808,7 @@ int cmd_train(int argc, char **argv) {
     if (plan && cover_checkpoint_extra(runtime_extra, &coverage, checkpoint_extra, sizeof checkpoint_extra)) return 2;
     fprintf(stderr, "model widths"); for (int i = 0; i < cfg.nlev; i++) fprintf(stderr, " %d", cfg.widths[i]);
     if (cfg.l0_norm) fprintf(stderr, " (level-0 norm %s)", cfg.l0_norm == 1 ? "none" : cfg.l0_norm == 2 ? "ema" : cfg.l0_norm == 3 ? "ws" : "slab");
+    if (cfg.gn_ema) fprintf(stderr, " (GroupNorm: running statistics, %ld updates so far)", unet_gn_ema_updates(G[0].u));
     if (g_Pz != P) fprintf(stderr, ": %zu params; window %dx%dx%d (slab) B=%d x %d GPU(s) [", np, g_Pz, P, P, B, ng); else fprintf(stderr, ": %zu params; P=%d B=%d x %d GPU(s) [", np, P, B, ng); for (int g = 0; g < ng; g++) fprintf(stderr, "%s%d", g ? "," : "", devs[g]); fprintf(stderr, "] %s%s\n", nn_get_tf32() ? "tensor cores (see precision.txt for compute and storage)" : "fp32", split ? ", each window split along z" : "");
     split_ctx *sctx = split ? split_create(devs[0], devs[1]) : nullptr;
     nn_init(G[0].dev);

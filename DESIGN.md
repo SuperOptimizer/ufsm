@@ -58,6 +58,21 @@ basis: Muon 0.01, AdamW 1e-3, warmup 1000, WSD cooldown 0.2.
 and the fine stem counted the 9 unsupervised pad channels. It now maps into the supervised voxel outputs only (phase 2, wind4 2,
 ink 1, rv 2, fibre 9 = 16, the stem kernel's limit); test_fibhead_train covers --lat 4 --fstem 16 --ink-head 1 --fib-head 1.
 
+**EMA GroupNorm at every site** (`--gn-ema 1`, unet_cfg.gn_ema; `--gn-ema-mom 0.01 --gn-ema-warm 500`): all GroupNorms (every level's
+blocks, the down norms, the attention stage, the head's input) normalise with running statistics (BatchNorm-style, [mean | var] per
+group in the gn_sites layout; the first warm training forwards use their own statistics, after that training forwards are constants
+in forward and backward, the backward without the statistics' terms, nn_set_gn_const; inference uses the running statistics as soon
+as there are any). The sites hold the constants before the convs run (ge_begin), the convs write their live statistics to twins
+(ge_dst) that ge_after pools into the running set after dec[0]; the EMA weights keep their own set (unet_ema), forwards with the
+EMA weights (the SSL teacher) do not update. Checkpoints: header keys `gn_ema`, `ge_n`, `ge_warm`, `ge_mom`, `ge_run` only when on
+(no new parameters: an old checkpoint loads into a gn_ema net as a fresh warm-up; u1-size net 448 floats, 31 KB header). Needs
+`--l0-norm gn`. Multi-GPU data parallel: each card keeps its own statistics (card 0's are saved); with --split z the cards share one
+window, so their statistics agree. Tests: test_gn_ema (both a down-norm net and an attention net: the warm-up then the running blend
+at every site to 1e-4; a far-corner input change leaves the logits bit-identical, live GN moves them; momentum 1 reproduces live GN,
+statistics 1e-7, logits 5e-3 of 6.2; EMA-weight set; checkpoint round trip bit-identical; old checkpoint = fresh warm-up; finite
+backward), test_unet~GN_EMA=1 (fp32 finite differences with down norms: worst 7.5e-5 over 60 params; tensor cores vs fp32 logits
+0.061 of 6.6). Train smoke (u1 widths, P 256, warm-up 10): losses continuous across the switch to constants.
+
 Found on the way (not fixed here): with the scratch1 sources at P 1024 on one card an early `inkfly gpu: out of device memory`
 falls back to the CPU and then segfaults in nn_ink_bits (cudaMemcpyAsync of an invalid host pointer, lab_upload kind 3); and
 the scratch1 data path holds ~7 GB of device memory outside the planner at P 512.

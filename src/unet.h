@@ -54,6 +54,11 @@ typedef struct {
                               the convs reading SiLU outputs with the NF-net gain 1 / std(silu(z))), 4 slab (GroupNorm statistics per
                               z-slab of l0_slab planes: no whole-window reduction). Tensor-core and fp32 paths (slab: MX or fp32 storage) */
     int l0_slab;           /* l0_norm 4: planes per slab (0: 64; the level-0 depth a multiple of it) */
+    int gn_ema;            /* 1: every GroupNorm (all levels, down norms, the attention stage's) normalises with running statistics
+                              (BatchNorm-style, per group: unet_set_gn_ema's momentum toward each training forward's window statistics,
+                              live statistics during its warm-up), constants in forward and backward, the same in inference: a cell's
+                              output no longer depends on the rest of the window (the seams, the 58% far-field coupling of 2026-11-13).
+                              Needs l0_norm 0. Saved with the statistics (header keys "gn_ema", "ge_*" only when on) */
     int attn_blocks;       /* transformer blocks on the bottleneck level's output (src/attn.h; 0 = none, the default): its raw output x (the
                               conv / residual-block a2) becomes x + PE(x) -> attn_blocks pre-LN blocks (MHSA with QK-norm, heads of 48, SwiGLU,
                               fp32 residual, zero-initialised out projections: a fresh stage is the identity) -> the stage's a2, whose
@@ -181,6 +186,12 @@ long unet_gn_pooled(unet *u, float *h);     /* pooled statistics (unet_gn_nstats
    warm forwards normalise with their own statistics (GroupNorm), later ones with the running statistics from before the forward.
    Defaults 0.01, 100; unet_l0_updates: training forwards so far (saved in checkpoints with the statistics) */
 void unet_set_l0_ema(unet *u, float mom, int warm);
+/* cfg.gn_ema: the running statistics (gn_sites order, [mean g | var g] per (mean, rstd) site pair; live weights and EMA weights) move by
+   mom toward each training forward's batch statistics (the first replaces them; forwards with the EMA weights do not update); the first
+   warm training forwards normalise with their own statistics, later ones and every inference forward (once there are statistics) with
+   the running ones. Defaults 0.01, 500. unet_gn_ema_updates: training forwards so far (saved with the statistics) */
+void unet_set_gn_ema(unet *u, float mom, int warm);
+long unet_gn_ema_updates(const unet *u);
 void unet_set_l0_slab_kern(int on);   /* --l0-norm slab on the kernel path (readers apply per-slab statistics; 1) or D's prototype (0); -1: env UFSM_L0_SLAB_KERN */
 void unet_set_l0_stream(int on);      /* the level-0 slab stream (stage S3: level-0 ops per slab in a skewed schedule; 1); -1: env UFSM_L0_STREAM */
 /* stage S4: the stream runs the head per slab (no whole-window logits; with the rings dec[0].a2 and gout[0] are rings too): fwd(ctx, z0,
