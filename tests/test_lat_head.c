@@ -155,8 +155,9 @@ int main(void) {
             const int v16 = unet_logits_h16(v);   /* (fp32 logits where the layout gives them no 16-bit buffer of their own: MX-fp8, 96 inputs, 8 outputs) */
             float *l8f = malloc(8 * S * 4); if (v16) nn_d2h(l8, lv, 8 * S * 2); else nn_d2h(l8f, lv, 8 * S * 4);
             nn_set_sr_step(3100); unet_backward_x(v, gl8, 1); unet_grad_d2h(v, g8);
-            size_t lneq = 0; double lmax = 0;
-            for (size_t i = 0; i < 8 * S; i++) { const float a8 = v16 ? h2f(l8[i]) : l8f[i], b8 = h2f(lw[c0 * S + i]); const double dd = fabs((double)a8 - b8); if (dd > lmax) lmax = dd; lneq += v16 ? l8[i] != lw[c0 * S + i] : !(dd <= 2e-3 * (1 + fabs(b8))); }   /* (fp32 against fp16: one fp16 rounding) */
+            size_t lneq = 0; double lmax = 0; const int tc = CO > 16 && !(getenv("UFSM_HEAD_TC") && !atoi(getenv("UFSM_HEAD_TC")));
+            for (size_t i = 0; i < 8 * S; i++) { const float a8 = v16 ? h2f(l8[i]) : l8f[i], b8 = h2f(lw[c0 * S + i]); const double dd = fabs((double)a8 - b8); if (dd > lmax) lmax = dd; lneq += v16 ? (tc ? !(dd <= ldexp(1.0, ilogb(fmax(fabs(b8), 6.1e-5)) - 9)) : l8[i] != lw[c0 * S + i]) : !(dd <= 2e-3 * (1 + fabs(b8))); }   /* (fp32 against fp16: one fp16 rounding; the wide head on the tensor cores
+                                                         (lp_mx_conv1.cu conv1_mx_tc_k, perf2 11-13) against the 8-output FFMA passes: fp16 activations and weights, within 2 fp16 ulps) */
             free(l8f);
             const double et = rel2(g4 + ne0, g8 + ne0, ow - ne0), ee = rel2(g4, g8, ne0), eh = rel2(g4 + ow + (size_t)c0 * C0, g8 + ow8, (size_t)8 * C0), ed = rel2(g4 + ob + CO, g8 + ob8 + 8, np8 - ob8 - 8);
             const int ok = lay && !lneq && et < 1e-5 && ee < 1e-5 && eh < 1e-5 && ed < 1e-5;
