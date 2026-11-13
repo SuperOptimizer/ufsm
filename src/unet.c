@@ -2834,6 +2834,11 @@ int unet_head_bwd_z(unet *u, int z0, int z1, const void *gy16, int first) {
     return nn_head_bwd_z(x, gn ? &g : nullptr, u->dec[0].ys, gy16, u->cfg.cout, P(u, u->head.w), u->g + u->head.w, u->g + u->head.b, u->gout[0],
                          (size_t)z0 * hw, (size_t)(z1 - z0) * hw, first);
 }
+void unet_split_head_halo(unet *u, unet_halo_k_fn fn, int k) {
+    if (!sp_on(u)) return;
+    const float *x; nn_gn_t g; head_src(u, &x, &g);
+    fn(x, u->dec[0].ys, sp_esz(x, 0), sp_h(u, u->dec[0].ys), k);
+}
 /* a 1^3 conv over dec[0]'s output as the head reads it (silu(gn(a2)) under recompute, else s2), after a forward (training or inference):
    fp16 planes [n][nc][S] into y16 (wtrunk: the head rows followed by identity rows = heads + level-0 features of a training forward) */
 int unet_head_ext_fwd(unet *u, const float *w, const float *b, int nc, void *y16) {

@@ -15,4 +15,5 @@ void split_halo(const void *p, shape5 s, int esz, int h);
    run work that does not read the halo in between. One such exchange in flight at a time (split_halo may run meanwhile). */
 void split_halo_begin(const void *p, shape5 s, int esz, int h);
 void split_halo_end(const void *p, shape5 s, int esz, int h);
+void split_halo_k(const void *p, shape5 s, int esz, int h, int k);   /* nn_split_halo_k inside a job (a collective) */
 void split_reduce(double *b, int n);   /* registered as the nn reduce callback by split_create */

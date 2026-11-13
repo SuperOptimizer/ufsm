@@ -362,6 +362,10 @@ void unet_blend_ema(unet *u, float a);          /* EMA weights := a x live + (1 
 void unet_set_head_cb(unet *u, void (*cb)(void *), void *ctx);
 int unet_head_fwd_z(unet *u, int z0, int z1, void *y16);
 int unet_head_bwd_z(unet *u, int z0, int z1, const void *gy16, int first);
+/* the spatial split: the head input's k innermost halo planes (dec[0]'s output) from the other GPU, so the head logits of the halo cells next to
+   the cut are the window's (a collective; train --lat 4 --split z: the head slabs upsample owned voxels next to the cut from it). No-op unsplit */
+typedef void (*unet_halo_k_fn)(const void *p, shape5 s, int esz, int h, int k);
+void unet_split_head_halo(unet *u, unet_halo_k_fn fn, int k);   /* the k innermost planes (split_halo_k) */
 void unet_set_fp16_logits(unet *u, int on);   /* MX activations: fp16 logits where they get their own buffer (half the head output; the readers
                                                  follow unet_logits_h16 / nn_set_logits_h16). Not for half-resolution or sheet nets */
 void unet_set_grad_mx4(int on);   /* MX-fp4 activation gradients (with the MX gradient mode; opt-in, env UFSM_GRAD_MX4) */
