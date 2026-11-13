@@ -311,10 +311,13 @@ extern "C" void nn_gn_silu_bwd(const float *x, shape5 s, int G, const float *gam
         /* MX-fp4: the apply also writes the fp4 weight gradient's gy records (its pre-pass skipped); record SR from a seed derived
            from gsr, so the global seed sequence is unchanged */
         int za, zb; const int zwin = zw_win(s.n * s.d, &za, &zb);   /* (z-window: the plain apply, same gx bits; no whole-layer records) */
-        if (zwin) g_gyrec.valid = 0;
+        if (zwin || zsp) g_gyrec.valid = 0;
         if (gdt == 4 && !zwin && lp_gnpend_want() && lp_gn_silu_bwd_apply_defer(x, xdt, s, G, gamma, beta, mean, rstd, gy, gx, AB, gsr, gsr * 0x9e3779b9u + 0x7f4a7c15u)) {}   /* (the
                                                                                                      weight gradient that follows applies it with its records, slab by slab) */
-        else if (gdt != 4 || zwin || !lp_gn_silu_bwd_apply_rec(x, xdt, s, G, gamma, beta, mean, rstd, gy, gx, AB, gsr, gsr * 0x9e3779b9u + 0x7f4a7c15u))
+        /* --split z: no whole-layer gy records (2026-11-13): they hold the halo planes' gx, which the caller zeroes only after this apply
+           (nn_split_zero), so the fp4 weight gradient and the bias sums read the halo voxels twice (dec0.c2.b 0.13 relative off). The
+           weight gradient's own pre-pass reads the zeroed gy; the records' 136 B per channel x 256 voxels stay unallocated */
+        else if (gdt != 4 || zwin || zsp || !lp_gn_silu_bwd_apply_rec(x, xdt, s, G, gamma, beta, mean, rstd, gy, gx, AB, gsr, gsr * 0x9e3779b9u + 0x7f4a7c15u))
             lp_gn_silu_bwd_apply_mx(x, xdt, s, G, gamma, beta, mean, rstd, gy, gx, gdt, AB, gsr);
         if (!zsp) gn_param_grad_k2<<<nblk(s.c, 128), 128>>>(scratch, ggamma, gbeta, s.n, s.c);
         KCHECK();
