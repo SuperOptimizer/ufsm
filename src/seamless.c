@@ -13,7 +13,8 @@
    arguments, the output <out>/.seam/{a,b}, --full-grid 1 --q 0 --levels 1 --window W --halo H --shard S / 2 and --grid-origin 0,0,0 /
    S/2,S/2,S/2 (shard S / 2: the shifted tiles stay aligned with the store's shards, one window per tile; with S-sized shards each
    shifted tile spans 8 shards and the planner runs 7.5x the windows, P4 inner 17405 vs 2311; outputs byte-identical). --gpus A,B runs
-   the passes at once, one per GPU; otherwise both on --gpu, one after the other. Then every store of pass a (the single output, or each
+   the passes at once, one per GPU; with --split (one window over both GPUs) the passes keep --split / --gpus and run one after the other;
+   otherwise both on --gpu, one after the other. Then every store of pass a (the single output, or each
    --heads store <out>/<name>) is blended with its pass-b twin (src/inkblend.c ink_blend_run) into <out>[/<name>] with the run's --q,
    --levels and --shard. A pass with <out>/.seam/<p>/.done is not rerun (resume after a blend failure); .seam is removed at the end
    (UFSM_SEAM_KEEP=1 keeps it). */
@@ -47,9 +48,27 @@ static int is_file(const char *p) { struct stat sb; return !stat(p, &sb) && S_IS
 
 /* the options a pass sets itself (each takes a value) */
 static const char *const own[] = {"--seamless", "--gpus", "--gpu", "--q", "--levels", "--full-grid", "--grid-origin", "--shard", "--window",
-                                  "--halo", "--resume", "--boxes", nullptr};
-static int owned(const char *a) { for (int k = 0; own[k]; k++) if (!strcmp(a, own[k])) return 1; return 0; }
+                                  "--halo", "--resume", "--boxes", "--box", nullptr};
+static int g_split;   /* --split z --gpus A,B: every window split over both GPUs; the passes keep --split / --gpus and run one after the other */
+static int owned(const char *a) {
+    if (g_split && (!strcmp(a, "--gpus") || !strcmp(a, "--gpu"))) return 0;
+    for (int k = 0; own[k]; k++) if (!strcmp(a, own[k])) return 1;
+    return 0;
+}
 
+/* the box of a pass (in --level voxels): its origin moved down onto the pass's tile grid (origin = shift mod S), else predict's planner
+   places one window per shard instead of per tile (stride check against --grid-origin): 1667 box at shard 256, 3305 windows vs 578. A
+   pass-b origin that would fall below 0 starts at shift instead (the voxels below shift come from pass a alone: ink_blend_run gives an
+   absent shard weight 0) */
+static long long g_lo[3], g_hi[3];
+static char *pass_box(int S, int shift) {
+    long long o[3], n[3];
+    for (int d = 0; d < 3; d++) {
+        long long lo = g_lo[d] - shift; lo = (lo >= 0 ? lo / S : -((-lo + S - 1) / S)) * S + shift; if (lo < 0) lo = shift;
+        o[d] = lo; n[d] = g_hi[d] > lo ? g_hi[d] - lo : 1;
+    }
+    char b[160]; snprintf(b, sizeof b, "%lld,%lld,%lld,%lld,%lld,%lld", o[0], o[1], o[2], n[0], n[1], n[2]); return strdup(b);
+}
 static pid_t spawn_pass(int argc, char **argv, const char *pout, int W, int H, int S2, int shift, int gpu, const char *logp) {
     char **v = calloc((size_t)argc + 32, sizeof *v); int n = 0;
     static char sw[16], sh[16], ss[16], sg[48], sgpu[16];
@@ -57,8 +76,9 @@ static pid_t spawn_pass(int argc, char **argv, const char *pout, int W, int H, i
     char *bg = strdup((snprintf(sg, sizeof sg, "%d,%d,%d", shift, shift, shift), sg)), *bu = strdup((snprintf(sgpu, sizeof sgpu, "%d", gpu), sgpu));
     for (int i = 0; i < 6 && i < argc; i++) v[n++] = i == 5 ? (char *)pout : argv[i];
     for (int i = 6; i < argc; i++) { if (owned(argv[i]) && i + 1 < argc) { i++; continue; } v[n++] = argv[i]; }
-    const char *add[] = {"--window", bw, "--halo", bh, "--shard", bs, "--grid-origin", bg, "--gpu", bu, "--full-grid", "1", "--q", "0", "--levels", "1"};
-    for (size_t k = 0; k < sizeof add / sizeof *add; k++) v[n++] = (char *)add[k];
+    char *bb = pass_box(2 * S2, shift);
+    const char *add[] = {"--box", bb, "--window", bw, "--halo", bh, "--shard", bs, "--grid-origin", bg, "--full-grid", "1", "--q", "0", "--levels", "1", "--gpu", bu};
+    for (size_t k = 0; k < sizeof add / sizeof *add - (g_split ? 2 : 0); k++) v[n++] = (char *)add[k];
     v[n] = nullptr;
     posix_spawn_file_actions_t fa; posix_spawn_file_actions_init(&fa);
     if (logp) { posix_spawn_file_actions_addopen(&fa, 2, logp, O_WRONLY | O_CREAT | O_TRUNC, 0644); posix_spawn_file_actions_adddup2(&fa, 2, 1); }
@@ -97,14 +117,19 @@ int predict_seamless(int argc, char **argv) {
     const int mode = atoi(sopt(argc, argv, "--seamless", "0"));
     if (mode != 2) { fprintf(stderr, "predict --seamless: 2 (two passes on half-tile-shifted grids, sin^2 blend) is the one mode\n"); return 2; }
     if (argc < 6) { fprintf(stderr, "predict --seamless: needs the positional arguments (ufsm predict CKPT ROOT KEY OUT ...)\n"); return 2; }
-    if (*sopt(argc, argv, "--boxes", "") || *sopt(argc, argv, "--fit-zarr", "") || *sopt(argc, argv, "--split", "") || *sopt(argc, argv, "--feather", "")) {
-        fprintf(stderr, "predict --seamless: not with --boxes, --fit-zarr, --split or --feather\n"); return 2; }
+    if (*sopt(argc, argv, "--boxes", "") || *sopt(argc, argv, "--fit-zarr", "") || *sopt(argc, argv, "--feather", "")) {
+        fprintf(stderr, "predict --seamless: not with --boxes, --fit-zarr or --feather\n"); return 2; }
+    g_split = *sopt(argc, argv, "--split", "") != 0;
+    { const char *b = sopt(argc, argv, "--box", nullptr); long long v[6];
+      if (b && sscanf(b, "%lld,%lld,%lld,%lld,%lld,%lld", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) == 6) for (int d = 0; d < 3; d++) { g_lo[d] = v[d]; g_hi[d] = v[d] + v[3 + d]; }
+      else if (b) { fprintf(stderr, "predict --seamless: --box z,y,x,nz,ny,nx\n"); return 2; }
+      else for (int d = 0; d < 3; d++) { g_lo[d] = 0; g_hi[d] = 1LL << 40; } }   /* (predict clips the box to the CT level) */
     const char *ws = sopt(argc, argv, "--window", ""), *hs = sopt(argc, argv, "--halo", "");
     const int W = *ws && strcmp(ws, "auto") ? atoi(ws) : 544, H = *hs ? atoi(hs) : 16, S = W - 2 * H, S2 = S / 2;
     if (H < 0 || S <= 0 || S % 256) { fprintf(stderr, "predict --seamless: window - 2 halo must be a positive multiple of 256 (window %d, halo %d)\n", W, H); return 2; }
     int ga = atoi(sopt(argc, argv, "--gpu", "0")), gb = ga, par = 0;
     const char *gl = sopt(argc, argv, "--gpus", nullptr);
-    if (gl) { if (sscanf(gl, "%d,%d", &ga, &gb) == 2 && ga != gb) par = 1; else if (sscanf(gl, "%d", &ga) == 1) gb = ga; }
+    if (gl && !g_split) { if (sscanf(gl, "%d,%d", &ga, &gb) == 2 && ga != gb) par = 1; else if (sscanf(gl, "%d", &ga) == 1) gb = ga; }
     const char *out = argv[5]; const double q = atof(sopt(argc, argv, "--q", "8")); const int nlev = atoi(sopt(argc, argv, "--levels", "4"));
     const int shard = atoi(sopt(argc, argv, "--shard", "512")), nt = atoi(sopt(argc, argv, "--threads", "8"));
     if (shard < 128 || shard % 128 || nlev < 1 || q < 0) { fprintf(stderr, "predict --seamless: --shard a multiple of 128, --levels >= 1, --q >= 0\n"); return 2; }
@@ -114,7 +139,7 @@ int predict_seamless(int argc, char **argv) {
     if (mkdir_p(tmp)) { fprintf(stderr, "predict --seamless: cannot create %s: %s\n", tmp, strerror(errno)); return 1; }
     setenv("UFSM_SEAM_CHILD", "1", 1);
     fprintf(stderr, "predict --seamless 2: window %d halo %d, tile %d, passes on grids 0 and %d (shards %d), %s; logs %s/{a,b}.log\n", W, H, S, S2, S2,
-            par ? "one per GPU at once" : "one after the other", tmp);
+            par ? "one per GPU at once" : g_split ? "one after the other, each window split (--split, --gpus kept)" : "one after the other", tmp);
     const int need_a = !is_file(da), need_b = !is_file(db); int rc = 0;
     if (need_a) rm_rf(pa);
     if (need_b) rm_rf(pb);

@@ -34,6 +34,11 @@ needs B ~ S / 2, i.e. windows ~2x as wide (8x the voxels).
 - every store of pass a (the single output, or each `--heads` store `<out>/<name>`, nested names like `fib/H` included) is blended with
   its pass-b twin by ink-blend's core (`ink_blend_run`, factored out of src/inkblend.c) into `<out>[/<name>]` with the run's --q,
   --levels and --shard; the store's attributes record `"seamless": {mode, window, halo, tile, grids}`;
+- each pass's --box is moved down onto its tile grid (origin = shift mod S): predict's planner places one window per tile only when
+  the box origin (rounded to shards) lies on the --grid-origin lattice, else one per shard (1667 labelled box at shard 256: 3305
+  windows instead of 578; the sequential --seamless run 774 s -> 256 s: pass a 516 windows 64 s, pass b 545 windows 77 s, the rest the
+  lossless writes, blend and pyramid). A pass-b origin below 0 starts at S / 2; the blend gives absent shards (that edge, occupancy
+  air skipped by one pass only) weight 0 instead of averaging in zeros;
 - a pass with `.seam/<p>/.done` is not rerun (resume after a blend failure); `.seam` is removed at the end (UFSM_SEAM_KEEP=1 keeps it).
   The pass logs are `.seam/{a,b}.log`.
 

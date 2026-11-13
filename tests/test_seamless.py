@@ -14,7 +14,7 @@ import json, os, pathlib, subprocess, sys
 a = sys.argv; out = pathlib.Path(a[5]); o = {a[i]: a[i + 1] for i in range(6, len(a) - 1) if a[i].startswith("--")}
 log = pathlib.Path(os.environ["SEAM_TEST_LOG"])
 with log.open("a") as f: f.write(json.dumps({"out": str(out), "opts": o, "rest": a[1:6]}) + "\n")
-assert os.environ.get("UFSM_SEAM_CHILD") == "1" and "--seamless" not in a and "--gpus" not in a
+assert os.environ.get("UFSM_SEAM_CHILD") == "1" and "--seamless" not in a and ("--gpus" not in a or "--split" in a)
 val = 100 if o["--grid-origin"] == "0,0,0" else 200
 t = out.parent / ("raw_" + out.name); lv = t / "src.zarr" / "0"; lv.mkdir(parents=True, exist_ok=True)
 lv.joinpath(".zarray").write_text(json.dumps({"shape": [%d] * 3, "chunks": [%d] * 3, "dtype": "|u1", "fill_value": 0, "order": "C",
@@ -60,6 +60,13 @@ with tempfile.TemporaryDirectory(prefix="ufsm-seam-", delete=not os.environ.get(
         assert (out / head / "19.2").exists() or any(p.name.startswith("19.2") for p in (out / head).iterdir()), list((out / head).iterdir())
         meta = json.loads((out / head / "9.6" / "zarr.json").read_text())
         assert meta["attributes"]["ufsm"]["seamless"]["tile"] == S, meta["attributes"]
+    # --split z --gpus 0,1 (one window over both GPUs): the passes keep --split / --gpus, get no --gpu, run one after the other
+    (t / "argv.log").unlink(); out2 = t / "out2"
+    rc, txt = run(env, BIN, "predict", "ck.ckpt", "root", "key", out2, "--heads", "ink", "--seamless", "2", "--window", W, "--halo", H,
+                  "--split", "z", "--gpus", "0,1", "--q", "0", "--levels", "1", "--shard", "128", "--threads", "2")
+    assert rc == 0 and "each window split" in txt, txt
+    calls = [json.loads(l) for l in (t / "argv.log").read_text().splitlines()]
+    assert len(calls) == 2 and all(c["opts"].get("--split") == "z" and c["opts"].get("--gpus") == "0,1" and "--gpu" not in c["opts"] for c in calls), calls
     # bad tile: window - 2 halo not a multiple of 256
     rc, txt = run(env, BIN, "predict", "ck.ckpt", "root", "key", t / "bad", "--heads", "ink", "--seamless", "2", "--window", 300, "--halo", 8)
     assert rc == 2 and "multiple of 256" in txt, txt
