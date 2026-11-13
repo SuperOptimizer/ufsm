@@ -217,6 +217,18 @@ static void tc(void) {   /* fp16 tensor-core Newton-Schulz vs the fp32 path: 3 M
         CHECK(e < 1e-2, "tc %d", i); free(x); free(y); free(r);
     }
     batch_free(&a); batch_free(&b);
+    for (int m = 2; m <= 2; m++) {   /* cuBLASLt Newton-Schulz: TF32 tensor cores vs fp32 */
+        batch_new(&a); batch_new(&b);
+        for (int i = 0; i < N; i++) { const size_t nw = (size_t)CO[i] * KK[i]; nn_zero(a.h[i].p, nw * 4); nn_zero(b.h[i].p, nw * 4); }
+        for (int s = 0; s < 3; s++) { set_g(&a, &b, 700 + s); nn_muon_batch(a.dd, N, a.maxco, a.maxk, 0.02f, 0.95f, 0.f); nn_muon_tc(m); nn_muon_batch(b.dd, N, b.maxco, b.maxk, 0.02f, 0.95f, 0.f); nn_muon_tc(0); }
+        for (int i = 0; i < N; i++) {
+            const size_t nw = (size_t)CO[i] * KK[i]; float *x = malloc(nw * 4), *y = malloc(nw * 4); double *r = malloc(nw * 8);
+            nn_d2h(x, a.h[i].p, nw * 4); nn_d2h(y, b.h[i].p, nw * 4); for (size_t j = 0; j < nw; j++) r[j] = x[j];
+            const double e = rel(y, r, nw); printf("  muon-tc %d %3d x %4d: cuBLASLt %s vs fp32, 3 steps: %.2e\n", m, CO[i], KK[i], "TF32", e);
+            CHECK(e < 1e-2, "tc%d %d", m, i); free(x); free(y); free(r);
+        }
+        batch_free(&a); batch_free(&b);
+    }
 }
 static void kron(void) {
     enum { NC = 2 }; const int Co[NC] = {12, 24}, Ci[NC] = {20, 8}; const float eps = 1e-3f, b2 = 0.9f;

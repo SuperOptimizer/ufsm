@@ -168,6 +168,13 @@ void unet_set_muon_variant(unet *u, int ns_mode, int normuon, float b2);
 void unet_set_muon_vr(unet *u, float gamma);
 void unet_set_muon_cautious(unet *u, int on);
 void unet_set_muon_qkv_split(unet *u, int on);
+/* QK-clip (attention nets): unet_qk_clip after each optimizer step scales the QK-norm gains of every head whose max logit in the step's
+   training forwards exceeded tau (tau 0: record only); unet_qk_lmax: the largest logit since its last call (-1: none recorded) */
+void unet_qk_clip(unet *u, float tau);
+float unet_qk_lmax(unet *u);
+/* multi-GPU: the per-head maxima (tbn x H floats) to / from the host, so every replica clips by the max over all GPUs; get returns the count */
+int unet_qk_get(const unet *u, float *h);
+void unet_qk_put(unet *u, const float *h);
 void unet_set_rest_sign(unet *u, int on, float mult);   /* --opt-rest sign: biases / norms / head on sign momentum (Scion ell-inf) instead of AdamW */   /* --muon-qkv-split 1: the attention q / k / v projections orthogonalised per head (before the first step) */
 /* --muon-ademamix A: AdEMAMix slow EMA (b3) added to Muon's Nesterov momentum, alpha ramped 0 -> A over T optimizer steps */
 void unet_set_muon_ademamix(unet *u, float alpha, float b3, int T);   /* --muon-cautious 1: sign-agreement mask on Muon's direction, norm kept */

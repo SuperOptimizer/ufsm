@@ -535,6 +535,16 @@ __global__ void k_vr_bwd(float *dqkv, const float *v1, const float *own, float *
 }
 
 /* ---- one block ---- */
+/* QK-clip (MuonClip, Kimi K2 2025, adapted to QK-norm): with RMS-normalised q / k the projections' scale cancels, so the logit scale
+   lives in the gains alone. Head h whose recorded max logit lmax[h] exceeds tau gets qg, kg x sqrt(tau / lmax) (the logit max -> tau).
+   last[0] = max(last, lmax); lmax zeroed for the next step. grid H, block 48 */
+__global__ void k_qk_clip(float *qg, float *kg, float *lmax, int H, float tau, float *last) {
+    const int h = blockIdx.x, d = threadIdx.x; const float l = lmax[h];
+    if (tau > 0.f && l > tau) { const float s = sqrtf(tau / l); qg[h * HD + d] *= s; kg[h * HD + d] *= s; }
+    __syncthreads();
+    if (!d) { atomicMax((unsigned *)last, __float_as_uint(l)); lmax[h] = 0.f; }
+}
+extern "C" void at_qk_clip(float *qg, float *kg, float *lmax, int H, float tau, float *last) { k_qk_clip<<<H, HD>>>(qg, kg, lmax, H, tau, last); }
 #define CK(x) do { if (x) return -1; } while (0)
 /* the attention's geometry: the grid's, or (radial attention) the rays' (nseq rays of Nr slots, their lengths, scroll RoPE positions) */
 static const at_geom *att_geom(const at_dims *d, const at_geom *g, at_geom *gr) {

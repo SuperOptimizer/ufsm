@@ -12,12 +12,12 @@ int main(int argc, char **argv) {
     const int steps = argc > 1 ? atoi(argv[1]) : 20;
     if (nn_init(0)) return 1;
     unet_cfg cfg = {6, {256, 320, 384, 448, 288, 288}, 4, 2, 8, 1}; cfg.attn_blocks = 4; cfg.attn_pe = 3;
-    enum { NV = 10 };
+    enum { NV = 11 };
     const char *name[NV] = {"muon (fp32 NS)", "muon --muon-tc 1", "--muon-ns polar", "--normuon 1", "--muon-vr 0.025", "--muon-kron 1", "--muon-c 1",
-                            "--muon-cautious 1", "--muon-ademamix 5", "kron + tc"};
+                            "--muon-cautious 1", "--muon-ademamix 5", "kron + tc", "muon --muon-tc 2 (TF32)"};
     for (int v = 0; v < NV; v++) {
         unet *u = unet_create(&cfg); unet_init(u, 1);
-        nn_muon_tc(v == 1 || v == 9);
+        nn_muon_tc(v == 10 ? 2 : v == 1 || v == 9);
         unet_set_muon_ext(u, v == 6, 0, 0.70710678f);
         unet_set_muon_variant(u, v == 2, v == 3, 0.95f);
         unet_set_muon_vr(u, v == 4 ? 0.025f : 0.f);

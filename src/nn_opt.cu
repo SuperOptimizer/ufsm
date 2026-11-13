@@ -148,7 +148,58 @@ template <int MODE> __global__ void __launch_bounds__(128) gemm_ns_tc_k(const mu
         else (swap ? D.X : D.Y)[(size_t)m * K + n] = b * X[(size_t)m * K + n] + a;
     }
 }
+/* cuBLASLt Newton-Schulz (train --muon-tc 2: TF32 tensor cores; fp32 buffers and accumulation. CUBLAS_COMPUTE_32F_FAST_16BF failed on the 92 M net's shapes). One GEMM
+   per product and matrix (3 x 5 per matrix), column-major view of the row-major X (Co x K) as Xc (K x Co):
+   A = Xc^T Xc, B = c A A + b A, Yc = Xc B + a Xc (B symmetric). The same products as gemm_ns_k, on the library's tuned kernels: the
+   hand-tiled fp32 kernels reach ~10% of the card's fp32 rate on the 92 M net (121 ms per step) and the wmma fp16 ones are slower still */
+#include <cublasLt.h>
+typedef struct { int dev, m, n, k, ta, tc, ok; cublasLtMatmulDesc_t op; cublasLtMatrixLayout_t a, b, c; cublasLtMatmulAlgo_t algo; } nsplan;
+static nsplan g_nsp[512]; static int g_nnsp;
+static cublasLtHandle_t g_nslt[16]; static void *g_nsws[16]; static const size_t NSWS = 32u << 20;
+static nsplan *nsplan_get(int dev, int ta, int m, int n, int k, int tc) {
+    for (int i = 0; i < g_nnsp; i++) { nsplan *p = &g_nsp[i]; if (p->dev == dev && p->m == m && p->n == n && p->k == k && p->ta == ta && p->tc == tc) return p; }
+    if (g_nnsp == 512 || dev < 0 || dev >= 16) return nullptr;
+    if (!g_nslt[dev]) { if (cublasLtCreate(&g_nslt[dev]) != CUBLAS_STATUS_SUCCESS || cudaMalloc(&g_nsws[dev], NSWS) != cudaSuccess) return nullptr; }
+    nsplan *p = &g_nsp[g_nnsp++]; memset(p, 0, sizeof *p); p->dev = dev; p->m = m; p->n = n; p->k = k; p->ta = ta; p->tc = tc;
+    cublasLtMatmulDescCreate(&p->op, CUBLAS_COMPUTE_32F_FAST_TF32, CUDA_R_32F);
+    const cublasOperation_t oa = ta ? CUBLAS_OP_T : CUBLAS_OP_N;
+    cublasLtMatmulDescSetAttribute(p->op, CUBLASLT_MATMUL_DESC_TRANSA, &oa, sizeof oa);
+    if (ta) cublasLtMatrixLayoutCreate(&p->a, CUDA_R_32F, k, m, k); else cublasLtMatrixLayoutCreate(&p->a, CUDA_R_32F, m, k, m);
+    cublasLtMatrixLayoutCreate(&p->b, CUDA_R_32F, k, n, k); cublasLtMatrixLayoutCreate(&p->c, CUDA_R_32F, m, n, m);
+    cublasLtMatmulPreference_t pref; cublasLtMatmulPreferenceCreate(&pref);
+    cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &NSWS, sizeof NSWS);
+    cublasLtMatmulHeuristicResult_t h; int nh = 0;
+    if (cublasLtMatmulAlgoGetHeuristic(g_nslt[dev], p->op, p->a, p->b, p->c, p->c, pref, 1, &h, &nh) == CUBLAS_STATUS_SUCCESS && nh > 0) { p->algo = h.algo; p->ok = 1; }
+    cublasLtMatmulPreferenceDestroy(pref);
+    if (!p->ok) fprintf(stderr, "muon-tc %d: no cuBLASLt algorithm for m %d n %d k %d ta %d\n", tc, m, n, k, ta);
+    return p;
+}
+/* column-major D (m x n) = alpha op(A) B + beta C (C may be D's input only when distinct; here C is never D) */
+static int ns_gemm(int dev, int tc, int ta, int m, int n, int k, const float *A, const float *B, float alpha, float beta, const float *C, float *D) {
+    nsplan *p = nsplan_get(dev, ta, m, n, k, tc); if (!p || !p->ok) return -1;
+    return cublasLtMatmul(g_nslt[dev], p->op, &alpha, A, p->a, B, p->b, &beta, C, p->c, D, p->c, &p->algo, g_nsws[dev], NSWS, 0) == CUBLAS_STATUS_SUCCESS ? 0 : -1;
+}
+static int ns5_lt(const muon_desc_t *d, int nconv, int mode) {
+    static const void *hk[16]; static int hn[16]; static muon_desc_t *hd[16];   /* the table's host copy per device (built once, pointers stable) */
+    int dev = 0; cudaGetDevice(&dev); if (dev < 0 || dev >= 16) return -1;
+    if (hk[dev] != d || hn[dev] != nconv) { free(hd[dev]); hd[dev] = (muon_desc_t *)malloc(sizeof(muon_desc_t) * (size_t)nconv);
+        cudaMemcpy(hd[dev], d, sizeof(muon_desc_t) * (size_t)nconv, cudaMemcpyDeviceToHost); hk[dev] = d; hn[dev] = nconv; }
+    int e = 0;
+    for (int i = 0; i < nconv; i++) {
+        const muon_desc_t D = hd[dev][i]; float *X = D.X, *Y = D.Y;
+        for (int it = 0; it < 5; it++) {
+            const float a = g_ns_maps[mode][it][0], b = g_ns_maps[mode][it][1], c = g_ns_maps[mode][it][2];
+            e |= ns_gemm(dev, g_ns_tc, 1, D.Co, D.Co, D.K, X, X, 1.f, 0.f, D.A, D.A);
+            e |= ns_gemm(dev, g_ns_tc, 0, D.Co, D.Co, D.Co, D.A, D.A, c, b, D.A, D.B);
+            e |= ns_gemm(dev, g_ns_tc, 0, D.K, D.Co, D.Co, X, D.B, 1.f, a, X, Y);
+            float *t = X; X = Y; Y = t;
+        }
+    }
+    if (e) { fprintf(stderr, "muon-tc %d: cuBLASLt Newton-Schulz failed\n", g_ns_tc); abort(); }
+    return 1;   /* 5 iterations: the result in Y */
+}
 static int ns5_batch(const muon_desc_t *d, int nconv, int maxco, int maxk, int mode = 0) {
+    if (g_ns_tc >= 2) return ns5_lt(d, nconv, mode);
     if (g_ns_tc) {
         dim3 gco(nblk(maxco, 64), nblk(maxco, 64), nconv), gk(nblk(maxk, 64), nblk(maxco, 64), nconv); int swap = 0;
         for (int it = 0; it < 5; it++) {
