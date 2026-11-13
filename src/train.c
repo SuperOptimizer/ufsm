@@ -3007,7 +3007,8 @@ int cmd_train(int argc, char **argv) {
     g_fstem = atoi(opt(argc, argv, "--fstem", "0")); g_fs_drop = (float)atof(opt(argc, argv, "--fstem-drop", "0.25"));
     if (g_fstem) {
         if (g_fstem < 1 || g_fstem > 16 || !(g_fs_drop >= 0 && g_fs_drop < 1) || !g_lat || g_lat_guide != 64 || !g_unwrap2 || B != 1) { fprintf(stderr, "--fstem 1..16 (--fstem-drop 0..1): task unwrap2, --lat 4 --lat-guide 3, --B 1\n"); return 2; }
-        g_fs_n = 0; for (int c = 0; c < g_cout; c++) if (c < g_norm_ch || c >= g_norm_ch + 7) g_fs_ch[g_fs_n++] = c;   /* (every voxel-logit output: not the fused normal / density) */
+        g_fs_n = 0; for (int c = 0; c < g_cout; c++) if ((c < g_norm_ch || c >= g_norm_ch + 7) && (g_pad_ch < 0 || c < g_pad_ch)) g_fs_ch[g_fs_n++] = c;   /* (every voxel-logit output: not the fused
+                                                         normal / density, not the unsupervised pad channels of a head past 16 outputs: with --fib-head the 16 of phase, wind4, ink, rv, fibre) */
         if (g_fs_n > 16) { fprintf(stderr, "--fstem: %d outputs (16 at most)\n", g_fs_n); return 2; }
         cfg.fstem = g_fstem; cfg.fstem_out = g_fs_n;
         fprintf(stderr, "fine stem: %d silu features of 4^3 voxels at stride 2 into %d head outputs, dropped on %.0f%% of the training windows\n", g_fstem, g_fs_n, 100 * g_fs_drop);
