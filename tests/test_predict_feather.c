@@ -59,7 +59,7 @@ int main(int argc, char **argv) {
     { const int64_t sh[3] = {N, N, N}; const double um = 1; char p[512]; uint8_t *d = malloc((size_t)N * N * N);
       for (size_t i = 0; i < (size_t)N * N * N; i++) {   /* structure + noise: material everywhere */
           const int z = (int)(i / (N * N)), y = (int)(i / N % N), x = (int)(i % N);
-          d[i] = (uint8_t)(20 + 0.5 * z + 0.2 * y + 30 * sin(0.11 * x + 0.07 * y) * cos(0.05 * z) * (1 + (x > 140)) + (int)((i * 2654435761u) >> 28));   /* (ramps + a contrast step: per-window statistics differ) */
+          d[i] = (uint8_t)(int64_t)(20 + 0.5 * z + 0.2 * y + 30 * sin(0.11 * x + 0.07 * y) * cos(0.05 * z) * (1 + (x > 140)) + (int)((i * 2654435761u) >> 28));   /* (ramps + a contrast step: per-window statistics differ; via int64_t: wraps mod 256 as gcc did, a direct out-of-range double -> uint8_t is UB and clang saturated) */
       }
       snprintf(p, sizeof p, "%s/ct/1", dir); z3w *w = z3w_create(p, sh, 128, 0, 0, nullptr);
       int bad = !w;
