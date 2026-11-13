@@ -146,7 +146,8 @@ typedef struct {
     int ink_bits;            /* --rv ink plane as batch.inkb (1 bit per voxel) + ct8 instead of batch.ink (host RAM: 7/8 B per voxel per slot);
                                 sampler_start drops it (0) unless --gpu-aug 2 cubes with the rv cutoff and no seam op / packed plane / sheet */
     int slot_skip;           /* batch planes the trainer never reads, not allocated nor filled (host RAM: 1 byte per window voxel per slot each):
-                                1 batch.tm (train: g_tm_unused, the unwrap2 head slabs), 2 batch.pm (unwrap2 without --pap-head) */
+                                1 batch.tm (train: g_tm_unused, the unwrap2 head slabs), 2 batch.pm (unwrap2 without --pap-head),
+                                4 batch.t / batch.m (the unpacked targets, g_tm_unused without --pack-targets: --split; sample.c sample_tm_unused) */
     int wind4;               /* train --task unwrap2 (side 2, stored phase): batch.w4 / wcomp, the relative winding mod 4 of each window
                                 (src/band.h band_wind4: the stored phase unwrapped over the window before the air test, its components
                                 kept as separate gauges); warped samples pull it through the warp within one component */

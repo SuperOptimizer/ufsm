@@ -242,6 +242,12 @@ static _Atomic size_t g_slot_bytes;   /* pinned (or malloc'd) batch slot bytes, 
 static int nopin(void) { static int v = -1; if (v < 0) { const char *e = getenv("UFSM_SAMPLER_NOPIN"); v = e && atoi(e); } return v; }
 static void *halloc(size_t n) { atomic_fetch_add(&g_slot_bytes, n); if (nopin()) { void *p = malloc(n ? n : 1); if (!p) abort(); memset(p, 0, n); return p; } return nn_host_alloc(n); }   /* (memset: faulted in like the pinned slots, so CPU-only benchmarks see no first-touch faults) */
 static void hfree(void *p) { if (nopin()) free(p); else nn_host_free(p); }
+/* slot_skip 4: the unpacked targets t (NCH x P^3) and loss mask m (P^3) neither allocated nor written: train sets it where the trainer
+   never reads them (g_tm_unused without --pack-targets, e.g. --lat 4 --split z: 3 B per voxel per slot, 3.2 GB at P 1024), and only for
+   the configurations where nothing else in the sampler reads them back (no sheet prior, papyrus task, task restore, pmask copy) */
+static int sample_tm_unused(const sample_cfg *c) {
+    return (c->slot_skip & 4) && !c->pack_tm && !c->restore && !c->sheet && !c->papyrus && !(c->pmask && !(c->slot_skip & 2)) && c->gpu_input;
+}
 static batch alloc_batch(const sample_cfg *c) {
     size_t p3 = (size_t)PZ(c) * c->P * c->P;
     batch b;
@@ -256,8 +262,9 @@ static batch alloc_batch(const sample_cfg *c) {
     b.x16 = c->xfmt && !c->restore && !c->gpu_aug ? halloc((size_t)c->B * xc * p3 * 2) : nullptr;   /* (--gpu-aug: the device builds the CT channel) */
     b.ct8 = c->gpu_aug ? halloc((size_t)c->B * p3) : nullptr; b.aug = c->gpu_aug ? halloc((size_t)c->B * sizeof(scan_ct_rec)) : nullptr;
     if (b.aug) memset(b.aug, 0, (size_t)c->B * sizeof(scan_ct_rec));   /* (the records' padding is never written: zero, so equal batches hash equal) */
-    b.t = c->pack_tm ? nullptr : halloc((size_t)c->B * (c->restore == 1 ? 1 : NCH) * p3);   /* (task restore: the clean CT alone; real pairs: target + input crop) */
-    b.m = c->pack_tm || c->restore ? nullptr : halloc((size_t)c->B * p3);
+    const int tmu = sample_tm_unused(c);   /* (slot_skip 4: the unpacked targets and mask are never read) */
+    b.t = c->pack_tm || tmu ? nullptr : halloc((size_t)c->B * (c->restore == 1 ? 1 : NCH) * p3);   /* (task restore: the clean CT alone; real pairs: target + input crop) */
+    b.m = c->pack_tm || c->restore || tmu ? nullptr : halloc((size_t)c->B * p3);
     b.tm = c->pack_tm && !(c->slot_skip & 1) ? halloc((size_t)c->B * p3) : nullptr;   /* one code byte per voxel instead of NCH + 1 */
     b.w = halloc((size_t)c->B * NCH);
     b.src = malloc((size_t)c->B * sizeof(int16_t));
@@ -3011,7 +3018,8 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
     PROF_MARK(PS_ZSCORE);
     /* packed targets (cfg.pack_tm): unwarped samples pack the code in the source frame over the mask (one symmetry copy into the batch);
        warped ones warp into pooled scratch and pack after */
-    uint8_t *T = c->pack_tm ? nullptr : b->t + (size_t)i * NCH * p3, *M = c->pack_tm ? nullptr : b->m + (size_t)i * p3;
+    const int tmu = sample_tm_unused(c);   /* (slot_skip 4: no t / m planes; their symmetry copy and host warp skipped, the warp's noise draws kept) */
+    uint8_t *T = c->pack_tm || tmu ? nullptr : b->t + (size_t)i * NCH * p3, *M = c->pack_tm || tmu ? nullptr : b->m + (size_t)i * p3;
     sym y = sym_of(0);
     float ia = 1.f, ib = 0.f, isg = 0.f;
     if (c->augment) {
@@ -3095,7 +3103,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
         }
         if (b->tm) sym_u8(mask, b->tm + (size_t)i * p3, Pz, P, y);
         }
-    } else if (!spatial.active) {
+    } else if (!spatial.active && !tmu) {
         for (int ch = 0; ch < NCH; ch++) sym_u8(ttmp + (size_t)ch * p3, T + (size_t)ch * p3, Pz, P, y);
         sym_u8(mask, M, Pz, P, y);
     }
@@ -3268,7 +3276,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
         params=malloc((size_t)P*sizeof *params);
         for (int sz=0;sz<P;sz++) sheet_parameters(c->sheet,o[0]+sz,params[sz]);
     }
-    if (lw) rskip(r, (uint64_t)Pz * P * (uint64_t)(P / 4 + P % 4));   /* (write_spatial_tm's noise draws) */
+    if (lw || (tmu && spatial.active)) rskip(r, (uint64_t)Pz * P * (uint64_t)(P / 4 + P % 4));   /* (write_spatial_tm's noise draws; tmu: with --gpu-input it writes T / M only) */
     else if (spatial.active) write_spatial_tm(ctu,ttmp,mask,T,M,P,o,(float)mean,(float)(1.0/sd),s->ax.n>0,cyz,cxz,y,&spatial,
             ia,ib,isg,r,nrow,c->xfmt,X,H,app,noise_state,noise_state?noise_state+P:nullptr,c->sheet,params,(float *)(big+p3),c->pack_tm,c->gpu_input,TMd);
     else if (c->sheet || (app && Pz != P)) write_x_aug(ctu, P, o, (float)mean, (float)(1.0 / sd), s->ax.n > 0, cyz, cxz, y, c->augment != 0, ia, ib, isg, r, nrow, c->xfmt,

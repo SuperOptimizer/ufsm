@@ -611,6 +611,10 @@ static void restore_upload(gpu_state *d, const batch *b, int i, int B, int P, in
 /* --gpu-aug 2 with --task unwrap(2): the papyrus mask of a warped window is its warped packed mask bit, written by the targets' warp (lab_upload
    kind 0's db); the batch's pm planes then go with the packed targets */
 static int lw_pm(const batch *b) { return g_unwrap && g_pack && g_gpu_aug == 2 && b->ct8; }
+/* slot_skip 4 (sample.c sample_tm_unused): the unpacked targets / mask t, m dropped from the slots where the trainer never reads them, g_tm_unused
+   without --pack-targets: --split turns the packing off, and the --lat split never uploads them (upload_slab, the non-latent split, does);
+   UFSM_TM_SKIP4=0 keeps them (3 B per voxel per slot, 3.2 GB at P 1024) */
+static int tm_slot_skip4(int split) { return !g_pack && (!split || g_lsplit) && (!getenv("UFSM_TM_SKIP4") || ufsm_env_on("UFSM_TM_SKIP4")); }
 static int pm_used(void) { return g_unwrap && (!g_unwrap2 || g_pap_head); }
 /* one label kind of a batch (nn_label_warp's: 0 packed targets / mask, 1 phase, 2 winding mod 4 + component) into da (db): --gpu-aug 2
    batches (batch.ct8) carry source-grid labels for windows with a warped radial record, warped on the device (rad: the records' device
@@ -3188,7 +3192,7 @@ int cmd_train(int argc, char **argv) {
         if (so && atoi(so) > 0) {
             train_unread_flags(argc, argv);
             setenv("UFSM_SAMPLER_NOPIN", "1", 1); gpu_input_settle(&sc, 1);
-            sc.slot_skip = g_unwrap2 && B == 1 && !g_ds && !ufsm_env_on("UFSM_TM_KEEP") ? 1 | (!pm_used() ? 2 : 0) : 0;
+            sc.slot_skip = g_unwrap2 && B == 1 && !g_ds && !ufsm_env_on("UFSM_TM_KEEP") ? 1 | (!pm_used() ? 2 : 0) | (tm_slot_skip4(split) ? 4 : 0) : 0;
             sc.ink_bits = g_rv && !g_lsplit && (!getenv("UFSM_INK_BITS") || ufsm_env_on("UFSM_INK_BITS"));
             sc.w4_runs = sc.w4_dev && (!getenv("UFSM_W4_RUNS") || ufsm_env_on("UFSM_W4_RUNS"));
             sc.replay = atoi(opt(argc, argv, "--replay", "1")); sc.replay_gap = atoi(opt(argc, argv, "--replay-gap", "0"));
@@ -4128,7 +4132,7 @@ int cmd_train(int argc, char **argv) {
                 "slower ones and workers without a free slot idle; ~1.5 slots per worker + %d keep them drawing (fewer workers and more slots "
                 "beat more workers: each idle worker holds ~16 P^3 bytes of scratch, a slot %.2f GB)\n", sc.nbuf, workers, 2 * ng + 2,
                 (double)B * g_Pz * P * P * ((size_t)g_xs * xbytes() + (g_pack ? 1 : NCH + 1) + (g_side != 0) + 2 * (g_unwrap2 != 0) + g_naux) / 1e9);
-    sc.slot_skip = g_tm_unused ? 1 | (!pm_used() ? 2 : 0) : 0;   /* (after the validation config's copy: its stored batches keep every plane) */
+    sc.slot_skip = g_tm_unused ? 1 | (!pm_used() ? 2 : 0) | (tm_slot_skip4(split) ? 4 : 0) : 0;   /* (after the validation config's copy: its stored batches keep every plane) */
     sc.w4_runs = sc.w4_dev && (!getenv("UFSM_W4_RUNS") || ufsm_env_on("UFSM_W4_RUNS"));   /* --gpu-aug 3: the winding as runs, no w4 / wcomp slot planes (sampler_start may drop it) */
     sc.ink_bits = g_rv && !g_lsplit && (!getenv("UFSM_INK_BITS") || ufsm_env_on("UFSM_INK_BITS"));   /* --rv: the papyrus plane as 1 known bit per voxel + ct8, built on the device (lab_upload); sampler_start may drop it */
     sc.replay_gap = atoi(opt(argc, argv, "--replay-gap", "0"));   /* (0: the slot count) */
