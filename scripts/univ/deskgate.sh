@@ -12,7 +12,7 @@
 # it is gone: both cards are in use).
 set -u
 CK=$(readlink -f "${1:?ckpt}"); T=${2:?tag}; PART=${3:?w1|w2|base}
-H=$(cd "$(dirname "$0")/../.." && pwd); WB=/vesuvius/ufsm/wbench; LB=${LB:-/vesuvius/ufsm/v2/lat/latres}
+H=${H:-$(cd "$(dirname "$0")/../.." && pwd)}; WB=/vesuvius/ufsm/wbench; LB=${LB:-/vesuvius/ufsm/v2/lat/latres}
 UP=${UP:-/home/forrest/ufsm-eval6b7/build/ufsm}; M=https://dl.ash2txt.org/community-uploads/forrest/volcomp
 P4K=PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr; WINMIN=${WINMIN:-45}; GPUS=${GPUS:-0 1}
 Q=$LB/gate-$T-$PART.q; MC=""; [ -x ~/bin/memcap ] && MC="$HOME/bin/memcap -m 24G"; LG=$LB/gate-$T.log; EQB=${EQB:-139-1 139-2 814-1 814-2}
@@ -40,6 +40,7 @@ case $PART in
         esac; done; done;;
   *) echo "deskgate: PART w1 | w2 | base"; exit 2;;
 esac
+[ -n "${EXTRA:-}" ] && [ -s $EXTRA ] && cat $EXTRA >> $Q   # EXTRA: job lines run after the gate's (NAME|ENV|sh CMD...: CMD with GPU=g)
 [ "${DRY:-0}" = 1 ] && { cat $Q; rm -f $Q; exit 0; }   # DRY=1: the job list only
 # the window: both cards free of the trainer (univA stops u1 for it)
 TRP=${TRP:-ufsm[^ ]* train .*sources-(u1|unified)}   # the desk trainer whose stop opens the window (u1, then the unified run)
@@ -67,10 +68,12 @@ worker() {   # worker GPU: take jobs until the queue is empty or the window ends
     case $kind in
       eq) eqtest $g;;
       rv) bash -c "env GPU=$g RVU=$UP WZARGS= WIN=640 $env TASKS=rv REFS= bash $H/scripts/univ/eval.sh $CK $T" >> $LB/gate-$T-rv.out 2>&1;;
+      sh\ *) bash -c "env GPU=$g $env ${kind#sh }" >> $LB/gate-$T-$nm.out 2>&1;;
       wb*) set -- $kind; bash -c "env $WBE GPU=$g $env $MC bash $H/scripts/wbench/wbench.sh $2 $3" >> $LB/gate-$T-$nm.out 2>&1;;
     esac; log "gpu $g: $nm done rc=$? in $(( $(date +%s) - t0 )) s"
   done; }
 for g in $GPUS; do worker $g & done; wait
 left=$(wc -l < $Q); log "window done: $left jobs not started$( [ $left -gt 0 ] && echo ': '$(cut -d'|' -f1 $Q | tr '\n' ' '))"
+[ -n "${FINAL:-}" ] && bash -c "$FINAL" >> $LG 2>&1   # FINAL: a CPU command once the queue is done (e.g. a table)
 rm -f $LB/gate.busy
 [ $PART = base ] || { TASKS=none REFS="${REFS:-wind96 lat-wz896-12000}" bash $H/scripts/univ/eval.sh $CK $T > /dev/null 2>&1; log "matrix -> $WB/univ/$T.matrix.txt"; }
