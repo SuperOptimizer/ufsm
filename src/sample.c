@@ -220,6 +220,7 @@ struct sampler {
     atomic_int stop, failed;
     atomic_uint_fast64_t produced, rejected;
     _Atomic uint32_t rej_sl[64][MAXLEV][SL_N];   /* per source (< 64) and level, by SL_* (sampler_level_stats) */
+    atomic_uint_fast64_t split_redraw, split_unwarp;   /* cfg.split_ns: warps redrawn for the staging bound / windows left unwarped */
     atomic_uint_fast64_t rej_why[4];   /* draws dropped: coarse CT probe, CT read (min_fg), empty targets, holdout overlap (not in rejected) */
     atomic_uint_fast64_t crushed;      /* --aug-crush windows drawn */
     atomic_uint_fast64_t augn[AUGN_N]; /* scroll augmentations applied (sampler_aug_count) */
@@ -760,6 +761,18 @@ static void rad_record(void *rec, const int64_t o[3], int D, int P, int hasax, s
     for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) { w[3 * i + j] = (float)a->R[i][j]; w[9 + 3 * i + j] = (float)a->A[i][j]; w[18 + 3 * i + j] = (float)a->Ainv[i][j]; }
     w[27] = (float)a->scale;
 }
+/* --split z: the most source planes either rank's output planes ([0, nz) / [P - nz, P)) read through the cube symmetry y and the warp a
+   (nn_aug_src_range on the window's record; the device staging of the z-range builders) */
+static int split_span(const spatial_aug *a, sym y, int P, int nz) {
+    static _Thread_local void *rec; static _Thread_local int recP; static _Thread_local float *zero;
+    if (recP < P) { free(rec); free(zero); rec = malloc(NN_RAD_REC(P)); zero = calloc((size_t)P, sizeof *zero); recP = P; if (!rec || !zero) abort(); }
+    const int64_t o[3] = {0, 0, 0};
+    rad_record(rec, o, P, P, 0, y, zero, zero, a);
+    int m = 0;
+    for (int k = 0; k < 2; k++) { int s0, s1; nn_aug_src_range(rec, P, k ? P - nz : 0, nz, &s0, &s1); if (s1 - s0 > m) m = s1 - s0; }
+    return m;
+}
+uint64_t sampler_split_redraws(const sampler *sp, uint64_t *unwarped) { if (unwarped) *unwarped = atomic_load(&sp->split_unwarp); return atomic_load(&sp->split_redraw); }
 /* the scroll-axis record (sample.h SAMPLE_AXR, unet.h UNET_AXR) of a window: the axis points (source z k, cyz[k], cxz[k]) through the
    inverse symmetry and the warp's forward map into window coordinates; the record's dim ad is the window dim the axis runs along most,
    its centres per window plane along ad interpolated (extrapolated past the ends) along that polyline */
@@ -3046,6 +3059,17 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
         else if (c->zoom_p > 0 && c->zoom_min > 0 && c->zoom_min < 1 && runif(r) < c->zoom_p) spatial_aug_zoom(&spatial, exp(runif(r) * log(c->zoom_min)));
         if (c->affine_p > 0 && c->scan.strength > 0 && runif(r) < c->affine_p)
             spatial_aug_affine(&spatial, rnext(r), c->affine_aniso * c->scan.strength, c->affine_shear * c->scan.strength);
+        for (int t = 0; spatial.active && c->split_ns > 0 && c->split_nz > 0 && c->split_nz < P && split_span(&spatial, y, P, c->split_nz) > c->split_ns; t++) {
+            /* --split z: the warp's source range of a rank's planes stays within the planner's staging (split_ns planes); else redraw
+               (the same distribution, conditioned on fitting), after 8 tries unwarped */
+            atomic_fetch_add(&sp->split_redraw, 1);
+            if (t == 8) { spatial.active = 0; atomic_fetch_add(&sp->split_unwarp, 1); break; }
+            spatial_aug_make(&spatial, rnext(r), P, c->rotate_degrees, c->rotate_p, c->elastic, c->elastic_p);   /* (the first draw's recipe) */
+            if (zoom_out > 0) spatial_aug_zoom(&spatial, .5 * zoom_out);
+            else if (c->zoom_p > 0 && c->zoom_min > 0 && c->zoom_min < 1 && runif(r) < c->zoom_p) spatial_aug_zoom(&spatial, exp(runif(r) * log(c->zoom_min)));
+            if (c->affine_p > 0 && c->scan.strength > 0 && runif(r) < c->affine_p)
+                spatial_aug_affine(&spatial, rnext(r), c->affine_aniso * c->scan.strength, c->affine_shear * c->scan.strength);
+        }
     }
     b->um[i] = (float)(s->um * (double)(1 << l) * (spatial.active ? spatial.scale * cbrt(spatial.det) : 1.0));   /* affine: the volume-preserving voxel size */
     if (c->papyrus) b->um[i] = c->papyrus->cond == 1 ? (float)(ia * ((pap_t - mean) / sd) + ib) : 0.f;   /* the cutoff where the input puts it */
@@ -3747,6 +3771,13 @@ static void replay_window(sampler *sp, batch *b, int i, int rep, uint8_t **scr) 
         if (!sa.active) spatial_aug_make(&sa, rnext(&r), P, c->rotate_degrees > 0 ? c->rotate_degrees : 5, 1.f, c->elastic, c->elastic_p);   /* (the labels need the device warp) */
         if (c->zoom_p > 0 && c->zoom_min > 0 && c->zoom_min < 1 && runif(&r) < c->zoom_p) spatial_aug_zoom(&sa, exp(runif(&r) * log(c->zoom_min)));
         if (c->affine_p > 0 && c->scan.strength > 0 && runif(&r) < c->affine_p) spatial_aug_affine(&sa, rnext(&r), c->affine_aniso * c->scan.strength, c->affine_shear * c->scan.strength);
+        for (int t = 0; c->split_ns > 0 && c->split_nz > 0 && c->split_nz < P && split_span(&sa, y, P, c->split_nz) > c->split_ns; t++) {   /* --split z: as sample_one's */
+            atomic_fetch_add(&sp->split_redraw, 1);
+            if (t == 8) { spatial_aug_make(&sa, rnext(&r), P, 0.5f, 1.f, 0, 0); atomic_fetch_add(&sp->split_unwarp, 1); break; }   /* (a warp the labels need: near the identity) */
+            spatial_aug_make(&sa, rnext(&r), P, c->rotate_degrees > 0 ? c->rotate_degrees : 5, 1.f, c->elastic, c->elastic_p);
+            if (c->zoom_p > 0 && c->zoom_min > 0 && c->zoom_min < 1 && runif(&r) < c->zoom_p) spatial_aug_zoom(&sa, exp(runif(&r) * log(c->zoom_min)));
+            if (c->affine_p > 0 && c->scan.strength > 0 && runif(&r) < c->affine_p) spatial_aug_affine(&sa, rnext(&r), c->affine_aniso * c->scan.strength, c->affine_shear * c->scan.strength);
+        }
     }
     const spatial_aug *ap = geom && sa.active ? &sa : nullptr;
     if (geom && b->mil && b->nmil0[i]) {   /* --ink-mil: the rays from the source grid through the replay's symmetry and warp (the planes go the same way) */

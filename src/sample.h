@@ -113,6 +113,9 @@ typedef struct {
     int w4_runs;             /* train --gpu-aug 3 (default on, UFSM_W4_RUNS=0 off): batch.w4r instead of the w4 / wcomp planes (host RAM: -2 B per voxel
                                 per slot); sampler_start drops it (0) unless cubes, side_air 0, no --phase-near-um / --aug-tear / sheet, nn.o linked */
     int w4_dev;              /* train --gpu-aug 3: the winding mod 4 through band_wind4_dev (band_w4dev.h; the same bytes; the CPU path if it declines) */
+    int split_nz, split_ns;  /* train --split z with --gpu-aug: each rank builds output planes [0, split_nz) / [P - split_nz, P) from at most
+                                split_ns source planes (nn_aug_src_range; the device staging the planner counts): a warp needing more is
+                                redrawn (8 tries, then the window unwarped; sampler_split_redraws). 0: off */
     int gpu_aug;             /* train --gpu-aug (with gpu_input, cubes, no --ct-aug, side_air 0; sample_gpu_aug_ok): batch.ct8 holds each window's
                                 source-grid bytes (after the seam shift) and batch.aug its scan_ct_rec (scanner plan, jitter, normalisation); the
                                 device builds the CT channel (nn.h nn_aug_ct); batch.x16 is absent. The labels and masks are the CPU path's, byte
@@ -268,7 +271,8 @@ void sampler_stats(const sampler *sp, uint64_t *produced, uint64_t *rejected);
    min_fg; windows kept with a holdout mask; windows produced */
 enum { SL_HOLD, SL_EMPTY, SL_PROBE, SL_FG, SL_MASKED, SL_PROD, SL_OTHER, SL_N };   /* SL_OTHER: no level / no window position (pick_level, patch / box bounds, a shape smaller than the window; level 0's slot when no level) */
 void sampler_level_stats(sampler *sp, int si, int l, uint32_t out[SL_N]);
-uint64_t sampler_crushed(const sampler *sp);   /* --aug-crush windows drawn so far */
+uint64_t sampler_crushed(const sampler *sp);
+uint64_t sampler_split_redraws(const sampler *sp, uint64_t *unwarped);   /* --split z: warps redrawn for the staging bound (and windows left unwarped) */   /* --aug-crush windows drawn so far */
 enum { AUGN_XSCAN, AUGN_TEAR, AUGN_DELAM, AUGN_DENSITY, AUGN_CURV, AUGN_INCL, AUGN_N };
 uint64_t sampler_aug_count(const sampler *sp, int which);   /* windows that received a scroll augmentation (AUGN_*) so far */
 /* draws dropped by reason: [0] the coarse CT probe (min_fg, before the CT read), [1] the CT read's min_fg, [2] empty targets
