@@ -219,8 +219,19 @@ int main(int argc, char **argv) {
                   " && grep -q ct_only %s/fx/sources-ink-ssl.json", d, d, d, d, d), "ink sources with an unlabelled copy (%s/fx/sources-ink.json's ending)", d);
         CHECK(!sh("UFSM_GRAD_MX8=1 %s train %s/fx/sources-ink-ssl.json --out %s/sslink %s %s --ink-head 1 --ssl-share 0.5 --ssl-ink 1 --ssl-ink-conf 0 --ssl-ink-pap 0 --steps 8 > %s/sslink.log 2>&1", U, d, d, cm, sf, d), "ssl-ink run (%s/sslink.log)", d);
         { snprintf(p, sizeof p, "%s/sslink.log", d); char *li = slurp(p); int nk = 0, nbad = 0;
-          for (const char *q = li; q && (q = strstr(q, " ink-ssl ")); q++) { const double v = atof(q + 9); const char *c = strchr(q, '('); const double sh_ = c ? atof(c + 1) : 0; nk++; nbad += !(isfinite(v) && v > 0 && sh_ > 30 && sh_ < 90); }
+          for (const char *q = li; q && (q = strstr(q, " ssl-ink ")); q++) { const double v = atof(q + 9); const char *c = strchr(q, '('); const double sh_ = c ? atof(c + 1) : 0; nk++; nbad += !(isfinite(v) && v > 0 && sh_ > 30 && sh_ < 90); }
           CHECK(nk >= 2 && !nbad, "ssl-ink: %d step lines with the term, %d with a non-finite loss or a cell share outside 30..90%%", nk, nbad); free(li); }
+        /* (f) --ssl-heads over every self-trainable head of a --rv 2 ink net (confidence 0, no papyrus gate): each head's term finite on the
+           unlabelled windows and covering the unmasked cells; a head the net lacks is refused */
+        CHECK(!sh("UFSM_GRAD_MX8=1 %s train %s/fx/sources-ink-ssl.json --out %s/sslh %s %s --ink-head 1 --rv 2 --rv-iso 64 --ssl-share 0.5 --ssl-heads ink,rv,dens,normal,phase:0.5"
+                  " --ssl-conf 0 --ssl-ink-conf 0 --ssl-norm-conf 0 --ssl-phase-conf 0 --ssl-pap 0 --ssl-ink-pap 0 --steps 8 > %s/sslh.log 2>&1", U, d, d, cm, sf, d), "ssl-heads run (%s/sslh.log)", d);
+        { snprintf(p, sizeof p, "%s/sslh.log", d); char *li = slurp(p); const char *hn[] = {" ssl-ink ", " ssl-rv ", " ssl-dens ", " ssl-normal ", " ssl-phase "};
+          for (int h = 0; h < 5; h++) { int nk = 0, nbad = 0;
+              for (const char *q = li; q && (q = strstr(q, hn[h])); q++) { const double v = atof(q + strlen(hn[h])); const char *c = strchr(q, '('); const double sh_ = c ? atof(c + 1) : 0; nk++; nbad += !(isfinite(v) && v > 0 && sh_ > 30 && sh_ < 90); }
+              CHECK(nk >= 2 && !nbad, "ssl-heads%s: %d step lines with the term, %d with a non-finite loss or a cell share outside 30..90%%", hn[h], nk, nbad); }
+          free(li); }
+        CHECK(sh("%s train %s/fx/sources-ink-ssl.json --out %s/sslhx %s %s --ink-head 1 --ssl-heads fib --steps 1 > %s/sslhx.log 2>&1", U, d, d, cm, sf, d) && !sh("grep -q 'the net has no such head' %s/sslhx.log", d),
+              "ssl-heads: a head the net lacks is refused (%s/sslhx.log)", d);
         /* (c) unlabelled windows skip the head slabs: the same losses as with the slabs run on zero masks (UFSM_SSL_SLABS=1) */
         CHECK(!sh("UFSM_SSL_SLABS=1 UFSM_GRAD_MX8=1 %s train %s/fx/sources-ssl.json --out %s/sslb %s %s --ssl-share 0.5 --steps 8 > %s/sslb.log 2>&1", U, d, d, cm, sf, d), "ssl run with slabs (%s/sslb.log)", d);
         snprintf(p, sizeof p, "%s/ssl.log", d); l0 = slurp(p); snprintf(p, sizeof p, "%s/sslb.log", d); l1 = slurp(p);

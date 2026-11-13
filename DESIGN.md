@@ -188,9 +188,59 @@ down, so the numbers below come from commit messages only:
   - Logged as `ink-ssl L (gated % of the cells, ink % of the gated)`.
   - test_ssl (5): targets and gradient against the host. test_heads (8e): a fixture run with the ink head.
   - Not with UFSM_SSL_SLABS=1 (the term rides on the skip path).
+- `--ssl-heads LIST` (11-12, user: "can we dino for all things the universal model supports"; c8eaa09) generalises `--ssl-ink` to
+  every head that a self-trained target can be checked for. `--ssl-ink W` is now `ink:W`, and its log marker is ` ssl-ink`.
+  - The same mechanism: the teacher's coarse head per chunk of cell planes, targets round(254 p) per enabled channel and cell
+    (255 = none) at the cells the student sees, the student's soft BCE on its own coarse logits in the skip path. One target
+    kernel and one gradient kernel over a per-head spec (`nn_sslh_targets` / `nn_sslh_grad`, ssl.h), replacing the ink pair.
+  - Gates per head (thresholds are flags):
+
+    | head (channels) | gate | papyrus |
+    |---|---|---|
+    | ink (11), dens (8), fib H / V (14-15) | each channel where \|p - 0.5\| >= `--ssl-conf` 0.3 (ink: `--ssl-ink-conf`) | yes |
+    | rv (12-13) | the same | no (papyrus vs void is what rv learns) |
+    | normal n n^T (2-7) | all six where \|N\|_F >= `--ssl-norm-conf` 0.8, N from the head's coding (1 for a clean unit dyad) | yes |
+    | phase cos / sin (0-1) | the pair where \|(2c - 1, 2s - 1)\| >= `--ssl-phase-conf` 0.7 | yes |
+
+    The papyrus gate is the teacher's (max of the rv pair >= 0.5, so --rv 2), `--ssl-pap 0` drops it (tests).
+  - Not self-trained: wind4 (its integer gauge is exactly what self-training cannot validate) and the fibre axis (rare, noisy
+    where wrong). No symmetry-agreement pass for the normals in v1: it would cost a second teacher forward per SSL window.
+  - Weights `name:W`, default `--ssl-heads-w` 0.25; per head W x the mean BCE over its targeted entries. Logged per head as
+    ` ssl-<head> L (g% gated)`.
+  - Default: none on. A head is self-trained only after it beats its reference teacher, else the term reinforces its errors.
+  - Memory: a byte per enabled channel and cell (16.8 MB per channel at P 1024), now counted by the planner (the old ink buffer
+    was not).
+  - Tests (desk GPU 0, 11-12 15:20, both pass): test_ssl (5) every mode in one spec vs the host (targets, counts, gradient against the formula and central
+    differences, per-head sums) at two normal thresholds; test_heads (8e) the `--ssl-ink` alias, (8f) five heads at confidence 0
+    finite and covering 30-90 % of the cells, a missing head refused.
+    test_ssl numbers: 512 cells, gated ink 165, rv 215 + 207, normal 236 (conf 0.8) / 185 (conf 1.2), phase 208, dens 152; 0 target
+    bytes differ; gradient worst 5.0e-7 against the formula and 5.0e-7 against central differences, of a largest 1.8e-3.
+  - Measurement: a paired short run with / without `--ssl-heads` from the same snapshot (wbench p05x, rv, the 34 ink crops, the
+    fibre judge), gated on unissl's 2000 / 4000 wbench rows showing the trunk term neutral or better.
 - Holdouts: inkB added the 10 extra crops to holdouts-ink.json ("inkeval-ho", 98 boxes), on the 0500P2 2.215 um and 0841 2.403 um
   scans. Those two volumes reject 5 / 6 boxes. `EXCLVOL` leaves out 0841's 9.366 um scan (the boxes are not mapped into it) and
   0500P2's 9.362 um scan (a labelled source already), so 35 unlabelled volumes remain.
+
+- unissl, the trunk term on desk GPU 1 (11-12 12:50 - 19:42, from unified/last.ckpt step 1504; ink off, --ssl 16 --ssl-share 0.25,
+  35 unlabelled scans): no collapse (std 0.234-0.243 against the 0.25 floor, cosine 0.19 -> 0.11, 40 % of the cells targeted), the
+  unlabelled share settles at 25 % after a startup skew (48 %: cheap windows fill the replay slots first). Two run faults, both fixed:
+  the inserted side head was never initialised on a resume (c46d58f) and nn_w4runs_label aborted on a full card (a5520d5).
+  wbench core p05x against unified-1504, all 44 rows, paired bootstrap: 2000 +0.001 [-0.013, +0.013], 4000 -0.007 [-0.018, +0.002],
+  6000 -0.017 [-0.036, -0.000] (latres, 39 clean boxes: -0.018, P(better) 0.04). A monotone slide, but unissl has no control: since
+  1504 the SSL term, the dropped ink sources / loss and 4500 more steps all changed.
+- Attribution, sslpair (11-12 19:45-): three arms from unissl snap/4000 back to back on GPU 1, --det 1 (identical windows), 1500
+  steps cooled to 5500 (wsd): ctrl (--ssl 16, no unlabelled source: the term never runs), ssl (unissl as is), heads (ssl +
+  --ssl-heads rv,dens,normal,phase). ctrl vs ssl attributes the slide; ssl vs heads is the heads term. --det costs ~15 % (212 vs 250
+  Mvox/s). Caveat: 1500 steps against a 0.017 effect (MDE ~0.02): a null is not evidence of no effect.
+
+- Closed 11-12 ~22:00 (user: "cancel the dino and the standalone ink training"; the pods went away). Where it stands:
+  - sslpair: ctrl reached 5300 (snap 4000 / 4500 / 5000 kept; one OOM kill at 21:19), ssl and heads never ran. unissl's slide after
+    2000 stays unattributed (SSL term vs dropped ink vs more steps).
+  - pod3dino (pod 3, RTX PRO 6000, from unissl 6773, trunk + --ssl-heads rv,dens,normal,phase, 6 labelled + 27 unlabelled sources): ran
+    ~480 steps before the pod went, no snapshot saved. 1040 Mvox/s (1.0 s/step, 4x the desk), loader wait 5 %, SM 100 % busy at B 1
+    (dmon; memory bandwidth 33-53 %, 20.7 of 97 GB), so B > 1 under --ssl was not needed. ssl 0.069, std 0.246; heads gated rv 24.5 %,
+    normal 19.2 %, dens 2.3 %, phase 2.7 % (the papyrus and magnitude gates leave dens / phase sparse at default thresholds).
+  - Code kept, off by default: --ssl, --ssl-heads (tests pass), the CT draw index for ct_only scans, side-head insertion on resume.
 
 **Code.**
 - Sources take `"ssl": 1` (CT only, no targets; `holdout_reject` for the wbench boxes).
