@@ -281,6 +281,8 @@ static int sp24_mode_of(const float *w) {   /* the registered conv whose weights
 extern "C" void lp_sp24_note_flip(const float *w, const float *flipped, size_t n) {
     if (sp24_mode_of(w) == 3) { g_sp24_flo = flipped; g_sp24_fhi = flipped + n; } else g_sp24_flo = g_sp24_fhi = nullptr;
 }
+static unsigned long g_sp24_calls;   /* sparse convs run (all threads; tests) */
+extern "C" unsigned long lp_sp24_calls(void) { return g_sp24_calls; }
 extern "C" unsigned lp_sp24_err(void) { unsigned h = 0; cudaMemcpyFromSymbol(&h, g_sp24_err, 4); return h; }
 extern "C" void lp_sp24_err_clear(void) { const unsigned z = 0; cudaMemcpyToSymbol(g_sp24_err, &z, 4); }
 static int sp24_eligible(const float *w) {   /* (the flip note is one-shot: the conv_fwd_tc call right after the flip consumes it) */
@@ -326,6 +328,7 @@ extern "C" int lp_sp24_conv_fwd(const void *x, int xbf, shape5 xs, const float *
     else if (TZ == 4) launch_sp24<2, 4>(grid, x, xs, wq, ws, wm, b, cout, y, Cop, Cip, gp, osum, Go, sp);
     else launch_sp24<2, 2>(grid, x, xs, wq, ws, wm, b, cout, y, Cop, Cip, gp, osum, Go, sp);
     LPCK();
+    __atomic_add_fetch(&g_sp24_calls, 1, __ATOMIC_RELAXED);
     return 1;
 #endif
 }

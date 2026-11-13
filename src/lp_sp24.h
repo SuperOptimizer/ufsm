@@ -19,6 +19,7 @@ void lp_sp24_note_flip(const float *w, const float *flipped, size_t n);   /* a b
 void lp_sp24_force(int on);        /* test hook: 1 every eligible call sparse, 0 none, -1 by the registered range (default) */
 unsigned lp_sp24_err(void);        /* groups the prep truncated (more than 2 non-zero pairs) since the last clear */
 void lp_sp24_err_clear(void);
+unsigned long lp_sp24_calls(void);   /* sparse convs run so far (tests: the routing) */
 #ifdef __cplusplus
 }
 #endif

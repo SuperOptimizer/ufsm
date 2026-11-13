@@ -201,13 +201,16 @@ int main(void) {
         /* routing: conv_fwd_tc (nn_conv3d_fwd on MX-fp4 tensors) runs the sparse kernel for registered weights, the dense one otherwise */
         nn_set_prec(3);
         void *x = mx4_dev(hgy, gs), *y1 = mx4_out(xs), *y2 = mx4_out(xs), *y3 = mx4_out(xs);
+        const unsigned long c0 = lp_sp24_calls();
         lp_sp24_reg_clear(); nn_conv3d_fwd(x, gs, wt, nullptr, Ci, 3, 1, y1);
+        const unsigned long c1 = lp_sp24_calls();
         lp_sp24_reg(wt, nw, 2); nn_conv3d_fwd(x, gs, wt, nullptr, Ci, 3, 1, y2); lp_sp24_reg_clear();
+        const unsigned long c2 = lp_sp24_calls();
         lp_sp24_force(1); lp_sp24_conv_fwd(x, 4, gs, wt, nullptr, Ci, y3, 4, none, nullptr, 0, (split_t){0}); lp_sp24_force(-1);
         const size_t nb = nn_mx4_bytes(xs); uint8_t *b1 = malloc(nb), *b2 = malloc(nb), *b3 = malloc(nb);
         nn_d2h(b1, y1, nb); nn_d2h(b2, y2, nb); nn_d2h(b3, y3, nb);
-        check("routing: registered weights take the sparse kernel (bytes == direct sparse call)", !memcmp(b2, b3, nb));
-        check("routing: unregistered weights take the dense kernel (bytes differ from sparse)", memcmp(b1, b3, nb) != 0);
+        check("routing: registered weights take the sparse kernel (one sparse call, bytes == direct sparse call)", c2 == c1 + 1 && !memcmp(b2, b3, nb));
+        check("routing: unregistered weights take the dense kernel (no sparse call; bytes equal: same masked weights)", c1 == c0 && !memcmp(b1, b3, nb));
         free(b1); free(b2); free(b3); nn_free(x); nn_free(y1); nn_free(y2); nn_free(y3);
         free(a); free(b); free(hw); free(hm); free(ht); free(hgy); nn_free(w); nn_free(wt); nn_free(gy); nn_free(gx1); nn_free(gx2);
     }
