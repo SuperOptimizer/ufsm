@@ -939,6 +939,13 @@ extern "C" unsigned long long nn_count_nonfinite(const void *p, size_t n, int h1
     unsigned long long h = 0; CK(cudaMemcpy(&h, d[dev], sizeof h, cudaMemcpyDeviceToHost));
     return h;
 }
+/* inference guard (predict, unroll audit 11-14 #16): cnt[2] += the non-finite values of one forward's logits, then folded on the device
+   (same stream, no sync): cnt[0] += cnt[2], cnt[1] += (cnt[2] != 0), cnt[2] = 0. Read once at the end (nn_nonfinite_read) */
+__global__ void nonfinite_fold_k(unsigned long long *cnt) { if (cnt[2]) { cnt[0] += cnt[2]; cnt[1]++; cnt[2] = 0; } }
+extern "C" void nn_nonfinite_acc(const void *p, size_t n, int h16, unsigned long long *cnt) {
+    count_nonfinite_k<<<n < (size_t)1024 * 256 ? nblk(n, 256) : 1024, 256>>>(p, n, h16, cnt + 2); KCHECK();
+    nonfinite_fold_k<<<1, 1>>>(cnt); KCHECK();
+}
 extern "C" void nn_ridge_u8(const uint8_t *p, const void *x, int xfmt, int d, int h, int w, int thr, uint8_t *out) {
     const size_t n = (size_t)d * h * w;
     if (xfmt == 1) ridge_k<__half><<<nblk(n, 256), 256>>>(p, (const __half *)x, d, h, w, thr, out);

@@ -224,6 +224,7 @@ ufsm_exe(test_reg SUITE tests/test_reg.c OBJS reg reg_init zarr3 zarr2 store jso
 ufsm_exe(test_reg_render SUITE tests/test_reg_render.c OBJS CORE NN LP LIBS LDLIBS CUDA)
 ufsm_exe(test_regz2 SUITE tests/test_regz2.c OBJS reg zarr3 zarr2 store json LIBS LDLIBS)
 ufsm_exe(test_render_fill SUITE tests/test_render_fill.c OBJS render inkcompare imgops jpegpar tiff tiffw z3w zarr3 store json LIBS LDLIBS)
+ufsm_exe(test_render_absent SUITE tests/test_render_absent.c OBJS render inkcompare imgops jpegpar tiff tiffw z3w zarr3 store json LIBS LDLIBS)
 ufsm_exe(test_render_fill_gpu SUITE tests/test_render_fill.c OBJS render inkcompare imgops jpegpar tiff tiffw z3w zarr3 store json nn_render
          nn_gpudec LIBS LDLIBS CUDA DEFS RENDER_GPU)
 ufsm_exe(test_render_known SUITE tests/test_render_known.c OBJS render inkcompare imgops jpegpar tiff tiffw z3w zarr3 store json LIBS

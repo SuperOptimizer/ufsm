@@ -37,7 +37,8 @@ test_fibhead                                   | gpu,smoke    |     2 | ./$B/tes
 test_fibhead_train                             | gpu          |    25 | tests/test_fibhead_train.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/fibhead
 test_slot_planes                               | gpu          |    30 | tests/test_slot_planes.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/slotplanes
 test_idle_release                              |              |     8 | tests/test_idle_release.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/idlerel
-test_scan_norm                                 | gpu          |     8 | tests/test_scan_norm.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/scannorm
+test_scan_norm                                 | gpu          |    14 | tests/test_scan_norm.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/scannorm
+test_predict_guard                             | gpu          |    20 | tests/test_predict_guard.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/predguard
 test_predict_heads~part0of3                   | gpu          |    25 | UFSM_TEST_PART=0/3 tests/test_predict_heads.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/predheads
 test_predict_heads~part1of3                   | gpu          |    25 | UFSM_TEST_PART=1/3 tests/test_predict_heads.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/predheads
 test_predict_heads~part2of3                   | gpu          |    25 | UFSM_TEST_PART=2/3 tests/test_predict_heads.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/predheads
@@ -308,6 +309,7 @@ test_predict_det                               | gpu          |    11 | ./$B/tes
 test_strip_gpu                                 | gpu          |    10 | ./$B/test_strip_gpu
 test_faces_gpu                                 | gpu          |    10 | ./$B/test_faces_gpu
 test_render_fill                               | smoke        |    10 | ./$B/test_render_fill
+test_render_absent                             | smoke        |     1 | ./$B/test_render_absent
 test_render_known                              | smoke        |     5 | ./$B/test_render_known ./$B/ufsm
 test_render_stream_gpu                         | gpu          |    10 | ./$B/test_render_stream_gpu
 test_render_fill_gpu                           | gpu          |    12 | ./$B/test_render_fill_gpu

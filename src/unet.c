@@ -227,6 +227,7 @@ struct unet {
     size_t bat_head, bat_tail;               /* unet_set_batch_bytes: the trainer's batch [head | tail] (the three-buffer layout sizes X3 for the tail) */
     size_t logits_bytes;                    /* lean: logits at the start of A, the 16-bit logit gradient after them */
     int logits_h16;                          /* lean 2: fp16 logits, so the 16-bit logit gradient fits after them in A */
+    unsigned long long *nf_cnt;              /* the inference guard (unet_nonfinite): non-finite logit values / forwards with any (device) */
     int lh16_req;                            /* unet_set_fp16_logits: fp16 logits where the MX head writes them into their own buffer */
     int hfeat; float *hf_w, *hf_b;           /* unet_set_head_feat: inference head also writes dec[0]'s output (identity rows), its weights */
     const void *l0fg; void *l0fg_mx; size_t l0fg_cap;   /* unet_set_l0_feat_grad: an extra d loss / d (dec[0]'s output) at the head step; its MX scratch */
@@ -523,7 +524,7 @@ void unet_free(unet *u) {
     for (int i = 0; i < 4; i++) if (u->l0s_reg[i]) { lp_gn_slab_reg(u->l0s_reg[i], 0, 0, 0, 0); u->l0s_reg[i] = nullptr; }
     free_acts(u);
     nn_free(u->p); nn_free(u->g); nn_free(u->m); nn_free(u->v); nn_free(u->ema); nn_free(u->hf_w); nn_free(u->l0fg_mx); free(u->inh);
-    nn_free(u->gn_scratch); nn_free(u->red_scratch); nn_free(u->wg_tmp);
+    nn_free(u->gn_scratch); nn_free(u->red_scratch); nn_free(u->wg_tmp); nn_free(u->nf_cnt);
     nn_free(u->wm); nn_free(u->sp24_kb); if (u->muon_mom != u->v) nn_free(u->muon_mom); nn_free(u->muon_work);   /* (aliased into v: mom_alloc) */ nn_free(u->muon_descs); nn_free(u->stem_b);
     nn_free(u->mx_mcd); nn_free(u->mx_nsd); nn_free(u->mx_pool); nn_free(u->mx_hbf); nn_free(u->mx_R); nn_free(u->mx_part); nn_free(u->mx_nmrows); nn_free(u->mx_nmoff); nn_free(u->mx_vrbuf); nn_free(u->mx_vrp); nn_kron_free(u->mx_kron); nn_free(u->qk_lmax); nn_free(u->mx_mixbuf); nn_free(u->mx_mixp);
     nn_free(u->ad_lrm); nn_free(u->ad_ema); nn_free(u->ad_dispbuf); nn_free(u->ad_dispp); nn_free(u->ad_dogst); nn_free(u->ad_part); nn_free(u->ost_dev); nn_free(u->ost_snap); free(u->ost_seg);
@@ -2984,7 +2985,23 @@ const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x
        only consume a2/logits, so its first backward can consume the original a1. */
     u->last_a1_live = train && recompute_a1() && !ufsm_env_on("UFSM_RC_REDO_LAST");
     u->sea_stale = 0;
+    if (!train && u->logits) {   /* the inference guard (unroll audit 11-14 #16): count this forward's non-finite logits on the device,
+        no sync; predict reads the totals once at the end (unet_nonfinite) and fails the run. UFSM_TEST_NAN_LOGITS=1: one NaN planted in
+        every forward's first logit (the guard's test) */
+        const size_t n = shape_numel(u->ls[0]) / u->ls[0].c * u->cfg.cout;
+        if (!u->nf_cnt) { u->nf_cnt = nn_malloc(3 * sizeof *u->nf_cnt); nn_zero(u->nf_cnt, 3 * sizeof *u->nf_cnt); }
+        static int tn = -1; if (tn < 0) tn = ufsm_env_on("UFSM_TEST_NAN_LOGITS");
+        if (tn) { const float nf = NAN; const uint16_t nh = 0x7e00; if (u->logits_h16) nn_h2d((void *)u->logits, &nh, 2); else nn_h2d((void *)u->logits, &nf, 4); }
+        if (n) nn_nonfinite_acc(u->logits, n, u->logits_h16 ? 1 : 0, u->nf_cnt);
+    }
     return u->logits;
+}
+int unet_nonfinite(const unet *u, unsigned long long *values, unsigned long long *forwards) {
+    unsigned long long h[3] = {0, 0, 0};
+    if (u && u->nf_cnt) { nn_sync(); nn_d2h(h, u->nf_cnt, sizeof h); }
+    if (values) *values = h[0];
+    if (forwards) *forwards = h[1];
+    return h[1] != 0;
 }
 
 /* head slabs (unet_set_head_ext): the head on output planes [z0, z1) of the window, from dec[0]'s output as the whole-window head

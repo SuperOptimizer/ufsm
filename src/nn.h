@@ -698,6 +698,8 @@ void nn_prob_u8(const float *logits, size_t n, uint8_t *out, float hard);   /* o
 void nn_ridge_u8(const uint8_t *p, const void *x, int xfmt, int d, int h, int w, int thr, uint8_t *out);
 void nn_fill_unlabelled(uint8_t *t, uint8_t *m, const uint8_t *vm, const uint8_t *src, size_t n);
 unsigned long long nn_count_nonfinite(const void *p, size_t n, int h16);   /* diagnostics (synchronous): non-finite values among n fp32 (h16 0) / fp16 (1) / bf16 (2) */
+void nn_nonfinite_acc(const void *p, size_t n, int h16, unsigned long long *cnt);   /* async: cnt (device, 3 u64) [0] += non-finite values,
+   [1] += 1 when this call saw any ([2] scratch); the inference guard of unet_forward_x (unet_nonfinite) */
 void nn_add_into(void *y, const void *x, shape5 s, int h16);   /* y += x in y's storage (MX by registration, else 16-bit or fp32) */
 void nn_fakeq_w4_2d(float *w, int Co, int Ci, int T, int B);   /* w[Co][Ci][T] in place to MX-fp4 values, a scale per B x B block and tap
                                                                    (unet_cfg.w4_2d: forward and backward-data then quantise it identically) */

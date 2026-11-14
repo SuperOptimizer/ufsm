@@ -6,11 +6,17 @@
 #include <string.h>
 
 char *checkpoint_header_line(const char *path) {
+    /* The whole first line, up to the loader's own cap (read_header: UFSM_CHECKPOINT_HEADER). This used to be the first 64 KB,
+       searched with strstr: scratch2's header is 37 KB with the unwrap / density block at its end, so a larger header would
+       silently read as unwrap v0 / density_scale 32. A file that opens but has no newline within the cap is a broken checkpoint:
+       stop, rather than hand the callers a truncated header they would take for an old one (audit 11-14 #14). */
     FILE *f = fopen(path, "rb"); if (!f) return nullptr;
-    char *line = malloc(1 << 16); if (!line) { fclose(f); return nullptr; }
-    const size_t n = fread(line, 1, (1 << 16) - 1, f); fclose(f); line[n] = 0;
-    char *e = memchr(line, '\n', n); if (e) *e = 0;
-    return line;
+    char *line = malloc(UFSM_CHECKPOINT_HEADER + 1); if (!line) { fclose(f); return nullptr; }
+    const size_t n = fread(line, 1, UFSM_CHECKPOINT_HEADER, f); fclose(f); line[n] = 0;
+    char *e = memchr(line, '\n', n);
+    if (!e) { fprintf(stderr, "checkpoint %s: no header newline in the first %d bytes (truncated or not a ufsm checkpoint)\n", path,
+                      UFSM_CHECKPOINT_HEADER); free(line); exit(2); }
+    *e = 0; return line;
 }
 int checkpoint_unwrap_version(const char *path) {
     char *h = checkpoint_header_line(path); if (!h) return 0;

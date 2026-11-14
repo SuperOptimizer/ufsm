@@ -2,7 +2,7 @@
 # train --scan-norm 1 --gn-ema 1 on the wind fixture: the sampler's per-scan CT normalisation (scannorm.h: mean / sd of the nonzero
 # voxels in boxes picked on a coarse level) is reported, deterministic across runs, kept in the checkpoint with the running GroupNorm
 # statistics, and predict on the same scan and level computes the same center / scale for the net (and --norm overrides it); the
-# training input changes with it (same seed, --det 1: different losses)
+# training input changes with it (same seed, --det 1: different losses). A latvol CT: the statistics of the rebuilt CT, or a refusal
 # Usage: test_scan_norm.sh UFSM MAKE_WIND_FIXTURE DIR
 set -eu
 U=$(readlink -f "$1"); MF=$(readlink -f "$2"); D=$3
@@ -31,4 +31,27 @@ lp=$(grep -m1 -o 'scan-norm net: level 0 center [0-9.]* scale [0-9.]*' pa.log ||
 [ "${lp#scan-norm net: }" = "${la#scan-norm: }" ] || { echo "FAIL: predict computes '$lp', the sampler '$la'"; exit 1; }
 "$U" predict a/last.ckpt fx ct pn --um 9.6 --level 0 --box 64,64,64,128,128,128 --gpu 0 --threads 2 --window 128 --halo 16 --norm 100,40 > pn.log 2>&1 || { echo "FAIL: predict --norm ($D/pn.log)"; exit 1; }
 grep -q 'scan-norm net' pn.log && { echo "FAIL: --norm did not override"; exit 1; }
-echo "test_scan_norm: ok ($la)"
+# a latvol CT (unroll audit 11-14 #15): predict computes the scan statistics on the rebuilt CT (as the sampler does for a latvol source),
+# close to the plain CT's; a latvol group without the coarse levels refuses instead of the silent per-window z-score. The transform: a
+# Walsh-Hadamard basis / 8 (orthonormal, row 0 the cell mean), written here; C 64 (all coefficients) keeps the rebuilt CT near-lossless
+python3 -I - lv.lcb <<'PY'
+import struct, sys
+H = [[1]]
+while len(H) < 64: H = [r + r for r in H] + [r + [-v for v in r] for r in H]
+with open(sys.argv[1], 'wb') as f:
+    f.write(struct.pack('<2I', 0x424c4655, 1)); f.write(struct.pack('<64f', *[64.0 / (k + 1) for k in range(64)]))
+    for r in H: f.write(struct.pack('<64f', *[v / 8 for v in r]))
+PY
+mkdir -p lv lv1
+"$U" latvol lv.lcb fx ct lv/ct --levels 9.6,19.2,38.4,76.8,153.6 --c 64 --threads 2 --gpu -1 > lv.log 2>&1 || { echo "FAIL: latvol ($D/lv.log)"; exit 1; }
+"$U" latvol lv.lcb fx ct lv1/ct --levels 9.6 --c 64 --threads 2 --gpu -1 > lv1.log 2>&1 || { echo "FAIL: latvol one level ($D/lv1.log)"; exit 1; }
+UFSM_SCANNORM_CACHE=0 "$U" predict a/last.ckpt lv ct pl --um 9.6 --level 0 --box 64,64,64,128,128,128 --gpu 0 --threads 2 --window 128 --halo 16 > pl.log 2>&1 || { echo "FAIL: predict on latvol ($D/pl.log)"; exit 1; }
+ll=$(grep -m1 -o 'scan-norm net: level 0 center [0-9.]* scale [0-9.]*' pl.log || true)
+[ -n "$ll" ] && grep -q 'latvol CT: the rebuilt CT' pl.log || { echo "FAIL: no scan statistics on the latvol CT ($D/pl.log)"; exit 1; }
+read -r c1 s1 c2 s2 <<< "$(echo "$lp $ll" | grep -o 'center [0-9.]* scale [0-9.]*' | awk '{printf "%s %s ", $2, $4}')"
+awk -v a="$c1" -v b="$c2" -v x="$s1" -v y="$s2" 'BEGIN { d = a - b; e = x / y - 1; exit !(d < 2 && d > -2 && e < .05 && e > -.05) }' \
+  || { echo "FAIL: latvol statistics '$ll' far from the CT's '$lp'"; exit 1; }
+if UFSM_SCANNORM_CACHE=0 "$U" predict a/last.ckpt lv1 ct p1 --um 9.6 --level 0 --box 64,64,64,128,128,128 --gpu 0 --threads 2 --window 128 --halo 16 > p1.log 2>&1; then
+  echo "FAIL: predict on a latvol group without coarse levels ran (per-window statistics, $D/p1.log)"; exit 1; fi
+grep -q 'no statistics at level 0 of ct (latvol)' p1.log || { echo "FAIL: no refusal message ($D/p1.log)"; exit 1; }
+echo "test_scan_norm: ok ($la; latvol $ll)"

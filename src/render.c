@@ -541,6 +541,44 @@ int render_wraps_chunked(z3 *const *vz, int nv, const int *depth, int ns, const 
                          int w, int h, double gs, uint8_t *const *img, int ow, int oh, const int *crop, size_t budget, int nthreads, int io_threads, int verbose) {
     return render_wraps_chunked_fill(vz, nv, depth, ns, Xs, Ys, Zs, w, h, gs, img, ow, oh, crop, budget, nthreads, io_threads, verbose, nullptr);
 }
+/* unroll audit 11-14 #13: a sample in a shard (or unsharded chunk) that is not in the store reads as 0, which for the ink volume is "no
+   ink" -- the ink predict's occupancy skip or a failed shard turns papyrus into blank. Counted per volume over the surface vertices (in
+   the crop): absent[v] of *total vertices sit in such shards (or outside the array), nshards[v] distinct absent shards. Shard presence
+   is asked once per shard (an open-addressed set). 0 ok, -1 on a store error */
+int render_absent_count(struct z3 *const *vz, int nv, int ns, const float *const *Xs, const float *const *Ys, const float *const *Zs, int w, int h,
+                        double gs, const int *crop, size_t absent[2], size_t nshards[2], size_t *total) {
+    *total = 0; int rc = 0;
+    for (int v = 0; v < nv && v < 2; v++) {
+        absent[v] = nshards[v] = 0;
+        const z3_meta *m = z3_meta_of(vz[v]); size_t cap = 1 << 12, used = 0;
+        uint64_t *key = calloc(cap, sizeof *key); int8_t *st = calloc(cap, 1); if (!key || !st) { free(key); free(st); return -1; }
+        size_t tot = 0;
+        for (int si = 0; si < ns; si++) for (int r = 0; r < h; r++) for (int c = 0; c < w; c++) {
+            const size_t i = (size_t)r * w + c; const float Z = Zs[si][i], Y = Ys[si][i], X = Xs[si][i]; if (!(Z >= 0)) continue;
+            if (crop) { const double px = c * gs, py = r * gs; if (px < crop[0] || px >= crop[0] + crop[2] || py < crop[1] || py >= crop[1] + crop[3]) continue; }
+            tot++;
+            const int64_t p3[3] = {(int64_t)Z, (int64_t)Y, (int64_t)X};
+            if (p3[0] >= m->shape[0] || p3[1] >= m->shape[1] || p3[2] >= m->shape[2]) { absent[v]++; continue; }
+            const int64_t sz = p3[0] / m->shard[0], sy = p3[1] / m->shard[1], sx = p3[2] / m->shard[2];
+            const uint64_t k = ((uint64_t)sz << 42 | (uint64_t)sy << 21 | (uint64_t)sx) + 1;
+            size_t j = (size_t)(k * 0x9e3779b97f4a7c15ull) & (cap - 1);
+            while (key[j] && key[j] != k) j = (j + 1) & (cap - 1);
+            if (!key[j]) {
+                const int pr = z3_shard_present(vz[v], sz, sy, sx); if (pr < 0) { rc = -1; continue; }
+                key[j] = k; st[j] = (int8_t)(pr ? 1 : 2); if (!pr) nshards[v]++;
+                if (++used * 2 > cap) {   /* grow */
+                    const size_t nc = cap * 2; uint64_t *k2 = calloc(nc, sizeof *k2); int8_t *s2 = calloc(nc, 1); if (!k2 || !s2) { free(k2); free(s2); free(key); free(st); return -1; }
+                    for (size_t q = 0; q < cap; q++) if (key[q]) { size_t t = (size_t)(key[q] * 0x9e3779b97f4a7c15ull) & (nc - 1); while (k2[t]) t = (t + 1) & (nc - 1); k2[t] = key[q]; s2[t] = st[q]; }
+                    free(key); free(st); key = k2; st = s2; cap = nc;
+                    j = (size_t)(k * 0x9e3779b97f4a7c15ull) & (cap - 1); while (key[j] != k) j = (j + 1) & (cap - 1);
+                }
+            }
+            if (st[j] == 2) absent[v]++;
+        }
+        *total = tot; free(key); free(st);
+    }
+    return rc;
+}
 static int wr_run(z3 *const *vz, int nv, const int *depth, int ns, const float *const *Xs, const float *const *Ys, const float *const *Zs,
                   int w, int h, double gs, uint8_t *const *img, int ow, int oh, const int *crop, size_t budget, int nthreads, int io_threads,
                   int verbose, const render_fill *F, int gpu) {
@@ -558,6 +596,12 @@ static int wr_run(z3 *const *vz, int nv, const int *depth, int ns, const float *
         R->depth[v] = depth[v]; if (depth[v] > dm) dm = depth[v];
     }
     R->F = F; if (F) dm += F->n;   /* the search moves every volume's window up to n voxels along the normal */
+    {   size_t ab[2] = {0, 0}, nsh[2] = {0, 0}, tot = 0;   /* absent shards read as 0 (ink: "no ink"): their share of the surface, printed */
+        if (render_absent_count(vz, nv, ns, Xs, Ys, Zs, w, h, gs, crop, ab, nsh, &tot)) fprintf(stderr, "render: shard presence check failed: %s\n", z3_error());
+        for (int v = 0; v < nv; v++) if (ab[v] || verbose)
+            fprintf(stderr, "render: volume %d: %zu of %zu surface vertices (%.3f %%) in %zu absent shards (read as 0%s)\n", v, ab[v], tot,
+                    tot ? 100.0 * (double)ab[v] / (double)tot : 0.0, nsh[v], v == 0 && nv == 2 ? ": no ink there" : "");
+    }
     /* blocks with their chunk ranges per volume */
     size_t cap = 1 << 16, nb = 0; rblock *b = malloc(cap * sizeof *b); int32_t (*hi1)[3] = malloc(cap * sizeof *hi1), (*lo1)[3] = malloc(cap * sizeof *lo1);
     if (!b || !hi1 || !lo1) goto out0;

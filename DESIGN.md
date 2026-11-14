@@ -6,6 +6,40 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Unroll audit fixes #7b, #13-#17: silent failures made loud (2026-11-14, branch unrollfix-wg-20261114)
+
+Items of /vesuvius/ufsm/audit-20261114/unroll.md. All default on. Tests: test_checkpoint_runtime, test_render_absent and test_strip
+pass on the desk CPU. test_scan_norm (its latvol case) and test_predict_guard need a GPU and run in the mega test pass.
+- **#14 checkpoint header**: checkpoint_header_line reads the whole first line up to UFSM_CHECKPOINT_HEADER (128 KB, the loader's cap)
+  and exits 2 without a newline. It used to search the first 64 KB with strstr. scratch2's header is 37 KB with the unwrap / density
+  block at its end, so a larger net would silently have read as unwrap v0 / density_scale 32. predict's density keys now read through it.
+- **#15 scan_norm on a latvol CT**: predict now computes the scan statistics on the rebuilt CT (scan_norm_stats_cached, as the sampler
+  does for a latvol source) and refuses when they cannot be computed. Before, it silently fell back to the per-window z-score.
+- **#16 non-finite logits**: every inference forward counts its non-finite logits on the device (nn_nonfinite_acc, same stream, no
+  sync). predict prints the totals at the end and exits 1, workers included. NaN used to become undefined bytes (fit_finalize_k's
+  lroundf, the probability casts). UFSM_TEST_NAN_LOGITS=1 plants one NaN for the test.
+- **#17 --resume identity**: zarr.json attrs carry "run" (checkpoint and axis sha256, level, um, window / halo (z), q, shard, full_grid,
+  ema, channel, gn_stats, the resolved norm, tta, grid origin, input gain / bias). A resume over a non-empty done list must match it, else
+  exit 2 with the store untouched; a store without the record (older binary) is refused too. --box is left out (full-grid stores are
+  filled box by box). Hashing the checkpoint costs ~0.2 s per predict.
+- **#13 absent shards in render**: render_absent_count counts the surface vertices whose sample falls in a shard missing from the
+  store (or outside the array), per volume. The renderer prints it ("volume 0: N of M surface vertices (x %) in K absent shards (read
+  as 0: no ink there)"). It counts vertices, not CT papyrus samples: the surface is the sheet.
+- **#7b strip-flatten / mosaic**: a full-size chunk (2S+1 columns, >= 3 valid vertices) without a mesh fails the run. Narrow edge
+  chunks (1299's last one, 11 columns) are counted. The raster counts the flipped triangles it leaves out and the pixels only they would
+  cover (flatten.txt "failures:", flat.json nomesh_chunks / raster_flipped_tris / flip_hole_px). strip-mosaic marks --fill-maps pixels
+  with flag >= 100 (grid-bridged, inpainted 250) as filled: hatched in the stripe JPEGs, cells tinted magenta by their filled share in
+  the overview / long strip, the share in filled.tsv.
+  An interior fold leaves no hole. The signed cover of a vertex star stays 1, so unflipped triangles always cover the flipped ones;
+  the test had to move the strip's end off the sheet to get one (282 flipped triangles, 1970 px). So blend folds such as 1299's mostly
+  give mirrored, overlapping texture, not grid-filled holes, and the flip and fold maps of strip-distort are the measure for them.
+- **1299 flatten energy 5904** (1667: 476, P4: 5.4). The frame is not the cause: P4's frame is worse (aniso p95 3.3 vs 2.7). Every
+  per-chunk SLIM has 0 flips. The blend's 275k flips (0.126 % of the area; 1667 0.015-0.02 %, P4 0.006 %) sit in two bands of
+  segments.tsv: segments 81-88 (wraps 100-107, u 313-339 cm, ~165k) and 101-102 (wraps 82-85, ~30k). There the chunk SLIM itself stays
+  anisotropic (after aniso p95 1.2-1.8 vs ~1.05 elsewhere), so the surface does not develop and neighbouring chunks disagree.
+  The energy is a mean of a 1/s^2 term, so a few near-degenerate triangles probably dominate it (not checked per triangle). Gate on
+  the flipped area and p99 aniso, not on the energy.
+
 ## Data-parallel gradient audit fixes (2026-11-14, branch dpgfix-20261114; audit targeted/dpgrad.md)
 - The math of an update was verified correct (per-window weight 1 / (ng x accepted steps), fp32, clip after reduce + accum). Muon / AdamW steps are
   batch-independent, so lr per window fell x0.8 at the P 512 / accum 4 -> P 768 / accum 5 switch (8 -> 10 windows per update); nothing to fix there.
