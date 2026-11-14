@@ -31,7 +31,9 @@
    ufsm strip-mosaic <flat-dir> <render-dir> <out-dir> [--ct-level 80] [--overview-px 16000] [--rows 10] [--tile-cm 1] [--quality 88]
      stripes (CT over ink, global contrast stretch) as JPEGs, the whole unrolled scroll as a folded overview JPEG and one long strip
      JPEG, and the on-papyrus share along the strip (CT >= ct-level within 3 x 3 px around the surface point) per 1 cm column and per
-     wrap (strip_papyrus.tsv, papyrus_wraps.tsv): where the surface leaves the papyrus is reported, never cut. */
+     wrap (strip_papyrus.tsv, papyrus_wraps.tsv): where the surface leaves the papyrus is reported, never cut.
+     Look flags (default off, 2026-11-14): --ct-stretch-papyrus 1: the CT window from pixels >= --ct-level only (air no longer sets its low end);
+     --ink-fixed 1: ink grey = probability (no percentile stretch: one p -> grey map across runs and models). */
 #include "flatten.h"
 #include "sysinfo.h"
 #include "imgops.h"
@@ -1144,8 +1146,7 @@ static void ms_write_out(ms_ctx *C, ms_out *O, long long Ltot, int ns, int barh)
            ns, Ltot * C->pxum * 1e-4, C->vtot * C->pxum * C->pxum * 1e-8, C->ctl, C->vtot > 0 ? C->ptot / C->vtot : 0, O->od, ovw, oovh, rows, ds, C->lw, pap ? C->lh : 2 * C->lh, C->lds);
 }
 int cmd_strip_mosaic(int argc, char **argv) {
-    if (argc < 5) { fprintf(stderr, "usage: ufsm strip-mosaic <flat-dir> <render-dir> <out-dir> [--strip DIR] [--ct-level 80] [--overview-px 16000] [--rows 10] [--tile-cm 1] [--quality 88] [--stripes 1] [--threads 8] [--stripe-jobs 2] [--stretch CA,CB,IA,IB] [--stretch-only 1] [--wait-renders 1] [--rm-renders 1] [--papyrus GAIN [--papyrus-bg 128]] [--papyrus-dir DIR [--papyrus-gain 1] [--papyrus-overview-px PX]] [--fill-maps DIR] [--ct-stretch-papyrus 1] [--ink-fixed 1]\n"
-                          "  --ct-stretch-papyrus 1: CT window from pixels >= --ct-level only; --ink-fixed 1: ink grey = probability (no stretch); both off by default\n"
+    if (argc < 5) { fprintf(stderr, "usage: ufsm strip-mosaic <flat-dir> <render-dir> <out-dir> [--strip DIR] [--ct-level 80] [--overview-px 16000] [--rows 10] [--tile-cm 1] [--quality 88] [--stripes 1] [--threads 8] [--stripe-jobs 2] [--stretch CA,CB,IA,IB] [--stretch-only 1] [--wait-renders 1] [--rm-renders 1] [--papyrus GAIN [--papyrus-bg 128]] [--papyrus-dir DIR [--papyrus-gain 1] [--papyrus-overview-px PX]] [--fill-maps DIR]\n"
                           "  --fill-maps DIR: <stripe>_fill.tif of render --fill: its rendered pixels (bridged grid holes, fills) join the stripe mask\n"
                           "  --papyrus GAIN: papyrus-look RGB stripe JPEGs (<stripe>_papyrus.jpg), overview and long strip (ink-compare --papyrus colours,\n"
                           "  the mosaic's stretch, ink x GAIN; CT 0 / no surface in grey --papyrus-bg)\n"
