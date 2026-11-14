@@ -37,6 +37,14 @@ typedef struct {
     int erode;               /* 0 or 1: native-grid face-neighbour erosion of binary targets before softening */
     float soft;              /* > 0: soft ridge target exp(-(d/soft)^2/2) around the surface (d = chamfer distance in level-0 voxels) */
     int soft_um;             /* 1: soft (and its annealed values) is in um, the same physical width for every source and level */
+    int snap_jitter;         /* --snap-jitter 1 (sampbias 11-14): after the snap each axis moves one chunk up with p 0.5 (the floor put the drawn cell at index 3 of 0-5, so the + faces
+                                of a labelled region got 3 of 6 window positions against 4 of 6 at the - faces; measured 0.50 vs 0.71 at the z edges) */
+    int edge_boost;          /* --edge-boost 1: phase-occupancy cells repeated 1/(labelled share of their window box) times, <= 4: the outer turns / region edges were covered
+                                0.58-0.85 (9.6 um) and 0.43-0.69 (19.2 um) of the interior */
+    float vox_cap;           /* --vox-cap K: a source's geometry-head loss scaled by min(1, K x its mean known-phase share / the weighted mean share): the loss is a per-window
+                                mean, so a source whose windows hold few labels got its voxels up to x8 (0500P2-gt) */
+    float focus_w;           /* --focus-w W: overrides every "focus" source's w (packed-sheet draw weight, off at 0 / without a map) */
+    int stick;               /* --stick-src N: a rejected draw is retried from the SAME source up to N times (the rejections took 35-46 % of 1299 / 0139-u2ink draws) */
     int snap;                /* align training windows to the CT chunk grid (3x fewer chunks decoded per window) */
     int scan_norm;           /* train --scan-norm 1: the CT input (v - center) / scale per scan and level (scannorm.h) instead of each window's
                                 own z-score (a source's "norm" wins) */
@@ -304,6 +312,7 @@ void sampler_prof_print(const sampler *sp);   /* env UFSM_SAMPLER_PROF=1: per-st
 void sampler_set_soft(sampler *sp, float sigma);   /* change the soft-target sigma while running (annealing); patches already drawn keep theirs */
 
 sample_cfg sample_cfg_default(void);
+float sampler_vox_scale(const sampler *sp, int si);   /* --vox-cap: the source's loss factor (1 without it) */
 /* augmentation presets for the dense-target tasks (train --aug): "none" (symmetries + intensity jitter only, the old default) or
    "all" (every scanner-domain op, continuous geometry, zoom in and out, axis jitter; sample.c sample_aug_preset). Sets the fields only
    (explicit flags override them afterwards); 0 on success, -1 for an unknown name. */

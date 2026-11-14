@@ -509,6 +509,7 @@ sources *sources_load(const char *path) {
             }
             fclose(mf);
         }
+        { const json *zb = json_get(e, "zboost"); if (zb) { s->zb_below = (int64_t)json_num(json_get(zb, "below"), 0); s->zb_k = (float)json_num(json_get(zb, "k"), 1); } }
         const json *mj = json_get(e, "mask");   /* {"map": RAW, "min": 2}: ufsm scanprep's cell mask (grid and lev in RAW.json) */
         if (mj) {
             const char *mp = json_str(json_get(mj, "map"), nullptr); s->mask_min = (int)json_num(json_get(mj, "min"), 2);

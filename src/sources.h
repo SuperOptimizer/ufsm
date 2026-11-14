@@ -144,6 +144,7 @@ typedef struct {
     z3 *phase_pl[MAXLEV], *phase_ign_pl[MAXLEV];   /* source_phase_at: the stored phase / ignore pooled to levels coarser than phase_level (lazy views) */
     uint8_t *focus; int64_t focus_grid[3]; float focus_w;   /* optional "focus": {"map": RAW, "w": K} (ufsm phase-packing --map: per coarse occupancy cell 0 none, else
                                                               1 + 254 x packed share): the position draw takes a cell 1 + K x share times as often */
+    int64_t zb_below; float zb_k;   /* optional "zboost": {"below": N, "k": K}: occupancy cells with z index < N (cells of the occupancy grid, see the log line) are drawn K times as often */
     z3 *wind;    /* optional, with a stored phase: the winding mod 14 turns on the same grid (ufsm phase-raster --winding; band.h
                     band_winding), {"band": {..., "phase": {...}, "winding": {"root": ..., "key": ...}}}: the --cond targets / condition */
     /* unlabelled scans (Phase U0, ufsm scanprep): */

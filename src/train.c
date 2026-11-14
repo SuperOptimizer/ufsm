@@ -276,7 +276,8 @@ static int g_gc;
    the fused normal / density group); --fstem-drop P: a training window without it (level dropout: the net keeps working without the fine
    level, as for scans with no finer data; validation and predict always use it) */
 static int g_fstem, g_fs_n, g_fs_ch[32]; static float g_fs_drop = 0.25f;
-static float src_head_w(int si, int h) { return (si >= 0 && g_S && si < g_S->n ? g_S->src[si].head_w[h] : 1.f) * g_hmul[h]; }   /* the source's "heads" multiplier x --uw */
+static sampler *g_vs_sp;   /* --vox-cap: the training sampler, for sampler_vox_scale */
+static float src_head_w(int si, int h) { return (si >= 0 && g_S && si < g_S->n ? g_S->src[si].head_w[h] : 1.f) * g_hmul[h] * (g_vs_sp && h != SH_INK && h != SH_FIBRE ? sampler_vox_scale(g_vs_sp, si) : 1.f); }   /* the source's "heads" multiplier x --uw */
 /* --init-from: does an unwrap2 donor keep its rv pair / ink row somewhere other than this net's channels (u1 rv 11-12 -> U2 ink 11, rv
    12-13)? Then the head is mapped by name; same places (a donor that only lacks appended heads, e.g. the fibre head) keep the positional
    branches */
@@ -3238,6 +3239,9 @@ int cmd_train(int argc, char **argv) {
     sample_cfg sc = sample_cfg_default();
     sc.P = P; sc.Pz = g_Pz != P ? g_Pz : 0; sc.B = B; sc.nworkers = workers; sc.nbuf = atoi(opt(argc, argv, "--sampler-slots", "0")) > 0 ? atoi(opt(argc, argv, "--sampler-slots", "0")) : 4 * ng + 2;   /* batches in flight (each worker fills one; pinned memory per slot) */ sc.seed = seed; sc.xfmt = g_xfmt;
     sc.echo_max = atoi(opt(argc, argv, "--echo-max", "0"));   /* --echo-max M: adaptive echoing, a step that would wait for data redraws a recent window (sample.h) */
+    sc.snap_jitter = atoi(opt(argc, argv, "--snap-jitter", "0")); sc.edge_boost = atoi(opt(argc, argv, "--edge-boost", "0")); sc.vox_cap = (float)atof(opt(argc, argv, "--vox-cap", "0"));
+    sc.focus_w = (float)atof(opt(argc, argv, "--focus-w", "0")); sc.stick = atoi(opt(argc, argv, "--stick-src", "0"));
+    if (sc.snap_jitter || sc.edge_boost || sc.vox_cap > 0 || sc.focus_w > 0 || sc.stick) fprintf(stderr, "sampler balance: snap-jitter %d, edge-boost %d, vox-cap %g, focus-w %g, stick-src %d\n", sc.snap_jitter, sc.edge_boost, sc.vox_cap, sc.focus_w, sc.stick);
     sc.echo_keep = split ? 1 : ng;   /* (the windows a step takes; sampler_start holds 2 per window as echo candidates only when the slots spare them) */
     const int ngh = split ? 1 : ng;   /* (batches the trainer holds: one per GPU; --split z: one window on both, 2026-11-14) */
     if (workers > sc.nbuf - ngh)   /* a worker fills a slot of its own and the trainer holds about one per GPU: workers beyond the free slots wait, and each
@@ -4605,7 +4609,7 @@ int cmd_train(int argc, char **argv) {
         fprintf(stderr, "train: --lat-direct-p %g: %d of %d sources have a \"latvol\" twin; their direct windows take the trunk's input from the stored cells (no step jitter)\n", g_lat_dp, nlv, S->n);
         sc.lat_direct_p = g_lat_dp;
     }
-    sampler *sp = sampler_start(S, &sc);
+    sampler *sp = sampler_start(S, &sc); g_vs_sp = sp;
     if (!sp) return 1;
     char logp[1400]; snprintf(logp, sizeof logp, "%s/log.csv", out);
     if (step0) csv_extend_header(logp, ",gns,", ",gns,gns_g2,gns_s");   /* (a resumed run's older log.csv: the header gains the new columns) */
