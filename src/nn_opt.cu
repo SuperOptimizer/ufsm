@@ -604,6 +604,16 @@ extern "C" void nn_adamw(float *p, const float *g, float *m, float *v, size_t n,
 }
 __global__ void ema_k(float *e, const float *p, size_t n, float d) { size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; if (i < n) e[i] = d * e[i] + (1.f - d) * p[i]; }
 extern "C" void nn_ema(float *ema, const float *p, size_t n, float decay) { ema_k<<<nblk(n, 256), 256>>>(ema, p, n, decay); KCHECK(); }
+/* nn_ema only when every p[i] is finite (one block: small vectors, e.g. the GroupNorm running statistics); else *skips += 1 and ema kept.
+   (2026-11-13 scratch2 try2: one non-finite window's batch statistics went into the gn_ema running statistics, and every later forward
+   that read them was non-finite: steps 501-508 skipped until the run was stopped) */
+__global__ void ema_finite_k(float *e, const float *p, size_t n, float d, unsigned *skips) {
+    int bad = 0;
+    for (size_t i = threadIdx.x; i < n; i += blockDim.x) bad |= !isfinite(p[i]);
+    if (__syncthreads_or(bad)) { if (!threadIdx.x && skips) atomicAdd(skips, 1u); return; }
+    for (size_t i = threadIdx.x; i < n; i += blockDim.x) e[i] = d * e[i] + (1.f - d) * p[i];
+}
+extern "C" void nn_ema_finite(float *ema, const float *p, size_t n, float decay, unsigned *skips) { if (!n) return; ema_finite_k<<<1, 1024>>>(ema, p, n, decay, skips); KCHECK(); }
 __global__ void sum_k(const float *x, size_t n, float *out, int sq) {
     double s = 0;
     for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) { double v = x[i]; s += sq ? v * v : v; }

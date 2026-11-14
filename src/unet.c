@@ -2151,7 +2151,7 @@ static void ge_site1(unet *u, float *d, int g, size_t off, void *arg) {
 static void ge_alloc(unet *u) {
     if (u->ge_run) return;
     u->ge_ns = gn_sites(u, nullptr, nullptr);
-    u->ge_run = nn_malloc(3 * u->ge_ns * 4); nn_zero(u->ge_run, 3 * u->ge_ns * 4); u->ge_n = 0;
+    u->ge_run = nn_malloc(3 * u->ge_ns * 4 + 64); nn_zero(u->ge_run, 3 * u->ge_ns * 4 + 64); u->ge_n = 0;   /* (+ the skip counter after the three arrays) */
 }
 static void ge_begin(unet *u) {   /* forward start: latch ge_c, the running statistics into the sites */
     u->ge_c = 0;
@@ -2179,12 +2179,15 @@ static void ge_after(unet *u) {   /* training forward, live weights: the batch's
         const float *m = u->ge_c ? u->ge_tw + (size_t)N * u->ge_so[i] : u->ge_sp[i], *r = u->ge_c ? u->ge_tw + (size_t)N * u->ge_so[i + 1] : u->ge_sp[i + 1];
         nn_gn_ema_update(bat + u->ge_so[i], m, r, N, u->ge_sg[i], 1.f, 1e-5f);
     }
-    if (!u->ge_n) { nn_d2d(run, bat, u->ge_ns * 4); nn_d2d(rune, bat, u->ge_ns * 4); }
-    else nn_ema(run, bat, u->ge_ns, 1.f - u->ge_mom);
+    /* a non-finite window's statistics are not pooled (nn_ema_finite; counted, unet_gn_ema_skips): they would make every later forward non-finite */
+    unsigned *sk = (unsigned *)(bat + u->ge_ns);
+    if (!u->ge_n) { nn_ema_finite(run, bat, u->ge_ns, 0.f, sk); nn_ema_finite(rune, bat, u->ge_ns, 0.f, nullptr); }
+    else nn_ema_finite(run, bat, u->ge_ns, 1.f - u->ge_mom, sk);
     u->ge_n++;
 }
 void unet_set_gn_ema(unet *u, float mom, int warm) { u->ge_mom = mom; u->ge_warm = warm; }
 long unet_gn_ema_updates(const unet *u) { return u->ge_n; }
+unsigned unet_gn_ema_skips(const unet *u) { unsigned k = 0; if (u->cfg.gn_ema && u->ge_run) nn_d2h(&k, u->ge_run + 3 * u->ge_ns, 4); return k; }
 static void l0_begin(unet *u) {   /* forward start: latch l0_c, the constant statistics into the sites */
     const int md = u->cfg.l0_norm, G = l0_G(u), N = u->xs.n;
     if (md == 4 && l0s_kern(u)) { l0s_kern_begin(u); u->l0_c = 0; return; }   /* (live statistics, the readers apply each plane's slab) */
@@ -4912,7 +4915,16 @@ int unet_load(unet *u, const char *path) {
     }
     if (u->cfg.gn_ema) {   /* (a checkpoint without them: a fresh warm-up on live statistics) */
         ge_alloc(u);
-        if (cfg.gn_ema && g_loaded_ge_cnt == 2 * u->ge_ns) { nn_h2d(u->ge_run, g_loaded_ge_run, g_loaded_ge_cnt * 4); u->ge_n = g_loaded_ge_n; u->ge_warm = g_loaded_ge_warm; u->ge_mom = g_loaded_ge_mom; }
+        if (cfg.gn_ema && g_loaded_ge_cnt == 2 * u->ge_ns) {
+            /* non-finite running statistics (a checkpoint saved after a non-finite window was pooled, before nn_ema_finite: scratch2 try2's
+               last.ckpt of 11-13, 32 means of 4 sites): the EMA weights' copy where finite, else a fresh warm-up */
+            size_t nbad = 0, nfix = 0;
+            for (size_t i = 0; i < u->ge_ns; i++) if (!isfinite(g_loaded_ge_run[i])) { nbad++; if (isfinite(g_loaded_ge_run[u->ge_ns + i])) { g_loaded_ge_run[i] = g_loaded_ge_run[u->ge_ns + i]; nfix++; } }
+            for (size_t i = 0; i < u->ge_ns; i++) if (!isfinite(g_loaded_ge_run[u->ge_ns + i])) { nbad++; if (isfinite(g_loaded_ge_run[i])) { g_loaded_ge_run[u->ge_ns + i] = g_loaded_ge_run[i]; nfix++; } }
+            if (nbad) fprintf(stderr, "unet: gn_ema: %zu non-finite running statistics in the checkpoint, %zu taken from the other copy%s\n", nbad, nfix, nfix < nbad ? "; a fresh warm-up" : "");
+            if (nfix < nbad) { nn_zero(u->ge_run, 3 * u->ge_ns * 4); u->ge_n = 0; }
+            else { nn_h2d(u->ge_run, g_loaded_ge_run, g_loaded_ge_cnt * 4); u->ge_n = g_loaded_ge_n; u->ge_warm = g_loaded_ge_warm; u->ge_mom = g_loaded_ge_mom; }
+        }
         else { if (cfg.gn_ema) fprintf(stderr, "unet: gn_ema: the checkpoint holds %zu running statistics, the net %zu: a fresh warm-up\n", g_loaded_ge_cnt, 2 * u->ge_ns);
                nn_zero(u->ge_run, 3 * u->ge_ns * 4); u->ge_n = 0; }
     }

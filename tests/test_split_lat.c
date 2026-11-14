@@ -19,12 +19,14 @@
 
 static int P, Pc, Dl, H0, TOP, LC = 29, DEV[2] = {0, 1};   /* P voxels (Pc = P / 4 cells); Dl, H0: this side's cells, the halo cells */
 static _Float16 *hct; static uint8_t *hrec; static _Float16 *hg; static float hbas[29 * 64], hgain[29];
+static int g_gnema; static unsigned g_skips;
 static size_t RB;   /* record bytes (global depth P) */
 
 typedef struct { unet *u; void *ct, *rec, *gl; } side_t;
 static void side_alloc(side_t *d, const unet_cfg *cfg, int dcells, int side) {
     const size_t nv = (size_t)P * P * 4 * dcells, nc = (size_t)Pc * Pc * dcells;
     d->u = unet_create(cfg); unet_init(d->u, 7); unet_set_lat_basis(d->u, hbas, hgain, LC, 0.f);
+    if (g_gnema) unet_set_gn_ema(d->u, 0.5f, 1);
     d->ct = nn_malloc(nv * 2); d->rec = nn_malloc(RB); d->gl = nn_malloc((size_t)cfg->cout * nc * 2);
     const int z0c = side < 0 ? 0 : side ? Pc / 2 - H0 : 0, z0v = 4 * z0c;   /* (the first cell / voxel plane of this side in the window) */
     nn_h2d(d->ct, hct + (size_t)z0v * P * P, nv * 2);
@@ -37,7 +39,10 @@ static void side_alloc(side_t *d, const unet_cfg *cfg, int dcells, int side) {
     }
     nn_h2d(d->gl, g, (size_t)cfg->cout * nc * 2); free(g);
 }
-static void side_free(side_t *d) { unet_free(d->u); nn_free(d->ct); nn_free(d->rec); nn_free(d->gl); }
+/* g_gnema / g_skips (above): UFSM_TEST_GN_EMA=1: cfg.gn_ema with a 1-step warm-up, two steps per run: the second forward
+                                                  on the running statistics, its batch statistics through the twins (the 11-13 try2 NaN: the
+                                                  split decoders' running means non-finite once the constant statistics started); skips must stay 0 */
+static void side_free(side_t *d) { if (g_gnema) g_skips += unet_gn_ema_skips(d->u); unet_free(d->u); nn_free(d->ct); nn_free(d->rec); nn_free(d->gl); }
 static void logits_d2h(side_t *d, const float *lg, int cout, int dcells, int z0, int nz, float *out, int oz) {   /* cells [z0, z0 + nz) -> out planes from oz */
     const size_t pl = (size_t)Pc * Pc, nc = pl * dcells; const int h16 = unet_logits_h16(d->u);
     for (int c = 0; c < cout; c++) {
@@ -55,7 +60,9 @@ static int head_plane(side_t *d, int cout, int z, _Float16 *out) {   /* cells [z
 /* forward (the owned cells' logits to lo right away: lean layouts reuse the logit buffer in the backward), the 2 halo cells next to the cut
    through the streamed head after unet_split_head_halo k 2 (side >= 0; the single run: the 2 cells each side of the cut), then the backward */
 static float *g_lo; static _Float16 *g_hh[2]; static int g_hok[2];
-static void step(side_t *d, int cin, int cout, int dcells, int side) {
+static void step1(side_t *d, int cin, int cout, int dcells, int side);
+static void step(side_t *d, int cin, int cout, int dcells, int side) { if (g_gnema) step1(d, cin, cout, dcells, side); step1(d, cin, cout, dcells, side); }
+static void step1(side_t *d, int cin, int cout, int dcells, int side) {
     const shape5 xs = {1, cin, dcells, Pc, Pc};
     const float *lg = unet_forward_x(d->u, d->ct, xs, 1, 1); nn_sync();
     const size_t pl = (size_t)Pc * Pc;
@@ -173,6 +180,7 @@ static int run(unet_cfg cfg, int top, int Pv, split_ctx *ctx) {
                sname[sy], dl, what, rl, dh < 0 ? "not covered" : dh == 0 ? "identical" : "DIFFER", dg, what, rg, ok && okh ? "ok" : "FAIL");
         fails += !okh;
         fails += !ok;
+        if (g_gnema) { printf("    gn_ema: %u non-finite batch statistics not pooled%s\n", g_skips, g_skips ? "  FAIL" : ""); fails += g_skips != 0; g_skips = 0; }
     }
     free(hct); free(hrec); free(hg); free(g0); free(g1); free(g2); free(l0); free(l1); free(l2); free(h0a); free(h0b); free(h1a); free(h1b); free(h2a); free(h2b);
     return fails;
@@ -182,6 +190,7 @@ int main(void) {
     if (nn_init(0)) { printf("test_split_lat: no GPU, skipped\n"); return 0; }
     if (ufsm_env_on("UFSM_SPLIT_ONE_GPU") || nn_init(1)) { DEV[1] = 0; nn_init(0); nn_check(); }
     nn_set_f16(1); nn_set_grad_scale(1024.f); nn_set_loss_grad_h16(1);
+    g_gnema = ufsm_env_on("UFSM_TEST_GN_EMA");
     setenv("UFSM_F4_WGRAD", "1", 0);
     split_ctx *ctx = split_create(DEV[0], DEV[1]);
     int fails = 0;
@@ -193,7 +202,7 @@ int main(void) {
         fails += run(cfg, 0, getenv("UFSM_P") ? atoi(getenv("UFSM_P")) : 128, ctx);
     }
     if (!only || atoi(only) == 1) {   /* the scratch2 shape in small: 6 levels, attention on the bottleneck, levels 3.. whole */
-        unet_cfg cfg = {6, {32, 32, 64, 64, 96, 96}, LC + 3, 16, 8, 1}; cfg.half_res = 3; cfg.attn_blocks = 1;
+        unet_cfg cfg = {6, {32, 32, 64, 64, 96, 96}, LC + 3, 16, 8, 1}; cfg.half_res = 3; cfg.attn_blocks = 1; cfg.gn_ema = g_gnema;
         ci = 9; fails += run(cfg, 3, getenv("UFSM_P6") ? atoi(getenv("UFSM_P6")) : 256, ctx);
     }
     split_free(ctx);
