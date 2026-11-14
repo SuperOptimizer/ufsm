@@ -20,9 +20,10 @@ int main(void) {
     CHECK(opt_atoi("--x", "") == 0 && opt_atoi("--x", nullptr) == 0 && opt_atof("--x", nullptr) == 0, "empty / absent: 0");
     CHECK(opt_atof("--x", "2e4") == 2e4 && opt_atof("--x", "0.25") == 0.25 && opt_atof("--x", "-1") == -1, "plain numbers");
     CHECK(opt_atoll("--x", "123456789012") == 123456789012ll, "long long");
-    const char *badi[] = {"2e4", "288x", "abc", "1.5", "0,1", "99999999999"};
+    CHECK(opt_atoi("--x", "0,1") == 0 && opt_atoi("--x", "3,0") == 3 && opt_atof("--x", "0.5,2") == 0.5, "a list value: its first element (--onfly-gpu A,B)");
+    const char *badi[] = {"2e4", "288x", "abc", "1.5", "2x,1", "99999999999"};
     for (int k = 0; k < 6; k++) CHECK(child_rc(0, badi[k]) == 2, "opt_atoi(\"%s\") must exit 2", badi[k]);
-    const char *badf[] = {"1.5x", "abc", "0.1,0.2"};
+    const char *badf[] = {"1.5x", "abc", "0.1x,0.2"};
     for (int k = 0; k < 3; k++) CHECK(child_rc(1, badf[k]) == 2, "opt_atof(\"%s\") must exit 2", badf[k]);
     CHECK(child_rc(0, "42") == -1 && child_rc(1, "1e-3") == -1, "valid values return");
     /* unread flags: argv[1] is the command; --known (with a value) and --fam-x (prefix family) are read, --typo and --bool-typo are not */

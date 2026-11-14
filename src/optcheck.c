@@ -69,7 +69,10 @@ int opt_unread(const char *who, int argc, char **argv) {
     fprintf(stderr, "option %s: \"%s\" is not %s\n", name ? name : "?", v, what);
     exit(2);
 }
-static const char *num_end(const char *e) { while (*e == ' ' || *e == '\t' || *e == '\n') e++; return e; }
+/* the end of a number: trailing blanks, then nothing or a list (",..."): list-valued options (--onfly-gpu A,B, --gpus, --widths ...)
+   are read for their first element here, the code that splits the list reads the rest (2026-11-14 sweep: test_phase_onfly's
+   "--onfly-gpu 0,0" was refused). Junk right after the number ("2e4" for an integer, "288x", "1.5x") still is an error. */
+static const char *num_end(const char *e) { while (*e == ' ' || *e == '\t' || *e == '\n') e++; return *e == ',' ? e + strlen(e) : e; }
 long long opt_atoll(const char *name, const char *v) {
     if (!v || !*v) return 0;
     char *e; errno = 0; const long long r = strtoll(v, &e, 10);

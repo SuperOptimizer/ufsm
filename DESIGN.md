@@ -854,7 +854,7 @@ literal, or the name parameter of the ~90 per-file opt helpers, rewritten mechan
 records the name; main() names the --flags a command never looked up when it returns 0 (train also after its setup, as before, now
 after the sampler-only branch's --replay reads). The 512-name cap is gone (hash set). Numeric option values: 1999 atoi / atof /
 atoll(opt(.., "--n", ..)) calls became opt_atoi / opt_atof / opt_atoll, which exit 2 on a value that is not entirely a number
-("--steps 2e4" trained 2 steps; "--gpus 0,x", "--window 288x"); empty / absent stay 0. Checked: every literal default parses; every
+("--steps 2e4" trained 2 steps; "--window 288x"); empty / absent stay 0; a list value ("--onfly-gpu 0,1") gives its first element, as atoi did (the sweep refused test_phase_onfly's "0,0"; the list's own parser reads the rest). Checked: every literal default parses; every
 literal value given to those flags in scripts/, tests/ and README parses (hits were comments or same-named flags of other commands);
 the three flags that also take a word (predict --window auto, train --accum auto, surf-labels --dir auto) parse the number only
 otherwise. Also: train's fibre buffers used a second --P read with default 64 (128^3 boxes for the default 512^3 windows) and now use
