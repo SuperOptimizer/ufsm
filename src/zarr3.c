@@ -245,6 +245,7 @@ void z3_close(z3 *z) {
 }
 
 const z3_meta *z3_meta_of(const z3 *z) { return &z->m; }
+uint64_t z3_id(const z3 *z) { return z->id; }
 const void *z3_latvol(const z3 *z) { return z && !z->derive ? z->lv : nullptr; }
 const char *z3_key(const z3 *z) { return z->key; }
 const char *z3_root(const z3 *z) { while (z && !z->s && z3_base_of(z)) z = z3_base_of(z); return z && z->s ? store_root(z->s) : ""; }
