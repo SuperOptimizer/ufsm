@@ -127,7 +127,10 @@ and `dino-train` both read it):
 
     "holdout_file": "/vesuvius/ufsm/wbench/holdouts.json"
 
-The file matches boxes by the source's CT basename. `"holdout"` also accepts a list of boxes `[[z,y,x,nz,ny,nx], ...]`; the
+The file matches boxes by the source's CT basename. Until 11-14 it stopped at C24 (46 of the 70 1667 boxes, 8 of the 12 core guard
+boxes, covered by nothing); `python3 -I mkholdouts.py --check` now verifies that every boxes.tsv row lies inside a holdout box of its
+CT, and `mkholdouts.py` appends the missing ones (93 boxes since 11-14). Run it after adding boxes. Note: an on-the-fly ink source that
+reads this file takes at most 64 boxes per CT (inkfly_holdouts), and 1667 now has 70. `"holdout"` also accepts a list of boxes `[[z,y,x,nz,ny,nx], ...]`; the
 first box is the validation box.
 
 ## What one run does
