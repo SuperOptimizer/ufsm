@@ -6,6 +6,18 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Sampler balance: snap jitter, edge boost, zboost, rejection-aware draws, loss cap, packed focus (2026-11-14, branch sampbias-20261114)
+
+From the targeted sampler audit (/vesuvius/ufsm/audit-20261114/targeted/sampler.md; chunk maps read from the shard indices). All options default off, one flag each:
+- `--stick-src N`: a rejected draw (probe, min_fg, empty) is retried from the SAME source, up to N times in a row. Before, 1299-b3 kept 0.65 and 0139-u2ink 0.54 of their weight (rejection 26 / 43 %).
+- `--snap-jitter 1`: after the chunk snap each axis moves one chunk up with p 0.5. The floor put the drawn cell at index 3 of 0-5: coverage of a labelled region's low-z edge 0.68, high-z edge 0.48; with jitter 0.61 / 0.56.
+- `--edge-boost 1`: cells of the phase-occupancy index repeated clamp(round(1 / labelled share of the window box), 1, 4) times (box = P >> (cell level - lowest level) cells). Replay over the june chunk map (coverage per labelled chunk, interior 1.0 before): radius 6-12 0.99 -> 0.87, 18-22 0.83 -> 0.84, 22-26 (outermost turns) 0.69 -> 0.77, z edges 0.68 / 0.48 -> 0.71 / 0.78 (with jitter). The mean repeat is 1.15.
+- source json `"zboost": {"below": N, "k": K}`: cells with z index < N (cells of the occupancy grid, the log's "level L cells") drawn K times as often. For Paris 4: the lower third (hull rows 5-51 at 9.6 um) has winding labels only in july48 (codesB48 rows 46-103 of its 4.8 um grid = 9.6 um rows 23-51; rows 5-22 have none anywhere; june / july / june48 start at row 52 / 52 / 54, ink segments at 57). `"zboost": {"below": 104, "k": 4}` on july48 takes the lower share of its draws from 23.7 % to 55 %: at weight .031 that is 0.8 % -> 1.7 % of all draws, at .06 3.3 % (vs 34 % of the hull volume).
+- `--vox-cap K`: the geometry heads' loss (phase, normal, density, wind4, rv) of a source is scaled by min(1, K x its mean known-phase share / the weight-averaged mean share), measured per source on every kept window (1 / 61 of the side plane; 1 until 8 windows). The loss is a per-window mean, so 0500P2-gt (0.056 known) weighed x8.3 per voxel against june. K 2 gives it x0.25.
+- `--focus-w W`: overrides the "focus" w of every source that has a packed map (`ufsm phase-packing --map`), off at 0. No live source has a map yet.
+- Not done: the zero-CT share of drawn windows (11-13 %) is a property of 6 / 12-cell windows centred on labelled cells; edge-boost is the only correction (windows near the hull rim are drawn more, not fewer).
+- test_sampbias: index repeats, zboost, the scale factor, and a sampler with all options on.
+
 ## Unroll geometry error budget: masked-CT gate, cf-demod (z drift, demod-only ref), GT boxes in the check stage (2026-11-14, branch ugeomfix-20261114)
 
 Audit `/vesuvius/ufsm/audit-20261114/ugeom.md` (1667 vs the published tifxyz, held-out GT boxes on 1667 / Paris 4). Its numbers, and what changed:

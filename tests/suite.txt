@@ -10,6 +10,7 @@
 # Helper binaries without a line of their own: test_sheet (test-sheet), test_http_reader / test_sampler_safety / test_formats (python).
 test_target_erode                              |              |     1 | ./$B/test_target_erode
 test_wind_sampler                              |              |    19 | ./$B/test_wind_sampler
+test_sampbias                                  |              |     5 | ./$B/test_sampbias
 test_crush                                     |              |    17 | ./$B/test_crush
 test_vwt_aug                                   |              |     2 | ./$B/test_vwt_aug
 test_zcache                                    |              |    10 | ./$B/test_zcache

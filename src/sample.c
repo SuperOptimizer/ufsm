@@ -229,6 +229,7 @@ struct sampler {
     _Atomic uint64_t outw[64][2];   /* per source (< 64): aligned phase-gradient samples rising outward / inward (sample_phase_outward) */
     _Atomic uint32_t rej_sl[64][MAXLEV][SL_N];   /* per source (< 64) and level, by SL_* (sampler_level_stats) */
     atomic_uint_fast64_t rej_why[4];   /* draws dropped: coarse CT probe, CT read (min_fg), empty targets, holdout overlap (not in rejected) */
+    _Atomic double ksh_sum[64]; _Atomic uint64_t ksh_n[64];   /* per source (< 64): known-phase share of its windows (--vox-cap), sum / count */
     atomic_uint_fast64_t crushed;      /* --aug-crush windows drawn */
     atomic_uint_fast64_t augn[AUGN_N]; /* scroll augmentations applied (sampler_aug_count) */
     atomic_uint soft_bits;   /* current soft-target sigma (float bits), set by sampler_set_soft */
@@ -2688,8 +2689,12 @@ static void *sn_pre_thread(void *a) {
     for (int k; (k = atomic_fetch_add(&q->next, 1)) < q->nj;) scan_norm_of(&q->sp->S->src[q->jobs[k][0]], q->jobs[k][1], &c, &s);
     return nullptr;
 }
+static _Thread_local int g_stick_si = -1, g_stick_n, g_last_si = -1;   /* --stick-src: the source of the last draw / the one to redraw from */
 static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp, uint8_t *big, uint64_t tile_index, float *noise_state, chain_st *cs) {
     const int rc = draw_(sp, b, i, r, xtmp, ttmp, big, tile_index, noise_state, cs);
+    if (sp->cfg.stick > 0) {   /* a rejection redraws from the same source (<= N in a row, then the global mix again: a source that never yields cannot starve the others) */
+        if (rc == 1 && g_last_si >= 0 && g_stick_n < sp->cfg.stick) { g_stick_si = g_last_si; g_stick_n++; } else { g_stick_si = -1; g_stick_n = 0; }
+    }
     if (sp->c255 && ufsm_env_on("UFSM_BANK_CHECK")) {   /* tests: the shared 255 plane is never written */
         const size_t p3 = P3(sp); for (size_t k = 0; k < p3; k++) if (sp->c255[k] != 255) { fprintf(stderr, "sampler: the plane bank's 255 plane was written (voxel %zu = %d)\n", k, sp->c255[k]); abort(); }
     }
@@ -2716,7 +2721,9 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
     int si = 0;
     if (c->cover) si = (int)c->cover->tiles[tile_index][0];
     else if (cont) si = cs->si;
+    else if (g_stick_si >= 0 && sp->cfg.stick > 0 && !cont) { si = g_stick_si; g_stick_si = -1; }
     else while (si < sp->S->n - 1 && sp->cum[si] < u) si++;
+    g_last_si = si;
     source *s = &sp->S->src[si];
     if (c->holdout && !s->hold_n[0]) return 1;
     if (b->nbank && bank_assign(sp, s, b)) return -1;   /* (--plane bank, B 1: this window's label roles) */
@@ -2780,6 +2787,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
             if (o[d] > m->shape[d] - n[d]) o[d] = m->shape[d] - n[d];   /* the last window of an axis may stay unaligned */
             if (o[d] < 0) o[d] = 0;
             if (inbox && o[d] < blo[d]) o[d] = o[d] + cs <= bhi[d] ? o[d] + cs : blo[d];   /* (a "boxes" window stays in its box) */
+            if (c->snap_jitter && !inbox && o[d] + cs <= m->shape[d] - n[d] && runif(r) < 0.5) o[d] += cs;   /* (--snap-jitter: the floor biased windows toward - by half a chunk) */
         }
     }
     {   /* debugging / tests: UFSM_SAMPLE_AT="z,y,x[;z,y,x...]" (this level's voxels, cycled): replay given windows of the drawn source */
@@ -3630,6 +3638,11 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
             return 1;
         }
     }
+    if (c->vox_cap > 0 && c->side == 2 && si < 64 && !c->cover && !c->holdout && !s->ct_only && b->side && b->side != sp->c255 && !b->nbank) {   /* --vox-cap: known-phase share, 1/61 of the plane */
+        const uint8_t *sd = b->side + (size_t)i * p3; size_t kn = 0, nn = 0;
+        for (size_t k = (size_t)i % 61; k < p3; k += 61, nn++) kn += sd[k] < PHASE_PERIOD;
+        if (nn) { atomic_fetch_add(&sp->ksh_sum[si], (double)kn / (double)nn); atomic_fetch_add(&sp->ksh_n[si], 1); }
+    }
     memcpy(b->w + (size_t)i * NCH, w, NCH);
     b->src[i] = (int16_t)si;
     b->level[i] = (int8_t)l;
@@ -4119,6 +4132,21 @@ static int echo_reclaim(sampler *sp) {
     if (old >= 0) { sp->rq[old] = 0; sp->rleft[old] = 0; sp->state[old] = FREE; }
     return old;
 }
+/* --vox-cap K: loss factor of source si's geometry heads. The head loss is a mean over each window's weighted labelled voxels, so a source whose windows hold few
+   labels (0500P2-gt: 0.056 of the window vs 0.66 for june) weighs x (ref / its share) per voxel: x8.3 (live weights). Factor min(1, K share / ref), ref = the
+   weight-averaged mean share of the sources measured (>= 8 windows); 1 until it is measured. */
+float sampler_vox_scale(const sampler *sp, int si) {
+    if (!sp || sp->cfg.vox_cap <= 0 || si < 0 || si >= 64 || si >= sp->S->n) return 1.f;
+    double num = 0, den = 0, mine = -1;
+    for (int j = 0; j < sp->S->n && j < 64; j++) {
+        const uint64_t n = atomic_load(&sp->ksh_n[j]); if (n < 8) continue;
+        const double sh = atomic_load(&sp->ksh_sum[j]) / (double)n, w = sp->cum[j] - (j ? sp->cum[j - 1] : 0);
+        if (sh <= 0) continue; num += w * sh; den += w; if (j == si) mine = sh;
+    }
+    if (mine <= 0 || den <= 0) return 1.f;
+    const double f = (double)sp->cfg.vox_cap * mine / (num / den);
+    return f >= 1.0 ? 1.f : (float)f;
+}
 void sampler_echo_stats(sampler *sp, uint64_t *fresh, uint64_t *echoed) { *fresh = atomic_load(&sp->n_fresh); *echoed = atomic_load(&sp->n_echo); }
 static void *replay_thread(void *arg) {
     sampler *sp = arg; uint8_t *scr = nullptr;
@@ -4148,6 +4176,54 @@ static int replay_selftest(void) {   /* sym_inverse undoes every cube symmetry (
     uint8_t a[125], t[125], u[125]; for (int k = 0; k < 125; k++) a[k] = (uint8_t)k;
     for (int q = 0; q < 48; q++) { const sym y = sym_of(q); sym_u8(a, t, 5, 5, y); sym_u8(t, u, 5, 5, sym_inverse(y)); if (memcmp(a, u, 125)) return -1; }
     return 0;
+}
+/* --edge-boost 1 and the source's "zboost" (sampbias 2026-11-14): the position draw's index of cells, repeated.
+   edge-boost: cell j x clamp(round(1 / labelled share of the window box around it), 1, 4) (box = P / 2^(cell level - lowest level) cells, 2..12 wide, the cell at its
+   index n/2 - 1 as the snapped draw puts it); only grids of <= 4e8 cells. The window box around the outermost turns holds 50-70 % labelled cells and the uniform
+   cell draw covered them 0.58-0.85 (9.6 um) of the interior (DESIGN 2026-11-14).
+   zboost {"below": N, "k": K}: cells with z index < N (the occupancy grid's) K times: the only winding labels in Paris 4's lower third are july48's. */
+static void edge_zboost_index(sampler *sp, const source *fs, occ_index *o) {
+    const sample_cfg *c = &sp->cfg; const int64_t *sh = o->shape;
+    const size_t tot = (size_t)sh[0] * sh[1] * sh[2];
+    const int zb = fs->zb_below > 0 && fs->zb_k > 1.f, eb = c->edge_boost && tot <= (size_t)400000000 && fs->band && fs->phase;
+    if (!zb && !eb) return;
+    uint8_t *rep = malloc(o->n); if (!rep) return;
+    for (size_t k = 0; k < o->n; k++) rep[k] = 1;
+    if (eb) {
+        int dl = o->lev - (fs->min_level > 0 ? fs->min_level : 0); int n = dl >= 0 && dl < 8 ? c->P >> dl : 2; n = n < 2 ? 2 : n > 12 ? 12 : n;
+        uint8_t *bm = calloc(tot, 1); int32_t *acc = malloc(tot * sizeof *acc);
+        if (bm && acc) {
+            for (size_t k = 0; k < o->n; k++) bm[o->idx[k]] = 1;
+            /* separable box sums of the window range [j - (n/2 - 1), j + n/2] along x, y, z */
+            const int lo = n / 2 - 1, hi = n / 2; int32_t *tmp = malloc(tot * sizeof *tmp);
+            if (tmp) {
+                for (size_t k = 0; k < tot; k++) tmp[k] = bm[k];
+                for (int ax = 2; ax >= 0; ax--) {   /* in place via a prefix pass per line */
+                    const int64_t len = sh[ax], str = ax == 2 ? 1 : ax == 1 ? sh[2] : sh[1] * sh[2];
+                    for (size_t b0 = 0; b0 < tot; b0++) {
+                        const int64_t pos = (int64_t)(b0 / (size_t)str) % len; if (pos) continue;   /* line starts */
+                        int64_t run = 0; for (int64_t t = 0; t <= hi && t < len; t++) run += tmp[b0 + t * str];
+                        for (int64_t j = 0; j < len; j++) {
+                            acc[b0 + j * str] = (int32_t)run;
+                            const int64_t add = j + hi + 1, sub = j - lo; if (add < len) run += tmp[b0 + add * str]; if (sub >= 0) run -= tmp[b0 + sub * str];
+                        }
+                    }
+                    memcpy(tmp, acc, tot * sizeof *tmp);
+                }
+                const double vol = (double)n * n * n;
+                for (size_t k = 0; k < o->n; k++) { const double d = tmp[o->idx[k]] / vol; const int r = d > 0 ? (int)lround(1.0 / d) : 4; rep[k] = (uint8_t)(r < 1 ? 1 : r > 4 ? 4 : r); }
+                free(tmp);
+            }
+        }
+        free(bm); free(acc);
+    }
+    if (zb) for (size_t k = 0; k < o->n; k++) { const int64_t z = o->idx[k] / (sh[1] * sh[2]); if (z < fs->zb_below) { const int r = (int)lround((double)rep[k] * fs->zb_k); rep[k] = (uint8_t)(r > 255 ? 255 : r); } }
+    size_t nn = 0; for (size_t k = 0; k < o->n; k++) nn += rep[k];
+    uint32_t *ix = malloc(nn * sizeof *ix);
+    if (ix) { size_t q = 0; for (size_t k = 0; k < o->n; k++) for (int t = 0; t < rep[k]; t++) ix[q++] = o->idx[k];
+        fprintf(stderr, "sampler: %s: %s%s: %zu cells -> %zu draws (x%.2f)\n", fs->name, eb ? "edge-boost" : "", zb ? (eb ? " + zboost" : "zboost") : "", o->n, nn, (double)nn / (double)o->n);
+        free(o->idx); o->idx = ix; o->n = nn; }
+    free(rep);
 }
 sampler *sampler_start(sources *S, const sample_cfg *cfg) {
     if (rskip_selftest()) { fprintf(stderr, "sampler: rng jump-ahead self-test failed\n"); return nullptr; }
@@ -4346,13 +4422,14 @@ sampler *sampler_start(sources *S, const sample_cfg *cfg) {
     for (int i = 0; !cfg->cover && cfg->restore != 2 && i < S->n; i++) {
         occ_index o = source_occupancy(&S->src[i]);
         const source *fs = &S->src[i];
-        if (o.n && fs->focus && fs->focus_w > 0) {   /* "focus": cell k drawn 1 + w x packed share times as often (repeated in the index) */
+        if (o.n) edge_zboost_index(sp, fs, &o);
+        if (o.n && fs->focus && (cfg->focus_w > 0 || fs->focus_w > 0)) {   /* "focus": cell k drawn 1 + w x packed share times as often (repeated in the index) */
             if (fs->focus_grid[0] != o.shape[0] || fs->focus_grid[1] != o.shape[1] || fs->focus_grid[2] != o.shape[2])
                 fprintf(stderr, "sampler: %s: the focus map grid %lldx%lldx%lld differs from the occupancy grid %lldx%lldx%lld: focus off\n", fs->name,
                         (long long)fs->focus_grid[0], (long long)fs->focus_grid[1], (long long)fs->focus_grid[2], (long long)o.shape[0], (long long)o.shape[1], (long long)o.shape[2]);
             else {
                 size_t nn = 0; int *rep = malloc(o.n * sizeof *rep);
-                for (size_t k = 0; k < o.n; k++) { const uint8_t v = fs->focus[o.idx[k]]; rep[k] = 1 + (v ? (int)lround(fs->focus_w * (v - 1) / 254.0) : 0); nn += (size_t)rep[k]; }
+                for (size_t k = 0; k < o.n; k++) { const uint8_t v = fs->focus[o.idx[k]]; rep[k] = 1 + (v ? (int)lround((cfg->focus_w > 0 ? cfg->focus_w : fs->focus_w) * (v - 1) / 254.0) : 0); nn += (size_t)rep[k]; }
                 uint32_t *ix = malloc(nn * sizeof *ix); size_t q = 0;
                 if (ix && rep) {
                     for (size_t k = 0; k < o.n; k++) for (int t = 0; t < rep[k]; t++) ix[q++] = o.idx[k];
