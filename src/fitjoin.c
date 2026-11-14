@@ -593,7 +593,7 @@ int cmd_fit_join(int argc, char **argv) {
             printf("  %4d  %9lld  %15.4f  %+11ld  %13.4f  %10.4f\n", k, hr[k].tot, (double)cm / hr[k].tot, S[k] - md, (double)cc / hr[k].tot, (double)nr / hr[k].tot);
             rt += hr[k].tot; rs += cc;
         }
-        printf("  mean share of the ref's integer at the chosen gauges, cell weighted: %.4f (self-consistency with the ref, not a quality measure: P4 0.971 at GT ids 0.18)\n", rt ? (double)rs / rt : 0);
+        printf("  mean share of the ref's integer at the chosen gauges, cell weighted: %.4f\n", rt ? (double)rs / rt : 0);
         fit_set_free(ref);
     }
     const int chosen = refdir || glob || hf;
@@ -608,7 +608,7 @@ int cmd_fit_join(int argc, char **argv) {
         tot_n += used; tot_share += share * used;
     }
     if (ns > 1) printf("  mean share(mode) over the boundaries, overlap-cell weighted: %.4f\n", tot_n ? tot_share / tot_n : 0);
-    if (ns > 1 && chosen) printf("  integer agreement on the overlaps at the chosen gauges, overlap-cell weighted: %.4f (slab-to-slab self-consistency, not a quality measure)\n", tot_n ? (double)tot_c / tot_n : 0);
+    if (ns > 1 && chosen) printf("  integer agreement on the overlaps at the chosen gauges, overlap-cell weighted: %.4f\n", tot_n ? (double)tot_c / tot_n : 0);
     /* where each slab's gauge came from (audit 11-14 #18: a slab with no ref and no overlap cells got its gauge at zero cost, silently) */
     int nref_g = 0, nchain_g = 0, nfree = 0;
     for (int k = 0; k < ns; k++) {
