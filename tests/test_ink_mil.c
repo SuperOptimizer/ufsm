@@ -69,6 +69,18 @@ int main(void) {
                             free(gc); }
                         ink_mil_set_async(-1);
                     }
+                    if (ink_mil_swap_hostmem && ink_mil_overflows && ink_mil_set_async && mode == 1) {   /* try6 (2026-11-14): the rays replaced between fin
+                        and the backward slabs (shifted 6 planes in z: the bound undercounts) must not fail; the next step falls back to the readback */
+                        inkray *R2 = malloc(NR * sizeof *R2); memcpy(R2, R, NR * sizeof *R2);
+                        for (int i = 0; i < NR; i++) R2[i].p[0] = R[i].p[0] < D / 2 ? R[i].p[0] + 6 : R[i].p[0] - 6;
+                        float *gs = malloc(nv * 4), *gr = malloc(nv * 4); double Lr = 0;
+                        ink_mil_set_async(0); ink_mil_slab_hostmem(lg, 0, D, H, W, R2, NR, Rr, step, tau, eps, sc, 7, gr, &Lr);
+                        const int o0 = ink_mil_overflows(); ink_mil_set_async(1);
+                        const int rc = ink_mil_swap_hostmem(lg, D, H, W, R, R2, NR, Rr, step, tau, eps, sc, 7, gs);
+                        fprintf(stderr, "mil rays swapped under the backward: rc %d, overflows %d, step 2 == readback: %s\n", rc, ink_mil_overflows() - o0, rc ? "-" : !memcmp(gs, gr, nv * 4) ? "yes" : "no");
+                        CHECK(!rc && ink_mil_overflows() - o0 == 1 && !memcmp(gs, gr, nv * 4), "mil plane-bound overflow: no fallback to the readback (rc %d)", rc);
+                        ink_mil_set_async(-1); free(R2); free(gs); free(gr);
+                    }
                 }
             }
             free(g);

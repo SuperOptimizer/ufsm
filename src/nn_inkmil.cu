@@ -155,7 +155,8 @@ extern "C" void ink_mil_set_max(int nr) { g_nrmax = nr; }
    counts, one plane of margin each side) with the unused tail filled by keys that sort last, and k_runs reads the true count on the device:
    the same sorted prefix, the same sums. An exceeded bound (never expected) is reported by the next step's first slab. Layout: device
    d[0, cap) the plane counts, d[cap] the overflow word; pinned h[0, cap) the counts, h[cap + 1] the previous step's overflow word. */
-static int g_mil_async = -1;
+static int g_mil_async = -1, g_mil_ovf;
+extern "C" int ink_mil_overflows(void) { return g_mil_ovf; }   /* tests: plane-bound overflows seen (each switched to the readback) */
 extern "C" void ink_mil_set_async(int on) { g_mil_async = on; }
 static __thread struct { unsigned *h, *d; cudaEvent_t ev; const float *dz; const inkray *rays; int D, nr, K, pend, cap; float R, step; } t_ph;
 static int mgrow(int i, size_t n) {
@@ -199,10 +200,17 @@ extern "C" int ink_mil_bwd_slab(const float *dz, int z0, int nz, int D, int H, i
     cudaStream_t st = (cudaStream_t)stream; const long long n = (long long)nr * K; const size_t cap = (size_t)(g_nrmax > nr ? (long long)g_nrmax * K : n) * 8;
     if (cap > 0xffffffffull || mgrow(1, cap * 8) || mgrow(2, cap * 4) || mgrow(3, cap * 8) || mgrow(4, cap * 4) || mgrow(5, 64)) return -1;
     unsigned *dc = (unsigned *)t_ms.p[5]; unsigned hc = 0;
-    const int ph = t_ph.dz == dz && t_ph.rays == rays && t_ph.D == D && t_ph.nr == nr && t_ph.K == K && t_ph.R == R && t_ph.step == step;
-    if (ph) {   /* the bound from fin's plane counts (waits for them once per step) */
-        if (t_ph.pend) { if (cudaEventSynchronize(t_ph.ev)) return -1; t_ph.pend = 0;
-            if (t_ph.h[t_ph.cap + 1]) { fprintf(stderr, "ink mil: a slab's pairs exceeded its plane bound by %u (gradient incomplete)\n", t_ph.h[t_ph.cap + 1]); return -1; } }
+    int ph = t_ph.dz == dz && t_ph.rays == rays && t_ph.D == D && t_ph.nr == nr && t_ph.K == K && t_ph.R == R && t_ph.step == step;
+    if (ph && t_ph.pend) {   /* fin's plane counts (waited for once per step) */
+        if (cudaEventSynchronize(t_ph.ev)) return -1;
+        t_ph.pend = 0;
+        if (t_ph.h[t_ph.cap + 1]) {   /* an earlier step's slab had more pairs than its bound (its MIL gradient lost the excess): the per-slab readback
+                                         from now on, for every thread (try6 2026-11-14: the rays changed between fin and the backward, see train.c mil_take) */
+            fprintf(stderr, "ink mil: a slab's pairs exceeded its plane bound by %u in an earlier step (that step's MIL gradient incomplete); the per-slab readback from now on\n", t_ph.h[t_ph.cap + 1]);
+            g_mil_ovf++; g_mil_async = 0; t_ph.dz = nullptr; ph = 0;
+        }
+    }
+    if (ph) {   /* the bound from fin's plane counts */
         unsigned long long b = 0; for (int a = z0 - 1; a <= z0 + nz; a++) if (a >= 0 && a <= t_ph.cap - 1) b += t_ph.h[a];
         if (!b) return 0;
         hc = (unsigned)(b < cap ? b : cap);
@@ -244,6 +252,31 @@ extern "C" int ink_mil_slab_hostmem(const float *logit, int bf16, int D, int H, 
         if (ink_mil_bwd_slab(acc, z0, z1 - z0, D, H, W, dr, nr, R, step, (char *)dg + (size_t)z0 * H * W * 2, bf16, nullptr)) goto out; }
     if (cudaMemcpy(h, dg, nv * 2, cudaMemcpyDeviceToHost) || cudaMemcpy(loss, dL, 8, cudaMemcpyDeviceToHost)) goto out;
     for (size_t k = 0; k < nv; k++) { if (bf16) { __nv_bfloat16 b; memcpy(&b, &h[k], 2); grad[k] = __bfloat162float(b); } else { __half b; memcpy(&b, &h[k], 2); grad[k] = __half2float(b); } }
+    rc = 0;
+out:
+    free(h); cudaFree(dl); cudaFree(dg); cudaFree(dr); cudaFree(acc); cudaFree(dL); return rc;
+}
+/* tests: try6's failure on host arrays. Step 1: the slab passes and fin on rays A, then rays B copied over the device rays before the
+   backward slabs (the next window's upload under the backward), whose pairs then exceed the plane bound; step 2: the passes on B. Returns
+   step 2's status; grad: step 2's 16-bit gradient as float (the bound path's overflow from step 1 must fall back to the readback) */
+extern "C" int ink_mil_swap_hostmem(const float *logit, int D, int H, int W, const inkray *ra, const inkray *rb, int nr, float R, float step, float tau, float eps,
+                                    float scale, int nslab, float *grad) {
+    const size_t nv = (size_t)D * H * W; const int K = ink_mil_samples(R, step); int rc = -1;
+    uint16_t *h = (uint16_t *)malloc(nv * 2); void *dl = nullptr, *dg = nullptr; inkray *dr = nullptr; float *acc = nullptr; double *dL = nullptr;
+    for (size_t k = 0; k < nv; k++) { __half b = __float2half(logit[k]); memcpy(&h[k], &b, 2); }
+    if (cudaMalloc(&dl, nv * 2) || cudaMalloc(&dg, nv * 2) || cudaMalloc(&dr, (size_t)nr * sizeof *dr) || cudaMalloc(&acc, (size_t)nr * K * 4) || cudaMalloc(&dL, 8)) goto out;
+    if (cudaMemcpy(dl, h, nv * 2, cudaMemcpyHostToDevice)) goto out;
+    for (int it = 0; it < 2; it++) {
+        if (cudaMemcpy(dr, it ? rb : ra, (size_t)nr * sizeof *dr, cudaMemcpyHostToDevice) || cudaMemset(dg, 0, nv * 2) || cudaMemset(acc, 0, (size_t)nr * K * 4) || cudaMemset(dL, 0, 8)) goto out;
+        for (int s = 0; s < nslab; s++) { const int z0 = (int)((long long)D * s / nslab), z1 = (int)((long long)D * (s + 1) / nslab);
+            if (ink_mil_fwd_slab((const char *)dl + (size_t)z0 * H * W * 2, 0, z0, z1 - z0, D, H, W, dr, nr, R, step, acc, nullptr)) goto out; }
+        if (ink_mil_fin(acc, dr, nr, D, H, W, R, step, tau, eps, scale, dL, nullptr)) goto out;
+        if (!it && cudaMemcpy(dr, rb, (size_t)nr * sizeof *dr, cudaMemcpyHostToDevice)) goto out;   /* (the rays change under the backward) */
+        for (int s = 0; s < nslab; s++) { const int z0 = (int)((long long)D * s / nslab), z1 = (int)((long long)D * (s + 1) / nslab);
+            if (ink_mil_bwd_slab(acc, z0, z1 - z0, D, H, W, dr, nr, R, step, (char *)dg + (size_t)z0 * H * W * 2, 0, nullptr)) goto out; }
+    }
+    if (cudaMemcpy(h, dg, nv * 2, cudaMemcpyDeviceToHost)) goto out;
+    for (size_t k = 0; k < nv; k++) { __half b; memcpy(&b, &h[k], 2); grad[k] = __half2float(b); }
     rc = 0;
 out:
     free(h); cudaFree(dl); cudaFree(dg); cudaFree(dr); cudaFree(acc); cudaFree(dL); return rc;

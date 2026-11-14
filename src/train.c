@@ -889,6 +889,10 @@ static size_t mil_bytes(void) { const size_t n = (size_t)g_mil_max * ink_mil_sam
 static void mil_take(gpu_state *d, const batch *b, int i, int copy_stream) {   /* --ink-mil: buffer i's rays (the batch's host list, copied in stream order) */
     if (!g_mil) return;
     const int n = b->mil && b->nmil && b->mil[0] ? (b->nmil[0] < g_mil_max ? b->nmil[0] : g_mil_max) : 0;
+    /* the copy stream (upload_async) waits for the step that last read buffer i (two back). It used to copy at once, before upload_async's
+       waits, and lean modes shared one ray buffer: the next window's rays landed under the current step's backward slabs (try6 P 512
+       DP 2026-11-14: "a slab's pairs exceeded its plane bound", and with UFSM_MIL_ASYNC=0 a MIL gradient from the wrong rays, silently) */
+    if (n && copy_stream) nn_stream_wait(copy_stream, d->ev_done[i]);
     d->miln[i] = n; if (n) nn_h2d_stream(copy_stream, d->milr[i], b->mil[0], (size_t)n * sizeof(inkray));
     if (n && ufsm_env_on("UFSM_MIL_CHECK")) { free(d->milh[i]); d->milh[i] = malloc((size_t)n * sizeof(inkray)); if (d->milh[i]) memcpy(d->milh[i], b->mil[0], (size_t)n * sizeof(inkray)); }   /* (the check's host copy) */
 }
@@ -4165,7 +4169,7 @@ int cmd_train(int argc, char **argv) {
             d->iscratch = nn_malloc(nn_loss_scratch((shape5){1, 1, g_Pz, P, P}) + 64);
             if (g_mil) {   /* --ink-mil: the rays of both buffers, the per-sample accumulator, the loss (the backward's sort buffers: inkmil's own, in mil_bytes) */
                 d->mil_k = ink_mil_samples(g_mil_R, g_mil_step);
-                d->milr[0] = nn_malloc((size_t)g_mil_max * sizeof(inkray)); d->milr[1] = lean ? d->milr[0] : nn_malloc((size_t)g_mil_max * sizeof(inkray));
+                d->milr[0] = nn_malloc((size_t)g_mil_max * sizeof(inkray)); d->milr[1] = nn_malloc((size_t)g_mil_max * sizeof(inkray));   /* (two buffers in every mode, lean too: see mil_take) */
                 d->milacc = nn_malloc((size_t)g_mil_max * d->mil_k * sizeof(float)); if (g_lsplit) d->milacc2 = nn_malloc((size_t)g_mil_max * d->mil_k * sizeof(float)); d->milloss = nn_malloc(sizeof(double)); d->miln[0] = d->miln[1] = 0;
             }
             d->nscratch = nn_malloc(nn_loss_scratch((shape5){1, 7, g_Pz, P, P}) + 64);
