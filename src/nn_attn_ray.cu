@@ -157,13 +157,13 @@ extern "C" void at_ray_scatter(const at_rays *R, const float *y, float *x, int C
     else k_ray_scatter<0><<<nbk(Tr * C4, 256), 256>>>(G, R->ray, R->ad, R->wsum, Tr, C4, y, x);
 }
 
-__global__ void k_scroll_pos(long long n, int S, int nreg, int D, int Hh, int W, int P, const int *ad, const float *cen, float *pos) {
+__global__ void k_scroll_pos(long long n, long long S, int nreg, int D, int Hh, int W, int P, const int *ad, const float *cen, float *pos) {
     const long long t = blockIdx.x * (long long)blockDim.x + threadIdx.x;
     if (t >= n) return;
-    const int b = (int)(t / S), ts = (int)(t % S) - nreg;
+    const int b = (int)(t / S); const long long ts = t % S - nreg;   /* (long long: a grid of 2^31 samples or more; audit mini/overflow #3) */
     float *p = pos + 3 * t;
     if (ts < 0) { p[0] = p[1] = p[2] = 0.f; return; }
-    const int z = ts / (Hh * W), y = (ts / W) % Hh, x = ts % W, a_ = ad[b];
+    const int z = (int)(ts / ((long long)Hh * W)), y = (int)(ts / W % Hh), x = (int)(ts % W), a_ = ad[b];
     const int k = a_ == 0 ? z : a_ == 1 ? y : x, ua = a_ == 0 ? y : z, vb = a_ == 2 ? y : x;
     const float *c = cen + ((size_t)b * P + k) * 4;
     if (c[2] < 0.f) { p[0] = (float)vb; p[1] = (float)ua; p[2] = (float)k; return; }
@@ -172,6 +172,6 @@ __global__ void k_scroll_pos(long long n, int S, int nreg, int D, int Hh, int W,
     p[0] = sqrtf(du * du + dv * dv); p[1] = th * c[2]; p[2] = (float)k;
 }
 extern "C" void at_scroll_pos(int n, int nreg, int D, int Hh, int W, const int *ad, const float *cen, float *pos) {
-    const int S = nreg + D * Hh * W; const long long N = (long long)n * S;
+    const long long S = nreg + (long long)D * Hh * W, N = (long long)n * S;
     k_scroll_pos<<<nbk(N, 256), 256>>>(N, S, nreg, D, Hh, W, imax3(D, Hh, W), ad, cen, pos);
 }

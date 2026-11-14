@@ -127,7 +127,7 @@ static int g_dev; static cudaStream_t g_st;
 static void *g_buf[6]; static size_t g_cap[6];   /* steps, counts + offsets, indices, ct, planes, the scan's scratch */
 static const int32_t *g_off;
 static fg_step *g_hst; static size_t g_hstc;   /* (pinned) */
-extern "C" void *fibre_gpu_host_alloc(size_t n) { void *p = nullptr; return cudaMallocHost(&p, n) == cudaSuccess ? p : nullptr; }
+extern "C" void *fibre_gpu_host_alloc(size_t n) { void *p = nullptr; if (cudaMallocHost(&p, n) == cudaSuccess) return p; cudaGetLastError(); return nullptr; }
 extern "C" void fibre_gpu_host_free(void *p) { if (p) cudaFreeHost(p); }
 extern "C" void fibre_gpu_device(int dev) { pthread_mutex_lock(&g_mu); g_dev = dev; pthread_mutex_unlock(&g_mu); }
 static int grow(int k, size_t n) { if (n <= g_cap[k]) return 0; if (g_buf[k]) cudaFree(g_buf[k]); g_buf[k] = nullptr; g_cap[k] = 0; if (cudaMalloc(&g_buf[k], n + (n >> 3)) != cudaSuccess) return -1; g_cap[k] = n + (n >> 3); return 0; }

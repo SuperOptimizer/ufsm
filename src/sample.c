@@ -383,6 +383,9 @@ static batch alloc_batch(const sample_cfg *c, uint8_t *c255) {
         b.nlvr = calloc((size_t)c->B, sizeof *b.nlvr); b.lvn = calloc((size_t)c->B, sizeof *b.lvn); b.lvz = calloc((size_t)c->B, sizeof *b.lvz);
         if (!b.latd || !b.lvc || !b.lvr || !b.nlvr || !b.lvn || !b.lvz) { fprintf(stderr, "sampler: --lat-direct-p buffers\n"); abort(); }
     }
+    if ((c->chain_p > 0 && (!b.chid || !b.chidx || !b.choff)) || (c->view_P > 0 && !b.vok) || !b.src || !b.level || !b.um || !b.corner || !b.sheet
+        || (c->w4_runs && !b.w4r) || (c->ink_bits && !b.ink_it) || (c->ink_mil && (!b.mil || !b.nmil || !b.mil0 || !b.nmil0))) {
+        fprintf(stderr, "sampler: out of host memory (batch slot records)\n"); abort(); }   /* (audit mini/alloc #8) */
 #undef RHALLOC
     b.emb = c->emb_ch ? halloc((size_t)c->B * c->emb_ch * (size_t)(PZ(c) / c->emb_div) * (c->P / c->emb_div) * (c->P / c->emb_div)) : nullptr;
     return b;
@@ -3426,6 +3429,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
     double (*params)[4]=nullptr;
     if (c->sheet) {
         params=malloc((size_t)P*sizeof *params);
+        if (!params) { fprintf(stderr, "sampler: out of host memory (sheet parameters)\n"); abort(); }   /* (audit mini/alloc #6) */
         for (int sz=0;sz<P;sz++) sheet_parameters(c->sheet,o[0]+sz,params[sz]);
     }
     if (lw || (tmu && spatial.active)) rskip(r, (uint64_t)Pz * P * (uint64_t)(P / 4 + P % 4));   /* (write_spatial_tm's noise draws; tmu: with --gpu-input it writes T / M only) */
@@ -3761,6 +3765,7 @@ static occ_index label_occupancy(source *s) {
     uint8_t *buf = malloc(plane * (size_t)SZ);
     if (!buf) return o;
     size_t cap = 1 << 20, n = 0; uint32_t *idx = malloc(cap * sizeof *idx);
+    if (!idx) { free(buf); return o; }   /* (audit mini/alloc #4) */
     int surf = 1;
     for (int pass = 0; pass < (binary ? 1 : 2) && !n; pass++) {   /* binary: 255 is a surface, never ignore */
         surf = pass == 0;
@@ -3842,6 +3847,7 @@ int sources_prefetch(sources *S, int maxlev, int nthreads, double fraction, int 
             int64_t ng[3]; for (int d = 0; d < 3; d++) ng[d] = (m->shape[d] + m->chunk[d] - 1) / m->chunk[d];
             size_t total = (size_t)ng[0] * ng[1] * ng[2];
             uint8_t *bits = calloc((total + 7) / 8, 1);
+            if (!bits) { fprintf(stderr, "prefetch: %s level %d: out of memory, skipped\n", s->name, l); continue; }   /* (audit mini/alloc #7) */
             int dl = o.lev - l; int64_t f = dl >= 0 ? (int64_t)1 << dl : 1;
             if (whole) { int64_t lo[3] = {0, 0, 0}, hi[3] = {ng[0] - 1, ng[1] - 1, ng[2] - 1}; pf_mark(bits, ng, lo, hi); }
             for (size_t k = 0; k < ncell && !whole; k++) {
@@ -3861,14 +3867,17 @@ int sources_prefetch(sources *S, int maxlev, int nthreads, double fraction, int 
             all += nmark;
             if (dry) { fprintf(stderr, "prefetch: %s level %d: %zu chunks needed (window %d)\n", s->name, l, nmark, P); free(bits); continue; }
             uint32_t *list = malloc((nmark ? nmark : 1) * sizeof *list); size_t nl = 0;
+            pthread_t *th = malloc(nthreads * sizeof *th); pf_arg *args = malloc(nthreads * sizeof *args); uint8_t *made = calloc(nthreads, 1);
+            if (!list || !th || !args || !made) { fprintf(stderr, "prefetch: %s level %d: out of memory, skipped\n", s->name, l); free(list); free(th); free(args); free(made); free(bits); continue; }
             for (size_t k = 0; k < total; k++) if ((bits[k >> 3] >> (k & 7)) & 1) list[nl++] = (uint32_t)k;
-            size_t done = 0, fetched = 0, fail = 0, next = 0; pthread_t *th = malloc(nthreads * sizeof *th); pf_arg *args = malloc(nthreads * sizeof *args);
-            for (int t = 0; t < nthreads; t++) { args[t] = (pf_arg){ct, list, nl, {ng[0], ng[1], ng[2]}, &next, &done, &fetched, &fail}; pthread_create(&th[t], nullptr, pf_worker, &args[t]); }
+            size_t done = 0, fetched = 0, fail = 0, next = 0; int nmade = 0;
+            for (int t = 0; t < nthreads; t++) { args[t] = (pf_arg){ct, list, nl, {ng[0], ng[1], ng[2]}, &next, &done, &fetched, &fail}; made[t] = !pthread_create(&th[t], nullptr, pf_worker, &args[t]); nmade += made[t]; }
+            if (!nmade) pf_worker(&args[0]);   /* (no thread could start: the list here, so the wait below ends; joins only the threads made) */
             size_t last = 0;
             while (last < nmark) { usleep(1000000); last = __atomic_load_n(&done, __ATOMIC_RELAXED); fprintf(stderr, "prefetch: %s level %d: %zu / %zu chunks checked, %zu fetched\r", s->name, l, last, nmark, __atomic_load_n(&fetched, __ATOMIC_RELAXED)); }
-            for (int t = 0; t < nthreads; t++) pthread_join(th[t], nullptr);
+            for (int t = 0; t < nthreads; t++) if (made[t]) pthread_join(th[t], nullptr);
             free(list);
-            free(th); free(args); free(bits);
+            free(th); free(args); free(made); free(bits);
             fprintf(stderr, "\nprefetch: %s level %d done (%zu chunks needed, %zu fetched now, %zu failures)\n", s->name, l, nmark, fetched, fail);
         }
         free(o.idx);

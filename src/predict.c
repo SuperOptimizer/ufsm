@@ -1331,6 +1331,7 @@ int predict_seamless(int argc, char **argv);   /* src/seamless.c */
 void seam_clear_store(const char *dir);         /* src/seamless.c: the level arrays <dir>/<um> removed */
 static int predict_one(int argc, char **argv);
 int predict_one_entry(int argc, char **argv) { return predict_one(argc, argv); }   /* (predict --seamless 2, in-process: src/seamless.c) */
+static void *ck_tiles(void *p, size_t n) { void *q = realloc(p, n); if (!q) { fprintf(stderr, "predict: out of host memory (%zu bytes of tile list)\n", n); abort(); } return q; }   /* (audit mini/alloc #5) */
 static int predict_one(int argc, char **argv) {
     if (*opt(argc, argv, "--seamless", "") && strcmp(opt(argc, argv, "--seamless", ""), "0") && !getenv("UFSM_SEAM_CHILD")) return predict_seamless(argc, argv);
     /* UFSM_PRED_DEVREAD=1: the CT windows decoded on the GPU into device memory (volcomp's GPU decoder, byte-identical): turned on here,
@@ -2251,7 +2252,7 @@ static int predict_one(int argc, char **argv) {
         for (int64_t sz = 0; sz < nss[0]; sz++) for (int64_t sy = 0; sy < nss[1]; sy++) for (int64_t sx = 0; sx < nss[2]; sx++) {
             const uint8_t e = fneed[(sz * nss[1] + sy) * nss[2] + sx];
             if (!e) continue;
-            if (rd.ntiles == cap) { cap = cap ? 2 * cap : 1024; rd.tiles = realloc(rd.tiles, (size_t)cap * sizeof *rd.tiles); }
+            if (rd.ntiles == cap) { cap = cap ? 2 * cap : 1024; rd.tiles = ck_tiles(rd.tiles, (size_t)cap * sizeof *rd.tiles); }
             rd.tiles[rd.ntiles++] = (tile_t){sz * stride - halo, sy * stride - halo, sx * stride - halo, (sz * nss[1] + sy) * nss[2] + sx, e == 2, 0};
         }
     } else
@@ -2267,7 +2268,7 @@ static int predict_one(int argc, char **argv) {
                                  for (int64_t c = q0[2]; c < q0[2] + 2 && c < ns[2]; c++) air &= sskip[(a * ns[1] + b) * ns[2] + c] == 2; }
                 else air = 0;
                 if (air) continue;
-                if (rd.ntiles == cap) { cap = cap ? 2 * cap : 1024; rd.tiles = realloc(rd.tiles, (size_t)cap * sizeof *rd.tiles); }
+                if (rd.ntiles == cap) { cap = cap ? 2 * cap : 1024; rd.tiles = ck_tiles(rd.tiles, (size_t)cap * sizeof *rd.tiles); }
                 rd.tiles[rd.ntiles++] = (tile_t){q0[0] * shard - halo, q0[1] * shard - halo, q0[2] * shard - halo, (q0[0] * ns[1] + q0[1]) * ns[2] + q0[2], 0, g};
             }
         }
@@ -2281,7 +2282,7 @@ static int predict_one(int argc, char **argv) {
         if (air) continue;
         if (nwork > 1 && (nwq++ % ngpu) != part) continue;
         if (all) continue;
-        if (rd.ntiles == cap) { cap = cap ? 2 * cap : 1024; rd.tiles = realloc(rd.tiles, (size_t)cap * sizeof *rd.tiles); }
+        if (rd.ntiles == cap) { cap = cap ? 2 * cap : 1024; rd.tiles = ck_tiles(rd.tiles, (size_t)cap * sizeof *rd.tiles); }
         rd.tiles[rd.ntiles++] = (tile_t){sz * stride - halo, sy * stride - halo, sx * stride - halo, (sz * nss[1] + sy) * nss[2] + sx, 0, 0};
     }
     /* (tile tests: not with --gn-save, whose statistics count every non-air window, nor --feather, whose neighbours need a skipped window's spill;
@@ -2313,7 +2314,7 @@ static int predict_one(int argc, char **argv) {
                 }
                 if (!occ_any(occb, occo, occn, occf, g0, g1)) { nocct++; continue; }
             }
-            if (rd.ntiles == cap) { cap = cap ? 2 * cap : 1024; rd.tiles = realloc(rd.tiles, (size_t)cap * sizeof *rd.tiles); }
+            if (rd.ntiles == cap) { cap = cap ? 2 * cap : 1024; rd.tiles = ck_tiles(rd.tiles, (size_t)cap * sizeof *rd.tiles); }
             rd.tiles[rd.ntiles++] = (tile_t){tz, ty, tx, (sz * ns[1] + sy) * ns[2] + sx, 0, 0};
         }
     }
@@ -2934,20 +2935,22 @@ static int predict_one(int argc, char **argv) {
         snprintf(p, sizeof p, "%s/fields.partial.json", ffz); remove(p);
         fprintf(stderr, "predict: fit fields %dx%dx%d (h %d) written to %s (zarr)\n", ffF[0], ffF[1], ffF[2], ffh, ffz);
     } else if (ffd) {   /* the fit fields: means over material (CT > 0) of the pooled heads, material fraction, max recto */
-        float *acc = malloc(ffna * ffn * 4); nn_sync(); nn_d2h(acc, ffacc, ffna * ffn * 4); nn_free(ffacc);
-        uint8_t *a[10]; for (int k = 0; k < 10; k++) a[k] = calloc(ffn, 1);
+        float *acc = malloc(ffna * ffn * 4); if (!acc) { fprintf(stderr, "predict: out of host memory (fit fields)\n"); abort(); }
+        nn_sync(); nn_d2h(acc, ffacc, ffna * ffn * 4); nn_free(ffacc);
+        uint8_t *a[10]; for (int k = 0; k < 10; k++) if (!(a[k] = calloc(ffn, 1))) { fprintf(stderr, "predict: out of host memory (fit fields)\n"); abort(); }   /* (audit mini/alloc #10) */
         fit_finalize(acc, ffn, ffh, a);
         const int na = (int)bn[0] + 1; float *cyb = malloc(na * sizeof(float)), *cxb = malloc(na * sizeof(float));
+        if (!cyb || !cxb) { fprintf(stderr, "predict: out of host memory (fit fields)\n"); abort(); }
         for (int z = 0; z < na; z++) { double cy = 0, cx = 0; if (ax.n) axis_at(&ax, (double)(bo[0] + z) * (1 << level), &cy, &cx); cyb[z] = (float)(cy / (1 << level) - bo[1]); cxb[z] = (float)(cx / (1 << level) - bo[2]); }
         const long long org[3] = {bo[0], bo[1], bo[2]};
         /* Preserve the recto head for local fitting as well as the normal/density/phase heads.
            acc[11] is already the maximum recto probability over each field cell. */
         uint8_t *recto = ffu2 ? nullptr : malloc(ffn);
-        if (!ffu2 && !recto) return 1;
+        if (!ffu2 && !recto) { fprintf(stderr, "predict: out of host memory (fit fields)\n"); abort(); }
         if (recto) for (size_t i = 0; i < ffn; i++) recto[i] = (uint8_t)lroundf(255.f * fminf(1.f, fmaxf(0.f, acc[11 * ffn + i])));
         uint8_t *a14[14] = {0}; for (int k = 0; k < 10; k++) a14[k] = a[k];
         if (ffw4d) {   /* task unwrap2: the relative winding mod 4 planes, finalized on the device */
-            uint8_t *d4 = nn_malloc(4 * ffn); for (int k = 0; k < 4; k++) a14[10 + k] = malloc(ffn);
+            uint8_t *d4 = nn_malloc(4 * ffn); for (int k = 0; k < 4; k++) if (!(a14[10 + k] = malloc(ffn))) { fprintf(stderr, "predict: out of host memory (fit fields)\n"); abort(); }
             nn_fit_finalize_w4(ffacc4, ffn, d4); nn_sync(); for (int k = 0; k < 4; k++) nn_d2h(a14[10 + k], d4 + k * ffn, ffn);
             nn_free(d4); nn_free(ffacc4);
         }

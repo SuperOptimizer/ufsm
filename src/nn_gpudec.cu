@@ -259,6 +259,7 @@ static int launch_batch(gd_slot *S) {
     GD_CK(cudaEventRecord(S->ev, S->st));
     return 0;
 fail:
+    cudaStreamSynchronize(S->st); cudaGetLastError();   /* (the copies queued before the failure still read / write h_in, h_out, h_status: done before the slot is released) */
     return -1;
 }
 

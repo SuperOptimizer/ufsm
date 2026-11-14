@@ -45,6 +45,8 @@ enum { ET = 64 };
    same exact integer (< 2^24) the stored floats held, so the indices come out identical. */
 static int edt_feature_cap(const uint8_t *seed, const int n[3], float cap2, float *d2, int32_t *idx) {
     const int nz = n[0], ny = n[1], nx = n[2], m = nz > ny ? (nz > nx ? nz : nx) : (ny > nx ? ny : nx);
+    if ((size_t)nz * ny * nx > (size_t)INT32_MAX) {   /* (the feature index is int32: it would wrap, silently unknown / wrong voxels; audit mini/overflow #1) */
+        fprintf(stderr, "band: a %d x %d x %d box has 2^31 voxels or more (the EDT's int32 feature index): use smaller boxes\n", nz, ny, nx); return -1; }
     float *f = malloc((size_t)m * ET * 4), *dl = malloc((size_t)m * 4), *z = malloc((size_t)(m + 1) * 4);
     int32_t *sr = malloc((size_t)m * ET * 4), *sl = malloc((size_t)m * 4); int *v = malloc((size_t)m * sizeof(int));
     if (!f || !dl || !z || !sr || !sl || !v) { free(f); free(dl); free(z); free(sr); free(sl); free(v); return -1; }
