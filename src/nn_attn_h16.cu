@@ -38,9 +38,15 @@ static cublasLtHandle_t g_hd[16]; static void *g_hwsd[16]; static const size_t H
 #define g_nhp g_nhpd[h16_dev()]
 #define g_h g_hd[h16_dev()]
 #define g_hws g_hwsd[h16_dev()]
+/* the current device's handle and workspace now (at_reserve: before the trainer's memory planner measures the free memory) */
+extern "C" int at_h16_reserve(void) {
+    if (!g_h) { if (cublasLtCreate(&g_h) != CUBLAS_STATUS_SUCCESS) { g_h = nullptr; return -1; } }
+    if (!g_hws && cudaMalloc(&g_hws, HWS) != cudaSuccess) { cudaGetLastError(); g_hws = nullptr; return -1; }
+    return 0;
+}
 static hplan *hplan_get(int M, int N, int K, int ta, int tb, int dbf, int bias, int al) {
     for (int i = 0; i < g_nhp; i++) { hplan *p = &g_hp[i]; if (p->M == M && p->N == N && p->K == K && p->ta == ta && p->tb == tb && p->dbf == dbf && p->bias == bias && p->al == al) return p; }
-    if (!g_h) { if (cublasLtCreate(&g_h) != CUBLAS_STATUS_SUCCESS) return nullptr; if (cudaMalloc(&g_hws, HWS) != cudaSuccess) return nullptr; }
+    if (at_h16_reserve()) return nullptr;
     int &next = g_nextd[h16_dev()]; hplan *p;
     if (g_nhp < 128) p = &g_hp[g_nhp++];
     else { p = &g_hp[next]; next = (next + 1) % 128; cublasLtMatmulDescDestroy(p->op); cublasLtMatrixLayoutDestroy(p->a); cublasLtMatrixLayoutDestroy(p->b); cublasLtMatrixLayoutDestroy(p->c); }

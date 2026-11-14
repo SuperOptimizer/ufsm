@@ -238,6 +238,10 @@ int unet_gn_ema_warm(const unet *u);
 int unet_gn_ema_const(const unet *u);   /* the last forward normalised with the running statistics */
 void unet_set_gn_ema(unet *u, float mom, int warm);
 long unet_gn_ema_updates(const unet *u);
+/* data parallel: each replica pools only its own windows' statistics; the trainer averages these 2 ge_ns device floats over the replicas
+   (exact: the running statistics are linear in the batch statistics, so the mean of the replicas' EMAs is the EMA of the mean) */
+float *unet_gn_ema_state(unet *u, size_t *n);
+void unet_reserve(unet *u, int muon, int muon_tc);   /* the optimizer's / attention's lazily allocated device buffers now (before a memory plan) */
 void unet_set_l0_slab_kern(int on);   /* --l0-norm slab on the kernel path (readers apply per-slab statistics; 1) or D's prototype (0); -1: env UFSM_L0_SLAB_KERN */
 void unet_set_l0_stream(int on);      /* the level-0 slab stream (stage S3: level-0 ops per slab in a skewed schedule; 1); -1: env UFSM_L0_STREAM */
 /* stage S4: the stream runs the head per slab (no whole-window logits; with the rings dec[0].a2 and gout[0] are rings too): fwd(ctx, z0,

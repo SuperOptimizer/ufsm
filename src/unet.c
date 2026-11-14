@@ -2200,6 +2200,10 @@ void unet_gn_ema_override(unet *u, float mom, int warm) { if (mom >= 0.f) u->ge_
 int unet_gn_ema_warm(const unet *u) { return u->ge_warm; }
 int unet_gn_ema_const(const unet *u) { return u->ge_c; }
 long unet_gn_ema_updates(const unet *u) { return u->ge_n; }
+float *unet_gn_ema_state(unet *u, size_t *n) {   /* the running statistics (live weights', EMA weights') on the device: 2 ge_ns floats, or nullptr */
+    *n = 0; if (!u->cfg.gn_ema || !u->ge_run) return nullptr;
+    *n = 2 * u->ge_ns; return u->ge_run;
+}
 unsigned unet_gn_ema_skips(const unet *u) { unsigned k = 0; if (u->cfg.gn_ema && u->ge_run) nn_d2h(&k, u->ge_run + 3 * u->ge_ns, 4); return k; }
 static void l0_begin(unet *u) {   /* forward start: latch l0_c, the constant statistics into the sites */
     const int md = u->cfg.l0_norm, G = l0_G(u), N = u->xs.n;
@@ -4472,6 +4476,18 @@ int unet_opt_stats_str(unet *u, char *buf, size_t cap) {
         if (u->ad_dog && k < cap) { double d[4]; nn_d2h(d, u->ad_dogst, sizeof d); k += (size_t)snprintf(buf + k, cap - k, " dog eta %.3e rbar %.3e dist %.3e", d[2], d[0], d[3]); }
     }
     return 1;
+}
+/* the optimizer's and the attention's device buffers now, on the current device (train: before the memory planner measures the free memory;
+   2026-11-14 audit: the Muon descriptor table + scratch pool (<= UFSM_MUON_POOL_MB, 128), its momentum (unless aliased into AdamW v) and the
+   cuBLASLt handles / 32 MB workspaces (attention linears, --muon-tc 2 Newton-Schulz) were allocated at the first step, after the plan) */
+int nn_muon_tc_reserve(void);
+void unet_reserve(unet *u, int muon, int muon_tc) {
+    if (u->tbn > 0 && at_reserve()) fprintf(stderr, "unet_reserve: the attention's cuBLASLt handle / workspace failed\n");
+    if (muon && !u->wq) {
+        if (!u->muon_mom) u->muon_mom = mom_alloc(u);
+        if (!u->muon_descs && !mx_any(u) && !ufsm_env_on("UFSM_MUON_UNBATCHED")) { muon_build_t *b = calloc(1, sizeof *b); muon_table(u, b); free(b); }
+        if (muon_tc >= 2 && nn_muon_tc_reserve()) fprintf(stderr, "unet_reserve: the Muon cuBLASLt handle / workspace failed\n");
+    }
 }
 void unet_muon(unet *u, float lr_muon, float beta, float lr_adam, float b1, float b2, float eps, float wd, int step) {
     if (head_lr_mode(u)) lr_muon *= u->trunk_lr;   /* (the 3^3 convs: all trunk; the head is on AdamW) */

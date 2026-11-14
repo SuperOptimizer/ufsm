@@ -247,12 +247,14 @@ __global__ void __launch_bounds__(128) mx_gemm_p_k(const uint8_t *__restrict__ A
                 }
             }
 }
-static uint8_t *g_pk = nullptr; static size_t g_pkn = 0;
+static uint8_t *g_pkd[8]; static size_t g_pknd[8];   /* mgpu: per-device (the packed operands of the current device; 2026-11-14 audit: one process-wide buffer
+                                                       under data parallel let GPU 1 pack into GPU 0's memory) */
 /* the packed path for large operands: pack both, then the packed GEMM (bits 4 / 8); 0, or -1 */
 static int mx_gemm_packed(int bits, int ta, int tb, int M, int N, int K, const float *A, const float *B, float *C, float beta, const float *bias, const float *res) {
     const int Kp = (K + 63) / 64 * 64, BPB = bits == 4 ? 16 : 32;
     const size_t qa = (size_t)M * (Kp / 32) * BPB, qb = (size_t)N * (Kp / 32) * BPB, sa = (size_t)M * (Kp / 32), sb = (size_t)N * (Kp / 32);
     const size_t need = ((qa + 255) & ~(size_t)255) + ((qb + 255) & ~(size_t)255) + ((sa + 255) & ~(size_t)255) + sb + 256;
+    const int dv = cur_dev_(); uint8_t *&g_pk = g_pkd[dv]; size_t &g_pkn = g_pknd[dv];
     if (need > g_pkn) { if (g_pk) cudaFree(g_pk); if (cudaMalloc(&g_pk, need) != cudaSuccess) { g_pk = nullptr; g_pkn = 0; return -1; } g_pkn = need; }
     uint8_t *Aq = g_pk, *Bq = Aq + ((qa + 255) & ~(size_t)255), *As = Bq + ((qb + 255) & ~(size_t)255), *Bs = As + ((sa + 255) & ~(size_t)255);
     const int lda = ta ? M : K, ldb = tb ? K : N;
