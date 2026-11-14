@@ -12,6 +12,7 @@
 #include "srpair.h"
 #include "cover.h"
 #include <limits.h>
+#include <openssl/evp.h>
 #include "sources.h"
 [[gnu::weak]] int inkfly_cache_budget(size_t);   /* (inksplat.o: the shared ink cache budget, --ink-cache-mb) */
 #include "inksplat.h"
@@ -4308,6 +4309,33 @@ int cmd_train(int argc, char **argv) {
         snprintf(hj + k, sizeof hj - k, "]}}");
         size_t n = strlen(runtime_extra); runtime_extra[n-1] = 0;
         snprintf(runtime_extra+n-1, sizeof runtime_extra-n+1, "%s", hj);
+    }
+    {   /* provenance (eval audit 11-14 #21): the sources file (path + sha256; a copy <out>/sources-<sha12>.json), the rungs, the held-out boxes
+           and the binary, so an eval can tell which labels a checkpoint trained on. New keys only (old checkpoints load as before; readers
+           ignore unknown "extra" objects) */
+        FILE *sf = fopen(src, "rb"); unsigned char hsh[32]; unsigned int nh = 0; char hex[65] = ""; long sl = -1; char *sb = nullptr;
+        if (sf) { fseek(sf, 0, SEEK_END); sl = ftell(sf); fseek(sf, 0, SEEK_SET); sb = sl >= 0 ? malloc((size_t)sl + 1) : nullptr;
+                  if (sb && fread(sb, 1, (size_t)sl, sf) != (size_t)sl) { free(sb); sb = nullptr; } fclose(sf); }
+        if (sb && EVP_Digest(sb, (size_t)sl, hsh, &nh, EVP_sha256(), nullptr) && nh == 32) for (int i = 0; i < 32; i++) snprintf(hex + 2 * i, 3, "%02x", hsh[i]);
+        if (*hex) {   /* the copy: one per distinct sources content (resumes with another SRCJ add theirs) */
+            char cp[1600]; snprintf(cp, sizeof cp, "%s/sources-%.12s.json", out, hex);
+            FILE *cf = access(cp, F_OK) == 0 ? nullptr : fopen(cp, "wx");
+            if (cf) { if (fwrite(sb, 1, (size_t)sl, cf) != (size_t)sl) fprintf(stderr, "warning: cannot write %s\n", cp); fclose(cf); }
+        }
+        free(sb);
+        int nhold = 0; for (int i = 0; i < S->n; i++) nhold += S->src[i].hold_n[0] > 0 ? (S->src[i].nhold > 1 ? S->src[i].nhold : 1) : 0;
+        char exe[1024] = ""; { const ssize_t k = readlink("/proc/self/exe", exe, sizeof exe - 1); exe[k > 0 ? k : 0] = 0; }
+        char sp[1024], ep[1024], rg[256]; size_t q = 0;   /* (JSON strings: quotes and backslashes dropped, they never occur in our paths) */
+        for (const char *c = src; *c && q < sizeof sp - 1; c++) if (*c != '"' && *c != '\\' && (unsigned char)*c >= 32) sp[q++] = *c; sp[q] = 0; q = 0;
+        for (const char *c = exe; *c && q < sizeof ep - 1; c++) if (*c != '"' && *c != '\\' && (unsigned char)*c >= 32) ep[q++] = *c; ep[q] = 0; q = 0;
+        for (const char *c = opt(argc, argv, "--um-rungs", ""); *c && q < sizeof rg - 1; c++) if (*c != '"' && *c != '\\' && (unsigned char)*c >= 32) rg[q++] = *c; rg[q] = 0;
+        size_t n = strlen(runtime_extra);
+        if (n + strlen(sp) + strlen(ep) + 256 < sizeof runtime_extra) {
+            runtime_extra[n - 1] = 0;
+            snprintf(runtime_extra + n - 1, sizeof runtime_extra - n + 1, ",\"provenance\":{\"version\":1,\"sources\":\"%s\",\"sources_sha256\":\"%s\",\"um_rungs\":\"%s\",\"holdout_boxes\":%d,\"binary\":\"%s\"}}",
+                     sp, hex, rg, nhold, ep);
+        } else fprintf(stderr, "warning: checkpoint provenance not recorded (header room)\n");
+        fprintf(stderr, "provenance: sources %s (sha256 %.12s), %d held-out boxes, binary %s\n", src, *hex ? hex : "?", nhold, exe);
     }
     fprintf(stderr, "surface targets: binary-core erosion %d native voxel(s), then soft sigma %g %s; loss offset tolerance %d voxel(s)\n", sc.erode, sc.soft, sc.soft_um ? "um" : "level-0 voxels", nn_get_loss_tol());
     if (g_aff) {

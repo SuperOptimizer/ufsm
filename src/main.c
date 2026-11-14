@@ -1411,7 +1411,8 @@ static int score_codes(z3 *z, double cf, const long long org[3], const int shp[3
     double med = 0, p90 = 0; { size_t c = 0; int got = 0; for (int k = 0; k <= NF / 28; k++) { c += ah[k]; if (!got && c * 2 >= na2) { med = (k + 0.5) / 1024; got = 1; } if (c * 10 >= na2 * 9) { p90 = (k + 0.5) / 1024; break; } } }
     printf("fit score: %zu labelled voxels, gauge %.3f, winding ids right %.4f, |error| < 0.08 turn %.4f, |error| median %.3f p90 %.3f turn\n", nd, mode + mean,
            nd ? (double)right / nd : 0, nd ? (double)close / nd : 0, na2 ? med : 0, na2 ? p90 : 0);
-    if (nan) printf("  %zu labelled voxels without U (%.4f of those in the box), not scored\n", nan, (double)nan / (nan + nd));
+    if (nan) printf("  %zu labelled voxels without U (%.4f of those in the box), not scored; counted as wrong: ids right over all labelled %.4f\n", nan,
+                    (double)nan / (nan + nd), (double)right / (nan + nd));   /* (eval audit 11-14 #12: a fit that never reaches a region loses nothing in "ids right") */
     const int dpass2 = P && atomic_load(&P->dover);
     if (detail && (ndet || dpass2)) {
         size_t ie[8][9] = {{0}}, re[256][9] = {{0}};   /* integer error -4..4 by z octile / by 250 um radius bin (up to 64 mm) */

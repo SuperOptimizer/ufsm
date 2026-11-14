@@ -1022,8 +1022,8 @@ int cmd_ink_score(int argc, char **argv) {
         }
         const double auc = ti && tn ? 1 - wrong / ((double)ti * tn) : 0;
         const uint64_t n = ti + tn;
-        fprintf(stderr, "ink-score: %s: %llu px, ink %.3f, F1 best %.4f (p >= %.3f), F1@0.5 %.4f (prec %.3f rec %.3f), AUC %.4f\n", nm,
-                (unsigned long long)n, n ? (double)ti / n : 0, best, bthr, f05, p05, r05, auc);
+        fprintf(stderr, "ink-score: %s: %llu px, ink %.3f, F1 best %.4f (p >= %.3f; all-ink floor %.4f), F1@0.5 %.4f (prec %.3f rec %.3f), AUC %.4f%s\n", nm,
+                (unsigned long long)n, n ? (double)ti / n : 0, best, bthr, n ? 2.0 * ti / (n + ti) : 0, f05, p05, r05, auc, ti && tn ? "" : " (one class only: AUC undefined)");
         if (row) printf("%s\t%s\t%llu\t%.4f\t%.4f\t%.3f\t%.4f\t%.4f\t%.4f\t%.4f\n", row, nm, (unsigned long long)n, n ? (double)ti / n : 0, best, bthr, f05, p05, r05, auc);
         fflush(stdout);
         free(mp);
@@ -1032,20 +1032,36 @@ int cmd_ink_score(int argc, char **argv) {
     return rc;
 }
 
-/* ufsm ink-vscore: voxelwise score of a 3-D ink prediction (prob254, 255 unknown) against a 3-D reference (an ink-splat zarr) over a box:
-   at the voxels known in both, AUC (tie-aware, 255-bin ranks), the best F1 over thresholds, F1 / precision / recall at 127 (p 0.5). */
+/* ufsm ink-vscore: voxelwise score of a 3-D ink prediction against a 3-D reference (an ink-splat zarr, prob254: 255 unknown) over a box:
+   at the voxels known in both, AUC (tie-aware, 256-bin ranks), the best F1 over thresholds, F1 / precision / recall at 127 (p 0.5).
+   The prediction's 255: predict writes round(255 sigmoid) (nn_pred_place), so 255 is p >= 0.998, not unknown; it was dropped as unknown
+   until 11-14 (eval audit #13), which removed a model's most confident voxels from AUC and F1 and changed the scored set between models.
+   --pred-unknown auto (default): 255 is unknown only when the prediction's zarr.json (array or its group) says prob254 (an ink-splat
+   store), else a value; 255 / none force it. */
+static int vs_pred_prob254(store *s, const char *key) {   /* 1: the array or its parent group declares prob254 */
+    char k[1200]; snprintf(k, sizeof k, "%s", key); size_t n = strlen(k); while (n && k[n - 1] == '/') k[--n] = 0;
+    for (int up = 0; up < 2; up++) {
+        char p[1300]; snprintf(p, sizeof p, "%s%szarr.json", k, *k ? "/" : ""); size_t len = 0; uint8_t *t = store_read_all(s, p, &len);
+        if (t) { const int hit = memmem(t, len, "prob254", 7) != nullptr; free(t); if (hit) return 1; }
+        char *sl = strrchr(k, '/'); if (!sl) { if (!*k) break; k[0] = 0; } else *sl = 0;
+    }
+    return 0;
+}
 int cmd_ink_vscore(int argc, char **argv) {
     const int gi = sidx(argc, argv, "--gt"), pi = sidx(argc, argv, "--pred");
     const char *bx = sopt(argc, argv, "--box", nullptr), *row = sopt(argc, argv, "--row", nullptr), *cache = sopt(argc, argv, "--cache", nullptr);
     const int L = atoi(sopt(argc, argv, "--level", "1")), nth = ufsm_threads(atoi(sopt(argc, argv, "--threads", "0")), 8);
+    const char *pu = sopt(argc, argv, "--pred-unknown", "auto");
     long long b[6];
+    if (strcmp(pu, "auto") && strcmp(pu, "255") && strcmp(pu, "none")) { fprintf(stderr, "ink-vscore: --pred-unknown auto | 255 | none\n"); return 2; }
     if (gi < 0 || pi < 0 || gi + 2 >= argc || pi + 2 >= argc || !bx || sscanf(bx, "%lld,%lld,%lld,%lld,%lld,%lld", b, b + 1, b + 2, b + 3, b + 4, b + 5) != 6 || L < 0 || L > 6) {
-        fprintf(stderr, "usage: ufsm ink-vscore --gt ROOT KEY --pred ROOT KEY --box z,y,x,nz,ny,nx (level-0) [--level 1] [--row TAG] [--threads 8] [--cache DIR]\n"
+        fprintf(stderr, "usage: ufsm ink-vscore --gt ROOT KEY --pred ROOT KEY --box z,y,x,nz,ny,nx (level-0) [--level 1] [--row TAG] [--threads 8] [--cache DIR] [--pred-unknown auto|255|none]\n"
                         "  voxelwise AUC / best F1 / F1 at 0.5 of a prob254 prediction vs a prob254 reference at the voxels known in both (the box on level L)\n"); return 2;
     }
     store *gs = store_open(argv[gi + 1]), *ps = store_open(argv[pi + 1]);
     z3 *g = gs ? z3_open(gs, argv[gi + 2], cache) : nullptr, *p = ps ? z3_open(ps, argv[pi + 2], cache) : nullptr;
     if (!g || !p) { fprintf(stderr, "ink-vscore: cannot open %s: %s\n", !g ? "--gt" : "--pred", z3_error()); return 1; }
+    const int p255 = !strcmp(pu, "255") || (!strcmp(pu, "auto") && vs_pred_prob254(ps, argv[pi + 2]));   /* the prediction's 255 = unknown */
     int64_t o[3], n[3]; size_t nv = 1;
     for (int d = 0; d < 3; d++) {
         const int64_t s = z3_meta_of(g)->shape[d] < z3_meta_of(p)->shape[d] ? z3_meta_of(g)->shape[d] : z3_meta_of(p)->shape[d];
@@ -1054,13 +1070,18 @@ int cmd_ink_vscore(int argc, char **argv) {
     }
     uint8_t *A = malloc(nv), *B = malloc(nv);
     if (!A || !B || z3_read(g, o, n, A, nth) || z3_read(p, o, n, B, nth)) { fprintf(stderr, "ink-vscore: read failed: %s\n", z3_error()); return 1; }
-    double h[2][255] = {{0}}; uint64_t ngt = 0;
-    for (size_t k = 0; k < nv; k++) { if (A[k] == 255) continue; ngt++; if (B[k] == 255) continue; h[A[k] >= 127][B[k]]++; }
-    double P = 0, N = 0; for (int v = 0; v < 255; v++) { P += h[1][v]; N += h[0][v]; }
-    double auc = 0, below = 0; for (int v = 0; v < 255; v++) { auc += h[1][v] * (below + 0.5 * h[0][v]); below += h[0][v]; }
+    double h[2][256] = {{0}}; uint64_t ngt = 0;
+    for (size_t k = 0; k < nv; k++) { if (A[k] == 255) continue; ngt++; if (p255 && B[k] == 255) continue; h[A[k] >= 127][B[k]]++; }
+    double P = 0, N = 0; for (int v = 0; v < 256; v++) { P += h[1][v]; N += h[0][v]; }
+    if (P + N <= 0) {   /* (a box given in level-L voxels instead of level 0, or a reference / prediction not covering it: nothing to score) */
+        fprintf(stderr, "ink-vscore: %s: no voxel known in both inside the box (%llu reference voxels known): wrong box (level-0 voxels?), level or store\n",
+                row ? row : "-", (unsigned long long)ngt);
+        free(A); free(B); z3_close(g); z3_close(p); store_close(gs); store_close(ps); return 1;
+    }
+    double auc = 0, below = 0; for (int v = 0; v < 256; v++) { auc += h[1][v] * (below + 0.5 * h[0][v]); below += h[0][v]; }
     auc = P > 0 && N > 0 ? auc / (P * N) : NAN;
     double best = 0; int bt = 0, f5i = 0; double f05 = 0, p05 = 0, r05 = 0, tp = P, fp = N;   /* predicted ink = value >= t */
-    for (int t = 0; t < 255; t++) {
+    for (int t = 0; t < 256; t++) {
         const double f1 = tp + fp + P > 0 ? 2 * tp / (tp + fp + P) : 0;
         if (f1 > best) { best = f1; bt = t; }
         if (t == 127) { f05 = f1; p05 = tp + fp > 0 ? tp / (tp + fp) : 0; r05 = P > 0 ? tp / P : 0; f5i = 1; }
@@ -1069,8 +1090,9 @@ int cmd_ink_vscore(int argc, char **argv) {
     (void)f5i;
     printf("%s\t%.0f\t%.0f\t%.4f\t%.4f\t%.4f\t%d\t%.4f\t%.4f\t%.4f\t%.4f\n", row ? row : "-", P, N, P + N > 0 ? (P + N) / ngt : 0, P / fmax(1, P + N), auc, bt, best, f05, p05, r05);
     fprintf(stderr, "ink-vscore: %s: box %lld,%lld,%lld +%lld,%lld,%lld on level %d: %.0f ink + %.0f no-ink known in both (%.1f%% of the %llu reference voxels): AUC %.4f, best F1 %.4f at >= %d, "
-                    "F1 / P / R at 0.5 %.4f / %.4f / %.4f\n", row ? row : "-", (long long)o[0], (long long)o[1], (long long)o[2], (long long)n[0], (long long)n[1], (long long)n[2], L, P, N,
-            ngt ? 100.0 * (P + N) / ngt : 0, (unsigned long long)ngt, auc, best, bt, f05, p05, r05);
+                    "F1 / P / R at 0.5 %.4f / %.4f / %.4f (prediction 255 %s; trivial best F1 floor, all ink: %.4f)\n", row ? row : "-", (long long)o[0], (long long)o[1], (long long)o[2], (long long)n[0], (long long)n[1], (long long)n[2], L, P, N,
+            ngt ? 100.0 * (P + N) / ngt : 0, (unsigned long long)ngt, auc, best, bt, f05, p05, r05, p255 ? "unknown (prob254)" : "p >= 0.998",
+            P + N > 0 ? 2 * P / (2 * P + N) : 0);
     free(A); free(B); z3_close(g); z3_close(p); store_close(gs); store_close(ps);
     return 0;
 }

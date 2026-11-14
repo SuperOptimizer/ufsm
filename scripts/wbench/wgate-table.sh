@@ -12,6 +12,7 @@ RR=$WB/res/$REF.tsv; RS=$WB/res/$REF-slabs.tsv; RRAD=$WB/res/$REF-radius.tsv; OR
 [ -s $RR ] || { RR=$WB/gate/$REF/rows.tsv; RS=$WB/gate/$REF/slabs.tsv; RRAD=$WB/gate/$REF/radius.tsv; }   # REF a wgate run (wind96fd)
 [ -s $O/slabref ] && { R2=$(cat $O/slabref); RS=$WB/res/$R2-slabs.tsv; RRAD=$WB/res/$R2-radius.tsv; [ -s $RS ] || { RS=$WB/gate/$R2/slabs.tsv; RRAD=$WB/gate/$R2/radius.tsv; }; }   # slab sites run elsewhere (wgate-slabs.sh): their own site's wind96
 [ -s $ROWS ] || { echo "no rows $ROWS"; exit 2; }
+[ -x "$ST" ] || { echo "no stats binary $ST (STATS=a ufsm with wbench-stats --tsv; a missing one used to print an empty table that passed R3)"; exit 2; }
 # the baseline's ceilings decide the clean set for both sides (rows without a ceil get REF's)
 T=$(mktemp -d); trap 'rm -rf $T' EXIT
 awk -F'\t' 'NR == FNR { if (FNR > 1) c[$2] = $22; next } FNR == 1 { for (i = 1; i <= NF; i++) if ($i == "ceil") k = i; print; next }
@@ -45,13 +46,24 @@ fi
 echo
 pd=$(v p05x paris4,paris4j 8); plo=$(v p05x paris4,paris4j 9); phi=$(v p05x paris4,paris4j 10); id=$(v ids paris4,paris4j 8); md=$(v p05x paris4,paris4j 12)
 ghi=$(v p05x 1667 10); gihi=$(v ids 1667 10); np=$(v p05x paris4,paris4j 3); ng=$(v p05x 1667 3)
+# (eval audit 11-14 #11 / #12: wbench-stats prints "na" for a stratum without rows, and awk's "na" + 0 = 0 let R3 pass with no guard
+#  data; a box whose fit died is an "na" row that the paired stats drop, so a candidate failing the hard boxes looked better. A rule
+#  now needs numeric values and at least NP_MIN (32) primary / NG_MIN (12) guard pairs, and any candidate box without a score blocks the
+#  verdict (FAILOK=1 overrides).)
+isnum() { [[ "$1" =~ ^[-+]?[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?$ ]]; }
+nfail=$(awk -F'\t' 'NR > 1 && ($5 == "na" || $5 == "") { n++; b = b " " $2 } END { printf "%d%s\n", n, b }' $ROWS)
 r1=$(awk -v lo=$plo -v d=$id 'BEGIN { print (lo + 0 > 0 && d + 0 >= 0) ? "PASS" : "fail" }')
+{ isnum "$plo" && isnum "$id" && isnum "$np" && [ "$np" -ge ${NP_MIN:-32} ]; } || r1=incomplete
 r2=$(awk -v a=$sa -v b=$sb -v n=$sn -v k=$sk 'BEGIN { print (n >= 4 && b - a >= 0.03 && k >= 3) ? "PASS" : (n < 4 ? "incomplete" : "fail") }')
 r3=$(awk -v a=$ghi -v b=$gihi 'BEGIN { print (a + 0 >= 0 && b + 0 >= 0) ? "PASS" : "fail" }')
+{ isnum "$ghi" && isnum "$gihi" && isnum "$ng" && [ "$ng" -ge ${NG_MIN:-12} ]; } || r3=incomplete
 echo "R1 primary ($np boxes): p05x diff CI low $plo > 0 and ids diff $id >= 0 -> $r1"
 echo "R2 slabs: joined mean $sb - $REF $sa >= +0.03 and >= 3 of 4 sites > +0.02 (null: wind96 on other hardware +0.014, 1 site > 0.02; $sk here) -> $r2"
 echo "R3 guard 1667 ($ng boxes): not worse beyond the CI (p05x CI high $ghi >= 0, ids CI high $gihi >= 0) -> $r3"
-if [ $r1 = PASS ] && [ $r2 = PASS ] && [ $r3 = PASS ]; then vd="PASS: promote (next: p4unwrap milestone)"
+[ "${nfail%% *}" -gt 0 ] && echo "failed boxes (fit died twice, no score): $nfail"
+if [ "${nfail%% *}" -gt 0 ] && [ "${FAILOK:-0}" != 1 ]; then vd="INCOMPLETE: ${nfail%% *} candidate boxes have no score (rerun them; FAILOK=1 judges without them)"
+elif [ $r1 = incomplete ] || [ $r3 = incomplete ]; then vd="INCOMPLETE: primary $np / ${NP_MIN:-32} or guard $ng / ${NG_MIN:-12} pairs, or a non-numeric statistic"
+elif [ $r1 = PASS ] && [ $r2 = PASS ] && [ $r3 = PASS ]; then vd="PASS: promote (next: p4unwrap milestone)"
 elif [ $r3 = fail ] || awk -v h=$phi 'BEGIN { exit !(h + 0 < 0) }'; then vd="FAIL: worse than $REF"
 elif awk -v d=$pd 'BEGIN { exit !(d + 0 > 0) }'; then vd="INCONCLUSIVE: p05x $pd is inside the noise (MDE $md); no promotion"
 else vd="FAIL: no gain over $REF"; fi
