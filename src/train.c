@@ -3609,6 +3609,7 @@ int cmd_train(int argc, char **argv) {
             unet_init(d->u, seed + 1); /* deterministic: every GPU starts identical */
             if (g_restore) unet_zero_head(d->u);   /* residual net: output == input at step 0 */
             const char *init_from = opt(argc, argv, "--init-from", nullptr);   /* partial warm start from another architecture */
+            int widened = 0;
             if (init_from) {
                 unet_set_init_shift(atoi(opt(argc, argv, "--init-shift", "0")));   /* a latent-grid net from a voxel donor: --init-shift 2 */
                 int rows[512];   /* --verso: recto copied into the verso channel, the donor's other rows (affinities) shifted up */
@@ -3651,6 +3652,30 @@ int cmd_train(int argc, char **argv) {
                         if (g == 0) fprintf(stderr, "init-from: head rows 0-%d copied, rows %d-%d (fibre head) fresh: zero weights, bias %s (masks) / 0 (direction)\n", dc.cout - 1, g_fib_ch, g_fib_ch + 8, opt(argc, argv, "--fib-bias", "-2"));
                     }
                 }
+                if (atoi(opt(argc, argv, "--init-widen", "0"))) {   /* a narrower, shallower donor's function in this net (unet_init_widen, DESIGN 2026-11-14) */
+                    unet_cfg dc; int ds; if (unet_peek(init_from, &dc, &ds)) { fprintf(stderr, "cannot read %s\n", init_from); return 1; }
+                    char *hd = checkpoint_header_line(init_from);
+                    const char *r2 = hd ? strstr(hd, "\"rv\":{\"version\":2,\"recto\":") : nullptr, *uw = hd ? strstr(hd, "\"unwrap\":{\"version\":2") : nullptr, *ik = uw ? strstr(uw, "\"ink\":") : nullptr;
+                    const int drv = r2 ? atoi(r2 + strlen("\"rv\":{\"version\":2,\"recto\":")) : -1, dink = ik ? atoi(ik + strlen("\"ink\":")) : -1; free(hd);
+                    const int dbase = g_lat_guide == 64 && dc.cout > 128 ? dc.cout - 128 : dc.cout;   /* the donor's interpolated outputs (its sub-cell rows after them) */
+                    for (int co = 0; co < cfg.cout; co++) rows[co] = co < 11 && co < dbase ? co : g_lat_guide == 64 && co >= LBASE && dbase + co - LBASE < dc.cout ? dbase + co - LBASE : -1;
+                    if (g_rv == 2) for (int k = 0; k < 2; k++) rows[g_rv_ch + k] = drv >= 0 ? drv + k : -1;
+                    if (g_ink2) rows[g_ink2_ch] = dink;
+                    if (g_fibh) for (int k = 0; k < 9; k++) rows[g_fib_ch + k] = -1;
+                    int frows[16] = {0};   /* the fine stem's outputs: channels 0-1 and 9.. of each net, mapped through the head rows */
+                    if (cfg.fstem) { int dl[16], nd = 0; for (int ch = 0; nd < dc.fstem_out && ch < dbase; ch++) if (ch < 2 || ch >= 9) dl[nd++] = ch;
+                        for (int k = 0, ch = 0; k < cfg.fstem_out && ch < cfg.cout; ch++) if (ch < 2 || ch >= 9) { frows[k] = -1; for (int q = 0; q < nd; q++) if (rows[ch] == dl[q]) frows[k] = q; k++; } }
+                    const int nt = unet_init_widen(d->u, init_from, rows, cfg.fstem ? frows : nullptr);
+                    if (nt < 0) { fprintf(stderr, "cannot widen %s into this net\n", init_from); return 1; }
+                    if (g_ink2 && dink < 0) unet_head_row_reset(d->u, g_ink2_ch, (float)atof(opt(argc, argv, "--ink-bias", "-2")));
+                    if (g_fibh) for (int k = 0; k < 9; k++) unet_head_row_reset(d->u, g_fib_ch + k, k < 2 ? (float)atof(opt(argc, argv, "--fib-bias", "-2")) : 0.f);
+                    if (g_rv == 2 && drv < 0) for (int k = 0; k < 2; k++) unet_head_row_reset(d->u, g_rv_ch + k, (float)atof(opt(argc, argv, "--rv-bias", "0")));
+                    if (g == 0) { fprintf(stderr, "init-widen: head rows 0-10 kept"); if (g_rv == 2) fprintf(stderr, ", rv %d-%d <- %d-%d", g_rv_ch, g_rv_ch + 1, drv, drv + 1);
+                                  if (g_ink2) fprintf(stderr, ", ink %d %s", g_ink2_ch, dink >= 0 ? "<- the donor's" : "fresh"); if (g_fibh) fprintf(stderr, ", fibre %d-%d fresh", g_fib_ch, g_fib_ch + 8);
+                                  if (g_lat_guide == 64) fprintf(stderr, ", sub-cell rows %d-%d <- %d-%d", LBASE, cfg.cout - 1, dbase, dc.cout - 1); fprintf(stderr, "\n"); }
+                    if (g == 0 && init_lr != 1.f) fprintf(stderr, "--init-lr-mult %g: %zu of %zu parameters inherited\n", init_lr, unet_inherited(d->u), unet_nparams(d->u));
+                    widened = 1;
+                } else {
                 if (hm) { int k = 0; char *t = strdup(hm); for (char *q = strtok(t, ","); q && k < 64; q = strtok(nullptr, ",")) rows[k++] = atoi(q); free(t);
                     if (k != cfg.cout) { fprintf(stderr, "--head-map has %d rows, the network %d outputs\n", k, cfg.cout); return 2; } }
                 const int nt = g_verso || hm || w4map ? unet_init_from_map(d->u, init_from, rows) : unet_init_from(d->u, init_from);
@@ -3665,8 +3690,9 @@ int cmd_train(int argc, char **argv) {
                 }
                 if (g == 0) fprintf(stderr, "initialised %d layer tensors from %s (the rest fresh)\n", nt, init_from);
                 if (g == 0 && init_lr != 1.f) fprintf(stderr, "--init-lr-mult %g: %zu of %zu parameters inherited\n", init_lr, unet_inherited(d->u), unet_nparams(d->u));
+                }
             }
-            if (g_lat_guide == 64) {   /* the sub-cell outputs start at zero: the net begins as the interpolated head (random rows gave a 4-voxel lattice wherever the labels do not reach) */
+            if (g_lat_guide == 64 && !widened) {   /* the sub-cell outputs start at zero (--init-widen: the donor's sub-cell rows): the net begins as the interpolated head (random rows gave a 4-voxel lattice wherever the labels do not reach) */
                 for (int co = LBASE; co < cfg.cout; co++) unet_head_row_reset(d->u, co, 0.f);
                 if (g == 0) fprintf(stderr, "sub-cell head: outputs %d-%d start at zero\n", LBASE, cfg.cout - 1);
             }

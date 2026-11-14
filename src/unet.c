@@ -5195,6 +5195,153 @@ int unet_init_from_map(unet *u, const char *path, const int *head_rows) {
     return n;
 }
 
+/* ---- --init-widen (train, DESIGN 2026-11-14 "Widening warm start"): a wider / deeper net from a narrower, shallower donor (u1 -> scratch2)
+   that computes the donor's function. Every channel space of the donor's levels 0 .. Ld (Ld = its bottom) is replicated group by group:
+   target channel j of GroupNorm group g is a copy of donor channel g cpg_d + (j mod cpg_t) mod cpg_d (the same group count), so a
+   replica holds its source's values, the consumers' weights are divided by the copy count and the convs compute the donor's sums.
+   The GroupNorm statistics stay the donor's exactly when every source has the same copy count (cpg_t a multiple of cpg_d), else the
+   group's mean / variance weight the sources unevenly (reported). The donor's bottom feeds dec[Ld - 1] directly; the target's extra
+   levels sit between, through dec[Ld] (conv - GN - SiLU - conv - GN - SiLU, no residual). It passes the donor's raw bottom tensor a
+   through exactly with silu(z) - silu(-z) = z: enc[Ld].c2 writes +a and -a in pairs (each group symmetric: its mean is 0, the
+   normalisation a per-group scale r), dec[Ld].c1 takes the pair difference into new +/- pairs, dec[Ld].n1 scales again, dec[Ld].c2
+   takes the difference: r r' a, whose GroupNorm (the donor's enc[Ld].n2 parameters) equals the donor's. The extra levels feed
+   dec[Ld].c1 through zero weights (fresh; gfilm and the attention stage start as identities); the head takes the donor's rows by
+   head_rows (-1: the fresh row), the fine stem its W1 / b1 and W2 rows by fstem_rows. Exact in real arithmetic (with the GroupNorm
+   proviso); the MX-fp4 storage of the two extra stages adds rounding. Optimiser state 0. Returns the copied tensor count or -1. */
+typedef struct { int n, *src, *sg, *cp, *cm; } wmap;   /* target channel -> donor channel, sign; copies of each donor channel (+ / -) */
+static void wm_free(wmap *m) { free(m->src); free(m->sg); free(m->cp); free(m->cm); }
+static int wm_make(wmap *m, int nt, int nd, int G, int pm) {   /* pm: +/- pairs */
+    const int Gt = G < nt ? G : nt, Gd = G < nd ? G : nd;
+    if (Gt != Gd || nt % Gt || nd % Gd) return -1;
+    const int ct = nt / Gt, cd = nd / Gd;
+    if (pm ? ct % 2 || ct < 2 * cd : ct < cd) return -1;
+    m->n = nt; m->src = malloc(nt * sizeof(int)); m->sg = malloc(nt * sizeof(int)); m->cp = calloc(nd, sizeof(int)); m->cm = calloc(nd, sizeof(int));
+    for (int j = 0; j < nt; j++) {
+        const int g = j / ct, k = j % ct;
+        m->src[j] = g * cd + (pm ? k / 2 : k) % cd; m->sg[j] = pm && (k & 1) ? -1 : 1;
+        if (m->sg[j] > 0) m->cp[m->src[j]]++; else m->cm[m->src[j]]++;
+    }
+    return 0;
+}
+static int wm_uniform(const wmap *m, int nd) { for (int s = 1; s < nd; s++) if (m->cp[s] != m->cp[0]) return 0; return 1; }
+/* conv a of the target from conv b of the donor: output rows by mo (sign included), input channel ci from donor input di[ci] times fi[ci]
+   (di -1: zero weight) */
+static void wd_conv(float *T, const float *D, const convp *a, const convp *b, const wmap *mo, const int *di, const float *fi) {
+    const size_t k3 = (size_t)a->k * a->k * a->k;
+    for (int co = 0; co < a->cout; co++) {
+        const int s = mo->src[co]; const float sg = (float)mo->sg[co];
+        for (int ci = 0; ci < a->cin; ci++) for (size_t t = 0; t < k3; t++)
+            T[a->w + ((size_t)co * a->cin + ci) * k3 + t] = di[ci] < 0 ? 0.f : sg * fi[ci] * D[b->w + ((size_t)s * b->cin + di[ci]) * k3 + t];
+        T[a->b + co] = sg * D[b->b + s];
+    }
+}
+static void wd_gn(float *T, const float *D, const gnp *a, const gnp *b, const wmap *m) {
+    for (int j = 0; j < a->c; j++) { T[a->gamma + j] = b ? D[b->gamma + m->src[j]] : 1.f; T[a->beta + j] = b ? D[b->beta + m->src[j]] : 0.f; }
+}
+static size_t film_fo(const unet *u, int j) { size_t fo = u->film_off; for (int i = 0; i < j; i++) fo += (size_t)2 * u->cfg.film * film_norm(u, i)->c; return fo; }
+static void wd_film(float *T, const float *D, const unet *u, int jt, const unet *o, int jd, const wmap *m) {   /* jd -1: zero (no modulation) */
+    const int K = u->cfg.film, ct = film_norm(u, jt)->c; const size_t ft = film_fo(u, jt);
+    if (jd < 0 || o->cfg.film != K) { memset(T + ft, 0, (size_t)2 * K * ct * 4); return; }
+    const int cd = film_norm(o, jd)->c; const size_t fd = film_fo(o, jd);
+    for (int h = 0; h < 2; h++) for (int k = 0; k < K; k++) for (int j = 0; j < ct; j++) T[ft + ((size_t)h * K + k) * ct + j] = D[fd + ((size_t)h * K + k) * cd + m->src[j]];
+}
+int unet_init_widen(unet *u, const char *path, const int *head_rows, const int *fstem_rows) {
+    unet_cfg oc; int step;
+    if (unet_peek(path, &oc, &step)) return -1;
+    const unet_cfg *c = &u->cfg; const int Lt = c->nlev, Ld = oc.nlev, B = Ld - 1;
+    const char *why = Ld > Lt ? "the donor is deeper" : oc.cin != c->cin ? "another input count" : oc.G != c->G ? "another GroupNorm group count" : oc.attn_blocks ? "a donor with an attention stage" :
+                      oc.down_norm && !c->down_norm ? "the donor has down_norm (pass --down-norm 1)" : !oc.down_norm && c->down_norm ? "the net has down_norm, the donor not" : oc.film && oc.film != c->film ? "another --film code count" : nullptr;
+    for (int i = 0; !why && i < Lt; i++) if (c->enc_blocks[i] || (i < Ld && oc.enc_blocks[i]) || (i < Lt - 1 && (c->dec_widths[i] || c->dec_convs[i] == 1)) || (i < Ld - 1 && (oc.dec_widths[i] || oc.dec_convs[i] == 1))) why = "residual blocks / decoder widths / one-conv decoders";
+    if (!why && Lt > Ld && c->widths[B] < 2 * oc.widths[B]) why = "the donor's bottom level needs >= 2x its width (the +/- pass-through)";
+    if (why) { fprintf(stderr, "init-widen: %s: %s\n", path, why); return -1; }
+    unet *o = unet_create(&oc);
+    if (unet_load(o, path) < 0) { unet_free(o); return -1; }
+    wmap M[UNET_MAXLEV] = {}, P = {}, P2 = {}; int bad = 0, nonu = 0;
+    for (int i = 0; i < Ld && !bad; i++) { bad |= wm_make(&M[i], c->widths[i], oc.widths[i], c->G, 0); if (!bad && !wm_uniform(&M[i], oc.widths[i])) nonu++; }
+    if (!bad && Lt > Ld) bad |= wm_make(&P, c->widths[B], oc.widths[B], c->G, 1) | wm_make(&P2, c->widths[B], oc.widths[B], c->G, 1);
+    if (bad) { fprintf(stderr, "init-widen: widths %d.. vs the donor's %d..: every level needs the same group count and >= the donor's channels per group\n", c->widths[0], oc.widths[0]); unet_free(o); return -1; }
+    float *Tp = malloc(u->np * 4), *Te = malloc(u->np * 4), *Dp = malloc(o->np * 4), *De = malloc(o->np * 4);
+    nn_d2h(Tp, u->p, u->np * 4); nn_d2h(Te, u->ema, u->np * 4); nn_d2h(Dp, o->p, o->np * 4); nn_d2h(De, o->ema, o->np * 4);
+    const int maxc = 4096; int *di = malloc(maxc * sizeof(int)); float *fi = malloc(maxc * sizeof(float)); int n = 0; u->ninh = 0;
+#define WIN(m, nd_off) do { for (int q_ = 0; q_ < (m)->n; q_++) { di[base_ + q_] = (nd_off) + (m)->src[q_]; fi[base_ + q_] = 1.f / (float)(m)->cp[(m)->src[q_]]; } base_ += (m)->n; } while (0)
+#define CONV(ta_, db_, mo_) do { inh_add(u, (ta_)->w, (size_t)(ta_)->cout * (ta_)->cin * (ta_)->k * (ta_)->k * (ta_)->k); inh_add(u, (ta_)->b, (size_t)(ta_)->cout); \
+                            wd_conv(Tp, Dp, ta_, db_, mo_, di, fi); wd_conv(Te, De, ta_, db_, mo_, di, fi); n++; } while (0)
+#define GN(ta_, db_, m_) do { inh_add(u, (ta_)->gamma, (size_t)(ta_)->c); inh_add(u, (ta_)->beta, (size_t)(ta_)->c); wd_gn(Tp, Dp, ta_, db_, m_); wd_gn(Te, De, ta_, db_, m_); n++; } while (0)
+    wmap I = {}; I.n = c->cin; I.src = malloc(c->cin * sizeof(int)); I.sg = malloc(c->cin * sizeof(int)); I.cp = calloc(c->cin, sizeof(int)); I.cm = calloc(c->cin, sizeof(int));
+    for (int k = 0; k < c->cin; k++) { I.src[k] = k; I.sg[k] = 1; I.cp[k] = 1; }
+    for (int i = 0; i < Ld; i++) {   /* encoders: c1 from the input (level 0) or down[i - 1]'s output, c2; the bottom's c2 into +/- pairs */
+        int base_ = 0; WIN(i ? &M[i - 1] : &I, 0); CONV(&u->enc[i].c1, &o->enc[i].c1, &M[i]); GN(&u->enc[i].n1, &o->enc[i].n1, &M[i]);
+        base_ = 0; WIN(&M[i], 0); CONV(&u->enc[i].c2, &o->enc[i].c2, i == B && Lt > Ld ? &P : &M[i]);
+        if (i == B && Lt > Ld) GN(&u->enc[i].n2, (const gnp *)nullptr, &P); else GN(&u->enc[i].n2, &o->enc[i].n2, &M[i]);
+    }
+    for (int i = 0; i < Ld - 1; i++) {   /* down convs and their norms */
+        int base_ = 0; WIN(&M[i], 0); CONV(&u->down[i], &o->down[i], &M[i]);
+        if (c->down_norm) GN(&u->dn[i], &o->dn[i], &M[i]);
+    }
+    for (int i = 0; i < Ld - 1; i++) {   /* decoders below the donor's bottom: [up (level i + 1's space) | skip] */
+        int base_ = 0; WIN(&M[i + 1], 0); WIN(&M[i], oc.widths[i + 1]);
+        CONV(&u->dec[i].c1, &o->dec[i].c1, &M[i]); GN(&u->dec[i].n1, &o->dec[i].n1, &M[i]);
+        base_ = 0; WIN(&M[i], 0); CONV(&u->dec[i].c2, &o->dec[i].c2, &M[i]); GN(&u->dec[i].n2, &o->dec[i].n2, &M[i]);
+    }
+    if (Lt > Ld) {   /* dec[B]: the pass-through of the donor's bottom (centre taps of pair differences; the up part from the extra levels 0) */
+        const block *d = &u->dec[B]; const size_t k3 = 27; const int cu = d->c1.cin - c->widths[B];
+        for (int e = 0; e < 2; e++) {
+            float *T = e ? Te : Tp;
+            memset(T + d->c1.w, 0, (size_t)d->c1.cout * d->c1.cin * k3 * 4); memset(T + d->c1.b, 0, (size_t)d->c1.cout * 4);
+            for (int co = 0; co < d->c1.cout; co++) for (int q = 0; q < P.n; q++) if (P.src[q] == P2.src[co])
+                T[d->c1.w + ((size_t)co * d->c1.cin + cu + q) * k3 + 13] = (float)P2.sg[co] * (P.sg[q] > 0 ? 1.f / P.cp[P.src[q]] : -1.f / P.cm[P.src[q]]);
+            memset(T + d->c2.w, 0, (size_t)d->c2.cout * d->c2.cin * k3 * 4); memset(T + d->c2.b, 0, (size_t)d->c2.cout * 4);
+            for (int co = 0; co < d->c2.cout; co++) for (int q = 0; q < P2.n; q++) if (P2.src[q] == M[B].src[co])
+                T[d->c2.w + ((size_t)co * d->c2.cin + q) * k3 + 13] = P2.sg[q] > 0 ? 1.f / P2.cp[P2.src[q]] : -1.f / P2.cm[P2.src[q]];
+        }
+        inh_add(u, d->c1.w, (size_t)d->c1.cout * d->c1.cin * k3); inh_add(u, d->c2.w, (size_t)d->c2.cout * d->c2.cin * k3);
+        GN(&d->n1, (const gnp *)nullptr, &P2); GN(&d->n2, &o->enc[B].n2, &M[B]); n += 2;
+    }
+    if (c->film) for (int j = 0; j < 2 * Lt - 1; j++) {   /* FiLM pairs: the donor's for the replicated norms, none for the +/- ones and the extra levels */
+        int jd = -1; const wmap *m = nullptr;
+        if (j < Lt) { if (j < Ld && !(j == B && Lt > Ld)) { jd = j; m = &M[j]; } }
+        else { const int lev = Lt - 2 - (j - Lt); if (lev < B) { jd = Ld + (Ld - 2 - lev); m = &M[lev]; } else if (lev == B) { jd = B; m = &M[B]; } }
+        if (!oc.film) jd = -1;
+        wd_film(Tp, Dp, u, j, o, jd, m); wd_film(Te, De, u, j, o, jd, m);
+        if (jd >= 0) inh_add(u, film_fo(u, j), (size_t)2 * c->film * film_norm(u, j)->c);
+    }
+    {   /* the head: the donor's rows (input channels the level-0 replicas) */
+        const convp *a = &u->head, *b = &o->head;
+        for (int co = 0; co < a->cout; co++) {
+            const int s = head_rows ? head_rows[co] : co < b->cout ? co : -1;
+            if (s < 0 || s >= b->cout) continue;
+            for (int e = 0; e < 2; e++) { float *T = e ? Te : Tp; const float *D = e ? De : Dp;
+                for (int ci = 0; ci < a->cin; ci++) T[a->w + (size_t)co * a->cin + ci] = D[b->w + (size_t)s * b->cin + M[0].src[ci]] / (float)M[0].cp[M[0].src[ci]];
+                T[a->b + co] = D[b->b + s]; }
+            inh_add(u, a->w + (size_t)co * a->cin, (size_t)a->cin); inh_add(u, a->b + co, 1);
+        }
+        n++;
+    }
+    if (c->fstem && oc.fstem == c->fstem) {   /* the fine stem: W1, b1 as is, W2 rows by fstem_rows (else by position), the others 0 */
+        const size_t nw = (size_t)c->fstem * 64 + c->fstem;
+        for (int e = 0; e < 2; e++) { float *T = e ? Te : Tp; const float *D = e ? De : Dp;
+            memcpy(T + u->fstem_off, D + o->fstem_off, nw * 4);
+            for (int k = 0; k < c->fstem_out; k++) { const int s = fstem_rows ? fstem_rows[k] : k < oc.fstem_out ? k : -1;
+                for (int q = 0; q < c->fstem; q++) T[u->fstem_off + nw + (size_t)k * c->fstem + q] = s >= 0 && s < oc.fstem_out ? D[o->fstem_off + nw + (size_t)s * c->fstem + q] : 0.f; } }
+        inh_add(u, u->fstem_off, nw + (size_t)c->fstem_out * c->fstem); n++;
+    }
+#undef WIN
+#undef CONV
+#undef GN
+    nn_wmemo_clear();
+    nn_h2d(u->p, Tp, u->np * 4); nn_h2d(u->ema, Te, u->np * 4);
+    nn_zero(u->m, u->np * 4); nn_zero(u->v, u->np * 4); if (u->muon_mom) nn_zero(u->muon_mom, u->np * 4);
+    u->mx_R_nload = 0; u->mx_R_ok = 0;
+    inh_norm(u);
+    fprintf(stderr, "init-widen: %s (%d levels, widths %d..%d) -> %d levels, widths %d..%d: %d tensors; GroupNorm statistics %s%s\n", path, Ld, oc.widths[0], oc.widths[B], Lt, c->widths[0], c->widths[Lt - 1], n,
+            nonu ? "weighted unevenly at " : "exact (whole copies)", nonu ? "" : "");
+    if (nonu) { for (int i = 0; i < Ld; i++) if (!wm_uniform(&M[i], oc.widths[i])) fprintf(stderr, " level %d (%d -> %d per group)", i, oc.widths[i] / (c->G < oc.widths[i] ? c->G : oc.widths[i]), c->widths[i] / (c->G < c->widths[i] ? c->G : c->widths[i])); fprintf(stderr, "\n"); }
+    for (int i = 0; i < Ld; i++) wm_free(&M[i]);
+    wm_free(&P); wm_free(&P2); wm_free(&I); free(di); free(fi); free(Tp); free(Te); free(Dp); free(De);
+    unet_free(o);
+    return n;
+}
+
 int unet_start_sheet(unet *u) {
     if (u->cfg.cin!=4 || u->cfg.cout!=2 || u->wq) {
         fputs("winding initialization needs a four-input/two-output donor with FP32 master weights\n",stderr); return -1;

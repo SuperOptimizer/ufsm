@@ -283,6 +283,7 @@ int unet_load_grow(unet *u, const char *path, int keep, float new_bias);   /* wa
 int unet_init_from(unet *u, const char *path);   /* partial warm start: shape-matching layers of another net (src/unet.c) */
 void unet_set_init_shift(int s);   /* the next unet_init_from*: u's level i from the donor's level i + s */
 int unet_init_from_map(unet *u, const char *path, const int *head_rows);   /* the same with an explicit head row map (src/unet.c) */
+int unet_init_widen(unet *u, const char *path, const int *head_rows, const int *fstem_rows);   /* --init-widen: a wider / deeper net computing a narrower donor's function (src/unet.c) */
 /* Retain surface response, zero the new scalar input and winding output,
    including EMA/Adam/Muon state for those parameters. */
 int unet_start_sheet(unet *u);
