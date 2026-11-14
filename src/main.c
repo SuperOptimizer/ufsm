@@ -230,6 +230,7 @@ static int usage(void) {
         "  ufsm annot-export ANN.json [--fib F] [--pairs T] [--gate B --level L] [--points DIR --like R K --level L]   annotations -> fitter votes / gate boxes / sparse codes\n"
         "  ufsm annot-regions OUT.tsv [--judge T.tsv ..] [--wrapcheck W --wraps D --um0 U]   flagged regions (fibre judge, wrap check) for annotate-serve --regions\n"
         "  ufsm wrap-check <model> <fields-dir> [--ct ROOT KEY --ct-um U] [--codes ROOT KEY]   duplicate / merged wraps: CT peaks between adjacent wraps along radial rays\n"
+        "  ufsm unroll-qa --fields DIR --model SET [--ct ROOT KEY] [--fibres F.fib] [--box ..]... [--out DIR] [--strict]   label-free sheet-identity gates (phase confidence, phase-unwrap witness, wind4, fibres)\n"
         "  ufsm surf-snap <wraps-in> <wraps-out> --volume ROOT KEY --vol-um U   tifxyz vertices onto the nearest papyrus ridge\n"
         "  ufsm wrap-snap <wraps-in> <wraps-out> --axis F --axis-um U0 --ct ROOT KEY --ct-um U   .sfc wraps moved along their rays onto the sheets (smooth, order-kept)\n"
         "  ufsm trace-prep --prob P --box Z0,Y0,X0,NZ,NY,NX --axis A --out DIR [--field ridge|prob] [--seeds 64]   tracer box input: radial ridge as an OME zarr v2 pyramid + seeds\n"
