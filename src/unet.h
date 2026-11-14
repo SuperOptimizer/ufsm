@@ -226,6 +226,9 @@ void unet_set_l0_ema(unet *u, float mom, int warm);
    warm training forwards normalise with their own statistics, later ones and every inference forward (once there are statistics) with
    the running ones. Defaults 0.01, 500. unet_gn_ema_updates: training forwards so far (saved with the statistics) */
 unsigned unet_gn_ema_skips(const unet *u);   /* gn_ema: training forwards whose non-finite batch statistics were not pooled */
+void unet_gn_ema_override(unet *u, float mom, int warm);   /* after unet_load: mom / warm >= 0 replace the checkpoint's (train --gn-ema-mom / -warm on a resume) */
+int unet_gn_ema_warm(const unet *u);
+int unet_gn_ema_const(const unet *u);   /* the last forward normalised with the running statistics */
 void unet_set_gn_ema(unet *u, float mom, int warm);
 long unet_gn_ema_updates(const unet *u);
 void unet_set_l0_slab_kern(int on);   /* --l0-norm slab on the kernel path (readers apply per-slab statistics; 1) or D's prototype (0); -1: env UFSM_L0_SLAB_KERN */

@@ -115,6 +115,24 @@ static void run(const char *name, unet_cfg cfg) {
         CHECK(!memcmp(la, lb, no * 4), "reloaded: the live weights' logits bit-identical (max diff %g)", maxdiff(la, lb, no));
         unet_use_ema(v, 1); fwd(v, d2, xs, 0, lb, no); unet_use_ema(v, 0);
         CHECK(!memcmp(lc, lb, no * 4), "reloaded: the EMA weights' logits bit-identical (max diff %g)", maxdiff(lc, lb, no));
+        /* a resume with the warm-up overridden past the run (train --gn-ema-warm 1000000000 on a resume, try3 11-13): the training forward goes
+           back to batch statistics (the live GroupNorm net's logits), the running ones still take each training forward, inference keeps them */
+        {
+            fwd(v, d1, xs, 1, la, no); CHECK(unet_gn_ema_const(v), "reloaded past the warm-up: a training forward on the running statistics");
+            unet_gn_ema_override(v, -1.f, 1000000000);
+            CHECK(unet_gn_ema_warm(v) == 1000000000, "override: warm-up %d", unet_gn_ema_warm(v));
+            const long n0 = unet_gn_ema_updates(v);
+            fwd(v, d1, xs, 1, la, no);
+            CHECK(!unet_gn_ema_const(v) && unet_gn_ema_updates(v) == n0 + 1, "override: the training forward on batch statistics (const %d), the running ones updated (%ld -> %ld)",
+                  unet_gn_ema_const(v), n0, unet_gn_ema_updates(v));
+            unet_cfg cl = pc; cl.gn_ema = 0; unet *lv = unet_create(&cl); unet_init(lv, 1); CHECK(unet_nparams(lv) == unet_nparams(v), "live net: same parameters"); unet_use_params(lv, unet_live_params(v));
+            fwd(lv, d1, xs, 1, lb, no);
+            CHECK(maxdiff(la, lb, no) <= 1e-4, "override: the training forward matches live GroupNorm (max diff %g)", maxdiff(la, lb, no));
+            unet_use_params(lv, nullptr); unet_free(lv);
+            fwd(v, d1, xs, 0, la, no); CHECK(unet_gn_ema_const(v), "override: inference still on the running statistics");
+            CHECK(!unet_save(v, path, 8, nullptr), "save (overridden)");
+            unet *v2 = unet_create(&pc); CHECK(unet_load(v2, path) == 8 && unet_gn_ema_warm(v2) == 1000000000, "the overridden warm-up saved (%d)", unet_gn_ema_warm(v2)); unet_free(v2);
+        }
         unet_free(v);
         /* an old checkpoint (no statistics) into a gn_ema net: a fresh warm-up */
         unet_cfg c0 = cfg; c0.gn_ema = 0; unet *o = unet_create(&c0); unet_init(o, 9);

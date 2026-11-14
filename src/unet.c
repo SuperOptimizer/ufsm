@@ -2186,6 +2186,12 @@ static void ge_after(unet *u) {   /* training forward, live weights: the batch's
     u->ge_n++;
 }
 void unet_set_gn_ema(unet *u, float mom, int warm) { u->ge_mom = mom; u->ge_warm = warm; }
+/* after unet_load (which takes the checkpoint's): mom >= 0 / warm >= 0 replace them (train --gn-ema-mom / --gn-ema-warm on a resume; saved with
+   the next checkpoint). A warm-up beyond the run's length keeps the training forward on batch statistics while the running ones still
+   follow every training forward (predict / validation use those) */
+void unet_gn_ema_override(unet *u, float mom, int warm) { if (mom >= 0.f) u->ge_mom = mom; if (warm >= 0) u->ge_warm = warm; }
+int unet_gn_ema_warm(const unet *u) { return u->ge_warm; }
+int unet_gn_ema_const(const unet *u) { return u->ge_c; }
 long unet_gn_ema_updates(const unet *u) { return u->ge_n; }
 unsigned unet_gn_ema_skips(const unet *u) { unsigned k = 0; if (u->cfg.gn_ema && u->ge_run) nn_d2h(&k, u->ge_run + 3 * u->ge_ns, 4); return k; }
 static void l0_begin(unet *u) {   /* forward start: latch l0_c, the constant statistics into the sites */
