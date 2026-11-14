@@ -109,6 +109,9 @@ typedef struct {
     axis ax;                /* n == 0 when unknown */
     int64_t hold_o[3], hold_n[3];   /* optional held-out box (level-0 voxels); hold_n[0] == 0 when absent (= hold[0]: the validation box) */
     int64_t (*hold)[6]; int nhold;  /* all held-out boxes (z y x nz ny nx, level 0): no training label inside them */
+    int hold_checked;       /* the boxes were checked against the CT extent (source_ct, first open) */
+    uint8_t *hold_nos;      /* per held-out box: 1 = "score": 0 in the holdout_file (masked from training, never a validation box: e.g. a second scan
+                               without a registration, where a cross-scan leak cannot be ruled out) */
     uint8_t *hold_rej;      /* per held-out box (parallel to hold): 1 = rejected even in mask mode ("holdout_reject": the box names) */
     int hold_mode;          /* "holdout_mode": 0 the sampler's (train --holdout-mode), 1 "mask", 2 "reject": this source's training windows
                                that overlap a held-out box */
@@ -142,6 +145,8 @@ typedef struct {
                         for every source), any long-range / count loss must skip it. "global" (default) */
     z3 *phase_ign;   /* optional "phase": {..., "ignore": {"root", "key"}}: a uint8 array on the stored phase's grid, nonzero = the phase there is not trained on (ufsm phase-conflict) */
     z3 *phase_pl[MAXLEV], *phase_ign_pl[MAXLEV];   /* source_phase_at: the stored phase / ignore pooled to levels coarser than phase_level (lazy views) */
+    store *phase_store; double phase_key_um;   /* a stored (not onfly) phase: its store and its key's um; source_phase_at opens a coarser level stored in
+                                                  the same group (ufsm downsample --mode phase, key = that level's um) instead of pooling per read */
     uint8_t *focus; int64_t focus_grid[3]; float focus_w;   /* optional "focus": {"map": RAW, "w": K} (ufsm phase-packing --map: per coarse occupancy cell 0 none, else
                                                               1 + 254 x packed share): the position draw takes a cell 1 + K x share times as often */
     z3 *wind;    /* optional, with a stored phase: the winding mod 14 turns on the same grid (ufsm phase-raster --winding; band.h

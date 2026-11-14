@@ -226,6 +226,7 @@ struct sampler {
     int64_t *rdue, *rseq, nserved, nrel; int rgap;   /* --replay interleave (under mu): a pending replay's due serve count / release order; batches handed out / released */   /* --replay: per slot replays left, in the replay pipeline (REPLAY or READY as one); its thread */
     atomic_int stop, failed;
     atomic_uint_fast64_t produced, rejected;
+    _Atomic uint64_t outw[64][2];   /* per source (< 64): aligned phase-gradient samples rising outward / inward (sample_phase_outward) */
     _Atomic uint32_t rej_sl[64][MAXLEV][SL_N];   /* per source (< 64) and level, by SL_* (sampler_level_stats) */
     atomic_uint_fast64_t rej_why[4];   /* draws dropped: coarse CT probe, CT read (min_fg), empty targets, holdout overlap (not in rejected) */
     atomic_uint_fast64_t crushed;      /* --aug-crush windows drawn */
@@ -394,7 +395,7 @@ static void free_batch(batch *b, int B) { free(b->latd); free(b->lvc); free(b->l
    can provide (pyramid: same level; regions: levels 0..1). Returns -1 if nothing is usable. */
 /* which levels a source can serve (CT and at least one target open): computed once per (source, region channel) since
    source_ct / source_tgt take the global open lock and may open remote stores; before this every draw re-checked every level */
-/* Inclusive level-l origins whose whole patch lies in the CT, region and validation box.
+/* Inclusive level-l origins whose whole patch lies in the CT, region and validation box (validation: 0 none, k + 1 held-out box k).
    Round starts up and ends down: flooring a non-aligned holdout start leaks outside it. */
 static int patch_bounds(const source *s, const z3_meta *m, const int64_t wn[3], int l, const regions *r, int ri, int validation, int64_t lo[3], int64_t hi[3]) {
     int64_t f = (int64_t)1 << l;
@@ -407,9 +408,12 @@ static int patch_bounds(const source *s, const z3_meta *m, const int64_t wn[3], 
             if (rl > lo[d]) lo[d] = rl;
             if (rh < hi[d]) hi[d] = rh;
         }
-        if (validation) {
-            if (s->hold_n[d] <= 0) return 0;
-            int64_t hl = (s->hold_o[d] + f - 1) / f, hh = (s->hold_o[d] + s->hold_n[d]) / f - P;
+        if (validation) {   /* (validation k + 1: held-out box k; 1 = box 0 = hold_o / hold_n) */
+            const int k = validation - 1; if (k >= (s->hold_n[0] > 0 ? (s->nhold > 1 ? s->nhold : 1) : 0)) return 0;
+            if (s->hold_nos && k < s->nhold && s->hold_nos[k]) return 0;   /* ("score": 0: masked, never validated on) */
+            const int64_t bo = k ? s->hold[k][d] : s->hold_o[d], bn = k ? s->hold[k][3 + d] : s->hold_n[d];
+            if (bn <= 0) return 0;
+            int64_t hl = (bo + f - 1) / f, hh = (bo + bn) / f - P;
             if (hl > lo[d]) lo[d] = hl;
             if (hh < hi[d]) hi[d] = hh;
         }
@@ -421,8 +425,19 @@ static int patch_bounds(const source *s, const z3_meta *m, const int64_t wn[3], 
 static inline int src_nhold(const source *h) { return h->hold_n[0] > 0 ? (h->nhold > 1 ? h->nhold : 1) : 0; }
 static inline int64_t hb_o(const source *h, int k, int d) { return k ? h->hold[k][d] : h->hold_o[d]; }
 static inline int64_t hb_n(const source *h, int k, int d) { return k ? h->hold[k][3 + d] : h->hold_n[d]; }
+/* eval audit 11-14 #7: the same scan by CT basename (+ um), not root + key: a local copy and the http mirror of one scan (the ink
+   sources read local CT, the winding ones dl.ash2txt) are one scan, and each source's boxes must mask the other's labels */
+static size_t ct_base(const char *p, const char **t) {   /* the last path component past trailing slashes and level digits */
+    size_t n = strlen(p);
+    for (;;) { while (n && p[n - 1] == '/') n--; size_t b = n; while (b && p[b - 1] != '/') b--;
+        int dig = b < n; for (size_t c = b; c < n; c++) dig &= p[c] >= '0' && p[c] <= '9';
+        if (dig && b) { n = b - 1; continue; } *t = p + b; return n - b; }
+}
 static int same_ct(const source *a, const source *b) {
-    return a == b || (a->um == b->um && !strcmp(a->ct_key, b->ct_key) && !strcmp(store_root(a->s), store_root(b->s)));
+    if (a == b) return 1;
+    if (a->um != b->um) return 0;
+    const char *ta, *tb; const size_t na = ct_base(a->ct_key, &ta), nb = ct_base(b->ct_key, &tb);
+    return na == nb && na && !memcmp(ta, tb, na);
 }
 static int hits_holdout_span(const sampler *sp, const source *s, const int64_t o[3], int l, int only_rej, int unit) {   /* unit: a 1-voxel span, not the window */
     const int64_t span[3] = {(int64_t)(unit ? 1 : PZ(&sp->cfg)) << l, (int64_t)(unit ? 1 : sp->cfg.P) << l, (int64_t)(unit ? 1 : sp->cfg.P) << l};
@@ -464,6 +479,24 @@ static int holdout_window_boxes(const sampler *sp, const source *s, const int64_
         }
     }
     return nb;
+}
+/* UFSM_HOLD_AUDIT (train's sampler-only mode): window i's known label voxels inside the held-out boxes of its CT (no guard), over every
+   source-grid label plane the batch holds (phase / side, w4, ink, aux, papyrus, loss mask, packed mask, ink known bits); the training
+   sampler masks the boxes + guard, so a nonzero count is a leak. Returns the voxels inside boxes (vox) and the known ones among them. */
+void sample_hold_audit(const sampler *sp, const batch *b, int i, uint64_t *vox, uint64_t *known) {
+    *vox = *known = 0; const int si = b->src ? b->src[i] : -1, l = b->level ? b->level[i] : 0; if (si < 0 || si >= sp->S->n || l < 0) return;
+    const source *s = &sp->S->src[si]; const int Pz = PZ(&sp->cfg), P = sp->cfg.P; const int64_t n[3] = {Pz, P, P}, o[3] = {b->corner[i][0] >> l, b->corner[i][1] >> l, b->corner[i][2] >> l};
+    int32_t hb[HB_MAX][6]; const int nb = holdout_window_boxes(sp, s, o, n, l, 0, hb, HB_MAX); if (nb <= 0) return;
+    const size_t nv = (size_t)Pz * P * P;
+    const uint8_t *pl[10] = {b->side, b->w4, b->ink, b->aux[0], b->aux[1], b->aux[2], b->aux[3], b->pap}; const uint8_t unk[10] = {255, 255, 255, 255, 255, 255, 255, 255};
+    for (int q = 0; q < nb; q++) for (int z = hb[q][0]; z < hb[q][3]; z++) for (int y = hb[q][1]; y < hb[q][4]; y++) for (int x = hb[q][2]; x < hb[q][5]; x++) {
+        const size_t k = ((size_t)z * P + y) * P + x; int kn = 0; (*vox)++;
+        for (int j = 0; j < 8; j++) kn |= pl[j] && (sp->cfg.plane_bank ? pl[j] != sp->c255 : 1) && pl[j][(size_t)i * nv + k] != unk[j];
+        if (b->m) kn |= b->m[(size_t)i * nv + k] != 0;
+        if (b->tm) kn |= (b->tm[(size_t)i * nv + k] & 4) != 0;
+        if (b->inkb) kn |= (b->inkb[((size_t)i * nv + k) >> 3] >> (k & 7)) & 1;
+        *known += kn != 0;
+    }
 }
 /* v in the boxes of a Pz x P x P source-grid plane (row runs: memset) */
 static void hold_fill(uint8_t *p, const int32_t (*hb)[6], int nb, int P, uint8_t v) {
@@ -512,8 +545,9 @@ static int level_ok(sampler *sp, source *s, int si, int l, int region_ch) {
             const z3_meta *m = z3_meta_of(source_ct(s, l));
             regions *r = region_ch >= 0 ? s->reg[region_ch] : nullptr;
             int fits = 0; int64_t lo[3], hi[3]; const int64_t wn[3] = {PZ(&sp->cfg), sp->cfg.P, sp->cfg.P};
-            for (int i = 0; i < (r ? r->n : 1); i++) if (patch_bounds(s, m, wn, l, r, i, sp->cfg.holdout, lo, hi) &&
-                (sp->cfg.holdout || training_corner_exists(sp, s, l, lo, hi))) { fits = 1; break; }
+            const int nbx = sp->cfg.holdout ? (s->hold_n[0] > 0 ? (s->nhold > 1 ? s->nhold : 1) : 0) : 1;   /* validation: any held-out box a window fits */
+            for (int i = 0; i < (r ? r->n : 1) && !fits; i++) for (int k = 0; k < nbx && !fits; k++) if (patch_bounds(s, m, wn, l, r, i, sp->cfg.holdout ? k + 1 : 0, lo, hi) &&
+                (sp->cfg.holdout || training_corner_exists(sp, s, l, lo, hi))) fits = 1;
             ok = fits;
         }
         if (ok && !sp->cfg.restore) {   /* (task restore: no targets) */
@@ -550,6 +584,17 @@ static int level_on(sampler *sp, source *s, int si, int l, int region_ch) {
     if (!sp->cfg.nrung) return sp->cfg.level_p[l] > 0;
     for (int k = 0; k < sp->cfg.nrung; k++) if (sp->cfg.rung_w[k] > 0 && rung_level(sp, s, si, k, region_ch) == l) return 1;
     return 0;
+}
+/* the rung shares pick_level draws for source si (no region): the weights over the rungs it reaches, then --rung-shift-p's move */
+void sample_rung_marginals(sampler *sp, int si, double q[8]) {
+    const int nr = sp->cfg.nrung; source *s = &sp->S->src[si]; int lv[8]; double tot = 0, p0[8] = {0};
+    for (int k = 0; k < 8; k++) q[k] = 0;
+    for (int k = 0; k < nr; k++) { lv[k] = sp->cfg.rung_w[k] > 0 ? rung_level(sp, s, si, k, -1) : -1; if (lv[k] >= 0) tot += sp->cfg.rung_w[k]; }
+    if (tot <= 0) return;
+    for (int k = 0; k < nr; k++) p0[k] = lv[k] >= 0 ? sp->cfg.rung_w[k] / tot : 0;
+    const double p = sp->cfg.rung_shift_p;
+    for (int k = 0; k < nr; k++) { if (!(p0[k] > 0)) continue; q[k] += p0[k] * (1 - p);
+        for (int e = -1; e <= 1; e += 2) { const int k2 = k + e; const int ok = k2 >= 0 && k2 < nr && rung_level(sp, s, si, k2, -1) >= 0; q[ok ? k2 : k] += p0[k] * p / 2; } }
 }
 static int pick_level(sampler *sp, source *s, rng *r, int region_ch) {
     if (sp->cfg.nrung) {   /* --um-rungs: a rung by weight among those this source reaches, maybe moved one rung (--rung-shift-p), then its level */
@@ -959,6 +1004,11 @@ void sample_write_x_test(const uint8_t *ctu, int D, int P, const int64_t o[3], f
 int sample_write_spatial_test(const uint8_t *ctu, const uint8_t *tgt, const uint8_t *mask, int P, const int64_t o[3], float mean, float isd,
                               int hasax, const float *cyz, const float *cxz, const int perm[3], const int flip[3], int xfmt, uint64_t seed,
                               uint64_t aug_seed, float zoom, int affine, int hard, uint16_t *H4, uint16_t *H1, void *rec, uint8_t *T, uint8_t *M);
+/* the CT value of a warped voxel pulled from outside the source cube (rotations reach ~P sin(theta) / 2 voxels past it: ~33 at 5 deg, P 768):
+   the z-scored raw 0, the value of a scan's masked outside (and of predict's windows past the volume), then the jitter as for any voxel. It
+   was 0 = the window's mean density, a texture-less slab of fake material with a sharp edge (audit 2026-11-14, datafix); its labels stay
+   unknown. nn_aug.cu aug_write_k fills the same. With --ct-aug's appearance (filter mode) 0 as before */
+static inline float warp_fill(const ct_aug_plan *ap, float mean, float isd) { return ap ? (ap->filter_mode ? 0.f : ap->lut[0]) : (0.f - mean) * isd; }
 /* Continuous geometry uses source coordinates for CT, labels, q0 and the axis.
    Only valid source voxels are supervised: rotated cube corners are ignored.
    The four input channels stay unchanged; a winding task uses q0 and the two
@@ -994,6 +1044,7 @@ int sample_write_spatial_test(const uint8_t *ctu, const uint8_t *tgt, const uint
             for (int d=0;d<3;d++) if (v[d]<0 || v[d]>P-1) inside=0;
             for (int ch=0;ch<NCH;ch++) T[(size_t)ch*p3+k]=0;
             M[k]=0;
+            if (!inside) out[0]=gain*warp_fill(ap,mean,isd)+offset+noise*nrow[x];   /* (the z-scored raw 0, jittered as any voxel: see warp_fill) */
             if (inside) {
                 int base[3]; float f[3];
                 for (int d=0;d<3;d++) { base[d]=(int)v[d]; if (base[d]>=P-1) base[d]=P-2; f[d]=v[d]-base[d]; }
@@ -1075,6 +1126,7 @@ static void write_spatial_tm(const uint8_t *ctu,const uint8_t *target,const uint
     }
     /* ((float)ctu - mean) * isd (or the plan's LUT) tabulated per value: the same floats */
     float lutv[256]; for (int i=0;i<256;i++) lutv[i]=ap?(ap->filter_mode?0:ap->lut[i]):((float)i-mean)*isd;
+    const float fillv=warp_fill(ap,mean,isd);   /* (outside the source cube) */
 #ifdef __AVX2__
     /* the trainer's case (hard targets, CT-only, P a multiple of 16): 8 voxels at a time with AVX2 gathers of the CT values (as floats in
        the appearance scratch), mask and target bytes (aligned 32-bit words, in bounds: P^3 % 4 == 0); the same float operations in the
@@ -1295,16 +1347,17 @@ static void write_spatial_tm(const uint8_t *ctu,const uint8_t *target,const uint
             int x=0;   /* (the row in place, then one store pass) */
 #ifdef __AVX2__
             {
-                const __m256 vg=_mm256_set1_ps(gain),vo=_mm256_set1_ps(offset),vn=_mm256_set1_ps(noise);
+                const __m256 vg=_mm256_set1_ps(gain),vo=_mm256_set1_ps(offset),vn=_mm256_set1_ps(noise),vfill=_mm256_set1_ps(fillv);
                 for (;x+8<=P;x+=8) {
                     uint64_t ib; memcpy(&ib,inb+kb0+x,8);
                     const __m256 keep=_mm256_castsi256_ps(_mm256_xor_si256(_mm256_cmpeq_epi32(_mm256_cvtepu8_epi32(_mm_cvtsi64_si128((long long)ib)),_mm256_setzero_si256()),_mm256_set1_epi32(-1)));
-                    const __m256 o=_mm256_add_ps(_mm256_add_ps(_mm256_mul_ps(vg,_mm256_loadu_ps(cvb+kb0+x)),vo),_mm256_mul_ps(vn,_mm256_loadu_ps(nrow+x)));
-                    _mm256_storeu_ps(nrow+x,_mm256_and_ps(o,keep));
+                    const __m256 cvx=_mm256_blendv_ps(vfill,_mm256_loadu_ps(cvb+kb0+x),keep);
+                    const __m256 o=_mm256_add_ps(_mm256_add_ps(_mm256_mul_ps(vg,cvx),vo),_mm256_mul_ps(vn,_mm256_loadu_ps(nrow+x)));
+                    _mm256_storeu_ps(nrow+x,o);
                 }
             }
 #endif
-            for (;x<P;x++) nrow[x]=inb[kb0+x]?gain*cvb[kb0+x]+offset+noise*nrow[x]:0.f;
+            for (;x<P;x++) nrow[x]=gain*(inb[kb0+x]?cvb[kb0+x]:fillv)+offset+noise*nrow[x];
             if (xfmt==1) f16_row(nrow,H+k0,P);
             else if (xfmt==2) for (int x=0;x<P;x++) H[k0+x]=bf16_rn(nrow[x]);
             else memcpy(X+k0,nrow,(size_t)P*sizeof *X);
@@ -1651,6 +1704,25 @@ static int phase_window_interp(z3 *a, const int64_t o[3], int D, int P, int shif
     tp_put(ph, N);
     return 0;
 }
+void sample_phase_outward(const uint8_t *ph, int Pz, int P, const int64_t o[3], const float *cyz, const float *cxz, uint64_t out[2]) {
+    const size_t PP = (size_t)P * P; uint64_t po = 0, pi = 0;
+    for (int z = 0; z + 1 < Pz; z += 8) for (int y = 0; y + 1 < P; y += 8) {
+        const uint8_t *row = ph + (size_t)z * PP + (size_t)y * P; const float ry = (float)(o[1] + y) - cyz[z];
+        for (int x = 0; x + 1 < P; x += 8) {
+            const int v = row[x], vz = row[x + PP], vy = row[x + P], vx = row[x + 1];
+            if (v >= PHASE_PERIOD || vz >= PHASE_PERIOD || vy >= PHASE_PERIOD || vx >= PHASE_PERIOD) continue;
+            const int H = PHASE_PERIOD / 2;   /* circular differences in (-H, H]: the 1 -> 0 wrap at a recto is a step of +1 */
+            const int dz = (vz - v + PHASE_PERIOD + H) % PHASE_PERIOD - H, dy = (vy - v + PHASE_PERIOD + H) % PHASE_PERIOD - H, dx = (vx - v + PHASE_PERIOD + H) % PHASE_PERIOD - H;
+            const float rx = (float)(o[2] + x) - cxz[z], rn2 = ry * ry + rx * rx, g2 = (float)(dz * dz + dy * dy + dx * dx);
+            if (rn2 < 1.f || g2 <= 0.f) continue;
+            const float dot = (float)dy * ry + (float)dx * rx;
+            if (dot * dot < 0.49f * g2 * rn2) continue;   /* (|cos| < 0.7: a sheet facing sideways says little about the direction) */
+            if (dot > 0) po++; else pi++;
+        }
+    }
+    out[0] += po; out[1] += pi;
+}
+void sampler_outward_stats(sampler *sp, int si, uint64_t out[2]) { for (int k = 0; k < 2; k++) out[k] = si >= 0 && si < 64 ? atomic_load(&sp->outw[si][k]) : 0; }
 /* sources "phase": {"weight"}: per 8^3 block of a Pz x P x P window, the block keeps its phase with probability (mean w) / 255
    (a draw from seed and the block index; w outside the array reads 255 = keep), else its voxels become unknown. Exposed for tests. */
 void phase_weight_drop(uint8_t *ph, const uint8_t *w, int Pz, int P, uint64_t seed) {
@@ -2676,7 +2748,12 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
         int64_t lo[3], hi[3]; if (!patch_bounds(s, m, n, l, R, ri, c->holdout, lo, hi)) SL_OTHER_RET();
         for (int d = 0; d < 3; d++) o[d] = lo[d] + rint_below(r, hi[d] - lo[d] + 1);
     } else if (c->holdout) {
-        int64_t lo[3], hi[3]; if (!patch_bounds(s, m, n, l, nullptr, 0, 1, lo, hi)) SL_OTHER_RET();
+        /* a held-out box drawn uniformly among those a window fits at this level (eval audit 11-14 #7: box 0 only before) */
+        int fitk[256], nf = 0; const int nbx = s->hold_n[0] > 0 ? (s->nhold > 1 ? s->nhold : 1) : 0;
+        for (int k = 0; k < nbx && nf < 256; k++) { int64_t a_[3], b_[3]; if (patch_bounds(s, m, n, l, nullptr, 0, k + 1, a_, b_)) fitk[nf++] = k; }
+        if (!nf) SL_OTHER_RET();
+        const int kk = fitk[rint_below(r, nf)];
+        int64_t lo[3], hi[3]; if (!patch_bounds(s, m, n, l, nullptr, 0, kk + 1, lo, hi)) SL_OTHER_RET();
         for (int d = 0; d < 3; d++) o[d] = lo[d] + rint_below(r, hi[d] - lo[d] + 1);
     } else if (s->nbox) {   /* "boxes": training windows inside them (e.g. the emb-only distillation boxes) */
         int64_t *lo = blo, *hi = bhi; if (box_bounds(s, m, n, l, r, lo, hi)) SL_OTHER_RET(); inbox = 1;
@@ -3325,6 +3402,16 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
             uint16_t *wq = nullptr;   /* warped --task unwrap2: the winding and its component for warp_phase_w4 (one pass with the phase) */
             if (!sw || (g_crush.ph ? (memcpy(sw, g_crush.ph, p3), 0) : phase_window(phz, o, Pz, P, psh, sw))) { SW_PUT(); return -1; }
             if (s->phase_sign < 0) phase_negate(sw, p3);   /* (before the winding mod 4: it unwraps this phase) */
+            {   /* the per-source outward share (train's "phase outward by source" line): the labels as trained, against the unjittered axis */
+                const int si_ = (int)(s - sp->S->src);
+                if (s->ax.n > 0 && si_ >= 0 && si_ < 64 && !g_crush.ph) {
+                    float *ay = malloc(2 * (size_t)Pz * sizeof *ay);
+                    if (ay) { const double sc = (double)(1 << l); uint64_t oc[2] = {0, 0};
+                        for (int z = 0; z < Pz; z++) { double cy, cx; axis_at(&s->ax, (double)(o[0] + z) * sc, &cy, &cx); ay[z] = (float)(cy / sc); ay[Pz + z] = (float)(cx / sc); }
+                        sample_phase_outward(sw, Pz, P, o, ay, ay + Pz, oc); atomic_fetch_add(&sp->outw[si_][0], oc[0]); atomic_fetch_add(&sp->outw[si_][1], oc[1]);
+                        free(ay); }
+                }
+            }
             if (nhb) hold_fill(sw, (const int32_t (*)[6])hb, nhb, P, PHASE_UNKNOWN);   /* (holdout mask: the phase, so the winding mod 4 too) */
             const int ign_none = ignz && psh == 0 && !g_crush.ig && z3_box_any(ignz, o, (const int64_t[3]){Pz, P, P}) == 0;   /* (no stored chunk in the window: all fill, which keeps every phase) */
             if (ignz && psh < 2 && !g_crush.pre && !ign_none) {   /* (--aug-tear: applied before the cut) (interpolated 2.4 um windows: no mask) "ignore": label sets that disagree there (ufsm phase-conflict): unknown, not trained on */
@@ -4188,6 +4275,18 @@ sampler *sampler_start(sources *S, const sample_cfg *cfg) {
         acc += eligible ? s->weight : 0; sp->cum[i] = acc;
     }
     if (acc <= 0) { fprintf(stderr, "sampler: no eligible sources; check window, holdout boxes, regions and levels\n"); free(sp->cum); free(sp->lvl_ok); free(sp); return nullptr; }
+    if (cfg->nrung > 1 && cfg->rung_shift_p > 0 && !cfg->holdout) {   /* --rung-shift-p carries no state past the draw: it only reweights the rungs. The
+        effective rung shares of the weighted draw (pick_level), so the run's real mix is in the log: a list neighbour with p / 2 each way, a
+        draw whose neighbour the source does not reach stays (1:2:1 weights become ~29 / 42 / 29 % at p 0.3; audit 2026-11-14) */
+        double tot[8] = {0}, wsum = 0;
+        for (int i = 0; i < S->n; i++) { if (!(sp->cum[i] > (i ? sp->cum[i - 1] : 0))) continue; double q[8]; sample_rung_marginals(sp, i, q); const double w = S->src[i].weight;
+            for (int k = 0; k < cfg->nrung; k++) tot[k] += w * q[k]; wsum += w; }
+        char ln[512]; int o = snprintf(ln, sizeof ln, "sampler: --rung-shift-p %g: the drawn rung mix over the weighted sources", cfg->rung_shift_p);
+        for (int k = 0; k < cfg->nrung && wsum > 0; k++) o += snprintf(ln + o, sizeof ln - o > 0 ? sizeof ln - o : 0, " %g um %.1f%%", cfg->rung_um[k], 100 * tot[k] / wsum);
+        fprintf(stderr, "%s (weights", ln);
+        for (int k = 0; k < cfg->nrung; k++) fprintf(stderr, " %g", cfg->rung_w[k]);
+        fprintf(stderr, "; the shift is only a reweighting: equal mixes come from --um-rungs weights alone)\n");
+    }
     if (cfg->cover) for (uint64_t k = 0; k < cfg->cover->count; k++) {
         const int64_t *t = cfg->cover->tiles[k]; source *s = &S->src[t[0]];
         z3 *ct = source_ct(s, 0); const z3_meta *m = ct ? z3_meta_of(ct) : nullptr;

@@ -169,6 +169,7 @@ ufsm_exe(test_lathead SUITE tests/test_lathead.c OBJS NN LP LIBS m CUDA)
 ufsm_exe(test_latvol SUITE tests/test_latvol.c OBJS latvol nn_latvol LIBS LDLIBS CUDA INC CUDA)
 ufsm_exe(test_latvol_nolink SUITE tests/test_latvol_nolink.c OBJS store zarr3 json LIBS LDLIBS)
 ufsm_exe(test_lldec SUITE tests/test_lldec.c OBJS band_onfly fuse band edt nn_band z3w zarr3 store json LIBS LDLIBS CUDA)
+ufsm_exe(test_codes_grid SUITE tests/test_codes_grid.c OBJS CORE NN LP LIBS LDLIBS CUDA)
 ufsm_exe(test_mesh_phase SUITE tests/test_mesh_phase.c OBJS CORE NN LP LIBS LDLIBS CUDA DEPS ufsm)
 ufsm_exe(test_muon SUITE tests/test_muon.c OBJS NN LP LIBS m CUDA)
 ufsm_exe(test_muonc SUITE tests/test_muonc.c OBJS NN LP LIBS m CUDA)
@@ -194,6 +195,9 @@ ufsm_exe(test_patchsolve SUITE tests/test_patchsolve.c OBJS patchsolve tracebox 
 ufsm_exe(test_pgrad SUITE tests/test_pgrad.c OBJS NN LP LIBS m CUDA)
 ufsm_exe(test_phase_check SUITE tests/test_phase_check.c OBJS phase_check LIBS m)
 ufsm_exe(test_phase_interp SUITE tests/test_phase_interp.c OBJS sample scannorm sample_emb embz edt band sheet ct_augment scan_augment
+         spatial_augment crush scrollaug cover sources band_onfly fuse fiberraster afv reg regmap zarr2 srpair view zarr3 store json z3w
+         tiff zipr hf NN LP LIBS m curl zstd blosc z crypto CUDA)
+ufsm_exe(test_phase_outward SUITE tests/test_phase_outward.c OBJS sample scannorm sample_emb embz edt band sheet ct_augment scan_augment
          spatial_augment crush scrollaug cover sources band_onfly fuse fiberraster afv reg regmap zarr2 srpair view zarr3 store json z3w
          tiff zipr hf NN LP LIBS m curl zstd blosc z crypto CUDA)
 ufsm_exe(test_phase_pool SUITE tests/test_phase_pool.c OBJS band_onfly fuse band edt zarr3 zarr2 store json z3w hf NN LP LIBS m curl zstd

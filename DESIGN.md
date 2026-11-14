@@ -6,6 +6,119 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Per-scroll holdouts for every label type, validation only inside them (2026-11-14, branch datafix-20261114)
+
+The user reversed "no holdouts" (11-12) on 11-14: every labelled scroll keeps ~8-10 % of its labels out of training, for every label
+type, and validation / scoring read only those boxes. Files: `/vesuvius/ufsm/univ/scratch1/holdouts-20261114.json` (118 boxes; copy and
+selector in `scripts/holdouts/`), `/vesuvius/ufsm/univ/scratch1/sources-scratch1-ph80-ho.json` (ph80 with `holdout_file` + `holdout_mode
+mask` on every source, `holdout_strict` 1, PHerc1218-b3 at weight 0, the re-rastered codes sets).
+
+**Boxes.** The existing definitions first: wbench (Paris 4 PH1-3 + HOLD, 1667 C1-C24, 0139 / 0814 / 0500P2 at 9.362 um and their xres
+maps into the 2.2-2.4 um scans), the 16 Paris 4 + 8 0139 / 1667 ink eval crops, 0841 / 0500P2 ink eval-ho crops, fibre 1447-HOLD. Then,
+per scan where a source stayed under ~8 %, one full-yx z slab chosen from `ufsm holdout-cover` (new: each source's draw cells inside the
+boxes, per box, and the uncovered labels per 256 z rows) so each source on that scan lands nearest 8-12 % (>= 4096 rows on 2.4 um scans,
+>= 2048 on 8-9 um: a P 512 validation window fits at 19.2 / 17.3 um). Trimmed: 0841 ink (the six eval crops held 49 %: the two smallest
+kept, 11 %), 1299's bottom-third band (26 %: replaced by a 4096-row slab). Second scans of one scroll: 0139 9.362 / 2.399 one joint slab
+through the xres affine (z nearly axis aligned, cz = 0.257 fz + 623, 300-row margin for the x / y tilt); the 2.399 / 2.215 um ink crops
+of 0139 / 0500P2 mapped back to the 9.362 um scans (`ufsm reg map --f2c --box`). **0009B has no registration** between 8.64 and 2.401 um:
+each scan has its own slab (z 7168 + 2048 of 9600; z 19456 + 4096 of 29120, similar fractions of the scan) - a cross-scan leak is
+possible there until a 0009B xres map exists. Its two boxes are therefore `"score": 0` (main 11-14): masked from training on both scans, but never a
+validation box (patch_bounds skips them) and skipped by the scoring tools' `--holdouts` and wbench's BOXES=holdout, so no reported number
+rests on them.
+
+Held-out share of each source's draw cells (holdout-cover; cells of 32^3 .. 512^3 level-0 voxels, so an upper bound on the label voxels):
+
+| source | held | source | held | source | held |
+|---|---|---|---|---|---|
+| Paris4-june / -july | 0.082 / 0.134 | Paris4-june48 / -july48 | 0.077 / 0.113 | Paris4-u2ink / -fib / -spiral / -hf | 0.160 / 0.081 / 0.095 / 0.080 |
+| 1667-gt / A48 / B48 | 0.081 / 0.088 / 0.087 | 1667-u2ink | 0.139 | 0139-gt / -good | 0.092 / 0.133 |
+| 0139-u2ink / -hf | 0.115 / 0.174 | 0500P2-gt / -u2ink | 0.247 / 0.360 | 0172-gt | 0.084 |
+| 1218-b3 / 1299-b3 | 0.084 / 0.080 | 0009B-good / -u2ink | 0.102 / 0.110 | 0175A-good / -fib | 0.090 / 0.099 |
+| 0814 / MAN5 / 0841 u2ink | 0.110 / 0.089 / 0.112 | 1447 / 0125 fib | 0.086 / 0.092 | 1451 / 0332 hf | 0.084 / 0.082 |
+
+(0500P2 stays high: its sets are tiny and the wbench + eval crops are kept whole on both scans.)
+
+**Mechanism fixes (eval audit #2 / #7).** Validation drew box 0 only: it now picks a box uniformly among those a window fits at the
+level. `same_ct` compared store root + key, so a local copy and the http mirror of one scan never masked each other: now the CT basename
++ um. A malformed box was skipped silently: now an error, and a box outside the CT extent is fatal at the first CT open. A
+`holdout_file` with no box of the source's CT prints a warning (fatal under `holdout_strict`); an onfly ink target's own `holdout_file`
+held out only the ink: lifted to the source. The onfly ink derived array blanked the boxes (no ink labels to validate on): the boxes now
+only drop draw cells, the ink inside stays and the sampler's mask hides it from training. Validation averages divide by the windows
+holding each label; "val by source" / "val by scroll" lines; validation with no boxes is fatal unless `--val-train-ok 1`.
+
+**Leak check.** `UFSM_HOLD_AUDIT=1` in sampler-only mode counts, per training window, the known label voxels (phase, w4, ink, aux,
+papyrus, loss mask, packed mask, ink bits; source grid) inside the boxes of its CT without the guard. On the -ho json's winding sources (CPU paths, the scratch2 recipe at P 256):
+100 training windows, 20 overlapping held-out boxes (136.6 M voxels inside the boxes), **0 known label voxels inside**; the smoke runs
+of both ink subsets (5 windows each, 3 overlapping) also 0. The planned 4500-window run was OOM-killed three times by the saturated
+ufsm-dev slice (other jobs at 40 / 40 GB), so the larger count is still open: `/vesuvius/ufsm/datafix-20261114/ho/leak.sh`
+(N / NI / MEM env) reruns it, and the flag is in the binary for a dry start (UFSM_SAMPLER_ONLY=N UFSM_HOLD_AUDIT=1). test_sampler_safety
+covers the parsing / box-draw side (every box drawn by validation, malformed boxes refused, holdout_strict).
+
+**Scoring, holdout only.** `ink-vscore` / `ink-score --holdouts H --ct KEY` (the voxels / the label pixels whose surface point lies in a
+box), `wbench.sh BOXES=holdout HOLDOUTS=H` (45 boxes). There is no `surfcmp` tool in the tree.
+
+**PHerc1218-b3 (weight 0 in -ho): why its labels are not learned.** Direction is ruled out (outward 1.000). No offset: on a
+128 x 512 x 512 crop at z 10240 the label band's papyrus share (CT >= 64) is 0.854 unshifted and 0.856 at the best of every shift up to
++-4 z / +-6 y, x. Packing is 1299's (median band-to-band 14 vs 13.5 voxels), the CT contrast across the band is comparable. What differs
+is the gate: 1218's weight array is 255 on 97 % of the labelled voxels (1299's gate keeps 71 %, median 128), and the fibre judge rates
+1218's labels 3-5x worse than Paris 4's (section "Fibre gate of our spiral labels"), whose gate was never applied pending its 1447 /
+0175A control (GPU). Most likely ungated label noise; the fix is that gate, not a weight.
+
+**try6 contamination.** try6 (scratch2, from step 0 on 11-14) trained on every one of these boxes for ~2000 steps with no masking, and
+every eval set was in its data (eval audit). Validation numbers on these boxes are clean only for a run started from scratch on the -ho
+json (try7). Restart flags: `--val-batches 32` (or more), `--val-P 384` (<= the smallest box edge at the window's level: 512 cells
+at 19.2 um = 4096 level-0 rows on 2.4 um scans), `--holdout-guard 32` (level-l cells of label mask around each box, 614 um at 19.2 um; the net's
+receptive field, 439 cells, cannot be a guard: on a 2048-row box at level 3 it would mask ~30x the box), sources `/vesuvius/ufsm/univ/scratch1/sources-scratch1-ph80-ho.json`.
+
+## Data / label fixes from the 2026-11-14 audit: outward check, codes grid, ink pooling, stored 19.2 phase, warp fill (2026-11-14, branch datafix-20261114)
+
+The read-only audit of the sampler / label path (/vesuvius/ufsm/audit-20261114/data.md) ranked ten findings; main took #1 (PHerc1218-b3's
+weight) and #3 (a 1667 holdout) as decisions. Implemented here, one commit each, with their label diffs:
+
+**Per-source losses and the outward check (#2).** The `--mix-every` lines gain "head bce by source" (phase / wind4 / normal per source,
+beside the rv line) and "phase outward by source": `sample_phase_outward` samples every 8th voxel of each drawn window's phase as trained
+(after `phase_sign`), takes its circular gradient where it is radially aligned with the unjittered axis (|cos| >= 0.7) and counts it
+rising outward or inward; below `--outward-warn` (0.9) with >= 2000 samples a WARNING names the source. The pair rule makes phase rise from
+the lower winding to the higher, so an inward-numbered GT set would reverse phase, rv, normals and wind4 silently, and no codes store
+records its direction. Sampler-only on the 15 live winding sources (P 256, 83 windows): every source rises outward, 0.977 (1667-B48),
+0.986 / 0.988 (1667-A48 / -gt), 0.988 (0172-gt), 0.996 (0139-gt), 0.999-1.000 the rest, **1218-b3 1.000**: its rv at chance (0.66-0.67
+over steps 1001-1500) is not a direction problem.
+
+**Codes rasters on the CT's grid (#4).** `ufsm raster` and the on-the-fly mesh codes (CPU and GPU stamp) put level-0 x into level-l voxel
+floor(x 2^-l + 1/2): voxel j centred on level-0 2^l j, while the CT pyramid (`pool2_mean`), ink and fibre rasters centre it on its block,
+2^l j + (2^l - 1) / 2. Codes sat 0.25 (level 1) / 0.375 (level 2) voxel off the CT, the sign flipped by the symmetry augmentation (a blur).
+Now floor(x 2^-l + 2^-l / 2); level 0 unchanged; meshcodes cache ids v2 at level > 0; raster attrs say `"grid": "block-centre"`.
+`test_codes_grid`: planes at x = 40..47, levels 0..3, land in column x >> l (12 of 32 cases off by one before). On the 1667 GT meshes
+vs the stored codesA (6 windows of 192^3 at level 1) the old binary is byte-identical, the new one differs in 497 k of 1.19 M coded
+voxels (thin sheets moving one voxel half the time). **Not yet re-rastered** (a label change mid-run): gtjuly codesA 9.6 (Paris4-june),
+p4full phaseB (Paris4-july), PHerc1667-wind-20261016 codesA / codesB 4.798 (1667-gt / A48 / B48), b1-paris4 codesA48 and
+univ/b1/gt/paris4 codesB48 (june48 / july48). Level-0 sets (0139-gt, 0500P2-gt, 0172-gt, the -good sets) are unaffected; 1218 / 1299
+come from surf-labels, whose wrap-to-grid scale has its own rule.
+
+**Ink at 9.6 um as the known mean (#5).** `inkfly_open_pooled` took the known max of each 2^3 block (any inked child inked the coarse
+voxel). Now `ink_pool8`, the rounded mean of the known children. Sampler-only `--det 1` at the 9.6 rung: ink voxels 0.00206 -> 0.00204
+(0139, same windows), 0.00332 -> 0.00314 (Paris 4): 1-5 % fewer, smaller than the audit's estimate because the face labels are a 7-voxel
+band at level 1, so only the band's edges grew; partial blocks are now soft targets.
+
+**Paris4-july's 19.2 um phase stored (#6).** Its 19.2 windows pooled the 9.6 um phaseB per read (8x the voxels decoded, an atan2 per
+coarse voxel, no cache). `source_phase_at` now reads a stored coarser level from the phase's group when present; phaseB/19.2 was written
+by `ufsm downsample --mode phase` (12 GB, 55 min). `test_phase_pool --compare` on 6 boxes of 384^3: 0.02 % of the known voxels known in
+one only, 4.1 % of the rest 1 code apart (double vs float sums), none more; read 0.90 s vs 15.34 s (17x). Sampler-only on Paris4-july alone at the 19.2 rung (P 256, CPU): the phase read stage 2218 -> 244 ms
+per window, 48 -> 147 Mvox/s; at P 768 the view's cost scales 27x.
+
+**Warp fill (#7).** Voxels a rotation pulls from outside the source cube were 0 after z-scoring (the window's mean density, fake material);
+now `warp_fill`, the z-scored raw 0 (air, as a masked scan's outside and predict's past-the-volume voxels), jittered like any voxel, on the
+host writers and the device (`aug_write_k`) alike. At `--rotate-deg 5`, P 768: 4.5 % of a rotated window's voxels (p90 6.1 %, max 7.3 %),
+~0.9 % of all input voxels at `--rotate-p 0.2`; every echo replay is rotated.
+
+**Rung shift (#8): a design choice, now visible.** `--rung-shift-p` moves the drawn rung to a list neighbour and nothing later depends on the
+original rung, so it is purely a reweighting: 1:2:1 at p 0.3 draws 28.75 / 42.5 / 28.75 % for a source reaching all three, 61.7 / 38.3 %
+(not 66.7 / 33.3) for one reaching 9.6 / 19.2. Unchanged; the sampler's start-up line prints the effective mix over the weighted sources.
+
+**Side finding.** The mesh-codes pack key (meshcodes.c `mc_key`) is the mesh names, sizes and mtimes, not the directory: two mesh dirs
+with same-named, same-sized meshes written in the same second share one pack under a common `UFSM_MESHCODES_CACHE` (seen in
+test_codes_grid with identical names; real sets have unique timestamped names).
+
 ## Packed-sheet label targets: unit-step gradient, sheet-voxel weight, physical density code (2026-11-14, branch phaselab-20261114)
 
 Audit (/vesuvius/ufsm/audit-20261114/targeted/phaselab.md) of the on-the-fly winding labels. The normal / density / packed-weight targets

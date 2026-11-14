@@ -963,7 +963,7 @@ int cmd_ink_score(int argc, char **argv) {
     const char *surf = sopt(argc, argv, "--surface", nullptr), *lab = sopt(argc, argv, "--labels", nullptr), *msk = sopt(argc, argv, "--mask", nullptr);
     const char *cache = sopt(argc, argv, "--cache", nullptr), *row = sopt(argc, argv, "--row", nullptr);
     if (!surf || !lab || sidx(argc, argv, "--map") < 0) {
-        fprintf(stderr, "usage: ufsm ink-score --surface TIFXYZ --labels L [--mask M] --map NAME=MAP.tif [--map ..] [--label-z K] [--label-scale F] [--surf-um U] [--cache DIR] [--row TAG]\n"); return 2;
+        fprintf(stderr, "usage: ufsm ink-score --surface TIFXYZ --labels L [--mask M] --map NAME=MAP.tif [--map ..] [--label-z K] [--label-scale F] [--surf-um U] [--cache DIR] [--row TAG] [--holdouts H.json --ct KEY]\n"); return 2;
     }
     ssurf S; if (ssurf_load(&S, surf)) return 1;
     { const double su = atof(sopt(argc, argv, "--surf-um", "0")); if (su > 0) S.vox_um = su; }   /* the mesh voxel size when its meta has none */
@@ -985,6 +985,11 @@ int cmd_ink_score(int argc, char **argv) {
     uint8_t *R[2] = {L, M};
     for (int k = 0; k < 2; k++) { if (!R[k]) continue; uint8_t mx = 0; for (size_t i = 0; i < np; i++) if (R[k][i] > mx) mx = R[k][i]; if (mx == 1) for (size_t i = 0; i < np; i++) R[k][i] *= 255; }
     fprintf(stderr, "ink-score: %s: labels %lld x %lld, %.4g canvas px per label px (canvas %.0f x %.0f)\n", S.name, (long long)LL.W, (long long)LL.H, F, ew, eh);
+    /* --holdouts H --ct KEY (holdout-only scoring, datafix 2026-11-14): only the label pixels whose surface point (the mesh's level-0
+       voxels, z y x as ssurf_pn) lies in one of H's boxes for that CT */
+    const char *hof = sopt(argc, argv, "--holdouts", nullptr), *hct = sopt(argc, argv, "--ct", nullptr); inksplat_cfg hc; memset(&hc, 0, sizeof hc); hc.ho_score_only = 1;
+    if (hof && (!hct || inkfly_holdouts(hof, hct, &hc) || !hc.nexcl)) { fprintf(stderr, "ink-score: --holdouts needs --ct KEY and at least one box of that CT in %s\n", hof); return 1; }
+    if (hof) fprintf(stderr, "ink-score: holdout-only: the pixels inside the %d held-out boxes of %s\n", hc.nexcl, hct);
     int rc = 0;
     for (int a = 2; a + 1 < argc; a++) {
         if (strcmp(argv[a], "--map")) continue;
@@ -998,6 +1003,7 @@ int cmd_ink_score(int argc, char **argv) {
             const size_t i = (size_t)r * LL.W + c; if (M && M[i] < 128) continue;
             const double cx = (c + 0.5) * F - 0.5, cy = (r + 0.5) * F - 0.5;
             double P[3], N[3]; if (ssurf_pn(&S, cx * S.scale, cy * S.scale, P, N)) continue;
+            if (hof) { int in = 0; for (int e = 0; e < hc.nexcl && !in; e++) { in = 1; for (int d = 0; d < 3; d++) in &= P[d] >= hc.excl[e][d] && P[d] < hc.excl[e][d] + hc.excl[e][3 + d]; } if (!in) continue; }
             double v;
             if (foot) {   /* the label pixel's canvas footprint */
                 const int x0 = (int)floor(c * F), y0 = (int)floor(r * F); double s = 0; int n = 0;
@@ -1040,7 +1046,7 @@ int cmd_ink_vscore(int argc, char **argv) {
     const int L = atoi(sopt(argc, argv, "--level", "1")), nth = ufsm_threads(atoi(sopt(argc, argv, "--threads", "0")), 8);
     long long b[6];
     if (gi < 0 || pi < 0 || gi + 2 >= argc || pi + 2 >= argc || !bx || sscanf(bx, "%lld,%lld,%lld,%lld,%lld,%lld", b, b + 1, b + 2, b + 3, b + 4, b + 5) != 6 || L < 0 || L > 6) {
-        fprintf(stderr, "usage: ufsm ink-vscore --gt ROOT KEY --pred ROOT KEY --box z,y,x,nz,ny,nx (level-0) [--level 1] [--row TAG] [--threads 8] [--cache DIR]\n"
+        fprintf(stderr, "usage: ufsm ink-vscore --gt ROOT KEY --pred ROOT KEY --box z,y,x,nz,ny,nx (level-0) [--level 1] [--row TAG] [--threads 8] [--cache DIR] [--holdouts H.json --ct KEY]\n"
                         "  voxelwise AUC / best F1 / F1 at 0.5 of a prob254 prediction vs a prob254 reference at the voxels known in both (the box on level L)\n"); return 2;
     }
     store *gs = store_open(argv[gi + 1]), *ps = store_open(argv[pi + 1]);
@@ -1054,6 +1060,17 @@ int cmd_ink_vscore(int argc, char **argv) {
     }
     uint8_t *A = malloc(nv), *B = malloc(nv);
     if (!A || !B || z3_read(g, o, n, A, nth) || z3_read(p, o, n, B, nth)) { fprintf(stderr, "ink-vscore: read failed: %s\n", z3_error()); return 1; }
+    /* --holdouts H --ct KEY (holdout-only scoring, datafix 2026-11-14): only the voxels whose level-0 centre lies in one of H's boxes
+       for that CT (basename match, as the sampler's holdout_file): a score on held-out labels, not on the training set */
+    const char *hof = sopt(argc, argv, "--holdouts", nullptr), *hct = sopt(argc, argv, "--ct", nullptr);
+    if (hof) { inksplat_cfg hc; memset(&hc, 0, sizeof hc); hc.ho_score_only = 1;
+        if (!hct || inkfly_holdouts(hof, hct, &hc) || !hc.nexcl) { fprintf(stderr, "ink-vscore: --holdouts needs --ct KEY and at least one box of that CT in %s\n", hof); return 1; }
+        uint64_t kept = 0; const int64_t hf = (int64_t)1 << L;
+        for (int64_t z = 0; z < n[0]; z++) for (int64_t y = 0; y < n[1]; y++) for (int64_t x = 0; x < n[2]; x++) {
+            const int64_t c0[3] = {((o[0] + z) * hf) + (hf - 1) / 2, ((o[1] + y) * hf) + (hf - 1) / 2, ((o[2] + x) * hf) + (hf - 1) / 2}; int in = 0;
+            for (int e = 0; e < hc.nexcl && !in; e++) { in = 1; for (int d = 0; d < 3; d++) in &= c0[d] >= hc.excl[e][d] && c0[d] < hc.excl[e][d] + hc.excl[e][3 + d]; }
+            const size_t k = ((size_t)z * n[1] + y) * n[2] + x; if (!in) A[k] = 255; else kept++; }
+        fprintf(stderr, "ink-vscore: holdout-only: %llu of %zu voxels inside the %d held-out boxes of %s\n", (unsigned long long)kept, nv, hc.nexcl, hct); }
     double h[2][255] = {{0}}; uint64_t ngt = 0;
     for (size_t k = 0; k < nv; k++) { if (A[k] == 255) continue; ngt++; if (B[k] == 255) continue; h[A[k] >= 127][B[k]]++; }
     double P = 0, N = 0; for (int v = 0; v < 255; v++) { P += h[1][v]; N += h[0][v]; }
@@ -1090,6 +1107,7 @@ typedef struct {
     ifunit *U; int nU;
     iftile *T; size_t nT;
     int64_t gcell, gdim[3]; uint32_t *gstart, *glist;   /* tile grid: cells of gcell level-0 voxels -> tile ids (CSR) */
+    int ncx; int64_t cx[64][6];   /* the held-out boxes whose draw cells inkfly_cells drops (cfg excl; f->c.nexcl is 0 under excl_cells_only) */
 } inkfly;
 static struct { _Atomic uint64_t reads, chunks, empty, hits, px, us, ct_us, gpu_chunks, gpu_us; } g_ifs;
 /* tests: UFSM_INKFLY_FAIL=N: the first N GPU chunks fail as if out of device memory (the CPU fallback from there) */
@@ -1353,7 +1371,7 @@ static int inkfly_derive(void *ctx, z3 *base, const int64_t o[3], const int64_t 
     atomic_fetch_add(&g_ifs.us, (uint64_t)((snow() - t0) * 1e6));
     return 0;
 }
-/* the coarser level: known-max 2x pooling of the level below (an onfly array), as the stored pyramid */
+/* the coarser level: 2x pooling of the level below (an onfly array): the known children's mean (ink_pool8) */
 typedef struct { z3 *fine; int own; } ifpool;
 /* in z-slabs of the fine level, cut at multiples of the fine array's cell (IFC) so no cell is derived for two slabs: the whole (2n)^3 box
    at once was 8.6 GB of scratch per worker building a P 1024 window at the pooled level (2026-11-12; a slab of 128 planes is 0.54 GB).
@@ -1371,8 +1389,7 @@ static int inkfly_pool_derive(void *ctx, z3 *base, const int64_t o[3], const int
         for (int64_t zz = 0; zz < nf / 2; zz++) for (int64_t y = 0; y < n[1]; y++) for (int64_t x = 0; x < n[2]; x++) {
             const uint8_t *q = b + ((size_t)(2 * zz) * f1 + 2 * y) * f2 + 2 * x;
             const uint8_t v[8] = {q[0], q[1], q[f2], q[f2 + 1], q[pl], q[pl + 1], q[pl + f2], q[pl + f2 + 1]};
-            int m = -1; for (int i = 0; i < 8; i++) if (v[i] != 255 && v[i] > m) m = v[i];
-            out[((size_t)(z + zz) * n[1] + y) * n[2] + x] = m < 0 ? 255 : (uint8_t)m;
+            out[((size_t)(z + zz) * n[1] + y) * n[2] + x] = ink_pool8(v);
         }
         z += nf / 2;
     }
@@ -1479,7 +1496,7 @@ z3 *inkfly_open(z3 *ct, const char *segs_path, const inksplat_cfg *cfg, size_t c
     fseek(fp, 0, SEEK_END); long sz = ftell(fp); fseek(fp, 0, SEEK_SET); char *txt = malloc((size_t)sz + 1); size_t rd = fread(txt, 1, (size_t)sz, fp); fclose(fp); txt[rd] = 0;
     json *j = json_parse(txt, rd); const json *sg = json_get(j, "segments"); char *sg_txt = txt;   /* (the segments text goes into the cache key) */
     if (!sg || sg->type != J_ARR || !sg->n) { fprintf(stderr, "ink onfly: %s: no \"segments\" array\n", segs_path); json_free(j); free(sg_txt); z3_close(ct); return nullptr; }
-    inkfly *f = calloc(1, sizeof *f); f->c = *cfg; f->L = cfg->level; f->V = (double)(1 << f->L); f->off = (f->V - 1) / 2; f->base_ct = ct;
+    inkfly *f = calloc(1, sizeof *f); f->c = *cfg; f->ncx = cfg->nexcl; memcpy(f->cx, cfg->excl, sizeof f->cx); if (cfg->excl_cells_only) f->c.nexcl = 0; f->L = cfg->level; f->V = (double)(1 << f->L); f->off = (f->V - 1) / 2; f->base_ct = ct;
     memcpy(f->shape, z3_meta_of(ct)->shape, sizeof f->shape);
     f->reach = fmax(fmax(fabs(cfg->face_lo), fabs(cfg->face_hi)) + 1, fmax(fabs(cfg->face_lo + cfg->face_a), fabs(cfg->face_hi + cfg->face_b)));
     const int nseg = (int)sg->n; f->S = calloc(nseg, sizeof *f->S); f->Spath = calloc(nseg, sizeof *f->Spath); f->Ls = calloc(3 * nseg, sizeof *f->Ls); f->Lpath = calloc(3 * nseg, sizeof *f->Lpath); f->U = calloc(nseg, sizeof *f->U);
@@ -1505,7 +1522,7 @@ z3 *inkfly_open(z3 *ct, const char *segs_path, const inksplat_cfg *cfg, size_t c
         u->ntx = (int)((u->lw + TS - 1) / TS); u->nty = (int)((u->lh + TS - 1) / TS);
         f->nU++;
     }
-    char *key = inkfly_key(f, cfg, sg_txt), kdir[1200] = "", ixp[1300] = ""; int have_ix = 0;
+    char *key = inkfly_key(f, &f->c, sg_txt), kdir[1200] = "", ixp[1300] = ""; int have_ix = 0;
     if (dcache_dir && *dcache_dir && !dcache_key_dir(dcache_dir, key, kdir, sizeof kdir)) {   /* the index cached beside the chunks (same inputs key) */
         snprintf(ixp, sizeof ixp, "%s/index.bin", kdir); FILE *ix = fopen(ixp, "rb");
         if (ix) { char m[4]; uint32_t nu = 0; uint64_t nt = 0;
@@ -1584,6 +1601,7 @@ int inkfly_holdouts(const char *path, const char *ct_key, inksplat_cfg *cfg) {
     for (size_t i = 0; bx && i < bx->n; i++) {
         const json *e = json_at(bx, i); const char *ck = json_str(json_get(e, "ct"), ""); const json *l0 = json_get(e, "l0");
         if (strcmp(base_name(ck), want) || !l0 || l0->n != 6) continue;
+        if (cfg->ho_score_only && json_num(json_get(e, "score"), 1) == 0) continue;
         if (cfg->nexcl >= 64) { fprintf(stderr, "ink onfly: more than 64 held-out boxes for %s\n", want); json_free(j); return -1; }
         for (int d = 0; d < 6; d++) cfg->excl[cfg->nexcl][d] = (int64_t)json_num(json_at(l0, (size_t)d), 0);
         cfg->nexcl++;
@@ -1814,13 +1832,14 @@ int inkfly_cells(void *handle, int lev, const int64_t shape[3], uint8_t *bits) {
        out with no known ink and was dropped as empty (Paris 4 under U2: 10 of 14 picked windows; its 16 eval crops sit where the labels
        are densest). Cells straddling a box edge stay: their window reaches the known labels outside it */
     size_t nx = 0;
-    for (int e = 0; e < f->c.nexcl; e++) {
-        const int64_t *bx = f->c.excl[e]; int64_t a[3], b[3]; int ok = 1;
+    for (int e = 0; e < f->ncx; e++) {
+        const int64_t *bx = f->cx[e]; int64_t a[3], b[3]; int ok = 1;
         for (int d = 0; d < 3; d++) { a[d] = (bx[d] + cs - 1) / cs; b[d] = (bx[d] + bx[3 + d]) / cs - 1; if (a[d] < 0) a[d] = 0; if (b[d] >= shape[d]) b[d] = shape[d] - 1; ok &= a[d] <= b[d]; }
         if (!ok) continue;
         for (int64_t z = a[0]; z <= b[0]; z++) for (int64_t y = a[1]; y <= b[1]; y++) for (int64_t x = a[2]; x <= b[2]; x++) { uint8_t *q = &bits[((size_t)z * shape[1] + y) * shape[2] + x]; nx += *q; *q = 0; }
     }
-    if (f->c.nexcl) fprintf(stderr, "ink onfly: %zu of %zu level-%d draw cells lie inside the %d held-out boxes: dropped\n", nx, n, lev, f->c.nexcl);
+    if (f->ncx) fprintf(stderr, "ink onfly: %zu of %zu level-%d draw cells lie inside the %d held-out boxes: dropped%s\n", nx, n, lev, f->ncx,
+                        f->c.nexcl ? "" : " (the ink inside them is kept: the sampler's holdout mask hides it from training, validation reads it)");
     n -= nx;
     return (int)(n > 2000000000 ? 2000000000 : n);
 }

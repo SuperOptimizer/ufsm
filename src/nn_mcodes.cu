@@ -42,7 +42,7 @@ __global__ void k_mc_stamp(const mcg_tile *T, const float *xyz, const float *val
             long long g[3]; int in = 1;
             for (int d = 0; d < 3; d++) {
                 const double qq = (1 - u) * (1 - v) * p[0][d] + u * (1 - v) * p[1][d] + (1 - u) * v * p[2][d] + u * v * p[3][d];
-                g[d] = (long long)floor(qq + 0.5) - B.o[d];
+                g[d] = (long long)floor(qq + 0.5 * sc) - B.o[d];   /* (meshcodes.c mc_stamp: block centres) */
                 if (g[d] < (d ? 0 : B.z0) || g[d] >= (d ? B.n[d] : B.z1)) in = 0;
             }
             if (!in) continue;

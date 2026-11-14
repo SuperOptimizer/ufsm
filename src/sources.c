@@ -4,6 +4,7 @@
 #include "band_onfly.h"
 #include "inksplat.h"
 #include "dcache.h"
+#include "z3w.h"
 #include <stdlib.h>
 /* weak: the sampler test binaries link sources.o without inksplat.o / dcache.o (an onfly ink target then fails to open) */
 [[gnu::weak]] z3 *inkfly_open(z3 *, const char *, const inksplat_cfg *, size_t, const char *, void **);
@@ -47,14 +48,20 @@ static const char *g_cache;   /* chunk cache dir for HTTPS stores; from the sour
 int rung_of_um(double um) { return (int)lround(log2(um / 0.6)); }
 
 /* ---- held-out boxes ---- */
-static void src_add_hold(source *s, const json *b, int rej) {   /* one [z, y, x, nz, ny, nx] (level 0); the first one is also hold_o / hold_n */
-    if (!b || b->type != J_ARR || b->n != 6) return;
-    int64_t v[6]; for (int d = 0; d < 6; d++) v[d] = (int64_t)json_num(json_at(b, (size_t)d), 0);
-    if (v[3] <= 0 || v[4] <= 0 || v[5] <= 0) return;
+/* eval audit 11-14 #7: a malformed box is an error, not a silent skip (a held-out box that is not one leaks its labels into training) */
+static int src_add_hold(source *s, const json *b, int rej, int nos) {   /* one [z, y, x, nz, ny, nx] (level 0); the first one is also hold_o / hold_n */
+    if (!b || b->type != J_ARR || b->n != 6) { fprintf(stderr, "sources: %s: a held-out box is not [z, y, x, nz, ny, nx] (level 0)\n", s->name); return 1; }
+    int64_t v[6]; for (int d = 0; d < 6; d++) { const json *q = json_at(b, (size_t)d); if (!q || q->type != J_NUM) { fprintf(stderr, "sources: %s: held-out box entry %d is not a number\n", s->name, d); return 1; }
+                                                v[d] = (int64_t)json_num(q, 0); }
+    if (v[3] <= 0 || v[4] <= 0 || v[5] <= 0 || v[0] < 0 || v[1] < 0 || v[2] < 0) {
+        fprintf(stderr, "sources: %s: held-out box [%lld %lld %lld %lld %lld %lld]: origin < 0 or extent <= 0\n", s->name, (long long)v[0], (long long)v[1], (long long)v[2], (long long)v[3], (long long)v[4], (long long)v[5]); return 1; }
     s->hold = realloc(s->hold, (size_t)(s->nhold + 1) * sizeof *s->hold); s->hold_rej = realloc(s->hold_rej, (size_t)(s->nhold + 1));
+    s->hold_nos = realloc(s->hold_nos, (size_t)(s->nhold + 1)); s->hold_nos[s->nhold] = (uint8_t)(nos != 0);
     s->hold_rej[s->nhold] = (uint8_t)(rej != 0); memcpy(s->hold[s->nhold++], v, sizeof v);
     if (s->nhold == 1) for (int d = 0; d < 3; d++) { s->hold_o[d] = v[d]; s->hold_n[d] = v[3 + d]; }
+    return 0;
 }
+static int g_hold_strict;   /* "holdout_strict": 1 (top level) or UFSM_HOLD_STRICT=1: a holdout_file with no box for a source is fatal */
 static const char *src_base(const char *p) {   /* the last path component, ignoring trailing slashes and a trailing "/<level digits>" */
     static _Thread_local char b[512]; snprintf(b, sizeof b, "%s", p ? p : "");
     for (;;) {
@@ -73,16 +80,19 @@ static int src_hold_file(source *s, const char *path, const json *rejn) {
     json *j = got == (size_t)n ? json_parse(t, (size_t)n) : nullptr; free(t);
     const json *bx = j ? json_get(j, "boxes") : nullptr;
     if (!bx || bx->type != J_ARR) { fprintf(stderr, "sources: %s: holdout_file %s: no \"boxes\" array\n", s->name, path); json_free(j); return 1; }
-    char me[512]; snprintf(me, sizeof me, "%s", src_base(s->ct_key)); int added = 0, nrej = 0;
+    char me[512]; snprintf(me, sizeof me, "%s", src_base(s->ct_key)); int added = 0, nrej = 0, nnos = 0;
     for (size_t k = 0; k < bx->n; k++) { const json *e = json_at(bx, k);
         if (!strcmp(src_base(json_str(json_get(e, "ct"), "")), me)) {
             const char *nm = json_str(json_get(e, "name"), ""); int rej = 0;
             for (size_t q = 0; rejn && rejn->type == J_ARR && q < rejn->n; q++) rej |= *nm && !strcmp(nm, json_str(json_at(rejn, q), ""));
-            src_add_hold(s, json_get(e, "l0"), rej); added++; nrej += rej;
+            const int nos = json_num(json_get(e, "score"), 1) == 0; nnos += nos;
+            if (src_add_hold(s, json_get(e, "l0"), rej, nos)) { fprintf(stderr, "sources: %s: holdout_file %s box %zu (%s)\n", s->name, path, k, nm); json_free(j); return 1; }
+            added++; nrej += rej;
             if (rej) fprintf(stderr, "sources: %s: held-out box %s rejects training windows (holdout_reject)\n", s->name, nm); } }
     json_free(j);
-    if (added) fprintf(stderr, "sources: %s: %d held-out boxes from %s (%d reject)\n", s->name, added, path, nrej);
-    return 0;
+    fprintf(stderr, "sources: %s: %d held-out boxes from %s (%d reject, %d not scored)%s\n", s->name, added, path, nrej, nnos,
+            added ? "" : g_hold_strict ? ": none match this CT (basename), fatal under holdout_strict" : ": WARNING none match this CT (basename): nothing held out");
+    return !added && g_hold_strict;
 }
 
 /* ---- axis ---- */
@@ -250,6 +260,7 @@ sources *sources_load(const char *path) {
     if (!arr || arr->type != J_ARR) { fprintf(stderr, "sources: no \"sources\" array in %s\n", path); json_free(j); return nullptr; }
     sources *S = calloc(1, sizeof *S);
     S->cache = sdup(json_str(json_get(j, "cache"), nullptr));
+    { const char *hs = getenv("UFSM_HOLD_STRICT"); g_hold_strict = (hs && atoi(hs)) || json_num(json_get(j, "holdout_strict"), 0) != 0; }
     if (S->cache) g_cache = S->cache;
     S->n = (int)arr->n;
     S->src = calloc(arr->n, sizeof *S->src);
@@ -317,6 +328,7 @@ sources *sources_load(const char *path) {
                 if (!sg || !(s->um > 0) || L < 0 || L + 1 >= MAXLEV || (hf && inkfly_holdouts(hf, s->ct_key, &ic))) {
                     fprintf(stderr, "sources: %s/%s: onfly needs \"segments\", the source's \"um\", level 0..%d (and a readable holdout_file)\n", s->name, CHNAME[c], MAXLEV - 2);
                     json_free(j); sources_free(S); return nullptr; }
+                ic.excl_cells_only = 1;   /* (eval audit #2: the boxes are masked by the sampler, every label type; the ink inside them stays for validation) */
                 z3 *ct = pyramid_open_level(s->s, s->ct_key, L, s->um, g_cache), *ct1 = pyramid_open_level(s->s, s->ct_key, L + 1, s->um, g_cache);
                 ic.ct_root = json_str(json_get(e, "root"), "."); ic.ct_key = s->ct_key;   /* (named in the derived cache's key) */
                 const char *dcd = json_str(json_get(of, "cache_dir"), dcache_default_dir ? dcache_default_dir() : nullptr);   /* the disk cache (dcache.h): "cache_dir" ("off": none), $UFSM_DERIVED_CACHE, ~/.cache/ufsm/derived */
@@ -414,6 +426,7 @@ sources *sources_load(const char *path) {
                 const char *proot = json_str(json_get(pt, "root"), nullptr), *pkey = json_str(json_get(pt, "key"), "4.8");
                 store *ps = proot ? store_open(proot) : nullptr;
                 s->phase = ps ? z3_open(ps, pkey, nullptr) : nullptr;
+                if (s->phase) { char *e = nullptr; const double ku = strtod(pkey, &e); if (e && !*e && ku > 0) { s->phase_store = ps; s->phase_key_um = ku; } }
                 const json *of = json_get(pt, "onfly");   /* {"root", "key", "rmax"}: the pair-rule phase computed from these codes on read
                                                              (band_onfly.h; byte-identical to phase-raster --pair 1 on the codes' grid) */
                 if (of && !s->phase) {
@@ -544,10 +557,18 @@ sources *sources_load(const char *path) {
             s->emb_name = strdup(json_str(json_get(ej, "name"), "pca64")); s->emb_level = (int)json_num(json_get(ej, "level"), -1);
             if (!s->nemb || s->emb_level < 0) { fprintf(stderr, "sources: %s: \"emb\" needs \"groups\": [DIR, ...] and \"level\" >= 0\n", s->name); json_free(j); sources_free(S); return nullptr; }
         }
-        const json *ho = json_get(e, "holdout");
-        if (ho && ho->type == J_ARR && ho->n == 6 && json_at(ho, 0)->type != J_ARR) src_add_hold(s, ho, 0);
-        else if (ho && ho->type == J_ARR) for (size_t k = 0; k < ho->n; k++) src_add_hold(s, json_at(ho, k), 0);
+        const json *ho = json_get(e, "holdout"); int hbad = 0;
+        if (ho && ho->type == J_ARR && ho->n == 6 && json_at(ho, 0)->type != J_ARR) hbad = src_add_hold(s, ho, 0, 0);
+        else if (ho && ho->type == J_ARR) for (size_t k = 0; k < ho->n && !hbad; k++) hbad = src_add_hold(s, json_at(ho, k), 0, 0);
+        else if (ho) hbad = src_add_hold(s, ho, 0, 0);
+        if (hbad) { json_free(j); sources_free(S); return nullptr; }
         const char *hf = json_str(json_get(e, "holdout_file"), nullptr);
+        if (!hf) {   /* eval audit #7: an onfly ink target's "holdout_file" alone held out only its ink; lifted to the source (every label type) */
+            const json *tg = json_get(e, "targets");
+            for (size_t q = 0; tg && tg->type == J_OBJ && q < tg->n && !hf; q++) { const json *t = tg->items[q];
+                const json *of = t && t->type == J_OBJ ? json_get(t, "onfly") : nullptr; if (of) hf = json_str(json_get(of, "holdout_file"), nullptr); }
+            if (hf) fprintf(stderr, "sources: %s: the onfly target's holdout_file %s holds out every label of the source\n", s->name, hf);
+        }
         if (hf && src_hold_file(s, hf, json_get(e, "holdout_reject"))) { json_free(j); sources_free(S); return nullptr; }
         const char *hm = json_str(json_get(e, "holdout_mode"), nullptr);
         if (hm) { s->hold_mode = !strcmp(hm, "mask") ? 1 : !strcmp(hm, "reject") ? 2 : -1;
@@ -585,7 +606,7 @@ void sources_free(sources *S) {
         for (int l = 0; l < MAXLEV; l++) z3_close(s->ct[l]);
         for (int l = 0; l < MAXLEV; l++) z3_close(s->lv[l]);
         for (int l = MAXLEV - 1; l >= 0; l--) { z3_close(s->phase_pl[l]); z3_close(s->phase_ign_pl[l]); }   /* (the pooled views borrow phase / ignore: closed first) */
-        if (s->band != s->phase) z3_close(s->band); z3_close(s->phase); z3_close(s->wind); z3_close(s->aux); z3_close(s->phase_ign); z3_close(s->phase_wt); free(s->box); free(s->hold); free(s->hold_rej); free(s->focus); free(s->mask); srpair_free(s->srp);
+        if (s->band != s->phase) z3_close(s->band); z3_close(s->phase); z3_close(s->wind); z3_close(s->aux); z3_close(s->phase_ign); z3_close(s->phase_wt); free(s->box); free(s->hold); free(s->hold_rej); free(s->hold_nos); free(s->focus); free(s->mask); srpair_free(s->srp);
         for (int c = 0; c < NTG; c++) {
             for (int l = 0; l < MAXLEV; l++) z3_close(s->tgt[c][l]);
             if (s->reg[c]) {
@@ -705,7 +726,17 @@ z3 *source_ct(source *s, int level) {
         z3 *z = open_ct_level(s, level);
         pthread_mutex_lock(&g_open_mu);
         if (!s->ct[level]) { s->ct[level] = z; z = nullptr; if (!s->ct[level]) { s->ct_present[level] = 0; open_failed(s, "ct", level); } }
+        const int chk = s->ct[level] && !s->hold_checked; if (chk) s->hold_checked = 1;
         pthread_mutex_unlock(&g_open_mu);
+        if (chk) for (int k = 0; k < s->nhold; k++) { const int64_t *sh = z3_meta_of(s->ct[level])->shape;   /* eval audit #7: a held-out box outside the scan (another scan's coordinates, a level-l box) holds nothing out */
+            const int64_t *b = s->hold[k]; int out = 0;
+            for (int d = 0; d < 3; d++) out |= b[d] >= (sh[d] << level);
+            if (out) { fprintf(stderr, "sources: %s: held-out box %d [%lld %lld %lld +%lld %lld %lld] lies outside the CT (level %d shape %lld %lld %lld = level 0 ~%lld %lld %lld)\n",
+                               s->name, k, (long long)b[0], (long long)b[1], (long long)b[2], (long long)b[3], (long long)b[4], (long long)b[5], level,
+                               (long long)sh[0], (long long)sh[1], (long long)sh[2],
+                               (long long)(sh[0] << level), (long long)(sh[1] << level), (long long)(sh[2] << level));
+                       exit(1); }
+        }
         if (z) z3_close(z);
     }
     return s->ct[level];
@@ -754,6 +785,16 @@ z3 *source_phase_at(source *s, int level, int ign) {
     if (!pl[level]) {
         z3 *under = source_phase_at(s, level - 1, ign); if (!under) return nullptr;
         pthread_mutex_lock(&g_open_mu);
+        if (!pl[level] && !ign && s->phase_store && s->phase_key_um > 0) {   /* the level stored once (ufsm downsample <root> <key> <root> <um> --mode phase):
+            the view's circular mean in double sums (phase_pool2_box: float sums): Paris4-july's 19.2 um array equals the view on all but ~0.02 % of
+            the known voxels and within 1 code (3-4 % of them differ by 1), read instead of 8x the voxels decoded and pooled per window (1536^3
+            phase bytes and an atan2 per coarse voxel at P 768; datafix 2026-11-14) */
+            char key[32]; z3w_level_name(s->phase_key_um * ldexp(1.0, level - s->phase_level), key, sizeof key);
+            z3 *st = z3_open(s->phase_store, key, nullptr); const z3_meta *um_ = z3_meta_of(under), *sm = st ? z3_meta_of(st) : nullptr; int ok = sm != nullptr;
+            for (int d = 0; d < 3 && ok; d++) ok = sm->shape[d] == (um_->shape[d] + 1) / 2;
+            if (ok) { pl[level] = st; fprintf(stderr, "sources: %s: phase level %d from the stored array \"%s\" (not pooled per read)\n", s->name, level, key); }
+            else if (st) { fprintf(stderr, "sources: %s: stored phase \"%s\" has the wrong shape for level %d: pooled per read instead\n", s->name, key, level); z3_close(st); }
+        }
         if (!pl[level]) pl[level] = phase_pool2_view(under, ign);   /* (cheap: no I/O; under the lock so one view per level) */
         pthread_mutex_unlock(&g_open_mu);
     }
