@@ -1817,7 +1817,7 @@ static void head_slab_pass(gpu_state *d, int pass) {
     if (hz) {
         unsigned long long h[15]; nn_sync(); nn_d2h(h, d->hsz, sizeof h);
 #define HZP(k) (h[3 * (k)] ? 100.0 * h[3 * (k) + 1] / h[3 * (k)] : 0.0), (h[3 * (k)] ? 100.0 * h[3 * (k) + 2] / h[3 * (k)] : 0.0)
-        fprintf(stderr, "hsg zero (GPU %d, gscale %g, pass %ld): phase %llu supervised: %.2f%% zero %.2f%% subnormal; rv %llu: %.2f%% %.2f%%; wind4 %llu: %.2f%% %.2f%%; ink %llu: %.2f%% %.2f%%;"
+        fprintf(stderr, "hsg zero (GPU %d, gscale %.0f, pass %ld): phase %llu supervised: %.2f%% zero %.2f%% subnormal; rv %llu: %.2f%% %.2f%%; wind4 %llu: %.2f%% %.2f%%; ink %llu: %.2f%% %.2f%%;"
                         " cells %llu nonzero of %llu: %.2f%% of them subnormal\n", d->dev, nn_get_grad_scale(), d->hsz_pass - 1, h[0] / 2, HZP(0), h[3] / 2, HZP(1), h[6] / 2, HZP(2), h[9], HZP(3),
                 h[12] - h[13], h[12], h[12] > h[13] ? 100.0 * h[14] / (h[12] - h[13]) : 0.0);
 #undef HZP

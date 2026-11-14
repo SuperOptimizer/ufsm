@@ -37,7 +37,7 @@ static void wind4_case(float N, float S) {   /* N: the supervised count (1e8: P 
     uint16_t *la = malloc(n * 2), *lb = malloc(n * 2); uint8_t *t = malloc(n), *cp = malloc(n), *m = malloc(n);
     for (size_t i = 0; i < n; i++) {   /* logits near their targets (a trained head: small residuals), some far */
         t[i] = (uint8_t)(i * 7 % 252); cp[i] = 0; m[i] = (uint8_t)(1 + (i % 5 == 0) * 7);   /* mask weights 1 and 8 (packed sheets) */
-        const double tg = 6.283185307179586 * (t[i] / 252.0 + 0.25 * (i % 4)), ta = 0.5 + 0.5 * cos(tg), tb = 0.5 + 0.5 * sin(tg);
+        const double tg = 6.283185307179586 * (t[i] / 252.0), ta = 0.5 + 0.5 * cos(tg), tb = 0.5 + 0.5 * sin(tg);   /* (component 0, gauge fin[8] = 0) */
         const double e = (i % 3 == 0) ? 0.3 * frand() : 0.003 * frand();
         const double pa = fmin(fmax(ta + e, 1e-3), 1 - 1e-3), pb = fmin(fmax(tb - e, 1e-3), 1 - 1e-3);
         la[i] = f2h((float)log(pa / (1 - pa))); lb[i] = f2h((float)log(pb / (1 - pb)));
@@ -52,7 +52,7 @@ static void wind4_case(float N, float S) {   /* N: the supervised count (1e8: P 
     nn_set_head_gscale(1.f);
     size_t dead1 = 0, dead2 = 0, nz = 0, bad = 0, exact_bad = 0, nnorm = 0; double worst = 0;
     for (size_t i = 0; i < n; i++) for (int ab = 0; ab < 2; ab++) {
-        const double tg = 6.283185307179586 * (t[i] / 252.0 + 0.25 * (i % 4)), tv = ab ? 0.5 + 0.5 * sin(tg) : 0.5 + 0.5 * cos(tg);
+        const double tg = 6.283185307179586 * (t[i] / 252.0 + 0.25 * fin[8 + cp[i]]), tv = ab ? 0.5 + 0.5 * sin(tg) : 0.5 + 0.5 * cos(tg);   /* (the kernel's gauge: fin[8 + component]; the reference had i % 4, a target the kernel never uses: 1e4 relative "errors", sweep 11-14) */
         const double x = h2f(ab ? lb[i] : la[i]), want = m[i] * 0.5 * (1.0 / N) * lam * gs * (1 / (1 + exp(-x)) - tv);   /* (the s 1 scale) */
         const float v1 = h2f(ab ? g1b[i] : g1a[i]), v2 = h2f(ab ? g2b[i] : g2a[i]) / S;
         if (fabs(want) * S > 1e-3) { nz++; dead1 += v1 == 0.f; dead2 += v2 == 0.f; }   /* (gradients s puts well inside fp16's normal range) */
