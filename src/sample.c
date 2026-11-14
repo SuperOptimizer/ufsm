@@ -1513,16 +1513,17 @@ static void u8_stats(const uint8_t *a, size_t n, size_t *nz, double *sum, double
     *nz = (size_t)z; *sum = (double)s1; *sq = (double)s2;
 }
 /* the stored phase (src/sources.h source.phase) of a window of the sample's level: shift 1 nearest-upsampled from the grid one
-   level coarser (the label grid for native windows) as band_window does, shift 0 read directly */
+   level coarser (the label grid for native windows): fine x takes coarse x >> 1, the block-centred grid of band.h grid_coarse_j (until
+   2026-11-14 (x + 1) >> 1, a grid centred on 2 j - 0.5, which band_window's binary labels still use), shift 0 read directly */
 /* shift >= 2 (a 9.6 um phase for 2.4 um windows): circular trilinear interpolation. Grid voxel j of g = 2^shift native voxels sits at
    g j + (g - 1) / 2 (src/band.c); each window voxel gets the weighted mean phasor of its 8 grid neighbours with a known phase,
    unknown when they hold under half the weight. Between two rectos the phase is a linear ramp, which this reproduces; the 1 -> 0
    wrap at a recto is continuous on the circle.
    ph: the grid region read (ln[0] x ln[1] x ln[2] codes, PHASE_UNKNOWN outside the array), its first voxel lo; o: the window corner. */
 static void phase_interp_axes(const int64_t o[3], const int64_t lo[3], int D, int P, int shift, int *j0, float *tf) {   /* per axis: the lower grid neighbour, the fraction */
-    const int g = 1 << shift; const double c0 = 0.5 * (g - 1); const int wn[3] = {D, P, P};
+    const int wn[3] = {D, P, P};
     for (int d = 0; d < 3; d++) for (int k = 0; k < wn[d]; k++) {
-        const double u = (o[d] + k - c0) / g; const int64_t j = (int64_t)floor(u);
+        const double u = grid_coarse_u((double)(o[d] + k), shift); const int64_t j = (int64_t)floor(u);
         j0[d * P + k] = (int)(j - lo[d]); tf[d * P + k] = (float)(u - j);
     }
 }
@@ -1694,7 +1695,7 @@ static int phase_window(z3 *a, const int64_t o[3], int D, int P, int shift, uint
     int64_t lo[3], ln[3], ro[3], rn[3]; const int wn[3] = {D, P, P};
     const z3_meta *m = z3_meta_of(a);
     for (int d = 0; d < 3; d++) {
-        lo[d] = (o[d] + shift) >> shift; ln[d] = ((o[d] + wn[d] - 1 + shift) >> shift) - lo[d] + 1;
+        lo[d] = grid_coarse_j(o[d], shift); ln[d] = grid_coarse_j(o[d] + wn[d] - 1, shift) - lo[d] + 1;
         ro[d] = lo[d] < 0 ? 0 : lo[d]; const int64_t e = lo[d] + ln[d] < m->shape[d] ? lo[d] + ln[d] : m->shape[d]; rn[d] = e - ro[d];
     }
     if (!shift) {   /* the window's own grid: read straight into it (outside the volume unknown), no staging copies */
@@ -1723,9 +1724,9 @@ static int phase_window(z3 *a, const int64_t o[3], int D, int P, int shift, uint
         tp_put(tmp, rnn);
     }
     for (int z = 0; z < D; z++) for (int y = 0; y < P; y++) {
-        const uint8_t *row = ph + ((size_t)(((o[0] + z + shift) >> shift) - lo[0]) * ln[1] + (((o[1] + y + shift) >> shift) - lo[1])) * ln[2];
+        const uint8_t *row = ph + ((size_t)(grid_coarse_j(o[0] + z, shift) - lo[0]) * ln[1] + (grid_coarse_j(o[1] + y, shift) - lo[1])) * ln[2];
         uint8_t *dst = side + ((size_t)z * P + y) * P;
-        for (int x = 0; x < P; x++) dst[x] = row[((o[2] + x + shift) >> shift) - lo[2]];
+        for (int x = 0; x < P; x++) dst[x] = row[grid_coarse_j(o[2] + x, shift) - lo[2]];
     }
     tp_put(ph, N);
     return 0;
@@ -2256,12 +2257,14 @@ int sample_chain_next(const axis *ax, int l, const int64_t shape[3], int Pz, int
    (2P)^3 scratch (free until the targets are built), so a footprint of several P^3 costs no RAM; the pulled phase (and its ignore
    mask) wait in pooled buffers for the stored-phase step (draw() returns them after every draw). */
 /* the window's pulled labels (--aug-crush, --aug-tear): ph / ig the phase and its ignore mask; --aug-tear: w4 / wc the winding mod 4 and
-   its component unwrapped before the tear (ph then already masked by ig: pre) */
-static _Thread_local struct { uint8_t *ph, *ig, *w4, *wc; int pre; size_t n; double k, j0; int fine; uint64_t tiles; sa_tear tear; sa_delam delam;
+   its component unwrapped before the tear (ph then already masked by ig: pre); wt the pulled "weight" (--aug-crush / --aug-curv; the
+   tear / delam paths apply the weight drop on their padded box before the pull, pre) */
+static _Thread_local struct { uint8_t *ph, *ig, *wt, *w4, *wc, *air0; int pre; size_t n; double k, j0; int fine; uint64_t tiles; sa_tear tear; sa_delam delam;
                               int cax; double ca[3], cA[3]; double r0, r1; } g_crush;   /* (cax: --aug-curv moved the axis: ca a point on it, cA its direction, window coordinates) */   /* (k .. tear: the last map, diagnostics) */
 static void crush_release(void) {
-    tp_put(g_crush.ph, g_crush.n + 64); tp_put(g_crush.ig, g_crush.n); tp_put(g_crush.w4, g_crush.n); tp_put(g_crush.wc, g_crush.n);
-    g_crush.ph = g_crush.ig = g_crush.w4 = g_crush.wc = nullptr; g_crush.pre = 0; g_crush.cax = 0;
+    tp_put(g_crush.ph, g_crush.n + 64); tp_put(g_crush.ig, g_crush.n); tp_put(g_crush.wt, g_crush.n); tp_put(g_crush.w4, g_crush.n); tp_put(g_crush.wc, g_crush.n);
+    tp_put(g_crush.air0, g_crush.n / 8 + 1);
+    g_crush.ph = g_crush.ig = g_crush.wt = g_crush.w4 = g_crush.wc = g_crush.air0 = nullptr; g_crush.pre = 0; g_crush.cax = 0;
 }
 typedef struct { crush_cache *cc; const crush_layer *L; const int64_t *o; } crush_ctu;
 static double crush_ct_at(void *ud, const double x[3]) {
@@ -2333,14 +2336,16 @@ static int crush_draw_(sampler *sp, source *s, int l, const int64_t o[3], int P,
     crush_ctu u = {&cc, &Lcol, o};
     crush_map_columns(&m, c->crush.jlo, c->crush.jhi, rnext(r), crush_ct_at, &u);   /* (1: too little CT for a papyrus / void split: no collapse) */
     if (cc.err) { crush_map_free(&m); crush_cache_free(&cc); return -1; }
-    uint8_t *ph = tp_get(p3 + 64, 0), *ig = s->phase_ign ? tp_get(p3, 0) : nullptr;
-    g_crush.ph = ph; g_crush.ig = ig; g_crush.n = p3;
-    if (!ph || (s->phase_ign && !ig)) { crush_map_free(&m); crush_cache_free(&cc); return -1; }
-    crush_layer L[3]; int nl = 0;
+    const int want_wt = s->phase_wt && pshift >= 0 && pshift < 2;   /* (the "weight" pulled with the phase: phase_weight_drop on the crushed window) */
+    uint8_t *ph = tp_get(p3 + 64, 0), *ig = s->phase_ign ? tp_get(p3, 0) : nullptr, *wt = want_wt ? tp_get(p3, 0) : nullptr;
+    g_crush.ph = ph; g_crush.ig = ig; g_crush.wt = wt; g_crush.n = p3;
+    if (!ph || (s->phase_ign && !ig) || (want_wt && !wt)) { crush_map_free(&m); crush_cache_free(&cc); return -1; }
+    crush_layer L[4]; int nl = 0;
     if (fine) { crush_layer f = {fz, CRUSH_LINEAR, 1, 0, 1, {0, 0, 0}, ctu}; crush_layer_level(&f, fine); L[nl++] = f; }
     else L[nl++] = Lct;
     Lph.out = ph; L[nl++] = Lph;
     if (ig) { crush_layer g = {s->phase_ign, CRUSH_NEAREST, 0, 0, 1, {0, 0, 0}, ig}; crush_layer_phase(&g, pshift); L[nl++] = g; }
+    if (wt) { crush_layer g = {s->phase_wt, CRUSH_NEAREST, 0, 255, 1, {0, 0, 0}, wt}; crush_layer_phase(&g, pshift); L[nl++] = g; }
     const int rc = crush_window(&m, &cc, o, L, nl);
     memset(ph + p3, PHASE_UNKNOWN, 64);
     g_crush.k = m.sq_k; g_crush.j0 = m.tab ? m.j0 : 1; g_crush.fine = fine; g_crush.tiles = cc.decoded;
@@ -2356,6 +2361,13 @@ static int crush_draw(sampler *sp, source *s, int l, const int64_t o[3], int P, 
     const int rc = crush_draw_(sp, s, l, o, P, pshift, r, a, own, ctu);
     tp_put(a, own);
     return rc;
+}
+/* the "weight" drop on a padded Pp^3 box (--aug-tear / --aug-delam, before the pull, as the ignore mask): 0 ok, -1 read error */
+static int pad_weight_drop(source *s, const int64_t po[3], int Pp, int pshift, uint8_t *php, uint64_t seed) {
+    const size_t pp3 = (size_t)Pp * Pp * Pp; uint8_t *w = tp_get(pp3, 0);
+    if (!w || phase_window(s->phase_wt, po, Pp, Pp, pshift, w)) { tp_put(w, pp3); return -1; }
+    phase_weight_drop(php, w, Pp, Pp, seed ^ 0x77656967687464ull);
+    tp_put(w, pp3); return 0;
 }
 /* --aug-tear: ctu (P^3) and g_crush (the phase, the winding mod 4 and its component) from a padded read cut and shifted (src/scrollaug.h).
    The labels are prepared on the padded box as the stored-phase path below would (sign, ignore mask, air, band_wind4_tiled), so the
@@ -2383,6 +2395,7 @@ static int tear_draw(sampler *sp, source *s, int l, const int64_t o[3], int P, i
         for (size_t k = 0; k < pp3; k++) if (ig[k] && ig[k] != PHASE_UNKNOWN) php[k] = PHASE_UNKNOWN;
         tp_put(ig, pp3);
     }
+    if (s->phase_wt && pshift < 2 && pad_weight_drop(s, po, Pp, pshift, php, seed)) { tp_put(ctp, pp3); tp_put(php, pp3 + 64); return -1; }
     for (size_t k = 0; k < pp3; k++) if (!ctp[k]) php[k] = PHASE_UNKNOWN;   /* (the window's air test after the pull: the same voxels) */
     uint8_t *wwp = nullptr, *wcp = nullptr;
     if (c->wind4) {
@@ -2428,6 +2441,7 @@ static int delam_draw(sampler *sp, source *s, int l, const int64_t o[3], int P, 
         for (size_t k = 0; k < pp3; k++) if (ig[k] && ig[k] != PHASE_UNKNOWN) php[k] = PHASE_UNKNOWN;
         tp_put(ig, pp3);
     }
+    if (s->phase_wt && pshift < 2 && pad_weight_drop(s, po, Pp, pshift, php, seed)) { tp_put(ctp, pp3); tp_put(php, pp3 + 64); return -1; }
     g_crush.n = p3; g_crush.pre = 1;
     if (!(g_crush.ph = tp_get(p3 + 64, 0))) { tp_put(ctp, pp3); tp_put(php, pp3 + 64); return -1; }
     sa_delam_apply(d, 1, P, M, ctp, php, ctu, g_crush.ph);
@@ -2499,12 +2513,14 @@ static int curv_draw_(sampler *sp, source *s, int l, const int64_t o[3], int P, 
     int64_t lo[3], nn[3];
     for (int d = 0; d < 3; d++) { lo[d] = o[d] + (int64_t)floor(cw - ext[d]); nn[d] = (int64_t)ceil(2 * ext[d]) + 2; }
     if (training_hits_holdout_box(sp, s, lo, nn, l)) { crush_cache_free(&cc); return 0; }
-    uint8_t *ph = tp_get(p3 + 64, 0), *ig = s->phase_ign ? tp_get(p3, 0) : nullptr;
-    g_crush.ph = ph; g_crush.ig = ig; g_crush.n = p3;
-    if (!ph || (s->phase_ign && !ig)) { crush_cache_free(&cc); return -1; }
-    crush_layer L[3]; int nl = 0;
+    const int want_wt = s->phase_wt && pshift >= 0 && pshift < 2;
+    uint8_t *ph = tp_get(p3 + 64, 0), *ig = s->phase_ign ? tp_get(p3, 0) : nullptr, *wt = want_wt ? tp_get(p3, 0) : nullptr;
+    g_crush.ph = ph; g_crush.ig = ig; g_crush.wt = wt; g_crush.n = p3;
+    if (!ph || (s->phase_ign && !ig) || (want_wt && !wt)) { crush_cache_free(&cc); return -1; }
+    crush_layer L[4]; int nl = 0;
     L[nl++] = Lct; Lph.out = ph; L[nl++] = Lph;
     if (ig) { crush_layer g = {s->phase_ign, CRUSH_NEAREST, 0, 0, 1, {0, 0, 0}, ig}; crush_layer_phase(&g, pshift); L[nl++] = g; }
+    if (wt) { crush_layer g = {s->phase_wt, CRUSH_NEAREST, 0, 255, 1, {0, 0, 0}, wt}; crush_layer_phase(&g, pshift); L[nl++] = g; }
     const int rc = crush_window(&m, &cc, o, L, nl);
     g_crush.tiles = cc.decoded; crush_cache_free(&cc);
     if (rc) return -1;
@@ -2605,7 +2621,7 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
     if (sp->c255 && ufsm_env_on("UFSM_BANK_CHECK")) {   /* tests: the shared 255 plane is never written */
         const size_t p3 = P3(sp); for (size_t k = 0; k < p3; k++) if (sp->c255[k] != 255) { fprintf(stderr, "sampler: the plane bank's 255 plane was written (voxel %zu = %d)\n", k, sp->c255[k]); abort(); }
     }
-    if (g_crush.ph || g_crush.ig || g_crush.w4 || g_crush.wc || g_crush.cax) crush_release();
+    if (g_crush.ph || g_crush.ig || g_crush.wt || g_crush.w4 || g_crush.wc || g_crush.air0 || g_crush.cax) crush_release();
     if (rc == 0 && b->chid && (!cs || cs->id < 0)) { b->chid[i] = -1; b->chidx[i] = 0; b->choff[3 * i] = b->choff[3 * i + 1] = b->choff[3 * i + 2] = 0.f; }
     return rc;
 }
@@ -3115,20 +3131,29 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
     if (grec) grec->scan = 0;
     if (c->augment && scan_aug_enabled(&c->scan)) {   /* scanner domains on the source grid; the per-patch z-score follows them, as at inference */
         PROF_MARK(PS_ZSCORE);
+        unsigned son = 0;
+        /* the scanner "air" op turns masked air (CT 0) into material: the side / phase / winding labels' air test (phase_air) must still
+           see the window's air as read, so keep its zero set (one bit per voxel) until the label path (g_crush.air0, released per draw) */
+        if (c->scan.p[SA_AIR] > 0 && c->side == 2 && !g_crush.air0) {
+            if (!g_crush.n) g_crush.n = p3;
+            if (g_crush.n != p3 || !(g_crush.air0 = tp_get(p3 / 8 + 1, 0))) return -1;
+            memset(g_crush.air0, 0, p3 / 8 + 1); for (size_t k = 0; k < p3; k++) g_crush.air0[k >> 3] |= (uint8_t)((!ctu[k]) << (k & 7));
+        }
         if (grec) {   /* --gpu-aug: the decisions and the label side here, the float ops on the device; ctu then holds only the output's zero
                          set (0 / 1: every later CPU reader of ctu needs no more with side_air 0, sample_gpu_aug_ok) */
             const scan_aug_cfg *sc_ = &c->scan;   /* (the plan writes the mask only for these ops: seam, air, dropped slices / cutouts that ignore) */
             if ((sc_->p[SA_SEAM] > 0 && !c->sheet && !c->band && !c->side) || sc_->p[SA_AIR] > 0 || (sc_->drop_ignore && (sc_->p[SA_DROPSLICE] > 0 || sc_->p[SA_CUTOUT] > 0))) IGN_REAL();
             const unsigned on = scan_aug_plan(&c->scan, rnext(r), ctu, ttmp, NCH, ign, P, o, cyz, cxz, s->ax.n > 0, m->chunk, !c->sheet && !c->band && !c->side, &grec->plan);
-            grec->scan = on != 0;
+            grec->scan = on != 0; son = on;
             if (on) {
                 scan_plan_notair(&grec->plan, ctu, b->ct8 + (size_t)i * p3);   /* (the bytes as read into ct8, then ctu = !scan_plan_air in place: one pass) */
             }
-        } else if ((IGN_REAL(), 1) && scan_aug_apply(&c->scan, rnext(r), ctu, ttmp, NCH, ign, P, o, cyz, cxz, s->ax.n > 0, m->chunk, !c->sheet && !c->band && !c->side, big + p3)) {
+        } else if ((IGN_REAL(), 1) && (son = scan_aug_apply(&c->scan, rnext(r), ctu, ttmp, NCH, ign, P, o, cyz, cxz, s->ax.n > 0, m->chunk, !c->sheet && !c->band && !c->side, big + p3))) {
             size_t nz2;   /* (integer sums: the same doubles as accumulating the bytes in double, exact below 2^53) */
             u8_stats(ctu, p3, &nz2, &sum, &sq);
             mean = sum / (double)p3; var = sq / (double)p3 - mean * mean; sd = sqrt(var > 0 ? var : 0) + 1e-3;
         }
+        if (g_crush.air0 && !(son & 1u << SA_AIR)) { tp_put(g_crush.air0, p3 / 8 + 1); g_crush.air0 = nullptr; }   /* (the op did not run: ctu's zeros are the air) */
         PROF_MARK(PS_SCAN);
     }
     if (grec && !grec->scan) memcpy(b->ct8 + (size_t)i * p3, ctu, p3);   /* (the bytes as read) */
@@ -3310,10 +3335,11 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
             }
             if (s->phase_wt && !ph_pool && pshift < 2 && !g_crush.pre) {   /* (pooled windows: no weight drop) */   /* "weight": each 8^3 block of the window keeps its phase with probability w / 255 */
                 uint8_t *wt = PH_GET(big + 9 * p3, p3);
-                if (!wt || phase_window(s->phase_wt, o, Pz, P, pshift, wt)) { PH_PUT(wt, p3); SW_PUT(); return -1; }
+                if (!wt || (g_crush.wt ? (memcpy(wt, g_crush.wt, p3), 0) : phase_window(s->phase_wt, o, Pz, P, pshift, wt))) { PH_PUT(wt, p3); SW_PUT(); return -1; }   /* (crush / curv: the pulled weight) */
                 phase_weight_drop(sw, wt, Pz, P, r->s[1] ^ (uint64_t)tile_index ^ c->seed ^ ((uint64_t)o[0] << 40) ^ ((uint64_t)o[1] << 20) ^ (uint64_t)o[2]);
                 PH_PUT(wt, p3);
             }
+            if (g_crush.air0) for (size_t k = 0; k < p3; k++) if (g_crush.air0[k >> 3] >> (k & 7) & 1) sw[k] = PHASE_UNKNOWN;   /* (scanner "air": the air as read) */
             PROF_MARK(PS_PHREAD);
             if (c->wind4 && s->scope_local != 1) {   /* ("scope": "local": the winding mod 4 stays unknown, below; "w4" trains it) */   /* the winding mod 4: the phase unwrapped before the air test (gaps join the windings), outside the scroll (CT 0) not */
                 uint8_t *pw = PH_GET(ttmp + p3 + 64, p3);
@@ -4045,8 +4071,7 @@ sampler *sampler_start(sources *S, const sample_cfg *cfg) {
     if (cfg->gpu_input && !sample_gpu_input_ok(cfg)) { fprintf(stderr, "sampler: --gpu-input needs 16-bit batches and no warps, sheet prior, slab appearance plan, aux or condition inputs\n"); return nullptr; }
     { int nl = 0, nw = 0; for (int i = 0; i < S->n; i++) { nl += S->src[i].scope_local == 1; nw += S->src[i].phase_wt != nullptr; }
       if (nl || nw) fprintf(stderr, "sampler: %d of %d sources scope local (no winding mod 4 target)%s, %d with a phase weight (8^3 blocks kept with probability w)\n",
-                            nl, S->n, cfg->wind4 ? "" : " (no --wind4 in this run: no effect)", nw);
-      for (int i = 0; i < S->n; i++) if (S->src[i].phase_wt && (cfg->crush.p > 0)) { fprintf(stderr, "sampler: note: phase weights are not applied on crushed / torn / re-bent windows\n"); break; } }
+                            nl, S->n, cfg->wind4 ? "" : " (no --wind4 in this run: no effect)", nw); }   /* (the weight is pulled with crushed / re-bent windows and dropped on the padded box of torn / delaminated ones) */
     if (cfg->erode < 0 || cfg->erode > 1 || (cfg->erode && (cfg->P < 2 || cfg->dilate || cfg->sheet))) {
         fprintf(stderr, "sampler: erode must be 0 or 1, with P >= 2, no dilation and no winding task\n"); return nullptr;
     }

@@ -34,6 +34,11 @@ int band_field_side(const uint8_t *codes, const int n[3], const int64_t o[3], co
    past the end of a trace, where the band is unknown). The recto side is phase < PHASE_PERIOD / 2. spacing (optional): the local
    distance between the two rectos (label voxels, 1..255; 0 where the phase is unknown). */
 enum { PHASE_PERIOD = 252, PHASE_UNKNOWN = 255 };
+/* The one grid convention for a label grid `shift` levels coarser than the window (the codes / CT pyramid one since 2026-11-14, datafix
+   b1db77b): coarse voxel j is centred on its 2^shift block, at fine 2^shift j + (2^shift - 1) / 2. grid_coarse_u: the fine coordinate x in
+   coarse units (interpolation: floor() the lower neighbour); grid_coarse_j: the coarse voxel whose block holds fine voxel x (nearest). */
+static inline double grid_coarse_u(double x, int shift) { const double g = shift >= 0 ? (double)(1ll << shift) : 1. / (double)(1ll << -shift); return (x - .5 * (g - 1)) / g; }
+static inline int64_t grid_coarse_j(int64_t x, int shift) { return x >> shift; }
 int band_field_phase(const uint8_t *codes, const int n[3], const int64_t o[3], const double *cy, const double *cx, band_params p, uint8_t *out, uint8_t *phase,
                      uint8_t *spacing);
 

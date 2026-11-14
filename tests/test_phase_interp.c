@@ -1,9 +1,12 @@
 /* sample_phase_interp (separable, polynomial atan2: the sampler's 9.6 -> 2.4 um stored-phase path) against the 8-neighbour atan2f
    reference: random phase ramps with unknown holes, windows of several shapes / offsets, shift 2 and 3. Codes must agree exactly in
    >= 99.9% of the known voxels and within 1 code (circular) everywhere; the known / unknown split may differ only at the 0.5-weight cut.
-   Prints both paths' times. */
+   Prints both paths' times. Then the one coarse-grid convention (band.h, audit 2026-11-14 data #3): grid_coarse_u puts coarse voxel j
+   at fine 2^s j + (2^s - 1) / 2, its nearest voxel is the block holding x (grid_coarse_j = x >> s, the shift-1 phase_window path), and
+   the crush layers' phase grid (crush_layer_phase) is the same map. */
 #include "sample.h"
 #include "band.h"
+#include "crush.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -46,6 +49,20 @@ int main(void) {
             fail |= bad;
             free(ph); free(a); free(b);
         }
+    }
+    {   /* the grid convention */
+        int bad = 0;
+        for (int sh = 0; sh <= 3; sh++) {
+            const int g = 1 << sh; crush_layer L = {0}; crush_layer_phase(&L, sh);
+            for (int64_t x = -40; x < 200; x++) {
+                const double u = grid_coarse_u((double)x, sh);
+                bad |= (int64_t)floor(u + .5) != grid_coarse_j(x, sh) || grid_coarse_j(x, sh) != (int64_t)floor((double)x / g);
+                bad |= fabs(L.a * (double)x + L.b[0] - u) > 1e-12 || fabs(L.a * (double)x + L.b[2] - u) > 1e-12;
+            }
+            for (int64_t j = -5; j < 20; j++) bad |= fabs(grid_coarse_u((double)(g * j) + .5 * (g - 1), sh) - (double)j) > 1e-12;
+        }
+        printf("grid convention (block-centred coarse voxels; nearest = x >> s; crush layers the same): %s\n", bad ? "FAIL" : "ok");
+        fail |= bad;
     }
     printf("separable %.3f s, reference %.3f s (%.1fx)\n", tn, tr, tr / tn);
     printf(fail ? "test_phase_interp: FAIL\n" : "test_phase_interp: ok\n");

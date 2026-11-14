@@ -113,7 +113,7 @@ typedef struct {
 /* the array coordinates of a level (finer by f levels: f > 0, coarser: f < 0) relative to the map's level, the pyramid convention
    p_l = (p_0 + 0.5) / 2^l - 0.5 */
 void crush_layer_level(crush_layer *L, int finer);
-/* the stored-phase grid of the sampler's phase_window (shift levels coarser: nearest (g + shift) >> shift) */
+/* the stored-phase grid of the sampler's phase_window (shift levels coarser, block-centred: band.h grid_coarse_u) */
 void crush_layer_phase(crush_layer *L, int shift);
 
 typedef struct {
