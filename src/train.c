@@ -5351,26 +5351,8 @@ int cmd_train(int argc, char **argv) {
           if (fault == step) nn_h2d(G[0].x, nullptr, 16); }
         if ((seconds && now() - t0 >= seconds) || (schedule_seconds && schedule_elapsed+now()-t0>=schedule_seconds) ||
             (limit_seconds && now() - t0 >= limit_seconds) || (stop_at && step >= stop_at)) g_stop = 1;
-<<<<<<< HEAD
         if (ng > 1 && G[0].side < 0 && cfg.gn_ema && unet_gn_ema_average_due(unet_gn_ema_updates(G[0].u), unet_gn_ema_warm(G[0].u), step, val_every, ckpt_every, steps, g_stop)) {
             gn_ema_average(G, ng); nn_init(G[0].dev);
-=======
-        {   /* replica check (split audit #6): every card must hold the same master weights (the same optimizer on the same allreduced gradient;
-               checkpoints come from G[0]). UFSM_REPLICA_CHECK=N: every N steps (default: the checkpoint steps and the last; 0 off); a mismatch stops the run */
-            static long rc_every = -2;   /* mgpu: main (the training loop) */
-            if (rc_every == -2) rc_every = getenv("UFSM_REPLICA_CHECK") ? atol(getenv("UFSM_REPLICA_CHECK")) : -1;
-            const int due = ng > 1 && rc_every != 0 && (rc_every > 0 ? step % rc_every == 0 : step % ckpt_every == 0 || step == steps || g_stop);
-            if (due) {
-                uint64_t h0 = 0; int bad = -1; const size_t nb = np * 4; uint8_t *hb = malloc(nb);
-                for (int g = 0; g < ng && hb; g++) {
-                    nn_init(G[g].dev); nn_sync(); nn_d2h(hb, unet_live_params(G[g].u), nb);
-                    uint64_t x = 1469598103934665603ull; for (size_t q = 0; q + 8 <= nb; q += 8) { uint64_t w; memcpy(&w, hb + q, 8); x = (x ^ w) * 1099511628211ull; }
-                    if (!g) h0 = x; else if (x != h0 && bad < 0) bad = g;
-                }
-                free(hb); nn_init(G[0].dev);
-                if (bad >= 0) { fprintf(stderr, "replica check at step %d: GPU %d's weights differ from GPU %d's (the cards diverged): stopping, no checkpoint of this step\n", step, G[bad].dev, G[0].dev); return 1; }
-            }
->>>>>>> origin/thrfix-20261114
         }
         const int step_ok = nskip == nskip_seen; nskip_seen = nskip; nacc++; if (!step_ok) nskl += 1;   /* a skipped (non-finite) step: no loss / label means (try3 step 504: its nan entered rv / normal / ink) */
         if (step_ok) { acc_loss += loss / nl; acc_g += gn; acc_active += active / nl;   /* (loss, bce, dice, active: the mean over the step's nl windows, all GPUs) */
