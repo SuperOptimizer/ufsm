@@ -70,7 +70,7 @@ static int sf_block(sf_job *J, const int64_t o[3], const int n[3], uint8_t *out,
           if (z3_read(J->ph, co, cn, c, 1)) { free(c); goto done; }
           if (J->nearest) {   /* --interp nearest: what the sampler's phase_window does for a stored phase one level coarser */
               for (int z = 0; z < D; z++) for (int y = 0; y < Y; y++) for (int x = 0; x < X; x++)
-                  ph[((size_t)z * Y + y) * X + x] = c[((size_t)(((ho[0] + z + 1) >> 1) - co[0]) * cn[1] + (((ho[1] + y + 1) >> 1) - co[1])) * cn[2] + (((ho[2] + x + 1) >> 1) - co[2])];
+                  ph[((size_t)z * Y + y) * X + x] = c[((size_t)(((ho[0] + z) >> 1) - co[0]) * cn[1] + (((ho[1] + y) >> 1) - co[1])) * cn[2] + (((ho[2] + x) >> 1) - co[2])];   /* (block centre: fine x lies in coarse x >> 1, as band.h grid_coarse_j; (x + 1) >> 1 before 11-14) */
           } else
           for (int z = 0; z < D; z++) for (int y = 0; y < Y; y++) for (int x = 0; x < X; x++) {
               const double p[3] = {(ho[0] + z + 0.5) / 2 - 0.5 - co[0], (ho[1] + y + 0.5) / 2 - 0.5 - co[1], (ho[2] + x + 0.5) / 2 - 0.5 - co[2]};
