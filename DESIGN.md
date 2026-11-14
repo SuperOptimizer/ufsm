@@ -6,6 +6,39 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Pod scripts and docs from the 11-14 mini audits (2026-11-14, branch opsfix2-20261114)
+
+Mini audits podscripts / docs (/vesuvius/ufsm/audit-20261114/mini/). Scripts only, plus three usage strings; no recipe change.
+- **Label staging removed** (podscripts #1, the hard rule). scripts/univ/pod_pack.sh no longer stages OUT/gt (PHerc0139 q-surfaces,
+  PHerc1667 codes A / B + phase, ~19 GB, ~75 min of desk uplink) or, with INK=1, the human ink GT (~2.7 GB). It refuses an OUT holding
+  any zarr store. pod_univ.sh `1667` needs G1667, the code rasters built on the pod from the dl.ash2txt GT, and stops with the rule
+  otherwise.
+- **Pod-to-pod labels** (#5): fibers/evald.sh scores 1447-HOLD against labels built on the eval pod (L2, mklabels2.sh in its pod mode)
+  instead of rsyncing them from the training pod.
+- **GPU lock + timeout** (#2, #9): setup.sh's smoke test runs `flock -w 1800 /root/gpu.lock timeout -k 10 600`. pod_univ.sh's
+  bench / dry runs go through `ulock` (flock + timeout, BTIMEOUT 5400 s). q.sh's lanes are bounded by QTIMEOUT (24 h; they share the
+  card by design). wingate.sh re-execs itself under the lock with WGTIMEOUT (12 h), and off the desk it requires its paths.
+- **setsid** (#3): pod_univ.sh u1run and fibhv-d.launch.sh, so stopping the caller does not take the trainer (try4, 11-14).
+- **Endpoints** (#4): evald.sh, evald_desk.sh and b1_pull_p4A.sh require TP / TPP and EP / EPP (no stale IP defaults). evald.sh
+  writes `done` only when every predict, trace and eval returned 0; otherwise it writes `failed` with the list and exits 1.
+- **Threads** (#6, #7, #10):
+  - q.sh, pod_bench.sh, pod_wb.sh and evald.sh take `ufsm sysinfo --ncpu` (the cgroup) instead of 13 / 40 / 16 / 8 / 12;
+  - unroll.sh and packfields.sh fall back to the cgroup's cpu.max / memory.max before nproc / MemAvailable.
+- **u2ink_smoke.sh** (#8) locks the trainers' shared /vesuvius/ufsm/opt/gpu$GPU.lock, not a private one.
+- **Docs**:
+  - README: `--window auto` is inklib.sh's default, not predict's;
+  - ZCACHE is off without a GPU or on WSL (not "on the laptop");
+  - recipe step 7's driver is desk-only;
+  - the usage strings now show `ink-compare --then`, `strip-flatten --tol` and `count-field --model-only / --model-stride`.
+  - CLAUDE.md is committed on opsfix-20261114.
+- tests/test_podscripts.sh (CPU, < 1 s) checks:
+  - no label staging;
+  - no hardcoded pod endpoint defaults (LAN hosts excepted);
+  - setsid on pod trainer launches;
+  - the locked smoke test;
+  - evald's done flag.
+  On the pre-fix scripts it reports 6 failures.
+
 ## Masked CT: no coupling through data-free cells, a majority data test in wraps, one no-data gate (2026-11-14, branch geoouter-20261114)
 
 **Problem (geo-outer audit, /vesuvius/ufsm/audit-20261114/geo-outer.md).** PHerc1667's fields ran on the `-masked` CT, whose SAM mask clips

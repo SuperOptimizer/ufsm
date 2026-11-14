@@ -10,7 +10,7 @@
 #   B  A + --ink-mil 1 --ink-mil-r MILR (3: +-3 window voxels, 7 um at 2.4 / 14 um at 4.8; the trainer's default 10) on the pixels without
 #      an open face (--ink-mil-mode 1)
 # Pass: the ink AUC rises over the arm's first scored checkpoint and sits above the CT floor on every scan after STEPS; B >= A on the
-# crops whose labels have many face-less pixels (Paris 4: 42%). Desk: GPU=1 (flock gpu1 bench lock, dev slice); pod: K set, LOCK= .
+# crops whose labels have many face-less pixels (Paris 4: 42%). Desk: GPU=1 (flock the shared /vesuvius/ufsm/opt/gpu$GPU.lock, dev slice); pod: K set, LOCK= .
 # Env: K (pod root; unset: the desk paths), IK (the staged inkgt dir, K/inkgt; its sibling inkeval/crops: the eval crops),
 #      U (binary with --ink-mil and the replay remap: master after milfix-20261112), INIT (u1 snapshot), SRCJ, STEPS (400),
 #      P (1024 pod: cubes only, user 2026-11-12; desk 384), GPU (0), MILR (3), MILMODE (1), SCORE (1: run baseline.sh after each arm),
@@ -21,7 +21,7 @@ if [ -n "${K:-}" ]; then   # pod: what pod_pack.sh / the u2ink staging put under
   SC_ENV="D=$IK CROPS=${CROPS:-$(dirname $IK)/inkeval/crops} CACHE=$K/cache"; P=${P:-1024}; LOCK=${LOCK-}
 else
   R=${R:-/vesuvius/ufsm/univ/u2ink/runs}; U=${U:-/vesuvius/ufsm/univ/u2ink/bin/ufsm}; INIT=${INIT:-/vesuvius/ufsm/v2/lat/runs/u1/snap/8000.ckpt}
-  SRCJ=${SRCJ:-/vesuvius/ufsm/inkgt/sources-u2ink.json}; BASIS=/vesuvius/ufsm/v2/lat/codec/klt1.lcb; SC_ENV=""; P=${P:-384}; LOCK=${LOCK-/tmp/gpu1-bench.lock}
+  SRCJ=${SRCJ:-/vesuvius/ufsm/inkgt/sources-u2ink.json}; BASIS=/vesuvius/ufsm/v2/lat/codec/klt1.lcb; SC_ENV=""; P=${P:-384}; LOCK=${LOCK-/vesuvius/ufsm/opt/gpu${GPU:-0}.lock}   # (the trainers' shared lock, not a private one: podscripts #8)
 fi
 STEPS=${STEPS:-400}; GPU=${GPU:-0}; MILR=${MILR:-3}; EVERY=${EVERY:-200}; mkdir -p $R
 for f in $U $INIT $SRCJ $BASIS; do [ -e $f ] || { echo "missing $f"; exit 1; }; done

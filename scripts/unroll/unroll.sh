@@ -59,8 +59,13 @@ UR=${UR:-/vesuvius/ufsm/unroll}; O=$UR/$S${TAG:-}   # (TAG: e.g. a test crop bes
 U=${U:-/vesuvius/ufsm/unroll/bin/ufsm}
 CK=${CK:-/vesuvius/ufsm/podready/pod/ckpt/wind96-wk1-best.ckpt}; INKCK=${INKCK:-/vesuvius/ufsm/ink-ft/runs/ift3/snap/ift3-24000.ckpt}   # (CK: the gate's wind96 copy, sha1 dafb8233; /vesuvius/ufsm/paris4 is gone since the 11-12 cleanup)
 # host limits (cgroup-aware on pods): ufsm sysinfo --ncpu / --avail-gb when the binary has it, else nproc / /proc/meminfo
-ncpu() { local n; n=$($U sysinfo --ncpu 2> /dev/null) && [ "$n" -gt 0 ] 2> /dev/null && { echo $n; return; }; nproc; }
+# (no sysinfo on a pod, i.e. a cgroup with a memory.max: the cgroup's own cpu.max / memory.max, never nproc / MemAvailable, which show the
+#  host there: 256 CPUs / 755 GB on a ~62 CPU / 200 GB pod; mini audit podscripts #7)
+cgmax() { local f=/sys/fs/cgroup/$1; [ -r $f ] && [ "$(cut -d' ' -f1 $f)" != max ] && cat $f; }
+ncpu() { local n; n=$($U sysinfo --ncpu 2> /dev/null) && [ "$n" -gt 0 ] 2> /dev/null && { echo $n; return; }
+         n=$(cgmax cpu.max) && { echo $n | awk '{print int($1 / $2) > 0 ? int($1 / $2) : 1}'; return; }; nproc; }
 availgb() { local g; g=$($U sysinfo --avail-gb 2> /dev/null) && [ "$g" -ge 0 ] 2> /dev/null && { echo $g; return; }
+            g=$(cgmax memory.max) && { awk -v m=$g '/^anon |^shmem / {u += $2} END {print int((m - u) / 1073741824)}' /sys/fs/cgroup/memory.stat; return; }
             awk '/MemAvailable/ {print int($2 / 1048576)}' /proc/meminfo; }
 # the ink: INKMODE lat (default since 2026-11-14, the latent-ink-only policy): scripts/pod/latink.sh (two tile grids + ink-blend, ink / c12 /
 # c13 heads, --axis) with LATINK_CK (default the newest inkpod snap, 15000) as INKCMD; INKMODE ift3: the legacy feathered single pass of INKCK

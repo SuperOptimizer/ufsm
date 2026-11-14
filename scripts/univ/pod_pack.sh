@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
 # scripts/univ/pod_pack.sh OUT [SNAP]: on the desk, stage everything a fresh universal-net pod cannot fetch itself (scripts/univ/pod_univ.sh),
 # laid out as the pod's K: OUT/small (the datakit layout: axis / umbilicus JSONs, gtaxis, klt1.lcb, holdouts, boxes, wind96, the init
-# checkpoints) and OUT/gt (the label inputs with no public source: PHerc0139 q-surfaces 55 MB, PHerc1667 codes A / B 9.4 GB + its 9.6 um
-# phase 9.8 GB). SNAP: a u1 snapshot (or last.ckpt) to resume on the pod, copied with its run's ufsm.bin (reference only:
+# checkpoints). NO label data (CLAUDE.md: never copy label data from the desk to a pod; its uplink is ~3 MB/s): until 11-14 this also
+# staged OUT/gt (PHerc0139 q-surfaces, PHerc1667 codes A / B + phase, ~19 GB) and with INK=1 the human ink GT (~2.7 GB); pods now build
+# every label from the dl.ash2txt GT (pod_univ.sh kit / 1667, the sampler's on-the-fly paths) (mini audit podscripts #1). SNAP: a u1 snapshot (or last.ckpt) to resume on the pod, copied with its run's ufsm.bin (reference only:
 # the desk binary needs glibc 2.43; pod_univ.sh setup rebuilds COMMIT from source) and COMMIT noted. Also OUT/md5: md5
 # sums of 8 sampled label shards per set, which pod_univ.sh `verify` checks against its rebuilt rasters. Everything else (CT, segments,
 # Paris 4 / 0139 / 0500P2 labels) the pod reads from the mirror or rebuilds (datakit.sh). Then from the desk:
-#   rsync -a --info=progress2 -e "ssh -p PORT -i ~/.ssh/id_ed25519" OUT/ root@HOST:/workspace/univ/      (~20 GB, ~75 min at 4.5 MB/s)
-# Hard links where possible (OUT on the same filesystem as the sources), so staging costs no disk. INK=1: also the U2 ink smoke's inputs
-# (OUT/inkgt, OUT/inkeval; POD: the pod's K for the rewritten paths, /workspace/univ).
+#   rsync -a -e "ssh -p PORT -i ~/.ssh/id_ed25519" OUT/ root@HOST:/workspace/univ/      (small files + checkpoints only)
+# Hard links where possible (OUT on the same filesystem as the sources), so staging costs no disk. INK=1: only sources-u2ink.json (the
+# ink GT itself is not staged: the pod fetches it from the mirror; POD: the pod's K for the rewritten paths, /workspace/univ).
 set -euo pipefail; O=${1:?OUT}; SNAP=${2:-}
-mkdir -p $O/small/axis $O/small/gtaxis $O/gt/p0139-q $O/gt/1667 $O/md5 $O/ckpt
+mkdir -p $O/small/axis $O/small/gtaxis $O/md5 $O/ckpt
 cpl() { cp -al "$1" "$2" 2>/dev/null || cp -a "$1" "$2"; }   # (hard link, else copy)
 cpl /vesuvius/ufsm/teacher/axis-0.json $O/small/axis/paris4-axis-0.json
 cpl /vesuvius/ufsm/umbilicus/PHerc0139/umbilicus-full-resolution.json $O/small/axis/PHerc0139-umbilicus.json
@@ -24,8 +25,6 @@ cpl /vesuvius/ufsm/wbench/holdouts.json $O/small/holdouts.json; cpl /vesuvius/uf
 cpl /vesuvius/ufsm/podready/pod/ckpt/wind96-wk1-best.ckpt $O/small/wind96-wk1-best.ckpt
 cpl /vesuvius/ufsm/v2/lat/runs/wz896/last.ckpt $O/ckpt/wz896.ckpt
 cpl /vesuvius/ufsm/univ/u1/sources-u1.json $O/small/sources-u1-desk.json
-G=${GTROOT:-/vesuvius/ufsm/gt}/PHerc0139-wind-20261016; [ -d $O/gt/p0139-q/qA ] || { cp -al $G/qA $G/qB $O/gt/p0139-q/ 2>/dev/null || cp -a $G/qA $G/qB $O/gt/p0139-q/; }
-G=${GTROOT:-/vesuvius/ufsm/gt}/PHerc1667-wind-20261016; for d in codesA codesB phase; do [ -d $O/gt/1667/$d ] || { cp -al $G/$d $O/gt/1667/ 2>/dev/null || cp -a $G/$d $O/gt/1667/; }; done
 # md5 samples of the label sets the pod rebuilds (8 shards each, fixed by sort order; shards without labels are absent on both sides)
 smp() { local n=$1 d=$2; (cd $d && find . -path '*/c/*' -type f | sort | awk 'NR % 97 == 1' | head -8 | xargs -r md5sum) > $O/md5/$n.md5; echo "$n: $(wc -l < $O/md5/$n.md5) shards"; }
 smp p4A /vesuvius/ufsm/v2/rv/gt/p4full/phaseA; smp p4B /vesuvius/ufsm/v2/rv/gt/p4full/phaseB; smp p0139 /vesuvius/ufsm/v2/rv/gt/p0139full/phase
@@ -35,11 +34,11 @@ if [ -n "$SNAP" ]; then   # the run to resume: its checkpoint, binary and the co
   cpl $R/ufsm.bin $O/ckpt/u1-ufsm.bin; echo ${COMMIT:?COMMIT: the commit that built the run ufsm.bin, u1: 23c085b} > $O/ckpt/u1-commit.txt
   head -1 $SNAP | grep -oE '"step":[0-9]+' > $O/ckpt/u1-step.txt || true
 fi
-if [ "${INK:-0}" = 1 ]; then   # the U2 ink smoke (scripts/univ/u2ink_smoke.sh): the human ink GT inputs (segments, labels, masks, validation rasters:
-  # inkgt/hf + od, 2.7 GB), the eval GT / crops (evgt, evcrops, wbench/inkeval/crops: 0.2 GB) and sources-u2ink.json with the pod's paths
-  G=/vesuvius/ufsm/inkgt; mkdir -p $O/inkgt $O/inkeval
-  for d in hf od evgt evcrops; do [ -d $O/inkgt/$d ] || cp -al $G/$d $O/inkgt/ 2>/dev/null || cp -aL $G/$d $O/inkgt/; done
-  [ -d $O/inkeval/crops ] || cp -al /vesuvius/ufsm/wbench/inkeval/crops $O/inkeval/ 2>/dev/null || cp -aL /vesuvius/ufsm/wbench/inkeval/crops $O/inkeval/
+if [ "${INK:-0}" = 1 ]; then   # the U2 ink smoke (scripts/univ/u2ink_smoke.sh): only its sources json, the paths rewritten to the pod's K
+  G=/vesuvius/ufsm/inkgt; mkdir -p $O/inkgt
   ROOT=${POD:-/workspace/univ}/inkgt CACHE=${POD:-/workspace/univ}/cache CACHE_MB=${CACHE_MB:-768} python3 -I $(dirname "$(readlink -f "$0")")/../inkgt/mksources_u2ink.py $G/sources-inkfly.json $O/inkgt/sources-u2ink.json
+  echo "INK=1: the pod fetches the ink GT (inkgt/hf, od, evgt, evcrops) from the mirror into ${POD:-/workspace/univ}/inkgt; nothing staged here"
 fi
+# (guard: no label store may be in OUT: a zarr.json anywhere under it means a label set slipped in)
+if find $O -name zarr.json -print -quit | grep -q .; then echo "pod_pack: OUT holds a zarr store ($(find $O -name zarr.json -print -quit)): label data must not go to a pod" >&2; exit 1; fi
 du -shL $O; echo "staged: rsync -a --info=progress2 -e 'ssh -p PORT -i ~/.ssh/id_ed25519' $O/ root@HOST:/workspace/univ/"

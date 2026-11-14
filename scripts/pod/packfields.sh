@@ -6,7 +6,8 @@
 # PHerc0490B 21.6 -> 2.85 GB (7.6x), PHerc0483B 30.4 -> 3.47 GB (8.8x); the phase planes 28-31x smaller. Threads: TH (the cgroup CPUs).
 set -eu
 F=${1:?usage: packfields.sh FIELDS [fields-pack options]}; shift
-U=${U:-ufsm}; TH=${TH:-$($U sysinfo --ncpu 2> /dev/null || nproc)}
+U=${U:-ufsm}; cgcpu() { [ -r /sys/fs/cgroup/cpu.max ] && awk '$1 != "max" {print int($1 / $2) > 0 ? int($1 / $2) : 1; f = 1} END {exit !f}' /sys/fs/cgroup/cpu.max; }
+TH=${TH:-$($U sysinfo --ncpu 2> /dev/null || cgcpu || nproc)}   # (cgroup before nproc: podscripts #7)
 [ -e "$F/fields.json" ] || { echo "packfields: no $F/fields.json"; exit 1; }
 rm -rf "$F.pk"
 $U fields-pack "$F" "$F.pk" --q-phase ${FITQP:-4} --threads $TH "$@"
