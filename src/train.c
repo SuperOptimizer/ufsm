@@ -4198,6 +4198,8 @@ int cmd_train(int argc, char **argv) {
             if (g_mil) {   /* --ink-mil: the rays of both buffers, the per-sample accumulator, the loss (the backward's sort buffers: inkmil's own, in mil_bytes) */
                 d->mil_k = ink_mil_samples(g_mil_R, g_mil_step);
                 d->milr[0] = nn_malloc((size_t)g_mil_max * sizeof(inkray)); d->milr[1] = nn_malloc((size_t)g_mil_max * sizeof(inkray));   /* (two buffers in every mode, lean too: see mil_take) */
+                if (ink_mil_set_async && !getenv("UFSM_MIL_ASYNC")) ink_mil_set_async(g_lsplit);   /* the plane-bound path only under --split z (its per-slab syncs
+                                    serialised the two cards' turns); one card / data parallel: the per-slab readback (try6 P 768 DP 2026-11-14: 157 Mvox/s vs 130 async) */
                 d->milacc = nn_malloc((size_t)g_mil_max * d->mil_k * sizeof(float)); if (g_lsplit) d->milacc2 = nn_malloc((size_t)g_mil_max * d->mil_k * sizeof(float)); d->milloss = nn_malloc(sizeof(double)); d->miln[0] = d->miln[1] = 0;
             }
             d->nscratch = nn_malloc(nn_loss_scratch((shape5){1, 7, g_Pz, P, P}) + 64);
