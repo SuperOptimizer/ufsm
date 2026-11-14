@@ -203,6 +203,7 @@ ufsm_exe(test_predict_unwrap2 SUITE tests/test_predict_unwrap2.c OBJS unet fit f
 ufsm_exe(test_pyports SUITE tests/test_pyports.c OBJS coreline_check coreline imgops jpegpar tiff tiffw fit fit_emb embz z3w fit_ct l1pot
          json zarr3 store NN LP LIBS LDLIBS CUDA)
 ufsm_exe(test_qkclip SUITE tests/test_qkclip.c OBJS NN LP LIBS LDLIBS CUDA)
+ufsm_exe(test_dpsafe SUITE tests/test_dpsafe.c OBJS NN LP LIBS LDLIBS CUDA)
 ufsm_exe(test_raster SUITE tests/test_raster.c OBJS scannorm edt band sheet ct_augment scan_augment spatial_augment crush scrollaug cover
          json store zarr3 sources band_onfly fuse fiberraster afv regmap srpair zarr2 tiff z3w hf zipr view reg sample_emb embz surfcomp
          LIBS LDLIBS)

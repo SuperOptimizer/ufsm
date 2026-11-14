@@ -6,6 +6,34 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## DP safety: process-wide state under one host thread per GPU, workspaces before the plan, an mgpu lint (2026-11-14, branch netfix-20261114)
+
+From the network / kernel audit (/vesuvius/ufsm/audit-20261114/net.md; today's at_set_lmax and cuBLASLt bugs were of this kind). Under data
+parallel the forward, losses and backward of each replica run on its own persistent host thread (train.c gworker); the gradient all-reduce,
+the optimizer and checkpoints run on the main thread. Fixed:
+
+| what | was | now |
+|---|---|---|
+| lp_mxgemm packed operands (UFSM_LINEAR_MX=4/8) | one buffer: GPU 1 packed into GPU 0's memory | per device |
+| VMM level-0 rings (UFSM_L0_RING=1) | device latched at the first call: GPU 1's rings backed by GPU 0's memory, table unlocked | device per call, granularity per device, table under a mutex |
+| GN slab registry (--l0-norm slab) | unlocked, 8 entries = exactly 2 replicas x 4 | mutex (lock-free "any" fast path), 32 entries |
+| Muon NS cuBLASLt plan table | unlocked append (safe only while the optimizer stays on the main thread) | mutex |
+| CUDA error latches g_err / g_lp_err | process-wide: one GPU thread could consume / report the other's error (UFSM_SYNC_CHECK) | per thread; every first error also posted process-wide; a non-worker thread's nn_check (the trainer's main thread) takes a posted one, a GPU thread only its own (nn_err_worker) |
+| stochastic-rounding seeds | identical on both replicas (the counter starts from the main thread's) | replica g's thread salts with g (salt 0 = the one-GPU draws; --split z halves keep 0: their halo planes must round alike). Signed data: no correlation either way; same-sign data had 0.39 |
+| --gn-ema running statistics | per replica, never combined: the checkpoint's (GPU 0's) saw half the windows | averaged over the replicas at validation / checkpoint steps, and every step once the forward reads them (from --gn-ema-warm); exact, the update is linear in the batch statistics |
+
+**Workspaces before the plan.** The planner measured the free memory before the first step, but these were allocated at the first step,
+outside the plan (covered only by the fixed 550 MB "kernel workspaces" + the 0.5 GB multi-GPU headroom; GPU 0 at P 768 DP runs 15.75 of
+16.3 GB): the cuBLASLt handles + 32 MB workspaces of the attention linears and of --muon-tc 2 (per device since today's fixes, so new on
+GPU 1), the Muon descriptor table + scratch pool (<= UFSM_MUON_POOL_MB 128) and momentum (unless aliased into AdamW v), and the latent
+input conv's MX-fp8 / MX-fp4 weight-gradient chunk copies (96 MB). unet_reserve + lp_f8w_mixed_reserve now allocate them on every GPU
+before nn_mem_free. MEMRESULTS
+
+**Lint.** tests/test_mgpu_lint.py (fast tier, CPU): every mutable process-wide variable in src/ (file-scope globals, function-local
+statics, __device__ / __constant__) needs `mgpu: TAG` (per-thread, per-device, guarded, config, env, main, process, debug) on its line or
+the line above; thread_local, const objects and locks need nothing. The 1112 that predate it are in tests/mgpu_baseline.txt (file name),
+so only new ones fail. A self-test checks the scanner on a sample (a pointer to const is mutable, a const object is not).
+
 ## Fully adaptive Muon: update / weight statistics, per-layer step control, DoG global step (2026-11-14, branch admuon-20261114)
 
 The user asked for "fully adaptive Muon" for the scratch2 trainer. Each piece below is behind its own flag and off by default; with the

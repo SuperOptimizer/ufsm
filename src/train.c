@@ -1865,7 +1865,8 @@ static void gn_ema_average(gpu_state *G, int ng) {
     free(acc); free(h);
 }
 static double g_echo_idle;   /* --echo-max: seconds a GPU waited for the next batch (from its step's end to the batch's handover), the "idle" share */
-static void gstep_job(void *p) { gstep_arg *a = p; nn_sr_salt(a->d->side < 0 ? (unsigned)a->g : 0u); gstep_fwd(a); if (!a->rc) gstep_bwd(a); nn_tls_capture(&a->out); }
+static void gstep_job(void *p) { gstep_arg *a = p; { static int rs = -1; if (rs < 0) rs = getenv("UFSM_SR_REPLICA_SALT") ? ufsm_env_on("UFSM_SR_REPLICA_SALT") : 1;   /* mgpu: env */
+                                                  nn_sr_salt(rs && a->d->side < 0 ? (unsigned)a->g : 0u); } gstep_fwd(a); if (!a->rc) gstep_bwd(a); nn_tls_capture(&a->out); }
 /* the per-GPU host threads (persistent: thread-local device scratch lives as long as they do), started on first use */
 typedef struct { pthread_t th; int dev, started, has; void (*fn)(void *); void *arg; nn_tls tls; } gworker;
 static gworker g_gw[8]; static pthread_mutex_t g_gw_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_gw_cv = PTHREAD_COND_INITIALIZER, g_gw_dcv = PTHREAD_COND_INITIALIZER;
