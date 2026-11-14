@@ -137,9 +137,10 @@ const unet_cfg *unet_cfg_of(const unet *u);
 size_t unet_nparams(const unet *u);
 size_t unet_gfilm_off(const unet *u);
 /* cfg.gfilm under --split: fn(ctx, dg, K) sums the device vector dg (K floats) across the cards, in the attention stage's backward before
-   the tokens read it. dg there holds the share of the decoder levels < top (split: each card's half); the levels >= top (unet_set_split_top:
-   the whole window on every card) are added once after the sum, and with dedup (one card, e.g. side 1) their A / B gradients are zeroed
-   there (the other card's count). top 0: every level split */
+   the tokens read it (UFSM_GFILM_TOKGRAD=1 only; without the hook that path aborts under split). dg there holds the split levels' share
+   (each card's half); the whole levels (>= unet_set_split_top's top) are added once after the sum, and side 1 zeroes their A / B
+   gradients by itself (split audit 2026-11-14 #1: before, nothing installed this hook and the whole levels' A / B counted twice).
+   top / dedup: unused (kept for the callers) */
 void unet_set_gfilm_reduce(unet *u, void (*fn)(void *ctx, float *dg, int K), void *ctx, int top, int dedup);
 void unet_head_offsets(const unet *u, size_t *w, size_t *b);   /* the 1^3 head's weights (cout x its input channels) and biases (cout) in the flat parameters */
 const float *unet_live_params(const unet *u);   /* device weights the optimiser trains (p) */

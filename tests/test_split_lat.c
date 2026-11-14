@@ -9,7 +9,8 @@
      rounding, chunked, lean 2, shared encoder a1); reference: the
      single-GPU difference between two rounding seeds.
    Symmetries: identity, z flip, z <-> y (the radial vector of a permuted z reads the record's global axis centres).
-   With one GPU both halves run on it (UFSM_SPLIT_ONE_GPU=1 forces it). env: UFSM_P (128 voxels), UFSM_ONLY=case. */
+   With one GPU both halves run on it (UFSM_SPLIT_ONE_GPU=1 forces it). env: UFSM_P (128 voxels), UFSM_ONLY=case.
+   UFSM_TEST_GFILM=1: net 1 with cfg.gfilm, its A / B gradient block compared on its own (the whole levels' A / B once). */
 #include "split.h"
 #include "unet.h"
 #include <math.h>
@@ -19,7 +20,7 @@
 
 static int P, Pc, Dl, H0, TOP, LC = 29, DEV[2] = {0, 1};   /* P voxels (Pc = P / 4 cells); Dl, H0: this side's cells, the halo cells */
 static _Float16 *hct; static uint8_t *hrec; static _Float16 *hg; static float hbas[29 * 64], hgain[29];
-static int g_gnema; static unsigned g_skips;
+static int g_gnema, g_gfilm; static unsigned g_skips;
 static size_t RB;   /* record bytes (global depth P) */
 
 typedef struct { unet *u; void *ct, *rec, *gl; } side_t;
@@ -142,7 +143,7 @@ static int run(unet_cfg cfg, int top, int Pv, split_ctx *ctx) {
         for (int z = 0; z < Pc; z++) for (int y = 0; y < Pc; y++) for (int x = 0; x < Pc; x++)
             hg[(((size_t)c * Pc + z) * Pc + y) * Pc + x] = (_Float16)(sin(k[0] * z + k[1] * y + k[2] * x + ph) + 0.2 * (2 * ru() - 1));
     }
-    size_t np; { unet *pr = unet_create(&cfg); np = unet_nparams(pr); unet_free(pr); }
+    size_t np, gfo = 0; { unet *pr = unet_create(&cfg); np = unet_nparams(pr); if (cfg.gfilm) gfo = unet_gfilm_off(pr); unet_free(pr); }
     float *g0 = malloc(np * 4), *g1 = malloc(np * 4), *g2 = malloc(np * 4);
     const size_t nl = (size_t)cfg.cout * c3; float *l0 = malloc(nl * 4), *l1 = malloc(nl * 4), *l2 = malloc(nl * 4);
     const size_t hn = (size_t)cfg.cout * 2 * Pc * Pc; _Float16 *h0a = malloc(hn * 2), *h0b = malloc(hn * 2), *h1a = malloc(hn * 2), *h1b = malloc(hn * 2), *h2a = malloc(hn * 2), *h2b = malloc(hn * 2);
@@ -164,7 +165,7 @@ static int run(unet_cfg cfg, int top, int Pv, split_ctx *ctx) {
                unet_set_grad_mx4(mode == 2); unet_set_share_enc_a1(1); unet_set_recompute(1); }   /* (MX-fp4 gradients need SR: the rn mode keeps MX-fp8 ones) */
         unet_set_input_mx(1); unet_set_input_prec(mode ? 4 : 0); nn_set_gn_stored(mode);   /* (the lat recipe's precision.txt: input_prec 4, gn_stored 1) */
         int ok0, ok1, ok2; single(&cfg, 1, g0, l0, h0a, h0b, &ok0); split2(ctx, &cfg, 1, g1, l1, h1a, h1b, &ok1, np);
-        const double dl = rel(l1, l0, nl), dg = rel(g1, g0, np);
+        const double dl = rel(l1, l0, nl), dg = rel(g1, g0, np), dgf = gfo ? rel(g1 + gfo, g0 + gfo, np - gfo) : 0;   /* (gfo: the gfilm A / B block alone) */
         double dh = -1;   /* the halo cells next to the cut after the exchange, against the single run's (the streamed head, fp16) */
         if (ok0 && ok1) { size_t nd = 0; for (size_t k = 0; k < hn; k++) nd += memcmp(&h0a[k], &h1a[k], 2) != 0 || memcmp(&h0b[k], &h1b[k], 2) != 0; dh = (double)nd / (2.0 * hn); }
         double rl, rg; const char *what;
@@ -174,6 +175,11 @@ static int run(unet_cfg cfg, int top, int Pv, split_ctx *ctx) {
             single(&cfg, 1, g2, l2, h2a, h2b, &ok2); memcpy(hct, keep, p3 * 2); free(keep); what = "perturbed";
         } else { single(&cfg, 2, g2, l2, h2a, h2b, &ok2); what = "seeds"; }
         rl = rel(l2, l0, nl); rg = rel(g2, g0, np);
+        const double rgf = gfo ? rel(g2 + gfo, g0 + gfo, np - gfo) : 0;
+        /* the gfilm block on its own: counted twice on the whole levels (split audit 2026-11-14 #1) it reads ~0.3-1 rel, far above either floor */
+        const int okf = !gfo || (mode < 2 ? dgf < 2 * rgf + 1e-3 : dgf < 1.5 * rgf + 1e-3);
+        if (gfo) printf("    gfilm A / B block (%zu params): grad rel %.2e (%s %.2e)  %s\n", np - gfo, dgf, mode < 2 ? "perturbed" : "seeds", rgf, okf ? "ok" : "FAIL");
+        fails += !okf;
         const int ok = mode < 2 ? dl < 2 * rl + 1e-4 && dg < 2 * rg + 1e-3 : dl < 1.5 * rl + 1e-3 && dg < 1.5 * rg + 1e-3;
         const int okh = dh == 0.0 || (dh < 0 && mode);   /* (bit-identical; not covered only where the streamed head is not: fp4 modes may lack it) */
         printf("  %d %s %-8s: owned logits rel %.2e (%s %.2e), cut halo cells %s, grad rel %.2e (%s %.2e)  %s\n", ci, mode == 2 ? "fp4 sr lean 2" : mode ? "fp4 rn lean 2" : "MX-fp8 rn    ",
@@ -191,6 +197,7 @@ int main(void) {
     if (ufsm_env_on("UFSM_SPLIT_ONE_GPU") || nn_init(1)) { DEV[1] = 0; nn_init(0); nn_check(); }
     nn_set_f16(1); nn_set_grad_scale(1024.f); nn_set_loss_grad_h16(1);
     g_gnema = ufsm_env_on("UFSM_TEST_GN_EMA");
+    g_gfilm = ufsm_env_on("UFSM_TEST_GFILM");   /* net 1 with cfg.gfilm (zero-initialised A / B: their gradients are not zero) */
     setenv("UFSM_F4_WGRAD", "1", 0);
     split_ctx *ctx = split_create(DEV[0], DEV[1]);
     int fails = 0;
@@ -202,7 +209,7 @@ int main(void) {
         fails += run(cfg, 0, getenv("UFSM_P") ? atoi(getenv("UFSM_P")) : 128, ctx);
     }
     if (!only || atoi(only) == 1) {   /* the scratch2 shape in small: 6 levels, attention on the bottleneck, levels 3.. whole */
-        unet_cfg cfg = {6, {32, 32, 64, 64, 96, 96}, LC + 3, 16, 8, 1}; cfg.half_res = 3; cfg.attn_blocks = 1; cfg.gn_ema = g_gnema;
+        unet_cfg cfg = {6, {32, 32, 64, 64, 96, 96}, LC + 3, 16, 8, 1}; cfg.half_res = 3; cfg.attn_blocks = 1; cfg.gn_ema = g_gnema; cfg.gfilm = g_gfilm;
         ci = 9; fails += run(cfg, 3, getenv("UFSM_P6") ? atoi(getenv("UFSM_P6")) : 256, ctx);
     }
     split_free(ctx);

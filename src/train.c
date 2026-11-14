@@ -1852,6 +1852,15 @@ static int echo_busy(void *p) {
     for (int i = 0; i < e->n; i++) if (nn_event_done(e->ev[i])) { if (e->t_open <= 0) e->t_open = now(); return 0; }
     return e->n > 0;
 }
+/* --gfilm under --split (UFSM_GFILM_TOKGRAD=1 only): the split levels' dg shares (K device floats) summed over both halves, through the
+   f64 split sum (a collective: both sides call it once per backward) */
+static void gf_dg_reduce(void *ctx, float *dg, int K) {
+    (void)ctx; float *hf = malloc((size_t)K * 4); double *hd = malloc((size_t)K * 8); void *dd = nn_malloc((size_t)K * 8);
+    nn_d2h(hf, dg, (size_t)K * 4); for (int i = 0; i < K; i++) hd[i] = hf[i];
+    nn_h2d(dd, hd, (size_t)K * 8); split_sum(dd, K, 1, nullptr); nn_sync(); nn_d2h(hd, dd, (size_t)K * 8);
+    for (int i = 0; i < K; i++) hf[i] = (float)hd[i];
+    nn_h2d(dg, hf, (size_t)K * 4); nn_free(dd); free(hf); free(hd);
+}
 static double g_echo_idle;   /* --echo-max: seconds a GPU waited for the next batch (from its step's end to the batch's handover), the "idle" share */
 static void gstep_job(void *p) { gstep_arg *a = p; gstep_fwd(a); if (!a->rc) gstep_bwd(a); nn_tls_capture(&a->out); }
 /* the per-GPU host threads (persistent: thread-local device scratch lives as long as they do), started on first use */
@@ -3801,7 +3810,8 @@ int cmd_train(int argc, char **argv) {
             } else nn_d2d(d->teacher, unet_live_params(d->u), np * 4);
         }
         if (split) { unet_set_split(d->u, g, g_lsplit ? g_h0 / 4 : g_h0, split_halo);   /* (--lat: the trunk's halo in cells) */ if (!getenv("UFSM_SPLIT_SYNC")) unet_set_split_async(d->u, split_halo_begin, split_halo_end);
-                    if (g_split_top) unet_set_split_top(d->u, g_split_top, split_gather); }
+                    if (g_split_top) unet_set_split_top(d->u, g_split_top, split_gather);
+                    if (cfg.gfilm) unet_set_gfilm_reduce(d->u, gf_dg_reduce, nullptr, 0, 0); }
         const char *e = nn_check(); if (e) { fprintf(stderr, "GPU %d: %s\n", d->dev, e); return 1; }
     }
     int lean = getenv("UFSM_LEAN") ? atoi(getenv("UFSM_LEAN")) : 0;   /* lean: one device batch buffer (no upload overlap), the logit
