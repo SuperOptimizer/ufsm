@@ -50,6 +50,7 @@ z3 *z3_open_derived_pool2(z3 *base, int fill, z3_derive_fn derive, void *ctx, vo
    derive ctx when it is the same). 0 or -1 */
 int z3_derived_extent(z3 *z, int (*fn)(void *ctx, const int64_t grid[3], const int chunk[3], uint8_t *bits), void *ctx);
 const z3_meta *z3_meta_of(const z3 *z);
+uint64_t z3_id(const z3 *z);   /* process-unique per open (never reused, unlike the address): cache keys */
 const char *z3_key(const z3 *z);
 const char *z3_root(const z3 *z);   /* the store root of z (a derived array: its base's), "" if none */
 

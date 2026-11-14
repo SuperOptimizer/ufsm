@@ -78,6 +78,20 @@ int main(void) {
         z3_close(DA[1]); DA[1] = nullptr;
         printf("zcache: %-90s %s\n", "both closed: the pool empty", dcache_pool_bytes(P, nullptr) == 0 ? "ok" : "FAIL"); fails += dcache_pool_bytes(P, nullptr) != 0;
     }
+    {   /* an array closed without zcache_drop, then another opened (often at the same address): its reads are its own (keys are
+           z3_id, not the address; data audit lower 11-14) */
+        char brr[512]; snprintf(brr, sizeof brr, "%s/b.zarr", dir); const int64_t bs[3] = {128, 128, 128};
+        z3w *wb = z3w_create(brr, bs, 128, 0, 0, nullptr); uint8_t *bb = malloc(128 * 128 * 128); memset(bb, 7, 128 * 128 * 128);
+        int ok = wb && !z3w_write_shard(wb, 0, 0, 0, bb, 1); if (wb) z3w_close(wb);
+        const int64_t o[3] = {10, 10, 10}, n[3] = {20, 20, 20}; uint8_t ra[8000], rb[8000];
+        for (int t = 0; ok && t < 4; t++) {
+            z3 *A2 = z3_open(st, "a.zarr", nullptr); ok &= A2 && !zcache_read(C, A2, o, n, ra); z3_close(A2);
+            z3 *B = z3_open(st, "b.zarr", nullptr); ok &= B && !zcache_read(C, B, o, n, rb); z3_close(B);
+            for (int k = 0; ok && k < 8000; k++) ok &= rb[k] == 7;
+        }
+        free(bb);
+        printf("zcache: %-90s %s\n", "a reopened array never reads a closed one's chunks", ok ? "ok" : "FAIL"); fails += !ok;
+    }
     zcache_close(C); z3_close(Z);
     char cmd[600]; snprintf(cmd, sizeof cmd, "rm -rf -- '%s'", dir); if (system(cmd)) {}
     return fails != 0;

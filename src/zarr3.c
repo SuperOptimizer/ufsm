@@ -44,6 +44,7 @@ static int fail(const char *fmt, ...) {
 static int option_on(const char *name) { const char *v = getenv(name); return !v || (*v && strcmp(v, "0")); }
 
 typedef struct { uint64_t off, len; } ientry_t;
+static uint64_t z3_next_id(void) { static atomic_uint_fast64_t next_id = 1; return atomic_fetch_add(&next_id, 1); }   /* (every z3, derived ones too: zcache keys) */
 struct z3 {
     store *s;
     char *key;
@@ -118,7 +119,7 @@ static z3 *z3_open_impl(store *s, const char *key, const char *cache_dir, int ty
     z3 *z = calloc(1, sizeof *z);
     z->s = s;
     z->key = strdup(key);
-    { static atomic_uint_fast64_t next_id = 1; z->id = atomic_fetch_add(&next_id, 1); }
+    z->id = z3_next_id();
     z->cache = store_cache_dir(s, cache_dir);   /* (per root: a cache directory is never shared by two roots) */
     pthread_mutex_init(&z->imu, nullptr);
     z3_meta *m = &z->m;
@@ -180,6 +181,7 @@ z3 *z3_open_typed(store *s, const char *key, const char *cache_dir) { return z3_
 z3 *z3_open_derived(z3 *base, int fill, z3_derive_fn derive, void *ctx, void (*ctx_free)(void *)) {
     if (!base || !derive) return nullptr;
     z3 *z = calloc(1, sizeof *z); if (!z) return nullptr;
+    z->id = z3_next_id();
     z->m = base->m; z->m.fill = fill; z->m.label_binary = 0; z->nc = base->nc; memcpy(z->cgrid, base->cgrid, sizeof z->cgrid);
     char k[1200]; snprintf(k, sizeof k, "%s#derived", base->key ? base->key : "");
     z->key = strdup(k); z->base = base; z->derive = derive; z->dctx = ctx; z->dfree = ctx_free;
@@ -245,6 +247,7 @@ void z3_close(z3 *z) {
 }
 
 const z3_meta *z3_meta_of(const z3 *z) { return &z->m; }
+uint64_t z3_id(const z3 *z) { return z ? z->id : 0; }
 const void *z3_latvol(const z3 *z) { return z && !z->derive ? z->lv : nullptr; }
 const char *z3_key(const z3 *z) { return z->key; }
 const char *z3_root(const z3 *z) { while (z && !z->s && z3_base_of(z)) z = z3_base_of(z); return z && z->s ? store_root(z->s) : ""; }
