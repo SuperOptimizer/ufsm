@@ -2550,7 +2550,8 @@ int cmd_train(int argc, char **argv) {
        "  opt step S: upd/w L0 .. deep .. attn .. head .. adamw .."; 0 = off). One extra read of the weights on those steps. */
     const int opt_stats = atoi(opt(argc, argv, "--opt-stats", "-1")) < 0 ? log_every : atoi(opt(argc, argv, "--opt-stats", "-1")); int ost_pending = 0, ost_armed = 0;
     int val_every = atoi(opt(argc, argv, "--val-every", "500")), ckpt_every = atoi(opt(argc, argv, "--ckpt-every", "1000"));
-    const int val_live = atoi(opt(argc, argv, "--val-live", "0"));   /* validate the live weights instead of the EMA (e.g. resume a last.ckpt for one lr-0 step) */
+    const int val_live = atoi(opt(argc, argv, "--val-live", "0"));
+    const int val_gn_live = atoi(opt(argc, argv, "--val-gn-live", "0"));   /* --gn-ema nets: validate on each window's own GroupNorm statistics instead of the running ones (audit 11-14 infer #2 A/B) */   /* validate the live weights instead of the EMA (e.g. resume a last.ckpt for one lr-0 step) */
     g_valP = atoi(opt(argc, argv, "--val-P", "0"));   /* (checked once the window and the task are known) */
     const int l0_recal = atoi(opt(argc, argv, "--l0-recal", "4"));   /* --l0-norm ema: windows recalibrating the EMA weights' level-0 statistics before each validation */
     uint64_t seed = (uint64_t)atoll(opt(argc, argv, "--seed", "0")); g_seed = seed;
@@ -5004,7 +5005,7 @@ int cmd_train(int argc, char **argv) {
             if (step % val_every == 0 || step == steps || g_stop) {
                 g_ptrunc_on = 0;   /* (validation: the plain phase loss) */
                 const int nv = split ? 2 : 1;   /* split: validation windows are split too */
-                for (int g = 0; g < nv; g++) { nn_init(G[g].dev); unet_use_ema(G[g].u, !val_live); }   /* (--val-live 1: the live weights) */
+                for (int g = 0; g < nv; g++) { nn_init(G[g].dev); unet_use_ema(G[g].u, !val_live); if (val_gn_live) unet_gn_ema_live(G[g].u, 1); }   /* (--val-live 1: the live weights) */
                 {   /* validation on the buffer not holding the prefetched batch (its upload has completed: ev_up synced above) */
                     int keep = G[0].cur;
                     for (int g = 0; g < nv; g++) { if (G[g].lean) { nn_init(G[g].dev); nn_event_sync(G[g].ev_up[keep]); nn_event_sync(G[g].ev_lab[keep]); } select_buf(&G[g], keep ^ 1); }   /* lean: one buffer, the prefetch must have landed */
@@ -5092,7 +5093,7 @@ int cmd_train(int argc, char **argv) {
                     }
                     if (split && G[0].lean && G[0].pending) split_upload(sctx, G, 2, G[0].pending, 0, 0, B, P);   /* (split: both halves in one job) */
                 }
-                for (int g = 0; g < nv; g++) { nn_init(G[g].dev); unet_use_ema(G[g].u, 0); }
+                for (int g = 0; g < nv; g++) { nn_init(G[g].dev); unet_use_ema(G[g].u, 0); unet_gn_ema_live(G[g].u, 0); }
                 nn_init(G[0].dev);
                 if (nval) { vl /= nval; vb /= nval; vd /= nval; }
                 if (g_unwrap2 && nval) fprintf(stderr, "val unwrap2: phase bce %.5f normal bce %.5f wind4 bce %.5f (worst gauge %.5f) turn acc %.4f over %.0f voxels\n",
