@@ -464,7 +464,10 @@ __device__ __forceinline__ unsigned amax_u(unsigned a, float v) { return max(a, 
 __device__ __forceinline__ float amax_xs(float a, float v) { float r; asm("max.NaN.xorsign.abs.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(v)); return r; }
 __device__ __forceinline__ int mx_exp(float amax, float inv_qmax) {
     unsigned u = __float_as_uint(amax * inv_qmax);
-    if ((u & 0x7fffffffu) > 0x7f800000u) return 128;   /* NaN amax: scale byte 0xFF (decoded as inf) so the non-finite value survives storage */
+    if ((u & 0x7fffffffu) >= 0x7f800000u) return 128;   /* NaN or inf amax (or amax * inv_qmax overflowing): scale byte 0xFF (decoded as inf)
+                                                            so the non-finite value survives storage. inf used to fall through to e 128,
+                                                            clamped to 126: the inf element saturated to 6 * 2^126, a finite value that
+                                                            hid the overflow until a later GN sum overflowed (audit 2026-11-14 kernels.md #3) */
     int e = (int)((u >> 23) & 0xff) - 127 + ((u & 0x7fffff) != 0);
     return max(-126, min(126, e));
 }
