@@ -17,7 +17,7 @@ The user asked for the full swap, not a staged one. On this branch:
 - `scripts/pod/setup.sh` installs mcc before the build and then fills mcudahw's JIT cache on all CPUs (`MCUDA_PRECOMPILE`), so
   the first training step does not compile 310 MB of PTX. Without /usr/bin/cc it uses the newest clang (`MCC_CC`).
 - `-g` emits DWARF 5 line tables and CFI (microc dwarf-20261114), so gdb, perf and `run_suite.sh -c` work as with clang.
-- The pin is ae30511 (microc branch mcc-int-20261114: x64simd + dwarf + vec-20261114). vec-20261114 adds:
+- The pin is 321211e (microc branch mcc-int-20261114: x64simd + dwarf + vec-20261114 + dwarf2: locals, types, inlined calls in gdb). vec-20261114 adds:
   - x86-64 v128 lowering, with opt_vec on: SSE2 everywhere, SSE4.1 under -march=native;
   - lane max/min from selects;
   - u8 / u16 / i32 / f32 loops widened to 4-byte lanes;
