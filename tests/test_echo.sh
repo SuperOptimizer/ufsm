@@ -27,8 +27,9 @@ echo "  starved: $(grep '^step' starve.log | grep -c ' echo ') lines with an ech
 GPUS=0,0 P_=128 ENV=UFSM_SAMPLER_DELAY_MS=250 run split --workers 1 --steps 20 --echo-max 3 --split z
 [ "$(grep -c '^step' split.log)" = 10 ] || fail "split: not 10 step lines ($D/split.log)"
 ! grep '^step' split.log | grep -qiE 'nan|inf ' || fail "split: non-finite losses ($D/split.log)"
-grep '^step' split.log | grep -q ' echo [1-9][0-9]*% (GPU idle for data [0-9]*%)' || fail "split: no echo / GPU-idle share ($D/split.log)"
-echo "  --split z: $(grep '^step' split.log | tail -1 | grep -o 'echo [0-9]*% (GPU idle for data [0-9]*%)')"
+grep '^step' split.log | grep -q ' echo [1-9][0-9]*% (GPU idle for data [0-9]*%; fresh [0-9.]* samp/s)' || fail "split: no echo / GPU-idle share ($D/split.log)"
+echo "  --split z: $(grep '^step' split.log | tail -1 | grep -o 'echo [0-9]*% (GPU idle for data [0-9]*%; fresh [0-9.]* samp/s)')"
+grep '^step' split.log | grep -q '(wait [0-9]*%, gate [0-9]*%)' || fail "split: no wait / gate split on the step line ($D/split.log)"
 run det0 --workers 2 --steps 8 --det 1
 run det1 --workers 2 --steps 8 --det 1 --echo-max 3
 grep -q "echo-max off under --det 1" det1.log || fail "--det 1 did not switch echo off ($D/det1.log)"

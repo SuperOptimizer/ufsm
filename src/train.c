@@ -2657,13 +2657,15 @@ static void trainstate_extra(char *dst, size_t n, int accum, int anchor, long up
 }
 /* a CSV log's header gains columns (ADD appended) unless it already holds COL: a resumed run appends rows with more fields than its old
    header named. The file is rewritten through a temporary next to it (log.csv is small) */
-static void csv_extend_header(const char *path, const char *col, const char *add) {
+static void csv_extend_header(const char *path, const char *full) {   /* FULL: the current header; an older one that is a proper prefix of it is extended */
     FILE *f = fopen(path, "r"); if (!f) return;
-    char h[4096]; if (!fgets(h, sizeof h, f) || strstr(h, col) || !strchr(h, '\n')) { fclose(f); return; }
+    char h[4096]; if (!fgets(h, sizeof h, f) || !strchr(h, '\n')) { fclose(f); return; }
+    h[strcspn(h, "\n")] = 0; const size_t n = strlen(h);
+    if (n >= strlen(full) || strncmp(full, h, n) || full[n] != ',') { fclose(f); return; }
     char tmp[1600]; snprintf(tmp, sizeof tmp, "%s.hdr", path);
     FILE *o = fopen(tmp, "w"); if (!o) { fclose(f); return; }
-    h[strcspn(h, "\n")] = 0; fprintf(o, "%s%s\n", h, add);
-    char buf[1 << 16]; size_t n; while ((n = fread(buf, 1, sizeof buf, f))) fwrite(buf, 1, n, o);
+    fprintf(o, "%s\n", full);
+    char buf[1 << 16]; size_t k; while ((k = fread(buf, 1, sizeof buf, f))) fwrite(buf, 1, k, o);
     fclose(f); if (fclose(o) == 0) rename(tmp, path); else remove(tmp);
 }
 
@@ -4268,13 +4270,14 @@ int cmd_train(int argc, char **argv) {
                     const size_t uws = g_unwrap && g_head_slab ? (size_t)g_hs_z * P * P * (2 * g_cout + 11) + (size_t)(3 * (g_rv != 0) + 2 * (g_ink2 || (g_fibn && !g_rv))) * g_hs_z * P * P : 0;
                     const size_t latb = g_lat ? (xin_sep ? 0 : xinb) + (g_tm_unused ? 0 : batb) : 0;
                     const size_t lath = g_lat && g_lat_hs ? ((size_t)LNC * (LGFC < LNC ? 6 : 4) + (size_t)LGFC * 4) * (size_t)(g_hs_z / 4 + 2) * (P / 4) * (P / 4) + (g_lat_fuse ? nn_lat_fuse_part(7, P / 4, P / 4, g_hs_z) : 0) : 0;
+                    const double listed = (double)uwp + uws + aug + latb + lath + (g_mil ? mil_bytes() : 0), task = (double)need - grec - tb - tb / 14 - trainer - ((size_t)550 << 20);
                     fprintf(stderr, "memory plan parts (mode %d, %.0f Mvox): label planes %.2f GB (%.1f B/vox; uint8 codes: phase / side, w4, comp, ink, %d aux) + head slabs %.2f + gpu-aug staging %.2f (%.1f B/vox, uint8 CT / labels)"
-                            " + lat batch %.2f (input %s, targets / mask %s) + lat head slab %.2f; the label stream %s; +1/14 margin\n",
+                            " + lat batch %.2f (input %s, targets / mask %s) + lat head slab %.2f; the label stream %s; +1/14 margin; task %.2f GB = these %.2f + other %.2f (the planner's other task terms, unlisted)\n",
                             c, v / 1e6, uwp / 1e9, (double)uwp / v, g_naux, uws / 1e9, aug / 1e9, (double)aug / v, latb / 1e9, xin_sep ? "separate" : "in gout[0]", g_tm_unused ? "unused" : "on device", lath / 1e9,
-                            g_lat && g_head_slab && B == 1 && (g_xs == 1 || g_gpu_want) && xbytes() == 2 && g_side ? "replaces the label planes by 2 slab sets" : "off");
+                            g_lat && g_head_slab && B == 1 && (g_xs == 1 || g_gpu_want) && xbytes() == 2 && g_side ? "replaces the label planes by 2 slab sets" : "off", task / 1e9, listed / 1e9, (task - listed) / 1e9);
                 }
                 if (ufsm_env_on("UFSM_MEM_REPORT"))   /* the planner's terms of this mode */
-                    fprintf(stderr, "memory plan: mode %d (%s%s): network %.2f + workspace %.2f + gy records %.2f + trainer %.2f + task %.2f + fixed %.2f = %.2f GB\n", c, cand[c].what,
+                    fprintf(stderr, "memory plan: mode %d (%s%s): network %.2f + workspace %.2f + gy records %.2f + trainer %.2f + task %.2f (the rest of the need: UFSM_MEM_REPORT=2 splits it) + fixed %.2f = %.2f GB\n", c, cand[c].what,
                             pass ? "" : ", no host offloads", tb / 1e9, tb / 14 / 1e9, grec / 1e9, trainer / 1e9, (need - grec - tb - tb / 14 - trainer - ((size_t)550 << 20)) / 1e9, (double)((size_t)550 << 20) / 1e9, need / 1e9);
                 if (need < min_need) { min_need = need; minc = c; min_hoff = pass; }   /* (no fit: the smallest mode evaluated) */
                 if (need <= fmin) { pick = c; pick_hoff = pass; pick_off = unet_last_offload_bytes(); pick_need = need; }
@@ -4913,7 +4916,7 @@ int cmd_train(int argc, char **argv) {
     sampler *sp = sampler_start(S, &sc); g_vs_sp = sp;
     if (!sp) return 1;
     char logp[1400]; snprintf(logp, sizeof logp, "%s/log.csv", out);
-    if (step0) csv_extend_header(logp, ",gns,", ",gns,gns_g2,gns_s");   /* (a resumed run's older log.csv: the header gains the new columns) */
+    if (step0) csv_extend_header(logp, "step,lr,loss,bce,dice,active,gnorm,val_loss,val_bce,val_dice,samples_per_s,wait_s,gns,gns_g2,gns_s,gate_s");   /* (a resumed run's older log.csv: the header gains the new columns) */
     FILE *log = fopen(logp, step0 ? "a" : "w");
     FILE *sheet_log=nullptr;
     if (g_sheet) {
@@ -4922,11 +4925,11 @@ int cmd_train(int argc, char **argv) {
     }
     if (log) {
         fseek(log, 0, SEEK_END);
-        if (ftell(log) == 0) fprintf(log, "step,lr,loss,bce,dice,active,gnorm,val_loss,val_bce,val_dice,samples_per_s,wait_s,gns,gns_g2,gns_s\n");
+        if (ftell(log) == 0) fprintf(log, "step,lr,loss,bce,dice,active,gnorm,val_loss,val_bce,val_dice,samples_per_s,wait_s,gns,gns_g2,gns_s,gate_s\n");
     }
     signal(SIGINT, on_sig); signal(SIGTERM, on_sig);
     int prof = ufsm_env_on("UFSM_PROF");
-    double t0 = now(), tlog = t0, wait = 0, acc_loss = 0, acc_bce = 0, acc_dice = 0, acc_g = 0; int nacc = 0;
+    double t0 = now(), tlog = t0, wait = 0, gate = 0, acc_active = 0, acc_loss = 0, acc_bce = 0, acc_dice = 0, acc_g = 0; int nacc = 0;
     if (seconds) fprintf(stderr, "training budget %.1fs, time-based warmup %.1fs\n", seconds, warmup_seconds);
     if (schedule_seconds) fprintf(stderr,"wall-time LR horizon %.1fs, elapsed %.1fs, warmup %.1fs; finite cover/ramp origin preserved\n",schedule_seconds,schedule_elapsed,warmup_seconds);
     int committed_step = step0, training_failed = 0;
@@ -4991,7 +4994,7 @@ int cmd_train(int argc, char **argv) {
             G[0].pending = nullptr;
             if (step < steps && !g_stop) {
                 echo_gate eg = {{G[0].ev_done[G[0].cur], G[1].ev_done[G[1].cur]}, 2, 0};
-                eg.t_open = 0; double tw = now(); batch *nb = sampler_next_gate(sp, echo_busy, &eg); wait += now() - tw; if (eg.t_open > 0) g_echo_idle += now() - eg.t_open;
+                eg.t_open = 0; double tw = now(); batch *nb = sampler_next_gate(sp, echo_busy, &eg); { const double tn = now(), idl = eg.t_open > 0 ? tn - eg.t_open : 0; wait += idl; gate += tn - tw - idl; g_echo_idle += idl; }   /* (logs: wait = the GPU idle for data; gate = the probe while the GPU still ran) */
                 if (!nb) { fprintf(stderr, "sampler stopped before final step\n"); training_failed = 1; break; }
                 split_upload(sctx, G, 0, nb, G[0].cur ^ 1, G[1].cur ^ 1, B, P);
                 for (int g = 0; g < 2; g++) { nn_init(G[g].dev); select_buf(&G[g], G[g].cur ^ 1); }
@@ -5094,7 +5097,7 @@ int cmd_train(int argc, char **argv) {
         for (int g = 0; g < ng && !g_stop && !training_failed; g++) {
             if (!want_next[g]) continue;
             gpu_state *d = &G[g]; nn_init(d->dev);
-            eg.t_open = 0; double tw = now(); batch *nb = sampler_next_gate(sp, echo_busy, &eg); wait += now() - tw; if (eg.t_open > 0) g_echo_idle += now() - eg.t_open;
+            eg.t_open = 0; double tw = now(); batch *nb = sampler_next_gate(sp, echo_busy, &eg); { const double tn = now(), idl = eg.t_open > 0 ? tn - eg.t_open : 0; wait += idl; gate += tn - tw - idl; g_echo_idle += idl; }   /* (logs: wait = the GPU idle for data; gate = the probe while the GPU still ran) */
             if (!nb) { fprintf(stderr, "sampler stopped before final step\n"); training_failed = 1; break; }
             int nxt = d->cur ^ 1; upload_async(d, nb, nxt, B, P); d->pending = nb; select_buf(d, nxt);
         }
@@ -5253,7 +5256,8 @@ int cmd_train(int argc, char **argv) {
             gn_ema_average(G, ng); nn_init(G[0].dev);
         }
         const int step_ok = nskip == nskip_seen; nskip_seen = nskip; nacc++; if (!step_ok) nskl += 1;   /* a skipped (non-finite) step: no loss / label means (try3 step 504: its nan entered rv / normal / ink) */
-        if (step_ok) { acc_loss += loss / nl; acc_bce += parts[0][0]; acc_dice += parts[0][g_aff || g_unwrap || g_heads || g_fibdir > 0 ? NCH : g_half ? g_cout : cfg.cout]; acc_g += gn;
+        if (step_ok) { acc_loss += loss / nl; acc_g += gn; acc_active += active / nl;   /* (loss, bce, dice, active: the mean over the step's nl windows, all GPUs) */
+        for (int g = 0; g < nl; g++) { acc_bce += parts[g][0] / nl; acc_dice += parts[g][g_aff || g_unwrap || g_heads || g_fibdir > 0 ? NCH : g_half ? g_cout : cfg.cout] / nl; }
         if (g_verso_on) { acc_vbce += G[0].vout[0]; acc_vdice += G[0].vout[1]; }
         if (g_side && G[0].side_loss > 0) { acc_side += G[0].sout[0]; acc_siden += 1; }
         if (g_rv == 2) acc_rv += G[0].rvout[0]; }
@@ -5326,7 +5330,7 @@ int cmd_train(int argc, char **argv) {
             }
         }
         if (step_ok) {
-        if (g_unwrap) { acc_ink += G[0].iout[0]; acc_norm += G[0].norm_raw; acc_normn += G[0].norm_loss > 0; }
+        if (g_unwrap) { acc_ink += G[0].iout[0]; if (G[0].norm_raw > 0) { acc_norm += G[0].norm_raw; acc_normn += 1; } }   /* (labels present: the unweighted loss, also under --norm-lambda 0) */
         if (g_mil && G[0].mil_n) { acc_mil += G[0].mil_raw; acc_miln += 1; acc_milr += G[0].mil_n; }
         if (g_fibh && (G[0].fhout[0][2] > 0 || G[0].fhout[1][2] > 0)) { acc_fh[0] += G[0].fib_raw[0]; acc_fh[1] += G[0].fib_raw[1]; acc_fhn += 1; }
         if (g_fibdir > 0) acc_norm += G[0].norm_raw;
@@ -5556,7 +5560,7 @@ int cmd_train(int argc, char **argv) {
             }
             if (sp) {   /* --echo-max: the share of the batches since the last line that were echoes (fresh counts only in echo mode) */
                 static uint64_t f0, e0; uint64_t f1, e1; sampler_echo_stats(sp, &f1, &e1);
-                if (f1 + e1 > f0 + e0) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " echo %.0f%% (GPU idle for data %.0f%%)", 100.0 * (double)(e1 - e0) / (double)(f1 + e1 - f0 - e0), 100.0 * g_echo_idle / dt); }
+                if (f1 + e1 > f0 + e0) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " echo %.0f%% (GPU idle for data %.0f%%; fresh %.2f samp/s)", 100.0 * (double)(e1 - e0) / (double)(f1 + e1 - f0 - e0), 100.0 * g_echo_idle / dt, (double)(f1 - f0) / dt); }   /* (fresh: new windows only; samp/s counts every window trained) */
                 g_echo_idle = 0;   /* (the trainer's "wait" also counts the probe's time while the GPUs still run the step: idle is what they lost) */
                 f0 = f1; e0 = e1;
             }
@@ -5580,8 +5584,8 @@ int cmd_train(int argc, char **argv) {
             char gcsv[96] = ",,";   /* --gns: B_noise in windows, EMA |G|^2 and S (empty before the first pair) */
             if (gns_on && gns.n) {
                 const double bn = gns_bnoise(&gns); size_t na = strlen(affs);
-                if (isfinite(bn)) snprintf(affs + na, sizeof affs - na, " gns %.0f W (|G|^2 %.3g, S %.3g)", bn, gns_g2(&gns), gns_s(&gns));
-                else snprintf(affs + na, sizeof affs - na, " gns - (|G|^2 %.3g <= 0, S %.3g)", gns_g2(&gns), gns_s(&gns));
+                if (isfinite(bn)) snprintf(affs + na, sizeof affs - na, " gns %.0f W (EMA; |G|^2 %.3g, S %.3g)", bn, gns_g2(&gns), gns_s(&gns));
+                else snprintf(affs + na, sizeof affs - na, " gns - (EMA; |G|^2 %.3g <= 0, S %.3g)", gns_g2(&gns), gns_s(&gns));
                 char bs[32] = ""; if (isfinite(bn)) snprintf(bs, sizeof bs, "%.6g", bn);
                 snprintf(gcsv, sizeof gcsv, "%s,%.6g,%.6g", bs, gns_g2(&gns), gns_s(&gns));
             }
@@ -5592,8 +5596,11 @@ int cmd_train(int argc, char **argv) {
                 for (int i = 1; i < nb; i++) for (int j = i; j > 0 && bs[j] < bs[j - 1]; j--) { const double t = bs[j]; bs[j] = bs[j - 1]; bs[j - 1] = t; }
                 fprintf(stderr, "  gns groups (B_noise in windows; '<0' = |G|^2 not resolved yet): median over the conv / attention groups %.0f, max %.0f |%s\n", nb ? bs[nb / 2] : -1.0, nb ? bs[nb - 1] : -1.0, gb);
             }
-            fprintf(stderr, "step %6d lr %.2e loss %.4f bce %.4f dice %.4f%s gn %.2f %.2f samp/s %.1f Mvox/s (wait %.0f%%)%s%s\n", step, lr, acc_loss / nok, acc_bce / nok, acc_dice / nok, affs, acc_g / nok,
-                    (double)nacc * B * nl / dt, (double)nacc * B * nl * g_Pz * P * P / 1e6 / dt, 100 * wait / dt, vl >= 0 ? " val " : "", vl >= 0 ? vstr : "");
+            if (B > 1) for (char *w = strstr(affs, " of windows"); w; w = strstr(w, " of windows")) memcpy(w, " of batches", 11);   /* (B > 1: the label shares count GPU 0's batches with a label, not windows) */
+            char gs[48] = ""; if (sc.echo_max > 0) snprintf(gs, sizeof gs, ", gate %.0f%%", 100 * gate / dt);   /* --echo-max: the echo probe's time while the GPUs still ran (not starvation) */
+            /* samp/s and Mvox/s: every window trained (echoes, skipped steps), input voxels including the halo: work rates (the fresh rate: the echo affix) */
+            fprintf(stderr, "step %6d lr %.2e loss %.4f bce %.4f dice %.4f%s gn %.2f %.2f samp/s %.1f Mvox/s (wait %.0f%%%s)%s%s\n", step, lr, acc_loss / nok, acc_bce / nok, acc_dice / nok, affs, acc_g / nok,
+                    (double)nacc * B * nl / dt, (double)nacc * B * nl * g_Pz * P * P / 1e6 / dt, 100 * wait / dt, gs, vl >= 0 ? " val " : "", vl >= 0 ? vstr : "");
             {   /* the on-the-fly phase since the last log line: reads, tiles (on the GPU), the pair rule's seconds per read (summed over threads) */
                 static phase_onfly_stats o0; phase_onfly_stats o1; phase_onfly_get_stats(&o1);
                 if (o1.reads > o0.reads) fprintf(stderr, "  onfly phase: %llu reads, %llu tiles (%llu GPU-decoded), %.0f ms per read in the pair rule, %.0f ms in CPU codes reads\n",
@@ -5622,10 +5629,10 @@ int cmd_train(int argc, char **argv) {
               if (memlog) { fprintf(stderr, "  device memory free:"); for (int g = 0; g < ng; g++) { nn_init(G[g].dev); fprintf(stderr, " GPU %d %.1f MB", G[g].dev, nn_mem_free() / 1e6); } fprintf(stderr, "\n"); nn_init(G[0].dev); } }
             { static int hm = -1, hmn = 0; if (hm < 0) hm = ufsm_env_on("UFSM_HOSTMEM");   /* host memory by owner at each log line (sampler_hostmem) */
               if (hm) { sampler_hostmem(sp, stderr, nn_host_bytes()); if (hmn++ == 1) nn_host_report(stderr); } }
-            if (log) { fprintf(log, "%d,%.3e,%.5f,%.5f,%.5f,%.0f,%.4f,%s,%.3f,%.3f,%s\n", step, lr, acc_loss / nok, acc_bce / nok, acc_dice / nok, active, acc_g / nok, vstr, (double)nacc * B * nl / dt, wait, gcsv); fflush(log); }
+            if (log) { fprintf(log, "%d,%.3e,%.5f,%.5f,%.5f,%.0f,%.4f,%s,%.3f,%.3f,%s,%.3f\n", step, lr, acc_loss / nok, acc_bce / nok, acc_dice / nok, acc_active / nok, acc_g / nok, vstr, (double)nacc * B * nl / dt, wait, gcsv, gate); fflush(log); }
             if (prof) { fprintf(stderr, "per-op GPU ms over the last %d steps (all GPUs):\n", log_every); unet_prof_report(); }
             nn_ptick_report(log_every);
-            acc_fh[0] = acc_fh[1] = acc_fhn = 0; acc_inkn = 0; acc_fib = acc_fibv = acc_fibn = 0; acc_emb = acc_embc = 0; acc_ssl = acc_sslv = acc_ssls = acc_sslc = acc_ssln = 0; for (int h = 0; h < SSLH_MAX; h++) acc_sslh[h] = acc_sslhg[h] = 0; acc_ds = 0; acc_loss = acc_bce = acc_dice = acc_g = acc_vbce = acc_vdice = acc_side = acc_ink = acc_norm = acc_cond = acc_ck = acc_cr = acc_pap = acc_cnt = acc_cnr = acc_w4 = acc_w4w = acc_w4a = acc_pg = acc_rv = 0; acc_siden = acc_normn = acc_w4n = 0; nacc = 0; nskl = 0; tlog = now(); wait = 0;
+            acc_fh[0] = acc_fh[1] = acc_fhn = 0; acc_inkn = 0; acc_fib = acc_fibv = acc_fibn = 0; acc_emb = acc_embc = 0; acc_ssl = acc_sslv = acc_ssls = acc_sslc = acc_ssln = 0; for (int h = 0; h < SSLH_MAX; h++) acc_sslh[h] = acc_sslhg[h] = 0; acc_ds = 0; acc_loss = acc_bce = acc_dice = acc_g = acc_vbce = acc_vdice = acc_side = acc_ink = acc_norm = acc_cond = acc_ck = acc_cr = acc_pap = acc_cnt = acc_cnr = acc_w4 = acc_w4w = acc_w4a = acc_pg = acc_rv = 0; acc_siden = acc_normn = acc_w4n = 0; nacc = 0; nskl = 0; tlog = now(); wait = 0; gate = 0; acc_active = 0;
         }
         if (step % ckpt_every == 0 || step == steps || g_stop) {
             nn_init(G[0].dev);

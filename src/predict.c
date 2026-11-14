@@ -3252,6 +3252,7 @@ static int predict_one(int argc, char **argv) {
         if (fwrite(h, 4, ns, f) != ns || fclose(f)) { fprintf(stderr, "predict: cannot write %s\n", gn_save); return 1; }
         fprintf(stderr, "GroupNorm statistics of %ld windows -> %s\n", nw, gn_save); free(h);
     }
+    const double t_win = now() - t0;   /* the window loop's seconds (the throughput lines below also show the end-to-end clock) */
     int nf_bad = 0;   /* the inference guard (unet_nonfinite; unroll audit 11-14 #16): non-finite logits in any forward fail the run, as NaN
                          became undefined bytes in the outputs (fit_finalize_k's lroundf, the probability casts) */
     {   unsigned long long nv = 0, nfw = 0, v1 = 0, f1 = 0; unet_nonfinite(u, &nv, &nfw);
@@ -3293,7 +3294,7 @@ static int predict_one(int argc, char **argv) {
     if (!gpyr) for (int l = pp ? 2 : 1; l < nlev; l++) if (pyramid_build_level(out, um_l, l, ash, shard, q, 0, nthreads, attrs)) return 1;
     if (pyramid_write_group(out, um_l, gpyr ? PH[0].pya->nlev : nlev, "ufsm-recto", attrs)) return 1;
     }
-    fprintf(stderr, "wrote %s (%ld tiles in %.0fs)\n", out, ntiles, now() - t0);
+    fprintf(stderr, "wrote %s (%ld tiles in %.0fs end-to-end, the windows %.0fs)\n", out, ntiles, now() - t0, t_win);
     if (skip_empty) fprintf(stderr, "predict: --skip-empty: %ld windows masked (thr %d, margin %d), %ld of %ld conv launches masked%s%.3f\n", skip_wins, skip_thr, skip_margin, skip_masked, skip_calls,
                             ufsm_env_on("UFSM_SKIP_REPORT") ? ", mean level-0 active tile share " : "", ufsm_env_on("UFSM_SKIP_REPORT") && skip_wins ? skip_share0 / skip_wins : -1.);
     if (lvm) { double ds = 0; long dn = 0; nn_latvol_stats(lvL, &ds, &dn);
@@ -3305,7 +3306,7 @@ static int predict_one(int argc, char **argv) {
         while (io && fgets(ln, sizeof ln, io)) { if (!strncmp(ln, "rchar:", 6)) rch = atoll(ln + 6); else if (!strncmp(ln, "read_bytes:", 11)) rdb = atoll(ln + 11); }
         if (io) fclose(io);
         const double gv = (double)bn[0] * bn[1] * bn[2] / 1e9, dt = now() - t0;
-        fprintf(stderr, "predict io: box %.4f Gvox in %.2f s (%.3f Gvox/s); read %.4f GB (%.4f GB per Gvox), from disk %.4f GB (%.4f GB per Gvox)%s\n", gv, dt, gv / dt,
+        fprintf(stderr, "predict io: box %.4f Gvox in %.2f s end-to-end (%.3f Gvox/s; the windows %.2f s, %.3f Gvox/s); read %.4f GB (%.4f GB per Gvox), from disk %.4f GB (%.4f GB per Gvox)%s\n", gv, dt, gv / dt, t_win, gv / t_win,
                 rch / 1e9, rch / 1e9 / gv, rdb / 1e9, rdb / 1e9 / gv, lat_store ? ", --latents" : "");
         if (lat_store) fprintf(stderr, "predict io: the latent store: %.4f GB of chunks and indices read (%.4f GB per Gvox)\n", zr_bytes_read() / 1e9, zr_bytes_read() / 1e9 / gv);
     }
