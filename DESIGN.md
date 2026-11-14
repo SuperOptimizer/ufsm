@@ -8,17 +8,25 @@ No teacher models, no distillation. All upstream data is re-exported once into t
 
 ## Unroll audit items #4 #8 #11 #12 #18 #20 (2026-11-14, branch unrollfix-pub-20261114)
 
-- **#8, slab vs ref coherence (diagnosed; recheck on fibfit's dir -1 refit post-mega).** The bimodal "U_ref - phase ... coherence" of the
+- **#8, slab vs ref coherence (diagnosed; rechecked on fibfit's dir -1 refit, below).** The bimodal "U_ref - phase ... coherence" of the
   1667 u1 slab fits is the count-field ref's sub-turn, not the network or the fit. Per field plane (`ufsm fit-phase-box` of ref-cf and
   joined, `ufsm read` of fields/lat pc / ps / w, material w >= 0.3): ref vs net phase coherence 0.63-0.67 in s010 / s050, 0.08-0.15 in
   s020 / s030 / s064; the joined model vs the net phase 0.76-0.84 in all five. Every 64 rows from 200 to 4552, the ref's coherence
   switches within ~6 rows (one ref lattice cell) at rows 834-840, 3002-3008 and 3906-3912 (l0 z ~6690 / 24030 / 31270), with a bias
   drifting 0.03-0.45 turn between them. Across each switch the ref W changes incoherently (12 rows: 0.06-0.11 vs the net phase 0.22-0.45).
-  Not the field-part seam (row 2048), not count-field's 768-row pooling chunks. ref.log: "closing error over 2x2-solve-cell loops: mean
-  2.060 turns, > 0.25 turn on 0.270": the curl a wrong dir puts in the count gradient (~2 turns per loop around the axis), absorbed by
-  the least-squares solve in z blocks. Against the published unwrap (pub1667) nothing per slab follows it: Spearman of coherence with
-  coverage at 50 / 100 um, median distance, signed offset, angle-corrected sheet identity |rho| <= 0.22 (p >= 0.07); the dir signature
-  (our id 0 -> +2 per turn) is the same in high and low slabs. Data `/vesuvius/ufsm/gt/pub1667-cmp/{slabcoh.txt,coh/}`.
+  Not the field-part seam (row 2048), not count-field's 768-row pooling chunks. Against the published unwrap (pub1667) nothing per slab
+  follows it: Spearman of coherence with coverage at 50 / 100 um, median distance, signed offset, angle-corrected sheet identity
+  |rho| <= 0.22 (p >= 0.07); the dir signature
+(our id 0 -> +2 per turn) is the same in high and low slabs. Data `/vesuvius/ufsm/gt/pub1667-cmp/{slabcoh.txt,coh/}`.
+  **Recheck on fibfit's dir -1 refit (11-14 evening; ref-dm1, slabs dm1/, same fields and slab flags).** The closing error is NOT a
+  direction indicator (2.061 turns at dir -1 vs 2.060 at +1: the theta term enters targets and loop sums alike), so the earlier
+  "the ref absorbs the wrong-dir curl" reading is withdrawn. Measured directly: slab "U_ref - phase" coherence mean 0.400 -> 0.515,
+  |bias| mean 0.082 -> 0.026 turn, slabs < 0.35: 45 -> 24 of 71, >= 0.5: 26 -> 36. The per-plane ref vs net coherence (rows 200..4552
+  step 64) now alternates on a regular grid: ~256 rows high (0.41-0.70), ~256 rows low (0.03-0.34), switches near rows 200 + 256 k
+  (712, 968, ..., 3002-3008, ..., 4296); the 834-840 and 3906-3912 switches of the dir +1 ref are gone (flat 0.09-0.10 / 0.18-0.19).
+  256 field rows = 512 level-2 planes = 32 ref lattice cells (L 16 native voxels). So dir -1 is right (sheet identity 0.487 -> 0.762,
+  fibfit) and removes the bias, and what is left is a z-periodic count-field artifact of that period (not the direction). Open: find
+  the 512-plane structure in count-field (solve-cell / lattice blocking). Data `/vesuvius/ufsm/gt/pub1667-cmp/{slabcoh_cmp.txt,coh_dm1/}`.
 - **#18:** fit-join with --ref gave a slab without ref cells and without overlap cells the first DP candidate, cen - 12 (every candidate
   cost 0): 12 turns off. It now takes the chain's prediction, the summary says how many slabs came from the ref / the chain / nothing,
   each unconstrained slab warns, `--require-constrained 1` exits 3 (test_fit_join cut-36 / cut-24 cases). 1667 / 1299 / P4 slab 0 have
