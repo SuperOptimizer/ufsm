@@ -4,6 +4,8 @@
 #include "optcheck.h"
 #include "dcache.h"
 #include "label_versions.h"
+#include <dirent.h>
+#include <sys/stat.h>
 #include "inkflygpu.h"
 #include "inkmil.h"
 #include <stdarg.h>
@@ -1410,6 +1412,18 @@ z3 *inkfly_open_pooled(z3 *ct_coarse, z3 *fine, int own_fine) {
 #define INKFLY_STR_(x) #x
 #define INKFLY_STR(x) INKFLY_STR_(x)
 #define INKFLY_CODE "inkfly " INKFLY_STR(LBL_INKFLY)   /* (label_versions.h LBL_INKFLY; 2 was "ink-splat --face, validation folding, 2026-11-12") */
+/* a label raster's generation: every file under it (count, bytes, newest mtime in ns; the dcache audit 2026-11-14: a directory's mtime
+   does not change when chunks below it are rewritten, so key_stat of the dir and zarr.json kept the key) */
+static void ink_arr_gen(const char *dir, int depth, long long *nf, long long *nb, long long *mt) {
+    DIR *d = depth < 8 ? opendir(dir) : nullptr; if (!d) return;
+    for (struct dirent *e; (e = readdir(d));) {
+        if (e->d_name[0] == '.' && (!e->d_name[1] || (e->d_name[1] == '.' && !e->d_name[2]))) continue;
+        char p[2400]; struct stat st; snprintf(p, sizeof p, "%s/%s", dir, e->d_name); if (stat(p, &st)) continue;
+        if (S_ISDIR(st.st_mode)) { ink_arr_gen(p, depth + 1, nf, nb, mt); continue; }
+        const long long t = (long long)st.st_mtim.tv_sec * 1000000000ll + st.st_mtim.tv_nsec; (*nf)++; *nb += (long long)st.st_size; if (t > *mt) *mt = t;
+    }
+    closedir(d);
+}
 static void key_stat(char **b, size_t *n, size_t *cap, const char *path, const char *sub) {
     char p[2100]; snprintf(p, sizeof p, "%s%s%s", path, sub ? "/" : "", sub ? sub : ""); struct stat st;
     char l[2400]; const int k = stat(p, &st) ? snprintf(l, sizeof l, " [%s: -]", sub ? sub : ".") :
@@ -1433,7 +1447,9 @@ static char *inkfly_key(const inkfly *f, const inksplat_cfg *c, const char *segs
     for (int i = 0; i < f->nS; i++) { key_add(&b, &n, &cap, "mesh %s", f->Spath[i]);
         static const char *fs[] = {"x.tif", "y.tif", "z.tif", "meta.json"}; for (int k = 0; k < 4; k++) key_stat(&b, &n, &cap, f->Spath[i], fs[k]); key_add(&b, &n, &cap, "\n"); }
     for (int i = 0; i < f->nL; i++) { key_add(&b, &n, &cap, "raster %s", f->Lpath[i]);
-        if (strncmp(f->Lpath[i], "http", 4)) { key_stat(&b, &n, &cap, f->Lpath[i], nullptr); key_stat(&b, &n, &cap, f->Lpath[i], "zarr.json"); } key_add(&b, &n, &cap, "\n"); }
+        if (strncmp(f->Lpath[i], "http", 4)) { key_stat(&b, &n, &cap, f->Lpath[i], nullptr); key_stat(&b, &n, &cap, f->Lpath[i], "zarr.json");
+            long long nf = 0, nb = 0, mt = 0; ink_arr_gen(f->Lpath[i], 0, &nf, &nb, &mt); key_add(&b, &n, &cap, " [files %lld bytes %lld newest %lld]", nf, nb, mt); }
+        key_add(&b, &n, &cap, "\n"); }
     const size_t ls = strlen(segs_txt); while (n + ls + 16 > cap) { cap *= 2; b = realloc(b, cap); }
     memcpy(b + n, "segments ", 9); memcpy(b + n + 9, segs_txt, ls); n += 9 + ls; b[n++] = '\n'; b[n] = 0;
     return b;
