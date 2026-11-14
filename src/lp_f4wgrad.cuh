@@ -66,7 +66,7 @@ __device__ __forceinline__ void had_lane(float &v, float p, bool hi) { v = hi ? 
 template <int MT, int NT, int LY, typename T, typename TG>   /* LY 0: 27 shifted blocks, 1: row pairs (2 pairings), 2: rows, one scale per (ci, plane) */
 __global__ void __launch_bounds__(288, LP_MINB(2)) conv_bwd_w_f4_k(const T *__restrict__ x, const TG *__restrict__ gy, float *__restrict__ gw, float *__restrict__ gb,
                                                        int N, int Ci, int D, int H, int W, int Co, gnp_t gp, split_t sp, int ZC, int had, int coop,
-                                                       const uint8_t *__restrict__ gpre, int zs0, int zs1) {
+                                                       const uint8_t *__restrict__ gpre, int zs0, int zs1, const uint8_t *__restrict__ skm = nullptr, int smy = 0, int smx = 0) {
     constexpr int CH = 8 * NT, BMo = 16 * MT;
     constexpr int XPS = LY >= 2 ? 240 : X4_PS, XCS = LY >= 2 ? 976 : X4_CS;   /* x bytes per plane / per channel (LY 2: 10 rows x 24 B, LY 3: 3 kx x 10 rows x 8 B) */
     extern __shared__ __align__(128) unsigned char smem_raw[];
@@ -91,6 +91,11 @@ __global__ void __launch_bounds__(288, LP_MINB(2)) conv_bwd_w_f4_k(const T *__re
     const int oy0 = (bz % nyt) * 8; bz /= nyt;
     const int nzc = (nzt - zs0 + ZC - 1) / ZC;
     const int zc = bz % nzc; const int n = bz / nzc;
+    if (skm && gpre) {   /* --skip-empty: a block whose tile is inactive in all its z-steps' mask tiles reads only zeroed gy records (block-uniform exit) */
+        const int zb = zs0 + zc * ZC, ze = min(nzt, zb + ZC); bool any = false;
+        for (int tz = zb >> 2; tz <= (ze - 1) >> 2 && !any; tz++) any = skm[((size_t)tz * smy + (oy0 >> 3)) * smx + (ox0 >> 4)] != 0;
+        if (!any) return;
+    }
     const size_t plane = (size_t)D * H * W;
     const int Cx = sp.x2 ? sp.c_split : Ci;
     const int kz = warp / 3, ky = warp % 3;
@@ -697,7 +702,8 @@ template <typename T, int NW> __device__ __forceinline__ void ws_xdec(const ws_x
 template <int MT, int NT, typename T, bool SL = false>   /* SL: slab-local GroupNorm statistics (their per-plane reload kept out of the usual
                                                           instance: +2-3% there, registers at the 80 cap) */
 __global__ void __launch_bounds__(WS_NT, 1) conv_bwd_w_f4ws_k(const T *__restrict__ x, float *__restrict__ gw, int N, int Ci, int D, int H, int W, int Co,
-                                                            gnp_t gp, split_t sp, int ZC, const uint8_t *__restrict__ gpre, int zs0, int zs1) {
+                                                            gnp_t gp, split_t sp, int ZC, const uint8_t *__restrict__ gpre, int zs0, int zs1,
+                                                            const uint8_t *__restrict__ skm = nullptr, int smy = 0, int smx = 0) {   /* skm: --skip-empty tiles (items all inactive are skipped) */
     constexpr int CH = 8 * NT, BMo = 16 * MT;
     extern __shared__ __align__(128) unsigned char smem_raw[];
     uint8_t *sxq = smem_raw;                                              /* [CH][WS_CS] */
@@ -713,8 +719,17 @@ __global__ void __launch_bounds__(WS_NT, 1) conv_bwd_w_f4ws_k(const T *__restric
     const int n = blockIdx.x / nper, w0 = blockIdx.x % nper;   /* items w0, w0 + nper, ... of batch entry n */
     const size_t plane = (size_t)D * H * W;
     const int Cx = sp.x2 ? sp.c_split : Ci;
+    /* --skip-empty (nn_skip.cu lp_skip_wgrad): an item whose (16-x, 8-row) tile is inactive in every 8-plane mask tile of its z-steps has
+       only zeroed gy records, no weight gradient. Every enumeration (these counts, the producers' cursors, the consumers) steps over it alike */
+    auto wact = [&](int w) -> bool {
+        if (!skm) return true;
+        const int xt = w % nxt, yt = (w / nxt) % nyt, zb = zs0 + (w / (nxt * nyt)) * ZC, ze = min(nzt, zb + ZC);
+        for (int tz = zb >> 2; tz <= (ze - 1) >> 2; tz++) if (skm[((size_t)tz * smy + yt) * smx + xt]) return true;
+        return false;
+    };
+    auto wfix = [&](int w) { while (w < nitem && !wact(w)) w += nper; return w; };
     int ntot = 0, npas = 0;   /* z-steps and producer passes of this block (an item: its z-steps + 1) */
-    for (int w = w0; w < nitem; w += nper) { const int zb = zs0 + (w / (nxt * nyt)) * ZC; ntot += min(nzt, zb + ZC) - zb; npas += min(nzt, zb + ZC) - zb + 1; }
+    for (int w = wfix(w0); w < nitem; w = wfix(w + nper)) { const int zb = zs0 + (w / (nxt * nyt)) * ZC; ntot += min(nzt, zb + ZC) - zb; npas += min(nzt, zb + ZC) - zb + 1; }
     if (threadIdx.x < CH) { const int ci = ci0 + threadIdx.x; ctab4[threadIdx.x] = make_chan(ci < Ci ? ci : Ci, Ci, Cx, n, plane, x, sp, gp, N); }
     __syncthreads();
     {
@@ -745,7 +760,7 @@ __global__ void __launch_bounds__(WS_NT, 1) conv_bwd_w_f4ws_k(const T *__restric
            2 ztb - 1 + 2 p). Divisions only when the item changes; the load stage (two passes ahead) and the LY 1 lanes keep a cursor
            each, the decode stage only the pass count */
         struct cur_t { int w, p, ox0, oy0, ztb, nzs; };
-        auto cset = [&](cur_t &c, int w) { c.w = w; c.p = 0; c.ox0 = c.oy0 = c.ztb = c.nzs = 0;
+        auto cset = [&](cur_t &c, int w) { w = wfix(w); c.w = w; c.p = 0; c.ox0 = c.oy0 = c.ztb = c.nzs = 0;
                                            if (w < nitem) { c.ox0 = (w % nxt) * 16; c.oy0 = ((w / nxt) % nyt) * 8; c.ztb = zs0 + (w / (nxt * nyt)) * ZC; c.nzs = min(nzt, c.ztb + ZC) - c.ztb; } };
         auto cadv = [&](cur_t &c) { if (++c.p > c.nzs) cset(c, c.w + nper); };
         auto cgz = [](const cur_t &c) { return 2 * c.ztb - 1 + 2 * c.p; };   /* the pass's first plane */
@@ -911,7 +926,7 @@ __global__ void __launch_bounds__(WS_NT, 1) conv_bwd_w_f4ws_k(const T *__restric
 #pragma unroll
     for (int a = 0; a < 3; a++) for (int m = 0; m < MT; m++) for (int q = 0; q < NT; q++) for (int k = 0; k < 4; k++) acc[a][m][q][k] = 0.f;
     int it = 0, pbase = 0;
-    for (int w = w0; w < nitem; w += nper) {
+    for (int w = wfix(w0); w < nitem; w = wfix(w + nper)) {
     const int zt_begin = zs0 + (w / (nxt * nyt)) * ZC, nzs = min(nzt, zt_begin + ZC) - zt_begin;
     for (int i = 0; i < nzs; i++, it++) {
         const int b = it & 1, s0 = pbase + 2 * i;   /* the slot index of plane oz0 - 1 (before the modulo) */
@@ -1084,14 +1099,14 @@ static void f4w_prof_dump(shape5 xs, shape5 ys, int MT, int NT, int lay) {
 }
 #endif
 template <int MT, int NT, typename T, typename TG> static void launch_bw4(dim3 grid, size_t smem, const void *x, shape5 xs, const TG *gy, shape5 ys, float *gw, float *gb, gnp_t gp, split_t sp, int ZC, int had, int lay,
-                                                                          const uint8_t *gpre = nullptr, int zs0 = 0, int zs1 = 0) {
+                                                                          const uint8_t *gpre = nullptr, int zs0 = 0, int zs1 = 0, skipm_t sk = skipm_t{nullptr, nullptr, 0, 0, 0}) {
     static int attr[8];
     if (!attr[cur_dev_()]) { attr[cur_dev_()] = 1; cudaFuncSetAttribute((const void *)conv_bwd_w_f4_k<MT, NT, 0, T, TG>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); cudaFuncSetAttribute((const void *)conv_bwd_w_f4_k<MT, NT, 1, T, TG>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); cudaFuncSetAttribute((const void *)conv_bwd_w_f4_k<MT, NT, 2, T, TG>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); cudaFuncSetAttribute((const void *)conv_bwd_w_f4_k<MT, NT, 3, T, TG>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
     const int coop = f4w_coop() && ys.c <= 16 && IS_MX(T) && IS_MX8(TG) && (lay == 1 || lay == 2);
-    if (lay == 3) conv_bwd_w_f4_k<MT, NT, 3, T, TG><<<grid, 288, smem>>>((const T *)x, gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, gp, sp, ZC, had, coop, gpre, zs0, zs1);
-    else if (lay == 2) conv_bwd_w_f4_k<MT, NT, 2, T, TG><<<grid, 288, smem>>>((const T *)x, gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, gp, sp, ZC, had, coop, gpre, zs0, zs1);
-    else if (lay == 1) conv_bwd_w_f4_k<MT, NT, 1, T, TG><<<grid, 288, smem>>>((const T *)x, gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, gp, sp, ZC, had, coop, gpre, zs0, zs1);
-    else conv_bwd_w_f4_k<MT, NT, 0, T, TG><<<grid, 288, smem>>>((const T *)x, gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, gp, sp, ZC, had, coop, gpre, zs0, zs1);
+    if (lay == 3) conv_bwd_w_f4_k<MT, NT, 3, T, TG><<<grid, 288, smem>>>((const T *)x, gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, gp, sp, ZC, had, coop, gpre, zs0, zs1, sk.m, sk.my, sk.mx);
+    else if (lay == 2) conv_bwd_w_f4_k<MT, NT, 2, T, TG><<<grid, 288, smem>>>((const T *)x, gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, gp, sp, ZC, had, coop, gpre, zs0, zs1, sk.m, sk.my, sk.mx);
+    else if (lay == 1) conv_bwd_w_f4_k<MT, NT, 1, T, TG><<<grid, 288, smem>>>((const T *)x, gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, gp, sp, ZC, had, coop, gpre, zs0, zs1, sk.m, sk.my, sk.mx);
+    else conv_bwd_w_f4_k<MT, NT, 0, T, TG><<<grid, 288, smem>>>((const T *)x, gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, gp, sp, ZC, had, coop, gpre, zs0, zs1, sk.m, sk.my, sk.mx);
 }
 template <int Z = 0> __global__ void gyrec_bias_k(float *gb, const float *s, int n) { const int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) gb[i] += s[i]; }
 template <typename T, typename TG> void bwd_w_f4_t(const void *x, shape5 xs, const TG *gy, shape5 ys, float *gw, float *gb, gnp_t gp, split_t sp, int had) {
@@ -1139,6 +1154,9 @@ template <typename T, typename TG> void bwd_w_f4_t(const void *x, shape5 xs, con
         const size_t cap_zt = (cap_kb << 10) / per_zt;
         const int szt = cached ? nzt : cap_zt < 1 ? 1 : cap_zt < (size_t)nzt ? (int)cap_zt : nzt;
         uint8_t *buf = cached ? (uint8_t *)rc.rec : lp_buf<uint8_t>(4, per_zt * szt);
+        skipm_t skw = lp_skip_wgrad(ys);   /* --skip-empty: a masked conv's inactive gy tiles leave the weight gradient (after the bias sums) */
+        const char *ske = getenv("UFSM_SKIP_WG_ITEMS");   /* 0: the kernels still visit the zeroed records' items (test_skip_empty: the same gradient) */
+        const skipm_t skk = ske && !atoi(ske) ? skipm_t{nullptr, nullptr, 0, 0, 0} : skw;
         if (cached && gb) gyrec_bias_k<<<nblk_((size_t)ys.c, 128), 128>>>(gb, rc.gb, ys.c);   /* the bias gradient: the apply's gy sums (N 1) */
         for (int zs0 = zt0; zs0 < zt1; zs0 += szt) {
             const int zs1 = zs0 + szt < zt1 ? zs0 + szt : zt1, Zs = (2 * zs1 < ys.d ? 2 * zs1 : ys.d) - 2 * zs0;
@@ -1151,6 +1169,7 @@ template <typename T, typename TG> void bwd_w_f4_t(const void *x, shape5 xs, con
             if (pend) lp_gnpend_slab(zs0, zs1, buf, gb, zs1 >= zt1);   /* the slab's gy (gx of the apply) and its records, the apply's bits */
             else if (!cached) { if (g_f4w_gy4) GP4(4); else GP4(8); }
 #undef GP4
+            if (skw.m) lp_skip_rec_zero(buf, ys, zs0, zs1, GP4_REC, skw);
             int zc_s = zs1 - zs0 < max_zc ? zs1 - zs0 : max_zc;
             while (zc_s > 1 && (size_t)base * nblk_(zs1 - zs0, zc_s) < 72) zc_s--;
             const dim3 g((unsigned)(nblk_(ys.w, 16) * nblk_(ys.h, 8) * nblk_(zs1 - zs0, zc_s) * ys.n), (xs.c + 8 * NT - 1) / (8 * NT), (ys.c + 16 * MT - 1) / (16 * MT));
@@ -1184,7 +1203,7 @@ template <typename T, typename TG> void bwd_w_f4_t(const void *x, shape5 xs, con
                 const bool wsl = gp.ns || sp.gp2.ns;   /* slab-local GroupNorm: the SL instance */
                 const int mi = (MT - 1) + 2 * (NTw - 1) + 4 * wsl;
 #define WSL1(M, NN, S) do { if (!wattr[cur_dev_()][mi]) { wattr[cur_dev_()][mi] = 1; cudaFuncSetAttribute((const void *)conv_bwd_w_f4ws_k<M, NN, T, S>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)ws_smem<M, NN>()); } \
-                        conv_bwd_w_f4ws_k<M, NN, T, S><<<gw3, WS_NT, ws_smem<M, NN>()>>>((const T *)x, gw, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, gp, sp, zc_w, buf, zs0, zs1); } while (0)
+                        conv_bwd_w_f4ws_k<M, NN, T, S><<<gw3, WS_NT, ws_smem<M, NN>()>>>((const T *)x, gw, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, gp, sp, zc_w, buf, zs0, zs1, skk.m, skk.my, skk.mx); } while (0)
 #define WSL(M, NN) do { if (wsl) WSL1(M, NN, true); else WSL1(M, NN, false); } while (0)
                 if (MT == 1 && NTw == 1) WSL(1, 1);
                 else if (MT == 1) WSL(1, 2);
@@ -1195,11 +1214,11 @@ template <typename T, typename TG> void bwd_w_f4_t(const void *x, shape5 xs, con
                 continue;
             }
             switch (MT * 10 + NT) {
-            case 11: launch_bw4<1, 1, T, TG>(g, smem, x, xs, gy, ys, gw, gb, gp, sp, zc_s, had, lay, buf, zs0, zs1); break;
-            case 12: launch_bw4<1, 2, T, TG>(g, smem, x, xs, gy, ys, gw, gb, gp, sp, zc_s, had, lay, buf, zs0, zs1); break;
-            case 13: launch_bw4<1, 3, T, TG>(g, smem, x, xs, gy, ys, gw, gb, gp, sp, zc_s, had, lay, buf, zs0, zs1); break;
-            case 21: launch_bw4<2, 1, T, TG>(g, smem, x, xs, gy, ys, gw, gb, gp, sp, zc_s, had, lay, buf, zs0, zs1); break;
-            case 22: launch_bw4<2, 2, T, TG>(g, smem, x, xs, gy, ys, gw, gb, gp, sp, zc_s, had, lay, buf, zs0, zs1); break;
+            case 11: launch_bw4<1, 1, T, TG>(g, smem, x, xs, gy, ys, gw, gb, gp, sp, zc_s, had, lay, buf, zs0, zs1, skk); break;
+            case 12: launch_bw4<1, 2, T, TG>(g, smem, x, xs, gy, ys, gw, gb, gp, sp, zc_s, had, lay, buf, zs0, zs1, skk); break;
+            case 13: launch_bw4<1, 3, T, TG>(g, smem, x, xs, gy, ys, gw, gb, gp, sp, zc_s, had, lay, buf, zs0, zs1, skk); break;
+            case 21: launch_bw4<2, 1, T, TG>(g, smem, x, xs, gy, ys, gw, gb, gp, sp, zc_s, had, lay, buf, zs0, zs1, skk); break;
+            case 22: launch_bw4<2, 2, T, TG>(g, smem, x, xs, gy, ys, gw, gb, gp, sp, zc_s, had, lay, buf, zs0, zs1, skk); break;
             default: fprintf(stderr, "lp_bwd_w_f4: bad MT/NT %d/%d\n", MT, NT); abort();
             }
         }
@@ -1208,6 +1227,7 @@ template <typename T, typename TG> void bwd_w_f4_t(const void *x, shape5 xs, con
 #endif
         return;
     }
+    if (lp_skip_wgrad(ys).m) { fprintf(stderr, "skip-empty: the weight gradient of a masked conv needs the gy record path (MX-fp8 / fp4 gy, SR on, plain layout)\n"); abort(); }
     if (zw_trange(ys.d, 2).y) { fprintf(stderr, "lp_bwd_w_f4: the z-window needs the gy pre-pass path\n"); abort(); }
     int nzc = (nzt + ZC - 1) / ZC;
     dim3 grid((unsigned)(nblk_(ys.w, 16) * nblk_(ys.h, 8) * nzc * ys.n), (xs.c + 8 * NT - 1) / (8 * NT), (ys.c + 16 * MT - 1) / (16 * MT));

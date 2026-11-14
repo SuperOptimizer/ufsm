@@ -122,6 +122,7 @@ typedef struct {
     double sheet_loss, sheet_parts[5];
     float umb[2], um;            /* input voxel size of the batch in each buffer / the current one (scale_cond) */
     float umdb[2], umd;          /* --film 2: the voxel size of the level read (no zoom / affine), per buffer / current */
+    float skthr[2];              /* --skip-empty: the buffer's CT threshold in the device CT channel's units (NAN: this window dense) */
     uint8_t *bandb[2], *band;    /* task band_affinity: band per voxel (double-buffered like t / m), current */
     uint8_t *sideb[2], *sdb, *sidet, *sidem, *sidew; float *sscratch, sout[5]; double side_loss;   /* --side: SIDE_* / PHASE_* labels, loss target / mask / weight */
     float *aff_fin, aff_out[48]; double aff_loss;
@@ -394,6 +395,18 @@ static int g_Dl, g_h0; static uint8_t *g_zeros;
    counts owned voxels; the gradient pass also takes the halo cell next to the cut, whose upsampled logits read the owned cell beside it, and
    the halo cells' gradient is dropped), the loss sums add across the GPUs in their finalisation (zs_reduce). g_Pw: the sampler's window depth */
 static int g_split_top;   /* --split-top (unet_set_split_top) */
+static int g_skip_thr = -1, g_skip_margin = 1;   /* --skip-empty 1 (--skip-thr T, --skip-margin M; a resume: the checkpoint's): masked convs, nn.h nn_skip_build16 */
+/* --skip-empty: the raw CT threshold T (bytes > T are material) in the device CT channel's units for this window: the source's fixed z-score
+   (--scan-norm / sources "norm"), then the intensity jitter (gain, offset, + 4.5 sd of its noise: air stays below); NAN (dense) when the
+   z-score is the window's own (computed on the device) or there is no record */
+static float skip_thr_of(const batch *b) {
+    if (g_skip_thr < 0 || !b->aug) return NAN;
+    const scan_ct_rec *r = (const scan_ct_rec *)b->aug;
+    if (!r->fixed || !(r->fisd > 0)) return NAN;
+    float t = ((float)g_skip_thr + 0.5f - r->fmean) * r->fisd;
+    if (r->jitter) t = r->ia * t + r->ib + 4.5f * fabsf(r->isg);
+    return t;
+}
 static int g_lsplit, g_Pw;
 static int g_bench_same;   /* UFSM_BENCH_SAME */
 static int g_Pz;   /* window depth: --Pz (a Pz x P x P slab), else P; g_lsplit: this GPU's part of the window */
@@ -885,7 +898,7 @@ static void upload(gpu_state *d, const batch *b, int B, int P) {
     nn_aug_stage_reset();   /* (the label / CT staging buffer holds nothing of this batch yet; the sampler reuses its host planes) */
     if (d->upsplit || d->hsplit) { nn_event_sync(d->ev_up[d->cur]); nn_event_sync(d->ev_lab[d->cur]); }   /* (an asynchronous head / tail into the same buffer may still be in flight; lab_early: its label warp in hs_lg) */
     d->sheet=b->sheet?b->sheet[0]:nullptr;
-    d->um = d->umb[d->cur] = b->um ? b->um[0] : 0.f; d->umd = d->umdb[d->cur] = batch_umd(b, d->um);
+    d->um = d->umb[d->cur] = b->um ? b->um[0] : 0.f; d->umd = d->umdb[d->cur] = batch_umd(b, d->um); d->skthr[d->cur] = skip_thr_of(b);
     if (b->corner && b->level) { memcpy(d->cornb[d->cur], b->corner[0], sizeof d->cornb[0]); d->lvlb[d->cur] = b->level[0]; }   /* validation copies carry none */
     d->srcb[d->cur] = b->src ? b->src[0] : -1; mil_take(d, b, d->cur, 0);
     axr_take(d, b, d->cur, B, P); if (g_restore || (d->side >= 0 && !g_split_top)) d->axv[d->cur] = 0; axr_set(d, d->cur); chain_take(d, b, d->cur, B); view_take(d, b, d->cur, B, 0);
@@ -922,7 +935,7 @@ static void upload_async(gpu_state *d, const batch *b, int i, int B, int P) {
     batch bview_; b = batch_view(&bview_, b, d, i, P);
     nn_aug_stage_reset();
     d->sheet=b->sheet?b->sheet[0]:nullptr;
-    d->umb[i] = b->um ? b->um[0] : 0.f; d->umdb[i] = batch_umd(b, d->umb[i]);
+    d->umb[i] = b->um ? b->um[0] : 0.f; d->umdb[i] = batch_umd(b, d->umb[i]); d->skthr[i] = skip_thr_of(b);
     if (b->corner && b->level) { memcpy(d->cornb[i], b->corner[0], sizeof d->cornb[0]); d->lvlb[i] = b->level[0]; }
     d->srcb[i] = b->src ? b->src[0] : -1; mil_take(d, b, i, 1);
     axr_take(d, b, i, B, P); if (g_restore || (d->side >= 0 && !g_split_top)) d->axv[i] = 0; chain_take(d, b, i, B); view_take(d, b, i, B, 1);
@@ -1963,6 +1976,13 @@ static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
     } else if (g_lat) {   /* --lat: x the full-resolution CT channel */
         nn_ptick("other: before the forward"); const shape5 ls = {B, unet_cfg_of(d->u)->cin, g_Pz / 4, P / 4, P / 4};
         if (train && getenv("UFSM_ERF")) erf_probe(d, ls, P);   /* (exits) */
+        if (g_skip_thr >= 0) {   /* --skip-empty: this window's tile masks from its CT channel (each card its half + halo; under --split the levels
+                                    below --split-top, the whole-window levels stay dense); kept through the backward (the next build replaces them) */
+            const float t = d->skthr[d->cur]; const int nl = d->side >= 0 && g_split_top ? g_split_top : unet_cfg_of(d->u)->nlev;
+            if (B == 1 && !isnan(t)) nn_skip_build16(d->x, g_Pz, P, P, 4, nl, t, g_skip_margin); else nn_skip_off();
+            static int rep = -1; if (rep < 0) rep = ufsm_env_on("UFSM_SKIP_REPORT");
+            if (rep && B == 1 && !isnan(t)) fprintf(stderr, "skip: GPU %d window: level-0 active %.3f, level 1 %.3f (threshold %.3f)\n", d->dev, nn_skip_share(0), nn_skip_share(1), t);
+        }
         if (d->ssl_win) ssl_teacher(d, ls, P);   /* --ssl, an unlabelled window: the teacher's targets, the student's masked input */
         int ld = 0; if (g_lat_dp > 0 && train) for (int s = 0; s < B && s < 8; s++) ld |= d->latd[d->cur][s].on;   /* --lat-direct-p: the direct windows' rows from their cells */
         if (ld) unet_set_input_hook(d->u, lat_hook, d);
@@ -2837,7 +2857,12 @@ int cmd_train(int argc, char **argv) {
         if (!cfg.attn_deform && (cfg.attn_dco || cfg.attn_dinit)) { fprintf(stderr, "--attn-dcoarse / --attn-deform-init: need --attn-deform\n"); return 2; }
     }
     cfg.w4_2d = atoi(opt(argc, argv, "--w4-2d", "0"));   /* consistent fp4 weights (unet_cfg.w4_2d): one scale per 32 x 32 block and tap */
-    if (resume) { unet_cfg pc; int st; if (!unet_peek(resume, &pc, &st)) { cfg.w4_2d = pc.w4_2d; cfg.down_norm = pc.down_norm; cfg.l0_norm = pc.l0_norm; cfg.l0_slab = pc.l0_slab; cfg.gn_ema |= pc.gn_ema; cfg.scan_norm |= pc.scan_norm; cfg.gfilm = pc.gfilm; cfg.scale_cond = pc.scale_cond; cfg.film = g_film = pc.film; memcpy(cfg.dec_widths, pc.dec_widths, sizeof cfg.dec_widths); cfg.ds_levels = pc.ds_levels; memcpy(cfg.dec_convs, pc.dec_convs, sizeof cfg.dec_convs); memcpy(cfg.enc_blocks, pc.enc_blocks, sizeof cfg.enc_blocks);
+    /* --skip-empty 1 [--skip-thr T (0: only zero CT, the outside of a masked scan) --skip-margin M (1)]: masked convs (DESIGN 2026-11-14);
+       the setting goes into the checkpoint (predict masks the same); a resume without the flag keeps the checkpoint's, --skip-empty 0 ends it */
+    const int skip_flag = atoi(opt(argc, argv, "--skip-empty", "-1")), skip_given = skip_flag >= 0;
+    if (skip_flag > 0) { cfg.skip_thr = atoi(opt(argc, argv, "--skip-thr", "0")) + 1; cfg.skip_margin = atoi(opt(argc, argv, "--skip-margin", "1")); }
+    if (skip_flag > 0 && (cfg.skip_thr < 1 || cfg.skip_thr > 256 || cfg.skip_margin < 0 || cfg.skip_margin > 8)) { fprintf(stderr, "--skip-thr 0..255, --skip-margin 0..8\n"); return 2; }
+    if (resume) { unet_cfg pc; int st; if (!unet_peek(resume, &pc, &st)) { cfg.w4_2d = pc.w4_2d; cfg.down_norm = pc.down_norm; cfg.l0_norm = pc.l0_norm; cfg.l0_slab = pc.l0_slab; cfg.gn_ema |= pc.gn_ema; cfg.scan_norm |= pc.scan_norm; if (!skip_given) { cfg.skip_thr = pc.skip_thr; cfg.skip_margin = pc.skip_margin; } cfg.gfilm = pc.gfilm; cfg.scale_cond = pc.scale_cond; cfg.film = g_film = pc.film; memcpy(cfg.dec_widths, pc.dec_widths, sizeof cfg.dec_widths); cfg.ds_levels = pc.ds_levels; memcpy(cfg.dec_convs, pc.dec_convs, sizeof cfg.dec_convs); memcpy(cfg.enc_blocks, pc.enc_blocks, sizeof cfg.enc_blocks);
                   cfg.attn_blocks = pc.attn_blocks; cfg.attn_pe = pc.attn_pe; cfg.attn_reg = pc.attn_reg; cfg.attn_mlp = pc.attn_mlp; cfg.attn_vres = pc.attn_vres; cfg.attn_axis = pc.attn_axis; cfg.attn_repeat = pc.attn_repeat; cfg.attn_mem = pc.attn_mem; cfg.view_P = pc.view_P; cfg.view_patch = pc.view_patch;
                   cfg.attn_deform = pc.attn_deform; cfg.attn_dlev = pc.attn_dlev; cfg.attn_dco = pc.attn_dco; cfg.attn_dinit = pc.attn_dinit; } }   /* the checkpoint decides */
     if (cfg.w4_2d) fprintf(stderr, "weights: consistent MX-fp4 (--w4-2d 1): one scale per 32 x 32 block and tap, the same values in the forward and backward-data\n");
@@ -3474,6 +3499,12 @@ int cmd_train(int argc, char **argv) {
         fprintf(stderr, "split: one %d^3 window on 2 GPUs, each %d planes (%d owned + %d halo voxels = %d trunk cells)\n", P, g_Dl, P / 2, g_h0, g_h0 / 4);
     }
     size_t p3 = (size_t)g_Pz * P * P, p3l = split && !g_lsplit ? (size_t)P * P * g_Dl : p3;   /* per-GPU voxels of a window */
+    if (cfg.skip_thr > 0) {   /* --skip-empty (or a checkpoint trained with it) */
+        if (!g_lat || B != 1) { fprintf(stderr, "--skip-empty: a latent-grid net (--lat 4), B 1\n"); return 2; }
+        g_skip_thr = cfg.skip_thr - 1; g_skip_margin = cfg.skip_margin; cfg.skip_nl = g_lsplit && g_split_top ? g_split_top : 0;   /* (as run_batch builds) */
+        fprintf(stderr, "skip-empty: masked convs: 8x8x16-cell tiles with no CT byte > %d (within %d tiles a level) left at their bias; exact gradients of that net%s\n",
+                g_skip_thr, g_skip_margin, g_lsplit ? " (split: the levels below --split-top)" : "");
+    }
     gpu_state G[8]; memset(G, 0, sizeof G); g_G0 = G;   /* (zeroed: fields added later rely on it) */
     int step0 = 0;
     g_hs_tcache = getenv("UFSM_HS_TCACHE") ? atoi(getenv("UFSM_HS_TCACHE")) != 0 : atoi(opt(argc, argv, "--hs-tcache", "0")) != 0;

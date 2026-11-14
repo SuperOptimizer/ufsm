@@ -1253,7 +1253,7 @@ static void skip_ab(unet *u, const void *x2, shape5 xn, int h16, uint8_t *ctd, i
     for (size_t c = 0; c < cv; c++) mat[c] = 0;
     for (int z = 0; z < Wz; z++) for (int y = 0; y < W; y++) for (int x = 0; x < W; x++) if (hct[((size_t)z * W + y) * W + x] >= 64) mat[((size_t)(z / 4) * Hc + y / 4) * Hc + x / 4] = 1;
     const int lh = unet_logits_h16(u) != 0; const size_t es = lh ? 2 : 4, nb = (size_t)C * cv * es;
-    uint8_t *A = malloc(nb), *Bm = malloc(nb); double t[2];
+    uint8_t *A = calloc(1, nb), *Bm = calloc(1, nb); double t[2];
     const int lay = getenv("UFSM_SKIP_AB") && atoi(getenv("UFSM_SKIP_AB")) >= 2;   /* UFSM_SKIP_AB=2: per-conv forward ms (UFSM_PROF layers) */
     static double (*pl)[UNET_NSLOT][3]; static double pc[2][8]; if (lay && !pl) pl = calloc(2, sizeof *pl);
     /* UFSM_SKIP_AB_FREEZE=1: the masked pass normalises with the dense pass's GroupNorm statistics (unet_gn_freeze): a live-GroupNorm net
@@ -1264,6 +1264,7 @@ static void skip_ab(unet *u, const void *x2, shape5 xn, int h16, uint8_t *ctd, i
         if (k && frz) { gst = malloc(unet_gn_nstats(u) * sizeof *gst); if (gst && !unet_gn_stats_get(u, gst)) unet_gn_freeze(u, gst); }
         if (lay) { unet_prof_layers_on(1); double junk[UNET_NSLOT][3]; nn_sync(); unet_prof_layers(junk); }
         nn_sync(); const double t0 = now(); const float *l = unet_forward_x(u, x2, xn, 0, h16); nn_sync(); t[k] = now() - t0;
+        if (!l) { fprintf(stderr, "skip A/B: the forward holds no cell logits (streamed heads): trunk %.3f s %s only\n", t[k], k ? "masked" : "dense"); continue; }
         if (lay) { unet_prof_layers(pl[k]); unet_prof_cats(pc[k]); unet_prof_layers_on(0); }
         nn_d2h(k ? Bm : A, l, nb);
     }
@@ -1489,8 +1490,10 @@ static int predict_one(int argc, char **argv) {
     const int tta = atoi(opt(argc, argv, "--tta", "1"));
     /* --skip-empty 1 (DESIGN 2026-11-13 "empty-space skipping", nn.h nn_skip_build): a latent-grid net's wide convs leave the 8^3-cell tiles
        with no CT voxel above --skip-thr (default 40, under the papyrus iso 64; air noise stays below it), dilated by --skip-margin tiles per
-       level (default 1), at their bias. An approximation (the net's air outputs are not constant): measured against the dense path there */
-    const int skip_empty = atoi(opt(argc, argv, "--skip-empty", "0")), skip_thr = atoi(opt(argc, argv, "--skip-thr", "40")), skip_margin = atoi(opt(argc, argv, "--skip-margin", "1"));
+       level (default 1), at their bias. An approximation (the net's air outputs are not constant): measured against the dense path there.
+       A net trained with --skip-empty (checkpoint key skip_empty, DESIGN 2026-11-14): on by default with the training's threshold, margin
+       and levels, so predict / ueval see the net they trained (--skip-empty 0: dense) */
+    int skip_empty = atoi(opt(argc, argv, "--skip-empty", "-1")), skip_thr = atoi(opt(argc, argv, "--skip-thr", "-1")), skip_margin = atoi(opt(argc, argv, "--skip-margin", "-1")), skip_nl = 0;
     long skip_wins = 0, skip_masked = 0, skip_calls = 0; double skip_share0 = 0;
     const int fea = atoi(opt(argc, argv, "--feather", "0"));   /* --feather B (above) */
     if (tta < 1 || tta > TTA_MAX) { fprintf(stderr, "predict: --tta 1..%d\n", TTA_MAX); return 2; }
@@ -1673,6 +1676,12 @@ static int predict_one(int argc, char **argv) {
     if (nn_init(gpu)) { fprintf(stderr, "cannot select GPU %d\n", gpu); return 1; }
     unet *u = unet_create(&cfg);
     if (unet_load(u, ckpt) < 0) { fprintf(stderr, "cannot load %s\n", ckpt); return 1; }
+    {   const unet_cfg *uc = unet_cfg_of(u); const int tr = uc->skip_thr > 0;   /* --skip-empty: the trained net's masks by default (above) */
+        if (skip_empty < 0) skip_empty = tr;
+        if (skip_thr < 0) skip_thr = tr ? uc->skip_thr - 1 : 40;
+        if (skip_margin < 0) skip_margin = tr ? uc->skip_margin : 1;
+        skip_nl = tr && uc->skip_nl ? uc->skip_nl : cfg.nlev;
+        if (skip_empty) fprintf(stderr, "predict: --skip-empty: thr %d, margin %d, %d levels%s\n", skip_thr, skip_margin, skip_nl, tr ? " (the checkpoint's training)" : ""); }
     if (ema_blend >= 0.f) unet_blend_ema(u, ema_blend);
     unet_use_ema(u, use_ema || ema_blend >= 0.f);
     const char *gn_save = opt(argc, argv, "--gn-save", nullptr), *gn_frozen = opt(argc, argv, "--gn-frozen", nullptr);
@@ -2586,7 +2595,7 @@ static int predict_one(int argc, char **argv) {
                 else nn_lowres_input(xd, xs, hdiv, hmode, lrt, x2, h16);
                 nn_ptick("input pool");
                 const int skw = skip_empty && half == 3 && ctd && gpath && !lat_store && !lvq;   /* (the CT window in ctd until the forward) */
-                if (skw && !nn_skip_build(ctd, Wz, W, W, 4, cfg.nlev, skip_thr, skip_margin)) { skip_wins++; if (ufsm_env_on("UFSM_SKIP_REPORT")) skip_share0 += nn_skip_share(0); }
+                if (skw && !nn_skip_build(ctd, Wz, W, W, 4, skip_nl, skip_thr, skip_margin)) { skip_wins++; if (ufsm_env_on("UFSM_SKIP_REPORT")) skip_share0 += nn_skip_share(0); }
                 if (skw && ufsm_env_on("UFSM_SKIP_AB")) skip_ab(u, x2, xn, h16, ctd, Wz, W, cfg.cout);   /* the dense / masked A/B of this window */
                 const float *l2 = unet_forward_x(u, x2, xn, 0, h16); nn_ptick("trunk forward");
                 if (skw) { long m_, c_; nn_skip_counts(&m_, &c_); skip_masked += m_; skip_calls += c_; nn_skip_off(); }

@@ -15,9 +15,12 @@ void launch_bwd_w_tc(const void *x, int xbf, shape5 xs, const void *gy, int gybf
     exec_prec(2, eff_prec_w() == 3 && f4_wgrad() && (!sp.up || ISMX(x)) ? 3 : ISMX(x) || ((eff_prec_w() == 2 || eff_prec_w() == 3) && !sp.up) ? 2 : 1);
     if (eff_prec_w() == 3 && f4_wgrad() && (!sp.up || ISMX(x))) {   /* sp.up: MX only (fused upsample in the tile decode) */
         if (sr_on()) sp.sr = sr_seed();
+        nn_skip_wg_begin();   /* (--skip-empty: a masked conv's weight gradient over its active tiles, lp_f4wgrad.cuh) */
         lp_bwd_w_f4(x, ISMX(x) ? MXDT(x) : LPDT(xbf), xs, gy, ISMX(gy) ? MXDT(gy) : LPDT(gybf), ys, gw, gb, gp, sp, f4_had_w());
+        nn_skip_wg_end();
         return;
     }
+    nn_skip_wg_begin(); if (lp_skip_wgrad(ys).m) { fprintf(stderr, "skip-empty: the weight gradient of a masked conv needs the fp4 kernel (--fp4 2)\n"); abort(); } nn_skip_wg_end();
     if (ISMX(x)) {
         if (sr_on()) sp.sr = sr_seed();   /* MX activations still need SR when gy is requantised to fp8 */
         /* debugging UFSM_WG_TRACE=1: per call, hashes of what the kernel reads (x, gy, the GroupNorm parameters, the seed) and a random

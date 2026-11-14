@@ -6,6 +6,70 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Skip-air training: masked convs in forward, backward-data and weight gradient (2026-11-14, branch skipair2-20261113)
+
+The user approved the masked-conv approximation of 2026-11-13 ("Empty-space skipping", below) for the live scratch2 run. `train
+--skip-empty 1 [--skip-thr 0] [--skip-margin 1]` trains the masked net itself, so the approximation becomes the model rather than an
+inference-time error.
+
+**What a step computes.** Per window, the tile masks are built on the GPU from the CT channel of the device input
+(`nn_skip_build16`). The raw byte threshold is mapped through the window's scan-norm z-score (ia/ib when the scan jitter is on: the
+threshold is widened by 4.5|isg|). Threshold 0 (the default) marks as air only cells that hold no CT byte above 0, i.e. outside a
+masked scan. Tiles are 8 x 8 x 16 cells (z, y, x) at level 0, dilated by the margin at every level. Under `--split z` only the levels
+below `--split-top` are masked; each card uses its own half plus halo. The masks stay registered through the backward.
+- **Forward:** the MX-fp4 conv kernel skips the main loop of an inactive tile, so the output there is the bias. The GN statistics
+  include those outputs.
+- **Backward-data** is gx = W^T (mask . gy). gy is staged as zero in inactive tiles. gx is computed only on tiles within one tile of
+  an active one.
+- **Weight gradient:** the gy records (136 B per 2 planes x 8 rows x 16 x) of inactive tiles are zeroed after the bias sums, so gb
+  stays the full sum. The fp4 wgrad kernels then skip every (tile, z-chunk) item whose records are all zero. In the warp-specialised
+  kernel, the counts, the producers' cursors and the consumers all step over an item alike.
+
+This is the exact gradient of the masked net. Safeguards:
+- a conv's backward is masked only if its forward was (`seen[cid]`);
+- a masked backward that reaches a kernel without the mask aborts;
+- the sparse 2:4 kernels are bypassed for masked convs in both directions.
+
+The heads stay dense. Skipped air still gets the head outputs computed from the constant fill, and `--ink-air` ("no ink" in air) and
+the rv losses apply there unchanged, so the fill is trained to predict air. The checkpoint header gains `"skip_empty":[thr,margin,levels]`
+(written only when on). A resume keeps it unless `--skip-empty 0` is passed. `predict` (and so ueval) masks the same way by default
+on such a checkpoint; `--skip-empty 0` gives the dense path.
+
+**Tests** (`test_skip_empty` (4), on the pod RTX PRO 4000):
+- With every tile active, the gradient matches the dense one within the dense run-to-run noise: |d|/|g| 1.2e-8 vs 1.3e-8. The weight
+  gradients sum with atomics, so the result is not bit-identical.
+- With CT masks, the gradient is finite and the masked backward-data and wgrad run on all 9 convs. The cosine to the dense gradient is
+  0.55, as expected for a different net with live statistics.
+- Skipping the wgrad items gives the same gradient as visiting the zeroed records.
+- The header round-trips.
+- A side note on gn_ema: running statistics at momentum 1 make each training pass normalise with the previous pass's statistics.
+  That is why the test uses live statistics.
+
+**scratch2's net on the pod**, single card, no split. Same widths, attention, gfilm, gn-ema, scan-norm, fstem, lat-guide 3 and all
+heads (unwrap2, rv 2, ink-head / mil / air 8, fib-head), on the synthetic wind fixture (`make_wind_fixture`, CT 0 outside the scroll),
+`--det 1`:
+- P 768, 30 steps, L0 active 0.97: the losses track dense (step 30: 1.2233 masked vs 1.2276 dense).
+- P 896 on the fixture with `FX_CT_ZCUT=0.55` (CT 0 above plane 563, labelled air), L0 active 0.51-0.66, 20 steps: median
+  throughput 129 Mvox/s dense, 144 masked, 146 with the wgrad item skip (+13%). The losses match to the third digit.
+- `UFSM_PROF` on the same run, last step: conv fwd 1161 -> 865 ms, bwd-data 898 -> 752, wgrad 1712 -> 1333; loss, GN and optimizer
+  unchanged; 4.34 -> 3.51 s GPU (-19%). Backward-data saves least because it needs the dilated mask.
+- Resume: a dense checkpoint resumed with `--skip-empty 1`, a skip checkpoint resumed with no flag (masked from the header) and with
+  `--skip-empty 0` (dense) all ran. The per-step losses of masked vs dense continuation differ by < 0.002.
+
+**Predict on a skip-trained net** (fixture, 30 steps, whole 1024^3 box, window 512): masked (the checkpoint default) vs dense
+`--skip-empty 0`. On material (CT >= 64) the mean |d| is 4.4 of 255 (2.8% of the mean output), 7.6% of voxels are identical and
+12.9% differ by more than 8. On air the mean |d| is 0.12. So the dense path is *not* within tolerance: the attention and gfilm
+couple the fill in globally. That is why predict follows the checkpoint by default. Masked predict took 10 s, dense 17 s.
+
+**Expected gain on scratch2.** The 2026-11-13 sampler measurement put the level-0 active share at 0.83 at threshold 40 (0.85 for the
+busier split half), nearly all of the inactive share being zero-filled outside of the scan, so threshold 0 sees the same.
+Scaling the fixture's conv savings (-21% of conv time at 38% inactive) to ~16% inactive gives about -8% conv time, about -6 to -8% s/step.
+That is to be measured in the step-5000 swap: s/step before and after on the live run, plus `skipair/swap_check.sh` (split_finite
+with the skip flags: every gradient finite, masks built on both cards, no dense fallback on a masked level).
+
+Not done: the predict `--split z` CT-stem path (non-latent nets) does not mask. The `UFSM_SKIP_AB` per-window diagnostic reads cell
+logits that the streamed-head predict path does not hold (guarded, prints the timings only).
+
 ## The next batch's label warp under the forward (2026-11-13, branch lwarp-20261113)
 
 The P 1024 split profile (perf2, below) left ~350 ms per card a step exposed at the step boundary: upload_tail warped the next --gpu-aug

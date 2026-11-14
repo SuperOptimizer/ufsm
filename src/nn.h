@@ -204,18 +204,28 @@ void nn_input_rad_pack(const void *ct16, shape5 xs, const void *rec, void *y);
    channel the cell mean of nn_input_rad's full-resolution value (warp included) from the full-resolution 16-bit CT channel ct16 */
 void nn_input_lat(const void *ct16, shape5 xs, const void *rec, void *y);
 /* the same with the learned cell transform (latfit.h): xs.c = C + 3 (16 or 32): C quantised coefficients x gain, then the radial means */
-/* --skip-empty (DESIGN 2026-11-13 "empty-space skipping", src/nn_skip.cu): masked 3^3 convs on this device. nn_skip_build: from the device
-   uint8 CT window (D x H x W voxels, cell voxels per level-0 cell) the per-level masks over tiles of 8^3 cells: a level-0 tile is active
-   when a voxel is > thr, level l's tiles active within margin of its own tiles of an active one; then the wide MX forward convs (N 1,
-   whole-tensor outputs on a level grid) leave inactive output tiles at their bias. nn_skip_off: dense again (and forgets the masks);
-   nn_skip_pause 1 / 0: dense for a while, the masks kept. nn_skip_set: a level's mask from the host (tests). nn_skip_share: active tile
-   share of a level (-1: none). nn_skip_counts: masked conv launches / conv launches looked up since the last call */
+/* --skip-empty (DESIGN 2026-11-13 / 11-14 "empty-space skipping", src/nn_skip.cu): masked 3^3 convs on this device. nn_skip_build: from the
+   device uint8 CT window (D x H x W voxels, cell voxels per level-0 cell) the per-level masks over tiles of 8 x 8 x 16 cells (z y x): a
+   level-0 tile is active when a voxel is > thr, level l's tiles active within margin of its own tiles of an active one; nn_skip_build16:
+   the same from the 16-bit CT channel (thr in its units). Then the wide MX convs whose output grid is a level leave inactive output tiles
+   at their bias, and their backward-data / weight gradient are that net's exact gradient (nn_skip.cu). nn_skip_off: dense again (and
+   forgets the masks); nn_skip_pause 1 / 0: dense for a while, the masks kept. nn_skip_set: a level's mask from the host (tests).
+   nn_skip_share: active tile share of a level (-1: none). nn_skip_counts: masked forward launches / lookups since the last call;
+   nn_skip_counts_bwd: masked backward-data launches / weight gradients */
 int nn_skip_build(const uint8_t *ct, int D, int H, int W, int cell, int nlev, int thr, int margin);
+int nn_skip_build16(const void *ct16, int D, int H, int W, int cell, int nlev, float thr, int margin);
 int nn_skip_set(int lev, const uint8_t *hmask, int Dc, int Hc, int Wc);
 void nn_skip_off(void);
 void nn_skip_pause(int paused);
+int nn_skip_on(void);
 double nn_skip_share(int lev);
 void nn_skip_counts(long *masked, long *calls);
+void nn_skip_counts_bwd(long *bwd, long *wg);
+int nn_skip_claim(shape5 xs);       /* (nn_bwd.cu / nn_wgrad.cu internals) */
+
+void nn_skip_bwd_check(void);
+void nn_skip_wg_begin(void);
+void nn_skip_wg_end(void);
 void nn_input_latc(const void *ct16, shape5 xs, const void *rec, const float *bas, const float *gain, int C, float step, void *y);
 /* train --lat-direct-p: rows of window n's cells [cz0, cz0 + ncz) of nn_input_latc's input with the C coefficient channels from stored latvol
    cells (int8 [ncz][h][w][stride], nn_latvol_decode's layout, raw-domain step step_raw) z-scored with the window's mean / isd (predict's
