@@ -280,6 +280,7 @@ void nn_loss_cfg_get(float *pw, float *rec_w, int *unit7);   /* the BCE's positi
 void nn_lat_grad_carry(float *a, int nf, void *sb, int C, size_t pl, int cap, int from, int n);
 void nn_lat_up_adj(const void *g, int C, int d, int h, int w, int z0, int nz, float *gc, void *scratch);   /* scratch: C nz h w fp32 for the separable path (z0, nz multiples of 4), or nullptr */
 int nn_lat_set_slow(int on);   /* the per-voxel kernels for every slab (UFSM_LAT_SLOW=1; train's UFSM_LAT_CHECK compares against them); returns the previous setting */
+int nn_lat_set_adj_tile(int on);   /* the tiled y / x gather of the slab adjoint (default; UFSM_LAT_ADJ_TILE=0: the per-cell kernel); on < 0 only reads; returns the previous setting */
 /* predict on a latent-grid net: the network's 4-channel input on the cell grid ([4][D/4][W/4][W/4], 16-bit storage as nn_set_f16) straight
    from a D x W x W uint8 CT window = nn_pred_input_d then nn_lowres_input (div 4, mode 1), without the full-resolution input */
 void nn_lat_pred_input(const uint8_t *ct, int D, int W, float mean, float isd, const float *dyo, const float *dxo, int axis, void *y);
