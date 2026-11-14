@@ -29,12 +29,13 @@ static void run(int ext) {
         const double da = (double)pa[i] - p0[i], db = (double)pb[i] - p0[i];
         if (pa[i] == pb[i]) { same++; continue; }
         if (fabs(db) < 1e-9) { tiny++; continue; }
-        const double r = da / db;
-        if (fabs(r - F) < 1e-3) { cf++; wf = fmax(wf, fabs(r - F) / F); }
-        else if (fabs(r - F * F2) < 1e-3) { cff++; wff = fmax(wff, fabs(r - F * F2) / (F * F2)); }
+        /* float rounding of the stored weights: the changes are known to a few ulp of |p| (cancellation when |dp| << |p|) */
+        const double tol = 4.0 * 6e-8 * (fabs(p0[i]) + fabs(pb[i])) + 1e-12, ef = fabs(da - F * db), eff = fabs(da - F * F2 * db);
+        if (ef <= tol && ef <= eff) { cf++; wf = fmax(wf, ef / fabs(F * db)); }
+        else if (eff <= tol) { cff++; wff = fmax(wff, eff / fabs(F * F2 * db)); }
         else other++;
     }
-    const size_t C = 48;   /* wo C x C + w2 C x F_mlp: at least C x C elements in the F x F2 class */
+    const size_t C = 48;   /* wo C x C + w2 C x F_mlp: at least C x C elements in the F x F2 class (measured: 8448 = wo 2304 + w2 6144; F: q/k/v 6912 + w1 12288) */
     printf("%s: %zu identical, %zu at F (worst rel %.1e), %zu at F x F2 (worst rel %.1e), %zu other, %zu tiny, of %zu\n", ext ? "ext (normuon)" : "plain",
            same, cf, wf, cff, wff, other, tiny, n);
     CHECK(cf > 0 && cff >= C * C, "both multiplier classes present");
