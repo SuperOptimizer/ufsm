@@ -26,12 +26,15 @@ int phase_onfly_tile_edge(float rmax) {
     while (tile_bytes(E + 8) <= (double)g_budget_mb * (1 << 20)) E += 8;
     return E;
 }
+static int g_gpu2 = -1;
+void phase_onfly_second_gpu(int gpu) { g_gpu2 = gpu; }
 int phase_onfly_config(int gpu, int slots, int budget_mb, int reserve) {
     g_cpu_decode = getenv("UFSM_ONFLY_CPU_DECODE") && atoi(getenv("UFSM_ONFLY_CPU_DECODE"));
     g_gpu = gpu; g_slots = slots < 1 ? 1 : slots; g_budget_mb = budget_mb < 64 ? 64 : budget_mb;
     if (gpu < 0) return 0;
     if (!band_pair_gpu) return -1;   /* (a binary without nn_band.o) */
-    band_pair_gpu_slots(g_slots, gpu);
+    if (g_gpu2 >= 0 && band_pair_gpu_devices) { const int d[2] = {gpu, g_gpu2}; band_pair_gpu_devices(d, 2, g_slots); }
+    else band_pair_gpu_slots(g_slots, gpu);
     if (reserve && band_pair_gpu_reserve && band_pair_gpu_reserve(phase_onfly_tile_edge(0))) return -1;
     return 0;
 }

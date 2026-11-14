@@ -3155,8 +3155,12 @@ int cmd_train(int argc, char **argv) {
         float rmax = 0; for (int i = 0; i < S->n; i++) if (S->src[i].phase_onfly > rmax) rmax = S->src[i].phase_onfly;
         if (rmax > 0) {
             const int og = atoi(opt(argc, argv, "--onfly-gpu", "0")), os = atoi(opt(argc, argv, "--onfly-slots", "2")), om = atoi(opt(argc, argv, "--onfly-mb", "2048"));
+            const char *oc = strchr(opt(argc, argv, "--onfly-gpu", "0"), ','); const int og2 = oc && og >= 0 ? atoi(oc + 1) : -1;   /* --onfly-gpu A,B: os slots on each, alternating */
+            if (og2 >= 0) phase_onfly_second_gpu(og2);
             if (phase_onfly_config(og, os, om, 1)) { fprintf(stderr, "train: --onfly-gpu %d: no GPU pair rule (or the reserve failed)\n", og); return 1; }
-            fprintf(stderr, "train: on-the-fly phase on %s %d, %d slots of %d MB (tile edge %d voxels at rmax %g)\n", og >= 0 ? "GPU" : "CPU", og, os, om, phase_onfly_tile_edge(rmax), rmax); ONFLY_MEM("the on-the-fly phase slots");
+            if (og2 >= 0) fprintf(stderr, "train: on-the-fly phase on GPUs %d and %d, %d slots of %d MB on each (alternating; tile edge %d voxels at rmax %g)\n", og, og2, os, om, phase_onfly_tile_edge(rmax), rmax);
+            else fprintf(stderr, "train: on-the-fly phase on %s %d, %d slots of %d MB (tile edge %d voxels at rmax %g)\n", og >= 0 ? "GPU" : "CPU", og, os, om, phase_onfly_tile_edge(rmax), rmax);
+            ONFLY_MEM("the on-the-fly phase slots");
         }
         int nfib = 0; for (int i = 0; i < S->n; i++) for (int c = 0; c < NTG; c++) nfib += S->src[i].tgt_fib[c] != nullptr;
         if (nfib) {   /* "fibre" targets (fiberraster.h): the planes' stamp and combine on --onfly-gpu, buffers for the window's box reserved now */

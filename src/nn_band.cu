@@ -236,15 +236,26 @@ __global__ void __launch_bounds__(256) k_ll_build(const bg_lchunk *__restrict__ 
 /* a pool of slot contexts (device buffers grown on demand, a stream each): a caller takes a free one and gives it back, so the
    block threads (new pthreads every shard) reuse the same few buffer sets */
 typedef struct { int init, busy; size_t cap, lcap, fcap; uint8_t *fine, *mid; uint8_t *codes, *phase; int32_t *ie, *io; float *F, *Z; int32_t *S; int *V; cudaStream_t st;
-                 size_t bcap, ccap, scap; uint8_t *blob, *scr, *tag; bg_lchunk *ch; uint32_t *status, *hstatus; int fixed; } bg_ctx;   /* (the codes decode: blob, chunk records, scratch) */
+                 size_t bcap, ccap, scap; uint8_t *blob, *scr, *tag; bg_lchunk *ch; uint32_t *status, *hstatus; int fixed, dev; } bg_ctx;   /* (the codes decode: blob, chunk records, scratch) */
 enum { BG_MAXS = 16 };
 static bg_ctx g_ctx[BG_MAXS];
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_cv = PTHREAD_COND_INITIALIZER;
-static int g_slots = 2, g_dev = 0;
+static int g_slots = 2, g_dev = 0, g_rr;   /* g_rr: the next take's first context (round robin: the contexts of several devices share the load) */
 static const int g_xw = !getenv("UFSM_BAND_X1");
 static const int g_timing = getenv("UFSM_BAND_TIMING") != nullptr;   /* per-call stage times on stderr */   /* (UFSM_BAND_X1: the thread-per-line x pass, for A/B) */
 
-extern "C" void band_pair_gpu_slots(int slots, int device) { pthread_mutex_lock(&g_mu); g_slots = slots < 1 ? 1 : slots > BG_MAXS ? BG_MAXS : slots; g_dev = device; pthread_mutex_unlock(&g_mu); }
+extern "C" void band_pair_gpu_devices(const int *devs, int n, int slots);
+extern "C" void band_pair_gpu_slots(int slots, int device) { band_pair_gpu_devices(&device, 1, slots); }
+/* the contexts spread over devices (2026-11-14, train --onfly-gpu 0,1): slots per device, context k on devs[k % n]; a take starts at the
+   context after the last one taken, so the devices alternate. try6 (P 768 DP) with the pair rule on GPU 0 only: GPU 0 100 %, GPU 1 74 %,
+   the all-reduce waiting for GPU 0 */
+extern "C" void band_pair_gpu_devices(const int *devs, int n, int slots) {
+    pthread_mutex_lock(&g_mu);
+    if (n < 1) n = 1; if (slots < 1) slots = 1;
+    g_slots = n * slots > BG_MAXS ? BG_MAXS : n * slots; g_dev = devs[0];
+    for (int k = 0; k < BG_MAXS; k++) g_ctx[k].dev = devs[k % n];
+    pthread_mutex_unlock(&g_mu);
+}
 extern "C" void band_pair_gpu_free(void) {   /* every idle context's buffers (call once no block thread is inside) */
     pthread_mutex_lock(&g_mu);
     for (int k = 0; k < BG_MAXS; k++) { bg_ctx &G = g_ctx[k]; if (!G.init || G.busy) continue;
@@ -271,7 +282,7 @@ static int bg_fields(bg_ctx &G, const int n[3], float rmax, cudaEvent_t *ev);
 static int bg_run(bg_ctx &G, const uint8_t *codes, const int n[3], float rmax, uint8_t *phase) {
     const long nz = n[0], ny = n[1], nx = n[2], N = nz * ny * nx;
     if (N >= (1L << 31)) return -1;   /* int32 feature indices */
-    BG_CK(cudaSetDevice(g_dev));   /* (per host thread state: set every call) */
+    BG_CK(cudaSetDevice(G.dev));   /* (per host thread state: set every call) */
     const long Lmax = nz > ny ? nz : ny, nlines = (nz * nx > ny * nx ? nz * nx : ny * nx), lc = bg_lines(N, Lmax, nlines);
     if (bg_alloc(G, N, Lmax, lc)) return -1;
     cudaEvent_t ev[6]; const int tim = g_timing; if (tim) for (int k = 0; k < 6; k++) cudaEventCreate(&ev[k]);
@@ -319,8 +330,7 @@ static int bg_codes_reserve(bg_ctx &G);
 extern "C" int band_pair_gpu_reserve(int edge) {   /* all g_slots contexts sized for edge^3 blocks (so a memory planner sees them) */
     const long E = edge, N = E * E * E, lines = E * E, lc = bg_lines(N, E, lines); int rc = 0;
     pthread_mutex_lock(&g_mu);
-    if (cudaSetDevice(g_dev) != cudaSuccess) rc = -1;
-    for (int k = 0; k < g_slots && !rc; k++) if (!g_ctx[k].busy) { g_ctx[k].fixed = 0; rc = bg_alloc(g_ctx[k], N, E, lc); if (!rc) rc = bg_codes_reserve(g_ctx[k]); }
+    for (int k = 0; k < g_slots && !rc; k++) if (!g_ctx[k].busy) { if (cudaSetDevice(g_ctx[k].dev) != cudaSuccess) { rc = -1; break; } g_ctx[k].fixed = 0; rc = bg_alloc(g_ctx[k], N, E, lc); if (!rc) rc = bg_codes_reserve(g_ctx[k]); }
     pthread_mutex_unlock(&g_mu);
     if (rc) cudaGetLastError();
     return rc;
@@ -328,8 +338,8 @@ extern "C" int band_pair_gpu_reserve(int edge) {   /* all g_slots contexts sized
 extern "C" int band_pair_gpu(const uint8_t *codes, const int n[3], float rmax, uint8_t *phase) {
     int k = -1;
     pthread_mutex_lock(&g_mu);
-    for (;;) { for (int q = 0; q < g_slots; q++) if (!g_ctx[q].busy) { k = q; break; } if (k >= 0) break; pthread_cond_wait(&g_cv, &g_mu); }
-    g_ctx[k].busy = 1; pthread_mutex_unlock(&g_mu);
+    for (;;) { for (int i = 0; i < g_slots; i++) { const int q = (g_rr + i) % g_slots; if (!g_ctx[q].busy) { k = q; break; } } if (k >= 0) break; pthread_cond_wait(&g_cv, &g_mu); }
+    g_ctx[k].busy = 1; g_rr = (k + 1) % g_slots; pthread_mutex_unlock(&g_mu);
     const int rc = bg_run(g_ctx[k], codes, n, rmax, phase);
     if (rc) cudaGetLastError();
     pthread_mutex_lock(&g_mu); g_ctx[k].busy = 0; pthread_cond_signal(&g_cv); pthread_mutex_unlock(&g_mu);
@@ -384,7 +394,7 @@ static int bg_codes_run(bg_ctx &G, const bg_lchunk *ch, int nch, const uint8_t *
     const int n[3] = {nf[0] >> pool, nf[1] >> pool, nf[2] >> pool};
     if ((n[0] << pool) != nf[0] || (n[1] << pool) != nf[1] || (n[2] << pool) != nf[2]) BGRET(-1, 2);
     const long nz = n[0], ny = n[1], nx = n[2], N = nz * ny * nx;
-    BG_CK(cudaSetDevice(g_dev));
+    BG_CK(cudaSetDevice(G.dev));
     const long Lmax = nz > ny ? nz : ny, nlines = (nz * nx > ny * nx ? nz * nx : ny * nx), lc = bg_lines(N, Lmax, nlines);
     if (bg_alloc(G, N, Lmax, lc)) BGRET(-1, 3);
     if (!G.fixed && bg_codes_reserve(G)) BGRET(-1, 4);   /* (an unreserved context, e.g. the tools: the fixed set on first use) */
@@ -458,8 +468,8 @@ extern "C" int band_pair_gpu_codes_pool(const bg_lchunk *ch, int nch, const uint
                                         int pool, float rmax, const int crop_o[3], const int crop_n[3], uint8_t *out) {
     int k = -1;
     pthread_mutex_lock(&g_mu);
-    for (;;) { for (int q = 0; q < g_slots; q++) if (!g_ctx[q].busy) { k = q; break; } if (k >= 0) break; pthread_cond_wait(&g_cv, &g_mu); }
-    g_ctx[k].busy = 1; pthread_mutex_unlock(&g_mu);
+    for (;;) { for (int i = 0; i < g_slots; i++) { const int q = (g_rr + i) % g_slots; if (!g_ctx[q].busy) { k = q; break; } } if (k >= 0) break; pthread_cond_wait(&g_cv, &g_mu); }
+    g_ctx[k].busy = 1; g_rr = (k + 1) % g_slots; pthread_mutex_unlock(&g_mu);
     const int rc = bg_codes_run(g_ctx[k], ch, nch, blob, blob_n, n, lo, hi, pool, rmax, crop_o, crop_n, out);
     if (rc < 0) cudaGetLastError();
     pthread_mutex_lock(&g_mu); g_ctx[k].busy = 0; pthread_cond_signal(&g_cv); pthread_mutex_unlock(&g_mu);

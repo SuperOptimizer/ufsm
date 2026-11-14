@@ -26,6 +26,7 @@ __attribute__((weak)) int band_pair_gpu_codes_pool(const bg_lchunk *ch, int nch,
                                                    int pool, float rmax, const int crop_o[3], const int crop_n[3], uint8_t *out);
 __attribute__((weak)) int band_pair_gpu(const uint8_t *codes, const int n[3], float rmax, uint8_t *phase);
 __attribute__((weak)) void band_pair_gpu_slots(int slots, int device);   /* before the first call: concurrent callers, the device */
+__attribute__((weak)) void band_pair_gpu_devices(const int *devs, int n, int slots);   /* as slots, slots contexts on each of n devices (alternating) */
 __attribute__((weak)) void band_pair_gpu_free(void);                     /* the idle slots' buffers */
 __attribute__((weak)) int band_pair_gpu_reserve(int edge);
 __attribute__((weak)) void *band_pair_gpu_host_alloc(size_t n);      /* pinned host memory (DMA at full PCIe rate), nullptr on failure */
