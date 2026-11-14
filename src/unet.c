@@ -4565,6 +4565,9 @@ void unet_sp24_grad_mask(unet *u) {
 void unet_sp24_project(unet *u) {   /* (only after unet_sp24_grad_mask wrote this step's mask) */
     if (!(u->sparse24 >= 2 && u->sp24_hard && u->sp24_r == 0.f && u->sp24_kdone)) return;
     for_each_conv3(u, prune_conv, nullptr); u->sp24_kdone = 0; nn_wmemo_clear();
+    static int chk = -1; if (chk < 0) chk = ufsm_env_on("UFSM_SP24_CHECK");   /* tests: the pruned master keeps all its energy under its own mask */
+    if (chk) { double e[2 * UNET_MAXLEV] = {0}; unet_sp24_energy(u, e); double a = 0, k = 0; for (int l = 0; l < UNET_MAXLEV; l++) { a += e[2 * l]; k += e[2 * l + 1]; }
+               fprintf(stderr, "sparse24 check: master kept |w|^2 %.6f\n", a > 0 ? k / a : 0.); }
 }
 void unet_set_sparse24_ramp(unet *u, float r, int hard) { if (r != u->sp24_r) nn_wmemo_clear(); u->sp24_r = r < 0.f ? 0.f : r; u->sp24_hard = hard; }
 float unet_get_sparse24_ramp(const unet *u) { return u->sp24_r; }
