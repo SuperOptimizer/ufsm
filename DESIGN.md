@@ -6,6 +6,26 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## The microc toolchain: `--preset mcc` and the mcc compile check (2026-11-14, branch mcc-20261114)
+
+The user wants the whole toolchain moved to microc (github.com/SuperOptimizer/microc, our own project). mcc is a C compiler for
+C23 / GNU C, plus a C++ subset for `.cu` files that it compiles to PTX. mcudahw is its CUDA runtime: it dlopens libcuda, has the
+driver JIT-compile mcc's PTX and caches the result, and forwards cuBLASLt to the real library. The assessment is
+/vesuvius/ufsm/microc/PLAN.md. Measured on master 3b411d2, desk CPU only:
+- host: 160 of 160 .c files compile; 59 of 59 CPU suite tests pass with mcc-built binaries;
+- CUDA: 166 of 168 .cu files compile. Both failures are mcc bugs, now fixed on microc branches, source only so far.
+- Host code is 3.6x slower than clang -O3 -march=native in total. mcc has no x86 vectoriser and no immintrin.h yet.
+- Compile time: 5.8 s for all host files, 51 s for all .cu files, one at a time. ptxas moves to the driver JIT at the first run.
+
+This branch is source only and has not been configured or run (the user's rule until the sweep):
+- `cmake/mcc.cmake` and `UFSM_TOOLCHAIN=mcc`: the presets `mcc` (build-mcc/) and `mcc-verify`. mcc compiles both the C and the
+  .cu files; CMake treats a `.cu` file as a C source, and mcc reads it as CUDA C++ from its suffix. The CUDA libraries come from
+  mcudahw's lib64 (`UFSM_MCC_CUDA`), so no toolkit and no ccache are needed. Host flags are `-mglibc -std=c23 -O2 -pthread
+  -DVOLCOMP_NO_AVX2`. The CUDA flags are `--cuda-arch=1200` (nn_*), `1200a` (lp_*), `--cuda-fast-math`, and `-fmad=false` for
+  the strict units. The link language stays C.
+- `tests/mcc_compile.sh`, suite line `test_mcc_compile`: compiles every host .c file and every .cu file with mcc (compile only,
+  no GPU). It is skipped when there is no mcc, so ufsm's C++ idioms that mcc does not yet read show up at merge time.
+
 ## Fully adaptive Muon: update / weight statistics, per-layer step control, DoG global step (2026-11-14, branch admuon-20261114)
 
 The user asked for "fully adaptive Muon" for the scratch2 trainer. Each piece below is behind its own flag and off by default; with the

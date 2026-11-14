@@ -30,6 +30,20 @@
       "inherits": "arch86",
       "binaryDir": "${sourceDir}/build86-verify",
       "cacheVariables": {"UFSM_VERIFY": "ON"}
+    },
+    {
+      "name": "mcc",
+      "displayName": "mcc: build-mcc/ (microc: mcc for host C + CUDA units, mcudahw runtime; no CUDA toolkit; UFSM_MCC / MCC_HOME)",
+      "inherits": "release",
+      "binaryDir": "${sourceDir}/build-mcc",
+      "toolchainFile": "${sourceDir}/cmake/mcc.cmake"
+    },
+    {
+      "name": "mcc-verify",
+      "displayName": "mcc-verify: build-mcc-verify/ (the suite binaries built by mcc)",
+      "inherits": "mcc",
+      "binaryDir": "${sourceDir}/build-mcc-verify",
+      "cacheVariables": {"UFSM_VERIFY": "ON"}
     }
   ],
   "buildPresets": [
@@ -43,6 +57,8 @@
      "targets": ["suite-bins"]},
     {"name": "pod-test", "displayName": "pod: build + fast suite tier", "configurePreset": "verify", "jobs": 6, "targets": ["test"]},
     {"name": "arch86", "configurePreset": "arch86"},
-    {"name": "arch86-verify", "configurePreset": "arch86-verify", "targets": ["suite-bins"]}
+    {"name": "arch86-verify", "configurePreset": "arch86-verify", "targets": ["suite-bins"]},
+    {"name": "mcc", "configurePreset": "mcc", "jobs": 8},
+    {"name": "mcc-verify", "configurePreset": "mcc-verify", "jobs": 8, "targets": ["suite-bins"]}
   ]
 }

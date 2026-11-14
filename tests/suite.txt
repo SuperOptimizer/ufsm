@@ -312,3 +312,4 @@ test_mesh_phase                                | gpu          |     8 | tests/te
 test_lldec                                     | gpu,smoke    |     3 | ./$B/test_lldec $TMPDIR/lldec
 test_echo                                      | gpu          |    40 | tests/test_echo.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/echo
 test_lab_early_split                           | gpu          |    40 | tests/test_lab_early_split.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/labearlysplit
+test_mcc_compile                               |              |    30 | bash tests/mcc_compile.sh
