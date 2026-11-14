@@ -130,6 +130,7 @@ void nn_srste24(float *g, const float *w, int co, int ci, int taps, float lambda
 int nn_sp24_eligible(int co, int ci, int mode);
 void nn_mask24m(const float *w, float *out, int co, int ci, int taps, int mode);
 void nn_srste24m(float *g, const float *w, int co, int ci, int taps, float lambda, int mode);
+void nn_mask24x(const float *w, float *out, float r, float *aux, double *e2, int co, int ci, int taps, int mode, uint8_t *kb, int kin);   /* pruned x r into out, aux zeroed where pruned, energy {all, kept} into e2; kb: keep bytes out (kin 0) / in (kin 1) */
 void nn_set_layer_prec(int id, int p);
 int nn_set_prec_policy(const char *policy);   /* see nn.cu: block names, enc1.c2-style single convs, "all", fwd:bwd_data:wgrad values */
 /* finer precision control (prec 4 = fp16 operands with fp16 group accumulation folded into fp32, needs bf16 storage):

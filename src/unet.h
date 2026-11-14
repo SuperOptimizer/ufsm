@@ -252,6 +252,15 @@ void unet_set_sparse24(unet *u, int mode);
 void unet_set_sparse24_levels(unet *u, int mask);
 int unet_get_sparse24(const unet *u);
 int unet_get_sparse24_levels(const unet *u);
+/* the switch to modes 2 / 3 mid-run: r > 0 ramps the pruned weights (forward copy x r, dense kernels), r 0 the mask; hard: after the ramp the master
+   is pruned (unet_sp24_project after every optimizer step, its Muon momentum too) and the pruned gradient zeroed before it (unet_sp24_grad_mask).
+   Checkpoints keep sparse24_hard / sparse24_r. unet_sp24_energy: per level {sum w^2, kept w^2} of the master (2 x UNET_MAXLEV doubles). */
+void unet_set_sparse24_ramp(unet *u, float r, int hard);
+float unet_get_sparse24_ramp(const unet *u);
+int unet_get_sparse24_hard(const unet *u);
+void unet_sp24_grad_mask(unet *u);
+void unet_sp24_project(unet *u);
+void unet_sp24_energy(unet *u, double *e2);
 void unet_apply_sparse24(unet *u);
 void unet_srste24(unet *u, float lambda);
 /* true fp8 / fp4 weights: the 3^3 conv weights live in packed e4m3 / e2m1 storage with MX block scales; AdamW and the EMA update
