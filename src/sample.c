@@ -4091,7 +4091,15 @@ sampler *sampler_start(sources *S, const sample_cfg *cfg) {
     sp->S = S;
     sp->cfg = *cfg;
     if (sp->cfg.echo_max > 0 && sp->cfg.deterministic) { fprintf(stderr, "sampler: --echo-max off under --det 1 (echo decisions depend on timing; a --det run stays reproducible)\n"); sp->cfg.echo_max = 0; }
-    if (sp->cfg.echo_max > 0 && sp->cfg.echo_keep < 1) sp->cfg.echo_keep = 1;
+    if (sp->cfg.echo_max > 0) {   /* echo_keep: the windows a step takes (w, from train). Two candidates per window only when the slots spare them:
+                                     try4 (P 1024 split, 4 slots, 10 workers) held 1 slot for the trainer and 2 for candidates, so 1 window was
+                                     built at a time instead of 3 and new windows came at ~1/3 of the step rate (echo 50-70 %, 11-14). One
+                                     candidate suffices while a redraw (0.4 s there) is far shorter than a step (7 s); the second only helped
+                                     at a 0.3 s step (sampler-only bench). UFSM_ECHO_KEEP=k: k candidates */
+        const int w = sp->cfg.echo_keep < 1 ? 1 : sp->cfg.echo_keep;
+        sp->cfg.echo_keep = getenv("UFSM_ECHO_KEEP") ? atoi(getenv("UFSM_ECHO_KEEP")) : cfg->nbuf - w >= cfg->nworkers + 2 * w ? 2 * w : w;
+        if (sp->cfg.echo_keep < 1) sp->cfg.echo_keep = 1;
+    }
     if (sp->cfg.w4_runs) {   /* the runs stand for the planes where the side plane is the winding input and every label is on the source grid */
         const sample_cfg *c = &sp->cfg;
         const int ok = w4runs_available() && c->wind4 && c->side == 2 && c->gpu_aug == 2 && (c->Pz <= 0 || c->Pz == c->P) && c->side_air == 0 && c->phase_near_um <= 0 &&
@@ -4319,8 +4327,9 @@ batch *sampler_next_gate(sampler *sp, int (*busy)(void *), void *arg) {
                 else if (sp->rq[j] && sp->state[j] == READY) { if (ec < 0 || sp->rseq[j] > sp->rseq[ec]) ec = j; }
             }
             if (nw >= 0) { k = nw; atomic_fetch_add(&sp->n_fresh, 1); break; }
-            if (ec >= 0 && (!busy || !busy(arg))) { k = ec; sp->rq[ec] = 0; atomic_fetch_add(&sp->n_echo, 1); break; }
-            if (ec >= 0) {   /* (the GPU still has work queued: a new window may yet come in time; look again in 0.5 ms) */
+            const int gb = busy ? busy(arg) : 0;   /* (asked on every pass: the trainer times the GPU's idle from its first 0) */
+            if (ec >= 0 && !gb) { k = ec; sp->rq[ec] = 0; atomic_fetch_add(&sp->n_echo, 1); break; }
+            if (busy) {   /* (the GPU still has work queued, or nothing to echo yet: look again in 0.5 ms) */
                 struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ts.tv_nsec += 500000; if (ts.tv_nsec >= 1000000000) { ts.tv_sec++; ts.tv_nsec -= 1000000000; }
                 pthread_cond_timedwait(&sp->cv_ready, &sp->mu, &ts); continue;
             }

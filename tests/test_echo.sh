@@ -9,11 +9,12 @@ set -eu
 U=$(readlink -f "$1"); MF=$(readlink -f "$2"); D=$3
 rm -rf "$D"; mkdir -p "$D"; cd "$D"
 "$MF" fx 256 2 1 > fx.log 2>&1
-C=(--task unwrap2 --levels 1 --P 64 --B 1 --gpus 0 --sampler-slots 4 --val-batches 0 --log-every 2 --ckpt-every 1000 --fp4 2
+C=(--task unwrap2 --levels 1 --P __P__ --B 1 --gpus __G__ --sampler-slots 4 --val-batches 0 --log-every 2 --ckpt-every 1000 --fp4 2
    --input-prec 8 --warmup 0 --seed 5 --wind4-tile 0 --widths 16,32,64 --lat 4 --lat-guide 3 --rv 2 --rv-iso 100 --sched wsd --cooldown 0 --opt muon
    --muon-lr 0.002 --lr 0.001 --packed-weight 8)
 fail() { echo "FAIL: $*"; exit 1; }
-run() { local tag=$1; shift; env ${ENV:-} "$U" train fx/sources.json --out $tag "${C[@]}" "$@" > $tag.log 2>&1 || fail "$tag ($D/$tag.log)"; }
+run() { local tag=$1 a=(); shift; for x in "${C[@]}"; do x=${x/__P__/${P_:-64}}; a+=("${x/__G__/${GPUS:-0}}"); done
+        env ${ENV:-} "$U" train fx/sources.json --out $tag "${a[@]}" "$@" > $tag.log 2>&1 || fail "$tag ($D/$tag.log)"; }
 losses() { grep '^step' $1.log | sed 's/ [0-9.]* samp\/s.*//'; }
 ENV=UFSM_SAMPLER_DELAY_MS=250 run starve --workers 1 --steps 40 --echo-max 3
 grep -q "^sampler: adaptive echo" starve.log || fail "no adaptive echo line ($D/starve.log)"
@@ -22,6 +23,12 @@ grep -q "^sampler: adaptive echo" starve.log || fail "no adaptive echo line ($D/
 e=$(grep '^step' starve.log | grep -o ' echo [0-9]*%' | tr -dc '0-9\n' | awk '{s += $1} END {print s + 0}')
 [ "$e" -gt 0 ] || fail "no echoes with one worker ($D/starve.log)"
 echo "  starved: $(grep '^step' starve.log | grep -c ' echo ') lines with an echo share (sum $e %), losses finite"
+# (3) --split z (both halves on one GPU, the split's emulation), starved likewise: echoes, finite losses, the GPU-idle share logged
+GPUS=0,0 P_=128 ENV=UFSM_SAMPLER_DELAY_MS=250 run split --workers 1 --steps 20 --echo-max 3 --split z
+[ "$(grep -c '^step' split.log)" = 10 ] || fail "split: not 10 step lines ($D/split.log)"
+! grep '^step' split.log | grep -qiE 'nan|inf ' || fail "split: non-finite losses ($D/split.log)"
+grep '^step' split.log | grep -q ' echo [1-9][0-9]*% (GPU idle for data [0-9]*%)' || fail "split: no echo / GPU-idle share ($D/split.log)"
+echo "  --split z: $(grep '^step' split.log | tail -1 | grep -o 'echo [0-9]*% (GPU idle for data [0-9]*%)')"
 run det0 --workers 2 --steps 8 --det 1
 run det1 --workers 2 --steps 8 --det 1 --echo-max 3
 grep -q "echo-max off under --det 1" det1.log || fail "--det 1 did not switch echo off ($D/det1.log)"

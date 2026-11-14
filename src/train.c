@@ -1837,8 +1837,13 @@ static void gstep_bwd(gstep_arg *a) {
 /* --echo-max's gate (sampler_next_gate): busy while every GPU still runs the step just launched (the backward's ev_done not reached);
    once one has finished, it waits on the host (its gradient exchange and update are launched after the next batch is taken), so a
    step that would wait for data takes an echo instead */
-typedef struct { void *ev[64]; int n; } echo_gate;
-static int echo_busy(void *p) { const echo_gate *e = p; for (int i = 0; i < e->n; i++) if (nn_event_done(e->ev[i])) return 0; return e->n > 0; }
+typedef struct { void *ev[64]; int n; double t_open; } echo_gate;   /* (t_open: when the probe first found a GPU done; the trainer's GPU-idle meter) */
+static int echo_busy(void *p) {
+    echo_gate *e = p;
+    for (int i = 0; i < e->n; i++) if (nn_event_done(e->ev[i])) { if (e->t_open <= 0) e->t_open = now(); return 0; }
+    return e->n > 0;
+}
+static double g_echo_idle;   /* --echo-max: seconds a GPU waited for the next batch (from its step's end to the batch's handover), the "idle" share */
 static void gstep_job(void *p) { gstep_arg *a = p; gstep_fwd(a); if (!a->rc) gstep_bwd(a); nn_tls_capture(&a->out); }
 /* the per-GPU host threads (persistent: thread-local device scratch lives as long as they do), started on first use */
 typedef struct { pthread_t th; int dev, started, has; void (*fn)(void *); void *arg; nn_tls tls; } gworker;
@@ -3181,8 +3186,7 @@ int cmd_train(int argc, char **argv) {
     sample_cfg sc = sample_cfg_default();
     sc.P = P; sc.Pz = g_Pz != P ? g_Pz : 0; sc.B = B; sc.nworkers = workers; sc.nbuf = atoi(opt(argc, argv, "--sampler-slots", "0")) > 0 ? atoi(opt(argc, argv, "--sampler-slots", "0")) : 4 * ng + 2;   /* batches in flight (each worker fills one; pinned memory per slot) */ sc.seed = seed; sc.xfmt = g_xfmt;
     sc.echo_max = atoi(opt(argc, argv, "--echo-max", "0"));   /* --echo-max M: adaptive echoing, a step that would wait for data redraws a recent window (sample.h) */
-    sc.echo_keep = getenv("UFSM_ECHO_KEEP") ? atoi(getenv("UFSM_ECHO_KEEP")) : 2 * (split ? 1 : ng);   /* (two per window a step takes, one shared window under --split z, one per
-                                                                                                       GPU otherwise: one is ready while the replay thread redraws the other) */
+    sc.echo_keep = split ? 1 : ng;   /* (the windows a step takes; sampler_start holds 2 per window as echo candidates only when the slots spare them) */
     const int ngh = split ? 1 : ng;   /* (batches the trainer holds: one per GPU; --split z: one window on both, 2026-11-14) */
     if (workers > sc.nbuf - ngh)   /* a worker fills a slot of its own and the trainer holds about one per GPU: workers beyond the free slots wait, and each
                                      holds its window scratch (5 bytes per voxel; P 640, 2026-11-09: 4 workers 3 slots 46% wait, 8 workers 3 slots 38%, 4 workers 5 slots 0%) */
@@ -4574,8 +4578,8 @@ int cmd_train(int argc, char **argv) {
             sampler_release(sp, G[0].pending);
             G[0].pending = nullptr;
             if (step < steps && !g_stop) {
-                echo_gate eg = {{G[0].ev_done[G[0].cur], G[1].ev_done[G[1].cur]}, 2};
-                double tw = now(); batch *nb = sampler_next_gate(sp, echo_busy, &eg); wait += now() - tw;
+                echo_gate eg = {{G[0].ev_done[G[0].cur], G[1].ev_done[G[1].cur]}, 2, 0};
+                eg.t_open = 0; double tw = now(); batch *nb = sampler_next_gate(sp, echo_busy, &eg); wait += now() - tw; if (eg.t_open > 0) g_echo_idle += now() - eg.t_open;
                 if (!nb) { fprintf(stderr, "sampler stopped before final step\n"); training_failed = 1; break; }
                 split_upload(sctx, G, 0, nb, G[0].cur ^ 1, G[1].cur ^ 1, B, P);
                 for (int g = 0; g < 2; g++) { nn_init(G[g].dev); select_buf(&G[g], G[g].cur ^ 1); }
@@ -4674,11 +4678,11 @@ int cmd_train(int argc, char **argv) {
             }
         }
         }
-        echo_gate eg = {{0}, 0}; for (int g = 0; g < ng && g < 64; g++) if (want_next[g]) eg.ev[eg.n++] = G[g].ev_done[G[g].cur];   /* (before select_buf flips cur) */
+        echo_gate eg = {{0}, 0, 0}; for (int g = 0; g < ng && g < 64; g++) if (want_next[g]) eg.ev[eg.n++] = G[g].ev_done[G[g].cur];   /* (before select_buf flips cur) */
         for (int g = 0; g < ng && !g_stop && !training_failed; g++) {
             if (!want_next[g]) continue;
             gpu_state *d = &G[g]; nn_init(d->dev);
-            double tw = now(); batch *nb = sampler_next_gate(sp, echo_busy, &eg); wait += now() - tw;
+            eg.t_open = 0; double tw = now(); batch *nb = sampler_next_gate(sp, echo_busy, &eg); wait += now() - tw; if (eg.t_open > 0) g_echo_idle += now() - eg.t_open;
             if (!nb) { fprintf(stderr, "sampler stopped before final step\n"); training_failed = 1; break; }
             int nxt = d->cur ^ 1; upload_async(d, nb, nxt, B, P); d->pending = nb; select_buf(d, nxt);
         }
@@ -5035,7 +5039,8 @@ int cmd_train(int argc, char **argv) {
             }
             if (sp) {   /* --echo-max: the share of the batches since the last line that were echoes (fresh counts only in echo mode) */
                 static uint64_t f0, e0; uint64_t f1, e1; sampler_echo_stats(sp, &f1, &e1);
-                if (f1 + e1 > f0 + e0) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " echo %.0f%%", 100.0 * (double)(e1 - e0) / (double)(f1 + e1 - f0 - e0)); }
+                if (f1 + e1 > f0 + e0) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " echo %.0f%% (GPU idle for data %.0f%%)", 100.0 * (double)(e1 - e0) / (double)(f1 + e1 - f0 - e0), 100.0 * g_echo_idle / dt); }
+                g_echo_idle = 0;   /* (the trainer's "wait" also counts the probe's time while the GPUs still run the step: idle is what they lost) */
                 f0 = f1; e0 = e1;
             }
             if (accum > 1) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " (update %d: %d windows each)", step / accum, accum); }   /* --accum: steps are windows */
