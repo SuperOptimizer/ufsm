@@ -9,7 +9,7 @@
 #include <string.h>
 #include <time.h>
 
-static int g_prof = -1;
+static int g_prof = -1;   /* mgpu: env (UFSM_PROF, or unet_prof_layers_on before the GPU threads run) */
 static const char *g_names[8] = {"conv_fwd", "conv_bwd_data", "conv_bwd_w", "gn", "elementwise", "up/concat", "loss", "optimizer"};
 /* UFSM_PROF=1: per-category event timing; UFSM_PROF=layers (or unet_prof_layers_on): also per conv, event category
    k + 8 * (slot + 1) with slot = 2 * layer + conv (layer ids as in nn_set_layer, conv 0 = c1 / single, 1 = c2) */
@@ -17,7 +17,9 @@ static const char *g_names[8] = {"conv_fwd", "conv_bwd_data", "conv_bwd_w", "gn"
 #define PROF_SLOT() (nn_get_layer() < 0 ? -1 : 2 * nn_get_layer() + (nn_get_conv() > 0 ? 1 : 0))
 #define PROF(k, call) do { PROF_INIT(); if (g_prof) { nn_prof_begin((k) + (g_prof == 2 ? 8 * (PROF_SLOT() + 1) : 0)); call; nn_prof_end(); } else { call; } } while (0)
 #define PROF_NK (8 * (UNET_NSLOT + 1))
-static double g_prof_slot[UNET_NSLOT][3];
+#include <pthread.h>
+static pthread_mutex_t g_prof_mu = PTHREAD_MUTEX_INITIALIZER;
+static double g_prof_slot[UNET_NSLOT][3];   /* mgpu: guarded (g_prof_mu: report / collect may run on either GPU's thread) */
 static void prof_collect(double *cat) {
     double ms[PROF_NK];
     nn_prof_collect(ms, PROF_NK);
@@ -26,6 +28,7 @@ static void prof_collect(double *cat) {
 }
 void unet_prof_report(void) {
     if (g_prof > 0) {
+        pthread_mutex_lock(&g_prof_mu);
         double ms[8]; prof_collect(ms); double tot = 0;
         for (int i = 0; i < 8; i++) tot += ms[i];
         for (int i = 0; i < 8; i++) if (ms[i] > 0) fprintf(stderr, "  %-14s %8.1f ms  %4.1f%%\n", g_names[i], ms[i], 100 * ms[i] / tot);
@@ -38,16 +41,19 @@ void unet_prof_report(void) {
             }
             for (int j = 0; j < 3; j++) g_prof_slot[i][j] = 0;
         }
+        pthread_mutex_unlock(&g_prof_mu);
     }
 }
 void unet_prof_layers_on(int on) { PROF_INIT(); g_prof = on ? 2 : 0; }
-static double g_prof_cat[8];
+static double g_prof_cat[8];   /* mgpu: guarded (g_prof_mu) */
 void unet_prof_layers(double out[][3]) {
+    pthread_mutex_lock(&g_prof_mu);
     for (int i = 0; i < UNET_NSLOT; i++) for (int j = 0; j < 3; j++) g_prof_slot[i][j] = 0;
     prof_collect(g_prof_cat);
     for (int i = 0; i < UNET_NSLOT; i++) for (int j = 0; j < 3; j++) out[i][j] = g_prof_slot[i][j];
+    pthread_mutex_unlock(&g_prof_mu);
 }
-void unet_prof_cats(double out[8]) { for (int i = 0; i < 8; i++) out[i] = g_prof_cat[i]; }   /* categories of the last unet_prof_layers call */
+void unet_prof_cats(double out[8]) { pthread_mutex_lock(&g_prof_mu); for (int i = 0; i < 8; i++) out[i] = g_prof_cat[i]; pthread_mutex_unlock(&g_prof_mu); }   /* categories of the last unet_prof_layers call */
 
 typedef struct { int cin, cout, k, stride; size_t w, b; } convp;      /* offsets into the flat param array */
 typedef struct { int c; size_t gamma, beta; } gnp;
@@ -618,12 +624,15 @@ void unet_init(unet *u, uint64_t seed) {
 
 /* ---- activation buffers ---- */
 /* dry run (unet_train_bytes): the activation allocators only count bytes and hand out a dummy pointer */
-static int g_dry = 0;
-static size_t g_hoff;   /* the last build's (dry or real) pinned host offload bytes; each is copied out and back once per step */
+/* Build state, per thread (mgpu): a build (dry_bytes or a real build_acts) runs start to end on one thread and its caller reads the
+   results (unet_last_offload_bytes, unet_last_dry_l3b, the report) on that thread; DP builds each GPU's net on its own thread, so a
+   process-wide g_dry let one card's dry plan turn another card's real dmalloc into a fake pointer. */
+static thread_local int g_dry = 0;
+static thread_local size_t g_hoff;   /* the last build's (dry or real) pinned host offload bytes; each is copied out and back once per step */
 /* UFSM_MEM_REPORT=1: unet_train_bytes prints the dry build's bytes per buffer group (g_mlab, set in build_acts) */
-static const char *g_mlab = "other";
-static struct { const char *lab; size_t b; int n; } g_mrep[64]; static int g_nmrep = 0;
-static double g_mrep_nv;   /* UFSM_MEM_REPORT=2: every allocation of the dry build, in bytes per input voxel */
+static thread_local const char *g_mlab = "other";
+static thread_local struct { const char *lab; size_t b; int n; } g_mrep[64]; static thread_local int g_nmrep = 0;
+static thread_local double g_mrep_nv;   /* UFSM_MEM_REPORT=2: every allocation of the dry build, in bytes per input voxel */
 static void mrep_add(size_t b) {
     if (g_mrep_nv > 0 && b >= 0.05 * g_mrep_nv) fprintf(stderr, "    alloc %-40s %7.2f B/voxel\n", g_mlab, b / g_mrep_nv);
     int i = 0; while (i < g_nmrep && strcmp(g_mrep[i].lab, g_mlab)) i++;
@@ -1844,7 +1853,7 @@ void *unet_l0_3buf_head_free(unet *u) {   /* (created here so a copy stream can 
     if (!u->ev_head) u->ev_head = nn_event_create();
     return u->ev_head;
 }
-static int g_last_dry_l3b;
+static thread_local int g_last_dry_l3b;   /* (per thread: the build state above) */
 int unet_last_dry_l3b(void) { return g_last_dry_l3b; }   /* the last dry build (unet_train_bytes) used the three level-0 buffers */
 /* device bytes of the training activations / gradients at input shape xs under the current storage modes, without allocating
    (dry build); the model is left unbuilt */
@@ -2203,6 +2212,13 @@ long unet_gn_ema_updates(const unet *u) { return u->ge_n; }
 float *unet_gn_ema_state(unet *u, size_t *n) {   /* the running statistics (live weights', EMA weights') on the device: 2 ge_ns floats, or nullptr */
     *n = 0; if (!u->cfg.gn_ema || !u->ge_run) return nullptr;
     *n = 2 * u->ge_ns; return u->ge_run;
+}
+void unet_gn_ema_mean_host(float *const *h, int ng, size_t n) {
+    if (ng < 2) return;
+    for (size_t i = 0; i < n; i++) { double a = 0; for (int g = 0; g < ng; g++) a += h[g][i]; const float m = (float)(a / ng); for (int g = 0; g < ng; g++) h[g][i] = m; }
+}
+int unet_gn_ema_average_due(long updates, int warm, int step, int val_every, int ckpt_every, int steps, int stop) {
+    return updates >= warm || (val_every > 0 && step % val_every == 0) || (ckpt_every > 0 && step % ckpt_every == 0) || step == steps || stop;
 }
 unsigned unet_gn_ema_skips(const unet *u) { unsigned k = 0; if (u->cfg.gn_ema && u->ge_run) nn_d2h(&k, u->ge_run + 3 * u->ge_ns, 4); return k; }
 static void l0_begin(unet *u) {   /* forward start: latch l0_c, the constant statistics into the sites */
@@ -4833,15 +4849,17 @@ static void wq_ema(unet *u, float decay) {
 void unet_wquant(unet *u, unsigned seed) { (void)u; (void)seed; }   /* kept for API compatibility: packed storage makes it unnecessary */
 
 /* ---- checkpoints ---- */
-static float g_loaded_sp24_r = 0.f;
-static int g_loaded_sparse = 0, g_loaded_sp24_lv = 0, g_loaded_sp24_hard = 0, g_loaded_wq = 0, g_loaded_muon = 0;   /* set by the header parser, applied by unet_load */
-static float g_loaded_hbR[UNET_MAXCONV]; static int g_loaded_hbR_n = 0;
-static float g_loaded_adema[UNET_MAXCONV]; static int g_loaded_adema_n; static double g_loaded_addog[3]; static int g_loaded_addog_n;   /* adaptive Muon state */   /* Hyperball radii of the header */
-static size_t *g_loaded_inh; static int g_loaded_ninh;   /* init_inh of the header (pairs) */
+/* The header parser's results, per thread (mgpu): read_header fills them and unet_load / unet_load_grow apply them on the same thread;
+   a unet_peek or a load on another thread (DP loads per GPU thread) no longer overwrites a load in progress. */
+static thread_local float g_loaded_sp24_r = 0.f;
+static thread_local int g_loaded_sparse = 0, g_loaded_sp24_lv = 0, g_loaded_sp24_hard = 0, g_loaded_wq = 0, g_loaded_muon = 0;   /* set by the header parser, applied by unet_load */
+static thread_local float g_loaded_hbR[UNET_MAXCONV]; static thread_local int g_loaded_hbR_n = 0;
+static thread_local float g_loaded_adema[UNET_MAXCONV]; static thread_local int g_loaded_adema_n; static thread_local double g_loaded_addog[3]; static thread_local int g_loaded_addog_n;   /* adaptive Muon state */   /* Hyperball radii of the header */
+static thread_local size_t *g_loaded_inh; static thread_local int g_loaded_ninh;   /* init_inh of the header (pairs) */
 static void inh_add(unet *u, size_t off, size_t n);
-static int g_loaded_lat_c; static float g_loaded_lat_step, g_loaded_lat_gain[29], g_loaded_lat_bas[29 * 64];   /* the cell transform of the last header read */
-static long g_loaded_ge_n; static int g_loaded_ge_warm; static float g_loaded_ge_mom, *g_loaded_ge_run; static size_t g_loaded_ge_cnt;   /* cfg.gn_ema */
-static long g_loaded_l0_n; static int g_loaded_l0_warm, g_loaded_l0_cnt; static float g_loaded_l0_mom, g_loaded_l0_run[16 * 256];   /* cfg.l0_norm ema */
+static thread_local int g_loaded_lat_c; static thread_local float g_loaded_lat_step, g_loaded_lat_gain[29], g_loaded_lat_bas[29 * 64];   /* the cell transform of the last header read */
+static thread_local long g_loaded_ge_n; static thread_local int g_loaded_ge_warm; static thread_local float g_loaded_ge_mom, *g_loaded_ge_run; static thread_local size_t g_loaded_ge_cnt;   /* cfg.gn_ema */
+static thread_local long g_loaded_l0_n; static thread_local int g_loaded_l0_warm, g_loaded_l0_cnt; static thread_local float g_loaded_l0_mom, g_loaded_l0_run[16 * 256];   /* cfg.l0_norm ema */
 /* debug: per block, the GroupNorm statistics of the last forward (mean / rstd of a1 and a2 per sample and group:
    non-finite counts and extremes) and the largest |weight| of each conv. Localises a non-finite forward. */
 void unet_debug_stats(const unet *u) {

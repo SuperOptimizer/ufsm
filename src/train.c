@@ -855,8 +855,13 @@ static void ct_upload(const batch *b, void *x, void *rad, int B, int P, int asyn
 /* diagnostic UFSM_DUMP_WIN=PREFIX (with UFSM_SYNC_UPLOAD=1 and --gpu-input 0, cubes): the first UFSM_DUMP_N (8) host windows as
    PREFIX-NN.jpg, rows z-mid / y-mid / x-mid, columns CT channel | phase hue over the CT | winding mod 4 hue over the CT (unknown: CT only) */
 int jpeg_write_rgb(const char *path, int w, int h, const uint8_t *rgb, int quality);   /* (imgops.h) */
-static void dump_win(const batch *b, int B, int P) {
-    static int nd = 0; const char *pre = getenv("UFSM_DUMP_WIN"); const int N = getenv("UFSM_DUMP_N") ? atoi(getenv("UFSM_DUMP_N")) : 8;
+static int g_dump_nd;   /* mgpu: guarded (g_dump_mu: one numbering, the GPUs' threads share the PREFIX-NN names) */
+static pthread_mutex_t g_dump_mu = PTHREAD_MUTEX_INITIALIZER;   /* mgpu: guarded */
+static void dump_win_(const batch *b, int B, int P);
+static void dump_win(const batch *b, int B, int P) { if (!getenv("UFSM_DUMP_WIN")) return; pthread_mutex_lock(&g_dump_mu); dump_win_(b, B, P); pthread_mutex_unlock(&g_dump_mu); }
+static void dump_win_(const batch *b, int B, int P) {
+    int nd = g_dump_nd;
+    const char *pre = getenv("UFSM_DUMP_WIN"); const int N = getenv("UFSM_DUMP_N") ? atoi(getenv("UFSM_DUMP_N")) : 8;
     if (!pre || nd >= N || g_Pz != P || !b->x16 || !g_xfmt) return;
     const size_t p3 = (size_t)P * P * P;
     uint8_t *img = malloc((size_t)9 * P * P * 3); if (!img) return;
@@ -882,7 +887,7 @@ static void dump_win(const batch *b, int B, int P) {
         else fprintf(stderr, "dumped window %s (source %d, corner %lld %lld %lld)\n", path, b->src ? b->src[s] : -1,
                      b->corner ? (long long)b->corner[s][0] : -1LL, b->corner ? (long long)b->corner[s][1] : -1LL, b->corner ? (long long)b->corner[s][2] : -1LL);
     }
-    free(img);
+    g_dump_nd = nd; free(img);
 }
 /* --ink-mil device bytes: the rays (2 buffers), the accumulator, and inkmil's backward (8 corner pairs per sample: keys / values twice, 24 B,
    the radix sort's temp ~ the same, the per-ray loss) */
@@ -1192,7 +1197,8 @@ static void verso_target(gpu_state *d, shape5 xs) {
         fprintf(stderr, "verso check (GPU %d): mean verso target %.1f, recto output %.1f, mean |difference| %.1f (of 255)\n", d->dev, sa / l3, sb / l3, ad / l3);
         const char *dump = getenv("UFSM_VERSO_DUMP");   /* dir: mid-z planes of CT input, verso target, recto output, recto label */
         if (dump) {
-            static int nd; char fn[1200]; snprintf(fn, sizeof fn, "%s/verso_%d_%d.raw", dump, d->dev, nd++);
+            static thread_local int nd;   /* mgpu: debug (per thread; the file name carries the device) */
+            char fn[1200]; snprintf(fn, sizeof fn, "%s/verso_%d_%d.raw", dump, d->dev, nd++);
             const size_t pl = (size_t)xs.h * xs.w, zm = (size_t)xs.d / 2;
             uint8_t *lab = malloc(l3); nn_d2h(lab, d->t, l3);
             uint8_t *xh = malloc(xb); nn_d2h(xh, d->x, xb);
@@ -1320,7 +1326,7 @@ static void head_slab_pass(gpu_state *d, int pass) {
     /* UFSM_MIL_CHECK=1: the device MIL path against the host reference (inksplat.c ink_mil_loss_host, central-difference tested in test_ink_mil)
        on this window's own fp16 logits: the pass-0 loss, and the gradient pass 1 adds (after - before bwd_slab, 16-bit) */
     static int mchk = -1; if (mchk < 0) mchk = ufsm_env_on("UFSM_MIL_CHECK");
-    static float *mlg; static uint8_t *mink; static double *mref, merr, mmax, mref2, mmaxd, mulp;
+    static thread_local float *mlg; static thread_local uint8_t *mink; static thread_local double *mref, merr, mmax, mref2, mmaxd, mulp;   /* mgpu: debug (per thread: a window's pass 0 and 1 run on one GPU thread) */
     const int mck = mchk && nmil && d->milh[d->cur];
     if (mck && !pass) { free(mlg); mlg = calloc((size_t)D * hw, sizeof *mlg); free(mink); mink = calloc((size_t)D * hw, 1); }
     if (!pass) d->mil_n = 0;
@@ -1399,7 +1405,8 @@ static void head_slab_pass(gpu_state *d, int pass) {
             if (g_lcheck) {   /* the streamed slab against the device planes */
                 const uint8_t *dv[NLPL] = {d->sdb, d->w4, d->wc}, *cv[NLPL] = {sdb, w4, wc};   /* (whole-window planes; what the kernels read: slab buffers, or the device-kept planes) */
                 for (int j = 0; j < g_naux; j++) { dv[3 + j] = d->aux[j]; cv[3 + j] = apl[j]; }
-                static long tot, bad; nn_sync();
+                static thread_local long tot, bad;   /* mgpu: debug (per thread: each GPU's own count) */
+                nn_sync();
                 for (int k = 0; k < NLPL; k++) { if (!lplane_on(k)) continue;   /* (no such plane: the check read a null plane and died without --rv / --ink-head) */
                     const size_t v0 = (size_t)LZA(k, z0) * hw, nb = (size_t)(LZB(k, z1) - LZA(k, z0)) * hw; uint8_t *ha = malloc(nb), *hb = malloc(nb);
                     nn_d2h(ha, cv[k] + v0, nb); nn_d2h(hb, dv[k] + v0, nb); size_t nd = 0;
@@ -1418,7 +1425,8 @@ static void head_slab_pass(gpu_state *d, int pass) {
         if (g_lat_hs) {
             if (unet_head_fwd_z(d->u, qa, qb, d->lgc)) { fprintf(stderr, "latent head stream: the head is not covered per slab (UFSM_LAT_HEAD_STREAM=0)\n"); abort(); }
             if (!pass && getenv("UFSM_LGC_DUMP")) {   /* diagnostic: the first statistics pass's cell logits per slab, appended: int32 qa, qb (local cells), fp16 [LNC][qb - qa][plane] */
-                static int dn_[3]; if (dn_[d->side + 1] < 1) { const size_t nb = (size_t)LNC * (qb - qa) * (H / 4) * (W / 4) * 2; void *hb = malloc(nb); nn_sync(); nn_d2h(hb, d->lgc, nb);
+                static thread_local int dn_[3];   /* mgpu: debug (per thread; DP threads share side -1 and its file: use one GPU or --split for this dump) */
+                if (dn_[d->side + 1] < 1) { const size_t nb = (size_t)LNC * (qb - qa) * (H / 4) * (W / 4) * 2; void *hb = malloc(nb); nn_sync(); nn_d2h(hb, d->lgc, nb);
                     char fn_[1100]; snprintf(fn_, sizeof fn_, "%s%s", getenv("UFSM_LGC_DUMP"), d->side == 0 ? ".s0" : d->side == 1 ? ".s1" : ""); FILE *f = fopen(fn_, z0 ? "ab" : "wb");
                     if (f) { const int32_t q2[2] = {qa, qb}; fwrite(q2, 4, 2, f); fwrite(hb, 1, nb, f); fclose(f); } free(hb); if (z1 == D) dn_[d->side + 1]++; }
             }
@@ -1430,7 +1438,7 @@ static void head_slab_pass(gpu_state *d, int pass) {
             const size_t nb = (size_t)LUPN * ns * 2; void *d2 = nn_malloc(nb); uint16_t *ha = malloc(nb), *hb = malloc(nb);
             const int was = nn_lat_set_slow(1); nn_lat_up_slab(d->lg, unet_logits_h16(d->u), LUPN, D / 4, H / 4, W / 4, z0, nz, d2); nn_lat_set_slow(was);
             nn_sync(); nn_d2h(ha, d->hs_lg, nb); nn_d2h(hb, d2, nb); nn_free(d2);
-            static double mx, sq, sr; static size_t nd, nt_, n1;
+            static thread_local double mx, sq, sr; static thread_local size_t nd, nt_, n1;   /* mgpu: debug (per thread) */
             for (size_t k = 0; k < nb / 2; k++) { _Float16 x, y; memcpy(&x, ha + k, 2); memcpy(&y, hb + k, 2); const double e = fabs((double)x - (double)y); nd += ha[k] != hb[k]; n1 += abs((int)(int16_t)ha[k] - (int)(int16_t)hb[k]) > 1; if (e > mx) mx = e; sq += e * e; sr += (double)y * (double)y; }
             nt_ += nb / 2; free(ha); free(hb);
             if (z1 == D) { fprintf(stderr, "lat check: upsampling: %zu of %zu fp16 logits differ (%zu by more than one code), max |difference| %.3g, rms difference / rms %.3g\n", nd, nt_, n1, mx, sqrt(sq / (sr > 0 ? sr : 1))); mx = sq = sr = 0; nd = nt_ = n1 = 0; }
@@ -1857,12 +1865,12 @@ static int echo_busy(void *p) {
    checkpoint steps gives the same statistics as averaging every step; from the warm-up on every step (the forwards read them) */
 static void gn_ema_average(gpu_state *G, int ng) {
     size_t n = 0; float *p0 = unet_gn_ema_state(G[0].u, &n); if (!p0 || !n) return;
-    double *acc = calloc(n, sizeof *acc); float *h = malloc(n * 4);
-    for (int g = 0; g < ng; g++) { size_t m = 0; float *p = unet_gn_ema_state(G[g].u, &m); if (!p || m != n) { free(acc); free(h); return; }
-                                   nn_init(G[g].dev); nn_d2h(h, p, n * 4); for (size_t i = 0; i < n; i++) acc[i] += h[i]; }
-    for (size_t i = 0; i < n; i++) h[i] = (float)(acc[i] / ng);
-    for (int g = 0; g < ng; g++) { size_t m = 0; float *p = unet_gn_ema_state(G[g].u, &m); nn_init(G[g].dev); nn_h2d(p, h, n * 4); }
-    free(acc); free(h);
+    float *hb = malloc((size_t)ng * n * 4), *h[16]; if (!hb || ng > 16) { free(hb); return; }
+    for (int g = 0; g < ng; g++) { size_t m = 0; float *p = unet_gn_ema_state(G[g].u, &m); if (!p || m != n) { free(hb); return; }
+                                   h[g] = hb + (size_t)g * n; nn_init(G[g].dev); nn_d2h(h[g], p, n * 4); }
+    unet_gn_ema_mean_host(h, ng, n);   /* (tested on the CPU: test_gn_ema_avg) */
+    for (int g = 0; g < ng; g++) { size_t m = 0; float *p = unet_gn_ema_state(G[g].u, &m); nn_init(G[g].dev); nn_h2d(p, h[g], n * 4); }
+    free(hb);
 }
 static double g_echo_idle;   /* --echo-max: seconds a GPU waited for the next batch (from its step's end to the batch's handover), the "idle" share */
 static void gstep_job(void *p) { gstep_arg *a = p; nn_sr_salt(a->d->side < 0 ? (unsigned)a->g : 0u); gstep_fwd(a); if (!a->rc) gstep_bwd(a); nn_tls_capture(&a->out); }
@@ -4945,7 +4953,7 @@ int cmd_train(int argc, char **argv) {
           if (fault == step) nn_h2d(G[0].x, nullptr, 16); }
         if ((seconds && now() - t0 >= seconds) || (schedule_seconds && schedule_elapsed+now()-t0>=schedule_seconds) ||
             (limit_seconds && now() - t0 >= limit_seconds) || (stop_at && step >= stop_at)) g_stop = 1;
-        if (ng > 1 && G[0].side < 0 && cfg.gn_ema && (unet_gn_ema_updates(G[0].u) >= unet_gn_ema_warm(G[0].u) || step % val_every == 0 || step % ckpt_every == 0 || step == steps || g_stop)) {
+        if (ng > 1 && G[0].side < 0 && cfg.gn_ema && unet_gn_ema_average_due(unet_gn_ema_updates(G[0].u), unet_gn_ema_warm(G[0].u), step, val_every, ckpt_every, steps, g_stop)) {
             gn_ema_average(G, ng); nn_init(G[0].dev);
         }
         const int step_ok = nskip == nskip_seen; nskip_seen = nskip; nacc++; if (!step_ok) nskl += 1;   /* a skipped (non-finite) step: no loss / label means (try3 step 504: its nan entered rv / normal / ink) */
