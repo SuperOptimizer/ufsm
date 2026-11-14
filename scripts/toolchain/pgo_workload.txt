@@ -1,3 +1,21 @@
-# pgo_collect.sh workload: one bash command per line, $U = the instrumented ufsm. Short (minutes each), host-heavy, representative.
-# The pipeline fixture CLI (sampler, predict, fit, render on a small local fixture):
-UFSM_PGO_BIN=$U python3 tests/test_pipeline_cli.py
+# pgo_collect.sh workload: one bash command per line, run in the repo root with U (the instrumented ufsm), B (the PGO build dir,
+# instrumented test binaries), MF (make_wind_fixture), W (scratch). Host-heavy and representative; minutes each (instrumented host
+# code runs ~1.5-3x slower). GPU lines want one free card (the sweep post-pass window). Source-only when written (2026-11-14):
+# the flag sets are the suite's (tests/test_predict_heads.sh, suite.txt), not yet run as a workload.
+#
+# the 384^3 wind fixture (synthetic spiral CT at q 2, labels, sources jsons, ink)
+"$MF" $W/fx 384 2 1 > $W/fx.log 2>&1
+# training: 200 steps, small P, --gpu-input on. TODO(launch2): replace the flags with try7's real argv (P / steps / out swapped).
+cd $W && "$U" train fx/sources-ink.json --out tr --task unwrap2 --levels 1 --P 128 --B 1 --gpus 0 --workers 4 --sampler-slots 8 --gpu-input 1 --fp4 2 --input-prec 8 --warmup 0 --seed 5 --widths 16,32,64 --lat 4 --lat-guide 3 --rv 2 --rv-iso 100 --ink-head 1 --fstem 16 --val-batches 2 --val-every 100 --log-every 50 --ckpt-every 200 --steps 200 > tr.log 2>&1
+# the sampler alone (host label / augmentation code; no GPU): 400 batches
+cd $W && UFSM_SAMPLER_ONLY=400 CUDA_VISIBLE_DEVICES= "$U" train fx/sources-ink.json --out so --task unwrap2 --levels 1 --P 128 --B 1 --workers 4 --sampler-slots 8 --fp4 2 --input-prec 8 --seed 6 --widths 16,32,64 --lat 4 --lat-guide 3 --rv 2 --rv-iso 100 --ink-head 1 --fstem 16 > so.log 2>&1
+# predict: all heads + the fit fields (fit-zarr) over the 384^3 box, encoded at q 4 (volcomp encode on the host)
+cd $W && "$U" predict tr/last.ckpt fx ct pr --um 9.6 --level 0 --window 160 --halo 16 --shard 128 --levels 2 --threads 8 --q 4 --heads all --fit-zarr prz > pr.log 2>&1
+# read back (volcomp decode on the host)
+cd $W && "$U" read pr/rv 9.6 0 0 0 384 384 384 rv.raw > rd.log 2>&1
+# count-field (model, pooling, CG), fit on slabs, render, volcomp encode / decode: the suite's drivers of those paths (CORE code,
+# instrumented here; the profile keys functions, so it applies to ufsm)
+UFSM_TEST_QUICK=1 "$B"/test_countfield
+UFSM_TEST_QUICK=1 UFSM_TEST_PART=1/9 "$B"/test_fit
+"$B"/test_render_stream
+"$B"/test_volcomp && "$B"/test_volcomp_fast

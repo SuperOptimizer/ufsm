@@ -2,7 +2,9 @@
 # pgo_collect.sh WORKLOAD [BUILD_DIR] [PGO_DIR]: the profile for UFSM_PGO=use (DESIGN 2026-11-14 "Fast math everywhere ...").
 #   1. configures BUILD_DIR (default build-pgo) as the release preset with UFSM_PGO=gen UFSM_PGO_DIR=PGO_DIR/raw (instrumented host
 #      C; the device code is not instrumented), builds ufsm (~/bin/lowprio, -j 8: the desk rule; JOBS overrides);
-#   2. runs every non-comment line of WORKLOAD under bash with U=<the instrumented ufsm>, in order (a failing line stops it): the
+#   2. runs every non-comment line of WORKLOAD under bash, in order (a failing line stops it), with U = the instrumented ufsm,
+#      B = BUILD_DIR (its test binaries are instrumented too: their profiles key the same CORE functions), MF = B/make_wind_fixture,
+#      W = PGO_DIR/work (scratch, emptied first); lines run in the repo root. The
 #      runs whose host time matters (sampler workers, predict / fit / render / count-field CPU paths). Instrumented code runs
 #      ~1.5-3x slower on the host; keep each run short (minutes);
 #   3. merges PGO_DIR/raw/*.profraw into PGO_DIR/ufsm.profdata (llvm-profdata of the clang that built it).
@@ -16,8 +18,10 @@ LP=; [ -x ~/bin/lowprio ] && LP=~/bin/lowprio
 case "$PD" in /?*/*) ;; *) echo "pgo_collect: refusing PGO_DIR '$PD'" >&2; exit 2;; esac
 rm -rf -- "$PD/raw"; mkdir -p "$PD/raw"
 cmake --preset release -B "$BD" -DUFSM_PGO=gen -DUFSM_PGO_DIR="$PD/raw" > "$PD/configure.log"
-$LP cmake --build "$BD" -j "$JOBS" --target ufsm > "$PD/build.log"
-export U=$H/$BD/ufsm LLVM_PROFILE_FILE="$PD/raw/ufsm-%p-%m.profraw"
+TG=${PGO_TARGETS:-ufsm make_wind_fixture test_countfield test_fit test_render_stream test_volcomp test_volcomp_fast}
+$LP cmake --build "$BD" -j "$JOBS" --target $TG > "$PD/build.log"
+rm -rf -- "$PD/work"; mkdir -p "$PD/work"
+export U=$H/$BD/ufsm B=$H/$BD MF=$H/$BD/make_wind_fixture W=$PD/work LLVM_PROFILE_FILE="$PD/raw/ufsm-%p-%m.profraw"
 n=0
 while IFS= read -r line; do
   case "$line" in ''|'#'*) continue;; esac

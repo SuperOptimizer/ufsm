@@ -33,9 +33,12 @@ optimization"):
   each would be a whole-program LTO link; `thin` with `UFSM_LTO_JOBS`). Consequence: the suite tests the non-LTO host code, and
   the shipped binary differs from it by cross-unit inlining (with fast math this can move roundings by an ulp).
 - PGO: `UFSM_PGO=gen|use`, `UFSM_PGO_DIR` (default <repo>/pgo). `scripts/toolchain/pgo_collect.sh WORKLOAD` builds an
-  instrumented `build-pgo/`, runs the workload lines with `$U`, and merges the profiles into `pgo/ufsm.profdata`. The default
-  workload (`scripts/toolchain/pgo_workload.txt`) is the pipeline-fixture CLI test. The production workloads (sampler-only
-  training, predict / fit / render on a real box) still need to be added there. Host only: device code has no PGO.
+  instrumented `build-pgo/`, runs the workload lines with `$U`, and merges the profiles into `pgo/ufsm.profdata`. The workload
+  (`scripts/toolchain/pgo_workload.txt`) runs on the 384^3 wind fixture: a 200-step train with --gpu-input (try7's argv to replace
+  the flags), sampler-only (UFSM_SAMPLER_ONLY), predict with all heads + fit-zarr at q 4 and a read-back (volcomp encode /
+  decode), and the instrumented test drivers of count-field, slab fit, render and volcomp (their profiles key the same CORE
+  functions). Queued as a sweep post-pass, with a full GPU suite against an LTO build dir (the shipped configuration, once per
+  toolchain change). Host only: device code has no PGO.
 - Device: clang -x cuda contraction `fast` (`on` under strict; test_half allows 1 ulp outside strict), `-Xcuda-ptxas -O3`; nvcc
   `-Xptxas -O3`, `--extra-device-vectorization`, host side `-march=native -mtune=native`. No device LTO (`-dlto`): it needs
   `-rdc` plus an nvcc device-link step, and the units are whole-program objects linked by clang / lld, so device LTO has nothing
