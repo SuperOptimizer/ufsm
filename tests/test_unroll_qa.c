@@ -4,7 +4,8 @@
    - right (pitch 10, offset -2): every fibre stays in its sheet (0 persistent changes), wind4 agreement 1 on all axes, tilt ~0, no
      density outliers, no low-confidence material, no phase-unwrap misses; the gates pass, exit 0 even under --strict;
    - wrong: the same plus a lattice term of 1.5 turns per 128 voxels along y (W slides across the sheets along each fibre: ~1.4 turns per
-     half turn of fibre): the fibre gate fires (gates.tsv "warn"), exit 0 by default and 3 under --strict; the median tilt grows.
+     half turn of fibre): the fibre and phase-unwrap (pw48) gates fire (gates.tsv "warn"), exit 0 by default and 3 under --strict;
+     the median tilt grows.
    Tiled mode (no --box) runs over the box's material tiles. CPU only. */
 #include "afv.h"
 #include "fit.h"
@@ -112,6 +113,7 @@ int main(void) {
         CHECK(rc == 0 && warn >= 1, "wrong model, warn only: exit %d, %d WARN lines (expected 0, >= 1)", rc, warn);
         const double fp = col(tsv, "fib_pers_h");
         CHECK(fp > 300, "wrong model: fibre H persistent %.1f /m (expected > 300)", fp);
+        CHECK(col(tsv, "pw48") > 0.10, "wrong model: phase-unwrap misses over 48 cells %.3f (expected > 0.10: W gains ~1.1 turns over 96 voxels of y)", col(tsv, "pw48"));
         char gt[400]; snprintf(gt, sizeof gt, "%s/boxes.tsv", og);
         CHECK(col(tsv, "tilt_med") > col(gt, "tilt_med") + 1, "wrong model: tilt median %.1f deg (right model %.1f)", col(tsv, "tilt_med"), col(gt, "tilt_med"));
         rc = cmd_unroll_qa(17, av); warn = warns(ob);

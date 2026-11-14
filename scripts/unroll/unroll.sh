@@ -22,7 +22,8 @@
 #   ref     -> fields: count-field --model-only (REFCMD F REF [--ct-cal FILE] overrides; cf GPU, TH threads) REFX: extra count-field flags (e.g. --rho-scale S)
 #   slabs   -> ref: snapped slab fits, FITLANES lanes per GPU in FITGPUS ("0 1"; auto: by device memory, 1..3); the INKGPU lanes start once the ink is done; then the
 #           bad-slab check (fit.log: "illegal memory", "loss 0.00000", no final loss line): refit on 1 lane, up to 3 tries, else fail
-#   join    -> slabs: fit-join --ref (refuses bad slabs) ; check -> join: wrap-check (wrapcheck.tsv verdicts; 0 CT peaks = fail)
+#   join    -> slabs: fit-join --ref (refuses bad slabs) ; check -> join: wrap-check (wrapcheck.tsv verdicts; 0 CT peaks = fail) +
+#           unroll-qa (label-free identity gates, warn only; UQSTRICT=1 fatal; FIBRES=UFIB adds the fibre gate; qa/unroll-qa)
 #   wraps   -> check: ufsm wraps (.sfc, step 4, --zr from scrolls.tsv, --min-cm2, --col-r p90)
 #   trim    -> wraps: the outer-end dup run (wrap-check) + near-empty outer wraps (on-papyrus <= PAPMIN 0.1; surf-stats) dropped: strip --last
 #           = the first kept id (state/strip.args, the dropped ids in progress.log); TRIM=0 or a --last in STRIPARGS (env only; a tsv --last is ignored): off
@@ -402,6 +403,16 @@ check() {
     { log "check: wrap-check found no CT peaks (empty share ~1 on every wrap): wrong --ct-um $LUM or CT level $K/$LV?"; return 1; }
   mv $O/wrapcheck.tsv.tmp $O/wrapcheck.tsv
   log "check: $(grep -E '^wrap-check: verdicts' $O/logs/check.log | tail -1)"
+  # unroll-qa: the label-free sheet-identity gates (wrap-check and the join agreement only measure self-consistency with the ref; DESIGN
+  # 2026-11-14): 48 tiles of 128^3 cells, phase confidence / phase-unwrap witness / winding-mod-4 agreement (+ fibre sheet changes with
+  # FIBRES=level-0 UFIB); its ok / WARN lines go to progress.log. Warn only; UQSTRICT=1 fails the stage on a gate. ~3-5 min CPU.
+  local uqs=(); [ "${UQSTRICT:-0}" = 1 ] && uqs=(--strict); [ -n "$FIBRES" ] && uqs+=(--fibres $FIBRES)
+  mkdir -p $O/qa/unroll-qa
+  if ! X $O/logs/unrollqa.log $U unroll-qa --fields $F --model $O/joined --ct $R $K/$LV --out $O/qa/unroll-qa --threads $TH --tiles ${UQTILES:-48} "${uqs[@]}"; then
+    [ "${UQSTRICT:-0}" = 1 ] && { log "check: unroll-qa failed or a gate failed (UQSTRICT=1; logs/unrollqa.log)"; return 1; }
+    log "check: unroll-qa did not finish (logs/unrollqa.log); warn only, continuing"
+  fi
+  [ "$DRY" = 1 ] || grep -E '^unroll-qa: (ok|WARN) gate' $O/logs/unrollqa.log | while read -r l; do log "check: $l"; done
 }
 wraps() {
   local zr=; [ -n "$ZR" ] && [ "$ZR" != - ] && zr="--zr $ZR"

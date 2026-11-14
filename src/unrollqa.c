@@ -7,7 +7,7 @@
    - fibres (--fibres, UFIB of level-0 points, e.g. fiber-trace output): a fibre lies in one sheet, so W along it must stay within a turn.
      The fiber-judge measure: W sampled every native voxel along the polyline, steps unwrapped, 9-sample median, hysteresis --hyst turn;
      "persistent" = |net sheet change| per stretch, per metre of fibre (H / V family). The validated gate (2026-11-14, 44 GT boxes):
-     H persistent > 130 /m flags 26 / 28 boxes with ids < 0.5 (PH1-3 at 604-1163 /m), 0 / 9 good 1667 boxes.
+     H persistent > 130 /m flags 24 / 27 Paris 4 boxes with ids < 0.5 (PH1-3 at 552-1090 /m), 0 / 7 good 1667 boxes, 3 / 5 good Paris 4 boxes.
    - wind4: the network's winding-mod-4 planes (dz dy dx: W(x + d e_a) - W(x) mod 4 inside one inference window, a head count-field does
      not read) against the model's W difference over the same d: share within half a turn, per axis;
    - w4 loop closure: the net's own mod-4 differences summed around d x d squares (input consistency, model-free);
@@ -17,7 +17,9 @@
    - phase-unwrap witness: the net phase unwrapped along each axis over 16 / 48 cells against the model's W difference (integer misses);
    - CT (--ct ROOT KEY, the fields' native grid): the zero-CT (masked) share of material, and the share of 16^3 blocks whose CT ridge
      contrast |<c e^{-2 pi i W}>| / <|c|> (c = CT minus its 9^3 mean) is < 0.2.
-   Only the gated metrics carry thresholds (warn lines, exit 3 under --strict); the others are reported for the record.
+   Gated (warn lines; exit 3 under --strict): conf_lo, pw48, w4 and, with fibres, fib_pers_h (thresholds at uq_gates); the others are
+   reported for the record (tang_tpm and lcoh_lo track identity as well but add nothing to the gates; tilt, density ratio, w4 loop
+   closure and the zero-CT share do not track it within a scroll).
    CPU only. */
 #include "afv.h"
 #include "fit.h"
@@ -259,12 +261,16 @@ static int uq_measure(const uq_ctx *C, int fz0, int nz, int oy, int ny, int ox, 
     return 0;
 }
 
-/* ---- gates: metric, direction (+1: bad when above), default threshold, option ---- */
+/* ---- gates (DESIGN 2026-11-14; thresholds from 92 clean GT boxes: Paris 4 PH1-3 / HOLD / 34 July J boxes on ref-cf, 54 clean 1667 C boxes on
+   ref-cf and on joined): conf_lo > 0.40 OR pw48 > 0.10 flags PH1-3, 30 / 33 Paris 4 boxes with ids < 0.5 and 8 / 9 1667 joined boxes
+   with ids < 0.7, against 1 / 79 good 1667 box fits (ids >= 0.8). Tiles: a gate warns when more than --max-bad-share (0.35) of the tiles
+   are over it (whole scrolls: 1667 joined 0.11 / 0.29 / 0.10 of 600 tiles for conf_lo / pw48 / w4, Paris 4 ref-cf 0.74 / 0.42 / 0.57). */
 typedef struct { int m, sign; double thr; const char *opt, *what; } uq_gate;
 static uq_gate uq_gates[] = {
-    {M_FPH, +1, 130, "--max-fib-pers", "fibre H persistent sheet changes per m (fibres must stay in one sheet)"},
-    {M_W4Z, -1, 0, "--min-w4z", "model vs net winding-mod-4 agreement along z"},
-    {M_CONFLO, +1, 0, "--max-conf-lo", "share of material with phase confidence < 0.3"},
+    {M_CONFLO, +1, 0.40, "--max-conf-lo", "the network's phase is unsure (confidence < 0.3) on much of the material: the evidence cannot fix sheet identity"},
+    {M_PW48, +1, 0.10, "--max-pw48", "the net phase unwrapped over 48 cells counts a different number of sheets than W (integer jumps of the fit)"},
+    {M_W4, -1, 0.80, "--min-w4", "W disagrees with the network's winding-mod-4 head (the sheet count over 32 voxels)"},
+    {M_FPH, +1, 130, "--max-fib-pers", "fibres change sheet in W (H family persistent changes per m; a fibre lies in one sheet)"},
 };
 enum { UQ_NG = sizeof uq_gates / sizeof uq_gates[0] };
 
@@ -272,16 +278,16 @@ int cmd_unroll_qa(int argc, char **argv) {
     if (argc < 3 || !uq_opt(argc, argv, "--fields", nullptr) || !uq_opt(argc, argv, "--model", nullptr)) {
         fprintf(stderr, "usage: ufsm unroll-qa --fields DIR --model SET [--ct ROOT KEY] [--fibres F.fib [--fib-um 2.4] [--hyst 0.75]]\n"
                         "         [--box Z,Y,X,NZ,NY,NX [--name N]]... | [--tile 128 --tiles 48 --min-mat 0.2]\n"
-                        "         [--out DIR] [--threads 8] [--strict] [--max-fib-pers 130] [--min-w4z F] [--max-conf-lo F] [--max-bad-share 0.25]\n"
+                        "         [--out DIR] [--threads 8] [--strict] [--max-conf-lo 0.40] [--max-pw48 0.10] [--min-w4 0.80] [--max-fib-pers 130] [--max-bad-share 0.35]\n"
                         "  label-free sheet-identity QA of a fitted winding (src/unrollqa.c): per box / tile the fibre sheet changes, the net's\n"
                         "  winding-mod-4 agreement, normal tilt, density ratio, phase confidence / coherence, phase-unwrap witness, CT; warn lines,\n"
-                        "  exit 3 under --strict when a gate fails (a box over its threshold; tiles: more than --max-bad-share of them)\n"); return 2;
+                        "  exit 3 under --strict when a gate fails (a box over its threshold; tiles: more than --max-bad-share of them; a threshold 0 turns a gate off)\n"); return 2;
     }
     const double t0 = uq_now();
     const char *fdir = uq_opt(argc, argv, "--fields", nullptr), *md = uq_opt(argc, argv, "--model", nullptr), *out = uq_opt(argc, argv, "--out", nullptr);
     const int nt = ufsm_threads(atoi(uq_opt(argc, argv, "--threads", "0")), 8), strict = uq_flag(argc, argv, "--strict");
-    for (int k = 0; k < UQ_NG; k++) uq_gates[k].thr = atof(uq_opt(argc, argv, uq_gates[k].opt, k == 0 ? "130" : "0"));
-    const double max_bad = atof(uq_opt(argc, argv, "--max-bad-share", "0.25"));
+    for (int k = 0; k < UQ_NG; k++) { const char *v = uq_opt(argc, argv, uq_gates[k].opt, nullptr); if (v) uq_gates[k].thr = atof(v); }   /* 0: that gate off */
+    const double max_bad = atof(uq_opt(argc, argv, "--max-bad-share", "0.35"));
     fit_set *S = fit_set_load(md); if (!S) { fprintf(stderr, "unroll-qa: cannot load the fit set %s\n", md); return 1; }
     uq_ctx C = {.fdir = fdir, .S = S, .nt = nt, .hyst = atof(uq_opt(argc, argv, "--hyst", "0.75"))};
     for (int i = 2; i + 2 < argc; i++) if (!strcmp(argv[i], "--ct")) {
