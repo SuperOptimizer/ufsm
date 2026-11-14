@@ -6,6 +6,80 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Training-loop audit fixes: the fp16 dead zone, the optimizer step on resume, KL logging, diagnostics (2026-11-14, branch trainfix-20261114)
+
+From the training-loop audit (/vesuvius/ufsm/audit-20261114/train.md).
+
+**The fp16 dead zone (train#1).** The streamed head writes each head's per-voxel logit gradient into fp16 before the upsampling adjoint
+sums it into the fp32 cell gradient. The stored value is `mask weight x residual / (window mask sum x active channels) x gscale x lambda`,
+with gscale fixed at 1024 (halved on overflow, never raised). At P 768 the window holds 4.5e8 voxels, so the values are ~1e-7..1e-6:
+inside fp16's subnormal range (step 6e-8, smallest normal 6.1e-5). Residuals below |s - p| < 3e-8 x nm x active / (mw x 1024 x lambda)
+round to 0, a dead zone rather than noise (the cell sums do not average it out). At 30 % unit-weight supervision that is 0.8 % for the
+phase pair and 3.3 % for wind4 (lambda 0.25). It scales with P^3: x2.4 at P 1024, /3.4 at P 512. CPU simulation of the rounding
+(residuals 60 % |r| ~ 0.03, 40 % ~ 0.25, packed weight 8 on 30 %), share of voxel gradients flushed / cell-sum relative L2 error:
+
+| P | supervised | 2-channel pair | 7-channel group (unfused) |
+|---|---|---|---|
+| 512 | 30 % | 9 % / 0.6 % | 29 % / 2.1 % |
+| 768 | 30 % | 28 % / 2.0 % | 55 % / 5.9 % |
+| 768 | 60 % | 45 % / 3.8 % | 66 % / 11 % |
+| 1024 | 30 % | 49 % / 4.4 % | 70 % / 12.5 % |
+
+audit-net's independent simulation (residuals 60 % N(0, .02), 40 % N(0, .3)) gives the same order: P 768 side pair 19 % zeroed / 2.4 %,
+normal group 53 % / 8 %, P 1024 67 % / 15 %, up to 93 % with lambda 0.25. The finished cell gradients (lat_gfin_k, fp16) are ~64x larger
+but at P 768 still partly subnormal. The fused normal / density path keeps fp32 sums but rounds each value through fp16 to match the
+slow path (nn_lat.cu fuse_grad_v). The fix as the default is the head planes' own power-of-two scale (branch hgscale-20261114, skipair).
+This branch adds:
+- `UFSM_HSG_ZERO=N`: every Nth gradient pass, per GPU, how many supervised voxels' fp16 gradients are 0 or subnormal (phase / side pair,
+  rv, wind4, ink) and how many of the finished cell gradients are subnormal. It runs on the device and costs one sync per counted pass,
+  so the live run can report its own numbers. The trainer's head-slab path has no measurement on real data yet: the pod pass was
+  dropped for the mega test pass, and tests/test_gscale.sh (1) prints the fixture's numbers at gscale 1024 / 65536 / 2^20 there.
+- `--gscale-grow N` / `--gscale-max M` (default 0: fixed): the AMP-style growable scale. It doubles after N steps without a
+  non-finite gradient and halves on one, as before. The scale now rides in the checkpoint (`"trainstate"`), and a resume takes it
+  unless `--gscale` is given.
+
+**The optimizer step on resume (train#5).** With a fixed --accum the optimizer's step count was step / accum. try6's switch from 4 to 5
+at step 1164 moved it back from update 287 to 250 (log), so AdamW's bias correction (beta2 0.999) grew v-hat by 21 % for a few hundred
+updates. Checkpoints now carry `"trainstate":{"accum","anchor","upd","gscale"}` (appended after "gns"). Resumed at the same --accum,
+the update count and the alignment go on unchanged. At another --accum the count continues from the updates done (anchor = the resume
+step; the partial sum is dropped, as under --accum auto), with a notice. An older checkpoint keeps step / accum. test_accum (6).
+
+**KL and the phase angle error in the log (train#7).** A soft-target BCE carries its targets' entropy: 0.386 nats per channel for a
+cos / sin pair over a uniform angle (phase, wind4), ~0.474 for n n^T with isotropic normals (diagonal 0.409, off-diagonal 0.540).
+try6's logged normal bce 0.50 is ~94 % floor (KL ~0.03), phase 0.64 is KL ~0.25, wind4 0.60 is KL ~0.21. The statistics pass now also
+sums mw H(t / 255):
+- loss_stats_k takes an optional entropy pointer (nn_loss_stats_acc_e). The value is free, because the target byte is already loaded.
+- nn_ent_acc covers the fused normal group, an extra read of 8 bytes a voxel.
+- w4_stats_k has a 10th sum, the pair's entropy.
+- nn_pair_angerr is the phase pair's mean |angle error| in degrees, an extra read of 2 logits + 3 bytes a voxel.
+- --split adds the halves' sums (nn_ent_fin).
+
+The step line gains `(kl phase .. rv .. normal .. wind4 .. ink .. fib .. dir ..; phase error .. deg)`, each a mean over the windows
+that carry the head's labels (the bce's windows). test_heads drops the group before its reference comparison.
+
+**Diagnostics for the gn drift (train#2 / #3).** `UFSM_GRAD_LAYERS=N`: every Nth update, GPU 0 logs:
+- per-layer gradient norms of the update's mean gradient before the clip: encoder / decoder convs, down convs, residual blocks, the
+  attention linears t<block>.<0 qkv, 1 out, 2 mlp in, 3 mlp out>, the head, the whole net;
+- the attention linears' weight norms.
+
+It costs one d2h of the gradient, plus one of the weights with attention. This is for localising try6's rise from gn 1.1 to 3 after
+the P 768 / accum 5 switch.
+
+**hs_ds layout (train#10).** The light finalisation's held mask weights moved from hs_ds + 100 (inside the fibre direction's sums,
+84..118) to + 120.
+
+**Weight-decay equilibrium (train#11, note).** Muon with decoupled decay wd 0.01 at lr 0.003 decays by lr x wd = 3e-5 per update, an
+e-folding time of 33k updates. try6's 71000 steps / accum 5 = 14.2k updates, so 3^3 conv weights (Kaiming |W|^2 = 2 Co = 512 at Co 256)
+drift toward the random-walk equilibrium |W|^2 ~ lr min(Co, K) / (2 wd) = 38. By the end of the constant phase that is a ~35 %
+shrink. On GroupNorm-scale-invariant convs the effective rotation per step grows by ~1.5x. That is slow next to try6's drift (~100
+updates); watch it with --opt-stats.
+
+Items handed out (MEGA pass, CPU only, recipe changes behind flags default off):
+- train#3 attention Muon lr multiplier and train#8 the accum A/B script: admuon, attnlr-20261114;
+- train#4 window weighting: perf2, winw-20261114;
+- train#9 replica check and the lat-step jitter seed: gns, dpcheck-20261114;
+- train#6 validation (--val-batches / holdouts per scroll): launch config.
+
 ## Build and option hygiene: mini audits cmake + opts (2026-11-14, branch cfgfix-20261114)
 
 CMake (mini/cmake.md 1-6): test-prep now reconfigures the sibling release / verify dir with all of this dir's settings every time
