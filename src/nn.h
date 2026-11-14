@@ -66,6 +66,7 @@ int nn_event_done(void *ev);                             /* 1: the work before t
    ev_done completes with the copy (nn_stream_wait(0, ev_done) before the compute stream touches dst / src again) */
 void nn_offload_copy(void *dst, const void *src, size_t n, int to_host, void *ev_start, void *ev_done);
 size_t nn_mem_free(void);
+size_t nn_mem_total(void);   /* the device's memory (cudaMemGetInfo total) */
 /* train --lat: label planes kept on the device, packed (bits 8 bytes, 4 codes 0..14 / 255, 2 --rv papyrus classes); stream k: 0 compute, 1 copy, 2 aux */
 void nn_lab_quant(int k, uint8_t *s, size_t n, int bits);   /* experiment: a cyclic label plane (codes 0..251) to 2^bits levels in place */
 void nn_lab_pack(int k, const uint8_t *s, uint8_t *d, size_t n, int bits);

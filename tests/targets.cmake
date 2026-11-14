@@ -20,6 +20,7 @@ ufsm_exe(bench_l0_ring tests/bench_l0_ring.c OBJS unet NN LP LIBS m CUDA)
 ufsm_exe(bench_l0misc tests/bench_l0misc.c OBJS NN LP LIBS m CUDA)
 ufsm_exe(bench_lp tests/bench_lp.c OBJS NN LP LIBS m CUDA)
 ufsm_exe(bench_mem tests/bench_mem.c OBJS unet NN LP LIBS m CUDA)
+ufsm_exe(bench_s2 tests/bench_s2.c OBJS unet NN LP LIBS m CUDA)
 ufsm_exe(bench_muonc tests/bench_muonc.c OBJS unet NN LP LIBS m CUDA)
 ufsm_exe(bench_muonx tests/bench_muonx.c OBJS unet NN LP LIBS m CUDA)
 ufsm_exe(bench_read tests/bench_read.c OBJS sample scannorm sample_emb embz edt band sheet ct_augment scan_augment spatial_augment crush
