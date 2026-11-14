@@ -242,7 +242,9 @@ extern "C" int nn_set_devmap(int n, const int *phys) {
     for (int k = 0; k < n; k++) ufsm_devmap_[k] = phys[k];
     ufsm_ndevmap_ = n; return 0;
 }
-extern "C" int nn_init(int device) { { static int ser = -1; if (ser < 0) { ser = ufsm_env_on("UFSM_SERIALIZE"); if (ser) { setenv("CUDA_LAUNCH_BLOCKING", "1", 1); fprintf(stderr, "UFSM_SERIALIZE=1: CUDA_LAUNCH_BLOCKING=1, every launch and copy completes in program order (tests/test_serialize.sh)\n"); } } } if (ufsm_env_on("UFSM_ACTF32")) g_actbf = 0; if (ufsm_env_on("UFSM_GRADF32")) g_gradbf = 0; if (ufsm_env_on("UFSM_F16")) { g_h16 = 1; g_gscale = getenv("UFSM_GSCALE") ? (float)atof(getenv("UFSM_GSCALE")) : 1024.f; } if (cudaSetDevice(device) != cudaSuccess) return -1; if (getenv("UFSM_MEM_REPORT") && atoi(getenv("UFSM_MEM_REPORT")) >= 3) { size_t fr = 0, tot = 0; cudaFree(0); cudaMemGetInfo(&fr, &tot); fprintf(stderr, "nn_init: device used %.1f MB after the context\n", (tot - fr) / 1e6); } return 0; }   /* mgpu: env */
+extern "C" int nn_init(int device) { { static int ser_done = 0;   /* mgpu: env (once per process: the first nn_init of any GPU thread, atomically) */
+    if (!__atomic_exchange_n(&ser_done, 1, __ATOMIC_ACQ_REL) && ufsm_env_on("UFSM_SERIALIZE")) { setenv("CUDA_LAUNCH_BLOCKING", "1", 1); fprintf(stderr, "UFSM_SERIALIZE=1: CUDA_LAUNCH_BLOCKING=1, every launch and copy completes in program order (tests/test_serialize.sh)\n"); } }
+    if (ufsm_env_on("UFSM_ACTF32")) g_actbf = 0; if (ufsm_env_on("UFSM_GRADF32")) g_gradbf = 0; if (ufsm_env_on("UFSM_F16")) { g_h16 = 1; g_gscale = getenv("UFSM_GSCALE") ? (float)atof(getenv("UFSM_GSCALE")) : 1024.f; } if (cudaSetDevice(device) != cudaSuccess) return -1; if (getenv("UFSM_MEM_REPORT") && atoi(getenv("UFSM_MEM_REPORT")) >= 3) { size_t fr = 0, tot = 0; cudaFree(0); cudaMemGetInfo(&fr, &tot); fprintf(stderr, "nn_init: device used %.1f MB after the context\n", (tot - fr) / 1e6); } return 0; }
 extern "C" const char *nn_check(void) {
     cudaError_t e = g_err; const char *ef = g_err_file, *ew = g_err_what; int el = g_err_line, from = -2;
     g_err = cudaSuccess;

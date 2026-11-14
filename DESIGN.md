@@ -798,6 +798,10 @@ The runner gives gpu2 tests tagged `l2` UFSM_TEST_GPUS=0,0 on one-GPU machines:
 
 test_gyrec was tagged gpu2 although it runs on device 0 alone; it is now `gpu`.
 
+**The mgpu lint** is audit-net's tests/test_mgpu_lint.py (netfix-20261114), not a second one here (an earlier draft of this branch
+had tests/lint_mgpu.py; dropped for it). The logical-device map in src/ufsm_dev.cuh carries `mgpu: main` (set once by nn_set_devmap
+before the GPU threads start; the per-thread logical device is thread_local).
+
 **The mgpu lint** (tests/lint_mgpu.py, CPU, < 1 s; since folded into tests/test_mgpu_lint.py, see "DP safety": one tool, one baseline tests/mgpu_baseline.txt, these tags accepted). Every file-scope mutable variable in src/ needs an mgpu class: `process`,
 `device`, `guarded`, `BUG`.
 - The class goes in an annotation `/* mgpu: ... */` on its line, or in tests/mgpu_baseline.txt.
@@ -848,6 +852,17 @@ test_gyrec was tagged gpu2 although it runs on device 0 alone; it is now `gpu`.
 - Kept: 40 with unmerged / dirty / in-use reasons, 8 with untracked files, 9 of active agents. The branches stay.
 - The main checkout was fast-forwarded to origin/master (it was 376 commits behind; its local evwatch.sh edit and untracked files kept).
 - CLAUDE.md is now tracked.
+
+**#19 /vesuvius retention.** /vesuvius was 87 % used (254 GB free) and grew ~140 GB/day on 11-13/14: profile dumps (perf2/prof
+44 GB), per-arm bench binary copies (merge/bench 12 GB), try checkpoints, GT comparison renders. scripts/run/retain.py is the policy:
+- one rule per scratch tree (perf2/prof 3 days, merge/bench 3 days, gt/pub1667-cmp 7 days; `--rule DIR:DAYS` adds one); the unit is
+  each top-level entry, which goes when nothing inside it changed for that long. Checkpoints stay with the trainer's ring (#10 / #11).
+- kept, with the reason listed: an entry a symlink under /vesuvius/ufsm or /home/forrest points into, one a process has open (fd,
+  cwd or exe: a bench arm still running its binary copy), one holding a `KEEP` file.
+- a dry run by default; `--apply` deletes only paths strictly inside the rule's dir. The symlink walk takes ~3 min on the desk.
+- 11-14 14:40 dry run: 0 entries (everything in those trees is from the last 2 days), so it runs again from the health alarm.
+health.py adds the slow trend: from 6 h of history, a filesystem (now /vesuvius explicitly too) that would be full within 3 days at
+its 24 h rate gets a `disktrend` alert naming retain.py. tests/test_retain.sh checks the drop / keep rules and `--apply` (CPU, 1 s).
 
 **#3 the health watcher.** scratch2.health.py was not running on 11-14 (its files had moved with try5), and its limits were the old
 104 GB slice. scripts/run/health.py RUN is the same set of checks, generalised, run as the systemd --user service `ufsm-health@RUN`

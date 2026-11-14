@@ -362,3 +362,4 @@ test_pgrad~synccheck                           | gpu,slow     |   120 | bash tes
 test_w4dev~racecheck                           | gpu,slow     |   120 | bash tests/sanitize.sh racecheck ./$B/test_w4dev
 test_w4dev~synccheck                           | gpu,slow     |   120 | bash tests/sanitize.sh synccheck ./$B/test_w4dev
 test_win_weight                                | gpu          |     2 | ./$B/test_win_weight
+test_retain                                    |              |     1 | bash tests/test_retain.sh

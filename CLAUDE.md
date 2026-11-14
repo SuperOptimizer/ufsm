@@ -42,6 +42,7 @@ scripts/test/desk_suite.sh BRANCH   # push to the desk, build and run the suite 
   tagged `l2` run that way on one-GPU machines (UFSM_TEST_GPUS=0,0).
 - Training runs: `scripts/run/install_health.sh RUN` (the health watcher service); `scripts/run/replay_ab.sh RUN OLD NEW` before a
   binary swap; `--ckpt-ring` / `--snap-every` (src/ckring.c). A result-changing fallback prints `DEFAULTED:` (src/defaulted.h).
+  /vesuvius scratch retention: `scripts/run/retain.py` (dry run; `--apply`; a `KEEP` file pins an entry).
 - Sources are globbed: a new `src/*.c`, `src/nn_*.cu` or `src/lp_*.cu` is picked up at the next build (no list to edit). CUDA units
   that must be byte-identical to their CPU versions go into `UFSM_STRICT_UNITS` in CMakeLists.txt (no fast math, no FMA).
 - Useful env: `UFSM_MEM_REPORT=1..3` (allocation report; 3 logs each allocation with its caller), `UFSM_MEM_DRY=1` (the planner
