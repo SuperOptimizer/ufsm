@@ -1144,7 +1144,8 @@ static void ms_write_out(ms_ctx *C, ms_out *O, long long Ltot, int ns, int barh)
            ns, Ltot * C->pxum * 1e-4, C->vtot * C->pxum * C->pxum * 1e-8, C->ctl, C->vtot > 0 ? C->ptot / C->vtot : 0, O->od, ovw, oovh, rows, ds, C->lw, pap ? C->lh : 2 * C->lh, C->lds);
 }
 int cmd_strip_mosaic(int argc, char **argv) {
-    if (argc < 5) { fprintf(stderr, "usage: ufsm strip-mosaic <flat-dir> <render-dir> <out-dir> [--strip DIR] [--ct-level 80] [--overview-px 16000] [--rows 10] [--tile-cm 1] [--quality 88] [--stripes 1] [--threads 8] [--stripe-jobs 2] [--stretch CA,CB,IA,IB] [--stretch-only 1] [--wait-renders 1] [--rm-renders 1] [--papyrus GAIN [--papyrus-bg 128]] [--papyrus-dir DIR [--papyrus-gain 1] [--papyrus-overview-px PX]] [--fill-maps DIR]\n"
+    if (argc < 5) { fprintf(stderr, "usage: ufsm strip-mosaic <flat-dir> <render-dir> <out-dir> [--strip DIR] [--ct-level 80] [--overview-px 16000] [--rows 10] [--tile-cm 1] [--quality 88] [--stripes 1] [--threads 8] [--stripe-jobs 2] [--stretch CA,CB,IA,IB] [--stretch-only 1] [--wait-renders 1] [--rm-renders 1] [--papyrus GAIN [--papyrus-bg 128]] [--papyrus-dir DIR [--papyrus-gain 1] [--papyrus-overview-px PX]] [--fill-maps DIR] [--ct-stretch-papyrus 1] [--ink-fixed 1]\n"
+                          "  --ct-stretch-papyrus 1: CT window from pixels >= --ct-level only; --ink-fixed 1: ink grey = probability (no stretch); both off by default\n"
                           "  --fill-maps DIR: <stripe>_fill.tif of render --fill: its rendered pixels (bridged grid holes, fills) join the stripe mask\n"
                           "  --papyrus GAIN: papyrus-look RGB stripe JPEGs (<stripe>_papyrus.jpg), overview and long strip (ink-compare --papyrus colours,\n"
                           "  the mosaic's stretch, ink x GAIN; CT 0 / no surface in grey --papyrus-bg)\n"
@@ -1197,8 +1198,15 @@ int cmd_strip_mosaic(int argc, char **argv) {
         for (int s = 0; s < ns; s++) { st[s].ow = render_out_px(st[s].gw, gs); st[s].oh = render_out_px(st[s].gh, gs); }
     } else {
         { pthread_t th[64]; for (int t = 0; t < nsj; t++) pthread_create(&th[t], nullptr, ms_pass1, C); for (int t = 0; t < nsj; t++) pthread_join(th[t], nullptr); }
-        hist_q(C->hc, 0.005, 0.998, &ca, &cb); hist_q(C->hi, 0.01, 0.999, &ia, &ib);
+        /* --ct-stretch-papyrus 1: the CT window from the papyrus pixels only (CT >= --ct-level): air on the surface (render --fill-ct 1 renders
+           sample it on ~half of 1667's surface, urender audit 11-14 #2) otherwise sets the low end (1667: 1..202, papyrus on 101..220) */
+        if (atoi(sopt(argc, argv, "--ct-stretch-papyrus", "0"))) { double h[256]; for (int k = 0; k < 256; k++) h[k] = k >= ctl ? C->hc[k] : 0; hist_q(h, 0.005, 0.998, &ca, &cb); }
+        else hist_q(C->hc, 0.005, 0.998, &ca, &cb);
+        hist_q(C->hi, 0.01, 0.999, &ia, &ib);
     }
+    /* --ink-fixed 1: ink grey = the probability (0..255 -> 0..255), the same p -> grey in every run and model (the percentile stretch makes a
+       grey mean a different probability per run); overrides the ink half of --stretch */
+    if (atoi(sopt(argc, argv, "--ink-fixed", "0"))) { ia = 0; ib = 255; }
     fprintf(stderr, "strip-mosaic: stretch CT %d..%d, ink %d..%d\n", ca, cb, ia, ib);
     if (atoi(sopt(argc, argv, "--stretch-only", "0"))) { printf("stretch %d,%d,%d,%d\n", ca, cb, ia, ib); return 0; }   /* (from the renders present) */
     C->wait = atoi(sopt(argc, argv, "--wait-renders", "0")); C->rm = atoi(sopt(argc, argv, "--rm-renders", "0"));

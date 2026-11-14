@@ -6,6 +6,36 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Unroll output quality vs the published 1667 unwrap; render / ink fixes (2026-11-14, branch urenderfix-20261114)
+
+Audit `/vesuvius/ufsm/audit-20261114/urender.md` (images in `urender/`). Its method is now `scripts/unroll/pubcmp.py`, a CPU check of a strip
+against a published unwrap.
+- **Correspondence:** each banner pixel goes to the published flattened grid, through the inverse of the r2 affine (held-out rms 0.77 vx), to
+  the nearest vertex of our stripes.
+- **Banner registration:** one of the 4 flips, chosen by FFT cross-correlation of the papyrus mask with our CT, plus a linear column drift.
+- **1667 dir +1 strip, renders inkr/inkpod-9000** (7.5 min, 30 GB cap):
+  - our surface is within 50 um of 71.5 % of the published px (median 24.5 um);
+  - banner = grid rotated 180 deg, +1 / -467 px, drift -0.016 / px; P(published papyrus | ours) 0.908;
+  - **direction FAIL:** local slope +3.38, global -3.50 of our columns per published px; 9.5 % of the 8-px steps are sheet hops. Inside every
+    published turn our strip runs backwards (the image side of the opposite handedness, unroll audit #1);
+  - **AUC against the published ink:** ink 0.514, CT 0.511 (589 k ink px), flat under +-0.5 mm shifts. That is the model, not the registration.
+- **Scale:** our flattening matches the 3-D surface within about 1 %. The published flat grid is 8.1 % / 4.5 % shorter than 3-D (along / across).
+
+Changes:
+- **`render --fill-ct` threshold:** with the default 1, only masked-zero CT was void, so the fill never recentred off unmasked air. On the 1667
+  renders 45-54 % of the flag-0 surface pixels have CT < 80 (31-42 % < 50), and the ink there is read in air (p95 98-133).
+  - The CLI default goes to 80 with unrollfix-20261114 (it owns the line), and FILLCT=80 in unroll.sh.
+  - test_render_fill: a threshold case (thr 201: sheet A counts as void, the gap bands move to sheet B).
+  - Post-pass GPU check: `scripts/unroll/urender_post.sh`.
+- **`ink-blend --q`** defaults to 0 (lossless). The inputs are already q-coded by predict; the old second lossy pass (32) stacked errors.
+- **strip-mosaic look flags** (default off; before / after in `urender/stretch_before_after.jpg`):
+  - `--ct-stretch-papyrus 1`: the CT window from pixels >= --ct-level only. On 1667 that is 80..224 instead of 1..202, where air set the low end.
+  - `--ink-fixed 1`: ink grey = probability, the same in every run and model, instead of the percentile stretch (9..232 on 1667).
+- **pubcmp.py gate:**
+  - fails when the local and global slopes differ in sign or more than 5 % of the steps jump;
+  - with renders, also fails when the ink AUC < CT AUC + 0.02;
+  - `--ink-gate c12,c13` scores the papyrus-gated ink.
+
 ## Fully adaptive Muon: update / weight statistics, per-layer step control, DoG global step (2026-11-14, branch admuon-20261114)
 
 The user asked for "fully adaptive Muon" for the scratch2 trainer. Each piece below is behind its own flag and off by default; with the
