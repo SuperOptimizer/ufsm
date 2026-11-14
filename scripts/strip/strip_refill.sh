@@ -14,7 +14,8 @@
 #   STOP: OUT/STOP_FILL
 set -u
 OUT=$1
-U=${U:-/vesuvius/ufsm/scroll1/src/build/ufsm}
+U=${U:-$(cd "$(dirname "$0")/../.." && pwd)/build/ufsm}   # (the repo's build; the old /vesuvius/ufsm/scroll1 default is gone)
+[ -x "$U" ] || { echo "$0: no ufsm binary $U (set U)" >&2; exit 1; }
 CTR=${CTR:?CT root}; CTK=${CTK:?CT key}; INK=${INK:?ink zarr}; INKK=${INKK:-9.6}
 RENDER_NT=${RENDER_NT:-8}; MOS_NT=${MOS_NT:-6}; MAXR=${MAXR:-6}; [ $MAXR -ge 1 ] || MAXR=1; CTL=${CTL:-80}; PAP=${PAP:-}; MEMGB=${MEMGB:-80}; PAPMOS=${PAPMOS:-}; PGAIN=${PGAIN:-1}; PAPPX=${PAPPX:-8000}
 FILLX=${FILLX:---fill 4 --fill-grid 50000 --fill-inpaint 4 --fill-pm 0}
